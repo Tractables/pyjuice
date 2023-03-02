@@ -1,0 +1,415 @@
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+import time
+import triton
+import triton.language as tl
+from functools import partial
+from typing import Optional, Sequence
+from pyjuice.graph import RegionGraph, InputRegionNode, InnerRegionNode, PartitionNode, truncate_npartition
+from pyjuice.layer import Layer, InputLayer, ProdLayer, SumLayer
+
+def _pc_model_backward_hook(grad, pc):
+    pc.backward(
+        ll_weights = grad / grad.sum() * grad.size(0),
+        compute_param_flows = pc._optim_hyperparams["compute_param_flows"], 
+        flows_memory = pc._optim_hyperparams["flows_memory"]
+    )
+    for i in range(len(pc._inputs)):
+        if pc._inputs[i] is not None:
+            if pc._inputs[i].requires_grad and pc._inputs_grad[i] is not None:
+                pc._inputs[i].backward(pc._inputs_grad[i])
+            pc._inputs[i] = None
+    return None
+
+class ProbCircuit(nn.Module):
+    def __init__(self, region_graph: RegionGraph, max_npartitions: Optional[int] = None) -> None:
+        super().__init__()
+
+        self.region_graph = self._convert_region_graph(region_graph, max_npartitions)
+
+        self.device = torch.device("cpu")
+
+        self.node_mars = None
+        self.element_mars = None
+        self.node_flows = None
+        self.element_flows = None
+        self.param_flows = None
+        self.sum_region_mars = None
+
+        # Experimental, wheter to do calculations NOT in logdomain. Does extra bookkeeping to avoid logsumexp.
+        self.skip_logsumexp = False
+
+        self._init_layers()
+
+        self._inputs = [None, None]
+        self._inputs_grad = [None, None]
+
+        self._optim_hyperparams = {
+            "compute_param_flows": True,
+            "flows_memory": 0.0
+        }
+
+    def forward(self, inputs: torch.Tensor, params: Optional[torch.Tensor] = None):
+        self.node_mars = torch.empty([self.num_nodes, inputs.size(0)], device = self.device)
+        self.element_mars = torch.empty([self.num_elements, inputs.size(0)], device = self.device)
+        
+
+        if self.skip_logsumexp:
+            self.sum_region_mars = torch.empty([self.num_sum_regions, inputs.size(0)], device=inputs.device)
+            self.node_mars[0,:] = 1.0
+            self.element_mars[0,:] = 0.0
+            self.sum_region_mars[:, :] = 0.0
+        else:
+            self.node_mars[0,:] = 0.0
+            self.element_mars[0,:] = -torch.inf
+
+        if params is None:
+            params = self.params
+        else:
+            self._inputs[1] = params
+
+        with torch.no_grad():
+            for layer in self.input_layers:
+                layer(inputs.permute(1, 0), self.node_mars, skip_logsumexp=self.skip_logsumexp)
+
+            for ltype, layer in self.inner_layers:
+                if ltype == "prod":
+                    layer(self.node_mars, self.element_mars, skip_logsumexp=self.skip_logsumexp)
+                elif ltype == "sum":
+                    layer(self.node_mars, self.element_mars, params, sum_region_mars=self.sum_region_mars, skip_logsumexp=self.skip_logsumexp)
+                else:
+                    raise ValueError(f"Unknown layer type {ltype}.")
+                
+        if self.skip_logsumexp:
+           lls = self.node_mars[-1,:] + self.sum_region_mars.log().sum(dim=0)
+        else:
+            lls = self.node_mars[-1,:]
+
+        if torch.is_grad_enabled():
+            lls.requires_grad = True
+            lls.register_hook(partial(_pc_model_backward_hook, pc = self))
+
+            self._inputs[0] = inputs # Record inputs for backward
+
+        return lls
+
+    def backward(self, inputs: Optional[torch.Tensor] = None, ll_weights: Optional[torch.Tensor] = None,
+                 compute_param_flows: bool = True, flows_memory: float = 0.0):
+        assert self.node_mars is not None and self.element_mars is not None, "Should run forward path first."
+
+        self.node_flows = torch.zeros([self.num_nodes, self.node_mars.size(1)], device = self.device)
+        self.element_flows = torch.zeros([self.num_elements, self.node_mars.size(1)], device = self.device)
+
+        if compute_param_flows:
+            self.init_param_flows(flows_memory = flows_memory)
+
+        if ll_weights is None:
+            self.node_flows[-1,:] = 1.0
+        else:
+            self.node_flows[-1,:] = ll_weights.squeeze()
+
+        if self._inputs[1] is not None:
+            params = self._inputs[1]
+        else:
+            params = self.params
+
+        with torch.no_grad():
+            for layer_id in range(len(self.inner_layers) - 1, -1, -1):
+                ltype, layer = self.inner_layers[layer_id]
+
+                if ltype == "prod":
+                    layer.backward(self.node_flows, self.element_flows, skip_logsumexp=self.skip_logsumexp)
+
+                elif ltype == "sum":
+                    self.inner_layers[layer_id-1][1].forward(self.node_mars, self.element_mars, skip_logsumexp=self.skip_logsumexp)
+                        
+                    if compute_param_flows:
+                        layer.backward(self.node_flows, self.element_flows, self.node_mars, self.element_mars, params, param_flows = self.param_flows, skip_logsumexp=self.skip_logsumexp, sum_region_mars=self.sum_region_mars)
+                    else:
+                        layer.backward(self.node_flows, self.element_flows, self.node_mars, self.element_mars, params, skip_logsumexp=self.skip_logsumexp, sum_region_mars=self.sum_region_mars)
+
+                else:
+                    raise ValueError(f"Unknown layer type {ltype}.")
+
+            if compute_param_flows:
+                if inputs is None:
+                    inputs = self._inputs[0]
+
+                for layer in self.input_layers:
+                    layer.backward(inputs.permute(1, 0), self.node_flows)
+
+        return None
+
+    def mini_batch_em(self, step_size: float, pseudocount: float = 0.0):
+        for layer in self.input_layers:
+            layer.mini_batch_em(step_size = step_size, pseudocount = pseudocount)
+        
+        with torch.no_grad():
+            flows = self.param_flows
+            self._normalize_parameters(flows, pseudocount = pseudocount)
+            self.params.data = (1.0 - step_size) * self.params.data + step_size * flows
+            self.params[0] = 1.0
+
+    def cumulate_flows(self, inputs: torch.Tensor, params: Optional[torch.Tensor] = None):
+        with torch.no_grad():
+            self.forward(inputs, params)
+            self.backward(inputs = inputs, compute_param_flows = True, flows_memory = 1.0)
+
+    def init_param_flows(self, flows_memory: float = 0.0):
+        if self.param_flows is None or self.param_flows.size(0) != self.params.size(0):
+            self.param_flows = torch.zeros([self.params.size(0)], device = self.device)
+        else:
+            assert self.param_flows.size(0) == self.params.size(0)
+            self.param_flows[:] *= flows_memory
+
+        for layer in self.input_layers:
+            layer.init_param_flows(flows_memory = flows_memory)
+
+        return None
+
+    def to(self, device):
+        super(ProbCircuit, self).to(device)
+
+        for layer in self.input_layers:
+            layer.device = device
+
+        self.device = device
+
+    def _convert_region_graph(self, region_graph: RegionGraph, max_npartitions: Optional[int] = None):
+        if max_npartitions is not None:
+            region_graph = truncate_npartition(region_graph, max_npartitions)
+
+        return region_graph
+
+    def _init_layers(self, init_input_params: Optional[Sequence[torch.Tensor]] = None, init_inner_params: Optional[torch.Tensor] = None):
+        depth2rnodes, num_layers = self._create_region_node_layers()
+
+        if hasattr(self, "input_layers") or hasattr(self, "inner_layers"):
+            raise ValueError("Attempting to initialize a ProbCircuit for the second time. " + \
+                "Please instead create a new ProbCircuit instance by `ProbCircuit(region_graph)`.")
+
+        self.input_layers = []
+        self.inner_layers = []
+
+        # Nodes include one dummy node and all input/sum nodes in the PC
+        num_nodes = 1
+
+        # Elements include one dummy element and all product nodes in the PC
+        num_elements = 1
+
+        # Number of parameters for sum nodes in the PC, plus one dummy parameter
+        param_ends = [1]
+
+        num_sum_regions = 0 # tally of sum regions so far
+
+        layer_id = 0
+        for depth in range(num_layers):
+            if depth == 0:
+                # Input layer
+                type2rnodes = self._categorize_input_region_nodes(depth2rnodes[0]["input"])
+                for NodeType, rnodes in type2rnodes.items():
+                    input_layer = NodeType(layer_id, region_nodes = rnodes, cum_nodes = num_nodes)
+
+                    num_nodes += input_layer.num_nodes
+                    self.input_layers.append(input_layer)
+                    self.add_module(f"input_layer_{layer_id}", input_layer)
+                    layer_id += 1
+            else:
+                assert len(depth2rnodes[depth]["prod"]) > 0 and len(depth2rnodes[depth]["sum"]) > 0, \
+                    "Depth {}: ({}, {})".format(depth, len(depth2rnodes[depth]["prod"]), len(depth2rnodes[depth]["sum"]))
+
+                # Product layer
+                prod_layer = ProdLayer(layer_id, depth2rnodes[depth]["prod"])
+
+                if prod_layer.num_nodes + 1 > num_elements:
+                    num_elements = prod_layer.num_nodes + 1
+                self.add_module(f"prod_layer_{layer_id}", prod_layer)
+                self.inner_layers.append(("prod", prod_layer))
+                layer_id += 1
+
+                # Sum layer
+                sum_layer = SumLayer(layer_id, depth2rnodes[depth]["sum"],
+                                        cum_nodes = num_nodes, 
+                                        param_ends = param_ends, 
+                                        ch_prod_layer_size = prod_layer.num_nodes + 1,
+                                        sum_region_start_id = num_sum_regions)
+
+                num_nodes += sum_layer.num_nodes
+                num_sum_regions += len(depth2rnodes[depth]["sum"])
+                self.add_module(f"sum_layer_{layer_id}", sum_layer)
+                self.inner_layers.append(("sum", sum_layer))
+                layer_id += 1
+
+        self.num_nodes = num_nodes
+        self.num_elements = num_elements
+        self.num_inner_params = param_ends[-1]
+        self.param_ends = param_ends
+        self.num_sum_regions = num_sum_regions
+
+        # For parameter normalization
+        node_ids = torch.empty([self.num_inner_params], dtype = torch.long)
+        node_nchs = torch.empty([self.num_nodes], dtype = torch.long)
+        node_ids[:self.param_ends[0]] = 0
+        node_nchs[0] = self.param_ends[0]
+        for i in range(1, len(self.param_ends)):
+            node_ids[self.param_ends[i-1]:self.param_ends[i]] = i
+            node_nchs[i] = self.param_ends[i] - self.param_ends[i-1]
+        
+        self.register_buffer("node_ids", node_ids)
+        self.register_buffer("node_nchs", node_nchs)
+
+        self._init_params()
+
+    def _init_params(self, perturbation: float = 4.0):
+        params = torch.exp(torch.rand([self.num_inner_params]) * -perturbation)
+
+        # Copy initial parameters if provided
+        for layer_type, layer in self.inner_layers:
+            if layer_type == "sum":
+                for rnode in layer.region_nodes:
+                    if hasattr(rnode, "_params"):
+                        sidx, eidx = rnode._param_range
+                        params[sidx:eidx] = rnode._params[rnode._inverse_param_ids].to(params.device)
+
+        self._normalize_parameters(params)
+        self.params = nn.Parameter(params)
+
+        # Due to the custom inplace backward pass implementation, we do not track 
+        # gradient of PC parameters by PyTorch.
+        self.params.requires_grad = False
+
+        for idx, layer in enumerate(self.input_layers):
+            layer._init_params(perturbation)
+
+    def _normalize_parameters(self, params, pseudocount: float = 0.0):
+        if self.node_ids.is_cuda:
+            assert params.is_cuda, "Input `params` should be on GPU."
+
+            cum_params = torch.zeros([self.num_nodes], dtype = torch.float32, device = self.device)
+
+            grid1 = lambda meta: (triton.cdiv(self.num_inner_params, meta['BLOCK_SIZE']),)
+            grid2 = lambda meta: (triton.cdiv(self.num_inner_params, meta['BLOCK_SIZE']),)
+
+            self._cum_params_kernel[grid1](params, cum_params, self.node_ids, self.num_inner_params, BLOCK_SIZE = 1024)
+            self._norm_params_kernel[grid2](params, cum_params, self.node_ids, self.node_nchs, self.num_inner_params, 
+                                            pseudocount, BLOCK_SIZE = 1024)
+
+        else:
+            with torch.no_grad():
+                param_ids = torch.arange(0, self.num_inner_params, dtype = torch.long, device = params.device)
+
+                cum_matrix1 = torch.sparse_coo_tensor(
+                    torch.stack((self.node_ids, param_ids), dim = 0), 
+                    params.view(-1), (len(self.param_ends), self.num_inner_params)
+                )
+                node_buffer = torch.sparse.mm(cum_matrix1, torch.ones([self.num_inner_params, 1], dtype = torch.float32, device = params.device))
+
+                node_buffer.reciprocal_()
+
+                cum_matrix2 = torch.sparse_coo_tensor(
+                    torch.stack((param_ids, self.node_ids), dim = 0), 
+                    params.view(-1), (self.num_inner_params, len(self.param_ends))
+                )
+                params_buffer = torch.sparse.mm(cum_matrix2, node_buffer)
+
+                params.data[:] = params_buffer[:,0]
+
+        return None
+
+    @staticmethod
+    @triton.jit
+    def _cum_params_kernel(params_ptr, cum_params_ptr, node_ids_ptr, tot_num_params, BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(axis = 0)
+        block_start = pid * BLOCK_SIZE
+
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < tot_num_params
+
+        n_offsets = tl.load(node_ids_ptr + offsets, mask = mask, other = 0)
+
+        params = tl.load(params_ptr + offsets, mask = mask, other = 0)
+
+        tl.atomic_add(cum_params_ptr + n_offsets, params, mask = mask)
+
+    @staticmethod
+    @triton.jit
+    def _norm_params_kernel(params_ptr, cum_params_ptr, node_ids_ptr, node_nchs_ptr, tot_num_params, 
+                            pseudocount, BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(axis = 0)
+        block_start = pid * BLOCK_SIZE
+
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < tot_num_params
+
+        n_offsets = tl.load(node_ids_ptr + offsets, mask = mask, other = 0)
+
+        params = tl.load(params_ptr + offsets, mask = mask, other = 0)
+        cum_params = tl.load(cum_params_ptr + n_offsets, mask = mask, other = 1)
+        nchs = tl.load(node_nchs_ptr + n_offsets, mask = mask, other = 1)
+
+        normed_params = (params + pseudocount / nchs) / (cum_params + pseudocount)
+        tl.store(params_ptr + offsets, normed_params, mask = mask)
+
+    def _extract_params_to_rnodes(self):
+        """
+        Extract all inner and input parameters from this ProbCircuit to individual region nodes.
+        """
+        assert self.device.type == "cpu", "Please move the ProbCircuit to CPU before extracting its parameters."
+
+        # Inner region nodes
+        for layer_type, layer in self.inner_layers:
+            if layer_type == "sum":
+                for rnode in layer.region_nodes:
+                    sidx, eidx = rnode._param_range
+                    rnode._params = self.params.data[sidx:eidx].detach().cpu().clone()
+
+        # Input region nodes
+        for layer in self.input_layers:
+            layer._extract_params_to_rnodes()
+
+    def _create_region_node_layers(self):
+        depth2rnodes = dict()
+        rnode2depth = dict()
+
+        num_layers = [1]
+
+        def dfs(n: RegionGraph):
+            if n in rnode2depth:
+                return
+            if isinstance(n, InputRegionNode):
+                rnode2depth[n] = 0
+                if 0 not in depth2rnodes:
+                    depth2rnodes[0] = {"input": []}
+                depth2rnodes[0]["input"].append(n)
+            else:
+                for c in n.children:
+                    dfs(c)
+
+                depth = max(map(lambda m: rnode2depth[m], n.children)) + (1 if isinstance(n, PartitionNode) else 0)
+                num_layers[0] = max(depth + 1, num_layers[0])
+                rnode2depth[n] = depth
+
+                if depth not in depth2rnodes:
+                    depth2rnodes[depth] = {"sum": [], "prod": []} # lists for sum and product regions
+                
+                if isinstance(n, PartitionNode):
+                    depth2rnodes[depth]["prod"].append(n)
+                elif isinstance(n, InnerRegionNode):
+                    depth2rnodes[depth]["sum"].append(n)
+                else:
+                    raise NotImplementedError(f"Unsupported region node type {type(n)}.")
+
+        dfs(self.region_graph)
+
+        return depth2rnodes, num_layers[0]
+
+    def _categorize_input_region_nodes(self, rnodes):
+        type2rnodes = dict()
+        for r in rnodes:
+            if r.node_type not in type2rnodes:
+                type2rnodes[r.node_type] = []
+            type2rnodes[r.node_type].append(r)
+
+        return type2rnodes
