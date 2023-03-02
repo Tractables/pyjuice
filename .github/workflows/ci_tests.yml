@@ -1,6 +1,7 @@
 name: CUDA CI Tests 
 
-on: [push]
+on: 
+  workflow_dispatch:
 
 jobs:
   build:
@@ -31,4 +32,4 @@ jobs:
           flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
       - name: Test with pytest
         run: |
-          pytest
+          pytest --exitfirst --verbose --failed-first --cov=. --cov-report html

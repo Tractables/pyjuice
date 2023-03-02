@@ -1,6 +1,5 @@
 import pyjuice as juice
 import torch
-import torchvision
 import numpy as np
 from torch.utils.data import TensorDataset, DataLoader
 
