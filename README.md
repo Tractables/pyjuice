@@ -6,15 +6,22 @@ Probabilistic Circuits Package
 
 For now need to manually install pytorch's nightly build (cuda).
 
-0. Clone this repository and `cd` into it.
+0. (Optional) Make a new conda environment
 
-1. Install the `pyjuice` package in developement mode, run the following:
+    ```bash
+    conda create -n pyjuice python=3
+    conda activate pyjuice
+    ```
+
+1. Clone this repository and `cd` into it.
+
+2. Install the `pyjuice` package in developement mode, run the following:
 
     ```bash
     pip install --editable .
     ```
 
-2. Install Pytorch Nightly Build
+3. Install Pytorch Nightly Build
 
     ```bash
     pip3 install -I torch --index-url https://download.pytorch.org/whl/nightly/cu118
