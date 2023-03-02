@@ -16,3 +16,4 @@ Contents
 .. toctree::
 
    start
+   api
