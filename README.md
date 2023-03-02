@@ -1,5 +1,7 @@
 # pyjuice
 
+[![CUDA CI Tests](https://github.com/Juice-jl/pyjuice/actions/workflows/ci_tests.yml/badge.svg?branch=main)](https://github.com/Juice-jl/pyjuice/actions/workflows/ci_tests.yml)
+
 Probabilistic Circuits Package
 
 ## Installation
