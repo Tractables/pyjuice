@@ -27,7 +27,7 @@ For now need to manually install pytorch's nightly build (cuda).
 3. Install Pytorch Nightly Build
 
     ```bash
-    pip3 install -I torch --index-url https://download.pytorch.org/whl/nightly/cu118
+    pip3 install -I torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu118
     ```
 
 ## Testing
