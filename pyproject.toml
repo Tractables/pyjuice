@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyjuice"
+version="0.0.1"
+description = "Probabilistic Circuits Library"
+dependencies = [
+    "numpy",
+    "torch",
+    "typing",
+    "triton",
+    "networkx"
+]
+authors = [
+    {name="StarAI", email="guyvdb@cs.ucla.edu"},
+]
+
+[options.packages.find]
+where = "src"
+
+[tool.setuptools.dynamic]
+readme = {file = "README.md"}
+
+
+[tool.pytest.ini_options]
+addopts = [
+    "--import-mode=importlib",
+]
