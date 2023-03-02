@@ -35,6 +35,13 @@ jobs:
           pip install pytest
           pip install pytest-cov
           pip install pytest-github-actions-annotate-failures
+          pip install pytest-codecov
       - name: Test with pytest
         run: |
-          pytest --exitfirst --verbose --failed-first --cov=. --cov-report html
+          pytest --exitfirst --verbose --failed-first --codecov # --cov=. --cov-report html
+
+      - name: Archive code coverage results
+        uses: actions/upload-artifact@v3
+        with:
+          name: code-coverage-report
+          path: output/test/code-coverage.html
