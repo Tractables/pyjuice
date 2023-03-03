@@ -9,10 +9,21 @@ import sys
 import logging
 import warnings
 from torch.utils.data import TensorDataset, DataLoader
+import argparse
 
 warnings.filterwarnings("ignore")
 logging.getLogger("torch._inductor.utils").setLevel(logging.ERROR)
 logging.getLogger("torch._inductor.compile_fx").setLevel(logging.ERROR)
+
+def process_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--batch_size', type=int, default=512, help='BATCH_SIZE')
+    parser.add_argument('--cuda', type=int, default=0, help='cuda idx')
+    parser.add_argument('--num_latents', type=int, default=32, help='NUM_LATENTS')
+    args = parser.parse_args()
+    return args
+
+
 
 def mini_batch_em_epoch(num_epochs, pc, optimizer, scheduler, train_loader, test_loader, device):
     for epoch in range(num_epochs):
@@ -74,10 +85,17 @@ def full_batch_em_epoch(epoch, pc, train_loader, test_loader, device):
         print(f"Epoch {epoch} - train LL: {train_ll:.2f} - test LL: {test_ll:.2f}")
 
 
-def main():
-    NUM_LATENTS = 32
-    BATCH_SIZE = 512
-    device = torch.device("cuda:0")
+def main(args):
+    NUM_LATENTS = args.num_latents
+    BATCH_SIZE = args.batch_size
+    CUDA = args.cuda
+    print("==========================================================")
+    print(f"num_latents  {NUM_LATENTS}")
+    print(f"batch_size   {BATCH_SIZE}")
+    print(f"cuda         {CUDA}")
+
+    torch.cuda.set_device(CUDA)
+    device = torch.device(f"cuda:{CUDA}")
     
     tr_dataset = torchvision.datasets.MNIST(root = "./examples/data", train = True, download = True)
     ts_dataset = torchvision.datasets.MNIST(root = "./examples/data", train = False, download = True)
@@ -116,4 +134,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    args = process_args()
+    main(args)
