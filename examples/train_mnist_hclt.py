@@ -104,6 +104,8 @@ def main(args):
     train_data = train_dataset.data.reshape(60000, 28*28)
     test_data = test_dataset.data.reshape(10000, 28*28)
 
+    num_features = train_data.size(1)
+
     train_loader = DataLoader(
         dataset = TensorDataset(train_data),
         batch_size = args.batch_size,
@@ -137,7 +139,7 @@ def main(args):
         t0_save = time.time()
         torch.save(pc, filename)
         t1_save = time.time()
-        print(f"took {t1_save - t0_save:2.f} (s)")
+        print(f"took {t1_save - t0_save:.2f} (s)")
 
     elif args.mode == "load":
         print("===========================LOAD===============================")
@@ -157,8 +159,8 @@ def main(args):
         test_ll = evaluate(pc, loader=test_loader)
         t2 = time.time()
 
-        train_bpd = -train_ll / (28*28 * np.log(2))
-        test_bpd = -test_ll / (28*28 * np.log(2))
+        train_bpd = -train_ll / (num_features * np.log(2))
+        test_bpd = -test_ll / (num_features * np.log(2))
 
         print(f"Compilation+test took {t0-t_compile:.2f} (s); train_ll {t1-t0:.2f} (s); test_ll {t2-t1:.2f} (s)")
         print(f"train_ll: {train_ll:.2f}, test_ll: {test_ll:.2f}")
