@@ -180,7 +180,12 @@ class SumLayer(Layer,nn.Module):
         if skip_logsumexp:
             self._dense_backward_pass_nolog(node_flows, element_flows, node_mars, element_mars, params, param_flows = param_flows, sum_region_mars=sum_region_mars)
         else:
-            self._dense_backward_pass(node_flows, element_flows, node_mars, element_mars, params, param_flows = param_flows)
+            if param_flows is None:
+                self._dense_backward_pass1(node_flows, element_flows, node_mars, element_mars, params, param_flows = param_flows)
+            elif params.size(1) == 1:
+                self._dense_backward_pass2(node_flows, element_flows, node_mars, element_mars, params, param_flows = param_flows)
+            else:
+                self._dense_backward_pass3(node_flows, element_flows, node_mars, element_mars, params, param_flows = param_flows)
 
     @torch.compile(mode = "reduce-overhead")
     def _dense_forward_pass(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor):
@@ -199,20 +204,42 @@ class SumLayer(Layer,nn.Module):
 
         return None
 
-
     @torch.compile(mode = "reduce-overhead")
-    def _dense_backward_pass(self, node_flows: torch.Tensor, element_flows: torch.Tensor, node_mars: torch.Tensor, 
-                             element_mars: torch.Tensor, params: torch.Tensor, param_flows: Optional[torch.Tensor] = None):
+    def _dense_backward_pass1(self, node_flows: torch.Tensor, element_flows: torch.Tensor, node_mars: torch.Tensor, 
+                              element_mars: torch.Tensor, params: torch.Tensor, param_flows: Optional[torch.Tensor] = None):
         element_flows[1:self.ch_prod_layer_size] = (node_flows[self.parids] * params[self.parpids] * \
             (element_mars[1:self.ch_prod_layer_size].unsqueeze(1) - node_mars[self.parids]).exp()).sum(dim = 1)
 
-        if param_flows is not None:
-            if params.size(1) == 1:
-                param_flows[self.seq_parpids] += (node_flows[self.parids] * params[self.parpids] * \
-                    (element_mars[1:self.ch_prod_layer_size].unsqueeze(1) - node_mars[self.parids]).exp()).sum(dim = 2)[self.seq_ids0, self.seq_ids1]
-            else:
-                param_flows[self.seq_parpids] += (node_flows[self.parids] * params[self.parpids] * \
-                    (element_mars[1:self.ch_prod_layer_size].unsqueeze(1) - node_mars[self.parids]).exp())[self.seq_ids0, self.seq_ids1]
+        return None
+
+    @torch.compile(mode = "reduce-overhead")
+    def _dense_backward_pass2(self, node_flows: torch.Tensor, element_flows: torch.Tensor, node_mars: torch.Tensor, 
+                              element_mars: torch.Tensor, params: torch.Tensor, param_flows: Optional[torch.Tensor] = None):
+        element_flows[1:self.ch_prod_layer_size] = (node_flows[self.parids] * params[self.parpids] * \
+            (element_mars[1:self.ch_prod_layer_size].unsqueeze(1) - node_mars[self.parids]).exp()).sum(dim = 1)
+
+        param_flows[self.seq_parpids] += (node_flows[self.parids] * params[self.parpids] * \
+            (element_mars[1:self.ch_prod_layer_size].unsqueeze(1) - node_mars[self.parids]).exp()).sum(dim = 2)[self.seq_ids0, self.seq_ids1]
+
+        '''aaa = (node_flows[self.parids] * params[self.parpids] * \
+            (element_mars[1:self.ch_prod_layer_size].unsqueeze(1) - node_mars[self.parids]).exp())
+        print(aaa.size())
+        print(aaa.sum(dim = 2).size())
+        print(aaa.sum(dim = 2)[self.seq_ids0, self.seq_ids1].size())
+        print(self.seq_ids0.min(), self.seq_ids0.max())
+        print(self.seq_ids1.min(), self.seq_ids1.max())
+        exit()'''
+
+        return None
+
+    @torch.compile(mode = "reduce-overhead")
+    def _dense_backward_pass3(self, node_flows: torch.Tensor, element_flows: torch.Tensor, node_mars: torch.Tensor, 
+                              element_mars: torch.Tensor, params: torch.Tensor, param_flows: Optional[torch.Tensor] = None):
+        element_flows[1:self.ch_prod_layer_size] = (node_flows[self.parids] * params[self.parpids] * \
+            (element_mars[1:self.ch_prod_layer_size].unsqueeze(1) - node_mars[self.parids]).exp()).sum(dim = 1)
+
+        param_flows[self.seq_parpids] += (node_flows[self.parids] * params[self.parpids] * \
+            (element_mars[1:self.ch_prod_layer_size].unsqueeze(1) - node_mars[self.parids]).exp())[self.seq_ids0, self.seq_ids1]
 
         return None
     

@@ -142,8 +142,8 @@ class ProbCircuit(nn.Module):
                     layer.backward(self.node_flows, self.element_flows, skip_logsumexp=self.skip_logsumexp)
 
                 elif ltype == "sum":
-                    self.inner_layers[layer_id-1][1].forward(self.node_mars, self.element_mars, skip_logsumexp=self.skip_logsumexp)
-                        
+                    self.inner_layers[layer_id-1][1].forward(self.node_mars, self.element_mars, skip_logsumexp = self.skip_logsumexp)
+
                     layer.backward(self.node_flows, self.element_flows, self.node_mars, self.element_mars, params, 
                                    param_flows = self.param_flows if compute_param_flows else None, 
                                    skip_logsumexp = self.skip_logsumexp, 
