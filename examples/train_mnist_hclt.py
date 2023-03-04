@@ -22,6 +22,7 @@ def process_args():
     parser.add_argument('--num_latents', type=int, default=32, help='num_latents')
     parser.add_argument("--mode", type=str, default="train", help="options: 'train', 'load'")
     parser.add_argument("--output_dir", type=str, default="examples", help="output directory")
+    parser.add_argument("--dataset", type=str, default="mnist", help="mnist, fashion")
     args = parser.parse_args()
     return args
 
@@ -87,10 +88,19 @@ def full_batch_em_epoch(pc, train_loader, test_loader, device):
 def main(args):
     torch.cuda.set_device(args.cuda)
     device = torch.device(f"cuda:{args.cuda}")
-    filename = f"{args.output_dir}/mnist_{args.num_latents}.torch"
+    filename = f"{args.output_dir}/{args.dataset}_{args.num_latents}.torch"
     
-    train_dataset = torchvision.datasets.MNIST(root = "./examples/data", train = True, download = True)
-    test_dataset = torchvision.datasets.MNIST(root = "./examples/data", train = False, download = True)
+
+    if args.dataset == "mnist":
+        train_dataset = torchvision.datasets.MNIST(root = "./examples/data", train = True, download = True)
+        test_dataset = torchvision.datasets.MNIST(root = "./examples/data", train = False, download = True)
+    elif args.dataset == "fashion":
+        train_dataset = torchvision.datasets.FashionMNIST(root = "./examples/data", train = True, download = True)
+        test_dataset = torchvision.datasets.FashionMNIST(root = "./examples/data", train = False, download = True)
+    else:
+        raise(f"Dataset {args.dataset} not supported.")
+    
+    
     train_data = train_dataset.data.reshape(60000, 28*28)
     test_data = test_dataset.data.reshape(10000, 28*28)
 
