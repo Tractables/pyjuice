@@ -9,10 +9,6 @@ from typing import List, Dict
 
 from pyjuice.graph.region_graph import RegionGraph, InputRegionNode
 from pyjuice.layer.input_layer import InputLayer
-from pyjuice.functional import normalize_parameters
-
-# Try to enable tensor cores
-torch.set_float32_matmul_precision('high')
 
 
 class CategoricalLayer(InputLayer, nn.Module):
@@ -125,58 +121,6 @@ class CategoricalLayer(InputLayer, nn.Module):
             self._normalize_parameters(flows, pseudocount = pseudocount)
             self.params.data = (1.0 - step_size) * self.params.data + step_size * flows
 
-    def _normalize_parameters(self, params, pseudocount: float = 0.0):
-        normalize_parameters(params, self.node_ids, self.node_nchs, pseudocount)
-
-    @staticmethod
-    @triton.jit
-    def _cum_params_kernel(params_ptr, cum_params_ptr, node_ids_ptr, tot_num_params, BLOCK_SIZE: tl.constexpr):
-        pid = tl.program_id(axis = 0)
-        block_start = pid * BLOCK_SIZE
-
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < tot_num_params
-
-        n_offsets = tl.load(node_ids_ptr + offsets, mask = mask, other = 0)
-
-        params = tl.load(params_ptr + offsets, mask = mask, other = 0)
-
-        tl.atomic_add(cum_params_ptr + n_offsets, params, mask = mask)
-
-    @staticmethod
-    @triton.jit
-    def _norm_params_kernel(params_ptr, cum_params_ptr, node_ids_ptr, node_nchs_ptr, tot_num_params, 
-                            pseudocount, BLOCK_SIZE: tl.constexpr):
-        pid = tl.program_id(axis = 0)
-        block_start = pid * BLOCK_SIZE
-
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < tot_num_params
-
-        n_offsets = tl.load(node_ids_ptr + offsets, mask = mask, other = 0)
-
-        params = tl.load(params_ptr + offsets, mask = mask, other = 0)
-        cum_params = tl.load(cum_params_ptr + n_offsets, mask = mask, other = 1)
-        nchs = tl.load(node_nchs_ptr + n_offsets, mask = mask, other = 1)
-
-        normed_params = (params + pseudocount / nchs) / (cum_params + pseudocount)
-        tl.store(params_ptr + offsets, normed_params, mask = mask)
-
-    @staticmethod
-    @triton.jit
-    def _flows_kernel(param_flows_ptr, node_flows_ptr, param_ids_ptr, layer_num_nodes, tot_num_nodes, batch_size, node_offset, BLOCK_SIZE: tl.constexpr):
-        pid = tl.program_id(axis = 0)
-        block_start = pid * BLOCK_SIZE
-
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < layer_num_nodes * batch_size
-
-        nf_offsets = batch_size * node_offset + offsets
-        pr_offsets = tl.load(param_ids_ptr + offsets, mask = mask, other = 0)
-
-        nflow = tl.load(node_flows_ptr + nf_offsets, mask = mask, other = 0)
-        tl.atomic_add(param_flows_ptr + pr_offsets, nflow, mask = mask)
-
     def _init_params(self, perturbation: float = 4.0):
         """
         Initialize the parameters with random values
@@ -207,76 +151,12 @@ class CategoricalLayer(InputLayer, nn.Module):
         self.params.requires_grad = False
 
     def _extract_params_to_rnodes(self):
-        n_start = 0
-        for idx, rnode in enumerate(self.region_nodes):
-            n_end = n_start + rnode.num_nodes
-
-            if idx == 0:
-                par_start = 0
-                par_end = self.param_ends[n_end-1]
-
-                param_ends = self.param_ends[0:n_end]
-            else:
-                par_start = self.param_ends[n_start-1]
-                par_end = self.param_ends[n_end-1]
-
-                param_ends = self.param_ends[n_start:n_end] - par_start
-
-            rnode._params = {
-                "params": self.params.data[par_start:par_end].detach().cpu().clone(),
-                "param_ends": param_ends.detach().cpu().clone()
-            }
-
-            n_start = n_end
+        raise NotImplementedError()
 
     @staticmethod
     def _prune_nodes(_params: Dict, node_keep_flag: torch.Tensor):
-        kept_nodes = torch.where(node_keep_flag)[0]
-        num_nodes = node_keep_flag.sum().item()
-
-        old_n_params = torch.zeros_like(_params["param_ends"])
-        old_n_params[0] = _params["param_ends"][0]
-        old_n_params[1:] = _params["param_ends"][1:] - _params["param_ends"][:-1]
-
-        param_ends = torch.cumsum(old_n_params[node_keep_flag], dim = 0)
-
-        params = torch.zeros([param_ends[-1]], dtype = torch.float32)
-        for idx in range(num_nodes):
-            oidx = kept_nodes[idx]
-            if oidx == 0:
-                ops, ope = 0, _params["param_ends"][0]
-            else:
-                ops, ope = _params["param_ends"][oidx-1], _params["param_ends"][oidx]
-
-            if idx == 0:
-                ps, pe = 0, param_ends[0]
-            else:
-                ps, pe = param_ends[idx-1], param_ends[idx]
-
-            params[ps:pe] = _params["params"][ops:ope]
-
-        return {"params": params, "param_ends": param_ends}
+        raise NotImplementedError()
 
     @staticmethod
     def _duplicate_nodes(_params: Dict):
-        num_nodes = _params["param_ends"].size(0)
-        num_params = _params["params"].size(0)
-
-        params = torch.zeros([num_params * 2])
-        par_start = 0
-        for idx in range(num_nodes):
-            if idx == 0:
-                np = _params["param_ends"][0]
-            else:
-                np = _params["param_ends"][idx] - _params["param_ends"][idx-1]
-
-            params[par_start*2:par_start*2+np] = _params["params"][par_start:par_start+np]
-            params[par_start*2+np:par_start*2+np*2] = _params["params"][par_start:par_start+np]
-
-            par_start += np
-
-        param_ends = _params["param_ends"].view(-1, 1).repeat(1, 2).reshape(-1) * 2
-        param_ends[2::2] -= _params["param_ends"][1:] - _params["param_ends"][:-1]
-        param_ends[0] -= _params["param_ends"][0]
-
-        return {"params": params, "param_ends": param_ends}
+        raise NotImplementedError()

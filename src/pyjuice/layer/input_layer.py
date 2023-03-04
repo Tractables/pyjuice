@@ -28,6 +28,11 @@ class InputLayer(Layer):
         self.param_flows = None
 
         self.device = torch.device("cpu")
+    
+    def to(self, device):
+        nn.Module.to(device = device)
+
+        self.device = device
 
     def init_param_flows(self, flows_memory: float = 0.0):
         if self.param_flows is None:

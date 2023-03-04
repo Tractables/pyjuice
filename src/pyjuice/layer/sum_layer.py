@@ -148,12 +148,16 @@ class SumLayer(Layer,nn.Module):
         self.register_buffer("seq_ids1", seq_ids1)
         self.register_buffer("seq_parpids", seq_parpids)
 
-    def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor, sum_region_mars: Optional[torch.tensor] = None, skip_logsumexp: bool = False):
+    def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor, 
+                sum_region_mars: Optional[torch.tensor] = None, skip_logsumexp: bool = False):
         """
         node_mars: [num_nodes, B]
         element_mars: [max_num_els, B]
-        params: [num_params, B]
+        params: [num_params, B] or [num_params]
         """
+        if params.dim() == 1:
+            params = params.unsqueeze(1)
+
         if skip_logsumexp:
             self._dense_forward_pass_nolog(node_mars, element_mars, params, sum_region_mars)
         else:
@@ -168,8 +172,11 @@ class SumLayer(Layer,nn.Module):
         element_flows: [max_num_els, B]
         node_mars: [num_nodes, B]
         element_mars: [max_num_els, B]
-        params: [num_params, B]
+        params: [num_params, B] or [num_params]
         """
+        if params.dim() == 1:
+            params = params.unsqueeze(1)
+
         if skip_logsumexp:
             self._dense_backward_pass_nolog(node_flows, element_flows, node_mars, element_mars, params, param_flows = param_flows, sum_region_mars=sum_region_mars)
         else:
@@ -179,14 +186,14 @@ class SumLayer(Layer,nn.Module):
     def _dense_forward_pass(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor):
         ch_mars = element_mars[self.cids]
         maxval = ch_mars.max(dim = 1, keepdim = True).values
-        node_mars[self.nrange[0]:self.nrange[1]] = (((ch_mars - maxval).exp() * params[self.pids].unsqueeze(-1)).sum(
-            dim = 1).clamp(min=1e-10)).log() + maxval.squeeze()
+        node_mars[self.nrange[0]:self.nrange[1]] = (((ch_mars - maxval).exp() * params[self.pids]).sum(
+            dim = 1).clamp(min=1e-10)).log() + maxval.squeeze(1)
 
         return None
     
     @torch.compile(mode = "reduce-overhead")
     def _dense_forward_pass_nolog(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor, sum_region_mars: torch.tensor):
-        node_mars[self.nrange[0]:self.nrange[1]] = (element_mars[self.cids] * params[self.pids].unsqueeze(-1)).sum(dim = 1)
+        node_mars[self.nrange[0]:self.nrange[1]] = (element_mars[self.cids] * params[self.pids]).sum(dim = 1)
         sum_region_mars.index_add_(0, self.sum_region_ids, node_mars[self.nrange[0]:self.nrange[1]], alpha=1.0)
         node_mars[self.nrange[0]:self.nrange[1]] = node_mars[self.nrange[0]:self.nrange[1]].div(sum_region_mars[self.sum_region_ids])
 
@@ -196,12 +203,16 @@ class SumLayer(Layer,nn.Module):
     @torch.compile(mode = "reduce-overhead")
     def _dense_backward_pass(self, node_flows: torch.Tensor, element_flows: torch.Tensor, node_mars: torch.Tensor, 
                              element_mars: torch.Tensor, params: torch.Tensor, param_flows: Optional[torch.Tensor] = None):
-        element_flows[1:self.ch_prod_layer_size] = (node_flows[self.parids] * params[self.parpids].unsqueeze(2) * \
+        element_flows[1:self.ch_prod_layer_size] = (node_flows[self.parids] * params[self.parpids] * \
             (element_mars[1:self.ch_prod_layer_size].unsqueeze(1) - node_mars[self.parids]).exp()).sum(dim = 1)
 
         if param_flows is not None:
-            param_flows[self.seq_parpids] += (node_flows[self.parids] * params[self.parpids].unsqueeze(2) * \
-                (element_mars[1:self.ch_prod_layer_size].unsqueeze(1) - node_mars[self.parids]).exp()).sum(dim = 2)[self.seq_ids0, self.seq_ids1]
+            if params.size(1) == 1:
+                param_flows[self.seq_parpids] += (node_flows[self.parids] * params[self.parpids] * \
+                    (element_mars[1:self.ch_prod_layer_size].unsqueeze(1) - node_mars[self.parids]).exp()).sum(dim = 2)[self.seq_ids0, self.seq_ids1]
+            else:
+                param_flows[self.seq_parpids] += (node_flows[self.parids] * params[self.parpids] * \
+                    (element_mars[1:self.ch_prod_layer_size].unsqueeze(1) - node_mars[self.parids]).exp())[self.seq_ids0, self.seq_ids1]
 
         return None
     
@@ -213,11 +224,11 @@ class SumLayer(Layer,nn.Module):
                                         sum_region_mars: torch.tensor,
                                         param_flows: Optional[torch.Tensor] = None):
         
-        element_flows[1:self.ch_prod_layer_size] = (node_flows[self.parids] * params[self.parpids].unsqueeze(2) * \
+        element_flows[1:self.ch_prod_layer_size] = (node_flows[self.parids] * params[self.parpids] * \
             (element_mars[1:self.ch_prod_layer_size].unsqueeze(1) / node_mars[self.parids] )).sum(dim = 1)
 
         if param_flows is not None:
-            param_flows[self.seq_parpids] += (node_flows[self.parids] * params[self.parpids].unsqueeze(2) * \
+            param_flows[self.seq_parpids] += (node_flows[self.parids] * params[self.parpids] * \
                 (element_mars[1:self.ch_prod_layer_size].unsqueeze(1) / node_mars[self.parids] )).sum(dim = 2)[self.seq_ids0, self.seq_ids1]
 
         return None

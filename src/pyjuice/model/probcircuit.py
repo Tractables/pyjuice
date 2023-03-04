@@ -7,8 +7,11 @@ import triton
 import triton.language as tl
 from functools import partial
 from typing import Optional, Sequence
+
 from pyjuice.graph import RegionGraph, InputRegionNode, InnerRegionNode, PartitionNode, truncate_npartition
 from pyjuice.layer import Layer, InputLayer, ProdLayer, SumLayer
+from pyjuice.functional import normalize_parameters, flat_softmax_fw, flat_softmax_bp
+from pyjuice.utils.grad_fns import ReverseGrad
 
 def _pc_model_backward_hook(grad, pc):
     pc.backward(
@@ -16,11 +19,15 @@ def _pc_model_backward_hook(grad, pc):
         compute_param_flows = pc._optim_hyperparams["compute_param_flows"], 
         flows_memory = pc._optim_hyperparams["flows_memory"]
     )
+
     for i in range(len(pc._inputs)):
         if pc._inputs[i] is not None:
             if pc._inputs[i].requires_grad and pc._inputs_grad[i] is not None:
                 pc._inputs[i].backward(pc._inputs_grad[i])
             pc._inputs[i] = None
+
+    pc._backward_buffer.clear()
+
     return None
 
 class ProbCircuit(nn.Module):
@@ -45,22 +52,23 @@ class ProbCircuit(nn.Module):
 
         self._inputs = [None, None]
         self._inputs_grad = [None, None]
+        self._backward_buffer = dict()
 
         self._optim_hyperparams = {
             "compute_param_flows": True,
             "flows_memory": 0.0
         }
 
+        self._used_external_sum_params = False
+
     def forward(self, inputs: torch.Tensor, params: Optional[torch.Tensor] = None):
         self.node_mars = torch.empty([self.num_nodes, inputs.size(0)], device = self.device)
         self.element_mars = torch.empty([self.num_elements, inputs.size(0)], device = self.device)
-        
 
         if self.skip_logsumexp:
-            self.sum_region_mars = torch.empty([self.num_sum_regions, inputs.size(0)], device=inputs.device)
+            self.sum_region_mars = torch.zeros([self.num_sum_regions, inputs.size(0)], device = inputs.device)
             self.node_mars[0,:] = 1.0
             self.element_mars[0,:] = 0.0
-            self.sum_region_mars[:, :] = 0.0
         else:
             self.node_mars[0,:] = 0.0
             self.element_mars[0,:] = -torch.inf
@@ -68,7 +76,18 @@ class ProbCircuit(nn.Module):
         if params is None:
             params = self.params
         else:
-            self._inputs[1] = params
+            if params.dim() == 2:
+                if params.size(1) == self.num_sum_params:
+                    params = params.permute(1, 0)
+                else:
+                    assert params.size(0) == self.num_sum_params, "Size of `params` does not match the number of sum parameters."
+
+            self._inputs[1] = ReverseGrad.apply(params)
+
+            # normalize
+            params = flat_softmax_fw(logits = params, node_ids = self.node_ids, inplace = False)
+            params[0] = 1.0
+            self._backward_buffer["normalized_params"] = params
 
         with torch.no_grad():
             for layer in self.input_layers:
@@ -83,7 +102,7 @@ class ProbCircuit(nn.Module):
                     raise ValueError(f"Unknown layer type {ltype}.")
                 
         if self.skip_logsumexp:
-           lls = self.node_mars[-1,:] + self.sum_region_mars.log().sum(dim=0)
+           lls = self.node_mars[-1,:] + self.sum_region_mars.log().sum(dim = 0)
         else:
             lls = self.node_mars[-1,:]
 
@@ -102,18 +121,18 @@ class ProbCircuit(nn.Module):
         self.node_flows = torch.zeros([self.num_nodes, self.node_mars.size(1)], device = self.device)
         self.element_flows = torch.zeros([self.num_elements, self.node_mars.size(1)], device = self.device)
 
-        if compute_param_flows:
-            self.init_param_flows(flows_memory = flows_memory)
-
         if ll_weights is None:
             self.node_flows[-1,:] = 1.0
         else:
             self.node_flows[-1,:] = ll_weights.squeeze()
 
         if self._inputs[1] is not None:
-            params = self._inputs[1]
+            params = self._backward_buffer["normalized_params"]
         else:
             params = self.params
+
+        if compute_param_flows:
+            self.init_param_flows(flows_memory = flows_memory, batch_size = params.size(1) if params.dim() == 2 else 1)
 
         with torch.no_grad():
             for layer_id in range(len(self.inner_layers) - 1, -1, -1):
@@ -125,10 +144,10 @@ class ProbCircuit(nn.Module):
                 elif ltype == "sum":
                     self.inner_layers[layer_id-1][1].forward(self.node_mars, self.element_mars, skip_logsumexp=self.skip_logsumexp)
                         
-                    if compute_param_flows:
-                        layer.backward(self.node_flows, self.element_flows, self.node_mars, self.element_mars, params, param_flows = self.param_flows, skip_logsumexp=self.skip_logsumexp, sum_region_mars=self.sum_region_mars)
-                    else:
-                        layer.backward(self.node_flows, self.element_flows, self.node_mars, self.element_mars, params, skip_logsumexp=self.skip_logsumexp, sum_region_mars=self.sum_region_mars)
+                    layer.backward(self.node_flows, self.element_flows, self.node_mars, self.element_mars, params, 
+                                   param_flows = self.param_flows if compute_param_flows else None, 
+                                   skip_logsumexp = self.skip_logsumexp, 
+                                   sum_region_mars = self.sum_region_mars)
 
                 else:
                     raise ValueError(f"Unknown layer type {ltype}.")
@@ -140,26 +159,54 @@ class ProbCircuit(nn.Module):
                 for layer in self.input_layers:
                     layer.backward(inputs.permute(1, 0), self.node_flows)
 
+            if self._inputs[1] is not None:
+                B = self._inputs[0].size(0)
+
+                # Below computes the parameter gradients derived from flows
+                # grads = self.param_flows / params / B
+                # grads[0] = 0.0
+                # self._inputs_grad[1] = flat_softmax_bp(grads, params, self.node_ids, log_param_grad = False, inplace = False)
+
+                # However, using the gradients directly generally leads to slow convergence
+                # Instead, we use a scaled version of the gradient, as shown below
+                flows = self.param_flows
+                self._normalize_parameters(flows, pseudocount = self._pseudocount)
+                flows[0] = 1.0
+                grads = 0.5 * (torch.log(flows) - torch.log(params))
+                self._inputs_grad[1] = flat_softmax_bp(grads, params, self.node_ids, log_param_grad = True, inplace = False)
+
+                self._used_external_sum_params = True
+            else:
+                self._used_external_sum_params = False
+
         return None
 
     def mini_batch_em(self, step_size: float, pseudocount: float = 0.0):
         for layer in self.input_layers:
             layer.mini_batch_em(step_size = step_size, pseudocount = pseudocount)
         
-        with torch.no_grad():
-            flows = self.param_flows
-            self._normalize_parameters(flows, pseudocount = pseudocount)
-            self.params.data = (1.0 - step_size) * self.params.data + step_size * flows
-            self.params[0] = 1.0
+        # Only apply parameter update if external parameters are not used in the previous forward/backward pass
+        if not self._used_external_sum_params:
+            with torch.no_grad():
+                flows = self.param_flows
+                self._normalize_parameters(flows, pseudocount = pseudocount)
+                self.params.data = (1.0 - step_size) * self.params.data + step_size * flows
+                self.params[0] = 1.0
 
     def cumulate_flows(self, inputs: torch.Tensor, params: Optional[torch.Tensor] = None):
         with torch.no_grad():
             self.forward(inputs, params)
             self.backward(inputs = inputs, compute_param_flows = True, flows_memory = 1.0)
 
-    def init_param_flows(self, flows_memory: float = 0.0):
-        if self.param_flows is None or self.param_flows.size(0) != self.params.size(0):
-            self.param_flows = torch.zeros([self.params.size(0)], device = self.device)
+    def init_param_flows(self, flows_memory: float = 0.0, batch_size: int = 1):
+        if self.param_flows is None or self.param_flows.size(0) != self.params.size(0) \
+                or (self.param_flows.dim() == 1 and batch_size > 1) \
+                or (self.param_flows.dim() == 2 and batch_size != self.param_flows.size(1)):
+            if batch_size == 1:
+                shape = [self.params.size(0)]
+            else:
+                shape = [self.params.size(0), batch_size]
+            self.param_flows = torch.zeros(shape, device = self.device)
         else:
             assert self.param_flows.size(0) == self.params.size(0)
             self.param_flows[:] *= flows_memory
@@ -231,10 +278,10 @@ class ProbCircuit(nn.Module):
 
                 # Sum layer
                 sum_layer = SumLayer(layer_id, depth2rnodes[depth]["sum"],
-                                        cum_nodes = num_nodes, 
-                                        param_ends = param_ends, 
-                                        ch_prod_layer_size = prod_layer.num_nodes + 1,
-                                        sum_region_start_id = num_sum_regions)
+                                     cum_nodes = num_nodes, 
+                                     param_ends = param_ends, 
+                                     ch_prod_layer_size = prod_layer.num_nodes + 1,
+                                     sum_region_start_id = num_sum_regions)
 
                 num_nodes += sum_layer.num_nodes
                 num_sum_regions += len(depth2rnodes[depth]["sum"])
@@ -249,8 +296,9 @@ class ProbCircuit(nn.Module):
         self.num_sum_regions = num_sum_regions
 
         # For parameter normalization
+        # Node that input nodes are implicitly omitted as they have no child
         node_ids = torch.empty([self.num_inner_params], dtype = torch.long)
-        node_nchs = torch.empty([self.num_nodes], dtype = torch.long)
+        node_nchs = torch.empty([len(self.param_ends)], dtype = torch.long)
         node_ids[:self.param_ends[0]] = 0
         node_nchs[0] = self.param_ends[0]
         for i in range(1, len(self.param_ends)):
@@ -284,39 +332,7 @@ class ProbCircuit(nn.Module):
             layer._init_params(perturbation)
 
     def _normalize_parameters(self, params, pseudocount: float = 0.0):
-        if self.node_ids.is_cuda:
-            assert params.is_cuda, "Input `params` should be on GPU."
-
-            cum_params = torch.zeros([self.num_nodes], dtype = torch.float32, device = self.device)
-
-            grid1 = lambda meta: (triton.cdiv(self.num_inner_params, meta['BLOCK_SIZE']),)
-            grid2 = lambda meta: (triton.cdiv(self.num_inner_params, meta['BLOCK_SIZE']),)
-
-            self._cum_params_kernel[grid1](params, cum_params, self.node_ids, self.num_inner_params, BLOCK_SIZE = 1024)
-            self._norm_params_kernel[grid2](params, cum_params, self.node_ids, self.node_nchs, self.num_inner_params, 
-                                            pseudocount, BLOCK_SIZE = 1024)
-
-        else:
-            with torch.no_grad():
-                param_ids = torch.arange(0, self.num_inner_params, dtype = torch.long, device = params.device)
-
-                cum_matrix1 = torch.sparse_coo_tensor(
-                    torch.stack((self.node_ids, param_ids), dim = 0), 
-                    params.view(-1), (len(self.param_ends), self.num_inner_params)
-                )
-                node_buffer = torch.sparse.mm(cum_matrix1, torch.ones([self.num_inner_params, 1], dtype = torch.float32, device = params.device))
-
-                node_buffer.reciprocal_()
-
-                cum_matrix2 = torch.sparse_coo_tensor(
-                    torch.stack((param_ids, self.node_ids), dim = 0), 
-                    params.view(-1), (self.num_inner_params, len(self.param_ends))
-                )
-                params_buffer = torch.sparse.mm(cum_matrix2, node_buffer)
-
-                params.data[:] = params_buffer[:,0]
-
-        return None
+        normalize_parameters(params, self.node_ids, self.node_nchs, pseudocount)
 
     @staticmethod
     @triton.jit
