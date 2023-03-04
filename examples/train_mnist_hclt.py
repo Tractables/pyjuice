@@ -59,7 +59,6 @@ def mini_batch_em_epoch(num_epochs, pc, optimizer, scheduler, train_loader, test
         test_ll = evaluate(pc, loader=test_loader)
         t2 = time.time()
 
-        test_ll /= len(test_loader)
         print(f"[Epoch {epoch}][train LL: {train_ll:.2f}; test LL: {test_ll:.2f}].....[train forward+backward+step {t1-t0:.2f}; test forward {t2-t1:.2f}] ")
 
 
@@ -124,8 +123,11 @@ def main(args):
         mini_batch_em_epoch(350, pc, optimizer, scheduler, train_loader, test_loader, device)
         full_batch_em_epoch(pc, train_loader, test_loader, device)
         
-        print(f"Saving into {filename}")
+        print(f"Saving pc into {filename}.....", end="")
+        t0_save = time.time()
         torch.save(pc, filename)
+        t1_save = time.time()
+        print(f"took {t1_save - t0_save:2.f} (s)")
 
     elif args.mode == "load":
         print("===========================LOAD===============================")
