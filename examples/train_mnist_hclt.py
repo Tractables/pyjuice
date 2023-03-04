@@ -147,8 +147,8 @@ def main(args):
         test_ll = evaluate(pc, loader=test_loader)
         t2 = time.time()
 
-        train_bpd = train_ll / (28*28 * np.log(2))
-        test_bpd = test_ll / (28*28 * np.log(2))
+        train_bpd = -train_ll / (28*28 * np.log(2))
+        test_bpd = -test_ll / (28*28 * np.log(2))
 
         print(f"Compilation+test took {t0-t_compile:.2f} (s); train_ll {t1-t0:.2f} (s); test_ll {t2-t1:.2f} (s)")
         print(f"train_ll: {train_ll:.2f}, test_ll: {test_ll:.2f}")
