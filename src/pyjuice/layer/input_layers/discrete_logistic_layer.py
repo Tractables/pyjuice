@@ -5,13 +5,21 @@ import torch.nn as nn
 import torch.nn.functional as F
 import triton
 import triton.language as tl
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 from pyjuice.graph.region_graph import RegionGraph, InputRegionNode
 from pyjuice.layer.input_layer import InputLayer
+from pyjuice.utils.grad_fns import ReverseGrad
 
 
-class CategoricalLayer(InputLayer, nn.Module):
+"""
+Implementation of discretized Logistic distribution (https://en.wikipedia.org/wiki/Logistic_distribution)
+Required parameters from the region nodes:
+    input_range (Tuple[float, float]): range of the inputs
+    bin_size (Optional[float]): size of every input bin
+    bin_count (Optional[int]): number of input bins
+"""
+class DiscreteLogisticLayer(InputLayer, nn.Module):
     def __init__(self, layer_id: int, region_nodes: List[RegionGraph], cum_nodes: int = 0) -> None:
         nn.Module.__init__(self)
 
@@ -21,134 +29,206 @@ class CategoricalLayer(InputLayer, nn.Module):
 
         self.vars = []
         self.rnode_num_nodes = []
-        self.rnode_num_cats = []
-        self.param_ends = []
+        self.rnode_input_range = []
+        self.rnode_bin_sizes = []
         layer_num_nodes = 0
-        cum_params = 0
-        num_nodes = 0
         for rnode in self.region_nodes:
-            assert len(rnode.scope) == 1, "CategoricalLayer only support uni-variate categorical distributions."
+            assert len(rnode.scope) == 1, "DiscreteLogisticLayer only support uni-variate categorical distributions."
 
             self.vars.append(next(iter(rnode.scope)))
             self.rnode_num_nodes.append(rnode.num_nodes)
-            self.rnode_num_cats.append(rnode.extra_params["num_cats"])
-
-            num_nodes += rnode.num_nodes
+            self.rnode_input_range.append(
+                [rnode.extra_params["input_range"][0], rnode.extra_params["input_range"][1]]
+            )
+            if "bin_size" in rnode.extra_params:
+                self.rnode_bin_sizes.append(rnode.extra_params["bin_size"])
+            elif "bin_count" in rnode.extra_params:
+                self.rnode_bin_sizes.append(
+                    (self.rnode_input_range[-1][1] - self.rnode_input_range[-1][0]) / rnode.extra_params["bin_count"]
+                )
+            else:
+                raise ValueError("Either `bin_size` or `bin_count` should be provided in the input region node.")
 
             rnode._output_ind_range = (cum_nodes, cum_nodes + rnode.num_nodes)
             cum_nodes += rnode.num_nodes
             layer_num_nodes += rnode.num_nodes
 
-            for nid in range(1, rnode.num_nodes + 1):
-                self.param_ends.append(cum_params + rnode.extra_params["num_cats"] * nid)
-            cum_params += rnode.num_nodes * rnode.extra_params["num_cats"]
-
         self._output_ind_range = (cum_nodes - layer_num_nodes, cum_nodes)
-        self.param_ends = torch.tensor(self.param_ends)
 
-        self.num_params = cum_params
         self.num_nodes = num_nodes
 
+        d2vids = torch.empty([self.num_regions], dtype = torch.long)
+        vrangeslow = torch.tensor([r[0] for r in self.rnode_input_range])
+        vrangeshigh = torch.tensor([r[1] for r in self.rnode_input_range])
+        vhbinsizes = torch.tensor(self.rnode_bin_sizes) / 2.0
         vids = torch.empty([layer_num_nodes], dtype = torch.long)
-        psids = torch.empty([layer_num_nodes], dtype = torch.long)
         n_start = 0
         for idx, rnode in enumerate(self.region_nodes):
             n_end = n_start + rnode.num_nodes
-            vids[n_start:n_end] = self.vars[idx]
 
-            if idx == 0:
-                psids[0] = 0
-                psids[1:n_end] = torch.tensor(self.param_ends[0:n_end-1])
-            else:
-                psids[n_start:n_end] = torch.tensor(self.param_ends[n_start-1:n_end-1])
+            d2vids[idx] = self.vars[idx]
+            vids[n_start:n_end] = idx
 
             n_start = n_end
 
+        self.register_buffer("d2vids", d2vids)
+        self.register_buffer("vrangeslow", vrangeslow.unsqueeze(1))
+        self.register_buffer("vrangeshigh", vrangeshigh.unsqueeze(1))
+        self.register_buffer("vhbinsizes", vhbinsizes.unsqueeze(1))
         self.register_buffer("vids", vids)
-        self.register_buffer("psids", psids)
-
-        # For parameter normalization
-        node_ids = torch.empty([self.num_params], dtype = torch.long)
-        node_nchs = torch.empty([self.num_nodes], dtype = torch.long)
-        node_ids[:self.param_ends[0]] = 0
-        node_nchs[0] = self.param_ends[0]
-        for i in range(1, len(self.param_ends)):
-            node_ids[self.param_ends[i-1]:self.param_ends[i]] = i
-            node_nchs[i] = self.param_ends[i] - self.param_ends[i-1]
-        
-        self.register_buffer("node_ids", node_ids)
-        self.register_buffer("node_nchs", node_nchs)
 
         # Initialize parameters
         self._init_params()
 
-        self.param_flows_size = self.params.size(0)
+        self.param_flows_size = self.mus.size(0) * 2
 
-    @torch.compile(mode = "reduce-overhead")
-    def forward(self, data: torch.Tensor, node_mars: torch.Tensor, skip_logsumexp: bool = False):
+        # Buffers for backward pass
+        self._backward_buffer = dict()
+
+        # Batch size of parameters in the previous forward pass
+        self._param_batch_size = 1
+
+    def forward(self, data: torch.Tensor, node_mars: torch.Tensor, params: Optional[Dict] = None, skip_logsumexp: bool = False):
         """
         data: [num_vars, B]
         node_mars: [num_nodes, B]
         """
-        sid, eid = self._output_ind_range[0], self._output_ind_range[1]
-        if skip_logsumexp:
-            node_mars[sid:eid,:] = ((self.params[data[self.vids] + self.psids.unsqueeze(1)] + 1e-8).clamp(min=1e-10))
+        super(DiscreteLogisticLayer, self).forward(params is not None)
+
+        B = data.size(1)
+
+        if params is None:
+            mus = self.mus
+            log_scales = self.log_scales
         else:
-            node_mars[sid:eid,:] = ((self.params[data[self.vids] + self.psids.unsqueeze(1)] + 1e-8).clamp(min=1e-10)).log()
+            mus = params["mus"]
+            log_scales = params["log_scales"]
+
+        if mus.dim() == 1:
+            mus = mus.unsqueeze(1)
+            log_scales = log_scales.unsqueeze(1)
+
+        log_scales = log_scales.clip(min = -5.0)
+
+        self._param_batch_size = mus.size(1)
+
+        l_boundaries = torch.empty([self.num_nodes, B], dtype = torch.float32, device = data.device)
+        r_boundaries = torch.empty([self.num_nodes, B], dtype = torch.float32, device = data.device)
+
+        if skip_logsumexp:
+            raise NotImplementedError()
+        else:
+            self._dense_forward_pass(data, node_mars, mus, log_scales, l_boundaries, r_boundaries)
 
         return None
 
-    def backward(self, data: torch.Tensor, node_flows: torch.Tensor):
+    def backward(self, data: torch.Tensor, node_flows: torch.Tensor, node_mars: torch.Tensor, params: Optional[Dict] = None):
         """
         data: [num_vars, B]
         node_flows: [num_nodes, B]
+        node_mars: [num_nodes, B]
         """
-        layer_num_nodes = self._output_ind_range[1] - self._output_ind_range[0]
-        tot_num_nodes = node_flows.size(0)
-        batch_size = node_flows.size(1)
-        node_offset = self._output_ind_range[0]
+        B = data.size(1)
 
-        param_ids = data[self.vids] + self.psids.unsqueeze(1)
+        if params is None:
+            mus = self.mus
+            log_scales = self.log_scales
+        else:
+            mus = params["mus"]
+            log_scales = params["log_scales"]
+
+        if mus.dim() == 1:
+            mus = mus.unsqueeze(1)
+            log_scales = log_scales.unsqueeze(1)
         
-        grid = lambda meta: (triton.cdiv(layer_num_nodes * batch_size, meta['BLOCK_SIZE']),)
-        self._flows_kernel[grid](self.param_flows, node_flows, param_ids, layer_num_nodes, tot_num_nodes, batch_size, node_offset, BLOCK_SIZE = 1024)
+        self._dense_backward_pass(data, node_flows, node_mars, mus, log_scales)
+
+        self._backward_buffer.clear()
         
         return None
 
     def mini_batch_em(self, step_size: float, pseudocount: float = 0.0):
-        with torch.no_grad():
-            flows = self.param_flows
-            self._normalize_parameters(flows, pseudocount = pseudocount)
-            self.params.data = (1.0 - step_size) * self.params.data + step_size * flows
+        if not self._used_external_params:
+            with torch.no_grad():
+                flows = self.param_flows
+                if flows is None:
+                    return None
+                self.mus.data += step_size * flows[:self.mus.size(0)]
+                self.log_scales.data += step_size * flows[self.mus.size(0):] / torch.norm(flows[self.mus.size(0):]).clip(min = 5.0) * 5.0
 
-    def _init_params(self, perturbation: float = 4.0):
+                self.mus.data.clamp(min = 0.0, max = 1.0)
+                self.log_scales.data.clamp(min = -4.0, max = 2.0)
+
+    def get_param_specs(self):
+        return {"mus": torch.Size([self.mus.size(0)]), "log_scales": torch.Size([self.log_scales.size(0)])}
+
+    def _dense_forward_pass(self, data: torch.Tensor, node_mars: torch.Tensor, mus: torch.Tensor, log_scales: torch.Tensor,
+                            l_boundaries: torch.Tensor, r_boundaries: torch.Tensor):
+        sid, eid = self._output_ind_range[0], self._output_ind_range[1]
+
+        scaled_data = (data[self.d2vids] - self.vrangeslow) / (self.vrangeshigh - self.vrangeslow)
+        l_b = ((scaled_data[self.vids] - self.vhbinsizes[self.vids] - mus) / log_scales.exp()).detach()
+        r_b = ((scaled_data[self.vids] + self.vhbinsizes[self.vids] - mus) / log_scales.exp()).detach()
+        with torch.enable_grad():
+            l_b.requires_grad = True
+            r_b.requires_grad = True
+            l_b.retain_grad()
+            r_b.retain_grad()
+
+            self._backward_buffer["l_b"] = l_b
+            self._backward_buffer["r_b"] = r_b
+
+            mars = self._log_min_exp(F.logsigmoid(r_b), F.logsigmoid(l_b))
+
+            self._backward_buffer["mars"] = mars
+
+        node_mars[sid:eid,:] = mars
+
+        return None
+
+    def _dense_backward_pass(self, data: torch.Tensor, node_flows: torch.Tensor, node_mars: torch.Tensor, mus: torch.Tensor, log_scales: torch.Tensor):
+        sid, eid = self._output_ind_range[0], self._output_ind_range[1]
+
+        maxval = node_mars[sid:eid,:].max(dim = 0)[0]
+        grads = node_flows[sid:eid,:] / (node_mars[sid:eid,:] - maxval.unsqueeze(0)).exp()
+
+        self._backward_buffer["mars"].backward(grads)
+
+        l_b, r_b = self._backward_buffer["l_b"], self._backward_buffer["r_b"]
+
+        if self.param_flows.dim() == 1:
+            self.param_flows[:self.num_nodes] = (-(l_b.grad + r_b.grad) / log_scales.exp()).sum(dim = 1)
+            self.param_flows[self.num_nodes:] = -(l_b.grad * l_b.data + r_b.grad * r_b.data).sum(dim = 1)
+        else:
+            self.param_flows[:self.num_nodes,:] = -(l_b.grad + r_b.grad) / log_scales.exp()
+            self.param_flows[self.num_nodes:,:] = -(l_b.grad * l_b.data + r_b.grad * r_b.data)
+
+        return None
+
+    @staticmethod
+    def _log_min_exp(a: torch.Tensor, b: torch.Tensor, epsilon = 1e-8):
+        return a + torch.log(1 - torch.exp(b - a) + epsilon)
+
+    @staticmethod
+    def _log_min_exp_grad(grad: torch.Tensor, a: torch.Tensor, b: torch.Tensor, epsilon = 1e-8):
+        exp_min = torch.exp(b - a)
+        h = exp_min / (1.0 - exp_min + epsilon)
+        return grad * (1.0 + h), -grad * h
+
+    def _init_params(self, perturbation: float = 0.2):
         """
         Initialize the parameters with random values
         """
-        params = torch.exp(torch.rand([self.num_params]) * -perturbation)
-        
-        n_start = 0
-        for idx, rnode in enumerate(self.region_nodes):
-            n_end = n_start + rnode.num_nodes
+        mus = torch.rand([self.num_nodes])
+        log_scales = torch.rand([self.num_nodes]) * -perturbation
 
-            if hasattr(rnode, "_params"):
-                if idx == 0:
-                    par_start = 0
-                    par_end = self.param_ends[n_end-1]
-                else:
-                    par_start = self.param_ends[n_start-1]
-                    par_end = self.param_ends[n_end-1]
-
-                params[par_start:par_end] = rnode._params["params"].to(params.device)
-
-            n_start = n_end
-
-        self._normalize_parameters(params)
-        self.params = nn.Parameter(params)
+        self.mus = nn.Parameter(mus)
+        self.log_scales = nn.Parameter(log_scales)
 
         # Due to the custom inplace backward pass implementation, we do not track 
         # gradient of PC parameters by PyTorch.
-        self.params.requires_grad = False
+        self.mus.requires_grad = False
+        self.log_scales.requires_grad = False
 
     def _extract_params_to_rnodes(self):
         raise NotImplementedError()
@@ -160,3 +240,25 @@ class CategoricalLayer(InputLayer, nn.Module):
     @staticmethod
     def _duplicate_nodes(_params: Dict):
         raise NotImplementedError()
+
+    @staticmethod
+    def _hook_params(grad_hook_idx: int, _inputs: List, layer_params: Dict):
+        while len(_inputs) < grad_hook_idx + 2:
+            _inputs.append(None)
+
+        with torch.enable_grad():
+            _inputs[grad_hook_idx] = ReverseGrad.apply(layer_params["mus"])
+            _inputs[grad_hook_idx+1] = ReverseGrad.apply(layer_params["log_scales"])
+
+        return grad_hook_idx + 2
+
+    def _hook_param_grads(self, grad_hook_idx: int, _inputs_grad: List):
+        while len(_inputs_grad) < grad_hook_idx + 2:
+            _inputs_grad.append(None)
+
+        _inputs_grad[grad_hook_idx] = self.param_flows[:self.num_nodes,:] / \
+            torch.norm(self.param_flows[:self.num_nodes,:], dim = 0, keepdim = True).clip(min = 5.0) * 5.0
+        _inputs_grad[grad_hook_idx+1] = self.param_flows[self.num_nodes:,:] / \
+            torch.norm(self.param_flows[self.num_nodes:,:], dim = 0, keepdim = True).clip(min = 5.0) * 5.0
+
+        return grad_hook_idx + 2
