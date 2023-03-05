@@ -11,7 +11,7 @@ from typing import Optional, Sequence
 from pyjuice.graph import RegionGraph, InputRegionNode, InnerRegionNode, PartitionNode, truncate_npartition
 from pyjuice.layer import Layer, InputLayer, ProdLayer, SumLayer
 from pyjuice.functional import normalize_parameters, flat_softmax_fw, flat_softmax_bp
-from pyjuice.utils.grad_fns import ReverseGrad
+from pyjuice.utils.grad_fns import ReverseGrad, PseudoHookFunc
 
 def _pc_model_backward_hook(grad, pc):
     pc.backward(
@@ -20,16 +20,25 @@ def _pc_model_backward_hook(grad, pc):
         flows_memory = pc._optim_hyperparams["flows_memory"]
     )
 
-    for i in range(len(pc._inputs)):
-        if pc._inputs[i] is not None:
-            if pc._inputs[i].requires_grad and pc._inputs_grad[i] is not None:
-                pc._inputs[i].backward(pc._inputs_grad[i])
-                pc._inputs_grad[i] = None
-            pc._inputs[i] = None
-
     pc._backward_buffer.clear()
 
     return None
+
+def _pc_inputs_hook(grad, pc, i):
+
+    if pc._inputs_grad[i] is not None:
+        if grad is not None:
+            grad = grad + pc._inputs_grad[i]
+        else:
+            grad = pc._inputs_grad[i]
+
+    if pc._inputs[i] is not None:
+        pc._inputs[i] = None
+    
+    if pc._inputs_grad[i] is not None:
+        pc._inputs_grad[i] = None
+    
+    return grad
 
 class ProbCircuit(nn.Module):
     def __init__(self, region_graph: RegionGraph, max_npartitions: Optional[int] = None) -> None:
@@ -64,11 +73,14 @@ class ProbCircuit(nn.Module):
 
     def forward(self, inputs: torch.Tensor, params: Optional[torch.Tensor] = None, 
                 input_params: Optional[Dict[str,torch.Tensor]] = None):
-        self.node_mars = torch.empty([self.num_nodes, inputs.size(0)], device = self.device)
-        self.element_mars = torch.empty([self.num_elements, inputs.size(0)], device = self.device)
+        B = inputs.size(0)
+        inputs = inputs.permute(1, 0)
+        
+        self.node_mars = torch.empty([self.num_nodes, B], device = self.device)
+        self.element_mars = torch.empty([self.num_elements, B], device = self.device)
 
         if self.skip_logsumexp:
-            self.sum_region_mars = torch.zeros([self.num_sum_regions, inputs.size(0)], device = inputs.device)
+            self.sum_region_mars = torch.zeros([self.num_sum_regions, B], device = inputs.device)
             self.node_mars[0,:] = 1.0
             self.element_mars[0,:] = 0.0
         else:
@@ -105,7 +117,7 @@ class ProbCircuit(nn.Module):
                 else:
                     layer_params = None
 
-                layer(inputs.permute(1, 0), self.node_mars, params = layer_params, skip_logsumexp = self.skip_logsumexp)
+                layer(inputs, self.node_mars, params = layer_params, skip_logsumexp = self.skip_logsumexp)
 
             for ltype, layer in self.inner_layers:
                 if ltype == "prod":
@@ -124,8 +136,17 @@ class ProbCircuit(nn.Module):
             lls.requires_grad = True
             lls.register_hook(partial(_pc_model_backward_hook, pc = self))
 
-            self._inputs[0] = inputs # Record inputs for backward
+            self._inputs[0] = ReverseGrad.apply(inputs) # Record inputs for backward
 
+            tensors = []
+            for i in range(len(self._inputs)):
+                if self._inputs[i] is not None and self._inputs[i].requires_grad:
+                    self._inputs[i].register_hook(partial(_pc_inputs_hook, pc = self, i = i))
+                    tensors.append(self._inputs[i])
+            tensors.append(lls)
+
+            return PseudoHookFunc.apply(*tensors)
+        
         return lls
 
     def backward(self, inputs: Optional[torch.Tensor] = None, ll_weights: Optional[torch.Tensor] = None,
@@ -169,13 +190,17 @@ class ProbCircuit(nn.Module):
             if compute_param_flows:
                 if inputs is None:
                     inputs = self._inputs[0]
+                else:
+                    inputs = inputs.permute(1, 0)
 
                 grad_hook_idx = 2
                 for idx, layer in enumerate(self.input_layers):
-                    layer.backward(inputs.permute(1, 0), self.node_flows, self.node_mars)
+                    layer.backward(inputs, self.node_flows, self.node_mars)
 
                     if "external_input_layers" in self._backward_buffer and idx in self._backward_buffer["external_input_layers"]:
-                        grad_hook_idx = layer._hook_param_grads(grad_hook_idx, self._inputs_grad)
+                        grad_hook_idx = layer._hook_param_grads(grad_hook_idx, self._inputs, self._inputs_grad)
+
+                    layer._hook_input_grads(self._inputs, self._inputs_grad)
 
             if self._inputs[1] is not None:
                 B = self._inputs[0].size(0)

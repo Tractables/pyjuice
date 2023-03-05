@@ -221,15 +221,6 @@ class SumLayer(Layer,nn.Module):
         param_flows[self.seq_parpids] += (node_flows[self.parids] * params[self.parpids] * \
             (element_mars[1:self.ch_prod_layer_size].unsqueeze(1) - node_mars[self.parids]).exp()).sum(dim = 2)[self.seq_ids0, self.seq_ids1]
 
-        '''aaa = (node_flows[self.parids] * params[self.parpids] * \
-            (element_mars[1:self.ch_prod_layer_size].unsqueeze(1) - node_mars[self.parids]).exp())
-        print(aaa.size())
-        print(aaa.sum(dim = 2).size())
-        print(aaa.sum(dim = 2)[self.seq_ids0, self.seq_ids1].size())
-        print(self.seq_ids0.min(), self.seq_ids0.max())
-        print(self.seq_ids1.min(), self.seq_ids1.max())
-        exit()'''
-
         return None
 
     @torch.compile(mode = "reduce-overhead")

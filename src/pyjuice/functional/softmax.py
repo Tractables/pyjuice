@@ -101,7 +101,7 @@ def _bp_norm_grads_logp_kernel(grads_ptr, targets_ptr, cum_grads_ptr, node_ids_p
     block_start = pid * BLOCK_SIZE
 
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < tot_num_logits
+    mask = offsets < tot_num_logits * batch_size
 
     param_offsets = offsets // batch_size
     batch_offsets = offsets % batch_size

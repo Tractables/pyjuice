@@ -10,7 +10,7 @@ def _cum_params_kernel(params_ptr, cum_params_ptr, node_ids_ptr, tot_num_params,
     block_start = pid * BLOCK_SIZE
 
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < tot_num_params
+    mask = offsets < tot_num_params * batch_size
 
     param_offsets = offsets // batch_size
     batch_offsets = offsets % batch_size
@@ -31,7 +31,7 @@ def _norm_params_kernel(params_ptr, cum_params_ptr, node_ids_ptr, node_nchs_ptr,
     block_start = pid * BLOCK_SIZE
 
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < tot_num_params
+    mask = offsets < tot_num_params * batch_size
 
     param_offsets = offsets // batch_size
     batch_offsets = offsets % batch_size

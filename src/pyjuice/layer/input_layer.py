@@ -70,5 +70,8 @@ class InputLayer(Layer, nn.Module):
     def _hook_params(grad_hook_idx: int, _inputs: List, layer_params: Dict):
         raise NotImplementedError()
 
-    def _hook_param_grads(self, grad_hook_idx: int, _inputs_grad: List):
+    def _hook_param_grads(self, grad_hook_idx: int, _inputs: List, _inputs_grad: List):
         raise NotImplementedError()
+
+    def _hook_input_grads(self, _inputs: List, _inputs_grad: List):
+        pass

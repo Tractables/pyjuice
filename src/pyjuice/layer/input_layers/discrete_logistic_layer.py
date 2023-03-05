@@ -62,6 +62,7 @@ class DiscreteLogisticLayer(InputLayer, nn.Module):
         vrangeshigh = torch.tensor([r[1] for r in self.rnode_input_range])
         vhbinsizes = torch.tensor(self.rnode_bin_sizes) / 2.0
         vids = torch.empty([layer_num_nodes], dtype = torch.long)
+        vids2d = torch.tensor(self.vars)
         n_start = 0
         for idx, rnode in enumerate(self.region_nodes):
             n_end = n_start + rnode.num_nodes
@@ -76,6 +77,7 @@ class DiscreteLogisticLayer(InputLayer, nn.Module):
         self.register_buffer("vrangeshigh", vrangeshigh.unsqueeze(1))
         self.register_buffer("vhbinsizes", vhbinsizes.unsqueeze(1))
         self.register_buffer("vids", vids)
+        self.register_buffer("vids2d", vids2d)
 
         # Initialize parameters
         self._init_params()
@@ -252,13 +254,68 @@ class DiscreteLogisticLayer(InputLayer, nn.Module):
 
         return grad_hook_idx + 2
 
-    def _hook_param_grads(self, grad_hook_idx: int, _inputs_grad: List):
+    def _hook_param_grads(self, grad_hook_idx: int, _inputs: List, _inputs_grad: List):
         while len(_inputs_grad) < grad_hook_idx + 2:
             _inputs_grad.append(None)
 
-        _inputs_grad[grad_hook_idx] = self.param_flows[:self.num_nodes,:] / \
-            torch.norm(self.param_flows[:self.num_nodes,:], dim = 0, keepdim = True).clip(min = 5.0) * 5.0
-        _inputs_grad[grad_hook_idx+1] = self.param_flows[self.num_nodes:,:] / \
-            torch.norm(self.param_flows[self.num_nodes:,:], dim = 0, keepdim = True).clip(min = 5.0) * 5.0
+        # Gradients of `mus`
+        if _inputs[grad_hook_idx] is not None and _inputs[grad_hook_idx].requires_grad:
+            if self.param_flows.dim() == 1:
+                grads = self.param_flows[:self.num_nodes]
+            else:
+                grads = self.param_flows[:self.num_nodes,:]
+
+            _inputs_grad[grad_hook_idx] = grads / torch.norm(grads, dim = 0, keepdim = True).clip(min = 5.0) * 5.0
+
+        # Gradients of `log_scales`
+        if _inputs[grad_hook_idx+1] is not None and _inputs[grad_hook_idx+1].requires_grad:
+            if self.param_flows.dim() == 1:
+                grads = self.param_flows[self.num_nodes:]
+            else:
+                grads = self.param_flows[self.num_nodes:,:]
+
+            _inputs_grad[grad_hook_idx+1] = grads / torch.norm(grads, dim = 0, keepdim = True).clip(min = 5.0) * 5.0
 
         return grad_hook_idx + 2
+
+    def _hook_input_grads(self, _inputs: List, _inputs_grad: List):
+
+        # Gradients of `input`
+        if _inputs[0] is not None and _inputs[0].requires_grad:
+
+            if self.param_flows.dim() == 1:
+                raise NotImplementedError()
+            else:
+                grads = -self.param_flows[:self.num_nodes,:]
+
+            targets = torch.zeros([_inputs[0].size(0), grads.size(1)], device = grads.device)
+
+            grid = lambda meta: (triton.cdiv(self.num_nodes * targets.size(1), meta['BLOCK_SIZE']),)
+            self._accum_grad_kernel[grid](grads, targets, self.vids, self.vids2d, self.num_nodes, targets.size(1), BLOCK_SIZE = 1024)
+
+            if _inputs_grad[0] is None:
+                _inputs_grad[0] = targets
+            else:
+                _inputs_grad[0] += targets
+
+    @staticmethod
+    @triton.jit
+    def _accum_grad_kernel(grads_ptr, targets_ptr, vids_ptr, vids2d_ptr, tot_num_nodes, batch_size, BLOCK_SIZE: tl.constexpr):
+
+        pid = tl.program_id(axis = 0)
+        block_start = pid * BLOCK_SIZE
+
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < tot_num_nodes * batch_size
+
+        node_offsets = offsets // batch_size
+        batch_offsets = offsets % batch_size
+
+        n_offsets = tl.load(vids_ptr + node_offsets, mask = mask, other = 0)
+        v_offsets = tl.load(vids2d_ptr + n_offsets, mask = mask, other = 0)
+        v_offsets = v_offsets * batch_size + batch_offsets
+
+        grads = tl.load(grads_ptr + offsets, mask = mask, other = 0)
+
+        tl.store(grads_ptr + offsets, v_offsets, mask = mask)
+        tl.atomic_add(targets_ptr + v_offsets, grads, mask = mask)
