@@ -166,17 +166,6 @@ def main():
     param_specs = pc.get_param_specs()
     print(param_specs)
 
-    x = torch.rand([10])
-    mu = torch.rand([10])
-    log_scales = (torch.rand([10]) + 0.01).log()
-    x.requires_grad = False
-    mu.requires_grad = True
-    log_scales.requires_grad = True
-    # torch.autograd.gradcheck(DiscreteLogistic.apply, (x, mu, log_scales))
-    # torch.autograd.gradcheck(correct_dl, (x, mu, log_scales))
-
-    # exit()
-
     args.input_size = (1, 32, 32)
 
     idf = IDF(args).to(device)
@@ -218,13 +207,13 @@ def main():
 
             # Use a PC as the distribution of the first set of latent variables
             lls = pc(latent_codes[0][0], input_params = input_params) + \
-                correct_dl(latent_codes[1][0], latent_codes[1][1][:,:,0], latent_codes[1][2][:,:,0]).sum(dim = 1) + \
-                correct_dl(latent_codes[2][0], latent_codes[2][1][:,:,0], latent_codes[2][2][:,:,0]).sum(dim = 1)
+                discrete_logistic_ll(latent_codes[1][0], latent_codes[1][1][:,:,0], latent_codes[1][2][:,:,0]).sum(dim = 1) + \
+                discrete_logistic_ll(latent_codes[2][0], latent_codes[2][1][:,:,0], latent_codes[2][2][:,:,0]).sum(dim = 1)
 
             # Original LL
-            '''lls = discrete_logistic_ll(latent_codes[0][0], latent_codes[0][1][:,:,0], latent_codes[0][2][:,:,0]).sum(dim = 1) + \
+            lls = discrete_logistic_ll(latent_codes[0][0], latent_codes[0][1][:,:,0], latent_codes[0][2][:,:,0]).sum(dim = 1) + \
                 discrete_logistic_ll(latent_codes[1][0], latent_codes[1][1][:,:,0], latent_codes[1][2][:,:,0]).sum(dim = 1) + \
-                discrete_logistic_ll(latent_codes[2][0], latent_codes[2][1][:,:,0], latent_codes[2][2][:,:,0]).sum(dim = 1)'''
+                discrete_logistic_ll(latent_codes[2][0], latent_codes[2][1][:,:,0], latent_codes[2][2][:,:,0]).sum(dim = 1)
 
             loss = -lls.mean()
             loss.backward()
