@@ -103,8 +103,8 @@ class DiscreteLogisticLayer(InputLayer, nn.Module):
             mus = self.mus
             log_scales = self.log_scales
         else:
-            mus = params["mus"]
-            log_scales = params["log_scales"]
+            mus = params["mus"].permute(1, 0)
+            log_scales = params["log_scales"].permute(1, 0)
 
         if mus.dim() == 1:
             mus = mus.unsqueeze(1)
@@ -136,8 +136,8 @@ class DiscreteLogisticLayer(InputLayer, nn.Module):
             mus = self.mus
             log_scales = self.log_scales
         else:
-            mus = params["mus"]
-            log_scales = params["log_scales"]
+            mus = params["mus"].permute(1, 0)
+            log_scales = params["log_scales"].permute(1, 0)
 
         if mus.dim() == 1:
             mus = mus.unsqueeze(1)
@@ -181,6 +181,8 @@ class DiscreteLogisticLayer(InputLayer, nn.Module):
             self._backward_buffer["r_b"] = r_b
 
             mars = self._log_min_exp(F.logsigmoid(r_b), F.logsigmoid(l_b))
+            mars = torch.where(scaled_data[self.vids] < 0.01, F.logsigmoid(l_b), mars)
+            mars = torch.where(scaled_data[self.vids] > 0.99, self._log_min_exp(0.0, F.logsigmoid(r_b)), mars)
 
             self._backward_buffer["mars"] = mars
 
@@ -249,8 +251,8 @@ class DiscreteLogisticLayer(InputLayer, nn.Module):
             _inputs.append(None)
 
         with torch.enable_grad():
-            _inputs[grad_hook_idx] = ReverseGrad.apply(layer_params["mus"])
-            _inputs[grad_hook_idx+1] = ReverseGrad.apply(layer_params["log_scales"])
+            _inputs[grad_hook_idx] = ReverseGrad.apply(layer_params["mus"].permute(1, 0))
+            _inputs[grad_hook_idx+1] = ReverseGrad.apply(layer_params["log_scales"].permute(1, 0))
 
         return grad_hook_idx + 2
 
