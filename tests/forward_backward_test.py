@@ -8,7 +8,7 @@ from pyjuice.model import ProbCircuit
 
 import pytest
 
-def test_backward():
+def test_forward_backward():
     torch.set_float32_matmul_precision('high')
     
     inputs = [InputRegionNode(scope = [i], num_nodes = 2, node_type = CategoricalLayer, num_cats = 2) for i in range(4)]
@@ -146,3 +146,7 @@ def test_backward():
     assert torch.abs(pf21.sum(dim = 0) / pf22.sum(dim = 0) - inner_param_flows[1] / inner_param_flows[2]) < 1e-4
     assert torch.abs(pf11 / pf12 - inner_param_flows[13] / inner_param_flows[14]) < 1e-4
     assert torch.abs(inner_param_flows[13] + inner_param_flows[14] - 1.0) < 1e-4
+
+
+if __name__ == "__main__":
+    test_forward_backward()
