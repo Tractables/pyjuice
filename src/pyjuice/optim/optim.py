@@ -31,7 +31,7 @@ class CircuitOptimizer():
 
     def step(self, closure = None):
         if self.base_optimizer is not None:
-            self.base_optimizer.zero_grad()
+            self.base_optimizer.step()
 
         if self.method == "EM":
             self.circuit.mini_batch_em(
