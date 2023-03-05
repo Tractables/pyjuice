@@ -15,9 +15,8 @@ from pyjuice.functional import normalize_parameters
 torch.set_float32_matmul_precision('high')
 
 
-class CategoricalLayer(InputLayer, nn.Module):
+class CategoricalLayer(InputLayer):
     def __init__(self, layer_id: int, region_nodes: List[RegionGraph], cum_nodes: int = 0) -> None:
-        nn.Module.__init__(self)
 
         num_nodes = sum(map(lambda r: r.num_nodes, region_nodes))
 
@@ -88,24 +87,35 @@ class CategoricalLayer(InputLayer, nn.Module):
 
         self.param_flows_size = self.params.size(0)
 
-    @torch.compile(mode = "reduce-overhead")
-    def forward(self, data: torch.Tensor, node_mars: torch.Tensor, skip_logsumexp: bool = False):
+        # Batch size of parameters in the previous forward pass
+        self._param_batch_size = 1
+
+    def forward(self, data: torch.Tensor, node_mars: torch.Tensor, params: Optional[Dict] = None, skip_logsumexp: bool = False):
         """
         data: [num_vars, B]
         node_mars: [num_nodes, B]
         """
-        sid, eid = self._output_ind_range[0], self._output_ind_range[1]
-        if skip_logsumexp:
-            node_mars[sid:eid,:] = ((self.params[data[self.vids] + self.psids.unsqueeze(1)] + 1e-8).clamp(min=1e-10))
+        super(CategoricalLayer, self).forward(params is not None)
+
+        if params is None:
+            params = self.params
         else:
-            node_mars[sid:eid,:] = ((self.params[data[self.vids] + self.psids.unsqueeze(1)] + 1e-8).clamp(min=1e-10)).log()
+            params = params["params"]
+
+        assert params.dim() == 1
+        
+        if skip_logsumexp:
+            self._dense_forward_pass_nolog(data, node_mars, params)
+        else:
+            self._dense_forward_pass(data, node_mars, params)
 
         return None
 
-    def backward(self, data: torch.Tensor, node_flows: torch.Tensor):
+    def backward(self, data: torch.Tensor, node_flows: torch.Tensor, node_mars: torch.Tensor, params: Optional[Dict] = None):
         """
         data: [num_vars, B]
         node_flows: [num_nodes, B]
+        node_mars: [num_nodes, B]
         """
         layer_num_nodes = self._output_ind_range[1] - self._output_ind_range[0]
         tot_num_nodes = node_flows.size(0)
@@ -120,10 +130,28 @@ class CategoricalLayer(InputLayer, nn.Module):
         return None
 
     def mini_batch_em(self, step_size: float, pseudocount: float = 0.0):
-        with torch.no_grad():
-            flows = self.param_flows
-            self._normalize_parameters(flows, pseudocount = pseudocount)
-            self.params.data = (1.0 - step_size) * self.params.data + step_size * flows
+        if not self._used_external_params:
+            with torch.no_grad():
+                flows = self.param_flows
+                self._normalize_parameters(flows, pseudocount = pseudocount)
+                self.params.data = (1.0 - step_size) * self.params.data + step_size * flows
+
+    def get_param_specs(self):
+        return {"params": torch.Size([self.params.size(0)])}
+
+    @torch.compile(mode = "reduce-overhead")
+    def _dense_forward_pass(self, data: torch.Tensor, node_mars: torch.Tensor, params: torch.Tensor):
+        sid, eid = self._output_ind_range[0], self._output_ind_range[1]
+        node_mars[sid:eid,:] = ((params[data[self.vids] + self.psids.unsqueeze(1)] + 1e-8).clamp(min=1e-10)).log()
+
+        return None
+
+    @torch.compile(mode = "reduce-overhead")
+    def _dense_forward_pass_nolog(self, data: torch.Tensor, node_mars: torch.Tensor, params: torch.Tensor):
+        sid, eid = self._output_ind_range[0], self._output_ind_range[1]
+        node_mars[sid:eid,:] = ((params[data[self.vids] + self.psids.unsqueeze(1)] + 1e-8).clamp(min=1e-10))
+
+        return None
 
     def _normalize_parameters(self, params, pseudocount: float = 0.0):
         normalize_parameters(params, self.node_ids, self.node_nchs, pseudocount)
