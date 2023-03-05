@@ -64,4 +64,8 @@ class CircuitOptimizer():
 
         if self.base_optimizer is not None:
             self.base_optimizer.load_state_dict(state_dict)
-        
+
+    @property
+    def param_groups(self):
+        assert self.base_optimizer is not None
+        return self.base_optimizer.param_groups
