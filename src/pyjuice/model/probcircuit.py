@@ -24,6 +24,7 @@ def _pc_model_backward_hook(grad, pc):
         if pc._inputs[i] is not None:
             if pc._inputs[i].requires_grad and pc._inputs_grad[i] is not None:
                 pc._inputs[i].backward(pc._inputs_grad[i])
+                pc._inputs_grad[i] = None
             pc._inputs[i] = None
 
     pc._backward_buffer.clear()
@@ -61,7 +62,8 @@ class ProbCircuit(nn.Module):
 
         self._used_external_sum_params = False
 
-    def forward(self, inputs: torch.Tensor, params: Optional[torch.Tensor] = None):
+    def forward(self, inputs: torch.Tensor, params: Optional[torch.Tensor] = None, 
+                input_params: Optional[Dict[str,torch.Tensor]] = None):
         self.node_mars = torch.empty([self.num_nodes, inputs.size(0)], device = self.device)
         self.element_mars = torch.empty([self.num_elements, inputs.size(0)], device = self.device)
 
@@ -89,20 +91,32 @@ class ProbCircuit(nn.Module):
             params[0] = 1.0
             self._backward_buffer["normalized_params"] = params
 
+        if input_params is not None:
+            grad_hook_idx = 2
+            self._backward_buffer["external_input_layers"] = set()
+
         with torch.no_grad():
-            for layer in self.input_layers:
-                layer(inputs.permute(1, 0), self.node_mars, skip_logsumexp=self.skip_logsumexp)
+            for idx, layer in enumerate(self.input_layers):
+                if input_params is not None and f"input_{idx}" in input_params:
+                    layer_params = input_params[f"input_{idx}"]
+
+                    self._backward_buffer["external_input_layers"].add(idx)
+                    grad_hook_idx = layer._hook_params(grad_hook_idx, self._inputs, layer_params)
+                else:
+                    layer_params = None
+
+                layer(inputs.permute(1, 0), self.node_mars, params = layer_params, skip_logsumexp = self.skip_logsumexp)
 
             for ltype, layer in self.inner_layers:
                 if ltype == "prod":
-                    layer(self.node_mars, self.element_mars, skip_logsumexp=self.skip_logsumexp)
+                    layer(self.node_mars, self.element_mars, skip_logsumexp = self.skip_logsumexp)
                 elif ltype == "sum":
-                    layer(self.node_mars, self.element_mars, params, sum_region_mars=self.sum_region_mars, skip_logsumexp=self.skip_logsumexp)
+                    layer(self.node_mars, self.element_mars, params, sum_region_mars=self.sum_region_mars, skip_logsumexp = self.skip_logsumexp)
                 else:
                     raise ValueError(f"Unknown layer type {ltype}.")
                 
         if self.skip_logsumexp:
-           lls = self.node_mars[-1,:] + self.sum_region_mars.log().sum(dim = 0)
+            lls = self.node_mars[-1,:] + self.sum_region_mars.log().sum(dim = 0)
         else:
             lls = self.node_mars[-1,:]
 
@@ -132,7 +146,7 @@ class ProbCircuit(nn.Module):
             params = self.params
 
         if compute_param_flows:
-            self.init_param_flows(flows_memory = flows_memory, batch_size = params.size(1) if params.dim() == 2 else 1)
+            self.init_param_flows(flows_memory = flows_memory)
 
         with torch.no_grad():
             for layer_id in range(len(self.inner_layers) - 1, -1, -1):
@@ -156,8 +170,12 @@ class ProbCircuit(nn.Module):
                 if inputs is None:
                     inputs = self._inputs[0]
 
-                for layer in self.input_layers:
-                    layer.backward(inputs.permute(1, 0), self.node_flows)
+                grad_hook_idx = 2
+                for idx, layer in enumerate(self.input_layers):
+                    layer.backward(inputs.permute(1, 0), self.node_flows, self.node_mars)
+
+                    if "external_input_layers" in self._backward_buffer and idx in self._backward_buffer["external_input_layers"]:
+                        grad_hook_idx = layer._hook_param_grads(grad_hook_idx, self._inputs_grad)
 
             if self._inputs[1] is not None:
                 B = self._inputs[0].size(0)
@@ -189,6 +207,8 @@ class ProbCircuit(nn.Module):
         if not self._used_external_sum_params:
             with torch.no_grad():
                 flows = self.param_flows
+                if flows is None:
+                    return None
                 self._normalize_parameters(flows, pseudocount = pseudocount)
                 self.params.data = (1.0 - step_size) * self.params.data + step_size * flows
                 self.params[0] = 1.0
@@ -198,7 +218,8 @@ class ProbCircuit(nn.Module):
             self.forward(inputs, params)
             self.backward(inputs = inputs, compute_param_flows = True, flows_memory = 1.0)
 
-    def init_param_flows(self, flows_memory: float = 0.0, batch_size: int = 1):
+    def init_param_flows(self, flows_memory: float = 0.0):
+        batch_size = self._inputs[1].size(1) if self._inputs[1] is not None and self._inputs[1].dim() == 2 else 1
         if self.param_flows is None or self.param_flows.size(0) != self.params.size(0) \
                 or (self.param_flows.dim() == 1 and batch_size > 1) \
                 or (self.param_flows.dim() == 2 and batch_size != self.param_flows.size(1)):
@@ -223,6 +244,14 @@ class ProbCircuit(nn.Module):
             layer.device = device
 
         self.device = device
+
+    def get_param_specs(self):
+        param_specs = dict()
+        param_specs["inner"] = torch.Size([self.num_sum_params])
+        for i, layer in enumerate(self.input_layers):
+            param_specs[f"input_{i}"] = layer.get_param_specs()
+
+        return param_specs
 
     def _convert_region_graph(self, region_graph: RegionGraph, max_npartitions: Optional[int] = None):
         if max_npartitions is not None:
@@ -291,13 +320,13 @@ class ProbCircuit(nn.Module):
 
         self.num_nodes = num_nodes
         self.num_elements = num_elements
-        self.num_inner_params = param_ends[-1]
+        self.num_sum_params = param_ends[-1]
         self.param_ends = param_ends
         self.num_sum_regions = num_sum_regions
 
         # For parameter normalization
         # Node that input nodes are implicitly omitted as they have no child
-        node_ids = torch.empty([self.num_inner_params], dtype = torch.long)
+        node_ids = torch.empty([self.num_sum_params], dtype = torch.long)
         node_nchs = torch.empty([len(self.param_ends)], dtype = torch.long)
         node_ids[:self.param_ends[0]] = 0
         node_nchs[0] = self.param_ends[0]
@@ -311,7 +340,7 @@ class ProbCircuit(nn.Module):
         self._init_params()
 
     def _init_params(self, perturbation: float = 4.0):
-        params = torch.exp(torch.rand([self.num_inner_params]) * -perturbation)
+        params = torch.exp(torch.rand([self.num_sum_params]) * -perturbation)
 
         # Copy initial parameters if provided
         for layer_type, layer in self.inner_layers:
@@ -332,7 +361,8 @@ class ProbCircuit(nn.Module):
             layer._init_params(perturbation)
 
     def _normalize_parameters(self, params, pseudocount: float = 0.0):
-        normalize_parameters(params, self.node_ids, self.node_nchs, pseudocount)
+        if params is not None:
+            normalize_parameters(params, self.node_ids, self.node_nchs, pseudocount)
 
     @staticmethod
     @triton.jit
