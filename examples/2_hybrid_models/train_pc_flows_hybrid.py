@@ -202,8 +202,8 @@ def main():
                 
                 latent_codes[idx] = [h, h_mean, h_logscale]
 
-            input_params = {"input_0": {"mus": latent_codes[0][1].reshape(-1, 16 * 16 * args.n_mixtures).permute(1, 0),
-                                        "log_scales": latent_codes[0][2].reshape(-1, 16 * 16 * args.n_mixtures).permute(1, 0)}}
+            input_params = {"input_0": {"mus": latent_codes[0][1].reshape(-1, 16 * 16 * args.n_mixtures),
+                                        "log_scales": latent_codes[0][2].reshape(-1, 16 * 16 * args.n_mixtures)}}
 
             # Use a PC as the distribution of the first set of latent variables
             lls = pc(latent_codes[0][0], input_params = input_params) + \
