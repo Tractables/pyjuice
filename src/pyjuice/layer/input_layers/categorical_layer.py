@@ -144,10 +144,11 @@ class CategoricalLayer(InputLayer):
         sid, eid = self._output_ind_range[0], self._output_ind_range[1]
         param_idxs = data[self.vids] + self.psids.unsqueeze(1)
         if missing_mask is not None:
-            not_missing_mask = ~missing_mask[self.vids]
-            node_mars[sid:eid,:][not_missing_mask] = ((params[param_idxs][not_missing_mask]).clamp(min=1e-10)).log()
+            mask = missing_mask[self.vids]
+            node_mars[sid:eid,:][~mask] = ((params[param_idxs][~mask]).clamp(min=1e-10)).log()
+            node_mars[sid:eid,:][mask] = 0.0
         else:
-            node_mars[sid:eid,:] = ((params[param_idxs]).clamp(min=1e-10)).log()
+            node_mars[sid:eid,:] = ((params[param_idxs]).clamp(min=1e-10)).log()            
         return None
 
     @torch.compile(mode = "reduce-overhead")

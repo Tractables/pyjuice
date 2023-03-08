@@ -179,7 +179,7 @@ def main(args):
 
     elif args.mode == "miss":
         print("===========================MISS===============================")    
-        print(f"Loading {filename} into {device}.......", end="")
+        print(f"Loading {filename} into {device}.......")
         pc = torch.load(filename)
         pc.to(device)
     
@@ -193,17 +193,25 @@ def main(args):
             shuffle = False,
             drop_last = True
         )
-        train_ll = evaluate(pc, loader=train_loader)
+        t_compile = time.time()
         test_ll = evaluate(pc, loader=test_loader) 
         test_ll_miss = evaluate_miss(pc, loader=test_loader_miss) 
+
+        t0 = time.time()
+        train_ll = evaluate(pc, loader=train_loader)
+        t1 = time.time()
+        test_ll = evaluate(pc, loader=test_loader) 
+        t2 = time.time()
+        test_ll_miss = evaluate_miss(pc, loader=test_loader_miss) 
+        t3 = time.time()
 
         train_bpd = -train_ll / (num_features * np.log(2))
         test_bpd = -test_ll / (num_features * np.log(2))
         test_miss_bpd = -test_ll_miss / (num_features * np.log(2))
 
-        print(f"train_ll: {train_ll:.2f}, train_bpd: {train_bpd:.2f}")
-        print(f"test_ll: {test_ll:.2f}, test_bpd: {test_bpd:.2f}")
-        print(f"test_miss_ll: {test_ll_miss:.2f}, test_miss_bpd: {test_miss_bpd:.2f}")
+        print(f"train_ll: {train_ll:.2f}, train_bpd: {train_bpd:.2f}; time = {t1-t0:.2f} (s)")
+        print(f"test_ll: {test_ll:.2f}, test_bpd: {test_bpd:.2f}; time = {t2-t1:.2f} (s)")
+        print(f"test_miss_ll: {test_ll_miss:.2f}, test_miss_bpd: {test_miss_bpd:.2f}; time = {t3-t2:.2f} (s)")
 
     print(f"Memory allocated: {torch.cuda.memory_allocated(device) / 1024 / 1024 / 1024:.1f}GB")
     print(f"Memory reserved: {torch.cuda.memory_reserved(device) / 1024 / 1024 / 1024:.1f}GB")
