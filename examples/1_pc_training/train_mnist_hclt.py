@@ -36,6 +36,17 @@ def evaluate(pc: juice.ProbCircuit, loader: DataLoader):
     lls_total /= len(loader)
     return lls_total
 
+def evaluate_miss(pc: juice.ProbCircuit, loader: DataLoader):
+    lls_total = 0.0
+    for batch in loader:
+        x = batch[0].to(pc.device)
+        mask = batch[1].to(pc.device)
+        lls = pc(x, missing_mask=mask)
+        lls_total += lls.mean().detach().cpu().numpy().item()
+    
+    lls_total /= len(loader)
+    return lls_total
+
 
 def mini_batch_em_epoch(num_epochs, pc, optimizer, scheduler, train_loader, test_loader, device):
     for epoch in range(num_epochs):
@@ -60,7 +71,7 @@ def mini_batch_em_epoch(num_epochs, pc, optimizer, scheduler, train_loader, test
         test_ll = evaluate(pc, loader=test_loader)
         t2 = time.time()
 
-        print(f"[Epoch {epoch}][train LL: {train_ll:.2f}; test LL: {test_ll:.2f}].....[train forward+backward+step {t1-t0:.2f}; test forward {t2-t1:.2f}] ")
+        print(f"[Epoch {epoch}/{num_epochs}][train LL: {train_ll:.2f}; test LL: {test_ll:.2f}].....[train forward+backward+step {t1-t0:.2f}; test forward {t2-t1:.2f}] ")
 
 
 def full_batch_em_epoch(pc, train_loader, test_loader, device):
@@ -165,6 +176,34 @@ def main(args):
         print(f"Compilation+test took {t0-t_compile:.2f} (s); train_ll {t1-t0:.2f} (s); test_ll {t2-t1:.2f} (s)")
         print(f"train_ll: {train_ll:.2f}, test_ll: {test_ll:.2f}")
         print(f"train_bpd: {train_bpd:.2f}, test_bpd: {test_bpd:.2f}")
+
+    elif args.mode == "miss":
+        print("===========================MISS===============================")    
+        print(f"Loading {filename} into {device}.......", end="")
+        pc = torch.load(filename)
+        pc.to(device)
+    
+        test_miss_mask = torch.zeros(test_data.size(), dtype=torch.bool)
+        test_miss_mask[1:5000, 0:392] = 1 # for first half of images make first half missing
+        test_miss_mask[5000:, 392:] = 1   # for second half of images make second half missing
+
+        test_loader_miss = DataLoader(
+            dataset = TensorDataset(test_data, test_miss_mask),
+            batch_size = args.batch_size,
+            shuffle = False,
+            drop_last = True
+        )
+        train_ll = evaluate(pc, loader=train_loader)
+        test_ll = evaluate(pc, loader=test_loader) 
+        test_ll_miss = evaluate_miss(pc, loader=test_loader_miss) 
+
+        train_bpd = -train_ll / (num_features * np.log(2))
+        test_bpd = -test_ll / (num_features * np.log(2))
+        test_miss_bpd = -test_ll_miss / (num_features * np.log(2))
+
+        print(f"train_ll: {train_ll:.2f}, train_bpd: {train_bpd:.2f}")
+        print(f"test_ll: {test_ll:.2f}, test_bpd: {test_bpd:.2f}")
+        print(f"test_miss_ll: {test_ll_miss:.2f}, test_miss_bpd: {test_miss_bpd:.2f}")
 
     print(f"Memory allocated: {torch.cuda.memory_allocated(device) / 1024 / 1024 / 1024:.1f}GB")
     print(f"Memory reserved: {torch.cuda.memory_reserved(device) / 1024 / 1024 / 1024:.1f}GB")
