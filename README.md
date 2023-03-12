@@ -12,7 +12,7 @@ For now need to manually install pytorch's nightly build (cuda).
 0. (Optional) Make a new conda environment
 
     ```bash
-    conda create -n pyjuice python=3
+    conda create -n pyjuice python=3.8
     conda activate pyjuice
     ```
 
