@@ -10,6 +10,7 @@ import logging
 import warnings
 from torch.utils.data import TensorDataset, DataLoader
 import argparse
+from typing import Optional
 
 warnings.filterwarnings("ignore")
 logging.getLogger("torch._inductor.utils").setLevel(logging.ERROR)
@@ -26,22 +27,22 @@ def process_args():
     args = parser.parse_args()
     return args
 
-def evaluate(pc: juice.ProbCircuit, loader: DataLoader):
+def evaluate(pc: juice.ProbCircuit, loader: DataLoader, alphas: Optional[torch.Tensor]=None):
     lls_total = 0.0
     for batch in loader:
         x = batch[0].to(pc.device)
-        lls = pc(x)
+        lls = pc(x, alphas=alphas)
         lls_total += lls.mean().detach().cpu().numpy().item()
     
     lls_total /= len(loader)
     return lls_total
 
-def evaluate_miss(pc: juice.ProbCircuit, loader: DataLoader):
+def evaluate_miss(pc: juice.ProbCircuit, loader: DataLoader, alphas: Optional[torch.Tensor]=None):
     lls_total = 0.0
     for batch in loader:
         x = batch[0].to(pc.device)
         mask = batch[1].to(pc.device)
-        lls = pc(x, missing_mask=mask)
+        lls = pc(x, missing_mask=mask, alphas=alphas)
         lls_total += lls.mean().detach().cpu().numpy().item()
     
     lls_total /= len(loader)
@@ -160,7 +161,8 @@ def main(args):
         pc.to(device)
         t1 = time.time()
         print(f"Took {t1-t0:.2f} (s)")
-
+        print("pc params size", pc.params.size())
+        print("pc num nodes ", pc.num_nodes)
         t_compile = time.time()
         test_ll = evaluate(pc, loader=test_loader) # force compilation
 
@@ -183,9 +185,10 @@ def main(args):
         pc = torch.load(filename)
         pc.to(device)
     
-        test_miss_mask = torch.zeros(test_data.size(), dtype=torch.bool)
-        test_miss_mask[1:5000, 0:392] = 1 # for first half of images make first half missing
-        test_miss_mask[5000:, 392:] = 1   # for second half of images make second half missing
+        # test_miss_mask = torch.zeros(test_data.size(), dtype=torch.bool)
+        # test_miss_mask[1:5000, 0:392] = 1 # for first half of images make first half missing
+        # test_miss_mask[5000:, 392:] = 1   # for second half of images make second half missing
+        test_miss_mask = torch.rand(test_data.size()) < 0.5
 
         test_loader_miss = DataLoader(
             dataset = TensorDataset(test_data, test_miss_mask),
@@ -212,6 +215,32 @@ def main(args):
         print(f"train_ll: {train_ll:.2f}, train_bpd: {train_bpd:.2f}; time = {t1-t0:.2f} (s)")
         print(f"test_ll: {test_ll:.2f}, test_bpd: {test_bpd:.2f}; time = {t2-t1:.2f} (s)")
         print(f"test_miss_ll: {test_ll_miss:.2f}, test_miss_bpd: {test_miss_bpd:.2f}; time = {t3-t2:.2f} (s)")
+    elif args.mode == "alphas":
+        print("===========================ALPHAS===============================")
+        t0 = time.time()
+        print(f"Loading {filename} into {device}.......", end="")
+        pc = torch.load(filename)
+        pc.to(device)
+        t1 = time.time()
+        print(f"Took {t1-t0:.2f} (s)")
+        print("pc params size", pc.params.size())
+        print("pc num nodes ", pc.num_nodes)
+
+        alphas = 0.99 * torch.ones(28*28, device=device)
+        test_ll = evaluate(pc, loader=test_loader) 
+        train_ll = evaluate(pc, loader=train_loader)
+
+        t0 = time.time()
+        train_ll_alpha = evaluate(pc, loader=train_loader, alphas=alphas)
+        t1 = time.time()
+        test_ll_alpha = evaluate(pc, loader=test_loader, alphas=alphas)
+        t2 = time.time()
+        
+        print(f"train_ll: {train_ll:.2f}, test_ll: {test_ll:.2f}")
+        print(f"train_ll_alpha: {train_ll_alpha:.2f}, test_ll_alpha: {test_ll_alpha:.2f}")
+        print(f"train {t1-t0:.2f} (s); test {t2-t1:.2f} (s)")
+    
+
 
     print(f"Memory allocated: {torch.cuda.memory_allocated(device) / 1024 / 1024 / 1024:.1f}GB")
     print(f"Memory reserved: {torch.cuda.memory_reserved(device) / 1024 / 1024 / 1024:.1f}GB")

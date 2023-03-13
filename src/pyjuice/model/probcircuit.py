@@ -54,6 +54,7 @@ class ProbCircuit(nn.Module):
         self.element_flows = None
         self.param_flows = None
         self.sum_region_mars = None
+        self.alphas = None
 
         # Experimental, wheter to do calculations NOT in logdomain. Does extra bookkeeping to avoid logsumexp.
         self.skip_logsumexp = False
@@ -72,12 +73,16 @@ class ProbCircuit(nn.Module):
         self._used_external_sum_params = False
 
     def forward(self, inputs: torch.Tensor, 
-                params: Optional[torch.Tensor] = None, 
-                input_params: Optional[Dict[str,torch.Tensor]] = None,
-                missing_mask: Optional[torch.Tensor] = None
-                ):
+                        params: Optional[torch.Tensor] = None, 
+                        input_params: Optional[Dict[str,torch.Tensor]] = None,
+                        missing_mask: Optional[torch.Tensor] = None,
+                        alphas: Optional[torch.Tensor]=None,
+                        ):
         if missing_mask is not None:
             assert inputs.size() == missing_mask.size(), f"inputs.size {inputs.size()} != mask.size {missing_mask.size()}" 
+        
+        if alphas is not None:
+            assert inputs.size(1) == alphas.size(0), f"inputs.size(1) {inputs.size(1)} != alphas.size(0) {alphas.size(0)}" 
 
         B = inputs.size(0)
         inputs = inputs.permute(1, 0)
@@ -125,7 +130,7 @@ class ProbCircuit(nn.Module):
                 else:
                     layer_params = None
 
-                layer(inputs, self.node_mars, params = layer_params, missing_mask=missing_mask, skip_logsumexp = self.skip_logsumexp)
+                layer(inputs, self.node_mars, params = layer_params, missing_mask=missing_mask, skip_logsumexp = self.skip_logsumexp, alphas=alphas)
 
             for ltype, layer in self.inner_layers:
                 if ltype == "prod":
