@@ -82,13 +82,15 @@ class ProbCircuit(nn.Module):
             assert inputs.size() == missing_mask.size(), f"inputs.size {inputs.size()} != mask.size {missing_mask.size()}" 
         
         if alphas is not None:
-            assert inputs.size(1) == alphas.size(0), f"inputs.size(1) {inputs.size(1)} != alphas.size(0) {alphas.size(0)}" 
+            assert inputs.size() == alphas.size(), f"inputs.size() {inputs.size()} != alphas.size() {alphas.size()}" 
 
         B = inputs.size(0)
         inputs = inputs.permute(1, 0)
+        if alphas is not None:
+            alphas = alphas.permute(1, 0)
         if missing_mask is not None:
             missing_mask = missing_mask.permute(1, 0)
-
+        
         self.node_mars = torch.empty([self.num_nodes, B], device = self.device)
         self.element_mars = torch.empty([self.num_elements, B], device = self.device)
 

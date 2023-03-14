@@ -226,7 +226,7 @@ def main(args):
         print("pc params size", pc.params.size())
         print("pc num nodes ", pc.num_nodes)
 
-        alphas = 0.99 * torch.ones(28*28, device=device)
+        alphas = 0.99 * torch.ones((args.batch_size, 28*28), device=device)
         test_ll = evaluate(pc, loader=test_loader) 
         train_ll = evaluate(pc, loader=train_loader)
 

@@ -159,9 +159,7 @@ class CategoricalLayer(InputLayer):
             node_mars[sid:eid,:] = ((params[param_idxs]).clamp(min=1e-10)).log()            
 
         if alphas is not None:
-            node_mars[sid:eid,:] = ((node_mars[sid:eid,:].exp() * alphas[self.vids].unsqueeze(dim=1)) 
-                                        + (1 - alphas[self.vids].unsqueeze(dim=1))
-                                    ).log()
+            node_mars[sid:eid,:] = ((node_mars[sid:eid,:].exp() * alphas[self.vids]) + (1 - alphas[self.vids])).log()
 
         return None
 
