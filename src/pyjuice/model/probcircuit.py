@@ -45,9 +45,16 @@ class ProbCircuit(nn.Module):
         super().__init__()
 
         self.region_graph = self._convert_region_graph(region_graph, max_npartitions)
-
         self.device = torch.device("cpu")
+        
+        # Experimental, wheter to do calculations NOT in logdomain. Does extra bookkeeping to avoid logsumexp.
+        self.skip_logsumexp = False
 
+        self._init_pass_tensors_()
+        self._init_layers(max_num_groups = max_num_groups)
+        self._init_ad_tensors()
+
+    def _init_pass_tensors_(self):
         self.node_mars = None
         self.element_mars = None
         self.node_flows = None
@@ -56,11 +63,7 @@ class ProbCircuit(nn.Module):
         self.sum_region_mars = None
         self.alphas = None
 
-        # Experimental, wheter to do calculations NOT in logdomain. Does extra bookkeeping to avoid logsumexp.
-        self.skip_logsumexp = False
-
-        self._init_layers(max_num_groups = max_num_groups)
-
+    def _init_ad_tensors(self):
         self._inputs = [None, None]
         self._inputs_grad = [None, None]
         self._backward_buffer = dict()
@@ -69,8 +72,8 @@ class ProbCircuit(nn.Module):
             "compute_param_flows": True,
             "flows_memory": 0.0
         }
-
         self._used_external_sum_params = False
+        
 
     def forward(self, inputs: torch.Tensor, 
                         params: Optional[torch.Tensor] = None, 
@@ -276,6 +279,18 @@ class ProbCircuit(nn.Module):
             layer.init_param_flows(flows_memory = flows_memory)
 
         return None
+    
+    @staticmethod
+    def load(filename):
+        pc = torch.load(filename, map_location='cpu')
+        pc._init_pass_tensors_()
+        pc._init_ad_tensors()
+
+        for layer in pc.input_layers:
+            layer.param_flows = None
+    
+        return pc
+    
 
     def to(self, device):
         super(ProbCircuit, self).to(device)
