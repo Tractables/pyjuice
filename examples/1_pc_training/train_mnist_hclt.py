@@ -157,7 +157,7 @@ def main(args):
         print("===========================LOAD===============================")
         t0 = time.time()
         print(f"Loading {filename} into {device}.......", end="")
-        pc = torch.load(filename)
+        pc = juice.model.ProbCircuit.load(filename)
         pc.to(device)
         t1 = time.time()
         print(f"Took {t1-t0:.2f} (s)")
@@ -182,7 +182,7 @@ def main(args):
     elif args.mode == "miss":
         print("===========================MISS===============================")    
         print(f"Loading {filename} into {device}.......")
-        pc = torch.load(filename)
+        pc = juice.model.ProbCircuit.load(filename)
         pc.to(device)
     
         # test_miss_mask = torch.zeros(test_data.size(), dtype=torch.bool)
@@ -219,7 +219,7 @@ def main(args):
         print("===========================ALPHAS===============================")
         t0 = time.time()
         print(f"Loading {filename} into {device}.......", end="")
-        pc = torch.load(filename)
+        pc = juice.model.ProbCircuit.load(filename)
         pc.to(device)
         t1 = time.time()
         print(f"Took {t1-t0:.2f} (s)")
