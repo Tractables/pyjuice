@@ -24,10 +24,10 @@ For now need to manually install pytorch's nightly build (cuda).
     pip install --editable .
     ```
 
-3. Install Pytorch Nightly Build
+3. Install Pytorch `2.0`.  See [pytorch installation guide](https://pytorch.org/get-started/locally/) for more details. Make sure to install version `>=2.0`.
 
     ```bash
-    pip3 install -I torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu118
+    pip3 install torch torchvision
     ```
 
 ## Testing
