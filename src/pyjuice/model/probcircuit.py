@@ -41,7 +41,7 @@ def _pc_inputs_hook(grad, pc, i):
     return grad
 
 class ProbCircuit(nn.Module):
-    def __init__(self, region_graph: RegionGraph, max_npartitions: Optional[int] = None) -> None:
+    def __init__(self, region_graph: RegionGraph, max_npartitions: Optional[int] = None, max_num_groups: int = 1) -> None:
         super().__init__()
 
         self.region_graph = self._convert_region_graph(region_graph, max_npartitions)
@@ -58,7 +58,7 @@ class ProbCircuit(nn.Module):
         # Experimental, wheter to do calculations NOT in logdomain. Does extra bookkeeping to avoid logsumexp.
         self.skip_logsumexp = False
 
-        self._init_layers()
+        self._init_layers(max_num_groups = max_num_groups)
 
         self._inputs = [None, None]
         self._inputs_grad = [None, None]
@@ -292,7 +292,8 @@ class ProbCircuit(nn.Module):
 
         return region_graph
 
-    def _init_layers(self, init_input_params: Optional[Sequence[torch.Tensor]] = None, init_inner_params: Optional[torch.Tensor] = None):
+    def _init_layers(self, init_input_params: Optional[Sequence[torch.Tensor]] = None, init_inner_params: Optional[torch.Tensor] = None,
+                     max_num_groups: int = 1):
         depth2rnodes, num_layers = self._create_region_node_layers()
 
         if hasattr(self, "input_layers") or hasattr(self, "inner_layers"):
@@ -330,7 +331,7 @@ class ProbCircuit(nn.Module):
                     "Depth {}: ({}, {})".format(depth, len(depth2rnodes[depth]["prod"]), len(depth2rnodes[depth]["sum"]))
 
                 # Product layer
-                prod_layer = ProdLayer(layer_id, depth2rnodes[depth]["prod"])
+                prod_layer = ProdLayer(layer_id, depth2rnodes[depth]["prod"], max_num_groups = max_num_groups)
 
                 if prod_layer.num_nodes + 1 > num_elements:
                     num_elements = prod_layer.num_nodes + 1
@@ -343,7 +344,8 @@ class ProbCircuit(nn.Module):
                                      cum_nodes = num_nodes, 
                                      param_ends = param_ends, 
                                      ch_prod_layer_size = prod_layer.num_nodes + 1,
-                                     sum_region_start_id = num_sum_regions)
+                                     sum_region_start_id = num_sum_regions,
+                                     max_num_groups = max_num_groups)
 
                 num_nodes += sum_layer.num_nodes
                 num_sum_regions += len(depth2rnodes[depth]["sum"])
