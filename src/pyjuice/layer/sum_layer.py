@@ -158,27 +158,6 @@ class SumLayer(Layer,nn.Module):
 
             node_start = node_end
 
-        '''self.register_buffer("parids", parids[1:,:]) # Strip away the dummy node
-        self.register_buffer("parpids", parpids[1:,:])
-
-        seq_ids0 = torch.zeros([tot_n_pars], dtype = torch.long)
-        seq_ids1 = torch.zeros([tot_n_pars], dtype = torch.long)
-        seq_parpids = torch.zeros([tot_n_pars], dtype = torch.long)
-        s_idx = 0
-        for idx in range(self.ch_prod_layer_size - 1):
-            num_pars = ch_n_pars[idx+1]
-            e_idx = s_idx + num_pars
-
-            seq_ids0[s_idx:e_idx] = torch.ones([num_pars], dtype = torch.long) * idx
-            seq_ids1[s_idx:e_idx] = torch.arange(num_pars)
-            seq_parpids[s_idx:e_idx] = parpids[idx+1, :num_pars]
-
-            s_idx = e_idx
-
-        self.register_buffer("seq_ids0", seq_ids0)
-        self.register_buffer("seq_ids1", seq_ids1)
-        self.register_buffer("seq_parpids", seq_parpids)'''
-
         # Find a good strategy to partition the child nodes into groups according to their number of parents 
         # to minimize total computation cost
         ch_n_pars = ch_n_pars[1:] # Strip away the dummy node. We will never use it in the following
