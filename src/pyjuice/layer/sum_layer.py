@@ -170,12 +170,12 @@ class SumLayer(Layer,nn.Module):
         grouped_seq_ids1 = []
         grouped_seq_parpids = []
         min_n_pars = 0
-        for max_n_chs in ch_group_sizes:
+        for max_n_pars in par_group_sizes:
             filter = (ch_n_pars >= min_n_pars) & (ch_n_pars <= max_n_pars)
             filtered_idxs = torch.where(filter)[0]
             curr_chids = (filtered_idxs + 1).clone()
-            curr_parids = parids[filtered_idxs+1,:max_n_chs].contiguous()
-            curr_parpids = parpids[filtered_idxs+1,:max_n_chs].contiguous()
+            curr_parids = parids[filtered_idxs+1,:max_n_pars].contiguous()
+            curr_parpids = parpids[filtered_idxs+1,:max_n_pars].contiguous()
 
             curr_tot_npar = ch_n_pars[filter].sum()
             curr_seq_ids0 = torch.zeros([curr_tot_npar], dtype = torch.long)
