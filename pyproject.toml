@@ -11,7 +11,8 @@ dependencies = [
     "torch",
     "typing",
     "triton",
-    "networkx"
+    "networkx",
+    "numba"
 ]
 authors = [
     {name="StarAI", email="guyvdb@cs.ucla.edu"},

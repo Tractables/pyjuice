@@ -72,10 +72,10 @@ class ProbCircuit(nn.Module):
         self._used_external_sum_params = False
 
     def forward(self, inputs: torch.Tensor, 
-                        params: Optional[torch.Tensor] = None, 
-                        input_params: Optional[Dict[str,torch.Tensor]] = None,
-                        missing_mask: Optional[torch.Tensor] = None
-                        ):
+                params: Optional[torch.Tensor] = None, 
+                input_params: Optional[Dict[str,torch.Tensor]] = None,
+                missing_mask: Optional[torch.Tensor] = None
+                ):
         if missing_mask is not None:
             assert inputs.size() == missing_mask.size(), f"inputs.size {inputs.size()} != mask.size {missing_mask.size()}" 
 
@@ -83,8 +83,7 @@ class ProbCircuit(nn.Module):
         inputs = inputs.permute(1, 0)
         if missing_mask is not None:
             missing_mask = missing_mask.permute(1, 0)
-        
-        
+
         self.node_mars = torch.empty([self.num_nodes, B], device = self.device)
         self.element_mars = torch.empty([self.num_elements, B], device = self.device)
 
