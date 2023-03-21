@@ -10,6 +10,7 @@ import logging
 import warnings
 from torch.utils.data import TensorDataset, DataLoader
 import argparse
+from typing import Optional
 
 warnings.filterwarnings("ignore")
 logging.getLogger("torch._inductor.utils").setLevel(logging.ERROR)
@@ -21,27 +22,28 @@ def process_args():
     parser.add_argument('--cuda', type=int, default=0, help='cuda idx')
     parser.add_argument('--num_latents', type=int, default=32, help='num_latents')
     parser.add_argument("--mode", type=str, default="train", help="options: 'train', 'load'")
-    parser.add_argument("--output_dir", type=str, default="examples", help="output directory")
     parser.add_argument("--dataset", type=str, default="mnist", help="mnist, fashion")
+    parser.add_argument("--input_circuit", type=str, default=None, help="load circuit from file instead of learning structure")
+    parser.add_argument("--output_dir", type=str, default="examples", help="output directory")
     args = parser.parse_args()
     return args
 
-def evaluate(pc: juice.ProbCircuit, loader: DataLoader):
+def evaluate(pc: juice.ProbCircuit, loader: DataLoader, alphas: Optional[torch.Tensor]=None):
     lls_total = 0.0
     for batch in loader:
         x = batch[0].to(pc.device)
-        lls = pc(x)
+        lls = pc(x, alphas=alphas)
         lls_total += lls.mean().detach().cpu().numpy().item()
     
     lls_total /= len(loader)
     return lls_total
 
-def evaluate_miss(pc: juice.ProbCircuit, loader: DataLoader):
+def evaluate_miss(pc: juice.ProbCircuit, loader: DataLoader, alphas: Optional[torch.Tensor]=None):
     lls_total = 0.0
     for batch in loader:
         x = batch[0].to(pc.device)
         mask = batch[1].to(pc.device)
-        lls = pc(x, missing_mask=mask)
+        lls = pc(x, missing_mask=mask, alphas=alphas)
         lls_total += lls.mean().detach().cpu().numpy().item()
     
     lls_total /= len(loader)
@@ -95,13 +97,37 @@ def full_batch_em_epoch(pc, train_loader, test_loader, device):
         t2 = time.time()
         print(f"[train LL: {train_ll:.2f}; test LL: {test_ll:.2f}].....[train forward+backward+step {t1-t0:.2f}; test forward {t2-t1:.2f}] ")
 
+def load_circuit(filename, verbose=False, device=None):
+    t0 = time.time()
+    if verbose:
+        print(f"Loading circuit....{filename}.....", end="")
+    pc = juice.model.ProbCircuit.load(filename)
+    if device is not None:
+        print(f"...into device {device}...", end="")
+        pc.to(device)
+    t1 = time.time()
+    if verbose:
+        print(f"Took {t1-t0:.2f} (s)")
+        print("pc params size", pc.params.size())
+        print("pc num nodes ", pc.num_nodes)
+
+    return pc
+
+def save_circuit(pc, filename, verbose=False):
+    if verbose:
+        print(f"Saving pc into {filename}.....", end="")
+    t0_save = time.time()
+    torch.save(pc, filename)
+    t1_save = time.time()
+    if verbose:
+        print(f"took {t1_save - t0_save:.2f} (s)")
+    
 
 def main(args):
     torch.cuda.set_device(args.cuda)
     device = torch.device(f"cuda:{args.cuda}")
     filename = f"{args.output_dir}/{args.dataset}_{args.num_latents}.torch"
     
-
     if args.dataset == "mnist":
         train_dataset = torchvision.datasets.MNIST(root = "./examples/data", train = True, download = True)
         test_dataset = torchvision.datasets.MNIST(root = "./examples/data", train = False, download = True)
@@ -110,8 +136,7 @@ def main(args):
         test_dataset = torchvision.datasets.FashionMNIST(root = "./examples/data", train = False, download = True)
     else:
         raise(f"Dataset {args.dataset} not supported.")
-    
-    
+     
     train_data = train_dataset.data.reshape(60000, 28*28)
     test_data = test_dataset.data.reshape(10000, 28*28)
 
@@ -132,12 +157,15 @@ def main(args):
 
     if args.mode == "train":
         print("===========================Train===============================")
-        pc = juice.structures.HCLT(train_data.float().to(device), num_bins = 32, 
-                                                                    sigma = 0.5 / 32, 
-                                                                    num_latents = args.num_latents, 
-                                                                    chunk_size = 32)
-        pc.to(device)
-
+        if args.input_circuit is None:
+            pc = juice.structures.HCLT(train_data.float().to(device), num_bins = 32, 
+                                                                        sigma = 0.5 / 32, 
+                                                                        num_latents = args.num_latents, 
+                                                                        chunk_size = 32)
+            pc.to(device)
+        else:
+            pc = load_circuit(args.input_circuit, verbose=True, device=device)
+        
         optimizer = juice.optim.CircuitOptimizer(pc, lr = 0.1, pseudocount = 0.1)
         scheduler = juice.optim.CircuitScheduler(optimizer, method = "multi_linear", 
                                                             lrs = [0.9, 0.1, 0.05], 
@@ -145,21 +173,12 @@ def main(args):
 
         mini_batch_em_epoch(350, pc, optimizer, scheduler, train_loader, test_loader, device)
         full_batch_em_epoch(pc, train_loader, test_loader, device)
-        
-        print(f"Saving pc into {filename}.....", end="")
-        t0_save = time.time()
-        torch.save(pc, filename)
-        t1_save = time.time()
-        print(f"took {t1_save - t0_save:.2f} (s)")
+        save_circuit(pc, filename, verbose=True)
+
 
     elif args.mode == "load":
         print("===========================LOAD===============================")
-        t0 = time.time()
-        print(f"Loading {filename} into {device}.......", end="")
-        pc = torch.load(filename)
-        pc.to(device)
-        t1 = time.time()
-        print(f"Took {t1-t0:.2f} (s)")
+        pc = load_circuit(filename, verbose=True, device=device)
 
         t_compile = time.time()
         test_ll = evaluate(pc, loader=test_loader) # force compilation
@@ -180,12 +199,12 @@ def main(args):
     elif args.mode == "miss":
         print("===========================MISS===============================")    
         print(f"Loading {filename} into {device}.......")
-        pc = torch.load(filename)
-        pc.to(device)
+        pc = load_circuit(filename, verbose=True, device=device)
     
-        test_miss_mask = torch.zeros(test_data.size(), dtype=torch.bool)
-        test_miss_mask[1:5000, 0:392] = 1 # for first half of images make first half missing
-        test_miss_mask[5000:, 392:] = 1   # for second half of images make second half missing
+        # test_miss_mask = torch.zeros(test_data.size(), dtype=torch.bool)
+        # test_miss_mask[1:5000, 0:392] = 1 # for first half of images make first half missing
+        # test_miss_mask[5000:, 392:] = 1   # for second half of images make second half missing
+        test_miss_mask = torch.rand(test_data.size()) < 0.5
 
         test_loader_miss = DataLoader(
             dataset = TensorDataset(test_data, test_miss_mask),
@@ -212,6 +231,24 @@ def main(args):
         print(f"train_ll: {train_ll:.2f}, train_bpd: {train_bpd:.2f}; time = {t1-t0:.2f} (s)")
         print(f"test_ll: {test_ll:.2f}, test_bpd: {test_bpd:.2f}; time = {t2-t1:.2f} (s)")
         print(f"test_miss_ll: {test_ll_miss:.2f}, test_miss_bpd: {test_miss_bpd:.2f}; time = {t3-t2:.2f} (s)")
+    elif args.mode == "alphas":
+        print("===========================ALPHAS===============================")
+        pc = load_circuit(filename, verbose=True, device=device)
+
+        alphas = 0.99 * torch.ones((args.batch_size, 28*28), device=device)
+        test_ll = evaluate(pc, loader=test_loader) 
+        train_ll = evaluate(pc, loader=train_loader)
+
+        t0 = time.time()
+        train_ll_alpha = evaluate(pc, loader=train_loader, alphas=alphas)
+        t1 = time.time()
+        test_ll_alpha = evaluate(pc, loader=test_loader, alphas=alphas)
+        t2 = time.time()
+        
+        print(f"train_ll: {train_ll:.2f}, test_ll: {test_ll:.2f}")
+        print(f"train_ll_alpha: {train_ll_alpha:.2f}, test_ll_alpha: {test_ll_alpha:.2f}")
+        print(f"train {t1-t0:.2f} (s); test {t2-t1:.2f} (s)")
+    
 
     print(f"Memory allocated: {torch.cuda.memory_allocated(device) / 1024 / 1024 / 1024:.1f}GB")
     print(f"Memory reserved: {torch.cuda.memory_reserved(device) / 1024 / 1024 / 1024:.1f}GB")

@@ -90,7 +90,11 @@ class CategoricalLayer(InputLayer):
         # Batch size of parameters in the previous forward pass
         self._param_batch_size = 1
 
-    def forward(self, data: torch.Tensor, node_mars: torch.Tensor, params: Optional[Dict] = None, missing_mask: Optional[torch.Tensor]=None,  skip_logsumexp: bool = False):
+    def forward(self, data: torch.Tensor, node_mars: torch.Tensor, 
+                                        params: Optional[Dict] = None, 
+                                        missing_mask: Optional[torch.Tensor]=None,  
+                                        alphas:Optional[torch.Torch]=None,
+                                        skip_logsumexp: bool = False):
         """
         data: [num_vars, B]
         node_mars: [num_nodes, B]
@@ -107,7 +111,7 @@ class CategoricalLayer(InputLayer):
         if skip_logsumexp:
             self._dense_forward_pass_nolog(data, node_mars, params)
         else:
-            self._dense_forward_pass(data, node_mars, params, missing_mask=missing_mask)
+            self._dense_forward_pass(data, node_mars, params, missing_mask=missing_mask, alphas=alphas)
 
         return None
 
@@ -140,7 +144,11 @@ class CategoricalLayer(InputLayer):
         return {"params": torch.Size([self.params.size(0)])}
 
     @torch.compile(mode = "default")
-    def _dense_forward_pass(self, data: torch.Tensor, node_mars: torch.Tensor, params: torch.Tensor, missing_mask: Optional[torch.Tensor]=None):
+    def _dense_forward_pass(self, data: torch.Tensor, node_mars: torch.Tensor,
+                                                            params: torch.Tensor, 
+                                                            missing_mask: Optional[torch.Tensor]=None, 
+                                                            alphas:Optional[torch.Tensor]=None):
+        
         sid, eid = self._output_ind_range[0], self._output_ind_range[1]
         param_idxs = data[self.vids] + self.psids.unsqueeze(1)
         if missing_mask is not None:
@@ -149,6 +157,10 @@ class CategoricalLayer(InputLayer):
             node_mars[sid:eid,:][mask] = 0.0
         else:
             node_mars[sid:eid,:] = ((params[param_idxs]).clamp(min=1e-10)).log()            
+
+        if alphas is not None:
+            node_mars[sid:eid,:] = ((node_mars[sid:eid,:].exp() * alphas[self.vids]) + (1 - alphas[self.vids])).log()
+
         return None
 
     @torch.compile(mode = "default")

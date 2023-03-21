@@ -45,21 +45,25 @@ class ProbCircuit(nn.Module):
         super().__init__()
 
         self.region_graph = self._convert_region_graph(region_graph, max_npartitions)
-
         self.device = torch.device("cpu")
+        
+        # Experimental, wheter to do calculations NOT in logdomain. Does extra bookkeeping to avoid logsumexp.
+        self.skip_logsumexp = False
 
+        self._init_pass_tensors_()
+        self._init_layers(max_num_groups = max_num_groups)
+        self._init_ad_tensors()
+
+    def _init_pass_tensors_(self):
         self.node_mars = None
         self.element_mars = None
         self.node_flows = None
         self.element_flows = None
         self.param_flows = None
         self.sum_region_mars = None
+        self.alphas = None
 
-        # Experimental, wheter to do calculations NOT in logdomain. Does extra bookkeeping to avoid logsumexp.
-        self.skip_logsumexp = False
-
-        self._init_layers(max_num_groups = max_num_groups)
-
+    def _init_ad_tensors(self):
         self._inputs = [None, None]
         self._inputs_grad = [None, None]
         self._backward_buffer = dict()
@@ -68,22 +72,28 @@ class ProbCircuit(nn.Module):
             "compute_param_flows": True,
             "flows_memory": 0.0
         }
-
         self._used_external_sum_params = False
+        
 
     def forward(self, inputs: torch.Tensor, 
-                params: Optional[torch.Tensor] = None, 
-                input_params: Optional[Dict[str,torch.Tensor]] = None,
-                missing_mask: Optional[torch.Tensor] = None
-                ):
+                        params: Optional[torch.Tensor] = None, 
+                        input_params: Optional[Dict[str,torch.Tensor]] = None,
+                        missing_mask: Optional[torch.Tensor] = None,
+                        alphas: Optional[torch.Tensor]=None,
+                        ):
         if missing_mask is not None:
             assert inputs.size() == missing_mask.size(), f"inputs.size {inputs.size()} != mask.size {missing_mask.size()}" 
+        
+        if alphas is not None:
+            assert inputs.size() == alphas.size(), f"inputs.size() {inputs.size()} != alphas.size() {alphas.size()}" 
 
         B = inputs.size(0)
         inputs = inputs.permute(1, 0)
+        if alphas is not None:
+            alphas = alphas.permute(1, 0)
         if missing_mask is not None:
             missing_mask = missing_mask.permute(1, 0)
-
+        
         self.node_mars = torch.empty([self.num_nodes, B], device = self.device)
         self.element_mars = torch.empty([self.num_elements, B], device = self.device)
 
@@ -125,7 +135,7 @@ class ProbCircuit(nn.Module):
                 else:
                     layer_params = None
 
-                layer(inputs, self.node_mars, params = layer_params, missing_mask=missing_mask, skip_logsumexp = self.skip_logsumexp)
+                layer(inputs, self.node_mars, params = layer_params, missing_mask=missing_mask, skip_logsumexp = self.skip_logsumexp, alphas=alphas)
 
             for ltype, layer in self.inner_layers:
                 if ltype == "prod":
@@ -269,6 +279,18 @@ class ProbCircuit(nn.Module):
             layer.init_param_flows(flows_memory = flows_memory)
 
         return None
+    
+    @staticmethod
+    def load(filename):
+        pc = torch.load(filename, map_location='cpu')
+        pc._init_pass_tensors_()
+        pc._init_ad_tensors()
+
+        for layer in pc.input_layers:
+            layer.param_flows = None
+    
+        return pc
+    
 
     def to(self, device):
         super(ProbCircuit, self).to(device)
