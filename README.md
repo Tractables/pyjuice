@@ -22,10 +22,10 @@ Probabilistic Circuits Package
     pip install --editable .
     ```
 
-3. Install Pytorch `2.0`.  See [pytorch installation guide](https://pytorch.org/get-started/locally/) for more details. Make sure to install version `>=2.0`.
+3. Install GPU Enabled Pytorch `2.0`.  See [pytorch installation guide](https://pytorch.org/get-started/locally/) for more details. Make sure to install version `>=2.0`.
 
     ```bash
-    pip3 install torch torchvision
+    pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
     ```
 
 ## Testing
