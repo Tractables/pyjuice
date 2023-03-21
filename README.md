@@ -7,8 +7,6 @@ Probabilistic Circuits Package
 
 ## Installation
 
-For now need to manually install pytorch's nightly build (cuda).
-
 0. (Optional) Make a new conda environment
 
     ```bash
