@@ -225,10 +225,45 @@ class SumLayer(Layer,nn.Module):
         else:
             self._dense_forward_pass(node_mars, element_mars, params)
 
-    def backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor, node_mars: torch.Tensor, 
-                    element_mars: torch.Tensor, params: torch.Tensor, param_flows: Optional[torch.Tensor] = None,
-                    sum_region_mars: Optional[torch.Tensor] = None,
-                    skip_logsumexp: bool = False):
+    @torch.compile(mode = "reduce-overhead", fullgraph = True)
+    def sample(self, node_flows: torch.Tensor, 
+                        element_flows: torch.Tensor, 
+                        node_mars: torch.Tensor, 
+                        element_mars: torch.Tensor, 
+                        params: torch.Tensor):
+        """
+        node_flows:         [num_nodes, B]
+        element_flows:      [max_num_els, B]
+        node_mars:          [num_nodes, B]
+        element_mars:       [max_num_els, B]
+        params:             [num_params] or [num_params, B]
+        """
+        if params.dim() == 1:
+            params = params.unsqueeze(1)
+
+        for group_id in range(self.num_backward_groups):
+            chids = self.grouped_chids[group_id]
+            parids = self.grouped_parids[group_id]
+            parpids = self.grouped_parpids[group_id]
+
+            # TODO (for each sum node n need to sample a child proportional to theta_{c|n} * pr_c
+            #      
+            #      that child c* will have all the flow 
+            #       flow_c* = 1 * flow_n
+            #       flow_c = 0 * flow_n for every other c
+            temp = node_flows[parids] * params[parpids] * node_mars[parids].exp()
+            # 
+            # element_flows[chids] = node_flows[parpids] 
+
+
+    def backward(self, node_flows: torch.Tensor, 
+                        element_flows: torch.Tensor, 
+                        node_mars: torch.Tensor, 
+                        element_mars: torch.Tensor, 
+                        params: torch.Tensor, 
+                        param_flows: Optional[torch.Tensor] = None,
+                        sum_region_mars: Optional[torch.Tensor] = None,
+                        skip_logsumexp: bool = False):
         """
         node_flows: [num_nodes, B]
         element_flows: [max_num_els, B]
