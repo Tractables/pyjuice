@@ -132,6 +132,12 @@ class CategoricalLayer(InputLayer):
         self._flows_kernel[grid](self.param_flows, node_flows, param_ids, layer_num_nodes, tot_num_nodes, batch_size, node_offset, BLOCK_SIZE = 1024)
         
         return None
+    
+    def sample(self, samples: torch.Tensor, missing_mask:torch.tensor, node_flows: torch.tensor):
+        # sample and replace only the missing values (input nodes should have either flow 0 or 1, 1 mean being active and should sample using that input node)
+        # only sample when missing_mask is True for that feature and input.
+        pass
+
 
     def mini_batch_em(self, step_size: float, pseudocount: float = 0.0):
         if not self._used_external_params:

@@ -242,18 +242,24 @@ class SumLayer(Layer,nn.Module):
             params = params.unsqueeze(1)
 
         for group_id in range(self.num_backward_groups):
+            nids = self.grouped_nids[group_id]
+            cids = self.grouped_cids[group_id]
+            pids = self.grouped_pids[group_id]
+
             chids = self.grouped_chids[group_id]
             parids = self.grouped_parids[group_id]
             parpids = self.grouped_parpids[group_id]
 
             # TODO (for each sum node n need to sample a child proportional to theta_{c|n} * pr_c
-            #      
             #      that child c* will have all the flow 
             #       flow_c* = 1 * flow_n
             #       flow_c = 0 * flow_n for every other c
-            temp = node_flows[parids] * params[parpids] * node_mars[parids].exp()
-            # 
-            # element_flows[chids] = node_flows[parpids] 
+            probs = params[pids] * element_mars[cids].exp()           # (num_sum_nodes, max_sum_children)
+            rand = torch.rand((nids.shape[0], 1), device=self.device) # (num_sum_nodes) 
+            cummul_probs = torch.cumsum(probs[:, 0:-1], -1)
+            sampled_idx = torch.sum(rand > cummul_probs, -1).long()   # (num_sum_nodes)
+
+            # element_flows[chids] += node_flows[nids] * sampled_flows[parpids] 
 
 
     def backward(self, node_flows: torch.Tensor, 
