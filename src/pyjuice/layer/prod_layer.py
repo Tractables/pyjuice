@@ -126,7 +126,7 @@ class ProdLayer(Layer,nn.Module):
         element_flows: [max_num_els, B]
         """
         if skip_logsumexp:
-            self._dense_forward_pass_nolog(node_flows, element_flows)
+            self._dense_backward_pass_nolog(node_flows, element_flows)
         else:
             self._dense_backward_pass(node_flows, element_flows)
 
@@ -149,6 +149,17 @@ class ProdLayer(Layer,nn.Module):
             element_mars[nids,:] = node_mars[cids].prod(dim = 1)
 
         return None
+    
+    @torch.compile(mode = "reduce-overhead")
+    def _dense_backward_pass_nolog(self, node_flows: torch.Tensor, element_flows: torch.Tensor):
+        for group_id in range(self.num_backward_groups):
+            parids = self.grouped_parids[group_id]
+            u_cids = self.grouped_u_cids[group_id]
+
+            node_flows[u_cids] += element_flows[parids].prod(dim = 1)
+        
+        return None
+
 
     @torch.compile(mode = "reduce-overhead")
     def _dense_backward_pass(self, node_flows: torch.Tensor, element_flows: torch.Tensor):
