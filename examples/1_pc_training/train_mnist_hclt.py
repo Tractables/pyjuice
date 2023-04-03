@@ -248,7 +248,25 @@ def main(args):
         print(f"train_ll: {train_ll:.2f}, test_ll: {test_ll:.2f}")
         print(f"train_ll_alpha: {train_ll_alpha:.2f}, test_ll_alpha: {test_ll_alpha:.2f}")
         print(f"train {t1-t0:.2f} (s); test {t2-t1:.2f} (s)")
-    
+
+    elif args.mode == "sample":
+        print("===========================SAMPLE===============================")
+        pc = load_circuit(filename, verbose=True, device=device)
+        pc.to(device)
+
+        for batch in train_loader:
+            x = batch[0].to(device)
+            miss_mask = torch.zeros(x.size(), dtype=torch.bool, device=device)
+            miss_mask[:, 1:100] = 1 
+
+            # 1. Run Forward Pass
+            lls = pc(x, missing_mask=miss_mask)
+            print(lls.mean().squeeze().detach().item())
+            # 2. Sample with backward
+            samples = pc.sample(x, miss_mask)
+
+            print(samples.size())
+            break # only want to sample from first batch
 
     print(f"Memory allocated: {torch.cuda.memory_allocated(device) / 1024 / 1024 / 1024:.1f}GB")
     print(f"Memory reserved: {torch.cuda.memory_reserved(device) / 1024 / 1024 / 1024:.1f}GB")

@@ -254,12 +254,28 @@ class SumLayer(Layer,nn.Module):
             #      that child c* will have all the flow 
             #       flow_c* = 1 * flow_n
             #       flow_c = 0 * flow_n for every other c
-            probs = params[pids] * element_mars[cids].exp()           # (num_sum_nodes, max_sum_children)
-            rand = torch.rand((nids.shape[0], 1), device=self.device) # (num_sum_nodes) 
-            cummul_probs = torch.cumsum(probs[:, 0:-1], -1)
-            sampled_idx = torch.sum(rand > cummul_probs, -1).long()   # (num_sum_nodes)
+            probs = params[pids] * element_mars[cids].exp()                    # (num_sum_nodes, max_sum_children, batch_size)
+            cummul_probs = torch.cumsum(probs[:, 0:-1], -1)                    # (num_sum_nodes, max_sum_children, batch_size)
+            rand = torch.rand((nids.shape[0], 1, probs.size(2))).cuda()#, device=self.device) # (num_sum_nodes, 1, batch_size)
 
-            # element_flows[chids] += node_flows[nids] * sampled_flows[parpids] 
+            print("probs", probs.shape)
+            print("rand", rand.shape)
+            print("cummul_probs", cummul_probs.shape)
+            
+            sampled_idx = torch.sum(rand > cummul_probs, -2).long()   # (num_sum_nodes, batch_size)
+            
+            print("nids", nids.shape)
+            print("cids", cids.shape)
+            print("chids", chids.shape)
+            print("sampled_idx", sampled_idx.shape)
+            print("element_flows[chids]", element_flows[chids].shape)
+            print("node_flows[nids]",  node_flows[nids].shape)
+            # print("nids[sampled_idx]", nids[sampled_idx].shape)
+            # chids torch.Size([1440])
+            # sampled_idx torch.Size([1440, 512])            
+
+            # element_flows[chids] += node_flows[nids]
+            print('--------------------')
 
 
     def backward(self, node_flows: torch.Tensor, 

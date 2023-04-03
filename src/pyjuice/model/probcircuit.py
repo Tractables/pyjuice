@@ -287,7 +287,7 @@ class ProbCircuit(nn.Module):
             for idx, layer in enumerate(self.input_layers):
                 layer.sample(samples, missing_mask, self.node_flows)
 
-        return samples.permutes(1, 0)
+        return samples.permute(1, 0)
         
 
 
