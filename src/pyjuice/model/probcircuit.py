@@ -476,40 +476,6 @@ class ProbCircuit(nn.Module):
         if params is not None:
             normalize_parameters(params, self.node_ids, self.node_nchs, pseudocount)
 
-    @staticmethod
-    @triton.jit
-    def _cum_params_kernel(params_ptr, cum_params_ptr, node_ids_ptr, tot_num_params, BLOCK_SIZE: tl.constexpr):
-        pid = tl.program_id(axis = 0)
-        block_start = pid * BLOCK_SIZE
-
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < tot_num_params
-
-        n_offsets = tl.load(node_ids_ptr + offsets, mask = mask, other = 0)
-
-        params = tl.load(params_ptr + offsets, mask = mask, other = 0)
-
-        tl.atomic_add(cum_params_ptr + n_offsets, params, mask = mask)
-
-    @staticmethod
-    @triton.jit
-    def _norm_params_kernel(params_ptr, cum_params_ptr, node_ids_ptr, node_nchs_ptr, tot_num_params, 
-                            pseudocount, BLOCK_SIZE: tl.constexpr):
-        pid = tl.program_id(axis = 0)
-        block_start = pid * BLOCK_SIZE
-
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < tot_num_params
-
-        n_offsets = tl.load(node_ids_ptr + offsets, mask = mask, other = 0)
-
-        params = tl.load(params_ptr + offsets, mask = mask, other = 0)
-        cum_params = tl.load(cum_params_ptr + n_offsets, mask = mask, other = 1)
-        nchs = tl.load(node_nchs_ptr + n_offsets, mask = mask, other = 1)
-
-        normed_params = (params + pseudocount / nchs) / (cum_params + pseudocount)
-        tl.store(params_ptr + offsets, normed_params, mask = mask)
-
     def _extract_params_to_rnodes(self):
         """
         Extract all inner and input parameters from this ProbCircuit to individual region nodes.

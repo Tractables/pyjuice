@@ -134,8 +134,18 @@ class CategoricalLayer(InputLayer):
         return None
     
     def sample(self, samples: torch.Tensor, missing_mask:torch.tensor, node_flows: torch.tensor):
+        # ONLY replace when its both missing and has positive node_flow
         # sample and replace only the missing values (input nodes should have either flow 0 or 1, 1 mean being active and should sample using that input node)
         # only sample when missing_mask is True for that feature and input.
+        sid, eid = self._output_ind_range[0], self._output_ind_range[1]
+        param_idxs = self.psids.unsqueeze(1)
+
+        print("param_idxs", param_idxs.shape)
+        print("missing_mask", missing_mask.shape)
+        print("node_flows", node_flows.shape)
+        print(sid, eid)
+        print(node_flows[sid:eid, :].sum(dim=0))
+        print(missing_mask.sum(dim=0))
         pass
 
 
@@ -178,40 +188,6 @@ class CategoricalLayer(InputLayer):
 
     def _normalize_parameters(self, params, pseudocount: float = 0.0):
         normalize_parameters(params, self.node_ids, self.node_nchs, pseudocount)
-
-    @staticmethod
-    @triton.jit
-    def _cum_params_kernel(params_ptr, cum_params_ptr, node_ids_ptr, tot_num_params, BLOCK_SIZE: tl.constexpr):
-        pid = tl.program_id(axis = 0)
-        block_start = pid * BLOCK_SIZE
-
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < tot_num_params
-
-        n_offsets = tl.load(node_ids_ptr + offsets, mask = mask, other = 0)
-
-        params = tl.load(params_ptr + offsets, mask = mask, other = 0)
-
-        tl.atomic_add(cum_params_ptr + n_offsets, params, mask = mask)
-
-    @staticmethod
-    @triton.jit
-    def _norm_params_kernel(params_ptr, cum_params_ptr, node_ids_ptr, node_nchs_ptr, tot_num_params, 
-                            pseudocount, BLOCK_SIZE: tl.constexpr):
-        pid = tl.program_id(axis = 0)
-        block_start = pid * BLOCK_SIZE
-
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < tot_num_params
-
-        n_offsets = tl.load(node_ids_ptr + offsets, mask = mask, other = 0)
-
-        params = tl.load(params_ptr + offsets, mask = mask, other = 0)
-        cum_params = tl.load(cum_params_ptr + n_offsets, mask = mask, other = 1)
-        nchs = tl.load(node_nchs_ptr + n_offsets, mask = mask, other = 1)
-
-        normed_params = (params + pseudocount / nchs) / (cum_params + pseudocount)
-        tl.store(params_ptr + offsets, normed_params, mask = mask)
 
     @staticmethod
     @triton.jit

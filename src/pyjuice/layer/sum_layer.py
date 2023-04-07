@@ -247,7 +247,7 @@ class SumLayer(Layer,nn.Module):
             pids = self.grouped_pids[group_id]
 
             chids = self.grouped_chids[group_id]
-    
+
             # For each sum node `n` we need to sample a child proportional to theta_{c|n} * pr_c
             # That child c* will have all the flow_c (and flow_c was either 0 or 1), i.e:
             #       flow_c* = flow_n
