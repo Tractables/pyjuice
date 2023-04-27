@@ -225,7 +225,7 @@ class SumLayer(Layer,nn.Module):
         else:
             self._dense_forward_pass(node_mars, element_mars, params)
 
-    # @torch.compile(mode = "reduce-overhead", fullgraph = True)
+    @torch.compile(mode = "reduce-overhead", fullgraph = True)
     def sample(self, node_flows: torch.Tensor, 
                         element_flows: torch.Tensor, 
                         node_mars: torch.Tensor, 
@@ -243,7 +243,7 @@ class SumLayer(Layer,nn.Module):
 
         for group_id in range(self.num_backward_groups):
             nids = self.grouped_nids[group_id]
-            cids = self.grouped_cids[group_id]
+            cids = self.grouped_cids[group_id]   # (num_sum_nodes, max_sum_children)
             pids = self.grouped_pids[group_id]
 
             chids = self.grouped_chids[group_id]
@@ -253,9 +253,13 @@ class SumLayer(Layer,nn.Module):
             #       flow_c* = flow_n
             #       flow_c =  0 for every other c != c*
             probs = params[pids] * element_mars[cids].exp()                                      # (num_sum_nodes, max_sum_children, batch_size)
-            cummul_probs = torch.cumsum(probs[:, 0:-1, :], -2)                                   # (num_sum_nodes, max_sum_children, batch_size)
-            rand = cummul_probs[:,-1:,:] * torch.rand((probs.size(0), 1, probs.size(2))).cuda()  # (num_sum_nodes, 1, batch_size)
-            sampled_idx = torch.sum(rand > cummul_probs, -2).long()                              # (num_sum_nodes, batch_size)            
+            cummul_probs = torch.cumsum(probs[:, :, :], 1)                                       # (num_sum_nodes, max_sum_children, batch_size)
+            cummul_probs = cummul_probs[:, -1:, :]                                               # (num_sum_nodes, 1, batch_size)
+            
+            rand = torch.rand((probs.size(0), 1, probs.size(2))).cuda()                          # (num_sum_nodes, 1, batch_size)
+            rand = cummul_probs * rand                                                           # (num_sum_nodes, 1, batch_size)   
+
+            sampled_idx = torch.sum(rand > cummul_probs, dim=1).long()                           # (num_sum_nodes, batch_size)             
             sampled_child_ids = torch.gather(cids, 1, sampled_idx)                               # (num_sum_nodes, batch_size)
             element_flows[chids] = torch.scatter_add(element_flows[chids], dim=0, index=sampled_child_ids, src=node_flows[nids])
 
