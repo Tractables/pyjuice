@@ -145,7 +145,6 @@ class CategoricalLayer(InputLayer):
         # only sample when missing_mask is True for that feature and input...
         sid, eid = self._output_ind_range[0], self._output_ind_range[1]
         
-
         # print("Bad (0 is good)", torch.sum(node_flows[sid:eid, :].sum(dim=0) != samples.size(0)))
         
         node_active_idxs = node_flows[sid:eid, :].nonzero()                 # (num_vars * B, 2)
@@ -159,23 +158,23 @@ class CategoricalLayer(InputLayer):
         # Mask of which feaures/input need to be replaced
         replace_mask = active_mask * missing_mask
         replace_idxs = replace_mask.nonzero()                               # (to be replaced, 2)
-        rands = torch.rand(replace_idxs.size(0)).cuda()                     # (to be replaced)
+        rands = torch.rand(replace_idxs.size(0), 1).cuda()                  # (to be replaced, 1)
 
+        # TODO fix later, for now assume constant number of cats 
+        # need a custome kernel probably
+        num_cats = self.psids[1] 
+        cummulp = self.params.view(-1, num_cats).cumsum(1)
 
-        param_idxs = self.psids.unsqueeze(1) # (num_nodes, 1)
-        replacement = samples.clone() # TODO replacements need to replace with samples
-        samples[missing_mask] = replacement[missing_mask]
+        replace_cummul_ps = cummulp[replace_idxs[:, 0]]
+        sampled_cats = torch.sum(rands > replace_cummul_ps, dim=1).to(samples.dtype)
+        samples[replace_mask] = sampled_cats
 
-
-        # print("vids", self.vids.size())
-        # print("psids", self.psids.size())
-        # print(node_active_idxs.shape)
-        # print(var_idxs.shape)
-        # print(mask_active_idx.shape)
-
-        # print(active_mask.sum())
-        # print(missing_mask.sum())
-        # print(final_mask.sum())
+        # print("rands", rands.size())
+        # print("cummulp", cummulp.size())
+        # print("replace_cummul_ps", replace_cummul_ps.size())
+        # print("replace_mask", replace_mask.size())
+        # print("samples[replace_mask]", samples[replace_mask].size())
+        # print("sampled_cats", sampled_cats.size())
 
 
     def mini_batch_em(self, step_size: float, pseudocount: float = 0.0):

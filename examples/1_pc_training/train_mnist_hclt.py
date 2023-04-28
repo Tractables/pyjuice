@@ -11,10 +11,14 @@ import warnings
 from torch.utils.data import TensorDataset, DataLoader
 import argparse
 from typing import Optional
+from PIL import Image
+from matplotlib import pyplot as plt
 
 warnings.filterwarnings("ignore")
 logging.getLogger("torch._inductor.utils").setLevel(logging.ERROR)
 logging.getLogger("torch._inductor.compile_fx").setLevel(logging.ERROR)
+logging.getLogger("torch._inductor.lowering").setLevel(logging.ERROR)
+logging.getLogger("torch._inductor.graph").setLevel(logging.ERROR)
 
 def process_args():
     parser = argparse.ArgumentParser()
@@ -257,7 +261,7 @@ def main(args):
         for batch in train_loader:
             x = batch[0].to(device)
             miss_mask = torch.zeros(x.size(), dtype=torch.bool, device=device)
-            miss_mask[:, 1:100] = 1 
+            miss_mask[:, 0:100] = 1 
 
             # 1. Run Forward Pass
             lls = pc(x, missing_mask=miss_mask)
@@ -265,8 +269,16 @@ def main(args):
             # 2. Sample with backward
             samples = pc.sample(x, miss_mask)
 
-            print(samples.size())
-            break # only want to sample from first batch
+            # Plot first 8 Samples
+            plt.figure()
+            f, axarr = plt.subplots(3, 8, figsize=(28, 10))
+            plt.gray()
+            for i in range(8):
+                axarr[0][i].imshow(x[i, :].reshape(28,28).cpu().numpy().astype(np.uint8))
+                axarr[1][i].imshow(255*miss_mask[i, :].reshape(28,28).cpu().numpy().astype(np.uint8))
+                axarr[2][i].imshow(samples[i, :].reshape(28,28).cpu().numpy().astype(np.uint8))
+            plt.savefig(f"examples/1_pc_training/samples_test.png")  
+            break # only want to sample from first batch for debugging
 
     print(f"Memory allocated: {torch.cuda.memory_allocated(device) / 1024 / 1024 / 1024:.1f}GB")
     print(f"Memory reserved: {torch.cuda.memory_reserved(device) / 1024 / 1024 / 1024:.1f}GB")
