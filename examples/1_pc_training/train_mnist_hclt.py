@@ -255,25 +255,33 @@ def main(args):
 
     elif args.mode == "sample":
         print("===========================SAMPLE===============================")
+        device="cpu"
         pc = load_circuit(filename, verbose=True, device=device)
         pc.to(device)
+
+        train_loader = DataLoader(
+            dataset = TensorDataset(train_data),
+            batch_size = 4,
+            shuffle = False,
+            drop_last = False
+        )
 
         for batch in train_loader:
             x = batch[0].to(device)
             miss_mask = torch.zeros(x.size(), dtype=torch.bool, device=device)
-            miss_mask[:, 0:100] = 1 
-
+            miss_mask[:, 0:14*28] = 1 
             # 1. Run Forward Pass
             lls = pc(x, missing_mask=miss_mask)
             print(lls.mean().squeeze().detach().item())
             # 2. Sample with backward
             samples = pc.sample(x, miss_mask)
 
-            # Plot first 8 Samples
+            # Plot first 4 Samples
+            print("Saving Samples as images to file")
             plt.figure()
-            f, axarr = plt.subplots(3, 8, figsize=(28, 10))
+            f, axarr = plt.subplots(3, 4, figsize=(28, 10))
             plt.gray()
-            for i in range(8):
+            for i in range(4):
                 axarr[0][i].imshow(x[i, :].reshape(28,28).cpu().numpy().astype(np.uint8))
                 axarr[1][i].imshow(255*miss_mask[i, :].reshape(28,28).cpu().numpy().astype(np.uint8))
                 axarr[2][i].imshow(samples[i, :].reshape(28,28).cpu().numpy().astype(np.uint8))

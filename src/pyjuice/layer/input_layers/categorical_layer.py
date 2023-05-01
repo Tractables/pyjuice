@@ -137,44 +137,30 @@ class CategoricalLayer(InputLayer):
         """
         samples:       [num_vars, B]
         missing_mask:  [num_vars, B]
-        node_flows:    [_, B]    (node_flows[sid:eid].size() == (num_nodes, B))
-        Note: it does not return anything, will update the samples in-place
+        node_flows:    [num_nodes, B]    
+        
+    
+         - Note: it does not return anything, will update the samples in-place
+         - node_flows[sid:eid].size() == (num_input_nodes, B)
         """
-        # ONLY replace when its both missing and has positive node_flow
-        # sample and replace only the missing values (input nodes should have either flow 0 or 1, 1 mean being active and should sample using that input node)
-        # only sample when missing_mask is True for that feature and input...
         sid, eid = self._output_ind_range[0], self._output_ind_range[1]
+        print(f"Input layer w/+ flows (should be {samples.size(1)})", node_flows[sid:eid, :].sum(dim=0))   
+    
+        node_idxs, batch_idxs = node_flows[sid:eid, :].nonzero(as_tuple=True)   # (num_vars * B, 2)
+        var_idxs = self.vids[node_idxs]                                         # (num_vars * B) 
         
-        # print("Bad (0 is good)", torch.sum(node_flows[sid:eid, :].sum(dim=0) != samples.size(0)))
-        
-        node_active_idxs = node_flows[sid:eid, :].nonzero()                 # (num_vars * B, 2)
-        var_idxs = self.vids[node_active_idxs[:, 0]]                        # (num_vars * B) 
-        mask_active_idx = torch.stack((var_idxs, node_active_idxs[:, 1]))   # (2, num_vars * B)
-        mask_active_idx = mask_active_idx.permute(1,0)                      # (num_vars * B, 2)
-
-        active_mask = torch.zeros(samples.shape, dtype=bool).cuda()         # (num_vars, B)
-        active_mask[mask_active_idx] = 1
-        
-        # Mask of which feaures/input need to be replaced
-        replace_mask = active_mask * missing_mask
-        replace_idxs = replace_mask.nonzero()                               # (to be replaced, 2)
-        rands = torch.rand(replace_idxs.size(0), 1).cuda()                  # (to be replaced, 1)
+        sampled_node_idxs = torch.zeros(samples.shape, dtype=torch.long)#.cuda() TODO uncomment .cuda
+        sampled_node_idxs[var_idxs, batch_idxs] = node_idxs
 
         # TODO fix later, for now assume constant number of cats 
         # need a custome kernel probably
-        num_cats = self.psids[1] 
-        cummulp = self.params.view(-1, num_cats).cumsum(1)
-
-        replace_cummul_ps = cummulp[replace_idxs[:, 0]]
-        sampled_cats = torch.sum(rands > replace_cummul_ps, dim=1).to(samples.dtype)
-        samples[replace_mask] = sampled_cats
-
-        # print("rands", rands.size())
-        # print("cummulp", cummulp.size())
-        # print("replace_cummul_ps", replace_cummul_ps.size())
-        # print("replace_mask", replace_mask.size())
-        # print("samples[replace_mask]", samples[replace_mask].size())
-        # print("sampled_cats", sampled_cats.size())
+        ps = self.params.view(-1, self.psids[1])                        # (num_nodes, num_cats)
+        cummulp = ps.cumsum(-1)
+        replace_cummul_ps = cummulp[sampled_node_idxs]                 # (var, B, num_cats)
+        rands = torch.rand(samples.size(0), samples.size(1), 1)#.cuda() TODO uncomment .cuda # (vars, B, 1)
+    
+        sampled_cats = torch.sum(rands > replace_cummul_ps, dim=2).to(samples.dtype)
+        samples[missing_mask] = sampled_cats[missing_mask]
 
 
     def mini_batch_em(self, step_size: float, pseudocount: float = 0.0):
