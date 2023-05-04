@@ -144,12 +144,12 @@ class CategoricalLayer(InputLayer):
          - node_flows[sid:eid].size() == (num_input_nodes, B)
         """
         sid, eid = self._output_ind_range[0], self._output_ind_range[1]
-        print(f"Input layer w/+ flows (should be {samples.size(1)})", node_flows[sid:eid, :].sum(dim=0))   
+        # print(f"Input layer w/+ flows (should be {samples.size(0)})", node_flows[sid:eid, :].sum(dim=0))   
     
         node_idxs, batch_idxs = node_flows[sid:eid, :].nonzero(as_tuple=True)   # (num_vars * B, 2)
         var_idxs = self.vids[node_idxs]                                         # (num_vars * B) 
         
-        sampled_node_idxs = torch.zeros(samples.shape, dtype=torch.long)#.cuda() TODO uncomment .cuda
+        sampled_node_idxs = torch.zeros(samples.shape, dtype=torch.long, device=samples.device)
         sampled_node_idxs[var_idxs, batch_idxs] = node_idxs
 
         # TODO fix later, for now assume constant number of cats 
@@ -157,7 +157,7 @@ class CategoricalLayer(InputLayer):
         ps = self.params.view(-1, self.psids[1])                        # (num_nodes, num_cats)
         cummulp = ps.cumsum(-1)
         replace_cummul_ps = cummulp[sampled_node_idxs]                 # (var, B, num_cats)
-        rands = torch.rand(samples.size(0), samples.size(1), 1)#.cuda() TODO uncomment .cuda # (vars, B, 1)
+        rands = torch.rand(samples.size(0), samples.size(1), 1, device=samples.device)  # (vars, B, 1)
     
         sampled_cats = torch.sum(rands > replace_cummul_ps, dim=2).to(samples.dtype)
         samples[missing_mask] = sampled_cats[missing_mask]

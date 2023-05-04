@@ -255,38 +255,40 @@ def main(args):
 
     elif args.mode == "sample":
         print("===========================SAMPLE===============================")
-        device="cpu"
         pc = load_circuit(filename, verbose=True, device=device)
         pc.to(device)
 
-        train_loader = DataLoader(
-            dataset = TensorDataset(train_data),
-            batch_size = 4,
-            shuffle = False,
-            drop_last = False
-        )
+        t0_sample = time.time()
 
-        for batch in train_loader:
-            x = batch[0].to(device)
-            miss_mask = torch.zeros(x.size(), dtype=torch.bool, device=device)
-            miss_mask[:, 0:14*28] = 1 
+        for batch_id, batch in enumerate(train_loader):
+            x = batch[0].to(device)                                                 # (B, num_vars)
+            miss_mask = torch.zeros(x.size(), dtype=torch.bool, device=device)      # (B, num_vars)
+            
+            # Left Side of Pixels Missing
+            for row in range(28):
+                miss_mask[:, row*28:row*28+14] = 1 
+
             # 1. Run Forward Pass
             lls = pc(x, missing_mask=miss_mask)
-            print(lls.mean().squeeze().detach().item())
-            # 2. Sample with backward
-            samples = pc.sample(x, miss_mask)
 
-            # Plot first 4 Samples
-            print("Saving Samples as images to file")
-            plt.figure()
-            f, axarr = plt.subplots(3, 4, figsize=(28, 10))
-            plt.gray()
-            for i in range(4):
-                axarr[0][i].imshow(x[i, :].reshape(28,28).cpu().numpy().astype(np.uint8))
-                axarr[1][i].imshow(255*miss_mask[i, :].reshape(28,28).cpu().numpy().astype(np.uint8))
-                axarr[2][i].imshow(samples[i, :].reshape(28,28).cpu().numpy().astype(np.uint8))
-            plt.savefig(f"examples/1_pc_training/samples_test.png")  
-            break # only want to sample from first batch for debugging
+            # 2. Sample (for each item in batch returns a sample from p(. | x^o))
+            samples = pc.sample(x, miss_mask)                                       # (B, num_vars)
+ 
+            if batch_id < 2:
+                # Plot first 8 Samples
+                plot_count = 8
+                print("Saving Samples as images to file")
+                plt.figure()
+                f, axarr = plt.subplots(3, plot_count, figsize=(28, 10))
+                plt.gray()
+                for i in range(plot_count):
+                    axarr[0][i].imshow(x[i, :].reshape(28,28).cpu().numpy().astype(np.uint8))
+                    axarr[1][i].imshow(255*miss_mask[i, :].reshape(28,28).cpu().numpy().astype(np.uint8))
+                    axarr[2][i].imshow(samples[i, :].reshape(28,28).cpu().numpy().astype(np.uint8))
+                plt.savefig(f"examples/1_pc_training/samples{batch_id}_test.png")  
+        t1_sample = time.time()   
+        print(f"Samples took {t1_sample - t0_sample:.2f} (s)")
+    
 
     print(f"Memory allocated: {torch.cuda.memory_allocated(device) / 1024 / 1024 / 1024:.1f}GB")
     print(f"Memory reserved: {torch.cuda.memory_reserved(device) / 1024 / 1024 / 1024:.1f}GB")
