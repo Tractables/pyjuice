@@ -11,10 +11,14 @@ import warnings
 from torch.utils.data import TensorDataset, DataLoader
 import argparse
 from typing import Optional
+from PIL import Image
+from matplotlib import pyplot as plt
 
 warnings.filterwarnings("ignore")
 logging.getLogger("torch._inductor.utils").setLevel(logging.ERROR)
 logging.getLogger("torch._inductor.compile_fx").setLevel(logging.ERROR)
+logging.getLogger("torch._inductor.lowering").setLevel(logging.ERROR)
+logging.getLogger("torch._inductor.graph").setLevel(logging.ERROR)
 
 def process_args():
     parser = argparse.ArgumentParser()
@@ -248,6 +252,42 @@ def main(args):
         print(f"train_ll: {train_ll:.2f}, test_ll: {test_ll:.2f}")
         print(f"train_ll_alpha: {train_ll_alpha:.2f}, test_ll_alpha: {test_ll_alpha:.2f}")
         print(f"train {t1-t0:.2f} (s); test {t2-t1:.2f} (s)")
+
+    elif args.mode == "sample":
+        print("===========================SAMPLE===============================")
+        pc = load_circuit(filename, verbose=True, device=device)
+        pc.to(device)
+
+        t0_sample = time.time()
+
+        for batch_id, batch in enumerate(train_loader):
+            x = batch[0].to(device)                                                 # (B, num_vars)
+            miss_mask = torch.zeros(x.size(), dtype=torch.bool, device=device)      # (B, num_vars)
+            
+            # Left Side of Pixels Missing
+            for row in range(28):
+                miss_mask[:, row*28:row*28+14] = 1 
+
+            # 1. Run Forward Pass
+            lls = pc(x, missing_mask=miss_mask)
+
+            # 2. Sample (for each item in batch returns a sample from p(. | x^o))
+            samples = pc.sample(x, miss_mask)                                       # (B, num_vars)
+ 
+            if batch_id < 2:
+                # Plot first 8 Samples
+                plot_count = 8
+                print("Saving Samples as images to file")
+                plt.figure()
+                f, axarr = plt.subplots(3, plot_count, figsize=(28, 10))
+                plt.gray()
+                for i in range(plot_count):
+                    axarr[0][i].imshow(x[i, :].reshape(28,28).cpu().numpy().astype(np.uint8))
+                    axarr[1][i].imshow(255*miss_mask[i, :].reshape(28,28).cpu().numpy().astype(np.uint8))
+                    axarr[2][i].imshow(samples[i, :].reshape(28,28).cpu().numpy().astype(np.uint8))
+                plt.savefig(f"examples/1_pc_training/samples{batch_id}_test.png")  
+        t1_sample = time.time()   
+        print(f"Samples took {t1_sample - t0_sample:.2f} (s)")
     
 
     print(f"Memory allocated: {torch.cuda.memory_allocated(device) / 1024 / 1024 / 1024:.1f}GB")

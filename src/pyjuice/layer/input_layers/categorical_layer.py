@@ -132,6 +132,36 @@ class CategoricalLayer(InputLayer):
         self._flows_kernel[grid](self.param_flows, node_flows, param_ids, layer_num_nodes, tot_num_nodes, batch_size, node_offset, BLOCK_SIZE = 1024)
         
         return None
+    
+    def sample(self, samples: torch.Tensor, missing_mask:torch.tensor, node_flows: torch.tensor):
+        """
+        samples:       [num_vars, B]
+        missing_mask:  [num_vars, B]
+        node_flows:    [num_nodes, B]    
+        
+    
+         - Note: it does not return anything, will update the samples in-place
+         - node_flows[sid:eid].size() == (num_input_nodes, B)
+        """
+        sid, eid = self._output_ind_range[0], self._output_ind_range[1]
+        # print(f"Input layer w/+ flows (should be {samples.size(0)})", node_flows[sid:eid, :].sum(dim=0))   
+    
+        node_idxs, batch_idxs = node_flows[sid:eid, :].nonzero(as_tuple=True)   # (num_vars * B, 2)
+        var_idxs = self.vids[node_idxs]                                         # (num_vars * B) 
+        
+        sampled_node_idxs = torch.zeros(samples.shape, dtype=torch.long, device=samples.device)
+        sampled_node_idxs[var_idxs, batch_idxs] = node_idxs
+
+        # TODO fix later, for now assume constant number of cats 
+        # need a custome kernel probably
+        ps = self.params.view(-1, self.psids[1])                        # (num_nodes, num_cats)
+        cummulp = ps.cumsum(-1)
+        replace_cummul_ps = cummulp[sampled_node_idxs]                 # (var, B, num_cats)
+        rands = torch.rand(samples.size(0), samples.size(1), 1, device=samples.device)  # (vars, B, 1)
+    
+        sampled_cats = torch.sum(rands > replace_cummul_ps, dim=2).to(samples.dtype)
+        samples[missing_mask] = sampled_cats[missing_mask]
+
 
     def mini_batch_em(self, step_size: float, pseudocount: float = 0.0):
         if not self._used_external_params:
@@ -172,40 +202,6 @@ class CategoricalLayer(InputLayer):
 
     def _normalize_parameters(self, params, pseudocount: float = 0.0):
         normalize_parameters(params, self.node_ids, self.node_nchs, pseudocount)
-
-    @staticmethod
-    @triton.jit
-    def _cum_params_kernel(params_ptr, cum_params_ptr, node_ids_ptr, tot_num_params, BLOCK_SIZE: tl.constexpr):
-        pid = tl.program_id(axis = 0)
-        block_start = pid * BLOCK_SIZE
-
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < tot_num_params
-
-        n_offsets = tl.load(node_ids_ptr + offsets, mask = mask, other = 0)
-
-        params = tl.load(params_ptr + offsets, mask = mask, other = 0)
-
-        tl.atomic_add(cum_params_ptr + n_offsets, params, mask = mask)
-
-    @staticmethod
-    @triton.jit
-    def _norm_params_kernel(params_ptr, cum_params_ptr, node_ids_ptr, node_nchs_ptr, tot_num_params, 
-                            pseudocount, BLOCK_SIZE: tl.constexpr):
-        pid = tl.program_id(axis = 0)
-        block_start = pid * BLOCK_SIZE
-
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < tot_num_params
-
-        n_offsets = tl.load(node_ids_ptr + offsets, mask = mask, other = 0)
-
-        params = tl.load(params_ptr + offsets, mask = mask, other = 0)
-        cum_params = tl.load(cum_params_ptr + n_offsets, mask = mask, other = 1)
-        nchs = tl.load(node_nchs_ptr + n_offsets, mask = mask, other = 1)
-
-        normed_params = (params + pseudocount / nchs) / (cum_params + pseudocount)
-        tl.store(params_ptr + offsets, normed_params, mask = mask)
 
     @staticmethod
     @triton.jit

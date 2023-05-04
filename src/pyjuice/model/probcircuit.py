@@ -241,6 +241,55 @@ class ProbCircuit(nn.Module):
                 self._used_external_sum_params = False
 
         return None
+    
+    def sample(self, inputs: torch.Tensor, missing_mask: torch.Tensor):
+        """
+        conditional samples from pr(x_missing | x_not missing) for each input in the batch
+
+        Arguments:
+         - inputs:             tensor       (num_features, batch_size)
+         - missing_mask:       tensor[bool] (num_features, batch_size)
+
+        Requirements:
+         - Already need to have run forward pass with same `inputs` and `missing_mask`.
+         
+        Outputs:
+         - samples: tensor (num_features, batch_size):
+                 replaces the missing values in inputs sampled by pr(x_miss | x_not miss)
+        """
+        assert self.node_mars is not None and self.element_mars is not None, "Should run forward path first."
+
+        inputs = inputs.permute(1, 0)
+        missing_mask = missing_mask.permute(1, 0)
+
+        samples = torch.clone(inputs)
+        
+        self.node_flows = torch.zeros([self.num_nodes, self.node_mars.size(1)], device = self.device, dtype=torch.bool)
+        self.element_flows = torch.zeros([self.num_elements, self.node_mars.size(1)], device = self.device, dtype=torch.bool)
+        self.node_mask = torch.zeros([self.num_nodes, self.node_mars.size(1)], device = self.device, dtype=torch.long)
+        self.node_flows[-1,:] = 1.0
+
+        with torch.no_grad():
+            for layer_id in range(len(self.inner_layers) - 1, -1, -1):
+                ltype, layer = self.inner_layers[layer_id]
+
+                if ltype == "prod":
+                    # nothing special needed, same as backward
+                    layer.backward(self.node_flows, self.element_flows, skip_logsumexp=self.skip_logsumexp)
+
+                elif ltype == "sum":
+                    # recompute element_mars for previous prod layer
+                    self.inner_layers[layer_id-1][1].forward(self.node_mars, self.element_mars, skip_logsumexp = self.skip_logsumexp)
+                    layer.sample(self.node_flows, self.element_flows, self.node_mars, self.element_mars, self.params, self.node_mask)
+
+                else:
+                    raise ValueError(f"Unknown layer type {ltype}.")
+                
+
+            for idx, layer in enumerate(self.input_layers):
+                layer.sample(samples, missing_mask, self.node_flows)
+
+        return samples.permute(1, 0)
 
     def mini_batch_em(self, step_size: float, pseudocount: float = 0.0):
         for layer in self.input_layers:
@@ -291,6 +340,11 @@ class ProbCircuit(nn.Module):
     
         return pc
     
+    def save(self, filename):
+        self._init_pass_tensors_()
+        self._init_ad_tensors()
+        torch.save(self, filename)
+
 
     def to(self, device):
         super(ProbCircuit, self).to(device)
@@ -314,8 +368,9 @@ class ProbCircuit(nn.Module):
 
         return region_graph
 
-    def _init_layers(self, init_input_params: Optional[Sequence[torch.Tensor]] = None, init_inner_params: Optional[torch.Tensor] = None,
-                     max_num_groups: int = 1):
+    def _init_layers(self, init_input_params: Optional[Sequence[torch.Tensor]] = None, 
+                        init_inner_params: Optional[torch.Tensor] = None,
+                        max_num_groups: int = 1):
         depth2rnodes, num_layers = self._create_region_node_layers()
 
         if hasattr(self, "input_layers") or hasattr(self, "inner_layers"):
@@ -420,40 +475,6 @@ class ProbCircuit(nn.Module):
     def _normalize_parameters(self, params, pseudocount: float = 0.0):
         if params is not None:
             normalize_parameters(params, self.node_ids, self.node_nchs, pseudocount)
-
-    @staticmethod
-    @triton.jit
-    def _cum_params_kernel(params_ptr, cum_params_ptr, node_ids_ptr, tot_num_params, BLOCK_SIZE: tl.constexpr):
-        pid = tl.program_id(axis = 0)
-        block_start = pid * BLOCK_SIZE
-
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < tot_num_params
-
-        n_offsets = tl.load(node_ids_ptr + offsets, mask = mask, other = 0)
-
-        params = tl.load(params_ptr + offsets, mask = mask, other = 0)
-
-        tl.atomic_add(cum_params_ptr + n_offsets, params, mask = mask)
-
-    @staticmethod
-    @triton.jit
-    def _norm_params_kernel(params_ptr, cum_params_ptr, node_ids_ptr, node_nchs_ptr, tot_num_params, 
-                            pseudocount, BLOCK_SIZE: tl.constexpr):
-        pid = tl.program_id(axis = 0)
-        block_start = pid * BLOCK_SIZE
-
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < tot_num_params
-
-        n_offsets = tl.load(node_ids_ptr + offsets, mask = mask, other = 0)
-
-        params = tl.load(params_ptr + offsets, mask = mask, other = 0)
-        cum_params = tl.load(cum_params_ptr + n_offsets, mask = mask, other = 1)
-        nchs = tl.load(node_nchs_ptr + n_offsets, mask = mask, other = 1)
-
-        normed_params = (params + pseudocount / nchs) / (cum_params + pseudocount)
-        tl.store(params_ptr + offsets, normed_params, mask = mask)
 
     def _extract_params_to_rnodes(self):
         """
