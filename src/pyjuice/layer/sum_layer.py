@@ -138,6 +138,8 @@ class SumLayer(Layer,nn.Module):
 
         parids = torch.zeros([self.ch_prod_layer_size, max_n_pars], dtype = torch.long) # Indices of parent nodes for each child node
         parpids = torch.zeros([self.ch_prod_layer_size, max_n_pars], dtype = torch.long) # Parameter indices for these edges
+        # For each edge, this matrix stores the index of the edge for the parent
+        parcids = torch.zeros([self.ch_prod_layer_size, max_n_pars], dtype = torch.long) 
         par_counts = torch.zeros([self.ch_prod_layer_size], dtype = torch.long)
         node_start = 0
         for rnode in self.region_nodes:
@@ -145,7 +147,7 @@ class SumLayer(Layer,nn.Module):
             for nid in range(rnode.num_nodes):
                 ch_start = 0
                 local_cumchs = 0
-                for c in rnode.children:
+                for cnode_id, c in enumerate(rnode.children):
                     criterion = (rnode.edge_ids[1,:] >= local_cumchs) & (rnode.edge_ids[1,:] < local_cumchs + c.num_nodes) & \
                                 (rnode.edge_ids[0,:] == nid)
                     local_cumchs += c.num_nodes
@@ -153,8 +155,10 @@ class SumLayer(Layer,nn.Module):
                     ch_ids = rnode.edge_ids[1,criterion] + c._output_ind_range[0]
                     parids[ch_ids, par_counts[ch_ids]] = n_start_id + node_start + nid
                     parpids[ch_ids, par_counts[ch_ids]] = pids[node_start+nid,:len(ch_ids)]
+                    parcids[ch_ids, par_counts[ch_ids]] = torch.arange(ch_start, ch_start + ch_ids.size(0))
 
                     par_counts[ch_ids] += 1
+                    ch_start += criterion.size(0)
 
             node_start = node_end
 
@@ -166,6 +170,7 @@ class SumLayer(Layer,nn.Module):
         grouped_chids = []
         grouped_parids = []
         grouped_parpids = []
+        grouped_parcids = []
         grouped_seq_ids0 = []
         grouped_seq_ids1 = []
         grouped_seq_parpids = []
@@ -176,6 +181,7 @@ class SumLayer(Layer,nn.Module):
             curr_chids = (filtered_idxs + 1).clone()
             curr_parids = parids[filtered_idxs+1,:max_n_pars].contiguous()
             curr_parpids = parpids[filtered_idxs+1,:max_n_pars].contiguous()
+            curr_parcids = parcids[filtered_idxs+1,:max_n_pars].contiguous()
 
             curr_tot_npar = ch_n_pars[filter].sum()
             curr_seq_ids0 = torch.zeros([curr_tot_npar], dtype = torch.long)
@@ -196,6 +202,7 @@ class SumLayer(Layer,nn.Module):
             grouped_chids.append(curr_chids)
             grouped_parids.append(curr_parids)
             grouped_parpids.append(curr_parpids)
+            grouped_parcids.append(curr_parcids)
             grouped_seq_ids0.append(curr_seq_ids0)
             grouped_seq_ids1.append(curr_seq_ids1)
             grouped_seq_parpids.append(curr_seq_parpids)
@@ -206,6 +213,7 @@ class SumLayer(Layer,nn.Module):
         self.grouped_chids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in grouped_chids])
         self.grouped_parids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in grouped_parids])
         self.grouped_parpids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in grouped_parpids])
+        self.grouped_parcids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in grouped_parcids])
         self.grouped_seq_ids0 = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in grouped_seq_ids0])
         self.grouped_seq_ids1 = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in grouped_seq_ids1])
         self.grouped_seq_parpids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in grouped_seq_parpids])
@@ -227,56 +235,25 @@ class SumLayer(Layer,nn.Module):
 
     # @torch.compile(mode = "reduce-overhead", fullgraph = True)
     def sample(self, node_flows: torch.Tensor, 
-                        element_flows: torch.Tensor, 
-                        node_mars: torch.Tensor, 
-                        element_mars: torch.Tensor, 
-                        params: torch.Tensor):
+               element_flows: torch.Tensor, 
+               node_mars: torch.Tensor, 
+               element_mars: torch.Tensor, 
+               params: torch.Tensor,
+               node_mask: torch.Tensor):
         """
         node_flows:         [num_nodes, B]
         element_flows:      [max_num_els, B]
         node_mars:          [num_nodes, B]
         element_mars:       [max_num_els, B]
         params:             [num_params] or [num_params, B]
+        node_mask:          [num_nodes, B]
         """
         if params.dim() == 1:
             params = params.unsqueeze(1)
 
-        for group_id in range(self.num_backward_groups):
-            nids = self.grouped_nids[group_id]
-            cids = self.grouped_cids[group_id]   # (num_sum_nodes, max_sum_children)
-            pids = self.grouped_pids[group_id]
-
-            chids = self.grouped_chids[group_id]
-
-            # For each sum node `n` we need to sample a child proportional to theta_{c|n} * pr_c
-            # That child c* will have all the flow_c (and flow_c was either 0 or 1), i.e:
-            #       flow_c* = flow_n
-            #       flow_c =  0 for every other c != c*
-            probs = params[pids] * element_mars[cids].exp()                                      # (num_sum_nodes, max_sum_children, batch_size)
-            cummul_probs = torch.cumsum(probs[:, :, :], 1)                                       # (num_sum_nodes, max_sum_children, batch_size)
-            cummul_probs_last = cummul_probs[:, -1:, :]                                          # (num_sum_nodes, 1, batch_size)
-            
-            rand = torch.rand((probs.size(0), 1, probs.size(2)))#.cuda()                         # (num_sum_nodes, 1, batch_size)
-            rand = cummul_probs_last * rand                                                      # (num_sum_nodes, 1, batch_size)   
-
-            sampled_idx = (torch.sum(rand > cummul_probs, dim=1).long())                         # (num_sum_nodes, batch_size)             
-            sampled_child_ids = torch.gather(cids, 1, sampled_idx) - 1                           # (num_sum_nodes, batch_size)
-            
-            # print("sampled_idx\n", sampled_idx)
-            # print("sampled_child_ids\n", sampled_child_ids)
-            # print("bad stuff in sampled_child_ids", (sampled_child_ids >= element_flows[chids].size(0)).sum())
-            
-            # print("element_flows", element_flows.size())
-            # print("element_flows[chids]", element_flows[chids].size())
-            # print("node_flows", node_flows.size())
-            # print("node_flows[nids]", node_flows[nids].size())
-            # print("node_mars", node_mars.size())
-            # print("chids", chids.size())
-            # print("cids", cids.size())
-            element_flows[chids] = torch.scatter_add(element_flows[chids], dim=0, index=sampled_child_ids, src=node_flows[nids])
-            # element_flows[chids].scatter_add_(dim=0, index=sampled_child_ids, src=node_flows[nids])
-
-
+        self._sample_mask_generation(node_mars, element_mars, params, node_mask)
+        self._sample_backward_pass(node_flows, element_flows, node_mars, 
+                                   element_mars, params, node_mask)
 
     def backward(self, node_flows: torch.Tensor, 
                         element_flows: torch.Tensor, 
@@ -406,5 +383,33 @@ class SumLayer(Layer,nn.Module):
             if param_flows is not None:
                 param_flows[self.seq_parpids] += (node_flows[parids] * params[parpids] * \
                     (element_mars[chids].unsqueeze(1) / node_mars[parids] )).sum(dim = 2)[seq_ids0, seq_ids1]
+
+        return None
+
+    # @torch.compile(mode = "reduce-overhead", fullgraph = True)
+    def _sample_mask_generation(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor,
+                                node_mask: torch.Tensor):
+        for group_id in range(self.num_forward_groups):
+            nids = self.grouped_nids[group_id]
+            cids = self.grouped_cids[group_id]
+            pids = self.grouped_pids[group_id]
+
+            ch_mars = element_mars[cids]
+            maxval = ch_mars.max(dim = 1, keepdim = True).values
+            unnorm_probs = (ch_mars - maxval).exp() * params[pids]
+            dist = torch.distributions.Categorical(probs = unnorm_probs.permute(0, 2, 1))
+            node_mask[nids] = dist.sample() # [num nodes, batch_size]
+
+        return None
+
+    # @torch.compile(mode = "reduce-overhead", fullgraph = True)
+    def _sample_backward_pass(self, node_flows: torch.Tensor, element_flows: torch.Tensor, node_mars: torch.Tensor, 
+                              element_mars: torch.Tensor, params: torch.Tensor, node_mask: torch.Tensor):
+        for group_id in range(self.num_backward_groups):
+            chids = self.grouped_chids[group_id]
+            parids = self.grouped_parids[group_id]
+            parcids = self.grouped_parcids[group_id]
+
+            element_flows[chids] = (node_flows[parids] * (node_mask[parids] == parcids.unsqueeze(-1))).any(dim = 1)
 
         return None

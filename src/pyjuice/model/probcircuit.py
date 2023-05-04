@@ -266,6 +266,7 @@ class ProbCircuit(nn.Module):
         
         self.node_flows = torch.zeros([self.num_nodes, self.node_mars.size(1)], device = self.device, dtype=torch.bool)
         self.element_flows = torch.zeros([self.num_elements, self.node_mars.size(1)], device = self.device, dtype=torch.bool)
+        self.node_mask = torch.zeros([self.num_nodes, self.node_mars.size(1)], device = self.device, dtype=torch.long)
         self.node_flows[-1,:] = 1.0
 
         with torch.no_grad():
@@ -279,7 +280,8 @@ class ProbCircuit(nn.Module):
                 elif ltype == "sum":
                     # recompute element_mars for previous prod layer
                     self.inner_layers[layer_id-1][1].forward(self.node_mars, self.element_mars, skip_logsumexp = self.skip_logsumexp)
-                    layer.sample(self.node_flows, self.element_flows, self.node_mars, self.element_mars, self.params)
+                    layer.sample(self.node_flows, self.element_flows, self.node_mars, self.element_mars, self.params, self.node_mask)
+
                 else:
                     raise ValueError(f"Unknown layer type {ltype}.")
                 
@@ -288,8 +290,6 @@ class ProbCircuit(nn.Module):
                 layer.sample(samples, missing_mask, self.node_flows)
 
         return samples.permute(1, 0)
-        
-
 
     def mini_batch_em(self, step_size: float, pseudocount: float = 0.0):
         for layer in self.input_layers:
