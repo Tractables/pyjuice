@@ -5,67 +5,57 @@ import torch.nn as nn
 import torch.nn.functional as F
 import triton
 import triton.language as tl
-from typing import List, Dict, Optional
+from typing import Sequence, Dict, Optional
 
-from pyjuice.graph.region_graph import RegionGraph, InputRegionNode
+from pyjuice.nodes import InputNodes
+from pyjuice.nodes.distributions import DiscreteLogistic
 from pyjuice.layer.input_layer import InputLayer
 from pyjuice.utils.grad_fns import ReverseGrad
 
 
 """
 Implementation of discretized Logistic distribution (https://en.wikipedia.org/wiki/Logistic_distribution)
-Required parameters from the region nodes:
-    input_range (Tuple[float, float]): range of the inputs
-    bin_size (Optional[float]): size of every input bin
-    bin_count (Optional[int]): number of input bins
 """
 class DiscreteLogisticLayer(InputLayer, nn.Module):
-    def __init__(self, layer_id: int, region_nodes: List[RegionGraph], cum_nodes: int = 0) -> None:
+    
+    def __init__(self, nodes: Sequence[InputNodes], cum_nodes: int = 0) -> None:
         nn.Module.__init__(self)
+        InputLayer.__init__(self, nodes)
 
-        num_nodes = sum(map(lambda r: r.num_nodes, region_nodes))
-
-        InputLayer.__init__(self, layer_id, region_nodes, num_nodes)
-
+        # Parse input `nodes`
         self.vars = []
-        self.rnode_num_nodes = []
-        self.rnode_input_range = []
-        self.rnode_bin_sizes = []
+        self.node_sizes = []
+        self.node_input_range = []
+        self.node_bin_sizes = []
         layer_num_nodes = 0
-        for rnode in self.region_nodes:
-            assert len(rnode.scope) == 1, "DiscreteLogisticLayer only support uni-variate categorical distributions."
+        for ns in self.region_nodes:
+            assert len(ns.scope) == 1, "DiscreteLogisticLayer only support uni-variate categorical distributions."
+            assert isinstance(ns.dist, DiscreteLogistic), f"Adding a `{type(ns.dist)}` node to a `DiscreteLogistic`."
 
-            self.vars.append(next(iter(rnode.scope)))
-            self.rnode_num_nodes.append(rnode.num_nodes)
-            self.rnode_input_range.append(
-                [rnode.extra_params["input_range"][0], rnode.extra_params["input_range"][1]]
+            self.vars.append(next(iter(ns.scope)))
+            self.node_sizes.append(ns.num_nodes)
+            self.node_input_range.append(
+                [ns.dist.input_range[0], ns.dist.input_range[1]]
             )
-            if "bin_size" in rnode.extra_params:
-                self.rnode_bin_sizes.append(rnode.extra_params["bin_size"])
-            elif "bin_count" in rnode.extra_params:
-                self.rnode_bin_sizes.append(
-                    (self.rnode_input_range[-1][1] - self.rnode_input_range[-1][0]) / rnode.extra_params["bin_count"]
-                )
-            else:
-                raise ValueError("Either `bin_size` or `bin_count` should be provided in the input region node.")
+            self.node_bin_sizes.append(ns.dist.bin_size)
 
-            rnode._output_ind_range = (cum_nodes, cum_nodes + rnode.num_nodes)
-            cum_nodes += rnode.num_nodes
-            layer_num_nodes += rnode.num_nodes
+            ns._output_ind_range = (cum_nodes, cum_nodes + ns.num_nodes)
+            cum_nodes += ns.num_nodes
+            layer_num_nodes += ns.num_nodes
 
         self._output_ind_range = (cum_nodes - layer_num_nodes, cum_nodes)
 
-        self.num_nodes = num_nodes
+        self.num_nodes = layer_num_nodes
 
-        d2vids = torch.empty([self.num_regions], dtype = torch.long)
-        vrangeslow = torch.tensor([r[0] for r in self.rnode_input_range])
-        vrangeshigh = torch.tensor([r[1] for r in self.rnode_input_range])
-        vhbinsizes = torch.tensor(self.rnode_bin_sizes) / 2.0
+        d2vids = torch.empty([len(self.nodes)], dtype = torch.long)
+        vrangeslow = torch.tensor([r[0] for r in self.node_input_range])
+        vrangeshigh = torch.tensor([r[1] for r in self.node_input_range])
+        vhbinsizes = torch.tensor(self.node_bin_sizes) / 2.0
         vids = torch.empty([layer_num_nodes], dtype = torch.long)
         vids2d = torch.tensor(self.vars)
         n_start = 0
-        for idx, rnode in enumerate(self.region_nodes):
-            n_end = n_start + rnode.num_nodes
+        for idx, ns in enumerate(self.nodes):
+            n_end = n_start + ns.num_nodes
 
             d2vids[idx] = self.vars[idx]
             vids[n_start:n_end] = idx

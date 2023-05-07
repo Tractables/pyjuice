@@ -6,9 +6,9 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 import warnings
-from typing import Tuple, List, Optional
+from typing import Sequence, List, Optional
 
-from pyjuice.graph.region_graph import RegionGraph, InnerRegionNode
+from pyjuice.nodes import SumNodes
 from .layer import Layer
 from .backend.node_partition import partition_nodes_by_n_edges
 
@@ -16,34 +16,32 @@ from .backend.node_partition import partition_nodes_by_n_edges
 torch.set_float32_matmul_precision('high')
 
 
-class SumLayer(Layer,nn.Module):
+class SumLayer(Layer, nn.Module):
 
-    def __init__(self, layer_id: int, region_nodes: List[RegionGraph], 
+    def __init__(self, nodes: Sequence[SumNodes], 
                  cum_nodes: int, 
                  param_ends: List, 
                  ch_prod_layer_size: int,
                  sum_region_start_id: int = 0,
                  max_num_groups: int = 1) -> None:
-        Layer.__init__(self, layer_id)
+        Layer.__init__(self)
         nn.Module.__init__(self)
 
-        assert len(region_nodes) > 0, "No input region node."
-        for rnode in region_nodes:
-            assert isinstance(rnode, InnerRegionNode), "SumLayer must respect to InnerRegionNode."
+        assert len(nodes) > 0, "No input node."
 
-        self.region_nodes = region_nodes
+        self.nodes = nodes
 
         layer_num_nodes = 0
         total_num_edges = 0
         max_n_chs = 0
-        for rnode_idx, rnode in enumerate(self.region_nodes):
-            n_chs = torch.max(torch.bincount(rnode.edge_ids[0,:])).item()
+        for ns_idx, ns in enumerate(self.nodes):
+            n_chs = torch.max(torch.bincount(ns.edge_ids[0,:])).item()
             if n_chs > max_n_chs:
                 max_n_chs = n_chs
-            rnode._output_ind_range = (cum_nodes, cum_nodes + rnode.num_nodes)
-            cum_nodes += rnode.num_nodes
-            layer_num_nodes += rnode.num_nodes
-            total_num_edges += rnode.edge_ids.size(1)
+            ns._output_ind_range = (cum_nodes, cum_nodes + ns.num_nodes)
+            cum_nodes += ns.num_nodes
+            layer_num_nodes += ns.num_nodes
+            total_num_edges += ns.edge_ids.size(1)
 
         self.num_nodes = layer_num_nodes
         self.num_params = total_num_edges
@@ -61,24 +59,24 @@ class SumLayer(Layer,nn.Module):
         ch_n_pars = torch.zeros([self.ch_prod_layer_size], dtype = torch.long) # Number of parents for each child node
         node_start = 0
         param_start = param_ends[-1]
-        for rnode_idx, rnode in enumerate(self.region_nodes):
+        for ns_idx, ns in enumerate(self.nodes):
 
-            param_ids = torch.zeros([rnode.edge_ids.size(1)], dtype = torch.long)
-            rnode_param_start = param_start
+            param_ids = torch.zeros([ns.edge_ids.size(1)], dtype = torch.long)
+            ns_param_start = param_start
 
-            node_end = node_start + rnode.num_nodes
+            node_end = node_start + ns.num_nodes
 
-            srids[node_start:node_end] = sum_region_start_id + rnode_idx
+            srids[node_start:node_end] = sum_region_start_id + ns_idx
 
-            for nid in range(rnode.num_nodes):
+            for nid in range(ns.num_nodes):
                 ch_start = 0
                 local_cumchs = 0
-                for c in rnode.children:
-                    criterion = (rnode.edge_ids[1,:] >= local_cumchs) & (rnode.edge_ids[1,:] < local_cumchs + c.num_nodes) & \
-                                (rnode.edge_ids[0,:] == nid)
+                for c in ns.chs:
+                    criterion = (ns.edge_ids[1,:] >= local_cumchs) & (ns.edge_ids[1,:] < local_cumchs + c.num_nodes) & \
+                                (ns.edge_ids[0,:] == nid)
                     local_cumchs += c.num_nodes
 
-                    ch_ids = rnode.edge_ids[1,criterion] + c._output_ind_range[0]
+                    ch_ids = ns.edge_ids[1,criterion] + c._output_ind_range[0]
                     cids[node_start+nid,ch_start:ch_start+ch_ids.size(0)] = ch_ids
                     ch_start += ch_ids.size(0)
 
@@ -95,10 +93,10 @@ class SumLayer(Layer,nn.Module):
                 
             node_start = node_end
 
-            rnode_param_end = param_start
-            rnode._param_range = (rnode_param_start, rnode_param_end)
-            rnode._param_ids = param_ids
-            rnode._inverse_param_ids = torch.argsort(param_ids)
+            ns_param_end = param_start
+            ns._param_range = (ns_param_start, ns_param_end)
+            ns._param_ids = param_ids
+            ns._inverse_param_ids = torch.argsort(param_ids)
 
         # Find a good strategy to partition the nodes into groups according to their number of children 
         # to minimize total computation cost
@@ -142,17 +140,17 @@ class SumLayer(Layer,nn.Module):
         parcids = torch.zeros([self.ch_prod_layer_size, max_n_pars], dtype = torch.long) 
         par_counts = torch.zeros([self.ch_prod_layer_size], dtype = torch.long)
         node_start = 0
-        for rnode in self.region_nodes:
-            node_end = node_start + rnode.num_nodes
-            for nid in range(rnode.num_nodes):
+        for ns in self.nodes:
+            node_end = node_start + ns.num_nodes
+            for nid in range(ns.num_nodes):
                 ch_start = 0
                 local_cumchs = 0
-                for cnode_id, c in enumerate(rnode.children):
-                    criterion = (rnode.edge_ids[1,:] >= local_cumchs) & (rnode.edge_ids[1,:] < local_cumchs + c.num_nodes) & \
-                                (rnode.edge_ids[0,:] == nid)
+                for cnode_id, c in enumerate(ns.chs):
+                    criterion = (ns.edge_ids[1,:] >= local_cumchs) & (ns.edge_ids[1,:] < local_cumchs + c.num_nodes) & \
+                                (ns.edge_ids[0,:] == nid)
                     local_cumchs += c.num_nodes
 
-                    ch_ids = rnode.edge_ids[1,criterion] + c._output_ind_range[0]
+                    ch_ids = ns.edge_ids[1,criterion] + c._output_ind_range[0]
                     parids[ch_ids, par_counts[ch_ids]] = n_start_id + node_start + nid
                     parpids[ch_ids, par_counts[ch_ids]] = pids[node_start+nid,:len(ch_ids)]
                     parcids[ch_ids, par_counts[ch_ids]] = torch.arange(ch_start, ch_start + ch_ids.size(0))

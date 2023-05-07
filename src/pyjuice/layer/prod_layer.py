@@ -5,9 +5,9 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 import warnings
-from pyjuice.graph.region_graph import RegionGraph, PartitionNode
-from typing import List
+from typing import Sequence
 
+from pyjuice.nodes import ProdNodes
 from .layer import Layer
 from .backend.node_partition import partition_nodes_by_n_edges
 
@@ -15,27 +15,25 @@ from .backend.node_partition import partition_nodes_by_n_edges
 torch.set_float32_matmul_precision('high')
 
 
-class ProdLayer(Layer,nn.Module):
+class ProdLayer(Layer, nn.Module):
 
-    def __init__(self, layer_id: int, region_nodes: List[RegionGraph], max_num_groups: int = 1) -> None:
-        Layer.__init__(self, layer_id)
+    def __init__(self, nodes: Sequence[ProdNodes], max_num_groups: int = 1) -> None:
+        Layer.__init__(self)
         nn.Module.__init__(self)
 
-        assert len(region_nodes) > 0, "No input region node."
-        for rnode in region_nodes:
-            assert isinstance(rnode, PartitionNode), "ProdLayer must respect to PartitionNode."
+        assert len(nodes) > 0, "No input node."
 
-        self.region_nodes = region_nodes
+        self.nodes = nodes
 
         max_n_chs = 0
         layer_num_nodes = 0
         cum_nodes = 1 # id 0 is reserved for the dummy node
-        for rnode in self.region_nodes:
-            if rnode.num_chs > max_n_chs:
-                max_n_chs = rnode.num_chs
-            rnode._output_ind_range = (cum_nodes, cum_nodes + rnode.num_nodes)
-            cum_nodes += rnode.num_nodes
-            layer_num_nodes += rnode.num_nodes
+        for ns in self.nodes:
+            if ns.num_child_regions > max_n_chs:
+                max_n_chs = ns.num_child_regions
+            ns._output_ind_range = (cum_nodes, cum_nodes + ns.num_nodes)
+            cum_nodes += ns.num_nodes
+            layer_num_nodes += ns.num_nodes
 
         self.num_nodes = layer_num_nodes
 
@@ -44,12 +42,12 @@ class ProdLayer(Layer,nn.Module):
         cids = torch.zeros([self.num_nodes, max_n_chs], dtype = torch.long) # cids[i,:] are the child node ids for node i
         n_chs = torch.zeros([self.num_nodes], dtype = torch.long) # Number of children for each node
         node_start = 0
-        for rnode in self.region_nodes:
-            node_end = node_start + rnode.num_nodes
-            for i, c in enumerate(rnode.children):
-                cids[node_start:node_end, i] = rnode.edge_ids[:,i] + c._output_ind_range[0]
+        for ns in self.nodes:
+            node_end = node_start + ns.num_nodes
+            for i, c in enumerate(ns.chs):
+                cids[node_start:node_end, i] = ns.edge_ids[:,i] + c._output_ind_range[0]
                 
-            n_chs[node_start:node_end] = len(rnode.children)
+            n_chs[node_start:node_end] = ns.num_child_regions
 
             node_start = node_end
 
@@ -77,6 +75,16 @@ class ProdLayer(Layer,nn.Module):
         ## Initialize backward pass ##
 
         u_cids, par_counts = torch.unique(cids, sorted = True, return_counts = True)
+
+        if u_cids[0] != 0:
+            u_cids = torch.cat(
+                (torch.zeros([1], dtype = torch.long), u_cids),
+                dim = 0
+            )
+            par_counts = torch.cat(
+                (torch.zeros([1], dtype = torch.long), par_counts),
+                dim = 0
+            )
 
         max_n_pars = torch.max(par_counts[1:])
         parids = torch.zeros([u_cids.size(0), max_n_pars], dtype = torch.long)

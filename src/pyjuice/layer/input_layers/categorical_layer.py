@@ -5,9 +5,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import triton
 import triton.language as tl
-from typing import List, Dict, Optional
+from typing import Sequence, Dict, Optional
 
-from pyjuice.graph.region_graph import RegionGraph, InputRegionNode
+from pyjuice.nodes import InputNodes
+from pyjuice.nodes.distributions import Categorical
 from pyjuice.layer.input_layer import InputLayer
 from pyjuice.functional import normalize_parameters
 
@@ -15,55 +16,54 @@ from pyjuice.functional import normalize_parameters
 torch.set_float32_matmul_precision('high')
 
 
-class CategoricalLayer(InputLayer):
-    def __init__(self, layer_id: int, region_nodes: List[RegionGraph], cum_nodes: int = 0) -> None:
+class CategoricalLayer(InputLayer, nn.Module):
+    
+    def __init__(self, nodes: Sequence[InputNodes], cum_nodes: int = 0) -> None:
+        nn.Module.__init__(self)
+        InputLayer.__init__(self, nodes)
 
-        num_nodes = sum(map(lambda r: r.num_nodes, region_nodes))
-
-        InputLayer.__init__(self, layer_id, region_nodes, num_nodes)
-
+        # Parse input `nodes`
         self.vars = []
-        self.rnode_num_nodes = []
-        self.rnode_num_cats = []
+        self.node_sizes = []
+        self.node_num_cats = []
         self.param_ends = []
         layer_num_nodes = 0
         cum_params = 0
-        num_nodes = 0
-        for rnode in self.region_nodes:
-            assert len(rnode.scope) == 1, "CategoricalLayer only support uni-variate categorical distributions."
+        for ns in self.nodes:
+            assert len(ns.scope) == 1, "CategoricalLayer only support uni-variate categorical distributions."
+            assert isinstance(ns.dist, Categorical), f"Adding a `{type(ns.dist)}` node to a `CategoricalLayer`."
 
-            self.vars.append(next(iter(rnode.scope)))
-            self.rnode_num_nodes.append(rnode.num_nodes)
-            self.rnode_num_cats.append(rnode.extra_params["num_cats"])
+            self.vars.append(next(iter(ns.scope)))
+            self.node_sizes.append(ns.num_nodes)
+            self.node_num_cats.append(ns.dist.num_cats)
 
-            num_nodes += rnode.num_nodes
+            ns._output_ind_range = (cum_nodes, cum_nodes + ns.num_nodes)
+            cum_nodes += ns.num_nodes
+            layer_num_nodes += ns.num_nodes
 
-            rnode._output_ind_range = (cum_nodes, cum_nodes + rnode.num_nodes)
-            cum_nodes += rnode.num_nodes
-            layer_num_nodes += rnode.num_nodes
-
-            for nid in range(1, rnode.num_nodes + 1):
-                self.param_ends.append(cum_params + rnode.extra_params["num_cats"] * nid)
-            cum_params += rnode.num_nodes * rnode.extra_params["num_cats"]
+            for nid in range(1, ns.num_nodes + 1):
+                self.param_ends.append(cum_params + ns.dist.num_cats * nid)
+            cum_params += ns.num_nodes * ns.dist.num_cats
 
         self._output_ind_range = (cum_nodes - layer_num_nodes, cum_nodes)
         self.param_ends = torch.tensor(self.param_ends)
 
         self.num_params = cum_params
-        self.num_nodes = num_nodes
+        self.num_nodes = layer_num_nodes
 
-        vids = torch.empty([layer_num_nodes], dtype = torch.long)
-        psids = torch.empty([layer_num_nodes], dtype = torch.long)
+        # Construct layered
+        vids = torch.empty([self.num_nodes], dtype = torch.long)
+        psids = torch.empty([self.num_nodes], dtype = torch.long)
         n_start = 0
-        for idx, rnode in enumerate(self.region_nodes):
-            n_end = n_start + rnode.num_nodes
+        for idx, ns in enumerate(self.nodes):
+            n_end = n_start + ns.num_nodes
             vids[n_start:n_end] = self.vars[idx]
 
             if idx == 0:
                 psids[0] = 0
-                psids[1:n_end] = torch.tensor(self.param_ends[0:n_end-1])
+                psids[1:n_end] = self.param_ends[0:n_end-1].clone().detach()
             else:
-                psids[n_start:n_end] = torch.tensor(self.param_ends[n_start-1:n_end-1])
+                psids[n_start:n_end] = self.param_ends[n_start-1:n_end-1].clone().detach()
 
             n_start = n_end
 
@@ -91,10 +91,10 @@ class CategoricalLayer(InputLayer):
         self._param_batch_size = 1
 
     def forward(self, data: torch.Tensor, node_mars: torch.Tensor, 
-                                        params: Optional[Dict] = None, 
-                                        missing_mask: Optional[torch.Tensor]=None,  
-                                        alphas:Optional[torch.Torch]=None,
-                                        skip_logsumexp: bool = False):
+                params: Optional[Dict] = None, 
+                missing_mask: Optional[torch.Tensor] = None,  
+                alphas:Optional[torch.Torch] = None,
+                skip_logsumexp: bool = False):
         """
         data: [num_vars, B]
         node_mars: [num_nodes, B]
@@ -115,7 +115,8 @@ class CategoricalLayer(InputLayer):
 
         return None
 
-    def backward(self, data: torch.Tensor, node_flows: torch.Tensor, node_mars: torch.Tensor, params: Optional[Dict] = None):
+    def backward(self, data: torch.Tensor, node_flows: torch.Tensor, 
+                 node_mars: torch.Tensor, params: Optional[Dict] = None):
         """
         data: [num_vars, B]
         node_flows: [num_nodes, B]
@@ -139,7 +140,6 @@ class CategoricalLayer(InputLayer):
         missing_mask:  [num_vars, B]
         node_flows:    [num_nodes, B]    
         
-    
          - Note: it does not return anything, will update the samples in-place
          - node_flows[sid:eid].size() == (num_input_nodes, B)
         """
@@ -161,7 +161,6 @@ class CategoricalLayer(InputLayer):
     
         sampled_cats = torch.sum(rands > replace_cummul_ps, dim=2).to(samples.dtype)
         samples[missing_mask] = sampled_cats[missing_mask]
-
 
     def mini_batch_em(self, step_size: float, pseudocount: float = 0.0):
         if not self._used_external_params:
@@ -225,10 +224,10 @@ class CategoricalLayer(InputLayer):
         params = torch.exp(torch.rand([self.num_params]) * -perturbation)
         
         n_start = 0
-        for idx, rnode in enumerate(self.region_nodes):
-            n_end = n_start + rnode.num_nodes
+        for idx, ns in enumerate(self.nodes):
+            n_end = n_start + ns.num_nodes
 
-            if hasattr(rnode, "_params"):
+            if hasattr(ns, "_params"):
                 if idx == 0:
                     par_start = 0
                     par_end = self.param_ends[n_end-1]
@@ -236,7 +235,7 @@ class CategoricalLayer(InputLayer):
                     par_start = self.param_ends[n_start-1]
                     par_end = self.param_ends[n_end-1]
 
-                params[par_start:par_end] = rnode._params["params"].to(params.device)
+                params[par_start:par_end] = ns._params["params"].to(params.device)
 
             n_start = n_end
 

@@ -5,9 +5,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import triton
 import triton.language as tl
-from typing import List, Dict
+from typing import Sequence, Dict
 
-from pyjuice.graph.region_graph import RegionGraph, InputRegionNode
+from pyjuice.nodes import InputNodes
 from pyjuice.utils.grad_fns import ReverseGrad
 from .layer import Layer
 
@@ -16,16 +16,11 @@ torch.set_float32_matmul_precision('high')
 
 
 class InputLayer(Layer, nn.Module):
-    def __init__(self, layer_id, region_nodes: List[RegionGraph], num_nodes: int) -> None:
+    def __init__(self, nodes: Sequence[InputNodes]) -> None:
         nn.Module.__init__(self)
-        Layer.__init__(self, layer_id)
+        Layer.__init__(self)
 
-        for rnode in region_nodes:
-            assert isinstance(rnode, InputRegionNode), "InputLayer must respect to InputRegionNode."
-
-        self.region_nodes = region_nodes
-        self.num_nodes = num_nodes
-        self.num_regions = len(self.region_nodes)
+        self.nodes = nodes
 
         self.param_flows = None
 
