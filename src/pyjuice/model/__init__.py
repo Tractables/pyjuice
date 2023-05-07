@@ -1,1 +1,1 @@
-from .probcircuit import ProbCircuit
+from .tensorcircuit import TensorCircuit

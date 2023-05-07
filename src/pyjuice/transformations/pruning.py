@@ -6,11 +6,11 @@ import networkx as nx
 from typing import Type, Optional
 from copy import deepcopy
 
-from pyjuice.model import ProbCircuit
+from pyjuice.model import TensorCircuit
 from pyjuice.graph import RegionGraph, InputRegionNode, InnerRegionNode, PartitionNode
 
 
-def prune(pc: ProbCircuit, threshold: float, threshold_type: str = "fraction", params: Optional[torch.Tensor] = None):
+def prune(pc: TensorCircuit, threshold: float, threshold_type: str = "fraction", params: Optional[torch.Tensor] = None):
     assert pc.param_flows is not None
 
     # Move PC to cpu for now

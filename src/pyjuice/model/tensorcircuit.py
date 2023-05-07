@@ -8,8 +8,8 @@ import triton.language as tl
 from functools import partial
 from typing import Optional, Sequence
 
-from pyjuice.graph import RegionGraph, InputRegionNode, InnerRegionNode, PartitionNode, truncate_npartition
-from pyjuice.layer import Layer, InputLayer, ProdLayer, SumLayer
+from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes
+from pyjuice.layer import Layer, InputLayer, ProdLayer, SumLayer, layerize
 from pyjuice.functional import normalize_parameters, flat_softmax_fw, flat_softmax_bp
 from pyjuice.utils.grad_fns import ReverseGrad, PseudoHookFunc
 
@@ -40,21 +40,21 @@ def _pc_inputs_hook(grad, pc, i):
     
     return grad
 
-class ProbCircuit(nn.Module):
-    def __init__(self, region_graph: RegionGraph, max_npartitions: Optional[int] = None, max_num_groups: int = 1) -> None:
+class TensorCircuit(nn.Module):
+    def __init__(self, root_nodes: CircuitNodes, max_num_groups: int = 1) -> None:
         super().__init__()
 
-        self.region_graph = self._convert_region_graph(region_graph, max_npartitions)
+        self.root_nodes = root_nodes
         self.device = torch.device("cpu")
         
         # Experimental, wheter to do calculations NOT in logdomain. Does extra bookkeeping to avoid logsumexp.
         self.skip_logsumexp = False
 
-        self._init_pass_tensors_()
+        self._init_pass_tensors()
         self._init_layers(max_num_groups = max_num_groups)
         self._init_ad_tensors()
 
-    def _init_pass_tensors_(self):
+    def _init_pass_tensors(self):
         self.node_mars = None
         self.element_mars = None
         self.node_flows = None
@@ -74,13 +74,12 @@ class ProbCircuit(nn.Module):
         }
         self._used_external_sum_params = False
         
-
     def forward(self, inputs: torch.Tensor, 
-                        params: Optional[torch.Tensor] = None, 
-                        input_params: Optional[Dict[str,torch.Tensor]] = None,
-                        missing_mask: Optional[torch.Tensor] = None,
-                        alphas: Optional[torch.Tensor]=None,
-                        ):
+                params: Optional[torch.Tensor] = None, 
+                input_params: Optional[Dict[str,torch.Tensor]] = None,
+                missing_mask: Optional[torch.Tensor] = None,
+                alphas: Optional[torch.Tensor] = None,
+                ):
         if missing_mask is not None:
             assert inputs.size() == missing_mask.size(), f"inputs.size {inputs.size()} != mask.size {missing_mask.size()}" 
         
@@ -135,15 +134,15 @@ class ProbCircuit(nn.Module):
                 else:
                     layer_params = None
 
-                layer(inputs, self.node_mars, params = layer_params, missing_mask=missing_mask, skip_logsumexp = self.skip_logsumexp, alphas=alphas)
+                layer(inputs, self.node_mars, params = layer_params, missing_mask=missing_mask, skip_logsumexp = self.skip_logsumexp, alphas = alphas)
 
-            for ltype, layer in self.inner_layers:
-                if ltype == "prod":
+            for layer in self.inner_layers:
+                if isinstance(layer, ProdLayer):
                     layer(self.node_mars, self.element_mars, skip_logsumexp = self.skip_logsumexp)
-                elif ltype == "sum":
-                    layer(self.node_mars, self.element_mars, params, sum_region_mars=self.sum_region_mars, skip_logsumexp = self.skip_logsumexp)
+                elif isinstance(layer, SumLayer):
+                    layer(self.node_mars, self.element_mars, params, sum_region_mars = self.sum_region_mars, skip_logsumexp = self.skip_logsumexp)
                 else:
-                    raise ValueError(f"Unknown layer type {ltype}.")
+                    raise ValueError(f"Unknown layer type {type(layer)}.")
                 
         if self.skip_logsumexp:
             lls = self.node_mars[-1,:] + self.sum_region_mars.log().sum(dim = 0)
@@ -167,8 +166,10 @@ class ProbCircuit(nn.Module):
         
         return lls
 
-    def backward(self, inputs: Optional[torch.Tensor] = None, ll_weights: Optional[torch.Tensor] = None,
-                 compute_param_flows: bool = True, flows_memory: float = 0.0):
+    def backward(self, inputs: Optional[torch.Tensor] = None, 
+                 ll_weights: Optional[torch.Tensor] = None,
+                 compute_param_flows: bool = True, 
+                 flows_memory: float = 0.0):
         assert self.node_mars is not None and self.element_mars is not None, "Should run forward path first."
 
         self.node_flows = torch.zeros([self.num_nodes, self.node_mars.size(1)], device = self.device)
@@ -189,13 +190,13 @@ class ProbCircuit(nn.Module):
 
         with torch.no_grad():
             for layer_id in range(len(self.inner_layers) - 1, -1, -1):
-                ltype, layer = self.inner_layers[layer_id]
+                layer = self.inner_layers[layer_id]
 
-                if ltype == "prod":
-                    layer.backward(self.node_flows, self.element_flows, skip_logsumexp=self.skip_logsumexp)
+                if isinstance(layer, ProdLayer):
+                    layer.backward(self.node_flows, self.element_flows, skip_logsumexp = self.skip_logsumexp)
 
-                elif ltype == "sum":
-                    self.inner_layers[layer_id-1][1].forward(self.node_mars, self.element_mars, skip_logsumexp = self.skip_logsumexp)
+                elif isinstance(layer, SumLayer):
+                    self.inner_layers[layer_id-1].forward(self.node_mars, self.element_mars, skip_logsumexp = self.skip_logsumexp)
 
                     layer.backward(self.node_flows, self.element_flows, self.node_mars, self.element_mars, params, 
                                    param_flows = self.param_flows if compute_param_flows else None, 
@@ -203,7 +204,7 @@ class ProbCircuit(nn.Module):
                                    sum_region_mars = self.sum_region_mars)
 
                 else:
-                    raise ValueError(f"Unknown layer type {ltype}.")
+                    raise ValueError(f"Unknown layer type {type(layer)}.")
 
             if compute_param_flows:
                 if inputs is None:
@@ -347,7 +348,7 @@ class ProbCircuit(nn.Module):
 
 
     def to(self, device):
-        super(ProbCircuit, self).to(device)
+        super(TensorCircuit, self).to(device)
 
         for layer in self.input_layers:
             layer.device = device
@@ -362,20 +363,14 @@ class ProbCircuit(nn.Module):
 
         return param_specs
 
-    def _convert_region_graph(self, region_graph: RegionGraph, max_npartitions: Optional[int] = None):
-        if max_npartitions is not None:
-            region_graph = truncate_npartition(region_graph, max_npartitions)
-
-        return region_graph
-
     def _init_layers(self, init_input_params: Optional[Sequence[torch.Tensor]] = None, 
-                        init_inner_params: Optional[torch.Tensor] = None,
-                        max_num_groups: int = 1):
-        depth2rnodes, num_layers = self._create_region_node_layers()
+                     init_inner_params: Optional[torch.Tensor] = None,
+                     max_num_groups: int = 1):
+        depth2nodes, num_layers = self._create_node_layers()
 
         if hasattr(self, "input_layers") or hasattr(self, "inner_layers"):
-            raise ValueError("Attempting to initialize a ProbCircuit for the second time. " + \
-                "Please instead create a new ProbCircuit instance by `ProbCircuit(region_graph)`.")
+            raise ValueError("Attempting to initialize a TensorCircuit for the second time. " + \
+                "Please instead create a new TensorCircuit instance by `TensorCircuit(nodes)`.")
 
         self.input_layers = []
         self.inner_layers = []
@@ -395,29 +390,30 @@ class ProbCircuit(nn.Module):
         for depth in range(num_layers):
             if depth == 0:
                 # Input layer
-                type2rnodes = self._categorize_input_region_nodes(depth2rnodes[0]["input"])
-                for NodeType, rnodes in type2rnodes.items():
-                    input_layer = NodeType(layer_id, region_nodes = rnodes, cum_nodes = num_nodes)
+                type2nodes = self._categorize_input_nodes(depth2nodes[0]["input"])
+                input_layer_id = 0
+                for NodeType, nodes in type2nodes.items():
+                    input_layer = NodeType(nodes = nodes, cum_nodes = num_nodes)
 
                     num_nodes += input_layer.num_nodes
                     self.input_layers.append(input_layer)
-                    self.add_module(f"input_layer_{layer_id}", input_layer)
-                    layer_id += 1
+                    self.add_module(f"input_layer_{input_layer_id}", input_layer)
+                    input_layer_id += 1
             else:
-                assert len(depth2rnodes[depth]["prod"]) > 0 and len(depth2rnodes[depth]["sum"]) > 0, \
-                    "Depth {}: ({}, {})".format(depth, len(depth2rnodes[depth]["prod"]), len(depth2rnodes[depth]["sum"]))
+                assert len(depth2nodes[depth]["prod"]) > 0 and len(depth2nodes[depth]["sum"]) > 0, \
+                    "Depth {}: ({}, {})".format(depth, len(depth2nodes[depth]["prod"]), len(depth2nodes[depth]["sum"]))
 
                 # Product layer
-                prod_layer = ProdLayer(layer_id, depth2rnodes[depth]["prod"], max_num_groups = max_num_groups)
+                prod_layer = ProdLayer(nodes = depth2nodes[depth]["prod"], max_num_groups = max_num_groups)
 
                 if prod_layer.num_nodes + 1 > num_elements:
                     num_elements = prod_layer.num_nodes + 1
+
                 self.add_module(f"prod_layer_{layer_id}", prod_layer)
-                self.inner_layers.append(("prod", prod_layer))
-                layer_id += 1
+                self.inner_layers.append(prod_layer)
 
                 # Sum layer
-                sum_layer = SumLayer(layer_id, depth2rnodes[depth]["sum"],
+                sum_layer = SumLayer(nodes = depth2nodes[depth]["sum"],
                                      cum_nodes = num_nodes, 
                                      param_ends = param_ends, 
                                      ch_prod_layer_size = prod_layer.num_nodes + 1,
@@ -425,9 +421,11 @@ class ProbCircuit(nn.Module):
                                      max_num_groups = max_num_groups)
 
                 num_nodes += sum_layer.num_nodes
-                num_sum_regions += len(depth2rnodes[depth]["sum"])
+                num_sum_regions += len(depth2nodes[depth]["sum"])
+
                 self.add_module(f"sum_layer_{layer_id}", sum_layer)
-                self.inner_layers.append(("sum", sum_layer))
+                self.inner_layers.append(sum_layer)
+
                 layer_id += 1
 
         self.num_nodes = num_nodes
@@ -455,9 +453,9 @@ class ProbCircuit(nn.Module):
         params = torch.exp(torch.rand([self.num_sum_params]) * -perturbation)
 
         # Copy initial parameters if provided
-        for layer_type, layer in self.inner_layers:
-            if layer_type == "sum":
-                for rnode in layer.region_nodes:
+        for layer in self.inner_layers:
+            if isinstance(layer, SumLayer):
+                for rnode in layer.nodes:
                     if hasattr(rnode, "_params"):
                         sidx, eidx = rnode._param_range
                         params[sidx:eidx] = rnode._params[rnode._inverse_param_ids].to(params.device)
@@ -478,62 +476,63 @@ class ProbCircuit(nn.Module):
 
     def _extract_params_to_rnodes(self):
         """
-        Extract all inner and input parameters from this ProbCircuit to individual region nodes.
+        Extract all inner and input parameters from this TensorCircuit to individual nodes.
         """
-        assert self.device.type == "cpu", "Please move the ProbCircuit to CPU before extracting its parameters."
+        assert self.device.type == "cpu", "Please move the TensorCircuit to CPU before extracting its parameters."
 
-        # Inner region nodes
+        # Inner nodes
         for layer_type, layer in self.inner_layers:
             if layer_type == "sum":
-                for rnode in layer.region_nodes:
-                    sidx, eidx = rnode._param_range
-                    rnode._params = self.params.data[sidx:eidx].detach().cpu().clone()
+                for ns in layer.nodes:
+                    sidx, eidx = ns._param_range
+                    ns._params = self.params.data[sidx:eidx].detach().cpu().clone()
 
-        # Input region nodes
+        # Input nodes
         for layer in self.input_layers:
             layer._extract_params_to_rnodes()
 
-    def _create_region_node_layers(self):
-        depth2rnodes = dict()
-        rnode2depth = dict()
+    def _create_node_layers(self):
+        depth2nodes = dict()
+        nodes2depth = dict()
 
         num_layers = [1]
 
-        def dfs(n: RegionGraph):
-            if n in rnode2depth:
+        def dfs(ns: CircuitNodes):
+            if ns in nodes2depth:
                 return
-            if isinstance(n, InputRegionNode):
-                rnode2depth[n] = 0
-                if 0 not in depth2rnodes:
-                    depth2rnodes[0] = {"input": []}
-                depth2rnodes[0]["input"].append(n)
+            if ns.isinput():
+                nodes2depth[ns] = 0
+                if 0 not in depth2nodes:
+                    depth2nodes[0] = {"input": []}
+                depth2nodes[0]["input"].append(ns)
             else:
-                for c in n.children:
-                    dfs(c)
+                for cs in ns.chs:
+                    dfs(cs)
 
-                depth = max(map(lambda m: rnode2depth[m], n.children)) + (1 if isinstance(n, PartitionNode) else 0)
+                depth = max(map(lambda ms: nodes2depth[ms], ns.chs)) + (1 if ns.isprod() else 0)
                 num_layers[0] = max(depth + 1, num_layers[0])
-                rnode2depth[n] = depth
+                nodes2depth[ns] = depth
 
-                if depth not in depth2rnodes:
-                    depth2rnodes[depth] = {"sum": [], "prod": []} # lists for sum and product regions
+                if depth not in depth2nodes:
+                    depth2nodes[depth] = {"sum": [], "prod": []} # lists for sum and product nodes
                 
-                if isinstance(n, PartitionNode):
-                    depth2rnodes[depth]["prod"].append(n)
-                elif isinstance(n, InnerRegionNode):
-                    depth2rnodes[depth]["sum"].append(n)
+                if ns.isprod():
+                    depth2nodes[depth]["prod"].append(ns)
+                elif ns.issum():
+                    depth2nodes[depth]["sum"].append(ns)
                 else:
-                    raise NotImplementedError(f"Unsupported region node type {type(n)}.")
+                    raise NotImplementedError(f"Unsupported node type {type(n)}.")
 
-        dfs(self.region_graph)
+        dfs(self.root_nodes)
 
-        return depth2rnodes, num_layers[0]
+        return depth2nodes, num_layers[0]
 
-    def _categorize_input_region_nodes(self, rnodes):
-        type2rnodes = dict()
-        for r in rnodes:
-            if r.node_type not in type2rnodes:
-                type2rnodes[r.node_type] = []
-            type2rnodes[r.node_type].append(r)
+    def _categorize_input_nodes(self, nodes: Sequence[InputNodes]):
+        type2nodes = dict()
+        for ns in nodes:
+            ltype = layerize(ns.dist)
+            if ltype not in type2nodes:
+                type2nodes[ltype] = []
+            type2nodes[ltype].append(ns)
 
-        return type2rnodes
+        return type2nodes

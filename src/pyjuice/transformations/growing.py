@@ -6,11 +6,11 @@ import networkx as nx
 from typing import Type, Optional
 from copy import deepcopy
 
-from pyjuice.model import ProbCircuit
+from pyjuice.model import TensorCircuit
 from pyjuice.graph import RegionGraph, InputRegionNode, InnerRegionNode, PartitionNode
 
 
-def duplicate(pc: ProbCircuit, sigma: float = 0.1):
+def duplicate(pc: TensorCircuit, sigma: float = 0.1):
     # Move PC to cpu for now
     pc_device = pc.device
     pc.to(torch.device("cpu"))
