@@ -11,6 +11,7 @@ from typing import Sequence, List, Optional
 from pyjuice.nodes import SumNodes
 from .layer import Layer
 from .backend.node_partition import partition_nodes_by_n_edges
+from .backend.index_set import batched_index_set, index_cum
 
 # Try to enable tensor cores
 torch.set_float32_matmul_precision('high')
@@ -217,6 +218,7 @@ class SumLayer(Layer, nn.Module):
         self.grouped_seq_parpids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in grouped_seq_parpids])
 
     def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor, 
+                scratch: torch.Tensor,
                 sum_region_mars: Optional[torch.tensor] = None, skip_logsumexp: bool = False):
         """
         node_mars: [num_nodes, B]
@@ -229,7 +231,7 @@ class SumLayer(Layer, nn.Module):
         if skip_logsumexp:
             self._dense_forward_pass_nolog(node_mars, element_mars, params, sum_region_mars)
         else:
-            self._dense_forward_pass(node_mars, element_mars, params)
+            self._dense_forward_pass(node_mars, element_mars, params, scratch)
 
     def sample(self, node_flows: torch.Tensor, 
                element_flows: torch.Tensor, 
@@ -253,13 +255,14 @@ class SumLayer(Layer, nn.Module):
                                    element_mars, params, node_mask)
 
     def backward(self, node_flows: torch.Tensor, 
-                        element_flows: torch.Tensor, 
-                        node_mars: torch.Tensor, 
-                        element_mars: torch.Tensor, 
-                        params: torch.Tensor, 
-                        param_flows: Optional[torch.Tensor] = None,
-                        sum_region_mars: Optional[torch.Tensor] = None,
-                        skip_logsumexp: bool = False):
+                 element_flows: torch.Tensor, 
+                 node_mars: torch.Tensor, 
+                 element_mars: torch.Tensor, 
+                 params: torch.Tensor, 
+                 scratch: torch.Tensor,
+                 param_flows: Optional[torch.Tensor] = None,
+                 sum_region_mars: Optional[torch.Tensor] = None,
+                 skip_logsumexp: bool = False):
         """
         node_flows: [num_nodes, B]
         element_flows: [max_num_els, B]
@@ -276,12 +279,12 @@ class SumLayer(Layer, nn.Module):
             if param_flows is None:
                 self._dense_backward_pass1(node_flows, element_flows, node_mars, element_mars, params, param_flows = param_flows)
             elif params.size(1) == 1:
-                self._dense_backward_pass2(node_flows, element_flows, node_mars, element_mars, params, param_flows = param_flows)
+                self._dense_backward_pass2(node_flows, element_flows, node_mars, element_mars, params, param_flows = param_flows, scratch = scratch)
             else:
                 self._dense_backward_pass3(node_flows, element_flows, node_mars, element_mars, params, param_flows = param_flows)
 
     @torch.compile(mode = "reduce-overhead", fullgraph = True)
-    def _dense_forward_pass(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor):
+    def _dense_forward_pass_legacy(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor, scratch):
         for group_id in range(self.num_forward_groups):
             nids = self.grouped_nids[group_id]
             cids = self.grouped_cids[group_id]
@@ -291,6 +294,31 @@ class SumLayer(Layer, nn.Module):
             maxval = ch_mars.max(dim = 1, keepdim = True).values
             node_mars[nids] = (((ch_mars - maxval).exp() * params[pids]).sum(
                 dim = 1).clamp(min = 1e-10)).log() + maxval.squeeze(1)
+
+        return None
+
+    @staticmethod
+    @torch.compile(mode = "reduce-overhead", fullgraph = True)
+    def _forward_kernel(scratch, element_mars, params, cids, pids):
+        ch_mars = element_mars[cids]
+        maxval = ch_mars.max(dim = 1, keepdim = True).values
+        scratch[:] = ((((ch_mars - maxval).exp() * params[pids]).sum(
+            dim = 1).clamp(min = 1e-10)).log() + maxval.squeeze(1)).reshape(-1)
+
+        return None
+
+    def _dense_forward_pass(self, node_mars: torch.Tensor, element_mars: torch.Tensor, 
+                            params: torch.Tensor, scratch: torch.Tensor):
+        
+        batch_size = node_mars.size(1)
+
+        for group_id in range(self.num_forward_groups):
+            nids = self.grouped_nids[group_id]
+            cids = self.grouped_cids[group_id]
+            pids = self.grouped_pids[group_id]
+
+            self._forward_kernel(scratch[:nids.numel() * batch_size], element_mars, params, cids, pids)
+            batched_index_set(node_mars, nids, scratch)
 
         return None
     
@@ -321,9 +349,52 @@ class SumLayer(Layer, nn.Module):
 
         return None
 
+    @staticmethod
     @torch.compile(mode = "reduce-overhead", fullgraph = True)
+    def _compute_elem_flows(scratch, node_flows, element_mars, node_mars, params, parids, parpids, chids):
+        scratch[:] = ((node_flows[parids] * params[parpids] * \
+            (element_mars[chids].unsqueeze(1) - node_mars[parids]).exp()).sum(dim = 1)).reshape(-1)
+
+        return None
+
+    @staticmethod
+    @torch.compile(mode = "reduce-overhead", fullgraph = True)
+    def _compute_param_flows(scratch, node_flows, element_mars, node_mars, params, parids, parpids, chids, seq_ids0, seq_ids1):
+        scratch[:] = ((node_flows[parids] * params[parpids] * \
+            (element_mars[chids].unsqueeze(1) - node_mars[parids]).exp()).sum(dim = 2)[seq_ids0, seq_ids1]).reshape(-1)
+
+        return None
+
     def _dense_backward_pass2(self, node_flows: torch.Tensor, element_flows: torch.Tensor, node_mars: torch.Tensor, 
-                              element_mars: torch.Tensor, params: torch.Tensor, param_flows: torch.Tensor):
+                              element_mars: torch.Tensor, params: torch.Tensor, param_flows: torch.Tensor, scratch: torch.Tensor):
+        
+        batch_size = node_flows.size(1)
+        
+        for group_id in range(self.num_backward_groups):
+            chids = self.grouped_chids[group_id]
+            parids = self.grouped_parids[group_id]
+            parpids = self.grouped_parpids[group_id]
+            seq_ids0 = self.grouped_seq_ids0[group_id]
+            seq_ids1 = self.grouped_seq_ids1[group_id]
+            seq_parpids = self.grouped_seq_parpids[group_id]
+
+            self._compute_elem_flows(
+                scratch[:chids.numel() * batch_size], node_flows, element_mars, 
+                node_mars, params, parids, parpids, chids
+            )
+            batched_index_set(element_flows, chids, scratch)
+
+            self._compute_param_flows(
+                scratch[:seq_parpids.numel()], node_flows, element_mars, 
+                node_mars, params, parids, parpids, chids, seq_ids0, seq_ids1
+            )
+            index_cum(param_flows, seq_parpids, scratch)
+
+        return None
+
+    @torch.compile(mode = "reduce-overhead", fullgraph = True)
+    def _dense_backward_pass2_legacy(self, node_flows: torch.Tensor, element_flows: torch.Tensor, node_mars: torch.Tensor, 
+                              element_mars: torch.Tensor, params: torch.Tensor, param_flows: torch.Tensor, scratch: torch.Tensor):
         for group_id in range(self.num_backward_groups):
             chids = self.grouped_chids[group_id]
             parids = self.grouped_parids[group_id]

@@ -10,6 +10,7 @@ from typing import Sequence
 from pyjuice.nodes import ProdNodes
 from .layer import Layer
 from .backend.node_partition import partition_nodes_by_n_edges
+from .backend.index_set import batched_index_set, batched_index_cum
 
 # Try to enable tensor cores
 torch.set_float32_matmul_precision('high')
@@ -118,7 +119,7 @@ class ProdLayer(Layer, nn.Module):
         self.grouped_parids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in grouped_parids])
         self.grouped_u_cids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in grouped_u_cids])
 
-    def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor, skip_logsumexp: bool = False):
+    def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor, scratch: torch.Tensor, skip_logsumexp: bool = False):
         """
         node_mars: [num_nodes, B]
         element_mars: [max_num_els, B]
@@ -126,9 +127,9 @@ class ProdLayer(Layer, nn.Module):
         if skip_logsumexp:
             self._dense_forward_pass_nolog(node_mars, element_mars)
         else:
-            self._dense_forward_pass(node_mars, element_mars)
+            self._dense_forward_pass(node_mars, element_mars, scratch)
 
-    def backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor, skip_logsumexp: bool = False):
+    def backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor, scratch: torch.Tensor, skip_logsumexp: bool = False):
         """
         node_flows: [num_nodes, B]
         element_flows: [max_num_els, B]
@@ -136,10 +137,30 @@ class ProdLayer(Layer, nn.Module):
         if skip_logsumexp:
             self._dense_backward_pass_nolog(node_flows, element_flows)
         else:
-            self._dense_backward_pass(node_flows, element_flows)
+            self._dense_backward_pass(node_flows, element_flows, scratch)
+
+    @staticmethod
+    @torch.compile(mode = "reduce-overhead")
+    def _forward_fn(scratch, node_mars, cids):
+        scratch[:] = (node_mars[cids].sum(dim = 1)).reshape(-1)
+
+        return None
+
+    def _dense_forward_pass(self, node_mars: torch.Tensor, element_mars: torch.Tensor, scratch: torch.Tensor):
+        
+        batch_size = node_mars.size(1)
+        
+        for group_id in range(self.num_forward_groups):
+            nids = self.grouped_nids[group_id]
+            cids = self.grouped_cids[group_id]
+
+            self._forward_fn(scratch[:nids.numel() * batch_size], node_mars, cids)
+            batched_index_set(element_mars, nids, scratch)
+
+        return None
 
     @torch.compile(mode = "reduce-overhead")
-    def _dense_forward_pass(self, node_mars: torch.Tensor, element_mars: torch.Tensor):
+    def _dense_forward_pass_legacy(self, node_mars: torch.Tensor, element_mars: torch.Tensor):
         for group_id in range(self.num_forward_groups):
             nids = self.grouped_nids[group_id]
             cids = self.grouped_cids[group_id]
@@ -168,9 +189,28 @@ class ProdLayer(Layer, nn.Module):
         
         return None
 
+    @staticmethod
+    @torch.compile(mode = "reduce-overhead")
+    def _backward_fn(scratch, element_flows, parids):
+        scratch[:] = (element_flows[parids].sum(dim = 1)).reshape(-1)
+
+        return None
+
+    def _dense_backward_pass(self, node_flows: torch.Tensor, element_flows: torch.Tensor, scratch: torch.Tensor):
+        
+        batch_size = node_flows.size(1)
+        
+        for group_id in range(self.num_backward_groups):
+            parids = self.grouped_parids[group_id]
+            u_cids = self.grouped_u_cids[group_id]
+
+            self._backward_fn(scratch[:u_cids.numel() * batch_size], element_flows, parids)
+            batched_index_cum(node_flows, u_cids, scratch)
+        
+        return None
 
     @torch.compile(mode = "reduce-overhead")
-    def _dense_backward_pass(self, node_flows: torch.Tensor, element_flows: torch.Tensor):
+    def _dense_backward_pass_legacy(self, node_flows: torch.Tensor, element_flows: torch.Tensor):
         for group_id in range(self.num_backward_groups):
             parids = self.grouped_parids[group_id]
             u_cids = self.grouped_u_cids[group_id]

@@ -94,6 +94,7 @@ class TensorCircuit(nn.Module):
             missing_mask = missing_mask.permute(1, 0)
         
         self.node_mars = torch.empty([self.num_nodes, B], device = self.device)
+        self.scratch = torch.empty([self.num_nodes * B], device = self.device) ##### debug
         self.element_mars = torch.empty([self.num_elements, B], device = self.device)
 
         if self.skip_logsumexp:
@@ -138,9 +139,9 @@ class TensorCircuit(nn.Module):
 
             for layer in self.inner_layers:
                 if isinstance(layer, ProdLayer):
-                    layer(self.node_mars, self.element_mars, skip_logsumexp = self.skip_logsumexp)
+                    layer(self.node_mars, self.element_mars, self.scratch, skip_logsumexp = self.skip_logsumexp)
                 elif isinstance(layer, SumLayer):
-                    layer(self.node_mars, self.element_mars, params, sum_region_mars = self.sum_region_mars, skip_logsumexp = self.skip_logsumexp)
+                    layer(self.node_mars, self.element_mars, params, self.scratch, sum_region_mars = self.sum_region_mars, skip_logsumexp = self.skip_logsumexp)
                 else:
                     raise ValueError(f"Unknown layer type {type(layer)}.")
                 
@@ -173,6 +174,7 @@ class TensorCircuit(nn.Module):
         assert self.node_mars is not None and self.element_mars is not None, "Should run forward path first."
 
         self.node_flows = torch.zeros([self.num_nodes, self.node_mars.size(1)], device = self.device)
+        self.scratch = torch.empty([self.num_nodes * self.node_mars.size(1)], device = self.device) ##### debug
         self.element_flows = torch.zeros([self.num_elements, self.node_mars.size(1)], device = self.device)
 
         if ll_weights is None:
@@ -193,12 +195,13 @@ class TensorCircuit(nn.Module):
                 layer = self.inner_layers[layer_id]
 
                 if isinstance(layer, ProdLayer):
-                    layer.backward(self.node_flows, self.element_flows, skip_logsumexp = self.skip_logsumexp)
+                    layer.backward(self.node_flows, self.element_flows, self.scratch, skip_logsumexp = self.skip_logsumexp)
 
                 elif isinstance(layer, SumLayer):
-                    self.inner_layers[layer_id-1].forward(self.node_mars, self.element_mars, skip_logsumexp = self.skip_logsumexp)
+                    self.inner_layers[layer_id-1].forward(self.node_mars, self.element_mars, self.scratch, skip_logsumexp = self.skip_logsumexp)
 
                     layer.backward(self.node_flows, self.element_flows, self.node_mars, self.element_mars, params, 
+                                   scratch = self.scratch,
                                    param_flows = self.param_flows if compute_param_flows else None, 
                                    skip_logsumexp = self.skip_logsumexp, 
                                    sum_region_mars = self.sum_region_mars)
