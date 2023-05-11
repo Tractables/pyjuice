@@ -28,7 +28,7 @@ class DiscreteLogisticLayer(InputLayer, nn.Module):
         self.node_input_range = []
         self.node_bin_sizes = []
         layer_num_nodes = 0
-        for ns in self.region_nodes:
+        for ns in self.nodes:
             assert len(ns.scope) == 1, "DiscreteLogisticLayer only support uni-variate categorical distributions."
             assert isinstance(ns.dist, DiscreteLogistic), f"Adding a `{type(ns.dist)}` node to a `DiscreteLogistic`."
 

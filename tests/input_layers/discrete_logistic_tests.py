@@ -2,20 +2,21 @@ import pyjuice as juice
 import torch
 import numpy as np
 
+import pyjuice.nodes.distributions as dists
 from pyjuice.graph import RegionGraph, InputRegionNode, InnerRegionNode, PartitionNode
 from pyjuice.layer import DiscreteLogisticLayer
-from pyjuice.model import ProbCircuit
+from pyjuice.nodes import multiply, summate, inputs
 
 import pytest
 
+
 def test_discrete_logistic_layer():
-    torch.set_float32_matmul_precision('high')
 
     device = torch.device("cuda:0")
 
-    inputs = [InputRegionNode(scope = [i], num_nodes = 2, node_type = DiscreteLogisticLayer, input_range = [0, 1], bin_count = 256) for i in range(4)]
+    ins = [inputs(0, num_nodes = 2, dist = dists.DiscreteLogistic(input_range = [0, 1], bin_count = 256)) for i in range(4)]
 
-    layer = DiscreteLogisticLayer(0, inputs, 0)
+    layer = DiscreteLogisticLayer(ins, 0)
     layer.to(device)
 
     data = torch.rand([4, 1]).to(device)
