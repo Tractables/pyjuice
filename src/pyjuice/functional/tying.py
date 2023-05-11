@@ -68,28 +68,41 @@ def tie_param_flows(param_flows: torch.Tensor, num_tied_params: int,
         assert tied_param_flows.size(0) == num_tied_params and tied_param_flows.size(1) == batch_size, "Size of `tied_param_flows` is incorrect."
         tied_param_flows = tied_param_flows[:,:]
 
-    grid = lambda meta: (triton.cdiv(num_params * batch_size, meta['BLOCK_SIZE']),)
+    if param_flows.is_cuda:
+        assert tied_param_flows.is_cuda and tied_param_ids.is_cuda and tied_param_group_ids.is_cuda
 
-    _aggregate_flows_kernel[grid](
-        param_flows_ptr = param_flows, 
-        tied_param_flows_ptr = tied_param_flows,
-        tied_param_ids_ptr = tied_param_ids, 
-        tied_param_group_ids_ptr = tied_param_group_ids,
-        num_params = num_params,
-        batch_size = batch_size,
-        BLOCK_SIZE = BLOCK_SIZE
-    )
+        grid = lambda meta: (triton.cdiv(num_params * batch_size, meta['BLOCK_SIZE']),)
 
-    grid = lambda meta: (triton.cdiv(num_params * batch_size, meta['BLOCK_SIZE']),)
+        _aggregate_flows_kernel[grid](
+            param_flows_ptr = param_flows, 
+            tied_param_flows_ptr = tied_param_flows,
+            tied_param_ids_ptr = tied_param_ids, 
+            tied_param_group_ids_ptr = tied_param_group_ids,
+            num_params = num_params,
+            batch_size = batch_size,
+            BLOCK_SIZE = BLOCK_SIZE
+        )
 
-    _assign_flows_kernel[grid](
-        param_flows_ptr = param_flows, 
-        tied_param_flows_ptr = tied_param_flows,
-        tied_param_ids_ptr = tied_param_ids, 
-        tied_param_group_ids_ptr = tied_param_group_ids,
-        num_params = num_params,
-        batch_size = batch_size,
-        BLOCK_SIZE = BLOCK_SIZE
-    )
+        grid = lambda meta: (triton.cdiv(num_params * batch_size, meta['BLOCK_SIZE']),)
+
+        _assign_flows_kernel[grid](
+            param_flows_ptr = param_flows, 
+            tied_param_flows_ptr = tied_param_flows,
+            tied_param_ids_ptr = tied_param_ids, 
+            tied_param_group_ids_ptr = tied_param_group_ids,
+            num_params = num_params,
+            batch_size = batch_size,
+            BLOCK_SIZE = BLOCK_SIZE
+        )
+
+    else:
+        cum_matrix = torch.sparse_coo_tensor(
+            torch.stack((tied_param_group_ids, tied_param_ids), dim = 0), 
+            torch.ones([num_params], dtype = torch.float32, device = param_flows.device), 
+            (num_tied_params, param_flows.size(0))
+        )
+        par_group_buffer = torch.sparse.mm(cum_matrix, param_flows) # [num_tied_params, B]
+
+        param_flows[tied_param_ids] = par_group_buffer[tied_param_group_ids]
 
     return None
