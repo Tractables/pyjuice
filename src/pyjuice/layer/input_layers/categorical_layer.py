@@ -10,7 +10,7 @@ from typing import Sequence, Dict, Optional
 from pyjuice.nodes import InputNodes
 from pyjuice.nodes.distributions import Categorical
 from pyjuice.layer.input_layer import InputLayer
-from pyjuice.functional import normalize_parameters
+from pyjuice.functional import normalize_parameters, tie_param_flows
 
 # Try to enable tensor cores
 torch.set_float32_matmul_precision('high')
@@ -27,6 +27,9 @@ class CategoricalLayer(InputLayer, nn.Module):
         self.node_sizes = []
         self.node_num_cats = []
         self.param_ends = []
+        self.tied_param_ids = []
+        self.tied_param_group_ids = []
+        self.num_tied_params = 0
         layer_num_nodes = 0
         cum_params = 0
         for ns in self.nodes:
@@ -44,9 +47,30 @@ class CategoricalLayer(InputLayer, nn.Module):
             for nid in range(1, ns.num_nodes + 1):
                 self.param_ends.append(cum_params + ns.dist.num_cats * nid)
             cum_params += ns.num_nodes * ns.dist.num_cats
+            ns._param_range = (cum_params - ns.num_nodes * ns.dist.num_cats, cum_params)
+
+            if ns._source_node is not None:
+                source_ns = ns._source_node
+                if source_ns._tied_param_group_ids is None:
+
+                    num_source_params = source_ns._param_range[1] - source_ns._param_range[0] + 1
+                    source_ns._tied_param_group_ids = [i for i in range(self.num_tied_params, self.num_tied_params + num_source_params)]
+
+                    tied_param_ids.extend([i for i in range(source_ns._param_range[0], source_ns._param_range[1])])
+                    tied_param_group_ids.extend(source_ns._tied_param_group_ids)
+
+                    self.num_tied_params += ns_param_end - ns_param_start + 1
+
+                ns._tied_param_group_ids = deepcopy(source_ns._tied_param_group_ids)
+                self.tied_param_ids.extend([i for i in range(ns._param_range[0], ns._param_range[1])])
+                self.tied_param_group_ids.extend(ns._tied_param_group_ids)
 
         self._output_ind_range = (cum_nodes - layer_num_nodes, cum_nodes)
         self.param_ends = torch.tensor(self.param_ends)
+
+        if self.num_tied_params > 0:
+            self.tied_param_ids = torch.tensor(tied_param_ids)
+            self.tied_param_group_ids = torch.tensor(tied_param_group_ids)
 
         self.num_params = cum_params
         self.num_nodes = layer_num_nodes
@@ -164,10 +188,25 @@ class CategoricalLayer(InputLayer, nn.Module):
 
     def mini_batch_em(self, step_size: float, pseudocount: float = 0.0):
         if not self._used_external_params:
+            # Tie parameter flows if necessary
+            if self.num_tied_params > 0:
+                with torch.no_grad():
+                    self._tie_param_flows(self.param_flows)
+
+            # Normalize and update parameters
             with torch.no_grad():
                 flows = self.param_flows
                 self._normalize_parameters(flows, pseudocount = pseudocount)
                 self.params.data = (1.0 - step_size) * self.params.data + step_size * flows
+
+    def _tie_param_flows(self, param_flows):
+        if param_flows is not None:
+            tie_param_flows(
+                param_flows = param_flows, 
+                num_tied_params = self.num_tied_params, 
+                tied_param_ids = self.tied_param_ids, 
+                tied_param_group_ids = self.tied_param_group_ids
+            )
 
     def get_param_specs(self):
         return {"params": torch.Size([self.params.size(0)])}

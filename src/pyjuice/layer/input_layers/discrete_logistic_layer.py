@@ -62,6 +62,9 @@ class DiscreteLogisticLayer(InputLayer, nn.Module):
 
             n_start = n_end
 
+            if ns._source_node is not None:
+                raise NotImplementedError()
+
         self.register_buffer("d2vids", d2vids)
         self.register_buffer("vrangeslow", vrangeslow.unsqueeze(1))
         self.register_buffer("vrangeshigh", vrangeshigh.unsqueeze(1))
