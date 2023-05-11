@@ -468,7 +468,7 @@ class TensorCircuit(nn.Module):
         self.register_buffer("node_nchs", node_nchs)
 
         # For parameter tying
-        self.num_tied_params = tied_param_ends[end]
+        self.num_tied_params = tied_param_ends[-1] if len(tied_param_ends) > 0 else 0
         if self.num_tied_params > 0:
             tied_param_ids = torch.from_numpy(tied_param_ids).long()
             tied_param_group_ids = torch.from_numpy(tied_param_group_ids).long()
