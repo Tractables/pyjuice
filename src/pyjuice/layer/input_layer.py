@@ -11,9 +11,6 @@ from pyjuice.nodes import InputNodes
 from pyjuice.utils.grad_fns import ReverseGrad
 from .layer import Layer
 
-# Try to enable tensor cores
-torch.set_float32_matmul_precision('high')
-
 
 class InputLayer(Layer, nn.Module):
     def __init__(self, nodes: Sequence[InputNodes]) -> None:

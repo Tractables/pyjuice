@@ -13,6 +13,7 @@ from pyjuice.layer import Layer, InputLayer, ProdLayer, SumLayer, layerize
 from pyjuice.functional import normalize_parameters, tie_param_flows, flat_softmax_fw, flat_softmax_bp
 from pyjuice.utils.grad_fns import ReverseGrad, PseudoHookFunc
 
+
 def _pc_model_backward_hook(grad, pc):
     pc.backward(
         ll_weights = grad / grad.sum() * grad.size(0),
@@ -23,6 +24,7 @@ def _pc_model_backward_hook(grad, pc):
     pc._backward_buffer.clear()
 
     return None
+
 
 def _pc_inputs_hook(grad, pc, i):
 
@@ -40,15 +42,13 @@ def _pc_inputs_hook(grad, pc, i):
     
     return grad
 
+
 class TensorCircuit(nn.Module):
     def __init__(self, root_nodes: CircuitNodes, max_num_groups: int = 1) -> None:
         super().__init__()
 
         self.root_nodes = root_nodes
         self.device = torch.device("cpu")
-        
-        # Experimental, wheter to do calculations NOT in logdomain. Does extra bookkeeping to avoid logsumexp.
-        self.skip_logsumexp = False
 
         self._init_pass_tensors()
         self._init_layers(max_num_groups = max_num_groups)
@@ -60,8 +60,6 @@ class TensorCircuit(nn.Module):
         self.node_flows = None
         self.element_flows = None
         self.param_flows = None
-        self.sum_region_mars = None
-        self.alphas = None
 
     def _init_ad_tensors(self):
         self._inputs = [None, None]
@@ -78,32 +76,20 @@ class TensorCircuit(nn.Module):
                 params: Optional[torch.Tensor] = None, 
                 input_params: Optional[Dict[str,torch.Tensor]] = None,
                 missing_mask: Optional[torch.Tensor] = None,
-                alphas: Optional[torch.Tensor] = None,
                 ):
         if missing_mask is not None:
             assert inputs.size() == missing_mask.size(), f"inputs.size {inputs.size()} != mask.size {missing_mask.size()}" 
         
-        if alphas is not None:
-            assert inputs.size() == alphas.size(), f"inputs.size() {inputs.size()} != alphas.size() {alphas.size()}" 
-
         B = inputs.size(0)
         inputs = inputs.permute(1, 0)
-        if alphas is not None:
-            alphas = alphas.permute(1, 0)
         if missing_mask is not None:
             missing_mask = missing_mask.permute(1, 0)
         
         self.node_mars = torch.empty([self.num_nodes, B], device = self.device)
-        self.scratch = torch.empty([self.num_nodes * B], device = self.device) ##### debug
         self.element_mars = torch.empty([self.num_elements, B], device = self.device)
 
-        if self.skip_logsumexp:
-            self.sum_region_mars = torch.zeros([self.num_sum_regions, B], device = inputs.device)
-            self.node_mars[0,:] = 1.0
-            self.element_mars[0,:] = 0.0
-        else:
-            self.node_mars[0,:] = 0.0
-            self.element_mars[0,:] = -torch.inf
+        self.node_mars[0,:] = 0.0
+        self.element_mars[0,:] = -torch.inf
 
         if params is None:
             params = self.params
@@ -135,20 +121,21 @@ class TensorCircuit(nn.Module):
                 else:
                     layer_params = None
 
-                layer(inputs, self.node_mars, params = layer_params, missing_mask=missing_mask, skip_logsumexp = self.skip_logsumexp, alphas = alphas)
+                layer(inputs, self.node_mars, params = layer_params, missing_mask=missing_mask)
 
             for layer in self.inner_layers:
                 if isinstance(layer, ProdLayer):
-                    layer(self.node_mars, self.element_mars, self.scratch, skip_logsumexp = self.skip_logsumexp)
+                    # Prod layer
+                    layer(self.node_mars, self.element_mars)
+
                 elif isinstance(layer, SumLayer):
-                    layer(self.node_mars, self.element_mars, params, self.scratch, sum_region_mars = self.sum_region_mars, skip_logsumexp = self.skip_logsumexp)
+                    # Sum layer
+                    layer(self.node_mars, self.element_mars, params)
+
                 else:
                     raise ValueError(f"Unknown layer type {type(layer)}.")
                 
-        if self.skip_logsumexp:
-            lls = self.node_mars[-1,:] + self.sum_region_mars.log().sum(dim = 0)
-        else:
-            lls = self.node_mars[-1,:]
+        lls = self.node_mars[-1,:]
 
         if torch.is_grad_enabled():
             lls.requires_grad = True
@@ -174,7 +161,6 @@ class TensorCircuit(nn.Module):
         assert self.node_mars is not None and self.element_mars is not None, "Should run forward path first."
 
         self.node_flows = torch.zeros([self.num_nodes, self.node_mars.size(1)], device = self.device)
-        self.scratch = torch.empty([self.num_nodes * self.node_mars.size(1)], device = self.device) ##### debug
         self.element_flows = torch.zeros([self.num_elements, self.node_mars.size(1)], device = self.device)
 
         if ll_weights is None:
@@ -195,16 +181,18 @@ class TensorCircuit(nn.Module):
                 layer = self.inner_layers[layer_id]
 
                 if isinstance(layer, ProdLayer):
-                    layer.backward(self.node_flows, self.element_flows, self.scratch, skip_logsumexp = self.skip_logsumexp)
+                    # Prod layer
+                    layer.backward(self.node_flows, self.element_flows)
 
                 elif isinstance(layer, SumLayer):
-                    self.inner_layers[layer_id-1].forward(self.node_mars, self.element_mars, self.scratch, skip_logsumexp = self.skip_logsumexp)
+                    # Sum layer
 
+                    # First recompute the previous product layer
+                    self.inner_layers[layer_id-1].forward(self.node_mars, self.element_mars)
+
+                    # Backward sum layer
                     layer.backward(self.node_flows, self.element_flows, self.node_mars, self.element_mars, params, 
-                                   scratch = self.scratch,
-                                   param_flows = self.param_flows if compute_param_flows else None, 
-                                   skip_logsumexp = self.skip_logsumexp, 
-                                   sum_region_mars = self.sum_region_mars)
+                                   param_flows = self.param_flows if compute_param_flows else None)
 
                 else:
                     raise ValueError(f"Unknown layer type {type(layer)}.")
@@ -278,12 +266,12 @@ class TensorCircuit(nn.Module):
                 ltype, layer = self.inner_layers[layer_id]
 
                 if ltype == "prod":
-                    # nothing special needed, same as backward
-                    layer.backward(self.node_flows, self.element_flows, skip_logsumexp=self.skip_logsumexp)
+                    # Nothing special needed, same as backward
+                    layer.backward(self.node_flows, self.element_flows)
 
                 elif ltype == "sum":
-                    # recompute element_mars for previous prod layer
-                    self.inner_layers[layer_id-1][1].forward(self.node_mars, self.element_mars, skip_logsumexp = self.skip_logsumexp)
+                    # Recompute `element_mars`` for previous prod layer
+                    self.inner_layers[layer_id-1][1].forward(self.node_mars, self.element_mars)
                     layer.sample(self.node_flows, self.element_flows, self.node_mars, self.element_mars, self.params, self.node_mask)
 
                 else:
@@ -356,7 +344,6 @@ class TensorCircuit(nn.Module):
         self._init_ad_tensors()
         torch.save(self, filename)
 
-
     def to(self, device):
         super(TensorCircuit, self).to(device)
 
@@ -399,8 +386,6 @@ class TensorCircuit(nn.Module):
         tied_param_group_ids = []
         tied_param_ends = []
 
-        num_sum_regions = 0 # tally of sum regions so far
-
         layer_id = 0
         for depth in range(num_layers):
             if depth == 0:
@@ -436,12 +421,10 @@ class TensorCircuit(nn.Module):
                     tied_param_group_ids = tied_param_group_ids,
                     tied_param_ends = tied_param_ends,
                     ch_prod_layer_size = prod_layer.num_nodes + 1,
-                    sum_region_start_id = num_sum_regions,
                     max_num_groups = max_num_groups
                 )
 
                 num_nodes += sum_layer.num_nodes
-                num_sum_regions += len(depth2nodes[depth]["sum"])
 
                 self.add_module(f"sum_layer_{layer_id}", sum_layer)
                 self.inner_layers.append(sum_layer)
@@ -452,7 +435,6 @@ class TensorCircuit(nn.Module):
         self.num_elements = num_elements
         self.num_sum_params = param_ends[-1]
         self.param_ends = param_ends
-        self.num_sum_regions = num_sum_regions
 
         # For parameter normalization
         # Node that input nodes are implicitly omitted as they have no child
@@ -518,8 +500,8 @@ class TensorCircuit(nn.Module):
         assert self.device.type == "cpu", "Please move the TensorCircuit to CPU before extracting its parameters."
 
         # Inner nodes
-        for layer_type, layer in self.inner_layers:
-            if layer_type == "sum":
+        for layer in self.inner_layers:
+            if layer.issum():
                 for ns in layer.nodes:
                     sidx, eidx = ns._param_range
                     ns._params = self.params.data[sidx:eidx].detach().cpu().clone()

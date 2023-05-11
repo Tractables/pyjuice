@@ -12,9 +12,6 @@ from .layer import Layer
 from .backend.node_partition import partition_nodes_by_n_edges
 from .backend.index_set import batched_index_set, batched_index_cum
 
-# Try to enable tensor cores
-torch.set_float32_matmul_precision('high')
-
 
 class ProdLayer(Layer, nn.Module):
 
@@ -125,65 +122,54 @@ class ProdLayer(Layer, nn.Module):
         self.grouped_parids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in grouped_parids])
         self.grouped_u_cids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in grouped_u_cids])
 
-    def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor, scratch: torch.Tensor, skip_logsumexp: bool = False):
+    def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor):
         """
-        node_mars: [num_nodes, B]
-        element_mars: [max_num_els, B]
+        Computes the forward pass of a product layer:
+        ```
+        element_mars[nids] = node_mars[cids].sum(dim = 1)
+        ```
+
+        Parameters:
+        `node_mars`:    [num_nodes, B]
+        `element_mars`: [max_num_els, B]
         """
-        if skip_logsumexp:
-            self._dense_forward_pass_nolog(node_mars, element_mars)
-        else:
-            self._dense_forward_pass(node_mars, element_mars, scratch)
 
-    def backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor, scratch: torch.Tensor, skip_logsumexp: bool = False):
-        """
-        node_flows: [num_nodes, B]
-        element_flows: [max_num_els, B]
-        """
-        if skip_logsumexp:
-            self._dense_backward_pass_nolog(node_flows, element_flows)
-        else:
-            self._dense_backward_pass(node_flows, element_flows, scratch)
-
-    @staticmethod
-    @torch.compile(mode = "reduce-overhead")
-    def _forward_fn(scratch, node_mars, cids):
-        scratch[:] = (node_mars[cids].sum(dim = 1)).reshape(-1)
-
-        return None
-
-    def _dense_forward_pass(self, node_mars: torch.Tensor, element_mars: torch.Tensor, scratch: torch.Tensor):
-        
-        batch_size = node_mars.size(1)
-        
         for group_id in range(self.num_forward_groups):
             nids = self.grouped_nids[group_id]
             cids = self.grouped_cids[group_id]
-
-            # self._forward_fn(scratch[:nids.numel() * batch_size], node_mars, cids)
-            # batched_index_set(element_mars, nids, scratch)
 
             self._forward_backward_triton(element_mars, node_mars, nids, cids)
 
         return None
 
-    @torch.compile(mode = "reduce-overhead")
-    def _dense_forward_pass_legacy(self, node_mars: torch.Tensor, element_mars: torch.Tensor):
-        for group_id in range(self.num_forward_groups):
-            nids = self.grouped_nids[group_id]
-            cids = self.grouped_cids[group_id]
+    def backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor):
+        """
+        Computes the backward pass of a product layer:
+        ```
+        node_flows[u_cids] = element_flows[parids].sum(dim = 1)
+        ```
 
-            element_mars[nids,:] = node_mars[cids].sum(dim = 1)
+        Parameters:
+        `node_flows`:    [num_nodes, B]
+        `element_flows`: [max_num_els, B]
+        """
+        
+        for group_id in range(self.num_backward_groups):
+            u_cids = self.grouped_u_cids[group_id]
+            parids = self.grouped_parids[group_id]
 
+            self._forward_backward_triton(node_flows, element_flows, u_cids, parids)
+        
         return None
 
     @staticmethod
     @triton.jit
     def _forward_backward_kernel(node_vals_ptr, element_vals_ptr, nids_ptr, cids_ptr, 
-                                    tot_n_nodes: tl.constexpr, tot_n_eles: tl.constexpr,
-                                    n_nodes: tl.constexpr, n_edges: tl.constexpr, 
-                                    batch_size: tl.constexpr, n_nodes_per_block_m: tl.constexpr,
-                                    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+                                 tot_n_nodes: tl.constexpr, tot_n_eles: tl.constexpr,
+                                 n_nodes: tl.constexpr, n_edges: tl.constexpr, 
+                                 batch_size: tl.constexpr, n_nodes_per_block_m: tl.constexpr,
+                                 BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+
         # We use BLOCK_M to index over edges, and BLOCK_N to index over batches
         pid0 = tl.program_id(axis = 0)
         pid1 = tl.program_id(axis = 1)
@@ -233,10 +219,10 @@ class ProdLayer(Layer, nn.Module):
         ``` node_vals[nids] = element_vals[cids].sum(dim = 1) ```
         
         Parameters:
-        `node_vals`:    Tensor[N, B]
-        `element_vals`: Tensor[M, B]
-        `nids`:         Tensor[n]
-        `cids`:         Tensor[n, c]
+        `node_vals`:    [N, B]
+        `element_vals`: [M, B]
+        `nids`:         [n]
+        `cids`:         [n, c]
         """
         tot_n_nodes = node_vals.size(0)
         tot_n_eles = element_vals.size(0)
@@ -268,56 +254,4 @@ class ProdLayer(Layer, nn.Module):
             BLOCK_N = BLOCK_N
         )
 
-        return None
-
-    @torch.compile(mode = "reduce-overhead")
-    def _dense_forward_pass_nolog(self, node_mars: torch.Tensor, element_mars: torch.Tensor):
-        for group_id in range(self.num_forward_groups):
-            nids = self.grouped_nids[group_id]
-            cids = self.grouped_cids[group_id]
-
-            element_mars[nids,:] = node_mars[cids].prod(dim = 1)
-
-        return None
-    
-    @torch.compile(mode = "reduce-overhead")
-    def _dense_backward_pass_nolog(self, node_flows: torch.Tensor, element_flows: torch.Tensor):
-        for group_id in range(self.num_backward_groups):
-            parids = self.grouped_parids[group_id]
-            u_cids = self.grouped_u_cids[group_id]
-
-            node_flows[u_cids] += element_flows[parids].prod(dim = 1)
-        
-        return None
-
-    @staticmethod
-    @torch.compile(mode = "reduce-overhead")
-    def _backward_fn(scratch, element_flows, parids):
-        scratch[:] = (element_flows[parids].sum(dim = 1)).reshape(-1)
-
-        return None
-
-    def _dense_backward_pass(self, node_flows: torch.Tensor, element_flows: torch.Tensor, scratch: torch.Tensor):
-        
-        batch_size = node_flows.size(1)
-        
-        for group_id in range(self.num_backward_groups):
-            u_cids = self.grouped_u_cids[group_id]
-            parids = self.grouped_parids[group_id]
-
-            # self._backward_fn(scratch[:u_cids.numel() * batch_size], element_flows, parids)
-            # batched_index_cum(node_flows, u_cids, scratch)
-
-            self._forward_backward_triton(node_flows, element_flows, u_cids, parids)
-        
-        return None
-
-    @torch.compile(mode = "reduce-overhead")
-    def _dense_backward_pass_legacy(self, node_flows: torch.Tensor, element_flows: torch.Tensor):
-        for group_id in range(self.num_backward_groups):
-            parids = self.grouped_parids[group_id]
-            u_cids = self.grouped_u_cids[group_id]
-
-            node_flows[u_cids] += element_flows[parids].sum(dim = 1)
-        
         return None

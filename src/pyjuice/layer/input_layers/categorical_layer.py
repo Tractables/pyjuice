@@ -116,9 +116,7 @@ class CategoricalLayer(InputLayer, nn.Module):
 
     def forward(self, data: torch.Tensor, node_mars: torch.Tensor, 
                 params: Optional[Dict] = None, 
-                missing_mask: Optional[torch.Tensor] = None,  
-                alphas:Optional[torch.Torch] = None,
-                skip_logsumexp: bool = False):
+                missing_mask: Optional[torch.Tensor] = None):
         """
         data: [num_vars, B]
         node_mars: [num_nodes, B]
@@ -132,10 +130,7 @@ class CategoricalLayer(InputLayer, nn.Module):
 
         assert params.dim() == 1
         
-        if skip_logsumexp:
-            self._dense_forward_pass_nolog(data, node_mars, params)
-        else:
-            self._dense_forward_pass(data, node_mars, params, missing_mask=missing_mask, alphas=alphas)
+        self._forward(data, node_mars, params, missing_mask = missing_mask)
 
         return None
 
@@ -154,6 +149,7 @@ class CategoricalLayer(InputLayer, nn.Module):
         param_ids = data[self.vids] + self.psids.unsqueeze(1)
         
         grid = lambda meta: (triton.cdiv(layer_num_nodes * batch_size, meta['BLOCK_SIZE']),)
+        
         self._flows_kernel[grid](self.param_flows, node_flows, param_ids, layer_num_nodes, tot_num_nodes, batch_size, node_offset, BLOCK_SIZE = 1024)
         
         return None
@@ -212,11 +208,9 @@ class CategoricalLayer(InputLayer, nn.Module):
         return {"params": torch.Size([self.params.size(0)])}
 
     @torch.compile(mode = "default")
-    def _dense_forward_pass(self, data: torch.Tensor, node_mars: torch.Tensor,
-                                                            params: torch.Tensor, 
-                                                            missing_mask: Optional[torch.Tensor]=None, 
-                                                            alphas:Optional[torch.Tensor]=None):
-        
+    def _forward(self, data: torch.Tensor, node_mars: torch.Tensor,
+                 params: torch.Tensor, missing_mask: Optional[torch.Tensor] = None):
+
         sid, eid = self._output_ind_range[0], self._output_ind_range[1]
         param_idxs = data[self.vids] + self.psids.unsqueeze(1)
         if missing_mask is not None:
@@ -225,16 +219,6 @@ class CategoricalLayer(InputLayer, nn.Module):
             node_mars[sid:eid,:][mask] = 0.0
         else:
             node_mars[sid:eid,:] = ((params[param_idxs]).clamp(min=1e-10)).log()            
-
-        if alphas is not None:
-            node_mars[sid:eid,:] = ((node_mars[sid:eid,:].exp() * alphas[self.vids]) + (1 - alphas[self.vids])).log()
-
-        return None
-
-    @torch.compile(mode = "default")
-    def _dense_forward_pass_nolog(self, data: torch.Tensor, node_mars: torch.Tensor, params: torch.Tensor):
-        sid, eid = self._output_ind_range[0], self._output_ind_range[1]
-        node_mars[sid:eid,:] = ((params[data[self.vids] + self.psids.unsqueeze(1)] + 1e-8).clamp(min=1e-10))
 
         return None
 
@@ -307,55 +291,3 @@ class CategoricalLayer(InputLayer, nn.Module):
             }
 
             n_start = n_end
-
-    @staticmethod
-    def _prune_nodes(_params: Dict, node_keep_flag: torch.Tensor):
-        kept_nodes = torch.where(node_keep_flag)[0]
-        num_nodes = node_keep_flag.sum().item()
-
-        old_n_params = torch.zeros_like(_params["param_ends"])
-        old_n_params[0] = _params["param_ends"][0]
-        old_n_params[1:] = _params["param_ends"][1:] - _params["param_ends"][:-1]
-
-        param_ends = torch.cumsum(old_n_params[node_keep_flag], dim = 0)
-
-        params = torch.zeros([param_ends[-1]], dtype = torch.float32)
-        for idx in range(num_nodes):
-            oidx = kept_nodes[idx]
-            if oidx == 0:
-                ops, ope = 0, _params["param_ends"][0]
-            else:
-                ops, ope = _params["param_ends"][oidx-1], _params["param_ends"][oidx]
-
-            if idx == 0:
-                ps, pe = 0, param_ends[0]
-            else:
-                ps, pe = param_ends[idx-1], param_ends[idx]
-
-            params[ps:pe] = _params["params"][ops:ope]
-
-        return {"params": params, "param_ends": param_ends}
-
-    @staticmethod
-    def _duplicate_nodes(_params: Dict):
-        num_nodes = _params["param_ends"].size(0)
-        num_params = _params["params"].size(0)
-
-        params = torch.zeros([num_params * 2])
-        par_start = 0
-        for idx in range(num_nodes):
-            if idx == 0:
-                np = _params["param_ends"][0]
-            else:
-                np = _params["param_ends"][idx] - _params["param_ends"][idx-1]
-
-            params[par_start*2:par_start*2+np] = _params["params"][par_start:par_start+np]
-            params[par_start*2+np:par_start*2+np*2] = _params["params"][par_start:par_start+np]
-
-            par_start += np
-
-        param_ends = _params["param_ends"].view(-1, 1).repeat(1, 2).reshape(-1) * 2
-        param_ends[2::2] -= _params["param_ends"][1:] - _params["param_ends"][:-1]
-        param_ends[0] -= _params["param_ends"][0]
-
-        return {"params": params, "param_ends": param_ends}
