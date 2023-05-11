@@ -93,7 +93,7 @@ def hclt_test():
         train_data.float().to(device), 
         num_bins = 32, 
         sigma = 0.5 / 32, 
-        num_latents = 32, 
+        num_latents = 64, 
         chunk_size = 32
     )
 
