@@ -21,7 +21,10 @@ class SumLayer(Layer, nn.Module):
 
     def __init__(self, nodes: Sequence[SumNodes], 
                  cum_nodes: int, 
-                 param_ends: List, 
+                 param_ends: Sequence, 
+                 tied_param_ids: Sequence,
+                 tied_param_group_ids: Sequence,
+                 tied_param_ends: Sequence,
                  ch_prod_layer_size: int,
                  sum_region_start_id: int = 0,
                  max_num_groups: int = 1) -> None:
@@ -98,6 +101,25 @@ class SumLayer(Layer, nn.Module):
             ns._param_range = (ns_param_start, ns_param_end)
             ns._param_ids = param_ids
             ns._inverse_param_ids = torch.argsort(param_ids)
+
+            # For tied nodes
+            if ns._source_node is not None:
+                source_ns = ns._source_node
+                if source_ns._tied_param_group_ids is None:
+                    num_tied_param_groups = tied_param_ends[end]
+                    ns_param_ends = filter(lambda x: (x > ns_param_start) and (x <= ns_param_end), param_ends)
+                    ns_param_ends = map(lambda x: x - ns_param_start + num_tied_param_groups, ns_param_ends)
+                    tied_param_ends.extend(ns_param_ends)
+
+                    num_source_params = source_ns._param_range[1] - source_ns._param_range[0] + 1
+                    source_ns._tied_param_group_ids = [i for i in range(num_tied_param_groups, num_tied_param_groups + num_source_params)]
+
+                    tied_param_ids.extend([i for i in range(source_ns._param_range[0], source_ns._param_range[1])])
+                    tied_param_group_ids.extend(source_ns._tied_param_group_ids)
+
+                ns._tied_param_group_ids = deepcopy(source_ns._tied_param_group_ids)
+                tied_param_ids.extend([i for i in range(ns._param_range[0], ns._param_range[1])])
+                tied_param_group_ids.extend(ns._tied_param_group_ids)
 
         # Find a good strategy to partition the nodes into groups according to their number of children 
         # to minimize total computation cost
@@ -298,6 +320,138 @@ class SumLayer(Layer, nn.Module):
         return None
 
     @staticmethod
+    @triton.jit
+    def _forward_triton_kernel(node_mars_ptr, element_mars_ptr, params_ptr, 
+                                nids_ptr, cids_ptr, pids_ptr,
+                                tot_n_nodes: tl.constexpr, tot_n_eles: tl.constexpr,
+                                tot_n_pars: tl.constexpr, 
+                                n_nodes: tl.constexpr, n_edges: tl.constexpr, 
+                                batch_size: tl.constexpr, n_nodes_per_block_m: tl.constexpr,
+                                BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+        # We use BLOCK_M to index over edges, and BLOCK_N to index over batches
+        pid0 = tl.program_id(axis = 0)
+        pid1 = tl.program_id(axis = 1)
+        ne_start = pid0 * BLOCK_M
+        b_start = pid1 * BLOCK_N
+
+        # Id of edges processed by the current block
+        ne_offsets = ne_start + tl.arange(0, BLOCK_M)
+        # Batch ids processed by the current block
+        b_offsets = b_start + tl.arange(0, BLOCK_N)
+        b_mask = b_offsets < batch_size
+
+        # Get node ids from `nids`
+        n_start = ne_start // n_edges
+        nid_offsets = n_start + tl.arange(0, n_nodes_per_block_m)
+        nid_mask = nid_offsets < n_nodes
+        n_ids = tl.load(nids_ptr + nid_offsets, mask = nid_mask, other = 0)
+
+        # Get edge ids from `cids`
+        cid_offsets = tl.reshape(ne_offsets, (n_edges, n_nodes_per_block_m))
+        cid_mask = tl.broadcast_to(nid_mask[None,:], (n_edges, n_nodes_per_block_m))
+        ch_ids = tl.load(cids_ptr + cid_offsets, mask = cid_mask, other = 0)
+
+        # Use `ch_ids` to retrieve the corresponding element mars
+        ele_offsets = tl.broadcast_to(ch_ids[None,:,:], (BLOCK_N, n_edges, n_nodes_per_block_m)) * batch_size + \
+            tl.broadcast_to(b_offsets[:,None,None], (BLOCK_N, n_edges, n_nodes_per_block_m))
+        ele_mask = tl.broadcast_to(nid_mask[None,None,:], (BLOCK_N, n_edges, n_nodes_per_block_m)) & \
+            tl.broadcast_to(b_mask[:,None,None], (BLOCK_N, n_edges, n_nodes_per_block_m))
+        ch_logps = tl.load(element_mars_ptr + ele_offsets, mask = ele_mask, other = 0) # `element_mars[cids]`
+
+        # Take the max of the child mars
+        ch_max_logp = tl.max(ch_logps, axis = 1) # `maxval`
+
+        # Subtract the max from child mars
+        ch_logps_sub_max = ch_logps - tl.broadcast_to(ch_max_logp[:,None,:], (BLOCK_N, n_edges, n_nodes_per_block_m))
+
+        # Take exp
+        ch_ps_sub_max = tl.exp(ch_logps_sub_max)
+
+        # Get param ids from `pids`
+        # Here we reuse `cid_offsets` and `cid_mask` thank to their similar structure
+        par_ids = tl.load(pids_ptr + cid_offsets, mask = cid_mask, other = 0)
+
+        # Use `par_ids` to retrieve the corresponding parameters
+        par_mask = tl.broadcast_to(nid_mask[None,:], (n_edges, n_nodes_per_block_m))
+        ch_pars = tl.load(params_ptr + par_ids, mask = par_mask, other = 0) # `params[pids]`
+        ch_pars = tl.broadcast_to(ch_pars[None,:,:], (BLOCK_N, n_edges, n_nodes_per_block_m))
+
+        # Sum node marginals (unnormalized)
+        n_ps = tl.sum(ch_ps_sub_max * ch_pars, axis = 1)
+
+        # Take log and subtract max vals
+        n_logps = tl.log(tl.maximum(n_ps, 1e-10)) + ch_max_logp
+
+        # Read out the target indices for `node_mars`
+        nmar_offsets = tl.broadcast_to(n_ids[None,:], (BLOCK_N, n_nodes_per_block_m)) * batch_size + \
+            tl.broadcast_to(b_offsets[:,None], (BLOCK_N, n_nodes_per_block_m))
+        nmar_mask = tl.broadcast_to(nid_mask[None,:], (BLOCK_N, n_nodes_per_block_m)) & \
+            tl.broadcast_to(b_mask[:,None], (BLOCK_N, n_nodes_per_block_m))
+        
+        tl.store(node_mars_ptr + nmar_offsets, n_logps, mask = nmar_mask)
+
+
+    def _forward_triton(self, node_mars: torch.Tensor, element_mars: torch.Tensor, 
+                        params: torch.Tensor,
+                        nids: torch.Tensor, cids: torch.Tensor,
+                        pids: torch.Tensor, BLOCK_SIZE = 2**12, MAX_BLOCK_M = 512, MAX_BLOCK_N = 64):
+        """
+        This function is equivalent to running:
+        ``` 
+        ch_mars = element_mars[cids]
+        maxval = ch_mars.max(dim = 1, keepdim = True).values
+        node_mars[nids] = (((ch_mars - maxval).exp() * params[pids]).sum(
+            dim = 1).clamp(min = 1e-10)).log() + maxval.squeeze(1)
+        ```
+        
+        Parameters:
+        `node_mars`:    Tensor[N, B]
+        `element_mars`: Tensor[M, B]
+        `params`:       Tensor[E]
+        `nids`:         Tensor[n]
+        `cids`:         Tensor[n, c]
+        `pids`:         Tensor[n, c]
+        """
+        tot_n_nodes = node_mars.size(0)
+        tot_n_eles = element_mars.size(0)
+        tot_n_pars = params.size(0)
+        n_nodes = nids.size(0)
+        n_edges = cids.size(1)
+        batch_size = node_mars.size(1)
+
+        if params.size(1) == 1:
+            params = params.squeeze(1)
+
+        assert n_edges <= MAX_BLOCK_M, "Number of edges should be smaller than or equal to MAX_BLOCK_M."
+        assert params.dim() == 1, "Expecting a 1D `params`."
+
+        MIN_BLOCK_M = min(triton.next_power_of_2(n_edges), MAX_BLOCK_M)
+        BLOCK_N = min(BLOCK_SIZE // MIN_BLOCK_M, MAX_BLOCK_N, triton.next_power_of_2(batch_size))
+        BLOCK_M = min(BLOCK_SIZE // BLOCK_N, MAX_BLOCK_M)
+
+        grid = (triton.cdiv(n_nodes * n_edges, BLOCK_M), triton.cdiv(batch_size, BLOCK_N), 1)
+
+        self._forward_triton_kernel[grid](
+            node_mars_ptr = node_mars, 
+            element_mars_ptr = element_mars, 
+            params_ptr = params,
+            nids_ptr = nids, 
+            cids_ptr = cids, 
+            pids_ptr = pids,
+            tot_n_nodes = tot_n_nodes,
+            tot_n_eles = tot_n_eles,
+            tot_n_pars = tot_n_pars,
+            n_nodes = n_nodes, 
+            n_edges = n_edges, 
+            batch_size = batch_size, 
+            n_nodes_per_block_m = BLOCK_M // n_edges,
+            BLOCK_M = BLOCK_M, 
+            BLOCK_N = BLOCK_N
+        )
+
+        return None
+
+    @staticmethod
     @torch.compile(mode = "reduce-overhead", fullgraph = True)
     def _forward_kernel(scratch, element_mars, params, cids, pids):
         ch_mars = element_mars[cids]
@@ -317,8 +471,10 @@ class SumLayer(Layer, nn.Module):
             cids = self.grouped_cids[group_id]
             pids = self.grouped_pids[group_id]
 
-            self._forward_kernel(scratch[:nids.numel() * batch_size], element_mars, params, cids, pids)
-            batched_index_set(node_mars, nids, scratch)
+            # self._forward_kernel(scratch[:nids.numel() * batch_size], element_mars, params, cids, pids)
+            # batched_index_set(node_mars, nids, scratch)
+
+            self._forward_triton(node_mars, element_mars, params, nids, cids, pids)
 
         return None
     
@@ -365,6 +521,142 @@ class SumLayer(Layer, nn.Module):
 
         return None
 
+    @staticmethod
+    @triton.jit
+    def _backward_kernel(node_flows_ptr, element_flows_ptr, params_ptr, 
+                         node_mars_ptr, element_mars_ptr, param_flows_ptr,
+                         chids_ptr, parids_ptr, parpids_ptr,
+                         tot_n_nodes: tl.constexpr, tot_n_eles: tl.constexpr,
+                         n_nodes: tl.constexpr, n_edges: tl.constexpr, 
+                         batch_size: tl.constexpr, n_nodes_per_block_m: tl.constexpr,
+                         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+        # We use BLOCK_M to index over edges, and BLOCK_N to index over batches
+        pid0 = tl.program_id(axis = 0)
+        pid1 = tl.program_id(axis = 1)
+        ne_start = pid0 * BLOCK_M
+        b_start = pid1 * BLOCK_N
+
+        # Id of edges processed by the current block
+        ne_offsets = ne_start + tl.arange(0, BLOCK_M)
+        # Batch ids processed by the current block
+        b_offsets = b_start + tl.arange(0, BLOCK_N)
+        b_mask = b_offsets < batch_size
+
+        # Node mask for future reuse
+        n_start = ne_start // n_edges
+        n_offsets = n_start + tl.arange(0, n_nodes_per_block_m)
+        n_mask = n_offsets < n_nodes
+
+        # Reusable ids for index tensors
+        par_offsets = tl.reshape(ne_offsets, (n_edges, n_nodes_per_block_m))
+        par_mask = tl.broadcast_to(n_mask[None,:], (n_edges, n_nodes_per_block_m)) 
+        bpar_mask = tl.broadcast_to(n_mask[None,None,:], (BLOCK_N, n_edges, n_nodes_per_block_m)) & \
+            tl.broadcast_to(b_mask[:,None,None], (BLOCK_N, n_edges, n_nodes_per_block_m))
+
+        # Get node ids from `parids` and retrieve the corresponding node flows and node mars
+        node_ids = tl.load(parids_ptr + par_offsets, mask = par_mask, other = 0)
+        node_offsets = tl.broadcast_to(node_ids[None,:,:], (BLOCK_N, n_edges, n_nodes_per_block_m)) * batch_size + \
+            tl.broadcast_to(b_offsets[:,None,None], (BLOCK_N, n_edges, n_nodes_per_block_m))
+        nflows = tl.load(node_flows_ptr + node_offsets, mask = bpar_mask, other = 0) # node_flows[parids]
+        nmars = tl.load(node_mars_ptr + node_offsets, mask = bpar_mask, other = 0) # node_mars[parids]
+
+        # Get param ids from `parpids` and retrieve the corresponding node params
+        eparam_ids = tl.load(parpids_ptr + par_offsets, mask = par_mask, other = 0)
+        eparams = tl.load(params_ptr + eparam_ids, mask = par_mask, other = 0)
+        eparams = tl.broadcast_to(eparams[None,:,:], (BLOCK_N, n_edges, n_nodes_per_block_m)) # params[parpids]
+
+        # Compute edge flows (partially)
+        cum_flow = nflows * eparams
+
+        # Get element ids from `cids` and retrieve the corresponding element mars
+        ele_ids = tl.load(chids_ptr + n_offsets, mask = n_mask, other = 0)
+        ele_offsets = tl.broadcast_to(ele_ids[None,:], (BLOCK_N, n_nodes_per_block_m)) * batch_size + \
+            tl.broadcast_to(b_offsets[:,None], (BLOCK_N, n_nodes_per_block_m))
+        ele_mask = tl.broadcast_to(n_mask[None,:], (BLOCK_N, n_nodes_per_block_m))
+        emars = tl.load(element_mars_ptr + ele_offsets, mask = ele_mask, other = 0) # element_mars[chids]
+        emars = tl.broadcast_to(emars[:,None,:], (BLOCK_N, n_edges, n_nodes_per_block_m)) # element_mars[chids].unsqueeze(1)
+
+        # Compute edge flows
+        emars_log_diff = emars - nmars
+        emars_diff = tl.exp(emars_log_diff)
+        eflows = cum_flow * emars_diff
+
+        # Store to `element_flows[chids]`
+        cum_eflows = tl.sum(eflows, axis = 1) # [BLOCK_N, n_nodes_per_block_m]
+        tl.store(element_flows_ptr + ele_offsets, cum_eflows, mask = ele_mask)
+
+        # Compute parameter flows
+        parflows = tl.sum(eflows, axis = 0) # [n_edges, n_nodes_per_block_m]
+        # Here the `eparam_ids > 0` term masks out dummy edges
+        parflow_mask = (eparam_ids > 0) & tl.broadcast_to(n_mask[None,:], (n_edges, n_nodes_per_block_m))
+        tl.atomic_add(param_flows_ptr + eparam_ids, parflows, mask = parflow_mask)
+
+    def _backward_triton(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
+                         params: torch.Tensor, node_mars: torch.Tensor, 
+                         element_mars: torch.Tensor, param_flows: torch.Tensor, 
+                         chids: torch.Tensor, parids: torch.Tensor, parpids: torch.Tensor, 
+                         BLOCK_SIZE = 2**12, MAX_BLOCK_M = 512, MAX_BLOCK_N = 64):
+        """
+        This function is equivalent to running:
+        ``` 
+        element_flows[chids] = (node_flows[parids] * params[parpids] * \
+            (element_mars[chids].unsqueeze(1) - node_mars[parids]).exp()).sum(dim = 1)
+
+        param_flows[seq_parpids] += (node_flows[parids] * params[parpids] * \
+            (element_mars[chids].unsqueeze(1) - node_mars[parids]).exp()).sum(dim = 2)[seq_ids0, seq_ids1]
+        ```
+        
+        Parameters:
+        `node_flows`:    Tensor[N, B]
+        `element_flows`: Tensor[M, B]
+        `params`:        Tensor[E]
+        `node_mars`:     Tensor[N, B]
+        `element_mars`:  Tensor[M, B]
+        `param_flows`:   Tensor[E]
+        `chids`:         Tensor[n]
+        `parids`:        Tensor[n, p]
+        `parpids`:       Tensor[n, p]
+        """
+        tot_n_nodes = node_mars.size(0)
+        tot_n_eles = element_mars.size(0)
+        n_nodes = chids.size(0)
+        n_edges = parids.size(1)
+        batch_size = node_mars.size(1)
+
+        if params.dim() == 2 and params.size(1) == 1:
+            params = params.squeeze(1)
+
+        assert n_edges <= MAX_BLOCK_M, "Number of edges should be smaller than or equal to MAX_BLOCK_M."
+        assert params.dim() == 1, "Expecting a 1D `params`."
+
+        MIN_BLOCK_M = min(triton.next_power_of_2(n_edges), MAX_BLOCK_M)
+        BLOCK_N = min(BLOCK_SIZE // MIN_BLOCK_M, MAX_BLOCK_N, triton.next_power_of_2(batch_size))
+        BLOCK_M = min(BLOCK_SIZE // BLOCK_N, MAX_BLOCK_M)
+
+        grid = (triton.cdiv(n_nodes * n_edges, BLOCK_M), triton.cdiv(batch_size, BLOCK_N), 1)
+
+        self._backward_kernel[grid](
+            node_flows_ptr = node_flows,
+            element_flows_ptr = element_flows,
+            params_ptr = params,
+            node_mars_ptr = node_mars, 
+            element_mars_ptr = element_mars,
+            param_flows_ptr = param_flows, 
+            chids_ptr = chids, 
+            parids_ptr = parids, 
+            parpids_ptr = parpids,
+            tot_n_nodes = tot_n_nodes,
+            tot_n_eles = tot_n_eles,
+            n_nodes = n_nodes, 
+            n_edges = n_edges, 
+            batch_size = batch_size, 
+            n_nodes_per_block_m = BLOCK_M // n_edges,
+            BLOCK_M = BLOCK_M, 
+            BLOCK_N = BLOCK_N
+        )
+
+        return None
+
     def _dense_backward_pass2(self, node_flows: torch.Tensor, element_flows: torch.Tensor, node_mars: torch.Tensor, 
                               element_mars: torch.Tensor, params: torch.Tensor, param_flows: torch.Tensor, scratch: torch.Tensor):
         
@@ -378,17 +670,20 @@ class SumLayer(Layer, nn.Module):
             seq_ids1 = self.grouped_seq_ids1[group_id]
             seq_parpids = self.grouped_seq_parpids[group_id]
 
-            self._compute_elem_flows(
-                scratch[:chids.numel() * batch_size], node_flows, element_mars, 
-                node_mars, params, parids, parpids, chids
-            )
-            batched_index_set(element_flows, chids, scratch)
+            # self._compute_elem_flows(
+            #     scratch[:chids.numel() * batch_size], node_flows, element_mars, 
+            #     node_mars, params, parids, parpids, chids
+            # )
+            # batched_index_set(element_flows, chids, scratch)
+            # 
+            # self._compute_param_flows(
+            #     scratch[:seq_parpids.numel()], node_flows, element_mars, 
+            #     node_mars, params, parids, parpids, chids, seq_ids0, seq_ids1
+            # )
+            # index_cum(param_flows, seq_parpids, scratch)
 
-            self._compute_param_flows(
-                scratch[:seq_parpids.numel()], node_flows, element_mars, 
-                node_mars, params, parids, parpids, chids, seq_ids0, seq_ids1
-            )
-            index_cum(param_flows, seq_parpids, scratch)
+            self._backward_triton(node_flows, element_flows, params, node_mars, 
+                                  element_mars, param_flows, chids, parids, parpids)
 
         return None
 
