@@ -13,7 +13,8 @@ Tensor = Union[np.ndarray,torch.Tensor]
 
 
 class SumNodes(CircuitNodes):
-    def __init__(self, num_nodes: int, chs: Sequence[CircuitNodes], edge_ids: Optional[Tensor] = None, **kwargs) -> None:
+    def __init__(self, num_nodes: int, chs: Sequence[CircuitNodes], edge_ids: Optional[Tensor] = None, 
+                 params: Optional[Tensor] = None, **kwargs) -> None:
 
         rg_node = InnerRegionNode([ch.region_node for ch in chs])
         super(SumNodes, self).__init__(num_nodes, rg_node, **kwargs)
@@ -26,6 +27,10 @@ class SumNodes(CircuitNodes):
 
         # Construct sum edges
         self._construct_edges(edge_ids)
+
+        # Set parameters
+        if params is not None:
+            self.set_params(params)
 
     def _construct_edges(self, edge_ids: Optional[Tensor]):
         if edge_ids is None:
@@ -62,3 +67,12 @@ class SumNodes(CircuitNodes):
         edge_ids = self.edge_ids.clone()
 
         return SumNodes(self.num_nodes, chs, edge_ids, source_node = self)
+
+    def get_params(self):
+        return self._params
+
+    def set_params(self, params: torch.Tensor):
+        assert params.dim() == 1
+        assert self.edge_ids.size(1) == params.size(0)
+
+        self._params = params.clone()
