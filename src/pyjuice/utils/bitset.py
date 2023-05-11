@@ -18,6 +18,15 @@ class BitSet(object):
 
         return b
 
+    def to_list(self):
+        vals = []
+        for i in range(self.byte_length):
+            for j in range(8):
+                if (self.values[i] & (1 << (7 - j))) != 0:
+                    vals.append(i * 8 + j)
+        
+        return vals
+
     def add(self, value):
         if self.hasitem(value):
             return

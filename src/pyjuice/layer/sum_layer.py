@@ -6,6 +6,7 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 import warnings
+from copy import deepcopy
 from typing import Sequence, List, Optional
 
 from pyjuice.nodes import SumNodes
@@ -97,13 +98,13 @@ class SumLayer(Layer, nn.Module):
             if ns._source_node is not None:
                 source_ns = ns._source_node
                 if source_ns._tied_param_group_ids is None:
-                    num_tied_param_groups = tied_param_ends[end]
+                    num_tied_param_groups = tied_param_ends[-1] if len(tied_param_ends) > 0 else 0
                     ns_param_ends = filter(lambda x: (x > ns_param_start) and (x <= ns_param_end), param_ends)
                     ns_param_ends = map(lambda x: x - ns_param_start + num_tied_param_groups, ns_param_ends)
                     tied_param_ends.extend(ns_param_ends)
 
                     num_source_params = source_ns._param_range[1] - source_ns._param_range[0] + 1
-                    source_ns._tied_param_group_ids = [i for i in range(num_tied_param_groups, num_tied_param_groups + num_source_params)]
+                    source_ns._tied_param_group_ids = [i for i in range(num_tied_param_groups, num_tied_param_groups + num_source_params - 1)]
 
                     tied_param_ids.extend([i for i in range(source_ns._param_range[0], source_ns._param_range[1])])
                     tied_param_group_ids.extend(source_ns._tied_param_group_ids)
@@ -121,10 +122,10 @@ class SumLayer(Layer, nn.Module):
         grouped_pids = []
         min_n_chs = 0
         for max_n_chs in ch_group_sizes:
-            filter = (n_chs >= min_n_chs) & (n_chs <= max_n_chs)
-            curr_nids = nids[filter].contiguous()
-            curr_cids = cids[filter,:max_n_chs].contiguous()
-            curr_pids = pids[filter,:max_n_chs].contiguous()
+            id_filter = (n_chs >= min_n_chs) & (n_chs <= max_n_chs)
+            curr_nids = nids[id_filter].contiguous()
+            curr_cids = cids[id_filter,:max_n_chs].contiguous()
+            curr_pids = pids[id_filter,:max_n_chs].contiguous()
 
             grouped_nids.append(curr_nids)
             grouped_cids.append(curr_cids)
@@ -184,14 +185,14 @@ class SumLayer(Layer, nn.Module):
         grouped_seq_parpids = []
         min_n_pars = 0
         for max_n_pars in par_group_sizes:
-            filter = (ch_n_pars >= min_n_pars) & (ch_n_pars <= max_n_pars)
-            filtered_idxs = torch.where(filter)[0]
+            id_filter = (ch_n_pars >= min_n_pars) & (ch_n_pars <= max_n_pars)
+            filtered_idxs = torch.where(id_filter)[0]
             curr_chids = (filtered_idxs + 1).clone()
             curr_parids = parids[filtered_idxs+1,:max_n_pars].contiguous()
             curr_parpids = parpids[filtered_idxs+1,:max_n_pars].contiguous()
             curr_parcids = parcids[filtered_idxs+1,:max_n_pars].contiguous()
 
-            curr_tot_npar = ch_n_pars[filter].sum()
+            curr_tot_npar = ch_n_pars[id_filter].sum()
             curr_seq_ids0 = torch.zeros([curr_tot_npar], dtype = torch.long)
             curr_seq_ids1 = torch.zeros([curr_tot_npar], dtype = torch.long)
             curr_seq_parpids = torch.zeros([curr_tot_npar], dtype = torch.long)

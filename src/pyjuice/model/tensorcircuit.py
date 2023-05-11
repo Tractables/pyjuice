@@ -452,8 +452,8 @@ class TensorCircuit(nn.Module):
         # For parameter tying
         self.num_tied_params = tied_param_ends[-1] if len(tied_param_ends) > 0 else 0
         if self.num_tied_params > 0:
-            tied_param_ids = torch.from_numpy(tied_param_ids).long()
-            tied_param_group_ids = torch.from_numpy(tied_param_group_ids).long()
+            tied_param_ids = torch.tensor(tied_param_ids).long()
+            tied_param_group_ids = torch.tensor(tied_param_group_ids).long()
             self.register_buffer("tied_param_ids", tied_param_ids)
             self.register_buffer("tied_param_group_ids", tied_param_group_ids)
 
@@ -469,6 +469,11 @@ class TensorCircuit(nn.Module):
                     if hasattr(rnode, "_params"):
                         sidx, eidx = rnode._param_range
                         params[sidx:eidx] = rnode._params[rnode._inverse_param_ids].to(params.device)
+
+        # Tie parameters
+        if self.num_tied_params > 0:
+            with torch.no_grad():
+                self._tie_param_flows(params)
 
         self._normalize_parameters(params)
         self.params = nn.Parameter(params)

@@ -42,8 +42,13 @@ class ProdNodes(CircuitNodes):
 
         self.edge_ids = edge_ids
 
-    def duplicate(self, chs: Optional[Sequence[CircuitNodes]] = None):
-        if chs is None:
+    def duplicate(self, *args):
+        chs = []
+        for ns in args:
+            assert isinstance(ns, CircuitNodes)
+            chs.append(ns)
+
+        if len(chs) == 0:
             chs = self.chs
         else:
             assert self.num_child_regions == len(chs), f"Number of new children ({len(chs)}) must match the number of original children ({self.num_child_regions})."

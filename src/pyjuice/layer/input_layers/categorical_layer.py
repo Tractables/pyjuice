@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+from copy import deepcopy
 from typing import Sequence, Dict, Optional
 
 from pyjuice.nodes import InputNodes
@@ -27,8 +28,8 @@ class CategoricalLayer(InputLayer, nn.Module):
         self.node_sizes = []
         self.node_num_cats = []
         self.param_ends = []
-        self.tied_param_ids = []
-        self.tied_param_group_ids = []
+        tied_param_ids = []
+        tied_param_group_ids = []
         self.num_tied_params = 0
         layer_num_nodes = 0
         cum_params = 0
@@ -54,23 +55,25 @@ class CategoricalLayer(InputLayer, nn.Module):
                 if source_ns._tied_param_group_ids is None:
 
                     num_source_params = source_ns._param_range[1] - source_ns._param_range[0] + 1
-                    source_ns._tied_param_group_ids = [i for i in range(self.num_tied_params, self.num_tied_params + num_source_params)]
+                    source_ns._tied_param_group_ids = [i for i in range(self.num_tied_params, self.num_tied_params + num_source_params - 1)]
 
                     tied_param_ids.extend([i for i in range(source_ns._param_range[0], source_ns._param_range[1])])
                     tied_param_group_ids.extend(source_ns._tied_param_group_ids)
 
-                    self.num_tied_params += ns_param_end - ns_param_start + 1
+                    self.num_tied_params += ns.num_nodes * ns.dist.num_cats
 
                 ns._tied_param_group_ids = deepcopy(source_ns._tied_param_group_ids)
-                self.tied_param_ids.extend([i for i in range(ns._param_range[0], ns._param_range[1])])
-                self.tied_param_group_ids.extend(ns._tied_param_group_ids)
+                tied_param_ids.extend([i for i in range(ns._param_range[0], ns._param_range[1])])
+                tied_param_group_ids.extend(ns._tied_param_group_ids)
 
         self._output_ind_range = (cum_nodes - layer_num_nodes, cum_nodes)
         self.param_ends = torch.tensor(self.param_ends)
 
         if self.num_tied_params > 0:
-            self.tied_param_ids = torch.tensor(tied_param_ids)
-            self.tied_param_group_ids = torch.tensor(tied_param_group_ids)
+            tied_param_ids = torch.tensor(tied_param_ids)
+            tied_param_group_ids = torch.tensor(tied_param_group_ids)
+            self.register_buffer("tied_param_ids", tied_param_ids)
+            self.register_buffer("tied_param_group_ids", tied_param_group_ids)
 
         self.num_params = cum_params
         self.num_nodes = layer_num_nodes
@@ -261,6 +264,11 @@ class CategoricalLayer(InputLayer, nn.Module):
                 params[par_start:par_end] = ns._params["params"].to(params.device)
 
             n_start = n_end
+
+        # Tie parameters
+        if self.num_tied_params > 0:
+            with torch.no_grad():
+                self._tie_param_flows(params)
 
         self._normalize_parameters(params)
         self.params = nn.Parameter(params)

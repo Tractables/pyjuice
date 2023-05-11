@@ -45,7 +45,12 @@ class SumNodes(CircuitNodes):
 
         self.edge_ids = edge_ids
 
-    def duplicate(self, chs: Optional[Sequence[CircuitNodes]] = None):
+    def duplicate(self, *args):
+        chs = []
+        for ns in args:
+            assert isinstance(ns, CircuitNodes)
+            chs.append(ns)
+
         if chs is None:
             chs = self.chs
         else:

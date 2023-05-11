@@ -11,19 +11,22 @@ from .nodes import CircuitNodes
 
 
 class InputNodes(CircuitNodes):
-    def __init__(self, num_nodes: int, scope: Union[Sequence,BitSet], dist: Distribution) -> None:
+    def __init__(self, num_nodes: int, scope: Union[Sequence,BitSet], dist: Distribution, **kwargs) -> None:
 
         rg_node = InputRegionNode(scope)
-        super(InputNodes, self).__init__(num_nodes, rg_node)
+        super(InputNodes, self).__init__(num_nodes, rg_node, **kwargs)
 
         self.chs = [] # InputNodes has no children
 
         self.dist = dist
 
-    def duplicate(self, scope: Optional[Union[Sequence,BitSet]] = None):
+    def duplicate(self, scope: Optional[Union[int,Sequence,BitSet]] = None):
         if scope is None:
             scope = self.scope
         else:
+            if isinstance(scope, int):
+                scope = [scope]
+
             assert len(scope) == len(self.scope)
 
         dist = deepcopy(self.dist)
