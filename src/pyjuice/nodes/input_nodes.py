@@ -20,3 +20,13 @@ class InputNodes(CircuitNodes):
 
         self.dist = dist
 
+    def duplicate(self, scope: Optional[Union[Sequence,BitSet]] = None):
+        if scope is None:
+            scope = self.scope
+        else:
+            assert len(scope) == len(self.scope)
+
+        dist = deepcopy(self.dist)
+
+        return InputNodes(self.num_nodes, scope = scope, dist = dist, source_node = self)
+

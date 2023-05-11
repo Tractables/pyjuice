@@ -10,7 +10,7 @@ from typing import Optional, Sequence
 
 from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes
 from pyjuice.layer import Layer, InputLayer, ProdLayer, SumLayer, layerize
-from pyjuice.functional import normalize_parameters, flat_softmax_fw, flat_softmax_bp
+from pyjuice.functional import normalize_parameters, tie_param_flows, flat_softmax_fw, flat_softmax_bp
 from pyjuice.utils.grad_fns import ReverseGrad, PseudoHookFunc
 
 def _pc_model_backward_hook(grad, pc):
@@ -301,6 +301,12 @@ class TensorCircuit(nn.Module):
         
         # Only apply parameter update if external parameters are not used in the previous forward/backward pass
         if not self._used_external_sum_params:
+            # Tie parameter flows if necessary
+            if self.num_tied_params > 0:
+                with torch.no_grad():
+                    self._tie_param_flows(self.param_flows)
+
+            # Normalize and update parameters
             with torch.no_grad():
                 flows = self.param_flows
                 if flows is None:
@@ -328,6 +334,7 @@ class TensorCircuit(nn.Module):
             assert self.param_flows.size(0) == self.params.size(0)
             self.param_flows[:] *= flows_memory
 
+        # For input layers
         for layer in self.input_layers:
             layer.init_param_flows(flows_memory = flows_memory)
 
@@ -387,6 +394,11 @@ class TensorCircuit(nn.Module):
         # Number of parameters for sum nodes in the PC, plus one dummy parameter
         param_ends = [1]
 
+        # Index mapping from original parameter space to a tied parameter space
+        tied_param_ids = []
+        tied_param_group_ids = []
+        tied_param_ends = []
+
         num_sum_regions = 0 # tally of sum regions so far
 
         layer_id = 0
@@ -416,12 +428,17 @@ class TensorCircuit(nn.Module):
                 self.inner_layers.append(prod_layer)
 
                 # Sum layer
-                sum_layer = SumLayer(nodes = depth2nodes[depth]["sum"],
-                                     cum_nodes = num_nodes, 
-                                     param_ends = param_ends, 
-                                     ch_prod_layer_size = prod_layer.num_nodes + 1,
-                                     sum_region_start_id = num_sum_regions,
-                                     max_num_groups = max_num_groups)
+                sum_layer = SumLayer(
+                    nodes = depth2nodes[depth]["sum"],
+                    cum_nodes = num_nodes, 
+                    param_ends = param_ends, 
+                    tied_param_ids = tied_param_ids,
+                    tied_param_group_ids = tied_param_group_ids,
+                    tied_param_ends = tied_param_ends,
+                    ch_prod_layer_size = prod_layer.num_nodes + 1,
+                    sum_region_start_id = num_sum_regions,
+                    max_num_groups = max_num_groups
+                )
 
                 num_nodes += sum_layer.num_nodes
                 num_sum_regions += len(depth2nodes[depth]["sum"])
@@ -450,6 +467,14 @@ class TensorCircuit(nn.Module):
         self.register_buffer("node_ids", node_ids)
         self.register_buffer("node_nchs", node_nchs)
 
+        # For parameter tying
+        self.num_tied_params = tied_param_ends[end]
+        if self.num_tied_params > 0:
+            tied_param_ids = torch.from_numpy(tied_param_ids).long()
+            tied_param_group_ids = torch.from_numpy(tied_param_group_ids).long()
+            self.register_buffer("tied_param_ids", tied_param_ids)
+            self.register_buffer("tied_param_group_ids", tied_param_group_ids)
+
         self._init_params()
 
     def _init_params(self, perturbation: float = 4.0):
@@ -476,6 +501,15 @@ class TensorCircuit(nn.Module):
     def _normalize_parameters(self, params, pseudocount: float = 0.0):
         if params is not None:
             normalize_parameters(params, self.node_ids, self.node_nchs, pseudocount)
+
+    def _tie_param_flows(self, param_flows):
+        if param_flows is not None:
+            tie_param_flows(
+                param_flows = param_flows, 
+                num_tied_params = self.num_tied_params, 
+                tied_param_ids = self.tied_param_ids, 
+                tied_param_group_ids = self.tied_param_group_ids
+            )
 
     def _extract_params_to_rnodes(self):
         """

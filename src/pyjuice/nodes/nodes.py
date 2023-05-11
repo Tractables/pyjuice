@@ -9,7 +9,7 @@ from pyjuice.graph import RegionGraph, PartitionNode, InnerRegionNode, InputRegi
 
 
 class CircuitNodes():
-    def __init__(self, num_nodes: int, region_node: RegionGraph):
+    def __init__(self, num_nodes: int, region_node: RegionGraph, source_node: Optional[CircuitNodes] = None):
         self.num_nodes = num_nodes
         self.region_node = region_node
 
@@ -17,6 +17,14 @@ class CircuitNodes():
         
         self._output_ind_range = None
         self._param_ids = None
+
+        # Source nodes it points to (for parameter tying)
+        if source_node is not None:
+            while source_node._source_node is not None:
+                source_node = source_node._source_node
+        self._source_node = source_node
+
+        self._tied_param_group_ids = None
 
     @property
     def scope(self):
@@ -34,3 +42,6 @@ class CircuitNodes():
     @property
     def num_child_regions(self):
         return len(self.chs)
+
+    def duplicate(self, *args, **kwargs):
+        raise ValueError(f"{type(self)} does not support `duplicate`.")

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import torch
-from typing import Sequence, Union, Type
+from typing import Sequence, Union, Type, Optional
 from copy import deepcopy
 from functools import reduce
 
@@ -13,10 +13,10 @@ Tensor = Union[np.ndarray,torch.Tensor]
 
 
 class ProdNodes(CircuitNodes):
-    def __init__(self, num_nodes: int, chs: Sequence[CircuitNodes], edge_ids: Optional[Tensor] = None) -> None:
+    def __init__(self, num_nodes: int, chs: Sequence[CircuitNodes], edge_ids: Optional[Tensor] = None, **kwargs) -> None:
 
         rg_node = PartitionNode([ch.region_node for ch in chs])
-        super(ProdNodes, self).__init__(num_nodes, rg_node)
+        super(ProdNodes, self).__init__(num_nodes, rg_node, **kwargs)
 
         # Child layers
         self.chs = chs
@@ -41,3 +41,16 @@ class ProdNodes(CircuitNodes):
             assert torch.all(edge_ids[:,cid] < self.chs[cid].num_nodes), "Edge index overflow."
 
         self.edge_ids = edge_ids
+
+    def duplicate(self, chs: Optional[Sequence[CircuitNodes]] = None):
+        if chs is None:
+            chs = self.chs
+        else:
+            assert self.num_child_regions == len(chs), f"Number of new children ({len(chs)}) must match the number of original children ({self.num_child_regions})."
+            for old_c, new_c in zip(self.chs, chs):
+                assert type(old_c) == type(new_c), f"Child type not match: ({type(new_c)} != {type(old_c)})."
+                assert old_c.num_nodes == new_c.num_nodes, f"Child node size not match: ({new_c.num_nodes} != {old_c.num_nodes})."
+
+        edge_ids = self.edge_ids.clone()
+
+        return ProdNodes(self.num_nodes, chs, edge_ids, source_node = self)
