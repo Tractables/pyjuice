@@ -78,11 +78,13 @@ def lvd_callback_fn(ns: CircuitNodes, lvdistiller: LVDistiller, lv_dataset: Opti
 
 
 class LVDistiller(_DecoratorContextManager):
-    def __init__(self, discretizer = "KMeans", pseudocount = 0.1, backend = "counting"):
+    def __init__(self, discretizer = "KMeans", pseudocount = 0.1, 
+                 backend = "counting", verbose = False):
 
         self.discretizer = discretizer
         self.pseudocount = pseudocount
         self.backend = backend
+        self.verbose = verbose
 
         self.datasets = []
 
