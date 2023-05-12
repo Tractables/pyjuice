@@ -33,3 +33,12 @@ class InputNodes(CircuitNodes):
 
         return InputNodes(self.num_nodes, scope = scope, dist = dist, source_node = self)
 
+    def get_params(self):
+        if self._params is None:
+            return None
+        else:
+            return self.dist.raw2processed_params(self._params)
+
+    def set_params(self, params):
+        params = self.dist.processed2raw_params(params)
+        self._params = params

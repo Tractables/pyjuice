@@ -17,6 +17,7 @@ class CircuitNodes():
         
         self._output_ind_range = None
         self._param_ids = None
+        self._params = None
 
         # Source nodes it points to (for parameter tying)
         if source_node is not None:

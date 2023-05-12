@@ -8,6 +8,7 @@ from pyjuice.layer import *
 from pyjuice.model import TensorCircuit
 from pyjuice.structures import BayesianTreeToHiddenRegionGraph
 
+
 def HMM(length: int, num_latents: int, 
         input_layer_type: Type[InputLayer] = CategoricalLayer, 
         input_layer_params: dict = {"num_cats": 256}):
