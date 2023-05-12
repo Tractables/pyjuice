@@ -9,7 +9,13 @@ from pyjuice.graph import RegionGraph, PartitionNode, InnerRegionNode, InputRegi
 
 
 class CircuitNodes():
-    def __init__(self, num_nodes: int, region_node: RegionGraph, source_node: Optional[CircuitNodes] = None):
+
+    # A list of function that will be called at the end of `__init__`
+    # This should only be changed by context managers, so please do not 
+    # add anything here.
+    INIT_CALLBACKS = []
+
+    def __init__(self, num_nodes: int, region_node: RegionGraph, source_node: Optional[CircuitNodes] = None, **kwargs):
         self.num_nodes = num_nodes
         self.region_node = region_node
 
@@ -26,6 +32,10 @@ class CircuitNodes():
         self._source_node = source_node
 
         self._tied_param_group_ids = None
+
+    def _run_init_callbacks(self, **kwargs):
+        for func in self.INIT_CALLBACKS:
+            func(self, **kwargs)
 
     @property
     def scope(self):

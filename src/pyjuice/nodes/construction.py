@@ -26,7 +26,10 @@ def inputs(var: Union[int,Sequence[int]], num_nodes: int, dist: Distribution):
 
 
 def multiply(nodes1: ProdNodesChs, nodes2: ProdNodesChs, *args, 
-             edge_ids: Optional[Tensor] = None):
+             edge_ids: Optional[Tensor] = None, **kwargs):
+
+    assert isinstance(nodes1, SumNodes) or isinstance(nodes1, InputNodes), "Children of product nodes must be input or sum nodes." 
+    assert isinstance(nodes2, SumNodes) or isinstance(nodes2, InputNodes), "Children of product nodes must be input or sum nodes." 
 
     chs = [nodes1, nodes2]
     num_nodes = nodes1.num_nodes
@@ -36,6 +39,7 @@ def multiply(nodes1: ProdNodesChs, nodes2: ProdNodesChs, *args,
     assert len(nodes2.scope & scope) == 0, "Children of a `ProdNodes` should have disjoint scopes."
     scope |= nodes2.scope
     for nodes in args:
+        assert isinstance(nodes, SumNodes) or isinstance(nodes, InputNodes), "Children of product nodes must be input or sum nodes."
         if edge_ids is None:
             assert nodes.num_nodes == num_nodes, "Input nodes should have the same `num_nodes`."
         assert len(nodes.scope & scope) == 0, "Children of a `ProdNodes` should have disjoint scopes."
@@ -45,10 +49,13 @@ def multiply(nodes1: ProdNodesChs, nodes2: ProdNodesChs, *args,
     if edge_ids is not None:
         num_nodes = edge_ids.shape[0]
 
-    return ProdNodes(num_nodes, chs, edge_ids)
+    return ProdNodes(num_nodes, chs, edge_ids, **kwargs)
 
 
-def summate(nodes1: SumNodesChs, *args, num_nodes: int = 0, edge_ids: Optional[Tensor] = None):
+def summate(nodes1: SumNodesChs, *args, num_nodes: int = 0, 
+            edge_ids: Optional[Tensor] = None, **kwargs):
+
+    assert isinstance(nodes1, ProdNodes) or isinstance(nodes1, InputNodes), "Children of sum nodes must be input or product nodes." 
 
     if edge_ids is not None and num_nodes == 0:
         num_nodes = edge_ids[0,:].max().item() + 1
@@ -58,7 +65,8 @@ def summate(nodes1: SumNodesChs, *args, num_nodes: int = 0, edge_ids: Optional[T
     chs = [nodes1]
     scope = deepcopy(nodes1.scope)
     for nodes in args:
+        assert isinstance(nodes, ProdNodes) or isinstance(nodes, InputNodes), "Children of sum nodes must be input or product nodes."
         assert nodes.scope == scope, "Children of a `SumNodes` should have the same scope."
         chs.append(nodes)
 
-    return SumNodes(num_nodes, chs, edge_ids)
+    return SumNodes(num_nodes, chs, edge_ids, **kwargs)

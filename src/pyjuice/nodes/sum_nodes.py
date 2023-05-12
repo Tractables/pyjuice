@@ -7,6 +7,7 @@ from copy import deepcopy
 from functools import reduce
 
 from pyjuice.graph import InnerRegionNode
+from pyjuice.functional import normalize_parameters
 from .nodes import CircuitNodes
 
 Tensor = Union[np.ndarray,torch.Tensor]
@@ -31,6 +32,9 @@ class SumNodes(CircuitNodes):
         # Set parameters
         if params is not None:
             self.set_params(params)
+
+        # Callbacks
+        self._run_init_callbacks(**kwargs)
 
     def _construct_edges(self, edge_ids: Optional[Tensor]):
         if edge_ids is None:
@@ -71,8 +75,17 @@ class SumNodes(CircuitNodes):
     def get_params(self):
         return self._params
 
-    def set_params(self, params: torch.Tensor):
-        assert params.dim() == 1
-        assert self.edge_ids.size(1) == params.size(0)
+    def set_params(self, params: torch.Tensor, normalize: Bool = False, pseudocount: float = 0.1):
+        if params.dim() == 1:
+            assert self.edge_ids.size(1) == params.size(0)
 
-        self._params = params.clone()
+            self._params = params.clone()
+
+        elif params.dim() == 2:
+            num_ch_nodes = sum([cs.num_nodes for cs in self.chs])
+            assert params.size(0) == self.num_nodes and params.size(1) == num_ch_nodes
+
+            self._params = params[self.edge_ids[0,:],self.edge_ids[1,:]].clone().contiguous()
+
+        if normalize:
+            normalize_parameters(self._params, self.edge_ids[0,:], pseudocount = pseudocount)

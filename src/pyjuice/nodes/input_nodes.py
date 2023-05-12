@@ -20,6 +20,9 @@ class InputNodes(CircuitNodes):
 
         self.dist = dist
 
+        # Callbacks
+        self._run_init_callbacks(**kwargs)
+
     def duplicate(self, scope: Optional[Union[int,Sequence,BitSet]] = None):
         if scope is None:
             scope = self.scope

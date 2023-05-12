@@ -253,7 +253,7 @@ class CategoricalLayer(InputLayer, nn.Module):
         for idx, ns in enumerate(self.nodes):
             n_end = n_start + ns.num_nodes
 
-            if hasattr(ns, "_params"):
+            if hasattr(ns, "_params") and ns._params is not None:
                 if idx == 0:
                     par_start = 0
                     par_end = self.param_ends[n_end-1]

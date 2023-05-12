@@ -24,6 +24,9 @@ class ProdNodes(CircuitNodes):
         # Construct sum edges
         self._construct_edges(edge_ids)
 
+        # Callbacks
+        self._run_init_callbacks(**kwargs)
+
     def _construct_edges(self, edge_ids: Optional[Tensor]):
         if edge_ids is None:
             for c in self.chs:

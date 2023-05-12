@@ -495,10 +495,10 @@ class TensorCircuit(nn.Module):
         # Copy initial parameters if provided
         for layer in self.inner_layers:
             if isinstance(layer, SumLayer):
-                for rnode in layer.nodes:
-                    if hasattr(rnode, "_params"):
-                        sidx, eidx = rnode._param_range
-                        params[sidx:eidx] = rnode._params[rnode._inverse_param_ids].to(params.device)
+                for ns in layer.nodes:
+                    if hasattr(ns, "_params") and ns._params is not None:
+                        sidx, eidx = ns._param_range
+                        params[sidx:eidx] = ns._params[ns._inverse_param_ids].to(params.device)
 
         # Tie parameters
         if self.num_tied_params > 0:
