@@ -16,3 +16,6 @@ class Categorical(Distribution):
 
     def processed2raw_params(self, params: torch.Tensor):
         return params.reshape(-1)
+
+    def init_parameters(num_nodes: int, perturbation: float, **kwargs):
+        return torch.exp(torch.rand([num_nodes * self.num_cats]) * -perturbation)

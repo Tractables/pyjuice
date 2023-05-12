@@ -45,6 +45,14 @@ def _pc_inputs_hook(grad, pc, i):
 
 class TensorCircuit(nn.Module):
     def __init__(self, root_nodes: CircuitNodes, max_num_groups: int = 1) -> None:
+        """
+        Create a tensorized circuit for the circuit rooted at `root_nodes`.
+
+        Parameters:
+        `root_nodes`:     root node(s) of the circuit
+        `max_num_groups`: how many groups do we want to split a layer into
+        """
+
         super().__init__()
 
         self.root_nodes = root_nodes

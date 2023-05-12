@@ -19,3 +19,6 @@ class DiscreteLogistic(Distribution):
 
     def processed2raw_params(self, params: torch.Tensor):
         return params
+
+    def init_parameters(num_nodes: int, perturbation: float, **kwargs):
+        raise NotImplementedError()

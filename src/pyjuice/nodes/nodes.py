@@ -56,3 +56,10 @@ class CircuitNodes():
 
     def duplicate(self, *args, **kwargs):
         raise ValueError(f"{type(self)} does not support `duplicate`.")
+
+    def init_parameters(self, perturbation: float = 2.0, recursive: bool = True, **kwargs):
+        if recursive:
+            for cs in self.chs:
+                self.init_parameters(
+                    perturbation = perturbation, recursive = recursive, **kwargs
+                )
