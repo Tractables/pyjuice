@@ -75,8 +75,17 @@ class TensorCircuit(nn.Module):
     def forward(self, inputs: torch.Tensor, 
                 params: Optional[torch.Tensor] = None, 
                 input_params: Optional[Dict[str,torch.Tensor]] = None,
-                missing_mask: Optional[torch.Tensor] = None,
-                ):
+                missing_mask: Optional[torch.Tensor] = None):
+        """
+        Forward the circuit.
+
+        Parameters:
+        `inputs`: [B, num_vars]
+        `params`: None or [B, num_params]
+        `input_params`: a dictionary of input parameters
+        `missing_mask`: [B, num_vars]
+        """
+                
         if missing_mask is not None:
             assert inputs.size() == missing_mask.size(), f"inputs.size {inputs.size()} != mask.size {missing_mask.size()}" 
         
@@ -121,7 +130,7 @@ class TensorCircuit(nn.Module):
                 else:
                     layer_params = None
 
-                layer(inputs, self.node_mars, params = layer_params, missing_mask=missing_mask)
+                layer(inputs, self.node_mars, params = layer_params, missing_mask = missing_mask)
 
             for layer in self.inner_layers:
                 if isinstance(layer, ProdLayer):
@@ -158,15 +167,30 @@ class TensorCircuit(nn.Module):
                  ll_weights: Optional[torch.Tensor] = None,
                  compute_param_flows: bool = True, 
                  flows_memory: float = 0.0):
+        """
+        Compute circuit flows.
+
+        Parameters:
+        `inputs`:       None or [B, num_vars]
+        `ll_weights`:   None or [B] or [B, num_roots]
+        """
+
         assert self.node_mars is not None and self.element_mars is not None, "Should run forward path first."
 
-        self.node_flows = torch.zeros([self.num_nodes, self.node_mars.size(1)], device = self.device)
-        self.element_flows = torch.zeros([self.num_elements, self.node_mars.size(1)], device = self.device)
+        B = self.node_mars.size(1)
+
+        self.node_flows = torch.zeros([self.num_nodes, B], device = self.device)
+        self.element_flows = torch.zeros([self.num_elements, B], device = self.device)
 
         if ll_weights is None:
-            self.node_flows[-1,:] = 1.0
+            self.node_flows[self._root_node_range[0]:self._root_node_range[1],:] = 1.0
         else:
-            self.node_flows[-1,:] = ll_weights.squeeze()
+            if ll_weights.dim() == 1:
+                ll_weights = ll_weights.unsqueeze(1)
+
+            assert ll_weights.size(1) == self.num_root_nodes
+
+            self.node_flows[self._root_node_range[0]:self._root_node_range[1],:] = ll_weights.permute(1, 0)
 
         if self._inputs[1] is not None:
             params = self._backward_buffer["normalized_params"]
@@ -363,6 +387,7 @@ class TensorCircuit(nn.Module):
     def _init_layers(self, init_input_params: Optional[Sequence[torch.Tensor]] = None, 
                      init_inner_params: Optional[torch.Tensor] = None,
                      max_num_groups: int = 1):
+
         depth2nodes, num_layers = self._create_node_layers()
 
         if hasattr(self, "input_layers") or hasattr(self, "inner_layers"):
@@ -457,6 +482,11 @@ class TensorCircuit(nn.Module):
             self.register_buffer("tied_param_ids", tied_param_ids)
             self.register_buffer("tied_param_group_ids", tied_param_group_ids)
 
+        # Register root nodes
+        self.num_root_nodes = self.inner_layers[-1].num_nodes
+        self._root_node_range = (self.num_nodes - self.num_root_nodes, self.num_nodes)
+
+        # Initialize parameters
         self._init_params()
 
     def _init_params(self, perturbation: float = 4.0):
