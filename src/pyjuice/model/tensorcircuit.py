@@ -8,7 +8,7 @@ import triton.language as tl
 from functools import partial
 from typing import Optional, Sequence
 
-from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes
+from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes, foreach
 from pyjuice.layer import Layer, InputLayer, ProdLayer, SumLayer, layerize
 from pyjuice.functional import normalize_parameters, tie_param_flows, flat_softmax_fw, flat_softmax_bp
 from pyjuice.utils.grad_fns import ReverseGrad, PseudoHookFunc
@@ -391,6 +391,22 @@ class TensorCircuit(nn.Module):
             param_specs[f"input_{i}"] = layer.get_param_specs()
 
         return param_specs
+
+    def update_parameters(self, clone_params = True):
+        """
+        Copy parameters from this `TensorCircuit` to the original `CircuitNodes`
+        """
+        params = self.params.detach().cpu()
+
+        def param_copy_func(ns):
+            if clone_params:
+                ns._params = self.params[ns._param_ids].clone()
+            else:
+                ns._params = self.params[ns._param_ids]
+
+        foreach(param_copy_func, self.root_nodes)
+
+        return None
 
     def _init_layers(self, init_input_params: Optional[Sequence[torch.Tensor]] = None, 
                      init_inner_params: Optional[torch.Tensor] = None,
