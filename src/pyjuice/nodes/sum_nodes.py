@@ -14,7 +14,7 @@ Tensor = Union[np.ndarray,torch.Tensor]
 
 
 class SumNodes(CircuitNodes):
-    def __init__(self, num_nodes: int, chs: Sequence[CircuitNodes], edge_ids: Optional[Tensor] = None, 
+    def __init__(self, num_nodes: int, chs: Sequence[CircuitNodes], edge_ids: Optional[Union[Tensor,Sequence[Tensor]]] = None, 
                  params: Optional[Tensor] = None, **kwargs) -> None:
 
         rg_node = InnerRegionNode([ch.region_node for ch in chs])
@@ -36,13 +36,29 @@ class SumNodes(CircuitNodes):
         # Callbacks
         self._run_init_callbacks(**kwargs)
 
-    def _construct_edges(self, edge_ids: Optional[Tensor]):
+    def _construct_edges(self, edge_ids: Optional[Union[Tensor,Sequence[Tensor]]]):
         if edge_ids is None:
             edge_ids = torch.cat(
                 (torch.arange(self.num_nodes).unsqueeze(1).repeat(1, self.num_ch_nodes).reshape(1, -1),
                  torch.arange(self.num_ch_nodes).unsqueeze(0).repeat(self.num_nodes, 1).reshape(1, -1)),
                 dim = 0
             )
+        elif isinstance(edge_ids, Sequence):
+            assert len(edge_ids) == len(self.chs)
+
+            per_ns_edge_ids = edge_ids
+            ch_nid_start = 0
+            edge_ids = []
+            for cs_id in range(len(self.chs)):
+                curr_edge_ids = per_ns_edge_ids[cs_id]
+                curr_edge_ids[1,:] += ch_nid_start
+                edge_ids.append(curr_edge_ids)
+
+                ch_nid_start += self.chs[cs_id].num_nodes
+
+            edge_ids = torch.cat(edge_ids, dim = 1)
+        else:
+            assert isinstance(edge_ids, Tensor)
 
         if isinstance(edge_ids, np.ndarray):
             edge_ids = torch.from_numpy(edge_ids)
