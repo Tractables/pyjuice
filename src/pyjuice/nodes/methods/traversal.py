@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from functools import partial
 from typing import Callable, Optional, Dict
 
 from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes
@@ -27,10 +28,13 @@ def foreach(func: Callable, root_nodes: CircuitNodes):
     return None
 
 
-def foldup_aggregate(func: Callable, root_nodes: CircuitNodes, cache: Optional[Dict] = None):
+def foldup_aggregate(func: Callable, root_nodes: CircuitNodes, cache: Optional[Dict] = None, **kwargs):
 
     if cache is None:
         cache = dict()
+
+    if len(kwargs) > 0:
+        func = partial(func, **kwargs)
 
     def dfs(ns: CircuitNodes):
         if ns in cache:
@@ -48,4 +52,4 @@ def foldup_aggregate(func: Callable, root_nodes: CircuitNodes, cache: Optional[D
 
     dfs(root_nodes)
 
-    return cached_outputs[root_nodes]
+    return cache[root_nodes]

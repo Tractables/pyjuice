@@ -54,7 +54,7 @@ class SumNodes(CircuitNodes):
 
         self.edge_ids = edge_ids
 
-    def duplicate(self, *args):
+    def duplicate(self, *args, tie_params: bool = True):
         chs = []
         for ns in args:
             assert isinstance(ns, CircuitNodes)
@@ -70,7 +70,12 @@ class SumNodes(CircuitNodes):
 
         edge_ids = self.edge_ids.clone()
 
-        return SumNodes(self.num_nodes, chs, edge_ids, source_node = self)
+        if hasattr(self, "_params") and self._params is not None:
+            params = self._params.clone()
+        else:
+            params = None
+
+        return SumNodes(self.num_nodes, chs, edge_ids, params = params, source_node = self if tie_params else None)
 
     def get_params(self):
         return self._params

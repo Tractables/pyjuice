@@ -23,7 +23,7 @@ class InputNodes(CircuitNodes):
         # Callbacks
         self._run_init_callbacks(**kwargs)
 
-    def duplicate(self, scope: Optional[Union[int,Sequence,BitSet]] = None):
+    def duplicate(self, scope: Optional[Union[int,Sequence,BitSet]] = None, tie_params: bool = True):
         if scope is None:
             scope = self.scope
         else:
@@ -34,7 +34,12 @@ class InputNodes(CircuitNodes):
 
         dist = deepcopy(self.dist)
 
-        return InputNodes(self.num_nodes, scope = scope, dist = dist, source_node = self)
+        ns = InputNodes(self.num_nodes, scope = scope, dist = dist, source_node = self if tie_params else None)
+
+        if hasattr(self, "_params") and self._params is not None:
+            ns._params = self._params.clone()
+
+        return ns
 
     def get_params(self):
         if self._params is None:

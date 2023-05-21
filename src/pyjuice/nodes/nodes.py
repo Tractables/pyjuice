@@ -8,6 +8,29 @@ from pyjuice.utils import BitSet
 from pyjuice.graph import RegionGraph, PartitionNode, InnerRegionNode, InputRegionNode
 
 
+def node_iterator(root_ns: CircuitNodes):
+    visited = set()
+    node_list = list()
+
+    def dfs(ns: CircuitNodes):
+        if ns in visited:
+            return
+
+        visited.add(ns)
+
+        # Recursively traverse children
+        if ns.issum() or ns.isprod():
+            for cs in ns.chs:
+                dfs(cs)
+
+        node_list.append(ns)
+
+    dfs(root_ns)
+
+    for ns in node_list:
+        yield ns
+
+
 class CircuitNodes():
 
     # A list of function that will be called at the end of `__init__`
@@ -57,9 +80,20 @@ class CircuitNodes():
     def duplicate(self, *args, **kwargs):
         raise ValueError(f"{type(self)} does not support `duplicate`.")
 
-    def init_parameters(self, perturbation: float = 2.0, recursive: bool = True, **kwargs):
+    def init_parameters(self, perturbation: float = 2.0, recursive: bool = True, visited: set = set(), **kwargs):
         if recursive:
+            if self in visited:
+                return None
+            
+            visited.add(self)
+
             for cs in self.chs:
-                self.init_parameters(
-                    perturbation = perturbation, recursive = recursive, **kwargs
+                cs.init_parameters(
+                    perturbation = perturbation, 
+                    recursive = recursive, 
+                    visited = visited, 
+                    **kwargs
                 )
+
+    def __iter__(self):
+        return node_iterator(self)
