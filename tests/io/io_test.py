@@ -38,6 +38,10 @@ def io_test():
     assert n0.chs[0].chs[1].scope == n0_dup.chs[0].chs[1].scope
     assert n0.chs[1].chs[0].scope == n0_dup.chs[1].chs[0].scope
     assert n0.chs[1].chs[1].scope == n0_dup.chs[1].chs[1].scope
+    assert n0.chs[0].chs[0].dist.num_cats == n0_dup.chs[0].chs[0].dist.num_cats
+    assert n0.chs[0].chs[1].dist.num_cats == n0_dup.chs[0].chs[1].dist.num_cats
+    assert n0.chs[1].chs[0].dist.num_cats == n0_dup.chs[1].chs[0].dist.num_cats
+    assert n0.chs[1].chs[1].dist.num_cats == n0_dup.chs[1].chs[1].dist.num_cats
 
 
 if __name__ == "__main__":
