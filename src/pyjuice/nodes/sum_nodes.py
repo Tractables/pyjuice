@@ -57,8 +57,6 @@ class SumNodes(CircuitNodes):
                 ch_nid_start += self.chs[cs_id].num_nodes
 
             edge_ids = torch.cat(edge_ids, dim = 1)
-        else:
-            assert isinstance(edge_ids, Tensor)
 
         if isinstance(edge_ids, np.ndarray):
             edge_ids = torch.from_numpy(edge_ids)

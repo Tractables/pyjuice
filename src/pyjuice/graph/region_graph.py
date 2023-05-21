@@ -31,6 +31,10 @@ class PartitionNode(RegionGraph):
 
         super().__init__(scope, children)
 
+    def __hash__(self):
+        ch_scopes = tuple(hash(c.scope) for c in self.children)
+        return hash(("PartitionNode", hash(self.scope), ch_scopes))
+
 
 class InnerRegionNode(RegionGraph):
     def __init__(self, children: List[Union[InputRegionNode,PartitionNode]]) -> None:
@@ -43,6 +47,9 @@ class InnerRegionNode(RegionGraph):
 
         super().__init__(scope, children)
 
+    def __hash__(self):
+        return hash(("InnerRegionNode", hash(self.scope)))
+
 
 class InputRegionNode(RegionGraph):
     def __init__(self, scope: Union[List,BitSet]) -> None:
@@ -50,3 +57,6 @@ class InputRegionNode(RegionGraph):
             scope = BitSet.from_array(scope)
 
         super().__init__(scope, [])
+
+    def __hash__(self):
+        return hash(("InputRegionNode", hash(self.scope)))
