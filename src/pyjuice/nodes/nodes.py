@@ -80,7 +80,8 @@ class CircuitNodes():
     def duplicate(self, *args, **kwargs):
         raise ValueError(f"{type(self)} does not support `duplicate`.")
 
-    def init_parameters(self, perturbation: float = 2.0, recursive: bool = True, visited: set = set(), **kwargs):
+    def init_parameters(self, perturbation: float = 2.0, recursive: bool = True, visited: set = set(), 
+                        is_root = True, **kwargs):
         if recursive:
             if self in visited:
                 return None
@@ -92,8 +93,17 @@ class CircuitNodes():
                     perturbation = perturbation, 
                     recursive = recursive, 
                     visited = visited, 
+                    is_root = False,
                     **kwargs
                 )
+        else:
+            visited.add(self)
+
+        # Process all tied nodes
+        for ns in visited:
+            if ns._source_node is not None:
+                ns_source = ns._source_node
+                ns._params = ns_source._params.clone()
 
     def __iter__(self):
         return node_iterator(self)

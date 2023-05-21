@@ -63,7 +63,10 @@ class ProdNodes(CircuitNodes):
 
         return ProdNodes(self.num_nodes, chs, edge_ids, source_node = self if tie_params else None)
 
-    def init_parameters(self, perturbation: float = 2.0, recursive: bool = True, **kwargs):
+    def init_parameters(self, perturbation: float = 2.0, recursive: bool = True, is_root: bool = True, **kwargs):
         super(ProdNodes, self).init_parameters(
-            perturbation = perturbation, recursive = recursive, **kwargs
+            perturbation = perturbation, 
+            recursive = recursive, 
+            is_root = is_root,
+            **kwargs
         )

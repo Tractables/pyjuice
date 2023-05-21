@@ -51,9 +51,11 @@ class InputNodes(CircuitNodes):
         params = self.dist.processed2raw_params(params)
         self._params = params
 
-    def init_parameters(self, perturbation: float = 2.0, recursive: bool = True, **kwargs):
-        self._params = self.dist.init_parameters(
-            num_nodes = self.num_nodes,
-            perturbation = perturbation,
-            **kwargs
-        )
+    def init_parameters(self, perturbation: float = 2.0, recursive: bool = True, is_root: bool = True, **kwargs):
+        if self._source_node is None:
+            self._params = self.dist.init_parameters(
+                num_nodes = self.num_nodes,
+                perturbation = perturbation,
+                is_root = is_root,
+                **kwargs
+            )

@@ -81,6 +81,15 @@ class SumNodes(CircuitNodes):
         return self._params
 
     def set_params(self, params: torch.Tensor, normalize: bool = False, pseudocount: float = 0.1):
+        if self._source_node is not None:
+            ns_source = self._source_node
+            while ns_source._source_node is not None:
+                ns_source = ns_source._source_node
+
+            ns_source.set_params(params, normalize = normalize, pseudocount = pseudocount)
+
+            return None
+
         if params.dim() == 1:
             assert self.edge_ids.size(1) == params.size(0)
 
@@ -95,11 +104,15 @@ class SumNodes(CircuitNodes):
         if normalize:
             normalize_parameters(self._params, self.edge_ids[0,:], pseudocount = pseudocount)
 
-    def init_parameters(self, perturbation: float = 2.0, recursive: bool = True, **kwargs):
-        self._params = torch.exp(torch.rand([self.edge_ids.size(1)]) * -perturbation)
+    def init_parameters(self, perturbation: float = 2.0, recursive: bool = True, is_root: bool = True, **kwargs):
+        if self._source_node is None:
+            self._params = torch.exp(torch.rand([self.edge_ids.size(1)]) * -perturbation)
 
-        normalize_parameters(self._params, self.edge_ids[0,:], pseudocount = 0.0)
+            normalize_parameters(self._params, self.edge_ids[0,:], pseudocount = 0.0)
 
         super(SumNodes, self).init_parameters(
-            perturbation = perturbation, recursive = recursive, **kwargs
+            perturbation = perturbation, 
+            recursive = recursive, 
+            is_root = is_root, 
+            **kwargs
         )
