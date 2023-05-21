@@ -19,3 +19,10 @@ class Categorical(Distribution):
 
     def init_parameters(self, num_nodes: int, perturbation: float, **kwargs):
         return torch.exp(torch.rand([num_nodes * self.num_cats]) * -perturbation)
+
+    def __getstate__(self):
+        state = {"num_cats": self.num_cats}
+        return state
+
+    def __setstate__(self, state):
+        self.num_cats = state["num_cats"]

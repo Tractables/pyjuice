@@ -22,3 +22,14 @@ class DiscreteLogistic(Distribution):
 
     def init_parameters(num_nodes: int, perturbation: float, **kwargs):
         raise NotImplementedError()
+
+    def __getstate__(self):
+        state = {
+            "input_range": self.input_range,
+            "bin_count": self.bin_count
+        }
+        return state
+
+    def __setstate__(self, state):
+        self.input_range = state["input_range"]
+        self.bin_count = state["bin_count"]

@@ -6,7 +6,7 @@ from typing import Callable, Optional, Dict
 
 from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes
 from pyjuice.graph import RegionGraph, PartitionNode, InnerRegionNode, InputRegionNode
-        
+
 
 def merge_sum_nodes(ns1: SumNodes, ns2: SumNodes, *args):
     all_ns = [ns1, ns2, *args]
