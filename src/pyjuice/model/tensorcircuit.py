@@ -392,19 +392,29 @@ class TensorCircuit(nn.Module):
 
         return param_specs
 
-    def update_parameters(self, clone_params = True):
+    def update_parameters(self, clone_params: bool = True):
         """
         Copy parameters from this `TensorCircuit` to the original `CircuitNodes`
         """
         params = self.params.detach().cpu()
 
-        def param_copy_func(ns):
-            if clone_params:
-                ns._params = self.params[ns._param_ids].clone()
-            else:
-                ns._params = self.params[ns._param_ids]
-
         foreach(param_copy_func, self.root_nodes)
+        for ns in self.root_nodes:
+            if clone_params:
+                ns._params = params[ns._param_ids].clone()
+            else:
+                ns._params = params[ns._param_ids]
+
+        return None
+
+    def copy_param_flows(self, clone_param_flows: bool = True, target_name: str = "_scores"):
+        param_flows = self.param_flows.detach().cpu()
+
+        for ns in self.root_nodes:
+            if clone_params:
+                setattr(ns, target_name, param_flows[ns._param_ids].clone())
+            else:
+                setattr(ns, target_name, param_flows[ns._param_ids])
 
         return None
 
