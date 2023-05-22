@@ -45,7 +45,7 @@ class ProdNodes(CircuitNodes):
 
         self.edge_ids = edge_ids
 
-    def duplicate(self, *args, tie_params: bool = True):
+    def duplicate(self, *args, tie_params: bool = False):
         chs = []
         for ns in args:
             assert isinstance(ns, CircuitNodes)

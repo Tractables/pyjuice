@@ -231,14 +231,6 @@ class DiscreteLogisticLayer(InputLayer, nn.Module):
         raise NotImplementedError()
 
     @staticmethod
-    def _prune_nodes(_params: Dict, node_keep_flag: torch.Tensor):
-        raise NotImplementedError()
-
-    @staticmethod
-    def _duplicate_nodes(_params: Dict):
-        raise NotImplementedError()
-
-    @staticmethod
     def _hook_params(grad_hook_idx: int, _inputs: List, layer_params: Dict):
         while len(_inputs) < grad_hook_idx + 2:
             _inputs.append(None)

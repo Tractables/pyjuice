@@ -23,7 +23,7 @@ class InputNodes(CircuitNodes):
         # Callbacks
         self._run_init_callbacks(**kwargs)
 
-    def duplicate(self, scope: Optional[Union[int,Sequence,BitSet]] = None, tie_params: bool = True):
+    def duplicate(self, scope: Optional[Union[int,Sequence,BitSet]] = None, tie_params: bool = False):
         if scope is None:
             scope = self.scope
         else:

@@ -41,7 +41,7 @@ def tie_sum_nodes_test():
     n1 = juice.summate(m1, num_nodes = num_nodes)
 
     m2 = juice.multiply(i2, i3)
-    n2 = n1.duplicate(m2)
+    n2 = n1.duplicate(m2, tie_params = True)
 
     m = juice.multiply(n1, n2)
     n = juice.summate(m, num_nodes = 1)
@@ -74,7 +74,7 @@ def tie_input_nodes_test():
     num_nodes = 2
     
     i0 = juice.inputs(0, num_nodes, dists.Categorical(num_cats = 5))
-    i1 = i0.duplicate(1)
+    i1 = i0.duplicate(1, tie_params = True)
 
     m = juice.multiply(i0, i1)
     n = juice.summate(m, num_nodes = 1)

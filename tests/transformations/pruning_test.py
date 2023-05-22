@@ -57,7 +57,7 @@ def pruning_with_param_tying_test():
     n1 = summate(m1, num_nodes = num_nodes)
 
     m2 = multiply(i2, i3)
-    n2 = n1.duplicate(m2)
+    n2 = n1.duplicate(m2, tie_params = True)
 
     m = multiply(n1, n2)
     n = summate(m, num_nodes = 1)
