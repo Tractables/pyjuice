@@ -227,7 +227,7 @@ class SumLayer(Layer, nn.Module):
         self.grouped_seq_ids1 = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in grouped_seq_ids1])
         self.grouped_seq_parpids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in grouped_seq_parpids])
 
-    def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor):
+    def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor) -> None:
         """
         Computes the forward pass of a sum layer:
         ```
@@ -250,9 +250,11 @@ class SumLayer(Layer, nn.Module):
 
             self._forward_triton(node_mars, element_mars, params, nids, cids, pids)
 
+        return None
+
     def backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
                  node_mars: torch.Tensor, element_mars: torch.Tensor, 
-                 params: torch.Tensor, param_flows: Optional[torch.Tensor] = None):
+                 params: torch.Tensor, param_flows: Optional[torch.Tensor] = None) -> None:
         """
         Computes the forward pass of a sum layer:
         ```
@@ -288,7 +290,7 @@ class SumLayer(Layer, nn.Module):
 
     def sample(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
                node_mars: torch.Tensor, element_mars: torch.Tensor, 
-               params: torch.Tensor, node_mask: torch.Tensor):
+               params: torch.Tensor, node_mask: torch.Tensor) -> None:
         """
         Compute sampling flow.
 
@@ -305,6 +307,8 @@ class SumLayer(Layer, nn.Module):
 
         self._sample_mask_generation(node_mars, element_mars, params, node_mask)
         self._sample_backward_pass(node_flows, element_flows, node_mars, element_mars, params, node_mask)
+
+        return None
         
     @staticmethod
     @triton.jit
@@ -381,7 +385,7 @@ class SumLayer(Layer, nn.Module):
     def _forward_triton(self, node_mars: torch.Tensor, element_mars: torch.Tensor, 
                         params: torch.Tensor,
                         nids: torch.Tensor, cids: torch.Tensor,
-                        pids: torch.Tensor, BLOCK_SIZE = 2**12, MAX_BLOCK_M = 512, MAX_BLOCK_N = 64):
+                        pids: torch.Tensor, BLOCK_SIZE = 2**12, MAX_BLOCK_M = 512, MAX_BLOCK_N = 64) -> None:
         """
         This function is equivalent to running:
         ``` 
@@ -512,7 +516,7 @@ class SumLayer(Layer, nn.Module):
                          params: torch.Tensor, node_mars: torch.Tensor, 
                          element_mars: torch.Tensor, param_flows: torch.Tensor, 
                          chids: torch.Tensor, parids: torch.Tensor, parpids: torch.Tensor, 
-                         BLOCK_SIZE = 2**12, MAX_BLOCK_M = 512, MAX_BLOCK_N = 64):
+                         BLOCK_SIZE = 2**12, MAX_BLOCK_M = 512, MAX_BLOCK_N = 64) -> None:
         """
         This function is equivalent to running:
         ``` 

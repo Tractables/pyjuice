@@ -122,7 +122,7 @@ class ProdLayer(Layer, nn.Module):
         self.grouped_parids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in grouped_parids])
         self.grouped_u_cids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in grouped_u_cids])
 
-    def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor):
+    def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor) -> None:
         """
         Computes the forward pass of a product layer:
         ```
@@ -142,7 +142,7 @@ class ProdLayer(Layer, nn.Module):
 
         return None
 
-    def backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor):
+    def backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor) -> None:
         """
         Computes the backward pass of a product layer:
         ```
@@ -213,7 +213,7 @@ class ProdLayer(Layer, nn.Module):
 
     def _forward_backward_triton(self, node_vals: torch.Tensor, element_vals: torch.Tensor, 
                                  nids: torch.Tensor, cids: torch.Tensor, 
-                                 BLOCK_SIZE = 2**12, MAX_BLOCK_M = 512, MAX_BLOCK_N = 64):
+                                 BLOCK_SIZE = 2**12, MAX_BLOCK_M = 512, MAX_BLOCK_N = 64) -> None:
         """
         This function is equivalent to running:
         ``` node_vals[nids] = element_vals[cids].sum(dim = 1) ```
