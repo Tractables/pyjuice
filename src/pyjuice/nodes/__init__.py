@@ -4,4 +4,3 @@ from .prod_nodes import ProdNodes
 from .sum_nodes import SumNodes
 from .construction import multiply, summate, inputs
 from .methods.traversal import foreach, foldup_aggregate
-from .methods.merge import merge

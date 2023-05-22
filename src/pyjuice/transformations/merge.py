@@ -8,7 +8,7 @@ from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes
 from pyjuice.graph import RegionGraph, PartitionNode, InnerRegionNode, InputRegionNode
 
 
-def merge_sum_nodes(ns1: SumNodes, ns2: SumNodes, *args):
+def merge_sum_nodes(ns1: SumNodes, ns2: SumNodes, *args) -> SumNodes:
     all_ns = [ns1, ns2, *args]
     for idx, ns in enumerate(all_ns):
         assert ns1.scope == ns.scope, "Sum nodes to be merged should have the same scope."
@@ -58,7 +58,7 @@ def merge_sum_nodes(ns1: SumNodes, ns2: SumNodes, *args):
     return SumNodes(num_nodes, sum_chs, edge_ids, params = params)
 
 
-def merge_prod_nodes(ns1: ProdNodes, ns2: ProdNodes, *args):
+def merge_prod_nodes(ns1: ProdNodes, ns2: ProdNodes, *args) -> ProdNodes:
     all_ns = [ns1, ns2, *args]
     ch_scopes = [cs.scope for cs in ns1.chs]
     num_scopes = len(ch_scopes)
@@ -102,7 +102,7 @@ def merge_prod_nodes(ns1: ProdNodes, ns2: ProdNodes, *args):
     return ProdNodes(num_nodes, new_sum_chs, edge_ids)
 
 
-def merge_by_region_node(root_ns: CircuitNodes):
+def merge_by_region_node(root_ns: CircuitNodes) -> CircuitNodes:
 
     rg2nodes = dict()
     rgs_list = list()
@@ -192,7 +192,7 @@ def merge_by_region_node(root_ns: CircuitNodes):
     return ns_old2new[root_ns][0]
 
 
-def merge(ns1: CircuitNodes, *args):
+def merge(ns1: CircuitNodes, *args) -> CircuitNodes:
     """
     Group nodes with identical region node together.
     """

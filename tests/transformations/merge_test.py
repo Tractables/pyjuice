@@ -5,7 +5,7 @@ import numpy as np
 import pyjuice.nodes.distributions as dists
 from pyjuice.utils import BitSet
 from pyjuice.nodes import multiply, summate, inputs
-from pyjuice.nodes.methods.merge import merge_sum_nodes, merge_prod_nodes, merge_by_region_node
+from pyjuice.transformations.merge import merge_sum_nodes, merge_prod_nodes, merge_by_region_node
 
 import pytest
 
