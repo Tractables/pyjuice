@@ -4,6 +4,7 @@ import pyjuice.layer
 import pyjuice.structures
 import pyjuice.optim
 import pyjuice.transformations
+import pyjuice.io
 
 # TensorCircuit
 from pyjuice.model import TensorCircuit
