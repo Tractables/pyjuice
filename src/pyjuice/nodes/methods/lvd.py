@@ -6,10 +6,41 @@ import functools
 from pyjuice.utils.context_manager import _DecoratorContextManager
 from pyjuice.utils.kmeans import faiss_kmeans
 from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes
-from .lvd_backend.counting import get_pairwise_count
+from .lvd_backend.counting import lvd_by_counting
 
 
-def lvd_callback_fn(ns: CircuitNodes, lvdistiller: LVDistiller, lv_dataset: Optional[torch.Tensor] = None, **kwargs):
+class LVDistiller(_DecoratorContextManager):
+    def __init__(self, discretizer = "KMeans", pseudocount = 0.1, 
+                 backend = "counting", verbose = False, **kwargs):
+
+        self.discretizer = discretizer
+        self.pseudocount = pseudocount
+        self.backend = backend
+        self.verbose = verbose
+        self.kwargs = kwargs
+
+        self.lv_datasets = []
+        self.obs_datasets = []
+
+        self.ns2lv_dataset_id = dict()
+        self.ns2obs_dataset_id = dict()
+
+        self.callback = functools.partial(lvd_callback_fn, lvdistiller = self)
+
+    def __enter__(self) -> None:
+        CircuitNodes.INIT_CALLBACKS.append(self.callback)
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        CircuitNodes.INIT_CALLBACKS.remove(self.callback)
+
+
+def lvd_callback_fn(ns: CircuitNodes, lvdistiller: LVDistiller, lv_dataset: Optional[torch.Tensor] = None, 
+                    obs_dataset: Optional[torch.Tensor] = None, **kwargs):
+
+    if obs_dataset is not None:
+        obs_dataset_id = len(lvdistiller.obs_datasets)
+        lvdistiller.obs_datasets.append(obs_dataset)
+        lvdistiller.ns2obs_dataset_id[ns] = obs_dataset_id
 
     if lv_dataset is None:
         # Do nothing if no LV dataset is provided
@@ -31,69 +62,14 @@ def lvd_callback_fn(ns: CircuitNodes, lvdistiller: LVDistiller, lv_dataset: Opti
 
     assert lv_dataset.max() < ns.num_nodes, f"Got more latent clusters ({lv_dataset.max().item()}) than nodes ({ns.num_nodes})."
 
-    dataset_id = len(lvdistiller.datasets)
-    lvdistiller.datasets.append(lv_dataset)
+    lv_dataset_id = len(lvdistiller.lv_datasets)
+    lvdistiller.lv_datasets.append(lv_dataset)
 
-    lvdistiller.ns2dataset_id[ns] = dataset_id
+    lvdistiller.ns2lv_dataset_id[ns] = lv_dataset_id
 
     # Perform LVD by the specified backend
     if lvdistiller.backend == "counting":
-        if isinstance(ns, ProdNodes):
-            for cs in ns.chs:
-                if cs not in lvdistiller.ns2dataset_id:
-                    lvdistiller.ns2dataset_id[cs] = dataset_id
-
-        # Get candidate LVD nodes
-        nodes_for_lvd = []
-        if isinstance(ns, SumNodes):
-            if any([cs in lvdistiller.ns2dataset_id for cs in ns.chs]):
-                nodes_for_lvd.append(ns)
-        elif isinstance(ns, ProdNodes):
-            for cs in ns.chs:
-                if any([ccs in lvdistiller.ns2dataset_id for ccs in cs.chs]):
-                    nodes_for_lvd.append(cs)
-
-        # Run LVD by counting
-        for ns in nodes_for_lvd:
-            ns_dataset = lvdistiller.datasets[lvdistiller.ns2dataset_id[ns]]
-            num_ch_nodes = sum([cs.num_nodes for cs in ns.chs])
-            edge_params = torch.empty([ns.num_nodes, num_ch_nodes], dtype = torch.float32, device = ns_dataset.device)
-            sid = 0
-            for cs in ns.chs:
-                eid = sid + cs.num_nodes
-                if cs in lvdistiller.ns2dataset_id:
-                    cs_dataset = lvdistiller.datasets[lvdistiller.ns2dataset_id[cs]]
-                    pairwise_count = get_pairwise_count(ns_dataset, cs_dataset, ns.num_nodes, cs.num_nodes)
-                else:
-                    # Randomly initialize parameters
-                    pairwise_count = torch.exp(-torch.rand([ns.num_nodes, cs.num_nodes]) * 2.0)
-
-                edge_params[:,sid:eid] = pairwise_count / pairwise_count.sum(dim = 1, keepdim = True)
-                sid = eid
-
-            ns.set_params(edge_params)
+        lvd_by_counting(lvdistiller, ns)
         
     else:
-        raise NotImplementedError(f"Unknown backend {lvdistiller.backend}.")
-
-
-class LVDistiller(_DecoratorContextManager):
-    def __init__(self, discretizer = "KMeans", pseudocount = 0.1, 
-                 backend = "counting", verbose = False):
-
-        self.discretizer = discretizer
-        self.pseudocount = pseudocount
-        self.backend = backend
-        self.verbose = verbose
-
-        self.datasets = []
-
-        self.ns2dataset_id = dict()
-
-        self.callback = functools.partial(lvd_callback_fn, lvdistiller = self)
-
-    def __enter__(self) -> None:
-        CircuitNodes.INIT_CALLBACKS.append(self.callback)
-
-    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
-        CircuitNodes.INIT_CALLBACKS.remove(self.callback)
+        raise NotImplementedError(f"Unknown LVD backend {lvdistiller.backend}.")

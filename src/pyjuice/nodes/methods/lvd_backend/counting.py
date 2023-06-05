@@ -1,8 +1,14 @@
+from __future__ import annotations
+
 import torch
 import triton
 import triton.language as tl
+import math
 
 from typing import Optional
+
+from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes
+from pyjuice.nodes.distributions import Categorical
 
 
 @triton.jit
@@ -53,3 +59,84 @@ def get_pairwise_count(data1: torch.Tensor, data2: torch.Tensor, n_cls1: torch.T
         pairwise_count = pairwise_count.reshape(n_cls1, n_cls2)
 
     return pairwise_count
+
+
+def lvd_for_input_nodes(lvdistiller, ns, lv_dataset: torch.Tensor, obs_dataset: torch.Tensor):
+    if isinstance(ns.dist, Categorical):
+        pairwise_count = get_pairwise_count(lv_dataset, obs_dataset, ns.num_nodes, ns.dist.num_cats)
+        pairwise_count = pairwise_count + lvdistiller.pseudocount
+        params = pairwise_count / (pairwise_count.sum(dim = 1, keepdim = True) + 1e-8)
+        ns.set_params(params)
+    else:
+        raise NotImplementedError(f"Input LVD function not implemented for distribution type {type(ns.dist)}.")
+
+
+def lvd_by_counting(lvdistiller, ns: CircuitNodes):
+    lv_dataset_id = lvdistiller.ns2lv_dataset_id[ns]
+    if ns.isprod():
+        for cs in ns.chs:
+            if cs not in lvdistiller.ns2lv_dataset_id:
+                lvdistiller.ns2lv_dataset_id[cs] = lv_dataset_id
+
+    # Get candidate LVD nodes
+    nodes_for_lvd = []
+    if ns.issum():
+        if any([cs in lvdistiller.ns2lv_dataset_id for cs in ns.chs]):
+            nodes_for_lvd.append(ns)
+    elif ns.isprod():
+        for cs in ns.chs:
+            if any([ccs in lvdistiller.ns2lv_dataset_id for ccs in cs.chs]):
+                nodes_for_lvd.append(cs)
+            elif cs.isinput() and cs in lvdistiller.ns2lv_dataset_id and cs in lvdistiller.ns2obs_dataset_id:
+                nodes_for_lvd.append(cs)
+    elif ns.isinput() and ns in lvdistiller.ns2lv_dataset_id and ns in lvdistiller.ns2obs_dataset_id:
+        nodes_for_lvd.append(ns)
+
+    # Run LVD by counting
+    for ns in nodes_for_lvd:
+        if ns.isinput():
+            ns_lv_dataset = lvdistiller.lv_datasets[lvdistiller.ns2lv_dataset_id[ns]]
+            ns_obs_dataset = lvdistiller.obs_datasets[lvdistiller.ns2obs_dataset_id[ns]]
+            lvd_for_input_nodes(lvdistiller, ns, ns_lv_dataset, ns_obs_dataset)
+        else:
+            assert ns.issum(), "Product nodes cannot apply LVD."
+            
+            ns_dataset = lvdistiller.lv_datasets[lvdistiller.ns2lv_dataset_id[ns]]
+            num_ch_nodes = sum([cs.num_nodes for cs in ns.chs])
+            edge_params = torch.empty([ns.num_nodes, num_ch_nodes], dtype = torch.float32, device = ns_dataset.device)
+            sid = 0
+            for cs in ns.chs:
+                eid = sid + cs.num_nodes
+                if cs in lvdistiller.ns2lv_dataset_id:
+                    cs_dataset = lvdistiller.lv_datasets[lvdistiller.ns2lv_dataset_id[cs]]
+                    pairwise_count = get_pairwise_count(ns_dataset, cs_dataset, ns.num_nodes, cs.num_nodes)
+                else:
+                    # Randomly initialize parameters
+                    pairwise_count = torch.exp(-torch.rand([ns.num_nodes, cs.num_nodes]) * 2.0)
+
+                edge_params[:,sid:eid] = pairwise_count
+
+                sid = eid
+
+            # Pruning
+            if "prune_frac" in lvdistiller.kwargs and lvdistiller.kwargs["prune_frac"] != 0.0:
+                assert 0.0 <= lvdistiller.kwargs["prune_frac"] < 1.0
+                edge_mask = ns._get_edges_as_mask()
+                num_edges_to_keep = int(math.ceil(ns.num_edges() * (1.0 - lvdistiller.kwargs["prune_frac"])))
+                edge_params[~edge_mask] = 0
+                _, indices = torch.topk(edge_params.flatten(), k = num_edges_to_keep)
+                edge_mask = torch.zeros([ns.num_nodes * ns.num_ch_nodes], dtype = torch.bool)
+                edge_mask[indices] = True
+                edge_mask = edge_mask.reshape(ns.num_nodes, ns.num_ch_nodes)
+
+                # Make sure that every node has at least one child
+                dnids = torch.where(edge_mask.sum(dim = 1) == 0)
+                amaxes = torch.argmax(edge_params[dnids,:], dim = 1)
+                edge_mask[dnids,amaxes] = True
+
+                # Update edges
+                ns._construct_edges(edge_mask)
+
+            edge_params /= pairwise_count.sum(dim = 1, keepdim = True) + 1e-8
+
+            ns.set_params(edge_params, pseudocount = lvdistiller.pseudocount)
