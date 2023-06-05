@@ -151,8 +151,6 @@ class TensorCircuit(nn.Module):
 
                 else:
                     raise ValueError(f"Unknown layer type {type(layer)}.")
-
-            a = 1
                 
         lls = self.node_mars[-1,:]
 
