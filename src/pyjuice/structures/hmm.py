@@ -6,7 +6,7 @@ from typing import Type
 from pyjuice.graph import *
 from pyjuice.layer import *
 from pyjuice.model import TensorCircuit
-from pyjuice.structures import BayesianTreeToHiddenRegionGraph
+from .compilation import BayesianTreeToHiddenRegionGraph
 
 
 def HMM(length: int, num_latents: int, 

@@ -7,7 +7,7 @@ from typing import Type
 from pyjuice.nodes.distributions import *
 from typing import Optional
 from pyjuice.model import TensorCircuit
-from pyjuice.structures import BayesianTreeToHiddenRegionGraph
+from .compilation import BayesianTreeToHiddenRegionGraph
 
 
 def mutual_information(x1: torch.Tensor, x2: torch.Tensor, num_bins: int, sigma: float):
