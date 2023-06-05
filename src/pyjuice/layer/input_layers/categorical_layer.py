@@ -261,7 +261,7 @@ class CategoricalLayer(InputLayer, nn.Module):
                     par_start = self.param_ends[n_start-1]
                     par_end = self.param_ends[n_end-1]
 
-                params[par_start:par_end] = ns._params["params"].to(params.device)
+                params[par_start:par_end] = ns._params.to(params.device)
 
             n_start = n_end
 
