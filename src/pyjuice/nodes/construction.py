@@ -17,11 +17,12 @@ ProdNodesChs = Union[SumNodes,InputNodes]
 SumNodesChs = Union[ProdNodes,InputNodes]
 
 
-def inputs(var: Union[int,Sequence[int]], num_nodes: int, dist: Distribution):
+def inputs(var: Union[int,Sequence[int]], num_nodes: int, dist: Distribution, **kwargs):
     return InputNodes(
         num_nodes = num_nodes,
         scope = [var] if isinstance(var, int) else var,
-        dist = dist
+        dist = dist,
+        **kwargs
     )
 
 
