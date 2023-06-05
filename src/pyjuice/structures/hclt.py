@@ -76,6 +76,4 @@ def HCLT(x: torch.Tensor, num_bins: int, sigma: float,
     root = nx.center(T)[0]
     root_r = BayesianTreeToHiddenRegionGraph(T, root, num_latents, input_layer_type, input_layer_params)
     
-    pc = TensorCircuit(root_r)
-    
-    return pc
+    return root_r

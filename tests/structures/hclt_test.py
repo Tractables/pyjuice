@@ -89,13 +89,14 @@ def hclt_test():
         drop_last = True
     )
 
-    pc = juice.structures.HCLT(
+    ns = juice.structures.HCLT(
         train_data.float().to(device), 
         num_bins = 32, 
         sigma = 0.5 / 32, 
         num_latents = 64, 
         chunk_size = 32
     )
+    pc = TensorCircuit(ns)
 
     pc.to(device)
 
