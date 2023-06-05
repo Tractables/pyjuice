@@ -112,6 +112,5 @@ def hclt_test():
     full_batch_em_epoch(pc, train_loader, test_loader, device)
 
 
-
 if __name__ == "__main__":
     hclt_test()

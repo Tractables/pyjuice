@@ -221,7 +221,7 @@ class CategoricalLayer(InputLayer, nn.Module):
             node_mars[sid:eid,:][~mask] = ((params[param_idxs][~mask]).clamp(min=1e-10)).log()
             node_mars[sid:eid,:][mask] = 0.0
         else:
-            node_mars[sid:eid,:] = ((params[param_idxs]).clamp(min=1e-10)).log()            
+            node_mars[sid:eid,:] = ((params[param_idxs]).clamp(min=1e-10)).log()
 
         return None
 

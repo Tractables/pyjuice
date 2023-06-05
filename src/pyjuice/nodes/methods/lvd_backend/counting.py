@@ -137,6 +137,6 @@ def lvd_by_counting(lvdistiller, ns: CircuitNodes):
                 # Update edges
                 ns._construct_edges(edge_mask)
 
-            edge_params /= pairwise_count.sum(dim = 1, keepdim = True) + 1e-8
+            edge_params /= edge_params.sum(dim = 1, keepdim = True) + 1e-8
 
             ns.set_params(edge_params, pseudocount = lvdistiller.pseudocount)

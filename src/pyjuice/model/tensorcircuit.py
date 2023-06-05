@@ -151,6 +151,8 @@ class TensorCircuit(nn.Module):
 
                 else:
                     raise ValueError(f"Unknown layer type {type(layer)}.")
+
+            a = 1
                 
         lls = self.node_mars[-1,:]
 
@@ -523,7 +525,7 @@ class TensorCircuit(nn.Module):
         # Initialize parameters
         self._init_params()
 
-    def _init_params(self, perturbation: float = 4.0):
+    def _init_params(self, perturbation: float = 4.0, pseudocount: float = 1e-6):
         params = torch.exp(torch.rand([self.num_sum_params]) * -perturbation)
 
         # Copy initial parameters if provided
@@ -539,7 +541,7 @@ class TensorCircuit(nn.Module):
             with torch.no_grad():
                 self._tie_param_flows(params)
 
-        self._normalize_parameters(params)
+        self._normalize_parameters(params, pseudocount = pseudocount)
         self.params = nn.Parameter(params)
 
         # Due to the custom inplace backward pass implementation, we do not track 
