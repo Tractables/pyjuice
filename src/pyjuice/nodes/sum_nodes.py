@@ -9,6 +9,7 @@ from functools import reduce
 from pyjuice.graph import InnerRegionNode
 from pyjuice.functional import normalize_parameters
 from .nodes import CircuitNodes
+from .prod_nodes import ProdNodes
 
 Tensor = Union[np.ndarray,torch.Tensor]
 
@@ -21,7 +22,7 @@ class SumNodes(CircuitNodes):
         super(SumNodes, self).__init__(num_nodes, rg_node, **kwargs)
 
         # Child layers
-        self.chs = chs
+        self.chs = self._standardize_chs(chs)
 
         # Total number of child circuit nodes
         self.num_ch_nodes = reduce(lambda m, n: m + n, map(lambda n: n.num_nodes, chs))
@@ -35,6 +36,21 @@ class SumNodes(CircuitNodes):
 
         # Callbacks
         self._run_init_callbacks(**kwargs)
+
+    def _standardize_chs(self, chs):
+        new_chs = []
+        for cs in chs:
+            if cs.isinput():
+                new_cs = ProdNodes(
+                    num_nodes = cs.num_nodes,
+                    chs = [cs],
+                    edge_ids = torch.arange(0, cs.num_nodes).reshape(-1, 1)
+                )
+                new_chs.append(new_cs)
+            else:
+                new_chs.append(cs)
+
+        return new_chs
 
     def _construct_edges(self, edge_ids: Optional[Union[Tensor,Sequence[Tensor]]]):
         if edge_ids is None:
@@ -61,12 +77,20 @@ class SumNodes(CircuitNodes):
         if isinstance(edge_ids, np.ndarray):
             edge_ids = torch.from_numpy(edge_ids)
 
+        if edge_ids.dim() == 2 and edge_ids.type() == torch.bool:
+            assert edge_ids.size(0) == self.num_nodes and edge_ids.size(1) == self.num_ch_nodes
+            x_ids, y_ids = torch.where(edge_ids)
+            edge_ids = torch.stack((x_ids, y_ids), dim = 0)
+
         # Sanity checks
-        assert edge_ids.size(0) == 2, "Expect edge_ids.size(0) == 2."
+        assert edge_ids.size(0) == 2, "Expect `edge_ids.size(0) == 2`."
         assert torch.all(edge_ids[0,:] >= 0) and torch.all(edge_ids[1,:] >= 0), "Edge index underflow."
         assert torch.all(edge_ids[0,:] < self.num_nodes) and torch.all(edge_ids[1,:] < self.num_ch_nodes), "Edge index overflow."
 
         self.edge_ids = edge_ids
+
+    def num_edges(self):
+        return self.edge_ids.size(1)
 
     def duplicate(self, *args, tie_params: bool = False):
         chs = []
@@ -110,8 +134,7 @@ class SumNodes(CircuitNodes):
             self._params = params.clone()
 
         elif params.dim() == 2:
-            num_ch_nodes = sum([cs.num_nodes for cs in self.chs])
-            assert params.size(0) == self.num_nodes and params.size(1) == num_ch_nodes
+            assert params.size(0) == self.num_nodes and params.size(1) == self.num_ch_nodes
 
             self._params = params[self.edge_ids[0,:],self.edge_ids[1,:]].clone().contiguous()
 
@@ -130,3 +153,9 @@ class SumNodes(CircuitNodes):
             is_root = is_root, 
             **kwargs
         )
+
+    def _get_edges_as_mask(self):
+        mask = torch.zeros([self.num_nodes, self.num_ch_nodes], dtype = torch.bool)
+        mask[self.edge_ids[0,:], self.edge_ids[1,:]] = True
+
+        return mask

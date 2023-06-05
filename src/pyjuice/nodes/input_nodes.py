@@ -23,6 +23,9 @@ class InputNodes(CircuitNodes):
         # Callbacks
         self._run_init_callbacks(**kwargs)
 
+    def num_edges(self):
+        return 0
+
     def duplicate(self, scope: Optional[Union[int,Sequence,BitSet]] = None, tie_params: bool = False):
         if scope is None:
             scope = self.scope

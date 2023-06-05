@@ -45,6 +45,9 @@ class ProdNodes(CircuitNodes):
 
         self.edge_ids = edge_ids
 
+    def num_edges(self):
+        return self.edge_ids.size(0) * self.edge_ids.size(1)
+
     def duplicate(self, *args, tie_params: bool = False):
         chs = []
         for ns in args:
