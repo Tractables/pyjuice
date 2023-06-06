@@ -530,9 +530,13 @@ class TensorCircuit(nn.Module):
         for layer in self.inner_layers:
             if isinstance(layer, SumLayer):
                 for ns in layer.nodes:
-                    if hasattr(ns, "_params") and ns._params is not None:
+                    if ns.has_params():
                         sidx, eidx = ns._param_range
-                        params[sidx:eidx] = ns._params[ns._inverse_param_ids].to(params.device)
+                        if ns.is_tied():
+                            source_ns = ns.get_source_ns()
+                            params[sidx:eidx] = source_ns._params[ns._inverse_param_ids].to(params.device)
+                        else:
+                            params[sidx:eidx] = ns._params[ns._inverse_param_ids].to(params.device)
 
         # Tie parameters
         if self.num_tied_params > 0:
@@ -562,7 +566,7 @@ class TensorCircuit(nn.Module):
                 tied_param_group_ids = self.tied_param_group_ids
             )
 
-    def _extract_params_to_rnodes(self):
+    def _extract_params_to_ns(self):
         """
         Extract all inner and input parameters from this TensorCircuit to individual nodes.
         """
@@ -572,12 +576,14 @@ class TensorCircuit(nn.Module):
         for layer in self.inner_layers:
             if layer.issum():
                 for ns in layer.nodes:
-                    sidx, eidx = ns._param_range
-                    ns._params = self.params.data[sidx:eidx].detach().cpu().clone()
+                    # Omit duplicated parameters from tied nodes
+                    if ns._source_node is None:
+                        sidx, eidx = ns._param_range
+                        ns._params = self.params.data[sidx:eidx].detach().cpu().clone()
 
         # Input nodes
         for layer in self.input_layers:
-            layer._extract_params_to_rnodes()
+            layer._extract_params_to_ns()
 
     def _create_node_layers(self):
         depth2nodes = dict()
