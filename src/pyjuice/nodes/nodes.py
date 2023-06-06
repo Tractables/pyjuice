@@ -102,8 +102,22 @@ class CircuitNodes():
         # Process all tied nodes
         for ns in visited:
             if ns._source_node is not None:
-                ns_source = ns._source_node
-                ns._params = ns_source._params.clone()
+                # Do not store parameters explicitly for tied nodes
+                # We can always retrieve them from the source nodes when required
+                ns._params = None
+
+    def is_tied(self):
+        return self._source_node is not None
+
+    def get_source_ns(self):
+        return self._source_node
+
+    def has_params(self):
+        if not self.is_tied():
+            return hasattr(self, "_params") and self._params is not None
+        else:
+            source_ns = self.get_source_ns()
+            return hasattr(source_ns, "_params") and source_ns._params is not None
 
     def __iter__(self):
         return node_iterator(self)

@@ -95,8 +95,8 @@ class SumLayer(Layer, nn.Module):
             ns._inverse_param_ids = torch.argsort(param_ids)
 
             # For tied nodes
-            if ns._source_node is not None:
-                source_ns = ns._source_node
+            if ns.is_tied():
+                source_ns = ns.get_source_ns()
                 if source_ns._tied_param_group_ids is None:
                     num_tied_param_groups = tied_param_ends[-1] if len(tied_param_ends) > 0 else 0
                     ns_param_ends = filter(lambda x: (x > ns_param_start) and (x <= ns_param_end), param_ends)
