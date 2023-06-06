@@ -6,6 +6,7 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 import warnings
+import time
 from copy import deepcopy
 from typing import Sequence, List, Optional
 
@@ -13,15 +14,16 @@ from pyjuice.nodes import SumNodes
 from .layer import Layer
 from .backend.node_partition import partition_nodes_by_n_edges
 from .backend.index_set import batched_index_set, index_cum
+from .compilation import get_sum_layer_stats, sum_layer_forward_compilation, \
+                         sum_layer_backward_compilation
 
 
 class SumLayer(Layer, nn.Module):
 
-    def __init__(self, nodes: Sequence[SumNodes], cum_nodes: int, 
+    def __init__(self, nodes: Sequence[SumNodes], global_node_start: int, 
                  param_ends: Sequence, tied_param_ids: Sequence,
                  tied_param_group_ids: Sequence, tied_param_ends: Sequence,
-                 ch_prod_layer_size: int, sum_region_start_id: int = 0,
-                 max_num_groups: int = 1) -> None:
+                 ch_prod_layer_size: int, max_num_groups: int = 1) -> None:
 
         Layer.__init__(self)
         nn.Module.__init__(self)
@@ -30,74 +32,38 @@ class SumLayer(Layer, nn.Module):
 
         self.nodes = nodes
 
-        layer_num_nodes = 0
-        total_num_edges = 0
-        max_n_chs = 0
-        for ns_idx, ns in enumerate(self.nodes):
-            n_chs = torch.max(torch.bincount(ns.edge_ids[0,:])).item()
-            if n_chs > max_n_chs:
-                max_n_chs = n_chs
-            ns._output_ind_range = (cum_nodes, cum_nodes + ns.num_nodes)
-            cum_nodes += ns.num_nodes
-            layer_num_nodes += ns.num_nodes
-            total_num_edges += ns.edge_ids.size(1)
+        ## Get layer statistics & prepare for compilation ##
+
+        layer_num_nodes, layer_num_edges, max_n_chs = get_sum_layer_stats(self.nodes, global_node_start)
 
         self.num_nodes = layer_num_nodes
-        self.num_params = total_num_edges
+        self.num_params = layer_num_edges
 
         self.ch_prod_layer_size = ch_prod_layer_size
 
         ## Initialize forward pass ##
 
-        n_start_id = cum_nodes - self.num_nodes
-        nids = torch.arange(cum_nodes - self.num_nodes, cum_nodes) # Node id
-        cids = torch.zeros([self.num_nodes, max_n_chs], dtype = torch.long) # Child id
-        pids = torch.zeros([self.num_nodes, max_n_chs], dtype = torch.long) # Parameter id
-        n_chs = torch.zeros([self.num_nodes], dtype = torch.long) # Number of children
-        ch_n_pars = torch.zeros([self.ch_prod_layer_size], dtype = torch.long) # Number of parents for each child node
-        node_start = 0
-        param_start = param_ends[-1]
-        for ns_idx, ns in enumerate(self.nodes):
+        # nids:      [num_nodes]            stores node ids
+        nids = torch.arange(global_node_start, global_node_start + self.num_nodes) # Node id
 
-            param_ids = torch.zeros([ns.edge_ids.size(1)], dtype = torch.long)
-            ns_param_start = param_start
+        # cids:      [num_nodes, max_n_chs] stores indices of child nodes
+        # pids:      [num_nodes, max_n_chs] stores indices of edge parameters
+        # n_chs:     [num_nodes]            stores the number of child nodes of each node
+        # ch_n_pars: [ch_prod_layer_size]   stores the number of parents for each child node
+        cids, pids, n_chs, ch_n_pars, dummy_param_ends = sum_layer_forward_compilation(
+            self.nodes, max_n_chs, ch_prod_layer_size, param_ends = param_ends
+        )
 
-            node_end = node_start + ns.num_nodes
-
-            for nid in range(ns.num_nodes):
-                ch_start = 0
-                local_cumchs = 0
-                for c in ns.chs:
-                    criterion = (ns.edge_ids[1,:] >= local_cumchs) & (ns.edge_ids[1,:] < local_cumchs + c.num_nodes) & \
-                                (ns.edge_ids[0,:] == nid)
-                    local_cumchs += c.num_nodes
-
-                    ch_ids = ns.edge_ids[1,criterion] + c._output_ind_range[0]
-                    cids[node_start+nid,ch_start:ch_start+ch_ids.size(0)] = ch_ids
-                    ch_start += ch_ids.size(0)
-
-                    ch_n_pars[ch_ids] += 1
-
-                    ids = torch.where(criterion)
-                    param_ids[ids] = torch.arange(param_start + ch_start - ch_ids.size(0), param_start + ch_start)
-
-                pids[node_start+nid,:ch_start] = torch.arange(param_start, param_start + ch_start, dtype = torch.long)
-                param_start += ch_start
-                param_ends.append(param_start)
-
-                n_chs[node_start+nid] = ch_start
-
-            node_start = node_end
-
-            ns_param_end = param_start
-            ns._param_range = (ns_param_start, ns_param_end)
-            ns._param_ids = param_ids
-            ns._inverse_param_ids = torch.argsort(param_ids)
-
-            # For tied nodes
+        # For parameter tying: assign tied parameters to the same group
+        # `tied_param_ids` contains the parameter indices to be tied, and `tied_param_group_ids` 
+        # refers to the corresponding group ids `tied_param_ends` contains the last edge id for 
+        # all tied nodes
+        for ns in self.nodes:
             if ns.is_tied():
                 source_ns = ns.get_source_ns()
                 if source_ns._tied_param_group_ids is None:
+                    ns_param_start, ns_param_end = ns._param_range
+
                     num_tied_param_groups = tied_param_ends[-1] if len(tied_param_ends) > 0 else 0
                     ns_param_ends = filter(lambda x: (x > ns_param_start) and (x <= ns_param_end), param_ends)
                     ns_param_ends = map(lambda x: x - ns_param_start + num_tied_param_groups, ns_param_ends)
@@ -145,31 +111,13 @@ class SumLayer(Layer, nn.Module):
         max_n_pars = torch.max(ch_n_pars)
         tot_n_pars = torch.sum(ch_n_pars[1:]) # Exclude the dummy node
 
-        parids = torch.zeros([self.ch_prod_layer_size, max_n_pars], dtype = torch.long) # Indices of parent nodes for each child node
-        parpids = torch.zeros([self.ch_prod_layer_size, max_n_pars], dtype = torch.long) # Parameter indices for these edges
-        # For each edge, this matrix stores the index of the edge for the parent
-        parcids = torch.zeros([self.ch_prod_layer_size, max_n_pars], dtype = torch.long) 
-        par_counts = torch.zeros([self.ch_prod_layer_size], dtype = torch.long)
-        node_start = 0
-        for ns in self.nodes:
-            node_end = node_start + ns.num_nodes
-            for nid in range(ns.num_nodes):
-                ch_start = 0
-                local_cumchs = 0
-                for cnode_id, c in enumerate(ns.chs):
-                    criterion = (ns.edge_ids[1,:] >= local_cumchs) & (ns.edge_ids[1,:] < local_cumchs + c.num_nodes) & \
-                                (ns.edge_ids[0,:] == nid)
-                    local_cumchs += c.num_nodes
-
-                    ch_ids = ns.edge_ids[1,criterion] + c._output_ind_range[0]
-                    parids[ch_ids, par_counts[ch_ids]] = n_start_id + node_start + nid
-                    parpids[ch_ids, par_counts[ch_ids]] = pids[node_start+nid,:len(ch_ids)]
-                    parcids[ch_ids, par_counts[ch_ids]] = torch.arange(ch_start, ch_start + ch_ids.size(0))
-
-                    par_counts[ch_ids] += 1
-                    ch_start += criterion.size(0)
-
-            node_start = node_end
+        # parids:     [prod_layer_size, max_n_pars]  stores parameter ids for each child node
+        # parpids:    [prod_layer_size, max_n_pars]  param id for the edges correspond to `parids`
+        # parcids:    [prod_layer_size, max_n_pars]  index of the edge for the parent (its `i`th child)
+        # par_counts: [prod_layer_size]              number of parents
+        parids, parpids, parcids, par_counts = sum_layer_backward_compilation(
+            self.nodes, pids, self.ch_prod_layer_size, max_n_pars, global_node_start
+        )
 
         # Find a good strategy to partition the child nodes into groups according to their number of parents 
         # to minimize total computation cost
@@ -218,6 +166,7 @@ class SumLayer(Layer, nn.Module):
 
             min_n_pars = max_n_pars + 1
 
+        # Store parameters
         self.num_backward_groups = par_group_sizes.shape[0]
         self.grouped_chids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in grouped_chids])
         self.grouped_parids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in grouped_parids])

@@ -474,7 +474,7 @@ class TensorCircuit(nn.Module):
                 # Sum layer
                 sum_layer = SumLayer(
                     nodes = depth2nodes[depth]["sum"],
-                    cum_nodes = num_nodes, 
+                    global_node_start = num_nodes, 
                     param_ends = param_ends, 
                     tied_param_ids = tied_param_ids,
                     tied_param_group_ids = tied_param_group_ids,
