@@ -86,7 +86,7 @@ class SumLayer(Layer, nn.Module):
                 param_ends.append(param_start)
 
                 n_chs[node_start+nid] = ch_start
-                
+
             node_start = node_end
 
             ns_param_end = param_start

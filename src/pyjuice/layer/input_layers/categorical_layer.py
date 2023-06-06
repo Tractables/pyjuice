@@ -11,7 +11,7 @@ from typing import Sequence, Dict, Optional
 from pyjuice.nodes import InputNodes
 from pyjuice.nodes.distributions import Categorical
 from pyjuice.layer.input_layer import InputLayer
-from pyjuice.functional import normalize_parameters, tie_param_flows
+from pyjuice.functional import normalize_parameters
 
 # Try to enable tensor cores
 torch.set_float32_matmul_precision('high')
@@ -185,25 +185,11 @@ class CategoricalLayer(InputLayer, nn.Module):
 
     def mini_batch_em(self, step_size: float, pseudocount: float = 0.0):
         if not self._used_external_params:
-            # Tie parameter flows if necessary
-            if self.num_tied_params > 0:
-                with torch.no_grad():
-                    self._tie_param_flows(self.param_flows)
-
             # Normalize and update parameters
             with torch.no_grad():
                 flows = self.param_flows
                 self._normalize_parameters(flows, pseudocount = pseudocount)
                 self.params.data = (1.0 - step_size) * self.params.data + step_size * flows
-
-    def _tie_param_flows(self, param_flows):
-        if param_flows is not None:
-            tie_param_flows(
-                param_flows = param_flows, 
-                num_tied_params = self.num_tied_params, 
-                tied_param_ids = self.tied_param_ids, 
-                tied_param_group_ids = self.tied_param_group_ids
-            )
 
     def get_param_specs(self):
         return {"params": torch.Size([self.params.size(0)])}

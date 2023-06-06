@@ -96,7 +96,7 @@ def hclt_test():
         num_latents = 64, 
         chunk_size = 32
     )
-    pc = TensorCircuit(ns)
+    pc = juice.TensorCircuit(ns)
 
     pc.to(device)
 
