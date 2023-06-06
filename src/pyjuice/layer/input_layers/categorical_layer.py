@@ -21,6 +21,9 @@ class CategoricalLayer(InputLayer, nn.Module):
     
     def __init__(self, nodes: Sequence[InputNodes], cum_nodes: int = 0) -> None:
         nn.Module.__init__(self)
+
+        # Reorder input nodes such that for any tied nodes, its source nodes appear before them
+        nodes = self._reorder_nodes(nodes)
         InputLayer.__init__(self, nodes)
 
         # Parse input `nodes`
@@ -28,9 +31,6 @@ class CategoricalLayer(InputLayer, nn.Module):
         self.node_sizes = []
         self.node_num_cats = []
         self.param_ends = []
-        tied_param_ids = []
-        tied_param_group_ids = []
-        self.num_tied_params = 0
         layer_num_nodes = 0
         cum_params = 0
         for ns in self.nodes:
@@ -45,35 +45,17 @@ class CategoricalLayer(InputLayer, nn.Module):
             cum_nodes += ns.num_nodes
             layer_num_nodes += ns.num_nodes
 
-            for nid in range(1, ns.num_nodes + 1):
-                self.param_ends.append(cum_params + ns.dist.num_cats * nid)
-            cum_params += ns.num_nodes * ns.dist.num_cats
-            ns._param_range = (cum_params - ns.num_nodes * ns.dist.num_cats, cum_params)
-
-            if ns._source_node is not None:
-                source_ns = ns._source_node
-                if source_ns._tied_param_group_ids is None:
-
-                    num_source_params = source_ns._param_range[1] - source_ns._param_range[0] + 1
-                    source_ns._tied_param_group_ids = [i for i in range(self.num_tied_params, self.num_tied_params + num_source_params - 1)]
-
-                    tied_param_ids.extend([i for i in range(source_ns._param_range[0], source_ns._param_range[1])])
-                    tied_param_group_ids.extend(source_ns._tied_param_group_ids)
-
-                    self.num_tied_params += ns.num_nodes * ns.dist.num_cats
-
-                ns._tied_param_group_ids = deepcopy(source_ns._tied_param_group_ids)
-                tied_param_ids.extend([i for i in range(ns._param_range[0], ns._param_range[1])])
-                tied_param_group_ids.extend(ns._tied_param_group_ids)
+            if not ns.is_tied():
+                for nid in range(1, ns.num_nodes + 1):
+                    self.param_ends.append(cum_params + ns.dist.num_cats * nid)
+                cum_params += ns.num_nodes * ns.dist.num_cats
+                ns._param_range = (cum_params - ns.num_nodes * ns.dist.num_cats, cum_params)
+            else:
+                source_ns = ns.get_source_ns()
+                ns._param_range = deepcopy(source_ns._param_range)
 
         self._output_ind_range = (cum_nodes - layer_num_nodes, cum_nodes)
         self.param_ends = torch.tensor(self.param_ends)
-
-        if self.num_tied_params > 0:
-            tied_param_ids = torch.tensor(tied_param_ids)
-            tied_param_group_ids = torch.tensor(tied_param_group_ids)
-            self.register_buffer("tied_param_ids", tied_param_ids)
-            self.register_buffer("tied_param_group_ids", tied_param_group_ids)
 
         self.num_params = cum_params
         self.num_nodes = layer_num_nodes
@@ -81,16 +63,32 @@ class CategoricalLayer(InputLayer, nn.Module):
         # Construct layered
         vids = torch.empty([self.num_nodes], dtype = torch.long)
         psids = torch.empty([self.num_nodes], dtype = torch.long)
-        n_start = 0
+        n_start, pn_start = 0, 0
+        ns2pnrange = dict()
         for idx, ns in enumerate(self.nodes):
             n_end = n_start + ns.num_nodes
             vids[n_start:n_end] = self.vars[idx]
 
-            if idx == 0:
-                psids[0] = 0
-                psids[1:n_end] = self.param_ends[0:n_end-1].clone().detach()
+            if not ns.is_tied():
+                pn_end = pn_start + ns.num_nodes
+
+                if idx == 0:
+                    psids[0] = 0
+                    psids[1:n_end] = self.param_ends[0:pn_end-1].clone().detach()
+                    ns2pnrange[ns] = (-1, pn_end)
+                else:
+                    psids[n_start:n_end] = self.param_ends[pn_start-1:pn_end-1].clone().detach()
+                    ns2pnrange[ns] = (pn_start, pn_end)
+
+                pn_start = pn_end
             else:
-                psids[n_start:n_end] = self.param_ends[n_start-1:n_end-1].clone().detach()
+                source_ns = ns.get_source_ns()
+                pns, pne = ns2pnrange[source_ns]
+                if pns == -1:
+                    psids[n_start] = 0
+                    psids[n_start+1:n_end] = self.param_ends[0:pne-1].clone().detach()
+                else:
+                    psids[n_start:n_end] = self.param_ends[pns-1:pne-1].clone().detach()
 
             n_start = n_end
 
@@ -249,26 +247,22 @@ class CategoricalLayer(InputLayer, nn.Module):
         """
         params = torch.exp(torch.rand([self.num_params]) * -perturbation)
         
-        n_start = 0
+        pn_start = 0
         for idx, ns in enumerate(self.nodes):
-            n_end = n_start + ns.num_nodes
+            if not ns.is_tied():
+                pn_end = pn_start + ns.num_nodes
 
-            if hasattr(ns, "_params") and ns._params is not None:
-                if idx == 0:
-                    par_start = 0
-                    par_end = self.param_ends[n_end-1]
-                else:
-                    par_start = self.param_ends[n_start-1]
-                    par_end = self.param_ends[n_end-1]
+                if ns.has_params():
+                    if idx == 0:
+                        par_start = 0
+                        par_end = self.param_ends[pn_end-1]
+                    else:
+                        par_start = self.param_ends[pn_start-1]
+                        par_end = self.param_ends[pn_end-1]
 
-                params[par_start:par_end] = ns._params.to(params.device)
+                    params[par_start:par_end] = ns._params.to(params.device)
 
-            n_start = n_end
-
-        # Tie parameters
-        if self.num_tied_params > 0:
-            with torch.no_grad():
-                self._tie_param_flows(params)
+                pn_start = pn_end
 
         self._normalize_parameters(params)
         self.params = nn.Parameter(params)
@@ -277,25 +271,47 @@ class CategoricalLayer(InputLayer, nn.Module):
         # gradient of PC parameters by PyTorch.
         self.params.requires_grad = False
 
-    def _extract_params_to_rnodes(self):
+    def _extract_params_to_ns(self):
         n_start = 0
-        for idx, rnode in enumerate(self.region_nodes):
-            n_end = n_start + rnode.num_nodes
+        for idx, ns in enumerate(self.nodes):
+            if ns.is_tied():
+                continue
+
+            n_end = n_start + ns.num_nodes
 
             if idx == 0:
                 par_start = 0
                 par_end = self.param_ends[n_end-1]
-
-                param_ends = self.param_ends[0:n_end]
             else:
                 par_start = self.param_ends[n_start-1]
                 par_end = self.param_ends[n_end-1]
 
-                param_ends = self.param_ends[n_start:n_end] - par_start
-
-            rnode._params = {
-                "params": self.params.data[par_start:par_end].detach().cpu().clone(),
-                "param_ends": param_ends.detach().cpu().clone()
-            }
+            ns._params = self.params.data[par_start:par_end].detach().cpu().clone()
 
             n_start = n_end
+
+    def _reorder_nodes(self, nodes):
+        node_set = set(nodes)
+        reordered_nodes = []
+        added_node_set = set()
+        for ns in nodes:
+            if ns in added_node_set:
+                continue
+            if not ns.is_tied():
+                reordered_nodes.append(ns)
+                added_node_set.add(ns)
+            else:
+                source_ns = ns.get_source_ns()
+                if source_ns in added_node_set:
+                    reordered_nodes.append(ns)
+                    added_node_set.add(ns)
+                elif source_ns in node_set:
+                    reordered_nodes.extend([source_ns, ns])
+                    added_node_set.add(ns)
+                    added_node_set.add(source_ns)
+                else:
+                    raise ValueError("A tied `InputNodes` should be in the same layer with its source nodes.")
+
+        assert len(reordered_nodes) == len(nodes), "Total node length should not change after reordering."
+
+        return reordered_nodes

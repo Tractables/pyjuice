@@ -79,7 +79,17 @@ def tie_input_nodes_test():
     m = juice.multiply(i0, i1)
     n = juice.summate(m, num_nodes = 1)
 
+    n.init_parameters()
+
+    assert i1.is_tied()
+    assert i1.get_source_ns() == i0
+
     pc = juice.TensorCircuit(n)
+
+    assert torch.all(pc.input_layers[0].vids == torch.tensor([0,0,1,1]))
+    assert torch.all(pc.input_layers[0].psids == torch.tensor([0,5,0,5]))
+    assert torch.all((pc.input_layers[0].params - i0._params).abs() < 1e-6)
+
     pc.to(device)
 
     data = torch.randint(0, 5, [16, 2]).to(device)
@@ -88,16 +98,22 @@ def tie_input_nodes_test():
 
     pc.backward(data)
 
-    aaa = pc.input_layers[0].param_flows[:10].clone()
-    bbb = pc.input_layers[0].param_flows[10:].clone()
+    dids = data.clone().cpu()
+    m1p = i0._params[dids[:,0]] * i0._params[dids[:,1]]
+    m2p = i0._params[dids[:,0]+5] * i0._params[dids[:,1]+5]
+    log_np = torch.log(m1p * n._params[0] + m2p * n._params[1])
 
-    pc.input_layers[0]._tie_param_flows(pc.input_layers[0].param_flows)
+    assert torch.all((log_np - lls.cpu()).abs() < 1e-6)
 
-    ccc = pc.input_layers[0].param_flows[:10]
-    ddd = pc.input_layers[0].param_flows[10:]
+    m1f = m1p * n._params[0] / (m1p * n._params[0] + m2p * n._params[1])
+    m2f = m2p * n._params[1] / (m1p * n._params[0] + m2p * n._params[1])
 
-    assert torch.abs(aaa + bbb - ccc).max() < 1e-6
-    assert torch.abs(aaa + bbb - ddd).max() < 1e-6
+    assert torch.all((m1f - pc.node_flows[3,:].cpu()).abs() < 1e-6)
+    assert torch.all((m2f - pc.node_flows[4,:].cpu()).abs() < 1e-6)
+
+    for i in range(5):
+        assert (pc.input_layers[0].param_flows[i] - m1f[dids[:,0] == i].sum() - m1f[dids[:,1] == i].sum()).abs() < 1e-3
+        assert (pc.input_layers[0].param_flows[i+5] - m2f[dids[:,0] == i].sum() - m2f[dids[:,1] == i].sum()).abs() < 1e-3
 
 
 if __name__ == "__main__":
