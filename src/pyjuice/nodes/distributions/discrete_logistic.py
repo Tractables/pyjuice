@@ -14,10 +14,10 @@ class DiscreteLogistic(Distribution):
 
         self.bin_size = (self.input_range[1] - self.input_range[0]) / self.bin_count
 
-    def raw2processed_params(self, params: torch.Tensor):
+    def raw2processed_params(self, num_nodes: int, params: torch.Tensor):
         return params
 
-    def processed2raw_params(self, params: torch.Tensor):
+    def processed2raw_params(self, num_nodes: int, params: torch.Tensor):
         return params
 
     def init_parameters(num_nodes: int, perturbation: float, **kwargs):
