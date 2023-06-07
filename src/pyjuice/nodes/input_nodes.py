@@ -28,6 +28,7 @@ class InputNodes(CircuitNodes):
         # Callbacks
         self._run_init_callbacks(**kwargs)
 
+    @property
     def num_edges(self):
         return 0
 

@@ -45,6 +45,7 @@ class ProdNodes(CircuitNodes):
 
         self.edge_ids = edge_ids
 
+    @property
     def num_edges(self):
         return self.edge_ids.size(0) * self.edge_ids.size(1)
 

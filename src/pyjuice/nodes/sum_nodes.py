@@ -89,6 +89,7 @@ class SumNodes(CircuitNodes):
 
         self.edge_ids = edge_ids
 
+    @property
     def num_edges(self):
         return self.edge_ids.size(1)
 
@@ -117,6 +118,8 @@ class SumNodes(CircuitNodes):
         return SumNodes(self.num_nodes, chs, edge_ids, params = params, source_node = self if tie_params else None)
 
     def get_params(self):
+        if not hasattr(self, "_params"):
+            return None
         return self._params
 
     def set_params(self, params: torch.Tensor, normalize: bool = False, pseudocount: float = 0.1):
