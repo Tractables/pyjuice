@@ -533,6 +533,7 @@ class TensorCircuit(nn.Module):
                     if ns.has_params():
                         sidx, eidx = ns._param_range
                         if ns.is_tied():
+                            # Retrieve tied parameters from the source node
                             source_ns = ns.get_source_ns()
                             params[sidx:eidx] = source_ns._params[ns._inverse_param_ids].to(params.device)
                         else:

@@ -108,9 +108,10 @@ class SumNodes(CircuitNodes):
 
         edge_ids = self.edge_ids.clone()
 
-        if hasattr(self, "_params") and self._params is not None:
+        if hasattr(self, "_params") and self._params is not None and not tie_params:
             params = self._params.clone()
         else:
+            # We also do not copy parameters explicitly if this is a tied node
             params = None
 
         return SumNodes(self.num_nodes, chs, edge_ids, params = params, source_node = self if tie_params else None)
