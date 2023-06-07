@@ -30,6 +30,7 @@ def _partition_nodes_dp_simple(nodes_n_edges: np.ndarray, dp: np.ndarray, backtr
 
     # Choose number of groups
     n_group = np.min(np.where(dp[-1,1:] <= dp[-1,-1] * 1.05)[0]) + 1
+    overhead = dp[-1,n_group]
 
     # Backtrace
     partitions = np.zeros([n_group], dtype = np.int64)
@@ -38,7 +39,7 @@ def _partition_nodes_dp_simple(nodes_n_edges: np.ndarray, dp: np.ndarray, backtr
         partitions[n-1] = i
         i = backtrace[i,n_group]
 
-    return np.unique(nodes_n_edges[partitions])
+    return np.unique(nodes_n_edges[partitions]), overhead
 
 
 def partition_nodes_by_n_edges(node_n_edges: Union[np.ndarray, torch.Tensor], max_num_groups: int, algorithm: str = "dp_simple"):
@@ -59,6 +60,11 @@ def partition_nodes_by_n_edges(node_n_edges: Union[np.ndarray, torch.Tensor], ma
     if algorithm == "dp_simple":
         dp = np.zeros([node_n_edges.shape[0], max_num_groups + 1], dtype = np.int64)
         backtrace = np.zeros([node_n_edges.shape[0], max_num_groups + 1], dtype = np.int64)
-        return _partition_nodes_dp_simple(node_n_edges, dp, backtrace, max_num_groups)
+        group_sizes, overhead = _partition_nodes_dp_simple(node_n_edges, dp, backtrace, max_num_groups)
     else:
         raise ValueError(f"Unknown algorithm {algorithm} for `partition_nodes_by_n_edges`.")
+
+    if isinstance(group_sizes, np.ndarray):
+        group_sizes = torch.from_numpy(group_sizes)
+
+    return group_sizes

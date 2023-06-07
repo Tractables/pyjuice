@@ -10,7 +10,7 @@ from typing import Optional, Sequence
 
 from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes, foreach
 from pyjuice.layer import Layer, InputLayer, ProdLayer, SumLayer, layerize
-from pyjuice.functional import normalize_parameters, tie_param_flows, flat_softmax_fw, flat_softmax_bp
+from pyjuice.functional import normalize_parameters, flat_softmax_fw, flat_softmax_bp
 from pyjuice.utils.grad_fns import ReverseGrad, PseudoHookFunc
 
 
@@ -321,11 +321,6 @@ class TensorCircuit(nn.Module):
         
         # Only apply parameter update if external parameters are not used in the previous forward/backward pass
         if not self._used_external_sum_params:
-            # Tie parameter flows if necessary
-            if self.num_tied_params > 0:
-                with torch.no_grad():
-                    self._tie_param_flows(self.param_flows)
-
             # Normalize and update parameters
             with torch.no_grad():
                 flows = self.param_flows
@@ -422,6 +417,7 @@ class TensorCircuit(nn.Module):
                      init_inner_params: Optional[torch.Tensor] = None,
                      max_num_groups: int = 1):
 
+        self.root_nodes._clear_tensor_circuit_hooks()
         depth2nodes, num_layers = self._create_node_layers()
 
         if hasattr(self, "input_layers") or hasattr(self, "inner_layers"):
@@ -474,7 +470,7 @@ class TensorCircuit(nn.Module):
                 # Sum layer
                 sum_layer = SumLayer(
                     nodes = depth2nodes[depth]["sum"],
-                    global_node_start = num_nodes, 
+                    global_nid_start = num_nodes, 
                     param_ends = param_ends, 
                     tied_param_ids = tied_param_ids,
                     tied_param_group_ids = tied_param_group_ids,
@@ -539,11 +535,6 @@ class TensorCircuit(nn.Module):
                         else:
                             params[sidx:eidx] = ns._params[ns._inverse_param_ids].to(params.device)
 
-        # Tie parameters
-        if self.num_tied_params > 0:
-            with torch.no_grad():
-                self._tie_param_flows(params)
-
         self._normalize_parameters(params, pseudocount = pseudocount)
         self.params = nn.Parameter(params)
 
@@ -557,15 +548,6 @@ class TensorCircuit(nn.Module):
     def _normalize_parameters(self, params, pseudocount: float = 0.0):
         if params is not None:
             normalize_parameters(params, self.node_ids, self.node_nchs, pseudocount)
-
-    def _tie_param_flows(self, param_flows):
-        if param_flows is not None:
-            tie_param_flows(
-                param_flows = param_flows, 
-                num_tied_params = self.num_tied_params, 
-                tied_param_ids = self.tied_param_ids, 
-                tied_param_group_ids = self.tied_param_group_ids
-            )
 
     def _extract_params_to_ns(self):
         """
