@@ -49,8 +49,9 @@ class CircuitNodes():
         self._params = None
 
         # Source nodes it points to (for parameter tying)
-        while source_node._source_node is not None:
-            source_node = source_node._source_node
+        if source_node is not None:
+            while source_node._source_node is not None:
+                source_node = source_node._source_node
         self._source_node = source_node
 
         self._tied_param_group_ids = None
@@ -117,6 +118,23 @@ class CircuitNodes():
         else:
             source_ns = self.get_source_ns()
             return hasattr(source_ns, "_params") and source_ns._params is not None
+
+    def _clear_tensor_circuit_hooks(self, recursive: bool = True):
+        if recursive:
+            for ns in self:
+                if hasattr(ns, "_param_range"):
+                    ns._param_range = None
+                if hasattr(ns, "_param_ids"):
+                    ns._param_ids = None
+                if hasattr(ns, "_inverse_param_ids"):
+                    ns._inverse_param_ids = None
+        else:
+            if hasattr(self, "_param_range"):
+                self._param_range = None
+            if hasattr(self, "_param_ids"):
+                self._param_ids = None
+            if hasattr(self, "_inverse_param_ids"):
+                self._inverse_param_ids = None
 
     def __iter__(self):
         return node_iterator(self)
