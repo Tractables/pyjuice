@@ -49,9 +49,8 @@ class CircuitNodes():
         self._params = None
 
         # Source nodes it points to (for parameter tying)
-        if source_node is not None:
-            while source_node._source_node is not None:
-                source_node = source_node._source_node
+        while source_node._source_node is not None:
+            source_node = source_node._source_node
         self._source_node = source_node
 
         self._tied_param_group_ids = None

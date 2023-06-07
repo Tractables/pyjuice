@@ -122,9 +122,6 @@ class SumNodes(CircuitNodes):
     def set_params(self, params: torch.Tensor, normalize: bool = False, pseudocount: float = 0.1):
         if self._source_node is not None:
             ns_source = self._source_node
-            while ns_source._source_node is not None:
-                ns_source = ns_source._source_node
-
             ns_source.set_params(params, normalize = normalize, pseudocount = pseudocount)
 
             return None
