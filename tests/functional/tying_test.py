@@ -55,16 +55,20 @@ def tie_sum_nodes_test():
 
     pc.backward(data)
 
-    aaa = pc.param_flows[1:5].clone()
-    bbb = pc.param_flows[5:9].clone()
+    f11 = (torch.exp(pc.node_mars[1,:] + pc.node_mars[3,:] + torch.log(pc.params[1]) - pc.node_mars[9,:]) * pc.node_flows[9,:]).sum()
+    f12 = (torch.exp(pc.node_mars[2,:] + pc.node_mars[4,:] + torch.log(pc.params[2]) - pc.node_mars[9,:]) * pc.node_flows[9,:]).sum()
+    f13 = (torch.exp(pc.node_mars[1,:] + pc.node_mars[3,:] + torch.log(pc.params[3]) - pc.node_mars[10,:]) * pc.node_flows[10,:]).sum()
+    f14 = (torch.exp(pc.node_mars[2,:] + pc.node_mars[4,:] + torch.log(pc.params[4]) - pc.node_mars[10,:]) * pc.node_flows[10,:]).sum()
+    
+    f21 = (torch.exp(pc.node_mars[5,:] + pc.node_mars[7,:] + torch.log(pc.params[1]) - pc.node_mars[11,:]) * pc.node_flows[11,:]).sum()
+    f22 = (torch.exp(pc.node_mars[6,:] + pc.node_mars[8,:] + torch.log(pc.params[2]) - pc.node_mars[11,:]) * pc.node_flows[11,:]).sum()
+    f23 = (torch.exp(pc.node_mars[5,:] + pc.node_mars[7,:] + torch.log(pc.params[3]) - pc.node_mars[12,:]) * pc.node_flows[12,:]).sum()
+    f24 = (torch.exp(pc.node_mars[6,:] + pc.node_mars[8,:] + torch.log(pc.params[4]) - pc.node_mars[12,:]) * pc.node_flows[12,:]).sum()
 
-    pc._tie_param_flows(pc.param_flows)
-
-    ccc = pc.param_flows[1:5].clone()
-    ddd = pc.param_flows[5:9].clone()
-
-    assert torch.abs(aaa + bbb - ccc).max() < 1e-6
-    assert torch.abs(aaa + bbb - ddd).max() < 1e-6
+    assert torch.abs(f11 + f21 - pc.param_flows[1]) < 1e-4
+    assert torch.abs(f12 + f22 - pc.param_flows[2]) < 1e-4
+    assert torch.abs(f13 + f23 - pc.param_flows[3]) < 1e-4
+    assert torch.abs(f14 + f24 - pc.param_flows[4]) < 1e-4
 
 
 def tie_input_nodes_test():
