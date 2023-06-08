@@ -14,7 +14,7 @@ from .layer import Layer
 from .backend.node_partition import partition_nodes_by_n_edges
 from .backend.index_set import batched_index_set, index_cum
 from .compilation import get_sum_layer_stats, sum_layer_forward_compilation, \
-                         sum_layer_backward_compilation
+                         sum_layer_backward_compilation, next_power_of_2
 
 
 class SumLayer(Layer, nn.Module):
@@ -47,6 +47,10 @@ class SumLayer(Layer, nn.Module):
         fw_group_max_chs = partition_nodes_by_n_edges(
             n_chs, sparsity_tolerance = layer_sparsity_tol, max_num_groups = max_num_groups
         )
+
+        # Since the triton kernels require the maximum number children for each group to be a power of 2,
+        # we postprocess the group sizes
+        fw_group_max_chs = torch.unique(next_power_of_2(fw_group_max_chs))
         
         self.num_fw_groups = len(fw_group_max_chs) # Number of groups
 
@@ -93,6 +97,10 @@ class SumLayer(Layer, nn.Module):
         bk_group_max_pars = partition_nodes_by_n_edges(
             ch_n_pars, sparsity_tolerance = layer_sparsity_tol, max_num_groups = max_num_groups
         )
+
+        # Since the triton kernels require the maximum number children for each group to be a power of 2,
+        # we postprocess the group sizes
+        bk_group_max_pars = torch.unique(next_power_of_2(bk_group_max_pars))
 
         self.num_bk_groups = len(bk_group_max_pars) # Number of groups
 
@@ -289,7 +297,7 @@ class SumLayer(Layer, nn.Module):
 
         ch_mars = element_mars[cids]
         maxval = ch_mars.max(dim = 1, keepdim = True).values
-        node_mars[nids] = (((ch_mars - maxval).exp() * params[pids]).sum(
+        node_mars[nids] = (((ch_mars - maxval).exp() * params[pids].unsqueeze(-1)).sum(
             dim = 1).clamp(min = 1e-10)).log() + maxval.squeeze(1)
 
         return None
