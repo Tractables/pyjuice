@@ -296,7 +296,8 @@ class SumLayer(Layer, nn.Module):
 
     def _forward_triton(self, node_mars: torch.Tensor, element_mars: torch.Tensor, 
                         params: torch.Tensor, nids: torch.Tensor, cids: torch.Tensor,
-                        pids: torch.Tensor, BLOCK_SIZE = 2**12, MAX_BLOCK_M = 2**12, MAX_BLOCK_N = 64) -> None:
+                        pids: torch.Tensor, BLOCK_M_HARD_LIMIT = 2**16, BLOCK_SIZE = 2**12, 
+                        MAX_BLOCK_M = 2**12, MAX_BLOCK_N = 64) -> None:
         """
         This function is equivalent to running:
         ``` 
@@ -324,17 +325,23 @@ class SumLayer(Layer, nn.Module):
             params = params.squeeze(1)
 
         # Fall back to the `torch.compile` kernel in the case where we cannot store child edges within a single block
-        if n_edges > MAX_BLOCK_M:
+        if n_edges > BLOCK_M_HARD_LIMIT:
             self._forward_pytorch_kernel(node_mars, element_mars, params, nids, cids, pids)
 
             return None
 
-        assert n_edges <= MAX_BLOCK_M, "Number of edges should be smaller than or equal to MAX_BLOCK_M."
+        assert n_edges <= BLOCK_M_HARD_LIMIT, f"Number of edges should be smaller than or equal to {BLOCK_M_HARD_LIMIT}."
         assert params.dim() == 1, "Expecting a 1D `params`."
 
-        MIN_BLOCK_M = min(triton.next_power_of_2(n_edges), MAX_BLOCK_M)
-        BLOCK_N = min(BLOCK_SIZE // MIN_BLOCK_M, MAX_BLOCK_N, triton.next_power_of_2(batch_size))
-        BLOCK_M = min(BLOCK_SIZE // BLOCK_N, MAX_BLOCK_M)
+        if n_edges <= MAX_BLOCK_M:
+            # In this case, we can find a better thread-block balance
+            MIN_BLOCK_M = min(triton.next_power_of_2(n_edges), MAX_BLOCK_M)
+            BLOCK_N = min(BLOCK_SIZE // MIN_BLOCK_M, MAX_BLOCK_N, triton.next_power_of_2(batch_size))
+            BLOCK_M = min(BLOCK_SIZE // BLOCK_N, MAX_BLOCK_M)
+        else:
+            # Try to fit all edges of a node in a single thread-block
+            BLOCK_M = triton.next_power_of_2(n_edges)
+            BLOCK_N = max(BLOCK_SIZE // BLOCK_M, 1)
 
         grid = (triton.cdiv(n_nodes * n_edges, BLOCK_M), triton.cdiv(batch_size, BLOCK_N), 1)
 
@@ -446,7 +453,8 @@ class SumLayer(Layer, nn.Module):
                          params: torch.Tensor, node_mars: torch.Tensor, 
                          element_mars: torch.Tensor, param_flows: torch.Tensor, 
                          chids: torch.Tensor, parids: torch.Tensor, parpids: torch.Tensor, 
-                         BLOCK_SIZE = 2**12, MAX_BLOCK_M = 2**12, MAX_BLOCK_N = 64) -> None:
+                         BLOCK_M_HARD_LIMIT = 2**16, BLOCK_SIZE = 2**12, MAX_BLOCK_M = 2**12, 
+                         MAX_BLOCK_N = 64) -> None:
         """
         This function is equivalent to running:
         ``` 
@@ -478,7 +486,7 @@ class SumLayer(Layer, nn.Module):
             params = params.squeeze(1)
 
         # Fall back to the `torch.compile` kernel in the case where we cannot store child edges within a single block
-        if n_edges > MAX_BLOCK_M:
+        if n_edges > BLOCK_M_HARD_LIMIT:
             raise NotImplementedError("This fallback workaround needs to be fixed..")
             self._backward_pytorch_kernel(
                 node_flows, element_flows, params, node_mars, 
@@ -487,12 +495,18 @@ class SumLayer(Layer, nn.Module):
 
             return None
 
-        assert n_edges <= MAX_BLOCK_M, "Number of edges should be smaller than or equal to MAX_BLOCK_M."
+        assert n_edges <= BLOCK_M_HARD_LIMIT, f"Number of edges should be smaller than or equal to {BLOCK_M_HARD_LIMIT}."
         assert params.dim() == 1, "Expecting a 1D `params`."
 
-        MIN_BLOCK_M = min(triton.next_power_of_2(n_edges), MAX_BLOCK_M)
-        BLOCK_N = min(BLOCK_SIZE // MIN_BLOCK_M, MAX_BLOCK_N, triton.next_power_of_2(batch_size))
-        BLOCK_M = min(BLOCK_SIZE // BLOCK_N, MAX_BLOCK_M)
+        if n_edges <= MAX_BLOCK_M:
+            # In this case, we can find a better thread-block balance
+            MIN_BLOCK_M = min(triton.next_power_of_2(n_edges), MAX_BLOCK_M)
+            BLOCK_N = min(BLOCK_SIZE // MIN_BLOCK_M, MAX_BLOCK_N, triton.next_power_of_2(batch_size))
+            BLOCK_M = min(BLOCK_SIZE // BLOCK_N, MAX_BLOCK_M)
+        else:
+            # Try to fit all edges of a node in a single thread-block
+            BLOCK_M = triton.next_power_of_2(n_edges)
+            BLOCK_N = max(BLOCK_SIZE // BLOCK_M, 1)
 
         grid = (triton.cdiv(n_nodes * n_edges, BLOCK_M), triton.cdiv(batch_size, BLOCK_N), 1)
 
