@@ -5,7 +5,7 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 import warnings
-from typing import Sequence
+from typing import Sequence, Optional
 
 from pyjuice.nodes import ProdNodes
 from .layer import Layer
@@ -15,7 +15,7 @@ from .backend.index_set import batched_index_set, batched_index_cum
 
 class ProdLayer(Layer, nn.Module):
 
-    def __init__(self, nodes: Sequence[ProdNodes], max_num_groups: int = 1) -> None:
+    def __init__(self, nodes: Sequence[ProdNodes], layer_sparsity_tol: float = 0.0, max_num_groups: Optional[int] = None) -> None:
         Layer.__init__(self)
         nn.Module.__init__(self)
 

@@ -44,13 +44,14 @@ def _pc_inputs_hook(grad, pc, i):
 
 
 class TensorCircuit(nn.Module):
-    def __init__(self, root_nodes: CircuitNodes, max_num_groups: int = 1) -> None:
+    def __init__(self, root_nodes: CircuitNodes, layer_sparsity_tol: float = 0.5, max_num_groups: Optional[int] = None) -> None:
         """
         Create a tensorized circuit for the circuit rooted at `root_nodes`.
 
         Parameters:
-        `root_nodes`:     root node(s) of the circuit
-        `max_num_groups`: how many groups do we want to split a layer into
+        `root_nodes`:         root node(s) of the circuit
+        `layer_sparsity_tol`: the minimum allowed sparsity of compiled layers; ranges from 0.0 to 1.0; larger means more strict
+        `max_num_groups`:     how many groups do we want to split a layer into
         """
 
         super().__init__()
@@ -59,7 +60,7 @@ class TensorCircuit(nn.Module):
         self.device = torch.device("cpu")
 
         self._init_pass_tensors()
-        self._init_layers(max_num_groups = max_num_groups)
+        self._init_layers(layer_sparsity_tol = layer_sparsity_tol, max_num_groups = max_num_groups)
         self._init_ad_tensors()
 
     def _init_pass_tensors(self):
@@ -415,7 +416,7 @@ class TensorCircuit(nn.Module):
 
     def _init_layers(self, init_input_params: Optional[Sequence[torch.Tensor]] = None, 
                      init_inner_params: Optional[torch.Tensor] = None,
-                     max_num_groups: int = 1):
+                     layer_sparsity_tol: float = 0.0, max_num_groups: Optional[int] = None):
 
         self.root_nodes._clear_tensor_circuit_hooks()
         depth2nodes, num_layers = self._create_node_layers()
@@ -459,7 +460,11 @@ class TensorCircuit(nn.Module):
                     "Depth {}: ({}, {})".format(depth, len(depth2nodes[depth]["prod"]), len(depth2nodes[depth]["sum"]))
 
                 # Product layer
-                prod_layer = ProdLayer(nodes = depth2nodes[depth]["prod"], max_num_groups = max_num_groups)
+                prod_layer = ProdLayer(
+                    nodes = depth2nodes[depth]["prod"], 
+                    layer_sparsity_tol = layer_sparsity_tol,
+                    max_num_groups = max_num_groups
+                )
 
                 if prod_layer.num_nodes + 1 > num_elements:
                     num_elements = prod_layer.num_nodes + 1
@@ -476,6 +481,7 @@ class TensorCircuit(nn.Module):
                     tied_param_group_ids = tied_param_group_ids,
                     tied_param_ends = tied_param_ends,
                     ch_prod_layer_size = prod_layer.num_nodes + 1,
+                    layer_sparsity_tol = layer_sparsity_tol,
                     max_num_groups = max_num_groups
                 )
 

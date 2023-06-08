@@ -23,12 +23,15 @@ class SumLayer(Layer, nn.Module):
     def __init__(self, nodes: Sequence[SumNodes], global_nid_start: int, 
                  param_ends: Sequence, tied_param_ids: Sequence,
                  tied_param_group_ids: Sequence, tied_param_ends: Sequence,
-                 ch_prod_layer_size: int, max_num_groups: int = 1) -> None:
+                 ch_prod_layer_size: int, layer_sparsity_tol: float = 0.0, 
+                 max_num_groups: Optional[int] = None) -> None:
 
         Layer.__init__(self)
         nn.Module.__init__(self)
 
         assert len(nodes) > 0, "No input node."
+
+        t0 = time.time() # debug
 
         self.nodes = nodes
         self.ch_prod_layer_size = ch_prod_layer_size
@@ -43,7 +46,12 @@ class SumLayer(Layer, nn.Module):
 
         # Find a good strategy to partition the nodes into groups according to their number of children 
         # to minimize total computation cost
-        fw_group_max_chs = partition_nodes_by_n_edges(n_chs, max_num_groups = max_num_groups)
+        t00 = time.time()
+        fw_group_max_chs = partition_nodes_by_n_edges(
+            n_chs, sparsity_tolerance = layer_sparsity_tol, max_num_groups = max_num_groups
+        )
+        t01 = time.time()
+        print("is this slow", t01 - t00)
         
         self.num_fw_groups = len(fw_group_max_chs) # Number of groups
 
@@ -65,6 +73,8 @@ class SumLayer(Layer, nn.Module):
 
             min_n_chs = max_n_chs + 1
 
+        t1 = time.time() # debug
+
         ## Initialize forward pass ##
 
         # nids:      List[[num_nodes]]                   stores node ids
@@ -81,12 +91,16 @@ class SumLayer(Layer, nn.Module):
         self.grouped_cids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in cids])
         self.grouped_pids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in pids])
 
+        t2 = time.time() # debug
+
         ## Initialize backward pass ##
 
         # Find a good strategy to partition the child nodes into groups according to their number of parents 
         # to minimize total computation cost
         ch_n_pars = ch_n_pars[1:] # Strip away the dummy node. We will never use it in the following
-        bk_group_max_pars = partition_nodes_by_n_edges(ch_n_pars, max_num_groups = max_num_groups)
+        bk_group_max_pars = partition_nodes_by_n_edges(
+            ch_n_pars, sparsity_tolerance = layer_sparsity_tol, max_num_groups = max_num_groups
+        )
 
         self.num_bk_groups = len(bk_group_max_pars) # Number of groups
 
@@ -112,6 +126,8 @@ class SumLayer(Layer, nn.Module):
 
             min_n_pars = max_n_pars + 1
 
+        t3 = time.time() # debug
+
         # parids:     List[[group_size, group_max_n_pars]]  stores parameter ids for each child node
         # parpids:    List[[group_size, max_n_pars]]        param id for the edges to parent (correspond to `parids`)
         parids, parpids = sum_layer_backward_compilation(
@@ -123,6 +139,9 @@ class SumLayer(Layer, nn.Module):
         self.grouped_chids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in chids])
         self.grouped_parids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in parids])
         self.grouped_parpids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in parpids])
+
+        t4 = time.time() # debug
+        print("sum layer time breakdown", t1 - t0, t2 - t1, t3 - t2, t4 - t3)
 
     def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor) -> None:
         """
