@@ -430,6 +430,8 @@ def sum_layer_backward_compilation(nodes, pids, fw_n_group_ids, fw_n_id_in_group
         parids.append(flat_parids[flatid_start:flatid_end].reshape(group_size, max_n_par))
         parpids.append(flat_parpids[flatid_start:flatid_end].reshape(group_size, max_n_par))
 
+        flatid_start = flatid_end
+
     return parids, parpids
 
 
