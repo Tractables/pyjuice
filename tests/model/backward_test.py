@@ -117,5 +117,129 @@ def backward_test():
     assert torch.abs(inner_param_flows[13] + inner_param_flows[14] - 1.0) < 1e-4
 
 
+def non_sd_pc_backward_test():
+    ni00 = inputs(0, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
+    ni10 = inputs(1, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
+    ni20 = inputs(2, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
+
+    m10 = multiply(ni00, ni10)
+    n10 = summate(m10, num_nodes = 2)
+    m20 = multiply(n10, ni20)
+
+    ni01 = inputs(0, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
+    ni11 = inputs(1, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
+    ni21 = inputs(2, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
+
+    m11 = multiply(ni11, ni21)
+    n11 = summate(m11, num_nodes = 2)
+    m21 = multiply(n11, ni01)
+
+    n = summate(m20, m21, num_nodes = 1)
+
+    pc = TensorCircuit(n)
+
+    device = torch.device("cuda:0")
+    pc.to(device)
+
+    data = torch.randint(0, 2, [16, 3]).to(device)
+
+    lls = pc(data)
+
+    pc.backward(data)
+
+    ## Unit tests for backward pass ##
+
+    f1 = torch.exp(pc.node_mars[13,0] + pc.node_mars[5,0]) * pc.params[9]
+    f2 = torch.exp(pc.node_mars[14,0] + pc.node_mars[6,0]) * pc.params[10]
+    f3 = torch.exp(pc.node_mars[15,0] + pc.node_mars[11,0]) * pc.params[11]
+    f4 = torch.exp(pc.node_mars[16,0] + pc.node_mars[12,0]) * pc.params[12]
+    f = torch.exp(pc.node_mars[17,0])
+
+    assert torch.abs(pc.node_flows[13,0] - f1 / f) < 1e-3
+    assert torch.abs(pc.node_flows[14,0] - f2 / f) < 1e-3
+    assert torch.abs(pc.node_flows[15,0] - f3 / f) < 1e-3
+    assert torch.abs(pc.node_flows[16,0] - f4 / f) < 1e-3
+
+    fp1 = (torch.exp(pc.node_mars[13,:] + pc.node_mars[5,:]) * pc.params[9] / \
+        torch.exp(pc.node_mars[17,:])).sum()
+    fp2 = (torch.exp(pc.node_mars[14,:] + pc.node_mars[6,:]) * pc.params[10] / \
+        torch.exp(pc.node_mars[17,:])).sum()
+    fp3 = (torch.exp(pc.node_mars[15,:] + pc.node_mars[11,:]) * pc.params[11] / \
+        torch.exp(pc.node_mars[17,:])).sum()
+    fp4 = (torch.exp(pc.node_mars[16,:] + pc.node_mars[12,:]) * pc.params[12] / \
+        torch.exp(pc.node_mars[17,:])).sum()
+
+    assert torch.abs(pc.param_flows[9] - fp1) < 1e-3
+    assert torch.abs(pc.param_flows[10] - fp2) < 1e-3
+    assert torch.abs(pc.param_flows[11] - fp3) < 1e-3
+    assert torch.abs(pc.param_flows[12] - fp4) < 1e-3
+
+
+def sparse_pc_backward_test():
+    
+    ni0 = inputs(0, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
+    ni1 = inputs(1, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
+    ni2 = inputs(2, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
+    ni3 = inputs(3, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
+
+    m1 = multiply(ni0, ni1, edge_ids = torch.tensor([[0, 0], [0, 1], [1, 0], [1, 1]], dtype = torch.long))
+    n1 = summate(m1, edge_ids = torch.tensor([[0, 0, 0, 1, 1, 1], [0, 1, 3, 0, 2, 3]], dtype = torch.long))
+
+    m2 = multiply(ni2, ni3, edge_ids = torch.tensor([[0, 0], [1, 1]], dtype = torch.long))
+    n2 = summate(m2, edge_ids = torch.tensor([[0, 0, 1], [0, 1, 1]], dtype = torch.long))
+
+    m = multiply(n1, n2, edge_ids = torch.tensor([[0, 0], [1, 1]], dtype = torch.long))
+    n = summate(m, edge_ids = torch.tensor([[0, 0], [0, 1]], dtype = torch.long))
+
+    pc = TensorCircuit(n)
+
+    device = torch.device("cuda:0")
+    pc.to(device)
+
+    data = torch.randint(0, 2, [16, 4]).to(device)
+
+    lls = pc(data)
+
+    pc.backward(data)
+
+    ## Unit tests for backward pass ##
+
+    p1 = torch.exp(pc.node_mars[1,0] + pc.node_mars[3,0])
+    p2 = torch.exp(pc.node_mars[1,0] + pc.node_mars[4,0])
+    p3 = torch.exp(pc.node_mars[2,0] + pc.node_mars[3,0])
+    p4 = torch.exp(pc.node_mars[2,0] + pc.node_mars[4,0])
+    s11 = p1 * pc.params[1] + p2 * pc.params[2] + p4 * pc.params[3]
+    s12 = p1 * pc.params[4] + p3 * pc.params[5] + p4 * pc.params[6]
+
+    f9 = pc.node_flows[9,0]
+    f10 = pc.node_flows[10,0]
+
+    assert torch.abs(f9 * (p1 * pc.params[1] + p2 * pc.params[2]) / s11 + \
+           f10 * p1 * pc.params[4] / s12 - pc.node_flows[1,0]) < 1e-4
+    assert torch.abs(f9 * p4 * pc.params[3] / s11 + f10 * (p3 * pc.params[5] + \
+           p4 * pc.params[6]) / s12 - pc.node_flows[2,0]) < 1e-4
+    assert torch.abs(f9 * p1 * pc.params[1] / s11 + f10 * (p1 * pc.params[4] + \
+           p3 * pc.params[5]) / s12 - pc.node_flows[3,0]) < 1e-4
+    assert torch.abs(f9 * (p2 * pc.params[2] + p4 * pc.params[3]) / s11 + \
+           f10 * p4 * pc.params[6] / s12 - pc.node_flows[4,0]) < 1e-4
+
+    p5 = torch.exp(pc.node_mars[5,0] + pc.node_mars[7,0])
+    p6 = torch.exp(pc.node_mars[6,0] + pc.node_mars[8,0])
+    s13 = p5 * pc.params[7] + p6 * pc.params[8]
+    s14 = p6 * pc.params[9]
+
+    f11 = pc.node_flows[11,0]
+    f12 = pc.node_flows[12,0]
+
+    assert torch.abs(f11 * p5 * pc.params[7] / s13 - pc.node_flows[5,0]) < 1e-4
+    assert torch.abs(f11 * p6 * pc.params[8] / s13 + f12 * p6 * pc.params[9] / s14 - \
+           pc.node_flows[6,0]) < 1e-4
+    assert torch.abs(f11 * p5 * pc.params[7] / s13 - pc.node_flows[7,0]) < 1e-4
+    assert torch.abs(f11 * p6 * pc.params[8] / s13 + f12 * p6 * pc.params[9] / s14 - \
+           pc.node_flows[8,0]) < 1e-4
+
+
 if __name__ == "__main__":
     backward_test()
+    non_sd_pc_backward_test()
+    sparse_pc_backward_test()

@@ -200,6 +200,6 @@ def sparse_pc_forward_test():
 
 
 if __name__ == "__main__":
-    # forward_test()
-    # non_sd_pc_forward_test()
+    forward_test()
+    non_sd_pc_forward_test()
     sparse_pc_forward_test()
