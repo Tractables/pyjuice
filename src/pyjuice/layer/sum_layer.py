@@ -325,7 +325,7 @@ class SumLayer(Layer, nn.Module):
             params = params.squeeze(1)
 
         # Fall back to the `torch.compile` kernel in the case where we cannot store child edges within a single block
-        if n_edges > BLOCK_M_HARD_LIMIT:
+        if n_edges > BLOCK_M_HARD_LIMIT or not node_mars.is_cuda:
             self._forward_pytorch_kernel(node_mars, element_mars, params, nids, cids, pids)
 
             return None
@@ -486,7 +486,7 @@ class SumLayer(Layer, nn.Module):
             params = params.squeeze(1)
 
         # Fall back to the `torch.compile` kernel in the case where we cannot store child edges within a single block
-        if n_edges > BLOCK_M_HARD_LIMIT:
+        if n_edges > BLOCK_M_HARD_LIMIT or not node_mars.is_cuda:
             raise NotImplementedError("This fallback workaround needs to be fixed..")
             self._backward_pytorch_kernel(
                 node_flows, element_flows, params, node_mars, 
