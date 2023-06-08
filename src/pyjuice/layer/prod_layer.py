@@ -5,12 +5,15 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 import warnings
+import time
 from typing import Sequence, Optional
 
 from pyjuice.nodes import ProdNodes
 from .layer import Layer
 from .backend.node_partition import partition_nodes_by_n_edges
 from .backend.index_set import batched_index_set, batched_index_cum
+from .compilation import next_power_of_2, get_prod_layer_stats, prod_layer_forward_compilation, \
+                         flatten_c_ids, get_prod_layer_parstats, prod_layer_backward_compilation
 
 
 class ProdLayer(Layer, nn.Module):
@@ -24,104 +27,104 @@ class ProdLayer(Layer, nn.Module):
 
         self.nodes = nodes
 
-        max_n_chs = 0
-        layer_num_nodes = 0
-        cum_nodes = 1 # id 0 is reserved for the dummy node
-        for ns in self.nodes:
-            if ns.num_chs > max_n_chs:
-                max_n_chs = ns.num_chs
-            ns._output_ind_range = (cum_nodes, cum_nodes + ns.num_nodes)
-            cum_nodes += ns.num_nodes
-            layer_num_nodes += ns.num_nodes
+        ## Get layer statistics & prepare for compilation ##
+
+        layer_num_nodes, n_chs = get_prod_layer_stats(self.nodes)
 
         self.num_nodes = layer_num_nodes
 
-        ## Initialize forward pass ##
-
-        n_edges = triton.next_power_of_2(max_n_chs)
-        cids = torch.zeros([self.num_nodes, n_edges], dtype = torch.long) # cids[i,:] are the child node ids for node i
-        n_chs = torch.zeros([self.num_nodes], dtype = torch.long) # Number of children for each node
-        node_start = 0
-        for ns in self.nodes:
-            node_end = node_start + ns.num_nodes
-            for i, c in enumerate(ns.chs):
-                cids[node_start:node_end, i] = ns.edge_ids[:,i] + c._output_ind_range[0]
-                
-            n_chs[node_start:node_end] = ns.num_chs
-
-            node_start = node_end
-
         # Find a good strategy to partition the nodes into groups according to their number of children 
         # to minimize total computation cost
-        ch_group_sizes = partition_nodes_by_n_edges(n_chs, max_num_groups = max_num_groups)
+        fw_group_max_chs = partition_nodes_by_n_edges(
+            n_chs, sparsity_tolerance = layer_sparsity_tol, max_num_groups = max_num_groups
+        )
 
-        grouped_nids = []
-        grouped_cids = []
-        min_n_chs = 0
-        for max_n_chs in ch_group_sizes:
-            filter = (n_chs >= min_n_chs) & (n_chs <= max_n_chs)
-            n_edges = triton.next_power_of_2(max_n_chs)
+        # Since the triton kernels require the maximum number children for each group to be a power of 2,
+        # we postprocess the group sizes
+        fw_group_max_chs = torch.unique(next_power_of_2(fw_group_max_chs))
 
-            curr_nids = (torch.where(filter)[0] + 1).clone()
-            curr_cids = cids[filter,:n_edges].contiguous()
+        self.num_fw_groups = len(fw_group_max_chs) # Number of groups
 
-            grouped_nids.append(curr_nids)
-            grouped_cids.append(curr_cids)
+        # fw_n_group_ids:     [num_ns]           stores the group id for each `ns` in `nodes`
+        # fw_n_id_in_group:   [num_ns]           stores the start index of each `ns` in the group
+        # fw_num_ns_in_group: [num_fw_groups]    number of nodes in each group
+        num_ns = len(self.nodes)
+        fw_n_group_ids = torch.zeros([num_ns], dtype = torch.long)
+        fw_n_id_in_group = torch.zeros([num_ns], dtype = torch.long)
+        fw_num_ns_in_group = torch.zeros([self.num_fw_groups], dtype = torch.long)
 
-            min_n_chs = max_n_chs + 1
+        for ns_id, ns in enumerate(self.nodes):
+            group_id = (ns.num_chs > fw_group_max_chs).sum().item()
 
-        self.num_forward_groups = ch_group_sizes.shape[0]
-        self.grouped_nids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in grouped_nids])
-        self.grouped_cids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in grouped_cids])
+            fw_n_group_ids[ns_id] = group_id
+            fw_n_id_in_group[ns_id] = fw_num_ns_in_group[group_id]
+            fw_num_ns_in_group[group_id] += ns.num_nodes
+
+        ## Initialize forward pass ##
+
+        # nids:      List[[group_size]]                  stores node ids
+        # cids:      List[[group_size, group_max_n_chs]] stores indices of child nodes
+        nids, cids = prod_layer_forward_compilation(
+            self.nodes, fw_group_max_chs, fw_n_group_ids, fw_n_id_in_group, fw_num_ns_in_group
+        )
+
+        # Store buffers for the forward pass
+        self.grouped_nids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in nids])
+        self.grouped_cids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in cids])
 
         ## Initialize backward pass ##
 
-        u_cids, par_counts = torch.unique(cids, sorted = True, return_counts = True)
+        # flat_cids:   flattened version of `cids`
+        # flat_cid2id: mapping from every `flat_cids` to its corresponding `nids`
+        flat_cids, flat_cid2nid = flatten_c_ids(nids, cids)
 
-        if u_cids[0] != 0:
-            u_cids = torch.cat(
-                (torch.zeros([1], dtype = torch.long), u_cids),
-                dim = 0
-            )
-            par_counts = torch.cat(
-                (torch.zeros([1], dtype = torch.long), par_counts),
-                dim = 0
-            )
-
-        max_n_pars = torch.max(par_counts[1:])
-        n_edges = triton.next_power_of_2(max_n_pars)
-        parids = torch.zeros([u_cids.size(0), n_edges], dtype = torch.long)
-        for idx in range(u_cids.size(0)):
-            cid = u_cids[idx]
-            if cid == 0:
-                continue # Skip the dummy node
-            b_nid = torch.where(cids == cid)[0]
-            parids[idx,:b_nid.size(0)] = b_nid + 1 # 1 for the dummy node
+        # flat_u_cids:        [num_used_ch_nodes]    child node ids that have at least one parent
+        # par_counts:         [num_used_ch_nodes]    the number of parents for each child node
+        # Note: the dummy node has been removed from `flat_u_cids` and `par_counts`
+        flat_u_cids, par_counts = get_prod_layer_parstats(flat_cids)
 
         # Find a good strategy to partition the child nodes into groups according to their number of parents 
         # to minimize total computation cost
-        par_counts = par_counts[1:] # Strip away the dummy node. We will never use it in the following
-        par_group_sizes = partition_nodes_by_n_edges(par_counts, max_num_groups = max_num_groups)
+        bk_group_max_pars = partition_nodes_by_n_edges(
+            par_counts, sparsity_tolerance = layer_sparsity_tol, max_num_groups = max_num_groups
+        )
 
-        grouped_parids = []
-        grouped_u_cids = []
+        # Since the triton kernels require the maximum number children for each group to be a power of 2,
+        # we postprocess the group sizes
+        bk_group_max_pars = torch.unique(next_power_of_2(bk_group_max_pars))
+
+        self.num_bk_groups = len(bk_group_max_pars) # Number of groups
+
+        # bk_n_group_ids:     [num_ch_nodes]       stores the group id for each `ns` in `nodes`
+        # bk_n_id_in_group:   [num_ch_nodes]       stores the start index of each `ns` in the group
+        # bk_num_ns_in_group: [num_bk_groups]      number of nodes in each group
+        num_ch_nodes = flat_u_cids.size(0)
+        bk_n_group_ids = torch.zeros([num_ch_nodes], dtype = torch.long)
+        bk_n_id_in_group = torch.zeros([num_ch_nodes], dtype = torch.long)
+        bk_num_ns_in_group = torch.zeros([self.num_bk_groups], dtype = torch.long)
+
         min_n_pars = 0
-        for max_n_pars in par_group_sizes:
-            filter = (par_counts >= min_n_pars) & (par_counts <= max_n_pars)
-            filtered_idxs = torch.where(filter)[0]
-            n_edges = triton.next_power_of_2(max_n_pars)
+        for group_id, max_n_pars in enumerate(bk_group_max_pars):
+            criterion = (par_counts >= min_n_pars) & (par_counts <= max_n_pars)
+            filtered_idxs = torch.where(criterion)[0]
+            group_size = criterion.sum().item()
 
-            curr_parids = parids[filtered_idxs+1,:n_edges].contiguous()
-            curr_u_cids = u_cids[filtered_idxs+1].contiguous()
-
-            grouped_parids.append(curr_parids)
-            grouped_u_cids.append(curr_u_cids)
+            bk_n_group_ids[criterion] = group_id
+            bk_n_id_in_group[criterion] = torch.arange(group_size)
+            bk_num_ns_in_group[group_id] = group_size
 
             min_n_pars = max_n_pars + 1
 
-        self.num_backward_groups = par_group_sizes.shape[0]
-        self.grouped_parids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in grouped_parids])
-        self.grouped_u_cids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in grouped_u_cids])
+        # u_cids:    List[[group_size]]                   stores child node ids
+        # parids:    List[[group_size, group_max_n_pars]] stores indices of parent nodes
+        u_cids, parids = prod_layer_backward_compilation(
+            flat_u_cids, flat_cids, flat_cid2nid, 
+            bk_group_max_pars, bk_n_group_ids, bk_n_id_in_group, bk_num_ns_in_group
+        )
+
+        # Store buffers for the backward pass
+        self.grouped_u_cids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in u_cids])
+        self.grouped_parids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in parids])
 
     def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor) -> None:
         """
@@ -135,7 +138,7 @@ class ProdLayer(Layer, nn.Module):
         `element_mars`: [max_num_els, B]
         """
 
-        for group_id in range(self.num_forward_groups):
+        for group_id in range(self.num_fw_groups):
             nids = self.grouped_nids[group_id]
             cids = self.grouped_cids[group_id]
 
@@ -155,7 +158,7 @@ class ProdLayer(Layer, nn.Module):
         `element_flows`: [max_num_els, B]
         """
         
-        for group_id in range(self.num_backward_groups):
+        for group_id in range(self.num_bk_groups):
             u_cids = self.grouped_u_cids[group_id]
             parids = self.grouped_parids[group_id]
 

@@ -46,6 +46,10 @@ def get_chunk_ids(n, k):
     return chunks
 
 
+def next_power_of_2(x: torch.Tensor):
+    return 2 ** torch.ceil(torch.log2(x.float())).long()
+
+
 ## Compilation for SumLayer ##
 
 
@@ -420,3 +424,118 @@ def sum_layer_backward_compilation(nodes, pids, fw_n_group_ids, fw_n_id_in_group
         parpids.append(flat_parpids[flatid_start:flatid_end].reshape(group_size, max_n_par))
 
     return parids, parpids
+
+
+## Compilation for ProdLayer ##
+
+
+def get_prod_layer_stats(nodes: Sequence[SumNodes]):
+    layer_num_nodes = sum(map(lambda ns: ns.num_nodes, nodes))
+    
+    global_nid_start = 1 # idx 0 is reserved for the dummy node
+
+    n_sid = 0
+    n_chs = torch.zeros([layer_num_nodes], dtype = torch.long)
+    for ns_idx, ns in enumerate(nodes):
+        n_eid = n_sid + ns.num_nodes
+
+        n_chs[n_sid:n_eid] = ns.num_chs
+
+        ns._output_ind_range = (global_nid_start, global_nid_start + ns.num_nodes)
+        global_nid_start += ns.num_nodes
+
+        n_sid = n_eid
+
+    return layer_num_nodes, n_chs
+
+
+@torch.no_grad()
+def prod_layer_forward_compilation(nodes, fw_group_max_chs, n_group_ids, n_id_in_group, num_ns_in_group, use_cuda: bool = False):
+
+    if use_cuda and not torch.cuda.is_available():
+        use_cuda = False
+
+    nids = [torch.zeros([group_size], dtype = torch.long) for group_size in num_ns_in_group] # Node id
+    cids = [torch.zeros([group_size, max_chs], dtype = torch.long) for group_size, max_chs in zip(num_ns_in_group, fw_group_max_chs)] # Child id
+
+    n_sid = 1 # offset the dummy node
+    for ns_id, ns in enumerate(nodes):
+        n_eid = n_sid + ns.num_nodes
+
+        # `group_id`:   which group the current node belongs to
+        # `local_sid`:  the start index of the node within the current group
+        # `group_nchs`: maximum number of child nodes in the current group
+        group_id = n_group_ids[ns_id]
+        local_sid = n_id_in_group[ns_id]
+        local_eid = local_sid + ns.num_nodes
+        group_nchs = fw_group_max_chs[group_id]
+
+        nids[group_id][local_sid:local_eid] = torch.arange(ns.num_nodes) + n_sid
+        for cs_id, cs in enumerate(ns.chs):
+            cids[group_id][local_sid:local_eid,cs_id] = ns.edge_ids[:,cs_id] + cs._output_ind_range[0]
+
+        n_sid = n_eid
+
+    return nids, cids
+
+
+@torch.no_grad()
+def flatten_c_ids(nids, cids):
+
+    num_cid_slots = sum(map(lambda x: x.size(0) * x.size(1), cids))
+    flat_cids = torch.zeros([num_cid_slots], dtype = torch.long)
+    flat_cid2nid = torch.zeros([num_cid_slots], dtype = torch.long)
+
+    n_sid = 0
+    c_sid = 0
+    for curr_nids, curr_cids in zip(nids, cids):
+        n_eid = n_sid + curr_nids.size(0)
+        c_eid = c_sid + curr_cids.size(0) * curr_cids.size(1)
+
+        flat_cids[c_sid:c_eid] = curr_cids.reshape(-1)
+        flat_cid2nid[c_sid:c_eid] = curr_nids.unsqueeze(1).repeat(1, curr_cids.size(1)).reshape(-1)
+
+        n_sid = n_eid
+        c_sid = c_eid
+
+    return flat_cids, flat_cid2nid
+
+
+@torch.no_grad()
+def get_prod_layer_parstats(flat_cids):
+
+    u_cids, par_counts = torch.unique(flat_cids, sorted = True, return_counts = True)
+
+    if u_cids[0] == 0:
+        # Strip away the dummy node
+        u_cids = u_cids[1:]
+        par_counts = par_counts[1:]
+
+    return u_cids, par_counts
+
+
+@torch.no_grad()
+def prod_layer_backward_compilation(flat_u_cids, flat_cids, flat_cid2nid, 
+                                    bk_group_max_pars, n_group_ids, n_id_in_group, num_ns_in_group, 
+                                    use_cuda: bool = False):
+    
+    if use_cuda and not torch.cuda.is_available():
+        use_cuda = False
+
+    u_cids = [torch.zeros([group_size], dtype = torch.long) for group_size in num_ns_in_group] # Node id
+    parids = [torch.zeros([group_size, max_n_pars], dtype = torch.long) for group_size, max_n_pars in zip(num_ns_in_group, bk_group_max_pars)] # Parent id
+
+    for idx in range(flat_u_cids.size(0)):
+        cid = flat_u_cids[idx]
+
+        # `group_id`:   which group the current node belongs to
+        # `local_id`:   the index of the node within the current group
+        group_id = n_group_ids[idx]
+        local_id = n_id_in_group[idx]
+
+        criterion = (flat_cids == cid)
+
+        u_cids[group_id][local_id] = cid
+        parids[group_id][local_id,:] = flat_cid2nid[criterion]
+
+    return u_cids, parids
