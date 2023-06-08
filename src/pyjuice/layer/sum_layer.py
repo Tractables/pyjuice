@@ -70,7 +70,7 @@ class SumLayer(Layer, nn.Module):
 
         ## Initialize forward pass ##
 
-        # nids:      List[[num_nodes]]                   stores node ids
+        # nids:      List[[group_size]]                  stores node ids
         # cids:      List[[group_size, group_max_n_chs]] stores indices of child nodes
         # pids:      List[[group_size, group_max_n_chs]] stores indices of edge parameters
         # ch_n_pars: [ch_prod_layer_size]                stores the number of parents for each child node
@@ -282,10 +282,21 @@ class SumLayer(Layer, nn.Module):
         
         tl.store(node_mars_ptr + nmar_offsets, n_logps, mask = nmar_mask)
 
+    @staticmethod
+    @torch.compile(mode = "reduce-overhead", fullgraph = True)
+    def _forward_pytorch_kernel(node_mars: torch.Tensor, element_mars: torch.Tensor, 
+                                params: torch.Tensor, nids: torch.Tensor, cids: torch.Tensor, pids: torch.Tensor):
+
+        ch_mars = element_mars[cids]
+        maxval = ch_mars.max(dim = 1, keepdim = True).values
+        node_mars[nids] = (((ch_mars - maxval).exp() * params[pids]).sum(
+            dim = 1).clamp(min = 1e-10)).log() + maxval.squeeze(1)
+
+        return None
+
     def _forward_triton(self, node_mars: torch.Tensor, element_mars: torch.Tensor, 
-                        params: torch.Tensor,
-                        nids: torch.Tensor, cids: torch.Tensor,
-                        pids: torch.Tensor, BLOCK_SIZE = 2**12, MAX_BLOCK_M = 512, MAX_BLOCK_N = 64) -> None:
+                        params: torch.Tensor, nids: torch.Tensor, cids: torch.Tensor,
+                        pids: torch.Tensor, BLOCK_SIZE = 2**12, MAX_BLOCK_M = 2**12, MAX_BLOCK_N = 64) -> None:
         """
         This function is equivalent to running:
         ``` 
@@ -312,6 +323,13 @@ class SumLayer(Layer, nn.Module):
         if params.dim() == 2 and params.size(1) == 1:
             params = params.squeeze(1)
 
+        # Fall back to the `torch.compile` kernel in the case where we cannot store child edges within a single block
+        if n_edges > MAX_BLOCK_M:
+            self._forward_pytorch_kernel(node_mars, element_mars, params, nids, cids, pids)
+
+            return None
+
+        assert n_edges <= MAX_BLOCK_M, "Number of edges should be smaller than or equal to MAX_BLOCK_M."
         assert params.dim() == 1, "Expecting a 1D `params`."
 
         MIN_BLOCK_M = min(triton.next_power_of_2(n_edges), MAX_BLOCK_M)
@@ -409,11 +427,26 @@ class SumLayer(Layer, nn.Module):
         parflow_mask = (eparam_ids > 0) & tl.broadcast_to(n_mask[None,:], (n_edges, n_nodes_per_block_m))
         tl.atomic_add(param_flows_ptr + eparam_ids, parflows, mask = parflow_mask)
 
+    @staticmethod
+    @torch.compile(mode = "reduce-overhead", fullgraph = True)
+    def _backward_pytorch_kernel(node_flows: torch.Tensor, element_flows: torch.Tensor, 
+                                 params: torch.Tensor, node_mars: torch.Tensor, 
+                                 element_mars: torch.Tensor, param_flows: torch.Tensor, 
+                                 chids: torch.Tensor, parids: torch.Tensor, parpids: torch.Tensor):
+        
+        element_flows[chids] = (node_flows[parids] * params[parpids] * \
+            (element_mars[chids].unsqueeze(1) - node_mars[parids]).exp()).sum(dim = 1)
+
+        param_flows[seq_parpids] += (node_flows[parids] * params[parpids] * \
+            (element_mars[chids].unsqueeze(1) - node_mars[parids]).exp()).sum(dim = 2)[seq_ids0, seq_ids1]
+
+        return None
+
     def _backward_triton(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
                          params: torch.Tensor, node_mars: torch.Tensor, 
                          element_mars: torch.Tensor, param_flows: torch.Tensor, 
                          chids: torch.Tensor, parids: torch.Tensor, parpids: torch.Tensor, 
-                         BLOCK_SIZE = 2**12, MAX_BLOCK_M = 512, MAX_BLOCK_N = 64) -> None:
+                         BLOCK_SIZE = 2**12, MAX_BLOCK_M = 2**12, MAX_BLOCK_N = 64) -> None:
         """
         This function is equivalent to running:
         ``` 
@@ -443,6 +476,16 @@ class SumLayer(Layer, nn.Module):
 
         if params.dim() == 2 and params.size(1) == 1:
             params = params.squeeze(1)
+
+        # Fall back to the `torch.compile` kernel in the case where we cannot store child edges within a single block
+        if n_edges > MAX_BLOCK_M:
+            raise NotImplementedError("This fallback workaround needs to be fixed..")
+            self._backward_pytorch_kernel(
+                node_flows, element_flows, params, node_mars, 
+                element_mars, param_flows, chids, parids, parpids
+            )
+
+            return None
 
         assert n_edges <= MAX_BLOCK_M, "Number of edges should be smaller than or equal to MAX_BLOCK_M."
         assert params.dim() == 1, "Expecting a 1D `params`."

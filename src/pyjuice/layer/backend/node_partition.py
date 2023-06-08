@@ -93,7 +93,7 @@ def partition_nodes_by_n_edges(node_n_edges: Union[np.ndarray, torch.Tensor],
     if max_num_groups == 1:
         partitions = np.zeros([1], dtype = np.int64)
         partitions[0] = np.max(node_n_edges)
-        return partitions
+        return torch.from_numpy(partitions)
 
     # Sort in non-descending order
     node_n_edges = np.sort(node_n_edges)
