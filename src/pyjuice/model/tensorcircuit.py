@@ -5,6 +5,7 @@ import torch.nn as nn
 import time
 import triton
 import triton.language as tl
+from tqdm import tqdm
 from functools import partial
 from typing import Optional, Sequence
 
@@ -44,14 +45,17 @@ def _pc_inputs_hook(grad, pc, i):
 
 
 class TensorCircuit(nn.Module):
-    def __init__(self, root_nodes: CircuitNodes, layer_sparsity_tol: float = 0.5, max_num_groups: Optional[int] = None) -> None:
+    def __init__(self, root_nodes: CircuitNodes, layer_sparsity_tol: float = 0.5, 
+                 max_num_groups: Optional[int] = None, disable_gpu_compilation: bool = False, 
+                 verbose: bool = True) -> None:
         """
         Create a tensorized circuit for the circuit rooted at `root_nodes`.
 
         Parameters:
-        `root_nodes`:         root node(s) of the circuit
-        `layer_sparsity_tol`: the minimum allowed sparsity of compiled layers; ranges from 0.0 to 1.0; larger means more strict
-        `max_num_groups`:     how many groups do we want to split a layer into
+        `root_nodes`:              root node(s) of the circuit
+        `layer_sparsity_tol`:      the minimum allowed sparsity of compiled layers; ranges from 0.0 to 1.0; larger means more strict
+        `max_num_groups`:          how many groups do we want to split a layer into
+        `disable_gpu_compilation`: disable GPU compilation of the layers
         """
 
         super().__init__()
@@ -60,7 +64,10 @@ class TensorCircuit(nn.Module):
         self.device = torch.device("cpu")
 
         self._init_pass_tensors()
-        self._init_layers(layer_sparsity_tol = layer_sparsity_tol, max_num_groups = max_num_groups)
+        self._init_layers(
+            layer_sparsity_tol = layer_sparsity_tol, max_num_groups = max_num_groups, 
+            disable_gpu_compilation = disable_gpu_compilation, verbose = verbose
+        )
         self._init_ad_tensors()
 
     def _init_pass_tensors(self):
@@ -416,7 +423,8 @@ class TensorCircuit(nn.Module):
 
     def _init_layers(self, init_input_params: Optional[Sequence[torch.Tensor]] = None, 
                      init_inner_params: Optional[torch.Tensor] = None,
-                     layer_sparsity_tol: float = 0.0, max_num_groups: Optional[int] = None):
+                     layer_sparsity_tol: float = 0.0, max_num_groups: Optional[int] = None,
+                     disable_gpu_compilation: bool = False, verbose: bool = True):
 
         self.root_nodes._clear_tensor_circuit_hooks()
         depth2nodes, num_layers = self._create_node_layers()
@@ -442,8 +450,10 @@ class TensorCircuit(nn.Module):
         tied_param_group_ids = []
         tied_param_ends = []
 
+        if verbose:
+            print(f"Compiling {num_layers} layers...")
         layer_id = 0
-        for depth in range(num_layers):
+        for depth in tqdm(range(num_layers), disable = not verbose):
             if depth == 0:
                 # Input layer
                 type2nodes = self._categorize_input_nodes(depth2nodes[0]["input"])
@@ -463,7 +473,8 @@ class TensorCircuit(nn.Module):
                 prod_layer = ProdLayer(
                     nodes = depth2nodes[depth]["prod"], 
                     layer_sparsity_tol = layer_sparsity_tol,
-                    max_num_groups = max_num_groups
+                    max_num_groups = max_num_groups,
+                    disable_gpu_compilation = disable_gpu_compilation
                 )
 
                 if prod_layer.num_nodes + 1 > num_elements:
@@ -482,7 +493,8 @@ class TensorCircuit(nn.Module):
                     tied_param_ends = tied_param_ends,
                     ch_prod_layer_size = prod_layer.num_nodes + 1,
                     layer_sparsity_tol = layer_sparsity_tol,
-                    max_num_groups = max_num_groups
+                    max_num_groups = max_num_groups,
+                    disable_gpu_compilation = disable_gpu_compilation
                 )
 
                 num_nodes += sum_layer.num_nodes

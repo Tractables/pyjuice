@@ -43,7 +43,9 @@ def sparse_pc_test():
     t0 = time.time()
     pc = juice.TensorCircuit(ns, layer_sparsity_tol = 0.8)
     t1 = time.time()
-    print(t1 - t0)
+    
+    # This takes ~17s on a RTX 4090 GPU
+    assert t1 - t0 < 40
 
 
 if __name__ == "__main__":

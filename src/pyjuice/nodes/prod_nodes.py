@@ -32,14 +32,14 @@ class ProdNodes(CircuitNodes):
             for c in self.chs:
                 assert self.num_nodes == c.num_nodes, "Cannot create edges implicitly since # nodes do not match."
 
-            edge_ids = torch.arange(self.num_nodes).unsqueeze(1).repeat(1, self.num_child_regions)
+            edge_ids = torch.arange(self.num_nodes).unsqueeze(1).repeat(1, self.num_chs)
 
         if isinstance(edge_ids, np.ndarray):
             edge_ids = torch.from_numpy(edge_ids)
 
         # Sanity checks
-        assert edge_ids.size(0) == self.num_nodes and edge_ids.size(1) == self.num_child_regions, f"Expect edge_ids.size() == ({self.num_nodes}, {self.num_child_regions})."
-        for cid in range(self.num_child_regions):
+        assert edge_ids.size(0) == self.num_nodes and edge_ids.size(1) == self.num_chs, f"Expect edge_ids.size() == ({self.num_nodes}, {self.num_chs})."
+        for cid in range(self.num_chs):
             assert torch.all(edge_ids[:,cid] >= 0), "Edge index underflow."
             assert torch.all(edge_ids[:,cid] < self.chs[cid].num_nodes), "Edge index overflow."
 
@@ -58,7 +58,7 @@ class ProdNodes(CircuitNodes):
         if len(chs) == 0:
             chs = self.chs
         else:
-            assert self.num_child_regions == len(chs), f"Number of new children ({len(chs)}) must match the number of original children ({self.num_child_regions})."
+            assert self.num_chs == len(chs), f"Number of new children ({len(chs)}) must match the number of original children ({self.num_chs})."
             for old_c, new_c in zip(self.chs, chs):
                 assert type(old_c) == type(new_c), f"Child type not match: ({type(new_c)} != {type(old_c)})."
                 assert old_c.num_nodes == new_c.num_nodes, f"Child node size not match: ({new_c.num_nodes} != {old_c.num_nodes})."

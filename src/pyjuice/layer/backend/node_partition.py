@@ -1,17 +1,17 @@
 import torch
 import numpy as np
-from numba import njit, prange
+from numba import njit
 import math
 
 from typing import Union, Optional
 
 
-@njit(parallel = True)
+@njit()
 def _partition_nodes_dp_simple_compiled(nodes_n_edges, dp, backtrace, max_num_groups, target_overhead):
     num_nodes = nodes_n_edges.shape[0]
 
     # Init
-    for i in prange(num_nodes):
+    for i in range(num_nodes):
         dp[i,1] = nodes_n_edges[i] * (i + 1)
 
     # Main DP
@@ -57,30 +57,11 @@ def _partition_nodes_dp_simple(nodes_n_edges: np.ndarray, dp: np.ndarray, backtr
         max_num_groups,
         target_overhead = 0 if target_overhead is None else target_overhead
     )
-    
-    import time
-    t0 = time.time()
-    overhead, target_n_group = _partition_nodes_dp_simple_compiled(
-        np.ascontiguousarray(nodes_n_edges), 
-        np.ascontiguousarray(dp), 
-        np.ascontiguousarray(backtrace),
-        max_num_groups,
-        target_overhead = 0 if target_overhead is None else target_overhead
-    )
-    t1 = time.time()
-    print("numba time", t1 - t0)
-
-    # import pdb; pdb.set_trace()
-    ####### Left to tomorrow
 
     # Backtrace
     partitions = np.zeros([target_n_group], dtype = np.int64)
     num_nodes = nodes_n_edges.shape[0]
     _backtrace_fn(partitions, backtrace, target_n_group, num_nodes)
-
-    print(nodes_n_edges[partitions])
-
-    exit()
 
     return np.unique(nodes_n_edges[partitions]), overhead
 

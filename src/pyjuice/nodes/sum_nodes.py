@@ -102,7 +102,7 @@ class SumNodes(CircuitNodes):
         if chs is None:
             chs = self.chs
         else:
-            assert self.num_child_regions == len(chs), f"Number of new children ({len(chs)}) must match the number of original children ({self.num_child_regions})."
+            assert self.num_chs == len(chs), f"Number of new children ({len(chs)}) must match the number of original children ({self.num_chs})."
             for old_c, new_c in zip(self.chs, chs):
                 assert type(old_c) == type(new_c), f"Child type not match: ({type(new_c)} != {type(old_c)})."
                 assert old_c.num_nodes == new_c.num_nodes, f"Child node size not match: ({new_c.num_nodes} != {old_c.num_nodes})."

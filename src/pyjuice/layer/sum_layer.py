@@ -6,7 +6,6 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 import warnings
-import time
 from copy import deepcopy
 from typing import Sequence, List, Optional
 
@@ -24,14 +23,13 @@ class SumLayer(Layer, nn.Module):
                  param_ends: Sequence, tied_param_ids: Sequence,
                  tied_param_group_ids: Sequence, tied_param_ends: Sequence,
                  ch_prod_layer_size: int, layer_sparsity_tol: float = 0.0, 
-                 max_num_groups: Optional[int] = None) -> None:
+                 max_num_groups: Optional[int] = None,
+                 disable_gpu_compilation: bool = False) -> None:
 
         Layer.__init__(self)
         nn.Module.__init__(self)
 
         assert len(nodes) > 0, "No input node."
-
-        t0 = time.time() # debug
 
         self.nodes = nodes
         self.ch_prod_layer_size = ch_prod_layer_size
@@ -46,12 +44,9 @@ class SumLayer(Layer, nn.Module):
 
         # Find a good strategy to partition the nodes into groups according to their number of children 
         # to minimize total computation cost
-        t00 = time.time()
         fw_group_max_chs = partition_nodes_by_n_edges(
             n_chs, sparsity_tolerance = layer_sparsity_tol, max_num_groups = max_num_groups
         )
-        t01 = time.time()
-        print("is this slow", t01 - t00)
         
         self.num_fw_groups = len(fw_group_max_chs) # Number of groups
 
@@ -73,8 +68,6 @@ class SumLayer(Layer, nn.Module):
 
             min_n_chs = max_n_chs + 1
 
-        t1 = time.time() # debug
-
         ## Initialize forward pass ##
 
         # nids:      List[[num_nodes]]                   stores node ids
@@ -83,15 +76,14 @@ class SumLayer(Layer, nn.Module):
         # ch_n_pars: [ch_prod_layer_size]                stores the number of parents for each child node
         nids, cids, pids, ch_n_pars, param_ends = sum_layer_forward_compilation(
             self.nodes, fw_group_max_chs, fw_n_group_ids, fw_n_id_in_group, fw_num_ns_in_group, 
-            n_chs, global_nid_start, ch_prod_layer_size, param_ends = param_ends
+            n_chs, global_nid_start, ch_prod_layer_size, param_ends = param_ends,
+            use_cuda = not disable_gpu_compilation and (self.num_edges > 250000) # Consider tuning this
         )
 
         # Store buffers for the forward pass
         self.grouped_nids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in nids])
         self.grouped_cids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in cids])
         self.grouped_pids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in pids])
-
-        t2 = time.time() # debug
 
         ## Initialize backward pass ##
 
@@ -126,22 +118,18 @@ class SumLayer(Layer, nn.Module):
 
             min_n_pars = max_n_pars + 1
 
-        t3 = time.time() # debug
-
         # parids:     List[[group_size, group_max_n_pars]]  stores parameter ids for each child node
         # parpids:    List[[group_size, max_n_pars]]        param id for the edges to parent (correspond to `parids`)
         parids, parpids = sum_layer_backward_compilation(
             self.nodes, pids, fw_n_group_ids, fw_n_id_in_group, self.num_bk_groups, bk_n_group_ids, bk_n_id_in_group,
-            bk_group_max_pars, bk_num_ns_in_group, ch_prod_layer_size, global_nid_start
+            bk_group_max_pars, bk_num_ns_in_group, ch_prod_layer_size, global_nid_start,
+            use_cuda = not disable_gpu_compilation and (self.num_edges > 250000) # Consider tuning this
         )
 
         # Store buffers for the backward pass
         self.grouped_chids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in chids])
         self.grouped_parids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in parids])
         self.grouped_parpids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in parpids])
-
-        t4 = time.time() # debug
-        print("sum layer time breakdown", t1 - t0, t2 - t1, t3 - t2, t4 - t3)
 
     def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor) -> None:
         """

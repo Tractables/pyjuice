@@ -15,7 +15,8 @@ from .backend.index_set import batched_index_set, batched_index_cum
 
 class ProdLayer(Layer, nn.Module):
 
-    def __init__(self, nodes: Sequence[ProdNodes], layer_sparsity_tol: float = 0.0, max_num_groups: Optional[int] = None) -> None:
+    def __init__(self, nodes: Sequence[ProdNodes], layer_sparsity_tol: float = 0.0, 
+                 max_num_groups: Optional[int] = None, disable_gpu_compilation: bool = False) -> None:
         Layer.__init__(self)
         nn.Module.__init__(self)
 
@@ -27,8 +28,8 @@ class ProdLayer(Layer, nn.Module):
         layer_num_nodes = 0
         cum_nodes = 1 # id 0 is reserved for the dummy node
         for ns in self.nodes:
-            if ns.num_child_regions > max_n_chs:
-                max_n_chs = ns.num_child_regions
+            if ns.num_chs > max_n_chs:
+                max_n_chs = ns.num_chs
             ns._output_ind_range = (cum_nodes, cum_nodes + ns.num_nodes)
             cum_nodes += ns.num_nodes
             layer_num_nodes += ns.num_nodes
@@ -46,7 +47,7 @@ class ProdLayer(Layer, nn.Module):
             for i, c in enumerate(ns.chs):
                 cids[node_start:node_end, i] = ns.edge_ids[:,i] + c._output_ind_range[0]
                 
-            n_chs[node_start:node_end] = ns.num_child_regions
+            n_chs[node_start:node_end] = ns.num_chs
 
             node_start = node_end
 

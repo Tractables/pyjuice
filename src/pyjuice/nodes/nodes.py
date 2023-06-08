@@ -74,7 +74,7 @@ class CircuitNodes():
         return isinstance(self.region_node, InputRegionNode)
 
     @property
-    def num_child_regions(self):
+    def num_chs(self):
         return len(self.chs)
 
     def duplicate(self, *args, **kwargs):
