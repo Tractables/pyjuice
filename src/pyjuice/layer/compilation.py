@@ -47,7 +47,11 @@ def get_chunk_ids(n, k):
 
 
 def next_power_of_2(x: torch.Tensor):
-    return 2 ** torch.ceil(torch.log2(x.float())).long()
+    return torch.where(
+        x == 1,
+        1,
+        2 ** torch.ceil(torch.log2(x.float())).long()
+    )
 
 
 ## Compilation for SumLayer ##
@@ -312,7 +316,8 @@ def sum_layer_forward_compilation(nodes, fw_group_max_chs, n_group_ids, n_id_in_
 def sum_layer_backward_compilation(nodes, pids, fw_n_group_ids, fw_n_id_in_group, 
                                    num_bk_groups, bk_n_group_ids, bk_n_id_in_group, 
                                    bk_group_max_pars, bk_num_ns_in_group,
-                                   ch_prod_layer_size, global_nid_start, use_cuda: bool = False):
+                                   ch_prod_layer_size, global_nid_start, use_cuda: bool = False,
+                                   debug = False):
 
     if use_cuda and not torch.cuda.is_available():
         use_cuda = False
@@ -370,6 +375,7 @@ def sum_layer_backward_compilation(nodes, pids, fw_n_group_ids, fw_n_id_in_group
             cid_end = cid_start + cs.num_nodes
             cid_starts[cnode_id] = cid_start
             cid_ends[cnode_id] = cid_end
+            cid_start = cid_end
         
         if use_cuda:
             cid_starts = cid_starts.cuda()
@@ -404,6 +410,7 @@ def sum_layer_backward_compilation(nodes, pids, fw_n_group_ids, fw_n_id_in_group
 
                 par_counts[ch_ids] += 1
                 cid_start = cid_end
+                pid_start = pid_end
 
         node_start = node_end
 

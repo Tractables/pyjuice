@@ -131,7 +131,8 @@ class SumLayer(Layer, nn.Module):
         parids, parpids = sum_layer_backward_compilation(
             self.nodes, pids, fw_n_group_ids, fw_n_id_in_group, self.num_bk_groups, bk_n_group_ids, bk_n_id_in_group,
             bk_group_max_pars, bk_num_ns_in_group, ch_prod_layer_size, global_nid_start,
-            use_cuda = not disable_gpu_compilation and (self.num_edges > 250000) # Consider tuning this
+            use_cuda = not disable_gpu_compilation and (self.num_edges > 250000), # Consider tuning this
+            debug = (bk_group_max_pars[0] == 1).item()
         )
 
         # Store buffers for the backward pass
