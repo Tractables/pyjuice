@@ -114,6 +114,8 @@ def sum_layer_forward_compilation_job(flat_nodes, nids, cids, pids, fw_group_max
             cid_end = cid_start + cs_num_nodes
             cid_starts[cnode_id] = cid_start
             cid_ends[cnode_id] = cid_end
+
+            cid_start = cid_end
         
         if use_cuda:
             cid_starts = cid_starts.cuda()
@@ -141,20 +143,20 @@ def sum_layer_forward_compilation_job(flat_nodes, nids, cids, pids, fw_group_max
 
             ns_criterion = (edge_ids[0,:] == nid)
 
+            # assign node id
+            nids[group_id][local_id] = global_nid
+
             ch_start = 0
             cid_start = 0
             for cnode_id, flat_cs in enumerate(flat_ns[3]):
                 cs_num_nodes = flat_cs[0]
                 cs_out_ind_range = flat_cs[1]
                 cid_end = cid_start + cs_num_nodes
-                criterion = cs_criterion[cnode_id,:] & ns_criterion
-                cid_start = cid_end
 
-                # assign node id
-                nids[group_id][local_id] = global_nid
+                criterion = cs_criterion[cnode_id,:] & ns_criterion
 
                 # assign child ids
-                ch_ids = edge_ids[1,criterion] + cs_out_ind_range[0]
+                ch_ids = edge_ids[1,criterion] + (cs_out_ind_range[0] - cid_start)
                 cids[group_id][local_id,ch_start:ch_start+ch_ids.size(0)] = ch_ids
 
                 # mapping from the current params to global params
@@ -164,6 +166,7 @@ def sum_layer_forward_compilation_job(flat_nodes, nids, cids, pids, fw_group_max
                     ns_param_ids[curr_ids] = curr_param_ids
 
                 ch_start += ch_ids.size(0)
+                cid_start = cid_end
 
             # assign parameter ids
             parids = torch.arange(ch_start, device = edge_ids.device) + (ns_pid_start + ns_local_pid)
@@ -273,6 +276,8 @@ def sum_layer_forward_compilation(nodes, fw_group_max_chs, n_group_ids, n_id_in_
             cs_e_oind = cs._output_ind_range[1]
             c_ns_counts = torch.bincount(ns.edge_ids[1,criterion] - ch_start)
             ch_n_pars[cs_s_oind:cs_e_oind] = c_ns_counts
+
+            ch_start = ch_end
 
     # Store local -> global parameter id mapping in `ns`
     for ns_param_ids in all_ns_param_ids:
