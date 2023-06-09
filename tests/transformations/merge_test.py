@@ -51,10 +51,10 @@ def prod_nodes_merge_test():
 
     m_new = merge_prod_nodes(m00, m01)
     assert (m_new.edge_ids == torch.Tensor([[0,0],[1,1],[2,2],[3,3]])).all()
-    assert m_new.chs[0].chs[0] == i00
-    assert m_new.chs[0].chs[1] == i01
-    assert m_new.chs[1].chs[0] == i10
-    assert m_new.chs[1].chs[1] == i11
+    assert m_new.chs[0].chs[0].chs[0] == i00
+    assert m_new.chs[0].chs[1].chs[0] == i01
+    assert m_new.chs[1].chs[0].chs[0] == i10
+    assert m_new.chs[1].chs[1].chs[0] == i11
 
     m_new = merge_prod_nodes(m00, m02)
     assert (m_new.edge_ids == torch.Tensor([[0,0],[1,1],[0,0],[1,1]])).all()
@@ -100,10 +100,10 @@ def merge_by_region_node_test():
     assert len(new_n.chs[0].chs[0].chs[0].chs) == 2
     assert (new_n.chs[0].chs[1].chs[0].edge_ids == torch.Tensor([[0,0],[1,1]])).all()
     assert len(new_n.chs[0].chs[1].chs[0].chs) == 2
-    assert new_n.chs[0].chs[0].chs[0].chs[0].chs[0] == i00
-    assert new_n.chs[0].chs[0].chs[0].chs[0].chs[1] == i01
-    assert new_n.chs[0].chs[0].chs[0].chs[1].chs[0] == i10
-    assert new_n.chs[0].chs[0].chs[0].chs[1].chs[1] == i11
+    assert new_n.chs[0].chs[0].chs[0].chs[0].chs[0].chs[0] == i00
+    assert new_n.chs[0].chs[0].chs[0].chs[0].chs[1].chs[0] == i01
+    assert new_n.chs[0].chs[0].chs[0].chs[1].chs[0].chs[0] == i10
+    assert new_n.chs[0].chs[0].chs[0].chs[1].chs[1].chs[0] == i11
     assert new_n.chs[0].chs[1].chs[0].chs[0] == i20
     assert new_n.chs[0].chs[1].chs[0].chs[1] == i30
 
