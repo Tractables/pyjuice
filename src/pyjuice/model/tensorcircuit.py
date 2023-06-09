@@ -544,14 +544,9 @@ class TensorCircuit(nn.Module):
         for layer in self.inner_layers:
             if isinstance(layer, SumLayer):
                 for ns in layer.nodes:
-                    if ns.has_params():
+                    if not ns.is_tied() and ns.has_params():
                         sidx, eidx = ns._param_range
-                        if ns.is_tied():
-                            # Retrieve tied parameters from the source node
-                            source_ns = ns.get_source_ns()
-                            params[sidx:eidx] = source_ns._params[ns._inverse_param_ids].to(params.device)
-                        else:
-                            params[sidx:eidx] = ns._params[ns._inverse_param_ids].to(params.device)
+                        params[sidx:eidx] = ns._params[ns._inverse_param_ids].to(params.device)
 
         self._normalize_parameters(params, pseudocount = pseudocount)
         self.params = nn.Parameter(params)
