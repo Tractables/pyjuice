@@ -161,7 +161,9 @@ class SumLayer(Layer, nn.Module):
             cids = self.grouped_cids[group_id]
             pids = self.grouped_pids[group_id]
 
-            self._forward_triton(node_mars, element_mars, params, nids, cids, pids)
+            self._forward(
+                node_mars, element_mars, params, nids, cids, pids
+            )
 
         return None
 
@@ -193,8 +195,10 @@ class SumLayer(Layer, nn.Module):
             parids = self.grouped_parids[group_id]
             parpids = self.grouped_parpids[group_id]
 
-            self._backward_triton(node_flows, element_flows, params, node_mars, 
-                                  element_mars, param_flows, chids, parids, parpids)
+            self._backward(
+                node_flows, element_flows, params, node_mars, 
+                element_mars, param_flows, chids, parids, parpids
+            )
 
         return None
 
@@ -303,10 +307,10 @@ class SumLayer(Layer, nn.Module):
 
         return None
 
-    def _forward_triton(self, node_mars: torch.Tensor, element_mars: torch.Tensor, 
-                        params: torch.Tensor, nids: torch.Tensor, cids: torch.Tensor,
-                        pids: torch.Tensor, BLOCK_M_HARD_LIMIT = 2**16, BLOCK_SIZE = 2**12, 
-                        MAX_BLOCK_M = 2**12, MAX_BLOCK_N = 64) -> None:
+    def _forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor, 
+                 params: torch.Tensor, nids: torch.Tensor, cids: torch.Tensor,
+                 pids: torch.Tensor, BLOCK_M_HARD_LIMIT = 2**16, BLOCK_SIZE = 2**12, 
+                 MAX_BLOCK_M = 2**12, MAX_BLOCK_N = 64) -> None:
         """
         This function is equivalent to running:
         ``` 
@@ -450,20 +454,20 @@ class SumLayer(Layer, nn.Module):
                                  element_mars: torch.Tensor, param_flows: torch.Tensor, 
                                  chids: torch.Tensor, parids: torch.Tensor, parpids: torch.Tensor):
         
-        element_flows[chids] = (node_flows[parids] * params[parpids] * \
+        element_flows[chids] = (node_flows[parids] * params[parpids].unsqueeze(-1) * \
             (element_mars[chids].unsqueeze(1) - node_mars[parids]).exp()).sum(dim = 1)
 
-        param_flows[seq_parpids] += (node_flows[parids] * params[parpids] * \
+        param_flows[seq_parpids] += (node_flows[parids] * params[parpids].unsqueeze(-1) * \
             (element_mars[chids].unsqueeze(1) - node_mars[parids]).exp()).sum(dim = 2)[seq_ids0, seq_ids1]
 
         return None
 
-    def _backward_triton(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
-                         params: torch.Tensor, node_mars: torch.Tensor, 
-                         element_mars: torch.Tensor, param_flows: torch.Tensor, 
-                         chids: torch.Tensor, parids: torch.Tensor, parpids: torch.Tensor, 
-                         BLOCK_M_HARD_LIMIT = 2**16, BLOCK_SIZE = 2**12, MAX_BLOCK_M = 2**12, 
-                         MAX_BLOCK_N = 64) -> None:
+    def _backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
+                  params: torch.Tensor, node_mars: torch.Tensor, 
+                  element_mars: torch.Tensor, param_flows: torch.Tensor, 
+                  chids: torch.Tensor, parids: torch.Tensor, parpids: torch.Tensor, 
+                  BLOCK_M_HARD_LIMIT = 2**16, BLOCK_SIZE = 2**12, MAX_BLOCK_M = 2**12, 
+                  MAX_BLOCK_N = 64) -> None:
         """
         This function is equivalent to running:
         ``` 
@@ -493,6 +497,12 @@ class SumLayer(Layer, nn.Module):
 
         if params.dim() == 2 and params.size(1) == 1:
             params = params.squeeze(1)
+
+        # If child nodes in the current group have no parent, we set the corresponding element flows to 0
+        if n_edges == 0:
+            element_flows[chids] = 0.0
+
+            return None
 
         # Fall back to the `torch.compile` kernel in the case where we cannot store child edges within a single block
         if n_edges > BLOCK_M_HARD_LIMIT or not node_mars.is_cuda:
@@ -549,11 +559,14 @@ class SumLayer(Layer, nn.Module):
             cids = self.grouped_cids[group_id]
             pids = self.grouped_pids[group_id]
 
+            N, C = cids.size()
+            B = node_mars.size(1)
+
             ch_mars = element_mars[cids]
             maxval = ch_mars.max(dim = 1, keepdim = True).values
             unnorm_probs = (ch_mars - maxval).exp() * params[pids]
             dist = torch.distributions.Categorical(probs = unnorm_probs.permute(0, 2, 1))
-            node_mask[nids] = dist.sample() # [num nodes, batch_size]
+            node_mask[nids] = cids.unsqueeze(2).expand(N, C, B).gather(1, dist.sample().unsqueeze(1)).squeeze(1) # [num nodes, batch_size]
 
         return None
 
@@ -565,6 +578,6 @@ class SumLayer(Layer, nn.Module):
             parids = self.grouped_parids[group_id]
             parcids = self.grouped_parcids[group_id]
 
-            element_flows[chids] = (node_flows[parids] * (node_mask[parids] == parcids.unsqueeze(-1))).any(dim = 1)
+            element_flows[chids] = (node_flows[parids] * (node_mask[parids] == chids.unsqueeze(-1))).any(dim = 1)
 
         return None

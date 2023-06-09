@@ -274,7 +274,7 @@ def sum_layer_forward_compilation(nodes, fw_group_max_chs, n_group_ids, n_id_in_
             
             cs_s_oind = cs._output_ind_range[0]
             cs_e_oind = cs._output_ind_range[1]
-            c_ns_counts = torch.bincount(ns.edge_ids[1,criterion] - ch_start)
+            c_ns_counts = torch.bincount(ns.edge_ids[1,criterion] - ch_start, minlength = cs.num_nodes)
             ch_n_pars[cs_s_oind:cs_e_oind] = c_ns_counts
 
             ch_start = ch_end
