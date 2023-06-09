@@ -2,6 +2,7 @@ import pyjuice as juice
 import torch
 import pyjuice.nodes.distributions as dists
 from pyjuice.functional import tie_param_flows
+from pyjuice import inputs, multiply, summate
 
 
 def tie_function_test():
@@ -120,7 +121,84 @@ def tie_input_nodes_test():
         assert (pc.input_layers[0].param_flows[i+5] - m2f[dids[:,0] == i].sum() - m2f[dids[:,1] == i].sum()).abs() < 1e-3
 
 
+def tie_sparse_nodes_test():
+    
+    device = torch.device("cuda:0")
+
+    num_nodes = 2
+    
+    i0 = juice.inputs(0, num_nodes, dists.Categorical(num_cats = 5))
+    i1 = juice.inputs(1, num_nodes, dists.Categorical(num_cats = 5))
+    i2 = juice.inputs(2, num_nodes, dists.Categorical(num_cats = 5))
+    i3 = juice.inputs(3, num_nodes, dists.Categorical(num_cats = 5))
+
+    m00 = multiply(i0, i1)
+    m01 = multiply(i0, i1, edge_ids = torch.tensor([[1,0]], dtype = torch.long))
+    n0 = summate(m00, m01, edge_ids = torch.tensor([[0,0,0,1,1],[0,1,2,1,2]], dtype = torch.long))
+
+    m10 = multiply(i2, i3)
+    m11 = multiply(i2, i3, edge_ids = torch.tensor([[1,0]], dtype = torch.long))
+    n1 = n0.duplicate(m10, m11, tie_params = True)
+
+    m = multiply(n0, n1)
+    n = summate(m, num_nodes = 1)
+
+    n.init_parameters()
+
+    pc = juice.TensorCircuit(n)
+
+    pc.to(device)
+
+    data = torch.randint(0, 5, [1, 4]).to(device)
+
+    lls = pc(data)
+
+    pc.backward(data)
+
+    ## Unit tests for compilation result ##
+
+    assert torch.all(pc.inner_layers[1].grouped_nids[0].cpu() == torch.tensor([10, 12], dtype = torch.long))
+    assert torch.all(pc.inner_layers[1].grouped_nids[1].cpu() == torch.tensor([9, 11], dtype = torch.long))
+    assert torch.all(pc.inner_layers[1].grouped_cids[0].cpu() == torch.tensor([[2,3],[5,6]], dtype = torch.long))
+    assert torch.all(pc.inner_layers[1].grouped_cids[1].cpu() == torch.tensor([[1,2,3,0],[4,5,6,0]], dtype = torch.long))
+    assert torch.all(pc.inner_layers[1].grouped_pids[0].cpu() == torch.tensor([[4,5],[4,5]], dtype = torch.long))
+    assert torch.all(pc.inner_layers[1].grouped_pids[1].cpu() == torch.tensor([[1,2,3,0],[1,2,3,0]], dtype = torch.long))
+
+    assert torch.all(pc.inner_layers[1].grouped_chids[0].cpu() == torch.tensor([1,4], dtype = torch.long))
+    assert torch.all(pc.inner_layers[1].grouped_chids[1].cpu() == torch.tensor([2,3,5,6], dtype = torch.long))
+    assert torch.all(pc.inner_layers[1].grouped_parids[0].cpu() == torch.tensor([[9],[11]], dtype = torch.long))
+    assert torch.all(pc.inner_layers[1].grouped_parids[1].cpu() == torch.tensor([[9,10],[9,10],[11,12],[11,12]], dtype = torch.long))
+    assert torch.all(pc.inner_layers[1].grouped_parpids[0].cpu() == torch.tensor([[1],[1]], dtype = torch.long))
+    assert torch.all(pc.inner_layers[1].grouped_parpids[1].cpu() == torch.tensor([[2,4],[3,5],[2,4],[3,5]], dtype = torch.long))
+
+    ## Unit tests for parameter flows ##
+
+    p9 = torch.exp(pc.node_mars[9,0])
+    p10 = torch.exp(pc.node_mars[10,0])
+    p11 = torch.exp(pc.node_mars[11,0])
+    p12 = torch.exp(pc.node_mars[12,0])
+
+    f9 = pc.node_flows[9,0]
+    f10 = pc.node_flows[10,0]
+    f11 = pc.node_flows[11,0]
+    f12 = pc.node_flows[12,0]
+
+    pm1 = torch.exp(pc.node_mars[1,0] + pc.node_mars[3,0])
+    pm2 = torch.exp(pc.node_mars[2,0] + pc.node_mars[4,0])
+    pm3 = torch.exp(pc.node_mars[2,0] + pc.node_mars[3,0])
+    pm4 = torch.exp(pc.node_mars[5,0] + pc.node_mars[7,0])
+    pm5 = torch.exp(pc.node_mars[6,0] + pc.node_mars[8,0])
+    pm6 = torch.exp(pc.node_mars[6,0] + pc.node_mars[7,0])
+
+    assert torch.abs(f9 * pm1 * pc.params[1] / p9 + f11 * pm4 * pc.params[1] / p11 - pc.param_flows[1]) < 1e-4
+    assert torch.abs(f9 * pm2 * pc.params[2] / p9 + f11 * pm5 * pc.params[2] / p11 - pc.param_flows[2]) < 1e-4
+    assert torch.abs(f9 * pm3 * pc.params[3] / p9 + f11 * pm6 * pc.params[3] / p11 - pc.param_flows[3]) < 1e-4
+    assert torch.abs(f10 * pm2 * pc.params[4] / p10 + f12 * pm5 * pc.params[4] / p12 - pc.param_flows[4]) < 1e-4
+    assert torch.abs(f10 * pm3 * pc.params[5] / p10 + f12 * pm6 * pc.params[5] / p12 - pc.param_flows[5]) < 1e-4
+
+
 if __name__ == "__main__":
     tie_function_test()
     tie_sum_nodes_test()
     tie_input_nodes_test()
+    tie_sparse_nodes_test()
