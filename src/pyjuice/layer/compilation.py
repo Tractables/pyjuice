@@ -445,6 +445,7 @@ def sum_layer_backward_compilation(nodes, pids, fw_n_group_ids, fw_n_id_in_group
 
 def get_prod_layer_stats(nodes: Sequence[SumNodes]):
     layer_num_nodes = sum(map(lambda ns: ns.num_nodes, nodes))
+    layer_num_edges = 0
     
     global_nid_start = 1 # idx 0 is reserved for the dummy node
 
@@ -455,12 +456,14 @@ def get_prod_layer_stats(nodes: Sequence[SumNodes]):
 
         n_chs[n_sid:n_eid] = ns.num_chs
 
+        layer_num_edges += ns.num_nodes * ns.num_chs
+
         ns._output_ind_range = (global_nid_start, global_nid_start + ns.num_nodes)
         global_nid_start += ns.num_nodes
 
         n_sid = n_eid
 
-    return layer_num_nodes, n_chs
+    return layer_num_nodes, layer_num_edges, n_chs
 
 
 @torch.no_grad()
