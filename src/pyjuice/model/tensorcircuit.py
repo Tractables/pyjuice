@@ -7,7 +7,7 @@ import triton
 import triton.language as tl
 from tqdm import tqdm
 from functools import partial
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Callable
 
 from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes, foreach
 from pyjuice.layer import Layer, InputLayer, ProdLayer, SumLayer, layerize
@@ -15,11 +15,12 @@ from pyjuice.functional import normalize_parameters, flat_softmax_fw, flat_softm
 from pyjuice.utils.grad_fns import ReverseGrad, PseudoHookFunc
 
 
-def _pc_model_backward_hook(grad, pc):
+def _pc_model_backward_hook(grad, pc, **kwargs):
     pc.backward(
         ll_weights = grad / grad.sum() * grad.size(0),
         compute_param_flows = pc._optim_hyperparams["compute_param_flows"], 
-        flows_memory = pc._optim_hyperparams["flows_memory"]
+        flows_memory = pc._optim_hyperparams["flows_memory"],
+        **kwargs
     )
 
     pc._backward_buffer.clear()
@@ -91,24 +92,23 @@ class TensorCircuit(nn.Module):
     def forward(self, inputs: torch.Tensor, 
                 params: Optional[torch.Tensor] = None, 
                 input_params: Optional[Dict[str,torch.Tensor]] = None,
-                missing_mask: Optional[torch.Tensor] = None):
+                input_layer_fn: Optional[Union[str,Callable]] = None,
+                **kwargs):
         """
         Forward the circuit.
 
         Parameters:
-        `inputs`: [B, num_vars]
-        `params`: None or [B, num_params]
-        `input_params`: a dictionary of input parameters
-        `missing_mask`: [B, num_vars]
+        `inputs`:         [B, num_vars]
+        `params`:         None or [B, num_params]
+        `input_params`:   A dictionary of input parameters
+        `input_layer_fn`: Custom forward function for input layers;
+                          if it is a string, then try to call 
+                          the corresponding member function of `input_layer`
+        `kwargs`:         Additional arguments for input layers
         """
-                
-        if missing_mask is not None:
-            assert inputs.size() == missing_mask.size(), f"inputs.size {inputs.size()} != mask.size {missing_mask.size()}" 
         
         B = inputs.size(0)
         inputs = inputs.permute(1, 0)
-        if missing_mask is not None:
-            missing_mask = missing_mask.permute(1, 0)
         
         self.node_mars = torch.empty([self.num_nodes, B], device = self.device)
         self.element_mars = torch.empty([self.num_elements, B], device = self.device)
@@ -137,6 +137,7 @@ class TensorCircuit(nn.Module):
             self._backward_buffer["external_input_layers"] = set()
 
         with torch.no_grad():
+            # Compute forward pass for all input layers
             for idx, layer in enumerate(self.input_layers):
                 if input_params is not None and f"input_{idx}" in input_params:
                     layer_params = input_params[f"input_{idx}"]
@@ -146,7 +147,15 @@ class TensorCircuit(nn.Module):
                 else:
                     layer_params = None
 
-                layer(inputs, self.node_mars, params = layer_params, missing_mask = missing_mask)
+                if input_layer_fn is None:
+                    layer(inputs, self.node_mars, params = layer_params, **kwargs)
+                elif isinstance(input_layer_fn, str):
+                    assert hasattr(layer, input_layer_fn), f"Custom input function `{input_layer_fn}` not found for layer type {type(layer)}."
+                    getattr(layer, input_layer_fn)(inputs, self.node_mars, params = layer_params, **kwargs)
+                else:
+                    assert isinstance(input_layer_fn, Callable), f"Custom input function should be either a `str` or a `Callable`. " + \
+                                                           f"Found {type(input_layer_fn)} instead."
+                    input_layer_fn(layer, inputs, self.node_mars, params = layer_params, **kwargs)
 
             for layer in self.inner_layers:
                 if isinstance(layer, ProdLayer):
@@ -164,7 +173,7 @@ class TensorCircuit(nn.Module):
 
         if torch.is_grad_enabled():
             lls.requires_grad = True
-            lls.register_hook(partial(_pc_model_backward_hook, pc = self))
+            lls.register_hook(partial(_pc_model_backward_hook, pc = self, **kwargs))
 
             self._inputs[0] = ReverseGrad.apply(inputs) # Record inputs for backward
 
@@ -182,13 +191,19 @@ class TensorCircuit(nn.Module):
     def backward(self, inputs: Optional[torch.Tensor] = None, 
                  ll_weights: Optional[torch.Tensor] = None,
                  compute_param_flows: bool = True, 
-                 flows_memory: float = 0.0):
+                 flows_memory: float = 0.0,
+                 input_layer_fn: Optional[Union[str,Callable]] = None,
+                 **kwargs):
         """
         Compute circuit flows.
 
         Parameters:
-        `inputs`:       None or [B, num_vars]
-        `ll_weights`:   None or [B] or [B, num_roots]
+        `inputs`:         None or [B, num_vars]
+        `ll_weights`:     None or [B] or [B, num_roots]
+        `input_layer_fn`: Custom forward function for input layers;
+                          if it is a string, then try to call 
+                          the corresponding member function of `input_layer`
+        `kwargs`:         Additional arguments for input layers
         """
 
         assert self.node_mars is not None and self.element_mars is not None, "Should run forward path first."
@@ -243,9 +258,18 @@ class TensorCircuit(nn.Module):
                 else:
                     inputs = inputs.permute(1, 0)
 
+                # Compute backward pass for all input layers
                 grad_hook_idx = 2
                 for idx, layer in enumerate(self.input_layers):
-                    layer.backward(inputs, self.node_flows, self.node_mars)
+                    if input_layer_fn is None:
+                        layer.backward(inputs, self.node_flows, self.node_mars, **kwargs)
+                    elif isinstance(input_layer_fn, str):
+                        assert hasattr(layer, input_layer_fn), f"Custom input function `{input_layer_fn}` not found for layer type {type(layer)}."
+                        getattr(layer, input_layer_fn)(inputs, self.node_flows, self.node_mars, **kwargs)
+                    else:
+                        assert isinstance(input_layer_fn, Callable), f"Custom input function should be either a `str` or a `Callable`. " + \
+                                                                     f"Found {type(input_layer_fn)} instead."
+                        input_layer_fn(layer, inputs, self.node_flows, self.node_mars, **kwargs)
 
                     if "external_input_layers" in self._backward_buffer and idx in self._backward_buffer["external_input_layers"]:
                         grad_hook_idx = layer._hook_param_grads(grad_hook_idx, self._inputs, self._inputs_grad)
@@ -439,6 +463,9 @@ class TensorCircuit(nn.Module):
         # Nodes include one dummy node and all input/sum nodes in the PC
         num_nodes = 1
 
+        # Total number of edges
+        num_edges = 0
+
         # Elements include one dummy element and all product nodes in the PC
         num_elements = 1
 
@@ -498,6 +525,7 @@ class TensorCircuit(nn.Module):
                 )
 
                 num_nodes += sum_layer.num_nodes
+                num_edges += prod_layer.num_edges + sum_layer.num_edges
 
                 self.add_module(f"sum_layer_{layer_id}", sum_layer)
                 self.inner_layers.append(sum_layer)
@@ -505,6 +533,7 @@ class TensorCircuit(nn.Module):
                 layer_id += 1
 
         self.num_nodes = num_nodes
+        self.num_edges = num_edges
         self.num_elements = num_elements
         self.num_sum_params = param_ends[-1]
         self.param_ends = param_ends
