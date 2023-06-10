@@ -29,9 +29,10 @@ class ProdLayer(Layer, nn.Module):
 
         ## Get layer statistics & prepare for compilation ##
 
-        layer_num_nodes, n_chs = get_prod_layer_stats(self.nodes)
+        layer_num_nodes, layer_num_edges, n_chs = get_prod_layer_stats(self.nodes)
 
         self.num_nodes = layer_num_nodes
+        self.num_edges = layer_num_edges
 
         # Find a good strategy to partition the nodes into groups according to their number of children 
         # to minimize total computation cost
