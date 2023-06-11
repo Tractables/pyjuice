@@ -428,7 +428,8 @@ class SumLayer(Layer, nn.Module):
         ele_ids = tl.load(chids_ptr + n_offsets, mask = n_mask, other = 0)
         ele_offsets = tl.broadcast_to(ele_ids[None,:], (BLOCK_N, n_nodes_per_block_m)) * batch_size + \
             tl.broadcast_to(b_offsets[:,None], (BLOCK_N, n_nodes_per_block_m))
-        ele_mask = tl.broadcast_to(n_mask[None,:], (BLOCK_N, n_nodes_per_block_m))
+        ele_mask = tl.broadcast_to(n_mask[None,:], (BLOCK_N, n_nodes_per_block_m)) & \
+            tl.broadcast_to(b_mask[:,None], (BLOCK_N, n_nodes_per_block_m))
         emars = tl.load(element_mars_ptr + ele_offsets, mask = ele_mask, other = 0) # element_mars[chids]
         emars = tl.broadcast_to(emars[:,None,:], (BLOCK_N, n_edges, n_nodes_per_block_m)) # element_mars[chids].unsqueeze(1)
 
