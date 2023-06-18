@@ -201,28 +201,6 @@ class SumLayer(Layer, nn.Module):
             )
 
         return None
-
-    def sample(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
-               node_mars: torch.Tensor, element_mars: torch.Tensor, 
-               params: torch.Tensor, node_mask: torch.Tensor) -> None:
-        """
-        Compute sampling flow.
-
-        Parameters:
-        `node_flows`:    [num_nodes, B]
-        `element_flows`: [max_num_els, B]
-        `node_mars`:     [num_nodes, B]
-        `element_mars`:  [max_num_els, B]
-        `params`:        [num_params] or [num_params, B]
-        `node_mask`:     [num_nodes, B]
-        """
-        if params.dim() == 1:
-            params = params.unsqueeze(1)
-
-        self._sample_mask_generation(node_mars, element_mars, params, node_mask)
-        self._sample_backward_pass(node_flows, element_flows, node_mars, element_mars, params, node_mask)
-
-        return None
         
     @staticmethod
     @triton.jit
@@ -467,7 +445,7 @@ class SumLayer(Layer, nn.Module):
                   params: torch.Tensor, node_mars: torch.Tensor, 
                   element_mars: torch.Tensor, param_flows: torch.Tensor, 
                   chids: torch.Tensor, parids: torch.Tensor, parpids: torch.Tensor, 
-                  BLOCK_M_HARD_LIMIT = 2**16, BLOCK_SIZE = 2**12, MAX_BLOCK_M = 2**12, 
+                  BLOCK_M_HARD_LIMIT = 2**16, BLOCK_SIZE = 2**12, MAX_BLOCK_M = 2**11, 
                   MAX_BLOCK_N = 64) -> None:
         """
         This function is equivalent to running:
@@ -549,36 +527,5 @@ class SumLayer(Layer, nn.Module):
             BLOCK_M = BLOCK_M, 
             BLOCK_N = BLOCK_N
         )
-
-        return None
-
-    @torch.compile(mode = "reduce-overhead", fullgraph = True)
-    def _sample_mask_generation(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor,
-                                node_mask: torch.Tensor):
-        for group_id in range(self.num_fw_groups):
-            nids = self.grouped_nids[group_id]
-            cids = self.grouped_cids[group_id]
-            pids = self.grouped_pids[group_id]
-
-            N, C = cids.size()
-            B = node_mars.size(1)
-
-            ch_mars = element_mars[cids]
-            maxval = ch_mars.max(dim = 1, keepdim = True).values
-            unnorm_probs = (ch_mars - maxval).exp() * params[pids]
-            dist = torch.distributions.Categorical(probs = unnorm_probs.permute(0, 2, 1))
-            node_mask[nids] = cids.unsqueeze(2).expand(N, C, B).gather(1, dist.sample().unsqueeze(1)).squeeze(1) # [num nodes, batch_size]
-
-        return None
-
-    @torch.compile(mode = "reduce-overhead", fullgraph = True)
-    def _sample_backward_pass(self, node_flows: torch.Tensor, element_flows: torch.Tensor, node_mars: torch.Tensor, 
-                              element_mars: torch.Tensor, params: torch.Tensor, node_mask: torch.Tensor):
-        for group_id in range(self.num_backward_groups):
-            chids = self.grouped_chids[group_id]
-            parids = self.grouped_parids[group_id]
-            parcids = self.grouped_parcids[group_id]
-
-            element_flows[chids] = (node_flows[parids] * (node_mask[parids] == chids.unsqueeze(-1))).any(dim = 1)
 
         return None

@@ -13,9 +13,6 @@ from pyjuice.nodes.distributions import Categorical
 from pyjuice.layer.input_layer import InputLayer
 from pyjuice.functional import normalize_parameters
 
-# Try to enable tensor cores
-torch.set_float32_matmul_precision('high')
-
 
 class CategoricalLayer(InputLayer, nn.Module):
     
@@ -63,14 +60,21 @@ class CategoricalLayer(InputLayer, nn.Module):
         # Construct layered
         vids = torch.empty([self.num_nodes], dtype = torch.long)
         psids = torch.empty([self.num_nodes], dtype = torch.long)
-        n_start, pn_start = 0, 0
+        node_ids = torch.empty([self.num_params], dtype = torch.long)
+        node_nchs = torch.empty([self.num_nodes], dtype = torch.long)
+        n_start, pn_start, p_start = 0, 0, 0
         ns2pnrange = dict()
         for idx, ns in enumerate(self.nodes):
             n_end = n_start + ns.num_nodes
             vids[n_start:n_end] = self.vars[idx]
 
+            node_nchs[n_start:n_end] = ns.dist.num_cats
+
             if not ns.is_tied():
                 pn_end = pn_start + ns.num_nodes
+                p_end = p_start + ns.num_nodes * ns.dist.num_cats
+
+                node_ids[p_start:p_end] = torch.arange(pn_start, pn_end)[:,None].repeat(1, ns.dist.num_cats).reshape(-1)
 
                 if idx == 0:
                     psids[0] = 0
@@ -81,6 +85,7 @@ class CategoricalLayer(InputLayer, nn.Module):
                     ns2pnrange[ns] = (pn_start, pn_end)
 
                 pn_start = pn_end
+                p_start = p_end
             else:
                 source_ns = ns.get_source_ns()
                 pns, pne = ns2pnrange[source_ns]
@@ -94,16 +99,6 @@ class CategoricalLayer(InputLayer, nn.Module):
 
         self.register_buffer("vids", vids)
         self.register_buffer("psids", psids)
-
-        # For parameter normalization
-        node_ids = torch.empty([self.num_params], dtype = torch.long)
-        node_nchs = torch.empty([self.num_nodes], dtype = torch.long)
-        node_ids[:self.param_ends[0]] = 0
-        node_nchs[0] = self.param_ends[0]
-        for i in range(1, len(self.param_ends)):
-            node_ids[self.param_ends[i-1]:self.param_ends[i]] = i
-            node_nchs[i] = self.param_ends[i] - self.param_ends[i-1]
-        
         self.register_buffer("node_ids", node_ids)
         self.register_buffer("node_nchs", node_nchs)
 
@@ -154,34 +149,96 @@ class CategoricalLayer(InputLayer, nn.Module):
         self._flows_kernel[grid](self.param_flows, node_flows, param_ids, layer_num_nodes, tot_num_nodes, batch_size, node_offset, BLOCK_SIZE = 1024)
         
         return None
-    
-    def sample(self, samples: torch.Tensor, missing_mask:torch.tensor, node_flows: torch.tensor):
+
+    def sample(self, samples: torch.Tensor, node_flows: torch.Tensor, missing_mask: Optional[torch.Tensor] = None, 
+               params: Optional[torch.Tensor] = None):
         """
         samples:       [num_vars, B]
-        missing_mask:  [num_vars, B]
-        node_flows:    [num_nodes, B]    
-        
-         - Note: it does not return anything, will update the samples in-place
-         - node_flows[sid:eid].size() == (num_input_nodes, B)
+        missing_mask:  [num_vars, B] or [num_vars] or None
+        node_flows:    [num_nodes, B]
         """
-        sid, eid = self._output_ind_range[0], self._output_ind_range[1]
-        # print(f"Input layer w/+ flows (should be {samples.size(0)})", node_flows[sid:eid, :].sum(dim=0))   
-    
-        node_idxs, batch_idxs = node_flows[sid:eid, :].nonzero(as_tuple=True)   # (num_vars * B, 2)
-        var_idxs = self.vids[node_idxs]                                         # (num_vars * B) 
-        
-        sampled_node_idxs = torch.zeros(samples.shape, dtype=torch.long, device=samples.device)
-        sampled_node_idxs[var_idxs, batch_idxs] = node_idxs
+        sid, eid = self._output_ind_range
+        num_nodes = eid - sid
+        num_vars = self.vids.max().item() + 1
+        num_cats = self.node_nchs.max().item()
+        batch_size = node_flows.size(1)
+        all_vars = torch.unique(self.vids)
 
-        # TODO fix later, for now assume constant number of cats 
-        # need a custome kernel probably
-        ps = self.params.view(-1, self.psids[1])                        # (num_nodes, num_cats)
-        cummulp = ps.cumsum(-1)
-        replace_cummul_ps = cummulp[sampled_node_idxs]                 # (var, B, num_cats)
-        rands = torch.rand(samples.size(0), samples.size(1), 1, device=samples.device)  # (vars, B, 1)
-    
-        sampled_cats = torch.sum(rands > replace_cummul_ps, dim=2).to(samples.dtype)
-        samples[missing_mask] = sampled_cats[missing_mask]
+        probs = torch.zeros([num_vars * num_cats * batch_size], dtype = torch.float32, device = node_flows.device)
+
+        if params is None:
+            params = self.params
+        else:
+            params = params["params"]
+
+        grid = lambda meta: (triton.cdiv(num_nodes * num_cats * batch_size, meta['BLOCK_SIZE']),)
+
+        self._sample_kernel[grid](
+            probs, node_flows, params, self.vids, self.psids, self.node_nchs,
+            sid, num_nodes, num_cats, batch_size, BLOCK_SIZE = 2048
+        )
+
+        probs = probs.reshape(num_vars, num_cats, batch_size)
+
+        if missing_mask is None:
+            dist = torch.distributions.Categorical(probs = probs.permute(0, 2, 1))
+            samples[all_vars,:] = dist.sample()[all_vars,:]
+
+        elif missing_mask.dim() == 1:
+            mask = torch.zeros([missing_mask.size(0)], dtype = torch.bool, device = missing_mask.device)
+            mask[all_vars] = True
+            missing_mask = missing_mask & mask
+            dist = torch.distributions.Categorical(probs = probs[missing_mask,:,:].permute(0, 2, 1))
+            samples[missing_mask,:] = dist.sample()
+
+        else:
+            assert missing_mask.dim() == 2
+
+            mask = torch.zeros([missing_mask.size(0), 1], dtype = torch.bool, device = missing_mask.device)
+            mask[all_vars,:] = True
+            missing_mask = missing_mask & mask
+
+            dist = torch.distributions.Categorical(probs = probs.permute(0, 2, 1))
+            samples = samples.view(-1)
+            missing_mask = missing_mask.view(-1)
+            samples[missing_mask] = dist.sample()[missing_mask]
+            samples = samples.reshape(num_vars, batch_size)
+
+        return samples
+
+    @triton.jit
+    def _sample_kernel(probs_ptr, node_flows_ptr, params_ptr, vids_ptr, psids_ptr, node_nchs_ptr,
+                       sid: tl.constexpr, num_nodes: tl.constexpr, num_cats: tl.constexpr, 
+                       batch_size: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(axis = 0)
+        block_start = pid * BLOCK_SIZE
+
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < num_nodes * num_cats * batch_size
+
+        # Get node ID, category ID, and batch ID
+        ns_offsets = offsets // (num_cats * batch_size)
+        cat_offsets = (offsets // batch_size) % num_cats
+        batch_offsets = (offsets % batch_size)
+        node_nch = tl.load(node_nchs_ptr + ns_offsets, mask = mask, other = 0)
+        mask = mask & (cat_offsets < node_nch)
+
+        # Get variable ID
+        vid = tl.load(vids_ptr + ns_offsets, mask = mask, other = 0)
+
+        # Get param
+        psid = tl.load(psids_ptr + ns_offsets, mask = mask, other = 0)
+        param = tl.load(params_ptr + psid + cat_offsets, mask = mask, other = 0)
+
+        # Get flow
+        nflow_offsets = (ns_offsets + sid) * batch_size + batch_offsets
+        nflow = tl.load(node_flows_ptr + nflow_offsets, mask = mask, other = 0)
+
+        # Compute edge flow and add to output
+        eflow = param * nflow
+
+        o_offsets = vid * (num_cats * batch_size) + cat_offsets * batch_size + batch_offsets
+        tl.atomic_add(probs_ptr + o_offsets, eflow, mask = mask)
 
     def mini_batch_em(self, step_size: float, pseudocount: float = 0.0):
         if not self._used_external_params:
@@ -194,7 +251,7 @@ class CategoricalLayer(InputLayer, nn.Module):
     def get_param_specs(self):
         return {"params": torch.Size([self.params.size(0)])}
 
-    @torch.compile(mode = "default")
+    # @torch.compile(mode = "default")
     def _forward(self, data: torch.Tensor, node_mars: torch.Tensor,
                  params: torch.Tensor, missing_mask: Optional[torch.Tensor] = None):
 
@@ -278,25 +335,29 @@ class CategoricalLayer(InputLayer, nn.Module):
 
     def _reorder_nodes(self, nodes):
         node_set = set(nodes)
-        reordered_nodes = []
+        reordered_untied_nodes = []
+        reordered_tied_nodes = []
         added_node_set = set()
         for ns in nodes:
             if ns in added_node_set:
                 continue
             if not ns.is_tied():
-                reordered_nodes.append(ns)
+                reordered_untied_nodes.append(ns)
                 added_node_set.add(ns)
             else:
                 source_ns = ns.get_source_ns()
                 if source_ns in added_node_set:
-                    reordered_nodes.append(ns)
+                    reordered_tied_nodes.append(ns)
                     added_node_set.add(ns)
                 elif source_ns in node_set:
-                    reordered_nodes.extend([source_ns, ns])
+                    reordered_untied_nodes.append(source_ns)
+                    reordered_tied_nodes.append(ns)
                     added_node_set.add(ns)
                     added_node_set.add(source_ns)
                 else:
                     raise ValueError("A tied `InputNodes` should be in the same layer with its source nodes.")
+
+        reordered_nodes = reordered_untied_nodes + reordered_tied_nodes
 
         assert len(reordered_nodes) == len(nodes), "Total node length should not change after reordering."
 

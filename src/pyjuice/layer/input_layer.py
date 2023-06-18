@@ -49,7 +49,10 @@ class InputLayer(Layer, nn.Module):
     def forward(self, used_external_params: bool):
         self._used_external_params = used_external_params
 
-    def backward(self):
+    def backward(self, *args, **kwargs):
+        raise NotImplementedError()
+
+    def sample(self, *args, **kwargs):
         raise NotImplementedError()
 
     def mini_batch_em(self):
