@@ -99,6 +99,33 @@ def hmm_sample_test():
         assert single_count > 0.9 * 400 * num_vars / num_latents
         assert joint_count > 0.7 * single_count
 
+    ## Conditional sample ##
+
+    data = torch.zeros([400, num_vars], dtype = torch.long, device = device)
+    missing_mask = torch.ones([num_vars], dtype = torch.bool, device = device)
+    data[:,4] = 2
+    missing_mask[4] = False
+
+    samples = juice.queries.sample(pc, data, missing_mask)
+
+    assert torch.all(samples[:,4] == 2)
+    assert ((samples[:,3] == 2) | (samples[:,3] == 3)).sum() > 0.7 * 400
+    assert ((samples[:,5] == 2) | (samples[:,5] == 3)).sum() > 0.7 * 400
+
+    assert ((samples[:,2] == 2) | (samples[:,2] == 3)).sum() > 0.55 * 400
+    assert ((samples[:,6] == 2) | (samples[:,6] == 3)).sum() > 0.55 * 400
+
+    data = torch.zeros([400, num_vars], dtype = torch.long, device = device)
+    missing_mask = torch.ones([num_vars], dtype = torch.bool, device = device)
+    data[:,4] = 2
+    data[:,6] = 2
+    missing_mask[4] = False
+    missing_mask[6] = False
+
+    samples = juice.queries.sample(pc, data, missing_mask)
+
+    assert ((samples[:,5] == 2) | (samples[:,5] == 3)).sum() > 0.9 * 400
+
 
 if __name__ == "__main__":
     import warnings
