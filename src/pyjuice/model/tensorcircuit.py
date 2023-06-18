@@ -321,55 +321,6 @@ class TensorCircuit(nn.Module):
                 self._used_external_sum_params = False
 
         return None
-    
-    def sample(self, inputs: torch.Tensor, missing_mask: torch.Tensor):
-        """
-        conditional samples from pr(x_missing | x_not missing) for each input in the batch
-
-        Arguments:
-         - inputs:             tensor       (num_features, batch_size)
-         - missing_mask:       tensor[bool] (num_features, batch_size)
-
-        Requirements:
-         - Already need to have run forward pass with same `inputs` and `missing_mask`.
-         
-        Outputs:
-         - samples: tensor (num_features, batch_size):
-                 replaces the missing values in inputs sampled by pr(x_miss | x_not miss)
-        """
-        assert self.node_mars is not None and self.element_mars is not None, "Should run forward path first."
-
-        inputs = inputs.permute(1, 0)
-        missing_mask = missing_mask.permute(1, 0)
-
-        samples = torch.clone(inputs)
-        
-        self.node_flows = torch.zeros([self.num_nodes, self.node_mars.size(1)], device = self.device, dtype=torch.bool)
-        self.element_flows = torch.zeros([self.num_elements, self.node_mars.size(1)], device = self.device, dtype=torch.bool)
-        self.node_mask = torch.zeros([self.num_nodes, self.node_mars.size(1)], device = self.device, dtype=torch.long)
-        self.node_flows[-1,:] = 1.0
-
-        with torch.no_grad():
-            for layer_id in range(len(self.inner_layers) - 1, -1, -1):
-                ltype, layer = self.inner_layers[layer_id]
-
-                if ltype == "prod":
-                    # Nothing special needed, same as backward
-                    layer.backward(self.node_flows, self.element_flows)
-
-                elif ltype == "sum":
-                    # Recompute `element_mars` for previous prod layer
-                    self.inner_layers[layer_id-1][1].forward(self.node_mars, self.element_mars)
-                    layer.sample(self.node_flows, self.element_flows, self.node_mars, self.element_mars, self.params, self.node_mask)
-
-                else:
-                    raise ValueError(f"Unknown layer type {ltype}.")
-                
-
-            for idx, layer in enumerate(self.input_layers):
-                layer.sample(samples, missing_mask, self.node_flows)
-
-        return samples.permute(1, 0)
 
     def mini_batch_em(self, step_size: float, pseudocount: float = 0.0):
         for layer in self.input_layers:
@@ -410,22 +361,6 @@ class TensorCircuit(nn.Module):
             layer.init_param_flows(flows_memory = flows_memory)
 
         return None
-    
-    @staticmethod
-    def load(filename):
-        pc = torch.load(filename, map_location='cpu')
-        pc._init_pass_tensors_()
-        pc._init_ad_tensors()
-
-        for layer in pc.input_layers:
-            layer.param_flows = None
-    
-        return pc
-    
-    def save(self, filename):
-        self._init_pass_tensors_()
-        self._init_ad_tensors()
-        torch.save(self, filename)
 
     def to(self, device):
         super(TensorCircuit, self).to(device)
