@@ -97,31 +97,36 @@ def _categorical_forward(layer, node_mars: torch.Tensor,
 
 
 @triton.jit
-def _categorical_bk_kernel(outputs_ptr, node_flows_ptr, params_ptr, vids_ptr, psids_ptr, node_nchs_ptr,
-                           sid: tl.constexpr, num_nodes: tl.constexpr, num_cats: tl.constexpr, 
-                           batch_size: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+def _categorical_bk_kernel(outputs_ptr, node_flows_ptr, params_ptr, nflow_xids_ptr, nflow_yids_ptr, vids_ptr, 
+                           psids_ptr, node_nchs_ptr, sid: tl.constexpr, num_activ_nodes: tl.constexpr, 
+                           num_cats: tl.constexpr, batch_size: tl.constexpr, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(axis = 0)
     block_start = pid * BLOCK_SIZE
 
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < num_nodes * num_cats * batch_size
+    mask = offsets < num_activ_nodes * num_cats
 
-    # Get node ID and category ID
-    ns_offsets = offsets // (num_cats * batch_size)
-    cat_offsets = (offsets // batch_size) % num_cats
-    batch_offsets = (offsets % batch_size)
-    node_nch = tl.load(node_nchs_ptr + ns_offsets, mask = mask, other = 0)
+    # Get node ID, category ID, and batch ID
+    nf_offsets = offsets // num_cats
+    cat_offsets = (offsets % num_cats)
+    node_offsets = tl.load(nflow_xids_ptr + nf_offsets, mask = mask, other = 0)
+    batch_offsets = tl.load(nflow_yids_ptr + nf_offsets, mask = mask, other = 0)
+
+    local_n_offsets = node_offsets - sid
+
+    # Number of chs for every node
+    node_nch = tl.load(node_nchs_ptr + local_n_offsets, mask = mask, other = 0)
     mask = mask & (cat_offsets < node_nch)
 
     # Get variable ID
-    vid = tl.load(vids_ptr + ns_offsets, mask = mask, other = 0)
+    vid = tl.load(vids_ptr + local_n_offsets, mask = mask, other = 0)
 
     # Get param
-    psid = tl.load(psids_ptr + ns_offsets, mask = mask, other = 0)
+    psid = tl.load(psids_ptr + local_n_offsets, mask = mask, other = 0)
     param = tl.load(params_ptr + psid + cat_offsets, mask = mask, other = 0)
 
     # Get flow
-    nflow_offsets = (ns_offsets + sid) * batch_size + batch_offsets
+    nflow_offsets = node_offsets * batch_size + batch_offsets
     nflow = tl.load(node_flows_ptr + nflow_offsets, mask = mask, other = 0)
 
     # Compute edge flow and add to output
@@ -150,11 +155,15 @@ def _categorical_backward(layer, node_flows: torch.Tensor, node_mars: torch.Tens
 
         outputs = torch.zeros([num_vars * num_cats * batch_size], dtype = torch.float32, device = node_flows.device)
 
-        grid = lambda meta: (triton.cdiv(num_nodes * num_cats * batch_size, meta['BLOCK_SIZE']),)
+        # Get all node ids with high flow
+        nflow_xids, nflow_yids = torch.where(node_flows[sid:eid,:] > 1e-6)
+        nflow_xids += sid
+        num_activ_nodes = nflow_xids.size(0)
 
+        grid = lambda meta: (triton.cdiv(num_nodes * num_cats * batch_size, meta['BLOCK_SIZE']),)
         _categorical_bk_kernel[grid](
-            outputs, node_flows, params, layer.vids, layer.psids, layer.node_nchs,
-            sid, num_nodes, num_cats, batch_size, BLOCK_SIZE = 2048
+            outputs, node_flows, params, nflow_xids, nflow_yids, layer.vids, layer.psids, layer.node_nchs,
+            sid, num_activ_nodes, num_cats, batch_size, BLOCK_SIZE = 2048
         )
 
         outputs = outputs.reshape(num_vars, num_cats, batch_size)

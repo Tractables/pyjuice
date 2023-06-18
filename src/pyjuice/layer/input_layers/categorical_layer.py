@@ -171,13 +171,19 @@ class CategoricalLayer(InputLayer, nn.Module):
         else:
             params = params["params"]
 
-        grid = lambda meta: (triton.cdiv(num_nodes * num_cats * batch_size, meta['BLOCK_SIZE']),)
+        # Get all node ids with non-zero flow
+        nflow_xids, nflow_yids = torch.where(node_flows[sid:eid,:])
+        nflow_xids += sid
+        num_activ_nodes = nflow_xids.size(0)
 
+        # Prepare and run the sample kernel
+        grid = lambda meta: (triton.cdiv(num_activ_nodes * num_cats, meta['BLOCK_SIZE']),)
         self._sample_kernel[grid](
-            probs, node_flows, params, self.vids, self.psids, self.node_nchs,
-            sid, num_nodes, num_cats, batch_size, BLOCK_SIZE = 2048
+            probs, node_flows, params, nflow_xids, nflow_yids, self.vids, self.psids, self.node_nchs,
+            sid, num_activ_nodes, num_cats, batch_size, BLOCK_SIZE = 2048
         )
 
+        # Reshape the cumulated (unnormalized) probabilities
         probs = probs.reshape(num_vars, num_cats, batch_size)
 
         if missing_mask is None:
@@ -205,40 +211,6 @@ class CategoricalLayer(InputLayer, nn.Module):
             samples = samples.reshape(num_vars, batch_size)
 
         return samples
-
-    @triton.jit
-    def _sample_kernel(probs_ptr, node_flows_ptr, params_ptr, vids_ptr, psids_ptr, node_nchs_ptr,
-                       sid: tl.constexpr, num_nodes: tl.constexpr, num_cats: tl.constexpr, 
-                       batch_size: tl.constexpr, BLOCK_SIZE: tl.constexpr):
-        pid = tl.program_id(axis = 0)
-        block_start = pid * BLOCK_SIZE
-
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < num_nodes * num_cats * batch_size
-
-        # Get node ID, category ID, and batch ID
-        ns_offsets = offsets // (num_cats * batch_size)
-        cat_offsets = (offsets // batch_size) % num_cats
-        batch_offsets = (offsets % batch_size)
-        node_nch = tl.load(node_nchs_ptr + ns_offsets, mask = mask, other = 0)
-        mask = mask & (cat_offsets < node_nch)
-
-        # Get variable ID
-        vid = tl.load(vids_ptr + ns_offsets, mask = mask, other = 0)
-
-        # Get param
-        psid = tl.load(psids_ptr + ns_offsets, mask = mask, other = 0)
-        param = tl.load(params_ptr + psid + cat_offsets, mask = mask, other = 0)
-
-        # Get flow
-        nflow_offsets = (ns_offsets + sid) * batch_size + batch_offsets
-        nflow = tl.load(node_flows_ptr + nflow_offsets, mask = mask, other = 0)
-
-        # Compute edge flow and add to output
-        eflow = param * nflow
-
-        o_offsets = vid * (num_cats * batch_size) + cat_offsets * batch_size + batch_offsets
-        tl.atomic_add(probs_ptr + o_offsets, eflow, mask = mask)
 
     def mini_batch_em(self, step_size: float, pseudocount: float = 0.0):
         if not self._used_external_params:
@@ -332,6 +304,46 @@ class CategoricalLayer(InputLayer, nn.Module):
             ns._params = self.params.data[par_start:par_end].detach().cpu().clone()
 
             n_start = n_end
+
+    @staticmethod
+    @triton.jit
+    def _sample_kernel(probs_ptr, node_flows_ptr, params_ptr, nflow_xids_ptr, nflow_yids_ptr, vids_ptr, 
+                       psids_ptr, node_nchs_ptr, sid: tl.constexpr, num_activ_nodes: tl.constexpr, 
+                       num_cats: tl.constexpr, batch_size: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(axis = 0)
+        block_start = pid * BLOCK_SIZE
+
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < num_activ_nodes * num_cats
+
+        # Get node ID, category ID, and batch ID
+        nf_offsets = offsets // num_cats
+        cat_offsets = (offsets % num_cats)
+        node_offsets = tl.load(nflow_xids_ptr + nf_offsets, mask = mask, other = 0)
+        batch_offsets = tl.load(nflow_yids_ptr + nf_offsets, mask = mask, other = 0)
+
+        local_n_offsets = node_offsets - sid
+
+        # Number of chs for every node
+        node_nch = tl.load(node_nchs_ptr + local_n_offsets, mask = mask, other = 0)
+        mask = mask & (cat_offsets < node_nch)
+
+        # Get variable ID
+        vid = tl.load(vids_ptr + local_n_offsets, mask = mask, other = 0)
+
+        # Get param
+        psid = tl.load(psids_ptr + local_n_offsets, mask = mask, other = 0)
+        param = tl.load(params_ptr + psid + cat_offsets, mask = mask, other = 0)
+
+        # Get flow
+        nflow_offsets = node_offsets * batch_size + batch_offsets
+        nflow = tl.load(node_flows_ptr + nflow_offsets, mask = mask, other = 0)
+
+        # Compute edge flow and add to output
+        eflow = param * nflow
+
+        o_offsets = vid * (num_cats * batch_size) + cat_offsets * batch_size + batch_offsets
+        tl.atomic_add(probs_ptr + o_offsets, eflow, mask = mask)
 
     def _reorder_nodes(self, nodes):
         node_set = set(nodes)
