@@ -110,11 +110,20 @@ class TensorCircuit(nn.Module):
         B = inputs.size(0)
         inputs = inputs.permute(1, 0)
         
-        self.node_mars = torch.empty([self.num_nodes, B], device = self.device)
-        self.element_mars = torch.empty([self.num_elements, B], device = self.device)
+        ## Initialize buffers for forward pass ##
+
+        if not isinstance(self.node_mars, torch.Tensor) or self.node_mars.size(0) != self.num_nodes or \
+                self.node_mars.size(1) != B or self.node_mars.device != self.device:
+            self.node_mars = torch.empty([self.num_nodes, B], device = self.device)
+
+        if not isinstance(self.element_mars, torch.Tensor) or self.element_mars.size(0) != self.num_elements or \
+                self.element_mars.size(1) != B or self.element_mars.device != self.device:
+            self.element_mars = torch.empty([self.num_elements, B], device = self.device)
 
         self.node_mars[0,:] = 0.0
         self.element_mars[0,:] = -torch.inf
+
+        ## Preprocess parameters ##
 
         if params is None:
             params = self.params
@@ -135,6 +144,8 @@ class TensorCircuit(nn.Module):
         if input_params is not None:
             grad_hook_idx = 2
             self._backward_buffer["external_input_layers"] = set()
+
+        ## Run forward pass ##
 
         with torch.no_grad():
             # Compute forward pass for all input layers
@@ -170,6 +181,8 @@ class TensorCircuit(nn.Module):
                     raise ValueError(f"Unknown layer type {type(layer)}.")
                 
         lls = self.node_mars[-1,:]
+
+        ## Add gradient hook for backward pass ##
 
         if torch.is_grad_enabled():
             lls.requires_grad = True
@@ -210,8 +223,15 @@ class TensorCircuit(nn.Module):
 
         B = self.node_mars.size(1)
 
-        self.node_flows = torch.zeros([self.num_nodes, B], device = self.device)
-        self.element_flows = torch.zeros([self.num_elements, B], device = self.device)
+        ## Initialize buffers for backward pass ##
+
+        if not isinstance(self.node_flows, torch.Tensor) or self.node_flows.size(0) != self.num_nodes or \
+                self.node_flows.size(1) != B or self.node_flows.device != self.device:
+            self.node_flows = torch.zeros([self.num_nodes, B], device = self.device)
+        
+        if not isinstance(self.element_flows, torch.Tensor) or self.element_flows.size(0) != self.num_elements or \
+                self.element_flows.size(1) != B or self.element_flows.device != self.device:
+            self.element_flows = torch.zeros([self.num_elements, B], device = self.device)
 
         if ll_weights is None:
             self.node_flows[self._root_node_range[0]:self._root_node_range[1],:] = 1.0
@@ -223,6 +243,8 @@ class TensorCircuit(nn.Module):
 
             self.node_flows[self._root_node_range[0]:self._root_node_range[1],:] = ll_weights.permute(1, 0)
 
+        ## Retrieve parameters and initialize parameter flows ##
+
         if self._inputs[1] is not None:
             params = self._backward_buffer["normalized_params"]
         else:
@@ -230,6 +252,8 @@ class TensorCircuit(nn.Module):
 
         if compute_param_flows:
             self.init_param_flows(flows_memory = flows_memory)
+
+        ## Run backward pass ##
 
         with torch.no_grad():
             for layer_id in range(len(self.inner_layers) - 1, -1, -1):
@@ -334,7 +358,7 @@ class TensorCircuit(nn.Module):
                     layer.backward(self.node_flows, self.element_flows)
 
                 elif ltype == "sum":
-                    # Recompute `element_mars`` for previous prod layer
+                    # Recompute `element_mars` for previous prod layer
                     self.inner_layers[layer_id-1][1].forward(self.node_mars, self.element_mars)
                     layer.sample(self.node_flows, self.element_flows, self.node_mars, self.element_mars, self.params, self.node_mask)
 
