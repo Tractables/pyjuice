@@ -27,8 +27,8 @@ def _pairwise_count_kernel(data1_ptr, data2_ptr, pairwise_count_ptr, num_samples
     tl.atomic_add(pairwise_count_ptr + cid, 1, mask = mask)
 
 
-def get_pairwise_count(data1: torch.Tensor, data2: torch.Tensor, n_cls1: torch.Tensor, n_cls2: torch.Tensor, 
-                       device: Optional[torch.device] = None):
+def get_pairwise_count(data1: torch.Tensor, data2: torch.Tensor, n_cls1: int, n_cls2: int, 
+                       device: Optional[torch.device] = None, BLOCK_SIZE = 2048):
     assert data1.min() >= 0 and data1.max() < n_cls1, f"Value range of `data1` exceeds limit: [Min: {data1.min().item()}, Max: {data1.max().item()}]."
     assert data2.min() >= 0 and data2.max() < n_cls2, f"Value range of `data2` exceeds limit: [Min: {data2.min().item()}, Max: {data2.max().item()}]."
     assert data1.size(0) == data2.size(0), "`data1` and `data2` must have the same number of examples."
@@ -39,8 +39,11 @@ def get_pairwise_count(data1: torch.Tensor, data2: torch.Tensor, n_cls1: torch.T
 
     if data1.is_cuda:
 
+        data1 = data1.long()
+        data2 = data2.long()
+
         num_samples = data1.size(0)
-        pairwise_count = torch.zeros([n_cls1, n_cls2], dtype = torch.long, device = data1.device)
+        pairwise_count = torch.zeros([n_cls1, n_cls2], dtype = torch.float32, device = data1.device)
 
         grid = lambda meta: (triton.cdiv(num_samples, meta['BLOCK_SIZE']),)
 
