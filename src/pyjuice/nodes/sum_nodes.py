@@ -86,6 +86,8 @@ class SumNodes(CircuitNodes):
         assert edge_ids.size(0) == 2, "Expect `edge_ids.size(0) == 2`."
         assert torch.all(edge_ids[0,:] >= 0) and torch.all(edge_ids[1,:] >= 0), "Edge index underflow."
         assert torch.all(edge_ids[0,:] < self.num_nodes) and torch.all(edge_ids[1,:] < self.num_ch_nodes), "Edge index overflow."
+        par_ns = torch.unique(edge_ids[0,:])
+        assert par_ns.size(0) == self.num_nodes and par_ns.max() == self.num_nodes - 1, "Some node has no edge."
 
         self.edge_ids = edge_ids
 
