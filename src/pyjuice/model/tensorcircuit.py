@@ -180,7 +180,7 @@ class TensorCircuit(nn.Module):
                 else:
                     raise ValueError(f"Unknown layer type {type(layer)}.")
                 
-        lls = self.node_mars[-1,:]
+        lls = self.node_mars[self._root_node_range[0]:self._root_node_range[1],:]
 
         ## Add gradient hook for backward pass ##
 
