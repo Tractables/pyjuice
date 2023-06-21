@@ -31,7 +31,7 @@ def _sample_mask_generation(layer: SumLayer, node_mars: torch.Tensor, element_ma
     return None
 
 
-# @torch.compile(mode = "reduce-overhead", fullgraph = True)
+@torch.compile()
 def _sample_backward_pass(layer: SumLayer, node_flows: torch.Tensor, element_flows: torch.Tensor, node_mars: torch.Tensor, 
                           element_mars: torch.Tensor, params: torch.Tensor, node_mask: torch.Tensor):
     for group_id in range(layer.num_bk_groups):

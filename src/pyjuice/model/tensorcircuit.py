@@ -16,6 +16,7 @@ from pyjuice.utils.grad_fns import ReverseGrad, PseudoHookFunc
 
 
 def _pc_model_backward_hook(grad, pc, **kwargs):
+    grad = grad.permute(1, 0)
     pc.backward(
         ll_weights = grad / grad.sum() * grad.size(0),
         compute_param_flows = pc._optim_hyperparams["compute_param_flows"], 
@@ -181,6 +182,7 @@ class TensorCircuit(nn.Module):
                     raise ValueError(f"Unknown layer type {type(layer)}.")
                 
         lls = self.node_mars[self._root_node_range[0]:self._root_node_range[1],:]
+        lls = lls.permute(1, 0)
 
         ## Add gradient hook for backward pass ##
 
@@ -239,9 +241,9 @@ class TensorCircuit(nn.Module):
             if ll_weights.dim() == 1:
                 ll_weights = ll_weights.unsqueeze(1)
 
-            assert ll_weights.size(1) == self.num_root_nodes
+            assert ll_weights.size(0) == self.num_root_nodes
 
-            self.node_flows[self._root_node_range[0]:self._root_node_range[1],:] = ll_weights.permute(1, 0)
+            self.node_flows[self._root_node_range[0]:self._root_node_range[1],:] = ll_weights
 
         ## Retrieve parameters and initialize parameter flows ##
 
