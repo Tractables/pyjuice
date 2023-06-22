@@ -19,7 +19,7 @@ def node_iterator(root_ns: CircuitNodes):
         visited.add(ns)
 
         # Recursively traverse children
-        if ns.issum() or ns.isprod():
+        if ns.is_sum() or ns.is_prod():
             for cs in ns.chs:
                 dfs(cs)
 
@@ -64,13 +64,13 @@ class CircuitNodes():
     def scope(self):
         return self.region_node.scope
 
-    def issum(self):
+    def is_sum(self):
         return isinstance(self.region_node, InnerRegionNode)
 
-    def isprod(self):
+    def is_prod(self):
         return isinstance(self.region_node, PartitionNode)
 
-    def isinput(self):
+    def is_input(self):
         return isinstance(self.region_node, InputRegionNode)
 
     @property

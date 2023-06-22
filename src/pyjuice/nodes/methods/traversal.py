@@ -17,7 +17,7 @@ def foreach(func: Callable, root_nodes: CircuitNodes):
         visited.add(ns)
 
         # Recursively traverse children
-        if ns.issum() or ns.isprod():
+        if ns.is_sum() or ns.is_prod():
             for cs in ns.chs:
                 dfs(cs)
 
@@ -41,7 +41,7 @@ def foldup_aggregate(func: Callable, root_nodes: CircuitNodes, cache: Optional[D
             return
 
         # Recursively traverse children
-        if ns.issum() or ns.isprod():
+        if ns.is_sum() or ns.is_prod():
             for cs in ns.chs:
                 dfs(cs)
 

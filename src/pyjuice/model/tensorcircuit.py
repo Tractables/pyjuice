@@ -560,7 +560,7 @@ class TensorCircuit(nn.Module):
 
         # Inner nodes
         for layer in self.inner_layers:
-            if layer.issum():
+            if layer.is_sum():
                 for ns in layer.nodes:
                     # Omit duplicated parameters from tied nodes
                     if ns._source_node is None:
@@ -580,7 +580,7 @@ class TensorCircuit(nn.Module):
         def dfs(ns: CircuitNodes):
             if ns in nodes2depth:
                 return
-            if ns.isinput():
+            if ns.is_input():
                 nodes2depth[ns] = 0
                 if 0 not in depth2nodes:
                     depth2nodes[0] = {"input": []}
@@ -589,16 +589,16 @@ class TensorCircuit(nn.Module):
                 for cs in ns.chs:
                     dfs(cs)
 
-                depth = max(map(lambda ms: nodes2depth[ms], ns.chs)) + (1 if ns.isprod() else 0)
+                depth = max(map(lambda ms: nodes2depth[ms], ns.chs)) + (1 if ns.is_prod() else 0)
                 num_layers[0] = max(depth + 1, num_layers[0])
                 nodes2depth[ns] = depth
 
                 if depth not in depth2nodes:
                     depth2nodes[depth] = {"sum": [], "prod": []} # lists for sum and product nodes
                 
-                if ns.isprod():
+                if ns.is_prod():
                     depth2nodes[depth]["prod"].append(ns)
-                elif ns.issum():
+                elif ns.is_sum():
                     depth2nodes[depth]["sum"].append(ns)
                 else:
                     raise NotImplementedError(f"Unsupported node type {type(n)}.")

@@ -76,33 +76,33 @@ def lvd_for_input_nodes(lvdistiller, ns, lv_dataset: torch.Tensor, obs_dataset: 
 
 def lvd_by_counting(lvdistiller, ns: CircuitNodes):
     lv_dataset_id = lvdistiller.ns2lv_dataset_id[ns]
-    if ns.isprod():
+    if ns.is_prod():
         for cs in ns.chs:
             if cs not in lvdistiller.ns2lv_dataset_id:
                 lvdistiller.ns2lv_dataset_id[cs] = lv_dataset_id
 
     # Get candidate LVD nodes
     nodes_for_lvd = []
-    if ns.issum():
+    if ns.is_sum():
         if any([cs in lvdistiller.ns2lv_dataset_id for cs in ns.chs]):
             nodes_for_lvd.append(ns)
-    elif ns.isprod():
+    elif ns.is_prod():
         for cs in ns.chs:
             if any([ccs in lvdistiller.ns2lv_dataset_id for ccs in cs.chs]):
                 nodes_for_lvd.append(cs)
-            elif cs.isinput() and cs in lvdistiller.ns2lv_dataset_id and cs in lvdistiller.ns2obs_dataset_id:
+            elif cs.is_input() and cs in lvdistiller.ns2lv_dataset_id and cs in lvdistiller.ns2obs_dataset_id:
                 nodes_for_lvd.append(cs)
-    elif ns.isinput() and ns in lvdistiller.ns2lv_dataset_id and ns in lvdistiller.ns2obs_dataset_id:
+    elif ns.is_input() and ns in lvdistiller.ns2lv_dataset_id and ns in lvdistiller.ns2obs_dataset_id:
         nodes_for_lvd.append(ns)
 
     # Run LVD by counting
     for ns in nodes_for_lvd:
-        if ns.isinput():
+        if ns.is_input():
             ns_lv_dataset = lvdistiller.lv_datasets[lvdistiller.ns2lv_dataset_id[ns]]
             ns_obs_dataset = lvdistiller.obs_datasets[lvdistiller.ns2obs_dataset_id[ns]]
             lvd_for_input_nodes(lvdistiller, ns, ns_lv_dataset, ns_obs_dataset)
         else:
-            assert ns.issum(), "Product nodes cannot apply LVD."
+            assert ns.is_sum(), "Product nodes cannot apply LVD."
             
             ns_dataset = lvdistiller.lv_datasets[lvdistiller.ns2lv_dataset_id[ns]]
             num_ch_nodes = sum([cs.num_nodes for cs in ns.chs])

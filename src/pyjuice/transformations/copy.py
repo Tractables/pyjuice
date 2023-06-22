@@ -17,7 +17,7 @@ def deepcopy(root_nodes: CircuitNodes, tie_params: bool = False,
             return
 
         # Recursively traverse children
-        if ns.issum() or ns.isprod():
+        if ns.is_sum() or ns.is_prod():
             for cs in ns.chs:
                 dfs(cs)
 
@@ -26,7 +26,7 @@ def deepcopy(root_nodes: CircuitNodes, tie_params: bool = False,
         if not tie_params and ns.is_tied():
             tied_ns_pairs.append((ns, ns.get_source_ns()))
 
-        if ns.issum():
+        if ns.is_sum():
             if not tie_params:
                 new_ns = SumNodes(
                     ns.num_nodes,
@@ -39,7 +39,7 @@ def deepcopy(root_nodes: CircuitNodes, tie_params: bool = False,
             else:
                 new_ns = ns.duplicate(*new_chs, tie_params = True)
             
-        elif ns.isprod():
+        elif ns.is_prod():
             new_ns = ProdNodes(
                 ns.num_nodes,
                 new_chs,
@@ -47,7 +47,7 @@ def deepcopy(root_nodes: CircuitNodes, tie_params: bool = False,
             )
             
         else:
-            assert ns.isinput()
+            assert ns.is_input()
             if not tie_params:
                 new_ns = InputNodes(
                     ns.num_nodes,

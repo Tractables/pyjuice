@@ -12,12 +12,12 @@ def serialize_nodes(root_ns: CircuitNodes):
     nodes_list = list()
     ns2id = dict()
     for ns in root_ns:
-        if ns.isinput():
+        if ns.is_input():
             ntype = "Input"
-        elif ns.isprod():
+        elif ns.is_prod():
             ntype = "Product"
         else:
-            assert ns.issum()
+            assert ns.is_sum()
             ntype = "Sum"
 
         ns_info = {
@@ -26,13 +26,13 @@ def serialize_nodes(root_ns: CircuitNodes):
             "chs": tuple(ns2id[cs] for cs in ns.chs)
         }
 
-        if ns.isprod() or ns.issum():
+        if ns.is_prod() or ns.is_sum():
             ns_info["edge_ids"] = ns.edge_ids.detach().cpu().numpy().copy()
 
         if hasattr(ns, "_params") and ns._params is not None:
             ns_info["params"] = ns._params.detach().cpu().numpy().copy()
 
-        if ns.isinput():
+        if ns.is_input():
             ns_info["scope"] = ns.scope.to_list()
             ns_info["dist"] = pickle.dumps(ns.dist)
 

@@ -40,7 +40,7 @@ class SumNodes(CircuitNodes):
     def _standardize_chs(self, chs):
         new_chs = []
         for cs in chs:
-            if cs.isinput():
+            if cs.is_input():
                 new_cs = ProdNodes(
                     num_nodes = cs.num_nodes,
                     chs = [cs],
