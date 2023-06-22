@@ -7,6 +7,9 @@ import pyjuice.transformations
 import pyjuice.queries
 import pyjuice.io
 
+# Distributions (for input nodes)
+import pyjuice.nodes.distributions as distributions
+
 # TensorCircuit
 from pyjuice.model import TensorCircuit
 
