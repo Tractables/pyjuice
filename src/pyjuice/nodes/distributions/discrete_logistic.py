@@ -17,7 +17,7 @@ class DiscreteLogistic(Distribution):
     def raw2processed_params(self, num_nodes: int, params: torch.Tensor):
         return params
 
-    def processed2raw_params(self, num_nodes: int, params: torch.Tensor):
+    def processed2raw_params(self, num_nodes: int, params: torch.Tensor, normalize: bool = True):
         return params
 
     def init_parameters(num_nodes: int, perturbation: float, **kwargs):

@@ -18,7 +18,9 @@ class Categorical(Distribution):
         params = self.normalize_parameters(params)
         return params
 
-    def processed2raw_params(self, num_nodes: int, params: torch.Tensor):
+    def processed2raw_params(self, num_nodes: int, params: torch.Tensor, normalize: bool = True):
+        if normalize:
+            params = params / params.sum(dim = 1, keepdim = True)
         return params.reshape(-1)
 
     def init_parameters(self, num_nodes: int, perturbation: float, **kwargs):
