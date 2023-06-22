@@ -37,60 +37,6 @@ class SumNodes(CircuitNodes):
         # Callbacks
         self._run_init_callbacks(**kwargs)
 
-    def _standardize_chs(self, chs):
-        new_chs = []
-        for cs in chs:
-            if cs.is_input():
-                new_cs = ProdNodes(
-                    num_nodes = cs.num_nodes,
-                    chs = [cs],
-                    edge_ids = torch.arange(0, cs.num_nodes).reshape(-1, 1)
-                )
-                new_chs.append(new_cs)
-            else:
-                new_chs.append(cs)
-
-        return new_chs
-
-    def _construct_edges(self, edge_ids: Optional[Union[Tensor,Sequence[Tensor]]]):
-        if edge_ids is None:
-            edge_ids = torch.cat(
-                (torch.arange(self.num_nodes).unsqueeze(1).repeat(1, self.num_ch_nodes).reshape(1, -1),
-                 torch.arange(self.num_ch_nodes).unsqueeze(0).repeat(self.num_nodes, 1).reshape(1, -1)),
-                dim = 0
-            )
-        elif isinstance(edge_ids, Sequence):
-            assert len(edge_ids) == len(self.chs)
-
-            per_ns_edge_ids = edge_ids
-            ch_nid_start = 0
-            edge_ids = []
-            for cs_id in range(len(self.chs)):
-                curr_edge_ids = per_ns_edge_ids[cs_id]
-                curr_edge_ids[1,:] += ch_nid_start
-                edge_ids.append(curr_edge_ids)
-
-                ch_nid_start += self.chs[cs_id].num_nodes
-
-            edge_ids = torch.cat(edge_ids, dim = 1)
-
-        if isinstance(edge_ids, np.ndarray):
-            edge_ids = torch.from_numpy(edge_ids)
-
-        if edge_ids.dim() == 2 and edge_ids.type() == torch.bool:
-            assert edge_ids.size(0) == self.num_nodes and edge_ids.size(1) == self.num_ch_nodes
-            x_ids, y_ids = torch.where(edge_ids)
-            edge_ids = torch.stack((x_ids, y_ids), dim = 0)
-
-        # Sanity checks
-        assert edge_ids.size(0) == 2, "Expect `edge_ids.size(0) == 2`."
-        assert torch.all(edge_ids[0,:] >= 0) and torch.all(edge_ids[1,:] >= 0), "Edge index underflow."
-        assert torch.all(edge_ids[0,:] < self.num_nodes) and torch.all(edge_ids[1,:] < self.num_ch_nodes), "Edge index overflow."
-        par_ns = torch.unique(edge_ids[0,:])
-        assert par_ns.size(0) == self.num_nodes and par_ns.max() == self.num_nodes - 1, "Some node has no edge."
-
-        self.edge_ids = edge_ids
-
     @property
     def num_edges(self):
         return self.edge_ids.size(1)
@@ -144,6 +90,11 @@ class SumNodes(CircuitNodes):
         if normalize:
             normalize_parameters(self._params, self.edge_ids[0,:], pseudocount = pseudocount)
 
+    def set_edges(self, edge_ids: Union[Tensor,Sequence[Tensor]]):
+        self._construct_edges(edge_ids)
+
+        self._params = None # Clear parameters
+
     def init_parameters(self, perturbation: float = 2.0, recursive: bool = True, is_root: bool = True, **kwargs):
         if self._source_node is None:
             self._params = torch.exp(torch.rand([self.edge_ids.size(1)]) * -perturbation)
@@ -162,3 +113,57 @@ class SumNodes(CircuitNodes):
         mask[self.edge_ids[0,:], self.edge_ids[1,:]] = True
 
         return mask
+
+    def _standardize_chs(self, chs):
+        new_chs = []
+        for cs in chs:
+            if cs.is_input():
+                new_cs = ProdNodes(
+                    num_nodes = cs.num_nodes,
+                    chs = [cs],
+                    edge_ids = torch.arange(0, cs.num_nodes).reshape(-1, 1)
+                )
+                new_chs.append(new_cs)
+            else:
+                new_chs.append(cs)
+
+        return new_chs
+
+    def _construct_edges(self, edge_ids: Optional[Union[Tensor,Sequence[Tensor]]]):
+        if edge_ids is None:
+            edge_ids = torch.cat(
+                (torch.arange(self.num_nodes).unsqueeze(1).repeat(1, self.num_ch_nodes).reshape(1, -1),
+                 torch.arange(self.num_ch_nodes).unsqueeze(0).repeat(self.num_nodes, 1).reshape(1, -1)),
+                dim = 0
+            )
+        elif isinstance(edge_ids, Sequence):
+            assert len(edge_ids) == len(self.chs)
+
+            per_ns_edge_ids = edge_ids
+            ch_nid_start = 0
+            edge_ids = []
+            for cs_id in range(len(self.chs)):
+                curr_edge_ids = per_ns_edge_ids[cs_id]
+                curr_edge_ids[1,:] += ch_nid_start
+                edge_ids.append(curr_edge_ids)
+
+                ch_nid_start += self.chs[cs_id].num_nodes
+
+            edge_ids = torch.cat(edge_ids, dim = 1)
+
+        if isinstance(edge_ids, np.ndarray):
+            edge_ids = torch.from_numpy(edge_ids)
+
+        if edge_ids.dim() == 2 and edge_ids.type() == torch.bool:
+            assert edge_ids.size(0) == self.num_nodes and edge_ids.size(1) == self.num_ch_nodes
+            x_ids, y_ids = torch.where(edge_ids)
+            edge_ids = torch.stack((x_ids, y_ids), dim = 0)
+
+        # Sanity checks
+        assert edge_ids.size(0) == 2, "Expect `edge_ids.size(0) == 2`."
+        assert torch.all(edge_ids[0,:] >= 0) and torch.all(edge_ids[1,:] >= 0), "Edge index underflow."
+        assert torch.all(edge_ids[0,:] < self.num_nodes) and torch.all(edge_ids[1,:] < self.num_ch_nodes), "Edge index overflow."
+        par_ns = torch.unique(edge_ids[0,:])
+        assert par_ns.size(0) == self.num_nodes and par_ns.max() == self.num_nodes - 1, "Some node has no edge."
+
+        self.edge_ids = edge_ids
