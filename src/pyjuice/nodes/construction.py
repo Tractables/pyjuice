@@ -27,19 +27,15 @@ def inputs(var: Union[int,Sequence[int]], num_nodes: int, dist: Distribution, pa
     )
 
 
-def multiply(nodes1: ProdNodesChs, nodes2: ProdNodesChs, *args, 
+def multiply(nodes1: ProdNodesChs, *args, 
              edge_ids: Optional[Tensor] = None, **kwargs):
 
     assert isinstance(nodes1, SumNodes) or isinstance(nodes1, InputNodes), "Children of product nodes must be input or sum nodes." 
-    assert isinstance(nodes2, SumNodes) or isinstance(nodes2, InputNodes), "Children of product nodes must be input or sum nodes." 
 
-    chs = [nodes1, nodes2]
+    chs = [nodes1]
     num_nodes = nodes1.num_nodes
     scope = deepcopy(nodes1.scope)
-    if edge_ids is None:
-        assert nodes2.num_nodes == num_nodes, "Input nodes should have the same `num_nodes`."
-    assert len(nodes2.scope & scope) == 0, "Children of a `ProdNodes` should have disjoint scopes."
-    scope |= nodes2.scope
+
     for nodes in args:
         assert isinstance(nodes, SumNodes) or isinstance(nodes, InputNodes), "Children of product nodes must be input or sum nodes."
         if edge_ids is None:
