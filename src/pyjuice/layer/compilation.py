@@ -551,8 +551,9 @@ def prod_layer_backward_compilation(flat_u_cids, flat_cids, flat_cid2nid,
         local_id = n_id_in_group[idx]
 
         criterion = (flat_cids == cid)
+        npar = criterion.sum()
 
         u_cids[group_id][local_id] = cid
-        parids[group_id][local_id,:] = flat_cid2nid[criterion]
+        parids[group_id][local_id,:npar] = flat_cid2nid[criterion]
 
     return u_cids, parids
