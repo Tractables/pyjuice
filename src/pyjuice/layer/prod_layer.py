@@ -143,7 +143,7 @@ class ProdLayer(Layer, nn.Module):
             nids = self.grouped_nids[group_id]
             cids = self.grouped_cids[group_id]
 
-            self._forward_backward_triton(element_mars, node_mars, nids, cids)
+            self._forward_backward(element_mars, node_mars, nids, cids)
 
         return None
 
@@ -163,7 +163,7 @@ class ProdLayer(Layer, nn.Module):
             u_cids = self.grouped_u_cids[group_id]
             parids = self.grouped_parids[group_id]
 
-            self._forward_backward_triton(node_flows, element_flows, u_cids, parids)
+            self._forward_backward(node_flows, element_flows, u_cids, parids)
         
         return None
 
@@ -223,10 +223,10 @@ class ProdLayer(Layer, nn.Module):
 
         return None
 
-    def _forward_backward_triton(self, node_vals: torch.Tensor, element_vals: torch.Tensor, 
-                                 nids: torch.Tensor, cids: torch.Tensor, 
-                                 BLOCK_M_HARD_LIMIT = 2**16,
-                                 BLOCK_SIZE = 2**12, MAX_BLOCK_M = 512, MAX_BLOCK_N = 64) -> None:
+    def _forward_backward(self, node_vals: torch.Tensor, element_vals: torch.Tensor, 
+                          nids: torch.Tensor, cids: torch.Tensor, 
+                          BLOCK_M_HARD_LIMIT = 2**16,
+                          BLOCK_SIZE = 2**12, MAX_BLOCK_M = 512, MAX_BLOCK_N = 64) -> None:
         """
         This function is equivalent to running:
         ``` node_vals[nids] = element_vals[cids].sum(dim = 1) ```
