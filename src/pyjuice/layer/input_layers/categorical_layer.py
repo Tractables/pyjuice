@@ -286,7 +286,7 @@ class CategoricalLayer(InputLayer, nn.Module):
         # gradient of PC parameters by PyTorch.
         self.params.requires_grad = False
 
-    def _extract_params_to_ns(self):
+    def update_parameters(self):
         n_start = 0
         for idx, ns in enumerate(self.nodes):
             if ns.is_tied():

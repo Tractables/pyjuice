@@ -386,12 +386,16 @@ class TensorCircuit(nn.Module):
         """
         params = self.params.detach().cpu()
 
-        foreach(param_copy_func, self.root_nodes)
         for ns in self.root_nodes:
-            if clone_params:
-                ns._params = params[ns._param_ids].clone()
-            else:
-                ns._params = params[ns._param_ids]
+            if ns.is_sum() and not ns.is_tied():
+                psid, peid = ns._param_range
+                if clone_params:
+                    ns._params = params[ns._param_ids].clone()
+                else:
+                    ns._params = params[ns._param_ids]
+
+        for layer in self.input_layers:
+            layer.update_parameters()
 
         return None
 
@@ -551,25 +555,6 @@ class TensorCircuit(nn.Module):
     def _normalize_parameters(self, params, pseudocount: float = 0.0):
         if params is not None:
             normalize_parameters(params, self.node_ids, self.node_nchs, pseudocount)
-
-    def _extract_params_to_ns(self):
-        """
-        Extract all inner and input parameters from this TensorCircuit to individual nodes.
-        """
-        assert self.device.type == "cpu", "Please move the TensorCircuit to CPU before extracting its parameters."
-
-        # Inner nodes
-        for layer in self.inner_layers:
-            if layer.is_sum():
-                for ns in layer.nodes:
-                    # Omit duplicated parameters from tied nodes
-                    if ns._source_node is None:
-                        sidx, eidx = ns._param_range
-                        ns._params = self.params.data[sidx:eidx].detach().cpu().clone()
-
-        # Input nodes
-        for layer in self.input_layers:
-            layer._extract_params_to_ns()
 
     def _create_node_layers(self):
         depth2nodes = dict()

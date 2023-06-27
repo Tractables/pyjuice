@@ -227,7 +227,7 @@ class DiscreteLogisticLayer(InputLayer, nn.Module):
         self.mus.requires_grad = False
         self.log_scales.requires_grad = False
 
-    def _extract_params_to_ns(self):
+    def update_parameters(self):
         raise NotImplementedError()
 
     @staticmethod
