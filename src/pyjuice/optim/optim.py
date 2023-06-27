@@ -3,14 +3,14 @@ import torch.nn as nn
 from torch.optim.optimizer import Optimizer
 from typing import Dict, Optional
 
-from pyjuice.model import ProbCircuit
+from pyjuice.model import TensorCircuit
 
 
 class CircuitOptimizer():
 
     SUPPORTED_OPTIM_METHODS = ["EM"]
 
-    def __init__(self, circuit: ProbCircuit, base_optimizer: Optional[Optimizer] = None, method: str = "EM", lr: float = 0.1,
+    def __init__(self, circuit: TensorCircuit, base_optimizer: Optional[Optimizer] = None, method: str = "EM", lr: float = 0.1,
                  pseudocount: float = 0.1):
         
         self.circuit = circuit

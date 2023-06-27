@@ -5,8 +5,9 @@ import networkx as nx
 from typing import Type
 from pyjuice.graph import *
 from pyjuice.layer import *
-from pyjuice.model import ProbCircuit
-from pyjuice.structures import BayesianTreeToHiddenRegionGraph
+from pyjuice.model import TensorCircuit
+from .compilation import BayesianTreeToHiddenRegionGraph
+
 
 def HMM(length: int, num_latents: int, 
         input_layer_type: Type[InputLayer] = CategoricalLayer, 
@@ -22,5 +23,5 @@ def HMM(length: int, num_latents: int,
 
     root = 0
     root_r = BayesianTreeToHiddenRegionGraph(T, root, num_latents, input_layer_type, input_layer_params)
-    pc = ProbCircuit(root_r)
-    return pc
+    
+    return root_r

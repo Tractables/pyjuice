@@ -1,1 +1,1 @@
-from .region_graph import RegionGraph, PartitionNode, InnerRegionNode, InputRegionNode, truncate_npartition
+from .region_graph import RegionGraph, PartitionNode, InnerRegionNode, InputRegionNode

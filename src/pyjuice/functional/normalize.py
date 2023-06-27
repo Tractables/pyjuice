@@ -2,6 +2,8 @@ import torch
 import triton
 import triton.language as tl
 
+from typing import Optional
+
 
 @triton.jit
 def _cum_params_kernel(params_ptr, cum_params_ptr, node_ids_ptr, tot_num_params, batch_size, BLOCK_SIZE: tl.constexpr):
@@ -47,10 +49,13 @@ def _norm_params_kernel(params_ptr, cum_params_ptr, node_ids_ptr, node_nchs_ptr,
     tl.store(params_ptr + offsets, normed_params, mask = mask)
 
 
-def normalize_parameters(params: torch.Tensor, node_ids: torch.Tensor, node_nchs: torch.Tensor, pseudocount: float = 0.0):
+def normalize_parameters(params: torch.Tensor, node_ids: torch.Tensor, node_nchs: Optional[torch.Tensor] = None, pseudocount: float = 0.0):
 
     num_params = params.size(0)
     num_nodes = torch.max(node_ids).detach().cpu().item() + 1
+
+    if node_nchs is None:
+        node_nchs = torch.bincount(node_ids)
 
     if node_ids.is_cuda:
         assert params.is_cuda, "Input `params` should be on GPU."
@@ -72,19 +77,20 @@ def normalize_parameters(params: torch.Tensor, node_ids: torch.Tensor, node_nchs
         assert params.dim() == 1, "CPU version of `normalize_parameters` does not support `batch_size > 1` for now."
 
         with torch.no_grad():
+
             param_ids = torch.arange(0, num_params, dtype = torch.long, device = params.device)
 
             cum_matrix1 = torch.sparse_coo_tensor(
                 torch.stack((node_ids, param_ids), dim = 0), 
                 params, (num_nodes, num_params)
             )
-            node_buffer = torch.sparse.mm(cum_matrix1, torch.ones([num_params, 1], dtype = torch.float32, device = params.device))
+            node_buffer = torch.sparse.mm(cum_matrix1, torch.ones([num_params, 1], dtype = torch.float32, device = params.device)) + pseudocount
 
             node_buffer.reciprocal_()
 
             cum_matrix2 = torch.sparse_coo_tensor(
                 torch.stack((param_ids, node_ids), dim = 0), 
-                params, (num_params, num_nodes)
+                params + pseudocount / node_nchs[node_ids], (num_params, num_nodes)
             )
             params_buffer = torch.sparse.mm(cum_matrix2, node_buffer)
             params.data[:] = params_buffer[:,0]

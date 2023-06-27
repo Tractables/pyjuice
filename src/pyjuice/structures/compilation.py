@@ -3,14 +3,16 @@ from __future__ import annotations
 import torch
 import networkx as nx
 from typing import Type
-from pyjuice.graph import RegionGraph, PartitionNode, InnerRegionNode, InputRegionNode
-from pyjuice.layer import InputLayer 
+
+from pyjuice.nodes import multiply, summate, inputs
+from pyjuice.nodes.distributions import Distribution
+
 
 def BayesianTreeToHiddenRegionGraph(tree: nx.Graph, 
                                     root,
                                     num_latents: int,  
-                                    input_layer_type: Type[InputLayer], 
-                                    input_layer_params: dict) -> RegionGraph:
+                                    InputDist: Type[Distribution], 
+                                    dist_params: dict) -> RegionGraph:
     """
     Given a Tree Bayesian Network tree T1 (i.e. at most one parents), 
     
@@ -45,7 +47,7 @@ def BayesianTreeToHiddenRegionGraph(tree: nx.Graph,
 
         if len(chs) == 0:             
             # Input Region
-            r = InputRegionNode(scope = [v], num_nodes = num_latents, node_type = input_layer_type, **input_layer_params)
+            r = inputs(v, num_nodes = num_latents, dist = InputDist(**dist_params))
             var2rnode[v] = r
         else:
             # Inner Region
@@ -54,20 +56,19 @@ def BayesianTreeToHiddenRegionGraph(tree: nx.Graph,
             ch_regions = [var2rnode[c] for c in chs]
 
             # Add x_v to children(z_v)
-            leaf_r = InputRegionNode(scope = [v], num_nodes = num_latents, node_type = input_layer_type, **input_layer_params)
+            leaf_r = inputs(v, num_nodes = num_latents, dist = InputDist(**dist_params))
             ch_regions.append(leaf_r)
 
-            edge_ids = torch.arange(0, num_latents).view(-1, 1).repeat(1, len(ch_regions)) 
-            rp = PartitionNode(ch_regions, num_nodes = num_latents, edge_ids = edge_ids)
+            rp = multiply(*ch_regions)
 
             if v == root:
                 par_ids = torch.zeros([num_latents], dtype = torch.int64)
                 chs_ids = torch.arange(0, num_latents)
-                r = InnerRegionNode([rp], num_nodes = 1, edge_ids = torch.stack((par_ids, chs_ids), dim = 0))
+                r = summate(rp, num_nodes = 1, edge_ids = torch.stack((par_ids, chs_ids), dim = 0))
             else:
                 par_ids = torch.arange(0, num_latents).view(-1, 1).repeat(1, num_latents).reshape(-1)
                 chs_ids = torch.arange(0, num_latents).view(1, -1).repeat(num_latents, 1).reshape(-1)
-                r = InnerRegionNode([rp], num_nodes = num_latents, edge_ids = torch.stack((par_ids, chs_ids), dim = 0))
+                r = summate(rp, num_nodes = num_latents, edge_ids = torch.stack((par_ids, chs_ids), dim = 0))
 
             var2rnode[v] = r
 

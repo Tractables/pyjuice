@@ -5,80 +5,100 @@ import torch.nn as nn
 import torch.nn.functional as F
 import triton
 import triton.language as tl
-from typing import List, Dict, Optional
+from copy import deepcopy
+from typing import Sequence, Dict, Optional
 
-from pyjuice.graph.region_graph import RegionGraph, InputRegionNode
+from pyjuice.nodes import InputNodes
+from pyjuice.nodes.distributions import Categorical
 from pyjuice.layer.input_layer import InputLayer
 from pyjuice.functional import normalize_parameters
 
-# Try to enable tensor cores
-torch.set_float32_matmul_precision('high')
 
+class CategoricalLayer(InputLayer, nn.Module):
+    
+    def __init__(self, nodes: Sequence[InputNodes], cum_nodes: int = 0) -> None:
+        nn.Module.__init__(self)
 
-class CategoricalLayer(InputLayer):
-    def __init__(self, layer_id: int, region_nodes: List[RegionGraph], cum_nodes: int = 0) -> None:
+        # Reorder input nodes such that for any tied nodes, its source nodes appear before them
+        nodes = self._reorder_nodes(nodes)
+        InputLayer.__init__(self, nodes)
 
-        num_nodes = sum(map(lambda r: r.num_nodes, region_nodes))
-
-        InputLayer.__init__(self, layer_id, region_nodes, num_nodes)
-
+        # Parse input `nodes`
         self.vars = []
-        self.rnode_num_nodes = []
-        self.rnode_num_cats = []
+        self.node_sizes = []
+        self.node_num_cats = []
         self.param_ends = []
         layer_num_nodes = 0
         cum_params = 0
-        num_nodes = 0
-        for rnode in self.region_nodes:
-            assert len(rnode.scope) == 1, "CategoricalLayer only support uni-variate categorical distributions."
+        for ns in self.nodes:
+            assert len(ns.scope) == 1, "CategoricalLayer only support uni-variate categorical distributions."
+            assert isinstance(ns.dist, Categorical), f"Adding a `{type(ns.dist)}` node to a `CategoricalLayer`."
 
-            self.vars.append(next(iter(rnode.scope)))
-            self.rnode_num_nodes.append(rnode.num_nodes)
-            self.rnode_num_cats.append(rnode.extra_params["num_cats"])
+            self.vars.append(next(iter(ns.scope)))
+            self.node_sizes.append(ns.num_nodes)
+            self.node_num_cats.append(ns.dist.num_cats)
 
-            num_nodes += rnode.num_nodes
+            ns._output_ind_range = (cum_nodes, cum_nodes + ns.num_nodes)
+            cum_nodes += ns.num_nodes
+            layer_num_nodes += ns.num_nodes
 
-            rnode._output_ind_range = (cum_nodes, cum_nodes + rnode.num_nodes)
-            cum_nodes += rnode.num_nodes
-            layer_num_nodes += rnode.num_nodes
-
-            for nid in range(1, rnode.num_nodes + 1):
-                self.param_ends.append(cum_params + rnode.extra_params["num_cats"] * nid)
-            cum_params += rnode.num_nodes * rnode.extra_params["num_cats"]
+            if not ns.is_tied():
+                for nid in range(1, ns.num_nodes + 1):
+                    self.param_ends.append(cum_params + ns.dist.num_cats * nid)
+                cum_params += ns.num_nodes * ns.dist.num_cats
+                ns._param_range = (cum_params - ns.num_nodes * ns.dist.num_cats, cum_params)
+            else:
+                source_ns = ns.get_source_ns()
+                ns._param_range = deepcopy(source_ns._param_range)
 
         self._output_ind_range = (cum_nodes - layer_num_nodes, cum_nodes)
         self.param_ends = torch.tensor(self.param_ends)
 
         self.num_params = cum_params
-        self.num_nodes = num_nodes
+        self.num_nodes = layer_num_nodes
 
-        vids = torch.empty([layer_num_nodes], dtype = torch.long)
-        psids = torch.empty([layer_num_nodes], dtype = torch.long)
-        n_start = 0
-        for idx, rnode in enumerate(self.region_nodes):
-            n_end = n_start + rnode.num_nodes
+        # Construct layered
+        vids = torch.empty([self.num_nodes], dtype = torch.long)
+        psids = torch.empty([self.num_nodes], dtype = torch.long)
+        node_ids = torch.empty([self.num_params], dtype = torch.long)
+        node_nchs = torch.empty([self.num_nodes], dtype = torch.long)
+        n_start, pn_start, p_start = 0, 0, 0
+        ns2pnrange = dict()
+        for idx, ns in enumerate(self.nodes):
+            n_end = n_start + ns.num_nodes
             vids[n_start:n_end] = self.vars[idx]
 
-            if idx == 0:
-                psids[0] = 0
-                psids[1:n_end] = torch.tensor(self.param_ends[0:n_end-1])
+            node_nchs[n_start:n_end] = ns.dist.num_cats
+
+            if not ns.is_tied():
+                pn_end = pn_start + ns.num_nodes
+                p_end = p_start + ns.num_nodes * ns.dist.num_cats
+
+                node_ids[p_start:p_end] = torch.arange(pn_start, pn_end)[:,None].repeat(1, ns.dist.num_cats).reshape(-1)
+
+                if idx == 0:
+                    psids[0] = 0
+                    psids[1:n_end] = self.param_ends[0:pn_end-1].clone().detach()
+                    ns2pnrange[ns] = (-1, pn_end)
+                else:
+                    psids[n_start:n_end] = self.param_ends[pn_start-1:pn_end-1].clone().detach()
+                    ns2pnrange[ns] = (pn_start, pn_end)
+
+                pn_start = pn_end
+                p_start = p_end
             else:
-                psids[n_start:n_end] = torch.tensor(self.param_ends[n_start-1:n_end-1])
+                source_ns = ns.get_source_ns()
+                pns, pne = ns2pnrange[source_ns]
+                if pns == -1:
+                    psids[n_start] = 0
+                    psids[n_start+1:n_end] = self.param_ends[0:pne-1].clone().detach()
+                else:
+                    psids[n_start:n_end] = self.param_ends[pns-1:pne-1].clone().detach()
 
             n_start = n_end
 
         self.register_buffer("vids", vids)
         self.register_buffer("psids", psids)
-
-        # For parameter normalization
-        node_ids = torch.empty([self.num_params], dtype = torch.long)
-        node_nchs = torch.empty([self.num_nodes], dtype = torch.long)
-        node_ids[:self.param_ends[0]] = 0
-        node_nchs[0] = self.param_ends[0]
-        for i in range(1, len(self.param_ends)):
-            node_ids[self.param_ends[i-1]:self.param_ends[i]] = i
-            node_nchs[i] = self.param_ends[i] - self.param_ends[i-1]
-        
         self.register_buffer("node_ids", node_ids)
         self.register_buffer("node_nchs", node_nchs)
 
@@ -91,10 +111,8 @@ class CategoricalLayer(InputLayer):
         self._param_batch_size = 1
 
     def forward(self, data: torch.Tensor, node_mars: torch.Tensor, 
-                                        params: Optional[Dict] = None, 
-                                        missing_mask: Optional[torch.Tensor]=None,  
-                                        alphas:Optional[torch.Torch]=None,
-                                        skip_logsumexp: bool = False):
+                params: Optional[Dict] = None, 
+                missing_mask: Optional[torch.Tensor] = None):
         """
         data: [num_vars, B]
         node_mars: [num_nodes, B]
@@ -108,14 +126,12 @@ class CategoricalLayer(InputLayer):
 
         assert params.dim() == 1
         
-        if skip_logsumexp:
-            self._dense_forward_pass_nolog(data, node_mars, params)
-        else:
-            self._dense_forward_pass(data, node_mars, params, missing_mask=missing_mask, alphas=alphas)
+        self._forward(data, node_mars, params, missing_mask = missing_mask)
 
         return None
 
-    def backward(self, data: torch.Tensor, node_flows: torch.Tensor, node_mars: torch.Tensor, params: Optional[Dict] = None):
+    def backward(self, data: torch.Tensor, node_flows: torch.Tensor, 
+                 node_mars: torch.Tensor, params: Optional[Dict] = None):
         """
         data: [num_vars, B]
         node_flows: [num_nodes, B]
@@ -129,42 +145,76 @@ class CategoricalLayer(InputLayer):
         param_ids = data[self.vids] + self.psids.unsqueeze(1)
         
         grid = lambda meta: (triton.cdiv(layer_num_nodes * batch_size, meta['BLOCK_SIZE']),)
+        
         self._flows_kernel[grid](self.param_flows, node_flows, param_ids, layer_num_nodes, tot_num_nodes, batch_size, node_offset, BLOCK_SIZE = 1024)
         
         return None
-    
-    def sample(self, samples: torch.Tensor, missing_mask:torch.tensor, node_flows: torch.tensor):
+
+    def sample(self, samples: torch.Tensor, node_flows: torch.Tensor, missing_mask: Optional[torch.Tensor] = None, 
+               params: Optional[torch.Tensor] = None):
         """
         samples:       [num_vars, B]
-        missing_mask:  [num_vars, B]
-        node_flows:    [num_nodes, B]    
-        
-    
-         - Note: it does not return anything, will update the samples in-place
-         - node_flows[sid:eid].size() == (num_input_nodes, B)
+        missing_mask:  [num_vars, B] or [num_vars] or None
+        node_flows:    [num_nodes, B]
         """
-        sid, eid = self._output_ind_range[0], self._output_ind_range[1]
-        # print(f"Input layer w/+ flows (should be {samples.size(0)})", node_flows[sid:eid, :].sum(dim=0))   
-    
-        node_idxs, batch_idxs = node_flows[sid:eid, :].nonzero(as_tuple=True)   # (num_vars * B, 2)
-        var_idxs = self.vids[node_idxs]                                         # (num_vars * B) 
-        
-        sampled_node_idxs = torch.zeros(samples.shape, dtype=torch.long, device=samples.device)
-        sampled_node_idxs[var_idxs, batch_idxs] = node_idxs
+        sid, eid = self._output_ind_range
+        num_nodes = eid - sid
+        num_vars = self.vids.max().item() + 1
+        num_cats = self.node_nchs.max().item()
+        batch_size = node_flows.size(1)
+        all_vars = torch.unique(self.vids)
 
-        # TODO fix later, for now assume constant number of cats 
-        # need a custome kernel probably
-        ps = self.params.view(-1, self.psids[1])                        # (num_nodes, num_cats)
-        cummulp = ps.cumsum(-1)
-        replace_cummul_ps = cummulp[sampled_node_idxs]                 # (var, B, num_cats)
-        rands = torch.rand(samples.size(0), samples.size(1), 1, device=samples.device)  # (vars, B, 1)
-    
-        sampled_cats = torch.sum(rands > replace_cummul_ps, dim=2).to(samples.dtype)
-        samples[missing_mask] = sampled_cats[missing_mask]
+        probs = torch.zeros([num_vars * num_cats * batch_size], dtype = torch.float32, device = node_flows.device)
 
+        if params is None:
+            params = self.params
+        else:
+            params = params["params"]
+
+        # Get all node ids with non-zero flow
+        nflow_xids, nflow_yids = torch.where(node_flows[sid:eid,:])
+        nflow_xids += sid
+        num_activ_nodes = nflow_xids.size(0)
+
+        # Prepare and run the sample kernel
+        grid = lambda meta: (triton.cdiv(num_activ_nodes * num_cats, meta['BLOCK_SIZE']),)
+        self._sample_kernel[grid](
+            probs, node_flows, params, nflow_xids, nflow_yids, self.vids, self.psids, self.node_nchs,
+            sid, num_activ_nodes, num_cats, batch_size, BLOCK_SIZE = 2048
+        )
+
+        # Reshape the cumulated (unnormalized) probabilities
+        probs = probs.reshape(num_vars, num_cats, batch_size)
+
+        if missing_mask is None:
+            dist = torch.distributions.Categorical(probs = probs.permute(0, 2, 1))
+            samples[all_vars,:] = dist.sample()[all_vars,:]
+
+        elif missing_mask.dim() == 1:
+            mask = torch.zeros([missing_mask.size(0)], dtype = torch.bool, device = missing_mask.device)
+            mask[all_vars] = True
+            missing_mask = missing_mask & mask
+            dist = torch.distributions.Categorical(probs = probs[missing_mask,:,:].permute(0, 2, 1))
+            samples[missing_mask,:] = dist.sample()
+
+        else:
+            assert missing_mask.dim() == 2
+
+            mask = torch.zeros([missing_mask.size(0), 1], dtype = torch.bool, device = missing_mask.device)
+            mask[all_vars,:] = True
+            missing_mask = missing_mask & mask
+
+            dist = torch.distributions.Categorical(probs = probs.permute(0, 2, 1))
+            samples = samples.view(-1)
+            missing_mask = missing_mask.view(-1)
+            samples[missing_mask] = dist.sample()[missing_mask]
+            samples = samples.reshape(num_vars, batch_size)
+
+        return samples
 
     def mini_batch_em(self, step_size: float, pseudocount: float = 0.0):
         if not self._used_external_params:
+            # Normalize and update parameters
             with torch.no_grad():
                 flows = self.param_flows
                 self._normalize_parameters(flows, pseudocount = pseudocount)
@@ -173,12 +223,10 @@ class CategoricalLayer(InputLayer):
     def get_param_specs(self):
         return {"params": torch.Size([self.params.size(0)])}
 
-    @torch.compile(mode = "default")
-    def _dense_forward_pass(self, data: torch.Tensor, node_mars: torch.Tensor,
-                                                            params: torch.Tensor, 
-                                                            missing_mask: Optional[torch.Tensor]=None, 
-                                                            alphas:Optional[torch.Tensor]=None):
-        
+    # @torch.compile(mode = "default")
+    def _forward(self, data: torch.Tensor, node_mars: torch.Tensor,
+                 params: torch.Tensor, missing_mask: Optional[torch.Tensor] = None):
+
         sid, eid = self._output_ind_range[0], self._output_ind_range[1]
         param_idxs = data[self.vids] + self.psids.unsqueeze(1)
         if missing_mask is not None:
@@ -186,17 +234,7 @@ class CategoricalLayer(InputLayer):
             node_mars[sid:eid,:][~mask] = ((params[param_idxs][~mask]).clamp(min=1e-10)).log()
             node_mars[sid:eid,:][mask] = 0.0
         else:
-            node_mars[sid:eid,:] = ((params[param_idxs]).clamp(min=1e-10)).log()            
-
-        if alphas is not None:
-            node_mars[sid:eid,:] = ((node_mars[sid:eid,:].exp() * alphas[self.vids]) + (1 - alphas[self.vids])).log()
-
-        return None
-
-    @torch.compile(mode = "default")
-    def _dense_forward_pass_nolog(self, data: torch.Tensor, node_mars: torch.Tensor, params: torch.Tensor):
-        sid, eid = self._output_ind_range[0], self._output_ind_range[1]
-        node_mars[sid:eid,:] = ((params[data[self.vids] + self.psids.unsqueeze(1)] + 1e-8).clamp(min=1e-10))
+            node_mars[sid:eid,:] = ((params[param_idxs]).clamp(min=1e-10)).log()
 
         return None
 
@@ -224,21 +262,22 @@ class CategoricalLayer(InputLayer):
         """
         params = torch.exp(torch.rand([self.num_params]) * -perturbation)
         
-        n_start = 0
-        for idx, rnode in enumerate(self.region_nodes):
-            n_end = n_start + rnode.num_nodes
+        pn_start = 0
+        for idx, ns in enumerate(self.nodes):
+            if not ns.is_tied():
+                pn_end = pn_start + ns.num_nodes
 
-            if hasattr(rnode, "_params"):
-                if idx == 0:
-                    par_start = 0
-                    par_end = self.param_ends[n_end-1]
-                else:
-                    par_start = self.param_ends[n_start-1]
-                    par_end = self.param_ends[n_end-1]
+                if ns.has_params():
+                    if idx == 0:
+                        par_start = 0
+                        par_end = self.param_ends[pn_end-1]
+                    else:
+                        par_start = self.param_ends[pn_start-1]
+                        par_end = self.param_ends[pn_end-1]
 
-                params[par_start:par_end] = rnode._params["params"].to(params.device)
+                    params[par_start:par_end] = ns._params.to(params.device)
 
-            n_start = n_end
+                pn_start = pn_end
 
         self._normalize_parameters(params)
         self.params = nn.Parameter(params)
@@ -247,77 +286,91 @@ class CategoricalLayer(InputLayer):
         # gradient of PC parameters by PyTorch.
         self.params.requires_grad = False
 
-    def _extract_params_to_rnodes(self):
+    def _extract_params_to_ns(self):
         n_start = 0
-        for idx, rnode in enumerate(self.region_nodes):
-            n_end = n_start + rnode.num_nodes
+        for idx, ns in enumerate(self.nodes):
+            if ns.is_tied():
+                continue
+
+            n_end = n_start + ns.num_nodes
 
             if idx == 0:
                 par_start = 0
                 par_end = self.param_ends[n_end-1]
-
-                param_ends = self.param_ends[0:n_end]
             else:
                 par_start = self.param_ends[n_start-1]
                 par_end = self.param_ends[n_end-1]
 
-                param_ends = self.param_ends[n_start:n_end] - par_start
-
-            rnode._params = {
-                "params": self.params.data[par_start:par_end].detach().cpu().clone(),
-                "param_ends": param_ends.detach().cpu().clone()
-            }
+            ns._params = self.params.data[par_start:par_end].detach().cpu().clone()
 
             n_start = n_end
 
     @staticmethod
-    def _prune_nodes(_params: Dict, node_keep_flag: torch.Tensor):
-        kept_nodes = torch.where(node_keep_flag)[0]
-        num_nodes = node_keep_flag.sum().item()
+    @triton.jit
+    def _sample_kernel(probs_ptr, node_flows_ptr, params_ptr, nflow_xids_ptr, nflow_yids_ptr, vids_ptr, 
+                       psids_ptr, node_nchs_ptr, sid: tl.constexpr, num_activ_nodes: tl.constexpr, 
+                       num_cats: tl.constexpr, batch_size: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(axis = 0)
+        block_start = pid * BLOCK_SIZE
 
-        old_n_params = torch.zeros_like(_params["param_ends"])
-        old_n_params[0] = _params["param_ends"][0]
-        old_n_params[1:] = _params["param_ends"][1:] - _params["param_ends"][:-1]
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < num_activ_nodes * num_cats
 
-        param_ends = torch.cumsum(old_n_params[node_keep_flag], dim = 0)
+        # Get node ID, category ID, and batch ID
+        nf_offsets = offsets // num_cats
+        cat_offsets = (offsets % num_cats)
+        node_offsets = tl.load(nflow_xids_ptr + nf_offsets, mask = mask, other = 0)
+        batch_offsets = tl.load(nflow_yids_ptr + nf_offsets, mask = mask, other = 0)
 
-        params = torch.zeros([param_ends[-1]], dtype = torch.float32)
-        for idx in range(num_nodes):
-            oidx = kept_nodes[idx]
-            if oidx == 0:
-                ops, ope = 0, _params["param_ends"][0]
+        local_n_offsets = node_offsets - sid
+
+        # Number of chs for every node
+        node_nch = tl.load(node_nchs_ptr + local_n_offsets, mask = mask, other = 0)
+        mask = mask & (cat_offsets < node_nch)
+
+        # Get variable ID
+        vid = tl.load(vids_ptr + local_n_offsets, mask = mask, other = 0)
+
+        # Get param
+        psid = tl.load(psids_ptr + local_n_offsets, mask = mask, other = 0)
+        param = tl.load(params_ptr + psid + cat_offsets, mask = mask, other = 0)
+
+        # Get flow
+        nflow_offsets = node_offsets * batch_size + batch_offsets
+        nflow = tl.load(node_flows_ptr + nflow_offsets, mask = mask, other = 0)
+
+        # Compute edge flow and add to output
+        eflow = param * nflow
+
+        o_offsets = vid * (num_cats * batch_size) + cat_offsets * batch_size + batch_offsets
+        tl.atomic_add(probs_ptr + o_offsets, eflow, mask = mask)
+
+    def _reorder_nodes(self, nodes):
+        node_set = set(nodes)
+        reordered_untied_nodes = []
+        reordered_tied_nodes = []
+        added_node_set = set()
+        for ns in nodes:
+            if ns in added_node_set:
+                continue
+            if not ns.is_tied():
+                reordered_untied_nodes.append(ns)
+                added_node_set.add(ns)
             else:
-                ops, ope = _params["param_ends"][oidx-1], _params["param_ends"][oidx]
+                source_ns = ns.get_source_ns()
+                if source_ns in added_node_set:
+                    reordered_tied_nodes.append(ns)
+                    added_node_set.add(ns)
+                elif source_ns in node_set:
+                    reordered_untied_nodes.append(source_ns)
+                    reordered_tied_nodes.append(ns)
+                    added_node_set.add(ns)
+                    added_node_set.add(source_ns)
+                else:
+                    raise ValueError("A tied `InputNodes` should be in the same layer with its source nodes.")
 
-            if idx == 0:
-                ps, pe = 0, param_ends[0]
-            else:
-                ps, pe = param_ends[idx-1], param_ends[idx]
+        reordered_nodes = reordered_untied_nodes + reordered_tied_nodes
 
-            params[ps:pe] = _params["params"][ops:ope]
+        assert len(reordered_nodes) == len(nodes), "Total node length should not change after reordering."
 
-        return {"params": params, "param_ends": param_ends}
-
-    @staticmethod
-    def _duplicate_nodes(_params: Dict):
-        num_nodes = _params["param_ends"].size(0)
-        num_params = _params["params"].size(0)
-
-        params = torch.zeros([num_params * 2])
-        par_start = 0
-        for idx in range(num_nodes):
-            if idx == 0:
-                np = _params["param_ends"][0]
-            else:
-                np = _params["param_ends"][idx] - _params["param_ends"][idx-1]
-
-            params[par_start*2:par_start*2+np] = _params["params"][par_start:par_start+np]
-            params[par_start*2+np:par_start*2+np*2] = _params["params"][par_start:par_start+np]
-
-            par_start += np
-
-        param_ends = _params["param_ends"].view(-1, 1).repeat(1, 2).reshape(-1) * 2
-        param_ends[2::2] -= _params["param_ends"][1:] - _params["param_ends"][:-1]
-        param_ends[0] -= _params["param_ends"][0]
-
-        return {"params": params, "param_ends": param_ends}
+        return reordered_nodes
