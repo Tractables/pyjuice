@@ -372,6 +372,8 @@ class TensorCircuit(nn.Module):
 
         self.device = device
 
+        return self
+
     def get_param_specs(self):
         param_specs = dict()
         param_specs["inner"] = torch.Size([self.num_sum_params])
