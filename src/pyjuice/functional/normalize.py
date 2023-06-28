@@ -78,6 +78,8 @@ def normalize_parameters(params: torch.Tensor, node_ids: torch.Tensor, node_nchs
 
         with torch.no_grad():
 
+            params = params.float()
+
             param_ids = torch.arange(0, num_params, dtype = torch.long, device = params.device)
 
             cum_matrix1 = torch.sparse_coo_tensor(
