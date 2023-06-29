@@ -57,7 +57,7 @@ class CategoricalLayer(InputLayer, nn.Module):
         self.num_params = cum_params
         self.num_nodes = layer_num_nodes
 
-        # Construct layered
+        # Construct layer
         vids = torch.empty([self.num_nodes], dtype = torch.long)
         psids = torch.empty([self.num_nodes], dtype = torch.long)
         node_ids = torch.empty([self.num_params], dtype = torch.long)
@@ -223,7 +223,7 @@ class CategoricalLayer(InputLayer, nn.Module):
     def get_param_specs(self):
         return {"params": torch.Size([self.params.size(0)])}
 
-    # @torch.compile(mode = "default")
+    @torch.compile(mode = "default")
     def _forward(self, data: torch.Tensor, node_mars: torch.Tensor,
                  params: torch.Tensor, missing_mask: Optional[torch.Tensor] = None):
 

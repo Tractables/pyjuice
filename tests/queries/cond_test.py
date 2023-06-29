@@ -39,6 +39,8 @@ def cond_test():
     assert (pc.node_mars[1,0].exp() - p0).abs() < 1e-4
     assert (pc.node_mars[2,0].exp() - p1).abs() < 1e-4
 
+    import pdb; pdb.set_trace()
+
     f1 = pc.node_flows[3,0]
     f2 = pc.node_flows[4,0]
     unnorm_o = f1 * pc.input_layers[0].params[4:8] + f2 * pc.input_layers[0].params[8:12]
