@@ -5,11 +5,18 @@ import pickle
 from functools import partial
 from typing import Sequence
 
+from pyjuice.model import TensorCircuit
 from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes
 from .serialization import serialize_nodes, deserialize_nodes
 
 
-def save(fname: str, root_ns: CircuitNodes):
+def save(fname: str, model: Union[CircuitNodes,TensorCircuit]):
+    if isinstance(model, TensorCircuit):
+        model.update_parameters()
+        root_ns = model.root_nodes
+    else:
+        root_ns = model
+
     if fname.endswith(".jpc"):
         sel_nodes = serialize_nodes(root_ns)
         with open(fname, "wb") as f:
