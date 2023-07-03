@@ -363,6 +363,7 @@ class SumLayer(Layer, nn.Module):
                          tot_n_nodes: tl.constexpr, tot_n_eles: tl.constexpr,
                          n_nodes: tl.constexpr, n_edges: tl.constexpr, 
                          batch_size: tl.constexpr, n_nodes_per_block_m: tl.constexpr,
+                         accumulate_param_flows: tl.constexpr,
                          BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
         # We use BLOCK_M to index over edges, and BLOCK_N to index over batches
         pid0 = tl.program_id(axis = 0)
@@ -421,23 +422,21 @@ class SumLayer(Layer, nn.Module):
         tl.store(element_flows_ptr + ele_offsets, cum_eflows, mask = ele_mask)
 
         # Compute parameter flows
-        parflows = tl.sum(eflows, axis = 0) # [n_edges, n_nodes_per_block_m]
-        # Here the `eparam_ids > 0` term masks out dummy edges
-        parflow_mask = (eparam_ids > 0) & tl.broadcast_to(n_mask[None,:], (n_edges, n_nodes_per_block_m))
-        tl.atomic_add(param_flows_ptr + eparam_ids, parflows, mask = parflow_mask)
+        if accumulate_param_flows:
+            parflows = tl.sum(eflows, axis = 0) # [n_edges, n_nodes_per_block_m]
+            # Here the `eparam_ids > 0` term masks out dummy edges
+            parflow_mask = (eparam_ids > 0) & tl.broadcast_to(n_mask[None,:], (n_edges, n_nodes_per_block_m))
+            tl.atomic_add(param_flows_ptr + eparam_ids, parflows, mask = parflow_mask)
 
     @staticmethod
     @torch.compile(mode = "reduce-overhead", fullgraph = True)
     def _backward_pytorch_kernel(node_flows: torch.Tensor, element_flows: torch.Tensor, 
                                  params: torch.Tensor, node_mars: torch.Tensor, 
-                                 element_mars: torch.Tensor, param_flows: torch.Tensor, 
+                                 element_mars: torch.Tensor, param_flows: Optional[torch.Tensor], 
                                  chids: torch.Tensor, parids: torch.Tensor, parpids: torch.Tensor):
         
         element_flows[chids] = (node_flows[parids] * params[parpids].unsqueeze(-1) * \
             (element_mars[chids].unsqueeze(1) - node_mars[parids]).exp()).sum(dim = 1)
-
-        param_flows[seq_parpids] += (node_flows[parids] * params[parpids].unsqueeze(-1) * \
-            (element_mars[chids].unsqueeze(1) - node_mars[parids]).exp()).sum(dim = 2)[seq_ids0, seq_ids1]
 
         return None
 
@@ -485,7 +484,7 @@ class SumLayer(Layer, nn.Module):
 
         # Fall back to the `torch.compile` kernel in the case where we cannot store child edges within a single block
         if n_edges > BLOCK_M_HARD_LIMIT or not node_mars.is_cuda:
-            raise NotImplementedError("This fallback workaround needs to be fixed..")
+            assert param_flows is None
             self._backward_pytorch_kernel(
                 node_flows, element_flows, params, node_mars, 
                 element_mars, param_flows, chids, parids, parpids
@@ -524,6 +523,7 @@ class SumLayer(Layer, nn.Module):
             n_edges = n_edges, 
             batch_size = batch_size, 
             n_nodes_per_block_m = BLOCK_M // n_edges,
+            accumulate_param_flows = (param_flows is not None),
             BLOCK_M = BLOCK_M, 
             BLOCK_N = BLOCK_N
         )
