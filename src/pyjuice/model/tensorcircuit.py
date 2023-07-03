@@ -278,29 +278,28 @@ class TensorCircuit(nn.Module):
                 else:
                     raise ValueError(f"Unknown layer type {type(layer)}.")
 
-            if compute_param_flows:
-                if inputs is None:
-                    inputs = self._inputs[0]
+            if inputs is None:
+                inputs = self._inputs[0]
+            else:
+                inputs = inputs.permute(1, 0)
+
+            # Compute backward pass for all input layers
+            grad_hook_idx = 2
+            for idx, layer in enumerate(self.input_layers):
+                if input_layer_fn is None:
+                    layer.backward(inputs, self.node_flows, self.node_mars, **kwargs)
+                elif isinstance(input_layer_fn, str):
+                    assert hasattr(layer, input_layer_fn), f"Custom input function `{input_layer_fn}` not found for layer type {type(layer)}."
+                    getattr(layer, input_layer_fn)(inputs, self.node_flows, self.node_mars, **kwargs)
                 else:
-                    inputs = inputs.permute(1, 0)
+                    assert isinstance(input_layer_fn, Callable), f"Custom input function should be either a `str` or a `Callable`. " + \
+                                                                    f"Found {type(input_layer_fn)} instead."
+                    input_layer_fn(layer, inputs, self.node_flows, self.node_mars, **kwargs)
 
-                # Compute backward pass for all input layers
-                grad_hook_idx = 2
-                for idx, layer in enumerate(self.input_layers):
-                    if input_layer_fn is None:
-                        layer.backward(inputs, self.node_flows, self.node_mars, **kwargs)
-                    elif isinstance(input_layer_fn, str):
-                        assert hasattr(layer, input_layer_fn), f"Custom input function `{input_layer_fn}` not found for layer type {type(layer)}."
-                        getattr(layer, input_layer_fn)(inputs, self.node_flows, self.node_mars, **kwargs)
-                    else:
-                        assert isinstance(input_layer_fn, Callable), f"Custom input function should be either a `str` or a `Callable`. " + \
-                                                                     f"Found {type(input_layer_fn)} instead."
-                        input_layer_fn(layer, inputs, self.node_flows, self.node_mars, **kwargs)
+                if "external_input_layers" in self._backward_buffer and idx in self._backward_buffer["external_input_layers"]:
+                    grad_hook_idx = layer._hook_param_grads(grad_hook_idx, self._inputs, self._inputs_grad)
 
-                    if "external_input_layers" in self._backward_buffer and idx in self._backward_buffer["external_input_layers"]:
-                        grad_hook_idx = layer._hook_param_grads(grad_hook_idx, self._inputs, self._inputs_grad)
-
-                    layer._hook_input_grads(self._inputs, self._inputs_grad)
+                layer._hook_input_grads(self._inputs, self._inputs_grad)
 
             if self._inputs[1] is not None:
                 B = self._inputs[0].size(0)

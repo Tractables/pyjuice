@@ -22,41 +22,48 @@ def _soft_evi_categorical_fw_kernel(data_ptr, node_mars_ptr, params_ptr, vids_pt
     block_start = pid * BLOCK_SIZE
 
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < num_nodes * num_cats * batch_size
+    mask = offsets < num_nodes * batch_size
 
     # Get node ID and category ID
-    ns_offsets = offsets // (num_cats * batch_size)
-    cat_offsets = (offsets // batch_size) % num_cats
-    batch_offsets = (offsets % batch_size)
+    ns_offsets = offsets // batch_size
+    batch_offsets = offsets % batch_size
+
+    # Get number of children (categories)
     node_nch = tl.load(node_nchs_ptr + ns_offsets, mask = mask, other = 0)
-    mask = mask & (cat_offsets < node_nch)
 
     # Get variable ID
     vid = tl.load(vids_ptr + ns_offsets, mask = mask, other = 0)
 
-    # Get data (soft evidence)
-    data_offsets = vid * (num_cats * batch_size) + cat_offsets * batch_size + batch_offsets
-    d_soft_evi = tl.load(data_ptr + data_offsets, mask = mask, other = 0)
-
-    # Get param
+    # Get param start ID
     psid = tl.load(psids_ptr + ns_offsets, mask = mask, other = 0)
-    param = tl.load(params_ptr + psid + cat_offsets, mask = mask, other = 0)
 
-    # Compute current likelihood and write back
-    pval = d_soft_evi * param
+    # Compute soft evidence per category
+    node_vals = tl.zeros((BLOCK_SIZE,), tl.float32)
+    for cat_id in range(num_cats):
 
-    nmar_offsets = (ns_offsets + sid) * batch_size + batch_offsets
-    tl.atomic_add(node_mars_ptr + nmar_offsets, pval, mask = mask)
+        cmask = mask & (cat_id < node_nch)
+
+        # Get data (soft evidence)
+        data_offsets = vid * (num_cats * batch_size) + cat_id * batch_size + batch_offsets
+        d_soft_evi = tl.load(data_ptr + data_offsets, mask = cmask, other = 0)
+
+        # Get param
+        param = tl.load(params_ptr + psid + cat_id, mask = cmask, other = 0)
+
+        # Compute current likelihood and accumulate
+        node_vals += d_soft_evi * param
+
+    # Write back
+    tl.store(node_mars_ptr + offsets + (sid * batch_size), tl.log(node_vals), mask = mask)
 
 
 def _categorical_forward(layer, node_mars: torch.Tensor,
                          params: Optional[torch.Tensor] = None, 
                          missing_mask: Optional[torch.Tensor] = None, **kwargs):
 
-    mask = missing_mask[layer.vids]
-
     if params is None:
         params = layer.params
+        params = params.clip(min = 1e-8)
 
     sid, eid = layer._output_ind_range[0], layer._output_ind_range[1]
     if "tokens" in kwargs:
@@ -70,25 +77,26 @@ def _categorical_forward(layer, node_mars: torch.Tensor,
         node_mars[sid:eid,:][mask] = 0.0
 
     elif "soft_evidence" in kwargs:
+
         data = kwargs["soft_evidence"]
         assert data.dim() == 3 and data.dtype == torch.float32 and data.min() >= 0.0 and data.max() <= 1.0
-        data = data.permute(1, 2, 0)
+        origin_data = data
+        data = data.clone().flatten(0, 1)
+        data[missing_mask.permute(1, 0).flatten(),:] = 1.0
+        data = data.reshape(missing_mask.size(1), missing_mask.size(0), -1).permute(1, 2, 0)
         
         num_nodes = eid - sid
         num_cats = data.size(1)
         batch_size = data.size(2)
 
-        node_mars[sid:eid,:] = 0.0
-
-        grid = lambda meta: (triton.cdiv(num_nodes * num_cats * batch_size, meta['BLOCK_SIZE']),)
+        grid = lambda meta: (triton.cdiv(num_nodes * batch_size, meta['BLOCK_SIZE']),)
 
         _soft_evi_categorical_fw_kernel[grid](
-            data.reshape(-1), node_mars, params, layer.vids, layer.psids, layer.node_nchs,
-            sid, num_nodes, num_cats, batch_size, BLOCK_SIZE = 2048
+            data.reshape(-1).contiguous(), node_mars, params, layer.vids, layer.psids, layer.node_nchs,
+            sid, num_nodes, num_cats, batch_size, BLOCK_SIZE = 512
         )
 
-        node_mars[sid:eid,:][~mask] = node_mars[sid:eid,:][~mask].log()
-        node_mars[sid:eid,:][mask] = 0.0
+        node_mars[sid:eid,:] = node_mars[sid:eid,:].clip(max = 1.0)
 
     else:
         raise NotImplementedError("Unknown method to compute the forward pass for `CategoricalLayer`.")
@@ -149,6 +157,7 @@ def _categorical_backward(layer, node_flows: torch.Tensor, node_mars: torch.Tens
 
     sid, eid = layer._output_ind_range[0], layer._output_ind_range[1]
     if mode == "full_distribution":
+
         num_nodes = eid - sid
         num_vars = layer.vids.max().item() + 1
         num_cats = layer.node_nchs.max().item()
