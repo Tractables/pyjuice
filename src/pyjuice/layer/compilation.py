@@ -7,6 +7,9 @@ import functools
 import os
 import warnings
 import time
+import triton
+import triton.language as tl
+from numba import njit
 from copy import deepcopy
 from typing import Optional, Sequence
 
@@ -531,6 +534,61 @@ def get_prod_layer_parstats(flat_cids):
     return u_cids, par_counts
 
 
+@njit
+def _assign_c_idx_kernel(flat_cids, flat_par_offsets, cum_c_nodes):
+
+    for i in range(flat_cids.shape[0]):
+        cid = flat_cids[i]
+        idx = cum_c_nodes[cid]
+        flat_par_offsets[i] = idx
+        cum_c_nodes[cid] = idx + 1
+
+
+@njit
+def _assign_cid2_group_local_id(flat_u_cids, n_group_ids, n_id_in_group, cid2group_id, cid2local_id):
+
+    for i in range(flat_u_cids.shape[0]):
+        cid = flat_u_cids[i]
+        cid2group_id[cid] = n_group_ids[i]
+        cid2local_id[cid] = n_id_in_group[i]
+
+
+@triton.jit
+def _assign_target_ucids_parids_kernel(target_u_cids_ptr, target_parids_ptr, flat_cid2nid_ptr, flat_cids_ptr, 
+                                       cid2group_id_ptr, cid2local_id_ptr, u_cids_group_start_ptr, parids_group_start_ptr,
+                                       flat_par_offsets_ptr, bk_group_max_pars_ptr, 
+                                       num_edges: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+
+    pid = tl.program_id(axis = 0)
+    block_start = pid * BLOCK_SIZE
+
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < num_edges
+
+    # Get `nid` and `cid` of the edges
+    nid = tl.load(flat_cid2nid_ptr + offsets, mask = mask, other = 0)
+    cid = tl.load(flat_cids_ptr + offsets, mask = mask, other = 0)
+
+    # Get `group_id` and `local_id` using `cid`
+    group_id = tl.load(cid2group_id_ptr + cid, mask = mask, other = 0)
+    local_id = tl.load(cid2local_id_ptr + cid, mask = mask, other = 0)
+
+    # Get the corresponding start id in the target tensors
+    u_cids_start = tl.load(u_cids_group_start_ptr + group_id, mask = mask, other = 0)
+    parids_start = tl.load(parids_group_start_ptr + group_id, mask = mask, other = 0)
+
+    # Get `par_offset` of the edges
+    par_offset = tl.load(flat_par_offsets_ptr + offsets, mask = mask, other = 0)
+
+    # Assign to `target_u_cids`
+    tl.store(target_u_cids_ptr + u_cids_start + local_id, cid, mask = mask)
+
+    # Assign to `target_parids`
+    group_max_n_pars = tl.load(bk_group_max_pars_ptr + group_id, mask = mask, other = 0)
+    parid_offsets = parids_start + local_id * group_max_n_pars + par_offset
+    tl.store(target_parids_ptr + parid_offsets, nid, mask = mask)
+
+
 @torch.no_grad()
 def prod_layer_backward_compilation(flat_u_cids, flat_cids, flat_cid2nid, 
                                     bk_group_max_pars, n_group_ids, n_id_in_group, num_ns_in_group, 
@@ -539,21 +597,85 @@ def prod_layer_backward_compilation(flat_u_cids, flat_cids, flat_cid2nid,
     if use_cuda and not torch.cuda.is_available():
         use_cuda = False
 
-    u_cids = [torch.zeros([group_size], dtype = torch.long) for group_size in num_ns_in_group] # Node id
-    parids = [torch.zeros([group_size, max_n_pars], dtype = torch.long) for group_size, max_n_pars in zip(num_ns_in_group, bk_group_max_pars)] # Parent id
+    if use_cuda:
 
-    for idx in range(flat_u_cids.size(0)):
-        cid = flat_u_cids[idx]
+        # We construct a flattened version of `u_cids` where the vectors of every group is concatenated
+        # into a single vector. `u_cids_group_start` is used to indicate the start index of every group's
+        # `u_cids`. That is, `target_u_cids[u_cids_group_start[gid]:u_cids_group_start[gid+1]] == u_cids[gid]`
+        u_cids_group_start = torch.zeros_like(num_ns_in_group)
+        u_cids_group_start[1:] = torch.cumsum(num_ns_in_group[:-1], dim = 0)
+        target_u_cids = torch.zeros([num_ns_in_group.sum()], dtype = torch.long)
 
-        # `group_id`:   which group the current node belongs to
-        # `local_id`:   the index of the node within the current group
-        group_id = n_group_ids[idx]
-        local_id = n_id_in_group[idx]
+        # Similar to `target_u_cids`, we construct a flattened version of `parids` and use `parids_group_start`
+        # for indexing
+        parids_group_start = torch.zeros_like(num_ns_in_group)
+        parids_group_start[1:] = torch.cumsum((num_ns_in_group * bk_group_max_pars)[:-1], dim = 0)
+        target_parids = torch.zeros([(num_ns_in_group * bk_group_max_pars).sum()], dtype = torch.long)
 
-        criterion = (flat_cids == cid)
-        npar = criterion.sum()
+        # Precompute the parent offset ids for every edge. That is, the `?` mark in `parids[group_id][local_id,?]`
+        flat_par_offsets = np.zeros([flat_cids.size(0)], dtype = np.int64)
+        num_c_nodes = flat_u_cids.max().item() + 1
+        cum_c_nodes = np.zeros([num_c_nodes], dtype = np.int64)
 
-        u_cids[group_id][local_id] = cid
-        parids[group_id][local_id,:npar] = flat_cid2nid[criterion]
+        _assign_c_idx_kernel(flat_cids.numpy(), flat_par_offsets, cum_c_nodes)
+        flat_par_offsets = torch.from_numpy(flat_par_offsets).cuda()
+
+        # Direct mapping from `cid` to `group_id` and `local_id`
+        cid2group_id = np.zeros([num_c_nodes], dtype = np.int64)
+        cid2local_id = np.zeros([num_c_nodes], dtype = np.int64)
+
+        _assign_cid2_group_local_id(flat_u_cids.numpy(), n_group_ids.numpy(), n_id_in_group.numpy(), cid2group_id, cid2local_id)
+        cid2group_id = torch.from_numpy(cid2group_id).cuda()
+        cid2local_id = torch.from_numpy(cid2local_id).cuda()
+
+        # The following kernel assigns the indices to `target_u_cids` and `target_parids`. This is equivalent
+        # to the easier-to-read CPU version enabled by setting `use_cuda = False`
+        num_edges = flat_cids.size(0)
+        target_u_cids = target_u_cids.cuda()
+        target_parids = target_parids.cuda()
+
+        grid = lambda meta: (triton.cdiv(num_edges, meta["BLOCK_SIZE"]),)
+
+        _assign_target_ucids_parids_kernel[grid](
+            target_u_cids, target_parids, flat_cid2nid.cuda(), flat_cids.cuda(), 
+            cid2group_id, cid2local_id, u_cids_group_start.cuda(), parids_group_start.cuda(),
+            flat_par_offsets, bk_group_max_pars.cuda(), 
+            num_edges = num_edges, BLOCK_SIZE = 2048
+        )
+
+        target_u_cids = target_u_cids.cpu()
+        u_cids = []
+        for group_id in range(num_ns_in_group.size(0)):
+            sid = u_cids_group_start[group_id]
+            eid = sid + num_ns_in_group[group_id]
+            u_cids.append(target_u_cids[sid:eid].contiguous())
+
+        target_parids = target_parids.cpu()
+        parids = []
+        for group_id in range(num_ns_in_group.size(0)):
+            sid = parids_group_start[group_id]
+            gsize = num_ns_in_group[group_id]
+            gnpar = bk_group_max_pars[group_id]
+            eid = sid + gsize * gnpar
+            parids.append(target_parids[sid:eid].reshape(gsize, gnpar).contiguous())
+
+    else:
+
+        u_cids = [torch.zeros([group_size], dtype = torch.long) for group_size in num_ns_in_group] # Node id
+        parids = [torch.zeros([group_size, max_n_pars], dtype = torch.long) for group_size, max_n_pars in zip(num_ns_in_group, bk_group_max_pars)] # Parent id
+
+        for idx in range(flat_u_cids.size(0)):
+            cid = flat_u_cids[idx]
+
+            # `group_id`:   which group the current node belongs to
+            # `local_id`:   the index of the node within the current group
+            group_id = n_group_ids[idx]
+            local_id = n_id_in_group[idx]
+
+            criterion = (flat_cids == cid)
+            npar = criterion.sum()
+
+            u_cids[group_id][local_id] = cid
+            parids[group_id][local_id,:npar] = flat_cid2nid[criterion]
 
     return u_cids, parids
