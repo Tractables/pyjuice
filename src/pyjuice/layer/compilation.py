@@ -90,6 +90,11 @@ def sum_layer_forward_compilation_job(flat_nodes, nids, cids, pids, fw_group_max
     """
     all_ns_param_ids = dict()
 
+    # Only allocate once for future reuse
+    range_vec = torch.arange(fw_group_max_chs.max().item())
+    if use_cuda:
+        range_vec = range_vec.cuda()
+
     node_start = 0
     for ns_idx, flat_ns in enumerate(flat_nodes):
         # Outer iteration over `ns` in this layer
@@ -172,8 +177,8 @@ def sum_layer_forward_compilation_job(flat_nodes, nids, cids, pids, fw_group_max
                 cid_start = cid_end
 
             # assign parameter ids
-            parids = torch.arange(ch_start, device = edge_ids.device) + (ns_pid_start + ns_local_pid)
-            pids[group_id][local_id,:ch_start] = parids
+            pids[group_id][local_id,:ch_start] = range_vec[:ch_start]
+            pids[group_id][local_id,:ch_start] += ns_pid_start + ns_local_pid
 
             ns_local_pid += ch_start
 
