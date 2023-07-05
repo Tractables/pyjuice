@@ -12,9 +12,9 @@ import pytest
 
 
 def compile_dense_pc_test():
-    num_latents = 1024
+    num_latents = 2048
     num_cats = 512
-    num_vars = 32
+    num_vars = 64
 
     curr_zs = juice.inputs(0, num_latents, dists.Categorical(num_cats = num_cats))
 
@@ -29,14 +29,14 @@ def compile_dense_pc_test():
     pc = juice.TensorCircuit(ns)
     t1 = time.time()
 
-    # This takes ~22s on a RTX 4090 GPU
-    assert t1 - t0 < 40
+    # This takes ~36s on a RTX 4090 GPU
+    assert t1 - t0 < 60
 
 
 def compile_sparse_pc_test():
     num_latents = 4096
     num_cats = 200
-    num_vars = 8
+    num_vars = 16
 
     sparsity = 0.05
 
@@ -66,8 +66,8 @@ def compile_sparse_pc_test():
     pc = juice.TensorCircuit(ns, layer_sparsity_tol = 0.8)
     t1 = time.time()
     
-    # This takes ~17s on a RTX 4090 GPU
-    assert t1 - t0 < 40
+    # This takes ~6s on a RTX 4090 GPU
+    assert t1 - t0 < 20
 
 
 if __name__ == "__main__":
