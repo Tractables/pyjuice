@@ -81,7 +81,8 @@ class SumLayer(Layer, nn.Module):
         nids, cids, pids, ch_n_pars, param_ends = sum_layer_forward_compilation(
             self.nodes, fw_group_max_chs, fw_n_group_ids, fw_n_id_in_group, fw_num_ns_in_group, 
             n_chs, global_nid_start, ch_prod_layer_size, param_ends = param_ends,
-            use_cuda = not disable_gpu_compilation and (self.num_edges > 1000) # Consider tuning this
+            # GPU compilation is slightly slower for small layer due to the kernel jit compilation time
+            use_cuda = not disable_gpu_compilation and (self.num_edges > 10000)
         )
 
         # Store buffers for the forward pass
@@ -130,9 +131,9 @@ class SumLayer(Layer, nn.Module):
         # parpids:    List[[group_size, max_n_pars]]        param id for the edges to parent (correspond to `parids`)
         parids, parpids = sum_layer_backward_compilation(
             self.nodes, pids, fw_n_group_ids, fw_n_id_in_group, self.num_bk_groups, bk_n_group_ids, bk_n_id_in_group,
-            bk_group_max_pars, bk_num_ns_in_group, ch_prod_layer_size, global_nid_start,
-            use_cuda = not disable_gpu_compilation and (self.num_edges > 250000), # Consider tuning this
-            debug = (bk_group_max_pars[0] == 1).item()
+            fw_group_max_chs, bk_group_max_pars, fw_num_ns_in_group, bk_num_ns_in_group, ch_prod_layer_size, global_nid_start,
+            # GPU compilation is slightly slower for small layer due to the kernel jit compilation time
+            use_cuda = not disable_gpu_compilation and (self.num_edges > 10000)
         )
 
         # Store buffers for the backward pass

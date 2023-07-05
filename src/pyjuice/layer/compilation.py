@@ -400,6 +400,9 @@ def sum_layer_forward_compilation(nodes, fw_group_max_chs, n_group_ids, n_id_in_
                                   global_nid_start, ch_prod_layer_size, param_ends,
                                   num_threads: int = 1, use_cuda: bool = True, legacy: bool = False):
 
+    if use_cuda and not torch.cuda.is_available():
+        use_cuda = False
+
     # Also use the legacy code if we compile with CPU
     if not use_cuda or legacy:
         return sum_layer_forward_compilation_legacy(
@@ -514,7 +517,8 @@ def sum_layer_forward_compilation(nodes, fw_group_max_chs, n_group_ids, n_id_in_
             target_nids, nids_group_start, target_cids, pcids_group_start,
             target_pids, edge_ids, chs_offsets, n_group_ids, n_id_in_group, 
             cs_ele_id_start, cs_node_cum_ids, fw_group_max_chs, cum_n_chs, 
-            ns_param_ids, ch_n_pars, constexprs, ns.num_chs, add_params_flag, BLOCK_SIZE = 2048
+            ns_param_ids, ch_n_pars, constexprs, ns.num_chs, add_params_flag, 
+            BLOCK_SIZE = 2048
         )
 
         node_start += ns_num_nodes
@@ -572,11 +576,10 @@ def sum_layer_forward_compilation(nodes, fw_group_max_chs, n_group_ids, n_id_in_
 
 
 @torch.no_grad()
-def sum_layer_backward_compilation(nodes, pids, fw_n_group_ids, fw_n_id_in_group, 
-                                   num_bk_groups, bk_n_group_ids, bk_n_id_in_group, 
-                                   bk_group_max_pars, bk_num_ns_in_group,
-                                   ch_prod_layer_size, global_nid_start, use_cuda: bool = False,
-                                   debug = False):
+def sum_layer_backward_compilation_legacy(nodes, pids, fw_n_group_ids, fw_n_id_in_group, 
+                                          num_bk_groups, bk_n_group_ids, bk_n_id_in_group, 
+                                          bk_group_max_pars, bk_num_ns_in_group,
+                                          ch_prod_layer_size, global_nid_start, use_cuda: bool = False):
 
     if use_cuda and not torch.cuda.is_available():
         use_cuda = False
@@ -685,10 +688,252 @@ def sum_layer_backward_compilation(nodes, pids, fw_n_group_ids, fw_n_id_in_group
         max_n_par = bk_group_max_pars[group_id]
         flatid_end = flatid_start + group_size * max_n_par
 
-        parids.append(flat_parids[flatid_start:flatid_end].reshape(group_size, max_n_par))
-        parpids.append(flat_parpids[flatid_start:flatid_end].reshape(group_size, max_n_par))
+        parids.append(flat_parids[flatid_start:flatid_end].reshape(group_size, max_n_par).contiguous())
+        parpids.append(flat_parpids[flatid_start:flatid_end].reshape(group_size, max_n_par).contiguous())
 
         flatid_start = flatid_end
+
+    return parids, parpids
+
+
+@triton.jit
+def _assign_global_eleids_kernel(global_ele_ids_ptr, cs_ele_id_start_ptr, cs_node_cum_ids_ptr, edge_ids_ptr, 
+                                 constexprs_ptr, num_chs: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+
+    pid = tl.program_id(axis = 0)
+    block_start = pid * BLOCK_SIZE
+
+    # Retrieve all constexprs
+    num_edges = tl.load(constexprs_ptr)
+
+    # Get edge indices to be processed by the current block
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < num_edges
+
+    # Get `cid`
+    cid = tl.load(edge_ids_ptr + offsets + num_edges, mask = mask, other = 0)
+
+    # Get the child ns index every `cid` belongs to and the cum nodes & global sid
+    cs_offsets = tl.arange(0, num_chs)
+    cs_node_cum_ids = tl.load(cs_node_cum_ids_ptr + cs_offsets)
+    
+    cid_node_id = tl.sum(tl.broadcast_to(cid[:,None], (BLOCK_SIZE, num_chs)) >= \
+        tl.broadcast_to(cs_node_cum_ids[None,:], (BLOCK_SIZE, num_chs)), axis = 1) - 1
+
+    cs_cum_num = tl.load(cs_node_cum_ids_ptr + cid_node_id, mask = mask, other = 0)
+    cs_ele_ind = tl.load(cs_ele_id_start_ptr + cid_node_id, mask = mask, other = 0)
+
+    # Compute global cids and store them
+    global_cid = cid + cs_ele_ind - cs_cum_num
+    tl.store(global_ele_ids_ptr + offsets, global_cid, mask = mask)
+
+
+@njit
+def _assign_parid_kernel(par_offsets, par_counts, global_ele_ids):
+    for i in range(par_offsets.shape[0]):
+        global_cid = global_ele_ids[i]
+        idx = par_counts[global_cid]
+        par_offsets[i] = idx
+        par_counts[global_cid] = idx + 1
+
+
+@triton.jit
+def _assign_target_parids_kernel(target_parids_ptr, target_parpids_ptr, parids_group_start_ptr, flat_pids_ptr, pids_group_start_ptr,
+                                 edge_ids_ptr, global_ele_ids_ptr, chs_offsets_ptr, par_offsets_ptr,
+                                 fw_n_group_ids_ptr, fw_n_id_in_group_ptr, bk_n_group_ids_ptr, bk_n_id_in_group_ptr,
+                                 fw_group_max_chs_ptr, bk_group_max_pars_ptr, constexprs_ptr, BLOCK_SIZE: tl.constexpr):
+
+    pid = tl.program_id(axis = 0)
+    block_start = pid * BLOCK_SIZE
+
+    # Retrieve all constexprs
+    global_nid_start = tl.load(constexprs_ptr)
+    node_start = tl.load(constexprs_ptr + 1)
+    num_edges = tl.load(constexprs_ptr + 2)
+
+    # Get edge indices to be processed by the current block
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < num_edges
+
+    # Get `nid` and `global_cid`
+    nid = tl.load(edge_ids_ptr + offsets, mask = mask, other = 0)
+    global_cid = tl.load(global_ele_ids_ptr + offsets, mask = mask, other = 0)
+
+    # Get `fw_group_id` and `fw_local_id` (for indexing `pids`)
+    fw_group_id = tl.load(fw_n_group_ids_ptr + nid + node_start, mask = mask, other = 0)
+    fw_local_id = tl.load(fw_n_id_in_group_ptr + nid + node_start, mask = mask, other = 0)
+
+    # Get `bk_group_id` and `bk_local_id` (for indexing `parids` and `parpids`)
+    bk_group_id = tl.load(bk_n_group_ids_ptr + global_cid, mask = mask, other = 0)
+    bk_local_id = tl.load(bk_n_id_in_group_ptr + global_cid, mask = mask, other = 0)
+
+    # Get child offsets (for indexing `pids`) and parent offsets (for indexing `parids` and `parpids`)
+    chs_offset = tl.load(chs_offsets_ptr + offsets, mask = mask, other = 0)
+    par_offset = tl.load(par_offsets_ptr + offsets, mask = mask, other = 0)
+    
+    # Store to `target_parids`
+    group_max_n_pars = tl.load(bk_group_max_pars_ptr + bk_group_id, mask = mask, other = 0)
+    parids_start = tl.load(parids_group_start_ptr + bk_group_id, mask = mask, other = 0)
+    parids_offsets = parids_start + bk_local_id * group_max_n_pars + par_offset
+    global_nid = global_nid_start + node_start + nid
+    tl.store(target_parids_ptr + parids_offsets, global_nid, mask = mask)
+
+    # Get the parameter ids of the edges...
+    group_max_n_chs = tl.load(fw_group_max_chs_ptr + fw_group_id, mask = mask, other = 0)
+    pids_start = tl.load(pids_group_start_ptr + fw_group_id, mask = mask, other = 0)
+    pids_offsets = pids_start + fw_local_id * group_max_n_chs + chs_offset
+    pid = tl.load(flat_pids_ptr + pids_offsets, mask = mask, other = 0)
+
+    # ...and store them to `target_parpids`
+    tl.store(target_parpids_ptr + parids_offsets, pid, mask = mask)
+
+
+@torch.no_grad()
+def sum_layer_backward_compilation(nodes, pids, fw_n_group_ids, fw_n_id_in_group, 
+                                   num_bk_groups, bk_n_group_ids, bk_n_id_in_group, 
+                                   fw_group_max_chs, bk_group_max_pars, 
+                                   fw_num_ns_in_group, bk_num_ns_in_group,
+                                   ch_prod_layer_size, global_nid_start, use_cuda: bool = False,
+                                   legacy: bool = False):
+
+    if use_cuda and not torch.cuda.is_available():
+        use_cuda = False
+
+    # Also use the legacy code if we compile with CPU
+    if not use_cuda or legacy:
+        return sum_layer_backward_compilation_legacy(
+            nodes, pids, fw_n_group_ids, fw_n_id_in_group, 
+            num_bk_groups, bk_n_group_ids, bk_n_id_in_group, 
+            bk_group_max_pars, bk_num_ns_in_group,
+            ch_prod_layer_size, global_nid_start, use_cuda = use_cuda
+        )
+
+    # We construct a flattened version of `parids` where the vectors of every group is concatenated
+    # into a single vector. `parids_group_start` is used to indicate the start index of every group's
+    # `parids`. That is, `target_parids[parids_group_start[gid]:parids_group_start[gid+1]] == parids[gid]`
+    parids_group_start = torch.zeros_like(bk_num_ns_in_group)
+    parids_group_start[1:] = torch.cumsum((bk_num_ns_in_group * bk_group_max_pars)[:-1], dim = 0)
+    target_parids = torch.zeros([(bk_num_ns_in_group * bk_group_max_pars).sum()], dtype = torch.long).cuda()
+
+    # Do the same to `parpids`
+    target_parpids = torch.zeros([(bk_num_ns_in_group * bk_group_max_pars).sum()], dtype = torch.long).cuda()
+
+    parids_group_start = parids_group_start.cuda()
+
+    # We also re-create `flat_pids` to be used to fill `parpids`
+    pids_group_start = torch.zeros_like(fw_num_ns_in_group)
+    pids_group_start[1:] = torch.cumsum((fw_num_ns_in_group * fw_group_max_chs)[:-1], dim = 0)
+    flat_pids = torch.zeros([(fw_num_ns_in_group * fw_group_max_chs).sum()], dtype = torch.long)
+    sid = 0
+    for group_id, (gsize, gnchs) in enumerate(zip(fw_num_ns_in_group, fw_group_max_chs)):
+        eid = sid + (gsize * gnchs)
+        flat_pids[sid:eid] = pids[group_id].reshape(gsize * gnchs)
+        sid = eid
+
+    flat_pids = flat_pids.cuda()
+    pids_group_start = pids_group_start.cuda()
+
+    # This vector maintains the "current" count of parents that have been processed for every child node
+    par_counts = torch.zeros([ch_prod_layer_size], dtype = torch.long)
+
+    # Move tensors to GPU
+    fw_n_group_ids = fw_n_group_ids.cuda()
+    fw_n_id_in_group = fw_n_id_in_group.cuda()
+    bk_n_group_ids = bk_n_group_ids.cuda()
+    bk_n_id_in_group = bk_n_id_in_group.cuda()
+    fw_group_max_chs = fw_group_max_chs.cuda()
+    bk_group_max_pars = bk_group_max_pars.cuda()
+
+    # This is the main loop: iterate over `ns` in the layer
+    node_start = 0 # The start index of nodes in the current `ns`
+    for ns in nodes:
+        node_end = node_start + ns.num_nodes
+
+        # number of nodes
+        ns_num_nodes = ns.num_nodes
+
+        # Edge indices of size [2, ns_num_edges]
+        edge_ids = ns.edge_ids.cuda()
+        ns_num_edges = edge_ids.size(1)
+
+        # Construct helper indices for child nodes
+        # `cs_ele_id_start` contains the global start indices of the child nodes
+        # `cs_node_cum_ids` contains the local cumulative number of child nodes
+        cs_ele_id_start = torch.zeros([ns.num_chs], dtype = torch.long)
+        cs_node_cum_ids = torch.zeros([ns.num_chs], dtype = torch.long)
+        for i, cs in enumerate(ns.chs):
+            cs_ele_id_start[i] = cs._output_ind_range[0]
+            if i < ns.num_chs - 1:
+                cs_node_cum_ids[i+1] = cs_node_cum_ids[i] + cs.num_nodes
+
+        cs_ele_id_start = cs_ele_id_start.cuda()
+        cs_node_cum_ids = cs_node_cum_ids.cuda()
+
+        # Get the global element ids for the child node of all edges
+        global_ele_ids = torch.zeros([ns_num_edges], dtype = torch.long).cuda()
+
+        # We store these constants in a tensor and retrieve them in the kernel
+        constexprs = torch.tensor([ns_num_edges]).long().cuda()
+
+        # Make the grid and launch kernel
+        grid = lambda meta: (triton.cdiv(ns_num_edges, meta["BLOCK_SIZE"]),)
+
+        _assign_global_eleids_kernel[grid](
+            global_ele_ids, cs_ele_id_start, cs_node_cum_ids, edge_ids, 
+            constexprs, ns.num_chs, BLOCK_SIZE = 2048
+        )
+
+        # [Recomputed] the child offset ids for every edge. That is, the `?` 
+        # mark in `pids[fw_group_id][fw_local_id,?]`
+        chs_offsets = np.zeros([ns_num_edges], dtype = np.int64)
+        ns_nchs = np.zeros([ns_num_nodes], dtype = np.int64)
+        edge_ids_np = ns.edge_ids.numpy()
+
+        _assign_chid_kernel(chs_offsets, ns_nchs, edge_ids_np)
+        chs_offsets = torch.from_numpy(chs_offsets).cuda()
+
+        # Compute the parent offset ids for every edge. That is, the `?`
+        # mark in `parids[bk_group_id][bk_local_id,?]`
+        par_offsets = np.zeros([ns_num_edges], dtype = np.int64)
+        par_counts_np = par_counts.numpy()
+        global_ele_ids_np = global_ele_ids.cpu().numpy()
+
+        _assign_parid_kernel(par_offsets, par_counts_np, global_ele_ids_np)
+
+        par_counts = torch.from_numpy(par_counts_np)
+        par_offsets = torch.from_numpy(par_offsets).cuda()
+
+        # The following kernel assigns the corresponding indices to `pids` and `psids`
+
+        # We store these constants in a tensor and retrieve them in the kernel
+        # This is to avoid `triton` from compiling separate kernels for every layer configuration
+        # Saves 99.9% compilation time :)
+        constexprs = torch.tensor([global_nid_start, node_start, ns_num_edges]).long().cuda()
+
+        # Make the grid and launch kernel
+        grid = lambda meta: (triton.cdiv(ns_num_edges, meta["BLOCK_SIZE"]),)
+
+        _assign_target_parids_kernel[grid](
+            target_parids, target_parpids, parids_group_start, flat_pids, pids_group_start,
+            edge_ids, global_ele_ids, chs_offsets, par_offsets,
+            fw_n_group_ids, fw_n_id_in_group, bk_n_group_ids, bk_n_id_in_group,
+            fw_group_max_chs, bk_group_max_pars, constexprs, BLOCK_SIZE = 2048
+        )
+
+        node_start = node_end
+
+    # Restore `parids` and `parpids`
+    target_parids = target_parids.cpu()
+    target_parpids = target_parpids.cpu()
+    parids = []
+    parpids = []
+    for group_id in range(bk_num_ns_in_group.size(0)): ###### TODO
+        sid = parids_group_start[group_id]
+        gsize = bk_num_ns_in_group[group_id]
+        gnchs = bk_group_max_pars[group_id]
+        eid = sid + gsize * gnchs
+        parids.append(target_parids[sid:eid].reshape(gsize, gnchs).contiguous())
+        parpids.append(target_parpids[sid:eid].reshape(gsize, gnchs).contiguous())
 
     return parids, parpids
 
