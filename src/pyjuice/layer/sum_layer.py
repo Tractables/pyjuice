@@ -81,7 +81,7 @@ class SumLayer(Layer, nn.Module):
         nids, cids, pids, ch_n_pars, param_ends = sum_layer_forward_compilation(
             self.nodes, fw_group_max_chs, fw_n_group_ids, fw_n_id_in_group, fw_num_ns_in_group, 
             n_chs, global_nid_start, ch_prod_layer_size, param_ends = param_ends,
-            use_cuda = not disable_gpu_compilation and (self.num_edges > 250000) # Consider tuning this
+            use_cuda = not disable_gpu_compilation and (self.num_edges > 1000) # Consider tuning this
         )
 
         # Store buffers for the forward pass
