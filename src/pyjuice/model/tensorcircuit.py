@@ -18,7 +18,7 @@ from pyjuice.utils.grad_fns import ReverseGrad, PseudoHookFunc
 def _pc_model_backward_hook(grad, pc, **kwargs):
     grad = grad.permute(1, 0)
     pc.backward(
-        ll_weights = grad / grad.sum() * grad.size(0),
+        ll_weights = grad / grad.sum() * grad.size(1),
         compute_param_flows = pc._optim_hyperparams["compute_param_flows"], 
         flows_memory = pc._optim_hyperparams["flows_memory"],
         **kwargs
