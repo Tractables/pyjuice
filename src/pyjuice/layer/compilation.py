@@ -927,7 +927,7 @@ def sum_layer_backward_compilation(nodes, pids, fw_n_group_ids, fw_n_id_in_group
     target_parpids = target_parpids.cpu()
     parids = []
     parpids = []
-    for group_id in range(bk_num_ns_in_group.size(0)): ###### TODO
+    for group_id in range(bk_num_ns_in_group.size(0)):
         sid = parids_group_start[group_id]
         gsize = bk_num_ns_in_group[group_id]
         gnchs = bk_group_max_pars[group_id]
@@ -1047,9 +1047,37 @@ def _assign_cid2_group_local_id(flat_u_cids, n_group_ids, n_id_in_group, cid2gro
 
 
 @triton.jit
-def _assign_target_ucids_parids_kernel(target_u_cids_ptr, target_parids_ptr, flat_cid2nid_ptr, flat_cids_ptr, 
-                                       cid2group_id_ptr, cid2local_id_ptr, u_cids_group_start_ptr, parids_group_start_ptr,
-                                       flat_par_offsets_ptr, bk_group_max_pars_ptr, constexprs_ptr, BLOCK_SIZE: tl.constexpr):
+def _assign_target_ucids_kernel(target_u_cids_ptr, flat_u_cids_ptr, n_group_ids_ptr, n_id_in_group_ptr, 
+                                u_cids_group_start_ptr, constexprs_ptr, BLOCK_SIZE: tl.constexpr):
+
+    pid = tl.program_id(axis = 0)
+    block_start = pid * BLOCK_SIZE
+
+    # Retrieve all constexprs
+    num_nodes = tl.load(constexprs_ptr)
+
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < num_nodes
+
+    # Get `cid`
+    cid = tl.load(flat_u_cids_ptr + offsets, mask = mask, other = 0)
+
+    # Get `group_id` and `local_id`
+    group_id = tl.load(n_group_ids_ptr + offsets, mask = mask, other = 0)
+    local_id = tl.load(n_id_in_group_ptr + offsets, mask = mask, other = 0)
+
+    # Get the corresponding start id in the target tensors
+    u_cids_start = tl.load(u_cids_group_start_ptr + group_id, mask = mask, other = 0)
+
+    # Assign to `target_u_cids`
+    tl.store(target_u_cids_ptr + u_cids_start + local_id, cid, mask = mask)
+
+
+@triton.jit
+def _assign_prod_target_parids_kernel(target_parids_ptr, flat_cid2nid_ptr, flat_cids_ptr, 
+                                      cid2group_id_ptr, cid2local_id_ptr, parids_group_start_ptr,
+                                      flat_par_offsets_ptr, bk_group_max_pars_ptr, constexprs_ptr, 
+                                      BLOCK_SIZE: tl.constexpr):
 
     pid = tl.program_id(axis = 0)
     block_start = pid * BLOCK_SIZE
@@ -1064,19 +1092,18 @@ def _assign_target_ucids_parids_kernel(target_u_cids_ptr, target_parids_ptr, fla
     nid = tl.load(flat_cid2nid_ptr + offsets, mask = mask, other = 0)
     cid = tl.load(flat_cids_ptr + offsets, mask = mask, other = 0)
 
+    # Mask out edges that point to the dummy node
+    mask = mask & (cid != 0)
+
     # Get `group_id` and `local_id` using `cid`
     group_id = tl.load(cid2group_id_ptr + cid, mask = mask, other = 0)
     local_id = tl.load(cid2local_id_ptr + cid, mask = mask, other = 0)
 
     # Get the corresponding start id in the target tensors
-    u_cids_start = tl.load(u_cids_group_start_ptr + group_id, mask = mask, other = 0)
     parids_start = tl.load(parids_group_start_ptr + group_id, mask = mask, other = 0)
 
     # Get `par_offset` of the edges
     par_offset = tl.load(flat_par_offsets_ptr + offsets, mask = mask, other = 0)
-
-    # Assign to `target_u_cids`
-    tl.store(target_u_cids_ptr + u_cids_start + local_id, cid, mask = mask)
 
     # Assign to `target_parids`
     group_max_n_pars = tl.load(bk_group_max_pars_ptr + group_id, mask = mask, other = 0)
@@ -1125,7 +1152,11 @@ def prod_layer_backward_compilation(flat_u_cids, flat_cids, flat_cid2nid,
 
         # The following kernel assigns the indices to `target_u_cids` and `target_parids`. This is equivalent
         # to the easier-to-read CPU version enabled by setting `use_cuda = False`
+        num_nodes = flat_u_cids.size(0)
         num_edges = flat_cids.size(0)
+        flat_u_cids = flat_u_cids.cuda()
+        n_group_ids = n_group_ids.cuda()
+        n_id_in_group = n_id_in_group.cuda()
         target_u_cids = target_u_cids.cuda()
         target_parids = target_parids.cuda()
         flat_cid2nid = flat_cid2nid.cuda()
@@ -1135,14 +1166,22 @@ def prod_layer_backward_compilation(flat_u_cids, flat_cids, flat_cid2nid,
         bk_group_max_pars = bk_group_max_pars.cuda()
 
         # We store these constants in a tensor and retrieve them in the kernel
-        constexprs = torch.tensor([num_edges]).long().cuda()
+        constexprs1 = torch.tensor([num_nodes]).long().cuda()
+        constexprs2 = torch.tensor([num_edges]).long().cuda()
 
-        grid = lambda meta: (triton.cdiv(num_edges, meta["BLOCK_SIZE"]),)
+        grid1 = lambda meta: (triton.cdiv(num_nodes, meta["BLOCK_SIZE"]),)
 
-        _assign_target_ucids_parids_kernel[grid](
-            target_u_cids, target_parids, flat_cid2nid, flat_cids, 
-            cid2group_id, cid2local_id, u_cids_group_start, parids_group_start,
-            flat_par_offsets, bk_group_max_pars, constexprs, BLOCK_SIZE = 2048
+        _assign_target_ucids_kernel[grid1](
+            target_u_cids, flat_u_cids, n_group_ids, n_id_in_group, 
+            u_cids_group_start, constexprs1, BLOCK_SIZE = 2048
+        )
+
+        grid2 = lambda meta: (triton.cdiv(num_edges, meta["BLOCK_SIZE"]),)
+
+        _assign_prod_target_parids_kernel[grid2](
+            target_parids, flat_cid2nid, flat_cids, 
+            cid2group_id, cid2local_id, parids_group_start,
+            flat_par_offsets, bk_group_max_pars, constexprs2, BLOCK_SIZE = 2048
         )
 
         target_u_cids = target_u_cids.cpu()
