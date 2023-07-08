@@ -31,14 +31,14 @@ def _sample_mask_generation(layer: SumLayer, node_mars: torch.Tensor, element_ma
     return None
 
 
-@torch.compile()
+@torch.compile(mode = "reduce-overhead", fullgraph = False)
 def _sample_backward_pass(layer: SumLayer, node_flows: torch.Tensor, element_flows: torch.Tensor, node_mars: torch.Tensor, 
                           element_mars: torch.Tensor, params: torch.Tensor, node_mask: torch.Tensor):
     for group_id in range(layer.num_bk_groups):
         chids = layer.grouped_chids[group_id]
         parids = layer.grouped_parids[group_id]
 
-        element_flows[chids] = (node_flows[parids] * (node_mask[parids] == chids[:,None,None])).any(dim = 1)
+        element_flows[chids] = (node_flows[parids] * (node_mask[parids] == chids[:,None,None])).sum(dim = 1)
 
     return None
 
