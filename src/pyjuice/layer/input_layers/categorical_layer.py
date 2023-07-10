@@ -187,14 +187,14 @@ class CategoricalLayer(InputLayer, nn.Module):
         probs = probs.reshape(num_vars, num_cats, batch_size)
 
         if missing_mask is None:
-            dist = torch.distributions.Categorical(probs = probs.permute(0, 2, 1))
+            dist = torch.distributions.Categorical(probs = probs.permute(0, 2, 1).clip(min = 1e-6))
             samples[all_vars,:] = dist.sample()[all_vars,:]
 
         elif missing_mask.dim() == 1:
             mask = torch.zeros([missing_mask.size(0)], dtype = torch.bool, device = missing_mask.device)
             mask[all_vars] = True
             missing_mask = missing_mask & mask
-            dist = torch.distributions.Categorical(probs = probs[missing_mask,:,:].permute(0, 2, 1))
+            dist = torch.distributions.Categorical(probs = probs[missing_mask,:,:].permute(0, 2, 1).clip(min = 1e-6))
             samples[missing_mask,:] = dist.sample()
 
         else:
@@ -204,7 +204,7 @@ class CategoricalLayer(InputLayer, nn.Module):
             mask[all_vars,:] = True
             missing_mask = missing_mask & mask
 
-            dist = torch.distributions.Categorical(probs = probs.permute(0, 2, 1))
+            dist = torch.distributions.Categorical(probs = probs.permute(0, 2, 1).clip(min = 1e-6))
             samples = samples.view(-1)
             missing_mask = missing_mask.view(-1)
             samples[missing_mask] = dist.sample()[missing_mask]
