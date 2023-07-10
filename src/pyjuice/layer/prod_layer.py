@@ -121,7 +121,7 @@ class ProdLayer(Layer, nn.Module):
         u_cids, parids = prod_layer_backward_compilation(
             flat_u_cids, flat_cids, flat_cid2nid, 
             bk_group_max_pars, bk_n_group_ids, bk_n_id_in_group, bk_num_ns_in_group,
-            use_cuda = (flat_cids.size(0) > 50000)
+            use_cuda = not disable_gpu_compilation and (flat_cids.size(0) > 50000)
         )
 
         # Store buffers for the backward pass
