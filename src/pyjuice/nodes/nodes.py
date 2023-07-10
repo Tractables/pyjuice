@@ -112,6 +112,13 @@ class CircuitNodes():
     def get_source_ns(self):
         return self._source_node
 
+    def set_source_ns(self, source_ns: CircuitNodes):
+        assert type(source_ns) == type(self), f"Node type of the source ns ({type(source_ns)}) does not match that of self ({type(self)})."
+        assert len(source_ns.chs) == len(self.chs), "Number of children does not match."
+        assert not hasattr(self, "_params") or self._params is None, "The current node should not have parameters to avoid confusion."
+
+        self._source_node = source_ns
+
     def has_params(self):
         if not self.is_tied():
             return hasattr(self, "_params") and self._params is not None
