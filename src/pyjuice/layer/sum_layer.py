@@ -127,8 +127,8 @@ class SumLayer(Layer, nn.Module):
 
             min_n_pars = max_n_pars + 1
 
-        # parids:     List[[group_size, group_max_n_pars]]  stores parameter ids for each child node
-        # parpids:    List[[group_size, max_n_pars]]        param id for the edges to parent (correspond to `parids`)
+        # parids:     List[[group_ch_size, group_max_n_pars]]  stores parameter ids for each child node
+        # parpids:    List[[group_ch_size, group_max_n_pars]]  param id for the edges to parent (correspond to `parids`)
         parids, parpids = sum_layer_backward_compilation(
             self.nodes, pids, fw_n_group_ids, fw_n_id_in_group, self.num_bk_groups, bk_n_group_ids, bk_n_id_in_group,
             fw_group_max_chs, bk_group_max_pars, fw_num_ns_in_group, bk_num_ns_in_group, ch_prod_layer_size, global_nid_start,
