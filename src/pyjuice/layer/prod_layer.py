@@ -116,8 +116,8 @@ class ProdLayer(Layer, nn.Module):
 
             min_n_pars = max_n_pars + 1
 
-        # u_cids:    List[[group_size]]                   stores child node ids
-        # parids:    List[[group_size, group_max_n_pars]] stores indices of parent nodes
+        # u_cids:    List[[group_ch_size]]                   stores child node ids
+        # parids:    List[[group_ch_size, group_max_n_pars]] stores indices of parent nodes
         u_cids, parids = prod_layer_backward_compilation(
             flat_u_cids, flat_cids, flat_cid2nid, 
             bk_group_max_pars, bk_n_group_ids, bk_n_id_in_group, bk_num_ns_in_group,
