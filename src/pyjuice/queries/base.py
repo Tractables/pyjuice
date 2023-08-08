@@ -14,10 +14,12 @@ def query(pc: TensorCircuit, inputs: torch.Tensor,
           fw_output_fn: Optional[Callable] = None, **kwargs):
 
     # Run forward pass
-    pc.forward(inputs, input_layer_fn = fw_input_fn, **kwargs)
+    lls = pc.forward(inputs, input_layer_fn = fw_input_fn, **kwargs)
 
     if fw_output_fn is not None:
         return fw_output_fn(pc)
+    elif not run_backward:
+        return lls
 
     # (Optionally) run backward pass
     assert bk_input_fn is not None
