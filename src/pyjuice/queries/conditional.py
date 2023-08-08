@@ -72,18 +72,23 @@ def _categorical_forward(layer, node_mars: torch.Tensor,
         data = data.permute(1, 0)
 
         param_idxs = data[layer.vids] + layer.psids.unsqueeze(1)
-        mask = missing_mask[layer.vids]
-        node_mars[sid:eid,:][~mask] = ((params[param_idxs][~mask]).clamp(min=1e-10)).log()
-        node_mars[sid:eid,:][mask] = 0.0
+
+        if missing_mask is not None:
+            mask = missing_mask[layer.vids]
+            node_mars[sid:eid,:][~mask] = ((params[param_idxs][~mask]).clamp(min=1e-10)).log()
+            node_mars[sid:eid,:][mask] = 0.0
 
     elif "soft_evidence" in kwargs:
 
         data = kwargs["soft_evidence"]
         assert data.dim() == 3 and data.dtype == torch.float32 and data.min() >= 0.0 and data.max() <= 1.0
-        origin_data = data
-        data = data.clone().flatten(0, 1)
-        data[missing_mask.permute(1, 0).flatten(),:] = 1.0
-        data = data.reshape(missing_mask.size(1), missing_mask.size(0), -1).permute(1, 2, 0)
+        
+        if missing_mask is not None:
+            data = data.flatten(0, 1)
+            data[missing_mask.permute(1, 0).flatten(),:] = 1.0
+            data = data.reshape(missing_mask.size(1), missing_mask.size(0), -1).permute(1, 2, 0)
+        else:
+            data = data.reshape(1, 2, 0)
         
         num_nodes = eid - sid
         num_cats = data.size(1)
@@ -96,7 +101,7 @@ def _categorical_forward(layer, node_mars: torch.Tensor,
             sid, num_nodes, num_cats, batch_size, BLOCK_SIZE = 512
         )
 
-        node_mars[sid:eid,:] = node_mars[sid:eid,:].clip(max = 1.0)
+        node_mars[sid:eid,:] = node_mars[sid:eid,:].clip(max = 0.0)
 
     else:
         raise NotImplementedError("Unknown method to compute the forward pass for `CategoricalLayer`.")
@@ -187,7 +192,6 @@ def _categorical_backward(layer, node_flows: torch.Tensor, node_mars: torch.Tens
 
 def _conditional_fw_input_fn(layer, inputs, node_mars, params, **kwargs):
     if isinstance(layer, CategoricalLayer):
-        assert "missing_mask" in kwargs
         _categorical_forward(layer, node_mars, params, **kwargs)
 
     else:
