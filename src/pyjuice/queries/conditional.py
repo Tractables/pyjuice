@@ -88,7 +88,7 @@ def _categorical_forward(layer, node_mars: torch.Tensor,
             data[missing_mask.permute(1, 0).flatten(),:] = 1.0
             data = data.reshape(missing_mask.size(1), missing_mask.size(0), -1).permute(1, 2, 0)
         else:
-            data = data.reshape(1, 2, 0)
+            data = data.permute(1, 2, 0)
         
         num_nodes = eid - sid
         num_cats = data.size(1)
