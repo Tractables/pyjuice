@@ -140,11 +140,22 @@ class ProdLayer(Layer, nn.Module):
         `element_mars`: [max_num_els, B]
         """
 
-        for group_id in range(self.num_fw_groups):
-            nids = self.grouped_nids[group_id]
-            cids = self.grouped_cids[group_id]
+        if not self.provided("fw_group_local_ids"):
+            # Evaluate the whole layer
+            for group_id in range(self.num_fw_groups):
+                nids = self.grouped_nids[group_id]
+                cids = self.grouped_cids[group_id]
 
-            self._forward_backward(element_mars, node_mars, nids, cids)
+                self._forward_backward(element_mars, node_mars, nids, cids)
+
+        else:
+            # Partial evaluation
+            for group_id in range(self.num_fw_groups):
+                nids = self.grouped_nids[group_id]
+                cids = self.grouped_cids[group_id]
+                local_ids = self.fw_group_local_ids[group_id]
+
+                self._forward_backward(element_mars, node_mars, nids, cids, local_ids = local_ids)
 
         return None
 
@@ -160,21 +171,30 @@ class ProdLayer(Layer, nn.Module):
         `element_flows`: [max_num_els, B]
         """
         
-        for group_id in range(self.num_bk_groups):
-            u_cids = self.grouped_u_cids[group_id]
-            parids = self.grouped_parids[group_id]
+        if not self.provided("bk_group_local_ids"):
+            # Evaluate the whole layer
+            for group_id in range(self.num_bk_groups):
+                u_cids = self.grouped_u_cids[group_id]
+                parids = self.grouped_parids[group_id]
 
-            self._forward_backward(node_flows, element_flows, u_cids, parids)
+                self._forward_backward(node_flows, element_flows, u_cids, parids)
+        
+        else:
+            # Partial evaluation
+            for group_id in range(self.num_bk_groups):
+                u_cids = self.grouped_u_cids[group_id]
+                parids = self.grouped_parids[group_id]
+                local_ids = self.bk_group_local_ids[group_id]
+
+                self._forward_backward(node_flows, element_flows, u_cids, parids, local_ids = local_ids)
         
         return None
 
     @staticmethod
     @triton.jit
-    def _forward_backward_kernel(node_vals_ptr, element_vals_ptr, nids_ptr, cids_ptr, 
-                                 tot_n_nodes: tl.constexpr, tot_n_eles: tl.constexpr,
-                                 n_nodes: tl.constexpr, n_edges: tl.constexpr, 
-                                 batch_size: tl.constexpr, n_nodes_per_block_m: tl.constexpr,
-                                 BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+    def _forward_backward_kernel(node_vals_ptr, element_vals_ptr, nids_ptr, cids_ptr, tot_n_nodes: tl.constexpr, 
+                                 tot_n_eles: tl.constexpr, n_nodes: tl.constexpr, n_edges: tl.constexpr, batch_size: tl.constexpr,
+                                 n_nodes_per_block_m: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
 
         # We use BLOCK_M to index over edges, and BLOCK_N to index over batches
         pid0 = tl.program_id(axis = 0)
@@ -225,7 +245,7 @@ class ProdLayer(Layer, nn.Module):
         return None
 
     def _forward_backward(self, node_vals: torch.Tensor, element_vals: torch.Tensor, 
-                          nids: torch.Tensor, cids: torch.Tensor, 
+                          nids: torch.Tensor, cids: torch.Tensor, local_ids: Optional[torch.Tensor] = None,
                           BLOCK_M_HARD_LIMIT = 2**16,
                           BLOCK_SIZE = 2**12, MAX_BLOCK_M = 512, MAX_BLOCK_N = 64) -> None:
         """
@@ -238,6 +258,15 @@ class ProdLayer(Layer, nn.Module):
         `nids`:         [n]
         `cids`:         [n, c]
         """
+
+        if local_ids is not None and local_ids.size(0) == 0:
+            # Nothing need to be evaluated in the current group
+            return None
+        elif local_ids is not None:
+            # Select nodes
+            nids = nids[local_ids].contiguous()
+            cids = cids[local_ids,:].contiguous()
+
         tot_n_nodes = node_vals.size(0)
         tot_n_eles = element_vals.size(0)
         n_nodes = nids.size(0)
@@ -272,12 +301,79 @@ class ProdLayer(Layer, nn.Module):
             cids_ptr = cids, 
             tot_n_nodes = tot_n_nodes,
             tot_n_eles = tot_n_eles,
-            n_nodes = n_nodes, 
-            n_edges = n_edges, 
-            batch_size = batch_size, 
+            n_nodes = n_nodes,
+            n_edges = n_edges,
+            batch_size = batch_size,
             n_nodes_per_block_m = BLOCK_M // n_edges,
             BLOCK_M = BLOCK_M, 
             BLOCK_N = BLOCK_N
         )
 
         return None
+
+    def _prepare_scope2nids(self):
+
+        # Saved for the next sum layer
+        prod_scope_eleids = list()
+        global_eid = 1
+        for ns in self.nodes:
+            s_eid = global_eid
+            e_eid = global_eid + ns.num_nodes
+
+            prod_scope_eleids.append((ns.scope, (s_eid, e_eid)))
+
+            global_eid += ns.num_nodes
+
+        if not (hasattr(self, "fw_scope2localids") and hasattr(self, "bk_scope2localids")):
+            fw_scope2localids = dict()
+            bk_scope2localids = dict()
+
+            # Forward local indices
+            global_eid = 1
+            for ns in self.nodes:
+                scope = ns.scope
+
+                s_eid = global_eid
+                e_eid = global_eid + ns.num_nodes
+
+                with torch.no_grad():
+                    if scope not in fw_scope2localids:
+                        fw_scope2localids[scope] = [
+                            torch.zeros([0], dtype = torch.long) for _ in range(self.num_fw_groups)
+                        ]
+
+                    for group_id in range(self.num_fw_groups):
+                        nids = self.grouped_nids[group_id]
+                        group_local_ids = torch.where((nids >= s_eid) & (nids < e_eid))[0].cpu()
+
+                        fw_scope2localids[scope][group_id] = torch.cat(
+                            (fw_scope2localids[scope][group_id], group_local_ids), dim = 0
+                        )
+
+                global_eid += ns.num_nodes
+
+            # Backward local indices
+            for ns in self.nodes:
+                for cs in ns.chs:
+                    scope = cs.scope
+
+                    s_nid = cs._output_ind_range[0]
+                    e_nid = cs._output_ind_range[1]
+
+                    if scope not in bk_scope2localids:
+                        bk_scope2localids[scope] = [
+                            torch.zeros([0], dtype = torch.long) for _ in range(self.num_bk_groups)
+                        ]
+
+                    for group_id in range(self.num_bk_groups):
+                        u_cids = self.grouped_u_cids[group_id]
+                        group_local_ids = torch.where((u_cids >= s_nid) & (u_cids < e_nid))[0].cpu()
+
+                        bk_scope2localids[scope][group_id] = torch.cat(
+                            (bk_scope2localids[scope][group_id], group_local_ids), dim = 0
+                        )
+
+            self.fw_scope2localids = fw_scope2localids
+            self.bk_scope2localids = bk_scope2localids
+
+        return prod_scope_eleids

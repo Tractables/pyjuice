@@ -54,6 +54,12 @@ class BitSet(object):
 
         return (self.values[value // 8] & (1 << (7 - value % 8))) != 0
 
+    def contains_all(self, other: BitSet):
+        return len(self & other) == len(other)
+
+    def contains_any(self, other: BitSet):
+        return len(self & other) > 0
+
     def __and__(self, other: BitSet):
         if self.byte_length > other.byte_length:
             b = deepcopy(self)

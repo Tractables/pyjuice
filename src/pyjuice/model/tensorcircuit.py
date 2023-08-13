@@ -7,12 +7,13 @@ import triton
 import triton.language as tl
 from tqdm import tqdm
 from functools import partial
-from typing import Optional, Sequence, Callable
+from typing import Optional, Sequence, Callable, Union
 
 from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes, foreach
 from pyjuice.layer import Layer, InputLayer, ProdLayer, SumLayer, layerize
 from pyjuice.functional import normalize_parameters, flat_softmax_fw, flat_softmax_bp
 from pyjuice.utils.grad_fns import ReverseGrad, PseudoHookFunc
+from pyjuice.utils import BitSet
 
 
 def _pc_model_backward_hook(grad, pc, **kwargs):
@@ -94,6 +95,8 @@ class TensorCircuit(nn.Module):
                 params: Optional[torch.Tensor] = None, 
                 input_params: Optional[Dict[str,torch.Tensor]] = None,
                 input_layer_fn: Optional[Union[str,Callable]] = None,
+                cache: Optional[dict] = None,
+                return_cache: bool = False,
                 **kwargs):
         """
         Forward the circuit.
@@ -120,6 +123,12 @@ class TensorCircuit(nn.Module):
         if not isinstance(self.element_mars, torch.Tensor) or self.element_mars.size(0) != self.num_elements or \
                 self.element_mars.size(1) != B or self.element_mars.device != self.device:
             self.element_mars = torch.empty([self.num_elements, B], device = self.device)
+
+        # Load cached node marginals
+        if cache is not None and "node_mars" in cache:
+            assert cache["node_mars"].dim() == 2 and cache["node_mars"].size(0) == self.node_mars.size(0) and \
+                cache["node_mars"].size(1) == self.node_mars.size(1)
+            self.node_mars[:,:] = cache["node_mars"].to(self.device)
 
         self.node_mars[0,:] = 0.0
         self.element_mars[0,:] = -torch.inf
@@ -184,6 +193,15 @@ class TensorCircuit(nn.Module):
         lls = self.node_mars[self._root_node_range[0]:self._root_node_range[1],:]
         lls = lls.permute(1, 0)
 
+        ## Create/Update cache if needed ##
+
+        if return_cache:
+            if cache is None:
+                cache = dict()
+
+            with torch.no_grad():
+                cache["node_mars"] = self.node_mars.cpu()
+
         ## Add gradient hook for backward pass ##
 
         if torch.is_grad_enabled():
@@ -199,15 +217,23 @@ class TensorCircuit(nn.Module):
                     tensors.append(self._inputs[i])
             tensors.append(lls)
 
-            return PseudoHookFunc.apply(*tensors)
-        
-        return lls
+            if return_cache:
+                return PseudoHookFunc.apply(*tensors).clone(), cache
+            else:
+                return PseudoHookFunc.apply(*tensors).clone()
+
+        if return_cache:
+            return lls.clone(), cache
+        else:
+            return lls.clone()
 
     def backward(self, inputs: Optional[torch.Tensor] = None, 
                  ll_weights: Optional[torch.Tensor] = None,
                  compute_param_flows: bool = True, 
                  flows_memory: float = 0.0,
                  input_layer_fn: Optional[Union[str,Callable]] = None,
+                 cache: Optional[dict] = None,
+                 return_cache: bool = False,
                  **kwargs):
         """
         Compute circuit flows.
@@ -244,6 +270,17 @@ class TensorCircuit(nn.Module):
             assert ll_weights.size(0) == self.num_root_nodes
 
             self.node_flows[self._root_node_range[0]:self._root_node_range[1],:] = ll_weights
+
+        # Load cached node flows
+        if cache is not None and "node_flows" in cache:
+            assert cache["node_flows"].dim() == 2 and cache["node_flows"].size(0) == self.node_flows.size(0) and \
+                cache["node_flows"].size(1) == self.node_flows.size(1)
+
+            if "replace_root_flows" in cache and cache["replace_root_flows"]:
+                self.node_flows[:self._root_node_range[0],:] = cache["node_flows"][:self._root_node_range[0],:].to(self.device)
+                self.node_flows[self._root_node_range[1]:,:] = cache["node_flows"][self._root_node_range[1]:,:].to(self.device)
+            else:
+                self.node_flows[:,:] = cache["node_flows"].to(self.device)
 
         ## Retrieve parameters and initialize parameter flows ##
 
@@ -321,7 +358,17 @@ class TensorCircuit(nn.Module):
             else:
                 self._used_external_sum_params = False
 
-        return None
+        if return_cache:
+            if cache is None:
+                cache = dict()
+
+            with torch.no_grad():
+                cache["node_flows"] = self.node_flows.cpu()
+
+            return cache
+
+        else:
+            return None
 
     def mini_batch_em(self, step_size: float, pseudocount: float = 0.0):
         for layer in self.input_layers:
@@ -410,6 +457,35 @@ class TensorCircuit(nn.Module):
                 setattr(ns, target_name, param_flows[ns._param_ids])
 
         return None
+
+    def enable_partial_evaluation(self, scopes: Union[Sequence[BitSet],Sequence[int]], 
+                                  forward: bool = False, backward: bool = False):
+        
+        # Create scope2nid cache
+        self._create_scope2nid_cache()
+
+        if isinstance(scopes[0], int):
+            scopes = [BitSet.from_array([var]) for var in scopes]
+
+        fw_scopes = scopes if forward else None
+        bk_scopes = scopes if backward else None
+
+        # Input layers
+        for layer in self.input_layers:
+            layer.enable_partial_evaluation(fw_scopes = fw_scopes, bk_scopes = bk_scopes)
+
+        # Inner layers
+        for layer in self.inner_layers:
+            layer.enable_partial_evaluation(fw_scopes = fw_scopes, bk_scopes = bk_scopes)
+
+    def disable_partial_evaluation(self, forward: bool = True, backward: bool = True):
+        # Input layers
+        for layer in self.input_layers:
+            layer.disable_partial_evaluation(forward = forward, backward = backward)
+
+        # Inner layers
+        for layer in self.inner_layers:
+            layer.disable_partial_evaluation(forward = forward, backward = backward)
 
     def _init_layers(self, init_input_params: Optional[Sequence[torch.Tensor]] = None, 
                      init_inner_params: Optional[torch.Tensor] = None,
@@ -602,3 +678,18 @@ class TensorCircuit(nn.Module):
             type2nodes[ltype].append(ns)
 
         return type2nodes
+
+    def _create_scope2nid_cache(self):
+        # Input layers
+        for idx, layer in enumerate(self.input_layers):
+            layer._prepare_scope2nids()
+
+        # Inner layers
+        prod_scope_eleids = None
+        for layer in self.inner_layers:
+            if isinstance(layer, ProdLayer):
+                prod_scope_eleids = layer._prepare_scope2nids()
+            else:
+                assert isinstance(layer, SumLayer)
+
+                layer._prepare_scope2nids(prod_scope_eleids)

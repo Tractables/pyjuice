@@ -7,9 +7,10 @@ import triton
 import triton.language as tl
 import warnings
 from copy import deepcopy
-from typing import Sequence, List, Optional
+from typing import Sequence, List, Tuple, Optional
 
 from pyjuice.nodes import SumNodes
+from pyjuice.utils import BitSet
 from .layer import Layer
 from .backend.node_partition import partition_nodes_by_n_edges
 from .backend.index_set import batched_index_set, index_cum
@@ -141,6 +142,10 @@ class SumLayer(Layer, nn.Module):
         self.grouped_parids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in parids])
         self.grouped_parpids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in parpids])
 
+        # Store the range of global node indices belonging to this layer
+        # This is used to implement partial evaluation
+        self.global_nid_range = (global_nid_start, global_nid_start + self.num_nodes)
+
     def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor) -> None:
         """
         Computes the forward pass of a sum layer:
@@ -157,14 +162,28 @@ class SumLayer(Layer, nn.Module):
         `params`:       [num_params, B] or [num_params]
         """
 
-        for group_id in range(self.num_fw_groups):
-            nids = self.grouped_nids[group_id]
-            cids = self.grouped_cids[group_id]
-            pids = self.grouped_pids[group_id]
+        if not self.provided("fw_group_local_ids"):
+            # Evaluate the whole layer
+            for group_id in range(self.num_fw_groups):
+                nids = self.grouped_nids[group_id]
+                cids = self.grouped_cids[group_id]
+                pids = self.grouped_pids[group_id]
 
-            self._forward(
-                node_mars, element_mars, params, nids, cids, pids
-            )
+                self._forward(
+                    node_mars, element_mars, params, nids, cids, pids
+                )
+
+        else:
+            # Partial evaluation
+            for group_id in range(self.num_fw_groups):
+                nids = self.grouped_nids[group_id]
+                cids = self.grouped_cids[group_id]
+                pids = self.grouped_pids[group_id]
+                local_ids = self.fw_group_local_ids[group_id]
+
+                self._forward(
+                    node_mars, element_mars, params, nids, cids, pids, local_ids = local_ids
+                )
 
         return None
 
@@ -191,25 +210,41 @@ class SumLayer(Layer, nn.Module):
         `params`:        [num_params, B] or [num_params]
         """
         
-        for group_id in range(self.num_bk_groups):
-            chids = self.grouped_chids[group_id]
-            parids = self.grouped_parids[group_id]
-            parpids = self.grouped_parpids[group_id]
+        if not self.provided("bk_group_local_ids"):
+            # Evaluate the whole layer
+            for group_id in range(self.num_bk_groups):
+                chids = self.grouped_chids[group_id]
+                parids = self.grouped_parids[group_id]
+                parpids = self.grouped_parpids[group_id]
 
-            self._backward(
-                node_flows, element_flows, params, node_mars, 
-                element_mars, param_flows, chids, parids, parpids
-            )
+                self._backward(
+                    node_flows, element_flows, params, node_mars, 
+                    element_mars, param_flows, chids, parids, parpids
+                )
+
+        else:
+            # Partial evaluation
+            for group_id in range(self.num_bk_groups):
+                chids = self.grouped_chids[group_id]
+                parids = self.grouped_parids[group_id]
+                parpids = self.grouped_parpids[group_id]
+                local_ids = self.bk_group_local_ids[group_id]
+
+                self._backward(
+                    node_flows, element_flows, params, node_mars,
+                    element_mars, param_flows, chids, parids, parpids,
+                    local_ids = local_ids
+                )
 
         return None
         
     @staticmethod
     @triton.jit
     def _forward_triton_kernel(node_mars_ptr, element_mars_ptr, params_ptr, 
-                               nids_ptr, cids_ptr, pids_ptr,
-                               tot_n_nodes: tl.constexpr, tot_n_eles: tl.constexpr,
-                               n_nodes: tl.constexpr, n_edges: tl.constexpr, 
-                               batch_size: tl.constexpr, n_nodes_per_block_m: tl.constexpr,
+                               nids_ptr, cids_ptr, pids_ptr, tot_n_nodes: tl.constexpr, 
+                               tot_n_eles: tl.constexpr, n_nodes: tl.constexpr, 
+                               n_edges: tl.constexpr, batch_size: tl.constexpr, 
+                               n_nodes_per_block_m: tl.constexpr,
                                BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
 
         # We use BLOCK_M to index over edges, and BLOCK_N to index over batches
@@ -288,7 +323,8 @@ class SumLayer(Layer, nn.Module):
 
     def _forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor, 
                  params: torch.Tensor, nids: torch.Tensor, cids: torch.Tensor,
-                 pids: torch.Tensor, BLOCK_M_HARD_LIMIT = 2**16, BLOCK_SIZE = 2**12, 
+                 pids: torch.Tensor, local_ids: Optional[torch.Tensor] = None, 
+                 BLOCK_M_HARD_LIMIT = 2**16, BLOCK_SIZE = 2**12, 
                  MAX_BLOCK_M = 2**12, MAX_BLOCK_N = 64) -> None:
         """
         This function is equivalent to running:
@@ -307,6 +343,16 @@ class SumLayer(Layer, nn.Module):
         `cids`:         [n, c]
         `pids`:         [n, c]
         """
+
+        if local_ids is not None and local_ids.size(0) == 0:
+            # Nothing need to be evaluated in the current group
+            return None
+        elif local_ids is not None:
+            # Select nodes
+            nids = nids[local_ids].contiguous()
+            cids = cids[local_ids,:].contiguous()
+            pids = pids[local_ids,:].contiguous()
+
         tot_n_nodes = node_mars.size(0)
         tot_n_eles = element_mars.size(0)
         n_nodes = nids.size(0)
@@ -346,9 +392,9 @@ class SumLayer(Layer, nn.Module):
             pids_ptr = pids,
             tot_n_nodes = tot_n_nodes,
             tot_n_eles = tot_n_eles,
-            n_nodes = n_nodes, 
-            n_edges = n_edges, 
-            batch_size = batch_size, 
+            n_nodes = n_nodes,
+            n_edges = n_edges,
+            batch_size = batch_size,
             n_nodes_per_block_m = BLOCK_M // n_edges,
             BLOCK_M = BLOCK_M, 
             BLOCK_N = BLOCK_N
@@ -360,10 +406,10 @@ class SumLayer(Layer, nn.Module):
     @triton.jit
     def _backward_kernel(node_flows_ptr, element_flows_ptr, params_ptr, 
                          node_mars_ptr, element_mars_ptr, param_flows_ptr,
-                         chids_ptr, parids_ptr, parpids_ptr,
-                         tot_n_nodes: tl.constexpr, tot_n_eles: tl.constexpr,
-                         n_nodes: tl.constexpr, n_edges: tl.constexpr, 
-                         batch_size: tl.constexpr, n_nodes_per_block_m: tl.constexpr,
+                         chids_ptr, parids_ptr, parpids_ptr, tot_n_nodes: tl.constexpr, 
+                         tot_n_eles: tl.constexpr, n_nodes: tl.constexpr, 
+                         n_edges: tl.constexpr, batch_size: tl.constexpr,
+                         n_nodes_per_block_m: tl.constexpr,
                          accumulate_param_flows: tl.constexpr,
                          BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
         # We use BLOCK_M to index over edges, and BLOCK_N to index over batches
@@ -445,6 +491,7 @@ class SumLayer(Layer, nn.Module):
                   params: torch.Tensor, node_mars: torch.Tensor, 
                   element_mars: torch.Tensor, param_flows: torch.Tensor, 
                   chids: torch.Tensor, parids: torch.Tensor, parpids: torch.Tensor, 
+                  local_ids: Optional[torch.Tensor] = None, 
                   BLOCK_M_HARD_LIMIT = 2**16, BLOCK_SIZE = 2**12, MAX_BLOCK_M = 2**11, 
                   MAX_BLOCK_N = 64) -> None:
         """
@@ -468,6 +515,16 @@ class SumLayer(Layer, nn.Module):
         `parids`:        [n, p]
         `parpids`:       [n, p]
         """
+
+        if local_ids is not None and local_ids.size(0) == 0:
+            # Nothing need to be evaluated in the current group
+            return None
+        elif local_ids is not None:
+            # Select nodes
+            chids = chids[local_ids].contiguous()
+            parids = parids[local_ids,:].contiguous()
+            parpids = parpids[local_ids,:].contiguous()
+
         tot_n_nodes = node_mars.size(0)
         tot_n_eles = element_mars.size(0)
         n_nodes = chids.size(0)
@@ -520,9 +577,9 @@ class SumLayer(Layer, nn.Module):
             parpids_ptr = parpids,
             tot_n_nodes = tot_n_nodes,
             tot_n_eles = tot_n_eles,
-            n_nodes = n_nodes, 
-            n_edges = n_edges, 
-            batch_size = batch_size, 
+            n_nodes = n_nodes,
+            n_edges = n_edges,
+            batch_size = batch_size,
             n_nodes_per_block_m = BLOCK_M // n_edges,
             accumulate_param_flows = (param_flows is not None),
             BLOCK_M = BLOCK_M, 
@@ -530,3 +587,53 @@ class SumLayer(Layer, nn.Module):
         )
 
         return None
+
+    def _prepare_scope2nids(self, prod_scope_eleids: Sequence[Tuple[BitSet, torch.Tensor]]):
+        if not (hasattr(self, "fw_scope2localids") and hasattr(self, "bk_scope2localids")):
+            fw_scope2localids = dict()
+            bk_scope2localids = dict()
+
+            # Forward local indices
+            global_nid = self.global_nid_range[0]
+            for ns in self.nodes:
+                scope = ns.scope
+
+                s_nid = global_nid
+                e_nid = global_nid + ns.num_nodes
+
+                with torch.no_grad():
+                    if scope not in fw_scope2localids:
+                        fw_scope2localids[scope] = [
+                            torch.zeros([0], dtype = torch.long) for _ in range(self.num_fw_groups)
+                        ]
+
+                    for group_id in range(self.num_fw_groups):
+                        nids = self.grouped_nids[group_id]
+                        group_local_ids = torch.where((nids >= s_nid) & (nids < e_nid))[0].cpu()
+
+                        fw_scope2localids[scope][group_id] = torch.cat(
+                            (fw_scope2localids[scope][group_id], group_local_ids), dim = 0
+                        )
+
+                global_nid += ns.num_nodes
+
+            # Backward local indices
+            for scope, ele_id_range in prod_scope_eleids:
+                s_eid, e_eid = ele_id_range
+
+                with torch.no_grad():
+                    if scope not in bk_scope2localids:
+                        bk_scope2localids[scope] = [
+                            torch.zeros([0], dtype = torch.long) for _ in range(self.num_bk_groups)
+                        ]
+
+                    for group_id in range(self.num_bk_groups):
+                        chids = self.grouped_chids[group_id]
+                        group_local_ids = torch.where((chids >= s_eid) & (chids < e_eid))[0].cpu()
+
+                        bk_scope2localids[scope][group_id] = torch.cat(
+                            (bk_scope2localids[scope][group_id], group_local_ids), dim = 0
+                        )
+
+            self.fw_scope2localids = fw_scope2localids
+            self.bk_scope2localids = bk_scope2localids

@@ -61,6 +61,36 @@ class InputLayer(Layer, nn.Module):
     def get_param_specs(self):
         raise NotImplementedError()
 
+    def enable_partial_evaluation(self, fw_scopes: Optional[Sequence[BitSet]] = None, bk_scopes: Optional[Sequence[BitSet]] = None):
+        # Filter forward nodes
+        if fw_scopes is not None:
+            fw_local_ids = [torch.zeros([0], dtype = torch.long)]
+            for scope in fw_scopes:
+                if scope not in self.scope2localids:
+                    continue
+
+                fw_local_ids.append(self.scope2localids[scope])
+
+            self.fw_local_ids = torch.cat(fw_local_ids, dim = 0).to(self.device)
+
+        # Filter backward nodes
+        if bk_scopes is not None:
+            bk_local_ids = [torch.zeros([0], dtype = torch.long)]
+            for scope in bk_scopes:
+                if scope not in self.scope2localids:
+                    continue
+
+                bk_local_ids.append(self.scope2localids[scope])
+
+            self.bk_local_ids = torch.cat(bk_local_ids, dim = 0).to(self.device)
+
+    def disable_partial_evaluation(self, forward: bool = True, backward: bool = True):
+        if forward:
+            self.fw_local_ids = None
+
+        if backward:
+            self.bk_local_ids = None
+
     @staticmethod
     def _hook_params(grad_hook_idx: int, _inputs: List, layer_params: Dict):
         raise NotImplementedError()
@@ -70,3 +100,27 @@ class InputLayer(Layer, nn.Module):
 
     def _hook_input_grads(self, _inputs: List, _inputs_grad: List):
         pass
+
+    def _prepare_scope2nids(self):
+        if not hasattr(self, "scope2localids"):
+            scope2localids = dict()
+
+            local_nid = 0
+            for ns in self.nodes:
+                scope = ns.scope
+
+                s_nid = local_nid
+                e_nid = local_nid + ns.num_nodes
+
+                with torch.no_grad():
+                    if scope not in scope2localids:
+                        scope2localids[scope] = [torch.zeros([0], dtype = torch.long)]
+
+                    group_local_ids = torch.arange(s_nid, e_nid)
+                    scope2localids[scope].append(group_local_ids)
+
+                local_nid += ns.num_nodes
+
+            self.scope2localids = {
+                scope: torch.cat(ids, dim = 0) for scope, ids in scope2localids.items()
+            }

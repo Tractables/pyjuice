@@ -126,7 +126,13 @@ class CategoricalLayer(InputLayer, nn.Module):
 
         assert params.dim() == 1
         
-        self._forward(data, node_mars, params, missing_mask = missing_mask)
+        if not self.provided("fw_local_ids"):
+            # Evaluate the whole layer
+            self._forward(data, node_mars, params, missing_mask = missing_mask)
+
+        else:
+            # Partial evaluation
+            self._forward(data, node_mars, params, missing_mask = missing_mask, local_ids = self.fw_local_ids)
 
         return None
 
@@ -137,16 +143,33 @@ class CategoricalLayer(InputLayer, nn.Module):
         node_flows: [num_nodes, B]
         node_mars: [num_nodes, B]
         """
-        layer_num_nodes = self._output_ind_range[1] - self._output_ind_range[0]
-        tot_num_nodes = node_flows.size(0)
-        batch_size = node_flows.size(1)
-        node_offset = self._output_ind_range[0]
 
-        param_ids = data[self.vids] + self.psids.unsqueeze(1)
-        
-        grid = lambda meta: (triton.cdiv(layer_num_nodes * batch_size, meta['BLOCK_SIZE']),)
-        
-        self._flows_kernel[grid](self.param_flows, node_flows, param_ids, layer_num_nodes, tot_num_nodes, batch_size, node_offset, BLOCK_SIZE = 1024)
+        if not self.provided("bk_local_ids"):
+            # Evaluate the whole layer
+            layer_num_nodes = self._output_ind_range[1] - self._output_ind_range[0]
+            tot_num_nodes = node_flows.size(0)
+            batch_size = node_flows.size(1)
+            node_offset = self._output_ind_range[0]
+
+            param_ids = data[self.vids] + self.psids.unsqueeze(1)
+            
+            grid = lambda meta: (triton.cdiv(layer_num_nodes * batch_size, meta['BLOCK_SIZE']),)
+            
+            self._flows_kernel[grid](self.param_flows, node_flows, param_ids, layer_num_nodes, tot_num_nodes, batch_size, node_offset, BLOCK_SIZE = 1024)
+
+        else:
+            # Partial evaluation
+            local_ids = self.bk_local_ids
+            layer_num_nodes = local_ids.size(0)
+            tot_num_nodes = node_flows.size(0)
+            batch_size = node_flows.size(1)
+            node_offset = self._output_ind_range[0]
+
+            param_ids = data[self.vids[local_ids]] + self.psids[local_ids].unsqueeze(1)
+
+            grid = lambda meta: (triton.cdiv(layer_num_nodes * batch_size, meta["BLOCK_SIZE"]),)
+
+            self._partial_flows_kernel[grid](self.param_flows, node_flows, param_ids, local_ids, layer_num_nodes, tot_num_nodes, batch_size, node_offset, BLOCK_SIZE = 1024)
         
         return None
 
@@ -224,12 +247,18 @@ class CategoricalLayer(InputLayer, nn.Module):
         return {"params": torch.Size([self.params.size(0)])}
 
     @torch.compile(mode = "default")
-    def _forward(self, data: torch.Tensor, node_mars: torch.Tensor,
-                 params: torch.Tensor, missing_mask: Optional[torch.Tensor] = None):
+    def _forward(self, data: torch.Tensor, node_mars: torch.Tensor, params: torch.Tensor, 
+                 missing_mask: Optional[torch.Tensor] = None, local_ids: Optional[torch.Tensor] = None):
 
         sid, eid = self._output_ind_range[0], self._output_ind_range[1]
-        param_idxs = data[self.vids] + self.psids.unsqueeze(1)
-        node_mars[sid:eid,:] = ((params[param_idxs]).clamp(min=1e-10)).log()
+
+        if local_ids is None:
+            param_idxs = data[self.vids] + self.psids.unsqueeze(1)
+            node_mars[sid:eid,:] = ((params[param_idxs]).clamp(min=1e-10)).log()
+        else:
+            param_idxs = data[self.vids[local_ids]] + self.psids[local_ids].unsqueeze(1)
+            node_mars[local_ids+sid,:] = ((params[param_idxs]).clamp(min=1e-10)).log()
+
         if missing_mask is not None:
             if missing_mask.dim() == 1:
                 mask = torch.where(missing_mask[self.vids])[0] + sid
@@ -256,6 +285,24 @@ class CategoricalLayer(InputLayer, nn.Module):
         mask = offsets < layer_num_nodes * batch_size
 
         nf_offsets = batch_size * node_offset + offsets
+        pr_offsets = tl.load(param_ids_ptr + offsets, mask = mask, other = 0)
+
+        nflow = tl.load(node_flows_ptr + nf_offsets, mask = mask, other = 0)
+        tl.atomic_add(param_flows_ptr + pr_offsets, nflow, mask = mask)
+
+    @staticmethod
+    @triton.jit
+    def _partial_flows_kernel(param_flows_ptr, node_flows_ptr, param_ids_ptr, local_ids_ptr, layer_num_nodes, tot_num_nodes, batch_size, node_offset, BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(axis = 0)
+        block_start = pid * BLOCK_SIZE
+
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < layer_num_nodes * batch_size
+
+        batch_offsets = (offsets % batch_size)
+        local_offsets = (offsets // batch_size)
+
+        nf_offsets = tl.load(local_ids_ptr + local_offsets, mask = mask, other = 0) + node_offset
         pr_offsets = tl.load(param_ids_ptr + offsets, mask = mask, other = 0)
 
         nflow = tl.load(node_flows_ptr + nf_offsets, mask = mask, other = 0)
