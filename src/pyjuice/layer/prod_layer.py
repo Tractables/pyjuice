@@ -128,7 +128,7 @@ class ProdLayer(Layer, nn.Module):
         self.grouped_u_cids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in u_cids])
         self.grouped_parids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in parids])
 
-    def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor) -> None:
+    def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor, _for_backward: bool = False) -> None:
         """
         Computes the forward pass of a product layer:
         ```
@@ -140,22 +140,31 @@ class ProdLayer(Layer, nn.Module):
         `element_mars`: [max_num_els, B]
         """
 
-        if not self.provided("fw_group_local_ids"):
-            # Evaluate the whole layer
-            for group_id in range(self.num_fw_groups):
-                nids = self.grouped_nids[group_id]
-                cids = self.grouped_cids[group_id]
-
-                self._forward_backward(element_mars, node_mars, nids, cids)
-
-        else:
-            # Partial evaluation
+        if not _for_backward and self.provided("fw_group_local_ids"):
+            # Partial evaluation (for forward pass)
             for group_id in range(self.num_fw_groups):
                 nids = self.grouped_nids[group_id]
                 cids = self.grouped_cids[group_id]
                 local_ids = self.fw_group_local_ids[group_id]
 
                 self._forward_backward(element_mars, node_mars, nids, cids, local_ids = local_ids)
+
+        elif _for_backward and self.provided("bk_fw_group_local_ids"):
+            # Partial evaluation (for backward pass)
+            for group_id in range(self.num_fw_groups):
+                nids = self.grouped_nids[group_id]
+                cids = self.grouped_cids[group_id]
+                local_ids = self.bk_fw_group_local_ids[group_id]
+
+                self._forward_backward(element_mars, node_mars, nids, cids, local_ids = local_ids)
+
+        else:
+            # Evaluate the whole layer
+            for group_id in range(self.num_fw_groups):
+                nids = self.grouped_nids[group_id]
+                cids = self.grouped_cids[group_id]
+
+                self._forward_backward(element_mars, node_mars, nids, cids)
 
         return None
 
@@ -189,6 +198,23 @@ class ProdLayer(Layer, nn.Module):
                 self._forward_backward(node_flows, element_flows, u_cids, parids, local_ids = local_ids)
         
         return None
+
+    def enable_partial_evaluation(self, fw_scopes: Optional[Sequence[BitSet]] = None, bk_scopes: Optional[Sequence[BitSet]] = None):
+        super(ProdLayer, self).enable_partial_evaluation(fw_scopes = fw_scopes, bk_scopes = bk_scopes)
+
+        # For product layers, we need a special forward pass during the backward process of the circuit
+        if bk_scopes is not None:
+            bk_fw_group_local_ids = [[torch.zeros([0], dtype = torch.long)] for _ in range(self.num_fw_groups)]
+            for scope in bk_scopes:
+                if scope not in self.fw_scope2localids:
+                    continue
+
+                for group_id, ids in enumerate(self.fw_scope2localids[scope]):
+                    bk_fw_group_local_ids[group_id].append(self.fw_scope2localids[scope][group_id])
+
+            self.bk_fw_group_local_ids = [
+                torch.cat(ids, dim = 0).to(self.device) for ids in bk_fw_group_local_ids
+            ]
 
     @staticmethod
     @triton.jit

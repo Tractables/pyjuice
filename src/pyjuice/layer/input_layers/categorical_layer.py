@@ -246,7 +246,7 @@ class CategoricalLayer(InputLayer, nn.Module):
     def get_param_specs(self):
         return {"params": torch.Size([self.params.size(0)])}
 
-    @torch.compile(mode = "default")
+    @torch.compile(mode = "default", fullgraph = False)
     def _forward(self, data: torch.Tensor, node_mars: torch.Tensor, params: torch.Tensor, 
                  missing_mask: Optional[torch.Tensor] = None, local_ids: Optional[torch.Tensor] = None):
 
@@ -264,8 +264,8 @@ class CategoricalLayer(InputLayer, nn.Module):
                 mask = torch.where(missing_mask[self.vids])[0] + sid
                 node_mars[mask,:] = 0.0
             elif missing_mask.dim() == 2:
-                maskx, masky = torch.where(missing_mask[self.vids])[0]
-                maskx += sid
+                maskx, masky = torch.where(missing_mask[self.vids])
+                maskx = maskx + sid
                 node_mars[maskx,masky] = 0.0
             else:
                 raise ValueError()

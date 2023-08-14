@@ -9,6 +9,7 @@ from functools import partial
 from pyjuice.nodes import CircuitNodes
 from pyjuice.model import TensorCircuit
 from pyjuice.layer.input_layers import CategoricalLayer
+from pyjuice.nodes.methods import get_subsumed_scopes
 from .base import query
 
 
@@ -59,7 +60,7 @@ def _soft_evi_categorical_fw_kernel(data_ptr, node_mars_ptr, params_ptr, vids_pt
 
 def _categorical_forward(layer, node_mars: torch.Tensor,
                          params: Optional[torch.Tensor] = None, 
-                         missing_mask: Optional[torch.Tensor] = None, **kwargs):
+                         missing_mask: Optional[torch.Tensor] = None, debug = False, **kwargs):
 
     if params is None:
         params = layer.params
@@ -71,12 +72,10 @@ def _categorical_forward(layer, node_mars: torch.Tensor,
         assert data.dim() == 2 and data.dtype == torch.long
         data = data.permute(1, 0)
 
-        param_idxs = data[layer.vids] + layer.psids.unsqueeze(1)
-
-        if missing_mask is not None:
-            mask = missing_mask[layer.vids]
-            node_mars[sid:eid,:][~mask] = ((params[param_idxs][~mask]).clamp(min=1e-10)).log()
-            node_mars[sid:eid,:][mask] = 0.0
+        if not layer.provided("fw_local_ids"):
+            layer._forward(data, node_mars, params, missing_mask)
+        else:
+            layer._forward(data, node_mars, params, missing_mask, local_ids = layer.fw_local_ids)
 
     elif "soft_evidence" in kwargs:
 
@@ -110,24 +109,25 @@ def _categorical_forward(layer, node_mars: torch.Tensor,
 
 
 @triton.jit
-def _categorical_backward_kernel(cat_probs_ptr, node_flows_ptr, vids_ptr, psids_ptr, node_nchs_ptr, params_ptr,
-                                 sid: tl.constexpr, eid: tl.constexpr,
-                                 batch_size: tl.constexpr, num_cats: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+def _categorical_backward_kernel(cat_probs_ptr, node_flows_ptr, local_ids_ptr, rev_vars_mapping_ptr, vids_ptr, psids_ptr, 
+                                 node_nchs_ptr, params_ptr, sid, eid, num_target_nodes, batch_size: tl.constexpr, 
+                                 num_cats: tl.constexpr, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(axis = 0)
     block_start = pid * BLOCK_SIZE
-    num_nodes = eid - sid
 
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = (offsets < num_nodes * batch_size)
+    mask = (offsets < num_target_nodes * batch_size)
 
     # Get node offsets and batch offsets
-    local_node_offsets = (offsets // batch_size)
+    local_offsets = (offsets // batch_size)
+    local_node_offsets = tl.load(local_ids_ptr + local_offsets, mask = mask, other = 0)
     batch_offsets = (offsets % batch_size)
 
     global_node_offsets = local_node_offsets + sid
 
     # Get variable ID
-    vid = tl.load(vids_ptr + local_node_offsets, mask = mask, other = 0)
+    origin_vid = tl.load(vids_ptr + local_node_offsets, mask = mask, other = 0)
+    vid = tl.load(rev_vars_mapping_ptr + origin_vid, mask = mask, other = 0)
 
     # Get number of children per node
     node_nch = tl.load(node_nchs_ptr + local_node_offsets, mask = mask, other = 0)
@@ -152,10 +152,7 @@ def _categorical_backward_kernel(cat_probs_ptr, node_flows_ptr, vids_ptr, psids_
 
 def _categorical_backward(layer, node_flows: torch.Tensor, node_mars: torch.Tensor,
                           params: Optional[torch.Tensor] = None, 
-                          missing_mask: Optional[torch.Tensor] = None, 
                           mode: str = "full_distribution", **kwargs):
-
-    mask = missing_mask[layer.vids]
 
     if params is None:
         params = layer.params
@@ -168,15 +165,32 @@ def _categorical_backward(layer, node_flows: torch.Tensor, node_mars: torch.Tens
         num_cats = layer.node_nchs.max().item()
         batch_size = node_flows.size(1)
 
-        cat_probs = torch.zeros([num_vars * num_cats * batch_size], dtype = torch.float32, device = node_flows.device)
+        if "target_vars" in kwargs and kwargs["target_vars"] is not None:
+            target_vars = kwargs["target_vars"]
 
-        grid = lambda meta: (triton.cdiv(num_nodes * batch_size, meta['BLOCK_SIZE']),)
+            rev_vars_mapping = torch.zeros([num_vars], dtype = torch.long)
+            for i, var in enumerate(target_vars):
+                rev_vars_mapping[var] = i
+            rev_vars_mapping = rev_vars_mapping.to(node_flows.device)
+        else:
+            target_vars = [var for var in range(num_vars)]
+
+            rev_vars_mapping = torch.arange(0, num_vars, device = node_flows.device)
+
+        num_target_vars = len(target_vars)
+
+        cat_probs = torch.zeros([num_target_vars * num_cats * batch_size], dtype = torch.float32, device = node_flows.device)
+
+        local_ids = layer.enable_partial_evaluation(bk_scopes = target_vars, return_ids = True).to(node_flows.device)
+        num_target_nodes = local_ids.size(0)
+
+        grid = lambda meta: (triton.cdiv(num_target_nodes * batch_size, meta['BLOCK_SIZE']),)
         _categorical_backward_kernel[grid](
-            cat_probs, node_flows, layer.vids, layer.psids, layer.node_nchs, layer.params,
-            sid, eid, batch_size, num_cats, BLOCK_SIZE = 512
+            cat_probs, node_flows, local_ids, rev_vars_mapping, layer.vids, layer.psids, layer.node_nchs, layer.params,
+            sid, eid, num_target_nodes, batch_size, num_cats, BLOCK_SIZE = 512
         )
 
-        cat_probs = cat_probs.reshape(num_vars, num_cats, batch_size)
+        cat_probs = cat_probs.reshape(num_target_vars, num_cats, batch_size)
 
         cat_probs /= cat_probs.sum(dim = 1, keepdim = True)
         cat_probs = cat_probs.permute(2, 0, 1)
@@ -200,7 +214,6 @@ def _conditional_fw_input_fn(layer, inputs, node_mars, params, **kwargs):
 
 def _conditional_bk_input_fn(layer, inputs, node_flows, node_mars, params = None, outputs = None, **kwargs):
     if isinstance(layer, CategoricalLayer):
-        assert "missing_mask" in kwargs
         outputs.append(
             _categorical_backward(layer, node_flows, node_mars, params, **kwargs)
         )
@@ -209,19 +222,58 @@ def _conditional_bk_input_fn(layer, inputs, node_flows, node_mars, params = None
         raise TypeError(f"Unknown/unsupported layer type {type(layer)}.")
 
 
-def conditional(pc: TensorCircuit, missing_mask: torch.Tensor,
+def conditional(pc: TensorCircuit, target_vars: Optional[Sequence[int]] = None,
+                missing_mask: Optional[torch.Tensor] = None,
                 fw_input_fn: Optional[Union[str,Callable]] = None, 
-                bk_input_fn: Optional[Union[str,Callable]] = None, **kwargs):
+                bk_input_fn: Optional[Union[str,Callable]] = None, 
+                fw_delta_vars: Optional[Sequence[int]] = None,
+                cache: Optional[dict] = None, **kwargs):
 
-    missing_mask = missing_mask.permute(1, 0)
+    if missing_mask is not None:
+        missing_mask = missing_mask.permute(1, 0)
+        B = missing_mask.size(1)
+    elif "soft_evidence" in kwargs:
+        B = kwargs["soft_evidence"].size(0)
+    else:
+        raise ValueError("Either `missing_mask` or `soft_evidence` should be provided.")
 
     outputs = []
 
     _wrapped_bk_input_fn = partial(_conditional_bk_input_fn, outputs = outputs)
-    
-    query(pc, inputs = torch.zeros([missing_mask.size(1), 1]), run_backward = True, 
-          fw_input_fn = _conditional_fw_input_fn if fw_input_fn is None else fw_input_fn, 
-          bk_input_fn = _wrapped_bk_input_fn if bk_input_fn is None else bk_input_fn, 
-          missing_mask = missing_mask, **kwargs)
 
-    return outputs[0]
+    kwargs["target_vars"] = target_vars
+
+    if cache is None:
+        query(pc, inputs = torch.zeros([B, 1]), run_backward = True, 
+            fw_input_fn = _conditional_fw_input_fn if fw_input_fn is None else fw_input_fn, 
+            bk_input_fn = _wrapped_bk_input_fn if bk_input_fn is None else bk_input_fn, 
+            missing_mask = missing_mask, **kwargs)
+
+        return outputs[0]
+
+    else:
+        if fw_delta_vars is not None:
+            fw_scopes = get_subsumed_scopes(pc, fw_delta_vars, type = "any")
+            pc.enable_partial_evaluation(scopes = fw_scopes, forward = True)
+
+        if target_vars is not None:
+            bk_scopes = get_subsumed_scopes(pc, target_vars, type = "any")
+            pc.enable_partial_evaluation(scopes = bk_scopes, backward = True)
+
+        kwargs["missing_mask"] = missing_mask
+
+        # Forward
+        lls, cache = pc.forward(
+            inputs = torch.zeros([B, 1]), 
+            # input_layer_fn = _conditional_fw_input_fn if fw_input_fn is None else fw_input_fn, 
+            input_layer_fn = partial(_conditional_fw_input_fn, debug = True) if fw_input_fn is None else fw_input_fn, 
+            cache = cache, return_cache = True, **kwargs
+        )
+
+        # Backward
+        cache = pc.backward(
+            input_layer_fn = _wrapped_bk_input_fn if bk_input_fn is None else bk_input_fn, 
+            compute_param_flows = False, cache = cache, return_cache = True, **kwargs
+        )
+
+        return outputs[0], cache

@@ -9,6 +9,7 @@ from typing import Sequence, Dict
 
 from pyjuice.nodes import InputNodes
 from pyjuice.utils.grad_fns import ReverseGrad
+from pyjuice.utils import BitSet
 from .layer import Layer
 
 
@@ -61,28 +62,45 @@ class InputLayer(Layer, nn.Module):
     def get_param_specs(self):
         raise NotImplementedError()
 
-    def enable_partial_evaluation(self, fw_scopes: Optional[Sequence[BitSet]] = None, bk_scopes: Optional[Sequence[BitSet]] = None):
+    def enable_partial_evaluation(self, fw_scopes: Optional[Union[Sequence[BitSet],Sequence[int]]] = None, 
+                                  bk_scopes: Optional[Union[Sequence[BitSet],Sequence[int]]] = None, return_ids: bool = False):
+        # Create cache if needed
+        if not self.provided("scope2localids"):
+            self._prepare_scope2nids()
+
         # Filter forward nodes
         if fw_scopes is not None:
             fw_local_ids = [torch.zeros([0], dtype = torch.long)]
             for scope in fw_scopes:
+                if isinstance(scope, int):
+                    scope = BitSet.from_array([scope])
+
                 if scope not in self.scope2localids:
                     continue
 
                 fw_local_ids.append(self.scope2localids[scope])
 
-            self.fw_local_ids = torch.cat(fw_local_ids, dim = 0).to(self.device)
+            if return_ids:
+                return torch.cat(fw_local_ids, dim = 0)
+            else:
+                self.fw_local_ids = torch.cat(fw_local_ids, dim = 0).to(self.device)
 
         # Filter backward nodes
         if bk_scopes is not None:
             bk_local_ids = [torch.zeros([0], dtype = torch.long)]
             for scope in bk_scopes:
+                if isinstance(scope, int):
+                    scope = BitSet.from_array([scope])
+
                 if scope not in self.scope2localids:
                     continue
 
                 bk_local_ids.append(self.scope2localids[scope])
 
-            self.bk_local_ids = torch.cat(bk_local_ids, dim = 0).to(self.device)
+            if return_ids:
+                return torch.cat(bk_local_ids, dim = 0)
+            else:
+                self.bk_local_ids = torch.cat(bk_local_ids, dim = 0).to(self.device)
 
     def disable_partial_evaluation(self, forward: bool = True, backward: bool = True):
         if forward:

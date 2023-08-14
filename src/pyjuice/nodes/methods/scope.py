@@ -7,10 +7,12 @@ from pyjuice.nodes import CircuitNodes
 from pyjuice.utils import BitSet
 
 
-def get_subsumed_scopes(root_ns: CircuitNodes, scopes: Union[Sequence[BitSet],Sequence[int],BitSet], type: str = "any"):
+def get_subsumed_scopes(root_ns, scopes: Union[Sequence[BitSet],Sequence[int],BitSet], type: str = "any"):
     """
     Get all scopes in the PC `root_ns` whose scope subsumes `scopes`. `type` could be "any" or "all".
     """
+    if not isinstance(root_ns, CircuitNodes):
+        root_ns = root_ns.root_nodes
 
     if isinstance(scopes, BitSet):
         scopes = [scopes]

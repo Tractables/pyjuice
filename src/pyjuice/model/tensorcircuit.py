@@ -306,7 +306,7 @@ class TensorCircuit(nn.Module):
                     # Sum layer
 
                     # First recompute the previous product layer
-                    self.inner_layers[layer_id-1].forward(self.node_mars, self.element_mars)
+                    self.inner_layers[layer_id-1].forward(self.node_mars, self.element_mars, _for_backward = True)
 
                     # Backward sum layer
                     layer.backward(self.node_flows, self.element_flows, self.node_mars, self.element_mars, params, 
