@@ -297,4 +297,6 @@ def conditional(pc: TensorCircuit, target_vars: Optional[Sequence[int]] = None,
             compute_param_flows = False, cache = cache, return_cache = True, **kwargs
         )
 
+        pc.disable_partial_evaluation(forward = True, backward = True)
+
         return outputs[0], cache
