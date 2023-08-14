@@ -204,7 +204,7 @@ class ProdLayer(Layer, nn.Module):
 
         # For product layers, we need a special forward pass during the backward process of the circuit
         if bk_scopes is not None:
-            bk_fw_group_local_ids = [[torch.zeros([0], dtype = torch.long)] for _ in range(self.num_fw_groups)]
+            bk_fw_group_local_ids = [[] for _ in range(self.num_fw_groups)]
             for scope in bk_scopes:
                 if scope not in self.fw_scope2localids:
                     continue
@@ -213,13 +213,13 @@ class ProdLayer(Layer, nn.Module):
                     bk_fw_group_local_ids[group_id].append(self.fw_scope2localids[scope][group_id])
 
             self.bk_fw_group_local_ids = [
-                torch.cat(ids, dim = 0).to(self.device) for ids in bk_fw_group_local_ids
+                torch.cat(ids, dim = 0) if len(ids) > 0 else torch.zeros([0], dtype = torch.long) for ids in bk_fw_group_local_ids
             ]
 
     @staticmethod
     @triton.jit
-    def _forward_backward_kernel(node_vals_ptr, element_vals_ptr, nids_ptr, cids_ptr, tot_n_nodes: tl.constexpr, 
-                                 tot_n_eles: tl.constexpr, n_nodes: tl.constexpr, n_edges: tl.constexpr, batch_size: tl.constexpr,
+    def _forward_backward_kernel(node_vals_ptr, element_vals_ptr, nids_ptr, cids_ptr, tot_n_nodes, 
+                                 tot_n_eles, n_nodes, n_edges: tl.constexpr, batch_size,
                                  n_nodes_per_block_m: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
 
         # We use BLOCK_M to index over edges, and BLOCK_N to index over batches
@@ -365,12 +365,12 @@ class ProdLayer(Layer, nn.Module):
                 with torch.no_grad():
                     if scope not in fw_scope2localids:
                         fw_scope2localids[scope] = [
-                            torch.zeros([0], dtype = torch.long) for _ in range(self.num_fw_groups)
+                            torch.zeros([0], dtype = torch.long).to(self.grouped_nids[0].device) for _ in range(self.num_fw_groups)
                         ]
 
                     for group_id in range(self.num_fw_groups):
                         nids = self.grouped_nids[group_id]
-                        group_local_ids = torch.where((nids >= s_eid) & (nids < e_eid))[0].cpu()
+                        group_local_ids = torch.where((nids >= s_eid) & (nids < e_eid))[0]
 
                         fw_scope2localids[scope][group_id] = torch.cat(
                             (fw_scope2localids[scope][group_id], group_local_ids), dim = 0
@@ -388,12 +388,12 @@ class ProdLayer(Layer, nn.Module):
 
                     if scope not in bk_scope2localids:
                         bk_scope2localids[scope] = [
-                            torch.zeros([0], dtype = torch.long) for _ in range(self.num_bk_groups)
+                            torch.zeros([0], dtype = torch.long).to(self.grouped_nids[0].device) for _ in range(self.num_bk_groups)
                         ]
 
                     for group_id in range(self.num_bk_groups):
                         u_cids = self.grouped_u_cids[group_id]
-                        group_local_ids = torch.where((u_cids >= s_nid) & (u_cids < e_nid))[0].cpu()
+                        group_local_ids = torch.where((u_cids >= s_nid) & (u_cids < e_nid))[0]
 
                         bk_scope2localids[scope][group_id] = torch.cat(
                             (bk_scope2localids[scope][group_id], group_local_ids), dim = 0

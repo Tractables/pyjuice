@@ -128,7 +128,7 @@ class TensorCircuit(nn.Module):
         if cache is not None and "node_mars" in cache:
             assert cache["node_mars"].dim() == 2 and cache["node_mars"].size(0) == self.node_mars.size(0) and \
                 cache["node_mars"].size(1) == self.node_mars.size(1)
-            self.node_mars[:,:] = cache["node_mars"].to(self.device)
+            self.node_mars[:,:] = cache["node_mars"]
 
         self.node_mars[0,:] = 0.0
         self.element_mars[0,:] = -torch.inf
@@ -200,7 +200,7 @@ class TensorCircuit(nn.Module):
                 cache = dict()
 
             with torch.no_grad():
-                cache["node_mars"] = self.node_mars.cpu()
+                cache["node_mars"] = self.node_mars.clone()
 
         ## Add gradient hook for backward pass ##
 
@@ -280,7 +280,7 @@ class TensorCircuit(nn.Module):
                 self.node_flows[:self._root_node_range[0],:] = cache["node_flows"][:self._root_node_range[0],:].to(self.device)
                 self.node_flows[self._root_node_range[1]:,:] = cache["node_flows"][self._root_node_range[1]:,:].to(self.device)
             else:
-                self.node_flows[:,:] = cache["node_flows"].to(self.device)
+                self.node_flows[:,:] = cache["node_flows"]
 
         ## Retrieve parameters and initialize parameter flows ##
 
@@ -363,7 +363,7 @@ class TensorCircuit(nn.Module):
                 cache = dict()
 
             with torch.no_grad():
-                cache["node_flows"] = self.node_flows.cpu()
+                cache["node_flows"] = self.node_flows.clone()
 
             return cache
 

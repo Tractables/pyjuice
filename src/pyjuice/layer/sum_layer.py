@@ -241,10 +241,9 @@ class SumLayer(Layer, nn.Module):
     @staticmethod
     @triton.jit
     def _forward_triton_kernel(node_mars_ptr, element_mars_ptr, params_ptr, 
-                               nids_ptr, cids_ptr, pids_ptr, tot_n_nodes: tl.constexpr, 
-                               tot_n_eles: tl.constexpr, n_nodes: tl.constexpr, 
-                               n_edges: tl.constexpr, batch_size: tl.constexpr, 
-                               n_nodes_per_block_m: tl.constexpr,
+                               nids_ptr, cids_ptr, pids_ptr, tot_n_nodes, 
+                               tot_n_eles, n_nodes, n_edges: tl.constexpr, 
+                               batch_size, n_nodes_per_block_m: tl.constexpr,
                                BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
 
         # We use BLOCK_M to index over edges, and BLOCK_N to index over batches
@@ -406,9 +405,8 @@ class SumLayer(Layer, nn.Module):
     @triton.jit
     def _backward_kernel(node_flows_ptr, element_flows_ptr, params_ptr, 
                          node_mars_ptr, element_mars_ptr, param_flows_ptr,
-                         chids_ptr, parids_ptr, parpids_ptr, tot_n_nodes: tl.constexpr, 
-                         tot_n_eles: tl.constexpr, n_nodes: tl.constexpr, 
-                         n_edges: tl.constexpr, batch_size: tl.constexpr,
+                         chids_ptr, parids_ptr, parpids_ptr, tot_n_nodes, 
+                         tot_n_eles, n_nodes, n_edges: tl.constexpr, batch_size,
                          n_nodes_per_block_m: tl.constexpr,
                          accumulate_param_flows: tl.constexpr,
                          BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
@@ -604,12 +602,12 @@ class SumLayer(Layer, nn.Module):
                 with torch.no_grad():
                     if scope not in fw_scope2localids:
                         fw_scope2localids[scope] = [
-                            torch.zeros([0], dtype = torch.long) for _ in range(self.num_fw_groups)
+                            torch.zeros([0], dtype = torch.long).to(self.grouped_nids[0].device) for _ in range(self.num_fw_groups)
                         ]
 
                     for group_id in range(self.num_fw_groups):
                         nids = self.grouped_nids[group_id]
-                        group_local_ids = torch.where((nids >= s_nid) & (nids < e_nid))[0].cpu()
+                        group_local_ids = torch.where((nids >= s_nid) & (nids < e_nid))[0]
 
                         fw_scope2localids[scope][group_id] = torch.cat(
                             (fw_scope2localids[scope][group_id], group_local_ids), dim = 0
@@ -624,12 +622,12 @@ class SumLayer(Layer, nn.Module):
                 with torch.no_grad():
                     if scope not in bk_scope2localids:
                         bk_scope2localids[scope] = [
-                            torch.zeros([0], dtype = torch.long) for _ in range(self.num_bk_groups)
+                            torch.zeros([0], dtype = torch.long).to(self.grouped_nids[0].device) for _ in range(self.num_bk_groups)
                         ]
 
                     for group_id in range(self.num_bk_groups):
                         chids = self.grouped_chids[group_id]
-                        group_local_ids = torch.where((chids >= s_eid) & (chids < e_eid))[0].cpu()
+                        group_local_ids = torch.where((chids >= s_eid) & (chids < e_eid))[0]
 
                         bk_scope2localids[scope][group_id] = torch.cat(
                             (bk_scope2localids[scope][group_id], group_local_ids), dim = 0

@@ -70,7 +70,7 @@ class InputLayer(Layer, nn.Module):
 
         # Filter forward nodes
         if fw_scopes is not None:
-            fw_local_ids = [torch.zeros([0], dtype = torch.long)]
+            fw_local_ids = []
             for scope in fw_scopes:
                 if isinstance(scope, int):
                     scope = BitSet.from_array([scope])
@@ -83,11 +83,11 @@ class InputLayer(Layer, nn.Module):
             if return_ids:
                 return torch.cat(fw_local_ids, dim = 0)
             else:
-                self.fw_local_ids = torch.cat(fw_local_ids, dim = 0).to(self.device)
+                self.fw_local_ids = torch.cat(fw_local_ids, dim = 0)
 
         # Filter backward nodes
         if bk_scopes is not None:
-            bk_local_ids = [torch.zeros([0], dtype = torch.long)]
+            bk_local_ids = []
             for scope in bk_scopes:
                 if isinstance(scope, int):
                     scope = BitSet.from_array([scope])
@@ -100,7 +100,7 @@ class InputLayer(Layer, nn.Module):
             if return_ids:
                 return torch.cat(bk_local_ids, dim = 0)
             else:
-                self.bk_local_ids = torch.cat(bk_local_ids, dim = 0).to(self.device)
+                self.bk_local_ids = torch.cat(bk_local_ids, dim = 0)
 
     def disable_partial_evaluation(self, forward: bool = True, backward: bool = True):
         if forward:
@@ -140,5 +140,5 @@ class InputLayer(Layer, nn.Module):
                 local_nid += ns.num_nodes
 
             self.scope2localids = {
-                scope: torch.cat(ids, dim = 0) for scope, ids in scope2localids.items()
+                scope: torch.cat(ids, dim = 0).to(self.params.device) for scope, ids in scope2localids.items()
             }

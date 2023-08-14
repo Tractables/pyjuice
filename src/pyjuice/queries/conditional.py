@@ -10,6 +10,7 @@ from pyjuice.nodes import CircuitNodes
 from pyjuice.model import TensorCircuit
 from pyjuice.layer.input_layers import CategoricalLayer
 from pyjuice.nodes.methods import get_subsumed_scopes
+from pyjuice.utils import BitSet
 from .base import query
 
 
@@ -248,6 +249,9 @@ def conditional(pc: TensorCircuit, target_vars: Optional[Sequence[int]] = None,
                 fw_input_fn: Optional[Union[str,Callable]] = None, 
                 bk_input_fn: Optional[Union[str,Callable]] = None, 
                 fw_delta_vars: Optional[Sequence[int]] = None,
+                fw_scopes: Optional[Sequence[BitSet]] = None,
+                bk_scopes: Optional[Sequence[BitSet]] = None,
+                overwrite_partial_eval: bool = True,
                 cache: Optional[dict] = None, **kwargs):
 
     if missing_mask is not None:
@@ -273,12 +277,16 @@ def conditional(pc: TensorCircuit, target_vars: Optional[Sequence[int]] = None,
         return outputs[0]
 
     else:
-        if fw_delta_vars is not None:
+        if fw_delta_vars is not None and fw_scopes is None:
             fw_scopes = get_subsumed_scopes(pc, fw_delta_vars, type = "any")
+        
+        if fw_scopes is not None and overwrite_partial_eval:
             pc.enable_partial_evaluation(scopes = fw_scopes, forward = True)
 
-        if target_vars is not None:
+        if target_vars is not None and bk_scopes is None:
             bk_scopes = get_subsumed_scopes(pc, target_vars, type = "any")
+        
+        if bk_scopes is not None and overwrite_partial_eval:
             pc.enable_partial_evaluation(scopes = bk_scopes, backward = True)
 
         kwargs["missing_mask"] = missing_mask
@@ -286,7 +294,6 @@ def conditional(pc: TensorCircuit, target_vars: Optional[Sequence[int]] = None,
         # Forward
         lls, cache = pc.forward(
             inputs = torch.zeros([B, 1]), 
-            # input_layer_fn = _conditional_fw_input_fn if fw_input_fn is None else fw_input_fn, 
             input_layer_fn = _conditional_fw_input_fn if fw_input_fn is None else fw_input_fn, 
             cache = cache, return_cache = True, **kwargs
         )
@@ -297,6 +304,6 @@ def conditional(pc: TensorCircuit, target_vars: Optional[Sequence[int]] = None,
             compute_param_flows = False, cache = cache, return_cache = True, **kwargs
         )
 
-        pc.disable_partial_evaluation(forward = True, backward = True)
+        # pc.disable_partial_evaluation(forward = True, backward = True)
 
         return outputs[0], cache

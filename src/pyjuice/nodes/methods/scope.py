@@ -24,12 +24,18 @@ def get_subsumed_scopes(root_ns, scopes: Union[Sequence[BitSet],Sequence[int],Bi
 
     if type == "any":
         for ns in root_ns:
+            if ns.scope in target_scopes:
+                continue
+
             if any([ns.scope.contains_all(ref_scope) for ref_scope in scopes]):
                 target_scopes.add(ns.scope)
 
     elif type == "all":
         ref_scope = reduce(lambda x, y: x | y, scopes)
         for ns in root_ns:
+            if ns.scope in target_scopes:
+                continue
+
             if ns.scope.contains_any(ref_scope):
                 target_scopes.add(ns.scope)
 
