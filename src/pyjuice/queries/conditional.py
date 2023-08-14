@@ -64,7 +64,7 @@ def _soft_evi_categorical_fw_kernel(data_ptr, node_mars_ptr, params_ptr, vids_pt
 
 def _categorical_forward(layer, node_mars: torch.Tensor,
                          params: Optional[torch.Tensor] = None, 
-                         missing_mask: Optional[torch.Tensor] = None, debug = False, **kwargs):
+                         missing_mask: Optional[torch.Tensor] = None, **kwargs):
 
     if params is None:
         params = layer.params
@@ -287,7 +287,7 @@ def conditional(pc: TensorCircuit, target_vars: Optional[Sequence[int]] = None,
         lls, cache = pc.forward(
             inputs = torch.zeros([B, 1]), 
             # input_layer_fn = _conditional_fw_input_fn if fw_input_fn is None else fw_input_fn, 
-            input_layer_fn = partial(_conditional_fw_input_fn, debug = True) if fw_input_fn is None else fw_input_fn, 
+            input_layer_fn = _conditional_fw_input_fn if fw_input_fn is None else fw_input_fn, 
             cache = cache, return_cache = True, **kwargs
         )
 
