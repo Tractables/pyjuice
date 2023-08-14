@@ -87,6 +87,18 @@ def partial_eval_cond_test():
 
     assert torch.all(torch.abs(cond_ps[:,0,:] - cond_ps4[:,0,:]) < 1e-6)
 
+    # Soft evidence
+
+    soft_data = torch.rand([16, 4, 2]).to(device)
+    soft_data /= soft_data.sum(dim = 2, keepdim = True)
+
+    cache["node_mars"][:,:] = 0.0
+
+    cond_ps5, cache = juice.queries.conditional(pc, target_vars = [1], soft_evidence = soft_data, missing_mask = missing_mask, cache = cache, fw_delta_vars = [2], debug = True)
+
+    assert torch.all(cache["node_mars"][:5,:] < 1e-4)
+    assert torch.all(cache["node_mars"][7:11,:] < 1e-4)
+
 
 if __name__ == "__main__":
     torch.manual_seed(123)

@@ -16,9 +16,9 @@ from .base import query
 ## Categorical layer ##
 
 @triton.jit
-def _soft_evi_categorical_fw_kernel(data_ptr, node_mars_ptr, params_ptr, vids_ptr, psids_ptr, node_nchs_ptr,
+def _soft_evi_categorical_fw_kernel(data_ptr, node_mars_ptr, params_ptr, vids_ptr, psids_ptr, node_nchs_ptr, local_ids,
                                     sid: tl.constexpr, num_nodes: tl.constexpr, num_cats: tl.constexpr, 
-                                    batch_size: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+                                    batch_size: tl.constexpr, partial: tl.constexpr, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(axis = 0)
     block_start = pid * BLOCK_SIZE
 
@@ -55,7 +55,11 @@ def _soft_evi_categorical_fw_kernel(data_ptr, node_mars_ptr, params_ptr, vids_pt
         node_vals += d_soft_evi * param
 
     # Write back
-    tl.store(node_mars_ptr + offsets + (sid * batch_size), tl.log(node_vals), mask = mask)
+    if not partial:
+        tl.store(node_mars_ptr + offsets + (sid * batch_size), tl.log(node_vals), mask = mask)
+    else:
+        global_nid = tl.load(local_ids + ns_offsets, mask = mask, other = 0) + sid
+        tl.store(node_mars_ptr + global_nid * batch_size + batch_offsets, tl.log(node_vals), mask = mask)
 
 
 def _categorical_forward(layer, node_mars: torch.Tensor,
@@ -88,17 +92,34 @@ def _categorical_forward(layer, node_mars: torch.Tensor,
             data = data.reshape(missing_mask.size(1), missing_mask.size(0), -1).permute(1, 2, 0)
         else:
             data = data.permute(1, 2, 0)
-        
-        num_nodes = eid - sid
+
         num_cats = data.size(1)
         batch_size = data.size(2)
+        
+        if not layer.provided("fw_local_ids"):
+            num_nodes = eid - sid
 
-        grid = lambda meta: (triton.cdiv(num_nodes * batch_size, meta['BLOCK_SIZE']),)
+            grid = lambda meta: (triton.cdiv(num_nodes * batch_size, meta['BLOCK_SIZE']),)
 
-        _soft_evi_categorical_fw_kernel[grid](
-            data.reshape(-1).contiguous(), node_mars, params, layer.vids, layer.psids, layer.node_nchs,
-            sid, num_nodes, num_cats, batch_size, BLOCK_SIZE = 512
-        )
+            _soft_evi_categorical_fw_kernel[grid](
+                data.reshape(-1).contiguous(), node_mars, params, layer.vids, layer.psids, layer.node_nchs,
+                None, sid, num_nodes, num_cats, batch_size, partial = False, BLOCK_SIZE = 512
+            )
+
+        else:
+            local_ids = layer.fw_local_ids
+            num_nodes = local_ids.size(0)
+
+            vids = layer.vids[local_ids]
+            psids = layer.psids[local_ids]
+            node_nchs = layer.node_nchs[local_ids]
+            
+            grid = lambda meta: (triton.cdiv(num_nodes * batch_size, meta['BLOCK_SIZE']),)
+
+            _soft_evi_categorical_fw_kernel[grid](
+                data.reshape(-1).contiguous(), node_mars, params, vids, psids, node_nchs,
+                local_ids, sid, num_nodes, num_cats, batch_size, partial = True, BLOCK_SIZE = 512
+            )
 
         node_mars[sid:eid,:] = node_mars[sid:eid,:].clip(max = 0.0)
 
