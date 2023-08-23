@@ -241,7 +241,12 @@ class CategoricalLayer(InputLayer, nn.Module):
             with torch.no_grad():
                 flows = self.param_flows
                 self._normalize_parameters(flows, pseudocount = pseudocount)
-                self.params.data = (1.0 - step_size) * self.params.data + step_size * flows
+
+                # self.params.data = (1.0 - step_size) * self.params.data + step_size * flows
+                # This is more memory efficient
+                self.params.data *= (1.0 - step_size)
+                flows *= step_size
+                self.params.data += flows
 
     def get_param_specs(self):
         return {"params": torch.Size([self.params.size(0)])}
