@@ -6,6 +6,7 @@ import pyjuice.optim
 import pyjuice.transformations
 import pyjuice.queries
 import pyjuice.io
+import pyjuice.visualize
 
 # TensorCircuit
 from pyjuice.model import TensorCircuit
