@@ -199,7 +199,29 @@ def sparse_pc_forward_test():
     assert torch.abs(pc.node_mars[13,0] - torch.log(s)) < 1e-4
 
 
+def non_sd_pc2_forward_test():
+    n0 = inputs(0, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
+    n1 = multiply(inputs(0, num_nodes = 2, dist = dists.Categorical(num_cats = 2)))
+    n2 = multiply(inputs(0, num_nodes = 2, dist = dists.Categorical(num_cats = 2)))
+    n3 = multiply(inputs(0, num_nodes = 2, dist = dists.Categorical(num_cats = 2)))
+    n4 = multiply(inputs(0, num_nodes = 2, dist = dists.Categorical(num_cats = 2)))
+
+    ns = summate(n0, n1, n2, n3, n4, num_nodes = 1)
+
+    pc = TensorCircuit(ns)
+
+    device = torch.device("cuda:0")
+    pc.to(device)
+
+    data = torch.randint(0, 2, [16, 1]).to(device)
+
+    lls = pc(data)
+
+    assert torch.abs(torch.logsumexp(pc.node_mars[1:-1,0] + pc.params[1:].log(), dim = 0) - pc.node_mars[-1,0]) < 1e-4
+
+
 if __name__ == "__main__":
     forward_test()
     non_sd_pc_forward_test()
     sparse_pc_forward_test()
+    non_sd_pc2_forward_test()
