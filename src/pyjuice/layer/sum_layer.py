@@ -306,6 +306,10 @@ class SumLayer(Layer, nn.Module):
         nmar_mask = tl.broadcast_to(nid_mask[None,:], (BLOCK_N, n_nodes_per_block_m)) & \
             tl.broadcast_to(b_mask[:,None], (BLOCK_N, n_nodes_per_block_m))
         
+        # Reshape seems to be necessary for certain combinations of (BLOCK_N, n_nodes_per_block_m)
+        nmar_offsets = tl.reshape(nmar_offsets, (BLOCK_N * n_nodes_per_block_m,))
+        nmar_mask = tl.reshape(nmar_mask, (BLOCK_N * n_nodes_per_block_m,))
+        n_logps = tl.reshape(n_logps, (BLOCK_N * n_nodes_per_block_m,))
         tl.store(node_mars_ptr + nmar_offsets, n_logps, mask = nmar_mask)
 
     @staticmethod
