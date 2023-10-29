@@ -6,7 +6,6 @@ import networkx as nx
 from typing import Type
 from pyjuice.nodes.distributions import *
 from typing import Optional
-from pyjuice.model import TensorCircuit
 from .compilation import BayesianTreeToHiddenRegionGraph
 
 
