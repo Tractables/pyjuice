@@ -658,14 +658,23 @@ class TensorCircuit(nn.Module):
                 if depth not in depth2nodes:
                     depth2nodes[depth] = {"sum": [], "prod": []} # lists for sum and product nodes
                 
-                if ns.is_prod():
-                    depth2nodes[depth]["prod"].append(ns)
-                elif ns.is_sum():
+                if ns.is_sum():
                     depth2nodes[depth]["sum"].append(ns)
-                else:
+                elif not ns.is_prod():
                     raise NotImplementedError(f"Unsupported node type {type(n)}.")
 
         dfs(self.root_nodes)
+
+        pns2layer = dict()
+        for layer in range(1, len(depth2nodes)):
+            for ns in depth2nodes[layer]["sum"]:
+                for cs in ns.chs:
+                    if cs.is_prod():
+                        if id(cs) in pns2layer:
+                            assert pns2layer[id(cs)] == layer, "Disallowed circumstance: a product node requested by sum nodes at different layers."
+                        else:
+                            depth2nodes[layer]["prod"].append(cs)
+                            pns2layer[id(cs)] = layer
 
         return depth2nodes, num_layers[0]
 

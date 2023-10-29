@@ -362,7 +362,8 @@ def _assign_target_ncpids_kernel(target_nids_ptr, nids_group_start_ptr, target_c
     cs_node_cum_ids = tl.load(cs_node_cum_ids_ptr + cs_offsets, mask = (cs_offsets < num_chs), other = 0)
     
     cid_node_id = tl.sum(tl.broadcast_to(cid[:,None], (BLOCK_SIZE, num_chs_np2)) >= \
-        tl.broadcast_to(cs_node_cum_ids[None,:], (BLOCK_SIZE, num_chs_np2)), axis = 1) - 1
+        tl.broadcast_to(cs_node_cum_ids[None,:], (BLOCK_SIZE, num_chs_np2)), axis = 1) - \
+        (1 + num_chs_np2 - num_chs)
 
     cs_cum_num = tl.load(cs_node_cum_ids_ptr + cid_node_id, mask = mask, other = 0)
     cs_ele_ind = tl.load(cs_ele_id_start_ptr + cid_node_id, mask = mask, other = 0)
@@ -719,7 +720,8 @@ def _assign_global_eleids_kernel(global_ele_ids_ptr, cs_ele_id_start_ptr, cs_nod
     cs_node_cum_ids = tl.load(cs_node_cum_ids_ptr + cs_offsets, mask = (cs_offsets < num_chs), other = 0)
     
     cid_node_id = tl.sum(tl.broadcast_to(cid[:,None], (BLOCK_SIZE, num_chs_np2)) >= \
-        tl.broadcast_to(cs_node_cum_ids[None,:], (BLOCK_SIZE, num_chs_np2)), axis = 1) - 1
+        tl.broadcast_to(cs_node_cum_ids[None,:], (BLOCK_SIZE, num_chs_np2)), axis = 1) - \
+        (1 + num_chs_np2 - num_chs)
 
     cs_cum_num = tl.load(cs_node_cum_ids_ptr + cid_node_id, mask = mask, other = 0)
     cs_ele_ind = tl.load(cs_ele_id_start_ptr + cid_node_id, mask = mask, other = 0)
