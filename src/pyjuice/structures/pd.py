@@ -110,6 +110,8 @@ def PDStructure(data_shape: Tuple, num_latents: int,
         if len(pns) == 0:
             # No split point found. Create input nodes instead
             ns = create_input_ns(hypercube)
+        elif hypercube == root_hypercube:
+            ns = summate(*pns, num_nodes = 1)
         elif len(pns) <= max_prod_group_conns:
             ns = summate(*pns, num_nodes = num_latents)
         else:
