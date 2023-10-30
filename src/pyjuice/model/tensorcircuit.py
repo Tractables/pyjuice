@@ -261,6 +261,10 @@ class TensorCircuit(nn.Module):
                 self.element_flows.size(1) != B or self.element_flows.device != self.device:
             self.element_flows = torch.zeros([self.num_elements, B], device = self.device)
 
+        # Clear node flows
+        self.node_flows[:,:] = 0.0
+
+        # Set root node flows
         if ll_weights is None:
             self.node_flows[self._root_node_range[0]:self._root_node_range[1],:] = 1.0
         else:
