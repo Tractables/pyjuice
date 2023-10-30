@@ -3,21 +3,25 @@ from __future__ import annotations
 import torch
 import random
 from copy import deepcopy
+from functools import reduce
 
+import pyjuice.transformations as jtf
 from typing import Tuple, Sequence, Optional, Type, Dict
 from pyjuice.nodes import multiply, summate, inputs
 from pyjuice.nodes.distributions import *
+from pyjuice.structures.hclt import HCLT
 from pyjuice.utils import BitSet
 
 
-def PDStructure(data_shape: Tuple, num_latents: int, 
-                split_intervals: Optional[Union[int, Tuple[int]]] = None, 
-                split_points: Optional[Sequence[Sequence[int]]] = None,
-                max_split_depth: Optional[int] = None,
-                max_prod_group_conns: int = 4,
-                input_node_fn: Optional[Callable] = None,
-                input_node_type: Type[Distribution] = Categorical, 
-                input_node_params: Dict = {"num_cats": 256}):
+def PD(data_shape: Tuple, num_latents: int, 
+       split_intervals: Optional[Union[int, Tuple[int]]] = None, 
+       split_points: Optional[Sequence[Sequence[int]]] = None,
+       max_split_depth: Optional[int] = None,
+       max_prod_group_conns: int = 4,
+       structure_type: str = "sum_dominated",
+       input_layer_fn: Optional[Callable] = None,
+       input_layer_type: Type[Distribution] = Categorical, 
+       input_layer_params: Dict = {"num_cats": 256}):
     """
     The PD structure was proposed in
         Sum-Product Networks: A New Deep Architecture
@@ -25,6 +29,8 @@ def PDStructure(data_shape: Tuple, num_latents: int,
         UAI 2011
     and generates a PC structure for random variables which can be naturally arranged on discrete grids, like images.
     """
+    assert structure_type in ["sum_dominated", "prod_dominated"]
+
     num_axes = len(data_shape)
 
     # Construct split points
@@ -74,12 +80,12 @@ def PDStructure(data_shape: Tuple, num_latents: int,
 
     def create_input_ns(hypercube):
         scope = hypercube2scope(hypercube)
-        if input_node_fn is not None:
-            return input_node_fn(scope, num_latents)
+        if input_layer_fn is not None:
+            return input_layer_fn(scope, num_latents)
         else:
             input_nodes = []
             for var in scope:
-                ns = inputs(var, num_nodes = num_latents, dist = input_node_type(**input_node_params))
+                ns = inputs(var, num_nodes = num_latents, dist = input_layer_type(**input_layer_params))
                 input_nodes.append(ns)
 
             edge_ids = torch.arange(0, num_latents)[None,:].repeat(2, 1)
@@ -104,7 +110,11 @@ def PDStructure(data_shape: Tuple, num_latents: int,
                 ns1 = recursive_construct(updated_hypercube(hypercube, axis, e = sp))
                 ns2 = recursive_construct(updated_hypercube(hypercube, axis, s = sp))
 
-                pn = multiply(ns1, ns2)
+                if structure_type == "sum_dominated":
+                    pn = multiply(ns1, ns2)
+                elif structure_type == "prod_dominated":
+                    pn = multiply(ns1.duplicate(), ns2.duplicate())
+
                 pns.append(pn)
 
         if len(pns) == 0:
@@ -128,3 +138,45 @@ def PDStructure(data_shape: Tuple, num_latents: int,
     root_ns = recursive_construct(root_hypercube)
 
     return root_ns
+
+
+def PDHCLT(data: torch.Tensor, data_shape: Tuple, num_latents: int, 
+           split_intervals: Optional[Union[int, Tuple[int]]] = None, 
+           split_points: Optional[Sequence[Sequence[int]]] = None,
+           max_split_depth: Optional[int] = None,
+           max_prod_group_conns: int = 4,
+           structure_type: str = "sum_dominated",
+           input_layer_type: Type[Distribution] = Categorical, 
+           input_layer_params: Dict = {"num_cats": 256},
+           hclt_kwargs: Dict = {"num_bins": 32, "sigma": 0.5 / 32, "chunk_size": 32}):
+
+    assert data.dim() == 2
+    assert data.size(1) == reduce(lambda x, y: x * y, data_shape)
+
+    def input_layer_fn(scope, num_latents):
+        vars = torch.tensor(scope.to_list()).sort().values
+        ns = HCLT(
+            x = data[:,vars], 
+            num_latents = num_latents, 
+            input_layer_type = input_layer_type,
+            input_layer_params = input_layer_params,
+            num_root_ns = num_latents,
+            **hclt_kwargs
+        )
+
+        # Map input variables
+        var_mapping = {v: vars[v].item() for v in range(vars.size(0))}
+        ns = jtf.deepcopy(ns, var_mapping = var_mapping)
+
+        return ns
+
+    ns = PD(data_shape = data_shape, num_latents = num_latents, 
+            split_intervals = split_intervals, split_points = split_points,
+            max_split_depth = max_split_depth, max_prod_group_conns = max_prod_group_conns,
+            structure_type = structure_type, input_layer_fn = input_layer_fn,
+            input_layer_type = input_layer_type, input_layer_params = input_layer_params)
+
+    if ns.num_nodes > 1:
+        ns = summate(*ns.chs, num_nodes = 1)
+
+    return ns

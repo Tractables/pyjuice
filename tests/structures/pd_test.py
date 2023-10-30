@@ -90,10 +90,11 @@ def pd_test():
         drop_last = True
     )
 
-    ns = juice.structures.PDStructure(
+    ns = juice.structures.PD(
         data_shape = (28, 28),
         num_latents = 32,
-        split_intervals = (4, 4)
+        split_intervals = (4, 4),
+        structure_type = "sum_dominated"
     )
     pc = juice.TensorCircuit(ns)
 
