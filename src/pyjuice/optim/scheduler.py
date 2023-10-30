@@ -34,9 +34,19 @@ class CircuitScheduler():
 
             if isinstance(self.lrs, List):
                 self.lrs = np.array(self.lrs)
+            else:
+                try:
+                    self.lrs = np.array(list(self.lrs))
+                except Exceptions:
+                    pass
 
             if isinstance(self.milestone_steps, List):
                 self.milestone_steps = np.array(self.milestone_steps)
+            else:
+                try:
+                    self.milestone_steps = np.array(list(self.milestone_steps))
+                except Exceptions:
+                    pass
             
             assert isinstance(self.lrs, np.ndarray)
             assert isinstance(self.milestone_steps, np.ndarray)
