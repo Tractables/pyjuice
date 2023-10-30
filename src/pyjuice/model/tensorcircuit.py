@@ -451,6 +451,14 @@ class TensorCircuit(nn.Module):
 
         return None
 
+    def print_statistics(self):
+        """
+        Print the statistics of the PC.
+        """
+        print(f"> Number of nodes: {self.num_nodes}")
+        print(f"> Number of edges: {self.num_edges}")
+        print(f"> Number of sum parameters: {self.num_sum_params}")
+
     def copy_param_flows(self, clone_param_flows: bool = True, target_name: str = "_scores"):
         param_flows = self.param_flows.detach().cpu()
 
