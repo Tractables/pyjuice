@@ -410,11 +410,29 @@ class TensorCircuit(nn.Module):
 
         return None
 
-    def to(self, device):
-        super(TensorCircuit, self).to(device)
+    def to(self, device, keep_input_layers_on_cpu: bool = False):
+        if not keep_input_layers_on_cpu:
+            super(TensorCircuit, self).to(device)
 
-        for layer in self.input_layers:
-            layer.device = device
+            for layer in self.input_layers:
+                layer.device = device
+
+        else:
+            for layer in self.inner_layers:
+                layer.to(device)
+                layer.device = device
+            
+            cpu = torch.device("cpu")
+            for layer in self.input_layers:
+                layer.to(cpu)
+                layer.device = cpu
+
+            for name, param in self.named_parameters():
+                if not name.startswith("input_layer") and not name.startswith("prod_layer") and not name.startswith("sum_layer"):
+                    if isinstance(param, nn.Parameter):
+                        self.register_parameter(name, nn.Parameter(param.to(device)))
+                    else:
+                        self.register_buffer(name, param.to(device))
 
         self.device = device
 
