@@ -151,11 +151,20 @@ class CategoricalLayer(InputLayer, nn.Module):
             batch_size = node_flows.size(1)
             node_offset = self._output_ind_range[0]
 
-            param_ids = data[self.vids] + self.psids.unsqueeze(1)
-            
-            grid = lambda meta: (triton.cdiv(layer_num_nodes * batch_size, meta['BLOCK_SIZE']),)
-            
-            self._flows_kernel[grid](self.param_flows, node_flows, param_ids, layer_num_nodes, tot_num_nodes, batch_size, node_offset, BLOCK_SIZE = 1024)
+            if self.device.type == "cuda":
+                param_ids = data[self.vids] + self.psids.unsqueeze(1)
+                
+                grid = lambda meta: (triton.cdiv(layer_num_nodes * batch_size, meta['BLOCK_SIZE']),)
+                
+                self._flows_kernel[grid](self.param_flows, node_flows, param_ids, layer_num_nodes, tot_num_nodes, batch_size, node_offset, BLOCK_SIZE = 1024)
+            else:
+                sid, eid = self._output_ind_range[0], self._output_ind_range[1]
+
+                data = data.cpu()
+                param_ids = data[self.vids] + self.psids.unsqueeze(1)
+
+                for i in range(data.size(1)):
+                    self.param_flows[param_ids[:,i]] += node_flows[sid:eid,i].cpu()
 
         else:
             # Partial evaluation
@@ -252,8 +261,8 @@ class CategoricalLayer(InputLayer, nn.Module):
         return {"params": torch.Size([self.params.size(0)])}
 
     @torch.compile(mode = "default", fullgraph = False)
-    def _forward(self, data: torch.Tensor, node_mars: torch.Tensor, params: torch.Tensor, 
-                 missing_mask: Optional[torch.Tensor] = None, local_ids: Optional[torch.Tensor] = None):
+    def _forward_gpu(self, data: torch.Tensor, node_mars: torch.Tensor, params: torch.Tensor, 
+                     missing_mask: Optional[torch.Tensor] = None, local_ids: Optional[torch.Tensor] = None):
 
         sid, eid = self._output_ind_range[0], self._output_ind_range[1]
 
@@ -263,6 +272,37 @@ class CategoricalLayer(InputLayer, nn.Module):
         else:
             param_idxs = data[self.vids[local_ids]] + self.psids[local_ids].unsqueeze(1)
             node_mars[local_ids+sid,:] = ((params[param_idxs]).clamp(min=1e-10)).log()
+
+        if missing_mask is not None:
+            if missing_mask.dim() == 1:
+                mask = torch.where(missing_mask[self.vids])[0] + sid
+                node_mars[mask,:] = 0.0
+            elif missing_mask.dim() == 2:
+                maskx, masky = torch.where(missing_mask[self.vids])
+                maskx = maskx + sid
+                node_mars[maskx,masky] = 0.0
+            else:
+                raise ValueError()
+
+        return None
+
+    def _forward(self, data: torch.Tensor, node_mars: torch.Tensor, params: torch.Tensor, 
+                 missing_mask: Optional[torch.Tensor] = None, local_ids: Optional[torch.Tensor] = None):
+        if self.device.type == "cuda":
+            self._forward_gpu(data, node_mars, params, missing_mask = missing_mask, local_ids = local_ids)
+            return None
+
+        sid, eid = self._output_ind_range[0], self._output_ind_range[1]
+
+        data = data.cpu()
+        device = node_mars.device
+
+        if local_ids is None:
+            param_idxs = data[self.vids] + self.psids.unsqueeze(1)
+            node_mars[sid:eid,:] = ((params[param_idxs]).clamp(min=1e-10)).log().to(device)
+        else:
+            param_idxs = data[self.vids[local_ids]] + self.psids[local_ids].unsqueeze(1)
+            node_mars[local_ids+sid,:] = ((params[param_idxs]).clamp(min=1e-10)).log().to(device)
 
         if missing_mask is not None:
             if missing_mask.dim() == 1:
