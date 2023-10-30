@@ -48,25 +48,27 @@ def deepcopy(root_nodes: CircuitNodes, tie_params: bool = False,
             
         else:
             assert ns.is_input()
+
+            # Map variable scope
+            if var_mapping is not None:
+                ns_scope = ns.scope
+                scope = BitSet()
+                for v in ns_scope:
+                    assert v in var_mapping, f"Variable {v} not found in `var_mapping`."
+                    scope.add(var_mapping[v])
+            else:
+                scope = pydeepcopy(ns.scope)
+
             if not tie_params:
                 new_ns = InputNodes(
-                    ns.num_nodes,
-                    pydeepcopy(ns.scope),
-                    pydeepcopy(ns.dist)
+                    num_nodes = ns.num_nodes,
+                    scope = pydeepcopy(scope),
+                    dist = pydeepcopy(ns.dist)
                 )
                 params = ns.get_params()
                 if params is not None:
                     new_ns.set_params(params.clone())
             else:
-                if var_mapping is not None:
-                    ns_scope = ns.scope
-                    scope = BitSet()
-                    for v in ns_scope:
-                        assert v in var_mapping, f"Variable {v} not found in `var_mapping`."
-                        scope.add(var_mapping[v])
-                else:
-                    scope = pydeepcopy(ns.scope)
-
                 new_ns = ns.duplicate(scope = scope, tie_params = True)
 
         old2new[ns] = new_ns

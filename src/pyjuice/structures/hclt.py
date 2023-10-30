@@ -6,7 +6,6 @@ import networkx as nx
 from typing import Type
 from pyjuice.nodes.distributions import *
 from typing import Optional
-from pyjuice.model import TensorCircuit
 from .compilation import BayesianTreeToHiddenRegionGraph
 
 
@@ -66,14 +65,15 @@ def chow_liu_tree(mi: np.ndarray):
     
 
 def HCLT(x: torch.Tensor, num_bins: int, sigma: float,                                            
-                                            chunk_size: int,
-                                            num_latents: int, 
-                                            input_layer_type: Type[Distribution] = Categorical, 
-                                            input_layer_params: dict = {"num_cats": 256}):
+         chunk_size: int,
+         num_latents: int, 
+         num_root_ns: int = 1,
+         input_layer_type: Type[Distribution] = Categorical, 
+         input_layer_params: dict = {"num_cats": 256}):
     
     mi = mutual_information_chunked(x, x, num_bins, sigma, chunk_size = chunk_size).detach().cpu().numpy()
     T = chow_liu_tree(mi)
     root = nx.center(T)[0]
-    root_r = BayesianTreeToHiddenRegionGraph(T, root, num_latents, input_layer_type, input_layer_params)
+    root_r = BayesianTreeToHiddenRegionGraph(T, root, num_latents, input_layer_type, input_layer_params, num_root_ns = num_root_ns)
     
     return root_r

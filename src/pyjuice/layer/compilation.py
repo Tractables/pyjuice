@@ -334,7 +334,7 @@ def _assign_target_ncpids_kernel(target_nids_ptr, nids_group_start_ptr, target_c
                                  target_pids_ptr, edge_ids_ptr, chs_offsets_ptr, n_group_ids_ptr, n_id_in_group_ptr, 
                                  cs_ele_id_start_ptr, cs_node_cum_ids_ptr, fw_group_max_chs_ptr, cum_n_chs_ptr, 
                                  ns_param_ids_ptr, ch_n_pars_ptr, constexprs_ptr, num_chs: tl.constexpr, 
-                                 add_params_flag: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+                                 num_chs_np2: tl.constexpr, add_params_flag: tl.constexpr, BLOCK_SIZE: tl.constexpr):
 
     pid = tl.program_id(axis = 0)
     block_start = pid * BLOCK_SIZE
@@ -358,11 +358,12 @@ def _assign_target_ncpids_kernel(target_nids_ptr, nids_group_start_ptr, target_c
     local_id = tl.load(n_id_in_group_ptr + nid + node_start, mask = mask, other = 0)
 
     # Get the child ns index every `cid` belongs to and the cum nodes & global sid
-    cs_offsets = tl.arange(0, num_chs)
-    cs_node_cum_ids = tl.load(cs_node_cum_ids_ptr + cs_offsets)
+    cs_offsets = tl.arange(0, num_chs_np2)
+    cs_node_cum_ids = tl.load(cs_node_cum_ids_ptr + cs_offsets, mask = (cs_offsets < num_chs), other = 0)
     
-    cid_node_id = tl.sum(tl.broadcast_to(cid[:,None], (BLOCK_SIZE, num_chs)) >= \
-        tl.broadcast_to(cs_node_cum_ids[None,:], (BLOCK_SIZE, num_chs)), axis = 1) - 1
+    cid_node_id = tl.sum(tl.broadcast_to(cid[:,None], (BLOCK_SIZE, num_chs_np2)) >= \
+        tl.broadcast_to(cs_node_cum_ids[None,:], (BLOCK_SIZE, num_chs_np2)), axis = 1) - \
+        (1 + num_chs_np2 - num_chs)
 
     cs_cum_num = tl.load(cs_node_cum_ids_ptr + cid_node_id, mask = mask, other = 0)
     cs_ele_ind = tl.load(cs_ele_id_start_ptr + cid_node_id, mask = mask, other = 0)
@@ -513,12 +514,13 @@ def sum_layer_forward_compilation(nodes, fw_group_max_chs, n_group_ids, n_id_in_
         # Make the grid and launch kernel
         grid = lambda meta: (triton.cdiv(ns_num_edges, meta["BLOCK_SIZE"]),)
 
+        num_chs_np2 = triton.next_power_of_2(ns.num_chs)
         _assign_target_ncpids_kernel[grid](
             target_nids, nids_group_start, target_cids, pcids_group_start,
             target_pids, edge_ids, chs_offsets, n_group_ids, n_id_in_group, 
             cs_ele_id_start, cs_node_cum_ids, fw_group_max_chs, cum_n_chs, 
-            ns_param_ids, ch_n_pars, constexprs, ns.num_chs, add_params_flag, 
-            BLOCK_SIZE = 2048
+            ns_param_ids, ch_n_pars, constexprs, ns.num_chs, num_chs_np2, 
+            add_params_flag, BLOCK_SIZE = min(2048, 2**20 // num_chs_np2)
         )
 
         node_start += ns_num_nodes
@@ -698,7 +700,7 @@ def sum_layer_backward_compilation_legacy(nodes, pids, fw_n_group_ids, fw_n_id_i
 
 @triton.jit
 def _assign_global_eleids_kernel(global_ele_ids_ptr, cs_ele_id_start_ptr, cs_node_cum_ids_ptr, edge_ids_ptr, 
-                                 constexprs_ptr, num_chs: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+                                 constexprs_ptr, num_chs: tl.constexpr, num_chs_np2: tl.constexpr, BLOCK_SIZE: tl.constexpr):
 
     pid = tl.program_id(axis = 0)
     block_start = pid * BLOCK_SIZE
@@ -714,11 +716,12 @@ def _assign_global_eleids_kernel(global_ele_ids_ptr, cs_ele_id_start_ptr, cs_nod
     cid = tl.load(edge_ids_ptr + offsets + num_edges, mask = mask, other = 0)
 
     # Get the child ns index every `cid` belongs to and the cum nodes & global sid
-    cs_offsets = tl.arange(0, num_chs)
-    cs_node_cum_ids = tl.load(cs_node_cum_ids_ptr + cs_offsets)
+    cs_offsets = tl.arange(0, num_chs_np2)
+    cs_node_cum_ids = tl.load(cs_node_cum_ids_ptr + cs_offsets, mask = (cs_offsets < num_chs), other = 0)
     
-    cid_node_id = tl.sum(tl.broadcast_to(cid[:,None], (BLOCK_SIZE, num_chs)) >= \
-        tl.broadcast_to(cs_node_cum_ids[None,:], (BLOCK_SIZE, num_chs)), axis = 1) - 1
+    cid_node_id = tl.sum(tl.broadcast_to(cid[:,None], (BLOCK_SIZE, num_chs_np2)) >= \
+        tl.broadcast_to(cs_node_cum_ids[None,:], (BLOCK_SIZE, num_chs_np2)), axis = 1) - \
+        (1 + num_chs_np2 - num_chs)
 
     cs_cum_num = tl.load(cs_node_cum_ids_ptr + cid_node_id, mask = mask, other = 0)
     cs_ele_ind = tl.load(cs_ele_id_start_ptr + cid_node_id, mask = mask, other = 0)
@@ -878,9 +881,10 @@ def sum_layer_backward_compilation(nodes, pids, fw_n_group_ids, fw_n_id_in_group
         # Make the grid and launch kernel
         grid = lambda meta: (triton.cdiv(ns_num_edges, meta["BLOCK_SIZE"]),)
 
+        num_chs_np2 = triton.next_power_of_2(ns.num_chs)
         _assign_global_eleids_kernel[grid](
             global_ele_ids, cs_ele_id_start, cs_node_cum_ids, edge_ids, 
-            constexprs, ns.num_chs, BLOCK_SIZE = 2048
+            constexprs, ns.num_chs, num_chs_np2, BLOCK_SIZE = 2048
         )
 
         # [Recomputed] the child offset ids for every edge. That is, the `?` 
@@ -917,7 +921,7 @@ def sum_layer_backward_compilation(nodes, pids, fw_n_group_ids, fw_n_id_in_group
             target_parids, target_parpids, parids_group_start, flat_pids, pids_group_start,
             edge_ids, global_ele_ids, chs_offsets, par_offsets,
             fw_n_group_ids, fw_n_id_in_group, bk_n_group_ids, bk_n_id_in_group,
-            fw_group_max_chs, bk_group_max_pars, constexprs, BLOCK_SIZE = 2048
+            fw_group_max_chs, bk_group_max_pars, constexprs, BLOCK_SIZE = min(2048, 2**20 // num_chs_np2)
         )
 
         node_start = node_end

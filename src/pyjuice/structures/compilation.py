@@ -12,7 +12,8 @@ def BayesianTreeToHiddenRegionGraph(tree: nx.Graph,
                                     root,
                                     num_latents: int,  
                                     InputDist: Type[Distribution], 
-                                    dist_params: dict) -> RegionGraph:
+                                    dist_params: dict,
+                                    num_root_ns: int = 1) -> RegionGraph:
     """
     Given a Tree Bayesian Network tree T1 (i.e. at most one parents), 
     
@@ -62,13 +63,9 @@ def BayesianTreeToHiddenRegionGraph(tree: nx.Graph,
             rp = multiply(*ch_regions)
 
             if v == root:
-                par_ids = torch.zeros([num_latents], dtype = torch.int64)
-                chs_ids = torch.arange(0, num_latents)
-                r = summate(rp, num_nodes = 1, edge_ids = torch.stack((par_ids, chs_ids), dim = 0))
+                r = summate(rp, num_nodes = num_root_ns)
             else:
-                par_ids = torch.arange(0, num_latents).view(-1, 1).repeat(1, num_latents).reshape(-1)
-                chs_ids = torch.arange(0, num_latents).view(1, -1).repeat(num_latents, 1).reshape(-1)
-                r = summate(rp, num_nodes = num_latents, edge_ids = torch.stack((par_ids, chs_ids), dim = 0))
+                r = summate(rp, num_nodes = num_latents)
 
             var2rnode[v] = r
 

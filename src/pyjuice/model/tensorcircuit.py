@@ -261,6 +261,10 @@ class TensorCircuit(nn.Module):
                 self.element_flows.size(1) != B or self.element_flows.device != self.device:
             self.element_flows = torch.zeros([self.num_elements, B], device = self.device)
 
+        # Clear node flows
+        self.node_flows[:,:] = 0.0
+
+        # Set root node flows
         if ll_weights is None:
             self.node_flows[self._root_node_range[0]:self._root_node_range[1],:] = 1.0
         else:
@@ -464,6 +468,14 @@ class TensorCircuit(nn.Module):
             layer.update_parameters()
 
         return None
+
+    def print_statistics(self):
+        """
+        Print the statistics of the PC.
+        """
+        print(f"> Number of nodes: {self.num_nodes}")
+        print(f"> Number of edges: {self.num_edges}")
+        print(f"> Number of sum parameters: {self.num_sum_params}")
 
     def copy_param_flows(self, clone_param_flows: bool = True, target_name: str = "_scores"):
         param_flows = self.param_flows.detach().cpu()
@@ -676,14 +688,23 @@ class TensorCircuit(nn.Module):
                 if depth not in depth2nodes:
                     depth2nodes[depth] = {"sum": [], "prod": []} # lists for sum and product nodes
                 
-                if ns.is_prod():
-                    depth2nodes[depth]["prod"].append(ns)
-                elif ns.is_sum():
+                if ns.is_sum():
                     depth2nodes[depth]["sum"].append(ns)
-                else:
+                elif not ns.is_prod():
                     raise NotImplementedError(f"Unsupported node type {type(n)}.")
 
         dfs(self.root_nodes)
+
+        pns2layer = dict()
+        for layer in range(1, len(depth2nodes)):
+            for ns in depth2nodes[layer]["sum"]:
+                for cs in ns.chs:
+                    if cs.is_prod():
+                        if id(cs) in pns2layer:
+                            assert pns2layer[id(cs)] == layer, "Disallowed circumstance: a product node requested by sum nodes at different layers."
+                        else:
+                            depth2nodes[layer]["prod"].append(cs)
+                            pns2layer[id(cs)] = layer
 
         return depth2nodes, num_layers[0]
 

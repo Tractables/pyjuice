@@ -147,7 +147,7 @@ class ProdLayer(Layer, nn.Module):
                 cids = self.grouped_cids[group_id]
                 local_ids = self.fw_group_local_ids[group_id]
 
-                self._forward_backward(element_mars, node_mars, nids, cids, local_ids = local_ids)
+                self._forward_backward(element_mars, node_mars, nids, cids, local_ids = local_ids, accum = False)
 
         elif _for_backward and self.provided("bk_fw_group_local_ids"):
             # Partial evaluation (for backward pass)
@@ -156,7 +156,7 @@ class ProdLayer(Layer, nn.Module):
                 cids = self.grouped_cids[group_id]
                 local_ids = self.bk_fw_group_local_ids[group_id]
 
-                self._forward_backward(element_mars, node_mars, nids, cids, local_ids = local_ids)
+                self._forward_backward(element_mars, node_mars, nids, cids, local_ids = local_ids, accum = False)
 
         else:
             # Evaluate the whole layer
@@ -164,7 +164,7 @@ class ProdLayer(Layer, nn.Module):
                 nids = self.grouped_nids[group_id]
                 cids = self.grouped_cids[group_id]
 
-                self._forward_backward(element_mars, node_mars, nids, cids)
+                self._forward_backward(element_mars, node_mars, nids, cids, accum = False)
 
         return None
 
@@ -186,7 +186,7 @@ class ProdLayer(Layer, nn.Module):
                 u_cids = self.grouped_u_cids[group_id]
                 parids = self.grouped_parids[group_id]
 
-                self._forward_backward(node_flows, element_flows, u_cids, parids)
+                self._forward_backward(node_flows, element_flows, u_cids, parids, accum = True)
         
         else:
             # Partial evaluation
@@ -195,7 +195,7 @@ class ProdLayer(Layer, nn.Module):
                 parids = self.grouped_parids[group_id]
                 local_ids = self.bk_group_local_ids[group_id]
 
-                self._forward_backward(node_flows, element_flows, u_cids, parids, local_ids = local_ids)
+                self._forward_backward(node_flows, element_flows, u_cids, parids, local_ids = local_ids, accum = True)
         
         return None
 
@@ -220,7 +220,8 @@ class ProdLayer(Layer, nn.Module):
     @triton.jit
     def _forward_backward_kernel(node_vals_ptr, element_vals_ptr, nids_ptr, cids_ptr, tot_n_nodes, 
                                  tot_n_eles, n_nodes, n_edges: tl.constexpr, batch_size,
-                                 n_nodes_per_block_m: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+                                 n_nodes_per_block_m: tl.constexpr, BLOCK_M: tl.constexpr, 
+                                 BLOCK_N: tl.constexpr, accum: tl.constexpr):
 
         # We use BLOCK_M to index over edges, and BLOCK_N to index over batches
         pid0 = tl.program_id(axis = 0)
@@ -260,20 +261,28 @@ class ProdLayer(Layer, nn.Module):
             tl.broadcast_to(b_offsets[:,None], (BLOCK_N, n_nodes_per_block_m))
         nmar_mask = tl.broadcast_to(nid_mask[None,:], (BLOCK_N, n_nodes_per_block_m)) & \
             tl.broadcast_to(b_mask[:,None], (BLOCK_N, n_nodes_per_block_m))
+
+        # Accumulate the `node_vals`` if required
+        if accum == 1:
+            node_vals = tl.load(node_vals_ptr + nmar_offsets, mask = nmar_mask, other = 0)
+            n_logps += node_vals
         
         tl.store(node_vals_ptr + nmar_offsets, n_logps, mask = nmar_mask)
 
     @staticmethod
     @torch.compile(mode = "reduce-overhead", fullgraph = True)
-    def _forward_backward_pytorch(node_vals, element_vals, nids, cids):
-        node_vals[nids] = element_vals[cids].sum(dim = 1)
+    def _forward_backward_pytorch(node_vals, element_vals, nids, cids, accum: bool = False):
+        if accum:
+            node_vals[nids] += element_vals[cids].sum(dim = 1)
+        else:
+            node_vals[nids] = element_vals[cids].sum(dim = 1)
 
         return None
 
     def _forward_backward(self, node_vals: torch.Tensor, element_vals: torch.Tensor, 
                           nids: torch.Tensor, cids: torch.Tensor, local_ids: Optional[torch.Tensor] = None,
-                          BLOCK_M_HARD_LIMIT = 2**16,
-                          BLOCK_SIZE = 2**12, MAX_BLOCK_M = 512, MAX_BLOCK_N = 64) -> None:
+                          BLOCK_M_HARD_LIMIT = 2**16, BLOCK_SIZE = 2**12, MAX_BLOCK_M = 512, 
+                          MAX_BLOCK_N = 64, accum: bool = False) -> None:
         """
         This function is equivalent to running:
         ``` node_vals[nids] = element_vals[cids].sum(dim = 1) ```
@@ -332,7 +341,8 @@ class ProdLayer(Layer, nn.Module):
             batch_size = batch_size,
             n_nodes_per_block_m = BLOCK_M // n_edges,
             BLOCK_M = BLOCK_M, 
-            BLOCK_N = BLOCK_N
+            BLOCK_N = BLOCK_N,
+            accum = 1 if accum else 0
         )
 
         return None

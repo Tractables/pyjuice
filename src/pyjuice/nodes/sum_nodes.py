@@ -47,7 +47,7 @@ class SumNodes(CircuitNodes):
             assert isinstance(ns, CircuitNodes)
             chs.append(ns)
 
-        if chs is None:
+        if len(chs) == 0:
             chs = self.chs
         else:
             assert self.num_chs == len(chs), f"Number of new children ({len(chs)}) must match the number of original children ({self.num_chs})."
