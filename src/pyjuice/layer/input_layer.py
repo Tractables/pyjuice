@@ -11,6 +11,7 @@ import inspect
 import random
 from typing import Sequence, Dict
 from triton.runtime.jit import JITFunction
+from copy import deepcopy
 
 from pyjuice.nodes import InputNodes
 from pyjuice.utils.grad_fns import ReverseGrad
@@ -400,6 +401,14 @@ class InputLayer(Layer, nn.Module):
         if backward:
             self.bk_local_ids = None
 
+    def update_parameters(self):
+        for idx, ns in enumerate(self.nodes):
+            if ns.is_tied():
+                continue
+
+            par_start, par_end = ns._param_range
+            ns._params = self.params.data[par_start:par_end].detach().cpu().clone()
+
     def _prepare_scope2nids(self):
         if not hasattr(self, "scope2localids"):
             scope2localids = dict()
@@ -483,7 +492,7 @@ class InputLayer(Layer, nn.Module):
         local_offsets = (offsets // batch_size)
 
         if partial_eval > 0:
-            local_offsets = tl.load(fw_local_ids + local_offsets, mask = mask, other = 0)
+            local_offsets = tl.load(fw_local_ids_ptr + local_offsets, mask = mask, other = 0)
 
         if num_vars_per_node == 1:
             # Get all variable ids
@@ -525,7 +534,7 @@ class InputLayer(Layer, nn.Module):
         local_offsets = (offsets // batch_size)
 
         if partial_eval > 0:
-            local_offsets = tl.load(fw_local_ids + local_offsets, mask = mask, other = 0)
+            local_offsets = tl.load(bk_local_ids_ptr + local_offsets, mask = mask, other = 0)
 
         if num_vars_per_node == 1:
             # Get all variable ids

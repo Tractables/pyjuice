@@ -54,10 +54,9 @@ class InputNodes(CircuitNodes):
         if self._params is None:
             return None
         else:
-            return self.dist.raw2processed_params(self.num_nodes, self._params)
+            return self._params
 
     def set_params(self, params: torch.Tensor, normalize: bool = True):
-        params = self.dist.processed2raw_params(self.num_nodes, params, normalize = normalize)
         self._params = params
 
     def init_parameters(self, perturbation: float = 2.0, recursive: bool = True, 

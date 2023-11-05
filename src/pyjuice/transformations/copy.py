@@ -35,7 +35,7 @@ def deepcopy(root_nodes: CircuitNodes, tie_params: bool = False,
                 )
                 params = ns.get_params()
                 if params is not None:
-                    new_ns.set_params(params.clone())
+                    new_ns.set_params(params.clone(), normalize = False)
             else:
                 new_ns = ns.duplicate(*new_chs, tie_params = True)
             
@@ -67,7 +67,7 @@ def deepcopy(root_nodes: CircuitNodes, tie_params: bool = False,
                 )
                 params = ns.get_params()
                 if params is not None:
-                    new_ns.set_params(params.clone())
+                    new_ns.set_params(params.clone(), normalize = False)
             else:
                 new_ns = ns.duplicate(scope = scope, tie_params = True)
 
