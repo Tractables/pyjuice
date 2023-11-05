@@ -70,6 +70,7 @@ class InputLayer(Layer, nn.Module):
         # Store the triton kernel functions implemented by the target `Distribution`
         self.fw_mar_fn = self.nodes[0].dist.fw_mar_fn
         self.bk_flow_fn = self.nodes[0].dist.bk_flow_fn
+        self.sample_fn = self.nodes[0].dist.sample_fn
         self.em_fn = self.nodes[0].dist.em_fn
 
         ## Prepair and compile the layer ##
@@ -271,8 +272,53 @@ class InputLayer(Layer, nn.Module):
         else:
             raise NotImplementedError("CPU backward fn for input nodes is not implemented.")
 
-    def sample(self, *args, **kwargs):
-        raise NotImplementedError()
+    def sample(self, samples: torch.Tensor, node_flows: torch.Tensor, missing_mask: Optional[torch.Tensor] = None, 
+               params: Optional[torch.Tensor] = None, seed: Optional[int] = None):
+        """
+        samples:       [num_vars, B]
+        missing_mask:  [num_vars, B] or [num_vars] or None
+        node_flows:    [num_nodes, B]
+        """
+
+        if params is None:
+            params = self.params
+        else:
+            params = params["params"]
+
+        assert params.dim() == 1
+
+        if "cuda" in self.device.type:
+
+            sid, eid = self._output_ind_range
+            tot_num_nodes = node_flows.size(0)
+            batch_size = node_flows.size(1)
+            node_offset = self._output_ind_range[0]
+
+            # Get all node ids with non-zero flow
+            nflow_xids, nflow_yids = torch.where(node_flows[sid:eid,:])
+            num_activ_nodes = nflow_xids.size(0)
+
+            if not self.provided("_sample_kernel"):
+                self._sample_kernel = self._compile_triton_kernel(self._sample_kernel_template, sample_fn = self.sample_fn)
+
+            grid = lambda meta: (triton.cdiv(num_activ_nodes, meta['BLOCK_SIZE']),)
+            self._sample_kernel[grid](
+                samples_ptr = samples, 
+                params_ptr = params,
+                nflow_xids_ptr = nflow_xids, 
+                nflow_yids_ptr = nflow_yids, 
+                vids_ptr = self.vids, 
+                s_pids_ptr = self.s_pids, 
+                metadata_ptr = self.metadata,
+                s_mids_ptr = self.s_mids,
+                num_activ_nodes = num_activ_nodes, 
+                batch_size = batch_size, 
+                BLOCK_SIZE = 2048
+                seed = seed if seed is not None else random.randint(0, 1e8)
+            )
+
+        else:
+            raise NotImplementedError("CPU sample fn for input nodes is not implemented.")
 
     def mini_batch_em(self, step_size: float, pseudocount: float = 0.0):
         if not self._used_external_params:
@@ -506,6 +552,35 @@ class InputLayer(Layer, nn.Module):
 
         flow_fn(local_offsets, data, flows, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
                 metadata, mask, num_vars_per_node, BLOCK_SIZE)
+
+    @staticmethod
+    def _sample_kernel_template(sample_fn, samples_ptr, params_ptr, nflow_xids_ptr, nflow_yids_ptr, vids_ptr, s_pids_ptr, metadata_ptr, s_mids_ptr,
+                                seed, num_activ_nodes: tl.constexpr, batch_size: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(axis = 0)
+        block_start = pid * BLOCK_SIZE
+
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < num_activ_nodes
+
+        # Raw batch and (local) node id
+        local_offsets = tl.load(nflow_xids_ptr + offsets, mask = mask, other = 0)
+        batch_offsets = tl.load(nflow_yids_ptr + offsets, mask = mask, other = 0)
+
+        # Get all variable ids
+        if num_vars_per_node == 1:
+            vids = tl.load(vids_ptr + local_offsets, mask = mask, other = 0)
+        else:
+            # Get all variable ids
+            vids_offsets = tl.broadcast_to(local_offsets[:,None], (BLOCK_SIZE, nv_block_size)) * num_vars_per_node + \
+                tl.broadcast_to(tl.arange(0, nv_block_size)[None,:], (BLOCK_SIZE, nv_block_size))
+            vids_mask = tl.broadcast_to(mask[:,None], (BLOCK_SIZE, nv_block_size)) & \
+                tl.broadcast_to((tl.arange(0, nv_block_size) < num_vars_per_node)[None,:], (BLOCK_SIZE, nv_block_size))
+            vids = tl.load(vids_ptr + vids_offsets, mask = vids_mask, other = 0)
+
+        # Get start parameter indices
+        s_pids = tl.load(s_pids_ptr + local_offsets, mask = mask, other = 0)
+
+        sample_fn(samples_ptr, local_offsets, batch_offsets, vids, s_pids, params_ptr, metadata_ptr, s_mids_ptr, batch_size, BLOCK_SIZE, seed)
 
     @staticmethod
     def _em_kernel_template(em_fn, params_ptr, param_flows_ptr, s_pids_ptr, s_pfids_ptr, metadata_ptr, s_mids_ptr,

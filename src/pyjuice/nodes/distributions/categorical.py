@@ -56,6 +56,33 @@ class Categorical(Distribution):
         tl.atomic_add(param_flows_ptr + pf_offsets, flows, mask = mask)
 
     @staticmethod
+    def sample_fn(samples_ptr, local_offsets, batch_offsets, vids, s_pids, params_ptr, metadata_ptr, s_mids_ptr, batch_size, BLOCK_SIZE, seed):
+        # Get `num_cats` from `metadata`
+        s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
+        num_cats = tl.load(metadata_ptr + s_mids, mask = mask, other = 0).to(tl.int64)
+
+        max_num_cats = tl.max(num_cats, axis = 0)
+
+        rnd_val = tl.rand(seed, tl.arange(0, BLOCK_SIZE))
+        sampled_id = tl.zeros([BLOCK_SIZE], dtype = tl.int64) - 1
+
+        # Sample by computing cumulative probability
+        cum_param = tl.zeros([BLOCK_SIZE], dtype = tl.float32)
+        for cat_id in range(max_num_cats):
+            cat_mask = mask & (cat_id < num_cats)
+
+            param = rl.load(params_ptr + s_pids + cat_id, mask = cat_mask, other = 0)
+            cum_param += param
+
+            sampled_id = tl.where((cum_param >= rnd_val) & (sampled_id == -1), cat_id, sampled_id)
+
+        sampled_id = tl.where((sampled_id == -1), 0, sampled_id)
+
+        # Write back to `samples`
+        sample_offsets = vids * batch_size + batch_offsets
+        tl.store(samples_ptr + sample_offsets, sampled_id, mask = mask)
+
+    @staticmethod
     def em_fn(local_offsets, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, s_mids_ptr, mask,
               step_size, pseudocount, BLOCK_SIZE):
         # Get `num_cats` from `metadata`
