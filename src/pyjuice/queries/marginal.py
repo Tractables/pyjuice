@@ -8,7 +8,6 @@ from functools import partial
 
 from pyjuice.nodes import CircuitNodes
 from pyjuice.model import TensorCircuit
-from pyjuice.layer.input_layers import CategoricalLayer
 from .base import query
 from .conditional import _conditional_fw_input_fn
 

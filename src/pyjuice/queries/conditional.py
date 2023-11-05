@@ -8,7 +8,6 @@ from functools import partial
 
 from pyjuice.nodes import CircuitNodes
 from pyjuice.model import TensorCircuit
-from pyjuice.layer.input_layers import CategoricalLayer
 from pyjuice.nodes.methods import get_subsumed_scopes
 from pyjuice.utils import BitSet
 from .base import query
@@ -186,7 +185,7 @@ def _categorical_forward(layer, node_mars: torch.Tensor,
         node_mars[sid:eid,:] = node_mars[sid:eid,:].clip(max = 0.0)
 
     else:
-        raise NotImplementedError("Unknown method to compute the forward pass for `CategoricalLayer`.")
+        raise NotImplementedError("Unknown method to compute the forward pass for `Categorical`.")
 
     return None
 
