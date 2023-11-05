@@ -60,11 +60,23 @@ class InputNodes(CircuitNodes):
         params = self.dist.processed2raw_params(self.num_nodes, params, normalize = normalize)
         self._params = params
 
-    def init_parameters(self, perturbation: float = 2.0, recursive: bool = True, is_root: bool = True, **kwargs):
-        if self._source_node is None and (not hasattr(self, "_params") or self._params is None):
+    def init_parameters(self, perturbation: float = 2.0, recursive: bool = True, 
+                        is_root: bool = True, ret_params: bool = False, **kwargs):
+        if not self.is_tied() and (not hasattr(self, "_params") or self._params is None):
             self._params = self.dist.init_parameters(
                 num_nodes = self.num_nodes,
                 perturbation = perturbation,
-                is_root = is_root,
+                **kwargs
+            )
+
+            if ret_params:
+                return self._params
+
+        elif self.is_tied() and ret_params:
+            return self.get_source_ns().init_parameters(
+                perturbation = perturbation,
+                recursive = False,
+                is_root = True,
+                ret_params = True,
                 **kwargs
             )

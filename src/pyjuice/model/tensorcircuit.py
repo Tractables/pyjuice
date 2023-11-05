@@ -10,7 +10,7 @@ from functools import partial
 from typing import Optional, Sequence, Callable, Union
 
 from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes, foreach
-from pyjuice.layer import Layer, InputLayer, ProdLayer, SumLayer, layerize
+from pyjuice.layer import Layer, InputLayer, ProdLayer, SumLayer
 from pyjuice.functional import normalize_parameters, flat_softmax_fw, flat_softmax_bp
 from pyjuice.utils.grad_fns import ReverseGrad, PseudoHookFunc
 from pyjuice.utils import BitSet
@@ -340,8 +340,6 @@ class TensorCircuit(nn.Module):
                 if "external_input_layers" in self._backward_buffer and idx in self._backward_buffer["external_input_layers"]:
                     grad_hook_idx = layer._hook_param_grads(grad_hook_idx, self._inputs, self._inputs_grad)
 
-                layer._hook_input_grads(self._inputs, self._inputs_grad)
-
             if self._inputs[1] is not None:
                 B = self._inputs[0].size(0)
 
@@ -558,7 +556,7 @@ class TensorCircuit(nn.Module):
                 type2nodes = self._categorize_input_nodes(depth2nodes[0]["input"])
                 input_layer_id = 0
                 for NodeType, nodes in type2nodes.items():
-                    input_layer = NodeType(nodes = nodes, cum_nodes = num_nodes)
+                    input_layer = InputLayer(nodes = nodes, cum_nodes = num_nodes)
 
                     num_nodes += input_layer.num_nodes
                     self.input_layers.append(input_layer)
@@ -636,9 +634,9 @@ class TensorCircuit(nn.Module):
         self._root_node_range = (self.num_nodes - self.num_root_nodes, self.num_nodes)
 
         # Initialize parameters
-        self._init_params()
+        self._init_parameters()
 
-    def _init_params(self, perturbation: float = 4.0, pseudocount: float = 1e-6):
+    def _init_parameters(self, perturbation: float = 4.0, pseudocount: float = 1e-6):
         params = torch.exp(torch.rand([self.num_sum_params]) * -perturbation)
 
         # Copy initial parameters if provided
@@ -657,7 +655,7 @@ class TensorCircuit(nn.Module):
         self.params.requires_grad = False
 
         for idx, layer in enumerate(self.input_layers):
-            layer._init_params(perturbation)
+            layer._init_parameters(perturbation)
 
     def _normalize_parameters(self, params, pseudocount: float = 0.0):
         if params is not None:
@@ -711,7 +709,7 @@ class TensorCircuit(nn.Module):
     def _categorize_input_nodes(self, nodes: Sequence[InputNodes]):
         type2nodes = dict()
         for ns in nodes:
-            ltype = layerize(ns.dist)
+            ltype = ns.dist.get_signature()
             if ltype not in type2nodes:
                 type2nodes[ltype] = []
             type2nodes[ltype].append(ns)
