@@ -271,67 +271,6 @@ class InputLayer(Layer, nn.Module):
         else:
             raise NotImplementedError("CPU backward fn for input nodes is not implemented.")
 
-    def backward1(self, data: torch.Tensor, node_flows: torch.Tensor, 
-                 node_mars: torch.Tensor, params: Optional[Dict] = None):
-        """
-        data: [num_vars, B]
-        node_flows: [num_nodes, B]
-        node_mars: [num_nodes, B]
-        """
-
-        if not self.provided("bk_local_ids"):
-            # Evaluate the whole layer
-            layer_num_nodes = self._output_ind_range[1] - self._output_ind_range[0]
-            tot_num_nodes = node_flows.size(0)
-            batch_size = node_flows.size(1)
-            node_offset = self._output_ind_range[0]
-
-            if self.device.type == "cuda":
-                param_ids = data[self.vids[:,0]] + self.s_pids.unsqueeze(1)
-                
-                grid = lambda meta: (triton.cdiv(layer_num_nodes * batch_size, meta['BLOCK_SIZE']),)
-                
-                self._flows_kernel2[grid](self.param_flows, node_flows, param_ids, layer_num_nodes, tot_num_nodes, batch_size, node_offset, BLOCK_SIZE = 1024)
-            else:
-                sid, eid = self._output_ind_range[0], self._output_ind_range[1]
-
-                data = data.cpu()
-                param_ids = data[self.vids[:,0]] + self.s_pids.unsqueeze(1)
-
-                for i in range(data.size(1)):
-                    self.param_flows[param_ids[:,i]] += node_flows[sid:eid,i].cpu()
-
-        else:
-            # Partial evaluation
-            local_ids = self.bk_local_ids
-            layer_num_nodes = local_ids.size(0)
-            tot_num_nodes = node_flows.size(0)
-            batch_size = node_flows.size(1)
-            node_offset = self._output_ind_range[0]
-
-            param_ids = data[self.vids[local_ids,0]] + self.psids[local_ids].unsqueeze(1)
-
-            grid = lambda meta: (triton.cdiv(layer_num_nodes * batch_size, meta["BLOCK_SIZE"]),)
-
-            self._partial_flows_kernel[grid](self.param_flows, node_flows, param_ids, local_ids, layer_num_nodes, tot_num_nodes, batch_size, node_offset, BLOCK_SIZE = 1024)
-        
-        return None
-
-    @staticmethod
-    @triton.jit
-    def _flows_kernel2(param_flows_ptr, node_flows_ptr, param_ids_ptr, layer_num_nodes, tot_num_nodes, batch_size, node_offset, BLOCK_SIZE: tl.constexpr):
-        pid = tl.program_id(axis = 0)
-        block_start = pid * BLOCK_SIZE
-
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < layer_num_nodes * batch_size
-
-        nf_offsets = batch_size * node_offset + offsets
-        pr_offsets = tl.load(param_ids_ptr + offsets, mask = mask, other = 0)
-
-        nflow = tl.load(node_flows_ptr + nf_offsets, mask = mask, other = 0)
-        tl.atomic_add(param_flows_ptr + pr_offsets, nflow, mask = mask)
-
     def sample(self, *args, **kwargs):
         raise NotImplementedError()
 
