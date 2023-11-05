@@ -749,6 +749,8 @@ class InputLayer(Layer, nn.Module):
                     base_indent_len = len(sub_fns[sub_fn_name][1][0]) - len(sub_fns[sub_fn_name][1][0].lstrip())
                     for fn_line in sub_fns[sub_fn_name][1]:
                         fn_line = indent + fn_line[base_indent_len:]
+                        if fn_line.split("#")[0].strip(" ") == "pass":
+                            continue
                         for k, v in var_mapping.items():
                             fn_line = fn_line.replace(k, v)
                         if "return" in fn_line and len(target_var) > 0:
