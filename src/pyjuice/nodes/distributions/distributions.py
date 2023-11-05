@@ -45,6 +45,12 @@ class Distribution():
         raise NotImplementedError()
 
     @staticmethod
+    def sample_fn(*args, **kwargs):
+        """
+        """
+        raise NotImplementedError()
+
+    @staticmethod
     def em_fn(*args, **kwargs):
         """
         """
