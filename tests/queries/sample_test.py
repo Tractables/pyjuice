@@ -20,8 +20,8 @@ def simple_sample_test():
     ms = multiply(ni0, ni1)
     ns = summate(ms, num_nodes = 1)
 
-    ni0.set_params(torch.tensor([[0.99, 0.005, 0.005], [0.0, 0.5, 0.5]]))
-    ni1.set_params(torch.tensor([[0.0, 0.5, 0.5, 0.0], [1.0, 0.0, 0.0, 0.0]]))
+    ni0.set_params(torch.tensor([[0.99, 0.005, 0.005], [0.02, 0.49, 0.49]]).reshape(-1))
+    ni1.set_params(torch.tensor([[0.0, 0.5, 0.5, 0.0], [1.0, 0.0, 0.0, 0.0]]).reshape(-1))
 
     ns.set_params(torch.tensor([0.5, 0.5]))
 
@@ -33,10 +33,10 @@ def simple_sample_test():
     missing_mask = torch.tensor([False, True], device = device)
 
     samples = juice.queries.sample(pc, data, missing_mask)
-
+    
     assert (samples[:500,1] == 1).sum() > 200
     assert (samples[:500,1] == 2).sum() > 200
-    assert (samples[500:,1] == 0).sum() > 490
+    assert (samples[500:,1] == 0).sum() > 475
 
 
 def hmm_sample_test():
@@ -63,7 +63,7 @@ def hmm_sample_test():
     gamma = torch.zeros([num_latents])
     gamma[:] = 1.0 / num_latents
 
-    ns_input = juice.inputs(num_vars - 1, num_latents, dists.Categorical(num_cats = num_cats), params = beta)
+    ns_input = juice.inputs(num_vars - 1, num_latents, dists.Categorical(num_cats = num_cats), params = beta.reshape(-1))
     ns_sum = None
 
     curr_zs = ns_input

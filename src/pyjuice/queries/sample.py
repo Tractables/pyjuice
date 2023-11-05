@@ -90,7 +90,7 @@ def sample(pc: TensorCircuit, inputs: torch.Tensor, missing_mask: Optional[torch
 
     ## Run backward pass ##
 
-    samples = inputs.clone().permute(1, 0)
+    samples = inputs.clone().permute(1, 0).contiguous()
     
     # Initialize buffers
     node_flows = torch.zeros([pc.num_nodes, pc.node_mars.size(1)], device = pc.device, dtype = torch.bool)
@@ -116,5 +116,10 @@ def sample(pc: TensorCircuit, inputs: torch.Tensor, missing_mask: Optional[torch
             
         for idx, layer in enumerate(pc.input_layers):
             layer.sample(samples, node_flows, missing_mask)
+
+        if missing_mask.dim() == 1:
+            samples[~missing_mask,:] = inputs.permute(1, 0)[~missing_mask,:]
+        else:
+            samples[~missing_mask] = inputs.permute(1, 0)[~missing_mask]
 
     return samples.permute(1, 0)

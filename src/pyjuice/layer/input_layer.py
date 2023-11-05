@@ -67,6 +67,7 @@ class InputLayer(Layer, nn.Module):
         self.num_params = cum_params
         self.num_param_flows = cum_param_flows
         self.num_nodes = layer_num_nodes
+        self.dist_signature = dist_signature
 
         # Store the triton kernel functions implemented by the target `Distribution`
         self.fw_mar_fn = self.nodes[0].dist.fw_mar_fn
@@ -166,7 +167,8 @@ class InputLayer(Layer, nn.Module):
 
         return None
 
-    def forward(self, data: torch.Tensor, node_mars: torch.Tensor, params: Optional[Dict] = None):
+    def forward(self, data: torch.Tensor, node_mars: torch.Tensor, params: Optional[Dict] = None,
+                missing_mask: Optional[torch.Tensor] = None):
         self._used_external_params = (params is not None)
 
         if params is None:
@@ -178,7 +180,7 @@ class InputLayer(Layer, nn.Module):
 
         if "cuda" in self.device.type:
             # Need to flatten data to ensure the memory is aligned following [num_vars, batch_size]
-            data = data.reshape(-1)
+            data = data.reshape(-1).contiguous()
 
             tot_num_nodes = node_mars.size(0)
             batch_size = node_mars.size(1)
@@ -213,6 +215,26 @@ class InputLayer(Layer, nn.Module):
                 partial_eval = 1 if fw_local_ids is not None else 0
             )
 
+            # Apply missing mask if required
+            if missing_mask is not None:
+                assert self.num_vars_per_node == 1, "`missing_mask` only supported for univariate distributions."
+
+                mask_dim = missing_mask.dim()
+
+                grid = lambda meta: (triton.cdiv(layer_num_nodes * batch_size, meta['BLOCK_SIZE']),)
+                self._fw_missing_mask_kernel[grid](
+                    missing_mask_ptr = missing_mask,
+                    node_mars_ptr = node_mars, 
+                    vids_ptr = self.vids, 
+                    fw_local_ids_ptr = fw_local_ids,
+                    layer_num_nodes = layer_num_nodes, 
+                    batch_size = batch_size, 
+                    node_offset = node_offset, 
+                    BLOCK_SIZE = 1024, 
+                    partial_eval = 1 if fw_local_ids is not None else 0,
+                    mask_dim = mask_dim
+                )
+
         else:
             raise NotImplementedError("CPU forward fn for input nodes is not implemented.")
 
@@ -233,7 +255,7 @@ class InputLayer(Layer, nn.Module):
 
         if "cuda" in self.device.type:
             # Need to flatten data to ensure the memory is aligned following [num_vars, batch_size]
-            data = data.reshape(-1)
+            data = data.reshape(-1).contiguous()
 
             tot_num_nodes = node_flows.size(0)
             batch_size = node_flows.size(1)
@@ -313,6 +335,8 @@ class InputLayer(Layer, nn.Module):
                 metadata_ptr = self.metadata,
                 s_mids_ptr = self.s_mids,
                 num_activ_nodes = num_activ_nodes, 
+                num_vars_per_node = self.num_vars_per_node, 
+                nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
                 batch_size = batch_size, 
                 BLOCK_SIZE = 2048,
                 seed = seed if seed is not None else random.randint(0, 1e8)
@@ -519,6 +543,40 @@ class InputLayer(Layer, nn.Module):
         tl.store(node_mars_ptr + node_offsets * batch_size + batch_offsets, mars, mask = mask)
 
     @staticmethod
+    @triton.jit
+    def _fw_missing_mask_kernel(missing_mask_ptr, node_mars_ptr, vids_ptr, fw_local_ids_ptr, layer_num_nodes: tl.constexpr, 
+                                batch_size: tl.constexpr, node_offset: tl.constexpr, BLOCK_SIZE: tl.constexpr, 
+                                partial_eval: tl.constexpr, mask_dim: tl.constexpr):
+        pid = tl.program_id(axis = 0)
+        block_start = pid * BLOCK_SIZE
+
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < layer_num_nodes * batch_size
+
+        # Raw batch and (local) node id
+        batch_offsets = (offsets % batch_size)
+        local_offsets = (offsets // batch_size)
+
+        if partial_eval > 0:
+            local_offsets = tl.load(fw_local_ids_ptr + local_offsets, mask = mask, other = 0)
+
+        # Get all variable ids
+        vids = tl.load(vids_ptr + local_offsets, mask = mask, other = 0)
+
+        # Fetch mask
+        if mask_dim == 1:
+            missing_mask = tl.load(missing_mask_ptr + vids, mask = mask, other = False)
+        else:
+            mask_offsets = vids * batch_size + batch_offsets
+            missing_mask = tl.load(missing_mask_ptr + mask_offsets, mask = mask, other = False)
+
+        # Apply mask
+        node_offsets = (local_offsets + node_offset) * batch_size + batch_offsets
+        mars = tl.load(node_mars_ptr + node_offsets, mask = mask, other = 0.0)
+        mars = tl.where(missing_mask, 0.0, mars)
+        tl.store(node_mars_ptr + node_offsets, mars, mask = mask)
+
+    @staticmethod
     def _flows_kernel_template(flow_fn, params_ptr, param_flows_ptr, node_flows_ptr, data_ptr, vids_ptr, s_pids_ptr, s_pfids_ptr,
                                metadata_ptr, s_mids_ptr, bk_local_ids_ptr, partial_eval: tl.constexpr, layer_num_nodes: tl.constexpr, 
                                batch_size: tl.constexpr, num_vars_per_node: tl.constexpr, nv_block_size: tl.constexpr, node_offset: tl.constexpr, 
@@ -564,7 +622,8 @@ class InputLayer(Layer, nn.Module):
 
     @staticmethod
     def _sample_kernel_template(sample_fn, samples_ptr, params_ptr, nflow_xids_ptr, nflow_yids_ptr, vids_ptr, s_pids_ptr, metadata_ptr, s_mids_ptr,
-                                seed, num_activ_nodes: tl.constexpr, batch_size: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+                                seed, num_vars_per_node: tl.constexpr, nv_block_size: tl.constexpr, num_activ_nodes: tl.constexpr, 
+                                batch_size: tl.constexpr, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(axis = 0)
         block_start = pid * BLOCK_SIZE
 

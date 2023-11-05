@@ -71,7 +71,7 @@ class Categorical(Distribution):
         for cat_id in range(max_num_cats):
             cat_mask = mask & (cat_id < num_cats)
 
-            param = rl.load(params_ptr + s_pids + cat_id, mask = cat_mask, other = 0)
+            param = tl.load(params_ptr + s_pids + cat_id, mask = cat_mask, other = 0)
             cum_param += param
 
             sampled_id = tl.where((cum_param >= rnd_val) & (sampled_id == -1), cat_id, sampled_id)

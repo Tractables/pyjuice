@@ -63,6 +63,65 @@ def _soft_evi_categorical_fw_kernel(data_ptr, node_mars_ptr, params_ptr, vids_pt
         tl.store(node_mars_ptr + global_nid * batch_size + batch_offsets, tl.log(node_vals), mask = mask)
 
 
+@torch.compile(mode = "default", fullgraph = False)
+def _cat_forward_gpu(self, data: torch.Tensor, node_mars: torch.Tensor, params: torch.Tensor, 
+                    missing_mask: Optional[torch.Tensor] = None, local_ids: Optional[torch.Tensor] = None):
+
+    sid, eid = self._output_ind_range[0], self._output_ind_range[1]
+
+    if local_ids is None:
+        param_idxs = data[self.vids[:,0]] + self.s_pids.unsqueeze(1)
+        node_mars[sid:eid,:] = ((params[param_idxs]).clamp(min=1e-10)).log()
+    else:
+        param_idxs = data[self.vids[local_ids,0]] + self.s_pids[local_ids].unsqueeze(1)
+        node_mars[local_ids+sid,:] = ((params[param_idxs]).clamp(min=1e-10)).log()
+
+    if missing_mask is not None:
+        if missing_mask.dim() == 1:
+            mask = torch.where(missing_mask[self.vids])[0] + sid
+            node_mars[mask,:] = 0.0
+        elif missing_mask.dim() == 2:
+            maskx, masky = torch.where(missing_mask[self.vids[:,0]])
+            maskx = maskx + sid
+            node_mars[maskx,masky] = 0.0
+        else:
+            raise ValueError()
+
+    return None
+
+def _cat_forward(self, data: torch.Tensor, node_mars: torch.Tensor, params: torch.Tensor, 
+                 missing_mask: Optional[torch.Tensor] = None, local_ids: Optional[torch.Tensor] = None):
+    if self.device.type == "cuda":
+        _cat_forward_gpu(self, data, node_mars, params, missing_mask = missing_mask, local_ids = local_ids)
+        return None
+
+    sid, eid = self._output_ind_range[0], self._output_ind_range[1]
+
+    data = data.cpu()
+    device = node_mars.device
+
+    if local_ids is None:
+        param_idxs = data[self.vids] + self.s_pids.unsqueeze(1)
+        node_mars[sid:eid,:] = ((params[param_idxs]).clamp(min=1e-10)).log().to(device)
+    else:
+        param_idxs = data[self.vids[local_ids]] + self.s_pids[local_ids].unsqueeze(1)
+        node_mars[local_ids+sid,:] = ((params[param_idxs]).clamp(min=1e-10)).log().to(device)
+
+    if missing_mask is not None:
+        if missing_mask.dim() == 1:
+            mask = torch.where(missing_mask[self.vids])[0] + sid
+            node_mars[mask,:] = 0.0
+        elif missing_mask.dim() == 2:
+            maskx, masky = torch.where(missing_mask[self.vids])
+            maskx = maskx + sid
+            node_mars[maskx,masky] = 0.0
+        else:
+            raise ValueError()
+
+    return None
+
+
+
 def _categorical_forward(layer, node_mars: torch.Tensor,
                          params: Optional[torch.Tensor] = None, 
                          missing_mask: Optional[torch.Tensor] = None, **kwargs):
@@ -78,9 +137,9 @@ def _categorical_forward(layer, node_mars: torch.Tensor,
         data = data.permute(1, 0)
 
         if not layer.provided("fw_local_ids"):
-            layer._forward(data, node_mars, params, missing_mask)
+            _cat_forward(layer, data, node_mars, params, missing_mask)
         else:
-            layer._forward(data, node_mars, params, missing_mask, local_ids = layer.fw_local_ids)
+            _cat_forward(layer, data, node_mars, params, missing_mask, local_ids = layer.fw_local_ids)
 
     elif "soft_evidence" in kwargs:
 
@@ -100,10 +159,12 @@ def _categorical_forward(layer, node_mars: torch.Tensor,
         if not layer.provided("fw_local_ids"):
             num_nodes = eid - sid
 
+            node_nchs = layer.metadata[layer.s_mids]
+
             grid = lambda meta: (triton.cdiv(num_nodes * batch_size, meta['BLOCK_SIZE']),)
 
             _soft_evi_categorical_fw_kernel[grid](
-                data.reshape(-1).contiguous(), node_mars, params, layer.vids, layer.psids, layer.node_nchs,
+                data.reshape(-1).contiguous(), node_mars, params, layer.vids.reshape(-1), layer.s_pids, node_nchs,
                 None, sid, num_nodes, num_cats, batch_size, partial = False, BLOCK_SIZE = 512
             )
 
@@ -111,14 +172,14 @@ def _categorical_forward(layer, node_mars: torch.Tensor,
             local_ids = layer.fw_local_ids
             num_nodes = local_ids.size(0)
 
-            vids = layer.vids[local_ids]
-            psids = layer.psids[local_ids]
-            node_nchs = layer.node_nchs[local_ids]
+            vids = layer.vids[local_ids,0]
+            s_pids = layer.s_pids[local_ids]
+            node_nchs = layer.metadata[layer.s_mids[local_ids]]
             
             grid = lambda meta: (triton.cdiv(num_nodes * batch_size, meta['BLOCK_SIZE']),)
 
             _soft_evi_categorical_fw_kernel[grid](
-                data.reshape(-1).contiguous(), node_mars, params, vids, psids, node_nchs,
+                data.reshape(-1).contiguous(), node_mars, params, vids, s_pids, node_nchs,
                 local_ids, sid, num_nodes, num_cats, batch_size, partial = True, BLOCK_SIZE = 512
             )
 
@@ -184,7 +245,7 @@ def _categorical_backward(layer, node_flows: torch.Tensor, node_mars: torch.Tens
 
         num_nodes = eid - sid
         num_vars = layer.vids.max().item() + 1
-        num_cats = layer.node_nchs.max().item()
+        num_cats = int(layer.metadata[layer.s_mids].max().item())
         batch_size = node_flows.size(1)
 
         if "target_vars" in kwargs and kwargs["target_vars"] is not None:
@@ -206,9 +267,11 @@ def _categorical_backward(layer, node_flows: torch.Tensor, node_mars: torch.Tens
         local_ids = layer.enable_partial_evaluation(bk_scopes = target_vars, return_ids = True).to(node_flows.device)
         num_target_nodes = local_ids.size(0)
 
+        node_nchs = layer.metadata[layer.s_mids]
+
         grid = lambda meta: (triton.cdiv(num_target_nodes * batch_size, meta['BLOCK_SIZE']),)
         _categorical_backward_kernel[grid](
-            cat_probs, node_flows, local_ids, rev_vars_mapping, layer.vids, layer.psids, layer.node_nchs, layer.params,
+            cat_probs, node_flows, local_ids, rev_vars_mapping, layer.vids, layer.s_pids, node_nchs, layer.params,
             sid, eid, num_target_nodes, batch_size, num_cats, BLOCK_SIZE = 512
         )
 
@@ -227,7 +290,7 @@ def _categorical_backward(layer, node_flows: torch.Tensor, node_mars: torch.Tens
 
 
 def _conditional_fw_input_fn(layer, inputs, node_mars, params, **kwargs):
-    if isinstance(layer, CategoricalLayer):
+    if layer.dist_signature == "Categorical":
         _categorical_forward(layer, node_mars, params, **kwargs)
 
     else:
@@ -235,7 +298,7 @@ def _conditional_fw_input_fn(layer, inputs, node_mars, params, **kwargs):
 
 
 def _conditional_bk_input_fn(layer, inputs, node_flows, node_mars, params = None, outputs = None, **kwargs):
-    if isinstance(layer, CategoricalLayer):
+    if layer.dist_signature == "Categorical":
         outputs.append(
             _categorical_backward(layer, node_flows, node_mars, params, **kwargs)
         )
