@@ -313,7 +313,7 @@ class InputLayer(Layer, nn.Module):
                 s_mids_ptr = self.s_mids,
                 num_activ_nodes = num_activ_nodes, 
                 batch_size = batch_size, 
-                BLOCK_SIZE = 2048
+                BLOCK_SIZE = 2048,
                 seed = seed if seed is not None else random.randint(0, 1e8)
             )
 
