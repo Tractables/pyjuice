@@ -66,7 +66,7 @@ class Bernoulli(Distribution):
         flow1 = tl.load(param_flows_ptr + s_pfids, mask = mask, other = 0)
         flow0 = tl.load(param_flows_ptr + s_pfids + 1, mask = mask, other = 0)
 
-        param = tl.load(params_ptr + s_pids + cat_id, mask = cat_mask, other = 0)
+        param = tl.load(params_ptr + s_pids, mask = mask, other = 0)
         updated_param = (flow1 + 0.5 * pseudocount) / (flow1 + flow0 + pseudocount)
 
         new_param = (1.0 - step_size) * param + step_size * updated_param
