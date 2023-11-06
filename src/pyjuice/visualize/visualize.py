@@ -20,6 +20,7 @@ import networkx as nx
 from pyjuice.io.serialization import serialize_nodes
 import numpy as np
 
+
 def plot_pc(ns, 
            node_id : bool                 = False,
            node_num_label :bool          = False, 
@@ -96,7 +97,6 @@ def plot_pc(ns,
                                 verticalalignment = 'bottom',
                                 horizontalalignment = 'left')
     return
-
 
 
 def plot_tensor_node_connection(ns, node_id : int = 0):

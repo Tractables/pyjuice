@@ -1,30 +1,150 @@
 from __future__ import annotations
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+import textwrap
+import inspect
+import random
 from typing import Sequence, Dict
+from triton.runtime.jit import JITFunction
+from copy import deepcopy
 
 from pyjuice.nodes import InputNodes
 from pyjuice.utils.grad_fns import ReverseGrad
 from pyjuice.utils import BitSet
+from pyjuice.utils.source2fn import make_function_from_src
 from .layer import Layer
 
 
 class InputLayer(Layer, nn.Module):
-    def __init__(self, nodes: Sequence[InputNodes]) -> None:
+    def __init__(self, nodes: Sequence[InputNodes], cum_nodes: int = 0) -> None:
         nn.Module.__init__(self)
         Layer.__init__(self)
 
-        self.nodes = nodes
+        # Reorder input nodes such that for any tied nodes, its source nodes appear before them
+        self.nodes = self._reorder_nodes(nodes)
+
+        ## Parse input `nodes` ##
+        node_vars = []
+        node_sizes = []
+        node_metadata = []
+        layer_num_nodes = 0
+        cum_params = 0
+        cum_param_flows = 0
+        cum_source_ns = 0
+        dist_signature = None
+        for ns in self.nodes:
+            if dist_signature is None:
+                dist_signature = ns.dist.get_signature()
+            else:
+                assert dist_signature == ns.dist.get_signature(), "Nodes of an InputLayer must have the same distribution type."
+
+            node_vars.append(ns.scope.to_list())
+            node_sizes.append(ns.num_nodes)
+            node_metadata.append(ns.dist.get_metadata())
+
+            ns._output_ind_range = (cum_nodes, cum_nodes + ns.num_nodes)
+            cum_nodes += ns.num_nodes
+            layer_num_nodes += ns.num_nodes
+
+            if not ns.is_tied():
+                cum_params += ns.num_nodes * ns.dist.num_parameters()
+                ns._param_range = (cum_params - ns.num_nodes * ns.dist.num_parameters(), cum_params)
+
+                cum_param_flows += ns.num_nodes * ns.dist.num_param_flows()
+                ns._param_flow_range = (cum_param_flows - ns.num_nodes * ns.dist.num_param_flows(), cum_param_flows)
+
+                cum_source_ns += ns.num_nodes
+            else:
+                source_ns = ns.get_source_ns()
+                ns._param_range = deepcopy(source_ns._param_range)
+
+        self._output_ind_range = (cum_nodes - layer_num_nodes, cum_nodes)
+        self.num_params = cum_params
+        self.num_param_flows = cum_param_flows
+        self.num_nodes = layer_num_nodes
+        self.dist_signature = dist_signature
+
+        # Store the triton kernel functions implemented by the target `Distribution`
+        self.fw_mar_fn = self.nodes[0].dist.fw_mar_fn
+        self.bk_flow_fn = self.nodes[0].dist.bk_flow_fn
+        self.sample_fn = self.nodes[0].dist.sample_fn
+        self.em_fn = self.nodes[0].dist.em_fn
+
+        ## Prepair and compile the layer ##
+        num_vars = len(node_vars[0])
+        # Start variable index: vids[i,:] are the variables of the ith node
+        vids = torch.empty([self.num_nodes, num_vars], dtype = torch.long)
+        # Start parameter index: params[s_pids[i]] is the first parameter of the ith node
+        s_pids = torch.empty([self.num_nodes], dtype = torch.long)
+        # Start parameter flow index: param_flows[s_pfids[i]] is the first parameter flow of the ith node
+        s_pfids = torch.empty([self.num_nodes], dtype = torch.long)
+        # Start metadata index: metadata[s_mids[i]] is the first metadata of the ith node
+        metadata = []
+        s_mids = torch.empty([self.num_nodes], dtype = torch.long)
+        # source node ids (nodes with their original parameters)
+        source_nids = torch.empty([cum_source_ns], dtype = torch.long)
+
+        # Parameters of this layer
+        params = torch.empty([self.num_params], dtype = torch.float32)
+        
+        n_start = 0
+        source_n_start = 0
+        for ns_id, ns in enumerate(self.nodes):
+            n_end = n_start + ns.num_nodes
+
+            # `vids`
+            assert len(node_vars[ns_id]) == num_vars
+            vids[n_start:n_end,:] = torch.tensor(node_vars[ns_id]).view(1, -1)
+
+            # `s_pids` and `s_pfids`
+            if not ns.is_tied():
+                source_ns = ns
+            else:
+                source_ns = ns.get_source_ns()
+            pid_offsets = torch.arange(0, ns.num_nodes * ns.dist.num_parameters(), ns.dist.num_parameters())
+            s_pids[n_start:n_end] = source_ns._param_range[0] + pid_offsets
+            pfid_offsets = torch.arange(0, ns.num_nodes * ns.dist.num_param_flows(), ns.dist.num_param_flows())
+            s_pfids[n_start:n_end] = source_ns._param_flow_range[0] + pfid_offsets
+
+            # `source_nids`
+            if not ns.is_tied():
+                source_n_end = source_n_start + ns.num_nodes
+                source_nids[source_n_start:source_n_end] = torch.arange(n_start, n_end)
+                source_n_start = source_n_end
+
+            # `metadata` and `s_mids`
+            s_mids[n_start:n_end] = len(metadata)
+            metadata.extend(node_metadata[ns_id])
+
+            n_start = n_end
+
+        self.register_buffer("vids", vids)
+        self.register_buffer("s_pids", s_pids)
+        self.register_buffer("s_pfids", s_pfids)
+        self.register_buffer("metadata", torch.tensor(metadata).float())
+        self.register_buffer("s_mids", s_mids)
+        self.register_buffer("source_nids", source_nids)
+
+        self.params = nn.Parameter(params)
+        # Due to the custom inplace backward pass implementation, we do not track 
+        # gradient of PC parameters by PyTorch.
+        self.params.requires_grad = False
+
+        self.num_vars_per_node = num_vars
 
         self.param_flows = None
 
         self.device = torch.device("cpu")
 
         self._used_external_params = False
+
+        # Batch size of parameters in the previous forward pass
+        self._param_batch_size = 1
     
     def to(self, device):
         nn.Module.to(self, device = device)
@@ -37,30 +157,227 @@ class InputLayer(Layer, nn.Module):
                 or (self.param_flows.dim() == 1 and batch_size > 1) \
                 or (self.param_flows.dim() == 2 and batch_size != self.param_flows.size(1)):
             if batch_size == 1:
-                shape = [self.param_flows_size]
+                shape = [self.num_param_flows]
             else:
-                shape = [self.param_flows_size, batch_size]
+                shape = [self.num_param_flows, batch_size]
             self.param_flows = torch.zeros(shape, device = self.device)
         else:
-            assert self.param_flows.size(0) == self.param_flows_size
+            assert self.param_flows.size(0) == self.num_param_flows
             self.param_flows[:] *= flows_memory
 
         return None
 
-    def forward(self, used_external_params: bool):
-        self._used_external_params = used_external_params
+    def forward(self, data: torch.Tensor, node_mars: torch.Tensor, params: Optional[Dict] = None,
+                missing_mask: Optional[torch.Tensor] = None):
+        self._used_external_params = (params is not None)
 
-    def backward(self, *args, **kwargs):
-        raise NotImplementedError()
+        if params is None:
+            params = self.params
+        else:
+            params = params["params"]
 
-    def sample(self, *args, **kwargs):
-        raise NotImplementedError()
+        assert params.dim() == 1
 
-    def mini_batch_em(self):
-        raise NotImplementedError()
+        if "cuda" in self.device.type:
+            # Need to flatten data to ensure the memory is aligned following [num_vars, batch_size]
+            data = data.reshape(-1).contiguous()
+
+            tot_num_nodes = node_mars.size(0)
+            batch_size = node_mars.size(1)
+            node_offset = self._output_ind_range[0]
+
+            if not self.provided("fw_local_ids"):
+                layer_num_nodes = self._output_ind_range[1] - self._output_ind_range[0]
+                fw_local_ids = None
+            else:
+                layer_num_nodes = self.fw_local_ids.size(0)
+                fw_local_ids = self.fw_local_ids
+
+            if not self.provided("_mars_kernel"):
+                self._mars_kernel = self._compile_triton_kernel(self._mars_kernel_template, mar_fn = self.fw_mar_fn)
+
+            grid = lambda meta: (triton.cdiv(layer_num_nodes * batch_size, meta['BLOCK_SIZE']),)
+            self._mars_kernel[grid](
+                params_ptr = self.params, 
+                node_mars_ptr = node_mars, 
+                data_ptr = data, 
+                vids_ptr = self.vids, 
+                s_pids_ptr = self.s_pids, 
+                metadata_ptr = self.metadata, 
+                s_mids_ptr = self.s_mids, 
+                fw_local_ids_ptr = fw_local_ids,
+                layer_num_nodes = layer_num_nodes, 
+                batch_size = batch_size, 
+                num_vars_per_node = self.num_vars_per_node, 
+                nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
+                node_offset = node_offset, 
+                BLOCK_SIZE = 1024, 
+                partial_eval = 1 if fw_local_ids is not None else 0
+            )
+
+            # Apply missing mask if required
+            if missing_mask is not None:
+                assert self.num_vars_per_node == 1, "`missing_mask` only supported for univariate distributions."
+
+                mask_dim = missing_mask.dim()
+
+                grid = lambda meta: (triton.cdiv(layer_num_nodes * batch_size, meta['BLOCK_SIZE']),)
+                self._fw_missing_mask_kernel[grid](
+                    missing_mask_ptr = missing_mask,
+                    node_mars_ptr = node_mars, 
+                    vids_ptr = self.vids, 
+                    fw_local_ids_ptr = fw_local_ids,
+                    layer_num_nodes = layer_num_nodes, 
+                    batch_size = batch_size, 
+                    node_offset = node_offset, 
+                    BLOCK_SIZE = 1024, 
+                    partial_eval = 1 if fw_local_ids is not None else 0,
+                    mask_dim = mask_dim
+                )
+
+        else:
+            raise NotImplementedError("CPU forward fn for input nodes is not implemented.")
+
+    def backward(self, data: torch.Tensor, node_flows: torch.Tensor, 
+                 node_mars: torch.Tensor, params: Optional[Dict] = None):
+        """
+        data: [num_vars, B]
+        node_flows: [num_nodes, B]
+        node_mars: [num_nodes, B]
+        """
+
+        if params is None:
+            params = self.params
+        else:
+            params = params["params"]
+
+        assert params.dim() == 1
+
+        if "cuda" in self.device.type:
+            # Need to flatten data to ensure the memory is aligned following [num_vars, batch_size]
+            data = data.reshape(-1).contiguous()
+
+            tot_num_nodes = node_flows.size(0)
+            batch_size = node_flows.size(1)
+            node_offset = self._output_ind_range[0]
+
+            if not self.provided("bk_local_ids"):
+                layer_num_nodes = self._output_ind_range[1] - self._output_ind_range[0]
+                bk_local_ids = None
+            else:
+                layer_num_nodes = self.bk_local_ids.size(0)
+                bk_local_ids = self.bk_local_ids
+
+            if not self.provided("_flows_kernel"):
+                self._flows_kernel = self._compile_triton_kernel(self._flows_kernel_template, flow_fn = self.bk_flow_fn)
+
+            grid = lambda meta: (triton.cdiv(layer_num_nodes * batch_size, meta['BLOCK_SIZE']),)
+            self._flows_kernel[grid](
+                params_ptr = self.params,
+                param_flows_ptr = self.param_flows,
+                node_flows_ptr = node_flows, 
+                node_mars_ptr = node_mars,
+                data_ptr = data, 
+                vids_ptr = self.vids, 
+                s_pids_ptr = self.s_pids,
+                s_pfids_ptr = self.s_pfids,
+                metadata_ptr = self.metadata, 
+                s_mids_ptr = self.s_mids, 
+                bk_local_ids_ptr = bk_local_ids,
+                layer_num_nodes = layer_num_nodes, 
+                batch_size = batch_size, 
+                num_vars_per_node = self.num_vars_per_node, 
+                nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
+                node_offset = node_offset, 
+                BLOCK_SIZE = 1024, 
+                partial_eval = 1 if bk_local_ids is not None else 0
+            )
+
+        else:
+            raise NotImplementedError("CPU backward fn for input nodes is not implemented.")
+
+    def sample(self, samples: torch.Tensor, node_flows: torch.Tensor, missing_mask: Optional[torch.Tensor] = None, 
+               params: Optional[torch.Tensor] = None, seed: Optional[int] = None):
+        """
+        samples:       [num_vars, B]
+        missing_mask:  [num_vars, B] or [num_vars] or None
+        node_flows:    [num_nodes, B]
+        """
+
+        if params is None:
+            params = self.params
+        else:
+            params = params["params"]
+
+        assert params.dim() == 1
+
+        if "cuda" in self.device.type:
+
+            sid, eid = self._output_ind_range
+            tot_num_nodes = node_flows.size(0)
+            batch_size = node_flows.size(1)
+            node_offset = self._output_ind_range[0]
+
+            # Get all node ids with non-zero flow
+            nflow_xids, nflow_yids = torch.where(node_flows[sid:eid,:])
+            num_activ_nodes = nflow_xids.size(0)
+
+            if not self.provided("_sample_kernel"):
+                self._sample_kernel = self._compile_triton_kernel(self._sample_kernel_template, sample_fn = self.sample_fn)
+
+            grid = lambda meta: (triton.cdiv(num_activ_nodes, meta['BLOCK_SIZE']),)
+            self._sample_kernel[grid](
+                samples_ptr = samples, 
+                params_ptr = params,
+                nflow_xids_ptr = nflow_xids, 
+                nflow_yids_ptr = nflow_yids, 
+                vids_ptr = self.vids, 
+                s_pids_ptr = self.s_pids, 
+                metadata_ptr = self.metadata,
+                s_mids_ptr = self.s_mids,
+                num_activ_nodes = num_activ_nodes, 
+                num_vars_per_node = self.num_vars_per_node, 
+                nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
+                batch_size = batch_size, 
+                BLOCK_SIZE = 2048,
+                seed = seed if seed is not None else random.randint(0, 1e8)
+            )
+
+        else:
+            raise NotImplementedError("CPU sample fn for input nodes is not implemented.")
+
+    def mini_batch_em(self, step_size: float, pseudocount: float = 0.0):
+        if not self._used_external_params:
+            # Normalize and update parameters
+            with torch.no_grad():
+
+                if "cuda" in self.device.type:
+                    layer_num_source_nodes = self.source_nids.size(0)
+
+                    if not self.provided("_em_kernel"):
+                        self._em_kernel = self._compile_triton_kernel(self._em_kernel_template, em_fn = self.em_fn)
+
+                    constexprs = torch.tensor([step_size, pseudocount], dtype = torch.float32, device = self.device)
+
+                    grid = lambda meta: (triton.cdiv(layer_num_source_nodes, meta['BLOCK_SIZE']),)
+                    self._em_kernel[grid](
+                        params_ptr = self.params,
+                        param_flows_ptr = self.param_flows,
+                        s_pids_ptr = self.s_pids,
+                        s_pfids_ptr = self.s_pfids,
+                        metadata_ptr = self.metadata,
+                        s_mids_ptr = self.s_mids,
+                        source_nids_ptr = self.source_nids,
+                        constexprs_ptr = constexprs,
+                        layer_num_source_nodes = layer_num_source_nodes,
+                        BLOCK_SIZE = 1024
+                    )
+
+                else:
+                    raise NotImplementedError("CPU minibatch em fn for input nodes is not implemented.")
 
     def get_param_specs(self):
-        raise NotImplementedError()
+        return {"params": torch.Size([self.num_params])}
 
     def enable_partial_evaluation(self, fw_scopes: Optional[Union[Sequence[BitSet],Sequence[int]]] = None, 
                                   bk_scopes: Optional[Union[Sequence[BitSet],Sequence[int]]] = None, return_ids: bool = False):
@@ -109,15 +426,13 @@ class InputLayer(Layer, nn.Module):
         if backward:
             self.bk_local_ids = None
 
-    @staticmethod
-    def _hook_params(grad_hook_idx: int, _inputs: List, layer_params: Dict):
-        raise NotImplementedError()
+    def update_parameters(self):
+        for idx, ns in enumerate(self.nodes):
+            if ns.is_tied():
+                continue
 
-    def _hook_param_grads(self, grad_hook_idx: int, _inputs: List, _inputs_grad: List):
-        raise NotImplementedError()
-
-    def _hook_input_grads(self, _inputs: List, _inputs_grad: List):
-        pass
+            par_start, par_end = ns._param_range
+            ns._params = self.params.data[par_start:par_end].detach().cpu().clone()
 
     def _prepare_scope2nids(self):
         if not hasattr(self, "scope2localids"):
@@ -142,3 +457,320 @@ class InputLayer(Layer, nn.Module):
             self.scope2localids = {
                 scope: torch.cat(ids, dim = 0).to(self.params.device) for scope, ids in scope2localids.items()
             }
+
+    def _reorder_nodes(self, nodes):
+        node_set = set(nodes)
+        reordered_untied_nodes = []
+        reordered_tied_nodes = []
+        added_node_set = set()
+        for ns in nodes:
+            if ns in added_node_set:
+                continue
+            if not ns.is_tied():
+                reordered_untied_nodes.append(ns)
+                added_node_set.add(ns)
+            else:
+                source_ns = ns.get_source_ns()
+                if source_ns in added_node_set:
+                    reordered_tied_nodes.append(ns)
+                    added_node_set.add(ns)
+                elif source_ns in node_set:
+                    reordered_untied_nodes.append(source_ns)
+                    reordered_tied_nodes.append(ns)
+                    added_node_set.add(ns)
+                    added_node_set.add(source_ns)
+                else:
+                    raise ValueError("A tied `InputNodes` should be in the same layer with its source nodes.")
+
+        reordered_nodes = reordered_untied_nodes + reordered_tied_nodes
+
+        assert len(reordered_nodes) == len(nodes), "Total node length should not change after reordering."
+
+        return reordered_nodes
+
+    def _init_parameters(self, perturbation):
+
+        p_start, p_end = 0, 0
+        for ns_id, ns in enumerate(self.nodes):
+            # `params` (init/copy parameters)
+            if not ns.is_tied():
+                p_end = p_start + ns.num_nodes * ns.dist.num_parameters()
+                if ns.has_params():
+                    self.params[p_start:p_end] = ns._params.to(self.device)
+                else:
+                    self.params[p_start:p_end] = ns.init_parameters(ret_params = True).to(self.device)
+
+                p_start = p_end
+
+    @staticmethod
+    def _mars_kernel_template(mar_fn, params_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, metadata_ptr, s_mids_ptr, 
+                              fw_local_ids_ptr, partial_eval: tl.constexpr, layer_num_nodes: tl.constexpr, batch_size: tl.constexpr, 
+                              num_vars_per_node: tl.constexpr, nv_block_size: tl.constexpr, node_offset: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(axis = 0)
+        block_start = pid * BLOCK_SIZE
+
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < layer_num_nodes * batch_size
+
+        # Raw batch and (local) node id
+        batch_offsets = (offsets % batch_size)
+        local_offsets = (offsets // batch_size)
+
+        if partial_eval > 0:
+            local_offsets = tl.load(fw_local_ids_ptr + local_offsets, mask = mask, other = 0)
+
+        if num_vars_per_node == 1:
+            # Get all variable ids
+            vids = tl.load(vids_ptr + local_offsets, mask = mask, other = 0)
+
+            # Load the corresponding data
+            data = tl.load(data_ptr + vids * batch_size + batch_offsets, mask = mask, other = 0)
+        else:
+            # Get all variable ids
+            vids_offsets = tl.broadcast_to(local_offsets[:,None], (BLOCK_SIZE, nv_block_size)) * num_vars_per_node + \
+                tl.broadcast_to(tl.arange(0, nv_block_size)[None,:], (BLOCK_SIZE, nv_block_size))
+            vids_mask = tl.broadcast_to(mask[:,None], (BLOCK_SIZE, nv_block_size)) & \
+                tl.broadcast_to((tl.arange(0, nv_block_size) < num_vars_per_node)[None,:], (BLOCK_SIZE, nv_block_size))
+            vids = tl.load(vids_ptr + vids_offsets, mask = vids_mask, other = 0)
+
+            # Load the corresponding data
+            data = tl.load(data_ptr + vids * batch_size + batch_offsets, mask = vids_mask, other = 0)
+
+        s_pids = tl.load(s_pids_ptr + local_offsets, mask = mask, other = 0)
+
+        mars = mar_fn(local_offsets, data, params_ptr, s_pids, metadata_ptr, metadata, mask, num_vars_per_node, BLOCK_SIZE)
+
+        node_offsets = local_offsets + node_offset
+        tl.store(node_mars_ptr + node_offsets * batch_size + batch_offsets, mars, mask = mask)
+
+    @staticmethod
+    @triton.jit
+    def _fw_missing_mask_kernel(missing_mask_ptr, node_mars_ptr, vids_ptr, fw_local_ids_ptr, layer_num_nodes: tl.constexpr, 
+                                batch_size: tl.constexpr, node_offset: tl.constexpr, BLOCK_SIZE: tl.constexpr, 
+                                partial_eval: tl.constexpr, mask_dim: tl.constexpr):
+        pid = tl.program_id(axis = 0)
+        block_start = pid * BLOCK_SIZE
+
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < layer_num_nodes * batch_size
+
+        # Raw batch and (local) node id
+        batch_offsets = (offsets % batch_size)
+        local_offsets = (offsets // batch_size)
+
+        if partial_eval > 0:
+            local_offsets = tl.load(fw_local_ids_ptr + local_offsets, mask = mask, other = 0)
+
+        # Get all variable ids
+        vids = tl.load(vids_ptr + local_offsets, mask = mask, other = 0)
+
+        # Fetch mask
+        if mask_dim == 1:
+            missing_mask = tl.load(missing_mask_ptr + vids, mask = mask, other = False)
+        else:
+            mask_offsets = vids * batch_size + batch_offsets
+            missing_mask = tl.load(missing_mask_ptr + mask_offsets, mask = mask, other = False)
+
+        # Apply mask
+        node_offsets = (local_offsets + node_offset) * batch_size + batch_offsets
+        mars = tl.load(node_mars_ptr + node_offsets, mask = mask, other = 0.0)
+        mars = tl.where(missing_mask, 0.0, mars)
+        tl.store(node_mars_ptr + node_offsets, mars, mask = mask)
+
+    @staticmethod
+    def _flows_kernel_template(flow_fn, params_ptr, param_flows_ptr, node_flows_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, s_pfids_ptr,
+                               metadata_ptr, s_mids_ptr, bk_local_ids_ptr, partial_eval: tl.constexpr, layer_num_nodes: tl.constexpr, 
+                               batch_size: tl.constexpr, num_vars_per_node: tl.constexpr, nv_block_size: tl.constexpr, node_offset: tl.constexpr, 
+                               BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(axis = 0)
+        block_start = pid * BLOCK_SIZE
+
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < layer_num_nodes * batch_size
+
+        # Raw batch and (local) node id
+        batch_offsets = (offsets % batch_size)
+        local_offsets = (offsets // batch_size)
+
+        if partial_eval > 0:
+            local_offsets = tl.load(bk_local_ids_ptr + local_offsets, mask = mask, other = 0)
+
+        if num_vars_per_node == 1:
+            # Get all variable ids
+            vids = tl.load(vids_ptr + local_offsets, mask = mask, other = 0)
+
+            # Load the corresponding data
+            data = tl.load(data_ptr + vids * batch_size + batch_offsets, mask = mask, other = 0)
+        else:
+            # Get all variable ids
+            vids_offsets = tl.broadcast_to(local_offsets[:,None], (BLOCK_SIZE, nv_block_size)) * num_vars_per_node + \
+                tl.broadcast_to(tl.arange(0, nv_block_size)[None,:], (BLOCK_SIZE, nv_block_size))
+            vids_mask = tl.broadcast_to(mask[:,None], (BLOCK_SIZE, nv_block_size)) & \
+                tl.broadcast_to((tl.arange(0, nv_block_size) < num_vars_per_node)[None,:], (BLOCK_SIZE, nv_block_size))
+            vids = tl.load(vids_ptr + vids_offsets, mask = vids_mask, other = 0)
+
+            # Load the corresponding data
+            data = tl.load(data_ptr + vids * batch_size + batch_offsets, mask = vids_mask, other = 0)
+
+        s_pids = tl.load(s_pids_ptr + local_offsets, mask = mask, other = 0)
+        s_pfids = tl.load(s_pfids_ptr + local_offsets, mask = mask, other = 0)
+
+        ns_offsets = (local_offsets + node_offset) * batch_size + batch_offsets
+        flows = tl.load(node_flows_ptr + ns_offsets, mask = mask, other = 0)
+
+        flow_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
+                metadata, mask, num_vars_per_node, BLOCK_SIZE)
+
+    @staticmethod
+    def _sample_kernel_template(sample_fn, samples_ptr, params_ptr, nflow_xids_ptr, nflow_yids_ptr, vids_ptr, s_pids_ptr, metadata_ptr, s_mids_ptr,
+                                seed, num_vars_per_node: tl.constexpr, nv_block_size: tl.constexpr, num_activ_nodes: tl.constexpr, 
+                                batch_size: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(axis = 0)
+        block_start = pid * BLOCK_SIZE
+
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < num_activ_nodes
+
+        # Raw batch and (local) node id
+        local_offsets = tl.load(nflow_xids_ptr + offsets, mask = mask, other = 0)
+        batch_offsets = tl.load(nflow_yids_ptr + offsets, mask = mask, other = 0)
+
+        # Get all variable ids
+        if num_vars_per_node == 1:
+            vids = tl.load(vids_ptr + local_offsets, mask = mask, other = 0)
+        else:
+            # Get all variable ids
+            vids_offsets = tl.broadcast_to(local_offsets[:,None], (BLOCK_SIZE, nv_block_size)) * num_vars_per_node + \
+                tl.broadcast_to(tl.arange(0, nv_block_size)[None,:], (BLOCK_SIZE, nv_block_size))
+            vids_mask = tl.broadcast_to(mask[:,None], (BLOCK_SIZE, nv_block_size)) & \
+                tl.broadcast_to((tl.arange(0, nv_block_size) < num_vars_per_node)[None,:], (BLOCK_SIZE, nv_block_size))
+            vids = tl.load(vids_ptr + vids_offsets, mask = vids_mask, other = 0)
+
+        # Get start parameter indices
+        s_pids = tl.load(s_pids_ptr + local_offsets, mask = mask, other = 0)
+
+        sample_fn(samples_ptr, local_offsets, batch_offsets, vids, s_pids, params_ptr, metadata_ptr, s_mids_ptr, batch_size, BLOCK_SIZE, seed)
+
+    @staticmethod
+    def _em_kernel_template(em_fn, params_ptr, param_flows_ptr, s_pids_ptr, s_pfids_ptr, metadata_ptr, s_mids_ptr,
+                            source_nids_ptr, constexprs_ptr, layer_num_source_nodes: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(axis = 0)
+        block_start = pid * BLOCK_SIZE
+
+        # Retrieve all constexprs
+        step_size = tl.load(constexprs_ptr)
+        pseudocount = tl.load(constexprs_ptr + 1)
+
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < layer_num_source_nodes
+
+        # Get the local node ids
+        local_offsets = tl.load(source_nids_ptr + offsets, mask = mask, other = 0)
+
+        # Get the corresponding start id for `params` and `param_flows`
+        s_pids = tl.load(s_pids_ptr + local_offsets, mask = mask, other = 0)
+        s_pfids = tl.load(s_pfids_ptr + local_offsets, mask = mask, other = 0)
+
+        em_fn(local_offsets, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, s_mids_ptr, mask,
+              step_size, pseudocount, BLOCK_SIZE)
+
+    @staticmethod
+    def _compile_triton_kernel(main_fn, **sub_fns):
+
+        def parse_source(src, get_signature = False):
+
+            if not isinstance(src, str):
+                src = textwrap.dedent(inspect.getsource(src))
+                src = src[src.find("def"):]
+
+            fn_header = ""
+            fn_body = []
+            curr_body = ""
+            is_header = True
+            for line in src.split("\n"):
+                if is_header:
+                    fn_header += line.strip(" ")
+                    if ")" in line:
+                        is_header = False
+                else:
+                    if line.strip(" ").startswith("#") or len(line.strip(" ")) == 0:
+                        continue
+
+                    if len(curr_body) > 0:
+                        line = line.strip(" ")
+                    else:
+                        line = line.rstrip(" ")
+                    curr_body += line
+                    if curr_body[-1] == "\\":
+                        curr_body = curr_body[:-1]
+                    else:
+                        parenthesis_count = curr_body.count("(") - curr_body.count(")")
+                        if parenthesis_count == 0:
+                            fn_body.append(curr_body)
+                            curr_body = ""
+                            parenthesis_count = 0
+
+            if get_signature:
+                args = fn_header.split("(")[1].split(")")[0].split(",")
+                signature = list(map(lambda arg: arg.split(":")[0].split("=")[0].strip(" "), args))
+
+                return fn_header, fn_body, signature
+
+            return fn_header, fn_body
+
+        main_fn_header, main_fn_body = parse_source(main_fn)
+
+        # Map to new function header
+        fn_name = main_fn_header.split("(")[0]
+        fn_args = main_fn_header.split("(")[1].split(")")[0].split(",")
+        fn_args = list(map(
+            lambda str: str.strip(" "),
+            filter(lambda arg: arg.split(":")[0].strip(" ") not in sub_fns, fn_args)
+        ))
+        seed_str = f"_{random.randint(0,1e8)}"
+        new_fn_header = fn_name + seed_str + "(" + ",".join(fn_args) + "):"
+        global_key = fn_name.split("def")[1].strip(" ") + seed_str
+
+        # Map to new function body
+        new_fn_body = []
+        sub_fns = {k: parse_source(v, get_signature = True) for k, v in sub_fns.items()}
+        for line in main_fn_body:
+            substituted = False
+            for sub_fn_name in sub_fns:
+                if sub_fn_name in line:
+
+                    # Get the target variable name
+                    target_var = line.split(sub_fn_name)[0].split("=")[0].strip(" ")
+
+                    # Get the variable name mapping
+                    target_args = line.split(sub_fn_name)[1].split("(")[1].split(")")[0].split(",")
+                    var_mapping = {k: v.strip(" ") for k, v in zip(sub_fns[sub_fn_name][2], target_args)}
+
+                    indent = " " * (len(line) - len(line.lstrip()))
+                    base_indent_len = len(sub_fns[sub_fn_name][1][0]) - len(sub_fns[sub_fn_name][1][0].lstrip())
+                    for fn_line in sub_fns[sub_fn_name][1]:
+                        fn_line = indent + fn_line[base_indent_len:]
+                        if fn_line.split("#")[0].strip(" ") == "pass":
+                            continue
+                        for k, v in var_mapping.items():
+                            fn_line = fn_line.replace(k, v)
+                        if "return" in fn_line and len(target_var) > 0:
+                            fn_line = fn_line.replace("return", f"{target_var} =")
+                        new_fn_body.append(fn_line)
+
+                    substituted = True
+                    break
+
+            if not substituted:
+                new_fn_body.append(line)
+
+        # Updated source code
+        new_src = new_fn_header + "\n" + "\n".join(new_fn_body)
+
+        # Add import commands
+        new_src = "import triton\nimport triton.language as tl\n\n" + new_src
+
+        # Make a pseudo-function from the source code
+        new_fn = make_function_from_src(new_src)
+
+        return JITFunction(new_fn)

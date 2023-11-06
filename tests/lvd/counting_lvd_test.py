@@ -12,7 +12,7 @@ import pytest
 def counting_lvd_test():
     num_nodes = 2
 
-    with juice.LVDistiller(backend = "counting"):
+    with juice.LVDistiller(backend = "counting", pseudocount = 0.0):
         i0 = inputs(0, num_nodes, dists.Categorical(num_cats = 5))
         i1 = inputs(1, num_nodes, dists.Categorical(num_cats = 5))
         i2 = inputs(2, num_nodes, dists.Categorical(num_cats = 5))

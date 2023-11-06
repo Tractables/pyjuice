@@ -32,7 +32,7 @@ class SumNodes(CircuitNodes):
 
         # Set parameters
         if params is not None:
-            self.set_params(params)
+            self.set_params(params, pseudocount = 0.0)
 
         # Callbacks
         self._run_init_callbacks(**kwargs)

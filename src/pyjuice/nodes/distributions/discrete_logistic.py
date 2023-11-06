@@ -1,35 +1,146 @@
 from __future__ import annotations
 
-from typing import Tuple, Optional
+import torch
+import triton
+import triton.language as tl
+import math
+from typing import Tuple
 
 from .distributions import Distribution
 
 
 class DiscreteLogistic(Distribution):
-    def __init__(self, input_range: Tuple[float,float], bin_count: int):
+    def __init__(self, val_range: Tuple[float,float], num_cats: int, min_std: float = 0.01):
         super(DiscreteLogistic, self).__init__()
 
-        self.input_range = input_range
-        self.bin_count = bin_count
+        self.val_range = val_range
+        self.num_cats = num_cats
+        self.min_std = min_std
 
-        self.bin_size = (self.input_range[1] - self.input_range[0]) / self.bin_count
+    def get_signature(self):
+        return "DiscreteLogistic"
 
-    def raw2processed_params(self, num_nodes: int, params: torch.Tensor):
-        return params
+    def get_metadata(self):
+        return [self.val_range[0], self.val_range[1], self.num_cats, self.min_std]
 
-    def processed2raw_params(self, num_nodes: int, params: torch.Tensor, normalize: bool = True):
-        return params
+    def num_parameters(self):
+        return 2
 
-    def init_parameters(num_nodes: int, perturbation: float, **kwargs):
-        raise NotImplementedError()
+    def num_param_flows(self):
+        return 3
 
-    def __getstate__(self):
-        state = {
-            "input_range": self.input_range,
-            "bin_count": self.bin_count
-        }
-        return state
+    def init_parameters(self, num_nodes: int, perturbation: float = 2.0, **kwargs):
+        """
+        Initialize parameters for `num_nodes` nodes.
+        Returned parameters should be flattened into a vector.
+        """
+        mu = kwargs["mu"] if "mu" in kwargs else (self.val_range[0] + self.val_range[1]) / 2.0
+        std = kwargs["std"] if "std" in kwargs else (self.val_range[1] - self.val_range[0]) / 4.0 # 2 sigma range
 
-    def __setstate__(self, state):
-        self.input_range = state["input_range"]
-        self.bin_count = state["bin_count"]
+        mus = torch.normal(mean = torch.ones([num_nodes]) * mu, std = std)
+        ss = torch.exp(torch.rand([num_nodes]) * -0.04 * perturbation) * std * math.sqrt(3) / math.pi
+
+        return torch.stack((mus, ss), dim = 1).reshape(-1).contiguous()
+
+    @staticmethod
+    def fw_mar_fn(local_offsets, data, params_ptr, s_pids, metadata_ptr, metadata, mask, num_vars_per_node, BLOCK_SIZE):
+        # Get `val_range` and `num_cats` from `metadata`
+        s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
+        range_low = tl.load(metadata_ptr + s_mids, mask = mask, other = 0)
+        range_high = tl.load(metadata_ptr + s_mids + 1, mask = mask, other = 0)
+        num_cats = tl.load(metadata_ptr + s_mids + 2, mask = mask, other = 0).to(tl.int64)
+
+        mu = tl.load(params_ptr + s_pids, mask = mask, other = 0)
+        s = tl.load(params_ptr + s_pids + 1, mask = mask, other = 0)
+
+        # 0: (-inf, range_low + interval]; 
+        # 1: (range_low + interval, range_low + 2 * interval]; 
+        # ...; 
+        # num_cats - 1: [range_high - interval, inf)
+        interval = (range_high - range_low) / num_cats
+        vlow = data * interval + range_low
+        vhigh = vlow + interval
+
+        cdfhigh = tl.where(data == num_cats - 1, 1.0, 1.0 / (1.0 + tl.exp((mu - vhigh) / s)))
+        cdflow = tl.where(data == 0, 0.0, 1.0 / (1.0 + tl.exp((mu - vlow) / s)))
+
+        log_probs = tl.maximum(tl.log(cdfhigh - cdflow), -1000.0)
+
+        return log_probs
+
+    @staticmethod
+    def bk_flow_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
+                   metadata, mask, num_vars_per_node, BLOCK_SIZE):
+        # Get `val_range` and `num_cats` from `metadata`
+        s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
+        range_low = tl.load(metadata_ptr + s_mids, mask = mask, other = 0)
+        range_high = tl.load(metadata_ptr + s_mids + 1, mask = mask, other = 0)
+        num_cats = tl.load(metadata_ptr + s_mids + 2, mask = mask, other = 0).to(tl.int64)
+
+        interval = (range_high - range_low) / num_cats
+        vmid = data * interval + range_low + 0.5 * interval # (vlow + vhigh) / 2
+
+        stat1 = vmid * flows
+        stat2 = vmid * vmid * flows
+        stat3 = flows
+
+        tl.atomic_add(param_flows_ptr + s_pfids, stat1, mask = mask)
+        tl.atomic_add(param_flows_ptr + s_pfids + 1, stat2, mask = mask)
+        tl.atomic_add(param_flows_ptr + s_pfids + 2, stat3, mask = mask)
+
+    @staticmethod
+    def sample_fn(samples_ptr, local_offsets, batch_offsets, vids, s_pids, params_ptr, metadata_ptr, s_mids_ptr, batch_size, BLOCK_SIZE, seed):
+        # Get `val_range` and `num_cats` from `metadata`
+        s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
+        range_low = tl.load(metadata_ptr + s_mids, mask = mask, other = 0)
+        range_high = tl.load(metadata_ptr + s_mids + 1, mask = mask, other = 0)
+        num_cats = tl.load(metadata_ptr + s_mids + 2, mask = mask, other = 0).to(tl.int64)
+
+        rnd_val = tl.rand(seed, tl.arange(0, BLOCK_SIZE))
+
+        mu = tl.load(params_ptr + s_pids, mask = mask, other = 0)
+        s = tl.load(params_ptr + s_pids + 1, mask = mask, other = 0)
+        
+        # Get sample using the quantile function
+        sample = mu + s * tl.log(rnd_val / (1.0 - rnd_val))
+
+        # Discretize
+        interval = (range_high - range_low) / num_cats
+        bin_val = (sample - range_low) / interval
+        sampled_id = tl.where(bin_val < 0, 0, tl.where(bin_val > num_cats - 1, num_cats - 1, tl.floor(bin_val).to(tl.int64)))
+
+        # Write back to `samples`
+        sample_offsets = vids * batch_size + batch_offsets
+        tl.store(samples_ptr + sample_offsets, sampled_id, mask = mask)
+
+    @staticmethod
+    def em_fn(local_offsets, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, s_mids_ptr, mask,
+              step_size, pseudocount, BLOCK_SIZE):
+        # Get `min_std`
+        s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
+        min_std = tl.load(metadata_ptr + s_mids + 3, mask = mask, other = 0)
+
+        mu = tl.load(params_ptr + s_pids, mask = mask, other = 0)
+        std = tl.load(params_ptr + s_pids + 1, mask = mask, other = 0) * 1.8137993642342178 # The constant is `math.pi / math.sqrt(3.0)`
+        ori_theta1 = mu
+        ori_theta2 = std * std + mu * mu
+
+        stat1 = tl.load(param_flows_ptr + s_pfids, mask = mask)
+        stat2 = tl.load(param_flows_ptr + s_pfids + 1, mask = mask)
+        stat3 = tl.load(param_flows_ptr + s_pfids + 2, mask = mask)
+
+        new_theta1 = stat1 / (stat3 + 1e-10)
+        new_theta2 = stat2 / (stat3 + 1e-10)
+
+        # Get the updated natural parameters
+        updated_theta1 = (1.0 - step_size) * ori_theta1 + step_size * new_theta1
+        updated_theta2 = (1.0 - step_size) * ori_theta2 + step_size * new_theta2
+
+        # Reconstruct `mu` and `std` from the expectation parameters (moment matching)
+        updated_mu = updated_theta1
+        updated_std2 = updated_theta2 - updated_mu * updated_mu
+        updated_std = tl.where(updated_std2 < min_std * min_std, min_std, tl.sqrt(updated_std2))
+        updated_s = updated_std * 0.5513288954217921 # The constant is `math.sqrt(3.0) / math.pi`
+
+        tl.store(params_ptr + s_pids, updated_mu, mask = mask)
+        tl.store(params_ptr + s_pids + 1, updated_s, mask = mask)

@@ -37,12 +37,13 @@ def pruning_test():
     new_n1 = new_n.chs[0].chs[0]
     assert new_n1.edge_ids.size(1) == 3
     assert torch.all(new_n1.edge_ids == torch.tensor([[0,1,1],[0,0,1]]))
-    assert torch.all(new_n1._params == n1._params[[0,2,3]])
+    assert torch.all(torch.abs(new_n1._params[1:] - n1._params[[2,3]]) < 1e-4)
+    assert torch.all(torch.abs(new_n1._params[0] - 1.0) < 1e-4)
 
     new_n2 = new_n.chs[0].chs[1]
     assert new_n2.edge_ids.size(1) == 2
     assert torch.all(new_n2.edge_ids == torch.tensor([[0,1],[1,1]]))
-    assert torch.all(new_n2._params == n2._params[[1,3]])
+    assert torch.all(torch.abs(new_n2._params - 1.0) < 1e-4)
 
 
 def pruning_with_param_tying_test():
@@ -72,12 +73,14 @@ def pruning_with_param_tying_test():
     new_n1 = new_n.chs[0].chs[0]
     assert new_n1.edge_ids.size(1) == 3
     assert torch.all(new_n1.edge_ids == torch.tensor([[0,1,1],[0,0,1]]))
-    assert torch.all(new_n1._params == n1._params[[0,2,3]])
+    assert torch.all(torch.abs(new_n1._params[1:] - n1._params[[2,3]]) < 1e-4)
+    assert torch.all(torch.abs(new_n1._params[0] - 1.0) < 1e-4)
 
     new_n2 = new_n.chs[0].chs[1]
     assert new_n2.edge_ids.size(1) == 3
     assert torch.all(new_n2.edge_ids == torch.tensor([[0,1,1],[0,0,1]]))
-    assert torch.all(new_n2._params == n1._params[[0,2,3]])
+    assert torch.all(torch.abs(new_n2._params[1:] - n1._params[[2,3]]) < 1e-4)
+    assert torch.all(torch.abs(new_n2._params[0] - 1.0) < 1e-4)
 
 
 if __name__ == "__main__":
