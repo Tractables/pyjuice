@@ -151,6 +151,79 @@ def bernoulli_nodes_test():
     assert torch.all(torch.abs(new_params - pc.input_layers[0].params) < 1e-4)
 
 
+def gaussian_nodes_test():
+
+    ni0 = inputs(0, num_nodes = 2, dist = dists.Gaussian(mu = 0.0, sigma = 1.0))
+    ni1 = inputs(1, num_nodes = 2, dist = dists.Gaussian(mu = 0.0, sigma = 1.0))
+    ni2 = inputs(2, num_nodes = 2, dist = dists.Gaussian(mu = 0.0, sigma = 1.0))
+    ni3 = inputs(3, num_nodes = 2, dist = dists.Gaussian(mu = 0.0, sigma = 1.0))
+
+    m1 = multiply(ni0, ni1, edge_ids = torch.tensor([[0, 0], [0, 1], [1, 0], [1, 1]], dtype = torch.long))
+    n1 = summate(m1, edge_ids = torch.tensor([[0, 0, 0, 0, 1, 1, 1, 1], [0, 1, 2, 3, 0, 1, 2, 3]], dtype = torch.long))
+
+    m2 = multiply(ni2, ni3, edge_ids = torch.tensor([[0, 0], [1, 1]], dtype = torch.long))
+    n2 = summate(m2, edge_ids = torch.tensor([[0, 0, 1, 1], [0, 1, 0, 1]], dtype = torch.long))
+
+    m = multiply(n1, n2, edge_ids = torch.tensor([[0, 0], [1, 1]], dtype = torch.long))
+    n = summate(m, edge_ids = torch.tensor([[0, 0], [0, 1]], dtype = torch.long))
+
+    pc = TensorCircuit(n)
+
+    device = torch.device("cuda:0")
+    pc.to(device)
+
+    data = torch.randn([16, 4]).to(device)
+
+    lls = pc(data)
+
+    pc.backward(data)
+
+    ## Input node forward tests ##
+
+    for j in range(8):
+        gt_probs = torch.distributions.normal.Normal(pc.input_layers[0].params[2*j], pc.input_layers[0].params[2*j+1]).log_prob(data[:,j//2])
+        assert torch.all(torch.abs(gt_probs - pc.node_mars[j+1,:]) < 1e-4)
+
+    ## Input node backward tests ##
+
+    gt_param_flows = torch.zeros([24], device = pc.node_flows.device)
+
+    for j in range(8):
+        gt_param_flows[3*j] = (data[:,j//2] * pc.node_flows[j+1,:]).sum()
+        gt_param_flows[3*j+1] = ((data[:,j//2] ** 2) * pc.node_flows[j+1,:]).sum()
+        gt_param_flows[3*j+2] = (pc.node_flows[j+1,:]).sum()
+
+    assert torch.all(torch.abs(gt_param_flows - pc.input_layers[0].param_flows) < 1e-4)
+
+    ## EM tests ##
+
+    ori_mu = pc.input_layers[0].params.reshape(8, 2)[:,0]
+    ori_sigma = pc.input_layers[0].params.reshape(8, 2)[:,1]
+
+    step_size = 0.3
+    pseudocount = 0.1
+
+    stat1 = pc.input_layers[0].param_flows.reshape(8, 3)[:,0]
+    stat2 = pc.input_layers[0].param_flows.reshape(8, 3)[:,1]
+    stat3 = pc.input_layers[0].param_flows.reshape(8, 3)[:,2]
+
+    updated_mu = stat1 / (stat3 + pseudocount)
+    updated_sigma2 = (stat2 - updated_mu * updated_mu * stat3) / (stat3 + pseudocount)
+
+    # Treating Gaussians as exponential distributions, we can do EM updates by 
+    # linear interpolation of `mu` and `sigma^2 - mu^2`
+    new_mu = (1.0 - step_size) * ori_mu + step_size * updated_mu
+    new_sigma2_min_mu2 = (1.0 - step_size) * (ori_sigma**2 - ori_mu**2) + \
+        step_size * (updated_sigma2 - updated_mu * updated_mu)
+    new_sigma = torch.sqrt(new_sigma2_min_mu2 + new_mu * new_mu)
+
+    pc.mini_batch_em(step_size = step_size, pseudocount = pseudocount)
+
+    assert torch.all(torch.abs(new_mu - pc.input_layers[0].params.reshape(8, 2)[:,0]) < 1e-4)
+    assert torch.all(torch.abs(new_sigma - pc.input_layers[0].params.reshape(8, 2)[:,1]) < 1e-4)
+
+
 if __name__ == "__main__":
     # categorical_nodes_test()
-    bernoulli_nodes_test()
+    # bernoulli_nodes_test()
+    gaussian_nodes_test()
