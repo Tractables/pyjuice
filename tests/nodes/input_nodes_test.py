@@ -1,6 +1,7 @@
 import pyjuice as juice
 import torch
 import numpy as np
+import math
 
 import pyjuice.nodes.distributions as dists
 from pyjuice.utils import BitSet
@@ -197,8 +198,8 @@ def gaussian_nodes_test():
 
     ## EM tests ##
 
-    ori_mu = pc.input_layers[0].params.reshape(8, 2)[:,0]
-    ori_sigma = pc.input_layers[0].params.reshape(8, 2)[:,1]
+    ori_mu = pc.input_layers[0].params.reshape(8, 2)[:,0].clone()
+    ori_sigma = pc.input_layers[0].params.reshape(8, 2)[:,1].clone()
 
     step_size = 0.3
     pseudocount = 0.1
@@ -211,19 +212,109 @@ def gaussian_nodes_test():
     updated_sigma2 = (stat2 - updated_mu * updated_mu * stat3) / (stat3 + pseudocount)
 
     # Treating Gaussians as exponential distributions, we can do EM updates by 
-    # linear interpolation of `mu` and `sigma^2 - mu^2`
+    # linear interpolation of `mu` and `sigma^2 + mu^2`
     new_mu = (1.0 - step_size) * ori_mu + step_size * updated_mu
-    new_sigma2_min_mu2 = (1.0 - step_size) * (ori_sigma**2 - ori_mu**2) + \
-        step_size * (updated_sigma2 - updated_mu * updated_mu)
-    new_sigma = torch.sqrt(new_sigma2_min_mu2 + new_mu * new_mu)
+    new_sigma2_plus_mu2 = (1.0 - step_size) * (ori_sigma**2 + ori_mu**2) + \
+        step_size * (updated_sigma2 + updated_mu * updated_mu)
+    new_sigma = torch.sqrt(new_sigma2_plus_mu2 - new_mu * new_mu)
 
     pc.mini_batch_em(step_size = step_size, pseudocount = pseudocount)
 
     assert torch.all(torch.abs(new_mu - pc.input_layers[0].params.reshape(8, 2)[:,0]) < 1e-4)
-    assert torch.all(torch.abs(new_sigma - pc.input_layers[0].params.reshape(8, 2)[:,1]) < 1e-4)
+    assert torch.all(torch.abs(new_sigma.clamp(min = 0.01) - pc.input_layers[0].params.reshape(8, 2)[:,1]) < 1e-4)
+
+
+def discrete_logistic_nodes_test():
+
+    ni0 = inputs(0, num_nodes = 2, dist = dists.DiscreteLogistic(val_range = [-1.0, 1.0], num_cats = 5))
+    ni1 = inputs(1, num_nodes = 2, dist = dists.DiscreteLogistic(val_range = [-1.0, 1.0], num_cats = 5))
+    ni2 = inputs(2, num_nodes = 2, dist = dists.DiscreteLogistic(val_range = [-1.0, 1.0], num_cats = 5))
+    ni3 = inputs(3, num_nodes = 2, dist = dists.DiscreteLogistic(val_range = [-1.0, 1.0], num_cats = 5))
+
+    m1 = multiply(ni0, ni1, edge_ids = torch.tensor([[0, 0], [0, 1], [1, 0], [1, 1]], dtype = torch.long))
+    n1 = summate(m1, edge_ids = torch.tensor([[0, 0, 0, 0, 1, 1, 1, 1], [0, 1, 2, 3, 0, 1, 2, 3]], dtype = torch.long))
+
+    m2 = multiply(ni2, ni3, edge_ids = torch.tensor([[0, 0], [1, 1]], dtype = torch.long))
+    n2 = summate(m2, edge_ids = torch.tensor([[0, 0, 1, 1], [0, 1, 0, 1]], dtype = torch.long))
+
+    m = multiply(n1, n2, edge_ids = torch.tensor([[0, 0], [1, 1]], dtype = torch.long))
+    n = summate(m, edge_ids = torch.tensor([[0, 0], [0, 1]], dtype = torch.long))
+
+    pc = TensorCircuit(n)
+
+    device = torch.device("cuda:0")
+    pc.to(device)
+
+    data = torch.arange(0, 5)[:,None].repeat(1, 4).to(device)
+
+    lls = pc(data)
+
+    pc.backward(data)
+
+    ## Input node forward tests ##
+
+    range_low = -1.0
+    range_high = 1.0
+
+    num_cats = 5
+
+    for j in range(8):
+        interval = (range_high - range_low) / num_cats
+        vlow = data[:,j//2] * interval + range_low
+        vhigh = vlow + interval
+
+        mu = pc.input_layers[0].params[2*j]
+        s = pc.input_layers[0].params[2*j+1]
+
+        cdfhigh = torch.where(data[:,j//2] == num_cats - 1, 1.0, 1.0 / (1.0 + torch.exp((mu - vhigh) / s)))
+        cdflow = torch.where(data[:,j//2] == 0, 0.0, 1.0 / (1.0 + torch.exp((mu - vlow) / s)))
+
+        log_probs = torch.log(cdfhigh - cdflow)
+
+        assert torch.all(torch.abs(pc.node_mars[j+1,:] - log_probs) < 1e-4)
+
+    ## Input node backward tests ##
+
+    gt_param_flows = torch.zeros([24], device = pc.node_flows.device)
+
+    for j in range(8):
+        gt_param_flows[3*j] = (data[:,j//2] * pc.node_flows[j+1,:]).sum()
+        gt_param_flows[3*j+1] = ((data[:,j//2] ** 2) * pc.node_flows[j+1,:]).sum()
+        gt_param_flows[3*j+2] = (pc.node_flows[j+1,:]).sum()
+
+    assert torch.all(torch.abs(gt_param_flows - pc.input_layers[0].param_flows) < 1e-4)
+
+    ## EM tests ##
+
+    ori_mu = pc.input_layers[0].params.reshape(8, 2)[:,0].clone()
+    ori_std = pc.input_layers[0].params.reshape(8, 2)[:,1].clone() * math.pi / math.sqrt(3.0)
+
+    step_size = 0.3
+    pseudocount = 0.1
+
+    stat1 = pc.input_layers[0].param_flows.reshape(8, 3)[:,0]
+    stat2 = pc.input_layers[0].param_flows.reshape(8, 3)[:,1]
+    stat3 = pc.input_layers[0].param_flows.reshape(8, 3)[:,2]
+
+    updated_mu = stat1 / (stat3 + pseudocount)
+    updated_std2 = (stat2 - updated_mu * updated_mu * stat3) / (stat3 + pseudocount)
+
+    # Treating Gaussians as exponential distributions, we can do EM updates by 
+    # linear interpolation of `mu` and `std^2 + mu^2`
+    new_mu = (1.0 - step_size) * ori_mu + step_size * updated_mu
+    new_std2_plus_mu2 = (1.0 - step_size) * (ori_std**2 + ori_mu**2) + \
+        step_size * (updated_std2 + updated_mu * updated_mu)
+    new_std = torch.sqrt(new_std2_plus_mu2 - new_mu * new_mu)
+    new_s = new_std * math.sqrt(3.0) / math.pi
+
+    pc.mini_batch_em(step_size = step_size, pseudocount = pseudocount)
+
+    assert torch.all(torch.abs(new_mu - pc.input_layers[0].params.reshape(8, 2)[:,0]) < 1e-4)
+    assert torch.all(torch.abs(new_s.clamp(min = 0.01) - pc.input_layers[0].params.reshape(8, 2)[:,1]) < 1e-4)
 
 
 if __name__ == "__main__":
-    # categorical_nodes_test()
-    # bernoulli_nodes_test()
+    categorical_nodes_test()
+    bernoulli_nodes_test()
     gaussian_nodes_test()
+    discrete_logistic_nodes_test()

@@ -10,17 +10,18 @@ from .distributions import Distribution
 
 
 class DiscreteLogistic(Distribution):
-    def __init__(self, val_range: Tuple[float,float], num_cats: int):
+    def __init__(self, val_range: Tuple[float,float], num_cats: int, min_std: float = 0.01):
         super(DiscreteLogistic, self).__init__()
 
         self.val_range = val_range
         self.num_cats = num_cats
+        self.min_std = min_std
 
     def get_signature(self):
         return "DiscreteLogistic"
 
     def get_metadata(self):
-        return [self.val_range[0], self.val_range[1], self.num_cats]
+        return [self.val_range[0], self.val_range[1], self.num_cats, self.min_std]
 
     def num_parameters(self):
         return 2
@@ -33,10 +34,13 @@ class DiscreteLogistic(Distribution):
         Initialize parameters for `num_nodes` nodes.
         Returned parameters should be flattened into a vector.
         """
-        mu = torch.normal(mean = torch.ones([num_nodes]) * kwargs["mu"], std = kwargs["sigma"])
-        s = torch.exp(torch.rand([num_nodes]) * -perturbation) * kwargs["sigma"] * math.sqrt(3) / math.pi
+        mu = kwargs["mu"] if "mu" in kwargs else (self.val_range[0] + self.val_range[1]) / 2.0
+        std = kwargs["std"] if "std" in kwargs else (self.val_range[1] - self.val_range[0]) / 4.0 # 2 sigma range
 
-        return torch.stack((mu, s), dim = 1).reshape(-1).contiguous()
+        mus = torch.normal(mean = torch.ones([num_nodes]) * mu, std = std)
+        ss = torch.exp(torch.rand([num_nodes]) * -0.04 * perturbation) * std * math.sqrt(3) / math.pi
+
+        return torch.stack((mus, ss), dim = 1).reshape(-1).contiguous()
 
     @staticmethod
     def fw_mar_fn(local_offsets, data, params_ptr, s_pids, metadata_ptr, metadata, mask, num_vars_per_node, BLOCK_SIZE):
@@ -49,10 +53,13 @@ class DiscreteLogistic(Distribution):
         mu = tl.load(params_ptr + s_pids, mask = mask, other = 0)
         s = tl.load(params_ptr + s_pids + 1, mask = mask, other = 0)
 
-        # 0: (-inf, range_low]; ...; num_cats - 1: [range_high, inf)
-        interval = (range_high - range_low) / (num_cats - 2)
-        vhigh = data * interval + range_low
-        vlow = vhigh - interval
+        # 0: (-inf, range_low + interval]; 
+        # 1: (range_low + interval, range_low + 2 * interval]; 
+        # ...; 
+        # num_cats - 1: [range_high - interval, inf)
+        interval = (range_high - range_low) / num_cats
+        vlow = data * interval + range_low
+        vhigh = vlow + interval
 
         cdfhigh = tl.where(data == num_cats - 1, 1.0, 1.0 / (1.0 + tl.exp((mu - vhigh) / s)))
         cdflow = tl.where(data == 0, 0.0, 1.0 / (1.0 + tl.exp((mu - vlow) / s)))
@@ -65,7 +72,7 @@ class DiscreteLogistic(Distribution):
     def bk_flow_fn(local_offsets, data, flows, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
                    metadata, mask, num_vars_per_node, BLOCK_SIZE):
         stat1 = data * flows
-        stat2 = tl.pow(data, 2) * flows
+        stat2 = data * data * flows
         stat3 = flows
 
         tl.atomic_add(param_flows_ptr + s_pfids, stat1, mask = mask)
@@ -89,9 +96,9 @@ class DiscreteLogistic(Distribution):
         sample = mu + s * tl.log(rnd_val / (1.0 - rnd_val))
 
         # Discretize
-        interval = (range_high - range_low) / (num_cats - 2)
+        interval = (range_high - range_low) / num_cats
         bin_val = (sample - range_low) / interval
-        sampled_id = tl.where(bin_val < 0, 0, tl.where(bin_val > num_cats - 1, num_cats, tl.floor(bin_val).to(tl.int64) + 1)) # TODO check
+        sampled_id = tl.where(bin_val < 0, 0, tl.where(bin_val > num_cats - 1, num_cats - 1, tl.floor(bin_val).to(tl.int64)))
 
         # Write back to `samples`
         sample_offsets = vids * batch_size + batch_offsets
@@ -100,24 +107,29 @@ class DiscreteLogistic(Distribution):
     @staticmethod
     def em_fn(local_offsets, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, s_mids_ptr, mask,
               step_size, pseudocount, BLOCK_SIZE):
+        # Get `min_std`
+        s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
+        min_std = tl.load(metadata_ptr + s_mids + 3, mask = mask, other = 0)
 
         mu = tl.load(params_ptr + s_pids, mask = mask, other = 0)
-        sigma = tl.load(params_ptr + s_pids + 1, mask = mask, other = 0) * math.pi / math.sqrt(3.0)
+        std = tl.load(params_ptr + s_pids + 1, mask = mask, other = 0) * 1.8137993642342178 # The constant is `math.pi / math.sqrt(3.0)`
 
         stat1 = tl.load(param_flows_ptr + s_pfids, mask = mask)
         stat2 = tl.load(param_flows_ptr + s_pfids + 1, mask = mask)
         stat3 = tl.load(param_flows_ptr + s_pfids + 2, mask = mask)
 
         updated_mu = stat1 / (stat3 + pseudocount)
-        updated_sigma2 = (stat2 - tl.pow(updated_mu, 2) * stat3) / (stat3 + pseudocount)
+        updated_std2 = (stat2 - updated_mu * updated_mu * stat3) / (stat3 + pseudocount)
 
         # Treating Gaussians as exponential distributions, we can do EM updates by 
-        # linear interpolation of `mu` and `sigma^2 - mu^2`
+        # linear interpolation of `mu` and `std^2 + mu^2`
         new_mu = (1.0 - step_size) * mu + step_size * updated_mu
-        new_sigma2_min_mu2 = (1.0 - step_size) * (tl.pow(sigma, 2) - tl.pow(mu, 2)) + \
-            step_size * (updated_sigma2 - tl.pow(updated_mu, 2))
-        new_sigma = tl.sqrt(new_sigma2_min_mu2 + tl.pow(new_mu, 2))
-        new_s = new_sigma * math.sqrt(3.0) / math.pi
+        new_std2_plus_mu2 = (1.0 - step_size) * (std * std + mu * mu) + \
+            step_size * (updated_std2 + updated_mu * updated_mu)
+        new_std2 = new_std2_plus_mu2 - new_mu * new_mu
+        new_std = tl.where(new_std2 > 1e-4, tl.sqrt(new_std2), min_std)
+        new_std = tl.where(new_std < min_std, min_std, new_std)
+        new_s = new_std * 0.5513288954217921 # The constant is `math.sqrt(3.0) / math.pi`
 
         tl.store(params_ptr + s_pids, new_mu, mask = mask)
         tl.store(params_ptr + s_pids + 1, new_s, mask = mask)

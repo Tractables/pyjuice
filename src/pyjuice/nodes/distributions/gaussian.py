@@ -10,7 +10,7 @@ from .distributions import Distribution
 
 
 class Gaussian(Distribution):
-    def __init__(self, mu: Optional[float] = None, sigma: Optional[float] = None):
+    def __init__(self, mu: Optional[float] = None, sigma: Optional[float] = None, min_sigma: float = 0.01):
         """
         `mu` and `sigma` are used to specify (approximately) the mean and std of the data.
         This is used for parameter initialization.
@@ -22,12 +22,13 @@ class Gaussian(Distribution):
 
         self.mu = mu
         self.sigma = sigma
+        self.min_sigma = min_sigma
 
     def get_signature(self):
         return "Gaussian"
 
     def get_metadata(self):
-        return []
+        return [self.min_sigma]
 
     def num_parameters(self):
         return 2
@@ -46,7 +47,7 @@ class Gaussian(Distribution):
         assert (sigma is not None), "`sigma` should be provided either during initialization or when calling `init_parameters`."
 
         mus = torch.normal(mean = torch.ones([num_nodes]) * mu, std = sigma)
-        sigmas = torch.exp(torch.rand([num_nodes]) * -perturbation) * sigma
+        sigmas = (torch.exp(torch.rand([num_nodes]) * -0.04 * perturbation) * sigma).clamp(min = self.min_sigma)
 
         return torch.stack((mus, sigmas), dim = 1).reshape(-1).contiguous()
 
@@ -88,6 +89,9 @@ class Gaussian(Distribution):
     @staticmethod
     def em_fn(local_offsets, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, s_mids_ptr, mask,
               step_size, pseudocount, BLOCK_SIZE):
+        # Get `num_cats` from `metadata`
+        s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
+        min_sigma = tl.load(metadata_ptr + s_mids, mask = mask, other = 0).to(tl.int64)
 
         mu = tl.load(params_ptr + s_pids, mask = mask, other = 0)
         sigma = tl.load(params_ptr + s_pids + 1, mask = mask, other = 0)
@@ -100,11 +104,13 @@ class Gaussian(Distribution):
         updated_sigma2 = (stat2 - updated_mu * updated_mu * stat3) / (stat3 + pseudocount)
 
         # Treating Gaussians as exponential distributions, we can do EM updates by 
-        # linear interpolation of `mu` and `sigma^2 - mu^2`
+        # linear interpolation of `mu` and `sigma^2 + mu^2`
         new_mu = (1.0 - step_size) * mu + step_size * updated_mu
-        new_sigma2_min_mu2 = (1.0 - step_size) * (sigma * sigma - mu * mu) + \
-            step_size * (updated_sigma2 - updated_mu * updated_mu)
-        new_sigma = tl.sqrt(new_sigma2_min_mu2 + new_mu * new_mu)
+        new_sigma2_plus_mu2 = (1.0 - step_size) * (sigma * sigma + mu * mu) + \
+            step_size * (updated_sigma2 + updated_mu * updated_mu)
+        new_sigma2 = new_sigma2_plus_mu2 - new_mu * new_mu
+        new_sigma = tl.where(new_sigma2 > 1e-4, tl.sqrt(new_sigma2), min_sigma)
+        new_sigma = tl.where(new_sigma < min_sigma, min_sigma, new_sigma)
 
         tl.store(params_ptr + s_pids, new_mu, mask = mask)
         tl.store(params_ptr + s_pids + 1, new_sigma, mask = mask)
