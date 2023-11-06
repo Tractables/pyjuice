@@ -276,6 +276,7 @@ class InputLayer(Layer, nn.Module):
                 params_ptr = self.params,
                 param_flows_ptr = self.param_flows,
                 node_flows_ptr = node_flows, 
+                node_mars_ptr = node_mars,
                 data_ptr = data, 
                 vids_ptr = self.vids, 
                 s_pids_ptr = self.s_pids,
@@ -577,7 +578,7 @@ class InputLayer(Layer, nn.Module):
         tl.store(node_mars_ptr + node_offsets, mars, mask = mask)
 
     @staticmethod
-    def _flows_kernel_template(flow_fn, params_ptr, param_flows_ptr, node_flows_ptr, data_ptr, vids_ptr, s_pids_ptr, s_pfids_ptr,
+    def _flows_kernel_template(flow_fn, params_ptr, param_flows_ptr, node_flows_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, s_pfids_ptr,
                                metadata_ptr, s_mids_ptr, bk_local_ids_ptr, partial_eval: tl.constexpr, layer_num_nodes: tl.constexpr, 
                                batch_size: tl.constexpr, num_vars_per_node: tl.constexpr, nv_block_size: tl.constexpr, node_offset: tl.constexpr, 
                                BLOCK_SIZE: tl.constexpr):
@@ -617,7 +618,7 @@ class InputLayer(Layer, nn.Module):
         ns_offsets = (local_offsets + node_offset) * batch_size + batch_offsets
         flows = tl.load(node_flows_ptr + ns_offsets, mask = mask, other = 0)
 
-        flow_fn(local_offsets, data, flows, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
+        flow_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
                 metadata, mask, num_vars_per_node, BLOCK_SIZE)
 
     @staticmethod

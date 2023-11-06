@@ -62,7 +62,7 @@ class Gaussian(Distribution):
         return log_probs
 
     @staticmethod
-    def bk_flow_fn(local_offsets, data, flows, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
+    def bk_flow_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
                    metadata, mask, num_vars_per_node, BLOCK_SIZE):
         stat1 = data * flows
         stat2 = data * data * flows
@@ -91,26 +91,28 @@ class Gaussian(Distribution):
               step_size, pseudocount, BLOCK_SIZE):
         # Get `num_cats` from `metadata`
         s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
-        min_sigma = tl.load(metadata_ptr + s_mids, mask = mask, other = 0).to(tl.int64)
+        min_sigma = tl.load(metadata_ptr + s_mids, mask = mask, other = 0)
 
         mu = tl.load(params_ptr + s_pids, mask = mask, other = 0)
         sigma = tl.load(params_ptr + s_pids + 1, mask = mask, other = 0)
+        ori_theta1 = mu
+        ori_theta2 = sigma * sigma + mu * mu
 
         stat1 = tl.load(param_flows_ptr + s_pfids, mask = mask)
         stat2 = tl.load(param_flows_ptr + s_pfids + 1, mask = mask)
         stat3 = tl.load(param_flows_ptr + s_pfids + 2, mask = mask)
 
-        updated_mu = stat1 / (stat3 + pseudocount)
-        updated_sigma2 = (stat2 - updated_mu * updated_mu * stat3) / (stat3 + pseudocount)
+        new_theta1 = stat1 / (stat3 + 1e-10)
+        new_theta2 = stat2 / (stat3 + 1e-10)
 
-        # Treating Gaussians as exponential distributions, we can do EM updates by 
-        # linear interpolation of `mu` and `sigma^2 + mu^2`
-        new_mu = (1.0 - step_size) * mu + step_size * updated_mu
-        new_sigma2_plus_mu2 = (1.0 - step_size) * (sigma * sigma + mu * mu) + \
-            step_size * (updated_sigma2 + updated_mu * updated_mu)
-        new_sigma2 = new_sigma2_plus_mu2 - new_mu * new_mu
-        new_sigma = tl.where(new_sigma2 > 1e-4, tl.sqrt(new_sigma2), min_sigma)
-        new_sigma = tl.where(new_sigma < min_sigma, min_sigma, new_sigma)
+        # Get the updated natural parameters
+        updated_theta1 = (1.0 - step_size) * ori_theta1 + step_size * new_theta1
+        updated_theta2 = (1.0 - step_size) * ori_theta2 + step_size * new_theta2
 
-        tl.store(params_ptr + s_pids, new_mu, mask = mask)
-        tl.store(params_ptr + s_pids + 1, new_sigma, mask = mask)
+        # Reconstruct `mu` and `sigma` from the expectation parameters (moment matching)
+        updated_mu = updated_theta1
+        updated_sigma2 = updated_theta2 - updated_mu * updated_mu
+        updated_sigma = tl.where(updated_sigma2 < min_sigma * min_sigma, min_sigma, tl.sqrt(updated_sigma2))
+
+        tl.store(params_ptr + s_pids, updated_mu, mask = mask)
+        tl.store(params_ptr + s_pids + 1, updated_sigma, mask = mask)

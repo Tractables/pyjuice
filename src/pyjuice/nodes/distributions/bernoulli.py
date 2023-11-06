@@ -42,7 +42,7 @@ class Bernoulli(Distribution):
         return log_probs
 
     @staticmethod
-    def bk_flow_fn(local_offsets, data, flows, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
+    def bk_flow_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
                    metadata, mask, num_vars_per_node, BLOCK_SIZE):
         pf_offsets = s_pfids + tl.where(data > 0, 0, 1)
         tl.atomic_add(param_flows_ptr + pf_offsets, flows, mask = mask)

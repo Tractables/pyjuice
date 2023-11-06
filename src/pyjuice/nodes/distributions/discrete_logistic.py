@@ -64,15 +64,24 @@ class DiscreteLogistic(Distribution):
         cdfhigh = tl.where(data == num_cats - 1, 1.0, 1.0 / (1.0 + tl.exp((mu - vhigh) / s)))
         cdflow = tl.where(data == 0, 0.0, 1.0 / (1.0 + tl.exp((mu - vlow) / s)))
 
-        log_probs = tl.log(cdfhigh - cdflow)
+        log_probs = tl.maximum(tl.log(cdfhigh - cdflow), -1000.0)
 
         return log_probs
 
     @staticmethod
-    def bk_flow_fn(local_offsets, data, flows, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
+    def bk_flow_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
                    metadata, mask, num_vars_per_node, BLOCK_SIZE):
-        stat1 = data * flows
-        stat2 = data * data * flows
+        # Get `val_range` and `num_cats` from `metadata`
+        s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
+        range_low = tl.load(metadata_ptr + s_mids, mask = mask, other = 0)
+        range_high = tl.load(metadata_ptr + s_mids + 1, mask = mask, other = 0)
+        num_cats = tl.load(metadata_ptr + s_mids + 2, mask = mask, other = 0).to(tl.int64)
+
+        interval = (range_high - range_low) / num_cats
+        vmid = data * interval + range_low + 0.5 * interval # (vlow + vhigh) / 2
+
+        stat1 = vmid * flows
+        stat2 = vmid * vmid * flows
         stat3 = flows
 
         tl.atomic_add(param_flows_ptr + s_pfids, stat1, mask = mask)
@@ -113,23 +122,25 @@ class DiscreteLogistic(Distribution):
 
         mu = tl.load(params_ptr + s_pids, mask = mask, other = 0)
         std = tl.load(params_ptr + s_pids + 1, mask = mask, other = 0) * 1.8137993642342178 # The constant is `math.pi / math.sqrt(3.0)`
+        ori_theta1 = mu
+        ori_theta2 = std * std + mu * mu
 
         stat1 = tl.load(param_flows_ptr + s_pfids, mask = mask)
         stat2 = tl.load(param_flows_ptr + s_pfids + 1, mask = mask)
         stat3 = tl.load(param_flows_ptr + s_pfids + 2, mask = mask)
 
-        updated_mu = stat1 / (stat3 + pseudocount)
-        updated_std2 = (stat2 - updated_mu * updated_mu * stat3) / (stat3 + pseudocount)
+        new_theta1 = stat1 / (stat3 + 1e-10)
+        new_theta2 = stat2 / (stat3 + 1e-10)
 
-        # Treating Gaussians as exponential distributions, we can do EM updates by 
-        # linear interpolation of `mu` and `std^2 + mu^2`
-        new_mu = (1.0 - step_size) * mu + step_size * updated_mu
-        new_std2_plus_mu2 = (1.0 - step_size) * (std * std + mu * mu) + \
-            step_size * (updated_std2 + updated_mu * updated_mu)
-        new_std2 = new_std2_plus_mu2 - new_mu * new_mu
-        new_std = tl.where(new_std2 > 1e-4, tl.sqrt(new_std2), min_std)
-        new_std = tl.where(new_std < min_std, min_std, new_std)
-        new_s = new_std * 0.5513288954217921 # The constant is `math.sqrt(3.0) / math.pi`
+        # Get the updated natural parameters
+        updated_theta1 = (1.0 - step_size) * ori_theta1 + step_size * new_theta1
+        updated_theta2 = (1.0 - step_size) * ori_theta2 + step_size * new_theta2
 
-        tl.store(params_ptr + s_pids, new_mu, mask = mask)
-        tl.store(params_ptr + s_pids + 1, new_s, mask = mask)
+        # Reconstruct `mu` and `std` from the expectation parameters (moment matching)
+        updated_mu = updated_theta1
+        updated_std2 = updated_theta2 - updated_mu * updated_mu
+        updated_std = tl.where(updated_std2 < min_std * min_std, min_std, tl.sqrt(updated_std2))
+        updated_s = updated_std * 0.5513288954217921 # The constant is `math.sqrt(3.0) / math.pi`
+
+        tl.store(params_ptr + s_pids, updated_mu, mask = mask)
+        tl.store(params_ptr + s_pids + 1, updated_s, mask = mask)

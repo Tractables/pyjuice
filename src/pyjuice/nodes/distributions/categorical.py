@@ -47,7 +47,7 @@ class Categorical(Distribution):
         return log_probs
 
     @staticmethod
-    def bk_flow_fn(local_offsets, data, flows, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
+    def bk_flow_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
                    metadata, mask, num_vars_per_node, BLOCK_SIZE):
         # I am not sure why, but the following code will not work...
         # tl.atomic_add(param_flows_ptr + s_pfids + data, flows, mask = mask)

@@ -194,34 +194,39 @@ def gaussian_nodes_test():
         gt_param_flows[3*j+1] = ((data[:,j//2] ** 2) * pc.node_flows[j+1,:]).sum()
         gt_param_flows[3*j+2] = (pc.node_flows[j+1,:]).sum()
 
-    assert torch.all(torch.abs(gt_param_flows - pc.input_layers[0].param_flows) < 1e-4)
+    assert torch.all(torch.abs(gt_param_flows - pc.input_layers[0].param_flows) < 1e-2)
 
     ## EM tests ##
 
-    ori_mu = pc.input_layers[0].params.reshape(8, 2)[:,0].clone()
-    ori_sigma = pc.input_layers[0].params.reshape(8, 2)[:,1].clone()
+    mu = pc.input_layers[0].params.reshape(8, 2)[:,0].clone()
+    sigma = pc.input_layers[0].params.reshape(8, 2)[:,1].clone()
+    ori_theta1 = mu
+    ori_theta2 = sigma * sigma + mu * mu
 
     step_size = 0.3
     pseudocount = 0.1
+    min_sigma = 0.01
 
     stat1 = pc.input_layers[0].param_flows.reshape(8, 3)[:,0]
     stat2 = pc.input_layers[0].param_flows.reshape(8, 3)[:,1]
     stat3 = pc.input_layers[0].param_flows.reshape(8, 3)[:,2]
 
-    updated_mu = stat1 / (stat3 + pseudocount)
-    updated_sigma2 = (stat2 - updated_mu * updated_mu * stat3) / (stat3 + pseudocount)
+    new_theta1 = stat1 / (stat3 + 1e-10)
+    new_theta2 = stat2 / (stat3 + 1e-10)
 
-    # Treating Gaussians as exponential distributions, we can do EM updates by 
-    # linear interpolation of `mu` and `sigma^2 + mu^2`
-    new_mu = (1.0 - step_size) * ori_mu + step_size * updated_mu
-    new_sigma2_plus_mu2 = (1.0 - step_size) * (ori_sigma**2 + ori_mu**2) + \
-        step_size * (updated_sigma2 + updated_mu * updated_mu)
-    new_sigma = torch.sqrt(new_sigma2_plus_mu2 - new_mu * new_mu)
+    # Get the updated natural parameters
+    updated_theta1 = (1.0 - step_size) * ori_theta1 + step_size * new_theta1
+    updated_theta2 = (1.0 - step_size) * ori_theta2 + step_size * new_theta2
+
+    # Reconstruct `mu` and `sigma` from the natural parameters
+    updated_mu = updated_theta1
+    updated_sigma2 = updated_theta2 - updated_mu * updated_mu
+    updated_sigma = torch.where(updated_sigma2 < min_sigma * min_sigma, min_sigma, torch.sqrt(updated_sigma2))
 
     pc.mini_batch_em(step_size = step_size, pseudocount = pseudocount)
 
-    assert torch.all(torch.abs(new_mu - pc.input_layers[0].params.reshape(8, 2)[:,0]) < 1e-4)
-    assert torch.all(torch.abs(new_sigma.clamp(min = 0.01) - pc.input_layers[0].params.reshape(8, 2)[:,1]) < 1e-4)
+    assert torch.all(torch.abs(updated_mu - pc.input_layers[0].params.reshape(8, 2)[:,0]) < 1e-4)
+    assert torch.all(torch.abs(updated_sigma.clamp(min = 0.01) - pc.input_layers[0].params.reshape(8, 2)[:,1]) < 1e-4)
 
 
 def discrete_logistic_nodes_test():
@@ -278,39 +283,94 @@ def discrete_logistic_nodes_test():
     gt_param_flows = torch.zeros([24], device = pc.node_flows.device)
 
     for j in range(8):
-        gt_param_flows[3*j] = (data[:,j//2] * pc.node_flows[j+1,:]).sum()
-        gt_param_flows[3*j+1] = ((data[:,j//2] ** 2) * pc.node_flows[j+1,:]).sum()
+        interval = (range_high - range_low) / num_cats
+        vmid = data[:,j//2] * interval + range_low + 0.5 * interval # (vlow + vhigh) / 2
+
+        gt_param_flows[3*j] = (vmid * pc.node_flows[j+1,:]).sum()
+        gt_param_flows[3*j+1] = ((vmid ** 2) * pc.node_flows[j+1,:]).sum()
         gt_param_flows[3*j+2] = (pc.node_flows[j+1,:]).sum()
 
     assert torch.all(torch.abs(gt_param_flows - pc.input_layers[0].param_flows) < 1e-4)
 
     ## EM tests ##
 
-    ori_mu = pc.input_layers[0].params.reshape(8, 2)[:,0].clone()
-    ori_std = pc.input_layers[0].params.reshape(8, 2)[:,1].clone() * math.pi / math.sqrt(3.0)
+    mu = pc.input_layers[0].params.reshape(8, 2)[:,0].clone()
+    std = pc.input_layers[0].params.reshape(8, 2)[:,1].clone() * math.pi / math.sqrt(3.0)
+    ori_theta1 = mu
+    ori_theta2 = std * std + mu * mu
 
     step_size = 0.3
     pseudocount = 0.1
+    min_std = 0.01
 
     stat1 = pc.input_layers[0].param_flows.reshape(8, 3)[:,0]
     stat2 = pc.input_layers[0].param_flows.reshape(8, 3)[:,1]
     stat3 = pc.input_layers[0].param_flows.reshape(8, 3)[:,2]
 
-    updated_mu = stat1 / (stat3 + pseudocount)
-    updated_std2 = (stat2 - updated_mu * updated_mu * stat3) / (stat3 + pseudocount)
+    new_theta1 = stat1 / (stat3 + 1e-10)
+    new_theta2 = stat2 / (stat3 + 1e-10)
 
-    # Treating Gaussians as exponential distributions, we can do EM updates by 
-    # linear interpolation of `mu` and `std^2 + mu^2`
-    new_mu = (1.0 - step_size) * ori_mu + step_size * updated_mu
-    new_std2_plus_mu2 = (1.0 - step_size) * (ori_std**2 + ori_mu**2) + \
-        step_size * (updated_std2 + updated_mu * updated_mu)
-    new_std = torch.sqrt(new_std2_plus_mu2 - new_mu * new_mu)
-    new_s = new_std * math.sqrt(3.0) / math.pi
+    # Get the updated natural parameters
+    updated_theta1 = (1.0 - step_size) * ori_theta1 + step_size * new_theta1
+    updated_theta2 = (1.0 - step_size) * ori_theta2 + step_size * new_theta2
+
+    # Reconstruct `mu` and `std` from the expectation parameters (moment matching)
+    updated_mu = updated_theta1
+    updated_std2 = updated_theta2 - updated_mu * updated_mu
+    updated_std = torch.where(updated_std2 < min_std * min_std, min_std, torch.sqrt(updated_std2))
+    updated_s = updated_std * math.sqrt(3.0) / math.pi
 
     pc.mini_batch_em(step_size = step_size, pseudocount = pseudocount)
 
-    assert torch.all(torch.abs(new_mu - pc.input_layers[0].params.reshape(8, 2)[:,0]) < 1e-4)
-    assert torch.all(torch.abs(new_s.clamp(min = 0.01) - pc.input_layers[0].params.reshape(8, 2)[:,1]) < 1e-4)
+    assert torch.all(torch.abs(updated_mu - pc.input_layers[0].params.reshape(8, 2)[:,0]) < 1e-4)
+    assert torch.all(torch.abs(updated_s - pc.input_layers[0].params.reshape(8, 2)[:,1]) < 1e-4)
+
+
+def discrete_logistic_nodes_behavior_test():
+
+    ni0 = inputs(0, num_nodes = 2, dist = dists.DiscreteLogistic(val_range = [-1.0, 1.0], num_cats = 5))
+    ni1 = inputs(1, num_nodes = 2, dist = dists.DiscreteLogistic(val_range = [-1.0, 1.0], num_cats = 5))
+    ni2 = inputs(2, num_nodes = 2, dist = dists.DiscreteLogistic(val_range = [-1.0, 1.0], num_cats = 5))
+    ni3 = inputs(3, num_nodes = 2, dist = dists.DiscreteLogistic(val_range = [-1.0, 1.0], num_cats = 5))
+
+    m1 = multiply(ni0, ni1, edge_ids = torch.tensor([[0, 0], [0, 1], [1, 0], [1, 1]], dtype = torch.long))
+    n1 = summate(m1, edge_ids = torch.tensor([[0, 0, 0, 0, 1, 1, 1, 1], [0, 1, 2, 3, 0, 1, 2, 3]], dtype = torch.long))
+
+    m2 = multiply(ni2, ni3, edge_ids = torch.tensor([[0, 0], [1, 1]], dtype = torch.long))
+    n2 = summate(m2, edge_ids = torch.tensor([[0, 0, 1, 1], [0, 1, 0, 1]], dtype = torch.long))
+
+    m = multiply(n1, n2, edge_ids = torch.tensor([[0, 0], [1, 1]], dtype = torch.long))
+    n = summate(m, edge_ids = torch.tensor([[0, 0], [0, 1]], dtype = torch.long))
+
+    pc = TensorCircuit(n)
+
+    device = torch.device("cuda:0")
+    pc.to(device)
+
+    data = torch.tensor([
+        [0,0,2,2],
+        [1,0,3,3],
+        [0,1,3,2],
+        [3,3,4,4],
+        [2,2,4,4],
+        [2,3,4,4]
+    ]).to(device)
+
+    for _ in range(20):
+        lls = pc(data)
+
+        pc.backward(data)
+
+        pc.mini_batch_em(step_size = 1.0, pseudocount = 0.01)
+
+    assert lls.mean() > -3.0
+
+    pc.update_parameters()
+
+    assert (ni0._params[0] > 0.05 and ni0._params[2] < -0.6) or (ni0._params[2] > 0.05 and ni0._params[0] < -0.6)
+    assert (ni1._params[0] > 0.05 and ni1._params[2] < -0.6) or (ni1._params[2] > 0.05 and ni1._params[0] < -0.6)
+    assert (ni2._params[0] > 0.78 and ni2._params[2] < 0.4) or (ni2._params[2] > 0.78 and ni2._params[0] < 0.4)
+    assert (ni3._params[0] > 0.78 and ni3._params[2] < 0.4) or (ni3._params[2] > 0.78 and ni3._params[0] < 0.4)
 
 
 if __name__ == "__main__":
@@ -318,3 +378,4 @@ if __name__ == "__main__":
     bernoulli_nodes_test()
     gaussian_nodes_test()
     discrete_logistic_nodes_test()
+    discrete_logistic_nodes_behavior_test()

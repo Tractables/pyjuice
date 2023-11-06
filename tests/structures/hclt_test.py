@@ -3,6 +3,7 @@ import torch
 import torchvision
 import time
 from torch.utils.data import TensorDataset, DataLoader
+import pyjuice.nodes.distributions as dists
 
 
 def evaluate(pc, loader):
@@ -112,5 +113,58 @@ def hclt_test():
     full_batch_em_epoch(pc, train_loader, test_loader, device)
 
 
+def hclt_logistic_test():
+
+    device = torch.device("cuda:0")
+
+    train_dataset = torchvision.datasets.MNIST(root = "./examples/data", train = True, download = True)
+    test_dataset = torchvision.datasets.MNIST(root = "./examples/data", train = False, download = True)
+
+    train_data = train_dataset.data.reshape(60000, 28*28).float()
+    test_data = test_dataset.data.reshape(10000, 28*28).float()
+
+    num_features = train_data.size(1)
+
+    train_loader = DataLoader(
+        dataset = TensorDataset(train_data),
+        batch_size = 512,
+        shuffle = True,
+        drop_last = True
+    )
+    test_loader = DataLoader(
+        dataset = TensorDataset(test_data),
+        batch_size = 512,
+        shuffle = False,
+        drop_last = True
+    )
+
+    ns = juice.structures.HCLT(
+        train_data.float().to(device), 
+        num_bins = 32, 
+        sigma = 0.5 / 32, 
+        num_latents = 64, 
+        chunk_size = 32,
+        # input_layer_type = dists.Gaussian,
+        # input_layer_params = {"mu": 0.0, "sigma": 1.0 / 3,"min_sigma": 0.01}
+        input_layer_type = dists.DiscreteLogistic,
+        input_layer_params = {"val_range": (-1.0, 1.0), "num_cats": 256}
+    )
+    pc = juice.TensorCircuit(ns)
+
+    pc.to(device)
+
+    optimizer = juice.optim.CircuitOptimizer(pc, lr = 0.1, pseudocount = 0.1)
+    scheduler = juice.optim.CircuitScheduler(
+        optimizer, 
+        method = "multi_linear", 
+        lrs = [0.9, 0.1, 0.05], 
+        milestone_steps = [0, len(train_loader) * 100, len(train_loader) * 350]
+    )
+
+    mini_batch_em_epoch(350, pc, optimizer, scheduler, train_loader, test_loader, device)
+    full_batch_em_epoch(pc, train_loader, test_loader, device)
+
+
 if __name__ == "__main__":
     hclt_test()
+    hclt_logistic_test()
