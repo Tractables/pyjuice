@@ -538,7 +538,7 @@ class InputLayer(Layer, nn.Module):
 
         s_pids = tl.load(s_pids_ptr + local_offsets, mask = mask, other = 0)
 
-        mars = mar_fn(local_offsets, data, params_ptr, s_pids, metadata_ptr, metadata, mask, num_vars_per_node, BLOCK_SIZE)
+        mars = mar_fn(local_offsets, data, params_ptr, s_pids, metadata_ptr, s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE)
 
         node_offsets = local_offsets + node_offset
         tl.store(node_mars_ptr + node_offsets * batch_size + batch_offsets, mars, mask = mask)
@@ -619,7 +619,7 @@ class InputLayer(Layer, nn.Module):
         flows = tl.load(node_flows_ptr + ns_offsets, mask = mask, other = 0)
 
         flow_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
-                metadata, mask, num_vars_per_node, BLOCK_SIZE)
+                s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE)
 
     @staticmethod
     def _sample_kernel_template(sample_fn, samples_ptr, params_ptr, nflow_xids_ptr, nflow_yids_ptr, vids_ptr, s_pids_ptr, metadata_ptr, s_mids_ptr,
@@ -649,7 +649,7 @@ class InputLayer(Layer, nn.Module):
         # Get start parameter indices
         s_pids = tl.load(s_pids_ptr + local_offsets, mask = mask, other = 0)
 
-        sample_fn(samples_ptr, local_offsets, batch_offsets, vids, s_pids, params_ptr, metadata_ptr, s_mids_ptr, batch_size, BLOCK_SIZE, seed)
+        sample_fn(samples_ptr, local_offsets, batch_offsets, vids, s_pids, params_ptr, metadata_ptr, s_mids_ptr, mask, batch_size, BLOCK_SIZE, seed)
 
     @staticmethod
     def _em_kernel_template(em_fn, params_ptr, param_flows_ptr, s_pids_ptr, s_pfids_ptr, metadata_ptr, s_mids_ptr,

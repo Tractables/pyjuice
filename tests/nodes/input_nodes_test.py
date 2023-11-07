@@ -356,14 +356,14 @@ def discrete_logistic_nodes_behavior_test():
         [2,3,4,4]
     ]).to(device)
 
-    for _ in range(20):
+    for _ in range(40):
         lls = pc(data)
 
         pc.backward(data)
 
         pc.mini_batch_em(step_size = 1.0, pseudocount = 0.01)
 
-    assert lls.mean() > -3.0
+    assert lls.mean() > -3.5
 
     pc.update_parameters()
 

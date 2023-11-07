@@ -34,7 +34,7 @@ class Bernoulli(Distribution):
         return params[:,0].contiguous()
 
     @staticmethod
-    def fw_mar_fn(local_offsets, data, params_ptr, s_pids, metadata_ptr, metadata, mask, num_vars_per_node, BLOCK_SIZE):
+    def fw_mar_fn(local_offsets, data, params_ptr, s_pids, metadata_ptr, s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE):
         probs = tl.load(params_ptr + s_pids, mask = mask, other = 0)
         probs = tl.where(data > 0, probs, 1.0 - probs)
         log_probs = tl.log(probs)
@@ -43,12 +43,12 @@ class Bernoulli(Distribution):
 
     @staticmethod
     def bk_flow_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
-                   metadata, mask, num_vars_per_node, BLOCK_SIZE):
+                   s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE):
         pf_offsets = s_pfids + tl.where(data > 0, 0, 1)
         tl.atomic_add(param_flows_ptr + pf_offsets, flows, mask = mask)
 
     @staticmethod
-    def sample_fn(samples_ptr, local_offsets, batch_offsets, vids, s_pids, params_ptr, metadata_ptr, s_mids_ptr, batch_size, BLOCK_SIZE, seed):
+    def sample_fn(samples_ptr, local_offsets, batch_offsets, vids, s_pids, params_ptr, metadata_ptr, s_mids_ptr, mask, batch_size, BLOCK_SIZE, seed):
 
         rnd_val = tl.rand(seed, tl.arange(0, BLOCK_SIZE))
 

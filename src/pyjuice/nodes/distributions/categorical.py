@@ -36,7 +36,7 @@ class Categorical(Distribution):
         return params.reshape(-1)
 
     @staticmethod
-    def fw_mar_fn(local_offsets, data, params_ptr, s_pids, metadata_ptr, metadata, mask, num_vars_per_node, BLOCK_SIZE):
+    def fw_mar_fn(local_offsets, data, params_ptr, s_pids, metadata_ptr, s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE):
         # I am not sure why, but the following code will not work...
         # probs = tl.load(params_ptr + s_pids + data, mask = mask, other = 0)
         # Seems like a bug of triton.
@@ -48,7 +48,7 @@ class Categorical(Distribution):
 
     @staticmethod
     def bk_flow_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
-                   metadata, mask, num_vars_per_node, BLOCK_SIZE):
+                   s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE):
         # I am not sure why, but the following code will not work...
         # tl.atomic_add(param_flows_ptr + s_pfids + data, flows, mask = mask)
         # Seems like a bug of triton.
@@ -56,7 +56,7 @@ class Categorical(Distribution):
         tl.atomic_add(param_flows_ptr + pf_offsets, flows, mask = mask)
 
     @staticmethod
-    def sample_fn(samples_ptr, local_offsets, batch_offsets, vids, s_pids, params_ptr, metadata_ptr, s_mids_ptr, batch_size, BLOCK_SIZE, seed):
+    def sample_fn(samples_ptr, local_offsets, batch_offsets, vids, s_pids, params_ptr, metadata_ptr, s_mids_ptr, mask, batch_size, BLOCK_SIZE, seed):
         # Get `num_cats` from `metadata`
         s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
         num_cats = tl.load(metadata_ptr + s_mids, mask = mask, other = 0).to(tl.int64)

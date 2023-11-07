@@ -52,7 +52,7 @@ class Gaussian(Distribution):
         return torch.stack((mus, sigmas), dim = 1).reshape(-1).contiguous()
 
     @staticmethod
-    def fw_mar_fn(local_offsets, data, params_ptr, s_pids, metadata_ptr, metadata, mask, num_vars_per_node, BLOCK_SIZE):
+    def fw_mar_fn(local_offsets, data, params_ptr, s_pids, metadata_ptr, s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE):
         mu = tl.load(params_ptr + s_pids, mask = mask, other = 0)
         sigma = tl.load(params_ptr + s_pids + 1, mask = mask, other = 0)
 
@@ -63,7 +63,7 @@ class Gaussian(Distribution):
 
     @staticmethod
     def bk_flow_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
-                   metadata, mask, num_vars_per_node, BLOCK_SIZE):
+                   s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE):
         stat1 = data * flows
         stat2 = data * data * flows
         stat3 = flows
@@ -73,7 +73,7 @@ class Gaussian(Distribution):
         tl.atomic_add(param_flows_ptr + s_pfids + 2, stat3, mask = mask)
 
     @staticmethod
-    def sample_fn(samples_ptr, local_offsets, batch_offsets, vids, s_pids, params_ptr, metadata_ptr, s_mids_ptr, batch_size, BLOCK_SIZE, seed):
+    def sample_fn(samples_ptr, local_offsets, batch_offsets, vids, s_pids, params_ptr, metadata_ptr, s_mids_ptr, mask, batch_size, BLOCK_SIZE, seed):
 
         rnd_val = tl.randn(seed, tl.arange(0, BLOCK_SIZE))
 
