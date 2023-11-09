@@ -436,11 +436,13 @@ class TensorCircuit(nn.Module):
 
         return param_specs
 
-    def update_parameters(self, clone_params: bool = True):
+    def update_parameters(self, clone_params: bool = True, update_flows: bool = False):
         """
         Copy parameters from this `TensorCircuit` to the original `CircuitNodes`
         """
         params = self.params.detach().cpu()
+        if update_flows:
+            param_flows = self.param_flows.detach().cpu()
 
         for ns in self.root_nodes:
             if ns.is_sum() and not ns.is_tied():
@@ -449,6 +451,12 @@ class TensorCircuit(nn.Module):
                     ns._params = params[ns._param_ids].clone()
                 else:
                     ns._params = params[ns._param_ids]
+                
+                if update_flows:
+                    if clone_params:
+                        ns._flows = param_flows[ns._param_ids].clone()
+                    else:
+                        ns._flows = param_flows[ns._param_ids]
 
         for layer in self.input_layers:
             layer.update_parameters()

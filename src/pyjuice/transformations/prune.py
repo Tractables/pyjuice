@@ -10,7 +10,7 @@ from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes, foreach
 Tensor = Union[np.ndarray,torch.Tensor]
 
 
-def prune_by_score(root_nodes: CircuitNodes, scores: Optional[Dict[CircuitNodes,Tensor]] = None, 
+def prune_by_score(root_nodes: CircuitNodes, key: str = "_scores", scores: Optional[Dict[CircuitNodes,Tensor]] = None, 
                    keep_frac: Optional[float] = None, score_threshold: Optional[float] = None):
     
     # Traverse all nodes to collect scores
@@ -28,8 +28,8 @@ def prune_by_score(root_nodes: CircuitNodes, scores: Optional[Dict[CircuitNodes,
             else:
                 curr_scores = None
         else:
-            if hasattr(ns, "_scores"):
-                curr_scores = ns._scores
+            if hasattr(ns, key):
+                curr_scores = ns.__dict__[key]
             else:
                 curr_scores = None
 

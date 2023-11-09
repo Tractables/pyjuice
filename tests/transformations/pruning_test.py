@@ -83,6 +83,46 @@ def pruning_with_param_tying_test():
     assert torch.all(torch.abs(new_n2._params[0] - 1.0) < 1e-4)
 
 
+def pruning_by_flow_test():
+    num_nodes = 2
+
+    i0 = inputs(0, num_nodes, dists.Categorical(num_cats = 5))
+    i1 = inputs(1, num_nodes, dists.Categorical(num_cats = 5))
+    i2 = inputs(2, num_nodes, dists.Categorical(num_cats = 5))
+    i3 = inputs(3, num_nodes, dists.Categorical(num_cats = 5))
+
+    m1 = multiply(i0, i1)
+    n1 = summate(m1, num_nodes = num_nodes)
+
+    m2 = multiply(i2, i3)
+    n2 = summate(m2, num_nodes = num_nodes)
+
+    m = multiply(n1, n2)
+    n = summate(m, num_nodes = 1)
+
+    n.init_parameters(perturbation = 2.0)
+
+    device = torch.device("cuda:0")
+
+    pc = juice.TensorCircuit(n)
+    pc.to(device)
+
+    data = torch.randint(0, 5, [16, 4]).to(device)
+
+    # Run forward and backward manually to get the edge flows
+    # If there are more samples, just do this iteratively for 
+    # all batches. The flows will be accumulated automatically.
+    lls = pc(data)
+    pc.backward(data)
+
+    pc.update_parameters(update_flows = True) # Map the flows back to their corresponding nodes
+
+    new_n = prune_by_score(n, key = "_flows", score_threshold = 0.5) # Use `n._flows` for pruning
+
+    import pdb; pdb.set_trace()
+
+
 if __name__ == "__main__":
     pruning_test()
     pruning_with_param_tying_test()
+    pruning_by_flow_test()
