@@ -82,8 +82,9 @@ def prune_by_score(root_nodes: CircuitNodes, key: str = "_scores", scores: Optio
                     curr_eids = (edge_ids[0,:] == node_id) * edge_filter
                     if curr_eids.sum().item() == 0:
                         maxid = torch.argmax(
-                            flat_scores[score_ranges[ns][0]:score_ranges[ns][1]] * (edge_ids[0,:] == node_id)
-                        ) + score_ranges[ns][0]
+                            flat_scores[score_ranges[ns][0]:score_ranges[ns][1]] * (edge_ids[0,:] == node_id) + 
+                            (edge_ids[0,:] == node_id) * 1e-8
+                        )
                         copied_edges.append(edge_ids[:,maxid].unsqueeze(1))
                         copied_params.append(ns._params[maxid].reshape(1))
                     else:

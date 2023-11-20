@@ -119,8 +119,6 @@ def pruning_by_flow_test():
 
     new_n = prune_by_score(n, key = "_flows", score_threshold = 0.5) # Use `n._flows` for pruning
 
-    import pdb; pdb.set_trace()
-
 
 if __name__ == "__main__":
     pruning_test()
