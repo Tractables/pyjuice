@@ -5,6 +5,8 @@ import time
 from torch.utils.data import TensorDataset, DataLoader
 import pyjuice.nodes.distributions as dists
 
+from pyjuice.queries.hard_em import hard_em
+
 
 def evaluate(pc, loader):
     lls_total = 0.0
@@ -101,7 +103,7 @@ def hclt_test():
 
     pc.to(device)
 
-    optimizer = juice.optim.CircuitOptimizer(pc, lr = 0.1, pseudocount = 0.1)
+    optimizer = juice.optim.CircuitOptimizer(pc, lr = 0.9, pseudocount = 0.1)
     scheduler = juice.optim.CircuitScheduler(
         optimizer, 
         method = "multi_linear", 

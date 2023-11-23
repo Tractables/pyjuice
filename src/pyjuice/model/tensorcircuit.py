@@ -379,6 +379,10 @@ class TensorCircuit(nn.Module):
             return None
 
     def mini_batch_em(self, step_size: float, pseudocount: float = 0.0):
+        """
+        EM step:
+        params <- (1-step_size) * params + step_size * flows (w/ pseudocount)
+        """
         for layer in self.input_layers:
             layer.mini_batch_em(step_size = step_size, pseudocount = pseudocount)
         
@@ -391,6 +395,8 @@ class TensorCircuit(nn.Module):
                     return None
                 self._normalize_parameters(flows, pseudocount = pseudocount)
                 self.params.data = (1.0 - step_size) * self.params.data + step_size * flows
+                # self.params.data = self.params.data * (step_size * flows).exp()
+                # self._normalize_parameters(self.params.data, pseudocount = 0.0)
                 self.params[0] = 1.0
 
     def cumulate_flows(self, inputs: torch.Tensor, params: Optional[torch.Tensor] = None):
