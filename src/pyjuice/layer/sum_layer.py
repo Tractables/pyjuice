@@ -265,7 +265,7 @@ class SumLayer(Layer, nn.Module):
         n_ids = tl.load(nids_ptr + nid_offsets, mask = nid_mask, other = 0)
 
         # Get edge ids from `cids`
-        cid_offsets = tl.reshape(ne_offsets, (n_edges, n_nodes_per_block_m))
+        cid_offsets = tl.view(ne_offsets, (n_edges, n_nodes_per_block_m))
         cid_mask = tl.broadcast_to(nid_mask[None,:], (n_edges, n_nodes_per_block_m))
         ch_ids = tl.load(cids_ptr + cid_offsets, mask = cid_mask, other = 0)
 
@@ -307,9 +307,9 @@ class SumLayer(Layer, nn.Module):
             tl.broadcast_to(b_mask[:,None], (BLOCK_N, n_nodes_per_block_m))
         
         # Reshape seems to be necessary for certain combinations of (BLOCK_N, n_nodes_per_block_m)
-        nmar_offsets = tl.reshape(nmar_offsets, (BLOCK_N * n_nodes_per_block_m,))
-        nmar_mask = tl.reshape(nmar_mask, (BLOCK_N * n_nodes_per_block_m,))
-        n_logps = tl.reshape(n_logps, (BLOCK_N * n_nodes_per_block_m,))
+        nmar_offsets = tl.view(nmar_offsets, (BLOCK_N * n_nodes_per_block_m,))
+        nmar_mask = tl.view(nmar_mask, (BLOCK_N * n_nodes_per_block_m,))
+        n_logps = tl.view(n_logps, (BLOCK_N * n_nodes_per_block_m,))
         tl.store(node_mars_ptr + nmar_offsets, n_logps, mask = nmar_mask)
 
     @staticmethod
@@ -432,7 +432,7 @@ class SumLayer(Layer, nn.Module):
         n_mask = n_offsets < n_nodes
 
         # Reusable ids for index tensors
-        par_offsets = tl.reshape(ne_offsets, (n_edges, n_nodes_per_block_m))
+        par_offsets = tl.view(ne_offsets, (n_edges, n_nodes_per_block_m))
         par_mask = tl.broadcast_to(n_mask[None,:], (n_edges, n_nodes_per_block_m)) 
         bpar_mask = tl.broadcast_to(n_mask[None,None,:], (BLOCK_N, n_edges, n_nodes_per_block_m)) & \
             tl.broadcast_to(b_mask[:,None,None], (BLOCK_N, n_edges, n_nodes_per_block_m))

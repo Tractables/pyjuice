@@ -242,7 +242,7 @@ class ProdLayer(Layer, nn.Module):
         n_ids = tl.load(nids_ptr + nid_offsets, mask = nid_mask, other = 0)
 
         # Get edge ids from `cids`
-        cid_offsets = tl.reshape(ne_offsets, (n_edges, n_nodes_per_block_m))
+        cid_offsets = tl.view(ne_offsets, (n_edges, n_nodes_per_block_m))
         cid_mask = tl.broadcast_to(nid_mask[None,:], (n_edges, n_nodes_per_block_m))
         ch_ids = tl.load(cids_ptr + cid_offsets, mask = cid_mask, other = 0)
 
