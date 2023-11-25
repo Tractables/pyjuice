@@ -27,8 +27,33 @@ share/python-wheels/
 *.egg
 MANIFEST
 
-.vscode/
+.vscode
+.vs
 *.o
+
+## Ignore files of Triton ##
+
+# Triton builds
+src/pyjuice/triton/build/
+build/
+
+# Triton Python module builds
+src/pyjuice/triton/python/build/
+src/pyjuice/triton/python/triton.egg-info/
+src/pyjuice/triton/python/triton/_C/libtriton.pyd
+src/pyjuice/triton/python/triton/_C/libtriton.so
+
+# Python caches
+__pycache__
+.pytest_cache
+
+# VS Code project files
+.vscode
+.vs
+
+# JetBrains project files
+.idea
+cmake-build-*
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
