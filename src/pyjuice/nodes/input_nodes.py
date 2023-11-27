@@ -22,6 +22,8 @@ class InputNodes(CircuitNodes):
         self.dist = dist
 
         # Init parameters
+        if self.dist.need_external_params and params is None:
+            raise RuntimeError(f"Distribution `{self.dist}` requires `params` to be set.")
         if params is not None:
             self.set_params(params)
 
@@ -57,8 +59,7 @@ class InputNodes(CircuitNodes):
             return self._params
 
     def set_params(self, params: torch.Tensor, normalize: bool = True):
-        assert params.numel() == self.num_nodes * self.dist.num_parameters()
-        self._params = params.reshape(-1)
+        self._params = self.dist.init_parameters(self.num_nodes, params = params).reshape(-1)
 
     def init_parameters(self, perturbation: float = 2.0, recursive: bool = True, 
                         is_root: bool = True, ret_params: bool = False, **kwargs):

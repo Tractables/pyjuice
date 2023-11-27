@@ -4,7 +4,7 @@ import torch
 import triton
 import triton.language as tl
 import math
-from typing import Optional
+from typing import Optional, Any
 
 from .distributions import Distribution
 
@@ -36,11 +36,16 @@ class Gaussian(Distribution):
     def num_param_flows(self):
         return 3
 
-    def init_parameters(self, num_nodes: int, perturbation: float = 2.0, **kwargs):
+    def init_parameters(self, num_nodes: int, perturbation: float = 2.0, params: Optional[Any] = None, **kwargs):
         """
         Initialize parameters for `num_nodes` nodes.
         Returned parameters should be flattened into a vector.
         """
+        if params is not None:
+            assert isinstance(params, torch.Tensor)
+            assert params.numel() == num_nodes * self.num_parameters()
+            return params.contiguous()
+
         mu = kwargs["mu"] if "mu" in kwargs else self.mu
         sigma = kwargs["sigma"] if "sigma" in kwargs else self.sigma
         assert (mu is not None), "`mu` should be provided either during initialization or when calling `init_parameters`."
@@ -89,7 +94,7 @@ class Gaussian(Distribution):
     @staticmethod
     def em_fn(local_offsets, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, s_mids_ptr, mask,
               step_size, pseudocount, BLOCK_SIZE):
-        # Get `num_cats` from `metadata`
+        # Get `min_sigma` from `metadata`
         s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
         min_sigma = tl.load(metadata_ptr + s_mids, mask = mask, other = 0)
 

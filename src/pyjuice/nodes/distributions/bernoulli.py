@@ -4,6 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+from typing import Optional, Any
+
 from .distributions import Distribution
 
 
@@ -23,11 +25,16 @@ class Bernoulli(Distribution):
     def num_param_flows(self):
         return 2
 
-    def init_parameters(self, num_nodes: int, perturbation: float = 2.0, **kwargs):
+    def init_parameters(self, num_nodes: int, perturbation: float = 2.0, params: Optional[Any] = None, **kwargs):
         """
         Initialize parameters for `num_nodes` nodes.
         Returned parameters should be flattened into a vector.
         """
+        if params is not None:
+            assert isinstance(params, torch.Tensor)
+            assert params.numel() == num_nodes * self.num_parameters()
+            return params
+
         params = torch.exp(torch.rand([num_nodes, 2]) * -perturbation)
         params /= params.sum(dim = 1, keepdim = True)
 
