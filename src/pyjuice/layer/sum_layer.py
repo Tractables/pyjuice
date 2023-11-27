@@ -384,6 +384,12 @@ class SumLayer(Layer, nn.Module):
             BLOCK_M = triton.next_power_of_2(n_edges)
             BLOCK_N = max(BLOCK_SIZE // BLOCK_M, 1)
 
+        # import numpy as np
+        # np.savez("temp.npz", node_mars = node_mars.cpu().numpy(), element_mars = element_mars.cpu().numpy(), params = params.cpu().numpy(),
+        #          nids = nids.cpu().numpy(), cids = cids.cpu().numpy(), pids = pids.cpu().numpy(), tot_n_nodes = tot_n_nodes, tot_n_eles = tot_n_eles, n_nodes = n_nodes,
+        #          n_edges = n_edges, batch_size = batch_size, BLOCK_M = BLOCK_M, BLOCK_N = BLOCK_N)
+        # import pdb; pdb.set_trace()
+
         grid = (triton.cdiv(n_nodes * n_edges, BLOCK_M), triton.cdiv(batch_size, BLOCK_N), 1)
 
         self._forward_triton_kernel[grid](

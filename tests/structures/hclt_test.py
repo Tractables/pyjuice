@@ -94,7 +94,7 @@ def hclt_test():
         train_data.float().to(device), 
         num_bins = 32, 
         sigma = 0.5 / 32, 
-        num_latents = 64, 
+        num_latents = 128, 
         chunk_size = 32
     )
     pc = juice.TensorCircuit(ns)
