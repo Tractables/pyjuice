@@ -13,7 +13,11 @@ class MaskedCategorical(Distribution):
     def __init__(self, num_cats: int, mask_mode: str):
         super(MaskedCategorical, self).__init__()
 
-        assert mask_mode in ["range", "full_mask"]
+        # `range``: only values in [lo, hi) are accepted
+        # `full_mask`: specify a full mask of size Size([num_cats]); 
+        #              1 for allowed values and 0 for disallowed
+        # `rev_range`: values in [lo, hi) are masked out
+        assert mask_mode in ["range", "full_mask", "rev_range"]
 
         self.num_cats = num_cats
         self.mask_mode = mask_mode
@@ -28,6 +32,11 @@ class MaskedCategorical(Distribution):
             self.bk_flow_fn = self.bk_flow_fn_full_mask
             self.sample_fn = self.sample_fn_full_mask
             self.em_fn = self.em_fn_full_mask
+        elif self.mask_mode == "rev_range":
+            self.fw_mar_fn = self.fw_mar_fn_rev_range
+            self.bk_flow_fn = self.bk_flow_fn_rev_range
+            self.sample_fn = self.sample_fn_rev_range
+            self.em_fn = self.em_fn_rev_range
 
     def get_signature(self):
         return f"MaskedCategorical-{self.mask_mode}"
@@ -40,6 +49,8 @@ class MaskedCategorical(Distribution):
             return self.num_cats + 3
         elif self.mask_mode == "full_mask":
             return self.num_cats * 2 + 1
+        elif self.mask_mode == "rev_range":
+            return self.num_cats + 3
         else:
             raise ValueError(f"Unknown mask mode {self.mask_mode}.")
 
@@ -68,6 +79,9 @@ class MaskedCategorical(Distribution):
         elif self.mask_mode == "full_mask":
             assert mask_tensor.size(1) == self.num_cats
             num_free_cats = mask_tensor.sum(dim = 1).unsqueeze(1)
+        elif self.mask_mode == "rev_range":
+            assert mask_tensor.size(1) == 2
+            num_free_cats = self.num_cats - (mask_tensor[:,1:2] - mask_tensor[:,0:1])
 
         cat_params = torch.exp(torch.rand([num_nodes, self.num_cats]) * -perturbation)
         
@@ -75,8 +89,11 @@ class MaskedCategorical(Distribution):
         if self.mask_mode == "range":
             mask = torch.arange(self.num_cats).unsqueeze(0).expand(num_nodes, -1)
             cat_params[(mask < mask_tensor[:,:1]) | (mask >= mask_tensor[:,1:])] = 0.0
-        else:
+        elif self.mask_mode == "full_mask":
             cat_params[(mask_tensor < 0.5)] = 0.0
+        elif self.mask_mode == "rev_range":
+            mask = torch.arange(self.num_cats).unsqueeze(0).expand(num_nodes, -1)
+            cat_params[(mask >= mask_tensor[:,:1]) & (mask < mask_tensor[:,1:])] = 0.0
         
         cat_params /= cat_params.sum(dim = 1, keepdim = True)
 
@@ -131,6 +148,24 @@ class MaskedCategorical(Distribution):
         return log_probs
 
     @staticmethod
+    def fw_mar_fn_rev_range(local_offsets, data, params_ptr, s_pids, metadata_ptr, s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE):
+        # Get `num_cats` from `metadata`
+        s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
+        num_cats = tl.load(metadata_ptr + s_mids, mask = mask, other = 0).to(tl.int64)
+
+        # Rev range mode
+        lo_idx = s_pids + num_cats
+        lo = tl.load(params_ptr + lo_idx, mask = mask, other = 0)
+        hi_idx = lo_idx + 1
+        hi = tl.load(params_ptr + hi_idx, mask = mask, other = 0)
+
+        param_idx = s_pids + data
+        probs = tl.load(params_ptr + param_idx, mask = mask, other = 0)
+        log_probs = tl.where((data < lo) | (data >= hi), tl.log(probs), -23.0258509299) # log(1e-10)
+
+        return log_probs
+
+    @staticmethod
     def bk_flow_fn_range(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
                          s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE):
         # Get `num_cats` and from `metadata`
@@ -160,6 +195,24 @@ class MaskedCategorical(Distribution):
         prob_mask = tl.load(params_ptr + prob_mask_idx, mask = mask, other = 0)
 
         mask = mask & (prob_mask > 0.5)
+
+        pf_offsets = s_pfids + data
+        tl.atomic_add(param_flows_ptr + pf_offsets, flows, mask = mask)
+
+    @staticmethod
+    def bk_flow_fn_rev_range(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
+                             s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE):
+        # Get `num_cats` and from `metadata`
+        s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
+        num_cats = tl.load(metadata_ptr + s_mids, mask = mask, other = 0).to(tl.int64)
+
+        # Rev range mode
+        lo_idx = s_pids + num_cats
+        lo = tl.load(params_ptr + lo_idx, mask = mask, other = 0)
+        hi_idx = lo_idx + 1
+        hi = tl.load(params_ptr + hi_idx, mask = mask, other = 0)
+
+        mask = mask & ((data < lo) | (data >= hi))
 
         pf_offsets = s_pfids + data
         tl.atomic_add(param_flows_ptr + pf_offsets, flows, mask = mask)
@@ -229,6 +282,39 @@ class MaskedCategorical(Distribution):
         tl.store(samples_ptr + sample_offsets, sampled_id, mask = mask)
 
     @staticmethod
+    def sample_fn_rev_range(samples_ptr, local_offsets, batch_offsets, vids, s_pids, params_ptr, metadata_ptr, s_mids_ptr, mask, batch_size, BLOCK_SIZE, seed):
+        # Get `num_cats` from `metadata`
+        s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
+        num_cats = tl.load(metadata_ptr + s_mids, mask = mask, other = 0).to(tl.int64)
+
+        max_num_cats = tl.max(num_cats, axis = 0)
+
+        rnd_val = tl.rand(seed, tl.arange(0, BLOCK_SIZE))
+        sampled_id = tl.zeros([BLOCK_SIZE], dtype = tl.int64) - 1
+
+        # Range mode
+        lo_idx = s_pids + num_cats
+        lo = tl.load(params_ptr + lo_idx, mask = mask, other = 0)
+        hi_idx = lo_idx + 1
+        hi = tl.load(params_ptr + hi_idx, mask = mask, other = 0)
+
+        # Sample by computing cumulative probability
+        cum_param = tl.zeros([BLOCK_SIZE], dtype = tl.float32)
+        for cat_id in range(max_num_cats):
+            cat_mask = mask & ((cat_id < lo) | (cat_id >= hi))
+
+            param = tl.load(params_ptr + s_pids + cat_id, mask = cat_mask, other = 0)
+            cum_param += param
+
+            sampled_id = tl.where((cum_param >= rnd_val) & (sampled_id == -1), cat_id, sampled_id)
+
+        sampled_id = tl.where((sampled_id == -1), 0, sampled_id)
+
+        # Write back to `samples`
+        sample_offsets = vids * batch_size + batch_offsets
+        tl.store(samples_ptr + sample_offsets, sampled_id, mask = mask)
+
+    @staticmethod
     def em_fn_range(local_offsets, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, s_mids_ptr, mask,
                     step_size, pseudocount, BLOCK_SIZE):
         # Get `num_cats` from `metadata`
@@ -267,6 +353,37 @@ class MaskedCategorical(Distribution):
         num_cats = tl.load(metadata_ptr + s_mids, mask = mask, other = 0).to(tl.int64)
 
         eff_num_cats = tl.load(params_ptr + s_pids + num_cats * 2, mask = mask, other = 1)
+
+        max_num_cats = tl.max(num_cats, axis = 0)
+
+        # Compute cumulative flows
+        cum_flow = tl.zeros([BLOCK_SIZE], dtype = tl.float32)
+        for cat_id in range(max_num_cats):
+            cat_mask = mask & (cat_id < num_cats)
+
+            flow = tl.load(param_flows_ptr + s_pfids + cat_id, mask = cat_mask, other = 0)
+            cum_flow += flow
+
+        # Parameter update
+        numerate_pseudocount = pseudocount / eff_num_cats
+        cum_flow += pseudocount
+        for cat_id in range(max_num_cats):
+            cat_mask = mask & (cat_id < num_cats)
+
+            param = tl.load(params_ptr + s_pids + cat_id, mask = cat_mask, other = 0)
+            flow = tl.load(param_flows_ptr + s_pfids + cat_id, mask = cat_mask, other = 0)
+
+            new_param = (1.0 - step_size) * param + step_size * (flow + numerate_pseudocount) / cum_flow
+            tl.store(params_ptr + s_pids + cat_id, new_param, mask = cat_mask)
+
+    @staticmethod
+    def em_fn_rev_range(local_offsets, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, s_mids_ptr, mask,
+                        step_size, pseudocount, BLOCK_SIZE):
+        # Get `num_cats` from `metadata`
+        s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
+        num_cats = tl.load(metadata_ptr + s_mids, mask = mask, other = 0).to(tl.int64)
+
+        eff_num_cats = tl.load(params_ptr + s_pids + num_cats + 2, mask = mask, other = 1)
 
         max_num_cats = tl.max(num_cats, axis = 0)
 
