@@ -12,7 +12,7 @@ import pyjuice.visualize
 from pyjuice.model import TensorCircuit
 
 # Construction methods
-from pyjuice.nodes import multiply, summate, inputs
+from pyjuice.nodes import multiply, summate, inputs, set_group_size
 
 # LVD
 from pyjuice.nodes.methods.lvd import LVDistiller

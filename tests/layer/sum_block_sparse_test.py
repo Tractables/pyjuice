@@ -291,7 +291,14 @@ def block_sparse_2d_kernel(node_mars, element_mars, params, nids, cids_start, ci
 
         emars_max = tl.max(emars, axis = 0)[None,:]
         emars = tl.exp(emars - emars_max)
-        nmars = tl.dot(epars.to(tl.float16), emars.to(tl.float16)).to(tl.float32)
+        epars = epars.to(tl.float16)
+        emars = emars.to(tl.float16)
+        nmars = tl.dot(epars, emars).to(tl.float32)
+
+        # if TILE_SIZE_M < 16:
+        #     epars = tl.view(tl.broadcast_to(epars[:,None,:], (TILE_SIZE_M, 16 // TILE_SIZE_M, TILE_SIZE_K)), (16, TILE_SIZE_K))
+        #     nmars = tl.dot(epars, emars).to(tl.float32)
+        #     nmars = tl.max(tl.view(nmars, (TILE_SIZE_M, 16 // TILE_SIZE_M, BLOCK_B)), axis = 1)
 
         acc = tl.where(emars_max > acc, 
             tl.log(nmars + tl.exp(acc - emars_max)) + emars_max,
@@ -312,12 +319,12 @@ def block_sparse_2d_kernel(node_mars, element_mars, params, nids, cids_start, ci
 
 def main_blocksparse_2d():
 
-    GROUP_SIZE_M = 64
+    GROUP_SIZE_M = 32
 
     TILE_SIZE_M = 16
-    TILE_SIZE_K = 32
+    TILE_SIZE_K = 64
 
-    BLOCK_B = 128
+    BLOCK_B = max(128, 16)
 
     data = np.load("temp.npz")
 
@@ -332,11 +339,11 @@ def main_blocksparse_2d():
     cids = torch.from_numpy(data["cids"])# .to(device)
     pids = torch.from_numpy(data["pids"])# .to(device)
 
-    # node_mars_gt = node_mars.clone()
-    # ch_mars = element_mars[cids]
-    # maxval = ch_mars.max(dim = 1, keepdim = True).values
-    # aaa = (((ch_mars - maxval).exp() * params[pids].unsqueeze(-1)).sum(
-    #     dim = 1).clamp(min = 1e-10)).log() + maxval.squeeze(1)
+    node_mars_gt = node_mars.clone()
+    ch_mars = element_mars[cids]
+    maxval = ch_mars.max(dim = 1, keepdim = True).values
+    aaa = (((ch_mars - maxval).exp() * params[pids].unsqueeze(-1)).sum(
+        dim = 1).clamp(min = 1e-10)).log() + maxval.squeeze(1)
 
     nids = nids.reshape(-1, GROUP_SIZE_M).contiguous().to(device)
     cids = cids[::GROUP_SIZE_M,:].reshape(nids.size(0), -1, TILE_SIZE_K).contiguous()
@@ -386,9 +393,9 @@ def main_blocksparse_2d():
     aveg_t, std_t = torch.tensor(ts).mean().item() * 1000, torch.tensor(ts).std().item() * 1000
     print(f"{aveg_t:.3f}±{std_t:.3f}ms")
 
-    # bbb = node_mars[nids]
+    bbb = node_mars[nids]
 
-    # print(torch.max((aaa - bbb.flatten(0, 1)).abs()))
+    print(torch.max((aaa - bbb.flatten(0, 1)).abs()))
 
     # import pdb; pdb.set_trace()
 

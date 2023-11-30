@@ -11,11 +11,11 @@ from .nodes import CircuitNodes
 
 
 class InputNodes(CircuitNodes):
-    def __init__(self, num_nodes: int, scope: Union[Sequence,BitSet], dist: Distribution, 
-                 params: Optional[torch.Tensor] = None, **kwargs) -> None:
+    def __init__(self, num_node_groups: int, scope: Union[Sequence,BitSet], dist: Distribution, 
+                 params: Optional[torch.Tensor] = None, group_size: int = 0, **kwargs) -> None:
 
         rg_node = InputRegionNode(scope)
-        super(InputNodes, self).__init__(num_nodes, rg_node, **kwargs)
+        super(InputNodes, self).__init__(num_node_groups, rg_node, group_size = group_size, **kwargs)
 
         self.chs = [] # InputNodes has no children
 
@@ -43,7 +43,7 @@ class InputNodes(CircuitNodes):
 
         dist = deepcopy(self.dist)
 
-        ns = InputNodes(self.num_nodes, scope = scope, dist = dist, source_node = self if tie_params else None)
+        ns = InputNodes(self.num_node_groups, scope = scope, dist = dist, group_size = self.group_size, source_node = self if tie_params else None)
 
         if hasattr(self, "_params") and self._params is not None and not tie_params:
             ns._params = self._params.clone()
