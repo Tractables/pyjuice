@@ -12,10 +12,12 @@ def merge_sum_nodes(ns1: SumNodes, ns2: SumNodes, *args) -> SumNodes:
     all_ns = [ns1, ns2, *args]
     for idx, ns in enumerate(all_ns):
         assert ns1.scope == ns.scope, "Sum nodes to be merged should have the same scope."
+        assert ns1.group_size == ns.group_size, "To-be-merged sum nodes must have the same group size."
         if not isinstance(ns, SumNodes):
-            edge_ids = torch.arange(0, ns.num_nodes).unsqueeze(0).repeat(2, 1)
-            params = torch.ones([ns.num_nodes])
-            new_ns = SumNodes(ns.num_nodes, [ns], edge_ids, params = params)
+            edge_ids = torch.arange(0, ns.num_node_groups).unsqueeze(0).repeat(2, 1)
+            group_size = ns.group_size
+            params = torch.eye(ns.group_size).unsqueeze(0).repeat(ns.num_node_groups, 1, 1)
+            new_ns = SumNodes(ns.num_node_groups, [ns], edge_ids, params = params, group_size = group_size)
             all_ns[idx] = new_ns
 
     sum_edge_ids = []
@@ -23,12 +25,18 @@ def merge_sum_nodes(ns1: SumNodes, ns2: SumNodes, *args) -> SumNodes:
     cs2start_id = dict()
     ns_start_id = 0
     global_cs_start_id = 0
+    ch_group_size = None
     for ns in all_ns:
-        ns_end_id = ns_start_id + ns.num_nodes
+        ns_end_id = ns_start_id + ns.num_node_groups
         curr_cs_sid = 0
         edge_ids = ns.edge_ids.clone()
         for cs in ns.chs:
-            curr_cs_eid = curr_cs_sid + cs.num_nodes
+            if ch_group_size is None:
+                ch_group_size = cs.group_size
+            else:
+                assert ch_group_size == cs.group_size, "Children must have the same group size."
+
+            curr_cs_eid = curr_cs_sid + cs.num_node_groups
             if cs in cs2start_id:
                 cs_start_id = cs2start_id[cs]
             else:
@@ -40,7 +48,7 @@ def merge_sum_nodes(ns1: SumNodes, ns2: SumNodes, *args) -> SumNodes:
             curr_cs_sid = curr_cs_eid
             if cs not in cs2start_id:
                 cs2start_id[cs] = global_cs_start_id
-                global_cs_start_id += cs.num_nodes
+                global_cs_start_id += cs.num_node_groups
                 sum_chs.append(cs)
 
         edge_ids[0,:] += ns_start_id
@@ -48,14 +56,14 @@ def merge_sum_nodes(ns1: SumNodes, ns2: SumNodes, *args) -> SumNodes:
         
         ns_start_id = ns_end_id
 
-    num_nodes = ns_start_id
+    num_node_groups = ns_start_id
     edge_ids = torch.cat(sum_edge_ids, dim = 1)
     if all([hasattr(ns, "_params") and ns._params is not None for ns in all_ns]):
         params = torch.cat([ns._params for ns in all_ns], dim = 0)
     else:
         params = None
     
-    return SumNodes(num_nodes, sum_chs, edge_ids, params = params)
+    return SumNodes(num_node_groups, sum_chs, edge_ids, params = params, group_size = ns1.group_size)
 
 
 def merge_prod_nodes(ns1: ProdNodes, ns2: ProdNodes, *args) -> ProdNodes:
@@ -65,18 +73,26 @@ def merge_prod_nodes(ns1: ProdNodes, ns2: ProdNodes, *args) -> ProdNodes:
     for ns in all_ns:
         assert isinstance(ns, ProdNodes), "Inputs should all be ProdNodes."
         assert ns1.scope == ns.scope, "Product nodes to be merged should have the same scope."
+        assert ns1.group_size == ns.group_size, "To-be-merged product nodes must have the same group size."
         for cs, scope in zip(ns.chs, ch_scopes):
             assert cs.scope == scope
 
     cs2start_id = dict()
     sum_chs = [[] for _ in range(num_scopes)]
     global_start_ids = [0 for _ in range(num_scopes)]
+    ch_group_size = None
     for ns in all_ns:
         for scope_id in range(num_scopes):
             cs = ns.chs[scope_id]
+
+            if ch_group_size is None:
+                ch_group_size = cs.group_size
+            else:
+                assert ch_group_size == cs.group_size, "Children must have the same group size."
+
             if cs not in cs2start_id:
                 cs2start_id[cs] = global_start_ids[scope_id]
-                global_start_ids[scope_id] += cs.num_nodes
+                global_start_ids[scope_id] += cs.num_node_groups
                 sum_chs[scope_id].append(cs)
 
     new_sum_chs = []
@@ -97,9 +113,9 @@ def merge_prod_nodes(ns1: ProdNodes, ns2: ProdNodes, *args) -> ProdNodes:
         prod_edge_ids.append(edge_ids)
 
     edge_ids = torch.cat(prod_edge_ids, dim = 0)
-    num_nodes = edge_ids.size(0)
+    num_node_groups = edge_ids.size(0)
 
-    return ProdNodes(num_nodes, new_sum_chs, edge_ids)
+    return ProdNodes(num_node_groups, new_sum_chs, edge_ids, group_size = ns1.group_size)
 
 
 def merge_by_region_node(root_ns: CircuitNodes) -> CircuitNodes:
@@ -124,7 +140,7 @@ def merge_by_region_node(root_ns: CircuitNodes) -> CircuitNodes:
         rg_hash = hash(rg)
         if isinstance(rg, InputRegionNode):
             for ns in rg2nodes[rg_hash]:
-                ns_old2new[ns] = (ns, (0, ns.num_nodes))
+                ns_old2new[ns] = (ns, (0, ns.num_node_groups))
         elif isinstance(rg, PartitionNode):
             prod_ns = []
             for ns in rg2nodes[rg_hash]:
@@ -135,7 +151,7 @@ def merge_by_region_node(root_ns: CircuitNodes) -> CircuitNodes:
                     edge_ids[:,scope_id] += sid
                     chs.append(new_cs)
 
-                prod_ns.append(ProdNodes(ns.num_nodes, chs, edge_ids))
+                prod_ns.append(ProdNodes(ns.num_node_groups, chs, edge_ids, group_size = ns.group_size))
 
             if len(prod_ns) == 1:
                 new_ns = prod_ns[0]
@@ -143,7 +159,7 @@ def merge_by_region_node(root_ns: CircuitNodes) -> CircuitNodes:
                 new_ns = merge_prod_nodes(*prod_ns)
             sid = 0
             for ns in rg2nodes[rg_hash]:
-                nid = sid + ns.num_nodes
+                nid = sid + ns.num_node_groups
                 ns_old2new[ns] = (new_ns, (sid, nid))
                 sid = nid
 
@@ -156,7 +172,7 @@ def merge_by_region_node(root_ns: CircuitNodes) -> CircuitNodes:
                 global_sid = 0
                 origin_sid = 0
                 for scope_id, cs in enumerate(ns.chs):
-                    origin_eid = origin_sid + cs.num_nodes
+                    origin_eid = origin_sid + cs.num_node_groups
                     new_cs, (offset_sid, offset_eid) = ns_old2new[cs]
                     if new_cs in ch2sid:
                         sid = ch2sid[new_cs]
@@ -169,7 +185,7 @@ def merge_by_region_node(root_ns: CircuitNodes) -> CircuitNodes:
                     if new_cs not in ch2sid:
                         chs.append(new_cs)
                         ch2sid[new_cs] = global_sid
-                        global_sid += new_cs.num_nodes
+                        global_sid += new_cs.num_node_groups
 
                     origin_sid = origin_eid
 
@@ -177,7 +193,7 @@ def merge_by_region_node(root_ns: CircuitNodes) -> CircuitNodes:
                     params = ns._params
                 else:
                     params = None
-                sum_ns.append(SumNodes(ns.num_nodes, chs, edge_ids, params = params))
+                sum_ns.append(SumNodes(ns.num_node_groups, chs, edge_ids, params = params, group_size = ns.group_size))
 
             if len(sum_ns) == 1:
                 new_ns = sum_ns[0]
@@ -185,7 +201,7 @@ def merge_by_region_node(root_ns: CircuitNodes) -> CircuitNodes:
                 new_ns = merge_sum_nodes(*sum_ns)
             sid = 0
             for ns in rg2nodes[rg_hash]:
-                nid = sid + ns.num_nodes
+                nid = sid + ns.num_node_groups
                 ns_old2new[ns] = (new_ns, (sid, nid))
                 sid = nid
 
