@@ -96,7 +96,7 @@ def normalize_parameters(params: torch.Tensor, node_ids: torch.Tensor, group_siz
         _cum_params_kernel[grid](grouped_params, cum_params, node_ids, num_param_blocks, group_size, batch_size, BLOCK_M, BLOCK_K, BLOCK_B)
         _norm_params_kernel[grid](grouped_params, cum_params, node_ids, node_nchs, num_param_blocks, group_size, batch_size, pseudocount, BLOCK_M, BLOCK_K, BLOCK_B)
 
-        params *= (grouped_params / params.sum(2)).unsqueeze(2)
+        params *= (grouped_params / (params.sum(2) + 1e-12)).unsqueeze(2)
 
     else:
         assert params.dim() == 3, "CPU version of `normalize_parameters` does not support `batch_size > 1` for now."
@@ -129,4 +129,4 @@ def normalize_parameters(params: torch.Tensor, node_ids: torch.Tensor, group_siz
             )
             params_buffer = torch.sparse.mm(cum_matrix2, node_buffer).reshape(num_param_blocks, group_size)
             
-            params *= (params_buffer / grouped_params).unsqueeze(2)
+            params *= (params_buffer / (grouped_params + 1e-12)).unsqueeze(2)

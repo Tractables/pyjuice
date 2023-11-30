@@ -102,6 +102,9 @@ class SumNodes(CircuitNodes):
 
             self._params = params[self.edge_ids[0,:],self.edge_ids[1,:],:,:].clone().contiguous()
 
+        else:
+            raise ValueError("Unsupported parameter input.")
+
         if normalize:
             normalize_parameters(self._params, self.edge_ids[0,:], group_size = self.group_size, 
                                  ch_group_size = self.ch_group_size, pseudocount = pseudocount)

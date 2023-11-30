@@ -54,7 +54,17 @@ def multiply(nodes1: ProdNodesChs, *args, edge_ids: Optional[Tensor] = None, **k
     return ProdNodes(num_node_groups, chs, edge_ids, group_size = group_size, **kwargs)
 
 
-def summate(nodes1: SumNodesChs, *args, num_node_groups: int = 0, edge_ids: Optional[Tensor] = None, group_size: int = 0, **kwargs):
+def summate(nodes1: SumNodesChs, *args, num_nodes: int = 0, num_node_groups: int = 0, edge_ids: Optional[Tensor] = None, group_size: int = 0, **kwargs):
+
+    if num_nodes > 0:
+        assert edge_ids is None
+        assert num_node_groups == 0, "Only one of `num_nodes` and `num_node_groups` can be set at the same time."
+        if group_size == 0:
+            group_size = CircuitNodes.DEFAULT_GROUP_SIZE
+
+        assert num_nodes % group_size == 0
+
+        num_node_groups = num_nodes // group_size
 
     assert isinstance(nodes1, ProdNodes) or isinstance(nodes1, InputNodes), f"Children of sum nodes must be input or product nodes, but found input of type {type(nodes1)}." 
 
