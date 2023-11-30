@@ -19,7 +19,17 @@ SumNodesChs = Union[ProdNodes,InputNodes]
 
 
 def inputs(var: Union[int,Sequence[int]], num_node_groups: int, dist: Distribution, params: Optional[Tensor] = None, 
-           group_size: int = 0, **kwargs):
+           num_nodes: int = 0, group_size: int = 0, **kwargs):
+
+    if num_nodes > 0:
+        assert num_node_groups == 0, "Only one of `num_nodes` and `num_node_groups` can be set at the same time."
+        if group_size == 0:
+            group_size = CircuitNodes.DEFAULT_GROUP_SIZE
+
+        assert num_nodes % group_size == 0
+
+        num_node_groups = num_nodes // group_size
+
     return InputNodes(
         num_node_groups = num_node_groups,
         scope = [var] if isinstance(var, int) else var,
