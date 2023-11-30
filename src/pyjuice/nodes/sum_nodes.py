@@ -115,7 +115,8 @@ class SumNodes(CircuitNodes):
         if self._source_node is None:
             self._params = torch.exp(torch.rand([self.edge_ids.size(1), self.group_size, self.ch_group_size]) * -perturbation)
 
-            normalize_parameters(self._params, self.edge_ids[0,:], pseudocount = 0.0)
+            normalize_parameters(self._params, self.edge_ids[0,:], group_size = self.group_size, 
+                                 ch_group_size = self.ch_group_size, pseudocount = 0.0)
 
         super(SumNodes, self).init_parameters(
             perturbation = perturbation, 

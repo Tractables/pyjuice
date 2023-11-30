@@ -14,18 +14,18 @@ def _cum_params_kernel(params_ptr, cum_params_ptr, node_ids_ptr, num_param_block
     m_pid = tl.program_id(axis = 2)
 
     m_offsets = m_pid * BLOCK_M + tl.arange(0, BLOCK_M)
-    m_mask = offsets < num_param_blocks
+    m_mask = m_offsets < num_param_blocks
 
-    group_size = k_pid * BLOCK_K + tl.arange(0, BLOCK_K)
+    k_offsets = k_pid * BLOCK_K + tl.arange(0, BLOCK_K)
 
     b_offsets = b_pid * BLOCK_B + tl.arange(0, BLOCK_B)
-    b_mask = offsets < batch_size
+    b_mask = b_offsets < batch_size
 
     n_offsets = tl.load(node_ids_ptr + m_offsets, mask = m_mask, other = 0)
-    reuse_offs = group_size[None,:,None] * batch_size + b_offsets[None,None,:]
+    reuse_offs = k_offsets[None,:,None] * batch_size + b_offsets[None,None,:]
 
     n_offsets = n_offsets[:,None,None] * (batch_size * group_size) + reuse_offs
-    p_offsets = m_offsets[:,None,None] * reuse_offs
+    p_offsets = m_offsets[:,None,None] * (batch_size * group_size) + reuse_offs
 
     mask = m_mask[:,None,None] & b_mask[None,None,:]
     params = tl.load(params_ptr + p_offsets, mask = mask, other = 0)
@@ -42,18 +42,18 @@ def _norm_params_kernel(params_ptr, cum_params_ptr, node_ids_ptr, node_nchs_ptr,
     m_pid = tl.program_id(axis = 2)
 
     m_offsets = m_pid * BLOCK_M + tl.arange(0, BLOCK_M)
-    m_mask = offsets < num_param_blocks
+    m_mask = m_offsets < num_param_blocks
 
-    group_size = k_pid * BLOCK_K + tl.arange(0, BLOCK_K)
+    k_offsets = k_pid * BLOCK_K + tl.arange(0, BLOCK_K)
 
     b_offsets = b_pid * BLOCK_B + tl.arange(0, BLOCK_B)
-    b_mask = offsets < batch_size
+    b_mask = b_offsets < batch_size
 
     n_offsets = tl.load(node_ids_ptr + m_offsets, mask = m_mask, other = 0)
-    reuse_offs = group_size[None,:,None] * batch_size + b_offsets[None,None,:]
+    reuse_offs = k_offsets[None,:,None] * batch_size + b_offsets[None,None,:]
 
     nb_offsets = n_offsets[:,None,None] * (batch_size * group_size) + reuse_offs
-    p_offsets = m_offsets[:,None,None] * reuse_offs
+    p_offsets = m_offsets[:,None,None] * (batch_size * group_size) + reuse_offs
 
     mask = m_mask[:,None,None] & b_mask[None,None,:]
     params = tl.load(params_ptr + p_offsets, mask = mask, other = 0)
@@ -94,7 +94,7 @@ def normalize_parameters(params: torch.Tensor, node_ids: torch.Tensor, group_siz
         grid = lambda meta: (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(group_size, BLOCK_K), triton.cdiv(num_param_blocks, BLOCK_M))
 
         _cum_params_kernel[grid](grouped_params, cum_params, node_ids, num_param_blocks, group_size, batch_size, BLOCK_M, BLOCK_K, BLOCK_B)
-        _norm_params_kernel[grid2](grouped_params, cum_params, node_ids, node_nchs, num_param_blocks, group_size, batch_size, pseudocount, BLOCK_M, BLOCK_K, BLOCK_B)
+        _norm_params_kernel[grid](grouped_params, cum_params, node_ids, node_nchs, num_param_blocks, group_size, batch_size, pseudocount, BLOCK_M, BLOCK_K, BLOCK_B)
 
         params *= (grouped_params / params.sum(2)).unsqueeze(2)
 
@@ -120,10 +120,12 @@ def normalize_parameters(params: torch.Tensor, node_ids: torch.Tensor, group_siz
             node_buffer = node_buffer.reshape(num_node_groups * group_size, 1)
 
             param_ids = torch.arange(0, num_param_blocks * group_size, dtype = torch.long, device = params.device)
+            flattened_node_ids = (node_ids.unsqueeze(1).repeat(1, group_size) * group_size + torch.arange(0, group_size, device = params.device)).reshape(-1)
 
             cum_matrix2 = torch.sparse_coo_tensor(
-                torch.stack((param_ids, node_ids.unsqueeze(1).repeat(1, group_size).reshape(-1)), dim = 0), 
-                (grouped_params + pseudocount / node_nchs[node_ids].unsqueeze(1)).reshape(-1), (num_param_blocks * group_size, num_node_groups)
+                torch.stack((param_ids, flattened_node_ids), dim = 0), 
+                (grouped_params + pseudocount / node_nchs[node_ids].unsqueeze(1)).reshape(-1), 
+                (num_param_blocks * group_size, num_node_groups * group_size)
             )
             params_buffer = torch.sparse.mm(cum_matrix2, node_buffer).reshape(num_param_blocks, group_size)
             
