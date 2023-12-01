@@ -107,8 +107,8 @@ def speed_test():
 
     device = torch.device("cuda:0")
 
-    group_size = 16
-    num_vars = 16*16*3
+    group_size = 4
+    num_vars = 28*28
     num_node_groups = 256 // group_size
 
     batch_size = 512
@@ -119,14 +119,14 @@ def speed_test():
         for v in range(num_vars):
             nis.append(inputs(0, num_node_groups = num_node_groups, dist = dists.Categorical(num_cats = 64)))
 
-    layer = InputLayer(nis, cum_nodes = 1)
+    layer = InputLayer(nis, cum_nodes = 1, maximize_group_size = False)
 
     layer._init_parameters(perturbation = 2.0)
 
     layer.to(device)
 
     data = torch.randint(0, 64, (num_vars, batch_size)).to(device)
-    node_mars = torch.zeros([1 + group_size * num_node_groups * num_vars, 16]).to(device)
+    node_mars = torch.zeros([1 + group_size * num_node_groups * num_vars, batch_size]).to(device)
 
     ## Forward tests ##
 

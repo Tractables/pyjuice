@@ -208,15 +208,12 @@ class InputLayer(Layer, nn.Module):
             # Need to flatten data to ensure the memory is aligned following [num_vars, batch_size]
             data = data.reshape(-1).contiguous()
 
-            tot_num_nodes = node_mars.size(0)
             batch_size = node_mars.size(1)
             node_offset = self._output_ind_range[0]
 
             if not self.provided("fw_local_group_ids"):
-                layer_num_nodes = self._output_ind_range[1] - self._output_ind_range[0]
                 fw_local_group_ids = None
             else:
-                layer_num_nodes = self.fw_local_group_ids.size(0)
                 fw_local_group_ids = self.fw_local_group_ids
 
             if not self.provided("_mars_kernel"):
@@ -294,15 +291,12 @@ class InputLayer(Layer, nn.Module):
             # Need to flatten data to ensure the memory is aligned following [num_vars, batch_size]
             data = data.reshape(-1).contiguous()
 
-            tot_num_nodes = node_flows.size(0)
             batch_size = node_flows.size(1)
             node_offset = self._output_ind_range[0]
 
             if not self.provided("bk_local_group_ids"):
-                layer_num_nodes = self._output_ind_range[1] - self._output_ind_range[0]
                 bk_local_group_ids = None
             else:
-                layer_num_nodes = self.bk_local_group_ids.size(0)
                 bk_local_group_ids = self.bk_local_group_ids
 
             if not self.provided("_flows_kernel"):
@@ -675,7 +669,7 @@ class InputLayer(Layer, nn.Module):
         mask_batch = offs_batch < batch_size
 
         if partial_eval > 0:
-            ngroup_id = tl.load(fw_local_group_ids_ptr + ngroup_id)
+            ngroup_id = tl.load(bk_local_group_ids_ptr + ngroup_id)
 
         if num_vars_per_node == 1:
             # Get variable id
@@ -723,9 +717,7 @@ class InputLayer(Layer, nn.Module):
             # Read out the flows
             flows = tl.load(p_nflows, mask = mask, other = 0)
 
-            # flow_fn(flows, data, p_parflows, p_params, p_metadata, mask, num_vars_per_node)
-            p_tarflows = p_parflows[:,None] + data[None,:]
-            tl.atomic_add(p_tarflows, flows, mask = mask)
+            flow_fn(flows, data, p_parflows, p_params, p_metadata, mask, num_vars_per_node)
 
             # Increment pointers
             p_params += inc_params * TILE_SIZE_K
