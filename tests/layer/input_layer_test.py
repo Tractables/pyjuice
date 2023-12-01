@@ -178,7 +178,28 @@ def speed_test():
     print("Reference computation time on RTX 4090: 0.086ms.")
     print("--------------------------------------------------------------")
 
+    ## Backward tests ##
+
+    node_flows = torch.rand([1 + group_size * num_node_groups * num_vars, batch_size]).to(device)
+
+    layer.init_param_flows(flows_memory = 0.0)
+
+    layer(data, node_mars)
+    layer.backward(data, node_flows, node_mars)
+
+    t0 = time.time()
+    torch.cuda.synchronize()
+    for _ in range(100):
+        layer.backward(data, node_flows, node_mars)
+    torch.cuda.synchronize()
+    t1 = time.time()
+    forward_ms = (t1 - t0) / 100 * 1000
+
+    print(f"Backward pass on average takes {forward_ms:.3f}ms.")
+    print("Reference computation time on RTX 4090: 0.086ms.")
+    print("--------------------------------------------------------------")
+
 
 if __name__ == "__main__":
-    input_layer_test()
-    # speed_test()
+    # input_layer_test()
+    speed_test()

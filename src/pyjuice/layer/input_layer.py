@@ -723,7 +723,9 @@ class InputLayer(Layer, nn.Module):
             # Read out the flows
             flows = tl.load(p_nflows, mask = mask, other = 0)
 
-            flow_fn(flows, data, p_parflows, p_params, p_metadata, mask, num_vars_per_node)
+            # flow_fn(flows, data, p_parflows, p_params, p_metadata, mask, num_vars_per_node)
+            p_tarflows = p_parflows[:,None] + data[None,:]
+            tl.atomic_add(p_tarflows, flows, mask = mask)
 
             # Increment pointers
             p_params += inc_params * TILE_SIZE_K
