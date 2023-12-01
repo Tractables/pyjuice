@@ -18,6 +18,7 @@ def input_layer_test():
     device = torch.device("cuda:0")
 
     group_size = 4
+    batch_size = 16
     
     with juice.set_group_size(group_size):
 
@@ -26,7 +27,7 @@ def input_layer_test():
         ni2 = inputs(2, num_node_groups = 2, dist = dists.Categorical(num_cats = 2))
         ni3 = inputs(3, num_node_groups = 2, dist = dists.Categorical(num_cats = 2))
 
-    layer = InputLayer([ni0, ni1, ni2, ni3], cum_nodes = 1)
+    layer = InputLayer([ni0, ni1, ni2, ni3], cum_nodes = 1, maximize_group_size = False)
 
     layer._init_parameters(perturbation = 2.0)
 
@@ -43,8 +44,8 @@ def input_layer_test():
 
     layer.to(device)
 
-    data = torch.randint(0, 2, (4, 16)).to(device)
-    node_mars = torch.zeros([33, 16]).to(device)
+    data = torch.randint(0, 2, (4, batch_size)).to(device)
+    node_mars = torch.zeros([33, batch_size]).to(device)
 
     ## Forward tests ##
 
@@ -56,7 +57,31 @@ def input_layer_test():
 
     ## Forward with mask tests ##
 
+    missing_mask = torch.tensor([0,1,0,1]).bool().to(device)
 
+    layer(data, node_mars, missing_mask = missing_mask)
+
+    for i in range(16):
+        for j in range(4 * 2 * group_size):
+            v = j//(2*group_size)
+            if v == 0 or v == 2:
+                assert torch.abs(node_mars[j+1,i].exp() - layer.params[j*2+data[v,i]]) < 1e-4
+            else:
+                assert torch.abs(node_mars[j+1,i].exp() - 1.0) < 1e-4
+
+    missing_mask = torch.randint(0, 2, (4, batch_size)).bool().to(device)
+
+    layer(data, node_mars, missing_mask = missing_mask)
+
+    for i in range(16):
+        for j in range(4 * 2 * group_size):
+            v = j//(2*group_size)
+            if not missing_mask[v,i]:
+                assert torch.abs(node_mars[j+1,i].exp() - layer.params[j*2+data[v,i]]) < 1e-4
+            else:
+                assert torch.abs(node_mars[j+1,i].exp() - 1.0) < 1e-4
+
+    ## Backward tests ##
 
     import pdb; pdb.set_trace()
 
@@ -65,7 +90,7 @@ def speed_test():
 
     device = torch.device("cuda:0")
 
-    group_size = 128
+    group_size = 16
     num_vars = 16*16*3
     num_node_groups = 256 // group_size
 
@@ -96,9 +121,47 @@ def speed_test():
         layer(data, node_mars)
     torch.cuda.synchronize()
     t1 = time.time()
-    print((t1 - t0) / 100 * 1000)
+    forward_ms = (t1 - t0) / 100 * 1000
+
+    print(f"Forward pass on average takes {forward_ms:.3f}ms.")
+    print("Reference computation time on RTX 4090: 0.048ms.")
+    print("--------------------------------------------------------------")
+
+    ## Forward with mask tests ##
+
+    missing_mask = torch.randint(0, 2, (num_vars,)).bool().to(device)
+
+    layer(data, node_mars, missing_mask = missing_mask)
+
+    t0 = time.time()
+    torch.cuda.synchronize()
+    for _ in range(100):
+        layer(data, node_mars, missing_mask = missing_mask)
+    torch.cuda.synchronize()
+    t1 = time.time()
+    forward_ms = (t1 - t0) / 100 * 1000
+
+    print(f"Forward pass (w/ sample independent mask) on average takes {forward_ms:.3f}ms.")
+    print("Reference computation time on RTX 4090: 0.062ms.")
+    print("--------------------------------------------------------------")
+
+    missing_mask = torch.randint(0, 2, (num_vars, batch_size)).bool().to(device)
+
+    layer(data, node_mars, missing_mask = missing_mask)
+
+    t0 = time.time()
+    torch.cuda.synchronize()
+    for _ in range(100):
+        layer(data, node_mars, missing_mask = missing_mask)
+    torch.cuda.synchronize()
+    t1 = time.time()
+    forward_ms = (t1 - t0) / 100 * 1000
+
+    print(f"Forward pass (w/ sample dependent mask) on average takes {forward_ms:.3f}ms.")
+    print("Reference computation time on RTX 4090: 0.086ms.")
+    print("--------------------------------------------------------------")
 
 
 if __name__ == "__main__":
-    # input_layer_test()
-    speed_test()
+    input_layer_test()
+    # speed_test()

@@ -21,7 +21,7 @@ from .layer import Layer
 
 
 class InputLayer(Layer, nn.Module):
-    def __init__(self, nodes: Sequence[InputNodes], cum_nodes: int = 0) -> None:
+    def __init__(self, nodes: Sequence[InputNodes], cum_nodes: int = 0, maximize_group_size: bool = True) -> None:
         nn.Module.__init__(self)
         Layer.__init__(self, nodes)
 
@@ -30,6 +30,9 @@ class InputLayer(Layer, nn.Module):
 
         # Group size of the nodes in the current layer
         self.group_size = self.nodes[0].group_size
+        if maximize_group_size:
+            min_num_groups = min([node.num_node_groups for node in self.nodes])
+            self.group_size *= 2 ** (min_num_groups.bit_length() - 1)
 
         ## Parse input `nodes` ##
         node_vars = []
@@ -61,7 +64,7 @@ class InputLayer(Layer, nn.Module):
                 cum_param_flows += ns.num_nodes * ns.dist.num_param_flows()
                 ns._param_flow_range = (cum_param_flows - ns.num_nodes * ns.dist.num_param_flows(), cum_param_flows)
 
-                cum_source_ngroups += ns.num_node_groups
+                cum_source_ngroups += ns.num_nodes // self.group_size
             else:
                 source_ns = ns.get_source_ns()
                 ns._param_range = deepcopy(source_ns._param_range)
@@ -106,7 +109,7 @@ class InputLayer(Layer, nn.Module):
         source_ng_start = 0
         param_start = 0
         for ns_id, ns in enumerate(self.nodes):
-            ng_end = ng_start + ns.num_node_groups
+            ng_end = ng_start + ns.num_nodes // self.group_size
 
             # `vids`
             assert len(node_vars[ns_id]) == num_vars, f"Input nodes in the same layer should define on the same " \
@@ -119,19 +122,21 @@ class InputLayer(Layer, nn.Module):
             else:
                 source_ns = ns.get_source_ns()
 
+            num_node_groups = ns.num_nodes // self.group_size
+
             n_params_per_group = self.group_size * ns.dist.num_parameters()
-            gpid_offsets = torch.arange(0, ns.num_node_groups * n_params_per_group, n_params_per_group)
+            gpid_offsets = torch.arange(0, num_node_groups * n_params_per_group, n_params_per_group)
             s_pids[ng_start:ng_end] = source_ns._param_range[0] + gpid_offsets
             inc_pids[ng_start:ng_end] = ns.dist.num_parameters()
 
             n_pflows_per_group = self.group_size * ns.dist.num_param_flows()
-            gpfid_offsets = torch.arange(0, ns.num_node_groups * n_pflows_per_group, n_pflows_per_group)
+            gpfid_offsets = torch.arange(0, num_node_groups * n_pflows_per_group, n_pflows_per_group)
             s_pfids[ng_start:ng_end] = source_ns._param_flow_range[0] + gpfid_offsets
             inc_pfids[ng_start:ng_end] = ns.dist.num_param_flows()
 
             # `source_ngids`
             if not ns.is_tied():
-                source_ng_end = source_ng_start + ns.num_node_groups
+                source_ng_end = source_ng_start + num_node_groups
                 source_ngids[source_ng_start:source_ng_end] = torch.arange(ng_start, ng_end)
                 source_ng_start = source_ng_end
 
@@ -233,7 +238,6 @@ class InputLayer(Layer, nn.Module):
                 metadata_ptr = self.metadata, 
                 s_mids_ptr = self.s_mids, 
                 fw_local_group_ids_ptr = fw_local_group_ids,
-                layer_num_node_groups = eval_num_groups, 
                 batch_size = batch_size, 
                 num_vars_per_node = self.num_vars_per_node, 
                 nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
@@ -248,19 +252,21 @@ class InputLayer(Layer, nn.Module):
             # Apply missing mask if required
             if missing_mask is not None:
                 assert self.num_vars_per_node == 1, "`missing_mask` only supported for univariate distributions."
+                assert missing_mask.dtype == torch.bool, "`missing_mask` must be boolean."
 
                 mask_dim = missing_mask.dim()
 
-                grid = lambda meta: (triton.cdiv(layer_num_nodes * batch_size, meta['BLOCK_SIZE']),)
                 self._fw_missing_mask_kernel[grid](
                     missing_mask_ptr = missing_mask,
                     node_mars_ptr = node_mars, 
                     vids_ptr = self.vids, 
                     fw_local_group_ids_ptr = fw_local_group_ids,
-                    layer_num_node_groups = eval_num_groups,
                     batch_size = batch_size, 
                     node_offset = node_offset, 
-                    BLOCK_SIZE = 1024, 
+                    group_size = self.group_size,
+                    TILE_SIZE_K = TILE_SIZE_K,
+                    K_NUM_TILES = self.group_size // TILE_SIZE_K,
+                    BLOCK_B = BLOCK_B,
                     partial_eval = 1 if fw_local_group_ids is not None else 0,
                     mask_dim = mask_dim
                 )
@@ -533,7 +539,7 @@ class InputLayer(Layer, nn.Module):
 
     @staticmethod
     def _mars_kernel_template(mar_fn, params_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, inc_pids_ptr, metadata_ptr, s_mids_ptr,
-                              fw_local_group_ids_ptr, partial_eval: tl.constexpr, layer_num_node_groups: tl.constexpr, batch_size: tl.constexpr, 
+                              fw_local_group_ids_ptr, partial_eval: tl.constexpr, batch_size: tl.constexpr, 
                               num_vars_per_node: tl.constexpr, nv_block_size: tl.constexpr, node_offset: tl.constexpr, group_size: tl.constexpr,
                               TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, BLOCK_B: tl.constexpr):
         bid = tl.program_id(axis = 0)
@@ -594,37 +600,56 @@ class InputLayer(Layer, nn.Module):
 
     @staticmethod
     @triton.jit
-    def _fw_missing_mask_kernel(missing_mask_ptr, node_mars_ptr, vids_ptr, fw_local_ids_ptr, layer_num_nodes: tl.constexpr, 
-                                batch_size: tl.constexpr, node_offset: tl.constexpr, BLOCK_SIZE: tl.constexpr, 
-                                partial_eval: tl.constexpr, mask_dim: tl.constexpr):
-        pid = tl.program_id(axis = 0)
-        block_start = pid * BLOCK_SIZE
+    def _fw_missing_mask_kernel(missing_mask_ptr, node_mars_ptr, vids_ptr, fw_local_group_ids_ptr, group_size: tl.constexpr,
+                                batch_size: tl.constexpr, node_offset: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
+                                BLOCK_B: tl.constexpr, partial_eval: tl.constexpr, mask_dim: tl.constexpr):
 
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < layer_num_nodes * batch_size
+        bid = tl.program_id(axis = 0)
+        ngroup_id = tl.program_id(axis = 1)
 
-        # Raw batch and (local) node id
-        batch_offsets = (offsets % batch_size)
-        local_offsets = (offsets // batch_size)
+        # Batch ids to process
+        offs_batch = bid * BLOCK_B + tl.arange(0, BLOCK_B)
+        mask_batch = offs_batch < batch_size
 
         if partial_eval > 0:
-            local_offsets = tl.load(fw_local_ids_ptr + local_offsets, mask = mask, other = 0)
+            ngroup_id = tl.load(fw_local_group_ids_ptr + ngroup_id)
 
-        # Get all variable ids
-        vids = tl.load(vids_ptr + local_offsets, mask = mask, other = 0)
+        # Get variable id
+        vid = tl.load(vids_ptr + ngroup_id)
 
         # Fetch mask
         if mask_dim == 1:
-            missing_mask = tl.load(missing_mask_ptr + vids, mask = mask, other = False)
+            missing_mask = tl.load(missing_mask_ptr + vid)
         else:
-            mask_offsets = vids * batch_size + batch_offsets
-            missing_mask = tl.load(missing_mask_ptr + mask_offsets, mask = mask, other = False)
+            offs_mmask = vid * batch_size + offs_batch
+            missing_mask = tl.load(missing_mask_ptr + offs_mmask, mask = mask_batch, other = False)
+
+        # Initialize pointers to `node_mars`
+        offs_node = tl.arange(0, TILE_SIZE_K)
+        p_nmars = node_mars_ptr + \
+            (ngroup_id * group_size + offs_node[:,None] + node_offset) * batch_size + \
+            offs_batch[None,:] # [TILE_SIZE_K, BLOCK_B]
 
         # Apply mask
-        node_offsets = (local_offsets + node_offset) * batch_size + batch_offsets
-        mars = tl.load(node_mars_ptr + node_offsets, mask = mask, other = 0.0)
-        mars = tl.where(missing_mask, 0.0, mars)
-        tl.store(node_mars_ptr + node_offsets, mars, mask = mask)
+        mask = mask_batch[None,:]
+        if mask_dim == 1:
+            if missing_mask:
+                for i in range(K_NUM_TILES):
+
+                    # mars = tl.load(p_nmars, mask = mask, other = 0.0)
+                    tl.store(p_nmars, 0.0, mask = mask)
+
+                    # Increment pointers
+                    p_nmars += TILE_SIZE_K * batch_size
+        else:
+            for i in range(K_NUM_TILES):
+
+                mars = tl.load(p_nmars, mask = mask, other = 0.0)
+                mars = tl.where(missing_mask[None,:], 0.0, mars)
+                tl.store(p_nmars, mars, mask = mask)
+
+                # Increment pointers
+                p_nmars += TILE_SIZE_K * batch_size
 
     @staticmethod
     def _flows_kernel_template(flow_fn, params_ptr, param_flows_ptr, node_flows_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, s_pfids_ptr,
