@@ -33,6 +33,7 @@ class InputLayer(Layer, nn.Module):
         if maximize_group_size:
             min_num_groups = min([node.num_node_groups for node in self.nodes])
             self.group_size *= 2 ** (min_num_groups.bit_length() - 1)
+            self.group_size = min(self.group_size, 512)
 
         ## Parse input `nodes` ##
         node_vars = []
@@ -307,25 +308,34 @@ class InputLayer(Layer, nn.Module):
             if not self.provided("_flows_kernel"):
                 self._flows_kernel = self._compile_triton_kernel(self._flows_kernel_template, flow_fn = self.bk_flow_fn)
 
-            grid = lambda meta: (triton.cdiv(layer_num_nodes * batch_size, meta['BLOCK_SIZE']),)
+            eval_num_groups = self.num_node_groups if not self.provided("bk_local_group_ids") else self.bk_local_group_ids.size(0)
+            BLOCK_B = min(batch_size, 1024)
+            TILE_SIZE_K = min(1024 // BLOCK_B, self.group_size)
+            BLOCK_M = 1
+
+            grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(eval_num_groups, BLOCK_M))
+
             self._flows_kernel[grid](
                 params_ptr = params,
                 param_flows_ptr = self.param_flows,
-                node_flows_ptr = node_flows, 
-                node_mars_ptr = node_mars,
+                node_flows_ptr = node_flows,
                 data_ptr = data, 
                 vids_ptr = self.vids, 
                 s_pids_ptr = self.s_pids,
+                inc_pids_ptr = self.inc_pids,
                 s_pfids_ptr = self.s_pfids,
+                inc_pfids_ptr = self.inc_pfids,
                 metadata_ptr = self.metadata, 
                 s_mids_ptr = self.s_mids, 
                 bk_local_group_ids_ptr = bk_local_group_ids,
-                layer_num_nodes = layer_num_nodes, 
                 batch_size = batch_size, 
                 num_vars_per_node = self.num_vars_per_node, 
                 nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
                 node_offset = node_offset, 
-                BLOCK_SIZE = 1024, 
+                group_size = self.group_size,
+                TILE_SIZE_K = TILE_SIZE_K,
+                K_NUM_TILES = self.group_size // TILE_SIZE_K,
+                BLOCK_B = BLOCK_B,
                 partial_eval = 1 if bk_local_group_ids is not None else 0
             )
 
@@ -652,48 +662,73 @@ class InputLayer(Layer, nn.Module):
                 p_nmars += TILE_SIZE_K * batch_size
 
     @staticmethod
-    def _flows_kernel_template(flow_fn, params_ptr, param_flows_ptr, node_flows_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, s_pfids_ptr,
-                               metadata_ptr, s_mids_ptr, bk_local_ids_ptr, partial_eval: tl.constexpr, layer_num_nodes: tl.constexpr, 
+    def _flows_kernel_template(flow_fn, params_ptr, param_flows_ptr, node_flows_ptr, data_ptr, vids_ptr, s_pids_ptr, inc_pids_ptr, 
+                               s_pfids_ptr, inc_pfids_ptr, metadata_ptr, s_mids_ptr, bk_local_group_ids_ptr, partial_eval: tl.constexpr, 
                                batch_size: tl.constexpr, num_vars_per_node: tl.constexpr, nv_block_size: tl.constexpr, node_offset: tl.constexpr, 
-                               BLOCK_SIZE: tl.constexpr):
-        pid = tl.program_id(axis = 0)
-        block_start = pid * BLOCK_SIZE
+                               group_size: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, BLOCK_B: tl.constexpr):
 
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < layer_num_nodes * batch_size
+        bid = tl.program_id(axis = 0)
+        ngroup_id = tl.program_id(axis = 1)
 
-        # Raw batch and (local) node id
-        batch_offsets = (offsets % batch_size)
-        local_offsets = (offsets // batch_size)
+        # Batch ids to process
+        offs_batch = bid * BLOCK_B + tl.arange(0, BLOCK_B)
+        mask_batch = offs_batch < batch_size
 
         if partial_eval > 0:
-            local_offsets = tl.load(bk_local_ids_ptr + local_offsets, mask = mask, other = 0)
+            ngroup_id = tl.load(fw_local_group_ids_ptr + ngroup_id)
 
         if num_vars_per_node == 1:
-            # Get all variable ids
-            vids = tl.load(vids_ptr + local_offsets, mask = mask, other = 0)
+            # Get variable id
+            vid = tl.load(vids_ptr + ngroup_id)
 
             # Load the corresponding data
-            data = tl.load(data_ptr + vids * batch_size + batch_offsets, mask = mask, other = 0)
+            offs_data = vid * batch_size + offs_batch
+            data = tl.load(data_ptr + offs_data, mask = mask_batch, other = 0) # [BLOCK_B]
         else:
             # Get all variable ids
-            vids_offsets = tl.broadcast_to(local_offsets[:,None], (BLOCK_SIZE, nv_block_size)) * num_vars_per_node + \
-                tl.broadcast_to(tl.arange(0, nv_block_size)[None,:], (BLOCK_SIZE, nv_block_size))
-            vids_mask = tl.broadcast_to(mask[:,None], (BLOCK_SIZE, nv_block_size)) & \
-                tl.broadcast_to((tl.arange(0, nv_block_size) < num_vars_per_node)[None,:], (BLOCK_SIZE, nv_block_size))
-            vids = tl.load(vids_ptr + vids_offsets, mask = vids_mask, other = 0)
+            offs_vs = tl.arange(0, nv_block_size)
+            mask_vs = offs_vs < num_vars_per_node
+            offs_vids = ngroup_id * num_vars_per_node + offs_vs
+            mask_vids = mask_vs
+            vids = tl.load(vids_ptr + offs_vids, mask = mask_vids, other = 0)
 
             # Load the corresponding data
-            data = tl.load(data_ptr + vids * batch_size + batch_offsets, mask = vids_mask, other = 0)
+            offs_data = vids[:,None] * batch_size + offs_batch[None,:]
+            data = tl.load(data_ptr + offs_data, mask = (mask_vids[:,None] & mask_batch[None,:]), other = 0)
 
-        s_pids = tl.load(s_pids_ptr + local_offsets, mask = mask, other = 0)
-        s_pfids = tl.load(s_pfids_ptr + local_offsets, mask = mask, other = 0)
+        # Initialize pointers to `params`
+        off_params = tl.load(s_pids_ptr + ngroup_id)
+        inc_params = tl.load(inc_pids_ptr + ngroup_id)
+        offs_node = tl.arange(0, TILE_SIZE_K)
+        p_params = params_ptr + off_params + inc_params * offs_node # [TILE_SIZE_K]
 
-        ns_offsets = (local_offsets + node_offset) * batch_size + batch_offsets
-        flows = tl.load(node_flows_ptr + ns_offsets, mask = mask, other = 0)
+        # Initialize pointers to `param_flows`
+        off_parflows = tl.load(s_pfids_ptr + ngroup_id)
+        inc_parflows = tl.load(inc_pfids_ptr + ngroup_id)
+        p_parflows = param_flows_ptr + off_parflows + inc_parflows * offs_node # [TILE_SIZE_K]
 
-        flow_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
-                s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE)
+        # Initialize pointers to `metadata`
+        offs_metadata = tl.load(s_mids_ptr + ngroup_id)
+        p_metadata = metadata_ptr + offs_metadata # [1]
+
+        # Initialize pointers to `node_mars`
+        p_nflows = node_flows_ptr + \
+            (ngroup_id * group_size + offs_node[:,None] + node_offset) * batch_size + \
+            offs_batch[None,:] # [TILE_SIZE_K, BLOCK_B]
+
+        # Inner loop to process everything in the node group
+        mask = mask_batch[None,:]
+        for i in range(K_NUM_TILES):
+
+            # Read out the flows
+            flows = tl.load(p_nflows, mask = mask, other = 0)
+
+            flow_fn(flows, data, p_parflows, p_params, p_metadata, mask, num_vars_per_node)
+
+            # Increment pointers
+            p_params += inc_params * TILE_SIZE_K
+            p_parflows += inc_parflows * TILE_SIZE_K
+            p_nflows += TILE_SIZE_K * batch_size
 
     @staticmethod
     def _sample_kernel_template(sample_fn, samples_ptr, params_ptr, nflow_xids_ptr, nflow_yids_ptr, vids_ptr, s_pids_ptr, metadata_ptr, s_mids_ptr,

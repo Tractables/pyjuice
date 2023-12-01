@@ -75,13 +75,30 @@ def input_layer_test():
 
     for i in range(16):
         for j in range(4 * 2 * group_size):
-            v = j//(2*group_size)
+            v = j // (2*group_size)
             if not missing_mask[v,i]:
                 assert torch.abs(node_mars[j+1,i].exp() - layer.params[j*2+data[v,i]]) < 1e-4
             else:
                 assert torch.abs(node_mars[j+1,i].exp() - 1.0) < 1e-4
 
     ## Backward tests ##
+
+    node_flows = torch.rand([33, batch_size]).to(device)
+
+    layer.init_param_flows(flows_memory = 0.0)
+
+    layer(data, node_mars)
+    layer.backward(data, node_flows, node_mars)
+
+    param_flows = torch.zeros([group_size * 2 * 4 * 2]).to(device)
+
+    for i in range(16):
+        for j in range(4 * 2 * group_size):
+            v = j // (2*group_size)
+
+            param_flows[j*2+data[j//(2*group_size),i]] += node_flows[j+1,i]
+
+    assert torch.all(torch.abs(layer.param_flows - param_flows) < 1e-4)
 
     import pdb; pdb.set_trace()
 
