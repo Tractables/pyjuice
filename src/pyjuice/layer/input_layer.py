@@ -23,10 +23,13 @@ from .layer import Layer
 class InputLayer(Layer, nn.Module):
     def __init__(self, nodes: Sequence[InputNodes], cum_nodes: int = 0) -> None:
         nn.Module.__init__(self)
-        Layer.__init__(self)
+        Layer.__init__(self, nodes)
 
         # Reorder input nodes such that for any tied nodes, its source nodes appear before them
         self.nodes = self._reorder_nodes(nodes)
+
+        # Group size of the nodes in the current layer
+        self.group_size = self.nodes[0].group_size
 
         ## Parse input `nodes` ##
         node_vars = []
@@ -35,13 +38,13 @@ class InputLayer(Layer, nn.Module):
         layer_num_nodes = 0
         cum_params = 0
         cum_param_flows = 0
-        cum_source_ns = 0
+        cum_source_ngroups = 0
         dist_signature = None
         for ns in self.nodes:
             if dist_signature is None:
                 dist_signature = ns.dist.get_signature()
             else:
-                assert dist_signature == ns.dist.get_signature(), "Nodes of an InputLayer must have the same distribution type."
+                assert dist_signature == ns.dist.get_signature(), f"Nodes of an InputLayer must have the same distribution type, but got `{dist_signature}` and `{ns.dist.get_signature()}`."
 
             node_vars.append(ns.scope.to_list())
             node_sizes.append(ns.num_nodes)
@@ -58,7 +61,7 @@ class InputLayer(Layer, nn.Module):
                 cum_param_flows += ns.num_nodes * ns.dist.num_param_flows()
                 ns._param_flow_range = (cum_param_flows - ns.num_nodes * ns.dist.num_param_flows(), cum_param_flows)
 
-                cum_source_ns += ns.num_nodes
+                cum_source_ngroups += ns.num_node_groups
             else:
                 source_ns = ns.get_source_ns()
                 ns._param_range = deepcopy(source_ns._param_range)
@@ -67,6 +70,7 @@ class InputLayer(Layer, nn.Module):
         self.num_params = cum_params
         self.num_param_flows = cum_param_flows
         self.num_nodes = layer_num_nodes
+        self.num_node_groups = self.num_nodes // self.group_size
         self.dist_signature = dist_signature
 
         # Store the triton kernel functions implemented by the target `Distribution`
@@ -77,60 +81,76 @@ class InputLayer(Layer, nn.Module):
 
         ## Prepair and compile the layer ##
         num_vars = len(node_vars[0])
-        # Start variable index: vids[i,:] are the variables of the ith node
-        vids = torch.empty([self.num_nodes, num_vars], dtype = torch.long)
-        # Start parameter index: params[s_pids[i]] is the first parameter of the ith node
-        s_pids = torch.empty([self.num_nodes], dtype = torch.long)
-        # Start parameter flow index: param_flows[s_pfids[i]] is the first parameter flow of the ith node
-        s_pfids = torch.empty([self.num_nodes], dtype = torch.long)
-        # Start metadata index: metadata[s_mids[i]] is the first metadata of the ith node
+        # Start variable index: vids[i,:] are the variables of the ith node group
+        vids = torch.empty([self.num_node_groups, num_vars], dtype = torch.long)
+        # Start parameter index: params[s_pids[i]] is the first parameter of the 1st node in the ith node group
+        s_pids = torch.empty([self.num_node_groups], dtype = torch.long)
+        # Pointer increment of the parameters: params[s_pids[i]+j*inc_pids[i]] is the first parameter 
+        # of the (j+1)th node in the ith node group
+        inc_pids = torch.empty([self.num_node_groups], dtype = torch.long)
+        # Start parameter flow index: param_flows[s_pfids[i]] is the first parameter flow of the 1st node in the ith node group
+        s_pfids = torch.empty([self.num_node_groups], dtype = torch.long)
+        # Pointer increment of the parameters: param_flows[s_pfids[i]+j*inc_pfids[i]] is the first parameter flow
+        # of the (j+1)th node in the ith node group
+        inc_pfids = torch.empty([self.num_node_groups], dtype = torch.long)
+        # Start metadata index: metadata[s_mids[i]] is the first metadata of the 1th node in the ith node group
         metadata = []
-        s_mids = torch.empty([self.num_nodes], dtype = torch.long)
-        # source node ids (nodes with their original parameters)
-        source_nids = torch.empty([cum_source_ns], dtype = torch.long)
+        s_mids = torch.empty([self.num_node_groups], dtype = torch.long)
+        # source node group ids (nodes with their original parameters)
+        source_ngids = torch.empty([cum_source_ngroups], dtype = torch.long)
 
         # Parameters of this layer
         params = torch.empty([self.num_params], dtype = torch.float32)
         
-        n_start = 0
-        source_n_start = 0
+        ng_start = 0
+        source_ng_start = 0
+        param_start = 0
         for ns_id, ns in enumerate(self.nodes):
-            n_end = n_start + ns.num_nodes
+            ng_end = ng_start + ns.num_node_groups
 
             # `vids`
-            assert len(node_vars[ns_id]) == num_vars
-            vids[n_start:n_end,:] = torch.tensor(node_vars[ns_id]).view(1, -1)
+            assert len(node_vars[ns_id]) == num_vars, f"Input nodes in the same layer should define on the same " \
+                                                      f"number of variables, but got {len(node_vars[ns_id])} and {num_vars}."
+            vids[ng_start:ng_end,:] = torch.tensor(node_vars[ns_id]).view(1, -1)
 
             # `s_pids` and `s_pfids`
             if not ns.is_tied():
                 source_ns = ns
             else:
                 source_ns = ns.get_source_ns()
-            pid_offsets = torch.arange(0, ns.num_nodes * ns.dist.num_parameters(), ns.dist.num_parameters())
-            s_pids[n_start:n_end] = source_ns._param_range[0] + pid_offsets
-            pfid_offsets = torch.arange(0, ns.num_nodes * ns.dist.num_param_flows(), ns.dist.num_param_flows())
-            s_pfids[n_start:n_end] = source_ns._param_flow_range[0] + pfid_offsets
 
-            # `source_nids`
+            n_params_per_group = self.group_size * ns.dist.num_parameters()
+            gpid_offsets = torch.arange(0, ns.num_node_groups * n_params_per_group, n_params_per_group)
+            s_pids[ng_start:ng_end] = source_ns._param_range[0] + gpid_offsets
+            inc_pids[ng_start:ng_end] = ns.dist.num_parameters()
+
+            n_pflows_per_group = self.group_size * ns.dist.num_param_flows()
+            gpfid_offsets = torch.arange(0, ns.num_node_groups * n_pflows_per_group, n_pflows_per_group)
+            s_pfids[ng_start:ng_end] = source_ns._param_flow_range[0] + gpfid_offsets
+            inc_pfids[ng_start:ng_end] = ns.dist.num_param_flows()
+
+            # `source_ngids`
             if not ns.is_tied():
-                source_n_end = source_n_start + ns.num_nodes
-                source_nids[source_n_start:source_n_end] = torch.arange(n_start, n_end)
-                source_n_start = source_n_end
+                source_ng_end = source_ng_start + ns.num_node_groups
+                source_ngids[source_ng_start:source_ng_end] = torch.arange(ng_start, ng_end)
+                source_ng_start = source_ng_end
 
             # `metadata` and `s_mids`
-            s_mids[n_start:n_end] = len(metadata)
+            s_mids[ng_start:ng_end] = len(metadata)
             metadata.extend(node_metadata[ns_id])
 
-            n_start = n_end
+            ng_start = ng_end
 
         self.register_buffer("vids", vids)
         self.register_buffer("s_pids", s_pids)
+        self.register_buffer("inc_pids", inc_pids)
         self.register_buffer("s_pfids", s_pfids)
+        self.register_buffer("inc_pfids", inc_pfids)
         self.register_buffer("metadata", torch.tensor(metadata).float())
         self.register_buffer("s_mids", s_mids)
-        self.register_buffer("source_nids", source_nids)
+        self.register_buffer("source_ngids", source_ngids)
 
-        self.params = nn.Parameter(params)
+        self.params = nn.Parameter(params) # Parameters will be set later in `self._init_parameters()`
         # Due to the custom inplace backward pass implementation, we do not track 
         # gradient of PC parameters by PyTorch.
         self.params.requires_grad = False
@@ -186,33 +206,43 @@ class InputLayer(Layer, nn.Module):
             batch_size = node_mars.size(1)
             node_offset = self._output_ind_range[0]
 
-            if not self.provided("fw_local_ids"):
+            if not self.provided("fw_local_group_ids"):
                 layer_num_nodes = self._output_ind_range[1] - self._output_ind_range[0]
-                fw_local_ids = None
+                fw_local_group_ids = None
             else:
-                layer_num_nodes = self.fw_local_ids.size(0)
-                fw_local_ids = self.fw_local_ids
+                layer_num_nodes = self.fw_local_group_ids.size(0)
+                fw_local_group_ids = self.fw_local_group_ids
 
             if not self.provided("_mars_kernel"):
                 self._mars_kernel = self._compile_triton_kernel(self._mars_kernel_template, mar_fn = self.fw_mar_fn)
 
-            grid = lambda meta: (triton.cdiv(layer_num_nodes * batch_size, meta['BLOCK_SIZE']),)
+            eval_num_groups = self.num_node_groups if not self.provided("fw_local_group_ids") else self.fw_local_group_ids.size(0)
+            BLOCK_B = min(batch_size, 1024)
+            TILE_SIZE_K = min(1024 // BLOCK_B, self.group_size)
+            BLOCK_M = 1
+
+            grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(eval_num_groups, BLOCK_M))
+
             self._mars_kernel[grid](
-                params_ptr = self.params, 
+                params_ptr = params, 
                 node_mars_ptr = node_mars, 
                 data_ptr = data, 
                 vids_ptr = self.vids, 
-                s_pids_ptr = self.s_pids, 
+                s_pids_ptr = self.s_pids,
+                inc_pids_ptr = self.inc_pids,
                 metadata_ptr = self.metadata, 
                 s_mids_ptr = self.s_mids, 
-                fw_local_ids_ptr = fw_local_ids,
-                layer_num_nodes = layer_num_nodes, 
+                fw_local_group_ids_ptr = fw_local_group_ids,
+                layer_num_node_groups = eval_num_groups, 
                 batch_size = batch_size, 
                 num_vars_per_node = self.num_vars_per_node, 
                 nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
                 node_offset = node_offset, 
-                BLOCK_SIZE = 1024, 
-                partial_eval = 1 if fw_local_ids is not None else 0
+                group_size = self.group_size,
+                TILE_SIZE_K = TILE_SIZE_K,
+                K_NUM_TILES = self.group_size // TILE_SIZE_K,
+                BLOCK_B = BLOCK_B,
+                partial_eval = 1 if fw_local_group_ids is not None else 0
             )
 
             # Apply missing mask if required
@@ -226,12 +256,12 @@ class InputLayer(Layer, nn.Module):
                     missing_mask_ptr = missing_mask,
                     node_mars_ptr = node_mars, 
                     vids_ptr = self.vids, 
-                    fw_local_ids_ptr = fw_local_ids,
-                    layer_num_nodes = layer_num_nodes, 
+                    fw_local_group_ids_ptr = fw_local_group_ids,
+                    layer_num_node_groups = eval_num_groups,
                     batch_size = batch_size, 
                     node_offset = node_offset, 
                     BLOCK_SIZE = 1024, 
-                    partial_eval = 1 if fw_local_ids is not None else 0,
+                    partial_eval = 1 if fw_local_group_ids is not None else 0,
                     mask_dim = mask_dim
                 )
 
@@ -261,19 +291,19 @@ class InputLayer(Layer, nn.Module):
             batch_size = node_flows.size(1)
             node_offset = self._output_ind_range[0]
 
-            if not self.provided("bk_local_ids"):
+            if not self.provided("bk_local_group_ids"):
                 layer_num_nodes = self._output_ind_range[1] - self._output_ind_range[0]
-                bk_local_ids = None
+                bk_local_group_ids = None
             else:
-                layer_num_nodes = self.bk_local_ids.size(0)
-                bk_local_ids = self.bk_local_ids
+                layer_num_nodes = self.bk_local_group_ids.size(0)
+                bk_local_group_ids = self.bk_local_group_ids
 
             if not self.provided("_flows_kernel"):
                 self._flows_kernel = self._compile_triton_kernel(self._flows_kernel_template, flow_fn = self.bk_flow_fn)
 
             grid = lambda meta: (triton.cdiv(layer_num_nodes * batch_size, meta['BLOCK_SIZE']),)
             self._flows_kernel[grid](
-                params_ptr = self.params,
+                params_ptr = params,
                 param_flows_ptr = self.param_flows,
                 node_flows_ptr = node_flows, 
                 node_mars_ptr = node_mars,
@@ -283,14 +313,14 @@ class InputLayer(Layer, nn.Module):
                 s_pfids_ptr = self.s_pfids,
                 metadata_ptr = self.metadata, 
                 s_mids_ptr = self.s_mids, 
-                bk_local_ids_ptr = bk_local_ids,
+                bk_local_group_ids_ptr = bk_local_group_ids,
                 layer_num_nodes = layer_num_nodes, 
                 batch_size = batch_size, 
                 num_vars_per_node = self.num_vars_per_node, 
                 nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
                 node_offset = node_offset, 
                 BLOCK_SIZE = 1024, 
-                partial_eval = 1 if bk_local_ids is not None else 0
+                partial_eval = 1 if bk_local_group_ids is not None else 0
             )
 
         else:
@@ -352,7 +382,7 @@ class InputLayer(Layer, nn.Module):
             with torch.no_grad():
 
                 if "cuda" in self.device.type:
-                    layer_num_source_nodes = self.source_nids.size(0)
+                    layer_num_source_nodes = self.source_ngids.size(0)
 
                     if not self.provided("_em_kernel"):
                         self._em_kernel = self._compile_triton_kernel(self._em_kernel_template, em_fn = self.em_fn)
@@ -367,7 +397,7 @@ class InputLayer(Layer, nn.Module):
                         s_pfids_ptr = self.s_pfids,
                         metadata_ptr = self.metadata,
                         s_mids_ptr = self.s_mids,
-                        source_nids_ptr = self.source_nids,
+                        source_ngids_ptr = self.source_ngids,
                         constexprs_ptr = constexprs,
                         layer_num_source_nodes = layer_num_source_nodes,
                         BLOCK_SIZE = 1024
@@ -382,49 +412,49 @@ class InputLayer(Layer, nn.Module):
     def enable_partial_evaluation(self, fw_scopes: Optional[Union[Sequence[BitSet],Sequence[int]]] = None, 
                                   bk_scopes: Optional[Union[Sequence[BitSet],Sequence[int]]] = None, return_ids: bool = False):
         # Create cache if needed
-        if not self.provided("scope2localids"):
+        if not self.provided("scope2localgids"):
             self._prepare_scope2nids()
 
         # Filter forward nodes
         if fw_scopes is not None:
-            fw_local_ids = []
+            fw_local_group_ids = []
             for scope in fw_scopes:
                 if isinstance(scope, int):
                     scope = BitSet.from_array([scope])
 
-                if scope not in self.scope2localids:
+                if scope not in self.scope2localgids:
                     continue
 
-                fw_local_ids.append(self.scope2localids[scope])
+                fw_local_group_ids.append(self.scope2localgids[scope])
 
             if return_ids:
-                return torch.cat(fw_local_ids, dim = 0)
+                return torch.cat(fw_local_group_ids, dim = 0)
             else:
-                self.fw_local_ids = torch.cat(fw_local_ids, dim = 0)
+                self.fw_local_group_ids = torch.cat(fw_local_group_ids, dim = 0)
 
         # Filter backward nodes
         if bk_scopes is not None:
-            bk_local_ids = []
+            bk_local_group_ids = []
             for scope in bk_scopes:
                 if isinstance(scope, int):
                     scope = BitSet.from_array([scope])
 
-                if scope not in self.scope2localids:
+                if scope not in self.scope2localgids:
                     continue
 
-                bk_local_ids.append(self.scope2localids[scope])
+                bk_local_group_ids.append(self.scope2localgids[scope])
 
             if return_ids:
-                return torch.cat(bk_local_ids, dim = 0)
+                return torch.cat(bk_local_group_ids, dim = 0)
             else:
-                self.bk_local_ids = torch.cat(bk_local_ids, dim = 0)
+                self.bk_local_group_ids = torch.cat(bk_local_group_ids, dim = 0)
 
     def disable_partial_evaluation(self, forward: bool = True, backward: bool = True):
         if forward:
-            self.fw_local_ids = None
+            self.fw_local_group_ids = None
 
         if backward:
-            self.bk_local_ids = None
+            self.bk_local_group_ids = None
 
     def update_parameters(self):
         for idx, ns in enumerate(self.nodes):
@@ -435,27 +465,26 @@ class InputLayer(Layer, nn.Module):
             ns._params = self.params.data[par_start:par_end].detach().cpu().clone()
 
     def _prepare_scope2nids(self):
-        if not hasattr(self, "scope2localids"):
-            scope2localids = dict()
+        if not hasattr(self, "scope2localgids"):
+            scope2localgids = dict()
 
-            local_nid = 0
+            local_ngid = 0
             for ns in self.nodes:
                 scope = ns.scope
 
-                s_nid = local_nid
-                e_nid = local_nid + ns.num_nodes
+                s_ngid = local_ngid
+                e_ngid = local_ngid + ns.num_node_groups
 
                 with torch.no_grad():
-                    if scope not in scope2localids:
-                        scope2localids[scope] = [torch.zeros([0], dtype = torch.long)]
+                    if scope not in scope2localgids:
+                        scope2localgids[scope] = [torch.zeros([0], dtype = torch.long)]
 
-                    group_local_ids = torch.arange(s_nid, e_nid)
-                    scope2localids[scope].append(group_local_ids)
+                    scope2localgids[scope].append(torch.arange(s_nid, e_nid))
 
                 local_nid += ns.num_nodes
 
-            self.scope2localids = {
-                scope: torch.cat(ids, dim = 0).to(self.params.device) for scope, ids in scope2localids.items()
+            self.scope2localgids = {
+                scope: torch.cat(ids, dim = 0).to(self.params.device) for scope, ids in scope2localgids.items()
             }
 
     def _reorder_nodes(self, nodes):
@@ -503,45 +532,65 @@ class InputLayer(Layer, nn.Module):
                 p_start = p_end
 
     @staticmethod
-    def _mars_kernel_template(mar_fn, params_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, metadata_ptr, s_mids_ptr, 
-                              fw_local_ids_ptr, partial_eval: tl.constexpr, layer_num_nodes: tl.constexpr, batch_size: tl.constexpr, 
-                              num_vars_per_node: tl.constexpr, nv_block_size: tl.constexpr, node_offset: tl.constexpr, BLOCK_SIZE: tl.constexpr):
-        pid = tl.program_id(axis = 0)
-        block_start = pid * BLOCK_SIZE
+    def _mars_kernel_template(mar_fn, params_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, inc_pids_ptr, metadata_ptr, s_mids_ptr,
+                              fw_local_group_ids_ptr, partial_eval: tl.constexpr, layer_num_node_groups: tl.constexpr, batch_size: tl.constexpr, 
+                              num_vars_per_node: tl.constexpr, nv_block_size: tl.constexpr, node_offset: tl.constexpr, group_size: tl.constexpr,
+                              TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, BLOCK_B: tl.constexpr):
+        bid = tl.program_id(axis = 0)
+        ngroup_id = tl.program_id(axis = 1)
 
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < layer_num_nodes * batch_size
-
-        # Raw batch and (local) node id
-        batch_offsets = (offsets % batch_size)
-        local_offsets = (offsets // batch_size)
+        # Batch ids to process
+        offs_batch = bid * BLOCK_B + tl.arange(0, BLOCK_B)
+        mask_batch = offs_batch < batch_size
 
         if partial_eval > 0:
-            local_offsets = tl.load(fw_local_ids_ptr + local_offsets, mask = mask, other = 0)
+            ngroup_id = tl.load(fw_local_group_ids_ptr + ngroup_id)
 
         if num_vars_per_node == 1:
-            # Get all variable ids
-            vids = tl.load(vids_ptr + local_offsets, mask = mask, other = 0)
+            # Get variable id
+            vid = tl.load(vids_ptr + ngroup_id)
 
             # Load the corresponding data
-            data = tl.load(data_ptr + vids * batch_size + batch_offsets, mask = mask, other = 0)
+            offs_data = vid * batch_size + offs_batch
+            data = tl.load(data_ptr + offs_data, mask = mask_batch, other = 0) # [BLOCK_B]
         else:
             # Get all variable ids
-            vids_offsets = tl.broadcast_to(local_offsets[:,None], (BLOCK_SIZE, nv_block_size)) * num_vars_per_node + \
-                tl.broadcast_to(tl.arange(0, nv_block_size)[None,:], (BLOCK_SIZE, nv_block_size))
-            vids_mask = tl.broadcast_to(mask[:,None], (BLOCK_SIZE, nv_block_size)) & \
-                tl.broadcast_to((tl.arange(0, nv_block_size) < num_vars_per_node)[None,:], (BLOCK_SIZE, nv_block_size))
-            vids = tl.load(vids_ptr + vids_offsets, mask = vids_mask, other = 0)
+            offs_vs = tl.arange(0, nv_block_size)
+            mask_vs = offs_vs < num_vars_per_node
+            offs_vids = ngroup_id * num_vars_per_node + offs_vs
+            mask_vids = mask_vs
+            vids = tl.load(vids_ptr + offs_vids, mask = mask_vids, other = 0)
 
             # Load the corresponding data
-            data = tl.load(data_ptr + vids * batch_size + batch_offsets, mask = vids_mask, other = 0)
+            offs_data = vids[:,None] * batch_size + offs_batch[None,:]
+            data = tl.load(data_ptr + offs_data, mask = (mask_vids[:,None] & mask_batch[None,:]), other = 0)
 
-        s_pids = tl.load(s_pids_ptr + local_offsets, mask = mask, other = 0)
+        # Initialize pointers to `params`
+        off_params = tl.load(s_pids_ptr + ngroup_id)
+        inc_params = tl.load(inc_pids_ptr + ngroup_id)
+        offs_node = tl.arange(0, TILE_SIZE_K)
+        p_params = params_ptr + off_params + inc_params * offs_node # [TILE_SIZE_K]
 
-        mars = mar_fn(local_offsets, data, params_ptr, s_pids, metadata_ptr, s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE)
+        # Initialize pointers to `metadata`
+        offs_metadata = tl.load(s_mids_ptr + ngroup_id)
+        p_metadata = metadata_ptr + offs_metadata # [1]
 
-        node_offsets = local_offsets + node_offset
-        tl.store(node_mars_ptr + node_offsets * batch_size + batch_offsets, mars, mask = mask)
+        # Initialize pointers to `node_mars`
+        p_nmars = node_mars_ptr + \
+            (ngroup_id * group_size + offs_node[:,None] + node_offset) * batch_size + \
+            offs_batch[None,:] # [TILE_SIZE_K, BLOCK_B]
+
+        # Inner loop to process everything in the node group
+        mask = mask_batch[None,:]
+        for i in range(K_NUM_TILES):
+
+            mars = mar_fn(data, p_params, p_metadata, mask, num_vars_per_node)
+
+            tl.store(p_nmars, mars, mask = mask)
+
+            # Increment pointers
+            p_params += inc_params * TILE_SIZE_K
+            p_nmars += TILE_SIZE_K * batch_size
 
     @staticmethod
     @triton.jit
@@ -653,7 +702,7 @@ class InputLayer(Layer, nn.Module):
 
     @staticmethod
     def _em_kernel_template(em_fn, params_ptr, param_flows_ptr, s_pids_ptr, s_pfids_ptr, metadata_ptr, s_mids_ptr,
-                            source_nids_ptr, constexprs_ptr, layer_num_source_nodes: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+                            source_ngids_ptr, constexprs_ptr, layer_num_source_nodes: tl.constexpr, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(axis = 0)
         block_start = pid * BLOCK_SIZE
 
@@ -665,7 +714,7 @@ class InputLayer(Layer, nn.Module):
         mask = offsets < layer_num_source_nodes
 
         # Get the local node ids
-        local_offsets = tl.load(source_nids_ptr + offsets, mask = mask, other = 0)
+        local_offsets = tl.load(source_ngids_ptr + offsets, mask = mask, other = 0)
 
         # Get the corresponding start id for `params` and `param_flows`
         s_pids = tl.load(s_pids_ptr + local_offsets, mask = mask, other = 0)

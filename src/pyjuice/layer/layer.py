@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import torch
-from typing import Union
+from typing import Union, Sequence
+
+from pyjuice.nodes import CircuitNodes
 
 
 class Layer():
-    def __init__(self) -> None:
+    def __init__(self, nodes: Sequence[CircuitNodes]) -> None:
+
+        for i in range(1, len(nodes)):
+            assert nodes[i].group_size == nodes[0].group_size, "`group_size` of nodes in the same layer must be identical."
+
         self.device = torch.device("cpu")
 
     def init_layer(self, params: Union[torch.Tensor,None]):

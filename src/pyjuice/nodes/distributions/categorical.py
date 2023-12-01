@@ -36,12 +36,10 @@ class Categorical(Distribution):
         return params.reshape(-1)
 
     @staticmethod
-    def fw_mar_fn(local_offsets, data, params_ptr, s_pids, metadata_ptr, s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE):
-        # I am not sure why, but the following code will not work...
-        # probs = tl.load(params_ptr + s_pids + data, mask = mask, other = 0)
-        # Seems like a bug of triton.
-        param_idx = s_pids + data
-        probs = tl.load(params_ptr + param_idx, mask = mask, other = 0)
+    def fw_mar_fn(data, p_params, p_metadata, mask, num_vars_per_node):
+
+        p_tarpars = p_params[:,None] + data[None,:]
+        probs = tl.load(p_tarpars, mask = mask, other = 0)
         log_probs = tl.log(probs)
 
         return log_probs

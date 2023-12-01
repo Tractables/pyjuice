@@ -554,6 +554,8 @@ class TensorCircuit(nn.Module):
         tied_param_group_ids = []
         tied_param_ends = []
 
+        import pdb; pdb.set_trace()
+
         if verbose:
             print(f"Compiling {num_layers} layers...")
         layer_id = 0

@@ -20,7 +20,7 @@ class ProdLayer(Layer, nn.Module):
 
     def __init__(self, nodes: Sequence[ProdNodes], layer_sparsity_tol: float = 0.0, 
                  max_num_groups: Optional[int] = None, disable_gpu_compilation: bool = False) -> None:
-        Layer.__init__(self)
+        Layer.__init__(self, nodes)
         nn.Module.__init__(self)
 
         assert len(nodes) > 0, "No input node."

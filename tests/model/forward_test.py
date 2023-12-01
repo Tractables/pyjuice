@@ -12,10 +12,10 @@ import pytest
 
 def forward_test():
 
-    ni0 = inputs(0, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
-    ni1 = inputs(1, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
-    ni2 = inputs(2, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
-    ni3 = inputs(3, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
+    ni0 = inputs(0, num_node_groups = 2, dist = dists.Categorical(num_cats = 2))
+    ni1 = inputs(1, num_node_groups = 2, dist = dists.Categorical(num_cats = 2))
+    ni2 = inputs(2, num_node_groups = 2, dist = dists.Categorical(num_cats = 2))
+    ni3 = inputs(3, num_node_groups = 2, dist = dists.Categorical(num_cats = 2))
 
     m1 = multiply(ni0, ni1, edge_ids = torch.tensor([[0, 0], [0, 1], [1, 0], [1, 1]], dtype = torch.long))
     n1 = summate(m1, edge_ids = torch.tensor([[0, 0, 0, 0, 1, 1, 1, 1], [0, 1, 2, 3, 0, 1, 2, 3]], dtype = torch.long))
@@ -27,6 +27,8 @@ def forward_test():
     n = summate(m, edge_ids = torch.tensor([[0, 0], [0, 1]], dtype = torch.long))
 
     pc = TensorCircuit(n)
+
+    import pdb; pdb.set_trace()
 
     device = torch.device("cuda:0")
     pc.to(device)
