@@ -27,7 +27,7 @@ def input_layer_test():
         ni2 = inputs(2, num_node_groups = 2, dist = dists.Categorical(num_cats = 2))
         ni3 = inputs(3, num_node_groups = 2, dist = dists.Categorical(num_cats = 2))
 
-    layer = InputLayer([ni0, ni1, ni2, ni3], cum_nodes = 1, maximize_group_size = False)
+    layer = InputLayer([ni0, ni1, ni2, ni3], cum_nodes = 1)
 
     layer._init_parameters(perturbation = 2.0)
 
@@ -111,6 +111,61 @@ def input_layer_test():
     assert torch.all(torch.abs(new_params - layer.params) < 1e-4)
 
 
+def tied_bp_test():
+
+    device = torch.device("cuda:0")
+
+    group_size = 4
+    batch_size = 16
+    
+    with juice.set_group_size(group_size):
+
+        ni0 = inputs(0, num_node_groups = 2, dist = dists.Categorical(num_cats = 2))
+        ni1 = inputs(1, num_node_groups = 2, dist = dists.Categorical(num_cats = 2))
+        ni2 = inputs(2, num_node_groups = 2, dist = dists.Categorical(num_cats = 2))
+        ni3 = ni1.duplicate(3, tie_params = True)
+
+    layer = InputLayer([ni0, ni1, ni2, ni3], cum_nodes = 1, max_tied_ns_per_parflow_group = 1.0)
+
+    layer._init_parameters(perturbation = 2.0)
+
+    assert torch.all(layer.vids == torch.tensor([0,1,2,3]).unsqueeze(1).repeat(1, 8).reshape(-1, 1))
+    s_pids = torch.arange(0, 32 * 2, 2)
+    s_pids[24:32] = s_pids[8:16]
+    assert torch.all(layer.s_pids == s_pids)
+    assert torch.all(layer.s_pfids == torch.arange(0, 32 * 2, 2))
+    assert torch.all(layer.metadata == torch.ones([4]) * 2.0)
+    assert torch.all(layer.s_mids == torch.tensor([0,1,2,3]).unsqueeze(1).repeat(1, 8).reshape(-1))
+    assert torch.all(layer.source_nids == torch.arange(0, 24))
+
+    assert layer.tied2source_nids[0][0] == 16
+    assert layer.tied2source_nids[0][1] == 16
+    assert torch.all(layer.tied2source_nids[0][2] == torch.tensor([16, 48]))
+
+    layer.to(device)
+
+    data = torch.randint(0, 2, (4, batch_size)).to(device)
+    node_mars = torch.zeros([33, batch_size]).to(device)
+    node_flows = torch.rand([33, batch_size]).to(device)
+
+    step_size = 0.3
+    pseudocount = 0.1
+
+    ## EM tests ##
+
+    layer.init_param_flows(flows_memory = 0.0)
+
+    layer(data, node_mars)
+    layer.backward(data, node_flows, node_mars)
+
+    param_flows = layer.param_flows.detach().clone()
+    param_flows[16:32] += param_flows[48:64]
+
+    layer.mini_batch_em(step_size = step_size, pseudocount = pseudocount)
+
+    assert torch.all(torch.abs(param_flows - layer.param_flows) < 1e-4)
+
+
 def speed_test():
 
     device = torch.device("cuda:0")
@@ -127,7 +182,7 @@ def speed_test():
         for v in range(num_vars):
             nis.append(inputs(0, num_node_groups = num_node_groups, dist = dists.Categorical(num_cats = 64)))
 
-    layer = InputLayer(nis, cum_nodes = 1, maximize_group_size = False)
+    layer = InputLayer(nis, cum_nodes = 1)
 
     layer._init_parameters(perturbation = 2.0)
 
@@ -223,10 +278,11 @@ def speed_test():
     forward_ms = (t1 - t0) / 100 * 1000
 
     print(f"EM on average takes {forward_ms:.3f}ms.")
-    print("Reference computation time on RTX 4090: 0.825ms.")
+    print("Reference computation time on RTX 4090: 0.784ms.")
     print("--------------------------------------------------------------")
 
 
 if __name__ == "__main__":
     input_layer_test()
+    tied_bp_test()
     speed_test()
