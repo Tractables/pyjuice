@@ -37,11 +37,15 @@ class Distribution():
         """
         Forward evaluation for log-probabilities.
         Args:
-        `data`: [BLOCK_M, BLOCK_B] data of the corresponding node groups
-        `p_params`: [BLOCK_M, TILE_SIZE_K] pointer to the parameters
-        `p_metadata`: [BLOCK_M] pointer to the metadata
-        `mask`: [BLOCK_M, BLOCK_B] full mask
+        `local_offsets`: [BLOCK_SIZE] the local indices of the to-be-processed input nodes
+        `data`: [BLOCK_SIZE, num_vars_per_node] data of the corresponding nodes
+        `params_ptr`: pointer to the parameter vector
+        `s_pids`: [BLOCK_SIZE] start parameter index (offset) for all input nodes
+        `metadata_ptr`: pointer to metadata
+        `s_mids_ptr`: pointer to the start metadata index (offset)
+        `mask`: [BLOCK_SIZE] indicate whether each node should be processed
         `num_vars_per_node`: numbers of variables per input node/distribution
+        `BLOCK_SIZE`: CUDA block size
         """
         raise NotImplementedError()
 

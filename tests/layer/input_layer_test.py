@@ -31,16 +31,12 @@ def input_layer_test():
 
     layer._init_parameters(perturbation = 2.0)
 
-    assert torch.all(layer.vids == torch.tensor([0,0,1,1,2,2,3,3]).reshape(-1, 1))
-    npars_per_group = group_size * ni0.dist.num_parameters()
-    assert torch.all(layer.s_pids == torch.arange(0, npars_per_group * 8, npars_per_group))
-    assert torch.all(layer.inc_pids == ni0.dist.num_parameters())
-    npflows_per_group = group_size * ni0.dist.num_param_flows()
-    assert torch.all(layer.s_pfids == torch.arange(0, npflows_per_group * 8, npflows_per_group))
-    assert torch.all(layer.inc_pfids == ni0.dist.num_param_flows())
+    assert torch.all(layer.vids == torch.tensor([0,1,2,3]).unsqueeze(1).repeat(1, 8).reshape(-1, 1))
+    assert torch.all(layer.s_pids == torch.arange(0, 32 * 2, 2))
+    assert torch.all(layer.s_pfids == torch.arange(0, 32 * 2, 2))
     assert torch.all(layer.metadata == torch.ones([4]) * 2.0)
-    assert torch.all(layer.s_mids == torch.tensor([0,0,1,1,2,2,3,3]))
-    assert torch.all(layer.source_ngids == torch.arange(0, 8))
+    assert torch.all(layer.s_mids == torch.tensor([0,1,2,3]).unsqueeze(1).repeat(1, 8).reshape(-1))
+    assert torch.all(layer.source_nids == torch.arange(0, 32))
 
     layer.to(device)
 
@@ -100,7 +96,9 @@ def input_layer_test():
 
     assert torch.all(torch.abs(layer.param_flows - param_flows) < 1e-4)
 
-    import pdb; pdb.set_trace()
+    ## EM tests ##
+
+    
 
 
 def speed_test():
@@ -134,14 +132,14 @@ def speed_test():
 
     t0 = time.time()
     torch.cuda.synchronize()
-    for _ in range(100):
+    for _ in range(2):
         layer(data, node_mars)
     torch.cuda.synchronize()
     t1 = time.time()
     forward_ms = (t1 - t0) / 100 * 1000
 
     print(f"Forward pass on average takes {forward_ms:.3f}ms.")
-    print("Reference computation time on RTX 4090: 0.048ms.")
+    print("Reference computation time on RTX 4090: 0.533ms.")
     print("--------------------------------------------------------------")
 
     ## Forward with mask tests ##
@@ -159,7 +157,7 @@ def speed_test():
     forward_ms = (t1 - t0) / 100 * 1000
 
     print(f"Forward pass (w/ sample independent mask) on average takes {forward_ms:.3f}ms.")
-    print("Reference computation time on RTX 4090: 0.062ms.")
+    print("Reference computation time on RTX 4090: 1.434ms.")
     print("--------------------------------------------------------------")
 
     missing_mask = torch.randint(0, 2, (num_vars, batch_size)).bool().to(device)
@@ -175,10 +173,10 @@ def speed_test():
     forward_ms = (t1 - t0) / 100 * 1000
 
     print(f"Forward pass (w/ sample dependent mask) on average takes {forward_ms:.3f}ms.")
-    print("Reference computation time on RTX 4090: 0.086ms.")
+    print("Reference computation time on RTX 4090: 1.431ms.")
     print("--------------------------------------------------------------")
 
-    ## Backward tests ##
+    # ## Backward tests ##
 
     node_flows = torch.rand([1 + group_size * num_node_groups * num_vars, batch_size]).to(device)
 
@@ -196,10 +194,10 @@ def speed_test():
     forward_ms = (t1 - t0) / 100 * 1000
 
     print(f"Backward pass on average takes {forward_ms:.3f}ms.")
-    print("Reference computation time on RTX 4090: 0.086ms.")
+    print("Reference computation time on RTX 4090: 0.825ms.")
     print("--------------------------------------------------------------")
 
 
 if __name__ == "__main__":
-    # input_layer_test()
+    input_layer_test()
     speed_test()

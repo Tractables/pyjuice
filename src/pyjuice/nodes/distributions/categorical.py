@@ -36,19 +36,24 @@ class Categorical(Distribution):
         return params.reshape(-1)
 
     @staticmethod
-    def fw_mar_fn(data, p_params, p_metadata, mask, num_vars_per_node):
-
-        p_tarpars = p_params[:,None] + data[None,:]
-        probs = tl.load(p_tarpars, mask = mask, other = 0)
+    def fw_mar_fn(local_offsets, data, params_ptr, s_pids, metadata_ptr, s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE):
+        # I am not sure why, but the following code will not work...
+        # probs = tl.load(params_ptr + s_pids + data, mask = mask, other = 0)
+        # Seems like a bug of triton.
+        param_idx = s_pids + data
+        probs = tl.load(params_ptr + param_idx, mask = mask, other = 0)
         log_probs = tl.log(probs)
 
         return log_probs
 
     @staticmethod
-    def bk_flow_fn(flows, data, p_parflows, p_params, p_metadata, mask, num_vars_per_node):
-
-        p_tarflows = p_parflows[:,None] + data[None,:]
-        tl.atomic_add(p_tarflows, flows, mask = mask)
+    def bk_flow_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
+                   s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE):
+        # I am not sure why, but the following code will not work...
+        # tl.atomic_add(param_flows_ptr + s_pfids + data, flows, mask = mask)
+        # Seems like a bug of triton.
+        pf_offsets = s_pfids + data
+        tl.atomic_add(param_flows_ptr + pf_offsets, flows, mask = mask)
 
     @staticmethod
     def sample_fn(samples_ptr, local_offsets, batch_offsets, vids, s_pids, params_ptr, metadata_ptr, s_mids_ptr, mask, batch_size, BLOCK_SIZE, seed):
