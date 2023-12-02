@@ -352,7 +352,7 @@ class InputLayer(Layer, nn.Module):
             with torch.no_grad():
 
                 if "cuda" in self.device.type:
-                    layer_num_source_nodes = self.source_ngids.size(0)
+                    layer_num_source_nodes = self.source_nids.size(0)
 
                     if not self.provided("_em_kernel"):
                         self._em_kernel = self._compile_triton_kernel(self._em_kernel_template, em_fn = self.em_fn)
@@ -360,6 +360,7 @@ class InputLayer(Layer, nn.Module):
                     constexprs = torch.tensor([step_size, pseudocount], dtype = torch.float32, device = self.device)
 
                     grid = lambda meta: (triton.cdiv(layer_num_source_nodes, meta['BLOCK_SIZE']),)
+
                     self._em_kernel[grid](
                         params_ptr = self.params,
                         param_flows_ptr = self.param_flows,
@@ -367,7 +368,7 @@ class InputLayer(Layer, nn.Module):
                         s_pfids_ptr = self.s_pfids,
                         metadata_ptr = self.metadata,
                         s_mids_ptr = self.s_mids,
-                        source_ngids_ptr = self.source_ngids,
+                        source_nids_ptr = self.source_nids,
                         constexprs_ptr = constexprs,
                         layer_num_source_nodes = layer_num_source_nodes,
                         BLOCK_SIZE = 1024
@@ -652,7 +653,7 @@ class InputLayer(Layer, nn.Module):
 
     @staticmethod
     def _em_kernel_template(em_fn, params_ptr, param_flows_ptr, s_pids_ptr, s_pfids_ptr, metadata_ptr, s_mids_ptr,
-                            source_ngids_ptr, constexprs_ptr, layer_num_source_nodes: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+                            source_nids_ptr, constexprs_ptr, layer_num_source_nodes: tl.constexpr, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(axis = 0)
         block_start = pid * BLOCK_SIZE
 
@@ -664,7 +665,7 @@ class InputLayer(Layer, nn.Module):
         mask = offsets < layer_num_source_nodes
 
         # Get the local node ids
-        local_offsets = tl.load(source_ngids_ptr + offsets, mask = mask, other = 0)
+        local_offsets = tl.load(source_nids_ptr + offsets, mask = mask, other = 0)
 
         # Get the corresponding start id for `params` and `param_flows`
         s_pids = tl.load(s_pids_ptr + local_offsets, mask = mask, other = 0)

@@ -98,7 +98,17 @@ def input_layer_test():
 
     ## EM tests ##
 
-    
+    original_params = layer.params.clone()
+
+    step_size = 0.3
+    pseudocount = 0.1
+
+    par_flows = layer.param_flows.clone().reshape(32, 2)
+    new_params = (1.0 - step_size) * original_params + step_size * ((par_flows + pseudocount / 2) / (par_flows.sum(dim = 1, keepdim = True) + pseudocount)).reshape(-1)
+
+    layer.mini_batch_em(step_size = step_size, pseudocount = pseudocount)
+
+    assert torch.all(torch.abs(new_params - layer.params) < 1e-4)
 
 
 def speed_test():
@@ -176,7 +186,7 @@ def speed_test():
     print("Reference computation time on RTX 4090: 1.431ms.")
     print("--------------------------------------------------------------")
 
-    # ## Backward tests ##
+    ## Backward tests ##
 
     node_flows = torch.rand([1 + group_size * num_node_groups * num_vars, batch_size]).to(device)
 
@@ -194,6 +204,25 @@ def speed_test():
     forward_ms = (t1 - t0) / 100 * 1000
 
     print(f"Backward pass on average takes {forward_ms:.3f}ms.")
+    print("Reference computation time on RTX 4090: 0.825ms.")
+    print("--------------------------------------------------------------")
+
+    ## EM tests ##
+
+    step_size = 0.01
+    pseudocount = 0.1
+
+    layer.mini_batch_em(step_size = step_size, pseudocount = pseudocount)
+
+    t0 = time.time()
+    torch.cuda.synchronize()
+    for _ in range(100):
+        layer.mini_batch_em(step_size = step_size, pseudocount = pseudocount)
+    torch.cuda.synchronize()
+    t1 = time.time()
+    forward_ms = (t1 - t0) / 100 * 1000
+
+    print(f"EM on average takes {forward_ms:.3f}ms.")
     print("Reference computation time on RTX 4090: 0.825ms.")
     print("--------------------------------------------------------------")
 
