@@ -156,6 +156,9 @@ def _weighted_partition_nodes_dp_simple(node_n_edges: np.ndarray, counts: np.nda
     dp = np.zeros([node_n_edges.shape[0], max_num_partitions + 1], dtype = np.int64)
     backtrace = np.zeros([node_n_edges.shape[0], max_num_partitions + 1], dtype = np.int64)
 
+    # if debug:
+    #     import pdb; pdb.set_trace()
+
     overhead, target_n_group = _weighted_partition_nodes_dp_simple_compiled(
         np.ascontiguousarray(node_n_edges),
         np.ascontiguousarray(cum_counts),
@@ -176,7 +179,7 @@ def _weighted_partition_nodes_dp_simple(node_n_edges: np.ndarray, counts: np.nda
 def partition_nodes_by_n_edges(node_n_edges: Union[np.ndarray, torch.Tensor], 
                                max_num_partitions: Optional[int] = None, 
                                sparsity_tolerance: Optional[float] = None,
-                               algorithm: str = "dp_with_coalesce", debug = False):
+                               algorithm: str = "dp_with_coalesce"):
 
     if sparsity_tolerance is not None and sparsity_tolerance < 1e-6:
         sparsity_tolerance = None
@@ -195,7 +198,7 @@ def partition_nodes_by_n_edges(node_n_edges: Union[np.ndarray, torch.Tensor],
         node_n_edges = node_n_edges.detach().cpu().numpy()
 
     total_num_edges = node_n_edges.sum()
-    target_overhead = None if sparsity_tolerance is None else int(math.ceil(total_num_edges / sparsity_tolerance))
+    target_overhead = None if sparsity_tolerance is None else int(math.ceil(total_num_edges * sparsity_tolerance))
 
     if max_num_partitions == 1:
         partitions = np.zeros([1], dtype = np.int64)
@@ -210,8 +213,6 @@ def partition_nodes_by_n_edges(node_n_edges: Union[np.ndarray, torch.Tensor],
 
     elif algorithm == "dp_with_coalesce":
         unique_n_edges, counts = _coalesce(node_n_edges, tol_range = "auto")
-        if debug:
-            import pdb; pdb.set_trace()
         group_sizes, overhead = _weighted_partition_nodes_dp_simple(unique_n_edges, counts, max_num_partitions, target_overhead)
 
     else:
