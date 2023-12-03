@@ -123,8 +123,6 @@ def speed_test():
 
     layer = ProdLayer(nps, layer_sparsity_tol = 0.1)
 
-    import pdb; pdb.set_trace()
-
     layer.to(device)
 
     node_mars = torch.rand([group_size + group_size * num_node_groups * num_vars, batch_size]).log().to(device)
@@ -162,10 +160,11 @@ def speed_test():
     forward_ms = (t1 - t0) / 100 * 1000
 
     print(f"Backward pass on average takes {forward_ms:.3f}ms.")
-    print("Reference computation time on RTX 4090: 0.330ms.")
+    print("Reference computation time on RTX 4090: 0.533ms.")
     print("--------------------------------------------------------------")
 
 
 if __name__ == "__main__":
-    # prod_layer_test()
+    torch.manual_seed(2390)
+    prod_layer_test()
     speed_test()

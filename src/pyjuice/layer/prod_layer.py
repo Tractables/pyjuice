@@ -15,8 +15,6 @@ from .backend.index_set import batched_index_set, batched_index_cum
 from .compilation import next_power_of_2, get_prod_layer_stats, prod_layer_forward_compilation, \
                          flatten_c_ids, get_prod_layer_parstats, prod_layer_backward_compilation
 
-from .compilation import get_prod_layer_stats_new, prod_layer_forward_compilation_new
-
 
 class ProdLayer(Layer, nn.Module):
 
@@ -35,7 +33,7 @@ class ProdLayer(Layer, nn.Module):
 
         ## Get layer statistics & prepare for compilation ##
 
-        layer_num_ngroups, layer_num_edges, n_chgs = get_prod_layer_stats_new(self.nodes, self.group_size)
+        layer_num_ngroups, layer_num_edges, n_chgs = get_prod_layer_stats(self.nodes, self.group_size)
 
         self.num_nodes = layer_num_ngroups * self.group_size
         self.num_edges = layer_num_edges
@@ -71,7 +69,7 @@ class ProdLayer(Layer, nn.Module):
 
         # nids:      List[[partition_size]]                      stores node ids
         # cids:      List[[partition_size, partition_max_n_chs]] stores indices of child nodes
-        nids, cids = prod_layer_forward_compilation_new(
+        nids, cids = prod_layer_forward_compilation(
             self.nodes, fw_partition_max_chs, fw_n_partition_ids, fw_n_id_in_partition, fw_num_ngs_in_partition, self.group_size
         )
 
@@ -93,7 +91,7 @@ class ProdLayer(Layer, nn.Module):
         # Find a good strategy to partition the child nodes into groups according to their number of parents 
         # to minimize total computation cost
         bk_partition_max_pars = partition_nodes_by_n_edges(
-            par_counts, sparsity_tolerance = layer_sparsity_tol, max_num_partitions = max_num_partitions, debug = True
+            par_counts, sparsity_tolerance = layer_sparsity_tol, max_num_partitions = max_num_partitions
         )
 
         # Since the triton kernels require the maximum number children for each group to be a power of 2,

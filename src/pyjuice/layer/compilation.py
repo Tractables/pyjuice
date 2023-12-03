@@ -945,30 +945,7 @@ def sum_layer_backward_compilation(nodes, pids, fw_n_group_ids, fw_n_id_in_group
 ## Compilation for ProdLayer ##
 
 
-def get_prod_layer_stats(nodes: Sequence[SumNodes]):
-    layer_num_nodes = sum(map(lambda ns: ns.num_nodes, nodes))
-    layer_num_edges = 0
-    
-    global_nid_start = 1 # idx 0 is reserved for the dummy node
-
-    n_sid = 0
-    n_chs = torch.zeros([layer_num_nodes], dtype = torch.long)
-    for ns_idx, ns in enumerate(nodes):
-        n_eid = n_sid + ns.num_nodes
-
-        n_chs[n_sid:n_eid] = ns.num_chs
-
-        layer_num_edges += ns.num_nodes * ns.num_chs
-
-        ns._output_ind_range = (global_nid_start, global_nid_start + ns.num_nodes)
-        global_nid_start += ns.num_nodes
-
-        n_sid = n_eid
-
-    return layer_num_nodes, layer_num_edges, n_chs
-
-
-def get_prod_layer_stats_new(nodes: Sequence[SumNodes], group_size: int):
+def get_prod_layer_stats(nodes: Sequence[SumNodes], group_size: int):
     layer_num_ngroup = sum(map(lambda ns: ns.num_node_groups, nodes))
     layer_num_edges = 0
     
@@ -992,37 +969,7 @@ def get_prod_layer_stats_new(nodes: Sequence[SumNodes], group_size: int):
 
 
 @torch.no_grad()
-def prod_layer_forward_compilation(nodes, fw_group_max_chs, n_group_ids, n_id_in_group, num_ns_in_group, use_cuda: bool = False):
-
-    if use_cuda and not torch.cuda.is_available():
-        use_cuda = False
-
-    nids = [torch.zeros([group_size], dtype = torch.long) for group_size in num_ns_in_group] # Node id
-    cids = [torch.zeros([group_size, max_chs], dtype = torch.long) for group_size, max_chs in zip(num_ns_in_group, fw_group_max_chs)] # Child id
-
-    n_sid = 1 # offset the dummy node
-    for ns_id, ns in enumerate(nodes):
-        n_eid = n_sid + ns.num_nodes
-
-        # `group_id`:   which group the current node belongs to
-        # `local_sid`:  the start index of the node within the current group
-        # `group_nchs`: maximum number of child nodes in the current group
-        group_id = n_group_ids[ns_id]
-        local_sid = n_id_in_group[ns_id]
-        local_eid = local_sid + ns.num_nodes
-        group_nchs = fw_group_max_chs[group_id]
-
-        nids[group_id][local_sid:local_eid] = torch.arange(ns.num_nodes) + n_sid
-        for cs_id, cs in enumerate(ns.chs):
-            cids[group_id][local_sid:local_eid,cs_id] = ns.edge_ids[:,cs_id] + cs._output_ind_range[0]
-
-        n_sid = n_eid
-
-    return nids, cids
-
-
-@torch.no_grad()
-def prod_layer_forward_compilation_new(nodes, fw_partition_max_chs, n_partition_ids, n_id_in_partition, num_ngs_in_partition, group_size, use_cuda: bool = False):
+def prod_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, n_id_in_partition, num_ngs_in_partition, group_size, use_cuda: bool = False):
     
     if use_cuda and not torch.cuda.is_available():
         use_cuda = False
