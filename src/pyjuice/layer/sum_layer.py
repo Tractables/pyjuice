@@ -24,7 +24,7 @@ class SumLayer(Layer, nn.Module):
                  param_ends: Sequence, tied_param_ids: Sequence,
                  tied_param_group_ids: Sequence, tied_param_ends: Sequence,
                  ch_prod_layer_size: int, layer_sparsity_tol: float = 0.0, 
-                 max_num_groups: Optional[int] = None,
+                 max_num_partitions: Optional[int] = None,
                  disable_gpu_compilation: bool = False) -> None:
 
         Layer.__init__(self, nodes)
@@ -46,7 +46,7 @@ class SumLayer(Layer, nn.Module):
         # Find a good strategy to partition the nodes into groups according to their number of children 
         # to minimize total computation cost
         fw_group_max_chs = partition_nodes_by_n_edges(
-            n_chs, sparsity_tolerance = layer_sparsity_tol, max_num_groups = max_num_groups
+            n_chs, sparsity_tolerance = layer_sparsity_tol, max_num_partitions = max_num_partitions
         )
 
         # Since the triton kernels require the maximum number children for each group to be a power of 2,
@@ -97,7 +97,7 @@ class SumLayer(Layer, nn.Module):
         # to minimize total computation cost
         ch_n_pars = ch_n_pars[1:] # Strip away the dummy node. We will never use it in the following
         bk_group_max_pars = partition_nodes_by_n_edges(
-            ch_n_pars, sparsity_tolerance = layer_sparsity_tol, max_num_groups = max_num_groups
+            ch_n_pars, sparsity_tolerance = layer_sparsity_tol, max_num_partitions = max_num_partitions
         )
 
         # Since the triton kernels require the maximum number children for each group to be a power of 2,

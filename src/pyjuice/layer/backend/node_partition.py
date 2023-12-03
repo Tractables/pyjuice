@@ -7,7 +7,7 @@ from typing import Union, Optional
 
 
 @njit()
-def _partition_nodes_dp_simple_compiled(node_n_edges, dp, backtrace, max_num_groups, target_overhead):
+def _partition_nodes_dp_simple_compiled(node_n_edges, dp, backtrace, max_num_partitions, target_overhead):
     num_nodes = node_n_edges.shape[0]
 
     # Init
@@ -15,8 +15,8 @@ def _partition_nodes_dp_simple_compiled(node_n_edges, dp, backtrace, max_num_gro
         dp[i,1] = node_n_edges[i] * (i + 1)
 
     # Main DP
-    target_n_group = max_num_groups
-    for n_group in range(2, max_num_groups + 1):
+    target_n_group = max_num_partitions
+    for n_group in range(2, max_num_partitions + 1):
         dp[0,n_group] = node_n_edges[0]
         backtrace[0,n_group] = 0
         for i in range(1, num_nodes):
@@ -47,16 +47,16 @@ def _backtrace_fn(partitions, backtrace, target_n_group, num_nodes):
         i = backtrace[i,target_n_group]
 
 
-def _partition_nodes_dp_simple(node_n_edges: np.ndarray, max_num_groups: int, target_overhead: Optional[int]):
+def _partition_nodes_dp_simple(node_n_edges: np.ndarray, max_num_partitions: int, target_overhead: Optional[int]):
 
-    dp = np.zeros([node_n_edges.shape[0], max_num_groups + 1], dtype = np.int64)
-    backtrace = np.zeros([node_n_edges.shape[0], max_num_groups + 1], dtype = np.int64)
+    dp = np.zeros([node_n_edges.shape[0], max_num_partitions + 1], dtype = np.int64)
+    backtrace = np.zeros([node_n_edges.shape[0], max_num_partitions + 1], dtype = np.int64)
 
     overhead, target_n_group = _partition_nodes_dp_simple_compiled(
         np.ascontiguousarray(node_n_edges), 
         np.ascontiguousarray(dp), 
         np.ascontiguousarray(backtrace),
-        max_num_groups,
+        max_num_partitions,
         target_overhead = 0 if target_overhead is None else target_overhead
     )
 
@@ -115,7 +115,7 @@ def _coalesce(vals, tol_range = "auto"):
 
 
 @njit()
-def _weighted_partition_nodes_dp_simple_compiled(node_n_edges, cum_counts, dp, backtrace, max_num_groups, target_overhead):
+def _weighted_partition_nodes_dp_simple_compiled(node_n_edges, cum_counts, dp, backtrace, max_num_partitions, target_overhead):
     num_nodes = node_n_edges.shape[0]
 
     # Init
@@ -123,8 +123,8 @@ def _weighted_partition_nodes_dp_simple_compiled(node_n_edges, cum_counts, dp, b
         dp[i,1] = node_n_edges[i] * cum_counts[i]
 
     # Main DP
-    target_n_group = max_num_groups
-    for n_group in range(2, max_num_groups + 1):
+    target_n_group = max_num_partitions
+    for n_group in range(2, max_num_partitions + 1):
         dp[0,n_group] = node_n_edges[0] * cum_counts[0]
         backtrace[0,n_group] = 0
         for i in range(1, num_nodes):
@@ -148,20 +148,20 @@ def _weighted_partition_nodes_dp_simple_compiled(node_n_edges, cum_counts, dp, b
     return overhead, target_n_group
 
 
-def _weighted_partition_nodes_dp_simple(node_n_edges: np.ndarray, counts: np.ndarray, max_num_groups: int, 
+def _weighted_partition_nodes_dp_simple(node_n_edges: np.ndarray, counts: np.ndarray, max_num_partitions: int, 
                                         target_overhead: Optional[int]):
 
     cum_counts = np.cumsum(counts)
 
-    dp = np.zeros([node_n_edges.shape[0], max_num_groups + 1], dtype = np.int64)
-    backtrace = np.zeros([node_n_edges.shape[0], max_num_groups + 1], dtype = np.int64)
+    dp = np.zeros([node_n_edges.shape[0], max_num_partitions + 1], dtype = np.int64)
+    backtrace = np.zeros([node_n_edges.shape[0], max_num_partitions + 1], dtype = np.int64)
 
     overhead, target_n_group = _weighted_partition_nodes_dp_simple_compiled(
         np.ascontiguousarray(node_n_edges),
         np.ascontiguousarray(cum_counts),
         np.ascontiguousarray(dp), 
         np.ascontiguousarray(backtrace),
-        max_num_groups,
+        max_num_partitions,
         target_overhead = 0 if target_overhead is None else target_overhead
     )
 
@@ -174,22 +174,22 @@ def _weighted_partition_nodes_dp_simple(node_n_edges: np.ndarray, counts: np.nda
 
 
 def partition_nodes_by_n_edges(node_n_edges: Union[np.ndarray, torch.Tensor], 
-                               max_num_groups: Optional[int] = None, 
+                               max_num_partitions: Optional[int] = None, 
                                sparsity_tolerance: Optional[float] = None,
-                               algorithm: str = "dp_with_coalesce"):
+                               algorithm: str = "dp_with_coalesce", debug = False):
 
     if sparsity_tolerance is not None and sparsity_tolerance < 1e-6:
         sparsity_tolerance = None
-        max_num_groups = 1
+        max_num_partitions = 1
 
     if sparsity_tolerance is not None:
         assert sparsity_tolerance > 1e-6 and sparsity_tolerance <= 1.0
-        if max_num_groups is None:
-            max_num_groups = max(min(int(math.ceil(node_n_edges.shape[0] * sparsity_tolerance)), 16), 1)
-    elif max_num_groups is None:
-        max_num_groups = 1
+        if max_num_partitions is None:
+            max_num_partitions = max(min(int(math.ceil(node_n_edges.shape[0] * sparsity_tolerance)), 16), 1)
+    elif max_num_partitions is None:
+        max_num_partitions = 1
     else:
-        assert max_num_groups >= 1, "Should provide at least 1 group."
+        assert max_num_partitions >= 1, "Should provide at least 1 group."
 
     if isinstance(node_n_edges, torch.Tensor):
         node_n_edges = node_n_edges.detach().cpu().numpy()
@@ -197,7 +197,7 @@ def partition_nodes_by_n_edges(node_n_edges: Union[np.ndarray, torch.Tensor],
     total_num_edges = node_n_edges.sum()
     target_overhead = None if sparsity_tolerance is None else int(math.ceil(total_num_edges / sparsity_tolerance))
 
-    if max_num_groups == 1:
+    if max_num_partitions == 1:
         partitions = np.zeros([1], dtype = np.int64)
         partitions[0] = np.max(node_n_edges)
         return torch.from_numpy(partitions)
@@ -206,11 +206,13 @@ def partition_nodes_by_n_edges(node_n_edges: Union[np.ndarray, torch.Tensor],
     node_n_edges = np.sort(node_n_edges)
 
     if algorithm == "dp_simple":
-        group_sizes, overhead = _partition_nodes_dp_simple(node_n_edges, max_num_groups, target_overhead)
+        group_sizes, overhead = _partition_nodes_dp_simple(node_n_edges, max_num_partitions, target_overhead)
 
     elif algorithm == "dp_with_coalesce":
         unique_n_edges, counts = _coalesce(node_n_edges, tol_range = "auto")
-        group_sizes, overhead = _weighted_partition_nodes_dp_simple(unique_n_edges, counts, max_num_groups, target_overhead)
+        if debug:
+            import pdb; pdb.set_trace()
+        group_sizes, overhead = _weighted_partition_nodes_dp_simple(unique_n_edges, counts, max_num_partitions, target_overhead)
 
     else:
         raise ValueError(f"Unknown algorithm {algorithm} for `partition_nodes_by_n_edges`.")

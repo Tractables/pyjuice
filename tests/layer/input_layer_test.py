@@ -180,7 +180,7 @@ def speed_test():
 
         nis = []
         for v in range(num_vars):
-            nis.append(inputs(0, num_node_groups = num_node_groups, dist = dists.Categorical(num_cats = 64)))
+            nis.append(inputs(v, num_node_groups = num_node_groups, dist = dists.Categorical(num_cats = 64)))
 
     layer = InputLayer(nis, cum_nodes = 1)
 
@@ -197,7 +197,7 @@ def speed_test():
 
     t0 = time.time()
     torch.cuda.synchronize()
-    for _ in range(2):
+    for _ in range(100):
         layer(data, node_mars)
     torch.cuda.synchronize()
     t1 = time.time()
