@@ -50,8 +50,8 @@ class ProdLayer(Layer, nn.Module):
 
         self.num_fw_partitions = len(fw_partition_max_chs) # Number of partitions
 
-        # fw_n_partition_ids:      [num_ns]          stores the partition id for each `ns` in `nodes`
-        # fw_n_id_in_partition:    [num_ns]          stores the start index of each `ns` in the corresponding partition
+        # fw_n_partition_ids:      [num_ns]             stores the partition id for each `ns` in `nodes`
+        # fw_n_id_in_partition:    [num_ns]             stores the start index of each `ns` in the corresponding partition
         # fw_num_ngs_in_partition: [num_fw_partitions]  number of node groups in each partition
         num_ns = len(self.nodes)
         fw_n_partition_ids = torch.zeros([num_ns], dtype = torch.long)
