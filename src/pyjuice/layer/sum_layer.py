@@ -410,6 +410,52 @@ class SumLayer(Layer, nn.Module):
 
         return None
 
+    def _forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor,
+                 params: torch.Tensor, nids: torch.Tensor, cids: torch.Tensor,
+                 pids: torch.Tensor, local_ids: Optional[torch.Tensor] = None,
+                 partition_id: int = -1, mode: Optional[str] = None) -> None:
+        """
+        Forward pass of sum layers.
+        
+        Parameters:
+        `node_mars`:    [N, B]
+        `element_mars`: [M, B]
+        `params`:       [E]
+        `nids`:         [ng]
+        `cids`:         [ng, c]
+        `pids`:         [ng, c]
+        """
+
+        num_edges = cids.size(1)
+        batch_size = node_mars.size(1)
+
+        if mode is not None:
+            assert mode in ["block_sparse", "sparse"]
+
+        elif params.dim() == 1 and self.group_size >= 16 and num_edges >= 16 and batch_size >= 16:
+            # In this case, we should definitely use the block-sparse implementation
+            mode = "block_sparse"
+        elif self.group_size * num_edges < 16 and num_edges * batch_size < 16:
+            # In this case, we should definitely use the sparse implementation
+            mode = "sparse"
+        else:
+            mode = "sparse"
+
+        if mode == "block_sparse":
+            self._forward_block_sparse(
+                node_mars, element_mars, params, nids, cids, pids, local_ids,
+                partition_id = partition_id
+            )
+
+        elif mode == "sparse":
+            self._forward_sparse(
+                node_mars, element_mars, params, nids, cids, pids, local_ids,
+                partition_id = partition_id
+            )
+        
+        else:
+            raise ValueError(f"Unexpected mode `{mode}`.")
+
     @staticmethod
     @triton.jit
     def _fw_triton_block_sparse_kernel(node_mars, element_mars, params, nids, cids_start, cids_increment,
@@ -483,12 +529,12 @@ class SumLayer(Layer, nn.Module):
         offs_nmars = (off_nids + offs_node[:,None]) * batch_size + offs_batch[None,:]
         tl.store(node_mars + offs_nmars, acc, mask = mask_batch[None,:])
 
-    def _forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor,
-                 params: torch.Tensor, nids: torch.Tensor, cids: torch.Tensor,
-                 pids: torch.Tensor, local_ids: Optional[torch.Tensor] = None,
-                 partition_id: int = -1) -> None:
+    def _forward_block_sparse(self, node_mars: torch.Tensor, element_mars: torch.Tensor,
+                              params: torch.Tensor, nids: torch.Tensor, cids: torch.Tensor,
+                              pids: torch.Tensor, local_ids: Optional[torch.Tensor] = None,
+                              partition_id: int = -1) -> None:
         """
-        Forward pass of sum layers.
+        Forward pass of sum layers with the block-sparse processing kernel.
         
         Parameters:
         `node_mars`:    [N, B]
@@ -505,9 +551,10 @@ class SumLayer(Layer, nn.Module):
         layer_n_nodes = num_ngroups * self.group_size
         num_edges = cids.size(1)
         batch_size = node_mars.size(1)
+        BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
 
         # Heuristic to set `TILE_SIZE_M`, `TILE_SIZE_K`, and `BLOCK_B`
-        base_size = min(self.group_size, num_edges, batch_size, 128)
+        base_size = min(self.group_size, num_edges, BATCH_SIZE_NP2, 128)
         if base_size >= 64:
             TILE_SIZE_K = base_size
             TILE_SIZE_M = 2048 // base_size
@@ -517,10 +564,10 @@ class SumLayer(Layer, nn.Module):
 
             TILE_SIZE_K = min(2048 // remainder, base_size * remainder, num_edges)
             TILE_SIZE_M = min(2048 // TILE_SIZE_K, self.group_size)
-            BLOCK_B = min(2048 // TILE_SIZE_K, batch_size)
+            BLOCK_B = min(2048 // TILE_SIZE_K, BATCH_SIZE_NP2)
         K_NUM_TILES = num_edges // TILE_SIZE_K
 
-        signature = (partition_id, TILE_SIZE_K)
+        signature = ("block_sparse", partition_id, TILE_SIZE_K)
         if signature not in self._cached_fw_pcids:
             # Pre-compute pointer increments for `cids` and `pids`
 
@@ -563,6 +610,110 @@ class SumLayer(Layer, nn.Module):
             GROUP_SIZE_M = self.group_size
         )
         
+        return None
+
+    @staticmethod
+    @triton.jit
+    def _fw_triton_sparse_kernel(node_mars, element_mars, params, nids, cids, pids,
+                                 local_ids, batch_size, partial_eval: tl.constexpr, n_edges: tl.constexpr, 
+                                 BLOCK_B: tl.constexpr, BLOCK_M: tl.constexpr, GROUP_SIZE_M: tl.constexpr):
+        
+        pid_b = tl.program_id(axis = 0) # ID of size-`BLOCK_B` batches
+        pid_m = tl.program_id(axis = 1) # ID of size-`BLOCK_M` nodes
+
+        # Get inferred node group id from `pid_m`
+        ngroup_id = pid_m // (GROUP_SIZE_M // BLOCK_M)
+        tile_id = pid_m % (GROUP_SIZE_M // BLOCK_M)
+
+        # Get the real node group id in the case of partial evaluation
+        if partial_eval == 1:
+            ngroup_id = tl.load(local_ids + ngroup_id)
+
+        # Initialize pointers to `params`
+        offs_edge = tl.arange(0, n_edges)
+        par_start = tl.load(pids + ngroup_id * n_edges + offs_edge)
+        epars_ptr = params + tile_id * BLOCK_M + par_start # [n_edges]
+
+        # Batch offsets and mask
+        offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B
+        mask_batch = offs_batch < batch_size
+
+        # Initialize and load edge mars
+        edge_ids = tl.load(cids + ngroup_id * n_edges + offs_edge)
+        emars_ptr = element_mars + \
+            edge_ids[:,None] * batch_size + \
+            offs_batch[None,:]
+        emars = tl.load(emars_ptr, mask = mask_batch[None,:]) # [n_edges, BLOCK_B]
+
+        # Compute max and subtract
+        emars_max = tl.max(emars, axis = 0)
+        emars = tl.exp(emars - emars_max[None,:])
+
+        # Initialize pointers to `node_mars`
+        off_nids = tl.load(nids + ngroup_id)
+        nmars_ptr = node_mars + \
+            (off_nids + tile_id * BLOCK_M) * batch_size + \
+            offs_batch
+
+        # Inner loop
+        for i in range(0, BLOCK_M):
+            epars = tl.load(epars_ptr)
+
+            nmars = tl.log(tl.sum(emars * epars[:,None], axis = 0)) + emars_max
+
+            tl.store(nmars_ptr, nmars, mask = mask_batch)
+
+            # Increment `epars_ptr`
+            epars_ptr += 1
+
+            # Increment `nmars_ptr`
+            nmars_ptr += batch_size
+
+    def _forward_sparse(self, node_mars: torch.Tensor, element_mars: torch.Tensor,
+                        params: torch.Tensor, nids: torch.Tensor, cids: torch.Tensor,
+                        pids: torch.Tensor, local_ids: Optional[torch.Tensor] = None,
+                        partition_id: int = -1) -> None:
+        """
+        Forward pass of sum layers with the sparse processing kernel.
+        
+        Parameters:
+        `node_mars`:    [N, B]
+        `element_mars`: [M, B]
+        `params`:       [E]
+        `nids`:         [ng]
+        `cids`:         [ng, c]
+        `pids`:         [ng, c]
+        """
+
+        num_ngroups = nids.size(0) if local_ids is None else local_ids.size(0)
+        layer_n_nodes = num_ngroups * self.group_size
+        n_edges = cids.size(1)
+        batch_size = node_mars.size(1)
+        BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
+
+        assert n_edges <= 16384
+
+        BLOCK_B = max(min(2048 // n_edges, BATCH_SIZE_NP2), 1)
+        BLOCK_M = self.group_size
+
+        grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, BLOCK_M))
+
+        self._fw_triton_sparse_kernel[grid](
+            node_mars = node_mars, 
+            element_mars = element_mars, 
+            params = params, 
+            nids = nids, 
+            cids = cids,
+            pids = pids,
+            local_ids = local_ids, 
+            batch_size = batch_size, 
+            partial_eval = 1 if local_ids is not None else 0, 
+            n_edges = n_edges, 
+            BLOCK_B = BLOCK_B, 
+            BLOCK_M = BLOCK_M, 
+            GROUP_SIZE_M = self.group_size
+        )
+
         return None
 
     @staticmethod
