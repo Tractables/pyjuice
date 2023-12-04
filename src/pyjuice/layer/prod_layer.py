@@ -6,6 +6,7 @@ import triton
 import triton.language as tl
 import warnings
 import time
+from packaging import version
 from typing import Sequence, Optional
 
 from pyjuice.nodes import ProdNodes
@@ -222,9 +223,12 @@ class ProdLayer(Layer, nn.Module):
 
     @staticmethod
     @triton.jit
-    def _forward_backward_kernel(node_vals_ptr, element_vals_ptr, local_ids_ptr, nids_ptr, cids_ptr, tot_n_nodes, tot_n_eles, n_ngroups,
-                                 n_edges: tl.constexpr, batch_size, BLOCK_M: tl.constexpr, BLOCK_B: tl.constexpr, 
-                                 group_size: tl.constexpr, accum: tl.constexpr, partial_eval: tl.constexpr):
+    def _forward_backward_kernel_3d(node_vals_ptr, element_vals_ptr, local_ids_ptr, nids_ptr, cids_ptr, tot_n_nodes, tot_n_eles, n_ngroups,
+                                    n_edges: tl.constexpr, batch_size, BLOCK_M: tl.constexpr, BLOCK_B: tl.constexpr, 
+                                    group_size: tl.constexpr, accum: tl.constexpr, partial_eval: tl.constexpr):
+        """
+        This kernel implements the function with 3d tensors. However, it only work with `triton==2.0.0`.
+        """
         
         pid_m = tl.program_id(axis = 0) # ID of size-`BLOCK_M` nodes
         pid_b = tl.program_id(axis = 1) # ID of size-`BLOCK_B` batches
@@ -310,6 +314,60 @@ class ProdLayer(Layer, nn.Module):
             tl.store(node_vals_ptr + offs_nvals, nvals, mask = mask_batch[:,None])
 
     @staticmethod
+    @triton.jit
+    def _forward_backward_kernel_2d(node_vals_ptr, element_vals_ptr, local_ids_ptr, nids_ptr, cids_ptr, tot_n_nodes, tot_n_eles, n_ngroups,
+                                    n_edges: tl.constexpr, batch_size, BLOCK_M: tl.constexpr, BLOCK_B: tl.constexpr, 
+                                    group_size: tl.constexpr, accum: tl.constexpr, partial_eval: tl.constexpr):
+        """
+        This kernel implements the function with 2d tensors. It works for all `triton` versions.
+        """
+
+        pid_m = tl.program_id(axis = 0) # ID of size-`BLOCK_M` nodes
+        pid_b = tl.program_id(axis = 1) # ID of size-`BLOCK_B` batches
+
+        # Get inferred node group id from `pid_m`
+        ngroup_id = pid_m // (group_size // BLOCK_M)
+        ntile_id = pid_m % (group_size // BLOCK_M)
+
+        # For partial evaluation
+        if partial_eval == 1:
+            ngroup_id = tl.load(local_ids_ptr + ngroup_id)
+
+        # Batch offsets and mask
+        offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B # [BLOCK_B]
+        mask_batch = offs_batch < batch_size
+
+        # Get the group start ids for the children
+        offs_edge = tl.arange(0, n_edges)
+        offs_egstart = tl.load(cids_ptr + ngroup_id * n_edges + offs_edge) # [n_edges]
+
+        # Base ptr for ch values
+        evals_ptr = element_vals_ptr + \
+            (offs_egstart[:,None] + ntile_id * BLOCK_M) * batch_size + \
+            offs_batch[None,:] # [n_edges, BLOCK_B]
+
+        # Base ptr for par values
+        ngroup_start = tl.load(nids_ptr + ngroup_id)
+        nvals_ptr = node_vals_ptr + \
+            (ngroup_start + ntile_id * BLOCK_M) * batch_size + \
+            offs_batch
+
+        # Inner loop
+        for i in range(0, BLOCK_M):
+            evals = tl.load(evals_ptr, mask = mask_batch[None,:], other = 0)
+            nvals = tl.sum(evals, axis = 0)
+
+            # Accumulate the `node_vals` if required
+            if accum == 1:
+                node_vals = tl.load(nvals_ptr, mask = mask_batch)
+                nvals += node_vals
+
+            tl.store(nvals_ptr, nvals, mask = mask_batch)
+
+            nvals_ptr += batch_size
+            evals_ptr += batch_size
+
+    @staticmethod
     @torch.compile(mode = "reduce-overhead", fullgraph = True)
     def _forward_backward_pytorch(node_vals, element_vals, nids, cids, accum: bool = False):
         nids = nids[:,None] + torch.arange(0, self.group_size, device = node_vals.device)[None,:]
@@ -341,28 +399,55 @@ class ProdLayer(Layer, nn.Module):
 
             return None
 
-        BLOCK_B = min(1024 // n_edges, triton.next_power_of_2(batch_size))
-        BLOCK_M = min(max(1024 // (BLOCK_B * n_edges), 1), triton.next_power_of_2(n_ngroups) * self.group_size)
+        if version.parse(triton.__version__) > version.parse("2.0.0"):
 
-        grid = (triton.cdiv(n_ngroups * self.group_size, BLOCK_M), triton.cdiv(batch_size, BLOCK_B))
+            BLOCK_B = min(1024 // n_edges, triton.next_power_of_2(batch_size))
+            BLOCK_M = min(max(1024 // (BLOCK_B * n_edges), 1), self.group_size)
 
-        self._forward_backward_kernel[grid](
-            node_vals_ptr = node_vals, 
-            element_vals_ptr = element_vals,
-            local_ids_ptr = local_ids,
-            nids_ptr = nids, 
-            cids_ptr = cids, 
-            tot_n_nodes = tot_n_nodes,
-            tot_n_eles = tot_n_eles,
-            n_ngroups = n_ngroups,
-            n_edges = n_edges,
-            batch_size = batch_size,
-            BLOCK_M = BLOCK_M, 
-            BLOCK_B = BLOCK_B,
-            group_size = self.group_size,
-            accum = 1 if accum else 0,
-            partial_eval = 1 if local_ids is not None else 0
-        )
+            grid = (triton.cdiv(n_ngroups * self.group_size, BLOCK_M), triton.cdiv(batch_size, BLOCK_B))
+
+            self._forward_backward_kernel_2d[grid](
+                node_vals_ptr = node_vals, 
+                element_vals_ptr = element_vals,
+                local_ids_ptr = local_ids,
+                nids_ptr = nids, 
+                cids_ptr = cids, 
+                tot_n_nodes = tot_n_nodes,
+                tot_n_eles = tot_n_eles,
+                n_ngroups = n_ngroups,
+                n_edges = n_edges,
+                batch_size = batch_size,
+                BLOCK_M = BLOCK_M, 
+                BLOCK_B = BLOCK_B,
+                group_size = self.group_size,
+                accum = 1 if accum else 0,
+                partial_eval = 1 if local_ids is not None else 0
+            )
+
+        else:
+
+            BLOCK_B = min(1024 // n_edges, triton.next_power_of_2(batch_size))
+            BLOCK_M = min(max(1024 // (BLOCK_B * n_edges), 1), triton.next_power_of_2(n_ngroups) * self.group_size)
+
+            grid = (triton.cdiv(n_ngroups * self.group_size, BLOCK_M), triton.cdiv(batch_size, BLOCK_B))
+
+            self._forward_backward_kernel_3d[grid](
+                node_vals_ptr = node_vals, 
+                element_vals_ptr = element_vals,
+                local_ids_ptr = local_ids,
+                nids_ptr = nids, 
+                cids_ptr = cids, 
+                tot_n_nodes = tot_n_nodes,
+                tot_n_eles = tot_n_eles,
+                n_ngroups = n_ngroups,
+                n_edges = n_edges,
+                batch_size = batch_size,
+                BLOCK_M = BLOCK_M, 
+                BLOCK_B = BLOCK_B,
+                group_size = self.group_size,
+                accum = 1 if accum else 0,
+                partial_eval = 1 if local_ids is not None else 0
+            )
 
         return None
 
