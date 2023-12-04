@@ -96,6 +96,17 @@ class SumLayer(Layer, nn.Module):
         # Store pre-compiled indices from `cids` and `pids` in the following buffer
         self._cached_fw_pcids = dict()
 
+        ## Initialize backward pass ##
+
+        # import pdb; pdb.set_trace()
+
+        # # Find a good strategy to partition the child nodes into groups according to their number of parents 
+        # # to minimize total computation cost
+        # ch_n_pars = ch_n_pars[1:] # Strip away the dummy node. We will never use it in the following
+        # bk_group_max_pars = partition_nodes_by_n_edges(
+        #     ch_n_pars, sparsity_tolerance = layer_sparsity_tol, max_num_partitions = max_num_partitions
+        # )
+
     def __init__old(self, nodes: Sequence[SumNodes], global_nid_start: int, 
                  param_ends: Sequence, tied_param_ids: Sequence,
                  tied_param_group_ids: Sequence, tied_param_ends: Sequence,
