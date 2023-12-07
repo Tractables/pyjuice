@@ -76,3 +76,6 @@ class ProdNodes(CircuitNodes):
             is_root = is_root,
             **kwargs
         )
+
+    def __repr__(self):
+        return f"ProdNodes(num_node_groups={self.num_node_groups}, group_size={self.group_size}, num_chs={self.num_chs})"

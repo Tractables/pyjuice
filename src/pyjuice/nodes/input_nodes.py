@@ -80,3 +80,6 @@ class InputNodes(CircuitNodes):
                 ret_params = True,
                 **kwargs
             )
+
+    def __repr__(self):
+        return f"InputNodes(num_node_groups={self.num_node_groups}, group_size={self.group_size}, dist={type(self.dist)})"
