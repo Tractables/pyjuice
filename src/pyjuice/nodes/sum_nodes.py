@@ -188,3 +188,6 @@ class SumNodes(CircuitNodes):
         assert par_ns.size(0) == self.num_node_groups and par_ns.max() == self.num_node_groups - 1, "Some node has no edge."
 
         self.edge_ids = edge_ids
+
+    def __repr__(self):
+        return f"SumNodes(num_node_groups={self.num_node_groups}, group_size={self.group_size}, num_chs={self.num_chs}, num_edges={self.num_edges})"

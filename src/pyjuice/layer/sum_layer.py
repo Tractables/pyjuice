@@ -14,7 +14,8 @@ from pyjuice.utils import BitSet
 from .layer import Layer
 from .backend.node_partition import partition_nodes_by_n_edges
 from .backend.index_set import batched_index_set, index_cum
-from .compilation import get_sum_layer_stats, sum_layer_forward_compilation, \
+from .compilation import get_sum_layer_forward_stats, sum_layer_forward_compilation, \
+                         get_sum_layer_backward_stats, \
                          sum_layer_backward_compilation, next_power_of_2
 
 
@@ -40,7 +41,7 @@ class SumLayer(Layer, nn.Module):
         # n_chs:       [num_node_groups]          stores the number of child nodes of each node
         # Note: to allow different nodes to have different `ch_group_size`s, we record the number of 
         #       child **nodes** (instead of # node groups) in `n_chs`
-        layer_num_ngroups, layer_num_edges, n_chs = get_sum_layer_stats(self.nodes, global_nid_start)
+        layer_num_ngroups, layer_num_edges, n_chs = get_sum_layer_forward_stats(self.nodes, global_nid_start)
 
         self.num_nodes = layer_num_ngroups * self.group_size # Total number of nodes
         self.num_edges = layer_num_edges # Total number of edges
@@ -59,10 +60,10 @@ class SumLayer(Layer, nn.Module):
 
         # fw_n_partition_ids:      [num_ngroups]           stores the partition id for each node node
         # fw_n_id_in_partition:    [num_ngroups]           stores the index of the node groups in the partition
-        # fw_num_ns_in_partition:  [num_fw_partitions]     number of node groups in each partition
+        # fw_num_ngs_in_partition: [num_fw_partitions]     number of node groups in each partition
         fw_n_partition_ids = torch.zeros([layer_num_ngroups], dtype = torch.long)
         fw_n_id_in_partition = torch.zeros([layer_num_ngroups], dtype = torch.long)
-        fw_num_ns_in_partition = torch.zeros([self.num_fw_partitions], dtype = torch.long)
+        fw_num_ngs_in_partition = torch.zeros([self.num_fw_partitions], dtype = torch.long)
 
         min_n_chs = 0
         for partition_id, max_n_chs in enumerate(fw_partition_max_chs):
@@ -71,7 +72,7 @@ class SumLayer(Layer, nn.Module):
 
             fw_n_partition_ids[criterion] = partition_id
             fw_n_id_in_partition[criterion] = torch.arange(partition_size)
-            fw_num_ns_in_partition[partition_id] = partition_size
+            fw_num_ngs_in_partition[partition_id] = partition_size
 
             min_n_chs = max_n_chs + 1
 
@@ -80,9 +81,8 @@ class SumLayer(Layer, nn.Module):
         # nids:      List[[partition_size]]                      stores node group ids
         # cids:      List[[partition_size, partition_max_n_chs]] stores indices of child node groups
         # pids:      List[[partition_size, partition_max_n_chs]] stores indices of edge parameters (1st parameter of every group)
-        # ch_n_pars: [ch_prod_layer_size]                        stores the number of parents for each child node
-        nids, cids, pids, ch_n_pars, param_ends = sum_layer_forward_compilation(
-            self.nodes, fw_partition_max_chs, fw_n_partition_ids, fw_n_id_in_partition, fw_num_ns_in_partition, 
+        nids, cids, pids, param_ends = sum_layer_forward_compilation(
+            self.nodes, fw_partition_max_chs, fw_n_partition_ids, fw_n_id_in_partition, fw_num_ngs_in_partition, 
             n_chs, global_nid_start, ch_prod_layer_size, param_ends = param_ends,
             # GPU compilation is slightly slower for small layer due to the kernel jit compilation time
             use_cuda = True # not disable_gpu_compilation and (self.num_edges > 1000)
@@ -98,14 +98,74 @@ class SumLayer(Layer, nn.Module):
 
         ## Initialize backward pass ##
 
-        # import pdb; pdb.set_trace()
+        # A sum layer could have children of different group sizes
+        # We separate and partition them into different backward kernels
+        ch_gsize2cs, ch_gsize2num_ngroups, ch_gsize2n_pargs, cs2parns = get_sum_layer_backward_stats(nodes)
 
-        # # Find a good strategy to partition the child nodes into groups according to their number of parents 
-        # # to minimize total computation cost
-        # ch_n_pars = ch_n_pars[1:] # Strip away the dummy node. We will never use it in the following
-        # bk_group_max_pars = partition_nodes_by_n_edges(
-        #     ch_n_pars, sparsity_tolerance = layer_sparsity_tol, max_num_partitions = max_num_partitions
-        # )
+        # For every possible child group size, we first compute the best partition strategy.
+        # We then move on to do the actual compilation
+        chids = []
+        parids = []
+        parpids = []
+        cs_group_sizes = []
+        for ch_gsize in ch_gsize2n_pargs:
+
+            num_ngroups = ch_gsize2num_ngroups[ch_gsize]
+            n_pargs = ch_gsize2n_pargs[ch_gsize]
+
+            # Find a good strategy to partition the node groups according to their number of children 
+            # to minimize total computation cost
+            bk_partition_max_pars = partition_nodes_by_n_edges(
+                n_pargs, sparsity_tolerance = layer_sparsity_tol, max_num_partitions = max_num_partitions
+            )
+
+            # Since the triton kernels require the maximum number children for each group to be a power of 2,
+            # we postprocess the partition sizes
+            bk_partition_max_pars = torch.unique(next_power_of_2(bk_partition_max_pars))
+            num_bk_partitions = bk_partition_max_pars.size(0)
+
+            # bk_n_partition_ids:      [num_ngroups]           stores the partition id for each node group
+            # bk_n_id_in_partition:    [num_ngroups]           stores the index of the node groups in the partition
+            # bk_num_ngs_in_partition: [num_bk_partitions]     number of node groups in each partition
+            bk_n_partition_ids = torch.zeros([num_ngroups], dtype = torch.long)
+            bk_n_id_in_partition = torch.zeros([num_ngroups], dtype = torch.long)
+            bk_num_ngs_in_partition = torch.zeros([num_bk_partitions], dtype = torch.long)
+
+            min_n_pars = 0
+            for partition_id, max_n_pars in enumerate(bk_partition_max_pars):
+                criterion = (n_pargs >= min_n_pars) & (n_pargs <= max_n_pars)
+                partition_size = criterion.sum().item()
+
+                bk_n_partition_ids[criterion] = partition_id
+                bk_n_id_in_partition[criterion] = torch.arange(partition_size)
+                bk_num_ngs_in_partition[partition_id] = partition_size
+
+                min_n_pars = max_n_pars + 1
+
+            # chids:      List[[partition_num_chs]]                         stores child group ids
+            # parids:     List[[partition_num_chs, partition_max_n_pargs]]  stores parent node groups' ids for each child node
+            # parpids:    List[[partition_num_chs, partition_max_n_pargs]]  param id for the edges to parent (correspond to `parids`)
+            curr_chids, curr_parids, curr_parpids = sum_layer_backward_compilation(
+                nodes = ch_gsize2cs[ch_gsize], 
+                cs2parns = cs2parns,
+                n_partition_ids = bk_n_partition_ids, 
+                n_id_in_partition = bk_n_id_in_partition, 
+                num_ngs_in_partition = bk_num_ngs_in_partition,
+                partition_max_pars = bk_partition_max_pars,
+                # GPU compilation is slightly slower for small layer due to the kernel jit compilation time
+                use_cuda = not disable_gpu_compilation and (self.num_edges > 1000)
+            )
+
+            chids.extend(curr_chids)
+            parids.extend(curr_parids)
+            parpids.extend(curr_parpids)
+            cs_group_sizes.extend([ch_gsize] * num_bk_partitions)
+
+        # Store buffers for the forward pass
+        self.partitioned_chids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in chids])
+        self.partitioned_parids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in parids])
+        self.partitioned_parpids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in parpids])
+        self.cs_group_sizes = cs_group_sizes
 
     def __init__old(self, nodes: Sequence[SumNodes], global_nid_start: int, 
                  param_ends: Sequence, tied_param_ids: Sequence,
@@ -470,7 +530,7 @@ class SumLayer(Layer, nn.Module):
     @staticmethod
     @triton.jit
     def _fw_triton_block_sparse_kernel(node_mars, element_mars, params, nids, cids_start, cids_increment,
-                                       pids_start, pids_increment, local_ids, batch_size, partial_eval: tl.constexpr,
+                                       pids_start, pids_increment, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
                                        BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
                                        TILE_SIZE_M: tl.constexpr, GROUP_SIZE_M: tl.constexpr):
 
@@ -485,20 +545,28 @@ class SumLayer(Layer, nn.Module):
         if partial_eval == 1:
             ngroup_id = tl.load(local_ids + ngroup_id)
 
-        # Initialize pointers to `params`
+        # Node offsets
         offs_node = tl.arange(0, TILE_SIZE_M) + tile_id * TILE_SIZE_M
+        offs_node = tl.max_contiguous(offs_node, TILE_SIZE_M)
+
+        # Edge offsets
         offs_edge = tl.arange(0, TILE_SIZE_K)
-        par_start = tl.load(pids_start + ngroup_id * TILE_SIZE_K + offs_edge)
+
+        # Initialize pointers to `params`
+        offs_estart = ngroup_id * TILE_SIZE_K + offs_edge
+        offs_estart = tl.max_contiguous(offs_estart, TILE_SIZE_K)
+        par_start = tl.load(pids_start + offs_estart)
         epars_ptr = params + \
             offs_node[:,None] + \
             par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
 
         # Batch offsets and mask
         offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B
+        offs_batch = tl.max_contiguous(offs_batch, BLOCK_B)
         mask_batch = offs_batch < batch_size
 
         # Initialize pointers to `element_mars`
-        edge_start = tl.load(cids_start + ngroup_id * TILE_SIZE_K + offs_edge)
+        edge_start = tl.load(cids_start + offs_estart)
         emars_ptr = element_mars + \
             edge_start[:,None] * batch_size + \
             offs_batch[None,:] # [TILE_SIZE_K, BLOCK_B]
@@ -528,12 +596,12 @@ class SumLayer(Layer, nn.Module):
             # Increment `epars_ptr`
             pids_inc = tl.load(pids_inc_ptr)
             epars_ptr += pids_inc[None,:]
-            pids_inc += TILE_SIZE_K
+            pids_inc_ptr += TILE_SIZE_K
 
             # Increment `emars_ptr`
             cids_inc = tl.load(cids_inc_ptr)
             emars_ptr += cids_inc[:,None] * batch_size
-            cids_inc += TILE_SIZE_K
+            cids_inc_ptr += TILE_SIZE_K
 
         # Write back
         off_nids = tl.load(nids + ngroup_id)
