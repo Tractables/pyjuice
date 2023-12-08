@@ -229,8 +229,6 @@ def sum_layer_test():
     assert torch.all(layer.partitioned_parpids[0][4,1] == 1 + 10 * group_size**2)
     assert torch.all(layer.partitioned_parpids[0][5,1] == 1 + 11 * group_size**2)
 
-    import pdb; pdb.set_trace()
-
     layer.to(device)
 
     ## Forward tests ##
@@ -248,6 +246,39 @@ def sum_layer_test():
             cmars = element_mars[layer.partitioned_cids[0][j,:]].exp()
             epars = params[layer.partitioned_pids[0][j,:]+i]
             assert torch.all(torch.abs(node_mars[(j+1)*group_size+i,:] - (epars[:,None] * cmars).sum(dim = 0).log()) < 1e-3)
+
+    ## Backward tests ##
+
+    node_flows = torch.rand([group_size + group_size * 2 * 3, batch_size]).to(device)
+    element_flows = torch.zeros([group_size + 3 * 2 * 2 * group_size, batch_size]).to(device)
+
+    param_flows = torch.zeros([1 + 3 * 4 * group_size * group_size]).to(device)
+
+    layer.backward(node_flows, element_flows, node_mars, element_mars, params, param_flows)
+
+    chids = layer.partitioned_chids[0]
+    parids = layer.partitioned_parids[0]
+    parpids = layer.partitioned_parpids[0]
+
+    num_ngroups = chids.size(0)
+    num_egroups = parids.size(1)
+    parids = (parids[:,:,None].repeat(1, 1, group_size) + torch.arange(0, group_size, device = parids.device)).reshape(num_ngroups, num_egroups * group_size)
+    parpids = (parpids[:,:,None] + torch.arange(0, group_size * group_size, group_size, device = parids.device)).reshape(
+        num_ngroups, num_egroups * group_size)
+
+    for i in range(group_size):
+        for j in range(6):
+            nmars = node_mars[parids[j,:]].exp()
+            nflows = node_flows[parids[j,:]]
+            emars = element_mars[(j+1)*group_size+i,:].exp()
+            epars = params[parpids[j,:]+i]
+            eflows = (nflows * epars[:,None] * emars[None,:] / nmars).sum(dim = 0)
+
+            import pdb; pdb.set_trace()
+
+            assert torch.all(torch.abs(eflows - element_flows[(j+1)*group_size+i,:]) < 1e-3)
+            
+    import pdb; pdb.set_trace()
 
 
 def speed_test():
@@ -319,6 +350,23 @@ def speed_test():
 
     node_flows = torch.rand([group_size + group_size * num_node_groups * num_prod_nodes, batch_size]).to(device)
     element_flows = torch.zeros([group_size + num_prod_nodes * group_size * num_node_groups, batch_size]).log().to(device)
+    param_flows = torch.zeros([layer.partitioned_pids[0].max() + group_size]).to(device)
+
+    layer.backward(node_flows, element_flows, node_mars, element_mars, params, param_flows)
+
+    t0 = time.time()
+    torch.cuda.synchronize()
+    for _ in range(100):
+        layer.backward(node_flows, element_flows, node_mars, element_mars, params, param_flows)
+    torch.cuda.synchronize()
+    t1 = time.time()
+    backward_ms = (t1 - t0) / 100 * 1000
+
+    print(f"Backward pass on average takes {forward_ms:.3f}ms.")
+    print("Reference computation time on RTX 4090: 11.255ms.")
+    print("--------------------------------------------------------------")
+
+    exit()
 
     # import pdb; pdb.set_trace()
 
@@ -436,5 +484,6 @@ def speed_test():
 
 
 if __name__ == "__main__":
-    sum_layer_test()
-    # speed_test()
+    torch.manual_seed(3890)
+    # sum_layer_test()
+    speed_test()

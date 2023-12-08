@@ -167,6 +167,11 @@ class SumLayer(Layer, nn.Module):
         self.partitioned_parpids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in parpids])
         self.cs_group_sizes = cs_group_sizes
 
+        self.num_bk_partitions = len(chids)
+
+        # Store pre-compiled indices from `parids` and `parpids` in the following buffer
+        self._cached_bk_parids = dict()
+
     def to(self, device):
         super(SumLayer, self).to(device)
 
@@ -241,112 +246,69 @@ class SumLayer(Layer, nn.Module):
         `params`:        [num_params, B] or [num_params]
         """
         
+        ## Compute flows w.r.t. elements (i.e., product nodes) ##
         if not self.provided("bk_group_local_ids"):
             # Evaluate the whole layer
-            for group_id in range(self.num_bk_groups):
-                chids = self.grouped_chids[group_id]
-                parids = self.grouped_parids[group_id]
-                parpids = self.grouped_parpids[group_id]
+            for partition_id in range(self.num_bk_partitions):
+                chids = self.partitioned_chids[partition_id]
+                parids = self.partitioned_parids[partition_id]
+                parpids = self.partitioned_parpids[partition_id]
+                cs_group_size = self.cs_group_sizes[partition_id]
 
                 self._backward(
                     node_flows, element_flows, params, node_mars, 
-                    element_mars, param_flows, chids, parids, parpids
+                    element_mars, param_flows, chids, parids, parpids,
+                    cs_group_size
                 )
 
         else:
             # Partial evaluation
-            for group_id in range(self.num_bk_groups):
-                chids = self.grouped_chids[group_id]
-                parids = self.grouped_parids[group_id]
-                parpids = self.grouped_parpids[group_id]
-                local_ids = self.bk_group_local_ids[group_id]
+            for partition_id in range(self.num_bk_partitions):
+                chids = self.grouped_chids[partition_id]
+                parids = self.grouped_parids[partition_id]
+                parpids = self.grouped_parpids[partition_id]
+                cs_group_size = self.cs_group_sizes[partition_id]
+                local_ids = self.bk_group_local_ids[partition_id]
 
                 self._backward(
                     node_flows, element_flows, params, node_mars,
                     element_mars, param_flows, chids, parids, parpids,
-                    local_ids = local_ids
+                    cs_group_size, local_ids = local_ids
+                )
+
+        ## Compute flows w.r.t. sum parameters ##
+        if param_flows is not None:
+            for partition_id in range(self.num_fw_partitions):
+                nids = self.partitioned_nids[partition_id]
+                cids = self.partitioned_cids[partition_id]
+                pids = self.partitioned_pids[partition_id]
+
+                self._backward(
+                    node_flows, element_flows, params, node_mars, 
+                    element_mars, param_flows, nids, cids, pids, 
+                    partition_id = partition_id
                 )
 
         return None
-        
-    @staticmethod
-    @triton.jit
-    def _forward_triton_kernel_old(node_mars_ptr, element_mars_ptr, params_ptr, 
-                               nids_ptr, cids_ptr, pids_ptr, tot_n_nodes, 
-                               tot_n_eles, n_nodes, n_edges: tl.constexpr, 
-                               batch_size, n_nodes_per_block_m: tl.constexpr,
-                               BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
-
-        # We use BLOCK_M to index over edges, and BLOCK_N to index over batches
-        pid0 = tl.program_id(axis = 0)
-        pid1 = tl.program_id(axis = 1)
-        ne_start = pid0 * BLOCK_M
-        b_start = pid1 * BLOCK_N
-
-        # Id of edges processed by the current block
-        ne_offsets = ne_start + tl.arange(0, BLOCK_M)
-        # Batch ids processed by the current block
-        b_offsets = b_start + tl.arange(0, BLOCK_N)
-        b_mask = b_offsets < batch_size
-
-        # Get node ids from `nids`
-        n_start = ne_start // n_edges
-        nid_offsets = n_start + tl.arange(0, n_nodes_per_block_m)
-        nid_mask = nid_offsets < n_nodes
-        n_ids = tl.load(nids_ptr + nid_offsets, mask = nid_mask, other = 0)
-
-        # Get edge ids from `cids`
-        cid_offsets = tl.view(ne_offsets, (n_edges, n_nodes_per_block_m))
-        cid_mask = tl.broadcast_to(nid_mask[None,:], (n_edges, n_nodes_per_block_m))
-        ch_ids = tl.load(cids_ptr + cid_offsets, mask = cid_mask, other = 0)
-
-        # Use `ch_ids` to retrieve the corresponding element mars
-        ele_offsets = tl.broadcast_to(ch_ids[None,:,:], (BLOCK_N, n_edges, n_nodes_per_block_m)) * batch_size + \
-            tl.broadcast_to(b_offsets[:,None,None], (BLOCK_N, n_edges, n_nodes_per_block_m))
-        ele_mask = tl.broadcast_to(nid_mask[None,None,:], (BLOCK_N, n_edges, n_nodes_per_block_m)) & \
-            tl.broadcast_to(b_mask[:,None,None], (BLOCK_N, n_edges, n_nodes_per_block_m))
-        ch_logps = tl.load(element_mars_ptr + ele_offsets, mask = ele_mask, other = 0) # `element_mars[cids]`
-
-        # Take the max of the child mars
-        ch_max_logp = tl.max(ch_logps, axis = 1) # `maxval`
-
-        # Subtract the max from child mars
-        ch_logps_sub_max = ch_logps - tl.broadcast_to(ch_max_logp[:,None,:], (BLOCK_N, n_edges, n_nodes_per_block_m))
-
-        # Take exp
-        ch_ps_sub_max = tl.exp(ch_logps_sub_max)
-
-        # Get param ids from `pids`
-        # Here we reuse `cid_offsets` and `cid_mask` thank to their similar structure
-        par_ids = tl.load(pids_ptr + cid_offsets, mask = cid_mask, other = 0)
-
-        # Use `par_ids` to retrieve the corresponding parameters
-        par_mask = tl.broadcast_to(nid_mask[None,:], (n_edges, n_nodes_per_block_m))
-        ch_pars = tl.load(params_ptr + par_ids, mask = par_mask, other = 0) # `params[pids]`
-        ch_pars = tl.broadcast_to(ch_pars[None,:,:], (BLOCK_N, n_edges, n_nodes_per_block_m))
-
-        # Sum node marginals (unnormalized)
-        n_ps = tl.sum(ch_ps_sub_max * ch_pars, axis = 1)
-
-        # Take log and subtract max vals
-        n_logps = tl.log(tl.maximum(n_ps, 1e-10)) + ch_max_logp
-
-        # Read out the target indices for `node_mars`
-        nmar_offsets = tl.broadcast_to(n_ids[None,:], (BLOCK_N, n_nodes_per_block_m)) * batch_size + \
-            tl.broadcast_to(b_offsets[:,None], (BLOCK_N, n_nodes_per_block_m))
-        nmar_mask = tl.broadcast_to(nid_mask[None,:], (BLOCK_N, n_nodes_per_block_m)) & \
-            tl.broadcast_to(b_mask[:,None], (BLOCK_N, n_nodes_per_block_m))
-        
-        # Reshape seems to be necessary for certain combinations of (BLOCK_N, n_nodes_per_block_m)
-        nmar_offsets = tl.view(nmar_offsets, (BLOCK_N * n_nodes_per_block_m,))
-        nmar_mask = tl.view(nmar_mask, (BLOCK_N * n_nodes_per_block_m,))
-        n_logps = tl.view(n_logps, (BLOCK_N * n_nodes_per_block_m,))
-        tl.store(node_mars_ptr + nmar_offsets, n_logps, mask = nmar_mask)
 
     @staticmethod
     @torch.compile(mode = "reduce-overhead", fullgraph = True)
-    def _forward_pytorch_kernel(node_mars: torch.Tensor, element_mars: torch.Tensor, 
-                                params: torch.Tensor, nids: torch.Tensor, cids: torch.Tensor, pids: torch.Tensor):
+    def _forward_pytorch_kernel(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor, 
+                                nids: torch.Tensor, cids: torch.Tensor, pids: torch.Tensor,
+                                local_ids: torch.Tensor):
+
+        if local_ids is not None:
+            nids = nids[local_ids]
+            cids = cids[local_ids]
+            pids = pids[local_ids]
+
+        num_ngroups = nids.size(0)
+        num_edges = cids.size(1)
+        nids = (nids[:,None].repeat(1, self.group_size) + \
+            torch.arange(0, self.group_size, device = nids.device)[None,:]).reshape(num_ngroups * self.group_size)
+        cids = cids[:,None,:].repeat(1, self.group_size, 1).reshape(num_ngroups * self.group_size, num_edges)
+        pids = (pids[:,None,:].repeat(1, self.group_size, 1) + \
+            torch.arange(0, self.group_size, device = cids.device)[None,:,None]).reshape(num_ngroups * self.group_size, num_edges)
 
         ch_mars = element_mars[cids]
         maxval = ch_mars.max(dim = 1, keepdim = True).values
@@ -396,6 +358,11 @@ class SumLayer(Layer, nn.Module):
             self._forward_sparse(
                 node_mars, element_mars, params, nids, cids, pids, local_ids,
                 partition_id = partition_id
+            )
+
+        elif mode == "pytorch":
+            self._forward_pytorch_kernel(
+                node_mars, element_mars, params, nids, cids, pids, local_ids
             )
         
         else:
@@ -524,14 +491,14 @@ class SumLayer(Layer, nn.Module):
         if signature not in self._cached_fw_pcids:
             # Pre-compute pointer increments for `cids` and `pids`
 
-            cids = cids.clone().reshape(num_ngroups, K_NUM_TILES, TILE_SIZE_K)
+            cids = cids.clone().reshape(cids.size(0), K_NUM_TILES, TILE_SIZE_K)
             cids_start = cids[:,0,:].contiguous()
             cids_increment = torch.cat(
                 (cids[:,1:,:] - cids[:,:-1,:], cids[:,0:1,:] * 0), 
                 dim = 1
             ).contiguous()
 
-            pids = pids.clone().reshape(num_ngroups, K_NUM_TILES, TILE_SIZE_K)
+            pids = pids.clone().reshape(pids.size(0), K_NUM_TILES, TILE_SIZE_K)
             pids_start = pids[:,0,:].contiguous()
             pids_increment = torch.cat(
                 (pids[:,1:,:] - pids[:,:-1,:], pids[:,0:1,:] * 0),
@@ -669,188 +636,301 @@ class SumLayer(Layer, nn.Module):
 
         return None
 
-    @staticmethod
-    @triton.jit
-    def _backward_kernel(node_flows_ptr, element_flows_ptr, params_ptr, 
-                         node_mars_ptr, element_mars_ptr, param_flows_ptr,
-                         chids_ptr, parids_ptr, parpids_ptr, tot_n_nodes, 
-                         tot_n_eles, n_nodes, n_edges: tl.constexpr, batch_size,
-                         n_nodes_per_block_m: tl.constexpr,
-                         accumulate_param_flows: tl.constexpr,
-                         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
-        # We use BLOCK_M to index over edges, and BLOCK_N to index over batches
-        pid0 = tl.program_id(axis = 0)
-        pid1 = tl.program_id(axis = 1)
-        ne_start = pid0 * BLOCK_M
-        b_start = pid1 * BLOCK_N
-
-        # Id of edges processed by the current block
-        ne_offsets = ne_start + tl.arange(0, BLOCK_M)
-        # Batch ids processed by the current block
-        b_offsets = b_start + tl.arange(0, BLOCK_N)
-        b_mask = b_offsets < batch_size
-
-        # Node mask for future reuse
-        n_start = ne_start // n_edges
-        n_offsets = n_start + tl.arange(0, n_nodes_per_block_m)
-        n_mask = n_offsets < n_nodes
-
-        # Reusable ids for index tensors
-        par_offsets = tl.view(ne_offsets, (n_edges, n_nodes_per_block_m))
-        par_mask = tl.broadcast_to(n_mask[None,:], (n_edges, n_nodes_per_block_m)) 
-        bpar_mask = tl.broadcast_to(n_mask[None,None,:], (BLOCK_N, n_edges, n_nodes_per_block_m)) & \
-            tl.broadcast_to(b_mask[:,None,None], (BLOCK_N, n_edges, n_nodes_per_block_m))
-
-        # Get node ids from `parids` and retrieve the corresponding node flows and node mars
-        node_ids = tl.load(parids_ptr + par_offsets, mask = par_mask, other = 0)
-        node_offsets = tl.broadcast_to(node_ids[None,:,:], (BLOCK_N, n_edges, n_nodes_per_block_m)) * batch_size + \
-            tl.broadcast_to(b_offsets[:,None,None], (BLOCK_N, n_edges, n_nodes_per_block_m))
-        nflows = tl.load(node_flows_ptr + node_offsets, mask = bpar_mask, other = 0) # node_flows[parids]
-        nmars = tl.load(node_mars_ptr + node_offsets, mask = bpar_mask, other = 0) # node_mars[parids]
-
-        # Get param ids from `parpids` and retrieve the corresponding node params
-        eparam_ids = tl.load(parpids_ptr + par_offsets, mask = par_mask, other = 0)
-        eparams = tl.load(params_ptr + eparam_ids, mask = par_mask, other = 0)
-        eparams = tl.broadcast_to(eparams[None,:,:], (BLOCK_N, n_edges, n_nodes_per_block_m)) # params[parpids]
-
-        # Compute edge flows (partially)
-        cum_flow = nflows * eparams
-
-        # Get element ids from `cids` and retrieve the corresponding element mars
-        ele_ids = tl.load(chids_ptr + n_offsets, mask = n_mask, other = 0)
-        ele_offsets = tl.broadcast_to(ele_ids[None,:], (BLOCK_N, n_nodes_per_block_m)) * batch_size + \
-            tl.broadcast_to(b_offsets[:,None], (BLOCK_N, n_nodes_per_block_m))
-        ele_mask = tl.broadcast_to(n_mask[None,:], (BLOCK_N, n_nodes_per_block_m)) & \
-            tl.broadcast_to(b_mask[:,None], (BLOCK_N, n_nodes_per_block_m))
-        emars = tl.load(element_mars_ptr + ele_offsets, mask = ele_mask, other = 0) # element_mars[chids]
-        emars = tl.broadcast_to(emars[:,None,:], (BLOCK_N, n_edges, n_nodes_per_block_m)) # element_mars[chids].unsqueeze(1)
-
-        # Compute edge flows
-        emars_log_diff = emars - nmars
-        emars_diff = tl.exp(emars_log_diff)
-        eflows = cum_flow * emars_diff
-
-        # Store to `element_flows[chids]`
-        cum_eflows = tl.sum(eflows, axis = 1) # [BLOCK_N, n_nodes_per_block_m]
-        tl.store(element_flows_ptr + ele_offsets, cum_eflows, mask = ele_mask)
-
-        # Compute parameter flows
-        if accumulate_param_flows:
-            parflows = tl.sum(eflows, axis = 0) # [n_edges, n_nodes_per_block_m]
-            # Here the `eparam_ids > 0` term masks out dummy edges
-            parflow_mask = (eparam_ids > 0) & tl.broadcast_to(n_mask[None,:], (n_edges, n_nodes_per_block_m))
-            tl.atomic_add(param_flows_ptr + eparam_ids, parflows, mask = parflow_mask)
-
-    @staticmethod
-    @torch.compile(mode = "reduce-overhead", fullgraph = True)
-    def _backward_pytorch_kernel(node_flows: torch.Tensor, element_flows: torch.Tensor, 
-                                 params: torch.Tensor, node_mars: torch.Tensor, 
-                                 element_mars: torch.Tensor, param_flows: Optional[torch.Tensor], 
-                                 chids: torch.Tensor, parids: torch.Tensor, parpids: torch.Tensor):
+    def _backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
+                  params: torch.Tensor, node_mars: torch.Tensor, 
+                  element_mars: torch.Tensor, param_flows: torch.Tensor,
+                  chids: torch.Tensor, parids: torch.Tensor, parpids: torch.Tensor, 
+                  cs_group_size: int, local_ids: Optional[torch.Tensor] = None, 
+                  partition_id: int = -1, mode: Optional[str] = None) -> None:
+        """
+        Back pass of sum layers.
         
-        element_flows[chids] = (node_flows[parids] * params[parpids].unsqueeze(-1) * \
-            (element_mars[chids].unsqueeze(1) - node_mars[parids]).exp()).sum(dim = 1)
+        Parameters:
+        `node_flows`:   [N, B]
+        `element_flows: [M, B]
+        `params`:       [E]
+        `node_mars`:    [N, B]
+        `element_mars`: [M, B]
+        `param_flows`:  [E]
+        `chids`:        [ng]
+        `parids`:       [ng, c]
+        `parpids`:      [ng, c]
+        """
+
+        num_edges = parids.size(1) * self.group_size
+        batch_size = node_flows.size(1)
+
+        if mode is not None:
+            assert mode in ["block_sparse", "sparse"]
+
+        elif params.dim() == 1 and self.group_size >= 16 and num_edges >= 16 and batch_size >= 16:
+            # In this case, we should definitely use the block-sparse implementation
+            mode = "block_sparse"
+
+        if mode == "block_sparse":
+            self._backward_block_sparse(
+                node_flows, element_flows, params, node_mars, element_mars, param_flows, 
+                nids, cids, pids, chids, parids, parpids, cs_group_size, local_ids, 
+                partition_id = partition_id
+            )
+
+        elif mode == "pytorch":
+            self._backward_pytorch(
+                node_flows, element_flows, params, node_mars, 
+                element_mars, param_flows, chids, parids, parpids,
+                cs_group_size
+            )
+
+    def _backward_block_sparse(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
+                               params: torch.Tensor, node_mars: torch.Tensor, 
+                               element_mars: torch.Tensor, param_flows: torch.Tensor, 
+                               nids: Optional[torch.Tensor], cids: Optional[torch.Tensor], pids: Optional[torch.Tensor],
+                               chids: Optional[torch.Tensor], parids: Optional[torch.Tensor], parpids: Optional[torch.Tensor], 
+                               cs_group_size: int, local_ids: Optional[torch.Tensor] = None,
+                               partition_id: int = -1) -> None:
+        """
+        Back pass of sum layers with block-sparse processing kernel.
+        
+        Parameters:
+        `node_flows`:   [N, B]
+        `element_flows: [M, B]
+        `params`:       [E]
+        `node_mars`:    [N, B]
+        `element_mars`: [M, B]
+        `param_flows`:  [E]
+        `chids`:        [ng]
+        `parids`:       [ng, c]
+        `parpids`:      [ng, c]
+        """
+
+        # Flows w.r.t. input elements (product nodes)
+        if chids is not None:
+            self._backward_block_sparse_ele_flows(
+                node_flows, element_flows, params, node_mars, element_mars,
+                chids, parids, parpids, cs_group_size, local_ids, partition_id
+            )
+
+        # Flows w.r.t. parameters
+        if param_flows is not None and nids is not None:
+            self._backward_block_sparse_par_flows(
+                node_flows, element_flows, params, node_mars, element_mars, 
+                nids, cids, pids, partition_id
+            )
 
         return None
 
-    def _backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
-                  params: torch.Tensor, node_mars: torch.Tensor, 
-                  element_mars: torch.Tensor, param_flows: torch.Tensor, 
-                  chids: torch.Tensor, parids: torch.Tensor, parpids: torch.Tensor, 
-                  local_ids: Optional[torch.Tensor] = None, 
-                  BLOCK_M_HARD_LIMIT = 2**16, BLOCK_SIZE = 2**12, MAX_BLOCK_M = 2**11, 
-                  MAX_BLOCK_N = 64) -> None:
-        """
-        This function is equivalent to running:
-        ``` 
-        element_flows[chids] = (node_flows[parids] * params[parpids] * \
-            (element_mars[chids].unsqueeze(1) - node_mars[parids]).exp()).sum(dim = 1)
+    @staticmethod
+    @triton.jit
+    def _bk_triton_block_sparse_ele_kernel(node_flows, element_flows, node_mars, element_mars, params, 
+                                           chids, parids_start, parids_increment, parpids_start, parpids_increment, 
+                                           local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr, ptr_inc_step: tl.constexpr, 
+                                           BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, TILE_SIZE_M: tl.constexpr, 
+                                           GROUP_SIZE_M: tl.constexpr, GROUP_SIZE_K: tl.constexpr):
 
-        param_flows[seq_parpids] += (node_flows[parids] * params[parpids] * \
-            (element_mars[chids].unsqueeze(1) - node_mars[parids]).exp()).sum(dim = 2)[seq_ids0, seq_ids1]
-        ```
-        
-        Parameters:
-        `node_flows`:    [N, B]
-        `element_flows`: [M, B]
-        `params`:        [E]
-        `node_mars`:     [N, B]
-        `element_mars`:  [M, B]
-        `param_flows`:   [E]
-        `chids`:         [n]
-        `parids`:        [n, p]
-        `parpids`:       [n, p]
-        """
+        pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
+        pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
 
-        if local_ids is not None and local_ids.size(0) == 0:
-            # Nothing need to be evaluated in the current group
-            return None
-        elif local_ids is not None:
-            # Select nodes
-            chids = chids[local_ids].contiguous()
-            parids = parids[local_ids,:].contiguous()
-            parpids = parpids[local_ids,:].contiguous()
+        # Get inferred node group id from `pid_m`
+        elegroup_id = pid_m // (GROUP_SIZE_M // TILE_SIZE_M)
+        tile_id = pid_m % (GROUP_SIZE_M // TILE_SIZE_M)
 
-        tot_n_nodes = node_mars.size(0)
-        tot_n_eles = element_mars.size(0)
-        n_nodes = chids.size(0)
-        n_edges = parids.size(1)
-        batch_size = node_mars.size(1)
+        # Get the real node group id in the case of partial evaluation
+        if partial_eval == 1:
+            elegroup_id = tl.load(local_ids + elegroup_id)
 
-        if params.dim() == 2 and params.size(1) == 1:
-            params = params.squeeze(1)
+        # Initialize pointers to `params`
+        offs_ele = tl.arange(0, TILE_SIZE_M) + tile_id * TILE_SIZE_M
+        offs_edge = tl.arange(0, TILE_SIZE_K)
+        offs_edge_gid = offs_edge // GROUP_SIZE_K
+        offs_edge_nid = (offs_edge % GROUP_SIZE_K)
+        par_start = tl.load(parpids_start + elegroup_id * ptr_inc_step + offs_edge_gid)
+        epars_ptr = params + \
+            offs_ele[:,None] + \
+            (par_start + offs_edge_nid * GROUP_SIZE_K)[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
 
-        # If child nodes in the current group have no parent, we set the corresponding element flows to 0
-        if n_edges == 0:
-            element_flows[chids] = 0.0
+        # Batch offsets and mask
+        offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B
+        mask_batch = offs_batch < batch_size
 
-            return None
+        # Initialize pointers to `node_mars`
+        edge_start = tl.load(parids_start + elegroup_id * ptr_inc_step + offs_edge_gid)
+        nmars_ptr = node_mars + \
+            (edge_start + offs_edge_nid)[:,None] * batch_size + \
+            offs_batch[None,:] # [TILE_SIZE_K, BLOCK_B]
+        nflows_ptr = node_flows + \
+            (edge_start + offs_edge_nid)[:,None] * batch_size + \
+            offs_batch[None,:] # [TILE_SIZE_K, BLOCK_B]
 
-        # Fall back to the `torch.compile` kernel in the case where we cannot store child edges within a single block
-        if n_edges > BLOCK_M_HARD_LIMIT or not node_mars.is_cuda:
-            assert param_flows is None
-            self._backward_pytorch_kernel(
-                node_flows, element_flows, params, node_mars, 
-                element_mars, param_flows, chids, parids, parpids
-            )
+        # Initialize pointers to `element_mars`
+        off_eleids = tl.load(chids + elegroup_id)
+        offs_elemfs = (off_eleids + offs_ele[:,None]) * batch_size + offs_batch[None,:]
+        tmp_emars = tl.load(element_mars + offs_elemfs, mask = mask_batch[None,:]) # [TILE_SIZE_K, BLOCK_B]
+        emars_max = tl.max(tmp_emars, axis = 0) # [BLOCK_B]
 
-            return None
+        # Batch increment pointers
+        parids_inc_ptr = parids_increment + elegroup_id * (K_NUM_TILES * ptr_inc_step) + offs_edge_gid
+        parpids_inc_ptr = parpids_increment + elegroup_id * (K_NUM_TILES * ptr_inc_step) + offs_edge_gid
 
-        assert n_edges <= BLOCK_M_HARD_LIMIT, f"Number of edges should be smaller than or equal to {BLOCK_M_HARD_LIMIT}."
+        # Inner loop
+        acc = tl.zeros([TILE_SIZE_M, BLOCK_B], dtype = tl.float32)
+
+        for k in range(0, K_NUM_TILES):
+            epars = tl.load(epars_ptr) # [TILE_SIZE_M, TILE_SIZE_K]
+            nmars = tl.load(nmars_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_K, BLOCK_B]
+            nflows = tl.load(nflows_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_K, BLOCK_B]
+
+            # Set a hard upper bound of 1e20 to avoid overflow
+            # However, this should not happen unless we have extremely small parameters
+            nflows_div_mars = nflows * tl.minimum(tl.exp(emars_max[None,:] - nmars), 1.0e20) 
+            
+            epars = epars.to(tl.bfloat16)
+            nflows_div_mars = nflows_div_mars.to(tl.bfloat16)
+            eflows = tl.dot(epars, nflows_div_mars).to(tl.float32)
+
+            acc += eflows
+
+            # Increment `epars_ptr`
+            parpids_inc = tl.load(parpids_inc_ptr)
+            epars_ptr += parpids_inc[None,:]
+            parpids_inc_ptr += ptr_inc_step
+
+            # Increment `nmars_ptr`
+            parids_inc = tl.load(parids_inc_ptr)
+            nmars_ptr += parids_inc[:,None] * batch_size
+            nflows_ptr += parids_inc[:,None] * batch_size
+            parids_inc += ptr_inc_step
+
+        # Initialize pointers to `element_mars`
+        off_eleids = tl.load(chids + elegroup_id)
+        offs_elemfs = (off_eleids + offs_ele[:,None]) * batch_size + offs_batch[None,:]
+        emars = tl.load(element_mars + offs_elemfs, mask = mask_batch[None,:]) # [TILE_SIZE_K, BLOCK_B]
+
+        eflows = acc * tl.exp(emars - emars_max[None,:])
+        tl.store(element_flows + offs_elemfs, eflows, mask = mask_batch[None,:])
+
+    def _backward_block_sparse_ele_flows(self, node_flows: torch.Tensor, element_flows: torch.Tensor,
+                                         params: torch.Tensor, node_mars: torch.Tensor,
+                                         element_mars: torch.Tensor, chids: torch.Tensor, parids: torch.Tensor,
+                                         parpids: torch.Tensor, cs_group_size: int, local_ids: Optional[torch.Tensor] = None,
+                                         partition_id: int = -1) -> None:
+
         assert params.dim() == 1, "Expecting a 1D `params`."
 
-        if n_edges <= MAX_BLOCK_M:
-            # In this case, we can find a better thread-block balance
-            MIN_BLOCK_M = min(triton.next_power_of_2(n_edges), MAX_BLOCK_M)
-            BLOCK_N = min(BLOCK_SIZE // MIN_BLOCK_M, MAX_BLOCK_N, triton.next_power_of_2(batch_size))
-            BLOCK_M = min(BLOCK_SIZE // BLOCK_N, MAX_BLOCK_M)
+        num_ngroups = chids.size(0) if local_ids is None else local_ids.size(0)
+        layer_n_nodes = num_ngroups * cs_group_size
+        num_edges = parids.size(1) * self.group_size
+        batch_size = node_flows.size(1)
+        BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
+
+        # Heuristic to set `TILE_SIZE_M`, `TILE_SIZE_K`, and `BLOCK_B`
+        base_size = min(self.group_size, num_edges, BATCH_SIZE_NP2, 128)
+        if base_size >= 64:
+            TILE_SIZE_K = base_size
+            TILE_SIZE_M = 2048 // base_size
+            BLOCK_B = 2048 // base_size
         else:
-            # Try to fit all edges of a node in a single thread-block
-            BLOCK_M = triton.next_power_of_2(n_edges)
-            BLOCK_N = max(BLOCK_SIZE // BLOCK_M, 1)
+            remainder = 2048 // (base_size ** 2)
 
-        grid = (triton.cdiv(n_nodes * n_edges, BLOCK_M), triton.cdiv(batch_size, BLOCK_N), 1)
+            TILE_SIZE_K = min(2048 // remainder, base_size * remainder, num_edges)
+            TILE_SIZE_M = min(2048 // TILE_SIZE_K, cs_group_size)
+            BLOCK_B = min(2048 // TILE_SIZE_K, BATCH_SIZE_NP2)
+        K_NUM_TILES = num_edges // TILE_SIZE_K
 
-        self._backward_kernel[grid](
-            node_flows_ptr = node_flows,
-            element_flows_ptr = element_flows,
-            params_ptr = params,
-            node_mars_ptr = node_mars, 
-            element_mars_ptr = element_mars,
-            param_flows_ptr = param_flows, 
-            chids_ptr = chids, 
-            parids_ptr = parids, 
-            parpids_ptr = parpids,
-            tot_n_nodes = tot_n_nodes,
-            tot_n_eles = tot_n_eles,
-            n_nodes = n_nodes,
-            n_edges = n_edges,
-            batch_size = batch_size,
-            n_nodes_per_block_m = BLOCK_M // n_edges,
-            accumulate_param_flows = (param_flows is not None),
-            BLOCK_M = BLOCK_M, 
-            BLOCK_N = BLOCK_N
+        signature = ("block_sparse", partition_id, TILE_SIZE_K)
+        if signature not in self._cached_bk_parids:
+            # Pre-compute pointer increments for `parids` and `parpids`
+
+            if TILE_SIZE_K <= self.group_size:
+                ptr_inc_step = 1
+
+                num_rep = self.group_size // TILE_SIZE_K
+                parids = (parids[:,:,None].repeat(1, 1, num_rep) + \
+                    torch.arange(0, self.group_size, TILE_SIZE_K, device = parids.device)[None,None,:]).reshape(
+                        parids.size(0), K_NUM_TILES, 1)
+                parpids = (parpids[:,:,None].repeat(1, 1, num_rep) + \
+                    torch.arange(0, self.group_size * cs_group_size, TILE_SIZE_K * cs_group_size, device = parpids.device)[None,None,:]).reshape(
+                        parpids.size(0), K_NUM_TILES, 1)
+
+            else:
+                ptr_inc_step = TILE_SIZE_K // self.group_size
+
+                parids = parids.reshape(parids.size(0), K_NUM_TILES, ptr_inc_step)
+                parpids = parpids.reshape(parpids.size(0), K_NUM_TILES, ptr_inc_step)
+
+            parids_start = parids[:,0,:].contiguous()
+            parids_increment = torch.cat(
+                (parids[:,1:,:] - parids[:,:-1,:], parids[:,0:1,:] * 0),
+                dim = 1
+            ).contiguous()
+
+            parpids_start = parpids[:,0,:].contiguous()
+            parpids_increment = torch.cat(
+                (parpids[:,1:,:] - parpids[:,:-1], parpids[:,0:1,:] * 0),
+                dim = 1
+            ).contiguous()
+
+            self._cached_bk_parids[signature] = [parids_start, parids_increment, parpids_start, parpids_increment, ptr_inc_step]
+        else:
+            parids_start, parids_increment, parpids_start, parpids_increment, ptr_inc_step = self._cached_bk_parids[signature]
+
+        grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
+
+        self._bk_triton_block_sparse_ele_kernel[grid](
+            node_flows = node_flows, 
+            element_flows = element_flows, 
+            node_mars = node_mars, 
+            element_mars = element_mars, 
+            params = params, 
+            chids = chids, 
+            parids_start = parids_start,
+            parids_increment = parids_increment,
+            parpids_start = parpids_start,
+            parpids_increment = parpids_increment, 
+            local_ids = local_ids, 
+            batch_size = batch_size, 
+            partial_eval = 1 if local_ids is not None else 0,
+            ptr_inc_step = ptr_inc_step,
+            BLOCK_B = BLOCK_B, 
+            TILE_SIZE_K = TILE_SIZE_K, 
+            K_NUM_TILES = K_NUM_TILES,
+            TILE_SIZE_M = TILE_SIZE_M, 
+            GROUP_SIZE_M = cs_group_size,
+            GROUP_SIZE_K = self.group_size
         )
+
+        return None
+
+    def _backward_block_sparse_par_flows(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
+                                         params: torch.Tensor, node_mars: torch.Tensor, element_mars: torch.Tensor, 
+                                         nids: torch.Tensor, cids: torch.Tensor, pids: torch.Tensor, 
+                                         partition_id: int = -1) -> None:
+
+        pass
+
+    # @torch.compile(mode = "reduce-overhead", fullgraph = True)
+    def _backward_pytorch(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
+                          params: torch.Tensor, node_mars: torch.Tensor, 
+                          element_mars: torch.Tensor, param_flows: Optional[torch.Tensor], 
+                          chids: torch.Tensor, parids: torch.Tensor, parpids: torch.Tensor,
+                          cs_group_size: int):
+
+        if param_flows is not None:
+            raise ValueError("PyTorch kernel does not support computing parameter flows.")
+
+        num_ngroups = chids.size(0)
+        num_egroups = parids.size(1)
+        parids = (parids[:,:,None].repeat(1, 1, self.group_size) + torch.arange(0, self.group_size, device = parids.device)).reshape(num_ngroups, num_egroups * self.group_size)
+        parpids = (parpids[:,:,None] + torch.arange(0, self.group_size * cs_group_size, cs_group_size, device = parids.device)).reshape(
+            num_ngroups, num_egroups * self.group_size)
+
+        chids = (chids[:,None].repeat(1, cs_group_size) + torch.arange(0, cs_group_size, device = chids.device)).reshape(num_ngroups * cs_group_size)
+        parids = parids[:,None,:].repeat(1, cs_group_size, 1).reshape(num_ngroups * cs_group_size, num_egroups * self.group_size)
+        parpids = (parpids[:,None,:].repeat(1, cs_group_size, 1) + torch.arange(0, cs_group_size, device = parpids.device)[None,:,None]).reshape(
+            num_ngroups * cs_group_size, num_egroups * self.group_size
+        )
+        
+        element_flows[chids] = (node_flows[parids] * params[parpids].unsqueeze(-1) * \
+            (element_mars[chids].unsqueeze(1) - node_mars[parids]).exp()).sum(dim = 1)
 
         return None
 
