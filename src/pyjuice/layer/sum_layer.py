@@ -257,8 +257,9 @@ class SumLayer(Layer, nn.Module):
 
                 self._backward(
                     node_flows, element_flows, params, node_mars, 
-                    element_mars, param_flows, chids, parids, parpids,
-                    cs_group_size
+                    element_mars, param_flows, 
+                    chids = chids, parids = parids, parpids = parpids,
+                    cs_group_size = cs_group_size
                 )
 
         else:
@@ -272,8 +273,9 @@ class SumLayer(Layer, nn.Module):
 
                 self._backward(
                     node_flows, element_flows, params, node_mars,
-                    element_mars, param_flows, chids, parids, parpids,
-                    cs_group_size, local_ids = local_ids
+                    element_mars, param_flows, 
+                    chids = chids, parids = parids, parpids = parpids,
+                    cs_group_size = cs_group_size, local_ids = local_ids
                 )
 
         ## Compute flows w.r.t. sum parameters ##
@@ -285,8 +287,8 @@ class SumLayer(Layer, nn.Module):
 
                 self._backward(
                     node_flows, element_flows, params, node_mars, 
-                    element_mars, param_flows, nids, cids, pids, 
-                    partition_id = partition_id
+                    element_mars, param_flows, nids = nids, 
+                    cids = cids, pids = pids, partition_id = partition_id
                 )
 
         return None
@@ -639,8 +641,10 @@ class SumLayer(Layer, nn.Module):
     def _backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
                   params: torch.Tensor, node_mars: torch.Tensor, 
                   element_mars: torch.Tensor, param_flows: torch.Tensor,
-                  chids: torch.Tensor, parids: torch.Tensor, parpids: torch.Tensor, 
-                  cs_group_size: int, local_ids: Optional[torch.Tensor] = None, 
+                  nids: Optional[torch.Tensor] = None, cids: Optional[torch.Tensor] = None, 
+                  pids: Optional[torch.Tensor] = None, chids: Optional[torch.Tensor] = None, 
+                  parids: Optional[torch.Tensor] = None, parpids: Optional[torch.Tensor] = None, 
+                  cs_group_size: int = 0, local_ids: Optional[torch.Tensor] = None, 
                   partition_id: int = -1, mode: Optional[str] = None) -> None:
         """
         Back pass of sum layers.
@@ -657,7 +661,10 @@ class SumLayer(Layer, nn.Module):
         `parpids`:      [ng, c]
         """
 
-        num_edges = parids.size(1) * self.group_size
+        if cids is not None:
+            num_edges = cids.size(1) * self.group_size
+        else:
+            num_edges = parids.size(1) * self.group_size
         batch_size = node_flows.size(1)
 
         if mode is not None:
@@ -707,14 +714,16 @@ class SumLayer(Layer, nn.Module):
         if chids is not None:
             self._backward_block_sparse_ele_flows(
                 node_flows, element_flows, params, node_mars, element_mars,
-                chids, parids, parpids, cs_group_size, local_ids, partition_id
+                chids = chids, parids = parids, parpids = parpids, 
+                cs_group_size = cs_group_size, local_ids = local_ids, 
+                partition_id = partition_id
             )
 
         # Flows w.r.t. parameters
         if param_flows is not None and nids is not None:
             self._backward_block_sparse_par_flows(
-                node_flows, element_flows, params, node_mars, element_mars, 
-                nids, cids, pids, partition_id
+                node_flows, params, node_mars, element_mars, param_flows,
+                nids = nids, cids = cids, pids = pids
             )
 
         return None
@@ -900,14 +909,134 @@ class SumLayer(Layer, nn.Module):
 
         return None
 
-    def _backward_block_sparse_par_flows(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
-                                         params: torch.Tensor, node_mars: torch.Tensor, element_mars: torch.Tensor, 
-                                         nids: torch.Tensor, cids: torch.Tensor, pids: torch.Tensor, 
-                                         partition_id: int = -1) -> None:
+    @staticmethod
+    @triton.jit
+    def _bk_triton_block_sparse_par_kernel(node_flows, node_mars, element_mars, params, param_flows, nids, cids, pids,
+                                           batch_size: tl.constexpr, num_edges: tl.constexpr, TILE_SIZE_B: tl.constexpr, 
+                                           B_NUM_TILES: tl.constexpr, TILE_SIZE_K: tl.constexpr, 
+                                           TILE_SIZE_M: tl.constexpr, GROUP_SIZE_M: tl.constexpr):
 
-        pass
+        pid_k = tl.program_id(0) # ID of size-`TILE_SIZE_K` edges
+        pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
 
-    # @torch.compile(mode = "reduce-overhead", fullgraph = True)
+        # Get inferred node group id from `pid_m`
+        ngroup_id = pid_m // (GROUP_SIZE_M // TILE_SIZE_M)
+        tile_id = pid_m % (GROUP_SIZE_M // TILE_SIZE_M)
+
+        # Batch offsets and mask
+        offs_batch = tl.arange(0, TILE_SIZE_B)
+        mask_batch = offs_batch < batch_size
+
+        # Initialize pointers to `element_mars`
+        offs_edge = tl.arange(0, TILE_SIZE_K) + pid_k * TILE_SIZE_K
+        edge_start = tl.load(cids + ngroup_id * num_edges + offs_edge)
+        emars_ptr = element_mars + \
+            edge_start[:,None] * batch_size + \
+            offs_batch[None,:] # [TILE_SIZE_K, TILE_SIZE_B]
+
+        # Initialize pointers to `node_flows` and `node_mars`
+        offs_node = tl.arange(0, TILE_SIZE_M) + tile_id * TILE_SIZE_M
+        off_nids = tl.load(nids + ngroup_id)
+        nmars_ptr = node_mars + (off_nids + offs_node[:,None]) * batch_size + offs_batch[None,:]
+        nflows_ptr = node_flows + (off_nids + offs_node[:,None]) * batch_size + offs_batch[None,:]
+
+        # Inner loop
+        acc = tl.zeros([TILE_SIZE_M, TILE_SIZE_K], dtype = tl.float32)
+
+        for b in range(0, B_NUM_TILES):
+            emars = tl.load(emars_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_K, TILE_SIZE_B]
+            nmars = tl.load(nmars_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_M, TILE_SIZE_B]
+            nflows = tl.load(nflows_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_M, TILE_SIZE_B]
+
+            emars_max = tl.max(emars, axis = 0)
+            nflows_div_mars = nflows * tl.exp(emars_max[None,:] - nmars)
+            nflows_div_mars = nflows_div_mars.to(tl.bfloat16)
+
+            emars = tl.exp(emars - emars_max[None,:])
+            emars = emars.to(tl.bfloat16)
+
+            pflows = tl.dot(nflows_div_mars, tl.trans(emars)).to(tl.float32)
+
+            acc += pflows
+
+            # Increment `emars_ptr`, `nmars_ptr`, and `nmars_ptr`
+            emars_ptr += TILE_SIZE_B
+            nmars_ptr += TILE_SIZE_B
+            nflows_ptr += TILE_SIZE_B
+
+            # Update batch mask
+            offs_batch += TILE_SIZE_B
+            mask_batch = offs_batch < batch_size
+
+        par_start = tl.load(pids + ngroup_id * num_edges + offs_edge)
+        epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
+        
+        epars = tl.load(params + epars_offsets)
+        pflows = acc * epars
+
+        tl.store(param_flows + epars_offsets, pflows)
+
+    def _backward_block_sparse_par_flows(self, node_flows: torch.Tensor, params: torch.Tensor, node_mars: torch.Tensor, 
+                                         element_mars: torch.Tensor, param_flows: torch.Tensor, nids: torch.Tensor, 
+                                         cids: torch.Tensor, pids: torch.Tensor, ) -> None:
+        """
+        Backward pass of sum layers w.r.t. sum parameters with the block-sparse processing kernel.
+        
+        Parameters:
+        `node_flows`:    [N, B]
+        `element_flows`: [M, B]
+        `params`:        [E]
+        `node_mars`:     [N, B]
+        `element_mars`:  [M, B]
+        `param_flows`:   [E]
+        `nids`:          [ng]
+        `cids`:          [ng, c]
+        `pids`:          [ng, c]
+        """
+
+        assert params.dim() == 1, "Expecting a 1D `params`."
+
+        num_ngroups = nids.size(0)
+        layer_n_nodes = num_ngroups * self.group_size
+        num_edges = cids.size(1)
+        batch_size = node_mars.size(1)
+        BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
+
+        # Heuristic to set `TILE_SIZE_M`, `TILE_SIZE_K`, and `BLOCK_B`
+        base_size = min(self.group_size, num_edges, BATCH_SIZE_NP2, 128)
+        if base_size >= 64:
+            TILE_SIZE_B = base_size
+            TILE_SIZE_M = 2048 // base_size
+            TILE_SIZE_K = 2048 // base_size
+        else:
+            remainder = 2048 // (base_size ** 2)
+
+            TILE_SIZE_B = min(2048 // remainder, base_size * remainder, BATCH_SIZE_NP2)
+            TILE_SIZE_M = min(2048 // TILE_SIZE_B, self.group_size)
+            TILE_SIZE_K = min(2048 // TILE_SIZE_B, num_edges)
+        B_NUM_TILES = batch_size // TILE_SIZE_B
+
+        grid = (triton.cdiv(num_edges, TILE_SIZE_K), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
+
+        self._bk_triton_block_sparse_par_kernel[grid](
+            node_flows = node_flows, 
+            node_mars = node_mars, 
+            element_mars = element_mars, 
+            params = params, 
+            param_flows = param_flows, 
+            nids = nids, 
+            cids = cids, 
+            pids = pids,
+            batch_size = batch_size, 
+            num_edges = num_edges, 
+            TILE_SIZE_B = TILE_SIZE_B, 
+            B_NUM_TILES = B_NUM_TILES, 
+            TILE_SIZE_K = TILE_SIZE_K, 
+            TILE_SIZE_M = TILE_SIZE_M, 
+            GROUP_SIZE_M = self.group_size
+        )
+
+    @torch.compile(mode = "reduce-overhead", fullgraph = True)
     def _backward_pytorch(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
                           params: torch.Tensor, node_mars: torch.Tensor, 
                           element_mars: torch.Tensor, param_flows: Optional[torch.Tensor], 

@@ -17,157 +17,6 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
-def _bk_triton_block_sparse_kernel(node_flows, element_flows, node_mars, element_mars, params, nids, cids_start, cids_increment,
-                                    pids_start, pids_increment, local_ids, batch_size, partial_eval: tl.constexpr,
-                                    BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
-                                    TILE_SIZE_M: tl.constexpr, GROUP_SIZE_M: tl.constexpr):
-
-    pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
-    pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
-
-    # Get inferred node group id from `pid_m`
-    ngroup_id = pid_m // (GROUP_SIZE_M // TILE_SIZE_M)
-    tile_id = pid_m % (GROUP_SIZE_M // TILE_SIZE_M)
-
-    # Get the real node group id in the case of partial evaluation
-    if partial_eval == 1:
-        ngroup_id = tl.load(local_ids + ngroup_id)
-
-    # Initialize pointers to `params`
-    offs_node = tl.arange(0, TILE_SIZE_M) + tile_id * TILE_SIZE_M
-    offs_edge = tl.arange(0, TILE_SIZE_K)
-    par_start = tl.load(pids_start + ngroup_id * TILE_SIZE_K + offs_edge)
-    epars_ptr = params + \
-        offs_node[:,None] + \
-        par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
-
-    # Batch offsets and mask
-    offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B
-    mask_batch = offs_batch < batch_size
-
-    # Initialize pointers to `element_mars`
-    edge_start = tl.load(cids_start + ngroup_id * TILE_SIZE_K + offs_edge)
-    emars_ptr = element_mars + \
-        edge_start[:,None] * batch_size + \
-        offs_batch[None,:] # [TILE_SIZE_K, BLOCK_B]
-
-    eflows_ptr = element_mars + \
-        edge_start[:,None] * batch_size + \
-        offs_batch[None,:] # [TILE_SIZE_K, BLOCK_B]
-
-    # Initialize pointers to `node_flows`
-    off_nids = tl.load(nids + ngroup_id)
-    offs_nmfs = (off_nids + offs_node[:,None]) * batch_size + offs_batch[None,:]
-    nmars = tl.load(node_mars + offs_nmfs, mask = mask_batch[None,:]) # [TILE_SIZE_M, BLOCK_B]
-    nflows = tl.load(node_flows + offs_nmfs, mask = mask_batch[None,:])
-
-    nmars_max = tl.max(nmars, axis = 0)
-    nflows_div_mars = nflows / tl.exp(nmars - nmars_max[None,:])
-    nflows_div_mars = nflows_div_mars.to(tl.float16)
-
-    # Batch increment pointers
-    pids_inc_ptr = pids_increment + ngroup_id * (K_NUM_TILES * TILE_SIZE_K) + offs_edge
-    cids_inc_ptr = cids_increment + ngroup_id * (K_NUM_TILES * TILE_SIZE_K) + offs_edge
-
-    # Inner loop
-    acc = tl.zeros([TILE_SIZE_M, TILE_SIZE_K], dtype = tl.float32)
-
-    for k in range(0, K_NUM_TILES):
-        epars = tl.load(epars_ptr) # [TILE_SIZE_M, TILE_SIZE_K]
-        emars = tl.load(emars_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_K, BLOCK_B]
-
-        epars = epars.to(tl.float16)
-        aaa = tl.dot(tl.trans(epars), nflows_div_mars).to(tl.float32)
-        bbb = aaa * (emars - nmars_max[None,:])
-
-        tl.atomic_add(eflows_ptr, bbb, mask = mask_batch[None,:])
-        # acc += bbb
-
-        # Increment `epars_ptr`
-        pids_inc = tl.load(pids_inc_ptr)
-        epars_ptr += pids_inc[None,:]
-        pids_inc_ptr += TILE_SIZE_K
-
-        # Increment `emars_ptr`
-        cids_inc = tl.load(cids_inc_ptr)
-        emars_ptr += cids_inc[:,None] * batch_size
-        eflows_ptr += cids_inc[:,None] * batch_size
-        cids_inc_ptr += TILE_SIZE_K
-
-
-@triton.jit
-def _bkp_triton_block_sparse_kernel(node_flows, node_mars, element_mars, params, param_flows, nids, cids, pids,
-                                    local_ids, batch_size: tl.constexpr, n_edges: tl.constexpr, partial_eval: tl.constexpr,
-                                    TILE_SIZE_B: tl.constexpr, B_NUM_TILES: tl.constexpr, TILE_SIZE_K: tl.constexpr, TILE_SIZE_M: tl.constexpr, 
-                                    GROUP_SIZE_M: tl.constexpr):
-
-    pid_k = tl.program_id(0) # ID of size-`TILE_SIZE_K` edges
-    pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
-
-    # Get inferred node group id from `pid_m`
-    ngroup_id = pid_m // (GROUP_SIZE_M // TILE_SIZE_M)
-    tile_id = pid_m % (GROUP_SIZE_M // TILE_SIZE_M)
-
-    # Get the real node group id in the case of partial evaluation
-    if partial_eval == 1:
-        ngroup_id = tl.load(local_ids + ngroup_id)
-
-    # Batch offsets and mask
-    offs_batch = tl.arange(0, TILE_SIZE_B)
-    mask_batch = offs_batch < batch_size
-
-    # Initialize pointers to `element_mars`
-    offs_edge = tl.arange(0, TILE_SIZE_K) + pid_k * TILE_SIZE_K
-    edge_start = tl.load(cids + ngroup_id * n_edges + offs_edge)
-    emars_ptr = element_mars + \
-        edge_start[:,None] * batch_size + \
-        offs_batch[None,:] # [TILE_SIZE_K, TILE_SIZE_B]
-
-    # Initialize pointers to `node_flows` and `node_mars`
-    offs_node = tl.arange(0, TILE_SIZE_M) + tile_id * TILE_SIZE_M
-    off_nids = tl.load(nids + ngroup_id)
-    offs_nmfs = (off_nids + offs_node[:,None]) * batch_size + offs_batch[None,:]
-    nmars_ptr = node_mars + offs_nmfs
-    nflows_ptr = node_flows + offs_nmfs
-
-    # Inner loop
-    acc = tl.zeros([TILE_SIZE_M, TILE_SIZE_K], dtype = tl.float32)
-
-    for b in range(0, B_NUM_TILES):
-        emars = tl.load(emars_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_K, TILE_SIZE_B]
-        nmars = tl.load(nmars_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_M, TILE_SIZE_B]
-        nflows = tl.load(nflows_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_M, TILE_SIZE_B]
-
-        nmars_max = tl.max(nmars, axis = 0)
-        nflows_div_mars = nflows / tl.exp(nmars - nmars_max[None,:])
-        nflows_div_mars = nflows_div_mars.to(tl.float16)
-
-        emars = tl.exp(emars - nmars_max[None,:])
-        emars = emars.to(tl.float16)
-
-        pflows = tl.dot(nflows_div_mars, tl.trans(emars)).to(tl.float32)
-
-        acc += pflows
-
-        # Increment `emars_ptr`, `nmars_ptr`, and `nmars_ptr`
-        emars_ptr += TILE_SIZE_B
-        nmars_ptr += TILE_SIZE_B
-        nflows_ptr += TILE_SIZE_B
-
-        # Update batch mask
-        offs_batch += TILE_SIZE_B
-        mask_batch = offs_batch < batch_size
-
-    par_start = tl.load(pids + ngroup_id * n_edges + offs_edge)
-    epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
-    
-    epars = tl.load(params + epars_offsets)
-    pflows = acc * epars
-
-    tl.store(param_flows + epars_offsets, pflows)
-
-
 def sum_layer_test():
 
     device = torch.device("cuda:0")
@@ -274,11 +123,21 @@ def sum_layer_test():
             epars = params[parpids[j,:]+i]
             eflows = (nflows * epars[:,None] * emars[None,:] / nmars).sum(dim = 0)
 
-            import pdb; pdb.set_trace()
+            assert torch.all(torch.abs(eflows - element_flows[(j+1)*group_size+i,:]) < 1e-2)
 
-            assert torch.all(torch.abs(eflows - element_flows[(j+1)*group_size+i,:]) < 1e-3)
-            
-    import pdb; pdb.set_trace()
+    my_pflows = torch.zeros_like(param_flows)
+
+    for i in range(group_size):
+        for j in range(6):
+            emars = element_mars[layer.partitioned_cids[0][j,:]].exp()
+            epars = params[layer.partitioned_pids[0][j,:]+i]
+            nmars = node_mars[(j+1)*group_size+i,:].exp()
+            nflows = node_flows[(j+1)*group_size+i,:]
+            pflows = epars * (nflows[None,:] * emars / nmars[None,:]).sum(dim = 1)
+
+            my_pflows[layer.partitioned_pids[0][j,:]+i] = pflows
+
+    assert torch.all(torch.abs(my_pflows - param_flows) < 2e-3)
 
 
 def speed_test():
@@ -320,15 +179,11 @@ def speed_test():
                          tied_param_group_ids = [], tied_param_ends = [],
                          ch_prod_layer_size = prod_layer.num_nodes + group_size)
 
-    # import pdb; pdb.set_trace()
-
     layer.to(device)
 
     node_mars = torch.zeros([group_size + group_size * num_node_groups * num_prod_nodes, batch_size]).to(device)
     element_mars = torch.rand([group_size + num_prod_nodes * group_size * num_node_groups, batch_size]).log().to(device)
     params = torch.rand([layer.partitioned_pids[0].max() + group_size]).to(device)
-
-    # import pdb; pdb.set_trace()
 
     ## Forward tests ##
 
@@ -343,10 +198,8 @@ def speed_test():
     forward_ms = (t1 - t0) / 100 * 1000
 
     print(f"Forward pass on average takes {forward_ms:.3f}ms.")
-    print("Reference computation time on RTX 4090: 11.255ms.")
+    print("Reference computation time on RTX 4090: 0.871ms.")
     print("--------------------------------------------------------------")
-
-    # exit()
 
     node_flows = torch.rand([group_size + group_size * num_node_groups * num_prod_nodes, batch_size]).to(device)
     element_flows = torch.zeros([group_size + num_prod_nodes * group_size * num_node_groups, batch_size]).log().to(device)
@@ -362,128 +215,12 @@ def speed_test():
     t1 = time.time()
     backward_ms = (t1 - t0) / 100 * 1000
 
-    print(f"Backward pass on average takes {forward_ms:.3f}ms.")
-    print("Reference computation time on RTX 4090: 11.255ms.")
+    print(f"Backward pass on average takes {backward_ms:.3f}ms.")
+    print("Reference computation time on RTX 4090: 1.200ms.")
     print("--------------------------------------------------------------")
-
-    exit()
-
-    # import pdb; pdb.set_trace()
-
-    nids = layer.partitioned_nids[0]
-    cids_start, cids_increment, pids_start, pids_increment = layer._cached_fw_pcids[("block_sparse", 0, 64)]
-
-    BLOCK_B = 128
-    TILE_SIZE_K = 64
-    K_NUM_TILES = layer.partitioned_cids[0].size(1) // TILE_SIZE_K
-    TILE_SIZE_M = 32
-
-    layer_n_nodes = nids.size(0) * layer.group_size
-    
-    grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
-        
-    _bk_triton_block_sparse_kernel[grid](
-        node_flows,
-        element_flows,
-        node_mars, 
-        element_mars, 
-        params, 
-        nids, 
-        cids_start,
-        cids_increment, 
-        pids_start,
-        pids_increment,
-        local_ids = None,
-        batch_size = batch_size,
-        partial_eval = 0,
-        BLOCK_B = BLOCK_B,
-        TILE_SIZE_K = TILE_SIZE_K,
-        K_NUM_TILES = K_NUM_TILES,
-        TILE_SIZE_M = TILE_SIZE_M,
-        GROUP_SIZE_M = layer.group_size
-    )
-
-    t0 = time.time()
-    torch.cuda.synchronize()
-    for _ in range(100):
-        _bk_triton_block_sparse_kernel[grid](
-            node_flows,
-            element_flows,
-            node_mars, 
-            element_mars, 
-            params, 
-            nids, 
-            cids_start,
-            cids_increment, 
-            pids_start,
-            pids_increment,
-            local_ids = None,
-            batch_size = batch_size,
-            partial_eval = 0,
-            BLOCK_B = BLOCK_B,
-            TILE_SIZE_K = TILE_SIZE_K,
-            K_NUM_TILES = K_NUM_TILES,
-            TILE_SIZE_M = TILE_SIZE_M,
-            GROUP_SIZE_M = layer.group_size
-        )
-    torch.cuda.synchronize()
-    t1 = time.time()
-    backward_ms = (t1 - t0) / 100 * 1000
-
-    print(f"bkbk: {backward_ms:.3f}ms.")
-
-    nids = layer.partitioned_nids[0]
-    cids = layer.partitioned_cids[0]
-    pids = layer.partitioned_pids[0]
-
-    param_flows = torch.zeros(params.size()).to(device)
-
-    TILE_SIZE_B = 64
-    TILE_SIZE_K = 64
-    B_NUM_TILES = triton.cdiv(batch_size, TILE_SIZE_B)
-    TILE_SIZE_M = 32
-
-    n_edges = cids.size(1)
-
-    layer_n_nodes = nids.size(0) * layer.group_size
-    
-    grid = (triton.cdiv(n_edges, TILE_SIZE_K), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
-
-    # print("aaa")
-
-    _bkp_triton_block_sparse_kernel[grid](
-        node_flows, node_mars, element_mars, params, 
-        param_flows, nids, cids, pids, local_ids = None, 
-        batch_size = batch_size, n_edges = n_edges, partial_eval = 0,
-        TILE_SIZE_B = TILE_SIZE_B, B_NUM_TILES = B_NUM_TILES, 
-        TILE_SIZE_K = TILE_SIZE_K, TILE_SIZE_M = TILE_SIZE_M, 
-        GROUP_SIZE_M = layer.group_size
-    )
-
-    t0 = time.time()
-    # print("bbb")
-    torch.cuda.synchronize()
-    # print("ccc")
-    for _ in range(100):
-        _bkp_triton_block_sparse_kernel[grid](
-            node_flows, node_mars, element_mars, params, 
-            param_flows, nids, cids, pids, local_ids = None, 
-            batch_size = batch_size, n_edges = n_edges, partial_eval = 0,
-            TILE_SIZE_B = TILE_SIZE_B, B_NUM_TILES = B_NUM_TILES, 
-            TILE_SIZE_K = TILE_SIZE_K, TILE_SIZE_M = TILE_SIZE_M, 
-            GROUP_SIZE_M = layer.group_size
-        )
-        # print("ddd")
-    torch.cuda.synchronize()
-    t1 = time.time()
-    backward_ms = (t1 - t0) / 100 * 1000
-
-    # print("eee")
-
-    print(f"bkpbkp: {backward_ms:.3f}ms.")
 
 
 if __name__ == "__main__":
     torch.manual_seed(3890)
-    # sum_layer_test()
+    sum_layer_test()
     speed_test()
