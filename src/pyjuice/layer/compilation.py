@@ -168,243 +168,89 @@ def get_sum_layer_backward_stats(nodes: Sequence[SumNodes]):
 
     return ch_gsize2cs, ch_gsize2num_ngroups, ch_gsize2n_pargs, cs2parns
 
-@torch.no_grad()
-def sum_layer_forward_compilation_job(flat_nodes, nids, cids, pids, fw_group_max_chs, n_group_ids, n_id_in_group,
-                                      global_nid_start, ch_prod_layer_size, job_start, job_end, return_dict = None, 
-                                      idx = 0, use_cuda: bool = False):
-    """
-    Note: Only process jobs in [job_start, job_end).
-    """
-    all_ns_param_ids = dict()
 
-    node_start = 0
-    for ns_idx, flat_ns in enumerate(flat_nodes):
-        # Outer iteration over `ns` in this layer
-        ns_num_nodes = flat_ns[0]
-        if node_start + ns_num_nodes < job_start:
-            node_start += ns_num_nodes
-            continue # Move on to the next ns
-        elif node_start >= job_end:
-            break # All jobs completed
+def sum_layer_forward_compilation_cpu(nodes, fw_partition_max_chs, n_partition_ids, n_id_in_partition, 
+                                      num_ngs_in_partition, n_chs, global_nid_start, param_ends):
 
-        edge_ids = flat_ns[1] # Edge indices of this `ns`
+    nids = [torch.zeros([num_ngs_in_partition[i]], dtype = torch.long) for i in range(len(num_ngs_in_partition))]
+    cids = [torch.zeros([num_ngs_in_partition[i], fw_partition_max_chs[i]], dtype = torch.long) for i in range(len(num_ngs_in_partition))]
+    pids = [torch.zeros([num_ngs_in_partition[i], fw_partition_max_chs[i]], dtype = torch.long) for i in range(len(num_ngs_in_partition))]
+
+    original_param_nids = [] # `ns` with their original parameters (i.e., not tied)
+    
+    # This is the main loop: iterate over `ns` in the layer
+    global_pid_start = param_ends[-1]
+    ngroup_start = 0 # The start index of the node groups in the current `ns`
+    ngid_in_partition = torch.zeros([len(num_ngs_in_partition)], dtype = torch.long)
+    for ns_idx, ns in enumerate(nodes):
+        if ns.is_tied():
+            target_ns = ns.get_source_ns()
+        else:
+            target_ns = ns
+
+        # If the parameters have not been instantiated, do it :)
+        if not hasattr(target_ns, "_param_range") or target_ns._param_range is None:
+            global_pid_end = global_pid_start + target_ns.num_edges
+            target_ns._param_range = (global_pid_start, global_pid_end)
+            global_pid_start = global_pid_end
+
+            add_params_flag = True
+            original_param_nids.append(ns_idx)
+        else:
+            add_params_flag = False
+
+        # Global pid start index for `ns`
+        ns_pid_start = target_ns._param_range[0]
+
+        # number of node groups
+        ns_num_ngroups = ns.num_node_groups
+
+        # Edge indices of size [2, ns_num_edges]
+        # Here child ids of the edges are flattened out, i.e., every edge points to 
+        # an actual "node" instead of a node group
+        edge_ids = ns.edge_ids.clone()
+        edge_ids = edge_ids[:,:,None].repeat(1, 1, ns.ch_group_size)
+        edge_ids[1,:,:] *= ns.ch_group_size
+        edge_ids[1,:,:] += torch.arange(0, ns.ch_group_size)[None,:]
+        edge_ids = edge_ids.reshape(2, ns.edge_ids.size(1) * ns.ch_group_size).contiguous()
         ns_num_edges = edge_ids.size(1)
 
-        add_params_flag = flat_ns[4]
-        if add_params_flag:
-            ns_param_ids = torch.zeros([edge_ids.size(1)], dtype = torch.long, device = edge_ids.device)
+        # Get number of child nodes for all nodes
+        ns_nchs = torch.bincount(edge_ids[0,:], minlength = ns_num_ngroups)
 
-        # Pre-compute cid flags for future reuse
-        num_chs = len(flat_ns[3])
-        cid_starts = torch.zeros([num_chs], dtype = torch.long)
-        cid_ends = torch.zeros([num_chs], dtype = torch.long)
-        cid_start = 0
-        for cnode_id, flat_cs in enumerate(flat_ns[3]):
-            cs_num_nodes = flat_cs[0]
-            cid_end = cid_start + cs_num_nodes
-            cid_starts[cnode_id] = cid_start
-            cid_ends[cnode_id] = cid_end
+        cs_node_cum_nodes = torch.zeros([ns.num_chs], dtype = torch.long)
+        cs_node_cum_nodes[0] = ns.chs[0].num_nodes
+        for i in range(1, ns.num_chs):
+            cs_node_cum_nodes[i] = cs_node_cum_nodes[i-1] + ns.chs[i].num_nodes
 
-            cid_start = cid_end
-        
-        if use_cuda:
-            cid_starts = cid_starts.cuda()
-            cid_ends = cid_ends.cuda()
+        # Iterate over node groups
+        cum_n_chs = 0
+        for ng_id in range(ns_num_ngroups):
+            partition_id = (ns_nchs[ng_id] > fw_partition_max_chs).sum()
+            local_id = ngid_in_partition[partition_id]
 
-        # Shape: [num_chs, num_edges]
-        cs_criterion = (edge_ids[1,:].unsqueeze(0) >= cid_starts[:,None]) & \
-                       (edge_ids[1,:].unsqueeze(0) < cid_ends[:,None])
+            global_nid = ns._output_ind_range[0] + ng_id * ns.group_size
 
-        # Loop over the nodes assigned to the current thread
-        nid_start = 0 if node_start >= job_start else job_start - node_start
-        nid_end = ns_num_nodes if node_start + ns_num_nodes <= job_end else job_end - node_start
-        ns_pid_start = flat_ns[2][0] # Start param id
-        ns_local_pid = (edge_ids[0,:] < nid_start).sum().item()
-        for nid in range(nid_start, nid_end):
-            # Global node idx
-            global_nid = global_nid_start + node_start + nid
+            # Assign `nids`
+            nids[partition_id][local_id] = global_nid
 
-            # `group_id`:   which group the current node belongs to
-            # `local_id`:   the index of the node within the current group
-            # `group_nchs`: maximum number of child nodes in the current group
-            group_id = n_group_ids[node_start + nid]
-            local_id = n_id_in_group[node_start + nid]
-            group_nchs = fw_group_max_chs[group_id]
+            # Assign `cids`
+            criterion = (edge_ids[0,:] == ng_id)
+            local_cids = edge_ids[1,criterion]
+            cids_gid = (local_cids[:,None] >= cs_node_cum_nodes[None,:]).sum(dim = 1)
+            for ch_id in range(local_cids.size(0)):
+                local_base = cs_node_cum_nodes[cids_gid[ch_id]-1] if cids_gid[ch_id] >= 1 else 0
+                global_cid = ns.chs[cids_gid[ch_id]]._output_ind_range[0] + local_cids[ch_id] - local_base
+                cids[partition_id][local_id, ch_id] = global_cid
 
-            ns_criterion = (edge_ids[0,:] == nid)
+            # Assign `pids`
+            global_pids = ns_pid_start + cum_n_chs + torch.arange(0, ns.group_size * criterion.sum(), ns.group_size)
+            pids[partition_id][local_id, 0:global_pids.size(0)] = global_pids
+            cum_n_chs += ns.group_size * criterion.sum()
 
-            # assign node id
-            nids[group_id][local_id] = global_nid
+            ngid_in_partition[partition_id] = local_id + 1
 
-            ch_start = 0
-            cid_start = 0
-            for cnode_id, flat_cs in enumerate(flat_ns[3]):
-                cs_num_nodes = flat_cs[0]
-                cs_out_ind_range = flat_cs[1]
-                cid_end = cid_start + cs_num_nodes
-
-                criterion = cs_criterion[cnode_id,:] & ns_criterion
-
-                # assign child ids
-                ch_ids = edge_ids[1,criterion] + (cs_out_ind_range[0] - cid_start)
-                cids[group_id][local_id,ch_start:ch_start+ch_ids.size(0)] = ch_ids
-
-                # mapping from the current params to global params
-                if add_params_flag:
-                    curr_ids = torch.where(criterion)[0]
-                    curr_param_ids = torch.arange(curr_ids.size(0), device = edge_ids.device) + (ns_pid_start + ns_local_pid + ch_start)
-                    ns_param_ids[curr_ids] = curr_param_ids
-
-                ch_start += ch_ids.size(0)
-                cid_start = cid_end
-
-            # assign parameter ids
-            parids = torch.arange(ch_start, device = edge_ids.device) + (ns_pid_start + ns_local_pid)
-            pids[group_id][local_id,:ch_start] = parids
-
-            ns_local_pid += ch_start
-
-        node_start += ns_num_nodes
-        ns_pid_start += ns_num_edges
-
-        if add_params_flag:
-            all_ns_param_ids[ns_idx] = ns_param_ids
-
-    if return_dict is not None:
-        return_dict[idx] = all_ns_param_ids
-    else:
-        return all_ns_param_ids
-
-
-@torch.no_grad()
-def sum_layer_forward_compilation_legacy(nodes, fw_group_max_chs, n_group_ids, n_id_in_group, num_ns_in_group, n_chs,
-                                         global_nid_start, ch_prod_layer_size, param_ends, 
-                                         num_threads: int = 1, use_cuda: bool = False):
-
-    if use_cuda and not torch.cuda.is_available():
-        use_cuda = False
-
-    total_num_jobs = sum(map(lambda ns: ns.num_nodes, nodes))
-
-    # Construct flattened_nodes
-    global_pid_start = param_ends[-1]
-    flat_nodes = []
-    add_ns_params_flag = []
-    for ns in nodes:
-        if ns.is_tied():
-            source_ns = ns.get_source_ns()
-            if not hasattr(source_ns, "_param_range") or source_ns._param_range is None:
-                global_pid_end = global_pid_start + source_ns.num_edges
-                source_ns._param_range = (global_pid_start, global_pid_end)
-                global_pid_start = global_pid_end
-
-                add_params_flag = True
-            else:
-                add_params_flag = False
-        else:
-            if not hasattr(ns, "_param_range") or ns._param_range is None:
-                global_pid_end = global_pid_start + ns.num_edges
-                ns._param_range = (global_pid_start, global_pid_end)
-                global_pid_start = global_pid_end
-
-                add_params_flag = True
-            else:
-                add_params_flag = False
-
-        add_ns_params_flag.append(add_params_flag)
-        flat_nodes.append(flatten_sum_nodes(ns, add_params_flag, use_cuda = use_cuda))
-
-    # Allocate target buffers
-    nids = [torch.zeros([group_size], dtype = torch.long) for group_size in num_ns_in_group] # Node id
-    cids = [torch.zeros([group_size, max_chs], dtype = torch.long) for group_size, max_chs in zip(num_ns_in_group, fw_group_max_chs)] # Child id
-    pids = [torch.zeros([group_size, max_chs], dtype = torch.long) for group_size, max_chs in zip(num_ns_in_group, fw_group_max_chs)] # Parameter id
-
-    if use_cuda:
-        nids = [tensor.cuda() for tensor in nids]
-        cids = [tensor.cuda() for tensor in cids]
-        pids = [tensor.cuda() for tensor in pids]
-
-    if num_threads == 1:
-        curr_ns_param_ids = sum_layer_forward_compilation_job(
-            flat_nodes, nids, cids, pids, fw_group_max_chs, n_group_ids, n_id_in_group,
-            global_nid_start, ch_prod_layer_size, 0, total_num_jobs, use_cuda = use_cuda
-        )
-        all_ns_param_ids = [curr_ns_param_ids]
-
-    else:
-        job_indices = get_chunk_ids(total_num_jobs, num_threads)
-
-        threads = []
-        return_dict = dict()
-        for idx, (job_start, job_end) in enumerate(job_indices):
-            th = threading.Thread(
-                target = sum_layer_forward_compilation_job, 
-                args = (flat_nodes, nids, cids, pids, fw_group_max_chs, n_group_ids, n_id_in_group,
-                        global_nid_start, ch_prod_layer_size, job_start, job_end, return_dict, idx, 
-                        use_cuda)
-            )
-            th.start()
-            threads.append(th)
-
-        for th in threads:
-            th.join()
-
-        all_ns_param_ids = []
-        for idx in range(num_threads):
-            curr_ns_param_ids = return_dict[idx]
-            all_ns_param_ids.append(curr_ns_param_ids)
-
-    # Compute the number of (sum) parents for each (prod) input node
-    ch_n_pars = torch.zeros([ch_prod_layer_size], dtype = torch.long) # Number of parents for each child node
-    for ns in nodes:
-        ch_start = 0
-        for cs in ns.chs:
-            ch_end = ch_start + cs.num_nodes
-            criterion = (ns.edge_ids[1,:] >= ch_start) & (ns.edge_ids[1,:] < ch_end)
-            
-            cs_s_oind = cs._output_ind_range[0]
-            cs_e_oind = cs._output_ind_range[1]
-            c_ns_counts = torch.bincount(ns.edge_ids[1,criterion] - ch_start, minlength = cs.num_nodes)
-            ch_n_pars[cs_s_oind:cs_e_oind] = c_ns_counts
-
-            ch_start = ch_end
-
-    # Store local -> global parameter id mapping in `ns`
-    for ns_param_ids in all_ns_param_ids:
-        for ns_idx, param_ids in ns_param_ids.items():
-            if use_cuda:
-                param_ids = param_ids.cpu()
-            ns = nodes[ns_idx]
-            if not hasattr(ns, "_param_ids") or ns._param_ids is None:
-                ns._param_ids = param_ids
-            else:
-                mask = (param_ids > 0)
-                ns._param_ids[mask] = param_ids[mask]
-
-    # Store global -> local parameter id mapping in `ns`
-    for ns, add_params_flag in zip(nodes, add_ns_params_flag):
-        if add_params_flag:
-            ns._param_range = (ns._param_ids.min().item(), ns._param_ids.max().item() + 1)
-            ns._inverse_param_ids = torch.argsort(ns._param_ids)
-
-    # Update `param_ends`
-    npars = param_ends[-1]
-    nid = 0
-    for ns, add_params_flag in zip(nodes, add_ns_params_flag):
-        if add_params_flag:
-            for i in range(ns.num_nodes):
-                npars += n_chs[nid+i].item()
-                param_ends.append(npars)
-        
-        nid += ns.num_nodes
-
-    if use_cuda:
-        # Move buffers back to CPU
-        nids = [tensor.cpu() for tensor in nids]
-        cids = [tensor.cpu() for tensor in cids]
-        pids = [tensor.cpu() for tensor in pids]
-
-    return nids, cids, pids, ch_n_pars, param_ends
+    return nids, cids, pids, param_ends
 
 
 @njit
@@ -484,20 +330,16 @@ def _assign_target_ncpids_kernel(target_nids_ptr, nids_partition_start_ptr, targ
 
 @torch.no_grad()
 def sum_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, n_id_in_partition, num_ngs_in_partition, n_chs,
-                                  global_nid_start, ch_prod_layer_size, param_ends,
-                                  num_threads: int = 1, use_cuda: bool = True, legacy: bool = False):
+                                  global_nid_start, param_ends, use_cuda: bool = True, legacy: bool = False):
 
     if use_cuda and not torch.cuda.is_available():
         use_cuda = False
 
     # Also use the legacy code if we compile with CPU
     if not use_cuda or legacy:
-        # TODO: restore CPU compilation
-        raise RuntimeError()
-        return sum_layer_forward_compilation_legacy(
-            nodes, fw_partition_max_chs, n_partition_ids, n_id_in_partition, num_ngs_in_partition, n_chs,
-            global_nid_start, ch_prod_layer_size, param_ends, num_threads = num_threads,
-            use_cuda = use_cuda
+        return sum_layer_forward_compilation_cpu(
+            nodes, fw_partition_max_chs, n_partition_ids, n_id_in_partition, 
+            num_ngs_in_partition, n_chs, global_nid_start, param_ends
         )
 
     # We construct a flattened version of `nids` where the vectors of every partition is concatenated
@@ -1055,11 +897,9 @@ def sum_layer_backward_compilation(nodes, cs2parns, n_partition_ids, n_id_in_par
 ## Compilation for ProdLayer ##
 
 
-def get_prod_layer_stats(nodes: Sequence[SumNodes], group_size: int):
+def get_prod_layer_stats(nodes: Sequence[SumNodes], group_size: int, global_nid_start: int):
     layer_num_ngroup = sum(map(lambda ns: ns.num_node_groups, nodes))
     layer_num_edges = 0
-    
-    global_nid_start = group_size # indices `0`` to `group_size - 1`` is reserved for the dummy node
 
     ng_sid = 0
     n_chgs = torch.zeros([layer_num_ngroup], dtype = torch.long)
@@ -1079,13 +919,19 @@ def get_prod_layer_stats(nodes: Sequence[SumNodes], group_size: int):
 
 
 @torch.no_grad()
-def prod_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, n_id_in_partition, num_ngs_in_partition, group_size, use_cuda: bool = False):
+def prod_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, n_id_in_partition, num_ngs_in_partition, 
+                                   group_size, use_cuda: bool = False):
     
     if use_cuda and not torch.cuda.is_available():
         use_cuda = False
 
-    nids = [torch.zeros([partition_size], dtype = torch.long) for partition_size in num_ngs_in_partition] # Node group start id
-    cids = [torch.zeros([partition_size, max_chs] , dtype = torch.long) for partition_size, max_chs in zip(num_ngs_in_partition, fw_partition_max_chs)] # Child group start id
+    if use_cuda:
+        device = torch.device("cuda:0")
+    else:
+        device = torch.device("cpu")
+
+    nids = [torch.zeros([partition_size], dtype = torch.long, device = device) for partition_size in num_ngs_in_partition] # Node group start id
+    cids = [torch.zeros([partition_size, max_chs] , dtype = torch.long, device = device) for partition_size, max_chs in zip(num_ngs_in_partition, fw_partition_max_chs)] # Child group start id
 
     for ns_id, ns in enumerate(nodes):
 
@@ -1098,15 +944,19 @@ def prod_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids,
         partition_nchs = fw_partition_max_chs[partition_id]
 
         n_sid = ns._output_ind_range[0]
-        nids[partition_id][local_sid:local_eid] = torch.arange(0, ns.num_nodes, group_size) + n_sid
+        nids[partition_id][local_sid:local_eid] = torch.arange(0, ns.num_nodes, group_size, device = device) + n_sid
         for cs_id, cs in enumerate(ns.chs):
-            cids[partition_id][local_sid:local_eid,cs_id] = ns.edge_ids[:,cs_id] * group_size + cs._output_ind_range[0]
+            cids[partition_id][local_sid:local_eid,cs_id] = ns.edge_ids[:,cs_id].to(device) * group_size + cs._output_ind_range[0]
+
+    if use_cuda:
+        nids = [tensor.cpu() for tensor in nids]
+        cids = [tensor.cpu() for tensor in cids]
 
     return nids, cids
 
 
 @torch.no_grad()
-def flatten_c_ids(nids, cids):
+def flatten_c_ids(nids: torch.Tensor, cids: torch.Tensor):
 
     num_cid_slots = sum(map(lambda x: x.size(0) * x.size(1), cids))
     flat_cids = torch.zeros([num_cid_slots], dtype = torch.long)
@@ -1128,14 +978,16 @@ def flatten_c_ids(nids, cids):
 
 
 @torch.no_grad()
-def get_prod_layer_parstats(flat_cids):
+def get_prod_layer_parstats(flat_cids: torch.Tensor, global_nid_start: int):
 
     u_cids, par_counts = torch.unique(flat_cids, sorted = True, return_counts = True)
 
-    if u_cids[0] == 0:
-        # Strip away the dummy node
-        u_cids = u_cids[1:]
-        par_counts = par_counts[1:]
+    c_sid = torch.arange(0, u_cids.size(0))[u_cids == global_nid_start].min()
+
+    if c_sid > 0:
+        # Strip away dummy nodes
+        u_cids = u_cids[c_sid:]
+        par_counts = par_counts[c_sid:]
 
     return u_cids, par_counts
 

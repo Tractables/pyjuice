@@ -13,9 +13,6 @@ from pyjuice.layer import InputLayer, ProdLayer, SumLayer
 
 import pytest
 
-import triton
-import triton.language as tl
-
 
 def sum_layer_test():
 
@@ -218,6 +215,8 @@ def speed_test():
     print(f"Backward pass on average takes {backward_ms:.3f}ms.")
     print("Reference computation time on RTX 4090: 1.200ms.")
     print("--------------------------------------------------------------")
+
+    import pdb; pdb.set_trace()
 
 
 if __name__ == "__main__":
