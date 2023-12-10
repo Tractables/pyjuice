@@ -188,7 +188,7 @@ def partition_nodes_by_n_edges(node_n_edges: Union[np.ndarray, torch.Tensor],
     if sparsity_tolerance is not None:
         assert sparsity_tolerance > 1e-6 and sparsity_tolerance <= 1.0
         if max_num_partitions is None:
-            max_num_partitions = max(min(int(math.ceil(node_n_edges.shape[0] * sparsity_tolerance)), 16), 1)
+            max_num_partitions = max(min(torch.unique(node_n_edges).shape[0], 16), 1)
     elif max_num_partitions is None:
         max_num_partitions = 1
     else:
