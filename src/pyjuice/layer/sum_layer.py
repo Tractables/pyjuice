@@ -25,6 +25,7 @@ class SumLayer(Layer, nn.Module):
                  global_pid_start: int, global_pfid_start: int, node2tiednodes: dict(),
                  layer_sparsity_tol: Optional[float] = None, 
                  max_num_partitions: Optional[int] = None,
+                 max_tied_ns_per_parflow_group: int = 8,
                  disable_gpu_compilation: bool = False,
                  force_gpu_compilation: bool = False) -> None:
 
@@ -84,9 +85,11 @@ class SumLayer(Layer, nn.Module):
         # nids:      List[[partition_size]]                      stores node group ids
         # cids:      List[[partition_size, partition_max_n_chs]] stores indices of child node groups
         # pids:      List[[partition_size, partition_max_n_chs]] stores indices of edge parameters (1st parameter of every group)
-        nids, cids, pids, layer_pid_end, layer_pfid_end = sum_layer_forward_compilation(
+        # pfids:     List[[partition_size, partition_max_n_chs]] stores indices of edge parameter flows (1st parameter flow of every group)
+        nids, cids, pids, pfids, layer_pid_end, layer_pfid_end = sum_layer_forward_compilation(
             self.nodes, fw_partition_max_chs, fw_n_partition_ids, fw_n_id_in_partition, 
             fw_num_ngs_in_partition, n_chs, global_nid_start, global_pid_start, global_pfid_start, node2tiednodes,
+            max_tied_ns_per_parflow_group = max_tied_ns_per_parflow_group,
             # GPU compilation is slightly slower for small layer due to the kernel jit compilation time
             use_cuda = force_gpu_compilation or (not disable_gpu_compilation and (self.num_edges > 1000))
         )
@@ -95,6 +98,7 @@ class SumLayer(Layer, nn.Module):
         self.partitioned_nids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in nids])
         self.partitioned_cids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in cids])
         self.partitioned_pids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in pids])
+        self.partitioned_pfids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in pfids])
 
         # Store pre-compiled indices from `cids` and `pids` in the following buffer
         self._cached_fw_pcids = dict()
@@ -209,7 +213,7 @@ class SumLayer(Layer, nn.Module):
             for partition_id in range(self.num_fw_partitions):
                 nids = self.partitioned_nids[partition_id]
                 cids = self.partitioned_cids[partition_id]
-                pids = self.partitioned_pids[partition_id]
+                pfids = self.partitioned_pfids[partition_id]
 
                 self._forward(
                     node_mars, element_mars, params, nids, cids, pids, partition_id = partition_id
@@ -292,11 +296,12 @@ class SumLayer(Layer, nn.Module):
                 nids = self.partitioned_nids[partition_id]
                 cids = self.partitioned_cids[partition_id]
                 pids = self.partitioned_pids[partition_id]
+                pfids = self.partitioned_pfids[partition_id]
 
                 self._backward(
                     node_flows, element_flows, params, node_mars, 
                     element_mars, param_flows, nids = nids, 
-                    cids = cids, pids = pids, partition_id = partition_id
+                    cids = cids, pids = pids, pfids = pfids, partition_id = partition_id
                 )
 
         return None
@@ -650,8 +655,9 @@ class SumLayer(Layer, nn.Module):
                   params: torch.Tensor, node_mars: torch.Tensor, 
                   element_mars: torch.Tensor, param_flows: torch.Tensor,
                   nids: Optional[torch.Tensor] = None, cids: Optional[torch.Tensor] = None, 
-                  pids: Optional[torch.Tensor] = None, chids: Optional[torch.Tensor] = None, 
-                  parids: Optional[torch.Tensor] = None, parpids: Optional[torch.Tensor] = None, 
+                  pids: Optional[torch.Tensor] = None, pfids: Optional[torch.Tensor] = None, 
+                  chids: Optional[torch.Tensor] = None, parids: Optional[torch.Tensor] = None, 
+                  parpids: Optional[torch.Tensor] = None, 
                   cs_group_size: int = 0, local_ids: Optional[torch.Tensor] = None, 
                   partition_id: int = -1, mode: Optional[str] = None) -> None:
         """
@@ -685,7 +691,7 @@ class SumLayer(Layer, nn.Module):
         if mode == "block_sparse":
             self._backward_block_sparse(
                 node_flows, element_flows, params, node_mars, element_mars, param_flows, 
-                nids, cids, pids, chids, parids, parpids, cs_group_size, local_ids, 
+                nids, cids, pids, pfids, chids, parids, parpids, cs_group_size, local_ids, 
                 partition_id = partition_id
             )
 
@@ -699,7 +705,7 @@ class SumLayer(Layer, nn.Module):
     def _backward_block_sparse(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
                                params: torch.Tensor, node_mars: torch.Tensor, 
                                element_mars: torch.Tensor, param_flows: torch.Tensor, 
-                               nids: Optional[torch.Tensor], cids: Optional[torch.Tensor], pids: Optional[torch.Tensor],
+                               nids: Optional[torch.Tensor], cids: Optional[torch.Tensor], pids: Optional[torch.Tensor], pfids: Optional[torch.Tensor],
                                chids: Optional[torch.Tensor], parids: Optional[torch.Tensor], parpids: Optional[torch.Tensor], 
                                cs_group_size: int, local_ids: Optional[torch.Tensor] = None,
                                partition_id: int = -1) -> None:
@@ -731,7 +737,7 @@ class SumLayer(Layer, nn.Module):
         if param_flows is not None and nids is not None:
             self._backward_block_sparse_par_flows(
                 node_flows, params, node_mars, element_mars, param_flows,
-                nids = nids, cids = cids, pids = pids
+                nids = nids, cids = cids, pids = pids, pfids = pfids
             )
 
         return None
@@ -919,7 +925,7 @@ class SumLayer(Layer, nn.Module):
 
     @staticmethod
     @triton.jit
-    def _bk_triton_block_sparse_par_kernel(node_flows, node_mars, element_mars, params, param_flows, nids, cids, pids,
+    def _bk_triton_block_sparse_par_kernel(node_flows, node_mars, element_mars, params, param_flows, nids, cids, pids, pfids,
                                            batch_size: tl.constexpr, num_edges: tl.constexpr, TILE_SIZE_B: tl.constexpr, 
                                            B_NUM_TILES: tl.constexpr, TILE_SIZE_K: tl.constexpr, 
                                            TILE_SIZE_M: tl.constexpr, GROUP_SIZE_M: tl.constexpr):
@@ -978,16 +984,18 @@ class SumLayer(Layer, nn.Module):
 
         par_start = tl.load(pids + ngroup_id * num_edges + offs_edge)
         epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
-        
         epars = tl.load(params + epars_offsets)
-        pflows = tl.load(param_flows + epars_offsets)
-        pflows += acc * epars
 
-        tl.store(param_flows + epars_offsets, pflows)
+        parflow_start = tl.load(pfids + ngroup_id * num_edges + offs_edge)
+        epars_offsets = offs_node[:,None] + parflow_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
+        
+        curr_pflows = acc * epars
+
+        tl.atomic_add(param_flows + epars_offsets, curr_pflows) # TODO: reimplement with the lock mechanism
 
     def _backward_block_sparse_par_flows(self, node_flows: torch.Tensor, params: torch.Tensor, node_mars: torch.Tensor, 
                                          element_mars: torch.Tensor, param_flows: torch.Tensor, nids: torch.Tensor, 
-                                         cids: torch.Tensor, pids: torch.Tensor, ) -> None:
+                                         cids: torch.Tensor, pids: torch.Tensor, pfids: torch.Tensor) -> None:
         """
         Backward pass of sum layers w.r.t. sum parameters with the block-sparse processing kernel.
         
@@ -1036,6 +1044,7 @@ class SumLayer(Layer, nn.Module):
             nids = nids, 
             cids = cids, 
             pids = pids,
+            pfids = pfids,
             batch_size = batch_size, 
             num_edges = num_edges, 
             TILE_SIZE_B = TILE_SIZE_B, 
