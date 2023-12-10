@@ -81,8 +81,6 @@ def sum_layer_compilation_test():
                                  global_pid_start = 1, global_pfid_start = 0, node2tiednodes = dict(), 
                                  layer_sparsity_tol = 0.1, force_gpu_compilation = True)
 
-        # import pdb; pdb.set_trace()
-
         for i in range(len(sum_layer_cpu.partitioned_nids)):
             assert torch.all(sum_layer_cpu.partitioned_nids[i] == sum_layer_gpu.partitioned_nids[i])
             assert torch.all(sum_layer_cpu.partitioned_cids[i] == sum_layer_gpu.partitioned_cids[i])
