@@ -685,22 +685,22 @@ def sum_layer_backward_compilation(nodes, cs2parns, n_partition_ids, n_id_in_par
     # `chids`. That is, `target_chids[chids_partition_start[i]:chids_partition_start[i+1]] == chids[i]`
     chids_partition_start = torch.zeros_like(num_ngs_in_partition)
     chids_partition_start[1:] = torch.cumsum(num_ngs_in_partition[:-1], dim = 0)
-    target_chids = torch.zeros([num_ngs_in_partition.sum()], dtype = torch.long).cuda()
+    target_chids = torch.zeros([num_ngs_in_partition.sum()], dtype = torch.long).to(device)
 
     # Similarly, we flatten `parids`...
     # Note: we call it `pcids...` because it is shared with `target_pids`
     parids_partition_start = torch.zeros_like(num_ngs_in_partition)
     parids_partition_start[1:] = torch.cumsum((num_ngs_in_partition * partition_max_pars)[:-1], dim = 0)
-    target_parids = torch.zeros([(num_ngs_in_partition * partition_max_pars).sum()], dtype = torch.long).cuda()
+    target_parids = torch.zeros([(num_ngs_in_partition * partition_max_pars).sum()], dtype = torch.long).to(device)
 
     # ...and `parpids`
-    target_parpids = torch.zeros([(num_ngs_in_partition * partition_max_pars).sum()], dtype = torch.long).cuda()
+    target_parpids = torch.zeros([(num_ngs_in_partition * partition_max_pars).sum()], dtype = torch.long).to(device)
 
     # Move tensors to GPU
-    n_partition_ids = n_partition_ids.cuda()
-    n_id_in_partition = n_id_in_partition.cuda()
-    num_ngs_in_partition = num_ngs_in_partition.cuda()
-    partition_max_pars = partition_max_pars.cuda()
+    n_partition_ids = n_partition_ids.to(device)
+    n_id_in_partition = n_id_in_partition.to(device)
+    num_ngs_in_partition = num_ngs_in_partition.to(device)
+    partition_max_pars = partition_max_pars.to(device)
 
     # This is the main loop: iterate over `cs` in the layer
     cs_ngroup_start = 0 # The start index of nodes in the current `cs`
@@ -755,14 +755,14 @@ def sum_layer_backward_compilation(nodes, cs2parns, n_partition_ids, n_id_in_par
         pars_offsets = torch.from_numpy(pars_offsets)
 
         # Move necessary buffers to GPU
-        chids_partition_start = chids_partition_start.cuda()
-        parids_partition_start = parids_partition_start.cuda()
-        pars_offsets = pars_offsets.cuda()
+        chids_partition_start = chids_partition_start.to(device)
+        parids_partition_start = parids_partition_start.to(device)
+        pars_offsets = pars_offsets.to(device)
 
         for ns, edge_ids in zip(cs2parns[cs], par_edge_ids):
 
             ns_num_edges = edge_ids.size(1)
-            edge_ids = edge_ids.cuda()
+            edge_ids = edge_ids.to(device)
 
             if ns.is_tied():
                 ns_pid_start = ns.get_source_ns()._param_range[0]
@@ -770,8 +770,8 @@ def sum_layer_backward_compilation(nodes, cs2parns, n_partition_ids, n_id_in_par
                 ns_pid_start = ns._param_range[0]
 
             # Get `cum_n_chs` and `chs_offsets`, which are used to get the parameter indices
-            cum_n_chs = ns2cum_n_chs[ns].cuda()
-            chs_offsets = ns2chs_offsets[ns].cuda()
+            cum_n_chs = ns2cum_n_chs[ns].to(device)
+            chs_offsets = ns2chs_offsets[ns].to(device)
 
             # We store these constants in a tensor and retrieve them in the kernel
             # This is to avoid `triton` from compiling separate kernels for every layer configuration
@@ -782,7 +782,7 @@ def sum_layer_backward_compilation(nodes, cs2parns, n_partition_ids, n_id_in_par
             cs_group_size = cs.group_size
             
             constexprs = torch.tensor([ns_global_node_start, cs_global_ele_start, ns_group_size, cs_group_size, 
-                                       ns_pid_start, ns_num_edges, cs_ngroup_start]).long().cuda()
+                                       ns_pid_start, ns_num_edges, cs_ngroup_start]).long().to(device)
 
             # Make the grid and launch kernel
             grid = lambda meta: (triton.cdiv(ns_num_edges, meta["BLOCK_SIZE"]),)
