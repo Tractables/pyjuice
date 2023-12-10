@@ -22,7 +22,7 @@ from .compilation import get_sum_layer_forward_stats, sum_layer_forward_compilat
 class SumLayer(Layer, nn.Module):
 
     def __init__(self, nodes: Sequence[SumNodes], global_nid_start: int, 
-                 param_ends: Sequence, 
+                 global_pid_start: int, global_pfid_start: int, node2tiednodes: dict(),
                  layer_sparsity_tol: Optional[float] = None, 
                  max_num_partitions: Optional[int] = None,
                  disable_gpu_compilation: bool = False,
@@ -34,6 +34,10 @@ class SumLayer(Layer, nn.Module):
         assert len(nodes) > 0, "No input node."
 
         self.nodes = nodes
+
+        layer_nid_start = global_nid_start
+        layer_pid_start = global_pid_start
+        layer_pfid_start = global_pfid_start
 
         ## Get layer statistics & prepare for compilation ##
 
@@ -80,9 +84,9 @@ class SumLayer(Layer, nn.Module):
         # nids:      List[[partition_size]]                      stores node group ids
         # cids:      List[[partition_size, partition_max_n_chs]] stores indices of child node groups
         # pids:      List[[partition_size, partition_max_n_chs]] stores indices of edge parameters (1st parameter of every group)
-        nids, cids, pids, param_ends = sum_layer_forward_compilation(
+        nids, cids, pids, param_ends, layer_pid_end, layer_pfid_end = sum_layer_forward_compilation(
             self.nodes, fw_partition_max_chs, fw_n_partition_ids, fw_n_id_in_partition, 
-            fw_num_ngs_in_partition, n_chs, global_nid_start, param_ends = param_ends,
+            fw_num_ngs_in_partition, n_chs, global_nid_start, global_pid_end, global_pfid_start, node2tiednodes,
             # GPU compilation is slightly slower for small layer due to the kernel jit compilation time
             use_cuda = force_gpu_compilation or (not disable_gpu_compilation and (self.num_edges > 1000))
         )
@@ -94,6 +98,11 @@ class SumLayer(Layer, nn.Module):
 
         # Store pre-compiled indices from `cids` and `pids` in the following buffer
         self._cached_fw_pcids = dict()
+
+        # Layer info
+        self._layer_nid_range = (layer_nid_start, layer_nid_start + self.num_nodes)
+        self._layer_pid_range = (layer_pid_start, layer_pid_end)
+        self._layer_pfid_range = (layer_pfid_start, layer_pfid_end)
 
         ## Initialize backward pass ##
 
@@ -971,7 +980,8 @@ class SumLayer(Layer, nn.Module):
         epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
         
         epars = tl.load(params + epars_offsets)
-        pflows = acc * epars
+        pflows = tl.load(param_flows + epars_offsets)
+        pflows += acc * epars
 
         tl.store(param_flows + epars_offsets, pflows)
 

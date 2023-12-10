@@ -169,38 +169,78 @@ def get_sum_layer_backward_stats(nodes: Sequence[SumNodes]):
     return ch_gsize2cs, ch_gsize2num_ngroups, ch_gsize2n_pargs, cs2parns
 
 
-def sum_layer_forward_compilation_cpu(nodes, fw_partition_max_chs, n_partition_ids, n_id_in_partition, 
-                                      num_ngs_in_partition, n_chs, global_nid_start, param_ends):
+def sum_layer_forward_compilation_cpu(nodes, fw_partition_max_chs, n_partition_ids, n_id_in_partition, num_ngs_in_partition, n_chs,
+                                      global_nid_start: int, global_pid_start: int, global_pfid_start: int, node2tiednodes: dict, 
+                                      max_tied_ns_per_parflow_group: int = 4):
 
     nids = [torch.zeros([num_ngs_in_partition[i]], dtype = torch.long) for i in range(len(num_ngs_in_partition))]
     cids = [torch.zeros([num_ngs_in_partition[i], fw_partition_max_chs[i]], dtype = torch.long) for i in range(len(num_ngs_in_partition))]
     pids = [torch.zeros([num_ngs_in_partition[i], fw_partition_max_chs[i]], dtype = torch.long) for i in range(len(num_ngs_in_partition))]
 
+    all_ns_param_ids = dict()
     original_param_nids = [] # `ns` with their original parameters (i.e., not tied)
     
     # This is the main loop: iterate over `ns` in the layer
-    global_pid_start = param_ends[-1]
     ngroup_start = 0 # The start index of the node groups in the current `ns`
     ngid_in_partition = torch.zeros([len(num_ngs_in_partition)], dtype = torch.long)
     for ns_idx, ns in enumerate(nodes):
-        if ns.is_tied():
-            target_ns = ns.get_source_ns()
-        else:
-            target_ns = ns
+        
+        if not ns.is_tied():
+            if not ns.provided("_param_range"):
+                global_pid_end = global_pid_start + ns.num_edges
+                ns._param_range = (global_pid_start, global_pid_end)
+                global_pid_start = global_pid_end
 
-        # If the parameters have not been instantiated, do it :)
-        if not hasattr(target_ns, "_param_range") or target_ns._param_range is None:
-            global_pid_end = global_pid_start + target_ns.num_edges
-            target_ns._param_range = (global_pid_start, global_pid_end)
-            global_pid_start = global_pid_end
+                global_pfid_end = global_pfid_start + ns.num_edges
+                ns._param_flow_range = (global_pfid_start, global_pfid_end)
+                global_pfid_start = global_pfid_end
 
-            add_params_flag = True
+                add_params_flag = True
+            else:
+                add_params_flag = False
+
             original_param_nids.append(ns_idx)
+                
+            # Global pid start index for `ns`
+            ns_pid_start = ns._param_range[0]
         else:
-            add_params_flag = False
+            source_ns = ns.get_source_ns()
 
-        # Global pid start index for `ns`
-        ns_pid_start = target_ns._param_range[0]
+            # Initialize parameters
+            if not source_ns.provided("_param_range"):
+                global_pid_end = global_pid_start + ns.num_edges
+                ns._param_range = (global_pid_start, global_pid_end)
+                global_pid_start = global_pid_end
+
+                global_pfid_end = global_pfid_start + ns.num_edges
+                ns._param_flow_range = (global_pfid_start, global_pfid_end)
+                global_pfid_start = global_pfid_end
+
+                add_params_flag = True
+            else:
+                ns._param_range = deepcopy(source_ns._param_range)
+
+                add_params_flag = False
+
+            if source_ns not in node2tiednodes:
+                node2tiednodes[source_ns] = [[source_ns], 1, source_ns._param_flow_range]
+            
+            dup_count = node2tiednodes[source_ns][1]
+            if dup_count >= max_tied_ns_per_parflow_group:
+                global_pfid_end = global_pfid_start + ns.num_edges
+                ns._param_flow_range = (global_pfid_start, global_pfid_end)
+                global_pfid_start = global_pfid_end
+                node2tiednodes[source_ns][2] = ns._param_flow_range
+
+                node2tiednodes[source_ns][0].append(ns)
+                node2tiednodes[source_ns][1] = 1
+            else:
+                ns._param_flow_range = deepcopy(node2tiednodes[source_ns][2])
+
+                node2tiednodes[source_ns][1] += 1
+
+            # Global pid start index for `ns`
+            ns_pid_start = source_ns._param_range[0]
 
         # number of node groups
         ns_num_ngroups = ns.num_node_groups
@@ -223,8 +263,14 @@ def sum_layer_forward_compilation_cpu(nodes, fw_partition_max_chs, n_partition_i
         for i in range(1, ns.num_chs):
             cs_node_cum_nodes[i] = cs_node_cum_nodes[i-1] + ns.chs[i].num_nodes
 
+        if add_params_flag:
+            ns_param_ids = torch.zeros([ns_num_edges], dtype = torch.long).cuda()
+        else:
+            ns_param_ids = None
+
         # Iterate over node groups
         cum_n_chs = 0
+        all_ns_param_ids = dict()
         for ng_id in range(ns_num_ngroups):
             partition_id = (ns_nchs[ng_id] > fw_partition_max_chs).sum()
             local_id = ngid_in_partition[partition_id]
@@ -248,9 +294,24 @@ def sum_layer_forward_compilation_cpu(nodes, fw_partition_max_chs, n_partition_i
             pids[partition_id][local_id, 0:global_pids.size(0)] = global_pids
             cum_n_chs += ns.group_size * criterion.sum()
 
+            if add_params_flag:
+                ns_param_ids[criterion] = global_pids
+
             ngid_in_partition[partition_id] = local_id + 1
 
-    return nids, cids, pids, param_ends
+        all_ns_param_ids[ns_idx] = ns_param_ids
+
+    # Store global -> local parameter id mapping in `ns`
+    for ns_idx, param_ids in all_ns_param_ids.items():
+        ns = nodes[ns_idx]
+        ns._param_ids = param_ids.cpu()[0::ns.ch_group_size] # Every edge specify the start id of [ch_group_size, group_size] parameters
+
+    # Store local -> global parameter id mapping in `ns`
+    for ns_idx in original_param_nids:
+        ns = nodes[ns_idx]
+        ns._inverse_param_ids = torch.argsort(ns._param_ids)
+
+    return nids, cids, pids, global_pid_end, global_pfid_end
 
 
 @njit
@@ -330,7 +391,8 @@ def _assign_target_ncpids_kernel(target_nids_ptr, nids_partition_start_ptr, targ
 
 @torch.no_grad()
 def sum_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, n_id_in_partition, num_ngs_in_partition, n_chs,
-                                  global_nid_start, param_ends, use_cuda: bool = True):
+                                  global_nid_start: int, global_pid_start: int, global_pfid_start: int, node2tiednodes: dict, 
+                                  max_tied_ns_per_parflow_group: int = 4, use_cuda: bool = True):
 
     if use_cuda and not torch.cuda.is_available():
         use_cuda = False
@@ -338,7 +400,8 @@ def sum_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, 
     if not use_cuda:
         return sum_layer_forward_compilation_cpu(
             nodes, fw_partition_max_chs, n_partition_ids, n_id_in_partition, 
-            num_ngs_in_partition, n_chs, global_nid_start, param_ends
+            num_ngs_in_partition, n_chs, global_nid_start, global_pid_start,
+            global_pfid_start, node2tiednodes, max_tied_ns_per_parflow_group
         )
 
     # We construct a flattened version of `nids` where the vectors of every partition is concatenated
@@ -366,27 +429,65 @@ def sum_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, 
     original_param_nids = [] # `ns` with their original parameters (i.e., not tied)
 
     # This is the main loop: iterate over `ns` in the layer
-    global_pid_start = param_ends[-1]
     ngroup_start = 0 # The start index of the node groups in the current `ns`
     for ns_idx, ns in enumerate(nodes):
-        if ns.is_tied():
-            target_ns = ns.get_source_ns()
-        else:
-            target_ns = ns
 
-        # If the parameters have not been instantiated, do it :)
-        if not hasattr(target_ns, "_param_range") or target_ns._param_range is None:
-            global_pid_end = global_pid_start + target_ns.num_edges
-            target_ns._param_range = (global_pid_start, global_pid_end)
-            global_pid_start = global_pid_end
+        if not ns.is_tied():
+            if not ns.provided("_param_range"):
+                global_pid_end = global_pid_start + ns.num_edges
+                ns._param_range = (global_pid_start, global_pid_end)
+                global_pid_start = global_pid_end
 
-            add_params_flag = True
+                global_pfid_end = global_pfid_start + ns.num_edges
+                ns._param_flow_range = (global_pfid_start, global_pfid_end)
+                global_pfid_start = global_pfid_end
+
+                add_params_flag = True
+            else:
+                add_params_flag = False
+
             original_param_nids.append(ns_idx)
+                
+            # Global pid start index for `ns`
+            ns_pid_start = ns._param_range[0]
         else:
-            add_params_flag = False
+            source_ns = ns.get_source_ns()
 
-        # Global pid start index for `ns`
-        ns_pid_start = target_ns._param_range[0]
+            # Initialize parameters
+            if not source_ns.provided("_param_range"):
+                global_pid_end = global_pid_start + ns.num_edges
+                ns._param_range = (global_pid_start, global_pid_end)
+                global_pid_start = global_pid_end
+
+                global_pfid_end = global_pfid_start + ns.num_edges
+                ns._param_flow_range = (global_pfid_start, global_pfid_end)
+                global_pfid_start = global_pfid_end
+
+                add_params_flag = True
+            else:
+                ns._param_range = deepcopy(source_ns._param_range)
+
+                add_params_flag = False
+
+            if source_ns not in node2tiednodes:
+                node2tiednodes[source_ns] = [[source_ns], 1, source_ns._param_flow_range]
+            
+            dup_count = node2tiednodes[source_ns][1]
+            if dup_count >= max_tied_ns_per_parflow_group:
+                global_pfid_end = global_pfid_start + ns.num_edges
+                ns._param_flow_range = (global_pfid_start, global_pfid_end)
+                global_pfid_start = global_pfid_end
+                node2tiednodes[source_ns][2] = ns._param_flow_range
+
+                node2tiednodes[source_ns][0].append(ns)
+                node2tiednodes[source_ns][1] = 1
+            else:
+                ns._param_flow_range = deepcopy(node2tiednodes[source_ns][2])
+
+                node2tiednodes[source_ns][1] += 1
+
+            # Global pid start index for `ns`
+            ns_pid_start = source_ns._param_range[0]
 
         # number of node groups
         ns_num_ngroups = ns.num_node_groups
@@ -462,30 +563,15 @@ def sum_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, 
         if add_params_flag:
             all_ns_param_ids[ns_idx] = ns_param_ids
 
-    # TODO: fix broken
-    # Store local -> global parameter id mapping in `ns`
+    # Store global -> local parameter id mapping in `ns`
     for ns_idx, param_ids in all_ns_param_ids.items():
         ns = nodes[ns_idx]
-        ns._param_ids = param_ids.cpu()
+        ns._param_ids = param_ids.cpu()[0::ns.ch_group_size] # Every edge specify the start id of [ch_group_size, group_size] parameters
 
-    # TODO: fix broken
-    # Store global -> local parameter id mapping in `ns`
+    # Store local -> global parameter id mapping in `ns`
     for ns_idx in original_param_nids:
         ns = nodes[ns_idx]
-        ns._param_range = (ns._param_ids.min().item(), ns._param_ids.max().item() + 1)
         ns._inverse_param_ids = torch.argsort(ns._param_ids)
-
-    # TODO: fix broken
-    # Update `param_ends`
-    npars = param_ends[-1]
-    nid = 0
-    for ns_idx in original_param_nids:
-        ns = nodes[ns_idx]
-        for i in range(ns.num_node_groups):
-            npars += n_chs[nid+i].item()
-            param_ends.append(npars)
-        
-        nid += ns.num_node_groups
 
     # Restore `nids`
     target_nids = target_nids.cpu()
@@ -508,7 +594,7 @@ def sum_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, 
         cids.append(target_cids[sid:eid].reshape(gsize, gnchs).contiguous())
         pids.append(target_pids[sid:eid].reshape(gsize, gnchs).contiguous())
 
-    return nids, cids, pids, param_ends
+    return nids, cids, pids, global_pid_end, global_pfid_end
 
 
 @njit
@@ -589,13 +675,10 @@ def sum_layer_backward_compilation(nodes, cs2parns, n_partition_ids, n_id_in_par
     if use_cuda and not torch.cuda.is_available():
         use_cuda = False
 
-    if not use_cuda:
-        return sum_layer_backward_compilation_cpu(
-            nodes, pids, fw_n_group_ids, fw_n_id_in_group, 
-            num_bk_groups, bk_n_group_ids, bk_n_id_in_group, 
-            bk_group_max_pars, bk_num_ns_in_group,
-            ch_prod_layer_size, global_nid_start, use_cuda = use_cuda
-        )
+    if use_cuda:
+        device = torch.device("cuda:0")
+    else:
+        device = torch.device("cpu")
 
     # We construct a flattened version of `chids` where the vectors of every partition is concatenated
     # into a single vector. `chids_partition_start` is used to indicate the start index of every partition's

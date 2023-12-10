@@ -166,3 +166,6 @@ class CircuitNodes():
 
     def __iter__(self):
         return node_iterator(self)
+
+    def provided(self, var_name):
+        return hasattr(self, var_name) and getattr(self, var_name) is not None
