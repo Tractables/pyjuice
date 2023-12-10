@@ -19,8 +19,9 @@ from .compilation import next_power_of_2, get_prod_layer_stats, prod_layer_forwa
 
 class ProdLayer(Layer, nn.Module):
 
-    def __init__(self, nodes: Sequence[ProdNodes], layer_sparsity_tol: Optional[float] = None,
-                 max_num_partitions: Optional[int] = None, disable_gpu_compilation: bool = False) -> None:
+    def __init__(self, nodes: Sequence[ProdNodes], global_nid_start: Optional[int] = None, 
+                 layer_sparsity_tol: Optional[float] = None, max_num_partitions: Optional[int] = None, 
+                 disable_gpu_compilation: bool = False, force_gpu_compilation: bool = False) -> None:
         Layer.__init__(self, nodes)
         nn.Module.__init__(self)
 
@@ -32,9 +33,12 @@ class ProdLayer(Layer, nn.Module):
         self.nodes = nodes
         self.group_size = nodes[0].group_size
 
+        if global_nid_start is None:
+            global_nid_start = self.group_size
+
         ## Get layer statistics & prepare for compilation ##
 
-        layer_num_ngroups, layer_num_edges, n_chgs = get_prod_layer_stats(self.nodes, self.group_size)
+        layer_num_ngroups, layer_num_edges, n_chgs = get_prod_layer_stats(self.nodes, self.group_size, global_nid_start = global_nid_start)
 
         self.num_nodes = layer_num_ngroups * self.group_size
         self.num_edges = layer_num_edges
@@ -87,7 +91,7 @@ class ProdLayer(Layer, nn.Module):
         # flat_u_cids:        [num_used_ch_ngroups]    child group ids that have at least one parent
         # par_counts:         [num_used_ch_ngroups]    the number of parents for each child node group
         # Note: the dummy node has been removed from `flat_u_cids` and `par_counts`
-        flat_u_cids, par_counts = get_prod_layer_parstats(flat_cids)
+        flat_u_cids, par_counts = get_prod_layer_parstats(flat_cids, global_nid_start = global_nid_start)
 
         # Find a good strategy to partition the child nodes into groups according to their number of parents 
         # to minimize total computation cost
@@ -126,7 +130,7 @@ class ProdLayer(Layer, nn.Module):
         u_cids, parids = prod_layer_backward_compilation(
             flat_u_cids, flat_cids, flat_cid2nid, 
             bk_partition_max_pars, bk_n_partition_ids, bk_n_id_in_partition, bk_num_ns_in_partition,
-            use_cuda = not disable_gpu_compilation and (flat_cids.size(0) > 4000)
+            use_cuda = force_gpu_compilation or (not disable_gpu_compilation and (flat_cids.size(0) > 4000))
         )
 
         # Store buffers for the backward pass
