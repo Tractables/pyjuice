@@ -49,7 +49,7 @@ def prod_layer_compilation_test():
 
 def sum_layer_compilation_test():
 
-    for group_size in [8, 16]:
+    for group_size in [1, 8, 16]:
     
         with juice.set_group_size(group_size):
 
@@ -69,22 +69,48 @@ def sum_layer_compilation_test():
 
             ns0 = summate(np0, edge_ids = torch.tensor([[0, 0, 0, 1, 1, 1, 2, 2, 2], [0, 2, 4, 2, 1, 5, 6, 2, 1]]))
             ns1 = summate(np0, np6, edge_ids = torch.tensor([[0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 4, 5], [0, 2, 4, 2, 1, 5, 6, 2, 1, 10, 3, 8, 9]]))
+            ns2 = summate(np5, edge_ids = torch.tensor([[0, 0, 1, 1, 2, 3], [6, 4, 2, 1, 3, 5]]))
 
         input_layer = InputLayer([ni0, ni1, ni2, ni3, ni4], cum_nodes = group_size)
         prod_layer = ProdLayer([np0, np1, np2, np3, np4, np5, np6], layer_sparsity_tol = 0.1, force_gpu_compilation = True)
 
-        sum_layer_cpu = SumLayer([ns0, ns1], global_nid_start = input_layer.num_nodes + group_size, 
-                                 param_ends = [1], layer_sparsity_tol = 0.1, disable_gpu_compilation = True)
-        sum_layer_gpu = SumLayer([ns0, ns1], global_nid_start = input_layer.num_nodes + group_size, 
-                                 param_ends = [1], layer_sparsity_tol = 0.1, force_gpu_compilation = True)
+        sum_layer_cpu = SumLayer([ns0, ns1, ns2], global_nid_start = input_layer.num_nodes + group_size, 
+                                 global_pid_start = 1, global_pfid_start = 0, node2tiednodes = dict(), 
+                                 layer_sparsity_tol = 0.1, disable_gpu_compilation = True)
+        sum_layer_gpu = SumLayer([ns0, ns1, ns2], global_nid_start = input_layer.num_nodes + group_size, 
+                                 global_pid_start = 1, global_pfid_start = 0, node2tiednodes = dict(), 
+                                 layer_sparsity_tol = 0.1, force_gpu_compilation = True)
 
-        for i in range(3):
+        # import pdb; pdb.set_trace()
+
+        for i in range(len(sum_layer_cpu.partitioned_nids)):
             assert torch.all(sum_layer_cpu.partitioned_nids[i] == sum_layer_gpu.partitioned_nids[i])
             assert torch.all(sum_layer_cpu.partitioned_cids[i] == sum_layer_gpu.partitioned_cids[i])
             assert torch.all(sum_layer_cpu.partitioned_pids[i] == sum_layer_gpu.partitioned_pids[i])
 
-        import pdb; pdb.set_trace()
-        
+        for i in range(len(sum_layer_cpu.partitioned_chids)):
+            assert torch.all(sum_layer_cpu.partitioned_chids[i] == sum_layer_gpu.partitioned_chids[i])
+            assert torch.all(sum_layer_cpu.partitioned_parids[i] == sum_layer_gpu.partitioned_parids[i])
+            assert torch.all(sum_layer_cpu.partitioned_parpids[i] == sum_layer_gpu.partitioned_parpids[i])
+
+        ncpids = set()
+        for i in range(len(sum_layer_cpu.partitioned_nids)):
+            for j in range(sum_layer_gpu.partitioned_cids[i].size(0)):
+                nid = sum_layer_gpu.partitioned_nids[i][j].item()
+                for k in range(sum_layer_gpu.partitioned_cids[i].size(1)):
+                    cid = sum_layer_gpu.partitioned_cids[i][j,k].item()
+                    pid = sum_layer_gpu.partitioned_pids[i][j,k].item()
+                    if cid != 0:
+                        ncpids.add((nid, cid, pid))
+
+        for i in range(len(sum_layer_cpu.partitioned_chids)):
+            for j in range(sum_layer_gpu.partitioned_parids[i].size(0)):
+                chid = sum_layer_gpu.partitioned_chids[i][j].item()
+                for k in range(sum_layer_gpu.partitioned_parids[i].size(1)):
+                    parid = sum_layer_gpu.partitioned_parids[i][j,k].item()
+                    pid = sum_layer_gpu.partitioned_parpids[i][j,k].item()
+                    if parid != 0:
+                        assert (parid, chid, pid) in ncpids, f"({parid}, {chid}, {pid})"
 
 
 if __name__ == "__main__":

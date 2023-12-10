@@ -68,7 +68,7 @@ class SumLayer(Layer, nn.Module):
         fw_n_id_in_partition = torch.zeros([layer_num_ngroups], dtype = torch.long)
         fw_num_ngs_in_partition = torch.zeros([self.num_fw_partitions], dtype = torch.long)
 
-        min_n_chs = 0
+        min_n_chs = 1
         for partition_id, max_n_chs in enumerate(fw_partition_max_chs):
             criterion = (n_chs >= min_n_chs) & (n_chs <= max_n_chs)
             partition_size = criterion.sum().item()
@@ -84,9 +84,9 @@ class SumLayer(Layer, nn.Module):
         # nids:      List[[partition_size]]                      stores node group ids
         # cids:      List[[partition_size, partition_max_n_chs]] stores indices of child node groups
         # pids:      List[[partition_size, partition_max_n_chs]] stores indices of edge parameters (1st parameter of every group)
-        nids, cids, pids, param_ends, layer_pid_end, layer_pfid_end = sum_layer_forward_compilation(
+        nids, cids, pids, layer_pid_end, layer_pfid_end = sum_layer_forward_compilation(
             self.nodes, fw_partition_max_chs, fw_n_partition_ids, fw_n_id_in_partition, 
-            fw_num_ngs_in_partition, n_chs, global_nid_start, global_pid_end, global_pfid_start, node2tiednodes,
+            fw_num_ngs_in_partition, n_chs, global_nid_start, global_pid_start, global_pfid_start, node2tiednodes,
             # GPU compilation is slightly slower for small layer due to the kernel jit compilation time
             use_cuda = force_gpu_compilation or (not disable_gpu_compilation and (self.num_edges > 1000))
         )
@@ -139,7 +139,7 @@ class SumLayer(Layer, nn.Module):
             bk_n_id_in_partition = torch.zeros([num_ngroups], dtype = torch.long)
             bk_num_ngs_in_partition = torch.zeros([num_bk_partitions], dtype = torch.long)
 
-            min_n_pars = 0
+            min_n_pars = 1
             for partition_id, max_n_pars in enumerate(bk_partition_max_pars):
                 criterion = (n_pargs >= min_n_pars) & (n_pargs <= max_n_pars)
                 partition_size = criterion.sum().item()
@@ -161,7 +161,7 @@ class SumLayer(Layer, nn.Module):
                 num_ngs_in_partition = bk_num_ngs_in_partition,
                 partition_max_pars = bk_partition_max_pars,
                 # GPU compilation is slightly slower for small layer due to the kernel jit compilation time
-                use_cuda = not disable_gpu_compilation and (self.num_edges > 1000)
+                use_cuda = force_gpu_compilation or (not disable_gpu_compilation and (self.num_edges > 1000))
             )
 
             chids.extend(curr_chids)
