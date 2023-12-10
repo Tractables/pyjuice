@@ -41,9 +41,7 @@ def sum_layer_test():
     prod_layer = ProdLayer([np0, np1, np2])
 
     layer = SumLayer([ns0, ns1, ns2], global_nid_start = group_size,
-                     param_ends = [1], tied_param_ids = [],
-                     tied_param_group_ids = [], tied_param_ends = [],
-                     ch_prod_layer_size = prod_layer.num_nodes + group_size)
+                     global_pid_start = 1, global_pfid_start = 0, node2tiednodes = dict(), )
 
     assert torch.all(layer.partitioned_nids[0] == torch.arange(group_size, 7 * group_size, group_size))
     assert torch.all(layer.partitioned_cids[0][0:2,0] == group_size)
@@ -172,9 +170,7 @@ def speed_test():
     prod_layer = ProdLayer(nps, layer_sparsity_tol = 0.1)
 
     layer = SumLayer(nodes, global_nid_start = group_size,
-                         param_ends = [1], tied_param_ids = [],
-                         tied_param_group_ids = [], tied_param_ends = [],
-                         ch_prod_layer_size = prod_layer.num_nodes + group_size)
+                     global_pid_start = 1, global_pfid_start = 0, node2tiednodes = dict(), )
 
     layer.to(device)
 
@@ -215,8 +211,6 @@ def speed_test():
     print(f"Backward pass on average takes {backward_ms:.3f}ms.")
     print("Reference computation time on RTX 4090: 1.200ms.")
     print("--------------------------------------------------------------")
-
-    import pdb; pdb.set_trace()
 
 
 if __name__ == "__main__":

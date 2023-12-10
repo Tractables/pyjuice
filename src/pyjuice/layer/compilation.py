@@ -433,7 +433,7 @@ def sum_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, 
 
             _assign_target_ncpids_kernel[grid](
                 target_nids, nids_partition_start, target_cids, pcids_partition_start,
-                target_pids, target_pfids_ptr, edge_ids, chs_offsets, n_partition_ids, 
+                target_pids, target_pfids, edge_ids, chs_offsets, n_partition_ids, 
                 n_id_in_partition, cs_ele_id_start, cs_node_cum_ids, fw_partition_max_chs, 
                 cum_n_chs, ns_param_ids, constexprs, ns.num_chs, num_chs_np2, 
                 add_params_flag, BLOCK_SIZE = min(2048, 2**20 // num_chs_np2)
@@ -894,10 +894,11 @@ def get_prod_layer_parstats(flat_cids: torch.Tensor, global_nid_start: int):
 
     u_cids, par_counts = torch.unique(flat_cids, sorted = True, return_counts = True)
 
-    c_sid = torch.arange(0, u_cids.size(0))[u_cids == global_nid_start].min()
+    c_sids = torch.arange(0, u_cids.size(0))[u_cids == global_nid_start]
 
-    if c_sid > 0:
+    if c_sids.numel() > 0:
         # Strip away dummy nodes
+        c_sid = c_sids.min() + 1
         u_cids = u_cids[c_sid:]
         par_counts = par_counts[c_sid:]
 

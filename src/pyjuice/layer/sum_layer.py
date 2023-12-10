@@ -213,7 +213,7 @@ class SumLayer(Layer, nn.Module):
             for partition_id in range(self.num_fw_partitions):
                 nids = self.partitioned_nids[partition_id]
                 cids = self.partitioned_cids[partition_id]
-                pfids = self.partitioned_pfids[partition_id]
+                pids = self.partitioned_pids[partition_id]
 
                 self._forward(
                     node_mars, element_mars, params, nids, cids, pids, partition_id = partition_id
