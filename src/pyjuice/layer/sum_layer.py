@@ -95,8 +95,6 @@ class SumLayer(Layer, nn.Module):
         # Store pre-compiled indices from `cids` and `pids` in the following buffer
         self._cached_fw_pcids = dict()
 
-        return None # debug
-
         ## Initialize backward pass ##
 
         # A sum layer could have children of different group sizes

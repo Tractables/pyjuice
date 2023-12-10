@@ -330,13 +330,12 @@ def _assign_target_ncpids_kernel(target_nids_ptr, nids_partition_start_ptr, targ
 
 @torch.no_grad()
 def sum_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, n_id_in_partition, num_ngs_in_partition, n_chs,
-                                  global_nid_start, param_ends, use_cuda: bool = True, legacy: bool = False):
+                                  global_nid_start, param_ends, use_cuda: bool = True):
 
     if use_cuda and not torch.cuda.is_available():
         use_cuda = False
 
-    # Also use the legacy code if we compile with CPU
-    if not use_cuda or legacy:
+    if not use_cuda:
         return sum_layer_forward_compilation_cpu(
             nodes, fw_partition_max_chs, n_partition_ids, n_id_in_partition, 
             num_ngs_in_partition, n_chs, global_nid_start, param_ends
@@ -512,127 +511,6 @@ def sum_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, 
     return nids, cids, pids, param_ends
 
 
-@torch.no_grad()
-def sum_layer_backward_compilation_legacy(nodes, pids, fw_n_group_ids, fw_n_id_in_group, 
-                                          num_bk_groups, bk_n_group_ids, bk_n_id_in_group, 
-                                          bk_group_max_pars, bk_num_ns_in_group,
-                                          ch_prod_layer_size, global_nid_start, use_cuda: bool = False):
-
-    if use_cuda and not torch.cuda.is_available():
-        use_cuda = False
-
-    # Since we will be iterating over parent nodes, we want to create a flattened scratch space for the 
-    # buffers. In the following, `flat_parids` and `flat_parpids` are the flattened version of 
-    # `parids` and `parpids`, respectively. Also, we create `ch2flatidx` which points to the start 
-    # location of the scratch space (`flat_parids` and `flat_parpids``) for every child node.
-    group2flatidx = torch.zeros([num_bk_groups], dtype = torch.long)
-    flatidx = 0
-    for group_id in range(num_bk_groups):
-        group_size = bk_num_ns_in_group[group_id]
-        max_n_par = bk_group_max_pars[group_id]
-
-        group2flatidx[group_id] = flatidx
-
-        flatidx += group_size * max_n_par
-    num_slots = flatidx
-
-    # parids:  indices of parent nodes for each child node
-    # parpids: parameter indices for these edges
-    flat_parids = torch.zeros([num_slots], dtype = torch.long)
-    flat_parpids = torch.zeros([num_slots], dtype = torch.long)
-
-    # The indexing vector pointing to the start position in the scratch space
-    ch2flatidx = group2flatidx[bk_n_group_ids] + bk_n_id_in_group * bk_group_max_pars[bk_n_group_ids]
-
-    # This vector maintains the count of parents that have been processed for every child node
-    par_counts = torch.zeros([ch_prod_layer_size], dtype = torch.long)
-
-    if use_cuda:
-        # Move buffers to GPU
-        flat_parids = flat_parids.cuda()
-        flat_parpids = flat_parpids.cuda()
-        ch2flatidx = ch2flatidx.cuda()
-        par_counts = par_counts.cuda()
-
-        fw_n_group_ids = fw_n_group_ids.cuda()
-        fw_n_id_in_group = fw_n_id_in_group.cuda()
-
-    node_start = 0
-    for ns in nodes:
-        node_end = node_start + ns.num_nodes
-        if use_cuda:
-            edge_ids = ns.edge_ids.cuda()
-        else:
-            edge_ids = ns.edge_ids
-
-        # Pre-compute cid flags for future reuse
-        cid_starts = torch.zeros([ns.num_chs], dtype = torch.long)
-        cid_ends = torch.zeros([ns.num_chs], dtype = torch.long)
-        cid_start = 0
-        for cnode_id, cs in enumerate(ns.chs):
-            cid_end = cid_start + cs.num_nodes
-            cid_starts[cnode_id] = cid_start
-            cid_ends[cnode_id] = cid_end
-            cid_start = cid_end
-        
-        if use_cuda:
-            cid_starts = cid_starts.cuda()
-            cid_ends = cid_ends.cuda()
-
-        # Shape: [ns.num_chs, num_edges]
-        cs_criterion = (edge_ids[1,:].unsqueeze(0) >= cid_starts[:,None]) & \
-                       (edge_ids[1,:].unsqueeze(0) < cid_ends[:,None])
-
-        for nid in range(ns.num_nodes):
-            # `group_id`: which group the current node belongs to
-            # `local_id`: the index of the node within the current group
-            group_id = fw_n_group_ids[node_start + nid]
-            local_id = fw_n_id_in_group[node_start + nid]
-            curr_pids = pids[group_id][local_id,:]
-            if use_cuda:
-                curr_pids = curr_pids.cuda()
-
-            ns_criterion = (edge_ids[0,:] == nid)
-
-            cid_start = 0
-            pid_start = 0
-            for cnode_id, cs in enumerate(ns.chs):
-                cid_end = cid_start + cs.num_nodes
-                criterion = cs_criterion[cnode_id,:] & ns_criterion
-                pid_end = pid_start + criterion.sum().item()
-
-                ch_ids = edge_ids[1,criterion] + (cs._output_ind_range[0] - cid_start)
-                flat_cids = ch2flatidx[ch_ids] + par_counts[ch_ids] # start position specified by `ch2flatidx` + offset specified by `par_counts`
-                flat_parids[flat_cids] = global_nid_start + node_start + nid
-                flat_parpids[flat_cids] = curr_pids[pid_start:pid_end]
-
-                par_counts[ch_ids] += 1
-                cid_start = cid_end
-                pid_start = pid_end
-
-        node_start = node_end
-
-    if use_cuda:
-        flat_parids = flat_parids.cpu()
-        flat_parpids = flat_parpids.cpu()
-
-    # Restore the original `parids` and `parpids`
-    parids = []
-    parpids = []
-    flatid_start = 0
-    for group_id in range(num_bk_groups):
-        group_size = bk_num_ns_in_group[group_id]
-        max_n_par = bk_group_max_pars[group_id]
-        flatid_end = flatid_start + group_size * max_n_par
-
-        parids.append(flat_parids[flatid_start:flatid_end].reshape(group_size, max_n_par).contiguous())
-        parpids.append(flat_parpids[flatid_start:flatid_end].reshape(group_size, max_n_par).contiguous())
-
-        flatid_start = flatid_end
-
-    return parids, parpids
-
-
 @njit
 def _assign_chid_kernel(chs_offsets, ns_nchs, edge_ids):
     for i in range(edge_ids.shape[1]):
@@ -640,39 +518,6 @@ def _assign_chid_kernel(chs_offsets, ns_nchs, edge_ids):
         idx = ns_nchs[nid]
         chs_offsets[i] = idx
         ns_nchs[nid] = idx + 1
-
-
-@triton.jit
-def _assign_global_eleids_kernel(global_ele_ids_ptr, cs_ele_id_start_ptr, cs_node_cum_ids_ptr, edge_ids_ptr, 
-                                 constexprs_ptr, num_chs: tl.constexpr, num_chs_np2: tl.constexpr, BLOCK_SIZE: tl.constexpr):
-
-    pid = tl.program_id(axis = 0)
-    block_start = pid * BLOCK_SIZE
-
-    # Retrieve all constexprs
-    num_edges = tl.load(constexprs_ptr)
-
-    # Get edge indices to be processed by the current block
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < num_edges
-
-    # Get `cid`
-    cid = tl.load(edge_ids_ptr + offsets + num_edges, mask = mask, other = 0)
-
-    # Get the child ns index every `cid` belongs to and the cum nodes & global sid
-    cs_offsets = tl.arange(0, num_chs_np2)
-    cs_node_cum_ids = tl.load(cs_node_cum_ids_ptr + cs_offsets, mask = (cs_offsets < num_chs), other = 0)
-    
-    cid_node_id = tl.sum(tl.broadcast_to(cid[:,None], (BLOCK_SIZE, num_chs_np2)) >= \
-        tl.broadcast_to(cs_node_cum_ids[None,:], (BLOCK_SIZE, num_chs_np2)), axis = 1) - \
-        (1 + num_chs_np2 - num_chs)
-
-    cs_cum_num = tl.load(cs_node_cum_ids_ptr + cid_node_id, mask = mask, other = 0)
-    cs_ele_ind = tl.load(cs_ele_id_start_ptr + cid_node_id, mask = mask, other = 0)
-
-    # Compute global cids and store them
-    global_cid = cid + cs_ele_ind - cs_cum_num
-    tl.store(global_ele_ids_ptr + offsets, global_cid, mask = mask)
 
 
 @njit
@@ -739,16 +584,13 @@ def _assign_target_chpapids_kernel(target_chids_ptr, chids_partition_start_ptr, 
 
 @torch.no_grad()
 def sum_layer_backward_compilation(nodes, cs2parns, n_partition_ids, n_id_in_partition, num_ngs_in_partition, partition_max_pars,
-                                   use_cuda: bool = False, legacy: bool = False):
+                                   use_cuda: bool = False):
 
     if use_cuda and not torch.cuda.is_available():
         use_cuda = False
 
-    # Also use the legacy code if we compile with CPU
-    if not use_cuda or legacy:
-        # TODO: restore CPU compilation
-        raise ValueError()
-        return sum_layer_backward_compilation_legacy(
+    if not use_cuda:
+        return sum_layer_backward_compilation_cpu(
             nodes, pids, fw_n_group_ids, fw_n_id_in_group, 
             num_bk_groups, bk_n_group_ids, bk_n_id_in_group, 
             bk_group_max_pars, bk_num_ns_in_group,
