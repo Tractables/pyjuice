@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import numpy as np
 import torch
 import torch.nn as nn
 import triton
@@ -10,7 +11,7 @@ from pyjuice.nodes import CircuitNodes
 
 
 @njit
-def _record_par_blks(par_start_ids, pflow_start_ids, blk_sizes, blk_intervals, global_nids, 
+def _record_par_blks(par_start_ids, pflow_start_ids, blk_sizes, blk_intervals, global_nids, nchs,
                      num_edges_per_ng, ns_num_node_groups, ns_group_size, cs_group_size, pid, 
                      global_nid, par_start, pflow_start, BLOCK_SIZE):
     for local_ngid in range(ns_num_node_groups):
@@ -31,6 +32,7 @@ def _record_par_blks(par_start_ids, pflow_start_ids, blk_sizes, blk_intervals, g
                 blk_sizes[pid] = blk_size
                 blk_intervals[pid] = ns_group_size
                 global_nids[pid] = global_nid + gid
+                nchs[pid] = num_edges * cs_group_size
 
                 pid += 1
 
@@ -49,6 +51,7 @@ def compile_par_update_fn(root_ns: CircuitNodes, BLOCK_SIZE: int = 32, buffer_in
     blk_sizes = np.zeros([buffer_inc_interval], dtype = np.int64)
     blk_intervals = np.zeros([buffer_inc_interval], dtype = np.int64)
     global_nids = np.zeros([buffer_inc_interval], dtype = np.int64)
+    nchs = np.zeros([buffer_inc_interval], dtype = np.int64)
     pid = 0
 
     global_nid = 0
@@ -63,7 +66,7 @@ def compile_par_update_fn(root_ns: CircuitNodes, BLOCK_SIZE: int = 32, buffer_in
         num_edges_per_ng = torch.bincount(ns.edge_ids[0,:], minlength = ns.num_node_groups).contiguous().numpy()
 
         # Enlarge the buffer if needed
-        est_num_slots = triton.cdiv(ns.edges.size(1) * ns.group_size * ns.ch_group_size, BLOCK_SIZE) + ns.num_nodes
+        est_num_slots = triton.cdiv(ns.edge_ids.size(1) * ns.group_size * ns.ch_group_size, BLOCK_SIZE) + ns.num_nodes
         if pid + est_num_slots > par_start_ids.shape[0]:
             curr_size = par_start_ids.shape[0]
             inc_shape = triton.cdiv(pid + est_num_slots - curr_size, buffer_inc_interval) * buffer_inc_interval
@@ -73,6 +76,7 @@ def compile_par_update_fn(root_ns: CircuitNodes, BLOCK_SIZE: int = 32, buffer_in
             blk_sizes = np.ascontiguousarray(blk_sizes.resize(curr_size + inc_shape))
             blk_intervals = np.ascontiguousarray(blk_intervals.resize(curr_size + inc_shape))
             global_nids = np.ascontiguousarray(global_nids.resize(curr_size + inc_shape))
+            nchs = np.ascontiguousarray(nchs.resize(curr_size + inc_shape))
 
         if use_numba:
 
@@ -81,7 +85,7 @@ def compile_par_update_fn(root_ns: CircuitNodes, BLOCK_SIZE: int = 32, buffer_in
             cs_group_size = ns.ch_group_size
 
             global_nid, pid = _record_par_blks(
-                par_start_ids, pflow_start_ids, blk_sizes, blk_intervals, global_nids, 
+                par_start_ids, pflow_start_ids, blk_sizes, blk_intervals, global_nids, nchs,
                 num_edges_per_ng, ns_num_node_groups, ns_group_size, cs_group_size, pid, 
                 global_nid, par_start, pflow_start, BLOCK_SIZE
             )
@@ -106,6 +110,7 @@ def compile_par_update_fn(root_ns: CircuitNodes, BLOCK_SIZE: int = 32, buffer_in
                     blk_sizes[pid:pid+ns.group_size] = blk_size
                     blk_intervals[pid:pid+ns.group_size] = ns.group_size
                     global_nids[pid:pid+ns.group_size] = curr_global_nids
+                    nchs[pid:pid+ns.group_size] = num_edges * ns.ch_group_size
 
                     pid += ns.group_size
 
@@ -116,12 +121,29 @@ def compile_par_update_fn(root_ns: CircuitNodes, BLOCK_SIZE: int = 32, buffer_in
     blk_sizes = torch.from_numpy(blk_sizes[:pid]).contiguous()
     blk_intervals = torch.from_numpy(blk_intervals[:pid]).contiguous()
     global_nids = torch.from_numpy(global_nids[:pid]).contiguous()
+    nchs = torch.from_numpy(nchs[:pid]).contiguous()
 
     cum_pflows = torch.zeros([global_nids[-1] + 1], dtype = torch.float32)
     
     metadata = {"tot_num_nodes": global_nids[-1] + 1, "BLOCK_SIZE": BLOCK_SIZE}
 
-    return par_start_ids, pflow_start_ids, blk_sizes, blk_intervals, global_nids, cum_pflows, metadata
+    return [par_start_ids, pflow_start_ids, blk_sizes, blk_intervals, global_nids, nchs, cum_pflows, metadata]
+
+
+def par_update_to_device(par_update_kwargs, device):
+
+    par_start_ids, pflow_start_ids, blk_sizes, blk_intervals, global_nids, nchs, cum_pflows, metadata = par_update_kwargs
+
+    return [
+        par_start_ids.to(device),
+        pflow_start_ids.to(device),
+        blk_sizes.to(device),
+        blk_intervals.to(device),
+        global_nids.to(device),
+        nchs.to(device),
+        cum_pflows.to(device),
+        metadata
+    ]
 
 
 @triton.jit
@@ -148,6 +170,7 @@ def cum_pflow_kernel(cum_pflows, param_flows, pflow_start_ids, blk_sizes, blk_in
     tl.atomic_add(cum_pflows + global_nid, nflows, mask = mask_m)
 
 
+@triton.jit
 def par_update_kernel(params, param_flows, cum_pflows, nchs, par_start_ids, pflow_start_ids, blk_sizes, blk_intervals,
                       global_nids, constexprs, num_blocks, BLOCK_ID: tl.constexpr, BLOCK_SIZE: tl.constexpr):
 
@@ -185,7 +208,7 @@ def par_update_kernel(params, param_flows, cum_pflows, nchs, par_start_ids, pflo
 
 
 def em_par_update(params, param_flows, par_start_ids, pflow_start_ids, blk_sizes, blk_intervals, 
-                  global_nids, metadata, step_size: float, pseudocount: float = 0.0, cum_pflows = None):
+                  global_nids, nchs, metadata, step_size: float, pseudocount: float = 0.0, cum_pflows = None):
 
     tot_num_nodes = metadata["tot_num_nodes"]
     BLOCK_SIZE = metadata["BLOCK_SIZE"]
@@ -208,6 +231,6 @@ def em_par_update(params, param_flows, par_start_ids, pflow_start_ids, blk_sizes
     constexprs = torch.tensor([step_size, pseudocount]).to(params.device)
 
     par_update_kernel[grid](
-        params, param_flows, cum_pflows, par_start_ids, pflow_start_ids, blk_sizes, blk_intervals,
+        params, param_flows, cum_pflows, nchs, par_start_ids, pflow_start_ids, blk_sizes, blk_intervals,
         global_nids, constexprs, num_blocks, BLOCK_ID, BLOCK_SIZE
     )

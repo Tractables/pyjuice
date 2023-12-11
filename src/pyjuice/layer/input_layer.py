@@ -88,7 +88,7 @@ class InputLayer(Layer, nn.Module):
                     node2tiednodes[source_ns][1] += 1
 
         self._output_ind_range = (cum_nodes - layer_num_nodes, cum_nodes)
-        self.num_params = cum_params
+        self.num_parameters = cum_params
         self.num_param_flows = cum_param_flows
         self.num_nodes = layer_num_nodes
         self.dist_signature = dist_signature
@@ -114,7 +114,7 @@ class InputLayer(Layer, nn.Module):
         source_nids = torch.empty([cum_source_ns], dtype = torch.long)
 
         # Parameters of this layer
-        params = torch.empty([self.num_params], dtype = torch.float32)
+        params = torch.empty([self.num_parameters], dtype = torch.float32)
         
         n_start = 0
         source_n_start = 0
@@ -442,7 +442,7 @@ class InputLayer(Layer, nn.Module):
                     raise NotImplementedError("CPU minibatch em fn for input nodes is not implemented.")
 
     def get_param_specs(self):
-        return {"params": torch.Size([self.num_params])}
+        return {"params": torch.Size([self.num_parameters])}
 
     def enable_partial_evaluation(self, fw_scopes: Optional[Union[Sequence[BitSet],Sequence[int]]] = None, 
                                   bk_scopes: Optional[Union[Sequence[BitSet],Sequence[int]]] = None, return_ids: bool = False):

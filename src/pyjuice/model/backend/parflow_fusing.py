@@ -8,7 +8,7 @@ import triton.language as tl
 
 def compile_cum_par_flows_fn(node2tiednodes, MAX_NGROUPS = 2048, BLOCK_SIZE = 2048):
 
-    ngroup2kernel_specs = []
+    ngroup2kernel_specs = dict()
     for source_ns, item in node2tiednodes.items():
         if len(item[0]) > 1: # If the length is 1, then everything is already accumulated in the source node's parflow
             num_par_flows = source_ns._param_flow_range[1] - source_ns._param_flow_range[0]
@@ -56,6 +56,21 @@ def compile_cum_par_flows_fn(node2tiednodes, MAX_NGROUPS = 2048, BLOCK_SIZE = 20
         ch_pfids = torch.tensor(ch_pfids).contiguous()
 
         kernels_args.append([target_pfids, block_sizes, ch_pfids, BLOCK_G, BLOCK_M])
+
+    return kernels_args
+
+
+def cum_par_flows_to_device(kernels_args, device):
+    for i in range(len(kernels_args)):
+        target_pfids, block_sizes, ch_pfids, BLOCK_G, BLOCK_M = kernels_args[i]
+
+        kernels_args[i] = [
+            target_pfids.to(device),
+            block_sizes.to(device),
+            ch_pfids.to(device),
+            BLOCK_G,
+            BLOCK_M
+        ]
 
     return kernels_args
 

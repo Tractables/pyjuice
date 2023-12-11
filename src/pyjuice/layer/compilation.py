@@ -894,11 +894,11 @@ def get_prod_layer_parstats(flat_cids: torch.Tensor, global_nid_start: int):
 
     u_cids, par_counts = torch.unique(flat_cids, sorted = True, return_counts = True)
 
-    c_sids = torch.arange(0, u_cids.size(0))[u_cids == global_nid_start]
+    c_sids = torch.arange(0, u_cids.size(0))[u_cids < global_nid_start]
 
     if c_sids.numel() > 0:
         # Strip away dummy nodes
-        c_sid = c_sids.min() + 1
+        c_sid = c_sids.max() + 1
         u_cids = u_cids[c_sid:]
         par_counts = par_counts[c_sid:]
 

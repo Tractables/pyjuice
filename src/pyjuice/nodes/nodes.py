@@ -148,21 +148,24 @@ class CircuitNodes():
             return hasattr(source_ns, "_params") and source_ns._params is not None
 
     def _clear_tensor_circuit_hooks(self, recursive: bool = True):
+
+        def clear_hooks(ns):
+            if hasattr(ns, "_param_range"):
+                ns._param_range = None
+            if hasattr(ns, "_param_ids"):
+                ns._param_ids = None
+            if hasattr(ns, "_inverse_param_ids"):
+                ns._inverse_param_ids = None
+            if hasattr(ns, "_param_flow_range"):
+                ns._param_flow_range = None
+            if hasattr(ns, "_output_ind_range"):
+                ns._output_ind_range = None
+
         if recursive:
             for ns in self:
-                if hasattr(ns, "_param_range"):
-                    ns._param_range = None
-                if hasattr(ns, "_param_ids"):
-                    ns._param_ids = None
-                if hasattr(ns, "_inverse_param_ids"):
-                    ns._inverse_param_ids = None
+                clear_hooks(ns)
         else:
-            if hasattr(self, "_param_range"):
-                self._param_range = None
-            if hasattr(self, "_param_ids"):
-                self._param_ids = None
-            if hasattr(self, "_inverse_param_ids"):
-                self._inverse_param_ids = None
+            clear_hooks(self)
 
     def __iter__(self):
         return node_iterator(self)

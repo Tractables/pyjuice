@@ -7,7 +7,7 @@ from copy import deepcopy
 from functools import reduce
 
 from pyjuice.graph import InnerRegionNode
-from pyjuice.functional import normalize_parameters
+from .backend import normalize_ns_parameters
 from .nodes import CircuitNodes
 from .prod_nodes import ProdNodes
 
@@ -106,8 +106,8 @@ class SumNodes(CircuitNodes):
             raise ValueError("Unsupported parameter input.")
 
         if normalize:
-            normalize_parameters(self._params, self.edge_ids[0,:], group_size = self.group_size, 
-                                 ch_group_size = self.ch_group_size, pseudocount = pseudocount)
+            normalize_ns_parameters(self._params, self.edge_ids[0,:], group_size = self.group_size, 
+                                    ch_group_size = self.ch_group_size, pseudocount = pseudocount)
 
     def set_edges(self, edge_ids: Union[Tensor,Sequence[Tensor]]):
         self._construct_edges(edge_ids)
@@ -118,8 +118,8 @@ class SumNodes(CircuitNodes):
         if self._source_node is None:
             self._params = torch.exp(torch.rand([self.edge_ids.size(1), self.group_size, self.ch_group_size]) * -perturbation)
 
-            normalize_parameters(self._params, self.edge_ids[0,:], group_size = self.group_size, 
-                                 ch_group_size = self.ch_group_size, pseudocount = 0.0)
+            normalize_ns_parameters(self._params, self.edge_ids[0,:], group_size = self.group_size, 
+                                    ch_group_size = self.ch_group_size, pseudocount = 0.0)
 
         super(SumNodes, self).init_parameters(
             perturbation = perturbation, 

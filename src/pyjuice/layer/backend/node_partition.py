@@ -197,8 +197,7 @@ def partition_nodes_by_n_edges(node_n_edges: Union[np.ndarray, torch.Tensor],
     if isinstance(node_n_edges, torch.Tensor):
         node_n_edges = node_n_edges.detach().cpu().numpy()
 
-    max_num_edges = node_n_edges.max()
-    target_overhead = None if sparsity_tolerance is None else int(math.ceil(node_n_edges.shape[0] * max_num_edges * sparsity_tolerance))
+    target_overhead = None if sparsity_tolerance is None else int(math.ceil(node_n_edges.sum() * (1.0 + sparsity_tolerance)))
 
     if max_num_partitions == 1:
         partitions = np.zeros([1], dtype = np.int64)

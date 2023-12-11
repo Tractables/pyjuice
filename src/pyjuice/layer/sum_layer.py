@@ -192,6 +192,10 @@ class SumLayer(Layer, nn.Module):
             new_v = [tensor.to(device) for tensor in v]
             self._cached_fw_compiled_pcids[k] = new_v
 
+    @property
+    def num_parameters(self):
+        return self._layer_pid_range[1] - self._layer_pid_range[0]
+
     def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor) -> None:
         """
         Computes the forward pass of a sum layer:

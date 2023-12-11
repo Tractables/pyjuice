@@ -64,8 +64,8 @@ def _norm_params_kernel(params_ptr, cum_params_ptr, node_ids_ptr, node_nchs_ptr,
     tl.store(params_ptr + p_offsets, normed_params, mask = mask)
 
 
-def normalize_parameters(params: torch.Tensor, node_ids: torch.Tensor, group_size: int, ch_group_size: int, 
-                         node_nchs: Optional[torch.Tensor] = None, pseudocount: float = 0.0):
+def normalize_ns_parameters(params: torch.Tensor, node_ids: torch.Tensor, group_size: int, ch_group_size: int, 
+                            node_nchs: Optional[torch.Tensor] = None, pseudocount: float = 0.0):
 
     assert 3 <= params.dim() <= 4 and params.size(1) == group_size and params.size(2) == ch_group_size
 
