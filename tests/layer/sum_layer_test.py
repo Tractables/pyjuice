@@ -202,7 +202,7 @@ def speed_test():
 
     t0 = time.time()
     torch.cuda.synchronize()
-    for _ in range(100):
+    for _ in range(10000000000000000):
         layer.backward(node_flows, element_flows, node_mars, element_mars, params, param_flows)
     torch.cuda.synchronize()
     t1 = time.time()

@@ -125,6 +125,18 @@ def simple_model_test():
     assert torch.all(sum_layer0.partitioned_parpids[0][6,:] == torch.tensor([3088, 3600]))
     assert torch.all(sum_layer0.partitioned_parpids[0][7,:] == torch.tensor([3344, 3856]))
 
+    assert torch.all(torch.abs(ns0._params.reshape(2, 4, 16, 16).sum(dim = 3).sum(dim = 1) - 1.0) < 1e-4)
+    assert torch.all(torch.abs(ns1._params.reshape(2, 2, 16, 16).sum(dim = 3).sum(dim = 1) - 1.0) < 1e-4)
+    assert torch.all(torch.abs(ns2._params.reshape(2, 2, 16, 16).sum(dim = 3).sum(dim = 1) - 1.0) < 1e-4)
+
+    assert torch.all(torch.abs(pc.params[:16] - 0.0) < 1e-4)
+    assert torch.all(torch.abs(pc.params[16:1040].reshape(1, 4, 16, 16).sum(dim = 2).sum(dim = 1) - 1.0) < 1e-4)
+    assert torch.all(torch.abs(pc.params[1040:2064].reshape(1, 4, 16, 16).sum(dim = 2).sum(dim = 1) - 1.0) < 1e-4)
+    assert torch.all(torch.abs(pc.params[2064:2576].reshape(1, 2, 16, 16).sum(dim = 2).sum(dim = 1) - 1.0) < 1e-4)
+    assert torch.all(torch.abs(pc.params[2576:3088].reshape(1, 2, 16, 16).sum(dim = 2).sum(dim = 1) - 1.0) < 1e-4)
+    assert torch.all(torch.abs(pc.params[3088:3600].reshape(1, 2, 16, 16).sum(dim = 2).sum(dim = 1) - 1.0) < 1e-4)
+    assert torch.all(torch.abs(pc.params[3600:4112].reshape(1, 2, 16, 16).sum(dim = 2).sum(dim = 1) - 1.0) < 1e-4)
+
     prod_layer1 = pc.inner_layers[2]
 
     assert torch.all(prod_layer1.partitioned_nids[0] == torch.arange(16, 112, 16))
@@ -133,8 +145,43 @@ def simple_model_test():
     assert torch.all(prod_layer1.partitioned_cids[0][1,:] == torch.tensor([160, 96, 128, 0]))
     assert torch.all(prod_layer1.partitioned_cids[0][2,:] == torch.tensor([176, 16, 48, 0]))
     assert torch.all(prod_layer1.partitioned_cids[0][3,:] == torch.tensor([192, 32, 64, 0]))
-    assert torch.all(prod_layer1.partitioned_cids[0][4,:] == torch.tensor([176, 16, 112, 0]))
-    assert torch.all(prod_layer1.partitioned_cids[0][5,:] == torch.tensor([192, 32, 128, 0]))
+    assert torch.all(prod_layer1.partitioned_cids[0][4,:] == torch.tensor([208, 16, 112, 0]))
+    assert torch.all(prod_layer1.partitioned_cids[0][5,:] == torch.tensor([224, 32, 128, 0]))
+
+    assert torch.all(prod_layer1.partitioned_u_cids[0] == torch.tensor([48, 64, 80, 96, 144, 160, 176, 192, 208, 224]))
+    assert torch.all(prod_layer1.partitioned_u_cids[1] == torch.tensor([16, 32, 112, 128]))
+
+    assert torch.all(prod_layer1.partitioned_parids[0][0:2,:] == torch.tensor([[48], [64]]))
+    assert torch.all(prod_layer1.partitioned_parids[0][2:4,:] == torch.tensor([[16], [32]]))
+    assert torch.all(prod_layer1.partitioned_parids[0][4:6,:] == torch.tensor([[16], [32]]))
+    assert torch.all(prod_layer1.partitioned_parids[0][6:8,:] == torch.tensor([[48], [64]]))
+    assert torch.all(prod_layer1.partitioned_parids[0][8:10,:] == torch.tensor([[80], [96]]))
+    assert torch.all(prod_layer1.partitioned_parids[1][0:2,:] == torch.tensor([[48, 80], [64, 96]]))
+    assert torch.all(prod_layer1.partitioned_parids[1][2:4,:] == torch.tensor([[16, 80], [32, 96]]))
+
+    sum_layer1 = pc.inner_layers[3]
+
+    assert sum_layer1.group_size == 1
+
+    assert torch.all(sum_layer1.partitioned_nids[0] == torch.tensor([240]))
+
+    assert torch.all(sum_layer1.partitioned_cids[0][0,:96] == torch.arange(16, 112))
+    assert torch.all(sum_layer1.partitioned_cids[0][0,96:] == 0)
+
+    assert torch.all(sum_layer1.partitioned_pids[0][0,:96] == torch.arange(4112, 4208))
+    assert torch.all(sum_layer1.partitioned_pids[0][0,96:] == 0)
+
+    assert torch.all(sum_layer1.partitioned_chids[0] == torch.arange(16, 112, 16))
+
+    assert torch.all(sum_layer1.partitioned_parids[0] == 240)
+
+    assert torch.all(sum_layer1.partitioned_parpids[0] == torch.arange(4112, 4208, 16)[:,None])
+
+    assert torch.abs(pc.params[4112:4208].sum() - 1.0) < 1e-4
+
+    ## Forward pass ##
+
+    pc.to(device)
 
     import pdb; pdb.set_trace()
 

@@ -36,6 +36,8 @@ def _record_par_blks(par_start_ids, pflow_start_ids, blk_sizes, blk_intervals, g
 
                 pid += 1
 
+        pflow_start += ns_group_size * num_edges * cs_group_size
+        par_start += ns_group_size * num_edges * cs_group_size
         global_nid += ns_group_size
 
     return global_nid, pid
@@ -114,6 +116,8 @@ def compile_par_update_fn(root_ns: CircuitNodes, BLOCK_SIZE: int = 32, buffer_in
 
                     pid += ns.group_size
 
+                par_start += ns.group_size * num_edges * ns.ch_group_size
+                pflow_start += ns.group_size * num_edges * ns.ch_group_size
                 global_nid += ns.group_size
 
     par_start_ids = torch.from_numpy(par_start_ids[:pid]).contiguous()

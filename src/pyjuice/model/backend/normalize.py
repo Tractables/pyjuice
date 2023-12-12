@@ -80,7 +80,7 @@ def cum_par_numba_kernel(cum_pflows, params, par_start_ids, blk_sizes, blk_inter
 @njit
 def par_update_numba_kernel(params, cum_pflows, nchs, par_start_ids, blk_sizes, blk_intervals, global_nids, pseudocount):
     for i in range(par_start_ids.shape[0]):
-        par_start_id = par_start_ids[i]
+        par_start = par_start_ids[i]
         blk_size = blk_sizes[i]
         blk_interval = blk_intervals[i]
         global_nid = global_nids[i]
@@ -89,9 +89,9 @@ def par_update_numba_kernel(params, cum_pflows, nchs, par_start_ids, blk_sizes, 
         nch = nchs[global_nid]
 
         for j in range(blk_size):
-            par = params[par_start_id+j*blk_interval]
-            norm_par = (par + pseudocount / nch) + (cum_par + pseudocount)
-            params[par_start_id+j*blk_interval] = norm_par
+            par = params[par_start+j*blk_interval]
+            norm_par = (par + pseudocount / nch) / (cum_par + pseudocount)
+            params[par_start+j*blk_interval] = norm_par
 
 
 def normalize_parameters(params, par_update_kwargs, pseudocount: float = 0.0):
