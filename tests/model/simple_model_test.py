@@ -183,6 +183,87 @@ def simple_model_test():
 
     pc.to(device)
 
+    data = torch.randint(0, 4, [512, 4], device = device)
+
+    lls = pc(data)
+
+    node_mars = pc.node_mars.cpu()
+    data = data.cpu()
+
+    sid, eid = ni0._output_ind_range
+    ni0_lls = node_mars[sid:eid,:]
+    assert torch.all(torch.abs(ni0_lls - ni0._params.reshape(-1, 4)[:,data[:,0]].log()) < 1e-4)
+
+    sid, eid = ni1._output_ind_range
+    ni1_lls = node_mars[sid:eid,:]
+    assert torch.all(torch.abs(ni1_lls - ni1._params.reshape(-1, 4)[:,data[:,1]].log()) < 1e-4)
+
+    sid, eid = ni2._output_ind_range
+    ni2_lls = node_mars[sid:eid,:]
+    assert torch.all(torch.abs(ni2_lls - ni2._params.reshape(-1, 6)[:,data[:,2]].log()) < 1e-4)
+
+    sid, eid = ni3._output_ind_range
+    ni3_lls = node_mars[sid:eid,:]
+    assert torch.all(torch.abs(ni3_lls - ni3._params.reshape(-1, 6)[:,data[:,3]].log()) < 1e-4)
+
+    np0_lls = ni0_lls + ni1_lls
+    np1_lls = ni2_lls + ni3_lls
+    np2_lls = ni1_lls + ni2_lls
+    np3_lls = ni0_lls + ni1_lls
+
+    pc.inner_layers[0].forward(pc.node_mars, pc.element_mars)
+    element_mars = pc.element_mars.cpu()
+
+    sid, eid = np0._output_ind_range
+    assert torch.all(torch.abs(np0_lls - element_mars[sid:eid,:]) < 1e-4)
+
+    sid, eid = np1._output_ind_range
+    assert torch.all(torch.abs(np1_lls - element_mars[sid:eid,:]) < 1e-4)
+
+    sid, eid = np2._output_ind_range
+    assert torch.all(torch.abs(np2_lls - element_mars[sid:eid,:]) < 1e-4)
+
+    sid, eid = np3._output_ind_range
+    assert torch.all(torch.abs(np3_lls - element_mars[sid:eid,:]) < 1e-4)
+
+    ch_lls = torch.cat((np0_lls, np3_lls), dim = 0)
+    epars = ns0._params.reshape(2, 4, 16, 16).permute(0, 2, 1, 3).reshape(32, 64)
+    ns0_lls = torch.matmul(epars, ch_lls.exp()).log()
+    sid, eid = ns0._output_ind_range
+    assert torch.all(torch.abs(ns0_lls - node_mars[sid:eid,:]) < 1e-3)
+    
+    epars = ns1._params.reshape(2, 2, 16, 16).permute(0, 2, 1, 3).reshape(32, 32)
+    ns1_lls = torch.matmul(epars, np1_lls.exp()).log()
+    sid, eid = ns1._output_ind_range
+    assert torch.all(torch.abs(ns1_lls - node_mars[sid:eid,:]) < 1e-3)
+
+    epars = ns2._params.reshape(2, 2, 16, 16).permute(0, 2, 1, 3).reshape(32, 32)
+    ns2_lls = torch.matmul(epars, np2_lls.exp()).log()
+    sid, eid = ns2._output_ind_range
+    assert torch.all(torch.abs(ns2_lls - node_mars[sid:eid,:]) < 1e-3)
+
+    np4_lls = ns0_lls + ni2_lls + ni3_lls
+    np5_lls = ns1_lls + ni0_lls + ni1_lls
+    np6_lls = ns2_lls + ni0_lls + ni3_lls
+
+    pc.inner_layers[2].forward(pc.node_mars, pc.element_mars)
+    element_mars = pc.element_mars.cpu()
+
+    sid, eid = np4._output_ind_range
+    assert torch.all(torch.abs(np4_lls - element_mars[sid:eid,:]) < 1e-3)
+
+    sid, eid = np5._output_ind_range
+    assert torch.all(torch.abs(np5_lls - element_mars[sid:eid,:]) < 1e-3)
+
+    sid, eid = np6._output_ind_range
+    assert torch.all(torch.abs(np6_lls - element_mars[sid:eid,:]) < 1e-3)
+
+    ch_lls = torch.cat((np4_lls, np5_lls, np6_lls), dim = 0)
+    epars = ns._params.reshape(1, 6, 1, 16).permute(0, 2, 1, 3).reshape(1, 96)
+    ns_lls = torch.matmul(epars, ch_lls.exp()).log()
+    sid, eid = ns._output_ind_range
+    assert torch.all(torch.abs(ns_lls - node_mars[sid:eid,:]) < 1e-3)
+
     import pdb; pdb.set_trace()
 
 

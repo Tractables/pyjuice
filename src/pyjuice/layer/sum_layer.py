@@ -392,7 +392,7 @@ class SumLayer(Layer, nn.Module):
     def _fw_triton_block_sparse_kernel(node_mars, element_mars, params, nids, cids_start, cids_increment,
                                        pids_start, pids_increment, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
                                        BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
-                                       TILE_SIZE_M: tl.constexpr, GROUP_SIZE_M: tl.constexpr):
+                                       TILE_SIZE_M: tl.constexpr, GROUP_SIZE_M: tl.constexpr, use_fp16: tl.constexpr):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
@@ -444,9 +444,13 @@ class SumLayer(Layer, nn.Module):
 
             emars_max = tl.max(emars, axis = 0)[None,:]
             emars = tl.exp(emars - emars_max)
-            epars = epars.to(tl.float16)
-            emars = emars.to(tl.float16)
-            nmars = tl.dot(epars, emars).to(tl.float32)
+
+            if use_fp16 == 1:
+                epars = epars.to(tl.float16) * (2**12)
+                emars = emars.to(tl.float16)
+                nmars = tl.dot(epars, emars).to(tl.float32) / (2**12)
+            else:
+                nmars = tl.dot(epars, emars)
 
             acc = tl.where(emars_max > acc,
                 tl.log(nmars + tl.exp(acc - emars_max)) + emars_max,
@@ -471,7 +475,7 @@ class SumLayer(Layer, nn.Module):
     def _forward_block_sparse(self, node_mars: torch.Tensor, element_mars: torch.Tensor,
                               params: torch.Tensor, nids: torch.Tensor, cids: torch.Tensor,
                               pids: torch.Tensor, local_ids: Optional[torch.Tensor] = None,
-                              partition_id: int = -1) -> None:
+                              partition_id: int = -1, use_fp16: bool = True) -> None:
         """
         Forward pass of sum layers with the block-sparse processing kernel.
         
@@ -546,7 +550,8 @@ class SumLayer(Layer, nn.Module):
             TILE_SIZE_K = TILE_SIZE_K,
             K_NUM_TILES = K_NUM_TILES,
             TILE_SIZE_M = TILE_SIZE_M,
-            GROUP_SIZE_M = self.group_size
+            GROUP_SIZE_M = self.group_size,
+            use_fp16 = 1 if use_fp16 else 0
         )
         
         return None

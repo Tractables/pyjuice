@@ -7,7 +7,7 @@ import triton
 import triton.language as tl
 from tqdm import tqdm
 from functools import partial
-from typing import Optional, Sequence, Callable, Union
+from typing import Optional, Sequence, Callable, Union, Tuple, Dict
 
 from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes, foreach
 from pyjuice.layer import Layer, InputLayer, ProdLayer, SumLayer
@@ -28,26 +28,7 @@ def _pc_model_backward_hook(grad, pc, **kwargs):
         **kwargs
     )
 
-    pc._backward_buffer.clear()
-
     return None
-
-
-def _pc_inputs_hook(grad, pc, i):
-
-    if pc._inputs_grad[i] is not None:
-        if grad is not None:
-            grad = grad + pc._inputs_grad[i]
-        else:
-            grad = pc._inputs_grad[i]
-
-    if pc._inputs[i] is not None:
-        pc._inputs[i] = None
-    
-    if pc._inputs_grad[i] is not None:
-        pc._inputs_grad[i] = None
-    
-    return grad
 
 
 class TensorCircuit(nn.Module):
@@ -96,20 +77,13 @@ class TensorCircuit(nn.Module):
         self.element_flows = None
         self.param_flows = None
         
-    def forward(self, inputs: torch.Tensor, 
-                params: Optional[torch.Tensor] = None, 
-                input_params: Optional[Dict[str,torch.Tensor]] = None,
-                input_layer_fn: Optional[Union[str,Callable]] = None,
-                cache: Optional[dict] = None,
-                return_cache: bool = False,
-                **kwargs):
+    def forward(self, inputs: torch.Tensor, input_layer_fn: Optional[Union[str,Callable]] = None,
+                cache: Optional[dict] = None, return_cache: bool = False, **kwargs):
         """
         Forward the circuit.
 
         Parameters:
         `inputs`:         [B, num_vars]
-        `params`:         None or [B, num_params]
-        `input_params`:   A dictionary of input parameters
         `input_layer_fn`: Custom forward function for input layers;
                           if it is a string, then try to call 
                           the corresponding member function of `input_layer`
@@ -121,68 +95,32 @@ class TensorCircuit(nn.Module):
         
         ## Initialize buffers for forward pass ##
 
-        if not isinstance(self.node_mars, torch.Tensor) or self.node_mars.size(0) != self.num_nodes or \
-                self.node_mars.size(1) != B or self.node_mars.device != self.device:
-            self.node_mars = torch.empty([self.num_nodes, B], device = self.device)
-
-        if not isinstance(self.element_mars, torch.Tensor) or self.element_mars.size(0) != self.num_elements or \
-                self.element_mars.size(1) != B or self.element_mars.device != self.device:
-            self.element_mars = torch.empty([self.num_elements, B], device = self.device)
+        self._init_buffer(name = "node_mars", shape = (self.num_nodes, B), set_value = 0.0)
+        self._init_buffer(name = "element_mars", shape = (self.num_elements, B), set_value = -torch.inf)
 
         # Load cached node marginals
-        if cache is not None and "node_mars" in cache:
-            assert cache["node_mars"].dim() == 2 and cache["node_mars"].size(0) == self.node_mars.size(0) and \
-                cache["node_mars"].size(1) == self.node_mars.size(1)
+        if self._buffer_matches(name = "node_mars", cache = cache):
             self.node_mars[:,:] = cache["node_mars"]
-
-        self.node_mars[0,:] = 0.0
-        self.element_mars[0,:] = -torch.inf
-
-        ## Preprocess parameters ##
-
-        if params is None:
-            params = self.params
-        else:
-            if params.dim() == 2:
-                if params.size(1) == self.num_sum_params:
-                    params = params.permute(1, 0)
-                else:
-                    assert params.size(0) == self.num_sum_params, "Size of `params` does not match the number of sum parameters."
-
-            self._inputs[1] = ReverseGrad.apply(params)
-
-            # normalize
-            params = flat_softmax_fw(logits = params, node_ids = self.node_ids, inplace = False)
-            params[0] = 1.0
-            self._backward_buffer["normalized_params"] = params
-
-        if input_params is not None:
-            grad_hook_idx = 2
-            self._backward_buffer["external_input_layers"] = set()
 
         ## Run forward pass ##
 
         with torch.no_grad():
-            # Compute forward pass for all input layers
+            # Input layers
             for idx, layer in enumerate(self.input_layers):
-                if input_params is not None and f"input_{idx}" in input_params:
-                    layer_params = input_params[f"input_{idx}"]
-
-                    self._backward_buffer["external_input_layers"].add(idx)
-                    grad_hook_idx = layer._hook_params(grad_hook_idx, self._inputs, layer_params)
-                else:
-                    layer_params = None
-
                 if input_layer_fn is None:
-                    layer(inputs, self.node_mars, params = layer_params, **kwargs)
+                    layer(inputs, self.node_mars, **kwargs)
+
                 elif isinstance(input_layer_fn, str):
                     assert hasattr(layer, input_layer_fn), f"Custom input function `{input_layer_fn}` not found for layer type {type(layer)}."
-                    getattr(layer, input_layer_fn)(inputs, self.node_mars, params = layer_params, **kwargs)
-                else:
-                    assert isinstance(input_layer_fn, Callable), f"Custom input function should be either a `str` or a `Callable`. " + \
-                                                           f"Found {type(input_layer_fn)} instead."
-                    input_layer_fn(layer, inputs, self.node_mars, params = layer_params, **kwargs)
+                    getattr(layer, input_layer_fn)(inputs, self.node_mars, **kwargs)
 
+                elif isinstance(input_layer_fn, Callable):
+                    input_layer_fn(layer, inputs, self.node_mars, **kwargs)
+
+                else:
+                    raise ValueError(f"Custom input function should be either a `str` or a `Callable`. Found {type(input_layer_fn)} instead.")
+
+            # Inner layers
             for layer in self.inner_layers:
                 if isinstance(layer, ProdLayer):
                     # Prod layer
@@ -190,7 +128,7 @@ class TensorCircuit(nn.Module):
 
                 elif isinstance(layer, SumLayer):
                     # Sum layer
-                    layer(self.node_mars, self.element_mars, params)
+                    layer(self.node_mars, self.element_mars, self.params)
 
                 else:
                     raise ValueError(f"Unknown layer type {type(layer)}.")
@@ -212,20 +150,6 @@ class TensorCircuit(nn.Module):
         if torch.is_grad_enabled():
             lls.requires_grad = True
             lls.register_hook(partial(_pc_model_backward_hook, pc = self, **kwargs))
-
-            self._inputs[0] = ReverseGrad.apply(inputs) # Record inputs for backward
-
-            tensors = []
-            for i in range(len(self._inputs)):
-                if self._inputs[i] is not None and self._inputs[i].requires_grad:
-                    self._inputs[i].register_hook(partial(_pc_inputs_hook, pc = self, i = i))
-                    tensors.append(self._inputs[i])
-            tensors.append(lls)
-
-            if return_cache:
-                return PseudoHookFunc.apply(*tensors).clone(), cache
-            else:
-                return PseudoHookFunc.apply(*tensors).clone()
 
         if return_cache:
             return lls.clone(), cache
@@ -439,14 +363,6 @@ class TensorCircuit(nn.Module):
 
         return self
 
-    def get_param_specs(self):
-        param_specs = dict()
-        param_specs["inner"] = torch.Size([self.num_sum_params])
-        for i, layer in enumerate(self.input_layers):
-            param_specs[f"input_{i}"] = layer.get_param_specs()
-
-        return param_specs
-
     def update_parameters(self, clone_params: bool = True, update_flows: bool = False):
         """
         Copy parameters from this `TensorCircuit` to the original `CircuitNodes`
@@ -483,6 +399,7 @@ class TensorCircuit(nn.Module):
         print(f"> Number of sum parameters: {self.num_sum_params}")
 
     def copy_param_flows(self, clone_param_flows: bool = True, target_name: str = "_scores"):
+        raise NotImplementedError("To be updated")
         param_flows = self.param_flows.detach().cpu()
 
         for ns in self.root_nodes:
@@ -495,6 +412,7 @@ class TensorCircuit(nn.Module):
 
     def enable_partial_evaluation(self, scopes: Union[Sequence[BitSet],Sequence[int]], 
                                   forward: bool = False, backward: bool = False):
+        raise NotImplementedError("To be updated")
         
         # Create scope2nid cache
         self._create_scope2nid_cache()
@@ -523,6 +441,8 @@ class TensorCircuit(nn.Module):
             self._pv_node_flows_mask = _pv_node_flows_mask.to(self.device)
 
     def disable_partial_evaluation(self, forward: bool = True, backward: bool = True):
+        raise NotImplementedError("To be updated")
+
         # Input layers
         for layer in self.input_layers:
             layer.disable_partial_evaluation(forward = forward, backward = backward)
@@ -532,6 +452,50 @@ class TensorCircuit(nn.Module):
             layer.disable_partial_evaluation(forward = forward, backward = backward)
 
         self._pv_node_flows_mask = None
+
+    def _init_buffer(self, name: str, shape: Tuple, set_value: Optional[float] = None, check_device: bool = True):
+        flag = False
+        if not name in self.__dict__:
+            flag = True
+        
+        tensor = self.__dict__[name]
+        if not flag and not isinstance(tensor, torch.Tensor):
+            flag = True
+        
+        if not flag and tensor.dim() != len(shape):
+            flag = True
+
+        for i, d in enumerate(shape):
+            if not flag and tensor.size(i) != d:
+                flag = True
+        
+        if not flag and check_device and tensor.device != self.device:
+            flag = True
+
+        if flag:
+            self.__dict__[name] = torch.empty(shape, device = self.device)
+
+        if set_value:
+            self.__dict__[name][:] = set_value
+
+    def _buffer_matches(self, name: str, cache: Optional[dict], check_device: bool = True):
+        if cache is None:
+            return False
+
+        assert name in self.__dict__
+
+        tensor = self.__dict__[name]
+        
+        if name not in cache:
+            return False
+
+        if tensor.size() != cache[name].size():
+            return False
+
+        if check_device and tensor.device != cache[name].device:
+            return False
+
+        return True
 
     def _init_layers(self, layer_sparsity_tol: Optional[float] = None, max_num_partitions: Optional[int] = None,
                      disable_gpu_compilation: bool = False, force_gpu_compilation: bool = False, 
