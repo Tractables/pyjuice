@@ -10,7 +10,7 @@ from functools import partial
 from typing import Optional, Sequence, Callable, Union, Tuple, Dict
 
 from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes, foreach
-from pyjuice.layer import Layer, InputLayer, ProdLayer, SumLayer
+from pyjuice.layer import Layer, InputLayer, ProdLayer, SumLayer, LayerGroup
 from pyjuice.utils.grad_fns import ReverseGrad, PseudoHookFunc
 from pyjuice.utils import BitSet
 
@@ -19,9 +19,10 @@ from .backend import compile_cum_par_flows_fn, compute_cum_par_flows, cum_par_fl
                      normalize_parameters
 
 
-def _pc_model_backward_hook(grad, pc, **kwargs):
+def _pc_model_backward_hook(grad, pc, inputs, **kwargs):
     grad = grad.permute(1, 0)
     pc.backward(
+        inputs = inputs,
         ll_weights = grad / grad.sum() * grad.size(1),
         compute_param_flows = pc._optim_hyperparams["compute_param_flows"], 
         flows_memory = pc._optim_hyperparams["flows_memory"],
@@ -106,7 +107,7 @@ class TensorCircuit(nn.Module):
 
         with torch.no_grad():
             # Input layers
-            for idx, layer in enumerate(self.input_layers):
+            for idx, layer in enumerate(self.input_layer_group):
                 if input_layer_fn is None:
                     layer(inputs, self.node_mars, **kwargs)
 
@@ -121,14 +122,14 @@ class TensorCircuit(nn.Module):
                     raise ValueError(f"Custom input function should be either a `str` or a `Callable`. Found {type(input_layer_fn)} instead.")
 
             # Inner layers
-            for layer in self.inner_layers:
-                if isinstance(layer, ProdLayer):
+            for layer_group in self.inner_layer_groups:
+                if layer_group.is_prod():
                     # Prod layer
-                    layer(self.node_mars, self.element_mars)
+                    layer_group(self.node_mars, self.element_mars)
 
-                elif isinstance(layer, SumLayer):
+                elif layer_group.is_sum():
                     # Sum layer
-                    layer(self.node_mars, self.element_mars, self.params)
+                    layer_group(self.node_mars, self.element_mars, self.params)
 
                 else:
                     raise ValueError(f"Unknown layer type {type(layer)}.")
@@ -149,7 +150,7 @@ class TensorCircuit(nn.Module):
 
         if torch.is_grad_enabled():
             lls.requires_grad = True
-            lls.register_hook(partial(_pc_model_backward_hook, pc = self, **kwargs))
+            lls.register_hook(partial(_pc_model_backward_hook, pc = self, inputs = inputs, **kwargs))
 
         if return_cache:
             return lls.clone(), cache
@@ -159,7 +160,7 @@ class TensorCircuit(nn.Module):
     def backward(self, inputs: Optional[torch.Tensor] = None, 
                  ll_weights: Optional[torch.Tensor] = None,
                  compute_param_flows: bool = True, 
-                 flows_memory: float = 0.0,
+                 flows_memory: float = 1.0,
                  input_layer_fn: Optional[Union[str,Callable]] = None,
                  cache: Optional[dict] = None,
                  return_cache: bool = False,
@@ -182,16 +183,8 @@ class TensorCircuit(nn.Module):
 
         ## Initialize buffers for backward pass ##
 
-        if not isinstance(self.node_flows, torch.Tensor) or self.node_flows.size(0) != self.num_nodes or \
-                self.node_flows.size(1) != B or self.node_flows.device != self.device:
-            self.node_flows = torch.zeros([self.num_nodes, B], device = self.device)
-        
-        if not isinstance(self.element_flows, torch.Tensor) or self.element_flows.size(0) != self.num_elements or \
-                self.element_flows.size(1) != B or self.element_flows.device != self.device:
-            self.element_flows = torch.zeros([self.num_elements, B], device = self.device)
-
-        # Clear node flows
-        self.node_flows[:,:] = 0.0
+        self._init_buffer(name = "node_flows", shape = (self.num_nodes, B), set_value = 0.0)
+        self._init_buffer(name = "element_flows", shape = (self.num_elements, B), set_value = 0.0)
 
         # Set root node flows
         if ll_weights is None:
@@ -205,95 +198,50 @@ class TensorCircuit(nn.Module):
             self.node_flows[self._root_node_range[0]:self._root_node_range[1],:] = ll_weights
 
         # Load cached node flows
-        if cache is not None and "node_flows" in cache:
-            assert cache["node_flows"].dim() == 2 and cache["node_flows"].size(0) == self.node_flows.size(0) and \
-                cache["node_flows"].size(1) == self.node_flows.size(1)
+        if self._buffer_matches(name = "node_flows", cache = cache):
+            self.node_flows[:,:] = cache["node_flows"]
 
-            if "replace_root_flows" in cache and cache["replace_root_flows"]:
-                if hasattr(self, "_pv_node_flows_mask") and getattr(self, "_pv_node_flows_mask") is not None:
-                    self.node_flows[self._pv_node_flows_mask,:] = 0.0
-
-                self.node_flows[:self._root_node_range[0],:] = cache["node_flows"][:self._root_node_range[0],:].to(self.device)
-                self.node_flows[self._root_node_range[1]:,:] = cache["node_flows"][self._root_node_range[1]:,:].to(self.device)
-            else:
-                self.node_flows[:,:] = cache["node_flows"]
-
-                if hasattr(self, "_pv_node_flows_mask") and getattr(self, "_pv_node_flows_mask") is not None:
-                    self.node_flows[self._pv_node_flows_mask,:] = 0.0
-                    self.node_flows[self._root_node_range[0]:self._root_node_range[1],:] = cache["node_flows"][self._root_node_range[0]:self._root_node_range[1],:]
-
-        ## Retrieve parameters and initialize parameter flows ##
-        if self._inputs[1] is not None:
-            params = self._backward_buffer["normalized_params"]
-        else:
-            params = self.params
-
+        ## Initialize parameter flows ##
         if compute_param_flows:
             self.init_param_flows(flows_memory = flows_memory)
 
         ## Run backward pass ##
 
         with torch.no_grad():
-            for layer_id in range(len(self.inner_layers) - 1, -1, -1):
-                layer = self.inner_layers[layer_id]
+            for layer_id in range(len(self.inner_layer_groups) - 1, -1, -1):
+                layer_group = self.inner_layer_groups[layer_id]
 
-                if isinstance(layer, ProdLayer):
+                if layer_group.is_prod():
                     # Prod layer
-                    layer.backward(self.node_flows, self.element_flows)
+                    layer_group.backward(self.node_flows, self.element_flows)
 
-                elif isinstance(layer, SumLayer):
+                elif layer_group.is_sum():
                     # Sum layer
 
                     # First recompute the previous product layer
-                    self.inner_layers[layer_id-1].forward(self.node_mars, self.element_mars, _for_backward = True)
+                    self.inner_layer_groups[layer_id-1].forward(self.node_mars, self.element_mars, _for_backward = True)
 
                     # Backward sum layer
-                    layer.backward(self.node_flows, self.element_flows, self.node_mars, self.element_mars, params, 
-                                   param_flows = self.param_flows if compute_param_flows else None)
+                    layer_group.backward(self.node_flows, self.element_flows, self.node_mars, self.element_mars, self.params, 
+                                         param_flows = self.param_flows if compute_param_flows else None)
 
                 else:
                     raise ValueError(f"Unknown layer type {type(layer)}.")
 
-            if inputs is None:
-                inputs = self._inputs[0]
-            else:
-                inputs = inputs.permute(1, 0)
-
             # Compute backward pass for all input layers
-            grad_hook_idx = 2
-            for idx, layer in enumerate(self.input_layers):
+            for idx, layer in enumerate(self.input_layer_group):
                 if input_layer_fn is None:
                     layer.backward(inputs, self.node_flows, self.node_mars, **kwargs)
+
                 elif isinstance(input_layer_fn, str):
                     assert hasattr(layer, input_layer_fn), f"Custom input function `{input_layer_fn}` not found for layer type {type(layer)}."
                     getattr(layer, input_layer_fn)(inputs, self.node_flows, self.node_mars, **kwargs)
-                else:
-                    assert isinstance(input_layer_fn, Callable), f"Custom input function should be either a `str` or a `Callable`. " + \
-                                                                    f"Found {type(input_layer_fn)} instead."
+
+                elif isinstance(input_layer_fn, Callable):
                     input_layer_fn(layer, inputs, self.node_flows, self.node_mars, **kwargs)
 
-                if "external_input_layers" in self._backward_buffer and idx in self._backward_buffer["external_input_layers"]:
-                    grad_hook_idx = layer._hook_param_grads(grad_hook_idx, self._inputs, self._inputs_grad)
-
-            if self._inputs[1] is not None:
-                B = self._inputs[0].size(0)
-
-                # Below computes the parameter gradients derived from flows
-                # grads = self.param_flows / params / B
-                # grads[0] = 0.0
-                # self._inputs_grad[1] = flat_softmax_bp(grads, params, self.node_ids, log_param_grad = False, inplace = False)
-
-                # However, using the gradients directly generally leads to slow convergence
-                # Instead, we use a scaled version of the gradient, as shown below
-                flows = self.param_flows
-                self._normalize_parameters(flows, pseudocount = self._pseudocount)
-                flows[0] = 1.0
-                grads = 0.5 * (torch.log(flows) - torch.log(params))
-                self._inputs_grad[1] = flat_softmax_bp(grads, params, self.node_ids, log_param_grad = True, inplace = False)
-
-                self._used_external_sum_params = True
-            else:
-                self._used_external_sum_params = False
+                else:
+                    raise ValueError(f"Custom input function should be either a `str` or a `Callable`. Found {type(input_layer_fn)} instead.")
 
         if return_cache:
             if cache is None:
@@ -303,12 +251,11 @@ class TensorCircuit(nn.Module):
                 cache["node_flows"] = self.node_flows.clone()
 
             return cache
-
         else:
             return None
 
     def mini_batch_em(self, step_size: float, pseudocount: float = 0.0):
-        for layer in self.input_layers:
+        for layer in self.input_layer_group:
             layer.mini_batch_em(step_size = step_size, pseudocount = pseudocount)
         
         # Only apply parameter update if external parameters are not used in the previous forward/backward pass
@@ -327,22 +274,22 @@ class TensorCircuit(nn.Module):
             self.forward(inputs, params)
             self.backward(inputs = inputs, compute_param_flows = True, flows_memory = 1.0)
 
-    def init_param_flows(self, flows_memory: float = 0.0):
-        batch_size = self._inputs[1].size(1) if self._inputs[1] is not None and self._inputs[1].dim() == 2 else 1
-        if self.param_flows is None or self.param_flows.size(0) != self.params.size(0) \
-                or (self.param_flows.dim() == 1 and batch_size > 1) \
-                or (self.param_flows.dim() == 2 and batch_size != self.param_flows.size(1)):
-            if batch_size == 1:
-                shape = [self.params.size(0)]
-            else:
-                shape = [self.params.size(0), batch_size]
-            self.param_flows = torch.zeros(shape, device = self.device)
+    def init_param_flows(self, flows_memory: float = 1.0, batch_size: Optional[int] = None):
+
+        assert 0.0 <= flows_memory <= 1.0, f"`flows_memory` should be in [0.0, 1.0]"
+
+        if batch_size is None:
+            pflow_shape = (self.num_param_flows,)
         else:
-            assert self.param_flows.size(0) == self.params.size(0)
+            pflow_shape = (self.num_param_flows, batch_size)
+            
+        self._init_buffer(name = "param_flows", shape = pflow_shape)
+
+        if flows_memory < 1.0:
             self.param_flows[:] *= flows_memory
 
         # For input layers
-        for layer in self.input_layers:
+        for layer in self.input_layer_group:
             layer.init_param_flows(flows_memory = flows_memory)
 
         return None
@@ -350,8 +297,7 @@ class TensorCircuit(nn.Module):
     def to(self, device):
         super(TensorCircuit, self).to(device)
 
-        for layer in self.input_layers:
-            layer.device = device
+        self.input_layer_group.to(device)
 
         self.device = device
 
@@ -385,7 +331,7 @@ class TensorCircuit(nn.Module):
                     else:
                         ns._flows = param_flows[ns._param_ids]
 
-        for layer in self.input_layers:
+        for layer in self.input_layer_group:
             layer.update_parameters()
 
         return None
@@ -473,7 +419,7 @@ class TensorCircuit(nn.Module):
             flag = True
 
         if flag:
-            self.__dict__[name] = torch.empty(shape, device = self.device)
+            self.__dict__[name] = torch.zeros(shape, device = self.device)
 
         if set_value:
             self.__dict__[name][:] = set_value
@@ -501,7 +447,7 @@ class TensorCircuit(nn.Module):
                      disable_gpu_compilation: bool = False, force_gpu_compilation: bool = False, 
                      max_tied_ns_per_parflow_group: int = 8, verbose: bool = True):
 
-        if hasattr(self, "input_layers") or hasattr(self, "inner_layers"):
+        if hasattr(self, "input_layer_group") or hasattr(self, "inner_layer_groups"):
             raise ValueError("Attempting to initialize a TensorCircuit for the second time. " + \
                 "Please instead create a new TensorCircuit instance by calling `pc = TensorCircuit(root_ns)`.")
 
@@ -511,8 +457,8 @@ class TensorCircuit(nn.Module):
         # Create layers
         depth2nodes, num_layers, max_node_group_size, max_ele_group_size = self._create_node_layers()
 
-        self.input_layers = []
-        self.inner_layers = []
+        self.input_layer_group = None
+        self.inner_layer_groups = []
 
         self.num_dummy_nodes = max_ele_group_size
         self.num_dummy_eles = max_node_group_size
@@ -544,17 +490,20 @@ class TensorCircuit(nn.Module):
                 # Input layer
                 signature2nodes = self._categorize_input_nodes(depth2nodes[0]["input"])
                 input_layer_id = 0
+                input_layers = []
                 for signature, nodes in signature2nodes.items():
                     input_layer = InputLayer(
                         nodes = nodes, cum_nodes = num_nodes,
                         max_tied_ns_per_parflow_group = max_tied_ns_per_parflow_group
                     )
 
-                    self.input_layers.append(input_layer)
-                    self.add_module(f"input_layer_{input_layer_id}", input_layer)
+                    input_layers.append(input_layer)
                     
                     input_layer_id += 1
                     num_nodes += input_layer.num_nodes
+
+                self.input_layer_group = LayerGroup(input_layers)
+
             else:
                 assert len(depth2nodes[depth]["prod"]) > 0 and len(depth2nodes[depth]["sum"]) > 0, \
                     "Depth {}: (# prod nodes: {}, # sum nodes: {})".format(depth, len(depth2nodes[depth]["prod"]), len(depth2nodes[depth]["sum"]))
@@ -568,6 +517,7 @@ class TensorCircuit(nn.Module):
                     gsize2prod_nodes[gsize].append(ns)
                 
                 layer_num_elements = max_node_group_size
+                prod_layers = []
                 for gsize, nodes in gsize2prod_nodes.items():
                     prod_layer = ProdLayer(
                         nodes = nodes, 
@@ -581,8 +531,11 @@ class TensorCircuit(nn.Module):
                     layer_num_elements += prod_layer.num_nodes
                     num_edges += prod_layer.num_edges
 
-                    self.add_module(f"prod_layer_{layer_id}_{gsize}", prod_layer)
-                    self.inner_layers.append(prod_layer)
+                    prod_layers.append(prod_layer)
+                
+                prod_layer_group = LayerGroup(prod_layers)
+                self.inner_layer_groups.append(prod_layer_group)
+                self.add_module(f"prod_layer_{layer_id}", prod_layer_group)
 
                 if layer_num_elements > num_elements:
                     num_elements = layer_num_elements
@@ -595,6 +548,7 @@ class TensorCircuit(nn.Module):
                         gsize2sum_nodes[gsize] = []
                     gsize2sum_nodes[gsize].append(ns)
                 
+                sum_layers = []
                 for gsize, nodes in gsize2sum_nodes.items():
                     sum_layer = SumLayer(
                         nodes = nodes,
@@ -612,9 +566,13 @@ class TensorCircuit(nn.Module):
                     num_nodes += sum_layer.num_nodes
                     num_edges += sum_layer.num_edges
                     num_parameters += sum_layer.num_parameters
+                    num_param_flows += sum_layer.num_param_flows
 
-                    self.add_module(f"sum_layer_{layer_id}_{gsize}", sum_layer)
-                    self.inner_layers.append(sum_layer)
+                    sum_layers.append(sum_layer)
+
+                sum_layer_group = LayerGroup(sum_layers)
+                self.inner_layer_groups.append(sum_layer_group)
+                self.add_module(f"sum_layer_{layer_id}", sum_layer_group)
 
                 layer_id += 1
 
@@ -656,7 +614,7 @@ class TensorCircuit(nn.Module):
         self.params.requires_grad = False
 
         # Initialize parameters for input layers
-        for idx, layer in enumerate(self.input_layers):
+        for idx, layer in enumerate(self.input_layer_group):
             layer._init_parameters(perturbation)
 
     def _normalize_parameters(self, params, pseudocount: float = 0.0):
@@ -731,8 +689,11 @@ class TensorCircuit(nn.Module):
         return signature2nodes
 
     def _create_scope2nid_cache(self):
+
+        raise NotImplementedError()
+
         # Input layers
-        for idx, layer in enumerate(self.input_layers):
+        for idx, layer in enumerate(self.input_layer_group):
             layer._prepare_scope2nids()
 
         # Inner layers

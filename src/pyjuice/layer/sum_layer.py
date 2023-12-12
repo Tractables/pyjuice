@@ -196,6 +196,10 @@ class SumLayer(Layer, nn.Module):
     def num_parameters(self):
         return self._layer_pid_range[1] - self._layer_pid_range[0]
 
+    @property
+    def num_param_flows(self):
+        return self._layer_pfid_range[1] - self._layer_pfid_range[0]
+
     def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor) -> None:
         """
         Computes the forward pass of a sum layer:

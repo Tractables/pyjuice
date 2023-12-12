@@ -48,7 +48,7 @@ def simple_model_test():
 
     ## Test all compilation-related stuff ##
 
-    input_layer = pc.input_layers[0]
+    input_layer = pc.input_layer_group[0]
 
     assert torch.all(input_layer.vids[0:32,0] == 0)
     assert torch.all(input_layer.vids[32:64,0] == 1)
@@ -73,7 +73,7 @@ def simple_model_test():
     assert torch.all(torch.abs(input_layer.params[:64*4].reshape(64, 4).sum(dim = 1) - 1.0) < 1e-4)
     assert torch.all(torch.abs(input_layer.params[64*4:].reshape(64, 6).sum(dim = 1) - 1.0) < 1e-4)
 
-    prod_layer0 = pc.inner_layers[0]
+    prod_layer0 = pc.inner_layer_groups[0][0]
 
     assert prod_layer0.num_nodes == 4 * 16 * 2
     assert prod_layer0.num_edges == 8 * 16 * 2
@@ -91,7 +91,7 @@ def simple_model_test():
     assert torch.all(prod_layer0.partitioned_parids[0] == torch.tensor([[16, 48], [32, 64], [80, 112], [96, 128], [80, 0], [96, 0]]))
     assert torch.all(prod_layer0.partitioned_parids[1] == torch.tensor([[16, 48, 112, 0], [32, 64, 128, 0]]))
 
-    sum_layer0 = pc.inner_layers[1]
+    sum_layer0 = pc.inner_layer_groups[1][0]
 
     assert torch.all(sum_layer0.partitioned_nids[0] == torch.tensor([176, 192, 208, 224]))
     assert torch.all(sum_layer0.partitioned_nids[1] == torch.tensor([144, 160]))
@@ -137,7 +137,7 @@ def simple_model_test():
     assert torch.all(torch.abs(pc.params[3088:3600].reshape(1, 2, 16, 16).sum(dim = 2).sum(dim = 1) - 1.0) < 1e-4)
     assert torch.all(torch.abs(pc.params[3600:4112].reshape(1, 2, 16, 16).sum(dim = 2).sum(dim = 1) - 1.0) < 1e-4)
 
-    prod_layer1 = pc.inner_layers[2]
+    prod_layer1 = pc.inner_layer_groups[2][0]
 
     assert torch.all(prod_layer1.partitioned_nids[0] == torch.arange(16, 112, 16))
 
@@ -159,7 +159,7 @@ def simple_model_test():
     assert torch.all(prod_layer1.partitioned_parids[1][0:2,:] == torch.tensor([[48, 80], [64, 96]]))
     assert torch.all(prod_layer1.partitioned_parids[1][2:4,:] == torch.tensor([[16, 80], [32, 96]]))
 
-    sum_layer1 = pc.inner_layers[3]
+    sum_layer1 = pc.inner_layer_groups[3][0]
 
     assert sum_layer1.group_size == 1
 
@@ -211,7 +211,7 @@ def simple_model_test():
     np2_lls = ni1_lls + ni2_lls
     np3_lls = ni0_lls + ni1_lls
 
-    pc.inner_layers[0].forward(pc.node_mars, pc.element_mars)
+    pc.inner_layer_groups[0][0].forward(pc.node_mars, pc.element_mars)
     element_mars = pc.element_mars.cpu()
 
     sid, eid = np0._output_ind_range
@@ -246,7 +246,7 @@ def simple_model_test():
     np5_lls = ns1_lls + ni0_lls + ni1_lls
     np6_lls = ns2_lls + ni0_lls + ni3_lls
 
-    pc.inner_layers[2].forward(pc.node_mars, pc.element_mars)
+    pc.inner_layer_groups[2][0].forward(pc.node_mars, pc.element_mars)
     element_mars = pc.element_mars.cpu()
 
     sid, eid = np4._output_ind_range
@@ -263,6 +263,10 @@ def simple_model_test():
     ns_lls = torch.matmul(epars, ch_lls.exp()).log()
     sid, eid = ns._output_ind_range
     assert torch.all(torch.abs(ns_lls - node_mars[sid:eid,:]) < 1e-3)
+
+    ## Backward pass ##
+
+    lls.mean().backward()
 
     import pdb; pdb.set_trace()
 
