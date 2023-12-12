@@ -268,6 +268,8 @@ def simple_model_test():
 
     lls.mean().backward()
 
+    node_flows = pc.node_flows.cpu()
+
     import pdb; pdb.set_trace()
 
 

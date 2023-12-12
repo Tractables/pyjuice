@@ -563,7 +563,7 @@ class SumLayer(Layer, nn.Module):
     @staticmethod
     @triton.jit
     def _fw_triton_sparse_kernel(node_mars, element_mars, params, nids, cids, pids,
-                                 local_ids, batch_size, partial_eval: tl.constexpr, n_edges: tl.constexpr, 
+                                 local_ids, batch_size, partial_eval: tl.constexpr, num_edges: tl.constexpr, 
                                  BLOCK_B: tl.constexpr, BLOCK_M: tl.constexpr, GROUP_SIZE_M: tl.constexpr):
         
         pid_b = tl.program_id(axis = 0) # ID of size-`BLOCK_B` batches
@@ -578,20 +578,20 @@ class SumLayer(Layer, nn.Module):
             ngroup_id = tl.load(local_ids + ngroup_id)
 
         # Initialize pointers to `params`
-        offs_edge = tl.arange(0, n_edges)
-        par_start = tl.load(pids + ngroup_id * n_edges + offs_edge)
-        epars_ptr = params + tile_id * BLOCK_M + par_start # [n_edges]
+        offs_edge = tl.arange(0, num_edges)
+        par_start = tl.load(pids + ngroup_id * num_edges + offs_edge)
+        epars_ptr = params + tile_id * BLOCK_M + par_start # [num_edges]
 
         # Batch offsets and mask
         offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B
         mask_batch = offs_batch < batch_size
 
         # Initialize and load edge mars
-        edge_ids = tl.load(cids + ngroup_id * n_edges + offs_edge)
+        edge_ids = tl.load(cids + ngroup_id * num_edges + offs_edge)
         emars_ptr = element_mars + \
             edge_ids[:,None] * batch_size + \
             offs_batch[None,:]
-        emars = tl.load(emars_ptr, mask = mask_batch[None,:]) # [n_edges, BLOCK_B]
+        emars = tl.load(emars_ptr, mask = mask_batch[None,:]) # [num_edges, BLOCK_B]
 
         # Compute max and subtract
         emars_max = tl.max(emars, axis = 0)
@@ -635,13 +635,13 @@ class SumLayer(Layer, nn.Module):
 
         num_ngroups = nids.size(0) if local_ids is None else local_ids.size(0)
         layer_n_nodes = num_ngroups * self.group_size
-        n_edges = cids.size(1)
+        num_edges = cids.size(1)
         batch_size = node_mars.size(1)
         BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
 
-        assert n_edges <= 16384
+        assert num_edges <= 16384, "The sparse forward kernel only support nodes with # edges smaller than 16384."
 
-        BLOCK_B = max(min(2048 // n_edges, BATCH_SIZE_NP2), 1)
+        BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
         BLOCK_M = self.group_size
 
         grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, BLOCK_M))
@@ -656,7 +656,7 @@ class SumLayer(Layer, nn.Module):
             local_ids = local_ids, 
             batch_size = batch_size, 
             partial_eval = 1 if local_ids is not None else 0, 
-            n_edges = n_edges, 
+            num_edges = num_edges, 
             BLOCK_B = BLOCK_B, 
             BLOCK_M = BLOCK_M, 
             GROUP_SIZE_M = self.group_size
@@ -696,10 +696,14 @@ class SumLayer(Layer, nn.Module):
 
         if mode is not None:
             assert mode in ["block_sparse", "sparse"]
-
         elif params.dim() == 1 and self.group_size >= 16 and num_edges >= 16 and batch_size >= 16:
             # In this case, we should definitely use the block-sparse implementation
             mode = "block_sparse"
+        elif self.group_size * num_edges < 4 and num_edges * batch_size < 4:
+            # In this case, we should definitely use the sparse implementation
+            mode = "sparse"
+        else:
+            mode = "sparse"
 
         if mode == "block_sparse":
             self._backward_block_sparse(
@@ -707,7 +711,12 @@ class SumLayer(Layer, nn.Module):
                 nids, cids, pids, pfids, chids, parids, parpids, cs_group_size, local_ids, 
                 partition_id = partition_id
             )
-
+        elif mode == "sparse":
+            self._backward_sparse(
+                node_flows, element_flows, params, node_mars, element_mars, param_flows, 
+                nids, cids, pids, pfids, chids, parids, parpids, cs_group_size, local_ids, 
+                partition_id = partition_id
+            )
         elif mode == "pytorch":
             self._backward_pytorch(
                 node_flows, element_flows, params, node_mars, 
@@ -1004,7 +1013,7 @@ class SumLayer(Layer, nn.Module):
         
         curr_pflows = acc * epars
 
-        tl.atomic_add(param_flows + epars_offsets, curr_pflows) # TODO: reimplement with the lock mechanism
+        tl.atomic_add(param_flows + epars_offsets, curr_pflows)
 
     def _backward_block_sparse_par_flows(self, node_flows: torch.Tensor, params: torch.Tensor, node_mars: torch.Tensor, 
                                          element_mars: torch.Tensor, param_flows: torch.Tensor, nids: torch.Tensor, 
@@ -1064,6 +1073,259 @@ class SumLayer(Layer, nn.Module):
             B_NUM_TILES = B_NUM_TILES, 
             TILE_SIZE_K = TILE_SIZE_K, 
             TILE_SIZE_M = TILE_SIZE_M, 
+            GROUP_SIZE_M = self.group_size
+        )
+
+    def _backward_sparse(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
+                         params: torch.Tensor, node_mars: torch.Tensor, 
+                         element_mars: torch.Tensor, param_flows: torch.Tensor, 
+                         nids: Optional[torch.Tensor], cids: Optional[torch.Tensor], pids: Optional[torch.Tensor], pfids: Optional[torch.Tensor],
+                         chids: Optional[torch.Tensor], parids: Optional[torch.Tensor], parpids: Optional[torch.Tensor], 
+                         cs_group_size: int, local_ids: Optional[torch.Tensor] = None,
+                         partition_id: int = -1) -> None:
+        """
+        Back pass of sum layers with sparse processing kernel.
+        
+        Parameters:
+        `node_flows`:   [N, B]
+        `element_flows: [M, B]
+        `params`:       [E]
+        `node_mars`:    [N, B]
+        `element_mars`: [M, B]
+        `param_flows`:  [E]
+        `chids`:        [ng]
+        `parids`:       [ng, c]
+        `parpids`:      [ng, c]
+        """
+
+        # Flows w.r.t. input elements (product nodes)
+        if chids is not None:
+            self._backward_sparse_ele_flows(
+                node_flows, element_flows, params, node_mars, element_mars,
+                chids = chids, parids = parids, parpids = parpids, 
+                cs_group_size = cs_group_size, local_ids = local_ids
+            )
+
+        # Flows w.r.t. parameters
+        if param_flows is not None and nids is not None:
+            self._backward_sparse_par_flows(
+                node_flows, params, node_mars, element_mars, param_flows,
+                nids = nids, cids = cids, pids = pids, pfids = pfids
+            )
+
+        return None
+
+    @staticmethod
+    @triton.jit
+    def _bk_triton_sparse_ele_kernel(node_flows, element_flows, node_mars, element_mars, params, 
+                                     chids, parids, parpids, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
+                                     n_edge_groups: tl.constexpr, BLOCK_B: tl.constexpr, BLOCK_M: tl.constexpr, 
+                                     GROUP_SIZE_K: tl.constexpr):
+
+        pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
+        pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
+
+        # Get inferred node group id from `pid_m`
+        elegroup_id = pid_m
+
+        # Get the real node group id in the case of partial evaluation
+        if partial_eval == 1:
+            elegroup_id = tl.load(local_ids + elegroup_id)
+
+        # Initialize pointers to `params`
+        offs_edge = tl.arange(0, n_edge_groups * GROUP_SIZE_K) # I.e., [0, num_edges)
+        offs_edge_gid = offs_edge // GROUP_SIZE_K
+        offs_edge_nid = (offs_edge % GROUP_SIZE_K)
+        par_start = tl.load(parpids + elegroup_id * n_edge_groups + offs_edge_gid)
+        epars_ptr = params + par_start + offs_edge_nid # [num_edges]
+
+        # Batch offsets and mask
+        offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B
+        mask_batch = offs_batch < batch_size
+
+        # Initialize `node_flows` and `node_mars`
+        edge_start = tl.load(parids + elegroup_id * n_edge_groups + offs_edge_gid)
+        nmars_ptr = node_mars + \
+            (edge_start + offs_edge_nid)[:,None] * batch_size + \
+            offs_batch[None,:]
+        nmars = tl.load(nmars_ptr, mask = mask_batch[None,:]) # [num_edges, BLOCK_B]
+        nflows_ptr = node_flows + \
+            (edge_start + offs_edge_nid)[:,None] * batch_size + \
+            offs_batch[None,:]
+        nflows = tl.load(nflows_ptr, mask = mask_batch[None,:]) # [num_edges, BLOCK_B]
+
+        # Initialize pointers to `element_flows` and `element_mars`
+        off_eleids = tl.load(chids + elegroup_id)
+        eflows_ptr = element_flows + off_eleids * batch_size + offs_batch # [BLOCK_B]
+        emars_ptr = element_mars + off_eleids * batch_size + offs_batch # [BLOCK_B]
+
+        # Inner loop
+        for i in range(0, BLOCK_M):
+            epars = tl.load(epars_ptr) # [num_edges]
+            emars = tl.load(emars_ptr, mask = mask_batch) # [BLOCK_B]
+
+            eflows = tl.sum(nflows * epars[:,None] * tl.exp(emars[None,:] - nmars), axis = 0)
+
+            tl.store(eflows_ptr, eflows, mask = mask_batch)
+
+            # Increment `emars_ptr` and `eflows_ptr`
+            emars_ptr += batch_size
+            eflows_ptr += batch_size
+
+    def _backward_sparse_ele_flows(self, node_flows: torch.Tensor, element_flows: torch.Tensor,
+                                   params: torch.Tensor, node_mars: torch.Tensor,
+                                   element_mars: torch.Tensor, chids: torch.Tensor, parids: torch.Tensor,
+                                   parpids: torch.Tensor, cs_group_size: int, local_ids: Optional[torch.Tensor] = None) -> None:
+
+        assert params.dim() == 1, "Expecting a 1D `params`."
+
+        num_ngroups = chids.size(0) if local_ids is None else local_ids.size(0)
+        layer_n_nodes = num_ngroups * cs_group_size
+        n_edge_groups = parids.size(1)
+        num_edges = n_edge_groups * self.group_size
+        batch_size = node_flows.size(1)
+        BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
+
+        assert num_edges <= 16384, "The sparse backward kernel only support nodes with # edges smaller than 16384."
+
+        BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
+        BLOCK_M = cs_group_sizes
+
+        grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, BLOCK_M))
+
+        self._bk_triton_sparse_ele_kernel[grid](
+            node_flows = node_flows, 
+            element_flows = element_flows, 
+            node_mars = node_mars, 
+            element_mars = element_mars, 
+            params = params, 
+            chids = chids, 
+            parids = parids,
+            parpids = parpids,
+            local_ids = local_ids, 
+            batch_size = batch_size, 
+            partial_eval = 1 if local_ids is not None else 0,
+            n_edge_groups = n_edge_groups,
+            BLOCK_B = BLOCK_B, 
+            BLOCK_M = BLOCK_M,
+            GROUP_SIZE_K = self.group_size
+        )
+
+        return None
+
+    @staticmethod
+    @triton.jit
+    def _bk_triton_sparse_par_kernel(node_flows, node_mars, element_mars, params, param_flows, nids, cids, pids, pfids,
+                                     batch_size: tl.constexpr, num_edges: tl.constexpr, BLOCK_M: tl.constexpr, 
+                                     BLOCK_B: tl.constexpr, B_NUM_BLOCKS: tl.constexpr, GROUP_SIZE_M: tl.constexpr):
+
+        pid_m = tl.program_id(0) # ID of size-`BLOCK_M` nodes
+
+        # Get inferred node group id from `pid_m`
+        ngroup_id = pid_m // GROUP_SIZE_M
+        tile_id = pid_m % GROUP_SIZE_M
+
+        # Batch offsets and mask
+        offs_batch = tl.arange(0, BLOCK_B)
+        mask_batch = offs_batch < batch_size
+
+        # Initialize pointers to `element_mars`
+        offs_edge = tl.arange(0, num_edges)
+        edge_start = tl.load(cids + ngroup_id * num_edges + offs_edge)
+        emars_ptr = element_mars + \
+            edge_start[:,None] * batch_size + \
+            offs_batch[None,:] # [num_edges, BLOCK_B]
+
+        # Initialize pointers to `node_flows` and `node_mars`
+        off_nids = tl.load(nids + ngroup_id)
+        nmars_ptr = node_mars + (off_nids + tile_id) * batch_size + offs_batch # [BLOCK_B]
+        nflows_ptr = node_flows + off_nids * batch_size + offs_batch # [BLOCK_B]
+
+        # Initialize `params`
+        par_start = tl.load(pids + ngroup_id * num_edges + offs_edge)
+        epars_ptr = params + par_start + tile_id
+        epars = tl.load(epars_ptr) # [num_edges]
+
+        # Inner loop
+        acc = tl.zeros([num_edges], dtype = tl.float32)
+
+        for b in range(0, B_NUM_BLOCKS):
+            emars = tl.load(emars_ptr, mask = mask_batch[None,:]) # [num_edges, BLOCK_B]
+            nmars = tl.load(nmars_ptr, mask = mask_batch[None,:]) # [BLOCK_B]
+            nflows = tl.load(nflows_ptr, mask = mask_batch[None,:]) # [BLOCK_B]
+
+            pflows = tl.sum(nflows[None,:] * tl.exp(emars - nmars[None,:]), axis = 1)
+
+            acc += pflows
+
+            # Increment `emars_ptr`, `nmars_ptr`, and `nmars_ptr`
+            emars_ptr += BLOCK_B
+            nmars_ptr += BLOCK_B
+            nflows_ptr += BLOCK_B
+
+            # Update batch mask
+            offs_batch += BLOCK_B
+            mask_batch = offs_batch < batch_size
+
+        par_start = tl.load(pids + ngroup_id * num_edges + offs_edge)
+        epars_ptr = params + par_start + tile_id
+        epars = tl.load(epars_ptr) # [num_edges]
+
+        parflow_start = tl.load(pfids + ngroup_id * num_edges + offs_edge)
+        eparflows_ptr = param_flows + par_start + tile_id
+        
+        curr_pflows = acc * epars
+
+        tl.atomic_add(eparflows_ptr, curr_pflows)
+
+    def _backward_sparse_par_flows(self, node_flows: torch.Tensor, params: torch.Tensor, node_mars: torch.Tensor, 
+                                   element_mars: torch.Tensor, param_flows: torch.Tensor, nids: torch.Tensor, 
+                                   cids: torch.Tensor, pids: torch.Tensor, pfids: torch.Tensor) -> None:
+        """
+        Backward pass of sum layers w.r.t. sum parameters with the block-sparse processing kernel.
+        
+        Parameters:
+        `node_flows`:    [N, B]
+        `element_flows`: [M, B]
+        `params`:        [E]
+        `node_mars`:     [N, B]
+        `element_mars`:  [M, B]
+        `param_flows`:   [E]
+        `nids`:          [ng]
+        `cids`:          [ng, c]
+        `pids`:          [ng, c]
+        """
+
+        assert params.dim() == 1, "Expecting a 1D `params`."
+
+        num_ngroups = nids.size(0)
+        layer_n_nodes = num_ngroups * self.group_size
+        num_edges = cids.size(1)
+        batch_size = node_mars.size(1)
+        BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
+
+        assert num_edges <= 16384, "The sparse backward kernel only support nodes with # edges smaller than 16384."
+
+        BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
+        BLOCK_M = self.group_sizes
+
+        grid = (layer_n_nodes,)
+
+        self._bk_triton_sparse_par_kernel[grid](
+            node_flows = node_flows, 
+            node_mars = node_mars, 
+            element_mars = element_mars, 
+            params = params, 
+            param_flows = param_flows, 
+            nids = nids, 
+            cids = cids, 
+            pids = pids,
+            pfids = pfids,
+            batch_size = batch_size, 
+            num_edges = num_edges, 
+            BLOCK_M = BLOCK_M,
+            BLOCK_B = BLOCK_B,
+            B_NUM_BLOCKS = triton.cdiv(batch_size, BLOCK_B),
             GROUP_SIZE_M = self.group_size
         )
 
