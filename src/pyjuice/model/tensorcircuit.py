@@ -67,7 +67,7 @@ class TensorCircuit(nn.Module):
         # Hyperparameters for backward pass
         self._optim_hyperparams = {
             "compute_param_flows": True,
-            "flows_memory": 0.0
+            "flows_memory": 1.0
         }
 
     def _init_pass_tensors(self):
