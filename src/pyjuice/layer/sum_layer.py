@@ -705,6 +705,8 @@ class SumLayer(Layer, nn.Module):
         else:
             mode = "sparse"
 
+        # mode = "pytorch" # debug
+
         if mode == "block_sparse":
             self._backward_block_sparse(
                 node_flows, element_flows, params, node_mars, element_mars, param_flows, 
@@ -980,12 +982,8 @@ class SumLayer(Layer, nn.Module):
 
         # Inner loop
         acc = tl.zeros([TILE_SIZE_M, TILE_SIZE_K], dtype = tl.float32)
-
+        
         for b in range(0, B_NUM_TILES):
-            # Update batch mask
-            offs_batch = tl.arange(0, TILE_SIZE_B) + b * TILE_SIZE_B
-            mask_batch = offs_batch < batch_size
-
             emars = tl.load(emars_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_K, TILE_SIZE_B]
             nmars = tl.load(nmars_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_M, TILE_SIZE_B]
             nflows = tl.load(nflows_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_M, TILE_SIZE_B]
@@ -1005,6 +1003,10 @@ class SumLayer(Layer, nn.Module):
             emars_ptr += TILE_SIZE_B
             nmars_ptr += TILE_SIZE_B
             nflows_ptr += TILE_SIZE_B
+
+            # Update batch mask
+            offs_batch += TILE_SIZE_B
+            mask_batch = offs_batch < batch_size
 
         par_start = tl.load(pids + ngroup_id * num_edges + offs_edge)
         epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
@@ -1044,7 +1046,7 @@ class SumLayer(Layer, nn.Module):
         BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
 
         # Heuristic to set `TILE_SIZE_M`, `TILE_SIZE_K`, and `BLOCK_B`
-        base_size = min(self.group_size, num_edges, BATCH_SIZE_NP2, 128)
+        base_size = min(self.group_size, num_edges, BATCH_SIZE_NP2, 64)
         if base_size >= 64:
             TILE_SIZE_B = base_size
             TILE_SIZE_M = 2048 // base_size
@@ -1250,10 +1252,6 @@ class SumLayer(Layer, nn.Module):
         acc = tl.zeros([num_edges], dtype = tl.float32)
 
         for b in range(0, B_NUM_BLOCKS):
-            # Update batch mask
-            offs_batch = tl.arange(0, BLOCK_B) + b * BLOCK_B
-            mask_batch = offs_batch < batch_size
-
             emars = tl.load(emars_ptr, mask = mask_batch[None,:]) # [num_edges, BLOCK_B]
             nmars = tl.load(nmars_ptr, mask = mask_batch) # [BLOCK_B]
             nflows = tl.load(nflows_ptr, mask = mask_batch) # [BLOCK_B]
@@ -1266,6 +1264,10 @@ class SumLayer(Layer, nn.Module):
             emars_ptr += BLOCK_B
             nmars_ptr += BLOCK_B
             nflows_ptr += BLOCK_B
+
+            # Update batch mask
+            offs_batch += TILE_SIZE_B
+            mask_batch = offs_batch < batch_size
 
         par_start = tl.load(pids + ngroup_id * num_edges + offs_edge)
         epars_ptr = params + par_start + tile_id

@@ -110,6 +110,13 @@ def simple_model_test():
     assert torch.all(sum_layer0.partitioned_pids[1][0,:] == torch.arange(256, 1280, 16))
     assert torch.all(sum_layer0.partitioned_pids[1][1,:] == torch.arange(1280, 2304, 16))
 
+    assert torch.all(sum_layer0.partitioned_pfids[0][0,:] == torch.arange(2048, 2560, 16))
+    assert torch.all(sum_layer0.partitioned_pfids[0][1,:] == torch.arange(2560, 3072, 16))
+    assert torch.all(sum_layer0.partitioned_pfids[0][2,:] == torch.arange(3072, 3584, 16))
+    assert torch.all(sum_layer0.partitioned_pfids[0][3,:] == torch.arange(3584, 4096, 16))
+    assert torch.all(sum_layer0.partitioned_pfids[1][0,:] == torch.arange(0, 1024, 16))
+    assert torch.all(sum_layer0.partitioned_pfids[1][1,:] == torch.arange(1024, 2048, 16))
+
     assert torch.all(sum_layer0.partitioned_chids[0] == torch.arange(16, 144, 16))
 
     assert torch.all(sum_layer0.partitioned_parids[0][:4] == torch.tensor([[144, 160]]))
