@@ -462,18 +462,19 @@ class TensorCircuit(nn.Module):
 
         self.num_dummy_nodes = max_ele_group_size
         self.num_dummy_eles = max_node_group_size
+        self.num_dummy_params = max_node_group_size * max_ele_group_size
 
         # Nodes include `max_ele_group_size` dummy nodes and all input/sum nodes in the PC
-        num_nodes = max_ele_group_size
+        num_nodes = self.num_dummy_nodes
 
         # Total number of edges
         num_edges = 0
 
         # Elements include `max_node_group_size` dummy elements and all product nodes in the PC
-        num_elements = max_node_group_size
+        num_elements = self.num_dummy_eles
 
         # Number of parameters
-        num_parameters = max_node_group_size * max_ele_group_size
+        num_parameters = self.num_dummy_params
 
         # Number of parameter flows
         num_param_flows = 0
@@ -597,7 +598,7 @@ class TensorCircuit(nn.Module):
 
     def _init_parameters(self, perturbation: float = 4.0, pseudocount: float = 0.0):
         params = torch.exp(torch.rand([self.num_sum_params]) * -perturbation)
-        params[:self.num_dummy_eles] = 0.0
+        params[:self.num_dummy_params] = 0.0
 
         # Copy initial parameters if provided
         for ns in self.root_ns:

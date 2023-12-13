@@ -1250,6 +1250,10 @@ class SumLayer(Layer, nn.Module):
         acc = tl.zeros([num_edges], dtype = tl.float32)
 
         for b in range(0, B_NUM_BLOCKS):
+            # Update batch mask
+            offs_batch = tl.arange(0, BLOCK_B) + b * BLOCK_B
+            mask_batch = offs_batch < batch_size
+
             emars = tl.load(emars_ptr, mask = mask_batch[None,:]) # [num_edges, BLOCK_B]
             nmars = tl.load(nmars_ptr, mask = mask_batch) # [BLOCK_B]
             nflows = tl.load(nflows_ptr, mask = mask_batch) # [BLOCK_B]
@@ -1262,10 +1266,6 @@ class SumLayer(Layer, nn.Module):
             emars_ptr += BLOCK_B
             nmars_ptr += BLOCK_B
             nflows_ptr += BLOCK_B
-
-            # Update batch mask
-            offs_batch += BLOCK_B
-            mask_batch = offs_batch < batch_size
 
         par_start = tl.load(pids + ngroup_id * num_edges + offs_edge)
         epars_ptr = params + par_start + tile_id
