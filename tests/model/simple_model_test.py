@@ -386,6 +386,34 @@ def simple_model_test():
     ni3_flows = np1_flows + np4_flows + np6_flows
     assert torch.all(torch.abs(ni3_flows - node_flows[sid:eid,:]) < 2e-4)
 
+    input_layer = pc.input_layer_group[0]
+    input_pflows = input_layer.param_flows.cpu()
+    data = data.cpu()
+
+    ni0_pflows = input_pflows[0:128].reshape(32, 4)
+    ref_pflows = torch.zeros_like(ni0_pflows)
+    for b in range(512):
+        ref_pflows[:,data[b,0]] += ni0_flows[:,b]
+    assert torch.all(torch.abs(ni0_pflows - ref_pflows) < 4e-3)
+
+    ni1_pflows = input_pflows[128:256].reshape(32, 4)
+    ref_pflows = torch.zeros_like(ni1_pflows)
+    for b in range(512):
+        ref_pflows[:,data[b,1]] += ni1_flows[:,b]
+    assert torch.all(torch.abs(ni1_pflows - ref_pflows) < 4e-3)
+
+    ni2_pflows = input_pflows[256:448].reshape(32, 6)
+    ref_pflows = torch.zeros_like(ni2_pflows)
+    for b in range(512):
+        ref_pflows[:,data[b,2]] += ni2_flows[:,b]
+    assert torch.all(torch.abs(ni2_pflows - ref_pflows) < 4e-3)
+
+    ni3_pflows = input_pflows[448:640].reshape(32, 6)
+    ref_pflows = torch.zeros_like(ni3_pflows)
+    for b in range(512):
+        ref_pflows[:,data[b,3]] += ni3_flows[:,b]
+    assert torch.all(torch.abs(ni3_pflows - ref_pflows) < 4e-3)
+
     import pdb; pdb.set_trace()
 
 
