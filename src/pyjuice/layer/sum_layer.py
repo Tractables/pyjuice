@@ -695,7 +695,7 @@ class SumLayer(Layer, nn.Module):
         batch_size = node_flows.size(1)
 
         if mode is not None:
-            assert mode in ["block_sparse", "sparse"]
+            assert mode in ["block_sparse", "sparse", "pytorch"]
         elif params.dim() == 1 and self.group_size >= 16 and num_edges >= 16 and batch_size >= 16:
             # In this case, we should definitely use the block-sparse implementation
             mode = "block_sparse"
@@ -704,6 +704,8 @@ class SumLayer(Layer, nn.Module):
             mode = "sparse"
         else:
             mode = "sparse"
+
+        # mode = "sparse" ##### debug
 
         if mode == "block_sparse":
             self._backward_block_sparse(
@@ -723,6 +725,8 @@ class SumLayer(Layer, nn.Module):
                 element_mars, param_flows, chids, parids, parpids,
                 cs_group_size
             )
+        else:
+            raise ValueError(f"Not supported mode `{mode}`.")
 
     def _backward_block_sparse(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
                                params: torch.Tensor, node_mars: torch.Tensor, 
@@ -1168,6 +1172,9 @@ class SumLayer(Layer, nn.Module):
 
             tl.store(eflows_ptr, eflows, mask = mask_batch)
 
+            # Increment `epars_ptr`
+            epars_ptr += GROUP_SIZE_K
+
             # Increment `emars_ptr` and `eflows_ptr`
             emars_ptr += batch_size
             eflows_ptr += batch_size
@@ -1189,7 +1196,7 @@ class SumLayer(Layer, nn.Module):
         assert num_edges <= 16384, "The sparse backward kernel only support nodes with # edges smaller than 16384."
 
         BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
-        BLOCK_M = cs_group_sizes
+        BLOCK_M = cs_group_size
 
         grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, BLOCK_M))
 
@@ -1251,8 +1258,8 @@ class SumLayer(Layer, nn.Module):
 
         for b in range(0, B_NUM_BLOCKS):
             emars = tl.load(emars_ptr, mask = mask_batch[None,:]) # [num_edges, BLOCK_B]
-            nmars = tl.load(nmars_ptr, mask = mask_batch[None,:]) # [BLOCK_B]
-            nflows = tl.load(nflows_ptr, mask = mask_batch[None,:]) # [BLOCK_B]
+            nmars = tl.load(nmars_ptr, mask = mask_batch) # [BLOCK_B]
+            nflows = tl.load(nflows_ptr, mask = mask_batch) # [BLOCK_B]
 
             pflows = tl.sum(nflows[None,:] * tl.exp(emars - nmars[None,:]), axis = 1)
 
@@ -1307,7 +1314,7 @@ class SumLayer(Layer, nn.Module):
         assert num_edges <= 16384, "The sparse backward kernel only support nodes with # edges smaller than 16384."
 
         BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
-        BLOCK_M = self.group_sizes
+        BLOCK_M = self.group_size
 
         grid = (layer_n_nodes,)
 

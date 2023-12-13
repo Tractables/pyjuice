@@ -326,7 +326,7 @@ def sum_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, 
                 
             # Global pid and pfid start index for `ns`
             ns_pid_start = ns._param_range[0]
-            ns_pfid_start = ns._param_range[0]
+            ns_pfid_start = ns._param_flow_range[0]
         else:
             source_ns = ns.get_source_ns()
 
@@ -517,6 +517,7 @@ def sum_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, 
         # Restore `cids` and `pids`
         target_cids = target_cids.cpu()
         target_pids = target_pids.cpu()
+        target_pfids = target_pfids.cpu()
         cids = []
         pids = []
         pfids = []
