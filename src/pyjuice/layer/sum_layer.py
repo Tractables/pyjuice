@@ -1266,7 +1266,7 @@ class SumLayer(Layer, nn.Module):
             nflows_ptr += BLOCK_B
 
             # Update batch mask
-            offs_batch += TILE_SIZE_B
+            offs_batch += BLOCK_B
             mask_batch = offs_batch < batch_size
 
         par_start = tl.load(pids + ngroup_id * num_edges + offs_edge)
