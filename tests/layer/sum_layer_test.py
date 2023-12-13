@@ -176,7 +176,7 @@ def speed_test():
     prod_layer = ProdLayer(nps, layer_sparsity_tol = 0.1)
 
     layer = SumLayer(nodes, global_nid_start = group_size,
-                     global_pid_start = 1, global_pfid_start = 0, node2tiednodes = dict(), )
+                     global_pid_start = group_size ** 2, global_pfid_start = 0, node2tiednodes = dict(), )
 
     layer.to(device)
 
@@ -197,30 +197,29 @@ def speed_test():
     forward_ms = (t1 - t0) / 100 * 1000
 
     print(f"Forward pass on average takes {forward_ms:.3f}ms.")
-    print("Reference computation time on RTX 4090: 0.871ms.")
+    print("Reference computation time on RTX 4090: 0.669ms.")
     print("--------------------------------------------------------------")
 
     node_flows = torch.rand([group_size + group_size * num_node_groups * num_prod_nodes, batch_size]).to(device)
     element_flows = torch.zeros([group_size + num_prod_nodes * group_size * num_node_groups, batch_size]).log().to(device)
-    param_flows = torch.zeros([layer.partitioned_pids[0].max() + group_size]).to(device)
+    param_flows = torch.zeros([group_size ** 2 + layer.partitioned_pids[0].max() + group_size]).to(device)
 
     layer.backward(node_flows, element_flows, node_mars, element_mars, params, param_flows)
 
     t0 = time.time()
     torch.cuda.synchronize()
-    for _ in range(10000000000000000):
+    for _ in range(100):
         layer.backward(node_flows, element_flows, node_mars, element_mars, params, param_flows)
-        time.sleep(0.002)
     torch.cuda.synchronize()
     t1 = time.time()
     backward_ms = (t1 - t0) / 100 * 1000
 
     print(f"Backward pass on average takes {backward_ms:.3f}ms.")
-    print("Reference computation time on RTX 4090: 1.200ms.")
+    print("Reference computation time on RTX 4090: 1.593ms.")
     print("--------------------------------------------------------------")
 
 
 if __name__ == "__main__":
     torch.manual_seed(3890)
     sum_layer_test()
-    # speed_test()
+    speed_test()

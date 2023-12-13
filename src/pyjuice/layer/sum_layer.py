@@ -314,32 +314,6 @@ class SumLayer(Layer, nn.Module):
 
         return None
 
-    @staticmethod
-    @torch.compile(mode = "reduce-overhead", fullgraph = True)
-    def _forward_pytorch_kernel(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor, 
-                                nids: torch.Tensor, cids: torch.Tensor, pids: torch.Tensor,
-                                local_ids: torch.Tensor):
-
-        if local_ids is not None:
-            nids = nids[local_ids]
-            cids = cids[local_ids]
-            pids = pids[local_ids]
-
-        num_ngroups = nids.size(0)
-        num_edges = cids.size(1)
-        nids = (nids[:,None].repeat(1, self.group_size) + \
-            torch.arange(0, self.group_size, device = nids.device)[None,:]).reshape(num_ngroups * self.group_size)
-        cids = cids[:,None,:].repeat(1, self.group_size, 1).reshape(num_ngroups * self.group_size, num_edges)
-        pids = (pids[:,None,:].repeat(1, self.group_size, 1) + \
-            torch.arange(0, self.group_size, device = cids.device)[None,:,None]).reshape(num_ngroups * self.group_size, num_edges)
-
-        ch_mars = element_mars[cids]
-        maxval = ch_mars.max(dim = 1, keepdim = True).values
-        node_mars[nids] = (((ch_mars - maxval).exp() * params[pids].unsqueeze(-1)).sum(
-            dim = 1).clamp(min = 1e-10)).log() + maxval.squeeze(1)
-
-        return None
-
     def _forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor,
                  params: torch.Tensor, nids: torch.Tensor, cids: torch.Tensor,
                  pids: torch.Tensor, local_ids: Optional[torch.Tensor] = None,
@@ -664,6 +638,32 @@ class SumLayer(Layer, nn.Module):
 
         return None
 
+    @staticmethod
+    @torch.compile(mode = "reduce-overhead", fullgraph = True)
+    def _forward_pytorch_kernel(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor, 
+                                nids: torch.Tensor, cids: torch.Tensor, pids: torch.Tensor,
+                                local_ids: torch.Tensor):
+
+        if local_ids is not None:
+            nids = nids[local_ids]
+            cids = cids[local_ids]
+            pids = pids[local_ids]
+
+        num_ngroups = nids.size(0)
+        num_edges = cids.size(1)
+        nids = (nids[:,None].repeat(1, self.group_size) + \
+            torch.arange(0, self.group_size, device = nids.device)[None,:]).reshape(num_ngroups * self.group_size)
+        cids = cids[:,None,:].repeat(1, self.group_size, 1).reshape(num_ngroups * self.group_size, num_edges)
+        pids = (pids[:,None,:].repeat(1, self.group_size, 1) + \
+            torch.arange(0, self.group_size, device = cids.device)[None,:,None]).reshape(num_ngroups * self.group_size, num_edges)
+
+        ch_mars = element_mars[cids]
+        maxval = ch_mars.max(dim = 1, keepdim = True).values
+        node_mars[nids] = (((ch_mars - maxval).exp() * params[pids].unsqueeze(-1)).sum(
+            dim = 1).clamp(min = 1e-10)).log() + maxval.squeeze(1)
+
+        return None
+
     def _backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
                   params: torch.Tensor, node_mars: torch.Tensor, 
                   element_mars: torch.Tensor, param_flows: torch.Tensor,
@@ -704,8 +704,6 @@ class SumLayer(Layer, nn.Module):
             mode = "sparse"
         else:
             mode = "sparse"
-
-        mode = "sparse" ##### debug
 
         if mode == "block_sparse":
             self._backward_block_sparse(
@@ -984,6 +982,10 @@ class SumLayer(Layer, nn.Module):
         acc = tl.zeros([TILE_SIZE_M, TILE_SIZE_K], dtype = tl.float32)
 
         for b in range(0, B_NUM_TILES):
+            # Update batch mask
+            offs_batch = tl.arange(0, TILE_SIZE_B) + b * TILE_SIZE_B
+            mask_batch = offs_batch < batch_size
+
             emars = tl.load(emars_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_K, TILE_SIZE_B]
             nmars = tl.load(nmars_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_M, TILE_SIZE_B]
             nflows = tl.load(nflows_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_M, TILE_SIZE_B]
@@ -1004,20 +1006,16 @@ class SumLayer(Layer, nn.Module):
             nmars_ptr += TILE_SIZE_B
             nflows_ptr += TILE_SIZE_B
 
-            # Update batch mask
-            offs_batch += TILE_SIZE_B
-            mask_batch = offs_batch < batch_size
-
         par_start = tl.load(pids + ngroup_id * num_edges + offs_edge)
         epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
         epars = tl.load(params + epars_offsets)
 
         parflow_start = tl.load(pfids + ngroup_id * num_edges + offs_edge)
-        epars_offsets = offs_node[:,None] + parflow_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
+        eparflows_offsets = offs_node[:,None] + parflow_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
         
         curr_pflows = acc * epars
 
-        tl.atomic_add(param_flows + epars_offsets, curr_pflows)
+        tl.atomic_add(param_flows + eparflows_offsets, curr_pflows)
 
     def _backward_block_sparse_par_flows(self, node_flows: torch.Tensor, params: torch.Tensor, node_mars: torch.Tensor, 
                                          element_mars: torch.Tensor, param_flows: torch.Tensor, nids: torch.Tensor, 
@@ -1248,11 +1246,6 @@ class SumLayer(Layer, nn.Module):
         nmars_ptr = node_mars + (off_nids + tile_id) * batch_size + offs_batch # [BLOCK_B]
         nflows_ptr = node_flows + (off_nids + tile_id) * batch_size + offs_batch # [BLOCK_B]
 
-        # Initialize `params`
-        par_start = tl.load(pids + ngroup_id * num_edges + offs_edge)
-        epars_ptr = params + par_start + tile_id
-        epars = tl.load(epars_ptr) # [num_edges]
-
         # Inner loop
         acc = tl.zeros([num_edges], dtype = tl.float32)
 
@@ -1362,7 +1355,10 @@ class SumLayer(Layer, nn.Module):
 
         # Flows w.r.t. parameters
         if param_flows is not None and nids is not None:
-            pass
+            self._backward_pytorch_par_kernel(
+                node_flows, params, node_mars, element_mars, param_flows, 
+                nids, cids, pids, pfids, self.group_size
+            )
 
     @torch.compile(mode = "reduce-overhead")
     def _backward_pytorch_ele_kernel(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
@@ -1388,8 +1384,28 @@ class SumLayer(Layer, nn.Module):
 
         return None
 
-    def _backward_pytorch_par_kernel(self, node_flows):
-        pass
+    @torch.compile(mode = "reduce-overhead")
+    def _backward_pytorch_par_kernel(self, node_flows: torch.Tensor, params: torch.Tensor, node_mars: torch.Tensor, 
+                                     element_mars: torch.Tensor, param_flows: torch.Tensor, nids: torch.Tensor, 
+                                     cids: torch.Tensor, pids: torch.Tensor, pfids: torch.Tensor, ns_group_size: int):
+
+        num_ngroups = nids.size(0)
+        num_edges = cids.size(1)
+        nids = (nids[:,None].repeat(1, self.group_size) + \
+            torch.arange(0, self.group_size, device = nids.device)[None,:]).reshape(num_ngroups * self.group_size)
+        cids = cids[:,None,:].repeat(1, self.group_size, 1).reshape(num_ngroups * self.group_size, num_edges)
+        pids = (pids[:,None,:].repeat(1, self.group_size, 1) + \
+            torch.arange(0, self.group_size, device = cids.device)[None,:,None]).reshape(num_ngroups * self.group_size, num_edges)
+        pfids = (pfids[:,None,:].repeat(1, self.group_size, 1) + \
+            torch.arange(0, self.group_size, device = cids.device)[None,:,None]).reshape(num_ngroups * self.group_size, num_edges)
+
+        parflows = (node_flows[nids].unsqueeze(1) * params[pids].unsqueeze(-1) * (element_mars[cids] - node_mars[nids].unsqueeze(1)).exp()).sum(dim = 2)
+
+        for i in range(num_ngroups):
+            sid, eid = ns_group_size * i, ns_group_size * (i + 1)
+            param_flows[pfids[sid:eid,:]] += parflows[sid:eid,:]
+
+        return None
 
     def _prepare_scope2nids(self, prod_scope_eleids: Sequence[Tuple[BitSet, torch.Tensor]]):
         if not (hasattr(self, "fw_scope2localids") and hasattr(self, "bk_scope2localids")):
