@@ -197,7 +197,7 @@ def speed_test():
     forward_ms = (t1 - t0) / 100 * 1000
 
     print(f"Forward pass on average takes {forward_ms:.3f}ms.")
-    print("Reference computation time on RTX 4090: 0.669ms.")
+    print("Reference computation time on RTX 4090: 0.635ms.")
     print("--------------------------------------------------------------")
 
     node_flows = torch.rand([group_size + group_size * num_node_groups * num_prod_nodes, batch_size]).to(device)
@@ -215,7 +215,7 @@ def speed_test():
     backward_ms = (t1 - t0) / 100 * 1000
 
     print(f"Backward pass on average takes {backward_ms:.3f}ms.")
-    print("Reference computation time on RTX 4090: 1.593ms.")
+    print("Reference computation time on RTX 4090: 1.274ms.")
     print("--------------------------------------------------------------")
 
 

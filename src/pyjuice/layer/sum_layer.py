@@ -990,10 +990,10 @@ class SumLayer(Layer, nn.Module):
 
             emars_max = tl.max(emars, axis = 0)
             nflows_div_mars = nflows * tl.exp(emars_max[None,:] - nmars)
-            nflows_div_mars = nflows_div_mars.to(tl.bfloat16)
+            nflows_div_mars = nflows_div_mars.to(tl.float16)
 
             emars = tl.exp(emars - emars_max[None,:])
-            emars = emars.to(tl.bfloat16)
+            emars = emars.to(tl.float16)
 
             pflows = tl.dot(nflows_div_mars, tl.trans(emars)).to(tl.float32)
 

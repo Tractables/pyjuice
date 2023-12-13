@@ -313,6 +313,7 @@ class TensorCircuit(nn.Module):
         """
         Copy parameters from this `TensorCircuit` to the original `CircuitNodes`
         """
+        raise NotImplementedError()
         params = self.params.detach().cpu()
         if update_flows:
             param_flows = self.param_flows.detach().cpu()

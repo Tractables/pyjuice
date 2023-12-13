@@ -275,10 +275,120 @@ def simple_model_test():
 
     lls.mean().backward()
 
-    # node_flows = pc.node_flows.cpu()
+    node_flows = pc.node_flows.cpu()
+    param_flows = pc.param_flows.cpu()
+
+    sid, eid = ns._output_ind_range
+    assert torch.all(torch.abs(node_flows[sid:eid,:] - 1.0) < 1e-4)
+
+    pc.inner_layer_groups[2][0].forward(pc.node_mars, pc.element_mars)
+    pc.inner_layer_groups[3][0].backward(pc.node_flows, pc.element_flows, pc.node_mars, pc.element_mars, pc.params, pc.param_flows)
+    element_flows = pc.element_flows.cpu()
+
+    ch_lls = torch.cat((np4_lls, np5_lls, np6_lls), dim = 0)
+    epars = ns._params.reshape(1, 6, 1, 16).permute(0, 2, 1, 3).reshape(96, 1)
+    eflows = epars * (ch_lls - ns_lls).exp()
+
+    sid, eid = np4._output_ind_range
+    np4_flows = eflows[0:32,:]
+    assert torch.all(torch.abs(np4_flows - element_flows[sid:eid,:]) < 1e-4)
+
+    sid, eid = np5._output_ind_range
+    np5_flows = eflows[32:64,:]
+    assert torch.all(torch.abs(np5_flows - element_flows[sid:eid,:]) < 1e-4)
+
+    sid, eid = np6._output_ind_range
+    np6_flows = eflows[64:96,:]
+    assert torch.all(torch.abs(np6_flows - element_flows[sid:eid,:]) < 1e-4)
+
+    ns_parflows = eflows.sum(dim = 1)
+    ref_parflows = param_flows[4096:4192]
+    assert torch.all(torch.abs(ns_parflows - ref_parflows) < 1e-3)
+
+    sid, eid = ns0._output_ind_range
+    ns0_flows = np4_flows
+    assert torch.all(torch.abs(ns0_flows - node_flows[sid:eid,:]) < 1e-4)
+
+    sid, eid = ns1._output_ind_range
+    ns1_flows = np5_flows
+    assert torch.all(torch.abs(ns1_flows - node_flows[sid:eid,:]) < 1e-4)
+
+    sid, eid = ns2._output_ind_range
+    ns2_flows = np6_flows
+    assert torch.all(torch.abs(ns2_flows - node_flows[sid:eid,:]) < 1e-4)
+
+    pc.inner_layer_groups[0][0].forward(pc.node_mars, pc.element_mars)
+    pc.inner_layer_groups[1][0].backward(pc.node_flows, pc.element_flows, pc.node_mars, pc.element_mars, pc.params, pc.param_flows)
+    element_flows = pc.element_flows.cpu()
+
+    ch_lls = torch.cat((np0_lls, np3_lls), dim = 0)
+    epars = ns0._params.reshape(2, 4, 16, 16).permute(0, 2, 1, 3).reshape(32, 64)
+    ch_lls_max = ch_lls.max(dim = 0).values
+    nflow_div_mar = ns0_flows * (ch_lls_max[None,:] - ns0_lls).exp()
+    emars = (ch_lls - ch_lls_max[None,:]).exp()
+    eflows = emars * torch.matmul(epars.permute(1, 0), nflow_div_mar)
+
+    sid, eid = np0._output_ind_range
+    np0_flows = eflows[0:32,:]
+    assert torch.all(torch.abs(np0_flows - element_flows[sid:eid,:]) < 1e-4)
+
+    sid, eid = np3._output_ind_range
+    np3_flows = eflows[32:64,:]
+    assert torch.all(torch.abs(np3_flows - element_flows[sid:eid,:]) < 1e-4)
+
+    ns0_parflows = epars * torch.matmul(nflow_div_mar, emars.permute(1, 0))
+    ref_parflows = param_flows[0:2048].reshape(2, 64, 16).permute(0, 2, 1).reshape(32, 64)
+    assert torch.all(torch.abs(ns0_parflows - ref_parflows) < 1e-4)
+
+    ch_lls = np1_lls
+    epars = ns1._params.reshape(2, 2, 16, 16).permute(0, 2, 1, 3).reshape(32, 32)
+    ch_lls_max = ch_lls.max(dim = 0).values
+    nflow_div_mar = ns1_flows * (ch_lls_max[None,:] - ns1_lls).exp()
+    emars = (ch_lls - ch_lls_max[None,:]).exp()
+    eflows = emars * torch.matmul(epars.permute(1, 0), nflow_div_mar)
+
+    sid, eid = np1._output_ind_range
+    np1_flows = eflows
+    assert torch.all(torch.abs(np1_flows - element_flows[sid:eid,:]) < 1e-4)
+
+    ns1_parflows = epars * torch.matmul(nflow_div_mar, emars.permute(1, 0))
+    ref_parflows = param_flows[2048:3072].reshape(2, 32, 16).permute(0, 2, 1).reshape(32, 32)
+    assert torch.all(torch.abs(ns1_parflows - ref_parflows) < 1e-4)
+
+    ch_lls = np2_lls
+    epars = ns2._params.reshape(2, 2, 16, 16).permute(0, 2, 1, 3).reshape(32, 32)
+    ch_lls_max = ch_lls.max(dim = 0).values
+    nflow_div_mar = ns2_flows * (ch_lls_max[None,:] - ns2_lls).exp()
+    emars = (ch_lls - ch_lls_max[None,:]).exp()
+    eflows = emars * torch.matmul(epars.permute(1, 0), nflow_div_mar)
+
+    sid, eid = np2._output_ind_range
+    np2_flows = eflows
+    assert torch.all(torch.abs(np2_flows - element_flows[sid:eid,:]) < 1e-4)
+
+    ns2_parflows = epars * torch.matmul(nflow_div_mar, emars.permute(1, 0))
+    ref_parflows = param_flows[3072:4096].reshape(2, 32, 16).permute(0, 2, 1).reshape(32, 32)
+    assert torch.all(torch.abs(ns2_parflows - ref_parflows) < 3e-4)
+
+    sid, eid = ni0._output_ind_range
+    ni0_flows = np0_flows + np3_flows + np5_flows + np6_flows
+    assert torch.all(torch.abs(ni0_flows - node_flows[sid:eid,:]) < 2e-4)
+
+    sid, eid = ni1._output_ind_range
+    ni1_flows = np0_flows + np2_flows + np3_flows + np5_flows
+    assert torch.all(torch.abs(ni1_flows - node_flows[sid:eid,:]) < 2e-4)
+
+    sid, eid = ni2._output_ind_range
+    ni2_flows = np1_flows + np2_flows + np4_flows
+    assert torch.all(torch.abs(ni2_flows - node_flows[sid:eid,:]) < 2e-4)
+
+    sid, eid = ni3._output_ind_range
+    ni3_flows = np1_flows + np4_flows + np6_flows
+    assert torch.all(torch.abs(ni3_flows - node_flows[sid:eid,:]) < 2e-4)
 
     import pdb; pdb.set_trace()
 
 
 if __name__ == "__main__":
+    torch.manual_seed(23892)
     simple_model_test()
