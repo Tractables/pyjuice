@@ -42,7 +42,7 @@ def sum_layer_test():
 
     layer = SumLayer([ns0, ns1, ns2], global_nid_start = group_size,
                      global_pid_start = group_size ** 2, 
-                     global_pfid_start = group_size ** 2, node2tiednodes = dict(), )
+                     global_pfid_start = 0, node2tiednodes = dict(), )
 
     assert torch.all(layer.partitioned_nids[0] == torch.arange(group_size, 7 * group_size, group_size))
     assert torch.all(layer.partitioned_cids[0][0:2,0] == group_size)
@@ -53,8 +53,8 @@ def sum_layer_test():
     assert torch.all(layer.partitioned_cids[0][4:6,1] == 5 * group_size + 1)
     assert torch.all(layer.partitioned_pids[0][:,0] == torch.arange(group_size, (group_size * 2 * 6 + 1) * group_size, 2 * group_size * group_size) - group_size + group_size ** 2)
     assert torch.all(layer.partitioned_pids[0][:,1] == torch.arange(group_size, (group_size * 2 * 6 + 1) * group_size, 2 * group_size * group_size) + group_size ** 2)
-    assert torch.all(layer.partitioned_pfids[0][:,0] == torch.arange(group_size, (group_size * 2 * 6 + 1) * group_size, 2 * group_size * group_size) - group_size + group_size ** 2)
-    assert torch.all(layer.partitioned_pfids[0][:,1] == torch.arange(group_size, (group_size * 2 * 6 + 1) * group_size, 2 * group_size * group_size) + group_size ** 2)
+    assert torch.all(layer.partitioned_pfids[0][:,0] == torch.arange(group_size, (group_size * 2 * 6 + 1) * group_size, 2 * group_size * group_size) - group_size)
+    assert torch.all(layer.partitioned_pfids[0][:,1] == torch.arange(group_size, (group_size * 2 * 6 + 1) * group_size, 2 * group_size * group_size))
 
     assert torch.all(layer.partitioned_chids[0] == torch.arange(group_size, 7 * group_size, group_size))
     assert torch.all(layer.partitioned_parids[0][0:2,0] == group_size)
@@ -137,8 +137,6 @@ def sum_layer_test():
             pflows = epars * (nflows[None,:] * emars / nmars[None,:]).sum(dim = 1)
 
             my_pflows[layer.partitioned_pfids[0][j,:]+i] = pflows
-
-    import pdb; pdb.set_trace()
 
     assert torch.all(torch.abs(my_pflows - param_flows) < 2e-3)
 

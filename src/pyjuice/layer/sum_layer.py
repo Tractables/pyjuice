@@ -705,7 +705,7 @@ class SumLayer(Layer, nn.Module):
         else:
             mode = "sparse"
 
-        mode = "pytorch" ##### debug
+        mode = "sparse" ##### debug
 
         if mode == "block_sparse":
             self._backward_block_sparse(
@@ -1224,13 +1224,13 @@ class SumLayer(Layer, nn.Module):
     @triton.jit
     def _bk_triton_sparse_par_kernel(node_flows, node_mars, element_mars, params, param_flows, nids, cids, pids, pfids,
                                      batch_size: tl.constexpr, num_edges: tl.constexpr, BLOCK_M: tl.constexpr, 
-                                     BLOCK_B: tl.constexpr, B_NUM_BLOCKS: tl.constexpr, GROUP_SIZE_M: tl.constexpr):
+                                     BLOCK_B: tl.constexpr, B_NUM_BLOCKS: tl.constexpr):
 
         pid_m = tl.program_id(0) # ID of size-`BLOCK_M` nodes
 
         # Get inferred node group id from `pid_m`
-        ngroup_id = pid_m // GROUP_SIZE_M
-        tile_id = pid_m % GROUP_SIZE_M
+        ngroup_id = pid_m // BLOCK_M
+        tile_id = pid_m % BLOCK_M
 
         # Batch offsets and mask
         offs_batch = tl.arange(0, BLOCK_B)
@@ -1246,7 +1246,7 @@ class SumLayer(Layer, nn.Module):
         # Initialize pointers to `node_flows` and `node_mars`
         off_nids = tl.load(nids + ngroup_id)
         nmars_ptr = node_mars + (off_nids + tile_id) * batch_size + offs_batch # [BLOCK_B]
-        nflows_ptr = node_flows + off_nids * batch_size + offs_batch # [BLOCK_B]
+        nflows_ptr = node_flows + (off_nids + tile_id) * batch_size + offs_batch # [BLOCK_B]
 
         # Initialize `params`
         par_start = tl.load(pids + ngroup_id * num_edges + offs_edge)
@@ -1279,7 +1279,7 @@ class SumLayer(Layer, nn.Module):
         epars = tl.load(epars_ptr) # [num_edges]
 
         parflow_start = tl.load(pfids + ngroup_id * num_edges + offs_edge)
-        eparflows_ptr = param_flows + par_start + tile_id
+        eparflows_ptr = param_flows + parflow_start + tile_id
         
         curr_pflows = acc * epars
 
@@ -1332,25 +1332,44 @@ class SumLayer(Layer, nn.Module):
             num_edges = num_edges, 
             BLOCK_M = BLOCK_M,
             BLOCK_B = BLOCK_B,
-            B_NUM_BLOCKS = triton.cdiv(batch_size, BLOCK_B),
-            GROUP_SIZE_M = self.group_size
+            B_NUM_BLOCKS = triton.cdiv(batch_size, BLOCK_B)
         )
 
     def _backward_pytorch(self, node_flows, element_flows, params, node_mars, 
                           element_mars, param_flows, nids, cids, pids, pfids, 
                           chids, parids, parpids, cs_group_size):
-
+        """
+        Back pass of sum layers with native pytorch.
         
+        Parameters:
+        `node_flows`:   [N, B]
+        `element_flows: [M, B]
+        `params`:       [E]
+        `node_mars`:    [N, B]
+        `element_mars`: [M, B]
+        `param_flows`:  [E]
+        `chids`:        [ng]
+        `parids`:       [ng, c]
+        `parpids`:      [ng, c]
+        """
 
-    @torch.compile(mode = "reduce-overhead", fullgraph = True)
+        # Flows w.r.t. input elements (product nodes)
+        if chids is not None:
+            self._backward_pytorch_ele_kernel(
+                node_flows, element_flows, params, node_mars, element_mars, 
+                param_flows, chids, parids, parpids, cs_group_size
+            )
+
+        # Flows w.r.t. parameters
+        if param_flows is not None and nids is not None:
+            pass
+
+    @torch.compile(mode = "reduce-overhead")
     def _backward_pytorch_ele_kernel(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
                                      params: torch.Tensor, node_mars: torch.Tensor, 
                                      element_mars: torch.Tensor, param_flows: Optional[torch.Tensor], 
                                      chids: torch.Tensor, parids: torch.Tensor, parpids: torch.Tensor,
                                      cs_group_size: int):
-
-        # if param_flows is not None:
-        #     raise ValueError("PyTorch kernel does not support computing parameter flows.")
 
         num_ngroups = chids.size(0)
         num_egroups = parids.size(1)
@@ -1368,6 +1387,9 @@ class SumLayer(Layer, nn.Module):
             (element_mars[chids].unsqueeze(1) - node_mars[parids]).exp()).sum(dim = 1)
 
         return None
+
+    def _backward_pytorch_par_kernel(self, node_flows):
+        pass
 
     def _prepare_scope2nids(self, prod_scope_eleids: Sequence[Tuple[BitSet, torch.Tensor]]):
         if not (hasattr(self, "fw_scope2localids") and hasattr(self, "bk_scope2localids")):
