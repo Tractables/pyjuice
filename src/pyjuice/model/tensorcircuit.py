@@ -473,10 +473,10 @@ class TensorCircuit(nn.Module):
         num_elements = max_node_group_size
 
         # Number of parameters
-        num_parameters = max_node_group_size
+        num_parameters = max_node_group_size * max_ele_group_size
 
         # Number of parameter flows
-        num_param_flows = 0
+        num_param_flows = max_node_group_size * max_ele_group_size
 
         # Stores distributed parameter flows
         node2tiednodes = dict()
