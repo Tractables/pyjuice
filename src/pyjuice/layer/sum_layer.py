@@ -705,7 +705,7 @@ class SumLayer(Layer, nn.Module):
         else:
             mode = "sparse"
 
-        # mode = "sparse" ##### debug
+        mode = "pytorch" ##### debug
 
         if mode == "block_sparse":
             self._backward_block_sparse(
@@ -722,8 +722,8 @@ class SumLayer(Layer, nn.Module):
         elif mode == "pytorch":
             self._backward_pytorch(
                 node_flows, element_flows, params, node_mars, 
-                element_mars, param_flows, chids, parids, parpids,
-                cs_group_size
+                element_mars, param_flows, nids, cids, pids, pfids, 
+                chids, parids, parpids, cs_group_size
             )
         else:
             raise ValueError(f"Not supported mode `{mode}`.")
@@ -794,8 +794,8 @@ class SumLayer(Layer, nn.Module):
         offs_edge_nid = (offs_edge % GROUP_SIZE_K)
         par_start = tl.load(parpids_start + elegroup_id * ptr_inc_step + offs_edge_gid)
         epars_ptr = params + \
-            offs_ele[:,None] + \
-            (par_start + offs_edge_nid * GROUP_SIZE_K)[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
+            offs_ele[:,None] * GROUP_SIZE_K + \
+            (par_start + offs_edge_nid)[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
 
         # Batch offsets and mask
         offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B
@@ -1336,25 +1336,31 @@ class SumLayer(Layer, nn.Module):
             GROUP_SIZE_M = self.group_size
         )
 
-    @torch.compile(mode = "reduce-overhead", fullgraph = True)
-    def _backward_pytorch(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
-                          params: torch.Tensor, node_mars: torch.Tensor, 
-                          element_mars: torch.Tensor, param_flows: Optional[torch.Tensor], 
-                          chids: torch.Tensor, parids: torch.Tensor, parpids: torch.Tensor,
-                          cs_group_size: int):
+    def _backward_pytorch(self, node_flows, element_flows, params, node_mars, 
+                          element_mars, param_flows, nids, cids, pids, pfids, 
+                          chids, parids, parpids, cs_group_size):
 
-        if param_flows is not None:
-            raise ValueError("PyTorch kernel does not support computing parameter flows.")
+        
+
+    @torch.compile(mode = "reduce-overhead", fullgraph = True)
+    def _backward_pytorch_ele_kernel(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
+                                     params: torch.Tensor, node_mars: torch.Tensor, 
+                                     element_mars: torch.Tensor, param_flows: Optional[torch.Tensor], 
+                                     chids: torch.Tensor, parids: torch.Tensor, parpids: torch.Tensor,
+                                     cs_group_size: int):
+
+        # if param_flows is not None:
+        #     raise ValueError("PyTorch kernel does not support computing parameter flows.")
 
         num_ngroups = chids.size(0)
         num_egroups = parids.size(1)
         parids = (parids[:,:,None].repeat(1, 1, self.group_size) + torch.arange(0, self.group_size, device = parids.device)).reshape(num_ngroups, num_egroups * self.group_size)
-        parpids = (parpids[:,:,None] + torch.arange(0, self.group_size * cs_group_size, cs_group_size, device = parids.device)).reshape(
+        parpids = (parpids[:,:,None] + torch.arange(0, self.group_size, device = parids.device)).reshape(
             num_ngroups, num_egroups * self.group_size)
 
         chids = (chids[:,None].repeat(1, cs_group_size) + torch.arange(0, cs_group_size, device = chids.device)).reshape(num_ngroups * cs_group_size)
         parids = parids[:,None,:].repeat(1, cs_group_size, 1).reshape(num_ngroups * cs_group_size, num_egroups * self.group_size)
-        parpids = (parpids[:,None,:].repeat(1, cs_group_size, 1) + torch.arange(0, cs_group_size, device = parpids.device)[None,:,None]).reshape(
+        parpids = (parpids[:,None,:].repeat(1, cs_group_size, 1) + torch.arange(0, cs_group_size * self.group_size, self.group_size, device = parpids.device)[None,:,None]).reshape(
             num_ngroups * cs_group_size, num_egroups * self.group_size
         )
         

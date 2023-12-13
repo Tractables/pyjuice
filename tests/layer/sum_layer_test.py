@@ -110,19 +110,21 @@ def sum_layer_test():
     num_ngroups = chids.size(0)
     num_egroups = parids.size(1)
     parids = (parids[:,:,None].repeat(1, 1, group_size) + torch.arange(0, group_size, device = parids.device)).reshape(num_ngroups, num_egroups * group_size)
-    parpids = (parpids[:,:,None] + torch.arange(0, group_size * group_size, group_size, device = parids.device)).reshape(
+    parpids_start = (parpids[:,:,None] + torch.arange(0, group_size, device = parids.device)).reshape(
         num_ngroups, num_egroups * group_size)
 
-    for i in range(group_size):
-        for j in range(6):
+    for j in range(6):
+        parpids = parpids_start.clone()
+        for i in range(group_size):
             nmars = node_mars[parids[j,:]].exp()
             nflows = node_flows[parids[j,:]]
             emars = element_mars[(j+1)*group_size+i,:].exp()
-            epars = params[parpids[j,:]+i]
+            epars = params[parpids[j,:]]
             eflows = (nflows * epars[:,None] * emars[None,:] / nmars).sum(dim = 0)
 
-            # import pdb; pdb.set_trace()
             assert torch.all(torch.abs(eflows - element_flows[(j+1)*group_size+i,:]) < 1e-2)
+
+            parpids += group_size
 
     my_pflows = torch.zeros_like(param_flows)
 
@@ -135,6 +137,8 @@ def sum_layer_test():
             pflows = epars * (nflows[None,:] * emars / nmars[None,:]).sum(dim = 1)
 
             my_pflows[layer.partitioned_pfids[0][j,:]+i] = pflows
+
+    import pdb; pdb.set_trace()
 
     assert torch.all(torch.abs(my_pflows - param_flows) < 2e-3)
 
