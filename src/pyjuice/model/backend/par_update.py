@@ -6,6 +6,7 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 from numba import njit
+from typing import Sequence
 
 from pyjuice.nodes import CircuitNodes
 
@@ -211,8 +212,10 @@ def par_update_kernel(params, param_flows, cum_pflows, nchs, par_start_ids, pflo
     tl.store(params + offs_par, updated_param, mask = mask_pflow)
 
 
-def em_par_update(params, param_flows, par_start_ids, pflow_start_ids, blk_sizes, blk_intervals, 
-                  global_nids, nchs, metadata, step_size: float, pseudocount: float = 0.0, cum_pflows = None):
+def em_par_update(params: torch.Tensor, param_flows: torch.Tensor, parflow_fusing_kwargs: Sequence, 
+                  step_size: float, pseudocount: float = 0.0):
+
+    par_start_ids, pflow_start_ids, blk_sizes, blk_intervals, global_nids, nchs, cum_pflows, metadata = parflow_fusing_kwargs
 
     tot_num_nodes = metadata["tot_num_nodes"]
     BLOCK_SIZE = metadata["BLOCK_SIZE"]

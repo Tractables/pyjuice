@@ -11,7 +11,7 @@ from typing import Optional, Sequence, Callable, Union, Tuple, Dict
 
 from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes, foreach
 from pyjuice.layer import Layer, InputLayer, ProdLayer, SumLayer, LayerGroup
-from pyjuice.utils.grad_fns import ReverseGrad, PseudoHookFunc
+from pyjuice.utils.grad_fns import ReverseGrad
 from pyjuice.utils import BitSet
 
 from .backend import compile_cum_par_flows_fn, compute_cum_par_flows, cum_par_flows_to_device, \
@@ -55,7 +55,12 @@ class TensorCircuit(nn.Module):
         self.root_ns = root_ns
         self.device = torch.device("cpu")
 
-        self._init_pass_tensors()
+        self.node_mars = None
+        self.element_mars = None
+        self.node_flows = None
+        self.element_flows = None
+        self.param_flows = None
+        
         self._init_layers(
             layer_sparsity_tol = layer_sparsity_tol, 
             max_num_partitions = max_num_partitions, 
@@ -71,12 +76,20 @@ class TensorCircuit(nn.Module):
             "flows_memory": 1.0
         }
 
-    def _init_pass_tensors(self):
-        self.node_mars = None
-        self.element_mars = None
-        self.node_flows = None
-        self.element_flows = None
-        self.param_flows = None
+    def to(self, device):
+        super(TensorCircuit, self).to(device)
+
+        self.input_layer_group.to(device)
+
+        self.device = device
+
+        # For parameter flow accumulation
+        self.parflow_fusing_kwargs = cum_par_flows_to_device(self.parflow_fusing_kwargs, device)
+        
+        # For parameter update
+        self.par_update_kwargs = par_update_to_device(self.par_update_kwargs, device)
+
+        return self
         
     def forward(self, inputs: torch.Tensor, input_layer_fn: Optional[Union[str,Callable]] = None,
                 cache: Optional[dict] = None, return_cache: bool = False, **kwargs):
@@ -255,19 +268,15 @@ class TensorCircuit(nn.Module):
             return None
 
     def mini_batch_em(self, step_size: float, pseudocount: float = 0.0):
+        # Update input layers
         for layer in self.input_layer_group:
             layer.mini_batch_em(step_size = step_size, pseudocount = pseudocount)
-        
-        # Only apply parameter update if external parameters are not used in the previous forward/backward pass
-        if not self._used_external_sum_params:
-            # Normalize and update parameters
-            with torch.no_grad():
-                flows = self.param_flows
-                if flows is None:
-                    return None
-                self._normalize_parameters(flows, pseudocount = pseudocount)
-                self.params.data = (1.0 - step_size) * self.params.data + step_size * flows
-                self.params[0] = 1.0
+
+        # Accumulate parameter flows of tied nodes
+        compute_cum_par_flows(self.parflow_fusing_kwargs)
+
+        # Normalize and update parameters
+        em_par_update(self.param, self.param_flows, self.par_update_kwargs, step_size = step_size, pseudocount = pseudocount)
 
     def cumulate_flows(self, inputs: torch.Tensor, params: Optional[torch.Tensor] = None):
         with torch.no_grad():
@@ -293,21 +302,6 @@ class TensorCircuit(nn.Module):
             layer.init_param_flows(flows_memory = flows_memory)
 
         return None
-
-    def to(self, device):
-        super(TensorCircuit, self).to(device)
-
-        self.input_layer_group.to(device)
-
-        self.device = device
-
-        # For parameter flow accumulation
-        self.parflow_fusing_kwargs = cum_par_flows_to_device(self.parflow_fusing_kwargs, device)
-        
-        # For parameter update
-        self.par_update_kwargs = par_update_to_device(self.par_update_kwargs, device)
-
-        return self
 
     def update_parameters(self, clone: bool = True):
         """
@@ -341,18 +335,6 @@ class TensorCircuit(nn.Module):
         print(f"> Number of nodes: {self.num_nodes}")
         print(f"> Number of edges: {self.num_edges}")
         print(f"> Number of sum parameters: {self.num_sum_params}")
-
-    def copy_param_flows(self, clone_param_flows: bool = True, target_name: str = "_scores"):
-        raise NotImplementedError("To be updated")
-        param_flows = self.param_flows.detach().cpu()
-
-        for ns in self.root_nodes:
-            if clone_params:
-                setattr(ns, target_name, param_flows[ns._param_ids].clone())
-            else:
-                setattr(ns, target_name, param_flows[ns._param_ids])
-
-        return None
 
     def enable_partial_evaluation(self, scopes: Union[Sequence[BitSet],Sequence[int]], 
                                   forward: bool = False, backward: bool = False):
