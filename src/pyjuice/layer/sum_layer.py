@@ -339,11 +339,14 @@ class SumLayer(Layer, nn.Module):
         elif params.dim() == 1 and self.group_size >= 16 and num_edges >= 16 and batch_size >= 16:
             # In this case, we should definitely use the block-sparse implementation
             mode = "block_sparse"
-        elif self.group_size * num_edges < 16 and num_edges * batch_size < 16:
+        elif self.group_size == 1 and num_edges < 16384:
             # In this case, we should definitely use the sparse implementation
             mode = "sparse"
-        else:
+        elif num_edges < 4:
+            # In this case, the block-sparse kernel will have compilation issues
             mode = "sparse"
+        else:
+            mode = "block_sparse"
 
         if mode == "block_sparse":
             self._forward_block_sparse(
@@ -370,7 +373,7 @@ class SumLayer(Layer, nn.Module):
     def _fw_triton_block_sparse_kernel(node_mars, element_mars, params, nids, cids_start, cids_increment,
                                        pids_start, pids_increment, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
                                        BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
-                                       TILE_SIZE_M: tl.constexpr, GROUP_SIZE_M: tl.constexpr, use_fp16: tl.constexpr):
+                                       TILE_SIZE_M: tl.constexpr, GROUP_SIZE_M: tl.constexpr, OP_MODE: tl.constexpr):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
@@ -423,22 +426,22 @@ class SumLayer(Layer, nn.Module):
             emars_max = tl.max(emars, axis = 0)[None,:]
             emars = tl.exp(emars - emars_max)
 
-            if TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and BLOCK_B >= 16:
-                # We can use the built-in matmul kernel of triton
-                if use_fp16 == 1:
-                    epars = (epars * (2**12)).to(tl.float16)
-                    emars = emars.to(tl.float16)
-                    nmars = tl.dot(epars, emars).to(tl.float32) / (2**12)
-                else:
-                    nmars = tl.dot(epars, emars)
-            else:
-                # We have to simulate matmul
-                if use_fp16 == 1:
-                    epars = (epars * (2**12)).to(tl.float16)
-                    emars = emars.to(tl.float16)
-                    nmars = tl.sum(epars[:,:,None] * emars[None,:,:], axis = 1).to(tl.float32) / (2**12)
-                else:
-                    nmars = tl.sum(epars[:,:,None] * emars[None,:,:], axis = 1)
+            if OP_MODE == 0:
+                # Built-in matmul kernel of triton + float16
+                epars = (epars * (2**12)).to(tl.float16)
+                emars = emars.to(tl.float16)
+                nmars = tl.dot(epars, emars).to(tl.float32) / (2**12)
+            if OP_MODE == 1:
+                # Built-in matmul kernel of triton + float32
+                nmars = tl.dot(epars, emars)
+            if OP_MODE == 2:
+                # Simulated matmul kernel + float16
+                epars = (epars * (2**12)).to(tl.float16)
+                emars = emars.to(tl.float16)
+                nmars = tl.sum(epars[:,:,None] * emars[None,:,:], axis = 1).to(tl.float32) / (2**12)
+            if OP_MODE == 3:
+                # Simulated matmul kernel + float32
+                nmars = tl.sum(epars[:,:,None] * emars[None,:,:], axis = 1)
 
             acc = tl.where(emars_max > acc,
                 tl.log(nmars + tl.exp(acc - emars_max)) + emars_max,
@@ -499,6 +502,10 @@ class SumLayer(Layer, nn.Module):
             BLOCK_B = min(2048 // TILE_SIZE_K, BATCH_SIZE_NP2)
         K_NUM_TILES = num_edges // TILE_SIZE_K
 
+        assert TILE_SIZE_K >= 4, f"`TILE_SIZE_K` should be greater than 4 (but got {TILE_SIZE_K}) in order to use the block-sparse kernel. " \
+                                  "This is an internal error of PyJuice. Please consider checking the kernel dispatching criterions and use the " \
+                                  "corresponding sparse kernel instead."
+
         signature = ("block_sparse", partition_id, TILE_SIZE_K)
         if signature not in self._cached_fw_pcids:
             # Pre-compute pointer increments for `cids` and `pids`
@@ -532,6 +539,17 @@ class SumLayer(Layer, nn.Module):
             else:
                 use_fp16 = False
 
+        if TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and BLOCK_B >= 16:
+            if use_fp16:
+                OP_MODE = 0
+            else:
+                OP_MODE = 1
+        else:
+            if use_fp16:
+                OP_MODE = 2
+            else:
+                OP_MODE = 3
+
         grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
         
         self._fw_triton_block_sparse_kernel[grid](
@@ -551,7 +569,7 @@ class SumLayer(Layer, nn.Module):
             K_NUM_TILES = K_NUM_TILES,
             TILE_SIZE_M = TILE_SIZE_M,
             GROUP_SIZE_M = self.group_size,
-            use_fp16 = 1 if use_fp16 else 0
+            OP_MODE = OP_MODE
         )
         
         return None
@@ -721,13 +739,14 @@ class SumLayer(Layer, nn.Module):
         elif params.dim() == 1 and self.group_size >= 16 and num_edges >= 16 and batch_size >= 16:
             # In this case, we should definitely use the block-sparse implementation
             mode = "block_sparse"
-        elif self.group_size * num_edges < 4 and num_edges * batch_size < 4:
+        elif (cs_group_size == 1 or self.group_size == 1) and num_edges < 16384:
             # In this case, we should definitely use the sparse implementation
             mode = "sparse"
-        else:
+        elif num_edges < 4 or batch_size < 4:
+            # In this case, the block-sparse kernel will have compilation issues
             mode = "sparse"
-
-        # mode = "pytorch" # debug
+        else:
+            mode = "block_sparse"
 
         if mode == "block_sparse":
             self._backward_block_sparse(
@@ -796,7 +815,7 @@ class SumLayer(Layer, nn.Module):
                                            chids, parids_start, parids_increment, parpids_start, parpids_increment, 
                                            local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr, ptr_inc_step: tl.constexpr, 
                                            BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, TILE_SIZE_M: tl.constexpr, 
-                                           GROUP_SIZE_M: tl.constexpr, GROUP_SIZE_K: tl.constexpr, use_fp16: tl.constexpr):
+                                           GROUP_SIZE_M: tl.constexpr, GROUP_SIZE_K: tl.constexpr, OP_MODE: tl.constexpr):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
@@ -852,22 +871,22 @@ class SumLayer(Layer, nn.Module):
 
             nflows_div_mars = nflows * tl.exp(emars_max[None,:] - nmars)
             
-            if TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and BLOCK_B >= 16:
-                # We can use the built-in matmul kernel of triton
-                if use_fp16 == 1:
-                    epars = epars.to(tl.float16)
-                    nflows_div_mars = nflows_div_mars.to(tl.float16)
-                    eflows = tl.dot(epars, nflows_div_mars).to(tl.float32)
-                else:
-                    eflows = tl.dot(epars, nflows_div_mars)
-            else:
-                # We have to simulate matmul
-                if use_fp16 == 1:
-                    epars = epars.to(tl.float16)
-                    nflows_div_mars = nflows_div_mars.to(tl.float16)
-                    eflows = tl.sum(epars[:,:,None] * nflows_div_mars[None,:,:], axis = 1).to(tl.float32)
-                else:
-                    eflows = tl.sum(epars[:,:,None] * nflows_div_mars[None,:,:], axis = 1)
+            if OP_MODE == 0:
+                # Built-in matmul kernel of triton + float16
+                epars = epars.to(tl.float16)
+                nflows_div_mars = nflows_div_mars.to(tl.float16)
+                eflows = tl.dot(epars, nflows_div_mars).to(tl.float32)
+            if OP_MODE == 1:
+                # Built-in matmul kernel of triton + float32
+                eflows = tl.dot(epars, nflows_div_mars)
+            if OP_MODE == 2:
+                # Simulated matmul kernel + float16
+                epars = epars.to(tl.float16)
+                nflows_div_mars = nflows_div_mars.to(tl.float16)
+                eflows = tl.sum(epars[:,:,None] * nflows_div_mars[None,:,:], axis = 1).to(tl.float32)
+            if OP_MODE == 3:
+                # Simulated matmul kernel + float32
+                eflows = tl.sum(epars[:,:,None] * nflows_div_mars[None,:,:], axis = 1)
 
             acc += eflows
 
@@ -918,6 +937,10 @@ class SumLayer(Layer, nn.Module):
             BLOCK_B = min(2048 // TILE_SIZE_K, BATCH_SIZE_NP2)
         K_NUM_TILES = num_edges // TILE_SIZE_K
 
+        assert TILE_SIZE_K >= 4, f"`TILE_SIZE_K` should be greater than 4 (but got {TILE_SIZE_K}) in order to use the block-sparse kernel. " \
+                                  "This is an internal error of PyJuice. Please consider checking the kernel dispatching criterions and use the " \
+                                  "corresponding sparse kernel instead."
+
         signature = ("block_sparse", partition_id, TILE_SIZE_K)
         if signature not in self._cached_bk_parids:
             # Pre-compute pointer increments for `parids` and `parpids`
@@ -966,6 +989,17 @@ class SumLayer(Layer, nn.Module):
             else:
                 use_fp16 = False
 
+        if TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and BLOCK_B >= 16:
+            if use_fp16:
+                OP_MODE = 0
+            else:
+                OP_MODE = 1
+        else:
+            if use_fp16:
+                OP_MODE = 2
+            else:
+                OP_MODE = 3
+
         grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
 
         self._bk_triton_block_sparse_ele_kernel[grid](
@@ -989,7 +1023,7 @@ class SumLayer(Layer, nn.Module):
             TILE_SIZE_M = TILE_SIZE_M, 
             GROUP_SIZE_M = cs_group_size,
             GROUP_SIZE_K = self.group_size,
-            use_fp16 = use_fp16
+            OP_MODE = OP_MODE
         )
 
         return None
@@ -999,7 +1033,7 @@ class SumLayer(Layer, nn.Module):
     def _bk_triton_block_sparse_par_kernel(node_flows, node_mars, element_mars, params, param_flows, nids, cids, pids, pfids,
                                            batch_size: tl.constexpr, num_edges: tl.constexpr, TILE_SIZE_B: tl.constexpr, 
                                            B_NUM_TILES: tl.constexpr, TILE_SIZE_K: tl.constexpr, 
-                                           TILE_SIZE_M: tl.constexpr, GROUP_SIZE_M: tl.constexpr, use_fp16: tl.constexpr):
+                                           TILE_SIZE_M: tl.constexpr, GROUP_SIZE_M: tl.constexpr, OP_MODE: tl.constexpr):
 
         pid_k = tl.program_id(0) # ID of size-`TILE_SIZE_K` edges
         pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
@@ -1038,22 +1072,22 @@ class SumLayer(Layer, nn.Module):
 
             emars = tl.exp(emars - emars_max[:,None])
 
-            if TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and TILE_SIZE_B >= 16:
-                # We can use the built-in matmul kernel of triton
-                if use_fp16 == 1:
-                    nflows_div_mars = nflows_div_mars.to(tl.float16)
-                    emars = emars.to(tl.float16)
-                    pflows = tl.dot(nflows_div_mars, emars).to(tl.float32)
-                else:
-                    pflows = tl.dot(nflows_div_mars, emars).to(tl.float32)
-            else:
-                # We have to simulate matmul
-                if use_fp16 == 1:
-                    nflows_div_mars = nflows_div_mars.to(tl.float16)
-                    emars = emars.to(tl.float16)
-                    pflows = tl.sum(nflows_div_mars[:,:,None] * emars[None,:,:], axis = 1).to(tl.float32)
-                else:
-                    pflows = tl.sum(nflows_div_mars[:,:,None] * emars[None,:,:], axis = 1)
+            if OP_MODE == 0:
+                # Built-in matmul kernel of triton + float16
+                nflows_div_mars = nflows_div_mars.to(tl.float16)
+                emars = emars.to(tl.float16)
+                pflows = tl.dot(nflows_div_mars, emars).to(tl.float32)
+            if OP_MODE == 1:
+                # Built-in matmul kernel of triton + float32
+                pflows = tl.dot(nflows_div_mars, emars).to(tl.float32)
+            if OP_MODE == 2:
+                # Simulated matmul kernel + float16
+                nflows_div_mars = nflows_div_mars.to(tl.float16)
+                emars = emars.to(tl.float16)
+                pflows = tl.sum(nflows_div_mars[:,:,None] * emars[None,:,:], axis = 1).to(tl.float32)
+            if OP_MODE == 3:
+                # Simulated matmul kernel + float32
+                pflows = tl.sum(nflows_div_mars[:,:,None] * emars[None,:,:], axis = 1)
 
             acc += pflows
 
@@ -1118,6 +1152,10 @@ class SumLayer(Layer, nn.Module):
             TILE_SIZE_K = min(2048 // TILE_SIZE_B, num_edges)
         B_NUM_TILES = batch_size // TILE_SIZE_B
 
+        assert TILE_SIZE_B >= 4, f"`TILE_SIZE_B` should be greater than 4 (but got {TILE_SIZE_B}) in order to use the block-sparse kernel. " \
+                                  "This is an internal error of PyJuice. Please consider checking the kernel dispatching criterions and use the " \
+                                  "corresponding sparse kernel instead."
+
         if force_use_fp16:
             assert not force_use_fp32
             use_fp16 = True
@@ -1128,6 +1166,17 @@ class SumLayer(Layer, nn.Module):
                 use_fp16 = True
             else:
                 use_fp16 = False
+
+        if TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and TILE_SIZE_B >= 16:
+            if use_fp16:
+                OP_MODE = 0
+            else:
+                OP_MODE = 1
+        else:
+            if use_fp16:
+                OP_MODE = 2
+            else:
+                OP_MODE = 3
 
         grid = (triton.cdiv(num_edges, TILE_SIZE_K), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
 
@@ -1148,7 +1197,7 @@ class SumLayer(Layer, nn.Module):
             TILE_SIZE_K = TILE_SIZE_K, 
             TILE_SIZE_M = TILE_SIZE_M, 
             GROUP_SIZE_M = self.group_size,
-            use_fp16 = use_fp16
+            OP_MODE = OP_MODE
         )
 
     def _backward_sparse(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 

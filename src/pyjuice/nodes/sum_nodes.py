@@ -142,9 +142,9 @@ class SumNodes(CircuitNodes):
             ns_params = params[psid:peid].cpu()
 
         local_parids = (self._param_ids - psid) // (self.group_size * self.ch_group_size)
-        num_pargroups = local_parids.size()
+        num_pargroups = local_parids.size(0)
         ns_params = ns_params.reshape(num_pargroups, self.ch_group_size, self.group_size)
-        ns._params = ns_params[local_parids,:,:].permute(0, 2, 1)
+        self._params = ns_params[local_parids,:,:].permute(0, 2, 1)
 
     def update_param_flows(self, param_flows: torch.Tensor, origin_ns_only: bool = True, clone: bool = True):
         assert self.provided("_param_flow_range"), "The `SumNodes` has not been compiled into a `TensorCircuit`."
@@ -159,9 +159,9 @@ class SumNodes(CircuitNodes):
             ns_param_flows = param_flows[pfsid:pfeid].cpu()
 
         local_parfids = (self._param_flow_ids - pfsid) // (self.group_size * self.ch_group_size)
-        num_parfgroups = local_parfids.size()
+        num_parfgroups = local_parfids.size(0)
         ns_param_flows = ns_param_flows.reshape(num_parfgroups, self.ch_group_size, self.group_size)
-        ns._param_flows = ns_param_flows[local_parfids,:,:].permute(0, 2, 1)
+        self._param_flows = ns_param_flows[local_parfids,:,:].permute(0, 2, 1)
 
     def gather_parameters(self, params: torch.Tensor):
         assert self.provided("_param_range"), "The `SumNodes` has not been compiled into a `TensorCircuit`."
