@@ -273,10 +273,10 @@ class TensorCircuit(nn.Module):
             layer.mini_batch_em(step_size = step_size, pseudocount = pseudocount)
 
         # Accumulate parameter flows of tied nodes
-        compute_cum_par_flows(self.parflow_fusing_kwargs)
+        compute_cum_par_flows(self.param_flows, self.parflow_fusing_kwargs)
 
         # Normalize and update parameters
-        em_par_update(self.param, self.param_flows, self.par_update_kwargs, step_size = step_size, pseudocount = pseudocount)
+        em_par_update(self.params, self.param_flows, self.par_update_kwargs, step_size = step_size, pseudocount = pseudocount)
 
     def cumulate_flows(self, inputs: torch.Tensor, params: Optional[torch.Tensor] = None):
         with torch.no_grad():

@@ -195,23 +195,23 @@ def simple_model_test():
     lls = pc(data)
 
     node_mars = pc.node_mars.cpu()
-    data = data.cpu()
+    data_cpu = data.cpu()
 
     sid, eid = ni0._output_ind_range
     ni0_lls = node_mars[sid:eid,:]
-    assert torch.all(torch.abs(ni0_lls - ni0._params.reshape(-1, 4)[:,data[:,0]].log()) < 1e-4)
+    assert torch.all(torch.abs(ni0_lls - ni0._params.reshape(-1, 4)[:,data_cpu[:,0]].log()) < 1e-4)
 
     sid, eid = ni1._output_ind_range
     ni1_lls = node_mars[sid:eid,:]
-    assert torch.all(torch.abs(ni1_lls - ni1._params.reshape(-1, 4)[:,data[:,1]].log()) < 1e-4)
+    assert torch.all(torch.abs(ni1_lls - ni1._params.reshape(-1, 4)[:,data_cpu[:,1]].log()) < 1e-4)
 
     sid, eid = ni2._output_ind_range
     ni2_lls = node_mars[sid:eid,:]
-    assert torch.all(torch.abs(ni2_lls - ni2._params.reshape(-1, 6)[:,data[:,2]].log()) < 1e-4)
+    assert torch.all(torch.abs(ni2_lls - ni2._params.reshape(-1, 6)[:,data_cpu[:,2]].log()) < 1e-4)
 
     sid, eid = ni3._output_ind_range
     ni3_lls = node_mars[sid:eid,:]
-    assert torch.all(torch.abs(ni3_lls - ni3._params.reshape(-1, 6)[:,data[:,3]].log()) < 1e-4)
+    assert torch.all(torch.abs(ni3_lls - ni3._params.reshape(-1, 6)[:,data_cpu[:,3]].log()) < 1e-4)
 
     np0_lls = ni0_lls + ni1_lls
     np1_lls = ni2_lls + ni3_lls
@@ -388,33 +388,132 @@ def simple_model_test():
 
     input_layer = pc.input_layer_group[0]
     input_pflows = input_layer.param_flows.cpu()
-    data = data.cpu()
+    data_cpu = data.cpu()
 
     ni0_pflows = input_pflows[0:128].reshape(32, 4)
     ref_pflows = torch.zeros_like(ni0_pflows)
     for b in range(512):
-        ref_pflows[:,data[b,0]] += ni0_flows[:,b]
+        ref_pflows[:,data_cpu[b,0]] += ni0_flows[:,b]
     assert torch.all(torch.abs(ni0_pflows - ref_pflows) < 4e-3)
 
     ni1_pflows = input_pflows[128:256].reshape(32, 4)
     ref_pflows = torch.zeros_like(ni1_pflows)
     for b in range(512):
-        ref_pflows[:,data[b,1]] += ni1_flows[:,b]
+        ref_pflows[:,data_cpu[b,1]] += ni1_flows[:,b]
     assert torch.all(torch.abs(ni1_pflows - ref_pflows) < 4e-3)
 
     ni2_pflows = input_pflows[256:448].reshape(32, 6)
     ref_pflows = torch.zeros_like(ni2_pflows)
     for b in range(512):
-        ref_pflows[:,data[b,2]] += ni2_flows[:,b]
+        ref_pflows[:,data_cpu[b,2]] += ni2_flows[:,b]
     assert torch.all(torch.abs(ni2_pflows - ref_pflows) < 4e-3)
 
     ni3_pflows = input_pflows[448:640].reshape(32, 6)
     ref_pflows = torch.zeros_like(ni3_pflows)
     for b in range(512):
-        ref_pflows[:,data[b,3]] += ni3_flows[:,b]
+        ref_pflows[:,data_cpu[b,3]] += ni3_flows[:,b]
     assert torch.all(torch.abs(ni3_pflows - ref_pflows) < 4e-3)
 
-    import pdb; pdb.set_trace()
+    ## EM Optimization tests ##
+
+    pc.backward(data.permute(1, 0), flows_memory = 0.0)
+
+    ns0_old_params = ns0._params.clone().reshape(2, 4, 16, 16).permute(0, 2, 1, 3).reshape(32, 64)
+    ns1_old_params = ns1._params.clone().reshape(2, 2, 16, 16).permute(0, 2, 1, 3).reshape(32, 32)
+    ns2_old_params = ns2._params.clone().reshape(2, 2, 16, 16).permute(0, 2, 1, 3).reshape(32, 32)
+
+    ns_old_params = ns._params.clone().reshape(96)
+
+    pc.update_param_flows()
+
+    ref_parflows = ns0._param_flows.reshape(2, 4, 16, 16).permute(0, 2, 1, 3).reshape(32, 64)
+    assert torch.all(torch.abs(ns0_parflows - ref_parflows) < 1e-3)
+
+    ref_parflows = ns1._param_flows.reshape(2, 2, 16, 16).permute(0, 2, 1, 3).reshape(32, 32)
+    assert torch.all(torch.abs(ns1_parflows - ref_parflows) < 1e-3)
+
+    ref_parflows = ns2._param_flows.reshape(2, 2, 16, 16).permute(0, 2, 1, 3).reshape(32, 32)
+    assert torch.all(torch.abs(ns2_parflows - ref_parflows) < 1e-3)
+
+    par_start_ids, pflow_start_ids, blk_sizes, blk_intervals, global_nids, nchs, cum_pflows, metadata = pc.par_update_kwargs
+
+    if metadata["BLOCK_SIZE"] == 32:
+        par_start_ids = par_start_ids.cpu()
+        assert torch.all(par_start_ids[0:16] == torch.arange(256, 272))
+        assert torch.all(par_start_ids[16:32] == torch.arange(768, 784))
+        assert torch.all(par_start_ids[32:48] == torch.arange(1280, 1296))
+        assert torch.all(par_start_ids[48:64] == torch.arange(1792, 1808))
+        assert torch.all(par_start_ids[64:80] == torch.arange(2304, 2320))
+        assert torch.all(par_start_ids[80:96] == torch.arange(2816, 2832))
+        assert torch.all(par_start_ids[96:112] == torch.arange(3328, 3344))
+        assert torch.all(par_start_ids[112:128] == torch.arange(3840, 3856))
+        assert torch.all(par_start_ids[128:131] == torch.tensor([4352, 4384, 4416]))
+
+        pflow_start_ids = pflow_start_ids.cpu()
+        assert torch.all(par_start_ids - pflow_start_ids == 256)
+
+        blk_sizes = blk_sizes.cpu()
+        assert torch.all(blk_sizes[0:128] == 32)
+        assert torch.all(blk_sizes[128:131] == 32)
+
+        blk_intervals = blk_intervals.cpu()
+        assert torch.all(blk_intervals[0:128] == 16)
+        assert torch.all(blk_intervals[128:131] == 1)
+
+        global_nids = global_nids.cpu()
+        assert torch.all(global_nids[0:16] == torch.arange(0, 16))
+        assert torch.all(global_nids[16:32] == torch.arange(0, 16))
+        assert torch.all(global_nids[32:48] == torch.arange(16, 32))
+        assert torch.all(global_nids[48:64] == torch.arange(16, 32))
+        assert torch.all(global_nids[64:80] == torch.arange(32, 48))
+        assert torch.all(global_nids[80:96] == torch.arange(48, 64))
+        assert torch.all(global_nids[96:112] == torch.arange(64, 80))
+        assert torch.all(global_nids[112:128] == torch.arange(80, 96))
+        assert torch.all(global_nids[128:131] == 96)
+
+        nchs = nchs.cpu()
+        assert torch.all(nchs[0:32] == 64)
+        assert torch.all(nchs[32:64] == 64)
+        assert torch.all(nchs[64:128] == 32)
+        assert torch.all(nchs[128:131] == 96)
+
+        assert cum_pflows.size(0) == 97
+
+    step_size = 0.25
+    pseudocount = 0.01
+
+    pc.mini_batch_em(step_size = step_size, pseudocount = pseudocount)
+
+    cum_pflows = pc.par_update_kwargs[6].cpu()
+
+    assert torch.all(torch.abs(ns0_parflows.sum(dim = 1) - cum_pflows[0:32]) < 1e-3)
+    assert torch.all(torch.abs(ns1_parflows.sum(dim = 1) - cum_pflows[32:64]) < 1e-3)
+    assert torch.all(torch.abs(ns2_parflows.sum(dim = 1) - cum_pflows[64:96]) < 1e-3)
+    assert torch.abs(ns_parflows.sum() - cum_pflows[96]) < 1e-3
+
+    ns0_new_params = (ns0_parflows + pseudocount / 64) / (ns0_parflows.sum(dim = 1, keepdim = True) + pseudocount)
+    ns1_new_params = (ns1_parflows + pseudocount / 32) / (ns1_parflows.sum(dim = 1, keepdim = True) + pseudocount)
+    ns2_new_params = (ns2_parflows + pseudocount / 32) / (ns2_parflows.sum(dim = 1, keepdim = True) + pseudocount)
+    ns_new_params = (ns_parflows + pseudocount / 96) / (ns_parflows.sum() + pseudocount)
+
+    ns0_updated_params = (1.0 - step_size) * ns0_old_params + step_size * ns0_new_params
+    ns1_updated_params = (1.0 - step_size) * ns1_old_params + step_size * ns1_new_params
+    ns2_updated_params = (1.0 - step_size) * ns2_old_params + step_size * ns2_new_params
+    ns_updated_params = (1.0 - step_size) * ns_old_params + step_size * ns_new_params
+
+    pc.update_parameters()
+
+    ref_params = ns0._params.clone().reshape(2, 4, 16, 16).permute(0, 2, 1, 3).reshape(32, 64)
+    assert torch.all(torch.abs(ns0_updated_params - ref_params) < 1e-4)
+
+    ref_params = ns1._params.clone().reshape(2, 2, 16, 16).permute(0, 2, 1, 3).reshape(32, 32)
+    assert torch.all(torch.abs(ns1_updated_params - ref_params) < 1e-4)
+
+    ref_params = ns2._params.clone().reshape(2, 2, 16, 16).permute(0, 2, 1, 3).reshape(32, 32)
+    assert torch.all(torch.abs(ns2_updated_params - ref_params) < 1e-4)
+
+    ref_params = ns._params.clone().reshape(96)
+    assert torch.all(torch.abs(ns_updated_params - ref_params) < 1e-4)
 
 
 if __name__ == "__main__":

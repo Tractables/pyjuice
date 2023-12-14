@@ -130,7 +130,7 @@ def compile_par_update_fn(root_ns: CircuitNodes, BLOCK_SIZE: int = 32, buffer_in
 
     cum_pflows = torch.zeros([global_nids[-1] + 1], dtype = torch.float32)
     
-    metadata = {"tot_num_nodes": global_nids[-1] + 1, "BLOCK_SIZE": BLOCK_SIZE}
+    metadata = {"tot_num_nodes": global_nids[-1].item() + 1, "BLOCK_SIZE": BLOCK_SIZE}
 
     return [par_start_ids, pflow_start_ids, blk_sizes, blk_intervals, global_nids, nchs, cum_pflows, metadata]
 
@@ -212,10 +212,10 @@ def par_update_kernel(params, param_flows, cum_pflows, nchs, par_start_ids, pflo
     tl.store(params + offs_par, updated_param, mask = mask_pflow)
 
 
-def em_par_update(params: torch.Tensor, param_flows: torch.Tensor, parflow_fusing_kwargs: Sequence, 
+def em_par_update(params: torch.Tensor, param_flows: torch.Tensor, par_update_kwargs: Sequence, 
                   step_size: float, pseudocount: float = 0.0):
 
-    par_start_ids, pflow_start_ids, blk_sizes, blk_intervals, global_nids, nchs, cum_pflows, metadata = parflow_fusing_kwargs
+    par_start_ids, pflow_start_ids, blk_sizes, blk_intervals, global_nids, nchs, cum_pflows, metadata = par_update_kwargs
 
     tot_num_nodes = metadata["tot_num_nodes"]
     BLOCK_SIZE = metadata["BLOCK_SIZE"]
