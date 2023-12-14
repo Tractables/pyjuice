@@ -309,7 +309,7 @@ class TensorCircuit(nn.Module):
         """
         params = self.params.detach().cpu()
 
-        for ns in self.root_nodes:
+        for ns in self.root_ns:
             if ns.is_sum() and not ns.is_tied():
                 ns.update_parameters(params, clone = clone)
 
@@ -324,9 +324,9 @@ class TensorCircuit(nn.Module):
         """
         param_flows = self.param_flows.detach().cpu()
 
-        for ns in self.root_nodes:
+        for ns in self.root_ns:
             if ns.is_sum() and not ns.is_tied():
-                ns.update_param_flows(params, clone = clone, origin_ns_only = origin_ns_only)
+                ns.update_param_flows(param_flows, clone = clone, origin_ns_only = origin_ns_only)
 
     def print_statistics(self):
         """
@@ -401,8 +401,19 @@ class TensorCircuit(nn.Module):
         if flag:
             self.__dict__[name] = torch.zeros(shape, device = self.device)
 
-        if set_value:
-            self.__dict__[name][:] = set_value
+        if set_value is not None:
+            if len(shape) == 1:
+                self.__dict__[name][:] = set_value
+            elif len(shape) == 2:
+                self.__dict__[name][:,:] = set_value
+            elif len(shape) == 3:
+                self.__dict__[name][:,:,:] = set_value
+            elif len(shape) == 4:
+                self.__dict__[name][:,:,:,:] = set_value
+            elif len(shape) == 5:
+                self.__dict__[name][:,:,:,:,:] = set_value
+            else:
+                raise ValueError(f"Too many dimensions ({len(shape)}).")
 
     def _buffer_matches(self, name: str, cache: Optional[dict], check_device: bool = True):
         if cache is None:
