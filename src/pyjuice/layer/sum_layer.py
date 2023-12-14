@@ -348,6 +348,8 @@ class SumLayer(Layer, nn.Module):
         else:
             mode = "block_sparse"
 
+        mode = "sparse" #### debug
+
         if mode == "block_sparse":
             self._forward_block_sparse(
                 node_mars, element_mars, params, nids, cids, pids, local_ids,

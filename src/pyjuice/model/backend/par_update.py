@@ -74,12 +74,29 @@ def compile_par_update_fn(root_ns: CircuitNodes, BLOCK_SIZE: int = 32, buffer_in
             curr_size = par_start_ids.shape[0]
             inc_shape = triton.cdiv(pid + est_num_slots - curr_size, buffer_inc_interval) * buffer_inc_interval
 
-            par_start_ids = np.ascontiguousarray(par_start_ids.resize(curr_size + inc_shape))
-            pflow_start_ids = np.ascontiguousarray(pflow_start_ids.resize(curr_size + inc_shape))
-            blk_sizes = np.ascontiguousarray(blk_sizes.resize(curr_size + inc_shape))
-            blk_intervals = np.ascontiguousarray(blk_intervals.resize(curr_size + inc_shape))
-            global_nids = np.ascontiguousarray(global_nids.resize(curr_size + inc_shape))
-            nchs = np.ascontiguousarray(nchs.resize(curr_size + inc_shape))
+            par_start_ids_new = np.zeros([curr_size + inc_shape], dtype = np.int64)
+            par_start_ids_new[:curr_size] = par_start_ids[:curr_size]
+            par_start_ids = par_start_ids_new
+
+            pflow_start_ids_new = np.zeros([curr_size + inc_shape], dtype = np.int64)
+            pflow_start_ids_new[:curr_size] = pflow_start_ids[:curr_size]
+            pflow_start_ids = pflow_start_ids_new
+
+            blk_sizes_new = np.zeros([curr_size + inc_shape], dtype = np.int64)
+            blk_sizes_new[:curr_size] = blk_sizes[:curr_size]
+            blk_sizes = blk_sizes_new
+
+            blk_intervals_new = np.zeros([curr_size + inc_shape], dtype = np.int64)
+            blk_intervals_new[:curr_size] = blk_intervals[:curr_size]
+            blk_intervals = blk_intervals_new
+
+            global_nids_new = np.zeros([curr_size + inc_shape], dtype = np.int64)
+            global_nids_new[:curr_size] = global_nids[:curr_size]
+            global_nids = global_nids_new
+
+            nchs_new = np.zeros([curr_size + inc_shape], dtype = np.int64)
+            nchs_new[:curr_size] = nchs[:curr_size]
+            nchs = nchs_new
 
         if use_numba:
 

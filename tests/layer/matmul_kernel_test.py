@@ -73,9 +73,9 @@ def kernel3(a, b, c, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr):
 if __name__ == "__main__":
     import time
 
-    M = 16
-    N = 16
-    K = 8
+    M = 1
+    N = 4
+    K = 1
 
     a = torch.rand([M, N]).cuda()
     b = torch.rand([N, K]).cuda()

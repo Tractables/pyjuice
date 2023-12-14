@@ -79,17 +79,17 @@ class CircuitScheduler():
         else:
             state_dict = dict()
 
-        state_dict["circuit_states"] = dict()
+        state_dict["pc_states"] = dict()
         for key, value in self.__dict__.items():
             if key != "optimizer" and key != "base_scheduler":
-                state_dict["circuit_states"][key] = value
+                state_dict["pc_states"][key] = value
 
     def load_state_dict(self, state_dict: Dict):
 
         for key, value in state_dict["circuit_states"].items():
             self.__dict__[key] = value
 
-        del state_dict["circuit_states"]
+        del state_dict["pc_states"]
 
         if self.base_optimizer is not None:
             self.base_optimizer.load_state_dict(state_dict)
