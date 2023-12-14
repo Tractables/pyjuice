@@ -186,8 +186,9 @@ def _assign_chid_kernel(chs_offsets, ns_nchs, edge_ids):
 def _assign_target_ncpids_kernel(target_nids_ptr, nids_partition_start_ptr, target_cids_ptr, pcids_partition_start_ptr,
                                  target_pids_ptr, target_pfids_ptr, edge_ids_ptr, chs_offsets_ptr, n_partition_ids_ptr, 
                                  n_id_in_partition_ptr, cs_ele_id_start_ptr, cs_node_cum_ids_ptr, fw_partition_max_chs_ptr, 
-                                 cum_n_chs_ptr, ns_param_ids_ptr, constexprs_ptr, num_chs: tl.constexpr, 
-                                 num_chs_np2: tl.constexpr, add_params_flag: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+                                 cum_n_chs_ptr, ns_param_ids_ptr, ns_param_flow_ids_ptr, constexprs_ptr, num_chs: tl.constexpr, 
+                                 num_chs_np2: tl.constexpr, add_params_flag: tl.constexpr, add_param_flows_flag: tl.constexpr, 
+                                 BLOCK_SIZE: tl.constexpr):
 
     pid = tl.program_id(axis = 0)
     block_start = pid * BLOCK_SIZE
@@ -252,6 +253,10 @@ def _assign_target_ncpids_kernel(target_nids_ptr, nids_partition_start_ptr, targ
     if add_params_flag:
         tl.store(ns_param_ids_ptr + offsets, global_pid, mask = mask)
 
+    # Global parameter flow indices for all edges
+    if add_param_flows_flag:
+        tl.store(ns_param_flow_ids_ptr + offsets, global_pfid, mask = mask)
+
 
 @torch.no_grad()
 def sum_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, n_id_in_partition, num_ngs_in_partition, n_chs,
@@ -300,6 +305,7 @@ def sum_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, 
         ngid_in_partition = torch.zeros([len(num_ngs_in_partition)], dtype = torch.long)
 
     all_ns_param_ids = dict()
+    all_ns_param_flow_ids = dict()
     original_param_nids = [] # `ns` with their original parameters (i.e., not tied)
 
     # This is the main loop: iterate over `ns` in the layer
@@ -317,10 +323,12 @@ def sum_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, 
                 global_pfid_start = global_pfid_end
 
                 add_params_flag = True
+                add_param_flows_flag = True
             else:
                 assert ns.provided("_param_flow_range")
 
                 add_params_flag = False
+                add_param_flows_flag = False
 
             original_param_nids.append(ns_idx)
                 
@@ -358,10 +366,14 @@ def sum_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, 
 
                 node2tiednodes[source_ns][0].append(ns)
                 node2tiednodes[source_ns][1] = 1
+
+                add_param_flows_flag = True
             else:
                 ns._param_flow_range = deepcopy(node2tiednodes[source_ns][2])
 
                 node2tiednodes[source_ns][1] += 1
+
+                add_param_flows_flag = False
 
             # Global pid and pfid start index for `ns`
             ns_pid_start = source_ns._param_range[0]
@@ -411,6 +423,11 @@ def sum_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, 
             else:
                 ns_param_ids = None
 
+            if add_param_flows_flag:
+                ns_param_flow_ids = torch.zeros([ns_num_edges], dtype = torch.long).to(device)
+            else:
+                ns_param_flow_ids = None
+
             # The following kernel assigns the corresponding indices to `nids`, `cids`, and `pids`
             # We first move necessary buffers to GPU
             nids_partition_start = nids_partition_start.to(device)
@@ -435,8 +452,8 @@ def sum_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, 
                 target_nids, nids_partition_start, target_cids, pcids_partition_start,
                 target_pids, target_pfids, edge_ids, chs_offsets, n_partition_ids, 
                 n_id_in_partition, cs_ele_id_start, cs_node_cum_ids, fw_partition_max_chs, 
-                cum_n_chs, ns_param_ids, constexprs, ns.num_chs, num_chs_np2, 
-                add_params_flag, BLOCK_SIZE = min(2048, 2**20 // num_chs_np2)
+                cum_n_chs, ns_param_ids, ns_param_flow_ids, constexprs, ns.num_chs, num_chs_np2, 
+                add_params_flag, add_param_flows_flag, BLOCK_SIZE = min(2048, 2**20 // num_chs_np2)
             )
 
             ngroup_start += ns_num_ngroups
@@ -456,6 +473,11 @@ def sum_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, 
                 ns_param_ids = torch.zeros([ns_num_edges], dtype = torch.long)
             else:
                 ns_param_ids = None
+
+            if add_param_flows_flag:
+                ns_param_flow_ids = torch.zeros([ns_num_edges], dtype = torch.long).to(device)
+            else:
+                ns_param_flow_ids = None
 
             # Iterate over node groups
             cum_n_chs = 0
@@ -490,15 +512,28 @@ def sum_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, 
                 if add_params_flag:
                     ns_param_ids[criterion] = global_pids
 
+                if add_param_flows_flag:
+                    ns_param_flow_ids[criterion] = global_pfids
+
                 ngid_in_partition[partition_id] = local_id + 1
 
         if add_params_flag:
             all_ns_param_ids[ns_idx] = ns_param_ids
 
+        if add_param_flows_flag:
+            all_ns_param_flow_ids[ns_idx] = ns_param_flow_ids
+
     # Store global -> local parameter id mapping in `ns`
     for ns_idx, param_ids in all_ns_param_ids.items():
         ns = nodes[ns_idx]
-        ns._param_ids = param_ids.cpu()[0::ns.ch_group_size] # Every edge specify the start id of [ch_group_size, group_size] parameters
+        # Every edge specify the start id of [ch_group_size, group_size] parameters
+        ns._param_ids = param_ids.cpu()[0::ns.ch_group_size]
+
+    # Store global -> local parameter flow id mapping in `ns`
+    for ns_idx, param_flow_ids in all_ns_param_flow_ids.items():
+        ns = nodes[ns_idx]
+        # Every edge specify the start id of [ch_group_size, group_size] parameter flows
+        ns._param_flow_ids = param_flow_ids.cpu()[0::ns.ch_group_size]
 
     # Store local -> global parameter id mapping in `ns`
     for ns_idx in original_param_nids:

@@ -16,9 +16,6 @@ class Layer():
 
         self.device = torch.device("cpu")
 
-    def init_layer(self, params: Union[torch.Tensor,None]):
-        raise NotImplementedError()
-
     def enable_partial_evaluation(self, fw_scopes: Optional[Sequence[BitSet]] = None, bk_scopes: Optional[Sequence[BitSet]] = None):
         if not self.provided("fw_scope2localids") or not self.provided("bk_scope2localids"):
             raise ValueError("Please initialize node cache by calling `pc._create_scope2nid_cache()` first.")

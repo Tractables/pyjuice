@@ -128,6 +128,51 @@ class SumNodes(CircuitNodes):
             **kwargs
         )
 
+    def update_parameters(self, params: torch.Tensor, clone: bool = True):
+        assert self.provided("_param_range"), "The `SumNodes` has not been compiled into a `TensorCircuit`."
+
+        if self.is_tied():
+            # Do not update parameters for tied nodes
+            return None
+
+        psid, peid = self._param_range
+        if clone:
+            ns_params = params[psid:peid].cpu().clone()
+        else:
+            ns_params = params[psid:peid].cpu()
+
+        local_parids = (self._param_ids - psid) // (self.group_size * self.ch_group_size)
+        num_pargroups = local_parids.size()
+        ns_params = ns_params.reshape(num_pargroups, self.ch_group_size, self.group_size)
+        ns._params = ns_params[local_parids,:,:].permute(0, 2, 1)
+
+    def update_param_flows(self, param_flows: torch.Tensor, origin_ns_only: bool = True, clone: bool = True):
+        assert self.provided("_param_flow_range"), "The `SumNodes` has not been compiled into a `TensorCircuit`."
+
+        if origin_ns_only and self.is_tied():
+            return None
+
+        pfsid, pfeid = self._param_flow_range
+        if clone:
+            ns_param_flows = param_flows[pfsid:pfeid].cpu().clone()
+        else:
+            ns_param_flows = param_flows[pfsid:pfeid].cpu()
+
+        local_parfids = (self._param_flow_ids - pfsid) // (self.group_size * self.ch_group_size)
+        num_parfgroups = local_parfids.size()
+        ns_param_flows = ns_param_flows.reshape(num_parfgroups, self.ch_group_size, self.group_size)
+        ns._param_flows = ns_param_flows[local_parfids,:,:].permute(0, 2, 1)
+
+    def gather_parameters(self, params: torch.Tensor):
+        assert self.provided("_param_range"), "The `SumNodes` has not been compiled into a `TensorCircuit`."
+
+        if self.is_tied() or not self.has_params():
+            return None
+
+        psid, peid = self._param_range
+        ns_params = self._params[self._inverse_param_ids,:,:].permute(0, 2, 1).reshape(-1)
+        params[psid:peid] = ns_params.to(params.device)
+
     def _get_edges_as_mask(self):
         mask = torch.zeros([self.num_node_groups, self.num_ch_nodes], dtype = torch.bool)
         mask[self.edge_ids[0,:], self.edge_ids[1,:]] = True

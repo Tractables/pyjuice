@@ -309,33 +309,30 @@ class TensorCircuit(nn.Module):
 
         return self
 
-    def update_parameters(self, clone_params: bool = True, update_flows: bool = False):
+    def update_parameters(self, clone: bool = True):
         """
         Copy parameters from this `TensorCircuit` to the original `CircuitNodes`
         """
-        raise NotImplementedError()
         params = self.params.detach().cpu()
-        if update_flows:
-            param_flows = self.param_flows.detach().cpu()
 
         for ns in self.root_nodes:
             if ns.is_sum() and not ns.is_tied():
-                psid, peid = ns._param_range
-                if clone_params:
-                    ns._params = params[ns._param_ids].clone()
-                else:
-                    ns._params = params[ns._param_ids]
-                
-                if update_flows:
-                    if clone_params:
-                        ns._flows = param_flows[ns._param_ids].clone()
-                    else:
-                        ns._flows = param_flows[ns._param_ids]
+                ns.update_parameters(params, clone = clone)
 
         for layer in self.input_layer_group:
             layer.update_parameters()
 
         return None
+
+    def update_param_flows(self, clone: bool = True, origin_ns_only: bool = True):
+        """
+        Copy parameter flows from this `TensorCircuit` to the original `CircuitNodes`
+        """
+        param_flows = self.param_flows.detach().cpu()
+
+        for ns in self.root_nodes:
+            if ns.is_sum() and not ns.is_tied():
+                ns.update_param_flows(params, clone = clone, origin_ns_only = origin_ns_only)
 
     def print_statistics(self):
         """
@@ -604,9 +601,7 @@ class TensorCircuit(nn.Module):
         # Copy initial parameters if provided
         for ns in self.root_ns:
             if ns.is_sum() and not ns.is_tied() and ns.has_params():
-                sidx, eidx = ns._param_range
-                ns_params = ns._params[ns._inverse_param_ids,:,:].permute(0, 2, 1).reshape(-1)
-                params[sidx:eidx] = ns_params.to(params.device)
+                ns.gather_parameters(params)
 
         self._normalize_parameters(params, pseudocount = pseudocount)
         self.params = nn.Parameter(params)
