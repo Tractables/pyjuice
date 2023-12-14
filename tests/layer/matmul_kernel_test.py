@@ -23,12 +23,12 @@ def kernel1(a, b, c, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr):
     pid = tl.program_id(axis = 0)
 
     offs_a = tl.arange(0, M)[:,None] * N + tl.arange(0, N)[None,:]
-    aa = tl.load(a + offs_a) # .to(tl.bfloat16)
+    aa = tl.load(a + offs_a).to(tl.float16)
 
     offs_b = tl.arange(0, N)[:,None] * K + tl.arange(0, K)[None,:]
-    bb = tl.load(b + offs_b) # .to(tl.bfloat16)
+    bb = tl.load(b + offs_b).to(tl.float16)
 
-    cc = tl.dot(aa, bb, allow_tf32 = True) # .to(tl.float32)
+    cc = tl.dot(aa, bb).to(tl.float32)
 
     offs_c = tl.arange(0, M)[:,None] * K + tl.arange(0, K)[None,:]
     tl.store(c + offs_c, cc)
@@ -39,12 +39,12 @@ def kernel2(a, b, c, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr):
     pid = tl.program_id(axis = 0)
 
     offs_a = tl.arange(0, M)[:,None] * N + tl.arange(0, N)[None,:]
-    aa = tl.load(a + offs_a) # .to(tl.bfloat16)
+    aa = tl.load(a + offs_a)#.to(tl.float16)
 
     offs_b = tl.arange(0, N)[:,None] * K + tl.arange(0, K)[None,:]
-    bb = tl.load(b + offs_b) # .to(tl.bfloat16)
+    bb = tl.load(b + offs_b)#.to(tl.float16)
 
-    cc = tl.sum(aa[:,:,None] * bb[None,:,:], axis = 1) # .to(tl.float32)
+    cc = tl.sum(aa[:,:,None] * bb[None,:,:], axis = 1)#.to(tl.float32)
 
     # cc = tl.dot(aa, bb)
 
@@ -75,15 +75,15 @@ if __name__ == "__main__":
 
     M = 16
     N = 16
-    K = 16
+    K = 8
 
     a = torch.rand([M, N]).cuda()
     b = torch.rand([N, K]).cuda()
-    c = torch.rand([M, K]).cuda()
+    c = torch.zeros([M, K]).cuda()
 
-    grid = (1000,)
+    grid = (1,)
 
-    kernel1[grid](a, b, c, M, N, K)
+    # kernel1[grid](a, b, c, M, N, K)
 
     # torch.cuda.synchronize()
     # t0 = time.time()
@@ -105,6 +105,10 @@ if __name__ == "__main__":
 
     # print((t1 - t0) / 100 * 1000)
 
-    # cc = torch.matmul(a, b)
+    cc = torch.matmul(a, b)
 
-    # print((c - cc).abs().max())
+    print((c - cc).abs().max())
+
+    ccc = c
+
+    import pdb; pdb.set_trace()
