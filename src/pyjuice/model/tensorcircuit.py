@@ -55,6 +55,8 @@ class TensorCircuit(nn.Module):
         self.root_ns = root_ns
         self.device = torch.device("cpu")
 
+        self.num_vars = self._get_num_vars(self.root_ns)
+
         self.node_mars = None
         self.element_mars = None
         self.node_flows = None
@@ -76,6 +78,9 @@ class TensorCircuit(nn.Module):
             "flows_memory": 1.0
         }
 
+        # Recorded CudaGraphs
+        self._recorded_cuda_graphs = dict()
+
     def to(self, device):
         super(TensorCircuit, self).to(device)
 
@@ -92,7 +97,8 @@ class TensorCircuit(nn.Module):
         return self
         
     def forward(self, inputs: torch.Tensor, input_layer_fn: Optional[Union[str,Callable]] = None,
-                cache: Optional[dict] = None, return_cache: bool = False, **kwargs):
+                cache: Optional[dict] = None, return_cache: bool = False, record_cudagraph: bool = False, 
+                apply_cudagraph: bool = False, **kwargs):
         """
         Forward the circuit.
 
@@ -103,6 +109,8 @@ class TensorCircuit(nn.Module):
                           the corresponding member function of `input_layer`
         `kwargs`:         Additional arguments for input layers
         """
+
+        assert inputs.dim() == 2 and inputs.size(1) == self.num_vars
         
         B = inputs.size(0)
         inputs = inputs.permute(1, 0)
@@ -135,17 +143,42 @@ class TensorCircuit(nn.Module):
                     raise ValueError(f"Custom input function should be either a `str` or a `Callable`. Found {type(input_layer_fn)} instead.")
 
             # Inner layers
-            for layer_group in self.inner_layer_groups:
-                if layer_group.is_prod():
-                    # Prod layer
-                    layer_group(self.node_mars, self.element_mars)
+            def _run_inner_layers():
+                for layer_group in self.inner_layer_groups:
+                    if layer_group.is_prod():
+                        # Prod layer
+                        layer_group(self.node_mars, self.element_mars)
 
-                elif layer_group.is_sum():
-                    # Sum layer
-                    layer_group(self.node_mars, self.element_mars, self.params)
+                    elif layer_group.is_sum():
+                        # Sum layer
+                        layer_group(self.node_mars, self.element_mars, self.params)
 
-                else:
-                    raise ValueError(f"Unknown layer type {type(layer)}.")
+                    else:
+                        raise ValueError(f"Unknown layer type {type(layer)}.")
+
+            signature = (id(self.node_mars), id(self.element_mars), B)
+            if record_cudagraph and signature not in self._recorded_cuda_graphs:
+                # Warmup
+                s = torch.cuda.Stream()
+                s.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(s):
+                    for _ in range(3):
+                        _run_inner_layers()
+                torch.cuda.current_stream().wait_stream(s)
+
+                # Capture
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g):
+                    _run_inner_layers()
+
+                # Save
+                self._recorded_cuda_graphs[signature] = g
+
+            if apply_cudagraph and signature in self._recorded_cuda_graphs:
+                g = self._recorded_cuda_graphs[signature]
+                g.replay()
+            else:
+                _run_inner_layers()
                 
         lls = self.node_mars[self._root_node_range[0]:self._root_node_range[1],:]
         lls = lls.permute(1, 0)
@@ -191,6 +224,7 @@ class TensorCircuit(nn.Module):
         """
 
         assert self.node_mars is not None and self.element_mars is not None, "Should run forward path first."
+        assert inputs.size(0) == self.num_vars
 
         B = self.node_mars.size(1)
 
@@ -433,6 +467,13 @@ class TensorCircuit(nn.Module):
             return False
 
         return True
+
+    def _get_num_vars(self, ns: CircuitNodes):
+        num_vars = 0
+        for v in ns.scope:
+            if (v + 1) > num_vars:
+                num_vars = v + 1
+        return num_vars
 
     def _init_layers(self, layer_sparsity_tol: Optional[float] = None, max_num_partitions: Optional[int] = None,
                      disable_gpu_compilation: bool = False, force_gpu_compilation: bool = False, 
