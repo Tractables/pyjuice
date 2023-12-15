@@ -515,7 +515,7 @@ class TensorCircuit(nn.Module):
         node2tiednodes = dict()
 
         if verbose:
-            print(f"Compiling {num_layers} layers...")
+            print(f"Compiling {num_layers} TensorCircuit layers...")
 
         layer_id = 0
         for depth in tqdm(range(num_layers), disable = not verbose):
