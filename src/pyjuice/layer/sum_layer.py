@@ -348,7 +348,7 @@ class SumLayer(Layer, nn.Module):
         else:
             mode = "block_sparse"
 
-        mode = "sparse" #### debug
+        # mode = "sparse" #### debug
 
         if mode == "block_sparse":
             self._forward_block_sparse(
@@ -372,10 +372,10 @@ class SumLayer(Layer, nn.Module):
 
     @staticmethod
     @triton.jit
-    def _fw_triton_block_sparse_kernel(node_mars, element_mars, params, nids, cids_start, cids_increment,
-                                       pids_start, pids_increment, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
-                                       BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
-                                       TILE_SIZE_M: tl.constexpr, GROUP_SIZE_M: tl.constexpr, OP_MODE: tl.constexpr):
+    def _fw_triton_block_sparse_tlmm_kernel(node_mars, element_mars, params, nids, cids_start, cids_increment,
+                                            pids_start, pids_increment, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
+                                            BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
+                                            TILE_SIZE_M: tl.constexpr, GROUP_SIZE_M: tl.constexpr, use_fp16: tl.constexpr):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
@@ -426,24 +426,16 @@ class SumLayer(Layer, nn.Module):
             emars = tl.load(emars_ptr, mask = mask_batch[None,:])
 
             emars_max = tl.max(emars, axis = 0)[None,:]
-            emars = tl.exp(emars - emars_max)
+            emars_sub = tl.exp(emars - emars_max)
 
-            if OP_MODE == 0:
+            if use_fp16 == 1:
                 # Built-in matmul kernel of triton + float16
-                epars = (epars * (2**12)).to(tl.float16)
-                emars = emars.to(tl.float16)
-                nmars = tl.dot(epars, emars).to(tl.float32) / (2**12)
-            if OP_MODE == 1:
+                epars_fp16 = (epars * (2**12)).to(tl.float16)
+                emars_fp16 = emars_sub.to(tl.float16)
+                nmars = tl.dot(epars_fp16, emars_fp16).to(tl.float32) / (2**12)
+            else:
                 # Built-in matmul kernel of triton + float32
-                nmars = tl.dot(epars, emars)
-            if OP_MODE == 2:
-                # Simulated matmul kernel + float16
-                epars = (epars * (2**12)).to(tl.float16)
-                emars = emars.to(tl.float16)
-                nmars = tl.sum(epars[:,:,None] * emars[None,:,:], axis = 1).to(tl.float32) / (2**12)
-            if OP_MODE == 3:
-                # Simulated matmul kernel + float32
-                nmars = tl.sum(epars[:,:,None] * emars[None,:,:], axis = 1)
+                nmars = tl.dot(epars, emars_sub)
 
             acc = tl.where(emars_max > acc,
                 tl.log(nmars + tl.exp(acc - emars_max)) + emars_max,
@@ -458,6 +450,93 @@ class SumLayer(Layer, nn.Module):
             # Increment `emars_ptr`
             cids_inc = tl.load(cids_inc_ptr)
             emars_ptr += cids_inc[:,None] * batch_size
+            cids_inc_ptr += TILE_SIZE_K
+
+        # Write back
+        off_nids = tl.load(nids + ngroup_id)
+        offs_nmars = (off_nids + offs_node[:,None]) * batch_size + offs_batch[None,:]
+        tl.store(node_mars + offs_nmars, acc, mask = mask_batch[None,:])
+
+    @staticmethod
+    @triton.jit
+    def _fw_triton_block_sparse_csmm_kernel(node_mars, element_mars, params, nids, cids_start, cids_increment,
+                                            pids_start, pids_increment, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
+                                            BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
+                                            TILE_SIZE_M: tl.constexpr, GROUP_SIZE_M: tl.constexpr, use_fp16: tl.constexpr):
+
+        pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
+        pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
+
+        # Get inferred node group id from `pid_m`
+        ngroup_id = pid_m // (GROUP_SIZE_M // TILE_SIZE_M)
+        tile_id = pid_m % (GROUP_SIZE_M // TILE_SIZE_M)
+
+        # Get the real node group id in the case of partial evaluation
+        if partial_eval == 1:
+            ngroup_id = tl.load(local_ids + ngroup_id)
+
+        # Node offsets
+        offs_node = tl.arange(0, TILE_SIZE_M) + tile_id * TILE_SIZE_M
+        offs_node = tl.max_contiguous(offs_node, TILE_SIZE_M)
+
+        # Edge offsets
+        offs_edge = tl.arange(0, TILE_SIZE_K)
+
+        # Initialize pointers to `params`
+        offs_estart = ngroup_id * TILE_SIZE_K + offs_edge
+        offs_estart = tl.max_contiguous(offs_estart, TILE_SIZE_K)
+        par_start = tl.load(pids_start + offs_estart)
+        epars_ptr = params + \
+            offs_node[:,None] + \
+            par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
+
+        # Batch offsets and mask
+        offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B
+        offs_batch = tl.max_contiguous(offs_batch, BLOCK_B)
+        mask_batch = offs_batch < batch_size
+
+        # Initialize pointers to `element_mars`
+        edge_start = tl.load(cids_start + offs_estart)
+        emars_ptr = element_mars + \
+            edge_start[None,:] * batch_size + \
+            offs_batch[:,None] # [BLOCK_B, TILE_SIZE_K]
+
+        # Batch increment pointers
+        pids_inc_ptr = pids_increment + ngroup_id * (K_NUM_TILES * TILE_SIZE_K) + offs_edge
+        cids_inc_ptr = cids_increment + ngroup_id * (K_NUM_TILES * TILE_SIZE_K) + offs_edge
+
+        # Inner loop
+        acc = tl.zeros([TILE_SIZE_M, BLOCK_B], dtype = tl.float32) - float("inf")
+
+        for k in range(0, K_NUM_TILES):
+            epars = tl.load(epars_ptr)
+            emars = tl.load(emars_ptr, mask = mask_batch[:,None])
+
+            emars_max = tl.max(emars, axis = 1)
+            emars_sub = tl.exp(emars - emars_max[:,None])
+
+            if use_fp16 == 1:
+                # Simulated matmul kernel + float16
+                epars = (epars * (2**12)).to(tl.float16)
+                emars = emars.to(tl.float16)
+                nmars = tl.sum(epars[:,:,None] * tl.trans(emars_sub)[None,:,:], axis = 1).to(tl.float32) / (2**12)
+            else:
+                # Simulated matmul kernel + float32
+                nmars = tl.sum(epars[:,:,None] * tl.trans(emars_sub)[None,:,:], axis = 1)
+
+            acc = tl.where(emars_max[None,:] > acc,
+                tl.log(nmars + tl.exp(acc - emars_max[None,:])) + emars_max[None,:],
+                tl.log(tl.exp(emars_max[None,:] - acc) * nmars + 1.0) + acc
+            )
+
+            # Increment `epars_ptr`
+            pids_inc = tl.load(pids_inc_ptr)
+            epars_ptr += pids_inc[None,:]
+            pids_inc_ptr += TILE_SIZE_K
+
+            # Increment `emars_ptr`
+            cids_inc = tl.load(cids_inc_ptr)
+            emars_ptr += cids_inc[None,:] * batch_size
             cids_inc_ptr += TILE_SIZE_K
 
         # Write back
@@ -541,38 +620,62 @@ class SumLayer(Layer, nn.Module):
             else:
                 use_fp16 = False
 
-        if TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and BLOCK_B >= 16:
-            if use_fp16:
-                OP_MODE = 0
-            else:
-                OP_MODE = 1
-        else:
-            if use_fp16:
-                OP_MODE = 2
-            else:
-                OP_MODE = 3
-
         grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
+
+        # print("========")
+        # print(layer_n_nodes)
+        # print(grid, grid[0] * grid[1])
+        # print(TILE_SIZE_M, TILE_SIZE_K, BLOCK_B)
+
+        # import time
+        # torch.cuda.synchronize()
+        # t0 = time.time()
         
-        self._fw_triton_block_sparse_kernel[grid](
-            node_mars, 
-            element_mars, 
-            params, 
-            nids, 
-            cids_start,
-            cids_increment, 
-            pids_start,
-            pids_increment,
-            local_ids,
-            batch_size,
-            partial_eval = 1 if local_ids is not None else 0,
-            BLOCK_B = BLOCK_B,
-            TILE_SIZE_K = TILE_SIZE_K,
-            K_NUM_TILES = K_NUM_TILES,
-            TILE_SIZE_M = TILE_SIZE_M,
-            GROUP_SIZE_M = self.group_size,
-            OP_MODE = OP_MODE
-        )
+        if TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and BLOCK_B >= 16:
+            self._fw_triton_block_sparse_tlmm_kernel[grid](
+                node_mars, 
+                element_mars, 
+                params, 
+                nids, 
+                cids_start,
+                cids_increment, 
+                pids_start,
+                pids_increment,
+                local_ids,
+                batch_size,
+                partial_eval = 1 if local_ids is not None else 0,
+                BLOCK_B = BLOCK_B,
+                TILE_SIZE_K = TILE_SIZE_K,
+                K_NUM_TILES = K_NUM_TILES,
+                TILE_SIZE_M = TILE_SIZE_M,
+                GROUP_SIZE_M = self.group_size,
+                use_fp16 = use_fp16
+            )
+        else:
+            self._fw_triton_block_sparse_csmm_kernel[grid](
+                node_mars, 
+                element_mars, 
+                params, 
+                nids, 
+                cids_start,
+                cids_increment, 
+                pids_start,
+                pids_increment,
+                local_ids,
+                batch_size,
+                partial_eval = 1 if local_ids is not None else 0,
+                BLOCK_B = BLOCK_B,
+                TILE_SIZE_K = TILE_SIZE_K,
+                K_NUM_TILES = K_NUM_TILES,
+                TILE_SIZE_M = TILE_SIZE_M,
+                GROUP_SIZE_M = self.group_size,
+                use_fp16 = use_fp16
+            )
+
+        # torch.cuda.synchronize()
+        # t1 = time.time()
+
+        # print(f"kernel time: {(t1-t0)*1000:.3f}ms")
         
         return None
 
