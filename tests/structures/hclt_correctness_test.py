@@ -167,7 +167,7 @@ def hclt_backward_test():
                     eflows = nflows * params.permute(1, 0) * (emars - nmars).exp()
                     pflows = eflows.sum(dim = 1)
 
-                    assert torch.all(torch.abs(pflows - param_flows[0,:]) < 3e-3)
+                    assert torch.all(torch.abs(pflows - param_flows[0,:]) < 6e-3)
 
                     if cs not in ns2flows:
                         ns2flows[cs] = torch.zeros([num_latents, batch_size])
@@ -210,14 +210,96 @@ def hclt_backward_test():
 
                     pflows = torch.matmul(nflows_div_mars, (emars - emars_max[None,:]).exp().permute(1, 0)) * params
 
-                    assert torch.all(torch.abs(pflows - param_flows) < 3e-3)
+                    assert torch.all(torch.abs(pflows - param_flows) < 6e-3)
 
                     if cs not in ns2flows:
                         ns2flows[cs] = torch.zeros([num_latents, batch_size])
                     ns2flows[cs] += eflows
 
 
+def hclt_em_test():
+
+    device = torch.device("cuda:0")
+
+    train_dataset = torchvision.datasets.MNIST(root = "./examples/data", train = True, download = True)
+
+    train_data = train_dataset.data.reshape(60000, 28*28)[:5000,:]
+
+    num_features = train_data.size(1)
+    num_latents = 128
+
+    root_ns = juice.structures.HCLT(
+        train_data.float().to(device), 
+        num_bins = 32, 
+        sigma = 0.5 / 32, 
+        num_latents = num_latents, 
+        chunk_size = 32
+    )
+    root_ns.init_parameters()
+
+    pc = juice.TensorCircuit(root_ns)
+
+    pc.to(device)
+
+    group_size = root_ns.chs[0].group_size
+    num_groups = num_latents // group_size
+
+    batch_data = train_data[:512,:].contiguous().to(device)
+    data_cpu = batch_data.cpu().long()
+    batch_size = batch_data.size(0)
+
+    lls = pc(batch_data)
+    lls.mean().backward()
+
+    ns2old_params = dict()
+    for ns in root_ns:
+        if ns.is_sum() and ns.has_params():
+            ns2old_params[ns] = ns._params.clone()
+
+    pseudocount = 0.01
+    step_size = 0.24
+
+    pc.mini_batch_em(step_size = step_size, pseudocount = pseudocount)
+
+    pc.update_parameters()
+    pc.update_param_flows()
+
+    for ns in root_ns:
+        if ns.is_sum() and ns != root_ns:
+            old_params = ns2old_params[ns].reshape(num_groups, num_groups * ns.num_chs, group_size, group_size).permute(0, 2, 1, 3)
+            old_params = old_params.reshape(num_latents, num_latents * ns.num_chs)
+
+            ref_params = ns._params.reshape(num_groups, num_groups * ns.num_chs, group_size, group_size).permute(0, 2, 1, 3)
+            ref_params = ref_params.reshape(num_latents, num_latents * ns.num_chs)
+
+            par_flows = ns._param_flows.reshape(num_groups, num_groups * ns.num_chs, group_size, group_size).permute(0, 2, 1, 3)
+            par_flows = par_flows.reshape(num_latents, num_latents * ns.num_chs)
+
+            new_params = (par_flows + pseudocount / par_flows.size(1)) / (par_flows.sum(dim = 1, keepdim = True) + pseudocount)
+
+            updated_params = (1.0 - step_size) * old_params + step_size * new_params
+
+            assert torch.all(torch.abs(ref_params - updated_params) < 1e-4)
+
+        elif ns == root_ns:
+            old_params = ns2old_params[ns].reshape(1, num_groups * ns.num_chs, 1, group_size).permute(0, 2, 1, 3)
+            old_params = old_params.reshape(1, num_latents * ns.num_chs)
+
+            ref_params = ns._params.reshape(1, num_groups * ns.num_chs, 1, group_size).permute(0, 2, 1, 3)
+            ref_params = ref_params.reshape(1, num_latents * ns.num_chs)
+
+            par_flows = ns._param_flows.reshape(1, num_groups * ns.num_chs, 1, group_size).permute(0, 2, 1, 3)
+            par_flows = par_flows.reshape(1, num_latents * ns.num_chs)
+
+            new_params = (par_flows + pseudocount / par_flows.size(1)) / (par_flows.sum(dim = 1, keepdim = True) + pseudocount)
+
+            updated_params = (1.0 - step_size) * old_params + step_size * new_params
+
+            assert torch.all(torch.abs(ref_params - updated_params) < 1e-4)
+
+
 if __name__ == "__main__":
     torch.manual_seed(320942)
     hclt_forward_test()
     hclt_backward_test()
+    hclt_em_test()

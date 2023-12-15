@@ -275,12 +275,38 @@ class SumLayer(Layer, nn.Module):
                 parpids = self.partitioned_parpids[partition_id]
                 cs_group_size = self.cs_group_sizes[partition_id]
 
+                torch.cuda.synchronize()
+
+                if node_flows.isnan().any() or node_flows.isinf().any():
+                    import pdb; pdb.set_trace()
+                    a = 0
+
+                if element_flows.isnan().any() or element_flows.isinf().any():
+                    import pdb; pdb.set_trace()
+                    a = 0
+
                 self._backward(
                     node_flows, element_flows, params, node_mars, 
                     element_mars, param_flows, 
                     chids = chids, parids = parids, parpids = parpids,
                     cs_group_size = cs_group_size
                 )
+
+                torch.cuda.synchronize()
+
+                if node_flows.isnan().any() or node_flows.isinf().any():
+                    import pdb; pdb.set_trace()
+                    a = 0
+
+                if element_flows.isnan().any() or element_flows.isinf().any():
+                    self._backward(
+                        node_flows, element_flows, params, node_mars, 
+                        element_mars, param_flows, 
+                        chids = chids, parids = parids, parpids = parpids,
+                        cs_group_size = cs_group_size, debug = True
+                    )
+                    import pdb; pdb.set_trace()
+                    a = 0
 
         else:
             # Partial evaluation
@@ -817,7 +843,7 @@ class SumLayer(Layer, nn.Module):
                   chids: Optional[torch.Tensor] = None, parids: Optional[torch.Tensor] = None, 
                   parpids: Optional[torch.Tensor] = None, 
                   cs_group_size: int = 0, local_ids: Optional[torch.Tensor] = None, 
-                  partition_id: int = -1, mode: Optional[str] = None) -> None:
+                  partition_id: int = -1, mode: Optional[str] = None, debug = False) -> None:
         """
         Back pass of sum layers.
         
@@ -857,14 +883,16 @@ class SumLayer(Layer, nn.Module):
             self._backward_block_sparse(
                 node_flows, element_flows, params, node_mars, element_mars, param_flows, 
                 nids, cids, pids, pfids, chids, parids, parpids, cs_group_size, local_ids, 
-                partition_id = partition_id
+                partition_id = partition_id, debug = debug
             )
+
         elif mode == "sparse":
             self._backward_sparse(
                 node_flows, element_flows, params, node_mars, element_mars, param_flows, 
                 nids, cids, pids, pfids, chids, parids, parpids, cs_group_size, local_ids, 
                 partition_id = partition_id
             )
+
         elif mode == "pytorch":
             self._backward_pytorch(
                 node_flows, element_flows, params, node_mars, 
@@ -880,7 +908,7 @@ class SumLayer(Layer, nn.Module):
                                nids: Optional[torch.Tensor], cids: Optional[torch.Tensor], pids: Optional[torch.Tensor], pfids: Optional[torch.Tensor],
                                chids: Optional[torch.Tensor], parids: Optional[torch.Tensor], parpids: Optional[torch.Tensor], 
                                cs_group_size: int, local_ids: Optional[torch.Tensor] = None,
-                               partition_id: int = -1) -> None:
+                               partition_id: int = -1, debug = False) -> None:
         """
         Back pass of sum layers with block-sparse processing kernel.
         
@@ -902,7 +930,7 @@ class SumLayer(Layer, nn.Module):
                 node_flows, element_flows, params, node_mars, element_mars,
                 chids = chids, parids = parids, parpids = parpids, 
                 cs_group_size = cs_group_size, local_ids = local_ids, 
-                partition_id = partition_id
+                partition_id = partition_id, debug = debug
             )
 
         # Flows w.r.t. parameters
@@ -959,8 +987,7 @@ class SumLayer(Layer, nn.Module):
         # Initialize pointers to `element_mars`
         off_eleids = tl.load(chids + elegroup_id)
         offs_elemfs = (off_eleids + offs_ele[:,None]) * batch_size + offs_batch[None,:]
-        tmp_emars = tl.load(element_mars + offs_elemfs, mask = mask_batch[None,:]) # [TILE_SIZE_K, BLOCK_B]
-        emars_max = tl.max(tmp_emars, axis = 0) # [BLOCK_B]
+        emars = tl.load(element_mars + offs_elemfs, mask = mask_batch[None,:]) # [TILE_SIZE_K, BLOCK_B]
 
         # Batch increment pointers
         parids_inc_ptr = parids_increment + elegroup_id * (K_NUM_TILES * ptr_inc_step) + offs_edge_gid
@@ -974,24 +1001,27 @@ class SumLayer(Layer, nn.Module):
             nmars = tl.load(nmars_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_K, BLOCK_B]
             nflows = tl.load(nflows_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_K, BLOCK_B]
 
-            nflows_div_mars = nflows * tl.exp(emars_max[None,:] - nmars)
+            nmars_max = tl.max(nmars, axis = 0) # [BLOCK_B]
+            nflows_div_mars = nflows * tl.exp(nmars_max[None,:] - nmars)
+
+            eflows = tl.sum(epars[:,:,None] * tl.exp(emars[:,None,:] - nmars[None,:,:]) * nflows[None,:,:], axis = 1)
             
-            if OP_MODE == 0:
-                # Built-in matmul kernel of triton + float16
-                epars = epars.to(tl.float16)
-                nflows_div_mars = nflows_div_mars.to(tl.float16)
-                eflows = tl.dot(epars, nflows_div_mars).to(tl.float32)
-            if OP_MODE == 1:
-                # Built-in matmul kernel of triton + float32
-                eflows = tl.dot(epars, nflows_div_mars)
-            if OP_MODE == 2:
-                # Simulated matmul kernel + float16
-                epars = epars.to(tl.float16)
-                nflows_div_mars = nflows_div_mars.to(tl.float16)
-                eflows = tl.sum(epars[:,:,None] * nflows_div_mars[None,:,:], axis = 1).to(tl.float32)
-            if OP_MODE == 3:
-                # Simulated matmul kernel + float32
-                eflows = tl.sum(epars[:,:,None] * nflows_div_mars[None,:,:], axis = 1)
+            # if OP_MODE == 0:
+            #     # Built-in matmul kernel of triton + float16
+            #     epars = epars.to(tl.float16)
+            #     nflows_div_mars = nflows_div_mars.to(tl.float16)
+            #     eflows = tl.dot(epars, nflows_div_mars).to(tl.float32)
+            # if OP_MODE == 1:
+            #     # Built-in matmul kernel of triton + float32
+            #     eflows = tl.dot(epars, nflows_div_mars)
+            # if OP_MODE == 2:
+            #     # Simulated matmul kernel + float16
+            #     epars = epars.to(tl.float16)
+            #     nflows_div_mars = nflows_div_mars.to(tl.float16)
+            #     eflows = tl.sum(epars[:,:,None] * nflows_div_mars[None,:,:], axis = 1).to(tl.float32)
+            # if OP_MODE == 3:
+            #     # Simulated matmul kernel + float32
+            #     eflows = tl.sum(epars[:,:,None] * nflows_div_mars[None,:,:], axis = 1)
 
             acc += eflows
 
@@ -1006,19 +1036,16 @@ class SumLayer(Layer, nn.Module):
             nflows_ptr += parids_inc[:,None] * batch_size
             parids_inc += ptr_inc_step
 
-        # Initialize pointers to `element_mars`
+        # Write back
         off_eleids = tl.load(chids + elegroup_id)
         offs_elemfs = (off_eleids + offs_ele[:,None]) * batch_size + offs_batch[None,:]
-        emars = tl.load(element_mars + offs_elemfs, mask = mask_batch[None,:]) # [TILE_SIZE_K, BLOCK_B]
-
-        eflows = acc * tl.exp(emars - emars_max[None,:])
-        tl.store(element_flows + offs_elemfs, eflows, mask = mask_batch[None,:])
+        tl.store(element_flows + offs_elemfs, acc, mask = mask_batch[None,:])
 
     def _backward_block_sparse_ele_flows(self, node_flows: torch.Tensor, element_flows: torch.Tensor,
                                          params: torch.Tensor, node_mars: torch.Tensor,
                                          element_mars: torch.Tensor, chids: torch.Tensor, parids: torch.Tensor,
                                          parpids: torch.Tensor, cs_group_size: int, local_ids: Optional[torch.Tensor] = None,
-                                         partition_id: int = -1, force_use_fp16: bool = False, force_use_fp32: bool = False) -> None:
+                                         partition_id: int = -1, force_use_fp16: bool = False, force_use_fp32: bool = False, debug = False) -> None:
 
         assert params.dim() == 1, "Expecting a 1D `params`."
 
@@ -1106,6 +1133,78 @@ class SumLayer(Layer, nn.Module):
                 OP_MODE = 3
 
         grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
+
+        if debug:
+            import pdb; pdb.set_trace()
+
+            # num_ngroups = chids.size(0)
+            # num_egroups = parids.size(1)
+            # parids = (parids[:,:,None].repeat(1, 1, self.group_size) + torch.arange(0, self.group_size, device = parids.device)).reshape(num_ngroups, num_egroups * self.group_size)
+            # parpids = (parpids[:,:,None] + torch.arange(0, self.group_size, device = parids.device)).reshape(
+            #     num_ngroups, num_egroups * self.group_size)
+
+            # chids = (chids[:,None].repeat(1, cs_group_size) + torch.arange(0, cs_group_size, device = chids.device)).reshape(num_ngroups * cs_group_size)
+            # parids = parids[:,None,:].repeat(1, cs_group_size, 1).reshape(num_ngroups * cs_group_size, num_egroups * self.group_size)
+            # parpids = (parpids[:,None,:].repeat(1, cs_group_size, 1) + torch.arange(0, cs_group_size * self.group_size, self.group_size, device = parpids.device)[None,:,None]).reshape(
+            #     num_ngroups * cs_group_size, num_egroups * self.group_size
+            # )
+            
+            # element_flows[chids] = (node_flows[parids] * params[parpids].unsqueeze(-1) * \
+            #     (element_mars[chids].unsqueeze(1) - node_mars[parids]).exp()).sum(dim = 1)
+
+            import numpy as np
+            np.savez("temp.npz", node_flows = node_flows.cpu().numpy(),
+                     element_flow = element_flows.cpu().numpy(),
+                     node_mars = node_mars.cpu().numpy(),
+                     element_mars = element_mars.cpu().numpy(),
+                     params = params.cpu().numpy(),
+                     chids = chids.cpu().numpy(),
+                     parids = parids.cpu().numpy(),
+                     parids_start = parids_start.cpu().numpy(),
+                     parids_increment = parids_increment.cpu().numpy(),
+                     parpids = parpids.cpu().numpy(),
+                     parpids_start = parpids_start.cpu().numpy(),
+                     parpids_increment = parpids_increment.cpu().numpy(),
+                     batch_size = batch_size,
+                     ptr_inc_step = ptr_inc_step,
+                     BLOCK_B = BLOCK_B, 
+                     TILE_SIZE_K = TILE_SIZE_K, 
+                     K_NUM_TILES = K_NUM_TILES,
+                     TILE_SIZE_M = TILE_SIZE_M, 
+                     GROUP_SIZE_M = cs_group_size,
+                     GROUP_SIZE_K = self.group_size,
+                     OP_MODE = OP_MODE, 
+                     layer_n_nodes = layer_n_nodes)
+
+            import pdb; pdb.set_trace()
+
+            OP_MODE = 1
+
+            self._bk_triton_block_sparse_ele_kernel[grid](
+                node_flows = node_flows, 
+                element_flows = element_flows, 
+                node_mars = node_mars, 
+                element_mars = element_mars, 
+                params = params, 
+                chids = chids, 
+                parids_start = parids_start,
+                parids_increment = parids_increment,
+                parpids_start = parpids_start,
+                parpids_increment = parpids_increment, 
+                local_ids = local_ids, 
+                batch_size = batch_size, 
+                partial_eval = 1 if local_ids is not None else 0,
+                ptr_inc_step = ptr_inc_step,
+                BLOCK_B = BLOCK_B, 
+                TILE_SIZE_K = TILE_SIZE_K, 
+                K_NUM_TILES = K_NUM_TILES,
+                TILE_SIZE_M = TILE_SIZE_M, 
+                GROUP_SIZE_M = cs_group_size,
+                GROUP_SIZE_K = self.group_size,
+                OP_MODE = OP_MODE
+            )
+
+            import pdb; pdb.set_trace()
 
         self._bk_triton_block_sparse_ele_kernel[grid](
             node_flows = node_flows, 
@@ -1425,6 +1524,16 @@ class SumLayer(Layer, nn.Module):
 
         grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, BLOCK_M))
 
+        torch.cuda.synchronize()
+
+        if node_flows.isnan().any() or node_flows.isinf().any():
+            import pdb; pdb.set_trace()
+            a = 0
+
+        if element_flows.isnan().any() or element_flows.isinf().any():
+            import pdb; pdb.set_trace()
+            a = 0
+
         self._bk_triton_sparse_ele_kernel[grid](
             node_flows = node_flows, 
             element_flows = element_flows, 
@@ -1442,6 +1551,16 @@ class SumLayer(Layer, nn.Module):
             BLOCK_M = BLOCK_M,
             GROUP_SIZE_K = self.group_size
         )
+
+        torch.cuda.synchronize()
+
+        if node_flows.isnan().any() or node_flows.isinf().any():
+            import pdb; pdb.set_trace()
+            a = 0
+
+        if element_flows.isnan().any() or element_flows.isinf().any():
+            import pdb; pdb.set_trace()
+            a = 0
 
         return None
 
