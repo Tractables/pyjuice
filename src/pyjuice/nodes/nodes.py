@@ -2,17 +2,16 @@ from __future__ import annotations
 
 import numpy as np
 import torch
-from typing import Sequence, Union, Optional
+from typing import Sequence, Union, Optional, Callable
 from copy import deepcopy
+from collections import deque
+
 from pyjuice.utils import BitSet
 from pyjuice.graph import RegionGraph, PartitionNode, InnerRegionNode, InputRegionNode
 
 
-def node_iterator(root_ns: CircuitNodes):
-    visited = set()
-    node_list = list()
-
-    def dfs(ns: CircuitNodes):
+def node_iterator(root_ns: CircuitNodes, reverse: bool = False):
+    def dfs(ns: CircuitNodes, fn: Callable, visited: set = set()):
         if ns in visited:
             return
 
@@ -21,14 +20,48 @@ def node_iterator(root_ns: CircuitNodes):
         # Recursively traverse children
         if ns.is_sum() or ns.is_prod():
             for cs in ns.chs:
-                dfs(cs)
+                dfs(cs, fn = fn, visited = visited)
 
-        node_list.append(ns)
+        fn(ns)
 
-    dfs(root_ns)
+    if not reverse:
+        visited = set()
+        node_list = list()
 
-    for ns in node_list:
-        yield ns
+        def record_fn(ns):
+            node_list.append(ns)
+
+        dfs(root_ns, record_fn)
+
+        for ns in node_list:
+            yield ns
+    
+    else:
+        parcount = dict()
+        node_list = list()
+
+        def inc_parcount(ns):
+            for cs in ns.chs:
+                if cs not in parcount:
+                    parcount[cs] = 0
+                parcount[cs] += 1
+
+        dfs(root_ns, inc_parcount)
+
+        queue = deque()
+        queue.append(root_ns)
+        while len(queue) > 0:
+            ns = queue.popleft()
+            node_list.append(ns)
+            for cs in ns.chs:
+                parcount[cs] -= 1
+                if parcount[cs] == 0:
+                    queue.append(cs)
+
+        assert len(parcount) + 1 == len(node_list)
+
+        for ns in node_list:
+            yield ns
 
 
 class CircuitNodes():
@@ -66,6 +99,8 @@ class CircuitNodes():
         self._source_node = source_node
 
         self._tied_param_group_ids = None
+
+        self._reverse_iter = False
 
     def _run_init_callbacks(self, **kwargs):
         for func in self.INIT_CALLBACKS:
@@ -168,7 +203,12 @@ class CircuitNodes():
             clear_hooks(self)
 
     def __iter__(self):
-        return node_iterator(self)
+        return node_iterator(self, self._reverse_iter)
+
+    def __call__(self, reverse: bool = False):
+        self._reverse_iter = reverse
+
+        return self
 
     def provided(self, var_name):
         return hasattr(self, var_name) and getattr(self, var_name) is not None
