@@ -98,7 +98,7 @@ class TensorCircuit(nn.Module):
         
     def forward(self, inputs: torch.Tensor, input_layer_fn: Optional[Union[str,Callable]] = None,
                 cache: Optional[dict] = None, return_cache: bool = False, record_cudagraph: bool = False, 
-                apply_cudagraph: bool = False, **kwargs):
+                apply_cudagraph: bool = True, **kwargs):
         """
         Forward the circuit.
 
@@ -109,7 +109,7 @@ class TensorCircuit(nn.Module):
                           the corresponding member function of `input_layer`
         `kwargs`:         Additional arguments for input layers
         """
-
+        
         assert inputs.dim() == 2 and inputs.size(1) == self.num_vars
         
         B = inputs.size(0)

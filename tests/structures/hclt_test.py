@@ -109,35 +109,34 @@ def hclt_test():
         milestone_steps = [0, len(train_loader) * 100, len(train_loader) * 350]
     )
 
-    # for epoch in range(10):
-    #     t0 = time.time()
-    #     train_ll = 0.0
-    #     for idx, batch in enumerate(train_loader):
+    # for batch in train_loader:
+    #     x = batch[0].to(device)
+
+    #     optimizer.zero_grad()
+
+    #     lls = pc(x)
+    #     lls.mean().backward()
+
+    #     optimizer.step()
+    #     scheduler.step()
+
+    # from torch.profiler import profile, record_function, ProfilerActivity
+    # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+    #     for batch in train_loader:
     #         x = batch[0].to(device)
 
     #         optimizer.zero_grad()
 
     #         lls = pc(x)
-
-    #         if lls.isnan().any():
-    #             import pdb; pdb.set_trace()
-
     #         lls.mean().backward()
-
-    #         if pc.node_flows.isnan().any():
-    #             import pdb; pdb.set_trace()
-
-    #         train_ll += lls.mean().detach().cpu().numpy().item()
 
     #         optimizer.step()
     #         scheduler.step()
 
-    #         if pc.params.isnan().any():
-    #             import pdb; pdb.set_trace()
+    #         break
 
-    #     train_ll /= len(train_loader)
+    # prof.export_chrome_trace("trace_new2.json")
 
-    # exit()
 
     mini_batch_em_epoch(350, pc, optimizer, scheduler, train_loader, test_loader, device)
     full_batch_em_epoch(pc, train_loader, test_loader, device)
