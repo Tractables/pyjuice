@@ -156,7 +156,9 @@ class ProdLayer(Layer, nn.Module):
                 cids = self.partitioned_cids[partition_id]
                 local_ids = self.fw_partition_local_ids[partition_id]
 
-                self._forward_backward(element_mars, node_mars, nids, cids, local_ids = local_ids, accum = False)
+                self._forward_backward(
+                    element_mars, node_mars, nids, cids, local_ids = local_ids, accum = False
+                )
 
         elif _for_backward and self.provided("bk_fw_partition_local_ids"):
             # Partial evaluation (for backward pass)
@@ -165,7 +167,9 @@ class ProdLayer(Layer, nn.Module):
                 cids = self.partitioned_cids[partition_id]
                 local_ids = self.bk_fw_partition_local_ids[partition_id]
 
-                self._forward_backward(element_mars, node_mars, nids, cids, local_ids = local_ids, accum = False)
+                self._forward_backward(
+                    element_mars, node_mars, nids, cids, local_ids = local_ids, accum = False
+                )
 
         else:
             # Evaluate the whole layer
@@ -173,7 +177,9 @@ class ProdLayer(Layer, nn.Module):
                 nids = self.partitioned_nids[partition_id]
                 cids = self.partitioned_cids[partition_id]
 
-                self._forward_backward(element_mars, node_mars, nids, cids, accum = False)
+                self._forward_backward(
+                    element_mars, node_mars, nids, cids, accum = False
+                )
 
         return None
 
@@ -228,7 +234,7 @@ class ProdLayer(Layer, nn.Module):
     @staticmethod
     @triton.jit
     def _forward_backward_kernel_3d(node_vals_ptr, element_vals_ptr, local_ids_ptr, nids_ptr, cids_ptr, tot_n_nodes, tot_n_eles, n_ngroups,
-                                    n_edges: tl.constexpr, batch_size, BLOCK_M: tl.constexpr, BLOCK_B: tl.constexpr, 
+                                    num_edges: tl.constexpr, batch_size, BLOCK_M: tl.constexpr, BLOCK_B: tl.constexpr, 
                                     group_size: tl.constexpr, accum: tl.constexpr, partial_eval: tl.constexpr):
         """
         This kernel implements the function with 3d tensors. However, it only work with `triton==2.0.0`.
@@ -253,9 +259,9 @@ class ProdLayer(Layer, nn.Module):
 
             # Get the group start ids for the children
             # To make the triton compiler happy, we reload every index `BLOCK_M` times
-            offs_ne = tl.arange(0, n_edges * BLOCK_M) // BLOCK_M
-            offs_ne = tl.view(offs_ne, (BLOCK_M, n_edges))
-            offs_egstart = tl.load(cids_ptr + ngroup_id * n_edges + offs_ne) # [BLOCK_M, n_edges]
+            offs_ne = tl.arange(0, num_edges * BLOCK_M) // BLOCK_M
+            offs_ne = tl.view(offs_ne, (BLOCK_M, num_edges))
+            offs_egstart = tl.load(cids_ptr + ngroup_id * num_edges + offs_ne) # [BLOCK_M, num_edges]
 
             # Get the edge values from child nodes
             group_nids = tl.arange(0, BLOCK_M) + ntile_id * BLOCK_M
@@ -294,9 +300,9 @@ class ProdLayer(Layer, nn.Module):
             mask_batch = offs_batch < batch_size
 
             # Get the group start ids for the children
-            offs_ne = tl.arange(0, n_edges * BLOCK_M) // BLOCK_M
-            offs_ne = tl.view(offs_ne, (BLOCK_M, n_edges))
-            offs_egstart = tl.load(cids_ptr + ngroup_ids[:,None] * n_edges + offs_ne, mask = mask_node[:,None]) # [BLOCK_M, n_edges]
+            offs_ne = tl.arange(0, num_edges * BLOCK_M) // BLOCK_M
+            offs_ne = tl.view(offs_ne, (BLOCK_M, num_edges))
+            offs_egstart = tl.load(cids_ptr + ngroup_ids[:,None] * num_edges + offs_ne, mask = mask_node[:,None]) # [BLOCK_M, num_edges]
 
             # Get the edge values from child nodes
             group_nids = (offs_node % group_size)
@@ -320,7 +326,7 @@ class ProdLayer(Layer, nn.Module):
     @staticmethod
     @triton.jit
     def _forward_backward_kernel_2d(node_vals_ptr, element_vals_ptr, local_ids_ptr, nids_ptr, cids_ptr, tot_n_nodes, tot_n_eles, n_ngroups,
-                                    n_edges: tl.constexpr, batch_size, BLOCK_M: tl.constexpr, BLOCK_B: tl.constexpr, 
+                                    num_edges: tl.constexpr, batch_size, BLOCK_M: tl.constexpr, BLOCK_B: tl.constexpr, 
                                     group_size: tl.constexpr, accum: tl.constexpr, partial_eval: tl.constexpr):
         """
         This kernel implements the function with 2d tensors. It works for all `triton` versions.
@@ -342,13 +348,13 @@ class ProdLayer(Layer, nn.Module):
         mask_batch = offs_batch < batch_size
 
         # Get the group start ids for the children
-        offs_edge = tl.arange(0, n_edges)
-        offs_egstart = tl.load(cids_ptr + ngroup_id * n_edges + offs_edge) # [n_edges]
+        offs_edge = tl.arange(0, num_edges)
+        offs_egstart = tl.load(cids_ptr + ngroup_id * num_edges + offs_edge) # [num_edges]
 
         # Base ptr for ch values
         evals_ptr = element_vals_ptr + \
             (offs_egstart[:,None] + ntile_id * BLOCK_M) * batch_size + \
-            offs_batch[None,:] # [n_edges, BLOCK_B]
+            offs_batch[None,:] # [num_edges, BLOCK_B]
 
         # Base ptr for par values
         ngroup_start = tl.load(nids_ptr + ngroup_id)
@@ -392,21 +398,25 @@ class ProdLayer(Layer, nn.Module):
         tot_n_nodes = node_vals.size(0)
         tot_n_eles = element_vals.size(0)
         n_ngroups = nids.size(0) if local_ids is None else local_ids.size(0)
-        n_edges = cids.size(1)
+        num_edges = cids.size(1)
         batch_size = node_vals.size(1)
 
-        assert n_edges & (n_edges - 1) == 0, "`n_edges` must be power of 2."
+        group_size = self.group_size
+        accum = 1 if accum else 0
+        partial_eval = 1 if local_ids is not None else 0
+
+        assert num_edges & (num_edges - 1) == 0, "`num_edges` must be power of 2."
 
         # Fall back to the `torch.compile` kernel in the case where we cannot store child edges within a single block
-        if n_edges > 1024:
+        if num_edges > 1024:
             self._forward_backward_pytorch(node_vals, element_vals, nids, cids, accum = accum)
 
             return None
 
         if version.parse(triton.__version__) > version.parse("2.0.0"):
 
-            BLOCK_B = min(1024 // n_edges, triton.next_power_of_2(batch_size))
-            BLOCK_M = min(max(1024 // (BLOCK_B * n_edges), 1), self.group_size)
+            BLOCK_B = min(1024 // num_edges, triton.next_power_of_2(batch_size))
+            BLOCK_M = min(max(1024 // (BLOCK_B * num_edges), 1), self.group_size)
 
             grid = (triton.cdiv(n_ngroups * self.group_size, BLOCK_M), triton.cdiv(batch_size, BLOCK_B))
 
@@ -419,19 +429,19 @@ class ProdLayer(Layer, nn.Module):
                 tot_n_nodes = tot_n_nodes,
                 tot_n_eles = tot_n_eles,
                 n_ngroups = n_ngroups,
-                n_edges = n_edges,
+                num_edges = num_edges,
                 batch_size = batch_size,
                 BLOCK_M = BLOCK_M, 
                 BLOCK_B = BLOCK_B,
-                group_size = self.group_size,
-                accum = 1 if accum else 0,
-                partial_eval = 1 if local_ids is not None else 0
+                group_size = group_size,
+                accum = accum,
+                partial_eval = partial_eval
             )
 
         else:
 
-            BLOCK_B = min(1024 // n_edges, triton.next_power_of_2(batch_size))
-            BLOCK_M = min(max(1024 // (BLOCK_B * n_edges), 1), triton.next_power_of_2(n_ngroups) * self.group_size)
+            BLOCK_B = min(1024 // num_edges, triton.next_power_of_2(batch_size))
+            BLOCK_M = min(max(1024 // (BLOCK_B * num_edges), 1), triton.next_power_of_2(n_ngroups) * self.group_size)
 
             grid = (triton.cdiv(n_ngroups * self.group_size, BLOCK_M), triton.cdiv(batch_size, BLOCK_B))
 
@@ -444,13 +454,13 @@ class ProdLayer(Layer, nn.Module):
                 tot_n_nodes = tot_n_nodes,
                 tot_n_eles = tot_n_eles,
                 n_ngroups = n_ngroups,
-                n_edges = n_edges,
+                num_edges = num_edges,
                 batch_size = batch_size,
                 BLOCK_M = BLOCK_M, 
                 BLOCK_B = BLOCK_B,
-                group_size = self.group_size,
-                accum = 1 if accum else 0,
-                partial_eval = 1 if local_ids is not None else 0
+                group_size = group_size,
+                accum = accum,
+                partial_eval = partial_eval
             )
 
         return None

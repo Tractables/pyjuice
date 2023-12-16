@@ -240,7 +240,31 @@ def main():
     grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
     # grid = (1, triton.cdiv(layer_n_nodes, TILE_SIZE_M))
 
-    ref_kernel[grid](
+    # ref_kernel[grid](
+    #     node_flows = node_flows, 
+    #     element_flows = element_flows, 
+    #     node_mars = node_mars, 
+    #     element_mars = element_mars, 
+    #     params = params, 
+    #     chids = chids, 
+    #     parids_start = parids_start,
+    #     parids_increment = parids_increment,
+    #     parpids_start = parpids_start,
+    #     parpids_increment = parpids_increment, 
+    #     local_ids = None, 
+    #     batch_size = batch_size, 
+    #     partial_eval = 0,
+    #     ptr_inc_step = ptr_inc_step,
+    #     BLOCK_B = BLOCK_B, 
+    #     TILE_SIZE_K = TILE_SIZE_K, 
+    #     K_NUM_TILES = K_NUM_TILES,
+    #     TILE_SIZE_M = TILE_SIZE_M, 
+    #     GROUP_SIZE_M = GROUP_SIZE_M,
+    #     GROUP_SIZE_K = GROUP_SIZE_K
+    # )
+
+    aaa = ref_kernel[grid]
+    aaa(
         node_flows = node_flows, 
         element_flows = element_flows, 
         node_mars = node_mars, 

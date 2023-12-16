@@ -19,13 +19,15 @@ from .backend import compile_cum_par_flows_fn, compute_cum_par_flows, cum_par_fl
                      normalize_parameters
 
 
-def _pc_model_backward_hook(grad, pc, inputs, **kwargs):
+def _pc_model_backward_hook(grad, pc, inputs, record_cudagraph, apply_cudagraph, **kwargs):
     grad = grad.permute(1, 0)
     pc.backward(
         inputs = inputs,
         ll_weights = grad / grad.sum() * grad.size(1),
         compute_param_flows = pc._optim_hyperparams["compute_param_flows"], 
         flows_memory = pc._optim_hyperparams["flows_memory"],
+        record_cudagraph = record_cudagraph,
+        apply_cudagraph = apply_cudagraph,
         **kwargs
     )
 
@@ -78,7 +80,7 @@ class TensorCircuit(nn.Module):
             "flows_memory": 1.0
         }
 
-        # Recorded CudaGraphs
+        # CudaGraph options
         self._recorded_cuda_graphs = dict()
 
     def to(self, device):
@@ -156,7 +158,7 @@ class TensorCircuit(nn.Module):
                     else:
                         raise ValueError(f"Unknown layer type {type(layer)}.")
 
-            signature = (id(self.node_mars), id(self.element_mars), B)
+            signature = (0, id(self.node_mars), id(self.element_mars), id(self.params), B)
             if record_cudagraph and signature not in self._recorded_cuda_graphs:
                 # Warmup
                 s = torch.cuda.Stream()
@@ -196,7 +198,16 @@ class TensorCircuit(nn.Module):
 
         if torch.is_grad_enabled():
             lls.requires_grad = True
-            lls.register_hook(partial(_pc_model_backward_hook, pc = self, inputs = inputs, **kwargs))
+            lls.register_hook(
+                partial(
+                    _pc_model_backward_hook, 
+                    pc = self, 
+                    inputs = inputs, 
+                    record_cudagraph = record_cudagraph, 
+                    apply_cudagraph = apply_cudagraph,
+                    **kwargs
+                )
+            )
 
         if return_cache:
             return lls.clone(), cache
@@ -210,6 +221,8 @@ class TensorCircuit(nn.Module):
                  input_layer_fn: Optional[Union[str,Callable]] = None,
                  cache: Optional[dict] = None,
                  return_cache: bool = False,
+                 record_cudagraph: bool = False, 
+                 apply_cudagraph: bool = True,
                  **kwargs):
         """
         Compute circuit flows.
@@ -255,25 +268,52 @@ class TensorCircuit(nn.Module):
         ## Run backward pass ##
 
         with torch.no_grad():
-            for layer_id in range(len(self.inner_layer_groups) - 1, -1, -1):
-                layer_group = self.inner_layer_groups[layer_id]
 
-                if layer_group.is_prod():
-                    # Prod layer
-                    layer_group.backward(self.node_flows, self.element_flows)
+            # Inner layers
+            def _run_inner_layers():
+                for layer_id in range(len(self.inner_layer_groups) - 1, -1, -1):
+                    layer_group = self.inner_layer_groups[layer_id]
 
-                elif layer_group.is_sum():
-                    # Sum layer
+                    if layer_group.is_prod():
+                        # Prod layer
+                        layer_group.backward(self.node_flows, self.element_flows)
 
-                    # First recompute the previous product layer
-                    self.inner_layer_groups[layer_id-1].forward(self.node_mars, self.element_mars, _for_backward = True)
+                    elif layer_group.is_sum():
+                        # Sum layer
 
-                    # Backward sum layer
-                    layer_group.backward(self.node_flows, self.element_flows, self.node_mars, self.element_mars, self.params, 
-                                         param_flows = self.param_flows if compute_param_flows else None)
+                        # First recompute the previous product layer
+                        self.inner_layer_groups[layer_id-1].forward(self.node_mars, self.element_mars, _for_backward = True)
 
-                else:
-                    raise ValueError(f"Unknown layer type {type(layer)}.")
+                        # Backward sum layer
+                        layer_group.backward(self.node_flows, self.element_flows, self.node_mars, self.element_mars, self.params, 
+                                            param_flows = self.param_flows if compute_param_flows else None)
+
+                    else:
+                        raise ValueError(f"Unknown layer type {type(layer)}.")
+
+            signature = (1, id(self.node_flows), id(self.element_flows), id(self.node_mars), id(self.element_mars), id(self.params), id(self.param_flows), B)
+            if record_cudagraph and signature not in self._recorded_cuda_graphs:
+                # Warmup
+                s = torch.cuda.Stream()
+                s.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(s):
+                    for _ in range(3):
+                        _run_inner_layers()
+                torch.cuda.current_stream().wait_stream(s)
+
+                # Capture
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g):
+                    _run_inner_layers()
+
+                # Save
+                self._recorded_cuda_graphs[signature] = g
+
+            if apply_cudagraph and signature in self._recorded_cuda_graphs:
+                g = self._recorded_cuda_graphs[signature]
+                g.replay()
+            else:
+                _run_inner_layers()
 
             # Compute backward pass for all input layers
             for idx, layer in enumerate(self.input_layer_group):

@@ -202,13 +202,7 @@ class SumLayer(Layer, nn.Module):
 
     def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor) -> None:
         """
-        Computes the forward pass of a sum layer:
-        ```
-        ch_mars = element_mars[cids]
-        maxval = ch_mars.max(dim = 1, keepdim = True).values
-        node_mars[nids] = (((ch_mars - maxval).exp() * params[pids]).sum(
-            dim = 1).clamp(min = 1e-10)).log() + maxval.squeeze(1)
-        ```
+        Computes the forward pass of a sum layer.
 
         Parameters:
         `node_mars`:    [num_nodes, B]
@@ -281,8 +275,6 @@ class SumLayer(Layer, nn.Module):
                     chids = chids, parids = parids, parpids = parpids,
                     cs_group_size = cs_group_size
                 )
-
-                torch.cuda.synchronize()
 
         else:
             # Partial evaluation
@@ -363,7 +355,7 @@ class SumLayer(Layer, nn.Module):
             )
 
         elif mode == "pytorch":
-            self._forward_pytorch_kernel(
+            self._forward_pytorch(
                 node_mars, element_mars, params, nids, cids, pids, local_ids
             )
         
@@ -609,6 +601,9 @@ class SumLayer(Layer, nn.Module):
         else:
             cids_start, cids_increment, pids_start, pids_increment = self._cached_fw_pcids[signature]
 
+        partial_eval = 1 if local_ids is not None else 0
+        GROUP_SIZE_M = self.group_size
+
         if force_use_fp16:
             assert not force_use_fp32
             use_fp16 = True
@@ -621,15 +616,6 @@ class SumLayer(Layer, nn.Module):
                 use_fp16 = False
 
         grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
-
-        # print("========")
-        # print(layer_n_nodes)
-        # print(grid, grid[0] * grid[1])
-        # print(TILE_SIZE_M, TILE_SIZE_K, BLOCK_B)
-
-        # import time
-        # torch.cuda.synchronize()
-        # t0 = time.time()
         
         if TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and BLOCK_B >= 16:
             self._fw_triton_block_sparse_tlmm_kernel[grid](
@@ -643,14 +629,15 @@ class SumLayer(Layer, nn.Module):
                 pids_increment,
                 local_ids,
                 batch_size,
-                partial_eval = 1 if local_ids is not None else 0,
+                partial_eval = partial_eval,
                 BLOCK_B = BLOCK_B,
                 TILE_SIZE_K = TILE_SIZE_K,
                 K_NUM_TILES = K_NUM_TILES,
                 TILE_SIZE_M = TILE_SIZE_M,
-                GROUP_SIZE_M = self.group_size,
+                GROUP_SIZE_M = GROUP_SIZE_M,
                 use_fp16 = use_fp16
             )
+
         else:
             self._fw_triton_block_sparse_csmm_kernel[grid](
                 node_mars, 
@@ -663,19 +650,14 @@ class SumLayer(Layer, nn.Module):
                 pids_increment,
                 local_ids,
                 batch_size,
-                partial_eval = 1 if local_ids is not None else 0,
+                partial_eval = partial_eval,
                 BLOCK_B = BLOCK_B,
                 TILE_SIZE_K = TILE_SIZE_K,
                 K_NUM_TILES = K_NUM_TILES,
                 TILE_SIZE_M = TILE_SIZE_M,
-                GROUP_SIZE_M = self.group_size,
+                GROUP_SIZE_M = GROUP_SIZE_M,
                 use_fp16 = use_fp16
             )
-
-        # torch.cuda.synchronize()
-        # t1 = time.time()
-
-        # print(f"kernel time: {(t1-t0)*1000:.3f}ms")
         
         return None
 
@@ -763,6 +745,9 @@ class SumLayer(Layer, nn.Module):
         BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
         BLOCK_M = self.group_size
 
+        partial_eval = 1 if local_ids is not None else 0
+        GROUP_SIZE_M = self.group_size
+
         grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, BLOCK_M))
 
         self._fw_triton_sparse_kernel[grid](
@@ -774,11 +759,11 @@ class SumLayer(Layer, nn.Module):
             pids = pids,
             local_ids = local_ids, 
             batch_size = batch_size, 
-            partial_eval = 1 if local_ids is not None else 0, 
+            partial_eval = partial_eval, 
             num_edges = num_edges, 
             BLOCK_B = BLOCK_B, 
             BLOCK_M = BLOCK_M, 
-            GROUP_SIZE_M = self.group_size
+            GROUP_SIZE_M = GROUP_SIZE_M
         )
 
         return None
@@ -808,6 +793,14 @@ class SumLayer(Layer, nn.Module):
             dim = 1).clamp(min = 1e-10)).log() + maxval.squeeze(1)
 
         return None
+
+    def _forward_pytorch(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor, 
+                         nids: torch.Tensor, cids: torch.Tensor, pids: torch.Tensor,
+                         local_ids: torch.Tensor):
+
+        self._forward_pytorch_kernel(
+            node_mars, element_mars, params, nids, cids, pids, local_ids
+        )
 
     def _backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
                   params: torch.Tensor, node_mars: torch.Tensor, 
@@ -958,102 +951,6 @@ class SumLayer(Layer, nn.Module):
             (edge_start + offs_edge_nid)[:,None] * batch_size + \
             offs_batch[None,:] # [TILE_SIZE_K, BLOCK_B]
 
-        # Initialize pointers to `element_mars`
-        off_eleids = tl.load(chids + elegroup_id)
-        emars_ptr = element_mars + (off_eleids + offs_ele[:,None]) * batch_size + offs_batch[None,:]
-        emars = tl.load(emars_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_K, BLOCK_B]
-
-        # Batch increment pointers
-        parids_inc_ptr = parids_increment + elegroup_id * (K_NUM_TILES * ptr_inc_step) + offs_edge_gid
-        parpids_inc_ptr = parpids_increment + elegroup_id * (K_NUM_TILES * ptr_inc_step) + offs_edge_gid
-
-        # Inner loop
-        acc = tl.zeros([TILE_SIZE_M, BLOCK_B], dtype = tl.float32)
-        log_max = tl.zeros([BLOCK_B], dtype = tl.float32) - float("inf")
-
-        for k in range(0, K_NUM_TILES):
-            epars = tl.load(epars_ptr) # [TILE_SIZE_M, TILE_SIZE_K]
-            nmars = tl.load(nmars_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_K, BLOCK_B]
-            nflows = tl.load(nflows_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_K, BLOCK_B]
-
-            # log_n_fdm = tl.log(nflows) - nmars
-            # log_n_fdm_max = tl.max(log_n_fdm, axis = 0)
-            # n_fdm_sub = tl.exp(log_n_fdm - log_n_fdm_max[None,:])
-
-            # partial_flows = tl.dot(epars, n_fdm_sub)
-
-            # acc = tl.where(log_max[None,:] > log_n_fdm_max[None,:], 
-            #                acc + tl.exp(log_n_fdm_max - log_max)[None,:] * partial_flows,
-            #                partial_flows + tl.exp(log_max - log_n_fdm_max)[None,:] * acc)
-            # log_max = tl.maximum(log_max, log_n_fdm_max)
-
-            eflows = tl.sum(epars[:,:,None] * tl.exp(emars[:,None,:] - nmars[None,:,:]) * nflows[None,:,:], axis = 1)
-            acc += eflows
-
-            # Increment `epars_ptr`
-            parpids_inc = tl.load(parpids_inc_ptr)
-            epars_ptr += parpids_inc[None,:]
-            parpids_inc_ptr += ptr_inc_step
-
-            # Increment `nmars_ptr`
-            parids_inc = tl.load(parids_inc_ptr)
-            nmars_ptr += parids_inc[:,None] * batch_size
-            nflows_ptr += parids_inc[:,None] * batch_size
-            parids_inc += ptr_inc_step
-
-        # # Initialize pointers to `element_mars`
-        # off_eleids = tl.load(chids + elegroup_id)
-        # emars_ptr = element_mars + (off_eleids + offs_ele[:,None]) * batch_size + offs_batch[None,:]
-        # emars = tl.load(emars_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_K, BLOCK_B]
-
-        # eflows = acc * tl.exp(emars + log_max[None,:])
-
-        # Write back
-        offs_elemfs = (off_eleids + offs_ele[:,None]) * batch_size + offs_batch[None,:]
-        tl.store(element_flows + offs_elemfs, acc, mask = mask_batch[None,:])
-
-    @staticmethod
-    @triton.jit
-    def my_kernel(node_flows, element_flows, node_mars, element_mars, params, 
-                                            chids, parids_start, parids_increment, parpids_start, parpids_increment, 
-                                            local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr, ptr_inc_step: tl.constexpr, 
-                                            BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, TILE_SIZE_M: tl.constexpr, 
-                                            GROUP_SIZE_M: tl.constexpr, GROUP_SIZE_K: tl.constexpr):
-
-        pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
-        pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
-
-        # Get inferred node group id from `pid_m`
-        elegroup_id = pid_m // (GROUP_SIZE_M // TILE_SIZE_M)
-        tile_id = pid_m % (GROUP_SIZE_M // TILE_SIZE_M)
-
-        # Get the real node group id in the case of partial evaluation
-        if partial_eval == 1:
-            elegroup_id = tl.load(local_ids + elegroup_id)
-
-        # Initialize pointers to `params`
-        offs_ele = tl.arange(0, TILE_SIZE_M) + tile_id * TILE_SIZE_M
-        offs_edge = tl.arange(0, TILE_SIZE_K)
-        offs_edge_gid = offs_edge // GROUP_SIZE_K
-        offs_edge_nid = (offs_edge % GROUP_SIZE_K)
-        par_start = tl.load(parpids_start + elegroup_id * ptr_inc_step + offs_edge_gid)
-        epars_ptr = params + \
-            offs_ele[:,None] * GROUP_SIZE_K + \
-            (par_start + offs_edge_nid)[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
-
-        # Batch offsets and mask
-        offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B
-        mask_batch = offs_batch < batch_size
-
-        # Initialize pointers to `node_mars`
-        edge_start = tl.load(parids_start + elegroup_id * ptr_inc_step + offs_edge_gid)
-        nmars_ptr = node_mars + \
-            (edge_start + offs_edge_nid)[:,None] * batch_size + \
-            offs_batch[None,:] # [TILE_SIZE_K, BLOCK_B]
-        nflows_ptr = node_flows + \
-            (edge_start + offs_edge_nid)[:,None] * batch_size + \
-            offs_batch[None,:] # [TILE_SIZE_K, BLOCK_B]
-
         # Batch increment pointers
         parids_inc_ptr = parids_increment + elegroup_id * (K_NUM_TILES * ptr_inc_step) + offs_edge_gid
         parpids_inc_ptr = parpids_increment + elegroup_id * (K_NUM_TILES * ptr_inc_step) + offs_edge_gid
@@ -1070,7 +967,7 @@ class SumLayer(Layer, nn.Module):
             log_n_fdm_max = tl.max(log_n_fdm, axis = 0)
             n_fdm_sub = tl.where(log_n_fdm_max[None,:] != -float("inf"), tl.exp(log_n_fdm - log_n_fdm_max[None,:]), 0.0)
 
-            partial_flows = tl.dot(epars, n_fdm_sub, allow_tf32 = True)
+            partial_flows = tl.dot(epars, n_fdm_sub)
             # partial_flows = tl.sum(epars[:,:,None] * n_fdm_sub[None,:,:], axis = 1)
 
             acc = tl.where(log_n_fdm_max[None,:] > acc,
@@ -1169,31 +1066,13 @@ class SumLayer(Layer, nn.Module):
         else:
             parids_start, parids_increment, parpids_start, parpids_increment, ptr_inc_step = self._cached_bk_parids[signature]
 
+        partial_eval = 1 if local_ids is not None else 0
+        GROUP_SIZE_M = cs_group_size
+        GROUP_SIZE_K = self.group_size
+
         grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
 
-        # self._bk_triton_block_sparse_ele_kernel[grid](
-        #     node_flows = node_flows, 
-        #     element_flows = element_flows, 
-        #     node_mars = node_mars, 
-        #     element_mars = element_mars, 
-        #     params = params, 
-        #     chids = chids, 
-        #     parids_start = parids_start,
-        #     parids_increment = parids_increment,
-        #     parpids_start = parpids_start,
-        #     parpids_increment = parpids_increment, 
-        #     local_ids = local_ids, 
-        #     batch_size = batch_size, 
-        #     partial_eval = 1 if local_ids is not None else 0,
-        #     ptr_inc_step = ptr_inc_step,
-        #     BLOCK_B = BLOCK_B, 
-        #     TILE_SIZE_K = TILE_SIZE_K, 
-        #     K_NUM_TILES = K_NUM_TILES,
-        #     TILE_SIZE_M = TILE_SIZE_M, 
-        #     GROUP_SIZE_M = cs_group_size,
-        #     GROUP_SIZE_K = self.group_size
-        # )
-        self.my_kernel[grid](
+        self._bk_triton_block_sparse_ele_kernel[grid](
             node_flows = node_flows, 
             element_flows = element_flows, 
             node_mars = node_mars, 
@@ -1206,17 +1085,18 @@ class SumLayer(Layer, nn.Module):
             parpids_increment = parpids_increment, 
             local_ids = local_ids, 
             batch_size = batch_size, 
-            partial_eval = 1 if local_ids is not None else 0,
+            partial_eval = partial_eval,
             ptr_inc_step = ptr_inc_step,
             BLOCK_B = BLOCK_B, 
             TILE_SIZE_K = TILE_SIZE_K, 
             K_NUM_TILES = K_NUM_TILES,
             TILE_SIZE_M = TILE_SIZE_M, 
-            GROUP_SIZE_M = cs_group_size,
-            GROUP_SIZE_K = self.group_size
+            GROUP_SIZE_M = GROUP_SIZE_M,
+            GROUP_SIZE_K = GROUP_SIZE_K
         )
 
-        # torch.cuda.synchronize()
+        # This doesn't seem to be necessary, but is necessary to avoid producing nans
+        # Needs to investigate more
         element_flows[0,:] = 0.0
 
         # if element_flows.isnan().any() or element_flows.isinf().any():
@@ -1227,83 +1107,6 @@ class SumLayer(Layer, nn.Module):
     @staticmethod
     @triton.jit
     def _bk_triton_block_sparse_par_kernel(node_flows, node_mars, element_mars, params, param_flows, nids, cids, pids, pfids,
-                                           batch_size: tl.constexpr, num_edges: tl.constexpr, TILE_SIZE_B: tl.constexpr, 
-                                           B_NUM_TILES: tl.constexpr, TILE_SIZE_K: tl.constexpr, 
-                                           TILE_SIZE_M: tl.constexpr, GROUP_SIZE_M: tl.constexpr):
-
-        pid_k = tl.program_id(0) # ID of size-`TILE_SIZE_K` edges
-        pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
-
-        # Get inferred node group id from `pid_m`
-        ngroup_id = pid_m // (GROUP_SIZE_M // TILE_SIZE_M)
-        tile_id = pid_m % (GROUP_SIZE_M // TILE_SIZE_M)
-
-        # Batch offsets and mask
-        offs_batch = tl.arange(0, TILE_SIZE_B)
-        mask_batch = offs_batch < batch_size
-
-        # Initialize pointers to `element_mars`
-        offs_edge = tl.arange(0, TILE_SIZE_K) + pid_k * TILE_SIZE_K
-        edge_start = tl.load(cids + ngroup_id * num_edges + offs_edge)
-        emars_ptr = element_mars + \
-            edge_start[None,:] * batch_size + \
-            offs_batch[:,None] # [TILE_SIZE_B, TILE_SIZE_K]
-
-        # Initialize pointers to `node_flows` and `node_mars`
-        offs_node = tl.arange(0, TILE_SIZE_M) + tile_id * TILE_SIZE_M
-        off_nids = tl.load(nids + ngroup_id)
-        nmars_ptr = node_mars + (off_nids + offs_node[:,None]) * batch_size + offs_batch[None,:]
-        nflows_ptr = node_flows + (off_nids + offs_node[:,None]) * batch_size + offs_batch[None,:]
-
-        # Initialize `params`
-        par_start = tl.load(pids + ngroup_id * num_edges + offs_edge)
-        epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
-        epars = tl.load(params + epars_offsets)
-
-        # Inner loop
-        acc = tl.zeros([TILE_SIZE_M, TILE_SIZE_K], dtype = tl.float32)
-        
-        for b in range(0, B_NUM_TILES):
-            emars = tl.load(emars_ptr, mask = mask_batch[:,None]) # [TILE_SIZE_B, TILE_SIZE_K]
-            nmars = tl.load(nmars_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_M, TILE_SIZE_B]
-            nflows = tl.load(nflows_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_M, TILE_SIZE_B]
-
-            # log_n_fdm = tl.log(nflows) - nmars
-            # log_n_fdm_max = tl.max(log_n_fdm, axis = 0)
-            # n_fdm_sub = tl.exp(log_n_fdm - log_n_fdm_max[None,:])
-
-            # scaled_emars = tl.exp(emars + log_n_fdm_max[:,None])
-
-            # partial_flows = tl.dot(n_fdm_sub, scaled_emars)
-            # acc += partial_flows
-
-            pflows = tl.sum(epars[:,None,:] * tl.exp(emars[None,:,:] - nmars[:,:,None]) * nflows[:,:,None], axis = 1)
-            acc += pflows
-
-            # Increment `emars_ptr`, `nmars_ptr`, and `nmars_ptr`
-            emars_ptr += TILE_SIZE_B
-            nmars_ptr += TILE_SIZE_B
-            nflows_ptr += TILE_SIZE_B
-
-            # Update batch mask
-            offs_batch += TILE_SIZE_B
-            mask_batch = offs_batch < batch_size
-
-        # # Initialize `params`
-        # par_start = tl.load(pids + ngroup_id * num_edges + offs_edge)
-        # epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
-        # epars = tl.load(params + epars_offsets)
-
-        # pflows = acc * epars
-
-        parflow_start = tl.load(pfids + ngroup_id * num_edges + offs_edge)
-        eparflows_offsets = offs_node[:,None] + parflow_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
-
-        tl.atomic_add(param_flows + eparflows_offsets, acc)
-
-    @staticmethod
-    @triton.jit
-    def my_kernel2(node_flows, node_mars, element_mars, params, param_flows, nids, cids, pids, pfids,
                                            batch_size: tl.constexpr, num_edges: tl.constexpr, TILE_SIZE_B: tl.constexpr, 
                                            B_NUM_TILES: tl.constexpr, TILE_SIZE_K: tl.constexpr, 
                                            TILE_SIZE_M: tl.constexpr, GROUP_SIZE_M: tl.constexpr):
@@ -1346,7 +1149,7 @@ class SumLayer(Layer, nn.Module):
 
             scaled_emars = tl.exp(emars + log_n_fdm_max[:,None])
 
-            partial_flows = tl.dot(n_fdm_sub, scaled_emars, allow_tf32 = True)
+            partial_flows = tl.dot(n_fdm_sub, scaled_emars)
             acc += partial_flows
 
             # Increment `emars_ptr`, `nmars_ptr`, and `nmars_ptr`
@@ -1416,25 +1219,7 @@ class SumLayer(Layer, nn.Module):
 
         grid = (triton.cdiv(num_edges, TILE_SIZE_K), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
 
-        # self._bk_triton_block_sparse_par_kernel[grid](
-        #     node_flows = node_flows, 
-        #     node_mars = node_mars, 
-        #     element_mars = element_mars, 
-        #     params = params, 
-        #     param_flows = param_flows, 
-        #     nids = nids, 
-        #     cids = cids, 
-        #     pids = pids,
-        #     pfids = pfids,
-        #     batch_size = batch_size, 
-        #     num_edges = num_edges, 
-        #     TILE_SIZE_B = TILE_SIZE_B, 
-        #     B_NUM_TILES = B_NUM_TILES, 
-        #     TILE_SIZE_K = TILE_SIZE_K, 
-        #     TILE_SIZE_M = TILE_SIZE_M, 
-        #     GROUP_SIZE_M = self.group_size
-        # )
-        self.my_kernel2[grid](
+        self._bk_triton_block_sparse_par_kernel[grid](
             node_flows = node_flows, 
             node_mars = node_mars, 
             element_mars = element_mars, 
@@ -1452,6 +1237,10 @@ class SumLayer(Layer, nn.Module):
             TILE_SIZE_M = TILE_SIZE_M, 
             GROUP_SIZE_M = self.group_size
         )
+
+        # This doesn't seem to be necessary, but is necessary to avoid producing nans
+        # Needs to investigate more
+        param_flows[0:1] = param_flows[0:1] * 1
 
     def _backward_sparse(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
                          params: torch.Tensor, node_mars: torch.Tensor, 
