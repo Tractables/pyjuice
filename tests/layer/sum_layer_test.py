@@ -182,7 +182,7 @@ def speed_test():
 
     node_mars = torch.zeros([group_size + group_size * num_node_groups * num_prod_nodes, batch_size]).to(device)
     element_mars = torch.rand([group_size + num_prod_nodes * group_size * num_node_groups, batch_size]).log().to(device)
-    params = torch.rand([layer.partitioned_pids[0].max() + group_size]).to(device)
+    params = torch.rand([layer.partitioned_pids[0].max() + group_size ** 2]).to(device)
 
     ## Forward tests ##
 
@@ -215,11 +215,11 @@ def speed_test():
     backward_ms = (t1 - t0) / 100 * 1000
 
     print(f"Backward pass on average takes {backward_ms:.3f}ms.")
-    print("Reference computation time on RTX 4090: 1.274ms.")
+    print("Reference computation time on RTX 4090: 1.814ms.")
     print("--------------------------------------------------------------")
 
 
 if __name__ == "__main__":
     torch.manual_seed(3890)
-    sum_layer_test()
-    # speed_test()
+    # sum_layer_test()
+    speed_test()

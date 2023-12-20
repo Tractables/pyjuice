@@ -109,46 +109,12 @@ def hclt_test():
         milestone_steps = [0, len(train_loader) * 100, len(train_loader) * 350]
     )
 
-    for batch in train_loader:
-        x = batch[0].to(device)
+    # for batch in train_loader:
+    #     x = batch[0].to(device)
 
-        # optimizer.zero_grad()
-
-        lls = pc(x, record_cudagraph = True)
-        lls.mean().backward()
-        break
-
-        # optimizer.step()
-        # scheduler.step()
-
-    # for _ in range(100):
-    #     t0 = time.time()
-    #     for batch in train_loader:
-    #         x = batch[0].to(device)
-
-    #         lls = pc(x, apply_cudagraph = True)
-    #         lls.mean().backward()
-
-    #     torch.cuda.synchronize()
-    #     t1 = time.time()
-    #     print(f"{(t1-t0)*1000:.3f}ms")
-
-    # from torch.profiler import profile, record_function, ProfilerActivity
-    # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-    #     for batch in train_loader:
-    #         x = batch[0].to(device)
-
-    #         optimizer.zero_grad()
-
-    #         lls = pc(x)
-    #         lls.mean().backward()
-
-    #         optimizer.step()
-    #         scheduler.step()
-
-    #         break
-
-    # prof.export_chrome_trace("trace_new2.json")
+    #     lls = pc(x, record_cudagraph = True)
+    #     lls.mean().backward()
+    #     break
 
 
     mini_batch_em_epoch(350, pc, optimizer, scheduler, train_loader, test_loader, device)
