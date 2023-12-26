@@ -39,7 +39,7 @@ def non_sd_test():
 
     lls = pc(data)
 
-    pc.backward(data)
+    pc.backward(data.permute(1, 0), allow_modify_flows = False)
 
     pc.update_parameters()
 
@@ -66,7 +66,7 @@ def non_sd_test():
     fwnp1 = fw910 * fw1112
     fwnp2 = fw12 * fw1314 * fw78
     fwnp3 = fw12 * fw34 * fw1112
-    fw15 = (ns._params * torch.cat((fwnp1, fwnp2, fwnp3), dim = 0)).sum()
+    fw15 = (ns._params.reshape(-1) * torch.cat((fwnp1, fwnp2, fwnp3), dim = 0)).sum()
 
     assert torch.all(torch.abs(fw15.log() - pc.node_mars[15,0].cpu()) < 1e-4)
 
@@ -74,9 +74,9 @@ def non_sd_test():
 
     assert torch.abs(pc.node_flows[15,0] - 1.0) < 1e-4
 
-    bknp1 = ns._params[0:2] * fwnp1 / fw15
-    bknp2 = ns._params[2:4] * fwnp2 / fw15
-    bknp3 = ns._params[4:6] * fwnp3 / fw15
+    bknp1 = ns._params.reshape(-1)[0:2] * fwnp1 / fw15
+    bknp2 = ns._params.reshape(-1)[2:4] * fwnp2 / fw15
+    bknp3 = ns._params.reshape(-1)[4:6] * fwnp3 / fw15
 
     bk910 = bknp1
     bk1112 = bknp1 + bknp3
@@ -86,9 +86,9 @@ def non_sd_test():
     assert torch.all(torch.abs(bk910 - pc.node_flows[9:11,0].cpu()) < 1e-4)
     assert torch.all(torch.abs(bk910 - pc.node_flows[9:11,0].cpu()) < 1e-4)
 
-    bknp12 = bk910[0] * ns12._params[0:2] * fw12 * fw34 / fw910[0] + bk910[1] * ns12._params[2:4] * fw12 * fw34 / fw910[1]
-    bknp23 = bk1314[0] * ns23._params[0:2] * fw34 * fw56 / fw1314[0] + bk1314[1] * ns23._params[2:4] * fw34 * fw56 / fw1314[1]
-    bknp34 = bk1112[0] * ns34._params[0:2] * fw56 * fw78 / fw1112[0] + bk1112[1] * ns34._params[2:4] * fw56 * fw78 / fw1112[1]
+    bknp12 = bk910[0] * ns12._params.reshape(-1)[0:2] * fw12 * fw34 / fw910[0] + bk910[1] * ns12._params.reshape(-1)[2:4] * fw12 * fw34 / fw910[1]
+    bknp23 = bk1314[0] * ns23._params.reshape(-1)[0:2] * fw34 * fw56 / fw1314[0] + bk1314[1] * ns23._params.reshape(-1)[2:4] * fw34 * fw56 / fw1314[1]
+    bknp34 = bk1112[0] * ns34._params.reshape(-1)[0:2] * fw56 * fw78 / fw1112[0] + bk1112[1] * ns34._params.reshape(-1)[2:4] * fw56 * fw78 / fw1112[1]
 
     bk12 = bknp12 + bknp2 + bknp3
     bk34 = bknp12 + bknp23 + bknp3
