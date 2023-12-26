@@ -22,7 +22,8 @@ def serialize_nodes(root_ns: CircuitNodes):
 
         ns_info = {
             "type": ntype, 
-            "num_nodes": ns.num_nodes,
+            "num_node_groups": ns.num_node_groups,
+            "group_size": ns.group_size,
             "chs": tuple(ns2id[cs] for cs in ns.chs)
         }
 
@@ -50,14 +51,15 @@ def serialize_nodes(root_ns: CircuitNodes):
 def deserialize_nodes(nodes_list: Sequence):
     id2ns = dict()
     for ns_id, ns_info in enumerate(nodes_list):
-        num_nodes = ns_info["num_nodes"]
+        num_node_groups = ns_info["num_node_groups"]
+        group_size = ns_info["group_size"]
         chids = ns_info["chs"]
 
         if ns_info["type"] == "Input":
             scope = ns_info["scope"]
             dist = pickle.loads(ns_info["dist"])
 
-            ns = inputs(scope, num_nodes, dist)
+            ns = inputs(scope, num_node_groups, dist)
 
             if "params" in ns_info:
                 ns._params = torch.from_numpy(ns_info["params"])
@@ -78,7 +80,7 @@ def deserialize_nodes(nodes_list: Sequence):
             else:
                 params = None
 
-            ns = summate(*chs, edge_ids = edge_ids, params = params)            
+            ns = summate(*chs, edge_ids = edge_ids, params = params, group_size = group_size)            
 
         id2ns[ns_id] = ns
 
