@@ -12,7 +12,10 @@ dependencies = [
     "typing",
     "triton>=2.1.0",
     "networkx",
-    "numba"
+    "numba",
+    "packaging",
+    "matplotlib",
+    "tqdm"
 ]
 authors = [
     {name="StarAI", email="guyvdb@cs.ucla.edu"},
