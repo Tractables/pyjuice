@@ -18,8 +18,8 @@ ProdNodesChs = Union[SumNodes,InputNodes]
 SumNodesChs = Union[ProdNodes,InputNodes]
 
 
-def inputs(var: Union[int,Sequence[int]], num_node_groups: int, dist: Distribution, params: Optional[Tensor] = None, 
-           num_nodes: int = 0, group_size: int = 0, **kwargs):
+def inputs(var: Union[int,Sequence[int]], num_node_groups: int = 0, dist: Distribution = Distribution(), 
+           params: Optional[Tensor] = None, num_nodes: int = 0, group_size: int = 0, **kwargs):
 
     if num_nodes > 0:
         assert num_node_groups == 0, "Only one of `num_nodes` and `num_node_groups` can be set at the same time."
