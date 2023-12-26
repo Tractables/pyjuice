@@ -1467,25 +1467,27 @@ class SumLayer(Layer, nn.Module):
     @staticmethod
     @triton.jit
     def _bk_triton_sparse_par_kernel(node_flows, node_mars, element_mars, params, param_flows, nids, cids, pids, pfids,
-                                     batch_size: tl.constexpr, num_edges: tl.constexpr, BLOCK_M: tl.constexpr, 
-                                     BLOCK_B: tl.constexpr, B_NUM_BLOCKS: tl.constexpr):
+                                     num_edges: tl.constexpr, batch_size: tl.constexpr, BLOCK_M: tl.constexpr, 
+                                     BLOCK_K: tl.constexpr, BLOCK_B: tl.constexpr, TILE_SIZE_B: tl.constexpr, B_NUM_BLOCKS: tl.constexpr):
 
-        pid_m = tl.program_id(0) # ID of size-`BLOCK_M` nodes
+        pid_b = tl.program_id(0) # ID of size-`BLOCK_B` samples
+        pid_e = tl.program_id(1) # ID of size-`BLOCK_K` edges
+        pid_m = tl.program_id(2) # ID of size-`BLOCK_M` nodes
 
         # Get inferred node group id from `pid_m`
         ngroup_id = pid_m // BLOCK_M
         tile_id = pid_m % BLOCK_M
 
         # Batch offsets and mask
-        offs_batch = tl.arange(0, BLOCK_B)
+        offs_batch = tl.arange(0, BLOCK_B) + pid_b * TILE_SIZE_B
         mask_batch = offs_batch < batch_size
 
         # Initialize pointers to `element_mars`
-        offs_edge = tl.arange(0, num_edges)
+        offs_edge = tl.arange(0, BLOCK_K) + pid_e * BLOCK_K
         edge_start = tl.load(cids + ngroup_id * num_edges + offs_edge)
         emars_ptr = element_mars + \
             edge_start[:,None] * batch_size + \
-            offs_batch[None,:] # [num_edges, BLOCK_B]
+            offs_batch[None,:] # [BLOCK_K, BLOCK_B]
 
         # Initialize pointers to `node_flows` and `node_mars`
         off_nids = tl.load(nids + ngroup_id)
@@ -1493,10 +1495,13 @@ class SumLayer(Layer, nn.Module):
         nflows_ptr = node_flows + (off_nids + tile_id) * batch_size + offs_batch # [BLOCK_B]
 
         # Inner loop
-        acc = tl.zeros([num_edges], dtype = tl.float32)
+        acc = tl.zeros([BLOCK_K], dtype = tl.float32)
 
         for b in range(0, B_NUM_BLOCKS):
-            emars = tl.load(emars_ptr, mask = mask_batch[None,:]) # [num_edges, BLOCK_B]
+            # Update batch mask
+            mask_batch = (offs_batch < batch_size)
+
+            emars = tl.load(emars_ptr, mask = mask_batch[None,:]) # [BLOCK_K, BLOCK_B]
             nmars = tl.load(nmars_ptr, mask = mask_batch) # [BLOCK_B]
             nflows = tl.load(nflows_ptr, mask = mask_batch) # [BLOCK_B]
 
@@ -1509,13 +1514,12 @@ class SumLayer(Layer, nn.Module):
             nmars_ptr += BLOCK_B
             nflows_ptr += BLOCK_B
 
-            # Update batch mask
+            # Update batch offsets
             offs_batch += BLOCK_B
-            mask_batch = offs_batch < batch_size
 
         par_start = tl.load(pids + ngroup_id * num_edges + offs_edge)
         epars_ptr = params + par_start + tile_id
-        epars = tl.load(epars_ptr) # [num_edges]
+        epars = tl.load(epars_ptr) # [BLOCK_K]
 
         parflow_start = tl.load(pfids + ngroup_id * num_edges + offs_edge)
         eparflows_ptr = param_flows + parflow_start + tile_id
@@ -1553,10 +1557,30 @@ class SumLayer(Layer, nn.Module):
 
         assert num_edges <= 16384, "The sparse backward kernel only support nodes with # edges smaller than 16384."
 
-        BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
-        BLOCK_M = self.group_size
+        if num_edges <= 1024:
+            BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
+            BLOCK_K = num_edges
+            BLOCK_M = max(min(2048 // num_edges, self.group_size), 1)
+        else:
+            BLOCK_B = min(512, BATCH_SIZE_NP2)
+            BLOCK_K = min(2048 // BLOCK_B, num_edges)
+            BLOCK_M = max(min(2048 // num_edges, self.group_size), 1)
+        B_NUM_BLOCKS = triton.cdiv(batch_size, BLOCK_B)
+        K_NUM_BLOCKS = triton.cdiv(num_edges, BLOCK_K)
 
-        grid = (layer_n_nodes,)
+        # When a thread-block is allocated for too much work, the overhead 
+        # outweigh that incurred by `atomic_add`. Add more thread-blocks 
+        # for parallel processing in this case.
+        if B_NUM_BLOCKS >= 4:
+            TILE_SIZE_B = 4 * BLOCK_B
+            B_NUM_BLOCKS = 4
+        else:
+            TILE_SIZE_B = batch_size
+        B_NUM_TILES = triton.cdiv(batch_size, TILE_SIZE_B)
+
+        allow_modify_flows = 1 if allow_modify_flows else 0
+
+        grid = (B_NUM_TILES, K_NUM_BLOCKS, layer_n_nodes)
 
         self._bk_triton_sparse_par_kernel[grid](
             node_flows = node_flows, 
@@ -1568,11 +1592,13 @@ class SumLayer(Layer, nn.Module):
             cids = cids, 
             pids = pids,
             pfids = pfids,
+            num_edges = num_edges,
             batch_size = batch_size, 
-            num_edges = num_edges, 
             BLOCK_M = BLOCK_M,
+            BLOCK_K = BLOCK_K,
             BLOCK_B = BLOCK_B,
-            B_NUM_BLOCKS = triton.cdiv(batch_size, BLOCK_B)
+            TILE_SIZE_B = TILE_SIZE_B,
+            B_NUM_BLOCKS = B_NUM_BLOCKS
         )
 
     def _backward_pytorch(self, node_flows, element_flows, params, node_mars, 
