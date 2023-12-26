@@ -44,25 +44,24 @@ def mini_batch_em_epoch(num_epochs, pc, optimizer, scheduler, train_loader, test
 
 
 def full_batch_em_epoch(pc, train_loader, test_loader, device):
-    with torch.no_grad():
-        t0 = time.time()
-        train_ll = 0.0
-        for batch in train_loader:
-            x = batch[0].to(device)
+    t0 = time.time()
+    train_ll = 0.0
+    for batch in train_loader:
+        x = batch[0].to(device)
 
-            lls = pc(x)
-            lls.mean().backward()
+        lls = pc(x)
+        lls.mean().backward()
 
-            train_ll += lls.mean().detach().cpu().numpy().item()
+        train_ll += lls.mean().detach().cpu().numpy().item()
 
-        pc.mini_batch_em(step_size = 1.0, pseudocount = 0.1)
+    pc.mini_batch_em(step_size = 1.0, pseudocount = 0.1)
 
-        train_ll /= len(train_loader)
+    train_ll /= len(train_loader)
 
-        t1 = time.time()
-        test_ll = evaluate(pc, loader=test_loader)
-        t2 = time.time()
-        print(f"[train LL: {train_ll:.2f}; test LL: {test_ll:.2f}].....[train forward+backward+step {t1-t0:.2f}; test forward {t2-t1:.2f}] ")
+    t1 = time.time()
+    test_ll = evaluate(pc, loader=test_loader)
+    t2 = time.time()
+    print(f"[train LL: {train_ll:.2f}; test LL: {test_ll:.2f}].....[train forward+backward+step {t1-t0:.2f}; test forward {t2-t1:.2f}] ")
 
 
 def hclt_test():
