@@ -129,7 +129,7 @@ def hclt_backward_test():
     batch_size = batch_data.size(0)
 
     lls = pc(batch_data)
-    lls.mean().backward()
+    pc.backward(batch_data.permute(1, 0), allow_modify_flows = False)
 
     pc.update_param_flows()
 
@@ -253,7 +253,7 @@ def hclt_em_test():
     batch_size = batch_data.size(0)
 
     lls = pc(batch_data)
-    lls.mean().backward()
+    pc.backward(batch_data.permute(1, 0), allow_modify_flows = False)
 
     ns2old_params = dict()
     for ns in root_ns:

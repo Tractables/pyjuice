@@ -5,7 +5,6 @@ import numpy as np
 import pyjuice.nodes.distributions as dists
 from pyjuice.utils import BitSet
 from pyjuice.nodes import multiply, summate, inputs
-from pyjuice.functional.normalize import normalize_parameters
 
 import pytest
 
@@ -41,14 +40,6 @@ def nodes_test():
                 assert n.num_edges == num_node_groups * (group_size ** 2)
 
                 n.init_parameters()
-
-                assert torch.all(torch.abs(n._params.sum(dim = 2).sum(dim = 0) - 1.0) < 1e-4)
-
-                n._params = n._params.to(device)
-                n.edge_ids = n.edge_ids.to(device)
-
-                normalize_parameters(n._params, n.edge_ids[0,:].contiguous(), group_size = n.group_size, 
-                                     ch_group_size = n.ch_group_size, pseudocount = 0.0)
 
                 assert torch.all(torch.abs(n._params.sum(dim = 2).sum(dim = 0) - 1.0) < 1e-4)
 

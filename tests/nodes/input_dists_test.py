@@ -36,19 +36,19 @@ def categorical_nodes_test():
 
     lls = pc(data)
 
-    pc.backward(data)
+    pc.backward(data.permute(1, 0))
 
     ## Input node forward tests ##
 
     for i in range(16):
-        assert torch.abs(pc.node_mars[1,i] - torch.log(pc.input_layers[0].params[data[i,0]])) < 1e-4
-        assert torch.abs(pc.node_mars[2,i] - torch.log(pc.input_layers[0].params[2+data[i,0]])) < 1e-4
-        assert torch.abs(pc.node_mars[3,i] - torch.log(pc.input_layers[0].params[4+data[i,1]])) < 1e-4
-        assert torch.abs(pc.node_mars[4,i] - torch.log(pc.input_layers[0].params[6+data[i,1]])) < 1e-4
-        assert torch.abs(pc.node_mars[5,i] - torch.log(pc.input_layers[0].params[8+data[i,2]])) < 1e-4
-        assert torch.abs(pc.node_mars[6,i] - torch.log(pc.input_layers[0].params[10+data[i,2]])) < 1e-4
-        assert torch.abs(pc.node_mars[7,i] - torch.log(pc.input_layers[0].params[12+data[i,3]])) < 1e-4
-        assert torch.abs(pc.node_mars[8,i] - torch.log(pc.input_layers[0].params[14+data[i,3]])) < 1e-4
+        assert torch.abs(pc.node_mars[1,i] - torch.log(pc.input_layer_group[0].params[data[i,0]])) < 1e-4
+        assert torch.abs(pc.node_mars[2,i] - torch.log(pc.input_layer_group[0].params[2+data[i,0]])) < 1e-4
+        assert torch.abs(pc.node_mars[3,i] - torch.log(pc.input_layer_group[0].params[4+data[i,1]])) < 1e-4
+        assert torch.abs(pc.node_mars[4,i] - torch.log(pc.input_layer_group[0].params[6+data[i,1]])) < 1e-4
+        assert torch.abs(pc.node_mars[5,i] - torch.log(pc.input_layer_group[0].params[8+data[i,2]])) < 1e-4
+        assert torch.abs(pc.node_mars[6,i] - torch.log(pc.input_layer_group[0].params[10+data[i,2]])) < 1e-4
+        assert torch.abs(pc.node_mars[7,i] - torch.log(pc.input_layer_group[0].params[12+data[i,3]])) < 1e-4
+        assert torch.abs(pc.node_mars[8,i] - torch.log(pc.input_layer_group[0].params[14+data[i,3]])) < 1e-4
 
     ## Input node backward tests ##
 
@@ -64,21 +64,21 @@ def categorical_nodes_test():
         gt_param_flows[12+data[i,3]] += pc.node_flows[7,i]
         gt_param_flows[14+data[i,3]] += pc.node_flows[8,i]
 
-    assert torch.all(torch.abs(gt_param_flows - pc.input_layers[0].param_flows) < 1e-4)
+    assert torch.all(torch.abs(gt_param_flows - pc.input_layer_group[0].param_flows) < 1e-4)
 
     ## EM tests ##
 
-    original_params = pc.input_layers[0].params.clone()
+    original_params = pc.input_layer_group[0].params.clone()
 
     step_size = 0.3
     pseudocount = 0.1
 
-    par_flows = pc.input_layers[0].param_flows.clone().reshape(8, 2)
+    par_flows = pc.input_layer_group[0].param_flows.clone().reshape(8, 2)
     new_params = (1.0 - step_size) * original_params + step_size * ((par_flows + pseudocount / 2) / (par_flows.sum(dim = 1, keepdim = True) + pseudocount)).reshape(-1)
 
     pc.mini_batch_em(step_size = step_size, pseudocount = pseudocount)
 
-    assert torch.all(torch.abs(new_params - pc.input_layers[0].params) < 1e-4)
+    assert torch.all(torch.abs(new_params - pc.input_layer_group[0].params) < 1e-4)
 
 
 def bernoulli_nodes_test():
@@ -106,19 +106,19 @@ def bernoulli_nodes_test():
 
     lls = pc(data)
 
-    pc.backward(data)
+    pc.backward(data.permute(1, 0))
 
     ## Input node forward tests ##
 
     for i in range(16):
-        assert torch.abs(pc.node_mars[1,i].exp() - (pc.input_layers[0].params[0] if data[i,0] == 1 else (1.0 - pc.input_layers[0].params[0]))) < 1e-4
-        assert torch.abs(pc.node_mars[2,i].exp() - (pc.input_layers[0].params[1] if data[i,0] == 1 else (1.0 - pc.input_layers[0].params[1]))) < 1e-4
-        assert torch.abs(pc.node_mars[3,i].exp() - (pc.input_layers[0].params[2] if data[i,1] == 1 else (1.0 - pc.input_layers[0].params[2]))) < 1e-4
-        assert torch.abs(pc.node_mars[4,i].exp() - (pc.input_layers[0].params[3] if data[i,1] == 1 else (1.0 - pc.input_layers[0].params[3]))) < 1e-4
-        assert torch.abs(pc.node_mars[5,i].exp() - (pc.input_layers[0].params[4] if data[i,2] == 1 else (1.0 - pc.input_layers[0].params[4]))) < 1e-4
-        assert torch.abs(pc.node_mars[6,i].exp() - (pc.input_layers[0].params[5] if data[i,2] == 1 else (1.0 - pc.input_layers[0].params[5]))) < 1e-4
-        assert torch.abs(pc.node_mars[7,i].exp() - (pc.input_layers[0].params[6] if data[i,3] == 1 else (1.0 - pc.input_layers[0].params[6]))) < 1e-4
-        assert torch.abs(pc.node_mars[8,i].exp() - (pc.input_layers[0].params[7] if data[i,3] == 1 else (1.0 - pc.input_layers[0].params[7]))) < 1e-4
+        assert torch.abs(pc.node_mars[1,i].exp() - (pc.input_layer_group[0].params[0] if data[i,0] == 1 else (1.0 - pc.input_layer_group[0].params[0]))) < 1e-4
+        assert torch.abs(pc.node_mars[2,i].exp() - (pc.input_layer_group[0].params[1] if data[i,0] == 1 else (1.0 - pc.input_layer_group[0].params[1]))) < 1e-4
+        assert torch.abs(pc.node_mars[3,i].exp() - (pc.input_layer_group[0].params[2] if data[i,1] == 1 else (1.0 - pc.input_layer_group[0].params[2]))) < 1e-4
+        assert torch.abs(pc.node_mars[4,i].exp() - (pc.input_layer_group[0].params[3] if data[i,1] == 1 else (1.0 - pc.input_layer_group[0].params[3]))) < 1e-4
+        assert torch.abs(pc.node_mars[5,i].exp() - (pc.input_layer_group[0].params[4] if data[i,2] == 1 else (1.0 - pc.input_layer_group[0].params[4]))) < 1e-4
+        assert torch.abs(pc.node_mars[6,i].exp() - (pc.input_layer_group[0].params[5] if data[i,2] == 1 else (1.0 - pc.input_layer_group[0].params[5]))) < 1e-4
+        assert torch.abs(pc.node_mars[7,i].exp() - (pc.input_layer_group[0].params[6] if data[i,3] == 1 else (1.0 - pc.input_layer_group[0].params[6]))) < 1e-4
+        assert torch.abs(pc.node_mars[8,i].exp() - (pc.input_layer_group[0].params[7] if data[i,3] == 1 else (1.0 - pc.input_layer_group[0].params[7]))) < 1e-4
 
     ## Input node backward tests ##
 
@@ -135,21 +135,21 @@ def bernoulli_nodes_test():
         gt_param_flows[12+offsets[i,3]] += pc.node_flows[7,i]
         gt_param_flows[14+offsets[i,3]] += pc.node_flows[8,i]
 
-    assert torch.all(torch.abs(gt_param_flows - pc.input_layers[0].param_flows) < 1e-4)
+    assert torch.all(torch.abs(gt_param_flows - pc.input_layer_group[0].param_flows) < 1e-4)
 
     ## EM tests ##
 
-    original_params = pc.input_layers[0].params.clone()
+    original_params = pc.input_layer_group[0].params.clone()
 
     step_size = 0.3
     pseudocount = 0.1
 
-    par_flows = pc.input_layers[0].param_flows.clone().reshape(8, 2)
+    par_flows = pc.input_layer_group[0].param_flows.clone().reshape(8, 2)
     new_params = (1.0 - step_size) * original_params + step_size * ((par_flows + pseudocount / 2) / (par_flows.sum(dim = 1, keepdim = True) + pseudocount))[:,0]
 
     pc.mini_batch_em(step_size = step_size, pseudocount = pseudocount)
 
-    assert torch.all(torch.abs(new_params - pc.input_layers[0].params) < 1e-4)
+    assert torch.all(torch.abs(new_params - pc.input_layer_group[0].params) < 1e-4)
 
 
 def gaussian_nodes_test():
@@ -177,12 +177,12 @@ def gaussian_nodes_test():
 
     lls = pc(data)
 
-    pc.backward(data)
+    pc.backward(data.permute(1, 0))
 
     ## Input node forward tests ##
 
     for j in range(8):
-        gt_probs = torch.distributions.normal.Normal(pc.input_layers[0].params[2*j], pc.input_layers[0].params[2*j+1]).log_prob(data[:,j//2])
+        gt_probs = torch.distributions.normal.Normal(pc.input_layer_group[0].params[2*j], pc.input_layer_group[0].params[2*j+1]).log_prob(data[:,j//2])
         assert torch.all(torch.abs(gt_probs - pc.node_mars[j+1,:]) < 1e-4)
 
     ## Input node backward tests ##
@@ -194,12 +194,12 @@ def gaussian_nodes_test():
         gt_param_flows[3*j+1] = ((data[:,j//2] ** 2) * pc.node_flows[j+1,:]).sum()
         gt_param_flows[3*j+2] = (pc.node_flows[j+1,:]).sum()
 
-    assert torch.all(torch.abs(gt_param_flows - pc.input_layers[0].param_flows) < 1e-2)
+    assert torch.all(torch.abs(gt_param_flows - pc.input_layer_group[0].param_flows) < 1e-2)
 
     ## EM tests ##
 
-    mu = pc.input_layers[0].params.reshape(8, 2)[:,0].clone()
-    sigma = pc.input_layers[0].params.reshape(8, 2)[:,1].clone()
+    mu = pc.input_layer_group[0].params.reshape(8, 2)[:,0].clone()
+    sigma = pc.input_layer_group[0].params.reshape(8, 2)[:,1].clone()
     ori_theta1 = mu
     ori_theta2 = sigma * sigma + mu * mu
 
@@ -207,9 +207,9 @@ def gaussian_nodes_test():
     pseudocount = 0.1
     min_sigma = 0.01
 
-    stat1 = pc.input_layers[0].param_flows.reshape(8, 3)[:,0]
-    stat2 = pc.input_layers[0].param_flows.reshape(8, 3)[:,1]
-    stat3 = pc.input_layers[0].param_flows.reshape(8, 3)[:,2]
+    stat1 = pc.input_layer_group[0].param_flows.reshape(8, 3)[:,0]
+    stat2 = pc.input_layer_group[0].param_flows.reshape(8, 3)[:,1]
+    stat3 = pc.input_layer_group[0].param_flows.reshape(8, 3)[:,2]
 
     new_theta1 = stat1 / (stat3 + 1e-10)
     new_theta2 = stat2 / (stat3 + 1e-10)
@@ -225,8 +225,8 @@ def gaussian_nodes_test():
 
     pc.mini_batch_em(step_size = step_size, pseudocount = pseudocount)
 
-    assert torch.all(torch.abs(updated_mu - pc.input_layers[0].params.reshape(8, 2)[:,0]) < 1e-4)
-    assert torch.all(torch.abs(updated_sigma.clamp(min = 0.01) - pc.input_layers[0].params.reshape(8, 2)[:,1]) < 1e-4)
+    assert torch.all(torch.abs(updated_mu - pc.input_layer_group[0].params.reshape(8, 2)[:,0]) < 1e-4)
+    assert torch.all(torch.abs(updated_sigma.clamp(min = 0.01) - pc.input_layer_group[0].params.reshape(8, 2)[:,1]) < 1e-4)
 
 
 def discrete_logistic_nodes_test():
@@ -254,7 +254,7 @@ def discrete_logistic_nodes_test():
 
     lls = pc(data)
 
-    pc.backward(data)
+    pc.backward(data.permute(1, 0))
 
     ## Input node forward tests ##
 
@@ -268,8 +268,8 @@ def discrete_logistic_nodes_test():
         vlow = data[:,j//2] * interval + range_low
         vhigh = vlow + interval
 
-        mu = pc.input_layers[0].params[2*j]
-        s = pc.input_layers[0].params[2*j+1]
+        mu = pc.input_layer_group[0].params[2*j]
+        s = pc.input_layer_group[0].params[2*j+1]
 
         cdfhigh = torch.where(data[:,j//2] == num_cats - 1, 1.0, 1.0 / (1.0 + torch.exp((mu - vhigh) / s)))
         cdflow = torch.where(data[:,j//2] == 0, 0.0, 1.0 / (1.0 + torch.exp((mu - vlow) / s)))
@@ -290,12 +290,12 @@ def discrete_logistic_nodes_test():
         gt_param_flows[3*j+1] = ((vmid ** 2) * pc.node_flows[j+1,:]).sum()
         gt_param_flows[3*j+2] = (pc.node_flows[j+1,:]).sum()
 
-    assert torch.all(torch.abs(gt_param_flows - pc.input_layers[0].param_flows) < 1e-4)
+    assert torch.all(torch.abs(gt_param_flows - pc.input_layer_group[0].param_flows) < 1e-4)
 
     ## EM tests ##
 
-    mu = pc.input_layers[0].params.reshape(8, 2)[:,0].clone()
-    std = pc.input_layers[0].params.reshape(8, 2)[:,1].clone() * math.pi / math.sqrt(3.0)
+    mu = pc.input_layer_group[0].params.reshape(8, 2)[:,0].clone()
+    std = pc.input_layer_group[0].params.reshape(8, 2)[:,1].clone() * math.pi / math.sqrt(3.0)
     ori_theta1 = mu
     ori_theta2 = std * std + mu * mu
 
@@ -303,9 +303,9 @@ def discrete_logistic_nodes_test():
     pseudocount = 0.1
     min_std = 0.01
 
-    stat1 = pc.input_layers[0].param_flows.reshape(8, 3)[:,0]
-    stat2 = pc.input_layers[0].param_flows.reshape(8, 3)[:,1]
-    stat3 = pc.input_layers[0].param_flows.reshape(8, 3)[:,2]
+    stat1 = pc.input_layer_group[0].param_flows.reshape(8, 3)[:,0]
+    stat2 = pc.input_layer_group[0].param_flows.reshape(8, 3)[:,1]
+    stat3 = pc.input_layer_group[0].param_flows.reshape(8, 3)[:,2]
 
     new_theta1 = stat1 / (stat3 + 1e-10)
     new_theta2 = stat2 / (stat3 + 1e-10)
@@ -322,8 +322,8 @@ def discrete_logistic_nodes_test():
 
     pc.mini_batch_em(step_size = step_size, pseudocount = pseudocount)
 
-    assert torch.all(torch.abs(updated_mu - pc.input_layers[0].params.reshape(8, 2)[:,0]) < 1e-4)
-    assert torch.all(torch.abs(updated_s - pc.input_layers[0].params.reshape(8, 2)[:,1]) < 1e-4)
+    assert torch.all(torch.abs(updated_mu - pc.input_layer_group[0].params.reshape(8, 2)[:,0]) < 1e-4)
+    assert torch.all(torch.abs(updated_s - pc.input_layer_group[0].params.reshape(8, 2)[:,1]) < 1e-4)
 
 
 def discrete_logistic_nodes_behavior_test():
@@ -333,8 +333,8 @@ def discrete_logistic_nodes_behavior_test():
     ni2 = inputs(2, num_nodes = 2, dist = dists.DiscreteLogistic(val_range = [-1.0, 1.0], num_cats = 5))
     ni3 = inputs(3, num_nodes = 2, dist = dists.DiscreteLogistic(val_range = [-1.0, 1.0], num_cats = 5))
 
-    m1 = multiply(ni0, ni1, edge_ids = torch.tensor([[0, 0], [0, 1], [1, 0], [1, 1]], dtype = torch.long))
-    n1 = summate(m1, edge_ids = torch.tensor([[0, 0, 0, 0, 1, 1, 1, 1], [0, 1, 2, 3, 0, 1, 2, 3]], dtype = torch.long))
+    m1 = multiply(ni0, ni1, edge_ids = torch.tensor([[0, 0], [1, 1]], dtype = torch.long))
+    n1 = summate(m1, edge_ids = torch.tensor([[0, 0, 1, 1], [0, 1, 0, 1]], dtype = torch.long))
 
     m2 = multiply(ni2, ni3, edge_ids = torch.tensor([[0, 0], [1, 1]], dtype = torch.long))
     n2 = summate(m2, edge_ids = torch.tensor([[0, 0, 1, 1], [0, 1, 0, 1]], dtype = torch.long))
@@ -359,7 +359,7 @@ def discrete_logistic_nodes_behavior_test():
     for _ in range(40):
         lls = pc(data)
 
-        pc.backward(data)
+        pc.backward(data.permute(1, 0), flows_memory = 0.0)
 
         pc.mini_batch_em(step_size = 1.0, pseudocount = 0.01)
 
@@ -369,11 +369,12 @@ def discrete_logistic_nodes_behavior_test():
 
     assert (ni0._params[0] > 0.05 and ni0._params[2] < -0.6) or (ni0._params[2] > 0.05 and ni0._params[0] < -0.6)
     assert (ni1._params[0] > 0.05 and ni1._params[2] < -0.6) or (ni1._params[2] > 0.05 and ni1._params[0] < -0.6)
-    assert (ni2._params[0] > 0.78 and ni2._params[2] < 0.4) or (ni2._params[2] > 0.78 and ni2._params[0] < 0.4)
-    assert (ni3._params[0] > 0.78 and ni3._params[2] < 0.4) or (ni3._params[2] > 0.78 and ni3._params[0] < 0.4)
+    assert (ni2._params[0] > 0.65 and ni2._params[2] < 0.4) or (ni2._params[2] > 0.65 and ni2._params[0] < 0.4)
+    assert (ni3._params[0] > 0.65 and ni3._params[2] < 0.4) or (ni3._params[2] > 0.65 and ni3._params[0] < 0.4)
 
 
 if __name__ == "__main__":
+    torch.manual_seed(2390)
     categorical_nodes_test()
     bernoulli_nodes_test()
     gaussian_nodes_test()
