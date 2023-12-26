@@ -273,7 +273,7 @@ def simple_model_test():
 
     ## Backward pass ##
 
-    lls.mean().backward()
+    pc.backward(data.permute(1, 0), allow_modify_flows = False)
 
     node_flows = pc.node_flows.cpu()
     param_flows = pc.param_flows.cpu()
