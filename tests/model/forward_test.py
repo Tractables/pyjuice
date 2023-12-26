@@ -28,8 +28,6 @@ def forward_test():
 
     pc = TensorCircuit(n)
 
-    import pdb; pdb.set_trace()
-
     device = torch.device("cuda:0")
     pc.to(device)
 
@@ -39,14 +37,14 @@ def forward_test():
 
     ## Unit tests for forward pass ##
 
-    assert torch.abs(pc.node_mars[1,0] - torch.log(pc.input_layers[0].params[data[0,0]])) < 1e-4
-    assert torch.abs(pc.node_mars[2,0] - torch.log(pc.input_layers[0].params[2+data[0,0]])) < 1e-4
-    assert torch.abs(pc.node_mars[3,0] - torch.log(pc.input_layers[0].params[4+data[0,1]])) < 1e-4
-    assert torch.abs(pc.node_mars[4,0] - torch.log(pc.input_layers[0].params[6+data[0,1]])) < 1e-4
-    assert torch.abs(pc.node_mars[5,0] - torch.log(pc.input_layers[0].params[8+data[0,2]])) < 1e-4
-    assert torch.abs(pc.node_mars[6,0] - torch.log(pc.input_layers[0].params[10+data[0,2]])) < 1e-4
-    assert torch.abs(pc.node_mars[7,0] - torch.log(pc.input_layers[0].params[12+data[0,3]])) < 1e-4
-    assert torch.abs(pc.node_mars[8,0] - torch.log(pc.input_layers[0].params[14+data[0,3]])) < 1e-4
+    assert torch.abs(pc.node_mars[1,0] - torch.log(pc.input_layer_group[0].params[data[0,0]])) < 1e-4
+    assert torch.abs(pc.node_mars[2,0] - torch.log(pc.input_layer_group[0].params[2+data[0,0]])) < 1e-4
+    assert torch.abs(pc.node_mars[3,0] - torch.log(pc.input_layer_group[0].params[4+data[0,1]])) < 1e-4
+    assert torch.abs(pc.node_mars[4,0] - torch.log(pc.input_layer_group[0].params[6+data[0,1]])) < 1e-4
+    assert torch.abs(pc.node_mars[5,0] - torch.log(pc.input_layer_group[0].params[8+data[0,2]])) < 1e-4
+    assert torch.abs(pc.node_mars[6,0] - torch.log(pc.input_layer_group[0].params[10+data[0,2]])) < 1e-4
+    assert torch.abs(pc.node_mars[7,0] - torch.log(pc.input_layer_group[0].params[12+data[0,3]])) < 1e-4
+    assert torch.abs(pc.node_mars[8,0] - torch.log(pc.input_layer_group[0].params[14+data[0,3]])) < 1e-4
 
     p1 = torch.exp(pc.node_mars[1,0] + pc.node_mars[3,0])
     p2 = torch.exp(pc.node_mars[1,0] + pc.node_mars[4,0])
@@ -103,18 +101,18 @@ def non_sd_pc_forward_test():
 
     ## Unit tests for forward pass ##
 
-    assert torch.abs(pc.node_mars[1,0] - torch.log(pc.input_layers[0].params[data[0,0]])) < 1e-3
-    assert torch.abs(pc.node_mars[2,0] - torch.log(pc.input_layers[0].params[2+data[0,0]])) < 1e-3
-    assert torch.abs(pc.node_mars[3,0] - torch.log(pc.input_layers[0].params[4+data[0,1]])) < 1e-3
-    assert torch.abs(pc.node_mars[4,0] - torch.log(pc.input_layers[0].params[6+data[0,1]])) < 1e-3
-    assert torch.abs(pc.node_mars[5,0] - torch.log(pc.input_layers[0].params[8+data[0,2]])) < 1e-3
-    assert torch.abs(pc.node_mars[6,0] - torch.log(pc.input_layers[0].params[10+data[0,2]])) < 1e-3
-    assert torch.abs(pc.node_mars[7,0] - torch.log(pc.input_layers[0].params[12+data[0,1]])) < 1e-3
-    assert torch.abs(pc.node_mars[8,0] - torch.log(pc.input_layers[0].params[14+data[0,1]])) < 1e-3
-    assert torch.abs(pc.node_mars[9,0] - torch.log(pc.input_layers[0].params[16+data[0,2]])) < 1e-3
-    assert torch.abs(pc.node_mars[10,0] - torch.log(pc.input_layers[0].params[18+data[0,2]])) < 1e-3
-    assert torch.abs(pc.node_mars[11,0] - torch.log(pc.input_layers[0].params[20+data[0,0]])) < 1e-3
-    assert torch.abs(pc.node_mars[12,0] - torch.log(pc.input_layers[0].params[22+data[0,0]])) < 1e-3
+    assert torch.abs(pc.node_mars[1,0] - torch.log(pc.input_layer_group[0].params[data[0,0]])) < 1e-3
+    assert torch.abs(pc.node_mars[2,0] - torch.log(pc.input_layer_group[0].params[2+data[0,0]])) < 1e-3
+    assert torch.abs(pc.node_mars[3,0] - torch.log(pc.input_layer_group[0].params[4+data[0,1]])) < 1e-3
+    assert torch.abs(pc.node_mars[4,0] - torch.log(pc.input_layer_group[0].params[6+data[0,1]])) < 1e-3
+    assert torch.abs(pc.node_mars[5,0] - torch.log(pc.input_layer_group[0].params[8+data[0,2]])) < 1e-3
+    assert torch.abs(pc.node_mars[6,0] - torch.log(pc.input_layer_group[0].params[10+data[0,2]])) < 1e-3
+    assert torch.abs(pc.node_mars[7,0] - torch.log(pc.input_layer_group[0].params[12+data[0,1]])) < 1e-3
+    assert torch.abs(pc.node_mars[8,0] - torch.log(pc.input_layer_group[0].params[14+data[0,1]])) < 1e-3
+    assert torch.abs(pc.node_mars[9,0] - torch.log(pc.input_layer_group[0].params[16+data[0,2]])) < 1e-3
+    assert torch.abs(pc.node_mars[10,0] - torch.log(pc.input_layer_group[0].params[18+data[0,2]])) < 1e-3
+    assert torch.abs(pc.node_mars[11,0] - torch.log(pc.input_layer_group[0].params[20+data[0,0]])) < 1e-3
+    assert torch.abs(pc.node_mars[12,0] - torch.log(pc.input_layer_group[0].params[22+data[0,0]])) < 1e-3
 
     f1 = torch.exp(pc.node_mars[1,0] + pc.node_mars[3,0]) * pc.params[1]
     f2 = torch.exp(pc.node_mars[2,0] + pc.node_mars[4,0]) * pc.params[2]
@@ -167,14 +165,14 @@ def sparse_pc_forward_test():
 
     ## Unit tests for forward pass ##
 
-    assert torch.abs(pc.node_mars[1,0] - torch.log(pc.input_layers[0].params[data[0,0]])) < 1e-4
-    assert torch.abs(pc.node_mars[2,0] - torch.log(pc.input_layers[0].params[2+data[0,0]])) < 1e-4
-    assert torch.abs(pc.node_mars[3,0] - torch.log(pc.input_layers[0].params[4+data[0,1]])) < 1e-4
-    assert torch.abs(pc.node_mars[4,0] - torch.log(pc.input_layers[0].params[6+data[0,1]])) < 1e-4
-    assert torch.abs(pc.node_mars[5,0] - torch.log(pc.input_layers[0].params[8+data[0,2]])) < 1e-4
-    assert torch.abs(pc.node_mars[6,0] - torch.log(pc.input_layers[0].params[10+data[0,2]])) < 1e-4
-    assert torch.abs(pc.node_mars[7,0] - torch.log(pc.input_layers[0].params[12+data[0,3]])) < 1e-4
-    assert torch.abs(pc.node_mars[8,0] - torch.log(pc.input_layers[0].params[14+data[0,3]])) < 1e-4
+    assert torch.abs(pc.node_mars[1,0] - torch.log(pc.input_layer_group[0].params[data[0,0]])) < 1e-4
+    assert torch.abs(pc.node_mars[2,0] - torch.log(pc.input_layer_group[0].params[2+data[0,0]])) < 1e-4
+    assert torch.abs(pc.node_mars[3,0] - torch.log(pc.input_layer_group[0].params[4+data[0,1]])) < 1e-4
+    assert torch.abs(pc.node_mars[4,0] - torch.log(pc.input_layer_group[0].params[6+data[0,1]])) < 1e-4
+    assert torch.abs(pc.node_mars[5,0] - torch.log(pc.input_layer_group[0].params[8+data[0,2]])) < 1e-4
+    assert torch.abs(pc.node_mars[6,0] - torch.log(pc.input_layer_group[0].params[10+data[0,2]])) < 1e-4
+    assert torch.abs(pc.node_mars[7,0] - torch.log(pc.input_layer_group[0].params[12+data[0,3]])) < 1e-4
+    assert torch.abs(pc.node_mars[8,0] - torch.log(pc.input_layer_group[0].params[14+data[0,3]])) < 1e-4
 
     p1 = torch.exp(pc.node_mars[1,0] + pc.node_mars[3,0])
     p2 = torch.exp(pc.node_mars[1,0] + pc.node_mars[4,0])
