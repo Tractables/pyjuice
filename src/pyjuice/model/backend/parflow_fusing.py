@@ -37,7 +37,7 @@ def compile_cum_par_flows_fn(node2tiednodes, MAX_NGROUPS = 2048, BLOCK_SIZE = 20
 
         target_pfids = []
         block_sizes = []
-        ch_pfids = []
+        child_pfids = []
         for kernel_spec in kernel_specs:
             pfid_start, num_par_flows, ch_pfids = kernel_spec
             for blk_start in range(0, num_par_flows, BLOCK_M):
@@ -49,13 +49,13 @@ def compile_cum_par_flows_fn(node2tiednodes, MAX_NGROUPS = 2048, BLOCK_SIZE = 20
 
                 target_pfids.append(pfid_start + blk_start)
                 block_sizes.append(blk_size)
-                ch_pfids.append()
+                child_pfids.append(ch_pfid)
 
         target_pfids = torch.tensor(target_pfids).contiguous()
         block_sizes = torch.tensor(block_sizes).contiguous()
-        ch_pfids = torch.tensor(ch_pfids).contiguous()
+        child_pfids = torch.tensor(child_pfids).contiguous()
 
-        kernels_args.append([target_pfids, block_sizes, ch_pfids, BLOCK_G, BLOCK_M])
+        kernels_args.append([target_pfids, block_sizes, child_pfids, BLOCK_G, BLOCK_M])
 
     return kernels_args
 
