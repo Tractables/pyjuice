@@ -223,6 +223,7 @@ class TensorCircuit(nn.Module):
                  return_cache: bool = False,
                  record_cudagraph: bool = False, 
                  apply_cudagraph: bool = True,
+                 allow_modify_flows: bool = True,
                  **kwargs):
         """
         Compute circuit flows.
@@ -247,15 +248,19 @@ class TensorCircuit(nn.Module):
         self._init_buffer(name = "element_flows", shape = (self.num_elements, B), set_value = 0.0)
 
         # Set root node flows
-        if ll_weights is None:
-            self.node_flows[self._root_node_range[0]:self._root_node_range[1],:] = 1.0
-        else:
-            if ll_weights.dim() == 1:
-                ll_weights = ll_weights.unsqueeze(1)
+        def _set_root_node_flows():
+            nonlocal ll_weights
+            if ll_weights is None:
+                self.node_flows[self._root_node_range[0]:self._root_node_range[1],:] = 1.0
+            else:
+                if ll_weights.dim() == 1:
+                    ll_weights = ll_weights.unsqueeze(1)
 
-            assert ll_weights.size(0) == self.num_root_nodes
+                assert ll_weights.size(0) == self.num_root_nodes
 
-            self.node_flows[self._root_node_range[0]:self._root_node_range[1],:] = ll_weights
+                self.node_flows[self._root_node_range[0]:self._root_node_range[1],:] = ll_weights
+
+        _set_root_node_flows()
 
         # Load cached node flows
         if self._buffer_matches(name = "node_flows", cache = cache):
@@ -271,6 +276,8 @@ class TensorCircuit(nn.Module):
 
             # Inner layers
             def _run_inner_layers():
+
+                # Backward pass for inner layers
                 for layer_id in range(len(self.inner_layer_groups) - 1, -1, -1):
                     layer_group = self.inner_layer_groups[layer_id]
 
@@ -286,7 +293,8 @@ class TensorCircuit(nn.Module):
 
                         # Backward sum layer
                         layer_group.backward(self.node_flows, self.element_flows, self.node_mars, self.element_mars, self.params, 
-                                            param_flows = self.param_flows if compute_param_flows else None)
+                                             param_flows = self.param_flows if compute_param_flows else None,
+                                             allow_modify_flows = allow_modify_flows)
 
                     else:
                         raise ValueError(f"Unknown layer type {type(layer)}.")
@@ -298,10 +306,14 @@ class TensorCircuit(nn.Module):
                 s.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(s):
                     for _ in range(3):
+                        self.node_flows[:,:] = 0.0
+                        _set_root_node_flows()
                         _run_inner_layers()
                 torch.cuda.current_stream().wait_stream(s)
 
                 # Capture
+                self.node_flows[:,:] = 0.0
+                _set_root_node_flows()
                 g = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(g):
                     _run_inner_layers()

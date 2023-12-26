@@ -51,7 +51,7 @@ def full_batch_em_epoch(pc, train_loader, test_loader, device):
             x = batch[0].to(device)
 
             lls = pc(x)
-            pc.backward(x, flows_memory = 1.0)
+            lls.mean().backward()
 
             train_ll += lls.mean().detach().cpu().numpy().item()
 
@@ -109,13 +109,12 @@ def hclt_test():
         milestone_steps = [0, len(train_loader) * 100, len(train_loader) * 350]
     )
 
-    # for batch in train_loader:
-    #     x = batch[0].to(device)
+    for batch in train_loader:
+        x = batch[0].to(device)
 
-    #     lls = pc(x, record_cudagraph = True)
-    #     lls.mean().backward()
-    #     break
-
+        lls = pc(x, record_cudagraph = True)
+        lls.mean().backward()
+        break
 
     mini_batch_em_epoch(350, pc, optimizer, scheduler, train_loader, test_loader, device)
     full_batch_em_epoch(pc, train_loader, test_loader, device)

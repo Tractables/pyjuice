@@ -317,7 +317,9 @@ class SumLayer(Layer, nn.Module):
                 self._backward(
                     node_flows, element_flows, params, node_mars, 
                     element_mars, param_flows, nids = nids, 
-                    cids = cids, pids = pids, pfids = pfids, partition_id = partition_id
+                    cids = cids, pids = pids, pfids = pfids, 
+                    partition_id = partition_id,
+                    allow_modify_flows = allow_modify_flows
                 )
 
         return None
@@ -1423,7 +1425,7 @@ class SumLayer(Layer, nn.Module):
             emars = tl.load(emars_ptr, mask = mask_batch) # [BLOCK_B]
 
             if allow_modify_flows == 1:
-                eflows = tl.sum(epars[:,None] * tl.exp(emars[None,:] - log_n_fdm), axis = 0)
+                eflows = tl.sum(epars[:,None] * tl.exp(emars[None,:] + log_n_fdm), axis = 0)
             else:
                 eflows = tl.sum(nflows * epars[:,None] * tl.exp(emars[None,:] - nmars), axis = 0)
 
@@ -1520,12 +1522,12 @@ class SumLayer(Layer, nn.Module):
             mask_batch = (offs_batch < batch_size)
 
             emars = tl.load(emars_ptr, mask = mask_batch[None,:]) # [BLOCK_K, BLOCK_B]
-            nmars = tl.load(nmars_ptr, mask = mask_batch) # [BLOCK_B]
 
             if allow_modify_flows == 1:
                 log_n_fdm = tl.load(nflows_ptr, mask = mask_batch) # [BLOCK_B]
-                pflows = tl.sum(tl.exp(emars - log_n_fdm[None,:]), axis = 1)
+                pflows = tl.sum(tl.exp(emars + log_n_fdm[None,:]), axis = 1)
             else:
+                nmars = tl.load(nmars_ptr, mask = mask_batch) # [BLOCK_B]
                 nflows = tl.load(nflows_ptr, mask = mask_batch) # [BLOCK_B]
                 pflows = tl.sum(nflows[None,:] * tl.exp(emars - nmars[None,:]), axis = 1)
 
