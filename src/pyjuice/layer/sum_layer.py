@@ -11,6 +11,8 @@ from typing import Sequence, List, Tuple, Optional
 
 from pyjuice.nodes import SumNodes
 from pyjuice.utils import BitSet
+from pyjuice.utils.parameter_list import FastParamList
+from pyjuice.utils.kernel_launcher import FastJITFunction
 from .layer import Layer
 from .backend.node_partition import partition_nodes_by_n_edges
 from .backend.index_set import batched_index_set, index_cum
@@ -95,10 +97,10 @@ class SumLayer(Layer, nn.Module):
         )
 
         # Store buffers for the forward pass
-        self.partitioned_nids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in nids])
-        self.partitioned_cids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in cids])
-        self.partitioned_pids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in pids])
-        self.partitioned_pfids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in pfids])
+        self.partitioned_nids = FastParamList([nn.Parameter(tensor, requires_grad = False) for tensor in nids])
+        self.partitioned_cids = FastParamList([nn.Parameter(tensor, requires_grad = False) for tensor in cids])
+        self.partitioned_pids = FastParamList([nn.Parameter(tensor, requires_grad = False) for tensor in pids])
+        self.partitioned_pfids = FastParamList([nn.Parameter(tensor, requires_grad = False) for tensor in pfids])
 
         # Store pre-compiled indices from `cids` and `pids` in the following buffer
         self._cached_fw_pcids = dict()
@@ -174,9 +176,9 @@ class SumLayer(Layer, nn.Module):
             cs_group_sizes.extend([ch_gsize] * num_bk_partitions)
 
         # Store buffers for the forward pass
-        self.partitioned_chids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in chids])
-        self.partitioned_parids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in parids])
-        self.partitioned_parpids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in parpids])
+        self.partitioned_chids = FastParamList([nn.Parameter(tensor, requires_grad = False) for tensor in chids])
+        self.partitioned_parids = FastParamList([nn.Parameter(tensor, requires_grad = False) for tensor in parids])
+        self.partitioned_parpids = FastParamList([nn.Parameter(tensor, requires_grad = False) for tensor in parpids])
         self.cs_group_sizes = cs_group_sizes
 
         self.num_bk_partitions = len(chids)
@@ -382,7 +384,8 @@ class SumLayer(Layer, nn.Module):
             raise ValueError(f"Unexpected mode `{mode}`.")
 
     @staticmethod
-    @triton.jit
+    # @triton.jit
+    @FastJITFunction
     def _fw_triton_block_sparse_tlmm_kernel(node_mars, element_mars, params, nids, cids_start, cids_increment,
                                             pids_start, pids_increment, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
                                             BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
@@ -469,7 +472,8 @@ class SumLayer(Layer, nn.Module):
         tl.store(node_mars + offs_nmars, acc, mask = mask_batch[None,:])
 
     @staticmethod
-    @triton.jit
+    # @triton.jit
+    @FastJITFunction
     def _fw_triton_block_sparse_csmm_kernel(node_mars, element_mars, params, nids, cids_start, cids_increment,
                                             pids_start, pids_increment, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
                                             BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
@@ -681,7 +685,8 @@ class SumLayer(Layer, nn.Module):
         return None
 
     @staticmethod
-    @triton.jit
+    # @triton.jit
+    @FastJITFunction
     def _fw_triton_sparse_kernel(node_mars, element_mars, params, nids, cids, pids,
                                  local_ids, batch_size, partial_eval: tl.constexpr, num_edges: tl.constexpr, 
                                  BLOCK_B: tl.constexpr, BLOCK_M: tl.constexpr, GROUP_SIZE_M: tl.constexpr):
@@ -892,7 +897,8 @@ class SumLayer(Layer, nn.Module):
             raise ValueError(f"Not supported mode `{mode}`.")
 
     @staticmethod
-    @triton.jit
+    # @triton.jit
+    @FastJITFunction
     def _bk_triton_block_sparse_modify_flow_kernel(node_flows, node_mars, local_ids, nids, batch_size: tl.constexpr, partial_eval: tl.constexpr, 
                                                    BLOCK_B: tl.constexpr, BLOCK_M: tl.constexpr, GROUP_SIZE_M: tl.constexpr):
 
@@ -996,7 +1002,8 @@ class SumLayer(Layer, nn.Module):
         return None
 
     @staticmethod
-    @triton.jit
+    # @triton.jit
+    @FastJITFunction
     def _bk_triton_block_sparse_ele_kernel(node_flows, element_flows, node_mars, element_mars, params, 
                                            chids, parids_start, parids_increment, parpids_start, parpids_increment, 
                                            local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr, ptr_inc_step: tl.constexpr, 
@@ -1193,7 +1200,8 @@ class SumLayer(Layer, nn.Module):
         return None
 
     @staticmethod
-    @triton.jit
+    # @triton.jit
+    @FastJITFunction
     def _bk_triton_block_sparse_par_kernel(node_flows, node_mars, element_mars, params, param_flows, nids, cids, pids, pfids,
                                            batch_size: tl.constexpr, num_edges: tl.constexpr, allow_modify_flows: tl.constexpr, 
                                            TILE_SIZE_B: tl.constexpr, B_NUM_TILES: tl.constexpr, TILE_SIZE_K: tl.constexpr, 
@@ -1376,7 +1384,8 @@ class SumLayer(Layer, nn.Module):
         return None
 
     @staticmethod
-    @triton.jit
+    # @triton.jit
+    @FastJITFunction
     def _bk_triton_sparse_ele_kernel(node_flows, element_flows, node_mars, element_mars, params, 
                                      chids, parids, parpids, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
                                      n_edge_groups: tl.constexpr, allow_modify_flows: tl.constexpr, BLOCK_B: tl.constexpr, 
@@ -1487,7 +1496,8 @@ class SumLayer(Layer, nn.Module):
         return None
 
     @staticmethod
-    @triton.jit
+    # @triton.jit
+    @FastJITFunction
     def _bk_triton_sparse_par_kernel(node_flows, node_mars, element_mars, params, param_flows, nids, cids, pids, pfids,
                                      num_edges: tl.constexpr, batch_size: tl.constexpr, allow_modify_flows: tl.constexpr, 
                                      BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_B: tl.constexpr, 

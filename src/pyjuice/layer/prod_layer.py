@@ -6,10 +6,11 @@ import triton
 import triton.language as tl
 import warnings
 import time
-from packaging import version
 from typing import Sequence, Optional
 
 from pyjuice.nodes import ProdNodes
+from pyjuice.utils.parameter_list import FastParamList
+from pyjuice.utils.kernel_launcher import FastJITFunction
 from .layer import Layer
 from .backend.node_partition import partition_nodes_by_n_edges
 from .backend.index_set import batched_index_set, batched_index_cum
@@ -79,8 +80,8 @@ class ProdLayer(Layer, nn.Module):
         )
 
         # Store buffers for the forward pass
-        self.partitioned_nids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in nids])
-        self.partitioned_cids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in cids])
+        self.partitioned_nids = FastParamList([nn.Parameter(tensor, requires_grad = False) for tensor in nids])
+        self.partitioned_cids = FastParamList([nn.Parameter(tensor, requires_grad = False) for tensor in cids])
 
         ## Initialize backward pass ##
 
@@ -134,8 +135,8 @@ class ProdLayer(Layer, nn.Module):
         )
 
         # Store buffers for the backward pass
-        self.partitioned_u_cids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in u_cids])
-        self.partitioned_parids = nn.ParameterList([nn.Parameter(tensor, requires_grad = False) for tensor in parids])
+        self.partitioned_u_cids = FastParamList([nn.Parameter(tensor, requires_grad = False) for tensor in u_cids])
+        self.partitioned_parids = FastParamList([nn.Parameter(tensor, requires_grad = False) for tensor in parids])
 
     def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor, _for_backward: bool = False) -> None:
         """
@@ -232,7 +233,8 @@ class ProdLayer(Layer, nn.Module):
             ]
 
     @staticmethod
-    @triton.jit
+    # @triton.jit
+    @FastJITFunction
     def _forward_backward_kernel_3d(node_vals_ptr, element_vals_ptr, local_ids_ptr, nids_ptr, cids_ptr, tot_n_nodes, tot_n_eles, n_ngroups,
                                     num_edges: tl.constexpr, batch_size, BLOCK_M: tl.constexpr, BLOCK_B: tl.constexpr, 
                                     group_size: tl.constexpr, accum: tl.constexpr, partial_eval: tl.constexpr):
@@ -324,7 +326,8 @@ class ProdLayer(Layer, nn.Module):
             tl.store(node_vals_ptr + offs_nvals, nvals, mask = mask_batch[:,None])
 
     @staticmethod
-    @triton.jit
+    # @triton.jit
+    @FastJITFunction
     def _forward_backward_kernel_2d(node_vals_ptr, element_vals_ptr, local_ids_ptr, nids_ptr, cids_ptr, tot_n_nodes, tot_n_eles, n_ngroups,
                                     num_edges: tl.constexpr, batch_size, BLOCK_M: tl.constexpr, BLOCK_B: tl.constexpr, 
                                     group_size: tl.constexpr, accum: tl.constexpr, partial_eval: tl.constexpr):
@@ -410,7 +413,7 @@ class ProdLayer(Layer, nn.Module):
 
             return None
 
-        if version.parse(triton.__version__) > version.parse("2.0.0"):
+        if not triton.__version__ == "2.0.0":
 
             BLOCK_B = min(1024 // num_edges, triton.next_power_of_2(batch_size))
             BLOCK_M = min(max(1024 // (BLOCK_B * num_edges), 1), self.group_size)
