@@ -1043,9 +1043,13 @@ class SumLayer(Layer, nn.Module):
         for k in range(0, K_NUM_TILES):
             epars = tl.load(epars_ptr) # [TILE_SIZE_M, TILE_SIZE_K]
             nmars = tl.load(nmars_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_K, BLOCK_B]
-            nflows = tl.load(nflows_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_K, BLOCK_B]
 
-            log_n_fdm = tl.log(nflows) - nmars
+            if allow_modify_flows == 1:
+                log_n_fdm = tl.load(nflows_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_K, BLOCK_B]
+            else:
+                nflows = tl.load(nflows_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_K, BLOCK_B]
+                log_n_fdm = tl.log(nflows) - nmars
+
             log_n_fdm_max = tl.max(log_n_fdm, axis = 0)
             n_fdm_sub = tl.where(log_n_fdm_max[None,:] != -float("inf"), tl.exp(log_n_fdm - log_n_fdm_max[None,:]), 0.0)
 
@@ -1220,9 +1224,13 @@ class SumLayer(Layer, nn.Module):
         for b in range(0, B_NUM_TILES):
             emars = tl.load(emars_ptr, mask = mask_batch[:,None]) # [TILE_SIZE_B, TILE_SIZE_K]
             nmars = tl.load(nmars_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_M, TILE_SIZE_B]
-            nflows = tl.load(nflows_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_M, TILE_SIZE_B]
 
-            log_n_fdm = tl.log(nflows) - nmars
+            if allow_modify_flows == 1:
+                log_n_fdm = tl.load(nflows_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_M, TILE_SIZE_B]
+            else:
+                nflows = tl.load(nflows_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_M, TILE_SIZE_B]
+                log_n_fdm = tl.log(nflows) - nmars
+
             log_n_fdm_max = tl.max(log_n_fdm, axis = 0)
             n_fdm_sub = tl.where(log_n_fdm_max[None,:] != -float("inf"), tl.exp(log_n_fdm - log_n_fdm_max[None,:]), 0.0)
 
@@ -1366,8 +1374,8 @@ class SumLayer(Layer, nn.Module):
     @triton.jit
     def _bk_triton_sparse_ele_kernel(node_flows, element_flows, node_mars, element_mars, params, 
                                      chids, parids, parpids, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
-                                     n_edge_groups: tl.constexpr, BLOCK_B: tl.constexpr, BLOCK_M: tl.constexpr, 
-                                     GROUP_SIZE_K: tl.constexpr):
+                                     n_edge_groups: tl.constexpr, allow_modify_flows: tl.constexpr, BLOCK_B: tl.constexpr, 
+                                     BLOCK_M: tl.constexpr, GROUP_SIZE_K: tl.constexpr):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
@@ -1399,7 +1407,10 @@ class SumLayer(Layer, nn.Module):
         nflows_ptr = node_flows + \
             (edge_start + offs_edge_nid)[:,None] * batch_size + \
             offs_batch[None,:]
-        nflows = tl.load(nflows_ptr, mask = mask_batch[None,:]) # [num_edges, BLOCK_B]
+        if allow_modify_flows == 1:
+            log_n_fdm = tl.load(nflows_ptr, mask = mask_batch[None,:]) # [num_edges, BLOCK_B]
+        else:
+            nflows = tl.load(nflows_ptr, mask = mask_batch[None,:]) # [num_edges, BLOCK_B]
 
         # Initialize pointers to `element_flows` and `element_mars`
         off_eleids = tl.load(chids + elegroup_id)
@@ -1411,7 +1422,10 @@ class SumLayer(Layer, nn.Module):
             epars = tl.load(epars_ptr) # [num_edges]
             emars = tl.load(emars_ptr, mask = mask_batch) # [BLOCK_B]
 
-            eflows = tl.sum(nflows * epars[:,None] * tl.exp(emars[None,:] - nmars), axis = 0)
+            if allow_modify_flows == 1:
+                eflows = tl.sum(epars[:,None] * tl.exp(emars[None,:] - log_n_fdm), axis = 0)
+            else:
+                eflows = tl.sum(nflows * epars[:,None] * tl.exp(emars[None,:] - nmars), axis = 0)
 
             tl.store(eflows_ptr, eflows, mask = mask_batch)
 
@@ -1442,6 +1456,8 @@ class SumLayer(Layer, nn.Module):
         BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
         BLOCK_M = cs_group_size
 
+        allow_modify_flows = 1 if allow_modify_flows else 0
+
         grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, BLOCK_M))
 
         self._bk_triton_sparse_ele_kernel[grid](
@@ -1457,6 +1473,7 @@ class SumLayer(Layer, nn.Module):
             batch_size = batch_size, 
             partial_eval = 1 if local_ids is not None else 0,
             n_edge_groups = n_edge_groups,
+            allow_modify_flows = allow_modify_flows,
             BLOCK_B = BLOCK_B, 
             BLOCK_M = BLOCK_M,
             GROUP_SIZE_K = self.group_size
@@ -1467,8 +1484,9 @@ class SumLayer(Layer, nn.Module):
     @staticmethod
     @triton.jit
     def _bk_triton_sparse_par_kernel(node_flows, node_mars, element_mars, params, param_flows, nids, cids, pids, pfids,
-                                     num_edges: tl.constexpr, batch_size: tl.constexpr, BLOCK_M: tl.constexpr, 
-                                     BLOCK_K: tl.constexpr, BLOCK_B: tl.constexpr, TILE_SIZE_B: tl.constexpr, B_NUM_BLOCKS: tl.constexpr):
+                                     num_edges: tl.constexpr, batch_size: tl.constexpr, allow_modify_flows: tl.constexpr, 
+                                     BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_B: tl.constexpr, 
+                                     TILE_SIZE_B: tl.constexpr, B_NUM_BLOCKS: tl.constexpr):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` samples
         pid_e = tl.program_id(1) # ID of size-`BLOCK_K` edges
@@ -1503,9 +1521,13 @@ class SumLayer(Layer, nn.Module):
 
             emars = tl.load(emars_ptr, mask = mask_batch[None,:]) # [BLOCK_K, BLOCK_B]
             nmars = tl.load(nmars_ptr, mask = mask_batch) # [BLOCK_B]
-            nflows = tl.load(nflows_ptr, mask = mask_batch) # [BLOCK_B]
 
-            pflows = tl.sum(nflows[None,:] * tl.exp(emars - nmars[None,:]), axis = 1)
+            if allow_modify_flows == 1:
+                log_n_fdm = tl.load(nflows_ptr, mask = mask_batch) # [BLOCK_B]
+                pflows = tl.sum(tl.exp(emars - log_n_fdm[None,:]), axis = 1)
+            else:
+                nflows = tl.load(nflows_ptr, mask = mask_batch) # [BLOCK_B]
+                pflows = tl.sum(nflows[None,:] * tl.exp(emars - nmars[None,:]), axis = 1)
 
             acc += pflows
 
@@ -1593,7 +1615,8 @@ class SumLayer(Layer, nn.Module):
             pids = pids,
             pfids = pfids,
             num_edges = num_edges,
-            batch_size = batch_size, 
+            batch_size = batch_size,
+            allow_modify_flows = allow_modify_flows,
             BLOCK_M = BLOCK_M,
             BLOCK_K = BLOCK_K,
             BLOCK_B = BLOCK_B,
