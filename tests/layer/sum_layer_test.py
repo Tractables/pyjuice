@@ -204,22 +204,24 @@ def speed_test():
     element_flows = torch.zeros([group_size + num_prod_nodes * group_size * num_node_groups, batch_size]).log().to(device)
     param_flows = torch.zeros([group_size ** 2 + layer.partitioned_pids[0].max() + group_size]).to(device)
 
-    layer.backward(node_flows, element_flows, node_mars, element_mars, params, param_flows)
+    layer.backward(node_flows, element_flows, node_mars, element_mars, params, param_flows,
+                   allow_modify_flows = True)
 
     t0 = time.time()
     torch.cuda.synchronize()
     for _ in range(100):
-        layer.backward(node_flows, element_flows, node_mars, element_mars, params, param_flows)
+        layer.backward(node_flows, element_flows, node_mars, element_mars, params, param_flows,
+                       allow_modify_flows = True)
     torch.cuda.synchronize()
     t1 = time.time()
     backward_ms = (t1 - t0) / 100 * 1000
 
     print(f"Backward pass on average takes {backward_ms:.3f}ms.")
-    print("Reference computation time on RTX 4090: 1.814ms.")
+    print("Reference computation time on RTX 4090: 2.175ms.")
     print("--------------------------------------------------------------")
 
 
 if __name__ == "__main__":
     torch.manual_seed(3890)
-    # sum_layer_test()
+    sum_layer_test()
     speed_test()
