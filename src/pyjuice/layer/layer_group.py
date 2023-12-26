@@ -51,6 +51,16 @@ class LayerGroup(nn.Module):
         for layer in self.layers:
             layer.backward(*args, **kwargs)
 
+    def enable_partial_evaluation(self, *args, **kwargs):
+
+        for layer in self.layers:
+            layer.enable_partial_evaluation(*args, **kwargs)
+
+    def disable_partial_evaluation(self, *args, **kwargs):
+
+        for layer in self.layers:
+            layer.disable_partial_evaluation(*args, **kwargs)
+
     def is_input(self):
         return self.layer_type == "input"
         
@@ -77,3 +87,16 @@ class LayerGroup(nn.Module):
             return layer
         else:
             raise StopIteration
+
+    def _prepare_scope2nids(self, *args, **kwargs):
+        
+        if self.is_prod():
+            prod_scope_eleids = list()
+            for layer in self.layers:
+                prod_scope_eleids.extend(layer._prepare_scope2nids(*args, **kwargs))
+
+            return prod_scope_eleids
+        
+        else:
+            for layer in self.layers:
+                layer._prepare_scope2nids(*args, **kwargs)

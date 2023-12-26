@@ -219,13 +219,13 @@ class ProdLayer(Layer, nn.Module):
 
         # For product layers, we need a special forward pass during the backward process of the circuit
         if bk_scopes is not None:
-            bk_fw_partition_local_ids = [[] for _ in range(self.num_fw_groups)]
+            bk_fw_partition_local_ids = [[] for _ in range(self.num_fw_partitions)]
             for scope in bk_scopes:
                 if scope not in self.fw_scope2localids:
                     continue
 
-                for group_id, ids in enumerate(self.fw_scope2localids[scope]):
-                    bk_fw_partition_local_ids[group_id].append(self.fw_scope2localids[scope][group_id])
+                for partition_id, ids in enumerate(self.fw_scope2localids[scope]):
+                    bk_fw_partition_local_ids[partition_id].append(self.fw_scope2localids[scope][partition_id])
 
             self.bk_fw_partition_local_ids = [
                 torch.cat(ids, dim = 0) if len(ids) > 0 else torch.zeros([0], dtype = torch.long) for ids in bk_fw_partition_local_ids
@@ -392,9 +392,6 @@ class ProdLayer(Layer, nn.Module):
     def _forward_backward(self, node_vals: torch.Tensor, element_vals: torch.Tensor,
                           nids: torch.Tensor, cids: torch.Tensor, local_ids: Optional[torch.Tensor] = None,
                           accum: bool = False) -> None:
-        if local_ids is not None:
-            raise NotImplementedError()
-
         tot_n_nodes = node_vals.size(0)
         tot_n_eles = element_vals.size(0)
         n_ngroups = nids.size(0) if local_ids is None else local_ids.size(0)
@@ -493,15 +490,15 @@ class ProdLayer(Layer, nn.Module):
                 with torch.no_grad():
                     if scope not in fw_scope2localids:
                         fw_scope2localids[scope] = [
-                            torch.zeros([0], dtype = torch.long).to(self.grouped_nids[0].device) for _ in range(self.num_fw_groups)
+                            torch.zeros([0], dtype = torch.long).to(self.partitioned_nids[0].device) for _ in range(self.num_fw_partitions)
                         ]
 
-                    for group_id in range(self.num_fw_groups):
-                        nids = self.grouped_nids[group_id]
-                        group_local_ids = torch.where((nids >= s_eid) & (nids < e_eid))[0]
+                    for partition_id in range(self.num_fw_partitions):
+                        nids = self.partitioned_nids[partition_id]
+                        partition_local_ids = torch.where((nids >= s_eid) & (nids < e_eid))[0]
 
-                        fw_scope2localids[scope][group_id] = torch.cat(
-                            (fw_scope2localids[scope][group_id], group_local_ids), dim = 0
+                        fw_scope2localids[scope][partition_id] = torch.cat(
+                            (fw_scope2localids[scope][partition_id], partition_local_ids), dim = 0
                         )
 
                 global_eid += ns.num_nodes
@@ -516,15 +513,15 @@ class ProdLayer(Layer, nn.Module):
 
                     if scope not in bk_scope2localids:
                         bk_scope2localids[scope] = [
-                            torch.zeros([0], dtype = torch.long).to(self.grouped_nids[0].device) for _ in range(self.num_bk_groups)
+                            torch.zeros([0], dtype = torch.long).to(self.partitioned_nids[0].device) for _ in range(self.num_bk_partitions)
                         ]
 
-                    for group_id in range(self.num_bk_groups):
-                        u_cids = self.grouped_u_cids[group_id]
-                        group_local_ids = torch.where((u_cids >= s_nid) & (u_cids < e_nid))[0]
+                    for partition_id in range(self.num_bk_partitions):
+                        u_cids = self.partitioned_u_cids[partition_id]
+                        partition_local_ids = torch.where((u_cids >= s_nid) & (u_cids < e_nid))[0]
 
-                        bk_scope2localids[scope][group_id] = torch.cat(
-                            (bk_scope2localids[scope][group_id], group_local_ids), dim = 0
+                        bk_scope2localids[scope][partition_id] = torch.cat(
+                            (bk_scope2localids[scope][partition_id], partition_local_ids), dim = 0
                         )
 
             self.fw_scope2localids = fw_scope2localids

@@ -261,19 +261,22 @@ class SumLayer(Layer, nn.Module):
         `params`:        [num_params, B] or [num_params]
         """
 
+        # Disallow modifications of `node_flows` in case of partial evaluation
+        if self.provided("bk_partition_local_ids") and allow_modify_flows:
+            allow_modify_flows = False
+
         ## Pre-compute `nflows.log() - nmars` if needed ##
         if allow_modify_flows:
+            assert not self.provided("bk_partition_local_ids"), "Must set `allow_modify_flows = False` for partial evaluation."
             for partition_id in range(self.num_fw_partitions):
                 nids = self.partitioned_nids[partition_id]
-                # TODO: be careful when restoring `local_ids`
-                local_ids = None
 
                 self._bk_triton_block_sparse_modify_flow(
-                    node_flows, node_mars, nids, local_ids
+                    node_flows, node_mars, nids, local_ids = None
                 )
         
         ## Compute flows w.r.t. elements (i.e., product nodes) ##
-        if not self.provided("bk_group_local_ids"):
+        if not self.provided("bk_partition_local_ids"):
             # Evaluate the whole layer
             for partition_id in range(self.num_bk_partitions):
                 chids = self.partitioned_chids[partition_id]
@@ -292,11 +295,11 @@ class SumLayer(Layer, nn.Module):
         else:
             # Partial evaluation
             for partition_id in range(self.num_bk_partitions):
-                chids = self.grouped_chids[partition_id]
-                parids = self.grouped_parids[partition_id]
-                parpids = self.grouped_parpids[partition_id]
+                chids = self.partitioned_chids[partition_id]
+                parids = self.partitioned_parids[partition_id]
+                parpids = self.partitioned_parpids[partition_id]
                 cs_group_size = self.cs_group_sizes[partition_id]
-                local_ids = self.bk_group_local_ids[partition_id]
+                local_ids = self.bk_partition_local_ids[partition_id]
 
                 self._backward(
                     node_flows, element_flows, params, node_mars,
@@ -1711,7 +1714,7 @@ class SumLayer(Layer, nn.Module):
             bk_scope2localids = dict()
 
             # Forward local indices
-            global_nid = self.global_nid_range[0]
+            global_nid = self._layer_nid_range[0]
             for ns in self.nodes:
                 scope = ns.scope
 
@@ -1721,15 +1724,15 @@ class SumLayer(Layer, nn.Module):
                 with torch.no_grad():
                     if scope not in fw_scope2localids:
                         fw_scope2localids[scope] = [
-                            torch.zeros([0], dtype = torch.long).to(self.grouped_nids[0].device) for _ in range(self.num_fw_groups)
+                            torch.zeros([0], dtype = torch.long).to(self.partitioned_nids[0].device) for _ in range(self.num_fw_partitions)
                         ]
 
-                    for group_id in range(self.num_fw_groups):
-                        nids = self.grouped_nids[group_id]
-                        group_local_ids = torch.where((nids >= s_nid) & (nids < e_nid))[0]
+                    for partition_id in range(self.num_fw_partitions):
+                        nids = self.partitioned_nids[partition_id]
+                        partition_local_ids = torch.where((nids >= s_nid) & (nids < e_nid))[0]
 
-                        fw_scope2localids[scope][group_id] = torch.cat(
-                            (fw_scope2localids[scope][group_id], group_local_ids), dim = 0
+                        fw_scope2localids[scope][partition_id] = torch.cat(
+                            (fw_scope2localids[scope][partition_id], partition_local_ids), dim = 0
                         )
 
                 global_nid += ns.num_nodes
@@ -1741,15 +1744,15 @@ class SumLayer(Layer, nn.Module):
                 with torch.no_grad():
                     if scope not in bk_scope2localids:
                         bk_scope2localids[scope] = [
-                            torch.zeros([0], dtype = torch.long).to(self.grouped_nids[0].device) for _ in range(self.num_bk_groups)
+                            torch.zeros([0], dtype = torch.long).to(self.partitioned_chids[0].device) for _ in range(self.num_bk_partitions)
                         ]
 
-                    for group_id in range(self.num_bk_groups):
-                        chids = self.grouped_chids[group_id]
-                        group_local_ids = torch.where((chids >= s_eid) & (chids < e_eid))[0]
+                    for partition_id in range(self.num_bk_partitions):
+                        chids = self.partitioned_chids[partition_id]
+                        partition_local_ids = torch.where((chids >= s_eid) & (chids < e_eid))[0]
 
-                        bk_scope2localids[scope][group_id] = torch.cat(
-                            (bk_scope2localids[scope][group_id], group_local_ids), dim = 0
+                        bk_scope2localids[scope][partition_id] = torch.cat(
+                            (bk_scope2localids[scope][partition_id], partition_local_ids), dim = 0
                         )
 
             self.fw_scope2localids = fw_scope2localids

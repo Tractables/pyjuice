@@ -452,7 +452,7 @@ class InputLayer(Layer, nn.Module):
 
         # Filter forward nodes
         if fw_scopes is not None:
-            fw_local_group_ids = []
+            fw_local_ids = []
             for scope in fw_scopes:
                 if isinstance(scope, int):
                     scope = BitSet.from_array([scope])
@@ -460,16 +460,16 @@ class InputLayer(Layer, nn.Module):
                 if scope not in self.scope2localgids:
                     continue
 
-                fw_local_group_ids.append(self.scope2localgids[scope])
+                fw_local_ids.append(self.scope2localgids[scope])
 
             if return_ids:
-                return torch.cat(fw_local_group_ids, dim = 0)
+                return torch.cat(fw_local_ids, dim = 0)
             else:
-                self.fw_local_group_ids = torch.cat(fw_local_group_ids, dim = 0)
+                self.fw_local_ids = torch.cat(fw_local_ids, dim = 0)
 
         # Filter backward nodes
         if bk_scopes is not None:
-            bk_local_group_ids = []
+            bk_local_ids = []
             for scope in bk_scopes:
                 if isinstance(scope, int):
                     scope = BitSet.from_array([scope])
@@ -477,19 +477,19 @@ class InputLayer(Layer, nn.Module):
                 if scope not in self.scope2localgids:
                     continue
 
-                bk_local_group_ids.append(self.scope2localgids[scope])
+                bk_local_ids.append(self.scope2localgids[scope])
 
             if return_ids:
-                return torch.cat(bk_local_group_ids, dim = 0)
+                return torch.cat(bk_local_ids, dim = 0)
             else:
-                self.bk_local_group_ids = torch.cat(bk_local_group_ids, dim = 0)
+                self.bk_local_ids = torch.cat(bk_local_ids, dim = 0)
 
     def disable_partial_evaluation(self, forward: bool = True, backward: bool = True):
         if forward:
-            self.fw_local_group_ids = None
+            self.fw_local_ids = None
 
         if backward:
-            self.bk_local_group_ids = None
+            self.bk_local_ids = None
 
     def update_parameters(self):
         for idx, ns in enumerate(self.nodes):
@@ -514,9 +514,9 @@ class InputLayer(Layer, nn.Module):
                     if scope not in scope2localgids:
                         scope2localgids[scope] = [torch.zeros([0], dtype = torch.long)]
 
-                    scope2localgids[scope].append(torch.arange(s_nid, e_nid))
+                    scope2localgids[scope].append(torch.arange(s_ngid, e_ngid))
 
-                local_nid += ns.num_nodes
+                local_ngid += ns.num_node_groups
 
             self.scope2localgids = {
                 scope: torch.cat(ids, dim = 0).to(self.params.device) for scope, ids in scope2localgids.items()

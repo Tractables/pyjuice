@@ -80,6 +80,10 @@ class TensorCircuit(nn.Module):
             "flows_memory": 1.0
         }
 
+        # Partial evaluation
+        self._fw_partial_eval_enabled = False
+        self._bk_partial_eval_enabled = False
+
         # CudaGraph options
         self._recorded_cuda_graphs = dict()
 
@@ -423,11 +427,12 @@ class TensorCircuit(nn.Module):
         print(f"> Number of sum parameters: {self.num_sum_params}")
 
     def enable_partial_evaluation(self, scopes: Union[Sequence[BitSet],Sequence[int]], 
-                                  forward: bool = False, backward: bool = False):
-        raise NotImplementedError("To be updated")
-        
+                                  forward: bool = False, backward: bool = False, overwrite: bool = False):
         # Create scope2nid cache
         self._create_scope2nid_cache()
+
+        if not overwrite and (forward and self._fw_partial_eval_enabled or backward and self._bk_partial_eval_enabled):
+            raise RuntimeError("Partial evaluation already enabled, consider calling `disable_partial_evaluation` first.")
 
         if isinstance(scopes[0], int):
             scopes = [BitSet.from_array([var]) for var in scopes]
@@ -436,34 +441,33 @@ class TensorCircuit(nn.Module):
         bk_scopes = scopes if backward else None
 
         # Input layers
-        for layer in self.input_layers:
+        for layer in self.input_layer_group:
             layer.enable_partial_evaluation(fw_scopes = fw_scopes, bk_scopes = bk_scopes)
 
         # Inner layers
-        for layer in self.inner_layers:
-            layer.enable_partial_evaluation(fw_scopes = fw_scopes, bk_scopes = bk_scopes)
+        for layer_group in self.inner_layer_groups:
+            layer_group.enable_partial_evaluation(fw_scopes = fw_scopes, bk_scopes = bk_scopes)
+
+        if forward:
+            self._fw_partial_eval_enabled = True
 
         if backward:
-            scopes = set(scopes)
-            _pv_node_flows_mask = torch.zeros([self.num_nodes], dtype = torch.bool)
-            for ns in self.root_nodes:
-                if (ns.is_sum() or ns.is_input()) and ns.scope in scopes:
-                    sid, eid = ns._output_ind_range
-                    _pv_node_flows_mask[sid:eid] = True
-            self._pv_node_flows_mask = _pv_node_flows_mask.to(self.device)
+            self._bk_partial_eval_enabled = True
 
     def disable_partial_evaluation(self, forward: bool = True, backward: bool = True):
-        raise NotImplementedError("To be updated")
-
         # Input layers
-        for layer in self.input_layers:
+        for layer in self.input_layer_group:
             layer.disable_partial_evaluation(forward = forward, backward = backward)
 
         # Inner layers
-        for layer in self.inner_layers:
-            layer.disable_partial_evaluation(forward = forward, backward = backward)
+        for layer_group in self.inner_layer_groups:
+            layer_group.disable_partial_evaluation(forward = forward, backward = backward)
 
-        self._pv_node_flows_mask = None
+        if forward:
+            self._fw_partial_eval_enabled = False
+
+        if backward:
+            self._bk_partial_eval_enabled = False
 
     def _init_buffer(self, name: str, shape: Tuple, set_value: Optional[float] = None, check_device: bool = True):
         flag = False
@@ -772,19 +776,16 @@ class TensorCircuit(nn.Module):
         return signature2nodes
 
     def _create_scope2nid_cache(self):
-
-        raise NotImplementedError()
-
         # Input layers
         for idx, layer in enumerate(self.input_layer_group):
             layer._prepare_scope2nids()
 
         # Inner layers
         prod_scope_eleids = None
-        for layer in self.inner_layers:
-            if isinstance(layer, ProdLayer):
-                prod_scope_eleids = layer._prepare_scope2nids()
+        for layer_group in self.inner_layer_groups:
+            if layer_group.is_prod():
+                prod_scope_eleids = layer_group._prepare_scope2nids()
             else:
-                assert isinstance(layer, SumLayer)
+                assert layer_group.is_sum()
 
-                layer._prepare_scope2nids(prod_scope_eleids)
+                layer_group._prepare_scope2nids(prod_scope_eleids)
