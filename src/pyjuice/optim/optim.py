@@ -23,11 +23,11 @@ class CircuitOptimizer():
         self.lr = lr
         self.pseudocount = pseudocount
 
-    def zero_grad(self, flows_memory: float = 0.0):
+    def zero_grad(self):
         if self.base_optimizer is not None:
             self.base_optimizer.zero_grad()
 
-        self.pc._optim_hyperparams["flows_memory"] = flows_memory
+        self.pc.init_param_flows(flows_memory = 0.0)
 
     def step(self, closure = None):
         if self.base_optimizer is not None:
