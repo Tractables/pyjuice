@@ -23,6 +23,11 @@ from .compilation import get_sum_layer_forward_stats, sum_layer_forward_compilat
 
 class SumLayer(Layer, nn.Module):
 
+    BLOCK_SPARSE = 0
+    SPARSE = 1
+    PYTORCH = 2
+    STR2MODE = {"block_sparse": 0, "sparse": 1, "pytorch": 2}
+
     def __init__(self, nodes: Sequence[SumNodes], global_nid_start: int, 
                  global_pid_start: int, global_pfid_start: int, node2tiednodes: dict(),
                  layer_sparsity_tol: Optional[float] = None, 
@@ -291,6 +296,7 @@ class SumLayer(Layer, nn.Module):
                     element_mars, param_flows, 
                     chids = chids, parids = parids, parpids = parpids,
                     cs_group_size = cs_group_size,
+                    partition_id = partition_id,
                     allow_modify_flows = allow_modify_flows
                 )
 
@@ -308,6 +314,7 @@ class SumLayer(Layer, nn.Module):
                     element_mars, param_flows, 
                     chids = chids, parids = parids, parpids = parpids,
                     cs_group_size = cs_group_size, local_ids = local_ids,
+                    partition_id = partition_id,
                     allow_modify_flows = allow_modify_flows
                 )
 
@@ -349,33 +356,34 @@ class SumLayer(Layer, nn.Module):
         batch_size = node_mars.size(1)
 
         if mode is not None:
-            assert mode in ["block_sparse", "sparse"]
+            assert mode in STR2MODE
+            mode = self.STR2MODE[mode]
 
         elif params.dim() == 1 and self.group_size >= 16 and num_edges >= 16 and batch_size >= 16:
             # In this case, we should definitely use the block-sparse implementation
-            mode = "block_sparse"
+            mode = self.BLOCK_SPARSE
         elif self.group_size == 1 and num_edges < 16384:
             # In this case, we should definitely use the sparse implementation
-            mode = "sparse"
+            mode = self.SPARSE
         elif num_edges < 4:
             # In this case, the block-sparse kernel will have compilation issues
-            mode = "sparse"
+            mode = self.SPARSE
         else:
-            mode = "block_sparse"
+            mode = self.BLOCK_SPARSE
 
-        if mode == "block_sparse":
+        if mode == self.BLOCK_SPARSE:
             self._forward_block_sparse(
                 node_mars, element_mars, params, nids, cids, pids, local_ids,
                 partition_id = partition_id
             )
 
-        elif mode == "sparse":
+        elif mode == self.SPARSE:
             self._forward_sparse(
                 node_mars, element_mars, params, nids, cids, pids, local_ids,
                 partition_id = partition_id
             )
 
-        elif mode == "pytorch":
+        elif mode == self.PYTORCH:
             self._forward_pytorch(
                 node_mars, element_mars, params, nids, cids, pids, local_ids
             )
@@ -440,7 +448,7 @@ class SumLayer(Layer, nn.Module):
             emars = tl.load(emars_ptr, mask = mask_batch[None,:])
 
             emars_max = tl.max(emars, axis = 0)[None,:]
-            emars_sub = tl.exp(emars - emars_max)
+            emars_sub = tl.where(emars_max != -float("inf"), tl.exp(emars - emars_max), 0.0)
 
             if use_fp16 == 1:
                 # Built-in matmul kernel of triton + float16
@@ -528,7 +536,7 @@ class SumLayer(Layer, nn.Module):
             emars = tl.load(emars_ptr, mask = mask_batch[:,None])
 
             emars_max = tl.max(emars, axis = 1)
-            emars_sub = tl.exp(emars - emars_max[:,None])
+            emars_sub = tl.where(emars_max != -float("inf"), tl.exp(emars - emars_max), 0.0)
 
             if use_fp16 == 1:
                 # Simulated matmul kernel + float16
@@ -660,6 +668,35 @@ class SumLayer(Layer, nn.Module):
                 GROUP_SIZE_M = GROUP_SIZE_M,
                 use_fp16 = use_fp16
             )
+
+            # if node_mars.isnan().any():
+            #     import pdb; pdb.set_trace()
+
+            #     import numpy as np
+
+            #     np.savez("temp.npz",
+            #         node_mars = node_mars.detach().cpu().numpy(),
+            #         element_mars = element_mars.detach().cpu().numpy(),
+            #         params = params.detach().cpu().numpy(),
+            #         nids = nids.detach().cpu().numpy(),
+            #         cids = cids.detach().cpu().numpy(),
+            #         cids_start = cids_start.detach().cpu().numpy(),
+            #         cids_increment = cids_increment.detach().cpu().numpy(),
+            #         pids = pids.detach().cpu().numpy(),
+            #         pids_start = pids_start.detach().cpu().numpy(),
+            #         pids_increment = pids_increment.detach().cpu().numpy(),
+            #         batch_size = batch_size,
+            #         partial_eval = partial_eval,
+            #         BLOCK_B = BLOCK_B,
+            #         TILE_SIZE_K = TILE_SIZE_K,
+            #         K_NUM_TILES = K_NUM_TILES,
+            #         TILE_SIZE_M = TILE_SIZE_M,
+            #         GROUP_SIZE_M = GROUP_SIZE_M,
+            #         use_fp16 = use_fp16,
+            #         layer_n_nodes = layer_n_nodes
+            #     )
+
+            #     import numpy as np
 
         else:
             self._fw_triton_block_sparse_csmm_kernel[grid](
@@ -858,34 +895,36 @@ class SumLayer(Layer, nn.Module):
         batch_size = node_flows.size(1)
 
         if mode is not None:
-            assert mode in ["block_sparse", "sparse", "pytorch"]
+            assert mode in STR2MODE
+            mode = self.STR2MODE[mode]
+
         elif params.dim() == 1 and self.group_size >= 16 and num_edges >= 16 and batch_size >= 16:
             # In this case, we should definitely use the block-sparse implementation
-            mode = "block_sparse"
+            mode = self.BLOCK_SPARSE
         elif (cs_group_size == 1 or self.group_size == 1) and num_edges < 16384:
             # In this case, we should definitely use the sparse implementation
-            mode = "sparse"
+            mode = self.SPARSE
         elif num_edges < 4 or batch_size < 4:
             # In this case, the block-sparse kernel will have compilation issues
-            mode = "sparse"
+            mode = self.SPARSE
         else:
-            mode = "block_sparse"
+            mode = self.BLOCK_SPARSE
 
-        if mode == "block_sparse":
+        if mode == self.BLOCK_SPARSE:
             self._backward_block_sparse(
                 node_flows, element_flows, params, node_mars, element_mars, param_flows, 
                 nids, cids, pids, pfids, chids, parids, parpids, cs_group_size, local_ids, 
                 partition_id = partition_id, allow_modify_flows = allow_modify_flows
             )
 
-        elif mode == "sparse":
+        elif mode == self.SPARSE:
             self._backward_sparse(
                 node_flows, element_flows, params, node_mars, element_mars, param_flows, 
                 nids, cids, pids, pfids, chids, parids, parpids, cs_group_size, local_ids, 
                 partition_id = partition_id, allow_modify_flows = allow_modify_flows
             )
 
-        elif mode == "pytorch":
+        elif mode == self.PYTORCH:
             assert not allow_modify_flows, "Please set `allow_modify_flows` to False when " \
                                            "using the native PyTorch backward."
             self._backward_pytorch(
@@ -1122,14 +1161,11 @@ class SumLayer(Layer, nn.Module):
         base_size = min(self.group_size, num_edges, BATCH_SIZE_NP2, 64)
         if base_size >= 64:
             TILE_SIZE_K = min(2048 // 32, num_edges)
-            TILE_SIZE_M = min(2048 // TILE_SIZE_K, cs_group_size)
-            BLOCK_B = min(2048 // TILE_SIZE_K, BATCH_SIZE_NP2)
         else:
             remainder = 2048 // (base_size ** 2)
-
             TILE_SIZE_K = min(512, base_size * remainder, num_edges)
-            TILE_SIZE_M = min(2048 // TILE_SIZE_K, cs_group_size)
-            BLOCK_B = min(2048 // TILE_SIZE_K, BATCH_SIZE_NP2)
+        TILE_SIZE_M = min(2048 // TILE_SIZE_K, cs_group_size)
+        BLOCK_B = min(2048 // TILE_SIZE_K, BATCH_SIZE_NP2)
         K_NUM_TILES = num_edges // TILE_SIZE_K
 
         assert TILE_SIZE_K >= 4, f"`TILE_SIZE_K` should be greater than 4 (but got {TILE_SIZE_K}) in order to use the block-sparse kernel. " \
