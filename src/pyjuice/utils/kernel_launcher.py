@@ -25,9 +25,6 @@ class FastJITFunction():
         def wrapper(*args, **kwargs):
             signature_list = list()
 
-            device_id = torch.cuda.current_device()
-            signature_list.append(device_id)
-
             for i in self.constexpr_ids:
                 if i >= len(args):
                     break
