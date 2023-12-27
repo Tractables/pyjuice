@@ -1074,6 +1074,13 @@ class SumLayer(Layer, nn.Module):
                 tl.log(tl.exp(log_n_fdm_max[None,:] - acc) * partial_flows + 1.0) + acc
             )
             acc = tl.where(neginf_flag, -float("inf"), acc)
+            # acc = tl.where(log_n_fdm_max[None,:] == acc,
+            #     acc + 0.69314718056, # log(2)
+            #     tl.where(log_n_fdm_max[None,:] > acc,
+            #         tl.log(partial_flows + tl.exp(acc - log_n_fdm_max[None,:])) + log_n_fdm_max[None,:],
+            #         tl.log(tl.exp(log_n_fdm_max[None,:] - acc) * partial_flows + 1.0) + acc
+            #     )
+            # )
 
             # Increment `epars_ptr`
             parpids_inc = tl.load(parpids_inc_ptr)
@@ -1113,16 +1120,16 @@ class SumLayer(Layer, nn.Module):
 
         # Heuristic to set `TILE_SIZE_M`, `TILE_SIZE_K`, and `BLOCK_B`
         base_size = min(self.group_size, num_edges, BATCH_SIZE_NP2, 64)
-        if base_size >= 32:
-            TILE_SIZE_K = base_size
-            TILE_SIZE_M = 1024 // base_size
-            BLOCK_B = 1024 // base_size
+        if base_size >= 64:
+            TILE_SIZE_K = min(2048 // 32, num_edges)
+            TILE_SIZE_M = min(2048 // TILE_SIZE_K, cs_group_size)
+            BLOCK_B = min(2048 // TILE_SIZE_K, BATCH_SIZE_NP2)
         else:
-            remainder = 1024 // (base_size ** 2)
+            remainder = 2048 // (base_size ** 2)
 
-            TILE_SIZE_K = min(1024 // remainder, base_size * remainder, num_edges)
-            TILE_SIZE_M = min(1024 // TILE_SIZE_K, cs_group_size)
-            BLOCK_B = min(1024 // TILE_SIZE_K, BATCH_SIZE_NP2)
+            TILE_SIZE_K = min(512, base_size * remainder, num_edges)
+            TILE_SIZE_M = min(2048 // TILE_SIZE_K, cs_group_size)
+            BLOCK_B = min(2048 // TILE_SIZE_K, BATCH_SIZE_NP2)
         K_NUM_TILES = num_edges // TILE_SIZE_K
 
         assert TILE_SIZE_K >= 4, f"`TILE_SIZE_K` should be greater than 4 (but got {TILE_SIZE_K}) in order to use the block-sparse kernel. " \
@@ -1194,7 +1201,9 @@ class SumLayer(Layer, nn.Module):
             K_NUM_TILES = K_NUM_TILES,
             TILE_SIZE_M = TILE_SIZE_M, 
             GROUP_SIZE_M = GROUP_SIZE_M,
-            GROUP_SIZE_K = GROUP_SIZE_K
+            GROUP_SIZE_K = GROUP_SIZE_K,
+            num_warps = 2, # TODO: test for different devices
+            num_stages = 2
         )
 
         return None
@@ -1301,17 +1310,14 @@ class SumLayer(Layer, nn.Module):
         BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
 
         # Heuristic to set `TILE_SIZE_M`, `TILE_SIZE_K`, and `BLOCK_B`
-        base_size = min(self.group_size, num_edges, BATCH_SIZE_NP2, 64)
+        base_size = min(self.group_size, num_edges, BATCH_SIZE_NP2)
         if base_size >= 64:
-            TILE_SIZE_B = base_size
-            TILE_SIZE_M = 2048 // base_size
-            TILE_SIZE_K = 2048 // base_size
+            TILE_SIZE_B = min(2048 // 32, BATCH_SIZE_NP2)
         else:
             remainder = 2048 // (base_size ** 2)
-
             TILE_SIZE_B = min(2048 // remainder, base_size * remainder, BATCH_SIZE_NP2)
-            TILE_SIZE_M = min(2048 // TILE_SIZE_B, self.group_size)
-            TILE_SIZE_K = min(2048 // TILE_SIZE_B, num_edges)
+        TILE_SIZE_M = min(2048 // TILE_SIZE_B, self.group_size)
+        TILE_SIZE_K = min(2048 // TILE_SIZE_B, num_edges)
         B_NUM_TILES = batch_size // TILE_SIZE_B
 
         allow_modify_flows = 1 if allow_modify_flows else 0
@@ -1339,7 +1345,9 @@ class SumLayer(Layer, nn.Module):
             B_NUM_TILES = B_NUM_TILES, 
             TILE_SIZE_K = TILE_SIZE_K, 
             TILE_SIZE_M = TILE_SIZE_M, 
-            GROUP_SIZE_M = self.group_size
+            GROUP_SIZE_M = self.group_size,
+            num_warps = 4, # TODO: test for different devices
+            num_stages = 3
         )
 
     def _backward_sparse(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
