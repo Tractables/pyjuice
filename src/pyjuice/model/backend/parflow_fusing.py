@@ -5,6 +5,8 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
+from pyjuice.utils.kernel_launcher import FastJITFunction
+
 
 def compile_cum_par_flows_fn(node2tiednodes, MAX_NGROUPS = 2048, BLOCK_SIZE = 2048):
 
@@ -75,17 +77,18 @@ def cum_par_flows_to_device(kernels_args, device):
     return kernels_args
 
 
-@triton.jit
+# @triton.jit
+@FastJITFunction
 def cum_par_flows_kernel(param_flows, target_pfids, block_sizes, ch_pfids, BLOCK_G: tl.constexpr, BLOCK_M: tl.constexpr):
 
     pid = tl.program_id(axis = 0)
 
     offs_g = tl.arange(0, BLOCK_G) + pid * BLOCK_G
-    offs_chblk = tl.load(ch_pfids + offs_chblk)
+    offs_chblk = tl.load(ch_pfids + offs_g)
     mask_chblk = offs_chblk >= 0
 
     block_size = tl.load(block_sizes + pid)
-    offs_m = tl.arange(0, BLOCK_M)[None,:]
+    offs_m = tl.arange(0, BLOCK_M)
     mask_m = offs_m < block_size
 
     offs_chs = offs_chblk[:,None] + tl.arange(0, BLOCK_M)[None,:]
