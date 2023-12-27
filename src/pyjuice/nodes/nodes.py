@@ -164,7 +164,7 @@ class CircuitNodes():
         return self._source_node is not None
 
     def get_source_ns(self):
-        return self._source_node
+        return self._source_node if self.is_tied() else self
 
     def set_source_ns(self, source_ns: CircuitNodes):
         assert type(source_ns) == type(self), f"Node type of the source ns ({type(source_ns)}) does not match that of self ({type(self)})."
