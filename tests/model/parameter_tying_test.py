@@ -612,4 +612,3 @@ if __name__ == "__main__":
     torch.manual_seed(2390)
     simple_structure_test_group1()
     simple_structure_test_group16()
-

@@ -251,7 +251,8 @@ class InputLayer(Layer, nn.Module):
                 nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
                 node_offset = node_offset, 
                 BLOCK_SIZE = 1024, 
-                partial_eval = 1 if fw_local_ids is not None else 0
+                partial_eval = 1 if fw_local_ids is not None else 0,
+                num_warps = 8
             )
 
             # Apply missing mask if required
@@ -271,7 +272,8 @@ class InputLayer(Layer, nn.Module):
                     node_offset = node_offset, 
                     BLOCK_SIZE = 1024, 
                     partial_eval = 1 if fw_local_ids is not None else 0,
-                    mask_dim = mask_dim
+                    mask_dim = mask_dim,
+                    num_warps = 8
                 )
 
         else:
@@ -329,7 +331,8 @@ class InputLayer(Layer, nn.Module):
                 nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
                 node_offset = node_offset, 
                 BLOCK_SIZE = 1024, 
-                partial_eval = 1 if bk_local_ids is not None else 0
+                partial_eval = 1 if bk_local_ids is not None else 0,
+                num_warps = 8
             )
 
         else:

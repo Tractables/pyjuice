@@ -109,21 +109,21 @@ def pd_test():
     #     lls.mean().backward()
     #     break
 
-    # from torch.profiler import profile, record_function, ProfilerActivity
-    # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], with_stack = True) as prof:
-    #     for i, batch in enumerate(train_loader):
-    #         x = batch[0].to(device)
+    from torch.profiler import profile, record_function, ProfilerActivity
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], with_stack = True) as prof:
+        for i, batch in enumerate(train_loader):
+            x = batch[0].to(device)
 
-    #         lls = pc(x, record_cudagraph = False)
-    #         lls.mean().backward()
-    #         if i > 10:
-    #             break
+            lls = pc(x, record_cudagraph = False)
+            lls.mean().backward()
+            if i > 10:
+                break
 
-    # prof.export_chrome_trace("trace3.json")
-    # # torch.autograd.profiler.tensorboard_trace_to_flame_graph('trace.json', 'flamegraph.svg')
-    # # prof.export_stacks("trace.txt", "cpu_time_total")
-    # import pdb; pdb.set_trace()
-    # exit()
+    prof.export_chrome_trace("trace3.json")
+    # torch.autograd.profiler.tensorboard_trace_to_flame_graph('trace.json', 'flamegraph.svg')
+    # prof.export_stacks("trace.txt", "cpu_time_total")
+    import pdb; pdb.set_trace()
+    exit()
 
     mini_batch_em_epoch(350, pc, optimizer, None, train_loader, test_loader, device)
     full_batch_em_epoch(pc, train_loader, test_loader, device)
