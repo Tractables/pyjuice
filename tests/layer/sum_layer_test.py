@@ -217,7 +217,7 @@ def speed_test():
     backward_ms = (t1 - t0) / 100 * 1000
 
     print(f"Backward pass on average takes {backward_ms:.3f}ms.")
-    print("Reference computation time on RTX 4090: 2.175ms.")
+    print("Reference computation time on RTX 4090: 1.544ms.")
     print("--------------------------------------------------------------")
 
 
