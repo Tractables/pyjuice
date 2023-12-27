@@ -355,30 +355,26 @@ class ProdLayer(Layer, nn.Module):
         offs_egstart = tl.load(cids_ptr + ngroup_id * num_edges + offs_edge) # [num_edges]
 
         # Base ptr for ch values
-        evals_ptr = element_vals_ptr + \
-            (offs_egstart[:,None] + ntile_id * BLOCK_M) * batch_size + \
-            offs_batch[None,:] # [num_edges, BLOCK_B]
+        offs_evals = (offs_egstart[:,None] + ntile_id * BLOCK_M) * batch_size + offs_batch[None,:] # [num_edges, BLOCK_B]
 
         # Base ptr for par values
         ngroup_start = tl.load(nids_ptr + ngroup_id)
-        nvals_ptr = node_vals_ptr + \
-            (ngroup_start + ntile_id * BLOCK_M) * batch_size + \
-            offs_batch
+        offs_nvals = (ngroup_start + ntile_id * BLOCK_M) * batch_size + offs_batch # [BLOCK_B]
 
         # Inner loop
         for i in range(0, BLOCK_M):
-            evals = tl.load(evals_ptr, mask = mask_batch[None,:], other = 0)
+            evals = tl.load(element_vals_ptr + offs_evals, mask = mask_batch[None,:], other = 0)
             nvals = tl.sum(evals, axis = 0)
 
             # Accumulate the `node_vals` if required
             if accum == 1:
-                node_vals = tl.load(nvals_ptr, mask = mask_batch)
+                node_vals = tl.load(node_vals_ptr + offs_nvals, mask = mask_batch)
                 nvals += node_vals
 
-            tl.store(nvals_ptr, nvals, mask = mask_batch)
+            tl.store(node_vals_ptr + offs_nvals, nvals, mask = mask_batch)
 
-            nvals_ptr += batch_size
-            evals_ptr += batch_size
+            offs_nvals += batch_size
+            offs_evals += batch_size
 
     @staticmethod
     @torch.compile(mode = "reduce-overhead", fullgraph = True)
@@ -415,8 +411,8 @@ class ProdLayer(Layer, nn.Module):
 
         if not triton.__version__ == "2.0.0":
 
-            BLOCK_B = min(1024 // num_edges, triton.next_power_of_2(batch_size))
-            BLOCK_M = min(max(1024 // (BLOCK_B * num_edges), 1), self.group_size)
+            BLOCK_B = min(2048 // num_edges, triton.next_power_of_2(batch_size))
+            BLOCK_M = min(max(2048 // (BLOCK_B * num_edges), 1), self.group_size)
 
             grid = (triton.cdiv(n_ngroups * self.group_size, BLOCK_M), triton.cdiv(batch_size, BLOCK_B))
 
