@@ -92,7 +92,7 @@ def PD(data_shape: Tuple, num_latents: int,
     def create_input_ns(hypercube):
         scope = hypercube2scope(hypercube)
         if input_layer_fn is not None:
-            return input_layer_fn(scope, num_latents)
+            return input_layer_fn(scope, num_latents, group_size)
         else:
             input_nodes = []
             for var in scope:
@@ -160,7 +160,8 @@ def PDHCLT(data: torch.Tensor, data_shape: Tuple, num_latents: int,
            structure_type: str = "sum_dominated",
            input_layer_type: Type[Distribution] = Categorical, 
            input_layer_params: Dict = {"num_cats": 256},
-           hclt_kwargs: Dict = {"num_bins": 32, "sigma": 0.5 / 32, "chunk_size": 32}):
+           hclt_kwargs: Dict = {"num_bins": 32, "sigma": 0.5 / 32, "chunk_size": 32},
+           group_size: Optional[int] = None):
 
     assert data.dim() == 2
     assert data.size(1) == reduce(lambda x, y: x * y, data_shape)
@@ -186,7 +187,8 @@ def PDHCLT(data: torch.Tensor, data_shape: Tuple, num_latents: int,
             split_intervals = split_intervals, split_points = split_points,
             max_split_depth = max_split_depth, max_prod_group_conns = max_prod_group_conns,
             structure_type = structure_type, input_layer_fn = input_layer_fn,
-            input_layer_type = input_layer_type, input_layer_params = input_layer_params)
+            input_layer_type = input_layer_type, input_layer_params = input_layer_params,
+            group_size = group_size)
 
     if ns.num_node_groups > 1:
         ns = summate(*ns.chs, num_node_groups = 1, group_size = 1)
