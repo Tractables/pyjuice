@@ -166,7 +166,7 @@ def PDHCLT(data: torch.Tensor, data_shape: Tuple, num_latents: int,
     assert data.dim() == 2
     assert data.size(1) == reduce(lambda x, y: x * y, data_shape)
 
-    def input_layer_fn(scope, num_latents):
+    def input_layer_fn(scope, num_latents, group_size):
         vars = torch.tensor(scope.to_list()).sort().values
         ns = HCLT(
             x = data[:,vars], 
@@ -174,6 +174,7 @@ def PDHCLT(data: torch.Tensor, data_shape: Tuple, num_latents: int,
             input_layer_type = input_layer_type,
             input_layer_params = input_layer_params,
             num_root_ns = num_latents,
+            group_size = group_size,
             **hclt_kwargs
         )
 
