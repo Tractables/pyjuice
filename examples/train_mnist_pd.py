@@ -65,7 +65,7 @@ def full_batch_em_epoch(pc, train_loader, test_loader, device):
         print(f"[train LL: {train_ll:.2f}; test LL: {test_ll:.2f}].....[train forward+backward+step {t1-t0:.2f}; test forward {t2-t1:.2f}] ")
 
 
-def pd_test():
+def train_mnist_pd():
 
     device = torch.device("cuda:0")
 
@@ -102,34 +102,9 @@ def pd_test():
 
     optimizer = juice.optim.CircuitOptimizer(pc, lr = 0.1, pseudocount = 0.0001)
 
-    # for batch in train_loader:
-    #     x = batch[0].to(device)
-
-    #     lls = pc(x, record_cudagraph = True)
-    #     lls.mean().backward()
-    #     break
-
-    # from torch.profiler import profile, record_function, ProfilerActivity
-    # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], with_stack = True) as prof:
-    #     for i, batch in enumerate(train_loader):
-    #         x = batch[0].to(device)
-
-    #         lls = pc(x, record_cudagraph = False)
-    #         lls.mean().backward()
-    #         pc.mini_batch_em(step_size = 0.1, pseudocount = 0.01)
-    #         if i > 10:
-    #             break
-
-    # prof.export_chrome_trace("trace3.json")
-    # # torch.autograd.profiler.tensorboard_trace_to_flame_graph('trace.json', 'flamegraph.svg')
-    # # prof.export_stacks("trace.txt", "cpu_time_total")
-    # import pdb; pdb.set_trace()
-    # exit()
-
     mini_batch_em_epoch(350, pc, optimizer, None, train_loader, test_loader, device)
     full_batch_em_epoch(pc, train_loader, test_loader, device)
 
 
 if __name__ == "__main__":
-    torch.manual_seed(2391)
-    pd_test()
+    train_mnist_pd()
