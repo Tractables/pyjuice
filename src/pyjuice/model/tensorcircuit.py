@@ -104,7 +104,7 @@ class TensorCircuit(nn.Module):
         
     def forward(self, inputs: torch.Tensor, input_layer_fn: Optional[Union[str,Callable]] = None,
                 cache: Optional[dict] = None, return_cache: bool = False, record_cudagraph: bool = False, 
-                apply_cudagraph: bool = True, **kwargs):
+                apply_cudagraph: bool = True, force_use_fp16: bool = False, force_use_fp32: bool = False, **kwargs):
         """
         Forward the circuit.
 
@@ -157,7 +157,9 @@ class TensorCircuit(nn.Module):
 
                     elif layer_group.is_sum():
                         # Sum layer
-                        layer_group(self.node_mars, self.element_mars, self.params)
+                        layer_group(self.node_mars, self.element_mars, self.params, 
+                                    force_use_fp16 = force_use_fp16, 
+                                    force_use_fp32 = force_use_fp32)
 
                     else:
                         raise ValueError(f"Unknown layer type {type(layer)}.")
