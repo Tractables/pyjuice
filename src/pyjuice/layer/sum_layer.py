@@ -370,9 +370,9 @@ class SumLayer(Layer, nn.Module):
         elif (self.group_size == 1 and num_edges < 16384) or num_edges < 4:
             # In this case, we should definitely use the sparse implementation
             mode = self.SPARSE
-        # elif self.group_size < 8:
-        #     # TODO: remove this when `triton` has fixed its bug
-        #     mode = self.SPARSE
+        elif self.group_size * batch_size < 32:
+            # Advantage of block-sparse processing is diminishing
+            mode = self.SPARSE
         else:
             mode = self.BLOCK_SPARSE
 
@@ -979,8 +979,8 @@ class SumLayer(Layer, nn.Module):
         elif (cs_group_size == 1 or self.group_size == 1) and num_edges < 16384:
             # In this case, we should definitely use the sparse implementation
             mode = self.SPARSE
-        elif num_edges < 4 or batch_size < 4:
-            # In this case, the block-sparse kernel will have compilation issues
+        elif self.group_size * batch_size < 32:
+            # Advantage of block-sparse processing is diminishing
             mode = self.SPARSE
         else:
             mode = self.BLOCK_SPARSE
