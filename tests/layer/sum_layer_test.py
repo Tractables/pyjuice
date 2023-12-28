@@ -42,7 +42,7 @@ def sum_layer_test():
 
     layer = SumLayer([ns0, ns1, ns2], global_nid_start = group_size,
                      global_pid_start = group_size ** 2, 
-                     global_pfid_start = 0, node2tiednodes = dict(), )
+                     global_pfid_start = 0, node2tiednodes = dict())
 
     assert torch.all(layer.partitioned_nids[0] == torch.arange(group_size, 7 * group_size, group_size))
     assert torch.all(layer.partitioned_cids[0][0:2,0] == group_size)
@@ -141,6 +141,145 @@ def sum_layer_test():
     assert torch.all(torch.abs(my_pflows - param_flows) < 2e-3)
 
 
+def corner_case_test():
+
+    device = torch.device("cuda:0")
+
+    group_sizes = [2, 4, 4,  4, 8,  8, 16, 32, 32, 32]
+    batch_sizes = [4, 4, 8, 16, 8, 16,  8,  8, 16, 32]
+    
+    for group_size, batch_size in zip(group_sizes, batch_sizes):
+        for force_use_fp16, force_use_fp32 in ((False, False), (True, False), (False, True)):
+    
+            with juice.set_group_size(group_size):
+
+                ni0 = inputs(0, num_node_groups = 2, dist = dists.Categorical(num_cats = 2))
+                ni1 = inputs(1, num_node_groups = 2, dist = dists.Categorical(num_cats = 2))
+                ni2 = inputs(2, num_node_groups = 2, dist = dists.Categorical(num_cats = 2))
+                ni3 = inputs(3, num_node_groups = 2, dist = dists.Categorical(num_cats = 2))
+
+                np0 = multiply(ni0, ni1)
+                np1 = multiply(ni2, ni3)
+                np2 = multiply(ni1, ni2)
+
+                ns0 = summate(np0, num_node_groups = 2)
+                ns1 = summate(np1, num_node_groups = 2)
+                ns2 = summate(np2, num_node_groups = 2)
+
+            input_layer = InputLayer([ni0, ni1, ni2, ni3], cum_nodes = group_size)
+
+            prod_layer = ProdLayer([np0, np1, np2])
+
+            layer = SumLayer([ns0, ns1, ns2], global_nid_start = group_size,
+                            global_pid_start = group_size ** 2, 
+                            global_pfid_start = 0, node2tiednodes = dict())
+
+            ## Compilation tests ##
+
+            assert torch.all(layer.partitioned_nids[0] == torch.arange(group_size, group_size * 7, group_size))
+
+            assert torch.all(layer.partitioned_cids[0][0,:] == torch.arange(group_size, group_size * 3))
+            assert torch.all(layer.partitioned_cids[0][1,:] == torch.arange(group_size, group_size * 3))
+            assert torch.all(layer.partitioned_cids[0][2,:] == torch.arange(group_size * 3, group_size * 5))
+            assert torch.all(layer.partitioned_cids[0][3,:] == torch.arange(group_size * 3, group_size * 5))
+            assert torch.all(layer.partitioned_cids[0][4,:] == torch.arange(group_size * 5, group_size * 7))
+            assert torch.all(layer.partitioned_cids[0][5,:] == torch.arange(group_size * 5, group_size * 7))
+
+            assert torch.all(layer.partitioned_pids[0][0,:] == torch.arange(group_size**2, group_size**2 * 3, group_size))
+            assert torch.all(layer.partitioned_pids[0][1,:] == torch.arange(group_size**2 * 3, group_size**2 * 5, group_size))
+            assert torch.all(layer.partitioned_pids[0][2,:] == torch.arange(group_size**2 * 5, group_size**2 * 7, group_size))
+            assert torch.all(layer.partitioned_pids[0][3,:] == torch.arange(group_size**2 * 7, group_size**2 * 9, group_size))
+            assert torch.all(layer.partitioned_pids[0][4,:] == torch.arange(group_size**2 * 9, group_size**2 * 11, group_size))
+            assert torch.all(layer.partitioned_pids[0][5,:] == torch.arange(group_size**2 * 11, group_size**2 * 13, group_size))
+
+            assert torch.all(layer.partitioned_pfids[0][0,:] == torch.arange(0, group_size**2 * 2, group_size))
+            assert torch.all(layer.partitioned_pfids[0][1,:] == torch.arange(group_size**2 * 2, group_size**2 * 4, group_size))
+            assert torch.all(layer.partitioned_pfids[0][2,:] == torch.arange(group_size**2 * 4, group_size**2 * 6, group_size))
+            assert torch.all(layer.partitioned_pfids[0][3,:] == torch.arange(group_size**2 * 6, group_size**2 * 8, group_size))
+            assert torch.all(layer.partitioned_pfids[0][4,:] == torch.arange(group_size**2 * 8, group_size**2 * 10, group_size))
+            assert torch.all(layer.partitioned_pfids[0][5,:] == torch.arange(group_size**2 * 10, group_size**2 * 12, group_size))
+
+            assert torch.all(layer.partitioned_chids[0] == torch.arange(group_size, group_size * 7, group_size))
+
+            assert torch.all(layer.partitioned_parids[0][0,:] == torch.tensor([group_size, group_size * 2]))
+            assert torch.all(layer.partitioned_parids[0][1,:] == torch.tensor([group_size, group_size * 2]))
+            assert torch.all(layer.partitioned_parids[0][2,:] == torch.tensor([group_size * 3, group_size * 4]))
+            assert torch.all(layer.partitioned_parids[0][3,:] == torch.tensor([group_size * 3, group_size * 4]))
+            assert torch.all(layer.partitioned_parids[0][4,:] == torch.tensor([group_size * 5, group_size * 6]))
+            assert torch.all(layer.partitioned_parids[0][5,:] == torch.tensor([group_size * 5, group_size * 6]))
+
+            assert torch.all(layer.partitioned_parpids[0][0,:] == torch.tensor([group_size**2 * 1, group_size**2 * 3]))
+            assert torch.all(layer.partitioned_parpids[0][1,:] == torch.tensor([group_size**2 * 2, group_size**2 * 4]))
+            assert torch.all(layer.partitioned_parpids[0][2,:] == torch.tensor([group_size**2 * 5, group_size**2 * 7]))
+            assert torch.all(layer.partitioned_parpids[0][3,:] == torch.tensor([group_size**2 * 6, group_size**2 * 8]))
+            assert torch.all(layer.partitioned_parpids[0][4,:] == torch.tensor([group_size**2 * 9, group_size**2 * 11]))
+            assert torch.all(layer.partitioned_parpids[0][5,:] == torch.tensor([group_size**2 * 10, group_size**2 * 12]))
+
+            layer.to(device)
+
+            ## Forward tests ##
+
+            element_mars = torch.rand([group_size + 3 * 2 * 2 * group_size, batch_size]).log().to(device)
+            element_mars[:group_size,:] = -float("inf")
+            node_mars = torch.zeros([group_size + group_size * 2 * 3, batch_size]).to(device)
+
+            params = torch.rand([group_size ** 2 + 3 * 4 * group_size * group_size]).to(device)
+
+            layer(node_mars, element_mars, params, force_use_fp16 = force_use_fp16, force_use_fp32 = force_use_fp32)
+
+            for i in range(group_size):
+                for j in range(6):
+                    cmars = element_mars[layer.partitioned_cids[0][j,:]].exp()
+                    epars = params[layer.partitioned_pids[0][j,:]+i]
+                    assert torch.all(torch.abs(node_mars[(j+1)*group_size+i,:] - (epars[:,None] * cmars).sum(dim = 0).log()) < 2e-3)
+
+            ## Backward tests ##
+
+            node_flows = torch.rand([group_size + group_size * 2 * 3, batch_size]).to(device)
+            element_flows = torch.zeros([group_size + 3 * 2 * 2 * group_size, batch_size]).to(device)
+
+            param_flows = torch.zeros([group_size ** 2 + 3 * 4 * group_size * group_size]).to(device)
+
+            layer.backward(node_flows, element_flows, node_mars, element_mars, params, param_flows)
+
+            chids = layer.partitioned_chids[0]
+            parids = layer.partitioned_parids[0]
+            parpids = layer.partitioned_parpids[0]
+
+            num_ngroups = chids.size(0)
+            num_egroups = parids.size(1)
+            parids = (parids[:,:,None].repeat(1, 1, group_size) + torch.arange(0, group_size, device = parids.device)).reshape(num_ngroups, num_egroups * group_size)
+            parpids_start = (parpids[:,:,None] + torch.arange(0, group_size, device = parids.device)).reshape(
+                num_ngroups, num_egroups * group_size)
+
+            for j in range(6):
+                parpids = parpids_start.clone()
+                for i in range(group_size):
+                    nmars = node_mars[parids[j,:]].exp()
+                    nflows = node_flows[parids[j,:]]
+                    emars = element_mars[(j+1)*group_size+i,:].exp()
+                    epars = params[parpids[j,:]]
+                    eflows = (nflows * epars[:,None] * emars[None,:] / nmars).sum(dim = 0)
+
+                    assert torch.all(torch.abs(eflows - element_flows[(j+1)*group_size+i,:]) < 1e-2)
+
+                    parpids += group_size
+
+            my_pflows = torch.zeros_like(param_flows)
+
+            for i in range(group_size):
+                for j in range(6):
+                    emars = element_mars[layer.partitioned_cids[0][j,:]].exp()
+                    epars = params[layer.partitioned_pids[0][j,:]+i]
+                    nmars = node_mars[(j+1)*group_size+i,:].exp()
+                    nflows = node_flows[(j+1)*group_size+i,:]
+                    pflows = epars * (nflows[None,:] * emars / nmars[None,:]).sum(dim = 1)
+
+                    my_pflows[layer.partitioned_pfids[0][j,:]+i] = pflows
+
+            assert torch.all(torch.abs(my_pflows - param_flows) < 2e-3)
+
+
 def speed_test():
 
     device = torch.device("cuda:0")
@@ -223,5 +362,6 @@ def speed_test():
 
 if __name__ == "__main__":
     torch.manual_seed(3890)
-    sum_layer_test()
-    speed_test()
+    # sum_layer_test()
+    corner_case_test()
+    # speed_test()
