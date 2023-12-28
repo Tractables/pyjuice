@@ -413,7 +413,7 @@ class InputLayer(Layer, nn.Module):
                                 num_coalesced_groups = num_coalesced_groups,
                                 num_par_flows = num_par_flows,
                                 BLOCK_M = BLOCK_M,
-                                BLOCK_N = BLOCK_N,
+                                BLOCK_N = BLOCK_N
                             )
                         else:
                             raise NotImplementedError("Unsupported number of coalesced parameter flows.")
@@ -438,7 +438,8 @@ class InputLayer(Layer, nn.Module):
                         source_nids_ptr = self.source_nids,
                         constexprs_ptr = constexprs,
                         layer_num_source_nodes = layer_num_source_nodes,
-                        BLOCK_SIZE = 1024
+                        BLOCK_SIZE = 1024,
+                        num_warps = 8
                     )
 
                 else:
