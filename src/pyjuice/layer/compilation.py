@@ -186,9 +186,9 @@ def _assign_chid_kernel(chs_offsets, ns_nchs, edge_ids):
 def _assign_target_ncpids_kernel(target_nids_ptr, nids_partition_start_ptr, target_cids_ptr, pcids_partition_start_ptr,
                                  target_pids_ptr, target_pfids_ptr, edge_ids_ptr, chs_offsets_ptr, n_partition_ids_ptr, 
                                  n_id_in_partition_ptr, cs_ele_id_start_ptr, cs_node_cum_ids_ptr, fw_partition_max_chs_ptr, 
-                                 cum_n_chs_ptr, ns_param_ids_ptr, ns_param_flow_ids_ptr, constexprs_ptr, num_chs: tl.constexpr, 
-                                 num_chs_np2: tl.constexpr, add_params_flag: tl.constexpr, add_param_flows_flag: tl.constexpr, 
-                                 BLOCK_SIZE: tl.constexpr):
+                                 cum_n_chs_ptr, ns_param_ids_ptr, ns_param_flow_ids_ptr, cid_node_id_ptr, constexprs_ptr, 
+                                 num_chs: tl.constexpr, num_chs_np2: tl.constexpr, add_params_flag: tl.constexpr, 
+                                 add_param_flows_flag: tl.constexpr, BLOCK_SIZE: tl.constexpr):
 
     pid = tl.program_id(axis = 0)
     block_start = pid * BLOCK_SIZE
@@ -217,9 +217,8 @@ def _assign_target_ncpids_kernel(target_nids_ptr, nids_partition_start_ptr, targ
     cs_offsets = tl.arange(0, num_chs_np2)
     cs_node_cum_ids = tl.load(cs_node_cum_ids_ptr + cs_offsets, mask = (cs_offsets < num_chs), other = 0)
     
-    cid_node_id = tl.sum(tl.broadcast_to(cid[:,None], (BLOCK_SIZE, num_chs_np2)) >= \
-        tl.broadcast_to(cs_node_cum_ids[None,:], (BLOCK_SIZE, num_chs_np2)), axis = 1) - \
-        (1 + num_chs_np2 - num_chs)
+    # Get the `cs` indices the edges belong to
+    cid_node_id = tl.load(cid_node_id_ptr + offsets, mask = mask, other = 0)
 
     cs_cum_num = tl.load(cs_node_cum_ids_ptr + cid_node_id, mask = mask, other = 0)
     cs_ele_ind = tl.load(cs_ele_id_start_ptr + cid_node_id, mask = mask, other = 0)
@@ -438,6 +437,9 @@ def sum_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, 
             cum_n_chs = cum_n_chs.to(device)
             pcids_partition_start = pcids_partition_start.to(device)
 
+            # Which `cs` are the edges pointing to
+            cid_node_id = (edge_ids[1,:].unsqueeze(1) >= cs_node_cum_ids[None,:]).sum(dim = 1) - 1
+
             # We store these constants in a tensor and retrieve them in the kernel
             # This is to avoid `triton` from compiling separate kernels for every layer configuration
             # Saves 99.9% compilation time :)
@@ -452,7 +454,7 @@ def sum_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, 
                 target_nids, nids_partition_start, target_cids, pcids_partition_start,
                 target_pids, target_pfids, edge_ids, chs_offsets, n_partition_ids, 
                 n_id_in_partition, cs_ele_id_start, cs_node_cum_ids, fw_partition_max_chs, 
-                cum_n_chs, ns_param_ids, ns_param_flow_ids, constexprs, ns.num_chs, num_chs_np2, 
+                cum_n_chs, ns_param_ids, ns_param_flow_ids, cid_node_id, constexprs, ns.num_chs, num_chs_np2, 
                 add_params_flag, add_param_flows_flag, BLOCK_SIZE = min(2048, 2**20 // num_chs_np2)
             )
 
