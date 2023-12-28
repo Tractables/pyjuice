@@ -72,7 +72,10 @@ def BayesianTreeToHiddenRegionGraph(tree: nx.Graph,
                 rp = multiply(*ch_regions)
 
                 if v == root:
-                    r = summate(rp, num_node_groups = num_root_ns, group_size = 1)
+                    if group_size == 1:
+                        r = summate(rp, num_node_groups = num_root_ns, group_size = 1)
+                    else:
+                        r = summate(rp, num_node_groups = num_root_ns // group_size, group_size = group_size)
                 else:
                     r = summate(rp, num_node_groups = num_node_groups)
 
