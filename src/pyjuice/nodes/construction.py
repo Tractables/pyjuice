@@ -52,7 +52,7 @@ def multiply(nodes1: ProdNodesChs, *args, edge_ids: Optional[Tensor] = None, **k
     for nodes in args:
         assert isinstance(nodes, SumNodes) or isinstance(nodes, InputNodes), f"Children of product nodes must be input or sum nodes, but found input of type {type(nodes)}."
         if edge_ids is None:
-            assert nodes.num_node_groups == num_node_groups, "Input nodes should have the same `num_node_groups`."
+            assert nodes.num_node_groups == num_node_groups, f"Input nodes should have the same `num_node_groups`, but got {nodes.num_node_groups} and {num_node_groups}."
         assert nodes.group_size == group_size, "Input nodes should have the same `num_node_groups`."
         assert len(nodes.scope & scope) == 0, "Children of a `ProdNodes` should have disjoint scopes."
         chs.append(nodes)
