@@ -59,10 +59,10 @@ def deserialize_nodes(nodes_list: Sequence):
             scope = ns_info["scope"]
             dist = pickle.loads(ns_info["dist"])
 
-            ns = inputs(scope, num_node_groups, dist)
+            ns = inputs(scope, num_node_groups, dist, group_size = group_size)
 
             if "params" in ns_info:
-                ns._params = torch.from_numpy(ns_info["params"])
+                ns.set_params(torch.from_numpy(ns_info["params"]))
 
         elif ns_info["type"] == "Product":
             chs = [id2ns[cid] for cid in chids]
