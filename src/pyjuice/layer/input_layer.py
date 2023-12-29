@@ -17,6 +17,7 @@ from pyjuice.nodes import InputNodes
 from pyjuice.utils.grad_fns import ReverseGrad
 from pyjuice.utils import BitSet
 from pyjuice.utils.source2fn import make_function_from_src
+from pyjuice.utils.kernel_launcher import FastJITFunction
 from .layer import Layer
 
 
@@ -235,7 +236,10 @@ class InputLayer(Layer, nn.Module):
             if not self.provided("_mars_kernel"):
                 self._mars_kernel = self._compile_triton_kernel(self._mars_kernel_template, mar_fn = self.fw_mar_fn)
 
-            grid = lambda meta: (triton.cdiv(layer_num_nodes * batch_size, meta['BLOCK_SIZE']),)
+            BLOCK_SIZE = 1024
+
+            grid = (triton.cdiv(layer_num_nodes * batch_size, BLOCK_SIZE),)
+
             self._mars_kernel[grid](
                 params_ptr = self.params, 
                 node_mars_ptr = node_mars, 
@@ -250,7 +254,7 @@ class InputLayer(Layer, nn.Module):
                 num_vars_per_node = self.num_vars_per_node, 
                 nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
                 node_offset = node_offset, 
-                BLOCK_SIZE = 1024, 
+                BLOCK_SIZE = BLOCK_SIZE, 
                 partial_eval = 1 if fw_local_ids is not None else 0,
                 num_warps = 8
             )
@@ -261,7 +265,8 @@ class InputLayer(Layer, nn.Module):
 
                 mask_dim = missing_mask.dim()
 
-                grid = lambda meta: (triton.cdiv(layer_num_nodes * batch_size, meta['BLOCK_SIZE']),)
+                grid = (triton.cdiv(layer_num_nodes * batch_size, BLOCK_SIZE),)
+
                 self._fw_missing_mask_kernel[grid](
                     missing_mask_ptr = missing_mask,
                     node_mars_ptr = node_mars, 
@@ -312,7 +317,10 @@ class InputLayer(Layer, nn.Module):
             if not self.provided("_flows_kernel"):
                 self._flows_kernel = self._compile_triton_kernel(self._flows_kernel_template, flow_fn = self.bk_flow_fn)
 
-            grid = lambda meta: (triton.cdiv(layer_num_nodes * batch_size, meta['BLOCK_SIZE']),)
+            BLOCK_SIZE = 1024
+
+            grid = (triton.cdiv(layer_num_nodes * batch_size, BLOCK_SIZE),)
+
             self._flows_kernel[grid](
                 params_ptr = self.params,
                 param_flows_ptr = self.param_flows,
@@ -330,7 +338,7 @@ class InputLayer(Layer, nn.Module):
                 num_vars_per_node = self.num_vars_per_node, 
                 nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
                 node_offset = node_offset, 
-                BLOCK_SIZE = 1024, 
+                BLOCK_SIZE = BLOCK_SIZE, 
                 partial_eval = 1 if bk_local_ids is not None else 0,
                 num_warps = 8
             )
@@ -367,7 +375,10 @@ class InputLayer(Layer, nn.Module):
             if not self.provided("_sample_kernel"):
                 self._sample_kernel = self._compile_triton_kernel(self._sample_kernel_template, sample_fn = self.sample_fn)
 
-            grid = lambda meta: (triton.cdiv(num_activ_nodes, meta['BLOCK_SIZE']),)
+            BLOCK_SIZE = 1024
+
+            grid = (triton.cdiv(num_activ_nodes, BLOCK_SIZE),)
+
             self._sample_kernel[grid](
                 samples_ptr = samples, 
                 params_ptr = params,
@@ -381,7 +392,7 @@ class InputLayer(Layer, nn.Module):
                 num_vars_per_node = self.num_vars_per_node, 
                 nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
                 batch_size = batch_size, 
-                BLOCK_SIZE = 2048,
+                BLOCK_SIZE = BLOCK_SIZE,
                 seed = seed if seed is not None else random.randint(0, 1e8)
             )
 
@@ -426,7 +437,9 @@ class InputLayer(Layer, nn.Module):
 
                     constexprs = torch.tensor([step_size, pseudocount], dtype = torch.float32, device = self.device)
 
-                    grid = lambda meta: (triton.cdiv(layer_num_source_nodes, meta['BLOCK_SIZE']),)
+                    BLOCK_SIZE = 1024
+
+                    grid = (triton.cdiv(layer_num_source_nodes, BLOCK_SIZE),)
 
                     self._em_kernel[grid](
                         params_ptr = self.params,
@@ -438,7 +451,7 @@ class InputLayer(Layer, nn.Module):
                         source_nids_ptr = self.source_nids,
                         constexprs_ptr = constexprs,
                         layer_num_source_nodes = layer_num_source_nodes,
-                        BLOCK_SIZE = 1024,
+                        BLOCK_SIZE = BLOCK_SIZE,
                         num_warps = 8
                     )
 
@@ -863,4 +876,4 @@ class InputLayer(Layer, nn.Module):
         # Make a pseudo-function from the source code
         new_fn = make_function_from_src(new_src)
 
-        return JITFunction(new_fn)
+        return FastJITFunction(new_fn)
