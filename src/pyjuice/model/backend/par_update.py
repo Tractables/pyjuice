@@ -58,7 +58,7 @@ def compile_par_update_fn(root_ns: CircuitNodes, BLOCK_SIZE: int = 32, buffer_in
     pid = 0
 
     global_nid = 0
-    for ns in root_ns:
+    for i, ns in enumerate(root_ns):
         if not ns.is_sum() or ns.is_tied():
             continue
 
@@ -98,8 +98,9 @@ def compile_par_update_fn(root_ns: CircuitNodes, BLOCK_SIZE: int = 32, buffer_in
             nchs_new[:curr_size] = nchs[:curr_size]
             nchs = nchs_new
 
-        if use_numba:
+            buffer_inc_interval *= 2
 
+        if use_numba:
             ns_num_node_groups = ns.num_node_groups
             ns_group_size = ns.group_size
             cs_group_size = ns.ch_group_size
