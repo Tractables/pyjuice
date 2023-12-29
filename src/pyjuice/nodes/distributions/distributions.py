@@ -13,6 +13,9 @@ class Distribution():
     def get_metadata(self):
         return [] # no metadata
 
+    def normalize_params(self, params: torch.Tensor):
+        return params
+
     def num_parameters(self):
         """
         The number of parameters per node.

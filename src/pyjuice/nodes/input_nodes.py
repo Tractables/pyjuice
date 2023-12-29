@@ -58,7 +58,12 @@ class InputNodes(CircuitNodes):
 
     def set_params(self, params: torch.Tensor, normalize: bool = True):
         assert params.numel() == self.num_nodes * self.dist.num_parameters()
-        self._params = params.reshape(-1)
+
+        params = params.reshape(-1)
+        if normalize:
+            params = self.dist.normalize_params(params)
+
+        self._params = params
 
     def init_parameters(self, perturbation: float = 2.0, recursive: bool = True, 
                         is_root: bool = True, ret_params: bool = False, **kwargs):
