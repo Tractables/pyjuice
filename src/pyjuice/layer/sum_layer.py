@@ -1208,7 +1208,7 @@ class SumLayer(Layer, nn.Module):
             if allow_modify_flows == 0:
                 nmars_ptr += parids_inc[:,None] * batch_size
             nflows_ptr += parids_inc[:,None] * batch_size
-            parids_inc += ptr_inc_step
+            parids_inc_ptr += ptr_inc_step
 
         # Initialize pointers to `element_mars`
         off_eleids = tl.load(chids + elegroup_id)
@@ -1311,7 +1311,7 @@ class SumLayer(Layer, nn.Module):
             if allow_modify_flows == 0:
                 nmars_ptr += parids_inc[None,:] * batch_size
             nflows_ptr += parids_inc[None,:] * batch_size
-            parids_inc += ptr_inc_step
+            parids_inc_ptr += ptr_inc_step
 
         # Initialize pointers to `element_mars`
         off_eleids = tl.load(chids + elegroup_id)
@@ -1382,7 +1382,7 @@ class SumLayer(Layer, nn.Module):
 
             parpids_start = parpids[:,0,:].contiguous()
             parpids_increment = torch.cat(
-                (parpids[:,1:,:] - parpids[:,:-1], parpids[:,0:1,:] * 0),
+                (parpids[:,1:,:] - parpids[:,:-1,:], parpids[:,0:1,:] * 0),
                 dim = 1
             ).contiguous()
 
