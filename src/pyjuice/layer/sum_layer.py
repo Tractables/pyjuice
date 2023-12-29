@@ -1897,8 +1897,9 @@ class SumLayer(Layer, nn.Module):
         acc = tl.zeros([BLOCK_K], dtype = tl.float32)
 
         for b in range(0, B_NUM_BLOCKS):
-            # Update batch mask
-            mask_batch = (offs_batch < batch_size)
+            # Batch offsets and mask
+            offs_batch = tl.arange(0, BLOCK_B) + pid_b * TILE_SIZE_B + b * BLOCK_B
+            mask_batch = offs_batch < batch_size
 
             emars = tl.load(emars_ptr, mask = mask_batch[None,:]) # [BLOCK_K, BLOCK_B]
 
@@ -1916,9 +1917,6 @@ class SumLayer(Layer, nn.Module):
             emars_ptr += BLOCK_B
             nmars_ptr += BLOCK_B
             nflows_ptr += BLOCK_B
-
-            # Update batch offsets
-            offs_batch += BLOCK_B
 
         par_start = tl.load(pids + ngroup_id * num_edges + offs_edge)
         epars_ptr = params + par_start + tile_id
@@ -2004,6 +2002,8 @@ class SumLayer(Layer, nn.Module):
             TILE_SIZE_B = TILE_SIZE_B,
             B_NUM_BLOCKS = B_NUM_BLOCKS
         )
+
+        return None
 
     def _backward_pytorch(self, node_flows, element_flows, params, node_mars, 
                           element_mars, param_flows, nids, cids, pids, pfids, 
