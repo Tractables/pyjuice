@@ -46,5 +46,38 @@ def io_test():
     assert n0.chs[1].chs[1].dist.num_cats == n0_dup.chs[1].chs[1].dist.num_cats
 
 
+def io_param_test():
+    num_node_groups = 2
+    group_size = 4
+
+    with juice.set_group_size(group_size):
+        i00 = inputs(0, num_node_groups, dists.Categorical(num_cats = 5))
+        i01 = inputs(0, num_node_groups, dists.Categorical(num_cats = 5))
+        i10 = inputs(1, num_node_groups, dists.Categorical(num_cats = 5))
+        i11 = inputs(1, num_node_groups, dists.Categorical(num_cats = 5))
+        
+        m00 = multiply(i00, i10)
+        m01 = multiply(i01, i11)
+
+        n0 = summate(m00, m01, num_node_groups = num_node_groups)
+
+    n0.init_parameters()
+
+    pc = juice.TensorCircuit(n0)
+
+    temp_file = tempfile.NamedTemporaryFile(suffix='.jpc')
+    temp_file_name = temp_file.name
+    save(temp_file_name, pc)
+
+    n0_dup = load(temp_file_name)
+
+    assert torch.all(torch.abs(n0._params - n0_dup._params) < 1e-4)
+    assert torch.all(torch.abs(n0.chs[0].chs[0]._params - n0_dup.chs[0].chs[0]._params) < 1e-4)
+    assert torch.all(torch.abs(n0.chs[0].chs[1]._params - n0_dup.chs[0].chs[1]._params) < 1e-4)
+    assert torch.all(torch.abs(n0.chs[1].chs[0]._params - n0_dup.chs[1].chs[0]._params) < 1e-4)
+    assert torch.all(torch.abs(n0.chs[1].chs[1]._params - n0_dup.chs[1].chs[1]._params) < 1e-4)
+
+
 if __name__ == "__main__":
     io_test()
+    io_param_test()
