@@ -92,7 +92,7 @@ def pd_test():
 
     ns = juice.structures.PD(
         data_shape = (28, 28),
-        num_latents = 128,
+        num_latents = 256,
         split_intervals = (4, 4),
         structure_type = "sum_dominated"
     )
