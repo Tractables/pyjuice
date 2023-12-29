@@ -18,4 +18,7 @@ from pyjuice.nodes import multiply, summate, inputs, set_group_size
 from pyjuice.nodes.methods.lvd import LVDistiller
 
 # Commonly-used transformations
-from .transformations import merge
+from pyjuice.transformations import merge
+
+# IO
+from pyjuice.io import load, save
