@@ -195,7 +195,8 @@ def cum_pflow_kernel(cum_pflows, param_flows, pflow_start_ids, blk_sizes, blk_in
 
 @triton.jit
 def par_update_kernel(params, param_flows, cum_pflows, nchs, par_start_ids, pflow_start_ids, blk_sizes, blk_intervals,
-                      global_nids, constexprs, num_blocks, BLOCK_ID: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+                      global_nids, constexprs, num_blocks, keep_zero_params: tl.constexpr, BLOCK_ID: tl.constexpr, 
+                      BLOCK_SIZE: tl.constexpr):
 
     pid = tl.program_id(axis = 0)
 
@@ -227,11 +228,15 @@ def par_update_kernel(params, param_flows, cum_pflows, nchs, par_start_ids, pflo
     old_param = tl.load(params + offs_par, mask = mask_pflow, other = 0)
 
     updated_param = (1.0 - step_size) * old_param + step_size * new_param
+
+    if keep_zero_params == 1:
+        updated_params = tl.where(old_param < 1e-12, 0.0, updated_params)
+
     tl.store(params + offs_par, updated_param, mask = mask_pflow)
 
 
 def em_par_update(params: torch.Tensor, param_flows: torch.Tensor, par_update_kwargs: Sequence, 
-                  step_size: float, pseudocount: float = 0.0):
+                  step_size: float, pseudocount: float = 0.0, keep_zero_params: bool = True):
 
     par_start_ids, pflow_start_ids, blk_sizes, blk_intervals, global_nids, nchs, cum_pflows, metadata = par_update_kwargs
 
@@ -255,7 +260,9 @@ def em_par_update(params: torch.Tensor, param_flows: torch.Tensor, par_update_kw
 
     constexprs = torch.tensor([step_size, pseudocount]).to(params.device)
 
+    keep_zero_params = 1 if keep_zero_params else 0
+
     par_update_kernel[grid](
         params, param_flows, cum_pflows, nchs, par_start_ids, pflow_start_ids, blk_sizes, blk_intervals,
-        global_nids, constexprs, num_blocks, BLOCK_ID, BLOCK_SIZE
+        global_nids, constexprs, num_blocks, keep_zero_params, BLOCK_ID, BLOCK_SIZE
     )

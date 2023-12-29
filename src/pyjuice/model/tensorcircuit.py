@@ -359,7 +359,7 @@ class TensorCircuit(nn.Module):
         else:
             return None
 
-    def mini_batch_em(self, step_size: float, pseudocount: float = 0.0):
+    def mini_batch_em(self, step_size: float, pseudocount: float = 0.0, keep_zero_params: bool = False):
         # Update input layers
         for layer in self.input_layer_group:
             layer.mini_batch_em(step_size = step_size, pseudocount = pseudocount)
@@ -368,7 +368,9 @@ class TensorCircuit(nn.Module):
         compute_cum_par_flows(self.param_flows, self.parflow_fusing_kwargs)
 
         # Normalize and update parameters
-        em_par_update(self.params, self.param_flows, self.par_update_kwargs, step_size = step_size, pseudocount = pseudocount)
+        em_par_update(self.params, self.param_flows, self.par_update_kwargs, 
+                      step_size = step_size, pseudocount = pseudocount,
+                      keep_zero_params = keep_zero_params)
 
     def cumulate_flows(self, inputs: torch.Tensor, params: Optional[torch.Tensor] = None):
         with torch.no_grad():
