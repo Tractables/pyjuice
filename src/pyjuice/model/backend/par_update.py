@@ -170,10 +170,14 @@ def par_update_to_device(par_update_kwargs, device):
 
 
 @triton.jit
-def cum_pflow_kernel(cum_pflows, param_flows, pflow_start_ids, blk_sizes, blk_intervals, 
-                     global_nids, num_blocks, BLOCK_ID: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+def cum_pflow_kernel(cum_pflows, params, param_flows, nchs, par_start_ids, pflow_start_ids, blk_sizes, blk_intervals, 
+                     global_nids, constexprs, num_blocks, keep_zero_params: tl.constexpr, BLOCK_ID: tl.constexpr, 
+                     BLOCK_SIZE: tl.constexpr):
 
     pid = tl.program_id(axis = 0)
+
+    # Retrieve the constants
+    pseudocount = tl.load(constexprs + 1)
 
     offs_m = pid * BLOCK_ID + tl.arange(0, BLOCK_ID)
     mask_m = offs_m < num_blocks
@@ -188,7 +192,18 @@ def cum_pflow_kernel(cum_pflows, param_flows, pflow_start_ids, blk_sizes, blk_in
     offs_pflow = pflow_start[:,None] + offs_blk[None,:] * blk_interval[:,None]
     mask_pflow = mask_m[:,None] & (offs_blk[None,:] < blk_size[:,None])
     pflows = tl.load(param_flows + offs_pflow, mask = mask_pflow, other = 0)
-    nflows = tl.sum(pflows, axis = 1)
+
+    if keep_zero_params == 1:
+        par_start = tl.load(par_start_ids + offs_m, mask = mask_m, other = 0)
+        offs_par = par_start[:,None] + offs_blk[None,:] * blk_interval[:,None]
+        old_params = tl.load(params + offs_par, mask = mask_pflow, other = 0)
+
+        nch = tl.load(nchs + global_nid, mask = mask_m, other = 1)
+        pflows += (pseudocount / nch[:,None])
+
+        nflows = tl.sum(tl.where(old_params < 1e-12, 0.0, pflows), axis = 1)
+    else:
+        nflows = tl.sum(pflows, axis = 1)
 
     tl.atomic_add(cum_pflows + global_nid, nflows, mask = mask_m)
 
@@ -222,7 +237,10 @@ def par_update_kernel(params, param_flows, cum_pflows, nchs, par_start_ids, pflo
     nflows = tl.load(cum_pflows + global_nid, mask = mask_m, other = 1)
     nch = tl.load(nchs + global_nid, mask = mask_m, other = 1)
 
-    new_param = (pflows + pseudocount / nch[:,None]) / (nflows[:,None] + pseudocount)
+    if keep_zero_params == 1:
+        new_param = (pflows + pseudocount / nch[:,None]) / nflows[:,None]
+    else:
+        new_param = (pflows + pseudocount / nch[:,None]) / (nflows[:,None] + pseudocount)
 
     offs_par = par_start[:,None] + offs_blk[None,:] * blk_interval[:,None]
     old_param = tl.load(params + offs_par, mask = mask_pflow, other = 0)
@@ -230,7 +248,7 @@ def par_update_kernel(params, param_flows, cum_pflows, nchs, par_start_ids, pflo
     updated_param = (1.0 - step_size) * old_param + step_size * new_param
 
     if keep_zero_params == 1:
-        updated_params = tl.where(old_param < 1e-12, 0.0, updated_params)
+        updated_params = tl.where(old_param < 1e-12, 0.0, updated_param)
 
     tl.store(params + offs_par, updated_param, mask = mask_pflow)
 
@@ -253,14 +271,14 @@ def em_par_update(params: torch.Tensor, param_flows: torch.Tensor, par_update_kw
 
     grid = (triton.cdiv(num_blocks, BLOCK_ID),)
 
-    cum_pflow_kernel[grid](
-        cum_pflows, param_flows, pflow_start_ids, blk_sizes, blk_intervals, 
-        global_nids, num_blocks, BLOCK_ID, BLOCK_SIZE
-    )
-
     constexprs = torch.tensor([step_size, pseudocount]).to(params.device)
 
     keep_zero_params = 1 if keep_zero_params else 0
+
+    cum_pflow_kernel[grid](
+        cum_pflows, params, param_flows, nchs, par_start_ids, pflow_start_ids, blk_sizes, blk_intervals, 
+        global_nids, constexprs, num_blocks, keep_zero_params, BLOCK_ID, BLOCK_SIZE
+    )
 
     par_update_kernel[grid](
         params, param_flows, cum_pflows, nchs, par_start_ids, pflow_start_ids, blk_sizes, blk_intervals,
