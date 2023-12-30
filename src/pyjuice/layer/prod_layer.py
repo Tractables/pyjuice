@@ -30,7 +30,7 @@ class ProdLayer(Layer, nn.Module):
 
         use_block_sparse_edges = True
         for nid in range(1, len(nodes)):
-            if nodes[0].group_size != nodes[nid].group_size or nodes[nid].is_sparse:
+            if nodes[0].group_size != nodes[nid].group_size or nodes[nid].is_sparse():
                 use_block_sparse_edges = False
                 break
         self.use_block_sparse_edges = use_block_sparse_edges

@@ -104,10 +104,10 @@ def merge_prod_nodes(ns1: ProdNodes, ns2: ProdNodes, *args) -> ProdNodes:
             new_sum_chs.append(merge_sum_nodes(*sum_ns))
 
     prod_edge_ids = []
-    use_sparse_mode = any([ns.is_sparse for ns in all_ns])
+    use_sparse_mode = any([ns.is_sparse() for ns in all_ns])
     for ns in all_ns:
         edge_ids = ns.edge_ids.clone()
-        if use_sparse_mode and ns.is_block_sparse:
+        if use_sparse_mode and ns.is_block_sparse():
             edge_ids = (edge_ids[:,None,:].repeat(1, ns.group_size, 1) * ns.group_size + torch.arange(0, ns.group_size)[None,:,None]).flatten(0, 1)
         for scope_id in range(num_scopes):
             cs = ns.chs[scope_id]

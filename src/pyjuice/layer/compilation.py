@@ -924,11 +924,11 @@ def prod_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids,
         else:
             n_sid = ns._output_ind_range[0]
             nids[partition_id][local_sid:local_eid] = torch.arange(0, ns.num_nodes, device = device) + n_sid
-            if ns.is_sparse:
+            if ns.is_sparse():
                 for cs_id, cs in enumerate(ns.chs):
                     cids[partition_id][local_sid:local_eid,cs_id] = ns.edge_ids[:,cs_id].to(device) + cs._output_ind_range[0]
             else:
-                assert ns.is_block_sparse
+                assert ns.is_block_sparse()
                 edge_ids = ns.edge_ids.clone()
                 edge_ids = (edge_ids[:,None,:].repeat(1, ns.group_size, 1) * ns.group_size + torch.arange(0, ns.group_size)[None,:,None]).flatten(0, 1)
                 for cs_id, cs in enumerate(ns.chs):

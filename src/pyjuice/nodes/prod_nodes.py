@@ -25,7 +25,7 @@ class ProdNodes(CircuitNodes):
         # Child layers
         self.chs = chs
 
-        # Construct sum edges
+        # Construct product edges
         self._construct_edges(edge_ids)
 
         # Callbacks
@@ -44,11 +44,9 @@ class ProdNodes(CircuitNodes):
         else:
             raise RuntimeError(f"Unexpected shape of `edge_ids`: ({self.edge_ids.size(0)}, {self.edge_ids.size(1)})")
 
-    @property
     def is_block_sparse(self):
         return self.edge_type == self.BLOCK_SPARSE
 
-    @property
     def is_sparse(self):
         return self.edge_type == self.SPARSE
 
@@ -106,6 +104,6 @@ class ProdNodes(CircuitNodes):
                 assert torch.all(edge_ids[:,cid] >= 0), "Edge index underflow."
                 assert torch.all(edge_ids[:,cid] < self.chs[cid].num_nodes), "Edge index overflow."
         else:
-            raise RuntimeError(f"Unexpected shape of `edge_ids`: ({self.edge_ids.size(0)}, {self.edge_ids.size(1)})")
+            raise RuntimeError(f"Unexpected shape of `edge_ids`: ({edge_ids.size(0)}, {edge_ids.size(1)})")
 
         self.edge_ids = edge_ids
