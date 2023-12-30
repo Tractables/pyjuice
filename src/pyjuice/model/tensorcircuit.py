@@ -689,6 +689,10 @@ class TensorCircuit(nn.Module):
         self._init_parameters()
 
     def _init_parameters(self, perturbation: float = 4.0, pseudocount: float = 0.0):
+        for ns in self.root_ns:
+            if not ns.is_tied() and (ns.is_sum() or ns.is_input()) and not ns.has_params():
+                ns.init_parameters(perturbation = perturbation, recursive = False)
+
         params = torch.exp(torch.rand([self.num_sum_params]) * -perturbation)
         params[:self.num_dummy_params] = 0.0
 
