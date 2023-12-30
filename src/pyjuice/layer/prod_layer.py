@@ -76,7 +76,10 @@ class ProdLayer(Layer, nn.Module):
 
             fw_n_partition_ids[ns_id] = partition_id
             fw_n_id_in_partition[ns_id] = fw_num_ngs_in_partition[partition_id]
-            fw_num_ngs_in_partition[partition_id] += ns.num_node_groups
+            if self.use_block_sparse_edges:
+                fw_num_ngs_in_partition[partition_id] += ns.num_node_groups
+            else:
+                fw_num_ngs_in_partition[partition_id] += ns.num_nodes
 
         ## Initialize forward pass ##
 

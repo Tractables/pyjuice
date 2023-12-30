@@ -50,7 +50,7 @@ def multiply(nodes1: ProdNodesChs, *args, edge_ids: Optional[Tensor] = None, **k
     scope = deepcopy(nodes1.scope)
 
     for nodes in args:
-        assert isinstance(nodes, SumNodes) or isinstance(nodes, InputNodes), f"Children of product nodes must be input or sum nodes, but found input of type {type(nodes)}."
+        assert nodes.is_input() or nodes.is_sum(), f"Children of product nodes must be input or sum nodes, but found input of type {type(nodes)}."
         if edge_ids is None:
             assert nodes.num_node_groups == num_node_groups, f"Input nodes should have the same `num_node_groups`, but got {nodes.num_node_groups} and {num_node_groups}."
         assert nodes.group_size == group_size, "Input nodes should have the same `num_node_groups`."
@@ -59,7 +59,7 @@ def multiply(nodes1: ProdNodesChs, *args, edge_ids: Optional[Tensor] = None, **k
         scope |= nodes.scope
 
     if edge_ids is not None:
-        num_node_groups = edge_ids.shape[0]
+        assert edge_ids.shape[0] == num_node_groups or edge_ids.shape[0] == num_node_groups * group_size
 
     return ProdNodes(num_node_groups, chs, edge_ids, group_size = group_size, **kwargs)
 
