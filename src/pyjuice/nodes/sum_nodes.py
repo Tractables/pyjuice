@@ -16,7 +16,7 @@ Tensor = Union[np.ndarray,torch.Tensor]
 
 class SumNodes(CircuitNodes):
     def __init__(self, num_node_groups: int, chs: Sequence[CircuitNodes], edge_ids: Optional[Union[Tensor,Sequence[Tensor]]] = None, 
-                 params: Optional[Tensor] = None, group_size: int = 0, **kwargs) -> None:
+                 params: Optional[Tensor] = None, zero_param_mask: Optional[Tensor] = None, group_size: int = 0, **kwargs) -> None:
 
         assert len(chs) > 0, "`SumNodes` must have at least one child."
         for i in range(1, len(chs)):
@@ -36,6 +36,10 @@ class SumNodes(CircuitNodes):
 
         # Construct sum edges
         self._construct_edges(edge_ids)
+
+        # Set zero parameter mask
+        if zero_param_mask is not None:
+            self.set_zero_param_mask(zero_param_mask)
 
         # Set parameters
         if params is not None:
@@ -105,9 +109,30 @@ class SumNodes(CircuitNodes):
         else:
             raise ValueError("Unsupported parameter input.")
 
+        if self.zero_param_mask is not None:
+            self._params[self.zero_param_mask] = 0.0
+
         if normalize:
             normalize_ns_parameters(self._params, self.edge_ids[0,:], group_size = self.group_size, 
                                     ch_group_size = self.ch_group_size, pseudocount = pseudocount)
+
+    def set_zero_param_mask(self, zero_param_mask: Optional[Tensor] = None):
+        if zero_param_mask is None:
+            return None
+
+        if self._source_node is not None:
+            ns_source = self._source_node
+            ns_source.set_zero_param_mask(zero_param_mask)
+
+            return None
+
+        assert zero_param_mask.dim() == 3
+        assert zero_param_mask.size(0) == self.edge_ids.size(1)
+        assert zero_param_mask.size(1) == self.group_size
+        assert zero_param_mask.size(2) == self.ch_group_size
+        assert zero_param_mask.dtype == torch.bool
+
+        self.zero_param_mask = zero_param_mask
 
     def set_edges(self, edge_ids: Union[Tensor,Sequence[Tensor]]):
         self._construct_edges(edge_ids)
@@ -117,6 +142,9 @@ class SumNodes(CircuitNodes):
     def init_parameters(self, perturbation: float = 2.0, recursive: bool = True, is_root: bool = True, **kwargs):
         if self._source_node is None:
             self._params = torch.exp(torch.rand([self.edge_ids.size(1), self.group_size, self.ch_group_size]) * -perturbation)
+
+            if self.zero_param_mask is not None:
+                self._params[self.zero_param_mask] = 0.0
 
             normalize_ns_parameters(self._params, self.edge_ids[0,:], group_size = self.group_size, 
                                     ch_group_size = self.ch_group_size, pseudocount = 0.0)
