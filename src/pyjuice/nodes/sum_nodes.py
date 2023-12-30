@@ -109,7 +109,7 @@ class SumNodes(CircuitNodes):
         else:
             raise ValueError("Unsupported parameter input.")
 
-        if self.zero_param_mask is not None:
+        if self.provided("zero_param_mask"):
             self._params[self.zero_param_mask] = 0.0
 
         if normalize:
@@ -143,7 +143,7 @@ class SumNodes(CircuitNodes):
         if self._source_node is None:
             self._params = torch.exp(torch.rand([self.edge_ids.size(1), self.group_size, self.ch_group_size]) * -perturbation)
 
-            if self.zero_param_mask is not None:
+            if self.provided("zero_param_mask"):
                 self._params[self.zero_param_mask] = 0.0
 
             normalize_ns_parameters(self._params, self.edge_ids[0,:], group_size = self.group_size, 

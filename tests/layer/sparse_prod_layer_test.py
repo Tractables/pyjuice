@@ -29,7 +29,7 @@ def sparse_prod_layer_test():
         ni3 = inputs(3, num_node_groups = 2, dist = dists.Categorical(num_cats = 2))
 
         np0 = multiply(ni0, ni1)
-        np1 = multiply(ni2, ni3, edge_ids = torch.arange(0, group_size * 2)[:,None].repeat(1, 2))
+        np1 = multiply(ni2, ni3, edge_ids = torch.arange(0, group_size * 2)[:,None].repeat(1, 2), sparse_edges = True)
         np2 = multiply(ni1, ni2)
 
     input_layer = InputLayer([ni0, ni1, ni2, ni3], cum_nodes = group_size)
