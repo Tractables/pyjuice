@@ -51,6 +51,8 @@ def prune_by_score(root_nodes: CircuitNodes, key: str = "_scores", scores: Optio
 
     # Indices to keep
     flat_scores = torch.cat(flat_scores, dim = 0)
+    if flat_scores.dim() == 3:
+        flat_scores = flat_scores.sum(dim = 2).sum(dim = 1)
     if keep_frac is not None:
         assert score_threshold is None, "Only one of `keep_frac` and `score_threshold` should be set."
         score_threshold = torch.quantile(flat_scores, 1.0 - keep_frac, dim = 0)
