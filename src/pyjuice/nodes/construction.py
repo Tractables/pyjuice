@@ -40,7 +40,7 @@ def inputs(var: Union[int,Sequence[int]], num_node_groups: int = 0, dist: Distri
     )
 
 
-def multiply(nodes1: ProdNodesChs, *args, edge_ids: Optional[Tensor] = None, **kwargs):
+def multiply(nodes1: ProdNodesChs, *args, edge_ids: Optional[Tensor] = None, sparse_edges: bool = False, **kwargs):
 
     assert isinstance(nodes1, SumNodes) or isinstance(nodes1, InputNodes), "Children of product nodes must be input or sum nodes." 
 
@@ -59,6 +59,11 @@ def multiply(nodes1: ProdNodesChs, *args, edge_ids: Optional[Tensor] = None, **k
         scope |= nodes.scope
 
     if edge_ids is not None:
+        if sparse_edges:
+            assert edge_ids.shape[0] % group_size == 0
+            num_node_groups = edge_ids.shape[0] // group_size
+        else:
+            num_node_groups = edge_ids.shape[0]
         assert edge_ids.shape[0] == num_node_groups or edge_ids.shape[0] == num_node_groups * group_size
 
     return ProdNodes(num_node_groups, chs, edge_ids, group_size = group_size, **kwargs)
