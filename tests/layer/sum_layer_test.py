@@ -362,6 +362,6 @@ def speed_test():
 
 if __name__ == "__main__":
     torch.manual_seed(3890)
-    # sum_layer_test()
+    sum_layer_test()
     corner_case_test()
-    # speed_test()
+    speed_test()
