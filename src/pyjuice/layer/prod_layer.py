@@ -28,18 +28,25 @@ class ProdLayer(Layer, nn.Module):
 
         assert len(nodes) > 0, "No input node."
 
+        use_block_sparse_edges = True
         for nid in range(1, len(nodes)):
-            assert nodes[0].group_size == nodes[nid].group_size, f"`group_size` within a `ProdLayer` should be the same, but found {nodes[0].group_size} and {nodes[nid].group_size}."
+            if nodes[0].group_size != nodes[nid].group_size or nodes[nid].is_sparse:
+                use_block_sparse_edges = False
+                break
+        self.use_block_sparse_edges = use_block_sparse_edges
 
         self.nodes = nodes
-        self.group_size = nodes[0].group_size
+        self.group_size = nodes[0].group_size if self.use_block_sparse_edges else 1
 
         if global_nid_start is None:
             global_nid_start = self.group_size
 
         ## Get layer statistics & prepare for compilation ##
 
-        layer_num_ngroups, layer_num_edges, n_chgs = get_prod_layer_stats(self.nodes, self.group_size, global_nid_start = global_nid_start)
+        layer_num_ngroups, layer_num_edges, n_chgs = get_prod_layer_stats(
+            self.nodes, self.group_size, global_nid_start = global_nid_start, 
+            use_block_sparse_edges = self.use_block_sparse_edges
+        )
 
         self.num_nodes = layer_num_ngroups * self.group_size
         self.num_edges = layer_num_edges
@@ -76,7 +83,8 @@ class ProdLayer(Layer, nn.Module):
         # nids:      List[[partition_size]]                      stores node ids
         # cids:      List[[partition_size, partition_max_n_chs]] stores indices of child nodes
         nids, cids = prod_layer_forward_compilation(
-            self.nodes, fw_partition_max_chs, fw_n_partition_ids, fw_n_id_in_partition, fw_num_ngs_in_partition, self.group_size
+            self.nodes, fw_partition_max_chs, fw_n_partition_ids, fw_n_id_in_partition, fw_num_ngs_in_partition, 
+            self.group_size, self.use_block_sparse_edges
         )
 
         # Store buffers for the forward pass

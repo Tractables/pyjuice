@@ -846,34 +846,54 @@ def sum_layer_backward_compilation(nodes, cs2parns, n_partition_ids, n_id_in_par
 
 ## Compilation for ProdLayer ##
 
+def get_prod_layer_stats(nodes: Sequence[SumNodes], group_size: int, global_nid_start: int, use_block_sparse_edges: bool):
+    if use_block_sparse_edges:
+        layer_num_ngroup = sum(map(lambda ns: ns.num_node_groups, nodes))
+        layer_num_edges = 0
 
-def get_prod_layer_stats(nodes: Sequence[SumNodes], group_size: int, global_nid_start: int):
-    layer_num_ngroup = sum(map(lambda ns: ns.num_node_groups, nodes))
-    layer_num_edges = 0
+        ng_sid = 0
+        n_chgs = torch.zeros([layer_num_ngroup], dtype = torch.long)
+        for ns_idx, ns in enumerate(nodes):
+            ng_eid = ng_sid + ns.num_node_groups
 
-    ng_sid = 0
-    n_chgs = torch.zeros([layer_num_ngroup], dtype = torch.long)
-    for ns_idx, ns in enumerate(nodes):
-        ng_eid = ng_sid + ns.num_node_groups
+            n_chgs[ng_sid:ng_eid] = ns.num_chs
 
-        n_chgs[ng_sid:ng_eid] = ns.num_chs
+            layer_num_edges += ns.num_nodes * ns.num_chs
 
-        layer_num_edges += ns.num_nodes * ns.num_chs
+            ns._output_ind_range = (global_nid_start, global_nid_start + ns.num_nodes)
+            global_nid_start += ns.num_nodes
 
-        ns._output_ind_range = (global_nid_start, global_nid_start + ns.num_nodes)
-        global_nid_start += ns.num_nodes
+            ng_sid = ng_eid
+    else:
+        layer_num_ngroup = sum(map(lambda ns: ns.num_nodes, nodes))
+        layer_num_edges = 0
 
-        ng_sid = ng_eid
+        ng_sid = 0
+        n_chgs = torch.zeros([layer_num_ngroup], dtype = torch.long)
+        for ns_idx, ns in enumerate(nodes):
+            ng_eid = ng_sid + ns.num_nodes
+
+            n_chgs[ng_sid:ng_eid] = ns.num_chs
+
+            layer_num_edges += ns.num_nodes * ns.num_chs
+
+            ns._output_ind_range = (global_nid_start, global_nid_start + ns.num_nodes)
+            global_nid_start += ns.num_nodes
+
+            ng_sid = ng_eid
 
     return layer_num_ngroup, layer_num_edges, n_chgs
 
 
 @torch.no_grad()
 def prod_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, n_id_in_partition, num_ngs_in_partition, 
-                                   group_size, use_cuda: bool = False):
+                                   group_size, use_block_sparse_edges: bool, use_cuda: bool = False):
     
     if use_cuda and not torch.cuda.is_available():
         use_cuda = False
+
+    if not use_block_sparse_edges:
+        assert group_size == 1
 
     if use_cuda:
         device = torch.device("cuda:0")
@@ -890,13 +910,29 @@ def prod_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids,
         # `partition_nchs`: maximum number of child nodes in the current partition
         partition_id = n_partition_ids[ns_id]
         local_sid = n_id_in_partition[ns_id]
-        local_eid = local_sid + ns.num_node_groups
+        if use_block_sparse_edges:
+            local_eid = local_sid + ns.num_node_groups
+        else:
+            local_eid = local_sid + ns.num_nodes
         partition_nchs = fw_partition_max_chs[partition_id]
 
-        n_sid = ns._output_ind_range[0]
-        nids[partition_id][local_sid:local_eid] = torch.arange(0, ns.num_nodes, group_size, device = device) + n_sid
-        for cs_id, cs in enumerate(ns.chs):
-            cids[partition_id][local_sid:local_eid,cs_id] = ns.edge_ids[:,cs_id].to(device) * group_size + cs._output_ind_range[0]
+        if use_block_sparse_edges:
+            n_sid = ns._output_ind_range[0]
+            nids[partition_id][local_sid:local_eid] = torch.arange(0, ns.num_nodes, group_size, device = device) + n_sid
+            for cs_id, cs in enumerate(ns.chs):
+                cids[partition_id][local_sid:local_eid,cs_id] = ns.edge_ids[:,cs_id].to(device) * group_size + cs._output_ind_range[0]
+        else:
+            n_sid = ns._output_ind_range[0]
+            nids[partition_id][local_sid:local_eid] = torch.arange(0, ns.num_nodes, device = device) + n_sid
+            if ns.is_sparse:
+                for cs_id, cs in enumerate(ns.chs):
+                    cids[partition_id][local_sid:local_eid,cs_id] = ns.edge_ids[:,cs_id].to(device) + cs._output_ind_range[0]
+            else:
+                assert ns.is_block_sparse
+                edge_ids = ns.edge_ids.clone()
+                edge_ids = (edge_ids[:,None,:].repeat(1, ns.group_size, 1) + torch.arange(0, ns.group_size)[None,:,None]).flatten(0, 1)
+                for cs_id, cs in enumerate(ns.chs):
+                    cids[partition_id][local_sid:local_eid,cs_id] = edge_ids[:,cs_id].to(device) + cs._output_ind_range[0]
 
     if use_cuda:
         nids = [tensor.cpu() for tensor in nids]
@@ -906,7 +942,7 @@ def prod_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids,
 
 
 @torch.no_grad()
-def flatten_c_ids(nids: torch.Tensor, cids: torch.Tensor):
+def flatten_c_ids(nids: Sequence[torch.Tensor], cids: Sequence[torch.Tensor]):
 
     num_cid_slots = sum(map(lambda x: x.size(0) * x.size(1), cids))
     flat_cids = torch.zeros([num_cid_slots], dtype = torch.long)
@@ -1026,9 +1062,8 @@ def _assign_prod_target_parids_kernel(target_parids_ptr, flat_cid2nid_ptr, flat_
 
 
 @torch.no_grad()
-def prod_layer_backward_compilation(flat_u_cids, flat_cids, flat_cid2nid, 
-                                    bk_partition_max_pars, n_partition_ids, n_id_in_partition, num_ns_in_partition, 
-                                    use_cuda: bool = False):
+def prod_layer_backward_compilation(flat_u_cids, flat_cids, flat_cid2nid, bk_partition_max_pars, n_partition_ids, 
+                                    n_id_in_partition, num_ns_in_partition, use_cuda: bool = False):
     
     if use_cuda and not torch.cuda.is_available():
         use_cuda = False
