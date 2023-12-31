@@ -223,7 +223,7 @@ class SumNodes(CircuitNodes):
 
         return new_chs
 
-    def _construct_edges(self, edge_ids: Optional[Union[Tensor,Sequence[Tensor]]]):
+    def _construct_edges(self, edge_ids: Optional[Union[Tensor,Sequence[Tensor]]], reorder: bool = True):
         if edge_ids is None:
             edge_ids = torch.cat(
                 (torch.arange(self.num_node_groups).unsqueeze(1).repeat(1, self.num_ch_node_groups).reshape(1, -1),
@@ -245,6 +245,9 @@ class SumNodes(CircuitNodes):
 
             edge_ids = torch.cat(edge_ids, dim = 1)
 
+        if reorder:
+            edge_ids = self._reorder_edges(edge_ids)
+
         if isinstance(edge_ids, np.ndarray):
             edge_ids = torch.from_numpy(edge_ids)
 
@@ -261,6 +264,10 @@ class SumNodes(CircuitNodes):
         assert par_ns.size(0) == self.num_node_groups and par_ns.max() == self.num_node_groups - 1, "Some node has no edge."
 
         self.edge_ids = edge_ids
+
+    def _reorder_edges(self, edge_ids: Tensor):
+        ids = torch.argsort(edge_ids[0,:] * self.num_ch_node_groups + edge_ids[1,:])
+        return edge_ids[:,ids].contiguous()
 
     def __repr__(self):
         return f"SumNodes(num_node_groups={self.num_node_groups}, group_size={self.group_size}, num_chs={self.num_chs}, num_edges={self.num_edges})"
