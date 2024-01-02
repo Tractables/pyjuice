@@ -375,10 +375,10 @@ def discrete_logistic_nodes_behavior_test():
 
 def masked_categorical_nodes_range_test():
 
-    ni0 = inputs(0, num_nodes = 2, dist = dists.MaskedCategorical(num_cats = 5, mask_mode = "range"), params = {"masks": torch.tensor([[2, 4], [3, 5]])})
-    ni1 = inputs(1, num_nodes = 2, dist = dists.MaskedCategorical(num_cats = 5, mask_mode = "range"), params = {"masks": torch.tensor([[2, 4], [3, 5]])})
-    ni2 = inputs(2, num_nodes = 2, dist = dists.MaskedCategorical(num_cats = 5, mask_mode = "range"), params = {"masks": torch.tensor([[0, 3], [1, 4]])})
-    ni3 = inputs(3, num_nodes = 2, dist = dists.MaskedCategorical(num_cats = 5, mask_mode = "range"), params = {"masks": torch.tensor([[0, 5], [2, 5]])})
+    ni0 = inputs(0, num_nodes = 2, dist = dists.MaskedCategorical(num_cats = 5, mask_mode = "range"), mask = torch.tensor([[2, 4], [3, 5]]))
+    ni1 = inputs(1, num_nodes = 2, dist = dists.MaskedCategorical(num_cats = 5, mask_mode = "range"), mask = torch.tensor([[2, 4], [3, 5]]))
+    ni2 = inputs(2, num_nodes = 2, dist = dists.MaskedCategorical(num_cats = 5, mask_mode = "range"), mask = torch.tensor([[0, 3], [1, 4]]))
+    ni3 = inputs(3, num_nodes = 2, dist = dists.MaskedCategorical(num_cats = 5, mask_mode = "range"), mask = torch.tensor([[0, 5], [2, 5]]))
 
     m1 = multiply(ni0, ni1, edge_ids = torch.tensor([[0, 0], [0, 1], [1, 0], [1, 1]], dtype = torch.long))
     n1 = summate(m1, edge_ids = torch.tensor([[0, 0, 0, 0, 1, 1, 1, 1], [0, 1, 2, 3, 0, 1, 2, 3]], dtype = torch.long))
@@ -405,41 +405,41 @@ def masked_categorical_nodes_range_test():
 
     lls = pc(data)
 
-    pc.backward(data)
+    pc.backward(data.permute(1, 0))
 
     ## Input node forward tests ##
 
     for i in range(16):
         if 2 <= data[i,0] < 4:
-            assert torch.abs(pc.node_mars[1,i] - torch.log(pc.input_layers[0].params[data[i,0]])) < 1e-4
+            assert torch.abs(pc.node_mars[1,i] - torch.log(pc.input_layer_group[0].params[data[i,0]])) < 1e-4
         else:
             assert torch.abs(pc.node_mars[1,i] - math.log(1e-10)) < 1e-4
         if 3 <= data[i,0] < 5:
-            assert torch.abs(pc.node_mars[2,i] - torch.log(pc.input_layers[0].params[8+data[i,0]])) < 1e-4
+            assert torch.abs(pc.node_mars[2,i] - torch.log(pc.input_layer_group[0].params[8+data[i,0]])) < 1e-4
         else:
             assert torch.abs(pc.node_mars[2,i] - math.log(1e-10)) < 1e-4
         if 2 <= data[i,1] < 4:
-            assert torch.abs(pc.node_mars[3,i] - torch.log(pc.input_layers[0].params[16+data[i,1]])) < 1e-4
+            assert torch.abs(pc.node_mars[3,i] - torch.log(pc.input_layer_group[0].params[16+data[i,1]])) < 1e-4
         else:
             assert torch.abs(pc.node_mars[3,i] - math.log(1e-10)) < 1e-4
         if 3 <= data[i,1] < 5:
-            assert torch.abs(pc.node_mars[4,i] - torch.log(pc.input_layers[0].params[24+data[i,1]])) < 1e-4
+            assert torch.abs(pc.node_mars[4,i] - torch.log(pc.input_layer_group[0].params[24+data[i,1]])) < 1e-4
         else:
             assert torch.abs(pc.node_mars[4,i] - math.log(1e-10)) < 1e-4
         if 0 <= data[i,2] < 3:
-            assert torch.abs(pc.node_mars[5,i] - torch.log(pc.input_layers[0].params[32+data[i,2]])) < 1e-4
+            assert torch.abs(pc.node_mars[5,i] - torch.log(pc.input_layer_group[0].params[32+data[i,2]])) < 1e-4
         else:
             assert torch.abs(pc.node_mars[5,i] - math.log(1e-10)) < 1e-4
         if 1 <= data[i,2] < 4:
-            assert torch.abs(pc.node_mars[6,i] - torch.log(pc.input_layers[0].params[40+data[i,2]])) < 1e-4
+            assert torch.abs(pc.node_mars[6,i] - torch.log(pc.input_layer_group[0].params[40+data[i,2]])) < 1e-4
         else:
             assert torch.abs(pc.node_mars[6,i] - math.log(1e-10)) < 1e-4
         if 0 <= data[i,3] < 5:
-            assert torch.abs(pc.node_mars[7,i] - torch.log(pc.input_layers[0].params[48+data[i,3]])) < 1e-4
+            assert torch.abs(pc.node_mars[7,i] - torch.log(pc.input_layer_group[0].params[48+data[i,3]])) < 1e-4
         else:
             assert torch.abs(pc.node_mars[7,i] - math.log(1e-10)) < 1e-4
         if 2 <= data[i,3] < 5:
-            assert torch.abs(pc.node_mars[8,i] - torch.log(pc.input_layers[0].params[56+data[i,3]])) < 1e-4
+            assert torch.abs(pc.node_mars[8,i] - torch.log(pc.input_layer_group[0].params[56+data[i,3]])) < 1e-4
         else:
             assert torch.abs(pc.node_mars[8,i] - math.log(1e-10)) < 1e-4
 
@@ -475,16 +475,16 @@ def masked_categorical_nodes_range_test():
     gt_param_flows[7,:2] = 0.0
     gt_param_flows[7,5:] = 0.0
 
-    assert torch.all(torch.abs(gt_param_flows - pc.input_layers[0].param_flows.reshape(-1, 5)) < 1e-4)
+    assert torch.all(torch.abs(gt_param_flows - pc.input_layer_group[0].param_flows.reshape(-1, 5)) < 1e-4)
 
     ## EM tests ##
 
-    original_params = pc.input_layers[0].params.clone().reshape(8, 8)
+    original_params = pc.input_layer_group[0].params.clone().reshape(8, 8)
 
     step_size = 0.3
     pseudocount = 0.1
 
-    par_flows = pc.input_layers[0].param_flows.clone().reshape(8, 5)
+    par_flows = pc.input_layer_group[0].param_flows.clone().reshape(8, 5)
     pseudocounts = pseudocount / torch.tensor([2, 2, 2, 2, 3, 3, 5, 3]).unsqueeze(1).to(device)
     new_params = (1.0 - step_size) * original_params[:,:5] + step_size * ((par_flows + pseudocounts) / (par_flows.sum(dim = 1, keepdim = True) + pseudocount))
     updated_params = original_params
@@ -492,15 +492,15 @@ def masked_categorical_nodes_range_test():
 
     pc.mini_batch_em(step_size = step_size, pseudocount = pseudocount)
 
-    assert torch.all(torch.abs(updated_params - pc.input_layers[0].params.reshape(8, 8)) < 1e-4)
+    assert torch.all(torch.abs(updated_params - pc.input_layer_group[0].params.reshape(8, 8)) < 1e-4)
 
 
 def masked_categorical_nodes_full_mask_test():
 
-    ni0 = inputs(0, num_nodes = 2, dist = dists.MaskedCategorical(num_cats = 5, mask_mode = "full_mask"), params = {"masks": torch.tensor([[0, 0, 1, 1, 0], [0, 0, 0, 1, 1]])})
-    ni1 = inputs(1, num_nodes = 2, dist = dists.MaskedCategorical(num_cats = 5, mask_mode = "full_mask"), params = {"masks": torch.tensor([[0, 0, 1, 1, 0], [0, 0, 0, 1, 1]])})
-    ni2 = inputs(2, num_nodes = 2, dist = dists.MaskedCategorical(num_cats = 5, mask_mode = "full_mask"), params = {"masks": torch.tensor([[1, 1, 1, 0, 0], [0, 1, 1, 1, 0]])})
-    ni3 = inputs(3, num_nodes = 2, dist = dists.MaskedCategorical(num_cats = 5, mask_mode = "full_mask"), params = {"masks": torch.tensor([[1, 1, 1, 1, 1], [0, 0, 1, 1, 1]])})
+    ni0 = inputs(0, num_nodes = 2, dist = dists.MaskedCategorical(num_cats = 5, mask_mode = "full_mask"), mask = torch.tensor([[0, 0, 1, 1, 0], [0, 0, 0, 1, 1]]))
+    ni1 = inputs(1, num_nodes = 2, dist = dists.MaskedCategorical(num_cats = 5, mask_mode = "full_mask"), mask = torch.tensor([[0, 0, 1, 1, 0], [0, 0, 0, 1, 1]]))
+    ni2 = inputs(2, num_nodes = 2, dist = dists.MaskedCategorical(num_cats = 5, mask_mode = "full_mask"), mask = torch.tensor([[1, 1, 1, 0, 0], [0, 1, 1, 1, 0]]))
+    ni3 = inputs(3, num_nodes = 2, dist = dists.MaskedCategorical(num_cats = 5, mask_mode = "full_mask"), mask = torch.tensor([[1, 1, 1, 1, 1], [0, 0, 1, 1, 1]]))
 
     m1 = multiply(ni0, ni1, edge_ids = torch.tensor([[0, 0], [0, 1], [1, 0], [1, 1]], dtype = torch.long))
     n1 = summate(m1, edge_ids = torch.tensor([[0, 0, 0, 0, 1, 1, 1, 1], [0, 1, 2, 3, 0, 1, 2, 3]], dtype = torch.long))
@@ -527,41 +527,41 @@ def masked_categorical_nodes_full_mask_test():
 
     lls = pc(data)
 
-    pc.backward(data)
+    pc.backward(data.permute(1, 0))
 
     ## Input node forward tests ##
 
     for i in range(16):
         if 2 <= data[i,0] < 4:
-            assert torch.abs(pc.node_mars[1,i] - torch.log(pc.input_layers[0].params[data[i,0]])) < 1e-4
+            assert torch.abs(pc.node_mars[1,i] - torch.log(pc.input_layer_group[0].params[data[i,0]])) < 1e-4
         else:
             assert torch.abs(pc.node_mars[1,i] - math.log(1e-10)) < 1e-4
         if 3 <= data[i,0] < 5:
-            assert torch.abs(pc.node_mars[2,i] - torch.log(pc.input_layers[0].params[11+data[i,0]])) < 1e-4
+            assert torch.abs(pc.node_mars[2,i] - torch.log(pc.input_layer_group[0].params[11+data[i,0]])) < 1e-4
         else:
             assert torch.abs(pc.node_mars[2,i] - math.log(1e-10)) < 1e-4
         if 2 <= data[i,1] < 4:
-            assert torch.abs(pc.node_mars[3,i] - torch.log(pc.input_layers[0].params[22+data[i,1]])) < 1e-4
+            assert torch.abs(pc.node_mars[3,i] - torch.log(pc.input_layer_group[0].params[22+data[i,1]])) < 1e-4
         else:
             assert torch.abs(pc.node_mars[3,i] - math.log(1e-10)) < 1e-4
         if 3 <= data[i,1] < 5:
-            assert torch.abs(pc.node_mars[4,i] - torch.log(pc.input_layers[0].params[33+data[i,1]])) < 1e-4
+            assert torch.abs(pc.node_mars[4,i] - torch.log(pc.input_layer_group[0].params[33+data[i,1]])) < 1e-4
         else:
             assert torch.abs(pc.node_mars[4,i] - math.log(1e-10)) < 1e-4
         if 0 <= data[i,2] < 3:
-            assert torch.abs(pc.node_mars[5,i] - torch.log(pc.input_layers[0].params[44+data[i,2]])) < 1e-4
+            assert torch.abs(pc.node_mars[5,i] - torch.log(pc.input_layer_group[0].params[44+data[i,2]])) < 1e-4
         else:
             assert torch.abs(pc.node_mars[5,i] - math.log(1e-10)) < 1e-4
         if 1 <= data[i,2] < 4:
-            assert torch.abs(pc.node_mars[6,i] - torch.log(pc.input_layers[0].params[55+data[i,2]])) < 1e-4
+            assert torch.abs(pc.node_mars[6,i] - torch.log(pc.input_layer_group[0].params[55+data[i,2]])) < 1e-4
         else:
             assert torch.abs(pc.node_mars[6,i] - math.log(1e-10)) < 1e-4
         if 0 <= data[i,3] < 5:
-            assert torch.abs(pc.node_mars[7,i] - torch.log(pc.input_layers[0].params[66+data[i,3]])) < 1e-4
+            assert torch.abs(pc.node_mars[7,i] - torch.log(pc.input_layer_group[0].params[66+data[i,3]])) < 1e-4
         else:
             assert torch.abs(pc.node_mars[7,i] - math.log(1e-10)) < 1e-4
         if 2 <= data[i,3] < 5:
-            assert torch.abs(pc.node_mars[8,i] - torch.log(pc.input_layers[0].params[77+data[i,3]])) < 1e-4
+            assert torch.abs(pc.node_mars[8,i] - torch.log(pc.input_layer_group[0].params[77+data[i,3]])) < 1e-4
         else:
             assert torch.abs(pc.node_mars[8,i] - math.log(1e-10)) < 1e-4
 
@@ -597,16 +597,16 @@ def masked_categorical_nodes_full_mask_test():
     gt_param_flows[7,:2] = 0.0
     gt_param_flows[7,5:] = 0.0
 
-    assert torch.all(torch.abs(gt_param_flows - pc.input_layers[0].param_flows.reshape(-1, 5)) < 1e-4)
+    assert torch.all(torch.abs(gt_param_flows - pc.input_layer_group[0].param_flows.reshape(-1, 5)) < 1e-4)
 
     ## EM tests ##
 
-    original_params = pc.input_layers[0].params.clone().reshape(8, 11)
+    original_params = pc.input_layer_group[0].params.clone().reshape(8, 11)
 
     step_size = 0.3
     pseudocount = 0.1
 
-    par_flows = pc.input_layers[0].param_flows.clone().reshape(8, 5)
+    par_flows = pc.input_layer_group[0].param_flows.clone().reshape(8, 5)
     pseudocounts = pseudocount / torch.tensor([2, 2, 2, 2, 3, 3, 5, 3]).unsqueeze(1).to(device)
     new_params = (1.0 - step_size) * original_params[:,:5] + step_size * ((par_flows + pseudocounts) / (par_flows.sum(dim = 1, keepdim = True) + pseudocount))
     updated_params = original_params
@@ -614,15 +614,15 @@ def masked_categorical_nodes_full_mask_test():
 
     pc.mini_batch_em(step_size = step_size, pseudocount = pseudocount)
 
-    assert torch.all(torch.abs(updated_params - pc.input_layers[0].params.reshape(8, 11)) < 1e-4)
+    assert torch.all(torch.abs(updated_params - pc.input_layer_group[0].params.reshape(8, 11)) < 1e-4)
 
 
 def masked_categorical_nodes_rev_range_test():
 
-    ni0 = inputs(0, num_nodes = 2, dist = dists.MaskedCategorical(num_cats = 5, mask_mode = "rev_range"), params = {"masks": torch.tensor([[2, 4], [3, 5]])})
-    ni1 = inputs(1, num_nodes = 2, dist = dists.MaskedCategorical(num_cats = 5, mask_mode = "rev_range"), params = {"masks": torch.tensor([[2, 4], [3, 5]])})
-    ni2 = inputs(2, num_nodes = 2, dist = dists.MaskedCategorical(num_cats = 5, mask_mode = "rev_range"), params = {"masks": torch.tensor([[0, 3], [1, 4]])})
-    ni3 = inputs(3, num_nodes = 2, dist = dists.MaskedCategorical(num_cats = 5, mask_mode = "rev_range"), params = {"masks": torch.tensor([[4, 5], [2, 5]])})
+    ni0 = inputs(0, num_nodes = 2, dist = dists.MaskedCategorical(num_cats = 5, mask_mode = "rev_range"), mask = torch.tensor([[2, 4], [3, 5]]))
+    ni1 = inputs(1, num_nodes = 2, dist = dists.MaskedCategorical(num_cats = 5, mask_mode = "rev_range"), mask = torch.tensor([[2, 4], [3, 5]]))
+    ni2 = inputs(2, num_nodes = 2, dist = dists.MaskedCategorical(num_cats = 5, mask_mode = "rev_range"), mask = torch.tensor([[0, 3], [1, 4]]))
+    ni3 = inputs(3, num_nodes = 2, dist = dists.MaskedCategorical(num_cats = 5, mask_mode = "rev_range"), mask = torch.tensor([[4, 5], [2, 5]]))
 
     m1 = multiply(ni0, ni1, edge_ids = torch.tensor([[0, 0], [0, 1], [1, 0], [1, 1]], dtype = torch.long))
     n1 = summate(m1, edge_ids = torch.tensor([[0, 0, 0, 0, 1, 1, 1, 1], [0, 1, 2, 3, 0, 1, 2, 3]], dtype = torch.long))
@@ -649,41 +649,41 @@ def masked_categorical_nodes_rev_range_test():
 
     lls = pc(data)
 
-    pc.backward(data)
+    pc.backward(data.permute(1, 0))
 
     ## Input node forward tests ##
 
     for i in range(16):
         if not 2 <= data[i,0] < 4:
-            assert torch.abs(pc.node_mars[1,i] - torch.log(pc.input_layers[0].params[data[i,0]])) < 1e-4
+            assert torch.abs(pc.node_mars[1,i] - torch.log(pc.input_layer_group[0].params[data[i,0]])) < 1e-4
         else:
             assert torch.abs(pc.node_mars[1,i] - math.log(1e-10)) < 1e-4
         if not 3 <= data[i,0] < 5:
-            assert torch.abs(pc.node_mars[2,i] - torch.log(pc.input_layers[0].params[8+data[i,0]])) < 1e-4
+            assert torch.abs(pc.node_mars[2,i] - torch.log(pc.input_layer_group[0].params[8+data[i,0]])) < 1e-4
         else:
             assert torch.abs(pc.node_mars[2,i] - math.log(1e-10)) < 1e-4
         if not 2 <= data[i,1] < 4:
-            assert torch.abs(pc.node_mars[3,i] - torch.log(pc.input_layers[0].params[16+data[i,1]])) < 1e-4
+            assert torch.abs(pc.node_mars[3,i] - torch.log(pc.input_layer_group[0].params[16+data[i,1]])) < 1e-4
         else:
             assert torch.abs(pc.node_mars[3,i] - math.log(1e-10)) < 1e-4
         if not 3 <= data[i,1] < 5:
-            assert torch.abs(pc.node_mars[4,i] - torch.log(pc.input_layers[0].params[24+data[i,1]])) < 1e-4
+            assert torch.abs(pc.node_mars[4,i] - torch.log(pc.input_layer_group[0].params[24+data[i,1]])) < 1e-4
         else:
             assert torch.abs(pc.node_mars[4,i] - math.log(1e-10)) < 1e-4
         if not 0 <= data[i,2] < 3:
-            assert torch.abs(pc.node_mars[5,i] - torch.log(pc.input_layers[0].params[32+data[i,2]])) < 1e-4
+            assert torch.abs(pc.node_mars[5,i] - torch.log(pc.input_layer_group[0].params[32+data[i,2]])) < 1e-4
         else:
             assert torch.abs(pc.node_mars[5,i] - math.log(1e-10)) < 1e-4
         if not 1 <= data[i,2] < 4:
-            assert torch.abs(pc.node_mars[6,i] - torch.log(pc.input_layers[0].params[40+data[i,2]])) < 1e-4
+            assert torch.abs(pc.node_mars[6,i] - torch.log(pc.input_layer_group[0].params[40+data[i,2]])) < 1e-4
         else:
             assert torch.abs(pc.node_mars[6,i] - math.log(1e-10)) < 1e-4
         if not 4 <= data[i,3] < 5:
-            assert torch.abs(pc.node_mars[7,i] - torch.log(pc.input_layers[0].params[48+data[i,3]])) < 1e-4
+            assert torch.abs(pc.node_mars[7,i] - torch.log(pc.input_layer_group[0].params[48+data[i,3]])) < 1e-4
         else:
             assert torch.abs(pc.node_mars[7,i] - math.log(1e-10)) < 1e-4
         if not 2 <= data[i,3] < 5:
-            assert torch.abs(pc.node_mars[8,i] - torch.log(pc.input_layers[0].params[56+data[i,3]])) < 1e-4
+            assert torch.abs(pc.node_mars[8,i] - torch.log(pc.input_layer_group[0].params[56+data[i,3]])) < 1e-4
         else:
             assert torch.abs(pc.node_mars[8,i] - math.log(1e-10)) < 1e-4
 
@@ -711,16 +711,16 @@ def masked_categorical_nodes_rev_range_test():
     gt_param_flows[6,4:5] = 0.0
     gt_param_flows[7,2:5] = 0.0
 
-    assert torch.all(torch.abs(gt_param_flows - pc.input_layers[0].param_flows.reshape(-1, 5)) < 1e-4)
+    assert torch.all(torch.abs(gt_param_flows - pc.input_layer_group[0].param_flows.reshape(-1, 5)) < 1e-4)
 
     ## EM tests ##
 
-    original_params = pc.input_layers[0].params.clone().reshape(8, 8)
+    original_params = pc.input_layer_group[0].params.clone().reshape(8, 8)
 
     step_size = 0.3
     pseudocount = 0.1
 
-    par_flows = pc.input_layers[0].param_flows.clone().reshape(8, 5)
+    par_flows = pc.input_layer_group[0].param_flows.clone().reshape(8, 5)
     pseudocounts = pseudocount / torch.tensor([3, 3, 3, 3, 2, 2, 4, 2]).unsqueeze(1).to(device)
     new_params = (1.0 - step_size) * original_params[:,:5] + step_size * ((par_flows + pseudocounts) / (par_flows.sum(dim = 1, keepdim = True) + pseudocount))
     updated_params = original_params
@@ -728,7 +728,7 @@ def masked_categorical_nodes_rev_range_test():
 
     pc.mini_batch_em(step_size = step_size, pseudocount = pseudocount)
 
-    assert torch.all(torch.abs(updated_params - pc.input_layers[0].params.reshape(8, 8)) < 1e-4)
+    assert torch.all(torch.abs(updated_params - pc.input_layer_group[0].params.reshape(8, 8)) < 1e-4)
 
 
 if __name__ == "__main__":
