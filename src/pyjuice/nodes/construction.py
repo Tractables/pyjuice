@@ -69,7 +69,8 @@ def multiply(nodes1: ProdNodesChs, *args, edge_ids: Optional[Tensor] = None, spa
     return ProdNodes(num_node_groups, chs, edge_ids, group_size = group_size, **kwargs)
 
 
-def summate(nodes1: SumNodesChs, *args, num_nodes: int = 0, num_node_groups: int = 0, edge_ids: Optional[Tensor] = None, group_size: int = 0, **kwargs):
+def summate(nodes1: SumNodesChs, *args, num_nodes: int = 0, num_node_groups: int = 0, 
+            edge_ids: Optional[Tensor] = None, group_size: int = 0, **kwargs):
 
     if num_nodes > 0:
         assert num_node_groups == 0, "Only one of `num_nodes` and `num_node_groups` can be set at the same time."
