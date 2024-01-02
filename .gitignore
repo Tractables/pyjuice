@@ -7,6 +7,10 @@ __pycache__/
 *.so
 
 temp.npz
+out.ncu-rep
+trace.json
+trace2.json
+trace3.json
 
 # Distribution / packaging
 .Python

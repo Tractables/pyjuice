@@ -111,8 +111,11 @@ def pd_hclt_degenerative_case_test():
 
     pc.print_statistics()
 
-    mini_batch_em_epoch(350, pc, optimizer, None, train_loader, test_loader, device)
-    full_batch_em_epoch(pc, train_loader, test_loader, device)
+    mini_batch_em_epoch(5, pc, optimizer, None, train_loader, test_loader, device)
+    
+    test_ll = evaluate(pc, test_loader)
+
+    assert test_ll > -690.0
 
 
 def pd_hclt_test():
@@ -143,7 +146,7 @@ def pd_hclt_test():
     ns = juice.structures.PDHCLT(
         train_data.cuda(),
         data_shape = (28, 28),
-        num_latents = 32,
+        num_latents = 128,
         split_intervals = (4, 4),
         structure_type = "sum_dominated"
     )
@@ -161,11 +164,21 @@ def pd_hclt_test():
 
     pc.print_statistics()
 
-    mini_batch_em_epoch(350, pc, optimizer, None, train_loader, test_loader, device)
-    full_batch_em_epoch(pc, train_loader, test_loader, device)
+    # for batch in train_loader:
+    #     x = batch[0].to(device)
+
+    #     lls = pc(x, record_cudagraph = True)
+    #     lls.mean().backward()
+    #     break
+
+    mini_batch_em_epoch(5, pc, optimizer, None, train_loader, test_loader, device)
+
+    test_ll = evaluate(pc, test_loader)
+
+    assert test_ll > -680.0
 
 
 if __name__ == "__main__":
     torch.manual_seed(2391)
-    # pd_hclt_degenerative_case_test()
+    pd_hclt_degenerative_case_test()
     pd_hclt_test()

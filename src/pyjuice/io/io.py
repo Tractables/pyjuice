@@ -13,7 +13,7 @@ from .serialization import serialize_nodes, deserialize_nodes
 def save(fname: str, model: Union[CircuitNodes,TensorCircuit]):
     if isinstance(model, TensorCircuit):
         model.update_parameters()
-        root_ns = model.root_nodes
+        root_ns = model.root_ns
     else:
         root_ns = model
 

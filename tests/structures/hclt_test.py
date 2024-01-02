@@ -44,25 +44,24 @@ def mini_batch_em_epoch(num_epochs, pc, optimizer, scheduler, train_loader, test
 
 
 def full_batch_em_epoch(pc, train_loader, test_loader, device):
-    with torch.no_grad():
-        t0 = time.time()
-        train_ll = 0.0
-        for batch in train_loader:
-            x = batch[0].to(device)
+    t0 = time.time()
+    train_ll = 0.0
+    for batch in train_loader:
+        x = batch[0].to(device)
 
-            lls = pc(x)
-            pc.backward(x, flows_memory = 1.0)
+        lls = pc(x)
+        lls.mean().backward()
 
-            train_ll += lls.mean().detach().cpu().numpy().item()
+        train_ll += lls.mean().detach().cpu().numpy().item()
 
-        pc.mini_batch_em(step_size = 1.0, pseudocount = 0.1)
+    pc.mini_batch_em(step_size = 1.0, pseudocount = 0.1)
 
-        train_ll /= len(train_loader)
+    train_ll /= len(train_loader)
 
-        t1 = time.time()
-        test_ll = evaluate(pc, loader=test_loader)
-        t2 = time.time()
-        print(f"[train LL: {train_ll:.2f}; test LL: {test_ll:.2f}].....[train forward+backward+step {t1-t0:.2f}; test forward {t2-t1:.2f}] ")
+    t1 = time.time()
+    test_ll = evaluate(pc, loader=test_loader)
+    t2 = time.time()
+    print(f"[train LL: {train_ll:.2f}; test LL: {test_ll:.2f}].....[train forward+backward+step {t1-t0:.2f}; test forward {t2-t1:.2f}] ")
 
 
 def hclt_test():
@@ -94,7 +93,7 @@ def hclt_test():
         train_data.float().to(device), 
         num_bins = 32, 
         sigma = 0.5 / 32, 
-        num_latents = 64, 
+        num_latents = 256, 
         chunk_size = 32
     )
     pc = juice.TensorCircuit(ns)
@@ -109,8 +108,42 @@ def hclt_test():
         milestone_steps = [0, len(train_loader) * 100, len(train_loader) * 350]
     )
 
-    mini_batch_em_epoch(350, pc, optimizer, scheduler, train_loader, test_loader, device)
-    full_batch_em_epoch(pc, train_loader, test_loader, device)
+    for batch in train_loader:
+        x = batch[0].to(device)
+
+        lls = pc(x, record_cudagraph = True)
+        lls.mean().backward()
+        break
+
+    # for i, batch in enumerate(train_loader):
+    #     x = batch[0].to(device)
+
+    #     lls = pc(x, record_cudagraph = False)
+    #     lls.mean().backward()
+    #     if i > 5:
+    #         break
+
+    # from torch.profiler import profile, record_function, ProfilerActivity
+    # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], with_stack = True) as prof:
+    #     for i, batch in enumerate(train_loader):
+    #         x = batch[0].to(device)
+
+    #         lls = pc(x, record_cudagraph = False)
+    #         lls.mean().backward()
+    #         if i > 5:
+    #             break
+
+    # prof.export_chrome_trace("trace3.json")
+    # # torch.autograd.profiler.tensorboard_trace_to_flame_graph('trace.json', 'flamegraph.svg')
+    # # prof.export_stacks("trace.txt", "cpu_time_total")
+    # import pdb; pdb.set_trace()
+    # exit()
+
+    mini_batch_em_epoch(5, pc, optimizer, scheduler, train_loader, test_loader, device)
+
+    test_ll = evaluate(pc, test_loader)
+
+    assert test_ll > -770
 
 
 def hclt_logistic_test():
@@ -161,8 +194,11 @@ def hclt_logistic_test():
         milestone_steps = [0, len(train_loader) * 100, len(train_loader) * 350]
     )
 
-    mini_batch_em_epoch(350, pc, optimizer, scheduler, train_loader, test_loader, device)
-    full_batch_em_epoch(pc, train_loader, test_loader, device)
+    mini_batch_em_epoch(5, pc, optimizer, scheduler, train_loader, test_loader, device)
+
+    test_ll = evaluate(pc, test_loader)
+
+    assert test_ll > -990.0
 
 
 if __name__ == "__main__":

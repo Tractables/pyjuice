@@ -21,6 +21,12 @@ class Categorical(Distribution):
     def get_metadata(self):
         return [self.num_cats]
 
+    def normalize_parameters(self, params: torch.Tensor):
+        params = params.reshape(-1, self.num_cats)
+        params /= params.sum(dim = 1, keepdim = True)
+
+        return params.reshape(-1)
+
     def num_parameters(self):
         return self.num_cats
 

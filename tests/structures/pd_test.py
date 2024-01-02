@@ -92,7 +92,7 @@ def pd_test():
 
     ns = juice.structures.PD(
         data_shape = (28, 28),
-        num_latents = 32,
+        num_latents = 256,
         split_intervals = (4, 4),
         structure_type = "sum_dominated"
     )
@@ -102,8 +102,35 @@ def pd_test():
 
     optimizer = juice.optim.CircuitOptimizer(pc, lr = 0.1, pseudocount = 0.0001)
 
-    mini_batch_em_epoch(350, pc, optimizer, None, train_loader, test_loader, device)
-    full_batch_em_epoch(pc, train_loader, test_loader, device)
+    # for batch in train_loader:
+    #     x = batch[0].to(device)
+
+    #     lls = pc(x, record_cudagraph = True)
+    #     lls.mean().backward()
+    #     break
+
+    # from torch.profiler import profile, record_function, ProfilerActivity
+    # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], with_stack = True) as prof:
+    #     for i, batch in enumerate(train_loader):
+    #         x = batch[0].to(device)
+
+    #         lls = pc(x, record_cudagraph = False)
+    #         lls.mean().backward()
+    #         pc.mini_batch_em(step_size = 0.1, pseudocount = 0.01)
+    #         if i > 10:
+    #             break
+
+    # prof.export_chrome_trace("trace3.json")
+    # # torch.autograd.profiler.tensorboard_trace_to_flame_graph('trace.json', 'flamegraph.svg')
+    # # prof.export_stacks("trace.txt", "cpu_time_total")
+    # import pdb; pdb.set_trace()
+    # exit()
+
+    mini_batch_em_epoch(5, pc, optimizer, None, train_loader, test_loader, device)
+    
+    test_ll = evaluate(pc, test_loader)
+
+    assert test_ll > -755.0
 
 
 if __name__ == "__main__":

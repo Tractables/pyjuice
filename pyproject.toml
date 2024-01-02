@@ -4,15 +4,18 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyjuice"
-version="0.0.1"
+version="2.0.0"
 description = "Probabilistic Circuits Library"
 dependencies = [
     "numpy",
-    "torch",
+    "torch>=2.0.0",
     "typing",
-    "triton",
+    "triton>=2.1.0",
     "networkx",
-    "numba"
+    "numba",
+    "packaging",
+    "matplotlib",
+    "tqdm"
 ]
 authors = [
     {name="StarAI", email="guyvdb@cs.ucla.edu"},

@@ -3,9 +3,9 @@ from __future__ import annotations
 import torch
 import numpy as np
 import networkx as nx
-from typing import Type
+from typing import Type, Optional
+
 from pyjuice.nodes.distributions import *
-from typing import Optional
 from .compilation import BayesianTreeToHiddenRegionGraph
 
 
@@ -68,12 +68,18 @@ def HCLT(x: torch.Tensor, num_bins: int, sigma: float,
          chunk_size: int,
          num_latents: int, 
          num_root_ns: int = 1,
+         group_size: Optional[int] = None,
          input_layer_type: Type[Distribution] = Categorical, 
          input_layer_params: dict = {"num_cats": 256}):
     
     mi = mutual_information_chunked(x, x, num_bins, sigma, chunk_size = chunk_size).detach().cpu().numpy()
     T = chow_liu_tree(mi)
     root = nx.center(T)[0]
-    root_r = BayesianTreeToHiddenRegionGraph(T, root, num_latents, input_layer_type, input_layer_params, num_root_ns = num_root_ns)
+
+    root_r = BayesianTreeToHiddenRegionGraph(
+        T, root, num_latents, input_layer_type, 
+        input_layer_params, num_root_ns = num_root_ns,
+        group_size = group_size
+    )
     
     return root_r

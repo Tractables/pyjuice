@@ -7,10 +7,11 @@ from functools import reduce
 
 import pyjuice.transformations as jtf
 from typing import Tuple, Sequence, Optional, Type, Dict
-from pyjuice.nodes import multiply, summate, inputs
+from pyjuice.nodes import multiply, summate, inputs, set_group_size
 from pyjuice.nodes.distributions import *
 from pyjuice.structures.hclt import HCLT
 from pyjuice.utils import BitSet
+from pyjuice.utils.util import max_cdf_power_of_2
 
 
 def PD(data_shape: Tuple, num_latents: int, 
@@ -21,7 +22,8 @@ def PD(data_shape: Tuple, num_latents: int,
        structure_type: str = "sum_dominated",
        input_layer_fn: Optional[Callable] = None,
        input_layer_type: Type[Distribution] = Categorical, 
-       input_layer_params: Dict = {"num_cats": 256}):
+       input_layer_params: Dict = {"num_cats": 256},
+       group_size: Optional[int] = None):
     """
     The PD structure was proposed in
         Sum-Product Networks: A New Deep Architecture
@@ -30,6 +32,15 @@ def PD(data_shape: Tuple, num_latents: int,
     and generates a PC structure for random variables which can be naturally arranged on discrete grids, like images.
     """
     assert structure_type in ["sum_dominated", "prod_dominated"]
+
+    # Specify group size
+    if group_size is None:
+        if num_latents <= 32:
+            group_size = min(16, max_cdf_power_of_2(num_latents))
+        else:
+            group_size = min(32, max_cdf_power_of_2(num_latents))
+
+    num_node_groups = num_latents // group_size
 
     num_axes = len(data_shape)
 
@@ -81,15 +92,15 @@ def PD(data_shape: Tuple, num_latents: int,
     def create_input_ns(hypercube):
         scope = hypercube2scope(hypercube)
         if input_layer_fn is not None:
-            return input_layer_fn(scope, num_latents)
+            return input_layer_fn(scope, num_latents, group_size)
         else:
             input_nodes = []
             for var in scope:
-                ns = inputs(var, num_nodes = num_latents, dist = input_layer_type(**input_layer_params))
+                ns = inputs(var, num_node_groups = num_node_groups, dist = input_layer_type(**input_layer_params))
                 input_nodes.append(ns)
 
-            edge_ids = torch.arange(0, num_latents)[None,:].repeat(2, 1)
-            return summate(multiply(*input_nodes), num_nodes = num_latents, edge_ids = edge_ids)
+            edge_ids = torch.arange(0, num_node_groups)[None,:].repeat(2, 1)
+            return summate(multiply(*input_nodes), num_node_groups = num_node_groups, edge_ids = edge_ids)
 
     def recursive_construct(hypercube, depth = 1):
         if hypercube in hypercube2ns:
@@ -121,21 +132,22 @@ def PD(data_shape: Tuple, num_latents: int,
             # No split point found. Create input nodes instead
             ns = create_input_ns(hypercube)
         elif hypercube == root_hypercube:
-            ns = summate(*pns, num_nodes = 1)
+            ns = summate(*pns, num_node_groups = 1, group_size = 1)
         elif len(pns) <= max_prod_group_conns:
-            ns = summate(*pns, num_nodes = num_latents)
+            ns = summate(*pns, num_node_groups = num_node_groups)
         else:
-            group_ids = torch.topk(torch.rand([num_latents, len(pns)]), k = max_prod_group_conns, dim = 1).indices
-            par_ids = torch.arange(0, num_latents)[:,None,None].repeat(1, max_prod_group_conns, num_latents)
-            chs_ids = group_ids[:,:,None] * num_latents + torch.arange(0, num_latents)[None,None,:]
+            group_ids = torch.topk(torch.rand([num_node_groups, len(pns)]), k = max_prod_group_conns, dim = 1).indices
+            par_ids = torch.arange(0, num_node_groups)[:,None,None].repeat(1, max_prod_group_conns, num_node_groups)
+            chs_ids = group_ids[:,:,None] * num_node_groups + torch.arange(0, num_node_groups)[None,None,:]
             edge_ids = torch.stack((par_ids.reshape(-1), chs_ids.reshape(-1)), dim = 0)
-            ns = summate(*pns, num_nodes = num_latents, edge_ids = edge_ids)
+            ns = summate(*pns, num_node_groups = num_node_groups, edge_ids = edge_ids)
 
         hypercube2ns[hypercube] = ns
         return ns
 
-    root_hypercube = ((0,) * num_axes, deepcopy(data_shape))
-    root_ns = recursive_construct(root_hypercube)
+    with set_group_size(group_size = group_size):
+        root_hypercube = ((0,) * num_axes, deepcopy(data_shape))
+        root_ns = recursive_construct(root_hypercube)
 
     return root_ns
 
@@ -148,12 +160,13 @@ def PDHCLT(data: torch.Tensor, data_shape: Tuple, num_latents: int,
            structure_type: str = "sum_dominated",
            input_layer_type: Type[Distribution] = Categorical, 
            input_layer_params: Dict = {"num_cats": 256},
-           hclt_kwargs: Dict = {"num_bins": 32, "sigma": 0.5 / 32, "chunk_size": 32}):
+           hclt_kwargs: Dict = {"num_bins": 32, "sigma": 0.5 / 32, "chunk_size": 32},
+           group_size: Optional[int] = None):
 
     assert data.dim() == 2
     assert data.size(1) == reduce(lambda x, y: x * y, data_shape)
 
-    def input_layer_fn(scope, num_latents):
+    def input_layer_fn(scope, num_latents, group_size):
         vars = torch.tensor(scope.to_list()).sort().values
         ns = HCLT(
             x = data[:,vars], 
@@ -161,6 +174,7 @@ def PDHCLT(data: torch.Tensor, data_shape: Tuple, num_latents: int,
             input_layer_type = input_layer_type,
             input_layer_params = input_layer_params,
             num_root_ns = num_latents,
+            group_size = group_size,
             **hclt_kwargs
         )
 
@@ -174,9 +188,10 @@ def PDHCLT(data: torch.Tensor, data_shape: Tuple, num_latents: int,
             split_intervals = split_intervals, split_points = split_points,
             max_split_depth = max_split_depth, max_prod_group_conns = max_prod_group_conns,
             structure_type = structure_type, input_layer_fn = input_layer_fn,
-            input_layer_type = input_layer_type, input_layer_params = input_layer_params)
+            input_layer_type = input_layer_type, input_layer_params = input_layer_params,
+            group_size = group_size)
 
-    if ns.num_nodes > 1:
-        ns = summate(*ns.chs, num_nodes = 1)
+    if ns.num_node_groups > 1:
+        ns = summate(*ns.chs, num_node_groups = 1, group_size = 1)
 
     return ns

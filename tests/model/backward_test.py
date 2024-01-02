@@ -35,7 +35,7 @@ def backward_test():
 
     lls = pc(data)
 
-    pc.backward(data)
+    pc.backward(data.permute(1, 0), allow_modify_flows = False)
 
     ## Unit tests for backward pass ##
 
@@ -72,8 +72,8 @@ def backward_test():
 
     pf11 = (pc.node_flows[13,:] * torch.exp(pc.node_mars[9,:] + pc.node_mars[11,:]) * pc.params[13].unsqueeze(0) / torch.exp(pc.node_mars[13,:])).sum(dim = 0)
     pf12 = (pc.node_flows[13,:] * torch.exp(pc.node_mars[10,:] + pc.node_mars[12,:]) * pc.params[14].unsqueeze(0) / torch.exp(pc.node_mars[13,:])).sum(dim = 0)
-    assert torch.abs(pc.param_flows[13] - pf11) < 1e-4
-    assert torch.abs(pc.param_flows[14] - pf12) < 1e-4
+    assert torch.abs(pc.param_flows[12] - pf11) < 1e-4
+    assert torch.abs(pc.param_flows[13] - pf12) < 1e-4
     pf21 = pc.node_flows[9,:] * torch.exp(pc.node_mars[1,:] + pc.node_mars[3,:]) * pc.params[1].unsqueeze(0) / torch.exp(pc.node_mars[9,:])
     pf22 = pc.node_flows[9,:] * torch.exp(pc.node_mars[1,:] + pc.node_mars[4,:]) * pc.params[2].unsqueeze(0) / torch.exp(pc.node_mars[9,:])
     pf23 = pc.node_flows[9,:] * torch.exp(pc.node_mars[2,:] + pc.node_mars[3,:]) * pc.params[3].unsqueeze(0) / torch.exp(pc.node_mars[9,:])
@@ -82,35 +82,37 @@ def backward_test():
     pf26 = pc.node_flows[10,:] * torch.exp(pc.node_mars[1,:] + pc.node_mars[4,:]) * pc.params[6].unsqueeze(0) / torch.exp(pc.node_mars[10,:])
     pf27 = pc.node_flows[10,:] * torch.exp(pc.node_mars[2,:] + pc.node_mars[3,:]) * pc.params[7].unsqueeze(0) / torch.exp(pc.node_mars[10,:])
     pf28 = pc.node_flows[10,:] * torch.exp(pc.node_mars[2,:] + pc.node_mars[4,:]) * pc.params[8].unsqueeze(0) / torch.exp(pc.node_mars[10,:])
-    assert torch.abs(pc.param_flows[1] - pf21.sum(dim = 0)) < 1e-4
-    assert torch.abs(pc.param_flows[2] - pf22.sum(dim = 0)) < 1e-4
-    assert torch.abs(pc.param_flows[3] - pf23.sum(dim = 0)) < 1e-4
-    assert torch.abs(pc.param_flows[4] - pf24.sum(dim = 0)) < 1e-4
-    assert torch.abs(pc.param_flows[5] - pf25.sum(dim = 0)) < 1e-4
-    assert torch.abs(pc.param_flows[6] - pf26.sum(dim = 0)) < 1e-4
-    assert torch.abs(pc.param_flows[7] - pf27.sum(dim = 0)) < 1e-4
-    assert torch.abs(pc.param_flows[8] - pf28.sum(dim = 0)) < 1e-4
+    assert torch.abs(pc.param_flows[0] - pf21.sum(dim = 0)) < 1e-4
+    assert torch.abs(pc.param_flows[1] - pf22.sum(dim = 0)) < 1e-4
+    assert torch.abs(pc.param_flows[2] - pf23.sum(dim = 0)) < 1e-4
+    assert torch.abs(pc.param_flows[3] - pf24.sum(dim = 0)) < 1e-4
+    assert torch.abs(pc.param_flows[4] - pf25.sum(dim = 0)) < 1e-4
+    assert torch.abs(pc.param_flows[5] - pf26.sum(dim = 0)) < 1e-4
+    assert torch.abs(pc.param_flows[6] - pf27.sum(dim = 0)) < 1e-4
+    assert torch.abs(pc.param_flows[7] - pf28.sum(dim = 0)) < 1e-4
 
-    assert torch.abs((pc.node_flows[1,:] * (data[:,0] == 0)).sum() - pc.input_layers[0].param_flows[0]) < 1e-4
-    assert torch.abs((pc.node_flows[1,:] * (data[:,0] == 1)).sum() - pc.input_layers[0].param_flows[1]) < 1e-4
-    assert torch.abs((pc.node_flows[2,:] * (data[:,0] == 0)).sum() - pc.input_layers[0].param_flows[2]) < 1e-4
-    assert torch.abs((pc.node_flows[2,:] * (data[:,0] == 1)).sum() - pc.input_layers[0].param_flows[3]) < 1e-4
-    assert torch.abs((pc.node_flows[3,:] * (data[:,1] == 0)).sum() - pc.input_layers[0].param_flows[4]) < 1e-4
-    assert torch.abs((pc.node_flows[3,:] * (data[:,1] == 1)).sum() - pc.input_layers[0].param_flows[5]) < 1e-4
-    assert torch.abs((pc.node_flows[4,:] * (data[:,1] == 0)).sum() - pc.input_layers[0].param_flows[6]) < 1e-4
-    assert torch.abs((pc.node_flows[4,:] * (data[:,1] == 1)).sum() - pc.input_layers[0].param_flows[7]) < 1e-4
-    assert torch.abs((pc.node_flows[5,:] * (data[:,2] == 0)).sum() - pc.input_layers[0].param_flows[8]) < 1e-4
-    assert torch.abs((pc.node_flows[5,:] * (data[:,2] == 1)).sum() - pc.input_layers[0].param_flows[9]) < 1e-4
-    assert torch.abs((pc.node_flows[6,:] * (data[:,2] == 0)).sum() - pc.input_layers[0].param_flows[10]) < 1e-4
-    assert torch.abs((pc.node_flows[6,:] * (data[:,2] == 1)).sum() - pc.input_layers[0].param_flows[11]) < 1e-4
-    assert torch.abs((pc.node_flows[7,:] * (data[:,3] == 0)).sum() - pc.input_layers[0].param_flows[12]) < 1e-4
-    assert torch.abs((pc.node_flows[7,:] * (data[:,3] == 1)).sum() - pc.input_layers[0].param_flows[13]) < 1e-4
-    assert torch.abs((pc.node_flows[8,:] * (data[:,3] == 0)).sum() - pc.input_layers[0].param_flows[14]) < 1e-4
-    assert torch.abs((pc.node_flows[8,:] * (data[:,3] == 1)).sum() - pc.input_layers[0].param_flows[15]) < 1e-4
+    assert torch.abs((pc.node_flows[1,:] * (data[:,0] == 0)).sum() - pc.input_layer_group[0].param_flows[0]) < 1e-4
+    assert torch.abs((pc.node_flows[1,:] * (data[:,0] == 1)).sum() - pc.input_layer_group[0].param_flows[1]) < 1e-4
+    assert torch.abs((pc.node_flows[2,:] * (data[:,0] == 0)).sum() - pc.input_layer_group[0].param_flows[2]) < 1e-4
+    assert torch.abs((pc.node_flows[2,:] * (data[:,0] == 1)).sum() - pc.input_layer_group[0].param_flows[3]) < 1e-4
+    assert torch.abs((pc.node_flows[3,:] * (data[:,1] == 0)).sum() - pc.input_layer_group[0].param_flows[4]) < 1e-4
+    assert torch.abs((pc.node_flows[3,:] * (data[:,1] == 1)).sum() - pc.input_layer_group[0].param_flows[5]) < 1e-4
+    assert torch.abs((pc.node_flows[4,:] * (data[:,1] == 0)).sum() - pc.input_layer_group[0].param_flows[6]) < 1e-4
+    assert torch.abs((pc.node_flows[4,:] * (data[:,1] == 1)).sum() - pc.input_layer_group[0].param_flows[7]) < 1e-4
+    assert torch.abs((pc.node_flows[5,:] * (data[:,2] == 0)).sum() - pc.input_layer_group[0].param_flows[8]) < 1e-4
+    assert torch.abs((pc.node_flows[5,:] * (data[:,2] == 1)).sum() - pc.input_layer_group[0].param_flows[9]) < 1e-4
+    assert torch.abs((pc.node_flows[6,:] * (data[:,2] == 0)).sum() - pc.input_layer_group[0].param_flows[10]) < 1e-4
+    assert torch.abs((pc.node_flows[6,:] * (data[:,2] == 1)).sum() - pc.input_layer_group[0].param_flows[11]) < 1e-4
+    assert torch.abs((pc.node_flows[7,:] * (data[:,3] == 0)).sum() - pc.input_layer_group[0].param_flows[12]) < 1e-4
+    assert torch.abs((pc.node_flows[7,:] * (data[:,3] == 1)).sum() - pc.input_layer_group[0].param_flows[13]) < 1e-4
+    assert torch.abs((pc.node_flows[8,:] * (data[:,3] == 0)).sum() - pc.input_layer_group[0].param_flows[14]) < 1e-4
+    assert torch.abs((pc.node_flows[8,:] * (data[:,3] == 1)).sum() - pc.input_layer_group[0].param_flows[15]) < 1e-4
 
     ## Unit tests for params ##
 
-    inner_param_flows = pc.param_flows.clone()
+    inner_param_flows = torch.cat(
+        (torch.zeros([1], device = device), pc.param_flows.clone()), dim = 0
+    )
     pc._normalize_parameters(inner_param_flows)
     assert torch.abs(pf21.sum(dim = 0) / pf22.sum(dim = 0) - inner_param_flows[1] / inner_param_flows[2]) < 1e-4
     assert torch.abs(pf11 / pf12 - inner_param_flows[13] / inner_param_flows[14]) < 1e-4
@@ -145,7 +147,7 @@ def non_sd_pc_backward_test():
 
     lls = pc(data)
 
-    pc.backward(data)
+    pc.backward(data.permute(1, 0), allow_modify_flows = False)
 
     ## Unit tests for backward pass ##
 
@@ -169,10 +171,10 @@ def non_sd_pc_backward_test():
     fp4 = (torch.exp(pc.node_mars[16,:] + pc.node_mars[12,:]) * pc.params[12] / \
         torch.exp(pc.node_mars[17,:])).sum()
 
-    assert torch.abs(pc.param_flows[9] - fp1) < 1e-3
-    assert torch.abs(pc.param_flows[10] - fp2) < 1e-3
-    assert torch.abs(pc.param_flows[11] - fp3) < 1e-3
-    assert torch.abs(pc.param_flows[12] - fp4) < 1e-3
+    assert torch.abs(pc.param_flows[8] - fp1) < 1e-3
+    assert torch.abs(pc.param_flows[9] - fp2) < 1e-3
+    assert torch.abs(pc.param_flows[10] - fp3) < 1e-3
+    assert torch.abs(pc.param_flows[11] - fp4) < 1e-3
 
 
 def sparse_pc_backward_test():
@@ -200,7 +202,7 @@ def sparse_pc_backward_test():
 
     lls = pc(data)
 
-    pc.backward(data)
+    pc.backward(data.permute(1, 0), allow_modify_flows = False)
 
     ## Unit tests for backward pass ##
 

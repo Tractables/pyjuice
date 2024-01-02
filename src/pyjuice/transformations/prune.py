@@ -51,6 +51,8 @@ def prune_by_score(root_nodes: CircuitNodes, key: str = "_scores", scores: Optio
 
     # Indices to keep
     flat_scores = torch.cat(flat_scores, dim = 0)
+    if flat_scores.dim() == 3:
+        flat_scores = flat_scores.sum(dim = 2).sum(dim = 1)
     if keep_frac is not None:
         assert score_threshold is None, "Only one of `keep_frac` and `score_threshold` should be set."
         score_threshold = torch.quantile(flat_scores, 1.0 - keep_frac, dim = 0)
@@ -78,7 +80,7 @@ def prune_by_score(root_nodes: CircuitNodes, key: str = "_scores", scores: Optio
                 edge_filter = selected_edges[score_ranges[ns][0]:score_ranges[ns][1]]
                 copied_edges = []
                 copied_params = []
-                for node_id in range(ns.num_nodes):
+                for node_id in range(ns.num_node_groups):
                     curr_eids = (edge_ids[0,:] == node_id) * edge_filter
                     if curr_eids.sum().item() == 0:
                         maxid = torch.argmax(
@@ -86,19 +88,20 @@ def prune_by_score(root_nodes: CircuitNodes, key: str = "_scores", scores: Optio
                             (edge_ids[0,:] == node_id) * 1e-8
                         )
                         copied_edges.append(edge_ids[:,maxid].unsqueeze(1))
-                        copied_params.append(ns._params[maxid].reshape(1))
+                        copied_params.append(ns._params[maxid].reshape(1, ns.group_size, ns.ch_group_size))
                     else:
                         copied_edges.append(edge_ids[:,curr_eids])
-                        copied_params.append(ns._params[curr_eids].reshape(-1))
+                        copied_params.append(ns._params[curr_eids,:,:])
 
                 edge_ids = torch.cat(copied_edges, dim = 1)
                 params = torch.cat(copied_params, dim = 0)
 
                 new_ns = SumNodes(
-                    num_nodes = ns.num_nodes, 
+                    num_node_groups = ns.num_node_groups, 
                     chs = ch_outputs, 
                     edge_ids = edge_ids,
-                    params = params
+                    params = params,
+                    group_size = ns.group_size
                 )
             else:
                 # Keep the node as-is
@@ -117,11 +120,11 @@ def prune_by_score(root_nodes: CircuitNodes, key: str = "_scores", scores: Optio
         ns_source = old2new[dup2source[ns]]
         ns._source_node = ns_source
 
-        assert ns.num_nodes == ns_source.num_nodes
+        assert ns.num_node_groups == ns_source.num_node_groups and ns.group_size == ns_source.group_size
 
         if hasattr(ns_source, "edge_ids"):
             ns.edge_ids = ns_source.edge_ids.clone()
-        if hasattr(ns_source, "_params"):
-            ns._params = ns_source._params.clone()
+        # if hasattr(ns_source, "_params"):
+        #     ns._params = ns_source._params.clone()
 
     return new_root_ns

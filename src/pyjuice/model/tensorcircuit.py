@@ -7,188 +7,186 @@ import triton
 import triton.language as tl
 from tqdm import tqdm
 from functools import partial
-from typing import Optional, Sequence, Callable, Union
+from typing import Optional, Sequence, Callable, Union, Tuple, Dict
 
 from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes, foreach
-from pyjuice.layer import Layer, InputLayer, ProdLayer, SumLayer
-from pyjuice.functional import normalize_parameters, flat_softmax_fw, flat_softmax_bp
-from pyjuice.utils.grad_fns import ReverseGrad, PseudoHookFunc
+from pyjuice.layer import Layer, InputLayer, ProdLayer, SumLayer, LayerGroup
+from pyjuice.utils.grad_fns import ReverseGrad
 from pyjuice.utils import BitSet
 
+from .backend import compile_cum_par_flows_fn, compute_cum_par_flows, cum_par_flows_to_device, \
+                     compile_par_update_fn, em_par_update, par_update_to_device, \
+                     normalize_parameters
 
-def _pc_model_backward_hook(grad, pc, **kwargs):
+
+def _pc_model_backward_hook(grad, pc, inputs, record_cudagraph, apply_cudagraph, **kwargs):
     grad = grad.permute(1, 0)
     pc.backward(
+        inputs = inputs,
         ll_weights = grad / grad.sum() * grad.size(1),
         compute_param_flows = pc._optim_hyperparams["compute_param_flows"], 
         flows_memory = pc._optim_hyperparams["flows_memory"],
+        record_cudagraph = record_cudagraph,
+        apply_cudagraph = apply_cudagraph,
         **kwargs
     )
-
-    pc._backward_buffer.clear()
 
     return None
 
 
-def _pc_inputs_hook(grad, pc, i):
-
-    if pc._inputs_grad[i] is not None:
-        if grad is not None:
-            grad = grad + pc._inputs_grad[i]
-        else:
-            grad = pc._inputs_grad[i]
-
-    if pc._inputs[i] is not None:
-        pc._inputs[i] = None
-    
-    if pc._inputs_grad[i] is not None:
-        pc._inputs_grad[i] = None
-    
-    return grad
-
-
 class TensorCircuit(nn.Module):
-    def __init__(self, root_nodes: CircuitNodes, layer_sparsity_tol: float = 0.5, 
-                 max_num_groups: Optional[int] = None, disable_gpu_compilation: bool = False, 
+    def __init__(self, root_ns: CircuitNodes, layer_sparsity_tol: float = 0.5, 
+                 max_num_partitions: Optional[int] = None, disable_gpu_compilation: bool = False, 
+                 force_gpu_compilation: bool = False,
+                 max_tied_ns_per_parflow_group: int = 8,
                  verbose: bool = True) -> None:
         """
-        Create a tensorized circuit for the circuit rooted at `root_nodes`.
+        Create a tensorized circuit for the circuit rooted at `root_ns`.
 
         Parameters:
-        `root_nodes`:              root node(s) of the circuit
-        `layer_sparsity_tol`:      the minimum allowed sparsity of compiled layers; ranges from 0.0 to 1.0; larger means more strict
-        `max_num_groups`:          how many groups do we want to split a layer into
-        `disable_gpu_compilation`: disable GPU compilation of the layers
+        `root_ns`:                       root nodes of the circuit
+        `layer_sparsity_tol`:            the minimum allowed sparsity of compiled layers; ranges from 0.0 to 1.0; smaller means more strict
+        `max_num_partitions`:            how many groups do we want to split a layer into
+        `disable_gpu_compilation`:       disable GPU compilation of the layers
+        `force_gpu_compilation`:         always use GPU when compiling the layers
+        `max_tied_ns_per_parflow_group`: when there are tied nodes, specify at most how many nodes share a parameter flow accumulation buffer 
         """
 
-        super().__init__()
+        super(TensorCircuit, self).__init__()
 
-        self.root_nodes = root_nodes
+        self.root_ns = root_ns
         self.device = torch.device("cpu")
 
-        self._init_pass_tensors()
-        self._init_layers(
-            layer_sparsity_tol = layer_sparsity_tol, max_num_groups = max_num_groups, 
-            disable_gpu_compilation = disable_gpu_compilation, verbose = verbose
-        )
-        self._init_ad_tensors()
+        self.num_vars = self._get_num_vars(self.root_ns)
 
-    def _init_pass_tensors(self):
         self.node_mars = None
         self.element_mars = None
         self.node_flows = None
         self.element_flows = None
         self.param_flows = None
-
-    def _init_ad_tensors(self):
-        self._inputs = [None, None]
-        self._inputs_grad = [None, None]
-        self._backward_buffer = dict()
-
+        
+        self._init_layers(
+            layer_sparsity_tol = layer_sparsity_tol, 
+            max_num_partitions = max_num_partitions, 
+            disable_gpu_compilation = disable_gpu_compilation, 
+            force_gpu_compilation = force_gpu_compilation,
+            max_tied_ns_per_parflow_group = max_tied_ns_per_parflow_group,
+            verbose = verbose
+        )
+        
+        # Hyperparameters for backward pass
         self._optim_hyperparams = {
             "compute_param_flows": True,
-            "flows_memory": 0.0
+            "flows_memory": 1.0
         }
-        self._used_external_sum_params = False
+
+        # Partial evaluation
+        self._fw_partial_eval_enabled = False
+        self._bk_partial_eval_enabled = False
+
+        # CudaGraph options
+        self._recorded_cuda_graphs = dict()
+
+    def to(self, device):
+        super(TensorCircuit, self).to(device)
+
+        self.input_layer_group.to(device)
+
+        self.device = device
+
+        # For parameter flow accumulation
+        self.parflow_fusing_kwargs = cum_par_flows_to_device(self.parflow_fusing_kwargs, device)
         
-    def forward(self, inputs: torch.Tensor, 
-                params: Optional[torch.Tensor] = None, 
-                input_params: Optional[Dict[str,torch.Tensor]] = None,
-                input_layer_fn: Optional[Union[str,Callable]] = None,
-                cache: Optional[dict] = None,
-                return_cache: bool = False,
-                **kwargs):
+        # For parameter update
+        self.par_update_kwargs = par_update_to_device(self.par_update_kwargs, device)
+
+        return self
+        
+    def forward(self, inputs: torch.Tensor, input_layer_fn: Optional[Union[str,Callable]] = None,
+                cache: Optional[dict] = None, return_cache: bool = False, record_cudagraph: bool = False, 
+                apply_cudagraph: bool = True, force_use_fp16: bool = False, force_use_fp32: bool = False, **kwargs):
         """
         Forward the circuit.
 
         Parameters:
         `inputs`:         [B, num_vars]
-        `params`:         None or [B, num_params]
-        `input_params`:   A dictionary of input parameters
         `input_layer_fn`: Custom forward function for input layers;
                           if it is a string, then try to call 
                           the corresponding member function of `input_layer`
         `kwargs`:         Additional arguments for input layers
         """
         
+        assert inputs.dim() == 2 and inputs.size(1) == self.num_vars
+        
         B = inputs.size(0)
         inputs = inputs.permute(1, 0)
         
         ## Initialize buffers for forward pass ##
 
-        if not isinstance(self.node_mars, torch.Tensor) or self.node_mars.size(0) != self.num_nodes or \
-                self.node_mars.size(1) != B or self.node_mars.device != self.device:
-            self.node_mars = torch.empty([self.num_nodes, B], device = self.device)
-
-        if not isinstance(self.element_mars, torch.Tensor) or self.element_mars.size(0) != self.num_elements or \
-                self.element_mars.size(1) != B or self.element_mars.device != self.device:
-            self.element_mars = torch.empty([self.num_elements, B], device = self.device)
+        self._init_buffer(name = "node_mars", shape = (self.num_nodes, B), set_value = 0.0)
+        self._init_buffer(name = "element_mars", shape = (self.num_elements, B), set_value = -torch.inf)
 
         # Load cached node marginals
-        if cache is not None and "node_mars" in cache:
-            assert cache["node_mars"].dim() == 2 and cache["node_mars"].size(0) == self.node_mars.size(0) and \
-                cache["node_mars"].size(1) == self.node_mars.size(1)
+        if self._buffer_matches(name = "node_mars", cache = cache):
             self.node_mars[:,:] = cache["node_mars"]
-
-        self.node_mars[0,:] = 0.0
-        self.element_mars[0,:] = -torch.inf
-
-        ## Preprocess parameters ##
-
-        if params is None:
-            params = self.params
-        else:
-            if params.dim() == 2:
-                if params.size(1) == self.num_sum_params:
-                    params = params.permute(1, 0)
-                else:
-                    assert params.size(0) == self.num_sum_params, "Size of `params` does not match the number of sum parameters."
-
-            self._inputs[1] = ReverseGrad.apply(params)
-
-            # normalize
-            params = flat_softmax_fw(logits = params, node_ids = self.node_ids, inplace = False)
-            params[0] = 1.0
-            self._backward_buffer["normalized_params"] = params
-
-        if input_params is not None:
-            grad_hook_idx = 2
-            self._backward_buffer["external_input_layers"] = set()
 
         ## Run forward pass ##
 
         with torch.no_grad():
-            # Compute forward pass for all input layers
-            for idx, layer in enumerate(self.input_layers):
-                if input_params is not None and f"input_{idx}" in input_params:
-                    layer_params = input_params[f"input_{idx}"]
-
-                    self._backward_buffer["external_input_layers"].add(idx)
-                    grad_hook_idx = layer._hook_params(grad_hook_idx, self._inputs, layer_params)
-                else:
-                    layer_params = None
-
+            # Input layers
+            for idx, layer in enumerate(self.input_layer_group):
                 if input_layer_fn is None:
-                    layer(inputs, self.node_mars, params = layer_params, **kwargs)
+                    layer(inputs, self.node_mars, **kwargs)
+
                 elif isinstance(input_layer_fn, str):
                     assert hasattr(layer, input_layer_fn), f"Custom input function `{input_layer_fn}` not found for layer type {type(layer)}."
-                    getattr(layer, input_layer_fn)(inputs, self.node_mars, params = layer_params, **kwargs)
-                else:
-                    assert isinstance(input_layer_fn, Callable), f"Custom input function should be either a `str` or a `Callable`. " + \
-                                                           f"Found {type(input_layer_fn)} instead."
-                    input_layer_fn(layer, inputs, self.node_mars, params = layer_params, **kwargs)
+                    getattr(layer, input_layer_fn)(inputs, self.node_mars, **kwargs)
 
-            for layer in self.inner_layers:
-                if isinstance(layer, ProdLayer):
-                    # Prod layer
-                    layer(self.node_mars, self.element_mars)
-
-                elif isinstance(layer, SumLayer):
-                    # Sum layer
-                    layer(self.node_mars, self.element_mars, params)
+                elif isinstance(input_layer_fn, Callable):
+                    input_layer_fn(layer, inputs, self.node_mars, **kwargs)
 
                 else:
-                    raise ValueError(f"Unknown layer type {type(layer)}.")
+                    raise ValueError(f"Custom input function should be either a `str` or a `Callable`. Found {type(input_layer_fn)} instead.")
+
+            # Inner layers
+            def _run_inner_layers():
+                for layer_group in self.inner_layer_groups:
+                    if layer_group.is_prod():
+                        # Prod layer
+                        layer_group(self.node_mars, self.element_mars)
+
+                    elif layer_group.is_sum():
+                        # Sum layer
+                        layer_group(self.node_mars, self.element_mars, self.params, 
+                                    force_use_fp16 = force_use_fp16, 
+                                    force_use_fp32 = force_use_fp32)
+
+                    else:
+                        raise ValueError(f"Unknown layer type {type(layer)}.")
+
+            signature = (0, id(self.node_mars), id(self.element_mars), id(self.params), B)
+            if record_cudagraph and signature not in self._recorded_cuda_graphs:
+                # Warmup
+                s = torch.cuda.Stream()
+                s.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(s):
+                    for _ in range(3):
+                        _run_inner_layers()
+                torch.cuda.current_stream().wait_stream(s)
+
+                # Capture
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g):
+                    _run_inner_layers()
+
+                # Save
+                self._recorded_cuda_graphs[signature] = g
+
+            if apply_cudagraph and signature in self._recorded_cuda_graphs:
+                g = self._recorded_cuda_graphs[signature]
+                g.replay()
+            else:
+                _run_inner_layers()
                 
         lls = self.node_mars[self._root_node_range[0]:self._root_node_range[1],:]
         lls = lls.permute(1, 0)
@@ -206,21 +204,16 @@ class TensorCircuit(nn.Module):
 
         if torch.is_grad_enabled():
             lls.requires_grad = True
-            lls.register_hook(partial(_pc_model_backward_hook, pc = self, **kwargs))
-
-            self._inputs[0] = ReverseGrad.apply(inputs) # Record inputs for backward
-
-            tensors = []
-            for i in range(len(self._inputs)):
-                if self._inputs[i] is not None and self._inputs[i].requires_grad:
-                    self._inputs[i].register_hook(partial(_pc_inputs_hook, pc = self, i = i))
-                    tensors.append(self._inputs[i])
-            tensors.append(lls)
-
-            if return_cache:
-                return PseudoHookFunc.apply(*tensors).clone(), cache
-            else:
-                return PseudoHookFunc.apply(*tensors).clone()
+            lls.register_hook(
+                partial(
+                    _pc_model_backward_hook, 
+                    pc = self, 
+                    inputs = inputs, 
+                    record_cudagraph = record_cudagraph, 
+                    apply_cudagraph = apply_cudagraph,
+                    **kwargs
+                )
+            )
 
         if return_cache:
             return lls.clone(), cache
@@ -230,10 +223,13 @@ class TensorCircuit(nn.Module):
     def backward(self, inputs: Optional[torch.Tensor] = None, 
                  ll_weights: Optional[torch.Tensor] = None,
                  compute_param_flows: bool = True, 
-                 flows_memory: float = 0.0,
+                 flows_memory: float = 1.0,
                  input_layer_fn: Optional[Union[str,Callable]] = None,
                  cache: Optional[dict] = None,
                  return_cache: bool = False,
+                 record_cudagraph: bool = False, 
+                 apply_cudagraph: bool = True,
+                 allow_modify_flows: bool = True,
                  **kwargs):
         """
         Compute circuit flows.
@@ -248,123 +244,109 @@ class TensorCircuit(nn.Module):
         """
 
         assert self.node_mars is not None and self.element_mars is not None, "Should run forward path first."
+        assert inputs.size(0) == self.num_vars
 
         B = self.node_mars.size(1)
 
         ## Initialize buffers for backward pass ##
 
-        if not isinstance(self.node_flows, torch.Tensor) or self.node_flows.size(0) != self.num_nodes or \
-                self.node_flows.size(1) != B or self.node_flows.device != self.device:
-            self.node_flows = torch.zeros([self.num_nodes, B], device = self.device)
-        
-        if not isinstance(self.element_flows, torch.Tensor) or self.element_flows.size(0) != self.num_elements or \
-                self.element_flows.size(1) != B or self.element_flows.device != self.device:
-            self.element_flows = torch.zeros([self.num_elements, B], device = self.device)
-
-        # Clear node flows
-        self.node_flows[:,:] = 0.0
+        self._init_buffer(name = "node_flows", shape = (self.num_nodes, B), set_value = 0.0)
+        self._init_buffer(name = "element_flows", shape = (self.num_elements, B), set_value = 0.0)
 
         # Set root node flows
-        if ll_weights is None:
-            self.node_flows[self._root_node_range[0]:self._root_node_range[1],:] = 1.0
-        else:
-            if ll_weights.dim() == 1:
-                ll_weights = ll_weights.unsqueeze(1)
+        def _set_root_node_flows():
+            nonlocal ll_weights
+            if ll_weights is None:
+                self.node_flows[self._root_node_range[0]:self._root_node_range[1],:] = 1.0
+            else:
+                if ll_weights.dim() == 1:
+                    ll_weights = ll_weights.unsqueeze(1)
 
-            assert ll_weights.size(0) == self.num_root_nodes
+                assert ll_weights.size(0) == self.num_root_nodes
 
-            self.node_flows[self._root_node_range[0]:self._root_node_range[1],:] = ll_weights
+                self.node_flows[self._root_node_range[0]:self._root_node_range[1],:] = ll_weights
+
+        _set_root_node_flows()
 
         # Load cached node flows
-        if cache is not None and "node_flows" in cache:
-            assert cache["node_flows"].dim() == 2 and cache["node_flows"].size(0) == self.node_flows.size(0) and \
-                cache["node_flows"].size(1) == self.node_flows.size(1)
+        if self._buffer_matches(name = "node_flows", cache = cache):
+            self.node_flows[:,:] = cache["node_flows"]
 
-            if "replace_root_flows" in cache and cache["replace_root_flows"]:
-                if hasattr(self, "_pv_node_flows_mask") and getattr(self, "_pv_node_flows_mask") is not None:
-                    self.node_flows[self._pv_node_flows_mask,:] = 0.0
-
-                self.node_flows[:self._root_node_range[0],:] = cache["node_flows"][:self._root_node_range[0],:].to(self.device)
-                self.node_flows[self._root_node_range[1]:,:] = cache["node_flows"][self._root_node_range[1]:,:].to(self.device)
-            else:
-                self.node_flows[:,:] = cache["node_flows"]
-
-                if hasattr(self, "_pv_node_flows_mask") and getattr(self, "_pv_node_flows_mask") is not None:
-                    self.node_flows[self._pv_node_flows_mask,:] = 0.0
-                    self.node_flows[self._root_node_range[0]:self._root_node_range[1],:] = cache["node_flows"][self._root_node_range[0]:self._root_node_range[1],:]
-
-        ## Retrieve parameters and initialize parameter flows ##
-        if self._inputs[1] is not None:
-            params = self._backward_buffer["normalized_params"]
-        else:
-            params = self.params
-
+        ## Initialize parameter flows ##
         if compute_param_flows:
             self.init_param_flows(flows_memory = flows_memory)
 
         ## Run backward pass ##
 
         with torch.no_grad():
-            for layer_id in range(len(self.inner_layers) - 1, -1, -1):
-                layer = self.inner_layers[layer_id]
 
-                if isinstance(layer, ProdLayer):
-                    # Prod layer
-                    layer.backward(self.node_flows, self.element_flows)
+            # Inner layers
+            def _run_inner_layers():
 
-                elif isinstance(layer, SumLayer):
-                    # Sum layer
+                # Backward pass for inner layers
+                for layer_id in range(len(self.inner_layer_groups) - 1, -1, -1):
+                    layer_group = self.inner_layer_groups[layer_id]
 
-                    # First recompute the previous product layer
-                    self.inner_layers[layer_id-1].forward(self.node_mars, self.element_mars, _for_backward = True)
+                    if layer_group.is_prod():
+                        # Prod layer
+                        layer_group.backward(self.node_flows, self.element_flows)
 
-                    # Backward sum layer
-                    layer.backward(self.node_flows, self.element_flows, self.node_mars, self.element_mars, params, 
-                                   param_flows = self.param_flows if compute_param_flows else None)
+                    elif layer_group.is_sum():
+                        # Sum layer
 
-                else:
-                    raise ValueError(f"Unknown layer type {type(layer)}.")
+                        # First recompute the previous product layer
+                        self.inner_layer_groups[layer_id-1].forward(self.node_mars, self.element_mars, _for_backward = True)
 
-            if inputs is None:
-                inputs = self._inputs[0]
+                        # Backward sum layer
+                        layer_group.backward(self.node_flows, self.element_flows, self.node_mars, self.element_mars, self.params, 
+                                             param_flows = self.param_flows if compute_param_flows else None,
+                                             allow_modify_flows = allow_modify_flows)
+
+                    else:
+                        raise ValueError(f"Unknown layer type {type(layer)}.")
+
+            signature = (1, id(self.node_flows), id(self.element_flows), id(self.node_mars), id(self.element_mars), id(self.params), id(self.param_flows), B)
+            if record_cudagraph and signature not in self._recorded_cuda_graphs:
+                # Warmup
+                s = torch.cuda.Stream()
+                s.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(s):
+                    for _ in range(3):
+                        self.node_flows[:,:] = 0.0
+                        _set_root_node_flows()
+                        _run_inner_layers()
+                torch.cuda.current_stream().wait_stream(s)
+
+                # Capture
+                self.node_flows[:,:] = 0.0
+                _set_root_node_flows()
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g):
+                    _run_inner_layers()
+
+                # Save
+                self._recorded_cuda_graphs[signature] = g
+
+            if apply_cudagraph and signature in self._recorded_cuda_graphs:
+                g = self._recorded_cuda_graphs[signature]
+                g.replay()
             else:
-                inputs = inputs.permute(1, 0)
+                _run_inner_layers()
 
             # Compute backward pass for all input layers
-            grad_hook_idx = 2
-            for idx, layer in enumerate(self.input_layers):
+            for idx, layer in enumerate(self.input_layer_group):
                 if input_layer_fn is None:
                     layer.backward(inputs, self.node_flows, self.node_mars, **kwargs)
+
                 elif isinstance(input_layer_fn, str):
                     assert hasattr(layer, input_layer_fn), f"Custom input function `{input_layer_fn}` not found for layer type {type(layer)}."
                     getattr(layer, input_layer_fn)(inputs, self.node_flows, self.node_mars, **kwargs)
-                else:
-                    assert isinstance(input_layer_fn, Callable), f"Custom input function should be either a `str` or a `Callable`. " + \
-                                                                    f"Found {type(input_layer_fn)} instead."
+
+                elif isinstance(input_layer_fn, Callable):
                     input_layer_fn(layer, inputs, self.node_flows, self.node_mars, **kwargs)
 
-                if "external_input_layers" in self._backward_buffer and idx in self._backward_buffer["external_input_layers"]:
-                    grad_hook_idx = layer._hook_param_grads(grad_hook_idx, self._inputs, self._inputs_grad)
-
-            if self._inputs[1] is not None:
-                B = self._inputs[0].size(0)
-
-                # Below computes the parameter gradients derived from flows
-                # grads = self.param_flows / params / B
-                # grads[0] = 0.0
-                # self._inputs_grad[1] = flat_softmax_bp(grads, params, self.node_ids, log_param_grad = False, inplace = False)
-
-                # However, using the gradients directly generally leads to slow convergence
-                # Instead, we use a scaled version of the gradient, as shown below
-                flows = self.param_flows
-                self._normalize_parameters(flows, pseudocount = self._pseudocount)
-                flows[0] = 1.0
-                grads = 0.5 * (torch.log(flows) - torch.log(params))
-                self._inputs_grad[1] = flat_softmax_bp(grads, params, self.node_ids, log_param_grad = True, inplace = False)
-
-                self._used_external_sum_params = True
-            else:
-                self._used_external_sum_params = False
+                else:
+                    raise ValueError(f"Custom input function should be either a `str` or a `Callable`. Found {type(input_layer_fn)} instead.")
 
         if return_cache:
             if cache is None:
@@ -374,94 +356,71 @@ class TensorCircuit(nn.Module):
                 cache["node_flows"] = self.node_flows.clone()
 
             return cache
-
         else:
             return None
 
-    def mini_batch_em(self, step_size: float, pseudocount: float = 0.0):
-        for layer in self.input_layers:
+    def mini_batch_em(self, step_size: float, pseudocount: float = 0.0, keep_zero_params: bool = False):
+        # Update input layers
+        for layer in self.input_layer_group:
             layer.mini_batch_em(step_size = step_size, pseudocount = pseudocount)
-        
-        # Only apply parameter update if external parameters are not used in the previous forward/backward pass
-        if not self._used_external_sum_params:
-            # Normalize and update parameters
-            with torch.no_grad():
-                flows = self.param_flows
-                if flows is None:
-                    return None
-                self._normalize_parameters(flows, pseudocount = pseudocount)
-                self.params.data = (1.0 - step_size) * self.params.data + step_size * flows
-                self.params[0] = 1.0
+
+        # Accumulate parameter flows of tied nodes
+        compute_cum_par_flows(self.param_flows, self.parflow_fusing_kwargs)
+
+        # Normalize and update parameters
+        em_par_update(self.params, self.param_flows, self.par_update_kwargs, 
+                      step_size = step_size, pseudocount = pseudocount,
+                      keep_zero_params = keep_zero_params)
 
     def cumulate_flows(self, inputs: torch.Tensor, params: Optional[torch.Tensor] = None):
         with torch.no_grad():
             self.forward(inputs, params)
             self.backward(inputs = inputs, compute_param_flows = True, flows_memory = 1.0)
 
-    def init_param_flows(self, flows_memory: float = 0.0):
-        batch_size = self._inputs[1].size(1) if self._inputs[1] is not None and self._inputs[1].dim() == 2 else 1
-        if self.param_flows is None or self.param_flows.size(0) != self.params.size(0) \
-                or (self.param_flows.dim() == 1 and batch_size > 1) \
-                or (self.param_flows.dim() == 2 and batch_size != self.param_flows.size(1)):
-            if batch_size == 1:
-                shape = [self.params.size(0)]
-            else:
-                shape = [self.params.size(0), batch_size]
-            self.param_flows = torch.zeros(shape, device = self.device)
+    def init_param_flows(self, flows_memory: float = 1.0, batch_size: Optional[int] = None):
+
+        assert 0.0 <= flows_memory <= 1.0, f"`flows_memory` should be in [0.0, 1.0]"
+
+        if batch_size is None:
+            pflow_shape = (self.num_param_flows,)
         else:
-            assert self.param_flows.size(0) == self.params.size(0)
+            pflow_shape = (self.num_param_flows, batch_size)
+            
+        self._init_buffer(name = "param_flows", shape = pflow_shape)
+
+        if flows_memory < 1.0:
             self.param_flows[:] *= flows_memory
 
         # For input layers
-        for layer in self.input_layers:
+        for layer in self.input_layer_group:
             layer.init_param_flows(flows_memory = flows_memory)
 
         return None
 
-    def to(self, device):
-        super(TensorCircuit, self).to(device)
-
-        for layer in self.input_layers:
-            layer.device = device
-
-        self.device = device
-
-        return self
-
-    def get_param_specs(self):
-        param_specs = dict()
-        param_specs["inner"] = torch.Size([self.num_sum_params])
-        for i, layer in enumerate(self.input_layers):
-            param_specs[f"input_{i}"] = layer.get_param_specs()
-
-        return param_specs
-
-    def update_parameters(self, clone_params: bool = True, update_flows: bool = False):
+    def update_parameters(self, clone: bool = True):
         """
         Copy parameters from this `TensorCircuit` to the original `CircuitNodes`
         """
         params = self.params.detach().cpu()
-        if update_flows:
-            param_flows = self.param_flows.detach().cpu()
 
-        for ns in self.root_nodes:
+        for ns in self.root_ns:
             if ns.is_sum() and not ns.is_tied():
-                psid, peid = ns._param_range
-                if clone_params:
-                    ns._params = params[ns._param_ids].clone()
-                else:
-                    ns._params = params[ns._param_ids]
-                
-                if update_flows:
-                    if clone_params:
-                        ns._flows = param_flows[ns._param_ids].clone()
-                    else:
-                        ns._flows = param_flows[ns._param_ids]
+                ns.update_parameters(params, clone = clone)
 
-        for layer in self.input_layers:
+        for layer in self.input_layer_group:
             layer.update_parameters()
 
         return None
+
+    def update_param_flows(self, clone: bool = True, origin_ns_only: bool = True):
+        """
+        Copy parameter flows from this `TensorCircuit` to the original `CircuitNodes`
+        """
+        param_flows = self.param_flows.detach().cpu()
+
+        for ns in self.root_ns:
+            if ns.is_sum() and not ns.is_tied():
+                ns.update_param_flows(param_flows, clone = clone, origin_ns_only = origin_ns_only)
 
     def print_statistics(self):
         """
@@ -471,22 +430,13 @@ class TensorCircuit(nn.Module):
         print(f"> Number of edges: {self.num_edges}")
         print(f"> Number of sum parameters: {self.num_sum_params}")
 
-    def copy_param_flows(self, clone_param_flows: bool = True, target_name: str = "_scores"):
-        param_flows = self.param_flows.detach().cpu()
-
-        for ns in self.root_nodes:
-            if clone_params:
-                setattr(ns, target_name, param_flows[ns._param_ids].clone())
-            else:
-                setattr(ns, target_name, param_flows[ns._param_ids])
-
-        return None
-
     def enable_partial_evaluation(self, scopes: Union[Sequence[BitSet],Sequence[int]], 
-                                  forward: bool = False, backward: bool = False):
-        
+                                  forward: bool = False, backward: bool = False, overwrite: bool = False):
         # Create scope2nid cache
         self._create_scope2nid_cache()
+
+        if not overwrite and (forward and self._fw_partial_eval_enabled or backward and self._bk_partial_eval_enabled):
+            raise RuntimeError("Partial evaluation already enabled, consider calling `disable_partial_evaluation` first.")
 
         if isinstance(scopes[0], int):
             scopes = [BitSet.from_array([var]) for var in scopes]
@@ -495,164 +445,261 @@ class TensorCircuit(nn.Module):
         bk_scopes = scopes if backward else None
 
         # Input layers
-        for layer in self.input_layers:
+        for layer in self.input_layer_group:
             layer.enable_partial_evaluation(fw_scopes = fw_scopes, bk_scopes = bk_scopes)
 
         # Inner layers
-        for layer in self.inner_layers:
-            layer.enable_partial_evaluation(fw_scopes = fw_scopes, bk_scopes = bk_scopes)
+        for layer_group in self.inner_layer_groups:
+            layer_group.enable_partial_evaluation(fw_scopes = fw_scopes, bk_scopes = bk_scopes)
+
+        if forward:
+            self._fw_partial_eval_enabled = True
 
         if backward:
-            scopes = set(scopes)
-            _pv_node_flows_mask = torch.zeros([self.num_nodes], dtype = torch.bool)
-            for ns in self.root_nodes:
-                if (ns.is_sum() or ns.is_input()) and ns.scope in scopes:
-                    sid, eid = ns._output_ind_range
-                    _pv_node_flows_mask[sid:eid] = True
-            self._pv_node_flows_mask = _pv_node_flows_mask.to(self.device)
+            self._bk_partial_eval_enabled = True
 
     def disable_partial_evaluation(self, forward: bool = True, backward: bool = True):
         # Input layers
-        for layer in self.input_layers:
+        for layer in self.input_layer_group:
             layer.disable_partial_evaluation(forward = forward, backward = backward)
 
         # Inner layers
-        for layer in self.inner_layers:
-            layer.disable_partial_evaluation(forward = forward, backward = backward)
+        for layer_group in self.inner_layer_groups:
+            layer_group.disable_partial_evaluation(forward = forward, backward = backward)
 
-        self._pv_node_flows_mask = None
+        if forward:
+            self._fw_partial_eval_enabled = False
 
-    def _init_layers(self, init_input_params: Optional[Sequence[torch.Tensor]] = None, 
-                     init_inner_params: Optional[torch.Tensor] = None,
-                     layer_sparsity_tol: float = 0.0, max_num_groups: Optional[int] = None,
-                     disable_gpu_compilation: bool = False, verbose: bool = True):
+        if backward:
+            self._bk_partial_eval_enabled = False
 
-        self.root_nodes._clear_tensor_circuit_hooks()
-        depth2nodes, num_layers = self._create_node_layers()
+    def _init_buffer(self, name: str, shape: Tuple, set_value: Optional[float] = None, check_device: bool = True):
+        flag = False
+        if not name in self.__dict__:
+            flag = True
+        
+        tensor = self.__dict__[name]
+        if not flag and not isinstance(tensor, torch.Tensor):
+            flag = True
+        
+        if not flag and tensor.dim() != len(shape):
+            flag = True
 
-        if hasattr(self, "input_layers") or hasattr(self, "inner_layers"):
+        for i, d in enumerate(shape):
+            if not flag and tensor.size(i) != d:
+                flag = True
+        
+        if not flag and check_device and tensor.device != self.device:
+            flag = True
+
+        if flag:
+            self.__dict__[name] = torch.zeros(shape, device = self.device)
+
+        if set_value is not None:
+            if len(shape) == 1:
+                self.__dict__[name][:] = set_value
+            elif len(shape) == 2:
+                self.__dict__[name][:,:] = set_value
+            elif len(shape) == 3:
+                self.__dict__[name][:,:,:] = set_value
+            elif len(shape) == 4:
+                self.__dict__[name][:,:,:,:] = set_value
+            elif len(shape) == 5:
+                self.__dict__[name][:,:,:,:,:] = set_value
+            else:
+                raise ValueError(f"Too many dimensions ({len(shape)}).")
+
+    def _buffer_matches(self, name: str, cache: Optional[dict], check_device: bool = True):
+        if cache is None:
+            return False
+
+        assert name in self.__dict__
+
+        tensor = self.__dict__[name]
+        
+        if name not in cache:
+            return False
+
+        if tensor.size() != cache[name].size():
+            return False
+
+        if check_device and tensor.device != cache[name].device:
+            return False
+
+        return True
+
+    def _get_num_vars(self, ns: CircuitNodes):
+        num_vars = 0
+        for v in ns.scope:
+            if (v + 1) > num_vars:
+                num_vars = v + 1
+        return num_vars
+
+    def _init_layers(self, layer_sparsity_tol: Optional[float] = None, max_num_partitions: Optional[int] = None,
+                     disable_gpu_compilation: bool = False, force_gpu_compilation: bool = False, 
+                     max_tied_ns_per_parflow_group: int = 8, verbose: bool = True):
+
+        if hasattr(self, "input_layer_group") or hasattr(self, "inner_layer_groups"):
             raise ValueError("Attempting to initialize a TensorCircuit for the second time. " + \
-                "Please instead create a new TensorCircuit instance by `TensorCircuit(nodes)`.")
+                "Please instead create a new TensorCircuit instance by calling `pc = TensorCircuit(root_ns)`.")
 
-        self.input_layers = []
-        self.inner_layers = []
+        # Clear hooks/pointers used by previous `TensorCircuit`s
+        self.root_ns._clear_tensor_circuit_hooks()
 
-        # Nodes include one dummy node and all input/sum nodes in the PC
-        num_nodes = 1
+        # Create layers
+        depth2nodes, num_layers, max_node_group_size, max_ele_group_size = self._create_node_layers()
+
+        self.input_layer_group = None
+        self.inner_layer_groups = []
+
+        self.num_dummy_nodes = max_ele_group_size
+        self.num_dummy_eles = max_node_group_size
+        self.num_dummy_params = max_node_group_size * max_ele_group_size
+
+        # Nodes include `max_ele_group_size` dummy nodes and all input/sum nodes in the PC
+        num_nodes = self.num_dummy_nodes
 
         # Total number of edges
         num_edges = 0
 
-        # Elements include one dummy element and all product nodes in the PC
-        num_elements = 1
+        # Elements include `max_node_group_size` dummy elements and all product nodes in the PC
+        num_elements = self.num_dummy_eles
 
-        # Number of parameters for sum nodes in the PC, plus one dummy parameter
-        param_ends = [1]
+        # Number of parameters
+        num_parameters = self.num_dummy_params
 
-        # Index mapping from original parameter space to a tied parameter space
-        tied_param_ids = []
-        tied_param_group_ids = []
-        tied_param_ends = []
+        # Number of parameter flows
+        num_param_flows = 0
+
+        # Stores distributed parameter flows
+        node2tiednodes = dict()
 
         if verbose:
-            print(f"Compiling {num_layers} layers...")
+            print(f"Compiling {num_layers} TensorCircuit layers...")
+
         layer_id = 0
         for depth in tqdm(range(num_layers), disable = not verbose):
             if depth == 0:
                 # Input layer
-                type2nodes = self._categorize_input_nodes(depth2nodes[0]["input"])
+                signature2nodes = self._categorize_input_nodes(depth2nodes[0]["input"])
                 input_layer_id = 0
-                for NodeType, nodes in type2nodes.items():
-                    input_layer = InputLayer(nodes = nodes, cum_nodes = num_nodes)
+                input_layers = []
+                for signature, nodes in signature2nodes.items():
+                    input_layer = InputLayer(
+                        nodes = nodes, cum_nodes = num_nodes,
+                        max_tied_ns_per_parflow_group = max_tied_ns_per_parflow_group
+                    )
 
-                    num_nodes += input_layer.num_nodes
-                    self.input_layers.append(input_layer)
-                    self.add_module(f"input_layer_{input_layer_id}", input_layer)
+                    input_layers.append(input_layer)
+                    
                     input_layer_id += 1
+                    num_nodes += input_layer.num_nodes
+
+                self.input_layer_group = LayerGroup(input_layers)
+
             else:
                 assert len(depth2nodes[depth]["prod"]) > 0 and len(depth2nodes[depth]["sum"]) > 0, \
-                    "Depth {}: ({}, {})".format(depth, len(depth2nodes[depth]["prod"]), len(depth2nodes[depth]["sum"]))
+                    "Depth {}: (# prod nodes: {}, # sum nodes: {})".format(depth, len(depth2nodes[depth]["prod"]), len(depth2nodes[depth]["sum"]))
 
-                # Product layer
-                prod_layer = ProdLayer(
-                    nodes = depth2nodes[depth]["prod"], 
-                    layer_sparsity_tol = layer_sparsity_tol,
-                    max_num_groups = max_num_groups,
-                    disable_gpu_compilation = disable_gpu_compilation
-                )
+                # Product layer(s)
+                gsize2prod_nodes = dict()
+                for ns in depth2nodes[depth]["prod"]:
+                    gsize = ns.group_size
+                    if gsize not in gsize2prod_nodes:
+                        gsize2prod_nodes[gsize] = []
+                    gsize2prod_nodes[gsize].append(ns)
+                
+                layer_num_elements = max_node_group_size
+                prod_layers = []
+                for gsize, nodes in gsize2prod_nodes.items():
+                    prod_layer = ProdLayer(
+                        nodes = nodes, 
+                        global_nid_start = layer_num_elements,
+                        layer_sparsity_tol = layer_sparsity_tol,
+                        max_num_partitions = max_num_partitions,
+                        disable_gpu_compilation = disable_gpu_compilation,
+                        force_gpu_compilation = force_gpu_compilation
+                    )
 
-                if prod_layer.num_nodes + 1 > num_elements:
-                    num_elements = prod_layer.num_nodes + 1
+                    layer_num_elements += prod_layer.num_nodes
+                    num_edges += prod_layer.num_edges
 
-                self.add_module(f"prod_layer_{layer_id}", prod_layer)
-                self.inner_layers.append(prod_layer)
+                    prod_layers.append(prod_layer)
+                
+                prod_layer_group = LayerGroup(prod_layers)
+                self.inner_layer_groups.append(prod_layer_group)
+                self.add_module(f"prod_layer_{layer_id}", prod_layer_group)
 
-                # Sum layer
-                sum_layer = SumLayer(
-                    nodes = depth2nodes[depth]["sum"],
-                    global_nid_start = num_nodes, 
-                    param_ends = param_ends, 
-                    tied_param_ids = tied_param_ids,
-                    tied_param_group_ids = tied_param_group_ids,
-                    tied_param_ends = tied_param_ends,
-                    ch_prod_layer_size = prod_layer.num_nodes + 1,
-                    layer_sparsity_tol = layer_sparsity_tol,
-                    max_num_groups = max_num_groups,
-                    disable_gpu_compilation = disable_gpu_compilation
-                )
+                if layer_num_elements > num_elements:
+                    num_elements = layer_num_elements
 
-                num_nodes += sum_layer.num_nodes
-                num_edges += prod_layer.num_edges + sum_layer.num_edges
+                # Sum layer(s)
+                gsize2sum_nodes = dict()
+                for ns in depth2nodes[depth]["sum"]:
+                    gsize = ns.group_size
+                    if gsize not in gsize2sum_nodes:
+                        gsize2sum_nodes[gsize] = []
+                    gsize2sum_nodes[gsize].append(ns)
+                
+                sum_layers = []
+                for gsize, nodes in gsize2sum_nodes.items():
+                    sum_layer = SumLayer(
+                        nodes = nodes,
+                        global_nid_start = num_nodes, 
+                        global_pid_start = num_parameters,
+                        global_pfid_start = num_param_flows,
+                        node2tiednodes = node2tiednodes,
+                        layer_sparsity_tol = layer_sparsity_tol,
+                        max_num_partitions = max_num_partitions,
+                        max_tied_ns_per_parflow_group = max_tied_ns_per_parflow_group,
+                        disable_gpu_compilation = disable_gpu_compilation,
+                        force_gpu_compilation = force_gpu_compilation
+                    )
 
-                self.add_module(f"sum_layer_{layer_id}", sum_layer)
-                self.inner_layers.append(sum_layer)
+                    num_nodes += sum_layer.num_nodes
+                    num_edges += sum_layer.num_edges
+                    num_parameters += sum_layer.num_parameters
+                    num_param_flows += sum_layer.num_param_flows
+
+                    sum_layers.append(sum_layer)
+
+                sum_layer_group = LayerGroup(sum_layers)
+                self.inner_layer_groups.append(sum_layer_group)
+                self.add_module(f"sum_layer_{layer_id}", sum_layer_group)
 
                 layer_id += 1
 
         self.num_nodes = num_nodes
         self.num_edges = num_edges
         self.num_elements = num_elements
-        self.num_sum_params = param_ends[-1]
-        self.param_ends = param_ends
+        self.num_sum_params = num_parameters
+        self.num_param_flows = num_param_flows
 
-        # For parameter normalization
-        # Node that input nodes are implicitly omitted as they have no child
-        node_ids = torch.empty([self.num_sum_params], dtype = torch.long)
-        node_nchs = torch.empty([len(self.param_ends)], dtype = torch.long)
-        node_ids[:self.param_ends[0]] = 0
-        node_nchs[0] = self.param_ends[0]
-        for i in range(1, len(self.param_ends)):
-            node_ids[self.param_ends[i-1]:self.param_ends[i]] = i
-            node_nchs[i] = self.param_ends[i] - self.param_ends[i-1]
+        # For parameter flow accumulation
+        self.parflow_fusing_kwargs = compile_cum_par_flows_fn(node2tiednodes, MAX_NGROUPS = 2048, BLOCK_SIZE = 2048)
         
-        self.register_buffer("node_ids", node_ids)
-        self.register_buffer("node_nchs", node_nchs)
-
-        # For parameter tying
-        self.num_tied_params = tied_param_ends[-1] if len(tied_param_ends) > 0 else 0
-        if self.num_tied_params > 0:
-            tied_param_ids = torch.tensor(tied_param_ids).long()
-            tied_param_group_ids = torch.tensor(tied_param_group_ids).long()
-            self.register_buffer("tied_param_ids", tied_param_ids)
-            self.register_buffer("tied_param_group_ids", tied_param_group_ids)
+        # For parameter update
+        self.par_update_kwargs = compile_par_update_fn(self.root_ns, BLOCK_SIZE = 32)
 
         # Register root nodes
-        self.num_root_nodes = self.inner_layers[-1].num_nodes
+        self.num_root_nodes = self.root_ns.num_nodes
         self._root_node_range = (self.num_nodes - self.num_root_nodes, self.num_nodes)
 
         # Initialize parameters
         self._init_parameters()
 
-    def _init_parameters(self, perturbation: float = 4.0, pseudocount: float = 1e-6):
+    def _init_parameters(self, perturbation: float = 4.0, pseudocount: float = 0.0):
+        for ns in self.root_ns:
+            if not ns.is_tied() and (ns.is_sum() or ns.is_input()) and not ns.has_params():
+                ns.init_parameters(perturbation = perturbation, recursive = False)
+
         params = torch.exp(torch.rand([self.num_sum_params]) * -perturbation)
+        params[:self.num_dummy_params] = 0.0
 
         # Copy initial parameters if provided
-        for layer in self.inner_layers:
-            if isinstance(layer, SumLayer):
-                for ns in layer.nodes:
-                    if not ns.is_tied() and ns.has_params():
-                        sidx, eidx = ns._param_range
-                        params[sidx:eidx] = ns._params[ns._inverse_param_ids].to(params.device)
+        for ns in self.root_ns:
+            if ns.is_sum() and not ns.is_tied() and ns.has_params():
+                ns.gather_parameters(params)
 
         self._normalize_parameters(params, pseudocount = pseudocount)
         self.params = nn.Parameter(params)
@@ -661,20 +708,28 @@ class TensorCircuit(nn.Module):
         # gradient of PC parameters by PyTorch.
         self.params.requires_grad = False
 
-        for idx, layer in enumerate(self.input_layers):
+        # Initialize parameters for input layers
+        for idx, layer in enumerate(self.input_layer_group):
             layer._init_parameters(perturbation)
 
     def _normalize_parameters(self, params, pseudocount: float = 0.0):
         if params is not None:
-            normalize_parameters(params, self.node_ids, self.node_nchs, pseudocount)
+            normalize_parameters(params, self.par_update_kwargs, pseudocount)
 
     def _create_node_layers(self):
         depth2nodes = dict()
         nodes2depth = dict()
 
-        num_layers = [1]
+        num_layers = 1
+        max_node_group_size = 0
+        max_ele_group_size = 0
 
         def dfs(ns: CircuitNodes):
+
+            nonlocal num_layers
+            nonlocal max_node_group_size
+            nonlocal max_ele_group_size
+
             if ns in nodes2depth:
                 return
             if ns.is_input():
@@ -687,7 +742,7 @@ class TensorCircuit(nn.Module):
                     dfs(cs)
 
                 depth = max(map(lambda ms: nodes2depth[ms], ns.chs)) + (1 if ns.is_prod() else 0)
-                num_layers[0] = max(depth + 1, num_layers[0])
+                num_layers = max(depth + 1, num_layers)
                 nodes2depth[ns] = depth
 
                 if depth not in depth2nodes:
@@ -695,10 +750,15 @@ class TensorCircuit(nn.Module):
                 
                 if ns.is_sum():
                     depth2nodes[depth]["sum"].append(ns)
-                elif not ns.is_prod():
+                    if ns.group_size > max_node_group_size:
+                        max_node_group_size = ns.group_size
+                elif ns.is_prod():
+                    if ns.group_size > max_ele_group_size:
+                        max_ele_group_size = ns.group_size
+                else:
                     raise NotImplementedError(f"Unsupported node type {type(n)}.")
 
-        dfs(self.root_nodes)
+        dfs(self.root_ns)
 
         pns2layer = dict()
         for layer in range(1, len(depth2nodes)):
@@ -711,29 +771,29 @@ class TensorCircuit(nn.Module):
                             depth2nodes[layer]["prod"].append(cs)
                             pns2layer[id(cs)] = layer
 
-        return depth2nodes, num_layers[0]
+        return depth2nodes, num_layers, max_node_group_size, max_ele_group_size
 
     def _categorize_input_nodes(self, nodes: Sequence[InputNodes]):
-        type2nodes = dict()
+        signature2nodes = dict()
         for ns in nodes:
-            ltype = ns.dist.get_signature()
-            if ltype not in type2nodes:
-                type2nodes[ltype] = []
-            type2nodes[ltype].append(ns)
+            signature = ns.dist.get_signature()
+            if signature not in signature2nodes:
+                signature2nodes[signature] = []
+            signature2nodes[signature].append(ns)
 
-        return type2nodes
+        return signature2nodes
 
     def _create_scope2nid_cache(self):
         # Input layers
-        for idx, layer in enumerate(self.input_layers):
+        for idx, layer in enumerate(self.input_layer_group):
             layer._prepare_scope2nids()
 
         # Inner layers
         prod_scope_eleids = None
-        for layer in self.inner_layers:
-            if isinstance(layer, ProdLayer):
-                prod_scope_eleids = layer._prepare_scope2nids()
+        for layer_group in self.inner_layer_groups:
+            if layer_group.is_prod():
+                prod_scope_eleids = layer_group._prepare_scope2nids()
             else:
-                assert isinstance(layer, SumLayer)
+                assert layer_group.is_sum()
 
-                layer._prepare_scope2nids(prod_scope_eleids)
+                layer_group._prepare_scope2nids(prod_scope_eleids)

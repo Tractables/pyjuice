@@ -2,17 +2,16 @@ from __future__ import annotations
 
 import numpy as np
 import torch
-from typing import Sequence, Union, Optional
+from typing import Sequence, Union, Optional, Callable
 from copy import deepcopy
+from collections import deque
+
 from pyjuice.utils import BitSet
 from pyjuice.graph import RegionGraph, PartitionNode, InnerRegionNode, InputRegionNode
 
 
-def node_iterator(root_ns: CircuitNodes):
-    visited = set()
-    node_list = list()
-
-    def dfs(ns: CircuitNodes):
+def node_iterator(root_ns: CircuitNodes, reverse: bool = False):
+    def dfs(ns: CircuitNodes, fn: Callable, visited: set = set()):
         if ns in visited:
             return
 
@@ -21,14 +20,48 @@ def node_iterator(root_ns: CircuitNodes):
         # Recursively traverse children
         if ns.is_sum() or ns.is_prod():
             for cs in ns.chs:
-                dfs(cs)
+                dfs(cs, fn = fn, visited = visited)
 
-        node_list.append(ns)
+        fn(ns)
 
-    dfs(root_ns)
+    if not reverse:
+        visited = set()
+        node_list = list()
 
-    for ns in node_list:
-        yield ns
+        def record_fn(ns):
+            node_list.append(ns)
+
+        dfs(root_ns, record_fn)
+
+        for ns in node_list:
+            yield ns
+    
+    else:
+        parcount = dict()
+        node_list = list()
+
+        def inc_parcount(ns):
+            for cs in ns.chs:
+                if cs not in parcount:
+                    parcount[cs] = 0
+                parcount[cs] += 1
+
+        dfs(root_ns, inc_parcount)
+
+        queue = deque()
+        queue.append(root_ns)
+        while len(queue) > 0:
+            ns = queue.popleft()
+            node_list.append(ns)
+            for cs in ns.chs:
+                parcount[cs] -= 1
+                if parcount[cs] == 0:
+                    queue.append(cs)
+
+        assert len(parcount) + 1 == len(node_list)
+
+        for ns in node_list:
+            yield ns
 
 
 class CircuitNodes():
@@ -38,8 +71,19 @@ class CircuitNodes():
     # add anything here.
     INIT_CALLBACKS = []
 
-    def __init__(self, num_nodes: int, region_node: RegionGraph, source_node: Optional[CircuitNodes] = None, **kwargs):
-        self.num_nodes = num_nodes
+    # Default `group_size`. Used by the context managers.
+    DEFAULT_GROUP_SIZE = 1
+
+    def __init__(self, num_node_groups: int, region_node: RegionGraph, group_size: int = 0, source_node: Optional[CircuitNodes] = None, **kwargs):
+
+        if group_size == 0:
+            group_size = self.DEFAULT_GROUP_SIZE
+
+        assert num_node_groups > 0
+        assert group_size > 0 and (group_size & (group_size - 1)) == 0, f"`group_size` must be a power of 2, but got `group_size={group_size}`."
+        
+        self.num_node_groups = num_node_groups
+        self.group_size = group_size
         self.region_node = region_node
 
         self.chs = []
@@ -55,6 +99,8 @@ class CircuitNodes():
         self._source_node = source_node
 
         self._tied_param_group_ids = None
+
+        self._reverse_iter = False
 
     def _run_init_callbacks(self, **kwargs):
         for func in self.INIT_CALLBACKS:
@@ -76,6 +122,14 @@ class CircuitNodes():
     @property
     def num_chs(self):
         return len(self.chs)
+
+    @property
+    def num_nodes(self):
+        return self.num_node_groups * self.group_size
+
+    @property
+    def num_edges(self):
+        raise NotImplementedError()
 
     def duplicate(self, *args, **kwargs):
         raise ValueError(f"{type(self)} does not support `duplicate`.")
@@ -110,16 +164,21 @@ class CircuitNodes():
         return self._source_node is not None
 
     def get_source_ns(self):
-        return self._source_node
+        return self._source_node if self.is_tied() else self
 
     def set_source_ns(self, source_ns: CircuitNodes):
         assert type(source_ns) == type(self), f"Node type of the source ns ({type(source_ns)}) does not match that of self ({type(self)})."
         assert len(source_ns.chs) == len(self.chs), "Number of children does not match."
         assert not hasattr(self, "_params") or self._params is None, "The current node should not have parameters to avoid confusion."
+        assert source_ns.num_node_groups == self.num_node_groups, "`num_node_groups` does not match."
+        assert source_ns.group_size == self.group_size,  "`group_size` does not match."
 
         self._source_node = source_ns
 
     def has_params(self):
+        if self.is_input():
+            return self._param_initialized
+
         if not self.is_tied():
             return hasattr(self, "_params") and self._params is not None
         else:
@@ -127,21 +186,32 @@ class CircuitNodes():
             return hasattr(source_ns, "_params") and source_ns._params is not None
 
     def _clear_tensor_circuit_hooks(self, recursive: bool = True):
+
+        def clear_hooks(ns):
+            if hasattr(ns, "_param_range"):
+                ns._param_range = None
+            if hasattr(ns, "_param_ids"):
+                ns._param_ids = None
+            if hasattr(ns, "_inverse_param_ids"):
+                ns._inverse_param_ids = None
+            if hasattr(ns, "_param_flow_range"):
+                ns._param_flow_range = None
+            if hasattr(ns, "_output_ind_range"):
+                ns._output_ind_range = None
+
         if recursive:
             for ns in self:
-                if hasattr(ns, "_param_range"):
-                    ns._param_range = None
-                if hasattr(ns, "_param_ids"):
-                    ns._param_ids = None
-                if hasattr(ns, "_inverse_param_ids"):
-                    ns._inverse_param_ids = None
+                clear_hooks(ns)
         else:
-            if hasattr(self, "_param_range"):
-                self._param_range = None
-            if hasattr(self, "_param_ids"):
-                self._param_ids = None
-            if hasattr(self, "_inverse_param_ids"):
-                self._inverse_param_ids = None
+            clear_hooks(self)
 
     def __iter__(self):
-        return node_iterator(self)
+        return node_iterator(self, self._reverse_iter)
+
+    def __call__(self, reverse: bool = False):
+        self._reverse_iter = reverse
+
+        return self
+
+    def provided(self, var_name):
+        return hasattr(self, var_name) and getattr(self, var_name) is not None

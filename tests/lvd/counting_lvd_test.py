@@ -27,8 +27,8 @@ def counting_lvd_test():
         m = multiply(n0, n1, lv_dataset = torch.tensor([0,0,1,1]))
         n = summate(m, num_nodes = 1)
 
-    assert torch.abs(n0._params - torch.tensor([1.0, 0.0, 0.0, 1.0])).max() < 1e-6
-    assert torch.abs(n1._params - torch.tensor([0.0, 1.0, 1.0, 0.0])).max() < 1e-6
+    assert torch.abs(n0._params.view(-1) - torch.tensor([1.0, 0.0, 0.0, 1.0])).max() < 1e-6
+    assert torch.abs(n1._params.view(-1) - torch.tensor([0.0, 1.0, 1.0, 0.0])).max() < 1e-6
 
 
 if __name__ == "__main__":

@@ -10,36 +10,36 @@ class CircuitOptimizer():
 
     SUPPORTED_OPTIM_METHODS = ["EM"]
 
-    def __init__(self, circuit: TensorCircuit, base_optimizer: Optional[Optimizer] = None, method: str = "EM", lr: float = 0.1,
+    def __init__(self, pc: TensorCircuit, base_optimizer: Optional[Optimizer] = None, method: str = "EM", lr: float = 0.1,
                  pseudocount: float = 0.1):
         
-        self.circuit = circuit
+        self.pc = pc
 
         self.base_optimizer = base_optimizer
 
-        assert method in self.SUPPORTED_OPTIM_METHODS, f"Unsupported optimization method {method} for circuits."
+        assert method in self.SUPPORTED_OPTIM_METHODS, f"Unsupported optimization method {method} for PCs."
         self.method = method
 
         self.lr = lr
         self.pseudocount = pseudocount
 
-    def zero_grad(self, flows_memory: float = 0.0):
+    def zero_grad(self):
         if self.base_optimizer is not None:
             self.base_optimizer.zero_grad()
 
-        self.circuit._optim_hyperparams["flows_memory"] = flows_memory
+        self.pc.init_param_flows(flows_memory = 0.0)
 
     def step(self, closure = None):
         if self.base_optimizer is not None:
             self.base_optimizer.step()
 
         if self.method == "EM":
-            self.circuit.mini_batch_em(
+            self.pc.mini_batch_em(
                 step_size = self.lr,
                 pseudocount = self.pseudocount
             )
         else:
-            raise ValueError(f"Unknown circuit optimization method {self.method}.")
+            raise ValueError(f"Unknown PC optimization method {self.method}.")
 
     def state_dict(self):
         if self.base_optimizer is not None:
@@ -47,20 +47,20 @@ class CircuitOptimizer():
         else:
             state_dict = dict()
 
-        state_dict["circuit_states"] = {
+        state_dict["pc_states"] = {
             "method": self.method, 
             "lr": self.lr, 
             "pseudocount": self.pseudocount
         }
 
     def load_state_dict(self, state_dict: Dict):
-        circuit_states = state_dict["circuit_states"]
+        pc_states = state_dict["pc_states"]
         
-        self.method = circuit_states["method"]
-        self.lr = circuit_states["lr"]
-        self.pseudocount = circuit_states["pseudocount"]
+        self.method = pc_states["method"]
+        self.lr = pc_states["lr"]
+        self.pseudocount = pc_states["pseudocount"]
 
-        del state_dict["circuit_states"]
+        del state_dict["pc_states"]
 
         if self.base_optimizer is not None:
             self.base_optimizer.load_state_dict(state_dict)

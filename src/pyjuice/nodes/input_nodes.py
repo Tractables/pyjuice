@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import torch
-from typing import Sequence, Union, Type, Optional
+from typing import Sequence, Union, Type, Optional, Dict
 from copy import deepcopy
 
 from pyjuice.graph import InputRegionNode
@@ -11,24 +11,27 @@ from .nodes import CircuitNodes
 
 
 class InputNodes(CircuitNodes):
-    def __init__(self, num_nodes: int, scope: Union[Sequence,BitSet], dist: Distribution, 
-                 params: Optional[torch.Tensor] = None, **kwargs) -> None:
+    def __init__(self, num_node_groups: int, scope: Union[Sequence,BitSet], dist: Distribution, 
+                 params: Optional[torch.Tensor] = None, group_size: int = 0, **kwargs) -> None:
 
         rg_node = InputRegionNode(scope)
-        super(InputNodes, self).__init__(num_nodes, rg_node, **kwargs)
+        super(InputNodes, self).__init__(num_node_groups, rg_node, group_size = group_size, **kwargs)
 
         self.chs = [] # InputNodes has no children
 
         self.dist = dist
 
-        # Init parameters
-        if self.dist.need_external_params and params is None:
-            raise RuntimeError(f"Distribution `{self.dist}` requires `params` to be set.")
+        # Init parameters and meta-parameters
+        if self.dist.need_meta_parameters:
+            self.set_meta_params(**kwargs)
         if params is not None:
             self.set_params(params)
 
         # Callbacks
         self._run_init_callbacks(**kwargs)
+
+        # Parameter initialization flag
+        self._param_initialized = False
 
     @property
     def num_edges(self):
@@ -45,7 +48,7 @@ class InputNodes(CircuitNodes):
 
         dist = deepcopy(self.dist)
 
-        ns = InputNodes(self.num_nodes, scope = scope, dist = dist, source_node = self if tie_params else None)
+        ns = InputNodes(self.num_node_groups, scope = scope, dist = dist, group_size = self.group_size, source_node = self if tie_params else None)
 
         if hasattr(self, "_params") and self._params is not None and not tie_params:
             ns._params = self._params.clone()
@@ -53,20 +56,34 @@ class InputNodes(CircuitNodes):
         return ns
 
     def get_params(self):
-        if self._params is None:
+        if not self.provided("_params"):
             return None
         else:
             return self._params
 
-    def set_params(self, params: torch.Tensor, normalize: bool = True):
-        self._params = self.dist.init_parameters(self.num_nodes, params = params).reshape(-1)
+    def set_params(self, params: Union[torch.Tensor,Dict], normalize: bool = True):
+        assert params.numel() == self.num_nodes * self.dist.num_parameters()
+
+        params = params.reshape(-1)
+        if normalize:
+            params = self.dist.normalize_parameters(params)
+
+        self._param_initialized = True
+        self._params = params
+
+    def set_meta_params(self, **kwargs):
+        params = self.dist.set_meta_parameters(self.num_nodes, **kwargs)
+
+        self._param_initialized = False
+        self._params = params
 
     def init_parameters(self, perturbation: float = 2.0, recursive: bool = True, 
                         is_root: bool = True, ret_params: bool = False, **kwargs):
-        if not self.is_tied() and (not hasattr(self, "_params") or self._params is None):
+        if not self.is_tied() and not self.has_params():
             self._params = self.dist.init_parameters(
                 num_nodes = self.num_nodes,
                 perturbation = perturbation,
+                params = self.get_params(),
                 **kwargs
             )
 
@@ -81,3 +98,6 @@ class InputNodes(CircuitNodes):
                 ret_params = True,
                 **kwargs
             )
+
+    def __repr__(self):
+        return f"InputNodes(num_node_groups={self.num_node_groups}, group_size={self.group_size}, dist={type(self.dist)})"
