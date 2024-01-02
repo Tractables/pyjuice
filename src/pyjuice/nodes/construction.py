@@ -21,6 +21,8 @@ SumNodesChs = Union[ProdNodes,InputNodes]
 def inputs(var: Union[int,Sequence[int]], num_node_groups: int = 0, dist: Distribution = Distribution(), 
            params: Optional[Tensor] = None, num_nodes: int = 0, group_size: int = 0, **kwargs):
 
+    assert group_size == 0 or group_size & (group_size - 1) == 0, "`group_size` must be a power of 2."
+
     if num_nodes > 0:
         assert num_node_groups == 0, "Only one of `num_nodes` and `num_node_groups` can be set at the same time."
         if group_size == 0:
@@ -72,6 +74,8 @@ def multiply(nodes1: ProdNodesChs, *args, edge_ids: Optional[Tensor] = None, spa
 def summate(nodes1: SumNodesChs, *args, num_nodes: int = 0, num_node_groups: int = 0, 
             edge_ids: Optional[Tensor] = None, group_size: int = 0, **kwargs):
 
+    assert group_size == 0 or group_size & (group_size - 1) == 0, "`group_size` must be a power of 2."
+
     if num_nodes > 0:
         assert num_node_groups == 0, "Only one of `num_nodes` and `num_node_groups` can be set at the same time."
         if group_size == 0:
@@ -100,6 +104,8 @@ def summate(nodes1: SumNodesChs, *args, num_nodes: int = 0, num_node_groups: int
 
 class set_group_size(_DecoratorContextManager):
     def __init__(self, group_size: int = 1):
+
+        assert group_size & (group_size - 1) == 0, "`group_size` must be a power of 2."
 
         self.group_size = group_size
         

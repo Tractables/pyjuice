@@ -412,7 +412,7 @@ class ProdLayer(Layer, nn.Module):
         accum = 1 if accum else 0
         partial_eval = 1 if local_ids is not None else 0
 
-        assert num_edges & (num_edges - 1) == 0, "`num_edges` must be power of 2."
+        assert num_edges & (num_edges - 1) == 0, "`num_edges` must be a power of 2."
 
         # Fall back to the `torch.compile` kernel in the case where we cannot store child edges within a single block
         if num_edges > 1024:

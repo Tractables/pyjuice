@@ -47,7 +47,7 @@ def _record_par_blks(par_start_ids, pflow_start_ids, blk_sizes, blk_intervals, g
 @torch.no_grad()
 def compile_par_update_fn(root_ns: CircuitNodes, BLOCK_SIZE: int = 32, buffer_inc_interval: int = 10000, use_numba: bool = True):
 
-    assert BLOCK_SIZE & (BLOCK_SIZE - 1) == 0, "`BLOCK_SIZE` must be power of 2."
+    assert BLOCK_SIZE & (BLOCK_SIZE - 1) == 0, "`BLOCK_SIZE` must be a power of 2."
 
     par_start_ids = np.zeros([buffer_inc_interval], dtype = np.int64)
     pflow_start_ids = np.zeros([buffer_inc_interval], dtype = np.int64)
