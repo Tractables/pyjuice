@@ -65,7 +65,7 @@ def full_batch_em_epoch(pc, train_loader, test_loader, device):
         print(f"[train LL: {train_ll:.2f}; test LL: {test_ll:.2f}].....[train forward+backward+step {t1-t0:.2f}; test forward {t2-t1:.2f}] ")
 
 
-def pd_test():
+def pd_hclt_test():
 
     device = torch.device("cuda:0")
 
@@ -90,9 +90,10 @@ def pd_test():
         drop_last = True
     )
 
-    ns = juice.structures.PD(
+    ns = juice.structures.PDHCLT(
+        train_data.cuda(),
         data_shape = (28, 28),
-        num_latents = 256,
+        num_latents = 128,
         split_intervals = (4, 4),
         structure_type = "sum_dominated"
     )
@@ -100,39 +101,20 @@ def pd_test():
 
     pc.to(device)
 
-    optimizer = juice.optim.CircuitOptimizer(pc, lr = 0.1, pseudocount = 0.0001)
+    optimizer = juice.optim.CircuitOptimizer(pc, lr = 0.1, pseudocount = 0.1)
+    scheduler = juice.optim.CircuitScheduler(
+        optimizer, 
+        method = "multi_linear", 
+        lrs = [0.9, 0.1, 0.05], 
+        milestone_steps = [0, len(train_loader) * 100, len(train_loader) * 350]
+    )
 
-    # for batch in train_loader:
-    #     x = batch[0].to(device)
+    pc.print_statistics()
 
-    #     lls = pc(x, record_cudagraph = True)
-    #     lls.mean().backward()
-    #     break
-
-    # from torch.profiler import profile, record_function, ProfilerActivity
-    # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], with_stack = True) as prof:
-    #     for i, batch in enumerate(train_loader):
-    #         x = batch[0].to(device)
-
-    #         lls = pc(x, record_cudagraph = False)
-    #         lls.mean().backward()
-    #         pc.mini_batch_em(step_size = 0.1, pseudocount = 0.01)
-    #         if i > 10:
-    #             break
-
-    # prof.export_chrome_trace("trace3.json")
-    # # torch.autograd.profiler.tensorboard_trace_to_flame_graph('trace.json', 'flamegraph.svg')
-    # # prof.export_stacks("trace.txt", "cpu_time_total")
-    # import pdb; pdb.set_trace()
-    # exit()
-
-    mini_batch_em_epoch(5, pc, optimizer, None, train_loader, test_loader, device)
-    
-    test_ll = evaluate(pc, test_loader)
-
-    assert test_ll > -755.0
+    mini_batch_em_epoch(350, pc, optimizer, None, train_loader, test_loader, device)
+    full_batch_em_epoch(pc, train_loader, test_loader, device)
 
 
 if __name__ == "__main__":
     torch.manual_seed(2391)
-    pd_test()
+    pd_hclt_test()

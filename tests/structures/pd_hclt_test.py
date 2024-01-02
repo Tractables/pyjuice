@@ -111,8 +111,11 @@ def pd_hclt_degenerative_case_test():
 
     pc.print_statistics()
 
-    mini_batch_em_epoch(350, pc, optimizer, None, train_loader, test_loader, device)
-    full_batch_em_epoch(pc, train_loader, test_loader, device)
+    mini_batch_em_epoch(5, pc, optimizer, None, train_loader, test_loader, device)
+    
+    test_ll = evaluate(pc, test_loader)
+
+    assert test_ll > -690.0
 
 
 def pd_hclt_test():
@@ -168,11 +171,14 @@ def pd_hclt_test():
     #     lls.mean().backward()
     #     break
 
-    mini_batch_em_epoch(350, pc, optimizer, None, train_loader, test_loader, device)
-    full_batch_em_epoch(pc, train_loader, test_loader, device)
+    mini_batch_em_epoch(5, pc, optimizer, None, train_loader, test_loader, device)
+
+    test_ll = evaluate(pc, test_loader)
+
+    assert test_ll > -680.0
 
 
 if __name__ == "__main__":
     torch.manual_seed(2391)
-    # pd_hclt_degenerative_case_test()
+    pd_hclt_degenerative_case_test()
     pd_hclt_test()

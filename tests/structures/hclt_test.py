@@ -93,7 +93,7 @@ def hclt_test():
         train_data.float().to(device), 
         num_bins = 32, 
         sigma = 0.5 / 32, 
-        num_latents = 512, 
+        num_latents = 256, 
         chunk_size = 32
     )
     pc = juice.TensorCircuit(ns)
@@ -139,8 +139,11 @@ def hclt_test():
     # import pdb; pdb.set_trace()
     # exit()
 
-    mini_batch_em_epoch(350, pc, optimizer, scheduler, train_loader, test_loader, device)
-    full_batch_em_epoch(pc, train_loader, test_loader, device)
+    mini_batch_em_epoch(5, pc, optimizer, scheduler, train_loader, test_loader, device)
+
+    test_ll = evaluate(pc, test_loader)
+
+    assert test_ll > -770
 
 
 def hclt_logistic_test():
@@ -191,10 +194,13 @@ def hclt_logistic_test():
         milestone_steps = [0, len(train_loader) * 100, len(train_loader) * 350]
     )
 
-    mini_batch_em_epoch(350, pc, optimizer, scheduler, train_loader, test_loader, device)
-    full_batch_em_epoch(pc, train_loader, test_loader, device)
+    mini_batch_em_epoch(5, pc, optimizer, scheduler, train_loader, test_loader, device)
+
+    test_ll = evaluate(pc, test_loader)
+
+    assert test_ll > -990.0
 
 
 if __name__ == "__main__":
     hclt_test()
-    # hclt_logistic_test()
+    hclt_logistic_test()
