@@ -4,7 +4,7 @@ import torch
 import triton
 import triton.language as tl
 import math
-from typing import Tuple
+from typing import Tuple, Optional, Any
 
 from .distributions import Distribution
 
@@ -29,11 +29,16 @@ class DiscreteLogistic(Distribution):
     def num_param_flows(self):
         return 3
 
-    def init_parameters(self, num_nodes: int, perturbation: float = 2.0, **kwargs):
+    def init_parameters(self, num_nodes: int, perturbation: float = 2.0, params: Optional[Any] = None, **kwargs):
         """
         Initialize parameters for `num_nodes` nodes.
         Returned parameters should be flattened into a vector.
         """
+        if params is not None:
+            assert isinstance(params, torch.Tensor)
+            assert params.numel() == num_nodes * self.num_parameters()
+            return params
+
         mu = kwargs["mu"] if "mu" in kwargs else (self.val_range[0] + self.val_range[1]) / 2.0
         std = kwargs["std"] if "std" in kwargs else (self.val_range[1] - self.val_range[0]) / 4.0 # 2 sigma range
 

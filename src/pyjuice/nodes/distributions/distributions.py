@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import torch
 
+from typing import Optional, Any
+
 
 class Distribution():
     def __init__(self):
@@ -28,12 +30,20 @@ class Distribution():
         """
         raise NotImplementedError()
 
-    def init_parameters(self, num_nodes: int, perturbation: float = 2.0, **kwargs):
+    def init_parameters(self, num_nodes: int, perturbation: float = 2.0, params: Optional[Any] = None, **kwargs):
         """
         Initialize parameters for `num_nodes` nodes.
         Returned parameters should be flattened into a vector.
         """
         raise NotImplementedError()
+
+    @property
+    def need_external_params(self):
+        """
+        A flag indicating whether users need to pass in `params` to the 
+        constructor of InputNodes.
+        """
+        return False
 
     @staticmethod
     def fw_mar_fn(*args, **kwargs):
