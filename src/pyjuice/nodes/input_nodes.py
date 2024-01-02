@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import torch
-from typing import Sequence, Union, Type, Optional
+from typing import Sequence, Union, Type, Optional, Dict
 from copy import deepcopy
 
 from pyjuice.graph import InputRegionNode
@@ -21,14 +21,17 @@ class InputNodes(CircuitNodes):
 
         self.dist = dist
 
-        # Init parameters
-        if self.dist.need_external_params and params is None:
-            raise RuntimeError(f"Distribution `{self.dist}` requires `params` to be set.")
+        # Init parameters and meta-parameters
+        if self.dist.need_meta_parameters:
+            self.set_meta_params(**kwargs)
         if params is not None:
             self.set_params(params)
 
         # Callbacks
         self._run_init_callbacks(**kwargs)
+
+        # Parameter initialization flag
+        self._param_initialized = False
 
     @property
     def num_edges(self):
@@ -53,26 +56,34 @@ class InputNodes(CircuitNodes):
         return ns
 
     def get_params(self):
-        if self._params is None:
+        if not self.provided("_params"):
             return None
         else:
             return self._params
 
-    def set_params(self, params: torch.Tensor, normalize: bool = True):
+    def set_params(self, params: Union[torch.Tensor,Dict], normalize: bool = True):
         assert params.numel() == self.num_nodes * self.dist.num_parameters()
 
         params = params.reshape(-1)
         if normalize:
-            params = self.dist.normalize_params(params)
+            params = self.dist.normalize_parameters(params)
 
+        self._param_initialized = True
+        self._params = params
+
+    def set_meta_params(self, **kwargs):
+        params = self.dist.set_meta_parameters(self.num_nodes, **kwargs)
+
+        self._param_initialized = False
         self._params = params
 
     def init_parameters(self, perturbation: float = 2.0, recursive: bool = True, 
                         is_root: bool = True, ret_params: bool = False, **kwargs):
-        if not self.is_tied() and (not hasattr(self, "_params") or self._params is None):
+        if not self.is_tied() and not self.has_params():
             self._params = self.dist.init_parameters(
                 num_nodes = self.num_nodes,
                 perturbation = perturbation,
+                params = self.get_params(),
                 **kwargs
             )
 

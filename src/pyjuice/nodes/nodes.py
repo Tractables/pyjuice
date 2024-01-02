@@ -176,6 +176,9 @@ class CircuitNodes():
         self._source_node = source_ns
 
     def has_params(self):
+        if self.is_input():
+            return self._param_initialized
+
         if not self.is_tied():
             return hasattr(self, "_params") and self._params is not None
         else:

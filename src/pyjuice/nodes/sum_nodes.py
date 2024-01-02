@@ -223,7 +223,7 @@ class SumNodes(CircuitNodes):
 
         return new_chs
 
-    def _construct_edges(self, edge_ids: Optional[Union[Tensor,Sequence[Tensor]]], reorder: bool = True):
+    def _construct_edges(self, edge_ids: Optional[Union[Tensor,Sequence[Tensor]]], reorder: bool = False):
         if edge_ids is None:
             edge_ids = torch.cat(
                 (torch.arange(self.num_node_groups).unsqueeze(1).repeat(1, self.num_ch_node_groups).reshape(1, -1),

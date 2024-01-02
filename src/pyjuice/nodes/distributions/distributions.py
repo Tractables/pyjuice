@@ -15,8 +15,15 @@ class Distribution():
     def get_metadata(self):
         return [] # no metadata
 
-    def normalize_params(self, params: torch.Tensor):
+    def normalize_parameters(self, params: torch.Tensor, **kwargs):
         return params
+
+    def set_meta_parameters(self, **kwargs):
+        """
+        Assign meta-parameters to `self._params`.
+        Note: the actual parameters are not initialized after this function call.
+        """
+        raise NotImplementedError()
 
     def num_parameters(self):
         """
@@ -37,10 +44,17 @@ class Distribution():
         """
         raise NotImplementedError()
 
-    @property
-    def need_external_params(self):
+    def init_meta_parameters(self, num_nodes: int, params: Any, **kwargs):
         """
-        A flag indicating whether users need to pass in `params` to the 
+        Initialize meta-parameters for `num_nodes` nodes.
+        Return shape should be the same with `init_parameters`.
+        """
+        raise NotImplementedError()
+
+    @property
+    def need_meta_parameters(self):
+        """
+        A flag indicating whether users need to pass in meta-parameters to the 
         constructor of InputNodes.
         """
         return False

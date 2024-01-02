@@ -57,20 +57,53 @@ class MaskedCategorical(Distribution):
     def num_param_flows(self):
         return self.num_cats
 
-    def init_parameters(self, num_nodes: int, perturbation: float = 2.0, params: Optional[Any] = None, **kwargs):
+    def init_parameters(self, num_nodes: int, perturbation: float = 2.0, params: Optional[torch.Tensor] = None, **kwargs):
         """
         Initialize parameters for `num_nodes` nodes.
         Returned parameters should be flattened into a vector.
         """
-        assert params is not None, "Musk info should be provided."
+        assert params is not None, "Parameters should be provided to get meta-parameters."
+        params = params.reshape(-1, self.num_parameters())
+        assert params.size(0) == num_nodes
 
-        if isinstance(params, dict):
-            mask_tensor = params["masks"].float()
-        elif isinstance(params, torch.Tensor):
-            mask_tensor = params.float()
-        else:
-            raise ValueError()
+        num_nodes = params.size(0)
 
+        if self.mask_mode == "range":
+            mask_tensor = params[:,self.num_cats:self.num_cats+2]
+        elif self.mask_mode == "full_mask":
+            mask_tensor = params[:,self.num_cats:self.num_cats*2]
+        elif self.mask_mode == "rev_range":
+            mask_tensor = params[:,self.num_cats:self.num_cats+2]
+
+        cat_params = torch.exp(torch.rand([num_nodes, self.num_cats]) * -perturbation)
+        
+        # Apply mask
+        self._apply_mask(cat_params, num_nodes, mask_tensor)
+        
+        cat_params /= cat_params.sum(dim = 1, keepdim = True)
+
+        params = params.clone()
+        params[:,:self.num_cats] = cat_params
+
+        return params.reshape(-1)
+
+    def normalize_parameters(self, params: torch.Tensor):
+        params = params.reshape(-1, self.num_parameters())
+        num_nodes = params.size(0)
+
+        cat_params = params[:,:self.num_cats]
+
+        # Apply mask
+        self._apply_mask(cat_params, num_nodes, mask_tensor)
+
+        cat_params /= cat_params.sum(dim = 1, keepdim = True)
+        params[:,:self.num_cats] = cat_params
+
+        return params.reshape(-1)
+
+    def set_meta_parameters(self, num_nodes: int, **kwargs):
+        assert "mask" in kwargs, "`MaskedCategorical` requires an input argument `mask`."
+        mask_tensor = kwargs["mask"]
         assert mask_tensor.size(0) == num_nodes
 
         if self.mask_mode == "range":
@@ -83,19 +116,7 @@ class MaskedCategorical(Distribution):
             assert mask_tensor.size(1) == 2
             num_free_cats = self.num_cats - (mask_tensor[:,1:2] - mask_tensor[:,0:1])
 
-        cat_params = torch.exp(torch.rand([num_nodes, self.num_cats]) * -perturbation)
-        
-        # Apply mask
-        if self.mask_mode == "range":
-            mask = torch.arange(self.num_cats).unsqueeze(0).expand(num_nodes, -1)
-            cat_params[(mask < mask_tensor[:,:1]) | (mask >= mask_tensor[:,1:])] = 0.0
-        elif self.mask_mode == "full_mask":
-            cat_params[(mask_tensor < 0.5)] = 0.0
-        elif self.mask_mode == "rev_range":
-            mask = torch.arange(self.num_cats).unsqueeze(0).expand(num_nodes, -1)
-            cat_params[(mask >= mask_tensor[:,:1]) & (mask < mask_tensor[:,1:])] = 0.0
-        
-        cat_params /= cat_params.sum(dim = 1, keepdim = True)
+        cat_params = torch.zeros([num_nodes, self.num_cats])
 
         params = torch.cat(
             (cat_params, mask_tensor, num_free_cats), 
@@ -105,12 +126,25 @@ class MaskedCategorical(Distribution):
         return params.reshape(-1)
 
     @property
-    def need_external_params(self):
+    def need_meta_parameters(self):
         """
-        A flag indicating whether users need to pass in `params` to the 
-        constructor of InputNodes.
+        A flag indicating whether users need to pass in meta-parameters to the 
+        constructor of InputNodes. In this case, we need to provide information
+        regarding the categorical mask.
         """
         return True
+
+    def _apply_mask(self, cat_params: torch.Tensor, num_nodes: int, mask_tensor: torch.Tensor):
+        if self.mask_mode == "range":
+            mask = torch.arange(self.num_cats).unsqueeze(0).expand(num_nodes, -1)
+            cat_params[(mask < mask_tensor[:,:1]) | (mask >= mask_tensor[:,1:])] = 0.0
+        elif self.mask_mode == "full_mask":
+            cat_params[(mask_tensor < 0.5)] = 0.0
+        elif self.mask_mode == "rev_range":
+            mask = torch.arange(self.num_cats).unsqueeze(0).expand(num_nodes, -1)
+            cat_params[(mask >= mask_tensor[:,:1]) & (mask < mask_tensor[:,1:])] = 0.0
+        else:
+            raise ValueError(f"Unknown mask mode {self.mask_mode}.")
 
     @staticmethod
     def fw_mar_fn_range(local_offsets, data, params_ptr, s_pids, metadata_ptr, s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE):
