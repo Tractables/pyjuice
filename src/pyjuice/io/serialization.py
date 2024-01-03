@@ -59,16 +59,25 @@ def deserialize_nodes(nodes_list: Sequence):
             scope = ns_info["scope"]
             dist = pickle.loads(ns_info["dist"])
 
-            ns = inputs(scope, num_node_groups, dist, group_size = group_size)
+            ns = inputs(scope, num_node_groups, dist, group_size = group_size, 
+                        _no_set_meta_params = dist.need_meta_parameters)
 
             if "params" in ns_info:
-                ns.set_params(torch.from_numpy(ns_info["params"]))
+                if dist.need_meta_parameters:
+                    ns._params = torch.from_numpy(ns_info["params"])
+                else:
+                    ns.set_params(torch.from_numpy(ns_info["params"]), normalize = False)
 
         elif ns_info["type"] == "Product":
             chs = [id2ns[cid] for cid in chids]
-            edge_ids = ns_info["edge_ids"]
+            edge_ids = torch.from_numpy(ns_info["edge_ids"])
 
-            ns = multiply(*chs, edge_ids = edge_ids)
+            if edge_ids.size(0) == chs[0].num_node_groups:
+                sparse_edges = False
+            else:
+                sparse_edges = True
+
+            ns = multiply(*chs, edge_ids = edge_ids, sparse_edges = sparse_edges)
 
         else:
             assert ns_info["type"] == "Sum"

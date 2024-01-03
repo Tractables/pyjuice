@@ -12,7 +12,8 @@ from .nodes import CircuitNodes
 
 class InputNodes(CircuitNodes):
     def __init__(self, num_node_groups: int, scope: Union[Sequence,BitSet], dist: Distribution, 
-                 params: Optional[torch.Tensor] = None, group_size: int = 0, **kwargs) -> None:
+                 params: Optional[torch.Tensor] = None, group_size: int = 0, 
+                 _no_set_meta_params: bool = False, **kwargs) -> None:
 
         rg_node = InputRegionNode(scope)
         super(InputNodes, self).__init__(num_node_groups, rg_node, group_size = group_size, **kwargs)
@@ -22,7 +23,7 @@ class InputNodes(CircuitNodes):
         self.dist = dist
 
         # Init parameters and meta-parameters
-        if self.dist.need_meta_parameters:
+        if not _no_set_meta_params and self.dist.need_meta_parameters:
             self.set_meta_params(**kwargs)
         if params is not None:
             self.set_params(params)

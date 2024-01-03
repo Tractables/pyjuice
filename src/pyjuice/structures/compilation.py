@@ -4,7 +4,7 @@ import torch
 import networkx as nx
 from typing import Type, Optional
 
-from pyjuice.nodes import multiply, summate, inputs, set_group_size
+from pyjuice.nodes import multiply, summate, inputs, set_group_size, CircuitNodes
 from pyjuice.nodes.distributions import Distribution
 from pyjuice.utils.util import max_cdf_power_of_2
 
@@ -15,7 +15,7 @@ def BayesianTreeToHiddenRegionGraph(tree: nx.Graph,
                                     InputDist: Type[Distribution], 
                                     dist_params: dict,
                                     num_root_ns: int = 1,
-                                    group_size: Optional[int] = None) -> RegionGraph:
+                                    group_size: Optional[int] = None) -> CircuitNodes:
     """
     Given a Tree Bayesian Network tree T1 (i.e. at most one parents), 
     
