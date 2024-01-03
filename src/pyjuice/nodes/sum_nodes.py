@@ -270,4 +270,5 @@ class SumNodes(CircuitNodes):
         return edge_ids[:,ids].contiguous()
 
     def __repr__(self):
-        return f"SumNodes(num_node_groups={self.num_node_groups}, group_size={self.group_size}, num_chs={self.num_chs}, num_edges={self.num_edges})"
+        scope_size = len(self.scope)
+        return f"SumNodes(num_node_groups={self.num_node_groups}, group_size={self.group_size}, num_chs={self.num_chs}, num_edges={self.num_edges}, scope_size={scope_size})"

@@ -77,10 +77,6 @@ class ProdNodes(CircuitNodes):
             **kwargs
         )
 
-    def __repr__(self):
-        edge_type = "sparse" if self.edge_type == self.SPARSE else "block_sparse"
-        return f"ProdNodes(num_node_groups={self.num_node_groups}, group_size={self.group_size}, num_chs={self.num_chs}, edge_type='{edge_type}')"
-
     def _construct_edges(self, edge_ids: Optional[Tensor]):
         if edge_ids is None:
             for c in self.chs:
@@ -107,3 +103,8 @@ class ProdNodes(CircuitNodes):
             raise RuntimeError(f"Unexpected shape of `edge_ids`: ({edge_ids.size(0)}, {edge_ids.size(1)})")
 
         self.edge_ids = edge_ids
+
+    def __repr__(self):
+        edge_type = "sparse" if self.edge_type == self.SPARSE else "block_sparse"
+        scope_size = len(self.scope)
+        return f"ProdNodes(num_node_groups={self.num_node_groups}, group_size={self.group_size}, num_chs={self.num_chs}, edge_type='{edge_type}', scope_size={scope_size})"
