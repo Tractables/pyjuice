@@ -128,7 +128,10 @@ class BitSet(object):
         return self.length
 
     def __repr__(self):
-        return "BitSet(byte_length={},length={})".format(self.byte_length, self.length)
+        if self.length <= 16:
+            return "BitSet([" + ",".join(self.to_list()) + "])"
+        else:
+            return "BitSet(num_elements={})".format(self.length)
 
     def __hash__(self):
         return hash(bytes(self.values))
