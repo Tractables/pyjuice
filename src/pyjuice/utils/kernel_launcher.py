@@ -37,10 +37,6 @@ class FastJITFunction():
             if "batch_size" in kwargs:
                 signature_list.append(("batch_size", kwargs["batch_size"]))
 
-            for i, arg in enumerate(args):
-                if isinstance(arg, torch.Tensor):
-                    signature_list.append((i, id(arg)))
-
             grid_length = len(grid)
             grid0, grid1, grid2 = grid[0], grid[1] if grid_length > 1 else 1, grid[2] if grid_length > 2 else 1
 
