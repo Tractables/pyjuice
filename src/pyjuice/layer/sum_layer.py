@@ -1984,7 +1984,6 @@ class SumLayer(Layer, nn.Module):
         grid = (B_NUM_TILES, K_NUM_BLOCKS, layer_n_nodes)
 
         self._bk_triton_sparse_par_kernel[grid](
-            ddd = ddd,
             node_flows = node_flows, 
             node_mars = node_mars, 
             element_mars = element_mars, 
