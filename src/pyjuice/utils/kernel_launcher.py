@@ -41,9 +41,8 @@ class FastJITFunction():
                 if isinstance(arg, torch.Tensor):
                     signature_list.append((i, id(arg)))
 
-            grid0 = grid[0]
-            grid1 = grid[1] if len(grid) > 1 else 1
-            grid2 = grid[2] if len(grid) > 2 else 1
+            grid_length = len(grid)
+            grid0, grid1, grid2 = grid[0], grid[1] if grid_length > 1 else 1, grid[2] if grid_length > 2 else 1
 
             signature = tuple(signature_list)
             if signature in self.cache:
