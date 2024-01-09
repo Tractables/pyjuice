@@ -14,6 +14,9 @@ from pyjuice.model import TensorCircuit
 # Construction methods
 from pyjuice.nodes import multiply, summate, inputs, set_group_size
 
+# Distributions
+from pyjuice.nodes import distributions
+
 # LVD
 from pyjuice.nodes.methods.lvd import LVDistiller
 
