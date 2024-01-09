@@ -267,6 +267,13 @@ class InputLayer(Layer, nn.Module):
                 assert self.num_vars_per_node == 1, "`missing_mask` only supported for univariate distributions."
 
                 mask_dim = missing_mask.dim()
+                num_vars = data.size(0)
+                if mask_dim == 1:
+                    mode = 0
+                elif num_vars == missing_mask.size(0):
+                    mode = 1
+                else:
+                    mode = 2
 
                 grid = (triton.cdiv(layer_num_nodes * batch_size, BLOCK_SIZE),)
 
@@ -275,12 +282,13 @@ class InputLayer(Layer, nn.Module):
                     node_mars_ptr = node_mars, 
                     vids_ptr = self.vids, 
                     fw_local_ids_ptr = fw_local_ids,
+                    num_vars = num_vars,
                     layer_num_nodes = layer_num_nodes, 
                     batch_size = batch_size, 
                     node_offset = node_offset, 
                     BLOCK_SIZE = 1024, 
                     partial_eval = 1 if fw_local_ids is not None else 0,
-                    mask_dim = mask_dim,
+                    mode = mode,
                     num_warps = 8
                 )
 
@@ -629,9 +637,9 @@ class InputLayer(Layer, nn.Module):
 
     @staticmethod
     @triton.jit
-    def _fw_missing_mask_kernel(missing_mask_ptr, node_mars_ptr, vids_ptr, fw_local_ids_ptr, layer_num_nodes: tl.constexpr, 
-                                batch_size: tl.constexpr, node_offset: tl.constexpr, BLOCK_SIZE: tl.constexpr, 
-                                partial_eval: tl.constexpr, mask_dim: tl.constexpr):
+    def _fw_missing_mask_kernel(missing_mask_ptr, node_mars_ptr, vids_ptr, fw_local_ids_ptr, num_vars,
+                                layer_num_nodes: tl.constexpr, batch_size: tl.constexpr, node_offset: tl.constexpr, 
+                                BLOCK_SIZE: tl.constexpr, partial_eval: tl.constexpr, mode: tl.constexpr):
         pid = tl.program_id(axis = 0)
         block_start = pid * BLOCK_SIZE
 
@@ -649,10 +657,16 @@ class InputLayer(Layer, nn.Module):
         vids = tl.load(vids_ptr + local_offsets, mask = mask, other = 0)
 
         # Fetch mask
-        if mask_dim == 1:
+        if mode == 0:
+            # `mask_dim == 1`
             missing_mask = tl.load(missing_mask_ptr + vids, mask = mask, other = False)
-        else:
+        elif mode == 1:
+            # `mask_dim == 1` and second dimension is batch
             mask_offsets = vids * batch_size + batch_offsets
+            missing_mask = tl.load(missing_mask_ptr + mask_offsets, mask = mask, other = False)
+        elif mode == 2:
+            # `mask_dim == 1` and first dimension is batch
+            mask_offsets = vids + batch_offsets * num_vars
             missing_mask = tl.load(missing_mask_ptr + mask_offsets, mask = mask, other = False)
 
         # Apply mask
