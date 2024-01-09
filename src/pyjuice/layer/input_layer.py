@@ -22,7 +22,7 @@ from .layer import Layer
 
 
 class InputLayer(Layer, nn.Module):
-    def __init__(self, nodes: Sequence[InputNodes], cum_nodes: int = 0, max_tied_ns_per_parflow_group: int = 4) -> None:
+    def __init__(self, nodes: Sequence[InputNodes], cum_nodes: int = 0, pc_num_vars: int = 0, max_tied_ns_per_parflow_group: int = 4) -> None:
         """
         Compiler flags:
         - `max_tied_ns_per_parflow_group`: the maximum number of tied nodes allowed in the backward pass. Setting to a larger value will
@@ -35,6 +35,9 @@ class InputLayer(Layer, nn.Module):
 
         # Reorder input nodes such that for any tied nodes, its source nodes appear before them
         self.nodes = self._reorder_nodes(nodes)
+
+        # Total number of variables
+        self.pc_num_vars = pc_num_vars
 
         ## Parse input `nodes` ##
         node_vars = []
@@ -208,7 +211,8 @@ class InputLayer(Layer, nn.Module):
         return None
 
     def forward(self, data: torch.Tensor, node_mars: torch.Tensor, params: Optional[Dict] = None,
-                missing_mask: Optional[torch.Tensor] = None, _apply_missing_mask_only: bool = False):
+                missing_mask: Optional[torch.Tensor] = None, _batch_first: bool = True, 
+                _apply_missing_mask_only: bool = False):
         self._used_external_params = (params is not None)
 
         if params is None:
@@ -267,10 +271,9 @@ class InputLayer(Layer, nn.Module):
                 assert self.num_vars_per_node == 1, "`missing_mask` only supported for univariate distributions."
 
                 mask_dim = missing_mask.dim()
-                num_vars = data.size(0)
                 if mask_dim == 1:
                     mode = 0
-                elif num_vars == missing_mask.size(0):
+                elif _batch_first or num_vars == missing_mask.size(1):
                     mode = 1
                 else:
                     mode = 2
@@ -282,7 +285,7 @@ class InputLayer(Layer, nn.Module):
                     node_mars_ptr = node_mars, 
                     vids_ptr = self.vids, 
                     fw_local_ids_ptr = fw_local_ids,
-                    num_vars = num_vars,
+                    num_vars = self.pc_num_vars,
                     layer_num_nodes = layer_num_nodes, 
                     batch_size = batch_size, 
                     node_offset = node_offset, 
@@ -661,12 +664,12 @@ class InputLayer(Layer, nn.Module):
             # `mask_dim == 1`
             missing_mask = tl.load(missing_mask_ptr + vids, mask = mask, other = False)
         elif mode == 1:
-            # `mask_dim == 1` and second dimension is batch
-            mask_offsets = vids * batch_size + batch_offsets
-            missing_mask = tl.load(missing_mask_ptr + mask_offsets, mask = mask, other = False)
-        elif mode == 2:
             # `mask_dim == 1` and first dimension is batch
             mask_offsets = vids + batch_offsets * num_vars
+            missing_mask = tl.load(missing_mask_ptr + mask_offsets, mask = mask, other = False)
+        elif mode == 2:
+            # `mask_dim == 1` and second dimension is batch
+            mask_offsets = vids * batch_size + batch_offsets
             missing_mask = tl.load(missing_mask_ptr + mask_offsets, mask = mask, other = False)
 
         # Apply mask

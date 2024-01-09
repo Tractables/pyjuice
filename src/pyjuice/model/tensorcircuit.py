@@ -546,6 +546,9 @@ class TensorCircuit(nn.Module):
         # Clear hooks/pointers used by previous `TensorCircuit`s
         self.root_ns._clear_tensor_circuit_hooks()
 
+        # TOtal number of variables
+        pc_num_vars = len(self.root_ns.scope)
+
         # Create layers
         depth2nodes, num_layers, max_node_group_size, max_ele_group_size = self._create_node_layers()
 
@@ -587,7 +590,8 @@ class TensorCircuit(nn.Module):
                 for signature, nodes in signature2nodes.items():
                     input_layer = InputLayer(
                         nodes = nodes, cum_nodes = num_nodes,
-                        max_tied_ns_per_parflow_group = max_tied_ns_per_parflow_group
+                        max_tied_ns_per_parflow_group = max_tied_ns_per_parflow_group,
+                        pc_num_vars = pc_num_vars
                     )
 
                     input_layers.append(input_layer)
