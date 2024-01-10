@@ -67,26 +67,28 @@ def full_batch_em_epoch(pc, train_loader, test_loader, device):
 
 def homogenes_hmm(seq_length, num_latents, vocab_size):
     
+    group_size = min(juice.utils.util.max_cdf_power_of_2(num_latents), 1024)
+    num_node_groups = num_latents // group_size
     
-    # with juice.set_group_size(group_size = 32):
-    ns_input = juice.inputs(seq_length - 1, num_latents,
-                            dists.Categorical(num_cats=vocab_size))
-    
-    ns_sum = None
-    curr_zs = ns_input
-    for var in range(seq_length - 2, -1, -1):
-        curr_xs = ns_input.duplicate(var, tie_params = True)
+    with juice.set_group_size(group_size = group_size):
+        ns_input = juice.inputs(seq_length - 1, num_node_groups = num_node_groups,
+                                dist = dists.Categorical(num_cats = vocab_size))
         
-        if ns_sum is None:
-            ns = juice.summate(
-                curr_zs, num_nodes = num_latents)
-            ns_sum = ns
-        else:
-            ns = ns_sum.duplicate(curr_zs, tie_params=True)
+        ns_sum = None
+        curr_zs = ns_input
+        for var in range(seq_length - 2, -1, -1):
+            curr_xs = ns_input.duplicate(var, tie_params = True)
+            
+            if ns_sum is None:
+                ns = juice.summate(
+                    curr_zs, num_node_groups = num_node_groups)
+                ns_sum = ns
+            else:
+                ns = ns_sum.duplicate(curr_zs, tie_params=True)
 
-        curr_zs = juice.multiply(curr_xs, ns)
-        
-    ns = juice.summate(curr_zs, num_nodes=1)
+            curr_zs = juice.multiply(curr_xs, ns)
+            
+        ns = juice.summate(curr_zs, num_node_groups = 1, group_size = 1)
     
     ns.init_parameters()
     
@@ -96,12 +98,10 @@ def homogenes_hmm(seq_length, num_latents, vocab_size):
 def train_hmm(enable_cudagrph = True):
 
     device = torch.device("cuda:0")
-    # ns = juice.structures.HMM(
-    #     16, # T = 16
-    #     num_latents = 16384, #8192, 
-    #     input_layer_params = {"num_cats": 50257})
+
     T = 5
     ns = homogenes_hmm(T, 16384, 50257)
+    import pdb; pdb.set_trace()
     
     pc = juice.TensorCircuit(ns, max_tied_ns_per_parflow_group = 9999999)
 
