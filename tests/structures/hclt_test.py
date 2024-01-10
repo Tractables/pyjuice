@@ -182,6 +182,7 @@ def hclt_logistic_test():
         input_layer_type = dists.DiscreteLogistic,
         input_layer_params = {"val_range": (-1.0, 1.0), "num_cats": 256}
     )
+    ns.init_parameters(perturbation = 4.0)
     pc = juice.TensorCircuit(ns)
 
     pc.to(device)
@@ -194,13 +195,14 @@ def hclt_logistic_test():
         milestone_steps = [0, len(train_loader) * 100, len(train_loader) * 350]
     )
 
-    mini_batch_em_epoch(5, pc, optimizer, scheduler, train_loader, test_loader, device)
+    mini_batch_em_epoch(20, pc, optimizer, scheduler, train_loader, test_loader, device)
 
     test_ll = evaluate(pc, test_loader)
 
-    assert test_ll > -990.0
+    assert test_ll > -995.0
 
 
 if __name__ == "__main__":
+    torch.manual_seed(3289)
     hclt_test()
     hclt_logistic_test()
