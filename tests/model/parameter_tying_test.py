@@ -136,7 +136,7 @@ def simple_structure_test_group1():
 
     assert torch.all(pc.inner_layer_groups[5][0].partitioned_pids[0] == torch.tensor([[5, 6, 7, 8], [9, 10, 11, 12]]))
 
-    assert torch.all(pc.inner_layer_groups[5][0].partitioned_pfids[0] == torch.tensor([[16, 17, 18, 19], [20, 21, 22, 23]]))
+    assert torch.all(pc.inner_layer_groups[5][0].partitioned_pfids[0] == torch.tensor([[8, 9, 10, 11], [12, 13, 14, 15]]))
 
     assert torch.all(pc.inner_layer_groups[5][0].partitioned_chids[0] == torch.arange(1, 5))
     assert torch.all(pc.inner_layer_groups[5][0].partitioned_parids[0] == torch.tensor([19, 20]).reshape(1, 2))
@@ -282,7 +282,7 @@ def simple_structure_test_group1():
     assert torch.all(torch.abs(node_flows[7:9,:] - ni3_flows) < 1e-4)
 
     assert torch.all(torch.abs(param_flows0.reshape(-1) - (param_flows[0:4] + param_flows[4:8])) < 1e-4)
-    assert torch.all(torch.abs(param_flows1.reshape(-1) - (param_flows[8:16] + param_flows[16:24])) < 1e-4)
+    assert torch.all(torch.abs(param_flows1.reshape(-1) - param_flows[8:16]) < 1e-4)
 
     ## Parameter learning & flow aggregation tests ##
 
@@ -433,8 +433,8 @@ def simple_structure_test_group16():
     assert torch.all(pc.inner_layer_groups[5][0].partitioned_pids[0][0,:] == torch.arange(1280, 2304, 16))
     assert torch.all(pc.inner_layer_groups[5][0].partitioned_pids[0][1,:] == torch.arange(2304, 3328, 16))
 
-    assert torch.all(pc.inner_layer_groups[5][0].partitioned_pfids[0][0,:] == torch.arange(4096, 5120, 16))
-    assert torch.all(pc.inner_layer_groups[5][0].partitioned_pfids[0][1,:] == torch.arange(5120, 6144, 16))
+    assert torch.all(pc.inner_layer_groups[5][0].partitioned_pfids[0][0,:] == torch.arange(2048, 3072, 16))
+    assert torch.all(pc.inner_layer_groups[5][0].partitioned_pfids[0][1,:] == torch.arange(3072, 4096, 16))
 
     assert torch.all(pc.inner_layer_groups[5][0].partitioned_chids[0] == torch.arange(1, 5) * 16)
     assert torch.all(pc.inner_layer_groups[5][0].partitioned_parids[0] == torch.tensor([19, 20]).reshape(1, 2) * 16)
@@ -582,7 +582,7 @@ def simple_structure_test_group16():
     ref_param_flows0 = (param_flows[0:1024] + param_flows[1024:2048]).reshape(2, 2, 16, 16).permute(0, 3, 1, 2).reshape(-1)
     assert torch.all(torch.abs(param_flows0.reshape(-1) - ref_param_flows0) < 1e-2)
 
-    ref_param_flows1 = (param_flows[2048:4096] + param_flows[4096:6144]).reshape(2, 4, 16, 16).permute(0, 3, 1, 2).reshape(-1)
+    ref_param_flows1 = param_flows[2048:4096].reshape(2, 4, 16, 16).permute(0, 3, 1, 2).reshape(-1)
     assert torch.all(torch.abs(param_flows1.reshape(-1) - ref_param_flows1) < 1e-2)
 
     ## Parameter learning & flow aggregation tests ##

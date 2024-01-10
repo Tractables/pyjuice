@@ -87,7 +87,7 @@ def homogeneous_hmm_test():
     assert torch.all(pc.inner_layer_groups[5][0].partitioned_nids[0] == torch.tensor([13, 14]))
     assert torch.all(pc.inner_layer_groups[5][0].partitioned_cids[0] == torch.tensor([[1, 2], [1, 2]]))
     assert torch.all(pc.inner_layer_groups[5][0].partitioned_pids[0] == torch.tensor([[1, 2], [3, 4]]))
-    assert torch.all(pc.inner_layer_groups[5][0].partitioned_pfids[0] == torch.tensor([[4, 5], [6, 7]]))
+    assert torch.all(pc.inner_layer_groups[5][0].partitioned_pfids[0] == torch.tensor([[0, 1], [2, 3]]))
 
     assert torch.all(pc.inner_layer_groups[5][0].partitioned_chids[0] == torch.tensor([1, 2]))
     assert torch.all(pc.inner_layer_groups[5][0].partitioned_parids[0] == torch.tensor([[13, 14], [13, 14]]))
@@ -189,7 +189,7 @@ def homogeneous_hmm_test():
     ni0_flows = element_flows[1:3,:]
     ni1_flows = element_flows[1:3,:]
 
-    assert torch.all(torch.abs(param_flows1.reshape(-1) - (param_flows[0:4] + param_flows[4:8])) < 1e-4)
+    assert torch.all(torch.abs(param_flows1.reshape(-1) - param_flows[0:4]) < 1e-4)
 
     ## Parameter learning & flow aggregation tests ##
 

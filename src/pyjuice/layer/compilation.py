@@ -309,6 +309,7 @@ def sum_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, 
 
     # This is the main loop: iterate over `ns` in the layer
     ngroup_start = 0 # The start index of the node groups in the current `ns`
+    node2tiedcounts = dict() # Locally accumulate the occupation count
     for ns_idx, ns in enumerate(nodes):
 
         if not ns.is_tied():
@@ -354,23 +355,26 @@ def sum_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, 
                 add_params_flag = False
 
             if source_ns not in node2tiednodes:
-                node2tiednodes[source_ns] = [[source_ns], 1, source_ns._param_flow_range]
+                node2tiednodes[source_ns] = [[source_ns], [source_ns._param_flow_range]]
+                node2tiedcounts[source_ns] = [1]
+            elif source_ns not in node2tiedcounts:
+                node2tiedcounts[source_ns] = [0 for _ in range(len(node2tiednodes[source_ns][0]))]
             
-            dup_count = node2tiednodes[source_ns][1]
-            if dup_count >= max_tied_ns_per_parflow_group:
+            if all([dup_count >= max_tied_ns_per_parflow_group for dup_count in node2tiedcounts[source_ns]]):
                 global_pfid_end = global_pfid_start + ns.num_edges
                 ns._param_flow_range = (global_pfid_start, global_pfid_end)
                 global_pfid_start = global_pfid_end
-                node2tiednodes[source_ns][2] = ns._param_flow_range
+                node2tiednodes[source_ns][1].append(ns._param_flow_range)
 
                 node2tiednodes[source_ns][0].append(ns)
-                node2tiednodes[source_ns][1] = 1
+                node2tiedcounts[source_ns].append(1)
 
                 add_param_flows_flag = True
             else:
-                ns._param_flow_range = deepcopy(node2tiednodes[source_ns][2])
+                target_id = min(range(len(node2tiedcounts[source_ns])), key = lambda i: node2tiedcounts[source_ns][i])
+                ns._param_flow_range = deepcopy(node2tiednodes[source_ns][1][target_id])
 
-                node2tiednodes[source_ns][1] += 1
+                node2tiedcounts[source_ns][target_id] += 1
 
                 add_param_flows_flag = False
 
