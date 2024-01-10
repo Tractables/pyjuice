@@ -27,7 +27,7 @@ def input_layer_test():
         ni2 = inputs(2, num_node_groups = 2, dist = dists.Categorical(num_cats = 2))
         ni3 = inputs(3, num_node_groups = 2, dist = dists.Categorical(num_cats = 2))
 
-    layer = InputLayer([ni0, ni1, ni2, ni3], cum_nodes = 1)
+    layer = InputLayer([ni0, ni1, ni2, ni3], cum_nodes = 1, pc_num_vars = 4)
 
     layer._init_parameters(perturbation = 2.0)
 
@@ -65,14 +65,14 @@ def input_layer_test():
             else:
                 assert torch.abs(node_mars[j+1,i].exp() - 1.0) < 1e-4
 
-    missing_mask = torch.randint(0, 2, (4, batch_size)).bool().to(device)
+    missing_mask = torch.randint(0, 2, (batch_size, 4)).bool().to(device)
 
     layer(data, node_mars, missing_mask = missing_mask)
 
     for i in range(16):
         for j in range(4 * 2 * group_size):
             v = j // (2*group_size)
-            if not missing_mask[v,i]:
+            if not missing_mask[i,v]:
                 assert torch.abs(node_mars[j+1,i].exp() - layer.params[j*2+data[v,i]]) < 1e-4
             else:
                 assert torch.abs(node_mars[j+1,i].exp() - 1.0) < 1e-4
@@ -125,7 +125,7 @@ def tied_bp_test():
         ni2 = inputs(2, num_node_groups = 2, dist = dists.Categorical(num_cats = 2))
         ni3 = ni1.duplicate(3, tie_params = True)
 
-    layer = InputLayer([ni0, ni1, ni2, ni3], cum_nodes = 1, max_tied_ns_per_parflow_group = 1.0)
+    layer = InputLayer([ni0, ni1, ni2, ni3], cum_nodes = 1, pc_num_vars = 3, max_tied_ns_per_parflow_group = 1.0)
 
     layer._init_parameters(perturbation = 2.0)
 
@@ -182,7 +182,7 @@ def speed_test():
         for v in range(num_vars):
             nis.append(inputs(v, num_node_groups = num_node_groups, dist = dists.Categorical(num_cats = 64)))
 
-    layer = InputLayer(nis, cum_nodes = 1)
+    layer = InputLayer(nis, cum_nodes = 1, pc_num_vars = num_vars)
 
     layer._init_parameters(perturbation = 2.0)
 
@@ -225,7 +225,7 @@ def speed_test():
     print("Reference computation time on RTX 4090: 1.434ms.")
     print("--------------------------------------------------------------")
 
-    missing_mask = torch.randint(0, 2, (num_vars, batch_size)).bool().to(device)
+    missing_mask = torch.randint(0, 2, (batch_size, num_vars)).bool().to(device)
 
     layer(data, node_mars, missing_mask = missing_mask)
 
