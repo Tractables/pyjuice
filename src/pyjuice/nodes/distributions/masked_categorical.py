@@ -87,11 +87,19 @@ class MaskedCategorical(Distribution):
 
         return params.reshape(-1)
 
-    def normalize_parameters(self, params: torch.Tensor):
+    def normalize_parameters(self, params: torch.Tensor, mask_tensor: Optional[torch.Tensor] = None):
         params = params.reshape(-1, self.num_parameters())
         num_nodes = params.size(0)
 
         cat_params = params[:,:self.num_cats]
+
+        if mask_tensor is None:
+            if self.mask_mode == "range":
+                mask_tensor = params[:,self.num_cats:self.num_cats+2]
+            elif self.mask_mode == "full_mask":
+                mask_tensor = params[:,self.num_cats:self.num_cats*2]
+            elif self.mask_mode == "rev_range":
+                mask_tensor = params[:,self.num_cats:self.num_cats+2]
 
         # Apply mask
         self._apply_mask(cat_params, num_nodes, mask_tensor)
