@@ -194,7 +194,7 @@ class InputLayer(Layer, nn.Module):
 
         self.device = device
 
-    def init_param_flows(self, flows_memory: float = 0.0):
+    def init_param_flows(self, flows_memory: float = 1.0):
         batch_size = self._param_batch_size
         if self.param_flows is None \
                 or (self.param_flows.dim() == 1 and batch_size > 1) \
@@ -206,7 +206,8 @@ class InputLayer(Layer, nn.Module):
             self.param_flows = torch.zeros(shape, device = self.device)
         else:
             assert self.param_flows.size(0) == self.num_param_flows
-            self.param_flows[:] *= flows_memory
+            if flows_memory < 1.0:
+                self.param_flows[:] *= flows_memory
 
         return None
 
