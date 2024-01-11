@@ -92,11 +92,12 @@ def train_mnist_pd():
 
     ns = juice.structures.PD(
         data_shape = (28, 28),
-        num_latents = 128,
+        num_latents = 512,
         split_intervals = (4, 4),
         structure_type = "sum_dominated"
     )
     pc = juice.TensorCircuit(ns)
+    pc.print_statistics()
 
     pc.to(device)
 

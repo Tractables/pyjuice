@@ -33,7 +33,8 @@ def mini_batch_em_epoch(num_epochs, pc, optimizer, scheduler, train_loader, test
             train_ll += lls.mean().detach().cpu().numpy().item()
 
             optimizer.step()
-            scheduler.step()
+            if scheduler is not None:
+                scheduler.step()
 
         train_ll /= len(train_loader)
 
@@ -99,14 +100,26 @@ def train_hmm(enable_cudagrph = True):
 
     device = torch.device("cuda:0")
 
-    T = 5
-    ns = homogenes_hmm(T, 16384, 50257)
-    import pdb; pdb.set_trace()
+    T = 32
+    ns = homogenes_hmm(T, 64, 33279)
     
-    pc = juice.TensorCircuit(ns, max_tied_ns_per_parflow_group = 9999999)
+    pc = juice.TensorCircuit(ns, max_tied_ns_per_parflow_group = 2)
+    pc.print_statistics()
 
-    print("finish compilation")
     pc.to(device)
+
+    data = torch.randint(0, 33279, (60000, T))
+
+    data_loader = DataLoader(
+        dataset = TensorDataset(data),
+        batch_size = 512,
+        shuffle = True,
+        drop_last = True
+    )
+
+    optimizer = juice.optim.CircuitOptimizer(pc, lr = 0.1, pseudocount = 0.0001)
+
+    mini_batch_em_epoch(350, pc, optimizer, None, data_loader, data_loader, device)
 
 
 if __name__ == "__main__":
