@@ -242,58 +242,60 @@ def group(root_ns: CircuitNodes, sparsity_tolerance: float = 0.25, max_target_gr
 
                 params = ns.get_params()
                 if params is not None:
-                    new_params = torch.zeros([new_edge_ids.size(1), new_group_size, new_ch_group_size], device = device)
-                    if use_cuda:
-                        edge_ids_np = edge_ids.numpy()
-                        new_edge_ids_np = new_edge_ids.numpy()
+                    old_group_size = ns.group_size
+                    old_ch_group_size = ns.chs[0].group_size
+                    if new_group_size > old_group_size or new_ch_group_size > old_ch_group_size:
+                        new_params = torch.zeros([new_edge_ids.size(1), new_group_size, new_ch_group_size], device = device)
+                        if use_cuda:
+                            edge_ids_np = edge_ids.numpy()
+                            new_edge_ids_np = new_edge_ids.numpy()
 
-                        old_group_size = ns.group_size
-                        old_ch_group_size = ns.chs[0].group_size
+                            target_id0 = np.zeros([edge_ids.size(1)], dtype = np.int64) - 1
+                            target_id1 = np.zeros([2, edge_ids.size(1)], dtype = np.int64) - 1
+                            target_id2 = np.zeros([2, edge_ids.size(1)], dtype = np.int64) - 1
+                            
+                            _compute_param_target_ids_kernel(
+                                target_id0, target_id1, target_id2, edge_ids_np, new_edge_ids_np, 
+                                group_mul_size, ch_group_mul_size, old_group_size, old_ch_group_size
+                            )
 
-                        target_id0 = np.zeros([edge_ids.size(1)], dtype = np.int64) - 1
-                        target_id1 = np.zeros([2, edge_ids.size(1)], dtype = np.int64) - 1
-                        target_id2 = np.zeros([2, edge_ids.size(1)], dtype = np.int64) - 1
-                        
-                        _compute_param_target_ids_kernel(
-                            target_id0, target_id1, target_id2, edge_ids_np, new_edge_ids_np, 
-                            group_mul_size, ch_group_mul_size, old_group_size, old_ch_group_size
-                        )
+                            target_id0 = torch.from_numpy(target_id0).to(device)
+                            target_id1 = torch.from_numpy(target_id1).to(device)
+                            target_id2 = torch.from_numpy(target_id2).to(device)
 
-                        target_id0 = torch.from_numpy(target_id0).to(device)
-                        target_id1 = torch.from_numpy(target_id1).to(device)
-                        target_id2 = torch.from_numpy(target_id2).to(device)
+                            params = params.to(device)
 
-                        params = params.to(device)
+                            BLOCK_M = min(32, old_group_size)
+                            BLOCK_N = min(32, old_ch_group_size)
 
-                        BLOCK_M = min(32, old_group_size)
-                        BLOCK_N = min(32, old_ch_group_size)
+                            grid = (old_ch_group_size // BLOCK_N, old_group_size // BLOCK_M, edge_ids.size(1))
 
-                        grid = (old_ch_group_size // BLOCK_N, old_group_size // BLOCK_M, edge_ids.size(1))
+                            _copy_params_kernel[grid](
+                                new_params, params, target_id0, target_id1, target_id2, 
+                                old_group_size = old_group_size, 
+                                old_ch_group_size = old_ch_group_size, 
+                                new_group_size = new_group_size, 
+                                new_ch_group_size = new_ch_group_size, 
+                                BLOCK_M = BLOCK_M, 
+                                BLOCK_N = BLOCK_N
+                            )
 
-                        _copy_params_kernel[grid](
-                            new_params, params, target_id0, target_id1, target_id2, 
-                            old_group_size = old_group_size, 
-                            old_ch_group_size = old_ch_group_size, 
-                            new_group_size = new_group_size, 
-                            new_ch_group_size = new_ch_group_size, 
-                            BLOCK_M = BLOCK_M, 
-                            BLOCK_N = BLOCK_N
-                        )
+                        else:
+                            for par_group_id in range(new_edge_ids.size(1)):
+                                nsid = new_edge_ids[0,par_group_id] * group_mul_size
+                                neid = nsid + group_mul_size
+                                csid = new_edge_ids[1,par_group_id] * ch_group_mul_size
+                                ceid = csid + ch_group_mul_size
 
+                                blk_ids = torch.where((edge_ids[0,:] >= nsid) & (edge_ids[0,:] < neid) & (edge_ids[1,:] >= csid) & (edge_ids[1,:] < ceid))[0]
+                                for blk_id in blk_ids:
+                                    nid0, nid1 = (edge_ids[0,blk_id] - nsid) * ns.group_size, (edge_ids[0,blk_id] - nsid + 1) * ns.group_size
+                                    cid0, cid1 = (edge_ids[1,blk_id] - csid) * ns.chs[0].group_size, (edge_ids[1,blk_id] - csid + 1) * ns.chs[0].group_size
+                                    new_params[par_group_id,nid0:nid1,cid0:cid1] = params[blk_id,:,:]
+
+                        new_ns.set_params(new_params.cpu(), normalize = False)
                     else:
-                        for par_group_id in range(new_edge_ids.size(1)):
-                            nsid = new_edge_ids[0,par_group_id] * group_mul_size
-                            neid = nsid + group_mul_size
-                            csid = new_edge_ids[1,par_group_id] * ch_group_mul_size
-                            ceid = csid + ch_group_mul_size
-
-                            blk_ids = torch.where((edge_ids[0,:] >= nsid) & (edge_ids[0,:] < neid) & (edge_ids[1,:] >= csid) & (edge_ids[1,:] < ceid))[0]
-                            for blk_id in blk_ids:
-                                nid0, nid1 = (edge_ids[0,blk_id] - nsid) * ns.group_size, (edge_ids[0,blk_id] - nsid + 1) * ns.group_size
-                                cid0, cid1 = (edge_ids[1,blk_id] - csid) * ns.chs[0].group_size, (edge_ids[1,blk_id] - csid + 1) * ns.chs[0].group_size
-                                new_params[par_group_id,nid0:nid1,cid0:cid1] = params[blk_id,:,:]
-
-                    new_ns.set_params(new_params.cpu(), normalize = False)
+                        new_ns.set_params(params, normalize = False)
 
         return new_ns
 
