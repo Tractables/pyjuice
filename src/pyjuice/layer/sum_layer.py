@@ -367,7 +367,7 @@ class SumLayer(Layer, nn.Module):
         elif params.dim() == 1 and self.group_size >= 16 and num_edges >= 16 and batch_size >= 16:
             # In this case, we should definitely use the block-sparse implementation
             mode = self.BLOCK_SPARSE
-        elif (self.group_size == 1 and num_edges < 16384) or num_edges < 4:
+        elif self.group_size == 1 or num_edges < 4:
             # In this case, we should definitely use the sparse implementation
             mode = self.SPARSE
         elif self.group_size * batch_size < 32:
