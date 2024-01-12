@@ -50,7 +50,7 @@ class ProdNodes(CircuitNodes):
     def is_sparse(self):
         return self.edge_type == self.SPARSE
 
-    def duplicate(self, *args, tie_params: bool = False):
+    def duplicate(self, *args, tie_params: bool = False, allow_type_mismatch: bool = False):
         chs = []
         for ns in args:
             assert isinstance(ns, CircuitNodes)
@@ -61,7 +61,10 @@ class ProdNodes(CircuitNodes):
         else:
             assert self.num_chs == len(chs), f"Number of new children ({len(chs)}) must match the number of original children ({self.num_chs})."
             for old_c, new_c in zip(self.chs, chs):
-                assert type(old_c) == type(new_c), f"Child type not match: ({type(new_c)} != {type(old_c)})."
+                if not allow_type_mismatch:
+                    assert type(old_c) == type(new_c), f"Child type not match: ({type(new_c)} != {type(old_c)})."
+                else:
+                    assert not new_c.is_prod(), f"Cannot connect a product node to another."
                 assert old_c.num_node_groups == new_c.num_node_groups, f"Child node size not match: (`num_node_groups`: {new_c.num_node_groups} != {old_c.num_node_groups})."
                 assert old_c.group_size == new_c.group_size, f"Child node size not match: (`group_size`: {new_c.group_size} != {old_c.group_size})."
 
