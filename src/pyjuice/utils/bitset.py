@@ -129,7 +129,7 @@ class BitSet(object):
 
     def __repr__(self):
         if self.length <= 16:
-            return "BitSet([" + ",".join(self.to_list()) + "])"
+            return "BitSet([" + ",".join([str(v) for v in self]) + "])"
         else:
             return "BitSet(num_elements={})".format(self.length)
 
