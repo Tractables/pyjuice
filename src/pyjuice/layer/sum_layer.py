@@ -282,7 +282,7 @@ class SumLayer(Layer, nn.Module):
             for partition_id in range(self.num_fw_partitions):
                 nids = self.partitioned_nids[partition_id]
 
-                self._bk_triton_block_sparse_modify_flow(
+                self._bk_triton_modify_flow(
                     node_flows, node_mars, nids, local_ids = None
                 )
         
@@ -753,6 +753,7 @@ class SumLayer(Layer, nn.Module):
                 GROUP_SIZE_M = GROUP_SIZE_M,
                 use_fp16 = use_fp16
             )
+            
         elif TILE_SIZE_M >= 8 and TILE_SIZE_K >= 8 and BLOCK_B >= 8:
             self._fw_triton_block_sparse_csmm1_kernel[grid](
                 node_mars, 
@@ -953,7 +954,7 @@ class SumLayer(Layer, nn.Module):
 
         else:
             BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
-            TILE_SIZE_M = min(4096 // num_edges // BLOCK_B, triton.next_power_of_2(layer_n_nodes))
+            TILE_SIZE_M = max(min(4096 // num_edges // BLOCK_B, triton.next_power_of_2(layer_n_nodes)), 1)
 
             partial_eval = 1 if local_ids is not None else 0
             GROUP_SIZE_M = self.group_size
@@ -1088,8 +1089,8 @@ class SumLayer(Layer, nn.Module):
     @staticmethod
     # @triton.jit
     @FastJITFunction
-    def _bk_triton_block_sparse_modify_flow_kernel(node_flows, node_mars, local_ids, nids, batch_size: tl.constexpr, partial_eval: tl.constexpr, 
-                                                   BLOCK_B: tl.constexpr, BLOCK_M: tl.constexpr, GROUP_SIZE_M: tl.constexpr):
+    def _bk_triton_modify_flow_kernel(node_flows, node_mars, local_ids, nids, batch_size: tl.constexpr, partial_eval: tl.constexpr, 
+                                      BLOCK_B: tl.constexpr, BLOCK_M: tl.constexpr, GROUP_SIZE_M: tl.constexpr):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` examples
         pid_m = tl.program_id(1) # ID of size-`BLOCK_M` nodes
@@ -1118,7 +1119,42 @@ class SumLayer(Layer, nn.Module):
 
         tl.store(node_flows + offs_nmfs, uflows, mask = mask_batch[None,:])
 
-    def _bk_triton_block_sparse_modify_flow(self, node_flows: torch.Tensor, node_mars: torch.Tensor,
+    @staticmethod
+    # @triton.jit
+    @FastJITFunction
+    def _bk_triton_large_modify_flow_kernel(node_flows, node_mars, local_ids, nids, num_nodes, batch_size: tl.constexpr, partial_eval: tl.constexpr, 
+                                            BLOCK_B: tl.constexpr, TILE_SIZE_M: tl.constexpr, GROUP_SIZE_M: tl.constexpr):
+
+        pid_b = tl.program_id(0) # ID of size-`BLOCK_B` examples
+        pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
+
+        offs_m = tl.arange(0, TILE_SIZE_M) + pid_m * TILE_SIZE_M
+        mask_m = offs_m < num_nodes
+
+        # Get inferred node group id from `pid_m`
+        ngroup_ids = offs_m // GROUP_SIZE_M
+        tile_ids = offs_m % GROUP_SIZE_M
+
+        # Get the real node group id in the case of partial evaluation
+        if partial_eval == 1:
+            ngroup_ids = tl.load(local_ids + ngroup_ids)
+
+        # Batch offsets and mask
+        offs_batch = tl.arange(0, BLOCK_B)
+        mask_batch = offs_batch < batch_size
+
+        # Initialize pointers to `node_flows` and `node_mars`
+        off_nids = tl.load(nids + ngroup_ids, mask = mask_m) # [TILE_SIZE_M]
+        offs_nmfs = (off_nids + tile_ids)[:,None] * batch_size + offs_batch[None,:]
+
+        nmars = tl.load(node_mars + offs_nmfs, mask = (mask_m[:,None] & mask_batch[None,:]))
+        nflows = tl.load(node_flows + offs_nmfs, mask = (mask_m[:,None] & mask_batch[None,:]))
+
+        uflows = tl.log(nflows) - nmars
+
+        tl.store(node_flows + offs_nmfs, uflows, mask = (mask_m[:,None] & mask_batch[None,:]))
+
+    def _bk_triton_modify_flow(self, node_flows: torch.Tensor, node_mars: torch.Tensor,
                                             nids: torch.Tensor, local_ids: Optional[torch.Tensor] = None):
         """
         Replace `node_flows[nids]` with `node_flows[nids].log() - node_mars[nids]`
@@ -1129,25 +1165,52 @@ class SumLayer(Layer, nn.Module):
         batch_size = node_mars.size(1)
         BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
 
-        BLOCK_B = min(2048, BATCH_SIZE_NP2)
-        BLOCK_M = min(2048 // BLOCK_B, self.group_size)
+        if triton.cdiv(layer_n_nodes, self.group_size) <= 4096:
 
-        partial_eval = 1 if local_ids is not None else 0
-        GROUP_SIZE_M = self.group_size
+            BLOCK_B = min(2048, BATCH_SIZE_NP2)
+            BLOCK_M = min(2048 // BLOCK_B, self.group_size)
 
-        grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, BLOCK_M))
+            partial_eval = 1 if local_ids is not None else 0
+            GROUP_SIZE_M = self.group_size
 
-        self._bk_triton_block_sparse_modify_flow_kernel[grid](
-            node_flows = node_flows, 
-            node_mars = node_mars, 
-            local_ids = local_ids, 
-            nids = nids, 
-            batch_size = batch_size, 
-            partial_eval = partial_eval, 
-            BLOCK_B = BLOCK_B, 
-            BLOCK_M = BLOCK_M, 
-            GROUP_SIZE_M = GROUP_SIZE_M
-        )
+            grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, BLOCK_M))
+
+            self._bk_triton_modify_flow_kernel[grid](
+                node_flows = node_flows, 
+                node_mars = node_mars, 
+                local_ids = local_ids, 
+                nids = nids, 
+                batch_size = batch_size, 
+                partial_eval = partial_eval, 
+                BLOCK_B = BLOCK_B, 
+                BLOCK_M = BLOCK_M, 
+                GROUP_SIZE_M = GROUP_SIZE_M
+            )
+
+        else:
+
+            BLOCK_B = min(2048, BATCH_SIZE_NP2)
+            TILE_SIZE_M = min(4096 // BLOCK_B, triton.next_power_of_2(layer_n_nodes))
+
+            partial_eval = 1 if local_ids is not None else 0
+            GROUP_SIZE_M = self.group_size
+
+            grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
+
+            self._bk_triton_large_modify_flow_kernel[grid](
+                node_flows = node_flows,
+                node_mars = node_mars,
+                local_ids = local_ids,
+                nids = nids,
+                num_nodes = layer_n_nodes,
+                batch_size = batch_size,
+                partial_eval = partial_eval,
+                BLOCK_B = BLOCK_B,
+                TILE_SIZE_M = TILE_SIZE_M,
+                GROUP_SIZE_M = GROUP_SIZE_M
+            )
+
+        return None
 
     def _backward_block_sparse(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
                                params: torch.Tensor, node_mars: torch.Tensor, 
@@ -1833,7 +1896,7 @@ class SumLayer(Layer, nn.Module):
                                      BLOCK_M: tl.constexpr, GROUP_SIZE_K: tl.constexpr):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
-        pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
+        pid_m = tl.program_id(1) # ID of size-`BLOCK_M` nodes
 
         # Get inferred node group id from `pid_m`
         elegroup_id = pid_m
@@ -1891,6 +1954,67 @@ class SumLayer(Layer, nn.Module):
             emars_ptr += batch_size
             eflows_ptr += batch_size
 
+    @staticmethod
+    # @triton.jit
+    @FastJITFunction
+    def _bk_triton_large_sparse_ele_kernel(node_flows, element_flows, node_mars, element_mars, params, 
+                                           chids, parids, parpids, local_ids, num_eles, batch_size: tl.constexpr, partial_eval: tl.constexpr,
+                                           n_edge_groups: tl.constexpr, allow_modify_flows: tl.constexpr, BLOCK_B: tl.constexpr, 
+                                           TILE_SIZE_M: tl.constexpr, GROUP_SIZE_M: tl.constexpr, GROUP_SIZE_K: tl.constexpr):
+
+        pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
+        pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
+
+        offs_m = tl.arange(0, TILE_SIZE_M) + pid_m * TILE_SIZE_M
+        mask_m = offs_m < num_eles
+
+        # Get inferred node group id from `pid_m`
+        elegroup_ids = offs_m // GROUP_SIZE_M
+        tile_ids = offs_m % GROUP_SIZE_M
+
+        # Get the real node group id in the case of partial evaluation
+        if partial_eval == 1:
+            elegroup_ids = tl.load(local_ids + elegroup_ids)
+
+        # Initialize pointers to `params`
+        offs_edge = tl.arange(0, n_edge_groups * GROUP_SIZE_K) # I.e., [0, num_edges)
+        offs_edge_gid = offs_edge // GROUP_SIZE_K
+        offs_edge_nid = (offs_edge % GROUP_SIZE_K)
+        par_start = tl.load(parpids + elegroup_ids[:,None] * n_edge_groups + offs_edge_gid[None,:])
+        epars = tl.load(params + par_start + offs_edge_nid[None,:], mask = mask_m[:,None]) # [TILE_SIZE_M, num_edges]
+
+        # Batch offsets and mask
+        offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B
+        mask_batch = offs_batch < batch_size
+
+        # Initialize `node_flows` and `node_mars`
+        edge_start = tl.load(parids + elegroup_ids[:,None] * n_edge_groups + offs_edge_gid[None,:]) # [TILE_SIZE_M, num_edges]
+        nmars_ptr = node_mars + \
+            (edge_start + offs_edge_nid[None,:])[:,:,None] * batch_size + \
+            offs_batch[None,None,:]
+        nmars = tl.load(nmars_ptr, mask = (mask_m[:,None,None] & mask_batch[None,None,:])) # [TILE_SIZE_M, num_edges, BLOCK_B]
+        nflows_ptr = node_flows + \
+            (edge_start + offs_edge_nid[None,:])[:,:,None] * batch_size + \
+            offs_batch[None,None,:]
+        if allow_modify_flows == 1:
+            log_n_fdm = tl.load(nflows_ptr, mask = (mask_m[:,None,None] & mask_batch[None,None,:])) # [TILE_SIZE_M, num_edges, BLOCK_B]
+        else:
+            nflows = tl.load(nflows_ptr, mask = (mask_m[:,None,None] & mask_batch[None,None,:])) # [TILE_SIZE_M, num_edges, BLOCK_B]
+
+        # Initialize pointers to `element_flows` and values `emars`
+        off_eleids = tl.load(chids + elegroup_ids) # TILE_SIZE_M
+        eflows_ptr = element_flows + off_eleids[:,None] * batch_size + offs_batch[None,:] # [TILE_SIZE_M, BLOCK_B]
+        emars = tl.load(element_mars + off_eleids[:,None] * batch_size + offs_batch[None,:], 
+                        mask = (mask_m[:,None] & mask_batch[None,:])) # [TILE_SIZE_M, BLOCK_B]
+
+        # Compute eflows
+        if allow_modify_flows == 1:
+            eflows = tl.sum(epars[:,:,None] * tl.exp(emars[:,None,:] + log_n_fdm), axis = 1)
+        else:
+            eflows = tl.sum(nflows * epars[:,:,None] * tl.exp(emars[:,None,:] - nmars), axis = 1)
+
+        tl.store(eflows_ptr, eflows, mask = (mask_m[:,None] & mask_batch[None,:]))
+
     def _backward_sparse_ele_flows(self, node_flows: torch.Tensor, element_flows: torch.Tensor,
                                    params: torch.Tensor, node_mars: torch.Tensor,
                                    element_mars: torch.Tensor, chids: torch.Tensor, parids: torch.Tensor,
@@ -1908,31 +2032,63 @@ class SumLayer(Layer, nn.Module):
 
         assert num_edges <= 16384, "The sparse backward kernel only support nodes with # edges smaller than 16384."
 
-        BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
-        BLOCK_M = cs_group_size
+        if triton.cdiv(layer_n_nodes, cs_group_size) <= 4096:
 
-        allow_modify_flows = 1 if allow_modify_flows else 0
+            BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
+            BLOCK_M = cs_group_size
 
-        grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, BLOCK_M))
+            allow_modify_flows = 1 if allow_modify_flows else 0
 
-        self._bk_triton_sparse_ele_kernel[grid](
-            node_flows = node_flows, 
-            element_flows = element_flows, 
-            node_mars = node_mars, 
-            element_mars = element_mars, 
-            params = params, 
-            chids = chids, 
-            parids = parids,
-            parpids = parpids,
-            local_ids = local_ids, 
-            batch_size = batch_size, 
-            partial_eval = 1 if local_ids is not None else 0,
-            n_edge_groups = n_edge_groups,
-            allow_modify_flows = allow_modify_flows,
-            BLOCK_B = BLOCK_B, 
-            BLOCK_M = BLOCK_M,
-            GROUP_SIZE_K = self.group_size
-        )
+            grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, BLOCK_M))
+
+            self._bk_triton_sparse_ele_kernel[grid](
+                node_flows = node_flows, 
+                element_flows = element_flows, 
+                node_mars = node_mars, 
+                element_mars = element_mars, 
+                params = params, 
+                chids = chids, 
+                parids = parids,
+                parpids = parpids,
+                local_ids = local_ids,
+                batch_size = batch_size,
+                partial_eval = 1 if local_ids is not None else 0,
+                n_edge_groups = n_edge_groups,
+                allow_modify_flows = allow_modify_flows,
+                BLOCK_B = BLOCK_B,
+                BLOCK_M = BLOCK_M,
+                GROUP_SIZE_K = self.group_size
+            )
+
+        else:
+
+            BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
+            TILE_SIZE_M = max(min(4096 // num_edges // BLOCK_B, triton.next_power_of_2(layer_n_nodes)), 1)
+
+            allow_modify_flows = 1 if allow_modify_flows else 0
+
+            grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
+
+            self._bk_triton_large_sparse_ele_kernel[grid](
+                node_flows = node_flows,
+                element_flows = element_flows,
+                node_mars = node_mars,
+                element_mars = element_mars,
+                params = params,
+                chids = chids,
+                parids = parids,
+                parpids = parpids,
+                local_ids = local_ids,
+                num_eles = layer_n_nodes,
+                batch_size = batch_size,
+                partial_eval = 1 if local_ids is not None else 0,
+                n_edge_groups = n_edge_groups,
+                allow_modify_flows = allow_modify_flows,
+                BLOCK_B = BLOCK_B,
+                TILE_SIZE_M = TILE_SIZE_M,
+                GROUP_SIZE_M = cs_group_size,
+                GROUP_SIZE_K = self.group_size
+            )
 
         return None
 
@@ -2004,6 +2160,77 @@ class SumLayer(Layer, nn.Module):
 
         tl.atomic_add(eparflows_ptr, curr_pflows)
 
+    @staticmethod
+    # @triton.jit
+    @FastJITFunction
+    def _bk_triton_large_sparse_par_kernel(node_flows, node_mars, element_mars, params, param_flows, nids, cids, pids, pfids,
+                                           num_nodes, num_edges: tl.constexpr, batch_size: tl.constexpr, allow_modify_flows: tl.constexpr, 
+                                           TILE_SIZE_M: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_B: tl.constexpr, 
+                                           TILE_SIZE_B: tl.constexpr, B_NUM_BLOCKS: tl.constexpr, GROUP_SIZE_M: tl.constexpr):
+
+        pid_b = tl.program_id(0) # ID of size-`BLOCK_B` samples
+        pid_e = tl.program_id(1) # ID of size-`BLOCK_K` edges
+        pid_m = tl.program_id(2) # ID of size-`TILE_SIZE_M` nodes
+
+        offs_m = tl.arange(0, TILE_SIZE_M) + pid_m * TILE_SIZE_M
+        mask_m = offs_m < num_nodes
+
+        # Get inferred node group id from `pid_m`
+        ngroup_ids = offs_m // GROUP_SIZE_M
+        tile_ids = offs_m % GROUP_SIZE_M
+
+        # Batch offsets and mask
+        offs_batch = tl.arange(0, BLOCK_B) + pid_b * TILE_SIZE_B
+        mask_batch = offs_batch < batch_size
+
+        # Initialize pointers to `element_mars`
+        offs_edge = tl.arange(0, BLOCK_K) + pid_e * BLOCK_K
+        edge_start = tl.load(cids + ngroup_ids[:,None] * num_edges + offs_edge[None,:], mask = mask_m[:,None])
+        emars_ptr = element_mars + \
+            edge_start[:,:,None] * batch_size + \
+            offs_batch[None,None,:] # [TILE_SIZE_M, BLOCK_K, BLOCK_B]
+
+        # Initialize pointers to `node_flows` and `node_mars`
+        off_nids = tl.load(nids + ngroup_ids, mask = mask_m)
+        nmars_ptr = node_mars + (off_nids + tile_ids)[:,None] * batch_size + offs_batch[None,:] # [TILE_SIZE_M, BLOCK_B]
+        nflows_ptr = node_flows + (off_nids + tile_ids)[:,None] * batch_size + offs_batch[None,:] # [TILE_SIZE_M, BLOCK_B]
+
+        # Inner loop
+        acc = tl.zeros([TILE_SIZE_M, BLOCK_K], dtype = tl.float32)
+
+        for b in range(0, B_NUM_BLOCKS):
+            # Batch offsets and mask
+            offs_batch = tl.arange(0, BLOCK_B) + pid_b * TILE_SIZE_B + b * BLOCK_B
+            mask_batch = offs_batch < batch_size
+
+            emars = tl.load(emars_ptr, mask = (mask_m[:,None,None] & mask_batch[None,None,:]), other = -float("inf")) # [TILE_SIZE_M, BLOCK_K, BLOCK_B]
+
+            if allow_modify_flows == 1:
+                log_n_fdm = tl.load(nflows_ptr, mask = (mask_m[:,None] & mask_batch[None,:]), other = -float("inf")) # [TILE_SIZE_M, BLOCK_B]
+                pflows = tl.sum(tl.exp(emars + log_n_fdm[:,None,:]), axis = 2)
+            else:
+                nmars = tl.load(nmars_ptr, mask = (mask_m[:,None] & mask_batch[None,:]), other = 0.0) # [TILE_SIZE_M, BLOCK_B]
+                nflows = tl.load(nflows_ptr, mask = (mask_m[:,None] & mask_batch[None,:]), other = 0.0) # [TILE_SIZE_M, BLOCK_B]
+                pflows = tl.sum(nflows[:,None,:] * tl.exp(emars - nmars[:,None,:]), axis = 2)
+
+            acc += pflows
+
+            # Increment `emars_ptr`, `nmars_ptr`, and `nmars_ptr`
+            emars_ptr += BLOCK_B
+            nmars_ptr += BLOCK_B
+            nflows_ptr += BLOCK_B
+
+        par_start = tl.load(pids + ngroup_ids[:,None] * num_edges + offs_edge[None,:])
+        epars_ptr = params + par_start + tile_ids[:,None]
+        epars = tl.load(epars_ptr, mask = mask_m[:,None]) # [TILE_SIZE_M, BLOCK_K]
+
+        parflow_start = tl.load(pfids + ngroup_ids[:,None] * num_edges + offs_edge[None,:])
+        eparflows_ptr = param_flows + parflow_start + tile_ids[:,None]
+        
+        curr_pflows = acc * epars
+
+        tl.atomic_add(eparflows_ptr, curr_pflows, mask = mask_m[:,None])
+
     def _backward_sparse_par_flows(self, node_flows: torch.Tensor, params: torch.Tensor, node_mars: torch.Tensor, 
                                    element_mars: torch.Tensor, param_flows: torch.Tensor, nids: torch.Tensor, 
                                    cids: torch.Tensor, pids: torch.Tensor, pfids: torch.Tensor,
@@ -2033,50 +2260,101 @@ class SumLayer(Layer, nn.Module):
 
         assert num_edges <= 16384, "The sparse backward kernel only support nodes with # edges smaller than 16384."
 
-        if num_edges <= 1024:
-            BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
-            BLOCK_K = num_edges
-            BLOCK_M = max(min(2048 // num_edges, self.group_size), 1)
+        if layer_n_nodes <= 4096:
+
+            if num_edges <= 1024:
+                BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
+                BLOCK_K = num_edges
+                BLOCK_M = max(min(2048 // num_edges, self.group_size), 1)
+            else:
+                BLOCK_B = min(512, BATCH_SIZE_NP2)
+                BLOCK_K = min(2048 // BLOCK_B, num_edges)
+                BLOCK_M = max(min(2048 // num_edges, self.group_size), 1)
+            B_NUM_BLOCKS = triton.cdiv(batch_size, BLOCK_B)
+            K_NUM_BLOCKS = triton.cdiv(num_edges, BLOCK_K)
+
+            # When a thread-block is allocated for too much work, the overhead 
+            # outweigh that incurred by `atomic_add`. Add more thread-blocks 
+            # for parallel processing in this case.
+            if B_NUM_BLOCKS >= 4:
+                TILE_SIZE_B = 4 * BLOCK_B
+                B_NUM_BLOCKS = 4
+            else:
+                TILE_SIZE_B = batch_size
+            B_NUM_TILES = triton.cdiv(batch_size, TILE_SIZE_B)
+
+            allow_modify_flows = 1 if allow_modify_flows else 0
+
+            grid = (B_NUM_TILES, K_NUM_BLOCKS, layer_n_nodes)
+
+            self._bk_triton_sparse_par_kernel[grid](
+                node_flows = node_flows, 
+                node_mars = node_mars, 
+                element_mars = element_mars, 
+                params = params, 
+                param_flows = param_flows, 
+                nids = nids, 
+                cids = cids, 
+                pids = pids,
+                pfids = pfids,
+                num_edges = num_edges,
+                batch_size = batch_size,
+                allow_modify_flows = allow_modify_flows,
+                BLOCK_M = BLOCK_M,
+                BLOCK_K = BLOCK_K,
+                BLOCK_B = BLOCK_B,
+                TILE_SIZE_B = TILE_SIZE_B,
+                B_NUM_BLOCKS = B_NUM_BLOCKS
+            )
+
         else:
-            BLOCK_B = min(512, BATCH_SIZE_NP2)
-            BLOCK_K = min(2048 // BLOCK_B, num_edges)
-            BLOCK_M = max(min(2048 // num_edges, self.group_size), 1)
-        B_NUM_BLOCKS = triton.cdiv(batch_size, BLOCK_B)
-        K_NUM_BLOCKS = triton.cdiv(num_edges, BLOCK_K)
 
-        # When a thread-block is allocated for too much work, the overhead 
-        # outweigh that incurred by `atomic_add`. Add more thread-blocks 
-        # for parallel processing in this case.
-        if B_NUM_BLOCKS >= 4:
-            TILE_SIZE_B = 4 * BLOCK_B
-            B_NUM_BLOCKS = 4
-        else:
-            TILE_SIZE_B = batch_size
-        B_NUM_TILES = triton.cdiv(batch_size, TILE_SIZE_B)
+            if num_edges <= 1024:
+                BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
+                BLOCK_K = num_edges
+                TILE_SIZE_M = max(min(4096 // num_edges, triton.next_power_of_2(layer_n_nodes)), 1)
+            else:
+                BLOCK_B = min(512, BATCH_SIZE_NP2)
+                BLOCK_K = min(2048 // BLOCK_B, num_edges)
+                TILE_SIZE_M = max(min(4096 // num_edges, triton.next_power_of_2(layer_n_nodes)), 1)
+            B_NUM_BLOCKS = triton.cdiv(batch_size, BLOCK_B)
+            K_NUM_BLOCKS = triton.cdiv(num_edges, BLOCK_K)
 
-        allow_modify_flows = 1 if allow_modify_flows else 0
+            # When a thread-block is allocated for too much work, the overhead 
+            # outweigh that incurred by `atomic_add`. Add more thread-blocks 
+            # for parallel processing in this case.
+            if B_NUM_BLOCKS >= 4:
+                TILE_SIZE_B = 4 * BLOCK_B
+                B_NUM_BLOCKS = 4
+            else:
+                TILE_SIZE_B = batch_size
+            B_NUM_TILES = triton.cdiv(batch_size, TILE_SIZE_B)
 
-        grid = (B_NUM_TILES, K_NUM_BLOCKS, layer_n_nodes)
+            allow_modify_flows = 1 if allow_modify_flows else 0
 
-        self._bk_triton_sparse_par_kernel[grid](
-            node_flows = node_flows, 
-            node_mars = node_mars, 
-            element_mars = element_mars, 
-            params = params, 
-            param_flows = param_flows, 
-            nids = nids, 
-            cids = cids, 
-            pids = pids,
-            pfids = pfids,
-            num_edges = num_edges,
-            batch_size = batch_size,
-            allow_modify_flows = allow_modify_flows,
-            BLOCK_M = BLOCK_M,
-            BLOCK_K = BLOCK_K,
-            BLOCK_B = BLOCK_B,
-            TILE_SIZE_B = TILE_SIZE_B,
-            B_NUM_BLOCKS = B_NUM_BLOCKS
-        )
+            grid = (B_NUM_TILES, K_NUM_BLOCKS, triton.cdiv(layer_n_nodes, TILE_SIZE_M))
+
+            self._bk_triton_large_sparse_par_kernel[grid](
+                node_flows = node_flows, 
+                node_mars = node_mars, 
+                element_mars = element_mars, 
+                params = params, 
+                param_flows = param_flows, 
+                nids = nids, 
+                cids = cids, 
+                pids = pids, 
+                pfids = pfids,
+                num_nodes = layer_n_nodes, 
+                num_edges = num_edges, 
+                batch_size = batch_size, 
+                allow_modify_flows = allow_modify_flows, 
+                TILE_SIZE_M = TILE_SIZE_M, 
+                BLOCK_K = BLOCK_K,
+                BLOCK_B = BLOCK_B,
+                TILE_SIZE_B = TILE_SIZE_B,
+                B_NUM_BLOCKS = B_NUM_BLOCKS,
+                GROUP_SIZE_M = self.group_size
+            )
 
         return None
 
