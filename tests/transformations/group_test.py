@@ -150,12 +150,12 @@ def block_sparse_group_test():
         assert torch.all(new_ns._params[2][4:8,8:12] == ns._params[18])
         assert torch.all(new_ns._params[2][4:8,12:16] == ns._params[19])
 
-        assert torch.all(new_ns.zero_param_mask[0][0:4,8:12])
-        assert torch.all(new_ns.zero_param_mask[0][4:8,0:4])
-        assert torch.all(new_ns.zero_param_mask[1][4:8,4:8])
-        assert torch.all(new_ns.zero_param_mask[2][4:8,0:4])
+        assert torch.all(new_ns._zero_param_mask[0][0:4,8:12])
+        assert torch.all(new_ns._zero_param_mask[0][4:8,0:4])
+        assert torch.all(new_ns._zero_param_mask[1][4:8,4:8])
+        assert torch.all(new_ns._zero_param_mask[2][4:8,0:4])
 
-        assert new_ns.zero_param_mask.long().sum() == 4 * 4 * 4
+        assert new_ns._zero_param_mask.long().sum() == 4 * 4 * 4
 
 
 if __name__ == "__main__":

@@ -110,7 +110,7 @@ class SumNodes(CircuitNodes):
             raise ValueError("Unsupported parameter input.")
 
         if self.provided("zero_param_mask"):
-            self._params[self.zero_param_mask] = 0.0
+            self._params[self._zero_param_mask] = 0.0
 
         if normalize:
             normalize_ns_parameters(self._params, self.edge_ids[0,:], group_size = self.group_size, 
@@ -132,7 +132,13 @@ class SumNodes(CircuitNodes):
         assert zero_param_mask.size(2) == self.ch_group_size
         assert zero_param_mask.dtype == torch.bool
 
-        self.zero_param_mask = zero_param_mask
+        self._zero_param_mask = zero_param_mask
+
+    def get_zero_param_mask(self):
+        if not self.provided("_zero_param_mask"):
+            return None
+        else:
+            return self._zero_param_mask
 
     def set_edges(self, edge_ids: Union[Tensor,Sequence[Tensor]]):
         self._construct_edges(edge_ids)
@@ -144,7 +150,7 @@ class SumNodes(CircuitNodes):
             self._params = torch.exp(torch.rand([self.edge_ids.size(1), self.group_size, self.ch_group_size]) * -perturbation)
 
             if self.provided("zero_param_mask"):
-                self._params[self.zero_param_mask] = 0.0
+                self._params[self._zero_param_mask] = 0.0
 
             normalize_ns_parameters(self._params, self.edge_ids[0,:], group_size = self.group_size, 
                                     ch_group_size = self.ch_group_size, pseudocount = 0.0)
