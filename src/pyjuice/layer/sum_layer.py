@@ -801,14 +801,13 @@ class SumLayer(Layer, nn.Module):
     @FastJITFunction
     def _fw_triton_sparse_kernel(node_mars, element_mars, params, nids, cids, pids,
                                  local_ids, batch_size, partial_eval: tl.constexpr, num_edges: tl.constexpr, 
-                                 BLOCK_B: tl.constexpr, BLOCK_M: tl.constexpr, GROUP_SIZE_M: tl.constexpr):
+                                 BLOCK_B: tl.constexpr, GROUP_SIZE_M: tl.constexpr):
         
         pid_b = tl.program_id(axis = 0) # ID of size-`BLOCK_B` batches
-        pid_m = tl.program_id(axis = 1) # ID of size-`BLOCK_M` nodes
+        pid_m = tl.program_id(axis = 1) # ID of size-`GROUP_SIZE_M` nodes
 
         # Get inferred node group id from `pid_m`
-        ngroup_id = pid_m // (GROUP_SIZE_M // BLOCK_M)
-        tile_id = pid_m % (GROUP_SIZE_M // BLOCK_M)
+        ngroup_id = pid_m
 
         # Get the real node group id in the case of partial evaluation
         if partial_eval == 1:
@@ -817,7 +816,7 @@ class SumLayer(Layer, nn.Module):
         # Initialize pointers to `params`
         offs_edge = tl.arange(0, num_edges)
         par_start = tl.load(pids + ngroup_id * num_edges + offs_edge)
-        epars_ptr = params + tile_id * BLOCK_M + par_start # [num_edges]
+        epars_ptr = params + par_start # [num_edges]
 
         # Batch offsets and mask
         offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B
@@ -837,11 +836,11 @@ class SumLayer(Layer, nn.Module):
         # Initialize pointers to `node_mars`
         off_nids = tl.load(nids + ngroup_id)
         nmars_ptr = node_mars + \
-            (off_nids + tile_id * BLOCK_M) * batch_size + \
+            off_nids * batch_size + \
             offs_batch
 
         # Inner loop
-        for i in range(0, BLOCK_M):
+        for i in range(0, GROUP_SIZE_M):
             epars = tl.load(epars_ptr)
 
             nmars = tl.log(tl.sum(emars * epars[:,None], axis = 0)) + emars_max
@@ -931,12 +930,11 @@ class SumLayer(Layer, nn.Module):
 
         if triton.cdiv(layer_n_nodes, self.group_size) <= 2048:
             BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
-            BLOCK_M = self.group_size
 
             partial_eval = 1 if local_ids is not None else 0
             GROUP_SIZE_M = self.group_size
 
-            grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, BLOCK_M))
+            grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, GROUP_SIZE_M))
 
             self._fw_triton_sparse_kernel[grid](
                 node_mars = node_mars, 
@@ -950,7 +948,6 @@ class SumLayer(Layer, nn.Module):
                 partial_eval = partial_eval, 
                 num_edges = num_edges, 
                 BLOCK_B = BLOCK_B, 
-                BLOCK_M = BLOCK_M, 
                 GROUP_SIZE_M = GROUP_SIZE_M
             )
 
