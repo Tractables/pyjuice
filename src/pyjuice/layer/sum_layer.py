@@ -854,6 +854,57 @@ class SumLayer(Layer, nn.Module):
             # Increment `nmars_ptr`
             nmars_ptr += batch_size
 
+    @staticmethod
+    # @triton.jit
+    @FastJITFunction
+    def _fw_triton_large_sparse_kernel(node_mars, element_mars, params, nids, cids, pids,
+                                       local_ids, batch_size, num_nodes, partial_eval: tl.constexpr, num_edges: tl.constexpr, 
+                                       BLOCK_B: tl.constexpr, TILE_SIZE_M: tl.constexpr, 
+                                       GROUP_SIZE_M: tl.constexpr):
+
+        pid_b = tl.program_id(axis = 0) # ID of size-`BLOCK_B` batches
+        pid_m = tl.program_id(axis = 1) # ID of size-`TILE_SIZE_M` nodes
+
+        offs_m = tl.arange(0, TILE_SIZE_M) + pid_m * TILE_SIZE_M
+        mask_m = offs_m < num_nodes
+
+        # Get inferred node group id from `pid_m`
+        ngroup_ids = offs_m // GROUP_SIZE_M
+        tile_ids = offs_m % GROUP_SIZE_M
+
+        # Get the real node group id in the case of partial evaluation
+        if partial_eval == 1:
+            ngroup_ids = tl.load(local_ids + ngroup_ids, mask = mask_m)
+
+        # Initialize pointers to `params`
+        offs_edge = tl.arange(0, num_edges)
+        par_start = tl.load(pids + ngroup_ids[:,None] * num_edges + offs_edge[None,:], mask = mask_m[:,None]) # [TILE_SIZE_M, num_edges]
+        epars = tl.load(params + tile_ids[:,None] * GROUP_SIZE_M + par_start, mask = mask_m[:,None], other = 0.0) # [TILE_SIZE_M, num_edges]
+
+        # Batch offsets and mask
+        offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B
+        mask_batch = offs_batch < batch_size
+
+        # Initialize and load edge mars
+        edge_ids = tl.load(cids + ngroup_ids[:,None] * num_edges + offs_edge[None,:]) # [TILE_SIZE_M, num_edges]
+        emars_ptr = element_mars + \
+            edge_ids[:,:,None] * batch_size + \
+            offs_batch[None,None,:] # [TILE_SIZE_M, num_edges, BLOCK_B]
+        emars = tl.load(emars_ptr, mask = (mask_m[:,None,None] & mask_batch[None,None,:]), other = 0.0) # [TILE_SIZE_M, num_edges, BLOCK_B]
+
+        # Compute max and subtract
+        emars_max = tl.max(emars, axis = 1)
+        emars = tl.exp(emars - emars_max[:,None,:])
+        nmars = tl.log(tl.sum(emars * epars[:,:,None], axis = 1)) + emars_max
+
+        # Initialize pointers to `node_mars`
+        off_nids = tl.load(nids + ngroup_ids) # [TILE_SIZE_M]
+        nmars_ptr = node_mars + \
+            (off_nids + tile_ids)[:,None] * batch_size + \
+            offs_batch[None,:] # [TILE_SIZE_M, BLOCK_B]
+
+        tl.store(nmars_ptr, nmars, mask = (mask_m[:,None] & mask_batch[None,:]))
+
     def _forward_sparse(self, node_mars: torch.Tensor, element_mars: torch.Tensor,
                         params: torch.Tensor, nids: torch.Tensor, cids: torch.Tensor,
                         pids: torch.Tensor, local_ids: Optional[torch.Tensor] = None,
@@ -878,29 +929,56 @@ class SumLayer(Layer, nn.Module):
 
         assert num_edges <= 16384, "The sparse forward kernel only support nodes with # edges smaller than 16384."
 
-        BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
-        BLOCK_M = self.group_size
+        if triton.cdiv(layer_n_nodes, self.group_size) <= 2048:
+            BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
+            BLOCK_M = self.group_size
 
-        partial_eval = 1 if local_ids is not None else 0
-        GROUP_SIZE_M = self.group_size
+            partial_eval = 1 if local_ids is not None else 0
+            GROUP_SIZE_M = self.group_size
 
-        grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, BLOCK_M))
+            grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, BLOCK_M))
 
-        self._fw_triton_sparse_kernel[grid](
-            node_mars = node_mars, 
-            element_mars = element_mars, 
-            params = params, 
-            nids = nids, 
-            cids = cids,
-            pids = pids,
-            local_ids = local_ids, 
-            batch_size = batch_size, 
-            partial_eval = partial_eval, 
-            num_edges = num_edges, 
-            BLOCK_B = BLOCK_B, 
-            BLOCK_M = BLOCK_M, 
-            GROUP_SIZE_M = GROUP_SIZE_M
-        )
+            self._fw_triton_sparse_kernel[grid](
+                node_mars = node_mars, 
+                element_mars = element_mars, 
+                params = params, 
+                nids = nids, 
+                cids = cids,
+                pids = pids,
+                local_ids = local_ids, 
+                batch_size = batch_size, 
+                partial_eval = partial_eval, 
+                num_edges = num_edges, 
+                BLOCK_B = BLOCK_B, 
+                BLOCK_M = BLOCK_M, 
+                GROUP_SIZE_M = GROUP_SIZE_M
+            )
+
+        else:
+            BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
+            TILE_SIZE_M = min(4096 // num_edges // BLOCK_B, triton.next_power_of_2(layer_n_nodes))
+
+            partial_eval = 1 if local_ids is not None else 0
+            GROUP_SIZE_M = self.group_size
+
+            grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
+
+            self._fw_triton_large_sparse_kernel[grid](
+                node_mars = node_mars,
+                element_mars = element_mars,
+                params = params,
+                nids = nids,
+                cids = cids,
+                pids = pids,
+                local_ids = local_ids,
+                batch_size = batch_size,
+                num_nodes = layer_n_nodes,
+                partial_eval = partial_eval,
+                num_edges = num_edges,
+                BLOCK_B = BLOCK_B,
+                TILE_SIZE_M = TILE_SIZE_M,
+                GROUP_SIZE_M = GROUP_SIZE_M
+            )
 
         return None
 
