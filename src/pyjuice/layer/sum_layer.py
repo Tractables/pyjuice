@@ -1392,7 +1392,7 @@ class SumLayer(Layer, nn.Module):
 
         partial_eval = 1 if local_ids is not None else 0
         GROUP_SIZE_M = cs_group_size
-        GROUP_SIZE_K = self.group_size
+        GROUP_SIZE_K = min(TILE_SIZE_K, self.group_size)
         allow_modify_flows = 1 if allow_modify_flows else 0
 
         if TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and BLOCK_B >= 16:
