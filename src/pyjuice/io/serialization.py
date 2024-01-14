@@ -33,6 +33,9 @@ def serialize_nodes(root_ns: CircuitNodes):
         if hasattr(ns, "_params") and ns._params is not None:
             ns_info["params"] = ns._params.detach().cpu().numpy().copy()
 
+        if hasattr(ns, "_zero_param_mask") and ns._zero_param_mask is not None:
+            ns_info["zero_param_mask"] = ns._zero_param_mask.detach().cpu().numpy().copy()
+
         if ns.is_input():
             ns_info["scope"] = ns.scope.to_list()
             ns_info["dist"] = pickle.dumps(ns.dist)
@@ -89,7 +92,11 @@ def deserialize_nodes(nodes_list: Sequence):
             else:
                 params = None
 
-            ns = summate(*chs, edge_ids = edge_ids, params = params, group_size = group_size)            
+            ns = summate(*chs, edge_ids = edge_ids, params = params, group_size = group_size)
+
+            if "zero_param_mask" in ns_info:
+                zero_param_mask = torch.from_numpy(ns_info["zero_param_mask"])
+                ns.set_zero_param_mask(zero_param_mask)
 
         id2ns[ns_id] = ns
 
