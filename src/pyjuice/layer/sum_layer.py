@@ -251,7 +251,7 @@ class SumLayer(Layer, nn.Module):
     def backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
                  node_mars: torch.Tensor, element_mars: torch.Tensor, 
                  params: torch.Tensor, param_flows: Optional[torch.Tensor] = None,
-                 allow_modify_flows: bool = False, debug = False) -> None: # debug
+                 allow_modify_flows: bool = False) -> None:
         """
         Computes the forward pass of a sum layer:
         ```
@@ -301,7 +301,7 @@ class SumLayer(Layer, nn.Module):
                     chids = chids, parids = parids, parpids = parpids,
                     cs_group_size = cs_group_size,
                     partition_id = partition_id,
-                    allow_modify_flows = allow_modify_flows, debug = debug # debug
+                    allow_modify_flows = allow_modify_flows
                 )
 
         else:
@@ -1048,7 +1048,7 @@ class SumLayer(Layer, nn.Module):
                   parpids: Optional[torch.Tensor] = None, 
                   cs_group_size: int = 0, local_ids: Optional[torch.Tensor] = None, 
                   partition_id: int = -1, mode: Optional[str] = None,
-                  allow_modify_flows: bool = False, debug = False) -> None: # debug
+                  allow_modify_flows: bool = False) -> None:
         """
         Back pass of sum layers.
         
@@ -1090,7 +1090,7 @@ class SumLayer(Layer, nn.Module):
             self._backward_block_sparse(
                 node_flows, element_flows, params, node_mars, element_mars, param_flows, 
                 nids, cids, pids, pfids, chids, parids, parpids, cs_group_size, local_ids, 
-                partition_id = partition_id, allow_modify_flows = allow_modify_flows, debug = debug # debug
+                partition_id = partition_id, allow_modify_flows = allow_modify_flows
             )
 
         elif mode == self.SPARSE:
@@ -1140,7 +1140,7 @@ class SumLayer(Layer, nn.Module):
         nmars = tl.load(node_mars + offs_nmfs, mask = mask_batch[None,:])
         nflows = tl.load(node_flows + offs_nmfs, mask = mask_batch[None,:])
 
-        uflows = tl.log(nflows) - nmars
+        uflows = tl.where(nmars == -float("inf"), -float("inf"), tl.log(nflows) - nmars)
 
         tl.store(node_flows + offs_nmfs, uflows, mask = mask_batch[None,:])
 
@@ -1175,12 +1175,12 @@ class SumLayer(Layer, nn.Module):
         nmars = tl.load(node_mars + offs_nmfs, mask = (mask_m[:,None] & mask_batch[None,:]))
         nflows = tl.load(node_flows + offs_nmfs, mask = (mask_m[:,None] & mask_batch[None,:]))
 
-        log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), tl.log(nflows) - nmars)
+        uflows = tl.where(nmars == -float("inf"), -float("inf"), tl.log(nflows) - nmars)
 
         tl.store(node_flows + offs_nmfs, uflows, mask = (mask_m[:,None] & mask_batch[None,:]))
 
     def _bk_triton_modify_flow(self, node_flows: torch.Tensor, node_mars: torch.Tensor,
-                                            nids: torch.Tensor, local_ids: Optional[torch.Tensor] = None):
+                               nids: torch.Tensor, local_ids: Optional[torch.Tensor] = None):
         """
         Replace `node_flows[nids]` with `node_flows[nids].log() - node_mars[nids]`
         """
@@ -1243,7 +1243,7 @@ class SumLayer(Layer, nn.Module):
                                nids: Optional[torch.Tensor], cids: Optional[torch.Tensor], pids: Optional[torch.Tensor], pfids: Optional[torch.Tensor],
                                chids: Optional[torch.Tensor], parids: Optional[torch.Tensor], parpids: Optional[torch.Tensor], 
                                cs_group_size: int, local_ids: Optional[torch.Tensor] = None,
-                               partition_id: int = -1, allow_modify_flows: bool = False, debug = False) -> None: # debug
+                               partition_id: int = -1, allow_modify_flows: bool = False) -> None:
         """
         Back pass of sum layers with block-sparse processing kernel.
         
@@ -1265,7 +1265,7 @@ class SumLayer(Layer, nn.Module):
                 node_flows, element_flows, params, node_mars, element_mars,
                 chids = chids, parids = parids, parpids = parpids, 
                 cs_group_size = cs_group_size, local_ids = local_ids, 
-                partition_id = partition_id, allow_modify_flows = allow_modify_flows, debug = debug # debug
+                partition_id = partition_id, allow_modify_flows = allow_modify_flows
             )
 
         # Flows w.r.t. parameters
@@ -1491,7 +1491,7 @@ class SumLayer(Layer, nn.Module):
                                          params: torch.Tensor, node_mars: torch.Tensor,
                                          element_mars: torch.Tensor, chids: torch.Tensor, parids: torch.Tensor,
                                          parpids: torch.Tensor, cs_group_size: int, local_ids: Optional[torch.Tensor] = None,
-                                         partition_id: int = -1, allow_modify_flows: bool = False, debug = False) -> None: # debug
+                                         partition_id: int = -1, allow_modify_flows: bool = False) -> None:
 
         assert params.dim() == 1, "Expecting a 1D `params`."
 
@@ -1566,8 +1566,6 @@ class SumLayer(Layer, nn.Module):
         grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
 
         if TILE_SIZE_M >= 8 and TILE_SIZE_K >= 8 and BLOCK_B >= 8:
-            if debug:
-                import pdb; pdb.set_trace()
             self._bk_triton_block_sparse_ele_kernel[grid](
                 node_flows = node_flows, 
                 element_flows = element_flows, 
@@ -1594,8 +1592,6 @@ class SumLayer(Layer, nn.Module):
                 num_warps = 2, # TODO: test for different devices
                 num_stages = 1
             )
-            if debug:
-                import pdb; pdb.set_trace()
         else:
             self._bk_triton_block_sparse_ele_csmm2_kernel[grid](
                 node_flows = node_flows, 
