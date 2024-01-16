@@ -236,7 +236,7 @@ class TensorCircuit(nn.Module):
 
         Parameters:
         `inputs`:         None or [B, num_vars]
-        `ll_weights`:     None or [B] or [B, num_roots]
+        `ll_weights`:     None or [B] or [num_roots, B]
         `input_layer_fn`: Custom forward function for input layers;
                           if it is a string, then try to call 
                           the corresponding member function of `input_layer`
