@@ -46,6 +46,9 @@ def mini_batch_em_epoch(num_epochs, pc, optimizer, scheduler, train_loader, test
 
 
 def full_batch_em_epoch(pc, train_loader, test_loader, device):
+
+    pc.init_param_flows(flows_memory = 0.0)
+
     t0 = time.time()
     train_ll = 0.0
     for batch in tqdm.tqdm(train_loader):
@@ -101,14 +104,14 @@ def train_hmm(enable_cudagrph = True):
     device = torch.device("cuda:0")
 
     T = 32
-    ns = homogenes_hmm(T, 64, 33279)
+    ns = homogenes_hmm(T, 16384, 10000)
     
     pc = juice.TensorCircuit(ns, max_tied_ns_per_parflow_group = 2)
     pc.print_statistics()
 
     pc.to(device)
 
-    data = torch.randint(0, 33279, (60000, T))
+    data = torch.randint(0, 10000, (60000, T))
 
     data_loader = DataLoader(
         dataset = TensorDataset(data),
