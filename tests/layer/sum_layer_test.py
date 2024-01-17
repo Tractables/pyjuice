@@ -360,8 +360,97 @@ def speed_test():
     print("--------------------------------------------------------------")
 
 
+def block_sparse_speed_test():
+
+    device = torch.device("cuda:0")
+
+    group_size = 32
+    num_vars = 28*28
+    num_node_groups = 1024 // group_size
+    num_prod_nodes = 200
+
+    batch_size = 512
+
+    with juice.set_group_size(group_size):
+
+        nis = []
+        for v in range(num_vars):
+            nis.append(inputs(v, num_node_groups = num_node_groups, dist = dists.Categorical(num_cats = 64)))
+
+        nps = []
+        for i in range(num_prod_nodes):
+            v1 = random.randint(0, num_vars - 1)
+            v2 = random.randint(0, num_vars - 1)
+            if v1 == v2:
+                if v1 == num_vars - 1:
+                    v1 -= 2
+                v2 = v1 + 1
+
+            nps.append(multiply(nis[v1], nis[v2]))
+
+        nodes = []
+        for np in nps:
+            edge_ids = torch.rand([num_node_groups, num_node_groups]) < 0.2
+            edge_ids[:,0] = True
+            edge_ids = torch.nonzero(edge_ids, as_tuple = False).permute(1, 0)
+            nodes.append(summate(np, num_node_groups = num_node_groups, edge_ids = edge_ids))
+
+    input_layer = InputLayer(nis, cum_nodes = group_size)
+
+    prod_layer = ProdLayer(nps, layer_sparsity_tol = 0.1)
+
+    layer = SumLayer(nodes, global_nid_start = group_size,
+                     global_pid_start = group_size ** 2, global_pfid_start = 0, node2tiednodes = dict(), 
+                     layer_sparsity_tol = 0.1)
+
+    layer.to(device)
+
+    node_mars = torch.zeros([group_size + group_size * num_node_groups * num_prod_nodes, batch_size]).to(device)
+    element_mars = torch.rand([group_size + num_prod_nodes * group_size * num_node_groups, batch_size]).log().to(device)
+    params = torch.rand([layer.partitioned_pids[0].max() + group_size ** 2]).to(device)
+
+    ## Forward tests ##
+
+    layer(node_mars, element_mars, params)
+
+    t0 = time.time()
+    torch.cuda.synchronize()
+    for _ in range(100):
+        layer(node_mars, element_mars, params)
+    torch.cuda.synchronize()
+    t1 = time.time()
+    forward_ms = (t1 - t0) / 100 * 1000
+
+    print(f"Sparse forward pass on average takes {forward_ms:.3f}ms.")
+    print("Reference computation time on RTX 4090: 2.594ms.")
+    print("--------------------------------------------------------------")
+
+    node_flows = torch.rand([group_size + group_size * num_node_groups * num_prod_nodes, batch_size]).to(device)
+    element_flows = torch.zeros([group_size + num_prod_nodes * group_size * num_node_groups, batch_size]).log().to(device)
+    param_flows = torch.zeros([group_size ** 2 + layer.partitioned_pids[0].max() + group_size]).to(device)
+
+    layer.backward(node_flows, element_flows, node_mars, element_mars, params, param_flows,
+                   allow_modify_flows = True)
+
+    t0 = time.time()
+    torch.cuda.synchronize()
+    for _ in range(100):
+        layer.backward(node_flows, element_flows, node_mars, element_mars, params, param_flows,
+                       allow_modify_flows = True)
+    torch.cuda.synchronize()
+    t1 = time.time()
+    backward_ms = (t1 - t0) / 100 * 1000
+
+    print(f"Sparse backward pass on average takes {backward_ms:.3f}ms.")
+    print("Reference computation time on RTX 4090: 8.528ms.")
+    print("--------------------------------------------------------------")
+
+    import pdb; pdb.set_trace()
+
+
 if __name__ == "__main__":
     torch.manual_seed(3890)
     sum_layer_test()
     corner_case_test()
     speed_test()
+    block_sparse_speed_test()
