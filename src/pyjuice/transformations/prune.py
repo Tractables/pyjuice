@@ -11,7 +11,7 @@ Tensor = Union[np.ndarray,torch.Tensor]
 
 
 def prune_by_score(root_nodes: CircuitNodes, key: str = "_scores", scores: Optional[Dict[CircuitNodes,Tensor]] = None, 
-                   keep_frac: Optional[float] = None, score_threshold: Optional[float] = None):
+                   keep_frac: Optional[float] = None, score_threshold: Optional[float] = None, group_reduction: str = "sum"):
     
     # Traverse all nodes to collect scores
     score_ranges = dict()
@@ -40,6 +40,18 @@ def prune_by_score(root_nodes: CircuitNodes, key: str = "_scores", scores: Optio
         if isinstance(curr_scores, np.ndarray):
             curr_scores = torch.from_numpy(curr_scores)
 
+        if curr_scores.dim() == 3:
+            if group_reduction == "sum":
+                curr_scores = curr_scores.sum(dim = 2).sum(dim = 1)
+            elif group_reduction == "mean":
+                curr_scores = curr_scores.mean(dim = 2).mean(dim = 1)
+            elif group_reduction == "max":
+                curr_scores = curr_scores.max(dim = 2).max(dim = 1)
+            else:
+                raise ValueError(f"Unknown group reduction method `{group_reduction}`.")
+        else:
+            assert curr_scores.dim() == 1
+
         flat_scores.append(curr_scores)
         num_scores = curr_scores.size(0)
 
@@ -57,7 +69,6 @@ def prune_by_score(root_nodes: CircuitNodes, key: str = "_scores", scores: Optio
         assert score_threshold is None, "Only one of `keep_frac` and `score_threshold` should be set."
         score_threshold = torch.quantile(flat_scores, 1.0 - keep_frac, dim = 0)
         selected_edges = (flat_scores >= score_threshold)
-
     else:
         assert score_threshold is not None, "At least one of `keep_frac` and `score_threshold` should be set."
         selected_edges = (flat_scores >= score_threshold)
@@ -124,7 +135,5 @@ def prune_by_score(root_nodes: CircuitNodes, key: str = "_scores", scores: Optio
 
         if hasattr(ns_source, "edge_ids"):
             ns.edge_ids = ns_source.edge_ids.clone()
-        # if hasattr(ns_source, "_params"):
-        #     ns._params = ns_source._params.clone()
 
     return new_root_ns
