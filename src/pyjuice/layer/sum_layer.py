@@ -1192,8 +1192,12 @@ class SumLayer(Layer, nn.Module):
 
         if triton.cdiv(layer_n_nodes, self.group_size) <= 4096:
 
-            BLOCK_B = min(2048, BATCH_SIZE_NP2)
-            BLOCK_M = min(2048 // BLOCK_B, self.group_size)
+            if BATCH_SIZE_NP2 >= 64 and self.group_size >= 64:
+                BLOCK_B = min(2048 // 64, BATCH_SIZE_NP2)
+                BLOCK_M = min(4096 // BLOCK_B, self.group_size)
+            else:
+                BLOCK_B = min(2048, BATCH_SIZE_NP2)
+                BLOCK_M = min(2048 // BLOCK_B, self.group_size)
 
             partial_eval = 1 if local_ids is not None else 0
             GROUP_SIZE_M = self.group_size
