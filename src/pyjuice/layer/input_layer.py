@@ -31,7 +31,7 @@ class InputLayer(Layer, nn.Module):
         """
 
         nn.Module.__init__(self)
-        Layer.__init__(self, nodes)
+        Layer.__init__(self, nodes, disable_group_size_check = True)
 
         # Reorder input nodes such that for any tied nodes, its source nodes appear before them
         self.nodes = self._reorder_nodes(nodes)
