@@ -107,6 +107,8 @@ def prune_by_score(root_nodes: CircuitNodes, key: str = "_scores", scores: Optio
                 edge_ids = torch.cat(copied_edges, dim = 1)
                 params = torch.cat(copied_params, dim = 0)
 
+                assert edge_ids.size(1) == params.size(0)
+
                 new_ns = SumNodes(
                     num_node_groups = ns.num_node_groups, 
                     chs = ch_outputs, 

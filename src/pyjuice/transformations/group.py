@@ -250,7 +250,7 @@ def group(root_ns: CircuitNodes, sparsity_tolerance: float = 0.25, max_target_gr
                     old_ch_group_size = ns.chs[0].group_size
                     if new_group_size > old_group_size or new_ch_group_size > old_ch_group_size:
                         new_params = torch.zeros([new_edge_ids.size(1), new_group_size, new_ch_group_size], device = device)
-                        if new_edge_ids.size(1) == new_num_ngroups * new_num_cgroups:
+                        if new_edge_ids.size(1) == new_num_ngroups * new_num_cgroups and params.numel() == new_params.numel():
                             # Fully-connected parameters
                             new_params = params.reshape(
                                 new_num_ngroups, group_mul_size, new_num_cgroups, ch_group_mul_size, old_group_size, old_ch_group_size
@@ -321,7 +321,7 @@ def group(root_ns: CircuitNodes, sparsity_tolerance: float = 0.25, max_target_gr
     return new_root_ns
 
 
-def ungroup(ns: CircuitNodes, group_size: int = 1, recursive: bool = True):
+def ungroup(root_ns: CircuitNodes, group_size: int = 1, recursive: bool = True, keys_to_copy: Optional[Sequence[str]] = None):
     
     def update_ns(ns: CircuitNodes, ns_chs: Sequence[CircuitNodes]):
         new_group_size = min(group_size, ns.group_size)
@@ -342,10 +342,10 @@ def ungroup(ns: CircuitNodes, group_size: int = 1, recursive: bool = True):
 
         elif ns.is_prod():
             if ns.is_block_sparse():
-                group_size_reduction = ns.group_size // new_group_size
+                gsize_redu = ns.group_size // new_group_size
                 edge_ids = ns.edge_ids.clone()
-                edge_ids = (edge_ids[:,None,:].repeat(1, group_size_reduction, 1) * group_size_reduction + \
-                    torch.arange(0, group_size_reduction)[None,:,None]).reshape(ns.num_nodes * group_size_reduction, ns.num_chs)
+                edge_ids = (edge_ids[:,None,:].repeat(1, gsize_redu, 1) * gsize_redu + \
+                    torch.arange(0, gsize_redu)[None,:,None]).reshape(ns.num_node_groups * gsize_redu, ns.num_chs)
 
             else:
                 edge_ids = ns.edge_ids.clone()
@@ -374,7 +374,7 @@ def ungroup(ns: CircuitNodes, group_size: int = 1, recursive: bool = True):
             edge_ids = edge_ids[:,None,:].repeat(1, gsize_redu * ch_gsize_redu, 1)
             edge_ids[0,:,:] = edge_ids[0,:,:] * gsize_redu + grid_x.reshape(-1)[:,None]
             edge_ids[1,:,:] = edge_ids[1,:,:] * ch_gsize_redu + grid_y.reshape(-1)[:,None]
-            edge_ids = edge_ids.reshape(2, ns.num_edges * gsize_redu * ch_gsize_redu)
+            edge_ids = edge_ids.reshape(2, ns.edge_ids.size(1) * gsize_redu * ch_gsize_redu)
 
             new_ns = SumNodes(
                 num_node_groups = new_num_ngroups,
@@ -386,12 +386,31 @@ def ungroup(ns: CircuitNodes, group_size: int = 1, recursive: bool = True):
             if not ns.is_tied() and ns.has_params():
                 params = ns._params.clone()
                 params = params.reshape(
-                    ns.num_edges, gsize_redu, new_group_size, ch_gsize_redu, new_ch_group_size
+                    ns.edge_ids.size(1), gsize_redu, new_group_size, ch_gsize_redu, new_ch_group_size
                 ).permute(0, 1, 3, 2, 4).reshape(
-                    ns.num_edges * gsize_redu * ch_gsize_redu, new_group_size, new_ch_group_size
+                    ns.edge_ids.size(1) * gsize_redu * ch_gsize_redu, new_group_size, new_ch_group_size
                 )
 
                 new_ns.set_params(params)
+
+                if keys_to_copy is not None:
+                    for key in keys_to_copy:
+                        if hasattr(ns, key):
+                            vals = getattr(ns, key)
+
+                            if vals.dim() == 3:
+                                vals = vals.reshape(
+                                    ns.edge_ids.size(1), gsize_redu, new_group_size, ch_gsize_redu, new_ch_group_size
+                                ).permute(0, 1, 3, 2, 4).reshape(
+                                    ns.edge_ids.size(1) * gsize_redu * ch_gsize_redu, new_group_size, new_ch_group_size
+                                )
+                                setattr(new_ns, key, vals)
+                            else:
+                                raise NotImplementedError()
+
+            assert new_ns._params.size(0) == new_ns.edge_ids.size(1)
+
+        return new_ns
 
     old2new = dict()
     new_root_ns = foldup_aggregate(update_ns, root_ns, cache = old2new)
