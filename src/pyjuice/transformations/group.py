@@ -76,10 +76,10 @@ def group(root_ns: CircuitNodes, sparsity_tolerance: float = 0.25, max_target_gr
     ns2group_size = dict()
     for ns in root_ns:
         if ns.is_input():
-            ns2group_size[ns] = min(max_cdf_power_of_2(ns.num_nodes), max_target_group_size)
+            ns2group_size[ns] = min(max_cdf_power_of_2(ns.num_nodes), max(ns.group_size, max_target_group_size))
 
         elif ns.is_prod():
-            ns2group_size[ns] = min(max_cdf_power_of_2(ns.num_nodes), max_target_group_size)
+            ns2group_size[ns] = min(max_cdf_power_of_2(ns.num_nodes), max(ns.group_size, max_target_group_size))
 
         else:
             assert ns.is_sum()
@@ -94,7 +94,7 @@ def group(root_ns: CircuitNodes, sparsity_tolerance: float = 0.25, max_target_gr
             flag = False
             plausible_combinations = list()
 
-            group_size = min(max_cdf_power_of_2(ns.num_nodes), max_target_group_size)
+            group_size = min(max_cdf_power_of_2(ns.num_nodes), max(ns.group_size, max_target_group_size))
             while group_size >= old_group_size:
                 group_mul_size = group_size // old_group_size
 
@@ -138,6 +138,10 @@ def group(root_ns: CircuitNodes, sparsity_tolerance: float = 0.25, max_target_gr
                         best_ch_group_size = ch_group_size
                         best_val = group_size * ch_group_size
                         best_frac = max(group_size, ch_group_size) // min(group_size, ch_group_size)
+
+            if best_group_size == 0:
+                best_group_size = old_group_size
+                best_ch_group_size = old_ch_group_size
 
             ns2group_size[ns] = best_group_size
             for cs in ns.chs:
