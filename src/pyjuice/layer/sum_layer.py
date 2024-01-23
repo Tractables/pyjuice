@@ -1111,6 +1111,8 @@ class SumLayer(Layer, nn.Module):
         else:
             raise ValueError(f"Not supported mode `{mode}`.")
 
+        return None
+
     @staticmethod
     # @triton.jit
     @FastJITFunction
@@ -1129,7 +1131,7 @@ class SumLayer(Layer, nn.Module):
             ngroup_id = tl.load(local_ids + ngroup_id)
 
         # Batch offsets and mask
-        offs_batch = tl.arange(0, BLOCK_B)
+        offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B
         mask_batch = offs_batch < batch_size
 
         # Initialize pointers to `node_flows` and `node_mars`
@@ -1140,7 +1142,7 @@ class SumLayer(Layer, nn.Module):
         nmars = tl.load(node_mars + offs_nmfs, mask = mask_batch[None,:])
         nflows = tl.load(node_flows + offs_nmfs, mask = mask_batch[None,:])
 
-        uflows = tl.where(nmars == -float("inf"), -float("inf"), tl.log(nflows) - nmars)
+        uflows = tl.where(nmars != -float("inf"), tl.log(nflows) - nmars, -float("inf"))
 
         tl.store(node_flows + offs_nmfs, uflows, mask = mask_batch[None,:])
 
@@ -1165,7 +1167,7 @@ class SumLayer(Layer, nn.Module):
             ngroup_ids = tl.load(local_ids + ngroup_ids)
 
         # Batch offsets and mask
-        offs_batch = tl.arange(0, BLOCK_B)
+        offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B
         mask_batch = offs_batch < batch_size
 
         # Initialize pointers to `node_flows` and `node_mars`
@@ -1175,7 +1177,7 @@ class SumLayer(Layer, nn.Module):
         nmars = tl.load(node_mars + offs_nmfs, mask = (mask_m[:,None] & mask_batch[None,:]))
         nflows = tl.load(node_flows + offs_nmfs, mask = (mask_m[:,None] & mask_batch[None,:]))
 
-        uflows = tl.where(nmars == -float("inf"), -float("inf"), tl.log(nflows) - nmars)
+        uflows = tl.where(nmars != -float("inf"), tl.log(nflows) - nmars, -float("inf"))
 
         tl.store(node_flows + offs_nmfs, uflows, mask = (mask_m[:,None] & mask_batch[None,:]))
 
