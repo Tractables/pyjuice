@@ -2195,7 +2195,7 @@ class SumLayer(Layer, nn.Module):
             emars = tl.load(emars_ptr, mask = mask_batch[None,:], other = -float("inf")) # [BLOCK_K, BLOCK_B]
 
             if allow_modify_flows == 1:
-                log_n_fdm = tl.load(nflows_ptr, mask = mask_batch) # [BLOCK_B]
+                log_n_fdm = tl.load(nflows_ptr, mask = mask_batch, other = -float("inf")) # [BLOCK_B]
                 pflows = tl.sum(tl.exp(emars + log_n_fdm[None,:]), axis = 1)
             else:
                 nmars = tl.load(nmars_ptr, mask = mask_batch, other = 0.0) # [BLOCK_B]
