@@ -19,7 +19,7 @@ def RAT_SPN(num_vars: int, num_latents: int, depth: int, num_repetitions: int, n
 
     # Specify group size
     if group_size is None:
-        group_size = min(128, max_cdf_power_of_2(num_latents))
+        group_size = min(256, max_cdf_power_of_2(num_latents))
 
     assert num_latents % group_size == 0, f"`num_latents` ({num_latents}) not divisible by `group_size` ({group_size})."
     num_node_groups = num_latents // group_size
