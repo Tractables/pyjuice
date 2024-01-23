@@ -9,7 +9,7 @@ from tqdm import tqdm
 from functools import partial
 from typing import Optional, Sequence, Callable, Union, Tuple, Dict
 
-from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes, foreach
+from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes, foreach, summate, multiply
 from pyjuice.layer import Layer, InputLayer, ProdLayer, SumLayer, LayerGroup
 from pyjuice.utils.grad_fns import ReverseGrad
 from pyjuice.utils import BitSet
@@ -753,6 +753,23 @@ class TensorCircuit(nn.Module):
                     depth2nodes[depth] = {"sum": [], "prod": []} # lists for sum and product nodes
                 
                 if ns.is_sum():
+                    for idx, cs in enumerate(ns.chs):
+                        cs_depth = nodes2depth[cs]
+                        if cs_depth < depth:
+                            pass_sum_ns = summate(
+                                cs, num_node_groups = cs.num_node_groups, group_size = cs.group_size,
+                                edge_ids = torch.arange(0, cs.num_node_groups)[None,:].repeat(2, 1),
+                                params = torch.eye(cs.group_size)[None,:,:].repeat(cs.num_node_groups, 1, 1)
+                            )
+                            pass_prod_ns = multiply(pass_sum_ns)
+                            ns.chs[idx] = pass_prod_ns
+
+                            depth2nodes[cs_depth]["sum"].append(pass_sum_ns)
+                            depth2nodes[depth]["prod"].append(pass_prod_ns)
+
+                            nodes2depth[pass_sum_ns] = cs_depth
+                            nodes2depth[pass_prod_ns] = depth
+
                     depth2nodes[depth]["sum"].append(ns)
                     if ns.group_size > max_node_group_size:
                         max_node_group_size = ns.group_size
