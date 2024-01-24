@@ -23,6 +23,7 @@ def PD(data_shape: Tuple, num_latents: int,
        input_layer_fn: Optional[Callable] = None,
        input_layer_type: Type[Distribution] = Categorical, 
        input_layer_params: Dict = {"num_cats": 256},
+       use_linear_mixing: bool = False,
        group_size: Optional[int] = None):
     """
     The PD structure was proposed in
@@ -133,14 +134,19 @@ def PD(data_shape: Tuple, num_latents: int,
             ns = create_input_ns(hypercube)
         elif hypercube == root_hypercube:
             ns = summate(*pns, num_node_groups = 1, group_size = 1)
-        elif len(pns) <= max_prod_group_conns:
-            ns = summate(*pns, num_node_groups = num_node_groups)
+        elif not use_linear_mixing:
+            if len(pns) <= max_prod_group_conns:
+                ns = summate(*pns, num_node_groups = num_node_groups)
+            else:
+                group_ids = torch.topk(torch.rand([num_node_groups, len(pns)]), k = max_prod_group_conns, dim = 1).indices
+                par_ids = torch.arange(0, num_node_groups)[:,None,None].repeat(1, max_prod_group_conns, num_node_groups)
+                chs_ids = group_ids[:,:,None] * num_node_groups + torch.arange(0, num_node_groups)[None,None,:]
+                edge_ids = torch.stack((par_ids.reshape(-1), chs_ids.reshape(-1)), dim = 0)
+                ns = summate(*pns, num_node_groups = num_node_groups, edge_ids = edge_ids)
         else:
-            group_ids = torch.topk(torch.rand([num_node_groups, len(pns)]), k = max_prod_group_conns, dim = 1).indices
-            par_ids = torch.arange(0, num_node_groups)[:,None,None].repeat(1, max_prod_group_conns, num_node_groups)
-            chs_ids = group_ids[:,:,None] * num_node_groups + torch.arange(0, num_node_groups)[None,None,:]
-            edge_ids = torch.stack((par_ids.reshape(-1), chs_ids.reshape(-1)), dim = 0)
-            ns = summate(*pns, num_node_groups = num_node_groups, edge_ids = edge_ids)
+            # Linear mixing as implemented in EiNet's Mixing layer
+            ch_ns = [multiply(summate(pn, num_node_groups = num_node_groups)) for pn in pns]
+            ns = summate(*ch_ns, num_node_groups = num_node_groups, edge_ids = torch.arange(0, num_node_groups)[None,:].repeat(2, 1))
 
         hypercube2ns[hypercube] = ns
         return ns

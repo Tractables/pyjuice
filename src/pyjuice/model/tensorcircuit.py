@@ -756,6 +756,7 @@ class TensorCircuit(nn.Module):
                     for idx, cs in enumerate(ns.chs):
                         cs_depth = nodes2depth[cs]
                         if cs_depth < depth:
+                            # TODO: Make the group size be 1
                             pass_sum_ns = summate(
                                 cs, num_node_groups = cs.num_node_groups, group_size = cs.group_size,
                                 edge_ids = torch.arange(0, cs.num_node_groups)[None,:].repeat(2, 1),
