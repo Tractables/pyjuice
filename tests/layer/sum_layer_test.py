@@ -445,8 +445,6 @@ def block_sparse_speed_test():
     print("Reference computation time on RTX 4090: 8.528ms.")
     print("--------------------------------------------------------------")
 
-    import pdb; pdb.set_trace()
-
 
 if __name__ == "__main__":
     torch.manual_seed(3890)
