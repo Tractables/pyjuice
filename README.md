@@ -9,13 +9,12 @@ PyJuice is a library for [Probabilistic Circuits](https://starai.cs.ucla.edu/pap
 
 ## Why PyJuice?
 
-The biggest advantage of PyJuice is its speed.
+The biggest advantage of PyJuice is its speed and scalability. We benchmark PyJuice against prior PC packages [SPFlow](https://github.com/SPFlow/SPFlow), [EiNet](https://github.com/cambridge-mlg/EinsumNetworks), and [Juice.jl](https://github.com/Juice-jl/ProbabilisticCircuits.jl) on the [PD](https://arxiv.org/pdf/1202.3732.pdf) and [HCLT](https://proceedings.neurips.cc/paper_files/paper/2021/file/1d0832c4969f6a4cc8e8a8fffe083efb-Paper.pdf) structures with various sizes by variating their width. We report the average ($\pm$ standard deviation of 5 runs) runtime (in seconds) per training epoch of 60K samples. All experiments were carried out on an RTX 4090 GPU with 24GB memory. To maximize parallelism, we always use the maximum possible batch size. "OOM" denotes out-of-memory with batch size 2.
 
-<table style="width:80%">
+<table>
   <tr>
     <td></td>
-    <td colspan="5", align="center"><b>PD</b></td>
-    <td colspan="5", align="center"><b>RAT-SPN</b></td>
+    <td colspan="5", align="center"><b><a href="https://arxiv.org/pdf/1202.3732.pdf">PD</a></b></td>
   </tr>
   <tr>
     <td># nodes</td>
@@ -24,11 +23,6 @@ The biggest advantage of PyJuice is its speed.
     <td>688K</td>
     <td>1.38M</td>
     <td>2.06M</td>
-    <td>58K</td>
-    <td>116K</td>
-    <td>232K</td>
-    <td>465K</td>
-    <td>930K</td>
   </tr>
   <tr>
     <td># edges</td>
@@ -37,11 +31,6 @@ The biggest advantage of PyJuice is its speed.
     <td>213M</td>
     <td>829M</td>
     <td>2.03B</td>
-    <td>616K</td>
-    <td>2.2M</td>
-    <td>8.6M</td>
-    <td>33.4M</td>
-    <td>132M</td>
   </tr>
   <tr>
     <td><b><a href="https://github.com/SPFlow/SPFlow">SPFlow</a></b></td>
@@ -59,41 +48,95 @@ The biggest advantage of PyJuice is its speed.
     <td>$1534.7_{\pm0.5}$</td>
     <td>OOM</td>
   </tr>
+  <tr>
+    <td><b><a href="https://github.com/Juice-jl/ProbabilisticCircuits.jl">Juice.jl</a></b></td>
+    <td>$12.6_{\pm0.5}$</td>
+    <td>$37.0_{\pm1.7}$</td>
+    <td>$141.7_{\pm6.9}$</td>
+    <td>OOM</td>
+    <td>OOM</td>
+  </tr>
+  <tr>
+    <td><b>PyJuice</b></td>
+    <td>$2.0_{\pm0.0}$</td>
+    <td>$5.3_{\pm0.0}$</td>
+    <td>$15.4_{\pm0.0}$</td>
+    <td>$57.1_{\pm0.2}$</td>
+    <td>$203.7_{\pm0.1}$</td>
+  </tr>
 </table>
+
+<table>
+  <tr>
+    <td></td>
+    <td colspan="5", align="center"><b><a href="https://proceedings.neurips.cc/paper_files/paper/2021/file/1d0832c4969f6a4cc8e8a8fffe083efb-Paper.pdf">HCLT</a></b></td>
+  </tr>
+  <tr>
+    <td># nodes</td>
+    <td>89K</td>
+    <td>178K</td>
+    <td>355K</td>
+    <td>710K</td>
+    <td>1.42M</td>
+  </tr>
+  <tr>
+    <td># edges</td>
+    <td>2.56M</td>
+    <td>10.1M</td>
+    <td>39.9M</td>
+    <td>159M</td>
+    <td>633M</td>
+  </tr>
+  <tr>
+    <td><b><a href="https://github.com/SPFlow/SPFlow">SPFlow</a></b></td>
+    <td>$22955.6_{\pm18.4}$</td>
+    <td>$\geq\!25000$</td>
+    <td>$\geq\!25000$</td>
+    <td>$\geq\!25000$</td>
+    <td>$\geq\!25000$</td>
+  </tr>
+  <tr>
+    <td><b><a href="https://github.com/cambridge-mlg/EinsumNetworks">EiNet</a></b></td>
+    <td>$52.5_{\pm0.3}$</td>
+    <td>$77.4_{\pm0.4}$</td>
+    <td>$233.5_{\pm2.8}$</td>
+    <td>$1170.7_{\pm8.9}$</td>
+    <td>$5654.3_{\pm17.4}$</td>
+  </tr>
+  <tr>
+    <td><b><a href="https://github.com/Juice-jl/ProbabilisticCircuits.jl">Juice.jl</a></b></td>
+    <td>$4.7_{\pm0.2}$</td>
+    <td>$6.4_{\pm0.5}$</td>
+    <td>$12.4_{\pm1.3}$</td>
+    <td>$41.1_{\pm0.1}$</td>
+    <td>$143.2_{\pm5.1}$</td>
+  </tr>
+  <tr>
+    <td><b>PyJuice</b></td>
+    <td>$0.8_{\pm0.0}$</td>
+    <td>$1.3_{\pm0.0}$</td>
+    <td>$2.6_{\pm0.0}$</td>
+    <td>$8.8_{\pm0.0}$</td>
+    <td>$24.9_{\pm0.1}$</td>
+  </tr>
+</table>
+
+As indicated by the tables, PyJuice is not only much faster than existing implementations, but it is also more scalable -- it can train much larger PCs in a reasonable amount of time without suffering from OOM issues.
 
 ## Installation
 
-0. (Optional) Make a new conda environment
+Since PyJuice is in active development, we recommend installing it from the latest development branch:
 
-    ```bash
-    conda create -n pyjuice python=3.8
-    conda activate pyjuice
-    ```
+```
+git clone git@github.com:Juice-jl/pyjuice.git
+cd pyjuice
+pip install -e .
+```
 
-1. Clone this repository and `cd` into it.
+## Example Usage (pre-specified structures)
 
-2. Install the `pyjuice` package in developement mode, run the following:
 
-    ```bash
-    pip install --editable .
-    ```
 
-3. Install GPU Enabled Pytorch `2.0`.  See [pytorch installation guide](https://pytorch.org/get-started/locally/) for more details. Make sure to install version `>=2.0`.
+## Example Usage (define your own PC)
 
-    ```bash
-    pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-    ```
 
-## Testing
-
-- Install `pytest`:
-
-    ```bash
-    pip install pytest
-    ```
-
-- To run the tests, simply call:
-
-    ```bash
-    pytest
-    ```
