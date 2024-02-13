@@ -1,4 +1,4 @@
-<img align="right" width="180px" src="https://avatars.githubusercontent.com/u/58918144?s=200&v=4">
+<img align="right" width="160px" src="https://avatars.githubusercontent.com/u/58918144?s=200&v=4">
 
 # PyJuice
 
@@ -178,6 +178,8 @@ batch_size = 256
 for batch_start in range(0, num_samples, batch_size):
     batch_end = min(batch_start + batch_size, num_samples)
     x = train_data[batch_start:batch_end,:].to(device)
+    # This is equivalent to zeroing out the parameter gradients of a neural network
+    pc.init_param_flows(flows_memory = 0.0)
     # Forward pass
     lls = pc(x)
     # Backward pass
@@ -186,8 +188,43 @@ for batch_start in range(0, num_samples, batch_size):
     pc.mini_batch_em(step_size = 0.01, pseudocount = 0.001)
 ```
 
-Here `pseudocount` is the Laplacian regularization hyper-parameter.
+Here `pseudocount` is the Laplacian regularization hyper-parameter. Alternatively, we can use `pyjuice.optim.CircuitOptimizer` 
 
 ## Example Usage (define your own PC)
 
+In the above section, we have learned how to generate a PC with a pre-defined structure and train its parameters with EM. This section delves deeper into the APIs for defining your own PCs.
 
+The main APIs we will be using are `juice.inputs`, `juice.multiply`, and `juice.summate`, which are used to define input nodes, product nodes, and sum nodes, respectively. We start with the inputs:
+
+```py
+input_ns0 = juice.inputs(var = 0, num_nodes = num_nodes, dist = juice_dists.Bernoulli())
+```
+
+The above line defines a vector of `num_nodes` input nodes, each defined on variable #0 and has a Bernoulli distribution. There are other optional arguments such as `params` that allow directly specifying the parameters of input nodes, and we will explain one that is particularly important: `block_size`.
+
+```py
+input_ns0 = juice.inputs(var = 0, num_node_blocks = num_nodes // 4, block_size = 4, dist = juice_dists.Bernoulli())
+```
+
+Assume without loss of generality that `num_nodes` is a multiple of 4, the above line is an equivalent way to define a vector of `num_nodes` input nodes. While the semantic meaning of the two lines are the same, the latter is preferred as it allows the compiler (i.e., `juice.compile`) to better exploit block-based parallelization. Therefore, setting `num_node_blocks` and `block_size` simultaneously is more preferrable than solely setting `num_nodes`. Note that this also applies to `juice.multiply` and `juice.summate`.
+
+We use `juice.multiply` to combine PCs defined on disjoint sets of variables:
+
+```py
+input_ns1 = juice.inputs(var = 1, num_node_blocks = num_nodes // 4, block_size = 4, dist = juice_dists.Bernoulli())
+prod_ns = juice.multiply(input_ns0, input_ns1, edge_ids = edge_ids)
+```
+
+In the second line, we define a vector of product nodes, where each product node connects to one node in `input_ns0` and one node in `input_ns1`. The connection pattern is specified in `edge_ids` (with size `[num_node_blocks, num_chs]`; here `num_chs = 2`). We can also choose to *not* provide `edge_ids`, in which case we assume the inputs have the same `num_node_blocks` and `block_size`, and create `num_node_blocks * block_size` product nodes, where the *i*th node connects to the *i*th node of every input.
+
+```py
+sum_ns = juice.summate(prod_ns, num_node_blocks = num_nodes // 4, block_size = 4)
+```
+
+The above line then defines a vector of `num_nodes` sum nodes fully-connected with the `num_nodes` product nodes in `prod_ns`. Optionally, we can define a block-sparse connectivity pattern by specifying `edge_ids`, which has size `[2, num_edges]`: every column of size-2 vector `[i,j]` denotes "the *i*th sum node block is connected to the *j*th product node block". We can also have multiple inputs to `juice.summate` (suppose we have defined `prod_ns1` and `prod_ns2`):
+
+```py
+sum_ns = juice.summate(prod_ns1, prod_ns2, num_node_blocks = num_nodes // 4, block_size = 4)
+```
+
+The above is equivalent to considering the input nodes to be concatenated into a single vector of nodes, and then define the edges correspondingly.
