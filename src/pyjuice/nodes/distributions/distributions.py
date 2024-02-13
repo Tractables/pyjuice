@@ -136,3 +136,6 @@ class Distribution():
         `BLOCK_SIZE`: CUDA block size
         """
         raise NotImplementedError()
+
+    def _get_constructor(self):
+        raise NotImplementedError()

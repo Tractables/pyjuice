@@ -78,3 +78,6 @@ class Bernoulli(Distribution):
 
         new_param = (1.0 - step_size) * param + step_size * updated_param
         tl.store(params_ptr + s_pids, new_param, mask = mask)
+
+    def _get_constructor(self):
+        return Bernoulli, {}

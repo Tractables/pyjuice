@@ -70,16 +70,20 @@ def HCLT(x: torch.Tensor, num_latents: int,
          chunk_size: int = 64,
          num_root_ns: int = 1,
          block_size: Optional[int] = None,
-         input_layer_type: Type[Distribution] = Categorical, 
-         input_layer_params: dict = {"num_cats": 256}):
+         input_dist: Optional[Distribution] = None,
+         input_node_type: Type[Distribution] = Categorical, 
+         input_node_params: dict = {"num_cats": 256}):
+
+    if input_dist is not None:
+        input_node_type, input_node_params = input_dist._get_constructor()
     
     mi = mutual_information_chunked(x, x, num_bins, sigma, chunk_size = chunk_size).detach().cpu().numpy()
     T = chow_liu_tree(mi)
     root = nx.center(T)[0]
 
     root_r = BayesianTreeToHiddenRegionGraph(
-        T, root, num_latents, input_layer_type, 
-        input_layer_params, num_root_ns = num_root_ns,
+        T, root, num_latents, input_node_type, 
+        input_node_params, num_root_ns = num_root_ns,
         block_size = block_size
     )
     

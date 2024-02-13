@@ -149,3 +149,6 @@ class DiscreteLogistic(Distribution):
 
         tl.store(params_ptr + s_pids, updated_mu, mask = mask)
         tl.store(params_ptr + s_pids + 1, updated_s, mask = mask)
+
+    def _get_constructor(self):
+        return DiscreteLogistic, {"val_range": self.val_range, "num_cats": self.num_cats, "min_std": self.min_std}

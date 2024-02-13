@@ -448,3 +448,6 @@ class MaskedCategorical(Distribution):
 
             new_param = (1.0 - step_size) * param + step_size * (flow + numerate_pseudocount) / cum_flow
             tl.store(params_ptr + s_pids + cat_id, new_param, mask = cat_mask)
+
+    def _get_constructor(self):
+        return MaskedCategorical, {"num_cats": self.num_cats, "mask_mode": self.mask_mode}

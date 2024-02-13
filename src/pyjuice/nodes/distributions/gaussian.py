@@ -121,3 +121,6 @@ class Gaussian(Distribution):
 
         tl.store(params_ptr + s_pids, updated_mu, mask = mask)
         tl.store(params_ptr + s_pids + 1, updated_sigma, mask = mask)
+
+    def _get_constructor(self):
+        return Gaussian, {"mu": self.mu, "sigma": self.sigma, "min_sigma": self.min_sigma}
