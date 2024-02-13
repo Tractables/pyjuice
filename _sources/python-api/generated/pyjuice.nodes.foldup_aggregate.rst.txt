@@ -1,0 +1,6 @@
+﻿pyjuice.nodes.foldup\_aggregate
+===============================
+
+.. currentmodule:: pyjuice.nodes
+
+.. autofunction:: foldup_aggregate

@@ -1,0 +1,6 @@
+﻿pyjuice.compile
+===============
+
+.. currentmodule:: pyjuice
+
+.. autofunction:: compile
