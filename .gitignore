@@ -167,3 +167,5 @@ examples/circuits
 examples/1_pc_training/samples_test.png
 
 tests/examples/
+
+docs/build/
