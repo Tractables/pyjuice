@@ -64,9 +64,10 @@ def chow_liu_tree(mi: np.ndarray):
     return T
     
 
-def HCLT(x: torch.Tensor, num_bins: int, sigma: float,
-         chunk_size: int,
-         num_latents: int, 
+def HCLT(x: torch.Tensor, num_latents: int, 
+         num_bins: int = 32, 
+         sigma: float = 0.5 / 32,
+         chunk_size: int = 64,
          num_root_ns: int = 1,
          block_size: Optional[int] = None,
          input_layer_type: Type[Distribution] = Categorical, 
