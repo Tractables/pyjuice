@@ -1,1 +1,1 @@
-from .tensorcircuit import TensorCircuit
+from .tensorcircuit import TensorCircuit, compile

@@ -9,7 +9,7 @@ import pyjuice.io
 import pyjuice.visualize
 
 # TensorCircuit
-from pyjuice.model import TensorCircuit
+from pyjuice.model import compile, TensorCircuit
 
 # Construction methods
 from pyjuice.nodes import multiply, summate, inputs, set_block_size

@@ -819,3 +819,7 @@ class TensorCircuit(nn.Module):
                 assert layer_group.is_sum()
 
                 layer_group._prepare_scope2nids(prod_scope_eleids)
+
+
+def compile(ns: CircuitNodes, *args, **kwargs):
+    return TensorCircuit(ns, *args, **kwargs)
