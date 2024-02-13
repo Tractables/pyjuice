@@ -68,7 +68,7 @@ def HCLT(x: torch.Tensor, num_bins: int, sigma: float,
          chunk_size: int,
          num_latents: int, 
          num_root_ns: int = 1,
-         group_size: Optional[int] = None,
+         block_size: Optional[int] = None,
          input_layer_type: Type[Distribution] = Categorical, 
          input_layer_params: dict = {"num_cats": 256}):
     
@@ -79,7 +79,7 @@ def HCLT(x: torch.Tensor, num_bins: int, sigma: float,
     root_r = BayesianTreeToHiddenRegionGraph(
         T, root, num_latents, input_layer_type, 
         input_layer_params, num_root_ns = num_root_ns,
-        group_size = group_size
+        block_size = block_size
     )
     
     return root_r

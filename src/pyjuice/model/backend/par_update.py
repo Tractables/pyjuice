@@ -13,33 +13,33 @@ from pyjuice.nodes import CircuitNodes
 
 @njit
 def _record_par_blks(par_start_ids, pflow_start_ids, blk_sizes, blk_intervals, global_nids, nchs,
-                     num_edges_per_ng, ns_num_node_groups, ns_group_size, cs_group_size, pid, 
+                     num_edges_per_ng, ns_num_node_blocks, ns_block_size, cs_block_size, pid, 
                      global_nid, par_start, pflow_start, BLOCK_SIZE):
-    for local_ngid in range(ns_num_node_groups):
+    for local_ngid in range(ns_num_node_blocks):
         num_edges = num_edges_per_ng[local_ngid]
-        num_chs = num_edges * cs_group_size
+        num_chs = num_edges * cs_block_size
 
         for sid in range(0, num_chs, BLOCK_SIZE):
             eid = min(sid + BLOCK_SIZE, num_chs)
             blk_size = eid - sid
 
-            for gid in range(ns_group_size):
-                psid = par_start + sid * ns_group_size + gid
-                pfsid = pflow_start + sid * ns_group_size + gid
+            for gid in range(ns_block_size):
+                psid = par_start + sid * ns_block_size + gid
+                pfsid = pflow_start + sid * ns_block_size + gid
                 global_ind = global_nid + gid
 
-                par_start_ids[pid] = par_start + sid * ns_group_size + gid
-                pflow_start_ids[pid] = pflow_start + sid * ns_group_size + gid
+                par_start_ids[pid] = par_start + sid * ns_block_size + gid
+                pflow_start_ids[pid] = pflow_start + sid * ns_block_size + gid
                 blk_sizes[pid] = blk_size
-                blk_intervals[pid] = ns_group_size
+                blk_intervals[pid] = ns_block_size
                 global_nids[pid] = global_nid + gid
-                nchs[pid] = num_edges * cs_group_size
+                nchs[pid] = num_edges * cs_block_size
 
                 pid += 1
 
-        pflow_start += ns_group_size * num_edges * cs_group_size
-        par_start += ns_group_size * num_edges * cs_group_size
-        global_nid += ns_group_size
+        pflow_start += ns_block_size * num_edges * cs_block_size
+        par_start += ns_block_size * num_edges * cs_block_size
+        global_nid += ns_block_size
 
     return global_nid, pid
 
@@ -66,10 +66,10 @@ def compile_par_update_fn(root_ns: CircuitNodes, BLOCK_SIZE: int = 32, buffer_in
         pflow_start = ns._param_flow_range[0]
         tot_n_pars = ns._param_range[1] - ns._param_range[0]
 
-        num_edges_per_ng = torch.bincount(ns.edge_ids[0,:], minlength = ns.num_node_groups).contiguous().numpy()
+        num_edges_per_ng = torch.bincount(ns.edge_ids[0,:], minlength = ns.num_node_blocks).contiguous().numpy()
 
         # Enlarge the buffer if needed
-        est_num_slots = triton.cdiv(ns.edge_ids.size(1) * ns.group_size * ns.ch_group_size, BLOCK_SIZE) + ns.num_nodes
+        est_num_slots = triton.cdiv(ns.edge_ids.size(1) * ns.block_size * ns.ch_block_size, BLOCK_SIZE) + ns.num_nodes
         if pid + est_num_slots > par_start_ids.shape[0]:
             curr_size = par_start_ids.shape[0]
             inc_shape = triton.cdiv(pid + est_num_slots - curr_size, buffer_inc_interval) * buffer_inc_interval
@@ -101,43 +101,43 @@ def compile_par_update_fn(root_ns: CircuitNodes, BLOCK_SIZE: int = 32, buffer_in
             buffer_inc_interval *= 2
 
         if use_numba:
-            ns_num_node_groups = ns.num_node_groups
-            ns_group_size = ns.group_size
-            cs_group_size = ns.ch_group_size
+            ns_num_node_blocks = ns.num_node_blocks
+            ns_block_size = ns.block_size
+            cs_block_size = ns.ch_block_size
 
             global_nid, pid = _record_par_blks(
                 par_start_ids, pflow_start_ids, blk_sizes, blk_intervals, global_nids, nchs,
-                num_edges_per_ng, ns_num_node_groups, ns_group_size, cs_group_size, pid, 
+                num_edges_per_ng, ns_num_node_blocks, ns_block_size, cs_block_size, pid, 
                 global_nid, par_start, pflow_start, BLOCK_SIZE
             )
 
         else:
-            ns_gid_range = torch.arange(0, ns.group_size)
+            ns_gid_range = torch.arange(0, ns.block_size)
 
-            for local_ngid in range(ns.num_node_groups):
+            for local_ngid in range(ns.num_node_blocks):
                 num_edges = num_edges_per_ng[local_ngid]
-                num_chs = num_edges * ns.ch_group_size
+                num_chs = num_edges * ns.ch_block_size
 
                 for sid in range(0, num_chs, BLOCK_SIZE):
                     eid = min(sid + BLOCK_SIZE, num_chs)
                     blk_size = eid - sid
 
-                    curr_psids = par_start + sid * ns.group_size + ns_gid_range
-                    curr_pfsids = pflow_start + sid * ns.group_size + ns_gid_range
+                    curr_psids = par_start + sid * ns.block_size + ns_gid_range
+                    curr_pfsids = pflow_start + sid * ns.block_size + ns_gid_range
                     curr_global_nids = global_nid + ns_gid_range
 
-                    par_start_ids[pid:pid+ns.group_size] = curr_psids
-                    pflow_start_ids[pid:pid+ns.group_size] = curr_pfsids
-                    blk_sizes[pid:pid+ns.group_size] = blk_size
-                    blk_intervals[pid:pid+ns.group_size] = ns.group_size
-                    global_nids[pid:pid+ns.group_size] = curr_global_nids
-                    nchs[pid:pid+ns.group_size] = num_edges * ns.ch_group_size
+                    par_start_ids[pid:pid+ns.block_size] = curr_psids
+                    pflow_start_ids[pid:pid+ns.block_size] = curr_pfsids
+                    blk_sizes[pid:pid+ns.block_size] = blk_size
+                    blk_intervals[pid:pid+ns.block_size] = ns.block_size
+                    global_nids[pid:pid+ns.block_size] = curr_global_nids
+                    nchs[pid:pid+ns.block_size] = num_edges * ns.ch_block_size
 
-                    pid += ns.group_size
+                    pid += ns.block_size
 
-                par_start += ns.group_size * num_edges * ns.ch_group_size
-                pflow_start += ns.group_size * num_edges * ns.ch_group_size
-                global_nid += ns.group_size
+                par_start += ns.block_size * num_edges * ns.ch_block_size
+                pflow_start += ns.block_size * num_edges * ns.ch_block_size
+                global_nid += ns.block_size
 
     par_start_ids = torch.from_numpy(par_start_ids[:pid]).contiguous()
     pflow_start_ids = torch.from_numpy(pflow_start_ids[:pid]).contiguous()

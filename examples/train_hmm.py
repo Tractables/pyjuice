@@ -104,25 +104,47 @@ def train_hmm(enable_cudagrph = True):
     device = torch.device("cuda:0")
 
     T = 32
-    ns = homogenes_hmm(T, 16384, 10000)
+    ns = homogenes_hmm(T, 8192, 4023)
     
     pc = juice.TensorCircuit(ns, max_tied_ns_per_parflow_group = 2)
     pc.print_statistics()
 
     pc.to(device)
 
-    data = torch.randint(0, 10000, (60000, T))
+    data = torch.randint(0, 10000, (6400, T))
 
     data_loader = DataLoader(
         dataset = TensorDataset(data),
-        batch_size = 512,
+        batch_size = 64,
         shuffle = True,
         drop_last = True
     )
 
     optimizer = juice.optim.CircuitOptimizer(pc, lr = 0.1, pseudocount = 0.0001)
 
-    mini_batch_em_epoch(350, pc, optimizer, None, data_loader, data_loader, device)
+    for batch in tqdm.tqdm(data_loader):
+        x = batch[0].to(device)
+
+        lls = pc(x)
+        lls.mean().backward()
+
+        break
+
+    torch.cuda.synchronize()
+    t0 = time.time()
+
+    for batch in tqdm.tqdm(data_loader):
+        x = batch[0].to(device)
+
+        lls = pc(x)
+        lls.mean().backward()
+
+    torch.cuda.synchronize()
+    t1 = time.time()
+
+    print((t1-t0)/100*1000, "ms")
+
+    # mini_batch_em_epoch(350, pc, optimizer, None, data_loader, data_loader, device)
 
 
 if __name__ == "__main__":

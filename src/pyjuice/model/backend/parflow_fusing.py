@@ -8,33 +8,33 @@ import triton.language as tl
 from pyjuice.utils.kernel_launcher import FastJITFunction
 
 
-def compile_cum_par_flows_fn(node2tiednodes, MAX_NGROUPS = 2048, BLOCK_SIZE = 2048):
+def compile_cum_par_flows_fn(node2tiednodes, MAX_NBLOCKS = 2048, BLOCK_SIZE = 2048):
 
-    ngroup2kernel_specs = dict()
+    nblock2kernel_specs = dict()
     for source_ns, item in node2tiednodes.items():
         if len(item[0]) > 1: # If the length is 1, then everything is already accumulated in the source node's parflow
             num_par_flows = source_ns._param_flow_range[1] - source_ns._param_flow_range[0]
             pfid_start = source_ns._param_flow_range[0]
             ch_nodes = item[0]
 
-            assert len(ch_nodes) <= MAX_NGROUPS, f"We only support fusing at most {MAX_NGROUPS} groups for parameter flow accumulation. " \
-                                                  "Consider setting a greater `max_tied_ns_per_parflow_group` when compiling sum layers."
+            assert len(ch_nodes) <= MAX_NBLOCKS, f"We only support fusing at most {MAX_NBLOCKS} blocks for parameter flow accumulation. " \
+                                                  "Consider setting a greater `max_tied_ns_per_parflow_block` when compiling sum layers."
 
-            ngroup = triton.next_power_of_2(len(ch_nodes))
+            nblock = triton.next_power_of_2(len(ch_nodes))
 
             ch_pfids = []
             for ch_ns in ch_nodes:
                 ch_pfids.append(ch_ns._param_flow_range[0])
 
-            if ngroup not in ngroup2kernel_specs:
-                ngroup2kernel_specs[ngroup] = []
+            if nblock not in nblock2kernel_specs:
+                nblock2kernel_specs[nblock] = []
 
-            ngroup2kernel_specs[ngroup].append([pfid_start, num_par_flows, ch_pfids])
+            nblock2kernel_specs[nblock].append([pfid_start, num_par_flows, ch_pfids])
 
     kernels_args = []
-    for ngroup, kernel_specs in ngroup2kernel_specs.items():
+    for nblock, kernel_specs in nblock2kernel_specs.items():
 
-        BLOCK_G = ngroup
+        BLOCK_G = nblock
         BLOCK_M = BLOCK_SIZE // BLOCK_G
 
         target_pfids = []

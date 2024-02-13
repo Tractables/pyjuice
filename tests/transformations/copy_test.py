@@ -11,22 +11,22 @@ import pytest
 
 
 def copy_test():
-    num_node_groups_candidates = [2, 4, 7]
-    group_size_candidates = [1, 4, 8]
+    num_node_blocks_candidates = [2, 4, 7]
+    block_size_candidates = [1, 4, 8]
 
-    for num_node_groups in num_node_groups_candidates:
-        for group_size in group_size_candidates:
+    for num_node_blocks in num_node_blocks_candidates:
+        for block_size in block_size_candidates:
 
-            with juice.set_group_size(group_size):
+            with juice.set_block_size(block_size):
 
-                i00 = inputs(0, num_node_groups, dists.Categorical(num_cats = 5))
-                i10 = inputs(1, num_node_groups, dists.Categorical(num_cats = 5))
-                i11 = inputs(1, num_node_groups, dists.Categorical(num_cats = 5))
+                i00 = inputs(0, num_node_blocks, dists.Categorical(num_cats = 5))
+                i10 = inputs(1, num_node_blocks, dists.Categorical(num_cats = 5))
+                i11 = inputs(1, num_node_blocks, dists.Categorical(num_cats = 5))
                 
                 ms0 = multiply(i00, i10)
                 ms1 = multiply(i00, i11)
 
-                ns = summate(ms0, ms1, num_node_groups = 1)
+                ns = summate(ms0, ms1, num_node_blocks = 1)
 
                 ns.init_parameters()
 

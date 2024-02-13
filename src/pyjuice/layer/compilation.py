@@ -104,17 +104,17 @@ def next_power_of_2(x: torch.Tensor):
 
 
 def get_sum_layer_forward_stats(nodes: Sequence[SumNodes], global_nid_start: int):
-    layer_num_ngroups = sum(map(lambda ns: ns.num_node_groups, nodes))
+    layer_num_nblocks = sum(map(lambda ns: ns.num_node_blocks, nodes))
     layer_num_edges = 0
 
     n_sid = 0
-    n_chs = torch.zeros([layer_num_ngroups], dtype = torch.long)
+    n_chs = torch.zeros([layer_num_nblocks], dtype = torch.long)
     for ns_idx, ns in enumerate(nodes):
-        n_eid = n_sid + ns.num_node_groups
+        n_eid = n_sid + ns.num_node_blocks
 
         curr_n_chs = torch.bincount(ns.edge_ids[0,:])
-        # To maximize flexibility, we point to individual child nodes instead of a node group
-        n_chs[n_sid:n_eid] = curr_n_chs * ns.ch_group_size
+        # To maximize flexibility, we point to individual child nodes instead of a node block
+        n_chs[n_sid:n_eid] = curr_n_chs * ns.ch_block_size
 
         ns._output_ind_range = (global_nid_start, global_nid_start + ns.num_nodes)
         global_nid_start += ns.num_nodes
@@ -122,47 +122,47 @@ def get_sum_layer_forward_stats(nodes: Sequence[SumNodes], global_nid_start: int
 
         n_sid = n_eid
 
-    return layer_num_ngroups, layer_num_edges, n_chs
+    return layer_num_nblocks, layer_num_edges, n_chs
 
 
 def get_sum_layer_backward_stats(nodes: Sequence[SumNodes]):
     ch_gsize2cs = dict()
-    ch_gsize2num_ngroups = dict()
+    ch_gsize2num_nblocks = dict()
     cs2parns = dict()
 
     for ns in nodes:
         for cs in ns.chs:
-            ch_gsize = cs.group_size
+            ch_gsize = cs.block_size
 
             if ch_gsize not in ch_gsize2cs:
                 ch_gsize2cs[ch_gsize] = OrderedSet()
-                ch_gsize2num_ngroups[ch_gsize] = 0
+                ch_gsize2num_nblocks[ch_gsize] = 0
 
             if cs not in ch_gsize2cs[ch_gsize]:
                 ch_gsize2cs[ch_gsize].append(cs)
-                ch_gsize2num_ngroups[ch_gsize] += cs.num_node_groups
+                ch_gsize2num_nblocks[ch_gsize] += cs.num_node_blocks
 
             if cs not in cs2parns:
                 cs2parns[cs] = OrderedSet()
 
             cs2parns[cs].append(ns)
 
-    # Iterate over all child nodes to get the parent (# node groups) counts
+    # Iterate over all child nodes to get the parent (# node blocks) counts
     ch_gsize2n_pargs = dict()
     for ch_gsize, ch_nodes in ch_gsize2cs.items():
         n_sid = 0
-        n_pargs = torch.zeros([ch_gsize2num_ngroups[ch_gsize]], dtype = torch.long)
+        n_pargs = torch.zeros([ch_gsize2num_nblocks[ch_gsize]], dtype = torch.long)
         for cs in ch_nodes:
-            n_eid = n_sid + cs.num_node_groups
+            n_eid = n_sid + cs.num_node_blocks
 
-            pargcounts = torch.zeros([cs.num_node_groups], dtype = torch.long)
+            pargcounts = torch.zeros([cs.num_node_blocks], dtype = torch.long)
             for ns in cs2parns[cs]:
                 cs_id = ns.chs.index(cs)
-                edge_sid = sum([c.num_node_groups for c in ns.chs[:cs_id]])
-                edge_eid = edge_sid + cs.num_node_groups
+                edge_sid = sum([c.num_node_blocks for c in ns.chs[:cs_id]])
+                edge_eid = edge_sid + cs.num_node_blocks
 
                 criterion = (ns.edge_ids[1,:] >= edge_sid) & (ns.edge_ids[1,:] < edge_eid)
-                pargcounts += torch.bincount(ns.edge_ids[1,criterion] - edge_sid, minlength = cs.num_node_groups)
+                pargcounts += torch.bincount(ns.edge_ids[1,criterion] - edge_sid, minlength = cs.num_node_blocks)
 
             n_pargs[n_sid:n_eid] = pargcounts
 
@@ -170,7 +170,7 @@ def get_sum_layer_backward_stats(nodes: Sequence[SumNodes]):
 
         ch_gsize2n_pargs[ch_gsize] = n_pargs
 
-    return ch_gsize2cs, ch_gsize2num_ngroups, ch_gsize2n_pargs, cs2parns
+    return ch_gsize2cs, ch_gsize2num_nblocks, ch_gsize2n_pargs, cs2parns
 
 
 @njit
@@ -197,9 +197,9 @@ def _assign_target_ncpids_kernel(target_nids_ptr, nids_partition_start_ptr, targ
     global_nid_start = tl.load(constexprs_ptr)
     ns_pid_start = tl.load(constexprs_ptr + 1)
     ns_pfid_start = tl.load(constexprs_ptr + 2)
-    ngroup_start = tl.load(constexprs_ptr + 3)
+    nblock_start = tl.load(constexprs_ptr + 3)
     num_edges = tl.load(constexprs_ptr + 4)
-    group_size = tl.load(constexprs_ptr + 5)
+    block_size = tl.load(constexprs_ptr + 5)
 
     # Get edge indices to be processed by the current block
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
@@ -210,8 +210,8 @@ def _assign_target_ncpids_kernel(target_nids_ptr, nids_partition_start_ptr, targ
     cid = tl.load(edge_ids_ptr + offsets + num_edges, mask = mask, other = 0)
 
     # Get `partition_id` and `local_id`
-    partition_id = tl.load(n_partition_ids_ptr + nid + ngroup_start, mask = mask, other = 0)
-    local_id = tl.load(n_id_in_partition_ptr + nid + ngroup_start, mask = mask, other = 0)
+    partition_id = tl.load(n_partition_ids_ptr + nid + nblock_start, mask = mask, other = 0)
+    local_id = tl.load(n_id_in_partition_ptr + nid + nblock_start, mask = mask, other = 0)
 
     # Get the child ns index every `cid` belongs to and the cum nodes & global sid
     cs_offsets = tl.arange(0, num_chs_np2)
@@ -229,7 +229,7 @@ def _assign_target_ncpids_kernel(target_nids_ptr, nids_partition_start_ptr, targ
 
     # Store to `target_nids`
     nids_start = tl.load(nids_partition_start_ptr + partition_id, mask = mask, other = 0)
-    global_nid = global_nid_start + (ngroup_start + nid) * group_size
+    global_nid = global_nid_start + (nblock_start + nid) * block_size
     tl.store(target_nids_ptr + nids_start + local_id, global_nid, mask = mask)
 
     # Store to `target_cids`
@@ -241,11 +241,11 @@ def _assign_target_ncpids_kernel(target_nids_ptr, nids_partition_start_ptr, targ
 
     # Store to `target_pids`
     ns_local_pid = tl.load(cum_n_chs_ptr + nid, mask = mask, other = 0)
-    global_pid = ns_pid_start + (ns_local_pid + chs_offset) * group_size
+    global_pid = ns_pid_start + (ns_local_pid + chs_offset) * block_size
     tl.store(target_pids_ptr + pcids_offsets, global_pid, mask = mask)
 
     # Store to `target_pfids`
-    global_pfid = ns_pfid_start + (ns_local_pid + chs_offset) * group_size
+    global_pfid = ns_pfid_start + (ns_local_pid + chs_offset) * block_size
     tl.store(target_pfids_ptr + pcids_offsets, global_pfid, mask = mask)
 
     # Global parameter indices for all edges
@@ -260,7 +260,7 @@ def _assign_target_ncpids_kernel(target_nids_ptr, nids_partition_start_ptr, targ
 @torch.no_grad()
 def sum_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, n_id_in_partition, num_ngs_in_partition, n_chs,
                                   global_nid_start: int, global_pid_start: int, global_pfid_start: int, node2tiednodes: dict, 
-                                  max_tied_ns_per_parflow_group: int = 4, use_cuda: bool = True):
+                                  max_tied_ns_per_parflow_block: int = 4, use_cuda: bool = True):
 
     if use_cuda and not torch.cuda.is_available():
         use_cuda = False
@@ -272,7 +272,7 @@ def sum_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, 
 
     if use_cuda:
         # We construct a flattened version of `nids` where the vectors of every partition is concatenated
-        # into a single vector. `nids_group_start` is used to indicate the start index of every group's
+        # into a single vector. `nids_block_start` is used to indicate the start index of every block's
         # `nids`. That is, `target_nids[nids_partition_start[i]:nids_partition_start[i+1]] == nids[i]`
         nids_partition_start = torch.zeros_like(num_ngs_in_partition)
         nids_partition_start[1:] = torch.cumsum(num_ngs_in_partition[:-1], dim = 0)
@@ -308,7 +308,7 @@ def sum_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, 
     original_param_nids = [] # `ns` with their original parameters (i.e., not tied)
 
     # This is the main loop: iterate over `ns` in the layer
-    ngroup_start = 0 # The start index of the node groups in the current `ns`
+    nblock_start = 0 # The start index of the node blocks in the current `ns`
     node2tiedcounts = dict() # Locally accumulate the occupation count
     for ns_idx, ns in enumerate(nodes):
 
@@ -367,7 +367,7 @@ def sum_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, 
                 node2tiedcounts[source_ns] = [0 for _ in range(len(node2tiednodes[source_ns][0]))]
             
             if not ns.provided("_param_flow_range"):
-                if all([dup_count >= max_tied_ns_per_parflow_group for dup_count in node2tiedcounts[source_ns]]):
+                if all([dup_count >= max_tied_ns_per_parflow_block for dup_count in node2tiedcounts[source_ns]]):
                     global_pfid_end = global_pfid_start + ns.num_edges
                     ns._param_flow_range = (global_pfid_start, global_pfid_end)
                     global_pfid_start = global_pfid_end
@@ -389,17 +389,17 @@ def sum_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, 
             ns_pid_start = source_ns._param_range[0]
             ns_pfid_start = ns._param_flow_range[0]
 
-        # number of node groups
-        ns_num_ngroups = ns.num_node_groups
+        # number of node blocks
+        ns_num_nblocks = ns.num_node_blocks
 
         # Edge indices of size [2, ns_num_edges]
         # Here child ids of the edges are flattened out, i.e., every edge points to 
-        # an actual "node" instead of a node group
+        # an actual "node" instead of a node block
         edge_ids = ns.edge_ids.clone()
-        edge_ids = edge_ids[:,:,None].repeat(1, 1, ns.ch_group_size)
-        edge_ids[1,:,:] *= ns.ch_group_size
-        edge_ids[1,:,:] += torch.arange(0, ns.ch_group_size)[None,:]
-        edge_ids = edge_ids.reshape(2, ns.edge_ids.size(1) * ns.ch_group_size).contiguous()
+        edge_ids = edge_ids[:,:,None].repeat(1, 1, ns.ch_block_size)
+        edge_ids[1,:,:] *= ns.ch_block_size
+        edge_ids[1,:,:] += torch.arange(0, ns.ch_block_size)[None,:]
+        edge_ids = edge_ids.reshape(2, ns.edge_ids.size(1) * ns.ch_block_size).contiguous()
         ns_num_edges = edge_ids.size(1)
 
         if use_cuda:
@@ -408,7 +408,7 @@ def sum_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, 
             # Precompute the child offset ids for every edge. That is, the `?` 
             # mark in `cids[partition][local_id,?]`
             chs_offsets = np.zeros([ns_num_edges], dtype = np.int64)
-            ns_nchs = np.zeros([ns_num_ngroups], dtype = np.int64)
+            ns_nchs = np.zeros([ns_num_nblocks], dtype = np.int64)
 
             _assign_chid_kernel(chs_offsets, ns_nchs, edge_ids.numpy())
             chs_offsets = torch.from_numpy(chs_offsets)
@@ -425,7 +425,7 @@ def sum_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, 
 
             # Cumulative nchs
             ns_nchs = torch.from_numpy(ns_nchs)
-            cum_n_chs = torch.zeros([ns_num_ngroups], dtype = torch.long)
+            cum_n_chs = torch.zeros([ns_num_nblocks], dtype = torch.long)
             cum_n_chs[1:] = torch.cumsum(ns_nchs[:-1], dim = 0)
 
             if add_params_flag:
@@ -454,7 +454,7 @@ def sum_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, 
             # We store these constants in a tensor and retrieve them in the kernel
             # This is to avoid `triton` from compiling separate kernels for every layer configuration
             # Saves 99.9% compilation time :)
-            constexprs = torch.tensor([global_nid_start, ns_pid_start, ns_pfid_start, ngroup_start, ns_num_edges, ns.group_size]).long().to(device)
+            constexprs = torch.tensor([global_nid_start, ns_pid_start, ns_pfid_start, nblock_start, ns_num_edges, ns.block_size]).long().to(device)
 
             num_chs_np2 = triton.next_power_of_2(ns.num_chs)
 
@@ -469,13 +469,13 @@ def sum_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, 
                 add_params_flag, add_param_flows_flag, BLOCK_SIZE = min(2048, 2**20 // num_chs_np2)
             )
 
-            ngroup_start += ns_num_ngroups
+            nblock_start += ns_num_nblocks
 
         else:
             ## CPU mode ##
 
             # Get number of child nodes for all nodes
-            ns_nchs = torch.bincount(edge_ids[0,:], minlength = ns_num_ngroups)
+            ns_nchs = torch.bincount(edge_ids[0,:], minlength = ns_num_nblocks)
 
             cs_node_cum_nodes = torch.zeros([ns.num_chs], dtype = torch.long)
             cs_node_cum_nodes[0] = ns.chs[0].num_nodes
@@ -492,13 +492,13 @@ def sum_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, 
             else:
                 ns_param_flow_ids = None
 
-            # Iterate over node groups
+            # Iterate over node blocks
             cum_n_chs = 0
-            for ng_id in range(ns_num_ngroups):
+            for ng_id in range(ns_num_nblocks):
                 partition_id = (ns_nchs[ng_id] > fw_partition_max_chs).sum()
                 local_id = ngid_in_partition[partition_id]
 
-                global_nid = ns._output_ind_range[0] + ng_id * ns.group_size
+                global_nid = ns._output_ind_range[0] + ng_id * ns.block_size
 
                 # Assign `nids`
                 nids[partition_id][local_id] = global_nid
@@ -513,14 +513,14 @@ def sum_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, 
                     cids[partition_id][local_id, ch_id] = global_cid
 
                 # Assign `pids`
-                global_pids = ns_pid_start + cum_n_chs + torch.arange(0, ns.group_size * criterion.sum(), ns.group_size)
+                global_pids = ns_pid_start + cum_n_chs + torch.arange(0, ns.block_size * criterion.sum(), ns.block_size)
                 pids[partition_id][local_id, 0:global_pids.size(0)] = global_pids
 
                 # Assign `pfids`
-                global_pfids = ns_pfid_start + cum_n_chs + torch.arange(0, ns.group_size * criterion.sum(), ns.group_size)
+                global_pfids = ns_pfid_start + cum_n_chs + torch.arange(0, ns.block_size * criterion.sum(), ns.block_size)
                 pfids[partition_id][local_id, 0:global_pfids.size(0)] = global_pfids
 
-                cum_n_chs += ns.group_size * criterion.sum()
+                cum_n_chs += ns.block_size * criterion.sum()
 
                 if add_params_flag:
                     ns_param_ids[criterion] = global_pids
@@ -541,14 +541,14 @@ def sum_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, 
         ns = nodes[ns_idx]
         if ns.is_tied():
             ns = ns.get_source_ns()
-        # Every edge specify the start id of [ch_group_size, group_size] parameters
-        ns._param_ids = param_ids.cpu()[0::ns.ch_group_size]
+        # Every edge specify the start id of [ch_block_size, block_size] parameters
+        ns._param_ids = param_ids.cpu()[0::ns.ch_block_size]
 
     # Store global -> local parameter flow id mapping in `ns`
     for ns_idx, param_flow_ids in all_ns_param_flow_ids.items():
         ns = nodes[ns_idx]
-        # Every edge specify the start id of [ch_group_size, group_size] parameter flows
-        ns._param_flow_ids = param_flow_ids.cpu()[0::ns.ch_group_size]
+        # Every edge specify the start id of [ch_block_size, block_size] parameter flows
+        ns._param_flow_ids = param_flow_ids.cpu()[0::ns.ch_block_size]
 
     # Store local -> global parameter id mapping in `ns`
     for ns_idx in original_param_nids:
@@ -613,11 +613,11 @@ def _assign_target_chpapids_kernel(target_chids_ptr, chids_partition_start_ptr, 
     # Retrieve all constexprs
     ns_global_node_start = tl.load(constexprs_ptr)
     cs_global_ele_start = tl.load(constexprs_ptr + 1)
-    ns_group_size = tl.load(constexprs_ptr + 2)
-    cs_group_size = tl.load(constexprs_ptr + 3)
+    ns_block_size = tl.load(constexprs_ptr + 2)
+    cs_block_size = tl.load(constexprs_ptr + 3)
     ns_pid_start = tl.load(constexprs_ptr + 4)
     num_edges = tl.load(constexprs_ptr + 5)
-    cs_ngroup_start = tl.load(constexprs_ptr + 6)
+    cs_nblock_start = tl.load(constexprs_ptr + 6)
     pars_offsets_start = tl.load(constexprs_ptr + 7)
 
     # Get edge indices to be processed by the current block
@@ -629,8 +629,8 @@ def _assign_target_chpapids_kernel(target_chids_ptr, chids_partition_start_ptr, 
     nid = tl.load(edge_ids_ptr + offsets, mask = mask, other = 0)
 
     # Get `partition_id` and `local_id`
-    partition_id = tl.load(n_partition_ids_ptr + cid + cs_ngroup_start, mask = mask, other = 0)
-    local_id = tl.load(n_id_in_partition_ptr + cid + cs_ngroup_start, mask = mask, other = 0)
+    partition_id = tl.load(n_partition_ids_ptr + cid + cs_nblock_start, mask = mask, other = 0)
+    local_id = tl.load(n_id_in_partition_ptr + cid + cs_nblock_start, mask = mask, other = 0)
 
     # Get parent offsets
     # Note: this is the `?` mark in `parids[partition_id][local_id,?]`
@@ -638,27 +638,27 @@ def _assign_target_chpapids_kernel(target_chids_ptr, chids_partition_start_ptr, 
 
     # Store to `target_chids`
     chids_start = tl.load(chids_partition_start_ptr + partition_id, mask = mask, other = 0)
-    global_chid = cs_global_ele_start + cid * cs_group_size
+    global_chid = cs_global_ele_start + cid * cs_block_size
     tl.store(target_chids_ptr + chids_start + local_id, global_chid, mask = mask)
 
     # Store to `target_parids`
     partition_max_n_pargs = tl.load(partition_max_pars_ptr + partition_id, mask = mask, other = 0)
     parids_start = tl.load(parids_partition_start_ptr + partition_id, mask = mask, other = 0)
     parids_offsets = parids_start + local_id * partition_max_n_pargs + pars_offset
-    global_parid = ns_global_node_start + nid * ns_group_size
+    global_parid = ns_global_node_start + nid * ns_block_size
     tl.store(target_parids_ptr + parids_offsets, global_parid, mask = mask)
 
     # Store to `target_parpids`
     ns_local_pid = tl.load(cum_n_chs_ptr + nid, mask = mask, other = 0)
     chs_offset = tl.load(chs_offsets_ptr + offsets, mask = mask, other = 0)
-    global_pid = ns_pid_start + (ns_local_pid + chs_offset) * ns_group_size * cs_group_size
+    global_pid = ns_pid_start + (ns_local_pid + chs_offset) * ns_block_size * cs_block_size
     tl.store(target_parpids_ptr + parids_offsets, global_pid, mask = mask)
 
 
 def _assign_target_chpapids_cpu(target_chids, chids_partition_start, target_parids, target_parpids, parids_partition_start,
                                 edge_ids, pars_offsets, n_partition_ids, n_id_in_partition, num_ngs_in_partition,
                                 partition_max_pars, cum_n_chs, chs_offsets, ns_global_node_start, cs_global_ele_start, 
-                                ns_group_size, cs_group_size, ns_pid_start, ns_num_edges, cs_ngroup_start, pars_offsets_start):
+                                ns_block_size, cs_block_size, ns_pid_start, ns_num_edges, cs_nblock_start, pars_offsets_start):
 
     for edge_id in range(ns_num_edges):
         # Get `cid` and `nid` (size of `edge_ids` is [2, num_edges])
@@ -666,8 +666,8 @@ def _assign_target_chpapids_cpu(target_chids, chids_partition_start, target_pari
         nid = edge_ids[0, edge_id]
 
         # Get `partition_id` and `local_id`
-        partition_id = n_partition_ids[cid + cs_ngroup_start]
-        local_id = n_id_in_partition[cid + cs_ngroup_start]
+        partition_id = n_partition_ids[cid + cs_nblock_start]
+        local_id = n_id_in_partition[cid + cs_nblock_start]
 
         # Get parent offsets
         # Note: this is the `?` mark in `parids[partition_id][local_id,?]`
@@ -675,20 +675,20 @@ def _assign_target_chpapids_cpu(target_chids, chids_partition_start, target_pari
 
         # Store to `target_chids`
         chids_start = chids_partition_start[partition_id]
-        global_chid = cs_global_ele_start + cid * cs_group_size
+        global_chid = cs_global_ele_start + cid * cs_block_size
         target_chids[chids_start + local_id] = global_chid
 
         # Store to `target_parids`
         partition_max_n_pargs = partition_max_pars[partition_id]
         parids_start = parids_partition_start[partition_id]
         parids_offsets = parids_start + local_id * partition_max_n_pargs + pars_offset
-        global_parid = ns_global_node_start + nid * ns_group_size
+        global_parid = ns_global_node_start + nid * ns_block_size
         target_parids[parids_offsets] = global_parid
 
         # Store to `target_parpids`
         ns_local_pid = cum_n_chs[nid]
         chs_offset = chs_offsets[edge_id]
-        global_pid = ns_pid_start + (ns_local_pid + chs_offset) * ns_group_size * cs_group_size
+        global_pid = ns_pid_start + (ns_local_pid + chs_offset) * ns_block_size * cs_block_size
         target_parpids[parids_offsets] = global_pid
 
 
@@ -727,7 +727,7 @@ def sum_layer_backward_compilation(nodes, cs2parns, n_partition_ids, n_id_in_par
     partition_max_pars = partition_max_pars.to(device)
 
     # This is the main loop: iterate over `cs` in the layer
-    cs_ngroup_start = 0 # The start index of nodes in the current `cs`
+    cs_nblock_start = 0 # The start index of nodes in the current `cs`
     ns2cum_n_chs = dict()
     ns2chs_offsets = dict()
     for cs in nodes:
@@ -737,8 +737,8 @@ def sum_layer_backward_compilation(nodes, cs2parns, n_partition_ids, n_id_in_par
         local_ns2chs_offsets = dict()
         for ns in cs2parns[cs]:
             cs_id = ns.chs.index(cs)
-            edge_sid = sum([c.num_node_groups for c in ns.chs[:cs_id]])
-            edge_eid = edge_sid + cs.num_node_groups
+            edge_sid = sum([c.num_node_blocks for c in ns.chs[:cs_id]])
+            edge_eid = edge_sid + cs.num_node_blocks
 
             criterion = (ns.edge_ids[1,:] >= edge_sid) & (ns.edge_ids[1,:] < edge_eid)
             extracted_edge_ids = ns.edge_ids[:,criterion].clone()
@@ -749,13 +749,13 @@ def sum_layer_backward_compilation(nodes, cs2parns, n_partition_ids, n_id_in_par
             # Recreate `chs_offsets` and `cum_n_chs` to get compute the parameter ids
             if not ns in ns2cum_n_chs:
                 chs_offsets = np.zeros([ns.edge_ids.size(1)], dtype = np.int64)
-                ns_nchs = np.zeros([ns.num_node_groups], dtype = np.int64)
+                ns_nchs = np.zeros([ns.num_node_blocks], dtype = np.int64)
 
                 _assign_chid_kernel(chs_offsets, ns_nchs, ns.edge_ids.numpy())
                 chs_offsets = torch.from_numpy(chs_offsets)
 
                 ns_nchs = torch.from_numpy(ns_nchs)
-                cum_n_chs = torch.zeros([ns.num_node_groups], dtype = torch.long)
+                cum_n_chs = torch.zeros([ns.num_node_blocks], dtype = torch.long)
                 cum_n_chs[1:] = torch.cumsum(ns_nchs[:-1], dim = 0)
 
                 ns2cum_n_chs[ns] = cum_n_chs
@@ -763,13 +763,13 @@ def sum_layer_backward_compilation(nodes, cs2parns, n_partition_ids, n_id_in_par
 
             local_ns2chs_offsets[ns] = ns2chs_offsets[ns][criterion]
 
-        cs_num_ngroups = cs.num_node_groups
+        cs_num_nblocks = cs.num_node_blocks
         cs_num_edges = sum([edge_ids.size(1) for edge_ids in par_edge_ids])
         
         # Precompute the parent offset ids for every. That is, the `?`
         # mark in `parids[partition_id][local_id,?]`
         pars_offsets = np.zeros([cs_num_edges], dtype = np.int64)
-        cs_npars = np.zeros([cs_num_ngroups], dtype = np.int64)
+        cs_npars = np.zeros([cs_num_nblocks], dtype = np.int64)
 
         edge_sid = 0
         for edge_ids in par_edge_ids:
@@ -806,12 +806,12 @@ def sum_layer_backward_compilation(nodes, cs2parns, n_partition_ids, n_id_in_par
             # Saves 99.9% compilation time :)
             cs_global_ele_start = cs._output_ind_range[0]
             ns_global_node_start = ns._output_ind_range[0]
-            ns_group_size = ns.group_size
-            cs_group_size = cs.group_size
+            ns_block_size = ns.block_size
+            cs_block_size = cs.block_size
             
             if use_cuda:
-                constexprs = torch.tensor([ns_global_node_start, cs_global_ele_start, ns_group_size, cs_group_size, 
-                                           ns_pid_start, ns_num_edges, cs_ngroup_start, pars_offsets_start]).long().to(device)
+                constexprs = torch.tensor([ns_global_node_start, cs_global_ele_start, ns_block_size, cs_block_size, 
+                                           ns_pid_start, ns_num_edges, cs_nblock_start, pars_offsets_start]).long().to(device)
 
                 # Make the grid and launch kernel
                 grid = lambda meta: (triton.cdiv(ns_num_edges, meta["BLOCK_SIZE"]),)
@@ -826,12 +826,12 @@ def sum_layer_backward_compilation(nodes, cs2parns, n_partition_ids, n_id_in_par
                     target_chids, chids_partition_start, target_parids, target_parpids, parids_partition_start,
                     edge_ids, pars_offsets, n_partition_ids, n_id_in_partition, num_ngs_in_partition,
                     partition_max_pars, cum_n_chs, chs_offsets, ns_global_node_start, cs_global_ele_start, 
-                    ns_group_size, cs_group_size, ns_pid_start, ns_num_edges, cs_ngroup_start, pars_offsets_start
+                    ns_block_size, cs_block_size, ns_pid_start, ns_num_edges, cs_nblock_start, pars_offsets_start
                 )
 
             pars_offsets_start += ns_num_edges
 
-        cs_ngroup_start += cs.num_node_groups
+        cs_nblock_start += cs.num_node_blocks
 
     # Restore `chids`
     target_chids = target_chids.cpu()
@@ -859,15 +859,15 @@ def sum_layer_backward_compilation(nodes, cs2parns, n_partition_ids, n_id_in_par
 
 ## Compilation for ProdLayer ##
 
-def get_prod_layer_stats(nodes: Sequence[SumNodes], group_size: int, global_nid_start: int, use_block_sparse_edges: bool):
+def get_prod_layer_stats(nodes: Sequence[SumNodes], block_size: int, global_nid_start: int, use_block_sparse_edges: bool):
     if use_block_sparse_edges:
-        layer_num_ngroup = sum(map(lambda ns: ns.num_node_groups, nodes))
+        layer_num_nblock = sum(map(lambda ns: ns.num_node_blocks, nodes))
         layer_num_edges = 0
 
         ng_sid = 0
-        n_chgs = torch.zeros([layer_num_ngroup], dtype = torch.long)
+        n_chgs = torch.zeros([layer_num_nblock], dtype = torch.long)
         for ns_idx, ns in enumerate(nodes):
-            ng_eid = ng_sid + ns.num_node_groups
+            ng_eid = ng_sid + ns.num_node_blocks
 
             n_chgs[ng_sid:ng_eid] = ns.num_chs
 
@@ -878,11 +878,11 @@ def get_prod_layer_stats(nodes: Sequence[SumNodes], group_size: int, global_nid_
 
             ng_sid = ng_eid
     else:
-        layer_num_ngroup = sum(map(lambda ns: ns.num_nodes, nodes))
+        layer_num_nblock = sum(map(lambda ns: ns.num_nodes, nodes))
         layer_num_edges = 0
 
         ng_sid = 0
-        n_chgs = torch.zeros([layer_num_ngroup], dtype = torch.long)
+        n_chgs = torch.zeros([layer_num_nblock], dtype = torch.long)
         for ns_idx, ns in enumerate(nodes):
             ng_eid = ng_sid + ns.num_nodes
 
@@ -895,26 +895,26 @@ def get_prod_layer_stats(nodes: Sequence[SumNodes], group_size: int, global_nid_
 
             ng_sid = ng_eid
 
-    return layer_num_ngroup, layer_num_edges, n_chgs
+    return layer_num_nblock, layer_num_edges, n_chgs
 
 
 @torch.no_grad()
 def prod_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, n_id_in_partition, num_ngs_in_partition, 
-                                   group_size, use_block_sparse_edges: bool, use_cuda: bool = False):
+                                   block_size, use_block_sparse_edges: bool, use_cuda: bool = False):
     
     if use_cuda and not torch.cuda.is_available():
         use_cuda = False
 
     if not use_block_sparse_edges:
-        assert group_size == 1
+        assert block_size == 1
 
     if use_cuda:
         device = torch.device("cuda:0")
     else:
         device = torch.device("cpu")
 
-    nids = [torch.zeros([partition_size], dtype = torch.long, device = device) for partition_size in num_ngs_in_partition] # Node group start id
-    cids = [torch.zeros([partition_size, max_chs] , dtype = torch.long, device = device) for partition_size, max_chs in zip(num_ngs_in_partition, fw_partition_max_chs)] # Child group start id
+    nids = [torch.zeros([partition_size], dtype = torch.long, device = device) for partition_size in num_ngs_in_partition] # Node block start id
+    cids = [torch.zeros([partition_size, max_chs] , dtype = torch.long, device = device) for partition_size, max_chs in zip(num_ngs_in_partition, fw_partition_max_chs)] # Child block start id
 
     for ns_id, ns in enumerate(nodes):
 
@@ -924,16 +924,16 @@ def prod_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids,
         partition_id = n_partition_ids[ns_id]
         local_sid = n_id_in_partition[ns_id]
         if use_block_sparse_edges:
-            local_eid = local_sid + ns.num_node_groups
+            local_eid = local_sid + ns.num_node_blocks
         else:
             local_eid = local_sid + ns.num_nodes
         partition_nchs = fw_partition_max_chs[partition_id]
 
         if use_block_sparse_edges:
             n_sid = ns._output_ind_range[0]
-            nids[partition_id][local_sid:local_eid] = torch.arange(0, ns.num_nodes, group_size, device = device) + n_sid
+            nids[partition_id][local_sid:local_eid] = torch.arange(0, ns.num_nodes, block_size, device = device) + n_sid
             for cs_id, cs in enumerate(ns.chs):
-                cids[partition_id][local_sid:local_eid,cs_id] = ns.edge_ids[:,cs_id].to(device) * group_size + cs._output_ind_range[0]
+                cids[partition_id][local_sid:local_eid,cs_id] = ns.edge_ids[:,cs_id].to(device) * block_size + cs._output_ind_range[0]
         else:
             n_sid = ns._output_ind_range[0]
             nids[partition_id][local_sid:local_eid] = torch.arange(0, ns.num_nodes, device = device) + n_sid
@@ -943,7 +943,7 @@ def prod_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids,
             else:
                 assert ns.is_block_sparse()
                 edge_ids = ns.edge_ids.clone()
-                edge_ids = (edge_ids[:,None,:].repeat(1, ns.group_size, 1) * ns.group_size + torch.arange(0, ns.group_size)[None,:,None]).flatten(0, 1)
+                edge_ids = (edge_ids[:,None,:].repeat(1, ns.block_size, 1) * ns.block_size + torch.arange(0, ns.block_size)[None,:,None]).flatten(0, 1)
                 for cs_id, cs in enumerate(ns.chs):
                     cids[partition_id][local_sid:local_eid,cs_id] = edge_ids[:,cs_id].to(device) + cs._output_ind_range[0]
 
@@ -1002,11 +1002,11 @@ def _assign_c_idx_kernel(flat_cids, flat_par_offsets, cum_c_nodes):
 
 
 @njit
-def _assign_cid2_group_local_id(flat_u_cids, n_group_ids, n_id_in_group, cid2group_id, cid2local_id):
+def _assign_cid2_block_local_id(flat_u_cids, n_block_ids, n_id_in_block, cid2block_id, cid2local_id):
     for i in range(flat_u_cids.shape[0]):
         cid = flat_u_cids[i]
-        cid2group_id[cid] = n_group_ids[i]
-        cid2local_id[cid] = n_id_in_group[i]
+        cid2block_id[cid] = n_block_ids[i]
+        cid2local_id[cid] = n_id_in_block[i]
 
 
 @triton.jit
@@ -1098,23 +1098,23 @@ def prod_layer_backward_compilation(flat_u_cids, flat_cids, flat_cid2nid, bk_par
 
         # Precompute the parent offset ids for every edge. That is, the `?` mark in `parids[partition_id][local_id,?]`
         flat_par_offsets = np.zeros([flat_cids.size(0)], dtype = np.int64)
-        num_c_ngroups = flat_u_cids.max().item() + 1
-        cum_c_ngroups = np.zeros([num_c_ngroups], dtype = np.int64)
+        num_c_nblocks = flat_u_cids.max().item() + 1
+        cum_c_nblocks = np.zeros([num_c_nblocks], dtype = np.int64)
 
-        _assign_c_idx_kernel(flat_cids.numpy(), flat_par_offsets, cum_c_ngroups)
+        _assign_c_idx_kernel(flat_cids.numpy(), flat_par_offsets, cum_c_nblocks)
         flat_par_offsets = torch.from_numpy(flat_par_offsets).cuda()
 
-        # Direct mapping from `cid` to `group_id` and `local_id`
-        cid2partition_id = np.zeros([num_c_ngroups], dtype = np.int64)
-        cid2local_id = np.zeros([num_c_ngroups], dtype = np.int64)
+        # Direct mapping from `cid` to `block_id` and `local_id`
+        cid2partition_id = np.zeros([num_c_nblocks], dtype = np.int64)
+        cid2local_id = np.zeros([num_c_nblocks], dtype = np.int64)
 
-        _assign_cid2_group_local_id(flat_u_cids.numpy(), n_partition_ids.numpy(), n_id_in_partition.numpy(), cid2partition_id, cid2local_id)
+        _assign_cid2_block_local_id(flat_u_cids.numpy(), n_partition_ids.numpy(), n_id_in_partition.numpy(), cid2partition_id, cid2local_id)
         cid2partition_id = torch.from_numpy(cid2partition_id).cuda()
         cid2local_id = torch.from_numpy(cid2local_id).cuda()
 
         # The following kernel assigns the indices to `target_u_cids` and `target_parids`. This is equivalent
         # to the easier-to-read CPU version enabled by setting `use_cuda = False`
-        num_ngroups = flat_u_cids.size(0)
+        num_nblocks = flat_u_cids.size(0)
         num_edges = flat_cids.size(0)
         flat_u_cids = flat_u_cids.cuda()
         n_partition_ids = n_partition_ids.cuda()
@@ -1128,10 +1128,10 @@ def prod_layer_backward_compilation(flat_u_cids, flat_cids, flat_cid2nid, bk_par
         bk_partition_max_pars = bk_partition_max_pars.cuda()
 
         # We store these constants in a tensor and retrieve them in the kernel
-        constexprs1 = torch.tensor([num_ngroups]).long().cuda()
+        constexprs1 = torch.tensor([num_nblocks]).long().cuda()
         constexprs2 = torch.tensor([num_edges]).long().cuda()
 
-        grid1 = lambda meta: (triton.cdiv(num_ngroups, meta["BLOCK_SIZE"]),)
+        grid1 = lambda meta: (triton.cdiv(num_nblocks, meta["BLOCK_SIZE"]),)
 
         _assign_target_ucids_kernel[grid1](
             target_u_cids, flat_u_cids, n_partition_ids, n_id_in_partition, 
@@ -1164,14 +1164,14 @@ def prod_layer_backward_compilation(flat_u_cids, flat_cids, flat_cid2nid, bk_par
 
     else:
 
-        u_cids = [torch.zeros([partition_size], dtype = torch.long) for partition_size in num_ns_in_partition] # Node group id
-        parids = [torch.zeros([partition_size, max_n_pars], dtype = torch.long) for partition_size, max_n_pars in zip(num_ns_in_partition, bk_partition_max_pars)] # Parent group id
+        u_cids = [torch.zeros([partition_size], dtype = torch.long) for partition_size in num_ns_in_partition] # Node block id
+        parids = [torch.zeros([partition_size, max_n_pars], dtype = torch.long) for partition_size, max_n_pars in zip(num_ns_in_partition, bk_partition_max_pars)] # Parent block id
 
         for idx in range(flat_u_cids.size(0)):
             cid = flat_u_cids[idx]
 
-            # `partition_id`:   which partition the current node group belongs to
-            # `local_id`:       the index of the node group within the current partition
+            # `partition_id`:   which partition the current node block belongs to
+            # `local_id`:       the index of the node block within the current partition
             partition_id = n_partition_ids[idx]
             local_id = n_id_in_partition[idx]
 

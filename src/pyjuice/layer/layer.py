@@ -7,15 +7,15 @@ from pyjuice.nodes import CircuitNodes
 
 
 class Layer():
-    def __init__(self, nodes: Sequence[CircuitNodes], disable_group_size_check: bool = False) -> None:
+    def __init__(self, nodes: Sequence[CircuitNodes], disable_block_size_check: bool = False) -> None:
 
-        if disable_group_size_check:
-            self.group_size = None
+        if disable_block_size_check:
+            self.block_size = None
         else:
             for i in range(1, len(nodes)):
-                assert nodes[i].group_size == nodes[0].group_size, "`group_size` of nodes in the same layer must be identical."
+                assert nodes[i].block_size == nodes[0].block_size, "`block_size` of nodes in the same layer must be identical."
 
-            self.group_size = nodes[0].group_size
+            self.block_size = nodes[0].block_size
 
         self.device = torch.device("cpu")
 

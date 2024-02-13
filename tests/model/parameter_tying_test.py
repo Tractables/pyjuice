@@ -4,35 +4,35 @@ import numpy as np
 
 import pyjuice.nodes.distributions as dists
 from pyjuice.utils import BitSet
-from pyjuice.nodes import multiply, summate, inputs, set_group_size
+from pyjuice.nodes import multiply, summate, inputs, set_block_size
 from pyjuice.model import TensorCircuit
 from pyjuice.model.backend import compute_cum_par_flows, em_par_update
 
 import pytest
 
 
-def simple_structure_test_group1():
+def simple_structure_test_block1():
 
-    group_size = 1
+    block_size = 1
     
-    with set_group_size(group_size = group_size):
+    with set_block_size(block_size = block_size):
 
-        ni0 = inputs(0, num_node_groups = 2, dist = dists.Categorical(num_cats = 5))
-        ni1 = inputs(1, num_node_groups = 2, dist = dists.Categorical(num_cats = 5))
-        ni2 = inputs(2, num_node_groups = 2, dist = dists.Categorical(num_cats = 5))
-        ni3 = inputs(3, num_node_groups = 2, dist = dists.Categorical(num_cats = 5))
+        ni0 = inputs(0, num_node_blocks = 2, dist = dists.Categorical(num_cats = 5))
+        ni1 = inputs(1, num_node_blocks = 2, dist = dists.Categorical(num_cats = 5))
+        ni2 = inputs(2, num_node_blocks = 2, dist = dists.Categorical(num_cats = 5))
+        ni3 = inputs(3, num_node_blocks = 2, dist = dists.Categorical(num_cats = 5))
 
         np01 = multiply(ni0, ni1)
         np12 = multiply(ni1, ni2)
         np23 = multiply(ni2, ni3)
 
-        ns01 = summate(np01, num_node_groups = 2)
+        ns01 = summate(np01, num_node_blocks = 2)
         ns12 = ns01.duplicate(np12, tie_params = True)
         ns23 = ns01.duplicate(np23, tie_params = True)
 
         np012_0 = multiply(ns01, ni2)
         np012_1 = multiply(ns12, ni0)
-        ns012 = summate(np012_0, np012_1, num_node_groups = 2)
+        ns012 = summate(np012_0, np012_1, num_node_blocks = 2)
 
         np123_0 = multiply(ns12, ni3)
         np123_1 = multiply(ns23, ni1)
@@ -42,7 +42,7 @@ def simple_structure_test_group1():
         np0123_1 = multiply(ns123, ni0)
         ns0123 = ns123.duplicate(np0123_0, np0123_1, tie_params = True)
 
-    pc = TensorCircuit(ns0123, max_tied_ns_per_parflow_group = 2)
+    pc = TensorCircuit(ns0123, max_tied_ns_per_parflow_block = 2)
 
     device = torch.device("cuda:0")
 
@@ -302,28 +302,28 @@ def simple_structure_test_group1():
     assert torch.all(torch.abs(param_flows1.reshape(-1) - pc.params[5:13].cpu()) < 1e-4)
 
 
-def simple_structure_test_group16():
+def simple_structure_test_block16():
 
-    group_size = 16
+    block_size = 16
     
-    with set_group_size(group_size = group_size):
+    with set_block_size(block_size = block_size):
 
-        ni0 = inputs(0, num_node_groups = 2, dist = dists.Categorical(num_cats = 5))
-        ni1 = inputs(1, num_node_groups = 2, dist = dists.Categorical(num_cats = 5))
-        ni2 = inputs(2, num_node_groups = 2, dist = dists.Categorical(num_cats = 5))
-        ni3 = inputs(3, num_node_groups = 2, dist = dists.Categorical(num_cats = 5))
+        ni0 = inputs(0, num_node_blocks = 2, dist = dists.Categorical(num_cats = 5))
+        ni1 = inputs(1, num_node_blocks = 2, dist = dists.Categorical(num_cats = 5))
+        ni2 = inputs(2, num_node_blocks = 2, dist = dists.Categorical(num_cats = 5))
+        ni3 = inputs(3, num_node_blocks = 2, dist = dists.Categorical(num_cats = 5))
 
         np01 = multiply(ni0, ni1)
         np12 = multiply(ni1, ni2)
         np23 = multiply(ni2, ni3)
 
-        ns01 = summate(np01, num_node_groups = 2)
+        ns01 = summate(np01, num_node_blocks = 2)
         ns12 = ns01.duplicate(np12, tie_params = True)
         ns23 = ns01.duplicate(np23, tie_params = True)
 
         np012_0 = multiply(ns01, ni2)
         np012_1 = multiply(ns12, ni0)
-        ns012 = summate(np012_0, np012_1, num_node_groups = 2)
+        ns012 = summate(np012_0, np012_1, num_node_blocks = 2)
 
         np123_0 = multiply(ns12, ni3)
         np123_1 = multiply(ns23, ni1)
@@ -334,7 +334,7 @@ def simple_structure_test_group16():
         ns0123 = ns123.duplicate(np0123_0, np0123_1, tie_params = True)
 
     ns0123.init_parameters()
-    pc = TensorCircuit(ns0123, max_tied_ns_per_parflow_group = 2)
+    pc = TensorCircuit(ns0123, max_tied_ns_per_parflow_block = 2)
 
     device = torch.device("cuda:0")
 
@@ -610,5 +610,5 @@ def simple_structure_test_group16():
 
 if __name__ == "__main__":
     torch.manual_seed(2390)
-    simple_structure_test_group1()
-    simple_structure_test_group16()
+    simple_structure_test_block1()
+    simple_structure_test_block16()

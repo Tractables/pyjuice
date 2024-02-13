@@ -16,11 +16,11 @@ def hmm_speed_test():
 
     for num_latents in [64, 512, 2048]:
 
-        group_size = min(juice.utils.util.max_cdf_power_of_2(num_latents), 1024)
-        num_node_groups = num_latents // group_size
+        block_size = min(juice.utils.util.max_cdf_power_of_2(num_latents), 1024)
+        num_node_blocks = num_latents // block_size
         
-        with juice.set_group_size(group_size = group_size):
-            ns_input = juice.inputs(seq_length - 1, num_node_groups = num_node_groups,
+        with juice.set_block_size(block_size = block_size):
+            ns_input = juice.inputs(seq_length - 1, num_node_blocks = num_node_blocks,
                                     dist = dists.Categorical(num_cats = vocab_size))
             
             ns_sum = None
@@ -30,18 +30,18 @@ def hmm_speed_test():
                 
                 if ns_sum is None:
                     ns = juice.summate(
-                        curr_zs, num_node_groups = num_node_groups)
+                        curr_zs, num_node_blocks = num_node_blocks)
                     ns_sum = ns
                 else:
                     ns = ns_sum.duplicate(curr_zs, tie_params=True)
 
                 curr_zs = juice.multiply(curr_xs, ns)
                 
-            ns = juice.summate(curr_zs, num_node_groups = 1, group_size = 1)
+            ns = juice.summate(curr_zs, num_node_blocks = 1, block_size = 1)
         
         ns.init_parameters()
 
-        pc = juice.TensorCircuit(ns, max_tied_ns_per_parflow_group = 2)
+        pc = juice.TensorCircuit(ns, max_tied_ns_per_parflow_block = 2)
         pc.print_statistics()
 
         pc.to(device)

@@ -8,25 +8,25 @@ import pytest
 
 
 def pruning_test():
-    num_node_groups = 2
+    num_node_blocks = 2
 
-    for group_size in [1, 2, 4, 8]:
+    for block_size in [1, 2, 4, 8]:
         
-        with juice.set_group_size(group_size):
+        with juice.set_block_size(block_size):
 
-            i0 = inputs(0, num_node_groups, dists.Categorical(num_cats = 5))
-            i1 = inputs(1, num_node_groups, dists.Categorical(num_cats = 5))
-            i2 = inputs(2, num_node_groups, dists.Categorical(num_cats = 5))
-            i3 = inputs(3, num_node_groups, dists.Categorical(num_cats = 5))
+            i0 = inputs(0, num_node_blocks, dists.Categorical(num_cats = 5))
+            i1 = inputs(1, num_node_blocks, dists.Categorical(num_cats = 5))
+            i2 = inputs(2, num_node_blocks, dists.Categorical(num_cats = 5))
+            i3 = inputs(3, num_node_blocks, dists.Categorical(num_cats = 5))
 
             m1 = multiply(i0, i1)
-            n1 = summate(m1, num_node_groups = num_node_groups)
+            n1 = summate(m1, num_node_blocks = num_node_blocks)
 
             m2 = multiply(i2, i3)
-            n2 = summate(m2, num_node_groups = num_node_groups)
+            n2 = summate(m2, num_node_blocks = num_node_blocks)
 
             m = multiply(n1, n2)
-            n = summate(m, num_node_groups = 1)
+            n = summate(m, num_node_blocks = 1)
 
             n.init_parameters(perturbation = 2.0)
 
@@ -51,25 +51,25 @@ def pruning_test():
 
 
 def pruning_with_param_tying_test():
-    num_node_groups = 2
+    num_node_blocks = 2
 
-    for group_size in [1, 2, 4, 8]:
+    for block_size in [1, 2, 4, 8]:
         
-        with juice.set_group_size(group_size):
+        with juice.set_block_size(block_size):
 
-            i0 = inputs(0, num_node_groups, dists.Categorical(num_cats = 5))
-            i1 = inputs(1, num_node_groups, dists.Categorical(num_cats = 5))
-            i2 = inputs(2, num_node_groups, dists.Categorical(num_cats = 5))
-            i3 = inputs(3, num_node_groups, dists.Categorical(num_cats = 5))
+            i0 = inputs(0, num_node_blocks, dists.Categorical(num_cats = 5))
+            i1 = inputs(1, num_node_blocks, dists.Categorical(num_cats = 5))
+            i2 = inputs(2, num_node_blocks, dists.Categorical(num_cats = 5))
+            i3 = inputs(3, num_node_blocks, dists.Categorical(num_cats = 5))
 
             m1 = multiply(i0, i1)
-            n1 = summate(m1, num_node_groups = num_node_groups)
+            n1 = summate(m1, num_node_blocks = num_node_blocks)
 
             m2 = multiply(i2, i3)
             n2 = n1.duplicate(m2, tie_params = True)
 
             m = multiply(n1, n2)
-            n = summate(m, num_node_groups = 1)
+            n = summate(m, num_node_blocks = 1)
 
             n.init_parameters(perturbation = 2.0)
 

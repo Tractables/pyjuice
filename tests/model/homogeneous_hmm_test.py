@@ -4,7 +4,7 @@ import numpy as np
 
 import pyjuice.nodes.distributions as dists
 from pyjuice.utils import BitSet
-from pyjuice.nodes import multiply, summate, inputs, set_group_size
+from pyjuice.nodes import multiply, summate, inputs, set_block_size
 from pyjuice.model import TensorCircuit
 from pyjuice.model.backend import compute_cum_par_flows, em_par_update
 
@@ -13,17 +13,17 @@ import pytest
 
 def homogeneous_hmm_test():
 
-    group_size = 1
+    block_size = 1
 
-    with set_group_size(group_size = group_size):
+    with set_block_size(block_size = block_size):
 
-        ni0 = inputs(0, num_node_groups = 2, dist = dists.Categorical(num_cats = 5))
+        ni0 = inputs(0, num_node_blocks = 2, dist = dists.Categorical(num_cats = 5))
         ni1 = ni0.duplicate(1, tie_params = True)
         ni2 = ni0.duplicate(2, tie_params = True)
         ni3 = ni0.duplicate(3, tie_params = True)
 
         np01 = multiply(ni0, ni1)
-        ns01 = summate(np01, num_node_groups = 2)
+        ns01 = summate(np01, num_node_blocks = 2)
 
         np012 = multiply(ns01, ni2)
         ns012 = ns01.duplicate(np012, tie_params = True)
@@ -33,7 +33,7 @@ def homogeneous_hmm_test():
 
     ns0123.init_parameters()
 
-    pc = TensorCircuit(ns0123, max_tied_ns_per_parflow_group = 2)
+    pc = TensorCircuit(ns0123, max_tied_ns_per_parflow_block = 2)
 
     device = torch.device("cuda:0")
 

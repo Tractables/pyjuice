@@ -22,8 +22,8 @@ def serialize_nodes(root_ns: CircuitNodes):
 
         ns_info = {
             "type": ntype, 
-            "num_node_groups": ns.num_node_groups,
-            "group_size": ns.group_size,
+            "num_node_blocks": ns.num_node_blocks,
+            "block_size": ns.block_size,
             "chs": tuple(ns2id[cs] for cs in ns.chs)
         }
 
@@ -54,15 +54,15 @@ def serialize_nodes(root_ns: CircuitNodes):
 def deserialize_nodes(nodes_list: Sequence):
     id2ns = dict()
     for ns_id, ns_info in enumerate(nodes_list):
-        num_node_groups = ns_info["num_node_groups"]
-        group_size = ns_info["group_size"]
+        num_node_blocks = ns_info["num_node_blocks"]
+        block_size = ns_info["block_size"]
         chids = ns_info["chs"]
 
         if ns_info["type"] == "Input":
             scope = ns_info["scope"]
             dist = pickle.loads(ns_info["dist"])
 
-            ns = inputs(scope, num_node_groups, dist, group_size = group_size, 
+            ns = inputs(scope, num_node_blocks, dist, block_size = block_size, 
                         _no_set_meta_params = dist.need_meta_parameters)
 
             if "params" in ns_info:
@@ -75,7 +75,7 @@ def deserialize_nodes(nodes_list: Sequence):
             chs = [id2ns[cid] for cid in chids]
             edge_ids = torch.from_numpy(ns_info["edge_ids"])
 
-            if edge_ids.size(0) == chs[0].num_node_groups:
+            if edge_ids.size(0) == chs[0].num_node_blocks:
                 sparse_edges = False
             else:
                 sparse_edges = True
@@ -92,7 +92,7 @@ def deserialize_nodes(nodes_list: Sequence):
             else:
                 params = None
 
-            ns = summate(*chs, edge_ids = edge_ids, params = params, group_size = group_size)
+            ns = summate(*chs, edge_ids = edge_ids, params = params, block_size = block_size)
 
             if "zero_param_mask" in ns_info:
                 zero_param_mask = torch.from_numpy(ns_info["zero_param_mask"])

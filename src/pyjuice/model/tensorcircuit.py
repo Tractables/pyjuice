@@ -38,7 +38,7 @@ class TensorCircuit(nn.Module):
     def __init__(self, root_ns: CircuitNodes, layer_sparsity_tol: float = 0.5, 
                  max_num_partitions: Optional[int] = None, disable_gpu_compilation: bool = False, 
                  force_gpu_compilation: bool = False,
-                 max_tied_ns_per_parflow_group: int = 8,
+                 max_tied_ns_per_parflow_block: int = 8,
                  verbose: bool = True) -> None:
         """
         Create a tensorized circuit for the circuit rooted at `root_ns`.
@@ -46,10 +46,10 @@ class TensorCircuit(nn.Module):
         Parameters:
         `root_ns`:                       root nodes of the circuit
         `layer_sparsity_tol`:            the minimum allowed sparsity of compiled layers; ranges from 0.0 to 1.0; smaller means more strict
-        `max_num_partitions`:            how many groups do we want to split a layer into
+        `max_num_partitions`:            how many partitions do we want to split a layer into
         `disable_gpu_compilation`:       disable GPU compilation of the layers
         `force_gpu_compilation`:         always use GPU when compiling the layers
-        `max_tied_ns_per_parflow_group`: when there are tied nodes, specify at most how many nodes share a parameter flow accumulation buffer 
+        `max_tied_ns_per_parflow_block`: when there are tied nodes, specify at most how many nodes share a parameter flow accumulation buffer within a layer
         """
 
         super(TensorCircuit, self).__init__()
@@ -70,7 +70,7 @@ class TensorCircuit(nn.Module):
             max_num_partitions = max_num_partitions, 
             disable_gpu_compilation = disable_gpu_compilation, 
             force_gpu_compilation = force_gpu_compilation,
-            max_tied_ns_per_parflow_group = max_tied_ns_per_parflow_group,
+            max_tied_ns_per_parflow_block = max_tied_ns_per_parflow_block,
             verbose = verbose
         )
         
@@ -537,7 +537,7 @@ class TensorCircuit(nn.Module):
 
     def _init_layers(self, layer_sparsity_tol: Optional[float] = None, max_num_partitions: Optional[int] = None,
                      disable_gpu_compilation: bool = False, force_gpu_compilation: bool = False, 
-                     max_tied_ns_per_parflow_group: int = 8, verbose: bool = True):
+                     max_tied_ns_per_parflow_block: int = 8, verbose: bool = True):
 
         if hasattr(self, "input_layer_group") or hasattr(self, "inner_layer_groups"):
             raise ValueError("Attempting to initialize a TensorCircuit for the second time. " + \
@@ -550,22 +550,22 @@ class TensorCircuit(nn.Module):
         pc_num_vars = len(self.root_ns.scope)
 
         # Create layers
-        depth2nodes, num_layers, max_node_group_size, max_ele_group_size = self._create_node_layers()
+        depth2nodes, num_layers, max_node_block_size, max_ele_block_size = self._create_node_layers()
 
         self.input_layer_group = None
         self.inner_layer_groups = []
 
-        self.num_dummy_nodes = max_ele_group_size
-        self.num_dummy_eles = max_node_group_size
-        self.num_dummy_params = max_node_group_size * max_ele_group_size
+        self.num_dummy_nodes = max_ele_block_size
+        self.num_dummy_eles = max_node_block_size
+        self.num_dummy_params = max_node_block_size * max_ele_block_size
 
-        # Nodes include `max_ele_group_size` dummy nodes and all input/sum nodes in the PC
+        # Nodes include `max_ele_block_size` dummy nodes and all input/sum nodes in the PC
         num_nodes = self.num_dummy_nodes
 
         # Total number of edges
         num_edges = 0
 
-        # Elements include `max_node_group_size` dummy elements and all product nodes in the PC
+        # Elements include `max_node_block_size` dummy elements and all product nodes in the PC
         num_elements = self.num_dummy_eles
 
         # Number of parameters
@@ -590,7 +590,7 @@ class TensorCircuit(nn.Module):
                 for signature, nodes in signature2nodes.items():
                     input_layer = InputLayer(
                         nodes = nodes, cum_nodes = num_nodes,
-                        max_tied_ns_per_parflow_group = max_tied_ns_per_parflow_group,
+                        max_tied_ns_per_parflow_block = max_tied_ns_per_parflow_block,
                         pc_num_vars = pc_num_vars
                     )
 
@@ -608,12 +608,12 @@ class TensorCircuit(nn.Module):
                 # Product layer(s)
                 gsize2prod_nodes = dict()
                 for ns in depth2nodes[depth]["prod"]:
-                    gsize = ns.group_size
+                    gsize = ns.block_size
                     if gsize not in gsize2prod_nodes:
                         gsize2prod_nodes[gsize] = []
                     gsize2prod_nodes[gsize].append(ns)
                 
-                layer_num_elements = max_node_group_size
+                layer_num_elements = max_node_block_size
                 prod_layers = []
                 for gsize, nodes in gsize2prod_nodes.items():
                     prod_layer = ProdLayer(
@@ -640,7 +640,7 @@ class TensorCircuit(nn.Module):
                 # Sum layer(s)
                 gsize2sum_nodes = dict()
                 for ns in depth2nodes[depth]["sum"]:
-                    gsize = ns.group_size
+                    gsize = ns.block_size
                     if gsize not in gsize2sum_nodes:
                         gsize2sum_nodes[gsize] = []
                     gsize2sum_nodes[gsize].append(ns)
@@ -655,7 +655,7 @@ class TensorCircuit(nn.Module):
                         node2tiednodes = node2tiednodes,
                         layer_sparsity_tol = layer_sparsity_tol,
                         max_num_partitions = max_num_partitions,
-                        max_tied_ns_per_parflow_group = max_tied_ns_per_parflow_group,
+                        max_tied_ns_per_parflow_block = max_tied_ns_per_parflow_block,
                         disable_gpu_compilation = disable_gpu_compilation,
                         force_gpu_compilation = force_gpu_compilation
                     )
@@ -680,7 +680,7 @@ class TensorCircuit(nn.Module):
         self.num_param_flows = num_param_flows
 
         # For parameter flow accumulation
-        self.parflow_fusing_kwargs = compile_cum_par_flows_fn(node2tiednodes, MAX_NGROUPS = 2048, BLOCK_SIZE = 2048)
+        self.parflow_fusing_kwargs = compile_cum_par_flows_fn(node2tiednodes, MAX_NBLOCKS = 2048, BLOCK_SIZE = 2048)
         
         # For parameter update
         self.par_update_kwargs = compile_par_update_fn(self.root_ns, BLOCK_SIZE = 32)
@@ -725,14 +725,14 @@ class TensorCircuit(nn.Module):
         nodes2depth = dict()
 
         num_layers = 1
-        max_node_group_size = 0
-        max_ele_group_size = 0
+        max_node_block_size = 0
+        max_ele_block_size = 0
 
         def dfs(ns: CircuitNodes):
 
             nonlocal num_layers
-            nonlocal max_node_group_size
-            nonlocal max_ele_group_size
+            nonlocal max_node_block_size
+            nonlocal max_ele_block_size
 
             if ns in nodes2depth:
                 return
@@ -756,11 +756,11 @@ class TensorCircuit(nn.Module):
                     for idx, cs in enumerate(ns.chs):
                         cs_depth = nodes2depth[cs]
                         if cs_depth < depth:
-                            # TODO: Make the group size be 1
+                            # TODO: Make the block size be 1
                             pass_sum_ns = summate(
-                                cs, num_node_groups = cs.num_node_groups, group_size = cs.group_size,
-                                edge_ids = torch.arange(0, cs.num_node_groups)[None,:].repeat(2, 1),
-                                params = torch.eye(cs.group_size)[None,:,:].repeat(cs.num_node_groups, 1, 1)
+                                cs, num_node_blocks = cs.num_node_blocks, block_size = cs.block_size,
+                                edge_ids = torch.arange(0, cs.num_node_blocks)[None,:].repeat(2, 1),
+                                params = torch.eye(cs.block_size)[None,:,:].repeat(cs.num_node_blocks, 1, 1)
                             )
                             pass_prod_ns = multiply(pass_sum_ns)
                             ns.chs[idx] = pass_prod_ns
@@ -772,11 +772,11 @@ class TensorCircuit(nn.Module):
                             nodes2depth[pass_prod_ns] = depth
 
                     depth2nodes[depth]["sum"].append(ns)
-                    if ns.group_size > max_node_group_size:
-                        max_node_group_size = ns.group_size
+                    if ns.block_size > max_node_block_size:
+                        max_node_block_size = ns.block_size
                 elif ns.is_prod():
-                    if ns.group_size > max_ele_group_size:
-                        max_ele_group_size = ns.group_size
+                    if ns.block_size > max_ele_block_size:
+                        max_ele_block_size = ns.block_size
                 else:
                     raise NotImplementedError(f"Unsupported node type {type(n)}.")
 
@@ -793,7 +793,7 @@ class TensorCircuit(nn.Module):
                             depth2nodes[layer]["prod"].append(cs)
                             pns2layer[id(cs)] = layer
 
-        return depth2nodes, num_layers, max_node_group_size, max_ele_group_size
+        return depth2nodes, num_layers, max_node_block_size, max_ele_block_size
 
     def _categorize_input_nodes(self, nodes: Sequence[InputNodes]):
         signature2nodes = dict()

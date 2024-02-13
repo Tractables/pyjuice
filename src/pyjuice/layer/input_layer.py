@@ -22,16 +22,16 @@ from .layer import Layer
 
 
 class InputLayer(Layer, nn.Module):
-    def __init__(self, nodes: Sequence[InputNodes], cum_nodes: int = 0, pc_num_vars: int = 0, max_tied_ns_per_parflow_group: int = 4) -> None:
+    def __init__(self, nodes: Sequence[InputNodes], cum_nodes: int = 0, pc_num_vars: int = 0, max_tied_ns_per_parflow_block: int = 4) -> None:
         """
         Compiler flags:
-        - `max_tied_ns_per_parflow_group`: the maximum number of tied nodes allowed in the backward pass. Setting to a larger value will
+        - `max_tied_ns_per_parflow_block`: the maximum number of tied nodes allowed in the backward pass. Setting to a larger value will
                                            lead to reduced memory overhead but might lead to additional computational burden due to conflicts
                                            in gradient accumulation.
         """
 
         nn.Module.__init__(self)
-        Layer.__init__(self, nodes, disable_group_size_check = True)
+        Layer.__init__(self, nodes, disable_block_size_check = True)
 
         # Reorder input nodes such that for any tied nodes, its source nodes appear before them
         self.nodes = self._reorder_nodes(nodes)
@@ -79,7 +79,7 @@ class InputLayer(Layer, nn.Module):
                     node2tiednodes[source_ns] = [[source_ns], 1, source_ns._param_flow_range]
                 
                 dup_count = node2tiednodes[source_ns][1]
-                if dup_count >= max_tied_ns_per_parflow_group:
+                if dup_count >= max_tied_ns_per_parflow_block:
                     cum_param_flows += ns.num_nodes * ns.dist.num_param_flows()
                     ns._param_flow_range = (cum_param_flows - ns.num_nodes * ns.dist.num_param_flows(), cum_param_flows)
                     node2tiednodes[source_ns][2] = ns._param_flow_range
@@ -424,10 +424,10 @@ class InputLayer(Layer, nn.Module):
                     # Accumulate parameter flows of tied nodes
                     for i in range(len(self.tied2source_nids)):
                         pfid_start, num_par_flows, ch_pfids = self.tied2source_nids[i]
-                        num_coalesced_groups = ch_pfids.size(0)
+                        num_coalesced_blocks = ch_pfids.size(0)
 
-                        if num_coalesced_groups <= 1024:
-                            BLOCK_N = triton.next_power_of_2(num_coalesced_groups)
+                        if num_coalesced_blocks <= 1024:
+                            BLOCK_N = triton.next_power_of_2(num_coalesced_blocks)
                             BLOCK_M = min(1024 // BLOCK_N, num_par_flows)
 
                             grid = (triton.cdiv(num_par_flows, BLOCK_M),)
@@ -436,7 +436,7 @@ class InputLayer(Layer, nn.Module):
                                 param_flows_ptr = self.param_flows,
                                 pfid_start = pfid_start,
                                 ch_pfids_ptr = ch_pfids,
-                                num_coalesced_groups = num_coalesced_groups,
+                                num_coalesced_blocks = num_coalesced_blocks,
                                 num_par_flows = num_par_flows,
                                 BLOCK_M = BLOCK_M,
                                 BLOCK_N = BLOCK_N
@@ -540,7 +540,7 @@ class InputLayer(Layer, nn.Module):
                 scope = ns.scope
 
                 s_ngid = local_ngid
-                e_ngid = local_ngid + ns.num_node_groups
+                e_ngid = local_ngid + ns.num_node_blocks
 
                 with torch.no_grad():
                     if scope not in scope2localgids:
@@ -548,7 +548,7 @@ class InputLayer(Layer, nn.Module):
 
                     scope2localgids[scope].append(torch.arange(s_ngid, e_ngid))
 
-                local_ngid += ns.num_node_groups
+                local_ngid += ns.num_node_blocks
 
             self.scope2localgids = {
                 scope: torch.cat(ids, dim = 0).to(self.params.device) for scope, ids in scope2localgids.items()
@@ -755,14 +755,14 @@ class InputLayer(Layer, nn.Module):
 
     @staticmethod
     @triton.jit
-    def _pflow_accum_kernel(param_flows_ptr, pfid_start, ch_pfids_ptr, num_coalesced_groups, num_par_flows, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+    def _pflow_accum_kernel(param_flows_ptr, pfid_start, ch_pfids_ptr, num_coalesced_blocks, num_par_flows, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
         pid = tl.program_id(axis = 0)
 
         offs_pflow = pid * BLOCK_M + tl.arange(0, BLOCK_M)
         mask_pflow = offs_pflow < num_par_flows
 
         offs_ch = tl.arange(0, BLOCK_N)
-        mask_ch = offs_ch < num_coalesced_groups
+        mask_ch = offs_ch < num_coalesced_blocks
 
         # Start id for all ch parflows
         ch_pstart = tl.load(ch_pfids_ptr + offs_ch, mask = mask_ch)

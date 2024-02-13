@@ -15,12 +15,12 @@ def hmm_forward_backward_test():
     vocab_size = 1023
     batch_size = 32
 
-    num_node_groups = 4 # 4096 // 32 # 4
-    group_size = 1024 # 32 # 1024
-    num_latents = group_size * num_node_groups
+    num_node_blocks = 4 # 4096 // 32 # 4
+    block_size = 1024 # 32 # 1024
+    num_latents = block_size * num_node_blocks
 
-    with juice.set_group_size(group_size = group_size):
-        ns_input = juice.inputs(seq_length - 1, num_node_groups = num_node_groups,
+    with juice.set_block_size(block_size = block_size):
+        ns_input = juice.inputs(seq_length - 1, num_node_blocks = num_node_blocks,
                                 dist = dists.Categorical(num_cats = vocab_size))
         
         ns_sum = None
@@ -30,14 +30,14 @@ def hmm_forward_backward_test():
             
             if ns_sum is None:
                 ns = juice.summate(
-                    curr_zs, num_node_groups = num_node_groups)
+                    curr_zs, num_node_blocks = num_node_blocks)
                 ns_sum = ns
             else:
                 ns = ns_sum.duplicate(curr_zs, tie_params=True)
 
             curr_zs = juice.multiply(curr_xs, ns)
             
-        root_ns = juice.summate(curr_zs, num_node_groups = 1, group_size = 1)
+        root_ns = juice.summate(curr_zs, num_node_blocks = 1, block_size = 1)
     
     root_ns.init_parameters()
 
@@ -77,7 +77,7 @@ def hmm_forward_backward_test():
 
             elif ns.is_sum() and ns != root_ns:
                 emars = torch.cat([ns2mars[cs] for cs in ns.chs], dim = 0)
-                params = ns.get_source_ns()._params.reshape(num_node_groups, num_node_groups * ns.num_chs, group_size, group_size).permute(0, 2, 1, 3)
+                params = ns.get_source_ns()._params.reshape(num_node_blocks, num_node_blocks * ns.num_chs, block_size, block_size).permute(0, 2, 1, 3)
                 params = params.reshape(num_latents, num_latents * ns.num_chs)
 
                 emars_max = torch.max(emars, dim = 0).values[None,:]
@@ -95,7 +95,7 @@ def hmm_forward_backward_test():
                 assert ns == root_ns
 
                 emars = torch.cat([ns2mars[cs] for cs in ns.chs], dim = 0)
-                params = ns._params.reshape(1, num_node_groups * ns.num_chs, 1, group_size).permute(0, 2, 1, 3)
+                params = ns._params.reshape(1, num_node_blocks * ns.num_chs, 1, block_size).permute(0, 2, 1, 3)
                 params = params.reshape(1, num_latents * ns.num_chs)
 
                 emars_max = torch.max(emars, dim = 0).values[None,:]
@@ -132,11 +132,11 @@ def hmm_forward_backward_test():
                 nmars = node_mars[sid:eid,:]
 
                 for i, cs in enumerate(ns.chs):
-                    params = ns._params.reshape(1, num_node_groups * ns.num_chs, 1, group_size).permute(0, 2, 1, 3)
-                    params = params[:,:,i*num_node_groups:(i+1)*num_node_groups,:].reshape(1, num_latents)
+                    params = ns._params.reshape(1, num_node_blocks * ns.num_chs, 1, block_size).permute(0, 2, 1, 3)
+                    params = params[:,:,i*num_node_blocks:(i+1)*num_node_blocks,:].reshape(1, num_latents)
 
-                    param_flows = ns._param_flows.reshape(1, num_node_groups * ns.num_chs, 1, group_size).permute(0, 2, 1, 3)
-                    param_flows = param_flows[:,:,i*num_node_groups:(i+1)*num_node_groups,:].reshape(1, num_latents)
+                    param_flows = ns._param_flows.reshape(1, num_node_blocks * ns.num_chs, 1, block_size).permute(0, 2, 1, 3)
+                    param_flows = param_flows[:,:,i*num_node_blocks:(i+1)*num_node_blocks,:].reshape(1, num_latents)
 
                     if cs.is_prod():
                         emars = torch.zeros([num_latents, batch_size])
@@ -173,8 +173,8 @@ def hmm_forward_backward_test():
                 nmars = node_mars[sid:eid,:]
 
                 for i, cs in enumerate(ns.chs):
-                    params = ns.get_source_ns()._params.reshape(num_node_groups, num_node_groups * ns.num_chs, group_size, group_size).permute(0, 2, 1, 3)
-                    params = params[:,:,i*num_node_groups:(i+1)*num_node_groups,:].reshape(num_latents, num_latents)
+                    params = ns.get_source_ns()._params.reshape(num_node_blocks, num_node_blocks * ns.num_chs, block_size, block_size).permute(0, 2, 1, 3)
+                    params = params[:,:,i*num_node_blocks:(i+1)*num_node_blocks,:].reshape(num_latents, num_latents)
 
                     if cs.is_prod():
                         emars = torch.zeros([num_latents, batch_size])
@@ -199,7 +199,7 @@ def hmm_forward_backward_test():
                         ns2flows[cs] = torch.zeros([num_latents, batch_size])
                     ns2flows[cs] += eflows
 
-    pflows = ns_sum._param_flows.reshape(num_node_groups, num_node_groups, group_size, group_size).permute(
+    pflows = ns_sum._param_flows.reshape(num_node_blocks, num_node_blocks, block_size, block_size).permute(
         0, 2, 1, 3).flatten(2, 3).flatten(0, 1)
     assert torch.all(torch.abs(pflows - cum_pflows) < 1e-4)
 

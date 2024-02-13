@@ -11,23 +11,23 @@ import pytest
 
 
 def sum_nodes_merge_test():
-    num_node_groups = 2
+    num_node_blocks = 2
 
-    for group_size in [1, 2, 4, 8]:
+    for block_size in [1, 2, 4, 8]:
         
-        with juice.set_group_size(group_size):
+        with juice.set_block_size(block_size):
 
-            i00 = inputs(0, num_node_groups, dists.Categorical(num_cats = 5))
-            i01 = inputs(0, num_node_groups, dists.Categorical(num_cats = 5))
-            i10 = inputs(1, num_node_groups, dists.Categorical(num_cats = 5))
-            i11 = inputs(1, num_node_groups, dists.Categorical(num_cats = 5))
+            i00 = inputs(0, num_node_blocks, dists.Categorical(num_cats = 5))
+            i01 = inputs(0, num_node_blocks, dists.Categorical(num_cats = 5))
+            i10 = inputs(1, num_node_blocks, dists.Categorical(num_cats = 5))
+            i11 = inputs(1, num_node_blocks, dists.Categorical(num_cats = 5))
             
             m00 = multiply(i00, i10)
             m01 = multiply(i01, i11)
 
-            n0 = summate(m00, num_node_groups = num_node_groups)
-            n1 = summate(m01, num_node_groups = num_node_groups)
-            n2 = summate(m00, num_node_groups = num_node_groups)
+            n0 = summate(m00, num_node_blocks = num_node_blocks)
+            n1 = summate(m01, num_node_blocks = num_node_blocks)
+            n2 = summate(m00, num_node_blocks = num_node_blocks)
 
             n_new = merge_sum_nodes(n0, n1)
             assert (n_new.edge_ids == torch.Tensor([[0,0,1,1,2,2,3,3],[0,1,0,1,2,3,2,3]])).all()
@@ -42,16 +42,16 @@ def sum_nodes_merge_test():
 
 
 def prod_nodes_merge_test():
-    num_node_groups = 2
+    num_node_blocks = 2
 
-    for group_size in [1, 2, 4, 8]:
+    for block_size in [1, 2, 4, 8]:
         
-        with juice.set_group_size(group_size):
+        with juice.set_block_size(block_size):
 
-            i00 = inputs(0, num_node_groups, dists.Categorical(num_cats = 5))
-            i01 = inputs(0, num_node_groups, dists.Categorical(num_cats = 5))
-            i10 = inputs(1, num_node_groups, dists.Categorical(num_cats = 5))
-            i11 = inputs(1, num_node_groups, dists.Categorical(num_cats = 5))
+            i00 = inputs(0, num_node_blocks, dists.Categorical(num_cats = 5))
+            i01 = inputs(0, num_node_blocks, dists.Categorical(num_cats = 5))
+            i10 = inputs(1, num_node_blocks, dists.Categorical(num_cats = 5))
+            i11 = inputs(1, num_node_blocks, dists.Categorical(num_cats = 5))
 
             m00 = multiply(i00, i10)
             m01 = multiply(i01, i11)
@@ -71,32 +71,32 @@ def prod_nodes_merge_test():
 
 
 def merge_by_region_node_test():
-    num_node_groups = 2
+    num_node_blocks = 2
 
-    for group_size in [1, 2, 4, 8]:
+    for block_size in [1, 2, 4, 8]:
         
-        with juice.set_group_size(group_size):
+        with juice.set_block_size(block_size):
 
-            i00 = inputs(0, num_node_groups, dists.Categorical(num_cats = 5))
-            i01 = inputs(0, num_node_groups, dists.Categorical(num_cats = 5))
-            i10 = inputs(1, num_node_groups, dists.Categorical(num_cats = 5))
-            i11 = inputs(1, num_node_groups, dists.Categorical(num_cats = 5))
-            i20 = inputs(2, num_node_groups, dists.Categorical(num_cats = 5))
-            i30 = inputs(3, num_node_groups, dists.Categorical(num_cats = 5))
+            i00 = inputs(0, num_node_blocks, dists.Categorical(num_cats = 5))
+            i01 = inputs(0, num_node_blocks, dists.Categorical(num_cats = 5))
+            i10 = inputs(1, num_node_blocks, dists.Categorical(num_cats = 5))
+            i11 = inputs(1, num_node_blocks, dists.Categorical(num_cats = 5))
+            i20 = inputs(2, num_node_blocks, dists.Categorical(num_cats = 5))
+            i30 = inputs(3, num_node_blocks, dists.Categorical(num_cats = 5))
 
             m00 = multiply(i00, i10)
             m01 = multiply(i01, i11)
             m02 = multiply(i00, i10)
             m10 = multiply(i20, i30)
 
-            n00 = summate(m00, num_node_groups = num_node_groups)
-            n01 = summate(m01, m02, num_node_groups = num_node_groups)
-            n10 = summate(m10, num_node_groups = num_node_groups)
+            n00 = summate(m00, num_node_blocks = num_node_blocks)
+            n01 = summate(m01, m02, num_node_blocks = num_node_blocks)
+            n10 = summate(m10, num_node_blocks = num_node_blocks)
 
             m20 = multiply(n00, n10)
             m21 = multiply(n01, n10)
 
-            n = summate(m20, m21, num_node_groups = 1, group_size = 1)
+            n = summate(m20, m21, num_node_blocks = 1, block_size = 1)
 
             new_n = merge_by_region_node(n)
             

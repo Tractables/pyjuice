@@ -11,7 +11,7 @@ Tensor = Union[np.ndarray,torch.Tensor]
 
 
 def prune_by_score(root_nodes: CircuitNodes, key: str = "_scores", scores: Optional[Dict[CircuitNodes,Tensor]] = None, 
-                   keep_frac: Optional[float] = None, score_threshold: Optional[float] = None, group_reduction: str = "sum"):
+                   keep_frac: Optional[float] = None, score_threshold: Optional[float] = None, block_reduction: str = "sum"):
     
     # Traverse all nodes to collect scores
     score_ranges = dict()
@@ -41,14 +41,14 @@ def prune_by_score(root_nodes: CircuitNodes, key: str = "_scores", scores: Optio
             curr_scores = torch.from_numpy(curr_scores)
 
         if curr_scores.dim() == 3:
-            if group_reduction == "sum":
+            if block_reduction == "sum":
                 curr_scores = curr_scores.sum(dim = 2).sum(dim = 1)
-            elif group_reduction == "mean":
+            elif block_reduction == "mean":
                 curr_scores = curr_scores.mean(dim = 2).mean(dim = 1)
-            elif group_reduction == "max":
+            elif block_reduction == "max":
                 curr_scores = curr_scores.max(dim = 2).max(dim = 1)
             else:
-                raise ValueError(f"Unknown group reduction method `{group_reduction}`.")
+                raise ValueError(f"Unknown block reduction method `{block_reduction}`.")
         else:
             assert curr_scores.dim() == 1
 
@@ -91,7 +91,7 @@ def prune_by_score(root_nodes: CircuitNodes, key: str = "_scores", scores: Optio
                 edge_filter = selected_edges[score_ranges[ns][0]:score_ranges[ns][1]]
                 copied_edges = []
                 copied_params = []
-                for node_id in range(ns.num_node_groups):
+                for node_id in range(ns.num_node_blocks):
                     curr_eids = (edge_ids[0,:] == node_id) * edge_filter
                     if curr_eids.sum().item() == 0:
                         maxid = torch.argmax(
@@ -99,7 +99,7 @@ def prune_by_score(root_nodes: CircuitNodes, key: str = "_scores", scores: Optio
                             (edge_ids[0,:] == node_id) * 1e-8
                         )
                         copied_edges.append(edge_ids[:,maxid].unsqueeze(1))
-                        copied_params.append(ns._params[maxid].reshape(1, ns.group_size, ns.ch_group_size))
+                        copied_params.append(ns._params[maxid].reshape(1, ns.block_size, ns.ch_block_size))
                     else:
                         copied_edges.append(edge_ids[:,curr_eids])
                         copied_params.append(ns._params[curr_eids,:,:])
@@ -110,11 +110,11 @@ def prune_by_score(root_nodes: CircuitNodes, key: str = "_scores", scores: Optio
                 assert edge_ids.size(1) == params.size(0)
 
                 new_ns = SumNodes(
-                    num_node_groups = ns.num_node_groups, 
+                    num_node_blocks = ns.num_node_blocks, 
                     chs = ch_outputs, 
                     edge_ids = edge_ids,
                     params = params,
-                    group_size = ns.group_size
+                    block_size = ns.block_size
                 )
             else:
                 # Keep the node as-is
@@ -133,7 +133,7 @@ def prune_by_score(root_nodes: CircuitNodes, key: str = "_scores", scores: Optio
         ns_source = old2new[dup2source[ns]]
         ns._source_node = ns_source
 
-        assert ns.num_node_groups == ns_source.num_node_groups and ns.group_size == ns_source.group_size
+        assert ns.num_node_blocks == ns_source.num_node_blocks and ns.block_size == ns_source.block_size
 
         if hasattr(ns_source, "edge_ids"):
             ns.edge_ids = ns_source.edge_ids.clone()

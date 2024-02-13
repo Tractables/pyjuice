@@ -32,7 +32,7 @@ class SumLayer(Layer, nn.Module):
                  global_pid_start: int, global_pfid_start: int, node2tiednodes: dict(),
                  layer_sparsity_tol: Optional[float] = None, 
                  max_num_partitions: Optional[int] = None,
-                 max_tied_ns_per_parflow_group: int = 8,
+                 max_tied_ns_per_parflow_block: int = 8,
                  disable_gpu_compilation: bool = False,
                  force_gpu_compilation: bool = False) -> None:
 
@@ -49,31 +49,31 @@ class SumLayer(Layer, nn.Module):
 
         ## Get layer statistics & prepare for compilation ##
 
-        # n_chs:       [num_node_groups]          stores the number of child nodes of each node
-        # Note: to allow different nodes to have different `ch_group_size`s, we record the number of 
-        #       child **nodes** (instead of # node groups) in `n_chs`
-        layer_num_ngroups, layer_num_edges, n_chs = get_sum_layer_forward_stats(self.nodes, global_nid_start)
+        # n_chs:       [num_node_blocks]          stores the number of child nodes of each node
+        # Note: to allow different nodes to have different `ch_block_size`s, we record the number of 
+        #       child **nodes** (instead of # node blocks) in `n_chs`
+        layer_num_nblocks, layer_num_edges, n_chs = get_sum_layer_forward_stats(self.nodes, global_nid_start)
 
-        self.num_nodes = layer_num_ngroups * self.group_size # Total number of nodes
+        self.num_nodes = layer_num_nblocks * self.block_size # Total number of nodes
         self.num_edges = layer_num_edges # Total number of edges
 
-        # Find a good strategy to partition the node groups according to their number of children 
+        # Find a good strategy to partition the node blocks according to their number of children 
         # to minimize total computation cost
         fw_partition_max_chs = partition_nodes_by_n_edges(
             n_chs, sparsity_tolerance = layer_sparsity_tol, max_num_partitions = max_num_partitions
         )
 
-        # Since the triton kernels require the maximum number children for each group to be a power of 2,
+        # Since the triton kernels require the maximum number children for each block to be a power of 2,
         # we postprocess the partition sizes
         fw_partition_max_chs = torch.unique(next_power_of_2(fw_partition_max_chs))
 
-        self.num_fw_partitions = len(fw_partition_max_chs) # Number of groups
+        self.num_fw_partitions = len(fw_partition_max_chs) # Number of blocks
 
-        # fw_n_partition_ids:      [num_ngroups]           stores the partition id for each node group
-        # fw_n_id_in_partition:    [num_ngroups]           stores the index of the node groups in the partition
-        # fw_num_ngs_in_partition: [num_fw_partitions]     number of node groups in each partition
-        fw_n_partition_ids = torch.zeros([layer_num_ngroups], dtype = torch.long)
-        fw_n_id_in_partition = torch.zeros([layer_num_ngroups], dtype = torch.long)
+        # fw_n_partition_ids:      [num_nblocks]           stores the partition id for each node block
+        # fw_n_id_in_partition:    [num_nblocks]           stores the index of the node blocks in the partition
+        # fw_num_ngs_in_partition: [num_fw_partitions]     number of node blocks in each partition
+        fw_n_partition_ids = torch.zeros([layer_num_nblocks], dtype = torch.long)
+        fw_n_id_in_partition = torch.zeros([layer_num_nblocks], dtype = torch.long)
         fw_num_ngs_in_partition = torch.zeros([self.num_fw_partitions], dtype = torch.long)
 
         min_n_chs = 1
@@ -89,14 +89,14 @@ class SumLayer(Layer, nn.Module):
 
         ## Initialize forward pass ##
 
-        # nids:      List[[partition_size]]                      stores node group ids
-        # cids:      List[[partition_size, partition_max_n_chs]] stores indices of child node groups
-        # pids:      List[[partition_size, partition_max_n_chs]] stores indices of edge parameters (1st parameter of every group)
-        # pfids:     List[[partition_size, partition_max_n_chs]] stores indices of edge parameter flows (1st parameter flow of every group)
+        # nids:      List[[partition_size]]                      stores node block ids
+        # cids:      List[[partition_size, partition_max_n_chs]] stores indices of child node blocks
+        # pids:      List[[partition_size, partition_max_n_chs]] stores indices of edge parameters (1st parameter of every block)
+        # pfids:     List[[partition_size, partition_max_n_chs]] stores indices of edge parameter flows (1st parameter flow of every block)
         nids, cids, pids, pfids, layer_pid_end, layer_pfid_end = sum_layer_forward_compilation(
             self.nodes, fw_partition_max_chs, fw_n_partition_ids, fw_n_id_in_partition, 
             fw_num_ngs_in_partition, n_chs, global_nid_start, global_pid_start, global_pfid_start, node2tiednodes,
-            max_tied_ns_per_parflow_group = max_tied_ns_per_parflow_group,
+            max_tied_ns_per_parflow_block = max_tied_ns_per_parflow_block,
             # GPU compilation is slightly slower for small layer due to the kernel jit compilation time
             use_cuda = force_gpu_compilation or (not disable_gpu_compilation and (self.num_edges > 1000))
         )
@@ -117,37 +117,37 @@ class SumLayer(Layer, nn.Module):
 
         ## Initialize backward pass ##
 
-        # A sum layer could have children of different group sizes
+        # A sum layer could have children of different block sizes
         # We separate and partition them into different backward kernels
-        ch_gsize2cs, ch_gsize2num_ngroups, ch_gsize2n_pargs, cs2parns = get_sum_layer_backward_stats(nodes)
+        ch_gsize2cs, ch_gsize2num_nblocks, ch_gsize2n_pargs, cs2parns = get_sum_layer_backward_stats(nodes)
 
-        # For every possible child group size, we first compute the best partition strategy.
+        # For every possible child block size, we first compute the best partition strategy.
         # We then move on to do the actual compilation
         chids = []
         parids = []
         parpids = []
-        cs_group_sizes = []
+        cs_block_sizes = []
         for ch_gsize in ch_gsize2n_pargs:
 
-            num_ngroups = ch_gsize2num_ngroups[ch_gsize]
+            num_nblocks = ch_gsize2num_nblocks[ch_gsize]
             n_pargs = ch_gsize2n_pargs[ch_gsize]
 
-            # Find a good strategy to partition the node groups according to their number of children 
+            # Find a good strategy to partition the node blocks according to their number of children 
             # to minimize total computation cost
             bk_partition_max_pars = partition_nodes_by_n_edges(
                 n_pargs, sparsity_tolerance = layer_sparsity_tol, max_num_partitions = max_num_partitions
             )
 
-            # Since the triton kernels require the maximum number children for each group to be a power of 2,
+            # Since the triton kernels require the maximum number children for each block to be a power of 2,
             # we postprocess the partition sizes
             bk_partition_max_pars = torch.unique(next_power_of_2(bk_partition_max_pars))
             num_bk_partitions = bk_partition_max_pars.size(0)
 
-            # bk_n_partition_ids:      [num_ngroups]           stores the partition id for each node group
-            # bk_n_id_in_partition:    [num_ngroups]           stores the index of the node groups in the partition
-            # bk_num_ngs_in_partition: [num_bk_partitions]     number of node groups in each partition
-            bk_n_partition_ids = torch.zeros([num_ngroups], dtype = torch.long)
-            bk_n_id_in_partition = torch.zeros([num_ngroups], dtype = torch.long)
+            # bk_n_partition_ids:      [num_nblocks]           stores the partition id for each node block
+            # bk_n_id_in_partition:    [num_nblocks]           stores the index of the node blocks in the partition
+            # bk_num_ngs_in_partition: [num_bk_partitions]     number of node blocks in each partition
+            bk_n_partition_ids = torch.zeros([num_nblocks], dtype = torch.long)
+            bk_n_id_in_partition = torch.zeros([num_nblocks], dtype = torch.long)
             bk_num_ngs_in_partition = torch.zeros([num_bk_partitions], dtype = torch.long)
 
             min_n_pars = 1
@@ -161,8 +161,8 @@ class SumLayer(Layer, nn.Module):
 
                 min_n_pars = max_n_pars + 1
 
-            # chids:      List[[partition_num_chs]]                         stores child group ids
-            # parids:     List[[partition_num_chs, partition_max_n_pargs]]  stores parent node groups' ids for each child node
+            # chids:      List[[partition_num_chs]]                         stores child block ids
+            # parids:     List[[partition_num_chs, partition_max_n_pargs]]  stores parent node blocks' ids for each child node
             # parpids:    List[[partition_num_chs, partition_max_n_pargs]]  param id for the edges to parent (correspond to `parids`)
             curr_chids, curr_parids, curr_parpids = sum_layer_backward_compilation(
                 nodes = ch_gsize2cs[ch_gsize], 
@@ -178,13 +178,13 @@ class SumLayer(Layer, nn.Module):
             chids.extend(curr_chids)
             parids.extend(curr_parids)
             parpids.extend(curr_parpids)
-            cs_group_sizes.extend([ch_gsize] * num_bk_partitions)
+            cs_block_sizes.extend([ch_gsize] * num_bk_partitions)
 
         # Store buffers for the forward pass
         self.partitioned_chids = FastParamList([nn.Parameter(tensor, requires_grad = False) for tensor in chids])
         self.partitioned_parids = FastParamList([nn.Parameter(tensor, requires_grad = False) for tensor in parids])
         self.partitioned_parpids = FastParamList([nn.Parameter(tensor, requires_grad = False) for tensor in parpids])
-        self.cs_group_sizes = cs_group_sizes
+        self.cs_block_sizes = cs_block_sizes
 
         self.num_bk_partitions = len(chids)
 
@@ -293,13 +293,13 @@ class SumLayer(Layer, nn.Module):
                 chids = self.partitioned_chids[partition_id]
                 parids = self.partitioned_parids[partition_id]
                 parpids = self.partitioned_parpids[partition_id]
-                cs_group_size = self.cs_group_sizes[partition_id]
+                cs_block_size = self.cs_block_sizes[partition_id]
 
                 self._backward(
                     node_flows, element_flows, params, node_mars, 
                     element_mars, param_flows, 
                     chids = chids, parids = parids, parpids = parpids,
-                    cs_group_size = cs_group_size,
+                    cs_block_size = cs_block_size,
                     partition_id = partition_id,
                     allow_modify_flows = allow_modify_flows
                 )
@@ -310,14 +310,14 @@ class SumLayer(Layer, nn.Module):
                 chids = self.partitioned_chids[partition_id]
                 parids = self.partitioned_parids[partition_id]
                 parpids = self.partitioned_parpids[partition_id]
-                cs_group_size = self.cs_group_sizes[partition_id]
+                cs_block_size = self.cs_block_sizes[partition_id]
                 local_ids = self.bk_partition_local_ids[partition_id]
 
                 self._backward(
                     node_flows, element_flows, params, node_mars,
                     element_mars, param_flows, 
                     chids = chids, parids = parids, parpids = parpids,
-                    cs_group_size = cs_group_size, local_ids = local_ids,
+                    cs_block_size = cs_block_size, local_ids = local_ids,
                     partition_id = partition_id,
                     allow_modify_flows = allow_modify_flows
                 )
@@ -364,13 +364,13 @@ class SumLayer(Layer, nn.Module):
             assert mode in STR2MODE
             mode = self.STR2MODE[mode]
 
-        elif params.dim() == 1 and self.group_size >= 16 and num_edges >= 16 and batch_size >= 16:
+        elif params.dim() == 1 and self.block_size >= 16 and num_edges >= 16 and batch_size >= 16:
             # In this case, we should definitely use the block-sparse implementation
             mode = self.BLOCK_SPARSE
-        elif self.group_size == 1 or num_edges < 4:
+        elif self.block_size == 1 or num_edges < 4:
             # In this case, we should definitely use the sparse implementation
             mode = self.SPARSE
-        elif self.group_size * batch_size < 32:
+        elif self.block_size * batch_size < 32:
             # Advantage of block-sparse processing is diminishing
             mode = self.SPARSE
         else:
@@ -403,18 +403,18 @@ class SumLayer(Layer, nn.Module):
     def _fw_triton_block_sparse_tlmm_kernel(node_mars, element_mars, params, nids, cids_start, cids_increment,
                                             pids_start, pids_increment, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
                                             BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
-                                            TILE_SIZE_M: tl.constexpr, GROUP_SIZE_M: tl.constexpr, use_fp16: tl.constexpr):
+                                            TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, use_fp16: tl.constexpr):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
 
-        # Get inferred node group id from `pid_m`
-        ngroup_id = pid_m // (GROUP_SIZE_M // TILE_SIZE_M)
-        tile_id = pid_m % (GROUP_SIZE_M // TILE_SIZE_M)
+        # Get inferred node block id from `pid_m`
+        nblock_id = pid_m // (BLOCK_SIZE_M // TILE_SIZE_M)
+        tile_id = pid_m % (BLOCK_SIZE_M // TILE_SIZE_M)
 
-        # Get the real node group id in the case of partial evaluation
+        # Get the real node block id in the case of partial evaluation
         if partial_eval == 1:
-            ngroup_id = tl.load(local_ids + ngroup_id)
+            nblock_id = tl.load(local_ids + nblock_id)
 
         # Node offsets
         offs_node = tl.arange(0, TILE_SIZE_M) + tile_id * TILE_SIZE_M
@@ -424,7 +424,7 @@ class SumLayer(Layer, nn.Module):
         offs_edge = tl.arange(0, TILE_SIZE_K)
 
         # Initialize pointers to `params`
-        offs_estart = ngroup_id * TILE_SIZE_K + offs_edge
+        offs_estart = nblock_id * TILE_SIZE_K + offs_edge
         offs_estart = tl.max_contiguous(offs_estart, TILE_SIZE_K)
         par_start = tl.load(pids_start + offs_estart)
         epars_ptr = params + \
@@ -443,8 +443,8 @@ class SumLayer(Layer, nn.Module):
             offs_batch[None,:] # [TILE_SIZE_K, BLOCK_B]
 
         # Batch increment pointers
-        pids_inc_ptr = pids_increment + ngroup_id * (K_NUM_TILES * TILE_SIZE_K) + offs_edge
-        cids_inc_ptr = cids_increment + ngroup_id * (K_NUM_TILES * TILE_SIZE_K) + offs_edge
+        pids_inc_ptr = pids_increment + nblock_id * (K_NUM_TILES * TILE_SIZE_K) + offs_edge
+        cids_inc_ptr = cids_increment + nblock_id * (K_NUM_TILES * TILE_SIZE_K) + offs_edge
 
         # Inner loop
         acc = tl.zeros([TILE_SIZE_M, BLOCK_B], dtype = tl.float32) - float("inf")
@@ -481,7 +481,7 @@ class SumLayer(Layer, nn.Module):
             cids_inc_ptr += TILE_SIZE_K
 
         # Write back
-        off_nids = tl.load(nids + ngroup_id)
+        off_nids = tl.load(nids + nblock_id)
         offs_nmars = (off_nids + offs_node[:,None]) * batch_size + offs_batch[None,:]
         tl.store(node_mars + offs_nmars, acc, mask = mask_batch[None,:])
 
@@ -491,18 +491,18 @@ class SumLayer(Layer, nn.Module):
     def _fw_triton_block_sparse_csmm1_kernel(node_mars, element_mars, params, nids, cids_start, cids_increment,
                                             pids_start, pids_increment, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
                                             BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
-                                            TILE_SIZE_M: tl.constexpr, GROUP_SIZE_M: tl.constexpr, use_fp16: tl.constexpr):
+                                            TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, use_fp16: tl.constexpr):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
 
-        # Get inferred node group id from `pid_m`
-        ngroup_id = pid_m // (GROUP_SIZE_M // TILE_SIZE_M)
-        tile_id = pid_m % (GROUP_SIZE_M // TILE_SIZE_M)
+        # Get inferred node block id from `pid_m`
+        nblock_id = pid_m // (BLOCK_SIZE_M // TILE_SIZE_M)
+        tile_id = pid_m % (BLOCK_SIZE_M // TILE_SIZE_M)
 
-        # Get the real node group id in the case of partial evaluation
+        # Get the real node block id in the case of partial evaluation
         if partial_eval == 1:
-            ngroup_id = tl.load(local_ids + ngroup_id)
+            nblock_id = tl.load(local_ids + nblock_id)
 
         # Node offsets
         offs_node = tl.arange(0, TILE_SIZE_M) + tile_id * TILE_SIZE_M
@@ -512,7 +512,7 @@ class SumLayer(Layer, nn.Module):
         offs_edge = tl.arange(0, TILE_SIZE_K)
 
         # Initialize pointers to `params`
-        offs_estart = ngroup_id * TILE_SIZE_K + offs_edge
+        offs_estart = nblock_id * TILE_SIZE_K + offs_edge
         offs_estart = tl.max_contiguous(offs_estart, TILE_SIZE_K)
         par_start = tl.load(pids_start + offs_estart)
         epars_ptr = params + \
@@ -531,8 +531,8 @@ class SumLayer(Layer, nn.Module):
             offs_batch[None,:] # [TILE_SIZE_K, BLOCK_B]
 
         # Batch increment pointers
-        pids_inc_ptr = pids_increment + ngroup_id * (K_NUM_TILES * TILE_SIZE_K) + offs_edge
-        cids_inc_ptr = cids_increment + ngroup_id * (K_NUM_TILES * TILE_SIZE_K) + offs_edge
+        pids_inc_ptr = pids_increment + nblock_id * (K_NUM_TILES * TILE_SIZE_K) + offs_edge
+        cids_inc_ptr = cids_increment + nblock_id * (K_NUM_TILES * TILE_SIZE_K) + offs_edge
 
         # Inner loop
         acc = tl.zeros([TILE_SIZE_M, BLOCK_B], dtype = tl.float32) - float("inf")
@@ -569,7 +569,7 @@ class SumLayer(Layer, nn.Module):
             cids_inc_ptr += TILE_SIZE_K
 
         # Write back
-        off_nids = tl.load(nids + ngroup_id)
+        off_nids = tl.load(nids + nblock_id)
         offs_nmars = (off_nids + offs_node[:,None]) * batch_size + offs_batch[None,:]
         tl.store(node_mars + offs_nmars, acc, mask = mask_batch[None,:])
 
@@ -579,18 +579,18 @@ class SumLayer(Layer, nn.Module):
     def _fw_triton_block_sparse_csmm2_kernel(node_mars, element_mars, params, nids, cids_start, cids_increment,
                                              pids_start, pids_increment, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
                                              BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
-                                             TILE_SIZE_M: tl.constexpr, GROUP_SIZE_M: tl.constexpr, use_fp16: tl.constexpr):
+                                             TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, use_fp16: tl.constexpr):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
 
-        # Get inferred node group id from `pid_m`
-        ngroup_id = pid_m // (GROUP_SIZE_M // TILE_SIZE_M)
-        tile_id = pid_m % (GROUP_SIZE_M // TILE_SIZE_M)
+        # Get inferred node block id from `pid_m`
+        nblock_id = pid_m // (BLOCK_SIZE_M // TILE_SIZE_M)
+        tile_id = pid_m % (BLOCK_SIZE_M // TILE_SIZE_M)
 
-        # Get the real node group id in the case of partial evaluation
+        # Get the real node block id in the case of partial evaluation
         if partial_eval == 1:
-            ngroup_id = tl.load(local_ids + ngroup_id)
+            nblock_id = tl.load(local_ids + nblock_id)
 
         # Node offsets
         offs_node = tl.arange(0, TILE_SIZE_M) + tile_id * TILE_SIZE_M
@@ -600,7 +600,7 @@ class SumLayer(Layer, nn.Module):
         offs_edge = tl.arange(0, TILE_SIZE_K)
 
         # Initialize pointers to `params`
-        offs_estart = ngroup_id * TILE_SIZE_K + offs_edge
+        offs_estart = nblock_id * TILE_SIZE_K + offs_edge
         offs_estart = tl.max_contiguous(offs_estart, TILE_SIZE_K)
         par_start = tl.load(pids_start + offs_estart)
         epars_ptr = params + \
@@ -619,8 +619,8 @@ class SumLayer(Layer, nn.Module):
             offs_batch[:,None] # [BLOCK_B, TILE_SIZE_K]
 
         # Batch increment pointers
-        pids_inc_ptr = pids_increment + ngroup_id * (K_NUM_TILES * TILE_SIZE_K) + offs_edge
-        cids_inc_ptr = cids_increment + ngroup_id * (K_NUM_TILES * TILE_SIZE_K) + offs_edge
+        pids_inc_ptr = pids_increment + nblock_id * (K_NUM_TILES * TILE_SIZE_K) + offs_edge
+        cids_inc_ptr = cids_increment + nblock_id * (K_NUM_TILES * TILE_SIZE_K) + offs_edge
 
         # Inner loop
         acc = tl.zeros([TILE_SIZE_M, BLOCK_B], dtype = tl.float32) - float("inf")
@@ -651,7 +651,7 @@ class SumLayer(Layer, nn.Module):
             cids_inc_ptr += TILE_SIZE_K
 
         # Write back
-        off_nids = tl.load(nids + ngroup_id)
+        off_nids = tl.load(nids + nblock_id)
         offs_nmars = (off_nids + offs_node[:,None]) * batch_size + offs_batch[None,:]
         tl.store(node_mars + offs_nmars, acc, mask = mask_batch[None,:])
 
@@ -674,20 +674,20 @@ class SumLayer(Layer, nn.Module):
 
         assert params.dim() == 1, "Expecting a 1D `params`."
 
-        num_ngroups = nids.size(0) if local_ids is None else local_ids.size(0)
-        layer_n_nodes = num_ngroups * self.group_size
+        num_nblocks = nids.size(0) if local_ids is None else local_ids.size(0)
+        layer_n_nodes = num_nblocks * self.block_size
         num_edges = cids.size(1)
         batch_size = node_mars.size(1)
         BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
 
         # Heuristic to set `TILE_SIZE_M`, `TILE_SIZE_K`, and `BLOCK_B`
-        base_size = min(self.group_size, num_edges, BATCH_SIZE_NP2, 128)
+        base_size = min(self.block_size, num_edges, BATCH_SIZE_NP2, 128)
         if base_size >= 64:
             TILE_SIZE_K = min(2048 // 32, num_edges)
         else:
             remainder = 2048 // (base_size ** 2)
             TILE_SIZE_K = min(2048 // remainder, base_size * remainder, num_edges)
-        TILE_SIZE_M = min(2048 // TILE_SIZE_K, self.group_size)
+        TILE_SIZE_M = min(2048 // TILE_SIZE_K, self.block_size)
         BLOCK_B = min(2048 // TILE_SIZE_K, BATCH_SIZE_NP2)
         K_NUM_TILES = num_edges // TILE_SIZE_K
 
@@ -718,7 +718,7 @@ class SumLayer(Layer, nn.Module):
             cids_start, cids_increment, pids_start, pids_increment = self._cached_fw_pcids[signature]
 
         partial_eval = 1 if local_ids is not None else 0
-        GROUP_SIZE_M = self.group_size
+        BLOCK_SIZE_M = self.block_size
 
         if force_use_fp16:
             assert not force_use_fp32
@@ -750,7 +750,7 @@ class SumLayer(Layer, nn.Module):
                 TILE_SIZE_K = TILE_SIZE_K,
                 K_NUM_TILES = K_NUM_TILES,
                 TILE_SIZE_M = TILE_SIZE_M,
-                GROUP_SIZE_M = GROUP_SIZE_M,
+                BLOCK_SIZE_M = BLOCK_SIZE_M,
                 use_fp16 = use_fp16
             )
             
@@ -771,7 +771,7 @@ class SumLayer(Layer, nn.Module):
                 TILE_SIZE_K = TILE_SIZE_K,
                 K_NUM_TILES = K_NUM_TILES,
                 TILE_SIZE_M = TILE_SIZE_M,
-                GROUP_SIZE_M = GROUP_SIZE_M,
+                BLOCK_SIZE_M = BLOCK_SIZE_M,
                 use_fp16 = use_fp16
             )
         else:
@@ -791,7 +791,7 @@ class SumLayer(Layer, nn.Module):
                 TILE_SIZE_K = TILE_SIZE_K,
                 K_NUM_TILES = K_NUM_TILES,
                 TILE_SIZE_M = TILE_SIZE_M,
-                GROUP_SIZE_M = GROUP_SIZE_M,
+                BLOCK_SIZE_M = BLOCK_SIZE_M,
                 use_fp16 = use_fp16
             )
         
@@ -802,21 +802,21 @@ class SumLayer(Layer, nn.Module):
     @FastJITFunction
     def _fw_triton_sparse_kernel(node_mars, element_mars, params, nids, cids, pids,
                                  local_ids, batch_size, partial_eval: tl.constexpr, num_edges: tl.constexpr, 
-                                 BLOCK_B: tl.constexpr, GROUP_SIZE_M: tl.constexpr):
+                                 BLOCK_B: tl.constexpr, BLOCK_SIZE_M: tl.constexpr):
         
         pid_b = tl.program_id(axis = 0) # ID of size-`BLOCK_B` batches
-        pid_m = tl.program_id(axis = 1) # ID of size-`GROUP_SIZE_M` nodes
+        pid_m = tl.program_id(axis = 1) # ID of size-`BLOCK_SIZE_M` nodes
 
-        # Get inferred node group id from `pid_m`
-        ngroup_id = pid_m
+        # Get inferred node block id from `pid_m`
+        nblock_id = pid_m
 
-        # Get the real node group id in the case of partial evaluation
+        # Get the real node block id in the case of partial evaluation
         if partial_eval == 1:
-            ngroup_id = tl.load(local_ids + ngroup_id)
+            nblock_id = tl.load(local_ids + nblock_id)
 
         # Initialize pointers to `params`
         offs_edge = tl.arange(0, num_edges)
-        par_start = tl.load(pids + ngroup_id * num_edges + offs_edge)
+        par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
         epars_ptr = params + par_start # [num_edges]
 
         # Batch offsets and mask
@@ -824,7 +824,7 @@ class SumLayer(Layer, nn.Module):
         mask_batch = offs_batch < batch_size
 
         # Initialize and load edge mars
-        edge_ids = tl.load(cids + ngroup_id * num_edges + offs_edge)
+        edge_ids = tl.load(cids + nblock_id * num_edges + offs_edge)
         emars_ptr = element_mars + \
             edge_ids[:,None] * batch_size + \
             offs_batch[None,:]
@@ -835,13 +835,13 @@ class SumLayer(Layer, nn.Module):
         emars = tl.exp(emars - emars_max[None,:])
 
         # Initialize pointers to `node_mars`
-        off_nids = tl.load(nids + ngroup_id)
+        off_nids = tl.load(nids + nblock_id)
         nmars_ptr = node_mars + \
             off_nids * batch_size + \
             offs_batch
 
         # Inner loop
-        for i in range(0, GROUP_SIZE_M):
+        for i in range(0, BLOCK_SIZE_M):
             epars = tl.load(epars_ptr)
 
             nmars = tl.log(tl.sum(emars * epars[:,None], axis = 0)) + emars_max
@@ -860,7 +860,7 @@ class SumLayer(Layer, nn.Module):
     def _fw_triton_large_sparse_kernel(node_mars, element_mars, params, nids, cids, pids,
                                        local_ids, batch_size, num_nodes, pid_m_offset, partial_eval: tl.constexpr, num_edges: tl.constexpr, 
                                        BLOCK_B: tl.constexpr, TILE_SIZE_M: tl.constexpr, 
-                                       GROUP_SIZE_M: tl.constexpr):
+                                       BLOCK_SIZE_M: tl.constexpr):
 
         pid_b = tl.program_id(axis = 0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(axis = 1) + pid_m_offset # ID of size-`TILE_SIZE_M` nodes
@@ -868,25 +868,25 @@ class SumLayer(Layer, nn.Module):
         offs_m = tl.arange(0, TILE_SIZE_M) + pid_m * TILE_SIZE_M
         mask_m = offs_m < num_nodes
 
-        # Get inferred node group id from `pid_m`
-        ngroup_ids = offs_m // GROUP_SIZE_M
-        tile_ids = offs_m % GROUP_SIZE_M
+        # Get inferred node block id from `pid_m`
+        nblock_ids = offs_m // BLOCK_SIZE_M
+        tile_ids = offs_m % BLOCK_SIZE_M
 
-        # Get the real node group id in the case of partial evaluation
+        # Get the real node block id in the case of partial evaluation
         if partial_eval == 1:
-            ngroup_ids = tl.load(local_ids + ngroup_ids, mask = mask_m)
+            nblock_ids = tl.load(local_ids + nblock_ids, mask = mask_m)
 
         # Initialize pointers to `params`
         offs_edge = tl.arange(0, num_edges)
-        par_start = tl.load(pids + ngroup_ids[:,None] * num_edges + offs_edge[None,:], mask = mask_m[:,None]) # [TILE_SIZE_M, num_edges]
-        epars = tl.load(params + tile_ids[:,None] * GROUP_SIZE_M + par_start, mask = mask_m[:,None], other = 0.0) # [TILE_SIZE_M, num_edges]
+        par_start = tl.load(pids + nblock_ids[:,None] * num_edges + offs_edge[None,:], mask = mask_m[:,None]) # [TILE_SIZE_M, num_edges]
+        epars = tl.load(params + tile_ids[:,None] * BLOCK_SIZE_M + par_start, mask = mask_m[:,None], other = 0.0) # [TILE_SIZE_M, num_edges]
 
         # Batch offsets and mask
         offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B
         mask_batch = offs_batch < batch_size
 
         # Initialize and load edge mars
-        edge_ids = tl.load(cids + ngroup_ids[:,None] * num_edges + offs_edge[None,:]) # [TILE_SIZE_M, num_edges]
+        edge_ids = tl.load(cids + nblock_ids[:,None] * num_edges + offs_edge[None,:]) # [TILE_SIZE_M, num_edges]
         emars_ptr = element_mars + \
             edge_ids[:,:,None] * batch_size + \
             offs_batch[None,None,:] # [TILE_SIZE_M, num_edges, BLOCK_B]
@@ -898,7 +898,7 @@ class SumLayer(Layer, nn.Module):
         nmars = tl.log(tl.sum(emars * epars[:,:,None], axis = 1)) + emars_max
 
         # Initialize pointers to `node_mars`
-        off_nids = tl.load(nids + ngroup_ids) # [TILE_SIZE_M]
+        off_nids = tl.load(nids + nblock_ids) # [TILE_SIZE_M]
         nmars_ptr = node_mars + \
             (off_nids + tile_ids)[:,None] * batch_size + \
             offs_batch[None,:] # [TILE_SIZE_M, BLOCK_B]
@@ -921,21 +921,21 @@ class SumLayer(Layer, nn.Module):
         `pids`:         [ng, c]
         """
 
-        num_ngroups = nids.size(0) if local_ids is None else local_ids.size(0)
-        layer_n_nodes = num_ngroups * self.group_size
+        num_nblocks = nids.size(0) if local_ids is None else local_ids.size(0)
+        layer_n_nodes = num_nblocks * self.block_size
         num_edges = cids.size(1)
         batch_size = node_mars.size(1)
         BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
 
         assert num_edges <= 16384, "The sparse forward kernel only support nodes with # edges smaller than 16384."
 
-        if triton.cdiv(layer_n_nodes, self.group_size) <= 2048:
+        if triton.cdiv(layer_n_nodes, self.block_size) <= 2048:
             BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
 
             partial_eval = 1 if local_ids is not None else 0
-            GROUP_SIZE_M = self.group_size
+            BLOCK_SIZE_M = self.block_size
 
-            grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, GROUP_SIZE_M))
+            grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, BLOCK_SIZE_M))
 
             self._fw_triton_sparse_kernel[grid](
                 node_mars = node_mars, 
@@ -949,7 +949,7 @@ class SumLayer(Layer, nn.Module):
                 partial_eval = partial_eval, 
                 num_edges = num_edges, 
                 BLOCK_B = BLOCK_B, 
-                GROUP_SIZE_M = GROUP_SIZE_M
+                BLOCK_SIZE_M = BLOCK_SIZE_M
             )
 
         else:
@@ -957,7 +957,7 @@ class SumLayer(Layer, nn.Module):
             TILE_SIZE_M = max(min(4096 // num_edges // BLOCK_B, triton.next_power_of_2(layer_n_nodes)), 1)
 
             partial_eval = 1 if local_ids is not None else 0
-            GROUP_SIZE_M = self.group_size
+            BLOCK_SIZE_M = self.block_size
 
             grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
 
@@ -977,7 +977,7 @@ class SumLayer(Layer, nn.Module):
                     num_edges = num_edges,
                     BLOCK_B = BLOCK_B,
                     TILE_SIZE_M = TILE_SIZE_M,
-                    GROUP_SIZE_M = GROUP_SIZE_M
+                    BLOCK_SIZE_M = BLOCK_SIZE_M
                 )
             else:
                 for pid_m_start in range(0, grid[1], 32768):
@@ -1000,7 +1000,7 @@ class SumLayer(Layer, nn.Module):
                         num_edges = num_edges,
                         BLOCK_B = BLOCK_B,
                         TILE_SIZE_M = TILE_SIZE_M,
-                        GROUP_SIZE_M = GROUP_SIZE_M
+                        BLOCK_SIZE_M = BLOCK_SIZE_M
                     )
 
         return None
@@ -1016,13 +1016,13 @@ class SumLayer(Layer, nn.Module):
             cids = cids[local_ids]
             pids = pids[local_ids]
 
-        num_ngroups = nids.size(0)
+        num_nblocks = nids.size(0)
         num_edges = cids.size(1)
-        nids = (nids[:,None].repeat(1, self.group_size) + \
-            torch.arange(0, self.group_size, device = nids.device)[None,:]).reshape(num_ngroups * self.group_size)
-        cids = cids[:,None,:].repeat(1, self.group_size, 1).reshape(num_ngroups * self.group_size, num_edges)
-        pids = (pids[:,None,:].repeat(1, self.group_size, 1) + \
-            torch.arange(0, self.group_size, device = cids.device)[None,:,None]).reshape(num_ngroups * self.group_size, num_edges)
+        nids = (nids[:,None].repeat(1, self.block_size) + \
+            torch.arange(0, self.block_size, device = nids.device)[None,:]).reshape(num_nblocks * self.block_size)
+        cids = cids[:,None,:].repeat(1, self.block_size, 1).reshape(num_nblocks * self.block_size, num_edges)
+        pids = (pids[:,None,:].repeat(1, self.block_size, 1) + \
+            torch.arange(0, self.block_size, device = cids.device)[None,:,None]).reshape(num_nblocks * self.block_size, num_edges)
 
         ch_mars = element_mars[cids]
         maxval = ch_mars.max(dim = 1, keepdim = True).values
@@ -1046,7 +1046,7 @@ class SumLayer(Layer, nn.Module):
                   pids: Optional[torch.Tensor] = None, pfids: Optional[torch.Tensor] = None, 
                   chids: Optional[torch.Tensor] = None, parids: Optional[torch.Tensor] = None, 
                   parpids: Optional[torch.Tensor] = None, 
-                  cs_group_size: int = 0, local_ids: Optional[torch.Tensor] = None, 
+                  cs_block_size: int = 0, local_ids: Optional[torch.Tensor] = None, 
                   partition_id: int = -1, mode: Optional[str] = None,
                   allow_modify_flows: bool = False) -> None:
         """
@@ -1065,22 +1065,22 @@ class SumLayer(Layer, nn.Module):
         """
 
         if cids is not None:
-            num_edges = cids.size(1) * self.group_size
+            num_edges = cids.size(1) * self.block_size
         else:
-            num_edges = parids.size(1) * self.group_size
+            num_edges = parids.size(1) * self.block_size
         batch_size = node_flows.size(1)
 
         if mode is not None:
             assert mode in STR2MODE
             mode = self.STR2MODE[mode]
 
-        elif params.dim() == 1 and self.group_size >= 16 and num_edges >= 16 and batch_size >= 16:
+        elif params.dim() == 1 and self.block_size >= 16 and num_edges >= 16 and batch_size >= 16:
             # In this case, we should definitely use the block-sparse implementation
             mode = self.BLOCK_SPARSE
-        elif (cs_group_size == 1 or self.group_size == 1) and num_edges <= 32768:
+        elif (cs_block_size == 1 or self.block_size == 1) and num_edges <= 32768:
             # In this case, we should definitely use the sparse implementation
             mode = self.SPARSE
-        elif self.group_size * batch_size < 32:
+        elif self.block_size * batch_size < 32:
             # Advantage of block-sparse processing is diminishing
             mode = self.SPARSE
         else:
@@ -1089,14 +1089,14 @@ class SumLayer(Layer, nn.Module):
         if mode == self.BLOCK_SPARSE:
             self._backward_block_sparse(
                 node_flows, element_flows, params, node_mars, element_mars, param_flows, 
-                nids, cids, pids, pfids, chids, parids, parpids, cs_group_size, local_ids, 
+                nids, cids, pids, pfids, chids, parids, parpids, cs_block_size, local_ids, 
                 partition_id = partition_id, allow_modify_flows = allow_modify_flows
             )
 
         elif mode == self.SPARSE:
             self._backward_sparse(
                 node_flows, element_flows, params, node_mars, element_mars, param_flows, 
-                nids, cids, pids, pfids, chids, parids, parpids, cs_group_size, local_ids, 
+                nids, cids, pids, pfids, chids, parids, parpids, cs_block_size, local_ids, 
                 partition_id = partition_id, allow_modify_flows = allow_modify_flows
             )
 
@@ -1106,7 +1106,7 @@ class SumLayer(Layer, nn.Module):
             self._backward_pytorch(
                 node_flows, element_flows, params, node_mars, 
                 element_mars, param_flows, nids, cids, pids, pfids, 
-                chids, parids, parpids, cs_group_size
+                chids, parids, parpids, cs_block_size
             )
         else:
             raise ValueError(f"Not supported mode `{mode}`.")
@@ -1117,18 +1117,18 @@ class SumLayer(Layer, nn.Module):
     # @triton.jit
     @FastJITFunction
     def _bk_triton_modify_flow_kernel(node_flows, node_mars, local_ids, nids, batch_size: tl.constexpr, partial_eval: tl.constexpr, 
-                                      BLOCK_B: tl.constexpr, BLOCK_M: tl.constexpr, GROUP_SIZE_M: tl.constexpr):
+                                      BLOCK_B: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` examples
         pid_m = tl.program_id(1) # ID of size-`BLOCK_M` nodes
 
-        # Get inferred node group id from `pid_m`
-        ngroup_id = pid_m // (GROUP_SIZE_M // BLOCK_M)
-        tile_id = pid_m % (GROUP_SIZE_M // BLOCK_M)
+        # Get inferred node block id from `pid_m`
+        nblock_id = pid_m // (BLOCK_SIZE_M // BLOCK_M)
+        tile_id = pid_m % (BLOCK_SIZE_M // BLOCK_M)
 
-        # Get the real node group id in the case of partial evaluation
+        # Get the real node block id in the case of partial evaluation
         if partial_eval == 1:
-            ngroup_id = tl.load(local_ids + ngroup_id)
+            nblock_id = tl.load(local_ids + nblock_id)
 
         # Batch offsets and mask
         offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B
@@ -1136,7 +1136,7 @@ class SumLayer(Layer, nn.Module):
 
         # Initialize pointers to `node_flows` and `node_mars`
         offs_node = tl.arange(0, BLOCK_M) + tile_id * BLOCK_M
-        off_nids = tl.load(nids + ngroup_id)
+        off_nids = tl.load(nids + nblock_id)
         offs_nmfs = (off_nids + offs_node[:,None]) * batch_size + offs_batch[None,:]
 
         nmars = tl.load(node_mars + offs_nmfs, mask = mask_batch[None,:])
@@ -1150,7 +1150,7 @@ class SumLayer(Layer, nn.Module):
     # @triton.jit
     @FastJITFunction
     def _bk_triton_large_modify_flow_kernel(node_flows, node_mars, local_ids, nids, num_nodes, batch_size: tl.constexpr, partial_eval: tl.constexpr, 
-                                            BLOCK_B: tl.constexpr, TILE_SIZE_M: tl.constexpr, GROUP_SIZE_M: tl.constexpr):
+                                            BLOCK_B: tl.constexpr, TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` examples
         pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
@@ -1158,20 +1158,20 @@ class SumLayer(Layer, nn.Module):
         offs_m = tl.arange(0, TILE_SIZE_M) + pid_m * TILE_SIZE_M
         mask_m = offs_m < num_nodes
 
-        # Get inferred node group id from `pid_m`
-        ngroup_ids = offs_m // GROUP_SIZE_M
-        tile_ids = offs_m % GROUP_SIZE_M
+        # Get inferred node block id from `pid_m`
+        nblock_ids = offs_m // BLOCK_SIZE_M
+        tile_ids = offs_m % BLOCK_SIZE_M
 
-        # Get the real node group id in the case of partial evaluation
+        # Get the real node block id in the case of partial evaluation
         if partial_eval == 1:
-            ngroup_ids = tl.load(local_ids + ngroup_ids)
+            nblock_ids = tl.load(local_ids + nblock_ids)
 
         # Batch offsets and mask
         offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B
         mask_batch = offs_batch < batch_size
 
         # Initialize pointers to `node_flows` and `node_mars`
-        off_nids = tl.load(nids + ngroup_ids, mask = mask_m) # [TILE_SIZE_M]
+        off_nids = tl.load(nids + nblock_ids, mask = mask_m) # [TILE_SIZE_M]
         offs_nmfs = (off_nids + tile_ids)[:,None] * batch_size + offs_batch[None,:]
 
         nmars = tl.load(node_mars + offs_nmfs, mask = (mask_m[:,None] & mask_batch[None,:]))
@@ -1187,22 +1187,22 @@ class SumLayer(Layer, nn.Module):
         Replace `node_flows[nids]` with `node_flows[nids].log() - node_mars[nids]`
         """
 
-        num_ngroups = nids.size(0) if local_ids is None else local_ids.size(0)
-        layer_n_nodes = num_ngroups * self.group_size
+        num_nblocks = nids.size(0) if local_ids is None else local_ids.size(0)
+        layer_n_nodes = num_nblocks * self.block_size
         batch_size = node_mars.size(1)
         BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
 
-        if triton.cdiv(layer_n_nodes, self.group_size) <= 4096:
+        if triton.cdiv(layer_n_nodes, self.block_size) <= 4096:
 
-            if BATCH_SIZE_NP2 >= 64 and self.group_size >= 64:
+            if BATCH_SIZE_NP2 >= 64 and self.block_size >= 64:
                 BLOCK_B = min(2048 // 64, BATCH_SIZE_NP2)
-                BLOCK_M = min(4096 // BLOCK_B, self.group_size)
+                BLOCK_M = min(4096 // BLOCK_B, self.block_size)
             else:
                 BLOCK_B = min(2048, BATCH_SIZE_NP2)
-                BLOCK_M = min(2048 // BLOCK_B, self.group_size)
+                BLOCK_M = min(2048 // BLOCK_B, self.block_size)
 
             partial_eval = 1 if local_ids is not None else 0
-            GROUP_SIZE_M = self.group_size
+            BLOCK_SIZE_M = self.block_size
 
             grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, BLOCK_M))
 
@@ -1215,7 +1215,7 @@ class SumLayer(Layer, nn.Module):
                 partial_eval = partial_eval, 
                 BLOCK_B = BLOCK_B, 
                 BLOCK_M = BLOCK_M, 
-                GROUP_SIZE_M = GROUP_SIZE_M
+                BLOCK_SIZE_M = BLOCK_SIZE_M
             )
 
         else:
@@ -1224,7 +1224,7 @@ class SumLayer(Layer, nn.Module):
             TILE_SIZE_M = min(4096 // BLOCK_B, triton.next_power_of_2(layer_n_nodes))
 
             partial_eval = 1 if local_ids is not None else 0
-            GROUP_SIZE_M = self.group_size
+            BLOCK_SIZE_M = self.block_size
 
             grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
 
@@ -1238,7 +1238,7 @@ class SumLayer(Layer, nn.Module):
                 partial_eval = partial_eval,
                 BLOCK_B = BLOCK_B,
                 TILE_SIZE_M = TILE_SIZE_M,
-                GROUP_SIZE_M = GROUP_SIZE_M
+                BLOCK_SIZE_M = BLOCK_SIZE_M
             )
 
         return None
@@ -1248,7 +1248,7 @@ class SumLayer(Layer, nn.Module):
                                element_mars: torch.Tensor, param_flows: torch.Tensor, 
                                nids: Optional[torch.Tensor], cids: Optional[torch.Tensor], pids: Optional[torch.Tensor], pfids: Optional[torch.Tensor],
                                chids: Optional[torch.Tensor], parids: Optional[torch.Tensor], parpids: Optional[torch.Tensor], 
-                               cs_group_size: int, local_ids: Optional[torch.Tensor] = None,
+                               cs_block_size: int, local_ids: Optional[torch.Tensor] = None,
                                partition_id: int = -1, allow_modify_flows: bool = False) -> None:
         """
         Back pass of sum layers with block-sparse processing kernel.
@@ -1270,7 +1270,7 @@ class SumLayer(Layer, nn.Module):
             self._backward_block_sparse_ele_flows(
                 node_flows, element_flows, params, node_mars, element_mars,
                 chids = chids, parids = parids, parpids = parpids, 
-                cs_group_size = cs_group_size, local_ids = local_ids, 
+                cs_block_size = cs_block_size, local_ids = local_ids, 
                 partition_id = partition_id, allow_modify_flows = allow_modify_flows
             )
 
@@ -1291,28 +1291,28 @@ class SumLayer(Layer, nn.Module):
                                            chids, parids_start, parids_increment, parpids_start, parpids_increment, 
                                            local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr, ptr_inc_step: tl.constexpr, 
                                            allow_modify_flows: tl.constexpr, BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, 
-                                           K_NUM_TILES: tl.constexpr, TILE_SIZE_M: tl.constexpr, GROUP_SIZE_M: tl.constexpr, 
-                                           GROUP_SIZE_K: tl.constexpr, TL_DOT: tl.constexpr):
+                                           K_NUM_TILES: tl.constexpr, TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, 
+                                           BLOCK_SIZE_K: tl.constexpr, TL_DOT: tl.constexpr):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
 
-        # Get inferred node group id from `pid_m`
-        elegroup_id = pid_m // (GROUP_SIZE_M // TILE_SIZE_M)
-        tile_id = pid_m % (GROUP_SIZE_M // TILE_SIZE_M)
+        # Get inferred node block id from `pid_m`
+        eleblock_id = pid_m // (BLOCK_SIZE_M // TILE_SIZE_M)
+        tile_id = pid_m % (BLOCK_SIZE_M // TILE_SIZE_M)
 
-        # Get the real node group id in the case of partial evaluation
+        # Get the real node block id in the case of partial evaluation
         if partial_eval == 1:
-            elegroup_id = tl.load(local_ids + elegroup_id)
+            eleblock_id = tl.load(local_ids + eleblock_id)
 
         # Initialize pointers to `params`
         offs_ele = tl.arange(0, TILE_SIZE_M) + tile_id * TILE_SIZE_M
         offs_edge = tl.arange(0, TILE_SIZE_K)
-        offs_edge_gid = offs_edge // GROUP_SIZE_K
-        offs_edge_nid = (offs_edge % GROUP_SIZE_K)
-        par_start = tl.load(parpids_start + elegroup_id * ptr_inc_step + offs_edge_gid)
+        offs_edge_gid = offs_edge // BLOCK_SIZE_K
+        offs_edge_nid = (offs_edge % BLOCK_SIZE_K)
+        par_start = tl.load(parpids_start + eleblock_id * ptr_inc_step + offs_edge_gid)
         epars_ptr = params + \
-            offs_ele[:,None] * GROUP_SIZE_K + \
+            offs_ele[:,None] * BLOCK_SIZE_K + \
             (par_start + offs_edge_nid)[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
 
         # Batch offsets and mask
@@ -1320,7 +1320,7 @@ class SumLayer(Layer, nn.Module):
         mask_batch = offs_batch < batch_size
 
         # Initialize pointers to `node_mars`
-        edge_start = tl.load(parids_start + elegroup_id * ptr_inc_step + offs_edge_gid)
+        edge_start = tl.load(parids_start + eleblock_id * ptr_inc_step + offs_edge_gid)
         nmars_ptr = node_mars + \
             (edge_start + offs_edge_nid)[:,None] * batch_size + \
             offs_batch[None,:] # [TILE_SIZE_K, BLOCK_B]
@@ -1329,8 +1329,8 @@ class SumLayer(Layer, nn.Module):
             offs_batch[None,:] # [TILE_SIZE_K, BLOCK_B]
 
         # Batch increment pointers
-        parids_inc_ptr = parids_increment + elegroup_id * (K_NUM_TILES * ptr_inc_step) + offs_edge_gid
-        parpids_inc_ptr = parpids_increment + elegroup_id * (K_NUM_TILES * ptr_inc_step) + offs_edge_gid
+        parids_inc_ptr = parids_increment + eleblock_id * (K_NUM_TILES * ptr_inc_step) + offs_edge_gid
+        parpids_inc_ptr = parpids_increment + eleblock_id * (K_NUM_TILES * ptr_inc_step) + offs_edge_gid
 
         # Inner loop
         acc = tl.zeros([TILE_SIZE_M, BLOCK_B], dtype = tl.float32) - float("inf")
@@ -1380,7 +1380,7 @@ class SumLayer(Layer, nn.Module):
             parids_inc_ptr += ptr_inc_step
 
         # Initialize pointers to `element_mars`
-        off_eleids = tl.load(chids + elegroup_id)
+        off_eleids = tl.load(chids + eleblock_id)
         emars_ptr = element_mars + (off_eleids + offs_ele[:,None]) * batch_size + offs_batch[None,:]
         emars = tl.load(emars_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_K, BLOCK_B]
 
@@ -1397,28 +1397,28 @@ class SumLayer(Layer, nn.Module):
                                                  chids, parids_start, parids_increment, parpids_start, parpids_increment, 
                                                  local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr, ptr_inc_step: tl.constexpr, 
                                                  allow_modify_flows: tl.constexpr, BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, 
-                                                 K_NUM_TILES: tl.constexpr, TILE_SIZE_M: tl.constexpr, GROUP_SIZE_M: tl.constexpr, 
-                                                 GROUP_SIZE_K: tl.constexpr, TL_DOT: tl.constexpr):
+                                                 K_NUM_TILES: tl.constexpr, TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, 
+                                                 BLOCK_SIZE_K: tl.constexpr, TL_DOT: tl.constexpr):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
 
-        # Get inferred node group id from `pid_m`
-        elegroup_id = pid_m // (GROUP_SIZE_M // TILE_SIZE_M)
-        tile_id = pid_m % (GROUP_SIZE_M // TILE_SIZE_M)
+        # Get inferred node block id from `pid_m`
+        eleblock_id = pid_m // (BLOCK_SIZE_M // TILE_SIZE_M)
+        tile_id = pid_m % (BLOCK_SIZE_M // TILE_SIZE_M)
 
-        # Get the real node group id in the case of partial evaluation
+        # Get the real node block id in the case of partial evaluation
         if partial_eval == 1:
-            elegroup_id = tl.load(local_ids + elegroup_id)
+            eleblock_id = tl.load(local_ids + eleblock_id)
 
         # Initialize pointers to `params`
         offs_ele = tl.arange(0, TILE_SIZE_M) + tile_id * TILE_SIZE_M
         offs_edge = tl.arange(0, TILE_SIZE_K)
-        offs_edge_gid = offs_edge // GROUP_SIZE_K
-        offs_edge_nid = (offs_edge % GROUP_SIZE_K)
-        par_start = tl.load(parpids_start + elegroup_id * ptr_inc_step + offs_edge_gid)
+        offs_edge_gid = offs_edge // BLOCK_SIZE_K
+        offs_edge_nid = (offs_edge % BLOCK_SIZE_K)
+        par_start = tl.load(parpids_start + eleblock_id * ptr_inc_step + offs_edge_gid)
         epars_ptr = params + \
-            offs_ele[:,None] * GROUP_SIZE_K + \
+            offs_ele[:,None] * BLOCK_SIZE_K + \
             (par_start + offs_edge_nid)[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
 
         # Batch offsets and mask
@@ -1426,7 +1426,7 @@ class SumLayer(Layer, nn.Module):
         mask_batch = offs_batch < batch_size
 
         # Initialize pointers to `node_mars`
-        edge_start = tl.load(parids_start + elegroup_id * ptr_inc_step + offs_edge_gid)
+        edge_start = tl.load(parids_start + eleblock_id * ptr_inc_step + offs_edge_gid)
         nmars_ptr = node_mars + \
             (edge_start + offs_edge_nid)[None,:] * batch_size + \
             offs_batch[:,None] # [BLOCK_B, TILE_SIZE_K]
@@ -1435,8 +1435,8 @@ class SumLayer(Layer, nn.Module):
             offs_batch[:,None] # [BLOCK_B, TILE_SIZE_K]
 
         # Batch increment pointers
-        parids_inc_ptr = parids_increment + elegroup_id * (K_NUM_TILES * ptr_inc_step) + offs_edge_gid
-        parpids_inc_ptr = parpids_increment + elegroup_id * (K_NUM_TILES * ptr_inc_step) + offs_edge_gid
+        parids_inc_ptr = parids_increment + eleblock_id * (K_NUM_TILES * ptr_inc_step) + offs_edge_gid
+        parpids_inc_ptr = parpids_increment + eleblock_id * (K_NUM_TILES * ptr_inc_step) + offs_edge_gid
 
         # Inner loop
         acc = tl.zeros([TILE_SIZE_M, BLOCK_B], dtype = tl.float32) - float("inf")
@@ -1483,7 +1483,7 @@ class SumLayer(Layer, nn.Module):
             parids_inc_ptr += ptr_inc_step
 
         # Initialize pointers to `element_mars`
-        off_eleids = tl.load(chids + elegroup_id)
+        off_eleids = tl.load(chids + eleblock_id)
         emars_ptr = element_mars + (off_eleids + offs_ele[:,None]) * batch_size + offs_batch[None,:]
         emars = tl.load(emars_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_K, BLOCK_B]
 
@@ -1496,25 +1496,25 @@ class SumLayer(Layer, nn.Module):
     def _backward_block_sparse_ele_flows(self, node_flows: torch.Tensor, element_flows: torch.Tensor,
                                          params: torch.Tensor, node_mars: torch.Tensor,
                                          element_mars: torch.Tensor, chids: torch.Tensor, parids: torch.Tensor,
-                                         parpids: torch.Tensor, cs_group_size: int, local_ids: Optional[torch.Tensor] = None,
+                                         parpids: torch.Tensor, cs_block_size: int, local_ids: Optional[torch.Tensor] = None,
                                          partition_id: int = -1, allow_modify_flows: bool = False) -> None:
 
         assert params.dim() == 1, "Expecting a 1D `params`."
 
-        num_ngroups = chids.size(0) if local_ids is None else local_ids.size(0)
-        layer_n_nodes = num_ngroups * cs_group_size
-        num_edges = parids.size(1) * self.group_size
+        num_nblocks = chids.size(0) if local_ids is None else local_ids.size(0)
+        layer_n_nodes = num_nblocks * cs_block_size
+        num_edges = parids.size(1) * self.block_size
         batch_size = node_flows.size(1)
         BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
 
         # Heuristic to set `TILE_SIZE_M`, `TILE_SIZE_K`, and `BLOCK_B`
-        base_size = min(self.group_size, num_edges, BATCH_SIZE_NP2, 64)
+        base_size = min(self.block_size, num_edges, BATCH_SIZE_NP2, 64)
         if base_size >= 64:
             TILE_SIZE_K = min(2048 // 32, num_edges)
         else:
             remainder = 2048 // (base_size ** 2)
             TILE_SIZE_K = min(512, base_size * remainder, num_edges)
-        TILE_SIZE_M = min(2048 // TILE_SIZE_K, cs_group_size)
+        TILE_SIZE_M = min(2048 // TILE_SIZE_K, cs_block_size)
         BLOCK_B = min(2048 // TILE_SIZE_K, BATCH_SIZE_NP2)
         K_NUM_TILES = num_edges // TILE_SIZE_K
 
@@ -1526,19 +1526,19 @@ class SumLayer(Layer, nn.Module):
         if signature not in self._cached_bk_parids:
             # Pre-compute pointer increments for `parids` and `parpids`
 
-            if TILE_SIZE_K < self.group_size:
+            if TILE_SIZE_K < self.block_size:
                 ptr_inc_step = 1
 
-                num_rep = self.group_size // TILE_SIZE_K
+                num_rep = self.block_size // TILE_SIZE_K
                 parids = (parids[:,:,None].repeat(1, 1, num_rep) + \
-                    torch.arange(0, self.group_size, TILE_SIZE_K, device = parids.device)[None,None,:]).reshape(
+                    torch.arange(0, self.block_size, TILE_SIZE_K, device = parids.device)[None,None,:]).reshape(
                         parids.size(0), K_NUM_TILES, 1)
                 parpids = (parpids[:,:,None].repeat(1, 1, num_rep) + \
-                    torch.arange(0, self.group_size, TILE_SIZE_K, device = parpids.device)[None,None,:]).reshape(
+                    torch.arange(0, self.block_size, TILE_SIZE_K, device = parpids.device)[None,None,:]).reshape(
                         parpids.size(0), K_NUM_TILES, 1)
 
             else:
-                ptr_inc_step = TILE_SIZE_K // self.group_size
+                ptr_inc_step = TILE_SIZE_K // self.block_size
 
                 parids = parids.reshape(parids.size(0), K_NUM_TILES, ptr_inc_step)
                 parpids = parpids.reshape(parpids.size(0), K_NUM_TILES, ptr_inc_step)
@@ -1560,8 +1560,8 @@ class SumLayer(Layer, nn.Module):
             parids_start, parids_increment, parpids_start, parpids_increment, ptr_inc_step = self._cached_bk_parids[signature]
 
         partial_eval = 1 if local_ids is not None else 0
-        GROUP_SIZE_M = cs_group_size
-        GROUP_SIZE_K = self.group_size
+        BLOCK_SIZE_M = cs_block_size
+        BLOCK_SIZE_K = self.block_size
         allow_modify_flows = 1 if allow_modify_flows else 0
 
         if TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and BLOCK_B >= 16:
@@ -1592,8 +1592,8 @@ class SumLayer(Layer, nn.Module):
                 TILE_SIZE_K = TILE_SIZE_K, 
                 K_NUM_TILES = K_NUM_TILES,
                 TILE_SIZE_M = TILE_SIZE_M, 
-                GROUP_SIZE_M = GROUP_SIZE_M,
-                GROUP_SIZE_K = GROUP_SIZE_K,
+                BLOCK_SIZE_M = BLOCK_SIZE_M,
+                BLOCK_SIZE_K = BLOCK_SIZE_K,
                 TL_DOT = TL_DOT,
                 num_warps = 2, # TODO: test for different devices
                 num_stages = 1
@@ -1619,8 +1619,8 @@ class SumLayer(Layer, nn.Module):
                 TILE_SIZE_K = TILE_SIZE_K, 
                 K_NUM_TILES = K_NUM_TILES,
                 TILE_SIZE_M = TILE_SIZE_M, 
-                GROUP_SIZE_M = GROUP_SIZE_M,
-                GROUP_SIZE_K = GROUP_SIZE_K,
+                BLOCK_SIZE_M = BLOCK_SIZE_M,
+                BLOCK_SIZE_K = BLOCK_SIZE_K,
                 TL_DOT = TL_DOT,
                 num_warps = 2, # TODO: test for different devices
                 num_stages = 1
@@ -1634,14 +1634,14 @@ class SumLayer(Layer, nn.Module):
     def _bk_triton_block_sparse_par_kernel(node_flows, node_mars, element_mars, params, param_flows, nids, cids, pids, pfids,
                                            batch_size: tl.constexpr, num_edges: tl.constexpr, allow_modify_flows: tl.constexpr, 
                                            TILE_SIZE_B: tl.constexpr, B_NUM_TILES: tl.constexpr, TILE_SIZE_K: tl.constexpr, 
-                                           TILE_SIZE_M: tl.constexpr, GROUP_SIZE_M: tl.constexpr, TL_DOT: tl.constexpr):
+                                           TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, TL_DOT: tl.constexpr):
 
         pid_k = tl.program_id(0) # ID of size-`TILE_SIZE_K` edges
         pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
 
-        # Get inferred node group id from `pid_m`
-        ngroup_id = pid_m // (GROUP_SIZE_M // TILE_SIZE_M)
-        tile_id = pid_m % (GROUP_SIZE_M // TILE_SIZE_M)
+        # Get inferred node block id from `pid_m`
+        nblock_id = pid_m // (BLOCK_SIZE_M // TILE_SIZE_M)
+        tile_id = pid_m % (BLOCK_SIZE_M // TILE_SIZE_M)
 
         # Batch offsets and mask
         offs_batch = tl.arange(0, TILE_SIZE_B)
@@ -1649,14 +1649,14 @@ class SumLayer(Layer, nn.Module):
 
         # Initialize pointers to `element_mars`
         offs_edge = tl.arange(0, TILE_SIZE_K) + pid_k * TILE_SIZE_K
-        edge_start = tl.load(cids + ngroup_id * num_edges + offs_edge)
+        edge_start = tl.load(cids + nblock_id * num_edges + offs_edge)
         emars_ptr = element_mars + \
             edge_start[None,:] * batch_size + \
             offs_batch[:,None] # [TILE_SIZE_B, TILE_SIZE_K]
 
         # Initialize pointers to `node_flows` and `node_mars`
         offs_node = tl.arange(0, TILE_SIZE_M) + tile_id * TILE_SIZE_M
-        off_nids = tl.load(nids + ngroup_id)
+        off_nids = tl.load(nids + nblock_id)
         nmars_ptr = node_mars + (off_nids + offs_node[:,None]) * batch_size + offs_batch[None,:]
         nflows_ptr = node_flows + (off_nids + offs_node[:,None]) * batch_size + offs_batch[None,:]
 
@@ -1696,13 +1696,13 @@ class SumLayer(Layer, nn.Module):
             mask_batch = offs_batch < batch_size
 
         # Initialize `params`
-        par_start = tl.load(pids + ngroup_id * num_edges + offs_edge)
+        par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
         epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
         epars = tl.load(params + epars_offsets)
 
         pflows = acc * epars
 
-        parflow_start = tl.load(pfids + ngroup_id * num_edges + offs_edge)
+        parflow_start = tl.load(pfids + nblock_id * num_edges + offs_edge)
         eparflows_offsets = offs_node[:,None] + parflow_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
 
         tl.atomic_add(param_flows + eparflows_offsets, pflows)
@@ -1713,14 +1713,14 @@ class SumLayer(Layer, nn.Module):
     def _bk_triton_block_sparse_par_csmm2_kernel(node_flows, node_mars, element_mars, params, param_flows, nids, cids, pids, pfids,
                                                  batch_size: tl.constexpr, num_edges: tl.constexpr, allow_modify_flows: tl.constexpr, 
                                                  TILE_SIZE_B: tl.constexpr, B_NUM_TILES: tl.constexpr, TILE_SIZE_K: tl.constexpr, 
-                                                 TILE_SIZE_M: tl.constexpr, GROUP_SIZE_M: tl.constexpr, TL_DOT: tl.constexpr):
+                                                 TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, TL_DOT: tl.constexpr):
 
         pid_k = tl.program_id(0) # ID of size-`TILE_SIZE_K` edges
         pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
 
-        # Get inferred node group id from `pid_m`
-        ngroup_id = pid_m // (GROUP_SIZE_M // TILE_SIZE_M)
-        tile_id = pid_m % (GROUP_SIZE_M // TILE_SIZE_M)
+        # Get inferred node block id from `pid_m`
+        nblock_id = pid_m // (BLOCK_SIZE_M // TILE_SIZE_M)
+        tile_id = pid_m % (BLOCK_SIZE_M // TILE_SIZE_M)
 
         # Batch offsets and mask
         offs_batch = tl.arange(0, TILE_SIZE_B)
@@ -1728,14 +1728,14 @@ class SumLayer(Layer, nn.Module):
 
         # Initialize pointers to `element_mars`
         offs_edge = tl.arange(0, TILE_SIZE_K) + pid_k * TILE_SIZE_K
-        edge_start = tl.load(cids + ngroup_id * num_edges + offs_edge)
+        edge_start = tl.load(cids + nblock_id * num_edges + offs_edge)
         emars_ptr = element_mars + \
             edge_start[None,:] * batch_size + \
             offs_batch[:,None] # [TILE_SIZE_B, TILE_SIZE_K]
 
         # Initialize pointers to `node_flows` and `node_mars`
         offs_node = tl.arange(0, TILE_SIZE_M) + tile_id * TILE_SIZE_M
-        off_nids = tl.load(nids + ngroup_id)
+        off_nids = tl.load(nids + nblock_id)
         nmars_ptr = node_mars + (off_nids + offs_node[None,:]) * batch_size + offs_batch[:,None]
         nflows_ptr = node_flows + (off_nids + offs_node[None,:]) * batch_size + offs_batch[:,None]
 
@@ -1772,13 +1772,13 @@ class SumLayer(Layer, nn.Module):
             mask_batch = offs_batch < batch_size
 
         # Initialize `params`
-        par_start = tl.load(pids + ngroup_id * num_edges + offs_edge)
+        par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
         epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
         epars = tl.load(params + epars_offsets)
 
         pflows = acc * epars
 
-        parflow_start = tl.load(pfids + ngroup_id * num_edges + offs_edge)
+        parflow_start = tl.load(pfids + nblock_id * num_edges + offs_edge)
         eparflows_offsets = offs_node[:,None] + parflow_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
 
         tl.atomic_add(param_flows + eparflows_offsets, pflows)
@@ -1804,20 +1804,20 @@ class SumLayer(Layer, nn.Module):
 
         assert params.dim() == 1, "Expecting a 1D `params`."
 
-        num_ngroups = nids.size(0)
-        layer_n_nodes = num_ngroups * self.group_size
+        num_nblocks = nids.size(0)
+        layer_n_nodes = num_nblocks * self.block_size
         num_edges = cids.size(1)
         batch_size = node_mars.size(1)
         BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
 
         # Heuristic to set `TILE_SIZE_M`, `TILE_SIZE_K`, and `BLOCK_B`
-        base_size = min(self.group_size, num_edges, BATCH_SIZE_NP2)
+        base_size = min(self.block_size, num_edges, BATCH_SIZE_NP2)
         if base_size >= 64:
             TILE_SIZE_B = min(2048 // 32, BATCH_SIZE_NP2)
         else:
             remainder = 2048 // (base_size ** 2)
             TILE_SIZE_B = min(2048 // remainder, base_size * remainder, BATCH_SIZE_NP2)
-        TILE_SIZE_M = min(2048 // TILE_SIZE_B, self.group_size)
+        TILE_SIZE_M = min(2048 // TILE_SIZE_B, self.block_size)
         TILE_SIZE_K = min(2048 // TILE_SIZE_B, num_edges)
         B_NUM_TILES = batch_size // TILE_SIZE_B
 
@@ -1852,7 +1852,7 @@ class SumLayer(Layer, nn.Module):
                 B_NUM_TILES = B_NUM_TILES, 
                 TILE_SIZE_K = TILE_SIZE_K, 
                 TILE_SIZE_M = TILE_SIZE_M, 
-                GROUP_SIZE_M = self.group_size,
+                BLOCK_SIZE_M = self.block_size,
                 TL_DOT = TL_DOT
             )
         else:
@@ -1873,7 +1873,7 @@ class SumLayer(Layer, nn.Module):
                 B_NUM_TILES = B_NUM_TILES, 
                 TILE_SIZE_K = TILE_SIZE_K, 
                 TILE_SIZE_M = TILE_SIZE_M, 
-                GROUP_SIZE_M = self.group_size,
+                BLOCK_SIZE_M = self.block_size,
                 TL_DOT = TL_DOT
             )
 
@@ -1882,7 +1882,7 @@ class SumLayer(Layer, nn.Module):
                          element_mars: torch.Tensor, param_flows: torch.Tensor, 
                          nids: Optional[torch.Tensor], cids: Optional[torch.Tensor], pids: Optional[torch.Tensor], pfids: Optional[torch.Tensor],
                          chids: Optional[torch.Tensor], parids: Optional[torch.Tensor], parpids: Optional[torch.Tensor], 
-                         cs_group_size: int, local_ids: Optional[torch.Tensor] = None,
+                         cs_block_size: int, local_ids: Optional[torch.Tensor] = None,
                          partition_id: int = -1, allow_modify_flows: bool = False) -> None:
         """
         Back pass of sum layers with sparse processing kernel.
@@ -1904,7 +1904,7 @@ class SumLayer(Layer, nn.Module):
             self._backward_sparse_ele_flows(
                 node_flows, element_flows, params, node_mars, element_mars,
                 chids = chids, parids = parids, parpids = parpids, 
-                cs_group_size = cs_group_size, local_ids = local_ids,
+                cs_block_size = cs_block_size, local_ids = local_ids,
                 allow_modify_flows = allow_modify_flows
             )
 
@@ -1923,24 +1923,24 @@ class SumLayer(Layer, nn.Module):
     @FastJITFunction
     def _bk_triton_sparse_ele_kernel(node_flows, element_flows, node_mars, element_mars, params, 
                                      chids, parids, parpids, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
-                                     n_edge_groups: tl.constexpr, allow_modify_flows: tl.constexpr, BLOCK_B: tl.constexpr, 
-                                     BLOCK_M: tl.constexpr, GROUP_SIZE_K: tl.constexpr):
+                                     n_edge_blocks: tl.constexpr, allow_modify_flows: tl.constexpr, BLOCK_B: tl.constexpr, 
+                                     BLOCK_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(1) # ID of size-`BLOCK_M` nodes
 
-        # Get inferred node group id from `pid_m`
-        elegroup_id = pid_m
+        # Get inferred node block id from `pid_m`
+        eleblock_id = pid_m
 
-        # Get the real node group id in the case of partial evaluation
+        # Get the real node block id in the case of partial evaluation
         if partial_eval == 1:
-            elegroup_id = tl.load(local_ids + elegroup_id)
+            eleblock_id = tl.load(local_ids + eleblock_id)
 
         # Initialize pointers to `params`
-        offs_edge = tl.arange(0, n_edge_groups * GROUP_SIZE_K) # I.e., [0, num_edges)
-        offs_edge_gid = offs_edge // GROUP_SIZE_K
-        offs_edge_nid = (offs_edge % GROUP_SIZE_K)
-        par_start = tl.load(parpids + elegroup_id * n_edge_groups + offs_edge_gid)
+        offs_edge = tl.arange(0, n_edge_blocks * BLOCK_SIZE_K) # I.e., [0, num_edges)
+        offs_edge_gid = offs_edge // BLOCK_SIZE_K
+        offs_edge_nid = (offs_edge % BLOCK_SIZE_K)
+        par_start = tl.load(parpids + eleblock_id * n_edge_blocks + offs_edge_gid)
         epars_ptr = params + par_start + offs_edge_nid # [num_edges]
 
         # Batch offsets and mask
@@ -1948,7 +1948,7 @@ class SumLayer(Layer, nn.Module):
         mask_batch = offs_batch < batch_size
 
         # Initialize `node_flows` and `node_mars`
-        edge_start = tl.load(parids + elegroup_id * n_edge_groups + offs_edge_gid)
+        edge_start = tl.load(parids + eleblock_id * n_edge_blocks + offs_edge_gid)
         nmars_ptr = node_mars + \
             (edge_start + offs_edge_nid)[:,None] * batch_size + \
             offs_batch[None,:]
@@ -1962,7 +1962,7 @@ class SumLayer(Layer, nn.Module):
             nflows = tl.load(nflows_ptr, mask = mask_batch[None,:]) # [num_edges, BLOCK_B]
 
         # Initialize pointers to `element_flows` and `element_mars`
-        off_eleids = tl.load(chids + elegroup_id)
+        off_eleids = tl.load(chids + eleblock_id)
         eflows_ptr = element_flows + off_eleids * batch_size + offs_batch # [BLOCK_B]
         emars_ptr = element_mars + off_eleids * batch_size + offs_batch # [BLOCK_B]
 
@@ -1979,7 +1979,7 @@ class SumLayer(Layer, nn.Module):
             tl.store(eflows_ptr, eflows, mask = mask_batch)
 
             # Increment `epars_ptr`
-            epars_ptr += GROUP_SIZE_K
+            epars_ptr += BLOCK_SIZE_K
 
             # Increment `emars_ptr` and `eflows_ptr`
             emars_ptr += batch_size
@@ -1991,8 +1991,8 @@ class SumLayer(Layer, nn.Module):
     def _bk_triton_large_sparse_ele_kernel(node_flows, element_flows, node_mars, element_mars, params, 
                                            chids, parids, parpids, local_ids, num_eles, pid_m_offset, 
                                            batch_size: tl.constexpr, partial_eval: tl.constexpr,
-                                           n_edge_groups: tl.constexpr, allow_modify_flows: tl.constexpr, BLOCK_B: tl.constexpr, 
-                                           TILE_SIZE_M: tl.constexpr, GROUP_SIZE_M: tl.constexpr, GROUP_SIZE_K: tl.constexpr):
+                                           n_edge_blocks: tl.constexpr, allow_modify_flows: tl.constexpr, BLOCK_B: tl.constexpr, 
+                                           TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(1) + pid_m_offset # ID of size-`TILE_SIZE_M` nodes
@@ -2000,19 +2000,19 @@ class SumLayer(Layer, nn.Module):
         offs_m = tl.arange(0, TILE_SIZE_M) + pid_m * TILE_SIZE_M
         mask_m = offs_m < num_eles
 
-        # Get inferred node group id from `pid_m`
-        elegroup_ids = offs_m // GROUP_SIZE_M
-        tile_ids = offs_m % GROUP_SIZE_M
+        # Get inferred node block id from `pid_m`
+        eleblock_ids = offs_m // BLOCK_SIZE_M
+        tile_ids = offs_m % BLOCK_SIZE_M
 
-        # Get the real node group id in the case of partial evaluation
+        # Get the real node block id in the case of partial evaluation
         if partial_eval == 1:
-            elegroup_ids = tl.load(local_ids + elegroup_ids)
+            eleblock_ids = tl.load(local_ids + eleblock_ids)
 
         # Initialize pointers to `params`
-        offs_edge = tl.arange(0, n_edge_groups * GROUP_SIZE_K) # I.e., [0, num_edges)
-        offs_edge_gid = offs_edge // GROUP_SIZE_K
-        offs_edge_nid = (offs_edge % GROUP_SIZE_K)
-        par_start = tl.load(parpids + elegroup_ids[:,None] * n_edge_groups + offs_edge_gid[None,:])
+        offs_edge = tl.arange(0, n_edge_blocks * BLOCK_SIZE_K) # I.e., [0, num_edges)
+        offs_edge_gid = offs_edge // BLOCK_SIZE_K
+        offs_edge_nid = (offs_edge % BLOCK_SIZE_K)
+        par_start = tl.load(parpids + eleblock_ids[:,None] * n_edge_blocks + offs_edge_gid[None,:])
         epars = tl.load(params + par_start + offs_edge_nid[None,:], mask = mask_m[:,None]) # [TILE_SIZE_M, num_edges]
 
         # Batch offsets and mask
@@ -2020,7 +2020,7 @@ class SumLayer(Layer, nn.Module):
         mask_batch = offs_batch < batch_size
 
         # Initialize `node_flows` and `node_mars`
-        edge_start = tl.load(parids + elegroup_ids[:,None] * n_edge_groups + offs_edge_gid[None,:]) # [TILE_SIZE_M, num_edges]
+        edge_start = tl.load(parids + eleblock_ids[:,None] * n_edge_blocks + offs_edge_gid[None,:]) # [TILE_SIZE_M, num_edges]
         nmars_ptr = node_mars + \
             (edge_start + offs_edge_nid[None,:])[:,:,None] * batch_size + \
             offs_batch[None,None,:]
@@ -2034,7 +2034,7 @@ class SumLayer(Layer, nn.Module):
             nflows = tl.load(nflows_ptr, mask = (mask_m[:,None,None] & mask_batch[None,None,:])) # [TILE_SIZE_M, num_edges, BLOCK_B]
 
         # Initialize pointers to `element_flows` and values `emars`
-        off_eleids = tl.load(chids + elegroup_ids) # TILE_SIZE_M
+        off_eleids = tl.load(chids + eleblock_ids) # TILE_SIZE_M
         eflows_ptr = element_flows + off_eleids[:,None] * batch_size + offs_batch[None,:] # [TILE_SIZE_M, BLOCK_B]
         emars = tl.load(element_mars + off_eleids[:,None] * batch_size + offs_batch[None,:], 
                         mask = (mask_m[:,None] & mask_batch[None,:])) # [TILE_SIZE_M, BLOCK_B]
@@ -2050,24 +2050,24 @@ class SumLayer(Layer, nn.Module):
     def _backward_sparse_ele_flows(self, node_flows: torch.Tensor, element_flows: torch.Tensor,
                                    params: torch.Tensor, node_mars: torch.Tensor,
                                    element_mars: torch.Tensor, chids: torch.Tensor, parids: torch.Tensor,
-                                   parpids: torch.Tensor, cs_group_size: int, local_ids: Optional[torch.Tensor] = None,
+                                   parpids: torch.Tensor, cs_block_size: int, local_ids: Optional[torch.Tensor] = None,
                                    allow_modify_flows: bool = False) -> None:
 
         assert params.dim() == 1, "Expecting a 1D `params`."
 
-        num_ngroups = chids.size(0) if local_ids is None else local_ids.size(0)
-        layer_n_nodes = num_ngroups * cs_group_size
-        n_edge_groups = parids.size(1)
-        num_edges = n_edge_groups * self.group_size
+        num_nblocks = chids.size(0) if local_ids is None else local_ids.size(0)
+        layer_n_nodes = num_nblocks * cs_block_size
+        n_edge_blocks = parids.size(1)
+        num_edges = n_edge_blocks * self.block_size
         batch_size = node_flows.size(1)
         BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
 
         assert num_edges <= 16384, "The sparse backward kernel only support nodes with # edges smaller than 16384."
 
-        if triton.cdiv(layer_n_nodes, cs_group_size) <= 32768:
+        if triton.cdiv(layer_n_nodes, cs_block_size) <= 32768:
 
             BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
-            BLOCK_M = cs_group_size
+            BLOCK_M = cs_block_size
 
             allow_modify_flows = 1 if allow_modify_flows else 0
 
@@ -2085,11 +2085,11 @@ class SumLayer(Layer, nn.Module):
                 local_ids = local_ids,
                 batch_size = batch_size,
                 partial_eval = 1 if local_ids is not None else 0,
-                n_edge_groups = n_edge_groups,
+                n_edge_blocks = n_edge_blocks,
                 allow_modify_flows = allow_modify_flows,
                 BLOCK_B = BLOCK_B,
                 BLOCK_M = BLOCK_M,
-                GROUP_SIZE_K = self.group_size
+                BLOCK_SIZE_K = self.block_size
             )
 
         else:
@@ -2116,12 +2116,12 @@ class SumLayer(Layer, nn.Module):
                     pid_m_offset = 0,
                     batch_size = batch_size,
                     partial_eval = 1 if local_ids is not None else 0,
-                    n_edge_groups = n_edge_groups,
+                    n_edge_blocks = n_edge_blocks,
                     allow_modify_flows = allow_modify_flows,
                     BLOCK_B = BLOCK_B,
                     TILE_SIZE_M = TILE_SIZE_M,
-                    GROUP_SIZE_M = cs_group_size,
-                    GROUP_SIZE_K = self.group_size
+                    BLOCK_SIZE_M = cs_block_size,
+                    BLOCK_SIZE_K = self.block_size
                 )
 
             else:
@@ -2144,12 +2144,12 @@ class SumLayer(Layer, nn.Module):
                         pid_m_offset = pid_m_start,
                         batch_size = batch_size,
                         partial_eval = 1 if local_ids is not None else 0,
-                        n_edge_groups = n_edge_groups,
+                        n_edge_blocks = n_edge_blocks,
                         allow_modify_flows = allow_modify_flows,
                         BLOCK_B = BLOCK_B,
                         TILE_SIZE_M = TILE_SIZE_M,
-                        GROUP_SIZE_M = cs_group_size,
-                        GROUP_SIZE_K = self.group_size
+                        BLOCK_SIZE_M = cs_block_size,
+                        BLOCK_SIZE_K = self.block_size
                     )
 
         return None
@@ -2166,8 +2166,8 @@ class SumLayer(Layer, nn.Module):
         pid_e = tl.program_id(1) # ID of size-`BLOCK_K` edges
         pid_m = tl.program_id(2) + pid_m_offset # ID of size-`BLOCK_M` nodes
 
-        # Get inferred node group id from `pid_m`
-        ngroup_id = pid_m // BLOCK_M
+        # Get inferred node block id from `pid_m`
+        nblock_id = pid_m // BLOCK_M
         tile_id = pid_m % BLOCK_M
 
         # Batch offsets and mask
@@ -2176,13 +2176,13 @@ class SumLayer(Layer, nn.Module):
 
         # Initialize pointers to `element_mars`
         offs_edge = tl.arange(0, BLOCK_K) + pid_e * BLOCK_K
-        edge_start = tl.load(cids + ngroup_id * num_edges + offs_edge)
+        edge_start = tl.load(cids + nblock_id * num_edges + offs_edge)
         emars_ptr = element_mars + \
             edge_start[:,None] * batch_size + \
             offs_batch[None,:] # [BLOCK_K, BLOCK_B]
 
         # Initialize pointers to `node_flows` and `node_mars`
-        off_nids = tl.load(nids + ngroup_id)
+        off_nids = tl.load(nids + nblock_id)
         nmars_ptr = node_mars + (off_nids + tile_id) * batch_size + offs_batch # [BLOCK_B]
         nflows_ptr = node_flows + (off_nids + tile_id) * batch_size + offs_batch # [BLOCK_B]
 
@@ -2211,11 +2211,11 @@ class SumLayer(Layer, nn.Module):
             nmars_ptr += BLOCK_B
             nflows_ptr += BLOCK_B
 
-        par_start = tl.load(pids + ngroup_id * num_edges + offs_edge)
+        par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
         epars_ptr = params + par_start + tile_id
         epars = tl.load(epars_ptr) # [BLOCK_K]
 
-        parflow_start = tl.load(pfids + ngroup_id * num_edges + offs_edge)
+        parflow_start = tl.load(pfids + nblock_id * num_edges + offs_edge)
         eparflows_ptr = param_flows + parflow_start + tile_id
         
         curr_pflows = acc * epars
@@ -2228,7 +2228,7 @@ class SumLayer(Layer, nn.Module):
     def _bk_triton_large_sparse_par_kernel(node_flows, node_mars, element_mars, params, param_flows, nids, cids, pids, pfids,
                                            num_nodes, num_edges: tl.constexpr, batch_size: tl.constexpr, allow_modify_flows: tl.constexpr, 
                                            TILE_SIZE_M: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_B: tl.constexpr, 
-                                           TILE_SIZE_B: tl.constexpr, B_NUM_BLOCKS: tl.constexpr, GROUP_SIZE_M: tl.constexpr):
+                                           TILE_SIZE_B: tl.constexpr, B_NUM_BLOCKS: tl.constexpr, BLOCK_SIZE_M: tl.constexpr):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` samples
         pid_e = tl.program_id(1) # ID of size-`BLOCK_K` edges
@@ -2237,9 +2237,9 @@ class SumLayer(Layer, nn.Module):
         offs_m = tl.arange(0, TILE_SIZE_M) + pid_m * TILE_SIZE_M
         mask_m = offs_m < num_nodes
 
-        # Get inferred node group id from `pid_m`
-        ngroup_ids = offs_m // GROUP_SIZE_M
-        tile_ids = offs_m % GROUP_SIZE_M
+        # Get inferred node block id from `pid_m`
+        nblock_ids = offs_m // BLOCK_SIZE_M
+        tile_ids = offs_m % BLOCK_SIZE_M
 
         # Batch offsets and mask
         offs_batch = tl.arange(0, BLOCK_B) + pid_b * TILE_SIZE_B
@@ -2247,13 +2247,13 @@ class SumLayer(Layer, nn.Module):
 
         # Initialize pointers to `element_mars`
         offs_edge = tl.arange(0, BLOCK_K) + pid_e * BLOCK_K
-        edge_start = tl.load(cids + ngroup_ids[:,None] * num_edges + offs_edge[None,:], mask = mask_m[:,None])
+        edge_start = tl.load(cids + nblock_ids[:,None] * num_edges + offs_edge[None,:], mask = mask_m[:,None])
         emars_ptr = element_mars + \
             edge_start[:,:,None] * batch_size + \
             offs_batch[None,None,:] # [TILE_SIZE_M, BLOCK_K, BLOCK_B]
 
         # Initialize pointers to `node_flows` and `node_mars`
-        off_nids = tl.load(nids + ngroup_ids, mask = mask_m)
+        off_nids = tl.load(nids + nblock_ids, mask = mask_m)
         nmars_ptr = node_mars + (off_nids + tile_ids)[:,None] * batch_size + offs_batch[None,:] # [TILE_SIZE_M, BLOCK_B]
         nflows_ptr = node_flows + (off_nids + tile_ids)[:,None] * batch_size + offs_batch[None,:] # [TILE_SIZE_M, BLOCK_B]
 
@@ -2282,11 +2282,11 @@ class SumLayer(Layer, nn.Module):
             nmars_ptr += BLOCK_B
             nflows_ptr += BLOCK_B
 
-        par_start = tl.load(pids + ngroup_ids[:,None] * num_edges + offs_edge[None,:])
+        par_start = tl.load(pids + nblock_ids[:,None] * num_edges + offs_edge[None,:])
         epars_ptr = params + par_start + tile_ids[:,None]
         epars = tl.load(epars_ptr, mask = mask_m[:,None]) # [TILE_SIZE_M, BLOCK_K]
 
-        parflow_start = tl.load(pfids + ngroup_ids[:,None] * num_edges + offs_edge[None,:])
+        parflow_start = tl.load(pfids + nblock_ids[:,None] * num_edges + offs_edge[None,:])
         eparflows_ptr = param_flows + parflow_start + tile_ids[:,None]
         
         curr_pflows = acc * epars
@@ -2314,8 +2314,8 @@ class SumLayer(Layer, nn.Module):
 
         assert params.dim() == 1, "Expecting a 1D `params`."
 
-        num_ngroups = nids.size(0)
-        layer_n_nodes = num_ngroups * self.group_size
+        num_nblocks = nids.size(0)
+        layer_n_nodes = num_nblocks * self.block_size
         num_edges = cids.size(1)
         batch_size = node_mars.size(1)
         BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
@@ -2326,11 +2326,11 @@ class SumLayer(Layer, nn.Module):
         if num_edges <= 1024:
             BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
             BLOCK_K = num_edges
-            BLOCK_M = max(min(2048 // num_edges, self.group_size), 1)
+            BLOCK_M = max(min(2048 // num_edges, self.block_size), 1)
         else:
             BLOCK_B = min(512, BATCH_SIZE_NP2)
             BLOCK_K = min(2048 // BLOCK_B, num_edges)
-            BLOCK_M = max(min(2048 // num_edges, self.group_size), 1)
+            BLOCK_M = max(min(2048 // num_edges, self.block_size), 1)
         B_NUM_BLOCKS = triton.cdiv(batch_size, BLOCK_B)
         K_NUM_BLOCKS = triton.cdiv(num_edges, BLOCK_K)
 
@@ -2448,7 +2448,7 @@ class SumLayer(Layer, nn.Module):
         #         BLOCK_B = BLOCK_B,
         #         TILE_SIZE_B = TILE_SIZE_B,
         #         B_NUM_BLOCKS = B_NUM_BLOCKS,
-        #         GROUP_SIZE_M = self.group_size
+        #         BLOCK_SIZE_M = self.block_size
         #     )
         #     print(">>>G", grid, "out")
 
@@ -2456,7 +2456,7 @@ class SumLayer(Layer, nn.Module):
 
     def _backward_pytorch(self, node_flows, element_flows, params, node_mars, 
                           element_mars, param_flows, nids, cids, pids, pfids, 
-                          chids, parids, parpids, cs_group_size):
+                          chids, parids, parpids, cs_block_size):
         """
         Back pass of sum layers with native pytorch.
         
@@ -2476,14 +2476,14 @@ class SumLayer(Layer, nn.Module):
         if chids is not None:
             self._backward_pytorch_ele_kernel(
                 node_flows, element_flows, params, node_mars, element_mars, 
-                param_flows, chids, parids, parpids, cs_group_size
+                param_flows, chids, parids, parpids, cs_block_size
             )
 
         # Flows w.r.t. parameters
         if param_flows is not None and nids is not None:
             self._backward_pytorch_par_kernel(
                 node_flows, params, node_mars, element_mars, param_flows, 
-                nids, cids, pids, pfids, self.group_size
+                nids, cids, pids, pfids, self.block_size
             )
 
     @torch.compile(mode = "reduce-overhead")
@@ -2491,18 +2491,18 @@ class SumLayer(Layer, nn.Module):
                                      params: torch.Tensor, node_mars: torch.Tensor, 
                                      element_mars: torch.Tensor, param_flows: Optional[torch.Tensor], 
                                      chids: torch.Tensor, parids: torch.Tensor, parpids: torch.Tensor,
-                                     cs_group_size: int):
+                                     cs_block_size: int):
 
-        num_ngroups = chids.size(0)
-        num_egroups = parids.size(1)
-        parids = (parids[:,:,None].repeat(1, 1, self.group_size) + torch.arange(0, self.group_size, device = parids.device)).reshape(num_ngroups, num_egroups * self.group_size)
-        parpids = (parpids[:,:,None] + torch.arange(0, self.group_size, device = parids.device)).reshape(
-            num_ngroups, num_egroups * self.group_size)
+        num_nblocks = chids.size(0)
+        num_eblocks = parids.size(1)
+        parids = (parids[:,:,None].repeat(1, 1, self.block_size) + torch.arange(0, self.block_size, device = parids.device)).reshape(num_nblocks, num_eblocks * self.block_size)
+        parpids = (parpids[:,:,None] + torch.arange(0, self.block_size, device = parids.device)).reshape(
+            num_nblocks, num_eblocks * self.block_size)
 
-        chids = (chids[:,None].repeat(1, cs_group_size) + torch.arange(0, cs_group_size, device = chids.device)).reshape(num_ngroups * cs_group_size)
-        parids = parids[:,None,:].repeat(1, cs_group_size, 1).reshape(num_ngroups * cs_group_size, num_egroups * self.group_size)
-        parpids = (parpids[:,None,:].repeat(1, cs_group_size, 1) + torch.arange(0, cs_group_size * self.group_size, self.group_size, device = parpids.device)[None,:,None]).reshape(
-            num_ngroups * cs_group_size, num_egroups * self.group_size
+        chids = (chids[:,None].repeat(1, cs_block_size) + torch.arange(0, cs_block_size, device = chids.device)).reshape(num_nblocks * cs_block_size)
+        parids = parids[:,None,:].repeat(1, cs_block_size, 1).reshape(num_nblocks * cs_block_size, num_eblocks * self.block_size)
+        parpids = (parpids[:,None,:].repeat(1, cs_block_size, 1) + torch.arange(0, cs_block_size * self.block_size, self.block_size, device = parpids.device)[None,:,None]).reshape(
+            num_nblocks * cs_block_size, num_eblocks * self.block_size
         )
         
         element_flows[chids] = (node_flows[parids] * params[parpids].unsqueeze(-1) * \
@@ -2513,22 +2513,22 @@ class SumLayer(Layer, nn.Module):
     @torch.compile(mode = "reduce-overhead")
     def _backward_pytorch_par_kernel(self, node_flows: torch.Tensor, params: torch.Tensor, node_mars: torch.Tensor, 
                                      element_mars: torch.Tensor, param_flows: torch.Tensor, nids: torch.Tensor, 
-                                     cids: torch.Tensor, pids: torch.Tensor, pfids: torch.Tensor, ns_group_size: int):
+                                     cids: torch.Tensor, pids: torch.Tensor, pfids: torch.Tensor, ns_block_size: int):
 
-        num_ngroups = nids.size(0)
+        num_nblocks = nids.size(0)
         num_edges = cids.size(1)
-        nids = (nids[:,None].repeat(1, self.group_size) + \
-            torch.arange(0, self.group_size, device = nids.device)[None,:]).reshape(num_ngroups * self.group_size)
-        cids = cids[:,None,:].repeat(1, self.group_size, 1).reshape(num_ngroups * self.group_size, num_edges)
-        pids = (pids[:,None,:].repeat(1, self.group_size, 1) + \
-            torch.arange(0, self.group_size, device = cids.device)[None,:,None]).reshape(num_ngroups * self.group_size, num_edges)
-        pfids = (pfids[:,None,:].repeat(1, self.group_size, 1) + \
-            torch.arange(0, self.group_size, device = cids.device)[None,:,None]).reshape(num_ngroups * self.group_size, num_edges)
+        nids = (nids[:,None].repeat(1, self.block_size) + \
+            torch.arange(0, self.block_size, device = nids.device)[None,:]).reshape(num_nblocks * self.block_size)
+        cids = cids[:,None,:].repeat(1, self.block_size, 1).reshape(num_nblocks * self.block_size, num_edges)
+        pids = (pids[:,None,:].repeat(1, self.block_size, 1) + \
+            torch.arange(0, self.block_size, device = cids.device)[None,:,None]).reshape(num_nblocks * self.block_size, num_edges)
+        pfids = (pfids[:,None,:].repeat(1, self.block_size, 1) + \
+            torch.arange(0, self.block_size, device = cids.device)[None,:,None]).reshape(num_nblocks * self.block_size, num_edges)
 
         parflows = (node_flows[nids].unsqueeze(1) * params[pids].unsqueeze(-1) * (element_mars[cids] - node_mars[nids].unsqueeze(1)).exp()).sum(dim = 2)
 
-        for i in range(num_ngroups):
-            sid, eid = ns_group_size * i, ns_group_size * (i + 1)
+        for i in range(num_nblocks):
+            sid, eid = ns_block_size * i, ns_block_size * (i + 1)
             param_flows[pfids[sid:eid,:]] += parflows[sid:eid,:]
 
         return None

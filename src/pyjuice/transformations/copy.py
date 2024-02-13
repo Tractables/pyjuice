@@ -29,10 +29,10 @@ def deepcopy(root_nodes: CircuitNodes, tie_params: bool = False,
         if ns.is_sum():
             if not tie_params:
                 new_ns = SumNodes(
-                    ns.num_node_groups,
+                    ns.num_node_blocks,
                     new_chs,
                     ns.edge_ids.clone(),
-                    group_size = ns.group_size
+                    block_size = ns.block_size
                 )
                 params = ns.get_params()
                 if params is not None:
@@ -42,10 +42,10 @@ def deepcopy(root_nodes: CircuitNodes, tie_params: bool = False,
             
         elif ns.is_prod():
             new_ns = ProdNodes(
-                ns.num_node_groups,
+                ns.num_node_blocks,
                 new_chs,
                 ns.edge_ids.clone(),
-                group_size = ns.group_size
+                block_size = ns.block_size
             )
             
         else:
@@ -63,10 +63,10 @@ def deepcopy(root_nodes: CircuitNodes, tie_params: bool = False,
 
             if not tie_params:
                 new_ns = InputNodes(
-                    num_node_groups = ns.num_node_groups,
+                    num_node_blocks = ns.num_node_blocks,
                     scope = pydeepcopy(scope),
                     dist = pydeepcopy(ns.dist),
-                    group_size = ns.group_size
+                    block_size = ns.block_size
                 )
                 params = ns.get_params()
                 if params is not None:

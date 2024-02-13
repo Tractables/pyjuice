@@ -12,7 +12,7 @@ import pyjuice.visualize
 from pyjuice.model import TensorCircuit
 
 # Construction methods
-from pyjuice.nodes import multiply, summate, inputs, set_group_size
+from pyjuice.nodes import multiply, summate, inputs, set_block_size
 
 # Distributions
 from pyjuice.nodes import distributions
@@ -21,7 +21,7 @@ from pyjuice.nodes import distributions
 from pyjuice.nodes.methods.lvd import LVDistiller
 
 # Commonly-used transformations
-from pyjuice.transformations import merge, group, ungroup, deepcopy
+from pyjuice.transformations import merge, blockify, unblockify, deepcopy
 
 # IO
 from pyjuice.io import load, save

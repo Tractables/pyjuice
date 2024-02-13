@@ -17,15 +17,15 @@ def input_layer_test():
 
     device = torch.device("cuda:0")
 
-    group_size = 4
+    block_size = 4
     batch_size = 16
     
-    with juice.set_group_size(group_size):
+    with juice.set_block_size(block_size):
 
-        ni0 = inputs(0, num_node_groups = 2, dist = dists.Categorical(num_cats = 2))
-        ni1 = inputs(1, num_node_groups = 2, dist = dists.Categorical(num_cats = 2))
-        ni2 = inputs(2, num_node_groups = 2, dist = dists.Categorical(num_cats = 2))
-        ni3 = inputs(3, num_node_groups = 2, dist = dists.Categorical(num_cats = 2))
+        ni0 = inputs(0, num_node_blocks = 2, dist = dists.Categorical(num_cats = 2))
+        ni1 = inputs(1, num_node_blocks = 2, dist = dists.Categorical(num_cats = 2))
+        ni2 = inputs(2, num_node_blocks = 2, dist = dists.Categorical(num_cats = 2))
+        ni3 = inputs(3, num_node_blocks = 2, dist = dists.Categorical(num_cats = 2))
 
     layer = InputLayer([ni0, ni1, ni2, ni3], cum_nodes = 1, pc_num_vars = 4)
 
@@ -48,8 +48,8 @@ def input_layer_test():
     layer(data, node_mars)
 
     for i in range(16):
-        for j in range(4 * 2 * group_size):
-            assert torch.abs(node_mars[j+1,i].exp() - layer.params[j*2+data[j//(2*group_size),i]]) < 1e-4
+        for j in range(4 * 2 * block_size):
+            assert torch.abs(node_mars[j+1,i].exp() - layer.params[j*2+data[j//(2*block_size),i]]) < 1e-4
 
     ## Forward with mask tests ##
 
@@ -58,8 +58,8 @@ def input_layer_test():
     layer(data, node_mars, missing_mask = missing_mask)
 
     for i in range(16):
-        for j in range(4 * 2 * group_size):
-            v = j//(2*group_size)
+        for j in range(4 * 2 * block_size):
+            v = j//(2*block_size)
             if v == 0 or v == 2:
                 assert torch.abs(node_mars[j+1,i].exp() - layer.params[j*2+data[v,i]]) < 1e-4
             else:
@@ -70,8 +70,8 @@ def input_layer_test():
     layer(data, node_mars, missing_mask = missing_mask)
 
     for i in range(16):
-        for j in range(4 * 2 * group_size):
-            v = j // (2*group_size)
+        for j in range(4 * 2 * block_size):
+            v = j // (2*block_size)
             if not missing_mask[i,v]:
                 assert torch.abs(node_mars[j+1,i].exp() - layer.params[j*2+data[v,i]]) < 1e-4
             else:
@@ -86,13 +86,13 @@ def input_layer_test():
     layer(data, node_mars)
     layer.backward(data, node_flows, node_mars)
 
-    param_flows = torch.zeros([group_size * 2 * 4 * 2]).to(device)
+    param_flows = torch.zeros([block_size * 2 * 4 * 2]).to(device)
 
     for i in range(16):
-        for j in range(4 * 2 * group_size):
-            v = j // (2*group_size)
+        for j in range(4 * 2 * block_size):
+            v = j // (2*block_size)
 
-            param_flows[j*2+data[j//(2*group_size),i]] += node_flows[j+1,i]
+            param_flows[j*2+data[j//(2*block_size),i]] += node_flows[j+1,i]
 
     assert torch.all(torch.abs(layer.param_flows - param_flows) < 1e-4)
 
@@ -115,17 +115,17 @@ def tied_bp_test():
 
     device = torch.device("cuda:0")
 
-    group_size = 4
+    block_size = 4
     batch_size = 16
     
-    with juice.set_group_size(group_size):
+    with juice.set_block_size(block_size):
 
-        ni0 = inputs(0, num_node_groups = 2, dist = dists.Categorical(num_cats = 2))
-        ni1 = inputs(1, num_node_groups = 2, dist = dists.Categorical(num_cats = 2))
-        ni2 = inputs(2, num_node_groups = 2, dist = dists.Categorical(num_cats = 2))
+        ni0 = inputs(0, num_node_blocks = 2, dist = dists.Categorical(num_cats = 2))
+        ni1 = inputs(1, num_node_blocks = 2, dist = dists.Categorical(num_cats = 2))
+        ni2 = inputs(2, num_node_blocks = 2, dist = dists.Categorical(num_cats = 2))
         ni3 = ni1.duplicate(3, tie_params = True)
 
-    layer = InputLayer([ni0, ni1, ni2, ni3], cum_nodes = 1, pc_num_vars = 3, max_tied_ns_per_parflow_group = 1.0)
+    layer = InputLayer([ni0, ni1, ni2, ni3], cum_nodes = 1, pc_num_vars = 3, max_tied_ns_per_parflow_block = 1.0)
 
     layer._init_parameters(perturbation = 2.0)
 
@@ -170,17 +170,17 @@ def speed_test():
 
     device = torch.device("cuda:0")
 
-    group_size = 4
+    block_size = 4
     num_vars = 28*28
-    num_node_groups = 256 // group_size
+    num_node_blocks = 256 // block_size
 
     batch_size = 512
     
-    with juice.set_group_size(group_size):
+    with juice.set_block_size(block_size):
 
         nis = []
         for v in range(num_vars):
-            nis.append(inputs(v, num_node_groups = num_node_groups, dist = dists.Categorical(num_cats = 64)))
+            nis.append(inputs(v, num_node_blocks = num_node_blocks, dist = dists.Categorical(num_cats = 64)))
 
     layer = InputLayer(nis, cum_nodes = 1, pc_num_vars = num_vars)
 
@@ -189,7 +189,7 @@ def speed_test():
     layer.to(device)
 
     data = torch.randint(0, 64, (num_vars, batch_size)).to(device)
-    node_mars = torch.zeros([1 + group_size * num_node_groups * num_vars, batch_size]).to(device)
+    node_mars = torch.zeros([1 + block_size * num_node_blocks * num_vars, batch_size]).to(device)
 
     ## Forward tests ##
 
@@ -243,7 +243,7 @@ def speed_test():
 
     ## Backward tests ##
 
-    node_flows = torch.rand([1 + group_size * num_node_groups * num_vars, batch_size]).to(device)
+    node_flows = torch.rand([1 + block_size * num_node_blocks * num_vars, batch_size]).to(device)
 
     layer.init_param_flows(flows_memory = 0.0)
 

@@ -12,19 +12,19 @@ import pytest
 
 
 def io_test():
-    num_node_groups = 2
-    group_size = 4
+    num_node_blocks = 2
+    block_size = 4
 
-    with juice.set_group_size(group_size):
-        i00 = inputs(0, num_node_groups, dists.Categorical(num_cats = 5))
-        i01 = inputs(0, num_node_groups, dists.Categorical(num_cats = 5))
-        i10 = inputs(1, num_node_groups, dists.Categorical(num_cats = 5))
-        i11 = inputs(1, num_node_groups, dists.Categorical(num_cats = 5))
+    with juice.set_block_size(block_size):
+        i00 = inputs(0, num_node_blocks, dists.Categorical(num_cats = 5))
+        i01 = inputs(0, num_node_blocks, dists.Categorical(num_cats = 5))
+        i10 = inputs(1, num_node_blocks, dists.Categorical(num_cats = 5))
+        i11 = inputs(1, num_node_blocks, dists.Categorical(num_cats = 5))
         
         m00 = multiply(i00, i10)
         m01 = multiply(i01, i11)
 
-        n0 = summate(m00, m01, num_node_groups = num_node_groups)
+        n0 = summate(m00, m01, num_node_blocks = num_node_blocks)
 
     temp_file = tempfile.NamedTemporaryFile(suffix='.jpc')
     temp_file_name = temp_file.name
@@ -47,19 +47,19 @@ def io_test():
 
 
 def io_param_test():
-    num_node_groups = 2
-    group_size = 4
+    num_node_blocks = 2
+    block_size = 4
 
-    with juice.set_group_size(group_size):
-        i00 = inputs(0, num_node_groups, dists.Categorical(num_cats = 5))
-        i01 = inputs(0, num_node_groups, dists.Categorical(num_cats = 5))
-        i10 = inputs(1, num_node_groups, dists.Categorical(num_cats = 5))
-        i11 = inputs(1, num_node_groups, dists.Categorical(num_cats = 5))
+    with juice.set_block_size(block_size):
+        i00 = inputs(0, num_node_blocks, dists.Categorical(num_cats = 5))
+        i01 = inputs(0, num_node_blocks, dists.Categorical(num_cats = 5))
+        i10 = inputs(1, num_node_blocks, dists.Categorical(num_cats = 5))
+        i11 = inputs(1, num_node_blocks, dists.Categorical(num_cats = 5))
         
         m00 = multiply(i00, i10)
         m01 = multiply(i01, i11)
 
-        n0 = summate(m00, m01, num_node_groups = num_node_groups)
+        n0 = summate(m00, m01, num_node_blocks = num_node_blocks)
 
     n0.init_parameters()
 

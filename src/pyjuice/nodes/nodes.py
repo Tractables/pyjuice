@@ -71,19 +71,19 @@ class CircuitNodes():
     # add anything here.
     INIT_CALLBACKS = []
 
-    # Default `group_size`. Used by the context managers.
-    DEFAULT_GROUP_SIZE = 1
+    # Default `block_size`. Used by the context managers.
+    DEFAULT_BLOCK_SIZE = 1
 
-    def __init__(self, num_node_groups: int, region_node: RegionGraph, group_size: int = 0, source_node: Optional[CircuitNodes] = None, **kwargs):
+    def __init__(self, num_node_blocks: int, region_node: RegionGraph, block_size: int = 0, source_node: Optional[CircuitNodes] = None, **kwargs):
 
-        if group_size == 0:
-            group_size = self.DEFAULT_GROUP_SIZE
+        if block_size == 0:
+            block_size = self.DEFAULT_BLOCK_SIZE
 
-        assert num_node_groups > 0
-        assert group_size > 0 and (group_size & (group_size - 1)) == 0, f"`group_size` must be a power of 2, but got `group_size={group_size}`."
+        assert num_node_blocks > 0
+        assert block_size > 0 and (block_size & (block_size - 1)) == 0, f"`block_size` must be a power of 2, but got `block_size={block_size}`."
         
-        self.num_node_groups = num_node_groups
-        self.group_size = group_size
+        self.num_node_blocks = num_node_blocks
+        self.block_size = block_size
         self.region_node = region_node
 
         self.chs = []
@@ -98,7 +98,7 @@ class CircuitNodes():
                 source_node = source_node._source_node
         self._source_node = source_node
 
-        self._tied_param_group_ids = None
+        self._tied_param_block_ids = None
 
         self._reverse_iter = False
 
@@ -125,7 +125,7 @@ class CircuitNodes():
 
     @property
     def num_nodes(self):
-        return self.num_node_groups * self.group_size
+        return self.num_node_blocks * self.block_size
 
     @property
     def num_edges(self):
@@ -170,8 +170,8 @@ class CircuitNodes():
         assert type(source_ns) == type(self), f"Node type of the source ns ({type(source_ns)}) does not match that of self ({type(self)})."
         assert len(source_ns.chs) == len(self.chs), "Number of children does not match."
         assert not hasattr(self, "_params") or self._params is None, "The current node should not have parameters to avoid confusion."
-        assert source_ns.num_node_groups == self.num_node_groups, "`num_node_groups` does not match."
-        assert source_ns.group_size == self.group_size,  "`group_size` does not match."
+        assert source_ns.num_node_blocks == self.num_node_blocks, "`num_node_blocks` does not match."
+        assert source_ns.block_size == self.block_size,  "`block_size` does not match."
 
         self._source_node = source_ns
 

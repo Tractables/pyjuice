@@ -16,15 +16,15 @@ import pytest
 
 def prod_layer_compilation_test():
     
-    for group_size in [1, 8, 16]:
+    for block_size in [1, 8, 16]:
     
-        with juice.set_group_size(group_size):
+        with juice.set_block_size(block_size):
 
-            ni0 = inputs(0, num_node_groups = 3, dist = dists.Categorical(num_cats = 2))
-            ni1 = inputs(1, num_node_groups = 7, dist = dists.Categorical(num_cats = 2))
-            ni2 = inputs(2, num_node_groups = 6, dist = dists.Categorical(num_cats = 2))
-            ni3 = inputs(3, num_node_groups = 12, dist = dists.Categorical(num_cats = 2))
-            ni4 = inputs(4, num_node_groups = 4, dist = dists.Categorical(num_cats = 2))
+            ni0 = inputs(0, num_node_blocks = 3, dist = dists.Categorical(num_cats = 2))
+            ni1 = inputs(1, num_node_blocks = 7, dist = dists.Categorical(num_cats = 2))
+            ni2 = inputs(2, num_node_blocks = 6, dist = dists.Categorical(num_cats = 2))
+            ni3 = inputs(3, num_node_blocks = 12, dist = dists.Categorical(num_cats = 2))
+            ni4 = inputs(4, num_node_blocks = 4, dist = dists.Categorical(num_cats = 2))
 
             np0 = multiply(ni0, ni1, edge_ids = torch.tensor([[0, 1, 2, 2, 1, 0, 1], [0, 1, 2, 3, 4, 5, 6]]).permute(1, 0))
             np1 = multiply(ni2, ni3, edge_ids = torch.tensor([[0, 1, 2, 3, 4, 5, 5, 4, 1, 2, 3, 0], [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]]).permute(1, 0))
@@ -33,7 +33,7 @@ def prod_layer_compilation_test():
             np4 = multiply(ni3, edge_ids = torch.tensor([[0, 1, 2, 3]]).permute(1, 0))
             np5 = multiply(ni0, ni1, ni2, ni4, edge_ids = torch.tensor([[0, 1, 2, 2, 1, 2, 0], [0, 1, 2, 3, 4, 5, 6], [0, 1, 1, 2, 3, 4, 5], [1, 3, 2, 0, 1, 2, 2]]).permute(1, 0))
 
-        input_layer = InputLayer([ni0, ni1, ni2, ni3, ni4], cum_nodes = group_size)
+        input_layer = InputLayer([ni0, ni1, ni2, ni3, ni4], cum_nodes = block_size)
 
         prod_layer_cpu = ProdLayer([np0, np1, np2, np3, np4, np5], layer_sparsity_tol = 0.1, disable_gpu_compilation = True)
         prod_layer_gpu = ProdLayer([np0, np1, np2, np3, np4, np5], layer_sparsity_tol = 0.1, force_gpu_compilation = True)
@@ -49,15 +49,15 @@ def prod_layer_compilation_test():
 
 def sum_layer_compilation_test():
 
-    for group_size in [1, 8, 16]:
+    for block_size in [1, 8, 16]:
     
-        with juice.set_group_size(group_size):
+        with juice.set_block_size(block_size):
 
-            ni0 = inputs(0, num_node_groups = 3, dist = dists.Categorical(num_cats = 2))
-            ni1 = inputs(1, num_node_groups = 7, dist = dists.Categorical(num_cats = 2))
-            ni2 = inputs(2, num_node_groups = 6, dist = dists.Categorical(num_cats = 2))
-            ni3 = inputs(3, num_node_groups = 12, dist = dists.Categorical(num_cats = 2))
-            ni4 = inputs(4, num_node_groups = 4, dist = dists.Categorical(num_cats = 2))
+            ni0 = inputs(0, num_node_blocks = 3, dist = dists.Categorical(num_cats = 2))
+            ni1 = inputs(1, num_node_blocks = 7, dist = dists.Categorical(num_cats = 2))
+            ni2 = inputs(2, num_node_blocks = 6, dist = dists.Categorical(num_cats = 2))
+            ni3 = inputs(3, num_node_blocks = 12, dist = dists.Categorical(num_cats = 2))
+            ni4 = inputs(4, num_node_blocks = 4, dist = dists.Categorical(num_cats = 2))
 
             np0 = multiply(ni0, ni1, edge_ids = torch.tensor([[0, 1, 2, 2, 1, 0, 1], [0, 1, 2, 3, 4, 5, 6]]).permute(1, 0))
             np1 = multiply(ni2, ni3, edge_ids = torch.tensor([[0, 1, 2, 3, 4, 5, 5, 4, 1, 2, 3, 0], [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]]).permute(1, 0))
@@ -71,13 +71,13 @@ def sum_layer_compilation_test():
             ns1 = summate(np0, np6, edge_ids = torch.tensor([[0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 4, 5], [0, 2, 4, 2, 1, 5, 6, 2, 1, 10, 3, 8, 9]]))
             ns2 = summate(np5, edge_ids = torch.tensor([[0, 0, 1, 1, 2, 3], [6, 4, 2, 1, 3, 5]]))
 
-        input_layer = InputLayer([ni0, ni1, ni2, ni3, ni4], cum_nodes = group_size)
+        input_layer = InputLayer([ni0, ni1, ni2, ni3, ni4], cum_nodes = block_size)
         prod_layer = ProdLayer([np0, np1, np2, np3, np4, np5, np6], layer_sparsity_tol = 0.1, force_gpu_compilation = True)
 
-        sum_layer_cpu = SumLayer([ns0, ns1, ns2], global_nid_start = input_layer.num_nodes + group_size, 
+        sum_layer_cpu = SumLayer([ns0, ns1, ns2], global_nid_start = input_layer.num_nodes + block_size, 
                                  global_pid_start = 1, global_pfid_start = 0, node2tiednodes = dict(), 
                                  layer_sparsity_tol = 0.1, disable_gpu_compilation = True)
-        sum_layer_gpu = SumLayer([ns0, ns1, ns2], global_nid_start = input_layer.num_nodes + group_size, 
+        sum_layer_gpu = SumLayer([ns0, ns1, ns2], global_nid_start = input_layer.num_nodes + block_size, 
                                  global_pid_start = 1, global_pfid_start = 0, node2tiednodes = dict(), 
                                  layer_sparsity_tol = 0.1, force_gpu_compilation = True)
 

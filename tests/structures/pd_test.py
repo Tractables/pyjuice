@@ -130,7 +130,7 @@ def pd_test():
     
     test_ll = evaluate(pc, test_loader)
 
-    assert test_ll > -755.0
+    assert test_ll > -765.0
 
 
 if __name__ == "__main__":

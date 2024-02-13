@@ -15,12 +15,12 @@ def structured_blk_sparse_pc_test():
 
     device = torch.device("cuda:0")
 
-    group_size = 16
-    num_node_groups = 8
-    num_nodes = group_size * num_node_groups
+    block_size = 16
+    num_node_blocks = 8
+    num_nodes = block_size * num_node_blocks
 
-    mask0 = torch.zeros([num_node_groups, num_node_groups], dtype = torch.long)
-    mask1 = torch.zeros([num_node_groups, num_node_groups], dtype = torch.long)
+    mask0 = torch.zeros([num_node_blocks, num_node_blocks], dtype = torch.long)
+    mask1 = torch.zeros([num_node_blocks, num_node_blocks], dtype = torch.long)
 
     mask0[0, [0, 1, 2, 3]] = 1
     mask1[0, [0, 1, 2, 3]] = 1
@@ -46,37 +46,37 @@ def structured_blk_sparse_pc_test():
     mask0[7, [3, 4]] = 1
     mask1[7, [0, 1, 6, 7]] = 1
 
-    input_mask0 = mask0[:,None,:,None].repeat(1, group_size, 1, 256 // num_node_groups).reshape(num_nodes, 256)
-    input_mask1 = mask1[:,None,:,None].repeat(1, group_size, 1, 256 // num_node_groups).reshape(num_nodes, 256)
+    input_mask0 = mask0[:,None,:,None].repeat(1, block_size, 1, 256 // num_node_blocks).reshape(num_nodes, 256)
+    input_mask1 = mask1[:,None,:,None].repeat(1, block_size, 1, 256 // num_node_blocks).reshape(num_nodes, 256)
 
     sum_edges0 = torch.nonzero(mask0, as_tuple = False).permute(1, 0)
     sum_edges1 = torch.nonzero(mask1, as_tuple = False).permute(1, 0)
     
-    with juice.set_group_size(group_size = group_size):
+    with juice.set_block_size(block_size = block_size):
 
-        ni0 = inputs(0, num_node_groups = num_node_groups, dist = dists.MaskedCategorical(num_cats = 256, mask_mode = "full_mask"), mask = input_mask0)
-        ni1 = inputs(1, num_node_groups = num_node_groups, dist = dists.MaskedCategorical(num_cats = 256, mask_mode = "full_mask"), mask = input_mask1)
+        ni0 = inputs(0, num_node_blocks = num_node_blocks, dist = dists.MaskedCategorical(num_cats = 256, mask_mode = "full_mask"), mask = input_mask0)
+        ni1 = inputs(1, num_node_blocks = num_node_blocks, dist = dists.MaskedCategorical(num_cats = 256, mask_mode = "full_mask"), mask = input_mask1)
 
-        rearranged_nids = torch.arange(0, num_nodes).reshape(num_node_groups, group_size).permute(1, 0).reshape(-1)
+        rearranged_nids = torch.arange(0, num_nodes).reshape(num_node_blocks, block_size).permute(1, 0).reshape(-1)
         edge_ids = rearranged_nids[:,None].repeat(1, 2)
         np01 = multiply(ni0, ni1, edge_ids = edge_ids, sparse_edges = True)
 
         ns01 = summate(np01, edge_ids = sum_edges0)
 
-        ni2 = inputs(2, num_node_groups = num_node_groups, dist = dists.MaskedCategorical(num_cats = 256, mask_mode = "full_mask"), mask = input_mask1)
+        ni2 = inputs(2, num_node_blocks = num_node_blocks, dist = dists.MaskedCategorical(num_cats = 256, mask_mode = "full_mask"), mask = input_mask1)
 
-        rearranged_nids = torch.arange(0, num_nodes).reshape(num_node_groups, group_size).permute(1, 0).reshape(-1)
+        rearranged_nids = torch.arange(0, num_nodes).reshape(num_node_blocks, block_size).permute(1, 0).reshape(-1)
         edge_ids = rearranged_nids[:,None].repeat(1, 2)
         np012 = multiply(ns01, ni2, edge_ids = edge_ids, sparse_edges = True)
 
-        ns012 = summate(np012, num_node_groups = 1, group_size = 1)
+        ns012 = summate(np012, num_node_blocks = 1, block_size = 1)
 
     pc = TensorCircuit(ns012)
 
     ## Compilation tests ##
 
     ni0_params = ni0._params.reshape(num_nodes, 2 * 256 + 1)
-    assert torch.all(ni0_params[:,256:512][::group_size,::(256 // num_node_groups)].long() == mask0)
+    assert torch.all(ni0_params[:,256:512][::block_size,::(256 // num_node_blocks)].long() == mask0)
     assert torch.all(pc.input_layer_group[0].vids.reshape(3, num_nodes)[0,:] == 0)
     assert torch.all(pc.input_layer_group[0].vids.reshape(3, num_nodes)[1,:] == 1)
     assert torch.all(pc.input_layer_group[0].vids.reshape(3, num_nodes)[2,:] == 2)

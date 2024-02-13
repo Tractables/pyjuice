@@ -18,95 +18,95 @@ def prod_layer_test():
 
     device = torch.device("cuda:0")
 
-    for (group_size, batch_size) in [(1, 16), (8, 512)]:
+    for (block_size, batch_size) in [(1, 16), (8, 512)]:
     
-        with juice.set_group_size(group_size):
+        with juice.set_block_size(block_size):
 
-            ni0 = inputs(0, num_node_groups = 2, dist = dists.Categorical(num_cats = 2))
-            ni1 = inputs(1, num_node_groups = 2, dist = dists.Categorical(num_cats = 2))
-            ni2 = inputs(2, num_node_groups = 2, dist = dists.Categorical(num_cats = 2))
-            ni3 = inputs(3, num_node_groups = 2, dist = dists.Categorical(num_cats = 2))
+            ni0 = inputs(0, num_node_blocks = 2, dist = dists.Categorical(num_cats = 2))
+            ni1 = inputs(1, num_node_blocks = 2, dist = dists.Categorical(num_cats = 2))
+            ni2 = inputs(2, num_node_blocks = 2, dist = dists.Categorical(num_cats = 2))
+            ni3 = inputs(3, num_node_blocks = 2, dist = dists.Categorical(num_cats = 2))
 
             np0 = multiply(ni0, ni1)
             np1 = multiply(ni2, ni3)
             np2 = multiply(ni1, ni2)
 
-        input_layer = InputLayer([ni0, ni1, ni2, ni3], cum_nodes = group_size)
+        input_layer = InputLayer([ni0, ni1, ni2, ni3], cum_nodes = block_size)
 
         layer = ProdLayer([np0, np1, np2])
 
-        assert torch.all(layer.partitioned_nids[0] == torch.arange(group_size, 7*group_size, group_size))
-        assert layer.partitioned_cids[0][0,0] == group_size
-        assert layer.partitioned_cids[0][0,1] == 3 * group_size
-        assert layer.partitioned_cids[0][1,0] == 2 * group_size
-        assert layer.partitioned_cids[0][1,1] == 4 * group_size
-        assert layer.partitioned_cids[0][2,0] == 5 * group_size
-        assert layer.partitioned_cids[0][2,1] == 7 * group_size
-        assert layer.partitioned_cids[0][3,0] == 6 * group_size
-        assert layer.partitioned_cids[0][3,1] == 8 * group_size
-        assert layer.partitioned_cids[0][4,0] == 3 * group_size
-        assert layer.partitioned_cids[0][4,1] == 5 * group_size
-        assert layer.partitioned_cids[0][5,0] == 4 * group_size
-        assert layer.partitioned_cids[0][5,1] == 6 * group_size
+        assert torch.all(layer.partitioned_nids[0] == torch.arange(block_size, 7*block_size, block_size))
+        assert layer.partitioned_cids[0][0,0] == block_size
+        assert layer.partitioned_cids[0][0,1] == 3 * block_size
+        assert layer.partitioned_cids[0][1,0] == 2 * block_size
+        assert layer.partitioned_cids[0][1,1] == 4 * block_size
+        assert layer.partitioned_cids[0][2,0] == 5 * block_size
+        assert layer.partitioned_cids[0][2,1] == 7 * block_size
+        assert layer.partitioned_cids[0][3,0] == 6 * block_size
+        assert layer.partitioned_cids[0][3,1] == 8 * block_size
+        assert layer.partitioned_cids[0][4,0] == 3 * block_size
+        assert layer.partitioned_cids[0][4,1] == 5 * block_size
+        assert layer.partitioned_cids[0][5,0] == 4 * block_size
+        assert layer.partitioned_cids[0][5,1] == 6 * block_size
 
         layer.to(device)
 
-        node_mars = torch.rand([group_size + group_size * 2 * 4, batch_size]).log().to(device)
-        element_mars = torch.zeros([group_size + 3 * 2 * 2 * group_size, batch_size]).to(device)
+        node_mars = torch.rand([block_size + block_size * 2 * 4, batch_size]).log().to(device)
+        element_mars = torch.zeros([block_size + 3 * 2 * 2 * block_size, batch_size]).to(device)
 
         ## Forward tests ##
 
         layer(node_mars, element_mars)
 
-        for i in range(group_size):
-            assert torch.all(torch.abs(element_mars[group_size+i,:] - (node_mars[group_size+i,:] + node_mars[3*group_size+i,:])) < 1e-4)
-            assert torch.all(torch.abs(element_mars[2*group_size+i,:] - (node_mars[2*group_size+i,:] + node_mars[4*group_size+i,:])) < 1e-4)
+        for i in range(block_size):
+            assert torch.all(torch.abs(element_mars[block_size+i,:] - (node_mars[block_size+i,:] + node_mars[3*block_size+i,:])) < 1e-4)
+            assert torch.all(torch.abs(element_mars[2*block_size+i,:] - (node_mars[2*block_size+i,:] + node_mars[4*block_size+i,:])) < 1e-4)
 
-            assert torch.all(torch.abs(element_mars[3*group_size+i,:] - (node_mars[5*group_size+i,:] + node_mars[7*group_size+i,:])) < 1e-4)
-            assert torch.all(torch.abs(element_mars[4*group_size+i,:] - (node_mars[6*group_size+i,:] + node_mars[8*group_size+i,:])) < 1e-4)
+            assert torch.all(torch.abs(element_mars[3*block_size+i,:] - (node_mars[5*block_size+i,:] + node_mars[7*block_size+i,:])) < 1e-4)
+            assert torch.all(torch.abs(element_mars[4*block_size+i,:] - (node_mars[6*block_size+i,:] + node_mars[8*block_size+i,:])) < 1e-4)
 
-            assert torch.all(torch.abs(element_mars[5*group_size+i,:] - (node_mars[3*group_size+i,:] + node_mars[5*group_size+i,:])) < 1e-4)
-            assert torch.all(torch.abs(element_mars[6*group_size+i,:] - (node_mars[4*group_size+i,:] + node_mars[6*group_size+i,:])) < 1e-4)
+            assert torch.all(torch.abs(element_mars[5*block_size+i,:] - (node_mars[3*block_size+i,:] + node_mars[5*block_size+i,:])) < 1e-4)
+            assert torch.all(torch.abs(element_mars[6*block_size+i,:] - (node_mars[4*block_size+i,:] + node_mars[6*block_size+i,:])) < 1e-4)
 
         ## Backward tests ##
 
-        element_flows = torch.rand([group_size + 3 * 2 * 2 * group_size, batch_size]).to(device)
-        element_flows[:group_size,:] = 0.0
-        node_flows = torch.zeros([group_size + group_size * 2 * 4, batch_size]).to(device)
+        element_flows = torch.rand([block_size + 3 * 2 * 2 * block_size, batch_size]).to(device)
+        element_flows[:block_size,:] = 0.0
+        node_flows = torch.zeros([block_size + block_size * 2 * 4, batch_size]).to(device)
 
         layer(node_mars, element_mars)
         layer.backward(node_flows, element_flows)
 
-        for i in range(group_size):
-            assert torch.all(torch.abs(node_flows[group_size+i,:] - element_flows[group_size+i,:]) < 1e-4)
-            assert torch.all(torch.abs(node_flows[2*group_size+i,:] - element_flows[2*group_size+i,:]) < 1e-4)
+        for i in range(block_size):
+            assert torch.all(torch.abs(node_flows[block_size+i,:] - element_flows[block_size+i,:]) < 1e-4)
+            assert torch.all(torch.abs(node_flows[2*block_size+i,:] - element_flows[2*block_size+i,:]) < 1e-4)
 
-            assert torch.all(torch.abs(node_flows[3*group_size+i,:] - (element_flows[group_size+i,:] + element_flows[5*group_size+i,:])) < 1e-4)
-            assert torch.all(torch.abs(node_flows[4*group_size+i,:] - (element_flows[2*group_size+i,:] + element_flows[6*group_size+i,:])) < 1e-4)
+            assert torch.all(torch.abs(node_flows[3*block_size+i,:] - (element_flows[block_size+i,:] + element_flows[5*block_size+i,:])) < 1e-4)
+            assert torch.all(torch.abs(node_flows[4*block_size+i,:] - (element_flows[2*block_size+i,:] + element_flows[6*block_size+i,:])) < 1e-4)
 
-            assert torch.all(torch.abs(node_flows[5*group_size+i,:] - (element_flows[3*group_size+i,:] + element_flows[5*group_size+i,:])) < 1e-4)
-            assert torch.all(torch.abs(node_flows[6*group_size+i,:] - (element_flows[4*group_size+i,:] + element_flows[6*group_size+i,:])) < 1e-4)
+            assert torch.all(torch.abs(node_flows[5*block_size+i,:] - (element_flows[3*block_size+i,:] + element_flows[5*block_size+i,:])) < 1e-4)
+            assert torch.all(torch.abs(node_flows[6*block_size+i,:] - (element_flows[4*block_size+i,:] + element_flows[6*block_size+i,:])) < 1e-4)
 
-            assert torch.all(torch.abs(node_flows[7*group_size+i,:] - element_flows[3*group_size+i,:]) < 1e-4)
-            assert torch.all(torch.abs(node_flows[8*group_size+i,:] - element_flows[4*group_size+i,:]) < 1e-4)
+            assert torch.all(torch.abs(node_flows[7*block_size+i,:] - element_flows[3*block_size+i,:]) < 1e-4)
+            assert torch.all(torch.abs(node_flows[8*block_size+i,:] - element_flows[4*block_size+i,:]) < 1e-4)
 
 
 def speed_test():
 
     device = torch.device("cuda:0")
 
-    group_size = 16
+    block_size = 16
     num_vars = 28*28
-    num_node_groups = 256 // group_size
+    num_node_blocks = 256 // block_size
     num_prod_nodes = 200
 
     batch_size = 512
 
-    with juice.set_group_size(group_size):
+    with juice.set_block_size(block_size):
 
         nis = []
         for v in range(num_vars):
-            nis.append(inputs(v, num_node_groups = num_node_groups, dist = dists.Categorical(num_cats = 64)))
+            nis.append(inputs(v, num_node_blocks = num_node_blocks, dist = dists.Categorical(num_cats = 64)))
 
         nps = []
         for i in range(num_prod_nodes):
@@ -119,14 +119,14 @@ def speed_test():
 
             nps.append(multiply(nis[v1], nis[v2]))
 
-    input_layer = InputLayer(nis, cum_nodes = group_size)
+    input_layer = InputLayer(nis, cum_nodes = block_size)
 
     layer = ProdLayer(nps, layer_sparsity_tol = 0.1)
 
     layer.to(device)
 
-    node_mars = torch.rand([group_size + group_size * num_node_groups * num_vars, batch_size]).log().to(device)
-    element_mars = torch.zeros([group_size + num_prod_nodes * group_size * num_node_groups, batch_size]).to(device)
+    node_mars = torch.rand([block_size + block_size * num_node_blocks * num_vars, batch_size]).log().to(device)
+    element_mars = torch.zeros([block_size + num_prod_nodes * block_size * num_node_blocks, batch_size]).to(device)
 
     ## Forward tests ##
 
@@ -144,9 +144,9 @@ def speed_test():
     print("Reference computation time on RTX 4090: 0.330ms.")
     print("--------------------------------------------------------------")
 
-    element_flows = torch.rand([group_size + num_prod_nodes * num_node_groups * group_size, batch_size]).to(device)
-    element_flows[:group_size,:] = 0.0
-    node_flows = torch.zeros([group_size + group_size * num_node_groups * num_vars, batch_size]).to(device)
+    element_flows = torch.rand([block_size + num_prod_nodes * num_node_blocks * block_size, batch_size]).to(device)
+    element_flows[:block_size,:] = 0.0
+    node_flows = torch.zeros([block_size + block_size * num_node_blocks * num_vars, batch_size]).to(device)
 
     layer(node_mars, element_mars)
     layer.backward(node_flows, element_flows)

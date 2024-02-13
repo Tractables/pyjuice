@@ -31,8 +31,8 @@ def hclt_forward_test():
 
     pc.to(device)
 
-    group_size = root_ns.chs[0].group_size
-    num_groups = num_latents // group_size
+    block_size = root_ns.chs[0].block_size
+    num_blocks = num_latents // block_size
 
     batch_data = train_data[:512,:].contiguous().to(device)
     data_cpu = batch_data.cpu().long()
@@ -66,7 +66,7 @@ def hclt_forward_test():
 
             elif ns.is_sum() and ns != root_ns:
                 emars = torch.cat([ns2mars[cs] for cs in ns.chs], dim = 0)
-                params = ns._params.reshape(num_groups, num_groups * ns.num_chs, group_size, group_size).permute(0, 2, 1, 3)
+                params = ns._params.reshape(num_blocks, num_blocks * ns.num_chs, block_size, block_size).permute(0, 2, 1, 3)
                 params = params.reshape(num_latents, num_latents * ns.num_chs)
 
                 emars_max = torch.max(emars, dim = 0).values[None,:]
@@ -84,7 +84,7 @@ def hclt_forward_test():
                 assert ns == root_ns
 
                 emars = torch.cat([ns2mars[cs] for cs in ns.chs], dim = 0)
-                params = ns._params.reshape(1, num_groups * ns.num_chs, 1, group_size).permute(0, 2, 1, 3)
+                params = ns._params.reshape(1, num_blocks * ns.num_chs, 1, block_size).permute(0, 2, 1, 3)
                 params = params.reshape(1, num_latents * ns.num_chs)
 
                 emars_max = torch.max(emars, dim = 0).values[None,:]
@@ -121,8 +121,8 @@ def hclt_backward_test():
 
     pc.to(device)
 
-    group_size = root_ns.chs[0].group_size
-    num_groups = num_latents // group_size
+    block_size = root_ns.chs[0].block_size
+    num_blocks = num_latents // block_size
 
     batch_data = train_data[:512,:].contiguous().to(device)
     data_cpu = batch_data.cpu().long()
@@ -150,11 +150,11 @@ def hclt_backward_test():
                 nmars = node_mars[sid:eid,:]
 
                 for i, cs in enumerate(ns.chs):
-                    params = ns._params.reshape(1, num_groups * ns.num_chs, 1, group_size).permute(0, 2, 1, 3)
-                    params = params[:,:,i*num_groups:(i+1)*num_groups,:].reshape(1, num_latents)
+                    params = ns._params.reshape(1, num_blocks * ns.num_chs, 1, block_size).permute(0, 2, 1, 3)
+                    params = params[:,:,i*num_blocks:(i+1)*num_blocks,:].reshape(1, num_latents)
 
-                    param_flows = ns._param_flows.reshape(1, num_groups * ns.num_chs, 1, group_size).permute(0, 2, 1, 3)
-                    param_flows = param_flows[:,:,i*num_groups:(i+1)*num_groups,:].reshape(1, num_latents)
+                    param_flows = ns._param_flows.reshape(1, num_blocks * ns.num_chs, 1, block_size).permute(0, 2, 1, 3)
+                    param_flows = param_flows[:,:,i*num_blocks:(i+1)*num_blocks,:].reshape(1, num_latents)
 
                     if cs.is_prod():
                         emars = torch.zeros([num_latents, batch_size])
@@ -191,11 +191,11 @@ def hclt_backward_test():
                 nmars = node_mars[sid:eid,:]
 
                 for i, cs in enumerate(ns.chs):
-                    params = ns._params.reshape(num_groups, num_groups * ns.num_chs, group_size, group_size).permute(0, 2, 1, 3)
-                    params = params[:,:,i*num_groups:(i+1)*num_groups,:].reshape(num_latents, num_latents)
+                    params = ns._params.reshape(num_blocks, num_blocks * ns.num_chs, block_size, block_size).permute(0, 2, 1, 3)
+                    params = params[:,:,i*num_blocks:(i+1)*num_blocks,:].reshape(num_latents, num_latents)
 
-                    param_flows = ns._param_flows.reshape(num_groups, num_groups * ns.num_chs, group_size, group_size).permute(0, 2, 1, 3)
-                    param_flows = param_flows[:,:,i*num_groups:(i+1)*num_groups,:].reshape(num_latents, num_latents)
+                    param_flows = ns._param_flows.reshape(num_blocks, num_blocks * ns.num_chs, block_size, block_size).permute(0, 2, 1, 3)
+                    param_flows = param_flows[:,:,i*num_blocks:(i+1)*num_blocks,:].reshape(num_latents, num_latents)
 
                     if cs.is_prod():
                         emars = torch.zeros([num_latents, batch_size])
@@ -245,8 +245,8 @@ def hclt_em_test():
 
     pc.to(device)
 
-    group_size = root_ns.chs[0].group_size
-    num_groups = num_latents // group_size
+    block_size = root_ns.chs[0].block_size
+    num_blocks = num_latents // block_size
 
     batch_data = train_data[:512,:].contiguous().to(device)
     data_cpu = batch_data.cpu().long()
@@ -270,13 +270,13 @@ def hclt_em_test():
 
     for ns in root_ns:
         if ns.is_sum() and ns != root_ns:
-            old_params = ns2old_params[ns].reshape(num_groups, num_groups * ns.num_chs, group_size, group_size).permute(0, 2, 1, 3)
+            old_params = ns2old_params[ns].reshape(num_blocks, num_blocks * ns.num_chs, block_size, block_size).permute(0, 2, 1, 3)
             old_params = old_params.reshape(num_latents, num_latents * ns.num_chs)
 
-            ref_params = ns._params.reshape(num_groups, num_groups * ns.num_chs, group_size, group_size).permute(0, 2, 1, 3)
+            ref_params = ns._params.reshape(num_blocks, num_blocks * ns.num_chs, block_size, block_size).permute(0, 2, 1, 3)
             ref_params = ref_params.reshape(num_latents, num_latents * ns.num_chs)
 
-            par_flows = ns._param_flows.reshape(num_groups, num_groups * ns.num_chs, group_size, group_size).permute(0, 2, 1, 3)
+            par_flows = ns._param_flows.reshape(num_blocks, num_blocks * ns.num_chs, block_size, block_size).permute(0, 2, 1, 3)
             par_flows = par_flows.reshape(num_latents, num_latents * ns.num_chs)
 
             new_params = (par_flows + pseudocount / par_flows.size(1)) / (par_flows.sum(dim = 1, keepdim = True) + pseudocount)
@@ -286,13 +286,13 @@ def hclt_em_test():
             assert torch.all(torch.abs(ref_params - updated_params) < 1e-4)
 
         elif ns == root_ns:
-            old_params = ns2old_params[ns].reshape(1, num_groups * ns.num_chs, 1, group_size).permute(0, 2, 1, 3)
+            old_params = ns2old_params[ns].reshape(1, num_blocks * ns.num_chs, 1, block_size).permute(0, 2, 1, 3)
             old_params = old_params.reshape(1, num_latents * ns.num_chs)
 
-            ref_params = ns._params.reshape(1, num_groups * ns.num_chs, 1, group_size).permute(0, 2, 1, 3)
+            ref_params = ns._params.reshape(1, num_blocks * ns.num_chs, 1, block_size).permute(0, 2, 1, 3)
             ref_params = ref_params.reshape(1, num_latents * ns.num_chs)
 
-            par_flows = ns._param_flows.reshape(1, num_groups * ns.num_chs, 1, group_size).permute(0, 2, 1, 3)
+            par_flows = ns._param_flows.reshape(1, num_blocks * ns.num_chs, 1, block_size).permute(0, 2, 1, 3)
             par_flows = par_flows.reshape(1, num_latents * ns.num_chs)
 
             new_params = (par_flows + pseudocount / par_flows.size(1)) / (par_flows.sum(dim = 1, keepdim = True) + pseudocount)

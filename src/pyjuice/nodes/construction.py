@@ -18,26 +18,26 @@ ProdNodesChs = Union[SumNodes,InputNodes]
 SumNodesChs = Union[ProdNodes,InputNodes]
 
 
-def inputs(var: Union[int,Sequence[int]], num_node_groups: int = 0, dist: Distribution = Distribution(), 
-           params: Optional[Tensor] = None, num_nodes: int = 0, group_size: int = 0, **kwargs):
+def inputs(var: Union[int,Sequence[int]], num_node_blocks: int = 0, dist: Distribution = Distribution(), 
+           params: Optional[Tensor] = None, num_nodes: int = 0, block_size: int = 0, **kwargs):
 
-    assert group_size == 0 or group_size & (group_size - 1) == 0, "`group_size` must be a power of 2."
+    assert block_size == 0 or block_size & (block_size - 1) == 0, "`block_size` must be a power of 2."
 
     if num_nodes > 0:
-        assert num_node_groups == 0, "Only one of `num_nodes` and `num_node_groups` can be set at the same time."
-        if group_size == 0:
-            group_size = CircuitNodes.DEFAULT_GROUP_SIZE
+        assert num_node_blocks == 0, "Only one of `num_nodes` and `num_node_blocks` can be set at the same time."
+        if block_size == 0:
+            block_size = CircuitNodes.DEFAULT_BLOCK_SIZE
 
-        assert num_nodes % group_size == 0
+        assert num_nodes % block_size == 0
 
-        num_node_groups = num_nodes // group_size
+        num_node_blocks = num_nodes // block_size
 
     return InputNodes(
-        num_node_groups = num_node_groups,
+        num_node_blocks = num_node_blocks,
         scope = [var] if isinstance(var, int) else var,
         dist = dist,
         params = params,
-        group_size = group_size,
+        block_size = block_size,
         **kwargs
     )
 
@@ -47,50 +47,50 @@ def multiply(nodes1: ProdNodesChs, *args, edge_ids: Optional[Tensor] = None, spa
     assert isinstance(nodes1, SumNodes) or isinstance(nodes1, InputNodes), "Children of product nodes must be input or sum nodes." 
 
     chs = [nodes1]
-    num_node_groups = nodes1.num_node_groups
-    group_size = nodes1.group_size
+    num_node_blocks = nodes1.num_node_blocks
+    block_size = nodes1.block_size
     scope = deepcopy(nodes1.scope)
 
     for nodes in args:
         assert nodes.is_input() or nodes.is_sum(), f"Children of product nodes must be input or sum nodes, but found input of type {type(nodes)}."
         if edge_ids is None:
-            assert nodes.num_node_groups == num_node_groups, f"Input nodes should have the same `num_node_groups`, but got {nodes.num_node_groups} and {num_node_groups}."
-        assert nodes.group_size == group_size, "Input nodes should have the same `num_node_groups`."
+            assert nodes.num_node_blocks == num_node_blocks, f"Input nodes should have the same `num_node_blocks`, but got {nodes.num_node_blocks} and {num_node_blocks}."
+        assert nodes.block_size == block_size, "Input nodes should have the same `num_node_blocks`."
         assert len(nodes.scope & scope) == 0, "Children of a `ProdNodes` should have disjoint scopes."
         chs.append(nodes)
         scope |= nodes.scope
 
     if edge_ids is not None:
         if sparse_edges:
-            assert edge_ids.shape[0] % group_size == 0
-            num_node_groups = edge_ids.shape[0] // group_size
+            assert edge_ids.shape[0] % block_size == 0
+            num_node_blocks = edge_ids.shape[0] // block_size
         else:
-            num_node_groups = edge_ids.shape[0]
-        assert edge_ids.shape[0] == num_node_groups or edge_ids.shape[0] == num_node_groups * group_size
+            num_node_blocks = edge_ids.shape[0]
+        assert edge_ids.shape[0] == num_node_blocks or edge_ids.shape[0] == num_node_blocks * block_size
 
-    return ProdNodes(num_node_groups, chs, edge_ids, group_size = group_size, **kwargs)
+    return ProdNodes(num_node_blocks, chs, edge_ids, block_size = block_size, **kwargs)
 
 
-def summate(nodes1: SumNodesChs, *args, num_nodes: int = 0, num_node_groups: int = 0, 
-            edge_ids: Optional[Tensor] = None, group_size: int = 0, **kwargs):
+def summate(nodes1: SumNodesChs, *args, num_nodes: int = 0, num_node_blocks: int = 0, 
+            edge_ids: Optional[Tensor] = None, block_size: int = 0, **kwargs):
 
-    assert group_size == 0 or group_size & (group_size - 1) == 0, "`group_size` must be a power of 2."
+    assert block_size == 0 or block_size & (block_size - 1) == 0, "`block_size` must be a power of 2."
 
     if num_nodes > 0:
-        assert num_node_groups == 0, "Only one of `num_nodes` and `num_node_groups` can be set at the same time."
-        if group_size == 0:
-            group_size = CircuitNodes.DEFAULT_GROUP_SIZE
+        assert num_node_blocks == 0, "Only one of `num_nodes` and `num_node_blocks` can be set at the same time."
+        if block_size == 0:
+            block_size = CircuitNodes.DEFAULT_BLOCK_SIZE
 
-        assert num_nodes % group_size == 0
+        assert num_nodes % block_size == 0
 
-        num_node_groups = num_nodes // group_size
+        num_node_blocks = num_nodes // block_size
 
     assert isinstance(nodes1, ProdNodes) or isinstance(nodes1, InputNodes), f"Children of sum nodes must be input or product nodes, but found input of type {type(nodes1)}." 
 
-    if edge_ids is not None and num_node_groups == 0:
-        num_node_groups = edge_ids[0,:].max().item() + 1
+    if edge_ids is not None and num_node_blocks == 0:
+        num_node_blocks = edge_ids[0,:].max().item() + 1
 
-    assert num_node_groups > 0, "Number of node groups should be greater than 0."
+    assert num_node_blocks > 0, "Number of node blocks should be greater than 0."
 
     chs = [nodes1]
     scope = deepcopy(nodes1.scope)
@@ -99,21 +99,21 @@ def summate(nodes1: SumNodesChs, *args, num_nodes: int = 0, num_node_groups: int
         assert nodes.scope == scope, "Children of a `SumNodes` should have the same scope."
         chs.append(nodes)
 
-    return SumNodes(num_node_groups, chs, edge_ids, group_size = group_size, **kwargs)
+    return SumNodes(num_node_blocks, chs, edge_ids, block_size = block_size, **kwargs)
 
 
-class set_group_size(_DecoratorContextManager):
-    def __init__(self, group_size: int = 1):
+class set_block_size(_DecoratorContextManager):
+    def __init__(self, block_size: int = 1):
 
-        assert group_size & (group_size - 1) == 0, "`group_size` must be a power of 2."
+        assert block_size & (block_size - 1) == 0, "`block_size` must be a power of 2."
 
-        self.group_size = group_size
+        self.block_size = block_size
         
-        self.original_group_size = None
+        self.original_block_size = None
 
     def __enter__(self) -> None:
-        self.original_group_size = CircuitNodes.DEFAULT_GROUP_SIZE
-        CircuitNodes.DEFAULT_GROUP_SIZE = self.group_size
+        self.original_block_size = CircuitNodes.DEFAULT_BLOCK_SIZE
+        CircuitNodes.DEFAULT_BLOCK_SIZE = self.block_size
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
-        CircuitNodes.DEFAULT_GROUP_SIZE = self.original_group_size
+        CircuitNodes.DEFAULT_BLOCK_SIZE = self.original_block_size

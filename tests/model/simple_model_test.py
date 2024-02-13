@@ -18,29 +18,29 @@ def simple_model_test():
     
     device = torch.device("cuda:0")
 
-    group_size = 16
+    block_size = 16
     
-    with juice.set_group_size(group_size):
+    with juice.set_block_size(block_size):
 
-        ni0 = inputs(0, num_node_groups = 2, dist = dists.Categorical(num_cats = 4))
-        ni1 = inputs(1, num_node_groups = 2, dist = dists.Categorical(num_cats = 4))
-        ni2 = inputs(2, num_node_groups = 2, dist = dists.Categorical(num_cats = 6))
-        ni3 = inputs(3, num_node_groups = 2, dist = dists.Categorical(num_cats = 6))
+        ni0 = inputs(0, num_node_blocks = 2, dist = dists.Categorical(num_cats = 4))
+        ni1 = inputs(1, num_node_blocks = 2, dist = dists.Categorical(num_cats = 4))
+        ni2 = inputs(2, num_node_blocks = 2, dist = dists.Categorical(num_cats = 6))
+        ni3 = inputs(3, num_node_blocks = 2, dist = dists.Categorical(num_cats = 6))
 
         np0 = multiply(ni0, ni1)
         np1 = multiply(ni2, ni3)
         np2 = multiply(ni1, ni2)
         np3 = multiply(ni0, ni1)
 
-        ns0 = summate(np0, np3, num_node_groups = 2)
-        ns1 = summate(np1, num_node_groups = 2)
-        ns2 = summate(np2, num_node_groups = 2)
+        ns0 = summate(np0, np3, num_node_blocks = 2)
+        ns1 = summate(np1, num_node_blocks = 2)
+        ns2 = summate(np2, num_node_blocks = 2)
 
         np4 = multiply(ns0, ni2, ni3)
         np5 = multiply(ns1, ni0, ni1)
         np6 = multiply(ns2, ni0, ni3)
 
-        ns = summate(np4, np5, np6, num_node_groups = 1, group_size = 1)
+        ns = summate(np4, np5, np6, num_node_blocks = 1, block_size = 1)
 
     ns.init_parameters()
 
@@ -168,7 +168,7 @@ def simple_model_test():
 
     sum_layer1 = pc.inner_layer_groups[3][0]
 
-    assert sum_layer1.group_size == 1
+    assert sum_layer1.block_size == 1
 
     assert torch.all(sum_layer1.partitioned_nids[0] == torch.tensor([240]))
 
