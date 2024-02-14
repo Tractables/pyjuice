@@ -821,5 +821,37 @@ class TensorCircuit(nn.Module):
                 layer_group._prepare_scope2nids(prod_scope_eleids)
 
 
-def compile(ns: CircuitNodes, *args, **kwargs):
-    return TensorCircuit(ns, *args, **kwargs)
+def compile(ns: CircuitNodes, layer_sparsity_tol: float = 0.5, 
+            max_num_partitions: Optional[int] = None, disable_gpu_compilation: bool = False, 
+            force_gpu_compilation: bool = False,
+            max_tied_ns_per_parflow_block: int = 8,
+            verbose: bool = True) -> nn.Module:
+    """
+    Compile a PC represented by a DAG into an equivalent `torch.nn.Module`.
+
+    :param ns: the root node of the PC's DAG
+    :type ns: CircuitNodes
+
+    :param layer_sparsity_tol: the maximum allowed fraction for added pseudo edges within every layer (better to set to a small number for sparse/block-sparse PCs)
+    :type layer_sparsity_tol: float
+
+    :param max_num_partitions: maximum number of partitions in a layer
+    :type max_num_partitions: Optional[int]
+
+    :param disable_gpu_compilation: force PyJuice to use CPU compilation
+    :type disable_gpu_compilation: bool
+
+    :param force_gpu_compilation: force PyJuice to use GPU compilation
+    :type force_gpu_compilation: bool
+
+    :param max_tied_ns_per_parflow_block: how many groups of tied parameters are allowed to share the same flow/gradient accumulator (higher values -> consumes less GPU memory; lower values -> potentially avoid stalls caused by atomic operations)
+    :type max_tied_ns_per_parflow_block: int
+
+    :param verbose: Whether to display the progress of the compilation
+    :type verbose: bool
+
+    :returns: the compiled PC with type `torch.nn.Module`
+    """
+    return TensorCircuit(ns, layer_sparsity_tol = layer_sparsity_tol, max_num_partitions = max_num_partitions,
+                         disable_gpu_compilation = disable_gpu_compilation, force_gpu_compilation = force_gpu_compilation,
+                         max_tied_ns_per_parflow_block = max_tied_ns_per_parflow_block, verbose = verbose)
