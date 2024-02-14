@@ -34,11 +34,12 @@ html_theme = 'sphinx_rtd_theme'
 # -- Options for EPUB output
 epub_show_urls = 'footnote'
 
+# Add any paths that contain templates here, relative to this directory.
+templates_path = ['_templates']
 html_sidebars = {
     '**': [
-        # 'relations.html',  # needs 'show_related': True theme option to display
-        'searchbox.html',
-    ]
+        '_templates/versions.html',
+    ],
 }
 
 # autosummary_generate = True
