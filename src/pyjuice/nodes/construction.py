@@ -19,7 +19,30 @@ SumNodesChs = Union[ProdNodes,InputNodes]
 
 
 def inputs(var: Union[int,Sequence[int]], num_node_blocks: int = 0, dist: Distribution = Distribution(), 
-           params: Optional[Tensor] = None, num_nodes: int = 0, block_size: int = 0, **kwargs):
+           params: Optional[Tensor] = None, num_nodes: int = 0, block_size: int = 0, **kwargs) -> InputNodes:
+    """
+    Construct a vector of input nodes defined on the same variable and have the same input distribution.
+
+    :param var: the variable ID (or a list of variable IDs if the parameter `dist` is a multivariate distribution)
+    :type var: Union[int,Sequence[int]]
+
+    :param num_node_blocks: number of node blocks each of size `block_size`. I.e., the total number of nodes is `num_node_blocks` * `block_size`
+    :type num_node_blocks: int
+
+    :param dist: the input distribution from `pyjuice.nodes.distributions`
+    :type dist: Distribution
+
+    :param params: an optional tensor that defines the parameters of the nodes
+    :type params: Optional[Tensor]
+
+    :param num_nodes: an alternative of `num_node_blocks`; if set, it should be divicible by `block_size`
+    :type num_nodes: int
+
+    :param block_size: block size of the nodes; it does not change the semantics of the nodes, but will affect the speed of the compiled PC
+    :type block_size: int
+
+    :returns: an `InputNodes` object (a subclass of `CircuitNodes`)
+    """
 
     assert block_size == 0 or block_size & (block_size - 1) == 0, "`block_size` must be a power of 2."
 
@@ -42,7 +65,30 @@ def inputs(var: Union[int,Sequence[int]], num_node_blocks: int = 0, dist: Distri
     )
 
 
-def multiply(nodes1: ProdNodesChs, *args, edge_ids: Optional[Tensor] = None, sparse_edges: bool = False, **kwargs):
+def multiply(nodes1: ProdNodesChs, *args, edge_ids: Optional[Tensor] = None, sparse_edges: bool = False, **kwargs) -> ProdNodes:
+    """
+    Construct a vector of product nodes given a list of children PCs defined on disjoint sets of variables.
+
+    :note: It requires all children to have the same block size.
+
+    :note: If all children have the same `num_node_blocks`, if `edge_ids` is not specified, `multiply` outputs a vector of `num_node_blocks` * `block_size` nodes, where the ith (product) node is connected to the ith node in every child.
+
+    :note: By default every edge specified by `edge_ids` denotes a block of `block_size` edges, unless `sparse_edge` is set to `True`, where the block size is assumed to be 1.
+
+    :param nodes1: the first child node
+    :type nodes1: Union[SumNodes,InputNodes]
+
+    :param args: the remaining child nodes
+    :type args: Union[SumNodes,InputNodes]
+
+    :param edge_ids: a matrix of size [# product node blocks, # children] - the ith product node block is connected to the `edge_ids[i,j]`th node block in the jth child
+    :type edge_ids: Optional[Tensor]
+
+    :param sparse_edges: if set to `True`, the size of `edge_ids` becomes [# product nodes, # children] (i.e., we assume the block size of every child is 1)
+    :type sparse_edges: bool
+
+    :returns: an `ProdNodes` object (a subclass of `CircuitNodes`)
+    """
 
     assert isinstance(nodes1, SumNodes) or isinstance(nodes1, InputNodes), "Children of product nodes must be input or sum nodes." 
 
@@ -71,8 +117,35 @@ def multiply(nodes1: ProdNodesChs, *args, edge_ids: Optional[Tensor] = None, spa
     return ProdNodes(num_node_blocks, chs, edge_ids, block_size = block_size, **kwargs)
 
 
-def summate(nodes1: SumNodesChs, *args, num_nodes: int = 0, num_node_blocks: int = 0, 
-            edge_ids: Optional[Tensor] = None, block_size: int = 0, **kwargs):
+def summate(nodes1: SumNodesChs, *args, num_node_blocks: int = 0, num_nodes: int = 0
+            edge_ids: Optional[Tensor] = None, block_size: int = 0, **kwargs) -> SumNodes:
+    """
+    Construct a vector of sum nodes given a list of children PCs defined on the same sets of variables.
+
+    :note: It requires all children to have the same block size.
+
+    :note: If `edge_ids` is not set, `summate` defines a set of sum nodes fully connected to the input nodes.
+
+    :param nodes1: the first child node
+    :type nodes1: Union[ProdNodes,InputNodes]
+
+    :param args: the remaining child nodes
+    :type args: Union[ProdNodes,InputNodes]
+
+    :param num_node_blocks: number of node blocks each of size `block_size`. I.e., the total number of nodes is `num_node_blocks` * `block_size`
+    :type num_node_blocks: int
+
+    :param num_nodes: an alternative of `num_node_blocks`; if set, it should be divicible by `block_size`
+    :type num_nodes: int
+
+    :param edge_ids: a matrix of size [2, # edges] - every size-2 column vector [i,j] defines a set of edges that fully connect the ith sum node block and the jth child node block
+    :type edge_ids: Optional[Tensor]
+
+    :param block_size: block size of the nodes; it does not change the semantics of the nodes, but will affect the speed of the compiled PC
+    :type block_size: int
+
+    :returns: an `SumNodes` object (a subclass of `CircuitNodes`)
+    """
 
     assert block_size == 0 or block_size & (block_size - 1) == 0, "`block_size` must be a power of 2."
 
@@ -103,6 +176,19 @@ def summate(nodes1: SumNodesChs, *args, num_nodes: int = 0, num_node_blocks: int
 
 
 class set_block_size(_DecoratorContextManager):
+    """
+    Context-manager that sets the block size of PC nodes constructed by `inputs`, `multiply`, and `summate`.
+
+    :param block_size: the target block size
+    :type block_size: int
+
+    Example::
+        >>> with pyjuice.set_block_size(16):
+        ...     nis = pyjuice.inputs(var = 0, num_node_blocks = 4, dist = Categorical(num_cats = 20))
+        >>> print(nis.num_nodes) # Should be 16 * 4
+        64
+    """
+
     def __init__(self, block_size: int = 1):
 
         assert block_size & (block_size - 1) == 0, "`block_size` must be a power of 2."
