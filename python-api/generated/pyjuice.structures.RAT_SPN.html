@@ -4,7 +4,7 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>pyjuice.structures.HMM &mdash; PyJuice 2.0.1 documentation</title>
+  <title>pyjuice.structures.RAT_SPN &mdash; PyJuice 2.0.1 documentation</title>
       <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=80d5e7a1" />
       <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=19f00094" />
 
@@ -21,8 +21,8 @@
     <script src="../../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../../genindex.html" />
     <link rel="search" title="Search" href="../../search.html" />
-    <link rel="next" title="pyjuice.structures.RAT_SPN" href="pyjuice.structures.RAT_SPN.html" />
-    <link rel="prev" title="pyjuice.structures.HCLT" href="pyjuice.structures.HCLT.html" /> 
+    <link rel="next" title="pyjuice.structures.PD" href="pyjuice.structures.PD.html" />
+    <link rel="prev" title="pyjuice.structures.HMM" href="pyjuice.structures.HMM.html" /> 
 </head>
 
 <body class="wy-body-for-nav"> 
@@ -59,11 +59,11 @@
 <li class="toctree-l1"><a class="reference internal" href="../tensorcircuit.html">pyjuice.TensorCircuit</a></li>
 <li class="toctree-l1 current"><a class="reference internal" href="../structures.html">pyjuice.structures</a><ul class="current">
 <li class="toctree-l2"><a class="reference internal" href="pyjuice.structures.HCLT.html">pyjuice.structures.HCLT</a></li>
-<li class="toctree-l2 current"><a class="current reference internal" href="#">pyjuice.structures.HMM</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="#pyjuice.structures.HMM"><code class="docutils literal notranslate"><span class="pre">HMM()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="pyjuice.structures.HMM.html">pyjuice.structures.HMM</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">pyjuice.structures.RAT_SPN</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#pyjuice.structures.RAT_SPN"><code class="docutils literal notranslate"><span class="pre">RAT_SPN()</span></code></a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="pyjuice.structures.RAT_SPN.html">pyjuice.structures.RAT_SPN</a></li>
 <li class="toctree-l2"><a class="reference internal" href="pyjuice.structures.PD.html">pyjuice.structures.PD</a></li>
 </ul>
 </li>
@@ -84,9 +84,9 @@
   <ul class="wy-breadcrumbs">
       <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
           <li class="breadcrumb-item"><a href="../structures.html">pyjuice.structures</a></li>
-      <li class="breadcrumb-item active">pyjuice.structures.HMM</li>
+      <li class="breadcrumb-item active">pyjuice.structures.RAT_SPN</li>
       <li class="wy-breadcrumbs-aside">
-            <a href="../../_sources/python-api/generated/pyjuice.structures.HMM.rst.txt" rel="nofollow"> View page source</a>
+            <a href="../../_sources/python-api/generated/pyjuice.structures.RAT_SPN.rst.txt" rel="nofollow"> View page source</a>
       </li>
   </ul>
   <hr/>
@@ -94,19 +94,22 @@
           <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
            <div itemprop="articleBody">
              
-  <section id="pyjuice-structures-hmm">
-<h1>pyjuice.structures.HMM<a class="headerlink" href="#pyjuice-structures-hmm" title="Link to this heading"></a></h1>
+  <section id="pyjuice-structures-rat-spn">
+<h1>pyjuice.structures.RAT_SPN<a class="headerlink" href="#pyjuice-structures-rat-spn" title="Link to this heading"></a></h1>
 <dl class="py function">
-<dt class="sig sig-object py" id="pyjuice.structures.HMM">
-<span class="sig-prename descclassname"><span class="pre">pyjuice.structures.</span></span><span class="sig-name descname"><span class="pre">HMM</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">seq_length</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_latents</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_emits</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">homogeneous</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyjuice.structures.HMM" title="Link to this definition"></a></dt>
-<dd><p>Constructs Hidden Markov Models.</p>
+<dt class="sig sig-object py" id="pyjuice.structures.RAT_SPN">
+<span class="sig-prename descclassname"><span class="pre">pyjuice.structures.</span></span><span class="sig-name descname"><span class="pre">RAT_SPN</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">num_vars:</span> <span class="pre">int</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_latents:</span> <span class="pre">int</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">depth:</span> <span class="pre">int</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_repetitions:</span> <span class="pre">int</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_pieces:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">2</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">input_dists:</span> <span class="pre">~pyjuice.nodes.distributions.distributions.Distribution</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">input_layer_type:</span> <span class="pre">~typing.Type[~pyjuice.nodes.distributions.distributions.Distribution]</span> <span class="pre">=</span> <span class="pre">&lt;class</span> <span class="pre">'pyjuice.nodes.distributions.categorical.Categorical'&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">input_layer_params:</span> <span class="pre">dict</span> <span class="pre">=</span> <span class="pre">{'num_cats':</span> <span class="pre">256}</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">block_size:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyjuice.structures.RAT_SPN" title="Link to this definition"></a></dt>
+<dd><p>Generate Random and Tensorized SPNs (<a class="reference external" href="https://proceedings.mlr.press/v115/peharz20a/peharz20a.pdf">https://proceedings.mlr.press/v115/peharz20a/peharz20a.pdf</a>)</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>seq_length</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – sequence length</p></li>
+<li><p><strong>num_vars</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – number of variables</p></li>
 <li><p><strong>num_latents</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – size of the latent space</p></li>
-<li><p><strong>num_emits</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – size of the emission space</p></li>
-<li><p><strong>homogeneous</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>) – whether to define a homogeneous (or inhomogeneous) HMM</p></li>
+<li><p><strong>depth</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – splitting depth of variable scopes</p></li>
+<li><p><strong>num_repetitions</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – number of random splits</p></li>
+<li><p><strong>num_pieces</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – the number of sub-scopes splitted from any scope</p></li>
+<li><p><strong>input_dist</strong> (<em>Distribution</em>) – input distribution</p></li>
+<li><p><strong>block_size</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – block size</p></li>
 </ul>
 </dd>
 </dl>
@@ -118,8 +121,8 @@
            </div>
           </div>
           <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
-        <a href="pyjuice.structures.HCLT.html" class="btn btn-neutral float-left" title="pyjuice.structures.HCLT" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
-        <a href="pyjuice.structures.RAT_SPN.html" class="btn btn-neutral float-right" title="pyjuice.structures.RAT_SPN" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+        <a href="pyjuice.structures.HMM.html" class="btn btn-neutral float-left" title="pyjuice.structures.HMM" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="pyjuice.structures.PD.html" class="btn btn-neutral float-right" title="pyjuice.structures.PD" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
     </div>
 
   <hr/>

@@ -1,0 +1,6 @@
+﻿pyjuice.structures.RAT\_SPN
+===========================
+
+.. currentmodule:: pyjuice.structures
+
+.. autofunction:: RAT_SPN

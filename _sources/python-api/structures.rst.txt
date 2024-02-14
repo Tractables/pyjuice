@@ -9,5 +9,5 @@ pyjuice.structures
 
     HCLT
     HMM
-    RAT-SPN
+    RAT_SPN
     PD
