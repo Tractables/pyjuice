@@ -6,8 +6,16 @@ Welcome to PyJuice's documentation!
 Getting started
 ---------------
 
-- Installation
-- Tutorials
+- Follow the :doc:`installation instructions <getting-started/installation>`.
+- Take a look at our :doc:`tutorials <getting-started/tutorials/index>`.
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Getting Started
+   :hidden:
+
+   getting-started/installation
+   getting-started/tutorials/index
 
 API
 ---
