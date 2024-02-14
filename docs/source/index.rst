@@ -4,13 +4,13 @@ Welcome to PyJuice's documentation!
 **PyJuice** is a Python library for Probabilistic Circuits. It aims to provide a easy-to-use environment for defining PCs that support efficient and scalable training and inference.
 
 Getting started
---------
+---------------
 
 - Installation
 - Tutorials
 
 API
---------
+---
 
 - :doc:`pyjuice <python-api/pyjuice>`
 - :doc:`pyjuice.nodes <python-api/nodes>`

@@ -33,3 +33,13 @@ html_theme = 'sphinx_rtd_theme'
 
 # -- Options for EPUB output
 epub_show_urls = 'footnote'
+
+# autosummary_generate = True
+
+def skip(app, what, name, obj, would_skip, options):
+    if '__' in name or name == "clone":
+        return True
+    return would_skip
+
+def setup(app):
+    app.connect('autodoc-skip-member', skip)
