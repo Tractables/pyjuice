@@ -9,13 +9,6 @@
    .. automethod:: __init__
 
    
-   .. rubric:: Methods
-
-   .. autosummary::
-   
-      ~set_block_size.__init__
-      ~set_block_size.clone
-   
    
 
    
