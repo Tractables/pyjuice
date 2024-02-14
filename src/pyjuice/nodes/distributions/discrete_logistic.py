@@ -10,6 +10,19 @@ from .distributions import Distribution
 
 
 class DiscreteLogistic(Distribution):
+    """
+    A class representing Discrete Logistic distributions.
+
+    :param val_range: range of the values represented by the distribution
+    :type val_range: Tuple[float,float]
+
+    :param num_cats: number of categories
+    :type num_cats: int
+
+    :param min_std: minimum standard deviation
+    :type min_std: float
+    """
+
     def __init__(self, val_range: Tuple[float,float], num_cats: int, min_std: float = 0.01):
         super(DiscreteLogistic, self).__init__()
 
@@ -18,9 +31,15 @@ class DiscreteLogistic(Distribution):
         self.min_std = min_std
 
     def get_signature(self):
+        """
+        Get the signature of the current distribution.
+        """
         return "DiscreteLogistic"
 
     def get_metadata(self):
+        """
+        Get the metadata of the current distribution.
+        """
         return [self.val_range[0], self.val_range[1], self.num_cats, self.min_std]
 
     def num_parameters(self):

@@ -10,13 +10,22 @@ from .distributions import Distribution
 
 
 class Bernoulli(Distribution):
+    """
+    A class representing Bernoulli distributions.
+    """
     def __init__(self):
         super(Bernoulli, self).__init__()
 
     def get_signature(self):
+        """
+        Get the signature of the current distribution.
+        """
         return "Bernoulli"
 
     def get_metadata(self):
+        """
+        Get the metadata of the current distribution.
+        """
         return []
 
     def num_parameters(self):

@@ -10,15 +10,27 @@ from .distributions import Distribution
 
 
 class Categorical(Distribution):
+    """
+    A class representing Categorical distributions.
+
+    :param num_cats: number of categories
+    :type num_cats: int
+    """
     def __init__(self, num_cats: int):
         super(Categorical, self).__init__()
 
         self.num_cats = num_cats
 
     def get_signature(self):
+        """
+        Get the signature of the current distribution.
+        """
         return "Categorical"
 
     def get_metadata(self):
+        """
+        Get the metadata of the current distribution.
+        """
         return [self.num_cats]
 
     def normalize_parameters(self, params: torch.Tensor):

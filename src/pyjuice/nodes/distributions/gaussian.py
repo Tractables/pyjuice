@@ -10,14 +10,21 @@ from .distributions import Distribution
 
 
 class Gaussian(Distribution):
+    """
+    A class representing Gaussian distributions.
+
+    :note: `mu` and `sigma` are used to specify (approximately) the mean and std of the data. This is used for parameter initialization.
+
+    :note: The parameters will NOT be initialized directly using the values of `mu` and `sigma`, perturbations will be added. You can specify the initialization behavior by passing `perturbation`, `mu`, and `sigma` to the `init_parameters` function.
+
+    :param mu: mean of the Gaussian
+    :type mu: float
+
+    :param sigma: standard deviation of the Gaussian
+    :type sigma: float
+    """
+
     def __init__(self, mu: Optional[float] = None, sigma: Optional[float] = None, min_sigma: float = 0.01):
-        """
-        `mu` and `sigma` are used to specify (approximately) the mean and std of the data.
-        This is used for parameter initialization.
-        Note: the parameters will NOT be initialized directly using the values of `mu` and `sigma`,
-              perturbations will be added. You can specify the initialization behavior by passing
-              `perturbation`, `mu`, and `sigma` to the `init_parameters` function.
-        """
         super(Gaussian, self).__init__()
 
         self.mu = mu
@@ -25,9 +32,15 @@ class Gaussian(Distribution):
         self.min_sigma = min_sigma
 
     def get_signature(self):
+        """
+        Get the signature of the current distribution.
+        """
         return "Gaussian"
 
     def get_metadata(self):
+        """
+        Get the metadata of the current distribution.
+        """
         return [self.min_sigma]
 
     def num_parameters(self):

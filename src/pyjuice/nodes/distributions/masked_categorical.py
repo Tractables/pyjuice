@@ -10,6 +10,16 @@ from .distributions import Distribution
 
 
 class MaskedCategorical(Distribution):
+    """
+    A class representing Categorical distributions with masks.
+
+    :param num_cats: number of categories
+    :type num_cats: int
+
+    :param mask_mode: type of mask; should be in ["range", "full_mask", "rev_range"]
+    :type num_cats: str
+    """
+
     def __init__(self, num_cats: int, mask_mode: str):
         super(MaskedCategorical, self).__init__()
 
@@ -39,9 +49,15 @@ class MaskedCategorical(Distribution):
             self.em_fn = self.em_fn_rev_range
 
     def get_signature(self):
+        """
+        Get the signature of the current distribution.
+        """
         return f"MaskedCategorical-{self.mask_mode}"
 
     def get_metadata(self):
+        """
+        Get the metadata of the current distribution.
+        """
         return [self.num_cats]
 
     def num_parameters(self):

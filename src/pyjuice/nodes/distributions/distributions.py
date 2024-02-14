@@ -10,18 +10,28 @@ class Distribution():
         pass
 
     def get_signature(self):
+        """
+        Get the signature of the current distribution.
+        """
         raise NotImplementedError()
 
     def get_metadata(self):
+        """
+        Get the metadata of the current distribution.
+        """
         return [] # no metadata
 
     def normalize_parameters(self, params: torch.Tensor, **kwargs):
+        """
+        Normalize node parameters.
+        """
         return params
 
     def set_meta_parameters(self, **kwargs):
         """
         Assign meta-parameters to `self._params`.
-        Note: the actual parameters are not initialized after this function call.
+        
+        :note: the actual parameters are not initialized after this function call.
         """
         raise NotImplementedError()
 
@@ -63,16 +73,16 @@ class Distribution():
     def fw_mar_fn(*args, **kwargs):
         """
         Forward evaluation for log-probabilities.
-        Args:
-        `local_offsets`: [BLOCK_SIZE] the local indices of the to-be-processed input nodes
-        `data`: [BLOCK_SIZE, num_vars_per_node] data of the corresponding nodes
-        `params_ptr`: pointer to the parameter vector
-        `s_pids`: [BLOCK_SIZE] start parameter index (offset) for all input nodes
-        `metadata_ptr`: pointer to metadata
-        `s_mids_ptr`: pointer to the start metadata index (offset)
-        `mask`: [BLOCK_SIZE] indicate whether each node should be processed
-        `num_vars_per_node`: numbers of variables per input node/distribution
-        `BLOCK_SIZE`: CUDA block size
+
+        :param local_offsets: [BLOCK_SIZE] the local indices of the to-be-processed input nodes
+        :param data: [BLOCK_SIZE, num_vars_per_node] data of the corresponding nodes
+        :param params_ptr: pointer to the parameter vector
+        :param s_pids: [BLOCK_SIZE] start parameter index (offset) for all input nodes
+        :param metadata_ptr: pointer to metadata
+        :param s_mids_ptr: pointer to the start metadata index (offset)
+        :param mask: [BLOCK_SIZE] indicate whether each node should be processed
+        :param num_vars_per_node: numbers of variables per input node/distribution
+        :param BLOCK_SIZE: CUDA block size
         """
         raise NotImplementedError()
 
@@ -80,21 +90,21 @@ class Distribution():
     def bk_flow_fn(*args, **kwargs):
         """
         Accumulate statistics and compute input parameter flows.
-        Args:
-        `local_offsets`: [BLOCK_SIZE] the local indices of the to-be-processed input nodes
-        `ns_offsets`: [BLOCK_SIZE] the global offsets used to load from `node_mars_ptr`
-        `data`: [BLOCK_SIZE, num_vars_per_node] data of the corresponding nodes
-        `flows`: [BLOCK_SIZE] node flows
-        `node_mars_ptr`: pointer to the forward values
-        `params_ptr`: pointer to the parameter vector
-        `param_flows_ptr`: pointer to the parameter flow vector
-        `s_pids`: [BLOCK_SIZE] start parameter index (offset) for all input nodes
-        `s_pfids`: [BLOCK_SIZE] start parameter flow index (offset) for all input nodes
-        `metadata_ptr`: pointer to metadata
-        `s_mids_ptr`: pointer to the start metadata index (offset)
-        `mask`: [BLOCK_SIZE] indicate whether each node should be processed
-        `num_vars_per_node`: numbers of variables per input node/distribution
-        `BLOCK_SIZE`: CUDA block size
+
+        :param local_offsets: [BLOCK_SIZE] the local indices of the to-be-processed input nodes
+        :param ns_offsets: [BLOCK_SIZE] the global offsets used to load from `node_mars_ptr`
+        :param data: [BLOCK_SIZE, num_vars_per_node] data of the corresponding nodes
+        :param flows: [BLOCK_SIZE] node flows
+        :param node_mars_ptr: pointer to the forward values
+        :param params_ptr: pointer to the parameter vector
+        :param param_flows_ptr: pointer to the parameter flow vector
+        :param s_pids: [BLOCK_SIZE] start parameter index (offset) for all input nodes
+        :param s_pfids: [BLOCK_SIZE] start parameter flow index (offset) for all input nodes
+        :param metadata_ptr: pointer to metadata
+        :param s_mids_ptr: pointer to the start metadata index (offset)
+        :param mask: [BLOCK_SIZE] indicate whether each node should be processed
+        :param num_vars_per_node: numbers of variables per input node/distribution
+        :param BLOCK_SIZE: CUDA block size
         """
         raise NotImplementedError()
 
@@ -102,19 +112,19 @@ class Distribution():
     def sample_fn(*args, **kwargs):
         """
         Sample from the distribution.
-        Args:
-        `samples_ptr`: pointer to store the resultant samples 
-        `local_offsets`: [BLOCK_SIZE] the local indices of the to-be-processed input nodes
-        `batch_offsets`: [BLOCK_SIZE] batch id corresponding to every node
-        `vids`: [BLOCK_SIZE] variable ids (only univariate distributions are supported)
-        `s_pids`: [BLOCK_SIZE] start parameter index (offset) for all input nodes 
-        `params_ptr`: pointer to the parameter vector
-        `metadata_ptr`: pointer to metadata
-        `s_mids_ptr`: pointer to the start metadata index (offset)
-        `mask`: [BLOCK_SIZE] indicate whether each node should be processed
-        `batch_size`: batch size
-        `BLOCK_SIZE`: CUDA block size
-        `seed`: random seed
+
+        :param samples_ptr: pointer to store the resultant samples 
+        :param local_offsets: [BLOCK_SIZE] the local indices of the to-be-processed input nodes
+        :param batch_offsets: [BLOCK_SIZE] batch id corresponding to every node
+        :param vids: [BLOCK_SIZE] variable ids (only univariate distributions are supported)
+        :param s_pids: [BLOCK_SIZE] start parameter index (offset) for all input nodes 
+        :param params_ptr: pointer to the parameter vector
+        :param metadata_ptr: pointer to metadata
+        :param s_mids_ptr: pointer to the start metadata index (offset)
+        :param mask: [BLOCK_SIZE] indicate whether each node should be processed
+        :param batch_size: batch size
+        :param BLOCK_SIZE: CUDA block size
+        :param seed: random seed
         """
         raise NotImplementedError()
 
@@ -122,18 +132,18 @@ class Distribution():
     def em_fn(*args, **kwargs):
         """
         Parameter update with EM
-        Args:
-        `local_offsets`: [BLOCK_SIZE] the local indices of the to-be-processed input nodes
-        `params_ptr`: pointer to the parameter vector
-        `param_flows_ptr`: pointer to the parameter flow vector
-        `s_pids`: [BLOCK_SIZE] start parameter index (offset) for all input nodes
-        `s_pfids`: [BLOCK_SIZE] start parameter flow index (offset) for all input nodes
-        `metadata_ptr`: pointer to metadata
-        `s_mids_ptr`: pointer to the start metadata index (offset)
-        `mask`: [BLOCK_SIZE] indicate whether each node should be processed
-        `step_size`: EM step size (0, 1]
-        `pseudocount`: pseudocount 
-        `BLOCK_SIZE`: CUDA block size
+
+        :param local_offsets: [BLOCK_SIZE] the local indices of the to-be-processed input nodes
+        :param params_ptr: pointer to the parameter vector
+        :param param_flows_ptr: pointer to the parameter flow vector
+        :param s_pids: [BLOCK_SIZE] start parameter index (offset) for all input nodes
+        :param s_pfids: [BLOCK_SIZE] start parameter flow index (offset) for all input nodes
+        :param metadata_ptr: pointer to metadata
+        :param s_mids_ptr: pointer to the start metadata index (offset)
+        :param mask: [BLOCK_SIZE] indicate whether each node should be processed
+        :param step_size: EM step size (0, 1]
+        :param pseudocount: pseudocount 
+        :param BLOCK_SIZE: CUDA block size
         """
         raise NotImplementedError()
 
