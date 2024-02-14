@@ -125,7 +125,13 @@ As indicated by the tables, PyJuice is not only much faster than existing implem
 
 ## Installation
 
-Since PyJuice is in active development, we recommend installing it from the latest development branch:
+The easiest way to install PyJuice is via pip:
+
+```bash
+pip install pyjuice
+```
+
+Alternatively, you can install PyJuice from source by running the following commands:
 
 ```bash
 git clone git@github.com:Juice-jl/pyjuice.git
