@@ -36,7 +36,28 @@ def _pc_model_backward_hook(grad, pc, inputs, record_cudagraph, apply_cudagraph,
 
 class TensorCircuit(nn.Module):
     """
-    Test.
+    A class for compiled PCs. It is a subclass of `torch.nn.Module`.
+
+    :param root_ns: the root node of the PC's DAG
+    :type root_ns: CircuitNodes
+
+    :param layer_sparsity_tol: the maximum allowed fraction for added pseudo edges within every layer (better to set to a small number for sparse/block-sparse PCs)
+    :type layer_sparsity_tol: float
+
+    :param max_num_partitions: maximum number of partitions in a layer
+    :type max_num_partitions: Optional[int]
+
+    :param disable_gpu_compilation: force PyJuice to use CPU compilation
+    :type disable_gpu_compilation: bool
+
+    :param force_gpu_compilation: force PyJuice to use GPU compilation
+    :type force_gpu_compilation: bool
+
+    :param max_tied_ns_per_parflow_block: how many groups of tied parameters are allowed to share the same flow/gradient accumulator (higher values -> consumes less GPU memory; lower values -> potentially avoid stalls caused by atomic operations)
+    :type max_tied_ns_per_parflow_block: int
+
+    :param verbose: Whether to display the progress of the compilation
+    :type verbose: bool
     """
 
     def __init__(self, root_ns: CircuitNodes, layer_sparsity_tol: float = 0.5, 
@@ -44,17 +65,6 @@ class TensorCircuit(nn.Module):
                  force_gpu_compilation: bool = False,
                  max_tied_ns_per_parflow_block: int = 8,
                  verbose: bool = True) -> None:
-        """
-        Create a tensorized circuit for the circuit rooted at `root_ns`.
-
-        Parameters:
-        `root_ns`:                       root nodes of the circuit
-        `layer_sparsity_tol`:            the minimum allowed sparsity of compiled layers; ranges from 0.0 to 1.0; smaller means more strict
-        `max_num_partitions`:            how many partitions do we want to split a layer into
-        `disable_gpu_compilation`:       disable GPU compilation of the layers
-        `force_gpu_compilation`:         always use GPU when compiling the layers
-        `max_tied_ns_per_parflow_block`: when there are tied nodes, specify at most how many nodes share a parameter flow accumulation buffer within a layer
-        """
 
         super(TensorCircuit, self).__init__()
 
@@ -110,14 +120,13 @@ class TensorCircuit(nn.Module):
                 cache: Optional[dict] = None, return_cache: bool = False, record_cudagraph: bool = False, 
                 apply_cudagraph: bool = True, force_use_fp16: bool = False, force_use_fp32: bool = False, **kwargs):
         """
-        Forward the circuit.
+        Forward evaluation of the PC.
 
-        Parameters:
-        `inputs`:         [B, num_vars]
-        `input_layer_fn`: Custom forward function for input layers;
-                          if it is a string, then try to call 
-                          the corresponding member function of `input_layer`
-        `kwargs`:         Additional arguments for input layers
+        :param inputs: input tensor of size `[B, num_vars]`
+        :type inputs: torch.Tensor
+
+        :param input_layer_fn: Custom forward function for input layers; if it is a string, then try to call the corresponding member function of the input layers
+        :type input_layer_fn: Optional[Union[str,Callable]]
         """
         
         assert inputs.dim() == 2 and inputs.size(1) == self.num_vars
@@ -236,15 +245,14 @@ class TensorCircuit(nn.Module):
                  allow_modify_flows: bool = True,
                  **kwargs):
         """
-        Compute circuit flows.
+        Backward evaluation of the PC that computes node flows as well as parameter flows.
 
-        Parameters:
-        `inputs`:         None or [B, num_vars]
-        `ll_weights`:     None or [B] or [num_roots, B]
-        `input_layer_fn`: Custom forward function for input layers;
-                          if it is a string, then try to call 
-                          the corresponding member function of `input_layer`
-        `kwargs`:         Additional arguments for input layers
+        :param inputs:         None or [B, num_vars]
+
+        :param ll_weights:     None or [B] or [num_roots, B]
+        
+        :param input_layer_fn: Custom forward function for input layers; if it is a string, then try to call the corresponding member function of the input layers
+        :type input_layer_fn: Optional[Union[str,Callable]]
         """
 
         assert self.node_mars is not None and self.element_mars is not None, "Should run forward path first."
@@ -364,6 +372,18 @@ class TensorCircuit(nn.Module):
             return None
 
     def mini_batch_em(self, step_size: float, pseudocount: float = 0.0, keep_zero_params: bool = False):
+        """
+        Perform an EM parameter update step using the accumulated parameter flows.
+
+        :param step_size: Step size - updated_params <- (1-step_size) * params + step_size * new_params
+        :type step_size: float
+
+        :param pseudocount: a pseudo count added to the parameter flows
+        :type pseudocount: float
+
+        :param keep_zero_params: if set to `True`, do not add pseudocounts to zero parameters
+        :type keep_zero_params: bool
+        """
         # Update input layers
         for layer in self.input_layer_group:
             layer.mini_batch_em(step_size = step_size, pseudocount = pseudocount)
@@ -382,6 +402,12 @@ class TensorCircuit(nn.Module):
             self.backward(inputs = inputs, compute_param_flows = True, flows_memory = 1.0)
 
     def init_param_flows(self, flows_memory: float = 1.0, batch_size: Optional[int] = None):
+        """
+        Initialize parameter flows.
+
+        :param flows_memory: the number that the current parameter flows (if any) will be multiplied by; equivalent to zeroling the flows if set to 0
+        :type flows_memory: float
+        """
 
         assert 0.0 <= flows_memory <= 1.0, f"`flows_memory` should be in [0.0, 1.0]"
 
@@ -403,7 +429,10 @@ class TensorCircuit(nn.Module):
 
     def update_parameters(self, clone: bool = True):
         """
-        Copy parameters from this `TensorCircuit` to the original `CircuitNodes`
+        Copy parameters from this `TensorCircuit` to the original `CircuitNodes`.
+
+        :param clone: whether to deepcopy parameters
+        :type clone: bool
         """
         params = self.params.detach().cpu()
 
@@ -418,7 +447,10 @@ class TensorCircuit(nn.Module):
 
     def update_param_flows(self, clone: bool = True, origin_ns_only: bool = True):
         """
-        Copy parameter flows from this `TensorCircuit` to the original `CircuitNodes`
+        Copy parameter flows from this `TensorCircuit` to the original `CircuitNodes`.
+
+        :param clone: whether to deepcopy parameters
+        :type clone: bool
         """
         param_flows = self.param_flows.detach().cpu()
 
