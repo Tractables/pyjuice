@@ -23,3 +23,4 @@ API
 
    python-api/pyjuice
    python-api/nodes
+   python-api/tensorcircuit
