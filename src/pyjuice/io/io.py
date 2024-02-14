@@ -11,6 +11,15 @@ from .serialization import serialize_nodes, deserialize_nodes
 
 
 def save(fname: str, model: Union[CircuitNodes,TensorCircuit]):
+    """
+    Save a PC to file. The file should end with ".jpc".
+
+    :param fname: file name
+    :type fname: str
+
+    :param model: an uncompiled (`CircuitNodes`) or compiled (`TensorCircuit`) PC
+    :type model: Union[CircuitNodes,TensorCircuit]
+    """
     if isinstance(model, TensorCircuit):
         model.update_parameters()
         root_ns = model.root_ns
@@ -25,7 +34,15 @@ def save(fname: str, model: Union[CircuitNodes,TensorCircuit]):
         raise ValueError(f"Unknown file type `.{fname.split('.')[-1]}`.")
 
 
-def load(fname: str):
+def load(fname: str) -> CircuitNodes:
+    """
+    Load a PC from file. The file should end with ".jpc".
+
+    :param fname: file name
+    :type fname: str
+
+    :returns: a PC node
+    """
     if fname.endswith(".jpc"):
         with open(fname, "rb") as f:
             sel_nodes = pickle.load(f)
