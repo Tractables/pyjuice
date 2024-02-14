@@ -73,6 +73,33 @@ def HCLT(x: torch.Tensor, num_latents: int,
          input_dist: Optional[Distribution] = None,
          input_node_type: Type[Distribution] = Categorical, 
          input_node_params: dict = {"num_cats": 256}):
+    """
+    Construct Hidden Chow-Liu Trees (https://arxiv.org/pdf/2106.02264.pdf).
+
+    :param x: the input data of size [# samples, # variables] used to construct the backbone Chow-Liu Tree
+    :type x: torch.Tensor
+
+    :param num_latents: size of the latent space
+    :type num_latents: int
+
+    :param num_bins: number of bins to divide the input data for mutual information estimation
+    :type num_bins: int
+
+    :param sigma: a variation parameter used when estimating mutual information
+    :type sigma: float
+
+    :param chunk_size: chunk size to compute mutual information (consider decreasing if running out of GPU memory)
+    :type chunk_size: int
+
+    :param num_root_ns: number of root nodes
+    :type num_root_ns: int
+
+    :param block_size: block size
+    :type block_size: int
+
+    :param input_dist: input distribution
+    :type input_dist: Distribution
+    """
 
     if input_dist is not None:
         input_node_type, input_node_params = input_dist._get_constructor()

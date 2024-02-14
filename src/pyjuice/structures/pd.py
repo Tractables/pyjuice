@@ -21,18 +21,45 @@ def PD(data_shape: Tuple, num_latents: int,
        max_prod_block_conns: int = 4,
        structure_type: str = "sum_dominated",
        input_layer_fn: Optional[Callable] = None,
+       input_dists: Optional[Distribution] = None,
        input_layer_type: Type[Distribution] = Categorical, 
        input_layer_params: Dict = {"num_cats": 256},
        use_linear_mixing: bool = False,
        block_size: Optional[int] = None):
     """
-    The PD structure was proposed in
-        Sum-Product Networks: A New Deep Architecture
-        Hoifung Poon, Pedro Domingos
-        UAI 2011
-    and generates a PC structure for random variables which can be naturally arranged on discrete grids, like images.
+    Generate PCs with the PD structure (https://arxiv.org/pdf/1202.3732.pdf).
+
+    :param data_shape: shape of the data (e.g., [H, W, 3] for images and [S] for sequences)
+    :type data_shape: Tuple
+
+    :param num_latents: size of the latent space
+    :type num_latents: int
+
+    :param split_intervals: a sequence of integers specifying the interval between split points in every dimension; either this or `split_points` needs to be specified
+    :type split_intervals: Optional[Union[int, Tuple[int]]]
+
+    :param split_points: a sequence of split points in each dimension; either this or `split_intervals` needs to be specified
+    :type split_points: Optional[Sequence[Sequence[int]]]
+
+    :param max_split_depth: maximum depth of the splits
+    :type max_split_depth: Optional[int]
+
+    :param max_prod_block_conns: the maximum number of product nodes connected to every sum node
+    :type max_prod_block_conns: int
+
+    :param structure_type: whether to reuse sum nodes; no reuse: "sum_dominated", reuse: "prod_dominated"
+    :type structure_type: str
+
+    :param input_dist: input distribution
+    :type input_dist: Distribution
+
+    :param block_size: block size
+    :type block_size: int
     """
     assert structure_type in ["sum_dominated", "prod_dominated"]
+
+    if input_dist is not None:
+        input_node_type, input_node_params = input_dist._get_constructor()
 
     # Specify block size
     if block_size is None:

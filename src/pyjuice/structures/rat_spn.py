@@ -13,13 +13,41 @@ from pyjuice.utils import BitSet
 
 
 def RAT_SPN(num_vars: int, num_latents: int, depth: int, num_repetitions: int, num_pieces: int = 2,
-            block_size: Optional[int] = None,
+            input_dists: Optional[Distribution] = None,
             input_layer_type: Type[Distribution] = Categorical, 
-            input_layer_params: dict = {"num_cats": 256}):
+            input_layer_params: dict = {"num_cats": 256},
+            block_size: Optional[int] = None):
+    """
+    Generate Random and Tensorized SPNs (https://proceedings.mlr.press/v115/peharz20a/peharz20a.pdf)
+
+    :param num_vars: number of variables
+    :type num_vars: int
+
+    :param num_latents: size of the latent space
+    :type num_latents: int
+
+    :param depth: splitting depth of variable scopes
+    :type depth: int
+
+    :param num_repetitions: number of random splits
+    :type num_repetitions: int
+
+    :param num_pieces: the number of sub-scopes splitted from any scope
+    :type num_pieces: int
+
+    :param input_dist: input distribution
+    :type input_dist: Distribution
+
+    :param block_size: block size
+    :type block_size: int
+    """
 
     # Specify block size
     if block_size is None:
         block_size = min(256, max_cdf_power_of_2(num_latents))
+
+    if input_dist is not None:
+        input_node_type, input_node_params = input_dist._get_constructor()
 
     assert num_latents % block_size == 0, f"`num_latents` ({num_latents}) not divisible by `block_size` ({block_size})."
     num_node_blocks = num_latents // block_size

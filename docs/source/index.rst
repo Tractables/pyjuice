@@ -15,6 +15,7 @@ API
 - :doc:`pyjuice <python-api/pyjuice>`
 - :doc:`pyjuice.nodes <python-api/nodes>`
 - :doc:`pyjuice.TensorCircuit <python-api/tensorcircuit>`
+- :doc:`pyjuice.structures <python-api/structures>`
 
 .. toctree::
    :maxdepth: 1
@@ -24,3 +25,4 @@ API
    python-api/pyjuice
    python-api/nodes
    python-api/tensorcircuit
+   python-api/structures
