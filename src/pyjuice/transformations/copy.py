@@ -7,8 +7,23 @@ from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes
 from pyjuice.utils import BitSet
 
 
-def deepcopy(root_nodes: CircuitNodes, tie_params: bool = False, 
-             var_mapping: Optional[Dict[int,int]] = None):
+def deepcopy(root_ns: CircuitNodes, tie_params: bool = False, 
+             var_mapping: Optional[Dict[int,int]] = None) -> CircuitNodes:
+    """
+    Create a deepcopy of the input PC.
+
+    :param root_ns: the input PC
+    :type root_ns: CircuitNodes
+
+    :param tie_params: whether to tie the parameters between the original PC and the copied PC (if tied, their parameters will always be the same)
+    :type tie_params: bool
+
+    :param var_mapping: a mapping dictionary between the variables of the original PC and the copied PC
+    :type var_mapping: Optional[Dict[int,int]]
+
+    :returns: a copied PC
+    """
+
     old2new = dict()
     tied_ns_pairs = []
 
@@ -76,7 +91,7 @@ def deepcopy(root_nodes: CircuitNodes, tie_params: bool = False,
 
         old2new[ns] = new_ns
 
-    dfs(root_nodes)
+    dfs(root_ns)
 
     for ns, source_ns in tied_ns_pairs:
         new_ns = old2new[ns]
@@ -84,4 +99,4 @@ def deepcopy(root_nodes: CircuitNodes, tie_params: bool = False,
 
         new_ns._source_node = new_source_ns
 
-    return old2new[root_nodes]
+    return old2new[root_ns]

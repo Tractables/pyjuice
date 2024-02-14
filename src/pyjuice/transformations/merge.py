@@ -214,12 +214,32 @@ def merge_by_region_node(root_ns: CircuitNodes) -> CircuitNodes:
 def merge(ns1: CircuitNodes, *args) -> CircuitNodes:
     """
     Merge nodes with identical region node together.
+
+    :param ns1: the first PC node
+    :type ns1: CircuitNodes
+
+    :param args: the remaining PC nodes
+    :type args: CircuitNodes
+
+    Example::
+        >>> i00 = inputs(0, num_node_blocks, dists.Categorical(num_cats = 5))
+        >>> i01 = inputs(0, num_node_blocks, dists.Categorical(num_cats = 5))
+        >>> i10 = inputs(1, num_node_blocks, dists.Categorical(num_cats = 5))
+        >>> i11 = inputs(1, num_node_blocks, dists.Categorical(num_cats = 5))
+ 
+        >>> m00 = multiply(i00, i10)
+        >>> m01 = multiply(i01, i11)
+
+        >>> n0 = summate(m00, num_node_blocks = num_node_blocks)
+        >>> n1 = summate(m01, num_node_blocks = num_node_blocks)
+
+        >>> n_new = pyjuice.merge(n0, n1)
     """
-    if isinstance(ns1, SumNodes) and len(args) > 0 and isinstance(args[0], SumNodes):
+    if ns1.is_sum() and len(args) > 0 and args[0].is_sum():
         return merge_sum_nodes(ns1, args[0], *args[1:])
-    elif isinstance(ns1, ProdNodes) and len(args) > 0 and isinstance(args[0], ProdNodes):
+    elif ns1.is_prod() and len(args) > 0 and args[0].is_prod():
         return merge_prod_nodes(ns1, args[0], *args[1:])
     elif len(args) == 0:
         return merge_by_region_node(ns1)
     else:
-        raise NotImplementedError()
+        raise ValueError()

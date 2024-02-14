@@ -64,7 +64,24 @@ def _copy_params_kernel(new_params, params, target_id0, target_id1, target_id2,
     tl.store(new_params + offs_npars, pars)
 
 
-def blockify(root_ns: CircuitNodes, sparsity_tolerance: float = 0.25, max_target_block_size: int = 32, use_cuda: bool = True):
+def blockify(root_ns: CircuitNodes, sparsity_tolerance: float = 0.25, max_target_block_size: int = 32, use_cuda: bool = True) -> CircuitNodes:
+    """
+    Generate an equivalent PC with potentially high block sizes.
+
+    :param root_ns: the input PC
+    :type root_ns: CircuitNodes
+
+    :param sparsity_tolerance: allowed fraction of zero parameters to be added (should be in the range (0, 1])
+    :type sparsity_tolerance: float
+
+    :param max_target_block_size: the maximum block size to search for
+    :type max_target_block_size: int
+
+    :param use_cuda: use GPU when possible
+    :type use_cuda: bool
+
+    :returns: An equivalent `CircuitNodes`
+    """
 
     if use_cuda:
         device = torch.device("cuda:0")
@@ -322,6 +339,23 @@ def blockify(root_ns: CircuitNodes, sparsity_tolerance: float = 0.25, max_target
 
 
 def unblockify(root_ns: CircuitNodes, block_size: int = 1, recursive: bool = True, keys_to_copy: Optional[Sequence[str]] = None):
+    """
+    Decrease the block size of a PC.
+
+    :param root_ns: the input PC
+    :type root_ns: CircuitNodes
+
+    :param block_size: the target block size
+    :type block_size: int
+
+    :param recursive: whether to do it recursively or just for the current node
+    :type recursive: bool
+
+    :param keys_to_copy: an optional dictionary of properties to copy
+    :type keys_to_copy: Optional[Sequence[str]]
+
+    :returns: An equivalent `CircuitNodes`
+    """
     
     def update_ns(ns: CircuitNodes, ns_chs: Sequence[CircuitNodes]):
         new_block_size = min(block_size, ns.block_size)
