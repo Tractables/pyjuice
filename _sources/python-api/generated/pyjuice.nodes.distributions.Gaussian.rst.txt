@@ -9,6 +9,13 @@
    .. automethod:: __init__
 
    
+   .. rubric:: Methods
+
+   .. autosummary::
+   
+      ~Gaussian.num_param_flows
+      ~Gaussian.num_parameters
+   
    
 
    

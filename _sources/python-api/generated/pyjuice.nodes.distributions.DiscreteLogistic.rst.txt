@@ -9,6 +9,13 @@
    .. automethod:: __init__
 
    
+   .. rubric:: Methods
+
+   .. autosummary::
+   
+      ~DiscreteLogistic.num_param_flows
+      ~DiscreteLogistic.num_parameters
+   
    
 
    
