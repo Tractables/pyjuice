@@ -8,9 +8,9 @@ version="2.0.0"
 description = "Probabilistic Circuits Library"
 dependencies = [
     "numpy",
-    "torch>=2.0.0",
+    "torch>=2.2.0",
     "typing",
-    "triton>=2.1.0",
+    "triton>=2.2.0",
     "networkx",
     "numba",
     "packaging",
