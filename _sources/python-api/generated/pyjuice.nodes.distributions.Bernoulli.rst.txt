@@ -1,0 +1,40 @@
+﻿pyjuice.nodes.distributions.Bernoulli
+=====================================
+
+.. currentmodule:: pyjuice.nodes.distributions
+
+.. autoclass:: Bernoulli
+
+   
+   .. automethod:: __init__
+
+   
+   .. rubric:: Methods
+
+   .. autosummary::
+   
+      ~Bernoulli._get_constructor
+      ~Bernoulli.bk_flow_fn
+      ~Bernoulli.em_fn
+      ~Bernoulli.fw_mar_fn
+      ~Bernoulli.get_metadata
+      ~Bernoulli.get_signature
+      ~Bernoulli.init_meta_parameters
+      ~Bernoulli.init_parameters
+      ~Bernoulli.normalize_parameters
+      ~Bernoulli.num_param_flows
+      ~Bernoulli.num_parameters
+      ~Bernoulli.sample_fn
+      ~Bernoulli.set_meta_parameters
+   
+   
+
+   
+   
+   .. rubric:: Attributes
+
+   .. autosummary::
+   
+      ~Bernoulli.need_meta_parameters
+   
+   
