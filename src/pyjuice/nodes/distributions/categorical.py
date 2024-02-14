@@ -40,9 +40,15 @@ class Categorical(Distribution):
         return params.reshape(-1)
 
     def num_parameters(self):
+        """
+        The number of parameters per node.
+        """
         return self.num_cats
 
     def num_param_flows(self):
+        """
+        The number of parameter flows per node.
+        """
         return self.num_cats
 
     def init_parameters(self, num_nodes: int, perturbation: float = 2.0, params: Optional[Any] = None, **kwargs):

@@ -61,6 +61,9 @@ class MaskedCategorical(Distribution):
         return [self.num_cats]
 
     def num_parameters(self):
+        """
+        The number of parameters per node.
+        """
         if self.mask_mode == "range":
             return self.num_cats + 3
         elif self.mask_mode == "full_mask":
@@ -71,6 +74,9 @@ class MaskedCategorical(Distribution):
             raise ValueError(f"Unknown mask mode {self.mask_mode}.")
 
     def num_param_flows(self):
+        """
+        The number of parameter flows per node.
+        """
         return self.num_cats
 
     def init_parameters(self, num_nodes: int, perturbation: float = 2.0, params: Optional[torch.Tensor] = None, **kwargs):

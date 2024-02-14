@@ -44,9 +44,15 @@ class Gaussian(Distribution):
         return [self.min_sigma]
 
     def num_parameters(self):
+        """
+        The number of parameters per node.
+        """
         return 2
 
     def num_param_flows(self):
+        """
+        The number of parameter flows per node.
+        """
         return 3
 
     def init_parameters(self, num_nodes: int, perturbation: float = 2.0, params: Optional[Any] = None, **kwargs):
