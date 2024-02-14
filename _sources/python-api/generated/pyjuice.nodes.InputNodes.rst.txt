@@ -13,35 +13,14 @@
 
    .. autosummary::
    
-      ~InputNodes._clear_tensor_circuit_hooks
-      ~InputNodes._run_init_callbacks
       ~InputNodes.duplicate
       ~InputNodes.get_params
-      ~InputNodes.get_source_ns
-      ~InputNodes.has_params
       ~InputNodes.init_parameters
-      ~InputNodes.is_input
-      ~InputNodes.is_prod
-      ~InputNodes.is_sum
-      ~InputNodes.is_tied
-      ~InputNodes.provided
       ~InputNodes.set_meta_params
       ~InputNodes.set_params
-      ~InputNodes.set_source_ns
    
    
 
    
-   
-   .. rubric:: Attributes
-
-   .. autosummary::
-   
-      ~InputNodes.DEFAULT_BLOCK_SIZE
-      ~InputNodes.INIT_CALLBACKS
-      ~InputNodes.num_chs
-      ~InputNodes.num_edges
-      ~InputNodes.num_nodes
-      ~InputNodes.scope
    
    

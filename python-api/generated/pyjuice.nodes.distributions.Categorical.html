@@ -101,50 +101,6 @@
 <span class="sig-name descname"><span class="pre">__init__</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">num_cats</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyjuice.nodes.distributions.Categorical.__init__" title="Link to this definition"></a></dt>
 <dd></dd></dl>
 
-<p class="rubric">Methods</p>
-<table class="autosummary longtable docutils align-default">
-<tbody>
-<tr class="row-odd"><td><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">_get_constructor</span></code>()</p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-even"><td><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">bk_flow_fn</span></code>(local_offsets, ns_offsets, data, ...)</p></td>
-<td><p>Accumulate statistics and compute input parameter flows.</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">em_fn</span></code>(local_offsets, params_ptr, ...)</p></td>
-<td><p>Parameter update with EM Args: <cite>local_offsets</cite>: [BLOCK_SIZE] the local indices of the to-be-processed input nodes <cite>params_ptr</cite>: pointer to the parameter vector <cite>param_flows_ptr</cite>: pointer to the parameter flow vector <cite>s_pids</cite>: [BLOCK_SIZE] start parameter index (offset) for all input nodes <cite>s_pfids</cite>: [BLOCK_SIZE] start parameter flow index (offset) for all input nodes <cite>metadata_ptr</cite>: pointer to metadata <cite>s_mids_ptr</cite>: pointer to the start metadata index (offset) <cite>mask</cite>: [BLOCK_SIZE] indicate whether each node should be processed <cite>step_size</cite>: EM step size (0, 1] <cite>pseudocount</cite>: pseudocount  <cite>BLOCK_SIZE</cite>: CUDA block size</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">fw_mar_fn</span></code>(local_offsets, data, params_ptr, ...)</p></td>
-<td><p>Forward evaluation for log-probabilities.</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">get_metadata</span></code>()</p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-even"><td><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">get_signature</span></code>()</p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_meta_parameters</span></code>(num_nodes, params, **kwargs)</p></td>
-<td><p>Initialize meta-parameters for <cite>num_nodes</cite> nodes.</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_parameters</span></code>(num_nodes[, perturbation, ...])</p></td>
-<td><p>Initialize parameters for <cite>num_nodes</cite> nodes.</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">normalize_parameters</span></code>(params)</p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-even"><td><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">num_param_flows</span></code>()</p></td>
-<td><p>The number of parameter flows per node.</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">num_parameters</span></code>()</p></td>
-<td><p>The number of parameters per node.</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">sample_fn</span></code>(samples_ptr, local_offsets, ...)</p></td>
-<td><p>Sample from the distribution.</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_meta_parameters</span></code>(**kwargs)</p></td>
-<td><p>Assign meta-parameters to <cite>self._params</cite>.</p></td>
-</tr>
-</tbody>
-</table>
 <p class="rubric">Attributes</p>
 <table class="autosummary longtable docutils align-default">
 <tbody>

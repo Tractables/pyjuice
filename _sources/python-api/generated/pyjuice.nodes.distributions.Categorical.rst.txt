@@ -9,24 +9,6 @@
    .. automethod:: __init__
 
    
-   .. rubric:: Methods
-
-   .. autosummary::
-   
-      ~Categorical._get_constructor
-      ~Categorical.bk_flow_fn
-      ~Categorical.em_fn
-      ~Categorical.fw_mar_fn
-      ~Categorical.get_metadata
-      ~Categorical.get_signature
-      ~Categorical.init_meta_parameters
-      ~Categorical.init_parameters
-      ~Categorical.normalize_parameters
-      ~Categorical.num_param_flows
-      ~Categorical.num_parameters
-      ~Categorical.sample_fn
-      ~Categorical.set_meta_parameters
-   
    
 
    

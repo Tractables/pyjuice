@@ -13,38 +13,13 @@
 
    .. autosummary::
    
-      ~ProdNodes._clear_tensor_circuit_hooks
-      ~ProdNodes._construct_edges
-      ~ProdNodes._run_init_callbacks
       ~ProdNodes.duplicate
-      ~ProdNodes.get_source_ns
-      ~ProdNodes.has_params
       ~ProdNodes.init_parameters
       ~ProdNodes.is_block_sparse
-      ~ProdNodes.is_input
-      ~ProdNodes.is_prod
       ~ProdNodes.is_sparse
-      ~ProdNodes.is_sum
-      ~ProdNodes.is_tied
-      ~ProdNodes.provided
-      ~ProdNodes.set_source_ns
    
    
 
    
-   
-   .. rubric:: Attributes
-
-   .. autosummary::
-   
-      ~ProdNodes.BLOCK_SPARSE
-      ~ProdNodes.DEFAULT_BLOCK_SIZE
-      ~ProdNodes.INIT_CALLBACKS
-      ~ProdNodes.SPARSE
-      ~ProdNodes.edge_type
-      ~ProdNodes.num_chs
-      ~ProdNodes.num_edges
-      ~ProdNodes.num_nodes
-      ~ProdNodes.scope
    
    

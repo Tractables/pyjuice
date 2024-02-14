@@ -13,44 +13,16 @@
 
    .. autosummary::
    
-      ~SumNodes._clear_tensor_circuit_hooks
-      ~SumNodes._construct_edges
-      ~SumNodes._get_edges_as_mask
-      ~SumNodes._reorder_edges
-      ~SumNodes._run_init_callbacks
-      ~SumNodes._standardize_chs
       ~SumNodes.duplicate
       ~SumNodes.gather_parameters
       ~SumNodes.get_params
-      ~SumNodes.get_source_ns
-      ~SumNodes.get_zero_param_mask
-      ~SumNodes.has_params
       ~SumNodes.init_parameters
-      ~SumNodes.is_input
-      ~SumNodes.is_prod
-      ~SumNodes.is_sum
-      ~SumNodes.is_tied
-      ~SumNodes.provided
-      ~SumNodes.set_edges
       ~SumNodes.set_params
-      ~SumNodes.set_source_ns
-      ~SumNodes.set_zero_param_mask
       ~SumNodes.update_param_flows
       ~SumNodes.update_parameters
    
    
 
    
-   
-   .. rubric:: Attributes
-
-   .. autosummary::
-   
-      ~SumNodes.DEFAULT_BLOCK_SIZE
-      ~SumNodes.INIT_CALLBACKS
-      ~SumNodes.num_chs
-      ~SumNodes.num_edges
-      ~SumNodes.num_nodes
-      ~SumNodes.scope
    
    
