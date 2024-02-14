@@ -1,10 +1,8 @@
 pyjuice.TensorCircuit
 =====================
 
-.. currentmodule:: pyjuice
+.. autoclass:: pyjuice.TensorCircuit
+    :members:
 
-.. autosummary::
-    :toctree: generated
-    :nosignatures:
-
-    TensorCircuit
+    .. automethod:: pyjuice.TensorCircuit.forward
+    .. automethod:: pyjuice.TensorCircuit.backward
