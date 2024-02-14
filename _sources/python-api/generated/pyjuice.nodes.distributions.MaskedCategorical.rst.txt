@@ -1,0 +1,22 @@
+﻿pyjuice.nodes.distributions.MaskedCategorical
+=============================================
+
+.. currentmodule:: pyjuice.nodes.distributions
+
+.. autoclass:: MaskedCategorical
+
+   
+   .. automethod:: __init__
+
+   
+   
+
+   
+   
+   .. rubric:: Attributes
+
+   .. autosummary::
+   
+      ~MaskedCategorical.need_meta_parameters
+   
+   

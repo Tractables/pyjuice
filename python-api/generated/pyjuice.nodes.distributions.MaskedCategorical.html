@@ -4,7 +4,7 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>pyjuice.nodes.distributions.Bernoulli &mdash; PyJuice 2.0.0 documentation</title>
+  <title>pyjuice.nodes.distributions.MaskedCategorical &mdash; PyJuice 2.0.0 documentation</title>
       <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=80d5e7a1" />
       <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=19f00094" />
 
@@ -21,8 +21,8 @@
     <script src="../../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../../genindex.html" />
     <link rel="search" title="Search" href="../../search.html" />
-    <link rel="next" title="pyjuice.nodes.distributions.Categorical" href="pyjuice.nodes.distributions.Categorical.html" />
-    <link rel="prev" title="pyjuice.nodes.foldup_aggregate" href="pyjuice.nodes.foldup_aggregate.html" /> 
+    <link rel="next" title="pyjuice.TensorCircuit" href="../tensorcircuit.html" />
+    <link rel="prev" title="pyjuice.nodes.distributions.Gaussian" href="pyjuice.nodes.distributions.Gaussian.html" /> 
 </head>
 
 <body class="wy-body-for-nav"> 
@@ -54,14 +54,14 @@
 <li class="toctree-l2"><a class="reference internal" href="../nodes.html#nodes">Nodes</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../nodes.html#methods">Methods</a></li>
 <li class="toctree-l2 current"><a class="reference internal" href="../nodes.html#input-distributions">Input Distributions</a><ul class="current">
-<li class="toctree-l3 current"><a class="current reference internal" href="#">pyjuice.nodes.distributions.Bernoulli</a><ul>
-<li class="toctree-l4"><a class="reference internal" href="#pyjuice.nodes.distributions.Bernoulli"><code class="docutils literal notranslate"><span class="pre">Bernoulli</span></code></a></li>
-</ul>
-</li>
+<li class="toctree-l3"><a class="reference internal" href="pyjuice.nodes.distributions.Bernoulli.html">pyjuice.nodes.distributions.Bernoulli</a></li>
 <li class="toctree-l3"><a class="reference internal" href="pyjuice.nodes.distributions.Categorical.html">pyjuice.nodes.distributions.Categorical</a></li>
 <li class="toctree-l3"><a class="reference internal" href="pyjuice.nodes.distributions.DiscreteLogistic.html">pyjuice.nodes.distributions.DiscreteLogistic</a></li>
 <li class="toctree-l3"><a class="reference internal" href="pyjuice.nodes.distributions.Gaussian.html">pyjuice.nodes.distributions.Gaussian</a></li>
-<li class="toctree-l3"><a class="reference internal" href="pyjuice.nodes.distributions.MaskedCategorical.html">pyjuice.nodes.distributions.MaskedCategorical</a></li>
+<li class="toctree-l3 current"><a class="current reference internal" href="#">pyjuice.nodes.distributions.MaskedCategorical</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#pyjuice.nodes.distributions.MaskedCategorical"><code class="docutils literal notranslate"><span class="pre">MaskedCategorical</span></code></a></li>
+</ul>
+</li>
 </ul>
 </li>
 </ul>
@@ -84,9 +84,9 @@
   <ul class="wy-breadcrumbs">
       <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
           <li class="breadcrumb-item"><a href="../nodes.html">pyjuice.nodes</a></li>
-      <li class="breadcrumb-item active">pyjuice.nodes.distributions.Bernoulli</li>
+      <li class="breadcrumb-item active">pyjuice.nodes.distributions.MaskedCategorical</li>
       <li class="wy-breadcrumbs-aside">
-            <a href="../../_sources/python-api/generated/pyjuice.nodes.distributions.Bernoulli.rst.txt" rel="nofollow"> View page source</a>
+            <a href="../../_sources/python-api/generated/pyjuice.nodes.distributions.MaskedCategorical.rst.txt" rel="nofollow"> View page source</a>
       </li>
   </ul>
   <hr/>
@@ -94,15 +94,23 @@
           <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
            <div itemprop="articleBody">
              
-  <section id="pyjuice-nodes-distributions-bernoulli">
-<h1>pyjuice.nodes.distributions.Bernoulli<a class="headerlink" href="#pyjuice-nodes-distributions-bernoulli" title="Link to this heading"></a></h1>
+  <section id="pyjuice-nodes-distributions-maskedcategorical">
+<h1>pyjuice.nodes.distributions.MaskedCategorical<a class="headerlink" href="#pyjuice-nodes-distributions-maskedcategorical" title="Link to this heading"></a></h1>
 <dl class="py class">
-<dt class="sig sig-object py" id="pyjuice.nodes.distributions.Bernoulli">
-<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">pyjuice.nodes.distributions.</span></span><span class="sig-name descname"><span class="pre">Bernoulli</span></span><a class="headerlink" href="#pyjuice.nodes.distributions.Bernoulli" title="Link to this definition"></a></dt>
-<dd><p>A class representing Bernoulli distributions.</p>
+<dt class="sig sig-object py" id="pyjuice.nodes.distributions.MaskedCategorical">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">pyjuice.nodes.distributions.</span></span><span class="sig-name descname"><span class="pre">MaskedCategorical</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">num_cats</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">mask_mode</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyjuice.nodes.distributions.MaskedCategorical" title="Link to this definition"></a></dt>
+<dd><p>A class representing Categorical distributions with masks.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>num_cats</strong> (<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>) – number of categories</p></li>
+<li><p><strong>mask_mode</strong> – type of mask; should be in [“range”, “full_mask”, “rev_range”]</p></li>
+</ul>
+</dd>
+</dl>
 <dl class="py method">
-<dt class="sig sig-object py" id="pyjuice.nodes.distributions.Bernoulli.__init__">
-<span class="sig-name descname"><span class="pre">__init__</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#pyjuice.nodes.distributions.Bernoulli.__init__" title="Link to this definition"></a></dt>
+<dt class="sig sig-object py" id="pyjuice.nodes.distributions.MaskedCategorical.__init__">
+<span class="sig-name descname"><span class="pre">__init__</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">num_cats</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">mask_mode</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyjuice.nodes.distributions.MaskedCategorical.__init__" title="Link to this definition"></a></dt>
 <dd></dd></dl>
 
 <p class="rubric">Attributes</p>
@@ -121,8 +129,8 @@
            </div>
           </div>
           <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
-        <a href="pyjuice.nodes.foldup_aggregate.html" class="btn btn-neutral float-left" title="pyjuice.nodes.foldup_aggregate" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
-        <a href="pyjuice.nodes.distributions.Categorical.html" class="btn btn-neutral float-right" title="pyjuice.nodes.distributions.Categorical" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+        <a href="pyjuice.nodes.distributions.Gaussian.html" class="btn btn-neutral float-left" title="pyjuice.nodes.distributions.Gaussian" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="../tensorcircuit.html" class="btn btn-neutral float-right" title="pyjuice.TensorCircuit" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
     </div>
 
   <hr/>

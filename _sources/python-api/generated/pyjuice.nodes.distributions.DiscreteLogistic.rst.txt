@@ -1,0 +1,22 @@
+﻿pyjuice.nodes.distributions.DiscreteLogistic
+============================================
+
+.. currentmodule:: pyjuice.nodes.distributions
+
+.. autoclass:: DiscreteLogistic
+
+   
+   .. automethod:: __init__
+
+   
+   
+
+   
+   
+   .. rubric:: Attributes
+
+   .. autosummary::
+   
+      ~DiscreteLogistic.need_meta_parameters
+   
+   

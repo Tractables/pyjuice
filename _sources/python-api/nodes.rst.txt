@@ -33,4 +33,6 @@ Input Distributions
 
     distributions.Bernoulli
     distributions.Categorical
-
+    distributions.DiscreteLogistic
+    distributions.Gaussian
+    distributions.MaskedCategorical
