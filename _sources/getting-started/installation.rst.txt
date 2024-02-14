@@ -1,7 +1,13 @@
 Installation
 ============
 
-Since PyJuice is in active development, we recommend installing it from the latest development branch:
+The easiest way to install PyJuice is via pip:
+
+.. code-block:: bash
+
+    pip install pyjuice
+
+Alternatively, you can install PyJuice from source by running the following commands:
 
 .. code-block:: bash
 
