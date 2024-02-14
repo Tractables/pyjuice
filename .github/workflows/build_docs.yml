@@ -30,9 +30,12 @@ jobs:
         run: |
           pip install sphinx sphinx_rtd_theme myst_parser
 
-      - name: Build the documentation with Sphinx
+      - name: Install PyJuice
         run: |
           pip install -e .
+
+      - name: Build the documentation with Sphinx
+        run: |
           sphinx-build -b html docs/source docs/build/html
 
       - name: Publish the documentation
