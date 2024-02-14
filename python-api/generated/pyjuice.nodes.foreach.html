@@ -95,8 +95,29 @@
 <h1>pyjuice.nodes.foreach<a class="headerlink" href="#pyjuice-nodes-foreach" title="Link to this heading"></a></h1>
 <dl class="py function">
 <dt class="sig sig-object py" id="pyjuice.nodes.foreach">
-<span class="sig-prename descclassname"><span class="pre">pyjuice.nodes.</span></span><span class="sig-name descname"><span class="pre">foreach</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">func</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Callable" title="(in Python v3.12)"><span class="pre">Callable</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">root_nodes</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">CircuitNodes</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyjuice.nodes.foreach" title="Link to this definition"></a></dt>
-<dd></dd></dl>
+<span class="sig-prename descclassname"><span class="pre">pyjuice.nodes.</span></span><span class="sig-name descname"><span class="pre">foreach</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">func</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Callable" title="(in Python v3.12)"><span class="pre">Callable</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">root_ns</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">CircuitNodes</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyjuice.nodes.foreach" title="Link to this definition"></a></dt>
+<dd><p>Traverse all nodes of a PC and can a specific function.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Note<span class="colon">:</span></dt>
+<dd class="field-odd"><p>An alternative is to use the iterator directly via the <cite>for</cite> statement. See below for an example.</p>
+</dd>
+<dt class="field-even">Parameters<span class="colon">:</span></dt>
+<dd class="field-even"><ul class="simple">
+<li><p><strong>func</strong> (<em>Callable</em>) – the function to be called</p></li>
+<li><p><strong>root_ns</strong> (<em>CircuitNodes</em>) – the root PC node</p></li>
+</ul>
+</dd>
+</dl>
+<dl>
+<dt>Example::</dt><dd><div class="doctest highlight-default notranslate"><div class="highlight"><pre><span></span><span class="gp">&gt;&gt;&gt; </span><span class="k">for</span> <span class="n">ns</span> <span class="ow">in</span> <span class="n">root_ns</span><span class="p">:</span> <span class="c1"># Traverse the PC bottom-up</span>
+<span class="gp">... </span>    <span class="p">[</span><span class="n">do</span> <span class="n">something</span><span class="o">...</span><span class="p">]</span>
+<span class="gp">&gt;&gt;&gt; </span><span class="k">for</span> <span class="n">ns</span> <span class="ow">in</span> <span class="n">root_ns</span><span class="p">(</span><span class="n">reverse</span> <span class="o">=</span> <span class="kc">True</span><span class="p">):</span> <span class="c1"># Traverse the PC top-down</span>
+<span class="gp">... </span>    <span class="p">[</span><span class="n">do</span> <span class="n">something</span><span class="o">...</span><span class="p">]</span>
+</pre></div>
+</div>
+</dd>
+</dl>
+</dd></dl>
 
 </section>
 
