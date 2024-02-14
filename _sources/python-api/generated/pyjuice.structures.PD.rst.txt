@@ -1,0 +1,6 @@
+﻿pyjuice.structures.PD
+=====================
+
+.. currentmodule:: pyjuice.structures
+
+.. autofunction:: PD
