@@ -117,7 +117,7 @@ def multiply(nodes1: ProdNodesChs, *args, edge_ids: Optional[Tensor] = None, spa
     return ProdNodes(num_node_blocks, chs, edge_ids, block_size = block_size, **kwargs)
 
 
-def summate(nodes1: SumNodesChs, *args, num_node_blocks: int = 0, num_nodes: int = 0
+def summate(nodes1: SumNodesChs, *args, num_node_blocks: int = 0, num_nodes: int = 0,
             edge_ids: Optional[Tensor] = None, block_size: int = 0, **kwargs) -> SumNodes:
     """
     Construct a vector of sum nodes given a list of children PCs defined on the same sets of variables.
