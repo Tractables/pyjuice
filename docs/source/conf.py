@@ -34,6 +34,13 @@ html_theme = 'sphinx_rtd_theme'
 # -- Options for EPUB output
 epub_show_urls = 'footnote'
 
+html_sidebars = {
+    '**': [
+        'relations.html',  # needs 'show_related': True theme option to display
+        'searchbox.html',
+    ]
+}
+
 # autosummary_generate = True
 
 def skip(app, what, name, obj, would_skip, options):
