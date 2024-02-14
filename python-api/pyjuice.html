@@ -21,7 +21,7 @@
     <script src="../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="pyjuice.compile" href="generated/pyjuice.compile.html" />
+    <link rel="next" title="pyjuice.inputs" href="generated/pyjuice.inputs.html" />
     <link rel="prev" title="Welcome to PyJuice’s documentation!" href="../index.html" /> 
 </head>
 
@@ -50,10 +50,24 @@
               <p class="caption" role="heading"><span class="caption-text">API</span></p>
 <ul class="current">
 <li class="toctree-l1 current"><a class="current reference internal" href="#">pyjuice</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="generated/pyjuice.compile.html">pyjuice.compile</a></li>
-<li class="toctree-l2"><a class="reference internal" href="generated/pyjuice.inputs.html">pyjuice.inputs</a></li>
-<li class="toctree-l2"><a class="reference internal" href="generated/pyjuice.summate.html">pyjuice.summate</a></li>
-<li class="toctree-l2"><a class="reference internal" href="generated/pyjuice.set_block_size.html">pyjuice.set_block_size</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#pc-creation">PC Creation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.inputs.html">pyjuice.inputs</a></li>
+<li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.multiply.html">pyjuice.multiply</a></li>
+<li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.summate.html">pyjuice.summate</a></li>
+<li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.set_block_size.html">pyjuice.set_block_size</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#pc-structure-transformation">PC Structure Transformation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.merge.html">pyjuice.merge</a></li>
+<li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.blockify.html">pyjuice.blockify</a></li>
+<li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.unblockify.html">pyjuice.unblockify</a></li>
+<li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.deepcopy.html">pyjuice.deepcopy</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#pc-compilation">PC Compilation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.compile.html">pyjuice.compile</a></li>
+</ul>
+</li>
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="nodes.html">pyjuice.nodes</a></li>
@@ -85,12 +99,14 @@
              
   <section id="pyjuice">
 <h1>pyjuice<a class="headerlink" href="#pyjuice" title="Link to this heading"></a></h1>
+<section id="pc-creation">
+<h2>PC Creation<a class="headerlink" href="#pc-creation" title="Link to this heading"></a></h2>
 <table class="autosummary longtable docutils align-default">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="generated/pyjuice.compile.html#pyjuice.compile" title="pyjuice.compile"><code class="xref py py-obj docutils literal notranslate"><span class="pre">compile</span></code></a></p></td>
-<td><p>Compile a PC represented by a DAG into an equivalent <cite>torch.nn.Module</cite>.</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="generated/pyjuice.inputs.html#pyjuice.inputs" title="pyjuice.inputs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">inputs</span></code></a></p></td>
+<td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="generated/pyjuice.inputs.html#pyjuice.inputs" title="pyjuice.inputs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">inputs</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="generated/pyjuice.multiply.html#pyjuice.multiply" title="pyjuice.multiply"><code class="xref py py-obj docutils literal notranslate"><span class="pre">multiply</span></code></a></p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="generated/pyjuice.summate.html#pyjuice.summate" title="pyjuice.summate"><code class="xref py py-obj docutils literal notranslate"><span class="pre">summate</span></code></a></p></td>
@@ -102,13 +118,43 @@
 </tbody>
 </table>
 </section>
+<section id="pc-structure-transformation">
+<h2>PC Structure Transformation<a class="headerlink" href="#pc-structure-transformation" title="Link to this heading"></a></h2>
+<table class="autosummary longtable docutils align-default">
+<tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="generated/pyjuice.merge.html#pyjuice.merge" title="pyjuice.merge"><code class="xref py py-obj docutils literal notranslate"><span class="pre">merge</span></code></a></p></td>
+<td><p>Merge nodes with identical region node together.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="generated/pyjuice.blockify.html#pyjuice.blockify" title="pyjuice.blockify"><code class="xref py py-obj docutils literal notranslate"><span class="pre">blockify</span></code></a></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="generated/pyjuice.unblockify.html#pyjuice.unblockify" title="pyjuice.unblockify"><code class="xref py py-obj docutils literal notranslate"><span class="pre">unblockify</span></code></a></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="generated/pyjuice.deepcopy.html#pyjuice.deepcopy" title="pyjuice.deepcopy"><code class="xref py py-obj docutils literal notranslate"><span class="pre">deepcopy</span></code></a></p></td>
+<td><p></p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="pc-compilation">
+<h2>PC Compilation<a class="headerlink" href="#pc-compilation" title="Link to this heading"></a></h2>
+<table class="autosummary longtable docutils align-default">
+<tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="generated/pyjuice.compile.html#pyjuice.compile" title="pyjuice.compile"><code class="xref py py-obj docutils literal notranslate"><span class="pre">compile</span></code></a></p></td>
+<td><p>Compile a PC represented by a DAG into an equivalent <cite>torch.nn.Module</cite>.</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
 
 
            </div>
           </div>
           <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
         <a href="../index.html" class="btn btn-neutral float-left" title="Welcome to PyJuice’s documentation!" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
-        <a href="generated/pyjuice.compile.html" class="btn btn-neutral float-right" title="pyjuice.compile" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+        <a href="generated/pyjuice.inputs.html" class="btn btn-neutral float-right" title="pyjuice.inputs" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
     </div>
 
   <hr/>

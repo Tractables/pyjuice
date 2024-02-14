@@ -1,0 +1,6 @@
+﻿pyjuice.multiply
+================
+
+.. currentmodule:: pyjuice
+
+.. autofunction:: multiply

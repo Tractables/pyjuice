@@ -1,0 +1,86 @@
+﻿pyjuice.TensorCircuit
+=====================
+
+.. currentmodule:: pyjuice
+
+.. autoclass:: TensorCircuit
+
+   
+   .. automethod:: __init__
+
+   
+   .. rubric:: Methods
+
+   .. autosummary::
+   
+      ~TensorCircuit.__init__
+      ~TensorCircuit.add_module
+      ~TensorCircuit.apply
+      ~TensorCircuit.backward
+      ~TensorCircuit.bfloat16
+      ~TensorCircuit.buffers
+      ~TensorCircuit.children
+      ~TensorCircuit.compile
+      ~TensorCircuit.cpu
+      ~TensorCircuit.cuda
+      ~TensorCircuit.cumulate_flows
+      ~TensorCircuit.disable_partial_evaluation
+      ~TensorCircuit.double
+      ~TensorCircuit.enable_partial_evaluation
+      ~TensorCircuit.eval
+      ~TensorCircuit.extra_repr
+      ~TensorCircuit.float
+      ~TensorCircuit.forward
+      ~TensorCircuit.get_buffer
+      ~TensorCircuit.get_extra_state
+      ~TensorCircuit.get_parameter
+      ~TensorCircuit.get_submodule
+      ~TensorCircuit.half
+      ~TensorCircuit.init_param_flows
+      ~TensorCircuit.ipu
+      ~TensorCircuit.load_state_dict
+      ~TensorCircuit.mini_batch_em
+      ~TensorCircuit.modules
+      ~TensorCircuit.named_buffers
+      ~TensorCircuit.named_children
+      ~TensorCircuit.named_modules
+      ~TensorCircuit.named_parameters
+      ~TensorCircuit.parameters
+      ~TensorCircuit.print_statistics
+      ~TensorCircuit.register_backward_hook
+      ~TensorCircuit.register_buffer
+      ~TensorCircuit.register_forward_hook
+      ~TensorCircuit.register_forward_pre_hook
+      ~TensorCircuit.register_full_backward_hook
+      ~TensorCircuit.register_full_backward_pre_hook
+      ~TensorCircuit.register_load_state_dict_post_hook
+      ~TensorCircuit.register_module
+      ~TensorCircuit.register_parameter
+      ~TensorCircuit.register_state_dict_pre_hook
+      ~TensorCircuit.requires_grad_
+      ~TensorCircuit.set_extra_state
+      ~TensorCircuit.share_memory
+      ~TensorCircuit.state_dict
+      ~TensorCircuit.to
+      ~TensorCircuit.to_empty
+      ~TensorCircuit.train
+      ~TensorCircuit.type
+      ~TensorCircuit.update_param_flows
+      ~TensorCircuit.update_parameters
+      ~TensorCircuit.xpu
+      ~TensorCircuit.zero_grad
+   
+   
+
+   
+   
+   .. rubric:: Attributes
+
+   .. autosummary::
+   
+      ~TensorCircuit.T_destination
+      ~TensorCircuit.call_super_init
+      ~TensorCircuit.dump_patches
+      ~TensorCircuit.training
+   
+   

@@ -1,0 +1,6 @@
+﻿pyjuice.deepcopy
+================
+
+.. currentmodule:: pyjuice
+
+.. autofunction:: deepcopy

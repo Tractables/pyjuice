@@ -4,7 +4,7 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>pyjuice.inputs &mdash; PyJuice 0.0.1 documentation</title>
+  <title>pyjuice.blockify &mdash; PyJuice 0.0.1 documentation</title>
       <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=80d5e7a1" />
       <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=19f00094" />
 
@@ -21,8 +21,8 @@
     <script src="../../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../../genindex.html" />
     <link rel="search" title="Search" href="../../search.html" />
-    <link rel="next" title="pyjuice.multiply" href="pyjuice.multiply.html" />
-    <link rel="prev" title="pyjuice" href="../pyjuice.html" /> 
+    <link rel="next" title="pyjuice.unblockify" href="pyjuice.unblockify.html" />
+    <link rel="prev" title="pyjuice.merge" href="pyjuice.merge.html" /> 
 </head>
 
 <body class="wy-body-for-nav"> 
@@ -50,17 +50,17 @@
               <p class="caption" role="heading"><span class="caption-text">API</span></p>
 <ul class="current">
 <li class="toctree-l1 current"><a class="reference internal" href="../pyjuice.html">pyjuice</a><ul class="current">
-<li class="toctree-l2 current"><a class="reference internal" href="../pyjuice.html#pc-creation">PC Creation</a><ul class="current">
-<li class="toctree-l3 current"><a class="current reference internal" href="#">pyjuice.inputs</a><ul>
-<li class="toctree-l4"><a class="reference internal" href="#pyjuice.inputs"><code class="docutils literal notranslate"><span class="pre">inputs()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pyjuice.html#pc-creation">PC Creation</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="../pyjuice.html#pc-structure-transformation">PC Structure Transformation</a><ul class="current">
+<li class="toctree-l3"><a class="reference internal" href="pyjuice.merge.html">pyjuice.merge</a></li>
+<li class="toctree-l3 current"><a class="current reference internal" href="#">pyjuice.blockify</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#pyjuice.blockify"><code class="docutils literal notranslate"><span class="pre">blockify()</span></code></a></li>
 </ul>
 </li>
-<li class="toctree-l3"><a class="reference internal" href="pyjuice.multiply.html">pyjuice.multiply</a></li>
-<li class="toctree-l3"><a class="reference internal" href="pyjuice.summate.html">pyjuice.summate</a></li>
-<li class="toctree-l3"><a class="reference internal" href="pyjuice.set_block_size.html">pyjuice.set_block_size</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pyjuice.unblockify.html">pyjuice.unblockify</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pyjuice.deepcopy.html">pyjuice.deepcopy</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="../pyjuice.html#pc-structure-transformation">PC Structure Transformation</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../pyjuice.html#pc-compilation">PC Compilation</a></li>
 </ul>
 </li>
@@ -82,9 +82,9 @@
   <ul class="wy-breadcrumbs">
       <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
           <li class="breadcrumb-item"><a href="../pyjuice.html">pyjuice</a></li>
-      <li class="breadcrumb-item active">pyjuice.inputs</li>
+      <li class="breadcrumb-item active">pyjuice.blockify</li>
       <li class="wy-breadcrumbs-aside">
-            <a href="../../_sources/python-api/generated/pyjuice.inputs.rst.txt" rel="nofollow"> View page source</a>
+            <a href="../../_sources/python-api/generated/pyjuice.blockify.rst.txt" rel="nofollow"> View page source</a>
       </li>
   </ul>
   <hr/>
@@ -92,11 +92,11 @@
           <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
            <div itemprop="articleBody">
              
-  <section id="pyjuice-inputs">
-<h1>pyjuice.inputs<a class="headerlink" href="#pyjuice-inputs" title="Link to this heading"></a></h1>
+  <section id="pyjuice-blockify">
+<h1>pyjuice.blockify<a class="headerlink" href="#pyjuice-blockify" title="Link to this heading"></a></h1>
 <dl class="py function">
-<dt class="sig sig-object py" id="pyjuice.inputs">
-<span class="sig-prename descclassname"><span class="pre">pyjuice.</span></span><span class="sig-name descname"><span class="pre">inputs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="pre">var:</span> <span class="pre">Union[int,</span> <span class="pre">Sequence[int]],</span> <span class="pre">num_node_blocks:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">0,</span> <span class="pre">dist:</span> <span class="pre">Distribution</span> <span class="pre">=</span> <span class="pre">&lt;pyjuice.nodes.distributions.distributions.Distribution</span> <span class="pre">object&gt;,</span> <span class="pre">params:</span> <span class="pre">Optional[Tensor]</span> <span class="pre">=</span> <span class="pre">None,</span> <span class="pre">num_nodes:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">0,</span> <span class="pre">block_size:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">0,</span> <span class="pre">**kwargs</span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyjuice.inputs" title="Link to this definition"></a></dt>
+<dt class="sig sig-object py" id="pyjuice.blockify">
+<span class="sig-prename descclassname"><span class="pre">pyjuice.</span></span><span class="sig-name descname"><span class="pre">blockify</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">root_ns</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">CircuitNodes</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sparsity_tolerance</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.12)"><span class="pre">float</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">0.25</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_target_block_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">32</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">use_cuda</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyjuice.blockify" title="Link to this definition"></a></dt>
 <dd></dd></dl>
 
 </section>
@@ -105,8 +105,8 @@
            </div>
           </div>
           <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
-        <a href="../pyjuice.html" class="btn btn-neutral float-left" title="pyjuice" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
-        <a href="pyjuice.multiply.html" class="btn btn-neutral float-right" title="pyjuice.multiply" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+        <a href="pyjuice.merge.html" class="btn btn-neutral float-left" title="pyjuice.merge" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="pyjuice.unblockify.html" class="btn btn-neutral float-right" title="pyjuice.unblockify" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
     </div>
 
   <hr/>

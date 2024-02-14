@@ -1,0 +1,6 @@
+﻿pyjuice.merge
+=============
+
+.. currentmodule:: pyjuice
+
+.. autofunction:: merge
