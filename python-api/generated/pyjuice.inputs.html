@@ -97,8 +97,24 @@
 <h1>pyjuice.inputs<a class="headerlink" href="#pyjuice-inputs" title="Link to this heading"></a></h1>
 <dl class="py function">
 <dt class="sig sig-object py" id="pyjuice.inputs">
-<span class="sig-prename descclassname"><span class="pre">pyjuice.</span></span><span class="sig-name descname"><span class="pre">inputs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="pre">var:</span> <span class="pre">Union[int,</span> <span class="pre">Sequence[int]],</span> <span class="pre">num_node_blocks:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">0,</span> <span class="pre">dist:</span> <span class="pre">Distribution</span> <span class="pre">=</span> <span class="pre">&lt;pyjuice.nodes.distributions.distributions.Distribution</span> <span class="pre">object&gt;,</span> <span class="pre">params:</span> <span class="pre">Optional[Tensor]</span> <span class="pre">=</span> <span class="pre">None,</span> <span class="pre">num_nodes:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">0,</span> <span class="pre">block_size:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">0,</span> <span class="pre">**kwargs</span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyjuice.inputs" title="Link to this definition"></a></dt>
-<dd></dd></dl>
+<span class="sig-prename descclassname"><span class="pre">pyjuice.</span></span><span class="sig-name descname"><span class="pre">inputs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="pre">var:</span> <span class="pre">Union[int,</span> <span class="pre">Sequence[int]],</span> <span class="pre">num_node_blocks:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">0,</span> <span class="pre">dist:</span> <span class="pre">Distribution</span> <span class="pre">=</span> <span class="pre">&lt;pyjuice.nodes.distributions.distributions.Distribution</span> <span class="pre">object&gt;,</span> <span class="pre">params:</span> <span class="pre">Optional[Tensor]</span> <span class="pre">=</span> <span class="pre">None,</span> <span class="pre">num_nodes:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">0,</span> <span class="pre">block_size:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">0,</span> <span class="pre">**kwargs</span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">InputNodes</span></span></span><a class="headerlink" href="#pyjuice.inputs" title="Link to this definition"></a></dt>
+<dd><p>Construct a vector of input nodes defined on the same variable and have the same input distribution.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>var</strong> (<em>Union</em><em>[</em><a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>,</em><em>Sequence</em><em>[</em><a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em><em>]</em>) – the variable ID (or a list of variable IDs if the parameter <cite>dist</cite> is a multivariate distribution)</p></li>
+<li><p><strong>num_node_blocks</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – number of node blocks each of size <cite>block_size</cite>. I.e., the total number of nodes is <cite>num_node_blocks</cite> * <cite>block_size</cite></p></li>
+<li><p><strong>dist</strong> (<em>Distribution</em>) – the input distribution from <cite>pyjuice.nodes.distributions</cite></p></li>
+<li><p><strong>params</strong> (<em>Optional</em><em>[</em><em>Tensor</em><em>]</em>) – an optional tensor that defines the parameters of the nodes</p></li>
+<li><p><strong>num_nodes</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – an alternative of <cite>num_node_blocks</cite>; if set, it should be divicible by <cite>block_size</cite></p></li>
+<li><p><strong>block_size</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – block size of the nodes; it does not change the semantics of the nodes, but will affect the speed of the compiled PC</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>an <cite>InputNodes</cite> object (a subclass of <cite>CircuitNodes</cite>)</p>
+</dd>
+</dl>
+</dd></dl>
 
 </section>
 
