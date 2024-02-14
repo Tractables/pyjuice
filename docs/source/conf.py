@@ -6,8 +6,8 @@ project = 'PyJuice'
 copyright = '2021, StarAI'
 author = 'StarAI'
 
-release = '0.0.1'
-version = '0.0.1'
+release = '2.0.0'
+version = '2.0.0'
 
 # -- General configuration
 
