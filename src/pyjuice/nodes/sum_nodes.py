@@ -16,7 +16,7 @@ Tensor = Union[np.ndarray,torch.Tensor]
 
 class SumNodes(CircuitNodes):
     """
-    A class representing vectors of sum nodes.
+    A class representing vectors of sum nodes. It is created by `pyjuice.summate`.
 
     :param num_node_blocks: number of node blocks
     :type num_node_blocks: int

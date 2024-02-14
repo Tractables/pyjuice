@@ -14,7 +14,7 @@ Tensor = Union[np.ndarray,torch.Tensor]
 
 class ProdNodes(CircuitNodes):
     """
-    A class representing vectors of product nodes.
+    A class representing vectors of product nodes. It is created by `pyjuice.multiply`.
 
     :param num_node_blocks: number of node blocks
     :type num_node_blocks: int

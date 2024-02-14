@@ -12,7 +12,7 @@ from .nodes import CircuitNodes
 
 class InputNodes(CircuitNodes):
     """
-    A class representing vectors of input nodes.
+    A class representing vectors of input nodes. It is created by `pyjuice.inputs`.
 
     :param num_node_blocks: number of node blocks
     :type num_node_blocks: int

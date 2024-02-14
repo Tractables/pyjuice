@@ -6,7 +6,24 @@ from typing import Callable, Optional, Dict
 from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes
 
 
-def foreach(func: Callable, root_nodes: CircuitNodes):
+def foreach(func: Callable, root_ns: CircuitNodes):
+    """
+    Traverse all nodes of a PC and can a specific function.
+
+    :note: An alternative is to use the iterator directly via the `for` statement. See below for an example.
+
+    :param func: the function to be called
+    :type func: Callable
+
+    :param root_ns: the root PC node
+    :type root_ns: CircuitNodes
+
+    Example::
+        >>> for ns in root_ns: # Traverse the PC bottom-up
+        ...     [do something...]
+        >>> for ns in root_ns(reverse = True): # Traverse the PC top-down
+        ...     [do something...]
+    """
 
     visited = set()
 
@@ -23,12 +40,24 @@ def foreach(func: Callable, root_nodes: CircuitNodes):
 
         func(ns)
 
-    dfs(root_nodes)
+    dfs(root_ns)
 
     return None
 
 
-def foldup_aggregate(func: Callable, root_nodes: CircuitNodes, cache: Optional[Dict] = None, **kwargs):
+def foldup_aggregate(func: Callable, root_ns: CircuitNodes, cache: Optional[Dict] = None, **kwargs):
+    """
+    Traverse all nodes of a PC bottom-up and aggregate a per-node object.
+
+    :param func: the function to compute the per-node object
+    :type func: Callable
+
+    :param root_ns: the root PC node
+    :type root_ns: CircuitNodes
+
+    :param cache: an optional dictionary to store the per-node object for all nodes
+    :type cache: Dict
+    """
 
     if cache is None:
         cache = dict()
@@ -50,6 +79,6 @@ def foldup_aggregate(func: Callable, root_nodes: CircuitNodes, cache: Optional[D
 
         cache[ns] = ns_output
 
-    dfs(root_nodes)
+    dfs(root_ns)
 
-    return cache[root_nodes]
+    return cache[root_ns]
