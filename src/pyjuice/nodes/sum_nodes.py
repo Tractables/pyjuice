@@ -15,6 +15,22 @@ Tensor = Union[np.ndarray,torch.Tensor]
 
 
 class SumNodes(CircuitNodes):
+    """
+    A class representing vectors of sum nodes.
+
+    :param num_node_blocks: number of node blocks
+    :type num_node_blocks: int
+
+    :param chs: sequence of child nodes
+    :type chs: Sequence[CircuitNodes]
+
+    :param edge_ids: a matrix of size [2, # edges] - every size-2 column vector [i,j] defines a set of edges that fully connect the ith sum node block and the jth child node block
+    :type edge_ids: Optional[Tensor]
+
+    :param block_size: block size
+    :type block_size: int
+    """
+
     def __init__(self, num_node_blocks: int, chs: Sequence[CircuitNodes], edge_ids: Optional[Union[Tensor,Sequence[Tensor]]] = None, 
                  params: Optional[Tensor] = None, zero_param_mask: Optional[Tensor] = None, block_size: int = 0, **kwargs) -> None:
 
@@ -50,9 +66,25 @@ class SumNodes(CircuitNodes):
 
     @property
     def num_edges(self):
+        """
+        Number of edges within the current node.
+        """
         return self.edge_ids.size(1) * self.block_size * self.ch_block_size
 
-    def duplicate(self, *args, tie_params: bool = False):
+    def duplicate(self, *args, tie_params: bool = False) -> SumNodes:
+        """
+        Create a duplication of the current node with the same specification (i.e., number of nodes, block size).
+
+        :note: The child nodes should have the same specifications compared to the original child nodes.
+
+        :param args: a sequence of new child nodes
+        :type args: CircuitNodes
+
+        :param tie_params: whether to tie the parameters of the current node and the duplicated node
+        :type tie_params: bool
+
+        :returns: a duplicated `SumNodes`
+        """
         chs = []
         for ns in args:
             assert isinstance(ns, CircuitNodes)
@@ -78,11 +110,26 @@ class SumNodes(CircuitNodes):
         return SumNodes(self.num_node_blocks, chs, edge_ids, params = params, block_size = self.block_size, source_node = self if tie_params else None)
 
     def get_params(self):
+        """
+        Get the sum node parameters.
+        """
         if not hasattr(self, "_params"):
             return None
         return self._params
 
-    def set_params(self, params: torch.Tensor, normalize: bool = True, pseudocount: float = 0.1):
+    def set_params(self, params: torch.Tensor, normalize: bool = True, pseudocount: float = 0.0):
+        """
+        Set the sum node parameters.
+
+        :param params: parameters to be set
+        :type params: Union[torch.Tensor,Dict]
+
+        :param normalize: whether to normalize the parameters
+        :type normalize: bool
+
+        :param pseudocount: pseudo count added to the parameters
+        :type pseudocount: float
+        """
         if self._source_node is not None:
             ns_source = self._source_node
             ns_source.set_params(params, normalize = normalize, pseudocount = pseudocount)
@@ -153,6 +200,15 @@ class SumNodes(CircuitNodes):
         self._params = None # Clear parameters
 
     def init_parameters(self, perturbation: float = 2.0, recursive: bool = True, is_root: bool = True, **kwargs):
+        """
+        Randomly initialize node parameters.
+
+        :param perturbation: "amount of perturbation" added to the parameters (should be greater than 0)
+        :type perturbation: float
+
+        :param recursive: whether to recursively apply the function to child nodes
+        :type recursive: bool
+        """
         if self._source_node is None:
             self._params = torch.exp(torch.rand([self.edge_ids.size(1), self.block_size, self.ch_block_size]) * -perturbation)
 
@@ -170,6 +226,15 @@ class SumNodes(CircuitNodes):
         )
 
     def update_parameters(self, params: torch.Tensor, clone: bool = True):
+        """
+        Update parameters from `pyjuice.TensorCircuit` to the current node.
+
+        :param params: the parameter tensor in the `TensorCircuit`
+        :type params: torch.Tensor
+
+        :param clone: whether to clone the parameters
+        :type clone: bool
+        """
         assert self.provided("_param_range"), "The `SumNodes` has not been compiled into a `TensorCircuit`."
 
         if self.is_tied():
@@ -188,6 +253,15 @@ class SumNodes(CircuitNodes):
         self._params = ns_params[local_parids,:,:].permute(0, 2, 1)
 
     def update_param_flows(self, param_flows: torch.Tensor, origin_ns_only: bool = True, clone: bool = True):
+        """
+        Update parameter flows from `pyjuice.TensorCircuit` to the current node.
+
+        :param params_flows: the parameter flow tensor in the `TensorCircuit`
+        :type params_flows: torch.Tensor
+
+        :param clone: whether to clone the parameters
+        :type clone: bool
+        """
         assert self.provided("_param_flow_range"), "The `SumNodes` has not been compiled into a `TensorCircuit`."
 
         if origin_ns_only and self.is_tied():
@@ -205,6 +279,12 @@ class SumNodes(CircuitNodes):
         self._param_flows = ns_param_flows[local_parfids,:,:].permute(0, 2, 1)
 
     def gather_parameters(self, params: torch.Tensor):
+        """
+        Update parameters from the current node to the compiled `pyjuice.TensorCircuit`.
+
+        :param params: the parameter tensor in the `TensorCircuit`
+        :type params: torch.Tensor
+        """
         assert self.provided("_param_range"), "The `SumNodes` has not been compiled into a `TensorCircuit`."
 
         if self.is_tied() or not self.has_params():

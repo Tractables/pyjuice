@@ -13,6 +13,21 @@ Tensor = Union[np.ndarray,torch.Tensor]
 
 
 class ProdNodes(CircuitNodes):
+    """
+    A class representing vectors of product nodes.
+
+    :param num_node_blocks: number of node blocks
+    :type num_node_blocks: int
+
+    :param chs: sequence of child nodes
+    :type chs: Sequence[CircuitNodes]
+
+    :param edge_ids: a matrix of size [# product node blocks, # children] - the ith product node block is connected to the `edge_ids[i,j]`th node block in the jth child
+    :type edge_ids: Optional[Tensor]
+
+    :param block_size: block size
+    :type block_size: int
+    """
 
     SPARSE = 0
     BLOCK_SPARSE = 1
@@ -33,10 +48,16 @@ class ProdNodes(CircuitNodes):
 
     @property
     def num_edges(self):
+        """
+        Number of edges within the current node.
+        """
         return self.num_nodes * self.num_chs
 
     @property
     def edge_type(self):
+        """
+        Type of the product edge. Either `BLOCK_SPARSE` or `SPARSE`.
+        """
         if self.edge_ids.size(0) == self.num_node_blocks:
             return self.BLOCK_SPARSE
         elif self.edge_ids.size(0) == self.num_nodes:
@@ -45,12 +66,31 @@ class ProdNodes(CircuitNodes):
             raise RuntimeError(f"Unexpected shape of `edge_ids`: ({self.edge_ids.size(0)}, {self.edge_ids.size(1)})")
 
     def is_block_sparse(self):
+        """
+        Whether the edge type is `BLOCK_SPARSE`.
+        """
         return self.edge_type == self.BLOCK_SPARSE
 
     def is_sparse(self):
+        """
+        Whether the edge type is `SPARSE`.
+        """
         return self.edge_type == self.SPARSE
 
     def duplicate(self, *args, tie_params: bool = False, allow_type_mismatch: bool = False):
+        """
+        Create a duplication of the current node with the same specification (i.e., number of nodes, block size).
+
+        :note: The child nodes should have the same specifications compared to the original child nodes.
+
+        :param args: a sequence of new child nodes
+        :type args: CircuitNodes
+
+        :param tie_params: whether to tie the parameters of the current node and the duplicated node
+        :type tie_params: bool
+
+        :returns: a duplicated `ProdNodes`
+        """
         chs = []
         for ns in args:
             assert isinstance(ns, CircuitNodes)
@@ -73,6 +113,15 @@ class ProdNodes(CircuitNodes):
         return ProdNodes(self.num_node_blocks, chs, edge_ids, block_size = self.block_size, source_node = self if tie_params else None)
 
     def init_parameters(self, perturbation: float = 2.0, recursive: bool = True, is_root: bool = True, **kwargs):
+        """
+        Randomly initialize node parameters.
+
+        :param perturbation: "amount of perturbation" added to the parameters (should be greater than 0)
+        :type perturbation: float
+
+        :param recursive: whether to recursively apply the function to child nodes
+        :type recursive: bool
+        """
         super(ProdNodes, self).init_parameters(
             perturbation = perturbation, 
             recursive = recursive, 

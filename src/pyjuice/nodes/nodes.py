@@ -125,6 +125,9 @@ class CircuitNodes():
 
     @property
     def num_nodes(self):
+        """
+        Number of PC nodes within the current node.
+        """
         return self.num_node_blocks * self.block_size
 
     @property

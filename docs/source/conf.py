@@ -45,9 +45,51 @@ html_sidebars = {
 # autosummary_generate = True
 
 def skip(app, what, name, obj, would_skip, options):
-    if '__' in name or name == "clone":
-        return True
-    return would_skip
+    flag = True
+
+    if name == "need_meta_parameters":
+        flag = False
+
+    elif "Nodes" in str(obj) and name == "duplicate":
+        flag = False
+
+    elif "Nodes" in str(obj) and name == "get_params":
+        flag = False
+
+    elif "Nodes" in str(obj) and name == "set_params":
+        flag = False
+
+    elif "InputNodes" in str(obj) and name == "set_meta_params":
+        flag = False
+
+    elif "Nodes" in str(obj) and name == "init_parameters":
+        flag = False
+
+    elif "Nodes" in str(obj) and name == "num_nodes":
+        flag = False
+
+    elif "Nodes" in str(obj) and name == "num_edges":
+        flag = False
+
+    elif "ProdNodes" in str(obj) and name == "edge_type":
+        flag = False
+
+    elif "ProdNodes" in str(obj) and name == "is_block_sparse":
+        flag = False
+
+    elif "ProdNodes" in str(obj) and name == "is_sparse":
+        flag = False
+
+    elif "SumNodes" in str(obj) and name == "update_parameters":
+        flag = False
+
+    elif "SumNodes" in str(obj) and name == "update_param_flows":
+        flag = False
+
+    elif "SumNodes" in str(obj) and name == "gather_parameters":
+        flag = False
+    
+    return flag or would_skip
 
 def setup(app):
     app.connect('autodoc-skip-member', skip)
