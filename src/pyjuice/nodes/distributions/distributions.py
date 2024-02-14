@@ -49,8 +49,13 @@ class Distribution():
 
     def init_parameters(self, num_nodes: int, perturbation: float = 2.0, params: Optional[Any] = None, **kwargs):
         """
-        Initialize parameters for `num_nodes` nodes.
-        Returned parameters should be flattened into a vector.
+        Randomly initialize node parameters.
+
+        :param num_nodes: number of nodes
+        :type num_nodes: int
+
+        :param perturbation: "amount of perturbation" added to the parameters (should be greater than 0)
+        :type perturbation: float
         """
         raise NotImplementedError()
 

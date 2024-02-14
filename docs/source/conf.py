@@ -50,6 +50,12 @@ def skip(app, what, name, obj, would_skip, options):
     if name == "need_meta_parameters":
         flag = False
 
+    elif name == "num_parameters":
+        flag = False
+
+    elif name == "num_param_flows":
+        flag = False
+
     elif "Nodes" in str(obj) and name == "duplicate":
         flag = False
 
