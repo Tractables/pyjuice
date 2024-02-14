@@ -99,6 +99,34 @@
 <dt class="sig sig-object py" id="pyjuice.merge">
 <span class="sig-prename descclassname"><span class="pre">pyjuice.</span></span><span class="sig-name descname"><span class="pre">merge</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">ns1</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">CircuitNodes</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">args</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">CircuitNodes</span></span></span><a class="headerlink" href="#pyjuice.merge" title="Link to this definition"></a></dt>
 <dd><p>Merge nodes with identical region node together.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>ns1</strong> (<em>CircuitNodes</em>) – the first PC node</p></li>
+<li><p><strong>args</strong> (<em>CircuitNodes</em>) – the remaining PC nodes</p></li>
+</ul>
+</dd>
+</dl>
+<dl>
+<dt>Example::</dt><dd><div class="doctest highlight-default notranslate"><div class="highlight"><pre><span></span><span class="gp">&gt;&gt;&gt; </span><span class="n">i00</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">num_node_blocks</span><span class="p">,</span> <span class="n">dists</span><span class="o">.</span><span class="n">Categorical</span><span class="p">(</span><span class="n">num_cats</span> <span class="o">=</span> <span class="mi">5</span><span class="p">))</span>
+<span class="gp">&gt;&gt;&gt; </span><span class="n">i01</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">num_node_blocks</span><span class="p">,</span> <span class="n">dists</span><span class="o">.</span><span class="n">Categorical</span><span class="p">(</span><span class="n">num_cats</span> <span class="o">=</span> <span class="mi">5</span><span class="p">))</span>
+<span class="gp">&gt;&gt;&gt; </span><span class="n">i10</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">num_node_blocks</span><span class="p">,</span> <span class="n">dists</span><span class="o">.</span><span class="n">Categorical</span><span class="p">(</span><span class="n">num_cats</span> <span class="o">=</span> <span class="mi">5</span><span class="p">))</span>
+<span class="gp">&gt;&gt;&gt; </span><span class="n">i11</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">num_node_blocks</span><span class="p">,</span> <span class="n">dists</span><span class="o">.</span><span class="n">Categorical</span><span class="p">(</span><span class="n">num_cats</span> <span class="o">=</span> <span class="mi">5</span><span class="p">))</span>
+</pre></div>
+</div>
+<div class="doctest highlight-default notranslate"><div class="highlight"><pre><span></span><span class="gp">&gt;&gt;&gt; </span><span class="n">m00</span> <span class="o">=</span> <span class="n">multiply</span><span class="p">(</span><span class="n">i00</span><span class="p">,</span> <span class="n">i10</span><span class="p">)</span>
+<span class="gp">&gt;&gt;&gt; </span><span class="n">m01</span> <span class="o">=</span> <span class="n">multiply</span><span class="p">(</span><span class="n">i01</span><span class="p">,</span> <span class="n">i11</span><span class="p">)</span>
+</pre></div>
+</div>
+<div class="doctest highlight-default notranslate"><div class="highlight"><pre><span></span><span class="gp">&gt;&gt;&gt; </span><span class="n">n0</span> <span class="o">=</span> <span class="n">summate</span><span class="p">(</span><span class="n">m00</span><span class="p">,</span> <span class="n">num_node_blocks</span> <span class="o">=</span> <span class="n">num_node_blocks</span><span class="p">)</span>
+<span class="gp">&gt;&gt;&gt; </span><span class="n">n1</span> <span class="o">=</span> <span class="n">summate</span><span class="p">(</span><span class="n">m01</span><span class="p">,</span> <span class="n">num_node_blocks</span> <span class="o">=</span> <span class="n">num_node_blocks</span><span class="p">)</span>
+</pre></div>
+</div>
+<div class="doctest highlight-default notranslate"><div class="highlight"><pre><span></span><span class="gp">&gt;&gt;&gt; </span><span class="n">n_new</span> <span class="o">=</span> <span class="n">pyjuice</span><span class="o">.</span><span class="n">merge</span><span class="p">(</span><span class="n">n0</span><span class="p">,</span> <span class="n">n1</span><span class="p">)</span>
+</pre></div>
+</div>
+</dd>
+</dl>
 </dd></dl>
 
 </section>
