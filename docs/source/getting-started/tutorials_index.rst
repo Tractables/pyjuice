@@ -31,3 +31,8 @@ Tutorials
 .. raw:: html
 
     </div>
+
+.. toctree::
+  :hidden:
+
+  /getting-started/tutorials/demo

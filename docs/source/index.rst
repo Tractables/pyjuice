@@ -7,7 +7,7 @@ Getting started
 ---------------
 
 - Follow the :doc:`installation instructions <getting-started/installation>`.
-- Take a look at our :doc:`tutorials <getting-started/tutorials/index>`.
+- Take a look at our :doc:`tutorials <getting-started/tutorials_index>`.
 
 .. toctree::
    :maxdepth: 1
@@ -15,7 +15,7 @@ Getting started
    :hidden:
 
    getting-started/installation
-   getting-started/tutorials/index
+   getting-started/tutorials_index
 
 API
 ---
