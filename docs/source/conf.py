@@ -17,7 +17,13 @@ extensions = [
     'sphinx.ext.autodoc',
     'sphinx.ext.autosummary',
     'sphinx.ext.intersphinx',
+    'sphinx_gallery.gen_gallery'
 ]
+
+sphinx_gallery_conf = {
+    # other configuration options
+    'gallery_dirs': 'getting-started/tutorials/generated/gallery',
+}
 
 intersphinx_mapping = {
     'python': ('https://docs.python.org/3/', None),

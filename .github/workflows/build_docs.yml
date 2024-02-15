@@ -28,7 +28,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install sphinx sphinx_rtd_theme myst_parser
+          pip install sphinx sphinx_rtd_theme myst_parser sphinx-gallery
 
       - name: Install PyJuice
         run: |
