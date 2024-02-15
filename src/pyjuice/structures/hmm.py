@@ -47,13 +47,13 @@ def HMM(seq_length: int, num_latents: int, num_emits: int, homogeneous: bool = T
     :type homogeneous: bool
     """
     
-    group_size = min(max_cdf_power_of_2(num_latents), 1024)
-    num_node_groups = num_latents // group_size
+    block_size = min(max_cdf_power_of_2(num_latents), 1024)
+    num_node_blocks = num_latents // block_size
     
-    with juice.set_group_size(group_size = group_size):
+    with juice.set_block_size(block_size = block_size):
 
         ns_input = inputs(
-            seq_length - 1, num_node_groups = num_node_groups,
+            seq_length - 1, num_node_blocks = num_node_blocks,
             dist = Categorical(num_cats = num_emits)
         )
         
@@ -63,13 +63,13 @@ def HMM(seq_length: int, num_latents: int, num_emits: int, homogeneous: bool = T
             curr_xs = ns_input.duplicate(var, tie_params = homogeneous)
             
             if ns_sum is None:
-                ns = summate(curr_zs, num_node_groups = num_node_groups)
+                ns = summate(curr_zs, num_node_blocks = num_node_blocks)
                 ns_sum = ns
             else:
                 ns = ns_sum.duplicate(curr_zs, tie_params = homogeneous)
 
             curr_zs = multiply(curr_xs, ns)
             
-        ns = summate(curr_zs, num_node_groups = 1, group_size = 1)
+        ns = summate(curr_zs, num_node_blocks = 1, block_size = 1)
     
     return ns

@@ -1,5 +1,7 @@
 # Configuration file for the Sphinx documentation builder.
 
+from sphinx_gallery.sorting import FileNameSortKey
+
 # -- Project information
 
 project = 'PyJuice'
@@ -25,6 +27,8 @@ sphinx_gallery_conf = {
     'examples_dirs': '../../examples',
     # other configuration options
     'gallery_dirs': 'getting-started/tutorials',
+    # sort key
+    'within_subsection_order': FileNameSortKey
 }
 
 intersphinx_mapping = {
