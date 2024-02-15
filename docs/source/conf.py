@@ -25,8 +25,6 @@ sphinx_gallery_conf = {
     'examples_dirs': '../../examples',
     # other configuration options
     'gallery_dirs': 'getting-started/tutorials',
-    # thumbnails
-    'default_thumb_file': 'imgs/juice.png'
 }
 
 intersphinx_mapping = {

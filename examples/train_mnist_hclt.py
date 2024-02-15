@@ -1,7 +1,11 @@
 """
 Example
 =======
+
+cccc
 """
+
+# sphinx_gallery_thumbnail_path = 'imgs/juice.png'
 
 import pyjuice as juice
 import torch
