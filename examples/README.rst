@@ -1,3 +1,6 @@
+Tutorials
+=========
+
 Welcome to the PyJuice examples gallery!
 
 This gallery contains various examples demonstrating the usage of PyJuice library.
