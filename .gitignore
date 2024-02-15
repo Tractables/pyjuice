@@ -170,4 +170,6 @@ tests/examples/
 
 docs/build/
 docs/source/python-api/generated/
-docs/source/getting-started/tutorials/generated/
+docs/source/getting-started/tutorials/
+
+data/

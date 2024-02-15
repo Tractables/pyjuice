@@ -21,8 +21,10 @@ extensions = [
 ]
 
 sphinx_gallery_conf = {
+    # path to your example scripts
+    'examples_dirs': '../../examples',
     # other configuration options
-    'gallery_dirs': 'getting-started/tutorials/generated/gallery',
+    'gallery_dirs': 'getting-started/tutorials'
 }
 
 intersphinx_mapping = {
