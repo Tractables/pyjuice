@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="../../">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Example &mdash; PyJuice 2.0.1 documentation</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=80d5e7a1" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=19f00094" />
+      <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery.css?v=61a4c737" />
+      <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery-binder.css?v=f4aeca0c" />
+      <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery-dataframe.css?v=2082cf3c" />
+      <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery-rendered-html.css?v=1277b6f3" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script src="../../_static/jquery.js?v=5d32c60e"></script>
+        <script src="../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+        <script src="../../_static/documentation_options.js?v=f5cff4aa"></script>
+        <script src="../../_static/doctools.js?v=888ff710"></script>
+        <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="pyjuice" href="../../python-api/pyjuice.html" />
+    <link rel="prev" title="Example" href="train_mnist_hclt.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            PyJuice
+          </a>
+              <div class="version">
+                2.0.1
+              </div>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../installation.html">Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="train_mnist_pd.html">Example</a></li>
+<li class="toctree-l1"><a class="reference internal" href="train_mnist_pdhclt.html">Example</a></li>
+<li class="toctree-l1"><a class="reference internal" href="train_mnist_hclt.html">Example</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">Example</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/pyjuice.html">pyjuice</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/nodes.html">pyjuice.nodes</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorcircuit.html">pyjuice.TensorCircuit</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/structures.html">pyjuice.structures</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">PyJuice</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">&lt;no title&gt;</a></li>
+      <li class="breadcrumb-item active">Example</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="../../_sources/getting-started/tutorials/train_hmm.rst.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <div class="sphx-glr-download-link-note admonition note">
+<p class="admonition-title">Note</p>
+<p><a class="reference internal" href="#sphx-glr-download-getting-started-tutorials-train-hmm-py"><span class="std std-ref">Go to the end</span></a>
+to download the full example code</p>
+</div>
+<section class="sphx-glr-example-title" id="example">
+<span id="sphx-glr-getting-started-tutorials-train-hmm-py"></span><h1>Example<a class="headerlink" href="#example" title="Link to this heading"></a></h1>
+<div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span> <span class="nn">pyjuice</span> <span class="k">as</span> <span class="nn">juice</span>
+<span class="kn">import</span> <span class="nn">torch</span>
+<span class="kn">import</span> <span class="nn">torchvision</span>
+<span class="kn">import</span> <span class="nn">time</span>
+<span class="kn">import</span> <span class="nn">tqdm</span>
+<span class="kn">from</span> <span class="nn">torch.utils.data</span> <span class="kn">import</span> <span class="n">TensorDataset</span><span class="p">,</span> <span class="n">DataLoader</span>
+<span class="kn">import</span> <span class="nn">pyjuice.nodes.distributions</span> <span class="k">as</span> <span class="nn">dists</span>
+
+
+<span class="k">def</span> <span class="nf">evaluate</span><span class="p">(</span><span class="n">pc</span><span class="p">,</span> <span class="n">loader</span><span class="p">):</span>
+    <span class="n">lls_total</span> <span class="o">=</span> <span class="mf">0.0</span>
+    <span class="k">for</span> <span class="n">batch</span> <span class="ow">in</span> <span class="n">loader</span><span class="p">:</span>
+        <span class="n">x</span> <span class="o">=</span> <span class="n">batch</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">pc</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+        <span class="n">lls</span> <span class="o">=</span> <span class="n">pc</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+        <span class="n">lls_total</span> <span class="o">+=</span> <span class="n">lls</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">cpu</span><span class="p">()</span><span class="o">.</span><span class="n">numpy</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
+
+    <span class="n">lls_total</span> <span class="o">/=</span> <span class="nb">len</span><span class="p">(</span><span class="n">loader</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">lls_total</span>
+
+
+<span class="k">def</span> <span class="nf">mini_batch_em_epoch</span><span class="p">(</span><span class="n">num_epochs</span><span class="p">,</span> <span class="n">pc</span><span class="p">,</span> <span class="n">optimizer</span><span class="p">,</span> <span class="n">scheduler</span><span class="p">,</span> <span class="n">train_loader</span><span class="p">,</span> <span class="n">test_loader</span><span class="p">,</span> <span class="n">device</span><span class="p">):</span>
+    <span class="k">for</span> <span class="n">epoch</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">num_epochs</span><span class="p">):</span>
+        <span class="n">t0</span> <span class="o">=</span> <a href="https://docs.python.org/3/library/time.html#time.time" title="time.time" class="sphx-glr-backref-module-time sphx-glr-backref-type-py-function"><span class="n">time</span><span class="o">.</span><span class="n">time</span></a><span class="p">()</span>
+        <span class="n">train_ll</span> <span class="o">=</span> <span class="mf">0.0</span>
+        <span class="k">for</span> <span class="n">batch</span> <span class="ow">in</span> <span class="n">train_loader</span><span class="p">:</span>
+            <span class="n">x</span> <span class="o">=</span> <span class="n">batch</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+
+            <span class="n">optimizer</span><span class="o">.</span><span class="n">zero_grad</span><span class="p">()</span>
+
+            <span class="n">lls</span> <span class="o">=</span> <span class="n">pc</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+            <span class="n">lls</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+
+            <span class="n">train_ll</span> <span class="o">+=</span> <span class="n">lls</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">cpu</span><span class="p">()</span><span class="o">.</span><span class="n">numpy</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
+
+            <span class="n">optimizer</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>
+            <span class="k">if</span> <span class="n">scheduler</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">scheduler</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>
+
+        <span class="n">train_ll</span> <span class="o">/=</span> <span class="nb">len</span><span class="p">(</span><span class="n">train_loader</span><span class="p">)</span>
+
+        <span class="n">t1</span> <span class="o">=</span> <a href="https://docs.python.org/3/library/time.html#time.time" title="time.time" class="sphx-glr-backref-module-time sphx-glr-backref-type-py-function"><span class="n">time</span><span class="o">.</span><span class="n">time</span></a><span class="p">()</span>
+        <span class="n">test_ll</span> <span class="o">=</span> <span class="n">evaluate</span><span class="p">(</span><span class="n">pc</span><span class="p">,</span> <span class="n">loader</span><span class="o">=</span><span class="n">test_loader</span><span class="p">)</span>
+        <span class="n">t2</span> <span class="o">=</span> <a href="https://docs.python.org/3/library/time.html#time.time" title="time.time" class="sphx-glr-backref-module-time sphx-glr-backref-type-py-function"><span class="n">time</span><span class="o">.</span><span class="n">time</span></a><span class="p">()</span>
+
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[Epoch </span><span class="si">{</span><span class="n">epoch</span><span class="si">}</span><span class="s2">/</span><span class="si">{</span><span class="n">num_epochs</span><span class="si">}</span><span class="s2">][train LL: </span><span class="si">{</span><span class="n">train_ll</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">; test LL: </span><span class="si">{</span><span class="n">test_ll</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">].....[train forward+backward+step </span><span class="si">{</span><span class="n">t1</span><span class="o">-</span><span class="n">t0</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">; test forward </span><span class="si">{</span><span class="n">t2</span><span class="o">-</span><span class="n">t1</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">] &quot;</span><span class="p">)</span>
+
+
+<span class="k">def</span> <span class="nf">full_batch_em_epoch</span><span class="p">(</span><span class="n">pc</span><span class="p">,</span> <span class="n">train_loader</span><span class="p">,</span> <span class="n">test_loader</span><span class="p">,</span> <span class="n">device</span><span class="p">):</span>
+
+    <span class="n">pc</span><span class="o">.</span><span class="n">init_param_flows</span><span class="p">(</span><span class="n">flows_memory</span> <span class="o">=</span> <span class="mf">0.0</span><span class="p">)</span>
+
+    <span class="n">t0</span> <span class="o">=</span> <a href="https://docs.python.org/3/library/time.html#time.time" title="time.time" class="sphx-glr-backref-module-time sphx-glr-backref-type-py-function"><span class="n">time</span><span class="o">.</span><span class="n">time</span></a><span class="p">()</span>
+    <span class="n">train_ll</span> <span class="o">=</span> <span class="mf">0.0</span>
+    <span class="k">for</span> <span class="n">batch</span> <span class="ow">in</span> <span class="n">tqdm</span><span class="o">.</span><span class="n">tqdm</span><span class="p">(</span><span class="n">train_loader</span><span class="p">):</span>
+        <span class="n">x</span> <span class="o">=</span> <span class="n">batch</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+
+        <span class="n">lls</span> <span class="o">=</span> <span class="n">pc</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+        <span class="n">lls</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+
+        <span class="n">train_ll</span> <span class="o">+=</span> <span class="n">lls</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">cpu</span><span class="p">()</span><span class="o">.</span><span class="n">numpy</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
+
+    <span class="n">pc</span><span class="o">.</span><span class="n">mini_batch_em</span><span class="p">(</span><span class="n">step_size</span> <span class="o">=</span> <span class="mf">1.0</span><span class="p">,</span> <span class="n">pseudocount</span> <span class="o">=</span> <span class="mf">0.1</span><span class="p">)</span>
+
+    <span class="n">train_ll</span> <span class="o">/=</span> <span class="nb">len</span><span class="p">(</span><span class="n">train_loader</span><span class="p">)</span>
+
+    <span class="n">t1</span> <span class="o">=</span> <a href="https://docs.python.org/3/library/time.html#time.time" title="time.time" class="sphx-glr-backref-module-time sphx-glr-backref-type-py-function"><span class="n">time</span><span class="o">.</span><span class="n">time</span></a><span class="p">()</span>
+    <span class="n">test_ll</span> <span class="o">=</span> <span class="n">evaluate</span><span class="p">(</span><span class="n">pc</span><span class="p">,</span> <span class="n">loader</span><span class="o">=</span><span class="n">test_loader</span><span class="p">)</span>
+    <span class="n">t2</span> <span class="o">=</span> <a href="https://docs.python.org/3/library/time.html#time.time" title="time.time" class="sphx-glr-backref-module-time sphx-glr-backref-type-py-function"><span class="n">time</span><span class="o">.</span><span class="n">time</span></a><span class="p">()</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[train LL: </span><span class="si">{</span><span class="n">train_ll</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">; test LL: </span><span class="si">{</span><span class="n">test_ll</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">].....[train forward+backward+step </span><span class="si">{</span><span class="n">t1</span><span class="o">-</span><span class="n">t0</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">; test forward </span><span class="si">{</span><span class="n">t2</span><span class="o">-</span><span class="n">t1</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">] &quot;</span><span class="p">)</span>
+
+
+<span class="k">def</span> <span class="nf">homogenes_hmm</span><span class="p">(</span><span class="n">seq_length</span><span class="p">,</span> <span class="n">num_latents</span><span class="p">,</span> <span class="n">vocab_size</span><span class="p">):</span>
+
+    <span class="n">group_size</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">juice</span><span class="o">.</span><span class="n">utils</span><span class="o">.</span><span class="n">util</span><span class="o">.</span><span class="n">max_cdf_power_of_2</span><span class="p">(</span><span class="n">num_latents</span><span class="p">),</span> <span class="mi">1024</span><span class="p">)</span>
+    <span class="n">num_node_groups</span> <span class="o">=</span> <span class="n">num_latents</span> <span class="o">//</span> <span class="n">group_size</span>
+
+    <span class="k">with</span> <span class="n">juice</span><span class="o">.</span><span class="n">set_group_size</span><span class="p">(</span><span class="n">group_size</span> <span class="o">=</span> <span class="n">group_size</span><span class="p">):</span>
+        <span class="n">ns_input</span> <span class="o">=</span> <span class="n">juice</span><span class="o">.</span><span class="n">inputs</span><span class="p">(</span><span class="n">seq_length</span> <span class="o">-</span> <span class="mi">1</span><span class="p">,</span> <span class="n">num_node_groups</span> <span class="o">=</span> <span class="n">num_node_groups</span><span class="p">,</span>
+                                <span class="n">dist</span> <span class="o">=</span> <span class="n">dists</span><span class="o">.</span><span class="n">Categorical</span><span class="p">(</span><span class="n">num_cats</span> <span class="o">=</span> <span class="n">vocab_size</span><span class="p">))</span>
+
+        <span class="n">ns_sum</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">curr_zs</span> <span class="o">=</span> <span class="n">ns_input</span>
+        <span class="k">for</span> <span class="n">var</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">seq_length</span> <span class="o">-</span> <span class="mi">2</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">):</span>
+            <span class="n">curr_xs</span> <span class="o">=</span> <span class="n">ns_input</span><span class="o">.</span><span class="n">duplicate</span><span class="p">(</span><span class="n">var</span><span class="p">,</span> <span class="n">tie_params</span> <span class="o">=</span> <span class="kc">True</span><span class="p">)</span>
+
+            <span class="k">if</span> <span class="n">ns_sum</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">ns</span> <span class="o">=</span> <span class="n">juice</span><span class="o">.</span><span class="n">summate</span><span class="p">(</span>
+                    <span class="n">curr_zs</span><span class="p">,</span> <span class="n">num_node_groups</span> <span class="o">=</span> <span class="n">num_node_groups</span><span class="p">)</span>
+                <span class="n">ns_sum</span> <span class="o">=</span> <span class="n">ns</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">ns</span> <span class="o">=</span> <span class="n">ns_sum</span><span class="o">.</span><span class="n">duplicate</span><span class="p">(</span><span class="n">curr_zs</span><span class="p">,</span> <span class="n">tie_params</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+
+            <span class="n">curr_zs</span> <span class="o">=</span> <span class="n">juice</span><span class="o">.</span><span class="n">multiply</span><span class="p">(</span><span class="n">curr_xs</span><span class="p">,</span> <span class="n">ns</span><span class="p">)</span>
+
+        <span class="n">ns</span> <span class="o">=</span> <span class="n">juice</span><span class="o">.</span><span class="n">summate</span><span class="p">(</span><span class="n">curr_zs</span><span class="p">,</span> <span class="n">num_node_groups</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span> <span class="n">group_size</span> <span class="o">=</span> <span class="mi">1</span><span class="p">)</span>
+
+    <span class="n">ns</span><span class="o">.</span><span class="n">init_parameters</span><span class="p">()</span>
+
+    <span class="k">return</span> <span class="n">ns</span>
+
+
+<span class="k">def</span> <span class="nf">train_hmm</span><span class="p">(</span><span class="n">enable_cudagrph</span> <span class="o">=</span> <span class="kc">True</span><span class="p">):</span>
+
+    <span class="n">device</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="s2">&quot;cuda:0&quot;</span><span class="p">)</span>
+
+    <span class="n">T</span> <span class="o">=</span> <span class="mi">32</span>
+    <span class="n">ns</span> <span class="o">=</span> <span class="n">homogenes_hmm</span><span class="p">(</span><span class="n">T</span><span class="p">,</span> <span class="mi">8192</span><span class="p">,</span> <span class="mi">4023</span><span class="p">)</span>
+
+    <span class="n">pc</span> <span class="o">=</span> <span class="n">juice</span><span class="o">.</span><span class="n">TensorCircuit</span><span class="p">(</span><span class="n">ns</span><span class="p">,</span> <span class="n">max_tied_ns_per_parflow_group</span> <span class="o">=</span> <span class="mi">2</span><span class="p">)</span>
+    <span class="n">pc</span><span class="o">.</span><span class="n">print_statistics</span><span class="p">()</span>
+
+    <span class="n">pc</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+
+    <span class="n">data</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randint</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">10000</span><span class="p">,</span> <span class="p">(</span><span class="mi">6400</span><span class="p">,</span> <span class="n">T</span><span class="p">))</span>
+
+    <span class="n">data_loader</span> <span class="o">=</span> <span class="n">DataLoader</span><span class="p">(</span>
+        <span class="n">dataset</span> <span class="o">=</span> <span class="n">TensorDataset</span><span class="p">(</span><span class="n">data</span><span class="p">),</span>
+        <span class="n">batch_size</span> <span class="o">=</span> <span class="mi">64</span><span class="p">,</span>
+        <span class="n">shuffle</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+        <span class="n">drop_last</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="p">)</span>
+
+    <span class="n">optimizer</span> <span class="o">=</span> <span class="n">juice</span><span class="o">.</span><span class="n">optim</span><span class="o">.</span><span class="n">CircuitOptimizer</span><span class="p">(</span><span class="n">pc</span><span class="p">,</span> <span class="n">lr</span> <span class="o">=</span> <span class="mf">0.1</span><span class="p">,</span> <span class="n">pseudocount</span> <span class="o">=</span> <span class="mf">0.0001</span><span class="p">)</span>
+
+    <span class="k">for</span> <span class="n">batch</span> <span class="ow">in</span> <span class="n">tqdm</span><span class="o">.</span><span class="n">tqdm</span><span class="p">(</span><span class="n">data_loader</span><span class="p">):</span>
+        <span class="n">x</span> <span class="o">=</span> <span class="n">batch</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+
+        <span class="n">lls</span> <span class="o">=</span> <span class="n">pc</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+        <span class="n">lls</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+
+        <span class="k">break</span>
+
+    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+    <span class="n">t0</span> <span class="o">=</span> <a href="https://docs.python.org/3/library/time.html#time.time" title="time.time" class="sphx-glr-backref-module-time sphx-glr-backref-type-py-function"><span class="n">time</span><span class="o">.</span><span class="n">time</span></a><span class="p">()</span>
+
+    <span class="k">for</span> <span class="n">batch</span> <span class="ow">in</span> <span class="n">tqdm</span><span class="o">.</span><span class="n">tqdm</span><span class="p">(</span><span class="n">data_loader</span><span class="p">):</span>
+        <span class="n">x</span> <span class="o">=</span> <span class="n">batch</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+
+        <span class="n">lls</span> <span class="o">=</span> <span class="n">pc</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+        <span class="n">lls</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+
+    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+    <span class="n">t1</span> <span class="o">=</span> <a href="https://docs.python.org/3/library/time.html#time.time" title="time.time" class="sphx-glr-backref-module-time sphx-glr-backref-type-py-function"><span class="n">time</span><span class="o">.</span><span class="n">time</span></a><span class="p">()</span>
+
+    <span class="nb">print</span><span class="p">((</span><span class="n">t1</span><span class="o">-</span><span class="n">t0</span><span class="p">)</span><span class="o">/</span><span class="mi">100</span><span class="o">*</span><span class="mi">1000</span><span class="p">,</span> <span class="s2">&quot;ms&quot;</span><span class="p">)</span>
+
+    <span class="c1"># mini_batch_em_epoch(350, pc, optimizer, None, data_loader, data_loader, device)</span>
+
+
+<span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">&quot;__main__&quot;</span><span class="p">:</span>
+    <span class="n">train_hmm</span><span class="p">()</span>
+</pre></div>
+</div>
+<div class="sphx-glr-footer sphx-glr-footer-example docutils container" id="sphx-glr-download-getting-started-tutorials-train-hmm-py">
+<div class="sphx-glr-download sphx-glr-download-jupyter docutils container">
+<p><a class="reference download internal" download="" href="../../_downloads/438b4d470415e8851fc30a112d3291db/train_hmm.ipynb"><code class="xref download docutils literal notranslate"><span class="pre">Download</span> <span class="pre">Jupyter</span> <span class="pre">notebook:</span> <span class="pre">train_hmm.ipynb</span></code></a></p>
+</div>
+<div class="sphx-glr-download sphx-glr-download-python docutils container">
+<p><a class="reference download internal" download="" href="../../_downloads/0749894295c4ed0d731492395c04895e/train_hmm.py"><code class="xref download docutils literal notranslate"><span class="pre">Download</span> <span class="pre">Python</span> <span class="pre">source</span> <span class="pre">code:</span> <span class="pre">train_hmm.py</span></code></a></p>
+</div>
+</div>
+<p class="sphx-glr-signature"><a class="reference external" href="https://sphinx-gallery.github.io">Gallery generated by Sphinx-Gallery</a></p>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="train_mnist_hclt.html" class="btn btn-neutral float-left" title="Example" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="../../python-api/pyjuice.html" class="btn btn-neutral float-right" title="pyjuice" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2021, StarAI.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>
