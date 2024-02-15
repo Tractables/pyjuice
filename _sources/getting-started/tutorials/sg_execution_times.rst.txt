@@ -6,7 +6,7 @@
 
 Computation times
 =================
-**00:00.000** total execution time for 4 files **from getting-started/tutorials**:
+**00:00.000** total execution time for 2 files **from getting-started/tutorials**:
 
 .. container::
 
@@ -32,15 +32,9 @@ Computation times
    * - Example
      - Time
      - Mem (MB)
-   * - :ref:`sphx_glr_getting-started_tutorials_train_hmm.py` (``train_hmm.py``)
+   * - :ref:`sphx_glr_getting-started_tutorials_01_train_pc.py` (``01_train_pc.py``)
      - 00:00.000
      - 0.0
-   * - :ref:`sphx_glr_getting-started_tutorials_train_mnist_hclt.py` (``train_mnist_hclt.py``)
-     - 00:00.000
-     - 0.0
-   * - :ref:`sphx_glr_getting-started_tutorials_train_mnist_pd.py` (``train_mnist_pd.py``)
-     - 00:00.000
-     - 0.0
-   * - :ref:`sphx_glr_getting-started_tutorials_train_mnist_pdhclt.py` (``train_mnist_pdhclt.py``)
+   * - :ref:`sphx_glr_getting-started_tutorials_02_construct_hmm.py` (``02_construct_hmm.py``)
      - 00:00.000
      - 0.0

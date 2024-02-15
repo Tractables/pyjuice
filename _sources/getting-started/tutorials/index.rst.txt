@@ -18,69 +18,35 @@ Feel free to explore the examples and learn how to use PyJuice for your projects
 
 .. raw:: html
 
-    <div class="sphx-glr-thumbcontainer" tooltip="bbbb">
+    <div class="sphx-glr-thumbcontainer" tooltip="This tutorial demonstrates how to create a Hidden Chow-Liu Tree (https://arxiv.org/pdf/2106.022...">
 
 .. only:: html
 
-  .. image:: /getting-started/tutorials/images/thumb/sphx_glr_train_mnist_pd_thumb.png
+  .. image:: /getting-started/tutorials/images/thumb/sphx_glr_01_train_pc_thumb.png
     :alt:
 
-  :ref:`sphx_glr_getting-started_tutorials_train_mnist_pd.py`
+  :ref:`sphx_glr_getting-started_tutorials_01_train_pc.py`
 
 .. raw:: html
 
-      <div class="sphx-glr-thumbnail-title">Example</div>
+      <div class="sphx-glr-thumbnail-title">Train a PC</div>
     </div>
 
 
 .. raw:: html
 
-    <div class="sphx-glr-thumbcontainer" tooltip="aaaa">
+    <div class="sphx-glr-thumbcontainer" tooltip="This tutorial demonstrates how to construct an HMM with PyJuice primitives inputs, multiply, an...">
 
 .. only:: html
 
-  .. image:: /getting-started/tutorials/images/thumb/sphx_glr_train_mnist_pdhclt_thumb.png
+  .. image:: /getting-started/tutorials/images/thumb/sphx_glr_02_construct_hmm_thumb.png
     :alt:
 
-  :ref:`sphx_glr_getting-started_tutorials_train_mnist_pdhclt.py`
+  :ref:`sphx_glr_getting-started_tutorials_02_construct_hmm.py`
 
 .. raw:: html
 
-      <div class="sphx-glr-thumbnail-title">Example</div>
-    </div>
-
-
-.. raw:: html
-
-    <div class="sphx-glr-thumbcontainer" tooltip="cccc">
-
-.. only:: html
-
-  .. image:: /getting-started/tutorials/images/thumb/sphx_glr_train_mnist_hclt_thumb.png
-    :alt:
-
-  :ref:`sphx_glr_getting-started_tutorials_train_mnist_hclt.py`
-
-.. raw:: html
-
-      <div class="sphx-glr-thumbnail-title">Example</div>
-    </div>
-
-
-.. raw:: html
-
-    <div class="sphx-glr-thumbcontainer" tooltip="dddd">
-
-.. only:: html
-
-  .. image:: /getting-started/tutorials/images/thumb/sphx_glr_train_hmm_thumb.png
-    :alt:
-
-  :ref:`sphx_glr_getting-started_tutorials_train_hmm.py`
-
-.. raw:: html
-
-      <div class="sphx-glr-thumbnail-title">Example</div>
+      <div class="sphx-glr-thumbnail-title">Construct an HMM</div>
     </div>
 
 
@@ -92,10 +58,8 @@ Feel free to explore the examples and learn how to use PyJuice for your projects
 .. toctree::
    :hidden:
 
-   /getting-started/tutorials/train_mnist_pd
-   /getting-started/tutorials/train_mnist_pdhclt
-   /getting-started/tutorials/train_mnist_hclt
-   /getting-started/tutorials/train_hmm
+   /getting-started/tutorials/01_train_pc
+   /getting-started/tutorials/02_construct_hmm
 
 
 .. only:: html
