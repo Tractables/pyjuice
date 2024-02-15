@@ -21,10 +21,14 @@
 Example
 =======
 
-.. GENERATED FROM PYTHON SOURCE LINES 5-126
+aaaa
+
+.. GENERATED FROM PYTHON SOURCE LINES 7-130
 
 .. code-block:: Python
 
+
+    # sphinx_gallery_thumbnail_path = 'imgs/juice.png'
 
     import pyjuice as juice
     import torch
