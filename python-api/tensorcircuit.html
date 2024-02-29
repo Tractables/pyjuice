@@ -139,8 +139,8 @@
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>inputs</strong> – None or [B, num_vars]</p></li>
-<li><p><strong>ll_weights</strong> – None or [B] or [num_roots, B]</p></li>
+<li><p><strong>inputs</strong> (<em>torch.Tensor</em>) – input tensor of size <cite>[B, num_vars]</cite></p></li>
+<li><p><strong>ll_weights</strong> (<em>torch.Tensor</em>) – weights of the log-likelihoods of size [B] or [num_roots, B]</p></li>
 <li><p><strong>input_layer_fn</strong> (<em>Optional</em><em>[</em><em>Union</em><em>[</em><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>,</em><em>Callable</em><em>]</em><em>]</em>) – Custom forward function for input layers; if it is a string, then try to call the corresponding member function of the input layers</p></li>
 </ul>
 </dd>
