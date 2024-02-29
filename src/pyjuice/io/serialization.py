@@ -54,8 +54,13 @@ def serialize_nodes(root_ns: CircuitNodes):
 def deserialize_nodes(nodes_list: Sequence):
     id2ns = dict()
     for ns_id, ns_info in enumerate(nodes_list):
-        num_node_blocks = ns_info["num_node_blocks"]
-        block_size = ns_info["block_size"]
+        if "num_node_blocks" in ns_info:
+            num_node_blocks = ns_info["num_node_blocks"]
+            block_size = ns_info["block_size"]
+        else:
+            assert "num_nodes" in ns_info
+            num_node_blocks = ns_info["num_nodes"]
+            block_size = 1
         chids = ns_info["chs"]
 
         if ns_info["type"] == "Input":
