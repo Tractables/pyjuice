@@ -22,6 +22,7 @@
         <script src="../../_static/documentation_options.js?v=c2377ec0"></script>
         <script src="../../_static/doctools.js?v=888ff710"></script>
         <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+        <script async="async" src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
     <script src="../../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../../genindex.html" />
     <link rel="search" title="Search" href="../../search.html" />
@@ -113,7 +114,7 @@ to download the full example code</p>
 </div>
 <section id="generate-a-pc">
 <h2>Generate a PC<a class="headerlink" href="#generate-a-pc" title="Link to this heading"></a></h2>
-<p>We create a simple PC consisting of two variables $X_1$ and $X_2$:</p>
+<p>We create a simple PC consisting of two variables <span class="math notranslate nohighlight">\(X_1\)</span> and <span class="math notranslate nohighlight">\(X_2\)</span>:</p>
 <div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span> <span class="nn">torch</span>
 <span class="kn">import</span> <span class="nn">pyjuice</span> <span class="k">as</span> <span class="nn">juice</span>
 <span class="kn">import</span> <span class="nn">pyjuice.nodes.distributions</span> <span class="k">as</span> <span class="nn">dists</span>
@@ -137,7 +138,7 @@ to download the full example code</p>
 </section>
 <section id="compute-marginal-probabilities">
 <h2>Compute marginal probabilities<a class="headerlink" href="#compute-marginal-probabilities" title="Link to this heading"></a></h2>
-<p>Assume we want to compute the probabilities $P(X_1 = 0)$ and $P(X_1 = 1)$. We need to create two tensors: a “data” tensor consisting the values of the observed variables ($X_1$ in this case) and another “mask” tensor indicating which variables are missing.</p>
+<p>Assume we want to compute the probabilities <span class="math notranslate nohighlight">\(P(X_1 = 0)\)</span> and <span class="math notranslate nohighlight">\(P(X_1 = 1)\)</span>. We need to create two tensors: a “data” tensor consisting the values of the observed variables (<span class="math notranslate nohighlight">\(X_1\)</span> in this case) and another “mask” tensor indicating which variables are missing.</p>
 <div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="n">data</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">]])</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
 <span class="n">missing_mask</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([[</span><span class="kc">False</span><span class="p">,</span> <span class="kc">True</span><span class="p">],</span> <span class="p">[</span><span class="kc">False</span><span class="p">,</span> <span class="kc">True</span><span class="p">]])</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span> <span class="c1"># True for variables to be conditioned on/are missing</span>
 </pre></div>
@@ -150,12 +151,12 @@ The <cite>missing_mask</cite> can have have shape [batch_size, num_vars] or [num
 <span class="p">)</span>
 </pre></div>
 </div>
-<p>For PCs defined on categorical variables, we can alternatively query for marginal probabilities given <em>soft</em> evidence, e.g., $P(X_1 = 0 text{~w.p.~} 0.3 text{~and~} 1 text{~w.p.~} 0.7).
+<p>For PCs defined on categorical variables, we can alternatively query for marginal probabilities given <em>soft</em> evidence, e.g., <span class="math notranslate nohighlight">\(P(X_1 = 0 \text{~w.p.~} 0.3 \text{~and~} 1 \text{~w.p.~} 0.7)\)</span>.
 This can be done by defining <cite>date</cite> as a 3D tensor of size [batch_size, num_vars, num_cats]:</p>
 <div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="n">data</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([[[</span><span class="mf">0.4</span><span class="p">,</span> <span class="mf">0.6</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">]],</span> <span class="p">[[</span><span class="mf">0.3</span><span class="p">,</span> <span class="mf">0.7</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">]]])</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
 </pre></div>
 </div>
-<p>Since $X_1$ has two categories and $X_2$ has four categories, the size of the last dimension of <cite>data</cite> should be 4.</p>
+<p>Since <span class="math notranslate nohighlight">\(X_1\)</span> has two categories and $X_2$ has four categories, the size of the last dimension of <cite>data</cite> should be 4.</p>
 <p>The soft marginal probabilities can be similarly computed by:</p>
 <div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="n">lls</span> <span class="o">=</span> <span class="n">juice</span><span class="o">.</span><span class="n">queries</span><span class="o">.</span><span class="n">marginal</span><span class="p">(</span>
     <span class="n">pc</span><span class="p">,</span> <span class="n">data</span> <span class="o">=</span> <span class="n">data</span><span class="p">,</span> <span class="n">missing_mask</span> <span class="o">=</span> <span class="n">missing_mask</span>

@@ -14,7 +14,7 @@ We will cover how to compute marginal and conditional probabilities.
 # -------------
 
 # %%
-# We create a simple PC consisting of two variables $X_1$ and $X_2$:
+# We create a simple PC consisting of two variables :math:`X_1` and :math:`X_2`:
 
 import torch
 import pyjuice as juice
@@ -41,7 +41,7 @@ pc.to(device)
 # ------------------------------
 
 # %%
-# Assume we want to compute the probabilities $P(X_1 = 0)$ and $P(X_1 = 1)$. We need to create two tensors: a "data" tensor consisting the values of the observed variables ($X_1$ in this case) and another "mask" tensor indicating which variables are missing.
+# Assume we want to compute the probabilities :math:`P(X_1 = 0)` and :math:`P(X_1 = 1)`. We need to create two tensors: a "data" tensor consisting the values of the observed variables (:math:`X_1` in this case) and another "mask" tensor indicating which variables are missing.
 
 data = torch.tensor([[0, 0], [1, 0]]).to(device)
 missing_mask = torch.tensor([[False, True], [False, True]]).to(device) # True for variables to be conditioned on/are missing
@@ -57,13 +57,13 @@ lls = juice.queries.marginal(
 )
 
 # %%
-# For PCs defined on categorical variables, we can alternatively query for marginal probabilities given *soft* evidence, e.g., $P(X_1 = 0 \text{~w.p.~} 0.3 \text{~and~} 1 \text{~w.p.~} 0.7).
+# For PCs defined on categorical variables, we can alternatively query for marginal probabilities given *soft* evidence, e.g., :math:`P(X_1 = 0 \text{~w.p.~} 0.3 \text{~and~} 1 \text{~w.p.~} 0.7)`.
 # This can be done by defining `date` as a 3D tensor of size [batch_size, num_vars, num_cats]:
 
 data = torch.tensor([[[0.4, 0.6, 0, 0], [0, 0, 0, 0]], [[0.3, 0.7, 0, 0], [0, 0, 0, 0]]]).to(device)
 
 # %%
-# Since $X_1$ has two categories and $X_2$ has four categories, the size of the last dimension of `data` should be 4.
+# Since :math:`X_1` has two categories and $X_2$ has four categories, the size of the last dimension of `data` should be 4.
 #
 # The soft marginal probabilities can be similarly computed by:
 
