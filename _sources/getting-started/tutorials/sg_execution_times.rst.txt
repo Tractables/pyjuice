@@ -6,7 +6,7 @@
 
 Computation times
 =================
-**00:00.000** total execution time for 2 files **from getting-started/tutorials**:
+**00:00.000** total execution time for 3 files **from getting-started/tutorials**:
 
 .. container::
 
@@ -36,5 +36,8 @@ Computation times
      - 00:00.000
      - 0.0
    * - :ref:`sphx_glr_getting-started_tutorials_02_construct_hmm.py` (``02_construct_hmm.py``)
+     - 00:00.000
+     - 0.0
+   * - :ref:`sphx_glr_getting-started_tutorials_03_query_pc.py` (``03_query_pc.py``)
      - 00:00.000
      - 0.0

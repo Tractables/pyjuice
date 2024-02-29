@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="../../">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Query a PC &mdash; PyJuice 2.0.2 documentation</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=80d5e7a1" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=19f00094" />
+      <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery.css?v=61a4c737" />
+      <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery-binder.css?v=f4aeca0c" />
+      <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery-dataframe.css?v=2082cf3c" />
+      <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery-rendered-html.css?v=1277b6f3" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script src="../../_static/jquery.js?v=5d32c60e"></script>
+        <script src="../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+        <script src="../../_static/documentation_options.js?v=c2377ec0"></script>
+        <script src="../../_static/doctools.js?v=888ff710"></script>
+        <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="pyjuice" href="../../python-api/pyjuice.html" />
+    <link rel="prev" title="Construct an HMM" href="02_construct_hmm.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            PyJuice
+          </a>
+              <div class="version">
+                2.0.2
+              </div>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../installation.html">Installation</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Tutorials</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="01_train_pc.html">Train a PC</a></li>
+<li class="toctree-l2"><a class="reference internal" href="02_construct_hmm.html">Construct an HMM</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">Query a PC</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#generate-a-pc">Generate a PC</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#compute-marginal-probabilities">Compute marginal probabilities</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#compute-conditional-probabilities">Compute conditional probabilities</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/pyjuice.html">pyjuice</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/nodes.html">pyjuice.nodes</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorcircuit.html">pyjuice.TensorCircuit</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/structures.html">pyjuice.structures</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">PyJuice</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">Tutorials</a></li>
+      <li class="breadcrumb-item active">Query a PC</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="../../_sources/getting-started/tutorials/03_query_pc.rst.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <div class="sphx-glr-download-link-note admonition note">
+<p class="admonition-title">Note</p>
+<p><a class="reference internal" href="#sphx-glr-download-getting-started-tutorials-03-query-pc-py"><span class="std std-ref">Go to the end</span></a>
+to download the full example code</p>
+</div>
+<section class="sphx-glr-example-title" id="query-a-pc">
+<span id="sphx-glr-getting-started-tutorials-03-query-pc-py"></span><h1>Query a PC<a class="headerlink" href="#query-a-pc" title="Link to this heading"></a></h1>
+<p>Assume we have constructed and trained a PC following the previous tutorials. This tutorial demonstrates how to query the PC, i.e., ask probabilistic queries about the distribution encoded by the PC.</p>
+<p>We will cover how to compute marginal and conditional probabilities.</p>
+<div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="c1"># sphinx_gallery_thumbnail_path = &#39;imgs/juice.png&#39;</span>
+</pre></div>
+</div>
+<section id="generate-a-pc">
+<h2>Generate a PC<a class="headerlink" href="#generate-a-pc" title="Link to this heading"></a></h2>
+<p>We create a simple PC consisting of two variables $X_1$ and $X_2$:</p>
+<div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span> <span class="nn">torch</span>
+<span class="kn">import</span> <span class="nn">pyjuice</span> <span class="k">as</span> <span class="nn">juice</span>
+<span class="kn">import</span> <span class="nn">pyjuice.nodes.distributions</span> <span class="k">as</span> <span class="nn">dists</span>
+
+<span class="n">ni0</span> <span class="o">=</span> <span class="n">juice</span><span class="o">.</span><span class="n">inputs</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">num_nodes</span> <span class="o">=</span> <span class="mi">2</span><span class="p">,</span> <span class="n">dist</span> <span class="o">=</span> <span class="n">dists</span><span class="o">.</span><span class="n">Categorical</span><span class="p">(</span><span class="n">num_cats</span> <span class="o">=</span> <span class="mi">2</span><span class="p">))</span>
+<span class="n">ni1</span> <span class="o">=</span> <span class="n">juice</span><span class="o">.</span><span class="n">inputs</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">num_nodes</span> <span class="o">=</span> <span class="mi">2</span><span class="p">,</span> <span class="n">dist</span> <span class="o">=</span> <span class="n">dists</span><span class="o">.</span><span class="n">Categorical</span><span class="p">(</span><span class="n">num_cats</span> <span class="o">=</span> <span class="mi">4</span><span class="p">))</span>
+
+<span class="n">ms</span> <span class="o">=</span> <span class="n">juice</span><span class="o">.</span><span class="n">multiply</span><span class="p">(</span><span class="n">ni0</span><span class="p">,</span> <span class="n">ni1</span><span class="p">)</span>
+<span class="n">ns</span> <span class="o">=</span> <span class="n">juice</span><span class="o">.</span><span class="n">summate</span><span class="p">(</span><span class="n">ms</span><span class="p">,</span> <span class="n">num_nodes</span> <span class="o">=</span> <span class="mi">1</span><span class="p">)</span>
+
+<span class="n">ns</span><span class="o">.</span><span class="n">init_parameters</span><span class="p">()</span>
+
+<span class="n">pc</span> <span class="o">=</span> <span class="n">juice</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">ns</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>Move the PC to a GPU:</p>
+<div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="n">device</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="s2">&quot;cuda:0&quot;</span><span class="p">)</span>
+<span class="n">pc</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="compute-marginal-probabilities">
+<h2>Compute marginal probabilities<a class="headerlink" href="#compute-marginal-probabilities" title="Link to this heading"></a></h2>
+<p>Assume we want to compute the probabilities $P(X_1 = 0)$ and $P(X_1 = 1)$. We need to create two tensors: a “data” tensor consisting the values of the observed variables ($X_1$ in this case) and another “mask” tensor indicating which variables are missing.</p>
+<div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="n">data</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">]])</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+<span class="n">missing_mask</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([[</span><span class="kc">False</span><span class="p">,</span> <span class="kc">True</span><span class="p">],</span> <span class="p">[</span><span class="kc">False</span><span class="p">,</span> <span class="kc">True</span><span class="p">]])</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span> <span class="c1"># True for variables to be conditioned on/are missing</span>
+</pre></div>
+</div>
+<p>In the data tensor, entries corresponding missing variables will be dismissed by PyJuice and will not influence the output.
+The <cite>missing_mask</cite> can have have shape [batch_size, num_vars] or [num_vars] if for all samples we marginalize out the same subset of variables.</p>
+<p>We proceed to compute the marginal probabilities using <cite>pyjuice.queries.marginal</cite>:</p>
+<div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="n">lls</span> <span class="o">=</span> <span class="n">juice</span><span class="o">.</span><span class="n">queries</span><span class="o">.</span><span class="n">marginal</span><span class="p">(</span>
+    <span class="n">pc</span><span class="p">,</span> <span class="n">data</span> <span class="o">=</span> <span class="n">data</span><span class="p">,</span> <span class="n">missing_mask</span> <span class="o">=</span> <span class="n">missing_mask</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<p>For PCs defined on categorical variables, we can alternatively query for marginal probabilities given <em>soft</em> evidence, e.g., $P(X_1 = 0 text{~w.p.~} 0.3 text{~and~} 1 text{~w.p.~} 0.7).
+This can be done by defining <cite>date</cite> as a 3D tensor of size [batch_size, num_vars, num_cats]:</p>
+<div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="n">data</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([[[</span><span class="mf">0.4</span><span class="p">,</span> <span class="mf">0.6</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">]],</span> <span class="p">[[</span><span class="mf">0.3</span><span class="p">,</span> <span class="mf">0.7</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">]]])</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>Since $X_1$ has two categories and $X_2$ has four categories, the size of the last dimension of <cite>data</cite> should be 4.</p>
+<p>The soft marginal probabilities can be similarly computed by:</p>
+<div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="n">lls</span> <span class="o">=</span> <span class="n">juice</span><span class="o">.</span><span class="n">queries</span><span class="o">.</span><span class="n">marginal</span><span class="p">(</span>
+    <span class="n">pc</span><span class="p">,</span> <span class="n">data</span> <span class="o">=</span> <span class="n">data</span><span class="p">,</span> <span class="n">missing_mask</span> <span class="o">=</span> <span class="n">missing_mask</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="compute-conditional-probabilities">
+<h2>Compute conditional probabilities<a class="headerlink" href="#compute-conditional-probabilities" title="Link to this heading"></a></h2>
+<p>Since every conditional probability can be represented as the quotient of two marginal probabilities, one may wonder why do we need a separate function for computing conditional probabilities.
+In fact, with <cite>pyjuice.queries.conditional</cite>, we can simultaneously compute a <em>set of</em> conditional probabilities. Specifically, given evidence $mathbf{E} = mathbf{e}$, we can compute $forall X notin mathbf{E}, x in mathrm{val}(X), P(X = x | mathbf{e})$.</p>
+<p>Say we want to compute the conditional probability of $X_2$ given evidence $X_1 = 0$ and $X_1 = 1$, respectively. We prepare the data and the mask similarly.</p>
+<div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="n">data</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">]])</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+<span class="n">missing_mask</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([[</span><span class="kc">False</span><span class="p">,</span> <span class="kc">True</span><span class="p">],</span> <span class="p">[</span><span class="kc">False</span><span class="p">,</span> <span class="kc">True</span><span class="p">]])</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span> <span class="c1"># True for variables to be conditioned on/are missing</span>
+</pre></div>
+</div>
+<p>The conditional probabilities are computed as follows:</p>
+<div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="n">outputs</span> <span class="o">=</span> <span class="n">juice</span><span class="o">.</span><span class="n">queries</span><span class="o">.</span><span class="n">conditional</span><span class="p">(</span>
+    <span class="n">pc</span><span class="p">,</span> <span class="n">data</span> <span class="o">=</span> <span class="n">data</span><span class="p">,</span> <span class="n">missing_mask</span> <span class="o">=</span> <span class="n">missing_mask</span><span class="p">,</span> <span class="n">target_vars</span> <span class="o">=</span> <span class="p">[</span><span class="mi">1</span><span class="p">]</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<p>The parameter <cite>target_vars</cite> is used to indicate the subset of variables which we want to compute their conditional probabilities. Probabilities of all variables will be returned if we do not specify <cite>target_vars</cite>.</p>
+<p>The shape of <cite>outputs</cite> is [B, num_target_vars, num_categories]. For example, <cite>outputs[1,0,3]</cite> is the conditional probability $P(X_2 = 3 | X_1 = 1)$.</p>
+<p>Similar to the marginal query, for categorical data, we can also feed <em>soft</em> evidence:</p>
+<div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="n">data</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([[[</span><span class="mf">0.4</span><span class="p">,</span> <span class="mf">0.6</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">]],</span> <span class="p">[[</span><span class="mf">0.3</span><span class="p">,</span> <span class="mf">0.7</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">]]])</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+<span class="n">missing_mask</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([[</span><span class="kc">False</span><span class="p">,</span> <span class="kc">True</span><span class="p">],</span> <span class="p">[</span><span class="kc">False</span><span class="p">,</span> <span class="kc">True</span><span class="p">]])</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+
+<span class="n">outputs</span> <span class="o">=</span> <span class="n">juice</span><span class="o">.</span><span class="n">queries</span><span class="o">.</span><span class="n">conditional</span><span class="p">(</span>
+    <span class="n">pc</span><span class="p">,</span> <span class="n">data</span> <span class="o">=</span> <span class="n">data</span><span class="p">,</span> <span class="n">missing_mask</span> <span class="o">=</span> <span class="n">missing_mask</span><span class="p">,</span> <span class="n">target_vars</span> <span class="o">=</span> <span class="p">[</span><span class="mi">1</span><span class="p">]</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<div class="sphx-glr-footer sphx-glr-footer-example docutils container" id="sphx-glr-download-getting-started-tutorials-03-query-pc-py">
+<div class="sphx-glr-download sphx-glr-download-jupyter docutils container">
+<p><a class="reference download internal" download="" href="../../_downloads/de85622651cd6e1d1c49a94204eca646/03_query_pc.ipynb"><code class="xref download docutils literal notranslate"><span class="pre">Download</span> <span class="pre">Jupyter</span> <span class="pre">notebook:</span> <span class="pre">03_query_pc.ipynb</span></code></a></p>
+</div>
+<div class="sphx-glr-download sphx-glr-download-python docutils container">
+<p><a class="reference download internal" download="" href="../../_downloads/503c3398b22275c2e286501bd6218cf1/03_query_pc.py"><code class="xref download docutils literal notranslate"><span class="pre">Download</span> <span class="pre">Python</span> <span class="pre">source</span> <span class="pre">code:</span> <span class="pre">03_query_pc.py</span></code></a></p>
+</div>
+</div>
+<p class="sphx-glr-signature"><a class="reference external" href="https://sphinx-gallery.github.io">Gallery generated by Sphinx-Gallery</a></p>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="02_construct_hmm.html" class="btn btn-neutral float-left" title="Construct an HMM" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="../../python-api/pyjuice.html" class="btn btn-neutral float-right" title="pyjuice" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2021, StarAI.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>
