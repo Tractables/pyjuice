@@ -129,10 +129,12 @@ class TensorCircuit(nn.Module):
         :type input_layer_fn: Optional[Union[str,Callable]]
         """
         
-        assert inputs.dim() == 2 and inputs.size(1) == self.num_vars
-        
         B = inputs.size(0)
-        inputs = inputs.permute(1, 0)
+
+        if input_layer_fn is None:
+            assert inputs.dim() == 2 and inputs.size(1) == self.num_vars
+
+            inputs = inputs.permute(1, 0)
         
         ## Initialize buffers for forward pass ##
 
@@ -247,16 +249,19 @@ class TensorCircuit(nn.Module):
         """
         Backward evaluation of the PC that computes node flows as well as parameter flows.
 
-        :param inputs:         None or [B, num_vars]
+        :param inputs: input tensor of size `[B, num_vars]`
+        :type inputs: torch.Tensor
 
-        :param ll_weights:     None or [B] or [num_roots, B]
+        :param ll_weights: weights of the log-likelihoods of size [B] or [num_roots, B]
+        :type ll_weights: torch.Tensor
         
         :param input_layer_fn: Custom forward function for input layers; if it is a string, then try to call the corresponding member function of the input layers
         :type input_layer_fn: Optional[Union[str,Callable]]
         """
 
         assert self.node_mars is not None and self.element_mars is not None, "Should run forward path first."
-        assert inputs.size(0) == self.num_vars
+        if input_layer_fn is None:
+            assert inputs.size(0) == self.num_vars
 
         B = self.node_mars.size(1)
 

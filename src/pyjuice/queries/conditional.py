@@ -62,125 +62,46 @@ def _soft_evi_categorical_fw_kernel(data_ptr, node_mars_ptr, params_ptr, vids_pt
         tl.store(node_mars_ptr + global_nid * batch_size + batch_offsets, tl.log(node_vals), mask = mask)
 
 
-@torch.compile(mode = "default", fullgraph = False)
-def _cat_forward_gpu(self, data: torch.Tensor, node_mars: torch.Tensor, params: torch.Tensor, 
-                    missing_mask: Optional[torch.Tensor] = None, local_ids: Optional[torch.Tensor] = None):
-
-    sid, eid = self._output_ind_range[0], self._output_ind_range[1]
-
-    if local_ids is None:
-        param_idxs = data[self.vids[:,0]] + self.s_pids.unsqueeze(1)
-        node_mars[sid:eid,:] = ((params[param_idxs]).clamp(min=1e-10)).log()
-    else:
-        param_idxs = data[self.vids[local_ids,0]] + self.s_pids[local_ids].unsqueeze(1)
-        node_mars[local_ids+sid,:] = ((params[param_idxs]).clamp(min=1e-10)).log()
-
-    if missing_mask is not None:
-        if missing_mask.dim() == 1:
-            mask = torch.where(missing_mask[self.vids])[0] + sid
-            node_mars[mask,:] = 0.0
-        elif missing_mask.dim() == 2:
-            maskx, masky = torch.where(missing_mask[self.vids[:,0]])
-            maskx = maskx + sid
-            node_mars[maskx,masky] = 0.0
-        else:
-            raise ValueError()
-
-    return None
-
-def _cat_forward(self, data: torch.Tensor, node_mars: torch.Tensor, params: torch.Tensor, 
-                 missing_mask: Optional[torch.Tensor] = None, local_ids: Optional[torch.Tensor] = None):
-    if self.device.type == "cuda":
-        _cat_forward_gpu(self, data, node_mars, params, missing_mask = missing_mask, local_ids = local_ids)
-        return None
-
-    sid, eid = self._output_ind_range[0], self._output_ind_range[1]
-
-    data = data.cpu()
-    device = node_mars.device
-
-    if local_ids is None:
-        param_idxs = data[self.vids] + self.s_pids.unsqueeze(1)
-        node_mars[sid:eid,:] = ((params[param_idxs]).clamp(min=1e-10)).log().to(device)
-    else:
-        param_idxs = data[self.vids[local_ids]] + self.s_pids[local_ids].unsqueeze(1)
-        node_mars[local_ids+sid,:] = ((params[param_idxs]).clamp(min=1e-10)).log().to(device)
-
-    if missing_mask is not None:
-        if missing_mask.dim() == 1:
-            mask = torch.where(missing_mask[self.vids])[0] + sid
-            node_mars[mask,:] = 0.0
-        elif missing_mask.dim() == 2:
-            maskx, masky = torch.where(missing_mask[self.vids])
-            maskx = maskx + sid
-            node_mars[maskx,masky] = 0.0
-        else:
-            raise ValueError()
-
-    return None
-
-
-
-def _categorical_forward(layer, node_mars: torch.Tensor,
-                         params: Optional[torch.Tensor] = None, 
+def _categorical_forward(layer, inputs: torch.Tensor, node_mars: torch.Tensor,
                          missing_mask: Optional[torch.Tensor] = None, **kwargs):
 
-    if params is None:
-        params = layer.params
-        params = params.clip(min = 1e-8)
+    batch_size, num_vars = inputs.size(0), inputs.size(1)
 
-    sid, eid = layer._output_ind_range[0], layer._output_ind_range[1]
-    if "tokens" in kwargs:
-        data = kwargs["tokens"]
-        assert data.dim() == 2 and data.dtype == torch.long
-        data = data.permute(1, 0)
+    if inputs.dim() == 2:
+        # Hard evidence
+        assert inputs.dtype == torch.long
 
-        if not layer.provided("fw_local_ids"):
-            _cat_forward(layer, data, node_mars, params, missing_mask)
-        else:
-            _cat_forward(layer, data, node_mars, params, missing_mask, local_ids = layer.fw_local_ids)
+        inputs = inputs.permute(1, 0).contiguous()
 
-    elif "soft_evidence" in kwargs:
+        layer.forward(data = inputs, node_mars = node_mars, missing_mask = missing_mask)
 
-        data = kwargs["soft_evidence"]
-        assert data.dim() == 3 and data.dtype == torch.float32 and data.min() >= 0.0 and data.max() <= 1.0
-        
+    elif inputs.dim() == 3:
+        # Soft evidence
+        assert inputs.dtype == torch.float32 and inputs.min() >= 0.0 and inputs.max() <= 1.0
+
         if missing_mask is not None:
-            data = data.flatten(0, 1)
-            data[missing_mask.permute(1, 0).flatten(),:] = 1.0
-            data = data.reshape(missing_mask.size(1), missing_mask.size(0), -1).permute(1, 2, 0)
-        else:
-            data = data.permute(1, 2, 0)
+            if missing_mask.dim() == 1:
+                inputs[:,missing_mask,:] = 1.0
+            else:
+                assert missing_mask.dim() == 2
+                inputs = inputs.flatten(0, 1)
+                inputs[missing_mask.flatten(),:] = 1.0
+                inputs = inputs.reshape(batch_size, num_vars, -1)
 
-        num_cats = data.size(1)
-        batch_size = data.size(2)
-        
-        if not layer.provided("fw_local_ids"):
-            num_nodes = eid - sid
+        inputs = inputs.permute(1, 2, 0) # [num_vars, num_cats, B]
+        num_cats = inputs.size(1)
 
-            node_nchs = layer.metadata[layer.s_mids]
+        sid, eid = layer._output_ind_range[0], layer._output_ind_range[1]
+        num_nodes = eid - sid
 
-            grid = lambda meta: (triton.cdiv(num_nodes * batch_size, meta['BLOCK_SIZE']),)
+        node_nchs = layer.metadata[layer.s_mids]
 
-            _soft_evi_categorical_fw_kernel[grid](
-                data.reshape(-1).contiguous(), node_mars, params, layer.vids.reshape(-1), layer.s_pids, node_nchs,
-                None, sid, num_nodes, num_cats, batch_size, partial = False, BLOCK_SIZE = 512
-            )
+        grid = lambda meta: (triton.cdiv(num_nodes * batch_size, meta['BLOCK_SIZE']),)
 
-        else:
-            local_ids = layer.fw_local_ids
-            num_nodes = local_ids.size(0)
-
-            vids = layer.vids[local_ids,0]
-            s_pids = layer.s_pids[local_ids]
-            node_nchs = layer.metadata[layer.s_mids[local_ids]]
-            
-            grid = lambda meta: (triton.cdiv(num_nodes * batch_size, meta['BLOCK_SIZE']),)
-
-            _soft_evi_categorical_fw_kernel[grid](
-                data.reshape(-1).contiguous(), node_mars, params, vids, s_pids, node_nchs,
-                local_ids, sid, num_nodes, num_cats, batch_size, partial = True, BLOCK_SIZE = 512
-            )
+        _soft_evi_categorical_fw_kernel[grid](
+            inputs.reshape(-1).contiguous(), node_mars, layer.params, layer.vids.reshape(-1), layer.s_pids, node_nchs,
+            None, sid, num_nodes, num_cats, batch_size, partial = False, BLOCK_SIZE = 512
+        )
 
         node_mars[sid:eid,:] = node_mars[sid:eid,:].clip(max = 0.0)
 
@@ -232,97 +153,97 @@ def _categorical_backward_kernel(cat_probs_ptr, node_flows_ptr, local_ids_ptr, r
         tl.atomic_add(cat_probs_ptr + p_offsets, eflow, mask = cmask)
 
 
-def _categorical_backward(layer, node_flows: torch.Tensor, node_mars: torch.Tensor,
-                          params: Optional[torch.Tensor] = None, 
-                          mode: str = "full_distribution", **kwargs):
+def _categorical_backward(layer, inputs: torch.Tensor, node_flows: torch.Tensor, node_mars: torch.Tensor,
+                          params: Optional[torch.Tensor] = None, **kwargs):
 
     if params is None:
         params = layer.params
 
     sid, eid = layer._output_ind_range[0], layer._output_ind_range[1]
-    if mode == "full_distribution":
 
-        num_nodes = eid - sid
-        num_vars = layer.vids.max().item() + 1
-        num_cats = int(layer.metadata[layer.s_mids].max().item())
-        batch_size = node_flows.size(1)
+    num_nodes = eid - sid
+    num_vars = layer.vids.max().item() + 1
+    num_cats = int(layer.metadata[layer.s_mids].max().item())
+    batch_size = node_flows.size(1)
 
-        if "target_vars" in kwargs and kwargs["target_vars"] is not None:
-            target_vars = kwargs["target_vars"]
+    if "target_vars" in kwargs and kwargs["target_vars"] is not None:
+        target_vars = kwargs["target_vars"]
 
-            rev_vars_mapping = torch.zeros([num_vars], dtype = torch.long)
-            for i, var in enumerate(target_vars):
-                rev_vars_mapping[var] = i
-            rev_vars_mapping = rev_vars_mapping.to(node_flows.device)
-        else:
-            target_vars = [var for var in range(num_vars)]
-
-            rev_vars_mapping = torch.arange(0, num_vars, device = node_flows.device)
-
-        num_target_vars = len(target_vars)
-
-        cat_probs = torch.zeros([num_target_vars * num_cats * batch_size], dtype = torch.float32, device = node_flows.device)
-
-        local_ids = layer.enable_partial_evaluation(bk_scopes = target_vars, return_ids = True).to(node_flows.device)
-        num_target_nodes = local_ids.size(0)
-
-        node_nchs = layer.metadata[layer.s_mids]
-
-        grid = lambda meta: (triton.cdiv(num_target_nodes * batch_size, meta['BLOCK_SIZE']),)
-        _categorical_backward_kernel[grid](
-            cat_probs, node_flows, local_ids, rev_vars_mapping, layer.vids, layer.s_pids, node_nchs, layer.params,
-            sid, eid, num_target_nodes, batch_size, num_cats, BLOCK_SIZE = 512
-        )
-
-        cat_probs = cat_probs.reshape(num_target_vars, num_cats, batch_size)
-
-        cat_probs /= cat_probs.sum(dim = 1, keepdim = True)
-        cat_probs = cat_probs.permute(2, 0, 1)
-
+        rev_vars_mapping = torch.zeros([num_vars], dtype = torch.long)
+        for i, var in enumerate(target_vars):
+            rev_vars_mapping[var] = i
+        rev_vars_mapping = rev_vars_mapping.to(node_flows.device)
     else:
-        raise ValueError(f"Unknown mode {mode}.")
+        target_vars = [var for var in range(num_vars)]
+
+        rev_vars_mapping = torch.arange(0, num_vars, device = node_flows.device)
+
+    num_target_vars = len(target_vars)
+
+    cat_probs = torch.zeros([num_target_vars * num_cats * batch_size], dtype = torch.float32, device = node_flows.device)
+
+    local_ids = layer.enable_partial_evaluation(bk_scopes = target_vars, return_ids = True).to(node_flows.device)
+    num_target_nodes = local_ids.size(0)
+
+    node_nchs = layer.metadata[layer.s_mids]
+
+    grid = lambda meta: (triton.cdiv(num_target_nodes * batch_size, meta['BLOCK_SIZE']),)
+    _categorical_backward_kernel[grid](
+        cat_probs, node_flows, local_ids, rev_vars_mapping, layer.vids, layer.s_pids, node_nchs, layer.params,
+        sid, eid, num_target_nodes, batch_size, num_cats, BLOCK_SIZE = 512
+    )
+
+    cat_probs = cat_probs.reshape(num_target_vars, num_cats, batch_size)
+
+    cat_probs /= cat_probs.sum(dim = 1, keepdim = True)
+    cat_probs = cat_probs.permute(2, 0, 1)
 
     return cat_probs
 
 
-## General API ##
-
-
-def _conditional_fw_input_fn(layer, inputs, node_mars, params, **kwargs):
+def _conditional_fw_input_fn(layer, inputs, node_mars, **kwargs):
     if layer.dist_signature == "Categorical":
-        _categorical_forward(layer, node_mars, params, **kwargs)
+        _categorical_forward(layer, inputs, node_mars, **kwargs)
 
     else:
-        raise TypeError(f"Unknown/unsupported layer type {type(layer)}.")
+        raise TypeError(f"Unknown/unsupported layer type {type(layer)} for the forward pass. Please implement and provide your own `fw_input_fn`.")
 
 
-def _conditional_bk_input_fn(layer, inputs, node_flows, node_mars, params = None, outputs = None, **kwargs):
+def _conditional_bk_input_fn(layer, inputs, node_flows, node_mars, outputs = None, **kwargs):
     if layer.dist_signature == "Categorical":
         outputs.append(
-            _categorical_backward(layer, node_flows, node_mars, params, **kwargs)
+            _categorical_backward(layer, inputs, node_flows, node_mars, layer.params, **kwargs)
         )
 
     else:
-        raise TypeError(f"Unknown/unsupported layer type {type(layer)}.")
+        raise TypeError(f"Unknown/unsupported layer type {type(layer)} for the backward pass. Please implement and provide your own `bk_input_fn`.")
 
 
-def conditional(pc: TensorCircuit, target_vars: Optional[Sequence[int]] = None,
-                missing_mask: Optional[torch.Tensor] = None,
+## Main API ##
+
+
+def conditional(pc: TensorCircuit, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None,
+                target_vars: Optional[Sequence[int]] = None,
                 fw_input_fn: Optional[Union[str,Callable]] = None, 
-                bk_input_fn: Optional[Union[str,Callable]] = None, 
-                fw_delta_vars: Optional[Sequence[int]] = None,
-                fw_scopes: Optional[Sequence[BitSet]] = None,
-                bk_scopes: Optional[Sequence[BitSet]] = None,
-                overwrite_partial_eval: bool = True,
-                cache: Optional[dict] = None, **kwargs):
+                bk_input_fn: Optional[Union[str,Callable]] = None, **kwargs):
+    """
+    Compute the conditional probability given hard or soft evidence, i.e., P(o|e).
 
-    if missing_mask is not None:
-        missing_mask = missing_mask.permute(1, 0)
-        B = missing_mask.size(1)
-    elif "soft_evidence" in kwargs:
-        B = kwargs["soft_evidence"].size(0)
-    else:
-        raise ValueError("Either `missing_mask` or `soft_evidence` should be provided.")
+    :param pc: the input PC
+    :type pc: TensorCircuit
+
+    :param data: data of size [B, num_vars] (hard evidence) or a custom shape paired with `fw_input_fn`
+    :type data: torch.Tensor
+
+    :param missing_mask: a boolean mask indicating marginalized variables; the size can be [num_vars] or [B, num_vars]
+    :type missing_mask: torch.Tensor
+
+    :param fw_input_fn: an optional custom function for the forward pass of input layers
+    :type fw_input_fn: Optional[Union[str,Callable]]
+
+    :param bk_input_fn: an optional custom function for the backward pass of input layers
+    :type bk_input_fn: Optional[Union[str,Callable]]
+    """
 
     outputs = []
 
@@ -330,42 +251,9 @@ def conditional(pc: TensorCircuit, target_vars: Optional[Sequence[int]] = None,
 
     kwargs["target_vars"] = target_vars
 
-    if cache is None:
-        query(pc, inputs = torch.zeros([B, 1]), run_backward = True, 
-            fw_input_fn = _conditional_fw_input_fn if fw_input_fn is None else fw_input_fn, 
-            bk_input_fn = _wrapped_bk_input_fn if bk_input_fn is None else bk_input_fn, 
-            missing_mask = missing_mask, **kwargs)
+    query(pc, inputs = data, run_backward = True, 
+          fw_input_fn = _conditional_fw_input_fn if fw_input_fn is None else fw_input_fn, 
+          bk_input_fn = _wrapped_bk_input_fn if bk_input_fn is None else bk_input_fn, 
+          missing_mask = missing_mask, **kwargs)
 
-        return outputs[0]
-
-    else:
-        if fw_delta_vars is not None and fw_scopes is None:
-            fw_scopes = get_subsumed_scopes(pc, fw_delta_vars, type = "any")
-        
-        if fw_scopes is not None and overwrite_partial_eval:
-            pc.enable_partial_evaluation(scopes = fw_scopes, forward = True)
-
-        if target_vars is not None and bk_scopes is None:
-            bk_scopes = get_subsumed_scopes(pc, target_vars, type = "any")
-        
-        if bk_scopes is not None and overwrite_partial_eval:
-            pc.enable_partial_evaluation(scopes = bk_scopes, backward = True)
-
-        kwargs["missing_mask"] = missing_mask
-
-        # Forward
-        lls, cache = pc.forward(
-            inputs = torch.zeros([B, 1]), 
-            input_layer_fn = _conditional_fw_input_fn if fw_input_fn is None else fw_input_fn, 
-            cache = cache, return_cache = True, **kwargs
-        )
-
-        # Backward
-        cache = pc.backward(
-            input_layer_fn = _wrapped_bk_input_fn if bk_input_fn is None else bk_input_fn, 
-            compute_param_flows = False, cache = cache, return_cache = True, **kwargs
-        )
-
-        # pc.disable_partial_evaluation(forward = True, backward = True)
-
-        return outputs[0], cache
+    return outputs[0]

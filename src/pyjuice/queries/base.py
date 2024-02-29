@@ -23,6 +23,6 @@ def query(pc: TensorCircuit, inputs: torch.Tensor,
 
     # (Optionally) run backward pass
     assert bk_input_fn is not None
-    pc.backward(input_layer_fn = bk_input_fn, compute_param_flows = False, **kwargs)
+    pc.backward(inputs, input_layer_fn = bk_input_fn, compute_param_flows = False, **kwargs)
 
     return None
