@@ -57,13 +57,13 @@ lls = juice.queries.marginal(
 )
 
 # %%
-# For PCs defined on categorical variables, we can alternatively query for marginal probabilities given *soft* evidence, e.g., :math:`P(X_1 = 0 \text{~w.p.~} 0.3 \text{~and~} 1 \text{~w.p.~} 0.7)`.
+# For PCs defined on categorical variables, we can alternatively query for marginal probabilities given *soft* evidence, e.g., :math:`P(X_1 = 0 \text{w.p.} 0.3 \text{and} 1 \text{w.p.} 0.7)`.
 # This can be done by defining `date` as a 3D tensor of size [batch_size, num_vars, num_cats]:
 
 data = torch.tensor([[[0.4, 0.6, 0, 0], [0, 0, 0, 0]], [[0.3, 0.7, 0, 0], [0, 0, 0, 0]]]).to(device)
 
 # %%
-# Since :math:`X_1` has two categories and $X_2$ has four categories, the size of the last dimension of `data` should be 4.
+# Since :math:`X_1` has two categories and :math:`X_2` has four categories, the size of the last dimension of `data` should be 4.
 #
 # The soft marginal probabilities can be similarly computed by:
 
@@ -77,10 +77,10 @@ lls = juice.queries.marginal(
 
 # %%
 # Since every conditional probability can be represented as the quotient of two marginal probabilities, one may wonder why do we need a separate function for computing conditional probabilities.
-# In fact, with `pyjuice.queries.conditional`, we can simultaneously compute a *set of* conditional probabilities. Specifically, given evidence $\mathbf{E} = \mathbf{e}$, we can compute $\forall X \not\in \mathbf{E}, x \in \mathrm{val}(X), P(X = x | \mathbf{e})$.
+# In fact, with `pyjuice.queries.conditional`, we can simultaneously compute a *set of* conditional probabilities. Specifically, given evidence :math:`\mathbf{E} = \mathbf{e}`, we can compute :math:`\forall X \not\in \mathbf{E}, x \in \mathrm{val}(X), P(X = x | \mathbf{e})`.
 
 # %%
-# Say we want to compute the conditional probability of $X_2$ given evidence $X_1 = 0$ and $X_1 = 1$, respectively. We prepare the data and the mask similarly.
+# Say we want to compute the conditional probability of :math:`X_2` given evidence :math:`X_1 = 0` and :math:`X_1 = 1`, respectively. We prepare the data and the mask similarly.
 
 data = torch.tensor([[0, 0], [1, 0]]).to(device)
 missing_mask = torch.tensor([[False, True], [False, True]]).to(device) # True for variables to be conditioned on/are missing
@@ -95,7 +95,7 @@ outputs = juice.queries.conditional(
 # %%
 # The parameter `target_vars` is used to indicate the subset of variables which we want to compute their conditional probabilities. Probabilities of all variables will be returned if we do not specify `target_vars`.
 # 
-# The shape of `outputs` is [B, num_target_vars, num_categories]. For example, `outputs[1,0,3]` is the conditional probability $P(X_2 = 3 | X_1 = 1)$.
+# The shape of `outputs` is [B, num_target_vars, num_categories]. For example, `outputs[1,0,3]` is the conditional probability :math:`P(X_2 = 3 | X_1 = 1)`.
 
 # %%
 # Similar to the marginal query, for categorical data, we can also feed *soft* evidence:
