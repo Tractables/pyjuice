@@ -261,7 +261,9 @@ class TensorCircuit(nn.Module):
 
         assert self.node_mars is not None and self.element_mars is not None, "Should run forward path first."
         if input_layer_fn is None:
-            assert inputs.size(0) == self.num_vars
+            if inputs.size(0) != self.num_vars:
+                assert inputs.dim() == 2 and inputs.size(1) == self.num_vars
+                inputs = inputs.permute(1, 0)
 
         B = self.node_mars.size(1)
 
