@@ -5,6 +5,8 @@ PC Structural Transformation Functions
 In this tutorial, you will learn how to use the built-in structural transformation algorithms to easily create and manipulate PCs.
 """
 
+# sphinx_gallery_thumbnail_path = 'imgs/juice.png'
+
 import torch
 import pyjuice as juice
 import pyjuice.nodes.distributions as dists
