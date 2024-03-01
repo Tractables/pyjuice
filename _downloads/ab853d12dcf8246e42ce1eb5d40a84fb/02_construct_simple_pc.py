@@ -48,9 +48,9 @@ ms = juice.multiply(ni0, ni1, edge_ids = edge_ids)
 # %%
 # :code:`ms` defines a product node vector where every node have two children: the first child is a node in :code:`ni0` and the second child is a node in :code:`ni1`.
 # :code:`edge_ids` specifies which child nodes do every node in :code:`ms` connects to. Specifically, :code:`edge_ids` has size :code:`[# product node blocks, # child node vectors]`, so in this case, it should has size :code:`[4, 2]`.
-# The semantic of :code:`edge_ids[i,j]` is 
-# the :math:`i`th product node block connects to the :code:`edge_ids[i,j]`th node block in the :math:`j`th child node vector (assume we always count from 0).
-# For example, :code:`edge_ids[1,0] = 1` means that the 1th product node block connects to the 1th node block in :code:`ni0`.
+# The semantic of :code:`edge_ids[i,j]` is:
+# the :math:`i`th product node block connects to the `edge_ids[i,j]`th node block in the jth child node vector (assume we always count from 0).
+# For example, `edge_ids[1,0] = 1` means that the 1th product node block connects to the 1th node block in :code:`ni0`.
 # 
 # We require the node vectors fed to :code:`pyjuice.multiply` have the same :code:`block_size`. And the block size of the output product node vector is also the same with that of the inputs.
 # We do not need to specify the number of node blocks (e.g., using :code:`num_node_blocks`) since it is equal to :code:`edge_ids.size(0)`.
