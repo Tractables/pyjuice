@@ -87,12 +87,14 @@ Let us define another input node vector and a product node vector that take the 
     ms = juice.multiply(ni0, ni1, edge_ids = edge_ids)
 
 
-.. GENERATED FROM PYTHON SOURCE LINES 49-60
+.. GENERATED FROM PYTHON SOURCE LINES 49-62
 
 :code:`ms` defines a product node vector where every node have two children: the first child is a node in :code:`ni0` and the second child is a node in :code:`ni1`.
 :code:`edge_ids` specifies which child nodes do every node in :code:`ms` connects to. Specifically, :code:`edge_ids` has size :code:`[# product node blocks, # child node vectors]`, so in this case, it should has size :code:`[4, 2]`.
 The semantic of :code:`edge_ids[i,j]` is:
-the :math:`i`th product node block connects to the `edge_ids[i,j]`th node block in the jth child node vector (assume we always count from 0).
+the :math:`i`th 
+product node block connects to the :math:`edge_ids[i,j]`th 
+node block in the jth child node vector (assume we always count from 0).
 For example, `edge_ids[1,0] = 1` means that the 1th product node block connects to the 1th node block in :code:`ni0`.
 
 We require the node vectors fed to :code:`pyjuice.multiply` have the same :code:`block_size`. And the block size of the output product node vector is also the same with that of the inputs.
@@ -101,7 +103,7 @@ For :code:`pyjuice.multiply`, if two node blocks are connected (as defined by :c
 
 When we do not provide the :code:`edge_ids`, PyJuice assumes it to be the following (we can only use this shortcut when the child node vectors have the same :code:`num_node_blocks` and :code:`block_size`):
 
-.. GENERATED FROM PYTHON SOURCE LINES 60-65
+.. GENERATED FROM PYTHON SOURCE LINES 62-67
 
 .. code-block:: Python
 
@@ -111,16 +113,16 @@ When we do not provide the :code:`edge_ids`, PyJuice assumes it to be the follow
     edge_ids = torch.arange(0, num_node_blocks)[:,None].repeat(1, num_child_node_vectors)
 
 
-.. GENERATED FROM PYTHON SOURCE LINES 66-68
+.. GENERATED FROM PYTHON SOURCE LINES 68-70
 
 Sum nodes
 ---------
 
-.. GENERATED FROM PYTHON SOURCE LINES 70-71
+.. GENERATED FROM PYTHON SOURCE LINES 72-73
 
 Finally, we introduce :code:`pyjuice.summate`, which is used to define sum node vectors.
 
-.. GENERATED FROM PYTHON SOURCE LINES 71-75
+.. GENERATED FROM PYTHON SOURCE LINES 73-77
 
 .. code-block:: Python
 
@@ -129,7 +131,7 @@ Finally, we introduce :code:`pyjuice.summate`, which is used to define sum node 
     ns = juice.summate(ms, num_node_blocks = 6, block_size = 2, edge_ids = edge_ids)
 
 
-.. GENERATED FROM PYTHON SOURCE LINES 76-87
+.. GENERATED FROM PYTHON SOURCE LINES 78-89
 
 Similar to :code:`pyjuice.multiply`, the positional arguments to :code:`pyjuice.summate` are the list of input node vectors (here we only provide :code:`ms`).
 :code:`num_node_blocks` and :code:`block_size` are the number of node blocks and the size of each node block, respectively.
@@ -143,7 +145,7 @@ That is, in the case where both :code:`ns` and :code:`ms` have block size 2, eve
 
 If :code:`edge_ids` is not provided, we assume that all nodes in the sum node vector are connected to all child nodes:
 
-.. GENERATED FROM PYTHON SOURCE LINES 87-88
+.. GENERATED FROM PYTHON SOURCE LINES 89-90
 
 .. code-block:: Python
 
