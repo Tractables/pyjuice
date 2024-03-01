@@ -12,7 +12,7 @@ from .nodes import CircuitNodes
 
 class InputNodes(CircuitNodes):
     """
-    A class representing vectors of input nodes. It is created by `pyjuice.inputs`.
+    A class representing vectors of input nodes. It is created by :code:`pyjuice.inputs`.
 
     :param num_node_blocks: number of node blocks
     :type num_node_blocks: int
@@ -66,7 +66,7 @@ class InputNodes(CircuitNodes):
         :param tie_params: whether to tie the parameters of the current node and the duplicated node
         :type tie_params: bool
 
-        :returns: a duplicated `InputNodes`
+        :returns: a duplicated :code:`InputNodes`
         """
         if scope is None:
             scope = self.scope

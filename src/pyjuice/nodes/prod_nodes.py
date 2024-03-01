@@ -14,7 +14,7 @@ Tensor = Union[np.ndarray,torch.Tensor]
 
 class ProdNodes(CircuitNodes):
     """
-    A class representing vectors of product nodes. It is created by `pyjuice.multiply`.
+    A class representing vectors of product nodes. It is created by :code:`pyjuice.multiply`.
 
     :param num_node_blocks: number of node blocks
     :type num_node_blocks: int
@@ -56,7 +56,7 @@ class ProdNodes(CircuitNodes):
     @property
     def edge_type(self):
         """
-        Type of the product edge. Either `BLOCK_SPARSE` or `SPARSE`.
+        Type of the product edge. Either :code:`BLOCK_SPARSE` or :code:`SPARSE`.
         """
         if self.edge_ids.size(0) == self.num_node_blocks:
             return self.BLOCK_SPARSE
@@ -67,13 +67,13 @@ class ProdNodes(CircuitNodes):
 
     def is_block_sparse(self):
         """
-        Whether the edge type is `BLOCK_SPARSE`.
+        Whether the edge type is :code:`BLOCK_SPARSE`.
         """
         return self.edge_type == self.BLOCK_SPARSE
 
     def is_sparse(self):
         """
-        Whether the edge type is `SPARSE`.
+        Whether the edge type is :code:`SPARSE`.
         """
         return self.edge_type == self.SPARSE
 
@@ -89,7 +89,7 @@ class ProdNodes(CircuitNodes):
         :param tie_params: whether to tie the parameters of the current node and the duplicated node
         :type tie_params: bool
 
-        :returns: a duplicated `ProdNodes`
+        :returns: a duplicated :code:`ProdNodes`
         """
         chs = []
         for ns in args:

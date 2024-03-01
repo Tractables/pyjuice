@@ -4,10 +4,9 @@ Train a PC
 
 This tutorial demonstrates how to create a Hidden Chow-Liu Tree (https://arxiv.org/pdf/2106.02264.pdf) using `pyjuice.structures` and train the model with mini-batch EM and full-batch EM.
 
-For simplicity, we use the MNIST dataset as an example.
+For simplicity, we use the MNIST dataset as an example. 
+Note that the goal of this tutorial is just to quickly demonstrate the basic training pipeline using PyJuice without covering additional details about details such as ways to construct a PC, which will be covered in the following tutorials.
 """
-
-# sphinx_gallery_thumbnail_path = 'imgs/juice.png'
 
 # %%
 # Load the MNIST Dataset
