@@ -2,7 +2,7 @@
 Construct an HMM
 ================
 
-This tutorial demonstrates how to construct an HMM with PyJuice primitives `inputs`, `multiply`, and `summate`.
+This tutorial demonstrates how to construct an HMM with :code:`pyjuice.inputs`, :code:`pyjuice.multiply`, and :code:`pyjuice.summate`.
 """
 
 # sphinx_gallery_thumbnail_path = 'imgs/juice.png'
@@ -58,3 +58,10 @@ with juice.set_block_size(block_size):
     # The Initial probabilities p(Z_{0})
     ns = juice.summate(curr_zs, num_node_blocks = 1, block_size = 1)
 
+# %%
+# Note that :code:`ns.duplication` is a handy function to create duplications of existing node vectors. 
+# For input nodes (e.g., :code:`ns_input.duplicate(var, tie_params = True)`) we can specify it to define on a new variable. 
+# The argument :code:`tie_params = True` means we want to use the same set of parameters in the original and the duplicated node vector.
+# The parameters will remain tied after parameter learning, structural transformation, etc.
+#
+# For sum node vectors, :code:`ns.duplicate` allows us to specify a new list of children. However, the child nodes must have the same size (same number of node blocks and block size).

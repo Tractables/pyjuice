@@ -48,7 +48,7 @@ ms = juice.multiply(ni0, ni1, edge_ids = edge_ids)
 # %%
 # :code:`ms` defines a product node vector where every node have two children: the first child is a node in :code:`ni0` and the second child is a node in :code:`ni1`.
 # :code:`edge_ids` specifies which child nodes do every node in :code:`ms` connects to. Specifically, :code:`edge_ids` has size :code:`[# product node blocks, # child node vectors]`, so in this case, it should has size :code:`[4, 2]`.
-# The semantic of :code:`edge_ids[i,j]` is the :math:`i`th product node block connects to the :code:`edge_ids[i,j]`th node block in the :math:`j`th child node vector (assume we always count from 0).
+# The semantic of :code:`edge_ids[i,j]` is: the :math:`i`th product node block connects to the :code:`edge_ids[i,j]`th node block in the :math:`j`th child node vector (assume we always count from 0).
 # For example, :code:`edge_ids[1,0] = 1` means that the 1th product node block connects to the 1th node block in :code:`ni0`.
 # 
 # We require the node vectors fed to :code:`pyjuice.multiply` have the same :code:`block_size`. And the block size of the output product node vector is also the same with that of the inputs.
@@ -78,7 +78,7 @@ ns = juice.summate(ms, num_node_blocks = 6, block_size = 2, edge_ids = edge_ids)
 # If there are multiple child node vectors, :code:`pyjuice.summate` assumes they have the same block size. However, the sum node vector can have a different block size compared to its children.
 # 
 # The connection pattern is specified by the keyword argument :code:`edge_ids`, which have shape :code:`[2, # edge blocks]`. 
-# Every size-2 column vector :math:`[m, n]^T` in :code:`edge_ids` indicates the existance of fully-connected edges between the the :math:`m`th sum node block and the :math:`n`th product node block.
+# Every size-2 column vector :math:`[m, n]^T` in :code:`edge_ids` indicates the existance of fully-connected edges between the :math:`m`th sum node block and the :math:`n`th product node block.
 # That is, in the case where both :code:`ns` and :code:`ms` have block size 2, every column in :code:`edge_ids` specifies :math:`2 \times 2 = 4` edges.
 # 
 # If :code:`edge_ids` is not provided, we assume that all nodes in the sum node vector are connected to all child nodes:
