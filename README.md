@@ -1,6 +1,6 @@
-<img align="right" width="160px" src="https://avatars.githubusercontent.com/u/58918144?s=200&v=4">
-
 # PyJuice
+
+<img align="right" width="160px" src="https://avatars.githubusercontent.com/u/58918144?s=200&v=4">
 
 [![CUDA CI Tests](https://github.com/Juice-jl/pyjuice/actions/workflows/ci_tests.yml/badge.svg?branch=main)](https://github.com/Juice-jl/pyjuice/actions/workflows/ci_tests.yml)
 [![codecov](https://codecov.io/gh/Juice-jl/pyjuice/branch/main/graph/badge.svg?token=XpgPLYa2RQ)](https://codecov.io/gh/Juice-jl/pyjuice)
