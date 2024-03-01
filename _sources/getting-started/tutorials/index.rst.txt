@@ -52,7 +52,7 @@ Feel free to explore the examples and learn how to use PyJuice for your projects
 
 .. raw:: html
 
-    <div class="sphx-glr-thumbcontainer" tooltip="This tutorial demonstrates how to construct an HMM with PyJuice primitives inputs, multiply, an...">
+    <div class="sphx-glr-thumbcontainer" tooltip="This tutorial demonstrates how to construct an HMM with pyjuice.inputs, pyjuice.multiply, and p...">
 
 .. only:: html
 

@@ -103,7 +103,7 @@ to download the full example code</p>
 </div>
 <section class="sphx-glr-example-title" id="construct-an-hmm">
 <span id="sphx-glr-getting-started-tutorials-03-construct-hmm-py"></span><h1>Construct an HMM<a class="headerlink" href="#construct-an-hmm" title="Link to this heading"></a></h1>
-<p>This tutorial demonstrates how to construct an HMM with PyJuice primitives <cite>inputs</cite>, <cite>multiply</cite>, and <cite>summate</cite>.</p>
+<p>This tutorial demonstrates how to construct an HMM with <code class="code docutils literal notranslate"><span class="pre">pyjuice.inputs</span></code>, <code class="code docutils literal notranslate"><span class="pre">pyjuice.multiply</span></code>, and <code class="code docutils literal notranslate"><span class="pre">pyjuice.summate</span></code>.</p>
 <div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="c1"># sphinx_gallery_thumbnail_path = &#39;imgs/juice.png&#39;</span>
 
 <span class="kn">import</span> <span class="nn">torch</span>
@@ -154,6 +154,11 @@ In the following we assume <cite>T = seq_length</cite> and <cite>K = num_latents
     <span class="n">ns</span> <span class="o">=</span> <span class="n">juice</span><span class="o">.</span><span class="n">summate</span><span class="p">(</span><span class="n">curr_zs</span><span class="p">,</span> <span class="n">num_node_blocks</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span> <span class="n">block_size</span> <span class="o">=</span> <span class="mi">1</span><span class="p">)</span>
 </pre></div>
 </div>
+<p>Note that <code class="code docutils literal notranslate"><span class="pre">ns.duplication</span></code> is a handy function to create duplications of existing node vectors.
+For input nodes (e.g., <code class="code docutils literal notranslate"><span class="pre">ns_input.duplicate(var,</span> <span class="pre">tie_params</span> <span class="pre">=</span> <span class="pre">True)</span></code>) we can specify it to define on a new variable.
+The argument <code class="code docutils literal notranslate"><span class="pre">tie_params</span> <span class="pre">=</span> <span class="pre">True</span></code> means we want to use the same set of parameters in the original and the duplicated node vector.
+The parameters will remain tied after parameter learning, structural transformation, etc.</p>
+<p>For sum node vectors, <code class="code docutils literal notranslate"><span class="pre">ns.duplicate</span></code> allows us to specify a new list of children. However, the child nodes must have the same size (same number of node blocks and block size).</p>
 <div class="sphx-glr-footer sphx-glr-footer-example docutils container" id="sphx-glr-download-getting-started-tutorials-03-construct-hmm-py">
 <div class="sphx-glr-download sphx-glr-download-jupyter docutils container">
 <p><a class="reference download internal" download="" href="../../_downloads/a6f4e70e566387d03c9a1773c5f52cdb/03_construct_hmm.ipynb"><code class="xref download docutils literal notranslate"><span class="pre">Download</span> <span class="pre">Jupyter</span> <span class="pre">notebook:</span> <span class="pre">03_construct_hmm.ipynb</span></code></a></p>
