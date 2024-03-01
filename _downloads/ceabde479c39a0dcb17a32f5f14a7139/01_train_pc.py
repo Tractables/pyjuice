@@ -2,11 +2,13 @@
 Train a PC
 ==========
 
-This tutorial demonstrates how to create a Hidden Chow-Liu Tree (https://arxiv.org/pdf/2106.02264.pdf) using `pyjuice.structures` and train the model with mini-batch EM and full-batch EM.
-
+This tutorial demonstrates how to create a Hidden Chow-Liu Tree (https://arxiv.org/pdf/2106.02264.pdf) using :code:`pyjuice.structures` and train the model with mini-batch EM and full-batch EM.
 For simplicity, we use the MNIST dataset as an example. 
-Note that the goal of this tutorial is just to quickly demonstrate the basic training pipeline using PyJuice without covering additional details about details such as ways to construct a PC, which will be covered in the following tutorials.
+
+Note that the goal of this tutorial is just to quickly demonstrate the basic training pipeline using PyJuice without covering additional details such as ways to construct a PC, which will be covered in the following tutorials.
 """
+
+# sphinx_gallery_thumbnail_path = 'imgs/juice.png'
 
 # %%
 # Load the MNIST Dataset
@@ -54,12 +56,18 @@ ns = juice.structures.HCLT(
 )
 
 # %%
-# We proceed to compile the PC with `pyjuice.compile`.
+# :code:`ns` is a Directed Acyclic Graph (DAG) representation of the PC. 
+# Specifically, we use :code:`pyjuice.nodes.InputNodes`, :code:`pyjuice.nodes.ProdNodes`, and :code:`pyjuice.nodes.SumNodes` to define vectors of input nodes, product nodes, and sum nodes, respectively.
+# By also storing the topological structure of the node vectors (with pointers to the child node vectors), we create the PC as a DAG-based structure. :code:`ns` is also just a node vector defining the root node of the PC.
+# 
+# While being user-friendly, the DAG-based representation is not amenable to efficient computation. 
+# Therefore, before doing any computation, we need to compile the PC with :code:`pyjuice.compile`, which creates a compact and equivalent representation of the PC.
 
 pc = juice.compile(ns)
 
 # %%
-# The `pc` is an instance of `torch.nn.Module`. So we can move it to the GPU as if it is a neural network.
+# The :code:`pc` is an instance of :code:`torch.nn.Module`. So we can safely assume it is just a neural network with the variable assignments :math:`\mathbf{x}` as input and its log-likelihood :math:`\log p(\mathbf{x})` as output. 
+# We proceed to move it to the GPU specified by :code:`device`.
 
 pc.to(device)
 

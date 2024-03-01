@@ -23,27 +23,29 @@ PC Structural Transformation Functions
 
 In this tutorial, you will learn how to use the built-in structural transformation algorithms to easily create and manipulate PCs.
 
-.. GENERATED FROM PYTHON SOURCE LINES 7-12
+.. GENERATED FROM PYTHON SOURCE LINES 7-14
 
 .. code-block:: Python
 
+
+    # sphinx_gallery_thumbnail_path = 'imgs/juice.png'
 
     import torch
     import pyjuice as juice
     import pyjuice.nodes.distributions as dists
 
 
-.. GENERATED FROM PYTHON SOURCE LINES 13-15
+.. GENERATED FROM PYTHON SOURCE LINES 15-17
 
 Clone a PC
 ----------
 
-.. GENERATED FROM PYTHON SOURCE LINES 17-19
+.. GENERATED FROM PYTHON SOURCE LINES 19-21
 
 :code:`pyjuice.deepcopy` allows us to clone a PC, with some options to manipulate the copy. 
 Let's start by defining a PC.
 
-.. GENERATED FROM PYTHON SOURCE LINES 19-33
+.. GENERATED FROM PYTHON SOURCE LINES 21-35
 
 .. code-block:: Python
 
@@ -62,11 +64,11 @@ Let's start by defining a PC.
     ns.init_parameters()
 
 
-.. GENERATED FROM PYTHON SOURCE LINES 34-35
+.. GENERATED FROM PYTHON SOURCE LINES 36-37
 
 To create an independent copy of :code:`ns`, we can run:
 
-.. GENERATED FROM PYTHON SOURCE LINES 35-38
+.. GENERATED FROM PYTHON SOURCE LINES 37-40
 
 .. code-block:: Python
 
@@ -74,11 +76,11 @@ To create an independent copy of :code:`ns`, we can run:
     new_ns1 = juice.deepcopy(ns)
 
 
-.. GENERATED FROM PYTHON SOURCE LINES 39-40
+.. GENERATED FROM PYTHON SOURCE LINES 41-42
 
 By setting :code:`tie_params` to :code:`True`, we can tie the parameters of the original PC with that of the copied PC. Note that tied parameters will remain the same during all transformation/learning procedures implemented in PyJuice.
 
-.. GENERATED FROM PYTHON SOURCE LINES 40-43
+.. GENERATED FROM PYTHON SOURCE LINES 42-45
 
 .. code-block:: Python
 
@@ -86,11 +88,11 @@ By setting :code:`tie_params` to :code:`True`, we can tie the parameters of the 
     new_ns2 = juice.deepcopy(ns, tie_params = True)
 
 
-.. GENERATED FROM PYTHON SOURCE LINES 44-45
+.. GENERATED FROM PYTHON SOURCE LINES 46-47
 
 By providing a :code:`var_mapping`, we can define the copied PC on another set of variables.
 
-.. GENERATED FROM PYTHON SOURCE LINES 45-49
+.. GENERATED FROM PYTHON SOURCE LINES 47-51
 
 .. code-block:: Python
 
@@ -99,11 +101,11 @@ By providing a :code:`var_mapping`, we can define the copied PC on another set o
     new_ns3 = juice.deepcopy(ns, var_mapping = var_mapping)
 
 
-.. GENERATED FROM PYTHON SOURCE LINES 50-51
+.. GENERATED FROM PYTHON SOURCE LINES 52-53
 
 Note that :code:`tie_params` and :code:`var_mapping` can be used simultaneously:
 
-.. GENERATED FROM PYTHON SOURCE LINES 51-54
+.. GENERATED FROM PYTHON SOURCE LINES 53-56
 
 .. code-block:: Python
 
@@ -111,17 +113,17 @@ Note that :code:`tie_params` and :code:`var_mapping` can be used simultaneously:
     new_ns3 = juice.deepcopy(ns, tie_params = True, var_mapping = var_mapping)
 
 
-.. GENERATED FROM PYTHON SOURCE LINES 55-57
+.. GENERATED FROM PYTHON SOURCE LINES 57-59
 
 Merge PCs
 ---------
 
-.. GENERATED FROM PYTHON SOURCE LINES 59-61
+.. GENERATED FROM PYTHON SOURCE LINES 61-63
 
 :code:`juice.merge` can be used to collapse vectors of nodes defined on the same variable scope into a single vector of nodes.
 Take the following PC as an example:
 
-.. GENERATED FROM PYTHON SOURCE LINES 61-74
+.. GENERATED FROM PYTHON SOURCE LINES 63-76
 
 .. code-block:: Python
 
@@ -139,12 +141,12 @@ Take the following PC as an example:
         ns = juice.summate(ms00, ms01, num_node_blocks = 1, block_size = 1)
 
 
-.. GENERATED FROM PYTHON SOURCE LINES 75-77
+.. GENERATED FROM PYTHON SOURCE LINES 77-79
 
 In the above PC (i.e., :code:`ns`), :code:`i00` and :code:`i01` (also :code:`i10` and :code:`i11`) can be merged into a single object since they define on the same variable and has the same distribution.
 :code:`juice.merge` outputs an equivalent PC with the objects properly merged:
 
-.. GENERATED FROM PYTHON SOURCE LINES 77-80
+.. GENERATED FROM PYTHON SOURCE LINES 79-82
 
 .. code-block:: Python
 
@@ -152,11 +154,11 @@ In the above PC (i.e., :code:`ns`), :code:`i00` and :code:`i01` (also :code:`i10
     new_ns1 = juice.merge(ns)
 
 
-.. GENERATED FROM PYTHON SOURCE LINES 81-82
+.. GENERATED FROM PYTHON SOURCE LINES 83-84
 
 Another usage of the merge function is to "concatenate" nodes defined by multiple PyJuice objects, if they are defined on the same set of variables.
 
-.. GENERATED FROM PYTHON SOURCE LINES 82-88
+.. GENERATED FROM PYTHON SOURCE LINES 84-90
 
 .. code-block:: Python
 
@@ -167,21 +169,21 @@ Another usage of the merge function is to "concatenate" nodes defined by multipl
     new_ns2 = juice.merge(ns0, ns1)
 
 
-.. GENERATED FROM PYTHON SOURCE LINES 89-90
+.. GENERATED FROM PYTHON SOURCE LINES 91-92
 
 :code:`new_ns2` will also be equivalent to :code:`ns`.
 
-.. GENERATED FROM PYTHON SOURCE LINES 92-94
+.. GENERATED FROM PYTHON SOURCE LINES 94-96
 
 Adjust block sizes
 ------------------
 
-.. GENERATED FROM PYTHON SOURCE LINES 96-98
+.. GENERATED FROM PYTHON SOURCE LINES 98-100
 
 In the second tutorial (i.e., "Construct Simple PCs"), we mentioned that defining PCs with large :code:`block_size` is crucial to their efficiency.
 While the best practice is to set high block sizes manually whenever possible, we provide :code:`pyjuice.blockify` to try bumping the group size of all vectors of nodes within a PC.
 
-.. GENERATED FROM PYTHON SOURCE LINES 98-117
+.. GENERATED FROM PYTHON SOURCE LINES 100-119
 
 .. code-block:: Python
 
@@ -205,12 +207,12 @@ While the best practice is to set high block sizes manually whenever possible, w
     ns.init_parameters()
 
 
-.. GENERATED FROM PYTHON SOURCE LINES 118-120
+.. GENERATED FROM PYTHON SOURCE LINES 120-122
 
 While the block sizes of the above-defined PC is 2 (except for the root node), :code:`ns1` could have block size 4 since every pair of 4 aligned sum nodes in :code:`ns1` and 4 aligned child nodes are fully connected.
 To apply such change, we can use:
 
-.. GENERATED FROM PYTHON SOURCE LINES 120-123
+.. GENERATED FROM PYTHON SOURCE LINES 122-125
 
 .. code-block:: Python
 
@@ -218,7 +220,7 @@ To apply such change, we can use:
     new_ns = juice.blockify(ns, sparsity_tolerance = 0.25, max_target_block_size = 32)
 
 
-.. GENERATED FROM PYTHON SOURCE LINES 124-125
+.. GENERATED FROM PYTHON SOURCE LINES 126-127
 
 There are two parameters to the function. :code:`max_target_block_size` specifies the maximum block size to be considered; :code:`sparsity_tolerance` specifies what fraction of pseudo-edges do we allow to add in order to increase the block size even if some pairs of parent and child node blocks are neither fully-connected nor unconnected.
 

@@ -5,6 +5,8 @@ Construct Simple PCs
 In this tutorial, you will learn about the basic APIs to construct PCs.
 """
 
+# sphinx_gallery_thumbnail_path = 'imgs/juice.png'
+
 import torch
 import pyjuice as juice
 import pyjuice.nodes.distributions as dists
