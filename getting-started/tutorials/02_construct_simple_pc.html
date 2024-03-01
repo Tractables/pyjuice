@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="../../">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Construct Simple PCs &mdash; PyJuice 2.0.2 documentation</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=80d5e7a1" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=19f00094" />
+      <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery.css?v=61a4c737" />
+      <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery-binder.css?v=f4aeca0c" />
+      <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery-dataframe.css?v=2082cf3c" />
+      <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery-rendered-html.css?v=1277b6f3" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script src="../../_static/jquery.js?v=5d32c60e"></script>
+        <script src="../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+        <script src="../../_static/documentation_options.js?v=c2377ec0"></script>
+        <script src="../../_static/doctools.js?v=888ff710"></script>
+        <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+        <script async="async" src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="Construct an HMM" href="03_construct_hmm.html" />
+    <link rel="prev" title="Train a PC" href="01_train_pc.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            PyJuice
+          </a>
+              <div class="version">
+                2.0.2
+              </div>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../installation.html">Installation</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Tutorials</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="01_train_pc.html">Train a PC</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">Construct Simple PCs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="03_construct_hmm.html">Construct an HMM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="04_query_pc.html">Query a PC</a></li>
+<li class="toctree-l2"><a class="reference internal" href="05_common_transformations.html">PC Structural Transformation Functions</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/pyjuice.html">pyjuice</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/nodes.html">pyjuice.nodes</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorcircuit.html">pyjuice.TensorCircuit</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/structures.html">pyjuice.structures</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">PyJuice</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">Tutorials</a></li>
+      <li class="breadcrumb-item active">Construct Simple PCs</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="../../_sources/getting-started/tutorials/02_construct_simple_pc.rst.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <div class="sphx-glr-download-link-note admonition note">
+<p class="admonition-title">Note</p>
+<p><a class="reference internal" href="#sphx-glr-download-getting-started-tutorials-02-construct-simple-pc-py"><span class="std std-ref">Go to the end</span></a>
+to download the full example code</p>
+</div>
+<section class="sphx-glr-example-title" id="construct-simple-pcs">
+<span id="sphx-glr-getting-started-tutorials-02-construct-simple-pc-py"></span><h1>Construct Simple PCs<a class="headerlink" href="#construct-simple-pcs" title="Link to this heading"></a></h1>
+<p>In this tutorial, you will learn about the basic APIs to construct PCs.</p>
+<div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span> <span class="nn">torch</span>
+<span class="kn">import</span> <span class="nn">pyjuice</span> <span class="k">as</span> <span class="nn">juice</span>
+<span class="kn">import</span> <span class="nn">pyjuice.nodes.distributions</span> <span class="k">as</span> <span class="nn">dists</span>
+</pre></div>
+</div>
+<p>A PC can be created using <code class="code docutils literal notranslate"><span class="pre">pyjuice.inputs</span></code>, <code class="code docutils literal notranslate"><span class="pre">pyjuice.multiply</span></code>, and <code class="code docutils literal notranslate"><span class="pre">pyjuice.summate</span></code>, which create input node vectors, product node vectors, and sum node vectors, respectively.
+The goal of this tutorial is to get you familiar with these three functions.</p>
+<p>Let us start with <code class="code docutils literal notranslate"><span class="pre">pyjuice.inputs</span></code>.</p>
+<div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="n">ni0</span> <span class="o">=</span> <span class="n">juice</span><span class="o">.</span><span class="n">inputs</span><span class="p">(</span><span class="n">var</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span> <span class="n">num_node_blocks</span> <span class="o">=</span> <span class="mi">4</span><span class="p">,</span> <span class="n">block_size</span> <span class="o">=</span> <span class="mi">2</span><span class="p">,</span> <span class="n">dist</span> <span class="o">=</span> <span class="n">dists</span><span class="o">.</span><span class="n">Categorical</span><span class="p">(</span><span class="n">num_cats</span> <span class="o">=</span> <span class="mi">4</span><span class="p">))</span>
+</pre></div>
+</div>
+<p>The above line defines <code class="code docutils literal notranslate"><span class="pre">num_node_blocks</span> <span class="pre">*</span> <span class="pre">block_size</span> <span class="pre">=</span> <span class="pre">64</span></code> input nodes on variable ID <code class="code docutils literal notranslate"><span class="pre">var</span> <span class="pre">=</span> <span class="pre">0</span></code> featuring Categorical distributions with 4 categories (i.e., <code class="code docutils literal notranslate"><span class="pre">dists.Categorical(num_cats</span> <span class="pre">=</span> <span class="pre">4)</span></code>). The set of input distributions are defined under <code class="code docutils literal notranslate"><span class="pre">pyjuice.nodes.distributions</span></code>.</p>
+<p>A seemingly redundant pair of parameters are <code class="code docutils literal notranslate"><span class="pre">num_node_blocks</span></code> and <code class="code docutils literal notranslate"><span class="pre">block_size</span></code>, since we can alternatively only specify the number of nodes in the node vector <code class="code docutils literal notranslate"><span class="pre">ni0</span></code>.
+In fact, ensuring large <code class="code docutils literal notranslate"><span class="pre">block_size</span></code> is crucial to the efficiency of the PC. So always try to use large block sizes when defining PCs.
+However, although using larger block sizes when defining input node vectors do not have any negative effects, it poses restrictions on the edge connection pattern as we shall proceed to show.</p>
+<p>Note that <code class="code docutils literal notranslate"><span class="pre">block_size</span></code> has to be a power of 2.</p>
+<p>Let us define another input node vector and a product node vector over them.</p>
+<div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="n">ni1</span> <span class="o">=</span> <span class="n">juice</span><span class="o">.</span><span class="n">inputs</span><span class="p">(</span><span class="n">var</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span> <span class="n">num_node_blocks</span> <span class="o">=</span> <span class="mi">4</span><span class="p">,</span> <span class="n">block_size</span> <span class="o">=</span> <span class="mi">2</span><span class="p">,</span> <span class="n">dist</span> <span class="o">=</span> <span class="n">dists</span><span class="o">.</span><span class="n">Categorical</span><span class="p">(</span><span class="n">num_cats</span> <span class="o">=</span> <span class="mi">4</span><span class="p">))</span>
+
+<span class="n">edge_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">],</span> <span class="p">[</span><span class="mi">2</span><span class="p">,</span> <span class="mi">2</span><span class="p">],</span> <span class="p">[</span><span class="mi">3</span><span class="p">,</span> <span class="mi">3</span><span class="p">]])</span>
+<span class="n">ms</span> <span class="o">=</span> <span class="n">juice</span><span class="o">.</span><span class="n">multiply</span><span class="p">(</span><span class="n">ni0</span><span class="p">,</span> <span class="n">ni1</span><span class="p">,</span> <span class="n">edge_ids</span> <span class="o">=</span> <span class="n">edge_ids</span><span class="p">)</span>
+</pre></div>
+</div>
+<p><code class="code docutils literal notranslate"><span class="pre">ms</span></code> defines a product node vector where every node have two children: the first child is a node in <code class="code docutils literal notranslate"><span class="pre">ni0</span></code> and the second child is a node in <code class="code docutils literal notranslate"><span class="pre">ni1</span></code>.
+<code class="code docutils literal notranslate"><span class="pre">edge_ids</span></code> specifies which child nodes do every node in <code class="code docutils literal notranslate"><span class="pre">ms</span></code> connects to. Specifically, <code class="code docutils literal notranslate"><span class="pre">edge_ids</span></code> has size <code class="code docutils literal notranslate"><span class="pre">[#</span> <span class="pre">product</span> <span class="pre">node</span> <span class="pre">blocks,</span> <span class="pre">#</span> <span class="pre">child</span> <span class="pre">node</span> <span class="pre">vectors]</span></code>, so in this case, it should has size <code class="code docutils literal notranslate"><span class="pre">[4,</span> <span class="pre">2]</span></code>.
+The semantic of <code class="code docutils literal notranslate"><span class="pre">edge_ids[i,j]</span></code> is “the <span class="math notranslate nohighlight">\(i`th product node block connects to the :code:`edge_ids[i,j]`th node block in the :math:`j`th child node vector (assume we always count from 0)&quot;.
+For example, :code:`edge_ids[1,0] = 1\)</span> means that the 1th product node block connects to the 1th node block in <code class="code docutils literal notranslate"><span class="pre">ni0</span></code>.</p>
+<p>We assume the node vectors fed to <code class="code docutils literal notranslate"><span class="pre">pyjuice.multiply</span></code> have the same <code class="code docutils literal notranslate"><span class="pre">block_size</span></code>. And the block size of the output product node vector is also the same with that of the inputs.
+We do not need to specify the number of node blocks (e.g., using <code class="code docutils literal notranslate"><span class="pre">num_node_blocks</span></code>) since it is equal to <code class="code docutils literal notranslate"><span class="pre">edge_ids.size(0)</span></code>.
+For <code class="code docutils literal notranslate"><span class="pre">pyjuice.multiply</span></code>, if two node blocks are connected (as defined by <code class="code docutils literal notranslate"><span class="pre">edge_ids</span></code>), we assume the :math:<a href="#id1"><span class="problematic" id="id2">`</span></a>i`th node in the (parent) product node block is connected to the :math:<a href="#id3"><span class="problematic" id="id4">`</span></a>i`th node in the child node block.</p>
+<p>Finally, when we do not provide the <code class="code docutils literal notranslate"><span class="pre">edge_ids</span></code>, PyJuice assumes it to be the following:</p>
+<div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="n">num_node_blocks</span> <span class="o">=</span> <span class="mi">4</span>
+<span class="n">num_child_node_vectors</span> <span class="o">=</span> <span class="mi">2</span>
+<span class="n">edge_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">num_node_blocks</span><span class="p">)[:,</span><span class="kc">None</span><span class="p">]</span><span class="o">.</span><span class="n">repeat</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">num_child_node_vectors</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>Finally, we introduce <code class="code docutils literal notranslate"><span class="pre">pyjuice.summate</span></code>, which is used to define sum node vectors.</p>
+<div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="n">edge_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">5</span><span class="p">],</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">0</span><span class="p">]])</span>
+<span class="n">ns</span> <span class="o">=</span> <span class="n">juice</span><span class="o">.</span><span class="n">summate</span><span class="p">(</span><span class="n">ms</span><span class="p">,</span> <span class="n">num_node_blocks</span> <span class="o">=</span> <span class="mi">6</span><span class="p">,</span> <span class="n">block_size</span> <span class="o">=</span> <span class="mi">2</span><span class="p">,</span> <span class="n">edge_ids</span> <span class="o">=</span> <span class="n">edge_ids</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>Similar to <code class="code docutils literal notranslate"><span class="pre">pyjuice.multiply</span></code>, the positional arguments to <code class="code docutils literal notranslate"><span class="pre">pyjuice.summate</span></code> are the list of input node vectors (here we only provide <code class="code docutils literal notranslate"><span class="pre">ms</span></code>).
+<code class="code docutils literal notranslate"><span class="pre">num_node_blocks</span></code> and <code class="code docutils literal notranslate"><span class="pre">block_size</span></code> are the number of node blocks and the size of each node block, respectively.
+Therefore, <code class="code docutils literal notranslate"><span class="pre">ns</span></code> defines a vector of <code class="code docutils literal notranslate"><span class="pre">num_node_blocks</span> <span class="pre">*</span> <span class="pre">block_size</span> <span class="pre">=</span> <span class="pre">12</span></code> sum nodes that are (partially) connected to the nodes in <code class="code docutils literal notranslate"><span class="pre">ms</span></code>.
+If there are multiple child node vectors, <code class="code docutils literal notranslate"><span class="pre">pyjuice.summate</span></code> assumes they have the same block size. However, the sum node vector can have a different block size compared to its children.</p>
+<p>The connection pattern is specified by the keyword argument <code class="code docutils literal notranslate"><span class="pre">edge_ids</span></code>, which have shape <code class="code docutils literal notranslate"><span class="pre">[2,</span> <span class="pre">#</span> <span class="pre">edge</span> <span class="pre">blocks]</span></code>.
+Every size-2 column vector <span class="math notranslate nohighlight">\([m, n]^T\)</span> in <code class="code docutils literal notranslate"><span class="pre">edge_ids</span></code> indicates the existance of fully-connected edges between the the <span class="math notranslate nohighlight">\(m`th sum node block and the :math:`n`th product node block.
+That is, in the case where both :code:`ns\)</span> and <code class="code docutils literal notranslate"><span class="pre">ms</span></code> have block size 2, every column in <code class="code docutils literal notranslate"><span class="pre">edge_ids</span></code> specifies <span class="math notranslate nohighlight">\(2 \times 2 = 4\)</span> edges.</p>
+<p>If <code class="code docutils literal notranslate"><span class="pre">edge_ids</span></code> is not provided, we assume that all nodes in the sum node vector are connected to all child nodes.</p>
+<div class="sphx-glr-footer sphx-glr-footer-example docutils container" id="sphx-glr-download-getting-started-tutorials-02-construct-simple-pc-py">
+<div class="sphx-glr-download sphx-glr-download-jupyter docutils container">
+<p><a class="reference download internal" download="" href="../../_downloads/94056bd45c0afc58d516144c0928bf8b/02_construct_simple_pc.ipynb"><code class="xref download docutils literal notranslate"><span class="pre">Download</span> <span class="pre">Jupyter</span> <span class="pre">notebook:</span> <span class="pre">02_construct_simple_pc.ipynb</span></code></a></p>
+</div>
+<div class="sphx-glr-download sphx-glr-download-python docutils container">
+<p><a class="reference download internal" download="" href="../../_downloads/ab853d12dcf8246e42ce1eb5d40a84fb/02_construct_simple_pc.py"><code class="xref download docutils literal notranslate"><span class="pre">Download</span> <span class="pre">Python</span> <span class="pre">source</span> <span class="pre">code:</span> <span class="pre">02_construct_simple_pc.py</span></code></a></p>
+</div>
+</div>
+<p class="sphx-glr-signature"><a class="reference external" href="https://sphinx-gallery.github.io">Gallery generated by Sphinx-Gallery</a></p>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="01_train_pc.html" class="btn btn-neutral float-left" title="Train a PC" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="03_construct_hmm.html" class="btn btn-neutral float-right" title="Construct an HMM" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2021, StarAI.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

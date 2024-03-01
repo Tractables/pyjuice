@@ -25,8 +25,8 @@
     <script src="../../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../../genindex.html" />
     <link rel="search" title="Search" href="../../search.html" />
-    <link rel="next" title="Query a PC" href="03_query_pc.html" />
-    <link rel="prev" title="Train a PC" href="01_train_pc.html" /> 
+    <link rel="next" title="Query a PC" href="04_query_pc.html" />
+    <link rel="prev" title="Construct Simple PCs" href="02_construct_simple_pc.html" /> 
 </head>
 
 <body class="wy-body-for-nav"> 
@@ -56,8 +56,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../installation.html">Installation</a></li>
 <li class="toctree-l1 current"><a class="reference internal" href="index.html">Tutorials</a><ul class="current">
 <li class="toctree-l2"><a class="reference internal" href="01_train_pc.html">Train a PC</a></li>
+<li class="toctree-l2"><a class="reference internal" href="02_construct_simple_pc.html">Construct Simple PCs</a></li>
 <li class="toctree-l2 current"><a class="current reference internal" href="#">Construct an HMM</a></li>
-<li class="toctree-l2"><a class="reference internal" href="03_query_pc.html">Query a PC</a></li>
+<li class="toctree-l2"><a class="reference internal" href="04_query_pc.html">Query a PC</a></li>
+<li class="toctree-l2"><a class="reference internal" href="05_common_transformations.html">PC Structural Transformation Functions</a></li>
 </ul>
 </li>
 </ul>
@@ -86,7 +88,7 @@
           <li class="breadcrumb-item"><a href="index.html">Tutorials</a></li>
       <li class="breadcrumb-item active">Construct an HMM</li>
       <li class="wy-breadcrumbs-aside">
-            <a href="../../_sources/getting-started/tutorials/02_construct_hmm.rst.txt" rel="nofollow"> View page source</a>
+            <a href="../../_sources/getting-started/tutorials/03_construct_hmm.rst.txt" rel="nofollow"> View page source</a>
       </li>
   </ul>
   <hr/>
@@ -96,11 +98,11 @@
              
   <div class="sphx-glr-download-link-note admonition note">
 <p class="admonition-title">Note</p>
-<p><a class="reference internal" href="#sphx-glr-download-getting-started-tutorials-02-construct-hmm-py"><span class="std std-ref">Go to the end</span></a>
+<p><a class="reference internal" href="#sphx-glr-download-getting-started-tutorials-03-construct-hmm-py"><span class="std std-ref">Go to the end</span></a>
 to download the full example code</p>
 </div>
 <section class="sphx-glr-example-title" id="construct-an-hmm">
-<span id="sphx-glr-getting-started-tutorials-02-construct-hmm-py"></span><h1>Construct an HMM<a class="headerlink" href="#construct-an-hmm" title="Link to this heading"></a></h1>
+<span id="sphx-glr-getting-started-tutorials-03-construct-hmm-py"></span><h1>Construct an HMM<a class="headerlink" href="#construct-an-hmm" title="Link to this heading"></a></h1>
 <p>This tutorial demonstrates how to construct an HMM with PyJuice primitives <cite>inputs</cite>, <cite>multiply</cite>, and <cite>summate</cite>.</p>
 <div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="c1"># sphinx_gallery_thumbnail_path = &#39;imgs/juice.png&#39;</span>
 
@@ -152,12 +154,12 @@ In the following we assume <cite>T = seq_length</cite> and <cite>K = num_latents
     <span class="n">ns</span> <span class="o">=</span> <span class="n">juice</span><span class="o">.</span><span class="n">summate</span><span class="p">(</span><span class="n">curr_zs</span><span class="p">,</span> <span class="n">num_node_blocks</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span> <span class="n">block_size</span> <span class="o">=</span> <span class="mi">1</span><span class="p">)</span>
 </pre></div>
 </div>
-<div class="sphx-glr-footer sphx-glr-footer-example docutils container" id="sphx-glr-download-getting-started-tutorials-02-construct-hmm-py">
+<div class="sphx-glr-footer sphx-glr-footer-example docutils container" id="sphx-glr-download-getting-started-tutorials-03-construct-hmm-py">
 <div class="sphx-glr-download sphx-glr-download-jupyter docutils container">
-<p><a class="reference download internal" download="" href="../../_downloads/b0343f567d433ce8d2a1756b93b3d81a/02_construct_hmm.ipynb"><code class="xref download docutils literal notranslate"><span class="pre">Download</span> <span class="pre">Jupyter</span> <span class="pre">notebook:</span> <span class="pre">02_construct_hmm.ipynb</span></code></a></p>
+<p><a class="reference download internal" download="" href="../../_downloads/a6f4e70e566387d03c9a1773c5f52cdb/03_construct_hmm.ipynb"><code class="xref download docutils literal notranslate"><span class="pre">Download</span> <span class="pre">Jupyter</span> <span class="pre">notebook:</span> <span class="pre">03_construct_hmm.ipynb</span></code></a></p>
 </div>
 <div class="sphx-glr-download sphx-glr-download-python docutils container">
-<p><a class="reference download internal" download="" href="../../_downloads/1a2ac70a45ac54e795a68eba2b506320/02_construct_hmm.py"><code class="xref download docutils literal notranslate"><span class="pre">Download</span> <span class="pre">Python</span> <span class="pre">source</span> <span class="pre">code:</span> <span class="pre">02_construct_hmm.py</span></code></a></p>
+<p><a class="reference download internal" download="" href="../../_downloads/4407a3dbbb1547f15d94cab7374d606b/03_construct_hmm.py"><code class="xref download docutils literal notranslate"><span class="pre">Download</span> <span class="pre">Python</span> <span class="pre">source</span> <span class="pre">code:</span> <span class="pre">03_construct_hmm.py</span></code></a></p>
 </div>
 </div>
 <p class="sphx-glr-signature"><a class="reference external" href="https://sphinx-gallery.github.io">Gallery generated by Sphinx-Gallery</a></p>
@@ -167,8 +169,8 @@ In the following we assume <cite>T = seq_length</cite> and <cite>K = num_latents
            </div>
           </div>
           <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
-        <a href="01_train_pc.html" class="btn btn-neutral float-left" title="Train a PC" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
-        <a href="03_query_pc.html" class="btn btn-neutral float-right" title="Query a PC" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+        <a href="02_construct_simple_pc.html" class="btn btn-neutral float-left" title="Construct Simple PCs" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="04_query_pc.html" class="btn btn-neutral float-right" title="Query a PC" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
     </div>
 
   <hr/>

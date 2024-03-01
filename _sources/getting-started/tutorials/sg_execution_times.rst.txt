@@ -6,7 +6,7 @@
 
 Computation times
 =================
-**00:00.000** total execution time for 3 files **from getting-started/tutorials**:
+**00:00.000** total execution time for 5 files **from getting-started/tutorials**:
 
 .. container::
 
@@ -35,9 +35,15 @@ Computation times
    * - :ref:`sphx_glr_getting-started_tutorials_01_train_pc.py` (``01_train_pc.py``)
      - 00:00.000
      - 0.0
-   * - :ref:`sphx_glr_getting-started_tutorials_02_construct_hmm.py` (``02_construct_hmm.py``)
+   * - :ref:`sphx_glr_getting-started_tutorials_02_construct_simple_pc.py` (``02_construct_simple_pc.py``)
      - 00:00.000
      - 0.0
-   * - :ref:`sphx_glr_getting-started_tutorials_03_query_pc.py` (``03_query_pc.py``)
+   * - :ref:`sphx_glr_getting-started_tutorials_03_construct_hmm.py` (``03_construct_hmm.py``)
+     - 00:00.000
+     - 0.0
+   * - :ref:`sphx_glr_getting-started_tutorials_04_query_pc.py` (``04_query_pc.py``)
+     - 00:00.000
+     - 0.0
+   * - :ref:`sphx_glr_getting-started_tutorials_05_common_transformations.py` (``05_common_transformations.py``)
      - 00:00.000
      - 0.0

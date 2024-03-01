@@ -25,7 +25,7 @@
     <script src="../../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../../genindex.html" />
     <link rel="search" title="Search" href="../../search.html" />
-    <link rel="next" title="Construct an HMM" href="02_construct_hmm.html" />
+    <link rel="next" title="Construct Simple PCs" href="02_construct_simple_pc.html" />
     <link rel="prev" title="Tutorials" href="index.html" /> 
 </head>
 
@@ -61,8 +61,10 @@
 <li class="toctree-l3"><a class="reference internal" href="#train-the-pc">Train the PC</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="02_construct_hmm.html">Construct an HMM</a></li>
-<li class="toctree-l2"><a class="reference internal" href="03_query_pc.html">Query a PC</a></li>
+<li class="toctree-l2"><a class="reference internal" href="02_construct_simple_pc.html">Construct Simple PCs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="03_construct_hmm.html">Construct an HMM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="04_query_pc.html">Query a PC</a></li>
+<li class="toctree-l2"><a class="reference internal" href="05_common_transformations.html">PC Structural Transformation Functions</a></li>
 </ul>
 </li>
 </ul>
@@ -107,10 +109,8 @@ to download the full example code</p>
 <section class="sphx-glr-example-title" id="train-a-pc">
 <span id="sphx-glr-getting-started-tutorials-01-train-pc-py"></span><h1>Train a PC<a class="headerlink" href="#train-a-pc" title="Link to this heading"></a></h1>
 <p>This tutorial demonstrates how to create a Hidden Chow-Liu Tree (<a class="reference external" href="https://arxiv.org/pdf/2106.02264.pdf">https://arxiv.org/pdf/2106.02264.pdf</a>) using <cite>pyjuice.structures</cite> and train the model with mini-batch EM and full-batch EM.</p>
-<p>For simplicity, we use the MNIST dataset as an example.</p>
-<div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="c1"># sphinx_gallery_thumbnail_path = &#39;imgs/juice.png&#39;</span>
-</pre></div>
-</div>
+<p>For simplicity, we use the MNIST dataset as an example.
+Note that the goal of this tutorial is just to quickly demonstrate the basic training pipeline using PyJuice without covering additional details about details such as ways to construct a PC, which will be covered in the following tutorials.</p>
 <section id="load-the-mnist-dataset">
 <h2>Load the MNIST Dataset<a class="headerlink" href="#load-the-mnist-dataset" title="Link to this heading"></a></h2>
 <div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span> <span class="nn">pyjuice</span> <span class="k">as</span> <span class="nn">juice</span>
@@ -271,7 +271,7 @@ to download the full example code</p>
           </div>
           <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
         <a href="index.html" class="btn btn-neutral float-left" title="Tutorials" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
-        <a href="02_construct_hmm.html" class="btn btn-neutral float-right" title="Construct an HMM" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+        <a href="02_construct_simple_pc.html" class="btn btn-neutral float-right" title="Construct Simple PCs" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
     </div>
 
   <hr/>

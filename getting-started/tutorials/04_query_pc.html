@@ -26,8 +26,8 @@
     <script src="../../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../../genindex.html" />
     <link rel="search" title="Search" href="../../search.html" />
-    <link rel="next" title="pyjuice" href="../../python-api/pyjuice.html" />
-    <link rel="prev" title="Construct an HMM" href="02_construct_hmm.html" /> 
+    <link rel="next" title="PC Structural Transformation Functions" href="05_common_transformations.html" />
+    <link rel="prev" title="Construct an HMM" href="03_construct_hmm.html" /> 
 </head>
 
 <body class="wy-body-for-nav"> 
@@ -57,13 +57,15 @@
 <li class="toctree-l1"><a class="reference internal" href="../installation.html">Installation</a></li>
 <li class="toctree-l1 current"><a class="reference internal" href="index.html">Tutorials</a><ul class="current">
 <li class="toctree-l2"><a class="reference internal" href="01_train_pc.html">Train a PC</a></li>
-<li class="toctree-l2"><a class="reference internal" href="02_construct_hmm.html">Construct an HMM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="02_construct_simple_pc.html">Construct Simple PCs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="03_construct_hmm.html">Construct an HMM</a></li>
 <li class="toctree-l2 current"><a class="current reference internal" href="#">Query a PC</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="#generate-a-pc">Generate a PC</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#compute-marginal-probabilities">Compute marginal probabilities</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#compute-conditional-probabilities">Compute conditional probabilities</a></li>
 </ul>
 </li>
+<li class="toctree-l2"><a class="reference internal" href="05_common_transformations.html">PC Structural Transformation Functions</a></li>
 </ul>
 </li>
 </ul>
@@ -92,7 +94,7 @@
           <li class="breadcrumb-item"><a href="index.html">Tutorials</a></li>
       <li class="breadcrumb-item active">Query a PC</li>
       <li class="wy-breadcrumbs-aside">
-            <a href="../../_sources/getting-started/tutorials/03_query_pc.rst.txt" rel="nofollow"> View page source</a>
+            <a href="../../_sources/getting-started/tutorials/04_query_pc.rst.txt" rel="nofollow"> View page source</a>
       </li>
   </ul>
   <hr/>
@@ -102,11 +104,11 @@
              
   <div class="sphx-glr-download-link-note admonition note">
 <p class="admonition-title">Note</p>
-<p><a class="reference internal" href="#sphx-glr-download-getting-started-tutorials-03-query-pc-py"><span class="std std-ref">Go to the end</span></a>
+<p><a class="reference internal" href="#sphx-glr-download-getting-started-tutorials-04-query-pc-py"><span class="std std-ref">Go to the end</span></a>
 to download the full example code</p>
 </div>
 <section class="sphx-glr-example-title" id="query-a-pc">
-<span id="sphx-glr-getting-started-tutorials-03-query-pc-py"></span><h1>Query a PC<a class="headerlink" href="#query-a-pc" title="Link to this heading"></a></h1>
+<span id="sphx-glr-getting-started-tutorials-04-query-pc-py"></span><h1>Query a PC<a class="headerlink" href="#query-a-pc" title="Link to this heading"></a></h1>
 <p>Assume we have constructed and trained a PC following the previous tutorials. This tutorial demonstrates how to query the PC, i.e., ask probabilistic queries about the distribution encoded by the PC.</p>
 <p>We will cover how to compute marginal and conditional probabilities.</p>
 <div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="c1"># sphinx_gallery_thumbnail_path = &#39;imgs/juice.png&#39;</span>
@@ -145,13 +147,13 @@ to download the full example code</p>
 </div>
 <p>In the data tensor, entries corresponding missing variables will be dismissed by PyJuice and will not influence the output.
 The <cite>missing_mask</cite> can have have shape [batch_size, num_vars] or [num_vars] if for all samples we marginalize out the same subset of variables.</p>
-<p>We proceed to compute the marginal probabilities using <cite>pyjuice.queries.marginal</cite>:</p>
+<p>We proceed to compute the marginal probabilities using <code class="code docutils literal notranslate"><span class="pre">pyjuice.queries.marginal</span></code>:</p>
 <div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="n">lls</span> <span class="o">=</span> <span class="n">juice</span><span class="o">.</span><span class="n">queries</span><span class="o">.</span><span class="n">marginal</span><span class="p">(</span>
     <span class="n">pc</span><span class="p">,</span> <span class="n">data</span> <span class="o">=</span> <span class="n">data</span><span class="p">,</span> <span class="n">missing_mask</span> <span class="o">=</span> <span class="n">missing_mask</span>
 <span class="p">)</span>
 </pre></div>
 </div>
-<p>For PCs defined on categorical variables, we can alternatively query for marginal probabilities given <em>soft</em> evidence, e.g., <span class="math notranslate nohighlight">\(P(X_1 = 0 \text{w.p.} 0.3 \text{and} 1 \text{w.p.} 0.7)\)</span>.
+<p>For PCs defined on categorical variables, we can alternatively query for marginal probabilities given <em>soft</em> evidence, e.g., <span class="math notranslate nohighlight">\(P(X_1 = 0 ~\text{w.p.}~ 0.3 ~\text{and}~ 1 ~\text{w.p.}~ 0.7)\)</span>.
 This can be done by defining <cite>date</cite> as a 3D tensor of size [batch_size, num_vars, num_cats]:</p>
 <div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="n">data</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([[[</span><span class="mf">0.4</span><span class="p">,</span> <span class="mf">0.6</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">]],</span> <span class="p">[[</span><span class="mf">0.3</span><span class="p">,</span> <span class="mf">0.7</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">]]])</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
 </pre></div>
@@ -167,7 +169,7 @@ This can be done by defining <cite>date</cite> as a 3D tensor of size [batch_siz
 <section id="compute-conditional-probabilities">
 <h2>Compute conditional probabilities<a class="headerlink" href="#compute-conditional-probabilities" title="Link to this heading"></a></h2>
 <p>Since every conditional probability can be represented as the quotient of two marginal probabilities, one may wonder why do we need a separate function for computing conditional probabilities.
-In fact, with <cite>pyjuice.queries.conditional</cite>, we can simultaneously compute a <em>set of</em> conditional probabilities. Specifically, given evidence <span class="math notranslate nohighlight">\(\mathbf{E} = \mathbf{e}\)</span>, we can compute <span class="math notranslate nohighlight">\(\forall X \not\in \mathbf{E}, x \in \mathrm{val}(X), P(X = x | \mathbf{e})\)</span>.</p>
+In fact, with <code class="code docutils literal notranslate"><span class="pre">pyjuice.queries.conditional</span></code>, we can simultaneously compute a <em>set of</em> conditional probabilities. Specifically, given evidence <span class="math notranslate nohighlight">\(\mathbf{E} = \mathbf{e}\)</span>, we can compute <span class="math notranslate nohighlight">\(\forall X \not\in \mathbf{E}, x \in \mathrm{val}(X), P(X = x | \mathbf{e})\)</span>.</p>
 <p>Say we want to compute the conditional probability of <span class="math notranslate nohighlight">\(X_2\)</span> given evidence <span class="math notranslate nohighlight">\(X_1 = 0\)</span> and <span class="math notranslate nohighlight">\(X_1 = 1\)</span>, respectively. We prepare the data and the mask similarly.</p>
 <div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="n">data</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">]])</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
 <span class="n">missing_mask</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([[</span><span class="kc">False</span><span class="p">,</span> <span class="kc">True</span><span class="p">],</span> <span class="p">[</span><span class="kc">False</span><span class="p">,</span> <span class="kc">True</span><span class="p">]])</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span> <span class="c1"># True for variables to be conditioned on/are missing</span>
@@ -180,7 +182,7 @@ In fact, with <cite>pyjuice.queries.conditional</cite>, we can simultaneously co
 </pre></div>
 </div>
 <p>The parameter <cite>target_vars</cite> is used to indicate the subset of variables which we want to compute their conditional probabilities. Probabilities of all variables will be returned if we do not specify <cite>target_vars</cite>.</p>
-<p>The shape of <cite>outputs</cite> is [B, num_target_vars, num_categories]. For example, <cite>outputs[1,0,3]</cite> is the conditional probability <span class="math notranslate nohighlight">\(P(X_2 = 3 | X_1 = 1)\)</span>.</p>
+<p>The shape of <span class="math notranslate nohighlight">\(\mathrm{outputs}\)</span> is [B, num_target_vars, num_categories]. For example, <span class="math notranslate nohighlight">\(\mathrm{outputs}[1,0,3]\)</span> is the conditional probability <span class="math notranslate nohighlight">\(P(X_2 = 3 | X_1 = 1)\)</span>.</p>
 <p>Similar to the marginal query, for categorical data, we can also feed <em>soft</em> evidence:</p>
 <div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="n">data</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([[[</span><span class="mf">0.4</span><span class="p">,</span> <span class="mf">0.6</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">]],</span> <span class="p">[[</span><span class="mf">0.3</span><span class="p">,</span> <span class="mf">0.7</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">]]])</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
 <span class="n">missing_mask</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([[</span><span class="kc">False</span><span class="p">,</span> <span class="kc">True</span><span class="p">],</span> <span class="p">[</span><span class="kc">False</span><span class="p">,</span> <span class="kc">True</span><span class="p">]])</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
@@ -190,12 +192,12 @@ In fact, with <cite>pyjuice.queries.conditional</cite>, we can simultaneously co
 <span class="p">)</span>
 </pre></div>
 </div>
-<div class="sphx-glr-footer sphx-glr-footer-example docutils container" id="sphx-glr-download-getting-started-tutorials-03-query-pc-py">
+<div class="sphx-glr-footer sphx-glr-footer-example docutils container" id="sphx-glr-download-getting-started-tutorials-04-query-pc-py">
 <div class="sphx-glr-download sphx-glr-download-jupyter docutils container">
-<p><a class="reference download internal" download="" href="../../_downloads/de85622651cd6e1d1c49a94204eca646/03_query_pc.ipynb"><code class="xref download docutils literal notranslate"><span class="pre">Download</span> <span class="pre">Jupyter</span> <span class="pre">notebook:</span> <span class="pre">03_query_pc.ipynb</span></code></a></p>
+<p><a class="reference download internal" download="" href="../../_downloads/aef0a86e373771ba745406f9889513e4/04_query_pc.ipynb"><code class="xref download docutils literal notranslate"><span class="pre">Download</span> <span class="pre">Jupyter</span> <span class="pre">notebook:</span> <span class="pre">04_query_pc.ipynb</span></code></a></p>
 </div>
 <div class="sphx-glr-download sphx-glr-download-python docutils container">
-<p><a class="reference download internal" download="" href="../../_downloads/503c3398b22275c2e286501bd6218cf1/03_query_pc.py"><code class="xref download docutils literal notranslate"><span class="pre">Download</span> <span class="pre">Python</span> <span class="pre">source</span> <span class="pre">code:</span> <span class="pre">03_query_pc.py</span></code></a></p>
+<p><a class="reference download internal" download="" href="../../_downloads/5b198da5a101bf5263f97b980527d5e8/04_query_pc.py"><code class="xref download docutils literal notranslate"><span class="pre">Download</span> <span class="pre">Python</span> <span class="pre">source</span> <span class="pre">code:</span> <span class="pre">04_query_pc.py</span></code></a></p>
 </div>
 </div>
 <p class="sphx-glr-signature"><a class="reference external" href="https://sphinx-gallery.github.io">Gallery generated by Sphinx-Gallery</a></p>
@@ -206,8 +208,8 @@ In fact, with <cite>pyjuice.queries.conditional</cite>, we can simultaneously co
            </div>
           </div>
           <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
-        <a href="02_construct_hmm.html" class="btn btn-neutral float-left" title="Construct an HMM" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
-        <a href="../../python-api/pyjuice.html" class="btn btn-neutral float-right" title="pyjuice" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+        <a href="03_construct_hmm.html" class="btn btn-neutral float-left" title="Construct an HMM" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="05_common_transformations.html" class="btn btn-neutral float-right" title="PC Structural Transformation Functions" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
     </div>
 
   <hr/>
