@@ -388,10 +388,67 @@ class ProdLayer(Layer, nn.Module):
             offs_evals += batch_size
 
     @staticmethod
+    # @triton.jit
+    @FastJITFunction
+    def _forward_backward_kernel_large(node_vals_ptr, element_vals_ptr, local_ids_ptr, nids_ptr, cids_ptr, tot_n_nodes, tot_n_eles, n_nblocks,
+                                       num_edges: tl.constexpr, batch_size, BLOCK_N: tl.constexpr, BLOCK_B: tl.constexpr, 
+                                       N_NUM_BLKS: tl.constexpr, block_size: tl.constexpr, accum: tl.constexpr, partial_eval: tl.constexpr):
+        """
+        This kernel implements the function with 2d tensors. It is designed for nodes with many edges.
+        """
+        
+        pid_m = tl.program_id(axis = 0) # ID of size-`1` nodes
+        pid_b = tl.program_id(axis = 1) # ID of size-`BLOCK_B` batches
+
+        # Get inferred node block id from `pid_m`
+        nblock_id = pid_m // block_size
+        ntile_id = pid_m % block_size
+
+        # For partial evaluation
+        if partial_eval == 1:
+            nblock_id = tl.load(local_ids_ptr + nblock_id)
+
+        # Batch offsets and mask
+        offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B # [BLOCK_B]
+        mask_batch = offs_batch < batch_size
+
+        # Get the block start ids for the children
+        offs_edge = tl.arange(0, BLOCK_N)
+        mask_edge = (offs_edge < num_edges)
+        offs_egstart = tl.load(cids_ptr + nblock_id * num_edges + offs_edge) # [BLOCK_N]
+
+        # Base ptr for ch values
+        offs_evals = (offs_egstart[:,None] + ntile_id) * batch_size + offs_batch[None,:] # [BLOCK_N, BLOCK_B]
+
+        # Base ptr for par values
+        nblock_start = tl.load(nids_ptr + nblock_id)
+        offs_nvals = (nblock_start + ntile_id) * batch_size + offs_batch # [BLOCK_B]
+
+        # Inner loop
+        nvals = tl.zeros([BLOCK_B], dtype = tl.float32)
+        for i in range(0, N_NUM_BLKS):
+            evals = tl.load(element_vals_ptr + offs_evals, mask = (mask_edge[:,None] & mask_batch[None,:]), other = 0)
+            nvals += tl.sum(evals, axis = 0)
+
+            offs_edge += BLOCK_N
+            mask_edge = (offs_edge < num_edges)
+
+            # Re-compute the ch value ids
+            offs_egstart = tl.load(cids_ptr + nblock_id * num_edges + offs_edge) # [BLOCK_N]
+            offs_evals = (offs_egstart[:,None] + ntile_id) * batch_size + offs_batch[None,:] # [BLOCK_N, BLOCK_B]
+
+        # Accumulate the `node_vals` if required
+        if accum == 1:
+            node_vals = tl.load(node_vals_ptr + offs_nvals, mask = mask_batch)
+            nvals += node_vals
+
+        tl.store(node_vals_ptr + offs_nvals, nvals, mask = mask_batch)
+
+    @staticmethod
     @torch.compile(mode = "reduce-overhead", fullgraph = True)
-    def _forward_backward_pytorch(node_vals, element_vals, nids, cids, accum: bool = False):
-        nids = nids[:,None] + torch.arange(0, self.block_size, device = node_vals.device)[None,:]
-        cids = cids[:,None,:] + torch.arange(0, self.block_size, device = node_vals.device)[None,:,None]
+    def _forward_backward_pytorch(node_vals, element_vals, nids, cids, block_size, accum: bool = False):
+        nids = nids[:,None] + torch.arange(0, block_size, device = node_vals.device)[None,:]
+        cids = cids[:,None,:] + torch.arange(0, block_size, device = node_vals.device)[None,:,None]
         if accum:
             node_vals[nids] += element_vals[cids].sum(dim = 2)
         else:
@@ -414,9 +471,32 @@ class ProdLayer(Layer, nn.Module):
 
         assert num_edges & (num_edges - 1) == 0, "`num_edges` must be a power of 2."
 
-        # Fall back to the `torch.compile` kernel in the case where we cannot store child edges within a single block
-        if num_edges > 1024:
-            self._forward_backward_pytorch(node_vals, element_vals, nids, cids, accum = accum)
+        # Special case: every node have > 2048 edges
+        if num_edges > 2048:
+
+            BLOCK_N = 2048
+            BLOCK_B = 1
+
+            grid = (n_nblocks * self.block_size, batch_size)
+            
+            self._forward_backward_kernel_large[grid](
+                node_vals_ptr = node_vals, 
+                element_vals_ptr = element_vals,
+                local_ids_ptr = local_ids,
+                nids_ptr = nids, 
+                cids_ptr = cids, 
+                tot_n_nodes = tot_n_nodes,
+                tot_n_eles = tot_n_eles,
+                n_nblocks = n_nblocks,
+                num_edges = num_edges,
+                batch_size = batch_size, 
+                BLOCK_N = BLOCK_N, 
+                BLOCK_B = BLOCK_B, 
+                N_NUM_BLKS = triton.cdiv(num_edges, BLOCK_B), 
+                block_size = block_size, 
+                accum = accum, 
+                partial_eval = partial_eval
+            )
 
             return None
 
