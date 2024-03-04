@@ -927,7 +927,7 @@ class SumLayer(Layer, nn.Module):
         batch_size = node_mars.size(1)
         BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
 
-        assert num_edges <= 16384, "The sparse forward kernel only support nodes with # edges smaller than 16384."
+        # assert num_edges <= 16384, "The sparse forward kernel only support nodes with # edges smaller than 16384."
 
         if triton.cdiv(layer_n_nodes, self.block_size) <= 2048:
             BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
@@ -1083,8 +1083,10 @@ class SumLayer(Layer, nn.Module):
         elif self.block_size * batch_size < 32:
             # Advantage of block-sparse processing is diminishing
             mode = self.SPARSE
-        else:
+        elif num_edges <= 32768:
             mode = self.BLOCK_SPARSE
+        else:
+            mode = self.SPARSE
 
         if mode == self.BLOCK_SPARSE:
             self._backward_block_sparse(
@@ -2320,8 +2322,7 @@ class SumLayer(Layer, nn.Module):
         batch_size = node_mars.size(1)
         BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
 
-        assert num_edges <= 16384, "The sparse backward kernel only support nodes with # edges smaller than 16384."
-
+        # assert num_edges <= 16384, "The sparse backward kernel only support nodes with # edges smaller than 16384."
 
         if num_edges <= 1024:
             BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
