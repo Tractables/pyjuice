@@ -444,18 +444,6 @@ class ProdLayer(Layer, nn.Module):
 
         tl.store(node_vals_ptr + offs_nvals, nvals, mask = mask_batch)
 
-    @staticmethod
-    @torch.compile(mode = "reduce-overhead", fullgraph = True)
-    def _forward_backward_pytorch(node_vals, element_vals, nids, cids, block_size, accum: bool = False):
-        nids = nids[:,None] + torch.arange(0, block_size, device = node_vals.device)[None,:]
-        cids = cids[:,None,:] + torch.arange(0, block_size, device = node_vals.device)[None,:,None]
-        if accum:
-            node_vals[nids] += element_vals[cids].sum(dim = 2)
-        else:
-            node_vals[nids] = element_vals[cids].sum(dim = 2)
-
-        return None
-
     def _forward_backward(self, node_vals: torch.Tensor, element_vals: torch.Tensor,
                           nids: torch.Tensor, cids: torch.Tensor, local_ids: Optional[torch.Tensor] = None,
                           accum: bool = False) -> None:
