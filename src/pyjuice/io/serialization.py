@@ -57,6 +57,11 @@ def deserialize_nodes(nodes_list: Sequence):
         if "num_node_blocks" in ns_info:
             num_node_blocks = ns_info["num_node_blocks"]
             block_size = ns_info["block_size"]
+        elif "num_node_groups" in ns_info:
+            # For backward compatibility. `num_node_blocks` was once called `num_node_groups`
+            # and `block_size` was termed `group_size`
+            num_node_blocks = ns_info["num_node_groups"]
+            block_size = ns_info["group_size"]
         else:
             assert "num_nodes" in ns_info
             num_node_blocks = ns_info["num_nodes"]
