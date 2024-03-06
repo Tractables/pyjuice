@@ -1006,7 +1006,7 @@ class SumLayer(Layer, nn.Module):
         return None
 
     @staticmethod
-    @torch.compile(mode = "reduce-overhead", fullgraph = True)
+    @torch.compile
     def _forward_pytorch_kernel(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor, 
                                 nids: torch.Tensor, cids: torch.Tensor, pids: torch.Tensor,
                                 local_ids: torch.Tensor):
@@ -2487,7 +2487,7 @@ class SumLayer(Layer, nn.Module):
                 nids, cids, pids, pfids, self.block_size
             )
 
-    @torch.compile(mode = "reduce-overhead")
+    @torch.compile
     def _backward_pytorch_ele_kernel(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
                                      params: torch.Tensor, node_mars: torch.Tensor, 
                                      element_mars: torch.Tensor, param_flows: Optional[torch.Tensor], 
@@ -2511,7 +2511,7 @@ class SumLayer(Layer, nn.Module):
 
         return None
 
-    @torch.compile(mode = "reduce-overhead")
+    @torch.compile
     def _backward_pytorch_par_kernel(self, node_flows: torch.Tensor, params: torch.Tensor, node_mars: torch.Tensor, 
                                      element_mars: torch.Tensor, param_flows: torch.Tensor, nids: torch.Tensor, 
                                      cids: torch.Tensor, pids: torch.Tensor, pfids: torch.Tensor, ns_block_size: int):
