@@ -139,7 +139,11 @@ cd pyjuice
 pip install -e .
 ```
 
-## Example Usage (pre-specified structures)
+## Example Usage 
+
+The best way to get familiar with PyJuice is by referring to our [documentation](https://juice-jl.github.io/pyjuice/) and the [tutorials](https://juice-jl.github.io/pyjuice/getting-started/tutorials/index.html), which provide a gentle introduction to the main functionalities of PyJuice. In the following, we provide some quick start guides to get your first PyJuice program running.
+
+### Train a PC with pre-specified structures
 
 `pyjuice.structures` contains a collection of widely used PC structures. In the following, we use HCLT as an example to demonstrate how to define an HCLT and learn its parameters with the mini-batch EM algorithm.
 
@@ -196,7 +200,7 @@ for batch_start in range(0, num_samples, batch_size):
 
 Here `pseudocount` is the Laplacian regularization hyper-parameter. Alternatively, we can use `pyjuice.optim.CircuitOptimizer` 
 
-## Example Usage (define your own PC)
+### Define your own PC
 
 In the above section, we have learned how to generate a PC with a pre-defined structure and train its parameters with EM. This section delves deeper into the APIs for defining your own PCs.
 
