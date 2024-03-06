@@ -35,7 +35,7 @@ def BayesianTreeToHiddenRegionGraph(tree: nx.Graph,
 
     # Specify block size
     if block_size is None:
-        block_size = min(64, max_cdf_power_of_2(num_latents))
+        block_size = min(1024, max_cdf_power_of_2(num_latents))
 
     num_node_blocks = num_latents // block_size
 
