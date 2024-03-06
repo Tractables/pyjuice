@@ -1,5 +1,6 @@
 import pyjuice.graph
 import pyjuice.nodes
+import pyjuice.distributions
 import pyjuice.layer
 import pyjuice.structures
 import pyjuice.optim
