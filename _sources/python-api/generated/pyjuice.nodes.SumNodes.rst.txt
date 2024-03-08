@@ -17,6 +17,7 @@
       ~SumNodes.gather_parameters
       ~SumNodes.get_params
       ~SumNodes.init_parameters
+      ~SumNodes.num_parameters
       ~SumNodes.set_params
       ~SumNodes.update_param_flows
       ~SumNodes.update_parameters

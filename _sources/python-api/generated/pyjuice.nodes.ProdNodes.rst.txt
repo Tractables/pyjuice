@@ -17,6 +17,7 @@
       ~ProdNodes.init_parameters
       ~ProdNodes.is_block_sparse
       ~ProdNodes.is_sparse
+      ~ProdNodes.num_parameters
    
    
 

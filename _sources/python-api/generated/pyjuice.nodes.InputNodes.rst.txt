@@ -16,6 +16,7 @@
       ~InputNodes.duplicate
       ~InputNodes.get_params
       ~InputNodes.init_parameters
+      ~InputNodes.num_parameters
       ~InputNodes.set_meta_params
       ~InputNodes.set_params
    
