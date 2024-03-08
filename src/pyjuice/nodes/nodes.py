@@ -163,6 +163,24 @@ class CircuitNodes():
                 # We can always retrieve them from the source nodes when required
                 ns._params = None
 
+    def num_parameters(self, count_input_params: bool = False, recursive: bool = True):
+        if recursive:
+            param_count = 0
+            for ns in self:
+                if ns.is_sum() and not ns.is_tied():
+                    param_count += ns.num_edges
+                elif ns.is_input() and count_input_params:
+                    param_count += ns.num_nodes * ns.dist.num_parameters()
+
+            return param_count
+        else:
+            if ns.is_sum() and not ns.is_tied():
+                return ns.num_edges
+            elif ns.is_input() and count_input_params:
+                return ns.num_nodes * ns.dist.num_parameters()
+            else:
+                return 0
+
     def is_tied(self):
         return self._source_node is not None
 
