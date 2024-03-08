@@ -2,14 +2,14 @@
 
 <img align="right" width="160px" src="https://avatars.githubusercontent.com/u/58918144?s=200&v=4">
 
-[![CUDA CI Tests](https://github.com/Juice-jl/pyjuice/actions/workflows/ci_tests.yml/badge.svg?branch=main)](https://github.com/Juice-jl/pyjuice/actions/workflows/ci_tests.yml)
-[![codecov](https://codecov.io/gh/Juice-jl/pyjuice/branch/main/graph/badge.svg?token=XpgPLYa2RQ)](https://codecov.io/gh/Juice-jl/pyjuice)
+[![CUDA CI Tests](https://github.com/Tractables/pyjuice/actions/workflows/ci_tests.yml/badge.svg?branch=main)](https://github.com/Tractables/pyjuice/actions/workflows/ci_tests.yml)
+[![codecov](https://codecov.io/gh/Tractables/pyjuice/branch/main/graph/badge.svg?token=XpgPLYa2RQ)](https://codecov.io/gh/Tractables/pyjuice)
 
-PyJuice is a library for [Probabilistic Circuits](https://starai.cs.ucla.edu/papers/ProbCirc20.pdf) (PCs) written in [PyTorch](https://github.com/pytorch/pytorch). It has code for inference (e.g., marginals, sampling) and learning (e.g., EM, pruning) in PCs, which can be either [defined by hand](https://github.com/Juice-jl/pyjuice#example-usage-define-your-own-pc) or generated directly [from pre-specified structures](https://github.com/Juice-jl/pyjuice#example-usage-pre-specified-structures) (e.g., [PD](https://arxiv.org/pdf/1202.3732.pdf), [RAT-SPN](https://proceedings.mlr.press/v115/peharz20a/peharz20a.pdf), [HCLT](https://proceedings.neurips.cc/paper_files/paper/2021/file/1d0832c4969f6a4cc8e8a8fffe083efb-Paper.pdf)).
+PyJuice is a library for [Probabilistic Circuits](https://starai.cs.ucla.edu/papers/ProbCirc20.pdf) (PCs) written in [PyTorch](https://github.com/pytorch/pytorch). It has code for inference (e.g., marginals, sampling) and learning (e.g., EM, pruning) in PCs, which can be either [defined by hand](https://github.com/Tractables/pyjuice#define-your-own-pc) or generated directly [from pre-specified structures](https://github.com/Tractables/pyjuice#train-a-pc-with-pre-specified-structures) (e.g., [PD](https://arxiv.org/pdf/1202.3732.pdf), [RAT-SPN](https://proceedings.mlr.press/v115/peharz20a/peharz20a.pdf), [HCLT](https://proceedings.neurips.cc/paper_files/paper/2021/file/1d0832c4969f6a4cc8e8a8fffe083efb-Paper.pdf)).
 
 ## Why PyJuice?
 
-The biggest advantage of PyJuice is its speed and scalability. We benchmark PyJuice against prior PC packages [SPFlow](https://github.com/SPFlow/SPFlow), [EiNet](https://github.com/cambridge-mlg/EinsumNetworks), and [Juice.jl](https://github.com/Juice-jl/ProbabilisticCircuits.jl) on the [PD](https://arxiv.org/pdf/1202.3732.pdf) and [HCLT](https://proceedings.neurips.cc/paper_files/paper/2021/file/1d0832c4969f6a4cc8e8a8fffe083efb-Paper.pdf) structures with various sizes by variating their width. We report the average ($\pm$ standard deviation of 5 runs) runtime (in seconds) per training epoch of 60K samples. All experiments were carried out on an RTX 4090 GPU with 24GB memory. To maximize parallelism, we always use the maximum possible batch size. "OOM" denotes out-of-memory with batch size 2.
+The biggest advantage of PyJuice is its speed and scalability. We benchmark PyJuice against prior PC packages [SPFlow](https://github.com/SPFlow/SPFlow), [EiNet](https://github.com/cambridge-mlg/EinsumNetworks), and [Juice.jl](https://github.com/Tractables/ProbabilisticCircuits.jl) on the [PD](https://arxiv.org/pdf/1202.3732.pdf) and [HCLT](https://proceedings.neurips.cc/paper_files/paper/2021/file/1d0832c4969f6a4cc8e8a8fffe083efb-Paper.pdf) structures with various sizes by variating their width. We report the average ($\pm$ standard deviation of 5 runs) runtime (in seconds) per training epoch of 60K samples. All experiments were carried out on an RTX 4090 GPU with 24GB memory. To maximize parallelism, we always use the maximum possible batch size. "OOM" denotes out-of-memory with batch size 2.
 
 <table>
   <tr>
@@ -49,7 +49,7 @@ The biggest advantage of PyJuice is its speed and scalability. We benchmark PyJu
     <td>OOM</td>
   </tr>
   <tr>
-    <td><b><a href="https://github.com/Juice-jl/ProbabilisticCircuits.jl">Juice.jl</a></b></td>
+    <td><b><a href="https://github.com/Tractables/ProbabilisticCircuits.jl">Juice.jl</a></b></td>
     <td>$12.6_{\pm0.5}$</td>
     <td>$37.0_{\pm1.7}$</td>
     <td>$141.7_{\pm6.9}$</td>
@@ -104,7 +104,7 @@ The biggest advantage of PyJuice is its speed and scalability. We benchmark PyJu
     <td>$5654.3_{\pm17.4}$</td>
   </tr>
   <tr>
-    <td><b><a href="https://github.com/Juice-jl/ProbabilisticCircuits.jl">Juice.jl</a></b></td>
+    <td><b><a href="https://github.com/Tractables/ProbabilisticCircuits.jl">Juice.jl</a></b></td>
     <td>$4.7_{\pm0.2}$</td>
     <td>$6.4_{\pm0.5}$</td>
     <td>$12.4_{\pm1.3}$</td>
@@ -134,12 +134,16 @@ pip install pyjuice
 Alternatively, you can install PyJuice from source by running the following commands:
 
 ```bash
-git clone git@github.com:Juice-jl/pyjuice.git
+git clone git@github.com:Tractables/pyjuice.git
 cd pyjuice
 pip install -e .
 ```
 
-## Example Usage (pre-specified structures)
+## Example Usage 
+
+The best way to get familiar with PyJuice is by referring to our [documentation](https://Tractables.github.io/pyjuice/) and the [tutorials](https://Tractables.github.io/pyjuice/getting-started/tutorials/index.html), which provide a gentle introduction to the main functionalities of PyJuice. In the following, we provide some quick start guides to get your first PyJuice program running.
+
+### Train a PC with pre-specified structures
 
 `pyjuice.structures` contains a collection of widely used PC structures. In the following, we use HCLT as an example to demonstrate how to define an HCLT and learn its parameters with the mini-batch EM algorithm.
 
@@ -196,7 +200,7 @@ for batch_start in range(0, num_samples, batch_size):
 
 Here `pseudocount` is the Laplacian regularization hyper-parameter. Alternatively, we can use `pyjuice.optim.CircuitOptimizer` 
 
-## Example Usage (define your own PC)
+### Define your own PC
 
 In the above section, we have learned how to generate a PC with a pre-defined structure and train its parameters with EM. This section delves deeper into the APIs for defining your own PCs.
 
