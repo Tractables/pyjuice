@@ -13,7 +13,7 @@ from pyjuice.utils import BitSet
 
 
 def RAT_SPN(num_vars: int, num_latents: int, depth: int, num_repetitions: int, num_pieces: int = 2,
-            input_dists: Optional[Distribution] = None,
+            input_dist: Optional[Distribution] = None,
             input_layer_type: Type[Distribution] = Categorical, 
             input_layer_params: dict = {"num_cats": 256},
             block_size: Optional[int] = None):
