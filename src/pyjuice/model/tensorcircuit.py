@@ -28,6 +28,7 @@ def _pc_model_backward_hook(grad, pc, inputs, record_cudagraph, apply_cudagraph,
         flows_memory = pc._optim_hyperparams["flows_memory"],
         record_cudagraph = record_cudagraph,
         apply_cudagraph = apply_cudagraph,
+        propagation_alg = propagation_alg,
         **kwargs
     )
 
@@ -252,6 +253,7 @@ class TensorCircuit(nn.Module):
                     inputs = inputs, 
                     record_cudagraph = record_cudagraph, 
                     apply_cudagraph = apply_cudagraph,
+                    propagation_alg = propagation_alg,
                     **kwargs
                 )
             )
@@ -271,6 +273,7 @@ class TensorCircuit(nn.Module):
                  record_cudagraph: bool = False, 
                  apply_cudagraph: bool = True,
                  allow_modify_flows: bool = True,
+                 propagation_alg: str = "LL",
                  **kwargs):
         """
         Backward evaluation of the PC that computes node flows as well as parameter flows.
@@ -345,7 +348,7 @@ class TensorCircuit(nn.Module):
                         # Backward sum layer
                         layer_group.backward(self.node_flows, self.element_flows, self.node_mars, self.element_mars, self.params, 
                                              param_flows = self.param_flows if compute_param_flows else None,
-                                             allow_modify_flows = allow_modify_flows)
+                                             allow_modify_flows = allow_modify_flows, propagation_alg = propagation_alg, **kwargs)
 
                     else:
                         raise ValueError(f"Unknown layer type {type(layer)}.")

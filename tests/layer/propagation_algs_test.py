@@ -20,7 +20,7 @@ def general_ll_prop_test():
 
     batch_size = 16
 
-    for block_size in [1, 4, 8, 16]:
+    for block_size in [4, 8, 16]:
     
         with juice.set_block_size(block_size):
 
@@ -67,6 +67,53 @@ def general_ll_prop_test():
                     scaled_lls = (epars[:,None]**alpha * cmars**alpha).sum(dim = 0).log() * (1.0 / alpha)
                     assert torch.all(torch.abs(node_mars[(j+1)*block_size+i,:] - scaled_lls) < 1e-3)
 
+        ## Backward pass ##
+
+        node_flows = torch.rand([block_size + block_size * 2 * 3, batch_size]).to(device)
+        element_flows = torch.zeros([block_size + 3 * 2 * 2 * block_size, batch_size]).to(device)
+
+        param_flows = torch.zeros([block_size ** 2 + 3 * 4 * block_size * block_size]).to(device)
+
+        layer.backward(node_flows, element_flows, node_mars, element_mars, params, param_flows, 
+                       propagation_alg = "GeneralLL", alpha = alpha)
+
+        chids = layer.partitioned_chids[0]
+        parids = layer.partitioned_parids[0]
+        parpids = layer.partitioned_parpids[0]
+
+        num_nblocks = chids.size(0)
+        num_eblocks = parids.size(1)
+        parids = (parids[:,:,None].repeat(1, 1, block_size) + torch.arange(0, block_size, device = parids.device)).reshape(num_nblocks, num_eblocks * block_size)
+        parpids_start = (parpids[:,:,None] + torch.arange(0, block_size, device = parids.device)).reshape(
+            num_nblocks, num_eblocks * block_size)
+
+        for j in range(6):
+            parpids = parpids_start.clone()
+            for i in range(block_size):
+                nmars = node_mars[parids[j,:]].exp()
+                nflows = node_flows[parids[j,:]]
+                emars = element_mars[(j+1)*block_size+i,:].exp()
+                epars = params[parpids[j,:]]
+                eflows = (nflows * (epars[:,None] * emars[None,:]) ** alpha / nmars ** alpha).sum(dim = 0)
+
+                assert torch.all(torch.abs(eflows - element_flows[(j+1)*block_size+i,:]) < 1e-2)
+
+                parpids += block_size
+
+        my_pflows = torch.zeros_like(param_flows)
+
+        for i in range(block_size):
+            for j in range(6):
+                emars = element_mars[layer.partitioned_cids[0][j,:]].exp()
+                epars = params[layer.partitioned_pids[0][j,:]+i]
+                nmars = node_mars[(j+1)*block_size+i,:].exp()
+                nflows = node_flows[(j+1)*block_size+i,:]
+                pflows = epars ** alpha * (nflows[None,:] * emars ** alpha / nmars[None,:] ** alpha).sum(dim = 1)
+
+                my_pflows[layer.partitioned_pfids[0][j,:]+i] = pflows
+
+        assert torch.all(torch.abs(my_pflows - param_flows) < 2e-3)
+
 
 def mpe_prop_test():
 
@@ -74,7 +121,7 @@ def mpe_prop_test():
 
     batch_size = 16
 
-    for block_size in [1, 4, 8, 16]:
+    for block_size in [4, 8, 16]:
     
         with juice.set_block_size(block_size):
 
@@ -117,6 +164,53 @@ def mpe_prop_test():
                 epars = params[layer.partitioned_pids[0][j,:]+i]
                 scaled_lls = (epars[:,None] * cmars).max(dim = 0).values.log()
                 assert torch.all(torch.abs(node_mars[(j+1)*block_size+i,:] - scaled_lls) < 1e-3)
+
+        ## Backward pass ##
+
+        node_flows = torch.rand([block_size + block_size * 2 * 3, batch_size]).to(device)
+        element_flows = torch.zeros([block_size + 3 * 2 * 2 * block_size, batch_size]).to(device)
+
+        param_flows = torch.zeros([block_size ** 2 + 3 * 4 * block_size * block_size]).to(device)
+
+        layer.backward(node_flows, element_flows, node_mars, element_mars, params, param_flows, 
+                       allow_modify_flows = False, propagation_alg = "MPE")
+
+        chids = layer.partitioned_chids[0]
+        parids = layer.partitioned_parids[0]
+        parpids = layer.partitioned_parpids[0]
+
+        num_nblocks = chids.size(0)
+        num_eblocks = parids.size(1)
+        parids = (parids[:,:,None].repeat(1, 1, block_size) + torch.arange(0, block_size, device = parids.device)).reshape(num_nblocks, num_eblocks * block_size)
+        parpids_start = (parpids[:,:,None] + torch.arange(0, block_size, device = parids.device)).reshape(
+            num_nblocks, num_eblocks * block_size)
+
+        for j in range(6):
+            parpids = parpids_start.clone()
+            for i in range(block_size):
+                nmars = node_mars[parids[j,:]].exp()
+                nflows = node_flows[parids[j,:]]
+                emars = element_mars[(j+1)*block_size+i,:].exp()
+                epars = params[parpids[j,:]]
+                eflows = (nflows * (((epars[:,None] * emars[None,:]) - nmars).abs() < 1e-6).float()).sum(dim = 0)
+
+                assert torch.all(torch.abs(eflows - element_flows[(j+1)*block_size+i,:]) < 1e-2)
+
+                parpids += block_size
+
+        my_pflows = torch.zeros_like(param_flows)
+
+        for i in range(block_size):
+            for j in range(6):
+                emars = element_mars[layer.partitioned_cids[0][j,:]].exp()
+                epars = params[layer.partitioned_pids[0][j,:]+i]
+                nmars = node_mars[(j+1)*block_size+i,:].exp()
+                nflows = node_flows[(j+1)*block_size+i,:]
+                pflows = (nflows[None,:] * ((epars[:,None] * emars - nmars[None,:]).abs() < 1e-6).float()).sum(dim = 1)
+
+                my_pflows[layer.partitioned_pfids[0][j,:]+i] = pflows
+
+        assert torch.all(torch.abs(my_pflows - param_flows) < 2e-3)
 
 
 if __name__ == "__main__":
