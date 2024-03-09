@@ -902,7 +902,7 @@ class SumLayer(Layer, nn.Module):
     @FastJITFunction
     def _fw_triton_sparse_kernel(node_mars, element_mars, params, nids, cids, pids,
                                  local_ids, batch_size, partial_eval: tl.constexpr, num_edges: tl.constexpr, 
-                                 BLOCK_B: tl.constexpr, BLOCK_SIZE_M: tl.constexpr):
+                                 BLOCK_B: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, propagation_alg_id: tl.constexpr, alpha = 0.0):
         
         pid_b = tl.program_id(axis = 0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(axis = 1) # ID of size-`BLOCK_SIZE_M` nodes
@@ -930,9 +930,15 @@ class SumLayer(Layer, nn.Module):
             offs_batch[None,:]
         emars = tl.load(emars_ptr, mask = mask_batch[None,:]) # [num_edges, BLOCK_B]
 
-        # Compute max and subtract
-        emars_max = tl.max(emars, axis = 0)
-        emars = tl.exp(emars - emars_max[None,:])
+        # Compute max and subtract (only when using LL or GeneralLL propagation method)
+        if propagation_alg_id == 0:
+            emars_max = tl.max(emars, axis = 0)
+            emars = tl.exp(emars - emars_max[None,:])
+        
+        if propagation_alg_id == 2:
+            emars_max = tl.max(emars, axis = 0)
+            emars = tl.exp((emars - emars_max[None,:]) * alpha)
+            emars_max *= alpha
 
         # Initialize pointers to `node_mars`
         off_nids = tl.load(nids + nblock_id)
@@ -944,7 +950,16 @@ class SumLayer(Layer, nn.Module):
         for i in range(0, BLOCK_SIZE_M):
             epars = tl.load(epars_ptr)
 
-            nmars = tl.log(tl.sum(emars * epars[:,None], axis = 0)) + emars_max
+            if propagation_alg_id == 0:
+                nmars = tl.log(tl.sum(emars * epars[:,None], axis = 0)) + emars_max
+
+            if propagation_alg_id == 1:
+                nmars = tl.max(emars + tl.log(epars)[:,None], axis = 0)
+
+            if propagation_alg_id == 2:
+                epars = tl.exp(tl.log(epars) * alpha)
+
+                nmars = (tl.log(tl.sum(emars * epars[:,None], axis = 0)) + emars_max) * (1.0 / alpha)
 
             tl.store(nmars_ptr, nmars, mask = mask_batch)
 
@@ -957,10 +972,9 @@ class SumLayer(Layer, nn.Module):
     @staticmethod
     # @triton.jit
     @FastJITFunction
-    def _fw_triton_large_sparse_kernel(node_mars, element_mars, params, nids, cids, pids,
-                                       local_ids, batch_size, num_nodes, pid_m_offset, partial_eval: tl.constexpr, num_edges: tl.constexpr, 
-                                       BLOCK_B: tl.constexpr, TILE_SIZE_M: tl.constexpr, 
-                                       BLOCK_SIZE_M: tl.constexpr):
+    def _fw_triton_large_sparse_kernel(node_mars, element_mars, params, nids, cids, pids, local_ids, batch_size, 
+                                       num_nodes, pid_m_offset, partial_eval: tl.constexpr, num_edges: tl.constexpr, BLOCK_B: tl.constexpr, 
+                                       TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, propagation_alg_id: tl.constexpr, alpha = 0.0):
 
         pid_b = tl.program_id(axis = 0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(axis = 1) + pid_m_offset # ID of size-`TILE_SIZE_M` nodes
@@ -992,10 +1006,27 @@ class SumLayer(Layer, nn.Module):
             offs_batch[None,None,:] # [TILE_SIZE_M, num_edges, BLOCK_B]
         emars = tl.load(emars_ptr, mask = (mask_m[:,None,None] & mask_batch[None,None,:]), other = 0.0) # [TILE_SIZE_M, num_edges, BLOCK_B]
 
-        # Compute max and subtract
-        emars_max = tl.max(emars, axis = 1)
-        emars = tl.exp(emars - emars_max[:,None,:])
-        nmars = tl.log(tl.sum(emars * epars[:,:,None], axis = 1)) + emars_max
+        # Compute max and subtract (only when using LL or GeneralLL propagation method)
+        if propagation_alg_id == 0:
+            emars_max = tl.max(emars, axis = 1)
+            emars = tl.exp(emars - emars_max[:,None,:])
+
+        if propagation_alg_id == 2:
+            emars_max = tl.max(emars, axis = 1)
+            emars = tl.exp((emars - emars_max[:,None,:]) * alpha)
+            emars_max *= alpha
+
+        # Compute sum node marginals
+        if propagation_alg_id == 0:
+            nmars = tl.log(tl.sum(emars * epars[:,:,None], axis = 1)) + emars_max
+
+        if propagation_alg_id == 1:
+            nmars = tl.max(emars + tl.log(epars)[:,:,None], axis = 1)
+
+        if propagation_alg_id == 2:
+            epars = tl.exp(tl.log(epars) * alpha)
+
+            nmars = (tl.log(tl.sum(emars * epars[:,:,None], axis = 1)) + emars_max) * (1.0 / alpha)
 
         # Initialize pointers to `node_mars`
         off_nids = tl.load(nids + nblock_ids) # [TILE_SIZE_M]
@@ -1008,7 +1039,7 @@ class SumLayer(Layer, nn.Module):
     def _forward_sparse(self, node_mars: torch.Tensor, element_mars: torch.Tensor,
                         params: torch.Tensor, nids: torch.Tensor, cids: torch.Tensor,
                         pids: torch.Tensor, local_ids: Optional[torch.Tensor] = None,
-                        partition_id: int = -1) -> None:
+                        partition_id: int = -1, propagation_alg: str = "LL", **kwargs) -> None:
         """
         Forward pass of sum layers with the sparse processing kernel.
         
@@ -1027,7 +1058,9 @@ class SumLayer(Layer, nn.Module):
         batch_size = node_mars.size(1)
         BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
 
-        # assert num_edges <= 16384, "The sparse forward kernel only support nodes with # edges smaller than 16384."
+        # Propagation algorithm
+        propagation_alg_id = self.propagation_alg_mapping[propagation_alg]
+        propagation_alg_kwargs = self._get_propagation_alg_kwargs(propagation_alg, **kwargs)
 
         if triton.cdiv(layer_n_nodes, self.block_size) <= 2048:
             BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
@@ -1049,7 +1082,9 @@ class SumLayer(Layer, nn.Module):
                 partial_eval = partial_eval, 
                 num_edges = num_edges, 
                 BLOCK_B = BLOCK_B, 
-                BLOCK_SIZE_M = BLOCK_SIZE_M
+                BLOCK_SIZE_M = BLOCK_SIZE_M,
+                propagation_alg_id = propagation_alg_id,
+                **propagation_alg_kwargs
             )
 
         else:
@@ -1077,7 +1112,9 @@ class SumLayer(Layer, nn.Module):
                     num_edges = num_edges,
                     BLOCK_B = BLOCK_B,
                     TILE_SIZE_M = TILE_SIZE_M,
-                    BLOCK_SIZE_M = BLOCK_SIZE_M
+                    BLOCK_SIZE_M = BLOCK_SIZE_M,
+                    propagation_alg_id = propagation_alg_id,
+                    **propagation_alg_kwargs
                 )
             else:
                 for pid_m_start in range(0, grid[1], 32768):
@@ -1100,7 +1137,9 @@ class SumLayer(Layer, nn.Module):
                         num_edges = num_edges,
                         BLOCK_B = BLOCK_B,
                         TILE_SIZE_M = TILE_SIZE_M,
-                        BLOCK_SIZE_M = BLOCK_SIZE_M
+                        BLOCK_SIZE_M = BLOCK_SIZE_M,
+                        propagation_alg_id = propagation_alg_id,
+                        **propagation_alg_kwargs
                     )
 
         return None

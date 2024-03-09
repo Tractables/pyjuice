@@ -20,7 +20,7 @@ def general_ll_prop_test():
 
     batch_size = 16
 
-    for block_size in [4, 8, 16]:
+    for block_size in [1, 4, 8, 16]:
     
         with juice.set_block_size(block_size):
 
@@ -74,7 +74,7 @@ def mpe_prop_test():
 
     batch_size = 16
 
-    for block_size in [4, 8, 16]:
+    for block_size in [1, 4, 8, 16]:
     
         with juice.set_block_size(block_size):
 
