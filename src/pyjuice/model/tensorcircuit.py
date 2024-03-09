@@ -101,6 +101,10 @@ class TensorCircuit(nn.Module):
         # CudaGraph options
         self._recorded_cuda_graphs = dict()
 
+        # Mode for forward and backward pass
+        self.default_propagation_alg = "LL" # Could be "LL", "MPE", or "GeneralLL"
+        self.propagation_alg_kwargs = dict()
+
     def to(self, device):
         super(TensorCircuit, self).to(device)
 
@@ -115,10 +119,26 @@ class TensorCircuit(nn.Module):
         self.par_update_kwargs = par_update_to_device(self.par_update_kwargs, device)
 
         return self
+
+    def set_propagation_alg(self, propagation_alg: str, **kwargs):
+        if propagation_alg == "LL":
+            self.default_propagation_alg = "LL"
+            self.propagation_alg_kwargs.clear()
+        elif propagation_alg == "MPE":
+            self.default_propagation_alg = "MPE"
+            self.propagation_alg_kwargs.clear()
+        elif propagation_alg == "GeneralLL":
+            assert "alpha" in kwargs, "Argument `alpha` should be provided for the `GeneralLL` propagation algorithm."
+            self.default_propagation_alg = "GeneralLL"
+            self.propagation_alg_kwargs.clear()
+            self.propagation_alg_kwargs["alpha"] = kwargs["alpha"]
+        else:
+            raise NotImplementedError(f"Unknown propagation algorithm {propagation_alg}.")
         
     def forward(self, inputs: torch.Tensor, input_layer_fn: Optional[Union[str,Callable]] = None,
                 cache: Optional[dict] = None, return_cache: bool = False, record_cudagraph: bool = False, 
-                apply_cudagraph: bool = True, force_use_fp16: bool = False, force_use_fp32: bool = False, **kwargs):
+                apply_cudagraph: bool = True, force_use_fp16: bool = False, force_use_fp32: bool = False, 
+                propagation_alg: Optional[str] = None, **kwargs):
         """
         Forward evaluation of the PC.
 
@@ -135,6 +155,11 @@ class TensorCircuit(nn.Module):
             assert inputs.dim() == 2 and inputs.size(1) == self.num_vars
 
             inputs = inputs.permute(1, 0)
+
+        # Set propagation algorithm
+        if propagation_alg is None:
+            propagation_alg = self.default_propagation_alg
+            kwargs.update(self.propagation_alg_kwargs)
         
         ## Initialize buffers for forward pass ##
 
@@ -173,8 +198,9 @@ class TensorCircuit(nn.Module):
                     elif layer_group.is_sum():
                         # Sum layer
                         layer_group(self.node_mars, self.element_mars, self.params, 
-                                    force_use_fp16 = force_use_fp16, 
-                                    force_use_fp32 = force_use_fp32)
+                                    force_use_fp16 = force_use_fp16,
+                                    force_use_fp32 = force_use_fp32, 
+                                    propagation_alg = propagation_alg, **kwargs)
 
                     else:
                         raise ValueError(f"Unknown layer type {type(layer)}.")
