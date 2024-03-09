@@ -1148,7 +1148,7 @@ class SumLayer(Layer, nn.Module):
     @torch.compile
     def _forward_pytorch_kernel(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor, 
                                 nids: torch.Tensor, cids: torch.Tensor, pids: torch.Tensor,
-                                local_ids: torch.Tensor):
+                                local_ids: torch.Tensor, propagation_alg_id: int, alpha: float = 0.0):
 
         if local_ids is not None:
             nids = nids[local_ids]
@@ -1164,18 +1164,33 @@ class SumLayer(Layer, nn.Module):
             torch.arange(0, self.block_size, device = cids.device)[None,:,None]).reshape(num_nblocks * self.block_size, num_edges)
 
         ch_mars = element_mars[cids]
-        maxval = ch_mars.max(dim = 1, keepdim = True).values
-        node_mars[nids] = (((ch_mars - maxval).exp() * params[pids].unsqueeze(-1)).sum(
-            dim = 1).clamp(min = 1e-10)).log() + maxval.squeeze(1)
+
+        if propagation_alg_id == 0:
+            maxval = ch_mars.max(dim = 1, keepdim = True).values
+            node_mars[nids] = (((ch_mars - maxval).exp() * params[pids].unsqueeze(-1)).sum(
+                dim = 1).clamp(min = 1e-10)).log() + maxval.squeeze(1)
+
+        elif propagation_alg_id == 1:
+            node_mars[nids] = (ch_mars + params[pids].log().unsqueeze(-1)).max(dim = 1).values
+
+        elif propagation_alg_id == 2:
+            maxval = ch_mars.max(dim = 1, keepdim = True).values
+            node_mars[nids] = ((((ch_mars - maxval).exp() * params[pids].unsqueeze(-1)) ** alpha).sum(
+                dim = 1).clamp(min = 1e-10)).log() ** (1.0 / alpha) + maxval.squeeze(1)
 
         return None
 
     def _forward_pytorch(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor, 
                          nids: torch.Tensor, cids: torch.Tensor, pids: torch.Tensor,
-                         local_ids: torch.Tensor):
+                         local_ids: torch.Tensor, propagation_alg: str = "LL", **kwargs):
+
+        # Propagation algorithm
+        propagation_alg_id = self.propagation_alg_mapping[propagation_alg]
+        propagation_alg_kwargs = self._get_propagation_alg_kwargs(propagation_alg, **kwargs)
 
         self._forward_pytorch_kernel(
-            node_mars, element_mars, params, nids, cids, pids, local_ids
+            node_mars, element_mars, params, nids, cids, pids, local_ids,
+            propagation_alg_id = propagation_alg_id, **propagation_alg_kwargs
         )
 
     def _backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
