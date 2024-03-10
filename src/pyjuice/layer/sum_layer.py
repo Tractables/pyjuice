@@ -1954,7 +1954,8 @@ class SumLayer(Layer, nn.Module):
                 nflows = tl.load(nflows_ptr, mask = mask_batch[None,:], other = 0.0) # [TILE_SIZE_M, TILE_SIZE_B]
                 nmars = tl.load(nmars_ptr, mask = mask_batch[None,:], other = 0.0) # [TILE_SIZE_M, TILE_SIZE_B]
 
-                acc += tl.sum(tl.where(tl.abs(elpars[None,:,:] + emars[:,None,:] - tl.trans(nmars)[:,:,None]) < 1e-6, tl.trans(nflows)[:,:,None], 0.0), axis = 0)
+                cond = tl.abs(elpars[:,None,:] + emars[None,:,:] - nmars[:,:,None]) < 1e-6
+                acc += tl.sum(tl.where(cond, nflows[:,:,None], 0.0), axis = 1)
 
             else:
 
@@ -2161,6 +2162,13 @@ class SumLayer(Layer, nn.Module):
             TILE_SIZE_B = min(2048 // remainder, base_size * remainder, BATCH_SIZE_NP2)
         TILE_SIZE_M = min(2048 // TILE_SIZE_B, self.block_size)
         TILE_SIZE_K = min(2048 // TILE_SIZE_B, num_edges)
+        
+        if propagation_alg_id == 1:
+            # The kernel will stale if the tile sizes are too large
+            TILE_SIZE_M = 16
+            TILE_SIZE_K = 16
+            TILE_SIZE_B = 16
+
         B_NUM_TILES = batch_size // TILE_SIZE_B
 
         allow_modify_flows = 1 if allow_modify_flows else 0
