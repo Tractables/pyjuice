@@ -52,8 +52,49 @@ def load_penn_treebank(seq_length = 32):
     return train_data, valid_data, test_data
 
 
+def train(pc, num_epochs, train_loader, valid_loader, device):
+
+    best_valid_ll = -10000.0
+    for epoch in range(1, num_epochs + 1):
+        t0 = time.time()
+        train_ll = 0.0
+        for batch in train_loader:
+            x = batch[0].to(device)
+
+            lls = pc(x, propagation_alg = "GeneralLL", alpha = 1.2)
+            lls.mean().backward()
+
+            train_ll += lls.mean().detach().cpu().numpy().item()
+
+        train_ll /= len(train_loader)
+
+        pc.mini_batch_em(step_size = 1.0, pseudocount = 0.01)
+
+        t1 = time.time()
+
+        with torch.no_grad():
+            valid_ll = 0.0
+            for batch in valid_loader:
+                x = batch[0].to(device)
+
+                lls = pc(x, propagation_alg = "LL")
+
+                valid_ll += lls.mean().detach().cpu().numpy().item()
+
+            valid_ll /= len(valid_loader)
+
+        t2 = time.time()
+
+        print(f"[epoch {epoch:3d}][train LL: {train_ll:.2f}; valid LL: {valid_ll:.2f}].....[train forward+backward+step {t1-t0:.2f}; test forward {t2-t1:.2f}]")
+
+        if valid_ll > best_valid_ll:
+            best_valid_ll = valid_ll
+
+    return best_valid_ll
+
+
 @pytest.mark.slow
-def test_hmm_viterbi():
+def test_hmm_general_ll():
     
     device = torch.device("cuda:0")
 
@@ -89,44 +130,52 @@ def test_hmm_viterbi():
     pc = juice.compile(root_ns)
     pc.to(device)
 
-    best_valid_ll = -10000.0
-    for epoch in range(1, 40 + 1):
-        t0 = time.time()
-        train_ll = 0.0
-        for batch in train_loader:
-            x = batch[0].to(device)
-
-            lls = pc(x, propagation_alg = "GeneralLL", alpha = 1.2)
-            lls.mean().backward()
-
-            train_ll += lls.mean().detach().cpu().numpy().item()
-
-        train_ll /= len(train_loader)
-
-        pc.mini_batch_em(step_size = 1.0, pseudocount = 0.01)
-
-        t1 = time.time()
-
-        with torch.no_grad():
-            valid_ll = 0.0
-            for batch in valid_loader:
-                x = batch[0].to(device)
-
-                lls = pc(x, propagation_alg = "LL")
-
-                valid_ll += lls.mean().detach().cpu().numpy().item()
-
-            valid_ll /= len(valid_loader)
-
-        t2 = time.time()
-
-        print(f"[epoch {epoch:3d}][train LL: {train_ll:.2f}; valid LL: {valid_ll:.2f}].....[train forward+backward+step {t1-t0:.2f}; test forward {t2-t1:.2f}]")
-
-        if valid_ll > best_valid_ll:
-            best_valid_ll = valid_ll
+    best_valid_ll = train(pc, 40, train_loader, valid_loader, device)
 
     assert best_valid_ll > -85.0
 
 
+def test_hmm_general_ll_fast():
+    
+    device = torch.device("cuda:0")
+
+    seq_length = 32
+
+    train_data, valid_data, test_data = load_penn_treebank(seq_length = seq_length)
+
+    vocab_size = train_data.max().item() + 1
+
+    train_loader = DataLoader(
+        dataset = TensorDataset(train_data),
+        batch_size = 512,
+        shuffle = True,
+        drop_last = True
+    )
+    valid_loader = DataLoader(
+        dataset = TensorDataset(valid_data),
+        batch_size = 512,
+        shuffle = False,
+        drop_last = True
+    )
+
+    print(f"> Number of training samples: {train_data.size(0)}")
+    print(f"> Number of validation samples: {valid_data.size(0)}")
+
+    root_ns = juice.structures.HMM(
+        seq_length = seq_length,
+        num_latents = 64,
+        num_emits = vocab_size,
+        homogeneous = True
+    )
+
+    pc = juice.compile(root_ns)
+    pc.to(device)
+
+    best_valid_ll = train(pc, 10, train_loader, valid_loader, device)
+
+    assert best_valid_ll > -92.0
+
+
 if __name__ == "__main__":
-    test_hmm_viterbi()
+    test_hmm_general_ll()
+    test_hmm_general_ll_fast()
