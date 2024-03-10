@@ -22,8 +22,8 @@ def PD(data_shape: Tuple, num_latents: int,
        structure_type: str = "sum_dominated",
        input_layer_fn: Optional[Callable] = None,
        input_dist: Optional[Distribution] = None,
-       input_layer_type: Type[Distribution] = Categorical, 
-       input_layer_params: Dict = {"num_cats": 256},
+       input_node_type: Type[Distribution] = Categorical, 
+       input_node_params: Dict = {"num_cats": 256},
        use_linear_mixing: bool = False,
        block_size: Optional[int] = None):
     """
@@ -124,7 +124,7 @@ def PD(data_shape: Tuple, num_latents: int,
         else:
             input_nodes = []
             for var in scope:
-                ns = inputs(var, num_node_blocks = num_node_blocks, dist = input_layer_type(**input_layer_params))
+                ns = inputs(var, num_node_blocks = num_node_blocks, dist = input_node_type(**input_node_params))
                 input_nodes.append(ns)
 
             edge_ids = torch.arange(0, num_node_blocks)[None,:].repeat(2, 1)
@@ -194,21 +194,25 @@ def PDHCLT(data: torch.Tensor, data_shape: Tuple, num_latents: int,
            max_split_depth: Optional[int] = None,
            max_prod_block_conns: int = 4,
            structure_type: str = "sum_dominated",
-           input_layer_type: Type[Distribution] = Categorical, 
-           input_layer_params: Dict = {"num_cats": 256},
+           input_dist: Optional[Distribution] = None,
+           input_node_type: Type[Distribution] = Categorical, 
+           input_node_params: Dict = {"num_cats": 256},
            hclt_kwargs: Dict = {"num_bins": 32, "sigma": 0.5 / 32, "chunk_size": 32},
            block_size: Optional[int] = None):
 
     assert data.dim() == 2
     assert data.size(1) == reduce(lambda x, y: x * y, data_shape)
 
+    if input_dist is not None:
+        input_node_type, input_node_params = input_dist._get_constructor()
+
     def input_layer_fn(scope, num_latents, block_size):
         vars = torch.tensor(scope.to_list()).sort().values
         ns = HCLT(
             x = data[:,vars], 
             num_latents = num_latents, 
-            input_layer_type = input_layer_type,
-            input_layer_params = input_layer_params,
+            input_node_type = input_node_type,
+            input_node_params = input_node_params,
             num_root_ns = num_latents,
             block_size = block_size,
             **hclt_kwargs
@@ -224,7 +228,7 @@ def PDHCLT(data: torch.Tensor, data_shape: Tuple, num_latents: int,
             split_intervals = split_intervals, split_points = split_points,
             max_split_depth = max_split_depth, max_prod_block_conns = max_prod_block_conns,
             structure_type = structure_type, input_layer_fn = input_layer_fn,
-            input_layer_type = input_layer_type, input_layer_params = input_layer_params,
+            input_node_type = input_node_type, input_node_params = input_node_params,
             block_size = block_size)
 
     if ns.num_node_blocks > 1:

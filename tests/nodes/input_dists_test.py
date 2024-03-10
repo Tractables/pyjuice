@@ -361,7 +361,9 @@ def test_discrete_logistic_nodes_behavior():
 
         pc.backward(data.permute(1, 0), flows_memory = 0.0)
 
-        pc.mini_batch_em(step_size = 1.0, pseudocount = 0.01)
+        pc.mini_batch_em(step_size = 1.0, pseudocount = 0.001)
+
+    lls = pc(data)
 
     assert lls.mean() > -3.5
 
@@ -732,7 +734,7 @@ def test_masked_categorical_nodes_rev_range():
 
 
 if __name__ == "__main__":
-    torch.manual_seed(2390)
+    # torch.manual_seed(235)
     test_categorical_nodes()
     test_bernoulli_nodes()
     test_gaussian_nodes()

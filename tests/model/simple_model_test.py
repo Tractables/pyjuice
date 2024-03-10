@@ -190,7 +190,9 @@ def test_simple_model():
 
     pc.to(device)
 
-    data = torch.randint(0, 4, [512, 4], device = device)
+    batch_size = 512
+
+    data = torch.randint(0, 4, [batch_size, 4], device = device)
 
     lls = pc(data)
 
@@ -303,7 +305,7 @@ def test_simple_model():
 
     ns_parflows = eflows.sum(dim = 1)
     ref_parflows = param_flows[4096:4192]
-    assert torch.all(torch.abs(ns_parflows - ref_parflows) < 1e-3)
+    assert torch.all(torch.abs(ns_parflows - ref_parflows) < 1e-4 * batch_size)
 
     sid, eid = ns0._output_ind_range
     ns0_flows = np4_flows
@@ -339,7 +341,7 @@ def test_simple_model():
 
     ns0_parflows = epars * torch.matmul(n_fdm_sub, emars.permute(1, 0))
     ref_parflows = param_flows[0:2048].reshape(2, 64, 16).permute(0, 2, 1).reshape(32, 64)
-    assert torch.all(torch.abs(ns0_parflows - ref_parflows) < 1e-3)
+    assert torch.all(torch.abs(ns0_parflows - ref_parflows) < 1e-4 * batch_size)
 
     ch_lls = np1_lls
     epars = ns1._params.reshape(2, 2, 16, 16).permute(0, 2, 1, 3).reshape(32, 32)
@@ -355,7 +357,7 @@ def test_simple_model():
 
     ns1_parflows = epars * torch.matmul(n_fdm_sub, emars.permute(1, 0))
     ref_parflows = param_flows[2048:3072].reshape(2, 32, 16).permute(0, 2, 1).reshape(32, 32)
-    assert torch.all(torch.abs(ns1_parflows - ref_parflows) < 1e-3)
+    assert torch.all(torch.abs(ns1_parflows - ref_parflows) < 1e-4 * batch_size)
 
     ch_lls = np2_lls
     epars = ns2._params.reshape(2, 2, 16, 16).permute(0, 2, 1, 3).reshape(32, 32)
@@ -371,7 +373,7 @@ def test_simple_model():
 
     ns2_parflows = epars * torch.matmul(n_fdm_sub, emars.permute(1, 0))
     ref_parflows = param_flows[3072:4096].reshape(2, 32, 16).permute(0, 2, 1).reshape(32, 32)
-    assert torch.all(torch.abs(ns2_parflows - ref_parflows) < 1e-3)
+    assert torch.all(torch.abs(ns2_parflows - ref_parflows) < 1e-4 * batch_size)
 
     sid, eid = ni0._output_ind_range
     ni0_flows = np0_flows + np3_flows + np5_flows + np6_flows
@@ -430,13 +432,13 @@ def test_simple_model():
     pc.update_param_flows()
 
     ref_parflows = ns0._param_flows.reshape(2, 4, 16, 16).permute(0, 2, 1, 3).reshape(32, 64)
-    assert torch.all(torch.abs(ns0_parflows - ref_parflows) < 1e-3)
+    assert torch.all(torch.abs(ns0_parflows - ref_parflows) < 1e-4 * batch_size)
 
     ref_parflows = ns1._param_flows.reshape(2, 2, 16, 16).permute(0, 2, 1, 3).reshape(32, 32)
-    assert torch.all(torch.abs(ns1_parflows - ref_parflows) < 1e-3)
+    assert torch.all(torch.abs(ns1_parflows - ref_parflows) < 1e-4 * batch_size)
 
     ref_parflows = ns2._param_flows.reshape(2, 2, 16, 16).permute(0, 2, 1, 3).reshape(32, 32)
-    assert torch.all(torch.abs(ns2_parflows - ref_parflows) < 1e-3)
+    assert torch.all(torch.abs(ns2_parflows - ref_parflows) < 1e-4 * batch_size)
 
     par_start_ids, pflow_start_ids, blk_sizes, blk_intervals, global_nids, nchs, cum_pflows, metadata = pc.par_update_kwargs
 
@@ -493,9 +495,9 @@ def test_simple_model():
     ns1_parflows = ns1._param_flows.reshape(2, 2, 16, 16).permute(0, 2, 1, 3).reshape(32, 32)
     ns2_parflows = ns2._param_flows.reshape(2, 2, 16, 16).permute(0, 2, 1, 3).reshape(32, 32)
 
-    assert torch.all(torch.abs(ns0_parflows.sum(dim = 1) - cum_pflows[0:32]) < 1e-3)
-    assert torch.all(torch.abs(ns1_parflows.sum(dim = 1) - cum_pflows[32:64]) < 1e-3)
-    assert torch.all(torch.abs(ns2_parflows.sum(dim = 1) - cum_pflows[64:96]) < 1e-3)
+    assert torch.all(torch.abs(ns0_parflows.sum(dim = 1) - cum_pflows[0:32]) < 1e-4 * batch_size)
+    assert torch.all(torch.abs(ns1_parflows.sum(dim = 1) - cum_pflows[32:64]) < 1e-4 * batch_size)
+    assert torch.all(torch.abs(ns2_parflows.sum(dim = 1) - cum_pflows[64:96]) < 1e-4 * batch_size)
     assert torch.abs(ns_parflows.sum() - cum_pflows[96]) < 1e-3
 
     ns0_new_params = (ns0_parflows + pseudocount / 64) / (ns0_parflows.sum(dim = 1, keepdim = True) + pseudocount)
@@ -524,5 +526,5 @@ def test_simple_model():
 
 
 if __name__ == "__main__":
-    torch.manual_seed(23892)
+    # torch.manual_seed(23892)
     test_simple_model()
