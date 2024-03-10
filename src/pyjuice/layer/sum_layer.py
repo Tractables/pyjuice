@@ -1077,25 +1077,22 @@ class SumLayer(Layer, nn.Module):
 
             grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, BLOCK_SIZE_M))
 
-            try:
-                self._fw_triton_sparse_kernel[grid](
-                    node_mars = node_mars, 
-                    element_mars = element_mars, 
-                    params = params, 
-                    nids = nids, 
-                    cids = cids,
-                    pids = pids,
-                    local_ids = local_ids, 
-                    batch_size = batch_size, 
-                    partial_eval = partial_eval, 
-                    num_edges = num_edges, 
-                    BLOCK_B = BLOCK_B, 
-                    BLOCK_SIZE_M = BLOCK_SIZE_M,
-                    propagation_alg_id = propagation_alg_id,
-                    **propagation_alg_kwargs
-                )
-            except TypeError:
-                import pdb; pdb.set_trace()
+            self._fw_triton_sparse_kernel[grid](
+                node_mars = node_mars, 
+                element_mars = element_mars, 
+                params = params, 
+                nids = nids, 
+                cids = cids,
+                pids = pids,
+                local_ids = local_ids, 
+                batch_size = batch_size, 
+                partial_eval = partial_eval, 
+                num_edges = num_edges, 
+                BLOCK_B = BLOCK_B, 
+                BLOCK_SIZE_M = BLOCK_SIZE_M,
+                propagation_alg_id = propagation_alg_id,
+                **propagation_alg_kwargs
+            )
 
         else:
             BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
@@ -2165,9 +2162,9 @@ class SumLayer(Layer, nn.Module):
         
         if propagation_alg_id == 1:
             # The kernel will stall if the tile sizes are too large
-            TILE_SIZE_M = 16
-            TILE_SIZE_K = 16
-            TILE_SIZE_B = 16
+            TILE_SIZE_M = min(TILE_SIZE_M, 16)
+            TILE_SIZE_K = min(TILE_SIZE_K, 16)
+            TILE_SIZE_B = min(TILE_SIZE_B, 16)
 
         B_NUM_TILES = batch_size // TILE_SIZE_B
 
@@ -2230,6 +2227,8 @@ class SumLayer(Layer, nn.Module):
                 propagation_alg_id = propagation_alg_id,
                 **propagation_alg_kwargs
             )
+
+        return None
 
     def _backward_sparse(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
                          params: torch.Tensor, node_mars: torch.Tensor, 
