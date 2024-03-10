@@ -1077,22 +1077,25 @@ class SumLayer(Layer, nn.Module):
 
             grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, BLOCK_SIZE_M))
 
-            self._fw_triton_sparse_kernel[grid](
-                node_mars = node_mars, 
-                element_mars = element_mars, 
-                params = params, 
-                nids = nids, 
-                cids = cids,
-                pids = pids,
-                local_ids = local_ids, 
-                batch_size = batch_size, 
-                partial_eval = partial_eval, 
-                num_edges = num_edges, 
-                BLOCK_B = BLOCK_B, 
-                BLOCK_SIZE_M = BLOCK_SIZE_M,
-                propagation_alg_id = propagation_alg_id,
-                **propagation_alg_kwargs
-            )
+            try:
+                self._fw_triton_sparse_kernel[grid](
+                    node_mars = node_mars, 
+                    element_mars = element_mars, 
+                    params = params, 
+                    nids = nids, 
+                    cids = cids,
+                    pids = pids,
+                    local_ids = local_ids, 
+                    batch_size = batch_size, 
+                    partial_eval = partial_eval, 
+                    num_edges = num_edges, 
+                    BLOCK_B = BLOCK_B, 
+                    BLOCK_SIZE_M = BLOCK_SIZE_M,
+                    propagation_alg_id = propagation_alg_id,
+                    **propagation_alg_kwargs
+                )
+            except TypeError:
+                import pdb; pdb.set_trace()
 
         else:
             BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
@@ -1310,13 +1313,15 @@ class SumLayer(Layer, nn.Module):
         nflows = tl.load(node_flows + offs_nmfs, mask = mask_batch[None,:])
 
         if propagation_alg_id == 0:
-            uflows = tl.where(nmars != -float("inf"), tl.log(nflows) - nmars, -float("inf"))
+            lflows = tl.log(nflows)
+            uflows = tl.where(nmars != -float("inf"), lflows - nmars, -float("inf"))
 
         if propagation_alg_id == 1:
             uflows = nflows
 
         if propagation_alg_id == 2:
-            uflows = tl.where(nmars != -float("inf"), tl.log(nflows) - nmars * alpha, -float("inf"))
+            lflows = tl.log(nflows)
+            uflows = tl.where(nmars != -float("inf"), lflows - nmars * alpha, -float("inf"))
 
         tl.store(node_flows + offs_nmfs, uflows, mask = mask_batch[None,:])
 
@@ -1352,19 +1357,21 @@ class SumLayer(Layer, nn.Module):
         nflows = tl.load(node_flows + offs_nmfs, mask = (mask_m[:,None] & mask_batch[None,:]))
 
         if propagation_alg_id == 0:
-            uflows = tl.where(nmars != -float("inf"), tl.log(nflows) - nmars, -float("inf"))
+            lflows = tl.log(nflows)
+            uflows = tl.where(nmars != -float("inf"), lflows - nmars, -float("inf"))
 
         if propagation_alg_id == 1:
             uflows = nflows
 
         if propagation_alg_id == 2:
-            uflows = tl.where(nmars != -float("inf"), tl.log(nflows) - nmars * alpha, -float("inf"))
+            lflows = tl.log(nflows)
+            uflows = tl.where(nmars != -float("inf"), lflows - nmars * alpha, -float("inf"))
 
         tl.store(node_flows + offs_nmfs, uflows, mask = (mask_m[:,None] & mask_batch[None,:]))
 
     def _bk_triton_modify_flow(self, node_flows: torch.Tensor, node_mars: torch.Tensor,
                                nids: torch.Tensor, local_ids: Optional[torch.Tensor] = None,
-                               propagation_alg_id: str = "LL", **kwargs):
+                               propagation_alg: str = "LL", **kwargs):
         """
         Replace `node_flows[nids]` with `node_flows[nids].log() - node_mars[nids]`
         """
@@ -2222,7 +2229,8 @@ class SumLayer(Layer, nn.Module):
                          nids: Optional[torch.Tensor], cids: Optional[torch.Tensor], pids: Optional[torch.Tensor], pfids: Optional[torch.Tensor],
                          chids: Optional[torch.Tensor], parids: Optional[torch.Tensor], parpids: Optional[torch.Tensor], 
                          cs_block_size: int, local_ids: Optional[torch.Tensor] = None,
-                         partition_id: int = -1, allow_modify_flows: bool = False) -> None:
+                         partition_id: int = -1, allow_modify_flows: bool = False, 
+                         propagation_alg: str = "LL", **kwargs) -> None:
         """
         Back pass of sum layers with sparse processing kernel.
         
@@ -2244,7 +2252,8 @@ class SumLayer(Layer, nn.Module):
                 node_flows, element_flows, params, node_mars, element_mars,
                 chids = chids, parids = parids, parpids = parpids, 
                 cs_block_size = cs_block_size, local_ids = local_ids,
-                allow_modify_flows = allow_modify_flows
+                allow_modify_flows = allow_modify_flows,
+                propagation_alg = propagation_alg, **kwargs
             )
 
         # Flows w.r.t. parameters
@@ -2252,7 +2261,8 @@ class SumLayer(Layer, nn.Module):
             self._backward_sparse_par_flows(
                 node_flows, params, node_mars, element_mars, param_flows,
                 nids = nids, cids = cids, pids = pids, pfids = pfids,
-                allow_modify_flows = allow_modify_flows
+                allow_modify_flows = allow_modify_flows,
+                propagation_alg = propagation_alg, **kwargs
             )
 
         return None
@@ -2263,7 +2273,7 @@ class SumLayer(Layer, nn.Module):
     def _bk_triton_sparse_ele_kernel(node_flows, element_flows, node_mars, element_mars, params, 
                                      chids, parids, parpids, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
                                      n_edge_blocks: tl.constexpr, allow_modify_flows: tl.constexpr, BLOCK_B: tl.constexpr, 
-                                     BLOCK_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr):
+                                     BLOCK_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, propagation_alg_id: tl.constexpr, alpha = 0.0):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(1) # ID of size-`BLOCK_M` nodes
@@ -2310,10 +2320,30 @@ class SumLayer(Layer, nn.Module):
             epars = tl.load(epars_ptr) # [num_edges]
             emars = tl.load(emars_ptr, mask = mask_batch) # [BLOCK_B]
 
-            if allow_modify_flows == 1:
-                eflows = tl.sum(epars[:,None] * tl.exp(emars[None,:] + log_n_fdm), axis = 0)
+            if propagation_alg_id == 1:
+                if allow_modify_flows:
+                    nflows = log_n_fdm
+
+                lpars = tl.log(epars)
+                eflows = tl.sum(tl.where(tl.abs(lpars[:,None] + emars[None,:] - nmars) < 1e-6, nflows, 0.0), axis = 0)
+
             else:
-                eflows = tl.sum(nflows * epars[:,None] * tl.exp(emars[None,:] - nmars), axis = 0)
+                if propagation_alg_id == 2:
+                    lpars = tl.log(epars)
+                    epars = tl.exp(lpars * alpha)
+
+                if allow_modify_flows == 1:
+                    if propagation_alg_id == 0:
+                        eflows = tl.sum(epars[:,None] * tl.exp(emars[None,:] + log_n_fdm), axis = 0)
+                    
+                    if propagation_alg_id == 2:
+                        eflows = tl.sum(epars[:,None] * tl.exp(emars[None,:] * alpha + log_n_fdm), axis = 0)
+                else:
+                    if propagation_alg_id == 0:
+                        eflows = tl.sum(nflows * epars[:,None] * tl.exp(emars[None,:] - nmars), axis = 0)
+
+                    if propagation_alg_id == 2:
+                        eflows = tl.sum(nflows * epars[:,None] * tl.exp((emars[None,:] - nmars) * alpha), axis = 0)
 
             tl.store(eflows_ptr, eflows, mask = mask_batch)
 
@@ -2331,7 +2361,8 @@ class SumLayer(Layer, nn.Module):
                                            chids, parids, parpids, local_ids, num_eles, pid_m_offset, 
                                            batch_size: tl.constexpr, partial_eval: tl.constexpr,
                                            n_edge_blocks: tl.constexpr, allow_modify_flows: tl.constexpr, BLOCK_B: tl.constexpr, 
-                                           TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr):
+                                           TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+                                           propagation_alg_id: tl.constexpr, alpha = 0.0):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(1) + pid_m_offset # ID of size-`TILE_SIZE_M` nodes
@@ -2379,10 +2410,32 @@ class SumLayer(Layer, nn.Module):
                         mask = (mask_m[:,None] & mask_batch[None,:])) # [TILE_SIZE_M, BLOCK_B]
 
         # Compute eflows
-        if allow_modify_flows == 1:
-            eflows = tl.sum(epars[:,:,None] * tl.exp(emars[:,None,:] + log_n_fdm), axis = 1)
+        if propagation_alg_id == 1:
+            if allow_modify_flows:
+                nflows = log_n_fdm
+
+            lpars = tl.log(epars)
+            eflows = tl.sum(tl.where(tl.abs(lpars[:,:,None] + emars[:,None,:] - nmars) < 1e-6, nflows, 0.0), axis = 1)
+
         else:
-            eflows = tl.sum(nflows * epars[:,:,None] * tl.exp(emars[:,None,:] - nmars), axis = 1)
+
+            if propagation_alg_id == 2:
+                lpars = tl.log(epars)
+                epars = tl.exp(lpars * alpha)
+
+            if allow_modify_flows == 1:
+                if propagation_alg_id == 0:
+                    eflows = tl.sum(epars[:,:,None] * tl.exp(emars[:,None,:] + log_n_fdm), axis = 1)
+
+                if propagation_alg_id == 2:
+                    eflows = tl.sum(epars[:,:,None] * tl.exp(emars[:,None,:] * alpha + log_n_fdm), axis = 1)
+            else:
+                
+                if propagation_alg_id == 0:
+                    eflows = tl.sum(nflows * epars[:,:,None] * tl.exp(emars[:,None,:] - nmars), axis = 1)
+
+                if propagation_alg_id == 2:
+                    eflows = tl.sum(nflows * epars[:,:,None] * tl.exp((emars[:,None,:] - nmars) * alpha), axis = 0)
 
         tl.store(eflows_ptr, eflows, mask = (mask_m[:,None] & mask_batch[None,:]))
 
@@ -2390,7 +2443,7 @@ class SumLayer(Layer, nn.Module):
                                    params: torch.Tensor, node_mars: torch.Tensor,
                                    element_mars: torch.Tensor, chids: torch.Tensor, parids: torch.Tensor,
                                    parpids: torch.Tensor, cs_block_size: int, local_ids: Optional[torch.Tensor] = None,
-                                   allow_modify_flows: bool = False) -> None:
+                                   allow_modify_flows: bool = False, propagation_alg: str = "LL", **kwargs) -> None:
 
         assert params.dim() == 1, "Expecting a 1D `params`."
 
@@ -2400,6 +2453,10 @@ class SumLayer(Layer, nn.Module):
         num_edges = n_edge_blocks * self.block_size
         batch_size = node_flows.size(1)
         BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
+
+        # Propagation algorithm
+        propagation_alg_id = self.propagation_alg_mapping[propagation_alg]
+        propagation_alg_kwargs = self._get_propagation_alg_kwargs(propagation_alg, **kwargs)
 
         assert num_edges <= 16384, "The sparse backward kernel only support nodes with # edges smaller than 16384."
 
@@ -2428,7 +2485,9 @@ class SumLayer(Layer, nn.Module):
                 allow_modify_flows = allow_modify_flows,
                 BLOCK_B = BLOCK_B,
                 BLOCK_M = BLOCK_M,
-                BLOCK_SIZE_K = self.block_size
+                BLOCK_SIZE_K = self.block_size,
+                propagation_alg_id = propagation_alg_id,
+                **propagation_alg_kwargs
             )
 
         else:
@@ -2460,7 +2519,9 @@ class SumLayer(Layer, nn.Module):
                     BLOCK_B = BLOCK_B,
                     TILE_SIZE_M = TILE_SIZE_M,
                     BLOCK_SIZE_M = cs_block_size,
-                    BLOCK_SIZE_K = self.block_size
+                    BLOCK_SIZE_K = self.block_size,
+                    propagation_alg_id = propagation_alg_id,
+                    **propagation_alg_kwargs
                 )
 
             else:
@@ -2488,7 +2549,9 @@ class SumLayer(Layer, nn.Module):
                         BLOCK_B = BLOCK_B,
                         TILE_SIZE_M = TILE_SIZE_M,
                         BLOCK_SIZE_M = cs_block_size,
-                        BLOCK_SIZE_K = self.block_size
+                        BLOCK_SIZE_K = self.block_size,
+                        propagation_alg_id = propagation_alg_id,
+                        **propagation_alg_kwargs
                     )
 
         return None
@@ -2499,7 +2562,7 @@ class SumLayer(Layer, nn.Module):
     def _bk_triton_sparse_par_kernel(node_flows, node_mars, element_mars, params, param_flows, nids, cids, pids, pfids,
                                      pid_m_offset, num_edges: tl.constexpr, batch_size: tl.constexpr, allow_modify_flows: tl.constexpr, 
                                      BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_B: tl.constexpr, 
-                                     TILE_SIZE_B: tl.constexpr, B_NUM_BLOCKS: tl.constexpr):
+                                     TILE_SIZE_B: tl.constexpr, B_NUM_BLOCKS: tl.constexpr, propagation_alg_id: tl.constexpr, alpha = 0.0):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` samples
         pid_e = tl.program_id(1) # ID of size-`BLOCK_K` edges
@@ -2525,6 +2588,12 @@ class SumLayer(Layer, nn.Module):
         nmars_ptr = node_mars + (off_nids + tile_id) * batch_size + offs_batch # [BLOCK_B]
         nflows_ptr = node_flows + (off_nids + tile_id) * batch_size + offs_batch # [BLOCK_B]
 
+        if propagation_alg_id == 1:
+            par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
+            epars_ptr = params + par_start + tile_id
+            epars = tl.load(epars_ptr) # [BLOCK_K]
+            elpars = tl.log(epars)
+
         # Inner loop
         acc = tl.zeros([BLOCK_K], dtype = tl.float32)
 
@@ -2535,107 +2604,59 @@ class SumLayer(Layer, nn.Module):
 
             emars = tl.load(emars_ptr, mask = mask_batch[None,:], other = -float("inf")) # [BLOCK_K, BLOCK_B]
 
-            if allow_modify_flows == 1:
-                log_n_fdm = tl.load(nflows_ptr, mask = mask_batch, other = -float("inf")) # [BLOCK_B]
-                pflows = tl.sum(tl.exp(emars + log_n_fdm[None,:]), axis = 1)
-            else:
+            if propagation_alg_id == 1:
                 nmars = tl.load(nmars_ptr, mask = mask_batch, other = 0.0) # [BLOCK_B]
                 nflows = tl.load(nflows_ptr, mask = mask_batch, other = 0.0) # [BLOCK_B]
-                pflows = tl.sum(nflows[None,:] * tl.exp(emars - nmars[None,:]), axis = 1)
 
-            acc += pflows
+                acc += tl.sum(tl.where(tl.abs(elpars[:,None] + emars - nmars[None,:]) < 1e-6, nflows[None,:], 0.0), axis = 1)
+
+            else:
+
+                if propagation_alg_id == 2:
+                    emars *= alpha
+
+                if allow_modify_flows == 1:
+                    log_n_fdm = tl.load(nflows_ptr, mask = mask_batch, other = -float("inf")) # [BLOCK_B]
+                    pflows = tl.sum(tl.exp(emars + log_n_fdm[None,:]), axis = 1)
+                else:
+                    nmars = tl.load(nmars_ptr, mask = mask_batch, other = 0.0) # [BLOCK_B]
+                    nflows = tl.load(nflows_ptr, mask = mask_batch, other = 0.0) # [BLOCK_B]
+
+                    if propagation_alg_id == 0:
+                        pflows = tl.sum(nflows[None,:] * tl.exp(emars - nmars[None,:]), axis = 1)
+
+                    if propagation_alg_id == 2:
+                        pflows = tl.sum(nflows[None,:] * tl.exp(emars - nmars[None,:] * alpha), axis = 1)
+
+                acc += pflows
 
             # Increment `emars_ptr`, `nmars_ptr`, and `nmars_ptr`
             emars_ptr += BLOCK_B
             nmars_ptr += BLOCK_B
             nflows_ptr += BLOCK_B
 
-        par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
-        epars_ptr = params + par_start + tile_id
-        epars = tl.load(epars_ptr) # [BLOCK_K]
+        if propagation_alg_id != 1:
+            par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
+            epars_ptr = params + par_start + tile_id
+            epars = tl.load(epars_ptr) # [BLOCK_K]
+
+        if propagation_alg_id == 2:
+            epars = tl.exp(tl.log(epars) * alpha)
 
         parflow_start = tl.load(pfids + nblock_id * num_edges + offs_edge)
         eparflows_ptr = param_flows + parflow_start + tile_id
         
-        curr_pflows = acc * epars
+        if propagation_alg_id != 1:
+            curr_pflows = acc * epars
+        else:
+            curr_pflows = acc
 
         tl.atomic_add(eparflows_ptr, curr_pflows)
-
-    @staticmethod
-    # @triton.jit
-    @FastJITFunction
-    def _bk_triton_large_sparse_par_kernel(node_flows, node_mars, element_mars, params, param_flows, nids, cids, pids, pfids,
-                                           num_nodes, num_edges: tl.constexpr, batch_size: tl.constexpr, allow_modify_flows: tl.constexpr, 
-                                           TILE_SIZE_M: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_B: tl.constexpr, 
-                                           TILE_SIZE_B: tl.constexpr, B_NUM_BLOCKS: tl.constexpr, BLOCK_SIZE_M: tl.constexpr):
-
-        pid_b = tl.program_id(0) # ID of size-`BLOCK_B` samples
-        pid_e = tl.program_id(1) # ID of size-`BLOCK_K` edges
-        pid_m = tl.program_id(2) # ID of size-`TILE_SIZE_M` nodes
-
-        offs_m = tl.arange(0, TILE_SIZE_M) + pid_m * TILE_SIZE_M
-        mask_m = offs_m < num_nodes
-
-        # Get inferred node block id from `pid_m`
-        nblock_ids = offs_m // BLOCK_SIZE_M
-        tile_ids = offs_m % BLOCK_SIZE_M
-
-        # Batch offsets and mask
-        offs_batch = tl.arange(0, BLOCK_B) + pid_b * TILE_SIZE_B
-        mask_batch = offs_batch < batch_size
-
-        # Initialize pointers to `element_mars`
-        offs_edge = tl.arange(0, BLOCK_K) + pid_e * BLOCK_K
-        edge_start = tl.load(cids + nblock_ids[:,None] * num_edges + offs_edge[None,:], mask = mask_m[:,None])
-        emars_ptr = element_mars + \
-            edge_start[:,:,None] * batch_size + \
-            offs_batch[None,None,:] # [TILE_SIZE_M, BLOCK_K, BLOCK_B]
-
-        # Initialize pointers to `node_flows` and `node_mars`
-        off_nids = tl.load(nids + nblock_ids, mask = mask_m)
-        nmars_ptr = node_mars + (off_nids + tile_ids)[:,None] * batch_size + offs_batch[None,:] # [TILE_SIZE_M, BLOCK_B]
-        nflows_ptr = node_flows + (off_nids + tile_ids)[:,None] * batch_size + offs_batch[None,:] # [TILE_SIZE_M, BLOCK_B]
-
-        # Inner loop
-        acc = tl.zeros([TILE_SIZE_M, BLOCK_K], dtype = tl.float32) + 0.1
-
-        for b in range(0, B_NUM_BLOCKS):
-            # Batch offsets and mask
-            offs_batch = tl.arange(0, BLOCK_B) + pid_b * TILE_SIZE_B + b * BLOCK_B
-            mask_batch = offs_batch < batch_size
-
-            emars = tl.load(emars_ptr, mask = (mask_m[:,None,None] & mask_batch[None,None,:]), other = -float("inf")) # [TILE_SIZE_M, BLOCK_K, BLOCK_B]
-
-            if allow_modify_flows == 1:
-                log_n_fdm = tl.load(nflows_ptr, mask = (mask_m[:,None] & mask_batch[None,:]), other = -float("inf")) # [TILE_SIZE_M, BLOCK_B]
-                pflows = tl.sum(tl.exp(emars + log_n_fdm[:,None,:]), axis = 2)
-            else:
-                nmars = tl.load(nmars_ptr, mask = (mask_m[:,None] & mask_batch[None,:]), other = 0.0) # [TILE_SIZE_M, BLOCK_B]
-                nflows = tl.load(nflows_ptr, mask = (mask_m[:,None] & mask_batch[None,:]), other = 0.0) # [TILE_SIZE_M, BLOCK_B]
-                pflows = tl.sum(nflows[:,None,:] * tl.exp(emars - nmars[:,None,:]), axis = 2)
-
-            acc += pflows
-
-            # Increment `emars_ptr`, `nmars_ptr`, and `nmars_ptr`
-            emars_ptr += BLOCK_B
-            nmars_ptr += BLOCK_B
-            nflows_ptr += BLOCK_B
-
-        par_start = tl.load(pids + nblock_ids[:,None] * num_edges + offs_edge[None,:])
-        epars_ptr = params + par_start + tile_ids[:,None]
-        epars = tl.load(epars_ptr, mask = mask_m[:,None]) # [TILE_SIZE_M, BLOCK_K]
-
-        parflow_start = tl.load(pfids + nblock_ids[:,None] * num_edges + offs_edge[None,:])
-        eparflows_ptr = param_flows + parflow_start + tile_ids[:,None]
-        
-        curr_pflows = acc * epars
-
-        tl.atomic_add(eparflows_ptr, curr_pflows, mask = mask_m[:,None])
 
     def _backward_sparse_par_flows(self, node_flows: torch.Tensor, params: torch.Tensor, node_mars: torch.Tensor, 
                                    element_mars: torch.Tensor, param_flows: torch.Tensor, nids: torch.Tensor, 
                                    cids: torch.Tensor, pids: torch.Tensor, pfids: torch.Tensor,
-                                   allow_modify_flows: bool = False) -> None:
+                                   allow_modify_flows: bool = False, propagation_alg: str = "LL", **kwargs) -> None:
         """
         Backward pass of sum layers w.r.t. sum parameters with the block-sparse processing kernel.
         
@@ -2659,7 +2680,9 @@ class SumLayer(Layer, nn.Module):
         batch_size = node_mars.size(1)
         BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
 
-        # assert num_edges <= 16384, "The sparse backward kernel only support nodes with # edges smaller than 16384."
+        # Propagation algorithm
+        propagation_alg_id = self.propagation_alg_mapping[propagation_alg]
+        propagation_alg_kwargs = self._get_propagation_alg_kwargs(propagation_alg, **kwargs)
 
         if num_edges <= 1024:
             BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
@@ -2705,7 +2728,9 @@ class SumLayer(Layer, nn.Module):
                 BLOCK_K = BLOCK_K,
                 BLOCK_B = BLOCK_B,
                 TILE_SIZE_B = TILE_SIZE_B,
-                B_NUM_BLOCKS = B_NUM_BLOCKS
+                B_NUM_BLOCKS = B_NUM_BLOCKS,
+                propagation_alg_id = propagation_alg_id,
+                **propagation_alg_kwargs
             )
         
         else:
@@ -2733,62 +2758,10 @@ class SumLayer(Layer, nn.Module):
                     BLOCK_K = BLOCK_K,
                     BLOCK_B = BLOCK_B,
                     TILE_SIZE_B = TILE_SIZE_B,
-                    B_NUM_BLOCKS = B_NUM_BLOCKS
+                    B_NUM_BLOCKS = B_NUM_BLOCKS,
+                    propagation_alg_id = propagation_alg_id,
+                    **propagation_alg_kwargs
                 )
-
-        # else:
-
-        #     if num_edges <= 1024:
-        #         BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
-        #         BLOCK_K = num_edges
-        #         TILE_SIZE_M = max(min(4096 // num_edges, triton.next_power_of_2(layer_n_nodes)), 1)
-        #     else:
-        #         BLOCK_B = min(512, BATCH_SIZE_NP2)
-        #         BLOCK_K = min(2048 // BLOCK_B, num_edges)
-        #         TILE_SIZE_M = max(min(2048 // num_edges, triton.next_power_of_2(layer_n_nodes)), 1)
-        #     B_NUM_BLOCKS = triton.cdiv(batch_size, BLOCK_B)
-        #     K_NUM_BLOCKS = triton.cdiv(num_edges, BLOCK_K)
-
-        #     # When a thread-block is allocated for too much work, the overhead 
-        #     # outweigh that incurred by `atomic_add`. Add more thread-blocks 
-        #     # for parallel processing in this case.
-        #     if B_NUM_BLOCKS >= 4:
-        #         TILE_SIZE_B = 4 * BLOCK_B
-        #         B_NUM_BLOCKS = 4
-        #     else:
-        #         TILE_SIZE_B = batch_size
-        #     B_NUM_TILES = triton.cdiv(batch_size, TILE_SIZE_B)
-
-        #     allow_modify_flows = 1 if allow_modify_flows else 0
-
-        #     grid = (B_NUM_TILES, K_NUM_BLOCKS, triton.cdiv(layer_n_nodes, TILE_SIZE_M))
-
-        #     print(">>>G", grid, "in")
-        #     # TODO: This kernel gets stuck for some input configurations. Fix it.
-        #     if grid[0] == 2 and grid[1] == 1 and grid[2] == 308:
-        #         import pdb; pdb.set_trace()
-        #     self._bk_triton_large_sparse_par_kernel[grid](
-        #         node_flows = node_flows, 
-        #         node_mars = node_mars, 
-        #         element_mars = element_mars, 
-        #         params = params, 
-        #         param_flows = param_flows, 
-        #         nids = nids, 
-        #         cids = cids, 
-        #         pids = pids, 
-        #         pfids = pfids,
-        #         num_nodes = layer_n_nodes, 
-        #         num_edges = num_edges, 
-        #         batch_size = batch_size, 
-        #         allow_modify_flows = allow_modify_flows, 
-        #         TILE_SIZE_M = TILE_SIZE_M, 
-        #         BLOCK_K = BLOCK_K,
-        #         BLOCK_B = BLOCK_B,
-        #         TILE_SIZE_B = TILE_SIZE_B,
-        #         B_NUM_BLOCKS = B_NUM_BLOCKS,
-        #         BLOCK_SIZE_M = self.block_size
-        #     )
-        #     print(">>>G", grid, "out")
 
         return None
 

@@ -70,9 +70,9 @@ class Layer():
 
     def _get_propagation_alg_kwargs(self, propagation_alg: str, **kwargs):
         if propagation_alg == "LL":
-            return {}
+            return {"alpha": 0.0}
         elif propagation_alg == "MPE":
-            return {}
+            return {"alpha": 0.0}
         elif propagation_alg == "GeneralLL":
             return {"alpha": kwargs["alpha"]}
         else:
