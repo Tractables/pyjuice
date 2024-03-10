@@ -4,6 +4,8 @@ import torchvision
 import time
 from torch.utils.data import TensorDataset, DataLoader
 
+import pytest
+
 
 def evaluate(pc, loader):
     lls_total = 0.0
@@ -65,7 +67,7 @@ def full_batch_em_epoch(pc, train_loader, test_loader, device):
         print(f"[train LL: {train_ll:.2f}; test LL: {test_ll:.2f}].....[train forward+backward+step {t1-t0:.2f}; test forward {t2-t1:.2f}] ")
 
 
-def pd_hclt_degenerative_case_test():
+def test_pd_hclt_degenerative_case():
 
     device = torch.device("cuda:0")
 
@@ -118,7 +120,7 @@ def pd_hclt_degenerative_case_test():
     assert test_ll > -690.0
 
 
-def pd_hclt_test():
+def test_pd_hclt():
 
     device = torch.device("cuda:0")
 
@@ -180,5 +182,5 @@ def pd_hclt_test():
 
 if __name__ == "__main__":
     torch.manual_seed(2391)
-    pd_hclt_degenerative_case_test()
-    pd_hclt_test()
+    test_pd_hclt_degenerative_case()
+    test_pd_hclt()

@@ -11,7 +11,7 @@ from pyjuice.model import TensorCircuit
 import pytest
 
 
-def structured_blk_sparse_pc_test():
+def test_structured_blk_sparse_pc():
 
     device = torch.device("cuda:0")
 
@@ -217,4 +217,4 @@ def structured_blk_sparse_pc_test():
 
 if __name__ == "__main__":
     torch.manual_seed(89172)
-    structured_blk_sparse_pc_test()
+    test_structured_blk_sparse_pc()

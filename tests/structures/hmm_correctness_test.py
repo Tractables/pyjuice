@@ -7,7 +7,7 @@ import pyjuice as juice
 import pyjuice.nodes.distributions as dists
 
 
-def hmm_forward_backward_test():
+def test_hmm_forward_backward():
 
     device = torch.device("cuda:0")
 
@@ -206,4 +206,4 @@ def hmm_forward_backward_test():
 
 if __name__ == "__main__":
     torch.manual_seed(23289)
-    hmm_forward_backward_test()
+    test_hmm_forward_backward()

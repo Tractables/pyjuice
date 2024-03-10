@@ -14,7 +14,7 @@ from pyjuice.layer import InputLayer, ProdLayer
 import pytest
 
 
-def prod_layer_test():
+def test_prod_layer():
 
     device = torch.device("cuda:0")
 
@@ -91,7 +91,8 @@ def prod_layer_test():
             assert torch.all(torch.abs(node_flows[8*block_size+i,:] - element_flows[4*block_size+i,:]) < 1e-4)
 
 
-def speed_test():
+@pytest.mark.slow
+def test_speed():
 
     device = torch.device("cuda:0")
 
@@ -166,5 +167,5 @@ def speed_test():
 
 if __name__ == "__main__":
     torch.manual_seed(2390)
-    prod_layer_test()
-    speed_test()
+    test_prod_layer()
+    test_speed()

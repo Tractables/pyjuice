@@ -11,7 +11,7 @@ from pyjuice.model.backend import compute_cum_par_flows, em_par_update
 import pytest
 
 
-def homogeneous_hmm_test():
+def test_homogeneous_hmm():
 
     block_size = 1
 
@@ -217,4 +217,4 @@ def homogeneous_hmm_test():
 
 if __name__ == "__main__":
     torch.manual_seed(2390)
-    homogeneous_hmm_test()
+    test_homogeneous_hmm()

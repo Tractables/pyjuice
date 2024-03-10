@@ -11,7 +11,7 @@ from pyjuice.transformations import deepcopy
 import pytest
 
 
-def block_test():
+def test_block():
     
     with set_block_size(block_size = 2):
 
@@ -78,7 +78,7 @@ def block_test():
         assert torch.all(new_n2._params[0][2:4,2:4] == n2._params[3])
 
 
-def block_sparse_block_test():
+def test_block_sparse_block():
 
     with set_block_size(block_size = 4):
 
@@ -159,5 +159,5 @@ def block_sparse_block_test():
 
 
 if __name__ == "__main__":
-    block_test()
-    block_sparse_block_test()
+    test_block()
+    test_block_sparse_block()

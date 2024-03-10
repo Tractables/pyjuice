@@ -11,7 +11,8 @@ from pyjuice.model import TensorCircuit
 import pytest
 
 
-def compile_dense_pc_test():
+@pytest.mark.slow
+def test_compile_dense_pc():
     num_latents = 2048
     num_cats = 512
     num_vars = 64
@@ -33,7 +34,8 @@ def compile_dense_pc_test():
     assert t1 - t0 < 60
 
 
-def compile_sparse_pc_test():
+@pytest.mark.slow
+def test_compile_sparse_pc():
     num_latents = 4096
     num_cats = 200
     num_vars = 16
@@ -71,5 +73,5 @@ def compile_sparse_pc_test():
 
 
 if __name__ == "__main__":
-    compile_dense_pc_test()
-    compile_sparse_pc_test()
+    test_compile_dense_pc()
+    test_compile_sparse_pc()

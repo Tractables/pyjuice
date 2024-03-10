@@ -3,8 +3,11 @@ import pyjuice.nodes.distributions as dists
 import torch
 import time
 
+import pytest
 
-def hmm_speed_test():
+
+@pytest.mark.slow
+def test_hmm_speed():
 
     device = torch.device("cuda:0")
 
@@ -82,5 +85,5 @@ def hmm_speed_test():
 
 
 if __name__ == "__main__":
-    hmm_speed_test()
+    test_hmm_speed()
 

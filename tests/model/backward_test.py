@@ -10,7 +10,7 @@ from pyjuice.model import TensorCircuit
 import pytest
 
 
-def backward_test():
+def test_backward():
 
     ni0 = inputs(0, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
     ni1 = inputs(1, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
@@ -119,7 +119,7 @@ def backward_test():
     assert torch.abs(inner_param_flows[13] + inner_param_flows[14] - 1.0) < 1e-4
 
 
-def non_sd_pc_backward_test():
+def test_non_sd_pc_backward():
     ni00 = inputs(0, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
     ni10 = inputs(1, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
     ni20 = inputs(2, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
@@ -177,7 +177,7 @@ def non_sd_pc_backward_test():
     assert torch.abs(pc.param_flows[11] - fp4) < 1e-3
 
 
-def sparse_pc_backward_test():
+def test_sparse_pc_backward():
     
     ni0 = inputs(0, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
     ni1 = inputs(1, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
@@ -242,6 +242,6 @@ def sparse_pc_backward_test():
 
 
 if __name__ == "__main__":
-    backward_test()
-    non_sd_pc_backward_test()
-    sparse_pc_backward_test()
+    test_backward()
+    test_non_sd_pc_backward()
+    test_sparse_pc_backward()

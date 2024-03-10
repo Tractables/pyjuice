@@ -191,6 +191,8 @@ def test_hclt_single_layer_backward():
 
 def test_hclt_backward():
 
+    torch.manual_seed(18329)
+
     device = torch.device("cuda:0")
 
     train_dataset = torchvision.datasets.MNIST(root = "./examples/data", train = True, download = True)
@@ -315,9 +317,6 @@ def test_hclt_backward():
 
                     eflows = (nflows[None,:,:] * (params.permute(1, 0).log()[:,:,None] + emars[:,None,:] - nmars[None,:,:]).exp()).sum(dim = 1)
                     pflows = (nflows[None,:,:] * (params.permute(1, 0).log()[:,:,None] + emars[:,None,:] - nmars[None,:,:]).exp()).sum(dim = 2).permute(1, 0)
-
-                    if not torch.all(torch.abs(pflows - param_flows) < 1e-3 * batch_size):
-                        import pdb; pdb.set_trace()
 
                     assert torch.all(torch.abs(pflows - param_flows) < 1e-3 * batch_size)
 

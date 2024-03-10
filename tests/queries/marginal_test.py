@@ -10,7 +10,7 @@ from pyjuice.model import TensorCircuit
 import pytest
 
 
-def cat_hard_marginal_test():
+def test_cat_hard_marginal():
 
     device = torch.device("cuda:0")
 
@@ -38,7 +38,7 @@ def cat_hard_marginal_test():
     assert torch.all((torch.log(p0 * pc.params[1] + p1 * pc.params[2]) - lls[:,0]).abs() < 1e-4)
 
 
-def cat_soft_marginal_test():
+def test_cat_soft_marginal():
 
     device = torch.device("cuda:0")
 
@@ -71,5 +71,5 @@ if __name__ == "__main__":
     torch.manual_seed(123)
     torch.cuda.manual_seed(123)
 
-    cat_hard_marginal_test()
-    cat_soft_marginal_test()
+    test_cat_hard_marginal()
+    test_cat_soft_marginal()

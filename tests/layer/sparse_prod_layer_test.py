@@ -14,7 +14,7 @@ from pyjuice.layer import InputLayer, ProdLayer
 import pytest
 
 
-def sparse_prod_layer_test():
+def test_sparse_prod_layer():
 
     device = torch.device("cuda:0")
 
@@ -104,4 +104,4 @@ def sparse_prod_layer_test():
 
 if __name__ == "__main__":
     torch.manual_seed(2390)
-    sparse_prod_layer_test()
+    test_sparse_prod_layer()

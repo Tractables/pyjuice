@@ -14,7 +14,7 @@ from pyjuice.layer import InputLayer, ProdLayer, SumLayer
 import pytest
 
 
-def ll_prop_test():
+def test_ll_prop():
     
     device = torch.device("cuda:0")
 
@@ -123,7 +123,7 @@ def ll_prop_test():
             assert torch.all(torch.abs(my_pflows - param_flows) < 2e-3)
 
 
-def general_ll_prop_test():
+def test_general_ll_prop():
     
     device = torch.device("cuda:0")
 
@@ -235,7 +235,7 @@ def general_ll_prop_test():
                 assert torch.all(torch.abs(my_pflows - param_flows) < 2e-3)
 
 
-def mpe_prop_test():
+def test_mpe_prop():
 
     device = torch.device("cuda:0")
 
@@ -339,6 +339,6 @@ def mpe_prop_test():
 
 if __name__ == "__main__":
     torch.manual_seed(280)
-    ll_prop_test()
-    general_ll_prop_test()
-    mpe_prop_test()
+    test_ll_prop()
+    test_general_ll_prop()
+    test_mpe_prop()

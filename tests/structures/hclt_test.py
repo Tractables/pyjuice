@@ -64,7 +64,7 @@ def full_batch_em_epoch(pc, train_loader, test_loader, device):
     print(f"[train LL: {train_ll:.2f}; test LL: {test_ll:.2f}].....[train forward+backward+step {t1-t0:.2f}; test forward {t2-t1:.2f}] ")
 
 
-def hclt_test():
+def test_hclt():
 
     device = torch.device("cuda:0")
 
@@ -146,7 +146,7 @@ def hclt_test():
     assert test_ll > -770
 
 
-def hclt_logistic_test():
+def test_hclt_logistic():
 
     device = torch.device("cuda:0")
 
@@ -204,5 +204,5 @@ def hclt_logistic_test():
 
 if __name__ == "__main__":
     torch.manual_seed(3289)
-    hclt_test()
-    hclt_logistic_test()
+    test_hclt()
+    test_hclt_logistic()

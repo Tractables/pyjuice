@@ -10,7 +10,7 @@ from pyjuice.model import TensorCircuit
 import pytest
 
 
-def non_sd_test():
+def test_non_sd():
     ni1 = inputs(0, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
     ni2 = inputs(1, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
     ni3 = inputs(2, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
@@ -103,4 +103,4 @@ def non_sd_test():
 
 if __name__ == "__main__":
     torch.manual_seed(129)
-    non_sd_test()
+    test_non_sd()

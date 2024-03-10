@@ -12,7 +12,7 @@ from pyjuice.nodes.methods import get_subsumed_scopes
 import pytest
 
 
-def partial_eval_forward_test():
+def test_partial_eval_forward():
 
     ni0 = inputs(0, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
     ni1 = inputs(1, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
@@ -68,7 +68,7 @@ def partial_eval_forward_test():
         assert torch.all(torch.abs(lls - lls2) < 1e-4)
 
 
-def partial_eval_backward_test():
+def test_partial_eval_backward():
 
     ni0 = inputs(0, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
     ni1 = inputs(1, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
@@ -112,5 +112,5 @@ def partial_eval_backward_test():
 
 
 if __name__ == "__main__":
-    partial_eval_forward_test()
-    partial_eval_backward_test()
+    test_partial_eval_forward()
+    test_partial_eval_backward()

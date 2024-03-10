@@ -10,7 +10,7 @@ from pyjuice.transformations.merge import merge_sum_nodes, merge_prod_nodes, mer
 import pytest
 
 
-def sum_nodes_merge_test():
+def test_sum_nodes_merge():
     num_node_blocks = 2
 
     for block_size in [1, 2, 4, 8]:
@@ -41,7 +41,7 @@ def sum_nodes_merge_test():
             assert n_new.chs[0] == m00
 
 
-def prod_nodes_merge_test():
+def test_prod_nodes_merge():
     num_node_blocks = 2
 
     for block_size in [1, 2, 4, 8]:
@@ -70,7 +70,7 @@ def prod_nodes_merge_test():
             assert m_new.chs[1] == i10
 
 
-def merge_by_region_node_test():
+def test_merge_by_region_node():
     num_node_blocks = 2
 
     for block_size in [1, 2, 4, 8]:
@@ -121,6 +121,6 @@ def merge_by_region_node_test():
 
 
 if __name__ == "__main__":
-    sum_nodes_merge_test()
-    prod_nodes_merge_test()
-    merge_by_region_node_test()
+    test_sum_nodes_merge()
+    test_prod_nodes_merge()
+    test_merge_by_region_node()

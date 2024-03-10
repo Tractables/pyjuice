@@ -13,7 +13,7 @@ from pyjuice.nodes.methods import get_subsumed_scopes
 import pytest
 
 
-def cat_soft_cond_test():
+def test_cat_soft_cond():
 
     device = torch.device("cuda:0")
 
@@ -54,4 +54,4 @@ if __name__ == "__main__":
     torch.manual_seed(123)
     torch.cuda.manual_seed(123)
 
-    cat_soft_cond_test()
+    test_cat_soft_cond()

@@ -14,7 +14,7 @@ from pyjuice.layer import InputLayer, ProdLayer, SumLayer
 import pytest
 
 
-def simple_model_test():
+def test_simple_model():
     
     device = torch.device("cuda:0")
 
@@ -525,4 +525,4 @@ def simple_model_test():
 
 if __name__ == "__main__":
     torch.manual_seed(23892)
-    simple_model_test()
+    test_simple_model()

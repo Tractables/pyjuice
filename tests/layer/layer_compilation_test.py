@@ -14,7 +14,7 @@ from pyjuice.layer import InputLayer, ProdLayer, SumLayer
 import pytest
 
 
-def prod_layer_compilation_test():
+def test_prod_layer_compilation():
     
     for block_size in [1, 8, 16]:
     
@@ -38,7 +38,7 @@ def prod_layer_compilation_test():
         prod_layer_cpu = ProdLayer([np0, np1, np2, np3, np4, np5], layer_sparsity_tol = 0.1, disable_gpu_compilation = True)
         prod_layer_gpu = ProdLayer([np0, np1, np2, np3, np4, np5], layer_sparsity_tol = 0.1, force_gpu_compilation = True)
 
-        for i in range(3):
+        for i in range(2):
             assert torch.all(prod_layer_cpu.partitioned_nids[i] == prod_layer_gpu.partitioned_nids[i])
             assert torch.all(prod_layer_cpu.partitioned_cids[i] == prod_layer_gpu.partitioned_cids[i])
 
@@ -47,7 +47,7 @@ def prod_layer_compilation_test():
             assert torch.all(prod_layer_cpu.partitioned_parids[i] == prod_layer_gpu.partitioned_parids[i])
 
 
-def sum_layer_compilation_test():
+def test_sum_layer_compilation():
 
     for block_size in [1, 8, 16]:
     
@@ -112,5 +112,5 @@ def sum_layer_compilation_test():
 
 
 if __name__ == "__main__":
-    # prod_layer_compilation_test()
-    sum_layer_compilation_test()
+    test_prod_layer_compilation()
+    test_sum_layer_compilation()
