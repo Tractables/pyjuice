@@ -213,7 +213,7 @@ class InputLayer(Layer, nn.Module):
 
     def forward(self, data: torch.Tensor, node_mars: torch.Tensor, params: Optional[Dict] = None,
                 missing_mask: Optional[torch.Tensor] = None, _batch_first: bool = True, 
-                _apply_missing_mask_only: bool = False):
+                _apply_missing_mask_only: bool = False, **kwargs):
         self._used_external_params = (params is not None)
 
         if params is None:
@@ -300,7 +300,7 @@ class InputLayer(Layer, nn.Module):
             raise NotImplementedError("CPU forward fn for input nodes is not implemented.")
 
     def backward(self, data: torch.Tensor, node_flows: torch.Tensor, 
-                 node_mars: torch.Tensor, params: Optional[Dict] = None):
+                 node_mars: torch.Tensor, params: Optional[Dict] = None, **kwargs):
         """
         data: [num_vars, B]
         node_flows: [num_nodes, B]

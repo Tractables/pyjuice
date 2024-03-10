@@ -149,7 +149,7 @@ class ProdLayer(Layer, nn.Module):
         self.partitioned_u_cids = FastParamList([nn.Parameter(tensor, requires_grad = False) for tensor in u_cids])
         self.partitioned_parids = FastParamList([nn.Parameter(tensor, requires_grad = False) for tensor in parids])
 
-    def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor, _for_backward: bool = False) -> None:
+    def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor, _for_backward: bool = False, **kwargs) -> None:
         """
         Computes the forward pass of a product layer. If `block_size == 1`, it is equivalent to the following:
         ```
@@ -195,7 +195,7 @@ class ProdLayer(Layer, nn.Module):
 
         return None
 
-    def backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor) -> None:
+    def backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor, **kwargs) -> None:
         """
         Computes the backward pass of a product layer:
         ```
