@@ -50,7 +50,7 @@ def HMM(seq_length: int, num_latents: int, num_emits: int, homogeneous: bool = T
     block_size = min(max_cdf_power_of_2(num_latents), 1024)
     num_node_blocks = num_latents // block_size
     
-    with juice.set_block_size(block_size = block_size):
+    with set_block_size(block_size = block_size):
 
         ns_input = inputs(
             seq_length - 1, num_node_blocks = num_node_blocks,
