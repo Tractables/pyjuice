@@ -33,6 +33,8 @@ def plot_pc(ns,
     """
     G = nx.DiGraph()
     node_list = serialize_nodes(ns)
+    for item in node_list:
+        item["num_nodes"] = item["num_node_blocks"] * item["block_size"]
     pos = {}
     nx.set_node_attributes(G, [], "node_type")
     nx.set_node_attributes(G, [], "num_nodes")
@@ -102,19 +104,13 @@ def plot_pc(ns,
 def plot_tensor_node_connection(ns, node_id : int = 0):
     G = nx.DiGraph()
     node_list = serialize_nodes(ns)
+    for item in node_list:
+        item["num_nodes"] = item["num_node_blocks"] * item["block_size"]
     node_target = node_list[node_id]
     pos = {}
     
     if node_target['type']=='Input':
-        # print(f'The target node {node_id} is a Input node...')
-        # input_node_list = []
-        # for i in range(node_target['num_nodes']):
-        #     G.add_node(f'i{i}')
-        #     input_node_list.append(f'i{i}')
-        # pos = nx.circular_layout(G)
-        # nx.draw(G, pos, node_color="#A5CE9D", with_labels=True, font_size=6) # green is sum nodes
-        # return input_node_list #return input node list
-        print(f"\n>>The target node {node_id} is a Input node, it has {node_target['num_nodes']} nodes, & no connection among them.<<\n")
+        print(f"\n>>The target node {node_id} is an Input node, it has {node_target['num_nodes']} nodes, & no connection among them.<<\n")
         return
     
     elif node_target['type']=='Product':
@@ -158,7 +154,7 @@ def plot_tensor_node_connection(ns, node_id : int = 0):
         # nx.draw_networkx_nodes(G, pos, nodelist=prod_node_list, node_color="#A2C8DD", **options) # blue is product nodes
         # nx.draw_networkx_edges(G, pos, width=0.1)
         
-        #adjacency matrix heatmap plot
+        # Adjacency matrix heatmap plot
         fig, ax = plt.subplots()
         ax.spy(adjacency_manual)
         ax.set_aspect('auto')
