@@ -2164,7 +2164,7 @@ class SumLayer(Layer, nn.Module):
         TILE_SIZE_K = min(2048 // TILE_SIZE_B, num_edges)
         
         if propagation_alg_id == 1:
-            # The kernel will stale if the tile sizes are too large
+            # The kernel will stall if the tile sizes are too large
             TILE_SIZE_M = 16
             TILE_SIZE_K = 16
             TILE_SIZE_B = 16
