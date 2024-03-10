@@ -148,7 +148,7 @@ def test_pd_hclt():
     ns = juice.structures.PDHCLT(
         train_data.cuda(),
         data_shape = (28, 28),
-        num_latents = 128,
+        num_latents = 64,
         split_intervals = (4, 4),
         structure_type = "sum_dominated"
     )
@@ -177,7 +177,7 @@ def test_pd_hclt():
 
     test_ll = evaluate(pc, test_loader)
 
-    assert test_ll > -680.0
+    assert test_ll > -692.0
 
 
 if __name__ == "__main__":

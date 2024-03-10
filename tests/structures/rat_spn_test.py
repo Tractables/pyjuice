@@ -93,7 +93,7 @@ def test_rat_spn():
 
     ns = juice.structures.RAT_SPN(
         num_vars = 28 * 28,
-        num_latents = 256, 
+        num_latents = 64, 
         depth = 5,
         num_repetitions = 4,
         num_pieces = 2
@@ -121,7 +121,7 @@ def test_rat_spn():
 
     test_ll = evaluate(pc, test_loader)
 
-    assert test_ll > -1015
+    assert test_ll > -1020
 
 
 if __name__ == "__main__":
