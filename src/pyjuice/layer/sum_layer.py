@@ -1410,7 +1410,7 @@ class SumLayer(Layer, nn.Module):
                 BLOCK_M = BLOCK_M, 
                 BLOCK_SIZE_M = BLOCK_SIZE_M,
                 propagation_alg_id = propagation_alg_id,
-                **kwargs
+                **propagation_alg_kwargs
             )
 
         else:
@@ -1435,7 +1435,7 @@ class SumLayer(Layer, nn.Module):
                 TILE_SIZE_M = TILE_SIZE_M,
                 BLOCK_SIZE_M = BLOCK_SIZE_M,
                 propagation_alg_id = propagation_alg_id,
-                **kwargs
+                **propagation_alg_kwargs
             )
 
         return None
