@@ -52,7 +52,7 @@ def load_penn_treebank(seq_length = 32):
     return train_data, valid_data, test_data
 
 
-def train(pc, num_epochs, train_loader, valid_loader, device):
+def train(pc, num_epochs, train_loader, valid_loader, device, propagation_alg, **kwargs):
 
     best_valid_ll = -10000.0
     for epoch in range(1, num_epochs + 1):
@@ -61,7 +61,7 @@ def train(pc, num_epochs, train_loader, valid_loader, device):
         for batch in train_loader:
             x = batch[0].to(device)
 
-            lls = pc(x, propagation_alg = "GeneralLL", alpha = 1.2)
+            lls = pc(x, propagation_alg = propagation_alg, **kwargs)
             lls.mean().backward()
 
             train_ll += lls.mean().detach().cpu().numpy().item()
@@ -93,8 +93,7 @@ def train(pc, num_epochs, train_loader, valid_loader, device):
     return best_valid_ll
 
 
-@pytest.mark.slow
-def test_hmm_general_ll():
+def test_hmm_em():
     
     device = torch.device("cuda:0")
 
@@ -130,13 +129,13 @@ def test_hmm_general_ll():
     pc = juice.compile(root_ns)
     pc.to(device)
 
-    best_valid_ll = train(pc, 40, train_loader, valid_loader, device)
+    best_valid_ll = train(pc, 20, train_loader, valid_loader, device, propagation_alg = "LL")
 
-    assert best_valid_ll > -85.0
+    assert best_valid_ll > -95.0
 
 
 @pytest.mark.slow
-def test_hmm_general_ll_slow():
+def test_hmm_em_slow():
     
     device = torch.device("cuda:0")
 
@@ -172,53 +171,11 @@ def test_hmm_general_ll_slow():
     pc = juice.compile(root_ns)
     pc.to(device)
 
-    best_valid_ll = train(pc, 300, train_loader, valid_loader, device)
+    best_valid_ll = train(pc, 200, train_loader, valid_loader, device, propagation_alg = "LL")
 
-    assert best_valid_ll > -85.0
-
-
-def test_hmm_general_ll_fast():
-    
-    device = torch.device("cuda:0")
-
-    seq_length = 32
-
-    train_data, valid_data, test_data = load_penn_treebank(seq_length = seq_length)
-
-    vocab_size = train_data.max().item() + 1
-
-    train_loader = DataLoader(
-        dataset = TensorDataset(train_data),
-        batch_size = 512,
-        shuffle = True,
-        drop_last = True
-    )
-    valid_loader = DataLoader(
-        dataset = TensorDataset(valid_data),
-        batch_size = 512,
-        shuffle = False,
-        drop_last = True
-    )
-
-    print(f"> Number of training samples: {train_data.size(0)}")
-    print(f"> Number of validation samples: {valid_data.size(0)}")
-
-    root_ns = juice.structures.HMM(
-        seq_length = seq_length,
-        num_latents = 64,
-        num_emits = vocab_size,
-        homogeneous = True
-    )
-
-    pc = juice.compile(root_ns)
-    pc.to(device)
-
-    best_valid_ll = train(pc, 10, train_loader, valid_loader, device)
-
-    assert best_valid_ll > -92.0
+    assert best_valid_ll > -95.0
 
 
 if __name__ == "__main__":
-    # test_hmm_general_ll()
-    # test_hmm_general_ll_fast()
-    test_hmm_general_ll_slow()
+    test_hmm_em()
+    test_hmm_em_slow()
