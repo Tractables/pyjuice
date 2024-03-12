@@ -494,9 +494,9 @@ class SumLayer(Layer, nn.Module):
 
                 if use_fp16 == 1:
                     # Built-in matmul kernel of triton + float16
-                    epars_fp16 = (epars * (2**12)).to(tl.float16)
+                    epars_fp16 = epars.to(tl.float16)
                     emars_fp16 = emars_sub.to(tl.float16)
-                    nmars = tl.dot(epars_fp16, emars_fp16).to(tl.float32) / (2**12)
+                    nmars = tl.dot(epars_fp16, emars_fp16).to(tl.float32)
                 else:
                     # Built-in matmul kernel of triton + float32
                     nmars = tl.dot(epars, emars_sub)
@@ -610,9 +610,9 @@ class SumLayer(Layer, nn.Module):
 
                 if use_fp16 == 1:
                     # Simulated matmul kernel + float16
-                    epars = (epars * (2**4)).to(tl.float16)
-                    emars_sub = emars_sub.to(tl.float16)
-                    nmars = tl.sum(epars[:,:,None] * emars_sub[None,:,:], axis = 1).to(tl.float32) / (2**4)
+                    epars = epars.to(tl.bfloat16)
+                    emars_sub = emars_sub.to(tl.bfloat16)
+                    nmars = tl.sum(epars[:,:,None] * emars_sub[None,:,:], axis = 1).to(tl.float32)
                 else:
                     # Simulated matmul kernel + float32
                     nmars = tl.sum(epars[:,:,None] * emars_sub[None,:,:], axis = 1)
