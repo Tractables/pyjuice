@@ -1956,11 +1956,14 @@ class SumLayer(Layer, nn.Module):
 
             else:
 
-                if propagation_alg_id == 2:
-                    emars *= alpha
+                # if propagation_alg_id == 2:
+                #     emars *= alpha
 
                 if allow_modify_flows == 1:
                     log_n_fdm = tl.load(nflows_ptr, mask = mask_batch[None,:], other = -float("inf")) # [TILE_SIZE_M, TILE_SIZE_B]
+                    nmars = tl.load(nmars_ptr, mask = mask_batch[None,:], other = 0.0) # [TILE_SIZE_M, TILE_SIZE_B]
+
+                    log_n_fdm += (1.0 - alpha) * nmars
                 else:
                     nflows = tl.load(nflows_ptr, mask = mask_batch[None,:], other = 0.0) # [TILE_SIZE_M, TILE_SIZE_B]
                     nmars = tl.load(nmars_ptr, mask = mask_batch[None,:], other = 0.0) # [TILE_SIZE_M, TILE_SIZE_B]
@@ -1969,7 +1972,7 @@ class SumLayer(Layer, nn.Module):
                         log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), tl.log(nflows) - nmars)
 
                     if propagation_alg_id == 2:
-                        log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), tl.log(nflows) - nmars * alpha)
+                        log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), tl.log(nflows) - nmars)
 
                 log_n_fdm_max = tl.max(log_n_fdm, axis = 0)
                 n_fdm_sub = tl.where(log_n_fdm_max[None,:] != -float("inf"), tl.exp(log_n_fdm - log_n_fdm_max[None,:]), 0.0)
@@ -1999,8 +2002,8 @@ class SumLayer(Layer, nn.Module):
             epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
             epars = tl.load(params + epars_offsets)
 
-        if propagation_alg_id == 2:
-            epars = tl.exp(tl.log(epars) * alpha)
+        # if propagation_alg_id == 2:
+        #     epars = tl.exp(tl.log(epars) * alpha)
 
         if propagation_alg_id != 1:
             pflows = acc * epars
@@ -2066,11 +2069,14 @@ class SumLayer(Layer, nn.Module):
 
             else:
 
-                if propagation_alg_id == 2:
-                    emars *= alpha
+                # if propagation_alg_id == 2:
+                #     emars *= alpha
 
                 if allow_modify_flows == 1:
                     log_n_fdm = tl.load(nflows_ptr, mask = mask_batch[:,None], other = -float("inf")) # [TILE_SIZE_B, TILE_SIZE_M]
+                    nmars = tl.load(nmars_ptr, mask = mask_batch[:,None], other = 0.0) # [TILE_SIZE_B, TILE_SIZE_M]
+
+                    log_n_fdm += (1.0 - alpha) * nmars
                 else:
                     nflows = tl.load(nflows_ptr, mask = mask_batch[:,None], other = 0.0) # [TILE_SIZE_B, TILE_SIZE_M]
                     nmars = tl.load(nmars_ptr, mask = mask_batch[:,None], other = 0.0) # [TILE_SIZE_B, TILE_SIZE_M]
@@ -2079,7 +2085,7 @@ class SumLayer(Layer, nn.Module):
                         log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), tl.log(nflows) - nmars)
 
                     if propagation_alg_id == 2:
-                        log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), tl.log(nflows) - nmars * alpha)
+                        log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), tl.log(nflows) - nmars)
 
                 log_n_fdm_max = tl.max(log_n_fdm, axis = 1)
                 n_fdm_sub = tl.where(log_n_fdm_max[:,None] != -float("inf"), tl.exp(log_n_fdm - log_n_fdm_max[:,None]), 0.0)
@@ -2106,8 +2112,8 @@ class SumLayer(Layer, nn.Module):
             epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
             epars = tl.load(params + epars_offsets)
 
-        if propagation_alg_id == 2:
-            epars = tl.exp(tl.log(epars) * alpha)
+        # if propagation_alg_id == 2:
+        #     epars = tl.exp(tl.log(epars) * alpha)
 
         if propagation_alg_id != 1:
             pflows = acc * epars
