@@ -219,6 +219,6 @@ def test_hmm_general_ll_fast():
 
 
 if __name__ == "__main__":
-    # test_hmm_general_ll()
-    # test_hmm_general_ll_fast()
+    test_hmm_general_ll()
+    test_hmm_general_ll_fast()
     test_hmm_general_ll_slow()

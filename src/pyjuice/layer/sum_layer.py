@@ -494,9 +494,9 @@ class SumLayer(Layer, nn.Module):
 
                 if use_fp16 == 1:
                     # Built-in matmul kernel of triton + float16
-                    epars_fp16 = epars.to(tl.bfloat16)
-                    emars_fp16 = emars_sub.to(tl.bfloat16)
-                    nmars = tl.dot(epars_fp16, emars_fp16).to(tl.float32)
+                    epars_fp16 = (epars * (2**12)).to(tl.float16)
+                    emars_fp16 = emars_sub.to(tl.float16)
+                    nmars = tl.dot(epars_fp16, emars_fp16).to(tl.float32) / (2**12)
                 else:
                     # Built-in matmul kernel of triton + float32
                     nmars = tl.dot(epars, emars_sub)
@@ -610,9 +610,9 @@ class SumLayer(Layer, nn.Module):
 
                 if use_fp16 == 1:
                     # Simulated matmul kernel + float16
-                    epars = epars.to(tl.bfloat16)
-                    emars_sub = emars_sub.to(tl.bfloat16)
-                    nmars = tl.sum(epars[:,:,None] * emars_sub[None,:,:], axis = 1).to(tl.float32)
+                    epars = (epars * (2**4)).to(tl.float16)
+                    emars_sub = emars_sub.to(tl.float16)
+                    nmars = tl.sum(epars[:,:,None] * emars_sub[None,:,:], axis = 1).to(tl.float32) / (2**4)
                 else:
                     # Simulated matmul kernel + float32
                     nmars = tl.sum(epars[:,:,None] * emars_sub[None,:,:], axis = 1)
@@ -1961,9 +1961,10 @@ class SumLayer(Layer, nn.Module):
 
                 if allow_modify_flows == 1:
                     log_n_fdm = tl.load(nflows_ptr, mask = mask_batch[None,:], other = -float("inf")) # [TILE_SIZE_M, TILE_SIZE_B]
-                    nmars = tl.load(nmars_ptr, mask = mask_batch[None,:], other = 0.0) # [TILE_SIZE_M, TILE_SIZE_B]
 
-                    log_n_fdm += (1.0 - alpha) * nmars
+                    if propagation_alg_id == 2:
+                        nmars = tl.load(nmars_ptr, mask = mask_batch[None,:], other = 0.0) # [TILE_SIZE_M, TILE_SIZE_B]
+                        log_n_fdm += (alpha - 1.0) * nmars
                 else:
                     nflows = tl.load(nflows_ptr, mask = mask_batch[None,:], other = 0.0) # [TILE_SIZE_M, TILE_SIZE_B]
                     nmars = tl.load(nmars_ptr, mask = mask_batch[None,:], other = 0.0) # [TILE_SIZE_M, TILE_SIZE_B]
@@ -2074,9 +2075,10 @@ class SumLayer(Layer, nn.Module):
 
                 if allow_modify_flows == 1:
                     log_n_fdm = tl.load(nflows_ptr, mask = mask_batch[:,None], other = -float("inf")) # [TILE_SIZE_B, TILE_SIZE_M]
-                    nmars = tl.load(nmars_ptr, mask = mask_batch[:,None], other = 0.0) # [TILE_SIZE_B, TILE_SIZE_M]
 
-                    log_n_fdm += (1.0 - alpha) * nmars
+                    if propagation_alg_id == 2:
+                        nmars = tl.load(nmars_ptr, mask = mask_batch[:,None], other = 0.0) # [TILE_SIZE_B, TILE_SIZE_M]
+                        log_n_fdm += (alpha - 1.0) * nmars
                 else:
                     nflows = tl.load(nflows_ptr, mask = mask_batch[:,None], other = 0.0) # [TILE_SIZE_B, TILE_SIZE_M]
                     nmars = tl.load(nmars_ptr, mask = mask_batch[:,None], other = 0.0) # [TILE_SIZE_B, TILE_SIZE_M]
@@ -2625,12 +2627,18 @@ class SumLayer(Layer, nn.Module):
 
             else:
 
-                if propagation_alg_id == 2:
-                    emars *= alpha
+                # if propagation_alg_id == 2:
+                #     emars *= alpha
 
                 if allow_modify_flows == 1:
                     log_n_fdm = tl.load(nflows_ptr, mask = mask_batch, other = -float("inf")) # [BLOCK_B]
-                    pflows = tl.sum(tl.exp(emars + log_n_fdm[None,:]), axis = 1)
+
+                    if propagation_alg_id == 0:
+                        pflows = tl.sum(tl.exp(emars + log_n_fdm[None,:]), axis = 1)
+                    
+                    if propagation_alg_id == 2:
+                        nmars = tl.load(nmars_ptr, mask = mask_batch, other = 0.0) # [BLOCK_B]
+                        pflows = tl.sum(tl.exp(emars + log_n_fdm[None,:] + (alpha - 1.0) * nmars[None,:]), axis = 1)
                 else:
                     nmars = tl.load(nmars_ptr, mask = mask_batch, other = 0.0) # [BLOCK_B]
                     nflows = tl.load(nflows_ptr, mask = mask_batch, other = 0.0) # [BLOCK_B]
@@ -2639,7 +2647,7 @@ class SumLayer(Layer, nn.Module):
                         pflows = tl.sum(nflows[None,:] * tl.exp(emars - nmars[None,:]), axis = 1)
 
                     if propagation_alg_id == 2:
-                        pflows = tl.sum(nflows[None,:] * tl.exp(emars - nmars[None,:] * alpha), axis = 1)
+                        pflows = tl.sum(nflows[None,:] * tl.exp(emars - nmars[None,:]), axis = 1)
 
                 acc += pflows
 
@@ -2653,8 +2661,8 @@ class SumLayer(Layer, nn.Module):
             epars_ptr = params + par_start + tile_id
             epars = tl.load(epars_ptr) # [BLOCK_K]
 
-        if propagation_alg_id == 2:
-            epars = tl.exp(tl.log(epars) * alpha)
+        # if propagation_alg_id == 2:
+        #     epars = tl.exp(tl.log(epars) * alpha)
 
         parflow_start = tl.load(pfids + nblock_id * num_edges + offs_edge)
         eparflows_ptr = param_flows + parflow_start + tile_id

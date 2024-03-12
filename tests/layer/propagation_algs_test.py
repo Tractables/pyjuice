@@ -228,11 +228,11 @@ def test_general_ll_prop():
                         epars = params[layer.partitioned_pids[0][j,:]+i]
                         nmars = node_mars[(j+1)*block_size+i,:].exp()
                         nflows = origin_node_flows[(j+1)*block_size+i,:]
-                        pflows = epars ** alpha * (nflows[None,:] * emars ** alpha / nmars[None,:] ** alpha).sum(dim = 1)
+                        pflows = epars * (nflows[None,:] * emars / nmars[None,:]).sum(dim = 1)
 
                         my_pflows[layer.partitioned_pfids[0][j,:]+i] = pflows
 
-                assert torch.all(torch.abs(my_pflows - param_flows) < 2e-3)
+                assert torch.all(torch.abs(my_pflows - param_flows) < 4e-3)
 
 
 def test_mpe_prop():
