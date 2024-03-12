@@ -407,6 +407,15 @@ class TensorCircuit(nn.Module):
         else:
             return None
 
+    def forward_ll(self, *args, **kwargs):
+        self.forward(*args, propagation_alg = "LL", **kwargs)
+
+    def forward_mpe(self, *args, **kwargs):
+        self.forward(*args, propagation_alg = "MPE", **kwargs)
+
+    def forward_general_ll(self, *args, alpha: float = 1.0, **kwargs):
+        self.forward(*args, propagation_alg = "GeneralLL", **kwargs)
+
     def mini_batch_em(self, step_size: float, pseudocount: float = 0.0, keep_zero_params: bool = False):
         """
         Perform an EM parameter update step using the accumulated parameter flows.
