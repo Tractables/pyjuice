@@ -191,8 +191,6 @@ def test_hclt_single_layer_backward():
 
 def test_hclt_backward():
 
-    torch.manual_seed(18329)
-
     device = torch.device("cuda:0")
 
     train_dataset = torchvision.datasets.MNIST(root = "./examples/data", train = True, download = True)
@@ -232,8 +230,17 @@ def test_hclt_backward():
     node_mars = pc.node_mars
     node_flows = pc.node_flows
 
+    temp_node_mars = pc.node_mars.clone()
+    temp_node_flows = pc.node_flows.clone()
+    temp_element_mars = pc.element_mars.clone()
+    temp_element_flows = pc.element_flows.clone()
+    temp_params = pc.params
+    temp_param_flows = pc.param_flows.clone()
+
     ns2flows = dict()
     ns2flows[root_ns] = torch.ones([1, batch_size], device = device)
+
+    gt_ch_flows = dict()
 
     ch2par = dict()
     for ns in root_ns:
@@ -279,8 +286,14 @@ def test_hclt_backward():
                         ns2flows[cs] = torch.zeros([num_latents, batch_size], device = device)
                     ns2flows[cs] += eflows
 
+                    gt_ch_flows[cs] = eflows.detach().clone()
+
             elif ns.is_prod():
                 nflows = ns2flows[ns]
+                gt_flows = gt_ch_flows[ns]
+
+                assert torch.all(torch.abs(gt_flows - nflows) < 1e-4)
+
                 for cs in ns.chs:
                     if cs not in ns2flows:
                         ns2flows[cs] = torch.zeros([num_latents, batch_size], device = device)
@@ -301,8 +314,14 @@ def test_hclt_backward():
                 #     assert torch.all(torch.abs(nflows - node_flows[sid:eid,:]) < 1e-3)
 
                 # ns2flows[ns] = node_flows[sid:eid,:]
+                # print(">>>>>>", torch.abs(nflows - node_flows[sid:eid,:]).max())
+
+                nflows = node_flows[sid:eid,:]
 
                 nmars = node_mars[sid:eid,:]
+
+                ch_eflows = []
+                ch_pflows = []
 
                 for i, cs in enumerate(ns.chs):
                     params = ns._params.reshape(num_blocks, num_blocks * ns.num_chs, block_size, block_size).permute(0, 2, 1, 3).to(device)
@@ -322,11 +341,70 @@ def test_hclt_backward():
                     eflows = (nflows[None,:,:] * (params.permute(1, 0).log()[:,:,None] + emars[:,None,:] - nmars[None,:,:]).exp()).sum(dim = 1)
                     pflows = (nflows[None,:,:] * (params.permute(1, 0).log()[:,:,None] + emars[:,None,:] - nmars[None,:,:]).exp()).sum(dim = 2).permute(1, 0)
 
+                    # log_n_fdm = nflows.log() - nmars
+                    # log_n_fdm_max = log_n_fdm.max(dim = 0).values
+                    # n_fdm_sub = (log_n_fdm - log_n_fdm_max[None,:]).exp()
+
+                    # eflows_prim = torch.matmul(params.permute(1, 0), n_fdm_sub) * (emars + log_n_fdm_max[None,:]).exp()
+
+                    # From `pc`
+                    pc_eflows = (node_flows[sid:eid,:][None,:,:] * (params.permute(1, 0).log()[:,:,None] + emars[:,None,:] - nmars[None,:,:]).exp()).sum(dim = 1)
+                    pc_pflows = (node_flows[sid:eid,:][None,:,:] * (params.permute(1, 0).log()[:,:,None] + emars[:,None,:] - nmars[None,:,:]).exp()).sum(dim = 2).permute(1, 0)
+
+                    # log_n_fdm = node_flows[sid:eid,:].log() - nmars
+                    # log_n_fdm_max = log_n_fdm.max(dim = 0).values
+                    # n_fdm_sub = (log_n_fdm - log_n_fdm_max[None,:]).exp()
+
+                    # pc_eflows_prim = torch.matmul(params.permute(1, 0), n_fdm_sub) * (emars + log_n_fdm_max[None,:]).exp()
+
+                    # print(torch.abs(eflows - pc_eflows).max())
+
+                    ch_eflows.append(eflows)
+                    ch_pflows.append(pflows)
+
                     assert torch.all(torch.abs(pflows - param_flows) < 1e-3 * batch_size)
 
                     if cs not in ns2flows:
                         ns2flows[cs] = torch.zeros([num_latents, batch_size], device = device)
                     ns2flows[cs] += eflows
+
+                ## Run the actual layer ##
+
+                curr_layer_id = -1
+                curr_layer = None
+                for layer_id in range(1, len(pc.inner_layer_groups), 2):
+                    layer = pc.inner_layer_groups[layer_id][0]
+                    if ns in layer.nodes:
+                        curr_layer_id = layer_id
+                        curr_layer = layer
+
+                assert curr_layer is not None
+
+                nsid, neid = ns._output_ind_range
+
+                temp_node_flows[nsid:neid,:] = nflows
+                temp_param_flows[:] = 0.0
+
+                pc.inner_layer_groups[curr_layer_id - 1].forward(temp_node_mars, temp_element_mars, _for_backward = True)
+
+                curr_layer.backward(temp_node_flows, temp_element_flows, temp_node_mars, temp_element_mars, temp_params, 
+                                    param_flows = temp_param_flows, allow_modify_flows = False, propagation_alg = "LL")
+
+                pfsid, pfeid = ns._param_flow_range
+
+                for i, cs in enumerate(ns.chs):
+                    eflows = ch_eflows[i]
+                    pflows = ch_pflows[i]
+
+                    csid, ceid = cs._output_ind_range
+
+                    # print("value", torch.abs(eflows - temp_element_flows[csid:ceid,:]).max())
+
+                    assert torch.all(torch.abs(eflows - temp_element_flows[csid:ceid,:]) < 1e-3)
+                    assert torch.all(torch.abs(temp_param_flows[pfsid:pfeid].reshape(num_latents, num_latents) - pflows.permute(1, 0)) < batch_size * 1e-4)
+
+                    assert cs not in gt_ch_flows
+                    gt_ch_flows[cs] = eflows.detach().clone()
 
 
 def test_hclt_em():
@@ -411,7 +489,6 @@ def test_hclt_em():
 
 
 if __name__ == "__main__":
-    # torch.manual_seed(320942)
     test_hclt_forward()
     test_hclt_single_layer_backward()
     test_hclt_backward()
