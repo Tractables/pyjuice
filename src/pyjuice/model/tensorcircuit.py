@@ -847,12 +847,12 @@ class TensorCircuit(nn.Module):
                             ns.chs[idx] = pass_prod_ns
 
                             depth2nodes[cs_depth]["sum"].append(pass_sum_ns)
-                            depth2nodes[depth]["prod"].append(pass_prod_ns)
 
                             nodes2depth[pass_sum_ns] = cs_depth
                             nodes2depth[pass_prod_ns] = depth
 
                     depth2nodes[depth]["sum"].append(ns)
+
                     if ns.block_size > max_node_block_size:
                         max_node_block_size = ns.block_size
                 elif ns.is_prod():
@@ -872,6 +872,7 @@ class TensorCircuit(nn.Module):
                             assert pns2layer[id(cs)] == layer, "Disallowed circumstance: a product node requested by sum nodes at different layers."
                         else:
                             depth2nodes[layer]["prod"].append(cs)
+
                             pns2layer[id(cs)] = layer
 
         return depth2nodes, num_layers, max_node_block_size, max_ele_block_size

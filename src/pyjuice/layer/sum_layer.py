@@ -40,6 +40,7 @@ class SumLayer(Layer, nn.Module):
         nn.Module.__init__(self)
 
         assert len(nodes) > 0, "No input node."
+        assert len(nodes) == len(set(nodes)), "Input node list contains duplicates."
 
         self.nodes = nodes
 
