@@ -137,10 +137,8 @@ def test_non_sd_generalized_em():
 
     pc.update_parameters()
 
-    import pdb; pdb.set_trace()
-
 
 if __name__ == "__main__":
     torch.manual_seed(129)
-    # test_non_sd()
+    test_non_sd()
     test_non_sd_generalized_em()

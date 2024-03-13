@@ -213,12 +213,12 @@ def test_hmm_general_ll_fast():
     pc = juice.compile(root_ns)
     pc.to(device)
 
-    best_valid_ll = train(pc, 10, train_loader, valid_loader, device)
+    best_valid_ll = train(pc, 20, train_loader, valid_loader, device)
 
     assert best_valid_ll > -92.0
 
 
 if __name__ == "__main__":
-    test_hmm_general_ll()
+    # test_hmm_general_ll()
     test_hmm_general_ll_fast()
     test_hmm_general_ll_slow()

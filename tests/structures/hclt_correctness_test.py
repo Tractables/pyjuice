@@ -189,6 +189,102 @@ def test_hclt_single_layer_backward():
                 assert torch.all(torch.abs(fpars - pflows) < 3e-4 * batch_size)
 
 
+def test_hclt_single_layer_backward_general_em():
+
+    device = torch.device("cuda:0")
+
+    train_dataset = torchvision.datasets.MNIST(root = "./examples/data", train = True, download = True)
+
+    train_data = train_dataset.data.reshape(60000, 28*28)[:5000,:]
+
+    num_features = train_data.size(1)
+    num_latents = 128
+
+    root_ns = juice.structures.HCLT(
+        train_data.float().to(device), 
+        num_bins = 32, 
+        sigma = 0.5 / 32, 
+        num_latents = num_latents, 
+        chunk_size = 32
+    )
+    root_ns.init_parameters()
+
+    pc = juice.TensorCircuit(root_ns)
+
+    pc.to(device)
+
+    block_size = root_ns.chs[0].block_size
+    num_blocks = num_latents // block_size
+
+    batch_data = train_data[:512,:].contiguous().to(device)
+    data_cpu = batch_data.cpu().long()
+    batch_size = batch_data.size(0)
+
+    alpha = 2.0
+
+    pc.init_param_flows(flows_memory = 0.0)
+
+    lls = pc(batch_data, propagation_alg = "GeneralLL", alpha = alpha)
+    pc.backward(batch_data.permute(1, 0), allow_modify_flows = False,
+                propagation_alg = "GeneralLL", alpha = alpha)
+
+    pc.update_param_flows()
+
+    for layer_id in range(1, len(pc.inner_layer_groups) - 2, 2):
+
+        node_mars = pc.node_mars.clone()
+        node_flows = pc.node_flows.clone()
+        element_mars = pc.element_mars.clone()
+        element_flows = pc.element_flows.clone()
+        params = pc.params.clone()
+        param_flows = pc.param_flows.clone().zero_()
+
+        my_layer = pc.inner_layer_groups[layer_id][0]
+        previous_layer = pc.inner_layer_groups[layer_id-1][0]
+
+        previous_layer.forward(node_mars, element_mars, _for_backward = True)
+
+        my_layer.backward(node_flows, element_flows, node_mars, element_mars, params, 
+                          param_flows = param_flows, allow_modify_flows = False, 
+                          propagation_alg = "GeneralLL", alpha = alpha)
+
+        chids = my_layer.partitioned_chids[0]
+        parids = my_layer.partitioned_parids[0]
+        parpids = my_layer.partitioned_parpids[0]
+
+        nids = my_layer.partitioned_nids[0]
+        cids = my_layer.partitioned_cids[0]
+        pids = my_layer.partitioned_pids[0]
+        pfids = my_layer.partitioned_pfids[0]
+
+        for i in range(chids.size(0)):
+            eflows = torch.zeros([block_size, batch_size], dtype = torch.float32, device = device)
+
+            for j in range(parids.size(1)):
+                nflows = node_flows[parids[i,j]:parids[i,j]+block_size,:] # [num_par_nodes, batch_size]
+                nmars = node_mars[parids[i,j]:parids[i,j]+block_size,:] # [num_par_nodes, batch_size]
+                emars = element_mars[chids[i]:chids[i]+block_size,:] # [num_ch_nodes, batch_size]
+                epars = params[parpids[i,j]:parpids[i,j]+block_size**2].reshape(block_size, block_size) # [num_ch_nodes, num_par_nodes]
+                fpars = param_flows[pfids[i,j]:pfids[i,j]+block_size**2].reshape(block_size, block_size) # [num_ch_nodes, num_par_nodes]
+
+                curr_eflows = (nflows[None,:,:] * ((epars.log()[:,:,None] + emars[:,None,:] - nmars[None,:,:]) * alpha).exp()).sum(dim = 1)
+                eflows += curr_eflows
+
+            assert torch.all(torch.abs(eflows - element_flows[chids[i]:chids[i]+block_size,:]) < 1e-3)
+
+        for i in range(nids.size(0)):
+            for j in range(0, cids.size(1), block_size):
+                nflows = node_flows[nids[i]:nids[i]+block_size,:] # [num_par_nodes, batch_size]
+                nmars = node_mars[nids[i]:nids[i]+block_size,:] # [num_par_nodes, batch_size]
+                emars = element_mars[cids[i,j]:cids[i,j]+block_size,:] # [num_ch_nodes, batch_size]
+                epars = params[pids[i,j]:pids[i,j]+block_size**2].reshape(block_size, block_size) # [num_ch_nodes, num_par_nodes]
+                fpars = param_flows[pfids[i,j]:pfids[i,j]+block_size**2].reshape(block_size, block_size) # [num_ch_nodes, num_par_nodes]
+
+                pflows = (nflows[None,:,:] * (epars.log()[:,:,None] + emars[:,None,:] - nmars[None,:,:]).exp()).sum(dim = 2)
+
+                assert torch.all(torch.abs(fpars - pflows) < 3e-4 * batch_size)
+
+
 def test_hclt_backward():
 
     device = torch.device("cuda:0")
@@ -497,3 +593,4 @@ if __name__ == "__main__":
     test_hclt_single_layer_backward()
     test_hclt_backward()
     test_hclt_em()
+    test_hclt_single_layer_backward_general_em()
