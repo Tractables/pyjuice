@@ -503,7 +503,7 @@ class SumLayer(Layer, nn.Module):
                     nmars = tl.dot(epars, emars_sub)
 
                 acc = tl.where(emars_max > acc,
-                    tl.log(nmars + tl.exp(acc - emars_max)) + emars_max,
+                    tl.log(nmars + tl.exp(acc - emars_max) + 1e-12) + emars_max,
                     tl.log(tl.exp(emars_max - acc) * nmars + 1.0) + acc
                 )
 
@@ -619,7 +619,7 @@ class SumLayer(Layer, nn.Module):
                     nmars = tl.sum(epars[:,:,None] * emars_sub[None,:,:], axis = 1)
 
                 acc = tl.where(emars_max > acc,
-                    tl.log(nmars + tl.exp(acc - emars_max)) + emars_max,
+                    tl.log(nmars + tl.exp(acc - emars_max) + 1e-12) + emars_max,
                     tl.log(tl.exp(emars_max - acc) * nmars + 1.0) + acc
                 )
 
@@ -729,7 +729,7 @@ class SumLayer(Layer, nn.Module):
                 nmars = tl.sum(epars[:,:,None] * tl.trans(emars_sub)[None,:,:], axis = 1)
 
                 acc = tl.where(emars_max[None,:] > acc,
-                    tl.log(nmars + tl.exp(acc - emars_max[None,:])) + emars_max[None,:],
+                    tl.log(nmars + tl.exp(acc - emars_max[None,:]) + 1e-12) + emars_max[None,:],
                     tl.log(tl.exp(emars_max[None,:] - acc) * nmars + 1.0) + acc
                 )
 
