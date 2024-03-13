@@ -30,6 +30,8 @@ class InputLayer(Layer, nn.Module):
                                            in gradient accumulation.
         """
 
+        assert len(nodes) == len(set(nodes)), "Input node list contains duplicates."
+
         nn.Module.__init__(self)
         Layer.__init__(self, nodes, disable_block_size_check = True)
 

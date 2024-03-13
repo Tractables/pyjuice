@@ -27,6 +27,7 @@ class ProdLayer(Layer, nn.Module):
         nn.Module.__init__(self)
 
         assert len(nodes) > 0, "No input node."
+        assert len(nodes) == len(set(nodes)), "Input node list contains duplicates."
 
         use_block_sparse_edges = True
         for nid in range(0, len(nodes)):
