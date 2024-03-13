@@ -101,6 +101,46 @@ def test_non_sd():
     assert torch.all(torch.abs(bk78 - pc.node_flows[7:9,0].cpu()) < 1e-4)
 
 
+def test_non_sd_generalized_em():
+    ni1 = inputs(0, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
+    ni2 = inputs(1, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
+    ni3 = inputs(2, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
+    ni4 = inputs(3, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
+
+    np12 = multiply(ni1, ni2)
+    np23 = multiply(ni2, ni3)
+    np34 = multiply(ni3, ni4)
+
+    ns12 = summate(np12, num_nodes = 2)
+    ns23 = summate(np23, num_nodes = 2)
+    ns34 = summate(np34, num_nodes = 2)
+
+    np1 = multiply(ns12, ns34)
+    np2 = multiply(ni1, ns23, ni4)
+    np3 = multiply(ni1, ni2, ns34)
+
+    ns = summate(np1, np2, np3, num_nodes = 1)
+
+    pc = TensorCircuit(ns)
+
+    device = torch.device("cuda:0")
+    pc.to(device)
+
+    data = torch.randint(0, 2, [16, 4]).to(device)
+
+    alpha = 2.0
+
+    lls = pc(data, propagation_alg = "GeneralLL", alpha = alpha)
+
+    pc.backward(data.permute(1, 0), allow_modify_flows = False,
+                propagation_alg = "GeneralLL", alpha = alpha)
+
+    pc.update_parameters()
+
+    import pdb; pdb.set_trace()
+
+
 if __name__ == "__main__":
     torch.manual_seed(129)
-    test_non_sd()
+    # test_non_sd()
+    test_non_sd_generalized_em()

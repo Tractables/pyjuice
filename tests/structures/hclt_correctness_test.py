@@ -341,11 +341,14 @@ def test_hclt_backward():
                     eflows = (nflows[None,:,:] * (params.permute(1, 0).log()[:,:,None] + emars[:,None,:] - nmars[None,:,:]).exp()).sum(dim = 1)
                     pflows = (nflows[None,:,:] * (params.permute(1, 0).log()[:,:,None] + emars[:,None,:] - nmars[None,:,:]).exp()).sum(dim = 2).permute(1, 0)
 
-                    # log_n_fdm = nflows.log() - nmars
-                    # log_n_fdm_max = log_n_fdm.max(dim = 0).values
-                    # n_fdm_sub = (log_n_fdm - log_n_fdm_max[None,:]).exp()
+                    log_n_fdm = nflows.log() - nmars
+                    log_n_fdm_max = log_n_fdm.max(dim = 0).values
+                    n_fdm_sub = (log_n_fdm - log_n_fdm_max[None,:]).exp()
 
-                    # eflows_prim = torch.matmul(params.permute(1, 0), n_fdm_sub) * (emars + log_n_fdm_max[None,:]).exp()
+                    eflows_prim = torch.matmul(params.permute(1, 0), n_fdm_sub) * (emars + log_n_fdm_max[None,:]).exp()
+
+                    scaled_emars = (emars + log_n_fdm_max[None,:]).exp()
+                    pflows_prim = torch.matmul(n_fdm_sub, scaled_emars.permute(1, 0)) * params
 
                     # From `pc`
                     pc_eflows = (node_flows[sid:eid,:][None,:,:] * (params.permute(1, 0).log()[:,:,None] + emars[:,None,:] - nmars[None,:,:]).exp()).sum(dim = 1)
@@ -357,7 +360,8 @@ def test_hclt_backward():
 
                     # pc_eflows_prim = torch.matmul(params.permute(1, 0), n_fdm_sub) * (emars + log_n_fdm_max[None,:]).exp()
 
-                    # print(torch.abs(eflows - pc_eflows).max())
+                    # print(torch.abs(eflows - eflows_prim).max())
+                    # print(torch.abs(pflows - pflows_prim).max())
 
                     ch_eflows.append(eflows)
                     ch_pflows.append(pflows)
