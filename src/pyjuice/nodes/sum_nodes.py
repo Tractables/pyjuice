@@ -71,6 +71,10 @@ class SumNodes(CircuitNodes):
         """
         return self.edge_ids.size(1) * self.block_size * self.ch_block_size
 
+    @property
+    def num_ch_nodes(self):
+        return self.num_ch_node_blocks * self.ch_block_size
+
     def duplicate(self, *args, tie_params: bool = False) -> SumNodes:
         """
         Create a duplication of the current node with the same specification (i.e., number of nodes, block size).
