@@ -139,7 +139,7 @@ class TensorCircuit(nn.Module):
     def forward(self, inputs: torch.Tensor, input_layer_fn: Optional[Union[str,Callable]] = None,
                 cache: Optional[dict] = None, return_cache: bool = False, record_cudagraph: bool = False, 
                 apply_cudagraph: bool = True, force_use_fp16: bool = False, force_use_fp32: bool = False, 
-                propagation_alg: Optional[str] = None, **kwargs):
+                propagation_alg: Optional[Union[str,Sequence[str]]] = None, **kwargs):
         """
         Forward evaluation of the PC.
 
@@ -191,7 +191,7 @@ class TensorCircuit(nn.Module):
 
             # Inner layers
             def _run_inner_layers():
-                for layer_group in self.inner_layer_groups:
+                for layer_id, layer_group in enumerate(self.inner_layer_groups):
                     if layer_group.is_prod():
                         # Prod layer
                         layer_group(self.node_mars, self.element_mars)
@@ -201,7 +201,8 @@ class TensorCircuit(nn.Module):
                         layer_group(self.node_mars, self.element_mars, self.params, 
                                     force_use_fp16 = force_use_fp16,
                                     force_use_fp32 = force_use_fp32, 
-                                    propagation_alg = propagation_alg, **kwargs)
+                                    propagation_alg = propagation_alg if isinstance(propagation_alg, str) else propagation_alg[layer_id], 
+                                    **kwargs)
 
                     else:
                         raise ValueError(f"Unknown layer type {type(layer)}.")
@@ -273,7 +274,7 @@ class TensorCircuit(nn.Module):
                  record_cudagraph: bool = False, 
                  apply_cudagraph: bool = True,
                  allow_modify_flows: bool = True,
-                 propagation_alg: str = "LL",
+                 propagation_alg: Union[str,Sequence[str]] = "LL",
                  **kwargs):
         """
         Backward evaluation of the PC that computes node flows as well as parameter flows.
@@ -348,7 +349,9 @@ class TensorCircuit(nn.Module):
                         # Backward sum layer
                         layer_group.backward(self.node_flows, self.element_flows, self.node_mars, self.element_mars, self.params, 
                                              param_flows = self.param_flows if compute_param_flows else None,
-                                             allow_modify_flows = allow_modify_flows, propagation_alg = propagation_alg, **kwargs)
+                                             allow_modify_flows = allow_modify_flows, 
+                                             propagation_alg = propagation_alg if isinstance(propagation_alg, str) else propagation_alg[layer_id], 
+                                             **kwargs)
 
                     else:
                         raise ValueError(f"Unknown layer type {type(layer)}.")
