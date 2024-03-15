@@ -292,7 +292,7 @@ class ProdLayer(Layer, nn.Module):
             if prop_logsumexp:
                 # Take the logsumexp of the child nodes' values
                 evals_max = tl.max(evals, axis = 2)
-                nvals = tl.sum(tl.exp(evals - evals_max[:,:,None]), axis = 2) + evals_max
+                nvals = tl.log(tl.sum(tl.exp(evals - evals_max[:,:,None]), axis = 2)) + evals_max
             else:
                 # Take the sum of the child nodes' values
                 nvals = tl.sum(evals, axis = 2)
@@ -304,6 +304,7 @@ class ProdLayer(Layer, nn.Module):
             # Accumulate the `node_vals` if required
             if accum:
                 node_vals = tl.load(node_vals_ptr + offs_nvals, mask = mask_batch[:,None], other = 0)
+                
                 if prop_logsumexp:
                     # logaddexp
                     diff = nvals - node_vals
@@ -352,7 +353,7 @@ class ProdLayer(Layer, nn.Module):
             if prop_logsumexp:
                 # Take the logsumexp of the child nodes' values
                 evals_max = tl.max(evals, axis = 2)
-                nvals = tl.sum(tl.exp(evals - evals_max[:,:,None]), axis = 2) + evals_max
+                nvals = tl.log(tl.sum(tl.exp(evals - evals_max[:,:,None]), axis = 2)) + evals_max
             else:
                 # Take the sum of the child nodes' values
                 nvals = tl.sum(evals, axis = 2)
@@ -364,6 +365,7 @@ class ProdLayer(Layer, nn.Module):
             # Accumulate the `node_vals` if required
             if accum:
                 node_vals = tl.load(node_vals_ptr + offs_nvals, mask = mask_batch[:,None], other = 0)
+                
                 if prop_logsumexp:
                     # logaddexp
                     diff = nvals - node_vals
@@ -425,7 +427,7 @@ class ProdLayer(Layer, nn.Module):
             if prop_logsumexp:
                 # Take the logsumexp of the child nodes' values
                 evals_max = tl.max(evals, axis = 0)
-                nvals = tl.sum(tl.exp(evals - evals_max[:,:,None]), axis = 2) + evals_max
+                nvals = tl.log(tl.sum(tl.exp(evals - evals_max[:,:,None]), axis = 2)) + evals_max
             else:
                 # Take the sum of the child nodes' values
                 nvals = tl.sum(evals, axis = 0)
