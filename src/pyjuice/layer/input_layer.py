@@ -302,7 +302,8 @@ class InputLayer(Layer, nn.Module):
             raise NotImplementedError("CPU forward fn for input nodes is not implemented.")
 
     def backward(self, data: torch.Tensor, node_flows: torch.Tensor, 
-                 node_mars: torch.Tensor, params: Optional[Dict] = None, **kwargs):
+                 node_mars: torch.Tensor, params: Optional[Dict] = None,
+                 logspace_flows: bool = False, **kwargs):
         """
         data: [num_vars, B]
         node_flows: [num_nodes, B]
@@ -357,6 +358,7 @@ class InputLayer(Layer, nn.Module):
                 node_offset = node_offset, 
                 BLOCK_SIZE = BLOCK_SIZE, 
                 partial_eval = 1 if bk_local_ids is not None else 0,
+                logspace_flows = logspace_flows,
                 num_warps = 8
             )
 
@@ -683,7 +685,7 @@ class InputLayer(Layer, nn.Module):
 
     @staticmethod
     def _flows_kernel_template(flow_fn, params_ptr, param_flows_ptr, node_flows_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, s_pfids_ptr,
-                               metadata_ptr, s_mids_ptr, bk_local_ids_ptr, partial_eval: tl.constexpr, layer_num_nodes: tl.constexpr, 
+                               metadata_ptr, s_mids_ptr, bk_local_ids_ptr, partial_eval: tl.constexpr, logspace_flows: tl.constexpr, layer_num_nodes: tl.constexpr, 
                                batch_size: tl.constexpr, num_vars_per_node: tl.constexpr, nv_block_size: tl.constexpr, node_offset: tl.constexpr, 
                                BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(axis = 0)
@@ -721,6 +723,9 @@ class InputLayer(Layer, nn.Module):
 
         ns_offsets = (local_offsets + node_offset) * batch_size + batch_offsets
         flows = tl.load(node_flows_ptr + ns_offsets, mask = mask, other = 0)
+
+        if logspace_flows:
+            flows = tl.exp(flows)
 
         flow_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
                 s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE)
