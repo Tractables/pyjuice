@@ -203,7 +203,7 @@ class ProdLayer(Layer, nn.Module):
 
         return None
 
-    def backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor, **kwargs) -> None:
+    def backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor, logspace_flows: bool = False, **kwargs) -> None:
         """
         Computes the backward pass of a product layer:
         ```
@@ -222,7 +222,8 @@ class ProdLayer(Layer, nn.Module):
                 parids = self.partitioned_parids[partition_id]
                 local_ids = self.bk_partition_local_ids[partition_id]
 
-                self._forward_backward(node_flows, element_flows, u_cids, parids, local_ids = local_ids, accum = True)
+                self._forward_backward(node_flows, element_flows, u_cids, parids, local_ids = local_ids, accum = True,
+                                       prop_logsumexp = logspace_flows)
         
         else:
             # Evaluate the whole layer
@@ -230,7 +231,8 @@ class ProdLayer(Layer, nn.Module):
                 u_cids = self.partitioned_u_cids[partition_id]
                 parids = self.partitioned_parids[partition_id]
 
-                self._forward_backward(node_flows, element_flows, u_cids, parids, accum = True)
+                self._forward_backward(node_flows, element_flows, u_cids, parids, accum = True,
+                                       prop_logsumexp = logspace_flows)
         
         return None
 
@@ -427,7 +429,7 @@ class ProdLayer(Layer, nn.Module):
             if prop_logsumexp:
                 # Take the logsumexp of the child nodes' values
                 evals_max = tl.max(evals, axis = 0)
-                nvals = tl.log(tl.sum(tl.exp(evals - evals_max[:,:,None]), axis = 2)) + evals_max
+                nvals = tl.log(tl.sum(tl.exp(evals - evals_max[None,:]), axis = 0)) + evals_max
             else:
                 # Take the sum of the child nodes' values
                 nvals = tl.sum(evals, axis = 0)
