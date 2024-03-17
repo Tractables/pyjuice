@@ -1613,9 +1613,12 @@ class SumLayer(Layer, nn.Module):
 
                 if logspace_flows:
                     partial_flows_max = emars + log_n_fdm_max
-                    acc = tl.where(partial_flows_max > acc,
-                        tl.log(partial_flows + tl.exp(acc - partial_flows_max) + 1e-24) + partial_flows_max,
-                        tl.log(tl.exp(partial_flows_max - acc) * partial_flows + 1.0) + acc
+                    acc = tl.where(log_n_fdm_max == -float("inf"),
+                        acc,
+                        tl.where(partial_flows_max > acc,
+                            tl.log(partial_flows + tl.exp(acc - partial_flows_max) + 1e-24) + partial_flows_max,
+                            tl.log(tl.exp(partial_flows_max - acc) * partial_flows + 1.0) + acc
+                        )
                     )
                 else:
                     acc += partial_flows * tl.exp(emars + log_n_fdm_max)
@@ -1757,9 +1760,12 @@ class SumLayer(Layer, nn.Module):
 
                 if logspace_flows:
                     partial_flows_max = emars + log_n_fdm_max[None,:]
-                    acc = tl.where(partial_flows_max > acc,
-                        tl.log(partial_flows + tl.exp(acc - partial_flows_max) + 1e-24) + partial_flows_max,
-                        tl.log(tl.exp(partial_flows_max - acc) * partial_flows + 1.0) + acc
+                    acc = tl.where(log_n_fdm_max[None,:] == -float("inf"),
+                        acc,
+                        tl.where(partial_flows_max > acc,
+                            tl.log(partial_flows + tl.exp(acc - partial_flows_max) + 1e-24) + partial_flows_max,
+                            tl.log(tl.exp(partial_flows_max - acc) * partial_flows + 1.0) + acc
+                        )
                     )
                 else:
                     acc += partial_flows * tl.exp(emars + log_n_fdm_max[None,:])
@@ -2692,7 +2698,10 @@ class SumLayer(Layer, nn.Module):
                     if logspace_flows:
                         plflows = nflows[None,:] + emars - nmars[None,:]
                         plflows_max = tl.max(plflows, axis = 1)
-                        pflows = tl.sum(tl.exp(plflows - plflows_max[:,None]), axis = 1) * tl.exp(plflows_max)
+                        pflows = tl.where(plflows_max != -float("inf"),
+                            tl.exp(tl.log(tl.sum(tl.exp(plflows - plflows_max[:,None]), axis = 1)) + plflows_max),
+                            0.0
+                        )
                     else:
                         pflows = tl.sum(nflows[None,:] * tl.exp(emars - nmars[None,:]), axis = 1)
 

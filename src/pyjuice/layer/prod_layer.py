@@ -370,14 +370,14 @@ class ProdLayer(Layer, nn.Module):
                 
                 if prop_logsumexp:
                     # logaddexp
-                    diff = nvals - node_vals
+                    diff = node_vals - nvals
                     nvals = tl.where(
-                        diff == 0, 
-                        nvals + 0.69314718055994530942, # log(2)
+                        nvals == -float("inf"), 
+                        node_vals,
                         tl.where(
                             diff > 0,
-                            nvals + tlmath.log1p(tl.exp(-diff)),
-                            node_vals + tlmath.log1p(tl.exp(diff))
+                            node_vals + tlmath.log1p(tl.exp(-diff)),
+                            nvals + tlmath.log1p(tl.exp(diff))
                         )
                     )
                 else:
@@ -429,7 +429,7 @@ class ProdLayer(Layer, nn.Module):
             if prop_logsumexp:
                 # Take the logsumexp of the child nodes' values
                 evals_max = tl.max(evals, axis = 0)
-                nvals = tl.log(tl.sum(tl.exp(evals - evals_max[None,:]), axis = 0)) + evals_max
+                nvals = tl.where(evals_max != -float("inf"), tl.log(tl.sum(tl.exp(evals - evals_max[None,:]), axis = 0)) + evals_max, -float("inf"))
             else:
                 # Take the sum of the child nodes' values
                 nvals = tl.sum(evals, axis = 0)
@@ -440,14 +440,14 @@ class ProdLayer(Layer, nn.Module):
 
                 if prop_logsumexp:
                     # logaddexp
-                    diff = nvals - node_vals
+                    diff = node_vals - nvals
                     nvals = tl.where(
-                        diff == 0, 
-                        nvals + 0.69314718055994530942, # log(2)
+                        nvals == -float("inf"), 
+                        node_vals,
                         tl.where(
                             diff > 0,
-                            nvals + tlmath.log1p(tl.exp(-diff)),
-                            node_vals + tlmath.log1p(tl.exp(diff))
+                            node_vals + tlmath.log1p(tl.exp(-diff)),
+                            nvals + tlmath.log1p(tl.exp(diff))
                         )
                     )
                 else:
@@ -510,7 +510,7 @@ class ProdLayer(Layer, nn.Module):
             if prop_logsumexp:
                 # Take the logsumexp of the child nodes' values
                 evals_max = tl.max(evals, axis = 0)
-                nvals_sub = tl.sum(tl.exp(evals - evals_max[None,:]), axis = 2)
+                nvals_sub = tl.where(evals_max != -float("inf"), tl.sum(tl.exp(evals - evals_max[None,:]), axis = 0), 0.0)
                 nvals = tl.where(evals_max > nvals,
                     tl.log(nvals_sub + tl.exp(nvals - evals_max) + 1e-24) + evals_max,
                     tl.log(tl.exp(evals_max - nvals) * nvals_sub + 1.0) + nvals
@@ -532,14 +532,14 @@ class ProdLayer(Layer, nn.Module):
             
             if prop_logsumexp:
                 # logaddexp
-                diff = nvals - node_vals
+                diff = node_vals - nvals
                 nvals = tl.where(
-                    diff == 0, 
-                    nvals + 0.69314718055994530942, # log(2)
+                    nvals == -float("inf"), 
+                    node_vals,
                     tl.where(
                         diff > 0,
-                        nvals + tlmath.log1p(tl.exp(-diff)),
-                        node_vals + tlmath.log1p(tl.exp(diff))
+                        node_vals + tlmath.log1p(tl.exp(-diff)),
+                        nvals + tlmath.log1p(tl.exp(diff))
                     )
                 )
             else:
