@@ -275,6 +275,7 @@ class TensorCircuit(nn.Module):
                  apply_cudagraph: bool = True,
                  allow_modify_flows: bool = True,
                  propagation_alg: Union[str,Sequence[str]] = "LL",
+                 logspace_flows: bool = False,
                  **kwargs):
         """
         Backward evaluation of the PC that computes node flows as well as parameter flows.
@@ -299,21 +300,24 @@ class TensorCircuit(nn.Module):
 
         ## Initialize buffers for backward pass ##
 
-        self._init_buffer(name = "node_flows", shape = (self.num_nodes, B), set_value = 0.0)
-        self._init_buffer(name = "element_flows", shape = (self.num_elements, B), set_value = 0.0)
+        self._init_buffer(name = "node_flows", shape = (self.num_nodes, B), set_value = 0.0 if not logspace_flows else -float("inf"))
+        self._init_buffer(name = "element_flows", shape = (self.num_elements, B), set_value = 0.0 if not logspace_flows else -float("inf"))
 
         # Set root node flows
         def _set_root_node_flows():
             nonlocal ll_weights
+            nonlocal logspace_flows
             if ll_weights is None:
-                self.node_flows[self._root_node_range[0]:self._root_node_range[1],:] = 1.0
+                root_flows = 1.0 if not logspace_flows else 0.0
+                self.node_flows[self._root_node_range[0]:self._root_node_range[1],:] = root_flows
             else:
                 if ll_weights.dim() == 1:
                     ll_weights = ll_weights.unsqueeze(1)
 
                 assert ll_weights.size(0) == self.num_root_nodes
 
-                self.node_flows[self._root_node_range[0]:self._root_node_range[1],:] = ll_weights
+                root_flows = ll_weights if not logspace_flows else ll_weights.log()
+                self.node_flows[self._root_node_range[0]:self._root_node_range[1],:] = root_flows
 
         _set_root_node_flows()
 
@@ -338,7 +342,7 @@ class TensorCircuit(nn.Module):
 
                     if layer_group.is_prod():
                         # Prod layer
-                        layer_group.backward(self.node_flows, self.element_flows)
+                        layer_group.backward(self.node_flows, self.element_flows, logspace_flows = logspace_flows)
 
                     elif layer_group.is_sum():
                         # Sum layer
@@ -351,12 +355,13 @@ class TensorCircuit(nn.Module):
                                              param_flows = self.param_flows if compute_param_flows else None,
                                              allow_modify_flows = allow_modify_flows, 
                                              propagation_alg = propagation_alg if isinstance(propagation_alg, str) else propagation_alg[layer_id], 
+                                             logspace_flows = logspace_flows,
                                              **kwargs)
 
                     else:
                         raise ValueError(f"Unknown layer type {type(layer)}.")
 
-            signature = (1, id(self.node_flows), id(self.element_flows), id(self.node_mars), id(self.element_mars), id(self.params), id(self.param_flows), B)
+            signature = (1, id(self.node_flows), id(self.element_flows), id(self.node_mars), id(self.element_mars), id(self.params), id(self.param_flows), B, allow_modify_flows, logspace_flows)
             if record_cudagraph and signature not in self._recorded_cuda_graphs:
                 # Warmup
                 s = torch.cuda.Stream()
@@ -387,14 +392,14 @@ class TensorCircuit(nn.Module):
             # Compute backward pass for all input layers
             for idx, layer in enumerate(self.input_layer_group):
                 if input_layer_fn is None:
-                    layer.backward(inputs, self.node_flows, self.node_mars, **kwargs)
+                    layer.backward(inputs, self.node_flows, self.node_mars, logspace_flows = logspace_flows, **kwargs)
 
                 elif isinstance(input_layer_fn, str):
                     assert hasattr(layer, input_layer_fn), f"Custom input function `{input_layer_fn}` not found for layer type {type(layer)}."
-                    getattr(layer, input_layer_fn)(inputs, self.node_flows, self.node_mars, **kwargs)
+                    getattr(layer, input_layer_fn)(inputs, self.node_flows, self.node_mars, logspace_flows = logspace_flows, **kwargs)
 
                 elif isinstance(input_layer_fn, Callable):
-                    input_layer_fn(layer, inputs, self.node_flows, self.node_mars, **kwargs)
+                    input_layer_fn(layer, inputs, self.node_flows, self.node_mars, logspace_flows = logspace_flows, **kwargs)
 
                 else:
                     raise ValueError(f"Custom input function should be either a `str` or a `Callable`. Found {type(input_layer_fn)} instead.")
