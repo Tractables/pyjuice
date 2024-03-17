@@ -135,6 +135,52 @@ def test_pd():
     assert test_ll > -765.0
 
 
+def test_homogeneous_pd():
+
+    device = torch.device("cuda:0")
+
+    train_dataset = torchvision.datasets.MNIST(root = "./examples/data", train = True, download = True)
+    test_dataset = torchvision.datasets.MNIST(root = "./examples/data", train = False, download = True)
+
+    train_data = train_dataset.data.reshape(60000, 28*28)
+    test_data = test_dataset.data.reshape(10000, 28*28)
+
+    num_features = train_data.size(1)
+
+    train_loader = DataLoader(
+        dataset = TensorDataset(train_data),
+        batch_size = 512,
+        shuffle = True,
+        drop_last = True
+    )
+    test_loader = DataLoader(
+        dataset = TensorDataset(test_data),
+        batch_size = 512,
+        shuffle = False,
+        drop_last = True
+    )
+
+    ns = juice.structures.PD(
+        data_shape = (28, 28),
+        num_latents = 256,
+        split_intervals = (4, 4),
+        structure_type = "sum_dominated",
+        tie_homogeneous_params = True
+    )
+    pc = juice.TensorCircuit(ns)
+
+    pc.to(device)
+
+    optimizer = juice.optim.CircuitOptimizer(pc, lr = 0.1, pseudocount = 0.0001)
+
+    mini_batch_em_epoch(10, pc, optimizer, None, train_loader, test_loader, device)
+    
+    test_ll = evaluate(pc, test_loader)
+
+    assert test_ll > -780.0
+
+
 if __name__ == "__main__":
-    torch.manual_seed(2391)
+    # torch.manual_seed(2391)
     test_pd()
+    test_homogeneous_pd()
