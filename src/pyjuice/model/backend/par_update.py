@@ -209,9 +209,9 @@ def cum_pflow_kernel(cum_pflows, params, param_flows, nchs, par_start_ids, pflow
 
 
 @triton.jit
-def par_update_kernel(params, param_flows, cum_pflows, nchs, par_start_ids, pflow_start_ids, blk_sizes, blk_intervals,
-                      global_nids, constexprs, num_blocks, keep_zero_params: tl.constexpr, BLOCK_ID: tl.constexpr, 
-                      BLOCK_SIZE: tl.constexpr):
+def em_par_update_kernel(params, param_flows, cum_pflows, nchs, par_start_ids, pflow_start_ids, blk_sizes, blk_intervals,
+                         global_nids, constexprs, num_blocks, keep_zero_params: tl.constexpr, BLOCK_ID: tl.constexpr, 
+                         BLOCK_SIZE: tl.constexpr):
 
     pid = tl.program_id(axis = 0)
 
@@ -253,6 +253,42 @@ def par_update_kernel(params, param_flows, cum_pflows, nchs, par_start_ids, pflo
     tl.store(params + offs_par, updated_param, mask = mask_pflow)
 
 
+@triton.jit
+def sgd_par_update_kernel(params, param_grads, par_start_ids, pgrad_start_ids, blk_sizes, blk_intervals,
+                         global_nids, constexprs, num_blocks, keep_zero_params: tl.constexpr, BLOCK_ID: tl.constexpr, 
+                         BLOCK_SIZE: tl.constexpr):
+
+    pid = tl.program_id(axis = 0)
+
+    # Retrieve the constants
+    lr = tl.load(constexprs)
+
+    offs_m = pid * BLOCK_ID + tl.arange(0, BLOCK_ID)
+    mask_m = offs_m < num_blocks
+
+    offs_blk = tl.arange(0, BLOCK_SIZE)
+
+    par_start = tl.load(par_start_ids + offs_m, mask = mask_m, other = 0)
+    pgrad_start = tl.load(pgrad_start_ids + offs_m, mask = mask_m, other = 0)
+    blk_size = tl.load(blk_sizes + offs_m, mask = mask_m, other = 0)
+    blk_interval = tl.load(blk_intervals + offs_m, mask = mask_m, other = 0)
+    global_nid = tl.load(global_nids + offs_m, mask = mask_m, other = 0)
+
+    offs_pgrad = pgrad_start[:,None] + offs_blk[None,:] * blk_interval[:,None]
+    mask_pgrad = mask_m[:,None] & (offs_blk[None,:] < blk_size[:,None])
+    pgrads = tl.load(param_grads + offs_pgrad, mask = mask_pgrad, other = 0)
+
+    offs_par = par_start[:,None] + offs_blk[None,:] * blk_interval[:,None]
+    old_param = tl.load(params + offs_par, mask = mask_pflow, other = 0)
+
+    if keep_zero_params:
+        updated_params = tl.where(old_param < 1e-12, 0.0, tl.exp(tl.log(old_param) + lr * pgrads))
+    else:
+        updated_param = tl.exp(tl.log(old_param) + lr * pgrads)
+
+    tl.store(params + offs_par, updated_param, mask = mask_pgrad)
+
+
 def em_par_update(params: torch.Tensor, param_flows: torch.Tensor, par_update_kwargs: Sequence, 
                   step_size: float, pseudocount: float = 0.0, keep_zero_params: bool = True):
 
@@ -280,7 +316,44 @@ def em_par_update(params: torch.Tensor, param_flows: torch.Tensor, par_update_kw
         global_nids, constexprs, num_blocks, keep_zero_params, BLOCK_ID, BLOCK_SIZE
     )
 
-    par_update_kernel[grid](
+    em_par_update_kernel[grid](
         params, param_flows, cum_pflows, nchs, par_start_ids, pflow_start_ids, blk_sizes, blk_intervals,
         global_nids, constexprs, num_blocks, keep_zero_params, BLOCK_ID, BLOCK_SIZE
     )
+
+    return None
+
+
+def sgd_par_update(params: torch.Tensor, param_grads: torch.Tensor, par_update_kwargs: Sequence, 
+                   lr: float, keep_zero_params: bool = True):
+    """
+    Apply one-step SGD parameter update.
+
+    :param params: the parameter tensor
+    :type params: torch.Tensor
+
+    :param param_grads: gradients of the log-parameters
+    :type param_grads: torch.Tensor
+
+    :param lr: learning rate
+    :type lr: float
+
+    :param keep_zero_params: whether to freeze zero parameters
+    :type keep_zero_params: bool
+    """
+
+    par_start_ids, pgrad_start_ids, blk_sizes, blk_intervals, global_nids, nchs, cum_pflows, metadata = par_update_kwargs
+
+    num_blocks = par_start_ids.size(0)
+    BLOCK_ID = 2048 // BLOCK_SIZE
+
+    grid = (triton.cdiv(num_blocks, BLOCK_ID),)
+
+    constexprs = torch.tensor([lr]).to(params.device)
+
+    sgd_par_update_kernel[grid](
+        params, param_grads, par_start_ids, pgrad_start_ids, blk_sizes, blk_intervals,
+        global_nids, constexprs, num_blocks, keep_zero_params, BLOCK_ID, BLOCK_SIZE
+    )
+
+    return None
