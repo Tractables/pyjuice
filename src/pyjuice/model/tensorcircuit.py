@@ -276,6 +276,7 @@ class TensorCircuit(nn.Module):
                  allow_modify_flows: bool = True,
                  propagation_alg: Union[str,Sequence[str]] = "LL",
                  logspace_flows: bool = False,
+                 negate_pflows: bool = False,
                  **kwargs):
         """
         Backward evaluation of the PC that computes node flows as well as parameter flows.
@@ -355,8 +356,7 @@ class TensorCircuit(nn.Module):
                                              param_flows = self.param_flows if compute_param_flows else None,
                                              allow_modify_flows = allow_modify_flows, 
                                              propagation_alg = propagation_alg if isinstance(propagation_alg, str) else propagation_alg[layer_id], 
-                                             logspace_flows = logspace_flows,
-                                             **kwargs)
+                                             logspace_flows = logspace_flows, negate_pflows = negate_pflows, **kwargs)
 
                     else:
                         raise ValueError(f"Unknown layer type {type(layer)}.")
