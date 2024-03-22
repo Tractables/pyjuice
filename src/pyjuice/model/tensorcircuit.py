@@ -153,7 +153,7 @@ class TensorCircuit(nn.Module):
         B = inputs.size(0)
 
         if input_layer_fn is None:
-            assert inputs.dim() == 2 and inputs.size(1) == self.num_vars
+            assert inputs.dim() == 2
 
             inputs = inputs.permute(1, 0)
 
