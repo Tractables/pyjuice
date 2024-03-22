@@ -338,8 +338,6 @@ class SumNodes(CircuitNodes):
                 curr_edge_ids[1,:] += ch_gid_start
                 edge_ids.append(curr_edge_ids)
 
-                ch_nid_start += self.chs[cs_id].num_node_blocks
-
             edge_ids = torch.cat(edge_ids, dim = 1)
 
         if reorder:
