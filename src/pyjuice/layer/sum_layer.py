@@ -504,9 +504,9 @@ class SumLayer(Layer, nn.Module):
 
                 if use_fp16 == 1:
                     # Built-in matmul kernel of triton + float16
-                    epars_fp16 = (epars * (2**12)).to(tl.float16)
+                    epars_fp16 = (epars * (2**4)).to(tl.float16)
                     emars_fp16 = emars_sub.to(tl.float16)
-                    nmars = tl.dot(epars_fp16, emars_fp16).to(tl.float32) / (2**12)
+                    nmars = tl.dot(epars_fp16, emars_fp16).to(tl.float32) / (2**4)
                 else:
                     # Built-in matmul kernel of triton + float32
                     nmars = tl.dot(epars, emars_sub)
@@ -1260,7 +1260,7 @@ class SumLayer(Layer, nn.Module):
         elif num_edges <= 32768:
             mode = self.BLOCK_SPARSE
         else:
-            mode = self.SPARSE
+            mode = self.BLOCK_SPARSE
 
         if mode == self.BLOCK_SPARSE:
             self._backward_block_sparse(
