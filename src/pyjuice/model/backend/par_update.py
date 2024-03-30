@@ -279,7 +279,7 @@ def sgd_par_update_kernel(params, param_grads, par_start_ids, pgrad_start_ids, b
     pgrads = tl.load(param_grads + offs_pgrad, mask = mask_pgrad, other = 0)
 
     offs_par = par_start[:,None] + offs_blk[None,:] * blk_interval[:,None]
-    old_param = tl.load(params + offs_par, mask = mask_pflow, other = 0)
+    old_param = tl.load(params + offs_par, mask = mask_pgrad, other = 0)
 
     if keep_zero_params:
         updated_params = tl.where(old_param < 1e-12, 0.0, tl.exp(tl.log(old_param) + lr * pgrads))
@@ -343,6 +343,9 @@ def sgd_par_update(params: torch.Tensor, param_grads: torch.Tensor, par_update_k
     """
 
     par_start_ids, pgrad_start_ids, blk_sizes, blk_intervals, global_nids, nchs, cum_pflows, metadata = par_update_kwargs
+
+    tot_num_nodes = metadata["tot_num_nodes"]
+    BLOCK_SIZE = metadata["BLOCK_SIZE"]
 
     num_blocks = par_start_ids.size(0)
     BLOCK_ID = 2048 // BLOCK_SIZE
