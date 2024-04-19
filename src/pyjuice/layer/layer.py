@@ -7,6 +7,13 @@ from pyjuice.nodes import CircuitNodes
 
 
 class Layer():
+
+    propagation_alg_mapping = {
+        "LL": 0,
+        "MPE": 1,
+        "GeneralLL": 2
+    }
+
     def __init__(self, nodes: Sequence[CircuitNodes], disable_block_size_check: bool = False) -> None:
 
         if disable_block_size_check:
@@ -60,3 +67,13 @@ class Layer():
 
     def provided(self, var_name):
         return hasattr(self, var_name) and getattr(self, var_name) is not None
+
+    def _get_propagation_alg_kwargs(self, propagation_alg: str, **kwargs):
+        if propagation_alg == "LL":
+            return {"alpha": 0.0}
+        elif propagation_alg == "MPE":
+            return {"alpha": 0.0}
+        elif propagation_alg == "GeneralLL":
+            return {"alpha": kwargs["alpha"]}
+        else:
+            raise ValueError(f"Unknown propagation algorithm {propagation_alg}.")

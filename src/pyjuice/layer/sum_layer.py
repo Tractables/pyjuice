@@ -40,6 +40,7 @@ class SumLayer(Layer, nn.Module):
         nn.Module.__init__(self)
 
         assert len(nodes) > 0, "No input node."
+        assert len(nodes) == len(set(nodes)), "Input node list contains duplicates."
 
         self.nodes = nodes
 
@@ -208,7 +209,8 @@ class SumLayer(Layer, nn.Module):
         return self._layer_pfid_range[1] - self._layer_pfid_range[0]
 
     def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor,
-                force_use_fp16: bool = False, force_use_fp32: bool = False) -> None:
+                force_use_fp16: bool = False, force_use_fp32: bool = False,
+                propagation_alg: str = "LL", **kwargs) -> None:
         """
         Computes the forward pass of a sum layer.
 
@@ -228,7 +230,8 @@ class SumLayer(Layer, nn.Module):
                 self._forward(
                     node_mars, element_mars, params, nids, cids, pids, 
                     partition_id = partition_id, force_use_fp16 = force_use_fp16,
-                    force_use_fp32 = force_use_fp32
+                    force_use_fp32 = force_use_fp32, 
+                    propagation_alg = propagation_alg, **kwargs
                 )
 
         else:
@@ -243,7 +246,8 @@ class SumLayer(Layer, nn.Module):
                     node_mars, element_mars, params, 
                     nids, cids, pids, local_ids = local_ids,
                     partition_id = partition_id, force_use_fp16 = force_use_fp16,
-                    force_use_fp32 = force_use_fp32
+                    force_use_fp32 = force_use_fp32,
+                    propagation_alg = propagation_alg, **kwargs
                 )
 
         return None
@@ -251,7 +255,8 @@ class SumLayer(Layer, nn.Module):
     def backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
                  node_mars: torch.Tensor, element_mars: torch.Tensor, 
                  params: torch.Tensor, param_flows: Optional[torch.Tensor] = None,
-                 allow_modify_flows: bool = False) -> None:
+                 allow_modify_flows: bool = False, propagation_alg: str = "LL", 
+                 logspace_flows: bool = False, negate_pflows: bool = False, **kwargs) -> None:
         """
         Computes the forward pass of a sum layer:
         ```
@@ -272,6 +277,8 @@ class SumLayer(Layer, nn.Module):
         `params`:        [num_params, B] or [num_params]
         """
 
+        assert not (allow_modify_flows and logspace_flows), "`allow_modify_flows` should be set to `False` when using `logspace_flows`."
+
         # Disallow modifications of `node_flows` in case of partial evaluation
         if self.provided("bk_partition_local_ids") and allow_modify_flows:
             allow_modify_flows = False
@@ -283,7 +290,8 @@ class SumLayer(Layer, nn.Module):
                 nids = self.partitioned_nids[partition_id]
 
                 self._bk_triton_modify_flow(
-                    node_flows, node_mars, nids, local_ids = None
+                    node_flows, node_mars, nids, local_ids = None,
+                    propagation_alg = propagation_alg, **kwargs
                 )
         
         ## Compute flows w.r.t. elements (i.e., product nodes) ##
@@ -301,7 +309,11 @@ class SumLayer(Layer, nn.Module):
                     chids = chids, parids = parids, parpids = parpids,
                     cs_block_size = cs_block_size,
                     partition_id = partition_id,
-                    allow_modify_flows = allow_modify_flows
+                    allow_modify_flows = allow_modify_flows,
+                    propagation_alg = propagation_alg,
+                    logspace_flows = logspace_flows,
+                    negate_pflows = negate_pflows, 
+                    **kwargs
                 )
 
         else:
@@ -319,7 +331,11 @@ class SumLayer(Layer, nn.Module):
                     chids = chids, parids = parids, parpids = parpids,
                     cs_block_size = cs_block_size, local_ids = local_ids,
                     partition_id = partition_id,
-                    allow_modify_flows = allow_modify_flows
+                    allow_modify_flows = allow_modify_flows,
+                    propagation_alg = propagation_alg,
+                    logspace_flows = logspace_flows,
+                    negate_pflows = negate_pflows, 
+                    **kwargs
                 )
 
         ## Compute flows w.r.t. sum parameters ##
@@ -335,7 +351,11 @@ class SumLayer(Layer, nn.Module):
                     element_mars, param_flows, nids = nids, 
                     cids = cids, pids = pids, pfids = pfids, 
                     partition_id = partition_id,
-                    allow_modify_flows = allow_modify_flows
+                    allow_modify_flows = allow_modify_flows,
+                    propagation_alg = propagation_alg,
+                    logspace_flows = logspace_flows,
+                    negate_pflows = negate_pflows, 
+                    **kwargs
                 )
 
         return None
@@ -344,7 +364,8 @@ class SumLayer(Layer, nn.Module):
                  params: torch.Tensor, nids: torch.Tensor, cids: torch.Tensor,
                  pids: torch.Tensor, local_ids: Optional[torch.Tensor] = None,
                  partition_id: int = -1, mode: Optional[str] = None,
-                 force_use_fp16: bool = False, force_use_fp32: bool = False) -> None:
+                 force_use_fp16: bool = False, force_use_fp32: bool = False,
+                 propagation_alg: str = "LL", **kwargs) -> None:
         """
         Forward pass of sum layers.
         
@@ -380,18 +401,19 @@ class SumLayer(Layer, nn.Module):
             self._forward_block_sparse(
                 node_mars, element_mars, params, nids, cids, pids, local_ids,
                 partition_id = partition_id, force_use_fp16 = force_use_fp16,
-                force_use_fp32 = force_use_fp32
+                force_use_fp32 = force_use_fp32, propagation_alg = propagation_alg, **kwargs
             )
 
         elif mode == self.SPARSE:
             self._forward_sparse(
                 node_mars, element_mars, params, nids, cids, pids, local_ids,
-                partition_id = partition_id
+                partition_id = partition_id, propagation_alg = propagation_alg, **kwargs
             )
 
         elif mode == self.PYTORCH:
             self._forward_pytorch(
-                node_mars, element_mars, params, nids, cids, pids, local_ids
+                node_mars, element_mars, params, nids, cids, pids, local_ids,
+                propagation_alg = propagation_alg, **kwargs
             )
         
         else:
@@ -403,7 +425,8 @@ class SumLayer(Layer, nn.Module):
     def _fw_triton_block_sparse_tlmm_kernel(node_mars, element_mars, params, nids, cids_start, cids_increment,
                                             pids_start, pids_increment, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
                                             BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
-                                            TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, use_fp16: tl.constexpr):
+                                            TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, use_fp16: tl.constexpr,
+                                            propagation_alg_id: tl.constexpr, alpha = 0.0):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
@@ -453,22 +476,45 @@ class SumLayer(Layer, nn.Module):
             epars = tl.load(epars_ptr)
             emars = tl.load(emars_ptr, mask = mask_batch[None,:])
 
-            emars_max = tl.max(emars, axis = 0)[None,:]
-            emars_sub = tl.where(emars_max != -float("inf"), tl.exp(emars - emars_max), 0.0)
+            if propagation_alg_id == 1:
+                # MPE propagation method
+                lpars = tl.log(epars)
+                nmars = tl.max(lpars[:,:,None] + emars[None,:,:], axis = 1)
 
-            if use_fp16 == 1:
-                # Built-in matmul kernel of triton + float16
-                epars_fp16 = (epars * (2**12)).to(tl.float16)
-                emars_fp16 = emars_sub.to(tl.float16)
-                nmars = tl.dot(epars_fp16, emars_fp16).to(tl.float32) / (2**12)
+                acc = tl.maximum(acc, nmars)
+
             else:
-                # Built-in matmul kernel of triton + float32
-                nmars = tl.dot(epars, emars_sub)
 
-            acc = tl.where(emars_max > acc,
-                tl.log(nmars + tl.exp(acc - emars_max)) + emars_max,
-                tl.log(tl.exp(emars_max - acc) * nmars + 1.0) + acc
-            )
+                if propagation_alg_id == 0:
+                    # LL propagation method
+                    emars_max = tl.max(emars, axis = 0)[None,:]
+                    emars_sub = tl.where(emars_max != -float("inf"), tl.exp(emars - emars_max), 0.0)
+
+                if propagation_alg_id == 2:
+                    # GeneralLL propagation method
+
+                    emars_max = tl.max(emars, axis = 0)[None,:]
+                    # Compute p_i^{alpha} for every i
+                    emars_sub = tl.where(emars_max != -float("inf"), tl.exp((emars - emars_max) * alpha), 0.0)
+                    # Compute w_i^{alpha} for every i
+                    epars = tl.exp(tl.log(epars) * alpha)
+
+                    # Also scale `emars_max`
+                    emars_max *= alpha
+
+                if use_fp16 == 1:
+                    # Built-in matmul kernel of triton + float16
+                    epars_fp16 = (epars * (2**4)).to(tl.float16)
+                    emars_fp16 = emars_sub.to(tl.float16)
+                    nmars = tl.dot(epars_fp16, emars_fp16).to(tl.float32) / (2**4)
+                else:
+                    # Built-in matmul kernel of triton + float32
+                    nmars = tl.dot(epars, emars_sub)
+
+                acc = tl.where(emars_max > acc,
+                    tl.log(nmars + tl.exp(acc - emars_max) + 1e-24) + emars_max,
+                    tl.log(tl.exp(emars_max - acc) * nmars + 1.0) + acc
+                )
 
             # Increment `epars_ptr`
             pids_inc = tl.load(pids_inc_ptr)
@@ -479,6 +525,10 @@ class SumLayer(Layer, nn.Module):
             cids_inc = tl.load(cids_inc_ptr)
             emars_ptr += cids_inc[:,None] * batch_size
             cids_inc_ptr += TILE_SIZE_K
+
+        if propagation_alg_id == 2:
+            # Compute p_i^{1/alpha}
+            acc *= (1.0 / alpha)
 
         # Write back
         off_nids = tl.load(nids + nblock_id)
@@ -491,7 +541,8 @@ class SumLayer(Layer, nn.Module):
     def _fw_triton_block_sparse_csmm1_kernel(node_mars, element_mars, params, nids, cids_start, cids_increment,
                                             pids_start, pids_increment, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
                                             BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
-                                            TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, use_fp16: tl.constexpr):
+                                            TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, use_fp16: tl.constexpr,
+                                            propagation_alg_id: tl.constexpr, alpha = 0.0):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
@@ -541,22 +592,45 @@ class SumLayer(Layer, nn.Module):
             epars = tl.load(epars_ptr)
             emars = tl.load(emars_ptr, mask = mask_batch[None,:])
 
-            emars_max = tl.max(emars, axis = 0)[None,:]
-            emars_sub = tl.where(emars_max != -float("inf"), tl.exp(emars - emars_max), 0.0)
+            if propagation_alg_id == 1:
+                # MPE propagation method
+                lpars = tl.log(epars)
+                nmars = tl.max(lpars[:,:,None] + emars[None,:,:], axis = 1)
 
-            if use_fp16 == 1:
-                # Simulated matmul kernel + float16
-                epars = (epars * (2**4)).to(tl.float16)
-                emars_sub = emars_sub.to(tl.float16)
-                nmars = tl.sum(epars[:,:,None] * emars_sub[None,:,:], axis = 1).to(tl.float32) / (2**4)
+                acc = tl.maximum(acc, nmars)
+
             else:
-                # Simulated matmul kernel + float32
-                nmars = tl.sum(epars[:,:,None] * emars_sub[None,:,:], axis = 1)
 
-            acc = tl.where(emars_max > acc,
-                tl.log(nmars + tl.exp(acc - emars_max)) + emars_max,
-                tl.log(tl.exp(emars_max - acc) * nmars + 1.0) + acc
-            )
+                if propagation_alg_id == 0:
+                    # LL propagation method
+                    emars_max = tl.max(emars, axis = 0)[None,:]
+                    emars_sub = tl.where(emars_max != -float("inf"), tl.exp(emars - emars_max), 0.0)
+
+                if propagation_alg_id == 2:
+                    # GeneralLL propagation method
+
+                    emars_max = tl.max(emars, axis = 0)[None,:]
+                    # Compute p_i^{alpha} for every i
+                    emars_sub = tl.where(emars_max != -float("inf"), tl.exp((emars - emars_max) * alpha), 0.0)
+                    # Compute w_i^{alpha} for every i
+                    epars = tl.exp(tl.log(epars) * alpha)
+
+                    # Also scale `emars_max`
+                    emars_max *= alpha
+
+                if use_fp16 == 1:
+                    # Simulated matmul kernel + float16
+                    epars = (epars * (2**4)).to(tl.float16)
+                    emars_sub = emars_sub.to(tl.float16)
+                    nmars = tl.sum(epars[:,:,None] * emars_sub[None,:,:], axis = 1).to(tl.float32) / (2**4)
+                else:
+                    # Simulated matmul kernel + float32
+                    nmars = tl.sum(epars[:,:,None] * emars_sub[None,:,:], axis = 1)
+
+                acc = tl.where(emars_max > acc,
+                    tl.log(nmars + tl.exp(acc - emars_max) + 1e-24) + emars_max,
+                    tl.log(tl.exp(emars_max - acc) * nmars + 1.0) + acc
+                )
 
             # Increment `epars_ptr`
             pids_inc = tl.load(pids_inc_ptr)
@@ -567,6 +641,10 @@ class SumLayer(Layer, nn.Module):
             cids_inc = tl.load(cids_inc_ptr)
             emars_ptr += cids_inc[:,None] * batch_size
             cids_inc_ptr += TILE_SIZE_K
+
+        if propagation_alg_id == 2:
+            # Compute p_i^{1/alpha}
+            acc *= (1.0 / alpha)
 
         # Write back
         off_nids = tl.load(nids + nblock_id)
@@ -579,7 +657,8 @@ class SumLayer(Layer, nn.Module):
     def _fw_triton_block_sparse_csmm2_kernel(node_mars, element_mars, params, nids, cids_start, cids_increment,
                                              pids_start, pids_increment, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
                                              BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
-                                             TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, use_fp16: tl.constexpr):
+                                             TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, use_fp16: tl.constexpr,
+                                             propagation_alg_id: tl.constexpr, alpha = 0.0):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
@@ -629,16 +708,39 @@ class SumLayer(Layer, nn.Module):
             epars = tl.load(epars_ptr)
             emars = tl.load(emars_ptr, mask = mask_batch[:,None])
 
-            emars_max = tl.max(emars, axis = 1)
-            emars_sub = tl.where(emars_max[:,None] != -float("inf"), tl.exp(emars - emars_max[:,None]), 0.0)
+            if propagation_alg_id == 1:
+                # MPE propagation method
+                lpars = tl.log(epars)
+                nmars = tl.max(lpars[:,:,None] + tl.trans(emars)[None,:,:], axis = 1)
 
-            # Simulated matmul kernel + float32
-            nmars = tl.sum(epars[:,:,None] * tl.trans(emars_sub)[None,:,:], axis = 1)
+                acc = tl.maximum(acc, nmars)
 
-            acc = tl.where(emars_max[None,:] > acc,
-                tl.log(nmars + tl.exp(acc - emars_max[None,:])) + emars_max[None,:],
-                tl.log(tl.exp(emars_max[None,:] - acc) * nmars + 1.0) + acc
-            )
+            else:
+
+                if propagation_alg_id == 0:
+                    # LL propagation method
+                    emars_max = tl.max(emars, axis = 1)
+                    emars_sub = tl.where(emars_max[:,None] != -float("inf"), tl.exp(emars - emars_max[:,None]), 0.0)
+
+                if propagation_alg_id == 2:
+                    # GeneralLL propagation method
+
+                    emars_max = tl.max(emars, axis = 1)
+                    # Compute p_i^{alpha} for every i
+                    emars_sub = tl.where(emars_max[:,None] != -float("inf"), tl.exp((emars - emars_max[:,None]) * alpha), 0.0)
+                    # Compute w_i^{alpha} for every i
+                    epars = tl.exp(tl.log(epars) * alpha)
+
+                    # Also scale `emars_max`
+                    emars_max *= alpha
+
+                # Simulated matmul kernel + float32
+                nmars = tl.sum(epars[:,:,None] * tl.trans(emars_sub)[None,:,:], axis = 1)
+
+                acc = tl.where(emars_max[None,:] > acc,
+                    tl.log(nmars + tl.exp(acc - emars_max[None,:]) + 1e-24) + emars_max[None,:],
+                    tl.log(tl.exp(emars_max[None,:] - acc) * nmars + 1.0) + acc
+                )
 
             # Increment `epars_ptr`
             pids_inc = tl.load(pids_inc_ptr)
@@ -650,6 +752,10 @@ class SumLayer(Layer, nn.Module):
             emars_ptr += cids_inc[None,:] * batch_size
             cids_inc_ptr += TILE_SIZE_K
 
+        if propagation_alg_id == 2:
+            # Compute p_i^{1/alpha}
+            acc *= (1.0 / alpha)
+
         # Write back
         off_nids = tl.load(nids + nblock_id)
         offs_nmars = (off_nids + offs_node[:,None]) * batch_size + offs_batch[None,:]
@@ -659,7 +765,7 @@ class SumLayer(Layer, nn.Module):
                               params: torch.Tensor, nids: torch.Tensor, cids: torch.Tensor,
                               pids: torch.Tensor, local_ids: Optional[torch.Tensor] = None,
                               partition_id: int = -1, force_use_fp16: bool = False,
-                              force_use_fp32: bool = False) -> None:
+                              force_use_fp32: bool = False, propagation_alg: str = "LL", **kwargs) -> None:
         """
         Forward pass of sum layers with the block-sparse processing kernel.
         
@@ -679,6 +785,10 @@ class SumLayer(Layer, nn.Module):
         num_edges = cids.size(1)
         batch_size = node_mars.size(1)
         BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
+
+        # Propagation algorithm
+        propagation_alg_id = self.propagation_alg_mapping[propagation_alg]
+        propagation_alg_kwargs = self._get_propagation_alg_kwargs(propagation_alg, **kwargs)
 
         # Heuristic to set `TILE_SIZE_M`, `TILE_SIZE_K`, and `BLOCK_B`
         base_size = min(self.block_size, num_edges, BATCH_SIZE_NP2, 128)
@@ -751,7 +861,9 @@ class SumLayer(Layer, nn.Module):
                 K_NUM_TILES = K_NUM_TILES,
                 TILE_SIZE_M = TILE_SIZE_M,
                 BLOCK_SIZE_M = BLOCK_SIZE_M,
-                use_fp16 = use_fp16
+                use_fp16 = use_fp16,
+                propagation_alg_id = propagation_alg_id,
+                **propagation_alg_kwargs
             )
             
         elif TILE_SIZE_M >= 8 and TILE_SIZE_K >= 8 and BLOCK_B >= 8:
@@ -772,8 +884,11 @@ class SumLayer(Layer, nn.Module):
                 K_NUM_TILES = K_NUM_TILES,
                 TILE_SIZE_M = TILE_SIZE_M,
                 BLOCK_SIZE_M = BLOCK_SIZE_M,
-                use_fp16 = use_fp16
+                use_fp16 = use_fp16,
+                propagation_alg_id = propagation_alg_id,
+                **propagation_alg_kwargs
             )
+
         else:
             self._fw_triton_block_sparse_csmm2_kernel[grid](
                 node_mars, 
@@ -792,7 +907,9 @@ class SumLayer(Layer, nn.Module):
                 K_NUM_TILES = K_NUM_TILES,
                 TILE_SIZE_M = TILE_SIZE_M,
                 BLOCK_SIZE_M = BLOCK_SIZE_M,
-                use_fp16 = use_fp16
+                use_fp16 = use_fp16,
+                propagation_alg_id = propagation_alg_id,
+                **propagation_alg_kwargs
             )
         
         return None
@@ -802,7 +919,7 @@ class SumLayer(Layer, nn.Module):
     @FastJITFunction
     def _fw_triton_sparse_kernel(node_mars, element_mars, params, nids, cids, pids,
                                  local_ids, batch_size, partial_eval: tl.constexpr, num_edges: tl.constexpr, 
-                                 BLOCK_B: tl.constexpr, BLOCK_SIZE_M: tl.constexpr):
+                                 BLOCK_B: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, propagation_alg_id: tl.constexpr, alpha = 0.0):
         
         pid_b = tl.program_id(axis = 0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(axis = 1) # ID of size-`BLOCK_SIZE_M` nodes
@@ -830,9 +947,15 @@ class SumLayer(Layer, nn.Module):
             offs_batch[None,:]
         emars = tl.load(emars_ptr, mask = mask_batch[None,:]) # [num_edges, BLOCK_B]
 
-        # Compute max and subtract
-        emars_max = tl.max(emars, axis = 0)
-        emars = tl.exp(emars - emars_max[None,:])
+        # Compute max and subtract (only when using LL or GeneralLL propagation method)
+        if propagation_alg_id == 0:
+            emars_max = tl.max(emars, axis = 0)
+            emars = tl.exp(emars - emars_max[None,:])
+        
+        if propagation_alg_id == 2:
+            emars_max = tl.max(emars, axis = 0)
+            emars = tl.exp((emars - emars_max[None,:]) * alpha)
+            emars_max *= alpha
 
         # Initialize pointers to `node_mars`
         off_nids = tl.load(nids + nblock_id)
@@ -844,7 +967,16 @@ class SumLayer(Layer, nn.Module):
         for i in range(0, BLOCK_SIZE_M):
             epars = tl.load(epars_ptr)
 
-            nmars = tl.log(tl.sum(emars * epars[:,None], axis = 0)) + emars_max
+            if propagation_alg_id == 0:
+                nmars = tl.log(tl.sum(emars * epars[:,None], axis = 0)) + emars_max
+
+            if propagation_alg_id == 1:
+                nmars = tl.max(emars + tl.log(epars)[:,None], axis = 0)
+
+            if propagation_alg_id == 2:
+                epars = tl.exp(tl.log(epars) * alpha)
+
+                nmars = (tl.log(tl.sum(emars * epars[:,None], axis = 0)) + emars_max) * (1.0 / alpha)
 
             tl.store(nmars_ptr, nmars, mask = mask_batch)
 
@@ -857,10 +989,9 @@ class SumLayer(Layer, nn.Module):
     @staticmethod
     # @triton.jit
     @FastJITFunction
-    def _fw_triton_large_sparse_kernel(node_mars, element_mars, params, nids, cids, pids,
-                                       local_ids, batch_size, num_nodes, pid_m_offset, partial_eval: tl.constexpr, num_edges: tl.constexpr, 
-                                       BLOCK_B: tl.constexpr, TILE_SIZE_M: tl.constexpr, 
-                                       BLOCK_SIZE_M: tl.constexpr):
+    def _fw_triton_large_sparse_kernel(node_mars, element_mars, params, nids, cids, pids, local_ids, batch_size, 
+                                       num_nodes, pid_m_offset, partial_eval: tl.constexpr, num_edges: tl.constexpr, BLOCK_B: tl.constexpr, 
+                                       TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, propagation_alg_id: tl.constexpr, alpha = 0.0):
 
         pid_b = tl.program_id(axis = 0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(axis = 1) + pid_m_offset # ID of size-`TILE_SIZE_M` nodes
@@ -892,10 +1023,27 @@ class SumLayer(Layer, nn.Module):
             offs_batch[None,None,:] # [TILE_SIZE_M, num_edges, BLOCK_B]
         emars = tl.load(emars_ptr, mask = (mask_m[:,None,None] & mask_batch[None,None,:]), other = 0.0) # [TILE_SIZE_M, num_edges, BLOCK_B]
 
-        # Compute max and subtract
-        emars_max = tl.max(emars, axis = 1)
-        emars = tl.exp(emars - emars_max[:,None,:])
-        nmars = tl.log(tl.sum(emars * epars[:,:,None], axis = 1)) + emars_max
+        # Compute max and subtract (only when using LL or GeneralLL propagation method)
+        if propagation_alg_id == 0:
+            emars_max = tl.max(emars, axis = 1)
+            emars = tl.exp(emars - emars_max[:,None,:])
+
+        if propagation_alg_id == 2:
+            emars_max = tl.max(emars, axis = 1)
+            emars = tl.exp((emars - emars_max[:,None,:]) * alpha)
+            emars_max *= alpha
+
+        # Compute sum node marginals
+        if propagation_alg_id == 0:
+            nmars = tl.log(tl.sum(emars * epars[:,:,None], axis = 1)) + emars_max
+
+        if propagation_alg_id == 1:
+            nmars = tl.max(emars + tl.log(epars)[:,:,None], axis = 1)
+
+        if propagation_alg_id == 2:
+            epars = tl.exp(tl.log(epars) * alpha)
+
+            nmars = (tl.log(tl.sum(emars * epars[:,:,None], axis = 1)) + emars_max) * (1.0 / alpha)
 
         # Initialize pointers to `node_mars`
         off_nids = tl.load(nids + nblock_ids) # [TILE_SIZE_M]
@@ -908,7 +1056,7 @@ class SumLayer(Layer, nn.Module):
     def _forward_sparse(self, node_mars: torch.Tensor, element_mars: torch.Tensor,
                         params: torch.Tensor, nids: torch.Tensor, cids: torch.Tensor,
                         pids: torch.Tensor, local_ids: Optional[torch.Tensor] = None,
-                        partition_id: int = -1) -> None:
+                        partition_id: int = -1, propagation_alg: str = "LL", **kwargs) -> None:
         """
         Forward pass of sum layers with the sparse processing kernel.
         
@@ -927,7 +1075,9 @@ class SumLayer(Layer, nn.Module):
         batch_size = node_mars.size(1)
         BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
 
-        # assert num_edges <= 16384, "The sparse forward kernel only support nodes with # edges smaller than 16384."
+        # Propagation algorithm
+        propagation_alg_id = self.propagation_alg_mapping[propagation_alg]
+        propagation_alg_kwargs = self._get_propagation_alg_kwargs(propagation_alg, **kwargs)
 
         if triton.cdiv(layer_n_nodes, self.block_size) <= 2048:
             BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
@@ -949,7 +1099,9 @@ class SumLayer(Layer, nn.Module):
                 partial_eval = partial_eval, 
                 num_edges = num_edges, 
                 BLOCK_B = BLOCK_B, 
-                BLOCK_SIZE_M = BLOCK_SIZE_M
+                BLOCK_SIZE_M = BLOCK_SIZE_M,
+                propagation_alg_id = propagation_alg_id,
+                **propagation_alg_kwargs
             )
 
         else:
@@ -977,7 +1129,9 @@ class SumLayer(Layer, nn.Module):
                     num_edges = num_edges,
                     BLOCK_B = BLOCK_B,
                     TILE_SIZE_M = TILE_SIZE_M,
-                    BLOCK_SIZE_M = BLOCK_SIZE_M
+                    BLOCK_SIZE_M = BLOCK_SIZE_M,
+                    propagation_alg_id = propagation_alg_id,
+                    **propagation_alg_kwargs
                 )
             else:
                 for pid_m_start in range(0, grid[1], 32768):
@@ -1000,7 +1154,9 @@ class SumLayer(Layer, nn.Module):
                         num_edges = num_edges,
                         BLOCK_B = BLOCK_B,
                         TILE_SIZE_M = TILE_SIZE_M,
-                        BLOCK_SIZE_M = BLOCK_SIZE_M
+                        BLOCK_SIZE_M = BLOCK_SIZE_M,
+                        propagation_alg_id = propagation_alg_id,
+                        **propagation_alg_kwargs
                     )
 
         return None
@@ -1009,7 +1165,7 @@ class SumLayer(Layer, nn.Module):
     @torch.compile
     def _forward_pytorch_kernel(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor, 
                                 nids: torch.Tensor, cids: torch.Tensor, pids: torch.Tensor,
-                                local_ids: torch.Tensor):
+                                local_ids: torch.Tensor, propagation_alg_id: int, alpha: float = 0.0):
 
         if local_ids is not None:
             nids = nids[local_ids]
@@ -1025,18 +1181,33 @@ class SumLayer(Layer, nn.Module):
             torch.arange(0, self.block_size, device = cids.device)[None,:,None]).reshape(num_nblocks * self.block_size, num_edges)
 
         ch_mars = element_mars[cids]
-        maxval = ch_mars.max(dim = 1, keepdim = True).values
-        node_mars[nids] = (((ch_mars - maxval).exp() * params[pids].unsqueeze(-1)).sum(
-            dim = 1).clamp(min = 1e-10)).log() + maxval.squeeze(1)
+
+        if propagation_alg_id == 0:
+            maxval = ch_mars.max(dim = 1, keepdim = True).values
+            node_mars[nids] = (((ch_mars - maxval).exp() * params[pids].unsqueeze(-1)).sum(
+                dim = 1).clamp(min = 1e-10)).log() + maxval.squeeze(1)
+
+        elif propagation_alg_id == 1:
+            node_mars[nids] = (ch_mars + params[pids].log().unsqueeze(-1)).max(dim = 1).values
+
+        elif propagation_alg_id == 2:
+            maxval = ch_mars.max(dim = 1, keepdim = True).values
+            node_mars[nids] = ((((ch_mars - maxval).exp() * params[pids].unsqueeze(-1)) ** alpha).sum(
+                dim = 1).clamp(min = 1e-10)).log() ** (1.0 / alpha) + maxval.squeeze(1)
 
         return None
 
     def _forward_pytorch(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor, 
                          nids: torch.Tensor, cids: torch.Tensor, pids: torch.Tensor,
-                         local_ids: torch.Tensor):
+                         local_ids: torch.Tensor, propagation_alg: str = "LL", **kwargs):
+
+        # Propagation algorithm
+        propagation_alg_id = self.propagation_alg_mapping[propagation_alg]
+        propagation_alg_kwargs = self._get_propagation_alg_kwargs(propagation_alg, **kwargs)
 
         self._forward_pytorch_kernel(
-            node_mars, element_mars, params, nids, cids, pids, local_ids
+            node_mars, element_mars, params, nids, cids, pids, local_ids,
+            propagation_alg_id = propagation_alg_id, **propagation_alg_kwargs
         )
 
     def _backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
@@ -1048,7 +1219,10 @@ class SumLayer(Layer, nn.Module):
                   parpids: Optional[torch.Tensor] = None, 
                   cs_block_size: int = 0, local_ids: Optional[torch.Tensor] = None, 
                   partition_id: int = -1, mode: Optional[str] = None,
-                  allow_modify_flows: bool = False) -> None:
+                  allow_modify_flows: bool = False,
+                  propagation_alg: str = "LL", 
+                  logspace_flows: bool = False, 
+                  negate_pflows: bool = False, **kwargs) -> None:
         """
         Back pass of sum layers.
         
@@ -1086,20 +1260,24 @@ class SumLayer(Layer, nn.Module):
         elif num_edges <= 32768:
             mode = self.BLOCK_SPARSE
         else:
-            mode = self.SPARSE
+            mode = self.BLOCK_SPARSE
 
         if mode == self.BLOCK_SPARSE:
             self._backward_block_sparse(
                 node_flows, element_flows, params, node_mars, element_mars, param_flows, 
                 nids, cids, pids, pfids, chids, parids, parpids, cs_block_size, local_ids, 
-                partition_id = partition_id, allow_modify_flows = allow_modify_flows
+                partition_id = partition_id, allow_modify_flows = allow_modify_flows,
+                propagation_alg = propagation_alg, logspace_flows = logspace_flows, 
+                negate_pflows = negate_pflows, **kwargs
             )
 
         elif mode == self.SPARSE:
             self._backward_sparse(
                 node_flows, element_flows, params, node_mars, element_mars, param_flows, 
                 nids, cids, pids, pfids, chids, parids, parpids, cs_block_size, local_ids, 
-                partition_id = partition_id, allow_modify_flows = allow_modify_flows
+                partition_id = partition_id, allow_modify_flows = allow_modify_flows,
+                propagation_alg = propagation_alg, logspace_flows = logspace_flows, 
+                negate_pflows = negate_pflows, **kwargs
             )
 
         elif mode == self.PYTORCH:
@@ -1108,7 +1286,9 @@ class SumLayer(Layer, nn.Module):
             self._backward_pytorch(
                 node_flows, element_flows, params, node_mars, 
                 element_mars, param_flows, nids, cids, pids, pfids, 
-                chids, parids, parpids, cs_block_size
+                chids, parids, parpids, cs_block_size,
+                propagation_alg = propagation_alg, 
+                negate_pflows = negate_pflows, **kwargs
             )
         else:
             raise ValueError(f"Not supported mode `{mode}`.")
@@ -1119,7 +1299,7 @@ class SumLayer(Layer, nn.Module):
     # @triton.jit
     @FastJITFunction
     def _bk_triton_modify_flow_kernel(node_flows, node_mars, local_ids, nids, batch_size: tl.constexpr, partial_eval: tl.constexpr, 
-                                      BLOCK_B: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr):
+                                      BLOCK_B: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, propagation_alg_id: tl.constexpr, alpha = 0.0):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` examples
         pid_m = tl.program_id(1) # ID of size-`BLOCK_M` nodes
@@ -1144,7 +1324,16 @@ class SumLayer(Layer, nn.Module):
         nmars = tl.load(node_mars + offs_nmfs, mask = mask_batch[None,:])
         nflows = tl.load(node_flows + offs_nmfs, mask = mask_batch[None,:])
 
-        uflows = tl.where(nmars != -float("inf"), tl.log(nflows) - nmars, -float("inf"))
+        if propagation_alg_id == 0:
+            lflows = tl.log(nflows)
+            uflows = tl.where(nmars != -float("inf"), lflows - nmars, -float("inf"))
+
+        if propagation_alg_id == 1:
+            uflows = nflows
+
+        if propagation_alg_id == 2:
+            lflows = tl.log(nflows)
+            uflows = tl.where(nmars != -float("inf"), lflows - nmars * alpha, -float("inf"))
 
         tl.store(node_flows + offs_nmfs, uflows, mask = mask_batch[None,:])
 
@@ -1152,7 +1341,7 @@ class SumLayer(Layer, nn.Module):
     # @triton.jit
     @FastJITFunction
     def _bk_triton_large_modify_flow_kernel(node_flows, node_mars, local_ids, nids, num_nodes, batch_size: tl.constexpr, partial_eval: tl.constexpr, 
-                                            BLOCK_B: tl.constexpr, TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr):
+                                            BLOCK_B: tl.constexpr, TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, propagation_alg_id: tl.constexpr, alpha = 0.0):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` examples
         pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
@@ -1179,12 +1368,22 @@ class SumLayer(Layer, nn.Module):
         nmars = tl.load(node_mars + offs_nmfs, mask = (mask_m[:,None] & mask_batch[None,:]))
         nflows = tl.load(node_flows + offs_nmfs, mask = (mask_m[:,None] & mask_batch[None,:]))
 
-        uflows = tl.where(nmars != -float("inf"), tl.log(nflows) - nmars, -float("inf"))
+        if propagation_alg_id == 0:
+            lflows = tl.log(nflows)
+            uflows = tl.where(nmars != -float("inf"), lflows - nmars, -float("inf"))
+
+        if propagation_alg_id == 1:
+            uflows = nflows
+
+        if propagation_alg_id == 2:
+            lflows = tl.log(nflows)
+            uflows = tl.where(nmars != -float("inf"), lflows - nmars * alpha, -float("inf"))
 
         tl.store(node_flows + offs_nmfs, uflows, mask = (mask_m[:,None] & mask_batch[None,:]))
 
     def _bk_triton_modify_flow(self, node_flows: torch.Tensor, node_mars: torch.Tensor,
-                               nids: torch.Tensor, local_ids: Optional[torch.Tensor] = None):
+                               nids: torch.Tensor, local_ids: Optional[torch.Tensor] = None,
+                               propagation_alg: str = "LL", **kwargs):
         """
         Replace `node_flows[nids]` with `node_flows[nids].log() - node_mars[nids]`
         """
@@ -1193,6 +1392,10 @@ class SumLayer(Layer, nn.Module):
         layer_n_nodes = num_nblocks * self.block_size
         batch_size = node_mars.size(1)
         BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
+
+        # Propagation algorithm
+        propagation_alg_id = self.propagation_alg_mapping[propagation_alg]
+        propagation_alg_kwargs = self._get_propagation_alg_kwargs(propagation_alg, **kwargs)
 
         if triton.cdiv(layer_n_nodes, self.block_size) <= 4096:
 
@@ -1217,7 +1420,9 @@ class SumLayer(Layer, nn.Module):
                 partial_eval = partial_eval, 
                 BLOCK_B = BLOCK_B, 
                 BLOCK_M = BLOCK_M, 
-                BLOCK_SIZE_M = BLOCK_SIZE_M
+                BLOCK_SIZE_M = BLOCK_SIZE_M,
+                propagation_alg_id = propagation_alg_id,
+                **propagation_alg_kwargs
             )
 
         else:
@@ -1240,7 +1445,9 @@ class SumLayer(Layer, nn.Module):
                 partial_eval = partial_eval,
                 BLOCK_B = BLOCK_B,
                 TILE_SIZE_M = TILE_SIZE_M,
-                BLOCK_SIZE_M = BLOCK_SIZE_M
+                BLOCK_SIZE_M = BLOCK_SIZE_M,
+                propagation_alg_id = propagation_alg_id,
+                **propagation_alg_kwargs
             )
 
         return None
@@ -1251,7 +1458,8 @@ class SumLayer(Layer, nn.Module):
                                nids: Optional[torch.Tensor], cids: Optional[torch.Tensor], pids: Optional[torch.Tensor], pfids: Optional[torch.Tensor],
                                chids: Optional[torch.Tensor], parids: Optional[torch.Tensor], parpids: Optional[torch.Tensor], 
                                cs_block_size: int, local_ids: Optional[torch.Tensor] = None,
-                               partition_id: int = -1, allow_modify_flows: bool = False) -> None:
+                               partition_id: int = -1, allow_modify_flows: bool = False, propagation_alg: str = "LL", 
+                               logspace_flows: bool = False, negate_pflows: bool = False, **kwargs) -> None:
         """
         Back pass of sum layers with block-sparse processing kernel.
         
@@ -1273,7 +1481,9 @@ class SumLayer(Layer, nn.Module):
                 node_flows, element_flows, params, node_mars, element_mars,
                 chids = chids, parids = parids, parpids = parpids, 
                 cs_block_size = cs_block_size, local_ids = local_ids, 
-                partition_id = partition_id, allow_modify_flows = allow_modify_flows
+                partition_id = partition_id, allow_modify_flows = allow_modify_flows,
+                propagation_alg = propagation_alg, 
+                logspace_flows = logspace_flows, **kwargs
             )
 
         # Flows w.r.t. parameters
@@ -1281,7 +1491,10 @@ class SumLayer(Layer, nn.Module):
             self._backward_block_sparse_par_flows(
                 node_flows, params, node_mars, element_mars, param_flows,
                 nids = nids, cids = cids, pids = pids, pfids = pfids,
-                allow_modify_flows = allow_modify_flows
+                allow_modify_flows = allow_modify_flows,
+                propagation_alg = propagation_alg, 
+                logspace_flows = logspace_flows, 
+                negate_pflows = negate_pflows, **kwargs
             )
 
         return None
@@ -1292,9 +1505,10 @@ class SumLayer(Layer, nn.Module):
     def _bk_triton_block_sparse_ele_kernel(node_flows, element_flows, node_mars, element_mars, params, 
                                            chids, parids_start, parids_increment, parpids_start, parpids_increment, 
                                            local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr, ptr_inc_step: tl.constexpr, 
-                                           allow_modify_flows: tl.constexpr, BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, 
-                                           K_NUM_TILES: tl.constexpr, TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, 
-                                           BLOCK_SIZE_K: tl.constexpr, TL_DOT: tl.constexpr):
+                                           allow_modify_flows: tl.constexpr, logspace_flows: tl.constexpr, BLOCK_B: tl.constexpr, 
+                                           TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, TILE_SIZE_M: tl.constexpr, 
+                                           BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, TL_DOT: tl.constexpr, 
+                                           propagation_alg_id: tl.constexpr, alpha = 0.0):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
@@ -1334,40 +1548,88 @@ class SumLayer(Layer, nn.Module):
         parids_inc_ptr = parids_increment + eleblock_id * (K_NUM_TILES * ptr_inc_step) + offs_edge_gid
         parpids_inc_ptr = parpids_increment + eleblock_id * (K_NUM_TILES * ptr_inc_step) + offs_edge_gid
 
+        # Initialize pointers to `element_mars` (only when using MPE propagation method)
+        off_eleids = tl.load(chids + eleblock_id)
+        emars_ptr = element_mars + (off_eleids + offs_ele[:,None]) * batch_size + offs_batch[None,:]
+        emars = tl.load(emars_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_M, BLOCK_B]
+
+        if propagation_alg_id == 2:
+            emars *= alpha
+
         # Inner loop
-        acc = tl.zeros([TILE_SIZE_M, BLOCK_B], dtype = tl.float32) - float("inf")
+        if logspace_flows:
+            acc = tl.zeros([TILE_SIZE_M, BLOCK_B], dtype = tl.float32) - float("inf")
+        else:
+            acc = tl.zeros([TILE_SIZE_M, BLOCK_B], dtype = tl.float32)
 
         for k in range(0, K_NUM_TILES):
             epars = tl.load(epars_ptr) # [TILE_SIZE_M, TILE_SIZE_K]
 
-            if allow_modify_flows == 1:
-                log_n_fdm = tl.load(nflows_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_K, BLOCK_B]
-            else:
+            if propagation_alg_id == 1:
                 nflows = tl.load(nflows_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_K, BLOCK_B]
                 nmars = tl.load(nmars_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_K, BLOCK_B]
-                log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), tl.log(nflows) - nmars)
+                elpars = tl.log(tl.trans(epars)) # [TILE_SIZE_K, TILE_SIZE_M]
 
-            log_n_fdm_max = tl.max(log_n_fdm, axis = 0)[None,:]
-            n_fdm_sub = tl.where(log_n_fdm_max != -float("inf"), tl.exp(log_n_fdm - log_n_fdm_max), 0.0)
+                eflows = tl.sum(tl.where(tl.abs(elpars[:,:,None] + emars[None,:,:] - nmars[:,None,:]) < 1e-6, nflows[:,None,:], 0.0), axis = 0)
 
-            if TL_DOT == 1:
-                partial_flows = tl.dot(epars, n_fdm_sub)
+                if logspace_flows:
+                    # logaddexp
+                    diff = acc - eflows
+                    acc = tl.where(
+                        diff == 0, 
+                        acc + 0.69314718055994530942, # log(2)
+                        tl.where(
+                            diff > 0,
+                            acc + tlmath.log1p(tl.exp(-diff)),
+                            eflows + tlmath.log1p(tl.exp(diff))
+                        )
+                    )
+                else:
+                    # sum
+                    acc += eflows
             else:
-                partial_flows = tl.sum(epars[:,:,None] * n_fdm_sub[None,:,:], axis = 1)
 
-            acc = tl.where(log_n_fdm_max == acc,
-                acc + 0.69314718056, # log(2)
-                tl.where(log_n_fdm_max > acc,
-                    tl.log(partial_flows + tl.exp(acc - log_n_fdm_max)) + log_n_fdm_max,
-                    tl.log(tl.exp(log_n_fdm_max - acc) * partial_flows + 1.0) + acc
-                )
-            )
-            # neginf_flag = (log_n_fdm_max == -float("inf")) & (acc == -float("inf"))
-            # acc = tl.where(log_n_fdm_max > acc,
-            #     tl.log(partial_flows + tl.exp(acc - log_n_fdm_max)) + log_n_fdm_max,
-            #     tl.log(tl.exp(log_n_fdm_max - acc) * partial_flows + 1.0) + acc
-            # )
-            # acc = tl.where(neginf_flag, -float("inf"), acc)
+                if propagation_alg_id == 2:
+                    epars = tl.exp(tl.log(epars) * alpha)
+
+                if allow_modify_flows == 1:
+                    log_n_fdm = tl.load(nflows_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_K, BLOCK_B]
+                else:
+                    nflows = tl.load(nflows_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_K, BLOCK_B]
+                    nmars = tl.load(nmars_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_K, BLOCK_B]
+
+                    if logspace_flows:
+                        if propagation_alg_id == 0:
+                            log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), nflows - nmars)
+
+                        if propagation_alg_id == 2:
+                            log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), nflows - nmars * alpha)
+                    else:
+                        if propagation_alg_id == 0:
+                            log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), tl.log(nflows) - nmars)
+                        
+                        if propagation_alg_id == 2:
+                            log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), tl.log(nflows) - nmars * alpha)
+
+                log_n_fdm_max = tl.max(log_n_fdm, axis = 0)[None,:]
+                n_fdm_sub = tl.where(log_n_fdm_max != -float("inf"), tl.exp(log_n_fdm - log_n_fdm_max), 0.0)
+
+                if TL_DOT == 1:
+                    partial_flows = tl.dot(epars, n_fdm_sub)
+                else:
+                    partial_flows = tl.sum(epars[:,:,None] * n_fdm_sub[None,:,:], axis = 1)
+
+                if logspace_flows:
+                    partial_flows_max = emars + log_n_fdm_max
+                    acc = tl.where(log_n_fdm_max == -float("inf"),
+                        acc,
+                        tl.where(partial_flows_max > acc,
+                            tl.log(partial_flows + tl.exp(acc - partial_flows_max) + 1e-24) + partial_flows_max,
+                            tl.log(tl.exp(partial_flows_max - acc) * partial_flows + 1.0) + acc
+                        )
+                    )
+                else:
+                    acc += partial_flows * tl.exp(emars + log_n_fdm_max)
 
             # Increment `epars_ptr`
             parpids_inc = tl.load(parpids_inc_ptr)
@@ -1381,16 +1643,9 @@ class SumLayer(Layer, nn.Module):
             nflows_ptr += parids_inc[:,None] * batch_size
             parids_inc_ptr += ptr_inc_step
 
-        # Initialize pointers to `element_mars`
-        off_eleids = tl.load(chids + eleblock_id)
-        emars_ptr = element_mars + (off_eleids + offs_ele[:,None]) * batch_size + offs_batch[None,:]
-        emars = tl.load(emars_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_K, BLOCK_B]
-
-        eflows = tl.exp(acc + emars)
-
         # Write back
         offs_elemfs = (off_eleids + offs_ele[:,None]) * batch_size + offs_batch[None,:]
-        tl.store(element_flows + offs_elemfs, eflows, mask = mask_batch[None,:])
+        tl.store(element_flows + offs_elemfs, acc, mask = mask_batch[None,:])
 
     @staticmethod
     # @triton.jit
@@ -1398,9 +1653,10 @@ class SumLayer(Layer, nn.Module):
     def _bk_triton_block_sparse_ele_csmm2_kernel(node_flows, element_flows, node_mars, element_mars, params, 
                                                  chids, parids_start, parids_increment, parpids_start, parpids_increment, 
                                                  local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr, ptr_inc_step: tl.constexpr, 
-                                                 allow_modify_flows: tl.constexpr, BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, 
-                                                 K_NUM_TILES: tl.constexpr, TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, 
-                                                 BLOCK_SIZE_K: tl.constexpr, TL_DOT: tl.constexpr):
+                                                 allow_modify_flows: tl.constexpr, logspace_flows: tl.constexpr, BLOCK_B: tl.constexpr, 
+                                                 TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, TILE_SIZE_M: tl.constexpr, 
+                                                 BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, TL_DOT: tl.constexpr, 
+                                                 propagation_alg_id: tl.constexpr, alpha = 0.0):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
@@ -1440,37 +1696,87 @@ class SumLayer(Layer, nn.Module):
         parids_inc_ptr = parids_increment + eleblock_id * (K_NUM_TILES * ptr_inc_step) + offs_edge_gid
         parpids_inc_ptr = parpids_increment + eleblock_id * (K_NUM_TILES * ptr_inc_step) + offs_edge_gid
 
+        # Initialize pointers to `element_mars`
+        off_eleids = tl.load(chids + eleblock_id)
+        emars_ptr = element_mars + (off_eleids + offs_ele[:,None]) * batch_size + offs_batch[None,:]
+        emars = tl.load(emars_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_M, BLOCK_B]
+
+        if propagation_alg_id == 2:
+            emars *= alpha
+
         # Inner loop
-        acc = tl.zeros([TILE_SIZE_M, BLOCK_B], dtype = tl.float32) - float("inf")
+        if logspace_flows:
+            acc = tl.zeros([TILE_SIZE_M, BLOCK_B], dtype = tl.float32) - float("inf")
+        else:
+            acc = tl.zeros([TILE_SIZE_M, BLOCK_B], dtype = tl.float32)
 
         for k in range(0, K_NUM_TILES):
             epars = tl.load(epars_ptr) # [TILE_SIZE_M, TILE_SIZE_K]
 
-            if allow_modify_flows == 1:
-                log_n_fdm = tl.load(nflows_ptr, mask = mask_batch[:,None]) # [BLOCK_B, TILE_SIZE_K]
-            else:
+            if propagation_alg_id == 1:
                 nflows = tl.load(nflows_ptr, mask = mask_batch[:,None]) # [BLOCK_B, TILE_SIZE_K]
                 nmars = tl.load(nmars_ptr, mask = mask_batch[:,None]) # [BLOCK_B, TILE_SIZE_K]
-                log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), tl.log(nflows) - nmars)
+                elpars = tl.log(tl.trans(epars)) # [TILE_SIZE_K, TILE_SIZE_M]
 
-            log_n_fdm_max = tl.max(log_n_fdm, axis = 1)
-            n_fdm_sub = tl.where(log_n_fdm_max[:,None] != -float("inf"), tl.exp(log_n_fdm - log_n_fdm_max[:,None]), 0.0)
+                eflows = tl.sum(tl.where(tl.abs(elpars[None,:,:] + tl.trans(emars)[:,None,:] - nmars[:,:,None]) < 1e-6, nflows[:,:,None], 0.0), axis = 1)
+                eflows = tl.trans(eflows)
 
-            partial_flows = tl.sum(epars[:,:,None] * tl.trans(n_fdm_sub)[None,:,:], axis = 1)
+                if logspace_flows:
+                    # logaddexp
+                    diff = acc - eflows
+                    acc = tl.where(
+                        diff == 0, 
+                        acc + 0.69314718055994530942, # log(2)
+                        tl.where(
+                            diff > 0,
+                            acc + tlmath.log1p(tl.exp(-diff)),
+                            eflows + tlmath.log1p(tl.exp(diff))
+                        )
+                    )
+                else:
+                    # sum
+                    acc += eflows
 
-            acc = tl.where(log_n_fdm_max[None,:] == acc,
-                acc + 0.69314718056, # log(2)
-                tl.where(log_n_fdm_max[None,:] > acc,
-                    tl.log(partial_flows + tl.exp(acc - log_n_fdm_max[None,:])) + log_n_fdm_max[None,:],
-                    tl.log(tl.exp(log_n_fdm_max[None,:] - acc) * partial_flows + 1.0) + acc
-                )
-            )
-            # neginf_flag = (log_n_fdm_max[None,:] == -float("inf")) & (acc == -float("inf"))
-            # acc = tl.where(log_n_fdm_max[None,:] > acc,
-            #     tl.log(partial_flows + tl.exp(acc - log_n_fdm_max[None,:])) + log_n_fdm_max[None,:],
-            #     tl.log(tl.exp(log_n_fdm_max[None,:] - acc) * partial_flows + 1.0) + acc
-            # )
-            # acc = tl.where(neginf_flag, -float("inf"), acc)
+            else:
+
+                if propagation_alg_id == 2:
+                    epars = tl.exp(tl.log(epars) * alpha)
+
+                if allow_modify_flows == 1:
+                    log_n_fdm = tl.load(nflows_ptr, mask = mask_batch[:,None]) # [BLOCK_B, TILE_SIZE_K]
+                else:
+                    nflows = tl.load(nflows_ptr, mask = mask_batch[:,None]) # [BLOCK_B, TILE_SIZE_K]
+                    nmars = tl.load(nmars_ptr, mask = mask_batch[:,None]) # [BLOCK_B, TILE_SIZE_K]
+
+                    if logspace_flows:
+                        if propagation_alg_id == 0:
+                            log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), nflows - nmars)
+
+                        if propagation_alg_id == 2:
+                            log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), nflows - nmars * alpha)
+                    else:
+                        if propagation_alg_id == 0:
+                            log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), tl.log(nflows) - nmars)
+                        
+                        if propagation_alg_id == 2:
+                            log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), tl.log(nflows) - nmars * alpha)
+
+                log_n_fdm_max = tl.max(log_n_fdm, axis = 1)
+                n_fdm_sub = tl.where(log_n_fdm_max[:,None] != -float("inf"), tl.exp(log_n_fdm - log_n_fdm_max[:,None]), 0.0)
+
+                partial_flows = tl.sum(epars[:,:,None] * tl.trans(n_fdm_sub)[None,:,:], axis = 1)
+
+                if logspace_flows:
+                    partial_flows_max = emars + log_n_fdm_max[None,:]
+                    acc = tl.where(log_n_fdm_max[None,:] == -float("inf"),
+                        acc,
+                        tl.where(partial_flows_max > acc,
+                            tl.log(partial_flows + tl.exp(acc - partial_flows_max) + 1e-24) + partial_flows_max,
+                            tl.log(tl.exp(partial_flows_max - acc) * partial_flows + 1.0) + acc
+                        )
+                    )
+                else:
+                    acc += partial_flows * tl.exp(emars + log_n_fdm_max[None,:])
 
             # Increment `epars_ptr`
             parpids_inc = tl.load(parpids_inc_ptr)
@@ -1484,22 +1790,16 @@ class SumLayer(Layer, nn.Module):
             nflows_ptr += parids_inc[None,:] * batch_size
             parids_inc_ptr += ptr_inc_step
 
-        # Initialize pointers to `element_mars`
-        off_eleids = tl.load(chids + eleblock_id)
-        emars_ptr = element_mars + (off_eleids + offs_ele[:,None]) * batch_size + offs_batch[None,:]
-        emars = tl.load(emars_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_K, BLOCK_B]
-
-        eflows = tl.exp(acc + emars)
-
         # Write back
         offs_elemfs = (off_eleids + offs_ele[:,None]) * batch_size + offs_batch[None,:]
-        tl.store(element_flows + offs_elemfs, eflows, mask = mask_batch[None,:])
+        tl.store(element_flows + offs_elemfs, acc, mask = mask_batch[None,:])
 
     def _backward_block_sparse_ele_flows(self, node_flows: torch.Tensor, element_flows: torch.Tensor,
                                          params: torch.Tensor, node_mars: torch.Tensor,
                                          element_mars: torch.Tensor, chids: torch.Tensor, parids: torch.Tensor,
                                          parpids: torch.Tensor, cs_block_size: int, local_ids: Optional[torch.Tensor] = None,
-                                         partition_id: int = -1, allow_modify_flows: bool = False) -> None:
+                                         partition_id: int = -1, allow_modify_flows: bool = False,
+                                         propagation_alg: str = "LL", logspace_flows: bool = False, **kwargs) -> None:
 
         assert params.dim() == 1, "Expecting a 1D `params`."
 
@@ -1508,6 +1808,10 @@ class SumLayer(Layer, nn.Module):
         num_edges = parids.size(1) * self.block_size
         batch_size = node_flows.size(1)
         BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
+
+        # Propagation algorithm
+        propagation_alg_id = self.propagation_alg_mapping[propagation_alg]
+        propagation_alg_kwargs = self._get_propagation_alg_kwargs(propagation_alg, **kwargs)
 
         # Heuristic to set `TILE_SIZE_M`, `TILE_SIZE_K`, and `BLOCK_B`
         base_size = min(self.block_size, num_edges, BATCH_SIZE_NP2, 64)
@@ -1590,6 +1894,7 @@ class SumLayer(Layer, nn.Module):
                 partial_eval = partial_eval,
                 ptr_inc_step = ptr_inc_step,
                 allow_modify_flows = allow_modify_flows,
+                logspace_flows = logspace_flows,
                 BLOCK_B = BLOCK_B, 
                 TILE_SIZE_K = TILE_SIZE_K, 
                 K_NUM_TILES = K_NUM_TILES,
@@ -1598,7 +1903,9 @@ class SumLayer(Layer, nn.Module):
                 BLOCK_SIZE_K = BLOCK_SIZE_K,
                 TL_DOT = TL_DOT,
                 num_warps = 2, # TODO: test for different devices
-                num_stages = 1
+                num_stages = 1,
+                propagation_alg_id = propagation_alg_id,
+                **propagation_alg_kwargs
             )
         else:
             self._bk_triton_block_sparse_ele_csmm2_kernel[grid](
@@ -1617,6 +1924,7 @@ class SumLayer(Layer, nn.Module):
                 partial_eval = partial_eval,
                 ptr_inc_step = ptr_inc_step,
                 allow_modify_flows = allow_modify_flows,
+                logspace_flows = logspace_flows,
                 BLOCK_B = BLOCK_B, 
                 TILE_SIZE_K = TILE_SIZE_K, 
                 K_NUM_TILES = K_NUM_TILES,
@@ -1625,7 +1933,9 @@ class SumLayer(Layer, nn.Module):
                 BLOCK_SIZE_K = BLOCK_SIZE_K,
                 TL_DOT = TL_DOT,
                 num_warps = 2, # TODO: test for different devices
-                num_stages = 1
+                num_stages = 1,
+                propagation_alg_id = propagation_alg_id,
+                **propagation_alg_kwargs
             )
 
         return None
@@ -1635,8 +1945,10 @@ class SumLayer(Layer, nn.Module):
     @FastJITFunction
     def _bk_triton_block_sparse_par_kernel(node_flows, node_mars, element_mars, params, param_flows, nids, cids, pids, pfids,
                                            batch_size: tl.constexpr, num_edges: tl.constexpr, allow_modify_flows: tl.constexpr, 
-                                           TILE_SIZE_B: tl.constexpr, B_NUM_TILES: tl.constexpr, TILE_SIZE_K: tl.constexpr, 
-                                           TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, TL_DOT: tl.constexpr):
+                                           logspace_flows: tl.constexpr, TILE_SIZE_B: tl.constexpr, B_NUM_TILES: tl.constexpr, 
+                                           TILE_SIZE_K: tl.constexpr, TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, 
+                                           TL_DOT: tl.constexpr, propagation_alg_id: tl.constexpr, negate_pflows: tl.constexpr, 
+                                           alpha = 0.0):
 
         pid_k = tl.program_id(0) # ID of size-`TILE_SIZE_K` edges
         pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
@@ -1662,30 +1974,57 @@ class SumLayer(Layer, nn.Module):
         nmars_ptr = node_mars + (off_nids + offs_node[:,None]) * batch_size + offs_batch[None,:]
         nflows_ptr = node_flows + (off_nids + offs_node[:,None]) * batch_size + offs_batch[None,:]
 
+        # Initialize `params` (only when using MPE propagation method)
+        if propagation_alg_id == 1:
+            par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
+            epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
+            epars = tl.load(params + epars_offsets)
+            elpars = tl.log(epars)
+
         # Inner loop
         acc = tl.zeros([TILE_SIZE_M, TILE_SIZE_K], dtype = tl.float32)
-        
+
         for b in range(0, B_NUM_TILES):
             emars = tl.load(emars_ptr, mask = mask_batch[:,None], other = 0.0) # [TILE_SIZE_B, TILE_SIZE_K]
 
-            if allow_modify_flows == 1:
-                log_n_fdm = tl.load(nflows_ptr, mask = mask_batch[None,:], other = -float("inf")) # [TILE_SIZE_M, TILE_SIZE_B]
-            else:
+            if propagation_alg_id == 1:
                 nflows = tl.load(nflows_ptr, mask = mask_batch[None,:], other = 0.0) # [TILE_SIZE_M, TILE_SIZE_B]
                 nmars = tl.load(nmars_ptr, mask = mask_batch[None,:], other = 0.0) # [TILE_SIZE_M, TILE_SIZE_B]
-                log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), tl.log(nflows) - nmars)
 
-            log_n_fdm_max = tl.max(log_n_fdm, axis = 0)
-            n_fdm_sub = tl.where(log_n_fdm_max[None,:] != -float("inf"), tl.exp(log_n_fdm - log_n_fdm_max[None,:]), 0.0)
+                cond = tl.abs(elpars[:,None,:] + emars[None,:,:] - nmars[:,:,None]) < 1e-6
+                if logspace_flows:
+                    acc += tl.sum(tl.where(cond, tl.exp(nflows[:,:,None]), 0.0), axis = 1)
+                else:
+                    acc += tl.sum(tl.where(cond, nflows[:,:,None], 0.0), axis = 1)
 
-            scaled_emars = tl.exp(emars + log_n_fdm_max[:,None])
-
-            if TL_DOT == 1:
-                partial_flows = tl.dot(n_fdm_sub, scaled_emars)
             else:
-                partial_flows = tl.sum(n_fdm_sub[:,:,None] * scaled_emars[None,:,:], axis = 1)
 
-            acc += partial_flows
+                nmars = tl.load(nmars_ptr, mask = mask_batch[None,:], other = 0.0) # [TILE_SIZE_M, TILE_SIZE_B]
+
+                if allow_modify_flows == 1:
+                    log_n_fdm = tl.load(nflows_ptr, mask = mask_batch[None,:], other = -float("inf")) # [TILE_SIZE_M, TILE_SIZE_B]
+
+                    if propagation_alg_id == 2:
+                        log_n_fdm += (alpha - 1.0) * nmars
+                else:
+                    nflows = tl.load(nflows_ptr, mask = mask_batch[None,:], other = 0.0) # [TILE_SIZE_M, TILE_SIZE_B]
+                    
+                    if logspace_flows:
+                        log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), nflows - nmars)
+                    else:
+                        log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), tl.log(nflows) - nmars)
+
+                log_n_fdm_max = tl.max(log_n_fdm, axis = 0)
+                n_fdm_sub = tl.where(log_n_fdm_max[None,:] != -float("inf"), tl.exp(log_n_fdm - log_n_fdm_max[None,:]), 0.0)
+
+                scaled_emars = tl.exp(emars + log_n_fdm_max[:,None])
+
+                if TL_DOT == 1:
+                    partial_flows = tl.dot(n_fdm_sub, scaled_emars)
+                else:
+                    partial_flows = tl.sum(n_fdm_sub[:,:,None] * scaled_emars[None,:,:], axis = 1)
+
+                acc += partial_flows
 
             # Increment `emars_ptr`, `nmars_ptr`, and `nmars_ptr`
             emars_ptr += TILE_SIZE_B
@@ -1697,25 +2036,34 @@ class SumLayer(Layer, nn.Module):
             offs_batch += TILE_SIZE_B
             mask_batch = offs_batch < batch_size
 
-        # Initialize `params`
-        par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
-        epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
-        epars = tl.load(params + epars_offsets)
+        # Initialize `params` (only when NOT using MPE propagation method)
+        if propagation_alg_id != 1:
+            par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
+            epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
+            epars = tl.load(params + epars_offsets)
 
-        pflows = acc * epars
+        if propagation_alg_id != 1:
+            pflows = acc * epars
+        else:
+            pflows = acc
 
         parflow_start = tl.load(pfids + nblock_id * num_edges + offs_edge)
         eparflows_offsets = offs_node[:,None] + parflow_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
 
-        tl.atomic_add(param_flows + eparflows_offsets, pflows)
+        if negate_pflows:
+            tl.atomic_add(param_flows + eparflows_offsets, -1.0 * pflows)
+        else:
+            tl.atomic_add(param_flows + eparflows_offsets, pflows)
 
     @staticmethod
     # @triton.jit
     @FastJITFunction
     def _bk_triton_block_sparse_par_csmm2_kernel(node_flows, node_mars, element_mars, params, param_flows, nids, cids, pids, pfids,
                                                  batch_size: tl.constexpr, num_edges: tl.constexpr, allow_modify_flows: tl.constexpr, 
-                                                 TILE_SIZE_B: tl.constexpr, B_NUM_TILES: tl.constexpr, TILE_SIZE_K: tl.constexpr, 
-                                                 TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, TL_DOT: tl.constexpr):
+                                                 logspace_flows: tl.constexpr, TILE_SIZE_B: tl.constexpr, B_NUM_TILES: tl.constexpr, 
+                                                 TILE_SIZE_K: tl.constexpr, TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, 
+                                                 TL_DOT: tl.constexpr, propagation_alg_id: tl.constexpr, negate_pflows: tl.constexpr, 
+                                                 alpha = 0.0):
 
         pid_k = tl.program_id(0) # ID of size-`TILE_SIZE_K` edges
         pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
@@ -1741,27 +2089,51 @@ class SumLayer(Layer, nn.Module):
         nmars_ptr = node_mars + (off_nids + offs_node[None,:]) * batch_size + offs_batch[:,None]
         nflows_ptr = node_flows + (off_nids + offs_node[None,:]) * batch_size + offs_batch[:,None]
 
+        # Initialize `params` (only when using MPE propagation method)
+        if propagation_alg_id == 1:
+            par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
+            epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
+            epars = tl.load(params + epars_offsets)
+            elpars = tl.log(epars)
+
         # Inner loop
         acc = tl.zeros([TILE_SIZE_M, TILE_SIZE_K], dtype = tl.float32)
         
         for b in range(0, B_NUM_TILES):
             emars = tl.load(emars_ptr, mask = mask_batch[:,None], other = 0.0) # [TILE_SIZE_B, TILE_SIZE_K]
+            nmars = tl.load(nmars_ptr, mask = mask_batch[:,None], other = 0.0) # [TILE_SIZE_B, TILE_SIZE_M]
 
-            if allow_modify_flows == 1:
-                log_n_fdm = tl.load(nflows_ptr, mask = mask_batch[:,None], other = -float("inf")) # [TILE_SIZE_B, TILE_SIZE_M]
-            else:
+            if propagation_alg_id == 1:
                 nflows = tl.load(nflows_ptr, mask = mask_batch[:,None], other = 0.0) # [TILE_SIZE_B, TILE_SIZE_M]
-                nmars = tl.load(nmars_ptr, mask = mask_batch[:,None], other = 0.0) # [TILE_SIZE_B, TILE_SIZE_M]
-                log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), tl.log(nflows) - nmars)
 
-            log_n_fdm_max = tl.max(log_n_fdm, axis = 1)
-            n_fdm_sub = tl.where(log_n_fdm_max[:,None] != -float("inf"), tl.exp(log_n_fdm - log_n_fdm_max[:,None]), 0.0)
+                if logspace_flows:
+                    acc += tl.sum(tl.where(tl.abs(elpars[None,:,:] + emars[:,None,:] - nmars[:,:,None]) < 1e-6, tl.exp(nflows[:,:,None]), 0.0), axis = 0)
+                else:
+                    acc += tl.sum(tl.where(tl.abs(elpars[None,:,:] + emars[:,None,:] - nmars[:,:,None]) < 1e-6, nflows[:,:,None], 0.0), axis = 0)
 
-            scaled_emars = tl.exp(emars + log_n_fdm_max[:,None])
+            else:
 
-            partial_flows = tl.sum(tl.trans(n_fdm_sub)[:,:,None] * scaled_emars[None,:,:], axis = 1)
+                if allow_modify_flows == 1:
+                    log_n_fdm = tl.load(nflows_ptr, mask = mask_batch[:,None], other = -float("inf")) # [TILE_SIZE_B, TILE_SIZE_M]
 
-            acc += partial_flows
+                    if propagation_alg_id == 2:
+                        log_n_fdm += (alpha - 1.0) * nmars
+                else:
+                    nflows = tl.load(nflows_ptr, mask = mask_batch[:,None], other = 0.0) # [TILE_SIZE_B, TILE_SIZE_M]
+
+                    if logspace_flows:
+                        log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), nflows - nmars)
+                    else:
+                        log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), tl.log(nflows) - nmars)
+
+                log_n_fdm_max = tl.max(log_n_fdm, axis = 1)
+                n_fdm_sub = tl.where(log_n_fdm_max[:,None] != -float("inf"), tl.exp(log_n_fdm - log_n_fdm_max[:,None]), 0.0)
+
+                scaled_emars = tl.exp(emars + log_n_fdm_max[:,None])
+
+                partial_flows = tl.sum(tl.trans(n_fdm_sub)[:,:,None] * scaled_emars[None,:,:], axis = 1)
+
+                acc += partial_flows
 
             # Increment `emars_ptr`, `nmars_ptr`, and `nmars_ptr`
             emars_ptr += TILE_SIZE_B
@@ -1773,22 +2145,30 @@ class SumLayer(Layer, nn.Module):
             offs_batch += TILE_SIZE_B
             mask_batch = offs_batch < batch_size
 
-        # Initialize `params`
-        par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
-        epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
-        epars = tl.load(params + epars_offsets)
+        # Initialize `params` (only when NOT using MPE propagation method)
+        if propagation_alg_id != 1:
+            par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
+            epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
+            epars = tl.load(params + epars_offsets)
 
-        pflows = acc * epars
+        if propagation_alg_id != 1:
+            pflows = acc * epars
+        else:
+            pflows = acc
 
         parflow_start = tl.load(pfids + nblock_id * num_edges + offs_edge)
         eparflows_offsets = offs_node[:,None] + parflow_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
 
-        tl.atomic_add(param_flows + eparflows_offsets, pflows)
+        if negate_pflows:
+            tl.atomic_add(param_flows + eparflows_offsets, -1.0 * pflows)
+        else:
+            tl.atomic_add(param_flows + eparflows_offsets, pflows)
 
     def _backward_block_sparse_par_flows(self, node_flows: torch.Tensor, params: torch.Tensor, node_mars: torch.Tensor, 
                                          element_mars: torch.Tensor, param_flows: torch.Tensor, nids: torch.Tensor, 
                                          cids: torch.Tensor, pids: torch.Tensor, pfids: torch.Tensor,
-                                         allow_modify_flows: bool = False) -> None:
+                                         allow_modify_flows: bool = False, propagation_alg: str = "LL", 
+                                         logspace_flows: bool = False, negate_pflows: bool = False, **kwargs) -> None:
         """
         Backward pass of sum layers w.r.t. sum parameters with the block-sparse processing kernel.
         
@@ -1812,6 +2192,10 @@ class SumLayer(Layer, nn.Module):
         batch_size = node_mars.size(1)
         BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
 
+        # Propagation algorithm
+        propagation_alg_id = self.propagation_alg_mapping[propagation_alg]
+        propagation_alg_kwargs = self._get_propagation_alg_kwargs(propagation_alg, **kwargs)
+
         # Heuristic to set `TILE_SIZE_M`, `TILE_SIZE_K`, and `BLOCK_B`
         base_size = min(self.block_size, num_edges, BATCH_SIZE_NP2)
         if base_size >= 64:
@@ -1821,6 +2205,13 @@ class SumLayer(Layer, nn.Module):
             TILE_SIZE_B = min(2048 // remainder, base_size * remainder, BATCH_SIZE_NP2)
         TILE_SIZE_M = min(2048 // TILE_SIZE_B, self.block_size)
         TILE_SIZE_K = min(2048 // TILE_SIZE_B, num_edges)
+        
+        if propagation_alg_id == 1:
+            # The kernel will stall if the tile sizes are too large
+            TILE_SIZE_M = min(TILE_SIZE_M, 16)
+            TILE_SIZE_K = min(TILE_SIZE_K, 16)
+            TILE_SIZE_B = min(TILE_SIZE_B, 16)
+
         B_NUM_TILES = batch_size // TILE_SIZE_B
 
         allow_modify_flows = 1 if allow_modify_flows else 0
@@ -1850,12 +2241,16 @@ class SumLayer(Layer, nn.Module):
                 batch_size = batch_size, 
                 num_edges = num_edges, 
                 allow_modify_flows = allow_modify_flows, 
+                logspace_flows = logspace_flows,
                 TILE_SIZE_B = TILE_SIZE_B, 
                 B_NUM_TILES = B_NUM_TILES, 
                 TILE_SIZE_K = TILE_SIZE_K, 
                 TILE_SIZE_M = TILE_SIZE_M, 
                 BLOCK_SIZE_M = self.block_size,
-                TL_DOT = TL_DOT
+                TL_DOT = TL_DOT,
+                propagation_alg_id = propagation_alg_id,
+                negate_pflows = negate_pflows,
+                **propagation_alg_kwargs
             )
         else:
             self._bk_triton_block_sparse_par_csmm2_kernel[grid](
@@ -1870,14 +2265,20 @@ class SumLayer(Layer, nn.Module):
                 pfids = pfids,
                 batch_size = batch_size, 
                 num_edges = num_edges, 
-                allow_modify_flows = allow_modify_flows, 
+                allow_modify_flows = allow_modify_flows,
+                logspace_flows = logspace_flows,
                 TILE_SIZE_B = TILE_SIZE_B, 
                 B_NUM_TILES = B_NUM_TILES, 
                 TILE_SIZE_K = TILE_SIZE_K, 
                 TILE_SIZE_M = TILE_SIZE_M, 
                 BLOCK_SIZE_M = self.block_size,
-                TL_DOT = TL_DOT
+                TL_DOT = TL_DOT,
+                propagation_alg_id = propagation_alg_id,
+                negate_pflows = negate_pflows,
+                **propagation_alg_kwargs
             )
+
+        return None
 
     def _backward_sparse(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
                          params: torch.Tensor, node_mars: torch.Tensor, 
@@ -1885,7 +2286,9 @@ class SumLayer(Layer, nn.Module):
                          nids: Optional[torch.Tensor], cids: Optional[torch.Tensor], pids: Optional[torch.Tensor], pfids: Optional[torch.Tensor],
                          chids: Optional[torch.Tensor], parids: Optional[torch.Tensor], parpids: Optional[torch.Tensor], 
                          cs_block_size: int, local_ids: Optional[torch.Tensor] = None,
-                         partition_id: int = -1, allow_modify_flows: bool = False) -> None:
+                         partition_id: int = -1, allow_modify_flows: bool = False, 
+                         propagation_alg: str = "LL", logspace_flows: bool = False, 
+                         negate_pflows: bool = False, **kwargs) -> None:
         """
         Back pass of sum layers with sparse processing kernel.
         
@@ -1907,7 +2310,9 @@ class SumLayer(Layer, nn.Module):
                 node_flows, element_flows, params, node_mars, element_mars,
                 chids = chids, parids = parids, parpids = parpids, 
                 cs_block_size = cs_block_size, local_ids = local_ids,
-                allow_modify_flows = allow_modify_flows
+                allow_modify_flows = allow_modify_flows,
+                propagation_alg = propagation_alg, 
+                logspace_flows = logspace_flows, **kwargs
             )
 
         # Flows w.r.t. parameters
@@ -1915,7 +2320,10 @@ class SumLayer(Layer, nn.Module):
             self._backward_sparse_par_flows(
                 node_flows, params, node_mars, element_mars, param_flows,
                 nids = nids, cids = cids, pids = pids, pfids = pfids,
-                allow_modify_flows = allow_modify_flows
+                allow_modify_flows = allow_modify_flows,
+                propagation_alg = propagation_alg, 
+                logspace_flows = logspace_flows, 
+                negate_pflows = negate_pflows, **kwargs
             )
 
         return None
@@ -1925,8 +2333,9 @@ class SumLayer(Layer, nn.Module):
     @FastJITFunction
     def _bk_triton_sparse_ele_kernel(node_flows, element_flows, node_mars, element_mars, params, 
                                      chids, parids, parpids, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
-                                     n_edge_blocks: tl.constexpr, allow_modify_flows: tl.constexpr, BLOCK_B: tl.constexpr, 
-                                     BLOCK_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr):
+                                     n_edge_blocks: tl.constexpr, allow_modify_flows: tl.constexpr, logspace_flows: tl.constexpr, 
+                                     BLOCK_B: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, 
+                                     propagation_alg_id: tl.constexpr, alpha = 0.0):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(1) # ID of size-`BLOCK_M` nodes
@@ -1973,10 +2382,41 @@ class SumLayer(Layer, nn.Module):
             epars = tl.load(epars_ptr) # [num_edges]
             emars = tl.load(emars_ptr, mask = mask_batch) # [BLOCK_B]
 
-            if allow_modify_flows == 1:
-                eflows = tl.sum(epars[:,None] * tl.exp(emars[None,:] + log_n_fdm), axis = 0)
+            if propagation_alg_id == 1:
+                if allow_modify_flows:
+                    nflows = log_n_fdm
+
+                lpars = tl.log(epars)
+                eflows = tl.sum(tl.where(tl.abs(lpars[:,None] + emars[None,:] - nmars) < 1e-6, nflows, 0.0), axis = 0)
+
             else:
-                eflows = tl.sum(nflows * epars[:,None] * tl.exp(emars[None,:] - nmars), axis = 0)
+                lpars = tl.log(epars)
+                if propagation_alg_id == 2:
+                    lpars *= alpha
+                    epars = tl.exp(lpars)
+
+                if allow_modify_flows == 1:
+                    if propagation_alg_id == 0:
+                        eflows = tl.sum(epars[:,None] * tl.exp(emars[None,:] + log_n_fdm), axis = 0)
+                    
+                    if propagation_alg_id == 2:
+                        eflows = tl.sum(epars[:,None] * tl.exp(emars[None,:] * alpha + log_n_fdm), axis = 0)
+                else:
+                    if logspace_flows:
+                        if propagation_alg_id == 0:
+                            elflows = nflows + lpars[:,None] + emars[None,:] - nmars
+                        
+                        if propagation_alg_id == 2:
+                            elflows = nflows + lpars[:,None] + (emars[None,:] - nmars) * alpha
+
+                        elflows_max = tl.max(elflows, axis = 0)
+                        eflows = tl.log(tl.sum(tl.exp(elflows - elflows_max[None,:]), axis = 0)) + elflows_max
+                    else:
+                        if propagation_alg_id == 0:
+                            eflows = tl.sum(nflows * epars[:,None] * tl.exp(emars[None,:] - nmars), axis = 0)
+
+                        if propagation_alg_id == 2:
+                            eflows = tl.sum(nflows * epars[:,None] * tl.exp((emars[None,:] - nmars) * alpha), axis = 0)
 
             tl.store(eflows_ptr, eflows, mask = mask_batch)
 
@@ -1993,8 +2433,10 @@ class SumLayer(Layer, nn.Module):
     def _bk_triton_large_sparse_ele_kernel(node_flows, element_flows, node_mars, element_mars, params, 
                                            chids, parids, parpids, local_ids, num_eles, pid_m_offset, 
                                            batch_size: tl.constexpr, partial_eval: tl.constexpr,
-                                           n_edge_blocks: tl.constexpr, allow_modify_flows: tl.constexpr, BLOCK_B: tl.constexpr, 
-                                           TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr):
+                                           n_edge_blocks: tl.constexpr, allow_modify_flows: tl.constexpr, 
+                                           logspace_flows: tl.constexpr, BLOCK_B: tl.constexpr, 
+                                           TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+                                           propagation_alg_id: tl.constexpr, alpha = 0.0):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(1) + pid_m_offset # ID of size-`TILE_SIZE_M` nodes
@@ -2042,10 +2484,41 @@ class SumLayer(Layer, nn.Module):
                         mask = (mask_m[:,None] & mask_batch[None,:])) # [TILE_SIZE_M, BLOCK_B]
 
         # Compute eflows
-        if allow_modify_flows == 1:
-            eflows = tl.sum(epars[:,:,None] * tl.exp(emars[:,None,:] + log_n_fdm), axis = 1)
+        if propagation_alg_id == 1:
+            if allow_modify_flows:
+                nflows = log_n_fdm
+
+            lpars = tl.log(epars)
+            eflows = tl.sum(tl.where(tl.abs(lpars[:,:,None] + emars[:,None,:] - nmars) < 1e-6, nflows, 0.0), axis = 1)
+
         else:
-            eflows = tl.sum(nflows * epars[:,:,None] * tl.exp(emars[:,None,:] - nmars), axis = 1)
+            lpars = tl.log(epars)
+            if propagation_alg_id == 2:
+                lpars *= alpha
+                epars = tl.exp(lpars)
+
+            if allow_modify_flows == 1:
+                if propagation_alg_id == 0:
+                    eflows = tl.sum(epars[:,:,None] * tl.exp(emars[:,None,:] + log_n_fdm), axis = 1)
+
+                if propagation_alg_id == 2:
+                    eflows = tl.sum(epars[:,:,None] * tl.exp(emars[:,None,:] * alpha + log_n_fdm), axis = 1)
+            else:
+                if logspace_flows:
+                    if propagation_alg_id == 0:
+                        elflows = nflows + lpars[:,:,None] + emars[:,None,:] - nmars
+
+                    if propagation_alg_id == 2:
+                        elflows = nflows + lpars[:,:,None] + (emars[:,None,:] - nmars) * alpha
+
+                    elflows_max = tl.max(elflows, axis = 1)
+                    eflows = tl.log(tl.sum(tl.exp(elflows - elflows_max[:,None,:]), axis = 1)) + elflows_max
+                else:
+                    if propagation_alg_id == 0:
+                        eflows = tl.sum(nflows * epars[:,:,None] * tl.exp(emars[:,None,:] - nmars), axis = 1)
+
+                    if propagation_alg_id == 2:
+                        eflows = tl.sum(nflows * epars[:,:,None] * tl.exp((emars[:,None,:] - nmars) * alpha), axis = 0)
 
         tl.store(eflows_ptr, eflows, mask = (mask_m[:,None] & mask_batch[None,:]))
 
@@ -2053,7 +2526,8 @@ class SumLayer(Layer, nn.Module):
                                    params: torch.Tensor, node_mars: torch.Tensor,
                                    element_mars: torch.Tensor, chids: torch.Tensor, parids: torch.Tensor,
                                    parpids: torch.Tensor, cs_block_size: int, local_ids: Optional[torch.Tensor] = None,
-                                   allow_modify_flows: bool = False) -> None:
+                                   allow_modify_flows: bool = False, propagation_alg: str = "LL", 
+                                   logspace_flows: bool = False, **kwargs) -> None:
 
         assert params.dim() == 1, "Expecting a 1D `params`."
 
@@ -2063,6 +2537,10 @@ class SumLayer(Layer, nn.Module):
         num_edges = n_edge_blocks * self.block_size
         batch_size = node_flows.size(1)
         BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
+
+        # Propagation algorithm
+        propagation_alg_id = self.propagation_alg_mapping[propagation_alg]
+        propagation_alg_kwargs = self._get_propagation_alg_kwargs(propagation_alg, **kwargs)
 
         assert num_edges <= 16384, "The sparse backward kernel only support nodes with # edges smaller than 16384."
 
@@ -2089,9 +2567,12 @@ class SumLayer(Layer, nn.Module):
                 partial_eval = 1 if local_ids is not None else 0,
                 n_edge_blocks = n_edge_blocks,
                 allow_modify_flows = allow_modify_flows,
+                logspace_flows = logspace_flows,
                 BLOCK_B = BLOCK_B,
                 BLOCK_M = BLOCK_M,
-                BLOCK_SIZE_K = self.block_size
+                BLOCK_SIZE_K = self.block_size,
+                propagation_alg_id = propagation_alg_id,
+                **propagation_alg_kwargs
             )
 
         else:
@@ -2120,10 +2601,13 @@ class SumLayer(Layer, nn.Module):
                     partial_eval = 1 if local_ids is not None else 0,
                     n_edge_blocks = n_edge_blocks,
                     allow_modify_flows = allow_modify_flows,
+                    logspace_flows = logspace_flows,
                     BLOCK_B = BLOCK_B,
                     TILE_SIZE_M = TILE_SIZE_M,
                     BLOCK_SIZE_M = cs_block_size,
-                    BLOCK_SIZE_K = self.block_size
+                    BLOCK_SIZE_K = self.block_size,
+                    propagation_alg_id = propagation_alg_id,
+                    **propagation_alg_kwargs
                 )
 
             else:
@@ -2148,10 +2632,13 @@ class SumLayer(Layer, nn.Module):
                         partial_eval = 1 if local_ids is not None else 0,
                         n_edge_blocks = n_edge_blocks,
                         allow_modify_flows = allow_modify_flows,
+                        logspace_flows = logspace_flows,
                         BLOCK_B = BLOCK_B,
                         TILE_SIZE_M = TILE_SIZE_M,
                         BLOCK_SIZE_M = cs_block_size,
-                        BLOCK_SIZE_K = self.block_size
+                        BLOCK_SIZE_K = self.block_size,
+                        propagation_alg_id = propagation_alg_id,
+                        **propagation_alg_kwargs
                     )
 
         return None
@@ -2161,8 +2648,9 @@ class SumLayer(Layer, nn.Module):
     @FastJITFunction
     def _bk_triton_sparse_par_kernel(node_flows, node_mars, element_mars, params, param_flows, nids, cids, pids, pfids,
                                      pid_m_offset, num_edges: tl.constexpr, batch_size: tl.constexpr, allow_modify_flows: tl.constexpr, 
-                                     BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_B: tl.constexpr, 
-                                     TILE_SIZE_B: tl.constexpr, B_NUM_BLOCKS: tl.constexpr):
+                                     logspace_flows: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_B: tl.constexpr, 
+                                     TILE_SIZE_B: tl.constexpr, B_NUM_BLOCKS: tl.constexpr, propagation_alg_id: tl.constexpr, 
+                                     negate_pflows: tl.constexpr, alpha = 0.0):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` samples
         pid_e = tl.program_id(1) # ID of size-`BLOCK_K` edges
@@ -2188,6 +2676,12 @@ class SumLayer(Layer, nn.Module):
         nmars_ptr = node_mars + (off_nids + tile_id) * batch_size + offs_batch # [BLOCK_B]
         nflows_ptr = node_flows + (off_nids + tile_id) * batch_size + offs_batch # [BLOCK_B]
 
+        if propagation_alg_id == 1:
+            par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
+            epars_ptr = params + par_start + tile_id
+            epars = tl.load(epars_ptr) # [BLOCK_K]
+            elpars = tl.log(epars)
+
         # Inner loop
         acc = tl.zeros([BLOCK_K], dtype = tl.float32)
 
@@ -2198,107 +2692,70 @@ class SumLayer(Layer, nn.Module):
 
             emars = tl.load(emars_ptr, mask = mask_batch[None,:], other = -float("inf")) # [BLOCK_K, BLOCK_B]
 
-            if allow_modify_flows == 1:
-                log_n_fdm = tl.load(nflows_ptr, mask = mask_batch, other = -float("inf")) # [BLOCK_B]
-                pflows = tl.sum(tl.exp(emars + log_n_fdm[None,:]), axis = 1)
-            else:
+            if propagation_alg_id == 1:
                 nmars = tl.load(nmars_ptr, mask = mask_batch, other = 0.0) # [BLOCK_B]
                 nflows = tl.load(nflows_ptr, mask = mask_batch, other = 0.0) # [BLOCK_B]
-                pflows = tl.sum(nflows[None,:] * tl.exp(emars - nmars[None,:]), axis = 1)
 
-            acc += pflows
+                if logspace_flows:
+                    acc += tl.sum(tl.where(tl.abs(elpars[:,None] + emars - nmars[None,:]) < 1e-6, tl.exp(nflows[None,:]), 0.0), axis = 1)
+                else:
+                    acc += tl.sum(tl.where(tl.abs(elpars[:,None] + emars - nmars[None,:]) < 1e-6, nflows[None,:], 0.0), axis = 1)
+
+            else:
+
+                if allow_modify_flows == 1:
+                    log_n_fdm = tl.load(nflows_ptr, mask = mask_batch, other = -float("inf")) # [BLOCK_B]
+
+                    if propagation_alg_id == 0:
+                        pflows = tl.sum(tl.exp(emars + log_n_fdm[None,:]), axis = 1)
+                    
+                    if propagation_alg_id == 2:
+                        nmars = tl.load(nmars_ptr, mask = mask_batch, other = 0.0) # [BLOCK_B]
+                        pflows = tl.sum(tl.exp(emars + log_n_fdm[None,:] + (alpha - 1.0) * nmars[None,:]), axis = 1)
+                else:
+                    nmars = tl.load(nmars_ptr, mask = mask_batch, other = 0.0) # [BLOCK_B]
+                    nflows = tl.load(nflows_ptr, mask = mask_batch, other = 0.0) # [BLOCK_B]
+
+                    if logspace_flows:
+                        plflows = nflows[None,:] + emars - nmars[None,:]
+                        plflows_max = tl.max(plflows, axis = 1)
+                        pflows = tl.where(plflows_max != -float("inf"),
+                            tl.exp(tl.log(tl.sum(tl.exp(plflows - plflows_max[:,None]), axis = 1)) + plflows_max),
+                            0.0
+                        )
+                    else:
+                        pflows = tl.sum(nflows[None,:] * tl.exp(emars - nmars[None,:]), axis = 1)
+
+                acc += pflows
 
             # Increment `emars_ptr`, `nmars_ptr`, and `nmars_ptr`
             emars_ptr += BLOCK_B
             nmars_ptr += BLOCK_B
             nflows_ptr += BLOCK_B
 
-        par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
-        epars_ptr = params + par_start + tile_id
-        epars = tl.load(epars_ptr) # [BLOCK_K]
+        if propagation_alg_id != 1:
+            par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
+            epars_ptr = params + par_start + tile_id
+            epars = tl.load(epars_ptr) # [BLOCK_K]
 
         parflow_start = tl.load(pfids + nblock_id * num_edges + offs_edge)
         eparflows_ptr = param_flows + parflow_start + tile_id
         
-        curr_pflows = acc * epars
+        if propagation_alg_id != 1:
+            curr_pflows = acc * epars
+        else:
+            curr_pflows = acc
 
-        tl.atomic_add(eparflows_ptr, curr_pflows)
-
-    @staticmethod
-    # @triton.jit
-    @FastJITFunction
-    def _bk_triton_large_sparse_par_kernel(node_flows, node_mars, element_mars, params, param_flows, nids, cids, pids, pfids,
-                                           num_nodes, num_edges: tl.constexpr, batch_size: tl.constexpr, allow_modify_flows: tl.constexpr, 
-                                           TILE_SIZE_M: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_B: tl.constexpr, 
-                                           TILE_SIZE_B: tl.constexpr, B_NUM_BLOCKS: tl.constexpr, BLOCK_SIZE_M: tl.constexpr):
-
-        pid_b = tl.program_id(0) # ID of size-`BLOCK_B` samples
-        pid_e = tl.program_id(1) # ID of size-`BLOCK_K` edges
-        pid_m = tl.program_id(2) # ID of size-`TILE_SIZE_M` nodes
-
-        offs_m = tl.arange(0, TILE_SIZE_M) + pid_m * TILE_SIZE_M
-        mask_m = offs_m < num_nodes
-
-        # Get inferred node block id from `pid_m`
-        nblock_ids = offs_m // BLOCK_SIZE_M
-        tile_ids = offs_m % BLOCK_SIZE_M
-
-        # Batch offsets and mask
-        offs_batch = tl.arange(0, BLOCK_B) + pid_b * TILE_SIZE_B
-        mask_batch = offs_batch < batch_size
-
-        # Initialize pointers to `element_mars`
-        offs_edge = tl.arange(0, BLOCK_K) + pid_e * BLOCK_K
-        edge_start = tl.load(cids + nblock_ids[:,None] * num_edges + offs_edge[None,:], mask = mask_m[:,None])
-        emars_ptr = element_mars + \
-            edge_start[:,:,None] * batch_size + \
-            offs_batch[None,None,:] # [TILE_SIZE_M, BLOCK_K, BLOCK_B]
-
-        # Initialize pointers to `node_flows` and `node_mars`
-        off_nids = tl.load(nids + nblock_ids, mask = mask_m)
-        nmars_ptr = node_mars + (off_nids + tile_ids)[:,None] * batch_size + offs_batch[None,:] # [TILE_SIZE_M, BLOCK_B]
-        nflows_ptr = node_flows + (off_nids + tile_ids)[:,None] * batch_size + offs_batch[None,:] # [TILE_SIZE_M, BLOCK_B]
-
-        # Inner loop
-        acc = tl.zeros([TILE_SIZE_M, BLOCK_K], dtype = tl.float32) + 0.1
-
-        for b in range(0, B_NUM_BLOCKS):
-            # Batch offsets and mask
-            offs_batch = tl.arange(0, BLOCK_B) + pid_b * TILE_SIZE_B + b * BLOCK_B
-            mask_batch = offs_batch < batch_size
-
-            emars = tl.load(emars_ptr, mask = (mask_m[:,None,None] & mask_batch[None,None,:]), other = -float("inf")) # [TILE_SIZE_M, BLOCK_K, BLOCK_B]
-
-            if allow_modify_flows == 1:
-                log_n_fdm = tl.load(nflows_ptr, mask = (mask_m[:,None] & mask_batch[None,:]), other = -float("inf")) # [TILE_SIZE_M, BLOCK_B]
-                pflows = tl.sum(tl.exp(emars + log_n_fdm[:,None,:]), axis = 2)
-            else:
-                nmars = tl.load(nmars_ptr, mask = (mask_m[:,None] & mask_batch[None,:]), other = 0.0) # [TILE_SIZE_M, BLOCK_B]
-                nflows = tl.load(nflows_ptr, mask = (mask_m[:,None] & mask_batch[None,:]), other = 0.0) # [TILE_SIZE_M, BLOCK_B]
-                pflows = tl.sum(nflows[:,None,:] * tl.exp(emars - nmars[:,None,:]), axis = 2)
-
-            acc += pflows
-
-            # Increment `emars_ptr`, `nmars_ptr`, and `nmars_ptr`
-            emars_ptr += BLOCK_B
-            nmars_ptr += BLOCK_B
-            nflows_ptr += BLOCK_B
-
-        par_start = tl.load(pids + nblock_ids[:,None] * num_edges + offs_edge[None,:])
-        epars_ptr = params + par_start + tile_ids[:,None]
-        epars = tl.load(epars_ptr, mask = mask_m[:,None]) # [TILE_SIZE_M, BLOCK_K]
-
-        parflow_start = tl.load(pfids + nblock_ids[:,None] * num_edges + offs_edge[None,:])
-        eparflows_ptr = param_flows + parflow_start + tile_ids[:,None]
-        
-        curr_pflows = acc * epars
-
-        tl.atomic_add(eparflows_ptr, curr_pflows, mask = mask_m[:,None])
+        if negate_pflows:
+            tl.atomic_add(eparflows_ptr, -1.0 * curr_pflows)
+        else:
+            tl.atomic_add(eparflows_ptr, curr_pflows)
 
     def _backward_sparse_par_flows(self, node_flows: torch.Tensor, params: torch.Tensor, node_mars: torch.Tensor, 
                                    element_mars: torch.Tensor, param_flows: torch.Tensor, nids: torch.Tensor, 
                                    cids: torch.Tensor, pids: torch.Tensor, pfids: torch.Tensor,
-                                   allow_modify_flows: bool = False) -> None:
+                                   allow_modify_flows: bool = False, propagation_alg: str = "LL", 
+                                   logspace_flows: bool = False, negate_pflows: bool = False, **kwargs) -> None:
         """
         Backward pass of sum layers w.r.t. sum parameters with the block-sparse processing kernel.
         
@@ -2322,7 +2779,9 @@ class SumLayer(Layer, nn.Module):
         batch_size = node_mars.size(1)
         BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
 
-        # assert num_edges <= 16384, "The sparse backward kernel only support nodes with # edges smaller than 16384."
+        # Propagation algorithm
+        propagation_alg_id = self.propagation_alg_mapping[propagation_alg]
+        propagation_alg_kwargs = self._get_propagation_alg_kwargs(propagation_alg, **kwargs)
 
         if num_edges <= 1024:
             BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
@@ -2364,11 +2823,15 @@ class SumLayer(Layer, nn.Module):
                 num_edges = num_edges,
                 batch_size = batch_size,
                 allow_modify_flows = allow_modify_flows,
+                logspace_flows = logspace_flows,
                 BLOCK_M = BLOCK_M,
                 BLOCK_K = BLOCK_K,
                 BLOCK_B = BLOCK_B,
                 TILE_SIZE_B = TILE_SIZE_B,
-                B_NUM_BLOCKS = B_NUM_BLOCKS
+                B_NUM_BLOCKS = B_NUM_BLOCKS,
+                propagation_alg_id = propagation_alg_id,
+                negate_pflows = negate_pflows,
+                **propagation_alg_kwargs
             )
         
         else:
@@ -2392,72 +2855,23 @@ class SumLayer(Layer, nn.Module):
                     num_edges = num_edges,
                     batch_size = batch_size,
                     allow_modify_flows = allow_modify_flows,
+                    logspace_flows = logspace_flows,
                     BLOCK_M = BLOCK_M,
                     BLOCK_K = BLOCK_K,
                     BLOCK_B = BLOCK_B,
                     TILE_SIZE_B = TILE_SIZE_B,
-                    B_NUM_BLOCKS = B_NUM_BLOCKS
+                    B_NUM_BLOCKS = B_NUM_BLOCKS,
+                    propagation_alg_id = propagation_alg_id,
+                    negate_pflows = negate_pflows,
+                    **propagation_alg_kwargs
                 )
-
-        # else:
-
-        #     if num_edges <= 1024:
-        #         BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
-        #         BLOCK_K = num_edges
-        #         TILE_SIZE_M = max(min(4096 // num_edges, triton.next_power_of_2(layer_n_nodes)), 1)
-        #     else:
-        #         BLOCK_B = min(512, BATCH_SIZE_NP2)
-        #         BLOCK_K = min(2048 // BLOCK_B, num_edges)
-        #         TILE_SIZE_M = max(min(2048 // num_edges, triton.next_power_of_2(layer_n_nodes)), 1)
-        #     B_NUM_BLOCKS = triton.cdiv(batch_size, BLOCK_B)
-        #     K_NUM_BLOCKS = triton.cdiv(num_edges, BLOCK_K)
-
-        #     # When a thread-block is allocated for too much work, the overhead 
-        #     # outweigh that incurred by `atomic_add`. Add more thread-blocks 
-        #     # for parallel processing in this case.
-        #     if B_NUM_BLOCKS >= 4:
-        #         TILE_SIZE_B = 4 * BLOCK_B
-        #         B_NUM_BLOCKS = 4
-        #     else:
-        #         TILE_SIZE_B = batch_size
-        #     B_NUM_TILES = triton.cdiv(batch_size, TILE_SIZE_B)
-
-        #     allow_modify_flows = 1 if allow_modify_flows else 0
-
-        #     grid = (B_NUM_TILES, K_NUM_BLOCKS, triton.cdiv(layer_n_nodes, TILE_SIZE_M))
-
-        #     print(">>>G", grid, "in")
-        #     # TODO: This kernel gets stuck for some input configurations. Fix it.
-        #     if grid[0] == 2 and grid[1] == 1 and grid[2] == 308:
-        #         import pdb; pdb.set_trace()
-        #     self._bk_triton_large_sparse_par_kernel[grid](
-        #         node_flows = node_flows, 
-        #         node_mars = node_mars, 
-        #         element_mars = element_mars, 
-        #         params = params, 
-        #         param_flows = param_flows, 
-        #         nids = nids, 
-        #         cids = cids, 
-        #         pids = pids, 
-        #         pfids = pfids,
-        #         num_nodes = layer_n_nodes, 
-        #         num_edges = num_edges, 
-        #         batch_size = batch_size, 
-        #         allow_modify_flows = allow_modify_flows, 
-        #         TILE_SIZE_M = TILE_SIZE_M, 
-        #         BLOCK_K = BLOCK_K,
-        #         BLOCK_B = BLOCK_B,
-        #         TILE_SIZE_B = TILE_SIZE_B,
-        #         B_NUM_BLOCKS = B_NUM_BLOCKS,
-        #         BLOCK_SIZE_M = self.block_size
-        #     )
-        #     print(">>>G", grid, "out")
 
         return None
 
     def _backward_pytorch(self, node_flows, element_flows, params, node_mars, 
                           element_mars, param_flows, nids, cids, pids, pfids, 
-                          chids, parids, parpids, cs_block_size):
+                          chids, parids, parpids, cs_block_size, propagation_alg: str = "LL", 
+                          logspace_flows: bool = False, negate_pflows: bool = False):
         """
         Back pass of sum layers with native pytorch.
         
@@ -2473,18 +2887,21 @@ class SumLayer(Layer, nn.Module):
         `parpids`:      [ng, c]
         """
 
+        assert propagation_alg == "LL"
+
         # Flows w.r.t. input elements (product nodes)
         if chids is not None:
             self._backward_pytorch_ele_kernel(
                 node_flows, element_flows, params, node_mars, element_mars, 
-                param_flows, chids, parids, parpids, cs_block_size
+                param_flows, chids, parids, parpids, cs_block_size, logspace_flows
             )
 
         # Flows w.r.t. parameters
         if param_flows is not None and nids is not None:
             self._backward_pytorch_par_kernel(
                 node_flows, params, node_mars, element_mars, param_flows, 
-                nids, cids, pids, pfids, self.block_size
+                nids, cids, pids, pfids, self.block_size, logspace_flows,
+                negate_pflows
             )
 
     @torch.compile
@@ -2492,7 +2909,7 @@ class SumLayer(Layer, nn.Module):
                                      params: torch.Tensor, node_mars: torch.Tensor, 
                                      element_mars: torch.Tensor, param_flows: Optional[torch.Tensor], 
                                      chids: torch.Tensor, parids: torch.Tensor, parpids: torch.Tensor,
-                                     cs_block_size: int):
+                                     cs_block_size: int, logspace_flows: bool):
 
         num_nblocks = chids.size(0)
         num_eblocks = parids.size(1)
@@ -2506,15 +2923,20 @@ class SumLayer(Layer, nn.Module):
             num_nblocks * cs_block_size, num_eblocks * self.block_size
         )
         
-        element_flows[chids] = (node_flows[parids] * params[parpids].unsqueeze(-1) * \
-            (element_mars[chids].unsqueeze(1) - node_mars[parids]).exp()).sum(dim = 1)
+        if logspace_flows:
+            element_flows[chids] = (node_flows[parids] + params[parpids].log().unsqueeze(-1) + \
+                element_mars[chids].unsqueeze(1) - node_mars[parids]).logsumexp(dim = 1)
+        else:
+            element_flows[chids] = (node_flows[parids] * params[parpids].unsqueeze(-1) * \
+                (element_mars[chids].unsqueeze(1) - node_mars[parids]).exp()).sum(dim = 1)
 
         return None
 
     @torch.compile
     def _backward_pytorch_par_kernel(self, node_flows: torch.Tensor, params: torch.Tensor, node_mars: torch.Tensor, 
                                      element_mars: torch.Tensor, param_flows: torch.Tensor, nids: torch.Tensor, 
-                                     cids: torch.Tensor, pids: torch.Tensor, pfids: torch.Tensor, ns_block_size: int):
+                                     cids: torch.Tensor, pids: torch.Tensor, pfids: torch.Tensor, ns_block_size: int,
+                                     logspace_flows: bool, negate_pflows: bool):
 
         num_nblocks = nids.size(0)
         num_edges = cids.size(1)
@@ -2526,11 +2948,17 @@ class SumLayer(Layer, nn.Module):
         pfids = (pfids[:,None,:].repeat(1, self.block_size, 1) + \
             torch.arange(0, self.block_size, device = cids.device)[None,:,None]).reshape(num_nblocks * self.block_size, num_edges)
 
-        parflows = (node_flows[nids].unsqueeze(1) * params[pids].unsqueeze(-1) * (element_mars[cids] - node_mars[nids].unsqueeze(1)).exp()).sum(dim = 2)
+        if logspace_flows:
+            parflows = (node_flows[nids].exp().unsqueeze(1) * params[pids].unsqueeze(-1) * (element_mars[cids] - node_mars[nids].unsqueeze(1)).exp()).sum(dim = 2)
+        else:
+            parflows = (node_flows[nids].unsqueeze(1) * params[pids].unsqueeze(-1) * (element_mars[cids] - node_mars[nids].unsqueeze(1)).exp()).sum(dim = 2)
 
         for i in range(num_nblocks):
             sid, eid = ns_block_size * i, ns_block_size * (i + 1)
-            param_flows[pfids[sid:eid,:]] += parflows[sid:eid,:]
+            if negate_pflows:
+                param_flows[pfids[sid:eid,:]] -= parflows[sid:eid,:]
+            else:
+                param_flows[pfids[sid:eid,:]] += parflows[sid:eid,:]
 
         return None
 

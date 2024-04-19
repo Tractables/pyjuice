@@ -11,7 +11,7 @@ from pyjuice.io import load, save
 import pytest
 
 
-def io_test():
+def test_io():
     num_node_blocks = 2
     block_size = 4
 
@@ -46,7 +46,7 @@ def io_test():
     assert n0.chs[1].chs[1].dist.num_cats == n0_dup.chs[1].chs[1].dist.num_cats
 
 
-def io_param_test():
+def test_io_param():
     num_node_blocks = 2
     block_size = 4
 
@@ -79,5 +79,5 @@ def io_param_test():
 
 
 if __name__ == "__main__":
-    io_test()
-    io_param_test()
+    test_io()
+    test_io_param()

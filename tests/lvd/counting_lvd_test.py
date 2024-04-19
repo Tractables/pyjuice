@@ -9,7 +9,7 @@ from pyjuice.nodes import multiply, summate, inputs
 import pytest
 
 
-def counting_lvd_test():
+def test_counting_lvd():
     num_nodes = 2
 
     with juice.LVDistiller(backend = "counting", pseudocount = 0.0):
@@ -32,4 +32,4 @@ def counting_lvd_test():
 
 
 if __name__ == "__main__":
-    counting_lvd_test()
+    test_counting_lvd()

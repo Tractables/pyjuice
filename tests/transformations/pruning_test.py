@@ -7,7 +7,7 @@ import pyjuice.nodes.distributions as dists
 import pytest
 
 
-def pruning_test():
+def test_pruning():
     num_node_blocks = 2
 
     for block_size in [1, 2, 4, 8]:
@@ -50,7 +50,7 @@ def pruning_test():
             assert torch.all(torch.abs(new_n2._params.sum(dim = 2) - 1.0) < 1e-4)
 
 
-def pruning_with_param_tying_test():
+def test_pruning_with_param_tying():
     num_node_blocks = 2
 
     for block_size in [1, 2, 4, 8]:
@@ -91,7 +91,7 @@ def pruning_with_param_tying_test():
             assert torch.all(torch.abs(new_n2._source_node._params[0].sum(dim = 1) - 1.0) < 1e-4)
 
 
-def pruning_by_flow_test():
+def test_pruning_by_flow():
     num_nodes = 2
 
     i0 = inputs(0, num_nodes, dists.Categorical(num_cats = 5))
@@ -130,6 +130,6 @@ def pruning_by_flow_test():
 
 
 if __name__ == "__main__":
-    pruning_test()
-    pruning_with_param_tying_test()
-    pruning_by_flow_test()
+    test_pruning()
+    test_pruning_with_param_tying()
+    test_pruning_by_flow()

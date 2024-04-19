@@ -114,7 +114,7 @@ def _categorical_forward(layer, inputs: torch.Tensor, node_mars: torch.Tensor,
 @triton.jit
 def _categorical_backward_kernel(cat_probs_ptr, node_flows_ptr, local_ids_ptr, rev_vars_mapping_ptr, vids_ptr, psids_ptr, 
                                  node_nchs_ptr, params_ptr, sid, eid, num_target_nodes, batch_size: tl.constexpr, 
-                                 num_cats: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+                                 num_cats: tl.constexpr, partial_eval: tl.constexpr, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(axis = 0)
     block_start = pid * BLOCK_SIZE
 
@@ -123,7 +123,10 @@ def _categorical_backward_kernel(cat_probs_ptr, node_flows_ptr, local_ids_ptr, r
 
     # Get node offsets and batch offsets
     local_offsets = (offsets // batch_size)
-    local_node_offsets = tl.load(local_ids_ptr + local_offsets, mask = mask, other = 0)
+    if partial_eval == 1: 
+        local_node_offsets = tl.load(local_ids_ptr + local_offsets, mask = mask, other = 0)
+    else:
+        local_node_offsets = local_offsets
     batch_offsets = (offsets % batch_size)
 
     global_node_offsets = local_node_offsets + sid
@@ -182,20 +185,27 @@ def _categorical_backward(layer, inputs: torch.Tensor, node_flows: torch.Tensor,
 
     cat_probs = torch.zeros([num_target_vars * num_cats * batch_size], dtype = torch.float32, device = node_flows.device)
 
-    local_ids = layer.enable_partial_evaluation(bk_scopes = target_vars, return_ids = True).to(node_flows.device)
-    num_target_nodes = local_ids.size(0)
+    if len(target_vars) < num_vars:
+        local_ids = layer.enable_partial_evaluation(bk_scopes = target_vars, return_ids = True).to(node_flows.device)
+        num_target_nodes = local_ids.size(0)
+        partial_eval = 1
+    else:
+        local_ids = None
+        num_target_nodes = eid - sid
+        partial_eval = 0
 
     node_nchs = layer.metadata[layer.s_mids]
 
     grid = lambda meta: (triton.cdiv(num_target_nodes * batch_size, meta['BLOCK_SIZE']),)
+
     _categorical_backward_kernel[grid](
         cat_probs, node_flows, local_ids, rev_vars_mapping, layer.vids, layer.s_pids, node_nchs, layer.params,
-        sid, eid, num_target_nodes, batch_size, num_cats, BLOCK_SIZE = 512
+        sid, eid, num_target_nodes, batch_size, num_cats, partial_eval = partial_eval, BLOCK_SIZE = 512
     )
 
     cat_probs = cat_probs.reshape(num_target_vars, num_cats, batch_size)
 
-    cat_probs /= cat_probs.sum(dim = 1, keepdim = True)
+    cat_probs /= (cat_probs.sum(dim = 1, keepdim = True) + 1e-12)
     cat_probs = cat_probs.permute(2, 0, 1)
 
     return cat_probs

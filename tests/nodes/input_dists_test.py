@@ -11,7 +11,7 @@ from pyjuice.model import TensorCircuit
 import pytest
 
 
-def categorical_nodes_test():
+def test_categorical_nodes():
 
     ni0 = inputs(0, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
     ni1 = inputs(1, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
@@ -81,7 +81,7 @@ def categorical_nodes_test():
     assert torch.all(torch.abs(new_params - pc.input_layer_group[0].params) < 1e-4)
 
 
-def bernoulli_nodes_test():
+def test_bernoulli_nodes():
 
     ni0 = inputs(0, num_nodes = 2, dist = dists.Bernoulli())
     ni1 = inputs(1, num_nodes = 2, dist = dists.Bernoulli())
@@ -152,7 +152,7 @@ def bernoulli_nodes_test():
     assert torch.all(torch.abs(new_params - pc.input_layer_group[0].params) < 1e-4)
 
 
-def gaussian_nodes_test():
+def test_gaussian_nodes():
 
     ni0 = inputs(0, num_nodes = 2, dist = dists.Gaussian(mu = 0.0, sigma = 1.0))
     ni1 = inputs(1, num_nodes = 2, dist = dists.Gaussian(mu = 0.0, sigma = 1.0))
@@ -229,7 +229,7 @@ def gaussian_nodes_test():
     assert torch.all(torch.abs(updated_sigma.clamp(min = 0.01) - pc.input_layer_group[0].params.reshape(8, 2)[:,1]) < 1e-4)
 
 
-def discrete_logistic_nodes_test():
+def test_discrete_logistic_nodes():
 
     ni0 = inputs(0, num_nodes = 2, dist = dists.DiscreteLogistic(val_range = [-1.0, 1.0], num_cats = 5))
     ni1 = inputs(1, num_nodes = 2, dist = dists.DiscreteLogistic(val_range = [-1.0, 1.0], num_cats = 5))
@@ -326,7 +326,7 @@ def discrete_logistic_nodes_test():
     assert torch.all(torch.abs(updated_s - pc.input_layer_group[0].params.reshape(8, 2)[:,1]) < 1e-4)
 
 
-def discrete_logistic_nodes_behavior_test():
+def test_discrete_logistic_nodes_behavior():
 
     ni0 = inputs(0, num_nodes = 2, dist = dists.DiscreteLogistic(val_range = [-1.0, 1.0], num_cats = 5))
     ni1 = inputs(1, num_nodes = 2, dist = dists.DiscreteLogistic(val_range = [-1.0, 1.0], num_cats = 5))
@@ -361,7 +361,9 @@ def discrete_logistic_nodes_behavior_test():
 
         pc.backward(data.permute(1, 0), flows_memory = 0.0)
 
-        pc.mini_batch_em(step_size = 1.0, pseudocount = 0.01)
+        pc.mini_batch_em(step_size = 1.0, pseudocount = 0.001)
+
+    lls = pc(data)
 
     assert lls.mean() > -3.5
 
@@ -373,7 +375,7 @@ def discrete_logistic_nodes_behavior_test():
     assert (ni3._params[0] > 0.65 and ni3._params[2] < 0.4) or (ni3._params[2] > 0.65 and ni3._params[0] < 0.4)
 
 
-def masked_categorical_nodes_range_test():
+def test_masked_categorical_nodes_range():
 
     ni0 = inputs(0, num_nodes = 2, dist = dists.MaskedCategorical(num_cats = 5, mask_mode = "range"), mask = torch.tensor([[2, 4], [3, 5]]))
     ni1 = inputs(1, num_nodes = 2, dist = dists.MaskedCategorical(num_cats = 5, mask_mode = "range"), mask = torch.tensor([[2, 4], [3, 5]]))
@@ -495,7 +497,7 @@ def masked_categorical_nodes_range_test():
     assert torch.all(torch.abs(updated_params - pc.input_layer_group[0].params.reshape(8, 8)) < 1e-4)
 
 
-def masked_categorical_nodes_full_mask_test():
+def test_masked_categorical_nodes_full_mask():
 
     ni0 = inputs(0, num_nodes = 2, dist = dists.MaskedCategorical(num_cats = 5, mask_mode = "full_mask"), mask = torch.tensor([[0, 0, 1, 1, 0], [0, 0, 0, 1, 1]]))
     ni1 = inputs(1, num_nodes = 2, dist = dists.MaskedCategorical(num_cats = 5, mask_mode = "full_mask"), mask = torch.tensor([[0, 0, 1, 1, 0], [0, 0, 0, 1, 1]]))
@@ -617,7 +619,7 @@ def masked_categorical_nodes_full_mask_test():
     assert torch.all(torch.abs(updated_params - pc.input_layer_group[0].params.reshape(8, 11)) < 1e-4)
 
 
-def masked_categorical_nodes_rev_range_test():
+def test_masked_categorical_nodes_rev_range():
 
     ni0 = inputs(0, num_nodes = 2, dist = dists.MaskedCategorical(num_cats = 5, mask_mode = "rev_range"), mask = torch.tensor([[2, 4], [3, 5]]))
     ni1 = inputs(1, num_nodes = 2, dist = dists.MaskedCategorical(num_cats = 5, mask_mode = "rev_range"), mask = torch.tensor([[2, 4], [3, 5]]))
@@ -732,12 +734,12 @@ def masked_categorical_nodes_rev_range_test():
 
 
 if __name__ == "__main__":
-    torch.manual_seed(2390)
-    categorical_nodes_test()
-    bernoulli_nodes_test()
-    gaussian_nodes_test()
-    discrete_logistic_nodes_test()
-    discrete_logistic_nodes_behavior_test()
-    masked_categorical_nodes_range_test()
-    masked_categorical_nodes_full_mask_test()
-    masked_categorical_nodes_rev_range_test()
+    # torch.manual_seed(235)
+    test_categorical_nodes()
+    test_bernoulli_nodes()
+    test_gaussian_nodes()
+    test_discrete_logistic_nodes()
+    test_discrete_logistic_nodes_behavior()
+    test_masked_categorical_nodes_range()
+    test_masked_categorical_nodes_full_mask()
+    test_masked_categorical_nodes_rev_range()

@@ -5,6 +5,8 @@ import pyjuice.nodes.distributions as dists
 
 import pyjuice.visualize as juice_vis
 
+import pytest
+
 
 def simple_pc_gen():
     n0 = inputs(0, num_nodes=256, dist=dists.Categorical(num_cats=5))
@@ -26,19 +28,25 @@ def simple_pc_gen():
     ns.init_parameters()
     return ns
 
-ns = simple_pc_gen()
 
-# case 1
-plt.figure()
-juice_vis.plot_pc(ns, node_id=True, node_num_label=True)
-plt.show()
+def test_plots():
+    ns = simple_pc_gen()
 
-# case 2
-juice_vis.plot_tensor_node_connection(ns, node_id=3)
+    # case 1
+    plt.figure()
+    juice_vis.plot_pc(ns, node_id=True, node_num_label=True)
+    plt.show()
 
-# case 3
-juice_vis.plot_tensor_node_connection(ns, node_id=4)
-plt.show()
+    # case 2
+    juice_vis.plot_tensor_node_connection(ns, node_id=3)
 
-# case 4
-juice_vis.plot_tensor_node_connection(ns, node_id=0)
+    # case 3
+    juice_vis.plot_tensor_node_connection(ns, node_id=4)
+    plt.show()
+
+    # case 4
+    juice_vis.plot_tensor_node_connection(ns, node_id=0)
+
+
+if __name__ == "__main__":
+    test_plots()

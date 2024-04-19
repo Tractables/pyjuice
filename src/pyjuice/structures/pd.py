@@ -22,9 +22,9 @@ def PD(data_shape: Tuple, num_latents: int,
        structure_type: str = "sum_dominated",
        input_layer_fn: Optional[Callable] = None,
        input_dist: Optional[Distribution] = None,
-       input_layer_type: Type[Distribution] = Categorical, 
-       input_layer_params: Dict = {"num_cats": 256},
-       use_linear_mixing: bool = False,
+       input_node_type: Type[Distribution] = Categorical, 
+       input_node_params: Dict = {"num_cats": 256},
+       tie_homogeneous_params: bool = False,
        block_size: Optional[int] = None):
     """
     Generate PCs with the PD structure (https://arxiv.org/pdf/1202.3732.pdf).
@@ -53,6 +53,9 @@ def PD(data_shape: Tuple, num_latents: int,
     :param input_dist: input distribution
     :type input_dist: Distribution
 
+    :param tie_homogeneous_params: whether to tie parameters of sum/input nodes with compatible structures
+    :type tie_homogeneous_params: bool
+
     :param block_size: block size
     :type block_size: int
     """
@@ -71,6 +74,9 @@ def PD(data_shape: Tuple, num_latents: int,
     num_node_blocks = num_latents // block_size
 
     num_axes = len(data_shape)
+
+    # A dictionary of source nodes
+    source_ns_dict = dict()
 
     # Construct split points
     if split_intervals is not None:
@@ -117,6 +123,12 @@ def PD(data_shape: Tuple, num_latents: int,
         hypercube = (tuple(hypercube[0]), tuple(hypercube[1]))
         return hypercube
 
+    def hypercube2shape(hypercube):
+        return tuple(hypercube[1][i] - hypercube[0][i] for i in range(len(hypercube[0])))
+
+    def get_signature(hypercube, *ch_ns):
+        return (hypercube2shape(hypercube), tuple(len(ns.scope) for ns in ch_ns))
+
     def create_input_ns(hypercube):
         scope = hypercube2scope(hypercube)
         if input_layer_fn is not None:
@@ -124,11 +136,28 @@ def PD(data_shape: Tuple, num_latents: int,
         else:
             input_nodes = []
             for var in scope:
-                ns = inputs(var, num_node_blocks = num_node_blocks, dist = input_layer_type(**input_layer_params))
+                if not tie_homogeneous_params:
+                    ns = inputs(var, num_node_blocks = num_node_blocks, dist = input_node_type(**input_node_params))
+                else:
+                    if "input" in source_ns_dict:
+                        ns = source_ns_dict["input"].duplicate(var, tie_params = True)
+                    else:
+                        ns = inputs(var, num_node_blocks = num_node_blocks, dist = input_node_type(**input_node_params))
+                        source_ns_dict["input"] = ns
                 input_nodes.append(ns)
 
             edge_ids = torch.arange(0, num_node_blocks)[None,:].repeat(2, 1)
-            return summate(multiply(*input_nodes), num_node_blocks = num_node_blocks, edge_ids = edge_ids)
+            pns = multiply(*input_nodes)
+            if not tie_homogeneous_params:
+                return summate(pns, num_node_blocks = num_node_blocks, edge_ids = edge_ids)
+            else:
+                signature = get_signature(hypercube, pns)
+                if signature in source_ns_dict:
+                    return source_ns_dict[signature].duplicate(pns, tie_params = True)
+                else:
+                    ns = summate(pns, num_node_blocks = num_node_blocks, edge_ids = edge_ids)
+                    source_ns_dict[signature] = ns
+                    return ns
 
     def recursive_construct(hypercube, depth = 1):
         if hypercube in hypercube2ns:
@@ -161,24 +190,35 @@ def PD(data_shape: Tuple, num_latents: int,
             ns = create_input_ns(hypercube)
         elif hypercube == root_hypercube:
             ns = summate(*pns, num_node_blocks = 1, block_size = 1)
-        elif not use_linear_mixing:
+        else:
             if len(pns) <= max_prod_block_conns:
-                ns = summate(*pns, num_node_blocks = num_node_blocks)
+                if not tie_homogeneous_params:
+                    ns = summate(*pns, num_node_blocks = num_node_blocks)
+                else:
+                    signature = get_signature(hypercube, *pns)
+                    if signature in source_ns_dict:
+                        ns = source_ns_dict[signature].duplicate(*pns, tie_params = True)
+                    else:
+                        ns = summate(*pns, num_node_blocks = num_node_blocks)
+                        source_ns_dict[signature] = ns
             else:
                 block_ids = torch.topk(torch.rand([num_node_blocks, len(pns)]), k = max_prod_block_conns, dim = 1).indices
                 par_ids = torch.arange(0, num_node_blocks)[:,None,None].repeat(1, max_prod_block_conns, num_node_blocks)
                 chs_ids = block_ids[:,:,None] * num_node_blocks + torch.arange(0, num_node_blocks)[None,None,:]
                 edge_ids = torch.stack((par_ids.reshape(-1), chs_ids.reshape(-1)), dim = 0)
-                ns = summate(*pns, num_node_blocks = num_node_blocks, edge_ids = edge_ids)
-        else:
-            # Linear mixing as implemented in EiNet's Mixing layer
-            if len(pns) <= max_prod_block_conns:
-                ns = summate(*pns, num_node_blocks = num_node_blocks)
-            else:
-                ch_ns = [multiply(summate(pn, num_node_blocks = num_node_blocks)) for pn in pns]
-                ns = summate(*ch_ns, num_node_blocks = num_node_blocks, edge_ids = torch.arange(0, num_node_blocks)[None,:].repeat(2, 1))
+
+                if not tie_homogeneous_params:
+                    ns = summate(*pns, num_node_blocks = num_node_blocks, edge_ids = edge_ids)
+                else:
+                    signature = get_signature(hypercube, *pns)
+                    if signature in source_ns_dict:
+                        ns = source_ns_dict[signature].duplicate(*pns, tie_params = True)
+                    else:
+                        ns = summate(*pns, num_node_blocks = num_node_blocks, edge_ids = edge_ids)
+                        source_ns_dict[signature] = ns
 
         hypercube2ns[hypercube] = ns
+
         return ns
 
     with set_block_size(block_size = block_size):
@@ -194,21 +234,25 @@ def PDHCLT(data: torch.Tensor, data_shape: Tuple, num_latents: int,
            max_split_depth: Optional[int] = None,
            max_prod_block_conns: int = 4,
            structure_type: str = "sum_dominated",
-           input_layer_type: Type[Distribution] = Categorical, 
-           input_layer_params: Dict = {"num_cats": 256},
+           input_dist: Optional[Distribution] = None,
+           input_node_type: Type[Distribution] = Categorical, 
+           input_node_params: Dict = {"num_cats": 256},
            hclt_kwargs: Dict = {"num_bins": 32, "sigma": 0.5 / 32, "chunk_size": 32},
            block_size: Optional[int] = None):
 
     assert data.dim() == 2
     assert data.size(1) == reduce(lambda x, y: x * y, data_shape)
 
+    if input_dist is not None:
+        input_node_type, input_node_params = input_dist._get_constructor()
+
     def input_layer_fn(scope, num_latents, block_size):
         vars = torch.tensor(scope.to_list()).sort().values
         ns = HCLT(
             x = data[:,vars], 
             num_latents = num_latents, 
-            input_layer_type = input_layer_type,
-            input_layer_params = input_layer_params,
+            input_node_type = input_node_type,
+            input_node_params = input_node_params,
             num_root_ns = num_latents,
             block_size = block_size,
             **hclt_kwargs
@@ -224,7 +268,7 @@ def PDHCLT(data: torch.Tensor, data_shape: Tuple, num_latents: int,
             split_intervals = split_intervals, split_points = split_points,
             max_split_depth = max_split_depth, max_prod_block_conns = max_prod_block_conns,
             structure_type = structure_type, input_layer_fn = input_layer_fn,
-            input_layer_type = input_layer_type, input_layer_params = input_layer_params,
+            input_node_type = input_node_type, input_node_params = input_node_params,
             block_size = block_size)
 
     if ns.num_node_blocks > 1:

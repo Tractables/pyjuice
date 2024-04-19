@@ -14,7 +14,7 @@ from pyjuice.layer import InputLayer, ProdLayer, SumLayer
 import pytest
 
 
-def block_sparse_pc_test():
+def test_block_sparse_pc():
     
     device = torch.device("cuda:0")
 
@@ -120,9 +120,9 @@ def block_sparse_pc_test():
             else:
                 curr_par_flows = torch.matmul(1.0 / ns_vals[ni], np2_vals[ci-num_node_blocks*2].permute(1, 0)) * params[i]
 
-            assert torch.all(torch.abs(param_flows[i] - curr_par_flows) < 1e-2)
+            assert torch.all(torch.abs(param_flows[i] - curr_par_flows) < 1e-3 * curr_par_flows)
 
 
 if __name__ == "__main__":
     torch.manual_seed(3890)
-    block_sparse_pc_test()
+    test_block_sparse_pc()

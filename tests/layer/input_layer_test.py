@@ -13,7 +13,7 @@ from pyjuice.layer import InputLayer
 import pytest
 
 
-def input_layer_test():
+def test_input_layer():
 
     device = torch.device("cuda:0")
 
@@ -111,7 +111,7 @@ def input_layer_test():
     assert torch.all(torch.abs(new_params - layer.params) < 1e-4)
 
 
-def tied_bp_test():
+def test_tied_bp():
 
     device = torch.device("cuda:0")
 
@@ -166,7 +166,8 @@ def tied_bp_test():
     assert torch.all(torch.abs(param_flows - layer.param_flows) < 1e-4)
 
 
-def speed_test():
+@pytest.mark.slow
+def test_speed():
 
     device = torch.device("cuda:0")
 
@@ -283,6 +284,6 @@ def speed_test():
 
 
 if __name__ == "__main__":
-    input_layer_test()
-    tied_bp_test()
-    speed_test()
+    test_input_layer()
+    test_tied_bp()
+    test_speed()

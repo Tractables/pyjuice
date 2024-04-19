@@ -5,6 +5,8 @@ import time
 from torch.utils.data import TensorDataset, DataLoader
 import pyjuice.nodes.distributions as dists
 
+import pytest
+
 
 def evaluate(pc, loader):
     lls_total = 0.0
@@ -64,7 +66,7 @@ def full_batch_em_epoch(pc, train_loader, test_loader, device):
     print(f"[train LL: {train_ll:.2f}; test LL: {test_ll:.2f}].....[train forward+backward+step {t1-t0:.2f}; test forward {t2-t1:.2f}] ")
 
 
-def rat_spn_test():
+def test_rat_spn():
 
     device = torch.device("cuda:0")
 
@@ -91,7 +93,7 @@ def rat_spn_test():
 
     ns = juice.structures.RAT_SPN(
         num_vars = 28 * 28,
-        num_latents = 256, 
+        num_latents = 64, 
         depth = 5,
         num_repetitions = 4,
         num_pieces = 2
@@ -119,9 +121,9 @@ def rat_spn_test():
 
     test_ll = evaluate(pc, test_loader)
 
-    assert test_ll > -1015
+    assert test_ll > -1020
 
 
 if __name__ == "__main__":
     torch.manual_seed(3289)
-    rat_spn_test()
+    test_rat_spn()

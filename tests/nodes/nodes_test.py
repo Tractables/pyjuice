@@ -9,7 +9,7 @@ from pyjuice.nodes import multiply, summate, inputs
 import pytest
 
 
-def nodes_test():
+def test_nodes():
 
     device = torch.device("cuda:0")
 
@@ -45,4 +45,4 @@ def nodes_test():
 
 
 if __name__ == "__main__":
-    nodes_test()
+    test_nodes()

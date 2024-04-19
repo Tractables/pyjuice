@@ -14,8 +14,8 @@ from pyjuice.utils import BitSet
 
 def RAT_SPN(num_vars: int, num_latents: int, depth: int, num_repetitions: int, num_pieces: int = 2,
             input_dist: Optional[Distribution] = None,
-            input_layer_type: Type[Distribution] = Categorical, 
-            input_layer_params: dict = {"num_cats": 256},
+            input_node_type: Type[Distribution] = Categorical, 
+            input_node_params: dict = {"num_cats": 256},
             block_size: Optional[int] = None):
     """
     Generate Random and Tensorized SPNs (https://proceedings.mlr.press/v115/peharz20a/peharz20a.pdf)
@@ -57,7 +57,7 @@ def RAT_SPN(num_vars: int, num_latents: int, depth: int, num_repetitions: int, n
         # Input nodes
         input_ns = []
         for v in range(num_vars):
-            ns = inputs(v, num_node_blocks = num_node_blocks, dist = input_layer_type(**input_layer_params))
+            ns = inputs(v, num_node_blocks = num_node_blocks, dist = input_node_type(**input_node_params))
             input_ns.append(ns)
 
         # Top-down partition

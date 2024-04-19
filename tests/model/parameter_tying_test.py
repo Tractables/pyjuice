@@ -11,7 +11,7 @@ from pyjuice.model.backend import compute_cum_par_flows, em_par_update
 import pytest
 
 
-def simple_structure_test_block1():
+def test_simple_structure_block1():
 
     block_size = 1
     
@@ -302,7 +302,7 @@ def simple_structure_test_block1():
     assert torch.all(torch.abs(param_flows1.reshape(-1) - pc.params[5:13].cpu()) < 1e-4)
 
 
-def simple_structure_test_block16():
+def test_simple_structure_block16():
 
     block_size = 16
     
@@ -610,5 +610,5 @@ def simple_structure_test_block16():
 
 if __name__ == "__main__":
     torch.manual_seed(2390)
-    simple_structure_test_block1()
-    simple_structure_test_block16()
+    test_simple_structure_block1()
+    test_simple_structure_block16()

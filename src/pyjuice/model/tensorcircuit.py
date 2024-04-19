@@ -19,7 +19,7 @@ from .backend import compile_cum_par_flows_fn, compute_cum_par_flows, cum_par_fl
                      normalize_parameters
 
 
-def _pc_model_backward_hook(grad, pc, inputs, record_cudagraph, apply_cudagraph, **kwargs):
+def _pc_model_backward_hook(grad, pc, inputs, record_cudagraph, apply_cudagraph, propagation_alg, **kwargs):
     grad = grad.permute(1, 0)
     pc.backward(
         inputs = inputs,
@@ -28,6 +28,7 @@ def _pc_model_backward_hook(grad, pc, inputs, record_cudagraph, apply_cudagraph,
         flows_memory = pc._optim_hyperparams["flows_memory"],
         record_cudagraph = record_cudagraph,
         apply_cudagraph = apply_cudagraph,
+        propagation_alg = propagation_alg,
         **kwargs
     )
 
@@ -101,6 +102,10 @@ class TensorCircuit(nn.Module):
         # CudaGraph options
         self._recorded_cuda_graphs = dict()
 
+        # Mode for forward and backward pass
+        self.default_propagation_alg = "LL" # Could be "LL", "MPE", or "GeneralLL"
+        self.propagation_alg_kwargs = dict()
+
     def to(self, device):
         super(TensorCircuit, self).to(device)
 
@@ -115,10 +120,26 @@ class TensorCircuit(nn.Module):
         self.par_update_kwargs = par_update_to_device(self.par_update_kwargs, device)
 
         return self
+
+    def set_propagation_alg(self, propagation_alg: str, **kwargs):
+        if propagation_alg == "LL":
+            self.default_propagation_alg = "LL"
+            self.propagation_alg_kwargs.clear()
+        elif propagation_alg == "MPE":
+            self.default_propagation_alg = "MPE"
+            self.propagation_alg_kwargs.clear()
+        elif propagation_alg == "GeneralLL":
+            assert "alpha" in kwargs, "Argument `alpha` should be provided for the `GeneralLL` propagation algorithm."
+            self.default_propagation_alg = "GeneralLL"
+            self.propagation_alg_kwargs.clear()
+            self.propagation_alg_kwargs["alpha"] = kwargs["alpha"]
+        else:
+            raise NotImplementedError(f"Unknown propagation algorithm {propagation_alg}.")
         
     def forward(self, inputs: torch.Tensor, input_layer_fn: Optional[Union[str,Callable]] = None,
                 cache: Optional[dict] = None, return_cache: bool = False, record_cudagraph: bool = False, 
-                apply_cudagraph: bool = True, force_use_fp16: bool = False, force_use_fp32: bool = False, **kwargs):
+                apply_cudagraph: bool = True, force_use_fp16: bool = False, force_use_fp32: bool = False, 
+                propagation_alg: Optional[Union[str,Sequence[str]]] = None, **kwargs):
         """
         Forward evaluation of the PC.
 
@@ -132,9 +153,14 @@ class TensorCircuit(nn.Module):
         B = inputs.size(0)
 
         if input_layer_fn is None:
-            assert inputs.dim() == 2 and inputs.size(1) == self.num_vars
+            assert inputs.dim() == 2
 
             inputs = inputs.permute(1, 0)
+
+        # Set propagation algorithm
+        if propagation_alg is None:
+            propagation_alg = self.default_propagation_alg
+            kwargs.update(self.propagation_alg_kwargs)
         
         ## Initialize buffers for forward pass ##
 
@@ -165,7 +191,7 @@ class TensorCircuit(nn.Module):
 
             # Inner layers
             def _run_inner_layers():
-                for layer_group in self.inner_layer_groups:
+                for layer_id, layer_group in enumerate(self.inner_layer_groups):
                     if layer_group.is_prod():
                         # Prod layer
                         layer_group(self.node_mars, self.element_mars)
@@ -173,8 +199,10 @@ class TensorCircuit(nn.Module):
                     elif layer_group.is_sum():
                         # Sum layer
                         layer_group(self.node_mars, self.element_mars, self.params, 
-                                    force_use_fp16 = force_use_fp16, 
-                                    force_use_fp32 = force_use_fp32)
+                                    force_use_fp16 = force_use_fp16,
+                                    force_use_fp32 = force_use_fp32, 
+                                    propagation_alg = propagation_alg if isinstance(propagation_alg, str) else propagation_alg[layer_id], 
+                                    **kwargs)
 
                     else:
                         raise ValueError(f"Unknown layer type {type(layer)}.")
@@ -226,6 +254,7 @@ class TensorCircuit(nn.Module):
                     inputs = inputs, 
                     record_cudagraph = record_cudagraph, 
                     apply_cudagraph = apply_cudagraph,
+                    propagation_alg = propagation_alg,
                     **kwargs
                 )
             )
@@ -245,6 +274,9 @@ class TensorCircuit(nn.Module):
                  record_cudagraph: bool = False, 
                  apply_cudagraph: bool = True,
                  allow_modify_flows: bool = True,
+                 propagation_alg: Union[str,Sequence[str]] = "LL",
+                 logspace_flows: bool = False,
+                 negate_pflows: bool = False,
                  **kwargs):
         """
         Backward evaluation of the PC that computes node flows as well as parameter flows.
@@ -269,21 +301,24 @@ class TensorCircuit(nn.Module):
 
         ## Initialize buffers for backward pass ##
 
-        self._init_buffer(name = "node_flows", shape = (self.num_nodes, B), set_value = 0.0)
-        self._init_buffer(name = "element_flows", shape = (self.num_elements, B), set_value = 0.0)
+        self._init_buffer(name = "node_flows", shape = (self.num_nodes, B), set_value = 0.0 if not logspace_flows else -float("inf"))
+        self._init_buffer(name = "element_flows", shape = (self.num_elements, B), set_value = 0.0 if not logspace_flows else -float("inf"))
 
         # Set root node flows
         def _set_root_node_flows():
             nonlocal ll_weights
+            nonlocal logspace_flows
             if ll_weights is None:
-                self.node_flows[self._root_node_range[0]:self._root_node_range[1],:] = 1.0
+                root_flows = 1.0 if not logspace_flows else 0.0
+                self.node_flows[self._root_node_range[0]:self._root_node_range[1],:] = root_flows
             else:
                 if ll_weights.dim() == 1:
                     ll_weights = ll_weights.unsqueeze(1)
 
                 assert ll_weights.size(0) == self.num_root_nodes
 
-                self.node_flows[self._root_node_range[0]:self._root_node_range[1],:] = ll_weights
+                root_flows = ll_weights if not logspace_flows else ll_weights.log()
+                self.node_flows[self._root_node_range[0]:self._root_node_range[1],:] = root_flows
 
         _set_root_node_flows()
 
@@ -308,7 +343,7 @@ class TensorCircuit(nn.Module):
 
                     if layer_group.is_prod():
                         # Prod layer
-                        layer_group.backward(self.node_flows, self.element_flows)
+                        layer_group.backward(self.node_flows, self.element_flows, logspace_flows = logspace_flows)
 
                     elif layer_group.is_sum():
                         # Sum layer
@@ -319,12 +354,14 @@ class TensorCircuit(nn.Module):
                         # Backward sum layer
                         layer_group.backward(self.node_flows, self.element_flows, self.node_mars, self.element_mars, self.params, 
                                              param_flows = self.param_flows if compute_param_flows else None,
-                                             allow_modify_flows = allow_modify_flows)
+                                             allow_modify_flows = allow_modify_flows, 
+                                             propagation_alg = propagation_alg if isinstance(propagation_alg, str) else propagation_alg[layer_id], 
+                                             logspace_flows = logspace_flows, negate_pflows = negate_pflows, **kwargs)
 
                     else:
                         raise ValueError(f"Unknown layer type {type(layer)}.")
 
-            signature = (1, id(self.node_flows), id(self.element_flows), id(self.node_mars), id(self.element_mars), id(self.params), id(self.param_flows), B)
+            signature = (1, id(self.node_flows), id(self.element_flows), id(self.node_mars), id(self.element_mars), id(self.params), id(self.param_flows), B, allow_modify_flows, logspace_flows)
             if record_cudagraph and signature not in self._recorded_cuda_graphs:
                 # Warmup
                 s = torch.cuda.Stream()
@@ -355,14 +392,14 @@ class TensorCircuit(nn.Module):
             # Compute backward pass for all input layers
             for idx, layer in enumerate(self.input_layer_group):
                 if input_layer_fn is None:
-                    layer.backward(inputs, self.node_flows, self.node_mars, **kwargs)
+                    layer.backward(inputs, self.node_flows, self.node_mars, logspace_flows = logspace_flows, **kwargs)
 
                 elif isinstance(input_layer_fn, str):
                     assert hasattr(layer, input_layer_fn), f"Custom input function `{input_layer_fn}` not found for layer type {type(layer)}."
-                    getattr(layer, input_layer_fn)(inputs, self.node_flows, self.node_mars, **kwargs)
+                    getattr(layer, input_layer_fn)(inputs, self.node_flows, self.node_mars, logspace_flows = logspace_flows, **kwargs)
 
                 elif isinstance(input_layer_fn, Callable):
-                    input_layer_fn(layer, inputs, self.node_flows, self.node_mars, **kwargs)
+                    input_layer_fn(layer, inputs, self.node_flows, self.node_mars, logspace_flows = logspace_flows, **kwargs)
 
                 else:
                     raise ValueError(f"Custom input function should be either a `str` or a `Callable`. Found {type(input_layer_fn)} instead.")
@@ -377,6 +414,15 @@ class TensorCircuit(nn.Module):
             return cache
         else:
             return None
+
+    def forward_ll(self, *args, **kwargs):
+        self.forward(*args, propagation_alg = "LL", **kwargs)
+
+    def forward_mpe(self, *args, **kwargs):
+        self.forward(*args, propagation_alg = "MPE", **kwargs)
+
+    def forward_general_ll(self, *args, alpha: float = 1.0, **kwargs):
+        self.forward(*args, propagation_alg = "GeneralLL", **kwargs)
 
     def mini_batch_em(self, step_size: float, pseudocount: float = 0.0, keep_zero_params: bool = False):
         """
@@ -809,12 +855,12 @@ class TensorCircuit(nn.Module):
                             ns.chs[idx] = pass_prod_ns
 
                             depth2nodes[cs_depth]["sum"].append(pass_sum_ns)
-                            depth2nodes[depth]["prod"].append(pass_prod_ns)
 
                             nodes2depth[pass_sum_ns] = cs_depth
                             nodes2depth[pass_prod_ns] = depth
 
                     depth2nodes[depth]["sum"].append(ns)
+
                     if ns.block_size > max_node_block_size:
                         max_node_block_size = ns.block_size
                 elif ns.is_prod():
@@ -834,6 +880,7 @@ class TensorCircuit(nn.Module):
                             assert pns2layer[id(cs)] == layer, "Disallowed circumstance: a product node requested by sum nodes at different layers."
                         else:
                             depth2nodes[layer]["prod"].append(cs)
+
                             pns2layer[id(cs)] = layer
 
         return depth2nodes, num_layers, max_node_block_size, max_ele_block_size

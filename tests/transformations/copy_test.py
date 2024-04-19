@@ -10,7 +10,7 @@ from pyjuice.transformations import deepcopy
 import pytest
 
 
-def copy_test():
+def test_copy():
     num_node_blocks_candidates = [2, 4, 7]
     block_size_candidates = [1, 4, 8]
 
@@ -66,4 +66,4 @@ def copy_test():
 
 
 if __name__ == "__main__":
-    copy_test()
+    test_copy()

@@ -8,10 +8,10 @@ from pyjuice.model import TensorCircuit
 
 class CircuitOptimizer():
 
-    SUPPORTED_OPTIM_METHODS = ["EM"]
+    SUPPORTED_OPTIM_METHODS = ["EM", "Viterbi", "GeneralEM"]
 
     def __init__(self, pc: TensorCircuit, base_optimizer: Optional[Optimizer] = None, method: str = "EM", lr: float = 0.1,
-                 pseudocount: float = 0.1):
+                 pseudocount: float = 0.1, **kwargs):
         
         self.pc = pc
 

@@ -226,6 +226,27 @@ class CircuitNodes():
         else:
             clear_hooks(self)
 
+    def __len__(self):
+        count = 0
+
+        def dfs(ns: CircuitNodes, visited: set = set()):
+            nonlocal count
+
+            if ns in visited:
+                return
+
+            visited.add(ns)
+
+            # Recursively traverse children
+            if ns.is_sum() or ns.is_prod():
+                for cs in ns.chs:
+                    dfs(cs, visited = visited)
+
+            count += 1
+
+        dfs(self)
+        return count
+
     def __iter__(self):
         return node_iterator(self, self._reverse_iter)
 

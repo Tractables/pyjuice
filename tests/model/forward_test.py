@@ -10,7 +10,7 @@ from pyjuice.model import TensorCircuit
 import pytest
 
 
-def forward_test():
+def test_forward():
 
     ni0 = inputs(0, num_node_blocks = 2, dist = dists.Categorical(num_cats = 2))
     ni1 = inputs(1, num_node_blocks = 2, dist = dists.Categorical(num_cats = 2))
@@ -71,7 +71,7 @@ def forward_test():
     assert torch.abs(pc.node_mars[13,0] - torch.log(s)) < 1e-4
 
 
-def non_sd_pc_forward_test():
+def test_non_sd_pc_forward():
     ni00 = inputs(0, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
     ni10 = inputs(1, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
     ni20 = inputs(2, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
@@ -138,7 +138,7 @@ def non_sd_pc_forward_test():
     assert torch.abs(torch.exp(pc.node_mars[17,0]) - (f9 + f10 + f11 + f12)) < 1e-3
 
 
-def sparse_pc_forward_test():
+def test_sparse_pc_forward():
     
     ni0 = inputs(0, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
     ni1 = inputs(1, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
@@ -199,7 +199,7 @@ def sparse_pc_forward_test():
     assert torch.abs(pc.node_mars[13,0] - torch.log(s)) < 1e-4
 
 
-def non_sd_pc2_forward_test():
+def test_non_sd_pc2_forward():
     n0 = inputs(0, num_nodes = 2, dist = dists.Categorical(num_cats = 2))
     n1 = multiply(inputs(0, num_nodes = 2, dist = dists.Categorical(num_cats = 2)))
     n2 = multiply(inputs(0, num_nodes = 2, dist = dists.Categorical(num_cats = 2)))
@@ -221,7 +221,7 @@ def non_sd_pc2_forward_test():
 
 
 if __name__ == "__main__":
-    forward_test()
-    non_sd_pc_forward_test()
-    sparse_pc_forward_test()
-    non_sd_pc2_forward_test()
+    test_forward()
+    test_non_sd_pc_forward()
+    test_sparse_pc_forward()
+    test_non_sd_pc2_forward()

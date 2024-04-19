@@ -14,7 +14,7 @@ from pyjuice.layer import InputLayer, ProdLayer, SumLayer
 import pytest
 
 
-def sum_layer_test():
+def test_sum_layer():
 
     device = torch.device("cuda:0")
 
@@ -141,7 +141,7 @@ def sum_layer_test():
     assert torch.all(torch.abs(my_pflows - param_flows) < 2e-3)
 
 
-def corner_case_test():
+def test_corner_case():
 
     device = torch.device("cuda:0")
 
@@ -280,7 +280,8 @@ def corner_case_test():
             assert torch.all(torch.abs(my_pflows - param_flows) < 2e-3)
 
 
-def speed_test():
+@pytest.mark.slow
+def test_speed():
 
     device = torch.device("cuda:0")
 
@@ -360,7 +361,8 @@ def speed_test():
     print("--------------------------------------------------------------")
 
 
-def block_sparse_speed_test():
+@pytest.mark.slow
+def test_block_sparse_speed():
 
     device = torch.device("cuda:0")
 
@@ -448,7 +450,7 @@ def block_sparse_speed_test():
 
 if __name__ == "__main__":
     torch.manual_seed(3890)
-    sum_layer_test()
-    corner_case_test()
-    speed_test()
-    block_sparse_speed_test()
+    test_sum_layer()
+    test_corner_case()
+    test_speed()
+    test_block_sparse_speed()

@@ -21,14 +21,26 @@ authors = [
     {name="StarAI", email="guyvdb@cs.ucla.edu"},
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-xdist",
+    "pytest-skip-slow",
+    "torchvision",
+    "torchtext",
+    "matplotlib"
+]
+
 [options.packages.find]
 where = "src"
 
 [tool.setuptools.dynamic]
 readme = {file = "README.md"}
 
-
 [tool.pytest.ini_options]
 addopts = [
     "--import-mode=importlib",
+]
+testpaths = [
+    "tests/"
 ]
