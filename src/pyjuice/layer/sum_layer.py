@@ -968,7 +968,7 @@ class SumLayer(Layer, nn.Module):
             epars = tl.load(epars_ptr)
 
             if propagation_alg_id == 0:
-                nmars = tl.log(tl.sum(emars * epars[:,None], axis = 0)) + emars_max
+                nmars = tl.where(emars_max == -float("inf"), -float("inf"), tl.log(tl.sum(emars * epars[:,None], axis = 0)) + emars_max)
 
             if propagation_alg_id == 1:
                 nmars = tl.max(emars + tl.log(epars)[:,None], axis = 0)
@@ -1035,7 +1035,7 @@ class SumLayer(Layer, nn.Module):
 
         # Compute sum node marginals
         if propagation_alg_id == 0:
-            nmars = tl.log(tl.sum(emars * epars[:,:,None], axis = 1)) + emars_max
+            nmars = tl.where(emars_max == -float("inf"), -float("inf"), tl.log(tl.sum(emars * epars[:,:,None], axis = 1)) + emars_max)
 
         if propagation_alg_id == 1:
             nmars = tl.max(emars + tl.log(epars)[:,:,None], axis = 1)
