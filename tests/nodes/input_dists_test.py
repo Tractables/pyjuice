@@ -733,8 +733,34 @@ def test_masked_categorical_nodes_rev_range():
     assert torch.all(torch.abs(updated_params - pc.input_layer_group[0].params.reshape(8, 8)) < 1e-4)
 
 
+def test_literal_nodes():
+
+    n0_pos = inputs(0, num_nodes = 1, dist = dists.Literal(lit = True))
+    n0_neg = inputs(0, num_nodes = 1, dist = dists.Literal(lit = False))
+    n1_pos = inputs(1, num_nodes = 1, dist = dists.Literal(lit = True))
+    n1_neg = inputs(1, num_nodes = 1, dist = dists.Literal(lit = False))
+
+    pn0 = multiply(n0_pos, n1_neg)
+    pn1 = multiply(n0_neg, n1_pos)
+
+    ns = summate(pn0, pn1, num_node_blocks = 1, block_size = 1)
+    ns.set_params(torch.tensor([[0.5, 0.5]]))
+
+    device = torch.device("cuda:0")
+
+    pc = TensorCircuit(ns)
+    pc.to(device)
+
+    data = torch.tensor([[False, True], [True, False], [True, True]], device = device)
+
+    lls = pc(data)
+
+    probs = lls.exp().view(-1)
+    assert ((probs.cpu() - torch.tensor([0.5, 0.5, 0.0])).abs() < 1e-4).all()
+
+
 if __name__ == "__main__":
-    # torch.manual_seed(235)
+    torch.manual_seed(235)
     test_categorical_nodes()
     test_bernoulli_nodes()
     test_gaussian_nodes()
@@ -743,3 +769,4 @@ if __name__ == "__main__":
     test_masked_categorical_nodes_range()
     test_masked_categorical_nodes_full_mask()
     test_masked_categorical_nodes_rev_range()
+    test_literal_nodes()

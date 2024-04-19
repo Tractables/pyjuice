@@ -120,7 +120,7 @@ class InputLayer(Layer, nn.Module):
         source_nids = torch.empty([cum_source_ns], dtype = torch.long)
 
         # Parameters of this layer
-        params = torch.empty([self.num_parameters], dtype = torch.float32)
+        params = torch.empty([max(self.num_parameters, 1)], dtype = torch.float32)
         
         n_start = 0
         source_n_start = 0
@@ -132,11 +132,17 @@ class InputLayer(Layer, nn.Module):
             vids[n_start:n_end,:] = torch.tensor(node_vars[ns_id]).view(1, -1)
 
             # `s_pids` and `s_pfids`
-            pid_offsets = torch.arange(0, ns.num_nodes * ns.dist.num_parameters(), ns.dist.num_parameters())
-            s_pids[n_start:n_end] = ns._param_range[0] + pid_offsets
+            if ns.dist.num_parameters() > 0:
+                pid_offsets = torch.arange(0, ns.num_nodes * ns.dist.num_parameters(), ns.dist.num_parameters())
+                s_pids[n_start:n_end] = ns._param_range[0] + pid_offsets
+            else:
+                s_pids[n_start:n_end] = 0
 
-            pfid_offsets = torch.arange(0, ns.num_nodes * ns.dist.num_param_flows(), ns.dist.num_param_flows())
-            s_pfids[n_start:n_end] = ns._param_flow_range[0] + pfid_offsets
+            if ns.dist.num_param_flows() > 0:
+                pfid_offsets = torch.arange(0, ns.num_nodes * ns.dist.num_param_flows(), ns.dist.num_param_flows())
+                s_pfids[n_start:n_end] = ns._param_flow_range[0] + pfid_offsets
+            else:
+                s_pfids[n_start:n_end] = 0
 
             # `source_nids`
             if not ns.is_tied():
@@ -202,9 +208,9 @@ class InputLayer(Layer, nn.Module):
                 or (self.param_flows.dim() == 1 and batch_size > 1) \
                 or (self.param_flows.dim() == 2 and batch_size != self.param_flows.size(1)):
             if batch_size == 1:
-                shape = [self.num_param_flows]
+                shape = [max(self.num_param_flows, 1)]
             else:
-                shape = [self.num_param_flows, batch_size]
+                shape = [max(self.num_param_flows, 1), batch_size]
             self.param_flows = torch.zeros(shape, device = self.device)
         else:
             assert self.param_flows.size(0) == self.num_param_flows
