@@ -9,6 +9,13 @@ import warnings
 from copy import deepcopy
 from typing import Sequence, List, Tuple, Optional
 
+# In the latest triton, math functions were shuffled around into different modules:
+# https://github.com/openai/triton/pull/3172
+if hasattr(tl.extra.cuda, "libdevice"):
+    tlmath = tl.extra.cuda.libdevic
+else:
+    tlmath = tl.math
+
 from pyjuice.nodes import SumNodes
 from pyjuice.utils import BitSet
 from pyjuice.utils.parameter_list import FastParamList
