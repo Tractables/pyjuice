@@ -4,8 +4,10 @@ from typing import Callable, Tuple
 
 
 class FastJITFunction():
-    def __init__(self, fn: Callable):
+    def __init__(self, fn: Callable, device_check: bool = True):
         self.jit_fn = triton.JITFunction(fn)
+
+        self.device_check = device_check
 
         try:
             self.constexpr_ids = [p.num for p in self.jit_fn.params if p.is_constexpr]
@@ -24,6 +26,22 @@ class FastJITFunction():
         
         def wrapper(*args, **kwargs):
             signature_list = list()
+
+            # Get device ID
+            if self.device_check:
+                device_id = -1
+                for arg in args:
+                    if isinstance(arg, torch.Tensor):
+                        device_id = arg.device.index
+                        break
+                
+                if device_id == -1:
+                    for k, v in kwargs.items():
+                        if isinstance(v, torch.Tensor):
+                            device_id = v.device.index
+                            break
+
+                signature_list.append(device_id)
 
             for i in self.constexpr_ids:
                 if i >= len(args):
@@ -53,13 +71,22 @@ class FastJITFunction():
                     if k in kwargs:
                         aligned_args.append(kwargs[k])
 
-                kernel[(grid0, grid1, grid2)](*aligned_args)
+                if self.device_check:
+                    with torch.cuda.device(device_id):
+                        kernel[(grid0, grid1, grid2)](*aligned_args)
+                else:
+                    kernel[(grid0, grid1, grid2)](*aligned_args)
             else:
-                kernel = self.jit_fn[grid](*args, **kwargs)
-                self.cache[signature] = kernel
+                if self.device_check:
+                    with torch.cuda.device(device_id):
+                        kernel = self.jit_fn[grid](*args, **kwargs)
+                        self.cache[signature] = kernel
+                else:
+                    kernel = self.jit_fn[grid](*args, **kwargs)
+                    self.cache[signature] = kernel
 
         return wrapper
 
 
-def triton_jit(fn: Callable):
-    return FastJITFunction(fn)
+def triton_jit(fn: Callable, device_check: bool = True):
+    return FastJITFunction(fn, device_check = device_check)
