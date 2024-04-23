@@ -12,9 +12,12 @@ from pyjuice.utils.kernel_launcher import FastJITFunction
 # @triton.jit
 @FastJITFunction
 def cum_par_kernel(cum_pflows, params, par_start_ids, blk_sizes, blk_intervals, 
-                   global_nids, num_blocks, BLOCK_ID: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+                   global_nids, constexprs, BLOCK_ID: tl.constexpr, BLOCK_SIZE: tl.constexpr):
 
     pid = tl.program_id(axis = 0)
+
+    # Retrieve the constants
+    num_blocks = tl.load(constexprs + 1).to(tl.int64)
 
     offs_m = pid * BLOCK_ID + tl.arange(0, BLOCK_ID)
     mask_m = offs_m < num_blocks
@@ -37,12 +40,13 @@ def cum_par_kernel(cum_pflows, params, par_start_ids, blk_sizes, blk_intervals,
 # @triton.jit
 @FastJITFunction
 def par_update_kernel(params, cum_pflows, nchs, par_start_ids, blk_sizes, blk_intervals,
-                      global_nids, constexprs, num_blocks, BLOCK_ID: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+                      global_nids, constexprs, BLOCK_ID: tl.constexpr, BLOCK_SIZE: tl.constexpr):
 
     pid = tl.program_id(axis = 0)
 
     # Retrieve the constants
     pseudocount = tl.load(constexprs)
+    num_blocks = tl.load(constexprs + 1).to(tl.int64)
 
     offs_m = pid * BLOCK_ID + tl.arange(0, BLOCK_ID)
     mask_m = offs_m < num_blocks
@@ -117,18 +121,18 @@ def normalize_parameters(params, par_update_kwargs, pseudocount: float = 0.0):
         num_blocks = par_start_ids.size(0)
         BLOCK_ID = 2048 // BLOCK_SIZE
 
+        constexprs = torch.tensor([pseudocount, num_blocks]).to(params.device)
+
         grid = (triton.cdiv(num_blocks, BLOCK_ID),)
 
         cum_par_kernel[grid](
             cum_pflows, params, par_start_ids, blk_sizes, blk_intervals, 
-            global_nids, num_blocks, BLOCK_ID, BLOCK_SIZE
+            global_nids, constexprs, BLOCK_ID, BLOCK_SIZE
         )
-
-        constexprs = torch.tensor([pseudocount]).to(params.device)
 
         par_update_kernel[grid](
             params, cum_pflows, nchs, par_start_ids, blk_sizes, blk_intervals,
-            global_nids, constexprs, num_blocks, BLOCK_ID, BLOCK_SIZE
+            global_nids, constexprs, BLOCK_ID, BLOCK_SIZE
         )
 
     else:

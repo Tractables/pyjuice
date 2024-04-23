@@ -760,7 +760,7 @@ def test_literal_nodes():
 
 
 if __name__ == "__main__":
-    torch.manual_seed(235)
+    # torch.manual_seed(235)
     test_categorical_nodes()
     test_bernoulli_nodes()
     test_gaussian_nodes()

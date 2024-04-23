@@ -183,8 +183,8 @@ def _assign_chid_kernel(chs_offsets, ns_nchs, edge_ids):
         ns_nchs[nid] = idx + 1
 
 
-# @triton.jit
-@FastJITFunction
+@triton.jit
+# @FastJITFunction
 def _assign_target_ncpids_kernel(target_nids_ptr, nids_partition_start_ptr, target_cids_ptr, pcids_partition_start_ptr,
                                  target_pids_ptr, target_pfids_ptr, edge_ids_ptr, chs_offsets_ptr, n_partition_ids_ptr, 
                                  n_id_in_partition_ptr, cs_ele_id_start_ptr, cs_node_cum_ids_ptr, fw_partition_max_chs_ptr, 
@@ -603,8 +603,8 @@ def _assign_parid_kernel(pars_offsets, cs_npars, edge_ids, edge_sid):
         cs_npars[cid] = idx + 1
 
 
-# @triton.jit
-@FastJITFunction
+@triton.jit
+# @FastJITFunction
 def _assign_target_chpapids_kernel(target_chids_ptr, chids_partition_start_ptr, target_parids_ptr, target_parpids_ptr, 
                                    parids_partition_start_ptr, edge_ids_ptr, pars_offsets_ptr, n_partition_ids_ptr, 
                                    n_id_in_partition_ptr, num_ngs_in_partition_ptr, partition_max_pars_ptr, cum_n_chs_ptr, 
@@ -1012,8 +1012,8 @@ def _assign_cid2_block_local_id(flat_u_cids, n_block_ids, n_id_in_block, cid2blo
         cid2local_id[cid] = n_id_in_block[i]
 
 
-# @triton.jit
-@FastJITFunction
+@triton.jit
+# @FastJITFunction
 def _assign_target_ucids_kernel(target_u_cids_ptr, flat_u_cids_ptr, n_partition_ids_ptr, n_id_in_partition_ptr, 
                                 u_cids_partition_start_ptr, constexprs_ptr, BLOCK_SIZE: tl.constexpr):
 
@@ -1040,8 +1040,8 @@ def _assign_target_ucids_kernel(target_u_cids_ptr, flat_u_cids_ptr, n_partition_
     tl.store(target_u_cids_ptr + u_cids_start + local_id, cid, mask = mask)
 
 
-# @triton.jit
-@FastJITFunction
+@triton.jit
+# @FastJITFunction
 def _assign_prod_target_parids_kernel(target_parids_ptr, flat_cid2nid_ptr, flat_cids_ptr, 
                                       cid2partition_id_ptr, cid2local_id_ptr, parids_partition_start_ptr,
                                       flat_par_offsets_ptr, bk_partition_max_pars_ptr, constexprs_ptr, 

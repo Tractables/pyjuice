@@ -4,7 +4,7 @@ from typing import Callable, Tuple, Union
 
 
 class FastJITFunction():
-    def __init__(self, fn: Callable, device_check: bool = True):
+    def __init__(self, fn: Callable, device_check: bool = False):
         self.jit_fn = triton.JITFunction(fn)
 
         self.device_check = device_check
@@ -94,5 +94,5 @@ class FastJITFunction():
         return wrapper
 
 
-def triton_jit(fn: Callable, device_check: bool = True):
+def triton_jit(fn: Callable, device_check: bool = False):
     return FastJITFunction(fn, device_check = device_check)

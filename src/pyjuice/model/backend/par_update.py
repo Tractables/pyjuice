@@ -170,16 +170,17 @@ def par_update_to_device(par_update_kwargs, device):
     ]
 
 
-# @triton.jit
-@FastJITFunction
+@triton.jit
+# @FastJITFunction
 def cum_pflow_kernel(cum_pflows, params, param_flows, nchs, par_start_ids, pflow_start_ids, blk_sizes, blk_intervals, 
-                     global_nids, constexprs, num_blocks, keep_zero_params: tl.constexpr, BLOCK_ID: tl.constexpr, 
+                     global_nids, constexprs, keep_zero_params: tl.constexpr, BLOCK_ID: tl.constexpr, 
                      BLOCK_SIZE: tl.constexpr):
 
     pid = tl.program_id(axis = 0)
 
     # Retrieve the constants
     pseudocount = tl.load(constexprs + 1)
+    num_blocks = tl.load(constexprs + 2).to(tl.int64)
 
     offs_m = pid * BLOCK_ID + tl.arange(0, BLOCK_ID)
     mask_m = offs_m < num_blocks
@@ -210,10 +211,10 @@ def cum_pflow_kernel(cum_pflows, params, param_flows, nchs, par_start_ids, pflow
     tl.atomic_add(cum_pflows + global_nid, nflows, mask = mask_m)
 
 
-# @triton.jit
-@FastJITFunction
+@triton.jit
+# @FastJITFunction
 def em_par_update_kernel(params, param_flows, cum_pflows, nchs, par_start_ids, pflow_start_ids, blk_sizes, blk_intervals,
-                         global_nids, constexprs, num_blocks, keep_zero_params: tl.constexpr, BLOCK_ID: tl.constexpr, 
+                         global_nids, constexprs, keep_zero_params: tl.constexpr, BLOCK_ID: tl.constexpr, 
                          BLOCK_SIZE: tl.constexpr):
 
     pid = tl.program_id(axis = 0)
@@ -221,6 +222,7 @@ def em_par_update_kernel(params, param_flows, cum_pflows, nchs, par_start_ids, p
     # Retrieve the constants
     step_size = tl.load(constexprs)
     pseudocount = tl.load(constexprs + 1)
+    num_blocks = tl.load(constexprs + 2).to(tl.int64)
 
     offs_m = pid * BLOCK_ID + tl.arange(0, BLOCK_ID)
     mask_m = offs_m < num_blocks
@@ -256,16 +258,17 @@ def em_par_update_kernel(params, param_flows, cum_pflows, nchs, par_start_ids, p
     tl.store(params + offs_par, updated_param, mask = mask_pflow)
 
 
-# @triton.jit
-@FastJITFunction
+@triton.jit
+# @FastJITFunction
 def sgd_par_update_kernel(params, param_grads, par_start_ids, pgrad_start_ids, blk_sizes, blk_intervals,
-                         global_nids, constexprs, num_blocks, keep_zero_params: tl.constexpr, BLOCK_ID: tl.constexpr, 
+                         global_nids, constexprs, keep_zero_params: tl.constexpr, BLOCK_ID: tl.constexpr, 
                          BLOCK_SIZE: tl.constexpr):
 
     pid = tl.program_id(axis = 0)
 
     # Retrieve the constants
     lr = tl.load(constexprs)
+    num_blocks = tl.load(constexprs + 1).to(tl.int64)
 
     offs_m = pid * BLOCK_ID + tl.arange(0, BLOCK_ID)
     mask_m = offs_m < num_blocks
@@ -311,18 +314,18 @@ def em_par_update(params: torch.Tensor, param_flows: torch.Tensor, par_update_kw
 
     grid = (triton.cdiv(num_blocks, BLOCK_ID),)
 
-    constexprs = torch.tensor([step_size, pseudocount]).to(params.device)
+    constexprs = torch.tensor([step_size, pseudocount, num_blocks]).to(params.device)
 
     keep_zero_params = 1 if keep_zero_params else 0
 
     cum_pflow_kernel[grid](
         cum_pflows, params, param_flows, nchs, par_start_ids, pflow_start_ids, blk_sizes, blk_intervals, 
-        global_nids, constexprs, num_blocks, keep_zero_params, BLOCK_ID, BLOCK_SIZE
+        global_nids, constexprs, keep_zero_params, BLOCK_ID, BLOCK_SIZE
     )
 
     em_par_update_kernel[grid](
         params, param_flows, cum_pflows, nchs, par_start_ids, pflow_start_ids, blk_sizes, blk_intervals,
-        global_nids, constexprs, num_blocks, keep_zero_params, BLOCK_ID, BLOCK_SIZE
+        global_nids, constexprs, keep_zero_params, BLOCK_ID, BLOCK_SIZE
     )
 
     return None
@@ -356,11 +359,11 @@ def sgd_par_update(params: torch.Tensor, param_grads: torch.Tensor, par_update_k
 
     grid = (triton.cdiv(num_blocks, BLOCK_ID),)
 
-    constexprs = torch.tensor([lr]).to(params.device)
+    constexprs = torch.tensor([lr, num_blocks]).to(params.device)
 
     sgd_par_update_kernel[grid](
         params, param_grads, par_start_ids, pgrad_start_ids, blk_sizes, blk_intervals,
-        global_nids, constexprs, num_blocks, keep_zero_params, BLOCK_ID, BLOCK_SIZE
+        global_nids, constexprs, keep_zero_params, BLOCK_ID, BLOCK_SIZE
     )
 
     return None

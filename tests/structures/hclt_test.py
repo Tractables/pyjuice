@@ -32,7 +32,7 @@ def mini_batch_em_epoch(num_epochs, pc, optimizer, scheduler, train_loader, test
             if not logspace_flows:
                 lls.mean().backward()
             else:
-                pc.backward(x.permute(1, 0), allow_modify_flows = False, logspace_flows = True)
+                pc.backward(x, allow_modify_flows = False, logspace_flows = True)
 
             train_ll += lls.mean().detach().cpu().numpy().item()
 
@@ -173,12 +173,12 @@ def test_hclt_logspace_flows():
         milestone_steps = [0, len(train_loader) * 100, len(train_loader) * 350]
     )
 
-    for batch in train_loader:
-        x = batch[0].to(device)
+    # for batch in train_loader:
+    #     x = batch[0].to(device)
 
-        lls = pc(x, record_cudagraph = True)
-        lls.mean().backward()
-        break
+    #     lls = pc(x, record_cudagraph = True)
+    #     lls.mean().backward()
+    #     break
 
     mini_batch_em_epoch(5, pc, optimizer, scheduler, train_loader, test_loader, device, logspace_flows = True)
 
@@ -365,8 +365,8 @@ def test_hclt_logistic():
 
 if __name__ == "__main__":
     # torch.manual_seed(3289)
-    # test_hclt()
+    test_hclt()
     test_hclt_logspace_flows()
-    # test_small_hclt_full()
+    test_small_hclt_full()
     # test_large_hclt_full()
-    # test_hclt_logistic()
+    test_hclt_logistic()

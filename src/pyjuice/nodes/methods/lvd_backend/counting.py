@@ -12,8 +12,8 @@ from pyjuice.nodes.distributions import Categorical
 from pyjuice.utils.kernel_launcher import FastJITFunction
 
 
-# @triton.jit
-@FastJITFunction
+@triton.jit
+# @FastJITFunction
 def _pairwise_count_kernel(data1_ptr, data2_ptr, pairwise_count_ptr, num_samples: tl.constexpr,
                            n_cls1: tl.constexpr, n_cls2: tl.constexpr, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(axis = 0)
