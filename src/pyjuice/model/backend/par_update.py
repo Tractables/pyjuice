@@ -9,6 +9,7 @@ from numba import njit
 from typing import Sequence
 
 from pyjuice.nodes import CircuitNodes
+from pyjuice.utils.kernel_launcher import FastJITFunction
 
 
 @njit
@@ -169,7 +170,8 @@ def par_update_to_device(par_update_kwargs, device):
     ]
 
 
-@triton.jit
+# @triton.jit
+@FastJITFunction
 def cum_pflow_kernel(cum_pflows, params, param_flows, nchs, par_start_ids, pflow_start_ids, blk_sizes, blk_intervals, 
                      global_nids, constexprs, num_blocks, keep_zero_params: tl.constexpr, BLOCK_ID: tl.constexpr, 
                      BLOCK_SIZE: tl.constexpr):
@@ -208,7 +210,8 @@ def cum_pflow_kernel(cum_pflows, params, param_flows, nchs, par_start_ids, pflow
     tl.atomic_add(cum_pflows + global_nid, nflows, mask = mask_m)
 
 
-@triton.jit
+# @triton.jit
+@FastJITFunction
 def em_par_update_kernel(params, param_flows, cum_pflows, nchs, par_start_ids, pflow_start_ids, blk_sizes, blk_intervals,
                          global_nids, constexprs, num_blocks, keep_zero_params: tl.constexpr, BLOCK_ID: tl.constexpr, 
                          BLOCK_SIZE: tl.constexpr):
@@ -253,7 +256,8 @@ def em_par_update_kernel(params, param_flows, cum_pflows, nchs, par_start_ids, p
     tl.store(params + offs_par, updated_param, mask = mask_pflow)
 
 
-@triton.jit
+# @triton.jit
+@FastJITFunction
 def sgd_par_update_kernel(params, param_grads, par_start_ids, pgrad_start_ids, blk_sizes, blk_intervals,
                          global_nids, constexprs, num_blocks, keep_zero_params: tl.constexpr, BLOCK_ID: tl.constexpr, 
                          BLOCK_SIZE: tl.constexpr):

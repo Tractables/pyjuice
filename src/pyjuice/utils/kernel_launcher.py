@@ -1,6 +1,6 @@
 import torch
 import triton
-from typing import Callable, Tuple
+from typing import Callable, Tuple, Union
 
 
 class FastJITFunction():
@@ -22,9 +22,12 @@ class FastJITFunction():
 
         self.cache = dict()
 
-    def __getitem__(self, grid: Tuple):
+    def __getitem__(self, grid: Union[Tuple,Callable]):
         
         def wrapper(*args, **kwargs):
+
+            nonlocal grid
+
             signature_list = list()
 
             # Get device ID
@@ -54,6 +57,9 @@ class FastJITFunction():
 
             if "batch_size" in kwargs:
                 signature_list.append(("batch_size", kwargs["batch_size"]))
+
+            if isinstance(grid, Callable):
+                grid = grid(kwargs)
 
             grid_length = len(grid)
             grid0, grid1, grid2 = grid[0], grid[1] if grid_length > 1 else 1, grid[2] if grid_length > 2 else 1

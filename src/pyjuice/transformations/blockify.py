@@ -11,6 +11,7 @@ from typing import Optional, Dict, Sequence
 from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes, foldup_aggregate
 from pyjuice.utils import BitSet
 from pyjuice.utils.util import max_cdf_power_of_2
+from pyjuice.utils.kernel_launcher import FastJITFunction
 
 
 @njit
@@ -40,7 +41,8 @@ def _compute_param_target_ids_kernel(target_id0, target_id1, target_id2, edge_id
                 break
 
 
-@triton.jit
+# @triton.jit
+@FastJITFunction
 def _copy_params_kernel(new_params, params, target_id0, target_id1, target_id2, 
                         old_block_size: tl.constexpr, old_ch_block_size: tl.constexpr, 
                         new_block_size: tl.constexpr, new_ch_block_size: tl.constexpr, 

@@ -650,7 +650,8 @@ class InputLayer(Layer, nn.Module):
         tl.store(node_mars_ptr + node_offsets * batch_size + batch_offsets, mars, mask = mask)
 
     @staticmethod
-    @triton.jit
+    # @triton.jit
+    @FastJITFunction
     def _fw_missing_mask_kernel(missing_mask_ptr, node_mars_ptr, vids_ptr, fw_local_ids_ptr, num_vars,
                                 layer_num_nodes: tl.constexpr, batch_size: tl.constexpr, node_offset: tl.constexpr, 
                                 BLOCK_SIZE: tl.constexpr, partial_eval: tl.constexpr, mode: tl.constexpr):
@@ -767,7 +768,8 @@ class InputLayer(Layer, nn.Module):
         sample_fn(samples_ptr, local_offsets, batch_offsets, vids, s_pids, params_ptr, metadata_ptr, s_mids_ptr, mask, batch_size, BLOCK_SIZE, seed)
 
     @staticmethod
-    @triton.jit
+    # @triton.jit
+    @FastJITFunction
     def _pflow_accum_kernel(param_flows_ptr, pfid_start, ch_pfids_ptr, num_coalesced_blocks, num_par_flows, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
         pid = tl.program_id(axis = 0)
 

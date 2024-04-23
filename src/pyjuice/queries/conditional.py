@@ -10,12 +10,14 @@ from pyjuice.nodes import CircuitNodes
 from pyjuice.model import TensorCircuit
 from pyjuice.nodes.methods import get_subsumed_scopes
 from pyjuice.utils import BitSet
+from pyjuice.utils.kernel_launcher import FastJITFunction
 from .base import query
 
 
 ## Categorical layer ##
 
-@triton.jit
+# @triton.jit
+@FastJITFunction
 def _soft_evi_categorical_fw_kernel(data_ptr, node_mars_ptr, params_ptr, vids_ptr, psids_ptr, node_nchs_ptr, local_ids,
                                     sid: tl.constexpr, num_nodes: tl.constexpr, num_cats: tl.constexpr, 
                                     batch_size: tl.constexpr, partial: tl.constexpr, BLOCK_SIZE: tl.constexpr):
@@ -111,7 +113,8 @@ def _categorical_forward(layer, inputs: torch.Tensor, node_mars: torch.Tensor,
     return None
 
 
-@triton.jit
+# @triton.jit
+@FastJITFunction
 def _categorical_backward_kernel(cat_probs_ptr, node_flows_ptr, local_ids_ptr, rev_vars_mapping_ptr, vids_ptr, psids_ptr, 
                                  node_nchs_ptr, params_ptr, sid, eid, num_target_nodes, batch_size: tl.constexpr, 
                                  num_cats: tl.constexpr, partial_eval: tl.constexpr, BLOCK_SIZE: tl.constexpr):
