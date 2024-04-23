@@ -44,5 +44,15 @@ def test_nodes():
                 assert torch.all(torch.abs(n._params.sum(dim = 2).sum(dim = 0) - 1.0) < 1e-4)
 
 
+def test_structural_properties():
+
+    with juice.structural_properties(allow_nonsmooth = True):
+        n0 = inputs(0, 4, dists.Categorical(num_cats = 5))
+        n1 = inputs(1, 4, dists.Categorical(num_cats = 5))
+
+        ns = summate(n0, n1, num_node_blocks = 1, block_size = 1)
+
+
 if __name__ == "__main__":
     test_nodes()
+    test_structural_properties()

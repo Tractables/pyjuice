@@ -9,6 +9,11 @@ from pyjuice.utils import BitSet
 
 
 class RegionGraph():
+
+    # Property checks
+    ALLOW_NONSMOOTH = False
+    ALLOW_NONDECOMPOSABLE = False
+
     def __init__(self, scope: BitSet, children: List[RegionGraph]) -> None:
         self.scope = scope
         self.children = children
@@ -26,7 +31,8 @@ class PartitionNode(RegionGraph):
 
         scope = BitSet()
         for n in children:
-            assert len(scope & n.scope) == 0, "Children of a PartitionNode have overlapping scopes."
+            if not self.ALLOW_NONDECOMPOSABLE:
+                assert len(scope & n.scope) == 0, "Children of a PartitionNode have overlapping scopes."
             scope |= n.scope
 
         super().__init__(scope, children)
@@ -43,7 +49,10 @@ class InnerRegionNode(RegionGraph):
 
         scope = deepcopy(children[0].scope)
         for n in children[1:]:
-            assert scope == n.scope, "Children of an InnerRegionNode must have the same scope."
+            if not self.ALLOW_NONSMOOTH:
+                assert scope == n.scope, "Children of an InnerRegionNode must have the same scope."
+            else:
+                scope |= n.scope
 
         super().__init__(scope, children)
 

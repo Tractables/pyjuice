@@ -13,7 +13,7 @@ import pyjuice.visualize
 from pyjuice.model import compile, TensorCircuit
 
 # Construction methods
-from pyjuice.nodes import multiply, summate, inputs, set_block_size
+from pyjuice.nodes import multiply, summate, inputs, set_block_size, structural_properties
 
 # Distributions
 from pyjuice.nodes import distributions

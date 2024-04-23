@@ -12,6 +12,7 @@ from .input_nodes import InputNodes
 from .prod_nodes import ProdNodes
 from .sum_nodes import SumNodes
 from .distributions import Distribution
+from pyjuice.graph import RegionGraph
 
 Tensor = Union[np.ndarray,torch.Tensor]
 ProdNodesChs = Union[SumNodes,InputNodes]
@@ -102,7 +103,8 @@ def multiply(nodes1: ProdNodesChs, *args, edge_ids: Optional[Tensor] = None, spa
         if edge_ids is None:
             assert nodes.num_node_blocks == num_node_blocks, f"Input nodes should have the same `num_node_blocks`, but got {nodes.num_node_blocks} and {num_node_blocks}."
         assert nodes.block_size == block_size, "Input nodes should have the same `num_node_blocks`."
-        assert len(nodes.scope & scope) == 0, "Children of a `ProdNodes` should have disjoint scopes."
+        if not RegionGraph.ALLOW_NONDECOMPOSABLE:
+            assert len(nodes.scope & scope) == 0, "Children of a `ProdNodes` should have disjoint scopes."
         chs.append(nodes)
         scope |= nodes.scope
 
@@ -169,7 +171,8 @@ def summate(nodes1: SumNodesChs, *args, num_node_blocks: int = 0, num_nodes: int
     scope = deepcopy(nodes1.scope)
     for nodes in args:
         assert isinstance(nodes, ProdNodes) or isinstance(nodes, InputNodes), f"Children of sum nodes must be input or product nodes, but found input of type {type(nodes)}."
-        assert nodes.scope == scope, "Children of a `SumNodes` should have the same scope."
+        if not RegionGraph.ALLOW_NONSMOOTH:
+            assert nodes.scope == scope, "Children of a `SumNodes` should have the same scope."
         chs.append(nodes)
 
     return SumNodes(num_node_blocks, chs, edge_ids, block_size = block_size, **kwargs)
@@ -203,3 +206,33 @@ class set_block_size(_DecoratorContextManager):
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
         CircuitNodes.DEFAULT_BLOCK_SIZE = self.original_block_size
+
+
+class structural_properties(_DecoratorContextManager):
+    """
+    Context-manager that controls the assertions of circuit structural properties, including smoothness and decomposability.
+
+    :param allow_nonsmooth: whether to allow non-smooth circuits
+    :type allow_nonsmooth: bool
+
+    :param allow_nondecomposable: whether to allow non-decomposable circuits
+    :type allow_nondecomposable: bool
+
+    Example::
+        >>> with pyjuice.structural_properties(allow_nonsmooth = True):
+        ...     nis = pyjuice.inputs(var = 0, num_node_blocks = 4, dist = Categorical(num_cats = 20))
+        ...     ....
+    """
+
+    def __init__(self, allow_nonsmooth = False, allow_nondecomposable = False):
+
+        self.allow_nonsmooth = allow_nonsmooth
+        self.allow_nondecomposable = allow_nondecomposable
+
+    def __enter__(self) -> None:
+        RegionGraph.ALLOW_NONSMOOTH = self.allow_nonsmooth
+        RegionGraph.ALLOW_NONDECOMPOSABLE = self.allow_nondecomposable
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        RegionGraph.ALLOW_NONSMOOTH = False
+        RegionGraph.ALLOW_NONDECOMPOSABLE = False
