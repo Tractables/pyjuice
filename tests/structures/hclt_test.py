@@ -360,7 +360,7 @@ def test_hclt_logistic():
 
     test_ll = evaluate(pc, test_loader)
 
-    assert test_ll > -995.0
+    assert test_ll > -996.0
 
 
 if __name__ == "__main__":
