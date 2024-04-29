@@ -15,6 +15,7 @@ Feel free to explore the examples and learn how to use PyJuice for your projects
 
     <div class="sphx-glr-thumbnails">
 
+.. thumbnail-parent-div-open
 
 .. raw:: html
 
@@ -100,6 +101,8 @@ Feel free to explore the examples and learn how to use PyJuice for your projects
       <div class="sphx-glr-thumbnail-title">PC Structural Transformation Functions</div>
     </div>
 
+
+.. thumbnail-parent-div-close
 
 .. raw:: html
 
