@@ -393,9 +393,8 @@ class InputLayer(Layer, nn.Module):
             )
 
             # Handle the masked input nodes
-            if missing_mask is not None:
+            if missing_mask is not None and self.bk_flow_mask_fn is not None:
                 if not self.provided("_flows_mask_kernel"):
-                    assert self.bk_flow_mask_fn is not None, f"`bk_flow_mask_fn` is not implemented for distribution {type(self.dist)}."
                     self._flows_mask_kernel = self._compile_triton_kernel(self._flows_kernel_template, flow_fn = self.bk_flow_mask_fn)
 
                 self._flows_mask_kernel[grid](
