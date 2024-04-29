@@ -338,7 +338,7 @@ def test_mpe_prop():
 
 
 if __name__ == "__main__":
-    torch.manual_seed(280)
+    # torch.manual_seed(280)
     test_ll_prop()
     test_general_ll_prop()
     test_mpe_prop()

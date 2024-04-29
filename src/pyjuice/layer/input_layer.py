@@ -104,6 +104,10 @@ class InputLayer(Layer, nn.Module):
         self.bk_flow_fn = self.nodes[0].dist.bk_flow_fn
         self.sample_fn = self.nodes[0].dist.sample_fn
         self.em_fn = self.nodes[0].dist.em_fn
+        if hasattr(self.nodes[0].dist, "bk_flow_mask_fn"):
+            self.bk_flow_mask_fn = self.nodes[0].dist.bk_flow_mask_fn
+        else:
+            self.bk_flow_mask_fn = None
 
         ## Prepair and compile the layer ##
         num_vars = len(node_vars[0])
@@ -309,7 +313,8 @@ class InputLayer(Layer, nn.Module):
 
     def backward(self, data: torch.Tensor, node_flows: torch.Tensor, 
                  node_mars: torch.Tensor, params: Optional[Dict] = None,
-                 logspace_flows: bool = False, **kwargs):
+                 logspace_flows: bool = False, missing_mask: Optional[torch.Tensor] = None, 
+                 _batch_first: bool = True, **kwargs):
         """
         data: [num_vars, B]
         node_flows: [num_nodes, B]
@@ -338,6 +343,21 @@ class InputLayer(Layer, nn.Module):
                 layer_num_nodes = self.bk_local_ids.size(0)
                 bk_local_ids = self.bk_local_ids
 
+            # Missing mask
+            num_vars = None
+            if missing_mask is None:
+                missing_mask_mode = 0
+            else:
+                if missing_mask.dim() == 1:
+                    missing_mask_mode = 1
+                    num_vars = missing_mask.size(0)
+                elif _batch_first or num_vars == missing_mask.size(1):
+                    missing_mask_mode = 2
+                    num_vars = missing_mask.size(1)
+                else:
+                    missing_mask_mode = 3
+                    num_vars = missing_mask.size(0)
+
             if not self.provided("_flows_kernel"):
                 self._flows_kernel = self._compile_triton_kernel(self._flows_kernel_template, flow_fn = self.bk_flow_fn)
 
@@ -351,6 +371,7 @@ class InputLayer(Layer, nn.Module):
                 node_flows_ptr = node_flows, 
                 node_mars_ptr = node_mars,
                 data_ptr = data, 
+                missing_mask_ptr = missing_mask,
                 vids_ptr = self.vids, 
                 s_pids_ptr = self.s_pids,
                 s_pfids_ptr = self.s_pfids,
@@ -360,13 +381,49 @@ class InputLayer(Layer, nn.Module):
                 layer_num_nodes = layer_num_nodes, 
                 batch_size = batch_size, 
                 num_vars_per_node = self.num_vars_per_node, 
+                num_vars = num_vars,
                 nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
                 node_offset = node_offset, 
                 BLOCK_SIZE = BLOCK_SIZE, 
                 partial_eval = 1 if bk_local_ids is not None else 0,
                 logspace_flows = logspace_flows,
+                missing_mask_mode = missing_mask_mode,
+                pass_type = 0,
                 num_warps = 8
             )
+
+            # Handle the masked input nodes
+            if missing_mask is not None:
+                if not self.provided("_flows_mask_kernel"):
+                    assert self.bk_flow_mask_fn is not None, f"`bk_flow_mask_fn` is not implemented for distribution {type(self.dist)}."
+                    self._flows_mask_kernel = self._compile_triton_kernel(self._flows_kernel_template, flow_fn = self.bk_flow_mask_fn)
+
+                self._flows_mask_kernel[grid](
+                    params_ptr = self.params,
+                    param_flows_ptr = self.param_flows,
+                    node_flows_ptr = node_flows, 
+                    node_mars_ptr = node_mars,
+                    data_ptr = data, 
+                    missing_mask_ptr = missing_mask,
+                    vids_ptr = self.vids, 
+                    s_pids_ptr = self.s_pids,
+                    s_pfids_ptr = self.s_pfids,
+                    metadata_ptr = self.metadata, 
+                    s_mids_ptr = self.s_mids, 
+                    bk_local_ids_ptr = bk_local_ids,
+                    layer_num_nodes = layer_num_nodes, 
+                    batch_size = batch_size, 
+                    num_vars_per_node = self.num_vars_per_node, 
+                    num_vars = num_vars,
+                    nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
+                    node_offset = node_offset, 
+                    BLOCK_SIZE = BLOCK_SIZE, 
+                    partial_eval = 1 if bk_local_ids is not None else 0,
+                    logspace_flows = logspace_flows,
+                    missing_mask_mode = missing_mask_mode,
+                    pass_type = 1,
+                    num_warps = 8
+                )
 
         else:
             raise NotImplementedError("CPU backward fn for input nodes is not implemented.")
@@ -691,10 +748,10 @@ class InputLayer(Layer, nn.Module):
         tl.store(node_mars_ptr + node_offsets, mars, mask = mask)
 
     @staticmethod
-    def _flows_kernel_template(flow_fn, params_ptr, param_flows_ptr, node_flows_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, s_pfids_ptr,
+    def _flows_kernel_template(flow_fn, params_ptr, param_flows_ptr, node_flows_ptr, node_mars_ptr, data_ptr, missing_mask_ptr, vids_ptr, s_pids_ptr, s_pfids_ptr,
                                metadata_ptr, s_mids_ptr, bk_local_ids_ptr, partial_eval: tl.constexpr, logspace_flows: tl.constexpr, layer_num_nodes: tl.constexpr, 
-                               batch_size: tl.constexpr, num_vars_per_node: tl.constexpr, nv_block_size: tl.constexpr, node_offset: tl.constexpr, 
-                               BLOCK_SIZE: tl.constexpr):
+                               batch_size: tl.constexpr, num_vars_per_node: tl.constexpr, num_vars: tl.constexpr, nv_block_size: tl.constexpr, node_offset: tl.constexpr, 
+                               missing_mask_mode: tl.constexpr, pass_type: tl.constexpr, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(axis = 0)
         block_start = pid * BLOCK_SIZE
 
@@ -714,6 +771,19 @@ class InputLayer(Layer, nn.Module):
 
             # Load the corresponding data
             data = tl.load(data_ptr + vids * batch_size + batch_offsets, mask = mask, other = 0)
+
+            if missing_mask_mode == 1:
+                missing_mask = tl.load(missing_mask_ptr + vids, mask = mask, other = False).to(tl.int1)
+                if pass_type == 0:
+                    mask &= (missing_mask == False)
+            elif missing_mask_mode == 2:
+                missing_mask = tl.load(missing_mask_ptr + batch_offsets * num_vars + vids, mask = mask, other = False).to(tl.int1)
+                if pass_type == 0:
+                    mask &= (missing_mask == False)
+            elif missing_mask_mode == 3:
+                missing_mask = tl.load(missing_mask_ptr + vids * batch_size + batch_offsets, mask = mask, other = False).to(tl.int1)
+                if pass_type == 0:
+                    mask &= (missing_mask == False)
         else:
             # Get all variable ids
             vids_offsets = tl.broadcast_to(local_offsets[:,None], (BLOCK_SIZE, nv_block_size)) * num_vars_per_node + \

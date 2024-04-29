@@ -96,6 +96,30 @@ def test_input_layer():
 
     assert torch.all(torch.abs(layer.param_flows - param_flows) < 1e-4)
 
+    ## Backward with missing tests ##
+
+    node_flows = torch.rand([33, batch_size]).to(device)
+    missing_mask = torch.randint(0, 2, (batch_size, 4)).bool().to(device)
+
+    layer.init_param_flows(flows_memory = 0.0)
+
+    layer(data, node_mars, missing_mask = missing_mask)
+    layer.backward(data, node_flows, node_mars, missing_mask = missing_mask)
+
+    param_flows = torch.zeros([block_size * 2 * 4 * 2]).to(device)
+
+    for i in range(16):
+        for j in range(4 * 2 * block_size):
+            v = j // (2*block_size)
+
+            if missing_mask[i,v]:
+                param_flows[j*2] += node_flows[j+1,i] * layer.params[j*2]
+                param_flows[j*2+1] += node_flows[j+1,i] * layer.params[j*2+1]
+            else:
+                param_flows[j*2+data[j//(2*block_size),i]] += node_flows[j+1,i]
+
+    assert torch.all(torch.abs(layer.param_flows - param_flows) < 1e-4)
+
     ## EM tests ##
 
     original_params = layer.params.clone()

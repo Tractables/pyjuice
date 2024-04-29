@@ -87,6 +87,24 @@ class Categorical(Distribution):
         tl.atomic_add(param_flows_ptr + pf_offsets, flows, mask = mask)
 
     @staticmethod
+    def bk_flow_mask_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
+                        s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE):
+        # Get `num_cats` from `metadata`
+        s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
+        num_cats = tl.load(metadata_ptr + s_mids, mask = mask, other = 0).to(tl.int64)
+
+        max_num_cats = tl.max(num_cats, axis = 0)
+
+        for cat_id in range(max_num_cats):
+            cat_mask = mask & missing_mask & (cat_id < num_cats)
+
+            p_offsets = s_pids + cat_id
+            param = tl.load(params_ptr + p_offsets, mask = cat_mask, other = 0)
+
+            pf_offsets = s_pfids + cat_id
+            tl.atomic_add(param_flows_ptr + pf_offsets, flows * param, mask = cat_mask)
+
+    @staticmethod
     def sample_fn(samples_ptr, local_offsets, batch_offsets, vids, s_pids, params_ptr, metadata_ptr, s_mids_ptr, mask, batch_size, BLOCK_SIZE, seed):
         # Get `num_cats` from `metadata`
         s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
