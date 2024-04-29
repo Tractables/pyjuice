@@ -49,7 +49,7 @@ class Literal(Distribution):
         Returned parameters should be flattened into a vector.
         """
 
-        return torch.zeros([0])
+        return torch.zeros(0)
 
     @staticmethod
     def fw_mar_fn(local_offsets, data, params_ptr, s_pids, metadata_ptr, s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE):

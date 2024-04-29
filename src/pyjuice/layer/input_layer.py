@@ -208,9 +208,9 @@ class InputLayer(Layer, nn.Module):
                 or (self.param_flows.dim() == 1 and batch_size > 1) \
                 or (self.param_flows.dim() == 2 and batch_size != self.param_flows.size(1)):
             if batch_size == 1:
-                shape = [max(self.num_param_flows, 1)]
+                shape = [self.num_param_flows]
             else:
-                shape = [max(self.num_param_flows, 1), batch_size]
+                shape = [self.num_param_flows, batch_size]
             self.param_flows = torch.zeros(shape, device = self.device)
         else:
             assert self.param_flows.size(0) == self.num_param_flows
