@@ -313,7 +313,7 @@ class TensorCircuit(nn.Module):
                 self.node_flows[self._root_node_range[0]:self._root_node_range[1],:] = root_flows
             else:
                 if ll_weights.dim() == 1:
-                    ll_weights = ll_weights.unsqueeze(1)
+                    ll_weights = ll_weights.unsqueeze(0)
 
                 assert ll_weights.size(0) == self.num_root_nodes
 
@@ -518,6 +518,12 @@ class TensorCircuit(nn.Module):
         print(f"> Number of nodes: {self.num_nodes}")
         print(f"> Number of edges: {self.num_edges}")
         print(f"> Number of sum parameters: {self.num_sum_params}")
+
+    def get_node_mars(self, ns: CircuitNodes):
+        pass
+
+    def get_node_flows(self, ns: CircuitNodes):
+        pass
 
     def enable_partial_evaluation(self, scopes: Union[Sequence[BitSet],Sequence[int]], 
                                   forward: bool = False, backward: bool = False, overwrite: bool = False):

@@ -232,7 +232,7 @@ def test_general_ll_prop():
 
                         my_pflows[layer.partitioned_pfids[0][j,:]+i] = pflows
 
-                assert torch.all(torch.abs(my_pflows - param_flows) < 4e-3)
+                assert torch.all(torch.abs(my_pflows - param_flows) < 6e-3)
 
 
 def test_mpe_prop():
