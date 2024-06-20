@@ -528,6 +528,12 @@ class TensorCircuit(nn.Module):
         print(f"> Number of sum parameters: {self.num_sum_params}")
 
     def get_node_mars(self, ns: CircuitNodes):
+        """
+        Retrieve the node values of `ns` from the previous forward pass.
+
+        :params ns: the target nodes
+        :type ns: CircuitNodes
+        """
         assert self.root_ns.contains(ns)
         assert hasattr(self, "node_mars") and self.node_mars is not None
         assert hasattr(self, "element_mars") and self.element_mars is not None
@@ -555,6 +561,12 @@ class TensorCircuit(nn.Module):
             return self.element_mars[nsid:neid,:].detach()
 
     def get_node_flows(self, ns: CircuitNodes, **kwargs):
+        """
+        Retrieve the node flows of `ns` from the previous backward pass.
+
+        :params ns: the target nodes
+        :type ns: CircuitNodes
+        """
         assert self.root_ns.contains(ns)
         assert hasattr(self, "node_flows") and self.node_flows is not None
         assert hasattr(self, "element_flows") and self.element_flows is not None
