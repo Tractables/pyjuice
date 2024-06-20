@@ -68,6 +68,15 @@ class Layer():
     def provided(self, var_name):
         return hasattr(self, var_name) and getattr(self, var_name) is not None
 
+    def is_sum(self):
+        return False
+
+    def is_prod(self):
+        return False
+
+    def is_input(self):
+        return False
+
     def _get_propagation_alg_kwargs(self, propagation_alg: str, **kwargs):
         if propagation_alg == "LL":
             return {"alpha": 0.0}

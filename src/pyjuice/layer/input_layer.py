@@ -620,6 +620,9 @@ class InputLayer(Layer, nn.Module):
                 scope: torch.cat(ids, dim = 0).to(self.params.device) for scope, ids in scope2localgids.items()
             }
 
+    def is_input(self):
+        return True
+
     def _reorder_nodes(self, nodes):
         node_set = set(nodes)
         reordered_untied_nodes = []

@@ -106,6 +106,9 @@ class TensorCircuit(nn.Module):
         self.default_propagation_alg = "LL" # Could be "LL", "MPE", or "GeneralLL"
         self.propagation_alg_kwargs = dict()
 
+        # Running parameters
+        self._run_params = dict()
+
     def to(self, device):
         super(TensorCircuit, self).to(device)
 
@@ -290,6 +293,11 @@ class TensorCircuit(nn.Module):
         :param input_layer_fn: Custom forward function for input layers; if it is a string, then try to call the corresponding member function of the input layers
         :type input_layer_fn: Optional[Union[str,Callable]]
         """
+
+        self._run_params["allow_modify_flows"] = allow_modify_flows
+        self._run_params["propagation_alg"] = propagation_alg
+        self._run_params["logspace_flows"] = logspace_flows
+        self._run_params["negate_pflows"] = negate_pflows
 
         assert self.node_mars is not None and self.element_mars is not None, "Should run forward path first."
         if input_layer_fn is None:
@@ -520,10 +528,65 @@ class TensorCircuit(nn.Module):
         print(f"> Number of sum parameters: {self.num_sum_params}")
 
     def get_node_mars(self, ns: CircuitNodes):
-        pass
+        assert self.root_ns.contains(ns)
+        assert hasattr(self, "node_mars") and self.node_mars is not None
+        assert hasattr(self, "element_mars") and self.element_mars is not None
 
-    def get_node_flows(self, ns: CircuitNodes):
-        pass
+        nsid, neid = ns._output_ind_range
+
+        if ns.is_sum() or ns.is_input():
+            return self.node_mars[nsid:neid,:].detach()
+        else:
+            assert ns.is_prod()
+
+            target_layer = None
+            for layer_group in self.inner_layer_groups:
+                for layer in layer_group:
+                    if layer.is_prod() and ns in layer.nodes:
+                        target_layer = layer
+                        break
+
+                if target_layer is not None:
+                    break
+
+            # Rerun the corresponding product layer to get the node values
+            layer(self.node_mars, self.element_mars)
+
+            return self.element_mars[nsid:neid,:].detach()
+
+    def get_node_flows(self, ns: CircuitNodes, **kwargs):
+        assert self.root_ns.contains(ns)
+        assert hasattr(self, "node_flows") and self.node_flows is not None
+        assert hasattr(self, "element_flows") and self.element_flows is not None
+
+        nsid, neid = ns._output_ind_range
+
+        if ns.is_sum() or ns.is_input():
+            return self.node_flows[nsid:neid,:].detach()
+        else:
+            assert ns.is_prod()
+
+            layer_id = None
+            for idx, layer_group in enumerate(self.inner_layer_groups):
+                for layer in layer_group:
+                    if layer.is_prod() and ns in layer.nodes:
+                        layer_id = idx
+                        break
+
+                if layer_id is not None:
+                    break
+
+            # Rerun the corresponding product layer to get the node values
+            self.inner_layer_groups[layer_id].forward(self.node_mars, self.element_mars, _for_backward = True)
+            self.inner_layer_groups[layer_id+1].backward(
+                self.node_flows, self.element_flows, self.node_mars, self.element_mars, self.params, 
+                param_flows = None, allow_modify_flows = self._run_params["allow_modify_flows"], 
+                propagation_alg = self._run_params["propagation_alg"], 
+                logspace_flows = self._run_params["logspace_flows"], 
+                negate_pflows = self._run_params["negate_pflows"], **kwargs
+            )
+
+            return self.element_flows[nsid:neid,:].detach()
 
     def enable_partial_evaluation(self, scopes: Union[Sequence[BitSet],Sequence[int]], 
                                   forward: bool = False, backward: bool = False, overwrite: bool = False):

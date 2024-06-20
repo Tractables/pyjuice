@@ -206,6 +206,13 @@ class CircuitNodes():
             source_ns = self.get_source_ns()
             return hasattr(source_ns, "_params") and source_ns._params is not None
 
+    def contains(self, ns: CircuitNodes):
+        for n in self:
+            if n == ns:
+                return True
+        
+        return False
+
     def _clear_tensor_circuit_hooks(self, recursive: bool = True):
 
         def clear_hooks(ns):

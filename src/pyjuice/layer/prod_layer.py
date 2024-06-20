@@ -253,6 +253,9 @@ class ProdLayer(Layer, nn.Module):
                 torch.cat(ids, dim = 0) if len(ids) > 0 else torch.zeros([0], dtype = torch.long) for ids in bk_fw_partition_local_ids
             ]
 
+    def is_prod(self):
+        return True
+
     @staticmethod
     # @triton.jit
     @FastJITFunction
