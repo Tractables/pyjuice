@@ -26,7 +26,8 @@ def _assign_cids_ind_target(ind_target, element_pointers, ind_b, num_samples):
 def sample_sum_layer_kernel(nids, cids, pids, node_mars, element_mars, params, node_samples, element_samples, 
                             ind_target, ind_n, ind_b, seed, block_size: tl.constexpr, batch_size: tl.constexpr, 
                             num_edges: tl.constexpr, num_samples: tl.constexpr, num_nblocks: tl.constexpr, BLOCK_S: tl.constexpr, 
-                            BLOCK_M: tl.constexpr, TILE_SIZE_M: tl.constexpr, BLOCK_K: tl.constexpr, TILE_SIZE_K: tl.constexpr):
+                            BLOCK_M: tl.constexpr, TILE_SIZE_M: tl.constexpr, BLOCK_K: tl.constexpr, TILE_SIZE_K: tl.constexpr,
+                            conditional: tl.constexpr):
     
     pid_s = tl.program_id(0) # ID of size-`BLOCK_S` batches
 
@@ -67,6 +68,9 @@ def sample_sum_layer_kernel(nids, cids, pids, node_mars, element_mars, params, n
     offs_child = tl.arange(0, BLOCK_K)
     mask_child = offs_child < num_edges
 
+    if conditional:
+        nmars = tl.load(node_mars + node_id, mask = mask_sample, other = 0.0)
+
     # Main loop over blocks of child nodes
     chids = tl.zeros([BLOCK_S], dtype = tl.int64) - 1
     for i in range(TILE_SIZE_K):
@@ -74,6 +78,13 @@ def sample_sum_layer_kernel(nids, cids, pids, node_mars, element_mars, params, n
         # Load parameters
         param_id = tl.load(pids + local_nids[None,:] * num_edges + offs_child[:,None], mask = (mask_sample[None,:] & mask_child[:,None]), other = 0)
         epars = tl.load(params + param_id + local_nid_offs[None,:], mask = (mask_sample[None,:] & mask_child[:,None]), other = 0.0)
+
+        if conditional:
+            # In this case, we use `param * cmar / nmar` as the "parameter"
+            emars_id = tl.load(cids + local_nids[None,:] * num_edges + offs_child[:,None], mask = (mask_sample[None,:] & mask_child[:,None]), other = 0)
+            emars = tl.load(params + emars_id, mask = (mask_sample[None,:] & mask_child[:,None]), other = 0.0)
+
+            epars = epars * tl.exp(emars - nmars[None,:])
         
         cum_probs = tl.cumsum(epars, axis = 0) # [BLOCK_K, BLOCK_S]
         local_chids = tl.sum((rnd_val[None,:] >= cum_probs).to(tl.int64), axis = 0) # [BLOCK_S]
@@ -94,7 +105,7 @@ def sample_sum_layer_kernel(nids, cids, pids, node_mars, element_mars, params, n
 
 
 def sample_sum_layer(layer, nids, cids, pids, node_mars, element_mars, params, node_samples, element_samples, 
-                     ind_target, ind_n, ind_b, block_size):
+                     ind_target, ind_n, ind_b, block_size, conditional):
     
     num_samples = ind_n.size(0)
     num_nblocks = nids.size(0)
@@ -114,7 +125,7 @@ def sample_sum_layer(layer, nids, cids, pids, node_mars, element_mars, params, n
     sample_sum_layer_kernel[grid](
         nids, cids, pids, node_mars, element_mars, params, node_samples, element_samples, 
         ind_target, ind_n, ind_b, seed, block_size, batch_size, num_edges, num_samples, num_nblocks, 
-        BLOCK_S, BLOCK_M, TILE_SIZE_M, BLOCK_K, TILE_SIZE_K
+        BLOCK_S, BLOCK_M, TILE_SIZE_M, BLOCK_K, TILE_SIZE_K, conditional
     )
 
     return None
@@ -194,7 +205,7 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
                     
                     sample_sum_layer(layer, nids, cids, pids, pc.node_mars, pc.element_mars, pc.params, 
                                      node_samples, element_samples, ind_target, ind_n, ind_b, 
-                                     layer.block_size)
+                                     layer.block_size, conditional)
 
                 # Clear completed nodes
                 node_samples[ind_n, ind_b] = -1
