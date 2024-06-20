@@ -74,6 +74,12 @@ class Distribution():
         """
         return False
 
+    def get_data_dtype(self):
+        """
+        Get the data dtype for the distribution.
+        """
+        return torch.float32
+
     @staticmethod
     def fw_mar_fn(*args, **kwargs):
         """

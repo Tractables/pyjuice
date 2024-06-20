@@ -16,6 +16,15 @@ class Layer():
 
     def __init__(self, nodes: Sequence[CircuitNodes], disable_block_size_check: bool = False) -> None:
 
+        # Nodes correspond to the current layer
+        self.nodes = nodes
+
+        # The set of unique scopes
+        self.scopes = []
+        for ns in self.nodes:
+            if ns.scope not in self.scopes:
+                self.scopes.append(ns.scope)
+
         if disable_block_size_check:
             self.block_size = None
         else:

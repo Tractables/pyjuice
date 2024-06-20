@@ -43,7 +43,6 @@ class ProdLayer(Layer, nn.Module):
                 break
         self.use_block_sparse_edges = use_block_sparse_edges
 
-        self.nodes = nodes
         self.block_size = nodes[0].block_size if self.use_block_sparse_edges else 1
 
         if global_nid_start is None:
@@ -58,6 +57,7 @@ class ProdLayer(Layer, nn.Module):
 
         self.num_nodes = layer_num_nblocks * self.block_size
         self.num_edges = layer_num_edges
+        self._layer_nid_range = (global_nid_start, global_nid_start + self.num_nodes)
 
         # Find a good strategy to partition the nodes into partitions according to their number of children 
         # to minimize total computation cost

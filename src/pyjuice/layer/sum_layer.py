@@ -49,8 +49,6 @@ class SumLayer(Layer, nn.Module):
         assert len(nodes) > 0, "No input node."
         assert len(nodes) == len(set(nodes)), "Input node list contains duplicates."
 
-        self.nodes = nodes
-
         layer_nid_start = global_nid_start
         layer_pid_start = global_pid_start
         layer_pfid_start = global_pfid_start

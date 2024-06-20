@@ -32,11 +32,11 @@ class InputLayer(Layer, nn.Module):
 
         assert len(nodes) == len(set(nodes)), "Input node list contains duplicates."
 
+        # Reorder input nodes such that for any tied nodes, its source nodes appear before them
+        nodes = self._reorder_nodes(nodes)
+
         nn.Module.__init__(self)
         Layer.__init__(self, nodes, disable_block_size_check = True)
-
-        # Reorder input nodes such that for any tied nodes, its source nodes appear before them
-        self.nodes = self._reorder_nodes(nodes)
 
         # Total number of variables
         self.pc_num_vars = pc_num_vars
@@ -450,7 +450,7 @@ class InputLayer(Layer, nn.Module):
             node_offset = self._output_ind_range[0]
 
             # Get all node ids with non-zero flow
-            nflow_xids, nflow_yids = torch.where(node_flows[sid:eid,:])
+            nflow_xids, nflow_yids = torch.where(node_flows[sid:eid,:] > 1e-8)
             num_activ_nodes = nflow_xids.size(0)
 
             if not self.provided("_sample_kernel"):
@@ -541,6 +541,12 @@ class InputLayer(Layer, nn.Module):
 
     def get_param_specs(self):
         return {"params": torch.Size([self.num_parameters])}
+
+    def get_data_dtype(self):
+        """
+        Get the data dtype for the distribution.
+        """
+        return self.nodes[0].get_data_dtype()
 
     def enable_partial_evaluation(self, fw_scopes: Optional[Union[Sequence[BitSet],Sequence[int]]] = None, 
                                   bk_scopes: Optional[Union[Sequence[BitSet],Sequence[int]]] = None, return_ids: bool = False):

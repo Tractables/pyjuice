@@ -35,20 +35,39 @@ def _pc_model_backward_hook(grad, pc, inputs, record_cudagraph, apply_cudagraph,
     return None
 
 
-def layer_iterator(pc, ret_layer_groups = False):
-    if ret_layer_groups:
-        yield pc.input_layer_group
+def layer_iterator(pc, reverse = False, ret_layer_groups = False, ignore_input_layers = False):
+    if not reverse:
+        if ret_layer_groups:
+            if not ignore_input_layers:
+                yield pc.input_layer_group
 
-        for layer_group in pc.inner_layer_groups:
-            yield layer_group
+            for layer_group in pc.inner_layer_groups:
+                yield layer_group
 
+        else:
+            if not ignore_input_layers:
+                for layer in pc.input_layer_group:
+                    yield layer
+
+            for layer_group in pc.inner_layer_groups:
+                for layer in layer_group:
+                    yield layer
     else:
-        for layer in pc.input_layer_group:
-            yield layer
+        if ret_layer_groups:
+            for layer_group in pc.inner_layer_groups[::-1]:
+                yield layer_group
 
-        for layer_group in pc.inner_layer_groups:
-            for layer in layer_group:
-                yield layer
+            if not ignore_input_layers:
+                yield pc.input_layer_group
+
+        else:
+            for layer_group in pc.inner_layer_groups[::-1]:
+                for layer in layer_group:
+                    yield layer
+
+            if not ignore_input_layers:
+                for layer in pc.input_layer_group:
+                    yield layer
 
 
 class TensorCircuit(nn.Module):
@@ -616,14 +635,14 @@ class TensorCircuit(nn.Module):
 
             return self.element_flows[nsid:neid,:].detach()
 
-    def layers(self, ret_layer_groups: bool = False):
+    def layers(self, reverse: bool = False, ret_layer_groups: bool = False, ignore_input_layers: bool = False):
         """
         Returns an iterator of all PC layers.
 
         :param ret_layer_groups: whether to return `LayerGroup`s instead of `Layer`s
         :type ret_layer_groups: bool
         """
-        return layer_iterator(self, ret_layer_groups = ret_layer_groups)
+        return layer_iterator(self, reverse = reverse, ret_layer_groups = ret_layer_groups, ignore_input_layers = ignore_input_layers)
 
     def enable_partial_evaluation(self, scopes: Union[Sequence[BitSet],Sequence[int]], 
                                   forward: bool = False, backward: bool = False, overwrite: bool = False):

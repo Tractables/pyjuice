@@ -153,5 +153,8 @@ class InputNodes(CircuitNodes):
                 **kwargs
             )
 
+    def get_data_dtype(self):
+        return self.dist.get_data_dtype()
+
     def __repr__(self):
         return f"InputNodes(num_node_blocks={self.num_node_blocks}, block_size={self.block_size}, dist={type(self.dist)})"

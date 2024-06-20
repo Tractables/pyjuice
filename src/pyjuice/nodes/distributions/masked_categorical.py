@@ -164,6 +164,12 @@ class MaskedCategorical(Distribution):
         """
         return True
 
+    def get_data_dtype(self):
+        """
+        Get the data dtype for the distribution.
+        """
+        return torch.long
+
     def _apply_mask(self, cat_params: torch.Tensor, num_nodes: int, mask_tensor: torch.Tensor):
         if self.mask_mode == "range":
             mask = torch.arange(self.num_cats).unsqueeze(0).expand(num_nodes, -1)

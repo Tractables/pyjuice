@@ -55,6 +55,12 @@ class Bernoulli(Distribution):
 
         return params[:,0].contiguous()
 
+    def get_data_dtype(self):
+        """
+        Get the data dtype for the distribution.
+        """
+        return torch.bool
+
     @staticmethod
     def fw_mar_fn(local_offsets, data, params_ptr, s_pids, metadata_ptr, s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE):
         probs = tl.load(params_ptr + s_pids, mask = mask, other = 0)

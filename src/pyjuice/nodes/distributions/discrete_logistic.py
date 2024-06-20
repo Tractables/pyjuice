@@ -72,6 +72,12 @@ class DiscreteLogistic(Distribution):
 
         return torch.stack((mus, ss), dim = 1).reshape(-1).contiguous()
 
+    def get_data_dtype(self):
+        """
+        Get the data dtype for the distribution.
+        """
+        return torch.float32
+
     @staticmethod
     def fw_mar_fn(local_offsets, data, params_ptr, s_pids, metadata_ptr, s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE):
         # Get `val_range` and `num_cats` from `metadata`
