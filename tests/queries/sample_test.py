@@ -1,6 +1,8 @@
 import pyjuice as juice
 import torch
+import torchvision
 import numpy as np
+from torch.utils.data import TensorDataset, DataLoader
 
 import pyjuice.nodes.distributions as dists
 from pyjuice.utils import BitSet
@@ -37,5 +39,48 @@ def test_sample():
     assert ((samples >= 0) & (samples < 2)).all()
 
 
+def test_sample_hclt():
+
+    device = torch.device("cuda:0")
+
+    train_dataset = torchvision.datasets.MNIST(root = "./examples/data", train = True, download = True)
+    test_dataset = torchvision.datasets.MNIST(root = "./examples/data", train = False, download = True)
+
+    train_data = train_dataset.data.reshape(60000, 28*28)
+    test_data = test_dataset.data.reshape(10000, 28*28)
+
+    num_features = train_data.size(1)
+
+    train_loader = DataLoader(
+        dataset = TensorDataset(train_data),
+        batch_size = 512,
+        shuffle = True,
+        drop_last = True
+    )
+    test_loader = DataLoader(
+        dataset = TensorDataset(test_data),
+        batch_size = 512,
+        shuffle = False,
+        drop_last = True
+    )
+
+    ns = juice.structures.HCLT(
+        train_data.float().to(device), 
+        num_bins = 32, 
+        sigma = 0.5 / 32, 
+        num_latents = 128, 
+        chunk_size = 32
+    )
+    ns.init_parameters(perturbation = 2.0)
+    pc = juice.TensorCircuit(ns)
+
+    pc.to(device)
+
+    samples = juice.queries.sample(pc, num_samples = 16)
+
+    assert ((samples >= 0) & (samples < 256)).all()
+
+
 if __name__ == "__main__":
     test_sample()
+    test_sample_hclt()

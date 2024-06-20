@@ -184,6 +184,7 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
 
             # Iterate over sum layers in the current layer group
             for layer in layer_group:
+
                 # Gather the indices to be processed
                 lsid, leid = layer._layer_nid_range
                 ind_n, ind_b = torch.where((node_samples >= lsid) & (node_samples < leid))
@@ -234,14 +235,27 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
                     local_nid_offsets = ((global_cids[:,None] - nids[None,:]) * is_match.long()).sum(dim = 1)
 
                     target_nids = cids[local_nids,:] + local_nid_offsets[:,None]
+                    target_cids = cids[local_nids,:]
 
                     target_idx = node_pointers[ind_b] + (torch.cumsum(mask, dim = 0)[ind_n, ind_b] - 1) * cids.size(1)
 
-                    target_nids = target_nids[is_match.any(dim = 1),:]
-                    target_idx = target_idx[is_match.any(dim = 1)]
+                    if target_idx.max() + cids.size(1) > node_samples.size(0):
+
+                        node_samples_new = torch.zeros([target_idx.max() + cids.size(1), num_samples], dtype = torch.long, device = pc.device)
+                        node_samples_new[:,:] = -1
+
+                        node_samples_new[:node_samples.size(0),:] = node_samples
+                        node_samples = node_samples_new
+
+                    match_filter = is_match.any(dim = 1)
+                    target_nids = target_nids[match_filter,:]
+                    target_cids = target_cids[match_filter,:]
+                    target_idx = target_idx[match_filter]
+                    target_b = ind_b[match_filter]
 
                     for i in range(cids.size(1)):
-                        node_samples[target_idx+i, ind_b] = target_nids[:,i]
+                        cmask = target_cids[:,i] != 0
+                        node_samples[target_idx[cmask]+i, target_b[cmask]] = target_nids[cmask,i]
 
                     node_pointers = (node_samples != -1).sum(dim = 0)
 
