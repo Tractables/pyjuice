@@ -39,6 +39,43 @@ def test_sample():
     assert ((samples >= 0) & (samples < 2)).all()
 
 
+def test_sample_correctness():
+
+    device = torch.device("cuda:0")
+
+    with juice.set_block_size(block_size = 1):
+        ni0 = inputs(0, num_node_blocks = 2, dist = dists.Categorical(num_cats = 2))
+        ni1 = inputs(1, num_node_blocks = 2, dist = dists.Categorical(num_cats = 2))
+
+        np = multiply(ni0, ni1)
+
+        ns = summate(np, num_node_blocks = 1)
+
+    ns.init_parameters(perturbation = 1.0)
+
+    ns._params[0,0,0] = 0.2
+    ns._params[1,0,0] = 0.8
+
+    ni0._params[0] = 0.999
+    ni0._params[1] = 0.001
+    ni0._params[2] = 0.001
+    ni0._params[3] = 0.999
+
+    ni1._params[0] = 0.001
+    ni1._params[1] = 0.999
+    ni1._params[2] = 0.999
+    ni1._params[3] = 0.001
+
+    pc = juice.TensorCircuit(ns)
+
+    pc.to(device)
+
+    samples = juice.queries.sample(pc, num_samples = 512)
+
+    assert samples[0,:].float().mean() < 0.4
+    assert samples[1,:].float().mean() > 0.6
+
+
 def test_sample_hclt():
 
     device = torch.device("cuda:0")
@@ -83,4 +120,5 @@ def test_sample_hclt():
 
 if __name__ == "__main__":
     test_sample()
+    test_sample_correctness()
     test_sample_hclt()
