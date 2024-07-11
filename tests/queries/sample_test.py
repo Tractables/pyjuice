@@ -72,8 +72,8 @@ def test_sample_correctness():
 
     samples = juice.queries.sample(pc, num_samples = 512)
 
-    assert samples[0,:].float().mean() < 0.4
-    assert samples[1,:].float().mean() > 0.6
+    assert samples[:,0].float().mean() < 0.4
+    assert samples[:,1].float().mean() > 0.6
 
 
 def test_sample_hclt():

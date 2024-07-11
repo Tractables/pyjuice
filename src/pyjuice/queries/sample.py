@@ -272,4 +272,4 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
         seed = random.randint(0, 2**31)
         layer.sample(samples, pc.node_flows, seed = seed)
 
-    return samples
+    return samples.permute(1, 0).contiguous()
