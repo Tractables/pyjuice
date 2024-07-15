@@ -7,6 +7,9 @@ This tutorial demonstrates how to construct an HMM with :code:`pyjuice.inputs`, 
 
 # sphinx_gallery_thumbnail_path = 'imgs/juice.png'
 
+# %% 
+# Let's start by importing the necessary packages.
+
 import torch
 import pyjuice as juice
 import pyjuice.nodes.distributions as dists
