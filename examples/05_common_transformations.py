@@ -7,6 +7,9 @@ In this tutorial, you will learn how to use the built-in structural transformati
 
 # sphinx_gallery_thumbnail_path = 'imgs/juice.png'
 
+# %% 
+# Let's start by importing the necessary packages.
+
 import torch
 import pyjuice as juice
 import pyjuice.nodes.distributions as dists
