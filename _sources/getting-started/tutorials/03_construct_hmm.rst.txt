@@ -23,23 +23,33 @@ Construct an HMM
 
 This tutorial demonstrates how to construct an HMM with :code:`pyjuice.inputs`, :code:`pyjuice.multiply`, and :code:`pyjuice.summate`.
 
-.. GENERATED FROM PYTHON SOURCE LINES 7-14
+.. GENERATED FROM PYTHON SOURCE LINES 7-10
 
 .. code-block:: Python
 
 
     # sphinx_gallery_thumbnail_path = 'imgs/juice.png'
 
+
+.. GENERATED FROM PYTHON SOURCE LINES 11-12
+
+Let's start by importing the necessary packages.
+
+.. GENERATED FROM PYTHON SOURCE LINES 12-17
+
+.. code-block:: Python
+
+
     import torch
     import pyjuice as juice
     import pyjuice.nodes.distributions as dists
 
 
-.. GENERATED FROM PYTHON SOURCE LINES 15-16
+.. GENERATED FROM PYTHON SOURCE LINES 18-19
 
 We start with specifying the structural parameters of the HMM
 
-.. GENERATED FROM PYTHON SOURCE LINES 16-21
+.. GENERATED FROM PYTHON SOURCE LINES 19-24
 
 .. code-block:: Python
 
@@ -49,12 +59,12 @@ We start with specifying the structural parameters of the HMM
     num_emits = 4023
 
 
-.. GENERATED FROM PYTHON SOURCE LINES 22-24
+.. GENERATED FROM PYTHON SOURCE LINES 25-27
 
 An important parameter to be determined is the block size, which is crucial for PyJuice to compile efficient models.
 Specifically, we want the block size to be large enough so that PyJuice can leverage block-based parallelization.
 
-.. GENERATED FROM PYTHON SOURCE LINES 24-27
+.. GENERATED FROM PYTHON SOURCE LINES 27-30
 
 .. code-block:: Python
 
@@ -62,11 +72,11 @@ Specifically, we want the block size to be large enough so that PyJuice can leve
     block_size = min(juice.utils.util.max_cdf_power_of_2(num_latents), 1024)
 
 
-.. GENERATED FROM PYTHON SOURCE LINES 28-29
+.. GENERATED FROM PYTHON SOURCE LINES 31-32
 
 The number of node blocks is derived accordingly
 
-.. GENERATED FROM PYTHON SOURCE LINES 29-32
+.. GENERATED FROM PYTHON SOURCE LINES 32-35
 
 .. code-block:: Python
 
@@ -74,12 +84,12 @@ The number of node blocks is derived accordingly
     num_node_blocks = num_latents // block_size
 
 
-.. GENERATED FROM PYTHON SOURCE LINES 33-35
+.. GENERATED FROM PYTHON SOURCE LINES 36-38
 
 We use the context manager `set_block_size` to set the block size of all PC nodes.
 In the following we assume `T = seq_length` and `K = num_latents`
 
-.. GENERATED FROM PYTHON SOURCE LINES 35-61
+.. GENERATED FROM PYTHON SOURCE LINES 38-64
 
 .. code-block:: Python
 
@@ -110,7 +120,7 @@ In the following we assume `T = seq_length` and `K = num_latents`
         ns = juice.summate(curr_zs, num_node_blocks = 1, block_size = 1)
 
 
-.. GENERATED FROM PYTHON SOURCE LINES 62-68
+.. GENERATED FROM PYTHON SOURCE LINES 65-71
 
 Note that :code:`ns.duplication` is a handy function to create duplications of existing node vectors. 
 For input nodes (e.g., :code:`ns_input.duplicate(var, tie_params = True)`) we can specify it to define on a new variable. 

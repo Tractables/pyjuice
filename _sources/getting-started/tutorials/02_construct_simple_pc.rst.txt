@@ -23,33 +23,43 @@ Construct Simple PCs
 
 In this tutorial, you will learn about the basic APIs to construct PCs.
 
-.. GENERATED FROM PYTHON SOURCE LINES 7-14
+.. GENERATED FROM PYTHON SOURCE LINES 7-10
 
 .. code-block:: Python
 
 
     # sphinx_gallery_thumbnail_path = 'imgs/juice.png'
 
+
+.. GENERATED FROM PYTHON SOURCE LINES 11-12
+
+Let's start by importing the necessary packages.
+
+.. GENERATED FROM PYTHON SOURCE LINES 12-17
+
+.. code-block:: Python
+
+
     import torch
     import pyjuice as juice
     import pyjuice.nodes.distributions as dists
 
 
-.. GENERATED FROM PYTHON SOURCE LINES 15-17
+.. GENERATED FROM PYTHON SOURCE LINES 18-20
 
 A PC can be created using :code:`pyjuice.inputs`, :code:`pyjuice.multiply`, and :code:`pyjuice.summate`, which create input node vectors, product node vectors, and sum node vectors, respectively.
 The goal of this tutorial is to get you familiar with these functions.
 
-.. GENERATED FROM PYTHON SOURCE LINES 19-21
+.. GENERATED FROM PYTHON SOURCE LINES 22-24
 
 Input nodes
 -----------
 
-.. GENERATED FROM PYTHON SOURCE LINES 23-24
+.. GENERATED FROM PYTHON SOURCE LINES 26-27
 
 Let us start with :code:`pyjuice.inputs`.
 
-.. GENERATED FROM PYTHON SOURCE LINES 24-27
+.. GENERATED FROM PYTHON SOURCE LINES 27-30
 
 .. code-block:: Python
 
@@ -57,7 +67,7 @@ Let us start with :code:`pyjuice.inputs`.
     ni0 = juice.inputs(var = 0, num_node_blocks = 4, block_size = 2, dist = dists.Categorical(num_cats = 4))
 
 
-.. GENERATED FROM PYTHON SOURCE LINES 28-35
+.. GENERATED FROM PYTHON SOURCE LINES 31-38
 
 The above line defines :code:`num_node_blocks * block_size = 8` input nodes on variable ID :code:`var = 0` featuring Categorical distributions with 4 categories (i.e., :code:`dists.Categorical(num_cats = 4)`). The set of input distributions are defined under :code:`pyjuice.nodes.distributions`.
 
@@ -67,16 +77,16 @@ Although using larger block sizes when defining input node vectors do not have a
 
 Note that :code:`block_size` has to be a power of 2.
 
-.. GENERATED FROM PYTHON SOURCE LINES 37-39
+.. GENERATED FROM PYTHON SOURCE LINES 40-42
 
 Product nodes
 -------------
 
-.. GENERATED FROM PYTHON SOURCE LINES 41-42
+.. GENERATED FROM PYTHON SOURCE LINES 44-45
 
 Let us define another input node vector and a product node vector that take the input nodes as children.
 
-.. GENERATED FROM PYTHON SOURCE LINES 42-48
+.. GENERATED FROM PYTHON SOURCE LINES 45-51
 
 .. code-block:: Python
 
@@ -87,7 +97,7 @@ Let us define another input node vector and a product node vector that take the 
     ms = juice.multiply(ni0, ni1, edge_ids = edge_ids)
 
 
-.. GENERATED FROM PYTHON SOURCE LINES 49-59
+.. GENERATED FROM PYTHON SOURCE LINES 52-62
 
 :code:`ms` defines a product node vector where every node have two children: the first child is a node in :code:`ni0` and the second child is a node in :code:`ni1`.
 :code:`edge_ids` specifies which child nodes do every node in :code:`ms` connects to. Specifically, :code:`edge_ids` has size :code:`[# product node blocks, # child node vectors]`, so in this case, it should has size :code:`[4, 2]`.
@@ -100,7 +110,7 @@ For :code:`pyjuice.multiply`, if two node blocks are connected (as defined by :c
 
 When we do not provide the :code:`edge_ids`, PyJuice assumes it to be the following (we can only use this shortcut when the child node vectors have the same :code:`num_node_blocks` and :code:`block_size`):
 
-.. GENERATED FROM PYTHON SOURCE LINES 59-64
+.. GENERATED FROM PYTHON SOURCE LINES 62-67
 
 .. code-block:: Python
 
@@ -110,16 +120,16 @@ When we do not provide the :code:`edge_ids`, PyJuice assumes it to be the follow
     edge_ids = torch.arange(0, num_node_blocks)[:,None].repeat(1, num_child_node_vectors)
 
 
-.. GENERATED FROM PYTHON SOURCE LINES 65-67
+.. GENERATED FROM PYTHON SOURCE LINES 68-70
 
 Sum nodes
 ---------
 
-.. GENERATED FROM PYTHON SOURCE LINES 69-70
+.. GENERATED FROM PYTHON SOURCE LINES 72-73
 
 Finally, we introduce :code:`pyjuice.summate`, which is used to define sum node vectors.
 
-.. GENERATED FROM PYTHON SOURCE LINES 70-74
+.. GENERATED FROM PYTHON SOURCE LINES 73-77
 
 .. code-block:: Python
 
@@ -128,7 +138,7 @@ Finally, we introduce :code:`pyjuice.summate`, which is used to define sum node 
     ns = juice.summate(ms, num_node_blocks = 6, block_size = 2, edge_ids = edge_ids)
 
 
-.. GENERATED FROM PYTHON SOURCE LINES 75-85
+.. GENERATED FROM PYTHON SOURCE LINES 78-88
 
 Similar to :code:`pyjuice.multiply`, the positional arguments to :code:`pyjuice.summate` are the list of input node vectors (here we only provide :code:`ms`).
 :code:`num_node_blocks` and :code:`block_size` are the number of node blocks and the size of each node block, respectively.
@@ -141,7 +151,7 @@ That is, in the case where both :code:`ns` and :code:`ms` have block size 2, eve
 
 If :code:`edge_ids` is not provided, we assume that all nodes in the sum node vector are connected to all child nodes:
 
-.. GENERATED FROM PYTHON SOURCE LINES 85-86
+.. GENERATED FROM PYTHON SOURCE LINES 88-89
 
 .. code-block:: Python
 
