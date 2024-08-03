@@ -12,7 +12,7 @@ from typing import Sequence, List, Tuple, Optional
 # In the latest triton, math functions were shuffled around into different modules:
 # https://github.com/openai/triton/pull/3172
 if hasattr(tl.extra.cuda, "libdevice"):
-    tlmath = tl.extra.cuda.libdevic
+    tlmath = tl.extra.cuda.libdevice
 else:
     tlmath = tl.math
 
