@@ -19,7 +19,7 @@ Feel free to explore the examples and learn how to use PyJuice for your projects
 
 .. raw:: html
 
-    <div class="sphx-glr-thumbcontainer" tooltip="This tutorial demonstrates how to create a Hidden Chow-Liu Tree (https://arxiv.org/pdf/2106.022...">
+    <div class="sphx-glr-thumbcontainer" tooltip="This tutorial demonstrates how to create a Hidden Chow-Liu Tree (https://arxiv.org/pdf/2106.02264.pdf) using pyjuice.structures and train the model with mini-batch EM and full-batch EM. For simplicity, we use the MNIST dataset as an example. ">
 
 .. only:: html
 
@@ -53,7 +53,7 @@ Feel free to explore the examples and learn how to use PyJuice for your projects
 
 .. raw:: html
 
-    <div class="sphx-glr-thumbcontainer" tooltip="This tutorial demonstrates how to construct an HMM with pyjuice.inputs, pyjuice.multiply, and p...">
+    <div class="sphx-glr-thumbcontainer" tooltip="This tutorial demonstrates how to construct an HMM with pyjuice.inputs, pyjuice.multiply, and pyjuice.summate.">
 
 .. only:: html
 
@@ -70,7 +70,7 @@ Feel free to explore the examples and learn how to use PyJuice for your projects
 
 .. raw:: html
 
-    <div class="sphx-glr-thumbcontainer" tooltip="Assume we have constructed and trained a PC following the previous tutorials. This tutorial dem...">
+    <div class="sphx-glr-thumbcontainer" tooltip="Assume we have constructed and trained a PC following the previous tutorials. This tutorial demonstrates how to query the PC, i.e., ask probabilistic queries about the distribution encoded by the PC.">
 
 .. only:: html
 
@@ -87,7 +87,7 @@ Feel free to explore the examples and learn how to use PyJuice for your projects
 
 .. raw:: html
 
-    <div class="sphx-glr-thumbcontainer" tooltip="In this tutorial, you will learn how to use the built-in structural transformation algorithms t...">
+    <div class="sphx-glr-thumbcontainer" tooltip="In this tutorial, you will learn how to use the built-in structural transformation algorithms to easily create and manipulate PCs.">
 
 .. only:: html
 

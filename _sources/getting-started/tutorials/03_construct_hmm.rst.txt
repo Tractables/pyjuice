@@ -144,6 +144,10 @@ For sum node vectors, :code:`ns.duplicate` allows us to specify a new list of ch
 
       :download:`Download Python source code: 03_construct_hmm.py <03_construct_hmm.py>`
 
+    .. container:: sphx-glr-download sphx-glr-download-zip
+
+      :download:`Download zipped: 03_construct_hmm.zip <03_construct_hmm.zip>`
+
 
 .. only:: html
 

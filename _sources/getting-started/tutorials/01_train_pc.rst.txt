@@ -265,6 +265,10 @@ Similarly, an example training loop for full-batch EM is given as follows.
 
       :download:`Download Python source code: 01_train_pc.py <01_train_pc.py>`
 
+    .. container:: sphx-glr-download sphx-glr-download-zip
+
+      :download:`Download zipped: 01_train_pc.zip <01_train_pc.zip>`
+
 
 .. only:: html
 

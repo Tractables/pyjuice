@@ -172,6 +172,10 @@ If :code:`edge_ids` is not provided, we assume that all nodes in the sum node ve
 
       :download:`Download Python source code: 02_construct_simple_pc.py <02_construct_simple_pc.py>`
 
+    .. container:: sphx-glr-download sphx-glr-download-zip
+
+      :download:`Download zipped: 02_construct_simple_pc.zip <02_construct_simple_pc.zip>`
+
 
 .. only:: html
 

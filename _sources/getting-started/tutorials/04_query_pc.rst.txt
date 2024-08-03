@@ -212,6 +212,10 @@ Similar to the marginal query, for categorical data, we can also feed *soft* evi
 
       :download:`Download Python source code: 04_query_pc.py <04_query_pc.py>`
 
+    .. container:: sphx-glr-download sphx-glr-download-zip
+
+      :download:`Download zipped: 04_query_pc.zip <04_query_pc.zip>`
+
 
 .. only:: html
 

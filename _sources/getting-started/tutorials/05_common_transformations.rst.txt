@@ -249,6 +249,10 @@ There are two parameters to the function. :code:`max_target_block_size` specifie
 
       :download:`Download Python source code: 05_common_transformations.py <05_common_transformations.py>`
 
+    .. container:: sphx-glr-download sphx-glr-download-zip
+
+      :download:`Download zipped: 05_common_transformations.zip <05_common_transformations.zip>`
+
 
 .. only:: html
 
