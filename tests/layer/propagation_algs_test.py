@@ -15,6 +15,8 @@ import pytest
 
 
 def test_ll_prop():
+
+    torch.manual_seed(82392)
     
     device = torch.device("cuda:0")
 

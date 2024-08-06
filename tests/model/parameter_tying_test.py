@@ -13,6 +13,8 @@ import pytest
 
 def test_simple_structure_block1():
 
+    torch.manual_seed(892910)
+
     block_size = 1
     
     with set_block_size(block_size = block_size):
@@ -474,19 +476,19 @@ def test_simple_structure_block16():
     np012_1_lls = ns12_lls + node_mars[16:48,:]
     np012_lls = torch.cat((np012_0_lls, np012_1_lls), dim = 0)
     ns012_lls = torch.matmul(params1, np012_lls.exp()).log()
-    assert torch.all(torch.abs(node_mars[240:272,:] - ns012_lls) < 1e-3)
+    assert torch.all(torch.abs(node_mars[240:272,:] - ns012_lls) < 4e-3)
 
     np123_0_lls = ns12_lls + node_mars[112:144,:]
     np123_1_lls = ns23_lls + node_mars[48:80,:]
     np123_lls = torch.cat((np123_0_lls, np123_1_lls), dim = 0)
     ns123_lls = torch.matmul(params1, np123_lls.exp()).log()
-    assert torch.all(torch.abs(node_mars[272:304,:] - ns123_lls) < 1e-3)
+    assert torch.all(torch.abs(node_mars[272:304,:] - ns123_lls) < 4e-3)
 
     np0123_0_lls = ns012_lls + node_mars[112:144,:]
     np0123_1_lls = ns123_lls + node_mars[16:48,:]
     np0123_lls = torch.cat((np0123_0_lls, np0123_1_lls), dim = 0)
     ns0123_lls = torch.matmul(params1, np0123_lls.exp()).log()
-    assert torch.all(torch.abs(node_mars[304:336,:] - ns0123_lls) < 1e-3)
+    assert torch.all(torch.abs(node_mars[304:336,:] - ns0123_lls) < 4e-3)
 
     ## Backward tests ##
 

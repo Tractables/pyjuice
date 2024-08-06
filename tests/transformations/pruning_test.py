@@ -121,7 +121,7 @@ def test_pruning_by_flow():
     # If there are more samples, just do this iteratively for 
     # all batches. The flows will be accumulated automatically.
     lls = pc(data)
-    pc.backward(data.permute(1, 0))
+    pc.backward(data)
 
     pc.update_parameters() # Map the flows back to their corresponding nodes
     pc.update_param_flows()

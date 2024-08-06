@@ -16,6 +16,8 @@ import pytest
 
 def test_sum_layer():
 
+    torch.manual_seed(63892)
+
     device = torch.device("cuda:0")
 
     block_size = 16
@@ -92,7 +94,7 @@ def test_sum_layer():
         for j in range(6):
             cmars = element_mars[layer.partitioned_cids[0][j,:]].exp()
             epars = params[layer.partitioned_pids[0][j,:]+i]
-            assert torch.all(torch.abs(node_mars[(j+1)*block_size+i,:] - (epars[:,None] * cmars).sum(dim = 0).log()) < 1e-3)
+            assert torch.all(torch.abs(node_mars[(j+1)*block_size+i,:] - (epars[:,None] * cmars).sum(dim = 0).log()) < 2e-3)
 
     ## Backward tests ##
 

@@ -328,6 +328,8 @@ def test_discrete_logistic_nodes():
 
 def test_discrete_logistic_nodes_behavior():
 
+    torch.manual_seed(239829)
+
     ni0 = inputs(0, num_nodes = 2, dist = dists.DiscreteLogistic(val_range = [-1.0, 1.0], num_cats = 5))
     ni1 = inputs(1, num_nodes = 2, dist = dists.DiscreteLogistic(val_range = [-1.0, 1.0], num_cats = 5))
     ni2 = inputs(2, num_nodes = 2, dist = dists.DiscreteLogistic(val_range = [-1.0, 1.0], num_cats = 5))
