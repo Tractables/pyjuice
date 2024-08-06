@@ -539,6 +539,40 @@ class InputLayer(Layer, nn.Module):
                 else:
                     raise NotImplementedError("CPU minibatch em fn for input nodes is not implemented.")
 
+    def add_missing_flows(self, node_flows: torch.Tensor, logspace_flows: bool = False, scale: float = 1.0):
+        """
+        node_flows: [num_nodes]
+        """
+
+        if "cuda" in self.device.type:
+            node_offset = self._output_ind_range[0]
+            layer_num_nodes = self._output_ind_range[1] - self._output_ind_range[0]
+
+            BLOCK_SIZE = 1024
+
+            grid = (triton.cdiv(layer_num_nodes, BLOCK_SIZE),)
+
+            if not self.provided("_missing_flows_kernel"):
+                assert self.bk_flow_mask_fn is not None, "The target distribution doesn't have `bk_flow_mask_fn` implemented."
+                self._missing_flows_kernel = self._compile_triton_kernel(self._missing_flows_kernel_template, flow_fn = self.bk_flow_mask_fn)
+
+            self._missing_flows_kernel[grid](
+                node_flows_ptr = node_flows,
+                params_ptr = self.params,
+                param_flows_ptr = self.param_flows,
+                s_pids_ptr = self.s_pids,
+                s_pfids_ptr = self.s_pfids,
+                metadata_ptr = self.metadata, 
+                s_mids_ptr = self.s_mids, 
+                scale = scale,
+                node_offset = node_offset,
+                layer_num_nodes = layer_num_nodes,
+                logspace_flows = logspace_flows,
+                BLOCK_SIZE = BLOCK_SIZE
+            )
+        else:
+            raise NotImplementedError("CPU minibatch missing flow fn for input nodes is not implemented.")
+
     def get_param_specs(self):
         return {"params": torch.Size([self.num_parameters])}
 
@@ -811,6 +845,34 @@ class InputLayer(Layer, nn.Module):
 
         if logspace_flows:
             flows = tl.exp(flows)
+
+        flow_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
+                s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE)
+
+    @staticmethod
+    def _missing_flows_kernel_template(node_flows_ptr, params_ptr, param_flows_ptr, s_pids_ptr, s_pfids_ptr,
+                                       metadata_ptr, s_mids_ptr, scale, node_offset: tl.constexpr, layer_num_nodes: tl.constexpr, 
+                                       logspace_flows: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(axis = 0)
+        block_start = pid * BLOCK_SIZE
+
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < layer_num_nodes
+
+        local_offsets = offsets
+
+        s_pids = tl.load(s_pids_ptr + offsets, mask = mask, other = 0)
+        s_pfids = tl.load(s_pfids_ptr + offsets, mask = mask, other = 0)
+
+        ns_offsets = offsets + node_offset
+        flows = tl.load(node_flows_ptr + ns_offsets, mask = mask, other = 0)
+
+        if logspace_flows:
+            flows = tl.exp(flows)
+
+        flows *= scale
+
+        missing_mask = True
 
         flow_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
                 s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE)
