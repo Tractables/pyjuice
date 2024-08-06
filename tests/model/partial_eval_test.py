@@ -92,7 +92,7 @@ def test_partial_eval_backward():
     data = torch.randint(0, 2, [16, 4]).to(device)
 
     lls, cache = pc(data, return_cache = True)
-    cache = pc.backward(data.permute(1, 0), cache = cache, return_cache = True, allow_modify_flows = False)
+    cache = pc.backward(data, cache = cache, return_cache = True, allow_modify_flows = False)
     new_cache = deepcopy(cache)
     new_cache["node_flows"][3:5,:] = 0.0
     new_cache["node_flows"][9:11,:] = 0.0
@@ -100,7 +100,7 @@ def test_partial_eval_backward():
     scopes = get_subsumed_scopes(n, [1])
     pc.enable_partial_evaluation(scopes = scopes, forward = False, backward = True)
 
-    cache2 = pc.backward(data.permute(1, 0), cache = new_cache, return_cache = True)
+    cache2 = pc.backward(data, cache = new_cache, return_cache = True)
 
     assert torch.all((cache["node_flows"] - cache2["node_flows"]).abs() < 1e-4)
 

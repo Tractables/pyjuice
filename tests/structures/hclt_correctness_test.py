@@ -9,6 +9,8 @@ import pyjuice.nodes.distributions as dists
 
 def test_hclt_forward():
 
+    torch.manual_seed(238900)
+
     device = torch.device("cuda:0")
 
     train_dataset = torchvision.datasets.MNIST(root = "./examples/data", train = True, download = True)
@@ -38,7 +40,7 @@ def test_hclt_forward():
     data_cpu = batch_data.cpu().long()
     batch_size = batch_data.size(0)
 
-    lls = pc(batch_data)
+    lls = pc(batch_data, force_use_fp32 = True)
 
     node_mars = pc.node_mars.cpu()
 
@@ -76,9 +78,10 @@ def test_hclt_forward():
                 nmars = nmars.log() + emars_max
 
                 sid, eid = ns._output_ind_range
-                assert torch.all(torch.abs(nmars - node_mars[sid:eid,:]) < 4e-3)
+                
+                assert torch.all(torch.abs(nmars - node_mars[sid:eid,:]) < 1e-3)
 
-                ns2mars[ns] = nmars
+                ns2mars[ns] = node_mars[sid:eid,:]
 
             else:
                 assert ns == root_ns
@@ -98,6 +101,8 @@ def test_hclt_forward():
 
 
 def test_hclt_single_layer_backward():
+
+    torch.manual_seed(84738)
 
     device = torch.device("cuda:0")
 
@@ -131,7 +136,7 @@ def test_hclt_single_layer_backward():
     pc.init_param_flows(flows_memory = 0.0)
 
     lls = pc(batch_data)
-    pc.backward(batch_data.permute(1, 0), allow_modify_flows = False)
+    pc.backward(batch_data, allow_modify_flows = False)
 
     pc.update_param_flows()
 
@@ -191,6 +196,8 @@ def test_hclt_single_layer_backward():
 
 def test_hclt_single_layer_backward_general_em():
 
+    torch.manual_seed(62328)
+
     device = torch.device("cuda:0")
 
     train_dataset = torchvision.datasets.MNIST(root = "./examples/data", train = True, download = True)
@@ -225,7 +232,7 @@ def test_hclt_single_layer_backward_general_em():
     pc.init_param_flows(flows_memory = 0.0)
 
     lls = pc(batch_data, propagation_alg = "GeneralLL", alpha = alpha)
-    pc.backward(batch_data.permute(1, 0), allow_modify_flows = False,
+    pc.backward(batch_data, allow_modify_flows = False,
                 propagation_alg = "GeneralLL", alpha = alpha)
 
     pc.update_param_flows()
@@ -287,6 +294,8 @@ def test_hclt_single_layer_backward_general_em():
 
 def test_hclt_backward():
 
+    torch.manual_seed(3467)
+
     device = torch.device("cuda:0")
 
     train_dataset = torchvision.datasets.MNIST(root = "./examples/data", train = True, download = True)
@@ -319,7 +328,7 @@ def test_hclt_backward():
     pc.init_param_flows(flows_memory = 0.0)
 
     lls = pc(batch_data)
-    pc.backward(batch_data.permute(1, 0), allow_modify_flows = False)
+    pc.backward(batch_data, allow_modify_flows = False)
 
     pc.update_param_flows()
 
@@ -509,6 +518,8 @@ def test_hclt_backward():
 
 def test_hclt_em():
 
+    torch.manual_seed(76767)
+
     device = torch.device("cuda:0")
 
     train_dataset = torchvision.datasets.MNIST(root = "./examples/data", train = True, download = True)
@@ -539,7 +550,7 @@ def test_hclt_em():
     batch_size = batch_data.size(0)
 
     lls = pc(batch_data)
-    pc.backward(batch_data.permute(1, 0), allow_modify_flows = False)
+    pc.backward(batch_data, allow_modify_flows = False)
 
     ns2old_params = dict()
     for ns in root_ns:

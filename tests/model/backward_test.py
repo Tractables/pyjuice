@@ -35,7 +35,7 @@ def test_backward():
 
     lls = pc(data)
 
-    pc.backward(data.permute(1, 0), allow_modify_flows = False)
+    pc.backward(data, allow_modify_flows = False)
 
     ## Unit tests for backward pass ##
 
@@ -147,7 +147,7 @@ def test_non_sd_pc_backward():
 
     lls = pc(data)
 
-    pc.backward(data.permute(1, 0), allow_modify_flows = False)
+    pc.backward(data, allow_modify_flows = False)
 
     ## Unit tests for backward pass ##
 
@@ -202,7 +202,7 @@ def test_sparse_pc_backward():
 
     lls = pc(data)
 
-    pc.backward(data.permute(1, 0), allow_modify_flows = False)
+    pc.backward(data, allow_modify_flows = False)
 
     ## Unit tests for backward pass ##
 

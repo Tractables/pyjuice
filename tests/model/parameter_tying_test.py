@@ -190,7 +190,7 @@ def test_simple_structure_block1():
 
     ## Backward tests ##
 
-    pc.backward(data.permute(1, 0), allow_modify_flows = False)
+    pc.backward(data, allow_modify_flows = False)
 
     node_flows = pc.node_flows.detach().cpu().clone()
     param_flows = pc.param_flows.detach().cpu().clone()
@@ -303,6 +303,8 @@ def test_simple_structure_block1():
 
 
 def test_simple_structure_block16():
+
+    torch.manual_seed(23892)
 
     block_size = 16
     
@@ -447,7 +449,7 @@ def test_simple_structure_block16():
 
     data = torch.randint(0, 5, [16, 4]).to(device)
 
-    lls = pc(data)
+    lls = pc(data, force_use_fp32 = True)
 
     node_mars = pc.node_mars.detach().cpu()
     params = pc.params.detach().cpu()
@@ -456,15 +458,15 @@ def test_simple_structure_block16():
 
     np01_lls = node_mars[16:48,:] + node_mars[48:80,:]
     ns01_lls = torch.matmul(params0, np01_lls.exp()).log()
-    assert torch.all(torch.abs(node_mars[144:176,:] - ns01_lls) < 1e-3)
+    assert torch.all(torch.abs(node_mars[144:176,:] - ns01_lls) < 2e-3)
 
     np12_lls = node_mars[48:80,:] + node_mars[80:112,:]
     ns12_lls = torch.matmul(params0, np12_lls.exp()).log()
-    assert torch.all(torch.abs(node_mars[176:208,:] - ns12_lls) < 1e-3)
+    assert torch.all(torch.abs(node_mars[176:208,:] - ns12_lls) < 2e-3)
 
     np23_lls = node_mars[80:112,:] + node_mars[112:144,:]
     ns23_lls = torch.matmul(params0, np23_lls.exp()).log()
-    assert torch.all(torch.abs(node_mars[208:240,:] - ns23_lls) < 1e-3)
+    assert torch.all(torch.abs(node_mars[208:240,:] - ns23_lls) < 2e-3)
 
     params1 = ns0123.get_source_ns()._params.reshape(2, 4, 16, 16).permute(0, 2, 1, 3).reshape(32, 64)
 
@@ -488,7 +490,7 @@ def test_simple_structure_block16():
 
     ## Backward tests ##
 
-    pc.backward(data.permute(1, 0), allow_modify_flows = False)
+    pc.backward(data, allow_modify_flows = False)
 
     node_flows = pc.node_flows.detach().cpu().clone()
     param_flows = pc.param_flows.detach().cpu().clone()

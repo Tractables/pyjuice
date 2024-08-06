@@ -125,5 +125,6 @@ def test_rat_spn():
 
 
 if __name__ == "__main__":
+    torch.set_num_threads(4)
     torch.manual_seed(3289)
     test_rat_spn()

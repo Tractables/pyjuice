@@ -119,6 +119,7 @@ def test_sample_hclt():
 
 
 if __name__ == "__main__":
+    torch.set_num_threads(4)
     test_sample()
     test_sample_correctness()
     test_sample_hclt()

@@ -82,7 +82,7 @@ def test_block_sparse_pc():
 
         ## Backward tests ##
 
-        pc.backward(data.permute(1, 0), allow_modify_flows = False)
+        pc.backward(data, allow_modify_flows = False)
 
         node_flows = pc.node_flows.cpu()
         element_flows = pc.element_flows.cpu()

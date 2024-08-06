@@ -67,12 +67,11 @@ def test_hmm_speed():
         print(f"Reference computation time on RTX 4090: {fw_4090_ref_times[num_latents]:.3f}ms.")
         print("--------------------------------------------------------------")
 
-        data_trans = data.permute(1, 0).contiguous()
-        pc.backward(data_trans, allow_modify_flows = True, record_cudagraph = num_latents <= 1024)
+        pc.backward(data, allow_modify_flows = True, record_cudagraph = num_latents <= 1024)
         torch.cuda.synchronize()
         t0 = time.time()
         for _ in range(100):
-            pc.backward(data_trans, allow_modify_flows = True)
+            pc.backward(data, allow_modify_flows = True)
         torch.cuda.synchronize()
         t1 = time.time()
         aveg_bk_ms = (t1 - t0) * 1000 / 100
@@ -85,5 +84,6 @@ def test_hmm_speed():
 
 
 if __name__ == "__main__":
+    torch.set_num_threads(4)
     test_hmm_speed()
 

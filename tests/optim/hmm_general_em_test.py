@@ -3,9 +3,7 @@ import torch
 import torchvision
 import time
 from tqdm import tqdm
-from torchtext.datasets import PennTreebank
-from torchtext.data.utils import get_tokenizer
-from torchtext.vocab import build_vocab_from_iterator
+from datasets import load_dataset
 from torch.utils.data import TensorDataset, DataLoader
 import pyjuice.distributions as dists
 
@@ -17,22 +15,22 @@ def load_penn_treebank(seq_length = 32):
     CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .!?,;:-'\"()[]{}"
     vocab = {char: idx for idx, char in enumerate(CHARS)}
 
-    # Define a tokenizer
-    tokenizer = get_tokenizer("basic_english")
-
     # Load the Penn Treebank dataset
-    train_dataset, valid_dataset, test_dataset = PennTreebank(root = "./examples/data")
+    dataset = load_dataset('ptb_text_only')
+    train_dataset = dataset['train']
+    valid_dataset = dataset['validation']
+    test_dataset = dataset['test']
 
     train_data = []
-    for sample in tqdm(train_dataset):
+    for sample in tqdm(train_dataset["sentence"]):
         train_data.extend([vocab[token] if token in vocab else len(CHARS) for token in sample])
 
     valid_data = []
-    for sample in tqdm(valid_dataset):
+    for sample in tqdm(valid_dataset["sentence"]):
         valid_data.extend([vocab[token] if token in vocab else len(CHARS) for token in sample])
 
     test_data = []
-    for sample in tqdm(test_dataset):
+    for sample in tqdm(test_dataset["sentence"]):
         test_data.extend([vocab[token] if token in vocab else len(CHARS) for token in sample])
 
     # Convert to PyTorch tensors

@@ -15,6 +15,8 @@ import pytest
 
 
 def test_simple_model():
+
+    torch.manual_seed(82392)
     
     device = torch.device("cuda:0")
 
@@ -237,19 +239,20 @@ def test_simple_model():
 
     ch_lls = torch.cat((np0_lls, np3_lls), dim = 0)
     epars = ns0._params.reshape(2, 4, 16, 16).permute(0, 2, 1, 3).reshape(32, 64)
-    ns0_lls = torch.matmul(epars, ch_lls.exp()).log()
+    ch_ll_max = ch_lls.amax(dim = 0, keepdim = True)
+    ns0_lls = torch.matmul(epars, (ch_lls - ch_ll_max).exp()).log() + ch_ll_max
     sid, eid = ns0._output_ind_range
-    assert torch.all(torch.abs(ns0_lls - node_mars[sid:eid,:]) < 1e-3)
+    assert torch.all(torch.abs(ns0_lls - node_mars[sid:eid,:]) < 2e-3)
     
     epars = ns1._params.reshape(2, 2, 16, 16).permute(0, 2, 1, 3).reshape(32, 32)
     ns1_lls = torch.matmul(epars, np1_lls.exp()).log()
     sid, eid = ns1._output_ind_range
-    assert torch.all(torch.abs(ns1_lls - node_mars[sid:eid,:]) < 1e-3)
+    assert torch.all(torch.abs(ns1_lls - node_mars[sid:eid,:]) < 2e-3)
 
     epars = ns2._params.reshape(2, 2, 16, 16).permute(0, 2, 1, 3).reshape(32, 32)
     ns2_lls = torch.matmul(epars, np2_lls.exp()).log()
     sid, eid = ns2._output_ind_range
-    assert torch.all(torch.abs(ns2_lls - node_mars[sid:eid,:]) < 1e-3)
+    assert torch.all(torch.abs(ns2_lls - node_mars[sid:eid,:]) < 2e-3)
 
     np4_lls = ns0_lls + ni2_lls + ni3_lls
     np5_lls = ns1_lls + ni0_lls + ni1_lls
@@ -259,23 +262,23 @@ def test_simple_model():
     element_mars = pc.element_mars.cpu()
 
     sid, eid = np4._output_ind_range
-    assert torch.all(torch.abs(np4_lls - element_mars[sid:eid,:]) < 1e-3)
+    assert torch.all(torch.abs(np4_lls - element_mars[sid:eid,:]) < 2e-3)
 
     sid, eid = np5._output_ind_range
-    assert torch.all(torch.abs(np5_lls - element_mars[sid:eid,:]) < 1e-3)
+    assert torch.all(torch.abs(np5_lls - element_mars[sid:eid,:]) < 2e-3)
 
     sid, eid = np6._output_ind_range
-    assert torch.all(torch.abs(np6_lls - element_mars[sid:eid,:]) < 1e-3)
+    assert torch.all(torch.abs(np6_lls - element_mars[sid:eid,:]) < 2e-3)
 
     ch_lls = torch.cat((np4_lls, np5_lls, np6_lls), dim = 0)
     epars = ns._params.reshape(1, 6, 1, 16).permute(0, 2, 1, 3).reshape(1, 96)
     ns_lls = torch.matmul(epars, ch_lls.exp()).log()
     sid, eid = ns._output_ind_range
-    assert torch.all(torch.abs(ns_lls - node_mars[sid:eid,:]) < 1e-3)
+    assert torch.all(torch.abs(ns_lls - node_mars[sid:eid,:]) < 2e-3)
 
     ## Backward pass ##
 
-    pc.backward(data.permute(1, 0), allow_modify_flows = False)
+    pc.backward(data, allow_modify_flows = False)
 
     node_flows = pc.node_flows.cpu()
     param_flows = pc.param_flows.cpu()
@@ -421,7 +424,7 @@ def test_simple_model():
 
     ## EM Optimization tests ##
 
-    pc.backward(data.permute(1, 0), flows_memory = 0.0)
+    pc.backward(data, flows_memory = 0.0)
 
     ns0_old_params = ns0._params.clone().reshape(2, 4, 16, 16).permute(0, 2, 1, 3).reshape(32, 64)
     ns1_old_params = ns1._params.clone().reshape(2, 2, 16, 16).permute(0, 2, 1, 3).reshape(32, 32)

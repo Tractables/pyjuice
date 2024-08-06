@@ -181,6 +181,7 @@ def test_pd_hclt():
 
 
 if __name__ == "__main__":
+    torch.set_num_threads(4)
     torch.manual_seed(2391)
     test_pd_hclt_degenerative_case()
     test_pd_hclt()

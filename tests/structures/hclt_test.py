@@ -364,6 +364,7 @@ def test_hclt_logistic():
 
 
 if __name__ == "__main__":
+    torch.set_num_threads(4)
     # torch.manual_seed(3289)
     test_hclt()
     test_hclt_logspace_flows()

@@ -34,7 +34,7 @@ def test_tensorcircuit_fns():
     data = torch.randint(0, 2, [16, 4]).to(device)
 
     lls = pc(data)
-    pc.backward(data.permute(1, 0), allow_modify_flows = False)
+    pc.backward(data, allow_modify_flows = False)
 
     nsid, neid = n2._output_ind_range
     n2_mars = pc.get_node_mars(n2)

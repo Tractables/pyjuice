@@ -109,7 +109,7 @@ def test_hmm_forward_backward():
 
     ## Backward tests ##
 
-    pc.backward(data.permute(1, 0), allow_modify_flows = False)
+    pc.backward(data, allow_modify_flows = False)
 
     pc.update_param_flows()
 
@@ -318,7 +318,7 @@ def test_hmm_forward_backward_with_generalized_em():
 
     ## Backward tests ##
 
-    pc.backward(data.permute(1, 0), allow_modify_flows = False, 
+    pc.backward(data, allow_modify_flows = False, 
                 propagation_alg = "GeneralLL", alpha = alpha)
 
     pc.update_param_flows()
@@ -417,5 +417,6 @@ def test_hmm_forward_backward_with_generalized_em():
 
 
 if __name__ == "__main__":
+    torch.set_num_threads(4)
     test_hmm_forward_backward()
     test_hmm_forward_backward_with_generalized_em()

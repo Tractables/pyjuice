@@ -56,7 +56,7 @@ def test_logspace_hclt_backward():
     pc.init_param_flows(flows_memory = 0.0)
 
     lls = pc(batch_data)
-    pc.backward(batch_data.permute(1, 0), allow_modify_flows = False, logspace_flows = True)
+    pc.backward(batch_data, allow_modify_flows = False, logspace_flows = True)
 
     pc.update_param_flows()
 
@@ -167,4 +167,5 @@ def test_logspace_hclt_backward():
 
 
 if __name__ == "__main__":
+    torch.set_num_threads(4)
     test_logspace_hclt_backward()

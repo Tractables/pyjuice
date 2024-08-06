@@ -39,7 +39,7 @@ def test_non_sd():
 
     lls = pc(data)
 
-    pc.backward(data.permute(1, 0), allow_modify_flows = False)
+    pc.backward(data, allow_modify_flows = False)
 
     pc.update_parameters()
 
@@ -132,7 +132,7 @@ def test_non_sd_generalized_em():
 
     lls = pc(data, propagation_alg = "GeneralLL", alpha = alpha)
 
-    pc.backward(data.permute(1, 0), allow_modify_flows = False,
+    pc.backward(data, allow_modify_flows = False,
                 propagation_alg = "GeneralLL", alpha = alpha)
 
     pc.update_parameters()

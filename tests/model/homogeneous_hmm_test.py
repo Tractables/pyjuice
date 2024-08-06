@@ -135,7 +135,7 @@ def test_homogeneous_hmm():
 
     ## Backward tests ##
 
-    pc.backward(data.permute(1, 0), allow_modify_flows = False)
+    pc.backward(data, allow_modify_flows = False)
 
     node_flows = pc.node_flows.detach().cpu().clone()
     param_flows = pc.param_flows.detach().cpu().clone()

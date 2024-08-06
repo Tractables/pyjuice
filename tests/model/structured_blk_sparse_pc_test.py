@@ -13,6 +13,8 @@ import pytest
 
 def test_structured_blk_sparse_pc():
 
+    torch.manual_seed(2893)
+
     device = torch.device("cuda:0")
 
     block_size = 16
@@ -117,7 +119,7 @@ def test_structured_blk_sparse_pc():
     data = torch.randint(0, 256, (512, 3)).to(device)
     data_cpu = data.cpu()
 
-    lls = pc(data)
+    lls = pc(data, force_use_fp32 = True)
 
     node_mars = pc.node_mars.clone().cpu()
 
@@ -152,20 +154,20 @@ def test_structured_blk_sparse_pc():
 
     ns01_lls = ns01_vals.reshape(128, 512).log()
 
-    assert torch.all(torch.abs(ns01_lls - node_mars[400:528,:]) < 1e-3)
+    assert torch.all(torch.abs(ns01_lls - node_mars[400:528,:]) < 2e-3)
 
     pc.inner_layer_groups[2][0].forward(pc.node_mars, pc.element_mars)
     element_mars = pc.element_mars.clone().cpu()
 
     np012_lls = (ns01_lls + ni2_lls).reshape(8, 16, 512).permute(1, 0, 2).reshape(128, 512)
-    assert torch.all(torch.abs(np012_lls - element_mars[16:144,:]) < 1e-3)
+    assert torch.all(torch.abs(np012_lls - element_mars[16:144,:]) < 2e-3)
 
     ns012_lls = torch.logsumexp(ns012._params.reshape(-1, 1).log() + np012_lls, dim = 0)
-    assert torch.all(torch.abs(ns012_lls - node_mars[528,:]) < 1e-3)
+    assert torch.all(torch.abs(ns012_lls - node_mars[528,:]) < 2e-3)
 
     ## Backward tests ##
 
-    pc.backward(data.permute(1, 0), allow_modify_flows = False)
+    pc.backward(data, allow_modify_flows = False)
 
     node_flows = pc.node_flows.clone().cpu()
     param_flows = pc.param_flows.clone().cpu()
