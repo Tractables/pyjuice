@@ -627,7 +627,7 @@ class SumLayer(Layer, nn.Module):
                     emars_max *= alpha
 
                 if use_bf16 == 1:
-                    # Simulated matmul kernel + float16
+                    # Simulated matmul kernel + bfloat16
                     epars = epars.to(tl.bfloat16)
                     emars_sub = emars_sub.to(tl.bfloat16)
                     nmars = tl.sum(epars[:,:,None] * emars_sub[None,:,:], axis = 1).to(tl.float32)
@@ -844,7 +844,7 @@ class SumLayer(Layer, nn.Module):
         elif force_use_fp32:
             use_bf16 = False
         else:
-            if TILE_SIZE_M >= 8 and TILE_SIZE_K >= 8 and BLOCK_B >= 8:
+            if TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and BLOCK_B >= 16:
                 use_bf16 = True
             else:
                 use_bf16 = False
