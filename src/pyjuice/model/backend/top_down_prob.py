@@ -276,6 +276,7 @@ def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0):
                 prod_layer_td_backward(layer, node_flows, element_flows)
 
             elif layer.is_sum():
+                element_flows[:pc.num_nodes] = 0.0
                 sum_layer_td_backward(layer, node_flows, element_flows, pc.params)
 
                 if update_pflow:
