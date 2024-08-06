@@ -27,7 +27,7 @@ dev = [
     "pytest-xdist",
     "pytest-skip-slow",
     "torchvision",
-    "torchtext",
+    "datasets",
     "matplotlib"
 ]
 
