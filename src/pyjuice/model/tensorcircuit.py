@@ -190,6 +190,7 @@ class TensorCircuit(nn.Module):
         
         B = inputs.size(0)
 
+        origin_inputs = inputs
         if input_layer_fn is None:
             assert inputs.dim() == 2
 
@@ -289,7 +290,7 @@ class TensorCircuit(nn.Module):
                 partial(
                     _pc_model_backward_hook, 
                     pc = self, 
-                    inputs = inputs, 
+                    inputs = origin_inputs, 
                     record_cudagraph = record_cudagraph, 
                     apply_cudagraph = apply_cudagraph,
                     propagation_alg = propagation_alg,
