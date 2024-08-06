@@ -214,7 +214,7 @@ class SumLayer(Layer, nn.Module):
         return self._layer_pfid_range[1] - self._layer_pfid_range[0]
 
     def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor,
-                force_use_fp16: bool = False, force_use_fp32: bool = False,
+                force_use_bf16: bool = False, force_use_fp32: bool = False,
                 propagation_alg: str = "LL", **kwargs) -> None:
         """
         Computes the forward pass of a sum layer.
@@ -234,7 +234,7 @@ class SumLayer(Layer, nn.Module):
 
                 self._forward(
                     node_mars, element_mars, params, nids, cids, pids, 
-                    partition_id = partition_id, force_use_fp16 = force_use_fp16,
+                    partition_id = partition_id, force_use_bf16 = force_use_bf16,
                     force_use_fp32 = force_use_fp32, 
                     propagation_alg = propagation_alg, **kwargs
                 )
@@ -250,7 +250,7 @@ class SumLayer(Layer, nn.Module):
                 self._forward(
                     node_mars, element_mars, params, 
                     nids, cids, pids, local_ids = local_ids,
-                    partition_id = partition_id, force_use_fp16 = force_use_fp16,
+                    partition_id = partition_id, force_use_bf16 = force_use_bf16,
                     force_use_fp32 = force_use_fp32,
                     propagation_alg = propagation_alg, **kwargs
                 )
@@ -372,7 +372,7 @@ class SumLayer(Layer, nn.Module):
                  params: torch.Tensor, nids: torch.Tensor, cids: torch.Tensor,
                  pids: torch.Tensor, local_ids: Optional[torch.Tensor] = None,
                  partition_id: int = -1, mode: Optional[str] = None,
-                 force_use_fp16: bool = False, force_use_fp32: bool = False,
+                 force_use_bf16: bool = False, force_use_fp32: bool = False,
                  propagation_alg: str = "LL", **kwargs) -> None:
         """
         Forward pass of sum layers.
@@ -408,7 +408,7 @@ class SumLayer(Layer, nn.Module):
         if mode == self.BLOCK_SPARSE:
             self._forward_block_sparse(
                 node_mars, element_mars, params, nids, cids, pids, local_ids,
-                partition_id = partition_id, force_use_fp16 = force_use_fp16,
+                partition_id = partition_id, force_use_bf16 = force_use_bf16,
                 force_use_fp32 = force_use_fp32, propagation_alg = propagation_alg, **kwargs
             )
 
@@ -433,7 +433,7 @@ class SumLayer(Layer, nn.Module):
     def _fw_triton_block_sparse_tlmm_kernel(node_mars, element_mars, params, nids, cids_start, cids_increment,
                                             pids_start, pids_increment, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
                                             BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
-                                            TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, use_fp16: tl.constexpr,
+                                            TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, use_bf16: tl.constexpr,
                                             propagation_alg_id: tl.constexpr, alpha = 0.0):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
@@ -510,11 +510,11 @@ class SumLayer(Layer, nn.Module):
                     # Also scale `emars_max`
                     emars_max *= alpha
 
-                if use_fp16 == 1:
+                if use_bf16 == 1:
                     # Built-in matmul kernel of triton + float16
-                    epars_fp16 = (epars * (2**4)).to(tl.float16)
-                    emars_fp16 = emars_sub.to(tl.float16)
-                    nmars = tl.dot(epars_fp16, emars_fp16).to(tl.float32) / (2**4)
+                    epars_bf16 = epars.to(tl.bfloat16)
+                    emars_bf16 = emars_sub.to(tl.bfloat16)
+                    nmars = tl.dot(epars_bf16, emars_bf16).to(tl.float32)
                 else:
                     # Built-in matmul kernel of triton + float32
                     nmars = tl.dot(epars, emars_sub)
@@ -549,7 +549,7 @@ class SumLayer(Layer, nn.Module):
     def _fw_triton_block_sparse_csmm1_kernel(node_mars, element_mars, params, nids, cids_start, cids_increment,
                                             pids_start, pids_increment, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
                                             BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
-                                            TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, use_fp16: tl.constexpr,
+                                            TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, use_bf16: tl.constexpr,
                                             propagation_alg_id: tl.constexpr, alpha = 0.0):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
@@ -626,11 +626,11 @@ class SumLayer(Layer, nn.Module):
                     # Also scale `emars_max`
                     emars_max *= alpha
 
-                if use_fp16 == 1:
+                if use_bf16 == 1:
                     # Simulated matmul kernel + float16
-                    epars = (epars * (2**4)).to(tl.float16)
-                    emars_sub = emars_sub.to(tl.float16)
-                    nmars = tl.sum(epars[:,:,None] * emars_sub[None,:,:], axis = 1).to(tl.float32) / (2**4)
+                    epars = epars.to(tl.bfloat16)
+                    emars_sub = emars_sub.to(tl.bfloat16)
+                    nmars = tl.sum(epars[:,:,None] * emars_sub[None,:,:], axis = 1).to(tl.float32)
                 else:
                     # Simulated matmul kernel + float32
                     nmars = tl.sum(epars[:,:,None] * emars_sub[None,:,:], axis = 1)
@@ -665,7 +665,7 @@ class SumLayer(Layer, nn.Module):
     def _fw_triton_block_sparse_csmm2_kernel(node_mars, element_mars, params, nids, cids_start, cids_increment,
                                              pids_start, pids_increment, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
                                              BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
-                                             TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, use_fp16: tl.constexpr,
+                                             TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, use_bf16: tl.constexpr,
                                              propagation_alg_id: tl.constexpr, alpha = 0.0):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
@@ -772,7 +772,7 @@ class SumLayer(Layer, nn.Module):
     def _forward_block_sparse(self, node_mars: torch.Tensor, element_mars: torch.Tensor,
                               params: torch.Tensor, nids: torch.Tensor, cids: torch.Tensor,
                               pids: torch.Tensor, local_ids: Optional[torch.Tensor] = None,
-                              partition_id: int = -1, force_use_fp16: bool = False,
+                              partition_id: int = -1, force_use_bf16: bool = False,
                               force_use_fp32: bool = False, propagation_alg: str = "LL", **kwargs) -> None:
         """
         Forward pass of sum layers with the block-sparse processing kernel.
@@ -838,16 +838,16 @@ class SumLayer(Layer, nn.Module):
         partial_eval = 1 if local_ids is not None else 0
         BLOCK_SIZE_M = self.block_size
 
-        if force_use_fp16:
+        if force_use_bf16:
             assert not force_use_fp32
-            use_fp16 = True
+            use_bf16 = True
         elif force_use_fp32:
-            use_fp16 = False
+            use_bf16 = False
         else:
             if TILE_SIZE_M >= 8 and TILE_SIZE_K >= 8 and BLOCK_B >= 8:
-                use_fp16 = True
+                use_bf16 = True
             else:
-                use_fp16 = False
+                use_bf16 = False
 
         grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
         
@@ -869,7 +869,7 @@ class SumLayer(Layer, nn.Module):
                 K_NUM_TILES = K_NUM_TILES,
                 TILE_SIZE_M = TILE_SIZE_M,
                 BLOCK_SIZE_M = BLOCK_SIZE_M,
-                use_fp16 = use_fp16,
+                use_bf16 = use_bf16,
                 propagation_alg_id = propagation_alg_id,
                 **propagation_alg_kwargs
             )
@@ -892,7 +892,7 @@ class SumLayer(Layer, nn.Module):
                 K_NUM_TILES = K_NUM_TILES,
                 TILE_SIZE_M = TILE_SIZE_M,
                 BLOCK_SIZE_M = BLOCK_SIZE_M,
-                use_fp16 = use_fp16,
+                use_bf16 = use_bf16,
                 propagation_alg_id = propagation_alg_id,
                 **propagation_alg_kwargs
             )
@@ -915,7 +915,7 @@ class SumLayer(Layer, nn.Module):
                 K_NUM_TILES = K_NUM_TILES,
                 TILE_SIZE_M = TILE_SIZE_M,
                 BLOCK_SIZE_M = BLOCK_SIZE_M,
-                use_fp16 = use_fp16,
+                use_bf16 = use_bf16,
                 propagation_alg_id = propagation_alg_id,
                 **propagation_alg_kwargs
             )
@@ -2260,6 +2260,7 @@ class SumLayer(Layer, nn.Module):
                 negate_pflows = negate_pflows,
                 **propagation_alg_kwargs
             )
+
         else:
             self._bk_triton_block_sparse_par_csmm2_kernel[grid](
                 node_flows = node_flows, 
