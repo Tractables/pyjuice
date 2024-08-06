@@ -176,7 +176,7 @@ class TensorCircuit(nn.Module):
         
     def forward(self, inputs: torch.Tensor, input_layer_fn: Optional[Union[str,Callable]] = None,
                 cache: Optional[dict] = None, return_cache: bool = False, record_cudagraph: bool = False, 
-                apply_cudagraph: bool = True, force_use_fp16: bool = False, force_use_fp32: bool = False, 
+                apply_cudagraph: bool = True, force_use_bf16: bool = False, force_use_fp32: bool = False, 
                 propagation_alg: Optional[Union[str,Sequence[str]]] = None, **kwargs):
         """
         Forward evaluation of the PC.
@@ -237,7 +237,7 @@ class TensorCircuit(nn.Module):
                     elif layer_group.is_sum():
                         # Sum layer
                         layer_group(self.node_mars, self.element_mars, self.params, 
-                                    force_use_fp16 = force_use_fp16,
+                                    force_use_bf16 = force_use_bf16,
                                     force_use_fp32 = force_use_fp32, 
                                     propagation_alg = propagation_alg if isinstance(propagation_alg, str) else propagation_alg[layer_id], 
                                     **kwargs)
@@ -336,9 +336,8 @@ class TensorCircuit(nn.Module):
 
         assert self.node_mars is not None and self.element_mars is not None, "Should run forward path first."
         if input_layer_fn is None:
-            if inputs.size(0) != self.num_vars:
-                assert inputs.dim() == 2 and inputs.size(1) == self.num_vars
-                inputs = inputs.permute(1, 0)
+            assert inputs.dim() == 2 and inputs.size(1) == self.num_vars
+            inputs = inputs.permute(1, 0)
 
         B = self.node_mars.size(1)
 
