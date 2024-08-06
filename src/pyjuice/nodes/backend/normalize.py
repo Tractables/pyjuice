@@ -106,8 +106,6 @@ def normalize_ns_parameters(params: torch.Tensor, node_ids: torch.Tensor, block_
 
         with torch.no_grad():
 
-            params = params.float()
-
             blockified_params = params.sum(dim = 2).contiguous()
 
             param_ids = torch.arange(0, num_param_blocks, dtype = torch.long, device = params.device)
@@ -132,4 +130,4 @@ def normalize_ns_parameters(params: torch.Tensor, node_ids: torch.Tensor, block_
             )
             params_buffer = torch.sparse.mm(cum_matrix2, node_buffer).reshape(num_param_blocks, block_size)
             
-            params *= (params_buffer / (blockified_params + 1e-12)).unsqueeze(2)
+            params *= (params_buffer / torch.where(blockified_params == 0.0, 1e-12, blockified_params)).unsqueeze(2)
