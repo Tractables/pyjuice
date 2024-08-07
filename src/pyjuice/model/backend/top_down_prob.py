@@ -262,8 +262,8 @@ def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0):
     node_flows = pc.node_flows.view(-1) # Reuse the allocated memory
     element_flows = pc.element_flows.view(-1)
 
-    node_flows[:] = 0.0
-    element_flows[:] = 0.0
+    node_flows[:pc.num_nodes] = 0.0
+    element_flows[:pc.num_elements] = 0.0
 
     node_flows[pc._root_node_range[0]:pc._root_node_range[1]] = 1.0
 

@@ -16,7 +16,7 @@ from pyjuice.utils import BitSet
 
 from .backend import compile_cum_par_flows_fn, compute_cum_par_flows, cum_par_flows_to_device, \
                      compile_par_update_fn, em_par_update, par_update_to_device, \
-                     normalize_parameters
+                     normalize_parameters, eval_top_down_probs
 
 
 def _pc_model_backward_hook(grad, pc, inputs, record_cudagraph, apply_cudagraph, propagation_alg, **kwargs):
@@ -143,6 +143,9 @@ class TensorCircuit(nn.Module):
 
         # Running parameters
         self._run_params = dict()
+
+        # Cumulative flows
+        self._cum_flow = 0.0
 
     def to(self, device):
         super(TensorCircuit, self).to(device)
@@ -365,6 +368,13 @@ class TensorCircuit(nn.Module):
 
         _set_root_node_flows()
 
+        # Accumulate the total amount of flows added to the PC
+        if compute_param_flows:
+            if ll_weights is None:
+                self._cum_flow += (self._root_node_range[1] - self._root_node_range[0]) * B
+            else:
+                self._cum_flow += ll_weights.sum().item()
+
         # Load cached node flows
         if self._buffer_matches(name = "node_flows", cache = cache):
             self.node_flows[:,:] = cache["node_flows"]
@@ -467,7 +477,8 @@ class TensorCircuit(nn.Module):
     def forward_general_ll(self, *args, alpha: float = 1.0, **kwargs):
         self.forward(*args, propagation_alg = "GeneralLL", **kwargs)
 
-    def mini_batch_em(self, step_size: float, pseudocount: float = 0.0, keep_zero_params: bool = False):
+    def mini_batch_em(self, step_size: float, pseudocount: float = 0.0, keep_zero_params: bool = False,
+                      step_size_rescaling: bool = False):
         """
         Perform an EM parameter update step using the accumulated parameter flows.
 
@@ -479,7 +490,22 @@ class TensorCircuit(nn.Module):
 
         :param keep_zero_params: if set to `True`, do not add pseudocounts to zero parameters
         :type keep_zero_params: bool
+
+        :param step_size_rescaling: whether to rescale the step size by flows
+        :type step_size_rescaling: bool
         """
+        assert self._cum_flow > 0.0, "Please perform a backward pass before calling `mini_batch_em`."
+        assert 0.0 < step_size <= 1.0, "`step_size` should be between 0 and 1."
+
+        # Apply step size rescaling according to the mini-batch EM objective derivation
+        if step_size_rescaling:
+            self.init_param_flows(flows_memory = step_size / self._cum_flow)
+
+            eval_top_down_probs(self, update_pflow = True, scale = (1.0 - step_size))
+
+            self._cum_flow = 0.0 # Zero out the cumulative flow value
+            step_size = 1.0 # We have applied the step size within the parameter flows
+
         # Update input layers
         for layer in self.input_layer_group:
             layer.mini_batch_em(step_size = step_size, pseudocount = pseudocount)
@@ -514,7 +540,7 @@ class TensorCircuit(nn.Module):
             
         self._init_buffer(name = "param_flows", shape = pflow_shape)
 
-        if flows_memory < 1.0:
+        if flows_memory != 1.0:
             self.param_flows[:] *= flows_memory
 
         # For input layers
@@ -522,6 +548,12 @@ class TensorCircuit(nn.Module):
             layer.init_param_flows(flows_memory = flows_memory)
 
         return None
+
+    def zero_param_flows(self):
+        """
+        Zero out parameter flows.
+        """
+        self.init_param_flows(flows_memory = 0.0)
 
     def update_parameters(self, clone: bool = True):
         """
