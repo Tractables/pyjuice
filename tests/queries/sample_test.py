@@ -72,8 +72,8 @@ def test_sample_correctness():
 
     samples = juice.queries.sample(pc, num_samples = 512)
 
-    assert samples[:,0].float().mean() < 0.4
-    assert samples[:,1].float().mean() > 0.6
+    assert samples[:,0].float().mean() > 0.6
+    assert samples[:,1].float().mean() < 0.4
 
 
 def test_sample_hclt():
@@ -118,8 +118,24 @@ def test_sample_hclt():
     assert ((samples >= 0) & (samples < 256)).all()
 
 
+def test_sample_hmm():
+    
+    device = torch.device("cuda:0")
+
+    ns = juice.structures.HMM(seq_length = 32, num_latents = 256, num_emits = 100, homogeneous = True, block_size = 64)
+    ns.init_parameters(perturbation = 2.0)
+
+    pc = juice.compile(ns)
+    pc.to(device)
+
+    samples = juice.queries.sample(pc, num_samples = 16)
+
+    assert ((samples >= 0) & (samples < 100)).all()
+
+
 if __name__ == "__main__":
     torch.set_num_threads(4)
     test_sample()
     test_sample_correctness()
     test_sample_hclt()
+    test_sample_hmm()
