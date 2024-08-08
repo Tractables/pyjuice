@@ -12,7 +12,7 @@ from pyjuice.utils.util import max_cdf_power_of_2
 from .compilation import BayesianTreeToHiddenRegionGraph
 
 
-def HMM(seq_length: int, num_latents: int, num_emits: int, homogeneous: bool = True,
+def HMM(seq_length: int, num_latents: int, num_emits: int, homogeneous: bool = True, block_size: Optional[int] = None,
         alpha: Optional[torch.Tensor] = None, beta: Optional[torch.Tensor] = None, gamma: Optional[torch.Tensor] = None):
     """
     Constructs Hidden Markov Models.
@@ -29,6 +29,9 @@ def HMM(seq_length: int, num_latents: int, num_emits: int, homogeneous: bool = T
     :param homogeneous: whether to define a homogeneous (or inhomogeneous) HMM
     :type homogeneous: bool
 
+    :param block_size: block size of the PC
+    :type block_size: Optional[int]
+
     :param alpha: optional transition parameters of size `[num_latents, num_latents]`
     :type alpha: Optional[torch.Tensor]
 
@@ -39,7 +42,8 @@ def HMM(seq_length: int, num_latents: int, num_emits: int, homogeneous: bool = T
     :type gamma: Optional[torch.Tensor]
     """
     
-    block_size = min(max_cdf_power_of_2(num_latents), 1024)
+    if block_size is None:
+        block_size = min(max_cdf_power_of_2(num_latents), 1024)
     num_node_blocks = num_latents // block_size
     
     with set_block_size(block_size = block_size):
