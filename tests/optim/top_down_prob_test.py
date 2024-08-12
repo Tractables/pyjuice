@@ -286,6 +286,7 @@ def test_scaled_mini_batch_em():
     assert torch.all(torch.abs(ni3_params - epars) < 1e-5)
 
 
+@pytest.mark.slow
 def test_tdp_speed():
 
     device = torch.device("cuda:0")
