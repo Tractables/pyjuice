@@ -160,3 +160,6 @@ class Distribution():
 
     def _get_constructor(self):
         raise NotImplementedError()
+
+    def _need_2nd_kernel_dim(self):
+        return False

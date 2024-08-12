@@ -286,6 +286,36 @@ def test_scaled_mini_batch_em():
     assert torch.all(torch.abs(ni3_params - epars) < 1e-5)
 
 
+def test_tdp_speed():
+
+    device = torch.device("cuda:0")
+    
+    root_ns = juice.structures.HMM(seq_length = 32, num_latents = 4096, num_emits = 50000, homogeneous = True)
+
+    pc = TensorCircuit(root_ns, layer_sparsity_tol = 0.1)
+    pc.to(device)
+
+    pc.init_param_flows()
+    pc._init_buffer(name = "node_flows", shape = (pc.num_nodes, 1), set_value = 0.0)
+    pc._init_buffer(name = "element_flows", shape = (pc.num_elements, 1), set_value = 0.0)
+
+    eval_top_down_probs(pc, update_pflow = True, scale = 1.0)
+
+    t0 = time.time()
+    for _ in range(100):
+        eval_top_down_probs(pc, update_pflow = True, scale = 1.0)
+    t1 = time.time()
+
+    tdp_ms = (t1 - t0) / 100 * 1000
+
+    print(f"Computing TDP on average takes {tdp_ms:.3f}ms.")
+    print("Reference computation time on RTX 4090: 31.423ms.")
+    print("--------------------------------------------------------------")
+
+
+
 if __name__ == "__main__":
+    torch.set_num_threads(8)
     test_simple_model_tdp()
     test_scaled_mini_batch_em()
+    test_tdp_speed()

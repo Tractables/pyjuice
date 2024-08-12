@@ -13,6 +13,13 @@ from typing import Sequence, Dict
 from triton.runtime.jit import JITFunction
 from copy import deepcopy
 
+# In the latest triton, math functions were shuffled around into different modules:
+# https://github.com/openai/triton/pull/3172
+if hasattr(tl.extra.cuda, "libdevice"):
+    tlmath = tl.extra.cuda.libdevice
+else:
+    tlmath = tl.math
+
 from pyjuice.nodes import InputNodes
 from pyjuice.utils.grad_fns import ReverseGrad
 from pyjuice.utils import BitSet
@@ -548,13 +555,18 @@ class InputLayer(Layer, nn.Module):
             node_offset = self._output_ind_range[0]
             layer_num_nodes = self._output_ind_range[1] - self._output_ind_range[0]
 
-            BLOCK_SIZE = 1024
-
-            grid = (triton.cdiv(layer_num_nodes, BLOCK_SIZE),)
-
             if not self.provided("_missing_flows_kernel"):
                 assert self.bk_flow_mask_fn is not None, "The target distribution doesn't have `bk_flow_mask_fn` implemented."
                 self._missing_flows_kernel = self._compile_triton_kernel(self._missing_flows_kernel_template, flow_fn = self.bk_flow_mask_fn)
+
+            if self._need_2nd_kernel_dim():
+                BLOCK_SIZE = 32
+                TILE_SIZE_K = 32
+            else:
+                BLOCK_SIZE = 1024
+                TILE_SIZE_K = 1
+            
+            grid = (triton.cdiv(layer_num_nodes, BLOCK_SIZE),)
 
             self._missing_flows_kernel[grid](
                 node_flows_ptr = node_flows,
@@ -568,7 +580,8 @@ class InputLayer(Layer, nn.Module):
                 node_offset = node_offset,
                 layer_num_nodes = layer_num_nodes,
                 logspace_flows = logspace_flows,
-                BLOCK_SIZE = BLOCK_SIZE
+                BLOCK_SIZE = BLOCK_SIZE,
+                TILE_SIZE_K = TILE_SIZE_K
             )
         else:
             raise NotImplementedError("CPU minibatch missing flow fn for input nodes is not implemented.")
@@ -706,6 +719,9 @@ class InputLayer(Layer, nn.Module):
                     self.params[p_start:p_end] = ns.init_parameters(ret_params = True).to(self.device)
 
                 p_start = p_end
+
+    def _need_2nd_kernel_dim(self):
+        return self.nodes[0].dist._need_2nd_kernel_dim()
 
     @staticmethod
     def _mars_kernel_template(mar_fn, params_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, metadata_ptr, s_mids_ptr, 
@@ -852,7 +868,7 @@ class InputLayer(Layer, nn.Module):
     @staticmethod
     def _missing_flows_kernel_template(node_flows_ptr, params_ptr, param_flows_ptr, s_pids_ptr, s_pfids_ptr,
                                        metadata_ptr, s_mids_ptr, scale, node_offset: tl.constexpr, layer_num_nodes: tl.constexpr, 
-                                       logspace_flows: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+                                       logspace_flows: tl.constexpr, BLOCK_SIZE: tl.constexpr, TILE_SIZE_K: tl.constexpr):
         pid = tl.program_id(axis = 0)
         block_start = pid * BLOCK_SIZE
 
@@ -1047,7 +1063,7 @@ class InputLayer(Layer, nn.Module):
         new_src = new_fn_header + "\n" + "\n".join(new_fn_body)
 
         # Add import commands
-        new_src = "import triton\nimport triton.language as tl\n\n" + new_src
+        new_src = "import triton\nimport triton.language as tl\nif hasattr(tl.extra.cuda, 'libdevice'):\n    tlmath = tl.extra.cuda.libdevice\nelse:\n    tlmath = tl.math\n\n" + new_src
 
         # Make a pseudo-function from the source code
         new_fn = make_function_from_src(new_src)
