@@ -113,6 +113,8 @@ class Categorical(Distribution):
             pf_offsets = s_pfids[:,None] + cat_ids[None,:]
             tl.atomic_add(param_flows_ptr + pf_offsets, flows[:,None] * param, mask = cat_mask)
 
+            cat_ids += TILE_SIZE_K
+
     @staticmethod
     def sample_fn(samples_ptr, local_offsets, batch_offsets, vids, s_pids, params_ptr, metadata_ptr, s_mids_ptr, mask, batch_size, BLOCK_SIZE, seed):
         # Get `num_cats` from `metadata`
