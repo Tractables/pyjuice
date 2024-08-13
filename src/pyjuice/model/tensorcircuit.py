@@ -494,7 +494,7 @@ class TensorCircuit(nn.Module):
         :param step_size_rescaling: whether to rescale the step size by flows
         :type step_size_rescaling: bool
         """
-        assert self._cum_flow > 0.0, "Please perform a backward pass before calling `mini_batch_em`."
+        assert not step_size_rescaling or self._cum_flow > 0.0, "Please perform a backward pass before calling `mini_batch_em`."
         assert 0.0 < step_size <= 1.0, "`step_size` should be between 0 and 1."
 
         # Apply step size rescaling according to the mini-batch EM objective derivation
