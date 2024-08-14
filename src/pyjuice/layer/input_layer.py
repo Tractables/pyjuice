@@ -369,6 +369,7 @@ class InputLayer(Layer, nn.Module):
                 self._flows_kernel = self._compile_triton_kernel(self._flows_kernel_template, flow_fn = self.bk_flow_fn)
 
             BLOCK_SIZE = 1024
+            TILE_SIZE_K = 1
 
             grid = (triton.cdiv(layer_num_nodes * batch_size, BLOCK_SIZE),)
 
@@ -396,6 +397,7 @@ class InputLayer(Layer, nn.Module):
                 logspace_flows = logspace_flows,
                 missing_mask_mode = missing_mask_mode,
                 pass_type = 0,
+                TILE_SIZE_K = 1,
                 num_warps = 8
             )
 
@@ -403,6 +405,15 @@ class InputLayer(Layer, nn.Module):
             if missing_mask is not None and self.bk_flow_mask_fn is not None:
                 if not self.provided("_flows_mask_kernel"):
                     self._flows_mask_kernel = self._compile_triton_kernel(self._flows_kernel_template, flow_fn = self.bk_flow_mask_fn)
+
+                if self._need_2nd_kernel_dim():
+                    BLOCK_SIZE = 32
+                    TILE_SIZE_K = 32
+                else:
+                    BLOCK_SIZE = 1024
+                    TILE_SIZE_K = 1
+
+                grid = (triton.cdiv(layer_num_nodes * batch_size, BLOCK_SIZE),)
 
                 self._flows_mask_kernel[grid](
                     params_ptr = self.params,
@@ -428,6 +439,7 @@ class InputLayer(Layer, nn.Module):
                     logspace_flows = logspace_flows,
                     missing_mask_mode = missing_mask_mode,
                     pass_type = 1,
+                    TILE_SIZE_K = TILE_SIZE_K,
                     num_warps = 8
                 )
 
@@ -809,7 +821,7 @@ class InputLayer(Layer, nn.Module):
     def _flows_kernel_template(flow_fn, params_ptr, param_flows_ptr, node_flows_ptr, node_mars_ptr, data_ptr, missing_mask_ptr, vids_ptr, s_pids_ptr, s_pfids_ptr,
                                metadata_ptr, s_mids_ptr, bk_local_ids_ptr, partial_eval: tl.constexpr, logspace_flows: tl.constexpr, layer_num_nodes: tl.constexpr, 
                                batch_size: tl.constexpr, num_vars_per_node: tl.constexpr, num_vars: tl.constexpr, nv_block_size: tl.constexpr, node_offset: tl.constexpr, 
-                               missing_mask_mode: tl.constexpr, pass_type: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+                               missing_mask_mode: tl.constexpr, pass_type: tl.constexpr, BLOCK_SIZE: tl.constexpr, TILE_SIZE_K: tl.constexpr):
         pid = tl.program_id(axis = 0)
         block_start = pid * BLOCK_SIZE
 

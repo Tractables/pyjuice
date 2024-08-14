@@ -100,20 +100,31 @@ class Categorical(Distribution):
         num_cats = tl.load(metadata_ptr + s_mids, mask = mask, other = 0).to(tl.int64)
 
         max_num_cats = tl.max(num_cats, axis = 0)
-        num_iters = tlmath.ceil(max_num_cats / TILE_SIZE_K).to(tl.int64)
 
-        cat_ids = tl.arange(0, TILE_SIZE_K)
+        if TILE_SIZE_K > 1:
+            num_iters = tlmath.ceil(max_num_cats / TILE_SIZE_K).to(tl.int64)
 
-        for i in range(num_iters):
-            cat_mask = mask[:,None] & missing_mask[:,None] & (cat_ids[None,:] < num_cats[:,None])
+            cat_ids = tl.arange(0, TILE_SIZE_K)
 
-            p_offsets = s_pids[:,None] + cat_ids[None,:]
-            param = tl.load(params_ptr + p_offsets, mask = cat_mask, other = 0)
+            for i in range(num_iters):
+                cat_mask = mask[:,None] & missing_mask[:,None] & (cat_ids[None,:] < num_cats[:,None])
 
-            pf_offsets = s_pfids[:,None] + cat_ids[None,:]
-            tl.atomic_add(param_flows_ptr + pf_offsets, flows[:,None] * param, mask = cat_mask)
+                p_offsets = s_pids[:,None] + cat_ids[None,:]
+                param = tl.load(params_ptr + p_offsets, mask = cat_mask, other = 0)
 
-            cat_ids += TILE_SIZE_K
+                pf_offsets = s_pfids[:,None] + cat_ids[None,:]
+                tl.atomic_add(param_flows_ptr + pf_offsets, flows[:,None] * param, mask = cat_mask)
+
+                cat_ids += TILE_SIZE_K
+        else:
+            for cat_id in range(max_num_cats):
+                cat_mask = mask & missing_mask & (cat_id < num_cats)
+
+                p_offsets = s_pids + cat_id
+                param = tl.load(params_ptr + p_offsets, mask = cat_mask, other = 0)
+
+                pf_offsets = s_pfids + cat_id
+                tl.atomic_add(param_flows_ptr + pf_offsets, flows * param, mask = cat_mask)
 
     @staticmethod
     def sample_fn(samples_ptr, local_offsets, batch_offsets, vids, s_pids, params_ptr, metadata_ptr, s_mids_ptr, mask, batch_size, BLOCK_SIZE, seed):
