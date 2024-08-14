@@ -2070,6 +2070,8 @@ class SumLayer(Layer, nn.Module):
                     
                     if logspace_flows:
                         log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), nflows - nmars)
+                    elif allow_neg_flows:
+                        log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), -nmars)
                     else:
                         log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), tl.log(nflows) - nmars)
 
