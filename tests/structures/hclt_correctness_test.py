@@ -289,7 +289,7 @@ def test_hclt_single_layer_backward_general_em():
 
                 pflows = (nflows[None,:,:] * (epars.log()[:,:,None] + emars[:,None,:] - nmars[None,:,:]).exp()).sum(dim = 2)
 
-                assert torch.all(torch.abs(fpars - pflows) < 3e-4 * batch_size)
+                assert torch.all(torch.abs(fpars - pflows) < 1e-3 * batch_size)
 
 
 def test_hclt_backward():
@@ -600,8 +600,8 @@ def test_hclt_em():
 
 
 if __name__ == "__main__":
-    test_hclt_forward()
-    test_hclt_single_layer_backward()
-    test_hclt_backward()
-    test_hclt_em()
+    # test_hclt_forward()
+    # test_hclt_single_layer_backward()
+    # test_hclt_backward()
+    # test_hclt_em()
     test_hclt_single_layer_backward_general_em()

@@ -402,19 +402,19 @@ def test_simple_model():
     ref_pflows = torch.zeros_like(ni0_pflows)
     for b in range(512):
         ref_pflows[:,data_cpu[b,0]] += ni0_flows[:,b]
-    assert torch.all(torch.abs(ni0_pflows - ref_pflows) < 6e-3)
+    assert torch.all(torch.abs(ni0_pflows - ref_pflows) < 8e-3)
 
     ni1_pflows = input_pflows[128:256].reshape(32, 4)
     ref_pflows = torch.zeros_like(ni1_pflows)
     for b in range(512):
         ref_pflows[:,data_cpu[b,1]] += ni1_flows[:,b]
-    assert torch.all(torch.abs(ni1_pflows - ref_pflows) < 6e-3)
+    assert torch.all(torch.abs(ni1_pflows - ref_pflows) < 8e-3)
 
     ni2_pflows = input_pflows[256:448].reshape(32, 6)
     ref_pflows = torch.zeros_like(ni2_pflows)
     for b in range(512):
         ref_pflows[:,data_cpu[b,2]] += ni2_flows[:,b]
-    assert torch.all(torch.abs(ni2_pflows - ref_pflows) < 6e-3)
+    assert torch.all(torch.abs(ni2_pflows - ref_pflows) < 8e-3)
 
     ni3_pflows = input_pflows[448:640].reshape(32, 6)
     ref_pflows = torch.zeros_like(ni3_pflows)

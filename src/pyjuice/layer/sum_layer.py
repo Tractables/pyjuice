@@ -262,7 +262,7 @@ class SumLayer(Layer, nn.Module):
                  params: torch.Tensor, param_flows: Optional[torch.Tensor] = None,
                  allow_modify_flows: bool = False, propagation_alg: str = "LL", 
                  logspace_flows: bool = False, negate_pflows: bool = False, 
-                 _accumulate_ch_flows: bool = False, **kwargs) -> None:
+                 accumulate_ch_flows: bool = False, allow_neg_flows: bool = False, **kwargs) -> None:
         """
         Computes the forward pass of a sum layer:
         ```
@@ -284,8 +284,10 @@ class SumLayer(Layer, nn.Module):
         """
 
         assert not (allow_modify_flows and logspace_flows), "`allow_modify_flows` should be set to `False` when using `logspace_flows`."
-        assert not (_accumulate_ch_flows and logspace_flows), "`_accumulate_ch_flows` should be set to `False` when using `logspace_flows`."
-        assert not (_accumulate_ch_flows and allow_modify_flows), "`_accumulate_ch_flows` should be set to `False` when `allow_modify_flows=True`."
+        assert not (accumulate_ch_flows and logspace_flows), "`accumulate_ch_flows` should be set to `False` when using `logspace_flows`."
+        assert not (accumulate_ch_flows and allow_modify_flows), "`accumulate_ch_flows` should be set to `False` when `allow_modify_flows=True`."
+        assert not (allow_neg_flows and logspace_flows), "`allow_neg_flows` should be set to `False` when using `logspace_flows`."
+        assert not (allow_neg_flows and allow_modify_flows), "`allow_neg_flows` should be set to `False` when `allow_modify_flows=True`."
 
         # Disallow modifications of `node_flows` in case of partial evaluation
         if self.provided("bk_partition_local_ids") and allow_modify_flows:
@@ -321,7 +323,8 @@ class SumLayer(Layer, nn.Module):
                     propagation_alg = propagation_alg,
                     logspace_flows = logspace_flows,
                     negate_pflows = negate_pflows, 
-                    _accumulate_ch_flows = _accumulate_ch_flows,
+                    accumulate_ch_flows = accumulate_ch_flows,
+                    allow_neg_flows = allow_neg_flows,
                     **kwargs
                 )
 
@@ -344,7 +347,8 @@ class SumLayer(Layer, nn.Module):
                     propagation_alg = propagation_alg,
                     logspace_flows = logspace_flows,
                     negate_pflows = negate_pflows, 
-                    _accumulate_ch_flows = _accumulate_ch_flows, 
+                    accumulate_ch_flows = accumulate_ch_flows, 
+                    allow_neg_flows = allow_neg_flows,
                     **kwargs
                 )
 
@@ -365,6 +369,7 @@ class SumLayer(Layer, nn.Module):
                     propagation_alg = propagation_alg,
                     logspace_flows = logspace_flows,
                     negate_pflows = negate_pflows, 
+                    allow_neg_flows = allow_neg_flows, 
                     **kwargs
                 )
 
@@ -1236,7 +1241,8 @@ class SumLayer(Layer, nn.Module):
                   propagation_alg: str = "LL", 
                   logspace_flows: bool = False, 
                   negate_pflows: bool = False, 
-                  _accumulate_ch_flows: bool = False, **kwargs) -> None:
+                  accumulate_ch_flows: bool = False, 
+                  allow_neg_flows: bool = False, **kwargs) -> None:
         """
         Back pass of sum layers.
         
@@ -1282,7 +1288,8 @@ class SumLayer(Layer, nn.Module):
                 nids, cids, pids, pfids, chids, parids, parpids, cs_block_size, local_ids, 
                 partition_id = partition_id, allow_modify_flows = allow_modify_flows,
                 propagation_alg = propagation_alg, logspace_flows = logspace_flows, 
-                negate_pflows = negate_pflows, _accumulate_ch_flows = _accumulate_ch_flows, **kwargs
+                negate_pflows = negate_pflows, accumulate_ch_flows = accumulate_ch_flows, 
+                allow_neg_flows = allow_neg_flows, **kwargs
             )
 
         elif mode == self.SPARSE:
@@ -1291,7 +1298,7 @@ class SumLayer(Layer, nn.Module):
                 nids, cids, pids, pfids, chids, parids, parpids, cs_block_size, local_ids, 
                 partition_id = partition_id, allow_modify_flows = allow_modify_flows,
                 propagation_alg = propagation_alg, logspace_flows = logspace_flows, 
-                negate_pflows = negate_pflows, _accumulate_ch_flows = _accumulate_ch_flows, **kwargs
+                negate_pflows = negate_pflows, accumulate_ch_flows = accumulate_ch_flows, **kwargs
             )
 
         elif mode == self.PYTORCH:
@@ -1302,7 +1309,7 @@ class SumLayer(Layer, nn.Module):
                 element_mars, param_flows, nids, cids, pids, pfids, 
                 chids, parids, parpids, cs_block_size,
                 propagation_alg = propagation_alg, 
-                negate_pflows = negate_pflows, _accumulate_ch_flows = _accumulate_ch_flows, **kwargs
+                negate_pflows = negate_pflows, accumulate_ch_flows = accumulate_ch_flows, **kwargs
             )
         else:
             raise ValueError(f"Not supported mode `{mode}`.")
@@ -1473,7 +1480,8 @@ class SumLayer(Layer, nn.Module):
                                chids: Optional[torch.Tensor], parids: Optional[torch.Tensor], parpids: Optional[torch.Tensor], 
                                cs_block_size: int, local_ids: Optional[torch.Tensor] = None,
                                partition_id: int = -1, allow_modify_flows: bool = False, propagation_alg: str = "LL", 
-                               logspace_flows: bool = False, negate_pflows: bool = False, _accumulate_ch_flows: bool = False, **kwargs) -> None:
+                               logspace_flows: bool = False, negate_pflows: bool = False, accumulate_ch_flows: bool = False, 
+                               allow_neg_flows: bool = False, **kwargs) -> None:
         """
         Back pass of sum layers with block-sparse processing kernel.
         
@@ -1498,7 +1506,8 @@ class SumLayer(Layer, nn.Module):
                 partition_id = partition_id, allow_modify_flows = allow_modify_flows,
                 propagation_alg = propagation_alg, 
                 logspace_flows = logspace_flows, 
-                _accumulate_ch_flows = _accumulate_ch_flows, **kwargs
+                accumulate_ch_flows = accumulate_ch_flows, 
+                allow_neg_flows = allow_neg_flows, **kwargs
             )
 
         # Flows w.r.t. parameters
@@ -1509,7 +1518,8 @@ class SumLayer(Layer, nn.Module):
                 allow_modify_flows = allow_modify_flows,
                 propagation_alg = propagation_alg, 
                 logspace_flows = logspace_flows, 
-                negate_pflows = negate_pflows, **kwargs
+                negate_pflows = negate_pflows, 
+                allow_neg_flows = allow_neg_flows, **kwargs
             )
 
         return None
@@ -1523,7 +1533,8 @@ class SumLayer(Layer, nn.Module):
                                            allow_modify_flows: tl.constexpr, logspace_flows: tl.constexpr, BLOCK_B: tl.constexpr, 
                                            TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, TILE_SIZE_M: tl.constexpr, 
                                            BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, TL_DOT: tl.constexpr, 
-                                           propagation_alg_id: tl.constexpr, accumulate_ch_flows: tl.constexpr, alpha = 0.0):
+                                           propagation_alg_id: tl.constexpr, accumulate_ch_flows: tl.constexpr, 
+                                           allow_neg_flows: tl.constexpr, alpha = 0.0):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
@@ -1619,17 +1630,23 @@ class SumLayer(Layer, nn.Module):
 
                         if propagation_alg_id == 2:
                             log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), nflows - nmars * alpha)
-                    else:
+                    elif allow_neg_flows:
                         if propagation_alg_id == 0:
-                            log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), - nmars)
+                            log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), -nmars)
                         
                         if propagation_alg_id == 2:
-                            log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), - nmars * alpha)
+                            log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), -nmars * alpha)
+                    else:
+                        if propagation_alg_id == 0:
+                            log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), tl.log(nflows) - nmars)
+                        
+                        if propagation_alg_id == 2:
+                            log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), tl.log(nflows) - nmars * alpha)
 
                 log_n_fdm_max = tl.max(log_n_fdm, axis = 0)[None,:]
                 n_fdm_sub = tl.where(log_n_fdm_max != -float("inf"), tl.exp(log_n_fdm - log_n_fdm_max), 0.0)
 
-                if allow_modify_flows == 0 and not logspace_flows:
+                if allow_neg_flows:
                     if TL_DOT == 1:
                         partial_flows = tl.dot(epars, n_fdm_sub * nflows)
                     else:
@@ -1680,7 +1697,8 @@ class SumLayer(Layer, nn.Module):
                                                  allow_modify_flows: tl.constexpr, logspace_flows: tl.constexpr, BLOCK_B: tl.constexpr, 
                                                  TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, TILE_SIZE_M: tl.constexpr, 
                                                  BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, TL_DOT: tl.constexpr, 
-                                                 propagation_alg_id: tl.constexpr, accumulate_ch_flows: tl.constexpr, alpha = 0.0):
+                                                 propagation_alg_id: tl.constexpr, accumulate_ch_flows: tl.constexpr, 
+                                                 allow_neg_flows: tl.constexpr, alpha = 0.0):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
@@ -1778,17 +1796,23 @@ class SumLayer(Layer, nn.Module):
 
                         if propagation_alg_id == 2:
                             log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), nflows - nmars * alpha)
-                    else:
+                    elif allow_neg_flows:
                         if propagation_alg_id == 0:
                             log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), -nmars)
                         
                         if propagation_alg_id == 2:
                             log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), -nmars * alpha)
+                    else:
+                        if propagation_alg_id == 0:
+                            log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), tl.log(nflows) - nmars)
+                        
+                        if propagation_alg_id == 2:
+                            log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), tl.log(nflows) - nmars * alpha)
 
                 log_n_fdm_max = tl.max(log_n_fdm, axis = 1)
                 n_fdm_sub = tl.where(log_n_fdm_max[:,None] != -float("inf"), tl.exp(log_n_fdm - log_n_fdm_max[:,None]), 0.0)
 
-                if allow_modify_flows == 0 and not logspace_flows:
+                if allow_neg_flows:
                     partial_flows = tl.sum(epars[:,:,None] * tl.trans(n_fdm_sub * nflows)[None,:,:], axis = 1)
                 else:
                     partial_flows = tl.sum(epars[:,:,None] * tl.trans(n_fdm_sub)[None,:,:], axis = 1)
@@ -1830,7 +1854,7 @@ class SumLayer(Layer, nn.Module):
                                          parpids: torch.Tensor, cs_block_size: int, local_ids: Optional[torch.Tensor] = None,
                                          partition_id: int = -1, allow_modify_flows: bool = False,
                                          propagation_alg: str = "LL", logspace_flows: bool = False, 
-                                         _accumulate_ch_flows: bool = False, **kwargs) -> None:
+                                         accumulate_ch_flows: bool = False, allow_neg_flows: bool = False, **kwargs) -> None:
 
         assert params.dim() == 1, "Expecting a 1D `params`."
 
@@ -1936,7 +1960,8 @@ class SumLayer(Layer, nn.Module):
                 num_warps = 2, # TODO: test for different devices
                 num_stages = 1,
                 propagation_alg_id = propagation_alg_id,
-                accumulate_ch_flows = _accumulate_ch_flows,
+                accumulate_ch_flows = accumulate_ch_flows,
+                allow_neg_flows = allow_neg_flows,
                 **propagation_alg_kwargs
             )
         else:
@@ -1967,7 +1992,8 @@ class SumLayer(Layer, nn.Module):
                 num_warps = 2, # TODO: test for different devices
                 num_stages = 1,
                 propagation_alg_id = propagation_alg_id,
-                accumulate_ch_flows = _accumulate_ch_flows,
+                accumulate_ch_flows = accumulate_ch_flows,
+                allow_neg_flows = allow_neg_flows,
                 **propagation_alg_kwargs
             )
 
@@ -1981,7 +2007,7 @@ class SumLayer(Layer, nn.Module):
                                            logspace_flows: tl.constexpr, TILE_SIZE_B: tl.constexpr, B_NUM_TILES: tl.constexpr, 
                                            TILE_SIZE_K: tl.constexpr, TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, 
                                            TL_DOT: tl.constexpr, propagation_alg_id: tl.constexpr, negate_pflows: tl.constexpr, 
-                                           alpha = 0.0):
+                                           allow_neg_flows: tl.constexpr, alpha = 0.0):
 
         pid_k = tl.program_id(0) # ID of size-`TILE_SIZE_K` edges
         pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
@@ -2045,14 +2071,14 @@ class SumLayer(Layer, nn.Module):
                     if logspace_flows:
                         log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), nflows - nmars)
                     else:
-                        log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), -nmars)
+                        log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), tl.log(nflows) - nmars)
 
                 log_n_fdm_max = tl.max(log_n_fdm, axis = 0)
                 n_fdm_sub = tl.where(log_n_fdm_max[None,:] != -float("inf"), tl.exp(log_n_fdm - log_n_fdm_max[None,:]), 0.0)
 
                 scaled_emars = tl.exp(emars + log_n_fdm_max[:,None])
 
-                if allow_modify_flows == 0 and not logspace_flows:
+                if allow_neg_flows:
                     if TL_DOT == 1:
                         partial_flows = tl.dot(n_fdm_sub * nflows, scaled_emars)
                     else:
@@ -2102,7 +2128,7 @@ class SumLayer(Layer, nn.Module):
                                                  logspace_flows: tl.constexpr, TILE_SIZE_B: tl.constexpr, B_NUM_TILES: tl.constexpr, 
                                                  TILE_SIZE_K: tl.constexpr, TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, 
                                                  TL_DOT: tl.constexpr, propagation_alg_id: tl.constexpr, negate_pflows: tl.constexpr, 
-                                                 alpha = 0.0):
+                                                 allow_neg_flows: tl.constexpr, alpha = 0.0):
 
         pid_k = tl.program_id(0) # ID of size-`TILE_SIZE_K` edges
         pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
@@ -2162,15 +2188,17 @@ class SumLayer(Layer, nn.Module):
 
                     if logspace_flows:
                         log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), nflows - nmars)
-                    else:
+                    elif allow_neg_flows:
                         log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), -nmars)
+                    else:
+                        log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), tl.log(nflows) - nmars)
 
                 log_n_fdm_max = tl.max(log_n_fdm, axis = 1)
                 n_fdm_sub = tl.where(log_n_fdm_max[:,None] != -float("inf"), tl.exp(log_n_fdm - log_n_fdm_max[:,None]), 0.0)
 
                 scaled_emars = tl.exp(emars + log_n_fdm_max[:,None])
 
-                if allow_modify_flows == 0 and not logspace_flows:
+                if allow_neg_flows:
                     partial_flows = tl.sum(tl.trans(n_fdm_sub * nflows)[:,:,None] * scaled_emars[None,:,:], axis = 1)
                 else:
                     partial_flows = tl.sum(tl.trans(n_fdm_sub)[:,:,None] * scaled_emars[None,:,:], axis = 1)
@@ -2210,7 +2238,8 @@ class SumLayer(Layer, nn.Module):
                                          element_mars: torch.Tensor, param_flows: torch.Tensor, nids: torch.Tensor, 
                                          cids: torch.Tensor, pids: torch.Tensor, pfids: torch.Tensor,
                                          allow_modify_flows: bool = False, propagation_alg: str = "LL", 
-                                         logspace_flows: bool = False, negate_pflows: bool = False, **kwargs) -> None:
+                                         logspace_flows: bool = False, negate_pflows: bool = False, 
+                                         allow_neg_flows: bool = False, **kwargs) -> None:
         """
         Backward pass of sum layers w.r.t. sum parameters with the block-sparse processing kernel.
         
@@ -2292,6 +2321,7 @@ class SumLayer(Layer, nn.Module):
                 TL_DOT = TL_DOT,
                 propagation_alg_id = propagation_alg_id,
                 negate_pflows = negate_pflows,
+                allow_neg_flows = allow_neg_flows,
                 **propagation_alg_kwargs
             )
 
@@ -2318,6 +2348,7 @@ class SumLayer(Layer, nn.Module):
                 TL_DOT = TL_DOT,
                 propagation_alg_id = propagation_alg_id,
                 negate_pflows = negate_pflows,
+                allow_neg_flows = allow_neg_flows,
                 **propagation_alg_kwargs
             )
 
@@ -2331,7 +2362,7 @@ class SumLayer(Layer, nn.Module):
                          cs_block_size: int, local_ids: Optional[torch.Tensor] = None,
                          partition_id: int = -1, allow_modify_flows: bool = False, 
                          propagation_alg: str = "LL", logspace_flows: bool = False, 
-                         negate_pflows: bool = False, _accumulate_ch_flows: bool = False, **kwargs) -> None:
+                         negate_pflows: bool = False, accumulate_ch_flows: bool = False, **kwargs) -> None:
         """
         Back pass of sum layers with sparse processing kernel.
         
@@ -2356,7 +2387,7 @@ class SumLayer(Layer, nn.Module):
                 allow_modify_flows = allow_modify_flows,
                 propagation_alg = propagation_alg, 
                 logspace_flows = logspace_flows, 
-                _accumulate_ch_flows = _accumulate_ch_flows, **kwargs
+                accumulate_ch_flows = accumulate_ch_flows, **kwargs
             )
 
         # Flows w.r.t. parameters
@@ -2579,7 +2610,7 @@ class SumLayer(Layer, nn.Module):
                                    element_mars: torch.Tensor, chids: torch.Tensor, parids: torch.Tensor,
                                    parpids: torch.Tensor, cs_block_size: int, local_ids: Optional[torch.Tensor] = None,
                                    allow_modify_flows: bool = False, propagation_alg: str = "LL", 
-                                   logspace_flows: bool = False, _accumulate_ch_flows: bool = False, **kwargs) -> None:
+                                   logspace_flows: bool = False, accumulate_ch_flows: bool = False, **kwargs) -> None:
 
         assert params.dim() == 1, "Expecting a 1D `params`."
 
@@ -2624,7 +2655,7 @@ class SumLayer(Layer, nn.Module):
                 BLOCK_M = BLOCK_M,
                 BLOCK_SIZE_K = self.block_size,
                 propagation_alg_id = propagation_alg_id,
-                accumulate_ch_flows = _accumulate_ch_flows,
+                accumulate_ch_flows = accumulate_ch_flows,
                 **propagation_alg_kwargs
             )
 
@@ -2660,7 +2691,7 @@ class SumLayer(Layer, nn.Module):
                     BLOCK_SIZE_M = cs_block_size,
                     BLOCK_SIZE_K = self.block_size,
                     propagation_alg_id = propagation_alg_id,
-                    accumulate_ch_flows = _accumulate_ch_flows,
+                    accumulate_ch_flows = accumulate_ch_flows,
                     **propagation_alg_kwargs
                 )
 
@@ -2692,7 +2723,7 @@ class SumLayer(Layer, nn.Module):
                         BLOCK_SIZE_M = cs_block_size,
                         BLOCK_SIZE_K = self.block_size,
                         propagation_alg_id = propagation_alg_id,
-                        accumulate_ch_flows = _accumulate_ch_flows,
+                        accumulate_ch_flows = accumulate_ch_flows,
                         **propagation_alg_kwargs
                     )
 
@@ -2927,7 +2958,7 @@ class SumLayer(Layer, nn.Module):
                           element_mars, param_flows, nids, cids, pids, pfids, 
                           chids, parids, parpids, cs_block_size, propagation_alg: str = "LL", 
                           logspace_flows: bool = False, negate_pflows: bool = False, 
-                          _accumulate_ch_flows: bool = False):
+                          accumulate_ch_flows: bool = False):
         """
         Back pass of sum layers with native pytorch.
         
@@ -2950,7 +2981,7 @@ class SumLayer(Layer, nn.Module):
             self._backward_pytorch_ele_kernel(
                 node_flows, element_flows, params, node_mars, element_mars, 
                 param_flows, chids, parids, parpids, cs_block_size, logspace_flows,
-                _accumulate_ch_flows = _accumulate_ch_flows
+                accumulate_ch_flows = accumulate_ch_flows
             )
 
         # Flows w.r.t. parameters
@@ -2966,7 +2997,7 @@ class SumLayer(Layer, nn.Module):
                                      params: torch.Tensor, node_mars: torch.Tensor, 
                                      element_mars: torch.Tensor, param_flows: Optional[torch.Tensor], 
                                      chids: torch.Tensor, parids: torch.Tensor, parpids: torch.Tensor,
-                                     cs_block_size: int, logspace_flows: bool, _accumulate_ch_flows: bool):
+                                     cs_block_size: int, logspace_flows: bool, accumulate_ch_flows: bool):
 
         num_nblocks = chids.size(0)
         num_eblocks = parids.size(1)
@@ -2981,14 +3012,14 @@ class SumLayer(Layer, nn.Module):
         )
         
         if logspace_flows:
-            if _accumulate_ch_flows:
+            if accumulate_ch_flows:
                 element_flows[chids] += (node_flows[parids] + params[parpids].log().unsqueeze(-1) + \
                     element_mars[chids].unsqueeze(1) - node_mars[parids]).logsumexp(dim = 1)
             else:
                 element_flows[chids] = (node_flows[parids] + params[parpids].log().unsqueeze(-1) + \
                     element_mars[chids].unsqueeze(1) - node_mars[parids]).logsumexp(dim = 1)
         else:
-            if _accumulate_ch_flows:
+            if accumulate_ch_flows:
                 element_flows[chids] += (node_flows[parids] * params[parpids].unsqueeze(-1) * \
                     (element_mars[chids].unsqueeze(1) - node_mars[parids]).exp()).sum(dim = 1)
             else:
