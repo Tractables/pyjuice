@@ -1621,18 +1621,24 @@ class SumLayer(Layer, nn.Module):
                             log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), nflows - nmars * alpha)
                     else:
                         if propagation_alg_id == 0:
-                            log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), tl.log(nflows) - nmars)
+                            log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), - nmars)
                         
                         if propagation_alg_id == 2:
-                            log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), tl.log(nflows) - nmars * alpha)
+                            log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), - nmars * alpha)
 
                 log_n_fdm_max = tl.max(log_n_fdm, axis = 0)[None,:]
                 n_fdm_sub = tl.where(log_n_fdm_max != -float("inf"), tl.exp(log_n_fdm - log_n_fdm_max), 0.0)
 
-                if TL_DOT == 1:
-                    partial_flows = tl.dot(epars, n_fdm_sub)
+                if allow_modify_flows == 0 and not logspace_flows:
+                    if TL_DOT == 1:
+                        partial_flows = tl.dot(epars, n_fdm_sub * nflows)
+                    else:
+                        partial_flows = tl.sum(epars[:,:,None] * n_fdm_sub[None,:,:] * nflows[None,:,:], axis = 1)
                 else:
-                    partial_flows = tl.sum(epars[:,:,None] * n_fdm_sub[None,:,:], axis = 1)
+                    if TL_DOT == 1:
+                        partial_flows = tl.dot(epars, n_fdm_sub)
+                    else:
+                        partial_flows = tl.sum(epars[:,:,None] * n_fdm_sub[None,:,:], axis = 1)
 
                 if logspace_flows:
                     partial_flows_max = emars + log_n_fdm_max
@@ -1774,15 +1780,18 @@ class SumLayer(Layer, nn.Module):
                             log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), nflows - nmars * alpha)
                     else:
                         if propagation_alg_id == 0:
-                            log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), tl.log(nflows) - nmars)
+                            log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), -nmars)
                         
                         if propagation_alg_id == 2:
-                            log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), tl.log(nflows) - nmars * alpha)
+                            log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), -nmars * alpha)
 
                 log_n_fdm_max = tl.max(log_n_fdm, axis = 1)
                 n_fdm_sub = tl.where(log_n_fdm_max[:,None] != -float("inf"), tl.exp(log_n_fdm - log_n_fdm_max[:,None]), 0.0)
 
-                partial_flows = tl.sum(epars[:,:,None] * tl.trans(n_fdm_sub)[None,:,:], axis = 1)
+                if allow_modify_flows == 0 and not logspace_flows:
+                    partial_flows = tl.sum(epars[:,:,None] * tl.trans(n_fdm_sub * nflows)[None,:,:], axis = 1)
+                else:
+                    partial_flows = tl.sum(epars[:,:,None] * tl.trans(n_fdm_sub)[None,:,:], axis = 1)
 
                 if logspace_flows:
                     partial_flows_max = emars + log_n_fdm_max[None,:]
@@ -2036,17 +2045,23 @@ class SumLayer(Layer, nn.Module):
                     if logspace_flows:
                         log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), nflows - nmars)
                     else:
-                        log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), tl.log(nflows) - nmars)
+                        log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), -nmars)
 
                 log_n_fdm_max = tl.max(log_n_fdm, axis = 0)
                 n_fdm_sub = tl.where(log_n_fdm_max[None,:] != -float("inf"), tl.exp(log_n_fdm - log_n_fdm_max[None,:]), 0.0)
 
                 scaled_emars = tl.exp(emars + log_n_fdm_max[:,None])
 
-                if TL_DOT == 1:
-                    partial_flows = tl.dot(n_fdm_sub, scaled_emars)
+                if allow_modify_flows == 0 and not logspace_flows:
+                    if TL_DOT == 1:
+                        partial_flows = tl.dot(n_fdm_sub * nflows, scaled_emars)
+                    else:
+                        partial_flows = tl.sum(n_fdm_sub[:,:,None] * nflows[:,:,None] * scaled_emars[None,:,:], axis = 1)
                 else:
-                    partial_flows = tl.sum(n_fdm_sub[:,:,None] * scaled_emars[None,:,:], axis = 1)
+                    if TL_DOT == 1:
+                        partial_flows = tl.dot(n_fdm_sub, scaled_emars)
+                    else:
+                        partial_flows = tl.sum(n_fdm_sub[:,:,None] * scaled_emars[None,:,:], axis = 1)
 
                 acc += partial_flows
 
@@ -2148,14 +2163,17 @@ class SumLayer(Layer, nn.Module):
                     if logspace_flows:
                         log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), nflows - nmars)
                     else:
-                        log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), tl.log(nflows) - nmars)
+                        log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), -nmars)
 
                 log_n_fdm_max = tl.max(log_n_fdm, axis = 1)
                 n_fdm_sub = tl.where(log_n_fdm_max[:,None] != -float("inf"), tl.exp(log_n_fdm - log_n_fdm_max[:,None]), 0.0)
 
                 scaled_emars = tl.exp(emars + log_n_fdm_max[:,None])
 
-                partial_flows = tl.sum(tl.trans(n_fdm_sub)[:,:,None] * scaled_emars[None,:,:], axis = 1)
+                if allow_modify_flows == 0 and not logspace_flows:
+                    partial_flows = tl.sum(tl.trans(n_fdm_sub * nflows)[:,:,None] * scaled_emars[None,:,:], axis = 1)
+                else:
+                    partial_flows = tl.sum(tl.trans(n_fdm_sub)[:,:,None] * scaled_emars[None,:,:], axis = 1)
 
                 acc += partial_flows
 
