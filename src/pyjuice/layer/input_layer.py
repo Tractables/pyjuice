@@ -111,10 +111,16 @@ class InputLayer(Layer, nn.Module):
         self.bk_flow_fn = self.nodes[0].dist.bk_flow_fn
         self.sample_fn = self.nodes[0].dist.sample_fn
         self.em_fn = self.nodes[0].dist.em_fn
+
         if hasattr(self.nodes[0].dist, "bk_flow_mask_fn"):
             self.bk_flow_mask_fn = self.nodes[0].dist.bk_flow_mask_fn
         else:
             self.bk_flow_mask_fn = None
+        
+        if hasattr(self.nodes[0].dist, "partition_fn"):
+            self.fw_partition_fn = self.nodes[0].dist.partition_fn
+        else:
+            self.fw_partition_fn = None
 
         ## Prepair and compile the layer ##
         num_vars = len(node_vars[0])
@@ -558,8 +564,54 @@ class InputLayer(Layer, nn.Module):
                 else:
                     raise NotImplementedError("CPU minibatch em fn for input nodes is not implemented.")
 
+    def eval_partition_fn(self, node_mars: torch.Tensor, params: Optional[Dict] = None):
+        """
+        Evaluate the partition function.
+        node_mars: [num_nodes]
+        """
+
+        if params is None:
+            params = self.params
+        else:
+            params = params["params"]
+
+        assert params.dim() == 1
+
+        if "cuda" in self.device.type:
+            node_offset = self._output_ind_range[0]
+            layer_num_nodes = self._output_ind_range[1] - self._output_ind_range[0]
+
+            if not self.provided("_partition_fn_kernel"):
+                self._partition_fn_kernel = self._compile_triton_kernel(self._partition_fn_kernel_template, partition_fn = self.fw_partition_fn)
+
+            if self._need_2nd_kernel_dim():
+                BLOCK_SIZE = 32
+                TILE_SIZE_K = 32
+            else:
+                BLOCK_SIZE = 1024
+                TILE_SIZE_K = 1
+
+            grid = (triton.cdiv(layer_num_nodes, BLOCK_SIZE),)
+
+            self._partition_fn_kernel[grid](
+                params_ptr = self.params,
+                node_mars_ptr = node_mars,
+                s_pids_ptr = self.s_pids,
+                metadata_ptr = self.metadata,
+                s_mids_ptr = self.s_mids,
+                layer_num_nodes = layer_num_nodes,
+                node_offset = node_offset,
+                BLOCK_SIZE = BLOCK_SIZE,
+                TILE_SIZE_K = TILE_SIZE_K,
+                num_warps = 8
+            )
+
+        else:
+            raise NotImplementedError("CPU minibatch partition fn for input nodes is not implemented.")
+
     def add_missing_flows(self, node_flows: torch.Tensor, logspace_flows: bool = False, scale: float = 1.0):
         """
+        Add missing flows specified by `node_flows` to the input node parameters.
         node_flows: [num_nodes]
         """
 
@@ -904,6 +956,22 @@ class InputLayer(Layer, nn.Module):
 
         flow_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
                 s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE)
+
+    @staticmethod
+    def _partition_fn_kernel_template(partition_fn, params_ptr, node_mars_ptr, s_pids_ptr, metadata_ptr, s_mids_ptr, layer_num_nodes: tl.constexpr,
+                                      node_offset: tl.constexpr, BLOCK_SIZE: tl.constexpr, TILE_SIZE_K: tl.constexpr):
+        pid = tl.program_id(axis = 0)
+        block_start = pid * BLOCK_SIZE
+
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < layer_num_nodes
+
+        s_pids = tl.load(s_pids_ptr + offsets, mask = mask, other = 0)
+
+        mars = partition_fn(offsets, params_ptr, s_pids, metadata_ptr, s_mids_ptr, mask, BLOCK_SIZE, TILE_SIZE_K)
+
+        node_offsets = node_offset + offsets
+        tl.store(node_mars_ptr + node_offsets, mars, mask = mask)
 
     @staticmethod
     def _sample_kernel_template(sample_fn, samples_ptr, params_ptr, nflow_xids_ptr, nflow_yids_ptr, vids_ptr, s_pids_ptr, metadata_ptr, s_mids_ptr,

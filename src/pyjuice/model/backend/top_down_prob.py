@@ -8,6 +8,8 @@ import triton.language as tl
 from pyjuice.layer import SumLayer, ProdLayer, InputLayer
 from pyjuice.utils.kernel_launcher import FastJITFunction
 
+from .eval_partition import eval_partition_fn, prod_layer_partition_fn
+
 
 @FastJITFunction
 def prod_layer_td_backward_kernel(node_flows, element_flows, u_cids, parids, c_num_nblocks: tl.constexpr,
@@ -70,9 +72,10 @@ def prod_layer_td_backward(layer, node_flows, element_flows):
 
 
 @FastJITFunction
-def sum_layer_td_backward_block_kernel(node_flows, element_flows, params, chids, parids, parpids, n_num_nodes: tl.constexpr,
-                                       c_num_nodes: tl.constexpr, TILE_SIZE_N: tl.constexpr, TILE_SIZE_C: tl.constexpr,
-                                       n_block_size: tl.constexpr, c_block_size: tl.constexpr, NUM_N_BLKS: tl.constexpr):
+def sum_layer_td_backward_block_kernel(node_flows, element_flows, node_mars, element_mars, params, chids, parids, parpids, 
+                                       n_num_nodes: tl.constexpr, c_num_nodes: tl.constexpr, TILE_SIZE_N: tl.constexpr, 
+                                       TILE_SIZE_C: tl.constexpr, n_block_size: tl.constexpr, c_block_size: tl.constexpr, 
+                                       NUM_N_BLKS: tl.constexpr, pc_is_normalized: tl.constexpr):
     pid_n = tl.program_id(0)
     pid_c = tl.program_id(1)
 
@@ -93,14 +96,21 @@ def sum_layer_td_backward_block_kernel(node_flows, element_flows, params, chids,
     pids = pid_base + offs_cnode[:,None] * n_block_size + offs_nnode[None,:] # [TILE_SIZE_C, TILE_SIZE_N]
     epars = tl.load(params + pids)
 
+    if not pc_is_normalized:
+        cmars = tl.load(element_mars + cids) # [TILE_SIZE_C]
+        nmars = tl.load(node_mars + nids) # [TILE_SIZE_N]
+
+        epars = tl.exp(tl.log(epars) + cmars[:,None] - nmars[None,:])
+
     cflows = tl.sum(epars * nflows[None,:], axis = 1)
     tl.atomic_add(element_flows + cids, cflows)
 
 
 @FastJITFunction
-def sum_layer_td_backward_node_kernel(node_flows, element_flows, params, chids, parids, parpids, n_num_nodes: tl.constexpr,
-                                      c_num_nodes: tl.constexpr, TILE_SIZE_N: tl.constexpr, TILE_SIZE_C: tl.constexpr,
-                                      n_block_size: tl.constexpr, c_block_size: tl.constexpr, NUM_N_BLKS: tl.constexpr):
+def sum_layer_td_backward_node_kernel(node_flows, element_flows, node_mars, element_mars, params, chids, parids, parpids, 
+                                      n_num_nodes: tl.constexpr, c_num_nodes: tl.constexpr, TILE_SIZE_N: tl.constexpr, 
+                                      TILE_SIZE_C: tl.constexpr, n_block_size: tl.constexpr, c_block_size: tl.constexpr, 
+                                      NUM_N_BLKS: tl.constexpr, pc_is_normalized: tl.constexpr):
     pid_n = tl.program_id(0)
     pid_c = tl.program_id(1)
 
@@ -127,11 +137,17 @@ def sum_layer_td_backward_node_kernel(node_flows, element_flows, params, chids, 
     pids = pids_base + offs_cnode[:,None] * n_block_size + offs_nnode[None,:] # [TILE_SIZE_C, TILE_SIZE_N]
     epars = tl.load(params + pids, mask = cn_mask, other = 0.0)
 
+    if not pc_is_normalized:
+        cmars = tl.load(element_mars + cids) # [TILE_SIZE_C]
+        nmars = tl.load(node_mars + nids, mask = cn_mask, other = 0.0) # [TILE_SIZE_C, TILE_SIZE_N]
+
+        epars = tl.exp(tl.log(epars) + cmars[:,None] - nmars)
+
     cflows = tl.sum(epars * nflows, axis = 1)
     tl.atomic_add(element_flows + cids, cflows)
 
 
-def sum_layer_td_backward(layer, node_flows, element_flows, params):
+def sum_layer_td_backward(layer, node_flows, element_flows, node_mars, element_mars, params, pc_is_normalized = True):
     block_size = layer.block_size
     for partition_id in range(layer.num_bk_partitions):
         chids = layer.partitioned_chids[partition_id]
@@ -151,6 +167,8 @@ def sum_layer_td_backward(layer, node_flows, element_flows, params):
             sum_layer_td_backward_block_kernel[grid](
                 node_flows,
                 element_flows,
+                node_mars,
+                element_mars,
                 params,
                 chids,
                 parids,
@@ -161,7 +179,8 @@ def sum_layer_td_backward(layer, node_flows, element_flows, params):
                 TILE_SIZE_C = TILE_SIZE_C,
                 n_block_size = block_size,
                 c_block_size = cs_block_size,
-                NUM_N_BLKS = parids.size(1)
+                NUM_N_BLKS = parids.size(1),
+                pc_is_normalized = pc_is_normalized
             )
 
         else:
@@ -173,6 +192,8 @@ def sum_layer_td_backward(layer, node_flows, element_flows, params):
             sum_layer_td_backward_node_kernel[grid](
                 node_flows,
                 element_flows,
+                node_mars,
+                element_mars,
                 params,
                 chids,
                 parids,
@@ -183,15 +204,15 @@ def sum_layer_td_backward(layer, node_flows, element_flows, params):
                 TILE_SIZE_C = TILE_SIZE_C,
                 n_block_size = block_size,
                 c_block_size = cs_block_size,
-                NUM_N_BLKS = parids.size(1)
+                NUM_N_BLKS = parids.size(1),
+                pc_is_normalized = pc_is_normalized
             )
 
 
 @FastJITFunction
-def sum_layer_td_pflow_kernel(node_flows, params, param_flows, nids, cids, pids, pfids, scale,
-                              n_num_nodes: tl.constexpr, c_num_nodes: tl.constexpr,
-                              TILE_SIZE_N: tl.constexpr, TILE_SIZE_C: tl.constexpr,
-                              n_block_size: tl.constexpr):
+def sum_layer_td_pflow_kernel(node_flows, node_mars, element_mars, params, param_flows, nids, cids, pids, pfids, scale,
+                              n_num_nodes: tl.constexpr, c_num_nodes: tl.constexpr, TILE_SIZE_N: tl.constexpr, TILE_SIZE_C: tl.constexpr,
+                              n_block_size: tl.constexpr, pc_is_normalized: tl.constexpr):
     pid_c = tl.program_id(0)
     pid_n = tl.program_id(1)
 
@@ -213,6 +234,14 @@ def sum_layer_td_pflow_kernel(node_flows, params, param_flows, nids, cids, pids,
     epids = pids_base + offs_nnode[:,None] # [TILE_SIZE_N, TILE_SIZE_C]
     epars = tl.load(params + epids, mask = nc_mask, other = 0.0)
 
+    if not pc_is_normalized:
+        nmars = tl.load(node_mars + snids, mask = n_mask, other = 0.0)
+
+        cids_base = tl.load(cids + ngroup_ids[:,None] * c_num_nodes + offs_cnode[None,:], mask = c_mask[None,:])
+        cmars = tl.load(element_mars + cids_base, mask = c_mask[None,:], other = 0.0) # [TILE_SIZE_N, TILE_SIZE_C]
+
+        epars = tl.exp(tl.log(epars) + cmars - nmars[:,None])
+
     eflows = epars * nflows[:,None] * scale
 
     pfids_base = tl.load(pfids + ngroup_ids[:,None] * c_num_nodes + offs_cnode[None,:], mask = nc_mask)
@@ -220,7 +249,7 @@ def sum_layer_td_pflow_kernel(node_flows, params, param_flows, nids, cids, pids,
     tl.atomic_add(param_flows + epfids, eflows, mask = nc_mask)
 
 
-def sum_layer_td_pflow(layer, node_flows, params, param_flows, scale):
+def sum_layer_td_pflow(layer, node_flows, node_mars, element_mars, params, param_flows, scale, pc_is_normalized = True):
     block_size = layer.block_size
     for partition_id in range(layer.num_fw_partitions):
         nids = layer.partitioned_nids[partition_id]
@@ -238,6 +267,8 @@ def sum_layer_td_pflow(layer, node_flows, params, param_flows, scale):
 
         sum_layer_td_pflow_kernel[grid](
             node_flows,
+            node_mars,
+            element_mars,
             params,
             param_flows,
             nids,
@@ -249,15 +280,19 @@ def sum_layer_td_pflow(layer, node_flows, params, param_flows, scale):
             c_num_nodes = c_num_nodes,
             TILE_SIZE_N = TILE_SIZE_N,
             TILE_SIZE_C = TILE_SIZE_C,
-            n_block_size = block_size
+            n_block_size = block_size,
+            pc_is_normalized = pc_is_normalized
         )
 
 
-def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0):
+def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0, pc_is_normalized: bool = True):
     """
     Computes the top-down probabilities of every node.
     We use the first # nodes entries in `pc.node_flows` and the first # element entries in `pc.element_flows`.
     """
+    assert hasattr(pc, "node_flows") and hasattr(pc, "element_flows")
+    assert pc.node_flows.numel() >= pc.num_nodes
+    assert pc.element_flows.numel() >= pc.num_elements
 
     node_flows = pc.node_flows.view(-1) # Reuse the allocated memory
     element_flows = pc.element_flows.view(-1)
@@ -267,9 +302,22 @@ def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0):
 
     node_flows[pc._root_node_range[0]:pc._root_node_range[1]] = 1.0
 
+    if not pc_is_normalized:
+        # Run a forward pass to evaluate the partition function of every node
+        eval_partition_fn(pc)
+        node_mars = pc.node_mars.view(-1)
+        element_mars = pc.element_mars.view(-1)
+    else:
+        node_mars, element_mars = None, None
+
     # Backward pass over the inner layers
     for layer_id in range(len(pc.inner_layer_groups) - 1, -1, -1):
         layer_group = pc.inner_layer_groups[layer_id]
+
+        if not pc_is_normalized and layer_group.is_sum():
+            prod_layer_group = pc.inner_layer_groups[layer_id]
+            for layer in prod_layer_group:
+                prod_layer_partition_fn(layer, node_mars, element_mars, pc.params)
 
         for layer in layer_group:
             if layer.is_prod():
@@ -277,10 +325,12 @@ def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0):
 
             elif layer.is_sum():
                 element_flows[:pc.num_nodes] = 0.0
-                sum_layer_td_backward(layer, node_flows, element_flows, pc.params)
+                sum_layer_td_backward(layer, node_flows, element_flows, node_mars, element_mars, pc.params, 
+                                      pc_is_normalized = pc_is_normalized)
 
                 if update_pflow:
-                    sum_layer_td_pflow(layer, node_flows, pc.params, pc.param_flows, scale)
+                    sum_layer_td_pflow(layer, node_flows, node_mars, element_mars, pc.params, pc.param_flows, scale,
+                                       pc_is_normalized = pc_is_normalized)
 
     # Backward pass over the input layers
     for layer in pc.input_layer_group:

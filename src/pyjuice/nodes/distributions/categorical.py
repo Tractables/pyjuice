@@ -182,6 +182,32 @@ class Categorical(Distribution):
             new_param = (1.0 - step_size) * param + step_size * (flow + numerate_pseudocount) / cum_flow
             tl.store(params_ptr + s_pids + cat_id, new_param, mask = cat_mask)
 
+    @staticmethod
+    def partition_fn(local_offsets, params_ptr, s_pids, metadata_ptr, s_mids_ptr, mask, BLOCK_SIZE, TILE_SIZE_K):
+        # Get `num_cats` from `metadata`
+        s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
+        num_cats = tl.load(metadata_ptr + s_mids, mask = mask, other = 0).to(tl.int64)
+
+        max_num_cats = tl.max(num_cats, axis = 0)
+
+        num_iters = tlmath.ceil(max_num_cats / TILE_SIZE_K).to(tl.int64)
+
+        cat_ids = tl.arange(0, TILE_SIZE_K)
+        mars = tl.zeros([BLOCK_SIZE], dtype = tl.float32)
+
+        for i in range(num_iters):
+            cat_mask = mask[:,None] & (cat_ids[None,:] < num_cats[:,None])
+
+            p_offsets = s_pids[:,None] + cat_ids[None,:]
+            param = tl.load(params_ptr + p_offsets, mask = cat_mask, other = 0)
+
+            mars += tl.sum(param, axis = 1)
+
+            cat_ids += TILE_SIZE_K
+
+        mars = tl.log(mars)
+        return mars
+
     def _get_constructor(self):
         return Categorical, {"num_cats": self.num_cats}
 

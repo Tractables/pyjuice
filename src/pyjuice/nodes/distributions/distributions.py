@@ -158,6 +158,22 @@ class Distribution():
         """
         raise NotImplementedError()
 
+    @staticmethod
+    def partition_fn(local_offsets, params_ptr, s_pids, metadata_ptr, s_mids_ptr, mask, BLOCK_SIZE, TILE_SIZE_K):
+        """
+        Evaluate partition function
+
+        :param local_offsets: [BLOCK_SIZE] the local indices of the to-be-processed input nodes
+        :param params_ptr: pointer to the parameter vector
+        :param s_pids: [BLOCK_SIZE] start parameter index (offset) for all input nodes
+        :param metadata_ptr: pointer to metadata
+        :param s_mids_ptr: pointer to the start metadata index (offset)
+        :param mask: [BLOCK_SIZE] indicate whether each node should be processed
+        :param BLOCK_SIZE: CUDA block size
+        :param TILE_SIZE_K: tile size for processing each individual input node
+        """
+        raise NotImplementedError()
+
     def _get_constructor(self):
         raise NotImplementedError()
 
