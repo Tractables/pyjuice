@@ -48,100 +48,105 @@ def test_simple_model_tdp():
     pc = TensorCircuit(ns, layer_sparsity_tol = 0.1)
     pc.to(device)
 
-    pc.init_param_flows()
+    pc._init_buffer(name = "node_mars", shape = (pc.num_nodes, 1), set_value = 0.0)
+    pc._init_buffer(name = "element_mars", shape = (pc.num_elements, 1), set_value = 0.0)
     pc._init_buffer(name = "node_flows", shape = (pc.num_nodes, 1), set_value = 0.0)
     pc._init_buffer(name = "element_flows", shape = (pc.num_elements, 1), set_value = 0.0)
 
-    eval_top_down_probs(pc, update_pflow = True, scale = 1.0)
+    for pc_is_normalized in [True, False]:
 
-    ns_params = ns._params.reshape(-1)
+        pc.init_param_flows(flows_memory = 0.0)
 
-    np4_tdp = ns_params[:32]
-    ns0_tdp = np4_tdp
-    sid, eid = ns0._output_ind_range
-    assert torch.all(torch.abs(ns0_tdp - pc.node_flows[sid:eid,0].cpu()) < 1e-5)
+        eval_top_down_probs(pc, update_pflow = True, scale = 1.0, pc_is_normalized = pc_is_normalized)
 
-    np5_tdp = ns_params[32:64]
-    ns1_tdp = np5_tdp
-    sid, eid = ns1._output_ind_range
-    assert torch.all(torch.abs(ns1_tdp - pc.node_flows[sid:eid,0].cpu()) < 1e-5)
+        ns_params = ns._params.reshape(-1)
 
-    np6_tdp = ns_params[64:96]
-    ns2_tdp = np6_tdp
-    sid, eid = ns2._output_ind_range
-    assert torch.all(torch.abs(ns2_tdp - pc.node_flows[sid:eid,0].cpu()) < 1e-5)
+        np4_tdp = ns_params[:32]
+        ns0_tdp = np4_tdp
+        sid, eid = ns0._output_ind_range
+        assert torch.all(torch.abs(ns0_tdp - pc.node_flows[sid:eid,0].cpu()) < 1e-5)
 
-    sid, eid = ns._param_flow_range
-    assert torch.all(torch.abs(ns_params - pc.param_flows[sid:eid].cpu()) < 1e-5)
+        np5_tdp = ns_params[32:64]
+        ns1_tdp = np5_tdp
+        sid, eid = ns1._output_ind_range
+        assert torch.all(torch.abs(ns1_tdp - pc.node_flows[sid:eid,0].cpu()) < 1e-5)
 
-    ns0_params = ns0._params.reshape(2, 4, 16, 16).permute(0, 2, 1, 3).reshape(32, 64)
-    ns0_epars_tdp = ns0_tdp[:,None] * ns0_params
-    np03_tdp = (ns0_tdp[None,:] @ ns0_params).squeeze(0)
-    np0_tdp = np03_tdp[:32]
-    np3_tdp = np03_tdp[32:]
+        np6_tdp = ns_params[64:96]
+        ns2_tdp = np6_tdp
+        sid, eid = ns2._output_ind_range
+        assert torch.all(torch.abs(ns2_tdp - pc.node_flows[sid:eid,0].cpu()) < 1e-5)
 
-    sid, eid = np0._output_ind_range
-    assert torch.all(torch.abs(np0_tdp - pc.element_flows[sid:eid,0].cpu()) < 1e-5)
+        sid, eid = ns._param_flow_range
+        assert torch.all(torch.abs(ns_params - pc.param_flows[sid:eid].cpu()) < 1e-5)
 
-    sid, eid = np3._output_ind_range
-    assert torch.all(torch.abs(np3_tdp - pc.element_flows[sid:eid,0].cpu()) < 1e-5)
+        ns0_params = ns0._params.reshape(2, 4, 16, 16).permute(0, 2, 1, 3).reshape(32, 64)
+        ns0_epars_tdp = ns0_tdp[:,None] * ns0_params
+        np03_tdp = (ns0_tdp[None,:] @ ns0_params).squeeze(0)
+        np0_tdp = np03_tdp[:32]
+        np3_tdp = np03_tdp[32:]
 
-    sid, eid = ns0._param_flow_range
-    epars_flow = pc.param_flows[sid:eid].reshape(2, 4, 16, 16).permute(0, 3, 1, 2).reshape(32, 64)
-    assert torch.all(torch.abs(ns0_epars_tdp - epars_flow.cpu()) < 1e-5)
+        sid, eid = np0._output_ind_range
+        assert torch.all(torch.abs(np0_tdp - pc.element_flows[sid:eid,0].cpu()) < 1e-5)
 
-    ns1_params = ns1._params.reshape(2, 2, 16, 16).permute(0, 2, 1, 3).reshape(32, 32)
-    ns1_epars_tdp = ns1_tdp[:,None] * ns1_params
-    np1_tdp = (ns1_tdp[None,:] @ ns1_params).squeeze(0)
-    
-    sid, eid = np1._output_ind_range
-    assert torch.all(torch.abs(np1_tdp - pc.element_flows[sid:eid,0].cpu()) < 1e-5)
+        sid, eid = np3._output_ind_range
+        assert torch.all(torch.abs(np3_tdp - pc.element_flows[sid:eid,0].cpu()) < 1e-5)
 
-    sid, eid = ns1._param_flow_range
-    epars_flow = pc.param_flows[sid:eid].reshape(2, 2, 16, 16).permute(0, 3, 1, 2).reshape(32, 32)
-    assert torch.all(torch.abs(ns1_epars_tdp - epars_flow.cpu()) < 1e-5)
+        sid, eid = ns0._param_flow_range
+        epars_flow = pc.param_flows[sid:eid].reshape(2, 4, 16, 16).permute(0, 3, 1, 2).reshape(32, 64)
+        assert torch.all(torch.abs(ns0_epars_tdp - epars_flow.cpu()) < 1e-5)
 
-    ns2_params = ns2._params.reshape(2, 2, 16, 16).permute(0, 2, 1, 3).reshape(32, 32)
-    ns2_epars_tdp = ns2_tdp[:,None] * ns2_params
-    np2_tdp = (ns2_tdp[None,:] @ ns2_params).squeeze(0)
+        ns1_params = ns1._params.reshape(2, 2, 16, 16).permute(0, 2, 1, 3).reshape(32, 32)
+        ns1_epars_tdp = ns1_tdp[:,None] * ns1_params
+        np1_tdp = (ns1_tdp[None,:] @ ns1_params).squeeze(0)
+        
+        sid, eid = np1._output_ind_range
+        assert torch.all(torch.abs(np1_tdp - pc.element_flows[sid:eid,0].cpu()) < 1e-5)
 
-    sid, eid = ns2._param_flow_range
-    epars_flow = pc.param_flows[sid:eid].reshape(2, 2, 16, 16).permute(0, 3, 1, 2).reshape(32, 32)
-    assert torch.all(torch.abs(ns2_epars_tdp - epars_flow.cpu()) < 1e-5)
+        sid, eid = ns1._param_flow_range
+        epars_flow = pc.param_flows[sid:eid].reshape(2, 2, 16, 16).permute(0, 3, 1, 2).reshape(32, 32)
+        assert torch.all(torch.abs(ns1_epars_tdp - epars_flow.cpu()) < 1e-5)
 
-    sid, eid = np2._output_ind_range
-    assert torch.all(torch.abs(np2_tdp - pc.element_flows[sid:eid,0].cpu()) < 1e-5)
+        ns2_params = ns2._params.reshape(2, 2, 16, 16).permute(0, 2, 1, 3).reshape(32, 32)
+        ns2_epars_tdp = ns2_tdp[:,None] * ns2_params
+        np2_tdp = (ns2_tdp[None,:] @ ns2_params).squeeze(0)
 
-    ni0_tdp = np0_tdp + np3_tdp + np5_tdp + np6_tdp
-    ni1_tdp = np0_tdp + np2_tdp + np3_tdp + np5_tdp
-    ni2_tdp = np1_tdp + np2_tdp + np4_tdp
-    ni3_tdp = np1_tdp + np4_tdp + np6_tdp
+        sid, eid = ns2._param_flow_range
+        epars_flow = pc.param_flows[sid:eid].reshape(2, 2, 16, 16).permute(0, 3, 1, 2).reshape(32, 32)
+        assert torch.all(torch.abs(ns2_epars_tdp - epars_flow.cpu()) < 1e-5)
 
-    sid, eid = ni0._output_ind_range
-    assert torch.all(torch.abs(ni0_tdp - pc.node_flows[sid:eid,0].cpu()) < 1e-5)
+        sid, eid = np2._output_ind_range
+        assert torch.all(torch.abs(np2_tdp - pc.element_flows[sid:eid,0].cpu()) < 1e-5)
 
-    sid, eid = ni1._output_ind_range
-    assert torch.all(torch.abs(ni1_tdp - pc.node_flows[sid:eid,0].cpu()) < 1e-5)
+        ni0_tdp = np0_tdp + np3_tdp + np5_tdp + np6_tdp
+        ni1_tdp = np0_tdp + np2_tdp + np3_tdp + np5_tdp
+        ni2_tdp = np1_tdp + np2_tdp + np4_tdp
+        ni3_tdp = np1_tdp + np4_tdp + np6_tdp
 
-    sid, eid = ni2._output_ind_range
-    assert torch.all(torch.abs(ni2_tdp - pc.node_flows[sid:eid,0].cpu()) < 1e-5)
+        sid, eid = ni0._output_ind_range
+        assert torch.all(torch.abs(ni0_tdp - pc.node_flows[sid:eid,0].cpu()) < 1e-5)
 
-    sid, eid = ni3._output_ind_range
-    assert torch.all(torch.abs(ni3_tdp - pc.node_flows[sid:eid,0].cpu()) < 1e-5)
+        sid, eid = ni1._output_ind_range
+        assert torch.all(torch.abs(ni1_tdp - pc.node_flows[sid:eid,0].cpu()) < 1e-5)
 
-    input_layer = pc.input_layer_group[0]
+        sid, eid = ni2._output_ind_range
+        assert torch.all(torch.abs(ni2_tdp - pc.node_flows[sid:eid,0].cpu()) < 1e-5)
 
-    ni0_epars_tdp = ni0_tdp[:,None] * input_layer.params[:32*4].reshape(32, 4).cpu()
-    assert torch.all(torch.abs(ni0_epars_tdp - input_layer.param_flows[:32*4].reshape(32, 4).cpu()) < 1e-5)
+        sid, eid = ni3._output_ind_range
+        assert torch.all(torch.abs(ni3_tdp - pc.node_flows[sid:eid,0].cpu()) < 1e-5)
 
-    ni1_epars_tdp = ni1_tdp[:,None] * input_layer.params[32*4:32*4*2].reshape(32, 4).cpu()
-    assert torch.all(torch.abs(ni1_epars_tdp - input_layer.param_flows[32*4:32*4*2].reshape(32, 4).cpu()) < 1e-5)
+        input_layer = pc.input_layer_group[0]
 
-    ni2_epars_tdp = ni2_tdp[:,None] * input_layer.params[32*4*2:32*4*2+32*6].reshape(32, 6).cpu()
-    assert torch.all(torch.abs(ni2_epars_tdp - input_layer.param_flows[32*4*2:32*4*2+32*6].reshape(32, 6).cpu()) < 1e-5)
+        ni0_epars_tdp = ni0_tdp[:,None] * input_layer.params[:32*4].reshape(32, 4).cpu()
+        assert torch.all(torch.abs(ni0_epars_tdp - input_layer.param_flows[:32*4].reshape(32, 4).cpu()) < 1e-5)
 
-    ni3_epars_tdp = ni3_tdp[:,None] * input_layer.params[32*4*2+32*6:32*4*2+32*6*2].reshape(32, 6).cpu()
-    assert torch.all(torch.abs(ni3_epars_tdp - input_layer.param_flows[32*4*2+32*6:32*4*2+32*6*2].reshape(32, 6).cpu()) < 1e-5)
+        ni1_epars_tdp = ni1_tdp[:,None] * input_layer.params[32*4:32*4*2].reshape(32, 4).cpu()
+        assert torch.all(torch.abs(ni1_epars_tdp - input_layer.param_flows[32*4:32*4*2].reshape(32, 4).cpu()) < 1e-5)
+
+        ni2_epars_tdp = ni2_tdp[:,None] * input_layer.params[32*4*2:32*4*2+32*6].reshape(32, 6).cpu()
+        assert torch.all(torch.abs(ni2_epars_tdp - input_layer.param_flows[32*4*2:32*4*2+32*6].reshape(32, 6).cpu()) < 1e-5)
+
+        ni3_epars_tdp = ni3_tdp[:,None] * input_layer.params[32*4*2+32*6:32*4*2+32*6*2].reshape(32, 6).cpu()
+        assert torch.all(torch.abs(ni3_epars_tdp - input_layer.param_flows[32*4*2+32*6:32*4*2+32*6*2].reshape(32, 6).cpu()) < 1e-5)
 
 
 def test_scaled_mini_batch_em():
