@@ -609,11 +609,16 @@ class InputLayer(Layer, nn.Module):
         else:
             raise NotImplementedError("CPU minibatch partition fn for input nodes is not implemented.")
 
-    def add_missing_flows(self, node_flows: torch.Tensor, logspace_flows: bool = False, scale: float = 1.0):
+    def add_missing_flows(self, node_flows: torch.Tensor, node_mars: Optional[torch.Tensor] = None, logspace_flows: bool = False, 
+                          scale: float = 1.0, pc_is_normalized: bool = True):
         """
         Add missing flows specified by `node_flows` to the input node parameters.
         node_flows: [num_nodes]
         """
+
+        if not pc_is_normalized:
+            sid, eid = self._output_ind_range
+            node_flows[sid:eid] /= torch.exp(node_mars[sid:eid])
 
         if "cuda" in self.device.type:
             node_offset = self._output_ind_range[0]
