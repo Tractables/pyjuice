@@ -1676,8 +1676,7 @@ class SumLayer(Layer, nn.Module):
 
             # Increment `nmars_ptr`
             parids_inc = tl.load(parids_inc_ptr)
-            if allow_modify_flows == 0:
-                nmars_ptr += parids_inc[:,None] * batch_size
+            nmars_ptr += parids_inc[:,None] * batch_size
             nflows_ptr += parids_inc[:,None] * batch_size
             parids_inc_ptr += ptr_inc_step
 
@@ -1836,8 +1835,7 @@ class SumLayer(Layer, nn.Module):
 
             # Increment `nmars_ptr`
             parids_inc = tl.load(parids_inc_ptr)
-            if allow_modify_flows == 0:
-                nmars_ptr += parids_inc[None,:] * batch_size
+            nmars_ptr += parids_inc[None,:] * batch_size
             nflows_ptr += parids_inc[None,:] * batch_size
             parids_inc_ptr += ptr_inc_step
 
