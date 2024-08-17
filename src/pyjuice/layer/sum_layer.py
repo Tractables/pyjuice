@@ -2095,8 +2095,7 @@ class SumLayer(Layer, nn.Module):
 
             # Increment `emars_ptr`, `nmars_ptr`, and `nmars_ptr`
             emars_ptr += TILE_SIZE_B
-            if allow_modify_flows == 0:
-                nmars_ptr += TILE_SIZE_B
+            nmars_ptr += TILE_SIZE_B
             nflows_ptr += TILE_SIZE_B
 
             # Update batch mask
@@ -2209,8 +2208,7 @@ class SumLayer(Layer, nn.Module):
 
             # Increment `emars_ptr`, `nmars_ptr`, and `nmars_ptr`
             emars_ptr += TILE_SIZE_B
-            if allow_modify_flows == 0:
-                nmars_ptr += TILE_SIZE_B
+            nmars_ptr += TILE_SIZE_B
             nflows_ptr += TILE_SIZE_B
 
             # Update batch mask
