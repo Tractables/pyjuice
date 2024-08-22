@@ -433,4 +433,4 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
         return samples.permute(1, 0).contiguous()
     else:
         # In this case, we do not explicitly sample input nodes
-        return None
+        return node_samples
