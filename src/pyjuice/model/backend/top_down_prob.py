@@ -333,7 +333,8 @@ def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0, pc_is
                                        pc_is_normalized = pc_is_normalized)
 
     # Backward pass over the input layers
-    for layer in pc.input_layer_group:
-        layer.add_missing_flows(node_flows, scale = scale)
+    if update_pflow:
+        for layer in pc.input_layer_group:
+            layer.add_missing_flows(node_flows, scale = scale)
 
     return None
