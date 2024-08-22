@@ -735,7 +735,7 @@ class TensorCircuit(nn.Module):
             if not flag and tensor.size(i) != d:
                 flag = True
         
-        if not flag and check_device and tensor.device != self.device:
+        if not flag and check_device and self.device.index is not None and tensor.device != self.device:
             flag = True
 
         if flag:
