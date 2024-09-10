@@ -1107,7 +1107,7 @@ class InputLayer(Layer, nn.Module):
             lambda str: str.strip(" "),
             filter(lambda arg: arg.split(":")[0].strip(" ") not in sub_fns, fn_args)
         ))
-        seed_str = f"_{random.randint(0,1e8)}"
+        seed_str = f"_{random.randint(0,int(1e8))}"
         new_fn_header = fn_name + seed_str + "(" + ",".join(fn_args) + "):"
         global_key = fn_name.split("def")[1].strip(" ") + seed_str
 
