@@ -123,6 +123,8 @@ The biggest advantage of PyJuice is its speed and scalability. We benchmark PyJu
 
 As indicated by the tables, PyJuice is not only much faster than existing implementations, but it is also more scalable -- it can train much larger PCs in a reasonable amount of time without suffering from OOM issues.
 
+Technical details of PyJuice can be found [here](https://arxiv.org/pdf/2406.00766).
+
 ## Installation
 
 The easiest way to install PyJuice is via pip:
