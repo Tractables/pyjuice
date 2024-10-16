@@ -180,7 +180,8 @@ class TensorCircuit(nn.Module):
     def forward(self, inputs: torch.Tensor, input_layer_fn: Optional[Union[str,Callable]] = None,
                 cache: Optional[dict] = None, return_cache: bool = False, record_cudagraph: bool = False, 
                 apply_cudagraph: bool = True, force_use_bf16: bool = False, force_use_fp32: bool = False, 
-                propagation_alg: Optional[Union[str,Sequence[str]]] = None, _inner_layers_only: bool = False, **kwargs):
+                propagation_alg: Optional[Union[str,Sequence[str]]] = None, _inner_layers_only: bool = False, 
+                _no_buffer_reset: bool = False, **kwargs):
         """
         Forward evaluation of the PC.
 
@@ -206,8 +207,9 @@ class TensorCircuit(nn.Module):
         
         ## Initialize buffers for forward pass ##
 
-        self._init_buffer(name = "node_mars", shape = (self.num_nodes, B), set_value = 0.0)
-        self._init_buffer(name = "element_mars", shape = (self.num_elements, B), set_value = -torch.inf)
+        if not _no_buffer_reset:
+            self._init_buffer(name = "node_mars", shape = (self.num_nodes, B), set_value = 0.0)
+            self._init_buffer(name = "element_mars", shape = (self.num_elements, B), set_value = -torch.inf)
 
         # Load cached node marginals
         if self._buffer_matches(name = "node_mars", cache = cache):
