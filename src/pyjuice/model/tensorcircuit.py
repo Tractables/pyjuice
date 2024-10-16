@@ -180,7 +180,7 @@ class TensorCircuit(nn.Module):
     def forward(self, inputs: torch.Tensor, input_layer_fn: Optional[Union[str,Callable]] = None,
                 cache: Optional[dict] = None, return_cache: bool = False, record_cudagraph: bool = False, 
                 apply_cudagraph: bool = True, force_use_bf16: bool = False, force_use_fp32: bool = False, 
-                propagation_alg: Optional[Union[str,Sequence[str]]] = None, **kwargs):
+                propagation_alg: Optional[Union[str,Sequence[str]]] = None, _inner_layers_only: bool = False, **kwargs):
         """
         Forward evaluation of the PC.
 
@@ -217,19 +217,20 @@ class TensorCircuit(nn.Module):
 
         with torch.no_grad():
             # Input layers
-            for idx, layer in enumerate(self.input_layer_group):
-                if input_layer_fn is None:
-                    layer(inputs, self.node_mars, **kwargs)
+            if not _inner_layers_only:
+                for idx, layer in enumerate(self.input_layer_group):
+                    if input_layer_fn is None:
+                        layer(inputs, self.node_mars, **kwargs)
 
-                elif isinstance(input_layer_fn, str):
-                    assert hasattr(layer, input_layer_fn), f"Custom input function `{input_layer_fn}` not found for layer type {type(layer)}."
-                    getattr(layer, input_layer_fn)(inputs, self.node_mars, **kwargs)
+                    elif isinstance(input_layer_fn, str):
+                        assert hasattr(layer, input_layer_fn), f"Custom input function `{input_layer_fn}` not found for layer type {type(layer)}."
+                        getattr(layer, input_layer_fn)(inputs, self.node_mars, **kwargs)
 
-                elif isinstance(input_layer_fn, Callable):
-                    input_layer_fn(layer, inputs, self.node_mars, **kwargs)
+                    elif isinstance(input_layer_fn, Callable):
+                        input_layer_fn(layer, inputs, self.node_mars, **kwargs)
 
-                else:
-                    raise ValueError(f"Custom input function should be either a `str` or a `Callable`. Found {type(input_layer_fn)} instead.")
+                    else:
+                        raise ValueError(f"Custom input function should be either a `str` or a `Callable`. Found {type(input_layer_fn)} instead.")
 
             # Inner layers
             def _run_inner_layers():
@@ -319,6 +320,7 @@ class TensorCircuit(nn.Module):
                  propagation_alg: Union[str,Sequence[str]] = "LL",
                  logspace_flows: bool = False,
                  negate_pflows: bool = False,
+                 _inner_layers_only: bool = False,
                  **kwargs):
         """
         Backward evaluation of the PC that computes node flows as well as parameter flows.
@@ -443,19 +445,20 @@ class TensorCircuit(nn.Module):
                 _run_inner_layers()
 
             # Compute backward pass for all input layers
-            for idx, layer in enumerate(self.input_layer_group):
-                if input_layer_fn is None:
-                    layer.backward(inputs, self.node_flows, self.node_mars, logspace_flows = logspace_flows, **kwargs)
+            if not _inner_layers_only:
+                for idx, layer in enumerate(self.input_layer_group):
+                    if input_layer_fn is None:
+                        layer.backward(inputs, self.node_flows, self.node_mars, logspace_flows = logspace_flows, **kwargs)
 
-                elif isinstance(input_layer_fn, str):
-                    assert hasattr(layer, input_layer_fn), f"Custom input function `{input_layer_fn}` not found for layer type {type(layer)}."
-                    getattr(layer, input_layer_fn)(inputs, self.node_flows, self.node_mars, logspace_flows = logspace_flows, **kwargs)
+                    elif isinstance(input_layer_fn, str):
+                        assert hasattr(layer, input_layer_fn), f"Custom input function `{input_layer_fn}` not found for layer type {type(layer)}."
+                        getattr(layer, input_layer_fn)(inputs, self.node_flows, self.node_mars, logspace_flows = logspace_flows, **kwargs)
 
-                elif isinstance(input_layer_fn, Callable):
-                    input_layer_fn(layer, inputs, self.node_flows, self.node_mars, logspace_flows = logspace_flows, **kwargs)
+                    elif isinstance(input_layer_fn, Callable):
+                        input_layer_fn(layer, inputs, self.node_flows, self.node_mars, logspace_flows = logspace_flows, **kwargs)
 
-                else:
-                    raise ValueError(f"Custom input function should be either a `str` or a `Callable`. Found {type(input_layer_fn)} instead.")
+                    else:
+                        raise ValueError(f"Custom input function should be either a `str` or a `Callable`. Found {type(input_layer_fn)} instead.")
 
         if return_cache:
             if cache is None:
