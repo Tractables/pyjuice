@@ -129,4 +129,5 @@ def test_cond_sample():
 
 
 if __name__ == "__main__":
+    torch.manual_seed(2389)
     test_cond_sample()

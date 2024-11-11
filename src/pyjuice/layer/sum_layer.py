@@ -444,10 +444,10 @@ class SumLayer(Layer, nn.Module):
                                             pids_start, pids_increment, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
                                             BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
                                             TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, use_bf16: tl.constexpr,
-                                            propagation_alg_id: tl.constexpr, alpha = 0.0):
+                                            propagation_alg_id: tl.constexpr, pid_m_offset = 0, alpha = 0.0):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
-        pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
+        pid_m = tl.program_id(1) + pid_m_offset # ID of size-`TILE_SIZE_M` nodes
 
         # Get inferred node block id from `pid_m`
         nblock_id = pid_m // (BLOCK_SIZE_M // TILE_SIZE_M)
@@ -560,10 +560,10 @@ class SumLayer(Layer, nn.Module):
                                             pids_start, pids_increment, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
                                             BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
                                             TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, use_bf16: tl.constexpr,
-                                            propagation_alg_id: tl.constexpr, alpha = 0.0):
+                                            propagation_alg_id: tl.constexpr, pid_m_offset = 0, alpha = 0.0):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
-        pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
+        pid_m = tl.program_id(1) + pid_m_offset # ID of size-`TILE_SIZE_M` nodes
 
         # Get inferred node block id from `pid_m`
         nblock_id = pid_m // (BLOCK_SIZE_M // TILE_SIZE_M)
@@ -676,10 +676,10 @@ class SumLayer(Layer, nn.Module):
                                              pids_start, pids_increment, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
                                              BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
                                              TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, use_bf16: tl.constexpr,
-                                             propagation_alg_id: tl.constexpr, alpha = 0.0):
+                                             propagation_alg_id: tl.constexpr, pid_m_offset = 0, alpha = 0.0):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
-        pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
+        pid_m = tl.program_id(1) + pid_m_offset # ID of size-`TILE_SIZE_M` nodes
 
         # Get inferred node block id from `pid_m`
         nblock_id = pid_m // (BLOCK_SIZE_M // TILE_SIZE_M)
@@ -861,77 +861,86 @@ class SumLayer(Layer, nn.Module):
 
         grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
         
-        if TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and BLOCK_B >= 16:
-            self._fw_triton_block_sparse_tlmm_kernel[grid](
-                node_mars, 
-                element_mars, 
-                params, 
-                nids, 
-                cids_start,
-                cids_increment, 
-                pids_start,
-                pids_increment,
-                local_ids,
-                batch_size,
-                partial_eval = partial_eval,
-                BLOCK_B = BLOCK_B,
-                TILE_SIZE_K = TILE_SIZE_K,
-                K_NUM_TILES = K_NUM_TILES,
-                TILE_SIZE_M = TILE_SIZE_M,
-                BLOCK_SIZE_M = BLOCK_SIZE_M,
-                use_bf16 = use_bf16,
-                propagation_alg_id = propagation_alg_id,
-                **propagation_alg_kwargs,
-                num_stages = 1
-            )
-            
-        elif TILE_SIZE_M >= 8 and TILE_SIZE_K >= 8 and BLOCK_B >= 8:
-            self._fw_triton_block_sparse_csmm1_kernel[grid](
-                node_mars, 
-                element_mars, 
-                params, 
-                nids, 
-                cids_start,
-                cids_increment, 
-                pids_start,
-                pids_increment,
-                local_ids,
-                batch_size,
-                partial_eval = partial_eval,
-                BLOCK_B = BLOCK_B,
-                TILE_SIZE_K = TILE_SIZE_K,
-                K_NUM_TILES = K_NUM_TILES,
-                TILE_SIZE_M = TILE_SIZE_M,
-                BLOCK_SIZE_M = BLOCK_SIZE_M,
-                use_bf16 = use_bf16,
-                propagation_alg_id = propagation_alg_id,
-                **propagation_alg_kwargs,
-                num_stages = 1
-            )
+        for pid_m_start in range(0, grid[1], 32768):
+            pid_m_end = min(pid_m_start + 32768, grid[1])
+            block_m_size = pid_m_end - pid_m_start
 
-        else:
-            self._fw_triton_block_sparse_csmm2_kernel[grid](
-                node_mars, 
-                element_mars, 
-                params, 
-                nids, 
-                cids_start,
-                cids_increment, 
-                pids_start,
-                pids_increment,
-                local_ids,
-                batch_size,
-                partial_eval = partial_eval,
-                BLOCK_B = BLOCK_B,
-                TILE_SIZE_K = TILE_SIZE_K,
-                K_NUM_TILES = K_NUM_TILES,
-                TILE_SIZE_M = TILE_SIZE_M,
-                BLOCK_SIZE_M = BLOCK_SIZE_M,
-                use_bf16 = use_bf16,
-                propagation_alg_id = propagation_alg_id,
-                **propagation_alg_kwargs,
-                num_stages = 1
-            )
+            curr_grid = (grid[0], block_m_size)
+        
+            if TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and BLOCK_B >= 16:
+                self._fw_triton_block_sparse_tlmm_kernel[curr_grid](
+                    node_mars, 
+                    element_mars, 
+                    params, 
+                    nids, 
+                    cids_start,
+                    cids_increment, 
+                    pids_start,
+                    pids_increment,
+                    local_ids,
+                    batch_size,
+                    partial_eval = partial_eval,
+                    BLOCK_B = BLOCK_B,
+                    TILE_SIZE_K = TILE_SIZE_K,
+                    K_NUM_TILES = K_NUM_TILES,
+                    TILE_SIZE_M = TILE_SIZE_M,
+                    BLOCK_SIZE_M = BLOCK_SIZE_M,
+                    use_bf16 = use_bf16,
+                    propagation_alg_id = propagation_alg_id,
+                    pid_m_offset = pid_m_start,
+                    **propagation_alg_kwargs,
+                    num_stages = 1
+                )
+                
+            elif TILE_SIZE_M >= 8 and TILE_SIZE_K >= 8 and BLOCK_B >= 8:
+                self._fw_triton_block_sparse_csmm1_kernel[curr_grid](
+                    node_mars, 
+                    element_mars, 
+                    params, 
+                    nids, 
+                    cids_start,
+                    cids_increment, 
+                    pids_start,
+                    pids_increment,
+                    local_ids,
+                    batch_size,
+                    partial_eval = partial_eval,
+                    BLOCK_B = BLOCK_B,
+                    TILE_SIZE_K = TILE_SIZE_K,
+                    K_NUM_TILES = K_NUM_TILES,
+                    TILE_SIZE_M = TILE_SIZE_M,
+                    BLOCK_SIZE_M = BLOCK_SIZE_M,
+                    use_bf16 = use_bf16,
+                    propagation_alg_id = propagation_alg_id,
+                    pid_m_offset = pid_m_start,
+                    **propagation_alg_kwargs,
+                    num_stages = 1
+                )
+
+            else:
+                self._fw_triton_block_sparse_csmm2_kernel[curr_grid](
+                    node_mars, 
+                    element_mars, 
+                    params, 
+                    nids, 
+                    cids_start,
+                    cids_increment, 
+                    pids_start,
+                    pids_increment,
+                    local_ids,
+                    batch_size,
+                    partial_eval = partial_eval,
+                    BLOCK_B = BLOCK_B,
+                    TILE_SIZE_K = TILE_SIZE_K,
+                    K_NUM_TILES = K_NUM_TILES,
+                    TILE_SIZE_M = TILE_SIZE_M,
+                    BLOCK_SIZE_M = BLOCK_SIZE_M,
+                    use_bf16 = use_bf16,
+                    propagation_alg_id = propagation_alg_id,
+                    pid_m_offset = pid_m_start,
+                    **propagation_alg_kwargs,
+                    num_stages = 1
+                )
         
         return None
 
@@ -1365,10 +1374,11 @@ class SumLayer(Layer, nn.Module):
     # @triton.jit
     @FastJITFunction
     def _bk_triton_large_modify_flow_kernel(node_flows, node_mars, local_ids, nids, num_nodes, batch_size: tl.constexpr, partial_eval: tl.constexpr, 
-                                            BLOCK_B: tl.constexpr, TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, propagation_alg_id: tl.constexpr, alpha = 0.0):
+                                            BLOCK_B: tl.constexpr, TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, propagation_alg_id: tl.constexpr, 
+                                            pid_m_offset = 0, alpha = 0.0):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` examples
-        pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
+        pid_m = tl.program_id(1) + pid_m_offset # ID of size-`TILE_SIZE_M` nodes
 
         offs_m = tl.arange(0, TILE_SIZE_M) + pid_m * TILE_SIZE_M
         mask_m = offs_m < num_nodes
@@ -1459,20 +1469,27 @@ class SumLayer(Layer, nn.Module):
 
             grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
 
-            self._bk_triton_large_modify_flow_kernel[grid](
-                node_flows = node_flows,
-                node_mars = node_mars,
-                local_ids = local_ids,
-                nids = nids,
-                num_nodes = layer_n_nodes,
-                batch_size = batch_size,
-                partial_eval = partial_eval,
-                BLOCK_B = BLOCK_B,
-                TILE_SIZE_M = TILE_SIZE_M,
-                BLOCK_SIZE_M = BLOCK_SIZE_M,
-                propagation_alg_id = propagation_alg_id,
-                **propagation_alg_kwargs
-            )
+            for pid_m_start in range(0, grid[1], 32768):
+                pid_m_end = min(pid_m_start + 32768, grid[1])
+                block_m_size = pid_m_end - pid_m_start
+
+                curr_grid = (grid[0], block_m_size)
+
+                self._bk_triton_large_modify_flow_kernel[grid](
+                    node_flows = node_flows,
+                    node_mars = node_mars,
+                    local_ids = local_ids,
+                    nids = nids,
+                    num_nodes = layer_n_nodes,
+                    batch_size = batch_size,
+                    partial_eval = partial_eval,
+                    BLOCK_B = BLOCK_B,
+                    TILE_SIZE_M = TILE_SIZE_M,
+                    BLOCK_SIZE_M = BLOCK_SIZE_M,
+                    propagation_alg_id = propagation_alg_id,
+                    pid_m_offset = pid_m_start,
+                    **propagation_alg_kwargs
+                )
 
         return None
 
@@ -1537,10 +1554,10 @@ class SumLayer(Layer, nn.Module):
                                            TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, TILE_SIZE_M: tl.constexpr, 
                                            BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, TL_DOT: tl.constexpr, 
                                            propagation_alg_id: tl.constexpr, accumulate_ch_flows: tl.constexpr, 
-                                           allow_neg_flows: tl.constexpr, alpha = 0.0):
+                                           allow_neg_flows: tl.constexpr, pid_m_offset = 0, alpha = 0.0):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
-        pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
+        pid_m = tl.program_id(1) + pid_m_offset # ID of size-`TILE_SIZE_M` nodes
 
         # Get inferred node block id from `pid_m`
         eleblock_id = pid_m // (BLOCK_SIZE_M // TILE_SIZE_M)
@@ -1700,10 +1717,10 @@ class SumLayer(Layer, nn.Module):
                                                  TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, TILE_SIZE_M: tl.constexpr, 
                                                  BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, TL_DOT: tl.constexpr, 
                                                  propagation_alg_id: tl.constexpr, accumulate_ch_flows: tl.constexpr, 
-                                                 allow_neg_flows: tl.constexpr, alpha = 0.0):
+                                                 allow_neg_flows: tl.constexpr, pid_m_offset = 0, alpha = 0.0):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
-        pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
+        pid_m = tl.program_id(1) + pid_m_offset # ID of size-`TILE_SIZE_M` nodes
 
         # Get inferred node block id from `pid_m`
         eleblock_id = pid_m // (BLOCK_SIZE_M // TILE_SIZE_M)
@@ -1933,68 +1950,76 @@ class SumLayer(Layer, nn.Module):
 
         grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
 
-        if TILE_SIZE_M >= 8 and TILE_SIZE_K >= 8 and BLOCK_B >= 8:
-            self._bk_triton_block_sparse_ele_kernel[grid](
-                node_flows = node_flows, 
-                element_flows = element_flows, 
-                node_mars = node_mars, 
-                element_mars = element_mars, 
-                params = params, 
-                chids = chids, 
-                parids_start = parids_start,
-                parids_increment = parids_increment,
-                parpids_start = parpids_start,
-                parpids_increment = parpids_increment, 
-                local_ids = local_ids, 
-                batch_size = batch_size, 
-                partial_eval = partial_eval,
-                ptr_inc_step = ptr_inc_step,
-                allow_modify_flows = allow_modify_flows,
-                logspace_flows = logspace_flows,
-                BLOCK_B = BLOCK_B, 
-                TILE_SIZE_K = TILE_SIZE_K, 
-                K_NUM_TILES = K_NUM_TILES,
-                TILE_SIZE_M = TILE_SIZE_M, 
-                BLOCK_SIZE_M = BLOCK_SIZE_M,
-                BLOCK_SIZE_K = BLOCK_SIZE_K,
-                TL_DOT = TL_DOT,
-                num_stages = 1,
-                propagation_alg_id = propagation_alg_id,
-                accumulate_ch_flows = accumulate_ch_flows,
-                allow_neg_flows = allow_neg_flows,
-                **propagation_alg_kwargs
-            )
-        else:
-            self._bk_triton_block_sparse_ele_csmm2_kernel[grid](
-                node_flows = node_flows, 
-                element_flows = element_flows, 
-                node_mars = node_mars, 
-                element_mars = element_mars, 
-                params = params, 
-                chids = chids, 
-                parids_start = parids_start,
-                parids_increment = parids_increment,
-                parpids_start = parpids_start,
-                parpids_increment = parpids_increment, 
-                local_ids = local_ids, 
-                batch_size = batch_size, 
-                partial_eval = partial_eval,
-                ptr_inc_step = ptr_inc_step,
-                allow_modify_flows = allow_modify_flows,
-                logspace_flows = logspace_flows,
-                BLOCK_B = BLOCK_B, 
-                TILE_SIZE_K = TILE_SIZE_K, 
-                K_NUM_TILES = K_NUM_TILES,
-                TILE_SIZE_M = TILE_SIZE_M, 
-                BLOCK_SIZE_M = BLOCK_SIZE_M,
-                BLOCK_SIZE_K = BLOCK_SIZE_K,
-                TL_DOT = TL_DOT,
-                num_stages = 1,
-                propagation_alg_id = propagation_alg_id,
-                accumulate_ch_flows = accumulate_ch_flows,
-                allow_neg_flows = allow_neg_flows,
-                **propagation_alg_kwargs
-            )
+        for pid_m_start in range(0, grid[1], 32768):
+            pid_m_end = min(pid_m_start + 32768, grid[1])
+            block_m_size = pid_m_end - pid_m_start
+
+            curr_grid = (grid[0], block_m_size)
+
+            if TILE_SIZE_M >= 8 and TILE_SIZE_K >= 8 and BLOCK_B >= 8:
+                self._bk_triton_block_sparse_ele_kernel[curr_grid](
+                    node_flows = node_flows, 
+                    element_flows = element_flows, 
+                    node_mars = node_mars, 
+                    element_mars = element_mars, 
+                    params = params, 
+                    chids = chids, 
+                    parids_start = parids_start,
+                    parids_increment = parids_increment,
+                    parpids_start = parpids_start,
+                    parpids_increment = parpids_increment, 
+                    local_ids = local_ids, 
+                    batch_size = batch_size, 
+                    partial_eval = partial_eval,
+                    ptr_inc_step = ptr_inc_step,
+                    allow_modify_flows = allow_modify_flows,
+                    logspace_flows = logspace_flows,
+                    BLOCK_B = BLOCK_B, 
+                    TILE_SIZE_K = TILE_SIZE_K, 
+                    K_NUM_TILES = K_NUM_TILES,
+                    TILE_SIZE_M = TILE_SIZE_M, 
+                    BLOCK_SIZE_M = BLOCK_SIZE_M,
+                    BLOCK_SIZE_K = BLOCK_SIZE_K,
+                    TL_DOT = TL_DOT,
+                    num_stages = 1,
+                    propagation_alg_id = propagation_alg_id,
+                    accumulate_ch_flows = accumulate_ch_flows,
+                    allow_neg_flows = allow_neg_flows,
+                    pid_m_offset = pid_m_start,
+                    **propagation_alg_kwargs
+                )
+            else:
+                self._bk_triton_block_sparse_ele_csmm2_kernel[curr_grid](
+                    node_flows = node_flows, 
+                    element_flows = element_flows, 
+                    node_mars = node_mars, 
+                    element_mars = element_mars, 
+                    params = params, 
+                    chids = chids, 
+                    parids_start = parids_start,
+                    parids_increment = parids_increment,
+                    parpids_start = parpids_start,
+                    parpids_increment = parpids_increment, 
+                    local_ids = local_ids, 
+                    batch_size = batch_size, 
+                    partial_eval = partial_eval,
+                    ptr_inc_step = ptr_inc_step,
+                    allow_modify_flows = allow_modify_flows,
+                    logspace_flows = logspace_flows,
+                    BLOCK_B = BLOCK_B, 
+                    TILE_SIZE_K = TILE_SIZE_K, 
+                    K_NUM_TILES = K_NUM_TILES,
+                    TILE_SIZE_M = TILE_SIZE_M, 
+                    BLOCK_SIZE_M = BLOCK_SIZE_M,
+                    BLOCK_SIZE_K = BLOCK_SIZE_K,
+                    TL_DOT = TL_DOT,
+                    num_stages = 1,
+                    propagation_alg_id = propagation_alg_id,
+                    accumulate_ch_flows = accumulate_ch_flows,
+                    allow_neg_flows = allow_neg_flows,
+                    pid_m_offset = pid_m_start,
+                    **propagation_alg_kwargs
+                )
 
         return None
 
@@ -2006,10 +2031,10 @@ class SumLayer(Layer, nn.Module):
                                            logspace_flows: tl.constexpr, TILE_SIZE_B: tl.constexpr, B_NUM_TILES: tl.constexpr, 
                                            TILE_SIZE_K: tl.constexpr, TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, 
                                            TL_DOT: tl.constexpr, propagation_alg_id: tl.constexpr, negate_pflows: tl.constexpr, 
-                                           allow_neg_flows: tl.constexpr, alpha = 0.0):
+                                           allow_neg_flows: tl.constexpr, pid_m_offset = 0, alpha = 0.0):
 
         pid_k = tl.program_id(0) # ID of size-`TILE_SIZE_K` edges
-        pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
+        pid_m = tl.program_id(1) + pid_m_offset # ID of size-`TILE_SIZE_M` nodes
 
         # Get inferred node block id from `pid_m`
         nblock_id = pid_m // (BLOCK_SIZE_M // TILE_SIZE_M)
@@ -2128,10 +2153,10 @@ class SumLayer(Layer, nn.Module):
                                                  logspace_flows: tl.constexpr, TILE_SIZE_B: tl.constexpr, B_NUM_TILES: tl.constexpr, 
                                                  TILE_SIZE_K: tl.constexpr, TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, 
                                                  TL_DOT: tl.constexpr, propagation_alg_id: tl.constexpr, negate_pflows: tl.constexpr, 
-                                                 allow_neg_flows: tl.constexpr, alpha = 0.0):
+                                                 allow_neg_flows: tl.constexpr, pid_m_offset = 0, alpha = 0.0):
 
         pid_k = tl.program_id(0) # ID of size-`TILE_SIZE_K` edges
-        pid_m = tl.program_id(1) # ID of size-`TILE_SIZE_M` nodes
+        pid_m = tl.program_id(1) + pid_m_offset # ID of size-`TILE_SIZE_M` nodes
 
         # Get inferred node block id from `pid_m`
         nblock_id = pid_m // (BLOCK_SIZE_M // TILE_SIZE_M)
@@ -2297,61 +2322,69 @@ class SumLayer(Layer, nn.Module):
 
         grid = (triton.cdiv(num_edges, TILE_SIZE_K), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
 
-        if TILE_SIZE_M >= 8 and TILE_SIZE_K >= 8 and TILE_SIZE_B >= 8:
-            self._bk_triton_block_sparse_par_kernel[grid](
-                node_flows = node_flows, 
-                node_mars = node_mars, 
-                element_mars = element_mars, 
-                params = params, 
-                param_flows = param_flows, 
-                nids = nids, 
-                cids = cids, 
-                pids = pids,
-                pfids = pfids,
-                batch_size = batch_size, 
-                num_edges = num_edges, 
-                allow_modify_flows = allow_modify_flows, 
-                logspace_flows = logspace_flows,
-                TILE_SIZE_B = TILE_SIZE_B, 
-                B_NUM_TILES = B_NUM_TILES, 
-                TILE_SIZE_K = TILE_SIZE_K, 
-                TILE_SIZE_M = TILE_SIZE_M, 
-                BLOCK_SIZE_M = self.block_size,
-                TL_DOT = TL_DOT,
-                propagation_alg_id = propagation_alg_id,
-                negate_pflows = negate_pflows,
-                allow_neg_flows = allow_neg_flows,
-                **propagation_alg_kwargs,
-                num_stages = 1
-            )
+        for pid_m_start in range(0, grid[1], 32768):
+            pid_m_end = min(pid_m_start + 32768, grid[1])
+            block_m_size = pid_m_end - pid_m_start
 
-        else:
-            self._bk_triton_block_sparse_par_csmm2_kernel[grid](
-                node_flows = node_flows, 
-                node_mars = node_mars, 
-                element_mars = element_mars, 
-                params = params, 
-                param_flows = param_flows, 
-                nids = nids, 
-                cids = cids, 
-                pids = pids,
-                pfids = pfids,
-                batch_size = batch_size, 
-                num_edges = num_edges, 
-                allow_modify_flows = allow_modify_flows,
-                logspace_flows = logspace_flows,
-                TILE_SIZE_B = TILE_SIZE_B, 
-                B_NUM_TILES = B_NUM_TILES, 
-                TILE_SIZE_K = TILE_SIZE_K, 
-                TILE_SIZE_M = TILE_SIZE_M, 
-                BLOCK_SIZE_M = self.block_size,
-                TL_DOT = TL_DOT,
-                propagation_alg_id = propagation_alg_id,
-                negate_pflows = negate_pflows,
-                allow_neg_flows = allow_neg_flows,
-                **propagation_alg_kwargs,
-                num_stages = 1
-            )
+            curr_grid = (grid[0], block_m_size)
+
+            if TILE_SIZE_M >= 8 and TILE_SIZE_K >= 8 and TILE_SIZE_B >= 8:
+                self._bk_triton_block_sparse_par_kernel[curr_grid](
+                    node_flows = node_flows, 
+                    node_mars = node_mars, 
+                    element_mars = element_mars, 
+                    params = params, 
+                    param_flows = param_flows, 
+                    nids = nids, 
+                    cids = cids, 
+                    pids = pids,
+                    pfids = pfids,
+                    batch_size = batch_size, 
+                    num_edges = num_edges, 
+                    allow_modify_flows = allow_modify_flows, 
+                    logspace_flows = logspace_flows,
+                    TILE_SIZE_B = TILE_SIZE_B, 
+                    B_NUM_TILES = B_NUM_TILES, 
+                    TILE_SIZE_K = TILE_SIZE_K, 
+                    TILE_SIZE_M = TILE_SIZE_M, 
+                    BLOCK_SIZE_M = self.block_size,
+                    TL_DOT = TL_DOT,
+                    propagation_alg_id = propagation_alg_id,
+                    negate_pflows = negate_pflows,
+                    allow_neg_flows = allow_neg_flows,
+                    pid_m_offset = pid_m_start,
+                    **propagation_alg_kwargs,
+                    num_stages = 1
+                )
+
+            else:
+                self._bk_triton_block_sparse_par_csmm2_kernel[curr_grid](
+                    node_flows = node_flows, 
+                    node_mars = node_mars, 
+                    element_mars = element_mars, 
+                    params = params, 
+                    param_flows = param_flows, 
+                    nids = nids, 
+                    cids = cids, 
+                    pids = pids,
+                    pfids = pfids,
+                    batch_size = batch_size, 
+                    num_edges = num_edges, 
+                    allow_modify_flows = allow_modify_flows,
+                    logspace_flows = logspace_flows,
+                    TILE_SIZE_B = TILE_SIZE_B, 
+                    B_NUM_TILES = B_NUM_TILES, 
+                    TILE_SIZE_K = TILE_SIZE_K, 
+                    TILE_SIZE_M = TILE_SIZE_M, 
+                    BLOCK_SIZE_M = self.block_size,
+                    TL_DOT = TL_DOT,
+                    propagation_alg_id = propagation_alg_id,
+                    negate_pflows = negate_pflows,
+                    allow_neg_flows = allow_neg_flows,
+                    pid_m_offset = pid_m_start,
+                    **propagation_alg_kwargs,
+                    num_stages = 1
+                )
 
         return None
 
