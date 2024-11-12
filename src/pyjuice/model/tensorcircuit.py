@@ -323,6 +323,7 @@ class TensorCircuit(nn.Module):
                  logspace_flows: bool = False,
                  negate_pflows: bool = False,
                  _inner_layers_only: bool = False,
+                 _disable_buffer_init: bool = False,
                  **kwargs):
         """
         Backward evaluation of the PC that computes node flows as well as parameter flows.
@@ -351,8 +352,9 @@ class TensorCircuit(nn.Module):
 
         ## Initialize buffers for backward pass ##
 
-        self._init_buffer(name = "node_flows", shape = (self.num_nodes, B), set_value = 0.0 if not logspace_flows else -float("inf"))
-        self._init_buffer(name = "element_flows", shape = (self.num_elements, B), set_value = 0.0 if not logspace_flows else -float("inf"))
+        if not _disable_buffer_init:
+            self._init_buffer(name = "node_flows", shape = (self.num_nodes, B), set_value = 0.0 if not logspace_flows else -float("inf"))
+            self._init_buffer(name = "element_flows", shape = (self.num_elements, B), set_value = 0.0 if not logspace_flows else -float("inf"))
 
         # Set root node flows
         def _set_root_node_flows():
