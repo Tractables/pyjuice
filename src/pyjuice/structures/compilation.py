@@ -15,7 +15,8 @@ def BayesianTreeToHiddenRegionGraph(tree: nx.Graph,
                                     InputDist: Type[Distribution], 
                                     dist_params: dict,
                                     num_root_ns: int = 1,
-                                    block_size: Optional[int] = None) -> CircuitNodes:
+                                    block_size: Optional[int] = None,
+                                    tie_input_params: bool = False) -> CircuitNodes:
     """
     Given a Tree Bayesian Network tree T1 (i.e. at most one parents), 
     
@@ -48,6 +49,22 @@ def BayesianTreeToHiddenRegionGraph(tree: nx.Graph,
     for n in clt.nodes:
         assert len(list(clt.predecessors(n))) <= 1
 
+    # For input parameter tying
+    template_ni = None
+    
+    def get_input_ns(v):
+        nonlocal template_ni
+        if tie_input_params:
+            if template_ni is None:
+                ni = inputs(v, num_node_blocks = num_node_blocks, dist = InputDist(**dist_params))
+                template_ni = ni
+            else:
+                ni = template_ni.duplicate(v, tie_params = True)
+        else:
+            ni = inputs(v, num_node_blocks = num_node_blocks, dist = InputDist(**dist_params))
+        
+        return ni
+
     # Compile the region graph for the circuit equivalent to T2
     node_seq = list(nx.dfs_postorder_nodes(tree, root))
     var2rnode = dict()
@@ -57,7 +74,7 @@ def BayesianTreeToHiddenRegionGraph(tree: nx.Graph,
 
             if len(chs) == 0:
                 # Input Region
-                r = inputs(v, num_node_blocks = num_node_blocks, dist = InputDist(**dist_params))
+                r = get_input_ns(v)
                 var2rnode[v] = r
             else:
                 # Inner Region
@@ -66,7 +83,7 @@ def BayesianTreeToHiddenRegionGraph(tree: nx.Graph,
                 ch_regions = [var2rnode[c] for c in chs]
 
                 # Add x_v to children(z_v)
-                leaf_r = inputs(v, num_node_blocks = num_node_blocks, dist = InputDist(**dist_params))
+                leaf_r = get_input_ns(v)
                 ch_regions.append(leaf_r)
 
                 rp = multiply(*ch_regions)

@@ -72,7 +72,8 @@ def HCLT(x: torch.Tensor, num_latents: int,
          block_size: Optional[int] = None,
          input_dist: Optional[Distribution] = None,
          input_node_type: Type[Distribution] = Categorical, 
-         input_node_params: dict = {"num_cats": 256}):
+         input_node_params: dict = {"num_cats": 256},
+         tie_input_params: bool = False):
     """
     Construct Hidden Chow-Liu Trees (https://arxiv.org/pdf/2106.02264.pdf).
 
@@ -99,6 +100,9 @@ def HCLT(x: torch.Tensor, num_latents: int,
 
     :param input_dist: input distribution
     :type input_dist: Distribution
+
+    :param tie_input_params: whether to tie the input parameters
+    :type tie_input_params: bool
     """
 
     if input_dist is not None:
@@ -111,7 +115,7 @@ def HCLT(x: torch.Tensor, num_latents: int,
     root_r = BayesianTreeToHiddenRegionGraph(
         T, root, num_latents, input_node_type, 
         input_node_params, num_root_ns = num_root_ns,
-        block_size = block_size
+        block_size = block_size, tie_input_params = tie_input_params
     )
     
     return root_r
