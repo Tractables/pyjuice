@@ -7,7 +7,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Train a PC &mdash; PyJuice 2.2.0 documentation</title>
-      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=80d5e7a1" />
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery.css?v=d2d258e8" />
       <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery-binder.css?v=f4aeca0c" />
@@ -112,12 +112,12 @@ For simplicity, we use the MNIST dataset as an example.</p>
 </div>
 <section id="load-the-mnist-dataset">
 <h2>Load the MNIST Dataset<a class="headerlink" href="#load-the-mnist-dataset" title="Link to this heading"></a></h2>
-<div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span> <span class="nn">pyjuice</span> <span class="k">as</span> <span class="nn">juice</span>
-<span class="kn">import</span> <span class="nn">torch</span>
-<span class="kn">import</span> <span class="nn">torchvision</span>
-<span class="kn">import</span> <span class="nn">time</span>
-<span class="kn">from</span> <span class="nn">torch.utils.data</span> <span class="kn">import</span> <span class="n">TensorDataset</span><span class="p">,</span> <span class="n">DataLoader</span>
-<span class="kn">import</span> <span class="nn">pyjuice.nodes.distributions</span> <span class="k">as</span> <span class="nn">dists</span>
+<div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">pyjuice</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">juice</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">torchvision</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">torch.utils.data</span><span class="w"> </span><span class="kn">import</span> <span class="n">TensorDataset</span><span class="p">,</span> <span class="n">DataLoader</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">pyjuice.nodes.distributions</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">dists</span>
 
 <span class="n">train_dataset</span> <span class="o">=</span> <span class="n">torchvision</span><span class="o">.</span><span class="n">datasets</span><span class="o">.</span><span class="n">MNIST</span><span class="p">(</span><span class="n">root</span> <span class="o">=</span> <span class="s2">&quot;../data&quot;</span><span class="p">,</span> <span class="n">train</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span> <span class="n">download</span> <span class="o">=</span> <span class="kc">True</span><span class="p">)</span>
 <span class="n">valid_dataset</span> <span class="o">=</span> <span class="n">torchvision</span><span class="o">.</span><span class="n">datasets</span><span class="o">.</span><span class="n">MNIST</span><span class="p">(</span><span class="n">root</span> <span class="o">=</span> <span class="s2">&quot;../data&quot;</span><span class="p">,</span> <span class="n">train</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span> <span class="n">download</span> <span class="o">=</span> <span class="kc">True</span><span class="p">)</span>
