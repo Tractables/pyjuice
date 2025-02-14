@@ -97,6 +97,20 @@ class Gaussian(Distribution):
         tl.atomic_add(param_flows_ptr + s_pfids + 2, stat3, mask = mask)
 
     @staticmethod
+    def bk_flow_mask_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
+                        s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE, TILE_SIZE_K):
+        mu = tl.load(params_ptr + s_pids, mask = mask, other = 0)
+        sigma = tl.load(params_ptr + s_pids + 1, mask = mask, other = 0)
+
+        stat1 = mu * flows
+        stat2 = (sigma * sigma + mu * mu) * flows
+        stat3 = flows
+
+        tl.atomic_add(param_flows_ptr + s_pfids, stat1, mask = mask)
+        tl.atomic_add(param_flows_ptr + s_pfids + 1, stat2, mask = mask)
+        tl.atomic_add(param_flows_ptr + s_pfids + 2, stat3, mask = mask)
+
+    @staticmethod
     def sample_fn(samples_ptr, local_offsets, batch_offsets, vids, s_pids, params_ptr, metadata_ptr, s_mids_ptr, mask, batch_size, BLOCK_SIZE, seed):
 
         rnd_val = tl.randn(seed, tl.arange(0, BLOCK_SIZE))
