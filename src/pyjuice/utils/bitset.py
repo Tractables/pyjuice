@@ -46,7 +46,7 @@ class BitSet(object):
 
         self.values[value // 8] &= (0xff ^ (1 << (7 - value % 8)))
 
-        self.length += 1
+        self.length -= 1
 
     def hasitem(self, value):
         if value >= self.byte_length * 8:
