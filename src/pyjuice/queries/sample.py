@@ -197,9 +197,6 @@ def count_prod_nch_kernel(nids, cids, element_samples, ind_ch_count, ind_nids, i
     tl.store(ind_nid_offs + offs_sample, local_nid_offs, mask = mask_sample)
     tl.store(ind_mask + offs_sample, partition_id, mask = mask_sample)
 
-    # Handle triton bug.. (otherwise `local_nids` will be wrong)
-    local_nids = tl.load(ind_nids + offs_sample, mask = mask_sample, other = 0)
-
     # Offset for children
     offs_child = tl.arange(0, BLOCK_C)
     mask_child = offs_child < num_edges
