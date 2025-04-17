@@ -100,6 +100,7 @@ class TensorCircuit(nn.Module):
                  max_num_partitions: Optional[int] = None, disable_gpu_compilation: bool = False, 
                  force_gpu_compilation: bool = False,
                  max_tied_ns_per_parflow_block: int = 8,
+                 device: Optional[Union[int,torch.device]] = None,
                  verbose: bool = True) -> None:
 
         super(TensorCircuit, self).__init__()
@@ -121,6 +122,7 @@ class TensorCircuit(nn.Module):
             disable_gpu_compilation = disable_gpu_compilation, 
             force_gpu_compilation = force_gpu_compilation,
             max_tied_ns_per_parflow_block = max_tied_ns_per_parflow_block,
+            device = device,
             verbose = verbose
         )
         
@@ -790,7 +792,7 @@ class TensorCircuit(nn.Module):
 
     def _init_layers(self, layer_sparsity_tol: Optional[float] = None, max_num_partitions: Optional[int] = None,
                      disable_gpu_compilation: bool = False, force_gpu_compilation: bool = False, 
-                     max_tied_ns_per_parflow_block: int = 8, verbose: bool = True):
+                     max_tied_ns_per_parflow_block: int = 8, verbose: bool = True, device: Optional[Union[str,torch.device]] = None):
 
         if hasattr(self, "input_layer_group") or hasattr(self, "inner_layer_groups"):
             raise ValueError("Attempting to initialize a TensorCircuit for the second time. " + \
@@ -833,98 +835,105 @@ class TensorCircuit(nn.Module):
         if verbose:
             print(f"Compiling {num_layers} TensorCircuit layers...")
 
-        layer_id = 0
-        for depth in tqdm(range(num_layers), disable = not verbose):
-            if depth == 0:
-                # Input layer
-                signature2nodes = self._categorize_input_nodes(depth2nodes[0]["input"])
-                input_layer_id = 0
-                input_layers = []
-                for signature, nodes in signature2nodes.items():
-                    input_layer = InputLayer(
-                        nodes = nodes, cum_nodes = num_nodes,
-                        max_tied_ns_per_parflow_block = max_tied_ns_per_parflow_block,
-                        pc_num_vars = pc_num_vars
-                    )
+        # Select device to use
+        if device is None:
+            device = torch.cuda.current_device()
+        elif isinstance(device, torch.device):
+            device = device.index
 
-                    input_layers.append(input_layer)
+        with torch.cuda.device(f"cuda:{device}"):
+            layer_id = 0
+            for depth in tqdm(range(num_layers), disable = not verbose):
+                if depth == 0:
+                    # Input layer
+                    signature2nodes = self._categorize_input_nodes(depth2nodes[0]["input"])
+                    input_layer_id = 0
+                    input_layers = []
+                    for signature, nodes in signature2nodes.items():
+                        input_layer = InputLayer(
+                            nodes = nodes, cum_nodes = num_nodes,
+                            max_tied_ns_per_parflow_block = max_tied_ns_per_parflow_block,
+                            pc_num_vars = pc_num_vars
+                        )
+
+                        input_layers.append(input_layer)
+                        
+                        input_layer_id += 1
+                        num_nodes += input_layer.num_nodes
+
+                    self.input_layer_group = LayerGroup(input_layers)
+
+                else:
+                    assert len(depth2nodes[depth]["prod"]) > 0 and len(depth2nodes[depth]["sum"]) > 0, \
+                        "Depth {}: (# prod nodes: {}, # sum nodes: {})".format(depth, len(depth2nodes[depth]["prod"]), len(depth2nodes[depth]["sum"]))
+
+                    # Product layer(s)
+                    gsize2prod_nodes = dict()
+                    for ns in depth2nodes[depth]["prod"]:
+                        gsize = ns.block_size
+                        if gsize not in gsize2prod_nodes:
+                            gsize2prod_nodes[gsize] = []
+                        gsize2prod_nodes[gsize].append(ns)
                     
-                    input_layer_id += 1
-                    num_nodes += input_layer.num_nodes
+                    layer_num_elements = max_node_block_size
+                    prod_layers = []
+                    for gsize, nodes in gsize2prod_nodes.items():
+                        prod_layer = ProdLayer(
+                            nodes = nodes, 
+                            global_nid_start = layer_num_elements,
+                            layer_sparsity_tol = layer_sparsity_tol,
+                            max_num_partitions = max_num_partitions,
+                            disable_gpu_compilation = disable_gpu_compilation,
+                            force_gpu_compilation = force_gpu_compilation
+                        )
 
-                self.input_layer_group = LayerGroup(input_layers)
+                        layer_num_elements += prod_layer.num_nodes
+                        num_edges += prod_layer.num_edges
 
-            else:
-                assert len(depth2nodes[depth]["prod"]) > 0 and len(depth2nodes[depth]["sum"]) > 0, \
-                    "Depth {}: (# prod nodes: {}, # sum nodes: {})".format(depth, len(depth2nodes[depth]["prod"]), len(depth2nodes[depth]["sum"]))
+                        prod_layers.append(prod_layer)
+                    
+                    prod_layer_group = LayerGroup(prod_layers)
+                    self.inner_layer_groups.append(prod_layer_group)
+                    self.add_module(f"prod_layer_{layer_id}", prod_layer_group)
 
-                # Product layer(s)
-                gsize2prod_nodes = dict()
-                for ns in depth2nodes[depth]["prod"]:
-                    gsize = ns.block_size
-                    if gsize not in gsize2prod_nodes:
-                        gsize2prod_nodes[gsize] = []
-                    gsize2prod_nodes[gsize].append(ns)
-                
-                layer_num_elements = max_node_block_size
-                prod_layers = []
-                for gsize, nodes in gsize2prod_nodes.items():
-                    prod_layer = ProdLayer(
-                        nodes = nodes, 
-                        global_nid_start = layer_num_elements,
-                        layer_sparsity_tol = layer_sparsity_tol,
-                        max_num_partitions = max_num_partitions,
-                        disable_gpu_compilation = disable_gpu_compilation,
-                        force_gpu_compilation = force_gpu_compilation
-                    )
+                    if layer_num_elements > num_elements:
+                        num_elements = layer_num_elements
 
-                    layer_num_elements += prod_layer.num_nodes
-                    num_edges += prod_layer.num_edges
+                    # Sum layer(s)
+                    gsize2sum_nodes = dict()
+                    for ns in depth2nodes[depth]["sum"]:
+                        gsize = ns.block_size
+                        if gsize not in gsize2sum_nodes:
+                            gsize2sum_nodes[gsize] = []
+                        gsize2sum_nodes[gsize].append(ns)
+                    
+                    sum_layers = []
+                    for gsize, nodes in gsize2sum_nodes.items():
+                        sum_layer = SumLayer(
+                            nodes = nodes,
+                            global_nid_start = num_nodes, 
+                            global_pid_start = num_parameters,
+                            global_pfid_start = num_param_flows,
+                            node2tiednodes = node2tiednodes,
+                            layer_sparsity_tol = layer_sparsity_tol,
+                            max_num_partitions = max_num_partitions,
+                            max_tied_ns_per_parflow_block = max_tied_ns_per_parflow_block,
+                            disable_gpu_compilation = disable_gpu_compilation,
+                            force_gpu_compilation = force_gpu_compilation
+                        )
 
-                    prod_layers.append(prod_layer)
-                
-                prod_layer_group = LayerGroup(prod_layers)
-                self.inner_layer_groups.append(prod_layer_group)
-                self.add_module(f"prod_layer_{layer_id}", prod_layer_group)
+                        num_nodes += sum_layer.num_nodes
+                        num_edges += sum_layer.num_edges
+                        num_parameters += sum_layer.num_parameters
+                        num_param_flows += sum_layer.num_param_flows
 
-                if layer_num_elements > num_elements:
-                    num_elements = layer_num_elements
+                        sum_layers.append(sum_layer)
 
-                # Sum layer(s)
-                gsize2sum_nodes = dict()
-                for ns in depth2nodes[depth]["sum"]:
-                    gsize = ns.block_size
-                    if gsize not in gsize2sum_nodes:
-                        gsize2sum_nodes[gsize] = []
-                    gsize2sum_nodes[gsize].append(ns)
-                
-                sum_layers = []
-                for gsize, nodes in gsize2sum_nodes.items():
-                    sum_layer = SumLayer(
-                        nodes = nodes,
-                        global_nid_start = num_nodes, 
-                        global_pid_start = num_parameters,
-                        global_pfid_start = num_param_flows,
-                        node2tiednodes = node2tiednodes,
-                        layer_sparsity_tol = layer_sparsity_tol,
-                        max_num_partitions = max_num_partitions,
-                        max_tied_ns_per_parflow_block = max_tied_ns_per_parflow_block,
-                        disable_gpu_compilation = disable_gpu_compilation,
-                        force_gpu_compilation = force_gpu_compilation
-                    )
+                    sum_layer_group = LayerGroup(sum_layers)
+                    self.inner_layer_groups.append(sum_layer_group)
+                    self.add_module(f"sum_layer_{layer_id}", sum_layer_group)
 
-                    num_nodes += sum_layer.num_nodes
-                    num_edges += sum_layer.num_edges
-                    num_parameters += sum_layer.num_parameters
-                    num_param_flows += sum_layer.num_param_flows
-
-                    sum_layers.append(sum_layer)
-
-                sum_layer_group = LayerGroup(sum_layers)
-                self.inner_layer_groups.append(sum_layer_group)
-                self.add_module(f"sum_layer_{layer_id}", sum_layer_group)
-
-                layer_id += 1
+                    layer_id += 1
 
         self.num_nodes = num_nodes
         self.num_edges = num_edges
@@ -1079,6 +1088,7 @@ def compile(ns: CircuitNodes, layer_sparsity_tol: float = 0.5,
             max_num_partitions: Optional[int] = None, disable_gpu_compilation: bool = False, 
             force_gpu_compilation: bool = False,
             max_tied_ns_per_parflow_block: int = 8,
+            device: Optional[Union[int,torch.device]] = None,
             verbose: bool = True) -> nn.Module:
     """
     Compile a PC represented by a DAG into an equivalent `torch.nn.Module`.
@@ -1101,6 +1111,9 @@ def compile(ns: CircuitNodes, layer_sparsity_tol: float = 0.5,
     :param max_tied_ns_per_parflow_block: how many groups of tied parameters are allowed to share the same flow/gradient accumulator (higher values -> consumes less GPU memory; lower values -> potentially avoid stalls caused by atomic operations)
     :type max_tied_ns_per_parflow_block: int
 
+    :param device: Which GPU do we use for compilation (the default is `torch.cuda.current_device`)
+    :type device: Optional[Union[int,torch.device]]
+
     :param verbose: Whether to display the progress of the compilation
     :type verbose: bool
 
@@ -1108,4 +1121,4 @@ def compile(ns: CircuitNodes, layer_sparsity_tol: float = 0.5,
     """
     return TensorCircuit(ns, layer_sparsity_tol = layer_sparsity_tol, max_num_partitions = max_num_partitions,
                          disable_gpu_compilation = disable_gpu_compilation, force_gpu_compilation = force_gpu_compilation,
-                         max_tied_ns_per_parflow_block = max_tied_ns_per_parflow_block, verbose = verbose)
+                         max_tied_ns_per_parflow_block = max_tied_ns_per_parflow_block, device = device, verbose = verbose)
