@@ -2520,6 +2520,8 @@ class SumLayer(Layer, nn.Module):
 
                         elflows_max = tl.max(elflows, axis = 0)
                         eflows = tl.log(tl.sum(tl.exp(elflows - elflows_max[None,:]), axis = 0)) + elflows_max
+                        eflows = tl.where((elflows_max == -float("inf")) | (emars == -float("inf")), -float("inf"), eflows)
+
                     else:
                         if propagation_alg_id == 0:
                             eflows = tl.sum(nflows * epars[:,None] * tl.exp(emars[None,:] - nmars), axis = 0)
@@ -2730,6 +2732,7 @@ class SumLayer(Layer, nn.Module):
                 )
 
             else:
+
                 for pid_m_start in range(0, grid[1], 32768):
 
                     pid_m_end = min(pid_m_start + 32768, grid[1])
@@ -2838,10 +2841,14 @@ class SumLayer(Layer, nn.Module):
 
                     if logspace_flows:
                         plflows = nflows[None,:] + emars - nmars[None,:]
+                        plflows = tl.where(nmars[None,:] == -float("inf"),
+                            nflows[None,:],
+                            plflows
+                        )
                         plflows_max = tl.max(plflows, axis = 1)
-                        pflows = tl.where(plflows_max != -float("inf"),
-                            tl.exp(tl.log(tl.sum(tl.exp(plflows - plflows_max[:,None]), axis = 1)) + plflows_max),
-                            0.0
+                        pflows = tl.where(plflows_max == -float("inf"),
+                            0.0,
+                            tl.exp(tl.log(tl.sum(tl.exp(plflows - plflows_max[:,None]), axis = 1)) + plflows_max)
                         )
                     else:
                         pflows = tl.sum(nflows[None,:] * tl.exp(emars - nmars[None,:]), axis = 1)
@@ -2860,7 +2867,7 @@ class SumLayer(Layer, nn.Module):
 
         parflow_start = tl.load(pfids + nblock_id * num_edges + offs_edge)
         eparflows_ptr = param_flows + parflow_start + tile_id
-        
+
         if propagation_alg_id != 1:
             curr_pflows = acc * epars
         else:
