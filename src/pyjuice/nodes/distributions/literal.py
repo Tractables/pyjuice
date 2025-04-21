@@ -13,11 +13,10 @@ class Literal(Distribution):
     """
     A class representing Literal (indicator) distributions.
     """
-    def __init__(self, lit: Union[bool,int], p: float = 1.0):
+    def __init__(self, lit: Union[bool,int]):
         super(Literal, self).__init__()
 
         self.lit = int(lit) # Convert True/False to 1/0
-        self.p = p
 
     def get_signature(self):
         """
@@ -29,7 +28,7 @@ class Literal(Distribution):
         """
         Get the metadata of the current distribution.
         """
-        return [self.lit, self.p]
+        return [self.lit]
 
     def num_parameters(self):
         """
@@ -55,9 +54,8 @@ class Literal(Distribution):
     def fw_mar_fn(local_offsets, data, params_ptr, s_pids, metadata_ptr, s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE):
         s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
         lit = tl.load(metadata_ptr + s_mids, mask = mask, other = 0).to(tl.int64)
-        prob = tl.load(metadata_ptr + s_mids + 1, mask = mask, other = 0).to(tl.int64)
 
-        probs = tl.where(data == lit, prob, 1.0 - prob)
+        probs = tl.where(data == lit, 1.0, 0.0)
         log_probs = tl.log(probs)
 
         return log_probs
@@ -77,4 +75,4 @@ class Literal(Distribution):
         pass
 
     def _get_constructor(self):
-        return Literal, {"lit": self.lit, "p": self.p}
+        return Literal, {"lit": self.lit}
