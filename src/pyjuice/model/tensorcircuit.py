@@ -101,7 +101,8 @@ class TensorCircuit(nn.Module):
                  force_gpu_compilation: bool = False,
                  max_tied_ns_per_parflow_block: int = 8,
                  device: Optional[Union[int,torch.device]] = None,
-                 verbose: bool = True) -> None:
+                 verbose: bool = True,
+                 normalize: bool = True) -> None:
 
         super(TensorCircuit, self).__init__()
 
@@ -123,7 +124,8 @@ class TensorCircuit(nn.Module):
             force_gpu_compilation = force_gpu_compilation,
             max_tied_ns_per_parflow_block = max_tied_ns_per_parflow_block,
             device = device,
-            verbose = verbose
+            verbose = verbose,
+            normalize = normalize
         )
         
         # Hyperparameters for backward pass
@@ -792,7 +794,7 @@ class TensorCircuit(nn.Module):
 
     def _init_layers(self, layer_sparsity_tol: Optional[float] = None, max_num_partitions: Optional[int] = None,
                      disable_gpu_compilation: bool = False, force_gpu_compilation: bool = False, 
-                     max_tied_ns_per_parflow_block: int = 8, verbose: bool = True, device: Optional[Union[str,torch.device]] = None):
+                     max_tied_ns_per_parflow_block: int = 8, verbose: bool = True, device: Optional[Union[str,torch.device]] = None, normalize: bool = True):
 
         if hasattr(self, "input_layer_group") or hasattr(self, "inner_layer_groups"):
             raise ValueError("Attempting to initialize a TensorCircuit for the second time. " + \
@@ -952,14 +954,40 @@ class TensorCircuit(nn.Module):
         self._root_node_range = (self.num_nodes - self.num_root_nodes, self.num_nodes)
 
         # Initialize parameters
-        self._init_parameters()
+        self._init_parameters(normalize = normalize)
 
-    def _init_parameters(self, perturbation: float = 4.0, pseudocount: float = 0.0):
+    def _init_parameters(self, perturbation: float = 4.0, pseudocount: float = 0.0, normalize: bool = True):
         for ns in self.root_ns:
             if not ns.is_tied() and (ns.is_sum() or ns.is_input()) and not ns.has_params():
                 ns.init_parameters(perturbation = perturbation, recursive = False)
 
         params = torch.exp(torch.rand([self.num_sum_params]) * -perturbation)
+        params[:self.num_dummy_params] = 0.0
+
+        # Copy initial parameters if provided
+        for ns in self.root_ns:
+            if ns.is_sum() and not ns.is_tied() and ns.has_params():
+                ns.gather_parameters(params)
+
+        if normalize:
+            self._normalize_parameters(params, pseudocount = pseudocount)
+        self.params = nn.Parameter(params)
+
+        # Due to the custom inplace backward pass implementation, we do not track 
+        # gradient of PC parameters by PyTorch.
+        self.params.requires_grad = False
+
+        # Initialize parameters for input layers
+        for idx, layer in enumerate(self.input_layer_group):
+            layer._init_parameters(perturbation)
+
+    def _normalize_parameters(self, params, pseudocount: float = 0.0):
+        if params is not None:
+            normalize_parameters(params, self.par_update_kwargs, pseudocount)
+
+    def normalize(self, perturbation: float = 0.0, pseudocount: float = 0.0):
+        params = torch.exp(torch.rand([self.num_sum_params]) * -perturbation)
+        params = params.to(self.device)
         params[:self.num_dummy_params] = 0.0
 
         # Copy initial parameters if provided
@@ -974,13 +1002,6 @@ class TensorCircuit(nn.Module):
         # gradient of PC parameters by PyTorch.
         self.params.requires_grad = False
 
-        # Initialize parameters for input layers
-        for idx, layer in enumerate(self.input_layer_group):
-            layer._init_parameters(perturbation)
-
-    def _normalize_parameters(self, params, pseudocount: float = 0.0):
-        if params is not None:
-            normalize_parameters(params, self.par_update_kwargs, pseudocount)
 
     def _create_node_layers(self):
         depth2nodes = dict()

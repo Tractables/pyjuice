@@ -74,5 +74,11 @@ class Literal(Distribution):
               step_size, pseudocount, BLOCK_SIZE):
         pass
 
+    @staticmethod
+    def partition_fn(local_offsets, params_ptr, s_pids, metadata_ptr, s_mids_ptr, mask, BLOCK_SIZE, TILE_SIZE_K):
+        mars = tl.zeros([BLOCK_SIZE], dtype = tl.float32)
+        return mars
+
+
     def _get_constructor(self):
         return Literal, {"lit": self.lit}
