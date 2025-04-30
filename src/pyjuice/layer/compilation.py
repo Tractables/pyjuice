@@ -268,7 +268,7 @@ def sum_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, 
         use_cuda = False
 
     if use_cuda:
-        device = torch.device("cuda:0")
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
     else:
         device = torch.device("cpu")
 
@@ -703,7 +703,7 @@ def sum_layer_backward_compilation(nodes, cs2parns, n_partition_ids, n_id_in_par
         use_cuda = False
 
     if use_cuda:
-        device = torch.device("cuda:0")
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
     else:
         device = torch.device("cpu")
 
@@ -912,7 +912,7 @@ def prod_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids,
         assert block_size == 1
 
     if use_cuda:
-        device = torch.device("cuda:0")
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
     else:
         device = torch.device("cpu")
 
