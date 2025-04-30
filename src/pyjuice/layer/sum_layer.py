@@ -531,7 +531,10 @@ class SumLayer(Layer, nn.Module):
 
                 acc = tl.where(emars_max > acc,
                     tl.log(nmars + tl.exp(acc - emars_max) + 1e-24) + emars_max,
-                    tl.log(tl.exp(emars_max - acc) * nmars + 1.0) + acc
+                    tl.where(acc != -float("inf"),
+                        tl.log(tl.exp(emars_max - acc) * nmars + 1.0) + acc,
+                        -float("inf")
+                    )
                 )
 
             # Increment `epars_ptr`
@@ -647,7 +650,10 @@ class SumLayer(Layer, nn.Module):
 
                 acc = tl.where(emars_max > acc,
                     tl.log(nmars + tl.exp(acc - emars_max) + 1e-24) + emars_max,
-                    tl.log(tl.exp(emars_max - acc) * nmars + 1.0) + acc
+                    tl.where(acc != -float("inf"),
+                        tl.log(tl.exp(emars_max - acc) * nmars + 1.0) + acc,
+                        -float("inf")
+                    )
                 )
 
             # Increment `epars_ptr`
@@ -757,7 +763,10 @@ class SumLayer(Layer, nn.Module):
 
                 acc = tl.where(emars_max[None,:] > acc,
                     tl.log(nmars + tl.exp(acc - emars_max[None,:]) + 1e-24) + emars_max[None,:],
-                    tl.log(tl.exp(emars_max[None,:] - acc) * nmars + 1.0) + acc
+                    tl.where(acc != -float("inf"), 
+                        tl.log(tl.exp(emars_max[None,:] - acc) * nmars + 1.0) + acc,
+                        -float("inf")
+                    )
                 )
 
             # Increment `epars_ptr`
