@@ -1110,7 +1110,7 @@ def compile(ns: CircuitNodes, layer_sparsity_tol: float = 0.5,
             force_gpu_compilation: bool = False,
             max_tied_ns_per_parflow_block: int = 8,
             device: Optional[Union[int,torch.device]] = None,
-            verbose: bool = True) -> nn.Module:
+            verbose: bool = True, normalize: bool = True) -> nn.Module:
     """
     Compile a PC represented by a DAG into an equivalent `torch.nn.Module`.
 
@@ -1142,4 +1142,4 @@ def compile(ns: CircuitNodes, layer_sparsity_tol: float = 0.5,
     """
     return TensorCircuit(ns, layer_sparsity_tol = layer_sparsity_tol, max_num_partitions = max_num_partitions,
                          disable_gpu_compilation = disable_gpu_compilation, force_gpu_compilation = force_gpu_compilation,
-                         max_tied_ns_per_parflow_block = max_tied_ns_per_parflow_block, device = device, verbose = verbose)
+                         max_tied_ns_per_parflow_block = max_tied_ns_per_parflow_block, device = device, verbose = verbose, normalize = normalize)
