@@ -240,3 +240,17 @@ sum_ns = juice.summate(prod_ns1, prod_ns2, num_node_blocks = num_nodes // 4, blo
 ```
 
 The above is equivalent to considering the input nodes to be concatenated into a single vector of nodes, and then define the edges correspondingly.
+
+## Citation
+
+If you find PyJuice useful, please consider citing us:
+
+```
+@inproceedings{liu2024scaling,
+  title         = {Scaling Tractable Probabilistic Circuits: A Systems Perspective},
+  author        = {Liu, Anji and Ahmed, Kareem and Van den Broeck, Guy},
+  booktitle     = {Proceedings of the 41th International Conference on Machine Learning (ICML)},
+  month         = {jul},
+  year          = {2024}
+}
+```
