@@ -2637,6 +2637,7 @@ class SumLayer(Layer, nn.Module):
 
                     elflows_max = tl.max(elflows, axis = 1)
                     eflows = tl.log(tl.sum(tl.exp(elflows - elflows_max[:,None,:]), axis = 1)) + elflows_max
+                    eflows = tl.where((elflows_max == -float("inf")) | (emars == -float("inf")), -float("inf"), eflows)
                 else:
                     if propagation_alg_id == 0:
                         eflows = tl.sum(nflows * epars[:,:,None] * tl.exp(emars[:,None,:] - nmars), axis = 1)
@@ -2741,7 +2742,6 @@ class SumLayer(Layer, nn.Module):
                 )
 
             else:
-
                 for pid_m_start in range(0, grid[1], 32768):
 
                     pid_m_end = min(pid_m_start + 32768, grid[1])
