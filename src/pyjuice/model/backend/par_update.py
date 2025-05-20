@@ -201,7 +201,7 @@ def cum_pflow_kernel(cum_pflows, params, param_flows, nchs, par_start_ids, pflow
         offs_par = par_start[:,None] + offs_blk[None,:] * blk_interval[:,None]
         old_params = tl.load(params + offs_par, mask = mask_pflow, other = 0)
 
-        nch = tl.load(nchs + global_nid, mask = mask_m, other = 1)
+        nch = tl.load(nchs + offs_m, mask = mask_m, other = 1)
         pflows += (pseudocount / nch[:,None])
 
         nflows = tl.sum(tl.where(old_params < 1e-12, 0.0, pflows), axis = 1)
@@ -240,7 +240,7 @@ def em_par_update_kernel(params, param_flows, cum_pflows, nchs, par_start_ids, p
     pflows = tl.load(param_flows + offs_pflow, mask = mask_pflow, other = 0)
 
     nflows = tl.load(cum_pflows + global_nid, mask = mask_m, other = 1)
-    nch = tl.load(nchs + global_nid, mask = mask_m, other = 1)
+    nch = tl.load(nchs + offs_m, mask = mask_m, other = 1)
 
     if keep_zero_params == 1:
         new_param = (pflows + pseudocount / nch[:,None]) / nflows[:,None]
