@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import torch
 import torch.nn as nn
 import time
@@ -317,6 +318,8 @@ class TensorCircuit(nn.Module):
                  flows_memory: float = 1.0,
                  input_layer_fn: Optional[Union[str,Callable]] = None,
                  cache: Optional[dict] = None,
+                 sum_layer_pre_backward_callback: Optional[Callable] = None,
+                 sum_layer_post_backward_callback: Optional[Callable] = None,
                  return_cache: bool = False,
                  record_cudagraph: bool = False, 
                  apply_cudagraph: bool = True,
@@ -412,12 +415,34 @@ class TensorCircuit(nn.Module):
                         # First recompute the previous product layer
                         self.inner_layer_groups[layer_id-1].forward(self.node_mars, self.element_mars, _for_backward = True)
 
+                        # Execute pre-backward callback
+                        layer_group.callback(
+                            sum_layer_pre_backward_callback, 
+                            node_flows = self.node_flows,
+                            element_flows = self.element_flows,
+                            node_mars = self.node_mars,
+                            element_mars = self.element_mars,
+                            params = self.params,
+                            param_flows = self.param_flows if hasattr(self, "param_flows") else None
+                        )
+
                         # Backward sum layer
                         layer_group.backward(self.node_flows, self.element_flows, self.node_mars, self.element_mars, self.params, 
                                              param_flows = self.param_flows if compute_param_flows else None,
                                              allow_modify_flows = allow_modify_flows, 
                                              propagation_alg = propagation_alg if isinstance(propagation_alg, str) else propagation_alg[layer_id], 
                                              logspace_flows = logspace_flows, negate_pflows = negate_pflows, **kwargs)
+
+                        # Execute post-backward callback
+                        layer_group.callback(
+                            sum_layer_post_backward_callback, 
+                            node_flows = self.node_flows,
+                            element_flows = self.element_flows,
+                            node_mars = self.node_mars,
+                            element_mars = self.element_mars,
+                            params = self.params,
+                            param_flows = self.param_flows if hasattr(self, "param_flows") else None
+                        )
 
                     else:
                         raise ValueError(f"Unknown layer type {type(layer)}.")
