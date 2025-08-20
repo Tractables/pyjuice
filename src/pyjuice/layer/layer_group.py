@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from typing import Sequence
+from typing import Sequence, Callable, Optional
 
 from .layer import Layer
 from .input_layer import InputLayer
@@ -50,6 +50,12 @@ class LayerGroup(nn.Module):
 
         for layer in self.layers:
             layer.backward(*args, **kwargs)
+
+    def callback(self, callback_fn: Optional[Callable], *args, **kwargs):
+
+        if callback_fn is not None:
+            for layer in self.layers:
+                callback_fn(layer, *args, **kwargs)
 
     def enable_partial_evaluation(self, *args, **kwargs):
 

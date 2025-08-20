@@ -531,7 +531,10 @@ class SumLayer(Layer, nn.Module):
 
                 acc = tl.where(emars_max > acc,
                     tl.log(nmars + tl.exp(acc - emars_max) + 1e-24) + emars_max,
-                    tl.log(tl.exp(emars_max - acc) * nmars + 1.0) + acc
+                    tl.where(acc != -float("inf"),
+                        tl.log(tl.exp(emars_max - acc) * nmars + 1.0) + acc,
+                        -float("inf")
+                    )
                 )
 
             # Increment `epars_ptr`
@@ -647,7 +650,10 @@ class SumLayer(Layer, nn.Module):
 
                 acc = tl.where(emars_max > acc,
                     tl.log(nmars + tl.exp(acc - emars_max) + 1e-24) + emars_max,
-                    tl.log(tl.exp(emars_max - acc) * nmars + 1.0) + acc
+                    tl.where(acc != -float("inf"),
+                        tl.log(tl.exp(emars_max - acc) * nmars + 1.0) + acc,
+                        -float("inf")
+                    )
                 )
 
             # Increment `epars_ptr`
@@ -757,7 +763,10 @@ class SumLayer(Layer, nn.Module):
 
                 acc = tl.where(emars_max[None,:] > acc,
                     tl.log(nmars + tl.exp(acc - emars_max[None,:]) + 1e-24) + emars_max[None,:],
-                    tl.log(tl.exp(emars_max[None,:] - acc) * nmars + 1.0) + acc
+                    tl.where(acc != -float("inf"), 
+                        tl.log(tl.exp(emars_max[None,:] - acc) * nmars + 1.0) + acc,
+                        -float("inf")
+                    )
                 )
 
             # Increment `epars_ptr`
@@ -1679,7 +1688,7 @@ class SumLayer(Layer, nn.Module):
 
                 if logspace_flows:
                     partial_flows_max = emars + log_n_fdm_max
-                    acc = tl.where(log_n_fdm_max == -float("inf"),
+                    acc = tl.where(partial_flows_max == -float("inf"),
                         acc,
                         tl.where(partial_flows_max > acc,
                             tl.log(partial_flows + tl.exp(acc - partial_flows_max) + 1e-24) + partial_flows_max,
@@ -1838,7 +1847,7 @@ class SumLayer(Layer, nn.Module):
 
                 if logspace_flows:
                     partial_flows_max = emars + log_n_fdm_max[None,:]
-                    acc = tl.where(log_n_fdm_max[None,:] == -float("inf"),
+                    acc = tl.where(partial_flows_max == -float("inf"),
                         acc,
                         tl.where(partial_flows_max > acc,
                             tl.log(partial_flows + tl.exp(acc - partial_flows_max) + 1e-24) + partial_flows_max,
@@ -2628,6 +2637,7 @@ class SumLayer(Layer, nn.Module):
 
                     elflows_max = tl.max(elflows, axis = 1)
                     eflows = tl.log(tl.sum(tl.exp(elflows - elflows_max[:,None,:]), axis = 1)) + elflows_max
+                    eflows = tl.where((elflows_max == -float("inf")) | (emars == -float("inf")), -float("inf"), eflows)
                 else:
                     if propagation_alg_id == 0:
                         eflows = tl.sum(nflows * epars[:,:,None] * tl.exp(emars[:,None,:] - nmars), axis = 1)
@@ -2732,7 +2742,6 @@ class SumLayer(Layer, nn.Module):
                 )
 
             else:
-
                 for pid_m_start in range(0, grid[1], 32768):
 
                     pid_m_end = min(pid_m_start + 32768, grid[1])

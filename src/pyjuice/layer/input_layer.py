@@ -499,7 +499,7 @@ class InputLayer(Layer, nn.Module):
                 nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
                 batch_size = batch_size, 
                 BLOCK_SIZE = BLOCK_SIZE,
-                seed = seed if seed is not None else random.randint(0, 1e8)
+                seed = seed if seed is not None else random.randint(0, int(1e8))
             )
 
         else:
