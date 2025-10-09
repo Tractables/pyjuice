@@ -108,12 +108,12 @@
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>var</strong> (<em>Union</em><em>[</em><a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.13)"><em>int</em></a><em>,</em><em>Sequence</em><em>[</em><a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.13)"><em>int</em></a><em>]</em><em>]</em>) – the variable ID (or a list of variable IDs if the parameter <cite>dist</cite> is a multivariate distribution)</p></li>
-<li><p><strong>num_node_blocks</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.13)"><em>int</em></a>) – number of node blocks each of size <cite>block_size</cite>. I.e., the total number of nodes is <cite>num_node_blocks</cite> * <cite>block_size</cite></p></li>
+<li><p><strong>var</strong> (<em>Union</em><em>[</em><a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)"><em>int</em></a><em>,</em><em>Sequence</em><em>[</em><a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)"><em>int</em></a><em>]</em><em>]</em>) – the variable ID (or a list of variable IDs if the parameter <cite>dist</cite> is a multivariate distribution)</p></li>
+<li><p><strong>num_node_blocks</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)"><em>int</em></a>) – number of node blocks each of size <cite>block_size</cite>. I.e., the total number of nodes is <cite>num_node_blocks</cite> * <cite>block_size</cite></p></li>
 <li><p><strong>dist</strong> (<em>Distribution</em>) – the input distribution from <cite>pyjuice.nodes.distributions</cite></p></li>
 <li><p><strong>params</strong> (<em>Optional</em><em>[</em><em>Tensor</em><em>]</em>) – an optional tensor that defines the parameters of the nodes</p></li>
-<li><p><strong>num_nodes</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.13)"><em>int</em></a>) – an alternative of <cite>num_node_blocks</cite>; if set, it should be divicible by <cite>block_size</cite></p></li>
-<li><p><strong>block_size</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.13)"><em>int</em></a>) – block size of the nodes; it does not change the semantics of the nodes, but will affect the speed of the compiled PC</p></li>
+<li><p><strong>num_nodes</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)"><em>int</em></a>) – an alternative of <cite>num_node_blocks</cite>; if set, it should be divicible by <cite>block_size</cite></p></li>
+<li><p><strong>block_size</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)"><em>int</em></a>) – block size of the nodes; it does not change the semantics of the nodes, but will affect the speed of the compiled PC</p></li>
 </ul>
 </dd>
 <dt class="field-even">Returns<span class="colon">:</span></dt>
