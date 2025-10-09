@@ -9,7 +9,7 @@ import triton.language as tl
 import textwrap
 import inspect
 import random
-from typing import Sequence, Dict
+from typing import Sequence, Dict, Optional
 from triton.runtime.jit import JITFunction
 from copy import deepcopy
 
@@ -112,6 +112,9 @@ class InputLayer(Layer, nn.Module):
         self.sample_fn = self.nodes[0].dist.sample_fn
         self.em_fn = self.nodes[0].dist.em_fn
 
+        self.post_fw_fns = self.nodes[0].dist.post_fw_fns
+        self.post_bp_fns = self.nodes[0].dist.post_bp_fns
+
         if hasattr(self.nodes[0].dist, "bk_flow_mask_fn"):
             self.bk_flow_mask_fn = self.nodes[0].dist.bk_flow_mask_fn
         else:
@@ -133,6 +136,8 @@ class InputLayer(Layer, nn.Module):
         # Start metadata index: metadata[s_mids[i]] is the first metadata of the ith node
         metadata = []
         s_mids = torch.empty([self.num_nodes], dtype = torch.long)
+        # Node local index: s_nids[i] is the local id of this node within all nodes defined on the same variable
+        nids = torch.empty([self.num_nodes], dtype = torch.long)
         # source node ids (nodes with their original parameters)
         source_nids = torch.empty([cum_source_ns], dtype = torch.long)
 
@@ -141,6 +146,7 @@ class InputLayer(Layer, nn.Module):
         
         n_start = 0
         source_n_start = 0
+        var2count = dict()
         for ns_id, ns in enumerate(self.nodes):
             n_end = n_start + ns.num_nodes
 
@@ -171,6 +177,14 @@ class InputLayer(Layer, nn.Module):
             s_mids[n_start:n_end] = len(metadata)
             metadata.extend(node_metadata[ns_id])
 
+            # `s_nids`
+            if len(node_vars[ns_id]) == 1:
+                var = node_vars[ns_id][0]
+                if var not in var2count:
+                    var2count[var] = 0
+                nids[n_start:n_end] = torch.arange(0, n_end - n_start) + var2count[var]
+                var2count[var] += n_end - n_start
+
             n_start = n_end
 
         self.register_buffer("vids", vids)
@@ -178,6 +192,7 @@ class InputLayer(Layer, nn.Module):
         self.register_buffer("s_pfids", s_pfids)
         self.register_buffer("metadata", torch.tensor(metadata).float())
         self.register_buffer("s_mids", s_mids)
+        self.register_buffer("nids", nids)
         self.register_buffer("source_nids", source_nids)
 
         ## Prepare info buffers for tied nodes ##
@@ -299,7 +314,7 @@ class InputLayer(Layer, nn.Module):
                 mask_dim = missing_mask.dim()
                 if mask_dim == 1:
                     mode = 0
-                elif _batch_first or num_vars == missing_mask.size(1):
+                elif _batch_first or self.pc_num_vars == missing_mask.size(1):
                     mode = 1
                 else:
                     mode = 2
@@ -319,6 +334,38 @@ class InputLayer(Layer, nn.Module):
                     partial_eval = 1 if fw_local_ids is not None else 0,
                     mode = mode,
                     num_warps = 8
+                )
+
+            # Apply post-processing kernels
+            for (kernel, cond_fn, prep_kwargs_fn) in self.post_fw_fns:
+                if not cond_fn(self, kwargs):
+                    continue
+
+                target_kwargs = prep_kwargs_fn(self, kwargs)
+
+                BLOCK_SIZE = 1024
+
+                grid = (triton.cdiv(layer_num_nodes * batch_size, BLOCK_SIZE),)
+
+                kernel[grid](
+                    params_ptr = self.params, 
+                    node_mars_ptr = node_mars, 
+                    data_ptr = data, 
+                    vids_ptr = self.vids, 
+                    s_pids_ptr = self.s_pids, 
+                    metadata_ptr = self.metadata, 
+                    s_mids_ptr = self.s_mids, 
+                    nids_ptr = self.nids,
+                    fw_local_ids_ptr = fw_local_ids,
+                    layer_num_nodes = layer_num_nodes, 
+                    batch_size = batch_size, 
+                    num_vars_per_node = self.num_vars_per_node, 
+                    nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
+                    node_offset = node_offset, 
+                    BLOCK_SIZE = BLOCK_SIZE, 
+                    partial_eval = 1 if fw_local_ids is not None else 0,
+                    num_warps = 8,
+                    **target_kwargs
                 )
 
         else:
@@ -449,6 +496,43 @@ class InputLayer(Layer, nn.Module):
                     num_warps = 8
                 )
 
+            # Apply post-processing kernels
+            for (kernel, cond_fn, prep_kwargs_fn) in self.post_bp_fns:
+                if not cond_fn(self, kwargs):
+                    continue
+
+                target_kwargs = prep_kwargs_fn(self, kwargs)
+
+                BLOCK_SIZE = 1024
+
+                grid = (triton.cdiv(layer_num_nodes * batch_size, BLOCK_SIZE),)
+
+                kernel[grid](
+                    params_ptr = self.params,
+                    param_flows_ptr = self.param_flows,
+                    node_flows_ptr = node_flows, 
+                    node_mars_ptr = node_mars,
+                    data_ptr = data, 
+                    vids_ptr = self.vids, 
+                    s_pids_ptr = self.s_pids,
+                    s_pfids_ptr = self.s_pfids,
+                    metadata_ptr = self.metadata, 
+                    s_mids_ptr = self.s_mids, 
+                    nids_ptr = self.nids,
+                    bk_local_ids_ptr = bk_local_ids,
+                    layer_num_nodes = layer_num_nodes, 
+                    batch_size = batch_size, 
+                    num_vars_per_node = self.num_vars_per_node, 
+                    num_vars = num_vars,
+                    nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
+                    node_offset = node_offset, 
+                    BLOCK_SIZE = BLOCK_SIZE, 
+                    partial_eval = 1 if bk_local_ids is not None else 0,
+                    logspace_flows = logspace_flows,
+                    TILE_SIZE_K = 1,
+                    num_warps = 8,
+                    **target_kwargs
+                )
         else:
             raise NotImplementedError("CPU backward fn for input nodes is not implemented.")
 
