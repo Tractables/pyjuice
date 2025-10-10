@@ -444,7 +444,7 @@ def unblockify(root_ns: CircuitNodes, block_size: int = 1, recursive: bool = Tru
                             else:
                                 raise NotImplementedError()
 
-            assert new_ns._params.size(0) == new_ns.edge_ids.size(1)
+                assert new_ns._params.size(0) == new_ns.edge_ids.size(1)
 
         return new_ns
 
