@@ -112,8 +112,15 @@ class InputLayer(Layer, nn.Module):
         self.sample_fn = self.nodes[0].dist.sample_fn
         self.em_fn = self.nodes[0].dist.em_fn
 
-        self.post_fw_fns = self.nodes[0].dist.post_fw_fns
-        self.post_bp_fns = self.nodes[0].dist.post_bp_fns
+        try:
+            self.post_fw_fns = self.nodes[0].dist.post_fw_fns
+        except AttributeError:
+            self.post_fw_fns = []
+
+        try:
+            self.post_bp_fns = self.nodes[0].dist.post_bp_fns
+        except AttributeError:
+            self.post_bp_fns = []
 
         if hasattr(self.nodes[0].dist, "bk_flow_mask_fn"):
             self.bk_flow_mask_fn = self.nodes[0].dist.bk_flow_mask_fn
