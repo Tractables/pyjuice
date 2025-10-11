@@ -77,7 +77,6 @@ def cum_par_flows_to_device(kernels_args, device):
     return kernels_args
 
 
-# @triton.jit
 @triton_jit
 def cum_par_flows_kernel(param_flows, target_pfids, block_sizes, ch_pfids, BLOCK_G: tl.constexpr, BLOCK_M: tl.constexpr):
 
