@@ -3,11 +3,9 @@ import triton
 import triton.language as tl
 
 from typing import Optional
-from pyjuice.utils.kernel_launcher import FastJITFunction
 
 
 @triton.jit
-# @FastJITFunction
 def _cum_params_kernel(params_ptr, cum_params_ptr, node_ids_ptr, num_param_blocks, block_size, batch_size, 
                        BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_B: tl.constexpr):
 
@@ -36,7 +34,6 @@ def _cum_params_kernel(params_ptr, cum_params_ptr, node_ids_ptr, num_param_block
 
 
 @triton.jit
-# @FastJITFunction
 def _norm_params_kernel(params_ptr, cum_params_ptr, node_ids_ptr, node_nchs_ptr, num_param_blocks, block_size, 
                         batch_size, pseudocount, BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_B: tl.constexpr):
 

@@ -17,7 +17,7 @@ else:
 
 from pyjuice.nodes import ProdNodes
 from pyjuice.utils.parameter_list import FastParamList
-from pyjuice.utils.kernel_launcher import FastJITFunction
+from pyjuice.utils.kernel_launcher import triton_jit
 from .layer import Layer
 from .backend.node_partition import partition_nodes_by_n_edges
 from .backend.index_set import batched_index_set, batched_index_cum
@@ -258,7 +258,7 @@ class ProdLayer(Layer, nn.Module):
 
     @staticmethod
     # @triton.jit
-    @FastJITFunction
+    @triton_jit
     def _forward_backward_kernel_3d(node_vals_ptr, element_vals_ptr, local_ids_ptr, nids_ptr, cids_ptr, tot_n_nodes, tot_n_eles, n_nblocks,
                                     num_edges: tl.constexpr, batch_size, BLOCK_M: tl.constexpr, BLOCK_B: tl.constexpr, 
                                     block_size: tl.constexpr, accum: tl.constexpr, partial_eval: tl.constexpr, prop_logsumexp: tl.constexpr):
@@ -391,7 +391,7 @@ class ProdLayer(Layer, nn.Module):
 
     @staticmethod
     # @triton.jit
-    @FastJITFunction
+    @triton_jit
     def _forward_backward_kernel_2d(node_vals_ptr, element_vals_ptr, local_ids_ptr, nids_ptr, cids_ptr, tot_n_nodes, tot_n_eles, n_nblocks,
                                     num_edges: tl.constexpr, batch_size, BLOCK_M: tl.constexpr, BLOCK_B: tl.constexpr, 
                                     block_size: tl.constexpr, accum: tl.constexpr, partial_eval: tl.constexpr, prop_logsumexp: tl.constexpr):
@@ -464,7 +464,7 @@ class ProdLayer(Layer, nn.Module):
 
     @staticmethod
     # @triton.jit
-    @FastJITFunction
+    @triton_jit
     def _forward_backward_kernel_large(node_vals_ptr, element_vals_ptr, local_ids_ptr, nids_ptr, cids_ptr, tot_n_nodes, tot_n_eles, n_nblocks,
                                        num_edges: tl.constexpr, batch_size, BLOCK_N: tl.constexpr, BLOCK_B: tl.constexpr, 
                                        N_NUM_BLKS: tl.constexpr, block_size: tl.constexpr, accum: tl.constexpr, partial_eval: tl.constexpr,

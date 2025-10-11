@@ -6,12 +6,11 @@ import triton
 import triton.language as tl
 from numba import njit
 
-from pyjuice.utils.kernel_launcher import FastJITFunction
+from pyjuice.utils.kernel_launcher import triton_jit
 
 
-# @triton.jit
-@FastJITFunction
-def cum_par_kernel(cum_pflows, params, par_start_ids, blk_sizes, blk_intervals, 
+@triton_jit
+def cum_par_kernel(cum_pflows, mparams, par_start_ids, blk_sizes, blk_intervals, 
                    global_nids, constexprs, BLOCK_ID: tl.constexpr, BLOCK_SIZE: tl.constexpr):
 
     pid = tl.program_id(axis = 0)
@@ -31,15 +30,14 @@ def cum_par_kernel(cum_pflows, params, par_start_ids, blk_sizes, blk_intervals,
 
     offs_par = par_start[:,None] + offs_blk[None,:] * blk_interval[:,None]
     mask_par = mask_m[:,None] & (offs_blk[None,:] < blk_size[:,None])
-    pars = tl.load(params + offs_par, mask = mask_par, other = 0)
+    pars = tl.load(mparams + offs_par, mask = mask_par, other = 0)
     sum_pars = tl.sum(pars, axis = 1)
 
     tl.atomic_add(cum_pflows + global_nid, sum_pars, mask = mask_m)
 
 
-# @triton.jit
-@FastJITFunction
-def par_update_kernel(params, cum_pflows, nchs, par_start_ids, blk_sizes, blk_intervals,
+@triton_jit
+def par_update_kernel(mparams, cum_pflows, nchs, par_start_ids, blk_sizes, blk_intervals,
                       global_nids, constexprs, BLOCK_ID: tl.constexpr, BLOCK_SIZE: tl.constexpr):
 
     pid = tl.program_id(axis = 0)
@@ -60,14 +58,14 @@ def par_update_kernel(params, cum_pflows, nchs, par_start_ids, blk_sizes, blk_in
 
     offs_par = par_start[:,None] + offs_blk[None,:] * blk_interval[:,None]
     mask_par = mask_m[:,None] & (offs_blk[None,:] < blk_size[:,None])
-    pars = tl.load(params + offs_par, mask = mask_par, other = 0)
+    pars = tl.load(mparams + offs_par, mask = mask_par, other = 0)
 
     sum_pars = tl.load(cum_pflows + global_nid, mask = mask_m, other = 1)
     nch = tl.load(nchs + global_nid, mask = mask_m, other = 1)
 
     norm_param = (pars + pseudocount / nch[:,None]) / (sum_pars[:,None] + pseudocount)
 
-    tl.store(params + offs_par, norm_param, mask = mask_par)
+    tl.store(mparams + offs_par, norm_param, mask = mask_par)
 
 
 @njit

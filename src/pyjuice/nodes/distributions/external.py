@@ -7,7 +7,7 @@ import math
 from typing import Tuple, Optional, Any
 
 from .distributions import Distribution
-from pyjuice.utils.kernel_launcher import FastJITFunction
+from pyjuice.utils.kernel_launcher import triton_jit
 
 
 def _condition_apply_soft_evi_kernel(layer, kwargs):
@@ -117,7 +117,7 @@ class External(Distribution):
         return torch.float32
 
     @staticmethod
-    @FastJITFunction
+    @triton_jit
     def apply_soft_evi_kernel(params_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, metadata_ptr, s_mids_ptr, nids_ptr, 
                               fw_local_ids_ptr, partial_eval: tl.constexpr, layer_num_nodes: tl.constexpr, batch_size: tl.constexpr, 
                               num_vars_per_node: tl.constexpr, nv_block_size: tl.constexpr, node_offset: tl.constexpr, BLOCK_SIZE: tl.constexpr,
@@ -149,7 +149,7 @@ class External(Distribution):
         tl.store(node_mars_ptr + node_offsets * batch_size + batch_offsets, soft_evi, mask = mask)
 
     @staticmethod
-    @FastJITFunction
+    @triton_jit
     def soft_evi_grad_kernel(params_ptr, param_flows_ptr, node_flows_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, s_pfids_ptr,
                              metadata_ptr, s_mids_ptr, nids_ptr, bk_local_ids_ptr, partial_eval: tl.constexpr, logspace_flows: tl.constexpr, layer_num_nodes: tl.constexpr, 
                              batch_size: tl.constexpr, num_vars_per_node: tl.constexpr, num_vars: tl.constexpr, nv_block_size: tl.constexpr, node_offset: tl.constexpr, 
