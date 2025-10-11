@@ -19,7 +19,7 @@ else:
 from pyjuice.nodes import SumNodes
 from pyjuice.utils import BitSet
 from pyjuice.utils.parameter_list import FastParamList
-from pyjuice.utils.kernel_launcher import FastJITFunction
+from pyjuice.utils.kernel_launcher import triton_jit
 from .layer import Layer
 from .backend.node_partition import partition_nodes_by_n_edges
 from .backend.index_set import batched_index_set, index_cum
@@ -439,8 +439,8 @@ class SumLayer(Layer, nn.Module):
 
     @staticmethod
     # @triton.jit
-    @FastJITFunction
-    def _fw_triton_block_sparse_tlmm_kernel(node_mars, element_mars, params, nids, cids_start, cids_increment,
+    @triton_jit
+    def _fw_triton_block_sparse_tlmm_kernel(node_mars, element_mars, mparams, nids, cids_start, cids_increment,
                                             pids_start, pids_increment, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
                                             BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
                                             TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, use_bf16: tl.constexpr,
@@ -468,7 +468,7 @@ class SumLayer(Layer, nn.Module):
         offs_estart = nblock_id * TILE_SIZE_K + offs_edge
         offs_estart = tl.max_contiguous(offs_estart, TILE_SIZE_K)
         par_start = tl.load(pids_start + offs_estart)
-        epars_ptr = params + \
+        epars_ptr = mparams + \
             offs_node[:,None] + \
             par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
 
@@ -558,8 +558,8 @@ class SumLayer(Layer, nn.Module):
 
     @staticmethod
     # @triton.jit
-    @FastJITFunction
-    def _fw_triton_block_sparse_csmm1_kernel(node_mars, element_mars, params, nids, cids_start, cids_increment,
+    @triton_jit
+    def _fw_triton_block_sparse_csmm1_kernel(node_mars, element_mars, mparams, nids, cids_start, cids_increment,
                                             pids_start, pids_increment, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
                                             BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
                                             TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, use_bf16: tl.constexpr,
@@ -587,7 +587,7 @@ class SumLayer(Layer, nn.Module):
         offs_estart = nblock_id * TILE_SIZE_K + offs_edge
         offs_estart = tl.max_contiguous(offs_estart, TILE_SIZE_K)
         par_start = tl.load(pids_start + offs_estart)
-        epars_ptr = params + \
+        epars_ptr = mparams + \
             offs_node[:,None] + \
             par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
 
@@ -677,8 +677,8 @@ class SumLayer(Layer, nn.Module):
 
     @staticmethod
     # @triton.jit
-    @FastJITFunction
-    def _fw_triton_block_sparse_csmm2_kernel(node_mars, element_mars, params, nids, cids_start, cids_increment,
+    @triton_jit
+    def _fw_triton_block_sparse_csmm2_kernel(node_mars, element_mars, mparams, nids, cids_start, cids_increment,
                                              pids_start, pids_increment, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
                                              BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
                                              TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, use_bf16: tl.constexpr,
@@ -706,7 +706,7 @@ class SumLayer(Layer, nn.Module):
         offs_estart = nblock_id * TILE_SIZE_K + offs_edge
         offs_estart = tl.max_contiguous(offs_estart, TILE_SIZE_K)
         par_start = tl.load(pids_start + offs_estart)
-        epars_ptr = params + \
+        epars_ptr = mparams + \
             offs_node[:,None] + \
             par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
 
@@ -955,8 +955,8 @@ class SumLayer(Layer, nn.Module):
 
     @staticmethod
     # @triton.jit
-    @FastJITFunction
-    def _fw_triton_sparse_kernel(node_mars, element_mars, params, nids, cids, pids,
+    @triton_jit
+    def _fw_triton_sparse_kernel(node_mars, element_mars, mparams, nids, cids, pids,
                                  local_ids, batch_size, partial_eval: tl.constexpr, num_edges: tl.constexpr, 
                                  BLOCK_B: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, propagation_alg_id: tl.constexpr, alpha = 0.0):
         
@@ -973,7 +973,7 @@ class SumLayer(Layer, nn.Module):
         # Initialize pointers to `params`
         offs_edge = tl.arange(0, num_edges)
         par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
-        epars_ptr = params + par_start # [num_edges]
+        epars_ptr = mparams + par_start # [num_edges]
 
         # Batch offsets and mask
         offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B
@@ -1027,8 +1027,8 @@ class SumLayer(Layer, nn.Module):
 
     @staticmethod
     # @triton.jit
-    @FastJITFunction
-    def _fw_triton_large_sparse_kernel(node_mars, element_mars, params, nids, cids, pids, local_ids, batch_size, 
+    @triton_jit
+    def _fw_triton_large_sparse_kernel(node_mars, element_mars, mparams, nids, cids, pids, local_ids, batch_size, 
                                        num_nodes, pid_m_offset, partial_eval: tl.constexpr, num_edges: tl.constexpr, BLOCK_B: tl.constexpr, 
                                        TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, propagation_alg_id: tl.constexpr, alpha = 0.0):
 
@@ -1049,7 +1049,7 @@ class SumLayer(Layer, nn.Module):
         # Initialize pointers to `params`
         offs_edge = tl.arange(0, num_edges)
         par_start = tl.load(pids + nblock_ids[:,None] * num_edges + offs_edge[None,:], mask = mask_m[:,None]) # [TILE_SIZE_M, num_edges]
-        epars = tl.load(params + tile_ids[:,None] * BLOCK_SIZE_M + par_start, mask = mask_m[:,None], other = 0.0) # [TILE_SIZE_M, num_edges]
+        epars = tl.load(mparams + tile_ids[:,None] * BLOCK_SIZE_M + par_start, mask = mask_m[:,None], other = 0.0) # [TILE_SIZE_M, num_edges]
 
         # Batch offsets and mask
         offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B
@@ -1129,7 +1129,7 @@ class SumLayer(Layer, nn.Module):
             self._fw_triton_sparse_kernel[grid](
                 node_mars = node_mars, 
                 element_mars = element_mars, 
-                params = params, 
+                mparams = params, 
                 nids = nids, 
                 cids = cids,
                 pids = pids,
@@ -1156,7 +1156,7 @@ class SumLayer(Layer, nn.Module):
                 self._fw_triton_large_sparse_kernel[grid](
                     node_mars = node_mars,
                     element_mars = element_mars,
-                    params = params,
+                    mparams = params,
                     nids = nids,
                     cids = cids,
                     pids = pids,
@@ -1181,7 +1181,7 @@ class SumLayer(Layer, nn.Module):
                     self._fw_triton_large_sparse_kernel[small_grid](
                         node_mars = node_mars,
                         element_mars = element_mars,
-                        params = params,
+                        mparams = params,
                         nids = nids,
                         cids = cids,
                         pids = pids,
@@ -1339,7 +1339,7 @@ class SumLayer(Layer, nn.Module):
 
     @staticmethod
     # @triton.jit
-    @FastJITFunction
+    @triton_jit
     def _bk_triton_modify_flow_kernel(node_flows, node_mars, local_ids, nids, batch_size: tl.constexpr, partial_eval: tl.constexpr, 
                                       BLOCK_B: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, propagation_alg_id: tl.constexpr, alpha = 0.0):
 
@@ -1381,7 +1381,7 @@ class SumLayer(Layer, nn.Module):
 
     @staticmethod
     # @triton.jit
-    @FastJITFunction
+    @triton_jit
     def _bk_triton_large_modify_flow_kernel(node_flows, node_mars, local_ids, nids, num_nodes, batch_size: tl.constexpr, partial_eval: tl.constexpr, 
                                             BLOCK_B: tl.constexpr, TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, propagation_alg_id: tl.constexpr, 
                                             pid_m_offset = 0, alpha = 0.0):
@@ -1555,8 +1555,8 @@ class SumLayer(Layer, nn.Module):
 
     @staticmethod
     # @triton.jit
-    @FastJITFunction
-    def _bk_triton_block_sparse_ele_kernel(node_flows, element_flows, node_mars, element_mars, params, 
+    @triton_jit
+    def _bk_triton_block_sparse_ele_kernel(node_flows, element_flows, node_mars, element_mars, mparams, 
                                            chids, parids_start, parids_increment, parpids_start, parpids_increment, 
                                            local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr, ptr_inc_step: tl.constexpr, 
                                            allow_modify_flows: tl.constexpr, logspace_flows: tl.constexpr, BLOCK_B: tl.constexpr, 
@@ -1582,7 +1582,7 @@ class SumLayer(Layer, nn.Module):
         offs_edge_gid = offs_edge // BLOCK_SIZE_K
         offs_edge_nid = (offs_edge % BLOCK_SIZE_K)
         par_start = tl.load(parpids_start + eleblock_id * ptr_inc_step + offs_edge_gid)
-        epars_ptr = params + \
+        epars_ptr = mparams + \
             offs_ele[:,None] * BLOCK_SIZE_K + \
             (par_start + offs_edge_nid)[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
 
@@ -1718,8 +1718,8 @@ class SumLayer(Layer, nn.Module):
 
     @staticmethod
     # @triton.jit
-    @FastJITFunction
-    def _bk_triton_block_sparse_ele_csmm2_kernel(node_flows, element_flows, node_mars, element_mars, params, 
+    @triton_jit
+    def _bk_triton_block_sparse_ele_csmm2_kernel(node_flows, element_flows, node_mars, element_mars, mparams, 
                                                  chids, parids_start, parids_increment, parpids_start, parpids_increment, 
                                                  local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr, ptr_inc_step: tl.constexpr, 
                                                  allow_modify_flows: tl.constexpr, logspace_flows: tl.constexpr, BLOCK_B: tl.constexpr, 
@@ -1745,7 +1745,7 @@ class SumLayer(Layer, nn.Module):
         offs_edge_gid = offs_edge // BLOCK_SIZE_K
         offs_edge_nid = (offs_edge % BLOCK_SIZE_K)
         par_start = tl.load(parpids_start + eleblock_id * ptr_inc_step + offs_edge_gid)
-        epars_ptr = params + \
+        epars_ptr = mparams + \
             offs_ele[:,None] * BLOCK_SIZE_K + \
             (par_start + offs_edge_nid)[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
 
@@ -1971,7 +1971,7 @@ class SumLayer(Layer, nn.Module):
                     element_flows = element_flows, 
                     node_mars = node_mars, 
                     element_mars = element_mars, 
-                    params = params, 
+                    mparams = params, 
                     chids = chids, 
                     parids_start = parids_start,
                     parids_increment = parids_increment,
@@ -2003,7 +2003,7 @@ class SumLayer(Layer, nn.Module):
                     element_flows = element_flows, 
                     node_mars = node_mars, 
                     element_mars = element_mars, 
-                    params = params, 
+                    mparams = params, 
                     chids = chids, 
                     parids_start = parids_start,
                     parids_increment = parids_increment,
@@ -2034,8 +2034,8 @@ class SumLayer(Layer, nn.Module):
 
     @staticmethod
     # @triton.jit
-    @FastJITFunction
-    def _bk_triton_block_sparse_par_kernel(node_flows, node_mars, element_mars, params, param_flows, nids, cids, pids, pfids,
+    @triton_jit
+    def _bk_triton_block_sparse_par_kernel(node_flows, node_mars, element_mars, mparams, param_flows, nids, cids, pids, pfids,
                                            batch_size: tl.constexpr, num_edges: tl.constexpr, allow_modify_flows: tl.constexpr, 
                                            logspace_flows: tl.constexpr, TILE_SIZE_B: tl.constexpr, B_NUM_TILES: tl.constexpr, 
                                            TILE_SIZE_K: tl.constexpr, TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, 
@@ -2070,7 +2070,7 @@ class SumLayer(Layer, nn.Module):
         if propagation_alg_id == 1:
             par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
             epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
-            epars = tl.load(params + epars_offsets)
+            epars = tl.load(mparams + epars_offsets)
             elpars = tl.log(epars)
 
         # Inner loop
@@ -2139,7 +2139,7 @@ class SumLayer(Layer, nn.Module):
         if propagation_alg_id != 1:
             par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
             epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
-            epars = tl.load(params + epars_offsets)
+            epars = tl.load(mparams + epars_offsets)
 
         if propagation_alg_id != 1:
             pflows = acc * epars
@@ -2156,8 +2156,8 @@ class SumLayer(Layer, nn.Module):
 
     @staticmethod
     # @triton.jit
-    @FastJITFunction
-    def _bk_triton_block_sparse_par_csmm2_kernel(node_flows, node_mars, element_mars, params, param_flows, nids, cids, pids, pfids,
+    @triton_jit
+    def _bk_triton_block_sparse_par_csmm2_kernel(node_flows, node_mars, element_mars, mparams, param_flows, nids, cids, pids, pfids,
                                                  batch_size: tl.constexpr, num_edges: tl.constexpr, allow_modify_flows: tl.constexpr, 
                                                  logspace_flows: tl.constexpr, TILE_SIZE_B: tl.constexpr, B_NUM_TILES: tl.constexpr, 
                                                  TILE_SIZE_K: tl.constexpr, TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, 
@@ -2192,7 +2192,7 @@ class SumLayer(Layer, nn.Module):
         if propagation_alg_id == 1:
             par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
             epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
-            epars = tl.load(params + epars_offsets)
+            epars = tl.load(mparams + epars_offsets)
             elpars = tl.log(epars)
 
         # Inner loop
@@ -2252,7 +2252,7 @@ class SumLayer(Layer, nn.Module):
         if propagation_alg_id != 1:
             par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
             epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
-            epars = tl.load(params + epars_offsets)
+            epars = tl.load(mparams + epars_offsets)
 
         if propagation_alg_id != 1:
             pflows = acc * epars
@@ -2342,7 +2342,7 @@ class SumLayer(Layer, nn.Module):
                     node_flows = node_flows, 
                     node_mars = node_mars, 
                     element_mars = element_mars, 
-                    params = params, 
+                    mparams = params, 
                     param_flows = param_flows, 
                     nids = nids, 
                     cids = cids, 
@@ -2371,7 +2371,7 @@ class SumLayer(Layer, nn.Module):
                     node_flows = node_flows, 
                     node_mars = node_mars, 
                     element_mars = element_mars, 
-                    params = params, 
+                    mparams = params, 
                     param_flows = param_flows, 
                     nids = nids, 
                     cids = cids, 
@@ -2448,8 +2448,8 @@ class SumLayer(Layer, nn.Module):
 
     @staticmethod
     # @triton.jit
-    @FastJITFunction
-    def _bk_triton_sparse_ele_kernel(node_flows, element_flows, node_mars, element_mars, params, 
+    @triton_jit
+    def _bk_triton_sparse_ele_kernel(node_flows, element_flows, node_mars, element_mars, mparams, 
                                      chids, parids, parpids, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
                                      n_edge_blocks: tl.constexpr, allow_modify_flows: tl.constexpr, logspace_flows: tl.constexpr, 
                                      BLOCK_B: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, 
@@ -2470,7 +2470,7 @@ class SumLayer(Layer, nn.Module):
         offs_edge_gid = offs_edge // BLOCK_SIZE_K
         offs_edge_nid = (offs_edge % BLOCK_SIZE_K)
         par_start = tl.load(parpids + eleblock_id * n_edge_blocks + offs_edge_gid)
-        epars_ptr = params + par_start + offs_edge_nid # [num_edges]
+        epars_ptr = mparams + par_start + offs_edge_nid # [num_edges]
 
         # Batch offsets and mask
         offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B
@@ -2553,8 +2553,8 @@ class SumLayer(Layer, nn.Module):
 
     @staticmethod
     # @triton.jit
-    @FastJITFunction
-    def _bk_triton_large_sparse_ele_kernel(node_flows, element_flows, node_mars, element_mars, params, 
+    @triton_jit
+    def _bk_triton_large_sparse_ele_kernel(node_flows, element_flows, node_mars, element_mars, mparams, 
                                            chids, parids, parpids, local_ids, num_eles, pid_m_offset, 
                                            batch_size: tl.constexpr, partial_eval: tl.constexpr,
                                            n_edge_blocks: tl.constexpr, allow_modify_flows: tl.constexpr, 
@@ -2581,7 +2581,7 @@ class SumLayer(Layer, nn.Module):
         offs_edge_gid = offs_edge // BLOCK_SIZE_K
         offs_edge_nid = (offs_edge % BLOCK_SIZE_K)
         par_start = tl.load(parpids + eleblock_ids[:,None] * n_edge_blocks + offs_edge_gid[None,:])
-        epars = tl.load(params + par_start + offs_edge_nid[None,:], mask = mask_m[:,None]) # [TILE_SIZE_M, num_edges]
+        epars = tl.load(mparams + par_start + offs_edge_nid[None,:], mask = mask_m[:,None]) # [TILE_SIZE_M, num_edges]
 
         # Batch offsets and mask
         offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B
@@ -2687,7 +2687,7 @@ class SumLayer(Layer, nn.Module):
                 element_flows = element_flows, 
                 node_mars = node_mars, 
                 element_mars = element_mars, 
-                params = params, 
+                mparams = params, 
                 chids = chids, 
                 parids = parids,
                 parpids = parpids,
@@ -2720,7 +2720,7 @@ class SumLayer(Layer, nn.Module):
                     element_flows = element_flows,
                     node_mars = node_mars,
                     element_mars = element_mars,
-                    params = params,
+                    mparams = params,
                     chids = chids,
                     parids = parids,
                     parpids = parpids,
@@ -2752,7 +2752,7 @@ class SumLayer(Layer, nn.Module):
                         element_flows = element_flows,
                         node_mars = node_mars,
                         element_mars = element_mars,
-                        params = params,
+                        mparams = params,
                         chids = chids,
                         parids = parids,
                         parpids = parpids,
@@ -2777,8 +2777,8 @@ class SumLayer(Layer, nn.Module):
 
     @staticmethod
     # @triton.jit
-    @FastJITFunction
-    def _bk_triton_sparse_par_kernel(node_flows, node_mars, element_mars, params, param_flows, nids, cids, pids, pfids,
+    @triton_jit
+    def _bk_triton_sparse_par_kernel(node_flows, node_mars, element_mars, mparams, param_flows, nids, cids, pids, pfids,
                                      pid_m_offset, num_edges: tl.constexpr, batch_size: tl.constexpr, allow_modify_flows: tl.constexpr, 
                                      logspace_flows: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_B: tl.constexpr, 
                                      TILE_SIZE_B: tl.constexpr, B_NUM_BLOCKS: tl.constexpr, propagation_alg_id: tl.constexpr, 
@@ -2810,7 +2810,7 @@ class SumLayer(Layer, nn.Module):
 
         if propagation_alg_id == 1:
             par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
-            epars_ptr = params + par_start + tile_id
+            epars_ptr = mparams + par_start + tile_id
             epars = tl.load(epars_ptr) # [BLOCK_K]
             elpars = tl.log(epars)
 
@@ -2871,7 +2871,7 @@ class SumLayer(Layer, nn.Module):
 
         if propagation_alg_id != 1:
             par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
-            epars_ptr = params + par_start + tile_id
+            epars_ptr = mparams + par_start + tile_id
             epars = tl.load(epars_ptr) # [BLOCK_K]
 
         parflow_start = tl.load(pfids + nblock_id * num_edges + offs_edge)
@@ -2949,7 +2949,7 @@ class SumLayer(Layer, nn.Module):
                 node_flows = node_flows, 
                 node_mars = node_mars, 
                 element_mars = element_mars, 
-                params = params, 
+                mparams = params, 
                 param_flows = param_flows, 
                 nids = nids, 
                 cids = cids, 
@@ -2981,7 +2981,7 @@ class SumLayer(Layer, nn.Module):
                     node_flows = node_flows, 
                     node_mars = node_mars, 
                     element_mars = element_mars, 
-                    params = params, 
+                    mparams = params, 
                     param_flows = param_flows, 
                     nids = nids, 
                     cids = cids, 

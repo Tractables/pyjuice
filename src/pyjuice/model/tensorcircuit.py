@@ -881,6 +881,16 @@ class TensorCircuit(nn.Module):
                             pc_num_vars = pc_num_vars
                         )
 
+                        # Special treatment for input layers with the `External` distribution
+                        if input_layer.dist_signature == "External":
+                            scope = BitSet()
+                            for ns in input_layer.nodes:
+                                scope |= ns.scope
+                            vars = torch.sort(torch.tensor(scope.to_list())).values
+                            var_idmapping = torch.zeros([pc_num_vars], dtype = torch.long)
+                            var_idmapping[vars] = torch.arange(0, vars.size(0))
+                            input_layer.register_buffer("var_idmapping", var_idmapping)
+
                         input_layers.append(input_layer)
                         
                         input_layer_id += 1
