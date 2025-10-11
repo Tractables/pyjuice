@@ -72,7 +72,7 @@ def prod_layer_td_backward(layer, node_flows, element_flows):
 
 
 @triton_jit
-def sum_layer_td_backward_block_kernel(node_flows, element_flows, node_mars, element_mars, params, chids, parids, parpids, 
+def sum_layer_td_backward_block_kernel(node_flows, element_flows, node_mars, element_mars, mparams, chids, parids, parpids, 
                                        n_num_nodes: tl.constexpr, c_num_nodes: tl.constexpr, TILE_SIZE_N: tl.constexpr, 
                                        TILE_SIZE_C: tl.constexpr, n_block_size: tl.constexpr, c_block_size: tl.constexpr, 
                                        NUM_N_BLKS: tl.constexpr, pc_is_normalized: tl.constexpr):
@@ -94,7 +94,7 @@ def sum_layer_td_backward_block_kernel(node_flows, element_flows, node_mars, ele
 
     pid_base = tl.load(parpids + cgroup_id * NUM_N_BLKS + ngroup_id)
     pids = pid_base + offs_cnode[:,None] * n_block_size + offs_nnode[None,:] # [TILE_SIZE_C, TILE_SIZE_N]
-    epars = tl.load(params + pids)
+    epars = tl.load(mparams + pids)
 
     if not pc_is_normalized:
         cmars = tl.load(element_mars + cids) # [TILE_SIZE_C]
@@ -107,7 +107,7 @@ def sum_layer_td_backward_block_kernel(node_flows, element_flows, node_mars, ele
 
 
 @triton_jit
-def sum_layer_td_backward_node_kernel(node_flows, element_flows, node_mars, element_mars, params, chids, parids, parpids, 
+def sum_layer_td_backward_node_kernel(node_flows, element_flows, node_mars, element_mars, mparams, chids, parids, parpids, 
                                       n_num_nodes: tl.constexpr, c_num_nodes: tl.constexpr, TILE_SIZE_N: tl.constexpr, 
                                       TILE_SIZE_C: tl.constexpr, n_block_size: tl.constexpr, c_block_size: tl.constexpr, 
                                       NUM_N_BLKS: tl.constexpr, pc_is_normalized: tl.constexpr):
@@ -135,7 +135,7 @@ def sum_layer_td_backward_node_kernel(node_flows, element_flows, node_mars, elem
 
     pids_base = tl.load(parpids + cgroup_ids[:,None] * NUM_N_BLKS + ngroup_ids[None,:], mask = cn_mask)
     pids = pids_base + offs_cnode[:,None] * n_block_size + offs_nnode[None,:] # [TILE_SIZE_C, TILE_SIZE_N]
-    epars = tl.load(params + pids, mask = cn_mask, other = 0.0)
+    epars = tl.load(mparams + pids, mask = cn_mask, other = 0.0)
 
     if not pc_is_normalized:
         cmars = tl.load(element_mars + cids) # [TILE_SIZE_C]
@@ -210,7 +210,7 @@ def sum_layer_td_backward(layer, node_flows, element_flows, node_mars, element_m
 
 
 @triton_jit
-def sum_layer_td_pflow_kernel(node_flows, node_mars, element_mars, params, param_flows, nids, cids, pids, pfids, scale,
+def sum_layer_td_pflow_kernel(node_flows, node_mars, element_mars, mparams, param_flows, nids, cids, pids, pfids, scale,
                               n_num_nodes: tl.constexpr, c_num_nodes: tl.constexpr, TILE_SIZE_N: tl.constexpr, TILE_SIZE_C: tl.constexpr,
                               n_block_size: tl.constexpr, pc_is_normalized: tl.constexpr):
     pid_c = tl.program_id(0)
@@ -232,7 +232,7 @@ def sum_layer_td_pflow_kernel(node_flows, node_mars, element_mars, params, param
 
     pids_base = tl.load(pids + ngroup_ids[:,None] * c_num_nodes + offs_cnode[None,:], mask = nc_mask)
     epids = pids_base + offs_nnode[:,None] # [TILE_SIZE_N, TILE_SIZE_C]
-    epars = tl.load(params + epids, mask = nc_mask, other = 0.0)
+    epars = tl.load(mparams + epids, mask = nc_mask, other = 0.0)
 
     if not pc_is_normalized:
         nmars = tl.load(node_mars + snids, mask = n_mask, other = 0.0)

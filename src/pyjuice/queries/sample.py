@@ -35,7 +35,7 @@ def _assign_nids_ind_target(ind_target, ind_target_sid, node_pointers, ind_ch_co
 
 
 @triton.jit
-def sample_sum_layer_kernel(nids, cids, pids, node_mars, element_mars, params, node_samples, element_samples, 
+def sample_sum_layer_kernel(nids, cids, pids, node_mars, element_mars, mparams, node_samples, element_samples, 
                             ind_target, ind_n, ind_b, seed, block_size: tl.constexpr, batch_size: tl.constexpr, 
                             num_edges: tl.constexpr, num_samples: tl.constexpr, num_nblocks: tl.constexpr, BLOCK_S: tl.constexpr, 
                             BLOCK_M: tl.constexpr, M_NUM_BLKS: tl.constexpr, BLOCK_K: tl.constexpr, K_NUM_BLKS: tl.constexpr,
@@ -87,7 +87,7 @@ def sample_sum_layer_kernel(nids, cids, pids, node_mars, element_mars, params, n
 
         # Load parameters
         param_id = tl.load(pids + local_nids[None,:] * num_edges + offs_child[:,None], mask = (mask_sample[None,:] & mask_child[:,None]), other = 0)
-        epars = tl.load(params + param_id + local_nid_offs[None,:], mask = (mask_sample[None,:] & mask_child[:,None]), other = 0.0) # [BLOCK_K, BLOCK_B]
+        epars = tl.load(mparams + param_id + local_nid_offs[None,:], mask = (mask_sample[None,:] & mask_child[:,None]), other = 0.0) # [BLOCK_K, BLOCK_B]
 
         if conditional:
             # In this case, we use `param * cmar / nmar` as the "parameter"
@@ -112,7 +112,7 @@ def sample_sum_layer_kernel(nids, cids, pids, node_mars, element_mars, params, n
 
         # Load parameters
         param_id = tl.load(pids + local_nids[None,:] * num_edges + offs_child[:,None], mask = (mask_sample[None,:] & mask_child[:,None]), other = 0)
-        epars = tl.load(params + param_id + local_nid_offs[None,:], mask = (mask_sample[None,:] & mask_child[:,None]), other = 0.0) # [BLOCK_K, BLOCK_B]
+        epars = tl.load(mparams + param_id + local_nid_offs[None,:], mask = (mask_sample[None,:] & mask_child[:,None]), other = 0.0) # [BLOCK_K, BLOCK_B]
 
         if conditional:
             # In this case, we use `param * cmar / nmar` as the "parameter"
