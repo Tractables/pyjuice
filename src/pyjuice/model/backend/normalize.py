@@ -6,11 +6,11 @@ import triton
 import triton.language as tl
 from numba import njit
 
-from pyjuice.utils.kernel_launcher import FastJITFunction
+from pyjuice.utils.kernel_launcher import triton_jit
 
 
 # @triton.jit
-@FastJITFunction
+@triton_jit
 def cum_par_kernel(cum_pflows, params, par_start_ids, blk_sizes, blk_intervals, 
                    global_nids, constexprs, BLOCK_ID: tl.constexpr, BLOCK_SIZE: tl.constexpr):
 
@@ -38,7 +38,7 @@ def cum_par_kernel(cum_pflows, params, par_start_ids, blk_sizes, blk_intervals,
 
 
 # @triton.jit
-@FastJITFunction
+@triton_jit
 def par_update_kernel(params, cum_pflows, nchs, par_start_ids, blk_sizes, blk_intervals,
                       global_nids, constexprs, BLOCK_ID: tl.constexpr, BLOCK_SIZE: tl.constexpr):
 

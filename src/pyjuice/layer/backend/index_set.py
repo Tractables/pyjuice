@@ -2,11 +2,8 @@ import torch
 import triton
 import triton.language as tl
 
-from pyjuice.utils.kernel_launcher import FastJITFunction
-
 
 @triton.jit
-# @FastJITFunction
 def _batched_index_set_kernel(target_tensor_ptr, ids_ptr, source_tensor_ptr, 
                               ids_size, batch_size, BLOCK_SIZE: tl.constexpr):
 
@@ -44,7 +41,6 @@ def batched_index_set(target_tensor: torch.Tensor, ids: torch.Tensor, source_ten
 
 
 @triton.jit
-# @FastJITFunction
 def _batched_index_cum_kernel(target_tensor_ptr, ids_ptr, source_tensor_ptr, 
                               ids_size, batch_size, BLOCK_SIZE: tl.constexpr):
 
@@ -84,7 +80,6 @@ def batched_index_cum(target_tensor: torch.Tensor, ids: torch.Tensor, source_ten
 
 
 @triton.jit
-# @FastJITFunction
 def _index_cum_kernel(target_tensor_ptr, ids_ptr, source_tensor_ptr, 
                       ids_size, BLOCK_SIZE: tl.constexpr):
 

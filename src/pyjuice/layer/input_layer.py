@@ -24,7 +24,7 @@ from pyjuice.nodes import InputNodes
 from pyjuice.utils.grad_fns import ReverseGrad
 from pyjuice.utils import BitSet
 from pyjuice.utils.source2fn import make_function_from_src
-from pyjuice.utils.kernel_launcher import FastJITFunction
+from pyjuice.utils.kernel_launcher import triton_jit
 from .layer import Layer
 
 
@@ -926,7 +926,7 @@ class InputLayer(Layer, nn.Module):
 
     @staticmethod
     # @triton.jit
-    @FastJITFunction
+    @triton_jit
     def _fw_missing_mask_kernel(missing_mask_ptr, node_mars_ptr, vids_ptr, fw_local_ids_ptr, num_vars,
                                 layer_num_nodes: tl.constexpr, batch_size: tl.constexpr, node_offset: tl.constexpr, 
                                 BLOCK_SIZE: tl.constexpr, partial_eval: tl.constexpr, mode: tl.constexpr):
@@ -1101,7 +1101,7 @@ class InputLayer(Layer, nn.Module):
 
     @staticmethod
     # @triton.jit
-    @FastJITFunction
+    @triton_jit
     def _pflow_accum_kernel(param_flows_ptr, pfid_start, ch_pfids_ptr, num_coalesced_blocks, num_par_flows, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
         pid = tl.program_id(axis = 0)
 
@@ -1244,4 +1244,4 @@ class InputLayer(Layer, nn.Module):
         # Make a pseudo-function from the source code
         new_fn = make_function_from_src(new_src)
 
-        return FastJITFunction(new_fn)
+        return triton_jit(new_fn)

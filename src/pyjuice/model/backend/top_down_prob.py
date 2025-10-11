@@ -6,12 +6,12 @@ import triton
 import triton.language as tl
 
 from pyjuice.layer import SumLayer, ProdLayer, InputLayer
-from pyjuice.utils.kernel_launcher import FastJITFunction
+from pyjuice.utils.kernel_launcher import triton_jit
 
 from .eval_partition import eval_partition_fn, prod_layer_partition_fn
 
 
-@FastJITFunction
+@triton_jit
 def prod_layer_td_backward_kernel(node_flows, element_flows, u_cids, parids, c_num_nblocks: tl.constexpr,
                                   c_num_nodes: tl.constexpr, n_num_nblocks: tl.constexpr, block_size: tl.constexpr,
                                   TILE_SIZE_N: tl.constexpr, TILE_SIZE_C: tl.constexpr):
@@ -71,7 +71,7 @@ def prod_layer_td_backward(layer, node_flows, element_flows):
             raise NotImplementedError("Need to implement a new kernel for this case.")
 
 
-@FastJITFunction
+@triton_jit
 def sum_layer_td_backward_block_kernel(node_flows, element_flows, node_mars, element_mars, params, chids, parids, parpids, 
                                        n_num_nodes: tl.constexpr, c_num_nodes: tl.constexpr, TILE_SIZE_N: tl.constexpr, 
                                        TILE_SIZE_C: tl.constexpr, n_block_size: tl.constexpr, c_block_size: tl.constexpr, 
@@ -106,7 +106,7 @@ def sum_layer_td_backward_block_kernel(node_flows, element_flows, node_mars, ele
     tl.atomic_add(element_flows + cids, cflows)
 
 
-@FastJITFunction
+@triton_jit
 def sum_layer_td_backward_node_kernel(node_flows, element_flows, node_mars, element_mars, params, chids, parids, parpids, 
                                       n_num_nodes: tl.constexpr, c_num_nodes: tl.constexpr, TILE_SIZE_N: tl.constexpr, 
                                       TILE_SIZE_C: tl.constexpr, n_block_size: tl.constexpr, c_block_size: tl.constexpr, 
@@ -209,7 +209,7 @@ def sum_layer_td_backward(layer, node_flows, element_flows, node_mars, element_m
             )
 
 
-@FastJITFunction
+@triton_jit
 def sum_layer_td_pflow_kernel(node_flows, node_mars, element_mars, params, param_flows, nids, cids, pids, pfids, scale,
                               n_num_nodes: tl.constexpr, c_num_nodes: tl.constexpr, TILE_SIZE_N: tl.constexpr, TILE_SIZE_C: tl.constexpr,
                               n_block_size: tl.constexpr, pc_is_normalized: tl.constexpr):
