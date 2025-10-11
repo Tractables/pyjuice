@@ -42,7 +42,7 @@ def _compute_param_target_ids_kernel(target_id0, target_id1, target_id2, edge_id
 
 
 @triton.jit
-def _copy_params_kernel(new_params, params, target_id0, target_id1, target_id2, 
+def _copy_params_kernel(new_params, mparams, target_id0, target_id1, target_id2, 
                         old_block_size: tl.constexpr, old_ch_block_size: tl.constexpr, 
                         new_block_size: tl.constexpr, new_ch_block_size: tl.constexpr, 
                         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
@@ -55,7 +55,7 @@ def _copy_params_kernel(new_params, params, target_id0, target_id1, target_id2,
     offs_n = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N
 
     offs_pars = pid_b * (old_block_size * old_ch_block_size) + offs_m[:,None] * old_ch_block_size + offs_n[None,:]
-    pars = tl.load(params + offs_pars)
+    pars = tl.load(mparams + offs_pars)
 
     id0 = tl.load(target_id0 + pid_b)
     id1 = tl.load(target_id1 + pid_b)
