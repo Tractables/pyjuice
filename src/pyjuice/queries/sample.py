@@ -76,38 +76,15 @@ def sample_sum_layer_kernel(nids, cids, pids, node_mars, element_mars, mparams, 
     # Sample random probabilities uniform between 0 and 1
     rnd_val = tl.rand(seed, tl.arange(0, BLOCK_S))
 
+    # Offset for children
+    offs_child = tl.arange(0, BLOCK_K)
+    mask_child = offs_child < num_edges
+
     if conditional:
         nmars = tl.load(node_mars + node_id * batch_size + batch_id, mask = mask_sample, other = 0.0) # [Block_B]
 
-    # Calibration loop
-    sum_pars = tl.zeros([BLOCK_S], dtype = tl.float32)
-    offs_child = tl.arange(0, BLOCK_K)
-    mask_child = offs_child < num_edges
-    for i in range(K_NUM_BLKS):
-
-        # Load parameters
-        param_id = tl.load(pids + local_nids[None,:] * num_edges + offs_child[:,None], mask = (mask_sample[None,:] & mask_child[:,None]), other = 0)
-        epars = tl.load(mparams + param_id + local_nid_offs[None,:], mask = (mask_sample[None,:] & mask_child[:,None]), other = 0.0) # [BLOCK_K, BLOCK_B]
-
-        if conditional:
-            # In this case, we use `param * cmar / nmar` as the "parameter"
-            emars_id = tl.load(cids + local_nids[None,:] * num_edges + offs_child[:,None], mask = (mask_sample[None,:] & mask_child[:,None]), other = 0)
-            emars = tl.load(element_mars + emars_id * batch_size + batch_id, mask = (mask_sample[None,:] & mask_child[:,None]), other = 0.0)
-
-            epars = epars * tl.exp(emars - nmars[None,:]) # [BLOCK_K, BLOCK_B]
-
-        sum_pars += tl.sum(epars, axis = 0)
-
-        offs_child += BLOCK_K
-        mask_child = offs_child < num_edges
-
-    rnd_val *= sum_pars
-    rnd_val -= 1e-8
-
     # Main loop over blocks of child nodes
     chids = tl.zeros([BLOCK_S], dtype = tl.int64) - 1
-    offs_child = tl.arange(0, BLOCK_K)
-    mask_child = offs_child < num_edges
     for i in range(K_NUM_BLKS):
 
         # Load parameters
