@@ -7,7 +7,8 @@ from typing import Optional, Any
 
 class Distribution():
     def __init__(self):
-        pass
+        self.post_fw_fns = []
+        self.post_bp_fns = []
 
     def get_signature(self):
         """
