@@ -213,6 +213,10 @@ class SumLayer(Layer, nn.Module):
     def num_param_flows(self):
         return self._layer_pfid_range[1] - self._layer_pfid_range[0]
 
+    @property
+    def nid_range(self):
+        return self._layer_nid_range[0], self._layer_nid_range[1]
+
     def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor,
                 force_use_bf16: bool = False, force_use_fp32: bool = False,
                 propagation_alg: str = "LL", **kwargs) -> None:
