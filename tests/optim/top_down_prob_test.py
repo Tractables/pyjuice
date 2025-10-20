@@ -57,24 +57,24 @@ def test_simple_model_tdp():
 
         pc.init_param_flows(flows_memory = 0.0)
 
-        eval_top_down_probs(pc, update_pflow = True, scale = 1.0, pc_is_normalized = pc_is_normalized)
+        eval_top_down_probs(pc, update_pflow = True, scale = 1.0, pc_is_normalized = pc_is_normalized, use_cudagraph = True)
 
         ns_params = ns._params.reshape(-1)
 
         np4_tdp = ns_params[:32]
         ns0_tdp = np4_tdp
         sid, eid = ns0._output_ind_range
-        assert torch.all(torch.abs(ns0_tdp - pc.node_flows[sid:eid,0].cpu()) < 1e-5)
+        assert torch.all(torch.abs(ns0_tdp - pc._single_node_flows[sid:eid].cpu()) < 1e-5)
 
         np5_tdp = ns_params[32:64]
         ns1_tdp = np5_tdp
         sid, eid = ns1._output_ind_range
-        assert torch.all(torch.abs(ns1_tdp - pc.node_flows[sid:eid,0].cpu()) < 1e-5)
+        assert torch.all(torch.abs(ns1_tdp - pc._single_node_flows[sid:eid].cpu()) < 1e-5)
 
         np6_tdp = ns_params[64:96]
         ns2_tdp = np6_tdp
         sid, eid = ns2._output_ind_range
-        assert torch.all(torch.abs(ns2_tdp - pc.node_flows[sid:eid,0].cpu()) < 1e-5)
+        assert torch.all(torch.abs(ns2_tdp - pc._single_node_flows[sid:eid].cpu()) < 1e-5)
 
         sid, eid = ns._param_flow_range
         assert torch.all(torch.abs(ns_params - pc.param_flows[sid:eid].cpu()) < 1e-5)
@@ -86,10 +86,10 @@ def test_simple_model_tdp():
         np3_tdp = np03_tdp[32:]
 
         sid, eid = np0._output_ind_range
-        assert torch.all(torch.abs(np0_tdp - pc.element_flows[sid:eid,0].cpu()) < 1e-5)
+        assert torch.all(torch.abs(np0_tdp - pc._single_element_flows[sid:eid].cpu()) < 1e-5)
 
         sid, eid = np3._output_ind_range
-        assert torch.all(torch.abs(np3_tdp - pc.element_flows[sid:eid,0].cpu()) < 1e-5)
+        assert torch.all(torch.abs(np3_tdp - pc._single_element_flows[sid:eid].cpu()) < 1e-5)
 
         sid, eid = ns0._param_flow_range
         epars_flow = pc.param_flows[sid:eid].reshape(2, 4, 16, 16).permute(0, 3, 1, 2).reshape(32, 64)
@@ -100,7 +100,7 @@ def test_simple_model_tdp():
         np1_tdp = (ns1_tdp[None,:] @ ns1_params).squeeze(0)
         
         sid, eid = np1._output_ind_range
-        assert torch.all(torch.abs(np1_tdp - pc.element_flows[sid:eid,0].cpu()) < 1e-5)
+        assert torch.all(torch.abs(np1_tdp - pc._single_element_flows[sid:eid].cpu()) < 1e-5)
 
         sid, eid = ns1._param_flow_range
         epars_flow = pc.param_flows[sid:eid].reshape(2, 2, 16, 16).permute(0, 3, 1, 2).reshape(32, 32)
@@ -115,7 +115,7 @@ def test_simple_model_tdp():
         assert torch.all(torch.abs(ns2_epars_tdp - epars_flow.cpu()) < 1e-5)
 
         sid, eid = np2._output_ind_range
-        assert torch.all(torch.abs(np2_tdp - pc.element_flows[sid:eid,0].cpu()) < 1e-5)
+        assert torch.all(torch.abs(np2_tdp - pc._single_element_flows[sid:eid].cpu()) < 1e-5)
 
         ni0_tdp = np0_tdp + np3_tdp + np5_tdp + np6_tdp
         ni1_tdp = np0_tdp + np2_tdp + np3_tdp + np5_tdp
@@ -123,16 +123,16 @@ def test_simple_model_tdp():
         ni3_tdp = np1_tdp + np4_tdp + np6_tdp
 
         sid, eid = ni0._output_ind_range
-        assert torch.all(torch.abs(ni0_tdp - pc.node_flows[sid:eid,0].cpu()) < 1e-5)
+        assert torch.all(torch.abs(ni0_tdp - pc._single_node_flows[sid:eid].cpu()) < 1e-5)
 
         sid, eid = ni1._output_ind_range
-        assert torch.all(torch.abs(ni1_tdp - pc.node_flows[sid:eid,0].cpu()) < 1e-5)
+        assert torch.all(torch.abs(ni1_tdp - pc._single_node_flows[sid:eid].cpu()) < 1e-5)
 
         sid, eid = ni2._output_ind_range
-        assert torch.all(torch.abs(ni2_tdp - pc.node_flows[sid:eid,0].cpu()) < 1e-5)
+        assert torch.all(torch.abs(ni2_tdp - pc._single_node_flows[sid:eid].cpu()) < 1e-5)
 
         sid, eid = ni3._output_ind_range
-        assert torch.all(torch.abs(ni3_tdp - pc.node_flows[sid:eid,0].cpu()) < 1e-5)
+        assert torch.all(torch.abs(ni3_tdp - pc._single_node_flows[sid:eid].cpu()) < 1e-5)
 
         input_layer = pc.input_layer_group[0]
 
@@ -309,15 +309,44 @@ def test_tdp_speed():
 
     t0 = time.time()
     for _ in range(100):
-        eval_top_down_probs(pc, update_pflow = True, scale = 1.0)
+        eval_top_down_probs(pc, update_pflow = True, scale = 1.0, use_cudagraph = False)
     t1 = time.time()
 
     tdp_ms = (t1 - t0) / 100 * 1000
 
     print(f"Computing TDP on average takes {tdp_ms:.3f}ms.")
-    print("Reference computation time on RTX 4090: 31.423ms.")
+    print("Reference computation time on RTX 4090: 98.574ms.")
     print("--------------------------------------------------------------")
 
+    eval_top_down_probs(pc, update_pflow = True, scale = 1.0, use_cudagraph = True)
+
+    t0 = time.time()
+    for _ in range(100):
+        eval_top_down_probs(pc, update_pflow = True, scale = 1.0, use_cudagraph = True)
+    t1 = time.time()
+
+    tdp_ms = (t1 - t0) / 100 * 1000
+
+    print(f"Computing TDP (using CUDAGraph) on average takes {tdp_ms:.3f}ms.")
+    print("Reference computation time on RTX 4090: 28.613ms.")
+    print("--------------------------------------------------------------")
+
+
+@pytest.mark.slow
+def test_tdp_speed_breakdown():
+
+    device = torch.device("cuda:0")
+    
+    root_ns = juice.structures.HMM(seq_length = 32, num_latents = 4096, num_emits = 50000, homogeneous = True)
+
+    pc = TensorCircuit(root_ns, layer_sparsity_tol = 0.1)
+    pc.to(device)
+
+    pc.init_param_flows()
+    pc._init_buffer(name = "node_flows", shape = (pc.num_nodes, 1), set_value = 0.0)
+    pc._init_buffer(name = "element_flows", shape = (pc.num_elements, 1), set_value = 0.0)
+
+    eval_top_down_probs(pc, update_pflow = True, scale = 1.0, use_cudagraph = False)
 
 
 if __name__ == "__main__":
@@ -325,3 +354,4 @@ if __name__ == "__main__":
     test_simple_model_tdp()
     test_scaled_mini_batch_em()
     test_tdp_speed()
+    test_tdp_speed_breakdown()

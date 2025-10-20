@@ -180,7 +180,7 @@ def sum_layer_td_backward(layer, node_flows, element_flows, node_mars, element_m
                 n_block_size = block_size,
                 c_block_size = cs_block_size,
                 NUM_N_BLKS = parids.size(1),
-                pc_is_normalized = pc_is_normalized
+                pc_is_normalized = pc_is_normalized,
             )
 
         else:
@@ -205,7 +205,7 @@ def sum_layer_td_backward(layer, node_flows, element_flows, node_mars, element_m
                 n_block_size = block_size,
                 c_block_size = cs_block_size,
                 NUM_N_BLKS = parids.size(1),
-                pc_is_normalized = pc_is_normalized
+                pc_is_normalized = pc_is_normalized,
             )
 
 
@@ -285,7 +285,7 @@ def sum_layer_td_pflow(layer, node_flows, node_mars, element_mars, params, param
         )
 
 
-def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0, pc_is_normalized: bool = True):
+def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0, pc_is_normalized: bool = True, use_cudagraph: bool = False):
     """
     Computes the top-down probabilities of every node.
     We use the first # nodes entries in `pc.node_flows` and the first # element entries in `pc.element_flows`.
@@ -294,11 +294,17 @@ def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0, pc_is
     assert pc.node_flows.numel() >= pc.num_nodes
     assert pc.element_flows.numel() >= pc.num_elements
 
-    node_flows = pc.node_flows.view(-1) # Reuse the allocated memory
-    element_flows = pc.element_flows.view(-1)
+    if not hasattr(pc, "_single_node_flows"):
+        pc._single_node_flows = torch.zeros([pc.num_nodes], dtype = torch.float32, device = pc.node_flows.device)
 
-    node_flows[:pc.num_nodes] = 0.0
-    element_flows[:pc.num_elements] = 0.0
+    if not hasattr(pc, "_single_element_flows"):
+        pc._single_element_flows = torch.zeros([pc.num_elements], dtype = torch.float32, device = pc.element_flows.device)
+
+    node_flows = pc._single_node_flows
+    element_flows = pc._single_element_flows
+
+    node_flows[:] = 0.0
+    element_flows[:] = 0.0
 
     node_flows[pc._root_node_range[0]:pc._root_node_range[1]] = 1.0
 
@@ -310,31 +316,77 @@ def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0, pc_is
     else:
         node_mars, element_mars = None, None
 
-    # Backward pass over the inner layers
-    for layer_id in range(len(pc.inner_layer_groups) - 1, -1, -1):
-        layer_group = pc.inner_layer_groups[layer_id]
+    def run_tdp_backward():
+        # Backward pass over the inner layers
+        for layer_id in range(len(pc.inner_layer_groups) - 1, -1, -1):
+            layer_group = pc.inner_layer_groups[layer_id]
 
-        if not pc_is_normalized and layer_group.is_sum():
-            prod_layer_group = pc.inner_layer_groups[layer_id]
-            for layer in prod_layer_group:
-                prod_layer_partition_fn(layer, node_mars, element_mars, pc.params)
+            if not pc_is_normalized and layer_group.is_sum():
+                prod_layer_group = pc.inner_layer_groups[layer_id]
+                for layer in prod_layer_group:
+                    prod_layer_partition_fn(layer, node_mars, element_mars, pc.params)
 
-        for layer in layer_group:
-            if layer.is_prod():
-                prod_layer_td_backward(layer, node_flows, element_flows)
+            for layer in layer_group:
+                if layer.is_prod():
+                    prod_layer_td_backward(layer, node_flows, element_flows)
 
-            elif layer.is_sum():
-                element_flows[:pc.num_nodes] = 0.0
-                sum_layer_td_backward(layer, node_flows, element_flows, node_mars, element_mars, pc.params, 
-                                      pc_is_normalized = pc_is_normalized)
+                elif layer.is_sum():
+                    element_flows[:pc.num_nodes] = 0.0
+                    sum_layer_td_backward(layer, node_flows, element_flows, node_mars, element_mars, pc.params, 
+                                        pc_is_normalized = pc_is_normalized)
 
-                if update_pflow:
-                    sum_layer_td_pflow(layer, node_flows, node_mars, element_mars, pc.params, pc.param_flows, scale,
-                                       pc_is_normalized = pc_is_normalized)
+                    if update_pflow:
+                        sum_layer_td_pflow(layer, node_flows, node_mars, element_mars, pc.params, pc.param_flows, scale,
+                                        pc_is_normalized = pc_is_normalized)
 
-    # Backward pass over the input layers
-    if update_pflow:
-        for layer in pc.input_layer_group:
-            layer.add_missing_flows(node_flows, scale = scale)
+        # Backward pass over the input layers
+        if update_pflow:
+            for layer in pc.input_layer_group:
+                layer.add_missing_flows(node_flows, scale = scale)
+
+    if not hasattr(pc, "_tdp_cudagraph"):
+        pc._tdp_cudagraph = dict()
+
+    key = (update_pflow, pc_is_normalized, (None if node_mars is None else id(node_mars)), 
+           (None if element_mars is None else id(element_mars)), id(node_flows), id(pc.params), id(pc.param_flows))
+    if use_cudagraph and key in pc._tdp_cudagraph:
+        g = pc._tdp_cudagraph[key]
+        g.replay()
+    elif not use_cudagraph:
+        run_tdp_backward()
+    else:
+        # Backup param flows
+        if update_pflow:
+            backup_node_flows = node_flows.detach().cpu().clone()
+            backup_element_flows = element_flows.detach().cpu().clone()
+            backup_param_flows = pc.param_flows.detach().cpu().clone()
+            backup_input_param_flows = []
+            for layer in pc.input_layer_group:
+                backup_input_param_flows.append(layer.param_flows.detach().cpu().clone())
+
+        # Record CUDAGraph
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                run_tdp_backward()
+        torch.cuda.current_stream().wait_stream(s)
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            run_tdp_backward()
+
+        pc._tdp_cudagraph[key] = g
+
+        # Restore param flows
+        if update_pflow:
+            device = pc.param_flows.device
+            node_flows[:] = backup_node_flows.to(device)[:]
+            element_flows[:] = backup_element_flows.to(device)[:]
+            pc.param_flows[:] = backup_param_flows.to(device)[:]
+            for layer, backup_pfs in zip(pc.input_layer_group, backup_input_param_flows):
+                layer.param_flows[:] = backup_pfs.to(device)[:]
+        
+        g.replay()
 
     return None
