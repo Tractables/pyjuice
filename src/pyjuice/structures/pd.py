@@ -20,7 +20,7 @@ def PD(data_shape: Tuple, num_latents: int,
        max_split_depth: Optional[int] = None,
        max_prod_block_conns: int = 4,
        structure_type: str = "sum_dominated",
-       input_layer_fn: Optional[Callable] = None,
+       input_ns_fn: Optional[Callable] = None,
        input_dist: Optional[Distribution] = None,
        input_node_type: Type[Distribution] = Categorical, 
        input_node_params: Dict = {"num_cats": 256},
@@ -131,8 +131,8 @@ def PD(data_shape: Tuple, num_latents: int,
 
     def create_input_ns(hypercube):
         scope = hypercube2scope(hypercube)
-        if input_layer_fn is not None:
-            return input_layer_fn(scope, num_latents, block_size)
+        if input_ns_fn is not None:
+            return input_ns_fn(scope, num_latents, block_size)
         else:
             input_nodes = []
             for var in scope:
@@ -246,7 +246,7 @@ def PDHCLT(data: torch.Tensor, data_shape: Tuple, num_latents: int,
     if input_dist is not None:
         input_node_type, input_node_params = input_dist._get_constructor()
 
-    def input_layer_fn(scope, num_latents, block_size):
+    def input_ns_fn(scope, num_latents, block_size):
         vars = torch.tensor(scope.to_list()).sort().values
         ns = HCLT(
             x = data[:,vars], 
@@ -267,7 +267,7 @@ def PDHCLT(data: torch.Tensor, data_shape: Tuple, num_latents: int,
     ns = PD(data_shape = data_shape, num_latents = num_latents, 
             split_intervals = split_intervals, split_points = split_points,
             max_split_depth = max_split_depth, max_prod_block_conns = max_prod_block_conns,
-            structure_type = structure_type, input_layer_fn = input_layer_fn,
+            structure_type = structure_type, input_ns_fn = input_ns_fn,
             input_node_type = input_node_type, input_node_params = input_node_params,
             block_size = block_size)
 
