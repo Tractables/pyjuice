@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyjuice"
-version="2.2.0"
+version="2.3.1"
 description = "Probabilistic Circuits Library"
 dependencies = [
     "numpy",
@@ -18,6 +18,7 @@ dependencies = [
     "tqdm"
 ]
 authors = [
+    {name="Anji Liu", email="anjiliu@comp.nus.edu.sg"},
     {name="StarAI", email="guyvdb@cs.ucla.edu"},
 ]
 
