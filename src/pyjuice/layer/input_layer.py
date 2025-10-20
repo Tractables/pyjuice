@@ -716,7 +716,7 @@ class InputLayer(Layer, nn.Module):
             raise NotImplementedError("CPU minibatch partition fn for input nodes is not implemented.")
 
     def add_missing_flows(self, node_flows: torch.Tensor, node_mars: Optional[torch.Tensor] = None, logspace_flows: bool = False, 
-                          scale: float = 1.0, pc_is_normalized: bool = True):
+                          scale: float = 1.0, pc_is_normalized: bool = True, _pre_accum_nflows: bool = True):
         """
         Add missing flows specified by `node_flows` to the input node parameters.
         node_flows: [num_nodes]
@@ -740,26 +740,78 @@ class InputLayer(Layer, nn.Module):
             else:
                 BLOCK_SIZE = 1024
                 TILE_SIZE_K = 1
-            
-            grid = (triton.cdiv(layer_num_nodes, BLOCK_SIZE),)
 
-            self._missing_flows_kernel[grid](
-                node_flows_ptr = node_flows,
-                params_ptr = self.params,
-                param_flows_ptr = self.param_flows,
-                s_pids_ptr = self.s_pids,
-                s_pfids_ptr = self.s_pfids,
-                metadata_ptr = self.metadata, 
-                s_mids_ptr = self.s_mids, 
-                scale = scale,
-                node_offset = node_offset,
-                layer_num_nodes = layer_num_nodes,
-                logspace_flows = logspace_flows,
-                BLOCK_SIZE = BLOCK_SIZE,
-                TILE_SIZE_K = TILE_SIZE_K
-            )
+            if _pre_accum_nflows:
+                layer_num_source_nodes = self.source_nids.size(0)
+
+                self._accum_flows_to_tied_nodes(node_flows, logspace_flows)
+
+                grid = (triton.cdiv(layer_num_source_nodes, BLOCK_SIZE),)
+
+                self._missing_flows_kernel[grid](
+                    node_flows_ptr = node_flows,
+                    params_ptr = self.params,
+                    param_flows_ptr = self.param_flows,
+                    s_pids_ptr = self.s_pids,
+                    s_pfids_ptr = self.s_pfids,
+                    metadata_ptr = self.metadata, 
+                    s_mids_ptr = self.s_mids, 
+                    source_nids_ptr = self.source_nids,
+                    scale = scale,
+                    node_offset = node_offset,
+                    layer_num_nodes = layer_num_nodes,
+                    logspace_flows = logspace_flows,
+                    are_source_nodes = True,
+                    BLOCK_SIZE = BLOCK_SIZE,
+                    TILE_SIZE_K = TILE_SIZE_K
+                )
+
+            else:
+                grid = (triton.cdiv(layer_num_nodes, BLOCK_SIZE),)
+
+                self._missing_flows_kernel[grid](
+                    node_flows_ptr = node_flows,
+                    params_ptr = self.params,
+                    param_flows_ptr = self.param_flows,
+                    s_pids_ptr = self.s_pids,
+                    s_pfids_ptr = self.s_pfids,
+                    metadata_ptr = self.metadata, 
+                    s_mids_ptr = self.s_mids, 
+                    source_nids_ptr = self.source_nids,
+                    scale = scale,
+                    node_offset = node_offset,
+                    layer_num_nodes = layer_num_nodes,
+                    logspace_flows = logspace_flows,
+                    are_source_nodes = False,
+                    BLOCK_SIZE = BLOCK_SIZE,
+                    TILE_SIZE_K = TILE_SIZE_K
+                )
         else:
             raise NotImplementedError("CPU minibatch missing flow fn for input nodes is not implemented.")
+
+    def _accum_flows_to_tied_nodes(self, node_flows: torch.Tensor, logspace_flows: bool = False):
+
+        assert not logspace_flows, "Not implemented yet."
+
+        if "cuda" in self.device.type:
+
+            node_offset = self._output_ind_range[0]
+            layer_num_nodes = self._output_ind_range[1] - self._output_ind_range[0]
+            
+            BLOCK_SIZE = 1024
+
+            grid = (triton.cdiv(layer_num_nodes, BLOCK_SIZE),)
+
+            self._accum_flows_to_tied_nodes_kernel[grid](
+                node_flows_ptr = node_flows,
+                node_id2source_id_ptr = self.node_id2source_id,
+                node_offset = node_offset,
+                layer_num_nodes = layer_num_nodes,
+                BLOCK_SIZE = BLOCK_SIZE
+            )
+
+        else:
+            raise NotImplementedError("CPU accum flow fn for input nodes is not implemented.")
 
     def get_param_specs(self):
         return {"params": torch.Size([self.num_parameters])}
@@ -1042,20 +1094,24 @@ class InputLayer(Layer, nn.Module):
 
     @staticmethod
     def _missing_flows_kernel_template(node_flows_ptr, params_ptr, param_flows_ptr, s_pids_ptr, s_pfids_ptr,
-                                       metadata_ptr, s_mids_ptr, scale, node_offset: tl.constexpr, layer_num_nodes: tl.constexpr, 
-                                       logspace_flows: tl.constexpr, BLOCK_SIZE: tl.constexpr, TILE_SIZE_K: tl.constexpr):
+                                       metadata_ptr, s_mids_ptr, source_nids_ptr, scale, node_offset: tl.constexpr, layer_num_nodes: tl.constexpr, 
+                                       logspace_flows: tl.constexpr, are_source_nodes: tl.constexpr, BLOCK_SIZE: tl.constexpr, TILE_SIZE_K: tl.constexpr):
         pid = tl.program_id(axis = 0)
         block_start = pid * BLOCK_SIZE
 
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
         mask = offsets < layer_num_nodes
 
-        local_offsets = offsets
+        # Get the local node ids
+        if are_source_nodes:
+            local_offsets = tl.load(source_nids_ptr + offsets, mask = mask, other = 0)
+        else:
+            local_offsets = offsets
 
-        s_pids = tl.load(s_pids_ptr + offsets, mask = mask, other = 0)
-        s_pfids = tl.load(s_pfids_ptr + offsets, mask = mask, other = 0)
+        s_pids = tl.load(s_pids_ptr + local_offsets, mask = mask, other = 0)
+        s_pfids = tl.load(s_pfids_ptr + local_offsets, mask = mask, other = 0)
 
-        ns_offsets = offsets + node_offset
+        ns_offsets = local_offsets + node_offset
         flows = tl.load(node_flows_ptr + ns_offsets, mask = mask, other = 0)
 
         if logspace_flows:
@@ -1067,6 +1123,22 @@ class InputLayer(Layer, nn.Module):
 
         flow_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
                 s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE)
+
+    @staticmethod
+    @triton_jit
+    def _accum_flows_to_tied_nodes_kernel(node_flows_ptr, node_id2source_id_ptr, node_offset, layer_num_nodes, BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(axis = 0)
+        block_start = pid * BLOCK_SIZE
+
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < layer_num_nodes
+
+        source_ids = tl.load(node_id2source_id_ptr + offsets, mask = mask, other = -1)
+        mask = mask & (source_ids == -1)
+
+        flows = tl.load(node_flows_ptr + node_offset + offsets, mask = mask, other = 0)
+
+        tl.atomic_add(node_flows_ptr + node_offset + source_ids, flows, mask = mask)
 
     @staticmethod
     def _partition_fn_kernel_template(partition_fn, params_ptr, node_mars_ptr, s_pids_ptr, metadata_ptr, s_mids_ptr, layer_num_nodes: tl.constexpr,
