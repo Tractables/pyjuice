@@ -339,11 +339,6 @@ def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0, pc_is
                         sum_layer_td_pflow(layer, node_flows, node_mars, element_mars, pc.params, pc.param_flows, scale,
                                         pc_is_normalized = pc_is_normalized)
 
-        # Backward pass over the input layers
-        if update_pflow:
-            for layer in pc.input_layer_group:
-                layer.add_missing_flows(node_flows, scale = scale)
-
     if not hasattr(pc, "_tdp_cudagraph"):
         pc._tdp_cudagraph = dict()
 
@@ -388,5 +383,10 @@ def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0, pc_is
                 layer.param_flows[:] = backup_pfs.to(device)[:]
         
         g.replay()
+
+    # Backward pass over the input layers
+    if update_pflow:
+        for layer in pc.input_layer_group:
+            layer.add_missing_flows(node_flows, scale = scale)
 
     return None
