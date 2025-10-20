@@ -81,6 +81,30 @@ class Distribution():
         """
         return torch.float32
 
+    def get_fw_mar_fn(self):
+        """
+        Return the `fw_mar_fn` to be used by the layer.
+        """
+        return self.fw_mar_fn
+
+    def get_bk_flow_fn(self):
+        """
+        Return the `bk_flow_fn` to be used by the layer.
+        """
+        return self.bk_flow_fn
+
+    def get_sample_fn(self):
+        """
+        Return the `sample_fn` to be used by the layer.
+        """
+        return self.sample_fn
+
+    def get_em_fn(self):
+        """
+        Return the `em_fn` to be used by the layer.
+        """
+        return self.em_fn
+
     @staticmethod
     def fw_mar_fn(*args, **kwargs):
         """

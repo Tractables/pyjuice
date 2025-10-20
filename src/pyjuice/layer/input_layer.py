@@ -107,10 +107,10 @@ class InputLayer(Layer, nn.Module):
         self.dist_signature = dist_signature
 
         # Store the triton kernel functions implemented by the target `Distribution`
-        self.fw_mar_fn = self.nodes[0].dist.fw_mar_fn
-        self.bk_flow_fn = self.nodes[0].dist.bk_flow_fn
-        self.sample_fn = self.nodes[0].dist.sample_fn
-        self.em_fn = self.nodes[0].dist.em_fn
+        self.fw_mar_fn = self.nodes[0].dist.get_fw_mar_fn()
+        self.bk_flow_fn = self.nodes[0].dist.get_bk_flow_fn()
+        self.sample_fn = self.nodes[0].dist.get_sample_fn()
+        self.em_fn = self.nodes[0].dist.get_em_fn()
 
         try:
             self.post_fw_fns = self.nodes[0].dist.post_fw_fns
@@ -634,7 +634,10 @@ class InputLayer(Layer, nn.Module):
 
                     constexprs = torch.tensor([step_size, pseudocount], dtype = torch.float32, device = self.device)
 
-                    BLOCK_SIZE = 1024
+                    if hasattr(self.nodes[0].dist, "em_block_size"):
+                        BLOCK_SIZE = self.nodes[0].dist.em_block_size
+                    else:
+                        BLOCK_SIZE = 1024
 
                     grid = (triton.cdiv(layer_num_source_nodes, BLOCK_SIZE),)
 

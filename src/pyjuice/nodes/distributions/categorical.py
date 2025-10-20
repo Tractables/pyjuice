@@ -72,6 +72,13 @@ class Categorical(Distribution):
         """
         return torch.long
 
+    def get_em_fn(self):
+        if self.num_cats <= 256:
+            return self.small_ncats_em_fn
+        else:
+            self.em_block_size = 8
+            return self.large_ncats_em_fn
+
     @staticmethod
     def fw_mar_fn(local_offsets, data, params_ptr, s_pids, metadata_ptr, s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE):
         # I am not sure why, but the following code will not work...
@@ -154,7 +161,7 @@ class Categorical(Distribution):
         tl.store(samples_ptr + sample_offsets, sampled_id, mask = mask)
 
     @staticmethod
-    def em_fn(local_offsets, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, s_mids_ptr, mask,
+    def small_ncats_em_fn(local_offsets, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, s_mids_ptr, mask,
               step_size, pseudocount, BLOCK_SIZE):
         # Get `num_cats` from `metadata`
         s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
@@ -181,6 +188,41 @@ class Categorical(Distribution):
 
             new_param = (1.0 - step_size) * param + step_size * (flow + numerate_pseudocount) / cum_flow
             tl.store(params_ptr + s_pids + cat_id, new_param, mask = cat_mask)
+
+    @staticmethod
+    def large_ncats_em_fn(local_offsets, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, s_mids_ptr, mask,
+              step_size, pseudocount, BLOCK_SIZE):
+        # Get `num_cats` from `metadata`
+        s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
+        num_cats = tl.load(metadata_ptr + s_mids, mask = mask, other = 0).to(tl.int64)
+
+        max_num_cats = tl.max(num_cats, axis = 0)
+
+        # Compute cumulative flows
+        cum_flow = tl.zeros([BLOCK_SIZE], dtype = tl.float32)
+        cat_ids = tl.arange(0, 128)
+        for cat_sid in range(0, max_num_cats, 128):
+            cat_mask = mask[:,None] & (cat_ids[None,:] < num_cats[:,None])
+
+            flow = tl.load(param_flows_ptr + s_pfids[:,None] + cat_ids[None,:], mask = cat_mask, other = 0)
+            cum_flow += tl.sum(flow, axis = 1)
+
+            cat_ids += 128
+
+        # Parameter update
+        numerate_pseudocount = pseudocount / num_cats
+        cum_flow += pseudocount
+        cat_ids = tl.arange(0, 128)
+        for cat_sid in range(0, max_num_cats, 128):
+            cat_mask = mask[:,None] & (cat_ids[None,:] < num_cats[:,None])
+
+            param = tl.load(params_ptr + s_pids[:,None] + cat_ids[None,:], mask = cat_mask, other = 0)
+            flow = tl.load(param_flows_ptr + s_pfids[:,None] + cat_ids[None,:], mask = cat_mask, other = 0)
+
+            new_param = (1.0 - step_size) * param + step_size * (flow + numerate_pseudocount[:,None]) / cum_flow[:,None]
+            tl.store(params_ptr + s_pids[:,None] + cat_ids[None,:], new_param, mask = cat_mask)
+
+            cat_ids += 128
 
     @staticmethod
     def partition_fn(local_offsets, params_ptr, s_pids, metadata_ptr, s_mids_ptr, mask, BLOCK_SIZE, TILE_SIZE_K):
