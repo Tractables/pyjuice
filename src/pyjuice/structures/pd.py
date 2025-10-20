@@ -6,7 +6,7 @@ from copy import deepcopy
 from functools import reduce
 
 import pyjuice.transformations as jtf
-from typing import Tuple, Sequence, Optional, Type, Dict
+from typing import Tuple, Sequence, Optional, Type, Dict, Union, Callable
 from pyjuice.nodes import multiply, summate, inputs, set_block_size
 from pyjuice.nodes.distributions import *
 from pyjuice.structures.hclt import HCLT
