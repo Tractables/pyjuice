@@ -145,8 +145,10 @@ class InputLayer(Layer, nn.Module):
         s_mids = torch.empty([self.num_nodes], dtype = torch.long)
         # Node local index: s_nids[i] is the local id of this node within all nodes defined on the same variable
         nids = torch.empty([self.num_nodes], dtype = torch.long)
-        # source node ids (nodes with their original parameters)
+        # Source node ids (nodes with their original parameters)
         source_nids = torch.empty([cum_source_ns], dtype = torch.long)
+        # Pointer to a node's source id
+        node_id2source_id = torch.empty([self.num_nodes], dtype = torch.long)
 
         # Parameters of this layer
         params = torch.empty([max(self.num_parameters, 1)], dtype = torch.float32)
@@ -154,8 +156,10 @@ class InputLayer(Layer, nn.Module):
         n_start = 0
         source_n_start = 0
         var2count = dict()
+        ns2n_range = dict()
         for ns_id, ns in enumerate(self.nodes):
             n_end = n_start + ns.num_nodes
+            ns2n_range[ns] = (n_start, n_end)
 
             # `vids`
             assert len(node_vars[ns_id]) == num_vars
@@ -180,6 +184,13 @@ class InputLayer(Layer, nn.Module):
                 source_nids[source_n_start:source_n_end] = torch.arange(n_start, n_end)
                 source_n_start = source_n_end
 
+            # `node_id2source_id`
+            if ns.is_tied():
+                temp_n_start, temp_n_end = ns2n_range[ns._source_node]
+                node_id2source_id[n_start:n_end] = torch.arange(temp_n_start, temp_n_end)
+            else:
+                node_id2source_id[n_start:n_end] = -1 # Set to -1 as a flag
+
             # `metadata` and `s_mids`
             s_mids[n_start:n_end] = len(metadata)
             metadata.extend(node_metadata[ns_id])
@@ -201,6 +212,7 @@ class InputLayer(Layer, nn.Module):
         self.register_buffer("s_mids", s_mids)
         self.register_buffer("nids", nids)
         self.register_buffer("source_nids", source_nids)
+        self.register_buffer("node_id2source_id", node_id2source_id)
 
         ## Prepare info buffers for tied nodes ##
         self.tied2source_nids = []
