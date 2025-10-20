@@ -62,7 +62,7 @@ def hmm_optim_speed_test():
     tdp_ms = (t1 - t0) / 100 * 1000
 
     print(f"Running Anemone on average takes {tdp_ms:.3f}ms.")
-    print("Reference computation time on RTX 4090: 67.954ms.")
+    print("Reference computation time on RTX 4090: 55.378ms.")
     print("--------------------------------------------------------------")
 
     # Update input layers
@@ -137,7 +137,7 @@ def hmm_optim_speed_test():
     def process():
         pc.init_param_flows(flows_memory = 0.9)
 
-        eval_top_down_probs(pc, update_pflow = True, scale = (1.0 - 0.1))
+        eval_top_down_probs(pc, update_pflow = True, scale = (1.0 - 0.1), use_cudagraph = True)
 
         # Update input layers
         for layer in pc.input_layer_group:

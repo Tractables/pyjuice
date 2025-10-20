@@ -315,7 +315,7 @@ def test_tdp_speed():
     tdp_ms = (t1 - t0) / 100 * 1000
 
     print(f"Computing TDP on average takes {tdp_ms:.3f}ms.")
-    print("Reference computation time on RTX 4090: 98.574ms.")
+    print("Reference computation time on RTX 4090: 14.184ms.")
     print("--------------------------------------------------------------")
 
     eval_top_down_probs(pc, update_pflow = True, scale = 1.0, use_cudagraph = True)
@@ -328,7 +328,7 @@ def test_tdp_speed():
     tdp_ms = (t1 - t0) / 100 * 1000
 
     print(f"Computing TDP (using CUDAGraph) on average takes {tdp_ms:.3f}ms.")
-    print("Reference computation time on RTX 4090: 28.613ms.")
+    print("Reference computation time on RTX 4090: 4.788ms.")
     print("--------------------------------------------------------------")
 
 
