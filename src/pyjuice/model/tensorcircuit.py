@@ -512,7 +512,7 @@ class TensorCircuit(nn.Module):
         self.forward(*args, propagation_alg = "GeneralLL", **kwargs)
 
     def mini_batch_em(self, step_size: float, pseudocount: float = 0.0, keep_zero_params: bool = False,
-                      step_size_rescaling: bool = False):
+                      step_size_rescaling: bool = False, use_cudagraph: bool = True):
         """
         Perform an EM parameter update step using the accumulated parameter flows.
 
@@ -535,7 +535,7 @@ class TensorCircuit(nn.Module):
         if step_size_rescaling:
             self.init_param_flows(flows_memory = step_size / self._cum_flow)
 
-            eval_top_down_probs(self, update_pflow = True, scale = (1.0 - step_size))
+            eval_top_down_probs(self, update_pflow = True, scale = (1.0 - step_size), use_cudagraph = use_cudagraph)
 
             self._cum_flow = 0.0 # Zero out the cumulative flow value
             step_size = 1.0 # We have applied the step size within the parameter flows
