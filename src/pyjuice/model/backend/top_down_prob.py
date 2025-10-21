@@ -285,7 +285,7 @@ def sum_layer_td_pflow(layer, node_flows, node_mars, element_mars, params, param
         )
 
 
-def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0, pc_is_normalized: bool = True, use_cudagraph: bool = False):
+def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0, pc_is_normalized: bool = True, use_cudagraph: bool = True):
     """
     Computes the top-down probabilities of every node.
     We use the first # nodes entries in `pc.node_flows` and the first # element entries in `pc.element_flows`.
@@ -331,18 +331,18 @@ def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0, pc_is
                     prod_layer_td_backward(layer, node_flows, element_flows)
 
                 elif layer.is_sum():
-                    element_flows[:pc.num_nodes] = 0.0
+                    element_flows[:] = 0.0
                     sum_layer_td_backward(layer, node_flows, element_flows, node_mars, element_mars, pc.params, 
-                                        pc_is_normalized = pc_is_normalized)
+                                          pc_is_normalized = pc_is_normalized)
 
                     if update_pflow:
                         sum_layer_td_pflow(layer, node_flows, node_mars, element_mars, pc.params, pc.param_flows, scale,
-                                        pc_is_normalized = pc_is_normalized)
+                                           pc_is_normalized = pc_is_normalized)
 
     if not hasattr(pc, "_tdp_cudagraph"):
         pc._tdp_cudagraph = dict()
 
-    key = (update_pflow, pc_is_normalized, (None if node_mars is None else id(node_mars)), 
+    key = (str(scale), update_pflow, pc_is_normalized, (None if node_mars is None else id(node_mars)), 
            (None if element_mars is None else id(element_mars)), id(node_flows), id(pc.params), id(pc.param_flows))
     if use_cudagraph and key in pc._tdp_cudagraph:
         g = pc._tdp_cudagraph[key]
@@ -351,9 +351,9 @@ def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0, pc_is
         run_tdp_backward()
     else:
         # Backup param flows
+        backup_node_flows = node_flows.detach().cpu().clone()
+        backup_element_flows = element_flows.detach().cpu().clone()
         if update_pflow:
-            backup_node_flows = node_flows.detach().cpu().clone()
-            backup_element_flows = element_flows.detach().cpu().clone()
             backup_param_flows = pc.param_flows.detach().cpu().clone()
             backup_input_param_flows = []
             for layer in pc.input_layer_group:
@@ -374,10 +374,10 @@ def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0, pc_is
         pc._tdp_cudagraph[key] = g
 
         # Restore param flows
+        device = node_flows.device
+        node_flows[:] = backup_node_flows.to(device)[:]
+        element_flows[:] = backup_element_flows.to(device)[:]
         if update_pflow:
-            device = pc.param_flows.device
-            node_flows[:] = backup_node_flows.to(device)[:]
-            element_flows[:] = backup_element_flows.to(device)[:]
             pc.param_flows[:] = backup_param_flows.to(device)[:]
             for layer, backup_pfs in zip(pc.input_layer_group, backup_input_param_flows):
                 layer.param_flows[:] = backup_pfs.to(device)[:]

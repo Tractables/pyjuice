@@ -264,6 +264,7 @@ def test_scaled_mini_batch_em():
 
     sid, eid = ns._param_range
     epars = pc.params[sid:eid]
+    import pdb; pdb.set_trace()
     assert torch.all(torch.abs(ns_params - epars) < 1e-5)
 
     sid, eid = ns0._param_range
