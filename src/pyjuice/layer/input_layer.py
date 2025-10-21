@@ -1134,7 +1134,7 @@ class InputLayer(Layer, nn.Module):
         mask = offsets < layer_num_nodes
 
         source_ids = tl.load(node_id2source_id_ptr + offsets, mask = mask, other = -1)
-        mask = mask & (source_ids == -1)
+        mask = mask & (source_ids != -1)
 
         flows = tl.load(node_flows_ptr + node_offset + offsets, mask = mask, other = 0)
 
