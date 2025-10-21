@@ -62,7 +62,7 @@ def hmm_optim_speed_test():
     tdp_ms = (t1 - t0) / 100 * 1000
 
     print(f"Running Anemone on average takes {tdp_ms:.3f}ms.")
-    print("Reference computation time on RTX 4090: 55.378ms.")
+    print("Reference computation time on RTX 4090: 20.344ms.")
     print("--------------------------------------------------------------")
 
     # Update input layers
@@ -116,7 +116,7 @@ def hmm_optim_speed_test():
     tdp_ms = (t1 - t0) / 100 * 1000
 
     print(f"Evaluate TDP on average takes {tdp_ms:.3f}ms.")
-    print("Reference computation time on RTX 4090: 55.511ms.")
+    print("Reference computation time on RTX 4090: 7.677ms.")
     print("--------------------------------------------------------------")
 
     pc.init_param_flows(flows_memory = 0.9)
@@ -163,7 +163,7 @@ def hmm_optim_speed_test():
     tdp_ms = (t1 - t0) / 100 * 1000
 
     print(f"Running custom `process` on average takes {tdp_ms:.3f}ms.")
-    print("Reference computation time on RTX 4090: 68.185ms.")
+    print("Reference computation time on RTX 4090: 20.421ms.")
     print("--------------------------------------------------------------")
 
 
