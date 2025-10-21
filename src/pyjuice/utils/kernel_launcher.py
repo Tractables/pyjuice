@@ -1,7 +1,6 @@
 import torch
 import triton
 from typing import Callable, Tuple, Union
-from packaging.version import Version
 
 
 class FastJITFunction():
@@ -96,7 +95,7 @@ class FastJITFunction():
 
 
 def triton_jit(fn: Callable, device_check: bool = False):
-    if Version(torch.__version__) <= Version("2.2.0"):
+    if torch.__version__[0] == "2" and torch.__version__[2] <= "2":
         return FastJITFunction(fn, device_check = device_check)
     else:
         return triton.jit(fn)
