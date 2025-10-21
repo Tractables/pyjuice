@@ -373,14 +373,14 @@ def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0, pc_is
 
         pc._tdp_cudagraph[key] = g
 
-        # Restore param flows
-        device = node_flows.device
-        node_flows[:] = backup_node_flows.to(device)[:]
-        element_flows[:] = backup_element_flows.to(device)[:]
+        # Restore param_flows (no extra GPU allocation)
+        node_flows.copy_(backup_node_flows, non_blocking = True)
+        element_flows.copy_(backup_element_flows, non_blocking = True)
         if update_pflow:
-            pc.param_flows[:] = backup_param_flows.to(device)[:]
+            pc.param_flows.copy_(backup_param_flows, non_blocking = True)
             for layer, backup_pfs in zip(pc.input_layer_group, backup_input_param_flows):
-                layer.param_flows[:] = backup_pfs.to(device)[:]
+                layer.param_flows.copy_(backup_pfs, non_blocking = True)
+        torch.cuda.synchronize()
         
         g.replay()
 
