@@ -512,7 +512,7 @@ class TensorCircuit(nn.Module):
         self.forward(*args, propagation_alg = "GeneralLL", **kwargs)
 
     def mini_batch_em(self, step_size: float, pseudocount: float = 0.0, keep_zero_params: bool = False,
-                      step_size_rescaling: bool = False, use_cudagraph: bool = True):
+                      step_size_rescaling: bool = False, use_cudagraph: bool = False):
         """
         Perform an EM parameter update step using the accumulated parameter flows.
 
