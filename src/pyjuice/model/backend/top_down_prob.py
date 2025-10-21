@@ -210,11 +210,13 @@ def sum_layer_td_backward(layer, node_flows, element_flows, node_mars, element_m
 
 
 @triton_jit
-def sum_layer_td_pflow_kernel(node_flows, node_mars, element_mars, mparams, param_flows, nids, cids, pids, pfids, scale,
+def sum_layer_td_pflow_kernel(node_flows, node_mars, element_mars, mparams, param_flows, nids, cids, pids, pfids, hyperparameters,
                               n_num_nodes: tl.constexpr, c_num_nodes: tl.constexpr, TILE_SIZE_N: tl.constexpr, TILE_SIZE_C: tl.constexpr,
                               n_block_size: tl.constexpr, pc_is_normalized: tl.constexpr):
     pid_c = tl.program_id(0)
     pid_n = tl.program_id(1)
+
+    scale = tl.load(hyperparameters)
 
     n_ids = tl.arange(0, TILE_SIZE_N) + pid_n * TILE_SIZE_N
     n_mask = (n_ids < n_num_nodes)
@@ -249,7 +251,7 @@ def sum_layer_td_pflow_kernel(node_flows, node_mars, element_mars, mparams, para
     tl.atomic_add(param_flows + epfids, eflows, mask = nc_mask)
 
 
-def sum_layer_td_pflow(layer, node_flows, node_mars, element_mars, params, param_flows, scale, pc_is_normalized = True):
+def sum_layer_td_pflow(layer, node_flows, node_mars, element_mars, params, param_flows, hyperparameters, pc_is_normalized = True):
     block_size = layer.block_size
     for partition_id in range(layer.num_fw_partitions):
         nids = layer.partitioned_nids[partition_id]
@@ -275,7 +277,7 @@ def sum_layer_td_pflow(layer, node_flows, node_mars, element_mars, params, param
             cids,
             pids,
             pfids,
-            scale,
+            hyperparameters,
             n_num_nodes = n_num_nodes,
             c_num_nodes = c_num_nodes,
             TILE_SIZE_N = TILE_SIZE_N,
@@ -300,13 +302,20 @@ def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0, pc_is
     if not hasattr(pc, "_single_element_flows"):
         pc._single_element_flows = torch.zeros([pc.num_elements], dtype = torch.float32, device = pc.element_flows.device)
 
+    if not hasattr(pc, "_tdp_hyperparams"):
+        pc._tdp_hyperparams = torch.zeros([1], dtype = torch.float32, device = pc.node_flows.device)
+
     node_flows = pc._single_node_flows
     element_flows = pc._single_element_flows
+    hyperparameters = pc._tdp_hyperparams
 
     node_flows[:] = 0.0
     element_flows[:] = 0.0
 
     node_flows[pc._root_node_range[0]:pc._root_node_range[1]] = 1.0
+
+    # Load hyperparameter(s)
+    hyperparameters[0] = scale
 
     if not pc_is_normalized:
         # Run a forward pass to evaluate the partition function of every node
@@ -336,14 +345,15 @@ def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0, pc_is
                                           pc_is_normalized = pc_is_normalized)
 
                     if update_pflow:
-                        sum_layer_td_pflow(layer, node_flows, node_mars, element_mars, pc.params, pc.param_flows, scale,
+                        sum_layer_td_pflow(layer, node_flows, node_mars, element_mars, pc.params, pc.param_flows, hyperparameters,
                                            pc_is_normalized = pc_is_normalized)
 
     if not hasattr(pc, "_tdp_cudagraph"):
         pc._tdp_cudagraph = dict()
 
-    key = (str(scale), update_pflow, pc_is_normalized, (None if node_mars is None else id(node_mars)), 
-           (None if element_mars is None else id(element_mars)), id(node_flows), id(pc.params), id(pc.param_flows))
+    key = (update_pflow, pc_is_normalized, (None if node_mars is None else id(node_mars)), 
+           (None if element_mars is None else id(element_mars)), id(node_flows), id(pc.params), 
+           id(pc.param_flows), id(hyperparameters))
     if use_cudagraph and key in pc._tdp_cudagraph:
         g = pc._tdp_cudagraph[key]
         g.replay()
