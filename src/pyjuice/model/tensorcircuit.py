@@ -106,6 +106,8 @@ class TensorCircuit(nn.Module):
 
         super(TensorCircuit, self).__init__()
 
+        assert isinstance(root_ns, CircuitNodes), "`root_ns` should be an instance of `CircuitNodes`."
+
         self.root_ns = root_ns
         self.device = torch.device("cpu")
 
@@ -512,7 +514,7 @@ class TensorCircuit(nn.Module):
         self.forward(*args, propagation_alg = "GeneralLL", **kwargs)
 
     def mini_batch_em(self, step_size: float, pseudocount: float = 0.0, keep_zero_params: bool = False,
-                      step_size_rescaling: bool = False, use_cudagraph: bool = False):
+                      step_size_rescaling: bool = False, use_cudagraph: bool = True):
         """
         Perform an EM parameter update step using the accumulated parameter flows.
 
