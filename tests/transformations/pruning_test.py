@@ -126,7 +126,7 @@ def test_pruning_by_flow():
     pc.update_parameters() # Map the flows back to their corresponding nodes
     pc.update_param_flows()
 
-    new_n = prune_by_score(n, key = "_param_flows", score_threshold = 0.5) # Use `n._flows` for pruning
+    new_n = prune_by_score(n, key = "_param_flows", keep_frac = 0.5) # Use `n._param_flows` for pruning
 
 
 if __name__ == "__main__":
