@@ -184,6 +184,12 @@ class CircuitNodes():
     def is_tied(self):
         return self._source_node is not None
 
+    def get_params(self):
+        return None
+
+    def get_param_flows(self):
+        return None
+
     def get_source_ns(self):
         return self._source_node if self.is_tied() else self
 

@@ -94,6 +94,15 @@ class InputNodes(CircuitNodes):
         else:
             return self._params
 
+    def get_param_flows(self) -> torch.Tensor:
+        """
+        Get the input node parameter flows.
+        """
+        if not self.provided("_param_flows"):
+            return None
+        else:
+            return self._param_flows
+
     def set_params(self, params: Union[torch.Tensor,Dict], normalize: bool = True):
         """
         Set the input node parameters.

@@ -121,6 +121,15 @@ class SumNodes(CircuitNodes):
             return None
         return self._params
 
+    def get_param_flows(self) -> torch.Tensor:
+        """
+        Get the sum node parameter flows.
+        """
+        if not self.provided("_param_flows"):
+            return None
+        else:
+            return self._param_flows
+
     def set_params(self, params: torch.Tensor, normalize: bool = True, pseudocount: float = 0.0):
         """
         Set the sum node parameters.
