@@ -162,7 +162,7 @@ class Categorical(Distribution):
 
     @staticmethod
     def small_ncats_em_fn(local_offsets, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, s_mids_ptr, mask,
-              step_size, pseudocount, BLOCK_SIZE):
+                          step_size, pseudocount, BLOCK_SIZE):
         # Get `num_cats` from `metadata`
         s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
         num_cats = tl.load(metadata_ptr + s_mids, mask = mask, other = 0).to(tl.int64)
@@ -170,15 +170,20 @@ class Categorical(Distribution):
         max_num_cats = tl.max(num_cats, axis = 0)
 
         # Compute cumulative flows
+        numerate_pseudocount = pseudocount / num_cats
         cum_flow = tl.zeros([BLOCK_SIZE], dtype = tl.float32)
         for cat_id in range(max_num_cats):
             cat_mask = mask & (cat_id < num_cats)
 
             flow = tl.load(param_flows_ptr + s_pfids + cat_id, mask = cat_mask, other = 0)
-            cum_flow += flow
+
+            if keep_zero_params:
+                param = tl.load(params_ptr + s_pids + cat_id, mask = cat_mask, other = 0)
+                cum_flow += tl.where(param < 1e-12, 0.0, flow + numerate_pseudocount)
+            else:
+                cum_flow += flow
 
         # Parameter update
-        numerate_pseudocount = pseudocount / num_cats
         cum_flow += pseudocount
         for cat_id in range(max_num_cats):
             cat_mask = mask & (cat_id < num_cats)
@@ -186,7 +191,12 @@ class Categorical(Distribution):
             param = tl.load(params_ptr + s_pids + cat_id, mask = cat_mask, other = 0)
             flow = tl.load(param_flows_ptr + s_pfids + cat_id, mask = cat_mask, other = 0)
 
-            new_param = (1.0 - step_size) * param + step_size * (flow + numerate_pseudocount) / cum_flow
+            if keep_zero_params:
+                new_param = (1.0 - step_size) * param + step_size * (flow + numerate_pseudocount) / (cum_flow - pseudocount)
+                new_param = tl.where(param < 1e-12, 0.0, new_param)
+            else:
+                new_param = (1.0 - step_size) * param + step_size * (flow + numerate_pseudocount) / cum_flow
+
             tl.store(params_ptr + s_pids + cat_id, new_param, mask = cat_mask)
 
     @staticmethod
@@ -199,18 +209,23 @@ class Categorical(Distribution):
         max_num_cats = tl.max(num_cats, axis = 0)
 
         # Compute cumulative flows
+        numerate_pseudocount = pseudocount / num_cats
         cum_flow = tl.zeros([BLOCK_SIZE], dtype = tl.float32)
         cat_ids = tl.arange(0, 128)
         for cat_sid in range(0, max_num_cats, 128):
             cat_mask = mask[:,None] & (cat_ids[None,:] < num_cats[:,None])
 
             flow = tl.load(param_flows_ptr + s_pfids[:,None] + cat_ids[None,:], mask = cat_mask, other = 0)
-            cum_flow += tl.sum(flow, axis = 1)
+
+            if keep_zero_params:
+                param = tl.load(params_ptr + s_pids[:,None] + cat_ids[None,:], mask = cat_mask, other = 0)
+                cum_flow += tl.sum(tl.where(param < 1e-12, 0.0, flow + numerate_pseudocount[:,None]))
+            else:
+                cum_flow += tl.sum(flow, axis = 1)
 
             cat_ids += 128
 
         # Parameter update
-        numerate_pseudocount = pseudocount / num_cats
         cum_flow += pseudocount
         cat_ids = tl.arange(0, 128)
         for cat_sid in range(0, max_num_cats, 128):
@@ -219,7 +234,11 @@ class Categorical(Distribution):
             param = tl.load(params_ptr + s_pids[:,None] + cat_ids[None,:], mask = cat_mask, other = 0)
             flow = tl.load(param_flows_ptr + s_pfids[:,None] + cat_ids[None,:], mask = cat_mask, other = 0)
 
-            new_param = (1.0 - step_size) * param + step_size * (flow + numerate_pseudocount[:,None]) / cum_flow[:,None]
+            if keep_zero_params:
+                new_param = (1.0 - step_size) * param + step_size * (flow + numerate_pseudocount[:,None]) / (cum_flow[:,None] - pseudocount)
+                new_param = tl.where(param < 1e-12, 0.0, new_param)
+            else:
+                new_param = (1.0 - step_size) * param + step_size * (flow + numerate_pseudocount[:,None]) / cum_flow[:,None]
             tl.store(params_ptr + s_pids[:,None] + cat_ids[None,:], new_param, mask = cat_mask)
 
             cat_ids += 128

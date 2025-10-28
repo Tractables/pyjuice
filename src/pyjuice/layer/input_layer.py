@@ -608,7 +608,7 @@ class InputLayer(Layer, nn.Module):
         else:
             raise NotImplementedError("CPU sample fn for input nodes is not implemented.")
 
-    def mini_batch_em(self, step_size: float, pseudocount: float = 0.0):
+    def mini_batch_em(self, step_size: float, pseudocount: float = 0.0, keep_zero_params: bool = False):
         if not self._used_external_params:
             # Normalize and update parameters
             with torch.no_grad():
@@ -663,6 +663,7 @@ class InputLayer(Layer, nn.Module):
                         source_nids_ptr = self.source_nids,
                         constexprs_ptr = constexprs,
                         layer_num_source_nodes = layer_num_source_nodes,
+                        keep_zero_params = keep_zero_params,
                         BLOCK_SIZE = BLOCK_SIZE,
                         num_warps = 8
                     )
@@ -1211,7 +1212,8 @@ class InputLayer(Layer, nn.Module):
 
     @staticmethod
     def _em_kernel_template(em_fn, params_ptr, param_flows_ptr, s_pids_ptr, s_pfids_ptr, metadata_ptr, s_mids_ptr,
-                            source_nids_ptr, constexprs_ptr, layer_num_source_nodes: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+                            source_nids_ptr, constexprs_ptr, layer_num_source_nodes: tl.constexpr, 
+                            keep_zero_params: tl.constexpr, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(axis = 0)
         block_start = pid * BLOCK_SIZE
 

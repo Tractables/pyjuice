@@ -544,7 +544,7 @@ class TensorCircuit(nn.Module):
 
         # Update input layers
         for layer in self.input_layer_group:
-            layer.mini_batch_em(step_size = step_size, pseudocount = pseudocount)
+            layer.mini_batch_em(step_size = step_size, pseudocount = pseudocount, keep_zero_params = keep_zero_params)
 
         # Accumulate parameter flows of tied nodes
         compute_cum_par_flows(self.param_flows, self.parflow_fusing_kwargs)
