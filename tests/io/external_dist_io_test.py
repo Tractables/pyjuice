@@ -30,6 +30,10 @@ def test_external_dist_io():
     temp_file_name = temp_file.name
     juice.save(temp_file_name, pc)
 
+    new_ns = juice.load(temp_file_name)
+
+    assert isinstance(new_ns.chs[0].chs[1].dist, juice.distributions.External)
+
 
 if __name__ == "__main__":
     test_external_dist_io()
