@@ -208,3 +208,6 @@ class External(Distribution):
 
     def _get_constructor(self):
         return External, {}
+
+    def __reduce__(self):
+        return (self.__class__, ())
