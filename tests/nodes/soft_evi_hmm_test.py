@@ -161,7 +161,7 @@ def test_soft_evi_hmm_type2():
                 assert torch.all(torch.abs(external_soft_evi_grad[:,v-seq_length,:].permute(1, 0) - pc.node_flows[sid:eid,:]) < 1e-5)
             elif v >= 2 * seq_length:
                 assert torch.all(torch.abs(external_soft_evi[:,v-seq_length,:].permute(1, 0) - pc.node_mars[sid:eid,:]) < 1e-5)
-                assert torch.all(torch.abs(external_soft_evi_grad[:,v-seq_length,:].permute(1, 0) - pc.node_mars[sid:eid,:]) < 1e-5)
+                assert torch.all(torch.abs(external_soft_evi_grad[:,v-seq_length,:].permute(1, 0) - pc.node_flows[sid:eid,:]) < 1e-5)
 
 
 if __name__ == "__main__":
