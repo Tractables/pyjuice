@@ -9,6 +9,7 @@ import triton.language as tl
 from tqdm import tqdm
 from functools import partial
 from typing import Optional, Sequence, Callable, Union, Tuple, Dict
+from contextlib import contextmanager
 
 from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes, foreach, summate, multiply
 from pyjuice.layer import Layer, InputLayer, ProdLayer, SumLayer, LayerGroup
@@ -69,6 +70,24 @@ def layer_iterator(pc, reverse = False, ret_layer_groups = False, ignore_input_l
             if not ignore_input_layers:
                 for layer in pc.input_layer_group:
                     yield layer
+
+
+@contextmanager
+def device_grad_controller(device, no_grad = True):
+    device_type = device.type
+    if device_type == "cpu":
+        if no_grad:
+            with torch.no_grad():
+                yield
+        else:
+            yield
+    else:
+        with torch.cuda.device(f"cuda:{device.index}"):
+            if no_grad:
+                with torch.no_grad():
+                    yield
+            else:
+                yield
 
 
 class TensorCircuit(nn.Module):
@@ -155,6 +174,9 @@ class TensorCircuit(nn.Module):
     def to(self, device):
         super(TensorCircuit, self).to(device)
 
+        if isinstance(device, int):
+            device = torch.device(f"cuda:{device}")
+
         self.input_layer_group.to(device)
 
         self.device = device
@@ -196,33 +218,34 @@ class TensorCircuit(nn.Module):
         :param input_layer_fn: Custom forward function for input layers; if it is a string, then try to call the corresponding member function of the input layers
         :type input_layer_fn: Optional[Union[str,Callable]]
         """
+
+        with device_grad_controller(device = self.device, no_grad = True):
         
-        B = inputs.size(0)
+            B = inputs.size(0)
 
-        origin_inputs = inputs
-        if input_layer_fn is None:
-            assert inputs.dim() == 2
+            origin_inputs = inputs
+            if input_layer_fn is None:
+                assert inputs.dim() == 2
 
-            inputs = inputs.permute(1, 0)
+                inputs = inputs.permute(1, 0)
 
-        # Set propagation algorithm
-        if propagation_alg is None:
-            propagation_alg = self.default_propagation_alg
-            kwargs.update(self.propagation_alg_kwargs)
-        
-        ## Initialize buffers for forward pass ##
+            # Set propagation algorithm
+            if propagation_alg is None:
+                propagation_alg = self.default_propagation_alg
+                kwargs.update(self.propagation_alg_kwargs)
+            
+            ## Initialize buffers for forward pass ##
 
-        if not _no_buffer_reset:
-            self._init_buffer(name = "node_mars", shape = (self.num_nodes, B), set_value = 0.0)
-            self._init_buffer(name = "element_mars", shape = (self.num_elements, B), set_value = -torch.inf)
+            if not _no_buffer_reset:
+                self._init_buffer(name = "node_mars", shape = (self.num_nodes, B), set_value = 0.0)
+                self._init_buffer(name = "element_mars", shape = (self.num_elements, B), set_value = -torch.inf)
 
-        # Load cached node marginals
-        if self._buffer_matches(name = "node_mars", cache = cache):
-            self.node_mars[:,:] = cache["node_mars"]
+            # Load cached node marginals
+            if self._buffer_matches(name = "node_mars", cache = cache):
+                self.node_mars[:,:] = cache["node_mars"]
 
-        ## Run forward pass ##
+            ## Run forward pass ##
 
-        with torch.no_grad():
             # Input layers
             if not _inner_layers_only:
                 for idx, layer in enumerate(self.input_layer_group):
@@ -281,8 +304,8 @@ class TensorCircuit(nn.Module):
             else:
                 _run_inner_layers()
                 
-        lls = self.node_mars[self._root_node_range[0]:self._root_node_range[1],:]
-        lls = lls.permute(1, 0)
+            lls = self.node_mars[self._root_node_range[0]:self._root_node_range[1],:]
+            lls = lls.permute(1, 0)
 
         ## Create/Update cache if needed ##
 
@@ -355,50 +378,50 @@ class TensorCircuit(nn.Module):
             assert inputs.dim() == 2 and inputs.size(1) == self.num_vars
             inputs = inputs.permute(1, 0)
 
-        B = self.node_mars.size(1)
+        with device_grad_controller(device = self.device, no_grad = True):
 
-        ## Initialize buffers for backward pass ##
+            B = self.node_mars.size(1)
 
-        if not _disable_buffer_init:
-            self._init_buffer(name = "node_flows", shape = (self.num_nodes, B), set_value = 0.0 if not logspace_flows else -float("inf"))
-            self._init_buffer(name = "element_flows", shape = (self.num_elements, B), set_value = 0.0 if not logspace_flows else -float("inf"))
+            ## Initialize buffers for backward pass ##
 
-        # Set root node flows
-        def _set_root_node_flows():
-            nonlocal ll_weights
-            nonlocal logspace_flows
-            if ll_weights is None:
-                root_flows = 1.0 if not logspace_flows else 0.0
-                self.node_flows[self._root_node_range[0]:self._root_node_range[1],:] = root_flows
-            else:
-                if ll_weights.dim() == 1:
-                    ll_weights = ll_weights.unsqueeze(0)
+            if not _disable_buffer_init:
+                self._init_buffer(name = "node_flows", shape = (self.num_nodes, B), set_value = 0.0 if not logspace_flows else -float("inf"))
+                self._init_buffer(name = "element_flows", shape = (self.num_elements, B), set_value = 0.0 if not logspace_flows else -float("inf"))
 
-                assert ll_weights.size(0) == self.num_root_nodes
+            # Set root node flows
+            def _set_root_node_flows():
+                nonlocal ll_weights
+                nonlocal logspace_flows
+                if ll_weights is None:
+                    root_flows = 1.0 if not logspace_flows else 0.0
+                    self.node_flows[self._root_node_range[0]:self._root_node_range[1],:] = root_flows
+                else:
+                    if ll_weights.dim() == 1:
+                        ll_weights = ll_weights.unsqueeze(0)
 
-                root_flows = ll_weights if not logspace_flows else ll_weights.log()
-                self.node_flows[self._root_node_range[0]:self._root_node_range[1],:] = root_flows
+                    assert ll_weights.size(0) == self.num_root_nodes
 
-        _set_root_node_flows()
+                    root_flows = ll_weights if not logspace_flows else ll_weights.log()
+                    self.node_flows[self._root_node_range[0]:self._root_node_range[1],:] = root_flows
 
-        # Accumulate the total amount of flows added to the PC
-        if compute_param_flows:
-            if ll_weights is None:
-                self._cum_flow += (self._root_node_range[1] - self._root_node_range[0]) * B
-            else:
-                self._cum_flow += ll_weights.sum().item()
+            _set_root_node_flows()
 
-        # Load cached node flows
-        if self._buffer_matches(name = "node_flows", cache = cache):
-            self.node_flows[:,:] = cache["node_flows"]
+            # Accumulate the total amount of flows added to the PC
+            if compute_param_flows:
+                if ll_weights is None:
+                    self._cum_flow += (self._root_node_range[1] - self._root_node_range[0]) * B
+                else:
+                    self._cum_flow += ll_weights.sum().item()
 
-        ## Initialize parameter flows ##
-        if compute_param_flows:
-            self.init_param_flows(flows_memory = flows_memory)
+            # Load cached node flows
+            if self._buffer_matches(name = "node_flows", cache = cache):
+                self.node_flows[:,:] = cache["node_flows"]
 
-        ## Run backward pass ##
+            ## Initialize parameter flows ##
+            if compute_param_flows:
+                self.init_param_flows(flows_memory = flows_memory)
 
-        with torch.no_grad():
+            ## Run backward pass ##
 
             # Inner layers
             def _run_inner_layers():
@@ -533,26 +556,28 @@ class TensorCircuit(nn.Module):
         assert not step_size_rescaling or self._cum_flow > 0.0, "Please perform a backward pass before calling `mini_batch_em`."
         assert 0.0 < step_size <= 1.0, "`step_size` should be between 0 and 1."
 
-        # Apply step size rescaling according to the mini-batch EM objective derivation
-        if step_size_rescaling:
-            self.init_param_flows(flows_memory = step_size / self._cum_flow)
+        with device_grad_controller(device = self.device, no_grad = True):
 
-            eval_top_down_probs(self, update_pflow = True, scale = (1.0 - step_size), use_cudagraph = use_cudagraph)
+            # Apply step size rescaling according to the mini-batch EM objective derivation
+            if step_size_rescaling:
+                self.init_param_flows(flows_memory = step_size / self._cum_flow)
 
-            self._cum_flow = 0.0 # Zero out the cumulative flow value
-            step_size = 1.0 # We have applied the step size within the parameter flows
+                eval_top_down_probs(self, update_pflow = True, scale = (1.0 - step_size), use_cudagraph = use_cudagraph)
 
-        # Update input layers
-        for layer in self.input_layer_group:
-            layer.mini_batch_em(step_size = step_size, pseudocount = pseudocount, keep_zero_params = keep_zero_params)
+                self._cum_flow = 0.0 # Zero out the cumulative flow value
+                step_size = 1.0 # We have applied the step size within the parameter flows
 
-        # Accumulate parameter flows of tied nodes
-        compute_cum_par_flows(self.param_flows, self.parflow_fusing_kwargs)
+            # Update input layers
+            for layer in self.input_layer_group:
+                layer.mini_batch_em(step_size = step_size, pseudocount = pseudocount, keep_zero_params = keep_zero_params)
 
-        # Normalize and update parameters
-        em_par_update(self.params, self.param_flows, self.par_update_kwargs, 
-                      step_size = step_size, pseudocount = pseudocount,
-                      keep_zero_params = keep_zero_params)
+            # Accumulate parameter flows of tied nodes
+            compute_cum_par_flows(self.param_flows, self.parflow_fusing_kwargs)
+
+            # Normalize and update parameters
+            em_par_update(self.params, self.param_flows, self.par_update_kwargs, 
+                        step_size = step_size, pseudocount = pseudocount,
+                        keep_zero_params = keep_zero_params)
 
     def cumulate_flows(self, inputs: torch.Tensor, params: Optional[torch.Tensor] = None):
         with torch.no_grad():
