@@ -413,7 +413,7 @@ class SumLayer(Layer, nn.Module):
         elif self.block_size == 1 or num_edges < 4:
             # In this case, we should definitely use the sparse implementation
             mode = self.SPARSE
-        elif self.block_size * batch_size < 32:
+        elif self.block_size * batch_size < 32 or batch_size < 4:
             # Advantage of block-sparse processing is diminishing
             mode = self.SPARSE
         else:
@@ -1299,7 +1299,7 @@ class SumLayer(Layer, nn.Module):
         elif cs_block_size == 1 or self.block_size == 1:
             # In this case, we should definitely use the sparse implementation
             mode = self.SPARSE
-        elif self.block_size * batch_size < 32:
+        elif self.block_size * batch_size < 32 or batch_size < 4:
             # Advantage of block-sparse processing is diminishing
             mode = self.SPARSE
         elif num_edges <= 32768:
