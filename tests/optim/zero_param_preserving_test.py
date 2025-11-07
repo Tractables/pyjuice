@@ -38,7 +38,7 @@ def test_zero_param_preserving_col():
     lls = pc(x)
     pc.backward(x, logspace_flows = True, allow_modify_flows = False)
 
-    pc.mini_batch_em(step_size = 1.0, keep_zero_params = True)
+    pc.mini_batch_em(step_size = 1.0, pseudocount = 1e-6, keep_zero_params = True)
 
     pc.update_parameters()
 
@@ -46,7 +46,7 @@ def test_zero_param_preserving_col():
 
     assert torch.all((alpha > 1e-12) | (alpha_new < 1e-12))
 
-    pc.mini_batch_em(step_size = 0.1, step_size_rescaling = True, keep_zero_params = True)
+    pc.mini_batch_em(step_size = 0.1, pseudocount = 1e-6, step_size_rescaling = True, keep_zero_params = True)
 
     pc.update_parameters()
 
@@ -82,7 +82,7 @@ def test_zero_param_preserving_rand():
     lls = pc(x)
     pc.backward(x, logspace_flows = True, allow_modify_flows = False)
 
-    pc.mini_batch_em(step_size = 1.0, keep_zero_params = True)
+    pc.mini_batch_em(step_size = 1.0, pseudocount = 1e-6, keep_zero_params = True)
 
     pc.update_parameters()
 
@@ -90,7 +90,7 @@ def test_zero_param_preserving_rand():
 
     assert torch.all((alpha > 1e-12) | (alpha_new < 1e-12))
 
-    pc.mini_batch_em(step_size = 0.1, step_size_rescaling = True, keep_zero_params = True)
+    pc.mini_batch_em(step_size = 0.1, pseudocount = 1e-6, step_size_rescaling = True, keep_zero_params = True)
 
     pc.update_parameters()
 
@@ -136,7 +136,7 @@ def test_zero_param_preserving_slow():
                 lls = pc(x)
                 pc.backward(x, logspace_flows = True, allow_modify_flows = False)
 
-                pc.mini_batch_em(step_size = 1.0, keep_zero_params = True)
+                pc.mini_batch_em(step_size = 1.0, pseudocount = 1e-6, keep_zero_params = True)
 
                 pc.update_parameters()
 
@@ -146,7 +146,7 @@ def test_zero_param_preserving_slow():
 
                 assert torch.all((alpha > 1e-12) | (alpha_new < 1e-12))
 
-                pc.mini_batch_em(step_size = 0.1, step_size_rescaling = True, keep_zero_params = True)
+                pc.mini_batch_em(step_size = 0.1, pseudocount = 1e-6, step_size_rescaling = True, keep_zero_params = True)
 
                 pc.update_parameters()
 

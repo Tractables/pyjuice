@@ -195,7 +195,7 @@ def cum_pflow_kernel(cum_pflows, mparams, param_flows, nchs, par_start_ids, pflo
     mask_pflow = mask_m[:,None] & (offs_blk[None,:] < blk_size[:,None])
     pflows = tl.load(param_flows + offs_pflow, mask = mask_pflow, other = 0)
 
-    if keep_zero_params == 1:
+    if keep_zero_params:
         par_start = tl.load(par_start_ids + offs_m, mask = mask_m, other = 0)
         offs_par = par_start[:,None] + offs_blk[None,:] * blk_interval[:,None]
         old_params = tl.load(mparams + offs_par, mask = mask_pflow, other = 0)
@@ -240,7 +240,7 @@ def em_par_update_kernel(mparams, param_flows, cum_pflows, nchs, par_start_ids, 
     nflows = tl.load(cum_pflows + global_nid, mask = mask_m, other = 1)
     nch = tl.load(nchs + offs_m, mask = mask_m, other = 1)
 
-    if keep_zero_params == 1:
+    if keep_zero_params:
         new_param = (pflows + pseudocount / nch[:,None]) / nflows[:,None]
     else:
         new_param = (pflows + pseudocount / nch[:,None]) / (nflows[:,None] + pseudocount)
@@ -248,12 +248,12 @@ def em_par_update_kernel(mparams, param_flows, cum_pflows, nchs, par_start_ids, 
     offs_par = par_start[:,None] + offs_blk[None,:] * blk_interval[:,None]
     old_param = tl.load(mparams + offs_par, mask = mask_pflow, other = 0)
 
-    updated_param = (1.0 - step_size) * old_param + step_size * new_param
+    if keep_zero_params:
+        updated_params = tl.where(old_param < 1e-12, 0.0, (1.0 - step_size) * old_param + step_size * new_param)
+    else:
+        updated_params = (1.0 - step_size) * old_param + step_size * new_param
 
-    if keep_zero_params == 1:
-        updated_params = tl.where(old_param < 1e-12, 0.0, updated_param)
-
-    tl.store(mparams + offs_par, updated_param, mask = mask_pflow)
+    tl.store(mparams + offs_par, updated_params, mask = mask_pflow)
 
 
 @triton.jit
@@ -288,9 +288,9 @@ def sgd_par_update_kernel(mparams, param_grads, par_start_ids, pgrad_start_ids, 
     if keep_zero_params:
         updated_params = tl.where(old_param < 1e-12, 0.0, tl.exp(tl.log(old_param) + lr * pgrads))
     else:
-        updated_param = tl.exp(tl.log(old_param) + lr * pgrads)
+        updated_params = tl.exp(tl.log(old_param) + lr * pgrads)
 
-    tl.store(mparams + offs_par, updated_param, mask = mask_pgrad)
+    tl.store(mparams + offs_par, updated_params, mask = mask_pgrad)
 
 
 def em_par_update(params: torch.Tensor, param_flows: torch.Tensor, par_update_kwargs: Sequence, 
@@ -312,8 +312,6 @@ def em_par_update(params: torch.Tensor, param_flows: torch.Tensor, par_update_kw
     grid = (triton.cdiv(num_blocks, BLOCK_ID),)
 
     constexprs = torch.tensor([step_size, pseudocount, num_blocks]).to(params.device)
-
-    keep_zero_params = 1 if keep_zero_params else 0
 
     cum_pflow_kernel[grid](
         cum_pflows, params, param_flows, nchs, par_start_ids, pflow_start_ids, blk_sizes, blk_intervals, 
