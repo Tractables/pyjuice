@@ -141,7 +141,7 @@ def test_hclt_zero_preserving():
 
             while True:
                 mask = torch.rand(num_sum_nodes, num_ch_nodes) < 0.1
-                if torch.all(mask.long().sum(dim = 1) > 0):
+                if torch.all((~mask).long().sum(dim = 1) > 0):
                     break
 
             params[mask] = 0.0
@@ -230,7 +230,7 @@ def test_hmm_zero_preserving():
 
             while True:
                 mask = torch.rand(num_sum_nodes, num_ch_nodes) < 0.1
-                if torch.all(mask.long().sum(dim = 1) > 0):
+                if torch.all((~mask).long().sum(dim = 1) > 0):
                     break
 
             params[mask] = 0.0
@@ -266,6 +266,96 @@ def test_hmm_zero_preserving():
             assert torch.all(~mask | (params < 1e-12))
 
 
+def test_hmm_zero_preserving_node_zeroling():
+
+    device = torch.device("cuda:0")
+
+    seq_length = 32
+
+    data = load_penn_treebank(seq_length = seq_length)
+    if data is None:
+        return None
+    train_data, valid_data, test_data = data
+
+    vocab_size = train_data.max().item() + 1
+
+    train_loader = DataLoader(
+        dataset = TensorDataset(train_data),
+        batch_size = 512,
+        shuffle = True,
+        drop_last = True
+    )
+    valid_loader = DataLoader(
+        dataset = TensorDataset(valid_data),
+        batch_size = 512,
+        shuffle = False,
+        drop_last = True
+    )
+
+    root_ns = juice.structures.HMM(
+        seq_length = seq_length,
+        num_latents = 512,
+        num_emits = vocab_size,
+        homogeneous = True
+    )
+    root_ns.init_parameters(perturbation = 8.0)
+
+    ns2mask = dict()
+
+    for ns in root_ns:
+        if ns.is_sum() and ns.has_params() and not ns.is_tied():
+            num_node_blocks = ns.num_node_blocks
+            num_ch_blocks = ns.chs[0].num_node_blocks
+            block_size = ns.block_size
+            ch_block_size = ns.chs[0].block_size
+
+            num_sum_nodes = num_node_blocks * block_size
+            num_ch_nodes = num_ch_blocks * ch_block_size
+
+            params = ns.get_params().reshape(
+                num_node_blocks, num_ch_blocks, block_size, ch_block_size).permute(0, 2, 1, 3).reshape(
+                    num_sum_nodes, num_ch_nodes
+                )
+
+            while True:
+                mask = torch.rand(num_ch_nodes) < 0.5
+                if torch.all((~mask).long().sum() > 0):
+                    break
+
+            params[:,mask] = 0.0
+            ns.set_params(params)
+            ns2mask[ns] = mask
+
+    pc = juice.compile(root_ns)
+    pc.to(device)
+
+    for epoch in range(1, 10 + 1):
+        full_batch_em_epoch(pc, train_loader, valid_loader, device)
+
+    test_ll = evaluate(pc, valid_loader)
+    assert test_ll > -90
+
+    for ns in root_ns:
+        if ns.is_sum() and ns.has_params() and not ns.is_tied():
+            num_node_blocks = ns.num_node_blocks
+            num_ch_blocks = ns.chs[0].num_node_blocks
+            block_size = ns.block_size
+            ch_block_size = ns.chs[0].block_size
+
+            num_sum_nodes = num_node_blocks * block_size
+            num_ch_nodes = num_ch_blocks * ch_block_size
+
+            params = ns.get_params().reshape(
+                num_node_blocks, num_ch_blocks, block_size, ch_block_size).permute(0, 2, 1, 3).reshape(
+                    num_sum_nodes, num_ch_nodes
+                )
+
+            mask = ns2mask[ns]
+
+            assert torch.all(~mask | (params.sum(dim = 0) < 1e-12))
+
+
 if __name__ == "__main__":
     test_hclt_zero_preserving()
     test_hmm_zero_preserving()
+    test_hmm_zero_preserving_node_zeroling()

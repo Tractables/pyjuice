@@ -69,7 +69,7 @@ def test_zero_param_preserving_rand():
     alpha = root_ns.chs[0].chs[1].get_source_ns()._params.clone().reshape(128, 128)
     while True:
         mask = torch.rand(128, 128) < 0.1
-        if torch.all(mask.long().sum(dim = 1) > 0):
+        if torch.all((~mask).long().sum(dim = 1) > 0):
             break
     alpha[mask] = 0.0
     root_ns.chs[0].chs[1].set_params(alpha)
@@ -123,7 +123,7 @@ def test_zero_param_preserving_slow():
                         0, 2, 1, 3).reshape(num_latents, num_latents)
                 while True:
                     mask = torch.rand(num_latents, num_latents) < 0.1
-                    if torch.all(mask.long().sum(dim = 1) > 0):
+                    if torch.all((~mask).long().sum(dim = 1) > 0):
                         break
                 alpha[mask] = 0.0
                 root_ns.chs[0].chs[1].set_params(alpha)
