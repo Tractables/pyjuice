@@ -52,7 +52,7 @@ def grow(root_ns: CircuitNodes, num_duplicates: int, perturbation: float = 0.0):
             assert ns.is_sum()
 
             edge_ids = ns.edge_ids.clone()
-            num_edges = edge_ids.size(1)
+            num_edges = edge_ids.size(1)    # number of edge = node_block_size * child_block_size * num_edges(_block)
             num_node_blocks = ns.num_node_blocks
             num_ch_node_blocks = sum(ms.num_node_blocks for ms in ns.chs)
 
@@ -69,14 +69,18 @@ def grow(root_ns: CircuitNodes, num_duplicates: int, perturbation: float = 0.0):
                     idx += 1
 
             if ns.has_params():
+                # num_edges(_block), node_block_size, child_block_size
                 params = ns.get_params()[None,:,:,:].repeat((num_duplicates + 1) ** 2, 1, 1, 1)
                 idx = 0
                 for i in range(num_duplicates + 1):
+                    # sample duplicate + 1 weights for each edge
+                    logits = perturbation * torch.rand(num_edges, num_duplicates + 1, ns.get_params().size(1), ns.get_params().size(2))
+                    prob = torch.softmax(logits, dim=1)
                     for j in range(num_duplicates + 1):
-                        if i > 0 or j > 0:
-                            params[idx,:,:,:] = (params[idx,:,:,:].log() + \
-                                perturbation * torch.rand_like(params[idx,:,:,:])).exp()
-
+                        params[idx,:,:,:] *= prob[:,j,:,:]
+                        # if i > 0 or j > 0:
+                        #     params[idx,:,:,:] = (params[idx,:,:,:].log() + \
+                        #         perturbation * torch.rand_like(params[idx,:,:,:])).exp()
                         idx += 1
             else:
                 params = None
@@ -86,7 +90,7 @@ def grow(root_ns: CircuitNodes, num_duplicates: int, perturbation: float = 0.0):
                 edge_ids = edge_ids, 
                 params = params, 
                 num_node_blocks = num_node_blocks * (1 + num_duplicates),
-                block_size = block_size
+                block_size = ns.block_size
             )
 
             if ns.is_tied():
