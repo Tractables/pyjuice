@@ -354,6 +354,7 @@ class TensorCircuit(nn.Module):
                  negate_pflows: bool = False,
                  _inner_layers_only: bool = False,
                  _disable_buffer_init: bool = False,
+                 force_use_fp32: bool = False,
                  **kwargs):
         """
         Backward evaluation of the PC that computes node flows as well as parameter flows.
@@ -372,6 +373,7 @@ class TensorCircuit(nn.Module):
         self._run_params["propagation_alg"] = propagation_alg
         self._run_params["logspace_flows"] = logspace_flows
         self._run_params["negate_pflows"] = negate_pflows
+        self._run_params["force_use_fp32"] = force_use_fp32
 
         assert self.node_mars is not None and self.element_mars is not None, "Should run forward path first."
         if input_layer_fn is None:
@@ -456,7 +458,7 @@ class TensorCircuit(nn.Module):
                                              param_flows = self.param_flows if compute_param_flows else None,
                                              allow_modify_flows = allow_modify_flows, 
                                              propagation_alg = propagation_alg if isinstance(propagation_alg, str) else propagation_alg[layer_id], 
-                                             logspace_flows = logspace_flows, negate_pflows = negate_pflows, **kwargs)
+                                             logspace_flows = logspace_flows, negate_pflows = negate_pflows, force_use_fp32 = force_use_fp32, **kwargs)
 
                         # Execute post-backward callback
                         layer_group.callback(
@@ -723,7 +725,8 @@ class TensorCircuit(nn.Module):
                 param_flows = None, allow_modify_flows = self._run_params["allow_modify_flows"], 
                 propagation_alg = self._run_params["propagation_alg"], 
                 logspace_flows = self._run_params["logspace_flows"], 
-                negate_pflows = self._run_params["negate_pflows"], **kwargs
+                negate_pflows = self._run_params["negate_pflows"],
+                force_use_fp32 = self._run_params["force_use_fp32"], **kwargs
             )
 
             return self.element_flows[nsid:neid,:].detach()
