@@ -6,6 +6,8 @@ from torch.utils.data import TensorDataset, DataLoader
 import pyjuice as juice
 import pyjuice.nodes.distributions as dists
 
+import pytest
+
 
 def test_hmm_forward_backward():
 
@@ -15,8 +17,8 @@ def test_hmm_forward_backward():
     vocab_size = 1023
     batch_size = 32
 
-    num_node_blocks = 4 # 4096 // 32 # 4
-    block_size = 1024 # 32 # 1024
+    num_node_blocks = 1 # 4096 // 32 # 4
+    block_size = 4096 # 32 # 1024
     num_latents = block_size * num_node_blocks
 
     with juice.set_block_size(block_size = block_size):
