@@ -117,6 +117,9 @@ class SumNodes(CircuitNodes):
         """
         Get the sum node parameters.
         """
+        if self.is_tied():
+            return self.get_source_ns().get_params()
+
         if not hasattr(self, "_params"):
             return None
         return self._params
@@ -125,6 +128,9 @@ class SumNodes(CircuitNodes):
         """
         Get the sum node parameter flows.
         """
+        if self.is_tied():
+            return self.get_source_ns().get_param_flows()
+
         if not self.provided("_param_flows"):
             return None
         else:
