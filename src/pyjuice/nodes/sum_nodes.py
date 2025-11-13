@@ -113,16 +113,35 @@ class SumNodes(CircuitNodes):
 
         return SumNodes(self.num_node_blocks, chs, edge_ids, params = params, block_size = self.block_size, source_node = self if tie_params else None)
 
-    def get_params(self):
+    def get_params(self, as_matrix: bool = False):
         """
         Get the sum node parameters.
         """
         if self.is_tied():
-            return self.get_source_ns().get_params()
+            return self.get_source_ns().get_params(as_matrix = as_matrix)
 
         if not hasattr(self, "_params"):
             return None
-        return self._params
+        
+        if not as_matrix:
+            return self._params
+        else:
+            num_node_blocks = self.num_node_blocks
+            block_size = self.block_size
+            num_ch_node_blocks = sum((cs.num_node_blocks for cs in self.chs))
+            ch_block_size = self.chs[0].block_size
+
+            params = torch.zeros([num_node_blocks * num_ch_node_blocks, block_size, ch_block_size], dtype = torch.float32)
+
+            idxs = self.edge_ids[0,:] * num_ch_node_blocks + self.edge_ids[1,:]
+            params[idxs,:,:] = self._params
+
+            params = params.reshape(
+                num_node_blocks, num_ch_node_blocks, block_size, ch_block_size
+            ).permute(0, 2, 1, 3).reshape(
+                num_node_blocks * block_size, num_ch_node_blocks * ch_block_size
+            )
+            return params
 
     def get_param_flows(self) -> torch.Tensor:
         """
