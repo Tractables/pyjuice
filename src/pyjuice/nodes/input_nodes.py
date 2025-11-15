@@ -85,14 +85,20 @@ class InputNodes(CircuitNodes):
 
         return ns
 
-    def get_params(self) -> torch.Tensor:
+    def get_params(self, as_matrix: bool = False) -> torch.Tensor:
         """
         Get the input node parameters.
         """
+        if self.is_tied():
+            return self.get_source_ns().get_params(as_matrix = as_matrix)
+        
         if not self.provided("_params"):
             return None
         else:
-            return self._params
+            if as_matrix:
+                return self._params.reshape(self.num_nodes, -1)
+            else:
+                return self._params
 
     def get_param_flows(self) -> torch.Tensor:
         """
