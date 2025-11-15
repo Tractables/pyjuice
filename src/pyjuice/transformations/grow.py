@@ -61,14 +61,14 @@ def grow(root_ns: CircuitNodes, num_duplicates: int, perturbation: float = 0.0):
             for i in range(num_duplicates + 1):
                 offset_i = num_node_blocks * i
                 for j in range(num_duplicates + 1):
-                    offset_j = num_node_blocks * j
+                    offset_j = num_ch_node_blocks * j
                     
                     new_edge_ids[0,idx * num_edges:(idx+1) * num_edges] = edge_ids[0,:] + offset_i
                     new_edge_ids[1,idx * num_edges:(idx+1) * num_edges] = edge_ids[1,:] + offset_j
 
                     idx += 1
 
-            if ns.has_params():
+            if ns.has_params() and not ns.is_tied():
                 # num_edges(_block), node_block_size, child_block_size
                 params = ns.get_params()[None,:,:,:].repeat((num_duplicates + 1) ** 2, 1, 1, 1)
                 idx = 0
@@ -82,12 +82,14 @@ def grow(root_ns: CircuitNodes, num_duplicates: int, perturbation: float = 0.0):
                         #     params[idx,:,:,:] = (params[idx,:,:,:].log() + \
                         #         perturbation * torch.rand_like(params[idx,:,:,:])).exp()
                         idx += 1
+                        
+                params = params.flatten(0, 1)
             else:
                 params = None
 
             new_ns = summate(
                 *ch_outputs, 
-                edge_ids = edge_ids, 
+                edge_ids = new_edge_ids, 
                 params = params, 
                 num_node_blocks = num_node_blocks * (1 + num_duplicates),
                 block_size = ns.block_size
