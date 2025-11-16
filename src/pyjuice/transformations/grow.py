@@ -28,11 +28,16 @@ def grow(root_ns: CircuitNodes, num_duplicates: int, perturbation: float = 0.0):
 
     def aggr_fn(ns, ch_outputs):
         if ns.is_input():
+            if ns.has_params() and not ns.is_tied():
+                params = ns.get_params().repeat(1 + num_duplicates)
+            else:
+                params = None
+
             new_ns = inputs(
                 var = ns.scope.to_list(),
                 num_node_blocks = ns.num_node_blocks * (1 + num_duplicates),
                 dist = ns.dist,
-                params = ns.get_params().repeat(1 + num_duplicates) if ns.has_params() else None,
+                params = params,
                 block_size = ns.block_size
             )
         elif ns.is_prod():
@@ -89,19 +94,28 @@ def grow(root_ns: CircuitNodes, num_duplicates: int, perturbation: float = 0.0):
             else:
                 params = None
 
+            if ns == root_ns:
+                new_num_node_blocks = num_node_blocks
+            else:
+                new_num_node_blocks = num_node_blocks * (1 + num_duplicates)
+
             new_ns = summate(
                 *ch_outputs, 
                 edge_ids = new_edge_ids, 
                 params = params, 
-                num_node_blocks = num_node_blocks * (1 + num_duplicates),
+                num_node_blocks = new_num_node_blocks,
                 block_size = ns.block_size
             )
-
-            if ns.is_tied():
-                new_ns.set_source_ns(old2new[ns.get_source_ns()])
 
             old2new[ns] = new_ns
 
         return new_ns
+    
+    new_root_ns = foldup_aggregate(aggr_fn, root_ns)
 
-    return foldup_aggregate(aggr_fn, root_ns)
+    for ns in root_ns:
+        if ns.is_tied():
+            source_ns = ns.get_source_ns()
+            old2new[ns].set_source_ns(old2new[source_ns])
+
+    return new_root_ns
