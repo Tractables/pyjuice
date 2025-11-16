@@ -107,7 +107,7 @@ def grow(root_ns: CircuitNodes, num_duplicates: int, perturbation: float = 0.0):
                 block_size = ns.block_size
             )
 
-            old2new[ns] = new_ns
+        old2new[ns] = new_ns
 
         return new_ns
     
