@@ -51,14 +51,16 @@ def grow(root_ns: CircuitNodes, num_duplicates: int, perturbation: float = 0.0):
         else:
             assert ns.is_sum()
 
+            sum_n_copies = 1 if root_ns == ns else (num_duplicates + 1)
+
             edge_ids = ns.edge_ids.clone()
             num_edges = edge_ids.size(1)    # number of edge = node_block_size * child_block_size * num_edges(_block)
             num_node_blocks = ns.num_node_blocks
             num_ch_node_blocks = sum(ms.num_node_blocks for ms in ns.chs)
 
-            new_edge_ids = torch.zeros([2, num_edges * ((num_duplicates + 1) ** 2)], dtype = torch.long)
+            new_edge_ids = torch.zeros([2, num_edges * ((num_duplicates + 1) * sum_n_copies)], dtype = torch.long)
             idx = 0
-            for i in range(num_duplicates + 1):
+            for i in range(sum_n_copies):
                 offset_i = num_node_blocks * i
                 for j in range(num_duplicates + 1):
                     offset_j = num_ch_node_blocks * j
@@ -70,9 +72,9 @@ def grow(root_ns: CircuitNodes, num_duplicates: int, perturbation: float = 0.0):
 
             if ns.has_params() and not ns.is_tied():
                 # num_edges(_block), node_block_size, child_block_size
-                params = ns.get_params()[None,:,:,:].repeat((num_duplicates + 1) ** 2, 1, 1, 1)
+                params = ns.get_params()[None,:,:,:].repeat((num_duplicates + 1) * sum_n_copies, 1, 1, 1)
                 idx = 0
-                for i in range(num_duplicates + 1):
+                for i in range(sum_n_copies):
                     # sample duplicate + 1 weights for each edge
                     logits = perturbation * torch.rand(num_edges, num_duplicates + 1, ns.get_params().size(1), ns.get_params().size(2))
                     prob = torch.softmax(logits, dim=1)
