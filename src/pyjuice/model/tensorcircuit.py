@@ -257,7 +257,11 @@ class TensorCircuit(nn.Module):
                         getattr(layer, input_layer_fn)(inputs, self.node_mars, **kwargs)
 
                     elif isinstance(input_layer_fn, Callable):
-                        input_layer_fn(layer, inputs, self.node_mars, **kwargs)
+                        ret = input_layer_fn(layer, inputs, self.node_mars, **kwargs)
+
+                        # If the layer is not handled by `input_layer_fn`, we assume it will return `False`
+                        if not ret and ret is not None:
+                            layer(inputs, self.node_mars, **kwargs)
 
                     else:
                         raise ValueError(f"Custom input function should be either a `str` or a `Callable`. Found {type(input_layer_fn)} instead.")
@@ -514,6 +518,10 @@ class TensorCircuit(nn.Module):
 
                     elif isinstance(input_layer_fn, Callable):
                         input_layer_fn(layer, inputs, self.node_flows, self.node_mars, logspace_flows = logspace_flows, **kwargs)
+
+                        # If the layer is not handled by `input_layer_fn`, we assume it will return `False`
+                        if not ret and ret is not None:
+                            layer.backward(inputs, self.node_flows, self.node_mars, logspace_flows = logspace_flows, **kwargs)
 
                     else:
                         raise ValueError(f"Custom input function should be either a `str` or a `Callable`. Found {type(input_layer_fn)} instead.")
