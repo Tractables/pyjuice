@@ -326,35 +326,6 @@ class InputLayer(Layer, nn.Module):
             else:
                 assert missing_mask is not None, "`missing_mask` should be provided when `_apply_missing_mask_only = True`."
 
-            # Apply missing mask if required
-            if missing_mask is not None:
-                assert self.num_vars_per_node == 1, "`missing_mask` only supported for univariate distributions."
-
-                mask_dim = missing_mask.dim()
-                if mask_dim == 1:
-                    mode = 0
-                elif _batch_first or self.pc_num_vars == missing_mask.size(1):
-                    mode = 1
-                else:
-                    mode = 2
-
-                grid = (triton.cdiv(layer_num_nodes * batch_size, BLOCK_SIZE),)
-
-                self._fw_missing_mask_kernel[grid](
-                    missing_mask_ptr = missing_mask,
-                    node_mars_ptr = node_mars, 
-                    vids_ptr = self.vids, 
-                    fw_local_ids_ptr = fw_local_ids,
-                    num_vars = self.pc_num_vars,
-                    layer_num_nodes = layer_num_nodes, 
-                    batch_size = batch_size, 
-                    node_offset = node_offset, 
-                    BLOCK_SIZE = 1024, 
-                    partial_eval = 1 if fw_local_ids is not None else 0,
-                    mode = mode,
-                    num_warps = 8
-                )
-
             # Apply post-processing kernels
             for (kernel, cond_fn, prep_kwargs_fn) in self.post_fw_fns:
                 if not cond_fn(self, kwargs):
@@ -385,6 +356,35 @@ class InputLayer(Layer, nn.Module):
                     partial_eval = 1 if fw_local_ids is not None else 0,
                     num_warps = 8,
                     **target_kwargs
+                )
+
+            # Apply missing mask if required
+            if missing_mask is not None:
+                assert self.num_vars_per_node == 1, "`missing_mask` only supported for univariate distributions."
+
+                mask_dim = missing_mask.dim()
+                if mask_dim == 1:
+                    mode = 0
+                elif _batch_first or self.pc_num_vars == missing_mask.size(1):
+                    mode = 1
+                else:
+                    mode = 2
+
+                grid = (triton.cdiv(layer_num_nodes * batch_size, BLOCK_SIZE),)
+
+                self._fw_missing_mask_kernel[grid](
+                    missing_mask_ptr = missing_mask,
+                    node_mars_ptr = node_mars, 
+                    vids_ptr = self.vids, 
+                    fw_local_ids_ptr = fw_local_ids,
+                    num_vars = self.pc_num_vars,
+                    layer_num_nodes = layer_num_nodes, 
+                    batch_size = batch_size, 
+                    node_offset = node_offset, 
+                    BLOCK_SIZE = 1024, 
+                    partial_eval = 1 if fw_local_ids is not None else 0,
+                    mode = mode,
+                    num_warps = 8
                 )
 
         else:
@@ -473,6 +473,44 @@ class InputLayer(Layer, nn.Module):
                 num_warps = 8
             )
 
+            # Apply post-processing kernels
+            for (kernel, cond_fn, prep_kwargs_fn) in self.post_bp_fns:
+                if not cond_fn(self, kwargs):
+                    continue
+
+                target_kwargs = prep_kwargs_fn(self, kwargs)
+
+                BLOCK_SIZE = 1024
+
+                grid = (triton.cdiv(layer_num_nodes * batch_size, BLOCK_SIZE),)
+
+                kernel[grid](
+                    params_ptr = self.params,
+                    param_flows_ptr = self.param_flows,
+                    node_flows_ptr = node_flows, 
+                    node_mars_ptr = node_mars,
+                    data_ptr = data, 
+                    vids_ptr = self.vids, 
+                    s_pids_ptr = self.s_pids,
+                    s_pfids_ptr = self.s_pfids,
+                    metadata_ptr = self.metadata, 
+                    s_mids_ptr = self.s_mids, 
+                    nids_ptr = self.nids,
+                    bk_local_ids_ptr = bk_local_ids,
+                    layer_num_nodes = layer_num_nodes, 
+                    batch_size = batch_size, 
+                    num_vars_per_node = self.num_vars_per_node, 
+                    num_vars = num_vars,
+                    nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
+                    node_offset = node_offset, 
+                    BLOCK_SIZE = BLOCK_SIZE, 
+                    partial_eval = 1 if bk_local_ids is not None else 0,
+                    logspace_flows = logspace_flows,
+                    TILE_SIZE_K = 1,
+                    num_warps = 8,
+                    **target_kwargs
+                )
+
             # Handle the masked input nodes
             if missing_mask is not None and self.bk_flow_mask_fn is not None:
                 if not self.provided("_flows_mask_kernel"):
@@ -513,44 +551,6 @@ class InputLayer(Layer, nn.Module):
                     pass_type = 1,
                     TILE_SIZE_K = TILE_SIZE_K,
                     num_warps = 8
-                )
-
-            # Apply post-processing kernels
-            for (kernel, cond_fn, prep_kwargs_fn) in self.post_bp_fns:
-                if not cond_fn(self, kwargs):
-                    continue
-
-                target_kwargs = prep_kwargs_fn(self, kwargs)
-
-                BLOCK_SIZE = 1024
-
-                grid = (triton.cdiv(layer_num_nodes * batch_size, BLOCK_SIZE),)
-
-                kernel[grid](
-                    params_ptr = self.params,
-                    param_flows_ptr = self.param_flows,
-                    node_flows_ptr = node_flows, 
-                    node_mars_ptr = node_mars,
-                    data_ptr = data, 
-                    vids_ptr = self.vids, 
-                    s_pids_ptr = self.s_pids,
-                    s_pfids_ptr = self.s_pfids,
-                    metadata_ptr = self.metadata, 
-                    s_mids_ptr = self.s_mids, 
-                    nids_ptr = self.nids,
-                    bk_local_ids_ptr = bk_local_ids,
-                    layer_num_nodes = layer_num_nodes, 
-                    batch_size = batch_size, 
-                    num_vars_per_node = self.num_vars_per_node, 
-                    num_vars = num_vars,
-                    nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
-                    node_offset = node_offset, 
-                    BLOCK_SIZE = BLOCK_SIZE, 
-                    partial_eval = 1 if bk_local_ids is not None else 0,
-                    logspace_flows = logspace_flows,
-                    TILE_SIZE_K = 1,
-                    num_warps = 8,
-                    **target_kwargs
                 )
         else:
             raise NotImplementedError("CPU backward fn for input nodes is not implemented.")
