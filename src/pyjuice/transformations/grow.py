@@ -29,7 +29,12 @@ def grow(root_ns: CircuitNodes, num_duplicates: int, perturbation: float = 0.0):
     def aggr_fn(ns, ch_outputs):
         if ns.is_input():
             if ns.has_params() and not ns.is_tied():
-                params = ns.get_params().repeat(1 + num_duplicates)
+                params = ns.get_params(as_matrix=True)[None,:,:].repeat(1 + num_duplicates, 1, 1) 
+                # perturbation
+                log_params = params.log()
+                new_params = torch.softmax(log_params + perturbation * torch.rand(log_params.size()), dim=2)
+                params = new_params.flatten()
+
             else:
                 params = None
 
