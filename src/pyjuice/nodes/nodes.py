@@ -134,6 +134,10 @@ class CircuitNodes():
     def num_edges(self):
         raise NotImplementedError()
 
+    @property
+    def num_vars(self):
+        return len(self.scope)
+
     def duplicate(self, *args, **kwargs):
         raise ValueError(f"{type(self)} does not support `duplicate`.")
 
