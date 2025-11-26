@@ -89,7 +89,7 @@ def test_hmm_extern():
         chunk_size = 32
     )
     root_ns.init_parameters(perturbation = 2.0)
-    root_ns = augment_input_ns_with_external_distributions(root_ns)
+    root_ns = augment_input_ns_with_external_distributions(root_ns) # Step 1
     pc = juice.TensorCircuit(root_ns)
 
     pc.to(device)
@@ -104,7 +104,7 @@ def test_hmm_extern():
             x = batch[0].long().to(device)
 
             # Assume this is the NN output
-            nn_logprobs = torch.rand([x.size(0), x.size(1), 256], device = device) * 0
+            nn_logprobs = torch.rand([x.size(0), x.size(1), 256], device = device) * 0 # Step 2
 
             # external_soft_evi[b,v] should be the logprob of the v-th variable in the b-th sample
             external_soft_evi = nn_logprobs.gather(2, x[:,:,None])
@@ -112,7 +112,7 @@ def test_hmm_extern():
             # Keep this to keep it compatible with num_latents > 1
             external_soft_evi = external_soft_evi.repeat(1, 1, num_latents)
 
-            unnorm_lls = pc(x.repeat(1, 2), external_soft_evi = external_soft_evi)
+            unnorm_lls = pc(x.repeat(1, 2), external_soft_evi = external_soft_evi) # Step 3: include `.repeat(1, 2)` and the `external_soft_evi` argument
             pc.backward(x.repeat(1, 2), allow_modify_flows = False, logspace_flows = True)
 
             train_ll += unnorm_lls.mean().detach().cpu().numpy().item()
