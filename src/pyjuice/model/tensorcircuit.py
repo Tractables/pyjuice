@@ -517,7 +517,7 @@ class TensorCircuit(nn.Module):
                         getattr(layer, input_layer_fn)(inputs, self.node_flows, self.node_mars, logspace_flows = logspace_flows, **kwargs)
 
                     elif isinstance(input_layer_fn, Callable):
-                        input_layer_fn(layer, inputs, self.node_flows, self.node_mars, logspace_flows = logspace_flows, **kwargs)
+                        ret = input_layer_fn(layer, inputs, self.node_flows, self.node_mars, logspace_flows = logspace_flows, **kwargs)
 
                         # If the layer is not handled by `input_layer_fn`, we assume it will return `False`
                         if not ret and ret is not None:
