@@ -2955,6 +2955,10 @@ class SumLayer(Layer, nn.Module):
 
         grid = (B_NUM_TILES, K_NUM_BLOCKS, layer_n_nodes)
 
+        # Triton seems to produce wrong results when using a (1, 1, 1) grid with BLOCK_B = 1 or 2...
+        if grid[0] == 1 and grid[1] == 1 and grid[2] == 1 and BLOCK_B < 4:
+            BLOCK_B = 4
+
         if grid[2] <= 32768:
             self._bk_triton_sparse_par_kernel[grid](
                 node_flows = node_flows, 
