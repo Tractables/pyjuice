@@ -2948,7 +2948,7 @@ class SumLayer(Layer, nn.Module):
             TILE_SIZE_B = 4 * BLOCK_B
             B_NUM_BLOCKS = 4
         else:
-            TILE_SIZE_B = batch_size
+            TILE_SIZE_B = BATCH_SIZE_NP2
         B_NUM_TILES = triton.cdiv(batch_size, TILE_SIZE_B)
 
         allow_modify_flows = 1 if allow_modify_flows else 0
