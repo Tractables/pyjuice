@@ -91,25 +91,25 @@ class Distribution():
         """
         Return the `fw_mar_fn` to be used by the layer.
         """
-        return self.fw_mar_fn
+        return self.fw_mar_fn if hasattr(self, "fw_mar_fn") else None
 
     def get_bk_flow_fn(self):
         """
         Return the `bk_flow_fn` to be used by the layer.
         """
-        return self.bk_flow_fn
+        return self.bk_flow_fn if hasattr(self, "bk_flow_fn") else None
 
     def get_sample_fn(self):
         """
         Return the `sample_fn` to be used by the layer.
         """
-        return self.sample_fn
+        return self.sample_fn if hasattr(self, "sample_fn") else None
 
     def get_em_fn(self):
         """
         Return the `em_fn` to be used by the layer.
         """
-        return self.em_fn
+        return self.em_fn if hasattr(self, "em_fn") else None
 
     @staticmethod
     def fw_mar_fn(*args, **kwargs):

@@ -307,25 +307,26 @@ class InputLayer(Layer, nn.Module):
 
             grid = (triton.cdiv(layer_num_nodes * batch_size, BLOCK_SIZE),)
 
-            if not _apply_missing_mask_only and self._mars_kernel is not None:
-                self._mars_kernel[grid](
-                    params_ptr = self.params, 
-                    node_mars_ptr = node_mars, 
-                    data_ptr = data, 
-                    vids_ptr = self.vids, 
-                    s_pids_ptr = self.s_pids, 
-                    metadata_ptr = self.metadata, 
-                    s_mids_ptr = self.s_mids, 
-                    fw_local_ids_ptr = fw_local_ids,
-                    layer_num_nodes = layer_num_nodes, 
-                    batch_size = batch_size, 
-                    num_vars_per_node = self.num_vars_per_node, 
-                    nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
-                    node_offset = node_offset, 
-                    BLOCK_SIZE = BLOCK_SIZE, 
-                    partial_eval = 1 if fw_local_ids is not None else 0,
-                    num_warps = 8
-                )
+            if not _apply_missing_mask_only:
+                if self._mars_kernel is not None:
+                    self._mars_kernel[grid](
+                        params_ptr = self.params, 
+                        node_mars_ptr = node_mars, 
+                        data_ptr = data, 
+                        vids_ptr = self.vids, 
+                        s_pids_ptr = self.s_pids, 
+                        metadata_ptr = self.metadata, 
+                        s_mids_ptr = self.s_mids, 
+                        fw_local_ids_ptr = fw_local_ids,
+                        layer_num_nodes = layer_num_nodes, 
+                        batch_size = batch_size, 
+                        num_vars_per_node = self.num_vars_per_node, 
+                        nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
+                        node_offset = node_offset, 
+                        BLOCK_SIZE = BLOCK_SIZE, 
+                        partial_eval = 1 if fw_local_ids is not None else 0,
+                        num_warps = 8
+                    )
             else:
                 assert missing_mask is not None, "`missing_mask` should be provided when `_apply_missing_mask_only = True`."
 
@@ -1342,7 +1343,10 @@ class InputLayer(Layer, nn.Module):
         # Add import commands
         new_src = "import triton\nimport triton.language as tl\nif hasattr(tl.extra.cuda, 'libdevice'):\n    tlmath = tl.extra.cuda.libdevice\nelse:\n    tlmath = tl.math\n\n" + new_src
 
-        # Make a pseudo-function from the source code
-        new_fn = make_function_from_src(new_src)
+        if "NotImplementedError" in new_src:
+            return None
+        else:
+            # Make a pseudo-function from the source code
+            new_fn = make_function_from_src(new_src)
 
-        return triton_jit(new_fn)
+            return triton_jit(new_fn)
