@@ -105,6 +105,7 @@ def _prep_args_apply_ll_bp_kernel(layer, kwargs):
 
     # prepare BLOCK_SIZE and TILE_SIZE_K
     target_kwargs["TILE_SIZE_K"] = min(128, triton.next_power_of_2(target_kwargs["max_num_cats"]))
+    target_kwargs["K_NUM_TILES"] = triton.cdiv(target_kwargs["max_num_cats"], target_kwargs["TILE_SIZE_K"])
     target_kwargs["BLOCK_SIZE"] = 1024 // target_kwargs["TILE_SIZE_K"]
 
     return target_kwargs
@@ -341,7 +342,10 @@ class ExternProductCategorical(Distribution):
             logZ = log_in_p + log_ex_p - logp
 
         # Load flows
+        node_offsets = local_offsets + node_offset
         flows = tl.load(node_flows_ptr + node_offsets * batch_size + batch_offsets, mask = mask, other = 0)
+        if logspace_flows:
+            flows = flows.exp()
 
         if compute_unnorm_logp:
             pf_offsets = s_pfids + data
