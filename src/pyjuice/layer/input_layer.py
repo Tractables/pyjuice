@@ -506,7 +506,6 @@ class InputLayer(Layer, nn.Module):
                     node_offset = node_offset,
                     partial_eval = 1 if bk_local_ids is not None else 0,
                     logspace_flows = logspace_flows,
-                    TILE_SIZE_K = 1,
                     num_warps = 8,
                     **target_kwargs
                 )
