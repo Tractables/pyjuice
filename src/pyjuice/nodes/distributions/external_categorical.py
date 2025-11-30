@@ -97,11 +97,53 @@ def _prep_args_apply_ll_bp_kernel(layer, kwargs):
     target_kwargs["max_num_cats"] = external_categorical_logps.size(2)
 
     # prepare BLOCK_SIZE and TILE_SIZE_K
-    target_kwargs["TILE_SIZE_K"] = min(128, triton.next_power_of_2(target_kwargs["max_num_cats"]))
-    target_kwargs["K_NUM_TILES"] = triton.cdiv(target_kwargs["max_num_cats"], target_kwargs["TILE_SIZE_K"])
-    target_kwargs["BLOCK_SIZE"] = 1024 // target_kwargs["TILE_SIZE_K"]
+    if kwargs["extern_product_categorical_mode"] == "normalizing_constant":
+        target_kwargs["TILE_SIZE_K"] = min(128, triton.next_power_of_2(target_kwargs["max_num_cats"]))
+        target_kwargs["K_NUM_TILES"] = triton.cdiv(target_kwargs["max_num_cats"], target_kwargs["TILE_SIZE_K"])
+        target_kwargs["BLOCK_SIZE"] = 1024 // target_kwargs["TILE_SIZE_K"]
+    else:
+        target_kwargs["TILE_SIZE_K"] = 1
+        target_kwargs["K_NUM_TILES"] = triton.cdiv(target_kwargs["max_num_cats"], target_kwargs["TILE_SIZE_K"])
+        target_kwargs["BLOCK_SIZE"] = 1024 // target_kwargs["TILE_SIZE_K"]
 
     return target_kwargs
+
+
+def _condition_apply_ll_bp_extern_grad_kernel(layer, kwargs):
+    return "extern_product_categorical_mode" in kwargs and \
+        "external_categorical_logps" in kwargs
+
+
+def _prep_args_apply_ll_bp_extern_grad_kernel(layer, kwargs):
+    target_kwargs = dict()
+
+    if kwargs["extern_product_categorical_mode"] == "normalized_ll":
+        compute_unnorm_logp = True
+        compute_logz = True
+    elif kwargs["extern_product_categorical_mode"] == "unnormalized_ll":
+        compute_unnorm_logp = True
+        compute_logz = False
+    elif kwargs["extern_product_categorical_mode"] == "normalizing_constant":
+        compute_unnorm_logp = False
+        compute_logz = True
+    else:
+        raise ValueError("Unexpected `extern_product_categorical_mode`. Should be 'normalized_ll', 'unnormalized_ll', or 'normalizing_constant'.")
+
+    target_kwargs["compute_unnorm_logp"] = compute_unnorm_logp
+    target_kwargs["compute_logz"] = compute_logz
+
+    assert "external_categorical_logps" in kwargs
+    external_categorical_logps = kwargs["external_categorical_logps"]
+    assert external_categorical_logps.dim() == 3
+
+    target_kwargs["external_categorical_logps_ptr"] = external_categorical_logps
+
+    target_kwargs["var_idmapping_ptr"] = layer.var_idmapping
+
+    target_kwargs["ext_num_vars"] = external_categorical_logps.size(1)
+
+    target_kwargs["max_num_cats"] = external_categorical_logps.size(2)
+
 
 
 class ExternProductCategorical(Distribution):
