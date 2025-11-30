@@ -146,6 +146,38 @@ def test_external_categorical_dist_bk_param_only():
 
         assert torch.all(torch.abs(param_flows - my_param_flows) < 1e-5)
 
+    pc.zero_param_flows()
+
+    lls = pc(data, external_categorical_logps = external_categorical_logps, extern_product_categorical_mode = "normalizing_constant")
+    pc.backward(data, logspace_flows = True, allow_modify_flows = False, 
+                external_categorical_logps = external_categorical_logps, extern_product_categorical_mode = "normalizing_constant")
+
+    num_latents = 64
+
+    layer = pc.input_layer_group[0]
+    vids = layer.vids[::num_latents,0]
+    for i in range(pc.num_vars):
+        v = vids[i]
+        sid = layer._output_ind_range[0] + i * num_latents
+        eid = layer._output_ind_range[0] + (i + 1) * num_latents
+
+        internal_params = layer.params[layer.s_pids[i*num_latents:(i+1)*num_latents][:,None] + torch.arange(0, num_cats, device = device)[None,:]]
+        external_params = external_categorical_logps[:,v,:].exp()
+
+        params = internal_params[None,:,:] * external_params[:,None,:]
+        normalized_params = params.log() - params.log().logsumexp(dim = 2, keepdim = True)
+
+        param_flows = layer.param_flows[layer.s_pids[i*num_latents:(i+1)*num_latents][:,None] + torch.arange(0, num_cats, device = device)[None,:]]
+
+        my_param_flows = torch.zeros_like(param_flows)
+
+        for b in range(16):
+            flows = pc.node_flows[sid:eid,b].exp()
+
+            my_param_flows[:,:] += normalized_params[b,:,:].exp() * flows[:,None]
+
+        assert torch.all(torch.abs(param_flows - my_param_flows) < 1e-5)
+
 
 if __name__ == "__main__":
     # test_external_categorical_dist_fw()

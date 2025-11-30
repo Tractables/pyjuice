@@ -326,7 +326,17 @@ class ExternProductCategorical(Distribution):
             pf_offsets = s_pfids + data
             tl.atomic_add(param_flows_ptr + pf_offsets, flows, mask = mask)
         else:
+            # Load logZ from `node_mars`
             logZ = tl.load(node_mars_ptr + node_offsets * batch_size + batch_offsets, mask = mask, other = 0)
+
+            # Ptrs pointing to internal parameters
+            inpars_ptr = params_ptr + s_pids[:,None] + tl.arange(0, TILE_SIZE_K)[None,:] # [BLOCK_SIZE, TILE_SIZE_K]
+
+            # Ptrs pointing to external parameters
+            expars_ptr = external_categorical_logps_ptr + \
+                batch_offsets[:,None] * (ext_num_vars * max_num_cats) + \
+                lvids[:,None] * max_num_cats + \
+                tl.arange(0, TILE_SIZE_K)[None,:]  # [BLOCK_SIZE, TILE_SIZE_K]
 
             parflow_ptrs = param_flows_ptr + s_pfids[:,None] + tl.arange(0, TILE_SIZE_K)[None,:]
             for i in range(K_NUM_TILES):
@@ -338,7 +348,7 @@ class ExternProductCategorical(Distribution):
                 par = inpar.log() + expar
                 parflows = flows[:,None] * tl.exp(par - logZ[:,None])
 
-                tl.atomic_add(parflow_ptrs, parflows, mask = mask)
+                tl.atomic_add(parflow_ptrs, parflows, mask = cat_mask)
 
                 parflow_ptrs += TILE_SIZE_K
 
