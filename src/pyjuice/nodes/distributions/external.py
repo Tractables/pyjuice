@@ -57,15 +57,6 @@ def _prep_args_soft_evi_grad_kernel(layer, kwargs):
 class External(Distribution):
     """
     A class representing user-define distributions (PyJuice only processes the incoming log-probabilities).
-
-    :param val_range: range of the values represented by the distribution
-    :type val_range: Tuple[float,float]
-
-    :param num_cats: number of categories
-    :type num_cats: int
-
-    :param min_std: minimum standard deviation
-    :type min_std: float
     """
 
     def __init__(self):

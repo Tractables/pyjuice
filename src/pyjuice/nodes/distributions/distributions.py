@@ -16,6 +16,12 @@ class Distribution():
         """
         raise NotImplementedError()
 
+    def requires_external_inputs(self):
+        """
+        Check if the distribution requires external inputs.
+        """
+        return "Extern" in self.get_signature()
+
     def get_metadata(self):
         """
         Get the metadata of the current distribution.

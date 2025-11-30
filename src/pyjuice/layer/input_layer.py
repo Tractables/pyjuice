@@ -333,9 +333,10 @@ class InputLayer(Layer, nn.Module):
 
                 target_kwargs = prep_kwargs_fn(self, kwargs)
 
-                BLOCK_SIZE = 1024
+                if not "BLOCK_SIZE" in target_kwargs:
+                    target_kwargs["BLOCK_SIZE"] = 1024
 
-                grid = (triton.cdiv(layer_num_nodes * batch_size, BLOCK_SIZE),)
+                grid = (triton.cdiv(layer_num_nodes * batch_size, target_kwargs["BLOCK_SIZE"]),)
 
                 kernel[grid](
                     params_ptr = self.params, 
@@ -352,7 +353,6 @@ class InputLayer(Layer, nn.Module):
                     num_vars_per_node = self.num_vars_per_node, 
                     nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
                     node_offset = node_offset, 
-                    BLOCK_SIZE = BLOCK_SIZE, 
                     partial_eval = 1 if fw_local_ids is not None else 0,
                     num_warps = 8,
                     **target_kwargs
@@ -480,9 +480,10 @@ class InputLayer(Layer, nn.Module):
 
                 target_kwargs = prep_kwargs_fn(self, kwargs)
 
-                BLOCK_SIZE = 1024
+                if not "BLOCK_SIZE" in target_kwargs:
+                    target_kwargs["BLOCK_SIZE"] = 1024
 
-                grid = (triton.cdiv(layer_num_nodes * batch_size, BLOCK_SIZE),)
+                grid = (triton.cdiv(layer_num_nodes * batch_size, target_kwargs["BLOCK_SIZE"]),)
 
                 kernel[grid](
                     params_ptr = self.params,
@@ -502,8 +503,7 @@ class InputLayer(Layer, nn.Module):
                     num_vars_per_node = self.num_vars_per_node, 
                     num_vars = num_vars,
                     nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
-                    node_offset = node_offset, 
-                    BLOCK_SIZE = BLOCK_SIZE, 
+                    node_offset = node_offset,
                     partial_eval = 1 if bk_local_ids is not None else 0,
                     logspace_flows = logspace_flows,
                     TILE_SIZE_K = 1,
@@ -822,6 +822,12 @@ class InputLayer(Layer, nn.Module):
         Get the data dtype for the distribution.
         """
         return self.nodes[0].get_data_dtype()
+
+    def get_dist(self):
+        """
+        Get the distribution of the input layer.
+        """
+        return self.nodes[0].dist
 
     def enable_partial_evaluation(self, fw_scopes: Optional[Union[Sequence[BitSet],Sequence[int]]] = None, 
                                   bk_scopes: Optional[Union[Sequence[BitSet],Sequence[int]]] = None, return_ids: bool = False):
