@@ -39,20 +39,20 @@ def _prep_args_apply_ll_kernel(layer, kwargs):
     kwargs["compute_unnorm_logp"] = compute_unnorm_logp
     kwargs["compute_logz"] = compute_logz
 
-    assert "extern_product_categorical_logps" in kwargs
-    extern_product_categorical_logps = kwargs["extern_product_categorical_logps"]
-    assert extern_product_categorical_logps.dim() == 3
+    assert "external_categorical_logps" in kwargs
+    external_categorical_logps = kwargs["external_categorical_logps"]
+    assert external_categorical_logps.dim() == 3
 
-    target_kwargs["extern_product_categorical_logps_ptr"] = extern_product_categorical_logps
+    target_kwargs["external_categorical_logps_ptr"] = external_categorical_logps
 
     target_kwargs["var_idmapping_ptr"] = layer.var_idmapping
 
-    target_kwargs["ext_num_vars"] = extern_product_categorical_logps.size(1)
+    target_kwargs["ext_num_vars"] = external_categorical_logps.size(1)
 
     for ns in layer.nodes:
-        assert ns.dist.num_cats <= extern_product_categorical_logps.size(2)
+        assert ns.dist.num_cats <= external_categorical_logps.size(2)
 
-    target_kwargs["max_num_cats"] = extern_product_categorical_logps.size(2)
+    target_kwargs["max_num_cats"] = external_categorical_logps.size(2)
 
     # prepare BLOCK_SIZE and TILE_SIZE_K
     target_kwargs["TILE_SIZE_K"] = min(128, triton.next_power_of_2(target_kwargs["max_num_cats"]))
@@ -83,23 +83,23 @@ def _prep_args_apply_ll_bp_kernel(layer, kwargs):
     kwargs["compute_unnorm_logp"] = compute_unnorm_logp
     kwargs["compute_logz"] = compute_logz
 
-    assert "extern_product_categorical_logps" in kwargs
-    extern_product_categorical_logps = kwargs["extern_product_categorical_logps"]
-    assert extern_product_categorical_logps.dim() == 3
+    assert "external_categorical_logps" in kwargs
+    external_categorical_logps = kwargs["external_categorical_logps"]
+    assert external_categorical_logps.dim() == 3
 
-    target_kwargs["extern_product_categorical_logps_ptr"] = extern_product_categorical_logps
+    target_kwargs["external_categorical_logps_ptr"] = external_categorical_logps
 
     target_kwargs["var_idmapping_ptr"] = layer.var_idmapping
 
-    target_kwargs["ext_num_vars"] = extern_product_categorical_logps.size(1)
+    target_kwargs["ext_num_vars"] = external_categorical_logps.size(1)
 
-    target_kwargs["max_num_cats"] = extern_product_categorical_logps.size(2)
+    target_kwargs["max_num_cats"] = external_categorical_logps.size(2)
 
-    if "extern_product_categorical_logps_grad" in kwargs:
-        target_kwargs["extern_product_categorical_logps_grad_ptr"] = kwargs["extern_product_categorical_logps_grad"]
+    if "external_categorical_logps_grad" in kwargs:
+        target_kwargs["external_categorical_logps_grad_ptr"] = kwargs["external_categorical_logps_grad"]
         target_kwargs["compute_extern_grad"] = True
     else:
-        target_kwargs["extern_product_categorical_logps_grad_ptr"] = None
+        target_kwargs["external_categorical_logps_grad_ptr"] = None
         target_kwargs["compute_extern_grad"] = False
 
     # prepare BLOCK_SIZE and TILE_SIZE_K
@@ -195,7 +195,7 @@ class ExternProductCategorical(Distribution):
                   fw_local_ids_ptr, partial_eval: tl.constexpr, layer_num_nodes: tl.constexpr, batch_size: tl.constexpr, 
                   num_vars_per_node: tl.constexpr, nv_block_size: tl.constexpr, node_offset: tl.constexpr, BLOCK_SIZE: tl.constexpr,
                   TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, compute_unnorm_logp: tl.constexpr, compute_logz: tl.constexpr,
-                  extern_product_categorical_logps_ptr, var_idmapping_ptr, ext_num_vars: tl.constexpr, max_num_cats: tl.constexpr):
+                  external_categorical_logps_ptr, var_idmapping_ptr, ext_num_vars: tl.constexpr, max_num_cats: tl.constexpr):
         pid = tl.program_id(axis = 0)
         block_start = pid * BLOCK_SIZE
 
@@ -227,7 +227,7 @@ class ExternProductCategorical(Distribution):
         inpars_ptr = s_pids[:,None] + tl.arange(0, TILE_SIZE_K)[None,:] # [BLOCK_SIZE, TILE_SIZE_K]
 
         # Ptrs pointing to external parameters
-        expars_ptr = extern_product_categorical_logps_ptr + \
+        expars_ptr = external_categorical_logps_ptr + \
             batch_offsets[:,None] * (ext_num_vars * max_num_cats) + \
             lvids[:,None] * max_num_cats + \
             tl.arange(0, TILE_SIZE_K)[None,:]  # [BLOCK_SIZE, TILE_SIZE_K]
@@ -241,7 +241,9 @@ class ExternProductCategorical(Distribution):
                 inpar = tl.load(inpars_ptr + i * TILE_SIZE_K, mask = cat_mask, other = 0.0)
                 expar = tl.load(expars_ptr + i * TILE_SIZE_K, mask = cat_mask, other = 0.0)
 
-                lpar = (inpar * expar).sum(axis = 1).log()
+                addlpar = inpar.log() + expar
+                addlpar_max = tl.max(addlpar, axis = 1)[:,None]
+                lpar = (addlpar - addlpar_max).exp().sum(axis = 1).log() + addlpar_max
 
                 # Compute log-add-exp(logZ, lpar)
                 maxval = tl.maximum(logZ, lpar)
@@ -260,7 +262,7 @@ class ExternProductCategorical(Distribution):
             data = tl.load(data_ptr + vids * batch_size + batch_offsets, mask = mask, other = 0)
             log_in_p = tl.load(params_ptr + s_pids + data, mask = mask, other = 0.0).log()
             
-            ex_p_ptr = extern_product_categorical_logps_ptr + \
+            ex_p_ptr = external_categorical_logps_ptr + \
                 batch_offsets * (ext_num_vars * max_num_cats) + \
                 lvids * max_num_cats + \
                 data
@@ -285,8 +287,8 @@ class ExternProductCategorical(Distribution):
                      metadata_ptr, s_mids_ptr, nids_ptr, bk_local_ids_ptr, partial_eval: tl.constexpr, logspace_flows: tl.constexpr, layer_num_nodes: tl.constexpr, 
                      batch_size: tl.constexpr, num_vars_per_node: tl.constexpr, num_vars: tl.constexpr, nv_block_size: tl.constexpr, node_offset: tl.constexpr, 
                      BLOCK_SIZE: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, compute_unnorm_logp: tl.constexpr, compute_logz: tl.constexpr,
-                     extern_product_categorical_logps_ptr, var_idmapping_ptr, ext_num_vars: tl.constexpr, max_num_cats: tl.constexpr,
-                     extern_product_categorical_logps_grad_ptr, compute_extern_grad: tl.constexpr):
+                     external_categorical_logps_ptr, var_idmapping_ptr, ext_num_vars: tl.constexpr, max_num_cats: tl.constexpr,
+                     external_categorical_logps_grad_ptr, compute_extern_grad: tl.constexpr):
         pid = tl.program_id(axis = 0)
         block_start = pid * BLOCK_SIZE
 
@@ -324,7 +326,7 @@ class ExternProductCategorical(Distribution):
             # Compute unnormalized log-probabilities
             log_in_p = tl.load(params_ptr + s_pids + data, mask = mask, other = 0.0).log()
             
-            ex_p_ptr = extern_product_categorical_logps_ptr + \
+            ex_p_ptr = external_categorical_logps_ptr + \
                 batch_offsets * (ext_num_vars * max_num_cats) + \
                 lvids * max_num_cats + \
                 data
