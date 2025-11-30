@@ -180,5 +180,5 @@ def test_external_categorical_dist_bk_param_only():
 
 
 if __name__ == "__main__":
-    # test_external_categorical_dist_fw()
+    test_external_categorical_dist_fw()
     test_external_categorical_dist_bk_param_only()
