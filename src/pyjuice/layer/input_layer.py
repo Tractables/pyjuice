@@ -298,13 +298,16 @@ class InputLayer(Layer, nn.Module):
                 fw_local_ids = self.fw_local_ids
 
             if not self.provided("_mars_kernel"):
-                self._mars_kernel = self._compile_triton_kernel(self._mars_kernel_template, mar_fn = self.fw_mar_fn)
+                if self.fw_mar_fn is not None:
+                    self._mars_kernel = self._compile_triton_kernel(self._mars_kernel_template, mar_fn = self.fw_mar_fn)
+                else:
+                    self._mars_kernel = None
 
             BLOCK_SIZE = 1024
 
             grid = (triton.cdiv(layer_num_nodes * batch_size, BLOCK_SIZE),)
 
-            if not _apply_missing_mask_only:
+            if not _apply_missing_mask_only and self._mars_kernel is not None:
                 self._mars_kernel[grid](
                     params_ptr = self.params, 
                     node_mars_ptr = node_mars, 
@@ -438,40 +441,44 @@ class InputLayer(Layer, nn.Module):
                     num_vars = missing_mask.size(0)
 
             if not self.provided("_flows_kernel"):
-                self._flows_kernel = self._compile_triton_kernel(self._flows_kernel_template, flow_fn = self.bk_flow_fn)
+                if self.bk_flow_fn is not None:
+                    self._flows_kernel = self._compile_triton_kernel(self._flows_kernel_template, flow_fn = self.bk_flow_fn)
+                else:
+                    self._flows_kernel = None
 
             BLOCK_SIZE = 1024
             TILE_SIZE_K = 1
 
             grid = (triton.cdiv(layer_num_nodes * batch_size, BLOCK_SIZE),)
 
-            self._flows_kernel[grid](
-                params_ptr = self.params,
-                param_flows_ptr = self.param_flows,
-                node_flows_ptr = node_flows, 
-                node_mars_ptr = node_mars,
-                data_ptr = data, 
-                missing_mask_ptr = missing_mask,
-                vids_ptr = self.vids, 
-                s_pids_ptr = self.s_pids,
-                s_pfids_ptr = self.s_pfids,
-                metadata_ptr = self.metadata, 
-                s_mids_ptr = self.s_mids, 
-                bk_local_ids_ptr = bk_local_ids,
-                layer_num_nodes = layer_num_nodes, 
-                batch_size = batch_size, 
-                num_vars_per_node = self.num_vars_per_node, 
-                num_vars = num_vars,
-                nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
-                node_offset = node_offset, 
-                BLOCK_SIZE = BLOCK_SIZE, 
-                partial_eval = 1 if bk_local_ids is not None else 0,
-                logspace_flows = logspace_flows,
-                missing_mask_mode = missing_mask_mode,
-                pass_type = 0,
-                TILE_SIZE_K = 1,
-                num_warps = 8
-            )
+            if self._flows_kernel is not None:
+                self._flows_kernel[grid](
+                    params_ptr = self.params,
+                    param_flows_ptr = self.param_flows,
+                    node_flows_ptr = node_flows, 
+                    node_mars_ptr = node_mars,
+                    data_ptr = data, 
+                    missing_mask_ptr = missing_mask,
+                    vids_ptr = self.vids, 
+                    s_pids_ptr = self.s_pids,
+                    s_pfids_ptr = self.s_pfids,
+                    metadata_ptr = self.metadata, 
+                    s_mids_ptr = self.s_mids, 
+                    bk_local_ids_ptr = bk_local_ids,
+                    layer_num_nodes = layer_num_nodes, 
+                    batch_size = batch_size, 
+                    num_vars_per_node = self.num_vars_per_node, 
+                    num_vars = num_vars,
+                    nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
+                    node_offset = node_offset, 
+                    BLOCK_SIZE = BLOCK_SIZE, 
+                    partial_eval = 1 if bk_local_ids is not None else 0,
+                    logspace_flows = logspace_flows,
+                    missing_mask_mode = missing_mask_mode,
+                    pass_type = 0,
+                    TILE_SIZE_K = 1,
+                    num_warps = 8
+                )
 
             # Apply post-processing kernels
             for (kernel, cond_fn, prep_kwargs_fn) in self.post_bp_fns:
