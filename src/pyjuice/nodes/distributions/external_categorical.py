@@ -59,7 +59,7 @@ def _prep_args_apply_ll_kernel(layer, kwargs):
     target_kwargs["K_NUM_TILES"] = triton.cdiv(target_kwargs["max_num_cats"], target_kwargs["TILE_SIZE_K"])
     target_kwargs["BLOCK_SIZE"] = 1024 // target_kwargs["TILE_SIZE_K"]
 
-    return target_kwargs
+    return target_kwargs, None
 
 
 def _condition_apply_ll_bp_kernel(layer, kwargs):
@@ -96,17 +96,29 @@ def _prep_args_apply_ll_bp_kernel(layer, kwargs):
 
     target_kwargs["max_num_cats"] = external_categorical_logps.size(2)
 
+    if not layer.provided("fw_local_ids"):
+        layer_num_nodes = layer._output_ind_range[1] - layer._output_ind_range[0]
+    else:
+        layer_num_nodes = layer.fw_local_ids.size(0)
+
     # prepare BLOCK_SIZE and TILE_SIZE_K
     if kwargs["extern_product_categorical_mode"] == "normalizing_constant":
-        target_kwargs["TILE_SIZE_K"] = min(128, triton.next_power_of_2(target_kwargs["max_num_cats"]))
+        target_kwargs["TILE_SIZE_K"] = min(64, triton.next_power_of_2(target_kwargs["max_num_cats"]))
         target_kwargs["K_NUM_TILES"] = triton.cdiv(target_kwargs["max_num_cats"], target_kwargs["TILE_SIZE_K"])
-        target_kwargs["BLOCK_SIZE"] = 1024 // target_kwargs["TILE_SIZE_K"]
+        BATCH_SIZE_NP2 = triton.next_power_of_2(external_categorical_logps.size(0))
+        target_kwargs["BLOCK_SIZE_B"] = min(128, 1024 // target_kwargs["TILE_SIZE_K"], BATCH_SIZE_NP2)
+        target_kwargs["BLOCK_SIZE_N"] = min(128, 1024 // target_kwargs["BLOCK_SIZE_B"] // target_kwargs["TILE_SIZE_K"])
     else:
         target_kwargs["TILE_SIZE_K"] = 1
         target_kwargs["K_NUM_TILES"] = triton.cdiv(target_kwargs["max_num_cats"], target_kwargs["TILE_SIZE_K"])
-        target_kwargs["BLOCK_SIZE"] = 1024 // target_kwargs["TILE_SIZE_K"]
+        BATCH_SIZE_NP2 = triton.next_power_of_2(external_categorical_logps.size(0))
+        target_kwargs["BLOCK_SIZE_B"] = min(128, BATCH_SIZE_NP2)
+        target_kwargs["BLOCK_SIZE_N"] = min(128, 1024 // target_kwargs["BLOCK_SIZE_B"])
 
-    return target_kwargs
+    grid = (triton.cdiv(external_categorical_logps.size(0), target_kwargs["BLOCK_SIZE_B"]),
+            triton.cdiv(layer_num_nodes, target_kwargs["BLOCK_SIZE_N"]))
+
+    return target_kwargs, grid
 
 
 def _condition_apply_ll_bp_extern_grad_kernel(layer, kwargs):
@@ -144,6 +156,9 @@ def _prep_args_apply_ll_bp_extern_grad_kernel(layer, kwargs):
 
     target_kwargs["max_num_cats"] = external_categorical_logps.size(2)
 
+    target_kwargs["TILE_SIZE_K"] = min(128, triton.next_power_of_2(target_kwargs["max_num_cats"]))
+    target_kwargs["K_NUM_TILES"] = triton.cdiv(target_kwargs["max_num_cats"], target_kwargs["TILE_SIZE_K"])
+    target_kwargs["BLOCK_SIZE"] = 1024 // target_kwargs["TILE_SIZE_K"]
 
 
 class ExternProductCategorical(Distribution):
@@ -323,74 +338,79 @@ class ExternProductCategorical(Distribution):
     def ll_bp_kernel(params_ptr, param_flows_ptr, node_flows_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, s_pfids_ptr,
                      metadata_ptr, s_mids_ptr, nids_ptr, bk_local_ids_ptr, partial_eval: tl.constexpr, logspace_flows: tl.constexpr, layer_num_nodes: tl.constexpr, 
                      batch_size: tl.constexpr, num_vars_per_node: tl.constexpr, num_vars: tl.constexpr, nv_block_size: tl.constexpr, node_offset: tl.constexpr, 
-                     BLOCK_SIZE: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, compute_unnorm_logp: tl.constexpr, compute_logz: tl.constexpr,
+                     BLOCK_SIZE_B: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, compute_unnorm_logp: tl.constexpr, compute_logz: tl.constexpr,
                      external_categorical_logps_ptr, var_idmapping_ptr, ext_num_vars: tl.constexpr, max_num_cats: tl.constexpr):
-        pid = tl.program_id(axis = 0)
-        block_start = pid * BLOCK_SIZE
+        pid_b = tl.program_id(axis = 0)
+        pid_n = tl.program_id(axis = 1)
 
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < layer_num_nodes * batch_size
+        offsets_b = pid_b * BLOCK_SIZE_B + tl.arange(0, BLOCK_SIZE_B)
+        offsets_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
 
-        # Raw batch and (local) node id
-        batch_offsets = (offsets % batch_size)
-        local_offsets = (offsets // batch_size)
+        mask_b = offsets_b < batch_size
+        mask_n = offsets_n < layer_num_nodes
 
         if partial_eval > 0:
-            local_offsets = tl.load(bk_local_ids_ptr + local_offsets, mask = mask, other = 0)
+            offsets_n = tl.load(bk_local_ids_ptr + offsets_n, mask = mask, other = 0)
 
         # Get all variable ids
-        vids = tl.load(vids_ptr + local_offsets, mask = mask, other = 0)
-        lvids = tl.load(var_idmapping_ptr + vids, mask = mask, other = 0)
-
-        # Get all latent offsets
-        nids = tl.load(nids_ptr + local_offsets, mask = mask, other = 0)
+        vids = tl.load(vids_ptr + offsets_n, mask = mask_n, other = 0) # [BLOCK_SIZE_N]
+        lvids = tl.load(var_idmapping_ptr + vids, mask = mask_n, other = 0) # [BLOCK_SIZE_N]
 
         # Get `num_cats` from `metadata`
-        s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
-        num_cats = tl.load(metadata_ptr + s_mids, mask = mask, other = 0).to(tl.int64) # [BLOCK_SIZE]
+        s_mids = tl.load(s_mids_ptr + offsets_n, mask = mask_n, other = 0) # [BLOCK_SIZE_N]
+        num_cats = tl.load(metadata_ptr + s_mids, mask = mask_n, other = 0).to(tl.int64) # [BLOCK_SIZE_N]
 
         # Get start parameter indices
-        s_pids = tl.load(s_pids_ptr + local_offsets, mask = mask, other = 0)
+        s_pids = tl.load(s_pids_ptr + offsets_n, mask = mask_n, other = 0) # [BLOCK_SIZE_N]
 
         # Get start parameter flow indices
-        s_pfids = tl.load(s_pfids_ptr + local_offsets, mask = mask, other = 0)
+        s_pfids = tl.load(s_pfids_ptr + offsets_n, mask = mask_n, other = 0) # [BLOCK_SIZE_N]
 
         # Get data
-        data = tl.load(data_ptr + vids * batch_size + batch_offsets, mask = mask, other = 0)
+        mask = mask_n[:,None] & mask_b[None,:]
+        data = tl.load(data_ptr + vids[:,None] * batch_size + offsets_b[None,:], mask = mask, other = 0) # [BLOCK_SIZE_N, BLOCK_SIZE_B]
 
         # Load flows
-        node_offsets = local_offsets + node_offset
-        flows = tl.load(node_flows_ptr + node_offsets * batch_size + batch_offsets, mask = mask, other = 0)
+        flows = tl.load(
+            node_flows_ptr + (offsets_n[:,None] + node_offset) * batch_size + offsets_b[None,:], 
+            mask = mask, 
+            other = 0
+        ) # [BLOCK_SIZE_N, BLOCK_SIZE_B]
+
         if logspace_flows:
             flows = flows.exp()
 
         if compute_unnorm_logp:
-            pf_offsets = s_pfids + data
-            tl.atomic_add(param_flows_ptr + pf_offsets, flows, mask = mask)
+            tl.atomic_add(param_flows_ptr + s_pfids[:,None] + data, flows, mask = mask)
         else:
             # Load logZ from `node_mars`
-            logZ = tl.load(node_mars_ptr + node_offsets * batch_size + batch_offsets, mask = mask, other = 0)
+            logZ = tl.load(
+                node_mars_ptr + (offsets_n[:,None] + node_offset) * batch_size + offsets_b[None,:], 
+                mask = mask, 
+                other = 0
+            ) # [BLOCK_SIZE_N, BLOCK_SIZE_B]
 
             # Ptrs pointing to internal parameters
             inpars_ptr = params_ptr + s_pids[:,None] + tl.arange(0, TILE_SIZE_K)[None,:] # [BLOCK_SIZE, TILE_SIZE_K]
 
             # Ptrs pointing to external parameters
             expars_ptr = external_categorical_logps_ptr + \
-                batch_offsets[:,None] * (ext_num_vars * max_num_cats) + \
-                lvids[:,None] * max_num_cats + \
-                tl.arange(0, TILE_SIZE_K)[None,:]  # [BLOCK_SIZE, TILE_SIZE_K]
+                offsets_b[None,:,None] * (ext_num_vars * max_num_cats) + \
+                lvids[:,None,None] * max_num_cats + \
+                tl.arange(0, TILE_SIZE_K)[None,None,:]  # [BLOCK_SIZE_N, BLOCK_SIZE_B, TILE_SIZE_K]
 
-            parflow_ptrs = param_flows_ptr + s_pfids[:,None] + tl.arange(0, TILE_SIZE_K)[None,:]
+            parflow_ptrs = param_flows_ptr + s_pfids[:,None] + tl.arange(0, TILE_SIZE_K)[None,:] # [BLOCK_SIZE_N, TILE_SIZE_K]
             for i in range(K_NUM_TILES):
-                cat_mask = mask[:,None] & (i * TILE_SIZE_K + tl.arange(0, TILE_SIZE_K)[None,:] < num_cats[:,None])
+                cat_mask_in = mask_n[:,None] & (i * TILE_SIZE_K + tl.arange(0, TILE_SIZE_K)[None,:] < num_cats[:,None]) # [BLOCK_SIZE_N, TILE_SIZE_K]
+                cat_mask_ex = mask[:,:,None] & (i * TILE_SIZE_K + tl.arange(0, TILE_SIZE_K)[None,None,:] < num_cats[:,None,None]) # [BLOCK_SIZE_N, BLOCK_SIZE_B, TILE_SIZE_K]
 
-                inpar = tl.load(inpars_ptr + i * TILE_SIZE_K, mask = cat_mask, other = 0.0)
-                expar = tl.load(expars_ptr + i * TILE_SIZE_K, mask = cat_mask, other = 0.0)
+                inpar = tl.load(inpars_ptr + i * TILE_SIZE_K, mask = cat_mask_in, other = 0.0) # [BLOCK_SIZE_N, TILE_SIZE_K]
+                expar = tl.load(expars_ptr + i * TILE_SIZE_K, mask = cat_mask_ex, other = 0.0) # [BLOCK_SIZE_N, BLOCK_SIZE_B, TILE_SIZE_K]
 
-                par = inpar.log() + expar
-                parflows = flows[:,None] * tl.exp(par - logZ[:,None])
+                par = inpar[:,None,:].log() + expar
+                parflows = flows[:,:,None] * tl.exp(par - logZ[:,:,None])
 
-                tl.atomic_add(parflow_ptrs, parflows, mask = cat_mask)
+                tl.atomic_add(parflow_ptrs, tl.sum(parflows, axis = 1), mask = cat_mask_in)
 
                 parflow_ptrs += TILE_SIZE_K
 

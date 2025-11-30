@@ -29,7 +29,9 @@ def _prep_args_apply_soft_evi_kernel(layer, kwargs):
 
     target_kwargs["max_num_latents"] = external_soft_evi.size(2)
 
-    return target_kwargs
+    target_kwargs["BLOCK_SIZE"] = 1024
+
+    return target_kwargs, None
 
 
 def _condition_soft_evi_grad_kernel(layer, kwargs):
@@ -51,7 +53,9 @@ def _prep_args_soft_evi_grad_kernel(layer, kwargs):
 
     target_kwargs["max_num_latents"] = external_soft_evi_grad.size(2)
 
-    return target_kwargs
+    target_kwargs["BLOCK_SIZE"] = 1024
+
+    return target_kwargs, None
 
 
 class External(Distribution):

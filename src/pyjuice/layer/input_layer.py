@@ -335,12 +335,10 @@ class InputLayer(Layer, nn.Module):
                 if not cond_fn(self, kwargs):
                     continue
 
-                target_kwargs = prep_kwargs_fn(self, kwargs)
+                target_kwargs, grid = prep_kwargs_fn(self, kwargs)
 
-                if not "BLOCK_SIZE" in target_kwargs:
-                    target_kwargs["BLOCK_SIZE"] = 1024
-
-                grid = (triton.cdiv(layer_num_nodes * batch_size, target_kwargs["BLOCK_SIZE"]),)
+                if grid is None:
+                    grid = (triton.cdiv(layer_num_nodes * batch_size, target_kwargs["BLOCK_SIZE"]),)
 
                 kernel[grid](
                     params_ptr = self.params, 
@@ -486,12 +484,10 @@ class InputLayer(Layer, nn.Module):
                 if not cond_fn(self, kwargs):
                     continue
 
-                target_kwargs = prep_kwargs_fn(self, kwargs)
+                target_kwargs, grid = prep_kwargs_fn(self, kwargs)
 
-                if not "BLOCK_SIZE" in target_kwargs:
-                    target_kwargs["BLOCK_SIZE"] = 1024
-
-                grid = (triton.cdiv(layer_num_nodes * batch_size, target_kwargs["BLOCK_SIZE"]),)
+                if grid is None:
+                    grid = (triton.cdiv(layer_num_nodes * batch_size, target_kwargs["BLOCK_SIZE"]),)
 
                 kernel[grid](
                     params_ptr = self.params,
