@@ -40,7 +40,9 @@ def _prep_args_apply_normalized_ll_kernel(layer, kwargs):
 
     target_kwargs["max_num_cats"] = extern_product_categorical_logps.size(2)
 
-    # TODO: BLOCK_SIZE and TILE_SIZE_K should be prepared here as well
+    # prepare BLOCK_SIZE and TILE_SIZE_K
+    target_kwargs["TILE_SIZE_K"] = min(128, triton.next_power_of_2(target_kwargs["max_num_cats"]))
+    target_kwargs["BLOCK_SIZE"] = 1024 // target_kwargs["TILE_SIZE_K"]
 
     return target_kwargs
 
