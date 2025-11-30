@@ -36,8 +36,8 @@ def _prep_args_apply_ll_kernel(layer, kwargs):
     else:
         raise ValueError("Unexpected `extern_product_categorical_mode`. Should be 'normalized_ll', 'unnormalized_ll', or 'normalizing_constant'.")
 
-    kwargs["compute_unnorm_logp"] = compute_unnorm_logp
-    kwargs["compute_logz"] = compute_logz
+    target_kwargs["compute_unnorm_logp"] = compute_unnorm_logp
+    target_kwargs["compute_logz"] = compute_logz
 
     assert "external_categorical_logps" in kwargs
     external_categorical_logps = kwargs["external_categorical_logps"]
@@ -56,6 +56,7 @@ def _prep_args_apply_ll_kernel(layer, kwargs):
 
     # prepare BLOCK_SIZE and TILE_SIZE_K
     target_kwargs["TILE_SIZE_K"] = min(128, triton.next_power_of_2(target_kwargs["max_num_cats"]))
+    target_kwargs["K_NUM_TILES"] = triton.cdiv(target_kwargs["max_num_cats"], target_kwargs["TILE_SIZE_K"])
     target_kwargs["BLOCK_SIZE"] = 1024 // target_kwargs["TILE_SIZE_K"]
 
     return target_kwargs
@@ -80,8 +81,8 @@ def _prep_args_apply_ll_bp_kernel(layer, kwargs):
     else:
         raise ValueError("Unexpected `extern_product_categorical_mode`. Should be 'normalized_ll', 'unnormalized_ll', or 'normalizing_constant'.")
 
-    kwargs["compute_unnorm_logp"] = compute_unnorm_logp
-    kwargs["compute_logz"] = compute_logz
+    target_kwargs["compute_unnorm_logp"] = compute_unnorm_logp
+    target_kwargs["compute_logz"] = compute_logz
 
     assert "external_categorical_logps" in kwargs
     external_categorical_logps = kwargs["external_categorical_logps"]
@@ -224,7 +225,7 @@ class ExternProductCategorical(Distribution):
         s_pids = tl.load(s_pids_ptr + local_offsets, mask = mask, other = 0)
 
         # Ptrs pointing to internal parameters
-        inpars_ptr = s_pids[:,None] + tl.arange(0, TILE_SIZE_K)[None,:] # [BLOCK_SIZE, TILE_SIZE_K]
+        inpars_ptr = params_ptr + s_pids[:,None] + tl.arange(0, TILE_SIZE_K)[None,:] # [BLOCK_SIZE, TILE_SIZE_K]
 
         # Ptrs pointing to external parameters
         expars_ptr = external_categorical_logps_ptr + \
@@ -242,8 +243,8 @@ class ExternProductCategorical(Distribution):
                 expar = tl.load(expars_ptr + i * TILE_SIZE_K, mask = cat_mask, other = 0.0)
 
                 addlpar = inpar.log() + expar
-                addlpar_max = tl.max(addlpar, axis = 1)[:,None]
-                lpar = (addlpar - addlpar_max).exp().sum(axis = 1).log() + addlpar_max
+                addlpar_max = tl.max(addlpar, axis = 1)
+                lpar = (addlpar - addlpar_max[:,None]).exp().sum(axis = 1).log() + addlpar_max
 
                 # Compute log-add-exp(logZ, lpar)
                 maxval = tl.maximum(logZ, lpar)
@@ -266,7 +267,7 @@ class ExternProductCategorical(Distribution):
                 batch_offsets * (ext_num_vars * max_num_cats) + \
                 lvids * max_num_cats + \
                 data
-            log_ex_p = tl.load(ex_p_ptr, mask = mask, other = 0.0).log()
+            log_ex_p = tl.load(ex_p_ptr, mask = mask, other = 0.0)
         else:
             log_in_p = tl.zeros([BLOCK_SIZE], dtype = tl.float32)
             log_ex_p = tl.zeros([BLOCK_SIZE], dtype = tl.float32)
@@ -345,17 +346,6 @@ class ExternProductCategorical(Distribution):
         if compute_unnorm_logp:
             pf_offsets = s_pfids + data
             tl.atomic_add(param_flows_ptr + pf_offsets, flows, mask = mask)
-
-    @staticmethod
-    def fw_mar_fn(local_offsets, data, params_ptr, s_pids, metadata_ptr, s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE):
-        log_probs = tl.where(data == 0, 0.0, 0.0)
-
-        return log_probs
-
-    @staticmethod
-    def bk_flow_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
-                   s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE):
-        pass
 
     @staticmethod
     def bk_flow_mask_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
