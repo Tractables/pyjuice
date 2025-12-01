@@ -12,6 +12,7 @@ import random
 from typing import Sequence, Dict, Optional
 from triton.runtime.jit import JITFunction
 from copy import deepcopy
+from functools import reduce
 
 # In the latest triton, math functions were shuffled around into different modules:
 # https://github.com/openai/triton/pull/3172
@@ -240,6 +241,8 @@ class InputLayer(Layer, nn.Module):
         self.device = torch.device("cpu")
 
         self._used_external_params = False
+
+        self.n_block_size = self._get_num_nodes_gcd()
 
         # Batch size of parameters in the previous forward pass
         self._param_batch_size = 1
@@ -1346,3 +1349,14 @@ class InputLayer(Layer, nn.Module):
             new_fn = make_function_from_src(new_src)
 
             return triton_jit(new_fn)
+
+    def _get_num_nodes_gcd(self):
+        vids = self.vids.detach().clone().cuda()
+
+        max_v = vids.max()
+        v = (vids * (max_v ** torch.arange(0, vids.size(1), device = vids.device))[None,:]).sum(dim = 1)
+
+        _, counts = torch.unique_consecutive(v, return_counts = True)
+        result = reduce(torch.gcd, counts)
+
+        return result.item()

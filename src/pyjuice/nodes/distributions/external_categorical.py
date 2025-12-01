@@ -17,6 +17,20 @@ else:
     tlmath = tl.math
 
 
+def max_power_of_2_factor(n):
+    if n == 0:
+        return 0
+    if n % 2 != 0:
+        return 1
+
+    power_of_2 = 1
+    while n % 2 == 0:
+        power_of_2 *= 2
+        n //= 2  # Use integer division
+
+    return power_of_2
+
+
 def _condition_apply_ll_kernel(layer, kwargs):
     return "extern_product_categorical_mode" in kwargs
 
@@ -149,8 +163,11 @@ def _prep_args_apply_ll_bp_extern_grad_kernel(layer, kwargs):
     assert external_categorical_logps.dim() == 3
 
     assert "external_categorical_logps_grad" in kwargs
-    assert kwargs["external_categorical_logps_grad"].shape == external_categorical_logps.shape
+    external_categorical_logps_grad = kwargs["external_categorical_logps_grad"]
+    assert external_categorical_logps_grad.shape == external_categorical_logps.shape
     target_kwargs["external_categorical_logps_grad_ptr"] = external_categorical_logps_grad
+
+    external_categorical_logps_grad.zero_()
 
     target_kwargs["external_categorical_logps_ptr"] = external_categorical_logps
 
@@ -160,15 +177,22 @@ def _prep_args_apply_ll_bp_extern_grad_kernel(layer, kwargs):
 
     target_kwargs["max_num_cats"] = external_categorical_logps.size(2)
 
+    n_block_size = max_power_of_2_factor(layer.n_block_size)
+
+    if not layer.provided("fw_local_ids"):
+        layer_num_nodes = layer._output_ind_range[1] - layer._output_ind_range[0]
+    else:
+        layer_num_nodes = layer.fw_local_ids.size(0)
+
     target_kwargs["TILE_SIZE_K"] = min(64, triton.next_power_of_2(target_kwargs["max_num_cats"]))
     target_kwargs["K_NUM_TILES"] = triton.cdiv(target_kwargs["max_num_cats"], target_kwargs["TILE_SIZE_K"])
     BATCH_SIZE_NP2 = triton.next_power_of_2(external_categorical_logps.size(0))
     target_kwargs["BLOCK_SIZE_B"] = min(128, 1024 // target_kwargs["TILE_SIZE_K"], BATCH_SIZE_NP2)
-    target_kwargs["BLOCK_SIZE_N"] = min(128, 1024 // target_kwargs["BLOCK_SIZE_B"], 1024 // target_kwargs["TILE_SIZE_K"]) # TODO: need to change this 128....
+    target_kwargs["BLOCK_SIZE_N"] = min(n_block_size, 1024 // target_kwargs["BLOCK_SIZE_B"], 1024 // target_kwargs["TILE_SIZE_K"])
 
     target_kwargs["use_tensor_core"] = (target_kwargs["TILE_SIZE_K"] >= 16) and \
-                                       (target_kwargs["TILE_SIZE_B"] >= 16) and \
-                                       (target_kwargs["TILE_SIZE_N"] >= 16)
+                                       (target_kwargs["BLOCK_SIZE_B"] >= 16) and \
+                                       (target_kwargs["BLOCK_SIZE_N"] >= 16)
 
     grid = (triton.cdiv(external_categorical_logps.size(0), target_kwargs["BLOCK_SIZE_B"]),
             triton.cdiv(layer_num_nodes, target_kwargs["BLOCK_SIZE_N"]))
@@ -195,7 +219,8 @@ class ExternProductCategorical(Distribution):
         ]
 
         self.post_bp_fns = [
-            (self.ll_bp_kernel, _condition_apply_ll_bp_kernel, _prep_args_apply_ll_bp_kernel)
+            (self.ll_bp_kernel, _condition_apply_ll_bp_kernel, _prep_args_apply_ll_bp_kernel),
+            (self.ll_bp_extern_grad_kernel, _condition_apply_ll_bp_extern_grad_kernel, _prep_args_apply_ll_bp_extern_grad_kernel)
         ]
 
     def get_signature(self):
@@ -432,12 +457,12 @@ class ExternProductCategorical(Distribution):
 
     @staticmethod
     @triton_jit
-    def ll_bp_extern_grad(params_ptr, param_flows_ptr, node_flows_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, s_pfids_ptr,
-                          metadata_ptr, s_mids_ptr, nids_ptr, bk_local_ids_ptr, partial_eval: tl.constexpr, logspace_flows: tl.constexpr, layer_num_nodes: tl.constexpr, 
-                          batch_size: tl.constexpr, num_vars_per_node: tl.constexpr, num_vars: tl.constexpr, nv_block_size: tl.constexpr, node_offset: tl.constexpr, 
-                          BLOCK_SIZE_B: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, compute_unnorm_logp: tl.constexpr, 
-                          compute_logz: tl.constexpr, external_categorical_logps_ptr, external_categorical_logps_grad_ptr, var_idmapping_ptr, ext_num_vars: tl.constexpr, 
-                          max_num_cats: tl.constexpr, use_tensor_core: tl.constexpr):
+    def ll_bp_extern_grad_kernel(params_ptr, param_flows_ptr, node_flows_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, s_pfids_ptr,
+                                 metadata_ptr, s_mids_ptr, nids_ptr, bk_local_ids_ptr, partial_eval: tl.constexpr, logspace_flows: tl.constexpr, layer_num_nodes: tl.constexpr, 
+                                 batch_size: tl.constexpr, num_vars_per_node: tl.constexpr, num_vars: tl.constexpr, nv_block_size: tl.constexpr, node_offset: tl.constexpr, 
+                                 BLOCK_SIZE_B: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, compute_unnorm_logp: tl.constexpr, 
+                                 compute_logz: tl.constexpr, external_categorical_logps_ptr, external_categorical_logps_grad_ptr, var_idmapping_ptr, ext_num_vars: tl.constexpr, 
+                                 max_num_cats: tl.constexpr, use_tensor_core: tl.constexpr):
         pid_b = tl.program_id(axis = 0)
         pid_n = tl.program_id(axis = 1)
 
@@ -454,12 +479,12 @@ class ExternProductCategorical(Distribution):
             offset_n = pid_n * BLOCK_SIZE_N
 
         # Get all variable ids
-        vid = tl.load(vids_ptr + offset_n, mas) # [1]
+        vid = tl.load(vids_ptr + offset_n) # [1]
         lvid = tl.load(var_idmapping_ptr + vid) # [1]
 
         # Get `num_cats` from `metadata`
-        s_mids = tl.load(s_mids_ptr + offset_n, mask = mask_n, other = 0) # [1]
-        num_cats = tl.load(metadata_ptr + s_mids, mask = mask_n, other = 0).to(tl.int64) # [1]
+        s_mids = tl.load(s_mids_ptr + offset_n) # [1]
+        num_cats = tl.load(metadata_ptr + s_mids).to(tl.int64) # [1]
 
         # Get start parameter indices
         s_pids = tl.load(s_pids_ptr + offsets_n, mask = mask_n, other = 0) # [BLOCK_SIZE_N]
@@ -486,18 +511,33 @@ class ExternProductCategorical(Distribution):
                 offsets_b * ext_num_vars * max_num_cats + \
                 lvid * max_num_cats # [BLOCK_SIZE_B]
 
-            tl.store(expars_grad_ptr + data, tl.sum(flows, axis = 1), mask = mask_b)
+            tl.atomic_add(expars_grad_ptr + data, tl.sum(flows, axis = 1), mask = mask_b)
 
         if compute_logz:
-            # Load logZ from `node_mars`
-            logZ = tl.load(
+            # Load mars from `node_mars`
+            mars = tl.load(
                 node_mars_ptr + (offsets_n[None,:] + node_offset) * batch_size + offsets_b[:,None], 
                 mask = mask, 
                 other = 0
             ) # [BLOCK_SIZE_B, BLOCK_SIZE_N]
+
+            if compute_unnorm_logp:
+                target_expars_ptr = external_categorical_logps_ptr + \
+                    offsets_b * (ext_num_vars * max_num_cats) + \
+                    lvid * max_num_cats + \
+                    data # [BLOCK_SIZE_B]
+                target_expar = tl.load(target_expars_ptr, mask = mask_b, other = 0.0)
+
+                target_inpars_ptr = params_ptr + s_pids[None,:] + data[:,None]
+                target_inpar = tl.load(target_inpars_ptr, mask = mask, other = 0.0) # [BLOCK_SIZE_B, BLOCK_SIZE_N]
+
+                logZ = target_inpar.log() + target_expar[:,None] - mars
+            else:
+                logZ = mars
             
-            neg_logZ_max = tl.max(-logZ, axis = 1)[:,None]
-            neg_logZ_sub = (-logZ - neg_logZ_max).exp()
+            fsublogZ = tl.log(flows) - logZ
+            fsublogZ_max = tl.max(fsublogZ, axis = 1)[:,None]
+            fsublogZ_sub = (fsublogZ - fsublogZ_max).exp()
 
             # Ptrs pointing to internal parameters
             inpars_ptr = params_ptr + s_pids[:,None] + tl.arange(0, TILE_SIZE_K)[None,:] # [BLOCK_SIZE_N, TILE_SIZE_K]
@@ -521,16 +561,16 @@ class ExternProductCategorical(Distribution):
                 expar = tl.load(expars_ptr + i * TILE_SIZE_K, mask = cat_mask_ex, other = 0.0) # [BLOCK_SIZE_B, TILE_SIZE_K]
 
                 if use_tensor_core:
-                    acc = tl.dot(neg_logZ_sub, inpar).log() + neg_logZ_max
+                    acc = tl.dot(fsublogZ_sub, inpar).log() + fsublogZ_max
                 else:
-                    acc = tl.sum(neg_logZ_sub[:,:,None] * inpar[None,:,:], axis = 1).log() + neg_logZ_max
-
-                parflows = flows[:,None] * tl.exp(acc + expar)
+                    acc = tl.sum(fsublogZ_sub[:,:,None] * inpar[None,:,:], axis = 1).log() + fsublogZ_max
 
                 if compute_unnorm_logp:
-                    tl.atomic_add(expars_grad_ptr + i * TILE_SIZE_K, -parflows, mask = cat_mask_ex)
+                    parflows = -1.0 * tl.exp(acc + expar) # [BLOCK_SIZE_B, TILE_SIZE_K]
                 else:
-                    tl.atomic_add(expars_grad_ptr + i * TILE_SIZE_K, parflows, mask = cat_mask_ex)
+                    parflows = tl.exp(acc + expar) # [BLOCK_SIZE_B, TILE_SIZE_K]
+
+                tl.atomic_add(expars_grad_ptr + i * TILE_SIZE_K, parflows, mask = cat_mask_ex)
 
     @staticmethod
     def bk_flow_mask_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
