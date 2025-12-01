@@ -920,7 +920,7 @@ class TensorCircuit(nn.Module):
                         )
 
                         # Special treatment for input layers with the `External` distribution
-                        if input_layer.dist_signature == "External":
+                        if input_layer.get_dist().requires_external_inputs():
                             scope = BitSet()
                             for ns in input_layer.nodes:
                                 scope |= ns.scope

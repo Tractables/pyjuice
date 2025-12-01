@@ -29,7 +29,9 @@ def _prep_args_apply_soft_evi_kernel(layer, kwargs):
 
     target_kwargs["max_num_latents"] = external_soft_evi.size(2)
 
-    return target_kwargs
+    target_kwargs["BLOCK_SIZE"] = 1024
+
+    return target_kwargs, None
 
 
 def _condition_soft_evi_grad_kernel(layer, kwargs):
@@ -51,21 +53,14 @@ def _prep_args_soft_evi_grad_kernel(layer, kwargs):
 
     target_kwargs["max_num_latents"] = external_soft_evi_grad.size(2)
 
-    return target_kwargs
+    target_kwargs["BLOCK_SIZE"] = 1024
+
+    return target_kwargs, None
 
 
 class External(Distribution):
     """
     A class representing user-define distributions (PyJuice only processes the incoming log-probabilities).
-
-    :param val_range: range of the values represented by the distribution
-    :type val_range: Tuple[float,float]
-
-    :param num_cats: number of categories
-    :type num_cats: int
-
-    :param min_std: minimum standard deviation
-    :type min_std: float
     """
 
     def __init__(self):
@@ -153,7 +148,7 @@ class External(Distribution):
     def soft_evi_grad_kernel(params_ptr, param_flows_ptr, node_flows_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, s_pfids_ptr,
                              metadata_ptr, s_mids_ptr, nids_ptr, bk_local_ids_ptr, partial_eval: tl.constexpr, logspace_flows: tl.constexpr, layer_num_nodes: tl.constexpr, 
                              batch_size: tl.constexpr, num_vars_per_node: tl.constexpr, num_vars: tl.constexpr, nv_block_size: tl.constexpr, node_offset: tl.constexpr, 
-                             BLOCK_SIZE: tl.constexpr, TILE_SIZE_K: tl.constexpr, external_soft_evi_grad_ptr, var_idmapping_ptr, ext_num_vars: tl.constexpr, max_num_latents: tl.constexpr):
+                             BLOCK_SIZE: tl.constexpr, external_soft_evi_grad_ptr, var_idmapping_ptr, ext_num_vars: tl.constexpr, max_num_latents: tl.constexpr):
         pid = tl.program_id(axis = 0)
         block_start = pid * BLOCK_SIZE
 
