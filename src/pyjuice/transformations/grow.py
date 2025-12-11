@@ -86,7 +86,7 @@ def grow(root_ns: CircuitNodes, num_duplicates: int, perturbation: float = 0.0):
                 edge_ids = edge_ids, 
                 params = params, 
                 num_node_blocks = num_node_blocks * (1 + num_duplicates),
-                block_size = block_size
+                block_size = ns.block_size
             )
 
             if ns.is_tied():

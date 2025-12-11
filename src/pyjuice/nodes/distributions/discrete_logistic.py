@@ -23,12 +23,15 @@ class DiscreteLogistic(Distribution):
     :type min_std: float
     """
 
-    def __init__(self, val_range: Tuple[float,float], num_cats: int, min_std: float = 0.01):
+    def __init__(self, val_range: Tuple[float,float], num_cats: int, min_std: float = 0.01, input_type: str = "discrete"):
         super(DiscreteLogistic, self).__init__()
 
         self.val_range = val_range
         self.num_cats = num_cats
         self.min_std = min_std
+
+        self.input_type = input_type
+        assert input_type == "discrete" # Only support discrete inputs for now..
 
     def get_signature(self):
         """
@@ -196,4 +199,4 @@ class DiscreteLogistic(Distribution):
         tl.store(params_ptr + s_pids + 1, updated_s, mask = mask)
 
     def _get_constructor(self):
-        return DiscreteLogistic, {"val_range": self.val_range, "num_cats": self.num_cats, "min_std": self.min_std}
+        return DiscreteLogistic, {"val_range": self.val_range, "num_cats": self.num_cats, "min_std": self.min_std, "input_type": self.input_type}
