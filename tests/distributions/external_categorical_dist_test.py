@@ -75,6 +75,49 @@ def test_external_categorical_dist_fw():
         assert torch.all(torch.abs(pc_mars - logz) < 1e-4)
 
 
+def test_external_categorical_dist_fw_dim2():
+
+    num_cats = 3298
+    
+    ni0 = inputs(0, num_node_blocks = 2, block_size = 32, dist = dists.ExternProductCategorical(num_cats = num_cats))
+    ni1 = inputs(1, num_node_blocks = 2, block_size = 32, dist = dists.ExternProductCategorical(num_cats = num_cats))
+
+    ms = multiply(ni0, ni1, edge_ids = torch.tensor([[0, 0], [0, 1], [1, 0], [1, 1]], dtype = torch.long))
+    ns = summate(ms, edge_ids = torch.tensor([[0, 0, 0, 0, 1, 1, 1, 1], [0, 1, 2, 3, 0, 1, 2, 3]], dtype = torch.long), block_size = 1)
+
+    pc = TensorCircuit(ns)
+
+    device = torch.device("cuda:0")
+    pc.to(device)
+
+    data = torch.randint(0, num_cats, [16, 2]).to(device)
+
+    external_categorical_logps = torch.rand([16, 2], device = device).log()
+
+    lls = pc(data, external_categorical_logps = external_categorical_logps, extern_product_categorical_mode = "unnormalized_ll")
+
+    unnorm_node_mars = pc.node_mars.detach().clone()
+
+    num_latents = 64
+
+    layer = pc.input_layer_group[0]
+    vids = layer.vids[::num_latents,0]
+    for i in range(pc.num_vars):
+        v = vids[i]
+        sid = layer._output_ind_range[0] + i * num_latents
+        eid = layer._output_ind_range[0] + (i + 1) * num_latents
+
+        internal_params = layer.params[layer.s_pids[i*num_latents:(i+1)*num_latents][:,None] + torch.arange(0, num_cats, device = device)[None,:]]
+        external_params = external_categorical_logps[:,v].exp()
+
+        params = internal_params[None,:,:] * external_params[:,None,None]
+
+        unnormalized_logp = params.gather(2, data[:,v][:,None,None].expand(16, num_latents, 1)).squeeze(-1).log()
+
+        pc_mars = unnorm_node_mars[sid:eid,:].permute(1, 0)
+        assert torch.all(torch.abs(pc_mars - unnormalized_logp) < 1e-4)
+
+
 def test_external_categorical_dist_bk_param_only():
 
     num_cats = 3298
@@ -292,5 +335,6 @@ def test_external_categorical_dist_bk_ext_grad():
 
 if __name__ == "__main__":
     test_external_categorical_dist_fw()
+    test_external_categorical_dist_fw_dim2()
     test_external_categorical_dist_bk_param_only()
     test_external_categorical_dist_bk_ext_grad()

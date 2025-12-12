@@ -38,24 +38,34 @@ def _condition_apply_ll_kernel(layer, kwargs):
 def _prep_args_apply_ll_kernel(layer, kwargs):
     target_kwargs = dict()
 
+    assert "external_categorical_logps" in kwargs
+    external_categorical_logps = kwargs["external_categorical_logps"]
+
     if kwargs["extern_product_categorical_mode"] == "normalized_ll":
+        assert external_categorical_logps.dim() == 3
         compute_unnorm_logp = True
         compute_logz = True
+        ext_softevi_indexing = True
     elif kwargs["extern_product_categorical_mode"] == "unnormalized_ll":
         compute_unnorm_logp = True
         compute_logz = False
+        if external_categorical_logps.dim() == 2:
+            ext_softevi_indexing = False
+        elif external_categorical_logps.dim() == 3:
+            ext_softevi_indexing = True
+        else:
+            raise ValueError()
     elif kwargs["extern_product_categorical_mode"] == "normalizing_constant":
+        assert external_categorical_logps.dim() == 3
         compute_unnorm_logp = False
         compute_logz = True
+        ext_softevi_indexing = True
     else:
         raise ValueError("Unexpected `extern_product_categorical_mode`. Should be 'normalized_ll', 'unnormalized_ll', or 'normalizing_constant'.")
 
     target_kwargs["compute_unnorm_logp"] = compute_unnorm_logp
     target_kwargs["compute_logz"] = compute_logz
-
-    assert "external_categorical_logps" in kwargs
-    external_categorical_logps = kwargs["external_categorical_logps"]
-    assert external_categorical_logps.dim() == 3
+    target_kwargs["ext_softevi_indexing"] = ext_softevi_indexing
 
     target_kwargs["external_categorical_logps_ptr"] = external_categorical_logps
 
@@ -63,10 +73,14 @@ def _prep_args_apply_ll_kernel(layer, kwargs):
 
     target_kwargs["ext_num_vars"] = external_categorical_logps.size(1)
 
-    for ns in layer.nodes:
-        assert ns.dist.num_cats <= external_categorical_logps.size(2)
+    if ext_softevi_indexing:
+        for ns in layer.nodes:
+            assert ns.dist.num_cats <= external_categorical_logps.size(2)
 
-    target_kwargs["max_num_cats"] = external_categorical_logps.size(2)
+    if external_categorical_logps.dim() == 3:
+        target_kwargs["max_num_cats"] = external_categorical_logps.size(2)
+    else:
+        target_kwargs["max_num_cats"] = 1
 
     # prepare BLOCK_SIZE and TILE_SIZE_K
     target_kwargs["TILE_SIZE_K"] = min(128, triton.next_power_of_2(target_kwargs["max_num_cats"]))
@@ -287,7 +301,7 @@ class ExternProductCategorical(Distribution):
                   fw_local_ids_ptr, partial_eval: tl.constexpr, layer_num_nodes: tl.constexpr, batch_size: tl.constexpr, 
                   num_vars_per_node: tl.constexpr, nv_block_size: tl.constexpr, node_offset: tl.constexpr, BLOCK_SIZE: tl.constexpr,
                   TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, compute_unnorm_logp: tl.constexpr, compute_logz: tl.constexpr,
-                  external_categorical_logps_ptr, var_idmapping_ptr, ext_num_vars: tl.constexpr, max_num_cats: tl.constexpr):
+                  ext_softevi_indexing: tl.constexpr, external_categorical_logps_ptr, var_idmapping_ptr, ext_num_vars: tl.constexpr, max_num_cats: tl.constexpr):
         pid = tl.program_id(axis = 0)
         block_start = pid * BLOCK_SIZE
 
@@ -354,10 +368,15 @@ class ExternProductCategorical(Distribution):
             data = tl.load(data_ptr + vids * batch_size + batch_offsets, mask = mask, other = 0)
             log_in_p = tl.load(params_ptr + s_pids + data, mask = mask, other = 0.0).log()
             
-            ex_p_ptr = external_categorical_logps_ptr + \
-                batch_offsets * (ext_num_vars * max_num_cats) + \
-                lvids * max_num_cats + \
-                data
+            if ext_softevi_indexing:
+                ex_p_ptr = external_categorical_logps_ptr + \
+                    batch_offsets * (ext_num_vars * max_num_cats) + \
+                    lvids * max_num_cats + \
+                    data
+            else:
+                ex_p_ptr = external_categorical_logps_ptr + \
+                    batch_offsets * (ext_num_vars * max_num_cats) + \
+                    lvids * max_num_cats
             log_ex_p = tl.load(ex_p_ptr, mask = mask, other = 0.0)
         else:
             log_in_p = tl.zeros([BLOCK_SIZE], dtype = tl.float32)
