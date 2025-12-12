@@ -5,7 +5,6 @@ import numpy as np
 from torch.utils.data import TensorDataset, DataLoader
 
 import pyjuice.nodes.distributions as dists
-from pyjuice.utils import BitSet
 from pyjuice.nodes import multiply, summate, inputs
 from pyjuice.model import TensorCircuit
 
