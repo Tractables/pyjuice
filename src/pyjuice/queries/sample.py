@@ -148,9 +148,9 @@ def sample_sum_layer(layer, nids, cids, pids, node_mars, element_mars, params, n
     batch_size = node_samples.size(1)
     seed = random.randint(0, 2**31)
 
-    BLOCK_S = min(256, triton.next_power_of_2(num_samples))
-    BLOCK_M = min(1024 // BLOCK_S, triton.next_power_of_2(num_nblocks))
-    BLOCK_K = min(1024 // BLOCK_S, triton.next_power_of_2(num_edges))
+    BLOCK_K = min(1024, triton.next_power_of_2(num_edges))
+    BLOCK_M = min(1024, triton.next_power_of_2(num_nblocks))
+    BLOCK_S = min(1024 // BLOCK_K, 1024 // BLOCK_M, triton.next_power_of_2(num_samples // 128))
 
     M_NUM_BLKS = triton.cdiv(num_nblocks, BLOCK_M)
     K_NUM_BLKS = triton.cdiv(num_edges, BLOCK_K)
@@ -162,6 +162,9 @@ def sample_sum_layer(layer, nids, cids, pids, node_mars, element_mars, params, n
         ind_target, ind_n, ind_b, seed, block_size, batch_size, num_edges, num_samples, num_nblocks, 
         BLOCK_S, BLOCK_M, M_NUM_BLKS, BLOCK_K, K_NUM_BLKS, conditional
     )
+
+    import pdb; pdb.set_trace()
+    a = 0
 
     return None
 
@@ -338,18 +341,25 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
     root_ns = pc.root_ns
     assert root_ns._output_ind_range[1] - root_ns._output_ind_range[0] == 1, "It is ambiguous to sample from multi-head PCs."
 
-    num_nscopes = 0
-    num_escopes = 0
-    for layer_group in pc.layers(ret_layer_groups = True):
-        curr_scopes = 0
-        for layer in layer_group:
-            curr_scopes += len(layer.scopes)
+    if hasattr(pc, "_num_nscopes") and hasattr(pc, "_num_escopes"):
+        num_nscopes = pc._num_nscopes
+        num_escopes = pc._num_escopes
+    else:
+        num_nscopes = 0
+        num_escopes = 0
+        for layer_group in pc.layers(ret_layer_groups = True):
+            curr_scopes = 0
+            for layer in layer_group:
+                curr_scopes += len(layer.scopes)
 
-        if layer_group.is_input() or layer_group.is_sum():
-            num_nscopes += curr_scopes
-        else:
-            assert layer_group.is_prod()
-            num_escopes = max(num_escopes, curr_scopes)
+            if layer_group.is_input() or layer_group.is_sum():
+                num_nscopes += curr_scopes
+            else:
+                assert layer_group.is_prod()
+                num_escopes = max(num_escopes, curr_scopes)
+
+        pc._num_nscopes = num_nscopes
+        pc._num_escopes = num_escopes
 
     # Stores selected node indices by the sampler
     node_samples = torch.zeros([num_nscopes, num_samples], dtype = torch.long, device = pc.device)
@@ -378,6 +388,7 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
                 ind_n, ind_b = torch.where((node_samples >= lsid) & (node_samples < leid))
 
                 # Pre-compute the target indices in `element_samples`
+                # The sampled child node indices will be put into the indices presented in `ind_target`
                 ind_target = np.zeros([ind_n.size(0)], dtype = np.int64)
                 _assign_cids_ind_target(ind_target, element_pointers, ind_b.detach().cpu().numpy(), num_samples)
                 ind_target = torch.from_numpy(ind_target).to(pc.device)
