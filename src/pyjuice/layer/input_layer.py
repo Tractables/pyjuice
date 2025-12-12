@@ -338,6 +338,7 @@ class InputLayer(Layer, nn.Module):
                 if not cond_fn(self, kwargs):
                     continue
 
+                kwargs["batch_size"] = batch_size
                 target_kwargs, grid = prep_kwargs_fn(self, kwargs)
 
                 if grid is None:
@@ -487,6 +488,7 @@ class InputLayer(Layer, nn.Module):
                 if not cond_fn(self, kwargs):
                     continue
 
+                kwargs["batch_size"] = batch_size
                 target_kwargs, grid = prep_kwargs_fn(self, kwargs)
 
                 if grid is None:

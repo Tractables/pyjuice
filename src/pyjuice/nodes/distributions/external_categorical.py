@@ -63,6 +63,8 @@ def _prep_args_apply_ll_kernel(layer, kwargs):
     else:
         raise ValueError("Unexpected `extern_product_categorical_mode`. Should be 'normalized_ll', 'unnormalized_ll', or 'normalizing_constant'.")
 
+    assert kwargs["batch_size"] == external_categorical_logps.size(0), "Batch size doesn't match in `external_categorical_logps`."
+
     target_kwargs["compute_unnorm_logp"] = compute_unnorm_logp
     target_kwargs["compute_logz"] = compute_logz
     target_kwargs["ext_softevi_indexing"] = ext_softevi_indexing
@@ -115,6 +117,8 @@ def _prep_args_apply_ll_bp_kernel(layer, kwargs):
     assert "external_categorical_logps" in kwargs
     external_categorical_logps = kwargs["external_categorical_logps"]
     assert external_categorical_logps.dim() == 3
+
+    assert kwargs["batch_size"] == external_categorical_logps.size(0), "Batch size doesn't match in `external_categorical_logps`."
 
     target_kwargs["external_categorical_logps_ptr"] = external_categorical_logps
 
@@ -175,6 +179,8 @@ def _prep_args_apply_ll_bp_extern_grad_kernel(layer, kwargs):
     assert "external_categorical_logps" in kwargs
     external_categorical_logps = kwargs["external_categorical_logps"]
     assert external_categorical_logps.dim() == 3
+
+    assert kwargs["batch_size"] == external_categorical_logps.size(0), "Batch size doesn't match in `external_categorical_logps`."
 
     assert "external_categorical_logps_grad" in kwargs
     external_categorical_logps_grad = kwargs["external_categorical_logps_grad"]
