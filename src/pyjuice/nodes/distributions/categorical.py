@@ -141,7 +141,7 @@ class Categorical(Distribution):
 
         max_num_cats = tl.max(num_cats, axis = 0)
 
-        rnd_val = tl.rand(seed, tl.arange(0, BLOCK_SIZE))
+        rnd_val = tl.rand(seed, tl.arange(0, BLOCK_SIZE) + block_start)
         sampled_id = tl.zeros([BLOCK_SIZE], dtype = tl.int64) - 1
 
         # Sample by computing cumulative probability

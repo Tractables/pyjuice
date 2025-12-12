@@ -23,7 +23,7 @@ def _assign_cids_ind_target(ind_target, element_pointers, ind_b, num_samples):
 
 
 @njit
-def _assign_nids_ind_target(ind_target, ind_target_sid, node_pointers, ind_ch_count, ind_b, num_samples):
+def _assign_nids_ind_target(ind_target, ind_target_sid, node_pointers, ind_b, num_samples):
     nid = 0
     for i in range(ind_target.shape[0]):
         if nid < ind_target_sid.shape[0] - 1 and i >= ind_target_sid[nid+1]:
@@ -39,7 +39,7 @@ def sample_sum_layer_kernel(nids, cids, pids, node_mars, element_mars, mparams, 
                             ind_target, ind_n, ind_b, seed, block_size: tl.constexpr, batch_size: tl.constexpr, 
                             num_edges: tl.constexpr, num_samples: tl.constexpr, num_nblocks: tl.constexpr, BLOCK_S: tl.constexpr, 
                             BLOCK_M: tl.constexpr, M_NUM_BLKS: tl.constexpr, BLOCK_K: tl.constexpr, K_NUM_BLKS: tl.constexpr,
-                            conditional: tl.constexpr):
+                            conditional: tl.constexpr, do_calibration: tl.constexpr):
     
     pid_s = tl.program_id(0) # ID of size-`BLOCK_S` batches
 
@@ -60,7 +60,7 @@ def sample_sum_layer_kernel(nids, cids, pids, node_mars, element_mars, mparams, 
         mask_nids = offs_nids < num_nblocks
 
         ref_nid = tl.load(nids + offs_nids, mask = mask_nids, other = 0)
-        is_match = (node_id[:,None] >= ref_nid[None,:]) & (node_id[:,None] < ref_nid[None,:] + block_size)
+        is_match = (node_id[:,None] >= ref_nid[None,:]) & (node_id[:,None] < ref_nid[None,:] + block_size) # [BLOCK_S, BLOCK_M]
 
         match_local_id = tl.sum(is_match * (offs_nids[None,:] + 1), axis = 1)
         match_local_offset = tl.sum(is_match * (node_id[:,None] - ref_nid[None,:]), axis = 1)
@@ -74,35 +74,36 @@ def sample_sum_layer_kernel(nids, cids, pids, node_mars, element_mars, mparams, 
     mask_sample = mask_sample & (local_nids >= 0)
 
     # Sample random probabilities uniform between 0 and 1
-    rnd_val = tl.rand(seed, tl.arange(0, BLOCK_S))
+    rnd_val = tl.rand(seed, offs_sample)
 
     if conditional:
         nmars = tl.load(node_mars + node_id * batch_size + batch_id, mask = mask_sample, other = 0.0) # [Block_B]
 
     # Calibration loop
-    sum_pars = tl.zeros([BLOCK_S], dtype = tl.float32)
-    offs_child = tl.arange(0, BLOCK_K)
-    mask_child = offs_child < num_edges
-    for i in range(K_NUM_BLKS):
-
-        # Load parameters
-        param_id = tl.load(pids + local_nids[None,:] * num_edges + offs_child[:,None], mask = (mask_sample[None,:] & mask_child[:,None]), other = 0)
-        epars = tl.load(mparams + param_id + local_nid_offs[None,:], mask = (mask_sample[None,:] & mask_child[:,None]), other = 0.0) # [BLOCK_K, BLOCK_B]
-
-        if conditional:
-            # In this case, we use `param * cmar / nmar` as the "parameter"
-            emars_id = tl.load(cids + local_nids[None,:] * num_edges + offs_child[:,None], mask = (mask_sample[None,:] & mask_child[:,None]), other = 0)
-            emars = tl.load(element_mars + emars_id * batch_size + batch_id, mask = (mask_sample[None,:] & mask_child[:,None]), other = 0.0)
-
-            epars = epars * tl.exp(emars - nmars[None,:]) # [BLOCK_K, BLOCK_B]
-
-        sum_pars += tl.sum(epars, axis = 0)
-
-        offs_child += BLOCK_K
+    if do_calibration:
+        sum_pars = tl.zeros([BLOCK_S], dtype = tl.float32)
+        offs_child = tl.arange(0, BLOCK_K)
         mask_child = offs_child < num_edges
+        for i in range(K_NUM_BLKS):
 
-    rnd_val *= sum_pars
-    rnd_val -= 1e-8
+            # Load parameters
+            param_id = tl.load(pids + local_nids[None,:] * num_edges + offs_child[:,None], mask = (mask_sample[None,:] & mask_child[:,None]), other = 0)
+            epars = tl.load(mparams + param_id + local_nid_offs[None,:], mask = (mask_sample[None,:] & mask_child[:,None]), other = 0.0) # [BLOCK_K, BLOCK_B]
+
+            if conditional:
+                # In this case, we use `param * cmar / nmar` as the "parameter"
+                emars_id = tl.load(cids + local_nids[None,:] * num_edges + offs_child[:,None], mask = (mask_sample[None,:] & mask_child[:,None]), other = 0)
+                emars = tl.load(element_mars + emars_id * batch_size + batch_id, mask = (mask_sample[None,:] & mask_child[:,None]), other = 0.0)
+
+                epars = epars * tl.exp(emars - nmars[None,:]) # [BLOCK_K, BLOCK_B]
+
+            sum_pars += tl.sum(epars, axis = 0)
+
+            offs_child += BLOCK_K
+            mask_child = offs_child < num_edges
+
+        rnd_val *= sum_pars
+        rnd_val -= 1e-12
 
     # Main loop over blocks of child nodes
     chids = tl.zeros([BLOCK_S], dtype = tl.int64) - 1
@@ -112,7 +113,7 @@ def sample_sum_layer_kernel(nids, cids, pids, node_mars, element_mars, mparams, 
 
         # Load parameters
         param_id = tl.load(pids + local_nids[None,:] * num_edges + offs_child[:,None], mask = (mask_sample[None,:] & mask_child[:,None]), other = 0)
-        epars = tl.load(mparams + param_id + local_nid_offs[None,:], mask = (mask_sample[None,:] & mask_child[:,None]), other = 0.0) # [BLOCK_K, BLOCK_B]
+        epars = tl.load(mparams + param_id + local_nid_offs[None,:], mask = (mask_sample[None,:] & mask_child[:,None]), other = 0.0) # [BLOCK_K, BLOCK_S]
 
         if conditional:
             # In this case, we use `param * cmar / nmar` as the "parameter"
@@ -122,7 +123,7 @@ def sample_sum_layer_kernel(nids, cids, pids, node_mars, element_mars, mparams, 
             epars = epars * tl.exp(emars - nmars[None,:]) # [BLOCK_K, BLOCK_B]
         
         cum_probs = tl.cumsum(epars, axis = 0) # [BLOCK_K, BLOCK_S]
-        local_chids = tl.sum((rnd_val[None,:] >= cum_probs).to(tl.int64), axis = 0) # [BLOCK_S]
+        local_chids = tl.sum((rnd_val[None,:] >= cum_probs).to(tl.int64), axis = 0) # [BLOCK_K, BLOCK_S]
 
         is_overflow = (local_chids == BLOCK_K)
         rnd_val = tl.where(is_overflow, rnd_val - tl.sum(epars, axis = 0), rnd_val)
@@ -130,7 +131,7 @@ def sample_sum_layer_kernel(nids, cids, pids, node_mars, element_mars, mparams, 
         chids = tl.where(is_overflow | (chids > -1), chids, local_chids + i * BLOCK_K)
 
         offs_child += BLOCK_K
-        mask_child = offs_child < num_edges
+        mask_child = (offs_child < num_edges)
 
     # Retrieve the global child ids and save them to `element_samples`
     global_chids = tl.load(cids + local_nids * num_edges + chids, mask = mask_sample, other = 0)
@@ -139,8 +140,8 @@ def sample_sum_layer_kernel(nids, cids, pids, node_mars, element_mars, mparams, 
     tl.store(element_samples + target_id, global_chids, mask = mask_sample)
 
 
-def sample_sum_layer(layer, nids, cids, pids, node_mars, element_mars, params, node_samples, element_samples, 
-                     ind_target, ind_n, ind_b, block_size, conditional):
+def sample_sum_layer(pc, layer, nids, cids, pids, node_mars, element_mars, params, node_samples, element_samples, 
+                     ind_target, ind_n, ind_b, block_size, conditional, do_calibration = False):
     
     num_samples = ind_n.size(0)
     num_nblocks = nids.size(0)
@@ -148,9 +149,9 @@ def sample_sum_layer(layer, nids, cids, pids, node_mars, element_mars, params, n
     batch_size = node_samples.size(1)
     seed = random.randint(0, 2**31)
 
-    BLOCK_S = min(256, triton.next_power_of_2(num_samples))
-    BLOCK_M = min(1024 // BLOCK_S, triton.next_power_of_2(num_nblocks))
-    BLOCK_K = min(1024 // BLOCK_S, triton.next_power_of_2(num_edges))
+    BLOCK_K = min(512, triton.next_power_of_2(num_edges))
+    BLOCK_M = min(512, triton.next_power_of_2(num_nblocks))
+    BLOCK_S = min(2048 // BLOCK_K, 2048 // BLOCK_M, max(triton.next_power_of_2(num_samples // 128), 1))
 
     M_NUM_BLKS = triton.cdiv(num_nblocks, BLOCK_M)
     K_NUM_BLKS = triton.cdiv(num_edges, BLOCK_K)
@@ -160,7 +161,7 @@ def sample_sum_layer(layer, nids, cids, pids, node_mars, element_mars, params, n
     sample_sum_layer_kernel[grid](
         nids, cids, pids, node_mars, element_mars, params, node_samples, element_samples, 
         ind_target, ind_n, ind_b, seed, block_size, batch_size, num_edges, num_samples, num_nblocks, 
-        BLOCK_S, BLOCK_M, M_NUM_BLKS, BLOCK_K, K_NUM_BLKS, conditional
+        BLOCK_S, BLOCK_M, M_NUM_BLKS, BLOCK_K, K_NUM_BLKS, conditional, do_calibration
     )
 
     return None
@@ -171,7 +172,7 @@ def push_non_neg_ones_to_front(matrix):
     result = torch.full_like(matrix, -1)
 
     s_mask = (matrix != -1)
-    d_mask = torch.sum(s_mask, dim = 0, keepdims = True) > torch.arange(matrix.size(0)).to(matrix.device)[:,None]
+    d_mask = torch.sum(s_mask, dim = 0, keepdims = True) > torch.arange(matrix.size(0), device = matrix.device)[:,None]
 
     result[d_mask] = matrix[s_mask]
     matrix[:] = result[:]
@@ -248,9 +249,9 @@ def count_prod_nch(layer, nids, cids, element_samples, ind_ch_count, ind_nids, i
     batch_size = element_samples.size(1)
     num_edges = cids.size(1)
 
-    BLOCK_C = min(1024, triton.next_power_of_2(num_edges))
-    BLOCK_S = min(1024 // BLOCK_C, triton.next_power_of_2(num_samples))
-    BLOCK_M = min(1024 // BLOCK_S, triton.next_power_of_2(num_nblocks))
+    BLOCK_C = min(128, triton.next_power_of_2(num_edges))
+    BLOCK_M = min(512, triton.next_power_of_2(num_nblocks))
+    BLOCK_S = min(2048 // BLOCK_C, 2048 // BLOCK_M, max(triton.next_power_of_2(num_samples // 128), 1))
 
     M_NUM_BLKS = triton.cdiv(num_nblocks, BLOCK_M)
     C_NUM_BLKS = triton.cdiv(num_edges, BLOCK_C)
@@ -316,7 +317,7 @@ def sample_prod_layer(layer, nids, cids, node_samples, element_samples, ind_targ
     batch_size = node_samples.size(1)
 
     BLOCK_C = min(1024, triton.next_power_of_2(num_edges))
-    BLOCK_S = min(1024 // BLOCK_C, triton.next_power_of_2(num_samples))
+    BLOCK_S = min(1024 // BLOCK_C, max(triton.next_power_of_2(num_samples // 128), 1))
 
     C_NUM_BLKS = triton.cdiv(num_edges, BLOCK_C)
 
@@ -328,8 +329,11 @@ def sample_prod_layer(layer, nids, cids, node_samples, element_samples, ind_targ
         num_nblocks, batch_size, num_edges, BLOCK_S, BLOCK_C, C_NUM_BLKS
     )
 
+    return None
 
-def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bool = False, _sample_input_ns: bool = True):
+
+def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bool = False, _sample_input_ns: bool = True,
+           _do_calibration: bool = False, **kwargs):
     if not conditional:
         assert num_samples is not None, "`num_samples` should be specified when doing unconditioned sampling."
     else:
@@ -338,18 +342,25 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
     root_ns = pc.root_ns
     assert root_ns._output_ind_range[1] - root_ns._output_ind_range[0] == 1, "It is ambiguous to sample from multi-head PCs."
 
-    num_nscopes = 0
-    num_escopes = 0
-    for layer_group in pc.layers(ret_layer_groups = True):
-        curr_scopes = 0
-        for layer in layer_group:
-            curr_scopes += len(layer.scopes)
+    if hasattr(pc, "_num_nscopes") and hasattr(pc, "_num_escopes"):
+        num_nscopes = pc._num_nscopes
+        num_escopes = pc._num_escopes
+    else:
+        num_nscopes = 0
+        num_escopes = 0
+        for layer_group in pc.layers(ret_layer_groups = True):
+            curr_scopes = 0
+            for layer in layer_group:
+                curr_scopes += len(layer.scopes)
 
-        if layer_group.is_input() or layer_group.is_sum():
-            num_nscopes += curr_scopes
-        else:
-            assert layer_group.is_prod()
-            num_escopes = max(num_escopes, curr_scopes)
+            if layer_group.is_input() or layer_group.is_sum():
+                num_nscopes += curr_scopes
+            else:
+                assert layer_group.is_prod()
+                num_escopes = max(num_escopes, curr_scopes)
+
+        pc._num_nscopes = num_nscopes
+        pc._num_escopes = num_escopes
 
     # Stores selected node indices by the sampler
     node_samples = torch.zeros([num_nscopes, num_samples], dtype = torch.long, device = pc.device)
@@ -378,6 +389,7 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
                 ind_n, ind_b = torch.where((node_samples >= lsid) & (node_samples < leid))
 
                 # Pre-compute the target indices in `element_samples`
+                # The sampled child node indices will be put into the indices presented in `ind_target`
                 ind_target = np.zeros([ind_n.size(0)], dtype = np.int64)
                 _assign_cids_ind_target(ind_target, element_pointers, ind_b.detach().cpu().numpy(), num_samples)
                 ind_target = torch.from_numpy(ind_target).to(pc.device)
@@ -392,9 +404,9 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
                     cids = layer.partitioned_cids[partition_id]
                     pids = layer.partitioned_pids[partition_id]
                     
-                    sample_sum_layer(layer, nids, cids, pids, pc.node_mars, pc.element_mars, pc.params, 
+                    sample_sum_layer(pc, layer, nids, cids, pids, pc.node_mars, pc.element_mars, pc.params, 
                                      node_samples, element_samples, ind_target, ind_n, ind_b, 
-                                     layer.block_size, conditional)
+                                     layer.block_size, conditional, do_calibration = _do_calibration)
 
                 # Clear completed nodes
                 node_samples[ind_n, ind_b] = -1
@@ -428,8 +440,7 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
                 ind_target_sid[1:] = ind_ch_count[:-1].cumsum(dim = 0).detach().cpu().numpy()
                 ind_target = np.zeros([ind_ch_count.sum()], dtype = np.int64)
                 _assign_nids_ind_target(ind_target, ind_target_sid, 
-                                        node_pointers.detach().cpu().numpy(), 
-                                        ind_ch_count.detach().cpu().numpy(), 
+                                        node_pointers.detach().cpu().numpy(),
                                         ind_b.detach().cpu().numpy(), num_samples)
                 ind_target_sid = torch.from_numpy(ind_target_sid).to(pc.device)
                 ind_target = torch.from_numpy(ind_target).to(pc.device)
@@ -454,7 +465,7 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
     if _sample_input_ns:
         for layer in pc.input_layer_group:
             seed = random.randint(0, 2**31)
-            layer.sample(samples, pc.node_flows, seed = seed)
+            layer.sample(samples, pc.node_flows, seed = seed, **kwargs)
 
         return samples.permute(1, 0).contiguous()
     else:

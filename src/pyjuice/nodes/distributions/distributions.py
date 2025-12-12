@@ -9,6 +9,7 @@ class Distribution():
     def __init__(self):
         self.post_fw_fns = []
         self.post_bp_fns = []
+        self.sampling_fns = []
 
     def get_signature(self):
         """
