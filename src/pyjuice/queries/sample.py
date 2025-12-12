@@ -333,7 +333,7 @@ def sample_prod_layer(layer, nids, cids, node_samples, element_samples, ind_targ
 
 
 def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bool = False, _sample_input_ns: bool = True,
-           _do_calibration: bool = False):
+           _do_calibration: bool = False, **kwargs):
     if not conditional:
         assert num_samples is not None, "`num_samples` should be specified when doing unconditioned sampling."
     else:
@@ -465,7 +465,7 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
     if _sample_input_ns:
         for layer in pc.input_layer_group:
             seed = random.randint(0, 2**31)
-            layer.sample(samples, pc.node_flows, seed = seed)
+            layer.sample(samples, pc.node_flows, seed = seed, **kwargs)
 
         return samples.permute(1, 0).contiguous()
     else:
