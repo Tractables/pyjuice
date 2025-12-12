@@ -562,7 +562,7 @@ class InputLayer(Layer, nn.Module):
             raise NotImplementedError("CPU backward fn for input nodes is not implemented.")
 
     def sample(self, samples: torch.Tensor, node_flows: torch.Tensor, missing_mask: Optional[torch.Tensor] = None, 
-               params: Optional[torch.Tensor] = None, seed: Optional[int] = None):
+               params: Optional[torch.Tensor] = None, seed: Optional[int] = None, **kwargs):
         """
         samples:       [num_vars, B]
         missing_mask:  [num_vars, B] or [num_vars] or None
@@ -576,43 +576,80 @@ class InputLayer(Layer, nn.Module):
 
         assert params.dim() == 1
 
-        if "cuda" in self.device.type:
+        if len(self.get_dist().sampling_fns) == 0:
+            if "cuda" in self.device.type:
 
-            sid, eid = self._output_ind_range
-            tot_num_nodes = node_flows.size(0)
-            batch_size = node_flows.size(1)
-            node_offset = self._output_ind_range[0]
+                sid, eid = self._output_ind_range
+                tot_num_nodes = node_flows.size(0)
+                batch_size = node_flows.size(1)
+                node_offset = self._output_ind_range[0]
 
-            # Get all node ids with non-zero flow
-            nflow_xids, nflow_yids = torch.where(node_flows[sid:eid,:] > 1e-8)
-            num_activ_nodes = nflow_xids.size(0)
+                # Get all node ids with non-zero flow
+                nflow_xids, nflow_yids = torch.where(node_flows[sid:eid,:] > 1e-8)
+                num_activ_nodes = nflow_xids.size(0)
 
-            if not self.provided("_sample_kernel"):
-                self._sample_kernel = self._compile_triton_kernel(self._sample_kernel_template, sample_fn = self.sample_fn)
+                if not self.provided("_sample_kernel"):
+                    self._sample_kernel = self._compile_triton_kernel(self._sample_kernel_template, sample_fn = self.sample_fn)
 
-            BLOCK_SIZE = 1024
+                BLOCK_SIZE = 1024
 
-            grid = (triton.cdiv(num_activ_nodes, BLOCK_SIZE),)
+                grid = (triton.cdiv(num_activ_nodes, BLOCK_SIZE),)
 
-            self._sample_kernel[grid](
-                samples_ptr = samples, 
-                params_ptr = params,
-                nflow_xids_ptr = nflow_xids, 
-                nflow_yids_ptr = nflow_yids, 
-                vids_ptr = self.vids, 
-                s_pids_ptr = self.s_pids, 
-                metadata_ptr = self.metadata,
-                s_mids_ptr = self.s_mids,
-                num_activ_nodes = num_activ_nodes, 
-                num_vars_per_node = self.num_vars_per_node, 
-                nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
-                batch_size = batch_size, 
-                BLOCK_SIZE = BLOCK_SIZE,
-                seed = seed if seed is not None else random.randint(0, int(1e8))
-            )
+                self._sample_kernel[grid](
+                    samples_ptr = samples, 
+                    params_ptr = params,
+                    nflow_xids_ptr = nflow_xids, 
+                    nflow_yids_ptr = nflow_yids, 
+                    vids_ptr = self.vids, 
+                    s_pids_ptr = self.s_pids, 
+                    metadata_ptr = self.metadata,
+                    s_mids_ptr = self.s_mids,
+                    num_activ_nodes = num_activ_nodes, 
+                    num_vars_per_node = self.num_vars_per_node, 
+                    nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
+                    batch_size = batch_size, 
+                    BLOCK_SIZE = BLOCK_SIZE,
+                    seed = seed if seed is not None else random.randint(0, int(1e8))
+                )
+
+            else:
+                raise NotImplementedError("CPU sample fn for input nodes is not implemented.")
 
         else:
-            raise NotImplementedError("CPU sample fn for input nodes is not implemented.")
+            for (kernel, cond_fn, prep_kwargs_fn) in self.get_dist().sampling_fns:
+                if not cond_fn(self, kwargs):
+                    continue
+
+                batch_size = node_flows.size(1)
+
+                # Get all node ids with non-zero flow
+                sid, eid = self._output_ind_range
+                nflow_xids, nflow_yids = torch.where(node_flows[sid:eid,:] > 1e-8)
+                num_activ_nodes = nflow_xids.size(0)
+
+                kwargs["num_activ_nodes"] = num_activ_nodes
+                kwargs["batch_size"] = batch_size
+                target_kwargs, grid = prep_kwargs_fn(self, kwargs)
+
+                if grid is None:
+                    grid = (triton.cdiv(num_activ_nodes, target_kwargs["BLOCK_SIZE"]),)
+
+                kernel[grid](
+                    samples_ptr = samples, 
+                    params_ptr = params,
+                    nflow_xids_ptr = nflow_xids, 
+                    nflow_yids_ptr = nflow_yids, 
+                    vids_ptr = self.vids, 
+                    s_pids_ptr = self.s_pids, 
+                    metadata_ptr = self.metadata,
+                    s_mids_ptr = self.s_mids,
+                    num_activ_nodes = num_activ_nodes, 
+                    num_vars_per_node = self.num_vars_per_node, 
+                    nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
+                    batch_size = batch_size,
+                    seed = seed if seed is not None else random.randint(0, int(1e8)),
+                    **target_kwargs
+                )
 
     def mini_batch_em(self, step_size: float, pseudocount: float = 0.0, keep_zero_params: bool = False):
         if not self._used_external_params:
