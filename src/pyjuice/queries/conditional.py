@@ -179,10 +179,10 @@ def _discrete_logistic_forward(layer, inputs: torch.Tensor, node_mars: torch.Ten
 
     if inputs.dim() == 2:
         # Hard evidence
-        if layer.input_type == "discrete":
+        if layer.nodes[0].dist.input_type == "discrete":
             assert inputs.dtype == torch.long, "Input dtype should be `torch.float32`."
         else: 
-            assert layer.input_type == "continuous"
+            assert layer.nodes[0].dist.input_type == "continuous"
             assert inputs.dtype == torch.float32, "Input dtype should be `torch.float32`."
 
         inputs = inputs.permute(1, 0).contiguous()
