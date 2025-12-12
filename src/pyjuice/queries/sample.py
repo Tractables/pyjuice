@@ -23,7 +23,7 @@ def _assign_cids_ind_target(ind_target, element_pointers, ind_b, num_samples):
 
 
 @njit
-def _assign_nids_ind_target(ind_target, ind_target_sid, node_pointers, ind_ch_count, ind_b, num_samples):
+def _assign_nids_ind_target(ind_target, ind_target_sid, node_pointers, ind_b, num_samples):
     nid = 0
     for i in range(ind_target.shape[0]):
         if nid < ind_target_sid.shape[0] - 1 and i >= ind_target_sid[nid+1]:
@@ -74,7 +74,7 @@ def sample_sum_layer_kernel(nids, cids, pids, node_mars, element_mars, mparams, 
     mask_sample = mask_sample & (local_nids >= 0)
 
     # Sample random probabilities uniform between 0 and 1
-    rnd_val = tl.rand(seed, tl.arange(0, BLOCK_S))
+    rnd_val = tl.rand(seed, offs_sample)
 
     if conditional:
         nmars = tl.load(node_mars + node_id * batch_size + batch_id, mask = mask_sample, other = 0.0) # [Block_B]
@@ -263,9 +263,6 @@ def count_prod_nch(layer, nids, cids, element_samples, ind_ch_count, ind_nids, i
         block_size, num_samples, num_nblocks, batch_size, num_edges, BLOCK_M, BLOCK_C, BLOCK_S, M_NUM_BLKS, C_NUM_BLKS
     )
 
-    import pdb; pdb.set_trace()
-    a = 0
-
     return None
 
 
@@ -320,7 +317,7 @@ def sample_prod_layer(layer, nids, cids, node_samples, element_samples, ind_targ
     batch_size = node_samples.size(1)
 
     BLOCK_C = min(1024, triton.next_power_of_2(num_edges))
-    BLOCK_S = min(1024 // BLOCK_C, triton.next_power_of_2(num_samples))
+    BLOCK_S = min(1024 // BLOCK_C, max(triton.next_power_of_2(num_samples // 128), 1))
 
     C_NUM_BLKS = triton.cdiv(num_edges, BLOCK_C)
 
@@ -331,6 +328,8 @@ def sample_prod_layer(layer, nids, cids, node_samples, element_samples, ind_targ
         ind_nids, ind_nid_offs, ind_mask, partition_id, block_size, num_samples, 
         num_nblocks, batch_size, num_edges, BLOCK_S, BLOCK_C, C_NUM_BLKS
     )
+
+    return None
 
 
 def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bool = False, _sample_input_ns: bool = True,
@@ -441,8 +440,7 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
                 ind_target_sid[1:] = ind_ch_count[:-1].cumsum(dim = 0).detach().cpu().numpy()
                 ind_target = np.zeros([ind_ch_count.sum()], dtype = np.int64)
                 _assign_nids_ind_target(ind_target, ind_target_sid, 
-                                        node_pointers.detach().cpu().numpy(), 
-                                        ind_ch_count.detach().cpu().numpy(), 
+                                        node_pointers.detach().cpu().numpy(),
                                         ind_b.detach().cpu().numpy(), num_samples)
                 ind_target_sid = torch.from_numpy(ind_target_sid).to(pc.device)
                 ind_target = torch.from_numpy(ind_target).to(pc.device)
