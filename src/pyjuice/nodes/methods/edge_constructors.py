@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import torch
+
 from functools import partial
 from typing import Callable, Optional, Dict
 
@@ -8,6 +10,9 @@ from pyjuice.nodes import CircuitNodes
 
 def block_diagonal_edge_constructor(ns0, *args, num_node_blocks: int = 0, block_size: int = 0, **kwargs):
     assert num_node_blocks > 0 and block_size > 0
+
+    if block_size == 1:
+        return None
 
     ch_block_size = ns0.block_size
 
@@ -27,6 +32,9 @@ def block_sparse_rnd_blk_edge_constructor(ns0, *args, num_node_blocks: int = 0, 
 
     assert num_node_blocks > 0 and block_size > 0
     assert num_chs_per_block > 0
+
+    if block_size == 1:
+        return None
 
     ch_block_size = ns0.block_size
 

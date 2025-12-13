@@ -167,7 +167,12 @@ def summate(nodes1: SumNodesChs, *args, num_node_blocks: int = 0, num_nodes: int
     assert isinstance(nodes1, ProdNodes) or isinstance(nodes1, InputNodes), f"Children of sum nodes must be input or product nodes, but found input of type {type(nodes1)}." 
 
     if sum_edge_ids_constructor is not None:
-        edge_ids = sum_edge_ids_constructor(nodes1, *args, num_node_blocks = num_node_blocks, block_size = block_size, **kwargs)
+        edge_ids = sum_edge_ids_constructor(
+            nodes1, *args, 
+            num_node_blocks = num_node_blocks, 
+            block_size = block_size if block_size > 0 else CircuitNodes.DEFAULT_BLOCK_SIZE, 
+            **kwargs
+        )
 
     if edge_ids is not None and num_node_blocks == 0:
         num_node_blocks = edge_ids[0,:].max().item() + 1
