@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 import numpy as np
 import networkx as nx
-from typing import Type, Optional
+from typing import Type, Optional, Callable
 
 from pyjuice.nodes.distributions import *
 from .compilation import BayesianTreeToHiddenRegionGraph
@@ -73,7 +73,8 @@ def HCLT(x: torch.Tensor, num_latents: int,
          input_dist: Optional[Distribution] = None,
          input_node_type: Type[Distribution] = Categorical, 
          input_node_params: dict = {"num_cats": 256},
-         tie_input_params: bool = False):
+         tie_input_params: bool = False,
+         sum_edge_ids_constructor: Optional[Callable] = None):
     """
     Construct Hidden Chow-Liu Trees (https://arxiv.org/pdf/2106.02264.pdf).
 
@@ -115,7 +116,8 @@ def HCLT(x: torch.Tensor, num_latents: int,
     root_r = BayesianTreeToHiddenRegionGraph(
         T, root, num_latents, input_node_type, 
         input_node_params, num_root_ns = num_root_ns,
-        block_size = block_size, tie_input_params = tie_input_params
+        block_size = block_size, tie_input_params = tie_input_params,
+        sum_edge_ids_constructor = sum_edge_ids_constructor
     )
     
     return root_r

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 import networkx as nx
-from typing import Type, Optional
+from typing import Type, Optional, Callable
 
 from pyjuice.nodes import multiply, summate, inputs, set_block_size, CircuitNodes
 from pyjuice.nodes.distributions import Distribution
@@ -16,7 +16,8 @@ def BayesianTreeToHiddenRegionGraph(tree: nx.Graph,
                                     dist_params: dict,
                                     num_root_ns: int = 1,
                                     block_size: Optional[int] = None,
-                                    tie_input_params: bool = False) -> CircuitNodes:
+                                    tie_input_params: bool = False,
+                                    sum_edge_ids_constructor: Optional[Callable] = None) -> CircuitNodes:
     """
     Given a Tree Bayesian Network tree T1 (i.e. at most one parents), 
     
@@ -90,11 +91,23 @@ def BayesianTreeToHiddenRegionGraph(tree: nx.Graph,
 
                 if v == root:
                     if num_root_ns == 1:
-                        r = summate(rp, num_node_blocks = num_root_ns, block_size = 1)
+                        if sum_edge_ids_constructor is not None:
+                            edge_ids = sum_edge_ids_constructor(rp, num_node_blocks = num_node_blocks, block_size = 1)
+                        else:
+                            edge_ids = None
+                        r = summate(rp, edge_ids = edge_ids, num_node_blocks = num_root_ns, block_size = 1)
                     else:
-                        r = summate(rp, num_node_blocks = num_root_ns // block_size, block_size = block_size)
+                        if sum_edge_ids_constructor is not None:
+                            edge_ids = sum_edge_ids_constructor(rp, num_node_blocks = num_root_ns // block_size, block_size = block_size)
+                        else:
+                            edge_ids = None
+                        r = summate(rp, edge_ids = edge_ids, num_node_blocks = num_root_ns // block_size, block_size = block_size)
                 else:
-                    r = summate(rp, num_node_blocks = num_node_blocks)
+                    if sum_edge_ids_constructor is not None:
+                        edge_ids = sum_edge_ids_constructor(rp, num_node_blocks = num_node_blocks, block_size = block_size)
+                    else:
+                        edge_ids = None
+                    r = summate(rp, edge_ids = edge_ids, num_node_blocks = num_node_blocks)
 
                 var2rnode[v] = r
 
