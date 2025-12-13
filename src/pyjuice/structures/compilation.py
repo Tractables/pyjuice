@@ -91,11 +91,11 @@ def BayesianTreeToHiddenRegionGraph(tree: nx.Graph,
 
                 if v == root:
                     if num_root_ns == 1:
-                        r = summate(rp, edge_ids = edge_ids, num_node_blocks = num_root_ns, block_size = 1, sum_edge_ids_constructor = sum_edge_ids_constructor)
+                        r = summate(rp, num_node_blocks = num_root_ns, block_size = 1, sum_edge_ids_constructor = sum_edge_ids_constructor)
                     else:
-                        r = summate(rp, edge_ids = edge_ids, num_node_blocks = num_root_ns // block_size, block_size = block_size, sum_edge_ids_constructor = sum_edge_ids_constructor)
+                        r = summate(rp, num_node_blocks = num_root_ns // block_size, block_size = block_size, sum_edge_ids_constructor = sum_edge_ids_constructor)
                 else:
-                    r = summate(rp, edge_ids = edge_ids, num_node_blocks = num_node_blocks, sum_edge_ids_constructor = sum_edge_ids_constructor)
+                    r = summate(rp, num_node_blocks = num_node_blocks, sum_edge_ids_constructor = sum_edge_ids_constructor)
 
                 var2rnode[v] = r
 
