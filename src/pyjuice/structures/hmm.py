@@ -139,7 +139,6 @@ def GeneralizedHMM(seq_length: int, num_latents: int, homogeneous: bool = True, 
         )
 
         if beta is not None:
-            assert beta.size(0) == num_latents and beta.size(1) == num_emits
             ns_input.set_params(beta)
         
         ns_sum = None
