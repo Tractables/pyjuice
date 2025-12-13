@@ -1,2 +1,3 @@
 from .scope import get_subsumed_scopes
 from .traversal import foreach, foldup_aggregate
+from .edge_constructors import block_diagonal_edge_constructor, block_sparse_rnd_blk_edge_constructor
