@@ -32,7 +32,9 @@ def max_power_of_2_factor(n):
 
 
 def _condition_apply_ll_kernel(layer, kwargs):
-    return "extern_product_categorical_mode" in kwargs
+    return "extern_product_categorical_mode" in kwargs and \
+        kwargs["extern_product_categorical_mode"] in ("normalized_ll", "unnormalized_ll", "normalizing_constant") and \
+        "external_categorical_value_mask" not in kwargs
 
 
 def _prep_args_apply_ll_kernel(layer, kwargs):
@@ -92,6 +94,59 @@ def _prep_args_apply_ll_kernel(layer, kwargs):
     return target_kwargs, None
 
 
+def _condition_apply_ll_w_mask_kernel(layer, kwargs):
+    return "extern_product_categorical_mode" in kwargs and \
+        kwargs["extern_product_categorical_mode"] in ("normalized_ll", "unnormalized_ll") and \
+        "external_categorical_value_mask" in kwargs
+
+
+def _prep_args_apply_ll_w_mask_kernel(layer, kwargs):
+    target_kwargs = dict()
+
+    assert "external_categorical_logps" in kwargs
+    external_categorical_logps = kwargs["external_categorical_logps"]
+    assert external_categorical_logps.dim() == 3
+
+    if kwargs["extern_product_categorical_mode"] == "normalized_ll":
+        use_normalized = True
+    elif kwargs["extern_product_categorical_mode"] == "unnormalized_ll":
+        use_normalized = False
+    else:
+        raise ValueError("Unexpected `extern_product_categorical_mode`. Should be 'normalized_ll' or 'unnormalized_ll'.")
+
+    batch_size = kwargs["batch_size"]
+
+    external_categorical_value_mask = kwargs["external_categorical_value_mask"]
+    assert external_categorical_value_mask.dim() == 2
+
+    assert external_categorical_logps.size(0) == batch_size, "Batch size doesn't match in `external_categorical_logps`."
+    assert external_categorical_value_mask.size(0) == batch_size, "Batch size doesn't match in `external_categorical_value_mask`."
+
+    target_kwargs["use_normalized"] = use_normalized
+
+    target_kwargs["external_categorical_logps_ptr"] = external_categorical_logps
+    target_kwargs["external_categorical_value_mask_ptr"] = external_categorical_value_mask
+
+    target_kwargs["var_idmapping_ptr"] = layer.var_idmapping
+
+    target_kwargs["ext_num_vars"] = external_categorical_logps.size(1)
+
+    for ns in layer.nodes:
+        assert ns.dist.num_cats <= external_categorical_logps.size(2)
+
+    if external_categorical_logps.dim() == 3:
+        target_kwargs["max_num_cats"] = external_categorical_logps.size(2)
+    else:
+        target_kwargs["max_num_cats"] = 1
+
+    # prepare BLOCK_SIZE and TILE_SIZE_K
+    target_kwargs["TILE_SIZE_K"] = min(128, triton.next_power_of_2(target_kwargs["max_num_cats"]))
+    target_kwargs["K_NUM_TILES"] = triton.cdiv(target_kwargs["max_num_cats"], target_kwargs["TILE_SIZE_K"])
+    target_kwargs["BLOCK_SIZE"] = 1024 // target_kwargs["TILE_SIZE_K"]
+
+    return target_kwargs, None
+
+
 def _condition_apply_ll_bp_kernel(layer, kwargs):
     return "extern_product_categorical_mode" in kwargs
 
@@ -114,19 +169,30 @@ def _prep_args_apply_ll_bp_kernel(layer, kwargs):
     target_kwargs["compute_unnorm_logp"] = compute_unnorm_logp
     target_kwargs["compute_logz"] = compute_logz
 
-    assert "external_categorical_logps" in kwargs
-    external_categorical_logps = kwargs["external_categorical_logps"]
-    assert external_categorical_logps.dim() == 3
+    batch_size = kwargs["batch_size"]
 
-    assert kwargs["batch_size"] == external_categorical_logps.size(0), "Batch size doesn't match in `external_categorical_logps`."
+    if kwargs["extern_product_categorical_mode"] == "normalizing_constant":
+        assert "external_categorical_logps" in kwargs
+        external_categorical_logps = kwargs["external_categorical_logps"]
+        assert external_categorical_logps.dim() == 3
 
-    target_kwargs["external_categorical_logps_ptr"] = external_categorical_logps
+        assert kwargs["batch_size"] == external_categorical_logps.size(0), "Batch size doesn't match in `external_categorical_logps`."
 
-    target_kwargs["var_idmapping_ptr"] = layer.var_idmapping
+        target_kwargs["external_categorical_logps_ptr"] = external_categorical_logps
 
-    target_kwargs["ext_num_vars"] = external_categorical_logps.size(1)
+        target_kwargs["var_idmapping_ptr"] = layer.var_idmapping
 
-    target_kwargs["max_num_cats"] = external_categorical_logps.size(2)
+        target_kwargs["ext_num_vars"] = external_categorical_logps.size(1)
+
+        target_kwargs["max_num_cats"] = external_categorical_logps.size(2)
+    else:
+        target_kwargs["external_categorical_logps_ptr"] = None
+
+        target_kwargs["var_idmapping_ptr"] = layer.var_idmapping
+
+        target_kwargs["ext_num_vars"] = 1
+
+        target_kwargs["max_num_cats"] = 1
 
     if not layer.provided("fw_local_ids"):
         layer_num_nodes = layer._output_ind_range[1] - layer._output_ind_range[0]
@@ -137,17 +203,17 @@ def _prep_args_apply_ll_bp_kernel(layer, kwargs):
     if kwargs["extern_product_categorical_mode"] == "normalizing_constant":
         target_kwargs["TILE_SIZE_K"] = min(64, triton.next_power_of_2(target_kwargs["max_num_cats"]))
         target_kwargs["K_NUM_TILES"] = triton.cdiv(target_kwargs["max_num_cats"], target_kwargs["TILE_SIZE_K"])
-        BATCH_SIZE_NP2 = triton.next_power_of_2(external_categorical_logps.size(0))
+        BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
         target_kwargs["BLOCK_SIZE_B"] = min(128, 1024 // target_kwargs["TILE_SIZE_K"], BATCH_SIZE_NP2)
         target_kwargs["BLOCK_SIZE_N"] = min(128, 1024 // target_kwargs["BLOCK_SIZE_B"] // target_kwargs["TILE_SIZE_K"])
     else:
         target_kwargs["TILE_SIZE_K"] = 1
         target_kwargs["K_NUM_TILES"] = triton.cdiv(target_kwargs["max_num_cats"], target_kwargs["TILE_SIZE_K"])
-        BATCH_SIZE_NP2 = triton.next_power_of_2(external_categorical_logps.size(0))
+        BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
         target_kwargs["BLOCK_SIZE_B"] = min(128, BATCH_SIZE_NP2)
         target_kwargs["BLOCK_SIZE_N"] = min(128, 1024 // target_kwargs["BLOCK_SIZE_B"])
 
-    grid = (triton.cdiv(external_categorical_logps.size(0), target_kwargs["BLOCK_SIZE_B"]),
+    grid = (triton.cdiv(batch_size, target_kwargs["BLOCK_SIZE_B"]),
             triton.cdiv(layer_num_nodes, target_kwargs["BLOCK_SIZE_N"]))
 
     return target_kwargs, grid
@@ -265,7 +331,8 @@ class ExternProductCategorical(Distribution):
         self.num_cats = num_cats
 
         self.post_fw_fns = [
-            (self.ll_kernel, _condition_apply_ll_kernel, _prep_args_apply_ll_kernel)
+            (self.ll_kernel, _condition_apply_ll_kernel, _prep_args_apply_ll_kernel),
+            (self.ll_w_mask_kernel, _condition_apply_ll_w_mask_kernel, _prep_args_apply_ll_w_mask_kernel)
         ]
 
         self.post_bp_fns = [
@@ -431,6 +498,96 @@ class ExternProductCategorical(Distribution):
         # Store the logprob
         node_offsets = local_offsets + node_offset
         tl.store(node_mars_ptr + node_offsets * batch_size + batch_offsets, log_p, mask = mask)
+
+    @staticmethod
+    @triton_jit
+    def ll_w_mask_kernel(params_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, metadata_ptr, s_mids_ptr, nids_ptr, 
+                         fw_local_ids_ptr, partial_eval: tl.constexpr, layer_num_nodes: tl.constexpr, batch_size: tl.constexpr, 
+                         num_vars_per_node: tl.constexpr, nv_block_size: tl.constexpr, node_offset: tl.constexpr, BLOCK_SIZE: tl.constexpr,
+                         TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, use_normalized: tl.constexpr,
+                         external_categorical_logps_ptr, external_categorical_value_mask_ptr, var_idmapping_ptr, ext_num_vars: tl.constexpr, 
+                         max_num_cats: tl.constexpr):
+        pid = tl.program_id(axis = 0)
+        block_start = pid * BLOCK_SIZE
+
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < layer_num_nodes * batch_size
+
+        # Raw batch and (local) node id
+        batch_offsets = (offsets % batch_size)
+        local_offsets = (offsets // batch_size)
+
+        if partial_eval > 0:
+            local_offsets = tl.load(fw_local_ids_ptr + local_offsets, mask = mask, other = 0)
+
+        # Get all variable ids
+        vids = tl.load(vids_ptr + local_offsets, mask = mask, other = 0)
+        lvids = tl.load(var_idmapping_ptr + vids, mask = mask, other = 0)
+
+        # Get all latent offsets
+        nids = tl.load(nids_ptr + local_offsets, mask = mask, other = 0)
+
+        # Get `num_cats` from `metadata`
+        s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
+        num_cats = tl.load(metadata_ptr + s_mids, mask = mask, other = 0).to(tl.int64) # [BLOCK_SIZE]
+
+        # Get start parameter indices
+        s_pids = tl.load(s_pids_ptr + local_offsets, mask = mask, other = 0)
+
+        # Ptrs pointing to internal parameters
+        inpars_ptr = params_ptr + s_pids[:,None] + tl.arange(0, TILE_SIZE_K)[None,:] # [BLOCK_SIZE, TILE_SIZE_K]
+
+        # Ptrs pointing to external parameters
+        expars_ptr = external_categorical_logps_ptr + \
+            batch_offsets[:,None] * (ext_num_vars * max_num_cats) + \
+            lvids[:,None] * max_num_cats + \
+            tl.arange(0, TILE_SIZE_K)[None,:]  # [BLOCK_SIZE, TILE_SIZE_K]
+
+        # Compute logZ
+        logZ = tl.zeros([BLOCK_SIZE], dtype = tl.float32) - float("inf")
+        for i in range(K_NUM_TILES):
+            cat_mask = mask[:,None] & (i * TILE_SIZE_K + tl.arange(0, TILE_SIZE_K)[None,:] < num_cats[:,None])
+
+            inpar = tl.load(inpars_ptr + i * TILE_SIZE_K, mask = cat_mask, other = 0.0)
+            expar = tl.load(expars_ptr + i * TILE_SIZE_K, mask = cat_mask, other = 0.0)
+
+            addlpar = inpar.log() + expar
+            addlpar_max = tl.max(addlpar, axis = 1)
+            lpar = (addlpar - addlpar_max[:,None]).exp().sum(axis = 1).log() + addlpar_max
+
+            # Compute log-add-exp(logZ, lpar)
+            maxval = tl.maximum(logZ, lpar)
+            minval = tl.minimum(logZ, lpar)
+            diff = minval - maxval
+
+            logZ = tl.where(logZ == -float("inf"),
+                lpar,
+                maxval + tlmath.log1p(tl.exp(diff))
+            )
+
+        # Compute unnormalized log-probabilities
+        data = tl.load(data_ptr + vids * batch_size + batch_offsets, mask = mask, other = 0)
+        log_in_p = tl.load(params_ptr + s_pids + data, mask = mask, other = 0.0).log()
+        
+        ex_p_ptr = external_categorical_logps_ptr + \
+            batch_offsets * (ext_num_vars * max_num_cats) + \
+            lvids * max_num_cats + \
+            data
+        log_ex_p = tl.load(ex_p_ptr, mask = mask, other = 0.0)
+
+        if use_normalized:
+            log_p = log_in_p + log_ex_p - logZ
+        else:
+            log_p = log_in_p + log_ex_p
+
+        # Get value masks (`True` to use value, `False` to use logZ)
+        ext_value_mask = tl.load(external_categorical_value_mask_ptr + batch_offsets * ext_num_vars + lvids, mask = mask, other = False) # [BLOCK_SIZE]
+
+        val = tl.where(ext_value_mask, log_p, logZ)
+
+        # Store the logprob
+        node_offsets = local_offsets + node_offset
+        tl.store(node_mars_ptr + node_offsets * batch_size + batch_offsets, val, mask = mask)
 
     @staticmethod
     @triton_jit
