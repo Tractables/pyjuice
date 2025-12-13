@@ -16,7 +16,8 @@ def RAT_SPN(num_vars: int, num_latents: int, depth: int, num_repetitions: int, n
             input_dist: Optional[Distribution] = None,
             input_node_type: Type[Distribution] = Categorical, 
             input_node_params: dict = {"num_cats": 256},
-            block_size: Optional[int] = None):
+            block_size: Optional[int] = None,
+            sum_edge_ids_constructor: Optional[Callable] = None):
     """
     Generate Random and Tensorized SPNs (https://proceedings.mlr.press/v115/peharz20a/peharz20a.pdf)
 
@@ -40,6 +41,9 @@ def RAT_SPN(num_vars: int, num_latents: int, depth: int, num_repetitions: int, n
 
     :param block_size: block size
     :type block_size: int
+
+    :param sum_edge_ids_constructor: optional helper functions to create special edge patterns (e.g., block-sparse)
+    :type sum_edge_ids_constructor: Callable
     """
 
     # Specify block size
@@ -65,7 +69,7 @@ def RAT_SPN(num_vars: int, num_latents: int, depth: int, num_repetitions: int, n
             if curr_depth >= depth or len(scope) < num_pieces:
                 chs = [input_ns[v] for v in scope]
                 np = multiply(*chs)
-                ns = summate(np, num_node_blocks = num_node_blocks)
+                ns = summate(np, num_node_blocks = num_node_blocks, sum_edge_ids_constructor = sum_edge_ids_constructor)
 
                 return ns
 
@@ -84,7 +88,7 @@ def RAT_SPN(num_vars: int, num_latents: int, depth: int, num_repetitions: int, n
 
             chs = [partition_ns(scope, curr_depth + 1) for scope in ch_scopes]
             np = multiply(*chs)
-            ns = summate(np, num_node_blocks = num_node_blocks)
+            ns = summate(np, num_node_blocks = num_node_blocks, sum_edge_ids_constructor = sum_edge_ids_constructor)
 
             return ns
 
@@ -93,7 +97,7 @@ def RAT_SPN(num_vars: int, num_latents: int, depth: int, num_repetitions: int, n
             root_ns = partition_ns(BitSet.from_array([v for v in range(num_vars)]))
             root_nps.append(root_ns.chs[0])
 
-        root_ns = summate(*root_nps, num_node_blocks = 1, block_size = 1)
+        root_ns = summate(*root_nps, num_node_blocks = 1, block_size = 1, sum_edge_ids_constructor = sum_edge_ids_constructor)
 
     return root_ns
     

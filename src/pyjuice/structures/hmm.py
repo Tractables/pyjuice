@@ -13,7 +13,8 @@ from .compilation import BayesianTreeToHiddenRegionGraph
 
 
 def HMM(seq_length: int, num_latents: int, num_emits: int, homogeneous: bool = True, block_size: Optional[int] = None,
-        alpha: Optional[torch.Tensor] = None, beta: Optional[torch.Tensor] = None, gamma: Optional[torch.Tensor] = None):
+        alpha: Optional[torch.Tensor] = None, beta: Optional[torch.Tensor] = None, gamma: Optional[torch.Tensor] = None,
+        sum_edge_ids_constructor: Optional[Callable] = None):
     """
     Constructs Hidden Markov Models.
 
@@ -40,6 +41,9 @@ def HMM(seq_length: int, num_latents: int, num_emits: int, homogeneous: bool = T
 
     :param gamma: optional init parameters of size `[num_latents]`
     :type gamma: Optional[torch.Tensor]
+
+    :param sum_edge_ids_constructor: optional helper functions to create special edge patterns (e.g., block-sparse)
+    :type sum_edge_ids_constructor: Callable
     """
     
     if block_size is None:
@@ -63,7 +67,7 @@ def HMM(seq_length: int, num_latents: int, num_emits: int, homogeneous: bool = T
             curr_xs = ns_input.duplicate(var, tie_params = homogeneous)
             
             if ns_sum is None:
-                ns = summate(curr_zs, num_node_blocks = num_node_blocks)
+                ns = summate(curr_zs, num_node_blocks = num_node_blocks, sum_edge_ids_constructor = sum_edge_ids_constructor)
                 if alpha is not None:
                     assert alpha.size(0) == num_latents and alpha.size(1) == num_latents
                     ns.set_params(alpha)
@@ -73,7 +77,7 @@ def HMM(seq_length: int, num_latents: int, num_emits: int, homogeneous: bool = T
 
             curr_zs = multiply(curr_xs, ns)
             
-        ns = summate(curr_zs, num_node_blocks = 1, block_size = 1)
+        ns = summate(curr_zs, num_node_blocks = 1, block_size = 1, sum_edge_ids_constructor = sum_edge_ids_constructor)
 
         if gamma is not None:
             assert gamma.dim() == 1 and gamma.size(0) == num_latents
@@ -85,7 +89,7 @@ def HMM(seq_length: int, num_latents: int, num_emits: int, homogeneous: bool = T
 def GeneralizedHMM(seq_length: int, num_latents: int, homogeneous: bool = True, block_size: Optional[int] = None,
                    alpha: Optional[torch.Tensor] = None, beta: Optional[torch.Tensor] = None, gamma: Optional[torch.Tensor] = None,
                    input_dist: Optional[Distribution] = None, input_node_type: Type[Distribution] = Categorical, 
-                   input_node_params: dict = {}):
+                   input_node_params: dict = {}, sum_edge_ids_constructor: Optional[Callable] = None):
     """
     Constructs Hidden Markov Models.
 
@@ -112,6 +116,9 @@ def GeneralizedHMM(seq_length: int, num_latents: int, homogeneous: bool = True, 
 
     :param gamma: optional init parameters of size `[num_latents]`
     :type gamma: Optional[torch.Tensor]
+
+    :param sum_edge_ids_constructor: optional helper functions to create special edge patterns (e.g., block-sparse)
+    :type sum_edge_ids_constructor: Callable
     """
 
     if input_dist is not None:
@@ -141,7 +148,7 @@ def GeneralizedHMM(seq_length: int, num_latents: int, homogeneous: bool = True, 
             curr_xs = ns_input.duplicate(var, tie_params = homogeneous)
             
             if ns_sum is None:
-                ns = summate(curr_zs, num_node_blocks = num_node_blocks)
+                ns = summate(curr_zs, num_node_blocks = num_node_blocks, sum_edge_ids_constructor = sum_edge_ids_constructor)
                 if alpha is not None:
                     assert alpha.size(0) == num_latents and alpha.size(1) == num_latents
                     ns.set_params(alpha)
@@ -151,7 +158,7 @@ def GeneralizedHMM(seq_length: int, num_latents: int, homogeneous: bool = True, 
 
             curr_zs = multiply(curr_xs, ns)
             
-        ns = summate(curr_zs, num_node_blocks = 1, block_size = 1)
+        ns = summate(curr_zs, num_node_blocks = 1, block_size = 1, sum_edge_ids_constructor = sum_edge_ids_constructor)
 
         if gamma is not None:
             assert gamma.dim() == 1 and gamma.size(0) == num_latents

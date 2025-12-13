@@ -104,6 +104,9 @@ def HCLT(x: torch.Tensor, num_latents: int,
 
     :param tie_input_params: whether to tie the input parameters
     :type tie_input_params: bool
+
+    :param sum_edge_ids_constructor: optional helper functions to create special edge patterns (e.g., block-sparse)
+    :type sum_edge_ids_constructor: Callable
     """
 
     if input_dist is not None:

@@ -120,7 +120,8 @@ def multiply(nodes1: ProdNodesChs, *args, edge_ids: Optional[Tensor] = None, spa
 
 
 def summate(nodes1: SumNodesChs, *args, num_node_blocks: int = 0, num_nodes: int = 0,
-            edge_ids: Optional[Tensor] = None, block_size: int = 0, **kwargs) -> SumNodes:
+            edge_ids: Optional[Tensor] = None, block_size: int = 0, 
+            sum_edge_ids_constructor: Optional[Callable] = None, **kwargs) -> SumNodes:
     """
     Construct a vector of sum nodes given a list of children PCs defined on the same sets of variables.
 
@@ -146,6 +147,9 @@ def summate(nodes1: SumNodesChs, *args, num_node_blocks: int = 0, num_nodes: int
     :param block_size: block size of the nodes; it does not change the semantics of the nodes, but will affect the speed of the compiled PC
     :type block_size: int
 
+    :param sum_edge_ids_constructor: optional helper functions to create special edge patterns (e.g., block-sparse)
+    :type sum_edge_ids_constructor: Callable
+
     :returns: an `SumNodes` object (a subclass of `CircuitNodes`)
     """
 
@@ -161,6 +165,9 @@ def summate(nodes1: SumNodesChs, *args, num_node_blocks: int = 0, num_nodes: int
         num_node_blocks = num_nodes // block_size
 
     assert isinstance(nodes1, ProdNodes) or isinstance(nodes1, InputNodes), f"Children of sum nodes must be input or product nodes, but found input of type {type(nodes1)}." 
+
+    if sum_edge_ids_constructor is not None:
+        edge_ids = sum_edge_ids_constructor(nodes1, *args, num_node_blocks = num_node_blocks, block_size = block_size, **kwargs)
 
     if edge_ids is not None and num_node_blocks == 0:
         num_node_blocks = edge_ids[0,:].max().item() + 1
