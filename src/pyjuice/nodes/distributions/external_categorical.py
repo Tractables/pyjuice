@@ -148,7 +148,9 @@ def _prep_args_apply_ll_w_mask_kernel(layer, kwargs):
 
 
 def _condition_apply_ll_bp_kernel(layer, kwargs):
-    return "extern_product_categorical_mode" in kwargs
+    return "extern_product_categorical_mode" in kwargs and \
+        kwargs["extern_product_categorical_mode"] in ("normalized_ll", "unnormalized_ll", "normalizing_constant") and \
+        "external_categorical_value_mask" not in kwargs
 
 
 def _prep_args_apply_ll_bp_kernel(layer, kwargs):
@@ -221,7 +223,9 @@ def _prep_args_apply_ll_bp_kernel(layer, kwargs):
 
 def _condition_apply_ll_bp_extern_grad_kernel(layer, kwargs):
     return "extern_product_categorical_mode" in kwargs and \
-        "external_categorical_logps_grad" in kwargs
+        "external_categorical_logps_grad" in kwargs and \
+        kwargs["extern_product_categorical_mode"] in ("normalized_ll", "unnormalized_ll", "normalizing_constant") and \
+        "external_categorical_value_mask" not in kwargs
 
 
 def _prep_args_apply_ll_bp_extern_grad_kernel(layer, kwargs):
@@ -287,6 +291,7 @@ def _prep_args_apply_ll_bp_extern_grad_kernel(layer, kwargs):
 
 
 def _condition_sample_kernel(layer, kwargs):
+    assert "external_categorical_logps" in kwargs, "`external_categorical_logps` must be provided."
     return "external_categorical_logps" in kwargs and kwargs["external_categorical_logps"].dim() == 3
 
 
