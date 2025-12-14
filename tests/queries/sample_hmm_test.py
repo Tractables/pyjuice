@@ -1,5 +1,7 @@
 import pyjuice as juice
 import torch
+import random
+import numpy as np
 
 import pytest
 
@@ -61,6 +63,11 @@ def make_peaked_distribution(shape, target_indices=None, noise_level=0.05):
 
 
 def test_sample_hmm_correctness():
+
+    seed_value = 328993719
+    random.seed(seed_value)
+    np.random.seed(seed_value)
+    torch.manual_seed(seed_value)
     
     device = torch.device("cuda:0")
 
