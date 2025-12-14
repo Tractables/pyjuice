@@ -291,7 +291,7 @@ def _prep_args_apply_ll_bp_extern_grad_kernel(layer, kwargs):
 
 
 def _condition_sample_kernel(layer, kwargs):
-    assert "external_categorical_logps" in kwargs, "`external_categorical_logps` must be provided."
+    assert "external_categorical_logps" in kwargs, "`external_categorical_logps` must be provided to sample from `ExternProductCategorical` distributions."
     return "external_categorical_logps" in kwargs and kwargs["external_categorical_logps"].dim() == 3
 
 
@@ -321,6 +321,36 @@ def _prep_args_sample_kernel(layer, kwargs):
     return target_kwargs, grid
 
 
+def _condition_sample_set_hard_context_kernel(layer, kwargs):
+    return "inputs" in kwargs and "external_categorical_value_mask" in kwargs
+
+
+def _prep_args_sample_set_hard_context_kernel(layer, kwargs):
+    target_kwargs = dict()
+
+    inputs = kwargs["inputs"]
+    external_categorical_value_mask = kwargs["external_categorical_value_mask"]
+    external_categorical_logps = kwargs["external_categorical_logps"]
+
+    batch_size = kwargs["batch_size"]
+    assert external_categorical_value_mask.size(0) == batch_size, "Batch size doesn't match."
+    assert inputs.size(0) == batch_size, "Batch size doesn't match."
+
+    target_kwargs["var_idmapping_ptr"] = layer.var_idmapping
+    target_kwargs["ext_num_vars"] = external_categorical_logps.size(1)
+
+    target_kwargs["num_vars"] = layer.pc_num_vars
+
+    target_kwargs["inputs_ptr"] = inputs
+    target_kwargs["external_categorical_value_mask_ptr"] = external_categorical_value_mask
+
+    target_kwargs["BLOCK_SIZE"] = min(512, triton.next_power_of_2(batch_size * target_kwargs["ext_num_vars"]))
+
+    grid = (triton.cdiv(batch_size * target_kwargs["ext_num_vars"], target_kwargs["BLOCK_SIZE"]),)
+
+    return target_kwargs, grid
+
+
 class ExternProductCategorical(Distribution):
     """
     A class representing a product distribution of two Categorical distributions: Pr_{A} * Pr_{B}.
@@ -346,7 +376,8 @@ class ExternProductCategorical(Distribution):
         ]
 
         self.sampling_fns = [
-            (self.sample_kernel, _condition_sample_kernel, _prep_args_sample_kernel)
+            (self.sample_kernel, _condition_sample_kernel, _prep_args_sample_kernel),
+            (self.sample_set_hard_context_kernel, _condition_sample_set_hard_context_kernel, _prep_args_sample_set_hard_context_kernel)
         ]
 
     def get_signature(self):
@@ -874,6 +905,33 @@ class ExternProductCategorical(Distribution):
         # Write back to `samples`
         sample_offsets = vids * batch_size + batch_offsets
         tl.store(samples_ptr + sample_offsets, sampled_ids, mask = mask)
+
+    @staticmethod
+    @triton_jit
+    def sample_set_hard_context_kernel(samples_ptr, params_ptr, nflow_xids_ptr, nflow_yids_ptr, vids_ptr, s_pids_ptr, metadata_ptr, s_mids_ptr,
+                                       num_activ_nodes, num_vars_per_node: tl.constexpr, nv_block_size: tl.constexpr, batch_size: tl.constexpr, seed,
+                                       var_idmapping_ptr, ext_num_vars: tl.constexpr, num_vars: tl.constexpr, inputs_ptr, external_categorical_value_mask_ptr, 
+                                       BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(axis = 0)
+        block_start = pid * BLOCK_SIZE
+
+        offsets = block_start + tl.arange(0, BLOCK_SIZE) # [BLOCK_SIZE]
+        mask = (offsets < batch_size * ext_num_vars)
+
+        offsets_b = (offsets // ext_num_vars)
+        offsets_v = (offsets % ext_num_vars)
+
+        # Variable indices
+        lvids = tl.load(var_idmapping_ptr + offsets_v, mask = mask, other = 0)
+
+        # Load mask value
+        val_mask = tl.load(external_categorical_value_mask_ptr + offsets_b * ext_num_vars + offsets_v, mask = mask, other = False)
+
+        # Load data
+        inputs = tl.load(inputs_ptr + offsets_b * num_vars + lvids, mask = mask, other = 0)
+
+        # Overwrite conditioned values to `samples`
+        tl.store(samples_ptr + offsets_v * batch_size + offsets_b, inputs, mask = (mask & val_mask))
 
     @staticmethod
     def bk_flow_mask_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
