@@ -49,6 +49,13 @@ class InputLayer(Layer, nn.Module):
         # Total number of variables
         self.pc_num_vars = pc_num_vars
 
+        # Layer scope
+        self.layer_scope = BitSet()
+        for ns in self.nodes:
+            self.layer_scope |= ns.scope
+        layer_var_list = torch.tensor(self.layer_scope.to_list()).long()
+        self.register_buffer("layer_var_list", layer_var_list)
+
         ## Parse input `nodes` ##
         node_vars = []
         node_sizes = []
