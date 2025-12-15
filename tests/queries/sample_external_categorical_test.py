@@ -2,6 +2,7 @@ import pyjuice as juice
 import torch
 import numpy as np
 import math
+import random
 
 import pyjuice.nodes.distributions as dists
 from pyjuice.utils import BitSet
@@ -12,6 +13,11 @@ import pytest
 
 
 def test_external_categorical_dist_sample():
+
+    seed_value = 328993719
+    random.seed(seed_value)
+    np.random.seed(seed_value)
+    torch.manual_seed(seed_value)
 
     num_cats = 3
     
@@ -47,6 +53,11 @@ def test_external_categorical_dist_sample():
 
 
 def test_external_categorical_dist_sample_with_mask():
+
+    seed_value = 328993719
+    random.seed(seed_value)
+    np.random.seed(seed_value)
+    torch.manual_seed(seed_value)
 
     num_cats = 3
     
@@ -90,6 +101,92 @@ def test_external_categorical_dist_sample_with_mask():
     assert torch.all(samples[64:,0] == 1)
 
 
+def test_external_categorical_dist_sample_additional1():
+
+    seed_value = 328993719
+    random.seed(seed_value)
+    np.random.seed(seed_value)
+    torch.manual_seed(seed_value)
+
+    num_cats = 3
+    
+    ni0 = juice.inputs(0, num_node_blocks = 2, block_size = 1, dist = dists.ExternProductCategorical(num_cats = num_cats))
+    ni1 = juice.inputs(1, num_node_blocks = 2, block_size = 1, dist = dists.ExternProductCategorical(num_cats = num_cats))
+
+    ms = multiply(ni0, ni1, edge_ids = torch.tensor([[0, 0], [0, 1], [1, 0], [1, 1]], dtype = torch.long))
+    ns = summate(ms, edge_ids = torch.tensor([[0, 0, 0, 0], [0, 1, 2, 3]], dtype = torch.long), block_size = 1)
+
+    ns.init_parameters(perturbation = 16)
+    ni0._params[0:num_cats] = 1 / num_cats
+    ni0._params[num_cats:] = ni0._params[:num_cats]
+    ni1._params[0:num_cats] = 1 / num_cats
+    ni1._params[num_cats:] = ni1._params[:num_cats]
+
+    pc = TensorCircuit(ns)
+
+    device = torch.device("cuda:0")
+    pc.to(device)
+
+    external_categorical_logps = torch.ones([128, 2, num_cats], device = device) * 0.1 / num_cats
+    rand_indices = torch.randint(0, num_cats, [128 * 2], device = device)
+    range_indices = torch.arange(0, 128 * 2, device = device)
+    external_categorical_logps = external_categorical_logps.flatten(0, 1)
+    external_categorical_logps[range_indices, rand_indices] += 1.0
+
+    external_categorical_logps = external_categorical_logps.reshape(128, 2, num_cats)
+    external_categorical_logps /= external_categorical_logps.sum(dim = 2, keepdim = True)
+    external_categorical_logps = external_categorical_logps.log()
+
+    samples = juice.queries.sample(pc, num_samples = 128, external_categorical_logps = external_categorical_logps)
+
+    frac_match = (samples == external_categorical_logps.max(dim = 2).indices).float().mean()
+    assert abs(frac_match - 1 / 1.1) < 0.1
+
+
+def test_external_categorical_dist_sample_additional2():
+
+    seed_value = 328993719
+    random.seed(seed_value)
+    np.random.seed(seed_value)
+    torch.manual_seed(seed_value)
+
+    num_cats = 3321
+    
+    ni0 = juice.inputs(0, num_node_blocks = 2, block_size = 1, dist = dists.ExternProductCategorical(num_cats = num_cats))
+    ni1 = juice.inputs(1, num_node_blocks = 2, block_size = 1, dist = dists.ExternProductCategorical(num_cats = num_cats))
+
+    ms = multiply(ni0, ni1, edge_ids = torch.tensor([[0, 0], [0, 1], [1, 0], [1, 1]], dtype = torch.long))
+    ns = summate(ms, edge_ids = torch.tensor([[0, 0, 0, 0], [0, 1, 2, 3]], dtype = torch.long), block_size = 1)
+
+    ns.init_parameters(perturbation = 16)
+    ni0._params[0:num_cats] = 1 / num_cats
+    ni0._params[num_cats:] = ni0._params[:num_cats]
+    ni1._params[0:num_cats] = 1 / num_cats
+    ni1._params[num_cats:] = ni1._params[:num_cats]
+
+    pc = TensorCircuit(ns)
+
+    device = torch.device("cuda:0")
+    pc.to(device)
+
+    external_categorical_logps = torch.ones([128, 2, num_cats], device = device) * 0.1 / num_cats
+    rand_indices = torch.randint(0, num_cats, [128 * 2], device = device)
+    range_indices = torch.arange(0, 128 * 2, device = device)
+    external_categorical_logps = external_categorical_logps.flatten(0, 1)
+    external_categorical_logps[range_indices, rand_indices] += 1.0
+
+    external_categorical_logps = external_categorical_logps.reshape(128, 2, num_cats)
+    external_categorical_logps /= external_categorical_logps.sum(dim = 2, keepdim = True)
+    external_categorical_logps = external_categorical_logps.log()
+
+    samples = juice.queries.sample(pc, num_samples = 128, external_categorical_logps = external_categorical_logps)
+
+    frac_match = (samples == external_categorical_logps.max(dim = 2).indices).float().mean()
+    assert abs(frac_match - 1 / 1.1) < 0.1
+
+
 if __name__ == "__main__":
     test_external_categorical_dist_sample()
     test_external_categorical_dist_sample_with_mask()
+    test_external_categorical_dist_sample_additional1()
+    test_external_categorical_dist_sample_additional2()
