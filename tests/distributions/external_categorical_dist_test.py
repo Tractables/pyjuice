@@ -2,6 +2,7 @@ import pyjuice as juice
 import torch
 import numpy as np
 import math
+import time
 
 import pyjuice.nodes.distributions as dists
 from pyjuice.utils import BitSet
@@ -120,7 +121,7 @@ def test_external_categorical_dist_fw_dim2():
 
 def test_external_categorical_dist_fw_w_mask():
 
-    num_cats = 3298
+    num_cats = 128
     
     ni0 = inputs(0, num_node_blocks = 2, block_size = 32, dist = dists.ExternProductCategorical(num_cats = num_cats))
     ni1 = inputs(1, num_node_blocks = 2, block_size = 32, dist = dists.ExternProductCategorical(num_cats = num_cats))
@@ -184,6 +185,119 @@ def test_external_categorical_dist_fw_w_mask():
 
         pc_mars = norm_node_mars[sid:eid,8:].permute(1, 0)
         assert torch.all(torch.abs(pc_mars - normalized_logp[8:,:]) < 1e-4)
+
+
+def test_external_categorical_dist_fw_w_mask_large():
+
+    num_cats = 329800
+    
+    ni0 = inputs(0, num_node_blocks = 2, block_size = 32, dist = dists.ExternProductCategorical(num_cats = num_cats))
+    ni1 = inputs(1, num_node_blocks = 2, block_size = 32, dist = dists.ExternProductCategorical(num_cats = num_cats))
+
+    ms = multiply(ni0, ni1, edge_ids = torch.tensor([[0, 0], [0, 1], [1, 0], [1, 1]], dtype = torch.long))
+    ns = summate(ms, edge_ids = torch.tensor([[0, 0, 0, 0, 1, 1, 1, 1], [0, 1, 2, 3, 0, 1, 2, 3]], dtype = torch.long), block_size = 1)
+
+    pc = TensorCircuit(ns)
+
+    device = torch.device("cuda:0")
+    pc.to(device)
+
+    data = torch.randint(0, num_cats, [16, 2]).to(device)
+
+    external_categorical_logps = torch.rand([16, 2, num_cats], device = device)
+    external_categorical_logps /= external_categorical_logps.sum(dim = 2, keepdim = True)
+    external_categorical_logps = external_categorical_logps.log()
+
+    external_categorical_value_mask = torch.zeros([16, 2], dtype = torch.bool, device = device)
+    external_categorical_value_mask[8:,:] = True
+
+    lls = pc(data, external_categorical_logps = external_categorical_logps, extern_product_categorical_mode = "unnormalized_ll",
+             external_categorical_value_mask = external_categorical_value_mask)
+
+    unnorm_node_mars = pc.node_mars.detach().clone()
+
+    lls = pc(data, external_categorical_logps = external_categorical_logps, extern_product_categorical_mode = "normalized_ll",
+             external_categorical_value_mask = external_categorical_value_mask)
+
+    norm_node_mars = pc.node_mars.detach().clone()
+
+    num_latents = 64
+
+    layer = pc.input_layer_group[0]
+    vids = layer.vids[::num_latents,0]
+    for i in range(pc.num_vars):
+        v = vids[i]
+        sid = layer._output_ind_range[0] + i * num_latents
+        eid = layer._output_ind_range[0] + (i + 1) * num_latents
+
+        internal_params = layer.params[layer.s_pids[i*num_latents:(i+1)*num_latents][:,None] + torch.arange(0, num_cats, device = device)[None,:]]
+        external_params = external_categorical_logps[:,v,:].exp()
+
+        params = internal_params[None,:,:] * external_params[:,None,:]
+
+        normalized_params = params.log() - params.log().logsumexp(dim = 2, keepdim = True)
+
+        logz = params.sum(dim = 2).log()
+
+        normalized_logp = normalized_params.gather(2, data[:,v][:,None,None].expand(16, num_latents, 1)).squeeze(-1)
+        unnormalized_logp = params.gather(2, data[:,v][:,None,None].expand(16, num_latents, 1)).squeeze(-1).log()
+
+        pc_mars = unnorm_node_mars[sid:eid,:8].permute(1, 0)
+        assert torch.all(torch.abs(pc_mars - logz[:8,:]) < 1e-3)
+
+        pc_mars = unnorm_node_mars[sid:eid,8:].permute(1, 0)
+        assert torch.all(torch.abs(pc_mars - unnormalized_logp[8:,:]) < 1e-3)
+
+        pc_mars = norm_node_mars[sid:eid,:8].permute(1, 0)
+        assert torch.all(torch.abs(pc_mars - logz[:8,:]) < 1e-3)
+
+        pc_mars = norm_node_mars[sid:eid,8:].permute(1, 0)
+        assert torch.all(torch.abs(pc_mars - normalized_logp[8:,:]) < 1e-3)
+
+
+def test_external_categorical_dist_fw_w_mask_speed():
+
+    num_cats = 329800
+    
+    ni0 = inputs(0, num_node_blocks = 2, block_size = 1024, dist = dists.ExternProductCategorical(num_cats = num_cats))
+    ni1 = inputs(1, num_node_blocks = 2, block_size = 1024, dist = dists.ExternProductCategorical(num_cats = num_cats))
+
+    ms = multiply(ni0, ni1, edge_ids = torch.tensor([[0, 0], [0, 1], [1, 0], [1, 1]], dtype = torch.long))
+    ns = summate(ms, edge_ids = torch.tensor([[0, 0, 0, 0, 1, 1, 1, 1], [0, 1, 2, 3, 0, 1, 2, 3]], dtype = torch.long), block_size = 1)
+
+    pc = TensorCircuit(ns)
+
+    device = torch.device("cuda:0")
+    pc.to(device)
+
+    data = torch.randint(0, num_cats, [16, 2]).to(device)
+
+    external_categorical_logps = torch.rand([16, 2, num_cats], device = device)
+    external_categorical_logps /= external_categorical_logps.sum(dim = 2, keepdim = True)
+    external_categorical_logps = external_categorical_logps.log()
+
+    external_categorical_value_mask = torch.zeros([16, 2], dtype = torch.bool, device = device)
+    external_categorical_value_mask[8:,:] = True
+
+    lls = pc(data, external_categorical_logps = external_categorical_logps, extern_product_categorical_mode = "unnormalized_ll",
+             external_categorical_value_mask = external_categorical_value_mask)
+
+    torch.cuda.synchronize()
+    t0 = time.time()
+
+    for _ in range(10):
+        lls = pc(data, external_categorical_logps = external_categorical_logps, extern_product_categorical_mode = "unnormalized_ll",
+                external_categorical_value_mask = external_categorical_value_mask)
+
+    torch.cuda.synchronize()
+    t1 = time.time()
+
+    runtime = (t1 - t0) / 10 * 1000
+
+    print("==============================================================")
+    print(f"Forward pass on average takes {runtime:.3f}ms.")
+    print(f"Reference computation time on A40: {12.8716:.3f}ms.")
+    print("==============================================================")
 
 
 def test_external_categorical_dist_bk_param_only():
@@ -568,6 +682,8 @@ if __name__ == "__main__":
     test_external_categorical_dist_fw()
     test_external_categorical_dist_fw_dim2()
     test_external_categorical_dist_fw_w_mask()
+    test_external_categorical_dist_fw_w_mask_large()
+    test_external_categorical_dist_fw_w_mask_speed()
     test_external_categorical_dist_bk_param_only()
     test_external_categorical_dist_bk_param_only_w_mask()
     test_external_categorical_dist_bk_ext_grad()
