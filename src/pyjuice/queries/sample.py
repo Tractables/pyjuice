@@ -470,4 +470,5 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
         return samples.permute(1, 0).contiguous()
     else:
         # In this case, we do not explicitly sample input nodes
+        push_non_neg_ones_to_front(node_samples)
         return node_samples
