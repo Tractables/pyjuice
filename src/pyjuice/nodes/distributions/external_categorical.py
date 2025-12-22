@@ -246,7 +246,8 @@ def _prep_args_apply_ll_w_mask_fast_kernel(layer, kwargs):
 
 
 def _condition_apply_ll_bp_kernel(layer, kwargs):
-    return "extern_product_categorical_mode" in kwargs and \
+    return ("no_param_update" not in kwargs or not kwargs["no_param_update"]) and \
+        "extern_product_categorical_mode" in kwargs and \
         kwargs["extern_product_categorical_mode"] in ("normalized_ll", "unnormalized_ll", "normalizing_constant") and \
         ("external_categorical_value_mask" not in kwargs or kwargs["external_categorical_value_mask"] is None)
 
@@ -320,7 +321,8 @@ def _prep_args_apply_ll_bp_kernel(layer, kwargs):
 
 
 def _condition_apply_ll_bp_w_mask_kernel1(layer, kwargs):
-    return "extern_product_categorical_mode" in kwargs and \
+    return ("no_param_update" not in kwargs or not kwargs["no_param_update"]) and \
+        "extern_product_categorical_mode" in kwargs and \
         kwargs["extern_product_categorical_mode"] in ("normalized_ll", "unnormalized_ll") and \
         ("external_categorical_value_mask" in kwargs and kwargs["external_categorical_value_mask"] is not None)
 
@@ -378,7 +380,8 @@ def _prep_args_apply_ll_bp_w_mask_kernel1(layer, kwargs):
 
 
 def _condition_apply_ll_bp_w_mask_kernel2(layer, kwargs):
-    return "extern_product_categorical_mode" in kwargs and \
+    return ("no_param_update" not in kwargs or not kwargs["no_param_update"]) and \
+        "extern_product_categorical_mode" in kwargs and \
         kwargs["extern_product_categorical_mode"] in ("normalized_ll", "unnormalized_ll") and \
         ("external_categorical_value_mask" in kwargs and kwargs["external_categorical_value_mask"] is not None)
 

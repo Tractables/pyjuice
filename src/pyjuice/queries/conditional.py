@@ -13,6 +13,11 @@ from pyjuice.utils import BitSet
 from pyjuice.utils.kernel_launcher import FastJITFunction
 from .base import query
 
+# `juice.distributions.ExternProductCategorical`
+from pyjuice.nodes.distributions.external_categorical import ExternProductCategorical
+from pyjuice.nodes.distributions.external_categorical import _condition_apply_ll_kernel, _prep_args_apply_ll_kernel
+from pyjuice.nodes.distributions.external_categorical import _condition_apply_ll_w_mask_kernel, _prep_args_apply_ll_w_mask_kernel
+
 
 ## Categorical layer ##
 
@@ -110,6 +115,14 @@ def _categorical_forward(layer, inputs: torch.Tensor, node_mars: torch.Tensor,
         raise NotImplementedError("Unknown method to compute the forward pass for `Categorical`.")
 
     return None
+
+
+def _external_categorical_forward(layer, inputs: torch.Tensor, node_mars: torch.Tensor,
+                                  missing_mask: Optional[torch.Tensor] = None, **kwargs):
+    
+    inputs = inputs.permute(1, 0).contiguous()
+
+    layer.forward(data = inputs, node_mars = node_mars, missing_mask = missing_mask, **kwargs)
 
 
 @triton.jit
@@ -324,6 +337,25 @@ def _categorical_backward(layer, inputs: torch.Tensor, node_flows: torch.Tensor,
     return cat_probs
 
 
+def _external_categorical_backward(pc, layer, inputs: torch.Tensor, node_flows: torch.Tensor, node_mars: torch.Tensor,
+                                   params: Optional[torch.Tensor] = None, **kwargs):
+    
+    assert "target_vars" not in kwargs
+
+    # num_vars = layer.vids.max().item() + 1
+    num_cats = int(layer.metadata[layer.s_mids].max().item())
+    batch_size = node_flows.size(1)
+
+    num_vars = layer.var_idmapping.size(0)
+
+    external_categorical_logps_grad = torch.zeros([batch_size, num_vars, num_cats], dtype = torch.float32, device = node_flows.device)
+    kwargs["external_categorical_logps_grad"] = external_categorical_logps_grad
+
+    kwargs["no_param_update"] = True
+    kwargs["extern_product_categorical_mode"] = "normalizing_constant"
+
+    layer.backward(inputs, node_flows, node_mars, logspace_flows = False, **kwargs)
+
 @triton.jit
 def _discrete_logistic_backward_kernel(cat_probs_ptr, node_flows_ptr, local_ids_ptr, rev_vars_mapping_ptr, vids_ptr, psids_ptr, 
                                        msids_ptr, metadata_ptr, params_ptr, sid, eid, num_target_nodes, 
@@ -444,11 +476,14 @@ def _conditional_fw_input_fn(layer, inputs, node_mars, **kwargs):
     elif layer.dist_signature == "DiscreteLogistic":
         _discrete_logistic_forward(layer, inputs, node_mars, **kwargs)
 
+    elif layer.dist_signature == "ExternProductCategorical":
+        _external_categorical_forward(layer, inputs, node_mars, **kwargs)
+
     else:
         raise TypeError(f"Unknown/unsupported layer type {type(layer)} for the forward pass. Please implement and provide your own `fw_input_fn`.")
 
 
-def _conditional_bk_input_fn(layer, inputs, node_flows, node_mars, outputs = None, **kwargs):
+def _conditional_bk_input_fn(pc, layer, inputs, node_flows, node_mars, outputs = None, **kwargs):
     if layer.dist_signature == "Categorical":
         outputs.append(
             _categorical_backward(layer, inputs, node_flows, node_mars, layer.params, **kwargs)
@@ -457,6 +492,11 @@ def _conditional_bk_input_fn(layer, inputs, node_flows, node_mars, outputs = Non
     elif layer.dist_signature == "DiscreteLogistic":
         outputs.append(
             _discrete_logistic_backward(layer, inputs, node_flows, node_mars, layer.params, **kwargs)
+        )
+
+    elif layer.dist_signature == "ExternProductCategorical":
+        outputs.append(
+            _external_categorical_backward(pc, layer, inputs, node_flows, node_mars, layer.params, **kwargs)
         )
 
     else:
@@ -491,7 +531,7 @@ def conditional(pc: TensorCircuit, data: torch.Tensor, missing_mask: Optional[to
 
     outputs = []
 
-    _wrapped_bk_input_fn = partial(_conditional_bk_input_fn, outputs = outputs)
+    _wrapped_bk_input_fn = partial(_conditional_bk_input_fn, outputs = outputs, pc = pc)
 
     kwargs["target_vars"] = target_vars
 
