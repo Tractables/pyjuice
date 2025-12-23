@@ -445,7 +445,7 @@ def _condition_apply_ll_bp_extern_grad_kernel(layer, kwargs):
     return "extern_product_categorical_mode" in kwargs and \
         "external_categorical_logps_grad" in kwargs and \
         kwargs["extern_product_categorical_mode"] in ("normalized_ll", "unnormalized_ll", "normalizing_constant") and \
-        ("external_categorical_value_mask" not in kwargs or kwargs["external_categorical_value_mask"] is None)
+        (kwargs["extern_product_categorical_mode"] == "normalizing_constant" or "external_categorical_value_mask" not in kwargs or kwargs["external_categorical_value_mask"] is None)
 
 
 def _prep_args_apply_ll_bp_extern_grad_kernel(layer, kwargs):

@@ -337,10 +337,10 @@ def _categorical_backward(layer, inputs: torch.Tensor, node_flows: torch.Tensor,
     return cat_probs
 
 
-def _external_categorical_backward(pc, layer, inputs: torch.Tensor, node_flows: torch.Tensor, node_mars: torch.Tensor,
+def _external_categorical_backward(layer, inputs: torch.Tensor, node_flows: torch.Tensor, node_mars: torch.Tensor,
                                    params: Optional[torch.Tensor] = None, **kwargs):
     
-    assert "target_vars" not in kwargs
+    assert "target_vars" not in kwargs or kwargs["target_vars"] is None
 
     # num_vars = layer.vids.max().item() + 1
     num_cats = int(layer.metadata[layer.s_mids].max().item())
@@ -348,13 +348,17 @@ def _external_categorical_backward(pc, layer, inputs: torch.Tensor, node_flows: 
 
     num_vars = layer.var_idmapping.size(0)
 
-    external_categorical_logps_grad = torch.zeros([batch_size, num_vars, num_cats], dtype = torch.float32, device = node_flows.device)
-    kwargs["external_categorical_logps_grad"] = external_categorical_logps_grad
+    cat_probs = torch.zeros([batch_size, num_vars, num_cats], dtype = torch.float32, device = node_flows.device)
+    kwargs["external_categorical_logps_grad"] = cat_probs
 
     kwargs["no_param_update"] = True
     kwargs["extern_product_categorical_mode"] = "normalizing_constant"
 
-    layer.backward(inputs, node_flows, node_mars, logspace_flows = False, **kwargs)
+    layer.backward(inputs, node_flows, node_mars, **kwargs)
+
+    cat_probs /= (cat_probs.sum(dim = 2, keepdim = True) + 1e-12)
+
+    return cat_probs
 
 @triton.jit
 def _discrete_logistic_backward_kernel(cat_probs_ptr, node_flows_ptr, local_ids_ptr, rev_vars_mapping_ptr, vids_ptr, psids_ptr, 
@@ -483,7 +487,7 @@ def _conditional_fw_input_fn(layer, inputs, node_mars, **kwargs):
         raise TypeError(f"Unknown/unsupported layer type {type(layer)} for the forward pass. Please implement and provide your own `fw_input_fn`.")
 
 
-def _conditional_bk_input_fn(pc, layer, inputs, node_flows, node_mars, outputs = None, **kwargs):
+def _conditional_bk_input_fn(layer, inputs, node_flows, node_mars, outputs = None, **kwargs):
     if layer.dist_signature == "Categorical":
         outputs.append(
             _categorical_backward(layer, inputs, node_flows, node_mars, layer.params, **kwargs)
@@ -496,7 +500,7 @@ def _conditional_bk_input_fn(pc, layer, inputs, node_flows, node_mars, outputs =
 
     elif layer.dist_signature == "ExternProductCategorical":
         outputs.append(
-            _external_categorical_backward(pc, layer, inputs, node_flows, node_mars, layer.params, **kwargs)
+            _external_categorical_backward(layer, inputs, node_flows, node_mars, layer.params, **kwargs)
         )
 
     else:
@@ -531,7 +535,7 @@ def conditional(pc: TensorCircuit, data: torch.Tensor, missing_mask: Optional[to
 
     outputs = []
 
-    _wrapped_bk_input_fn = partial(_conditional_bk_input_fn, outputs = outputs, pc = pc)
+    _wrapped_bk_input_fn = partial(_conditional_bk_input_fn, outputs = outputs)
 
     kwargs["target_vars"] = target_vars
 
