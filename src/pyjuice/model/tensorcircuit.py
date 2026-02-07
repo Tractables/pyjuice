@@ -739,6 +739,61 @@ class TensorCircuit(nn.Module):
 
             return self.element_flows[nsid:neid,:].detach()
 
+    def get_node_params(self, ns: CircuitNodes, clone: bool = True, **kwargs):
+        """
+        Retrieve the node parameters of `ns`.
+
+        :params ns: the target nodes
+        :type ns: CircuitNodes
+
+        :params clone: whether to clone the parameters
+        :type clone: bool
+        """
+        assert self.root_ns.contains(ns)
+        assert hasattr(self, "params") and self.params is not None
+
+        if not ns.is_sum() or ns.is_tied():
+            return None
+
+        psid, peid = ns._param_range
+        if clone:
+            ns_params = params[psid:peid].detach().clone()
+        else:
+            ns_params = params[psid:peid]
+
+        local_parids = (ns._param_ids - psid) // (ns.block_size * ns.ch_block_size)
+        num_parblocks = local_parids.size(0)
+        ns_params = ns_params.reshape(num_parblocks, ns.ch_block_size, ns.block_size)
+
+        return ns_params[local_parids,:,:].permute(0, 2, 1)
+
+    def get_node_param_flows(self, ns: CircuitNodes, clone: bool = True, **kwargs):
+        """
+        Retrieve the node parameter flows of `ns`.
+
+        :params ns: the target nodes
+        :type ns: CircuitNodes
+
+        :params clone: whether to clone the parameter flows
+        :type clone: bool
+        """
+        assert self.root_ns.contains(ns)
+        assert hasattr(self, "param_flows") and self.param_flows is not None
+
+        if not ns.is_sum() or ns.is_tied():
+            return None
+
+        pfsid, pfeid = ns._param_flow_range
+        if clone:
+            ns_param_flows = param_flows[pfsid:pfeid].detach().clone()
+        else:
+            ns_param_flows = param_flows[pfsid:pfeid]
+
+        local_parfids = (ns._param_flow_ids - pfsid) // (ns.block_size * ns.ch_block_size)
+        num_parfblocks = local_parfids.size(0)
+        ns_param_flows = ns_param_flows.reshape(num_parfblocks, ns.ch_block_size, ns.block_size)
+        return ns_param_flows[local_parfids,:,:].permute(0, 2, 1)
+
     def layers(self, reverse: bool = False, ret_layer_groups: bool = False, ignore_input_layers: bool = False):
         """
         Returns an iterator of all PC layers.
