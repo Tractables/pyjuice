@@ -188,10 +188,10 @@ class CircuitNodes():
     def is_tied(self):
         return self._source_node is not None
 
-    def get_params(self):
+    def get_params(self, *args, **kwargs):
         return None
 
-    def get_param_flows(self):
+    def get_param_flows(self, *args, **kwargs):
         return None
 
     def get_source_ns(self):

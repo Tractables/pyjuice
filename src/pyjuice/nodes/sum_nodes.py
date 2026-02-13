@@ -113,22 +113,61 @@ class SumNodes(CircuitNodes):
 
         return SumNodes(self.num_node_blocks, chs, edge_ids, params = params, block_size = self.block_size, source_node = self if tie_params else None)
 
-    def get_params(self):
+    def get_params(self, as_matrix: bool = False):
         """
         Get the sum node parameters.
         """
         if not hasattr(self, "_params"):
             return None
-        return self._params
+        
+        if not as_matrix:
+            return self._params
+        else:
+            num_node_blocks = self.num_node_blocks
+            block_size = self.block_size
+            num_ch_node_blocks = sum((cs.num_node_blocks for cs in self.chs))
+            ch_block_size = self.chs[0].block_size
 
-    def get_param_flows(self) -> torch.Tensor:
+            params = torch.zeros([num_node_blocks * num_ch_node_blocks, block_size, ch_block_size], dtype = torch.float32)
+
+            idxs = self.edge_ids[0,:] * num_ch_node_blocks + self.edge_ids[1,:]
+            params[idxs,:,:] = self._params
+
+            params = params.reshape(
+                num_node_blocks, num_ch_node_blocks, block_size, ch_block_size
+            ).permute(0, 2, 1, 3).reshape(
+                num_node_blocks * block_size, num_ch_node_blocks * ch_block_size
+            )
+
+            return params
+
+    def get_param_flows(self, as_matrix: bool = False) -> torch.Tensor:
         """
         Get the sum node parameter flows.
         """
         if not self.provided("_param_flows"):
             return None
-        else:
+        
+        if not as_matrix:
             return self._param_flows
+        else:
+            num_node_blocks = self.num_node_blocks
+            block_size = self.block_size
+            num_ch_node_blocks = sum((cs.num_node_blocks for cs in self.chs))
+            ch_block_size = self.chs[0].block_size
+
+            param_flows = torch.zeros([num_node_blocks * num_ch_node_blocks, block_size, ch_block_size], dtype = torch.float32)
+
+            idxs = self.edge_ids[0,:] * num_ch_node_blocks + self.edge_ids[1,:]
+            param_flows[idxs,:,:] = self._param_flows
+
+            param_flows = param_flows.reshape(
+                num_node_blocks, num_ch_node_blocks, block_size, ch_block_size
+            ).permute(0, 2, 1, 3).reshape(
+                num_node_blocks * block_size, num_ch_node_blocks * ch_block_size
+            )
+
+            return param_flows
 
     def set_params(self, params: torch.Tensor, normalize: bool = True, pseudocount: float = 0.0):
         """
