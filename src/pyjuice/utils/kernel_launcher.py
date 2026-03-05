@@ -3,7 +3,7 @@ import triton
 from typing import Callable, Tuple, Union
 
 
-class FastJITFunction():
+class FastJITFunction:
     def __init__(self, fn: Callable, device_check: bool = False):
         self.jit_fn = triton.JITFunction(fn)
 
@@ -11,19 +11,29 @@ class FastJITFunction():
 
         try:
             self.constexpr_ids = [p.num for p in self.jit_fn.params if p.is_constexpr]
-            self.constexpr_names = {p.name: p.num for p in self.jit_fn.params if p.is_constexpr}
-            self.nonconstexpr_names = [p.name for p in self.jit_fn.params if not p.is_constexpr]
+            self.constexpr_names = {
+                p.name: p.num for p in self.jit_fn.params if p.is_constexpr
+            }
+            self.nonconstexpr_names = [
+                p.name for p in self.jit_fn.params if not p.is_constexpr
+            ]
         except AttributeError:
             self.constexpr_ids = self.jit_fn.constexprs
-            self.constexpr_names = {self.jit_fn.arg_names[i]: i for i in self.jit_fn.constexprs}
-            self.nonconstexpr_names = [self.jit_fn.arg_names[i] for i in range(len(self.jit_fn.arg_names)) if i not in self.jit_fn.constexprs]
+            self.constexpr_names = {
+                self.jit_fn.arg_names[i]: i for i in self.jit_fn.constexprs
+            }
+            self.nonconstexpr_names = [
+                self.jit_fn.arg_names[i]
+                for i in range(len(self.jit_fn.arg_names))
+                if i not in self.jit_fn.constexprs
+            ]
 
         self.constexpr_ids_set = set(self.constexpr_ids)
 
         self.cache = dict()
 
-    def __getitem__(self, grid: Union[Tuple,Callable]):
-        
+    def __getitem__(self, grid: Union[Tuple, Callable]):
+
         def wrapper(*args, **kwargs):
 
             nonlocal grid
@@ -37,7 +47,7 @@ class FastJITFunction():
                     if isinstance(arg, torch.Tensor):
                         device_id = arg.device.index
                         break
-                
+
                 if device_id == -1:
                     for k, v in kwargs.items():
                         if isinstance(v, torch.Tensor):
@@ -62,7 +72,11 @@ class FastJITFunction():
                 grid = grid(kwargs)
 
             grid_length = len(grid)
-            grid0, grid1, grid2 = grid[0], grid[1] if grid_length > 1 else 1, grid[2] if grid_length > 2 else 1
+            grid0, grid1, grid2 = (
+                grid[0],
+                grid[1] if grid_length > 1 else 1,
+                grid[2] if grid_length > 2 else 1,
+            )
 
             signature = tuple(signature_list)
             if signature in self.cache:
@@ -95,7 +109,24 @@ class FastJITFunction():
 
 
 def triton_jit(fn: Callable, device_check: bool = False):
-    if torch.__version__[0] == "2" and torch.__version__[2] <= "2":
-        return FastJITFunction(fn, device_check = device_check)
+    # FastJITFunction manually packs kernel arguments on the cached path,
+    # which is incompatible with triton >= 3.0 (changed CUDA launch ABI).
+    # Check the triton version first and only use FastJITFunction for triton 2.x.
+    try:
+        _triton_major = int(triton.__version__.split(".")[0])
+    except Exception:
+        _triton_major = 3  # assume modern triton if version can't be parsed
+
+    if _triton_major >= 3:
+        return triton.jit(fn)
+
+    # For triton 2.x with older torch, use the FastJITFunction optimisation
+    try:
+        _torch_minor = int(torch.__version__.split(".")[1])
+    except Exception:
+        _torch_minor = 99
+
+    if torch.__version__.startswith("2.") and _torch_minor <= 2:
+        return FastJITFunction(fn, device_check=device_check)
     else:
         return triton.jit(fn)
