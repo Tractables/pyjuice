@@ -11,6 +11,8 @@ class Distribution():
         self.post_bp_fns = []
         self.sampling_fns = []
 
+        self.requires_individual_node_counts = False
+
     def get_signature(self):
         """
         Get the signature of the current distribution.

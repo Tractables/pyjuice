@@ -9,32 +9,35 @@ from typing import Optional, Any, Union
 from .distributions import Distribution
 
 
-class Literal(Distribution):
+class Indicator(Distribution):
     """
-    A class representing Literal distributions.
+    A class representing Indicator distributions. It is a special case of `Literal`, and handles
+    the case where we want to have k nodes on X representing X = 0, X = 1, ..., X = k-1.
     """
-    def __init__(self, lit: Union[bool,int]):
-        super(Literal, self).__init__()
+    def __init__(self, num_states: int):
+        super(Indicator, self).__init__()
 
-        self.lit = int(lit) # Convert True/False to 1/0
+        self.num_states = num_states
+
+        self.requires_individual_node_counts = True
 
     def get_signature(self):
         """
         Get the signature of the current distribution.
         """
-        return "Literal"
+        return f"Indicator"
 
     def get_metadata(self):
         """
         Get the metadata of the current distribution.
         """
-        return [self.lit]
+        return []
 
     def num_parameters(self):
         """
         The number of parameters per node.
         """
-        return 0
+        return 1
 
     def num_param_flows(self):
         """
@@ -47,14 +50,20 @@ class Literal(Distribution):
         Initialize parameters for `num_nodes` nodes.
         Returned parameters should be flattened into a vector.
         """
+        assert "individual_node_counts" in kwargs
 
-        return torch.zeros(0)
+        params = torch.zeros([num_nodes], dtype = torch.float32)
+
+        sid = 0
+        for node_count in kwargs["individual_node_counts"]:
+            params[sid:sid+node_count] = torch.arange(node_count).float()
+            sid += node_count
+
+        return params
 
     @staticmethod
     def fw_mar_fn(local_offsets, data, params_ptr, s_pids, metadata_ptr, s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE):
-        s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
-        lit = tl.load(metadata_ptr + s_mids, mask = mask, other = 0).to(tl.int64)
-
+        lits = tl.load(params_ptr + s_pids, mask = mask, other = 0).to(tl.int64)
         probs = tl.where(data == lit, 1.0, 0.0)
         log_probs = tl.log(probs)
 
