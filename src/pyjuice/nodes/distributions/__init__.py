@@ -8,3 +8,4 @@ from .discrete_logistic import DiscreteLogistic
 from .masked_categorical import MaskedCategorical
 from .external import External
 from .external_categorical import ExternProductCategorical
+from .softevi_categorical import SoftEvidenceCategorical
