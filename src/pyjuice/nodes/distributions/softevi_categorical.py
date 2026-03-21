@@ -68,7 +68,7 @@ def _prep_args_apply_fw_kernel(layer, kwargs):
         K_NUM_TILES = triton.cdiv(num_cats, TILE_SIZE_K)
         BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
         BLOCK_SIZE_B = min(128, 2048 // TILE_SIZE_K, BATCH_SIZE_NP2)
-        BLOCK_SIZE_N = min(n_block_size, 2048 // TILE_SIZE_K, 2048 // TILE_SIZE_K)
+        BLOCK_SIZE_N = min(n_block_size, 2048 // TILE_SIZE_K, 2048 // BLOCK_SIZE_B)
 
     use_tensor_core = (TILE_SIZE_K >= 16) and (BLOCK_SIZE_B >= 16) and (BLOCK_SIZE_N >= 16) and not target_kwargs["has_ext_ids"]
 
@@ -105,7 +105,19 @@ def _prep_args_apply_bk_params_kernel(layer, kwargs):
     target_kwargs["soft_evidence_logp_ptr"] = soft_evidence_logp
     target_kwargs["var_idmapping_ptr"] = layer.var_idmapping
 
-    return target_kwargs
+    # Prepare block/grid size
+    assert not layer.provided("fw_local_ids")
+    n_block_size = max_power_of_2_factor(layer.n_block_size)
+
+    # prepare BLOCK_SIZE
+    BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
+    BLOCK_SIZE_B = min(128, 2048 // TILE_SIZE_K, BATCH_SIZE_NP2)
+    BLOCK_SIZE_N = min(n_block_size, 2048 // BLOCK_SIZE_B)
+
+    layer_num_nodes = layer._output_ind_range[1] - layer._output_ind_range[0]
+    grid = (triton.cdiv(batch_size, BLOCK_SIZE_B), triton.cdiv(layer_num_nodes, BLOCK_SIZE_N))
+
+    return target_kwargs, grid
 
 
 class SoftEvidenceCategorical(Distribution):
@@ -122,6 +134,10 @@ class SoftEvidenceCategorical(Distribution):
 
         self.post_fw_fns = [
             (self.fw_kernel, _condition_apply_fw_kernel, _prep_args_apply_fw_kernel)
+        ]
+
+        self.post_bp_fns = [
+            (self.bk_params_kernel, _condition_apply_bk_params_kernel, _prep_args_apply_bk_params_kernel)
         ]
 
     def get_signature(self):
@@ -335,6 +351,44 @@ class SoftEvidenceCategorical(Distribution):
         # Store results
         node_offsets = offsets_n + node_offset
         tl.store(node_mars_ptr + node_offsets[None,:] * batch_size + offsets_b[:,None], log_p, mask = (mask_b[:,None] & mask_n[None,:]))
+
+    @staticmethod
+    @triton_jit
+    def bk_params_kernel(params_ptr, param_flows_ptr, node_flows_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, s_pfids_ptr, metadata_ptr, s_mids_ptr, nids_ptr,
+                         bk_local_ids_ptr, layer_num_nodes, batch_size, num_vars_per_node: tl.constexpr, num_vars: tl.constexpr, nv_block_size: tl.constexpr,
+                         node_offset, partial_eval: tl.constexpr, logspace_flows: tl.constexpr, BLOCK_SIZE_B: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, 
+                         soft_evidence_logp_ptr, var_idmapping_ptr, num_cats: tl.constexpr, ext_num_vars: tl.constexpr):
+
+        pid_b = tl.program_id(axis = 0)
+        pid_n = tl.program_id(axis = 1)
+
+        offsets_b = pid_b * BLOCK_SIZE_B + tl.arange(0, BLOCK_SIZE_B)
+        offsets_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+
+        mask_b = offsets_b < batch_size
+        mask_n = offsets_n < layer_num_nodes
+        mask_nb = mask_n[:,None] & mask_b[None,:]
+
+        offset_n = pid_n * BLOCK_SIZE_N
+
+        # Get all variable ids
+        vids = tl.load(vids_ptr + offsets_n, mask = mask_n, other = 0) # [BLOCK_SIZE_N]
+
+        # Get start parameter flow indices
+        s_pfids = tl.load(s_pfids_ptr + offsets_n, mask = mask_n, other = 0) # [BLOCK_SIZE_N]
+
+        # Get data
+        data = tl.load(data_ptr + vids[:,None] * batch_size + offsets_b[None,:], mask = mask_nb, other = 0) # [BLOCK_SIZE_N, BLOCK_SIZE_B]
+
+        # Load node flows
+        node_offsets = offsets_n + node_offset
+        nflows = tl.load(node_flows_ptr + node_offsets[:,None] * batch_size + offsets_b[None,:], mask = mask_nb, other = 0.0) # [BLOCK_SIZE_N, BLOCK_SIZE_B]
+
+        if logspace_flows:
+            flows = flows.exp()
+
+        # Cumulate parameter flows
+        tl.atomic_add(param_flows_ptr + s_pfids[:,None] + data, flows, mask = mask_nb)
 
     @staticmethod
     def bk_flow_mask_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
