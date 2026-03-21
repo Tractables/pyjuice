@@ -59,11 +59,18 @@ def _prep_args_apply_fw_kernel(layer, kwargs):
     layer_num_nodes = layer._output_ind_range[1] - layer._output_ind_range[0]
 
     # prepare BLOCK_SIZE and TILE_SIZE_K
-    TILE_SIZE_K = min(64, triton.next_power_of_2(num_cats))
-    K_NUM_TILES = triton.cdiv(num_cats, TILE_SIZE_K)
-    BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
-    BLOCK_SIZE_B = min(128, 2048 // TILE_SIZE_K, BATCH_SIZE_NP2)
-    BLOCK_SIZE_N = min(n_block_size, 2048 // TILE_SIZE_K, 2048 // TILE_SIZE_K)
+    if target_kwargs["has_ext_ids"]:
+        TILE_SIZE_K = min(16, triton.next_power_of_2(num_cats))
+        K_NUM_TILES = triton.cdiv(num_cats, TILE_SIZE_K)
+        BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
+        BLOCK_SIZE_B = min(128, 1024 // TILE_SIZE_K, BATCH_SIZE_NP2)
+        BLOCK_SIZE_N = min(n_block_size, max(4096 // TILE_SIZE_K // TILE_SIZE_K, 1))
+    else:
+        TILE_SIZE_K = min(64, triton.next_power_of_2(num_cats))
+        K_NUM_TILES = triton.cdiv(num_cats, TILE_SIZE_K)
+        BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
+        BLOCK_SIZE_B = min(128, 2048 // TILE_SIZE_K, BATCH_SIZE_NP2)
+        BLOCK_SIZE_N = min(n_block_size, 2048 // TILE_SIZE_K, 2048 // TILE_SIZE_K)
 
     use_tensor_core = (TILE_SIZE_K >= 16) and (BLOCK_SIZE_B >= 16) and (BLOCK_SIZE_N >= 16) and not target_kwargs["has_ext_ids"]
 
