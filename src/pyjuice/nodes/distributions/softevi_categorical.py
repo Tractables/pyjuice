@@ -187,7 +187,7 @@ class SoftEvidenceCategorical(Distribution):
     def fw_kernel(params_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, metadata_ptr, s_mids_ptr, nids_ptr, fw_local_ids_ptr, layer_num_nodes,
                   batch_size, num_vars_per_node: tl.constexpr, nv_block_size: tl.constexpr, node_offset, partial_eval: tl.constexpr,
                   TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, BLOCK_SIZE_B: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, use_tensor_core: tl.constexpr,
-                  soft_evidence_logp_ptr, soft_evidence_cat_ids_ptr, var_idmapping_ptr, num_cats: tl.constexpr, ext_num_vars: tl.constexpr, has_ext_ids: tl.constexpr)
+                  soft_evidence_logp_ptr, soft_evidence_cat_ids_ptr, var_idmapping_ptr, num_cats: tl.constexpr, ext_num_vars: tl.constexpr, has_ext_ids: tl.constexpr):
 
         pid_b = tl.program_id(axis = 0)
         pid_n = tl.program_id(axis = 1)
@@ -213,11 +213,12 @@ class SoftEvidenceCategorical(Distribution):
         # Ptrs pointing to external parameters
         expars_ptr = soft_evidence_logp_ptr + \
             offsets_b[:,None] * (ext_num_vars * num_cats) + \
-            lvid * max_num_cats + \
+            lvid * num_cats + \
             tl.arange(0, TILE_SIZE_K)[None,:] # [BLOCK_SIZE_B, TILE_SIZE_K]
 
         # Compute logZ
         logZ = tl.zeros([BLOCK_SIZE_B, BLOCK_SIZE_N], dtype = tl.float32) - float("inf")
+
         if has_ext_ids:
             # Ptrs pointing to internal parameters
             inpars_ptr = params_ptr + s_pids # [BLOCK_SIZE_N]
@@ -225,7 +226,7 @@ class SoftEvidenceCategorical(Distribution):
             # Ptrs pointing to external parameter indices
             catids_ptr = soft_evidence_cat_ids_ptr + \
                 offsets_b[:,None] * (ext_num_vars * num_cats) + \
-                lvid * max_num_cats + \
+                lvid * num_cats + \
                 tl.arange(0, TILE_SIZE_K)[None,:] # [BLOCK_SIZE_B, TILE_SIZE_K]
 
             for i in range(K_NUM_TILES):
@@ -258,7 +259,7 @@ class SoftEvidenceCategorical(Distribution):
         else:
             # Ptrs pointing to internal parameters
             inpars_ptr = params_ptr + \
-                tl.arange(0, TILE_SIZE_K)[:,None]
+                tl.arange(0, TILE_SIZE_K)[:,None] + \
                 s_pids[None,:] # [TILE_SIZE_K, BLOCK_SIZE_N]
 
             for i in range(K_NUM_TILES):
@@ -268,23 +269,23 @@ class SoftEvidenceCategorical(Distribution):
                 inpars = tl.load(inpars_ptr + i * TILE_SIZE_K, mask = (mask_c[:,None] & mask_n[None,:]), other = 0.0) # [TILE_SIZE_K, BLOCK_SIZE_N]
 
                 # Load the external parameters
-                expars = tl.load(expars + i * TILE_SIZE_K, mask = (mask_b[:,None] & mask_c[None,:]), other = 0.0) # [BLOCK_SIZE_B, TILE_SIZE_K]
+                expars = tl.load(expars_ptr + i * TILE_SIZE_K, mask = (mask_b[:,None] & mask_c[None,:]), other = 0.0) # [BLOCK_SIZE_B, TILE_SIZE_K]
 
                 expars_max = tl.max(expars, axis = 1)[:,None]
                 expars_sub = tl.exp(expars - expars_max)
 
                 if use_tensor_core:
-                    params = tl.dot(expars_sub, inpars).log() + expar_max
+                    params = tl.dot(expars_sub, inpars).log() + expars_max
                 else:
-                    params = tl.sum(expars_sub[:,:,None] * inpars[None,:,:], axis = 1).log() + expar_max
+                    params = tl.sum(expars_sub[:,:,None] * inpars[None,:,:], axis = 1).log() + expars_max
 
-                # Compute logaddexp(logZ, cum_params)
-                maxval = tl.maximum(logZ, cum_params)
-                minval = tl.minimum(logZ, cum_params)
+                # Compute logaddexp(logZ, params)
+                maxval = tl.maximum(logZ, params)
+                minval = tl.minimum(logZ, params)
                 diff = minval - maxval
 
                 logZ = tl.where(logZ == -float("inf"),
-                    cum_params,
+                    params,
                     maxval + tlmath.log1p(tl.exp(diff))
                 )
 
@@ -298,13 +299,13 @@ class SoftEvidenceCategorical(Distribution):
             # Ptrs pointing to external parameter indices
             catids_ptr = soft_evidence_cat_ids_ptr + \
                 offsets_b[:,None] * (ext_num_vars * num_cats) + \
-                lvid * max_num_cats + \
+                lvid * num_cats + \
                 tl.arange(0, TILE_SIZE_K)[None,:] # [BLOCK_SIZE_B, TILE_SIZE_K]
 
             # Ptrs pointing to external parameters
             expar_ptr = soft_evidence_logp_ptr + \
                 offsets_b * (ext_num_vars * num_cats) + \
-                lvid * max_num_cats # [BLOCK_SIZE_B]
+                lvid * num_cats # [BLOCK_SIZE_B]
 
             log_ex_p = tl.zeros([BLOCK_SIZE_B], dtype = tl.float32) - float("inf")
             for i in range(K_NUM_TILES):
