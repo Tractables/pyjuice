@@ -962,6 +962,9 @@ class InputLayer(Layer, nn.Module):
     def is_input(self):
         return True
 
+    def __repr__(self):
+        return f"InputLayer(nid_range=({self._output_ind_range[0]}, {self._output_ind_range[1]}), num_vars={len(self.layer_scope)})"
+
     def _reorder_nodes(self, nodes):
         node_set = set(nodes)
         reordered_untied_nodes = []

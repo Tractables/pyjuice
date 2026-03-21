@@ -256,6 +256,9 @@ class ProdLayer(Layer, nn.Module):
     def is_prod(self):
         return True
 
+    def __repr__(self):
+        return f"ProdLayer(nid_range=({self._layer_nid_range[0]}, {self._layer_nid_range[1]}), num_nodes={self.num_nodes}, num_edges={self.num_edges})"
+
     @staticmethod
     # @triton.jit
     @triton_jit

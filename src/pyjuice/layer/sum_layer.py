@@ -386,6 +386,9 @@ class SumLayer(Layer, nn.Module):
     def is_sum(self):
         return True
 
+    def __repr__(self):
+        return f"SumLayer(nid_range=({self._layer_nid_range[0]}, {self._layer_nid_range[1]}), num_nodes={self.num_nodes}, num_edges={self.num_edges})"
+
     def _forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor,
                  params: torch.Tensor, nids: torch.Tensor, cids: torch.Tensor,
                  pids: torch.Tensor, local_ids: Optional[torch.Tensor] = None,
