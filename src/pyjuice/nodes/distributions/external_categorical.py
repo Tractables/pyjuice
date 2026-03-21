@@ -8,6 +8,7 @@ from typing import Tuple, Optional, Any
 
 from .distributions import Distribution
 from pyjuice.utils.kernel_launcher import triton_jit
+from pyjuice.utils.util import max_power_of_2_factor
 
 # In the latest triton, math functions were shuffled around into different modules:
 # https://github.com/openai/triton/pull/3172
@@ -15,20 +16,6 @@ if hasattr(tl.extra.cuda, "libdevice"):
     tlmath = tl.extra.cuda.libdevice
 else:
     tlmath = tl.math
-
-
-def max_power_of_2_factor(n):
-    if n == 0:
-        return 0
-    if n % 2 != 0:
-        return 1
-
-    power_of_2 = 1
-    while n % 2 == 0:
-        power_of_2 *= 2
-        n //= 2  # Use integer division
-
-    return power_of_2
 
 
 def _condition_apply_ll_kernel(layer, kwargs):
