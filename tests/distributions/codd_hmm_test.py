@@ -64,6 +64,28 @@ def test_codd_hmm():
 
         assert torch.all(torch.abs(target_mars - v_mars) < 1e-3)
 
+    ############################
+    ## Backward pass runtests ##
+    ############################
+
+    pc.backward(
+        data, allow_modify_flows = False, logspace_flows = True,
+        soft_evidence_logp = soft_evidence_logp
+    )
+
+    flows = pc.node_flows[sid:eid,:].reshape(num_vars, num_latents, batch_size).permute(2, 0, 1)
+
+    pflows = input_layer.param_flows.reshape(-1, num_latents, num_cats).sum(dim = 0)
+
+    my_pflows = torch.zeros_like(pflows)
+    for i in range(num_vars):
+        v = var_order[i,0]
+
+        for b in range(batch_size):
+            my_pflows[:,data[b,v]] += flows[b,i,:].exp()
+
+    assert torch.all(torch.abs(pflows - my_pflows) < 1e-5)
+
 
 if __name__ == "__main__":
     test_codd_hmm()
