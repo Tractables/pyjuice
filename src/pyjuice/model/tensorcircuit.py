@@ -665,6 +665,15 @@ class TensorCircuit(nn.Module):
         print(f"> Number of edges: {self.num_edges}")
         print(f"> Number of sum parameters: {self.num_sum_params}")
 
+        num_input_parameters = 0
+        for layer in self.input_layer_group:
+            try:
+                num_input_parameters += layer.params.numel()
+            except AttributeError:
+                pass
+        
+        print(f"> Number of input parameters: {self.num_input_params}")
+
     def get_node_mars(self, ns: CircuitNodes):
         """
         Retrieve the node values of `ns` from the previous forward pass.
