@@ -68,12 +68,15 @@ def test_codd_hmm():
     ## Backward pass runtests ##
     ############################
 
+    soft_evidence_logp_grad = torch.zeros_like(soft_evidence_logp)
+
     pc.backward(
         data, allow_modify_flows = False, logspace_flows = True,
-        soft_evidence_logp = soft_evidence_logp
+        soft_evidence_logp = soft_evidence_logp,
+        soft_evidence_logp_grad = soft_evidence_logp_grad
     )
 
-    flows = pc.node_flows[sid:eid,:].reshape(num_vars, num_latents, batch_size).permute(2, 0, 1)
+    flows = pc.node_flows[sid:eid,:].reshape(num_vars, num_latents, batch_size).permute(2, 0, 1) # [B, V, N]
 
     pflows = input_layer.param_flows.reshape(-1, num_latents, num_cats).sum(dim = 0)
 
@@ -85,6 +88,20 @@ def test_codd_hmm():
             my_pflows[:,data[b,v]] += flows[b,i,:].exp()
 
     assert torch.all(torch.abs(pflows - my_pflows) < 1e-5)
+
+    my_grads = torch.zeros_like(soft_evidence_logp_grad) # [B, V, K]
+    for i in range(num_vars):
+        v = var_order[i,0]
+
+        for b in range(batch_size):
+            my_grads[b,v,data[b,v]] += flows[b,i,:].exp().sum()
+
+            log_params = soft_evidence_logp[b,v,:][None,:] + emit_params.log() # [N, C]
+            logZ = torch.logsumexp(log_params, dim = 1) # [N]
+
+            my_grads[b,v,:] -= (flows[b,i,:][:,None] + log_params - logZ[:,None]).exp().sum(dim = 0)
+
+    assert torch.all(torch.abs(soft_evidence_logp_grad - my_grads) < 1e-4)
 
 
 if __name__ == "__main__":
