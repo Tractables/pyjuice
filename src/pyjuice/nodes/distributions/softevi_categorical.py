@@ -111,8 +111,11 @@ def _prep_args_apply_bk_params_kernel(layer, kwargs):
 
     # prepare BLOCK_SIZE
     BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
-    BLOCK_SIZE_B = min(128, 2048 // TILE_SIZE_K, BATCH_SIZE_NP2)
+    BLOCK_SIZE_B = min(1024, BATCH_SIZE_NP2)
     BLOCK_SIZE_N = min(n_block_size, 2048 // BLOCK_SIZE_B)
+
+    target_kwargs["BLOCK_SIZE_B"] = BLOCK_SIZE_B
+    target_kwargs["BLOCK_SIZE_N"] = BLOCK_SIZE_N
 
     layer_num_nodes = layer._output_ind_range[1] - layer._output_ind_range[0]
     grid = (triton.cdiv(batch_size, BLOCK_SIZE_B), triton.cdiv(layer_num_nodes, BLOCK_SIZE_N))
@@ -385,10 +388,10 @@ class SoftEvidenceCategorical(Distribution):
         nflows = tl.load(node_flows_ptr + node_offsets[:,None] * batch_size + offsets_b[None,:], mask = mask_nb, other = 0.0) # [BLOCK_SIZE_N, BLOCK_SIZE_B]
 
         if logspace_flows:
-            flows = flows.exp()
+            nflows = nflows.exp()
 
         # Cumulate parameter flows
-        tl.atomic_add(param_flows_ptr + s_pfids[:,None] + data, flows, mask = mask_nb)
+        tl.atomic_add(param_flows_ptr + s_pfids[:,None] + data, nflows, mask = mask_nb)
 
     @staticmethod
     def bk_flow_mask_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
