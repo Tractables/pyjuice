@@ -42,7 +42,7 @@ def test_codd_hmm_no_filter():
     ## Forward pass runtests ##
     ###########################
 
-    unnorm_lls = pc(
+    lls = pc(
         data,
         soft_evidence_logp = soft_evidence_logp
     )
