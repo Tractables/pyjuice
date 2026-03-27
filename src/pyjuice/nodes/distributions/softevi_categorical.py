@@ -613,27 +613,35 @@ class SoftEvidenceCategorical(Distribution):
 
         else:
             # Ptrs pointing to internal parameters
-            inpars_ptr = params_ptr + \
-                tl.arange(0, TILE_SIZE_K)[None,:] + \
-                s_pids[:,None] # [BLOCK_SIZE_N, TILE_SIZE_K]
+            if use_tensor_core:
+                inpars_ptr = params_ptr + \
+                    tl.arange(0, TILE_SIZE_K)[None,:] + \
+                    s_pids[:,None] # [BLOCK_SIZE_N, TILE_SIZE_K]
+            else:
+                inpars_ptr = params_ptr + \
+                    tl.arange(0, TILE_SIZE_K)[:,None] + \
+                    s_pids[None,:] # [TILE_SIZE_K, BLOCK_SIZE_N]
+
+            nflow_sub_logz = nflows.log() - logZ # [BLOCK_SIZE_B, BLOCK_SIZE_N]
+            nflow_sub_logz_max = tl.max(nflow_sub_logz, axis = 1)[:,None]
+            nflow_sub_logz_sub = tl.exp(nflow_sub_logz - nflow_sub_logz_max)
 
             for i in range(K_NUM_TILES):
                 mask_c = (i * TILE_SIZE_K + tl.arange(0, TILE_SIZE_K) < num_cats) # [TILE_SIZE_K]
 
                 # Load the internal parameters
-                inpars = tl.load(inpars_ptr + i * TILE_SIZE_K, mask = (mask_c[None,:] & mask_n[:,None]), other = 0.0) # [BLOCK_SIZE_N, TILE_SIZE_K]
+                if use_tensor_core:
+                    inpars = tl.load(inpars_ptr + i * TILE_SIZE_K, mask = (mask_c[None,:] & mask_n[:,None]), other = 0.0) # [BLOCK_SIZE_N, TILE_SIZE_K]
+                else:
+                    inpars = tl.load(inpars_ptr + i * TILE_SIZE_K, mask = (mask_c[:,None] & mask_n[None,:]), other = 0.0) # [TILE_SIZE_K, BLOCK_SIZE_N]
 
                 # Load the external parameters
                 expars = tl.load(expars_ptr + i * TILE_SIZE_K, mask = (mask_b[:,None] & mask_c[None,:]), other = 0.0) # [BLOCK_SIZE_B, TILE_SIZE_K]
 
-                nflow_sub_logz = nflows.log() - logZ # [BLOCK_SIZE_B, BLOCK_SIZE_N]
-                nflow_sub_logz_max = tl.max(nflow_sub_logz, axis = 1)[:,None]
-                nflow_sub_logz_sub = tl.exp(nflow_sub_logz - nflow_sub_logz_max)
-
                 if use_tensor_core:
                     expars_grad = tl.dot(nflow_sub_logz_sub, inpars).log() + nflow_sub_logz_max + expars
                 else:
-                    expars_grad = tl.sum(nflow_sub_logz_sub[:,:,None] * inpars[None,:,:], axis = 1).log() + nflow_sub_logz_max + expars
+                    expars_grad = tl.sum(nflow_sub_logz_sub[:,None,:] * inpars[None,:,:], axis = 2).log() + nflow_sub_logz_max + expars
 
                 tl.atomic_add(expars_grad_ptr + i * TILE_SIZE_K, -tl.exp(expars_grad), mask = (mask_b[:,None] & mask_c[None,:]))
 
