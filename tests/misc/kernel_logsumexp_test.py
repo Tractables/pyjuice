@@ -54,7 +54,7 @@ def compute_lse_pair_fixed_with_lut_kernel(x_ptr, y_ptr, z_ptr, lut_ptr, seq_len
     x = tl.load(x_ptr + offsets, mask = mask, other = 0.0)
     y = tl.load(y_ptr + offsets, mask = mask, other = 0.0)
 
-    # Convert to fix-point representation
+    # Convert to fix-point representation (1.44269504089 is used to convert to base 2)
     x_fixed = (x * 1.44269504089 * 65536.0).to(tl.int32)
     y_fixed = (y * 1.44269504089 * 65536.0).to(tl.int32)
 
