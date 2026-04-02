@@ -349,9 +349,57 @@ def test_tdp_speed_breakdown():
     eval_top_down_probs(pc, update_pflow = True, scale = 1.0, use_cudagraph = False)
 
 
+def test_tdp_correctness():
+
+    device = torch.device("cuda:0")
+
+    for block_size in [16, 64, 1024]:
+    
+        with juice.set_block_size(block_size):
+
+            ni0 = inputs(0, num_node_blocks = 2, dist = dists.Categorical(num_cats = 4))
+            ni1 = inputs(1, num_node_blocks = 2, dist = dists.Categorical(num_cats = 4))
+            ni2 = inputs(2, num_node_blocks = 2, dist = dists.Categorical(num_cats = 6))
+            ni3 = inputs(3, num_node_blocks = 2, dist = dists.Categorical(num_cats = 6))
+
+            np0 = multiply(ni0, ni1)
+            np1 = multiply(ni2, ni3)
+            np2 = multiply(ni1, ni2)
+            np3 = multiply(ni0, ni1)
+
+            ns0 = summate(np0, np3, num_node_blocks = 2)
+            ns1 = summate(np1, num_node_blocks = 2)
+            ns2 = summate(np2, num_node_blocks = 2)
+
+            np4 = multiply(ns0, ni2, ni3)
+            np5 = multiply(ns1, ni0, ni1)
+            np6 = multiply(ns2, ni0, ni3)
+
+            ns = summate(np4, np5, np6, num_node_blocks = 1, block_size = 1)
+
+        ns.init_parameters()
+
+        pc = TensorCircuit(ns, layer_sparsity_tol = 0.1)
+        pc.to(device)
+
+        pc.init_param_flows()
+        pc._init_buffer(name = "node_flows", shape = (pc.num_nodes, 1), set_value = 0.0)
+        pc._init_buffer(name = "element_flows", shape = (pc.num_elements, 1), set_value = 0.0)
+
+        params1 = pc.params.clone()
+
+        eval_top_down_probs(pc, update_pflow = True, scale = 1.0)
+
+        pc._cum_flow = 1.0
+        pc.mini_batch_em(step_size = 1e-12, step_size_rescaling = True)
+
+        assert torch.all(torch.abs(pc.params - params1) < 1e-6)
+
+
 if __name__ == "__main__":
     torch.set_num_threads(8)
     test_simple_model_tdp()
     test_scaled_mini_batch_em()
     test_tdp_speed()
     test_tdp_speed_breakdown()
+    test_tdp_correctness()
