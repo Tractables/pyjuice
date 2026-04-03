@@ -672,7 +672,7 @@ class TensorCircuit(nn.Module):
             except AttributeError:
                 pass
         
-        print(f"> Number of input parameters: {num_input_params}")
+        print(f"> Number of input parameters: {num_input_parameters}")
 
     def get_node_mars(self, ns: CircuitNodes):
         """
