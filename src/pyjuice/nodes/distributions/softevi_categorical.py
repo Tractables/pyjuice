@@ -68,7 +68,7 @@ def _prep_args_apply_fw_kernel(layer, kwargs):
         K_NUM_TILES = triton.cdiv(num_cats, TILE_SIZE_K)
         BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
         BLOCK_SIZE_B = min(128, 2048 // TILE_SIZE_K, BATCH_SIZE_NP2)
-        BLOCK_SIZE_N = min(n_block_size, 2048 // TILE_SIZE_K, 2048 // BLOCK_SIZE_B)
+        BLOCK_SIZE_N = max(min(n_block_size, 2048 // TILE_SIZE_K, 2048 // BLOCK_SIZE_B), 1)
 
     use_tensor_core = (TILE_SIZE_K >= 16) and (BLOCK_SIZE_B >= 16) and (BLOCK_SIZE_N >= 16) and not target_kwargs["has_ext_ids"]
 
@@ -218,7 +218,7 @@ class SoftEvidenceCategorical(Distribution):
         """
         Get the signature of the current distribution.
         """
-        return "ExternProductCategorical"
+        return "ExternSoftEvidenceCategorical"
 
     def get_metadata(self):
         """
