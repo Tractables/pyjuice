@@ -47,7 +47,7 @@ def test_soft_evidence_categorical_dist():
 
     lls = pc(
         data,
-        soft_evidence_logp = logits
+        categorical_evidence_logp = logits
     )
 
     assert torch.all(torch.abs(lls.view(-1) - target_lls) < 1e-3)
@@ -60,8 +60,8 @@ def test_soft_evidence_categorical_dist():
 
     pc.backward(
         data, allow_modify_flows = False, logspace_flows = True,
-        soft_evidence_logp = logits,
-        soft_evidence_logp_grad = logits_grad
+        categorical_evidence_logp = logits,
+        categorical_evidence_logp_grad = logits_grad
     )
     
     assert torch.all(torch.abs(logits_grad - target_logits_grad) < 1e-5)
@@ -112,7 +112,7 @@ def test_soft_evidence_categorical_dist_varied():
 
     lls = pc(
         data,
-        soft_evidence_logp = logits
+        categorical_evidence_logp = logits
     )
 
     assert torch.all(torch.abs(lls.view(-1) - target_lls) < 1e-3)
@@ -125,8 +125,8 @@ def test_soft_evidence_categorical_dist_varied():
 
     pc.backward(
         data, allow_modify_flows = False, logspace_flows = True,
-        soft_evidence_logp = logits,
-        soft_evidence_logp_grad = logits_grad
+        categorical_evidence_logp = logits,
+        categorical_evidence_logp_grad = logits_grad
     )
     
     assert torch.all(torch.abs(logits_grad - target_logits_grad) < 1e-5)
@@ -174,7 +174,7 @@ def test_soft_evidence_categorical_dist_multi_nodes():
 
         lls = pc(
             data,
-            soft_evidence_logp = logits
+            categorical_evidence_logp = logits
         )
 
         assert torch.all(torch.abs(lls.view(-1) - target_lls) / num_vars < 1e-3)
@@ -187,8 +187,8 @@ def test_soft_evidence_categorical_dist_multi_nodes():
 
         pc.backward(
             data, allow_modify_flows = False, logspace_flows = True,
-            soft_evidence_logp = logits,
-            soft_evidence_logp_grad = logits_grad
+            categorical_evidence_logp = logits,
+            categorical_evidence_logp_grad = logits_grad
         )
         
         assert torch.all(torch.abs(logits_grad - target_logits_grad) < 1e-5)

@@ -19,7 +19,7 @@ else:
 
 
 def _condition_apply_fw_kernel(layer, kwargs):
-    return "soft_evidence_logp" in kwargs
+    return "categorical_evidence_logp" in kwargs
 
 
 def _prep_args_apply_fw_kernel(layer, kwargs):
@@ -27,24 +27,24 @@ def _prep_args_apply_fw_kernel(layer, kwargs):
 
     batch_size = kwargs["batch_size"]
 
-    soft_evidence_logp = kwargs["soft_evidence_logp"]
-    assert soft_evidence_logp.size(0) == batch_size, "Batch size doesn't match in `soft_evidence_logp`."
+    categorical_evidence_logp = kwargs["categorical_evidence_logp"]
+    assert categorical_evidence_logp.size(0) == batch_size, "Batch size doesn't match in `categorical_evidence_logp`."
 
-    ext_num_vars = soft_evidence_logp.size(1)
+    ext_num_vars = categorical_evidence_logp.size(1)
     target_kwargs["ext_num_vars"] = ext_num_vars
 
-    num_cats = soft_evidence_logp.size(2)
+    num_cats = categorical_evidence_logp.size(2)
     for ns in layer.nodes:
         assert num_cats <= ns.dist.num_cats
     target_kwargs["num_cats"] = num_cats
 
-    target_kwargs["soft_evidence_logp_ptr"] = soft_evidence_logp
+    target_kwargs["categorical_evidence_logp_ptr"] = categorical_evidence_logp
     target_kwargs["var_idmapping_ptr"] = layer.var_idmapping
 
     # (Optional) soft_evidence_cat_ids
     if "soft_evidence_cat_ids" in kwargs:
         soft_evidence_cat_ids = kwargs["soft_evidence_cat_ids"]
-        assert soft_evidence_logp.size() == soft_evidence_cat_ids.size()
+        assert categorical_evidence_logp.size() == soft_evidence_cat_ids.size()
 
         target_kwargs["soft_evidence_cat_ids_ptr"] = soft_evidence_cat_ids
         target_kwargs["has_ext_ids"] = True
@@ -85,7 +85,7 @@ def _prep_args_apply_fw_kernel(layer, kwargs):
 
 
 def _condition_apply_bk_params_kernel(layer, kwargs):
-    return "soft_evidence_logp" in kwargs
+    return "categorical_evidence_logp" in kwargs
 
 
 def _prep_args_apply_bk_params_kernel(layer, kwargs):
@@ -93,16 +93,16 @@ def _prep_args_apply_bk_params_kernel(layer, kwargs):
 
     batch_size = kwargs["batch_size"]
 
-    soft_evidence_logp = kwargs["soft_evidence_logp"]
-    assert soft_evidence_logp.size(0) == batch_size, "Batch size doesn't match in `soft_evidence_logp`."
+    categorical_evidence_logp = kwargs["categorical_evidence_logp"]
+    assert categorical_evidence_logp.size(0) == batch_size, "Batch size doesn't match in `categorical_evidence_logp`."
 
-    ext_num_vars = soft_evidence_logp.size(1)
+    ext_num_vars = categorical_evidence_logp.size(1)
     target_kwargs["ext_num_vars"] = ext_num_vars
 
-    num_cats = soft_evidence_logp.size(2)
+    num_cats = categorical_evidence_logp.size(2)
     target_kwargs["num_cats"] = num_cats
 
-    target_kwargs["soft_evidence_logp_ptr"] = soft_evidence_logp
+    target_kwargs["categorical_evidence_logp_ptr"] = categorical_evidence_logp
     target_kwargs["var_idmapping_ptr"] = layer.var_idmapping
 
     # Prepare block/grid size
@@ -124,7 +124,7 @@ def _prep_args_apply_bk_params_kernel(layer, kwargs):
 
 
 def _condition_apply_bk_softevi_kernel(layer, kwargs):
-    return "soft_evidence_logp" in kwargs and "soft_evidence_logp_grad" in kwargs
+    return "categorical_evidence_logp" in kwargs and "categorical_evidence_logp_grad" in kwargs
 
 
 def _prep_args_apply_bk_softevi_kernel(layer, kwargs):
@@ -132,28 +132,28 @@ def _prep_args_apply_bk_softevi_kernel(layer, kwargs):
 
     batch_size = kwargs["batch_size"]
 
-    soft_evidence_logp = kwargs["soft_evidence_logp"]
-    assert soft_evidence_logp.size(0) == batch_size, "Batch size doesn't match in `soft_evidence_logp`."
+    categorical_evidence_logp = kwargs["categorical_evidence_logp"]
+    assert categorical_evidence_logp.size(0) == batch_size, "Batch size doesn't match in `categorical_evidence_logp`."
 
-    ext_num_vars = soft_evidence_logp.size(1)
+    ext_num_vars = categorical_evidence_logp.size(1)
     target_kwargs["ext_num_vars"] = ext_num_vars
 
-    num_cats = soft_evidence_logp.size(2)
+    num_cats = categorical_evidence_logp.size(2)
     target_kwargs["num_cats"] = num_cats
 
-    soft_evidence_logp_grad = kwargs["soft_evidence_logp_grad"]
-    assert soft_evidence_logp_grad.size(0) == batch_size
-    assert soft_evidence_logp_grad.size(1) == ext_num_vars
-    assert soft_evidence_logp_grad.size(2) == num_cats
+    categorical_evidence_logp_grad = kwargs["categorical_evidence_logp_grad"]
+    assert categorical_evidence_logp_grad.size(0) == batch_size
+    assert categorical_evidence_logp_grad.size(1) == ext_num_vars
+    assert categorical_evidence_logp_grad.size(2) == num_cats
 
-    target_kwargs["soft_evidence_logp_ptr"] = soft_evidence_logp
-    target_kwargs["soft_evidence_logp_grad_ptr"] = soft_evidence_logp_grad
+    target_kwargs["categorical_evidence_logp_ptr"] = categorical_evidence_logp
+    target_kwargs["categorical_evidence_logp_grad_ptr"] = categorical_evidence_logp_grad
     target_kwargs["var_idmapping_ptr"] = layer.var_idmapping
 
     # (Optional) soft_evidence_cat_ids
     if "soft_evidence_cat_ids" in kwargs:
         soft_evidence_cat_ids = kwargs["soft_evidence_cat_ids"]
-        assert soft_evidence_logp.size() == soft_evidence_cat_ids.size()
+        assert categorical_evidence_logp.size() == soft_evidence_cat_ids.size()
 
         target_kwargs["soft_evidence_cat_ids_ptr"] = soft_evidence_cat_ids
         target_kwargs["has_ext_ids"] = True
@@ -277,7 +277,7 @@ class SoftEvidenceCategorical(Distribution):
     def fw_kernel(params_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, metadata_ptr, s_mids_ptr, nids_ptr, fw_local_ids_ptr, layer_num_nodes,
                   batch_size, num_vars_per_node: tl.constexpr, nv_block_size: tl.constexpr, node_offset, partial_eval: tl.constexpr,
                   TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, BLOCK_SIZE_B: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, use_tensor_core: tl.constexpr,
-                  soft_evidence_logp_ptr, soft_evidence_cat_ids_ptr, var_idmapping_ptr, num_cats: tl.constexpr, ext_num_vars: tl.constexpr, has_ext_ids: tl.constexpr):
+                  categorical_evidence_logp_ptr, soft_evidence_cat_ids_ptr, var_idmapping_ptr, num_cats: tl.constexpr, ext_num_vars: tl.constexpr, has_ext_ids: tl.constexpr):
 
         pid_b = tl.program_id(axis = 0)
         pid_n = tl.program_id(axis = 1)
@@ -301,7 +301,7 @@ class SoftEvidenceCategorical(Distribution):
         s_pids = tl.load(s_pids_ptr + offsets_n, mask = mask_n, other = 0) # [BLOCK_SIZE_N]
 
         # Ptrs pointing to external parameters
-        expars_ptr = soft_evidence_logp_ptr + \
+        expars_ptr = categorical_evidence_logp_ptr + \
             offsets_b[:,None] * (ext_num_vars * num_cats) + \
             lvid * num_cats + \
             tl.arange(0, TILE_SIZE_K)[None,:] # [BLOCK_SIZE_B, TILE_SIZE_K]
@@ -392,7 +392,7 @@ class SoftEvidenceCategorical(Distribution):
                 tl.arange(0, TILE_SIZE_K)[None,:] # [BLOCK_SIZE_B, TILE_SIZE_K]
 
             # Ptrs pointing to external parameters
-            expar_ptr = soft_evidence_logp_ptr + \
+            expar_ptr = categorical_evidence_logp_ptr + \
                 offsets_b * (ext_num_vars * num_cats) + \
                 lvid * num_cats # [BLOCK_SIZE_B]
 
@@ -413,7 +413,7 @@ class SoftEvidenceCategorical(Distribution):
                 log_ex_p = tl.where(has_match, expar, log_ex_p)
 
         else:
-            ex_p_ptr = soft_evidence_logp_ptr + \
+            ex_p_ptr = categorical_evidence_logp_ptr + \
                 offsets_b * (ext_num_vars * num_cats) + \
                 lvid * num_cats + \
                 data
@@ -431,7 +431,7 @@ class SoftEvidenceCategorical(Distribution):
     def bk_params_kernel(params_ptr, param_flows_ptr, node_flows_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, s_pfids_ptr, metadata_ptr, s_mids_ptr, nids_ptr,
                          bk_local_ids_ptr, layer_num_nodes, batch_size, num_vars_per_node: tl.constexpr, num_vars: tl.constexpr, nv_block_size: tl.constexpr,
                          node_offset, partial_eval: tl.constexpr, logspace_flows: tl.constexpr, BLOCK_SIZE_B: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, 
-                         soft_evidence_logp_ptr, var_idmapping_ptr, num_cats: tl.constexpr, ext_num_vars: tl.constexpr):
+                         categorical_evidence_logp_ptr, var_idmapping_ptr, num_cats: tl.constexpr, ext_num_vars: tl.constexpr):
 
         pid_b = tl.program_id(axis = 0)
         pid_n = tl.program_id(axis = 1)
@@ -470,7 +470,7 @@ class SoftEvidenceCategorical(Distribution):
                           bk_local_ids_ptr, layer_num_nodes, batch_size, num_vars_per_node: tl.constexpr, num_vars: tl.constexpr, nv_block_size: tl.constexpr,
                           node_offset, partial_eval: tl.constexpr, logspace_flows: tl.constexpr, BLOCK_SIZE_B: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, 
                           TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, use_tensor_core: tl.constexpr,
-                          soft_evidence_logp_ptr, soft_evidence_cat_ids_ptr, soft_evidence_logp_grad_ptr, var_idmapping_ptr, 
+                          categorical_evidence_logp_ptr, soft_evidence_cat_ids_ptr, categorical_evidence_logp_grad_ptr, var_idmapping_ptr, 
                           num_cats: tl.constexpr, ext_num_vars: tl.constexpr, has_ext_ids: tl.constexpr):
         
         pid_b = tl.program_id(axis = 0)
@@ -495,7 +495,7 @@ class SoftEvidenceCategorical(Distribution):
         s_pids = tl.load(s_pids_ptr + offsets_n, mask = mask_n, other = 0) # [BLOCK_SIZE_N]
 
         # Ptrs pointing to external parameters
-        expars_ptr = soft_evidence_logp_ptr + \
+        expars_ptr = categorical_evidence_logp_ptr + \
             offsets_b[:,None] * (ext_num_vars * num_cats) + \
             lvid * num_cats + \
             tl.arange(0, TILE_SIZE_K)[None,:] # [BLOCK_SIZE_B, TILE_SIZE_K]
@@ -526,12 +526,12 @@ class SoftEvidenceCategorical(Distribution):
                 tl.arange(0, TILE_SIZE_K)[None,:] # [BLOCK_SIZE_B, TILE_SIZE_K]
 
             # Ptrs pointing to external parameters
-            expar_ptr = soft_evidence_logp_ptr + \
+            expar_ptr = categorical_evidence_logp_ptr + \
                 offsets_b * (ext_num_vars * num_cats) + \
                 lvid * num_cats # [BLOCK_SIZE_B]
 
             # Ptrs pointing to external parameter gradients
-            expar_grad_ptr = soft_evidence_logp_grad_ptr + \
+            expar_grad_ptr = categorical_evidence_logp_grad_ptr + \
                 offsets_b * (ext_num_vars * num_cats) + \
                 lvid * num_cats # [BLOCK_SIZE_B]
 
@@ -555,14 +555,14 @@ class SoftEvidenceCategorical(Distribution):
                 tl.atomic_add(expar_grad_ptr + i * TILE_SIZE_K + match_ids, tl.sum(nflows, axis = 1), mask = (mask_b & has_match)) # [BLOCK_SIZE_B]
 
         else:
-            ex_p_ptr = soft_evidence_logp_ptr + \
+            ex_p_ptr = categorical_evidence_logp_ptr + \
                 offsets_b * (ext_num_vars * num_cats) + \
                 lvid * num_cats + \
                 data
             log_ex_p = tl.load(ex_p_ptr, mask = mask_b, other = 0.0) # [BLOCK_SIZE_B]
 
             # Accumulate gradients
-            unnorm_ll_grad_ptr = soft_evidence_logp_grad_ptr + \
+            unnorm_ll_grad_ptr = categorical_evidence_logp_grad_ptr + \
                 offsets_b * (ext_num_vars * num_cats) + \
                 lvid * num_cats + \
                 data
@@ -573,7 +573,7 @@ class SoftEvidenceCategorical(Distribution):
         logZ = log_in_p + log_ex_p[:,None] - nmars # [BLOCK_SIZE_B, BLOCK_SIZE_N]
 
         # Ptrs pointing to external parameter gradients
-        expars_grad_ptr = soft_evidence_logp_grad_ptr + \
+        expars_grad_ptr = categorical_evidence_logp_grad_ptr + \
             offsets_b[:,None] * (ext_num_vars * num_cats) + \
             lvid * num_cats + \
             tl.arange(0, TILE_SIZE_K)[None,:] # [BLOCK_SIZE_B, TILE_SIZE_K]
