@@ -9,3 +9,4 @@ from .masked_categorical import MaskedCategorical
 from .external import External
 from .external_categorical import ExternProductCategorical
 from .softevi_categorical import SoftEvidenceCategorical
+from .softevi_indicator import SoftEvidenceIndicator
