@@ -194,9 +194,44 @@ def test_soft_evidence_categorical_dist_multi_nodes():
         assert torch.all(torch.abs(logits_grad - target_logits_grad) < 1e-5)
 
 
+def test_soft_evidence_categorical_dist_sample():
+
+    device = torch.device("cuda:0")
+
+    batch_size = 64
+    num_cats = 43
+
+    # Construct PC
+    ni0 = juice.inputs(0, num_nodes = 1, dist = dists.SoftEvidenceCategorical(num_cats = num_cats))
+    ni1 = juice.inputs(1, num_nodes = 1, dist = dists.SoftEvidenceCategorical(num_cats = num_cats))
+
+    np = juice.multiply(ni0, ni1)
+    ns = juice.summate(np, num_nodes = 1)
+
+    ns.init_parameters(perturbation = 0.0)
+
+    pc = juice.compile(ns)
+    pc.to(device)
+
+    probs = torch.rand([batch_size, 2, num_cats], device = device)
+    probs /= probs.sum(dim = 2, keepdim = True)
+    probs *= 0.1
+    probs[:,:,10] += 0.9
+    logits = probs.log()
+
+    samples = juice.queries.sample(
+        pc, 
+        num_samples = batch_size,
+        categorical_evidence_logp = logits
+    )
+
+    assert (samples == 10).float().mean() > 0.8
+
+
 if __name__ == "__main__":
     torch.manual_seed(4343442)
     torch.cuda.manual_seed(5434)
     test_soft_evidence_categorical_dist()
     test_soft_evidence_categorical_dist_varied()
     test_soft_evidence_categorical_dist_multi_nodes()
+    test_soft_evidence_categorical_dist_sample()
