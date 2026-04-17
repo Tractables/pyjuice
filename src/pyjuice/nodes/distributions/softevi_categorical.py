@@ -193,6 +193,35 @@ def _prep_args_apply_bk_softevi_kernel(layer, kwargs):
     return target_kwargs, grid
 
 
+def _condition_sample_kernel(layer, kwargs):
+    return "categorical_evidence_logp" in kwargs
+
+
+def _prep_args_sample_kernel(layer, kwargs):
+    target_kwargs = dict()
+
+    categorical_evidence_logp = kwargs["categorical_evidence_logp"]
+
+    assert kwargs["batch_size"] == categorical_evidence_logp.size(0), "Batch size doesn't match."
+
+    target_kwargs["categorical_evidence_logp_ptr"] = categorical_evidence_logp
+
+    target_kwargs["var_idmapping_ptr"] = layer.var_idmapping
+
+    target_kwargs["ext_num_vars"] = categorical_evidence_logp.size(1)
+    target_kwargs["max_num_cats"] = categorical_evidence_logp.size(2)
+
+    num_activ_nodes = kwargs["num_activ_nodes"]
+
+    target_kwargs["TILE_SIZE_K"] = min(64, triton.next_power_of_2(target_kwargs["max_num_cats"]))
+    target_kwargs["K_NUM_TILES"] = triton.cdiv(target_kwargs["max_num_cats"], target_kwargs["TILE_SIZE_K"])
+    target_kwargs["BLOCK_S"] = min(64, 1024 // target_kwargs["TILE_SIZE_K"], triton.next_power_of_2(num_activ_nodes))
+
+    grid = (triton.cdiv(num_activ_nodes, target_kwargs["BLOCK_S"]),)
+
+    return target_kwargs, grid
+
+
 class SoftEvidenceCategorical(Distribution):
     """
     A class representing a Categorical distribution that allows external soft evidence.
@@ -212,6 +241,10 @@ class SoftEvidenceCategorical(Distribution):
         self.post_bp_fns = [
             (self.bk_params_kernel, _condition_apply_bk_params_kernel, _prep_args_apply_bk_params_kernel),
             (self.bk_softevi_kernel, _condition_apply_bk_softevi_kernel, _prep_args_apply_bk_softevi_kernel)
+        ]
+
+        self.sampling_fns = [
+            (self.sample_kernel, _condition_sample_kernel, _prep_args_sample_kernel)
         ]
 
     def get_signature(self):
@@ -644,6 +677,88 @@ class SoftEvidenceCategorical(Distribution):
                     expars_grad = tl.sum(nflow_sub_logz_sub[:,None,:] * inpars[None,:,:], axis = 2).log() + nflow_sub_logz_max + expars
 
                 tl.atomic_add(expars_grad_ptr + i * TILE_SIZE_K, -tl.exp(expars_grad), mask = (mask_b[:,None] & mask_c[None,:]))
+
+    @staticmethod
+    @triton_jit
+    def sample_kernel(samples_ptr, params_ptr, nflow_xids_ptr, nflow_yids_ptr, vids_ptr, s_pids_ptr, metadata_ptr, s_mids_ptr,
+                      num_activ_nodes, num_vars_per_node: tl.constexpr, nv_block_size: tl.constexpr, batch_size: tl.constexpr, seed, 
+                      categorical_evidence_logp_ptr, var_idmapping_ptr, ext_num_vars: tl.constexpr, max_num_cats: tl.constexpr,
+                      TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, BLOCK_S: tl.constexpr):
+        pid = tl.program_id(axis = 0)
+        block_start = pid * BLOCK_S
+
+        offsets = block_start + tl.arange(0, BLOCK_S) # [BLOCK_S]
+        mask = offsets < num_activ_nodes
+
+        # Raw batch and (local) node id
+        local_offsets = tl.load(nflow_xids_ptr + offsets, mask = mask, other = 0)
+        batch_offsets = tl.load(nflow_yids_ptr + offsets, mask = mask, other = 0)
+
+        # Load variable ids from `vids_ptr`
+        vids = tl.load(vids_ptr + local_offsets, mask = mask, other = 0)
+        lvids = tl.load(var_idmapping_ptr + vids, mask = mask, other = 0)
+
+        # Get `num_cats` from `metadata`
+        s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
+        num_cats = tl.load(metadata_ptr + s_mids, mask = mask, other = 0).to(tl.int64) # [BLOCK_SIZE]
+
+        # Get start parameter indices
+        s_pids = tl.load(s_pids_ptr + local_offsets, mask = mask, other = 0)
+
+        # Ptrs pointing to internal parameters
+        inpars_ptr = params_ptr + s_pids[:,None] + tl.arange(0, TILE_SIZE_K)[None,:] # [BLOCK_S, TILE_SIZE_K]
+
+        # Ptrs pointing to external parameters
+        expars_ptr = categorical_evidence_logp + \
+            batch_offsets[:,None] * (ext_num_vars * max_num_cats) + \
+            lvids[:,None] * max_num_cats + \
+            tl.arange(0, TILE_SIZE_K)[None,:]  # [BLOCK_S, TILE_SIZE_K]
+
+        # Compute logZ
+        logZ = tl.zeros([BLOCK_S], dtype = tl.float32) - float("inf")
+        for i in range(K_NUM_TILES):
+            cat_mask = mask[:,None] & (i * TILE_SIZE_K + tl.arange(0, TILE_SIZE_K)[None,:] < num_cats[:,None])
+
+            inpar = tl.load(inpars_ptr + i * TILE_SIZE_K, mask = cat_mask, other = 0.0)
+            expar = tl.load(expars_ptr + i * TILE_SIZE_K, mask = cat_mask, other = 0.0)
+
+            addlpar = inpar.log() + expar
+            addlpar_max = tl.max(addlpar, axis = 1)
+            lpar = (addlpar - addlpar_max[:,None]).exp().sum(axis = 1).log() + addlpar_max
+
+            # Compute log-add-exp(logZ, lpar)
+            maxval = tl.maximum(logZ, lpar)
+            minval = tl.minimum(logZ, lpar)
+            diff = minval - maxval
+
+            logZ = tl.where(logZ == -float("inf"),
+                lpar,
+                maxval + tlmath.log1p(tl.exp(diff))
+            )
+
+        # Generate random number
+        rnd_val = tl.rand(seed, offsets)
+
+        # Draw samples
+        sampled_ids = tl.zeros([BLOCK_S], dtype = tl.int64) - 1
+        for i in range(K_NUM_TILES):
+            cat_mask = mask[:,None] & (i * TILE_SIZE_K + tl.arange(0, TILE_SIZE_K)[None,:] < num_cats[:,None])
+
+            inpar = tl.load(inpars_ptr + i * TILE_SIZE_K, mask = cat_mask, other = 0.0)
+            expar = tl.load(expars_ptr + i * TILE_SIZE_K, mask = cat_mask, other = 0.0)
+
+            probs = tl.exp(tl.log(inpar) + expar - logZ[:,None]) # [BLOCK_S, TILE_SIZE_K]
+            cum_probs = tl.cumsum(probs, axis = 1) # [BLOCK_S, TILE_SIZE_K]
+
+            local_catids = tl.sum((rnd_val[:,None] >= cum_probs).to(tl.int64), axis = 1) # [BLOCK_S]
+
+            is_overflow = (local_catids == TILE_SIZE_K)
+            rnd_val = tl.where(is_overflow, rnd_val - tl.sum(probs, axis = 1), rnd_val)
+            sampled_ids = tl.where(is_overflow | (sampled_ids > -1), sampled_ids, local_catids + i * TILE_SIZE_K)
+
+        # Write back to `samples`
+        sample_offsets = vids * batch_size + batch_offsets
+        tl.store(samples_ptr + sample_offsets, sampled_ids, mask = mask)
 
     @staticmethod
     def bk_flow_mask_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
