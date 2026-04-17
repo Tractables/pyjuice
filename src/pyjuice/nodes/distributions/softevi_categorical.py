@@ -709,7 +709,7 @@ class SoftEvidenceCategorical(Distribution):
         inpars_ptr = params_ptr + s_pids[:,None] + tl.arange(0, TILE_SIZE_K)[None,:] # [BLOCK_S, TILE_SIZE_K]
 
         # Ptrs pointing to external parameters
-        expars_ptr = categorical_evidence_logp + \
+        expars_ptr = categorical_evidence_logp_ptr + \
             batch_offsets[:,None] * (ext_num_vars * max_num_cats) + \
             lvids[:,None] * max_num_cats + \
             tl.arange(0, TILE_SIZE_K)[None,:]  # [BLOCK_S, TILE_SIZE_K]
