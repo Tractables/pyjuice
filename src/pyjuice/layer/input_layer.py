@@ -940,20 +940,25 @@ class InputLayer(Layer, nn.Module):
         if not hasattr(self, "scope2localgids"):
             scope2localgids = dict()
 
-            local_ngid = 0
+            # Build per-node indices (not per-block): every InputLayer kernel that
+            # consumes `fw_local_ids` / `bk_local_ids` uses them as offsets into
+            # per-node tensors (`vids`, `s_pids`, ...), so they must count nodes.
+            # Counting blocks here silently drops `num_nodes - num_node_blocks`
+            # nodes per `InputNodes` whenever `block_size > 1`.
+            local_nid = 0
             for ns in self.nodes:
                 scope = ns.scope
 
-                s_ngid = local_ngid
-                e_ngid = local_ngid + ns.num_node_blocks
+                s_nid = local_nid
+                e_nid = local_nid + ns.num_nodes
 
                 with torch.no_grad():
                     if scope not in scope2localgids:
                         scope2localgids[scope] = [torch.zeros([0], dtype = torch.long)]
 
-                    scope2localgids[scope].append(torch.arange(s_ngid, e_ngid))
+                    scope2localgids[scope].append(torch.arange(s_nid, e_nid))
 
-                local_ngid += ns.num_node_blocks
+                local_nid += ns.num_nodes
 
             self.scope2localgids = {
                 scope: torch.cat(ids, dim = 0).to(self.params.device) for scope, ids in scope2localgids.items()
