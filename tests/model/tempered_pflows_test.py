@@ -124,12 +124,23 @@ def test_tempered_pflows_backward():
 
     unnorm_flows = (ns_params[:,None] * np2_mars.exp()).pow(1.0 / temperature)
     ns_parflows_target = (unnorm_flows / unnorm_flows.sum(dim = 0, keepdim = True)).sum(dim = 1)
-    # assert torch.all(torch.abs(ns_parflows_target - ns_param_flows) < 1e-2)
+    assert torch.all(torch.abs(ns_parflows_target - ns_param_flows) < 1e-2)
 
-    import pdb; pdb.set_trace()
-    a = 4
+    ns0_param_flows = ns0.get_param_flows(as_matrix = True).to(device)
+    ns0_params = ns0.get_params(as_matrix = True).to(device)
+
+    ni0_mars = pc.node_mars[ni0._output_ind_range[0]:ni0._output_ind_range[1],:]
+    ni1_mars = pc.node_mars[ni1._output_ind_range[0]:ni1._output_ind_range[1],:]
+    np0_mars = ni0_mars + ni1_mars
+
+    ns0_flows = pc.node_flows[ns0._output_ind_range[0]:ns0._output_ind_range[1],:]
+    ns0_mars_tempered = pc.node_mars_tempered[ns0._output_ind_range[0]:ns0._output_ind_range[1],:]
+
+    ns0_parflows_target = (ns0_flows[:,None,:] + ns0_params[:,:,None].pow(1.0 / temperature).log() + \
+        (np0_mars[None,:,:] / temperature) - ns0_mars_tempered[:,None,:]).exp().sum(dim = 2)
+    assert torch.all(torch.abs(ns0_parflows_target - ns0_param_flows) < 1e-3)
 
 
 if __name__ == "__main__":
-    # test_tempered_pflows_forward()
+    test_tempered_pflows_forward()
     test_tempered_pflows_backward()
