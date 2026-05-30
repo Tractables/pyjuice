@@ -407,6 +407,11 @@ class TensorCircuit(nn.Module):
                 self._init_buffer(name = "node_flows", shape = (self.num_nodes, B), set_value = 0.0 if not logspace_flows else -float("inf"))
                 self._init_buffer(name = "element_flows", shape = (self.num_elements, B), set_value = 0.0 if not logspace_flows else -float("inf"))
 
+            # Tempered pflows
+            if abs(pflow_temperature - 1.0) >= 1e-6:
+                assert hasattr(self, "node_mars_tempered")
+                kwargs["node_mars_tempered"] = self.node_mars_tempered
+
             # Set root node flows
             def _set_root_node_flows():
                 nonlocal ll_weights
