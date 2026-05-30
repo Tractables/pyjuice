@@ -16,7 +16,13 @@ def load_penn_treebank(seq_length = 32):
 
     # Load the Penn Treebank dataset
     try:
-        dataset = load_dataset('ptb_text_only')
+        base = "https://raw.githubusercontent.com/wojzaremba/lstm/master/data/"
+        data_files = {
+            "train": base + "ptb.train.txt",
+            "validation": base + "ptb.valid.txt",
+            "test": base + "ptb.test.txt",
+        }
+        dataset = load_dataset("text", data_files = data_files)
     except ConnectionError:
         return None # Skip the test if the dataset fails to load
     train_dataset = dataset['train']
@@ -24,15 +30,15 @@ def load_penn_treebank(seq_length = 32):
     test_dataset = dataset['test']
 
     train_data = []
-    for sample in tqdm(train_dataset["sentence"]):
+    for sample in tqdm(train_dataset["text"]):
         train_data.extend([vocab[token] if token in vocab else len(CHARS) for token in sample])
 
     valid_data = []
-    for sample in tqdm(valid_dataset["sentence"]):
+    for sample in tqdm(valid_dataset["text"]):
         valid_data.extend([vocab[token] if token in vocab else len(CHARS) for token in sample])
 
     test_data = []
-    for sample in tqdm(test_dataset["sentence"]):
+    for sample in tqdm(test_dataset["text"]):
         test_data.extend([vocab[token] if token in vocab else len(CHARS) for token in sample])
 
     # Convert to PyTorch tensors

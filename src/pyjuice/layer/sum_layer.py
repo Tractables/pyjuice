@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 
+import math
 import torch
 import torch.nn as nn
 import triton
@@ -219,7 +220,7 @@ class SumLayer(Layer, nn.Module):
 
     def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor,
                 force_use_bf16: bool = False, force_use_fp32: bool = False,
-                propagation_alg: str = "LL", **kwargs) -> None:
+                propagation_alg: str = "LL", pflow_temperature: float = 1.0, **kwargs) -> None:
         """
         Computes the forward pass of a sum layer.
 
@@ -228,6 +229,7 @@ class SumLayer(Layer, nn.Module):
         `element_mars`: [max_num_els, B]
         `params`:       [num_params, B] or [num_params]
         """
+        assert not (propagation_alg != "LL" and abs(pflow_temperature - 1.0) > 1e-6), "`pflow_temperature` can only be 1 if `propagation_alg` is not 'LL'."
 
         if not self.provided("fw_partition_local_ids"):
             # Evaluate the whole layer
@@ -240,7 +242,8 @@ class SumLayer(Layer, nn.Module):
                     node_mars, element_mars, params, nids, cids, pids, 
                     partition_id = partition_id, force_use_bf16 = force_use_bf16,
                     force_use_fp32 = force_use_fp32, 
-                    propagation_alg = propagation_alg, **kwargs
+                    propagation_alg = propagation_alg, 
+                    pflow_temperature = pflow_temperature, **kwargs
                 )
 
         else:
@@ -256,7 +259,8 @@ class SumLayer(Layer, nn.Module):
                     nids, cids, pids, local_ids = local_ids,
                     partition_id = partition_id, force_use_bf16 = force_use_bf16,
                     force_use_fp32 = force_use_fp32,
-                    propagation_alg = propagation_alg, **kwargs
+                    propagation_alg = propagation_alg, 
+                    pflow_temperature = pflow_temperature, **kwargs
                 )
 
         return None
@@ -267,7 +271,7 @@ class SumLayer(Layer, nn.Module):
                  allow_modify_flows: bool = False, propagation_alg: str = "LL", 
                  logspace_flows: bool = False, negate_pflows: bool = False, 
                  accumulate_ch_flows: bool = False, allow_neg_flows: bool = False,
-                 force_use_fp32: bool = False, **kwargs) -> None:
+                 force_use_fp32: bool = False, pflow_temperature: float = 1.0, **kwargs) -> None:
         """
         Computes the forward pass of a sum layer:
         ```
@@ -293,6 +297,8 @@ class SumLayer(Layer, nn.Module):
         assert not (accumulate_ch_flows and allow_modify_flows), "`accumulate_ch_flows` should be set to `False` when `allow_modify_flows=True`."
         assert not (allow_neg_flows and logspace_flows), "`allow_neg_flows` should be set to `False` when using `logspace_flows`."
         assert not (allow_neg_flows and allow_modify_flows), "`allow_neg_flows` should be set to `False` when `allow_modify_flows=True`."
+        assert not (propagation_alg != "LL" and abs(pflow_temperature - 1.0) > 1e-6), "`pflow_temperature` can only be 1 if `propagation_alg` is not 'LL'."
+        assert logspace_flows or abs(pflow_temperature - 1.0) < 1e-6, "`pflow_temperature` can only be enabled when `logspace_flows = True`."
 
         # Disallow modifications of `node_flows` in case of partial evaluation
         if self.provided("bk_partition_local_ids") and allow_modify_flows:
@@ -331,6 +337,7 @@ class SumLayer(Layer, nn.Module):
                     accumulate_ch_flows = accumulate_ch_flows,
                     allow_neg_flows = allow_neg_flows,
                     force_use_fp32 = force_use_fp32,
+                    pflow_temperature = pflow_temperature,
                     **kwargs
                 )
 
@@ -356,6 +363,7 @@ class SumLayer(Layer, nn.Module):
                     accumulate_ch_flows = accumulate_ch_flows, 
                     allow_neg_flows = allow_neg_flows,
                     force_use_fp32 = force_use_fp32,
+                    pflow_temperature = pflow_temperature,
                     **kwargs
                 )
 
@@ -378,6 +386,7 @@ class SumLayer(Layer, nn.Module):
                     negate_pflows = negate_pflows, 
                     allow_neg_flows = allow_neg_flows, 
                     force_use_fp32 = force_use_fp32,
+                    pflow_temperature = pflow_temperature,
                     **kwargs
                 )
 
@@ -394,7 +403,7 @@ class SumLayer(Layer, nn.Module):
                  pids: torch.Tensor, local_ids: Optional[torch.Tensor] = None,
                  partition_id: int = -1, mode: Optional[str] = None,
                  force_use_bf16: bool = False, force_use_fp32: bool = False,
-                 propagation_alg: str = "LL", **kwargs) -> None:
+                 propagation_alg: str = "LL", pflow_temperature: float = 1.0, **kwargs) -> None:
         """
         Forward pass of sum layers.
         
@@ -430,16 +439,20 @@ class SumLayer(Layer, nn.Module):
             self._forward_block_sparse(
                 node_mars, element_mars, params, nids, cids, pids, local_ids,
                 partition_id = partition_id, force_use_bf16 = force_use_bf16,
-                force_use_fp32 = force_use_fp32, propagation_alg = propagation_alg, **kwargs
+                force_use_fp32 = force_use_fp32, propagation_alg = propagation_alg, 
+                pflow_temperature = pflow_temperature, **kwargs
             )
 
         elif mode == self.SPARSE:
             self._forward_sparse(
                 node_mars, element_mars, params, nids, cids, pids, local_ids,
-                partition_id = partition_id, propagation_alg = propagation_alg, **kwargs
+                partition_id = partition_id, propagation_alg = propagation_alg, 
+                pflow_temperature = pflow_temperature, **kwargs
             )
 
         elif mode == self.PYTORCH:
+            assert abs(pflow_temperature - 1.0) < 1e-6, "`pflow_temperature != 1.0` not supported by the PyTorch backend."
+
             self._forward_pytorch(
                 node_mars, element_mars, params, nids, cids, pids, local_ids,
                 propagation_alg = propagation_alg, **kwargs
@@ -455,7 +468,8 @@ class SumLayer(Layer, nn.Module):
                                             pids_start, pids_increment, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
                                             BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
                                             TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, use_bf16: tl.constexpr,
-                                            propagation_alg_id: tl.constexpr, pid_m_offset = 0, alpha = 0.0):
+                                            propagation_alg_id: tl.constexpr, pflow_tempered_enabled: tl.constexpr, 
+                                            pid_m_offset = 0, alpha = 0.0, pflow_temperature = 1.0, node_mars_tempered = None):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(1) + pid_m_offset # ID of size-`TILE_SIZE_M` nodes
@@ -500,6 +514,9 @@ class SumLayer(Layer, nn.Module):
 
         # Inner loop
         acc = tl.zeros([TILE_SIZE_M, BLOCK_B], dtype = tl.float32) - float("inf")
+
+        if pflow_tempered_enabled:
+            acc_tempered = tl.zeros([TILE_SIZE_M, BLOCK_B], dtype = tl.float32) - float("inf")
 
         for k in range(0, K_NUM_TILES):
             epars = tl.load(epars_ptr)
@@ -548,6 +565,28 @@ class SumLayer(Layer, nn.Module):
                     )
                 )
 
+                if pflow_tempered_enabled:
+                    emars_sub = tl.where(emars_max != -float("inf"), tl.exp((emars - emars_max) / pflow_temperature), 0.0)
+                    epars = tlmath.pow(epars, 1.0 / pflow_temperature)
+                    emars_max /= pflow_temperature
+
+                    if use_bf16 == 1:
+                        # Built-in matmul kernel of triton + float16
+                        epars_bf16 = epars.to(tl.bfloat16)
+                        emars_bf16 = emars_sub.to(tl.bfloat16)
+                        nmars = tl.dot(epars_bf16, emars_bf16).to(tl.float32)
+                    else:
+                        # Built-in matmul kernel of triton + float32
+                        nmars = tl.dot(epars, emars_sub)
+
+                    acc_tempered = tl.where(emars_max > acc_tempered,
+                        tl.log(nmars + tl.exp(acc_tempered - emars_max) + 1e-24) + emars_max,
+                        tl.where(acc_tempered != -float("inf"),
+                            tl.log(tl.exp(emars_max - acc_tempered) * nmars + 1.0) + acc_tempered,
+                            -float("inf")
+                        )
+                    )
+
             # Increment `epars_ptr`
             pids_inc = tl.load(pids_inc_ptr)
             epars_ptr += pids_inc[None,:]
@@ -567,6 +606,9 @@ class SumLayer(Layer, nn.Module):
         offs_nmars = (off_nids + offs_node[:,None]) * batch_size + offs_batch[None,:]
         tl.store(node_mars + offs_nmars, acc, mask = mask_batch[None,:])
 
+        if pflow_tempered_enabled:
+            tl.store(node_mars_tempered + offs_nmars, acc_tempered, mask = mask_batch[None,:])
+
     @staticmethod
     # @triton.jit
     @triton_jit
@@ -574,7 +616,8 @@ class SumLayer(Layer, nn.Module):
                                             pids_start, pids_increment, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
                                             BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
                                             TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, use_bf16: tl.constexpr,
-                                            propagation_alg_id: tl.constexpr, pid_m_offset = 0, alpha = 0.0):
+                                            propagation_alg_id: tl.constexpr, pflow_tempered_enabled: tl.constexpr, 
+                                            pid_m_offset = 0, alpha = 0.0, pflow_temperature = 1.0, node_mars_tempered = None):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(1) + pid_m_offset # ID of size-`TILE_SIZE_M` nodes
@@ -619,6 +662,9 @@ class SumLayer(Layer, nn.Module):
 
         # Inner loop
         acc = tl.zeros([TILE_SIZE_M, BLOCK_B], dtype = tl.float32) - float("inf")
+
+        if pflow_tempered_enabled:
+            acc_tempered = tl.zeros([TILE_SIZE_M, BLOCK_B], dtype = tl.float32) - float("inf")
 
         for k in range(0, K_NUM_TILES):
             epars = tl.load(epars_ptr)
@@ -667,6 +713,28 @@ class SumLayer(Layer, nn.Module):
                     )
                 )
 
+                if pflow_tempered_enabled:
+                    emars_sub = tl.where(emars_max != -float("inf"), tl.exp((emars - emars_max) / pflow_temperature), 0.0)
+                    epars = tlmath.pow(epars, 1.0 / pflow_temperature)
+                    emars_max /= pflow_temperature
+
+                    if use_bf16 == 1:
+                        # Simulated matmul kernel + bfloat16
+                        epars = epars.to(tl.bfloat16)
+                        emars_sub = emars_sub.to(tl.bfloat16)
+                        nmars = tl.sum(epars[:,:,None] * emars_sub[None,:,:], axis = 1).to(tl.float32)
+                    else:
+                        # Simulated matmul kernel + float32
+                        nmars = tl.sum(epars[:,:,None] * emars_sub[None,:,:], axis = 1)
+
+                    acc_tempered = tl.where(emars_max > acc_tempered,
+                        tl.log(nmars + tl.exp(acc_tempered - emars_max) + 1e-24) + emars_max,
+                        tl.where(acc_tempered != -float("inf"),
+                            tl.log(tl.exp(emars_max - acc_tempered) * nmars + 1.0) + acc_tempered,
+                            -float("inf")
+                        )
+                    )
+
             # Increment `epars_ptr`
             pids_inc = tl.load(pids_inc_ptr)
             epars_ptr += pids_inc[None,:]
@@ -686,6 +754,9 @@ class SumLayer(Layer, nn.Module):
         offs_nmars = (off_nids + offs_node[:,None]) * batch_size + offs_batch[None,:]
         tl.store(node_mars + offs_nmars, acc, mask = mask_batch[None,:])
 
+        if pflow_tempered_enabled:
+            tl.store(node_mars_tempered + offs_nmars, acc_tempered, mask = mask_batch[None,:])
+
     @staticmethod
     # @triton.jit
     @triton_jit
@@ -693,7 +764,8 @@ class SumLayer(Layer, nn.Module):
                                              pids_start, pids_increment, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
                                              BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
                                              TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, use_bf16: tl.constexpr,
-                                             propagation_alg_id: tl.constexpr, pid_m_offset = 0, alpha = 0.0):
+                                             propagation_alg_id: tl.constexpr, pflow_tempered_enabled: tl.constexpr, 
+                                             pid_m_offset = 0, alpha = 0.0, pflow_temperature = 1.0, node_mars_tempered = None):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(1) + pid_m_offset # ID of size-`TILE_SIZE_M` nodes
@@ -739,6 +811,9 @@ class SumLayer(Layer, nn.Module):
         # Inner loop
         acc = tl.zeros([TILE_SIZE_M, BLOCK_B], dtype = tl.float32) - float("inf")
 
+        if pflow_tempered_enabled:
+            acc_tempered = tl.zeros([TILE_SIZE_M, BLOCK_B], dtype = tl.float32) - float("inf")
+
         for k in range(0, K_NUM_TILES):
             epars = tl.load(epars_ptr)
             emars = tl.load(emars_ptr, mask = mask_batch[:,None])
@@ -780,6 +855,22 @@ class SumLayer(Layer, nn.Module):
                     )
                 )
 
+                if pflow_tempered_enabled:
+                    emars_sub = tl.where(emars_max != -float("inf"), tl.exp((emars - emars_max) / pflow_temperature), 0.0)
+                    epars = tlmath.pow(epars, 1.0 / pflow_temperature)
+                    emars_max /= pflow_temperature
+
+                    # Simulated matmul kernel + float32
+                    nmars = tl.sum(epars[:,:,None] * tl.trans(emars_sub)[None,:,:], axis = 1)
+
+                    acc_tempered = tl.where(emars_max[None,:] > acc_tempered,
+                        tl.log(nmars + tl.exp(acc_tempered - emars_max[None,:]) + 1e-24) + emars_max[None,:],
+                        tl.where(acc_tempered != -float("inf"), 
+                            tl.log(tl.exp(emars_max[None,:] - acc_tempered) * nmars + 1.0) + acc_tempered,
+                            -float("inf")
+                        )
+                    )
+
             # Increment `epars_ptr`
             pids_inc = tl.load(pids_inc_ptr)
             epars_ptr += pids_inc[None,:]
@@ -799,11 +890,15 @@ class SumLayer(Layer, nn.Module):
         offs_nmars = (off_nids + offs_node[:,None]) * batch_size + offs_batch[None,:]
         tl.store(node_mars + offs_nmars, acc, mask = mask_batch[None,:])
 
+        if pflow_tempered_enabled:
+            tl.store(node_mars_tempered + offs_nmars, acc_tempered, mask = mask_batch[None,:])
+
     def _forward_block_sparse(self, node_mars: torch.Tensor, element_mars: torch.Tensor,
                               params: torch.Tensor, nids: torch.Tensor, cids: torch.Tensor,
                               pids: torch.Tensor, local_ids: Optional[torch.Tensor] = None,
                               partition_id: int = -1, force_use_bf16: bool = False,
-                              force_use_fp32: bool = False, propagation_alg: str = "LL", **kwargs) -> None:
+                              force_use_fp32: bool = False, propagation_alg: str = "LL", 
+                              pflow_temperature: float = 1.0, **kwargs) -> None:
         """
         Forward pass of sum layers with the block-sparse processing kernel.
         
@@ -827,6 +922,18 @@ class SumLayer(Layer, nn.Module):
         # Propagation algorithm
         propagation_alg_id = self.propagation_alg_mapping[propagation_alg]
         propagation_alg_kwargs = self._get_propagation_alg_kwargs(propagation_alg, **kwargs)
+
+        # Tempered pflow
+        if abs(pflow_temperature - 1.0) < 1e-6:
+            pflow_tempered_enabled = False
+            pflow_tempered_kwargs = {}
+        else:
+            assert "node_mars_tempered" in kwargs
+            pflow_tempered_enabled = True
+            pflow_tempered_kwargs = {
+                "pflow_temperature": pflow_temperature,
+                "node_mars_tempered": kwargs["node_mars_tempered"]
+            }
 
         # Heuristic to set `TILE_SIZE_M`, `TILE_SIZE_K`, and `BLOCK_B`
         base_size = min(self.block_size, num_edges, BATCH_SIZE_NP2, 128)
@@ -907,8 +1014,10 @@ class SumLayer(Layer, nn.Module):
                     BLOCK_SIZE_M = BLOCK_SIZE_M,
                     use_bf16 = use_bf16,
                     propagation_alg_id = propagation_alg_id,
+                    pflow_tempered_enabled = pflow_tempered_enabled,
                     pid_m_offset = pid_m_start,
                     **propagation_alg_kwargs,
+                    **pflow_tempered_kwargs,
                     num_stages = 1
                 )
                 
@@ -932,8 +1041,10 @@ class SumLayer(Layer, nn.Module):
                     BLOCK_SIZE_M = BLOCK_SIZE_M,
                     use_bf16 = use_bf16,
                     propagation_alg_id = propagation_alg_id,
+                    pflow_tempered_enabled = pflow_tempered_enabled,
                     pid_m_offset = pid_m_start,
                     **propagation_alg_kwargs,
+                    **pflow_tempered_kwargs,
                     num_stages = 1
                 )
 
@@ -957,19 +1068,22 @@ class SumLayer(Layer, nn.Module):
                     BLOCK_SIZE_M = BLOCK_SIZE_M,
                     use_bf16 = use_bf16,
                     propagation_alg_id = propagation_alg_id,
+                    pflow_tempered_enabled = pflow_tempered_enabled,
                     pid_m_offset = pid_m_start,
                     **propagation_alg_kwargs,
+                    **pflow_tempered_kwargs,
                     num_stages = 1
                 )
         
         return None
 
     @staticmethod
-    # @triton.jit
     @triton_jit
     def _fw_triton_sparse_kernel(node_mars, element_mars, mparams, nids, cids, pids,
                                  local_ids, batch_size, partial_eval: tl.constexpr, num_edges: tl.constexpr, 
-                                 BLOCK_B: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, propagation_alg_id: tl.constexpr, alpha = 0.0):
+                                 BLOCK_B: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, propagation_alg_id: tl.constexpr, 
+                                 pflow_tempered_enabled: tl.constexpr, alpha = 0.0, node_mars_tempered = None,
+                                 pflow_temperature = 1.0):
         
         pid_b = tl.program_id(axis = 0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(axis = 1) # ID of size-`BLOCK_SIZE_M` nodes
@@ -1013,6 +1127,11 @@ class SumLayer(Layer, nn.Module):
             off_nids * batch_size + \
             offs_batch
 
+        if pflow_tempered_enabled:
+            nmars_tempered_ptr = node_mars_tempered + \
+                off_nids * batch_size + \
+                offs_batch
+
         # Inner loop
         for i in range(0, BLOCK_SIZE_M):
             epars = tl.load(epars_ptr)
@@ -1030,18 +1149,28 @@ class SumLayer(Layer, nn.Module):
 
             tl.store(nmars_ptr, nmars, mask = mask_batch)
 
+            if pflow_tempered_enabled:
+                nmars_tempered = tl.log(tl.sum(tlmath.pow(emars * epars[:,None], 1.0 / pflow_temperature), axis = 0)) + emars_max / pflow_temperature
+
+                tl.store(nmars_tempered_ptr, nmars_tempered, mask = mask_batch)
+
             # Increment `epars_ptr`
             epars_ptr += 1
 
             # Increment `nmars_ptr`
             nmars_ptr += batch_size
 
+            if pflow_tempered_enabled:
+                nmars_tempered_ptr += batch_size
+
     @staticmethod
     # @triton.jit
     @triton_jit
     def _fw_triton_large_sparse_kernel(node_mars, element_mars, mparams, nids, cids, pids, local_ids, batch_size, 
                                        num_nodes, pid_m_offset, partial_eval: tl.constexpr, num_edges: tl.constexpr, BLOCK_B: tl.constexpr, 
-                                       TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, propagation_alg_id: tl.constexpr, alpha = 0.0):
+                                       TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, propagation_alg_id: tl.constexpr, 
+                                       pflow_tempered_enabled: tl.constexpr, alpha = 0.0, node_mars_tempered = None,
+                                       pflow_temperature = 1.0):
 
         pid_b = tl.program_id(axis = 0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(axis = 1) + pid_m_offset # ID of size-`TILE_SIZE_M` nodes
@@ -1103,10 +1232,20 @@ class SumLayer(Layer, nn.Module):
 
         tl.store(nmars_ptr, nmars, mask = (mask_m[:,None] & mask_batch[None,:]))
 
+        if pflow_tempered_enabled:
+            nmars_tempered = tl.log(tl.sum(tlmath.pow(emars * epars[:,None], 1.0 / pflow_temperature), axis = 0)) + emars_max / pflow_temperature
+
+            nmars_ptr = node_mars_tempered + \
+                (off_nids + tile_ids)[:,None] * batch_size + \
+                offs_batch[None,:] # [TILE_SIZE_M, BLOCK_B]
+
+            tl.store(nmars_tempered_ptr, nmars_tempered, mask = (mask_m[:,None] & mask_batch[None,:]))
+
     def _forward_sparse(self, node_mars: torch.Tensor, element_mars: torch.Tensor,
                         params: torch.Tensor, nids: torch.Tensor, cids: torch.Tensor,
                         pids: torch.Tensor, local_ids: Optional[torch.Tensor] = None,
-                        partition_id: int = -1, propagation_alg: str = "LL", **kwargs) -> None:
+                        partition_id: int = -1, propagation_alg: str = "LL",
+                        pflow_temperature: float = 1.0, **kwargs) -> None:
         """
         Forward pass of sum layers with the sparse processing kernel.
         
@@ -1128,6 +1267,18 @@ class SumLayer(Layer, nn.Module):
         # Propagation algorithm
         propagation_alg_id = self.propagation_alg_mapping[propagation_alg]
         propagation_alg_kwargs = self._get_propagation_alg_kwargs(propagation_alg, **kwargs)
+
+        # Tempered pflow
+        if abs(pflow_temperature - 1.0) < 1e-6:
+            pflow_tempered_enabled = False
+            pflow_tempered_kwargs = {}
+        else:
+            assert "node_mars_tempered" in kwargs
+            pflow_tempered_enabled = True
+            pflow_tempered_kwargs = {
+                "pflow_temperature": pflow_temperature,
+                "node_mars_tempered": kwargs["node_mars_tempered"]
+            }
 
         if triton.cdiv(layer_n_nodes, self.block_size) <= 2048:
             BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
@@ -1151,7 +1302,9 @@ class SumLayer(Layer, nn.Module):
                 BLOCK_B = BLOCK_B, 
                 BLOCK_SIZE_M = BLOCK_SIZE_M,
                 propagation_alg_id = propagation_alg_id,
-                **propagation_alg_kwargs
+                pflow_tempered_enabled = pflow_tempered_enabled,
+                **propagation_alg_kwargs,
+                **pflow_tempered_kwargs
             )
 
         else:
@@ -1181,7 +1334,9 @@ class SumLayer(Layer, nn.Module):
                     TILE_SIZE_M = TILE_SIZE_M,
                     BLOCK_SIZE_M = BLOCK_SIZE_M,
                     propagation_alg_id = propagation_alg_id,
-                    **propagation_alg_kwargs
+                    pflow_tempered_enabled = pflow_tempered_enabled,
+                    **propagation_alg_kwargs,
+                    **pflow_tempered_kwargs
                 )
             else:
                 for pid_m_start in range(0, grid[1], 32768):
@@ -1206,7 +1361,9 @@ class SumLayer(Layer, nn.Module):
                         TILE_SIZE_M = TILE_SIZE_M,
                         BLOCK_SIZE_M = BLOCK_SIZE_M,
                         propagation_alg_id = propagation_alg_id,
-                        **propagation_alg_kwargs
+                        pflow_tempered_enabled = pflow_tempered_enabled,
+                        **propagation_alg_kwargs,
+                        **pflow_tempered_kwargs
                     )
 
         return None
@@ -1275,7 +1432,8 @@ class SumLayer(Layer, nn.Module):
                   negate_pflows: bool = False, 
                   accumulate_ch_flows: bool = False, 
                   allow_neg_flows: bool = False, 
-                  force_use_fp32: bool = False, **kwargs) -> None:
+                  force_use_fp32: bool = False, 
+                  pflow_temperature: float = 1.0, **kwargs) -> None:
         """
         Back pass of sum layers.
         
@@ -1322,7 +1480,8 @@ class SumLayer(Layer, nn.Module):
                 partition_id = partition_id, allow_modify_flows = allow_modify_flows,
                 propagation_alg = propagation_alg, logspace_flows = logspace_flows, 
                 negate_pflows = negate_pflows, accumulate_ch_flows = accumulate_ch_flows, 
-                allow_neg_flows = allow_neg_flows, force_use_fp32 = force_use_fp32, **kwargs
+                allow_neg_flows = allow_neg_flows, force_use_fp32 = force_use_fp32, 
+                pflow_temperature = pflow_temperature, **kwargs
             )
 
         elif mode == self.SPARSE:
@@ -1331,12 +1490,14 @@ class SumLayer(Layer, nn.Module):
                 nids, cids, pids, pfids, chids, parids, parpids, cs_block_size, local_ids, 
                 partition_id = partition_id, allow_modify_flows = allow_modify_flows,
                 propagation_alg = propagation_alg, logspace_flows = logspace_flows, 
-                negate_pflows = negate_pflows, accumulate_ch_flows = accumulate_ch_flows, **kwargs
+                negate_pflows = negate_pflows, accumulate_ch_flows = accumulate_ch_flows, 
+                pflow_temperature = pflow_temperature, **kwargs
             )
 
         elif mode == self.PYTORCH:
             assert not allow_modify_flows, "Please set `allow_modify_flows` to False when " \
                                            "using the native PyTorch backward."
+            assert abs(pflow_temperature - 1.0) < 1e-6, "`pflow_temperature != 0` not supported with PyTorch backend."
             self._backward_pytorch(
                 node_flows, element_flows, params, node_mars, 
                 element_mars, param_flows, nids, cids, pids, pfids, 
@@ -1522,7 +1683,7 @@ class SumLayer(Layer, nn.Module):
                                cs_block_size: int, local_ids: Optional[torch.Tensor] = None,
                                partition_id: int = -1, allow_modify_flows: bool = False, propagation_alg: str = "LL", 
                                logspace_flows: bool = False, negate_pflows: bool = False, accumulate_ch_flows: bool = False, 
-                               allow_neg_flows: bool = False, force_use_fp32 = False, **kwargs) -> None:
+                               allow_neg_flows: bool = False, force_use_fp32 = False, pflow_temperature: float = 1.0, **kwargs) -> None:
         """
         Back pass of sum layers with block-sparse processing kernel.
         
@@ -1561,7 +1722,8 @@ class SumLayer(Layer, nn.Module):
                 propagation_alg = propagation_alg, 
                 logspace_flows = logspace_flows, 
                 negate_pflows = negate_pflows, 
-                allow_neg_flows = allow_neg_flows, **kwargs
+                allow_neg_flows = allow_neg_flows, 
+                pflow_temperature = pflow_temperature, **kwargs
             )
 
         return None
@@ -2140,7 +2302,7 @@ class SumLayer(Layer, nn.Module):
 
                 acc += partial_flows
 
-            # Increment `emars_ptr`, `nmars_ptr`, and `nmars_ptr`
+            # Increment `emars_ptr`, `nmars_ptr`, and `nflows_ptr`
             emars_ptr += TILE_SIZE_B
             nmars_ptr += TILE_SIZE_B
             nflows_ptr += TILE_SIZE_B
@@ -2253,7 +2415,7 @@ class SumLayer(Layer, nn.Module):
 
                 acc += partial_flows
 
-            # Increment `emars_ptr`, `nmars_ptr`, and `nmars_ptr`
+            # Increment `emars_ptr`, `nmars_ptr`, and `nflows_ptr`
             emars_ptr += TILE_SIZE_B
             nmars_ptr += TILE_SIZE_B
             nflows_ptr += TILE_SIZE_B
@@ -2281,12 +2443,166 @@ class SumLayer(Layer, nn.Module):
         else:
             tl.atomic_add(param_flows + eparflows_offsets, pflows)
 
+    @staticmethod
+    @triton_jit
+    def _bk_triton_block_sparse_tempered_par_kernel(node_flows, node_mars_tempered, element_mars, mparams, param_flows, nids, cids, pids, pfids,
+                                                    batch_size: tl.constexpr, num_edges: tl.constexpr, TILE_SIZE_B: tl.constexpr, B_NUM_TILES: tl.constexpr, 
+                                                    TILE_SIZE_K: tl.constexpr, TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, 
+                                                    TL_DOT: tl.constexpr, negate_pflows: tl.constexpr, pid_m_offset = 0, pflow_temperature = 1.0):
+
+        pid_k = tl.program_id(0) # ID of size-`TILE_SIZE_K` edges
+        pid_m = tl.program_id(1) + pid_m_offset # ID of size-`TILE_SIZE_M` nodes
+
+        # Get inferred node block id from `pid_m`
+        nblock_id = pid_m // (BLOCK_SIZE_M // TILE_SIZE_M)
+        tile_id = pid_m % (BLOCK_SIZE_M // TILE_SIZE_M)
+
+        # Batch offsets and mask
+        offs_batch = tl.arange(0, TILE_SIZE_B)
+        mask_batch = offs_batch < batch_size
+
+        # Initialize pointers to `element_mars`
+        offs_edge = tl.arange(0, TILE_SIZE_K) + pid_k * TILE_SIZE_K
+        edge_start = tl.load(cids + nblock_id * num_edges + offs_edge)
+        emars_ptr = element_mars + \
+            edge_start[None,:] * batch_size + \
+            offs_batch[:,None] # [TILE_SIZE_B, TILE_SIZE_K]
+
+        # Initialize pointers to `node_flows` and `node_mars_tempered`
+        offs_node = tl.arange(0, TILE_SIZE_M) + tile_id * TILE_SIZE_M
+        off_nids = tl.load(nids + nblock_id)
+        nmars_tempered_ptr = node_mars_tempered + (off_nids + offs_node[:,None]) * batch_size + offs_batch[None,:]
+        nflows_ptr = node_flows + (off_nids + offs_node[:,None]) * batch_size + offs_batch[None,:]
+
+        # Inner loop
+        acc = tl.zeros([TILE_SIZE_M, TILE_SIZE_K], dtype = tl.float32)
+
+        for b in range(0, B_NUM_TILES):
+            emars = tl.load(emars_ptr, mask = mask_batch[:,None], other = 0.0) # [TILE_SIZE_B, TILE_SIZE_K]
+
+            nmars_tempered = tl.load(nmars_tempered_ptr, mask = mask_batch[None,:], other = 0.0) # [TILE_SIZE_M, TILE_SIZE_B]
+
+            nflows = tl.load(nflows_ptr, mask = mask_batch[None,:], other = 0.0) # [TILE_SIZE_M, TILE_SIZE_B]
+                
+            log_n_fdm = tl.where(nmars_tempered == -float("inf"), -float("inf"), nflows - nmars_tempered)
+
+            log_n_fdm_max = tl.max(log_n_fdm, axis = 0)
+            n_fdm_sub = tl.where(log_n_fdm_max[None,:] != -float("inf"), tl.exp(log_n_fdm - log_n_fdm_max[None,:]), 0.0)
+
+            scaled_emars = tl.exp(emars / pflow_temperature + log_n_fdm_max[:,None])
+
+            if TL_DOT == 1:
+                partial_flows = tl.dot(n_fdm_sub, scaled_emars)
+            else:
+                partial_flows = tl.sum(n_fdm_sub[:,:,None] * scaled_emars[None,:,:], axis = 1)
+
+            acc += partial_flows
+
+            # Increment `emars_ptr`, `nmars_tempered_ptr`, and `nflows_ptr`
+            emars_ptr += TILE_SIZE_B
+            nmars_tempered_ptr += TILE_SIZE_B
+            nflows_ptr += TILE_SIZE_B
+
+            # Update batch mask
+            offs_batch += TILE_SIZE_B
+            mask_batch = offs_batch < batch_size
+
+        # Initialize `params` (only when NOT using MPE propagation method)
+        par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
+        epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
+        epars = tl.load(mparams + epars_offsets)
+
+        pflows = acc * tlmath.pow(epars, 1.0 / pflow_temperature)
+
+        parflow_start = tl.load(pfids + nblock_id * num_edges + offs_edge)
+        eparflows_offsets = offs_node[:,None] + parflow_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
+
+        if negate_pflows:
+            tl.atomic_add(param_flows + eparflows_offsets, -1.0 * pflows)
+        else:
+            tl.atomic_add(param_flows + eparflows_offsets, pflows)
+
+    @staticmethod
+    @triton_jit
+    def _bk_triton_block_sparse_tempered_par_csmm2_kernel(node_flows, node_mars_tempered, element_mars, mparams, param_flows, nids, cids, pids, pfids,
+                                                          batch_size: tl.constexpr, num_edges: tl.constexpr, TILE_SIZE_B: tl.constexpr, B_NUM_TILES: tl.constexpr, 
+                                                          TILE_SIZE_K: tl.constexpr, TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, 
+                                                          TL_DOT: tl.constexpr, negate_pflows: tl.constexpr, pid_m_offset = 0, pflow_temperature = 1.0):
+
+        pid_k = tl.program_id(0) # ID of size-`TILE_SIZE_K` edges
+        pid_m = tl.program_id(1) + pid_m_offset # ID of size-`TILE_SIZE_M` nodes
+
+        # Get inferred node block id from `pid_m`
+        nblock_id = pid_m // (BLOCK_SIZE_M // TILE_SIZE_M)
+        tile_id = pid_m % (BLOCK_SIZE_M // TILE_SIZE_M)
+
+        # Batch offsets and mask
+        offs_batch = tl.arange(0, TILE_SIZE_B)
+        mask_batch = offs_batch < batch_size
+
+        # Initialize pointers to `element_mars`
+        offs_edge = tl.arange(0, TILE_SIZE_K) + pid_k * TILE_SIZE_K
+        edge_start = tl.load(cids + nblock_id * num_edges + offs_edge)
+        emars_ptr = element_mars + \
+            edge_start[None,:] * batch_size + \
+            offs_batch[:,None] # [TILE_SIZE_B, TILE_SIZE_K]
+
+        # Initialize pointers to `node_flows` and `node_mars`
+        offs_node = tl.arange(0, TILE_SIZE_M) + tile_id * TILE_SIZE_M
+        off_nids = tl.load(nids + nblock_id)
+        nmars_tempered_ptr = node_mars_tempered + (off_nids + offs_node[None,:]) * batch_size + offs_batch[:,None]
+        nflows_ptr = node_flows + (off_nids + offs_node[None,:]) * batch_size + offs_batch[:,None]
+
+        # Inner loop
+        acc = tl.zeros([TILE_SIZE_M, TILE_SIZE_K], dtype = tl.float32)
+        
+        for b in range(0, B_NUM_TILES):
+            emars = tl.load(emars_ptr, mask = mask_batch[:,None], other = 0.0) # [TILE_SIZE_B, TILE_SIZE_K]
+            nmars_tempered = tl.load(nmars_tempered_ptr, mask = mask_batch[:,None], other = 0.0) # [TILE_SIZE_B, TILE_SIZE_M]
+
+            nflows = tl.load(nflows_ptr, mask = mask_batch[:,None], other = 0.0) # [TILE_SIZE_B, TILE_SIZE_M]
+
+            log_n_fdm = tl.where(nmars_tempered == -float("inf"), -float("inf"), nflows - nmars_tempered)
+
+            log_n_fdm_max = tl.max(log_n_fdm, axis = 1)
+            n_fdm_sub = tl.where(log_n_fdm_max[:,None] != -float("inf"), tl.exp(log_n_fdm - log_n_fdm_max[:,None]), 0.0)
+
+            scaled_emars = tl.exp(emars / pflow_temperature + log_n_fdm_max[:,None])
+
+            partial_flows = tl.sum(tl.trans(n_fdm_sub)[:,:,None] * scaled_emars[None,:,:], axis = 1)
+
+            acc += partial_flows
+
+            # Increment `emars_ptr`, `nmars_ptr`, and `nflows_ptr`
+            emars_ptr += TILE_SIZE_B
+            nmars_tempered_ptr += TILE_SIZE_B
+            nflows_ptr += TILE_SIZE_B
+
+            # Update batch mask
+            offs_batch += TILE_SIZE_B
+            mask_batch = offs_batch < batch_size
+
+        # Initialize `params`
+        par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
+        epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
+        epars = tl.load(mparams + epars_offsets)
+
+        pflows = acc * tlmath.pow(epars, 1.0 / pflow_temperature)
+
+        parflow_start = tl.load(pfids + nblock_id * num_edges + offs_edge)
+        eparflows_offsets = offs_node[:,None] + parflow_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
+
+        if negate_pflows:
+            tl.atomic_add(param_flows + eparflows_offsets, -1.0 * pflows)
+        else:
+            tl.atomic_add(param_flows + eparflows_offsets, pflows)
+
     def _backward_block_sparse_par_flows(self, node_flows: torch.Tensor, params: torch.Tensor, node_mars: torch.Tensor, 
                                          element_mars: torch.Tensor, param_flows: torch.Tensor, nids: torch.Tensor, 
                                          cids: torch.Tensor, pids: torch.Tensor, pfids: torch.Tensor,
                                          allow_modify_flows: bool = False, propagation_alg: str = "LL", 
                                          logspace_flows: bool = False, negate_pflows: bool = False, 
-                                         allow_neg_flows: bool = False, **kwargs) -> None:
+                                         allow_neg_flows: bool = False, pflow_temperature: float = 1.0, **kwargs) -> None:
         """
         Backward pass of sum layers w.r.t. sum parameters with the block-sparse processing kernel.
         
@@ -2351,63 +2667,118 @@ class SumLayer(Layer, nn.Module):
 
             curr_grid = (grid[0], block_m_size)
 
-            if TILE_SIZE_M >= 8 and TILE_SIZE_K >= 8 and TILE_SIZE_B >= 8:
-                self._bk_triton_block_sparse_par_kernel[curr_grid](
-                    node_flows = node_flows, 
-                    node_mars = node_mars, 
-                    element_mars = element_mars, 
-                    mparams = params, 
-                    param_flows = param_flows, 
-                    nids = nids, 
-                    cids = cids, 
-                    pids = pids,
-                    pfids = pfids,
-                    batch_size = batch_size, 
-                    num_edges = num_edges, 
-                    allow_modify_flows = allow_modify_flows, 
-                    logspace_flows = logspace_flows,
-                    TILE_SIZE_B = TILE_SIZE_B, 
-                    B_NUM_TILES = B_NUM_TILES, 
-                    TILE_SIZE_K = TILE_SIZE_K, 
-                    TILE_SIZE_M = TILE_SIZE_M, 
-                    BLOCK_SIZE_M = self.block_size,
-                    TL_DOT = TL_DOT,
-                    propagation_alg_id = propagation_alg_id,
-                    negate_pflows = negate_pflows,
-                    allow_neg_flows = allow_neg_flows,
-                    pid_m_offset = pid_m_start,
-                    **propagation_alg_kwargs,
-                    num_stages = 1
-                )
+            if abs(pflow_temperature - 1.0) < 1e-6:
+
+                if TILE_SIZE_M >= 8 and TILE_SIZE_K >= 8 and TILE_SIZE_B >= 8:
+                    self._bk_triton_block_sparse_par_kernel[curr_grid](
+                        node_flows = node_flows, 
+                        node_mars = node_mars, 
+                        element_mars = element_mars, 
+                        mparams = params, 
+                        param_flows = param_flows, 
+                        nids = nids, 
+                        cids = cids, 
+                        pids = pids,
+                        pfids = pfids,
+                        batch_size = batch_size, 
+                        num_edges = num_edges, 
+                        allow_modify_flows = allow_modify_flows, 
+                        logspace_flows = logspace_flows,
+                        TILE_SIZE_B = TILE_SIZE_B, 
+                        B_NUM_TILES = B_NUM_TILES, 
+                        TILE_SIZE_K = TILE_SIZE_K, 
+                        TILE_SIZE_M = TILE_SIZE_M, 
+                        BLOCK_SIZE_M = self.block_size,
+                        TL_DOT = TL_DOT,
+                        propagation_alg_id = propagation_alg_id,
+                        negate_pflows = negate_pflows,
+                        allow_neg_flows = allow_neg_flows,
+                        pid_m_offset = pid_m_start,
+                        **propagation_alg_kwargs,
+                        num_stages = 1
+                    )
+
+                else:
+                    self._bk_triton_block_sparse_par_csmm2_kernel[curr_grid](
+                        node_flows = node_flows, 
+                        node_mars = node_mars, 
+                        element_mars = element_mars, 
+                        mparams = params, 
+                        param_flows = param_flows, 
+                        nids = nids, 
+                        cids = cids, 
+                        pids = pids,
+                        pfids = pfids,
+                        batch_size = batch_size, 
+                        num_edges = num_edges, 
+                        allow_modify_flows = allow_modify_flows,
+                        logspace_flows = logspace_flows,
+                        TILE_SIZE_B = TILE_SIZE_B, 
+                        B_NUM_TILES = B_NUM_TILES, 
+                        TILE_SIZE_K = TILE_SIZE_K, 
+                        TILE_SIZE_M = TILE_SIZE_M, 
+                        BLOCK_SIZE_M = self.block_size,
+                        TL_DOT = TL_DOT,
+                        propagation_alg_id = propagation_alg_id,
+                        negate_pflows = negate_pflows,
+                        allow_neg_flows = allow_neg_flows,
+                        pid_m_offset = pid_m_start,
+                        **propagation_alg_kwargs,
+                        num_stages = 1
+                    )
 
             else:
-                self._bk_triton_block_sparse_par_csmm2_kernel[curr_grid](
-                    node_flows = node_flows, 
-                    node_mars = node_mars, 
-                    element_mars = element_mars, 
-                    mparams = params, 
-                    param_flows = param_flows, 
-                    nids = nids, 
-                    cids = cids, 
-                    pids = pids,
-                    pfids = pfids,
-                    batch_size = batch_size, 
-                    num_edges = num_edges, 
-                    allow_modify_flows = allow_modify_flows,
-                    logspace_flows = logspace_flows,
-                    TILE_SIZE_B = TILE_SIZE_B, 
-                    B_NUM_TILES = B_NUM_TILES, 
-                    TILE_SIZE_K = TILE_SIZE_K, 
-                    TILE_SIZE_M = TILE_SIZE_M, 
-                    BLOCK_SIZE_M = self.block_size,
-                    TL_DOT = TL_DOT,
-                    propagation_alg_id = propagation_alg_id,
-                    negate_pflows = negate_pflows,
-                    allow_neg_flows = allow_neg_flows,
-                    pid_m_offset = pid_m_start,
-                    **propagation_alg_kwargs,
-                    num_stages = 1
-                )
+
+                if TILE_SIZE_M >= 8 and TILE_SIZE_K >= 8 and TILE_SIZE_B >= 8:
+                    self._bk_triton_block_sparse_tempered_par_kernel[curr_grid](
+                        node_flows = node_flows, 
+                        node_mars_tempered = kwargs["node_mars_tempered"], 
+                        element_mars = element_mars, 
+                        mparams = params, 
+                        param_flows = param_flows, 
+                        nids = nids, 
+                        cids = cids, 
+                        pids = pids,
+                        pfids = pfids,
+                        batch_size = batch_size, 
+                        num_edges = num_edges, 
+                        TILE_SIZE_B = TILE_SIZE_B, 
+                        B_NUM_TILES = B_NUM_TILES, 
+                        TILE_SIZE_K = TILE_SIZE_K, 
+                        TILE_SIZE_M = TILE_SIZE_M, 
+                        BLOCK_SIZE_M = self.block_size,
+                        TL_DOT = TL_DOT,
+                        negate_pflows = negate_pflows,
+                        pid_m_offset = pid_m_start,
+                        pflow_temperature = pflow_temperature,
+                        num_stages = 1
+                    )
+
+                else:
+                    self._bk_triton_block_sparse_tempered_par_csmm2_kernel[curr_grid](
+                        node_flows = node_flows, 
+                        node_mars_tempered = kwargs["node_mars_tempered"], 
+                        element_mars = element_mars, 
+                        mparams = params, 
+                        param_flows = param_flows, 
+                        nids = nids, 
+                        cids = cids, 
+                        pids = pids,
+                        pfids = pfids,
+                        batch_size = batch_size, 
+                        num_edges = num_edges, 
+                        TILE_SIZE_B = TILE_SIZE_B, 
+                        B_NUM_TILES = B_NUM_TILES, 
+                        TILE_SIZE_K = TILE_SIZE_K, 
+                        TILE_SIZE_M = TILE_SIZE_M, 
+                        BLOCK_SIZE_M = self.block_size,
+                        TL_DOT = TL_DOT,
+                        negate_pflows = negate_pflows,
+                        allow_neg_flows = allow_neg_flows,
+                        pid_m_offset = pid_m_start,
+                        pflow_temperature = pflow_temperature,
+                        num_stages = 1
+                    )
 
         return None
 
@@ -2419,7 +2790,8 @@ class SumLayer(Layer, nn.Module):
                          cs_block_size: int, local_ids: Optional[torch.Tensor] = None,
                          partition_id: int = -1, allow_modify_flows: bool = False, 
                          propagation_alg: str = "LL", logspace_flows: bool = False, 
-                         negate_pflows: bool = False, accumulate_ch_flows: bool = False, **kwargs) -> None:
+                         negate_pflows: bool = False, accumulate_ch_flows: bool = False, 
+                         pflow_temperature: float = 1.0, **kwargs) -> None:
         """
         Back pass of sum layers with sparse processing kernel.
         
@@ -2455,7 +2827,8 @@ class SumLayer(Layer, nn.Module):
                 allow_modify_flows = allow_modify_flows,
                 propagation_alg = propagation_alg, 
                 logspace_flows = logspace_flows, 
-                negate_pflows = negate_pflows, **kwargs
+                negate_pflows = negate_pflows, 
+                pflow_temperature = pflow_temperature, **kwargs
             )
 
         return None
@@ -2901,11 +3274,88 @@ class SumLayer(Layer, nn.Module):
         else:
             tl.atomic_add(eparflows_ptr, curr_pflows)
 
+    @staticmethod
+    @triton_jit
+    def _bk_triton_sparse_tempered_par_kernel(node_flows, node_mars_tempered, element_mars, mparams, param_flows, nids, cids, pids, pfids,
+                                              pid_m_offset, num_edges: tl.constexpr, batch_size: tl.constexpr, BLOCK_M: tl.constexpr, 
+                                              BLOCK_K: tl.constexpr, BLOCK_B: tl.constexpr, TILE_SIZE_B: tl.constexpr, B_NUM_BLOCKS: tl.constexpr, 
+                                              negate_pflows: tl.constexpr, pflow_temperature = 1.0):
+
+        pid_b = tl.program_id(0) # ID of size-`BLOCK_B` samples
+        pid_e = tl.program_id(1) # ID of size-`BLOCK_K` edges
+        pid_m = tl.program_id(2) + pid_m_offset # ID of size-`BLOCK_M` nodes
+
+        # Get inferred node block id from `pid_m`
+        nblock_id = pid_m // BLOCK_M
+        tile_id = pid_m % BLOCK_M
+
+        # Batch offsets and mask
+        offs_batch = tl.arange(0, BLOCK_B) + pid_b * TILE_SIZE_B
+        mask_batch = offs_batch < batch_size
+
+        # Initialize pointers to `element_mars`
+        offs_edge = tl.arange(0, BLOCK_K) + pid_e * BLOCK_K
+        edge_start = tl.load(cids + nblock_id * num_edges + offs_edge)
+        emars_ptr = element_mars + \
+            edge_start[:,None] * batch_size + \
+            offs_batch[None,:] # [BLOCK_K, BLOCK_B]
+
+        # Initialize pointers to `node_flows` and `node_mars_tempered`
+        off_nids = tl.load(nids + nblock_id)
+        nmars_tempered_ptr = node_mars_tempered + (off_nids + tile_id) * batch_size + offs_batch # [BLOCK_B]
+        nflows_ptr = node_flows + (off_nids + tile_id) * batch_size + offs_batch # [BLOCK_B]
+
+        # Inner loop
+        acc = tl.zeros([BLOCK_K], dtype = tl.float32)
+
+        for b in range(0, B_NUM_BLOCKS):
+            # Batch offsets and mask
+            offs_batch = tl.arange(0, BLOCK_B) + pid_b * TILE_SIZE_B + b * BLOCK_B
+            mask_batch = offs_batch < batch_size
+
+            emars = tl.load(emars_ptr, mask = mask_batch[None,:], other = -float("inf")) # [BLOCK_K, BLOCK_B]
+
+            nmars_tempered = tl.load(nmars_tempered_ptr, mask = mask_batch, other = 0.0) # [BLOCK_B]
+            nflows = tl.load(nflows_ptr, mask = mask_batch, other = 0.0) # [BLOCK_B]
+
+            plflows = nflows[None,:] + emars / pflow_temperature - nmars_tempered[None,:]
+            plflows = tl.where(nmars_tempered[None,:] == -float("inf"),
+                nflows[None,:],
+                plflows
+            )
+            plflows_max = tl.max(plflows, axis = 1)
+            pflows = tl.where(plflows_max == -float("inf"),
+                0.0,
+                tl.exp(tl.log(tl.sum(tl.exp(plflows - plflows_max[:,None]), axis = 1)) + plflows_max)
+            )
+
+            acc += pflows
+
+            # Increment `emars_ptr`, `nmars_tempered_ptr`, and `nflows_ptr`
+            emars_ptr += BLOCK_B
+            nmars_tempered_ptr += BLOCK_B
+            nflows_ptr += BLOCK_B
+
+        par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
+        epars_ptr = mparams + par_start + tile_id
+        epars = tl.load(epars_ptr) # [BLOCK_K]
+
+        parflow_start = tl.load(pfids + nblock_id * num_edges + offs_edge)
+        eparflows_ptr = param_flows + parflow_start + tile_id
+
+        curr_pflows = acc * tlmath.pow(epars, 1.0 / pflow_temperature)
+
+        if negate_pflows:
+            tl.atomic_add(eparflows_ptr, -1.0 * curr_pflows)
+        else:
+            tl.atomic_add(eparflows_ptr, curr_pflows)
+
     def _backward_sparse_par_flows(self, node_flows: torch.Tensor, params: torch.Tensor, node_mars: torch.Tensor, 
                                    element_mars: torch.Tensor, param_flows: torch.Tensor, nids: torch.Tensor, 
                                    cids: torch.Tensor, pids: torch.Tensor, pfids: torch.Tensor,
                                    allow_modify_flows: bool = False, propagation_alg: str = "LL", 
-                                   logspace_flows: bool = False, negate_pflows: bool = False, **kwargs) -> None:
+                                   logspace_flows: bool = False, negate_pflows: bool = False, 
+                                   pflow_temperature: float = 1.0, **kwargs) -> None:
         """
         Backward pass of sum layers w.r.t. sum parameters with the block-sparse processing kernel.
         
@@ -2962,40 +3412,9 @@ class SumLayer(Layer, nn.Module):
         # if grid[0] == 1 and grid[1] == 1 and grid[2] == 1 and BLOCK_B < 4:
         #     BLOCK_B = 4
 
-        if grid[2] <= 32768:
-            self._bk_triton_sparse_par_kernel[grid](
-                node_flows = node_flows, 
-                node_mars = node_mars, 
-                element_mars = element_mars, 
-                mparams = params, 
-                param_flows = param_flows, 
-                nids = nids, 
-                cids = cids, 
-                pids = pids,
-                pfids = pfids,
-                pid_m_offset = 0,
-                num_edges = num_edges,
-                batch_size = batch_size,
-                allow_modify_flows = allow_modify_flows,
-                logspace_flows = logspace_flows,
-                BLOCK_M = BLOCK_M,
-                BLOCK_K = BLOCK_K,
-                BLOCK_B = BLOCK_B,
-                TILE_SIZE_B = TILE_SIZE_B,
-                B_NUM_BLOCKS = B_NUM_BLOCKS,
-                propagation_alg_id = propagation_alg_id,
-                negate_pflows = negate_pflows,
-                **propagation_alg_kwargs
-            )
-        
-        else:
-            # TODO: This is a temporal fix...
-            for pid_m_start in range(0, grid[2], 32768):
-
-                pid_m_end = min(pid_m_start + 32768, grid[2])
-                small_grid = (grid[0], grid[1], pid_m_end - pid_m_start)
-
-                self._bk_triton_sparse_par_kernel[small_grid](
+        if abs(pflow_temperature - 1.0) < 1e-6:
+            if grid[2] <= 32768:
+                self._bk_triton_sparse_par_kernel[grid](
                     node_flows = node_flows, 
                     node_mars = node_mars, 
                     element_mars = element_mars, 
@@ -3005,7 +3424,7 @@ class SumLayer(Layer, nn.Module):
                     cids = cids, 
                     pids = pids,
                     pfids = pfids,
-                    pid_m_offset = pid_m_start,
+                    pid_m_offset = 0,
                     num_edges = num_edges,
                     batch_size = batch_size,
                     allow_modify_flows = allow_modify_flows,
@@ -3019,6 +3438,91 @@ class SumLayer(Layer, nn.Module):
                     negate_pflows = negate_pflows,
                     **propagation_alg_kwargs
                 )
+            
+            else:
+                # TODO: This is a temporal fix...
+                for pid_m_start in range(0, grid[2], 32768):
+
+                    pid_m_end = min(pid_m_start + 32768, grid[2])
+                    small_grid = (grid[0], grid[1], pid_m_end - pid_m_start)
+
+                    self._bk_triton_sparse_par_kernel[small_grid](
+                        node_flows = node_flows, 
+                        node_mars = node_mars, 
+                        element_mars = element_mars, 
+                        mparams = params, 
+                        param_flows = param_flows, 
+                        nids = nids, 
+                        cids = cids, 
+                        pids = pids,
+                        pfids = pfids,
+                        pid_m_offset = pid_m_start,
+                        num_edges = num_edges,
+                        batch_size = batch_size,
+                        allow_modify_flows = allow_modify_flows,
+                        logspace_flows = logspace_flows,
+                        BLOCK_M = BLOCK_M,
+                        BLOCK_K = BLOCK_K,
+                        BLOCK_B = BLOCK_B,
+                        TILE_SIZE_B = TILE_SIZE_B,
+                        B_NUM_BLOCKS = B_NUM_BLOCKS,
+                        propagation_alg_id = propagation_alg_id,
+                        negate_pflows = negate_pflows,
+                        **propagation_alg_kwargs
+                    )
+
+        else:
+            if grid[2] <= 32768:
+                self._bk_triton_sparse_tempered_par_kernel[grid](
+                    node_flows = node_flows, 
+                    node_mars_tempered = kwargs["node_mars_tempered"], 
+                    element_mars = element_mars, 
+                    mparams = params, 
+                    param_flows = param_flows, 
+                    nids = nids, 
+                    cids = cids, 
+                    pids = pids,
+                    pfids = pfids,
+                    pid_m_offset = 0,
+                    num_edges = num_edges,
+                    batch_size = batch_size,
+                    BLOCK_M = BLOCK_M,
+                    BLOCK_K = BLOCK_K,
+                    BLOCK_B = BLOCK_B,
+                    TILE_SIZE_B = TILE_SIZE_B,
+                    B_NUM_BLOCKS = B_NUM_BLOCKS,
+                    negate_pflows = negate_pflows,
+                    pflow_temperature = pflow_temperature
+                )
+            
+            else:
+                # TODO: This is a temporal fix...
+                for pid_m_start in range(0, grid[2], 32768):
+
+                    pid_m_end = min(pid_m_start + 32768, grid[2])
+                    small_grid = (grid[0], grid[1], pid_m_end - pid_m_start)
+
+                    self._bk_triton_sparse_tempered_par_kernel[small_grid](
+                        node_flows = node_flows, 
+                        node_mars_tempered = kwargs["node_mars_tempered"], 
+                        element_mars = element_mars, 
+                        mparams = params, 
+                        param_flows = param_flows, 
+                        nids = nids, 
+                        cids = cids, 
+                        pids = pids,
+                        pfids = pfids,
+                        pid_m_offset = pid_m_start,
+                        num_edges = num_edges,
+                        batch_size = batch_size,
+                        BLOCK_M = BLOCK_M,
+                        BLOCK_K = BLOCK_K,
+                        BLOCK_B = BLOCK_B,
+                        TILE_SIZE_B = TILE_SIZE_B,
+                        B_NUM_BLOCKS = B_NUM_BLOCKS,
+                        negate_pflows = negate_pflows,
+                        pflow_temperature = pflow_temperature
+                    )
 
         return None
 

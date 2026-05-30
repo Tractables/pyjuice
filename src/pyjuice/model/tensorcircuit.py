@@ -137,6 +137,7 @@ class TensorCircuit(nn.Module):
         self.node_flows = None
         self.element_flows = None
         self.param_flows = None
+        self.node_mars_tempered = None
         
         self._init_layers(
             layer_sparsity_tol = layer_sparsity_tol, 
@@ -207,8 +208,8 @@ class TensorCircuit(nn.Module):
     def forward(self, inputs: torch.Tensor, input_layer_fn: Optional[Union[str,Callable]] = None,
                 cache: Optional[dict] = None, return_cache: bool = False, record_cudagraph: bool = False, 
                 apply_cudagraph: bool = True, force_use_bf16: bool = False, force_use_fp32: bool = False, 
-                propagation_alg: Optional[Union[str,Sequence[str]]] = None, _inner_layers_only: bool = False, 
-                _no_buffer_reset: bool = False, **kwargs):
+                propagation_alg: Optional[Union[str,Sequence[str]]] = None, pflow_temperature: float = 1.0, 
+                _inner_layers_only: bool = False, _no_buffer_reset: bool = False, **kwargs):
         """
         Forward evaluation of the PC.
 
@@ -233,16 +234,26 @@ class TensorCircuit(nn.Module):
             if propagation_alg is None:
                 propagation_alg = self.default_propagation_alg
                 kwargs.update(self.propagation_alg_kwargs)
+
+            # Tempered param flow
+            pflow_tempered_enabled = abs(pflow_temperature - 1.0) >= 1e-6
             
             ## Initialize buffers for forward pass ##
 
             if not _no_buffer_reset:
                 self._init_buffer(name = "node_mars", shape = (self.num_nodes, B), set_value = 0.0)
                 self._init_buffer(name = "element_mars", shape = (self.num_elements, B), set_value = -torch.inf)
+                if pflow_tempered_enabled:
+                    self._init_buffer(name = "node_mars_tempered", shape = (self.num_nodes, B), set_value = 0.0)
+                    kwargs["node_mars_tempered"] = self.node_mars_tempered
 
             # Load cached node marginals
             if self._buffer_matches(name = "node_mars", cache = cache):
                 self.node_mars[:,:] = cache["node_mars"]
+
+            if pflow_tempered_enabled and self._buffer_matches(name = "node_mars_tempered", cache = cache):
+                self.node_mars_tempered[:,:] = cache["node_mars_tempered"]
+                kwargs["node_mars_tempered"] = self.node_mars_tempered
 
             ## Run forward pass ##
 
@@ -279,6 +290,7 @@ class TensorCircuit(nn.Module):
                                     force_use_bf16 = force_use_bf16,
                                     force_use_fp32 = force_use_fp32, 
                                     propagation_alg = propagation_alg if isinstance(propagation_alg, str) else propagation_alg[layer_id], 
+                                    pflow_temperature = pflow_temperature,
                                     **kwargs)
 
                     else:
@@ -359,6 +371,7 @@ class TensorCircuit(nn.Module):
                  _inner_layers_only: bool = False,
                  _disable_buffer_init: bool = False,
                  force_use_fp32: bool = False,
+                 pflow_temperature: float = 1.0,
                  **kwargs):
         """
         Backward evaluation of the PC that computes node flows as well as parameter flows.
@@ -378,6 +391,7 @@ class TensorCircuit(nn.Module):
         self._run_params["logspace_flows"] = logspace_flows
         self._run_params["negate_pflows"] = negate_pflows
         self._run_params["force_use_fp32"] = force_use_fp32
+        self._run_params["pflow_temperature"] = pflow_temperature
 
         assert self.node_mars is not None and self.element_mars is not None, "Should run forward path first."
         if input_layer_fn is None:
@@ -393,6 +407,11 @@ class TensorCircuit(nn.Module):
             if not _disable_buffer_init:
                 self._init_buffer(name = "node_flows", shape = (self.num_nodes, B), set_value = 0.0 if not logspace_flows else -float("inf"))
                 self._init_buffer(name = "element_flows", shape = (self.num_elements, B), set_value = 0.0 if not logspace_flows else -float("inf"))
+
+            # Tempered pflows
+            if abs(pflow_temperature - 1.0) >= 1e-6:
+                assert hasattr(self, "node_mars_tempered")
+                kwargs["node_mars_tempered"] = self.node_mars_tempered
 
             # Set root node flows
             def _set_root_node_flows():
@@ -462,7 +481,8 @@ class TensorCircuit(nn.Module):
                                              param_flows = self.param_flows if compute_param_flows else None,
                                              allow_modify_flows = allow_modify_flows, 
                                              propagation_alg = propagation_alg if isinstance(propagation_alg, str) else propagation_alg[layer_id], 
-                                             logspace_flows = logspace_flows, negate_pflows = negate_pflows, force_use_fp32 = force_use_fp32, **kwargs)
+                                             logspace_flows = logspace_flows, negate_pflows = negate_pflows, force_use_fp32 = force_use_fp32, 
+                                             pflow_temperature = pflow_temperature, **kwargs)
 
                         # Execute post-backward callback
                         layer_group.callback(
