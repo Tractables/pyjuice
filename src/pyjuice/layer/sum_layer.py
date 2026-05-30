@@ -3473,7 +3473,6 @@ class SumLayer(Layer, nn.Module):
 
         else:
             if grid[2] <= 32768:
-                print(" fsaidofjwaeoif")
                 self._bk_triton_sparse_tempered_par_kernel[grid](
                     node_flows = node_flows, 
                     node_mars_tempered = kwargs["node_mars_tempered"], 
