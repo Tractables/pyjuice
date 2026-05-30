@@ -565,9 +565,9 @@ class SumLayer(Layer, nn.Module):
                 )
 
                 if pflow_tempered_enabled:
-                    emars_sub = tl.where(emars_max != -float("inf"), tl.exp(emars - emars_max), 0.0)
-                    epars = tl.exp(tl.log(epars) * pflow_temperature)
-                    emars_max *= pflow_temperature
+                    emars_sub = tl.where(emars_max != -float("inf"), tl.exp((emars - emars_max) / pflow_temperature), 0.0)
+                    epars = tlmath.pow(epars, 1.0 / pflow_temperature)
+                    emars_max /= pflow_temperature
 
                     if use_bf16 == 1:
                         # Built-in matmul kernel of triton + float16
@@ -713,9 +713,9 @@ class SumLayer(Layer, nn.Module):
                 )
 
                 if pflow_tempered_enabled:
-                    emars_sub = tl.where(emars_max != -float("inf"), tl.exp(emars - emars_max), 0.0)
-                    epars = tl.exp(tl.log(epars) * pflow_temperature)
-                    emars_max *= pflow_temperature
+                    emars_sub = tl.where(emars_max != -float("inf"), tl.exp((emars - emars_max) / pflow_temperature), 0.0)
+                    epars = tlmath.pow(epars, 1.0 / pflow_temperature)
+                    emars_max /= pflow_temperature
 
                     if use_bf16 == 1:
                         # Simulated matmul kernel + bfloat16
@@ -855,9 +855,9 @@ class SumLayer(Layer, nn.Module):
                 )
 
                 if pflow_tempered_enabled:
-                    emars_sub = tl.where(emars_max != -float("inf"), tl.exp(emars - emars_max), 0.0)
-                    epars = tl.exp(tl.log(epars) * pflow_temperature)
-                    emars_max *= pflow_temperature
+                    emars_sub = tl.where(emars_max != -float("inf"), tl.exp((emars - emars_max) / pflow_temperature), 0.0)
+                    epars = tlmath.pow(epars, 1.0 / pflow_temperature)
+                    emars_max /= pflow_temperature
 
                     # Simulated matmul kernel + float32
                     nmars = tl.sum(epars[:,:,None] * tl.trans(emars_sub)[None,:,:], axis = 1)
@@ -1077,12 +1077,12 @@ class SumLayer(Layer, nn.Module):
         return None
 
     @staticmethod
-    # @triton.jit
     @triton_jit
     def _fw_triton_sparse_kernel(node_mars, element_mars, mparams, nids, cids, pids,
                                  local_ids, batch_size, partial_eval: tl.constexpr, num_edges: tl.constexpr, 
                                  BLOCK_B: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, propagation_alg_id: tl.constexpr, 
-                                 pflow_tempered_enabled: tl.constexpr, alpha = 0.0, node_mars_tempered = None):
+                                 pflow_tempered_enabled: tl.constexpr, alpha = 0.0, node_mars_tempered = None,
+                                 pflow_temperature = 1.0):
         
         pid_b = tl.program_id(axis = 0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(axis = 1) # ID of size-`BLOCK_SIZE_M` nodes
@@ -1120,11 +1120,6 @@ class SumLayer(Layer, nn.Module):
             emars = tl.exp((emars - emars_max[None,:]) * alpha)
             emars_max *= alpha
 
-        if pflow_tempered_enabled:
-            emars_max_tempered = tl.max(emars, axis = 0)
-            emars_tempered = tl.exp((emars - emars_max_tempered[None,:]) * alpha)
-            emars_max_tempered *= alpha
-
         # Initialize pointers to `node_mars`
         off_nids = tl.load(nids + nblock_id)
         nmars_ptr = node_mars + \
@@ -1154,8 +1149,7 @@ class SumLayer(Layer, nn.Module):
             tl.store(nmars_ptr, nmars, mask = mask_batch)
 
             if pflow_tempered_enabled:
-                epars_tempered = tl.exp(tl.log(epars) * alpha)
-                nmars_tempered = (tl.log(tl.sum(emars_tempered * epars_tempered[:,None], axis = 0)) + emars_max) * (1.0 / alpha)
+                nmars_tempered = tl.log(tl.sum(tlmath.pow(emars * epars[:,None], 1.0 / pflow_temperature), axis = 0)) + emars_max / pflow_temperature
 
                 tl.store(nmars_tempered_ptr, nmars_tempered, mask = mask_batch)
 
@@ -1174,7 +1168,8 @@ class SumLayer(Layer, nn.Module):
     def _fw_triton_large_sparse_kernel(node_mars, element_mars, mparams, nids, cids, pids, local_ids, batch_size, 
                                        num_nodes, pid_m_offset, partial_eval: tl.constexpr, num_edges: tl.constexpr, BLOCK_B: tl.constexpr, 
                                        TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, propagation_alg_id: tl.constexpr, 
-                                       pflow_tempered_enabled: tl.constexpr, alpha = 0.0, node_mars_tempered = None):
+                                       pflow_tempered_enabled: tl.constexpr, alpha = 0.0, node_mars_tempered = None,
+                                       pflow_temperature = 1.0):
 
         pid_b = tl.program_id(axis = 0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(axis = 1) + pid_m_offset # ID of size-`TILE_SIZE_M` nodes
@@ -1216,11 +1211,6 @@ class SumLayer(Layer, nn.Module):
             emars = tl.exp((emars - emars_max[:,None,:]) * alpha)
             emars_max *= alpha
 
-        if pflow_tempered_enabled:
-            emars_max_tempered = tl.max(emars, axis = 1)
-            emars_tempered = tl.exp((emars - emars_max_tempered[None,:]) * alpha)
-            emars_max_tempered *= alpha
-
         # Compute sum node marginals
         if propagation_alg_id == 0:
             nmars = tl.where(emars_max == -float("inf"), -float("inf"), tl.log(tl.sum(emars * epars[:,:,None], axis = 1)) + emars_max)
@@ -1242,8 +1232,7 @@ class SumLayer(Layer, nn.Module):
         tl.store(nmars_ptr, nmars, mask = (mask_m[:,None] & mask_batch[None,:]))
 
         if pflow_tempered_enabled:
-            epars_tempered = tl.exp(tl.log(epars) * alpha)
-            nmars_tempered = (tl.log(tl.sum(emars_tempered * epars_tempered[:,None], axis = 0)) + emars_max) * (1.0 / alpha)
+            nmars_tempered = tl.log(tl.sum(tlmath.pow(emars * epars[:,None], 1.0 / pflow_temperature), axis = 0)) + emars_max / pflow_temperature
 
             nmars_ptr = node_mars_tempered + \
                 (off_nids + tile_ids)[:,None] * batch_size + \
@@ -2499,7 +2488,7 @@ class SumLayer(Layer, nn.Module):
             log_n_fdm_max = tl.max(log_n_fdm, axis = 0)
             n_fdm_sub = tl.where(log_n_fdm_max[None,:] != -float("inf"), tl.exp(log_n_fdm - log_n_fdm_max[None,:]), 0.0)
 
-            scaled_emars = tl.exp(emars * pflow_temperature + log_n_fdm_max[:,None])
+            scaled_emars = tl.exp(emars / pflow_temperature + log_n_fdm_max[:,None])
 
             if TL_DOT == 1:
                 partial_flows = tl.dot(n_fdm_sub, scaled_emars)
@@ -2522,7 +2511,7 @@ class SumLayer(Layer, nn.Module):
         epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
         epars = tl.load(mparams + epars_offsets)
 
-        pflows = acc * tlmath.pow(epars, pflow_temperature)
+        pflows = acc * tlmath.pow(epars, 1.0 / pflow_temperature)
 
         parflow_start = tl.load(pfids + nblock_id * num_edges + offs_edge)
         eparflows_offsets = offs_node[:,None] + parflow_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
@@ -2537,7 +2526,7 @@ class SumLayer(Layer, nn.Module):
     def _bk_triton_block_sparse_tempered_par_csmm2_kernel(node_flows, node_mars_tempered, element_mars, mparams, param_flows, nids, cids, pids, pfids,
                                                           batch_size: tl.constexpr, num_edges: tl.constexpr, TILE_SIZE_B: tl.constexpr, B_NUM_TILES: tl.constexpr, 
                                                           TILE_SIZE_K: tl.constexpr, TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, 
-                                                          TL_DOT: tl.constexpr, negate_pflows: tl.constexpr, pid_m_offset = 0, alpha = 0.0, pflow_temperature = 1.0):
+                                                          TL_DOT: tl.constexpr, negate_pflows: tl.constexpr, pid_m_offset = 0, pflow_temperature = 1.0):
 
         pid_k = tl.program_id(0) # ID of size-`TILE_SIZE_K` edges
         pid_m = tl.program_id(1) + pid_m_offset # ID of size-`TILE_SIZE_M` nodes
@@ -2577,7 +2566,7 @@ class SumLayer(Layer, nn.Module):
             log_n_fdm_max = tl.max(log_n_fdm, axis = 1)
             n_fdm_sub = tl.where(log_n_fdm_max[:,None] != -float("inf"), tl.exp(log_n_fdm - log_n_fdm_max[:,None]), 0.0)
 
-            scaled_emars = tl.exp(emars * pflow_temperature + log_n_fdm_max[:,None])
+            scaled_emars = tl.exp(emars / pflow_temperature + log_n_fdm_max[:,None])
 
             partial_flows = tl.sum(tl.trans(n_fdm_sub)[:,:,None] * scaled_emars[None,:,:], axis = 1)
 
@@ -2597,7 +2586,7 @@ class SumLayer(Layer, nn.Module):
         epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
         epars = tl.load(mparams + epars_offsets)
 
-        pflows = acc * tlmath.pow(epars, pflow_temperature)
+        pflows = acc * tlmath.pow(epars, 1.0 / pflow_temperature)
 
         parflow_start = tl.load(pfids + nblock_id * num_edges + offs_edge)
         eparflows_offsets = offs_node[:,None] + parflow_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]

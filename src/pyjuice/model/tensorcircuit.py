@@ -137,6 +137,7 @@ class TensorCircuit(nn.Module):
         self.node_flows = None
         self.element_flows = None
         self.param_flows = None
+        self.node_mars_tempered = None
         
         self._init_layers(
             layer_sparsity_tol = layer_sparsity_tol, 
