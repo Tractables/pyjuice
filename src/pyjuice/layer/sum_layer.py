@@ -386,6 +386,7 @@ class SumLayer(Layer, nn.Module):
                     negate_pflows = negate_pflows, 
                     allow_neg_flows = allow_neg_flows, 
                     force_use_fp32 = force_use_fp32,
+                    pflow_temperature = pflow_temperature,
                     **kwargs
                 )
 
@@ -2789,7 +2790,8 @@ class SumLayer(Layer, nn.Module):
                          cs_block_size: int, local_ids: Optional[torch.Tensor] = None,
                          partition_id: int = -1, allow_modify_flows: bool = False, 
                          propagation_alg: str = "LL", logspace_flows: bool = False, 
-                         negate_pflows: bool = False, accumulate_ch_flows: bool = False, **kwargs) -> None:
+                         negate_pflows: bool = False, accumulate_ch_flows: bool = False, 
+                         pflow_temperature: float = 1.0, **kwargs) -> None:
         """
         Back pass of sum layers with sparse processing kernel.
         
@@ -2825,7 +2827,8 @@ class SumLayer(Layer, nn.Module):
                 allow_modify_flows = allow_modify_flows,
                 propagation_alg = propagation_alg, 
                 logspace_flows = logspace_flows, 
-                negate_pflows = negate_pflows, **kwargs
+                negate_pflows = negate_pflows, 
+                pflow_temperature = pflow_temperature, **kwargs
             )
 
         return None
@@ -3271,11 +3274,88 @@ class SumLayer(Layer, nn.Module):
         else:
             tl.atomic_add(eparflows_ptr, curr_pflows)
 
+    @staticmethod
+    @triton_jit
+    def _bk_triton_sparse_tempered_par_kernel(node_flows, node_mars_tempered, element_mars, mparams, param_flows, nids, cids, pids, pfids,
+                                              pid_m_offset, num_edges: tl.constexpr, batch_size: tl.constexpr, BLOCK_M: tl.constexpr, 
+                                              BLOCK_K: tl.constexpr, BLOCK_B: tl.constexpr, TILE_SIZE_B: tl.constexpr, B_NUM_BLOCKS: tl.constexpr, 
+                                              negate_pflows: tl.constexpr, pflow_temperature = 1.0):
+
+        pid_b = tl.program_id(0) # ID of size-`BLOCK_B` samples
+        pid_e = tl.program_id(1) # ID of size-`BLOCK_K` edges
+        pid_m = tl.program_id(2) + pid_m_offset # ID of size-`BLOCK_M` nodes
+
+        # Get inferred node block id from `pid_m`
+        nblock_id = pid_m // BLOCK_M
+        tile_id = pid_m % BLOCK_M
+
+        # Batch offsets and mask
+        offs_batch = tl.arange(0, BLOCK_B) + pid_b * TILE_SIZE_B
+        mask_batch = offs_batch < batch_size
+
+        # Initialize pointers to `element_mars`
+        offs_edge = tl.arange(0, BLOCK_K) + pid_e * BLOCK_K
+        edge_start = tl.load(cids + nblock_id * num_edges + offs_edge)
+        emars_ptr = element_mars + \
+            edge_start[:,None] * batch_size + \
+            offs_batch[None,:] # [BLOCK_K, BLOCK_B]
+
+        # Initialize pointers to `node_flows` and `node_mars_tempered`
+        off_nids = tl.load(nids + nblock_id)
+        nmars_tempered_ptr = node_mars_tempered + (off_nids + tile_id) * batch_size + offs_batch # [BLOCK_B]
+        nflows_ptr = node_flows + (off_nids + tile_id) * batch_size + offs_batch # [BLOCK_B]
+
+        # Inner loop
+        acc = tl.zeros([BLOCK_K], dtype = tl.float32)
+
+        for b in range(0, B_NUM_BLOCKS):
+            # Batch offsets and mask
+            offs_batch = tl.arange(0, BLOCK_B) + pid_b * TILE_SIZE_B + b * BLOCK_B
+            mask_batch = offs_batch < batch_size
+
+            emars = tl.load(emars_ptr, mask = mask_batch[None,:], other = -float("inf")) # [BLOCK_K, BLOCK_B]
+
+            nmars_tempered = tl.load(nmars_tempered_ptr, mask = mask_batch, other = 0.0) # [BLOCK_B]
+            nflows = tl.load(nflows_ptr, mask = mask_batch, other = 0.0) # [BLOCK_B]
+
+            plflows = nflows[None,:] + emars / pflow_temperature - nmars_tempered[None,:]
+            plflows = tl.where(nmars_tempered[None,:] == -float("inf"),
+                nflows[None,:],
+                plflows
+            )
+            plflows_max = tl.max(plflows, axis = 1)
+            pflows = tl.where(plflows_max == -float("inf"),
+                0.0,
+                tl.exp(tl.log(tl.sum(tl.exp(plflows - plflows_max[:,None]), axis = 1)) + plflows_max)
+            )
+
+            acc += pflows
+
+            # Increment `emars_ptr`, `nmars_tempered_ptr`, and `nflows_ptr`
+            emars_ptr += BLOCK_B
+            nmars_tempered_ptr += BLOCK_B
+            nflows_ptr += BLOCK_B
+
+        par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
+        epars_ptr = mparams + par_start + tile_id
+        epars = tl.load(epars_ptr) # [BLOCK_K]
+
+        parflow_start = tl.load(pfids + nblock_id * num_edges + offs_edge)
+        eparflows_ptr = param_flows + parflow_start + tile_id
+
+        curr_pflows = acc * tlmath.pow(epars, 1.0 / pflow_temperature)
+
+        if negate_pflows:
+            tl.atomic_add(eparflows_ptr, -1.0 * curr_pflows)
+        else:
+            tl.atomic_add(eparflows_ptr, curr_pflows)
+
     def _backward_sparse_par_flows(self, node_flows: torch.Tensor, params: torch.Tensor, node_mars: torch.Tensor, 
                                    element_mars: torch.Tensor, param_flows: torch.Tensor, nids: torch.Tensor, 
                                    cids: torch.Tensor, pids: torch.Tensor, pfids: torch.Tensor,
                                    allow_modify_flows: bool = False, propagation_alg: str = "LL", 
-                                   logspace_flows: bool = False, negate_pflows: bool = False, **kwargs) -> None:
+                                   logspace_flows: bool = False, negate_pflows: bool = False, 
+                                   pflow_temperature: float = 1.0, **kwargs) -> None:
         """
         Backward pass of sum layers w.r.t. sum parameters with the block-sparse processing kernel.
         
@@ -3332,40 +3412,9 @@ class SumLayer(Layer, nn.Module):
         # if grid[0] == 1 and grid[1] == 1 and grid[2] == 1 and BLOCK_B < 4:
         #     BLOCK_B = 4
 
-        if grid[2] <= 32768:
-            self._bk_triton_sparse_par_kernel[grid](
-                node_flows = node_flows, 
-                node_mars = node_mars, 
-                element_mars = element_mars, 
-                mparams = params, 
-                param_flows = param_flows, 
-                nids = nids, 
-                cids = cids, 
-                pids = pids,
-                pfids = pfids,
-                pid_m_offset = 0,
-                num_edges = num_edges,
-                batch_size = batch_size,
-                allow_modify_flows = allow_modify_flows,
-                logspace_flows = logspace_flows,
-                BLOCK_M = BLOCK_M,
-                BLOCK_K = BLOCK_K,
-                BLOCK_B = BLOCK_B,
-                TILE_SIZE_B = TILE_SIZE_B,
-                B_NUM_BLOCKS = B_NUM_BLOCKS,
-                propagation_alg_id = propagation_alg_id,
-                negate_pflows = negate_pflows,
-                **propagation_alg_kwargs
-            )
-        
-        else:
-            # TODO: This is a temporal fix...
-            for pid_m_start in range(0, grid[2], 32768):
-
-                pid_m_end = min(pid_m_start + 32768, grid[2])
-                small_grid = (grid[0], grid[1], pid_m_end - pid_m_start)
-
-                self._bk_triton_sparse_par_kernel[small_grid](
+        if abs(pflow_temperature - 1.0) < 1e-6:
+            if grid[2] <= 32768:
+                self._bk_triton_sparse_par_kernel[grid](
                     node_flows = node_flows, 
                     node_mars = node_mars, 
                     element_mars = element_mars, 
@@ -3375,7 +3424,7 @@ class SumLayer(Layer, nn.Module):
                     cids = cids, 
                     pids = pids,
                     pfids = pfids,
-                    pid_m_offset = pid_m_start,
+                    pid_m_offset = 0,
                     num_edges = num_edges,
                     batch_size = batch_size,
                     allow_modify_flows = allow_modify_flows,
@@ -3389,6 +3438,92 @@ class SumLayer(Layer, nn.Module):
                     negate_pflows = negate_pflows,
                     **propagation_alg_kwargs
                 )
+            
+            else:
+                # TODO: This is a temporal fix...
+                for pid_m_start in range(0, grid[2], 32768):
+
+                    pid_m_end = min(pid_m_start + 32768, grid[2])
+                    small_grid = (grid[0], grid[1], pid_m_end - pid_m_start)
+
+                    self._bk_triton_sparse_par_kernel[small_grid](
+                        node_flows = node_flows, 
+                        node_mars = node_mars, 
+                        element_mars = element_mars, 
+                        mparams = params, 
+                        param_flows = param_flows, 
+                        nids = nids, 
+                        cids = cids, 
+                        pids = pids,
+                        pfids = pfids,
+                        pid_m_offset = pid_m_start,
+                        num_edges = num_edges,
+                        batch_size = batch_size,
+                        allow_modify_flows = allow_modify_flows,
+                        logspace_flows = logspace_flows,
+                        BLOCK_M = BLOCK_M,
+                        BLOCK_K = BLOCK_K,
+                        BLOCK_B = BLOCK_B,
+                        TILE_SIZE_B = TILE_SIZE_B,
+                        B_NUM_BLOCKS = B_NUM_BLOCKS,
+                        propagation_alg_id = propagation_alg_id,
+                        negate_pflows = negate_pflows,
+                        **propagation_alg_kwargs
+                    )
+
+        else:
+            if grid[2] <= 32768:
+                print(" fsaidofjwaeoif")
+                self._bk_triton_sparse_tempered_par_kernel[grid](
+                    node_flows = node_flows, 
+                    node_mars_tempered = kwargs["node_mars_tempered"], 
+                    element_mars = element_mars, 
+                    mparams = params, 
+                    param_flows = param_flows, 
+                    nids = nids, 
+                    cids = cids, 
+                    pids = pids,
+                    pfids = pfids,
+                    pid_m_offset = 0,
+                    num_edges = num_edges,
+                    batch_size = batch_size,
+                    BLOCK_M = BLOCK_M,
+                    BLOCK_K = BLOCK_K,
+                    BLOCK_B = BLOCK_B,
+                    TILE_SIZE_B = TILE_SIZE_B,
+                    B_NUM_BLOCKS = B_NUM_BLOCKS,
+                    negate_pflows = negate_pflows,
+                    pflow_temperature = pflow_temperature
+                )
+            
+            else:
+                # TODO: This is a temporal fix...
+                for pid_m_start in range(0, grid[2], 32768):
+
+                    pid_m_end = min(pid_m_start + 32768, grid[2])
+                    small_grid = (grid[0], grid[1], pid_m_end - pid_m_start)
+
+                    self._bk_triton_sparse_tempered_par_kernel[small_grid](
+                        node_flows = node_flows, 
+                        node_mars_tempered = kwargs["node_mars_tempered"], 
+                        element_mars = element_mars, 
+                        mparams = params, 
+                        param_flows = param_flows, 
+                        nids = nids, 
+                        cids = cids, 
+                        pids = pids,
+                        pfids = pfids,
+                        pid_m_offset = pid_m_start,
+                        num_edges = num_edges,
+                        batch_size = batch_size,
+                        BLOCK_M = BLOCK_M,
+                        BLOCK_K = BLOCK_K,
+                        BLOCK_B = BLOCK_B,
+                        TILE_SIZE_B = TILE_SIZE_B,
+                        B_NUM_BLOCKS = B_NUM_BLOCKS,
+                        negate_pflows = negate_pflows,
+                        pflow_temperature = pflow_temperature
+                    )
 
         return None
 

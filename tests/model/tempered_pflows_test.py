@@ -75,9 +75,61 @@ def test_tempered_pflows_forward():
     ns_mars_tempered_target = torch.matmul(ns_params.pow(1.0 / temperature), (np2_mars / temperature).exp()).log()
     assert torch.all(torch.abs(ns_mars_tempered - ns_mars_tempered_target) < 1e-2)
 
+
+def test_tempered_pflows_backward():
+
+    torch.manual_seed(63892)
+
+    device = torch.device("cuda:0")
+
+    block_size = 16
+    batch_size = 32
+    temperature = 0.5
+    
+    with juice.set_block_size(block_size):
+
+        ni0 = inputs(0, num_node_blocks = 2, dist = dists.Categorical(num_cats = 2))
+        ni1 = inputs(1, num_node_blocks = 2, dist = dists.Categorical(num_cats = 2))
+        ni2 = inputs(2, num_node_blocks = 2, dist = dists.Categorical(num_cats = 2))
+        ni3 = inputs(3, num_node_blocks = 2, dist = dists.Categorical(num_cats = 2))
+
+        np0 = multiply(ni0, ni1)
+        np1 = multiply(ni2, ni3)
+
+        ns0 = summate(np0, num_node_blocks = 2)
+        ns1 = summate(np1, num_node_blocks = 2)
+
+        np2 = multiply(ns0, ns1)
+        ns = summate(np2, num_node_blocks = 1, block_size = 1)
+
+    ns.init_parameters(perturbation = 4.0)
+    pc = juice.compile(ns)
+    pc.to(device)
+
+    data = torch.randint(0, 2, [batch_size, 4]).to(device)
+
+    pc.init_param_flows()
+
+    lls = pc(data, pflow_temperature = temperature)
+    pc.backward(data, logspace_flows = True, allow_modify_flows = False, pflow_temperature = temperature)
+
+    pc.update_param_flows()
+
+    ns_param_flows = ns.get_param_flows(as_matrix = True).to(device)[0,:]
+    ns_params = ns.get_params(as_matrix = True).to(device)[0,:]
+
+    ns0_mars = pc.node_mars[ns0._output_ind_range[0]:ns0._output_ind_range[1],:]
+    ns1_mars = pc.node_mars[ns1._output_ind_range[0]:ns1._output_ind_range[1],:]
+    np2_mars = ns0_mars + ns1_mars
+
+    unnorm_flows = (ns_params[:,None] * np2_mars.exp()).pow(1.0 / temperature)
+    ns_parflows_target = (unnorm_flows / unnorm_flows.sum(dim = 0, keepdim = True)).sum(dim = 1)
+    # assert torch.all(torch.abs(ns_parflows_target - ns_param_flows) < 1e-2)
+
     import pdb; pdb.set_trace()
-    a = 3
+    a = 4
 
 
 if __name__ == "__main__":
-    test_tempered_pflows_forward()
+    # test_tempered_pflows_forward()
+    test_tempered_pflows_backward()
