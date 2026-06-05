@@ -42,7 +42,7 @@ def _prep_args_apply_fw_kernel(layer, kwargs):
     target_kwargs["var_idmapping_ptr"] = layer.var_idmapping
 
     # (Optional) soft_evidence_cat_ids
-    if "soft_evidence_cat_ids" in kwargs:
+    if "soft_evidence_cat_ids" in kwargs and kwargs["soft_evidence_cat_ids"] is not None:
         soft_evidence_cat_ids = kwargs["soft_evidence_cat_ids"]
         assert categorical_evidence_logp.size() == soft_evidence_cat_ids.size()
 
@@ -151,7 +151,7 @@ def _prep_args_apply_bk_softevi_kernel(layer, kwargs):
     target_kwargs["var_idmapping_ptr"] = layer.var_idmapping
 
     # (Optional) soft_evidence_cat_ids
-    if "soft_evidence_cat_ids" in kwargs:
+    if "soft_evidence_cat_ids" in kwargs and kwargs["soft_evidence_cat_ids"] is not None:
         soft_evidence_cat_ids = kwargs["soft_evidence_cat_ids"]
         assert categorical_evidence_logp.size() == soft_evidence_cat_ids.size()
 
