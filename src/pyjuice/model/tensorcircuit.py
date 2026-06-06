@@ -500,7 +500,8 @@ class TensorCircuit(nn.Module):
                     else:
                         raise ValueError(f"Unknown layer type {type(layer)}.")
 
-            signature = (1, id(self.node_flows), id(self.element_flows), id(self.node_mars), id(self.element_mars), id(self.params), id(self.param_flows), B, allow_modify_flows, logspace_flows)
+            signature = (1, id(self.node_flows), id(self.element_flows), id(self.node_mars), id(self.element_mars), id(self.params), id(self.param_flows), B, 
+                         allow_modify_flows, logspace_flows, ((abs(pflow_temperature) - 1.0) < 1e-6), temper_eflow)
             if record_cudagraph and signature not in self._recorded_cuda_graphs:
                 # Warmup
                 s = torch.cuda.Stream()
