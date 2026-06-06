@@ -271,7 +271,8 @@ class SumLayer(Layer, nn.Module):
                  allow_modify_flows: bool = False, propagation_alg: str = "LL", 
                  logspace_flows: bool = False, negate_pflows: bool = False, 
                  accumulate_ch_flows: bool = False, allow_neg_flows: bool = False,
-                 force_use_fp32: bool = False, pflow_temperature: float = 1.0, **kwargs) -> None:
+                 force_use_fp32: bool = False, pflow_temperature: float = 1.0, 
+                 temper_eflow: bool = False, **kwargs) -> None:
         """
         Computes the forward pass of a sum layer:
         ```
@@ -338,6 +339,7 @@ class SumLayer(Layer, nn.Module):
                     allow_neg_flows = allow_neg_flows,
                     force_use_fp32 = force_use_fp32,
                     pflow_temperature = pflow_temperature,
+                    temper_eflow = temper_eflow,
                     **kwargs
                 )
 
@@ -364,6 +366,7 @@ class SumLayer(Layer, nn.Module):
                     allow_neg_flows = allow_neg_flows,
                     force_use_fp32 = force_use_fp32,
                     pflow_temperature = pflow_temperature,
+                    temper_eflow = temper_eflow,
                     **kwargs
                 )
 
@@ -387,6 +390,7 @@ class SumLayer(Layer, nn.Module):
                     allow_neg_flows = allow_neg_flows, 
                     force_use_fp32 = force_use_fp32,
                     pflow_temperature = pflow_temperature,
+                    temper_eflow = temper_eflow,
                     **kwargs
                 )
 
@@ -1433,7 +1437,8 @@ class SumLayer(Layer, nn.Module):
                   accumulate_ch_flows: bool = False, 
                   allow_neg_flows: bool = False, 
                   force_use_fp32: bool = False, 
-                  pflow_temperature: float = 1.0, **kwargs) -> None:
+                  pflow_temperature: float = 1.0, 
+                  temper_eflow: bool = False, **kwargs) -> None:
         """
         Back pass of sum layers.
         
@@ -1481,7 +1486,7 @@ class SumLayer(Layer, nn.Module):
                 propagation_alg = propagation_alg, logspace_flows = logspace_flows, 
                 negate_pflows = negate_pflows, accumulate_ch_flows = accumulate_ch_flows, 
                 allow_neg_flows = allow_neg_flows, force_use_fp32 = force_use_fp32, 
-                pflow_temperature = pflow_temperature, **kwargs
+                pflow_temperature = pflow_temperature, temper_eflow = temper_eflow, **kwargs
             )
 
         elif mode == self.SPARSE:
@@ -1491,13 +1496,14 @@ class SumLayer(Layer, nn.Module):
                 partition_id = partition_id, allow_modify_flows = allow_modify_flows,
                 propagation_alg = propagation_alg, logspace_flows = logspace_flows, 
                 negate_pflows = negate_pflows, accumulate_ch_flows = accumulate_ch_flows, 
-                pflow_temperature = pflow_temperature, **kwargs
+                pflow_temperature = pflow_temperature, temper_eflow = temper_eflow, **kwargs
             )
 
         elif mode == self.PYTORCH:
             assert not allow_modify_flows, "Please set `allow_modify_flows` to False when " \
                                            "using the native PyTorch backward."
             assert abs(pflow_temperature - 1.0) < 1e-6, "`pflow_temperature != 0` not supported with PyTorch backend."
+            assert not temper_eflow, "`temper_eflow == True` not supported with PyTorch backend."
             self._backward_pytorch(
                 node_flows, element_flows, params, node_mars, 
                 element_mars, param_flows, nids, cids, pids, pfids, 
@@ -1683,7 +1689,8 @@ class SumLayer(Layer, nn.Module):
                                cs_block_size: int, local_ids: Optional[torch.Tensor] = None,
                                partition_id: int = -1, allow_modify_flows: bool = False, propagation_alg: str = "LL", 
                                logspace_flows: bool = False, negate_pflows: bool = False, accumulate_ch_flows: bool = False, 
-                               allow_neg_flows: bool = False, force_use_fp32 = False, pflow_temperature: float = 1.0, **kwargs) -> None:
+                               allow_neg_flows: bool = False, force_use_fp32 = False, pflow_temperature: float = 1.0, 
+                               temper_eflow: bool = False, **kwargs) -> None:
         """
         Back pass of sum layers with block-sparse processing kernel.
         
@@ -1710,7 +1717,9 @@ class SumLayer(Layer, nn.Module):
                 logspace_flows = logspace_flows, 
                 accumulate_ch_flows = accumulate_ch_flows, 
                 allow_neg_flows = allow_neg_flows, 
-                force_use_fp32 = force_use_fp32, **kwargs
+                force_use_fp32 = force_use_fp32, 
+                eflow_temperature = pflow_temperature if temper_eflow else 1.0, 
+                **kwargs
             )
 
         # Flows w.r.t. parameters
@@ -2791,7 +2800,7 @@ class SumLayer(Layer, nn.Module):
                          partition_id: int = -1, allow_modify_flows: bool = False, 
                          propagation_alg: str = "LL", logspace_flows: bool = False, 
                          negate_pflows: bool = False, accumulate_ch_flows: bool = False, 
-                         pflow_temperature: float = 1.0, **kwargs) -> None:
+                         pflow_temperature: float = 1.0, temper_eflow: bool = False, **kwargs) -> None:
         """
         Back pass of sum layers with sparse processing kernel.
         
@@ -2816,7 +2825,9 @@ class SumLayer(Layer, nn.Module):
                 allow_modify_flows = allow_modify_flows,
                 propagation_alg = propagation_alg, 
                 logspace_flows = logspace_flows, 
-                accumulate_ch_flows = accumulate_ch_flows, **kwargs
+                accumulate_ch_flows = accumulate_ch_flows, 
+                eflow_temperature = pflow_temperature if temper_eflow else 1.0, 
+                **kwargs
             )
 
         # Flows w.r.t. parameters
