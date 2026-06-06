@@ -2159,9 +2159,9 @@ class SumLayer(Layer, nn.Module):
             epars_ptr += parpids_inc[None,:]
             parpids_inc_ptr += ptr_inc_step
 
-            # Increment `nmars_ptr`
+            # Increment `nmars_tempered_ptr`
             parids_inc = tl.load(parids_inc_ptr)
-            nmars_ptr += parids_inc[:,None] * batch_size
+            nmars_tempered_ptr += parids_inc[:,None] * batch_size
             nflows_ptr += parids_inc[:,None] * batch_size
             parids_inc_ptr += ptr_inc_step
 
@@ -2260,9 +2260,9 @@ class SumLayer(Layer, nn.Module):
             epars_ptr += parpids_inc[None,:]
             parpids_inc_ptr += ptr_inc_step
 
-            # Increment `nmars_ptr`
+            # Increment `nmars_tempered_ptr`
             parids_inc = tl.load(parids_inc_ptr)
-            nmars_ptr += parids_inc[None,:] * batch_size
+            nmars_tempered_ptr += parids_inc[None,:] * batch_size
             nflows_ptr += parids_inc[None,:] * batch_size
             parids_inc_ptr += ptr_inc_step
 
@@ -2463,7 +2463,7 @@ class SumLayer(Layer, nn.Module):
                         TL_DOT = TL_DOT,
                         accumulate_ch_flows = accumulate_ch_flows,
                         pid_m_offset = pid_m_start,
-                        eflow_temperature = eflow_temperature
+                        eflow_temperature = eflow_temperature,
                         num_stages = 1,
                     )
                 else:
@@ -3511,7 +3511,7 @@ class SumLayer(Layer, nn.Module):
 
             grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, BLOCK_M))
 
-            if abs(pflow_temperature - 1.0) < 1e-6:
+            if abs(eflow_temperature - 1.0) < 1e-6:
 
                 self._bk_triton_sparse_ele_kernel[grid](
                     node_flows = node_flows, 
@@ -3567,7 +3567,7 @@ class SumLayer(Layer, nn.Module):
 
             grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
 
-            if abs(pflow_temperature - 1.0) < 1e-6:
+            if abs(eflow_temperature - 1.0) < 1e-6:
 
                 if grid[1] <= 32768:
                     self._bk_triton_large_sparse_ele_kernel[grid](
