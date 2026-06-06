@@ -3218,7 +3218,12 @@ class SumLayer(Layer, nn.Module):
 
             if accumulate_ch_flows:
                 ori_eflows = tl.load(eflows_ptr, mask = mask_batch, other = 0.0)
-                eflows += ori_eflows
+                if logspace_flows:
+                    m = tl.maximum(eflows, ori_eflows)
+                    eflows = tl.where(m == -float("inf"), -float("inf"),
+                                    m + tl.log(tl.exp(eflows - m) + tl.exp(ori_eflows - m)))
+                else:
+                    eflows += ori_eflows
 
             tl.store(eflows_ptr, eflows, mask = mask_batch)
 
@@ -3325,7 +3330,12 @@ class SumLayer(Layer, nn.Module):
 
         if accumulate_ch_flows:
             ori_eflows = tl.load(eflows_ptr, mask = (mask_m[:,None] & mask_batch[None,:]), other = 0.0)
-            eflows += ori_eflows
+            if logspace_flows:
+                m = tl.maximum(eflows, ori_eflows)
+                eflows = tl.where(m == -float("inf"), -float("inf"),
+                                  m + tl.log(tl.exp(eflows - m) + tl.exp(ori_eflows - m)))
+            else:
+                eflows += ori_eflows
 
         tl.store(eflows_ptr, eflows, mask = (mask_m[:,None] & mask_batch[None,:]))
 
