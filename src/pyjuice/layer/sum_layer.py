@@ -3341,10 +3341,10 @@ class SumLayer(Layer, nn.Module):
 
     @staticmethod
     @triton_jit
-    def _bk_triton_sparse_ele_kernel(node_flows, element_flows, node_mars_tempered, element_mars, mparams, 
-                                     chids, parids, parpids, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
-                                     n_edge_blocks: tl.constexpr, BLOCK_B: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, 
-                                     accumulate_ch_flows: tl.constexpr, eflow_temperature = 1.0):
+    def _bk_triton_sparse_tempered_ele_kernel(node_flows, element_flows, node_mars_tempered, element_mars, mparams, 
+                                              chids, parids, parpids, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
+                                              n_edge_blocks: tl.constexpr, BLOCK_B: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, 
+                                              accumulate_ch_flows: tl.constexpr, eflow_temperature = 1.0):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(1) # ID of size-`BLOCK_M` nodes
@@ -3473,7 +3473,7 @@ class SumLayer(Layer, nn.Module):
                 self._bk_triton_sparse_tempered_ele_kernel[grid](
                     node_flows = node_flows, 
                     element_flows = element_flows, 
-                    node_mars_tempered = kwargs["node_mars_tempered"], 
+                    node_mars_tempered = kwargs["node_mars_tempered"],
                     element_mars = element_mars, 
                     mparams = params, 
                     chids = chids, 
@@ -3499,40 +3499,10 @@ class SumLayer(Layer, nn.Module):
 
             grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
 
-            if grid[1] <= 32768:
-                self._bk_triton_large_sparse_ele_kernel[grid](
-                    node_flows = node_flows,
-                    element_flows = element_flows,
-                    node_mars = node_mars,
-                    element_mars = element_mars,
-                    mparams = params,
-                    chids = chids,
-                    parids = parids,
-                    parpids = parpids,
-                    local_ids = local_ids,
-                    num_eles = layer_n_nodes,
-                    pid_m_offset = 0,
-                    batch_size = batch_size,
-                    partial_eval = 1 if local_ids is not None else 0,
-                    n_edge_blocks = n_edge_blocks,
-                    allow_modify_flows = allow_modify_flows,
-                    logspace_flows = logspace_flows,
-                    BLOCK_B = BLOCK_B,
-                    TILE_SIZE_M = TILE_SIZE_M,
-                    BLOCK_SIZE_M = cs_block_size,
-                    BLOCK_SIZE_K = self.block_size,
-                    propagation_alg_id = propagation_alg_id,
-                    accumulate_ch_flows = accumulate_ch_flows,
-                    **propagation_alg_kwargs
-                )
+            if abs(pflow_temperature - 1.0) < 1e-6:
 
-            else:
-                for pid_m_start in range(0, grid[1], 32768):
-
-                    pid_m_end = min(pid_m_start + 32768, grid[1])
-                    small_grid = (grid[0], pid_m_end - pid_m_start)
-
-                    self._bk_triton_large_sparse_ele_kernel[small_grid](
+                if grid[1] <= 32768:
+                    self._bk_triton_large_sparse_ele_kernel[grid](
                         node_flows = node_flows,
                         element_flows = element_flows,
                         node_mars = node_mars,
@@ -3543,7 +3513,7 @@ class SumLayer(Layer, nn.Module):
                         parpids = parpids,
                         local_ids = local_ids,
                         num_eles = layer_n_nodes,
-                        pid_m_offset = pid_m_start,
+                        pid_m_offset = 0,
                         batch_size = batch_size,
                         partial_eval = 1 if local_ids is not None else 0,
                         n_edge_blocks = n_edge_blocks,
@@ -3557,6 +3527,93 @@ class SumLayer(Layer, nn.Module):
                         accumulate_ch_flows = accumulate_ch_flows,
                         **propagation_alg_kwargs
                     )
+
+                else:
+                    for pid_m_start in range(0, grid[1], 32768):
+
+                        pid_m_end = min(pid_m_start + 32768, grid[1])
+                        small_grid = (grid[0], pid_m_end - pid_m_start)
+
+                        self._bk_triton_large_sparse_ele_kernel[small_grid](
+                            node_flows = node_flows,
+                            element_flows = element_flows,
+                            node_mars = node_mars,
+                            element_mars = element_mars,
+                            mparams = params,
+                            chids = chids,
+                            parids = parids,
+                            parpids = parpids,
+                            local_ids = local_ids,
+                            num_eles = layer_n_nodes,
+                            pid_m_offset = pid_m_start,
+                            batch_size = batch_size,
+                            partial_eval = 1 if local_ids is not None else 0,
+                            n_edge_blocks = n_edge_blocks,
+                            allow_modify_flows = allow_modify_flows,
+                            logspace_flows = logspace_flows,
+                            BLOCK_B = BLOCK_B,
+                            TILE_SIZE_M = TILE_SIZE_M,
+                            BLOCK_SIZE_M = cs_block_size,
+                            BLOCK_SIZE_K = self.block_size,
+                            propagation_alg_id = propagation_alg_id,
+                            accumulate_ch_flows = accumulate_ch_flows,
+                            **propagation_alg_kwargs
+                        )
+
+            else:
+
+                if grid[1] <= 32768:
+                    self._bk_triton_large_sparse_tempered_ele_kernel[grid](
+                        node_flows = node_flows,
+                        element_flows = element_flows,
+                        node_mars_tempered = kwargs["node_mars_tempered"], 
+                        element_mars = element_mars,
+                        mparams = params,
+                        chids = chids,
+                        parids = parids,
+                        parpids = parpids,
+                        local_ids = local_ids,
+                        num_eles = layer_n_nodes,
+                        pid_m_offset = 0,
+                        batch_size = batch_size,
+                        partial_eval = 1 if local_ids is not None else 0,
+                        n_edge_blocks = n_edge_blocks,
+                        BLOCK_B = BLOCK_B,
+                        TILE_SIZE_M = TILE_SIZE_M,
+                        BLOCK_SIZE_M = cs_block_size,
+                        BLOCK_SIZE_K = self.block_size,
+                        accumulate_ch_flows = accumulate_ch_flows,
+                        eflow_temperature = eflow_temperature
+                    )
+
+                else:
+                    for pid_m_start in range(0, grid[1], 32768):
+
+                        pid_m_end = min(pid_m_start + 32768, grid[1])
+                        small_grid = (grid[0], pid_m_end - pid_m_start)
+
+                        self._bk_triton_large_sparse_tempered_ele_kernel[small_grid](
+                            node_flows = node_flows,
+                            element_flows = element_flows,
+                            node_mars_tempered = kwargs["node_mars_tempered"], 
+                            element_mars = element_mars,
+                            mparams = params,
+                            chids = chids,
+                            parids = parids,
+                            parpids = parpids,
+                            local_ids = local_ids,
+                            num_eles = layer_n_nodes,
+                            pid_m_offset = pid_m_start,
+                            batch_size = batch_size,
+                            partial_eval = 1 if local_ids is not None else 0,
+                            n_edge_blocks = n_edge_blocks,
+                            BLOCK_B = BLOCK_B,
+                            TILE_SIZE_M = TILE_SIZE_M,
+                            BLOCK_SIZE_M = cs_block_size,
+                            BLOCK_SIZE_K = self.block_size,
+                            accumulate_ch_flows = accumulate_ch_flows,
+                            eflow_temperature = eflow_temperature
+                        )
 
         return None
 
