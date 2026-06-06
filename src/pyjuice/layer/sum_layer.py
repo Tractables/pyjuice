@@ -1897,7 +1897,14 @@ class SumLayer(Layer, nn.Module):
         offs_elemfs = (off_eleids + offs_ele[:,None]) * batch_size + offs_batch[None,:]
         if accumulate_ch_flows:
             ori_eflows = tl.load(element_flows + offs_elemfs, mask = mask_batch[None,:], other = 0.0)
-            acc += ori_eflows
+            if logspace_flows:
+                m = tl.maximum(acc, ori_eflows)
+                acc = tl.where(m == -float("inf"), 
+                    -float("inf"),
+                    m + tl.log(tl.exp(acc - m) + tl.exp(ori_eflows - m))
+                )
+            else:
+                acc += ori_eflows
         tl.store(element_flows + offs_elemfs, acc, mask = mask_batch[None,:])
 
     @staticmethod
@@ -2056,7 +2063,14 @@ class SumLayer(Layer, nn.Module):
         offs_elemfs = (off_eleids + offs_ele[:,None]) * batch_size + offs_batch[None,:]
         if accumulate_ch_flows:
             ori_eflows = tl.load(element_flows + offs_elemfs, mask = mask_batch[None,:], other = 0.0)
-            acc += ori_eflows
+            if logspace_flows:
+                m = tl.maximum(acc, ori_eflows)
+                acc = tl.where(m == -float("inf"), 
+                    -float("inf"),
+                    m + tl.log(tl.exp(acc - m) + tl.exp(ori_eflows - m))
+                )
+            else:
+                acc += ori_eflows
         tl.store(element_flows + offs_elemfs, acc, mask = mask_batch[None,:])
 
     @staticmethod
