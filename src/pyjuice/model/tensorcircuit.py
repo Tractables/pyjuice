@@ -372,6 +372,7 @@ class TensorCircuit(nn.Module):
                  _disable_buffer_init: bool = False,
                  force_use_fp32: bool = False,
                  pflow_temperature: float = 1.0,
+                 temper_eflow: bool = False,
                  **kwargs):
         """
         Backward evaluation of the PC that computes node flows as well as parameter flows.
@@ -392,6 +393,7 @@ class TensorCircuit(nn.Module):
         self._run_params["negate_pflows"] = negate_pflows
         self._run_params["force_use_fp32"] = force_use_fp32
         self._run_params["pflow_temperature"] = pflow_temperature
+        self._run_params["temper_eflow"] = temper_eflow
 
         assert self.node_mars is not None and self.element_mars is not None, "Should run forward path first."
         if input_layer_fn is None:
@@ -482,7 +484,7 @@ class TensorCircuit(nn.Module):
                                              allow_modify_flows = allow_modify_flows, 
                                              propagation_alg = propagation_alg if isinstance(propagation_alg, str) else propagation_alg[layer_id], 
                                              logspace_flows = logspace_flows, negate_pflows = negate_pflows, force_use_fp32 = force_use_fp32, 
-                                             pflow_temperature = pflow_temperature, **kwargs)
+                                             pflow_temperature = pflow_temperature, temper_eflow = temper_eflow, **kwargs)
 
                         # Execute post-backward callback
                         layer_group.callback(
