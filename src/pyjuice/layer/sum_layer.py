@@ -3329,12 +3329,85 @@ class SumLayer(Layer, nn.Module):
 
         tl.store(eflows_ptr, eflows, mask = (mask_m[:,None] & mask_batch[None,:]))
 
+    @staticmethod
+    @triton_jit
+    def _bk_triton_sparse_ele_kernel(node_flows, element_flows, node_mars_tempered, element_mars, mparams, 
+                                     chids, parids, parpids, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
+                                     n_edge_blocks: tl.constexpr, BLOCK_B: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, 
+                                     accumulate_ch_flows: tl.constexpr, eflow_temperature = 1.0):
+
+        pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
+        pid_m = tl.program_id(1) # ID of size-`BLOCK_M` nodes
+
+        # Get inferred node block id from `pid_m`
+        eleblock_id = pid_m
+
+        # Get the real node block id in the case of partial evaluation
+        if partial_eval == 1:
+            eleblock_id = tl.load(local_ids + eleblock_id)
+
+        # Initialize pointers to `params`
+        offs_edge = tl.arange(0, n_edge_blocks * BLOCK_SIZE_K) # I.e., [0, num_edges)
+        offs_edge_gid = offs_edge // BLOCK_SIZE_K
+        offs_edge_nid = (offs_edge % BLOCK_SIZE_K)
+        par_start = tl.load(parpids + eleblock_id * n_edge_blocks + offs_edge_gid)
+        epars_ptr = mparams + par_start + offs_edge_nid # [num_edges]
+
+        # Batch offsets and mask
+        offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B
+        mask_batch = offs_batch < batch_size
+
+        # Initialize `node_flows` and `node_mars_tempered`
+        edge_start = tl.load(parids + eleblock_id * n_edge_blocks + offs_edge_gid)
+        nmars_tempered_ptr = node_mars_tempered + \
+            (edge_start + offs_edge_nid)[:,None] * batch_size + \
+            offs_batch[None,:]
+        nmars_tempered = tl.load(nmars_tempered_ptr, mask = mask_batch[None,:]) # [num_edges, BLOCK_B]
+        nflows_ptr = node_flows + \
+            (edge_start + offs_edge_nid)[:,None] * batch_size + \
+            offs_batch[None,:]
+        nflows = tl.load(nflows_ptr, mask = mask_batch[None,:]) # [num_edges, BLOCK_B]
+
+        # Initialize pointers to `element_flows` and `element_mars`
+        off_eleids = tl.load(chids + eleblock_id)
+        eflows_ptr = element_flows + off_eleids * batch_size + offs_batch # [BLOCK_B]
+        emars_ptr = element_mars + off_eleids * batch_size + offs_batch # [BLOCK_B]
+
+        # Inner loop
+        for i in range(0, BLOCK_M):
+            epars = tl.load(epars_ptr) # [num_edges]
+            emars = tl.load(emars_ptr, mask = mask_batch) # [BLOCK_B]
+
+            lpars = tl.log(epars)
+
+            elflows = nflows + (lpars[:,None] + emars[None,:]) / eflow_temperature - nmars_tempered
+
+            elflows_max = tl.max(elflows, axis = 0)
+            eflows = tl.log(tl.sum(tl.exp(elflows - elflows_max[None,:]), axis = 0)) + elflows_max
+            eflows = tl.where((elflows_max == -float("inf")) | (emars == -float("inf")), -float("inf"), eflows)
+
+            if accumulate_ch_flows:
+                ori_eflows = tl.load(eflows_ptr, mask = mask_batch, other = 0.0)
+                m = tl.maximum(eflows, ori_eflows)
+                eflows = tl.where(m == -float("inf"), -float("inf"),
+                                  m + tl.log(tl.exp(eflows - m) + tl.exp(ori_eflows - m)))
+
+            tl.store(eflows_ptr, eflows, mask = mask_batch)
+
+            # Increment `epars_ptr`
+            epars_ptr += BLOCK_SIZE_K
+
+            # Increment `emars_ptr` and `eflows_ptr`
+            emars_ptr += batch_size
+            eflows_ptr += batch_size
+
     def _backward_sparse_ele_flows(self, node_flows: torch.Tensor, element_flows: torch.Tensor,
                                    params: torch.Tensor, node_mars: torch.Tensor,
                                    element_mars: torch.Tensor, chids: torch.Tensor, parids: torch.Tensor,
                                    parpids: torch.Tensor, cs_block_size: int, local_ids: Optional[torch.Tensor] = None,
                                    allow_modify_flows: bool = False, propagation_alg: str = "LL", 
-                                   logspace_flows: bool = False, accumulate_ch_flows: bool = False, **kwargs) -> None:
+                                   logspace_flows: bool = False, accumulate_ch_flows: bool = False, 
+                                   eflow_temperature: float = 1.0, **kwargs) -> None:
 
         assert params.dim() == 1, "Expecting a 1D `params`."
 
@@ -3360,28 +3433,52 @@ class SumLayer(Layer, nn.Module):
 
             grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, BLOCK_M))
 
-            self._bk_triton_sparse_ele_kernel[grid](
-                node_flows = node_flows, 
-                element_flows = element_flows, 
-                node_mars = node_mars, 
-                element_mars = element_mars, 
-                mparams = params, 
-                chids = chids, 
-                parids = parids,
-                parpids = parpids,
-                local_ids = local_ids,
-                batch_size = batch_size,
-                partial_eval = 1 if local_ids is not None else 0,
-                n_edge_blocks = n_edge_blocks,
-                allow_modify_flows = allow_modify_flows,
-                logspace_flows = logspace_flows,
-                BLOCK_B = BLOCK_B,
-                BLOCK_M = BLOCK_M,
-                BLOCK_SIZE_K = self.block_size,
-                propagation_alg_id = propagation_alg_id,
-                accumulate_ch_flows = accumulate_ch_flows,
-                **propagation_alg_kwargs
-            )
+            if abs(pflow_temperature - 1.0) < 1e-6:
+
+                self._bk_triton_sparse_ele_kernel[grid](
+                    node_flows = node_flows, 
+                    element_flows = element_flows, 
+                    node_mars = node_mars, 
+                    element_mars = element_mars, 
+                    mparams = params, 
+                    chids = chids, 
+                    parids = parids,
+                    parpids = parpids,
+                    local_ids = local_ids,
+                    batch_size = batch_size,
+                    partial_eval = 1 if local_ids is not None else 0,
+                    n_edge_blocks = n_edge_blocks,
+                    allow_modify_flows = allow_modify_flows,
+                    logspace_flows = logspace_flows,
+                    BLOCK_B = BLOCK_B,
+                    BLOCK_M = BLOCK_M,
+                    BLOCK_SIZE_K = self.block_size,
+                    propagation_alg_id = propagation_alg_id,
+                    accumulate_ch_flows = accumulate_ch_flows,
+                    **propagation_alg_kwargs
+                )
+
+            else:
+
+                self._bk_triton_sparse_tempered_ele_kernel[grid](
+                    node_flows = node_flows, 
+                    element_flows = element_flows, 
+                    node_mars_tempered = kwargs["node_mars_tempered"], 
+                    element_mars = element_mars, 
+                    mparams = params, 
+                    chids = chids, 
+                    parids = parids,
+                    parpids = parpids,
+                    local_ids = local_ids,
+                    batch_size = batch_size,
+                    partial_eval = 1 if local_ids is not None else 0,
+                    n_edge_blocks = n_edge_blocks,
+                    BLOCK_B = BLOCK_B,
+                    BLOCK_M = BLOCK_M,
+                    BLOCK_SIZE_K = self.block_size,
+                    accumulate_ch_flows = accumulate_ch_flows,
+                    eflow_temperature = eflow_temperature
+                )
 
         else:
 
