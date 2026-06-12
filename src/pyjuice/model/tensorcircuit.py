@@ -237,7 +237,11 @@ class TensorCircuit(nn.Module):
 
             # Tempered param flow
             pflow_tempered_enabled = abs(pflow_temperature - 1.0) >= 1e-6
-            
+            if pflow_tempered_enabled:
+                # The kernels read the temperature from device memory, so its value can be
+                # changed between CUDA graph replays (as long as it stays != 1)
+                kwargs["pflow_temperature_buf"] = self._update_pflow_temperature_buf(pflow_temperature)
+
             ## Initialize buffers for forward pass ##
 
             if not _no_buffer_reset:
@@ -296,7 +300,7 @@ class TensorCircuit(nn.Module):
                     else:
                         raise ValueError(f"Unknown layer type {type(layer)}.")
 
-            signature = (0, id(self.node_mars), id(self.element_mars), id(self.params), B)
+            signature = (0, id(self.node_mars), id(self.element_mars), id(self.params), B, pflow_tempered_enabled)
             if record_cudagraph and signature not in self._recorded_cuda_graphs:
                 # Warmup
                 s = torch.cuda.Stream()
@@ -411,9 +415,13 @@ class TensorCircuit(nn.Module):
                 self._init_buffer(name = "element_flows", shape = (self.num_elements, B), set_value = 0.0 if not logspace_flows else -float("inf"))
 
             # Tempered pflows
-            if abs(pflow_temperature - 1.0) >= 1e-6:
+            pflow_tempered_enabled = abs(pflow_temperature - 1.0) >= 1e-6
+            if pflow_tempered_enabled:
                 assert hasattr(self, "node_mars_tempered")
                 kwargs["node_mars_tempered"] = self.node_mars_tempered
+                # The kernels read the temperature from device memory, so its value can be
+                # changed between CUDA graph replays (as long as it stays != 1)
+                kwargs["pflow_temperature_buf"] = self._update_pflow_temperature_buf(pflow_temperature)
 
             # Set root node flows
             def _set_root_node_flows():
@@ -500,8 +508,8 @@ class TensorCircuit(nn.Module):
                     else:
                         raise ValueError(f"Unknown layer type {type(layer)}.")
 
-            signature = (1, id(self.node_flows), id(self.element_flows), id(self.node_mars), id(self.element_mars), id(self.params), id(self.param_flows), B, 
-                         allow_modify_flows, logspace_flows, ((abs(pflow_temperature) - 1.0) < 1e-6), temper_eflow)
+            signature = (1, id(self.node_flows), id(self.element_flows), id(self.node_mars), id(self.element_mars), id(self.params), id(self.param_flows), B,
+                         allow_modify_flows, logspace_flows, pflow_tempered_enabled, temper_eflow)
             if record_cudagraph and signature not in self._recorded_cuda_graphs:
                 # Warmup
                 s = torch.cuda.Stream()
@@ -877,6 +885,19 @@ class TensorCircuit(nn.Module):
 
         if backward:
             self._bk_partial_eval_enabled = False
+
+    def _update_pflow_temperature_buf(self, pflow_temperature: float):
+        # The temperature is passed to the Triton kernels through this 1-element buffer
+        # (instead of as a scalar argument, which would be frozen into recorded CUDA graphs);
+        # graph replays pick up whatever value is currently stored here
+        buf = getattr(self, "_pflow_temperature_buf", None)
+        if buf is None or (self.device.index is not None and buf.device != self.device):
+            buf = torch.empty([1], dtype = torch.float32, device = self.device)
+            self._pflow_temperature_buf = buf
+
+        buf.fill_(pflow_temperature)
+
+        return buf
 
     def _init_buffer(self, name: str, shape: Tuple, set_value: Optional[float] = None, check_device: bool = True):
         flag = False

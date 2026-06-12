@@ -29,6 +29,17 @@ from .compilation import get_sum_layer_forward_stats, sum_layer_forward_compilat
                          sum_layer_backward_compilation, next_power_of_2
 
 
+def _temperature_as_tensor(temperature: float, kwargs: dict, device: torch.device) -> torch.Tensor:
+    # The tempered kernels read the temperature from device memory (instead of taking it as
+    # a scalar argument, which would be frozen into recorded CUDA graphs). `TensorCircuit`
+    # provides a persistent buffer via `kwargs` and refreshes its value before every call;
+    # the fallback below only triggers when the layer is invoked directly.
+    buf = kwargs.get("pflow_temperature_buf", None)
+    if buf is None:
+        buf = torch.full([1], temperature, dtype = torch.float32, device = device)
+    return buf
+
+
 class SumLayer(Layer, nn.Module):
 
     BLOCK_SPARSE = 0
@@ -472,8 +483,13 @@ class SumLayer(Layer, nn.Module):
                                             pids_start, pids_increment, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
                                             BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
                                             TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, use_bf16: tl.constexpr,
-                                            propagation_alg_id: tl.constexpr, pflow_tempered_enabled: tl.constexpr, 
+                                            propagation_alg_id: tl.constexpr, pflow_tempered_enabled: tl.constexpr,
                                             pid_m_offset = 0, alpha = 0.0, pflow_temperature = 1.0, node_mars_tempered = None):
+
+        if pflow_tempered_enabled:
+            # `pflow_temperature` is a pointer to a 1-element tensor; reading it from device
+            # memory allows its value to change between CUDA graph replays
+            pflow_temperature = tl.load(pflow_temperature)
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(1) + pid_m_offset # ID of size-`TILE_SIZE_M` nodes
@@ -620,8 +636,13 @@ class SumLayer(Layer, nn.Module):
                                             pids_start, pids_increment, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
                                             BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
                                             TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, use_bf16: tl.constexpr,
-                                            propagation_alg_id: tl.constexpr, pflow_tempered_enabled: tl.constexpr, 
+                                            propagation_alg_id: tl.constexpr, pflow_tempered_enabled: tl.constexpr,
                                             pid_m_offset = 0, alpha = 0.0, pflow_temperature = 1.0, node_mars_tempered = None):
+
+        if pflow_tempered_enabled:
+            # `pflow_temperature` is a pointer to a 1-element tensor; reading it from device
+            # memory allows its value to change between CUDA graph replays
+            pflow_temperature = tl.load(pflow_temperature)
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(1) + pid_m_offset # ID of size-`TILE_SIZE_M` nodes
@@ -768,8 +789,13 @@ class SumLayer(Layer, nn.Module):
                                              pids_start, pids_increment, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
                                              BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
                                              TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, use_bf16: tl.constexpr,
-                                             propagation_alg_id: tl.constexpr, pflow_tempered_enabled: tl.constexpr, 
+                                             propagation_alg_id: tl.constexpr, pflow_tempered_enabled: tl.constexpr,
                                              pid_m_offset = 0, alpha = 0.0, pflow_temperature = 1.0, node_mars_tempered = None):
+
+        if pflow_tempered_enabled:
+            # `pflow_temperature` is a pointer to a 1-element tensor; reading it from device
+            # memory allows its value to change between CUDA graph replays
+            pflow_temperature = tl.load(pflow_temperature)
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(1) + pid_m_offset # ID of size-`TILE_SIZE_M` nodes
@@ -860,7 +886,7 @@ class SumLayer(Layer, nn.Module):
                 )
 
                 if pflow_tempered_enabled:
-                    emars_sub = tl.where(emars_max != -float("inf"), tl.exp((emars - emars_max) / pflow_temperature), 0.0)
+                    emars_sub = tl.where(emars_max[:,None] != -float("inf"), tl.exp((emars - emars_max[:,None]) / pflow_temperature), 0.0)
                     epars = tlmath.pow(epars, 1.0 / pflow_temperature)
                     emars_max /= pflow_temperature
 
@@ -935,7 +961,7 @@ class SumLayer(Layer, nn.Module):
             assert "node_mars_tempered" in kwargs
             pflow_tempered_enabled = True
             pflow_tempered_kwargs = {
-                "pflow_temperature": pflow_temperature,
+                "pflow_temperature": _temperature_as_tensor(pflow_temperature, kwargs, node_mars.device),
                 "node_mars_tempered": kwargs["node_mars_tempered"]
             }
 
@@ -1088,7 +1114,12 @@ class SumLayer(Layer, nn.Module):
                                  BLOCK_B: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, propagation_alg_id: tl.constexpr, 
                                  pflow_tempered_enabled: tl.constexpr, alpha = 0.0, node_mars_tempered = None,
                                  pflow_temperature = 1.0):
-        
+
+        if pflow_tempered_enabled:
+            # `pflow_temperature` is a pointer to a 1-element tensor; reading it from device
+            # memory allows its value to change between CUDA graph replays
+            pflow_temperature = tl.load(pflow_temperature)
+
         pid_b = tl.program_id(axis = 0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(axis = 1) # ID of size-`BLOCK_SIZE_M` nodes
 
@@ -1176,6 +1207,11 @@ class SumLayer(Layer, nn.Module):
                                        pflow_tempered_enabled: tl.constexpr, alpha = 0.0, node_mars_tempered = None,
                                        pflow_temperature = 1.0):
 
+        if pflow_tempered_enabled:
+            # `pflow_temperature` is a pointer to a 1-element tensor; reading it from device
+            # memory allows its value to change between CUDA graph replays
+            pflow_temperature = tl.load(pflow_temperature)
+
         pid_b = tl.program_id(axis = 0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(axis = 1) + pid_m_offset # ID of size-`TILE_SIZE_M` nodes
 
@@ -1237,9 +1273,9 @@ class SumLayer(Layer, nn.Module):
         tl.store(nmars_ptr, nmars, mask = (mask_m[:,None] & mask_batch[None,:]))
 
         if pflow_tempered_enabled:
-            nmars_tempered = tl.log(tl.sum(tlmath.pow(emars * epars[:,None], 1.0 / pflow_temperature), axis = 0)) + emars_max / pflow_temperature
+            nmars_tempered = tl.log(tl.sum(tlmath.pow(emars * epars[:,:,None], 1.0 / pflow_temperature), axis = 1)) + emars_max / pflow_temperature
 
-            nmars_ptr = node_mars_tempered + \
+            nmars_tempered_ptr = node_mars_tempered + \
                 (off_nids + tile_ids)[:,None] * batch_size + \
                 offs_batch[None,:] # [TILE_SIZE_M, BLOCK_B]
 
@@ -1280,7 +1316,7 @@ class SumLayer(Layer, nn.Module):
             assert "node_mars_tempered" in kwargs
             pflow_tempered_enabled = True
             pflow_tempered_kwargs = {
-                "pflow_temperature": pflow_temperature,
+                "pflow_temperature": _temperature_as_tensor(pflow_temperature, kwargs, node_mars.device),
                 "node_mars_tempered": kwargs["node_mars_tempered"]
             }
 
@@ -2082,6 +2118,10 @@ class SumLayer(Layer, nn.Module):
                                                     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, TL_DOT: tl.constexpr, 
                                                     accumulate_ch_flows: tl.constexpr, pid_m_offset = 0, eflow_temperature = 1.0):
 
+        # `eflow_temperature` is a pointer to a 1-element tensor; reading it from device
+        # memory allows its value to change between CUDA graph replays
+        eflow_temperature = tl.load(eflow_temperature)
+
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(1) + pid_m_offset # ID of size-`TILE_SIZE_M` nodes
 
@@ -2185,6 +2225,10 @@ class SumLayer(Layer, nn.Module):
                                                           BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, TILE_SIZE_M: tl.constexpr, 
                                                           BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, TL_DOT: tl.constexpr, 
                                                           accumulate_ch_flows: tl.constexpr, pid_m_offset = 0, eflow_temperature = 1.0):
+
+        # `eflow_temperature` is a pointer to a 1-element tensor; reading it from device
+        # memory allows its value to change between CUDA graph replays
+        eflow_temperature = tl.load(eflow_temperature)
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(1) + pid_m_offset # ID of size-`TILE_SIZE_M` nodes
@@ -2463,7 +2507,7 @@ class SumLayer(Layer, nn.Module):
                         TL_DOT = TL_DOT,
                         accumulate_ch_flows = accumulate_ch_flows,
                         pid_m_offset = pid_m_start,
-                        eflow_temperature = eflow_temperature,
+                        eflow_temperature = _temperature_as_tensor(eflow_temperature, kwargs, node_flows.device),
                         num_stages = 1,
                     )
                 else:
@@ -2491,7 +2535,7 @@ class SumLayer(Layer, nn.Module):
                         TL_DOT = TL_DOT,
                         accumulate_ch_flows = accumulate_ch_flows,
                         pid_m_offset = pid_m_start,
-                        eflow_temperature = eflow_temperature,
+                        eflow_temperature = _temperature_as_tensor(eflow_temperature, kwargs, node_flows.device),
                         num_stages = 1,
                     )
 
@@ -2735,9 +2779,13 @@ class SumLayer(Layer, nn.Module):
     @staticmethod
     @triton_jit
     def _bk_triton_block_sparse_tempered_par_kernel(node_flows, node_mars_tempered, element_mars, mparams, param_flows, nids, cids, pids, pfids,
-                                                    batch_size: tl.constexpr, num_edges: tl.constexpr, TILE_SIZE_B: tl.constexpr, B_NUM_TILES: tl.constexpr, 
-                                                    TILE_SIZE_K: tl.constexpr, TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, 
+                                                    batch_size: tl.constexpr, num_edges: tl.constexpr, TILE_SIZE_B: tl.constexpr, B_NUM_TILES: tl.constexpr,
+                                                    TILE_SIZE_K: tl.constexpr, TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr,
                                                     TL_DOT: tl.constexpr, negate_pflows: tl.constexpr, pid_m_offset = 0, pflow_temperature = 1.0):
+
+        # `pflow_temperature` is a pointer to a 1-element tensor; reading it from device
+        # memory allows its value to change between CUDA graph replays
+        pflow_temperature = tl.load(pflow_temperature)
 
         pid_k = tl.program_id(0) # ID of size-`TILE_SIZE_K` edges
         pid_m = tl.program_id(1) + pid_m_offset # ID of size-`TILE_SIZE_M` nodes
@@ -2817,6 +2865,10 @@ class SumLayer(Layer, nn.Module):
                                                           batch_size: tl.constexpr, num_edges: tl.constexpr, TILE_SIZE_B: tl.constexpr, B_NUM_TILES: tl.constexpr, 
                                                           TILE_SIZE_K: tl.constexpr, TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, 
                                                           TL_DOT: tl.constexpr, negate_pflows: tl.constexpr, pid_m_offset = 0, pflow_temperature = 1.0):
+
+        # `pflow_temperature` is a pointer to a 1-element tensor; reading it from device
+        # memory allows its value to change between CUDA graph replays
+        pflow_temperature = tl.load(pflow_temperature)
 
         pid_k = tl.program_id(0) # ID of size-`TILE_SIZE_K` edges
         pid_m = tl.program_id(1) + pid_m_offset # ID of size-`TILE_SIZE_M` nodes
@@ -3039,7 +3091,7 @@ class SumLayer(Layer, nn.Module):
                         TL_DOT = TL_DOT,
                         negate_pflows = negate_pflows,
                         pid_m_offset = pid_m_start,
-                        pflow_temperature = pflow_temperature,
+                        pflow_temperature = _temperature_as_tensor(pflow_temperature, kwargs, node_flows.device),
                         num_stages = 1
                     )
 
@@ -3065,7 +3117,7 @@ class SumLayer(Layer, nn.Module):
                         negate_pflows = negate_pflows,
                         allow_neg_flows = allow_neg_flows,
                         pid_m_offset = pid_m_start,
-                        pflow_temperature = pflow_temperature,
+                        pflow_temperature = _temperature_as_tensor(pflow_temperature, kwargs, node_flows.device),
                         num_stages = 1
                     )
 
@@ -3341,10 +3393,14 @@ class SumLayer(Layer, nn.Module):
 
     @staticmethod
     @triton_jit
-    def _bk_triton_sparse_tempered_ele_kernel(node_flows, element_flows, node_mars_tempered, element_mars, mparams, 
+    def _bk_triton_sparse_tempered_ele_kernel(node_flows, element_flows, node_mars_tempered, element_mars, mparams,
                                               chids, parids, parpids, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
-                                              n_edge_blocks: tl.constexpr, BLOCK_B: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, 
+                                              n_edge_blocks: tl.constexpr, BLOCK_B: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
                                               accumulate_ch_flows: tl.constexpr, eflow_temperature = 1.0):
+
+        # `eflow_temperature` is a pointer to a 1-element tensor; reading it from device
+        # memory allows its value to change between CUDA graph replays
+        eflow_temperature = tl.load(eflow_temperature)
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(1) # ID of size-`BLOCK_M` nodes
@@ -3419,6 +3475,10 @@ class SumLayer(Layer, nn.Module):
                                                     n_edge_blocks: tl.constexpr, BLOCK_B: tl.constexpr, 
                                                     TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
                                                     accumulate_ch_flows: tl.constexpr, eflow_temperature = 1.0):
+
+        # `eflow_temperature` is a pointer to a 1-element tensor; reading it from device
+        # memory allows its value to change between CUDA graph replays
+        eflow_temperature = tl.load(eflow_temperature)
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
         pid_m = tl.program_id(1) + pid_m_offset # ID of size-`TILE_SIZE_M` nodes
@@ -3555,7 +3615,7 @@ class SumLayer(Layer, nn.Module):
                     BLOCK_M = BLOCK_M,
                     BLOCK_SIZE_K = self.block_size,
                     accumulate_ch_flows = accumulate_ch_flows,
-                    eflow_temperature = eflow_temperature
+                    eflow_temperature = _temperature_as_tensor(eflow_temperature, kwargs, node_flows.device)
                 )
 
         else:
@@ -3651,7 +3711,7 @@ class SumLayer(Layer, nn.Module):
                         BLOCK_SIZE_M = cs_block_size,
                         BLOCK_SIZE_K = self.block_size,
                         accumulate_ch_flows = accumulate_ch_flows,
-                        eflow_temperature = eflow_temperature
+                        eflow_temperature = _temperature_as_tensor(eflow_temperature, kwargs, node_flows.device)
                     )
 
                 else:
@@ -3680,7 +3740,7 @@ class SumLayer(Layer, nn.Module):
                             BLOCK_SIZE_M = cs_block_size,
                             BLOCK_SIZE_K = self.block_size,
                             accumulate_ch_flows = accumulate_ch_flows,
-                            eflow_temperature = eflow_temperature
+                            eflow_temperature = _temperature_as_tensor(eflow_temperature, kwargs, node_flows.device)
                         )
 
         return None
@@ -3803,6 +3863,10 @@ class SumLayer(Layer, nn.Module):
                                               pid_m_offset, num_edges: tl.constexpr, batch_size: tl.constexpr, BLOCK_M: tl.constexpr, 
                                               BLOCK_K: tl.constexpr, BLOCK_B: tl.constexpr, TILE_SIZE_B: tl.constexpr, B_NUM_BLOCKS: tl.constexpr, 
                                               negate_pflows: tl.constexpr, pflow_temperature = 1.0):
+
+        # `pflow_temperature` is a pointer to a 1-element tensor; reading it from device
+        # memory allows its value to change between CUDA graph replays
+        pflow_temperature = tl.load(pflow_temperature)
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` samples
         pid_e = tl.program_id(1) # ID of size-`BLOCK_K` edges
@@ -4015,7 +4079,7 @@ class SumLayer(Layer, nn.Module):
                     TILE_SIZE_B = TILE_SIZE_B,
                     B_NUM_BLOCKS = B_NUM_BLOCKS,
                     negate_pflows = negate_pflows,
-                    pflow_temperature = pflow_temperature
+                    pflow_temperature = _temperature_as_tensor(pflow_temperature, kwargs, node_flows.device)
                 )
             
             else:
@@ -4044,7 +4108,7 @@ class SumLayer(Layer, nn.Module):
                         TILE_SIZE_B = TILE_SIZE_B,
                         B_NUM_BLOCKS = B_NUM_BLOCKS,
                         negate_pflows = negate_pflows,
-                        pflow_temperature = pflow_temperature
+                        pflow_temperature = _temperature_as_tensor(pflow_temperature, kwargs, node_flows.device)
                     )
 
         return None
