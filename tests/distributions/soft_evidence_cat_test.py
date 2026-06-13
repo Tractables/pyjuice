@@ -228,10 +228,93 @@ def test_soft_evidence_categorical_dist_sample():
     assert (samples == 10).float().mean() > 0.8
 
 
+def test_soft_evidence_categorical_dist_dual_flow():
+
+    device = torch.device("cuda:0")
+
+    batch_size = 64
+    num_vars = 32
+    num_cats = 1278
+
+    # Construct PC
+    nis = [
+        juice.inputs(v, num_nodes = 1, dist = dists.SoftEvidenceCategorical(num_cats = num_cats, _dual_flow_backward = True)) for v in range(num_vars)
+    ]
+
+    np = juice.multiply(*nis)
+    ns = juice.summate(np, num_nodes = 1)
+
+    ns.init_parameters(perturbation = 0.0)
+
+    pc = juice.compile(ns)
+    pc.to(device)
+
+    # Inputs
+    data = torch.randint(0, num_cats, [batch_size, num_vars], device = device)
+    logits = torch.rand([batch_size, num_vars, num_cats], device = device) * 2 - 1
+
+    # Compute groundtruth
+    logits.requires_grad = True
+    logits.retain_grad()
+    logps = torch.log_softmax(logits, dim = 2)
+    target_lls = logps.gather(2, data.unsqueeze(2)).squeeze(2).sum(dim = 1)
+
+    target_lls.sum().backward()
+    target_logits_grad = logits.grad
+
+    ###########################
+    ## Forward pass runtests ##
+    ###########################
+
+    lls = pc(
+        data,
+        categorical_evidence_logp = logits
+    )
+
+    assert torch.all(torch.abs(lls.view(-1) - target_lls) < 1e-3)
+
+    ############################
+    ## Backward pass runtests ##
+    ############################
+
+    logits_grad = torch.zeros_like(logits)
+
+    pc.backward(
+        data, allow_modify_flows = False, logspace_flows = True,
+        categorical_evidence_logp = logits,
+        categorical_evidence_logp_grad = logits_grad
+    )
+    
+    assert torch.all(torch.abs(logits_grad - target_logits_grad) < 1e-5)
+
+    ## Runtest for pflow
+    input_layer = pc.input_layer_group[0]
+    sid, eid = input_layer._output_ind_range
+    flows = pc.node_flows[sid:eid,:].reshape(num_vars, batch_size).permute(1, 0) # [B, V]
+
+    pflows = input_layer.param_flows.reshape(num_vars, num_cats * 2)
+    pflows_num = pflows[:,:num_cats]
+
+    # Numerator
+    var_order = pc.input_layer_group[0].vids
+    my_pflows_num = torch.zeros_like(pflows_num)
+    for i in range(num_vars):
+        v = var_order[i,0]
+
+        for b in range(batch_size):
+            my_pflows_num[i,data[b,v]] += flows[b,i].exp()
+
+    assert torch.all(torch.abs(pflows_num - my_pflows_num) < 1e-5)
+
+    import pdb; pdb.set_trace()
+    a = 2
+
+
 if __name__ == "__main__":
     torch.manual_seed(4343442)
     torch.cuda.manual_seed(5434)
-    test_soft_evidence_categorical_dist()
-    test_soft_evidence_categorical_dist_varied()
-    test_soft_evidence_categorical_dist_multi_nodes()
-    test_soft_evidence_categorical_dist_sample()
+    # test_soft_evidence_categorical_dist()
+    # test_soft_evidence_categorical_dist_varied()
+    # test_soft_evidence_categorical_dist_multi_nodes()
+    # test_soft_evidence_categorical_dist_sample()
+    test_soft_evidence_categorical_dist_dual_flow()
