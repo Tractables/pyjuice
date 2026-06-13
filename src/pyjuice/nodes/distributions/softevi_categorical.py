@@ -275,7 +275,7 @@ class SoftEvidenceCategorical(Distribution):
         """
         The number of parameter flows per node.
         """
-        return self.num_cats
+        return self.num_cats * 2
 
     def init_parameters(self, num_nodes: int, perturbation: float = 2.0, params: Optional[Any] = None, **kwargs):
         """
