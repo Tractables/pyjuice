@@ -285,7 +285,7 @@ class SoftEvidenceCategorical(Distribution):
         """
         The number of parameter flows per node.
         """
-        return self.num_cats * 2
+        return self.num_cats * 2 if self._dual_flow_backward else self.num_cats
 
     def init_parameters(self, num_nodes: int, perturbation: float = 2.0, params: Optional[Any] = None, **kwargs):
         """
@@ -517,7 +517,7 @@ class SoftEvidenceCategorical(Distribution):
                           node_offset, partial_eval: tl.constexpr, logspace_flows: tl.constexpr, BLOCK_SIZE_B: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, 
                           TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, use_tensor_core: tl.constexpr,
                           categorical_evidence_logp_ptr, soft_evidence_cat_ids_ptr, categorical_evidence_logp_grad_ptr, var_idmapping_ptr, 
-                          num_cats: tl.constexpr, ext_num_vars: tl.constexpr, has_ext_ids: tl.constexpr):
+                          num_cats: tl.constexpr, ext_num_vars: tl.constexpr, has_ext_ids: tl.constexpr, update_pflows: tl.constexpr, update_extflows: tl.constexpr):
         
         pid_b = tl.program_id(axis = 0)
         pid_n = tl.program_id(axis = 1)
@@ -564,6 +564,13 @@ class SoftEvidenceCategorical(Distribution):
         # Compute unnormalized logprobs & backprop the "nominator" parts of the gradients
         data = tl.load(data_ptr + vid * batch_size + offsets_b, mask = mask_b, other = 0) # [BLOCK_SIZE_B]
 
+        # Update the numerater part of `pflow` if required
+        if update_pflows:
+            # Get start parameter flow indices
+            s_pfids = tl.load(s_pfids_ptr + offsets_n, mask = mask_n, other = 0) # [BLOCK_SIZE_N]
+
+            tl.atomic_add(param_flows_ptr + s_pfids[None,:] + data[:,None], nflows, mask = (mask_b[:,None] & mask_n[None,:]))
+
         if has_ext_ids:
             # Ptrs pointing to external parameter indices
             catids_ptr = soft_evidence_cat_ids_ptr + \
@@ -577,9 +584,10 @@ class SoftEvidenceCategorical(Distribution):
                 lvid * num_cats # [BLOCK_SIZE_B]
 
             # Ptrs pointing to external parameter gradients
-            expar_grad_ptr = categorical_evidence_logp_grad_ptr + \
-                offsets_b * (ext_num_vars * num_cats) + \
-                lvid * num_cats # [BLOCK_SIZE_B]
+            if update_extflows:
+                expar_grad_ptr = categorical_evidence_logp_grad_ptr + \
+                    offsets_b * (ext_num_vars * num_cats) + \
+                    lvid * num_cats # [BLOCK_SIZE_B]
 
             log_ex_p = tl.zeros([BLOCK_SIZE_B], dtype = tl.float32) - float("inf")
             for i in range(K_NUM_TILES):
@@ -597,8 +605,9 @@ class SoftEvidenceCategorical(Distribution):
                 expar = tl.load(expar_ptr + i * TILE_SIZE_K + match_ids, mask = (mask_b & has_match), other = 0.0) # [BLOCK_SIZE_B]
                 log_ex_p = tl.where(has_match, expar, log_ex_p)
 
-                # Accumulate gradients
-                tl.atomic_add(expar_grad_ptr + i * TILE_SIZE_K + match_ids, tl.sum(nflows, axis = 1), mask = (mask_b & has_match)) # [BLOCK_SIZE_B]
+                # Accumulate gradients for `extflow`
+                if update_extflows:
+                    tl.atomic_add(expar_grad_ptr + i * TILE_SIZE_K + match_ids, tl.sum(nflows, axis = 1), mask = (mask_b & has_match)) # [BLOCK_SIZE_B]
 
         else:
             ex_p_ptr = categorical_evidence_logp_ptr + \
@@ -608,21 +617,23 @@ class SoftEvidenceCategorical(Distribution):
             log_ex_p = tl.load(ex_p_ptr, mask = mask_b, other = 0.0) # [BLOCK_SIZE_B]
 
             # Accumulate gradients
-            unnorm_ll_grad_ptr = categorical_evidence_logp_grad_ptr + \
-                offsets_b * (ext_num_vars * num_cats) + \
-                lvid * num_cats + \
-                data
-            tl.atomic_add(unnorm_ll_grad_ptr, tl.sum(nflows, axis = 1), mask = mask_b)
+            if update_extflows:
+                unnorm_ll_grad_ptr = categorical_evidence_logp_grad_ptr + \
+                    offsets_b * (ext_num_vars * num_cats) + \
+                    lvid * num_cats + \
+                    data
+                tl.atomic_add(unnorm_ll_grad_ptr, tl.sum(nflows, axis = 1), mask = mask_b)
 
         # Retrieve logZ
         log_in_p = tl.load(params_ptr + s_pids[None,:] + data[:,None], mask = (mask_b[:,None] & mask_n[None,:]), other = 0.0).log() # [BLOCK_SIZE_B, BLOCK_SIZE_N]
         logZ = log_in_p + log_ex_p[:,None] - nmars # [BLOCK_SIZE_B, BLOCK_SIZE_N]
 
         # Ptrs pointing to external parameter gradients
-        expars_grad_ptr = categorical_evidence_logp_grad_ptr + \
-            offsets_b[:,None] * (ext_num_vars * num_cats) + \
-            lvid * num_cats + \
-            tl.arange(0, TILE_SIZE_K)[None,:] # [BLOCK_SIZE_B, TILE_SIZE_K]
+        if update_extflows:
+            expars_grad_ptr = categorical_evidence_logp_grad_ptr + \
+                offsets_b[:,None] * (ext_num_vars * num_cats) + \
+                lvid * num_cats + \
+                tl.arange(0, TILE_SIZE_K)[None,:] # [BLOCK_SIZE_B, TILE_SIZE_K]
 
         # Backprop the "denominator" parts of the gradients
         if has_ext_ids:
@@ -648,14 +659,20 @@ class SoftEvidenceCategorical(Distribution):
                 # Load the external parameters
                 expars = tl.load(expars_ptr + i * TILE_SIZE_K, mask = (mask_b[:,None] & mask_c[None,:]), other = 0.0) # [BLOCK_SIZE_B, TILE_SIZE_K]
 
-                ve_grads = (nflows.log() - logZ)[:,None,:] + inpars.log() # [BLOCK_SIZE_B, TILE_SIZE_K, BLOCK_SIZE_N]
-                ve_grads_max = tl.max(ve_grads, axis = 2)
-                ve_grads_sub = tl.exp(ve_grads - ve_grads_max[:,:,None])
-                cum_ve_grads = tl.sum(ve_grads_sub, axis = 2).log() + ve_grads_max # [BLOCK_SIZE_B, TILE_SIZE_K]
+                if update_pflows:
+                    vp_grads = (nflows.log() - logZ)[:,None,:] + inpars.log() + expars[:,:,None] # [BLOCK_SIZE_B, TILE_SIZE_K, BLOCK_SIZE_N]
 
-                expars_grad = cum_ve_grads + expars
+                    tl.atomic_add(param_flows_ptr + num_cats + s_pfids[None,None,:] + catids[:,:,None], vp_grads, mask = (mask_b[:,None,None] & mask_n[None,None,:]))
 
-                tl.atomic_add(expars_grad_ptr + i * TILE_SIZE_K, -tl.exp(expars_grad), mask = (mask_b[:,None] & mask_c[None,:]))
+                if update_extflows:
+                    ve_grads = (nflows.log() - logZ)[:,None,:] + inpars.log() # [BLOCK_SIZE_B, TILE_SIZE_K, BLOCK_SIZE_N]
+                    ve_grads_max = tl.max(ve_grads, axis = 2)
+                    ve_grads_sub = tl.exp(ve_grads - ve_grads_max[:,:,None])
+                    cum_ve_grads = tl.sum(ve_grads_sub, axis = 2).log() + ve_grads_max # [BLOCK_SIZE_B, TILE_SIZE_K]
+
+                    expars_grad = cum_ve_grads + expars
+
+                    tl.atomic_add(expars_grad_ptr + i * TILE_SIZE_K, -tl.exp(expars_grad), mask = (mask_b[:,None] & mask_c[None,:]))
 
         else:
             # Ptrs pointing to internal parameters
@@ -668,12 +685,19 @@ class SoftEvidenceCategorical(Distribution):
                     tl.arange(0, TILE_SIZE_K)[:,None] + \
                     s_pids[None,:] # [TILE_SIZE_K, BLOCK_SIZE_N]
 
-            nflow_sub_logz = nflows.log() - logZ # [BLOCK_SIZE_B, BLOCK_SIZE_N]
-            nflow_sub_logz_max = tl.max(nflow_sub_logz, axis = 1)[:,None]
-            nflow_sub_logz_sub = tl.exp(nflow_sub_logz - nflow_sub_logz_max)
+            if update_pflows:
+                nflow_sub_logz_p = tl.trans(nflows.log() - logZ) # [BLOCK_SIZE_N, BLOCK_SIZE_B]
+                nflow_sub_logz_p_max = tl.max(nflow_sub_logz_p, axis = 1)[:,None]
+                nflow_sub_logz_p_sub = tl.exp(nflow_sub_logz_p - nflow_sub_logz_p_max)
+
+            if update_extflows:
+                nflow_sub_logz = nflows.log() - logZ # [BLOCK_SIZE_B, BLOCK_SIZE_N]
+                nflow_sub_logz_max = tl.max(nflow_sub_logz, axis = 1)[:,None]
+                nflow_sub_logz_sub = tl.exp(nflow_sub_logz - nflow_sub_logz_max)
 
             for i in range(K_NUM_TILES):
-                mask_c = (i * TILE_SIZE_K + tl.arange(0, TILE_SIZE_K) < num_cats) # [TILE_SIZE_K]
+                offsets_c = (i * TILE_SIZE_K + tl.arange(0, TILE_SIZE_K))
+                mask_c = (offsets_c < num_cats) # [TILE_SIZE_K]
 
                 # Load the internal parameters
                 if use_tensor_core:
@@ -684,12 +708,23 @@ class SoftEvidenceCategorical(Distribution):
                 # Load the external parameters
                 expars = tl.load(expars_ptr + i * TILE_SIZE_K, mask = (mask_b[:,None] & mask_c[None,:]), other = 0.0) # [BLOCK_SIZE_B, TILE_SIZE_K]
 
-                if use_tensor_core:
-                    expars_grad = tl.dot(nflow_sub_logz_sub, inpars).log() + nflow_sub_logz_max + expars
-                else:
-                    expars_grad = tl.sum(nflow_sub_logz_sub[:,None,:] * inpars[None,:,:], axis = 2).log() + nflow_sub_logz_max + expars
+                if update_pflows:
+                    expars_max = tl.max(expars, axis = 0)[None,:]
+                    expars_sub = tl.exp(expars - expars_max)
+                    if use_tensor_core:
+                        pars_grad = tl.dot(nflow_sub_logz_p_sub, expars_sub) + inpars.log() + nflow_sub_logz_p_max + expars_max
+                    else:
+                        pars_grad = tl.sum(nflow_sub_logz_p_sub[:,:,None], expars_sub[None,:,:], axis = 1) + tl.trans(inpars).log() + nflow_sub_logz_p_max + expars_max
 
-                tl.atomic_add(expars_grad_ptr + i * TILE_SIZE_K, -tl.exp(expars_grad), mask = (mask_b[:,None] & mask_c[None,:]))
+                    tl.atomic_add(param_flows_ptr + num_cats + s_pfids[:,None] + offsets_c[None,:], pars_grad, mask = (mask_n[:,None] & mask_c[None,:]))
+
+                if update_extflows:
+                    if use_tensor_core:
+                        expars_grad = tl.dot(nflow_sub_logz_sub, inpars).log() + nflow_sub_logz_max + expars
+                    else:
+                        expars_grad = tl.sum(nflow_sub_logz_sub[:,None,:] * inpars[None,:,:], axis = 2).log() + nflow_sub_logz_max + expars
+
+                    tl.atomic_add(expars_grad_ptr + i * TILE_SIZE_K, -tl.exp(expars_grad), mask = (mask_b[:,None] & mask_c[None,:]))
 
     @staticmethod
     @triton_jit
