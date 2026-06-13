@@ -85,7 +85,7 @@ def _prep_args_apply_fw_kernel(layer, kwargs):
 
 
 def _condition_apply_bk_params_kernel(layer, kwargs):
-    return "categorical_evidence_logp" in kwargs
+    return "categorical_evidence_logp" in kwargs and not kwargs["dual_flow_backward"]
 
 
 def _prep_args_apply_bk_params_kernel(layer, kwargs):
@@ -124,7 +124,8 @@ def _prep_args_apply_bk_params_kernel(layer, kwargs):
 
 
 def _condition_apply_bk_softevi_kernel(layer, kwargs):
-    return "categorical_evidence_logp" in kwargs and "categorical_evidence_logp_grad" in kwargs
+    return "categorical_evidence_logp" in kwargs and \
+        ("categorical_evidence_logp_grad" in kwargs or kwargs["dual_flow_backward"])
 
 
 def _prep_args_apply_bk_softevi_kernel(layer, kwargs):
@@ -141,10 +142,13 @@ def _prep_args_apply_bk_softevi_kernel(layer, kwargs):
     num_cats = categorical_evidence_logp.size(2)
     target_kwargs["num_cats"] = num_cats
 
-    categorical_evidence_logp_grad = kwargs["categorical_evidence_logp_grad"]
-    assert categorical_evidence_logp_grad.size(0) == batch_size
-    assert categorical_evidence_logp_grad.size(1) == ext_num_vars
-    assert categorical_evidence_logp_grad.size(2) == num_cats
+    if "categorical_evidence_logp_grad" in kwargs:
+        categorical_evidence_logp_grad = kwargs["categorical_evidence_logp_grad"]
+        assert categorical_evidence_logp_grad.size(0) == batch_size
+        assert categorical_evidence_logp_grad.size(1) == ext_num_vars
+        assert categorical_evidence_logp_grad.size(2) == num_cats
+    else:
+        categorical_evidence_logp_grad = None
 
     target_kwargs["categorical_evidence_logp_ptr"] = categorical_evidence_logp
     target_kwargs["categorical_evidence_logp_grad_ptr"] = categorical_evidence_logp_grad
@@ -190,6 +194,10 @@ def _prep_args_apply_bk_softevi_kernel(layer, kwargs):
     target_kwargs["BLOCK_SIZE_N"] = BLOCK_SIZE_N
     target_kwargs["use_tensor_core"] = use_tensor_core
 
+    # Whether to update `pflow` and `extflow`
+    target_kwargs["update_pflows"] = kwargs["dual_flow_backward"]
+    target_kwargs["update_extflows"] = ("categorical_evidence_logp_grad" in kwargs)
+
     return target_kwargs, grid
 
 
@@ -229,7 +237,7 @@ class SoftEvidenceCategorical(Distribution):
     :param num_cats: number of categories
     :type num_cats: int
     """
-    def __init__(self, num_cats: int):
+    def __init__(self, num_cats: int, _dual_flow_backward: bool = True):
         super(SoftEvidenceCategorical, self).__init__()
 
         self.num_cats = num_cats
@@ -246,6 +254,8 @@ class SoftEvidenceCategorical(Distribution):
         self.sampling_fns = [
             (self.sample_kernel, _condition_sample_kernel, _prep_args_sample_kernel)
         ]
+
+        self._dual_flow_backward = _dual_flow_backward
 
     def get_signature(self):
         """
@@ -304,6 +314,9 @@ class SoftEvidenceCategorical(Distribution):
         else:
             self.em_block_size = 8
             return self.large_ncats_em_fn
+
+    def set_custom_kernel_kwargs(self, kwargs):
+        kwargs["dual_flow_backward"] = self._dual_flow_backward
 
     @staticmethod
     @triton_jit
