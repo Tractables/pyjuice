@@ -292,8 +292,11 @@ def test_soft_evidence_categorical_dist_dual_flow():
     sid, eid = input_layer._output_ind_range
     flows = pc.node_flows[sid:eid,:].reshape(num_vars, batch_size).permute(1, 0) # [B, V]
 
+    params = input_layer.params.reshape(num_vars, num_cats)
+
     pflows = input_layer.param_flows.reshape(num_vars, num_cats * 2)
     pflows_num = pflows[:,:num_cats]
+    pflows_denom = pflows[:,num_cats:]
 
     # Numerator
     var_order = pc.input_layer_group[0].vids
@@ -306,8 +309,18 @@ def test_soft_evidence_categorical_dist_dual_flow():
 
     assert torch.all(torch.abs(pflows_num - my_pflows_num) < 1e-5)
 
-    import pdb; pdb.set_trace()
-    a = 2
+    # Denominator
+    logps = logits + params[None,:,:].log()
+    logps -= logps.logsumexp(dim = 2, keepdim = True)
+
+    my_pflows_denom = torch.zeros_like(pflows_denom)
+    for i in range(num_vars):
+        v = var_order[i,0]
+
+        for b in range(batch_size):
+            my_pflows_denom[i,:] += (flows[b,i] + logps[b,i,:]).exp()
+
+    assert torch.all(torch.abs(pflows_denom - my_pflows_denom) < 1e-5)
 
 
 if __name__ == "__main__":
