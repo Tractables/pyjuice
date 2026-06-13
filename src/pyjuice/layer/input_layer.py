@@ -115,28 +115,28 @@ class InputLayer(Layer, nn.Module):
         self.dist_signature = dist_signature
 
         # Store the triton kernel functions implemented by the target `Distribution`
-        self.fw_mar_fn = self.nodes[0].dist.get_fw_mar_fn()
-        self.bk_flow_fn = self.nodes[0].dist.get_bk_flow_fn()
-        self.sample_fn = self.nodes[0].dist.get_sample_fn()
-        self.em_fn = self.nodes[0].dist.get_em_fn()
+        self.fw_mar_fn = self.dist.get_fw_mar_fn()
+        self.bk_flow_fn = self.dist.get_bk_flow_fn()
+        self.sample_fn = self.dist.get_sample_fn()
+        self.em_fn = self.dist.get_em_fn()
 
         try:
-            self.post_fw_fns = self.nodes[0].dist.post_fw_fns
+            self.post_fw_fns = self.dist.post_fw_fns
         except AttributeError:
             self.post_fw_fns = []
 
         try:
-            self.post_bp_fns = self.nodes[0].dist.post_bp_fns
+            self.post_bp_fns = self.dist.post_bp_fns
         except AttributeError:
             self.post_bp_fns = []
 
-        if hasattr(self.nodes[0].dist, "bk_flow_mask_fn"):
-            self.bk_flow_mask_fn = self.nodes[0].dist.bk_flow_mask_fn
+        if hasattr(self.dist, "bk_flow_mask_fn"):
+            self.bk_flow_mask_fn = self.dist.bk_flow_mask_fn
         else:
             self.bk_flow_mask_fn = None
         
-        if hasattr(self.nodes[0].dist, "partition_fn"):
-            self.fw_partition_fn = self.nodes[0].dist.partition_fn
+        if hasattr(self.dist, "partition_fn"):
+            self.fw_partition_fn = self.dist.partition_fn
         else:
             self.fw_partition_fn = None
 
@@ -341,6 +341,7 @@ class InputLayer(Layer, nn.Module):
                 assert missing_mask is not None, "`missing_mask` should be provided when `_apply_missing_mask_only = True`."
 
             # Apply post-processing kernels
+            self.dist.set_custom_kernel_kwargs(kwargs)
             for (kernel, cond_fn, prep_kwargs_fn) in self.post_fw_fns:
                 if not cond_fn(self, kwargs):
                     continue
@@ -491,6 +492,7 @@ class InputLayer(Layer, nn.Module):
                 )
 
             # Apply post-processing kernels
+            self.dist.set_custom_kernel_kwargs(kwargs)
             for (kernel, cond_fn, prep_kwargs_fn) in self.post_bp_fns:
                 if not cond_fn(self, kwargs):
                     continue
@@ -585,7 +587,7 @@ class InputLayer(Layer, nn.Module):
 
         assert params.dim() == 1
 
-        if len(self.get_dist().sampling_fns) == 0:
+        if len(self.dist.sampling_fns) == 0:
             if "cuda" in self.device.type:
 
                 sid, eid = self._output_ind_range
@@ -625,7 +627,7 @@ class InputLayer(Layer, nn.Module):
                 raise NotImplementedError("CPU sample fn for input nodes is not implemented.")
 
         else:
-            for (kernel, cond_fn, prep_kwargs_fn) in self.get_dist().sampling_fns:
+            for (kernel, cond_fn, prep_kwargs_fn) in self.dist.sampling_fns:
                 if not cond_fn(self, kwargs):
                     continue
 
@@ -698,8 +700,8 @@ class InputLayer(Layer, nn.Module):
 
                     constexprs = torch.tensor([step_size, pseudocount], dtype = torch.float32, device = self.device)
 
-                    if hasattr(self.nodes[0].dist, "em_block_size"):
-                        BLOCK_SIZE = self.nodes[0].dist.em_block_size
+                    if hasattr(self.dist, "em_block_size"):
+                        BLOCK_SIZE = self.dist.em_block_size
                     else:
                         BLOCK_SIZE = 1024
 
@@ -875,7 +877,8 @@ class InputLayer(Layer, nn.Module):
         """
         return self.nodes[0].get_data_dtype()
 
-    def get_dist(self):
+    @property
+    def dist(self):
         """
         Get the distribution of the input layer.
         """
@@ -1015,7 +1018,7 @@ class InputLayer(Layer, nn.Module):
                 p_start = p_end
 
     def _need_2nd_kernel_dim(self):
-        return self.nodes[0].dist._need_2nd_kernel_dim()
+        return self.dist._need_2nd_kernel_dim()
 
     @staticmethod
     def _mars_kernel_template(mar_fn, params_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, metadata_ptr, s_mids_ptr, 
