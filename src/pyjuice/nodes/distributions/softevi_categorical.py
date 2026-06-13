@@ -709,14 +709,16 @@ class SoftEvidenceCategorical(Distribution):
                 expars = tl.load(expars_ptr + i * TILE_SIZE_K, mask = (mask_b[:,None] & mask_c[None,:]), other = 0.0) # [BLOCK_SIZE_B, TILE_SIZE_K]
 
                 if update_pflows:
-                    expars_max = tl.max(expars, axis = 0)[None,:]
-                    expars_sub = tl.exp(expars - expars_max)
                     if use_tensor_core:
+                        expars_max = tl.max(expars, axis = 0)[None,:]
+                        expars_sub = tl.exp(expars - expars_max)
                         pars_grad = tl.dot(nflow_sub_logz_p_sub, expars_sub) + inpars.log() + nflow_sub_logz_p_max + expars_max
                     else:
-                        pars_grad = tl.sum(nflow_sub_logz_p_sub[:,:,None] * expars_sub[None,:,:], axis = 1) + tl.trans(inpars).log() + nflow_sub_logz_p_max + expars_max
+                        expars_max = tl.max(expars, axis = 0)
+                        expars_sub = tl.exp(tl.trans(expars) - expars_max[:,None]) # [TILE_SIZE_K, BLOCK_SIZE_B]
+                        pars_grad = tl.sum(nflow_sub_logz_p_sub[:,None,:] * expars_sub[None,:,:], axis = 2).log() + tl.trans(inpars).log() + nflow_sub_logz_p_max + expars_max[None,:]
 
-                    tl.atomic_add(param_flows_ptr + num_cats + s_pfids[:,None] + offsets_c[None,:], pars_grad, mask = (mask_n[:,None] & mask_c[None,:]))
+                    tl.atomic_add(param_flows_ptr + num_cats + s_pfids[:,None] + offsets_c[None,:], tl.exp(pars_grad), mask = (mask_n[:,None] & mask_c[None,:]))
 
                 if update_extflows:
                     if use_tensor_core:
