@@ -449,8 +449,8 @@ class SoftEvidenceCategorical(Distribution):
                 # Load the category IDs from `soft_evidence_cat_ids`
                 catids = tl.load(catids_ptr + i * TILE_SIZE_K, mask = (mask_b[:,None] & mask_c[None,:]), other = 0) # [BLOCK_SIZE_B, TILE_SIZE_K]
 
-                # Find matching ids
-                is_match = (catids == data[:,None]).to(tl.int64) # [BLOCK_SIZE_B, TILE_SIZE_K]
+                # Find matching ids (mask out padding categories so they can't spuriously match `data == 0`)
+                is_match = ((catids == data[:,None]) & mask_c[None,:]).to(tl.int64) # [BLOCK_SIZE_B, TILE_SIZE_K]
                 match_ids = tl.sum(is_match * tl.arange(0, TILE_SIZE_K), axis = 1) # [BLOCK_SIZE_B]
                 has_match = (tl.sum(is_match, axis = 1) > 0) # [BLOCK_SIZE_B]
 
@@ -596,8 +596,8 @@ class SoftEvidenceCategorical(Distribution):
                 # Load the category IDs from `soft_evidence_cat_ids`
                 catids = tl.load(catids_ptr + i * TILE_SIZE_K, mask = (mask_b[:,None] & mask_c[None,:]), other = 0) # [BLOCK_SIZE_B, TILE_SIZE_K]
 
-                # Find matching ids
-                is_match = (catids == data[:,None]).to(tl.int64) # [BLOCK_SIZE_B, TILE_SIZE_K]
+                # Find matching ids (mask out padding categories so they can't spuriously match `data == 0`)
+                is_match = ((catids == data[:,None]) & mask_c[None,:]).to(tl.int64) # [BLOCK_SIZE_B, TILE_SIZE_K]
                 match_ids = tl.sum(is_match * tl.arange(0, TILE_SIZE_K), axis = 1) # [BLOCK_SIZE_B]
                 has_match = (tl.sum(is_match, axis = 1) > 0) # [BLOCK_SIZE_B]
 
@@ -662,7 +662,7 @@ class SoftEvidenceCategorical(Distribution):
                 if update_pflows:
                     vp_grads = (nflows.log() - logZ)[:,None,:] + inpars.log() + expars[:,:,None] # [BLOCK_SIZE_B, TILE_SIZE_K, BLOCK_SIZE_N]
 
-                    tl.atomic_add(param_flows_ptr + num_cats + s_pfids[None,None,:] + catids[:,:,None], vp_grads, mask = (mask_b[:,None,None] & mask_n[None,None,:]))
+                    tl.atomic_add(param_flows_ptr + num_cats + s_pfids[None,None,:] + catids[:,:,None], tl.exp(vp_grads), mask = (mask_b[:,None,None] & mask_n[None,None,:]))
 
                 if update_extflows:
                     ve_grads = (nflows.log() - logZ)[:,None,:] + inpars.log() # [BLOCK_SIZE_B, TILE_SIZE_K, BLOCK_SIZE_N]
