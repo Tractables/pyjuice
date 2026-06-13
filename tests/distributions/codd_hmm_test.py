@@ -19,7 +19,7 @@ def test_codd_hmm_no_filter():
         seq_length = num_vars,
         num_latents = num_latents,
         homogeneous = True,
-        input_dist = dists.SoftEvidenceCategorical(num_cats = num_cats)
+        input_dist = dists.SoftEvidenceCategorical(num_cats = num_cats, _dual_flow_backward = False)
     )
     root_ns.init_parameters(perturbation = 32.0)
 
@@ -119,7 +119,7 @@ def test_codd_hmm_with_filter():
         seq_length = num_vars,
         num_latents = num_latents,
         homogeneous = True,
-        input_dist = dists.SoftEvidenceCategorical(num_cats = num_cats)
+        input_dist = dists.SoftEvidenceCategorical(num_cats = num_cats, _dual_flow_backward = False)
     )
     root_ns.init_parameters(perturbation = 32.0)
 
