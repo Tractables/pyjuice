@@ -714,7 +714,7 @@ class SoftEvidenceCategorical(Distribution):
                     if use_tensor_core:
                         pars_grad = tl.dot(nflow_sub_logz_p_sub, expars_sub) + inpars.log() + nflow_sub_logz_p_max + expars_max
                     else:
-                        pars_grad = tl.sum(nflow_sub_logz_p_sub[:,:,None], expars_sub[None,:,:], axis = 1) + tl.trans(inpars).log() + nflow_sub_logz_p_max + expars_max
+                        pars_grad = tl.sum(nflow_sub_logz_p_sub[:,:,None] * expars_sub[None,:,:], axis = 1) + tl.trans(inpars).log() + nflow_sub_logz_p_max + expars_max
 
                     tl.atomic_add(param_flows_ptr + num_cats + s_pfids[:,None] + offsets_c[None,:], pars_grad, mask = (mask_n[:,None] & mask_c[None,:]))
 
