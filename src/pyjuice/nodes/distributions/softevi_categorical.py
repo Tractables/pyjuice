@@ -901,7 +901,7 @@ class SoftEvidenceCategorical(Distribution):
             cat_ids += 128
 
     def _get_constructor(self):
-        return SoftEvidenceCategorical, {"num_cats": self.num_cats}
+        return SoftEvidenceCategorical, {"num_cats": self.num_cats, "_dual_flow_backward": self._dual_flow_backward}
 
     def __reduce__(self):
-        return (self.__class__, (self.num_cats,))
+        return (self.__class__, (self.num_cats, self._dual_flow_backward))
