@@ -17,7 +17,7 @@ def test_soft_evidence_categorical_dist():
 
     # Construct PC
     nis = [
-        juice.inputs(v, num_nodes = 1, dist = dists.SoftEvidenceCategorical(num_cats = num_cats)) for v in range(num_vars)
+        juice.inputs(v, num_nodes = 1, dist = dists.SoftEvidenceCategorical(num_cats = num_cats, _dual_flow_backward = False)) for v in range(num_vars)
     ]
 
     np = juice.multiply(*nis)
@@ -77,7 +77,7 @@ def test_soft_evidence_categorical_dist_varied():
 
     # Construct PC
     nis = [
-        juice.inputs(v, num_nodes = 1, dist = dists.SoftEvidenceCategorical(num_cats = num_cats)) for v in range(num_vars)
+        juice.inputs(v, num_nodes = 1, dist = dists.SoftEvidenceCategorical(num_cats = num_cats, _dual_flow_backward = False)) for v in range(num_vars)
     ]
 
     np = juice.multiply(*nis)
@@ -144,7 +144,7 @@ def test_soft_evidence_categorical_dist_multi_nodes():
 
         # Construct PC
         nis = [
-            juice.inputs(v, num_nodes = num_nodes, dist = dists.SoftEvidenceCategorical(num_cats = num_cats)) for v in range(num_vars)
+            juice.inputs(v, num_nodes = num_nodes, dist = dists.SoftEvidenceCategorical(num_cats = num_cats, _dual_flow_backward = False)) for v in range(num_vars)
         ]
 
         np = juice.multiply(*nis)
@@ -202,8 +202,8 @@ def test_soft_evidence_categorical_dist_sample():
     num_cats = 43
 
     # Construct PC
-    ni0 = juice.inputs(0, num_nodes = 1, dist = dists.SoftEvidenceCategorical(num_cats = num_cats))
-    ni1 = juice.inputs(1, num_nodes = 1, dist = dists.SoftEvidenceCategorical(num_cats = num_cats))
+    ni0 = juice.inputs(0, num_nodes = 1, dist = dists.SoftEvidenceCategorical(num_cats = num_cats, _dual_flow_backward = False))
+    ni1 = juice.inputs(1, num_nodes = 1, dist = dists.SoftEvidenceCategorical(num_cats = num_cats, _dual_flow_backward = False))
 
     np = juice.multiply(ni0, ni1)
     ns = juice.summate(np, num_nodes = 1)
