@@ -6,7 +6,7 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>pyjuice &mdash; PyJuice 2.2.0 documentation</title>
+  <title>pyjuice &mdash; PyJuice 2.5.2 documentation</title>
       <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=9edc463e" />
       <link rel="stylesheet" type="text/css" href="../_static/sg_gallery.css?v=d2d258e8" />
@@ -17,7 +17,7 @@
   
       <script src="../_static/jquery.js?v=5d32c60e"></script>
       <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="../_static/documentation_options.js?v=b21de401"></script>
+      <script src="../_static/documentation_options.js?v=afc61bbc"></script>
       <script src="../_static/doctools.js?v=9a2dae69"></script>
       <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/js/theme.js"></script>
@@ -59,6 +59,7 @@
 <li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.multiply.html">pyjuice.multiply</a></li>
 <li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.summate.html">pyjuice.summate</a></li>
 <li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.set_block_size.html">pyjuice.set_block_size</a></li>
+<li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.structural_properties.html">pyjuice.structural_properties</a></li>
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="#pc-structure-transformation">PC Structure Transformation</a><ul>
@@ -66,6 +67,9 @@
 <li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.blockify.html">pyjuice.blockify</a></li>
 <li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.unblockify.html">pyjuice.unblockify</a></li>
 <li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.deepcopy.html">pyjuice.deepcopy</a></li>
+<li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.transformations.grow.html">pyjuice.transformations.grow</a></li>
+<li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.transformations.prune_by_score.html">pyjuice.transformations.prune_by_score</a></li>
+<li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.transformations.bump_block_size.html">pyjuice.transformations.bump_block_size</a></li>
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="#pc-compilation">PC Compilation</a><ul>
@@ -81,6 +85,8 @@
 </li>
 <li class="toctree-l1"><a class="reference internal" href="nodes.html">pyjuice.nodes</a></li>
 <li class="toctree-l1"><a class="reference internal" href="tensorcircuit.html">pyjuice.TensorCircuit</a></li>
+<li class="toctree-l1"><a class="reference internal" href="queries.html">pyjuice.queries</a></li>
+<li class="toctree-l1"><a class="reference internal" href="optim.html">pyjuice.optim</a></li>
 <li class="toctree-l1"><a class="reference internal" href="structures.html">pyjuice.structures</a></li>
 </ul>
 
@@ -126,6 +132,9 @@
 <tr class="row-even"><td><p><a class="reference internal" href="generated/pyjuice.set_block_size.html#pyjuice.set_block_size" title="pyjuice.set_block_size"><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_block_size</span></code></a></p></td>
 <td><p>Context-manager that sets the block size of PC nodes constructed by <cite>inputs</cite>, <cite>multiply</cite>, and <cite>summate</cite>.</p></td>
 </tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="generated/pyjuice.structural_properties.html#pyjuice.structural_properties" title="pyjuice.structural_properties"><code class="xref py py-obj docutils literal notranslate"><span class="pre">structural_properties</span></code></a></p></td>
+<td><p>Context-manager that controls the assertions of circuit structural properties, including smoothness and decomposability.</p></td>
+</tr>
 </tbody>
 </table>
 </section>
@@ -144,6 +153,19 @@
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="generated/pyjuice.deepcopy.html#pyjuice.deepcopy" title="pyjuice.deepcopy"><code class="xref py py-obj docutils literal notranslate"><span class="pre">deepcopy</span></code></a></p></td>
 <td><p>Create a deepcopy of the input PC.</p></td>
+</tr>
+</tbody>
+</table>
+<table class="autosummary longtable docutils align-default">
+<tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="generated/pyjuice.transformations.grow.html#pyjuice.transformations.grow" title="pyjuice.transformations.grow"><code class="xref py py-obj docutils literal notranslate"><span class="pre">grow</span></code></a></p></td>
+<td><p>Grow a PC by creating duplicates of all nodes (except for the root node).</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="generated/pyjuice.transformations.prune_by_score.html#pyjuice.transformations.prune_by_score" title="pyjuice.transformations.prune_by_score"><code class="xref py py-obj docutils literal notranslate"><span class="pre">prune_by_score</span></code></a></p></td>
+<td><p>Prune sum-edge connections from a PC based on per-edge scores, returning a new, sparser PC.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="generated/pyjuice.transformations.bump_block_size.html#pyjuice.transformations.bump_block_size" title="pyjuice.transformations.bump_block_size"><code class="xref py py-obj docutils literal notranslate"><span class="pre">bump_block_size</span></code></a></p></td>
+<td><p>Return a copy of a node group whose block size is increased to <cite>block_size</cite> (which must be a multiple of the current block size and divide the number of nodes), re-packing its parameters and edges accordingly.</p></td>
 </tr>
 </tbody>
 </table>

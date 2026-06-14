@@ -1,0 +1,6 @@
+﻿pyjuice.transformations.prune\_by\_score
+========================================
+
+.. currentmodule:: pyjuice.transformations
+
+.. autofunction:: prune_by_score

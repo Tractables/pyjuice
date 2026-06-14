@@ -1,0 +1,6 @@
+﻿pyjuice.queries.marginal
+========================
+
+.. currentmodule:: pyjuice.queries
+
+.. autofunction:: marginal

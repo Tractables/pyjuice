@@ -6,7 +6,7 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>pyjuice.nodes.foreach &mdash; PyJuice 2.2.0 documentation</title>
+  <title>pyjuice.nodes.foreach &mdash; PyJuice 2.5.2 documentation</title>
       <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=9edc463e" />
       <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery.css?v=d2d258e8" />
@@ -17,7 +17,7 @@
   
       <script src="../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="../../_static/documentation_options.js?v=b21de401"></script>
+      <script src="../../_static/documentation_options.js?v=afc61bbc"></script>
       <script src="../../_static/doctools.js?v=9a2dae69"></script>
       <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../../_static/js/theme.js"></script>
@@ -64,10 +64,13 @@
 <li class="toctree-l3"><a class="reference internal" href="pyjuice.nodes.foldup_aggregate.html">pyjuice.nodes.foldup_aggregate</a></li>
 </ul>
 </li>
+<li class="toctree-l2"><a class="reference internal" href="../nodes.html#edge-constructors">Edge Constructors</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../nodes.html#input-distributions">Input Distributions</a></li>
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="../tensorcircuit.html">pyjuice.TensorCircuit</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../queries.html">pyjuice.queries</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../optim.html">pyjuice.optim</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../structures.html">pyjuice.structures</a></li>
 </ul>
 
@@ -100,7 +103,7 @@
 <h1>pyjuice.nodes.foreach<a class="headerlink" href="#pyjuice-nodes-foreach" title="Link to this heading"></a></h1>
 <dl class="py function">
 <dt class="sig sig-object py" id="pyjuice.nodes.foreach">
-<span class="sig-prename descclassname"><span class="pre">pyjuice.nodes.</span></span><span class="sig-name descname"><span class="pre">foreach</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">func</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Callable" title="(in Python v3.14)"><span class="pre">Callable</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">root_ns</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">CircuitNodes</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyjuice.nodes.foreach" title="Link to this definition"></a></dt>
+<span class="sig-prename descclassname"><span class="pre">pyjuice.nodes.</span></span><span class="sig-name descname"><span class="pre">foreach</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">func</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Callable" title="(in Python v3.14)"><span class="pre">Callable</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">root_ns</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="pyjuice.nodes.CircuitNodes.html#pyjuice.nodes.CircuitNodes" title="pyjuice.nodes.nodes.CircuitNodes"><span class="pre">CircuitNodes</span></a></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyjuice.nodes.foreach" title="Link to this definition"></a></dt>
 <dd><p>Traverse all nodes of a PC and can a specific function.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Note<span class="colon">:</span></dt>
@@ -109,7 +112,7 @@
 <dt class="field-even">Parameters<span class="colon">:</span></dt>
 <dd class="field-even"><ul class="simple">
 <li><p><strong>func</strong> (<em>Callable</em>) – the function to be called</p></li>
-<li><p><strong>root_ns</strong> (<em>CircuitNodes</em>) – the root PC node</p></li>
+<li><p><strong>root_ns</strong> (<a class="reference internal" href="pyjuice.nodes.CircuitNodes.html#pyjuice.nodes.CircuitNodes" title="pyjuice.nodes.CircuitNodes"><em>CircuitNodes</em></a>) – the root PC node</p></li>
 </ul>
 </dd>
 </dl>

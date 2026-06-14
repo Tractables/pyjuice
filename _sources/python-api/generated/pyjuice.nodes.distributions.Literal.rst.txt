@@ -1,0 +1,29 @@
+﻿pyjuice.nodes.distributions.Literal
+===================================
+
+.. currentmodule:: pyjuice.nodes.distributions
+
+.. autoclass:: Literal
+
+   
+   .. automethod:: __init__
+
+   
+   .. rubric:: Methods
+
+   .. autosummary::
+   
+      ~Literal.num_param_flows
+      ~Literal.num_parameters
+   
+   
+
+   
+   
+   .. rubric:: Attributes
+
+   .. autosummary::
+   
+      ~Literal.need_meta_parameters
+   
+   

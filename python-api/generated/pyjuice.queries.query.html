@@ -1,0 +1,156 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="../../">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>pyjuice.queries.query &mdash; PyJuice 2.5.2 documentation</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=9edc463e" />
+      <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery.css?v=d2d258e8" />
+      <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery-binder.css?v=f4aeca0c" />
+      <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery-dataframe.css?v=2082cf3c" />
+      <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery-rendered-html.css?v=1277b6f3" />
+
+  
+      <script src="../../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../../_static/documentation_options.js?v=afc61bbc"></script>
+      <script src="../../_static/doctools.js?v=9a2dae69"></script>
+      <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="pyjuice.optim" href="../optim.html" />
+    <link rel="prev" title="pyjuice.queries.sample" href="pyjuice.queries.sample.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            PyJuice
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../getting-started/installation.html">Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../getting-started/tutorials/index.html">Tutorials</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../pyjuice.html">pyjuice</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nodes.html">pyjuice.nodes</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../tensorcircuit.html">pyjuice.TensorCircuit</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="../queries.html">pyjuice.queries</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="pyjuice.queries.marginal.html">pyjuice.queries.marginal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pyjuice.queries.conditional.html">pyjuice.queries.conditional</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pyjuice.queries.sample.html">pyjuice.queries.sample</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">pyjuice.queries.query</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#pyjuice.queries.query"><code class="docutils literal notranslate"><span class="pre">query()</span></code></a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../optim.html">pyjuice.optim</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../structures.html">pyjuice.structures</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">PyJuice</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="../queries.html">pyjuice.queries</a></li>
+      <li class="breadcrumb-item active">pyjuice.queries.query</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="../../_sources/python-api/generated/pyjuice.queries.query.rst.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="pyjuice-queries-query">
+<h1>pyjuice.queries.query<a class="headerlink" href="#pyjuice-queries-query" title="Link to this heading"></a></h1>
+<dl class="py function">
+<dt class="sig sig-object py" id="pyjuice.queries.query">
+<span class="sig-prename descclassname"><span class="pre">pyjuice.queries.</span></span><span class="sig-name descname"><span class="pre">query</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">pc</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="../tensorcircuit.html#pyjuice.TensorCircuit" title="pyjuice.model.tensorcircuit.TensorCircuit"><span class="pre">TensorCircuit</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">inputs</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">run_backward</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/library/functions.html#bool" title="(in Python v3.14)"><span class="pre">bool</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">fw_input_fn</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)"><span class="pre">str</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Callable" title="(in Python v3.14)"><span class="pre">Callable</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/library/constants.html#None" title="(in Python v3.14)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">bk_input_fn</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)"><span class="pre">str</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Callable" title="(in Python v3.14)"><span class="pre">Callable</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/library/constants.html#None" title="(in Python v3.14)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">fw_output_fn</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Callable" title="(in Python v3.14)"><span class="pre">Callable</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/library/constants.html#None" title="(in Python v3.14)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyjuice.queries.query" title="Link to this definition"></a></dt>
+<dd><p>A general-purpose entry point for running queries on a PC. It runs a forward pass (and optionally a
+backward pass) of the PC, optionally with custom input-layer functions, and is the common backend of
+<a class="reference internal" href="pyjuice.queries.marginal.html#pyjuice.queries.marginal" title="pyjuice.queries.marginal"><code class="xref py py-func docutils literal notranslate"><span class="pre">marginal()</span></code></a>, <a class="reference internal" href="pyjuice.queries.conditional.html#pyjuice.queries.conditional" title="pyjuice.queries.conditional"><code class="xref py py-func docutils literal notranslate"><span class="pre">conditional()</span></code></a>, and <a class="reference internal" href="pyjuice.queries.sample.html#pyjuice.queries.sample" title="pyjuice.queries.sample"><code class="xref py py-func docutils literal notranslate"><span class="pre">sample()</span></code></a>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>pc</strong> (<a class="reference internal" href="../tensorcircuit.html#pyjuice.TensorCircuit" title="pyjuice.TensorCircuit"><em>TensorCircuit</em></a>) – the input PC</p></li>
+<li><p><strong>inputs</strong> (<em>torch.Tensor</em>) – input tensor of size [B, num_vars], or a custom shape paired with <cite>fw_input_fn</cite></p></li>
+<li><p><strong>run_backward</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#bool" title="(in Python v3.14)"><em>bool</em></a>) – whether to run the backward pass after the forward pass</p></li>
+<li><p><strong>fw_input_fn</strong> (<em>Optional</em><em>[</em><em>Union</em><em>[</em><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)"><em>str</em></a><em>,</em><em>Callable</em><em>]</em><em>]</em>) – an optional custom function (or the name of an input-layer method) for the forward pass of input layers</p></li>
+<li><p><strong>bk_input_fn</strong> (<em>Optional</em><em>[</em><em>Union</em><em>[</em><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)"><em>str</em></a><em>,</em><em>Callable</em><em>]</em><em>]</em>) – an optional custom function (or the name of an input-layer method) for the backward pass of input layers</p></li>
+<li><p><strong>fw_output_fn</strong> (<em>Optional</em><em>[</em><em>Callable</em><em>]</em>) – an optional function applied to <cite>pc</cite> right after the forward pass; if provided, its return value is returned immediately and no backward pass is run</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>the log-likelihoods from the forward pass (when <cite>run_backward</cite> is <cite>False</cite>), the output of <cite>fw_output_fn</cite> (when provided), or <cite>None</cite> (after a backward pass)</p>
+</dd>
+</dl>
+</dd></dl>
+
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="pyjuice.queries.sample.html" class="btn btn-neutral float-left" title="pyjuice.queries.sample" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="../optim.html" class="btn btn-neutral float-right" title="pyjuice.optim" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2021, StarAI.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

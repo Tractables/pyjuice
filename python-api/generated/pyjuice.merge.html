@@ -6,7 +6,7 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>pyjuice.merge &mdash; PyJuice 2.2.0 documentation</title>
+  <title>pyjuice.merge &mdash; PyJuice 2.5.2 documentation</title>
       <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=9edc463e" />
       <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery.css?v=d2d258e8" />
@@ -17,14 +17,14 @@
   
       <script src="../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="../../_static/documentation_options.js?v=b21de401"></script>
+      <script src="../../_static/documentation_options.js?v=afc61bbc"></script>
       <script src="../../_static/doctools.js?v=9a2dae69"></script>
       <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../../genindex.html" />
     <link rel="search" title="Search" href="../../search.html" />
     <link rel="next" title="pyjuice.blockify" href="pyjuice.blockify.html" />
-    <link rel="prev" title="pyjuice.set_block_size" href="pyjuice.set_block_size.html" /> 
+    <link rel="prev" title="pyjuice.structural_properties" href="pyjuice.structural_properties.html" /> 
 </head>
 
 <body class="wy-body-for-nav"> 
@@ -63,6 +63,9 @@
 <li class="toctree-l3"><a class="reference internal" href="pyjuice.blockify.html">pyjuice.blockify</a></li>
 <li class="toctree-l3"><a class="reference internal" href="pyjuice.unblockify.html">pyjuice.unblockify</a></li>
 <li class="toctree-l3"><a class="reference internal" href="pyjuice.deepcopy.html">pyjuice.deepcopy</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pyjuice.transformations.grow.html">pyjuice.transformations.grow</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pyjuice.transformations.prune_by_score.html">pyjuice.transformations.prune_by_score</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pyjuice.transformations.bump_block_size.html">pyjuice.transformations.bump_block_size</a></li>
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="../pyjuice.html#pc-compilation">PC Compilation</a></li>
@@ -71,6 +74,8 @@
 </li>
 <li class="toctree-l1"><a class="reference internal" href="../nodes.html">pyjuice.nodes</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../tensorcircuit.html">pyjuice.TensorCircuit</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../queries.html">pyjuice.queries</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../optim.html">pyjuice.optim</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../structures.html">pyjuice.structures</a></li>
 </ul>
 
@@ -103,13 +108,13 @@
 <h1>pyjuice.merge<a class="headerlink" href="#pyjuice-merge" title="Link to this heading"></a></h1>
 <dl class="py function">
 <dt class="sig sig-object py" id="pyjuice.merge">
-<span class="sig-prename descclassname"><span class="pre">pyjuice.</span></span><span class="sig-name descname"><span class="pre">merge</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">ns1</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">CircuitNodes</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">args</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">CircuitNodes</span></span></span><a class="headerlink" href="#pyjuice.merge" title="Link to this definition"></a></dt>
+<span class="sig-prename descclassname"><span class="pre">pyjuice.</span></span><span class="sig-name descname"><span class="pre">merge</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">ns1</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="pyjuice.nodes.CircuitNodes.html#pyjuice.nodes.CircuitNodes" title="pyjuice.nodes.nodes.CircuitNodes"><span class="pre">CircuitNodes</span></a></span></em>, <em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">args</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference internal" href="pyjuice.nodes.CircuitNodes.html#pyjuice.nodes.CircuitNodes" title="pyjuice.nodes.nodes.CircuitNodes"><span class="pre">CircuitNodes</span></a></span></span><a class="headerlink" href="#pyjuice.merge" title="Link to this definition"></a></dt>
 <dd><p>Merge nodes with identical region node together.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>ns1</strong> (<em>CircuitNodes</em>) – the first PC node</p></li>
-<li><p><strong>args</strong> (<em>CircuitNodes</em>) – the remaining PC nodes</p></li>
+<li><p><strong>ns1</strong> (<a class="reference internal" href="pyjuice.nodes.CircuitNodes.html#pyjuice.nodes.CircuitNodes" title="pyjuice.nodes.CircuitNodes"><em>CircuitNodes</em></a>) – the first PC node</p></li>
+<li><p><strong>args</strong> (<a class="reference internal" href="pyjuice.nodes.CircuitNodes.html#pyjuice.nodes.CircuitNodes" title="pyjuice.nodes.CircuitNodes"><em>CircuitNodes</em></a>) – the remaining PC nodes</p></li>
 </ul>
 </dd>
 </dl>
@@ -141,7 +146,7 @@
            </div>
           </div>
           <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
-        <a href="pyjuice.set_block_size.html" class="btn btn-neutral float-left" title="pyjuice.set_block_size" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="pyjuice.structural_properties.html" class="btn btn-neutral float-left" title="pyjuice.structural_properties" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
         <a href="pyjuice.blockify.html" class="btn btn-neutral float-right" title="pyjuice.blockify" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
     </div>
 

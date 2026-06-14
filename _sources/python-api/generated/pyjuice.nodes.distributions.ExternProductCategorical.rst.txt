@@ -1,0 +1,29 @@
+﻿pyjuice.nodes.distributions.ExternProductCategorical
+====================================================
+
+.. currentmodule:: pyjuice.nodes.distributions
+
+.. autoclass:: ExternProductCategorical
+
+   
+   .. automethod:: __init__
+
+   
+   .. rubric:: Methods
+
+   .. autosummary::
+   
+      ~ExternProductCategorical.num_param_flows
+      ~ExternProductCategorical.num_parameters
+   
+   
+
+   
+   
+   .. rubric:: Attributes
+
+   .. autosummary::
+   
+      ~ExternProductCategorical.need_meta_parameters
+   
+   

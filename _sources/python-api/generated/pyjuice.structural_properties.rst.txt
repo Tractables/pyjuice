@@ -1,0 +1,16 @@
+﻿pyjuice.structural\_properties
+==============================
+
+.. currentmodule:: pyjuice
+
+.. autoclass:: structural_properties
+
+   
+   .. automethod:: __init__
+
+   
+   
+
+   
+   
+   

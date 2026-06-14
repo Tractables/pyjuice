@@ -6,7 +6,7 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>pyjuice.save &mdash; PyJuice 2.2.0 documentation</title>
+  <title>pyjuice.save &mdash; PyJuice 2.5.2 documentation</title>
       <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=9edc463e" />
       <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery.css?v=d2d258e8" />
@@ -17,7 +17,7 @@
   
       <script src="../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="../../_static/documentation_options.js?v=b21de401"></script>
+      <script src="../../_static/documentation_options.js?v=afc61bbc"></script>
       <script src="../../_static/doctools.js?v=9a2dae69"></script>
       <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../../_static/js/theme.js"></script>
@@ -69,6 +69,8 @@
 </li>
 <li class="toctree-l1"><a class="reference internal" href="../nodes.html">pyjuice.nodes</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../tensorcircuit.html">pyjuice.TensorCircuit</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../queries.html">pyjuice.queries</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../optim.html">pyjuice.optim</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../structures.html">pyjuice.structures</a></li>
 </ul>
 
@@ -101,13 +103,13 @@
 <h1>pyjuice.save<a class="headerlink" href="#pyjuice-save" title="Link to this heading"></a></h1>
 <dl class="py function">
 <dt class="sig sig-object py" id="pyjuice.save">
-<span class="sig-prename descclassname"><span class="pre">pyjuice.</span></span><span class="sig-name descname"><span class="pre">save</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">fname</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)"><span class="pre">str</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">model</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">CircuitNodes</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference internal" href="../tensorcircuit.html#pyjuice.TensorCircuit" title="pyjuice.TensorCircuit"><span class="pre">TensorCircuit</span></a></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyjuice.save" title="Link to this definition"></a></dt>
+<span class="sig-prename descclassname"><span class="pre">pyjuice.</span></span><span class="sig-name descname"><span class="pre">save</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">fname</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)"><span class="pre">str</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">model</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="pyjuice.nodes.CircuitNodes.html#pyjuice.nodes.CircuitNodes" title="pyjuice.nodes.CircuitNodes"><span class="pre">CircuitNodes</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference internal" href="../tensorcircuit.html#pyjuice.TensorCircuit" title="pyjuice.TensorCircuit"><span class="pre">TensorCircuit</span></a></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyjuice.save" title="Link to this definition"></a></dt>
 <dd><p>Save a PC to file. The file should end with “.jpc”.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>fname</strong> (<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)"><em>str</em></a>) – file name</p></li>
-<li><p><strong>model</strong> (<em>Union</em><em>[</em><em>CircuitNodes</em><em>,</em><a class="reference internal" href="../tensorcircuit.html#pyjuice.TensorCircuit" title="pyjuice.TensorCircuit"><em>TensorCircuit</em></a><em>]</em>) – an uncompiled (<cite>CircuitNodes</cite>) or compiled (<cite>TensorCircuit</cite>) PC</p></li>
+<li><p><strong>model</strong> (<em>Union</em><em>[</em><a class="reference internal" href="pyjuice.nodes.CircuitNodes.html#pyjuice.nodes.CircuitNodes" title="pyjuice.nodes.CircuitNodes"><em>CircuitNodes</em></a><em>,</em><a class="reference internal" href="../tensorcircuit.html#pyjuice.TensorCircuit" title="pyjuice.TensorCircuit"><em>TensorCircuit</em></a><em>]</em>) – an uncompiled (<cite>CircuitNodes</cite>) or compiled (<cite>TensorCircuit</cite>) PC</p></li>
 </ul>
 </dd>
 </dl>

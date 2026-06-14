@@ -1,0 +1,6 @@
+﻿pyjuice.queries.query
+=====================
+
+.. currentmodule:: pyjuice.queries
+
+.. autofunction:: query

@@ -1,0 +1,29 @@
+﻿pyjuice.nodes.distributions.SoftEvidenceIndicator
+=================================================
+
+.. currentmodule:: pyjuice.nodes.distributions
+
+.. autoclass:: SoftEvidenceIndicator
+
+   
+   .. automethod:: __init__
+
+   
+   .. rubric:: Methods
+
+   .. autosummary::
+   
+      ~SoftEvidenceIndicator.num_param_flows
+      ~SoftEvidenceIndicator.num_parameters
+   
+   
+
+   
+   
+   .. rubric:: Attributes
+
+   .. autosummary::
+   
+      ~SoftEvidenceIndicator.need_meta_parameters
+   
+   

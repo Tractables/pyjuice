@@ -1,0 +1,6 @@
+﻿pyjuice.transformations.bump\_block\_size
+=========================================
+
+.. currentmodule:: pyjuice.transformations
+
+.. autofunction:: bump_block_size

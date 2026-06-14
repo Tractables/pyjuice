@@ -1,0 +1,6 @@
+﻿pyjuice.queries.sample
+======================
+
+.. currentmodule:: pyjuice.queries
+
+.. autofunction:: sample

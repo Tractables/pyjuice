@@ -1,0 +1,25 @@
+﻿pyjuice.nodes.CircuitNodes
+==========================
+
+.. currentmodule:: pyjuice.nodes
+
+.. autoclass:: CircuitNodes
+
+   
+   .. automethod:: __init__
+
+   
+   .. rubric:: Methods
+
+   .. autosummary::
+   
+      ~CircuitNodes.duplicate
+      ~CircuitNodes.get_params
+      ~CircuitNodes.init_parameters
+      ~CircuitNodes.num_parameters
+   
+   
+
+   
+   
+   

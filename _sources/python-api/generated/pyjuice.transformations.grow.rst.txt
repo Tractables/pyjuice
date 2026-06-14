@@ -1,0 +1,6 @@
+﻿pyjuice.transformations.grow
+============================
+
+.. currentmodule:: pyjuice.transformations
+
+.. autofunction:: grow

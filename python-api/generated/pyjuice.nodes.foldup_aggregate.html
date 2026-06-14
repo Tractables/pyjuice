@@ -6,7 +6,7 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>pyjuice.nodes.foldup_aggregate &mdash; PyJuice 2.2.0 documentation</title>
+  <title>pyjuice.nodes.foldup_aggregate &mdash; PyJuice 2.5.2 documentation</title>
       <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=9edc463e" />
       <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery.css?v=d2d258e8" />
@@ -17,13 +17,13 @@
   
       <script src="../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="../../_static/documentation_options.js?v=b21de401"></script>
+      <script src="../../_static/documentation_options.js?v=afc61bbc"></script>
       <script src="../../_static/doctools.js?v=9a2dae69"></script>
       <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../../genindex.html" />
     <link rel="search" title="Search" href="../../search.html" />
-    <link rel="next" title="pyjuice.nodes.distributions.Bernoulli" href="pyjuice.nodes.distributions.Bernoulli.html" />
+    <link rel="next" title="pyjuice.nodes.edge_constructors.block_diagonal_edge_constructor" href="pyjuice.nodes.edge_constructors.block_diagonal_edge_constructor.html" />
     <link rel="prev" title="pyjuice.nodes.foreach" href="pyjuice.nodes.foreach.html" /> 
 </head>
 
@@ -64,10 +64,13 @@
 </li>
 </ul>
 </li>
+<li class="toctree-l2"><a class="reference internal" href="../nodes.html#edge-constructors">Edge Constructors</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../nodes.html#input-distributions">Input Distributions</a></li>
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="../tensorcircuit.html">pyjuice.TensorCircuit</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../queries.html">pyjuice.queries</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../optim.html">pyjuice.optim</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../structures.html">pyjuice.structures</a></li>
 </ul>
 
@@ -100,13 +103,13 @@
 <h1>pyjuice.nodes.foldup_aggregate<a class="headerlink" href="#pyjuice-nodes-foldup-aggregate" title="Link to this heading"></a></h1>
 <dl class="py function">
 <dt class="sig sig-object py" id="pyjuice.nodes.foldup_aggregate">
-<span class="sig-prename descclassname"><span class="pre">pyjuice.nodes.</span></span><span class="sig-name descname"><span class="pre">foldup_aggregate</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">func</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Callable" title="(in Python v3.14)"><span class="pre">Callable</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">root_ns</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">CircuitNodes</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cache</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Dict" title="(in Python v3.14)"><span class="pre">Dict</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/library/constants.html#None" title="(in Python v3.14)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyjuice.nodes.foldup_aggregate" title="Link to this definition"></a></dt>
+<span class="sig-prename descclassname"><span class="pre">pyjuice.nodes.</span></span><span class="sig-name descname"><span class="pre">foldup_aggregate</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">func</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Callable" title="(in Python v3.14)"><span class="pre">Callable</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">root_ns</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="pyjuice.nodes.CircuitNodes.html#pyjuice.nodes.CircuitNodes" title="pyjuice.nodes.nodes.CircuitNodes"><span class="pre">CircuitNodes</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">cache</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Dict" title="(in Python v3.14)"><span class="pre">Dict</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/library/constants.html#None" title="(in Python v3.14)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyjuice.nodes.foldup_aggregate" title="Link to this definition"></a></dt>
 <dd><p>Traverse all nodes of a PC bottom-up and aggregate a per-node object.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>func</strong> (<em>Callable</em>) – the function to compute the per-node object</p></li>
-<li><p><strong>root_ns</strong> (<em>CircuitNodes</em>) – the root PC node</p></li>
+<li><p><strong>root_ns</strong> (<a class="reference internal" href="pyjuice.nodes.CircuitNodes.html#pyjuice.nodes.CircuitNodes" title="pyjuice.nodes.CircuitNodes"><em>CircuitNodes</em></a>) – the root PC node</p></li>
 <li><p><strong>cache</strong> (<em>Dict</em>) – an optional dictionary to store the per-node object for all nodes</p></li>
 </ul>
 </dd>
@@ -120,7 +123,7 @@
           </div>
           <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
         <a href="pyjuice.nodes.foreach.html" class="btn btn-neutral float-left" title="pyjuice.nodes.foreach" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
-        <a href="pyjuice.nodes.distributions.Bernoulli.html" class="btn btn-neutral float-right" title="pyjuice.nodes.distributions.Bernoulli" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+        <a href="pyjuice.nodes.edge_constructors.block_diagonal_edge_constructor.html" class="btn btn-neutral float-right" title="pyjuice.nodes.edge_constructors.block_diagonal_edge_constructor" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
     </div>
 
   <hr/>

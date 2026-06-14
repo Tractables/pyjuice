@@ -1,0 +1,6 @@
+﻿pyjuice.nodes.edge\_constructors.block\_diagonal\_edge\_constructor
+===================================================================
+
+.. currentmodule:: pyjuice.nodes
+
+.. autofunction:: edge_constructors.block_diagonal_edge_constructor

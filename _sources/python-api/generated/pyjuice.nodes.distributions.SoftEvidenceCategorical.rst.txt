@@ -1,0 +1,29 @@
+﻿pyjuice.nodes.distributions.SoftEvidenceCategorical
+===================================================
+
+.. currentmodule:: pyjuice.nodes.distributions
+
+.. autoclass:: SoftEvidenceCategorical
+
+   
+   .. automethod:: __init__
+
+   
+   .. rubric:: Methods
+
+   .. autosummary::
+   
+      ~SoftEvidenceCategorical.num_param_flows
+      ~SoftEvidenceCategorical.num_parameters
+   
+   
+
+   
+   
+   .. rubric:: Attributes
+
+   .. autosummary::
+   
+      ~SoftEvidenceCategorical.need_meta_parameters
+   
+   

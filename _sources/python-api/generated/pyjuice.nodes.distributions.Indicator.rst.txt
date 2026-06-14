@@ -1,0 +1,29 @@
+﻿pyjuice.nodes.distributions.Indicator
+=====================================
+
+.. currentmodule:: pyjuice.nodes.distributions
+
+.. autoclass:: Indicator
+
+   
+   .. automethod:: __init__
+
+   
+   .. rubric:: Methods
+
+   .. autosummary::
+   
+      ~Indicator.num_param_flows
+      ~Indicator.num_parameters
+   
+   
+
+   
+   
+   .. rubric:: Attributes
+
+   .. autosummary::
+   
+      ~Indicator.need_meta_parameters
+   
+   

@@ -5,7 +5,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Index &mdash; PyJuice 2.2.0 documentation</title>
+  <title>Index &mdash; PyJuice 2.5.2 documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
       <link rel="stylesheet" type="text/css" href="_static/sg_gallery.css?v=d2d258e8" />
@@ -16,7 +16,7 @@
   
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="_static/documentation_options.js?v=b21de401"></script>
+      <script src="_static/documentation_options.js?v=afc61bbc"></script>
       <script src="_static/doctools.js?v=9a2dae69"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
@@ -53,6 +53,8 @@
 <li class="toctree-l1"><a class="reference internal" href="python-api/pyjuice.html">pyjuice</a></li>
 <li class="toctree-l1"><a class="reference internal" href="python-api/nodes.html">pyjuice.nodes</a></li>
 <li class="toctree-l1"><a class="reference internal" href="python-api/tensorcircuit.html">pyjuice.TensorCircuit</a></li>
+<li class="toctree-l1"><a class="reference internal" href="python-api/queries.html">pyjuice.queries</a></li>
+<li class="toctree-l1"><a class="reference internal" href="python-api/optim.html">pyjuice.optim</a></li>
 <li class="toctree-l1"><a class="reference internal" href="python-api/structures.html">pyjuice.structures</a></li>
 </ul>
 
@@ -87,6 +89,7 @@
  | <a href="#B"><strong>B</strong></a>
  | <a href="#C"><strong>C</strong></a>
  | <a href="#D"><strong>D</strong></a>
+ | <a href="#E"><strong>E</strong></a>
  | <a href="#F"><strong>F</strong></a>
  | <a href="#G"><strong>G</strong></a>
  | <a href="#H"><strong>H</strong></a>
@@ -94,25 +97,41 @@
  | <a href="#L"><strong>L</strong></a>
  | <a href="#M"><strong>M</strong></a>
  | <a href="#P"><strong>P</strong></a>
+ | <a href="#Q"><strong>Q</strong></a>
  | <a href="#R"><strong>R</strong></a>
  | <a href="#S"><strong>S</strong></a>
  | <a href="#T"><strong>T</strong></a>
  | <a href="#U"><strong>U</strong></a>
+ | <a href="#Z"><strong>Z</strong></a>
  
 </div>
 <h2 id="_">_</h2>
 <table style="width: 100%" class="indextable genindextable"><tr>
   <td style="width: 33%; vertical-align: top;"><ul>
-      <li><a href="python-api/generated/pyjuice.nodes.distributions.Bernoulli.html#pyjuice.nodes.distributions.Bernoulli.__init__">__init__() (pyjuice.nodes.distributions.Bernoulli method)</a>
+      <li><a href="python-api/generated/pyjuice.nodes.CircuitNodes.html#pyjuice.nodes.CircuitNodes.__init__">__init__() (pyjuice.nodes.CircuitNodes method)</a>
 
       <ul>
+        <li><a href="python-api/generated/pyjuice.nodes.distributions.Bernoulli.html#pyjuice.nodes.distributions.Bernoulli.__init__">(pyjuice.nodes.distributions.Bernoulli method)</a>
+</li>
         <li><a href="python-api/generated/pyjuice.nodes.distributions.Categorical.html#pyjuice.nodes.distributions.Categorical.__init__">(pyjuice.nodes.distributions.Categorical method)</a>
 </li>
         <li><a href="python-api/generated/pyjuice.nodes.distributions.DiscreteLogistic.html#pyjuice.nodes.distributions.DiscreteLogistic.__init__">(pyjuice.nodes.distributions.DiscreteLogistic method)</a>
 </li>
+        <li><a href="python-api/generated/pyjuice.nodes.distributions.External.html#pyjuice.nodes.distributions.External.__init__">(pyjuice.nodes.distributions.External method)</a>
+</li>
+        <li><a href="python-api/generated/pyjuice.nodes.distributions.ExternProductCategorical.html#pyjuice.nodes.distributions.ExternProductCategorical.__init__">(pyjuice.nodes.distributions.ExternProductCategorical method)</a>
+</li>
         <li><a href="python-api/generated/pyjuice.nodes.distributions.Gaussian.html#pyjuice.nodes.distributions.Gaussian.__init__">(pyjuice.nodes.distributions.Gaussian method)</a>
 </li>
+        <li><a href="python-api/generated/pyjuice.nodes.distributions.Indicator.html#pyjuice.nodes.distributions.Indicator.__init__">(pyjuice.nodes.distributions.Indicator method)</a>
+</li>
+        <li><a href="python-api/generated/pyjuice.nodes.distributions.Literal.html#pyjuice.nodes.distributions.Literal.__init__">(pyjuice.nodes.distributions.Literal method)</a>
+</li>
         <li><a href="python-api/generated/pyjuice.nodes.distributions.MaskedCategorical.html#pyjuice.nodes.distributions.MaskedCategorical.__init__">(pyjuice.nodes.distributions.MaskedCategorical method)</a>
+</li>
+        <li><a href="python-api/generated/pyjuice.nodes.distributions.SoftEvidenceCategorical.html#pyjuice.nodes.distributions.SoftEvidenceCategorical.__init__">(pyjuice.nodes.distributions.SoftEvidenceCategorical method)</a>
+</li>
+        <li><a href="python-api/generated/pyjuice.nodes.distributions.SoftEvidenceIndicator.html#pyjuice.nodes.distributions.SoftEvidenceIndicator.__init__">(pyjuice.nodes.distributions.SoftEvidenceIndicator method)</a>
 </li>
         <li><a href="python-api/generated/pyjuice.nodes.InputNodes.html#pyjuice.nodes.InputNodes.__init__">(pyjuice.nodes.InputNodes method)</a>
 </li>
@@ -121,6 +140,8 @@
         <li><a href="python-api/generated/pyjuice.nodes.SumNodes.html#pyjuice.nodes.SumNodes.__init__">(pyjuice.nodes.SumNodes method)</a>
 </li>
         <li><a href="python-api/generated/pyjuice.set_block_size.html#pyjuice.set_block_size.__init__">(pyjuice.set_block_size method)</a>
+</li>
+        <li><a href="python-api/generated/pyjuice.structural_properties.html#pyjuice.structural_properties.__init__">(pyjuice.structural_properties method)</a>
 </li>
       </ul></li>
   </ul></td>
@@ -131,11 +152,13 @@
   <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="python-api/tensorcircuit.html#pyjuice.TensorCircuit.backward">backward() (pyjuice.TensorCircuit method)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="python-api/generated/pyjuice.nodes.distributions.Bernoulli.html#pyjuice.nodes.distributions.Bernoulli">Bernoulli (class in pyjuice.nodes.distributions)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="python-api/generated/pyjuice.blockify.html#pyjuice.blockify">blockify() (in module pyjuice)</a>
+</li>
+      <li><a href="python-api/generated/pyjuice.transformations.bump_block_size.html#pyjuice.transformations.bump_block_size">bump_block_size() (in module pyjuice.transformations)</a>
 </li>
   </ul></td>
 </tr></table>
@@ -145,9 +168,19 @@
   <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="python-api/generated/pyjuice.nodes.distributions.Categorical.html#pyjuice.nodes.distributions.Categorical">Categorical (class in pyjuice.nodes.distributions)</a>
 </li>
+      <li><a href="python-api/generated/pyjuice.nodes.CircuitNodes.html#pyjuice.nodes.CircuitNodes">CircuitNodes (class in pyjuice.nodes)</a>
+</li>
+      <li><a href="python-api/optim.html#pyjuice.optim.CircuitOptimizer">CircuitOptimizer (class in pyjuice.optim)</a>
+</li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="python-api/optim.html#pyjuice.optim.CircuitScheduler">CircuitScheduler (class in pyjuice.optim)</a>
+</li>
       <li><a href="python-api/generated/pyjuice.compile.html#pyjuice.compile">compile() (in module pyjuice)</a>
+</li>
+      <li><a href="python-api/generated/pyjuice.queries.conditional.html#pyjuice.queries.conditional">conditional() (in module pyjuice.queries)</a>
+</li>
+      <li><a href="python-api/tensorcircuit.html#pyjuice.TensorCircuit.cumulate_flows">cumulate_flows() (pyjuice.TensorCircuit method)</a>
 </li>
   </ul></td>
 </tr></table>
@@ -159,7 +192,23 @@
 </li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="python-api/tensorcircuit.html#pyjuice.TensorCircuit.disable_partial_evaluation">disable_partial_evaluation() (pyjuice.TensorCircuit method)</a>
+</li>
       <li><a href="python-api/generated/pyjuice.nodes.distributions.DiscreteLogistic.html#pyjuice.nodes.distributions.DiscreteLogistic">DiscreteLogistic (class in pyjuice.nodes.distributions)</a>
+</li>
+  </ul></td>
+</tr></table>
+
+<h2 id="E">E</h2>
+<table style="width: 100%" class="indextable genindextable"><tr>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="python-api/tensorcircuit.html#pyjuice.TensorCircuit.enable_partial_evaluation">enable_partial_evaluation() (pyjuice.TensorCircuit method)</a>
+</li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="python-api/generated/pyjuice.nodes.distributions.External.html#pyjuice.nodes.distributions.External">External (class in pyjuice.nodes.distributions)</a>
+</li>
+      <li><a href="python-api/generated/pyjuice.nodes.distributions.ExternProductCategorical.html#pyjuice.nodes.distributions.ExternProductCategorical">ExternProductCategorical (class in pyjuice.nodes.distributions)</a>
 </li>
   </ul></td>
 </tr></table>
@@ -183,6 +232,20 @@
   <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="python-api/generated/pyjuice.nodes.distributions.Gaussian.html#pyjuice.nodes.distributions.Gaussian">Gaussian (class in pyjuice.nodes.distributions)</a>
 </li>
+      <li><a href="python-api/generated/pyjuice.structures.GeneralizedHMM.html#pyjuice.structures.GeneralizedHMM">GeneralizedHMM() (in module pyjuice.structures)</a>
+</li>
+      <li><a href="python-api/tensorcircuit.html#pyjuice.TensorCircuit.get_node_flows">get_node_flows() (pyjuice.TensorCircuit method)</a>
+</li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="python-api/tensorcircuit.html#pyjuice.TensorCircuit.get_node_mars">get_node_mars() (pyjuice.TensorCircuit method)</a>
+</li>
+      <li><a href="python-api/tensorcircuit.html#pyjuice.TensorCircuit.get_node_param_flows">get_node_param_flows() (pyjuice.TensorCircuit method)</a>
+</li>
+      <li><a href="python-api/tensorcircuit.html#pyjuice.TensorCircuit.get_node_params">get_node_params() (pyjuice.TensorCircuit method)</a>
+</li>
+      <li><a href="python-api/generated/pyjuice.transformations.grow.html#pyjuice.transformations.grow">grow() (in module pyjuice.transformations)</a>
+</li>
   </ul></td>
 </tr></table>
 
@@ -201,6 +264,8 @@
 <h2 id="I">I</h2>
 <table style="width: 100%" class="indextable genindextable"><tr>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="python-api/generated/pyjuice.nodes.distributions.Indicator.html#pyjuice.nodes.distributions.Indicator">Indicator (class in pyjuice.nodes.distributions)</a>
+</li>
       <li><a href="python-api/tensorcircuit.html#pyjuice.TensorCircuit.init_param_flows">init_param_flows() (pyjuice.TensorCircuit method)</a>
 </li>
   </ul></td>
@@ -215,7 +280,13 @@
 <h2 id="L">L</h2>
 <table style="width: 100%" class="indextable genindextable"><tr>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="python-api/generated/pyjuice.nodes.distributions.Literal.html#pyjuice.nodes.distributions.Literal">Literal (class in pyjuice.nodes.distributions)</a>
+</li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="python-api/generated/pyjuice.load.html#pyjuice.load">load() (in module pyjuice)</a>
+</li>
+      <li><a href="python-api/optim.html#pyjuice.optim.CircuitOptimizer.load_state_dict">load_state_dict() (pyjuice.optim.CircuitOptimizer method)</a>
 </li>
   </ul></td>
 </tr></table>
@@ -223,12 +294,14 @@
 <h2 id="M">M</h2>
 <table style="width: 100%" class="indextable genindextable"><tr>
   <td style="width: 33%; vertical-align: top;"><ul>
-      <li><a href="python-api/generated/pyjuice.nodes.distributions.MaskedCategorical.html#pyjuice.nodes.distributions.MaskedCategorical">MaskedCategorical (class in pyjuice.nodes.distributions)</a>
+      <li><a href="python-api/generated/pyjuice.queries.marginal.html#pyjuice.queries.marginal">marginal() (in module pyjuice.queries)</a>
 </li>
-      <li><a href="python-api/generated/pyjuice.merge.html#pyjuice.merge">merge() (in module pyjuice)</a>
+      <li><a href="python-api/generated/pyjuice.nodes.distributions.MaskedCategorical.html#pyjuice.nodes.distributions.MaskedCategorical">MaskedCategorical (class in pyjuice.nodes.distributions)</a>
 </li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="python-api/generated/pyjuice.merge.html#pyjuice.merge">merge() (in module pyjuice)</a>
+</li>
       <li><a href="python-api/tensorcircuit.html#pyjuice.TensorCircuit.mini_batch_em">mini_batch_em() (pyjuice.TensorCircuit method)</a>
 </li>
       <li><a href="python-api/generated/pyjuice.multiply.html#pyjuice.multiply">multiply() (in module pyjuice)</a>
@@ -241,9 +314,23 @@
   <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="python-api/generated/pyjuice.structures.PD.html#pyjuice.structures.PD">PD() (in module pyjuice.structures)</a>
 </li>
+      <li><a href="python-api/generated/pyjuice.structures.PDHCLT.html#pyjuice.structures.PDHCLT">PDHCLT() (in module pyjuice.structures)</a>
+</li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="python-api/tensorcircuit.html#pyjuice.TensorCircuit.print_statistics">print_statistics() (pyjuice.TensorCircuit method)</a>
+</li>
       <li><a href="python-api/generated/pyjuice.nodes.ProdNodes.html#pyjuice.nodes.ProdNodes">ProdNodes (class in pyjuice.nodes)</a>
+</li>
+      <li><a href="python-api/generated/pyjuice.transformations.prune_by_score.html#pyjuice.transformations.prune_by_score">prune_by_score() (in module pyjuice.transformations)</a>
+</li>
+  </ul></td>
+</tr></table>
+
+<h2 id="Q">Q</h2>
+<table style="width: 100%" class="indextable genindextable"><tr>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="python-api/generated/pyjuice.queries.query.html#pyjuice.queries.query">query() (in module pyjuice.queries)</a>
 </li>
   </ul></td>
 </tr></table>
@@ -259,12 +346,30 @@
 <h2 id="S">S</h2>
 <table style="width: 100%" class="indextable genindextable"><tr>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="python-api/generated/pyjuice.queries.sample.html#pyjuice.queries.sample">sample() (in module pyjuice.queries)</a>
+</li>
       <li><a href="python-api/generated/pyjuice.save.html#pyjuice.save">save() (in module pyjuice)</a>
 </li>
       <li><a href="python-api/generated/pyjuice.set_block_size.html#pyjuice.set_block_size">set_block_size (class in pyjuice)</a>
 </li>
+      <li><a href="python-api/tensorcircuit.html#pyjuice.TensorCircuit.set_propagation_alg">set_propagation_alg() (pyjuice.TensorCircuit method)</a>
+</li>
+      <li><a href="python-api/generated/pyjuice.nodes.distributions.SoftEvidenceCategorical.html#pyjuice.nodes.distributions.SoftEvidenceCategorical">SoftEvidenceCategorical (class in pyjuice.nodes.distributions)</a>
+</li>
+      <li><a href="python-api/generated/pyjuice.nodes.distributions.SoftEvidenceIndicator.html#pyjuice.nodes.distributions.SoftEvidenceIndicator">SoftEvidenceIndicator (class in pyjuice.nodes.distributions)</a>
+</li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="python-api/optim.html#pyjuice.optim.CircuitOptimizer.state_dict">state_dict() (pyjuice.optim.CircuitOptimizer method)</a>
+</li>
+      <li><a href="python-api/optim.html#pyjuice.optim.CircuitOptimizer.step">step() (pyjuice.optim.CircuitOptimizer method)</a>
+
+      <ul>
+        <li><a href="python-api/optim.html#pyjuice.optim.CircuitScheduler.step">(pyjuice.optim.CircuitScheduler method)</a>
+</li>
+      </ul></li>
+      <li><a href="python-api/generated/pyjuice.structural_properties.html#pyjuice.structural_properties">structural_properties (class in pyjuice)</a>
+</li>
       <li><a href="python-api/generated/pyjuice.summate.html#pyjuice.summate">summate() (in module pyjuice)</a>
 </li>
       <li><a href="python-api/generated/pyjuice.nodes.SumNodes.html#pyjuice.nodes.SumNodes">SumNodes (class in pyjuice.nodes)</a>
@@ -290,6 +395,18 @@
       <li><a href="python-api/tensorcircuit.html#pyjuice.TensorCircuit.update_param_flows">update_param_flows() (pyjuice.TensorCircuit method)</a>
 </li>
       <li><a href="python-api/tensorcircuit.html#pyjuice.TensorCircuit.update_parameters">update_parameters() (pyjuice.TensorCircuit method)</a>
+</li>
+  </ul></td>
+</tr></table>
+
+<h2 id="Z">Z</h2>
+<table style="width: 100%" class="indextable genindextable"><tr>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="python-api/optim.html#pyjuice.optim.CircuitOptimizer.zero_grad">zero_grad() (pyjuice.optim.CircuitOptimizer method)</a>
+</li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="python-api/tensorcircuit.html#pyjuice.TensorCircuit.zero_param_flows">zero_param_flows() (pyjuice.TensorCircuit method)</a>
 </li>
   </ul></td>
 </tr></table>

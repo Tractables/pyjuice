@@ -1,0 +1,6 @@
+﻿pyjuice.structures.GeneralizedHMM
+=================================
+
+.. currentmodule:: pyjuice.structures
+
+.. autofunction:: GeneralizedHMM

@@ -1,0 +1,29 @@
+﻿pyjuice.nodes.distributions.External
+====================================
+
+.. currentmodule:: pyjuice.nodes.distributions
+
+.. autoclass:: External
+
+   
+   .. automethod:: __init__
+
+   
+   .. rubric:: Methods
+
+   .. autosummary::
+   
+      ~External.num_param_flows
+      ~External.num_parameters
+   
+   
+
+   
+   
+   .. rubric:: Attributes
+
+   .. autosummary::
+   
+      ~External.need_meta_parameters
+   
+   

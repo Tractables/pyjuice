@@ -6,7 +6,7 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>pyjuice.nodes &mdash; PyJuice 2.2.0 documentation</title>
+  <title>pyjuice.nodes &mdash; PyJuice 2.5.2 documentation</title>
       <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=9edc463e" />
       <link rel="stylesheet" type="text/css" href="../_static/sg_gallery.css?v=d2d258e8" />
@@ -17,13 +17,13 @@
   
       <script src="../_static/jquery.js?v=5d32c60e"></script>
       <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="../_static/documentation_options.js?v=b21de401"></script>
+      <script src="../_static/documentation_options.js?v=afc61bbc"></script>
       <script src="../_static/doctools.js?v=9a2dae69"></script>
       <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="pyjuice.nodes.InputNodes" href="generated/pyjuice.nodes.InputNodes.html" />
+    <link rel="next" title="pyjuice.nodes.CircuitNodes" href="generated/pyjuice.nodes.CircuitNodes.html" />
     <link rel="prev" title="pyjuice.save" href="generated/pyjuice.save.html" /> 
 </head>
 
@@ -56,6 +56,7 @@
 <li class="toctree-l1"><a class="reference internal" href="pyjuice.html">pyjuice</a></li>
 <li class="toctree-l1 current"><a class="current reference internal" href="#">pyjuice.nodes</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="#nodes">Nodes</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.nodes.CircuitNodes.html">pyjuice.nodes.CircuitNodes</a></li>
 <li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.nodes.InputNodes.html">pyjuice.nodes.InputNodes</a></li>
 <li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.nodes.ProdNodes.html">pyjuice.nodes.ProdNodes</a></li>
 <li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.nodes.SumNodes.html">pyjuice.nodes.SumNodes</a></li>
@@ -66,17 +67,30 @@
 <li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.nodes.foldup_aggregate.html">pyjuice.nodes.foldup_aggregate</a></li>
 </ul>
 </li>
+<li class="toctree-l2"><a class="reference internal" href="#edge-constructors">Edge Constructors</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.nodes.edge_constructors.block_diagonal_edge_constructor.html">pyjuice.nodes.edge_constructors.block_diagonal_edge_constructor</a></li>
+<li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.nodes.edge_constructors.block_sparse_rnd_blk_edge_constructor.html">pyjuice.nodes.edge_constructors.block_sparse_rnd_blk_edge_constructor</a></li>
+</ul>
+</li>
 <li class="toctree-l2"><a class="reference internal" href="#input-distributions">Input Distributions</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.nodes.distributions.Bernoulli.html">pyjuice.nodes.distributions.Bernoulli</a></li>
 <li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.nodes.distributions.Categorical.html">pyjuice.nodes.distributions.Categorical</a></li>
 <li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.nodes.distributions.DiscreteLogistic.html">pyjuice.nodes.distributions.DiscreteLogistic</a></li>
 <li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.nodes.distributions.Gaussian.html">pyjuice.nodes.distributions.Gaussian</a></li>
 <li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.nodes.distributions.MaskedCategorical.html">pyjuice.nodes.distributions.MaskedCategorical</a></li>
+<li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.nodes.distributions.Literal.html">pyjuice.nodes.distributions.Literal</a></li>
+<li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.nodes.distributions.Indicator.html">pyjuice.nodes.distributions.Indicator</a></li>
+<li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.nodes.distributions.SoftEvidenceCategorical.html">pyjuice.nodes.distributions.SoftEvidenceCategorical</a></li>
+<li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.nodes.distributions.SoftEvidenceIndicator.html">pyjuice.nodes.distributions.SoftEvidenceIndicator</a></li>
+<li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.nodes.distributions.External.html">pyjuice.nodes.distributions.External</a></li>
+<li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.nodes.distributions.ExternProductCategorical.html">pyjuice.nodes.distributions.ExternProductCategorical</a></li>
 </ul>
 </li>
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="tensorcircuit.html">pyjuice.TensorCircuit</a></li>
+<li class="toctree-l1"><a class="reference internal" href="queries.html">pyjuice.queries</a></li>
+<li class="toctree-l1"><a class="reference internal" href="optim.html">pyjuice.optim</a></li>
 <li class="toctree-l1"><a class="reference internal" href="structures.html">pyjuice.structures</a></li>
 </ul>
 
@@ -110,13 +124,16 @@
 <h2>Nodes<a class="headerlink" href="#nodes" title="Link to this heading"></a></h2>
 <table class="autosummary longtable docutils align-default">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="generated/pyjuice.nodes.InputNodes.html#pyjuice.nodes.InputNodes" title="pyjuice.nodes.InputNodes"><code class="xref py py-obj docutils literal notranslate"><span class="pre">InputNodes</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="generated/pyjuice.nodes.CircuitNodes.html#pyjuice.nodes.CircuitNodes" title="pyjuice.nodes.CircuitNodes"><code class="xref py py-obj docutils literal notranslate"><span class="pre">CircuitNodes</span></code></a></p></td>
+<td><p>The base class for a vector (block) of circuit nodes that share the same scope and structure.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="generated/pyjuice.nodes.InputNodes.html#pyjuice.nodes.InputNodes" title="pyjuice.nodes.InputNodes"><code class="xref py py-obj docutils literal notranslate"><span class="pre">InputNodes</span></code></a></p></td>
 <td><p>A class representing vectors of input nodes.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="generated/pyjuice.nodes.ProdNodes.html#pyjuice.nodes.ProdNodes" title="pyjuice.nodes.ProdNodes"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ProdNodes</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="generated/pyjuice.nodes.ProdNodes.html#pyjuice.nodes.ProdNodes" title="pyjuice.nodes.ProdNodes"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ProdNodes</span></code></a></p></td>
 <td><p>A class representing vectors of product nodes.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="generated/pyjuice.nodes.SumNodes.html#pyjuice.nodes.SumNodes" title="pyjuice.nodes.SumNodes"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SumNodes</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="generated/pyjuice.nodes.SumNodes.html#pyjuice.nodes.SumNodes" title="pyjuice.nodes.SumNodes"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SumNodes</span></code></a></p></td>
 <td><p>A class representing vectors of sum nodes.</p></td>
 </tr>
 </tbody>
@@ -131,6 +148,21 @@
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="generated/pyjuice.nodes.foldup_aggregate.html#pyjuice.nodes.foldup_aggregate" title="pyjuice.nodes.foldup_aggregate"><code class="xref py py-obj docutils literal notranslate"><span class="pre">foldup_aggregate</span></code></a></p></td>
 <td><p>Traverse all nodes of a PC bottom-up and aggregate a per-node object.</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="edge-constructors">
+<h2>Edge Constructors<a class="headerlink" href="#edge-constructors" title="Link to this heading"></a></h2>
+<p>Helpers that build structured (block-diagonal or block-sparse) edge patterns, passed as the
+<code class="docutils literal notranslate"><span class="pre">edge_ids</span></code> argument of <a class="reference internal" href="generated/pyjuice.summate.html#pyjuice.summate" title="pyjuice.summate"><code class="xref py py-func docutils literal notranslate"><span class="pre">summate()</span></code></a>.</p>
+<table class="autosummary longtable docutils align-default">
+<tbody>
+<tr class="row-odd"><td><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">edge_constructors.block_diagonal_edge_constructor</span></code></p></td>
+<td><p>An edge constructor that connects sum and child node blocks in a one-to-one (block-diagonal) pattern: the i-th sum node block is connected only to the i-th child node block.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">edge_constructors.block_sparse_rnd_blk_edge_constructor</span></code></p></td>
+<td><p>An edge constructor that connects every sum node block to <cite>num_chs_per_block</cite> randomly chosen child node blocks, yielding a block-sparse (rather than fully-connected) sum layer.</p></td>
 </tr>
 </tbody>
 </table>
@@ -154,6 +186,24 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="generated/pyjuice.nodes.distributions.MaskedCategorical.html#pyjuice.nodes.distributions.MaskedCategorical" title="pyjuice.nodes.distributions.MaskedCategorical"><code class="xref py py-obj docutils literal notranslate"><span class="pre">distributions.MaskedCategorical</span></code></a></p></td>
 <td><p>A class representing Categorical distributions with masks.</p></td>
 </tr>
+<tr class="row-even"><td><p><a class="reference internal" href="generated/pyjuice.nodes.distributions.Literal.html#pyjuice.nodes.distributions.Literal" title="pyjuice.nodes.distributions.Literal"><code class="xref py py-obj docutils literal notranslate"><span class="pre">distributions.Literal</span></code></a></p></td>
+<td><p>A class representing Literal (indicator) distributions.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="generated/pyjuice.nodes.distributions.Indicator.html#pyjuice.nodes.distributions.Indicator" title="pyjuice.nodes.distributions.Indicator"><code class="xref py py-obj docutils literal notranslate"><span class="pre">distributions.Indicator</span></code></a></p></td>
+<td><p>A class representing Indicator distributions.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="generated/pyjuice.nodes.distributions.SoftEvidenceCategorical.html#pyjuice.nodes.distributions.SoftEvidenceCategorical" title="pyjuice.nodes.distributions.SoftEvidenceCategorical"><code class="xref py py-obj docutils literal notranslate"><span class="pre">distributions.SoftEvidenceCategorical</span></code></a></p></td>
+<td><p>A class representing a Categorical distribution that allows external soft evidence.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="generated/pyjuice.nodes.distributions.SoftEvidenceIndicator.html#pyjuice.nodes.distributions.SoftEvidenceIndicator" title="pyjuice.nodes.distributions.SoftEvidenceIndicator"><code class="xref py py-obj docutils literal notranslate"><span class="pre">distributions.SoftEvidenceIndicator</span></code></a></p></td>
+<td><p>A class representing an Indicator distribution that allows external soft evidence.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="generated/pyjuice.nodes.distributions.External.html#pyjuice.nodes.distributions.External" title="pyjuice.nodes.distributions.External"><code class="xref py py-obj docutils literal notranslate"><span class="pre">distributions.External</span></code></a></p></td>
+<td><p>A class representing user-define distributions (PyJuice only processes the incoming log-probabilities).</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="generated/pyjuice.nodes.distributions.ExternProductCategorical.html#pyjuice.nodes.distributions.ExternProductCategorical" title="pyjuice.nodes.distributions.ExternProductCategorical"><code class="xref py py-obj docutils literal notranslate"><span class="pre">distributions.ExternProductCategorical</span></code></a></p></td>
+<td><p>A class representing a product distribution of two Categorical distributions: Pr_{A} * Pr_{B}.</p></td>
+</tr>
 </tbody>
 </table>
 </section>
@@ -164,7 +214,7 @@
           </div>
           <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
         <a href="generated/pyjuice.save.html" class="btn btn-neutral float-left" title="pyjuice.save" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
-        <a href="generated/pyjuice.nodes.InputNodes.html" class="btn btn-neutral float-right" title="pyjuice.nodes.InputNodes" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+        <a href="generated/pyjuice.nodes.CircuitNodes.html" class="btn btn-neutral float-right" title="pyjuice.nodes.CircuitNodes" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
     </div>
 
   <hr/>

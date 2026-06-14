@@ -1,0 +1,6 @@
+﻿pyjuice.queries.conditional
+===========================
+
+.. currentmodule:: pyjuice.queries
+
+.. autofunction:: conditional

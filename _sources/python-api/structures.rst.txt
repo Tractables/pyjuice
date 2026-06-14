@@ -9,5 +9,7 @@ pyjuice.structures
 
     HCLT
     HMM
+    GeneralizedHMM
     RAT_SPN
     PD
+    PDHCLT
