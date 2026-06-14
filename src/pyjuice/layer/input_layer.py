@@ -130,7 +130,9 @@ class InputLayer(Layer, nn.Module):
         except AttributeError:
             self.post_bp_fns = []
 
-        if hasattr(self.dist, "bk_flow_mask_fn"):
+        if hasattr(self.dist, "get_flow_mask_fn"):
+            self.bk_flow_mask_fn = self.dist.get_flow_mask_fn()
+        elif hasattr(self.dist, "bk_flow_mask_fn"):
             self.bk_flow_mask_fn = self.dist.bk_flow_mask_fn
         else:
             self.bk_flow_mask_fn = None
