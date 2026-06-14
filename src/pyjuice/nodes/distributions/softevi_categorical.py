@@ -1010,7 +1010,14 @@ class SoftEvidenceCategorical(Distribution):
             flow_num = tl.load(param_flows_ptr + s_pfids + cat_id, mask = cat_mask, other = 0)
             flow_denom = tl.load(param_flows_ptr + s_pfids + num_cats + cat_id, mask = cat_mask, other = 0)
 
-            flow = param * (flow_num + numerate_pseudocount) / (flow_denom + pseudocount)
+            # MAP M-step (Dirichlet prior): denominator is F- + pseudocount*beta, NOT F- + pseudocount.
+            # This is the multiplicative form of beta = (F+ + pc/K)/(lambda + G-); the pc*beta term
+            # floors never-observed categories (F+=0 => beta settles at (pc/K)/(G-+pc), independent
+            # of beta) so they can't underflow, and reduces exactly to (F+ + pc/K)/(sum F+ + pc) when
+            # p_theta is uniform (F- = beta*Gamma).
+            flow = param * (flow_num + numerate_pseudocount) / (flow_denom + pseudocount * param)
+            # Padding lanes (cat_id >= num_cats) load param/flows as 0 => 0/0 = NaN; zero them out.
+            flow = tl.where(cat_mask, flow, 0.0)
 
             if keep_zero_params:
                 cum_flow += tl.where(param < 1e-12, 0.0, flow)
@@ -1027,7 +1034,13 @@ class SoftEvidenceCategorical(Distribution):
             flow_num = tl.load(param_flows_ptr + s_pfids + cat_id, mask = cat_mask, other = 0)
             flow_denom = tl.load(param_flows_ptr + s_pfids + num_cats + cat_id, mask = cat_mask, other = 0)
 
-            new_param = param * ((1.0 - step_size) + step_size * (flow_num + numerate_pseudocount) / (flow_denom + pseudocount)) / cum_flow
+            new_param = param * ((1.0 - step_size) + step_size * (flow_num + numerate_pseudocount) / (flow_denom + pseudocount * param)) / cum_flow
+
+            # Numerical guard: the MAP denominator self-floors only when F- is computed fresh from
+            # the current beta. Under flow momentum, a stale (larger) F- is divided against a fast-
+            # collapsing beta, so dying categories underflow float32 -> NaN. Clamp far below any real
+            # token probability (~1e-30, ~8 orders above float32 underflow); LL-neutral.
+            new_param = tl.maximum(new_param, 1e-30)
 
             if keep_zero_params:
                 new_param = tl.where(param < 1e-12, 0.0, new_param)
@@ -1054,10 +1067,13 @@ class SoftEvidenceCategorical(Distribution):
             flow_num = tl.load(param_flows_ptr + s_pfids[:,None] + cat_ids[None,:], mask = cat_mask, other = 0)
             flow_denom = tl.load(param_flows_ptr + s_pfids[:,None] + num_cats[:,None] + cat_ids[None,:], mask = cat_mask, other = 0)
 
-            flow = param * (flow_num + numerate_pseudocount[:,None]) / (flow_denom + pseudocount)
+            # MAP M-step (Dirichlet prior): denominator F- + pseudocount*beta (see small_ncats variant).
+            flow = param * (flow_num + numerate_pseudocount[:,None]) / (flow_denom + pseudocount * param)
+            # Padding lanes (cat_id >= num_cats) load param/flows as 0 => 0/0 = NaN; zero them out.
+            flow = tl.where(cat_mask, flow, 0.0)
 
             if keep_zero_params:
-                cum_flow += tl.sum(tl.where(param < 1e-12, 0.0, flow))
+                cum_flow += tl.sum(tl.where(param < 1e-12, 0.0, flow), axis = 1)
             else:
                 cum_flow += tl.sum(flow, axis = 1)
 
@@ -1074,7 +1090,10 @@ class SoftEvidenceCategorical(Distribution):
             flow_num = tl.load(param_flows_ptr + s_pfids[:,None] + cat_ids[None,:], mask = cat_mask, other = 0)
             flow_denom = tl.load(param_flows_ptr + s_pfids[:,None] + num_cats[:,None] + cat_ids[None,:], mask = cat_mask, other = 0)
 
-            new_param = param * ((1.0 - step_size) + step_size * (flow_num + numerate_pseudocount[:,None]) / (flow_denom + pseudocount)) / cum_flow[:,None]
+            new_param = param * ((1.0 - step_size) + step_size * (flow_num + numerate_pseudocount[:,None]) / (flow_denom + pseudocount * param)) / cum_flow[:,None]
+
+            # Numerical guard against momentum-induced underflow (see small_ncats variant).
+            new_param = tl.maximum(new_param, 1e-30)
 
             if keep_zero_params:
                 new_param = tl.where(param < 1e-12, 0.0, new_param)
