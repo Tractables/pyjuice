@@ -14,6 +14,7 @@ PC Creation
     multiply
     summate
     set_block_size
+    structural_properties
 
 PC Structure Transformation
 ---------------------------
@@ -26,6 +27,18 @@ PC Structure Transformation
     blockify
     unblockify
     deepcopy
+
+.. currentmodule:: pyjuice.transformations
+
+.. autosummary::
+    :toctree: generated
+    :nosignatures:
+
+    grow
+    prune_by_score
+    bump_block_size
+
+.. currentmodule:: pyjuice
 
 PC Compilation
 --------------

@@ -65,9 +65,20 @@ def node_iterator(root_ns: CircuitNodes, reverse: bool = False):
 
 
 class CircuitNodes():
+    """
+    The base class for a vector (block) of circuit nodes that share the same scope and structure.
+    Its concrete subclasses are :class:`~pyjuice.nodes.InputNodes`, :class:`~pyjuice.nodes.ProdNodes`,
+    and :class:`~pyjuice.nodes.SumNodes`, which are normally created through the construction helpers
+    :func:`~pyjuice.inputs`, :func:`~pyjuice.multiply`, and :func:`~pyjuice.summate`, respectively.
+
+    A `CircuitNodes` represents `num_node_blocks` blocks of `block_size` nodes each (i.e.,
+    `num_node_blocks * block_size` nodes in total); using `block_size > 1` enables PyJuice's
+    block-based, GPU-friendly representation. Together, a set of connected `CircuitNodes` forms the
+    DAG of a PC, whose root is passed to :func:`~pyjuice.compile`.
+    """
 
     # A list of function that will be called at the end of `__init__`
-    # This should only be changed by context managers, so please do not 
+    # This should only be changed by context managers, so please do not
     # add anything here.
     INIT_CALLBACKS = []
 

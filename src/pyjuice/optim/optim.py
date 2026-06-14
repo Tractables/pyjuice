@@ -7,12 +7,35 @@ from pyjuice.model import TensorCircuit
 
 
 class CircuitOptimizer():
+    """
+    A PyTorch-style optimizer for PCs that wraps PyJuice's parameter-update routines (e.g., EM).
+
+    It mirrors the :class:`torch.optim.Optimizer` API (:func:`zero_grad`, :func:`step`,
+    :func:`state_dict`, :func:`load_state_dict`), so a training loop looks the same as a standard
+    PyTorch loop. An optional `base_optimizer` can be supplied to additionally update any non-PC
+    (e.g., neural network) parameters in the same `step`.
+
+    :param pc: the PC to optimize
+    :type pc: TensorCircuit
+
+    :param base_optimizer: an optional PyTorch optimizer for non-PC parameters, stepped alongside the PC update
+    :type base_optimizer: Optional[torch.optim.Optimizer]
+
+    :param method: the parameter-update method; one of `"EM"`, `"Viterbi"`, or `"GeneralEM"`
+    :type method: str
+
+    :param lr: the step size (learning rate) of the PC parameter update
+    :type lr: float
+
+    :param pseudocount: the Laplace smoothing pseudocount added during the update
+    :type pseudocount: float
+    """
 
     SUPPORTED_OPTIM_METHODS = ["EM", "Viterbi", "GeneralEM"]
 
     def __init__(self, pc: TensorCircuit, base_optimizer: Optional[Optimizer] = None, method: str = "EM", lr: float = 0.1,
                  pseudocount: float = 0.1, **kwargs):
-        
+
         self.pc = pc
 
         self.base_optimizer = base_optimizer

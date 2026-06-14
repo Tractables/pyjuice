@@ -9,6 +9,17 @@ from pyjuice.nodes import CircuitNodes
 
 
 def block_diagonal_edge_constructor(ns0, *args, num_node_blocks: int = 0, block_size: int = 0, **kwargs):
+    """
+    An edge constructor that connects sum and child node blocks in a one-to-one (block-diagonal)
+    pattern: the i-th sum node block is connected only to the i-th child node block. It is meant to be
+    passed as the `edge_ids` argument of :func:`~pyjuice.summate`, and requires the number of sum node
+    blocks to equal the total number of child node blocks.
+
+    :param ns0: the first child node group; additional child node groups are passed as positional arguments
+    :type ns0: CircuitNodes
+
+    :returns: an edge-id tensor of size [2, num_node_blocks], or `None` when `block_size == 1`
+    """
     assert num_node_blocks > 0 and block_size > 0
 
     if block_size == 1:
@@ -29,6 +40,21 @@ def block_diagonal_edge_constructor(ns0, *args, num_node_blocks: int = 0, block_
 
 
 def block_sparse_rnd_blk_edge_constructor(ns0, *args, num_node_blocks: int = 0, block_size: int = 0, num_chs_per_block: int = 0, **kwargs):
+    """
+    An edge constructor that connects every sum node block to `num_chs_per_block` randomly chosen child
+    node blocks, yielding a block-sparse (rather than fully-connected) sum layer. It is meant to be
+    passed as the `edge_ids` argument of :func:`~pyjuice.summate`, and is useful for building large,
+    sparsely-connected PCs. When enough edges are requested, every child block is guaranteed to be
+    connected at least once.
+
+    :param ns0: the first child node group; additional child node groups are passed as positional arguments
+    :type ns0: CircuitNodes
+
+    :param num_chs_per_block: number of child node blocks each sum node block connects to
+    :type num_chs_per_block: int
+
+    :returns: an edge-id tensor describing the sampled sum-to-child block connections, or `None` when `block_size == 1`
+    """
 
     assert num_node_blocks > 0 and block_size > 0
     assert num_chs_per_block > 0

@@ -10,9 +10,36 @@ from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes, foreach
 Tensor = Union[np.ndarray,torch.Tensor]
 
 
-def prune_by_score(root_nodes: CircuitNodes, key: str = "_scores", scores: Optional[Dict[CircuitNodes,Tensor]] = None, 
+def prune_by_score(root_nodes: CircuitNodes, key: str = "_scores", scores: Optional[Dict[CircuitNodes,Tensor]] = None,
                    keep_frac: Optional[float] = None, score_threshold: Optional[float] = None, block_reduction: str = "sum"):
-    
+    """
+    Prune sum-edge connections from a PC based on per-edge scores, returning a new, sparser PC. Edges
+    are kept either by retaining the top `keep_frac` fraction of the highest-scoring edges, or by
+    keeping all edges whose score is at least `score_threshold` (exactly one of the two must be given).
+    Parameter-tied nodes and nodes without scores are left untouched.
+
+    :param root_nodes: the root of the PC to prune
+    :type root_nodes: CircuitNodes
+
+    :param key: the attribute name under which per-node edge scores are stored on each node (used when `scores` is not given)
+    :type key: str
+
+    :param scores: an explicit mapping from nodes to their edge-score tensors; overrides `key` when provided
+    :type scores: Optional[Dict[CircuitNodes, Tensor]]
+
+    :param keep_frac: the fraction of highest-scoring edges to keep; mutually exclusive with `score_threshold`
+    :type keep_frac: Optional[float]
+
+    :param score_threshold: the minimum score for an edge to be kept; mutually exclusive with `keep_frac`
+    :type score_threshold: Optional[float]
+
+    :param block_reduction: how per-edge scores are reduced over a node block when blocks have size > 1 (e.g., `"sum"`)
+    :type block_reduction: str
+
+    :returns: a new PC with the low-scoring edges removed
+    :rtype: CircuitNodes
+    """
+
     # Traverse all nodes to collect scores
     score_ranges = dict()
     score_start = 0
