@@ -112,6 +112,9 @@ class Distribution():
         """
         return self.em_fn if hasattr(self, "em_fn") else None
 
+    def set_custom_kernel_kwargs(self, kwargs):
+        pass
+
     @staticmethod
     def fw_mar_fn(*args, **kwargs):
         """

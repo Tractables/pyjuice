@@ -85,7 +85,7 @@ def _prep_args_apply_fw_kernel(layer, kwargs):
 
 
 def _condition_apply_bk_params_kernel(layer, kwargs):
-    return "categorical_evidence_logp" in kwargs
+    return "categorical_evidence_logp" in kwargs and not kwargs["dual_flow_backward"]
 
 
 def _prep_args_apply_bk_params_kernel(layer, kwargs):
@@ -124,7 +124,8 @@ def _prep_args_apply_bk_params_kernel(layer, kwargs):
 
 
 def _condition_apply_bk_softevi_kernel(layer, kwargs):
-    return "categorical_evidence_logp" in kwargs and "categorical_evidence_logp_grad" in kwargs
+    return "categorical_evidence_logp" in kwargs and \
+        ("categorical_evidence_logp_grad" in kwargs or kwargs["dual_flow_backward"])
 
 
 def _prep_args_apply_bk_softevi_kernel(layer, kwargs):
@@ -141,10 +142,18 @@ def _prep_args_apply_bk_softevi_kernel(layer, kwargs):
     num_cats = categorical_evidence_logp.size(2)
     target_kwargs["num_cats"] = num_cats
 
-    categorical_evidence_logp_grad = kwargs["categorical_evidence_logp_grad"]
-    assert categorical_evidence_logp_grad.size(0) == batch_size
-    assert categorical_evidence_logp_grad.size(1) == ext_num_vars
-    assert categorical_evidence_logp_grad.size(2) == num_cats
+    # Full (distribution) num_cats = the width of one param-flow phase. With top-k soft
+    # evidence, `num_cats` above is the top-k tile width (< V_full); the F- (denominator)
+    # phase of the dual-flow buffer starts at offset V_full, NOT at the top-k width.
+    target_kwargs["tot_num_cats"] = layer.nodes[0].dist.num_cats
+
+    if "categorical_evidence_logp_grad" in kwargs:
+        categorical_evidence_logp_grad = kwargs["categorical_evidence_logp_grad"]
+        assert categorical_evidence_logp_grad.size(0) == batch_size
+        assert categorical_evidence_logp_grad.size(1) == ext_num_vars
+        assert categorical_evidence_logp_grad.size(2) == num_cats
+    else:
+        categorical_evidence_logp_grad = None
 
     target_kwargs["categorical_evidence_logp_ptr"] = categorical_evidence_logp
     target_kwargs["categorical_evidence_logp_grad_ptr"] = categorical_evidence_logp_grad
@@ -190,6 +199,10 @@ def _prep_args_apply_bk_softevi_kernel(layer, kwargs):
     target_kwargs["BLOCK_SIZE_N"] = BLOCK_SIZE_N
     target_kwargs["use_tensor_core"] = use_tensor_core
 
+    # Whether to update `pflow` and `extflow`
+    target_kwargs["update_pflows"] = kwargs["dual_flow_backward"]
+    target_kwargs["update_extflows"] = ("categorical_evidence_logp_grad" in kwargs)
+
     return target_kwargs, grid
 
 
@@ -229,7 +242,7 @@ class SoftEvidenceCategorical(Distribution):
     :param num_cats: number of categories
     :type num_cats: int
     """
-    def __init__(self, num_cats: int):
+    def __init__(self, num_cats: int, _dual_flow_backward: bool = True):
         super(SoftEvidenceCategorical, self).__init__()
 
         self.num_cats = num_cats
@@ -246,6 +259,8 @@ class SoftEvidenceCategorical(Distribution):
         self.sampling_fns = [
             (self.sample_kernel, _condition_sample_kernel, _prep_args_sample_kernel)
         ]
+
+        self._dual_flow_backward = _dual_flow_backward
 
     def get_signature(self):
         """
@@ -275,7 +290,7 @@ class SoftEvidenceCategorical(Distribution):
         """
         The number of parameter flows per node.
         """
-        return self.num_cats
+        return self.num_cats * 2 if self._dual_flow_backward else self.num_cats
 
     def init_parameters(self, num_nodes: int, perturbation: float = 2.0, params: Optional[Any] = None, **kwargs):
         """
@@ -299,11 +314,27 @@ class SoftEvidenceCategorical(Distribution):
         return torch.long
 
     def get_em_fn(self):
-        if self.num_cats <= 256:
-            return self.small_ncats_em_fn
+        if self._dual_flow_backward:
+            if self.num_cats <= 256:
+                return self.small_ncats_dual_em_fn
+            else:
+                self.em_block_size = 8
+                return self.large_ncats_dual_em_fn
         else:
-            self.em_block_size = 8
-            return self.large_ncats_em_fn
+            if self.num_cats <= 256:
+                return self.small_ncats_em_fn
+            else:
+                self.em_block_size = 8
+                return self.large_ncats_em_fn
+
+    def get_flow_mask_fn(self):
+        if self._dual_flow_backward:
+            return self.bk_dual_flow_mask_fn
+        else:
+            return self.bk_flow_mask_fn
+
+    def set_custom_kernel_kwargs(self, kwargs):
+        kwargs["dual_flow_backward"] = self._dual_flow_backward
 
     @staticmethod
     @triton_jit
@@ -436,8 +467,8 @@ class SoftEvidenceCategorical(Distribution):
                 # Load the category IDs from `soft_evidence_cat_ids`
                 catids = tl.load(catids_ptr + i * TILE_SIZE_K, mask = (mask_b[:,None] & mask_c[None,:]), other = 0) # [BLOCK_SIZE_B, TILE_SIZE_K]
 
-                # Find matching ids
-                is_match = (catids == data[:,None]).to(tl.int64) # [BLOCK_SIZE_B, TILE_SIZE_K]
+                # Find matching ids (mask out padding categories so they can't spuriously match `data == 0`)
+                is_match = ((catids == data[:,None]) & mask_c[None,:]).to(tl.int64) # [BLOCK_SIZE_B, TILE_SIZE_K]
                 match_ids = tl.sum(is_match * tl.arange(0, TILE_SIZE_K), axis = 1) # [BLOCK_SIZE_B]
                 has_match = (tl.sum(is_match, axis = 1) > 0) # [BLOCK_SIZE_B]
 
@@ -503,8 +534,8 @@ class SoftEvidenceCategorical(Distribution):
                           bk_local_ids_ptr, layer_num_nodes, batch_size, num_vars_per_node: tl.constexpr, num_vars: tl.constexpr, nv_block_size: tl.constexpr,
                           node_offset, partial_eval: tl.constexpr, logspace_flows: tl.constexpr, BLOCK_SIZE_B: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, 
                           TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, use_tensor_core: tl.constexpr,
-                          categorical_evidence_logp_ptr, soft_evidence_cat_ids_ptr, categorical_evidence_logp_grad_ptr, var_idmapping_ptr, 
-                          num_cats: tl.constexpr, ext_num_vars: tl.constexpr, has_ext_ids: tl.constexpr):
+                          categorical_evidence_logp_ptr, soft_evidence_cat_ids_ptr, categorical_evidence_logp_grad_ptr, var_idmapping_ptr,
+                          num_cats: tl.constexpr, tot_num_cats: tl.constexpr, ext_num_vars: tl.constexpr, has_ext_ids: tl.constexpr, update_pflows: tl.constexpr, update_extflows: tl.constexpr):
         
         pid_b = tl.program_id(axis = 0)
         pid_n = tl.program_id(axis = 1)
@@ -551,6 +582,13 @@ class SoftEvidenceCategorical(Distribution):
         # Compute unnormalized logprobs & backprop the "nominator" parts of the gradients
         data = tl.load(data_ptr + vid * batch_size + offsets_b, mask = mask_b, other = 0) # [BLOCK_SIZE_B]
 
+        # Update the numerater part of `pflow` if required
+        if update_pflows:
+            # Get start parameter flow indices
+            s_pfids = tl.load(s_pfids_ptr + offsets_n, mask = mask_n, other = 0) # [BLOCK_SIZE_N]
+
+            tl.atomic_add(param_flows_ptr + s_pfids[None,:] + data[:,None], nflows, mask = (mask_b[:,None] & mask_n[None,:]))
+
         if has_ext_ids:
             # Ptrs pointing to external parameter indices
             catids_ptr = soft_evidence_cat_ids_ptr + \
@@ -564,9 +602,10 @@ class SoftEvidenceCategorical(Distribution):
                 lvid * num_cats # [BLOCK_SIZE_B]
 
             # Ptrs pointing to external parameter gradients
-            expar_grad_ptr = categorical_evidence_logp_grad_ptr + \
-                offsets_b * (ext_num_vars * num_cats) + \
-                lvid * num_cats # [BLOCK_SIZE_B]
+            if update_extflows:
+                expar_grad_ptr = categorical_evidence_logp_grad_ptr + \
+                    offsets_b * (ext_num_vars * num_cats) + \
+                    lvid * num_cats # [BLOCK_SIZE_B]
 
             log_ex_p = tl.zeros([BLOCK_SIZE_B], dtype = tl.float32) - float("inf")
             for i in range(K_NUM_TILES):
@@ -575,8 +614,8 @@ class SoftEvidenceCategorical(Distribution):
                 # Load the category IDs from `soft_evidence_cat_ids`
                 catids = tl.load(catids_ptr + i * TILE_SIZE_K, mask = (mask_b[:,None] & mask_c[None,:]), other = 0) # [BLOCK_SIZE_B, TILE_SIZE_K]
 
-                # Find matching ids
-                is_match = (catids == data[:,None]).to(tl.int64) # [BLOCK_SIZE_B, TILE_SIZE_K]
+                # Find matching ids (mask out padding categories so they can't spuriously match `data == 0`)
+                is_match = ((catids == data[:,None]) & mask_c[None,:]).to(tl.int64) # [BLOCK_SIZE_B, TILE_SIZE_K]
                 match_ids = tl.sum(is_match * tl.arange(0, TILE_SIZE_K), axis = 1) # [BLOCK_SIZE_B]
                 has_match = (tl.sum(is_match, axis = 1) > 0) # [BLOCK_SIZE_B]
 
@@ -584,8 +623,9 @@ class SoftEvidenceCategorical(Distribution):
                 expar = tl.load(expar_ptr + i * TILE_SIZE_K + match_ids, mask = (mask_b & has_match), other = 0.0) # [BLOCK_SIZE_B]
                 log_ex_p = tl.where(has_match, expar, log_ex_p)
 
-                # Accumulate gradients
-                tl.atomic_add(expar_grad_ptr + i * TILE_SIZE_K + match_ids, tl.sum(nflows, axis = 1), mask = (mask_b & has_match)) # [BLOCK_SIZE_B]
+                # Accumulate gradients for `extflow`
+                if update_extflows:
+                    tl.atomic_add(expar_grad_ptr + i * TILE_SIZE_K + match_ids, tl.sum(nflows, axis = 1), mask = (mask_b & has_match)) # [BLOCK_SIZE_B]
 
         else:
             ex_p_ptr = categorical_evidence_logp_ptr + \
@@ -595,21 +635,23 @@ class SoftEvidenceCategorical(Distribution):
             log_ex_p = tl.load(ex_p_ptr, mask = mask_b, other = 0.0) # [BLOCK_SIZE_B]
 
             # Accumulate gradients
-            unnorm_ll_grad_ptr = categorical_evidence_logp_grad_ptr + \
-                offsets_b * (ext_num_vars * num_cats) + \
-                lvid * num_cats + \
-                data
-            tl.atomic_add(unnorm_ll_grad_ptr, tl.sum(nflows, axis = 1), mask = mask_b)
+            if update_extflows:
+                unnorm_ll_grad_ptr = categorical_evidence_logp_grad_ptr + \
+                    offsets_b * (ext_num_vars * num_cats) + \
+                    lvid * num_cats + \
+                    data
+                tl.atomic_add(unnorm_ll_grad_ptr, tl.sum(nflows, axis = 1), mask = mask_b)
 
         # Retrieve logZ
         log_in_p = tl.load(params_ptr + s_pids[None,:] + data[:,None], mask = (mask_b[:,None] & mask_n[None,:]), other = 0.0).log() # [BLOCK_SIZE_B, BLOCK_SIZE_N]
         logZ = log_in_p + log_ex_p[:,None] - nmars # [BLOCK_SIZE_B, BLOCK_SIZE_N]
 
         # Ptrs pointing to external parameter gradients
-        expars_grad_ptr = categorical_evidence_logp_grad_ptr + \
-            offsets_b[:,None] * (ext_num_vars * num_cats) + \
-            lvid * num_cats + \
-            tl.arange(0, TILE_SIZE_K)[None,:] # [BLOCK_SIZE_B, TILE_SIZE_K]
+        if update_extflows:
+            expars_grad_ptr = categorical_evidence_logp_grad_ptr + \
+                offsets_b[:,None] * (ext_num_vars * num_cats) + \
+                lvid * num_cats + \
+                tl.arange(0, TILE_SIZE_K)[None,:] # [BLOCK_SIZE_B, TILE_SIZE_K]
 
         # Backprop the "denominator" parts of the gradients
         if has_ext_ids:
@@ -635,14 +677,20 @@ class SoftEvidenceCategorical(Distribution):
                 # Load the external parameters
                 expars = tl.load(expars_ptr + i * TILE_SIZE_K, mask = (mask_b[:,None] & mask_c[None,:]), other = 0.0) # [BLOCK_SIZE_B, TILE_SIZE_K]
 
-                ve_grads = (nflows.log() - logZ)[:,None,:] + inpars.log() # [BLOCK_SIZE_B, TILE_SIZE_K, BLOCK_SIZE_N]
-                ve_grads_max = tl.max(ve_grads, axis = 2)
-                ve_grads_sub = tl.exp(ve_grads - ve_grads_max[:,:,None])
-                cum_ve_grads = tl.sum(ve_grads_sub, axis = 2).log() + ve_grads_max # [BLOCK_SIZE_B, TILE_SIZE_K]
+                if update_pflows:
+                    vp_grads = (nflows.log() - logZ)[:,None,:] + inpars.log() + expars[:,:,None] # [BLOCK_SIZE_B, TILE_SIZE_K, BLOCK_SIZE_N]
 
-                expars_grad = cum_ve_grads + expars
+                    tl.atomic_add(param_flows_ptr + tot_num_cats + s_pfids[None,None,:] + catids[:,:,None], tl.exp(vp_grads), mask = (mask_b[:,None,None] & mask_n[None,None,:]))
 
-                tl.atomic_add(expars_grad_ptr + i * TILE_SIZE_K, -tl.exp(expars_grad), mask = (mask_b[:,None] & mask_c[None,:]))
+                if update_extflows:
+                    ve_grads = (nflows.log() - logZ)[:,None,:] + inpars.log() # [BLOCK_SIZE_B, TILE_SIZE_K, BLOCK_SIZE_N]
+                    ve_grads_max = tl.max(ve_grads, axis = 2)
+                    ve_grads_sub = tl.exp(ve_grads - ve_grads_max[:,:,None])
+                    cum_ve_grads = tl.sum(ve_grads_sub, axis = 2).log() + ve_grads_max # [BLOCK_SIZE_B, TILE_SIZE_K]
+
+                    expars_grad = cum_ve_grads + expars
+
+                    tl.atomic_add(expars_grad_ptr + i * TILE_SIZE_K, -tl.exp(expars_grad), mask = (mask_b[:,None] & mask_c[None,:]))
 
         else:
             # Ptrs pointing to internal parameters
@@ -655,12 +703,19 @@ class SoftEvidenceCategorical(Distribution):
                     tl.arange(0, TILE_SIZE_K)[:,None] + \
                     s_pids[None,:] # [TILE_SIZE_K, BLOCK_SIZE_N]
 
-            nflow_sub_logz = nflows.log() - logZ # [BLOCK_SIZE_B, BLOCK_SIZE_N]
-            nflow_sub_logz_max = tl.max(nflow_sub_logz, axis = 1)[:,None]
-            nflow_sub_logz_sub = tl.exp(nflow_sub_logz - nflow_sub_logz_max)
+            if update_pflows:
+                nflow_sub_logz_p = tl.trans(nflows.log() - logZ) # [BLOCK_SIZE_N, BLOCK_SIZE_B]
+                nflow_sub_logz_p_max = tl.max(nflow_sub_logz_p, axis = 1)[:,None]
+                nflow_sub_logz_p_sub = tl.exp(nflow_sub_logz_p - nflow_sub_logz_p_max)
+
+            if update_extflows:
+                nflow_sub_logz = nflows.log() - logZ # [BLOCK_SIZE_B, BLOCK_SIZE_N]
+                nflow_sub_logz_max = tl.max(nflow_sub_logz, axis = 1)[:,None]
+                nflow_sub_logz_sub = tl.exp(nflow_sub_logz - nflow_sub_logz_max)
 
             for i in range(K_NUM_TILES):
-                mask_c = (i * TILE_SIZE_K + tl.arange(0, TILE_SIZE_K) < num_cats) # [TILE_SIZE_K]
+                offsets_c = (i * TILE_SIZE_K + tl.arange(0, TILE_SIZE_K))
+                mask_c = (offsets_c < num_cats) # [TILE_SIZE_K]
 
                 # Load the internal parameters
                 if use_tensor_core:
@@ -671,12 +726,25 @@ class SoftEvidenceCategorical(Distribution):
                 # Load the external parameters
                 expars = tl.load(expars_ptr + i * TILE_SIZE_K, mask = (mask_b[:,None] & mask_c[None,:]), other = 0.0) # [BLOCK_SIZE_B, TILE_SIZE_K]
 
-                if use_tensor_core:
-                    expars_grad = tl.dot(nflow_sub_logz_sub, inpars).log() + nflow_sub_logz_max + expars
-                else:
-                    expars_grad = tl.sum(nflow_sub_logz_sub[:,None,:] * inpars[None,:,:], axis = 2).log() + nflow_sub_logz_max + expars
+                if update_pflows:
+                    if use_tensor_core:
+                        expars_max = tl.max(expars, axis = 0)[None,:]
+                        expars_sub = tl.exp(expars - expars_max)
+                        pars_grad = tl.dot(nflow_sub_logz_p_sub, expars_sub) + inpars.log() + nflow_sub_logz_p_max + expars_max
+                    else:
+                        expars_max = tl.max(expars, axis = 0)
+                        expars_sub = tl.exp(tl.trans(expars) - expars_max[:,None]) # [TILE_SIZE_K, BLOCK_SIZE_B]
+                        pars_grad = tl.sum(nflow_sub_logz_p_sub[:,None,:] * expars_sub[None,:,:], axis = 2).log() + tl.trans(inpars).log() + nflow_sub_logz_p_max + expars_max[None,:]
 
-                tl.atomic_add(expars_grad_ptr + i * TILE_SIZE_K, -tl.exp(expars_grad), mask = (mask_b[:,None] & mask_c[None,:]))
+                    tl.atomic_add(param_flows_ptr + tot_num_cats + s_pfids[:,None] + offsets_c[None,:], tl.exp(pars_grad), mask = (mask_n[:,None] & mask_c[None,:]))
+
+                if update_extflows:
+                    if use_tensor_core:
+                        expars_grad = tl.dot(nflow_sub_logz_sub, inpars).log() + nflow_sub_logz_max + expars
+                    else:
+                        expars_grad = tl.sum(nflow_sub_logz_sub[:,None,:] * inpars[None,:,:], axis = 2).log() + nflow_sub_logz_max + expars
+
+                    tl.atomic_add(expars_grad_ptr + i * TILE_SIZE_K, -tl.exp(expars_grad), mask = (mask_b[:,None] & mask_c[None,:]))
 
     @staticmethod
     @triton_jit
@@ -763,7 +831,78 @@ class SoftEvidenceCategorical(Distribution):
     @staticmethod
     def bk_flow_mask_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
                         s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE, TILE_SIZE_K):
-        pass
+        # Get `num_cats` from `metadata`
+        s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
+        num_cats = tl.load(metadata_ptr + s_mids, mask = mask, other = 0).to(tl.int64)
+
+        max_num_cats = tl.max(num_cats, axis = 0)
+
+        if TILE_SIZE_K > 1:
+            num_iters = tlmath.ceil(max_num_cats / TILE_SIZE_K).to(tl.int64)
+
+            cat_ids = tl.arange(0, TILE_SIZE_K)
+
+            for i in range(num_iters):
+                cat_mask = mask[:,None] & missing_mask[:,None] & (cat_ids[None,:] < num_cats[:,None])
+
+                p_offsets = s_pids[:,None] + cat_ids[None,:]
+                param = tl.load(params_ptr + p_offsets, mask = cat_mask, other = 0)
+
+                pf_offsets = s_pfids[:,None] + cat_ids[None,:]
+                tl.atomic_add(param_flows_ptr + pf_offsets, flows[:,None] * param, mask = cat_mask)
+
+                cat_ids += TILE_SIZE_K
+        else:
+            for cat_id in range(max_num_cats):
+                cat_mask = mask & missing_mask & (cat_id < num_cats)
+
+                p_offsets = s_pids + cat_id
+                param = tl.load(params_ptr + p_offsets, mask = cat_mask, other = 0)
+
+                pf_offsets = s_pfids + cat_id
+                tl.atomic_add(param_flows_ptr + pf_offsets, flows * param, mask = cat_mask)
+
+    @staticmethod
+    def bk_dual_flow_mask_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr,
+                             s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE, TILE_SIZE_K):
+        # Get `num_cats` from `metadata`
+        s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
+        num_cats = tl.load(metadata_ptr + s_mids, mask = mask, other = 0).to(tl.int64)
+
+        max_num_cats = tl.max(num_cats, axis = 0)
+
+        if TILE_SIZE_K > 1:
+            num_iters = tlmath.ceil(max_num_cats / TILE_SIZE_K).to(tl.int64)
+
+            cat_ids = tl.arange(0, TILE_SIZE_K)
+
+            for i in range(num_iters):
+                cat_mask = mask[:,None] & missing_mask[:,None] & (cat_ids[None,:] < num_cats[:,None])
+
+                p_offsets = s_pids[:,None] + cat_ids[None,:]
+                param = tl.load(params_ptr + p_offsets, mask = cat_mask, other = 0)
+
+                # Anchor = (scale·)TD·β, already carrying `scale=(1-step_size)` via `flows`.
+                # Add the SAME anchor to both phases so ratio -> 1 at s=0 (no update).
+                anchor = flows[:,None] * param
+
+                pf_offsets = s_pfids[:,None] + cat_ids[None,:]
+                tl.atomic_add(param_flows_ptr + pf_offsets,                    anchor, mask = cat_mask)  # F⁺
+                tl.atomic_add(param_flows_ptr + pf_offsets + num_cats[:,None], anchor, mask = cat_mask)  # F⁻
+
+                cat_ids += TILE_SIZE_K
+        else:
+            for cat_id in range(max_num_cats):
+                cat_mask = mask & missing_mask & (cat_id < num_cats)
+
+                p_offsets = s_pids + cat_id
+                param = tl.load(params_ptr + p_offsets, mask = cat_mask, other = 0)
+
+                anchor = flows * param
+
+                pf_offsets = s_pfids + cat_id
+                tl.atomic_add(param_flows_ptr + pf_offsets,            anchor, mask = cat_mask)  # F⁺
+                tl.atomic_add(param_flows_ptr + pf_offsets + num_cats, anchor, mask = cat_mask)  # F⁻
 
     @staticmethod
     def sample_fn(samples_ptr, local_offsets, batch_offsets, vids, s_pids, params_ptr, metadata_ptr, s_mids_ptr, mask, batch_size, BLOCK_SIZE, seed):
@@ -852,8 +991,119 @@ class SoftEvidenceCategorical(Distribution):
 
             cat_ids += 128
 
+    @staticmethod
+    def small_ncats_dual_em_fn(local_offsets, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, s_mids_ptr, mask,
+                               step_size, pseudocount, BLOCK_SIZE):
+        # Get `num_cats` from `metadata`
+        s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
+        num_cats = tl.load(metadata_ptr + s_mids, mask = mask, other = 0).to(tl.int64)
+
+        max_num_cats = tl.max(num_cats, axis = 0)
+
+        # Compute cumulative flows
+        numerate_pseudocount = pseudocount / num_cats
+        cum_flow = tl.zeros([BLOCK_SIZE], dtype = tl.float32)
+        for cat_id in range(max_num_cats):
+            cat_mask = mask & (cat_id < num_cats)
+
+            param = tl.load(params_ptr + s_pids + cat_id, mask = cat_mask, other = 0)
+            flow_num = tl.load(param_flows_ptr + s_pfids + cat_id, mask = cat_mask, other = 0)
+            flow_denom = tl.load(param_flows_ptr + s_pfids + num_cats + cat_id, mask = cat_mask, other = 0)
+
+            # MAP M-step (Dirichlet prior): denominator is F- + pseudocount*beta, NOT F- + pseudocount.
+            # This is the multiplicative form of beta = (F+ + pc/K)/(lambda + G-); the pc*beta term
+            # floors never-observed categories (F+=0 => beta settles at (pc/K)/(G-+pc), independent
+            # of beta) so they can't underflow, and reduces exactly to (F+ + pc/K)/(sum F+ + pc) when
+            # p_theta is uniform (F- = beta*Gamma).
+            flow = param * (flow_num + numerate_pseudocount) / (flow_denom + pseudocount * param)
+            # Padding lanes (cat_id >= num_cats) load param/flows as 0 => 0/0 = NaN; zero them out.
+            flow = tl.where(cat_mask, flow, 0.0)
+
+            if keep_zero_params:
+                cum_flow += tl.where(param < 1e-12, 0.0, flow)
+            else:
+                cum_flow += flow
+
+        cum_flow = (1.0 - step_size) + step_size * cum_flow
+
+        # Parameter update
+        for cat_id in range(max_num_cats):
+            cat_mask = mask & (cat_id < num_cats)
+
+            param = tl.load(params_ptr + s_pids + cat_id, mask = cat_mask, other = 0)
+            flow_num = tl.load(param_flows_ptr + s_pfids + cat_id, mask = cat_mask, other = 0)
+            flow_denom = tl.load(param_flows_ptr + s_pfids + num_cats + cat_id, mask = cat_mask, other = 0)
+
+            new_param = param * ((1.0 - step_size) + step_size * (flow_num + numerate_pseudocount) / (flow_denom + pseudocount * param)) / cum_flow
+
+            # Numerical guard: the MAP denominator self-floors only when F- is computed fresh from
+            # the current beta. Under flow momentum, a stale (larger) F- is divided against a fast-
+            # collapsing beta, so dying categories underflow float32 -> NaN. Clamp far below any real
+            # token probability (~1e-30, ~8 orders above float32 underflow); LL-neutral.
+            new_param = tl.maximum(new_param, 1e-30)
+
+            if keep_zero_params:
+                new_param = tl.where(param < 1e-12, 0.0, new_param)
+
+            tl.store(params_ptr + s_pids + cat_id, new_param, mask = cat_mask)
+
+    @staticmethod
+    def large_ncats_dual_em_fn(local_offsets, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, s_mids_ptr, mask,
+                               step_size, pseudocount, BLOCK_SIZE):
+        # Get `num_cats` from `metadata`
+        s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
+        num_cats = tl.load(metadata_ptr + s_mids, mask = mask, other = 0).to(tl.int64)
+
+        max_num_cats = tl.max(num_cats, axis = 0)
+
+        # Compute cumulative flows
+        numerate_pseudocount = pseudocount / num_cats
+        cum_flow = tl.zeros([BLOCK_SIZE], dtype = tl.float32)
+        cat_ids = tl.arange(0, 128)
+        for cat_sid in range(0, max_num_cats, 128):
+            cat_mask = mask[:,None] & (cat_ids[None,:] < num_cats[:,None])
+
+            param = tl.load(params_ptr + s_pids[:,None] + cat_ids[None,:], mask = cat_mask, other = 0)
+            flow_num = tl.load(param_flows_ptr + s_pfids[:,None] + cat_ids[None,:], mask = cat_mask, other = 0)
+            flow_denom = tl.load(param_flows_ptr + s_pfids[:,None] + num_cats[:,None] + cat_ids[None,:], mask = cat_mask, other = 0)
+
+            # MAP M-step (Dirichlet prior): denominator F- + pseudocount*beta (see small_ncats variant).
+            flow = param * (flow_num + numerate_pseudocount[:,None]) / (flow_denom + pseudocount * param)
+            # Padding lanes (cat_id >= num_cats) load param/flows as 0 => 0/0 = NaN; zero them out.
+            flow = tl.where(cat_mask, flow, 0.0)
+
+            if keep_zero_params:
+                cum_flow += tl.sum(tl.where(param < 1e-12, 0.0, flow), axis = 1)
+            else:
+                cum_flow += tl.sum(flow, axis = 1)
+
+            cat_ids += 128
+
+        cum_flow = (1.0 - step_size) + step_size * cum_flow
+
+        # Parameter update
+        cat_ids = tl.arange(0, 128)
+        for cat_sid in range(0, max_num_cats, 128):
+            cat_mask = mask[:,None] & (cat_ids[None,:] < num_cats[:,None])
+
+            param = tl.load(params_ptr + s_pids[:,None] + cat_ids[None,:], mask = cat_mask, other = 0)
+            flow_num = tl.load(param_flows_ptr + s_pfids[:,None] + cat_ids[None,:], mask = cat_mask, other = 0)
+            flow_denom = tl.load(param_flows_ptr + s_pfids[:,None] + num_cats[:,None] + cat_ids[None,:], mask = cat_mask, other = 0)
+
+            new_param = param * ((1.0 - step_size) + step_size * (flow_num + numerate_pseudocount[:,None]) / (flow_denom + pseudocount * param)) / cum_flow[:,None]
+
+            # Numerical guard against momentum-induced underflow (see small_ncats variant).
+            new_param = tl.maximum(new_param, 1e-30)
+
+            if keep_zero_params:
+                new_param = tl.where(param < 1e-12, 0.0, new_param)
+
+            tl.store(params_ptr + s_pids[:,None] + cat_ids[None,:], new_param, mask = cat_mask)
+
+            cat_ids += 128
+
     def _get_constructor(self):
-        return SoftEvidenceCategorical, {"num_cats": self.num_cats}
+        return SoftEvidenceCategorical, {"num_cats": self.num_cats, "_dual_flow_backward": self._dual_flow_backward}
 
     def __reduce__(self):
-        return (self.__class__, (self.num_cats,))
+        return (self.__class__, (self.num_cats, self._dual_flow_backward))
