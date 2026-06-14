@@ -423,12 +423,72 @@ def test_soft_evidence_categorical_dist_dual_flow_filtered():
     assert torch.all(torch.abs(pflows_denom - my_pflows_denom) < 1e-5)
 
 
+def test_soft_evidence_categorical_dist_dual_flow_em():
+
+    device = torch.device("cuda:0")
+
+    batch_size = 64
+    num_vars = 32
+
+    for num_cats in [256, 2381]:
+
+        # Construct PC
+        nis = [
+            juice.inputs(v, num_nodes = 1, dist = dists.SoftEvidenceCategorical(num_cats = num_cats, _dual_flow_backward = True)) for v in range(num_vars)
+        ]
+
+        np = juice.multiply(*nis)
+        ns = juice.summate(np, num_nodes = 1)
+
+        ns.init_parameters(perturbation = 2.0)
+
+        pc = juice.compile(ns)
+        pc.to(device)
+
+        # Inputs
+        data = torch.randint(0, num_cats, [batch_size, num_vars], device = device)
+        logits = torch.rand([batch_size, num_vars, num_cats], device = device) * 2 - 1
+
+        # Compute groundtruth
+        logits.requires_grad = True
+        logits.retain_grad()
+        logps = torch.log_softmax(logits, dim = 2)
+        target_lls = logps.gather(2, data.unsqueeze(2)).squeeze(2).sum(dim = 1)
+
+        target_lls.sum().backward()
+        target_logits_grad = logits.grad
+
+        lls = pc(
+            data,
+            categorical_evidence_logp = logits
+        )
+
+        logits_grad = torch.zeros_like(logits)
+
+        pc.backward(
+            data, allow_modify_flows = False, logspace_flows = True,
+            categorical_evidence_logp = logits,
+            categorical_evidence_logp_grad = logits_grad
+        )
+
+        pc.mini_batch_em(step_size = 0.1, pseudocount = 1e-6)
+
+        input_layer = pc.input_layer_group[0]
+        params = input_layer.params.reshape(num_vars, num_cats)
+
+        # assert torch.all(torch.abs(params.sum(dim = 1) - 1.0) < 1e-6)
+
+        import pdb; pdb.set_trace()
+        a = 3
+
+
 if __name__ == "__main__":
     torch.manual_seed(4343442)
     torch.cuda.manual_seed(5434)
-    test_soft_evidence_categorical_dist()
-    test_soft_evidence_categorical_dist_varied()
-    test_soft_evidence_categorical_dist_multi_nodes()
-    test_soft_evidence_categorical_dist_sample()
-    test_soft_evidence_categorical_dist_dual_flow()
-    test_soft_evidence_categorical_dist_dual_flow_filtered()
+    # test_soft_evidence_categorical_dist()
+    # test_soft_evidence_categorical_dist_varied()
+    # test_soft_evidence_categorical_dist_multi_nodes()
+    # test_soft_evidence_categorical_dist_sample()
+    # test_soft_evidence_categorical_dist_dual_flow()
+    # test_soft_evidence_categorical_dist_dual_flow_filtered()
+    test_soft_evidence_categorical_dist_dual_flow_em()
