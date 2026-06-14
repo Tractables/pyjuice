@@ -309,11 +309,18 @@ class SoftEvidenceCategorical(Distribution):
         return torch.long
 
     def get_em_fn(self):
-        if self.num_cats <= 256:
-            return self.small_ncats_em_fn
+        if self._dual_flow_backward:
+            if self.num_cats <= 256:
+                return self.small_ncats_dual_em_fn
+            else:
+                self.em_block_size = 8
+                return self.large_ncats_dual_em_fn
         else:
-            self.em_block_size = 8
-            return self.large_ncats_em_fn
+            if self.num_cats <= 256:
+                return self.small_ncats_em_fn
+            else:
+                self.em_block_size = 8
+                return self.large_ncats_em_fn
 
     def set_custom_kernel_kwargs(self, kwargs):
         kwargs["dual_flow_backward"] = self._dual_flow_backward
@@ -898,6 +905,98 @@ class SoftEvidenceCategorical(Distribution):
                 new_param = tl.where(param < 1e-12, 0.0, new_param)
             else:
                 new_param = (1.0 - step_size) * param + step_size * (flow + numerate_pseudocount[:,None]) / cum_flow[:,None]
+            tl.store(params_ptr + s_pids[:,None] + cat_ids[None,:], new_param, mask = cat_mask)
+
+            cat_ids += 128
+
+    @staticmethod
+    def small_ncats_dual_em_fn(local_offsets, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, s_mids_ptr, mask,
+                               step_size, pseudocount, BLOCK_SIZE):
+        # Get `num_cats` from `metadata`
+        s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
+        num_cats = tl.load(metadata_ptr + s_mids, mask = mask, other = 0).to(tl.int64)
+
+        max_num_cats = tl.max(num_cats, axis = 0)
+
+        # Compute cumulative flows
+        numerate_pseudocount = pseudocount / num_cats
+        cum_flow = tl.zeros([BLOCK_SIZE], dtype = tl.float32)
+        for cat_id in range(max_num_cats):
+            cat_mask = mask & (cat_id < num_cats)
+
+            param = tl.load(params_ptr + s_pids + cat_id, mask = cat_mask, other = 0)
+            flow_num = tl.load(param_flows_ptr + s_pfids + cat_id, mask = cat_mask, other = 0)
+            flow_denom = tl.load(param_flows_ptr + s_pfids + num_cats + cat_id, mask = cat_mask, other = 0)
+
+            flow = param * (flow_num + numerate_pseudocount) / (flow_denom + pseudocount)
+
+            if keep_zero_params:
+                cum_flow += tl.where(param < 1e-12, 0.0, flow)
+            else:
+                cum_flow += flow
+
+        cum_flow = (1.0 - step_size) + step_size * cum_flow
+
+        # Parameter update
+        for cat_id in range(max_num_cats):
+            cat_mask = mask & (cat_id < num_cats)
+
+            param = tl.load(params_ptr + s_pids + cat_id, mask = cat_mask, other = 0)
+            flow_num = tl.load(param_flows_ptr + s_pfids + cat_id, mask = cat_mask, other = 0)
+            flow_denom = tl.load(param_flows_ptr + s_pfids + num_cats + cat_id, mask = cat_mask, other = 0)
+
+            new_param = param * ((1.0 - step_size) + step_size * (flow_num + numerate_pseudocount) / (flow_denom + pseudocount)) / cum_flow
+
+            if keep_zero_params:
+                new_param = tl.where(param < 1e-12, 0.0, new_param)
+
+            tl.store(params_ptr + s_pids + cat_id, new_param, mask = cat_mask)
+
+    @staticmethod
+    def large_ncats_dual_em_fn(local_offsets, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, s_mids_ptr, mask,
+                               step_size, pseudocount, BLOCK_SIZE):
+        # Get `num_cats` from `metadata`
+        s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
+        num_cats = tl.load(metadata_ptr + s_mids, mask = mask, other = 0).to(tl.int64)
+
+        max_num_cats = tl.max(num_cats, axis = 0)
+
+        # Compute cumulative flows
+        numerate_pseudocount = pseudocount / num_cats
+        cum_flow = tl.zeros([BLOCK_SIZE], dtype = tl.float32)
+        cat_ids = tl.arange(0, 128)
+        for cat_sid in range(0, max_num_cats, 128):
+            cat_mask = mask[:,None] & (cat_ids[None,:] < num_cats[:,None])
+
+            param = tl.load(params_ptr + s_pids[:,None] + cat_ids[None,:], mask = cat_mask, other = 0)
+            flow_num = tl.load(param_flows_ptr + s_pfids[:,None] + cat_ids[None,:], mask = cat_mask, other = 0)
+            flow_denom = tl.load(param_flows_ptr + s_pfids[:,None] + num_cats[:,None] + cat_ids[None,:], mask = cat_mask, other = 0)
+
+            flow = param * (flow_num + numerate_pseudocount[:,None]) / (flow_denom + pseudocount)
+
+            if keep_zero_params:
+                cum_flow += tl.sum(tl.where(param < 1e-12, 0.0, flow))
+            else:
+                cum_flow += tl.sum(flow, axis = 1)
+
+            cat_ids += 128
+
+        cum_flow = (1.0 - step_size) + step_size * cum_flow
+
+        # Parameter update
+        cat_ids = tl.arange(0, 128)
+        for cat_sid in range(0, max_num_cats, 128):
+            cat_mask = mask[:,None] & (cat_ids[None,:] < num_cats[:,None])
+
+            param = tl.load(params_ptr + s_pids[:,None] + cat_ids[None,:], mask = cat_mask, other = 0)
+            flow_num = tl.load(param_flows_ptr + s_pfids[:,None] + cat_ids[None,:], mask = cat_mask, other = 0)
+            flow_denom = tl.load(param_flows_ptr + s_pfids[:,None] + num_cats[:,None] + cat_ids[None,:], mask = cat_mask, other = 0)
+
+            new_param = param * ((1.0 - step_size) + step_size * (flow_num + numerate_pseudocount[:,None]) / (flow_denom + pseudocount)) / cum_flow[:,None]
+
+            if keep_zero_params:
+                new_param = tl.where(param < 1e-12, 0.0, new_param)
+
             tl.store(params_ptr + s_pids[:,None] + cat_ids[None,:], new_param, mask = cat_mask)
 
             cat_ids += 128
