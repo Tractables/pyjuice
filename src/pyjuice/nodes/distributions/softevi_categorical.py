@@ -818,7 +818,7 @@ class SoftEvidenceCategorical(Distribution):
         tl.store(samples_ptr + sample_offsets, sampled_ids, mask = mask)
 
     @staticmethod
-    def bk_flow_mask_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
+    def bk_flow_mask_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr,
                         s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE, TILE_SIZE_K):
         # Get `num_cats` from `metadata`
         s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
@@ -837,8 +837,13 @@ class SoftEvidenceCategorical(Distribution):
                 p_offsets = s_pids[:,None] + cat_ids[None,:]
                 param = tl.load(params_ptr + p_offsets, mask = cat_mask, other = 0)
 
+                # Anchor = (scale·)TD·β, already carrying `scale=(1-step_size)` via `flows`.
+                # Add the SAME anchor to both phases so ratio -> 1 at s=0 (no update).
+                anchor = flows[:,None] * param
+
                 pf_offsets = s_pfids[:,None] + cat_ids[None,:]
-                tl.atomic_add(param_flows_ptr + pf_offsets, flows[:,None] * param, mask = cat_mask)
+                tl.atomic_add(param_flows_ptr + pf_offsets,                    anchor, mask = cat_mask)  # F⁺
+                tl.atomic_add(param_flows_ptr + pf_offsets + num_cats[:,None], anchor, mask = cat_mask)  # F⁻
 
                 cat_ids += TILE_SIZE_K
         else:
@@ -848,8 +853,11 @@ class SoftEvidenceCategorical(Distribution):
                 p_offsets = s_pids + cat_id
                 param = tl.load(params_ptr + p_offsets, mask = cat_mask, other = 0)
 
+                anchor = flows * param
+
                 pf_offsets = s_pfids + cat_id
-                tl.atomic_add(param_flows_ptr + pf_offsets, flows * param, mask = cat_mask)
+                tl.atomic_add(param_flows_ptr + pf_offsets,            anchor, mask = cat_mask)  # F⁺
+                tl.atomic_add(param_flows_ptr + pf_offsets + num_cats, anchor, mask = cat_mask)  # F⁻
 
     @staticmethod
     def sample_fn(samples_ptr, local_offsets, batch_offsets, vids, s_pids, params_ptr, metadata_ptr, s_mids_ptr, mask, batch_size, BLOCK_SIZE, seed):
