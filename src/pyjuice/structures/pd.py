@@ -239,6 +239,32 @@ def PDHCLT(data: torch.Tensor, data_shape: Tuple, num_latents: int,
            input_node_params: Dict = {"num_cats": 256},
            hclt_kwargs: Dict = {"num_bins": 32, "sigma": 0.5 / 32, "chunk_size": 32},
            block_size: Optional[int] = None):
+    """
+    Generate a PD-structured PC (see :func:`PD`) whose leaf regions are modeled by data-dependent HCLTs
+    (see :func:`~pyjuice.structures.HCLT`) instead of plain input distributions. This combines the PD
+    region structure over (e.g., image) dimensions with the expressive, data-informed leaves of HCLT.
+
+    :param data: training data of size [N, num_vars] used to build the per-region HCLTs; `num_vars` must equal the product of `data_shape`
+    :type data: torch.Tensor
+
+    :param data_shape: shape of the data (e.g., [H, W, 3] for images and [S] for sequences)
+    :type data_shape: Tuple
+
+    :param num_latents: size of the latent space
+    :type num_latents: int
+
+    :param split_intervals: the interval between split points in every dimension; either this or `split_points` needs to be specified
+    :type split_intervals: Optional[Union[int, Tuple[int]]]
+
+    :param split_points: a sequence of split points in each dimension; either this or `split_intervals` needs to be specified
+    :type split_points: Optional[Sequence[Sequence[int]]]
+
+    :param hclt_kwargs: keyword arguments forwarded to the per-region :func:`~pyjuice.structures.HCLT` construction
+    :type hclt_kwargs: Dict
+
+    :param block_size: block size of the PC
+    :type block_size: Optional[int]
+    """
 
     assert data.dim() == 2
     assert data.size(1) == reduce(lambda x, y: x * y, data_shape)

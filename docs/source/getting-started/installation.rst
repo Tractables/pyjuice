@@ -11,6 +11,6 @@ Alternatively, you can install PyJuice from source by running the following comm
 
 .. code-block:: bash
 
-    git clone git@github.com:Juice-jl/pyjuice.git
+    git clone git@github.com:Tractables/pyjuice.git
     cd pyjuice
     pip install -e .

@@ -191,6 +191,17 @@ class TensorCircuit(nn.Module):
         return self
 
     def set_propagation_alg(self, propagation_alg: str, **kwargs):
+        """
+        Set the default propagation algorithm used by :func:`forward` and :func:`backward`.
+
+        :param propagation_alg: the propagation algorithm; one of `"LL"` (log-likelihood / standard
+            marginal inference), `"MPE"` (most-probable-explanation / max-product), or `"GeneralLL"`
+            (an entropy-/temperature-style generalization that interpolates between `"LL"` and `"MPE"`)
+        :type propagation_alg: str
+
+        For `"GeneralLL"`, an `alpha` keyword argument must be provided. The algorithm can also be
+        selected per-call by passing `propagation_alg=...` directly to :func:`forward`/:func:`backward`.
+        """
         if propagation_alg == "LL":
             self.default_propagation_alg = "LL"
             self.propagation_alg_kwargs.clear()
@@ -835,8 +846,26 @@ class TensorCircuit(nn.Module):
         """
         return layer_iterator(self, reverse = reverse, ret_layer_groups = ret_layer_groups, ignore_input_layers = ignore_input_layers)
 
-    def enable_partial_evaluation(self, scopes: Union[Sequence[BitSet],Sequence[int]], 
+    def enable_partial_evaluation(self, scopes: Union[Sequence[BitSet],Sequence[int]],
                                   forward: bool = False, backward: bool = False, overwrite: bool = False):
+        """
+        Restrict subsequent forward and/or backward passes to only the nodes whose scope is contained
+        in `scopes`. This speeds up repeated queries that touch a fixed subset of variables (e.g.,
+        evaluating or updating only part of the circuit). Call :func:`disable_partial_evaluation` to
+        revert to evaluating the whole circuit.
+
+        :param scopes: the scopes to evaluate, given either as a sequence of variable ids or :class:`~pyjuice.utils.BitSet` scopes
+        :type scopes: Union[Sequence[BitSet], Sequence[int]]
+
+        :param forward: whether to enable partial evaluation for the forward pass
+        :type forward: bool
+
+        :param backward: whether to enable partial evaluation for the backward pass
+        :type backward: bool
+
+        :param overwrite: whether to overwrite an already-enabled partial-evaluation configuration
+        :type overwrite: bool
+        """
         # Create scope2nid cache
         self._create_scope2nid_cache()
 
@@ -864,6 +893,16 @@ class TensorCircuit(nn.Module):
             self._bk_partial_eval_enabled = True
 
     def disable_partial_evaluation(self, forward: bool = True, backward: bool = True):
+        """
+        Disable partial evaluation (see :func:`enable_partial_evaluation`), so that subsequent passes
+        again evaluate the entire circuit.
+
+        :param forward: whether to disable partial evaluation for the forward pass
+        :type forward: bool
+
+        :param backward: whether to disable partial evaluation for the backward pass
+        :type backward: bool
+        """
         # Input layers
         for layer in self.input_layer_group:
             layer.disable_partial_evaluation(forward = forward, backward = backward)

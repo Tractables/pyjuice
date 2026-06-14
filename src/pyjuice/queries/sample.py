@@ -334,6 +334,26 @@ def sample_prod_layer(layer, nids, cids, node_samples, element_samples, ind_targ
 
 def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bool = False, _sample_input_ns: bool = True,
            _do_calibration: bool = False, **kwargs):
+    """
+    Draw samples from a PC by performing a top-down ancestral sampling pass.
+
+    For unconditional sampling, `num_samples` must be specified. For conditional sampling
+    (`conditional = True`), run a forward pass on the evidence first (e.g., via :func:`marginal`); the
+    sampler then reuses the cached `pc.node_mars` and draws one sample per example in that batch, so
+    `num_samples` is ignored.
+
+    :param pc: the input PC
+    :type pc: TensorCircuit
+
+    :param num_samples: number of samples to draw; required for unconditional sampling, ignored when `conditional = True`
+    :type num_samples: Optional[int]
+
+    :param conditional: whether to sample conditioned on the evidence cached by a preceding forward pass
+    :type conditional: bool
+
+    :returns: a tensor of samples of size [num_samples, num_vars]
+    :rtype: torch.Tensor
+    """
     if not conditional:
         assert num_samples is not None, "`num_samples` should be specified when doing unconditioned sampling."
     else:

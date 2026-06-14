@@ -23,6 +23,8 @@ API
 - :doc:`pyjuice <python-api/pyjuice>`
 - :doc:`pyjuice.nodes <python-api/nodes>`
 - :doc:`pyjuice.TensorCircuit <python-api/tensorcircuit>`
+- :doc:`pyjuice.queries <python-api/queries>`
+- :doc:`pyjuice.optim <python-api/optim>`
 - :doc:`pyjuice.structures <python-api/structures>`
 
 .. toctree::
@@ -33,4 +35,6 @@ API
    python-api/pyjuice
    python-api/nodes
    python-api/tensorcircuit
+   python-api/queries
+   python-api/optim
    python-api/structures

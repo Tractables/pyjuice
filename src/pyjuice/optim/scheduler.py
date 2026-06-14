@@ -8,10 +8,27 @@ from .optim import CircuitOptimizer
 
 
 class CircuitScheduler():
+    """
+    A learning-rate scheduler for a :class:`CircuitOptimizer`, analogous to the schedulers in
+    :mod:`torch.optim.lr_scheduler`. Calling :func:`step` updates the optimizer's step size according
+    to the chosen schedule.
+
+    :param optimizer: the circuit optimizer whose step size is being scheduled
+    :type optimizer: CircuitOptimizer
+
+    :param base_scheduler: an optional PyTorch scheduler stepped alongside, for an attached `base_optimizer`
+    :type base_scheduler: Optional[torch.optim.lr_scheduler.LRScheduler]
+
+    :param method: the schedule type; one of `"constant"` or `"multi_linear"` (piecewise-linear between milestones)
+    :type method: str
+
+    For the `"multi_linear"` schedule, pass `lrs` (the learning rates at each milestone) and
+    `milestone_steps` (the step indices of the milestones) as keyword arguments.
+    """
 
     SUPPORTED_SCHEDULER_METHODS = ["constant", "multi_linear"]
 
-    def __init__(self, optimizer: CircuitOptimizer, base_scheduler: Optional[LRScheduler] = None, 
+    def __init__(self, optimizer: CircuitOptimizer, base_scheduler: Optional[LRScheduler] = None,
                  method: str = "constant", **kwargs):
 
         self.optimizer = optimizer

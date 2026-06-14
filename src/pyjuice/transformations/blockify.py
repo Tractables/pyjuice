@@ -461,6 +461,24 @@ def unblockify(root_ns: CircuitNodes, block_size: int = 1, recursive: bool = Tru
 
 
 def bump_block_size(ns: CircuitNodes, block_size: int, use_cuda: bool = True):
+    """
+    Return a copy of a node group whose block size is increased to `block_size` (which must be a
+    multiple of the current block size and divide the number of nodes), re-packing its parameters and
+    edges accordingly. Larger block sizes make better use of the GPU; see also :func:`~pyjuice.blockify`,
+    which chooses and applies block sizes across a whole PC.
+
+    :param ns: the node group whose block size is increased
+    :type ns: CircuitNodes
+
+    :param block_size: the target block size; must be greater than `ns.block_size`
+    :type block_size: int
+
+    :param use_cuda: whether to perform the re-packing on the GPU
+    :type use_cuda: bool
+
+    :returns: a new node group with the larger block size
+    :rtype: CircuitNodes
+    """
     assert block_size > ns.block_size, f"`block_size` already greater than {block_size}."
     assert ns.num_nodes % block_size == 0, f"`num_nodes` not divicible by the target block size."
 
