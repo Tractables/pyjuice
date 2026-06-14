@@ -322,6 +322,12 @@ class SoftEvidenceCategorical(Distribution):
                 self.em_block_size = 8
                 return self.large_ncats_em_fn
 
+    def get_flow_mask_fn(self):
+        if self._dual_flow_backward:
+            return self.bk_dual_flow_mask_fn
+        else:
+            return self.bk_flow_mask_fn
+
     def set_custom_kernel_kwargs(self, kwargs):
         kwargs["dual_flow_backward"] = self._dual_flow_backward
 
@@ -818,8 +824,42 @@ class SoftEvidenceCategorical(Distribution):
         tl.store(samples_ptr + sample_offsets, sampled_ids, mask = mask)
 
     @staticmethod
-    def bk_flow_mask_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr,
+    def bk_flow_mask_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
                         s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE, TILE_SIZE_K):
+        # Get `num_cats` from `metadata`
+        s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
+        num_cats = tl.load(metadata_ptr + s_mids, mask = mask, other = 0).to(tl.int64)
+
+        max_num_cats = tl.max(num_cats, axis = 0)
+
+        if TILE_SIZE_K > 1:
+            num_iters = tlmath.ceil(max_num_cats / TILE_SIZE_K).to(tl.int64)
+
+            cat_ids = tl.arange(0, TILE_SIZE_K)
+
+            for i in range(num_iters):
+                cat_mask = mask[:,None] & missing_mask[:,None] & (cat_ids[None,:] < num_cats[:,None])
+
+                p_offsets = s_pids[:,None] + cat_ids[None,:]
+                param = tl.load(params_ptr + p_offsets, mask = cat_mask, other = 0)
+
+                pf_offsets = s_pfids[:,None] + cat_ids[None,:]
+                tl.atomic_add(param_flows_ptr + pf_offsets, flows[:,None] * param, mask = cat_mask)
+
+                cat_ids += TILE_SIZE_K
+        else:
+            for cat_id in range(max_num_cats):
+                cat_mask = mask & missing_mask & (cat_id < num_cats)
+
+                p_offsets = s_pids + cat_id
+                param = tl.load(params_ptr + p_offsets, mask = cat_mask, other = 0)
+
+                pf_offsets = s_pfids + cat_id
+                tl.atomic_add(param_flows_ptr + pf_offsets, flows * param, mask = cat_mask)
+
+    @staticmethod
+    def bk_dual_flow_mask_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr,
+                             s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE, TILE_SIZE_K):
         # Get `num_cats` from `metadata`
         s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
         num_cats = tl.load(metadata_ptr + s_mids, mask = mask, other = 0).to(tl.int64)
