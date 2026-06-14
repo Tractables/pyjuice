@@ -142,6 +142,11 @@ def _prep_args_apply_bk_softevi_kernel(layer, kwargs):
     num_cats = categorical_evidence_logp.size(2)
     target_kwargs["num_cats"] = num_cats
 
+    # Full (distribution) num_cats = the width of one param-flow phase. With top-k soft
+    # evidence, `num_cats` above is the top-k tile width (< V_full); the F- (denominator)
+    # phase of the dual-flow buffer starts at offset V_full, NOT at the top-k width.
+    target_kwargs["tot_num_cats"] = layer.nodes[0].dist.num_cats
+
     if "categorical_evidence_logp_grad" in kwargs:
         categorical_evidence_logp_grad = kwargs["categorical_evidence_logp_grad"]
         assert categorical_evidence_logp_grad.size(0) == batch_size
@@ -529,8 +534,8 @@ class SoftEvidenceCategorical(Distribution):
                           bk_local_ids_ptr, layer_num_nodes, batch_size, num_vars_per_node: tl.constexpr, num_vars: tl.constexpr, nv_block_size: tl.constexpr,
                           node_offset, partial_eval: tl.constexpr, logspace_flows: tl.constexpr, BLOCK_SIZE_B: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, 
                           TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, use_tensor_core: tl.constexpr,
-                          categorical_evidence_logp_ptr, soft_evidence_cat_ids_ptr, categorical_evidence_logp_grad_ptr, var_idmapping_ptr, 
-                          num_cats: tl.constexpr, ext_num_vars: tl.constexpr, has_ext_ids: tl.constexpr, update_pflows: tl.constexpr, update_extflows: tl.constexpr):
+                          categorical_evidence_logp_ptr, soft_evidence_cat_ids_ptr, categorical_evidence_logp_grad_ptr, var_idmapping_ptr,
+                          num_cats: tl.constexpr, tot_num_cats: tl.constexpr, ext_num_vars: tl.constexpr, has_ext_ids: tl.constexpr, update_pflows: tl.constexpr, update_extflows: tl.constexpr):
         
         pid_b = tl.program_id(axis = 0)
         pid_n = tl.program_id(axis = 1)
@@ -675,7 +680,7 @@ class SoftEvidenceCategorical(Distribution):
                 if update_pflows:
                     vp_grads = (nflows.log() - logZ)[:,None,:] + inpars.log() + expars[:,:,None] # [BLOCK_SIZE_B, TILE_SIZE_K, BLOCK_SIZE_N]
 
-                    tl.atomic_add(param_flows_ptr + num_cats + s_pfids[None,None,:] + catids[:,:,None], tl.exp(vp_grads), mask = (mask_b[:,None,None] & mask_n[None,None,:]))
+                    tl.atomic_add(param_flows_ptr + tot_num_cats + s_pfids[None,None,:] + catids[:,:,None], tl.exp(vp_grads), mask = (mask_b[:,None,None] & mask_n[None,None,:]))
 
                 if update_extflows:
                     ve_grads = (nflows.log() - logZ)[:,None,:] + inpars.log() # [BLOCK_SIZE_B, TILE_SIZE_K, BLOCK_SIZE_N]
@@ -731,7 +736,7 @@ class SoftEvidenceCategorical(Distribution):
                         expars_sub = tl.exp(tl.trans(expars) - expars_max[:,None]) # [TILE_SIZE_K, BLOCK_SIZE_B]
                         pars_grad = tl.sum(nflow_sub_logz_p_sub[:,None,:] * expars_sub[None,:,:], axis = 2).log() + tl.trans(inpars).log() + nflow_sub_logz_p_max + expars_max[None,:]
 
-                    tl.atomic_add(param_flows_ptr + num_cats + s_pfids[:,None] + offsets_c[None,:], tl.exp(pars_grad), mask = (mask_n[:,None] & mask_c[None,:]))
+                    tl.atomic_add(param_flows_ptr + tot_num_cats + s_pfids[:,None] + offsets_c[None,:], tl.exp(pars_grad), mask = (mask_n[:,None] & mask_c[None,:]))
 
                 if update_extflows:
                     if use_tensor_core:
