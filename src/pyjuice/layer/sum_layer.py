@@ -1280,7 +1280,30 @@ class SumLayer(Layer, nn.Module):
 
         return None
 
-    def _backward_block_sparse_par_flows(self, node_flows: torch.Tensor, params: torch.Tensor, node_mars: torch.Tensor, 
+    def _par_flow_collision_free(self, pfids: torch.Tensor) -> bool:
+        """
+        Whether the parameter-flow writes of this partition are collision-free, i.e. no two
+        programs accumulate into the same `param_flows` slot. The kernel writes the block of
+        `block_size` slots `[pfid, pfid + block_size)` for each `pfid` in `pfids`; these are
+        disjoint iff all `pfids` are distinct and spaced at least `block_size` apart. When true,
+        the non-atomic read-add-store kernel variant is bit-exact; otherwise the atomic kernel is
+        required (e.g. tied parameter flows). Computed once per `pfids` tensor and cached.
+        """
+        if not hasattr(self, "_par_collision_free_cache"):
+            self._par_collision_free_cache = dict()
+        key = id(pfids)
+        if key not in self._par_collision_free_cache:
+            flat = pfids.reshape(-1)
+            if flat.numel() <= 1:
+                collision_free = True
+            else:
+                sorted_ids = torch.unique(flat, sorted = True)
+                collision_free = bool(sorted_ids.numel() == flat.numel()) and \
+                    bool((sorted_ids[1:] - sorted_ids[:-1] >= self.block_size).all().item())
+            self._par_collision_free_cache[key] = collision_free
+        return self._par_collision_free_cache[key]
+
+    def _backward_block_sparse_par_flows(self, node_flows: torch.Tensor, params: torch.Tensor, node_mars: torch.Tensor,
                                          element_mars: torch.Tensor, param_flows: torch.Tensor, nids: torch.Tensor, 
                                          cids: torch.Tensor, pids: torch.Tensor, pfids: torch.Tensor,
                                          allow_modify_flows: bool = False, propagation_alg: str = "LL", 
@@ -1369,24 +1392,31 @@ class SumLayer(Layer, nn.Module):
             if abs(pflow_temperature - 1.0) < 1e-6:
 
                 if TILE_SIZE_M >= 8 and TILE_SIZE_K >= 8 and TILE_SIZE_B >= 8:
-                    bk_par_bsparse._bk_triton_block_sparse_par_kernel[curr_grid](
-                        node_flows = node_flows, 
-                        node_mars = node_mars, 
-                        element_mars = element_mars, 
-                        mparams = params, 
-                        param_flows = param_flows, 
-                        nids = nids, 
-                        cids = cids, 
+                    # Use the non-atomic read-add-store variant when this partition's param-flow
+                    # slots are provably collision-free (untied); otherwise the atomic kernel.
+                    # The check is computed once per partition and cached (see the helper).
+                    if self._par_flow_collision_free(pfids):
+                        par_kernel = bk_par_bsparse._bk_triton_block_sparse_par_kernel_rmw
+                    else:
+                        par_kernel = bk_par_bsparse._bk_triton_block_sparse_par_kernel
+                    par_kernel[curr_grid](
+                        node_flows = node_flows,
+                        node_mars = node_mars,
+                        element_mars = element_mars,
+                        mparams = params,
+                        param_flows = param_flows,
+                        nids = nids,
+                        cids = cids,
                         pids = pids,
                         pfids = pfids,
-                        batch_size = batch_size, 
-                        num_edges = num_edges, 
-                        allow_modify_flows = allow_modify_flows, 
+                        batch_size = batch_size,
+                        num_edges = num_edges,
+                        allow_modify_flows = allow_modify_flows,
                         logspace_flows = logspace_flows,
-                        TILE_SIZE_B = TILE_SIZE_B, 
-                        B_NUM_TILES = B_NUM_TILES, 
-                        TILE_SIZE_K = TILE_SIZE_K, 
-                        TILE_SIZE_M = TILE_SIZE_M, 
+                        TILE_SIZE_B = TILE_SIZE_B,
+                        B_NUM_TILES = B_NUM_TILES,
+                        TILE_SIZE_K = TILE_SIZE_K,
+                        TILE_SIZE_M = TILE_SIZE_M,
                         BLOCK_SIZE_M = self.block_size,
                         TL_DOT = TL_DOT,
                         propagation_alg_id = propagation_alg_id,
