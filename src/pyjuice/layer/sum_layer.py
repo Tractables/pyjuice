@@ -41,6 +41,10 @@ from .compilation import get_sum_layer_forward_stats, sum_layer_forward_compilat
 # RTX PRO 6000 (Blackwell); set to False to recover the exact original launch configuration.
 BACKWARD_PAR_FLOW_TUNED = True
 
+# Analogous tuning for the block-sparse element-flow backward kernel: a larger TILE_SIZE_M
+# (element-output tiling only, so bit-exact). Tuned for an RTX PRO 6000; set False to disable.
+BACKWARD_ELE_FLOW_TUNED = True
+
 
 class SumLayer(Layer, nn.Module):
 
@@ -1144,6 +1148,13 @@ class SumLayer(Layer, nn.Module):
         BLOCK_SIZE_M = cs_block_size
         BLOCK_SIZE_K = self.block_size
         allow_modify_flows = 1 if allow_modify_flows else 0
+
+        # Bit-exact tuning: a larger TILE_SIZE_M (element-output tiling only -> identical results)
+        # improves throughput in the LL block-sparse-dot regime. See BACKWARD_ELE_FLOW_TUNED.
+        if BACKWARD_ELE_FLOW_TUNED and propagation_alg_id == 0 and abs(eflow_temperature - 1.0) < 1e-6 \
+                and TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and BLOCK_B >= 16 \
+                and 2 * TILE_SIZE_M <= cs_block_size:
+            TILE_SIZE_M = 2 * TILE_SIZE_M
 
         if TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and BLOCK_B >= 16 and not force_use_fp32:
             TL_DOT = 1
