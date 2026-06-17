@@ -26,6 +26,16 @@ from .compilation import get_sum_layer_forward_stats, sum_layer_forward_compilat
                          sum_layer_backward_compilation, next_power_of_2
 
 
+# Launch tuning for the block-sparse parameter-flow backward kernel (kernel body unchanged).
+# When enabled, the dominant LL block-sparse-dot regime uses a larger `TILE_SIZE_K`, a
+# smaller `TILE_SIZE_B`, and `num_warps = 8`. `TILE_SIZE_M` -- which sets the node group over
+# which the `log_n_fdm_max` stabilizer is taken -- is left unchanged, so per-element results
+# match the original up to floating-point reduction-order noise (the same ~1e-7 order as the
+# atomic-add nondeterminism already present in this kernel). These constants are tuned for an
+# RTX PRO 6000 (Blackwell); set to False to recover the exact original launch configuration.
+BACKWARD_PAR_FLOW_TUNED = True
+
+
 class SumLayer(Layer, nn.Module):
 
     BLOCK_SPARSE = 0
@@ -1332,6 +1342,22 @@ class SumLayer(Layer, nn.Module):
         else:
             TL_DOT = 0
 
+        # Launch tuning for the LL block-sparse-dot regime (see `BACKWARD_PAR_FLOW_TUNED`).
+        # Bit-exactness note: results depend only on `TILE_SIZE_M` (it sets the node group
+        # over which `log_n_fdm_max` is taken), which is left unchanged; `TILE_SIZE_K`
+        # (output-column tiling) and `TILE_SIZE_B` (batch-reduction tiling) do not change the
+        # per-element result. Doubling K halves redundant `node_mars`/`node_flows` reads, a
+        # smaller batch tile improves occupancy, and `num_warps=8` pairs with both. These
+        # constants are tuned for an RTX PRO 6000 (Blackwell) and may differ on other GPUs.
+        par_kernel_extra = {}
+        if BACKWARD_PAR_FLOW_TUNED and TL_DOT == 1 and propagation_alg_id == 0 \
+                and abs(pflow_temperature - 1.0) < 1e-6 and num_edges >= 2 * TILE_SIZE_K:
+            TILE_SIZE_K = 2 * TILE_SIZE_K
+            if TILE_SIZE_B > 32 and batch_size % 32 == 0:
+                TILE_SIZE_B = 32
+                B_NUM_TILES = batch_size // TILE_SIZE_B
+            par_kernel_extra["num_warps"] = 8
+
         grid = (triton.cdiv(num_edges, TILE_SIZE_K), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
 
         for pid_m_start in range(0, grid[1], 32768):
@@ -1368,6 +1394,7 @@ class SumLayer(Layer, nn.Module):
                         allow_neg_flows = allow_neg_flows,
                         pid_m_offset = pid_m_start,
                         **propagation_alg_kwargs,
+                        **par_kernel_extra,
                         num_stages = 1
                     )
 
