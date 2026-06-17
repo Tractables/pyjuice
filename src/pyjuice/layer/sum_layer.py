@@ -5,6 +5,12 @@ import torch
 import torch.nn as nn
 import triton
 import warnings
+
+try:
+    from triton.runtime.errors import OutOfResources as _TritonOutOfResources
+except Exception:  # pragma: no cover - guards across triton versions
+    class _TritonOutOfResources(Exception):
+        pass
 from copy import deepcopy
 from typing import Sequence, List, Tuple, Optional
 
@@ -24,6 +30,20 @@ from .backend.index_set import batched_index_set, index_cum
 from .compilation import get_sum_layer_forward_stats, sum_layer_forward_compilation, \
                          get_sum_layer_backward_stats, \
                          sum_layer_backward_compilation, next_power_of_2
+
+
+# Launch tuning for the block-sparse parameter-flow backward kernel (kernel body unchanged).
+# When enabled, the dominant LL block-sparse-dot regime uses a larger `TILE_SIZE_K`, a
+# smaller `TILE_SIZE_B`, and `num_warps = 8`. `TILE_SIZE_M` -- which sets the node group over
+# which the `log_n_fdm_max` stabilizer is taken -- is left unchanged, so per-element results
+# match the original up to floating-point reduction-order noise (the same ~1e-7 order as the
+# atomic-add nondeterminism already present in this kernel). These constants are tuned for an
+# RTX PRO 6000 (Blackwell); set to False to recover the exact original launch configuration.
+BACKWARD_PAR_FLOW_TUNED = True
+
+# Analogous tuning for the block-sparse element-flow backward kernel: a larger TILE_SIZE_M
+# (element-output tiling only, so bit-exact). Tuned for an RTX PRO 6000; set False to disable.
+BACKWARD_ELE_FLOW_TUNED = True
 
 
 class SumLayer(Layer, nn.Module):
@@ -1129,6 +1149,13 @@ class SumLayer(Layer, nn.Module):
         BLOCK_SIZE_K = self.block_size
         allow_modify_flows = 1 if allow_modify_flows else 0
 
+        # Bit-exact tuning: a larger TILE_SIZE_M (element-output tiling only -> identical results)
+        # improves throughput in the LL block-sparse-dot regime. See BACKWARD_ELE_FLOW_TUNED.
+        if BACKWARD_ELE_FLOW_TUNED and propagation_alg_id == 0 and abs(eflow_temperature - 1.0) < 1e-6 \
+                and TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and BLOCK_B >= 16 \
+                and 2 * TILE_SIZE_M <= cs_block_size:
+            TILE_SIZE_M = 2 * TILE_SIZE_M
+
         if TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and BLOCK_B >= 16 and not force_use_fp32:
             TL_DOT = 1
         else:
@@ -1270,7 +1297,30 @@ class SumLayer(Layer, nn.Module):
 
         return None
 
-    def _backward_block_sparse_par_flows(self, node_flows: torch.Tensor, params: torch.Tensor, node_mars: torch.Tensor, 
+    def _par_flow_collision_free(self, pfids: torch.Tensor) -> bool:
+        """
+        Whether the parameter-flow writes of this partition are collision-free, i.e. no two
+        programs accumulate into the same `param_flows` slot. The kernel writes the block of
+        `block_size` slots `[pfid, pfid + block_size)` for each `pfid` in `pfids`; these are
+        disjoint iff all `pfids` are distinct and spaced at least `block_size` apart. When true,
+        the non-atomic read-add-store kernel variant is bit-exact; otherwise the atomic kernel is
+        required (e.g. tied parameter flows). Computed once per `pfids` tensor and cached.
+        """
+        if not hasattr(self, "_par_collision_free_cache"):
+            self._par_collision_free_cache = dict()
+        key = id(pfids)
+        if key not in self._par_collision_free_cache:
+            flat = pfids.reshape(-1)
+            if flat.numel() <= 1:
+                collision_free = True
+            else:
+                sorted_ids = torch.unique(flat, sorted = True)
+                collision_free = bool(sorted_ids.numel() == flat.numel()) and \
+                    bool((sorted_ids[1:] - sorted_ids[:-1] >= self.block_size).all().item())
+            self._par_collision_free_cache[key] = collision_free
+        return self._par_collision_free_cache[key]
+
+    def _backward_block_sparse_par_flows(self, node_flows: torch.Tensor, params: torch.Tensor, node_mars: torch.Tensor,
                                          element_mars: torch.Tensor, param_flows: torch.Tensor, nids: torch.Tensor, 
                                          cids: torch.Tensor, pids: torch.Tensor, pfids: torch.Tensor,
                                          allow_modify_flows: bool = False, propagation_alg: str = "LL", 
@@ -1332,6 +1382,23 @@ class SumLayer(Layer, nn.Module):
         else:
             TL_DOT = 0
 
+        # Launch tuning for the LL block-sparse-dot regime (see `BACKWARD_PAR_FLOW_TUNED`).
+        # Bit-exactness note: results depend only on `TILE_SIZE_M` (it sets the node group
+        # over which `log_n_fdm_max` is taken), which is left unchanged; `TILE_SIZE_K`
+        # (output-column tiling) and `TILE_SIZE_B` (batch-reduction tiling) do not change the
+        # per-element result. Doubling K halves redundant `node_mars`/`node_flows` reads, a
+        # smaller batch tile improves occupancy, and `num_warps=8` pairs with both. These
+        # constants are tuned for an RTX PRO 6000 (Blackwell) and may differ on other GPUs.
+        par_kernel_extra = {}
+        if BACKWARD_PAR_FLOW_TUNED and not getattr(self, "_par_tuning_oom", False) \
+                and TL_DOT == 1 and propagation_alg_id == 0 \
+                and abs(pflow_temperature - 1.0) < 1e-6 and num_edges >= 2 * TILE_SIZE_K:
+            TILE_SIZE_K = 2 * TILE_SIZE_K
+            if TILE_SIZE_B > 32 and batch_size % 32 == 0:
+                TILE_SIZE_B = 32
+                B_NUM_TILES = batch_size // TILE_SIZE_B
+            par_kernel_extra["num_warps"] = 8
+
         grid = (triton.cdiv(num_edges, TILE_SIZE_K), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
 
         for pid_m_start in range(0, grid[1], 32768):
@@ -1343,33 +1410,58 @@ class SumLayer(Layer, nn.Module):
             if abs(pflow_temperature - 1.0) < 1e-6:
 
                 if TILE_SIZE_M >= 8 and TILE_SIZE_K >= 8 and TILE_SIZE_B >= 8:
-                    bk_par_bsparse._bk_triton_block_sparse_par_kernel[curr_grid](
-                        node_flows = node_flows, 
-                        node_mars = node_mars, 
-                        element_mars = element_mars, 
-                        mparams = params, 
-                        param_flows = param_flows, 
-                        nids = nids, 
-                        cids = cids, 
-                        pids = pids,
-                        pfids = pfids,
-                        batch_size = batch_size, 
-                        num_edges = num_edges, 
-                        allow_modify_flows = allow_modify_flows, 
-                        logspace_flows = logspace_flows,
-                        TILE_SIZE_B = TILE_SIZE_B, 
-                        B_NUM_TILES = B_NUM_TILES, 
-                        TILE_SIZE_K = TILE_SIZE_K, 
-                        TILE_SIZE_M = TILE_SIZE_M, 
-                        BLOCK_SIZE_M = self.block_size,
-                        TL_DOT = TL_DOT,
-                        propagation_alg_id = propagation_alg_id,
-                        negate_pflows = negate_pflows,
-                        allow_neg_flows = allow_neg_flows,
-                        pid_m_offset = pid_m_start,
-                        **propagation_alg_kwargs,
-                        num_stages = 1
-                    )
+                    # Use the non-atomic read-add-store variant when this partition's param-flow
+                    # slots are provably collision-free (untied); otherwise the atomic kernel.
+                    # The check is computed once per partition and cached (see the helper).
+                    if self._par_flow_collision_free(pfids):
+                        par_kernel = bk_par_bsparse._bk_triton_block_sparse_par_kernel_rmw
+                    else:
+                        par_kernel = bk_par_bsparse._bk_triton_block_sparse_par_kernel
+                    try:
+                        par_kernel[curr_grid](
+                            node_flows = node_flows,
+                            node_mars = node_mars,
+                            element_mars = element_mars,
+                            mparams = params,
+                            param_flows = param_flows,
+                            nids = nids,
+                            cids = cids,
+                            pids = pids,
+                            pfids = pfids,
+                            batch_size = batch_size,
+                            num_edges = num_edges,
+                            allow_modify_flows = allow_modify_flows,
+                            logspace_flows = logspace_flows,
+                            TILE_SIZE_B = TILE_SIZE_B,
+                            B_NUM_TILES = B_NUM_TILES,
+                            TILE_SIZE_K = TILE_SIZE_K,
+                            TILE_SIZE_M = TILE_SIZE_M,
+                            BLOCK_SIZE_M = self.block_size,
+                            TL_DOT = TL_DOT,
+                            propagation_alg_id = propagation_alg_id,
+                            negate_pflows = negate_pflows,
+                            allow_neg_flows = allow_neg_flows,
+                            pid_m_offset = pid_m_start,
+                            **propagation_alg_kwargs,
+                            **par_kernel_extra,
+                            num_stages = 1
+                        )
+                    except _TritonOutOfResources:
+                        # The tuned launch config exceeds this GPU's shared memory. Disable the
+                        # tuning for this layer (cached) and retry with the default heuristic.
+                        # `OutOfResources` is raised at compile time, before any `param_flows`
+                        # write, so re-running from scratch is safe (no partial accumulation).
+                        if "num_warps" not in par_kernel_extra:
+                            raise
+                        self._par_tuning_oom = True
+                        warnings.warn("pyjuice: tuned parameter-flow backward launch exceeds GPU "
+                                      "shared memory; falling back to the default configuration.")
+                        return self._backward_block_sparse_par_flows(
+                            node_flows, params, node_mars, element_mars, param_flows,
+                            nids, cids, pids, pfids, allow_modify_flows = allow_modify_flows,
+                            propagation_alg = propagation_alg, logspace_flows = logspace_flows,
+                            negate_pflows = negate_pflows, allow_neg_flows = allow_neg_flows,
+                            pflow_temperature = pflow_temperature, **kwargs)
 
                 else:
                     bk_par_bsparse._bk_triton_block_sparse_par_csmm2_kernel[curr_grid](
