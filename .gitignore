@@ -173,3 +173,5 @@ docs/source/python-api/generated/
 docs/source/getting-started/tutorials/
 
 data/
+
+.claude/
