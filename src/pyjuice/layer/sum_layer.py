@@ -5,6 +5,12 @@ import torch
 import torch.nn as nn
 import triton
 import warnings
+
+try:
+    from triton.runtime.errors import OutOfResources as _TritonOutOfResources
+except Exception:  # pragma: no cover - guards across triton versions
+    class _TritonOutOfResources(Exception):
+        pass
 from copy import deepcopy
 from typing import Sequence, List, Tuple, Optional
 
@@ -1373,7 +1379,8 @@ class SumLayer(Layer, nn.Module):
         # smaller batch tile improves occupancy, and `num_warps=8` pairs with both. These
         # constants are tuned for an RTX PRO 6000 (Blackwell) and may differ on other GPUs.
         par_kernel_extra = {}
-        if BACKWARD_PAR_FLOW_TUNED and TL_DOT == 1 and propagation_alg_id == 0 \
+        if BACKWARD_PAR_FLOW_TUNED and not getattr(self, "_par_tuning_oom", False) \
+                and TL_DOT == 1 and propagation_alg_id == 0 \
                 and abs(pflow_temperature - 1.0) < 1e-6 and num_edges >= 2 * TILE_SIZE_K:
             TILE_SIZE_K = 2 * TILE_SIZE_K
             if TILE_SIZE_B > 32 and batch_size % 32 == 0:
@@ -1399,34 +1406,51 @@ class SumLayer(Layer, nn.Module):
                         par_kernel = bk_par_bsparse._bk_triton_block_sparse_par_kernel_rmw
                     else:
                         par_kernel = bk_par_bsparse._bk_triton_block_sparse_par_kernel
-                    par_kernel[curr_grid](
-                        node_flows = node_flows,
-                        node_mars = node_mars,
-                        element_mars = element_mars,
-                        mparams = params,
-                        param_flows = param_flows,
-                        nids = nids,
-                        cids = cids,
-                        pids = pids,
-                        pfids = pfids,
-                        batch_size = batch_size,
-                        num_edges = num_edges,
-                        allow_modify_flows = allow_modify_flows,
-                        logspace_flows = logspace_flows,
-                        TILE_SIZE_B = TILE_SIZE_B,
-                        B_NUM_TILES = B_NUM_TILES,
-                        TILE_SIZE_K = TILE_SIZE_K,
-                        TILE_SIZE_M = TILE_SIZE_M,
-                        BLOCK_SIZE_M = self.block_size,
-                        TL_DOT = TL_DOT,
-                        propagation_alg_id = propagation_alg_id,
-                        negate_pflows = negate_pflows,
-                        allow_neg_flows = allow_neg_flows,
-                        pid_m_offset = pid_m_start,
-                        **propagation_alg_kwargs,
-                        **par_kernel_extra,
-                        num_stages = 1
-                    )
+                    try:
+                        par_kernel[curr_grid](
+                            node_flows = node_flows,
+                            node_mars = node_mars,
+                            element_mars = element_mars,
+                            mparams = params,
+                            param_flows = param_flows,
+                            nids = nids,
+                            cids = cids,
+                            pids = pids,
+                            pfids = pfids,
+                            batch_size = batch_size,
+                            num_edges = num_edges,
+                            allow_modify_flows = allow_modify_flows,
+                            logspace_flows = logspace_flows,
+                            TILE_SIZE_B = TILE_SIZE_B,
+                            B_NUM_TILES = B_NUM_TILES,
+                            TILE_SIZE_K = TILE_SIZE_K,
+                            TILE_SIZE_M = TILE_SIZE_M,
+                            BLOCK_SIZE_M = self.block_size,
+                            TL_DOT = TL_DOT,
+                            propagation_alg_id = propagation_alg_id,
+                            negate_pflows = negate_pflows,
+                            allow_neg_flows = allow_neg_flows,
+                            pid_m_offset = pid_m_start,
+                            **propagation_alg_kwargs,
+                            **par_kernel_extra,
+                            num_stages = 1
+                        )
+                    except _TritonOutOfResources:
+                        # The tuned launch config exceeds this GPU's shared memory. Disable the
+                        # tuning for this layer (cached) and retry with the default heuristic.
+                        # `OutOfResources` is raised at compile time, before any `param_flows`
+                        # write, so re-running from scratch is safe (no partial accumulation).
+                        if "num_warps" not in par_kernel_extra:
+                            raise
+                        self._par_tuning_oom = True
+                        warnings.warn("pyjuice: tuned parameter-flow backward launch exceeds GPU "
+                                      "shared memory; falling back to the default configuration.")
+                        return self._backward_block_sparse_par_flows(
+                            node_flows, params, node_mars, element_mars, param_flows,
+                            nids, cids, pids, pfids, allow_modify_flows = allow_modify_flows,
+                            propagation_alg = propagation_alg, logspace_flows = logspace_flows,
+                            negate_pflows = negate_pflows, allow_neg_flows = allow_neg_flows,
+                            pflow_temperature = pflow_temperature, **kwargs)
 
                 else:
                     bk_par_bsparse._bk_triton_block_sparse_par_csmm2_kernel[curr_grid](
