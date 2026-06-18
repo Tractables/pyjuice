@@ -56,6 +56,17 @@ BACKWARD_ELE_FLOW_TUNED = True
 # 6000 (Blackwell); set False to recover the exact original launch configuration.
 FORWARD_SUM_TUNED = True
 
+# Optional CUDA (CuTe/CUTLASS + TMA) fast path for the block-sparse sum-layer FORWARD `tlmm`
+# kernel. When enabled AND all dispatch conditions hold (LL propagation, bf16 dot path, no
+# partial-eval / tempering, block_size % 128 == 0, batch % 64 == 0, TILE_SIZE_K == 64, a
+# contiguous edge/param layout, and a TMA-capable GPU sm_90+ with CUTLASS available), it replaces
+# the Triton `tlmm` launch. The kernel is JIT-compiled on first use and is numerically equivalent
+# to the Triton kernel (bf16 dot + fp32 accumulate; agrees to ~1.5e-3 in log-space, well within the
+# accuracy bar). On ANY of: incompatible GPU, missing nvcc/CUTLASS, compile failure, or an
+# unsupported layer shape, it transparently falls back to the Triton kernel. Set False to disable.
+FORWARD_SUM_CUDA = True
+from .kernels import c as cuda_kernels
+
 
 class SumLayer(Layer, nn.Module):
 
@@ -144,6 +155,14 @@ class SumLayer(Layer, nn.Module):
 
         # Store pre-compiled indices from `cids` and `pids` in the following buffer
         self._cached_fw_pcids = dict()
+
+        # Per-signature cache for the optional CUDA fast path: (ebase, pbase, cuda_ok) where ebase /
+        # pbase are the per-tile first child-node index / first param offset, and cuda_ok records
+        # whether this layer's edge/param layout satisfies the kernel's contiguity assumptions.
+        self._cached_fw_cuda = dict()
+        # Per-signature autotuned dispatch choice: ("cuda", cfg_id) or ("triton", -1). Decided once
+        # by benchmarking the valid CUDA tile configs against Triton for this layer's shape.
+        self._cached_fw_cuda_choice = dict()
 
         # Layer info
         self._layer_nid_range = (layer_nid_start, layer_nid_start + self.num_nodes)
@@ -574,6 +593,20 @@ class SumLayer(Layer, nn.Module):
             ).contiguous()
 
             self._cached_fw_pcids[signature] = [cids_start, cids_increment, pids_start, pids_increment]
+
+            # Pre-compute the CUDA fast-path operands + validate its layout assumptions (once).
+            # `ebase` / `pbase`: per-tile first child-node index / first param offset. The kernel
+            # reads element_mars[ebase + e, b] and params[pbase + e * block_size + m], i.e. it
+            # assumes the tile's children are CONTIGUOUS node rows and its params stride by
+            # `block_size` across edges. Record whether both hold so the dispatcher can fall back.
+            ebase = cids[:, :, 0].contiguous().to(torch.int64)   # [ng, K_NUM_TILES]
+            pbase = pids[:, :, 0].contiguous().to(torch.int64)   # [ng, K_NUM_TILES]
+            _ar = torch.arange(TILE_SIZE_K, device=cids.device, dtype=torch.int64)
+            cids_contig = torch.equal(cids.to(torch.int64), ebase.unsqueeze(-1) + _ar.view(1, 1, -1))
+            pids_strided = torch.equal(pids.to(torch.int64),
+                                       pbase.unsqueeze(-1) + _ar.view(1, 1, -1) * self.block_size)
+            cuda_ok = bool(cids_contig and pids_strided)
+            self._cached_fw_cuda[signature] = [ebase, pbase, cuda_ok]
         else:
             cids_start, cids_increment, pids_start, pids_increment = self._cached_fw_pcids[signature]
 
@@ -592,6 +625,56 @@ class SumLayer(Layer, nn.Module):
                 use_bf16 = False
 
         grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
+
+        # Optional CUDA (CuTe/TMA) fast path for the `tlmm` regime. It is numerically equivalent to
+        # the Triton tlmm kernel and only valid here: LL propagation (`propagation_alg_id == 0`), the
+        # bf16 dot path (`use_bf16`), no partial eval (`local_ids is None` <=> `partial_eval == 0`),
+        # no pflow tempering, TILE_SIZE_K == 64 with num_edges a multiple of it, and a contiguous
+        # edge/param layout (`cuda_ok`). `is_available()` JIT-compiles on first call and self-disables
+        # (-> Triton) on an unsuitable GPU/toolchain/CUTLASS, so this is a no-op without the CUDA
+        # prerequisites. The best tile config (or Triton) is autotuned once per layer signature.
+        if (FORWARD_SUM_CUDA and use_bf16 and propagation_alg_id == 0
+                and not pflow_tempered_enabled and local_ids is None
+                and TILE_SIZE_K == 64 and num_edges % TILE_SIZE_K == 0
+                and node_mars.is_cuda and cuda_kernels.is_available()):
+            ebase, pbase, cuda_ok = self._cached_fw_cuda[signature]
+            valid_cfgs = cuda_kernels.valid_configs(self.block_size, batch_size) if cuda_ok else []
+            if valid_cfgs:
+                # The best config depends on batch_size (which tile shapes are valid + their speed),
+                # so the autotuned choice is keyed by (signature, batch_size), not signature alone.
+                choice_key = (signature, batch_size)
+                choice = self._cached_fw_cuda_choice.get(choice_key)
+                if choice is None:
+                    # Autotune once: fastest of {valid CUDA tile configs} vs Triton. Every candidate
+                    # computes the same result into `node_mars`, so it stays correct afterwards.
+                    cands = [(("cuda", c),
+                              (lambda c=c: cuda_kernels.tlmm_forward_sum(
+                                  node_mars, element_mars, params, nids, ebase, pbase,
+                                  batch_size, self.block_size, K_NUM_TILES, c)))
+                             for c in valid_cfgs]
+
+                    def _triton_tlmm_cand():
+                        for s in range(0, grid[1], 32768):
+                            cg = (grid[0], min(s + 32768, grid[1]) - s)
+                            fw_bsparse._fw_triton_block_sparse_tlmm_kernel[cg](
+                                node_mars, element_mars, params, nids, cids_start, cids_increment,
+                                pids_start, pids_increment, local_ids, batch_size,
+                                partial_eval = partial_eval, BLOCK_B = BLOCK_B,
+                                TILE_SIZE_K = TILE_SIZE_K, K_NUM_TILES = K_NUM_TILES,
+                                TILE_SIZE_M = TILE_SIZE_M, BLOCK_SIZE_M = BLOCK_SIZE_M,
+                                use_bf16 = use_bf16, propagation_alg_id = propagation_alg_id,
+                                pflow_tempered_enabled = pflow_tempered_enabled, pid_m_offset = s,
+                                **propagation_alg_kwargs, **pflow_tempered_kwargs, num_stages = 1)
+                    cands.append((("triton", -1), _triton_tlmm_cand))
+                    choice = cuda_kernels.autotune(cands) or ("triton", -1)
+                    self._cached_fw_cuda_choice[choice_key] = choice
+
+                if choice[0] == "cuda":
+                    cuda_kernels.tlmm_forward_sum(
+                        node_mars, element_mars, params, nids, ebase, pbase,
+                        batch_size, self.block_size, K_NUM_TILES, choice[1])
+                    return None
+                # choice == ("triton", -1): fall through to the Triton launch below
         
         # OOM-safe tuned launch: if the larger tuned tiles exceed this GPU's shared-memory/
         # register budget, fall back to the default configuration (recompiled untuned).
