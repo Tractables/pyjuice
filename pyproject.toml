@@ -38,6 +38,11 @@ where = "src"
 [tool.setuptools.dynamic]
 readme = {file = "README.md"}
 
+# Ship the CUDA source for the optional JIT-compiled fast-path kernels with the package, so it is
+# present in installed trees / wheels (it is compiled at runtime via torch.utils.cpp_extension).
+[tool.setuptools.package-data]
+"pyjuice.layer.kernels.c" = ["*.cu", "*.cuh", "*.h"]
+
 [tool.pytest.ini_options]
 addopts = [
     "--import-mode=importlib",
