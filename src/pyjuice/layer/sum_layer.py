@@ -45,6 +45,17 @@ BACKWARD_PAR_FLOW_TUNED = True
 # (element-output tiling only, so bit-exact). Tuned for an RTX PRO 6000; set False to disable.
 BACKWARD_ELE_FLOW_TUNED = True
 
+# Launch tuning for the block-sparse sum-layer FORWARD kernel (kernel body unchanged). In the LL
+# block-sparse-dot regime, `emars_max` / `exp(emars - max)` / the `emars` load depend only on
+# (edge, batch), not on the output node, so the standard `TILE_SIZE_M = 32` recomputes them
+# `block_size / TILE_SIZE_M` times across the m-tile programs of a block. `TILE_SIZE_M` and
+# `BLOCK_B` are pure output- / batch-tiling (the max stabilizer is over `TILE_SIZE_K` edges,
+# left unchanged), so enlarging them is BIT-EXACT; doing so amortizes the redundant max/exp/load
+# (`TILE_SIZE_M`) and the `epars` load (`BLOCK_B`). Raises the tile cap 2048 -> 4096 (=> 64x64 for
+# `TILE_SIZE_K = 64`). Auto-falls-back on `OutOfResources` (smaller GPUs). Tuned for an RTX PRO
+# 6000 (Blackwell); set False to recover the exact original launch configuration.
+FORWARD_SUM_TUNED = True
+
 
 class SumLayer(Layer, nn.Module):
 
@@ -531,8 +542,13 @@ class SumLayer(Layer, nn.Module):
         else:
             remainder = 2048 // (base_size ** 2)
             TILE_SIZE_K = min(2048 // remainder, base_size * remainder, num_edges)
-        TILE_SIZE_M = min(2048 // TILE_SIZE_K, self.block_size)
-        BLOCK_B = min(2048 // TILE_SIZE_K, BATCH_SIZE_NP2)
+        # Larger TILE_SIZE_M / BLOCK_B (bit-exact) amortize the per-m-tile recomputation of
+        # `emars_max` / `exp` / the `emars` load and the per-batch-tile `epars` load. Gated to the
+        # LL (non-tempered) regime that was validated bit-exact; auto-disabled on a prior OOM.
+        _fw_tile_cap = 4096 if (FORWARD_SUM_TUNED and not getattr(self, "_fw_tuning_oom", False)
+                                and propagation_alg_id == 0 and not pflow_tempered_enabled) else 2048
+        TILE_SIZE_M = min(_fw_tile_cap // TILE_SIZE_K, self.block_size)
+        BLOCK_B = min(_fw_tile_cap // TILE_SIZE_K, BATCH_SIZE_NP2)
         K_NUM_TILES = num_edges // TILE_SIZE_K
 
         assert TILE_SIZE_K >= 4, f"`TILE_SIZE_K` should be greater than 4 (but got {TILE_SIZE_K}) in order to use the block-sparse kernel. " \
@@ -577,93 +593,108 @@ class SumLayer(Layer, nn.Module):
 
         grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
         
-        for pid_m_start in range(0, grid[1], 32768):
-            pid_m_end = min(pid_m_start + 32768, grid[1])
-            block_m_size = pid_m_end - pid_m_start
+        # OOM-safe tuned launch: if the larger tuned tiles exceed this GPU's shared-memory/
+        # register budget, fall back to the default configuration (recompiled untuned).
+        try:
+            for pid_m_start in range(0, grid[1], 32768):
+                pid_m_end = min(pid_m_start + 32768, grid[1])
+                block_m_size = pid_m_end - pid_m_start
 
-            curr_grid = (grid[0], block_m_size)
+                curr_grid = (grid[0], block_m_size)
         
-            if TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and BLOCK_B >= 16:
-                fw_bsparse._fw_triton_block_sparse_tlmm_kernel[curr_grid](
-                    node_mars, 
-                    element_mars, 
-                    params, 
-                    nids, 
-                    cids_start,
-                    cids_increment, 
-                    pids_start,
-                    pids_increment,
-                    local_ids,
-                    batch_size,
-                    partial_eval = partial_eval,
-                    BLOCK_B = BLOCK_B,
-                    TILE_SIZE_K = TILE_SIZE_K,
-                    K_NUM_TILES = K_NUM_TILES,
-                    TILE_SIZE_M = TILE_SIZE_M,
-                    BLOCK_SIZE_M = BLOCK_SIZE_M,
-                    use_bf16 = use_bf16,
-                    propagation_alg_id = propagation_alg_id,
-                    pflow_tempered_enabled = pflow_tempered_enabled,
-                    pid_m_offset = pid_m_start,
-                    **propagation_alg_kwargs,
-                    **pflow_tempered_kwargs,
-                    num_stages = 1
-                )
+                if TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and BLOCK_B >= 16:
+                    fw_bsparse._fw_triton_block_sparse_tlmm_kernel[curr_grid](
+                        node_mars, 
+                        element_mars, 
+                        params, 
+                        nids, 
+                        cids_start,
+                        cids_increment, 
+                        pids_start,
+                        pids_increment,
+                        local_ids,
+                        batch_size,
+                        partial_eval = partial_eval,
+                        BLOCK_B = BLOCK_B,
+                        TILE_SIZE_K = TILE_SIZE_K,
+                        K_NUM_TILES = K_NUM_TILES,
+                        TILE_SIZE_M = TILE_SIZE_M,
+                        BLOCK_SIZE_M = BLOCK_SIZE_M,
+                        use_bf16 = use_bf16,
+                        propagation_alg_id = propagation_alg_id,
+                        pflow_tempered_enabled = pflow_tempered_enabled,
+                        pid_m_offset = pid_m_start,
+                        **propagation_alg_kwargs,
+                        **pflow_tempered_kwargs,
+                        num_stages = 1
+                    )
                 
-            elif TILE_SIZE_M >= 8 and TILE_SIZE_K >= 8 and BLOCK_B >= 8:
-                fw_bsparse._fw_triton_block_sparse_csmm1_kernel[curr_grid](
-                    node_mars, 
-                    element_mars, 
-                    params, 
-                    nids, 
-                    cids_start,
-                    cids_increment, 
-                    pids_start,
-                    pids_increment,
-                    local_ids,
-                    batch_size,
-                    partial_eval = partial_eval,
-                    BLOCK_B = BLOCK_B,
-                    TILE_SIZE_K = TILE_SIZE_K,
-                    K_NUM_TILES = K_NUM_TILES,
-                    TILE_SIZE_M = TILE_SIZE_M,
-                    BLOCK_SIZE_M = BLOCK_SIZE_M,
-                    use_bf16 = use_bf16,
-                    propagation_alg_id = propagation_alg_id,
-                    pflow_tempered_enabled = pflow_tempered_enabled,
-                    pid_m_offset = pid_m_start,
-                    **propagation_alg_kwargs,
-                    **pflow_tempered_kwargs,
-                    num_stages = 1
-                )
+                elif TILE_SIZE_M >= 8 and TILE_SIZE_K >= 8 and BLOCK_B >= 8:
+                    fw_bsparse._fw_triton_block_sparse_csmm1_kernel[curr_grid](
+                        node_mars, 
+                        element_mars, 
+                        params, 
+                        nids, 
+                        cids_start,
+                        cids_increment, 
+                        pids_start,
+                        pids_increment,
+                        local_ids,
+                        batch_size,
+                        partial_eval = partial_eval,
+                        BLOCK_B = BLOCK_B,
+                        TILE_SIZE_K = TILE_SIZE_K,
+                        K_NUM_TILES = K_NUM_TILES,
+                        TILE_SIZE_M = TILE_SIZE_M,
+                        BLOCK_SIZE_M = BLOCK_SIZE_M,
+                        use_bf16 = use_bf16,
+                        propagation_alg_id = propagation_alg_id,
+                        pflow_tempered_enabled = pflow_tempered_enabled,
+                        pid_m_offset = pid_m_start,
+                        **propagation_alg_kwargs,
+                        **pflow_tempered_kwargs,
+                        num_stages = 1
+                    )
 
-            else:
-                fw_bsparse._fw_triton_block_sparse_csmm2_kernel[curr_grid](
-                    node_mars, 
-                    element_mars, 
-                    params, 
-                    nids, 
-                    cids_start,
-                    cids_increment, 
-                    pids_start,
-                    pids_increment,
-                    local_ids,
-                    batch_size,
-                    partial_eval = partial_eval,
-                    BLOCK_B = BLOCK_B,
-                    TILE_SIZE_K = TILE_SIZE_K,
-                    K_NUM_TILES = K_NUM_TILES,
-                    TILE_SIZE_M = TILE_SIZE_M,
-                    BLOCK_SIZE_M = BLOCK_SIZE_M,
-                    use_bf16 = use_bf16,
-                    propagation_alg_id = propagation_alg_id,
-                    pflow_tempered_enabled = pflow_tempered_enabled,
-                    pid_m_offset = pid_m_start,
-                    **propagation_alg_kwargs,
-                    **pflow_tempered_kwargs,
-                    num_stages = 1
-                )
-        
+                else:
+                    fw_bsparse._fw_triton_block_sparse_csmm2_kernel[curr_grid](
+                        node_mars, 
+                        element_mars, 
+                        params, 
+                        nids, 
+                        cids_start,
+                        cids_increment, 
+                        pids_start,
+                        pids_increment,
+                        local_ids,
+                        batch_size,
+                        partial_eval = partial_eval,
+                        BLOCK_B = BLOCK_B,
+                        TILE_SIZE_K = TILE_SIZE_K,
+                        K_NUM_TILES = K_NUM_TILES,
+                        TILE_SIZE_M = TILE_SIZE_M,
+                        BLOCK_SIZE_M = BLOCK_SIZE_M,
+                        use_bf16 = use_bf16,
+                        propagation_alg_id = propagation_alg_id,
+                        pflow_tempered_enabled = pflow_tempered_enabled,
+                        pid_m_offset = pid_m_start,
+                        **propagation_alg_kwargs,
+                        **pflow_tempered_kwargs,
+                        num_stages = 1
+                    )
+        except _TritonOutOfResources:
+            # `OutOfResources` is raised at compile time before any write, so retry is safe.
+            if not (FORWARD_SUM_TUNED and not getattr(self, "_fw_tuning_oom", False)
+                    and propagation_alg_id == 0 and not pflow_tempered_enabled):
+                raise
+            self._fw_tuning_oom = True
+            warnings.warn("Forward sum-layer tile tuning (FORWARD_SUM_TUNED) exceeded shared "
+                          "memory on this GPU; falling back to the default launch config.", RuntimeWarning)
+            return self._forward_block_sparse(
+                node_mars, element_mars, params, nids, cids, pids, local_ids=local_ids,
+                partition_id=partition_id, force_use_bf16=force_use_bf16,
+                force_use_fp32=force_use_fp32, propagation_alg=propagation_alg,
+                pflow_temperature=pflow_temperature, **kwargs)
         return None
 
     def _forward_sparse(self, node_mars: torch.Tensor, element_mars: torch.Tensor,
