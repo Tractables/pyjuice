@@ -52,11 +52,15 @@ def _find_cutlass_include() -> Optional[str]:
                 if _ok(cand):
                     return cand
 
-    # 2. nvidia-cutlass pip package (ships headers under the package dir)
+    # 2. nvidia-cutlass pip package (ships headers under the package dir). The layout has varied across
+    # releases: nvidia-cutlass >= 4.x puts them at `cutlass_library/source/include`; older wheels used
+    # `<base>/include` or a sibling `include/`. Try all known locations.
     try:
         import cutlass_library  # noqa: F401  (provided by the nvidia-cutlass package)
         base = os.path.dirname(os.path.abspath(cutlass_library.__file__))
-        for cand in (os.path.join(base, "..", "include"), os.path.join(base, "include")):
+        for cand in (os.path.join(base, "source", "include"),  # nvidia-cutlass >= 4.x
+                     os.path.join(base, "..", "include"),
+                     os.path.join(base, "include")):
             cand = os.path.normpath(cand)
             if _ok(cand):
                 return cand
