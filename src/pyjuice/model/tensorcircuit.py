@@ -252,8 +252,8 @@ class TensorCircuit(nn.Module):
             ## Initialize buffers for forward pass ##
 
             if not _no_buffer_reset:
-                self._init_buffer(name = "node_mars", shape = (self.num_nodes, B), set_value = 0.0)
-                self._init_buffer(name = "element_mars", shape = (self.num_elements, B), set_value = -torch.inf)
+                self._init_buffer(name = "node_mars", shape = (self.num_nodes, B), set_value = 0.0, fill_each_call = False, dummy_reset = self.num_dummy_nodes)
+                self._init_buffer(name = "element_mars", shape = (self.num_elements, B), set_value = -torch.inf, fill_each_call = False, dummy_reset = self.num_dummy_eles)
                 if pflow_tempered_enabled:
                     self._init_buffer(name = "node_mars_tempered", shape = (self.num_nodes, B), set_value = 0.0)
                     kwargs["node_mars_tempered"] = self.node_mars_tempered
@@ -419,7 +419,7 @@ class TensorCircuit(nn.Module):
 
             if not _disable_buffer_init:
                 self._init_buffer(name = "node_flows", shape = (self.num_nodes, B), set_value = 0.0 if not logspace_flows else -float("inf"))
-                self._init_buffer(name = "element_flows", shape = (self.num_elements, B), set_value = 0.0 if not logspace_flows else -float("inf"))
+                self._init_buffer(name = "element_flows", shape = (self.num_elements, B), set_value = 0.0 if not logspace_flows else -float("inf"), fill_each_call = False, dummy_reset = self.num_dummy_eles)
 
             # Tempered pflows
             if abs(pflow_temperature - 1.0) >= 1e-6:
@@ -917,29 +917,35 @@ class TensorCircuit(nn.Module):
         if backward:
             self._bk_partial_eval_enabled = False
 
-    def _init_buffer(self, name: str, shape: Tuple, set_value: Optional[float] = None, check_device: bool = True):
+    def _init_buffer(self, name: str, shape: Tuple, set_value: Optional[float] = None, check_device: bool = True,
+                     fill_each_call: bool = True, dummy_reset: int = 0):
         flag = False
         if not name in self.__dict__:
             flag = True
-        
+
         tensor = self.__dict__[name]
         if not flag and not isinstance(tensor, torch.Tensor):
             flag = True
-        
+
         if not flag and tensor.dim() != len(shape):
             flag = True
 
         for i, d in enumerate(shape):
             if not flag and tensor.size(i) != d:
                 flag = True
-        
+
         if not flag and check_device and self.device.index is not None and tensor.device != self.device:
             flag = True
 
         if flag:
             self.__dict__[name] = torch.zeros(shape, device = self.device)
 
-        if set_value is not None:
+        # `fill_each_call = False` skips the per-iter full memset for buffers that are fully overwritten
+        # every pass (node_mars / element_mars / element_flows) -> the full fill is redundant (verified
+        # bit-identical). But the `dummy_reset` prefix (the dummy nodes/elements, which are NOT written
+        # by any layer) is ALWAYS reset as a cheap safety net against unexpected writes. `node_flows`
+        # keeps fill_each_call = True (it is accumulated via logaddexp, so it must reset every backward).
+        if set_value is not None and (flag or fill_each_call):
             if len(shape) == 1:
                 self.__dict__[name][:] = set_value
             elif len(shape) == 2:
@@ -952,6 +958,8 @@ class TensorCircuit(nn.Module):
                 self.__dict__[name][:,:,:,:,:] = set_value
             else:
                 raise ValueError(f"Too many dimensions ({len(shape)}).")
+        elif set_value is not None and dummy_reset > 0:
+            self.__dict__[name][:dummy_reset] = set_value  # always reset dummy prefix (near-free)
 
     def _buffer_matches(self, name: str, cache: Optional[dict], check_device: bool = True):
         if cache is None:
