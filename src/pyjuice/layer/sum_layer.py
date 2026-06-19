@@ -45,6 +45,17 @@ BACKWARD_PAR_FLOW_TUNED = True
 # (element-output tiling only, so bit-exact). Tuned for an RTX PRO 6000; set False to disable.
 BACKWARD_ELE_FLOW_TUNED = True
 
+# Optional CUDA (CuTe/CUTLASS + fp16 + TMA) fast path for the block-sparse element-flow backward
+# `_bk_triton_block_sparse_ele_kernel`. When enabled AND all dispatch conditions hold (LL, logspace
+# flows, allow_modify_flows / allow_neg_flows / accumulate_ch_flows all off, no tempering / partial
+# eval, TILE_SIZE_K == 64, ptr_inc_step == 1, block_size % 128 == 0, batch % 64 == 0, and a
+# TMA-capable GPU sm_90+ with CUTLASS), it replaces the Triton ele launch. Numerically equivalent
+# (fp16 dot + fp32 accumulate; ~1.07e-3 in log-space, under the 1.5e-3 bound). The best of {CUDA,
+# Triton} is autotuned once per layer signature INTO A SCRATCH BUFFER (never the live element_flows,
+# which is read-accumulate-write when accumulate_ch_flows=True) and cached. Falls back to Triton on
+# any unsupported shape / missing toolchain. Set False to disable.
+BACKWARD_ELE_FLOW_CUDA = True
+
 # Launch tuning for the block-sparse sum-layer FORWARD kernel (kernel body unchanged). In the LL
 # block-sparse-dot regime, `emars_max` / `exp(emars - max)` / the `emars` load depend only on
 # (edge, batch), not on the output node, so the standard `TILE_SIZE_M = 32` recomputes them
@@ -244,6 +255,12 @@ class SumLayer(Layer, nn.Module):
 
         # Store pre-compiled indices from `parids` and `parpids` in the following buffer
         self._cached_bk_parids = dict()
+
+        # Optional CUDA ele-backward fast path: per-signature (ebase, pbase, cuda_ok), per-(signature,
+        # batch) autotuned choice, and a reused scratch output buffer for corruption-safe autotuning.
+        self._cached_bk_ele_cuda = dict()
+        self._cached_bk_ele_choice = dict()
+        self._bk_ele_scratch = None
 
     def to(self, device):
         super(SumLayer, self).to(device)
@@ -1255,6 +1272,20 @@ class SumLayer(Layer, nn.Module):
             ).contiguous()
 
             self._cached_bk_parids[signature] = [parids_start, parids_increment, parpids_start, parpids_increment, ptr_inc_step]
+
+            # Pre-compute the CUDA fast-path operands: per-tile first parent-node index (`ebase`) and
+            # first param offset (`pbase`) = cumsum-reconstruction of the parids / parpids starts +
+            # increments. The kernel reads node_*[ebase + e] and mp[pbase + m*BLOCK_SIZE_K + e] over
+            # the tile's BK contiguous edges; that contiguity is structural when ptr_inc_step == 1
+            # (single param-block group per tile), which is the only layout the CUDA kernel supports.
+            def _cumbase(start, incr):
+                c = torch.cumsum(incr.to(torch.int64), 1)
+                sh = torch.zeros_like(c); sh[:, 1:] = c[:, :-1]
+                return (start[:, None, :].to(torch.int64) + sh)[:, :, 0].contiguous()
+            ele_ebase = _cumbase(parids_start, parids_increment)    # [n_eleblocks, K_NUM_TILES]
+            ele_pbase = _cumbase(parpids_start, parpids_increment)
+            ele_cuda_ok = (ptr_inc_step == 1)
+            self._cached_bk_ele_cuda[signature] = [ele_ebase, ele_pbase, ele_cuda_ok]
         else:
             parids_start, parids_increment, parpids_start, parpids_increment, ptr_inc_step = self._cached_bk_parids[signature]
 
@@ -1276,6 +1307,63 @@ class SumLayer(Layer, nn.Module):
             TL_DOT = 0
 
         grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
+
+        # Optional CUDA (CuTe/fp16/TMA) fast path for the element-flow backward `tlmm` regime. It is
+        # numerically equivalent to the Triton ele kernel (fp16 dot + fp32 accumulate; ~1.07e-3
+        # log-space) and only valid here: LL, logspace flows, allow_modify_flows / allow_neg_flows /
+        # accumulate_ch_flows all off, no tempering / partial eval, the bf16/fp16 dot regime
+        # (TL_DOT, not force_use_fp32), TILE_SIZE_K == 64, ptr_inc_step == 1 (contiguous layout),
+        # block_size % 128 == 0, batch % 64 == 0, and a TMA-capable GPU with CUTLASS. The best of
+        # {CUDA, Triton} is autotuned once per (signature, batch) -- INTO A SCRATCH buffer, never the
+        # live element_flows (which is read-accumulate-write when accumulate_ch_flows is on) -- and
+        # cached. Otherwise it falls through to the Triton launch below.
+        if (BACKWARD_ELE_FLOW_CUDA and propagation_alg_id == 0 and abs(eflow_temperature - 1.0) < 1e-6
+                and allow_modify_flows == 0 and logspace_flows and not allow_neg_flows
+                and not accumulate_ch_flows and local_ids is None and not force_use_fp32
+                and TILE_SIZE_K == 64 and num_edges % TILE_SIZE_K == 0
+                and cs_block_size % 128 == 0 and batch_size % 64 == 0
+                and node_flows.is_cuda and cuda_kernels.ele_is_available()):
+            ele_ebase, ele_pbase, ele_cuda_ok = self._cached_bk_ele_cuda[signature]
+            if ele_cuda_ok:
+                def _cuda_ele(tgt):
+                    cuda_kernels.ele_backward_sum(
+                        tgt, element_mars, node_flows, node_mars, params, chids, ele_ebase, ele_pbase,
+                        batch_size, self.block_size, cs_block_size, K_NUM_TILES)
+
+                def _triton_ele(tgt):
+                    for s in range(0, grid[1], 32768):
+                        cg = (grid[0], min(s + 32768, grid[1]) - s)
+                        bk_ele_bsparse._bk_triton_block_sparse_ele_kernel[cg](
+                            node_flows = node_flows, element_flows = tgt, node_mars = node_mars,
+                            element_mars = element_mars, mparams = params, chids = chids,
+                            parids_start = parids_start, parids_increment = parids_increment,
+                            parpids_start = parpids_start, parpids_increment = parpids_increment,
+                            local_ids = local_ids, batch_size = batch_size, partial_eval = partial_eval,
+                            ptr_inc_step = ptr_inc_step, allow_modify_flows = allow_modify_flows,
+                            logspace_flows = logspace_flows, BLOCK_B = BLOCK_B, TILE_SIZE_K = TILE_SIZE_K,
+                            K_NUM_TILES = K_NUM_TILES, TILE_SIZE_M = TILE_SIZE_M,
+                            BLOCK_SIZE_M = BLOCK_SIZE_M, BLOCK_SIZE_K = BLOCK_SIZE_K, TL_DOT = TL_DOT,
+                            num_stages = 1, propagation_alg_id = propagation_alg_id,
+                            accumulate_ch_flows = accumulate_ch_flows, allow_neg_flows = allow_neg_flows,
+                            pid_m_offset = s, **propagation_alg_kwargs)
+
+                choice_key = (signature, batch_size)
+                choice = self._cached_bk_ele_choice.get(choice_key)
+                if choice is None:
+                    # autotune into a SCRATCH clone (corruption-safe); the live element_flows is
+                    # touched only by the single real run below.
+                    if (self._bk_ele_scratch is None or self._bk_ele_scratch.shape != element_flows.shape
+                            or self._bk_ele_scratch.dtype != element_flows.dtype):
+                        self._bk_ele_scratch = torch.empty_like(element_flows)
+                    scr = self._bk_ele_scratch
+                    choice = cuda_kernels.autotune(
+                        [(("cuda", 0), (lambda: _cuda_ele(scr))),
+                         (("triton", -1), (lambda: _triton_ele(scr)))]) or ("triton", -1)
+                    self._cached_bk_ele_choice[choice_key] = choice
+                if choice[0] == "cuda":
+                    _cuda_ele(element_flows)
+                    return None
+                # choice == ("triton", -1): fall through to the Triton launch below
 
         for pid_m_start in range(0, grid[1], 32768):
             pid_m_end = min(pid_m_start + 32768, grid[1])

@@ -29,9 +29,12 @@ _MIN_CC = (9, 0)
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Lazy singletons: None = not attempted yet, False = attempted and unavailable, module = loaded.
-_module = None
+# Lazy singletons: None = not attempted yet, module = loaded, False = attempted and unavailable.
+_module = None          # forward (tlmm)
 _attempted = False
+_ele_module = None      # element-flow backward
+_ele_attempted = False
+_flags_cache = "unset"  # cached (cuda_cflags, ldflags) or None; computed once
 
 
 def _find_cutlass_include() -> Optional[str]:
@@ -67,20 +70,21 @@ def _find_cutlass_include() -> Optional[str]:
     return None
 
 
-def _build():
-    """Attempt the JIT build. Returns the loaded module or None (and warns once on failure)."""
-    if not ENABLE_CUDA_KERNELS:
+def _compile_flags():
+    """Return (cuda_cflags, ldflags) for nvcc, or None if a prerequisite is missing. Computed once
+    (warns once) and cached, so multiple kernel modules share the same toolchain probe."""
+    global _flags_cache
+    if _flags_cache != "unset":
+        return _flags_cache
+    _flags_cache = None
+    if not ENABLE_CUDA_KERNELS or not torch.cuda.is_available():
         return None
-    if not torch.cuda.is_available():
-        return None
-
     cc = torch.cuda.get_device_capability()
     if cc < _MIN_CC:
         warnings.warn(
             f"pyjuice CUDA sum-layer kernels need compute capability >= {_MIN_CC[0]}.{_MIN_CC[1]} "
             f"(TMA); this GPU is sm_{cc[0]}{cc[1]}. Using the Triton kernels.", RuntimeWarning)
         return None
-
     cutlass_inc = _find_cutlass_include()
     if cutlass_inc is None:
         warnings.warn(
@@ -88,44 +92,64 @@ def _build():
             "$PYJUICE_CUTLASS_PATH to a CUTLASS checkout (>= 3.5) or `pip install nvidia-cutlass` "
             "to enable it. Falling back to the Triton kernels.", RuntimeWarning)
         return None
-
-    from torch.utils.cpp_extension import load, CUDA_HOME
-
+    from torch.utils.cpp_extension import CUDA_HOME
     arch = f"sm_{cc[0]}{cc[1]}a"  # arch-specific (the `a` suffix enables TMA & family features)
-    cuda_cflags = [
-        "-O3", f"-arch={arch}", "--use_fast_math",
-        "--expt-relaxed-constexpr", "--expt-extended-lambda", "-DNDEBUG",
-        f"-I{cutlass_inc}",
-    ]
-    # `-lcuda` for the driver API (cuTensorMapEncodeTiled). The stubs dir guarantees the linker
-    # finds libcuda even on build hosts without a driver lib on the default search path.
+    cuda_cflags = ["-O3", f"-arch={arch}", "--use_fast_math",
+                   "--expt-relaxed-constexpr", "--expt-extended-lambda", "-DNDEBUG", f"-I{cutlass_inc}"]
+    # `-lcuda` for the driver API (cuTensorMapEncodeTiled). The stubs dir guarantees the linker finds
+    # libcuda even on build hosts without a driver lib on the default search path.
     ldflags = ["-lcuda"]
     if CUDA_HOME:
         ldflags = [f"-L{os.path.join(CUDA_HOME, 'lib64', 'stubs')}"] + ldflags
+    _flags_cache = (cuda_cflags, ldflags)
+    return _flags_cache
 
+
+def _jit(name: str, source_file: str):
+    """JIT-compile one .cu into a loaded module, or None (warns once on failure)."""
+    fl = _compile_flags()
+    if fl is None:
+        return None
+    cuda_cflags, ldflags = fl
+    from torch.utils.cpp_extension import load
     try:
-        mod = load(
-            name = "pyjuice_sum_forward_cuda",
-            sources = [os.path.join(_THIS_DIR, "tlmm_forward_sum.cu")],
-            extra_cuda_cflags = cuda_cflags,
-            extra_ldflags = ldflags,
-            verbose = False,
-        )
-        return mod
+        return load(name=name, sources=[os.path.join(_THIS_DIR, source_file)],
+                    extra_cuda_cflags=cuda_cflags, extra_ldflags=ldflags, verbose=False)
     except Exception as e:  # nvcc missing, compile error, CUTLASS too old, etc.
         warnings.warn(
-            f"pyjuice CUDA sum-layer kernel failed to compile ({type(e).__name__}: {e}). "
+            f"pyjuice CUDA kernel '{name}' failed to compile ({type(e).__name__}: {e}). "
             "Falling back to the Triton kernels.", RuntimeWarning)
         return None
 
 
 def is_available() -> bool:
-    """Whether the CUDA fast-path kernels are usable (lazily attempts the JIT build once)."""
+    """Whether the CUDA forward fast-path kernel is usable (lazily JIT-compiles once)."""
     global _module, _attempted
     if not _attempted:
         _attempted = True
-        _module = _build()
+        _module = _jit("pyjuice_sum_forward_cuda", "tlmm_forward_sum.cu")
     return _module is not None
+
+
+def ele_is_available() -> bool:
+    """Whether the CUDA element-flow backward fast-path kernel is usable (lazily JIT-compiles once)."""
+    global _ele_module, _ele_attempted
+    if not _ele_attempted:
+        _ele_attempted = True
+        _ele_module = _jit("pyjuice_sum_backward_ele_cuda", "ele_backward_sum.cu")
+    return _ele_module is not None
+
+
+def ele_backward_sum(element_flows: torch.Tensor, element_mars: torch.Tensor, node_flows: torch.Tensor,
+                     node_mars: torch.Tensor, params: torch.Tensor, chids: torch.Tensor,
+                     ebase: torch.Tensor, pbase: torch.Tensor,
+                     batch_size: int, block_size_k: int, block_size_m: int, k_num_tiles: int) -> None:
+    """Block-sparse sum-layer element-flow backward (in-place into ``element_flows``). Caller must
+    guarantee the dispatch conditions hold (see ``ele_is_available`` + the gate in
+    ``sum_layer._backward_block_sparse``)."""
+    _ele_module.ele_backward_sum(element_flows, element_mars, node_flows, node_mars, params, chids,
+                                 ebase, pbase, int(batch_size), int(block_size_k), int(block_size_m),
+                                 int(k_num_tiles))
 
 
 def tlmm_forward_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor,
