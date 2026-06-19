@@ -102,6 +102,7 @@ __global__ void __launch_bounds__(NTH) ele_kernel(
     Tensor tXsA = s2rA.get_thread_slice(tid).partition_S(sAt); Tensor tXrA = s2rA.get_thread_slice(tid).retile_D(tCrA);
     Tensor tXsB = s2rB.get_thread_slice(tid).partition_S(sBt); Tensor tXrB = s2rB.get_thread_slice(tid).retile_D(tCrB);
     Tensor cC = make_identity_tensor(Shape<Int<BM>, Int<BN>>{}); Tensor tCcC = thr.partition_C(cC);
+    // tCrS = per-k-tile MMA result; (tCrL, tCrM) = running (sum, max) of the online log-sum-exp across k-tiles.
     Tensor tCrS = thr.partition_fragment_C(cC); Tensor tCrL = thr.partition_fragment_C(cC); Tensor tCrM = thr.partition_fragment_C(cC);
     clear(tCrL);
     CUTE_UNROLL
@@ -116,11 +117,13 @@ __global__ void __launch_bounds__(NTH) ele_kernel(
             tma_load_2d(sNm, &descNm, b0, (int)ec, bar);
         }
         mbar_wait(bar, phase); phase ^= 1;
+        // log_n_fdm[e,b] = node_flows[par,b] - node_mars[par,b] (in-place into sLf); -inf mar -> -inf.
         for (int i = tid; i < (BK * BN) / 4; i += NTH) { int idx = i * 4;
             float4 nf = *(const float4*)&sLf[idx]; float4 nm = *(const float4*)&sNm[idx];
             float4 lf; lf.x = (nm.x == -INFINITY) ? -INFINITY : nf.x - nm.x; lf.y = (nm.y == -INFINITY) ? -INFINITY : nf.y - nm.y;
             lf.z = (nm.z == -INFINITY) ? -INFINITY : nf.z - nm.z; lf.w = (nm.w == -INFINITY) ? -INFINITY : nf.w - nm.w; *(float4*)&sLf[idx] = lf; }
         __syncthreads();
+        // per-batch max over this k-tile's edges (max-stabilization for the exp below).
         for (int b = tid; b < BN; b += NTH) { float mx = -INFINITY; for (int e = 0; e < BK; e++) mx = fmaxf(mx, sLf[e * BN + b]); sMx[b] = mx; }
         __syncthreads();
         // B[b,e] = nfsub (e-contiguous, 8/float4)
@@ -135,8 +138,10 @@ __global__ void __launch_bounds__(NTH) ele_kernel(
             r[4] = static_cast<half_t>(b2.x); r[5] = static_cast<half_t>(b2.y); r[6] = static_cast<half_t>(b2.z); r[7] = static_cast<half_t>(b2.w);
             *(float4*)&sAt(m, ee) = *(const float4*)r; }
         __syncthreads();
+        // fp16 tensor-core dot: partial[m,b] = sum_e epars[m,e] * nfsub[e,b], accumulated in fp32.
         copy(s2rA, tXsA, tXrA); copy(s2rB, tXsB, tXrB);
         clear(tCrS); cute::gemm(mma, tCrA, tCrB, tCrS);
+        // online log-sum-exp merge of this k-tile's (partial, max=pfm) into the running (L=tCrL, M=tCrM).
         CUTE_UNROLL
         for (int i = 0; i < size(tCrS); i++) { int b = get<1>(tCcC(i));
             float partial = tCrS(i); float pfm = sMx[b];
@@ -144,6 +149,7 @@ __global__ void __launch_bounds__(NTH) ele_kernel(
             if (nM != -INFINITY) { float pa = (Mo == -INFINITY) ? 0.f : Lo * __expf(Mo - nM); float pc2 = (pfm == -INFINITY) ? 0.f : partial * __expf(pfm - nM); tCrL(i) = pa + pc2; tCrM(i) = nM; } }
         __syncthreads();
     }
+    // finalize: element_flows[m,b] = element_mars[m,b] + (log(L) + M)   [the +emars folds the loop-invariant factor back in]
     CUTE_UNROLL
     for (int i = 0; i < size(tCrL); i++) { int m = get<0>(tCcC(i)), b = get<1>(tCcC(i));
         if (m < BM && b < BN) { float r = (tCrM(i) == -INFINITY) ? -INFINITY : (logf(tCrL(i)) + tCrM(i));

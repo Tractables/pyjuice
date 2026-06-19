@@ -1,5 +1,32 @@
-// Param-flow backward, edge-blocked, BK=32 (half the smem of BK=64 -> 4 CTAs/SM = 2x occupancy to
-// hide load latency). Plain K-major smem + auto-vectorized smem->reg copy (no LDSM swizzle needed).
+// CUDA (CuTe/CUTLASS + TMA) implementation of the block-sparse sum-layer PARAMETER-FLOW backward
+// kernel (the "_bk_triton_block_sparse_par_kernel" path, LL / logspace_flows regime).
+//
+// Computes, per (output node-block m, edge-block e), the parameter flow -- a GEMM contracting over the
+// BATCH dimension:
+//   pflow[m,e] = epars[m,e] * sum_b exp( (node_flows[m,b] - node_mars[m,b]) + element_mars[e,b] )
+//             += into param_flows (read-modify-write; or atomicAdd / store-only, see `use_atomic`).
+// Let lr[m,b] = node_flows[m,b] - node_mars[m,b] (log flow/marginal ratio). The inner sum is a dot over
+// batch of exp(lr) (the A operand) and exp(element_mars) (the B operand); we run it on the fp16 tensor
+// cores and multiply by epars in the epilogue. Numerically equivalent to the Triton kernel (TF32 dot);
+// fp16 stays within the accuracy bar (healthy-node log-param diff ~5.9e-4 < 1e-3).
+//
+// NUMERICAL TRICK (balanced shift + clamp): A*B = exp(lr) * exp(emar) = exp(lr + emar) is invariant to
+// any per-batch shift S[b] applied as exp(lr - S) * exp(emar + S). For near-dead nodes lr or emar can
+// reach exp(47)+, overflowing fp16 (max 65504). We pick the BALANCED shift S[b] = (max_m lr - max_e emar)/2
+// so the two operands' exponents are centred, then CLAMP each to 65504. On a degenerate batch column the
+// clamp only touches the (already-negligible) dead nodes; healthy nodes' A=exp(lr-S)->0 underflows
+// harmlessly. A simple (non-balanced) shift breaks healthy nodes, so the balance matters.
+//
+// PERF: the output is the FULL [block_size x num_edges] param matrix, so the EPILOGUE (params read +
+// param_flows RMW) is the dominant cost, NOT the matmul. Levers: BK=32 (half the smem of BK=64 -> 4
+// CTAs/SM = 2x occupancy to hide load latency); EE edge-subtiles per CTA share the loaded node tile
+// (lr/cmax computed once, reused for EE element-tiles); plain K-major smem + auto-vectorized smem->reg
+// copy (no LDSM swizzle); 128-bit float4 params I/O in the epilogue. node_flows / node_mars / element_mars
+// are TMA-loaded.
+//
+// SPECIALIZED fast path; the Python dispatcher only calls it when its assumptions hold (LL, logspace_flows,
+// pflow_temperature=1, allow_modify_flows=0, no neg/negate flows, no partial-eval, block_size%64==0,
+// num_edges%128==0, batch%32==0, collision-free pfids, contiguous layout, TMA-capable GPU sm_90+). Else Triton.
 #include <torch/extension.h>
 #include <cuda_fp16.h>
 #include <cuda.h>
@@ -53,23 +80,27 @@ __global__ void __launch_bounds__(NTH) par_kernel(
         int batch, int block_size, int num_edges, int bnt, int use_atomic, int pid_my_offset,
         const __grid_constant__ CUtensorMap descNf, const __grid_constant__ CUtensorMap descNm,
         const __grid_constant__ CUtensorMap descEm) {
+    // grid = (num_edges/(EE*BN) on x, chunk_of[n_nblocks * block_size/BM] on y). Each CTA owns one
+    // m-tile (BM nodes of node-block nb) and EE consecutive edge-subtiles (BN edges each) on pid_e.
     int mtiles = block_size / BM;
     int pid_e = blockIdx.x;
     int pid_my = blockIdx.y + pid_my_offset;
     int nb = pid_my / mtiles, tile_id = pid_my % mtiles;
-    long node_row0 = nbase[nb] + (long)tile_id * BM;
+    long node_row0 = nbase[nb] + (long)tile_id * BM;   // first node-row this CTA handles
     int tid = threadIdx.x;
 
+    // Plain K(batch)-major smem [rows, BK] for both MMA operands (auto-vectorized smem->reg, no swizzle).
     auto sAl = make_layout(make_shape(Int<BM>{}, Int<BK>{}), make_stride(Int<BK>{}, _1{}));
     auto sBl = make_layout(make_shape(Int<BN>{}, Int<BK>{}), make_stride(Int<BK>{}, _1{}));
-    float* sNf = (float*)smem_raw;        // lr (shared)
-    float* sNm = sNf + BM * BK;           // holds fp16 A + C
-    float* sEm = sNm + BM * BK;           // emar (per subtile)
-    half_t* pA = (half_t*)sNm;
-    half_t* pB = (half_t*)sNm + BM * BK;
-    float* sCmax = sEm + BN * BK;
-    float* sS = sCmax + BK;
-    int*   sV = (int*)(sS + BK);
+    // smem aliasing to keep the footprint at 4 CTAs/SM:
+    float* sNf = (float*)smem_raw;        // node_flows TMA dest; reused in-place for lr, then partialS spill
+    float* sNm = sNf + BM * BK;           // node_mars TMA dest; reused as the fp16 A+B operand region
+    float* sEm = sNm + BM * BK;           // element_mars TMA dest (one edge-subtile at a time)
+    half_t* pA = (half_t*)sNm;            // A operand = exp(lr - S)  [BM x BK]  (overlays sNm)
+    half_t* pB = (half_t*)sNm + BM * BK;  // B operand = exp(emar + S) [BN x BK]
+    float* sCmax = sEm + BN * BK;         // per-batch max_m lr[m,b]
+    float* sS = sCmax + BK;               // per-batch balanced shift S[b]
+    int*   sV = (int*)(sS + BK);          // per-batch valid flag (both lr and emar finite)
     uint64_t* bar = (uint64_t*)(sV + BK + 4);
     if (tid == 0) mbar_init(bar, 1);
     __syncthreads();
@@ -90,52 +121,64 @@ __global__ void __launch_bounds__(NTH) par_kernel(
     CUTE_UNROLL
     for (int s = 0; s < EE; s++) clear(acc[s]);
 
+    // Contract over batch in BK-sized k-tiles (bnt = batch/BK). The node tile (lr, cmax) is loaded
+    // ONCE per k-tile and reused across the EE edge-subtiles (the edge-blocking win).
     for (int bt = 0; bt < bnt; bt++) {
         int b0 = bt * BK;
+        // TMA-load this k-tile of node_flows and node_mars for the BM nodes.
         if (tid == 0) {
             mbar_expect(bar, (BM * BK + BM * BK) * 4);
             tma_load_2d(sNf, &descNf, b0, (int)node_row0, bar);
             tma_load_2d(sNm, &descNm, b0, (int)node_row0, bar);
         }
         mbar_wait(bar, phase); phase ^= 1;
+        // lr[m,b] = node_flows - node_mars (in-place into sNf); -inf node_mar => -inf (dead node).
         for (int i = tid; i < (BM * BK) / 4; i += NTH) { int idx = i * 4;
             float4 nf = *(const float4*)&sNf[idx]; float4 nm = *(const float4*)&sNm[idx];
             float4 lr; lr.x=(nm.x==-INFINITY)?-INFINITY:nf.x-nm.x; lr.y=(nm.y==-INFINITY)?-INFINITY:nf.y-nm.y;
             lr.z=(nm.z==-INFINITY)?-INFINITY:nf.z-nm.z; lr.w=(nm.w==-INFINITY)?-INFINITY:nf.w-nm.w; *(float4*)&sNf[idx]=lr; }
         __syncthreads();
+        // cmax[b] = max over the BM nodes of lr[m,b] (the "A" half of the balanced shift).
         for (int b = tid; b < BK; b += NTH) { float cm = -INFINITY;
             for (int m = 0; m < BM; m++) cm = fmaxf(cm, sNf[m * BK + b]); sCmax[b] = cm; }
         __syncthreads();
         CUTE_UNROLL
-        for (int s = 0; s < EE; s++) {
+        for (int s = 0; s < EE; s++) {   // EE edge-subtiles sharing the node tile above
             long ele_row = cbase[nb] + (long)(pid_e * EE + s) * BN;
             if (tid == 0) { mbar_expect(bar, BN * BK * 4); tma_load_2d(sEm, &descEm, b0, (int)ele_row, bar); }
             mbar_wait(bar, phase); phase ^= 1;
+            // gm[b] = max_e element_mars; balanced shift S[b] = (cmax - gm)/2; valid iff both finite.
             for (int b = tid; b < BK; b += NTH) { float gm = -INFINITY;
                 for (int e = 0; e < BN; e++) gm = fmaxf(gm, sEm[e * BK + b]);
                 float cm = sCmax[b]; int v = (cm != -INFINITY && gm != -INFINITY);
                 sV[b] = v; sS[b] = v ? 0.5f * (cm - gm) : 0.0f; }
             __syncthreads();
+            // A[m,b] = exp(lr - S) clamped to fp16 max (dead/-inf -> 0); staged into the fp16 A operand.
             for (int i = tid; i < (BM * BK) / 8; i += NTH) { int m = i/(BK/8), bb = (i%(BK/8))*8;
                 half_t r[8]; for (int j = 0; j < 8; j++) { int b = bb+j; float lr = sNf[m*BK+b];
                     r[j] = static_cast<half_t>((!sV[b]||lr==-INFINITY)?0.f:fminf(__expf(lr-sS[b]),65504.0f)); }
                 *(float4*)&sAt(m, bb) = *(const float4*)r; }
+            // B[e,b] = exp(emar + S) clamped; staged into the fp16 B operand. (A*B = exp(lr+emar), shift cancels.)
             for (int i = tid; i < (BN * BK) / 8; i += NTH) { int e = i/(BK/8), bb = (i%(BK/8))*8;
                 half_t r[8]; for (int j = 0; j < 8; j++) { int b = bb+j; float em = sEm[e*BK+b];
                     r[j] = static_cast<half_t>((!sV[b]||em==-INFINITY)?0.f:fminf(__expf(em+sS[b]),65504.0f)); }
                 *(float4*)&sBt(e, bb) = *(const float4*)r; }
             __syncthreads();
+            // fp16 tensor-core dot accumulated in fp32 into acc[s] (one fragment per edge-subtile).
             copy(s2rA, tXsA, tXrA); copy(s2rB, tXsB, tXrB);
             cute::gemm(mma, tCrA, tCrB, acc[s]);
             __syncthreads();
         }
     }
-    float* partialS = sNf;
+    // EPILOGUE (the dominant cost): for each edge-subtile, spill the MMA accumulator to smem, then
+    // pflow[m,e] += epars[m,e] * partial[m,e] with 128-bit vectorized params/param_flows I/O.
+    float* partialS = sNf;   // reuse the (now-dead) node smem to hold the [BN x BM] partial tile
     CUTE_UNROLL
     for (int s = 0; s < EE; s++) {
-        long par0 = pbase[nb] + (long)(pid_e * EE + s) * BN * (long)block_size + (long)tile_id * BM;
-        long pf0  = fbase[nb] + (long)(pid_e * EE + s) * BN * (long)block_size + (long)tile_id * BM;
+        long par0 = pbase[nb] + (long)(pid_e * EE + s) * BN * (long)block_size + (long)tile_id * BM;  // params base
+        long pf0  = fbase[nb] + (long)(pid_e * EE + s) * BN * (long)block_size + (long)tile_id * BM;  // param_flows base
         __syncthreads();
+        // spill the register C-fragment to smem in [e, m] layout (m contiguous, for coalesced float4 below)
         CUTE_UNROLL
         for (int i = 0; i < size(acc[s]); i++) { int m = get<0>(tCcC(i)), e = get<1>(tCcC(i));
             if (m < BM && e < BN) partialS[e * BM + m] = acc[s](i); }
@@ -145,12 +188,16 @@ __global__ void __launch_bounds__(NTH) par_kernel(
             long off = (long)e * (long)block_size + m4;
             float4 ps = *(const float4*)&partialS[e * BM + m4];
             float4 ep = *(const float4*)&mp[par0 + off];
-            float4 v = {ps.x*ep.x, ps.y*ep.y, ps.z*ep.z, ps.w*ep.w};
+            float4 v = {ps.x*ep.x, ps.y*ep.y, ps.z*ep.z, ps.w*ep.w};   // pflow = epars * partial
+            // Write mode (set by the Python gate): 0 = read-modify-write (RMW; the safe default,
+            // accumulates across minibatches, requires collision-free pfids); 1 = atomicAdd (for tied
+            // params where edge-blocks collide); 2 = store-only (fastest, but ONLY valid when param_flows
+            // was freshly zeroed -- skips the RMW read; currently unused/footgun, see the Python side).
             if (use_atomic == 1) {
                 atomicAdd(&pflows[pf0+off], v.x); atomicAdd(&pflows[pf0+off+1], v.y);
                 atomicAdd(&pflows[pf0+off+2], v.z); atomicAdd(&pflows[pf0+off+3], v.w);
             } else if (use_atomic == 2) {
-                *(float4*)&pflows[pf0+off] = v;   // store-only: valid when param_flows is freshly zeroed (skips the RMW read)
+                *(float4*)&pflows[pf0+off] = v;
             } else {
                 float4 o = *(float4*)&pflows[pf0+off]; o.x+=v.x; o.y+=v.y; o.z+=v.z; o.w+=v.w;
                 *(float4*)&pflows[pf0+off] = o;

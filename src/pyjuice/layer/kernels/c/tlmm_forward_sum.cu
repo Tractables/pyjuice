@@ -103,10 +103,10 @@ __global__ void __launch_bounds__(WM * WN * 32) tlmm_kernel(
     Tensor tXsB = s2rB.get_thread_slice(tid).partition_S(sBt);
     Tensor tXrB = s2rB.get_thread_slice(tid).retile_D(tCrB);
     Tensor cC = make_identity_tensor(Shape<Int<BM>, Int<BN>>{});
-    Tensor tCcC = thr.partition_C(cC);
-    Tensor tCrS = thr.partition_fragment_C(cC);
-    Tensor tCrL = thr.partition_fragment_C(cC);
-    Tensor tCrM = thr.partition_fragment_C(cC);
+    Tensor tCcC = thr.partition_C(cC);              // C coords -> (m, b) per fragment element
+    Tensor tCrS = thr.partition_fragment_C(cC);     // per-k-tile MMA result
+    Tensor tCrL = thr.partition_fragment_C(cC);     // running sum  L of the online log-sum-exp
+    Tensor tCrM = thr.partition_fragment_C(cC);     // running max  M of the online log-sum-exp
     clear(tCrL);
     CUTE_UNROLL
     for (int i = 0; i < size(tCrM); i++) tCrM(i) = -INFINITY;
@@ -115,11 +115,16 @@ __global__ void __launch_bounds__(WM * WN * 32) tlmm_kernel(
     __syncthreads();
     int phase = 0;
 
+    // Contract over edges in BK-sized k-tiles (knt = num_edges/BK). Per tile: TMA-load this tile of
+    // element_mars, max-stabilize, exp into the B operand, load params into the A operand, MMA, then
+    // online log-sum-exp merge.
     for (int kt = 0; kt < knt; kt++) {
-        long pc = pb[kt] + (long)tile_id * BM;
+        long pc = pb[kt] + (long)tile_id * BM;   // params base for this edge-tile + m-tile
+        // TMA bulk-load element_mars[edge-tile, batch-tile] into the fp32 scratch sEm.
         if (tid == 0) { mbar_expect(bar, BK * BN * 4); tma_load_2d(sEm, &desc, b0, (int)eb[kt], bar); }
         mbar_wait(bar, phase); phase ^= 1;
 
+        // per-batch max over this tile's edges (max-stabilization).
         for (int b = tid; b < BN; b += NTH) {
             float mx = -INFINITY;
             for (int e = 0; e < BK; e++) mx = fmaxf(mx, sEm[e * BN + b]);
@@ -127,6 +132,7 @@ __global__ void __launch_bounds__(WM * WN * 32) tlmm_kernel(
         }
         __syncthreads();
 
+        // B operand[b,e] = exp(element_mars - max) in bf16 (8 lanes via float4).
         for (int i = tid; i < (BN * BK) / 8; i += NTH) {
             int e = i / (BN / 8), bb = (i % (BN / 8)) * 8;
             float mx0 = sMx[bb], mx1 = sMx[bb + 1], mx2 = sMx[bb + 2], mx3 = sMx[bb + 3];
@@ -143,6 +149,7 @@ __global__ void __launch_bounds__(WM * WN * 32) tlmm_kernel(
             r[7] = static_cast<bfloat16_t>((mx7 == -INFINITY) ? 0.f : __expf(s[7] - mx7));
             *(float4*)&sBt(bb, e) = *(const float4*)r;
         }
+        // A operand[m,e] = log-params, cast fp32 -> bf16 (the dot computes params . exp(emar-max)).
         for (int i = tid; i < (BM * BK) / 8; i += NTH) {
             int e = i / (BM / 8), mm = (i % (BM / 8)) * 8;
             const float* g = &mp[pc + (long)e * block_size + mm];
@@ -156,9 +163,11 @@ __global__ void __launch_bounds__(WM * WN * 32) tlmm_kernel(
         }
         __syncthreads();
 
+        // bf16 tensor-core dot: tCrS[m,b] = sum_e params[m,e] * exp(emar[e,b] - max[b]); fp32 accumulate.
         copy(s2rA, tXsA, tXrA); copy(s2rB, tXsB, tXrB);
         clear(tCrS); cute::gemm(mma, tCrA, tCrB, tCrS);
 
+        // online log-sum-exp: merge this tile's (partial=tCrS, max=mxk) into the running (L=tCrL, M=tCrM).
         CUTE_UNROLL
         for (int i = 0; i < size(tCrS); i++) {
             int b = get<1>(tCcC(i));
@@ -173,6 +182,7 @@ __global__ void __launch_bounds__(WM * WN * 32) tlmm_kernel(
         }
         __syncthreads();
     }
+    // finalize: node_mars[m,b] = log(L) + M  (the log-sum-exp over all edges).
     CUTE_UNROLL
     for (int i = 0; i < size(tCrL); i++) {
         int m = get<0>(tCcC(i)), b = get<1>(tCcC(i));
