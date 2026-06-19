@@ -29,6 +29,11 @@ from pyjuice.utils.kernel_launcher import triton_jit
 from .layer import Layer
 
 
+# Use the optional per-distribution CUDA backward fast-path (e.g. Categorical smem-histogram) when the
+# distribution provides one and the dispatch gate holds; falls back to the Triton kernel otherwise.
+INPUT_FLOW_CUDA = True
+
+
 class InputLayer(Layer, nn.Module):
     def __init__(self, nodes: Sequence[InputNodes], cum_nodes: int = 0, pc_num_vars: int = 0, max_tied_ns_per_parflow_block: int = 4) -> None:
         """
@@ -117,6 +122,8 @@ class InputLayer(Layer, nn.Module):
         # Store the triton kernel functions implemented by the target `Distribution`
         self.fw_mar_fn = self.dist.get_fw_mar_fn()
         self.bk_flow_fn = self.dist.get_bk_flow_fn()
+        self.bk_flow_cuda_fn = self.dist.get_bk_flow_cuda_fn()  # optional CUDA backward fast-path (or None)
+        self._bk_cuda_ok = None  # cached gate for the CUDA backward (computed once, see backward())
         self.sample_fn = self.dist.get_sample_fn()
         self.em_fn = self.dist.get_em_fn()
 
@@ -281,6 +288,20 @@ class InputLayer(Layer, nn.Module):
                 self.param_flows[:] *= flows_memory
 
         return None
+
+    def _cuda_backward_ok(self) -> bool:
+        """Static precondition for the non-atomic CUDA backward fast-path (computed once, cached): each
+        node's param_flow region must be written by exactly one block, i.e. `s_pfids` distinct (untied)
+        and 16B-aligned (multiples of 4), and `s_pfids`/`vids` contiguous. False (=> Triton) for tied
+        input nodes or unusual layouts."""
+        if self._bk_cuda_ok is None:
+            sp = self.s_pfids
+            self._bk_cuda_ok = bool(
+                sp.is_contiguous() and self.vids.is_contiguous()
+                and (sp % 4 == 0).all().item()
+                and sp.unique().numel() == sp.numel()
+            )
+        return self._bk_cuda_ok
 
     def forward(self, data: torch.Tensor, node_mars: torch.Tensor, params: Optional[Dict] = None,
                 missing_mask: Optional[torch.Tensor] = None, _batch_first: bool = True, 
@@ -453,7 +474,20 @@ class InputLayer(Layer, nn.Module):
                     missing_mask_mode = 3
                     num_vars = missing_mask.size(0)
 
-            if not self.provided("_flows_kernel"):
+            # Optional per-distribution CUDA backward fast-path (e.g. Categorical smem-histogram):
+            # replaces the Triton _flows kernel below when the gate holds. The post-processing kernels
+            # and missing-mask handling are unaffected. Falls back to Triton otherwise.
+            cuda_handled = False
+            if (INPUT_FLOW_CUDA and self.bk_flow_cuda_fn is not None and bk_local_ids is None
+                    and missing_mask is None and self.num_vars_per_node == 1
+                    and node_flows.is_cuda and node_flows.is_contiguous() and node_flows.dtype == torch.float32
+                    and self.param_flows is not None and self.param_flows.is_contiguous()
+                    and self._cuda_backward_ok()):
+                cuda_handled = self.bk_flow_cuda_fn(
+                    self.param_flows, node_flows, data, self.vids, self.s_pfids,
+                    layer_num_nodes, batch_size, node_offset, bool(logspace_flows))
+
+            if not cuda_handled and not self.provided("_flows_kernel"):
                 if self.bk_flow_fn is not None:
                     self._flows_kernel = self._compile_triton_kernel(self._flows_kernel_template, flow_fn = self.bk_flow_fn)
                 else:
@@ -464,7 +498,7 @@ class InputLayer(Layer, nn.Module):
 
             grid = (triton.cdiv(layer_num_nodes * batch_size, BLOCK_SIZE),)
 
-            if self._flows_kernel is not None:
+            if (not cuda_handled) and self.provided("_flows_kernel") and self._flows_kernel is not None:
                 self._flows_kernel[grid](
                     params_ptr = self.params,
                     param_flows_ptr = self.param_flows,
