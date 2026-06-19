@@ -34,6 +34,8 @@ _module = None          # forward (tlmm)
 _attempted = False
 _ele_module = None      # element-flow backward
 _ele_attempted = False
+_par_module = None      # parameter-flow backward
+_par_attempted = False
 _flags_cache = "unset"  # cached (cuda_cflags, ldflags) or None; computed once
 
 
@@ -138,6 +140,28 @@ def ele_is_available() -> bool:
         _ele_attempted = True
         _ele_module = _jit("pyjuice_sum_backward_ele_cuda", "ele_backward_sum.cu")
     return _ele_module is not None
+
+
+def par_is_available() -> bool:
+    """Whether the CUDA parameter-flow backward fast-path kernel is usable (lazily JIT-compiles once)."""
+    global _par_module, _par_attempted
+    if not _par_attempted:
+        _par_attempted = True
+        _par_module = _jit("pyjuice_sum_backward_par_cuda", "par_backward_sum.cu")
+    return _par_module is not None
+
+
+def par_backward_sum(param_flows: torch.Tensor, node_flows: torch.Tensor, node_mars: torch.Tensor,
+                     element_mars: torch.Tensor, params: torch.Tensor, nbase: torch.Tensor,
+                     cbase: torch.Tensor, pbase: torch.Tensor, fbase: torch.Tensor,
+                     batch_size: int, block_size: int, num_edges: int, mode: int = 0) -> None:
+    """Block-sparse sum-layer parameter-flow backward (accumulates into ``param_flows``). ``mode``:
+    0 = read-add-store (RMW, collision-free); 1 = atomicAdd (tied params); 2 = store-only (valid only
+    when ``param_flows`` is freshly zeroed). Caller guarantees the dispatch conditions (see
+    ``par_is_available`` + the gate in ``sum_layer._backward_block_sparse_par_flows``)."""
+    _par_module.par_backward_sum(param_flows, node_flows, node_mars, element_mars, params,
+                                 nbase, cbase, pbase, fbase, int(batch_size), int(block_size),
+                                 int(num_edges), int(mode))
 
 
 def ele_backward_sum(element_flows: torch.Tensor, element_mars: torch.Tensor, node_flows: torch.Tensor,

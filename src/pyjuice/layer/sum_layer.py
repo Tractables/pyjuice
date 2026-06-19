@@ -56,6 +56,19 @@ BACKWARD_ELE_FLOW_TUNED = True
 # any unsupported shape / missing toolchain. Set False to disable.
 BACKWARD_ELE_FLOW_CUDA = True
 
+# Optional CUDA (CuTe/CUTLASS + fp16 + TMA) fast path for the block-sparse parameter-flow backward
+# `_bk_triton_block_sparse_par_kernel(_rmw)`. When enabled AND all dispatch conditions hold (LL,
+# logspace flows, allow_modify_flows / allow_neg_flows / negate_pflows all off, temperature 1,
+# collision-free (untied) param-flow slots, contiguous cids / block_size-strided pids&pfids,
+# block_size % 64 == 0, num_edges % 128 == 0, batch % 32 == 0, and a TMA-capable GPU sm_90+ with
+# CUTLASS), it replaces the Triton param launch. Numerically equivalent (fp16 dot + fp32 accumulate;
+# unbiased, < 1e-3 in log-param space). It is a batch-contraction GEMM whose epilogue is the dominant
+# (params-I/O) cost; the kernel uses BK=32 for 4-CTA occupancy, edge-blocking to share node loads, and
+# a 128-bit vectorized RMW epilogue. The best of {CUDA, Triton} is autotuned once per layer signature
+# INTO A SCRATCH BUFFER (never the live param_flows, which is read-accumulate-write) and cached. Falls
+# back to Triton on any unsupported shape / missing toolchain. Set False to disable.
+BACKWARD_PAR_FLOW_CUDA = True
+
 # Launch tuning for the block-sparse sum-layer FORWARD kernel (kernel body unchanged). In the LL
 # block-sparse-dot regime, `emars_max` / `exp(emars - max)` / the `emars` load depend only on
 # (edge, batch), not on the output node, so the standard `TILE_SIZE_M = 32` recomputes them
@@ -261,6 +274,13 @@ class SumLayer(Layer, nn.Module):
         self._cached_bk_ele_cuda = dict()
         self._cached_bk_ele_choice = dict()
         self._bk_ele_scratch = None
+
+        # Optional CUDA param-backward fast path: per-partition (nbase, cbase, pbase, fbase, cuda_ok),
+        # per-(partition, batch) autotuned choice, and a reused scratch param_flows buffer for
+        # corruption-safe autotuning (the kernel is read-accumulate-write).
+        self._cached_bk_par_cuda = dict()
+        self._cached_bk_par_choice = dict()
+        self._bk_par_scratch = None
 
     def to(self, device):
         super(SumLayer, self).to(device)
@@ -1602,6 +1622,72 @@ class SumLayer(Layer, nn.Module):
             par_kernel_extra["num_warps"] = 8
 
         grid = (triton.cdiv(num_edges, TILE_SIZE_K), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
+
+        # Optional CUDA fast path (CuTe/fp16/TMA), autotuned vs Triton INTO A SCRATCH buffer so the
+        # autotune timing runs never corrupt the live param_flows (the kernel is read-accumulate-write).
+        # Only intercepts when CUDA wins; Triton / unsupported shapes fall through to the dispatch below
+        # (which keeps the OOM-retry path). See BACKWARD_PAR_FLOW_CUDA.
+        if (BACKWARD_PAR_FLOW_CUDA and propagation_alg_id == 0 and abs(pflow_temperature - 1.0) < 1e-6
+                and allow_modify_flows == 0 and logspace_flows and not allow_neg_flows and not negate_pflows
+                and self.block_size % 64 == 0 and num_edges % 128 == 0 and batch_size % 32 == 0
+                and node_flows.is_cuda and cuda_kernels.par_is_available()):
+            par_sig = id(pfids)
+            cache = self._cached_bk_par_cuda.get(par_sig)
+            if cache is None:
+                # collision-free (untied) + contiguous cids / block_size-strided pids&pfids -> the CUDA
+                # kernel's index assumptions hold. Computed once per partition and cached.
+                contig = bool((cids[:, 1:] - cids[:, :-1] == 1).all()
+                              and (pids[:, 1:] - pids[:, :-1] == self.block_size).all()
+                              and (pfids[:, 1:] - pfids[:, :-1] == self.block_size).all())
+                if contig and self._par_flow_collision_free(pfids):
+                    cache = (nids.contiguous(), cids[:, 0].contiguous(), pids[:, 0].contiguous(),
+                             pfids[:, 0].contiguous(), True)
+                else:
+                    cache = (None, None, None, None, False)
+                self._cached_bk_par_cuda[par_sig] = cache
+            nbase, cbase, pbase, fbase, par_ok = cache
+            if par_ok:
+                def _cuda_par(tgt):
+                    # mode 0 = read-accumulate-write (RMW): always correct (accumulates onto prior
+                    # param_flows, e.g. multi-batch). The kernel also has a store-only mode that skips
+                    # the RMW read, but that is only valid when param_flows is freshly zeroed; not used
+                    # here to keep the path unconditionally correct.
+                    cuda_kernels.par_backward_sum(tgt, node_flows, node_mars, element_mars, params,
+                        nbase, cbase, pbase, fbase, batch_size, self.block_size, num_edges, 0)
+
+                def _triton_par(tgt):
+                    for s in range(0, grid[1], 32768):
+                        cg = (grid[0], min(s + 32768, grid[1]) - s)
+                        bk_par_bsparse._bk_triton_block_sparse_par_kernel_rmw[cg](
+                            node_flows = node_flows, node_mars = node_mars, element_mars = element_mars,
+                            mparams = params, param_flows = tgt, nids = nids, cids = cids, pids = pids,
+                            pfids = pfids, batch_size = batch_size, num_edges = num_edges,
+                            allow_modify_flows = allow_modify_flows, logspace_flows = logspace_flows,
+                            TILE_SIZE_B = TILE_SIZE_B, B_NUM_TILES = B_NUM_TILES, TILE_SIZE_K = TILE_SIZE_K,
+                            TILE_SIZE_M = TILE_SIZE_M, BLOCK_SIZE_M = self.block_size, TL_DOT = TL_DOT,
+                            propagation_alg_id = propagation_alg_id, negate_pflows = negate_pflows,
+                            allow_neg_flows = allow_neg_flows, pid_m_offset = s,
+                            **propagation_alg_kwargs, **par_kernel_extra, num_stages = 1)
+
+                choice_key = (par_sig, batch_size)
+                choice = self._cached_bk_par_choice.get(choice_key)
+                if choice is None:
+                    # autotune into a scratch clone (corruption-safe; the kernel is read-accumulate-write).
+                    # `param_flows` is the full param array (can be GBs), so the scratch is LOCAL and freed
+                    # right after the autotune (run once per signature; the choice is then cached). If the
+                    # scratch can't be allocated (memory-constrained GPU), fall back to Triton.
+                    try:
+                        scr = torch.empty_like(param_flows)
+                        choice = cuda_kernels.autotune(
+                            [("cuda", (lambda: _cuda_par(scr))), ("triton", (lambda: _triton_par(scr)))]) or "triton"
+                        del scr
+                    except torch.cuda.OutOfMemoryError:
+                        choice = "triton"
+                    self._cached_bk_par_choice[choice_key] = choice
+                if choice == "cuda":
+                    _cuda_par(param_flows)
+                    return None
+                # choice == "triton": fall through to the Triton dispatch below
 
         for pid_m_start in range(0, grid[1], 32768):
             pid_m_end = min(pid_m_start + 32768, grid[1])
