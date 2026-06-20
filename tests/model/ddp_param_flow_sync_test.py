@@ -1,6 +1,10 @@
 import os
-import socket
+import sys
+import shutil
+import tempfile
+import traceback
 import subprocess
+from datetime import timedelta
 
 import pytest
 import torch
@@ -16,22 +20,36 @@ def _num_real_gpus():
         return 0
 
 
-def _free_port():
-    s = socket.socket(); s.bind(("", 0)); p = s.getsockname()[1]; s.close()
-    return p
-
-
-def _ddp_gpu_pair(world_size = 2):
-    # Pick a worker-specific block of `world_size` GPUs from the pool the conftest exposes, so that
-    # under `pytest -n` different (multi-GPU) tests land on different GPUs rather than all grabbing
-    # 0,1. Falls back to the physical GPUs when run outside the conftest. Returns None if too few.
+def _ddp_gpus(world_size = 2):
+    # Choose `world_size` GPUs for this DDP test. Prefer GPUs that are NOT pinned to a concurrently
+    # running single-GPU xdist worker: the conftest pins worker w to gpus[w], so under `pytest -n N`
+    # the GPUs gpus[N:] are idle. Running the spawned ranks there keeps this multi-GPU test from
+    # fighting the other workers for memory/compute (which is what made it flake under a busy suite).
+    # Falls back to the physical GPUs outside the conftest, and to sharing the top GPUs when every
+    # GPU is busy (the tiny test model coexists fine). Returns None if there are too few GPUs.
     pool = os.environ.get("PYJUICE_TEST_GPU_POOL")
     gpus = [g for g in pool.split(",") if g] if pool else [str(i) for i in range(_num_real_gpus())]
     if len(gpus) < world_size:
         return None
-    wid = int(os.environ.get("PYJUICE_TEST_WORKER_ID", "0"))
-    start = (wid * world_size) % len(gpus)
-    return [gpus[(start + i) % len(gpus)] for i in range(world_size)]
+    n_workers = int(os.environ.get("PYTEST_XDIST_WORKER_COUNT", "1"))
+    idle = gpus[n_workers:]
+    if len(idle) >= world_size:
+        return idle[:world_size]
+    return gpus[-world_size:]
+
+
+def _read_child_errs(errdir):
+    out = []
+    for name in sorted(os.listdir(errdir)):
+        if name.endswith(".err"):
+            try:
+                with open(os.path.join(errdir, name)) as f:
+                    txt = f.read().strip()
+            except OSError:
+                txt = ""
+            if txt:
+                out.append(f"---- {name} ----\n{txt}")
+    return "\n".join(out) if out else "(no child stderr captured)"
 
 
 def _build_small_pc(device):
@@ -45,71 +63,104 @@ def _build_small_pc(device):
     return pc
 
 
-def _ddp_worker(rank, world_size, port):
-    # Triton path only (skip the optional CUDA-kernel JIT for a fast test).
-    os.environ["PYJUICE_DISABLE_CUDA_KERNELS"] = "1"
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = str(port)
+def _ddp_worker(rank, world_size, init_file, errdir):
+    # Redirect this child's stderr to a file FIRST: mp.spawn only reports the child's exit code, so a
+    # C-level NCCL/CUDA abort (which never becomes a catchable Python exception) would otherwise show
+    # up only as the opaque "process N terminated with exit code 1". With this, the real cause lands
+    # in errdir/rankN.err and the parent surfaces it.
+    fd = os.open(os.path.join(errdir, f"rank{rank}.err"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    os.dup2(fd, 2)
+    os.environ.setdefault("NCCL_DEBUG", "WARN")
+    os.environ["PYJUICE_DISABLE_CUDA_KERNELS"] = "1"   # Triton path only (skip the optional CUDA JIT)
 
-    import torch.distributed as dist
-    dist.init_process_group("nccl", rank = rank, world_size = world_size)
-    torch.cuda.set_device(rank)
-    device = torch.device(f"cuda:{rank}")
+    try:
+        import torch.distributed as dist
 
-    pc = _build_small_pc(device)
-    x = torch.randint(0, 8, (32, 16), device = device)   # identical batch on every rank (same seed)
+        # Set the device before init so NCCL binds the right GPU (CUDA_VISIBLE_DEVICES is the chosen
+        # GPU pair, so rank r -> the r-th GPU of that pair).
+        torch.cuda.set_device(rank)
+        # FileStore rendezvous (init_method=file://) instead of a TCP MASTER_PORT: avoids the
+        # free-port TOCTOU race that flakes under a busy suite. A short timeout fails fast instead of
+        # hanging if a transient rendezvous problem occurs.
+        dist.init_process_group(backend = "nccl", init_method = f"file://{init_file}",
+                                rank = rank, world_size = world_size,
+                                timeout = timedelta(seconds = 120))
+        device = torch.device(f"cuda:{rank}")
 
-    def bwd():
-        pc.init_param_flows(flows_memory = 0.0)
-        pc(x, propagation_alg = "LL")
-        pc.backward(x, flows_memory = 1.0, allow_modify_flows = False,
-                    propagation_alg = "LL", logspace_flows = True)
+        pc = _build_small_pc(device)
+        x = torch.randint(0, 8, (32, 16), device = device)   # identical batch on every rank (same seed)
 
-    # All ranks compute identical flows P -> a SUM all-reduce must give world_size * P everywhere.
-    # IMPORTANT: do every collective first, then assert (an assert between collectives would deadlock
-    # the other ranks that proceed to the next collective).
+        def bwd():
+            pc.init_param_flows(flows_memory = 0.0)
+            pc(x, propagation_alg = "LL")
+            pc.backward(x, flows_memory = 1.0, allow_modify_flows = False,
+                        propagation_alg = "LL", logspace_flows = True)
 
-    bwd(); P = pc.param_flows.clone()
-    pc.sync_param_flows()                              # fp32 SUM
-    pf_fp32 = pc.param_flows.clone()
+        # All ranks compute identical flows P -> a SUM all-reduce must give world_size * P everywhere.
+        # IMPORTANT: do every collective first, then assert (an assert between collectives would
+        # deadlock the other ranks that proceed to the next collective).
+        bwd(); P = pc.param_flows.clone()
+        pc.sync_param_flows()                              # fp32 SUM
+        pf_fp32 = pc.param_flows.clone()
 
-    bwd(); P2 = pc.param_flows.clone()
-    pc.sync_param_flows(dtype = torch.bfloat16)        # bf16 SUM
-    pf_bf16 = pc.param_flows.clone()
+        bwd(); P2 = pc.param_flows.clone()
+        pc.sync_param_flows(dtype = torch.bfloat16)        # bf16 SUM
+        pf_bf16 = pc.param_flows.clone()
 
-    pc._cum_flow = float(rank + 1)                     # distinct per rank -> SUM is sum(1..world_size)
-    pc.sync_param_flows()
-    cum_flow = pc._cum_flow
+        pc._cum_flow = float(rank + 1)                     # distinct per rank -> SUM is sum(1..world_size)
+        pc.sync_param_flows()
+        cum_flow = pc._cum_flow
 
-    dist.barrier()   # all collectives done; safe to assert now
+        dist.barrier()   # all collectives done; safe to assert now
 
-    m = P.abs() > P.abs().max() * 1e-4
-    assert torch.allclose(pf_fp32[m], world_size * P[m], rtol = 1e-4, atol = 1e-6), \
-        f"[rank {rank}] fp32 sync_param_flows mismatch"
+        m = P.abs() > P.abs().max() * 1e-4
+        assert torch.allclose(pf_fp32[m], world_size * P[m], rtol = 1e-4, atol = 1e-6), \
+            f"[rank {rank}] fp32 sync_param_flows mismatch"
 
-    m2 = P2.abs() > P2.abs().max() * 1e-4
-    rel = ((pf_bf16[m2] - world_size * P2[m2]).abs() / (world_size * P2[m2].abs())).max().item()
-    assert rel < 2e-2, f"[rank {rank}] bf16 sync_param_flows rel error too large: {rel:.3e}"
+        m2 = P2.abs() > P2.abs().max() * 1e-4
+        rel = ((pf_bf16[m2] - world_size * P2[m2]).abs() / (world_size * P2[m2].abs())).max().item()
+        assert rel < 2e-2, f"[rank {rank}] bf16 sync_param_flows rel error too large: {rel:.3e}"
 
-    assert abs(cum_flow - sum(range(1, world_size + 1))) < 1e-6, \
-        f"[rank {rank}] _cum_flow sync mismatch: {cum_flow}"
+        assert abs(cum_flow - sum(range(1, world_size + 1))) < 1e-6, \
+            f"[rank {rank}] _cum_flow sync mismatch: {cum_flow}"
 
-    dist.destroy_process_group()
+        dist.destroy_process_group()
+    except Exception:
+        traceback.print_exc()   # -> the redirected stderr file, so the parent can surface it
+        sys.stderr.flush()
+        raise
 
 
-@pytest.mark.skipif(_ddp_gpu_pair() is None, reason = "requires >= 2 GPUs")
+@pytest.mark.skipif(_ddp_gpus() is None, reason = "requires >= 2 GPUs")
 def test_sync_param_flows_ddp():
     import torch.multiprocessing as mp
 
     world_size = 2
-    # The conftest pins this process to a single GPU; expose this worker's >=2-GPU subset to the
-    # spawned ranks so each rank gets its own device and parallel workers stay on distinct GPUs.
+    # The conftest pins this process to a single GPU; expose this worker's idle-GPU subset to the
+    # spawned ranks so each rank gets its own device and concurrent workers stay off these GPUs.
     # (Spawned processes re-read CUDA_VISIBLE_DEVICES at torch import.)
-    pair = _ddp_gpu_pair(world_size)
+    gpus = _ddp_gpus(world_size)
     prev = os.environ.get("CUDA_VISIBLE_DEVICES")
-    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(pair)
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(gpus)
+
+    last_err = ""
     try:
-        mp.spawn(_ddp_worker, args = (world_size, _free_port()), nprocs = world_size, join = True)
+        # DDP rendezvous/NCCL can flake transiently under a saturated parallel suite (the failure is
+        # a child dying with exit code 1, not a reproducible assertion). Retry a few times with a
+        # fresh rendezvous file; a real regression fails all attempts and we surface the captured
+        # child stderr.
+        for attempt in range(3):
+            errdir = tempfile.mkdtemp(prefix = "pyjuice_ddp_")
+            init_file = os.path.join(errdir, "store")
+            try:
+                mp.spawn(_ddp_worker, args = (world_size, init_file, errdir),
+                         nprocs = world_size, join = True)
+                return   # success
+            except Exception as e:
+                last_err = f"attempt {attempt} failed: {e}\n{_read_child_errs(errdir)}"
+            finally:
+                shutil.rmtree(errdir, ignore_errors = True)
+        pytest.fail(f"DDP sync test failed after 3 attempts.\n{last_err}")
     finally:
         if prev is None:
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)
