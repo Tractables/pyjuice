@@ -45,6 +45,12 @@ def pytest_configure(config):
     # Pin this worker to a single GPU from the pool.
     os.environ["CUDA_VISIBLE_DEVICES"] = gpus[worker_id % len(gpus)]
 
+    # Expose the full pool (and this worker's id) so multi-GPU tests, which need >=2 visible GPUs,
+    # can select a worker-specific subset instead of the single pinned GPU above -- keeping such
+    # tests spread across distinct GPUs under `pytest -n`.
+    os.environ["PYJUICE_TEST_GPU_POOL"] = ",".join(gpus)
+    os.environ["PYJUICE_TEST_WORKER_ID"] = str(worker_id)
+
     # CPU limits — env vars before torch import
     os.environ["OMP_NUM_THREADS"] = "8"
     os.environ["MKL_NUM_THREADS"] = "8"
