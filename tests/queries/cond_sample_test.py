@@ -35,29 +35,39 @@ def gen_data(sample_size: int = 10_000, dim: int = 1, cond: float = None, shift:
     return theta, x
 
 
+def _multi_linear_step_size(step, lrs, milestone_steps):
+    if step >= milestone_steps[-1]:
+        return lrs[-1]
+    idx = sum(1 for ms in milestone_steps if ms < step)
+    if idx == 0:
+        return lrs[0]
+    return lrs[idx - 1] + (lrs[idx] - lrs[idx - 1]) * (step - milestone_steps[idx - 1]) / \
+           (milestone_steps[idx] - milestone_steps[idx - 1])
+
+
 def train(pc, train_loader, device, num_epochs = 100):
 
-    optimizer = juice.optim.CircuitOptimizer(pc, lr = 0.1, pseudocount = 0.1, method = "EM")
-    scheduler = juice.optim.CircuitScheduler(
-        optimizer,
-        method = "multi_linear",
-        lrs = [0.1, 0.0001],
-        milestone_steps = [0, len(train_loader) * num_epochs],
-    )
+    optimizer = juice.optim.MiniBatchEM(pc, step_size = 0.1, pseudocount = 0.1)
+    lrs = [0.1, 0.0001]
+    milestone_steps = [0, len(train_loader) * num_epochs]
 
     for epoch in range(1, num_epochs + 1):
         train_ll = 0.0
-        for batch in train_loader:
+        for batch_idx, batch in enumerate(train_loader):
             x = batch[0].to(device)
-            optimizer.zero_grad()
 
             lls = pc(x)
             lls.mean().backward()
 
             train_ll += lls.mean().detach().cpu().numpy().item()
 
-            optimizer.step()
-            scheduler.step()
+            # Faithfully reproduce the old CircuitOptimizer + CircuitScheduler timing:
+            # the original loop called optimizer.step() (using the lr from the *previous*
+            # scheduler.step()) and then scheduler.step(); the scheduler's internal counter
+            # therefore lagged the optimizer step by one, so step #k used schedule value k-2
+            # (clamped at the lrs[0] plateau, which equals the constructor lr 0.1).
+            step_count = (epoch - 1) * len(train_loader) + batch_idx - 1
+            optimizer.step(step_size = _multi_linear_step_size(step_count, lrs, milestone_steps))
 
         train_ll /= len(train_loader)
 

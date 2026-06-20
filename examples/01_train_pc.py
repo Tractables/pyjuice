@@ -76,15 +76,10 @@ pc.to(device)
 # ------------
 
 # %%
-# We start by defining the optimizer and scheduler.
+# We start by defining the optimizer. PyJuice provides a few EM-based optimizers in `juice.optim`
+# (`FullBatchEM`, `MiniBatchEM`, and `Anemone`); here we use mini-batch EM.
 
-optimizer = juice.optim.CircuitOptimizer(pc, lr = 0.1, pseudocount = 0.1, method = "EM")
-scheduler = juice.optim.CircuitScheduler(
-    optimizer, 
-    method = "multi_linear", 
-    lrs = [0.9, 0.1, 0.05], 
-    milestone_steps = [0, len(train_loader) * 100, len(train_loader) * 350]
-)
+optimizer = juice.optim.MiniBatchEM(pc, step_size = 0.1, pseudocount = 0.1)
 
 # %%
 # Optionally, we can leverage CUDA Graphs to hide the kernel launching overhead by doing a dry run.
@@ -105,20 +100,16 @@ for epoch in range(1, 350+1):
     for batch in train_loader:
         x = batch[0].to(device)
 
-        # Similar to PyTorch optimizers zeroling out the gradients, we zero out the parameter flows
-        optimizer.zero_grad()
-
         # Forward pass
         lls = pc(x)
 
-        # Backward pass
+        # Backward pass accumulates the parameter flows
         lls.mean().backward()
 
         train_ll += lls.mean().detach().cpu().numpy().item()
 
-        # Perform a mini-batch EM step
+        # Perform a mini-batch EM step (consumes the flows, then resets the accumulator)
         optimizer.step()
-        scheduler.step()
 
     train_ll /= len(train_loader)
 

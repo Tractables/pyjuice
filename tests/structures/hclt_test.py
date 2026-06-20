@@ -8,6 +8,25 @@ import pyjuice.nodes.distributions as dists
 import pytest
 
 
+def _multi_linear_step_size(step, lrs, milestone_steps):
+    if step >= milestone_steps[-1]:
+        return lrs[-1]
+    idx = sum(1 for ms in milestone_steps if ms < step)
+    if idx == 0:
+        return lrs[0]
+    return lrs[idx - 1] + (lrs[idx] - lrs[idx - 1]) * (step - milestone_steps[idx - 1]) / \
+           (milestone_steps[idx] - milestone_steps[idx - 1])
+
+
+def _scheduled_step_size(minibatch_idx, base_lr, lrs, milestone_steps):
+    # Faithfully reproduce the original `optimizer.step(); scheduler.step()` ordering: the very first
+    # minibatch ran before any `scheduler.step()`, so it used the optimizer's constructor `lr`; every
+    # subsequent minibatch used the multi-linear value at `scheduler.step_count = minibatch_idx - 1`.
+    if minibatch_idx == 0:
+        return base_lr
+    return _multi_linear_step_size(minibatch_idx - 1, lrs, milestone_steps)
+
+
 def evaluate(pc, loader):
     lls_total = 0.0
     for batch in loader:
@@ -19,14 +38,12 @@ def evaluate(pc, loader):
     return lls_total
 
 
-def mini_batch_em_epoch(num_epochs, pc, optimizer, scheduler, train_loader, test_loader, device, logspace_flows = False):
+def mini_batch_em_epoch(num_epochs, pc, optimizer, base_lr, lrs, milestone_steps, train_loader, test_loader, device, logspace_flows = False):
     for epoch in range(num_epochs):
         t0 = time.time()
         train_ll = 0.0
-        for batch in train_loader:
+        for batch_idx, batch in enumerate(train_loader):
             x = batch[0].to(device)
-
-            optimizer.zero_grad()
 
             lls = pc(x)
             if not logspace_flows:
@@ -36,8 +53,8 @@ def mini_batch_em_epoch(num_epochs, pc, optimizer, scheduler, train_loader, test
 
             train_ll += lls.mean().detach().cpu().numpy().item()
 
-            optimizer.step()
-            scheduler.step()
+            step_count = epoch * len(train_loader) + batch_idx
+            optimizer.step(step_size = _scheduled_step_size(step_count, base_lr, lrs, milestone_steps))
 
         train_ll /= len(train_loader)
 
@@ -106,13 +123,9 @@ def test_hclt():
 
     pc.to(device)
 
-    optimizer = juice.optim.CircuitOptimizer(pc, lr = 0.1, pseudocount = 0.1)
-    scheduler = juice.optim.CircuitScheduler(
-        optimizer, 
-        method = "multi_linear", 
-        lrs = [0.9, 0.1, 0.05], 
-        milestone_steps = [0, len(train_loader) * 100, len(train_loader) * 350]
-    )
+    optimizer = juice.optim.MiniBatchEM(pc, step_size = 0.1, pseudocount = 0.1)
+    lrs = [0.9, 0.1, 0.05]
+    milestone_steps = [0, len(train_loader) * 100, len(train_loader) * 350]
 
     for batch in train_loader:
         x = batch[0].to(device)
@@ -121,7 +134,7 @@ def test_hclt():
         lls.mean().backward()
         break
 
-    mini_batch_em_epoch(5, pc, optimizer, scheduler, train_loader, test_loader, device)
+    mini_batch_em_epoch(5, pc, optimizer, 0.1, lrs, milestone_steps, train_loader, test_loader, device)
 
     test_ll = evaluate(pc, test_loader)
 
@@ -165,13 +178,9 @@ def test_hclt_logspace_flows():
 
     pc.to(device)
 
-    optimizer = juice.optim.CircuitOptimizer(pc, lr = 0.1, pseudocount = 0.1)
-    scheduler = juice.optim.CircuitScheduler(
-        optimizer, 
-        method = "multi_linear", 
-        lrs = [0.9, 0.1, 0.05], 
-        milestone_steps = [0, len(train_loader) * 100, len(train_loader) * 350]
-    )
+    optimizer = juice.optim.MiniBatchEM(pc, step_size = 0.1, pseudocount = 0.1)
+    lrs = [0.9, 0.1, 0.05]
+    milestone_steps = [0, len(train_loader) * 100, len(train_loader) * 350]
 
     # for batch in train_loader:
     #     x = batch[0].to(device)
@@ -180,7 +189,7 @@ def test_hclt_logspace_flows():
     #     lls.mean().backward()
     #     break
 
-    mini_batch_em_epoch(5, pc, optimizer, scheduler, train_loader, test_loader, device, logspace_flows = True)
+    mini_batch_em_epoch(5, pc, optimizer, 0.1, lrs, milestone_steps, train_loader, test_loader, device, logspace_flows = True)
 
     test_ll = evaluate(pc, test_loader)
 
@@ -225,13 +234,9 @@ def test_small_hclt_full():
 
     pc.to(device)
 
-    optimizer = juice.optim.CircuitOptimizer(pc, lr = 0.1, pseudocount = 0.1)
-    scheduler = juice.optim.CircuitScheduler(
-        optimizer, 
-        method = "multi_linear", 
-        lrs = [0.9, 0.1, 0.05], 
-        milestone_steps = [0, len(train_loader) * 100, len(train_loader) * 350]
-    )
+    optimizer = juice.optim.MiniBatchEM(pc, step_size = 0.1, pseudocount = 0.1)
+    lrs = [0.9, 0.1, 0.05]
+    milestone_steps = [0, len(train_loader) * 100, len(train_loader) * 350]
 
     for batch in train_loader:
         x = batch[0].to(device)
@@ -240,7 +245,7 @@ def test_small_hclt_full():
         lls.mean().backward()
         break
 
-    mini_batch_em_epoch(350, pc, optimizer, scheduler, train_loader, test_loader, device)
+    mini_batch_em_epoch(350, pc, optimizer, 0.1, lrs, milestone_steps, train_loader, test_loader, device)
     full_batch_em_epoch(pc, train_loader, test_loader, device)
 
     test_ll = evaluate(pc, test_loader)
@@ -286,13 +291,9 @@ def test_large_hclt_full():
 
     pc.to(device)
 
-    optimizer = juice.optim.CircuitOptimizer(pc, lr = 0.1, pseudocount = 0.1)
-    scheduler = juice.optim.CircuitScheduler(
-        optimizer, 
-        method = "multi_linear", 
-        lrs = [0.9, 0.1, 0.05], 
-        milestone_steps = [0, len(train_loader) * 100, len(train_loader) * 350]
-    )
+    optimizer = juice.optim.MiniBatchEM(pc, step_size = 0.1, pseudocount = 0.1)
+    lrs = [0.9, 0.1, 0.05]
+    milestone_steps = [0, len(train_loader) * 100, len(train_loader) * 350]
 
     for batch in train_loader:
         x = batch[0].to(device)
@@ -301,7 +302,7 @@ def test_large_hclt_full():
         lls.mean().backward()
         break
 
-    mini_batch_em_epoch(350, pc, optimizer, scheduler, train_loader, test_loader, device)
+    mini_batch_em_epoch(350, pc, optimizer, 0.1, lrs, milestone_steps, train_loader, test_loader, device)
     full_batch_em_epoch(pc, train_loader, test_loader, device)
 
     test_ll = evaluate(pc, test_loader)
@@ -312,6 +313,10 @@ def test_large_hclt_full():
 def test_hclt_logistic():
 
     device = torch.device("cuda:0")
+
+    # Seed for determinism: this test has a tight LL threshold with little margin, so without a fixed
+    # seed the unseeded parameter init + shuffled loader make it RNG-flaky around the threshold.
+    torch.manual_seed(42)
 
     train_dataset = torchvision.datasets.MNIST(root = "./examples/data", train = True, download = True)
     test_dataset = torchvision.datasets.MNIST(root = "./examples/data", train = False, download = True)
@@ -348,15 +353,11 @@ def test_hclt_logistic():
 
     pc.to(device)
 
-    optimizer = juice.optim.CircuitOptimizer(pc, lr = 0.1, pseudocount = 0.1)
-    scheduler = juice.optim.CircuitScheduler(
-        optimizer, 
-        method = "multi_linear", 
-        lrs = [0.9, 0.1, 0.05], 
-        milestone_steps = [0, len(train_loader) * 100, len(train_loader) * 350]
-    )
+    optimizer = juice.optim.MiniBatchEM(pc, step_size = 0.1, pseudocount = 0.1)
+    lrs = [0.9, 0.1, 0.05]
+    milestone_steps = [0, len(train_loader) * 100, len(train_loader) * 350]
 
-    mini_batch_em_epoch(20, pc, optimizer, scheduler, train_loader, test_loader, device)
+    mini_batch_em_epoch(20, pc, optimizer, 0.1, lrs, milestone_steps, train_loader, test_loader, device)
 
     test_ll = evaluate(pc, test_loader)
 

@@ -18,14 +18,12 @@ def evaluate(pc, loader):
     return lls_total
 
 
-def mini_batch_em_epoch(num_epochs, pc, optimizer, scheduler, train_loader, test_loader, device):
+def mini_batch_em_epoch(num_epochs, pc, optimizer, train_loader, test_loader, device):
     for epoch in range(num_epochs):
         t0 = time.time()
         train_ll = 0.0
         for batch in train_loader:
             x = batch[0].to(device)
-
-            optimizer.zero_grad()
 
             lls = pc(x)
             lls.mean().backward()
@@ -33,8 +31,6 @@ def mini_batch_em_epoch(num_epochs, pc, optimizer, scheduler, train_loader, test
             train_ll += lls.mean().detach().cpu().numpy().item()
 
             optimizer.step()
-            if scheduler is not None:
-                scheduler.step()
 
         train_ll /= len(train_loader)
 
@@ -102,7 +98,7 @@ def test_pd():
 
     pc.to(device)
 
-    optimizer = juice.optim.CircuitOptimizer(pc, lr = 0.1, pseudocount = 0.0001)
+    optimizer = juice.optim.MiniBatchEM(pc, step_size = 0.1, pseudocount = 0.0001)
 
     # for batch in train_loader:
     #     x = batch[0].to(device)
@@ -128,7 +124,7 @@ def test_pd():
     # import pdb; pdb.set_trace()
     # exit()
 
-    mini_batch_em_epoch(5, pc, optimizer, None, train_loader, test_loader, device)
+    mini_batch_em_epoch(5, pc, optimizer, train_loader, test_loader, device)
     
     test_ll = evaluate(pc, test_loader)
 
@@ -171,9 +167,9 @@ def test_homogeneous_pd():
 
     pc.to(device)
 
-    optimizer = juice.optim.CircuitOptimizer(pc, lr = 0.1, pseudocount = 0.0001)
+    optimizer = juice.optim.MiniBatchEM(pc, step_size = 0.1, pseudocount = 0.0001)
 
-    mini_batch_em_epoch(10, pc, optimizer, None, train_loader, test_loader, device)
+    mini_batch_em_epoch(10, pc, optimizer, train_loader, test_loader, device)
     
     test_ll = evaluate(pc, test_loader)
 

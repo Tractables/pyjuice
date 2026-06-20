@@ -1,2 +1,4 @@
 from .optim import CircuitOptimizer
-from .scheduler import CircuitScheduler
+from .full_batch_em import FullBatchEM
+from .mini_batch_em import MiniBatchEM
+from .anemone import Anemone
