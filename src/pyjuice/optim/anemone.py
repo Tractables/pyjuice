@@ -44,14 +44,15 @@ class Anemone(CircuitOptimizer):
 
     def __init__(self, pc: TensorCircuit, step_size: float = 0.4, momentum: float = 0.9,
                  niters_per_update: int = 1, pseudocount: float = 1e-6, keep_zero_params: bool = False,
-                 ddp: bool = False, ddp_dtype: Optional[torch.dtype] = None, ddp_group = None):
+                 ddp: bool = False, ddp_dtype: Optional[torch.dtype] = None, ddp_group = None,
+                 sync_every: int = 1):
 
         assert 0.0 < step_size <= 1.0, "`step_size` should be in (0, 1]."
         assert 0.0 <= momentum < 1.0, "`momentum` should be in [0, 1)."
         assert niters_per_update >= 1, "`niters_per_update` should be a positive integer."
 
         super().__init__(pc, pseudocount = pseudocount, keep_zero_params = keep_zero_params,
-                         ddp = ddp, ddp_dtype = ddp_dtype, ddp_group = ddp_group)
+                         ddp = ddp, ddp_dtype = ddp_dtype, ddp_group = ddp_group, sync_every = sync_every)
 
         self.step_size = step_size
         self.momentum = momentum
@@ -67,7 +68,10 @@ class Anemone(CircuitOptimizer):
         if self._iter % self.niters_per_update != 0:
             return   # still accumulating this update window
 
-        self._sync_flows()
+        if self.sync_every <= 1:
+            self._sync_flows()   # synchronous DDP: reduce flows (+ _cum_flow) before the update
+        # else: Local-SGD -- the rescaling normalizer (_cum_flow) and momentum stay LOCAL to this rank;
+        #       params are averaged across ranks in _post_update_sync every `sync_every` updates.
 
         if self.momentum > 0.0:
             self._apply_momentum()
@@ -77,6 +81,7 @@ class Anemone(CircuitOptimizer):
                               keep_zero_params = self.keep_zero_params, step_size_rescaling = True)
         self.zero_flows()
         self._num_updates += 1
+        self._post_update_sync()
 
     def _apply_momentum(self):
         m = self.momentum

@@ -28,13 +28,14 @@ class MiniBatchEM(CircuitOptimizer):
 
     def __init__(self, pc: TensorCircuit, step_size: float = 0.1, niters_per_update: int = 1,
                  pseudocount: float = 0.0, keep_zero_params: bool = False,
-                 ddp: bool = False, ddp_dtype: Optional[torch.dtype] = None, ddp_group = None):
+                 ddp: bool = False, ddp_dtype: Optional[torch.dtype] = None, ddp_group = None,
+                 sync_every: int = 1):
 
         assert 0.0 < step_size <= 1.0, "`step_size` should be in (0, 1]."
         assert niters_per_update >= 1, "`niters_per_update` should be a positive integer."
 
         super().__init__(pc, pseudocount = pseudocount, keep_zero_params = keep_zero_params,
-                         ddp = ddp, ddp_dtype = ddp_dtype, ddp_group = ddp_group)
+                         ddp = ddp, ddp_dtype = ddp_dtype, ddp_group = ddp_group, sync_every = sync_every)
 
         self.step_size = step_size
         self.niters_per_update = niters_per_update
@@ -45,8 +46,11 @@ class MiniBatchEM(CircuitOptimizer):
         if self._iter % self.niters_per_update != 0:
             return   # still accumulating this update window
 
-        self._sync_flows()
+        if self.sync_every <= 1:
+            self._sync_flows()   # synchronous DDP: reduce flows before the (then identical) update
+        # else: Local-SGD -- update locally on this rank's flows; params are averaged in _post_update_sync
         ss = self.step_size if step_size is None else step_size
         self.pc.mini_batch_em(step_size = ss, pseudocount = self.pseudocount,
                               keep_zero_params = self.keep_zero_params)
         self.zero_flows()
+        self._post_update_sync()

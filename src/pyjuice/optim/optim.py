@@ -46,10 +46,22 @@ class CircuitOptimizer():
     :type ddp_dtype: Optional[torch.dtype]
 
     :param ddp_group: optional ``torch.distributed`` process group for the all-reduce
+
+    :param sync_every: DDP synchronization cadence, in EM updates. ``1`` (default) reduces the parameter
+        flows every update -- exact synchronous DDP. ``> 1`` runs ``sync_every`` *local* EM updates per
+        rank (each on its own data shard, no flow reduction) and then averages the *parameters* across
+        ranks (Local-SGD): the all-reduce happens ``sync_every`` times less often. Only meaningful when
+        ``ddp = True``. NOTE: ``sync_every > 1`` is a different optimizer than the synchronous one
+        (averaging params after local updates is not the same as one update on averaged flows), so its
+        convergence should be validated.
+    :type sync_every: int
     """
 
     def __init__(self, pc: TensorCircuit, pseudocount: float = 0.0, keep_zero_params: bool = False,
-                 ddp: bool = False, ddp_dtype: Optional[torch.dtype] = None, ddp_group = None):
+                 ddp: bool = False, ddp_dtype: Optional[torch.dtype] = None, ddp_group = None,
+                 sync_every: int = 1):
+
+        assert sync_every >= 1, "`sync_every` should be a positive integer."
 
         self.pc = pc
         self.pseudocount = pseudocount
@@ -58,6 +70,9 @@ class CircuitOptimizer():
         self.ddp = ddp
         self.ddp_dtype = ddp_dtype
         self.ddp_group = ddp_group
+
+        self.sync_every = sync_every
+        self._update_count = 0   # number of EM updates performed (drives the Local-SGD sync cadence)
 
         # The backward pass should ACCUMULATE flows across the minibatches of an update window; the
         # optimizer resets the accumulator itself after each update.
@@ -78,6 +93,43 @@ class CircuitOptimizer():
         # All-reduce the accumulated flows (and the EM normalizer ``_cum_flow``) across DDP ranks.
         if self.ddp:
             self.pc.sync_param_flows(dtype = self.ddp_dtype, group = self.ddp_group)
+
+    def _average_params(self):
+        # Local-SGD: replace each rank's params by their arithmetic mean across the process group. The
+        # mean of normalized PC params is itself normalized (per sum node the children sum to 1 on every
+        # rank, so their mean sums to 1), so no renormalization is needed. No-op without DDP.
+        if not self.ddp:
+            return
+        import torch.distributed as dist
+        if not dist.is_available() or not dist.is_initialized():
+            return
+        ws = dist.get_world_size(self.ddp_group)
+        if ws <= 1:
+            return
+
+        tensors = [self.pc.params]
+        for layer in self.pc.input_layer_group:
+            p = getattr(layer, "params", None)
+            if p is not None:
+                tensors.append(p)
+
+        with torch.no_grad():
+            for p in tensors:
+                if self.ddp_dtype is not None and p.dtype != self.ddp_dtype:
+                    buf = p.to(self.ddp_dtype)
+                    dist.all_reduce(buf, op = dist.ReduceOp.SUM, group = self.ddp_group)
+                    p.copy_(buf)
+                else:
+                    dist.all_reduce(p, op = dist.ReduceOp.SUM, group = self.ddp_group)
+                p.div_(ws)
+
+    def _post_update_sync(self):
+        # Called by each subclass's `step` AFTER the local EM update. In Local-SGD mode
+        # (``sync_every > 1``) the params are averaged across ranks every ``sync_every`` updates;
+        # otherwise nothing happens here (the flows were already reduced before the update).
+        self._update_count += 1
+        if self.sync_every > 1 and self._update_count % self.sync_every == 0:
+            self._average_params()
 
     def step(self, step_size: Optional[float] = None):
         """
