@@ -68,7 +68,7 @@ def train(pc, num_epochs, train_loader, valid_loader, device, propagation_alg, *
         for batch in train_loader:
             x = batch[0].to(device)
 
-            lls = pc(x, propagation_alg = propagation_alg, **kwargs)
+            lls = pc(x, propagation_alg = propagation_alg, logspace_flows = False, **kwargs)
             lls.mean().backward()
 
             train_ll += lls.mean().detach().cpu().numpy().item()

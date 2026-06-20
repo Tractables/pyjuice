@@ -136,7 +136,7 @@ def test_hclt_single_layer_backward():
     pc.init_param_flows(flows_memory = 0.0)
 
     lls = pc(batch_data)
-    pc.backward(batch_data, allow_modify_flows = False)
+    pc.backward(batch_data, allow_modify_flows = False, logspace_flows = False)
 
     pc.update_param_flows()
 
@@ -154,8 +154,8 @@ def test_hclt_single_layer_backward():
 
         previous_layer.forward(node_mars, element_mars, _for_backward = True)
 
-        my_layer.backward(node_flows, element_flows, node_mars, element_mars, params, 
-                          param_flows = param_flows, allow_modify_flows = False, propagation_alg = "LL")
+        my_layer.backward(node_flows, element_flows, node_mars, element_mars, params,
+                          param_flows = param_flows, allow_modify_flows = False, propagation_alg = "LL", logspace_flows = False)
 
         chids = my_layer.partitioned_chids[0]
         parids = my_layer.partitioned_parids[0]
@@ -232,7 +232,7 @@ def test_hclt_single_layer_backward_general_em():
     pc.init_param_flows(flows_memory = 0.0)
 
     lls = pc(batch_data, propagation_alg = "GeneralLL", alpha = alpha)
-    pc.backward(batch_data, allow_modify_flows = False,
+    pc.backward(batch_data, allow_modify_flows = False, logspace_flows = False,
                 propagation_alg = "GeneralLL", alpha = alpha)
 
     pc.update_param_flows()
@@ -251,9 +251,9 @@ def test_hclt_single_layer_backward_general_em():
 
         previous_layer.forward(node_mars, element_mars, _for_backward = True)
 
-        my_layer.backward(node_flows, element_flows, node_mars, element_mars, params, 
-                          param_flows = param_flows, allow_modify_flows = False, 
-                          propagation_alg = "GeneralLL", alpha = alpha)
+        my_layer.backward(node_flows, element_flows, node_mars, element_mars, params,
+                          param_flows = param_flows, allow_modify_flows = False,
+                          propagation_alg = "GeneralLL", alpha = alpha, logspace_flows = False)
 
         chids = my_layer.partitioned_chids[0]
         parids = my_layer.partitioned_parids[0]
@@ -328,7 +328,7 @@ def test_hclt_backward():
     pc.init_param_flows(flows_memory = 0.0)
 
     lls = pc(batch_data)
-    pc.backward(batch_data, allow_modify_flows = False)
+    pc.backward(batch_data, allow_modify_flows = False, logspace_flows = False)
 
     pc.update_param_flows()
 
@@ -496,8 +496,8 @@ def test_hclt_backward():
 
                 pc.inner_layer_groups[curr_layer_id - 1].forward(temp_node_mars, temp_element_mars, _for_backward = True)
 
-                curr_layer.backward(temp_node_flows, temp_element_flows, temp_node_mars, temp_element_mars, temp_params, 
-                                    param_flows = temp_param_flows, allow_modify_flows = False, propagation_alg = "LL")
+                curr_layer.backward(temp_node_flows, temp_element_flows, temp_node_mars, temp_element_mars, temp_params,
+                                    param_flows = temp_param_flows, allow_modify_flows = False, propagation_alg = "LL", logspace_flows = False)
 
                 pfsid, pfeid = ns._param_flow_range
 
@@ -550,7 +550,7 @@ def test_hclt_em():
     batch_size = batch_data.size(0)
 
     lls = pc(batch_data)
-    pc.backward(batch_data, allow_modify_flows = False)
+    pc.backward(batch_data, allow_modify_flows = False, logspace_flows = False)
 
     ns2old_params = dict()
     for ns in root_ns:

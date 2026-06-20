@@ -192,7 +192,7 @@ def test_simple_structure_block1():
 
     ## Backward tests ##
 
-    pc.backward(data, allow_modify_flows = False)
+    pc.backward(data, allow_modify_flows = False, logspace_flows = False)
 
     node_flows = pc.node_flows.detach().cpu().clone()
     param_flows = pc.param_flows.detach().cpu().clone()
@@ -492,7 +492,7 @@ def test_simple_structure_block16():
 
     ## Backward tests ##
 
-    pc.backward(data, allow_modify_flows = False)
+    pc.backward(data, allow_modify_flows = False, logspace_flows = False)
 
     node_flows = pc.node_flows.detach().cpu().clone()
     param_flows = pc.param_flows.detach().cpu().clone()
