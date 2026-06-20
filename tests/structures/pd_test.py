@@ -67,6 +67,10 @@ def test_pd():
 
     device = torch.device("cuda:0")
 
+    # Seed for determinism: tight LL threshold with little margin -> unseeded init + shuffle make it
+    # RNG-flaky (compounded by the kernels' atomic non-determinism).
+    torch.manual_seed(42)
+
     train_dataset = torchvision.datasets.MNIST(root = "./examples/data", train = True, download = True)
     test_dataset = torchvision.datasets.MNIST(root = "./examples/data", train = False, download = True)
 
@@ -134,6 +138,10 @@ def test_pd():
 def test_homogeneous_pd():
 
     device = torch.device("cuda:0")
+
+    # Seed for determinism: tight LL threshold with little margin -> unseeded init + shuffle make it
+    # RNG-flaky (compounded by the kernels' atomic non-determinism).
+    torch.manual_seed(42)
 
     train_dataset = torchvision.datasets.MNIST(root = "./examples/data", train = True, download = True)
     test_dataset = torchvision.datasets.MNIST(root = "./examples/data", train = False, download = True)
