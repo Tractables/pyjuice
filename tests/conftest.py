@@ -27,28 +27,36 @@ def pytest_configure(config):
     worker = os.environ.get("PYTEST_XDIST_WORKER", "gw0")
     worker_id = int(worker.replace("gw", "")) if worker.startswith("gw") else 0
 
-    # Determine the pool of GPUs to distribute workers across.
-    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if visible is not None and visible.strip() != "":
-        # Respect an externally-provided restriction (e.g. `CUDA_VISIBLE_DEVICES=4,5,6,7 pytest -n 4`):
-        # pick from that set rather than overriding it with absolute indices.
-        gpus = [g.strip() for g in visible.split(",") if g.strip() != ""]
+    # Determine the pool of GPUs to distribute workers across. PYJUICE_TEST_GPU_POOL is the source of
+    # truth: the controller computes it ONCE, and workers -- spawned with the controller's (mutated)
+    # environment -- inherit it. This indirection is essential: the controller pins its OWN
+    # CUDA_VISIBLE_DEVICES to a single GPU just below, the workers inherit that shrunk value, so
+    # re-deriving the pool from CUDA_VISIBLE_DEVICES inside a worker would collapse it to one GPU and
+    # put EVERY worker on GPU 0 (the bug this guards against).
+    pool = os.environ.get("PYJUICE_TEST_GPU_POOL")
+    if pool is not None and pool.strip() != "":
+        gpus = [g.strip() for g in pool.split(",") if g.strip() != ""]
     else:
-        # No restriction provided: enumerate all physical GPUs WITHOUT initializing CUDA.
-        try:
-            out = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True)
-            num_gpus = len(out.stdout.strip().splitlines())
-        except FileNotFoundError:
-            num_gpus = 1
-        gpus = [str(i) for i in range(max(num_gpus, 1))]
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if visible is not None and visible.strip() != "":
+            # Respect an externally-provided restriction (e.g. `CUDA_VISIBLE_DEVICES=4,5,6,7 pytest`):
+            # pick from that set rather than overriding it with absolute indices.
+            gpus = [g.strip() for g in visible.split(",") if g.strip() != ""]
+        else:
+            # No restriction provided: enumerate all physical GPUs WITHOUT initializing CUDA.
+            try:
+                out = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True)
+                num_gpus = len(out.stdout.strip().splitlines())
+            except FileNotFoundError:
+                num_gpus = 1
+            gpus = [str(i) for i in range(max(num_gpus, 1))]
+        # Publish the full pool once (on the controller) so spawned workers inherit it and never
+        # re-derive a collapsed pool from the pinned CUDA_VISIBLE_DEVICES set below.
+        os.environ["PYJUICE_TEST_GPU_POOL"] = ",".join(gpus)
 
-    # Pin this worker to a single GPU from the pool.
+    # Pin this worker to a single GPU from the pool, and expose the worker id so multi-GPU tests can
+    # select a worker-specific subset of the pool (keeping them on distinct GPUs under `pytest -n`).
     os.environ["CUDA_VISIBLE_DEVICES"] = gpus[worker_id % len(gpus)]
-
-    # Expose the full pool (and this worker's id) so multi-GPU tests, which need >=2 visible GPUs,
-    # can select a worker-specific subset instead of the single pinned GPU above -- keeping such
-    # tests spread across distinct GPUs under `pytest -n`.
-    os.environ["PYJUICE_TEST_GPU_POOL"] = ",".join(gpus)
     os.environ["PYJUICE_TEST_WORKER_ID"] = str(worker_id)
 
     # CPU limits — env vars before torch import
