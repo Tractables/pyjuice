@@ -129,29 +129,24 @@ We proceed to move it to the GPU specified by :code:`device`.
 Train the PC
 ------------
 
-.. GENERATED FROM PYTHON SOURCE LINES 79-80
+.. GENERATED FROM PYTHON SOURCE LINES 79-81
 
-We start by defining the optimizer and scheduler.
+We start by defining the optimizer. PyJuice provides a few EM-based optimizers in `juice.optim`
+(`FullBatchEM`, `MiniBatchEM`, and `Anemone`); here we use mini-batch EM.
 
-.. GENERATED FROM PYTHON SOURCE LINES 80-89
+.. GENERATED FROM PYTHON SOURCE LINES 81-84
 
 .. code-block:: Python
 
 
-    optimizer = juice.optim.CircuitOptimizer(pc, lr = 0.1, pseudocount = 0.1, method = "EM")
-    scheduler = juice.optim.CircuitScheduler(
-        optimizer, 
-        method = "multi_linear", 
-        lrs = [0.9, 0.1, 0.05], 
-        milestone_steps = [0, len(train_loader) * 100, len(train_loader) * 350]
-    )
+    optimizer = juice.optim.MiniBatchEM(pc, step_size = 0.1, pseudocount = 0.1)
 
 
-.. GENERATED FROM PYTHON SOURCE LINES 90-91
+.. GENERATED FROM PYTHON SOURCE LINES 85-86
 
 Optionally, we can leverage CUDA Graphs to hide the kernel launching overhead by doing a dry run.
 
-.. GENERATED FROM PYTHON SOURCE LINES 91-99
+.. GENERATED FROM PYTHON SOURCE LINES 86-94
 
 .. code-block:: Python
 
@@ -164,11 +159,11 @@ Optionally, we can leverage CUDA Graphs to hide the kernel launching overhead by
         break
 
 
-.. GENERATED FROM PYTHON SOURCE LINES 100-101
+.. GENERATED FROM PYTHON SOURCE LINES 95-96
 
 We are now ready for the training. Below is an example training loop for mini-batch EM.
 
-.. GENERATED FROM PYTHON SOURCE LINES 101-137
+.. GENERATED FROM PYTHON SOURCE LINES 96-128
 
 .. code-block:: Python
 
@@ -179,20 +174,16 @@ We are now ready for the training. Below is an example training loop for mini-ba
         for batch in train_loader:
             x = batch[0].to(device)
 
-            # Similar to PyTorch optimizers zeroling out the gradients, we zero out the parameter flows
-            optimizer.zero_grad()
-
             # Forward pass
             lls = pc(x)
 
-            # Backward pass
+            # Backward pass accumulates the parameter flows
             lls.mean().backward()
 
             train_ll += lls.mean().detach().cpu().numpy().item()
 
-            # Perform a mini-batch EM step
+            # Perform a mini-batch EM step (consumes the flows, then resets the accumulator)
             optimizer.step()
-            scheduler.step()
 
         train_ll /= len(train_loader)
 
@@ -209,11 +200,11 @@ We are now ready for the training. Below is an example training loop for mini-ba
         print(f"[Epoch {epoch}/{350}][train LL: {train_ll:.2f}; val LL: {test_ll:.2f}].....[train forward+backward+step {t1-t0:.2f}; val forward {t2-t1:.2f}] ")
 
 
-.. GENERATED FROM PYTHON SOURCE LINES 138-139
+.. GENERATED FROM PYTHON SOURCE LINES 129-130
 
 Similarly, an example training loop for full-batch EM is given as follows.
 
-.. GENERATED FROM PYTHON SOURCE LINES 139-171
+.. GENERATED FROM PYTHON SOURCE LINES 130-162
 
 .. code-block:: Python
 
