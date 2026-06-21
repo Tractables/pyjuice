@@ -264,6 +264,13 @@ class InputLayer(Layer, nn.Module):
         self._param_batch_size = 1
     
     def to(self, device):
+        # Normalize to a `torch.device` (int ordinal / string / `torch.device`), matching
+        # `TensorCircuit.to`, so `self.device.type`/`.index` accesses below and elsewhere are valid.
+        if isinstance(device, int):
+            device = torch.device(f"cuda:{device}")
+        else:
+            device = torch.device(device)
+
         nn.Module.to(self, device = device)
 
         # Take special care to `tied2source_nids`

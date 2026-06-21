@@ -82,7 +82,10 @@ def device_grad_controller(device, no_grad = True):
         else:
             yield
     else:
-        with torch.cuda.device(f"cuda:{device.index}"):
+        # Pass the `torch.device` straight through: it handles an index-less CUDA device
+        # (`torch.device("cuda")`, `.index is None`) by selecting the current device, whereas
+        # `f"cuda:{device.index}"` would build the invalid string "cuda:None".
+        with torch.cuda.device(device):
             if no_grad:
                 with torch.no_grad():
                     yield
@@ -173,10 +176,15 @@ class TensorCircuit(nn.Module):
         self._cum_flow = 0.0
 
     def to(self, device):
-        super(TensorCircuit, self).to(device)
-
+        # Normalize to a `torch.device` so all downstream consumers (which rely on `self.device.type` /
+        # `self.device.index`) work uniformly. Accept an int ordinal (`pc.to(0)`), a string
+        # (`pc.to("cuda:0")` / `pc.to("cpu")`), or a `torch.device`.
         if isinstance(device, int):
             device = torch.device(f"cuda:{device}")
+        else:
+            device = torch.device(device)
+
+        super(TensorCircuit, self).to(device)
 
         self.input_layer_group.to(device)
 
