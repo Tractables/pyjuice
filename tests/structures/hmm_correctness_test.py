@@ -111,7 +111,7 @@ def test_hmm_forward_backward():
 
     ## Backward tests ##
 
-    pc.backward(data, allow_modify_flows = False)
+    pc.backward(data, allow_modify_flows = False, logspace_flows = False)
 
     pc.update_param_flows()
 
@@ -320,7 +320,7 @@ def test_hmm_forward_backward_with_generalized_em():
 
     ## Backward tests ##
 
-    pc.backward(data, allow_modify_flows = False, 
+    pc.backward(data, allow_modify_flows = False, logspace_flows = False,
                 propagation_alg = "GeneralLL", alpha = alpha)
 
     pc.update_param_flows()

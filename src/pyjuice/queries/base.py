@@ -46,8 +46,13 @@ def query(pc: TensorCircuit, inputs: torch.Tensor,
     elif not run_backward:
         return lls
 
-    # (Optionally) run backward pass
+    # (Optionally) run backward pass.
+    # Queries (marginal/conditional/sample) read node flows in *linear* space via `bk_input_fn`, so
+    # keep the pre-change backward behavior here regardless of the global default (which is now
+    # log-space flows, intended for EM training). `setdefault` still lets a caller override.
     assert bk_input_fn is not None
+    kwargs.setdefault("logspace_flows", False)
+    kwargs.setdefault("allow_modify_flows", True)
     pc.backward(inputs, input_layer_fn = bk_input_fn, compute_param_flows = False, **kwargs)
 
     return None

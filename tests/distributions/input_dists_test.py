@@ -36,7 +36,7 @@ def test_categorical_nodes():
 
     lls = pc(data)
 
-    pc.backward(data)
+    pc.backward(data, logspace_flows = False)
 
     ## Input node forward tests ##
 
@@ -106,7 +106,7 @@ def test_bernoulli_nodes():
 
     lls = pc(data)
 
-    pc.backward(data)
+    pc.backward(data, logspace_flows = False)
 
     ## Input node forward tests ##
 
@@ -177,7 +177,7 @@ def test_gaussian_nodes():
 
     lls = pc(data)
 
-    pc.backward(data)
+    pc.backward(data, logspace_flows = False)
 
     ## Input node forward tests ##
 
@@ -254,7 +254,7 @@ def test_discrete_logistic_nodes():
 
     lls = pc(data)
 
-    pc.backward(data)
+    pc.backward(data, logspace_flows = False)
 
     ## Input node forward tests ##
 
@@ -361,7 +361,7 @@ def test_discrete_logistic_nodes_behavior():
     for _ in range(40):
         lls = pc(data)
 
-        pc.backward(data, flows_memory = 0.0)
+        pc.backward(data, flows_memory = 0.0, logspace_flows = False)
 
         pc.mini_batch_em(step_size = 1.0, pseudocount = 0.001)
 
@@ -409,7 +409,7 @@ def test_masked_categorical_nodes_range():
 
     lls = pc(data)
 
-    pc.backward(data)
+    pc.backward(data, logspace_flows = False)
 
     ## Input node forward tests ##
 
@@ -531,7 +531,7 @@ def test_masked_categorical_nodes_full_mask():
 
     lls = pc(data)
 
-    pc.backward(data)
+    pc.backward(data, logspace_flows = False)
 
     ## Input node forward tests ##
 
@@ -653,7 +653,7 @@ def test_masked_categorical_nodes_rev_range():
 
     lls = pc(data)
 
-    pc.backward(data)
+    pc.backward(data, logspace_flows = False)
 
     ## Input node forward tests ##
 

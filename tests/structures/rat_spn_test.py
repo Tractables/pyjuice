@@ -19,22 +19,37 @@ def evaluate(pc, loader):
     return lls_total
 
 
-def mini_batch_em_epoch(num_epochs, pc, optimizer, scheduler, train_loader, test_loader, device):
+def _multi_linear_step_size(step, lrs, milestone_steps):
+    if step >= milestone_steps[-1]:
+        return lrs[-1]
+    idx = sum(1 for ms in milestone_steps if ms < step)
+    if idx == 0:
+        return lrs[0]
+    return lrs[idx - 1] + (lrs[idx] - lrs[idx - 1]) * (step - milestone_steps[idx - 1]) / \
+           (milestone_steps[idx] - milestone_steps[idx - 1])
+
+
+def mini_batch_em_epoch(num_epochs, pc, optimizer, train_loader, test_loader, device, base_lr, lrs, milestone_steps):
     for epoch in range(num_epochs):
         t0 = time.time()
         train_ll = 0.0
-        for batch in train_loader:
+        for batch_idx, batch in enumerate(train_loader):
             x = batch[0].to(device)
-
-            optimizer.zero_grad()
 
             lls = pc(x)
             lls.mean().backward()
 
             train_ll += lls.mean().detach().cpu().numpy().item()
 
-            optimizer.step()
-            scheduler.step()
+            # Reproduce the original (optimizer.step() then scheduler.step()) ordering: the very
+            # first minibatch used the optimizer's initial lr, and minibatch m (m >= 1) used the
+            # scheduler value computed at step_count = m - 1.
+            minibatch = epoch * len(train_loader) + batch_idx
+            if minibatch == 0:
+                step_size = base_lr
+            else:
+                step_size = _multi_linear_step_size(minibatch - 1, lrs, milestone_steps)
+            optimizer.step(step_size = step_size)
 
         train_ll /= len(train_loader)
 
@@ -102,13 +117,10 @@ def test_rat_spn():
 
     pc.to(device)
 
-    optimizer = juice.optim.CircuitOptimizer(pc, lr = 0.1, pseudocount = 0.1)
-    scheduler = juice.optim.CircuitScheduler(
-        optimizer, 
-        method = "multi_linear", 
-        lrs = [0.9, 0.1, 0.05], 
-        milestone_steps = [0, len(train_loader) * 100, len(train_loader) * 350]
-    )
+    base_lr = 0.1
+    optimizer = juice.optim.MiniBatchEM(pc, step_size = base_lr, pseudocount = 0.1)
+    lrs = [0.9, 0.1, 0.05]
+    milestone_steps = [0, len(train_loader) * 100, len(train_loader) * 350]
 
     for batch in train_loader:
         x = batch[0].to(device)
@@ -117,7 +129,7 @@ def test_rat_spn():
         lls.mean().backward()
         break
 
-    mini_batch_em_epoch(20, pc, optimizer, scheduler, train_loader, test_loader, device)
+    mini_batch_em_epoch(20, pc, optimizer, train_loader, test_loader, device, base_lr, lrs, milestone_steps)
 
     test_ll = evaluate(pc, test_loader)
 

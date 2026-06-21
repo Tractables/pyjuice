@@ -64,7 +64,7 @@ def test_soft_evi_bp():
 
     lls = pc(data)
 
-    pc.backward(data)
+    pc.backward(data, logspace_flows = False)
 
     ## Input node backward tests ##
 
@@ -81,7 +81,7 @@ def test_soft_evi_bp():
 
     lls = pc(data, external_soft_evi = external_soft_evi)
 
-    pc.backward(data, external_soft_evi_grad = external_soft_evi_grad)
+    pc.backward(data, external_soft_evi_grad = external_soft_evi_grad, logspace_flows = False)
 
     for i in range(16):
         assert torch.abs(pc.node_flows[3,i] - external_soft_evi_grad[i,0,0]) < 1e-4

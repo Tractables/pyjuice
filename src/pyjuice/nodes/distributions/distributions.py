@@ -100,6 +100,15 @@ class Distribution():
         """
         return self.bk_flow_fn if hasattr(self, "bk_flow_fn") else None
 
+    def get_bk_flow_cuda_fn(self):
+        """
+        Return an optional CUDA fast-path for the backward param-flow accumulation, or None to use the
+        Triton `bk_flow_fn`. The callable should run the accumulation and return True if it handled the
+        call (gate passed + kernel available), False to fall back to Triton. Only the distributions with
+        a hand-written CUDA kernel override this.
+        """
+        return self.bk_flow_cuda_fn if hasattr(self, "bk_flow_cuda_fn") else None
+
     def get_sample_fn(self):
         """
         Return the `sample_fn` to be used by the layer.

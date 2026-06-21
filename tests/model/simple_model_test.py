@@ -278,7 +278,7 @@ def test_simple_model():
 
     ## Backward pass ##
 
-    pc.backward(data, allow_modify_flows = False)
+    pc.backward(data, allow_modify_flows = False, logspace_flows = False)
 
     node_flows = pc.node_flows.cpu()
     param_flows = pc.param_flows.cpu()
@@ -287,7 +287,7 @@ def test_simple_model():
     assert torch.all(torch.abs(node_flows[sid:eid,:] - 1.0) < 1e-4)
 
     pc.inner_layer_groups[2][0].forward(pc.node_mars, pc.element_mars)
-    pc.inner_layer_groups[3][0].backward(pc.node_flows, pc.element_flows, pc.node_mars, pc.element_mars, pc.params, pc.param_flows)
+    pc.inner_layer_groups[3][0].backward(pc.node_flows, pc.element_flows, pc.node_mars, pc.element_mars, pc.params, pc.param_flows, logspace_flows = False)
     element_flows = pc.element_flows.cpu()
 
     ch_lls = torch.cat((np4_lls, np5_lls, np6_lls), dim = 0)
@@ -323,7 +323,7 @@ def test_simple_model():
     assert torch.all(torch.abs(ns2_flows - node_flows[sid:eid,:]) < 1e-4)
 
     pc.inner_layer_groups[0][0].forward(pc.node_mars, pc.element_mars)
-    pc.inner_layer_groups[1][0].backward(pc.node_flows, pc.element_flows, pc.node_mars, pc.element_mars, pc.params, pc.param_flows)
+    pc.inner_layer_groups[1][0].backward(pc.node_flows, pc.element_flows, pc.node_mars, pc.element_mars, pc.params, pc.param_flows, logspace_flows = False)
     element_flows = pc.element_flows.cpu()
 
     ch_lls = torch.cat((np0_lls, np3_lls), dim = 0)
@@ -424,7 +424,7 @@ def test_simple_model():
 
     ## EM Optimization tests ##
 
-    pc.backward(data, flows_memory = 0.0)
+    pc.backward(data, flows_memory = 0.0, logspace_flows = False)
 
     ns0_old_params = ns0._params.clone().reshape(2, 4, 16, 16).permute(0, 2, 1, 3).reshape(32, 64)
     ns1_old_params = ns1._params.clone().reshape(2, 2, 16, 16).permute(0, 2, 1, 3).reshape(32, 32)

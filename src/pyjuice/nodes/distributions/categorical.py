@@ -99,8 +99,25 @@ class Categorical(Distribution):
         pf_offsets = s_pfids + data
         tl.atomic_add(param_flows_ptr + pf_offsets, flows, mask = mask)
 
+    def bk_flow_cuda_fn(self, param_flows, node_flows, data, vids, s_pfids, layer_num_nodes,
+                        batch_size, node_offset, logspace):
+        """Optional CUDA fast-path for the backward param-flow accumulation (smem-histogram). Returns
+        True if it ran (gate passed + kernel compiled), False to fall back to the Triton `bk_flow_fn`.
+        The input-layer gate already guarantees full eval, no missing mask, univariate, contiguous
+        float32 buffers, and distinct 4-aligned `s_pfids`; here we check the divisibility/availability."""
+        if (batch_size % 4 != 0) or (self.num_cats % 4 != 0):
+            return False
+        if data.dtype not in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
+            return False  # kernel dispatches over integer category-id dtypes; else fall back to Triton
+        from pyjuice.layer.kernels.c.input_layers import cat_backward_is_available, cat_backward
+        if not cat_backward_is_available():
+            return False
+        cat_backward(param_flows, node_flows, data, vids, s_pfids, layer_num_nodes,
+                     batch_size, node_offset, self.num_cats, logspace)
+        return True
+
     @staticmethod
-    def bk_flow_mask_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
+    def bk_flow_mask_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr,
                         s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE, TILE_SIZE_K):
         # Get `num_cats` from `metadata`
         s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)

@@ -45,6 +45,52 @@ BACKWARD_PAR_FLOW_TUNED = True
 # (element-output tiling only, so bit-exact). Tuned for an RTX PRO 6000; set False to disable.
 BACKWARD_ELE_FLOW_TUNED = True
 
+# Optional CUDA (CuTe/CUTLASS + fp16 + TMA) fast path for the block-sparse element-flow backward
+# `_bk_triton_block_sparse_ele_kernel`. When enabled AND all dispatch conditions hold (LL, logspace
+# flows, allow_modify_flows / allow_neg_flows / accumulate_ch_flows all off, no tempering / partial
+# eval, TILE_SIZE_K == 64, ptr_inc_step == 1, block_size % 128 == 0, batch % 64 == 0, and a
+# TMA-capable GPU sm_90+ with CUTLASS), it replaces the Triton ele launch. Numerically equivalent
+# (fp16 dot + fp32 accumulate; ~1.07e-3 in log-space, under the 1.5e-3 bound). The best of {CUDA,
+# Triton} is autotuned once per layer signature INTO A SCRATCH BUFFER (never the live element_flows,
+# which is read-accumulate-write when accumulate_ch_flows=True) and cached. Falls back to Triton on
+# any unsupported shape / missing toolchain. Set False to disable.
+BACKWARD_ELE_FLOW_CUDA = True
+
+# Optional CUDA (CuTe/CUTLASS + fp16 + TMA) fast path for the block-sparse parameter-flow backward
+# `_bk_triton_block_sparse_par_kernel(_rmw)`. When enabled AND all dispatch conditions hold (LL,
+# logspace flows, allow_modify_flows / allow_neg_flows / negate_pflows all off, temperature 1,
+# collision-free (untied) param-flow slots, contiguous cids / block_size-strided pids&pfids,
+# block_size % 64 == 0, num_edges % 128 == 0, batch % 32 == 0, and a TMA-capable GPU sm_90+ with
+# CUTLASS), it replaces the Triton param launch. Numerically equivalent (fp16 dot + fp32 accumulate;
+# unbiased, < 1e-3 in log-param space). It is a batch-contraction GEMM whose epilogue is the dominant
+# (params-I/O) cost; the kernel uses BK=32 for 4-CTA occupancy, edge-blocking to share node loads, and
+# a 128-bit vectorized RMW epilogue. The best of {CUDA, Triton} is autotuned once per layer signature
+# INTO A SCRATCH BUFFER (never the live param_flows, which is read-accumulate-write) and cached. Falls
+# back to Triton on any unsupported shape / missing toolchain. Set False to disable.
+BACKWARD_PAR_FLOW_CUDA = True
+
+# Launch tuning for the block-sparse sum-layer FORWARD kernel (kernel body unchanged). In the LL
+# block-sparse-dot regime, `emars_max` / `exp(emars - max)` / the `emars` load depend only on
+# (edge, batch), not on the output node, so the standard `TILE_SIZE_M = 32` recomputes them
+# `block_size / TILE_SIZE_M` times across the m-tile programs of a block. `TILE_SIZE_M` and
+# `BLOCK_B` are pure output- / batch-tiling (the max stabilizer is over `TILE_SIZE_K` edges,
+# left unchanged), so enlarging them is BIT-EXACT; doing so amortizes the redundant max/exp/load
+# (`TILE_SIZE_M`) and the `epars` load (`BLOCK_B`). Raises the tile cap 2048 -> 4096 (=> 64x64 for
+# `TILE_SIZE_K = 64`). Auto-falls-back on `OutOfResources` (smaller GPUs). Tuned for an RTX PRO
+# 6000 (Blackwell); set False to recover the exact original launch configuration.
+FORWARD_SUM_TUNED = True
+
+# Optional CUDA (CuTe/CUTLASS + TMA) fast path for the block-sparse sum-layer FORWARD `tlmm`
+# kernel. When enabled AND all dispatch conditions hold (LL propagation, bf16 dot path, no
+# partial-eval / tempering, block_size % 128 == 0, batch % 64 == 0, TILE_SIZE_K == 64, a
+# contiguous edge/param layout, and a TMA-capable GPU sm_90+ with CUTLASS available), it replaces
+# the Triton `tlmm` launch. The kernel is JIT-compiled on first use and is numerically equivalent
+# to the Triton kernel (bf16 dot + fp32 accumulate; agrees to ~1.5e-3 in log-space, well within the
+# accuracy bar). On ANY of: incompatible GPU, missing nvcc/CUTLASS, compile failure, or an
+# unsupported layer shape, it transparently falls back to the Triton kernel. Set False to disable.
+FORWARD_SUM_CUDA = True
+from .kernels import c as cuda_kernels
+
 
 class SumLayer(Layer, nn.Module):
 
@@ -134,6 +180,14 @@ class SumLayer(Layer, nn.Module):
         # Store pre-compiled indices from `cids` and `pids` in the following buffer
         self._cached_fw_pcids = dict()
 
+        # Per-signature cache for the optional CUDA fast path: (ebase, pbase, cuda_ok) where ebase /
+        # pbase are the per-tile first child-node index / first param offset, and cuda_ok records
+        # whether this layer's edge/param layout satisfies the kernel's contiguity assumptions.
+        self._cached_fw_cuda = dict()
+        # Per-signature autotuned dispatch choice: ("cuda", cfg_id) or ("triton", -1). Decided once
+        # by benchmarking the valid CUDA tile configs against Triton for this layer's shape.
+        self._cached_fw_cuda_choice = dict()
+
         # Layer info
         self._layer_nid_range = (layer_nid_start, layer_nid_start + self.num_nodes)
         self._layer_pid_range = (layer_pid_start, layer_pid_end)
@@ -214,6 +268,19 @@ class SumLayer(Layer, nn.Module):
 
         # Store pre-compiled indices from `parids` and `parpids` in the following buffer
         self._cached_bk_parids = dict()
+
+        # Optional CUDA ele-backward fast path: per-signature (ebase, pbase, cuda_ok), per-(signature,
+        # batch) autotuned choice, and a reused scratch output buffer for corruption-safe autotuning.
+        self._cached_bk_ele_cuda = dict()
+        self._cached_bk_ele_choice = dict()
+        self._bk_ele_scratch = None
+
+        # Optional CUDA param-backward fast path: per-partition (nbase, cbase, pbase, fbase, cuda_ok),
+        # per-(partition, batch) autotuned choice, and a reused scratch param_flows buffer for
+        # corruption-safe autotuning (the kernel is read-accumulate-write).
+        self._cached_bk_par_cuda = dict()
+        self._cached_bk_par_choice = dict()
+        self._bk_par_scratch = None
 
     def to(self, device):
         super(SumLayer, self).to(device)
@@ -531,8 +598,13 @@ class SumLayer(Layer, nn.Module):
         else:
             remainder = 2048 // (base_size ** 2)
             TILE_SIZE_K = min(2048 // remainder, base_size * remainder, num_edges)
-        TILE_SIZE_M = min(2048 // TILE_SIZE_K, self.block_size)
-        BLOCK_B = min(2048 // TILE_SIZE_K, BATCH_SIZE_NP2)
+        # Larger TILE_SIZE_M / BLOCK_B (bit-exact) amortize the per-m-tile recomputation of
+        # `emars_max` / `exp` / the `emars` load and the per-batch-tile `epars` load. Gated to the
+        # LL (non-tempered) regime that was validated bit-exact; auto-disabled on a prior OOM.
+        _fw_tile_cap = 4096 if (FORWARD_SUM_TUNED and not getattr(self, "_fw_tuning_oom", False)
+                                and propagation_alg_id == 0 and not pflow_tempered_enabled) else 2048
+        TILE_SIZE_M = min(_fw_tile_cap // TILE_SIZE_K, self.block_size)
+        BLOCK_B = min(_fw_tile_cap // TILE_SIZE_K, BATCH_SIZE_NP2)
         K_NUM_TILES = num_edges // TILE_SIZE_K
 
         assert TILE_SIZE_K >= 4, f"`TILE_SIZE_K` should be greater than 4 (but got {TILE_SIZE_K}) in order to use the block-sparse kernel. " \
@@ -558,6 +630,20 @@ class SumLayer(Layer, nn.Module):
             ).contiguous()
 
             self._cached_fw_pcids[signature] = [cids_start, cids_increment, pids_start, pids_increment]
+
+            # Pre-compute the CUDA fast-path operands + validate its layout assumptions (once).
+            # `ebase` / `pbase`: per-tile first child-node index / first param offset. The kernel
+            # reads element_mars[ebase + e, b] and params[pbase + e * block_size + m], i.e. it
+            # assumes the tile's children are CONTIGUOUS node rows and its params stride by
+            # `block_size` across edges. Record whether both hold so the dispatcher can fall back.
+            ebase = cids[:, :, 0].contiguous().to(torch.int64)   # [ng, K_NUM_TILES]
+            pbase = pids[:, :, 0].contiguous().to(torch.int64)   # [ng, K_NUM_TILES]
+            _ar = torch.arange(TILE_SIZE_K, device=cids.device, dtype=torch.int64)
+            cids_contig = torch.equal(cids.to(torch.int64), ebase.unsqueeze(-1) + _ar.view(1, 1, -1))
+            pids_strided = torch.equal(pids.to(torch.int64),
+                                       pbase.unsqueeze(-1) + _ar.view(1, 1, -1) * self.block_size)
+            cuda_ok = bool(cids_contig and pids_strided)
+            self._cached_fw_cuda[signature] = [ebase, pbase, cuda_ok]
         else:
             cids_start, cids_increment, pids_start, pids_increment = self._cached_fw_pcids[signature]
 
@@ -576,94 +662,159 @@ class SumLayer(Layer, nn.Module):
                 use_bf16 = False
 
         grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
-        
-        for pid_m_start in range(0, grid[1], 32768):
-            pid_m_end = min(pid_m_start + 32768, grid[1])
-            block_m_size = pid_m_end - pid_m_start
 
-            curr_grid = (grid[0], block_m_size)
+        # Optional CUDA (CuTe/TMA) fast path for the `tlmm` regime. It is numerically equivalent to
+        # the Triton tlmm kernel and only valid here: LL propagation (`propagation_alg_id == 0`), the
+        # bf16 dot path (`use_bf16`), no partial eval (`local_ids is None` <=> `partial_eval == 0`),
+        # no pflow tempering, TILE_SIZE_K == 64 with num_edges a multiple of it, and a contiguous
+        # edge/param layout (`cuda_ok`). `is_available()` JIT-compiles on first call and self-disables
+        # (-> Triton) on an unsuitable GPU/toolchain/CUTLASS, so this is a no-op without the CUDA
+        # prerequisites. The best tile config (or Triton) is autotuned once per layer signature.
+        if (FORWARD_SUM_CUDA and use_bf16 and propagation_alg_id == 0
+                and not pflow_tempered_enabled and local_ids is None
+                and TILE_SIZE_K == 64 and num_edges % TILE_SIZE_K == 0
+                and node_mars.is_cuda and cuda_kernels.is_available()):
+            ebase, pbase, cuda_ok = self._cached_fw_cuda[signature]
+            valid_cfgs = cuda_kernels.valid_configs(self.block_size, batch_size) if cuda_ok else []
+            if valid_cfgs:
+                # The best config depends on batch_size (which tile shapes are valid + their speed),
+                # so the autotuned choice is keyed by (signature, batch_size), not signature alone.
+                choice_key = (signature, batch_size)
+                choice = self._cached_fw_cuda_choice.get(choice_key)
+                if choice is None:
+                    # Autotune once: fastest of {valid CUDA tile configs} vs Triton. Every candidate
+                    # computes the same result into `node_mars`, so it stays correct afterwards.
+                    cands = [(("cuda", c),
+                              (lambda c=c: cuda_kernels.tlmm_forward_sum(
+                                  node_mars, element_mars, params, nids, ebase, pbase,
+                                  batch_size, self.block_size, K_NUM_TILES, c)))
+                             for c in valid_cfgs]
+
+                    def _triton_tlmm_cand():
+                        for s in range(0, grid[1], 32768):
+                            cg = (grid[0], min(s + 32768, grid[1]) - s)
+                            fw_bsparse._fw_triton_block_sparse_tlmm_kernel[cg](
+                                node_mars, element_mars, params, nids, cids_start, cids_increment,
+                                pids_start, pids_increment, local_ids, batch_size,
+                                partial_eval = partial_eval, BLOCK_B = BLOCK_B,
+                                TILE_SIZE_K = TILE_SIZE_K, K_NUM_TILES = K_NUM_TILES,
+                                TILE_SIZE_M = TILE_SIZE_M, BLOCK_SIZE_M = BLOCK_SIZE_M,
+                                use_bf16 = use_bf16, propagation_alg_id = propagation_alg_id,
+                                pflow_tempered_enabled = pflow_tempered_enabled, pid_m_offset = s,
+                                **propagation_alg_kwargs, **pflow_tempered_kwargs, num_stages = 1)
+                    cands.append((("triton", -1), _triton_tlmm_cand))
+                    choice = cuda_kernels.autotune(cands) or ("triton", -1)
+                    self._cached_fw_cuda_choice[choice_key] = choice
+
+                if choice[0] == "cuda":
+                    cuda_kernels.tlmm_forward_sum(
+                        node_mars, element_mars, params, nids, ebase, pbase,
+                        batch_size, self.block_size, K_NUM_TILES, choice[1])
+                    return None
+                # choice == ("triton", -1): fall through to the Triton launch below
         
-            if TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and BLOCK_B >= 16:
-                fw_bsparse._fw_triton_block_sparse_tlmm_kernel[curr_grid](
-                    node_mars, 
-                    element_mars, 
-                    params, 
-                    nids, 
-                    cids_start,
-                    cids_increment, 
-                    pids_start,
-                    pids_increment,
-                    local_ids,
-                    batch_size,
-                    partial_eval = partial_eval,
-                    BLOCK_B = BLOCK_B,
-                    TILE_SIZE_K = TILE_SIZE_K,
-                    K_NUM_TILES = K_NUM_TILES,
-                    TILE_SIZE_M = TILE_SIZE_M,
-                    BLOCK_SIZE_M = BLOCK_SIZE_M,
-                    use_bf16 = use_bf16,
-                    propagation_alg_id = propagation_alg_id,
-                    pflow_tempered_enabled = pflow_tempered_enabled,
-                    pid_m_offset = pid_m_start,
-                    **propagation_alg_kwargs,
-                    **pflow_tempered_kwargs,
-                    num_stages = 1
-                )
+        # OOM-safe tuned launch: if the larger tuned tiles exceed this GPU's shared-memory/
+        # register budget, fall back to the default configuration (recompiled untuned).
+        try:
+            for pid_m_start in range(0, grid[1], 32768):
+                pid_m_end = min(pid_m_start + 32768, grid[1])
+                block_m_size = pid_m_end - pid_m_start
+
+                curr_grid = (grid[0], block_m_size)
+        
+                if TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and BLOCK_B >= 16:
+                    fw_bsparse._fw_triton_block_sparse_tlmm_kernel[curr_grid](
+                        node_mars, 
+                        element_mars, 
+                        params, 
+                        nids, 
+                        cids_start,
+                        cids_increment, 
+                        pids_start,
+                        pids_increment,
+                        local_ids,
+                        batch_size,
+                        partial_eval = partial_eval,
+                        BLOCK_B = BLOCK_B,
+                        TILE_SIZE_K = TILE_SIZE_K,
+                        K_NUM_TILES = K_NUM_TILES,
+                        TILE_SIZE_M = TILE_SIZE_M,
+                        BLOCK_SIZE_M = BLOCK_SIZE_M,
+                        use_bf16 = use_bf16,
+                        propagation_alg_id = propagation_alg_id,
+                        pflow_tempered_enabled = pflow_tempered_enabled,
+                        pid_m_offset = pid_m_start,
+                        **propagation_alg_kwargs,
+                        **pflow_tempered_kwargs,
+                        num_stages = 1
+                    )
                 
-            elif TILE_SIZE_M >= 8 and TILE_SIZE_K >= 8 and BLOCK_B >= 8:
-                fw_bsparse._fw_triton_block_sparse_csmm1_kernel[curr_grid](
-                    node_mars, 
-                    element_mars, 
-                    params, 
-                    nids, 
-                    cids_start,
-                    cids_increment, 
-                    pids_start,
-                    pids_increment,
-                    local_ids,
-                    batch_size,
-                    partial_eval = partial_eval,
-                    BLOCK_B = BLOCK_B,
-                    TILE_SIZE_K = TILE_SIZE_K,
-                    K_NUM_TILES = K_NUM_TILES,
-                    TILE_SIZE_M = TILE_SIZE_M,
-                    BLOCK_SIZE_M = BLOCK_SIZE_M,
-                    use_bf16 = use_bf16,
-                    propagation_alg_id = propagation_alg_id,
-                    pflow_tempered_enabled = pflow_tempered_enabled,
-                    pid_m_offset = pid_m_start,
-                    **propagation_alg_kwargs,
-                    **pflow_tempered_kwargs,
-                    num_stages = 1
-                )
+                elif TILE_SIZE_M >= 8 and TILE_SIZE_K >= 8 and BLOCK_B >= 8:
+                    fw_bsparse._fw_triton_block_sparse_csmm1_kernel[curr_grid](
+                        node_mars, 
+                        element_mars, 
+                        params, 
+                        nids, 
+                        cids_start,
+                        cids_increment, 
+                        pids_start,
+                        pids_increment,
+                        local_ids,
+                        batch_size,
+                        partial_eval = partial_eval,
+                        BLOCK_B = BLOCK_B,
+                        TILE_SIZE_K = TILE_SIZE_K,
+                        K_NUM_TILES = K_NUM_TILES,
+                        TILE_SIZE_M = TILE_SIZE_M,
+                        BLOCK_SIZE_M = BLOCK_SIZE_M,
+                        use_bf16 = use_bf16,
+                        propagation_alg_id = propagation_alg_id,
+                        pflow_tempered_enabled = pflow_tempered_enabled,
+                        pid_m_offset = pid_m_start,
+                        **propagation_alg_kwargs,
+                        **pflow_tempered_kwargs,
+                        num_stages = 1
+                    )
 
-            else:
-                fw_bsparse._fw_triton_block_sparse_csmm2_kernel[curr_grid](
-                    node_mars, 
-                    element_mars, 
-                    params, 
-                    nids, 
-                    cids_start,
-                    cids_increment, 
-                    pids_start,
-                    pids_increment,
-                    local_ids,
-                    batch_size,
-                    partial_eval = partial_eval,
-                    BLOCK_B = BLOCK_B,
-                    TILE_SIZE_K = TILE_SIZE_K,
-                    K_NUM_TILES = K_NUM_TILES,
-                    TILE_SIZE_M = TILE_SIZE_M,
-                    BLOCK_SIZE_M = BLOCK_SIZE_M,
-                    use_bf16 = use_bf16,
-                    propagation_alg_id = propagation_alg_id,
-                    pflow_tempered_enabled = pflow_tempered_enabled,
-                    pid_m_offset = pid_m_start,
-                    **propagation_alg_kwargs,
-                    **pflow_tempered_kwargs,
-                    num_stages = 1
-                )
-        
+                else:
+                    fw_bsparse._fw_triton_block_sparse_csmm2_kernel[curr_grid](
+                        node_mars, 
+                        element_mars, 
+                        params, 
+                        nids, 
+                        cids_start,
+                        cids_increment, 
+                        pids_start,
+                        pids_increment,
+                        local_ids,
+                        batch_size,
+                        partial_eval = partial_eval,
+                        BLOCK_B = BLOCK_B,
+                        TILE_SIZE_K = TILE_SIZE_K,
+                        K_NUM_TILES = K_NUM_TILES,
+                        TILE_SIZE_M = TILE_SIZE_M,
+                        BLOCK_SIZE_M = BLOCK_SIZE_M,
+                        use_bf16 = use_bf16,
+                        propagation_alg_id = propagation_alg_id,
+                        pflow_tempered_enabled = pflow_tempered_enabled,
+                        pid_m_offset = pid_m_start,
+                        **propagation_alg_kwargs,
+                        **pflow_tempered_kwargs,
+                        num_stages = 1
+                    )
+        except _TritonOutOfResources:
+            # `OutOfResources` is raised at compile time before any write, so retry is safe.
+            if not (FORWARD_SUM_TUNED and not getattr(self, "_fw_tuning_oom", False)
+                    and propagation_alg_id == 0 and not pflow_tempered_enabled):
+                raise
+            self._fw_tuning_oom = True
+            warnings.warn("Forward sum-layer tile tuning (FORWARD_SUM_TUNED) exceeded shared "
+                          "memory on this GPU; falling back to the default launch config.", RuntimeWarning)
+            return self._forward_block_sparse(
+                node_mars, element_mars, params, nids, cids, pids, local_ids=local_ids,
+                partition_id=partition_id, force_use_bf16=force_use_bf16,
+                force_use_fp32=force_use_fp32, propagation_alg=propagation_alg,
+                pflow_temperature=pflow_temperature, **kwargs)
         return None
 
     def _forward_sparse(self, node_mars: torch.Tensor, element_mars: torch.Tensor,
@@ -1141,6 +1292,20 @@ class SumLayer(Layer, nn.Module):
             ).contiguous()
 
             self._cached_bk_parids[signature] = [parids_start, parids_increment, parpids_start, parpids_increment, ptr_inc_step]
+
+            # Pre-compute the CUDA fast-path operands: per-tile first parent-node index (`ebase`) and
+            # first param offset (`pbase`) = cumsum-reconstruction of the parids / parpids starts +
+            # increments. The kernel reads node_*[ebase + e] and mp[pbase + m*BLOCK_SIZE_K + e] over
+            # the tile's BK contiguous edges; that contiguity is structural when ptr_inc_step == 1
+            # (single param-block group per tile), which is the only layout the CUDA kernel supports.
+            def _cumbase(start, incr):
+                c = torch.cumsum(incr.to(torch.int64), 1)
+                sh = torch.zeros_like(c); sh[:, 1:] = c[:, :-1]
+                return (start[:, None, :].to(torch.int64) + sh)[:, :, 0].contiguous()
+            ele_ebase = _cumbase(parids_start, parids_increment)    # [n_eleblocks, K_NUM_TILES]
+            ele_pbase = _cumbase(parpids_start, parpids_increment)
+            ele_cuda_ok = (ptr_inc_step == 1)
+            self._cached_bk_ele_cuda[signature] = [ele_ebase, ele_pbase, ele_cuda_ok]
         else:
             parids_start, parids_increment, parpids_start, parpids_increment, ptr_inc_step = self._cached_bk_parids[signature]
 
@@ -1162,6 +1327,63 @@ class SumLayer(Layer, nn.Module):
             TL_DOT = 0
 
         grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
+
+        # Optional CUDA (CuTe/fp16/TMA) fast path for the element-flow backward `tlmm` regime. It is
+        # numerically equivalent to the Triton ele kernel (fp16 dot + fp32 accumulate; ~1.07e-3
+        # log-space) and only valid here: LL, logspace flows, allow_modify_flows / allow_neg_flows /
+        # accumulate_ch_flows all off, no tempering / partial eval, the bf16/fp16 dot regime
+        # (TL_DOT, not force_use_fp32), TILE_SIZE_K == 64, ptr_inc_step == 1 (contiguous layout),
+        # block_size % 128 == 0, batch % 64 == 0, and a TMA-capable GPU with CUTLASS. The best of
+        # {CUDA, Triton} is autotuned once per (signature, batch) -- INTO A SCRATCH buffer, never the
+        # live element_flows (which is read-accumulate-write when accumulate_ch_flows is on) -- and
+        # cached. Otherwise it falls through to the Triton launch below.
+        if (BACKWARD_ELE_FLOW_CUDA and propagation_alg_id == 0 and abs(eflow_temperature - 1.0) < 1e-6
+                and allow_modify_flows == 0 and logspace_flows and not allow_neg_flows
+                and not accumulate_ch_flows and local_ids is None and not force_use_fp32
+                and TILE_SIZE_K == 64 and num_edges % TILE_SIZE_K == 0
+                and cs_block_size % 128 == 0 and batch_size % 64 == 0
+                and node_flows.is_cuda and cuda_kernels.ele_is_available()):
+            ele_ebase, ele_pbase, ele_cuda_ok = self._cached_bk_ele_cuda[signature]
+            if ele_cuda_ok:
+                def _cuda_ele(tgt):
+                    cuda_kernels.ele_backward_sum(
+                        tgt, element_mars, node_flows, node_mars, params, chids, ele_ebase, ele_pbase,
+                        batch_size, self.block_size, cs_block_size, K_NUM_TILES)
+
+                def _triton_ele(tgt):
+                    for s in range(0, grid[1], 32768):
+                        cg = (grid[0], min(s + 32768, grid[1]) - s)
+                        bk_ele_bsparse._bk_triton_block_sparse_ele_kernel[cg](
+                            node_flows = node_flows, element_flows = tgt, node_mars = node_mars,
+                            element_mars = element_mars, mparams = params, chids = chids,
+                            parids_start = parids_start, parids_increment = parids_increment,
+                            parpids_start = parpids_start, parpids_increment = parpids_increment,
+                            local_ids = local_ids, batch_size = batch_size, partial_eval = partial_eval,
+                            ptr_inc_step = ptr_inc_step, allow_modify_flows = allow_modify_flows,
+                            logspace_flows = logspace_flows, BLOCK_B = BLOCK_B, TILE_SIZE_K = TILE_SIZE_K,
+                            K_NUM_TILES = K_NUM_TILES, TILE_SIZE_M = TILE_SIZE_M,
+                            BLOCK_SIZE_M = BLOCK_SIZE_M, BLOCK_SIZE_K = BLOCK_SIZE_K, TL_DOT = TL_DOT,
+                            num_stages = 1, propagation_alg_id = propagation_alg_id,
+                            accumulate_ch_flows = accumulate_ch_flows, allow_neg_flows = allow_neg_flows,
+                            pid_m_offset = s, **propagation_alg_kwargs)
+
+                choice_key = (signature, batch_size)
+                choice = self._cached_bk_ele_choice.get(choice_key)
+                if choice is None:
+                    # autotune into a SCRATCH clone (corruption-safe); the live element_flows is
+                    # touched only by the single real run below.
+                    if (self._bk_ele_scratch is None or self._bk_ele_scratch.shape != element_flows.shape
+                            or self._bk_ele_scratch.dtype != element_flows.dtype):
+                        self._bk_ele_scratch = torch.empty_like(element_flows)
+                    scr = self._bk_ele_scratch
+                    choice = cuda_kernels.autotune(
+                        [(("cuda", 0), (lambda: _cuda_ele(scr))),
+                         (("triton", -1), (lambda: _triton_ele(scr)))]) or ("triton", -1)
+                    self._cached_bk_ele_choice[choice_key] = choice
+                if choice[0] == "cuda":
+                    _cuda_ele(element_flows)
+                    return None
+                # choice == ("triton", -1): fall through to the Triton launch below
 
         for pid_m_start in range(0, grid[1], 32768):
             pid_m_end = min(pid_m_start + 32768, grid[1])
@@ -1400,6 +1622,72 @@ class SumLayer(Layer, nn.Module):
             par_kernel_extra["num_warps"] = 8
 
         grid = (triton.cdiv(num_edges, TILE_SIZE_K), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
+
+        # Optional CUDA fast path (CuTe/fp16/TMA), autotuned vs Triton INTO A SCRATCH buffer so the
+        # autotune timing runs never corrupt the live param_flows (the kernel is read-accumulate-write).
+        # Only intercepts when CUDA wins; Triton / unsupported shapes fall through to the dispatch below
+        # (which keeps the OOM-retry path). See BACKWARD_PAR_FLOW_CUDA.
+        if (BACKWARD_PAR_FLOW_CUDA and propagation_alg_id == 0 and abs(pflow_temperature - 1.0) < 1e-6
+                and allow_modify_flows == 0 and logspace_flows and not allow_neg_flows and not negate_pflows
+                and self.block_size % 64 == 0 and num_edges % 128 == 0 and batch_size % 32 == 0
+                and node_flows.is_cuda and cuda_kernels.par_is_available()):
+            par_sig = id(pfids)
+            cache = self._cached_bk_par_cuda.get(par_sig)
+            if cache is None:
+                # collision-free (untied) + contiguous cids / block_size-strided pids&pfids -> the CUDA
+                # kernel's index assumptions hold. Computed once per partition and cached.
+                contig = bool((cids[:, 1:] - cids[:, :-1] == 1).all()
+                              and (pids[:, 1:] - pids[:, :-1] == self.block_size).all()
+                              and (pfids[:, 1:] - pfids[:, :-1] == self.block_size).all())
+                if contig and self._par_flow_collision_free(pfids):
+                    cache = (nids.contiguous(), cids[:, 0].contiguous(), pids[:, 0].contiguous(),
+                             pfids[:, 0].contiguous(), True)
+                else:
+                    cache = (None, None, None, None, False)
+                self._cached_bk_par_cuda[par_sig] = cache
+            nbase, cbase, pbase, fbase, par_ok = cache
+            if par_ok:
+                def _cuda_par(tgt):
+                    # mode 0 = read-accumulate-write (RMW): always correct (accumulates onto prior
+                    # param_flows, e.g. multi-batch). The kernel also has a store-only mode that skips
+                    # the RMW read, but that is only valid when param_flows is freshly zeroed; not used
+                    # here to keep the path unconditionally correct.
+                    cuda_kernels.par_backward_sum(tgt, node_flows, node_mars, element_mars, params,
+                        nbase, cbase, pbase, fbase, batch_size, self.block_size, num_edges, 0)
+
+                def _triton_par(tgt):
+                    for s in range(0, grid[1], 32768):
+                        cg = (grid[0], min(s + 32768, grid[1]) - s)
+                        bk_par_bsparse._bk_triton_block_sparse_par_kernel_rmw[cg](
+                            node_flows = node_flows, node_mars = node_mars, element_mars = element_mars,
+                            mparams = params, param_flows = tgt, nids = nids, cids = cids, pids = pids,
+                            pfids = pfids, batch_size = batch_size, num_edges = num_edges,
+                            allow_modify_flows = allow_modify_flows, logspace_flows = logspace_flows,
+                            TILE_SIZE_B = TILE_SIZE_B, B_NUM_TILES = B_NUM_TILES, TILE_SIZE_K = TILE_SIZE_K,
+                            TILE_SIZE_M = TILE_SIZE_M, BLOCK_SIZE_M = self.block_size, TL_DOT = TL_DOT,
+                            propagation_alg_id = propagation_alg_id, negate_pflows = negate_pflows,
+                            allow_neg_flows = allow_neg_flows, pid_m_offset = s,
+                            **propagation_alg_kwargs, **par_kernel_extra, num_stages = 1)
+
+                choice_key = (par_sig, batch_size)
+                choice = self._cached_bk_par_choice.get(choice_key)
+                if choice is None:
+                    # autotune into a scratch clone (corruption-safe; the kernel is read-accumulate-write).
+                    # `param_flows` is the full param array (can be GBs), so the scratch is LOCAL and freed
+                    # right after the autotune (run once per signature; the choice is then cached). If the
+                    # scratch can't be allocated (memory-constrained GPU), fall back to Triton.
+                    try:
+                        scr = torch.empty_like(param_flows)
+                        choice = cuda_kernels.autotune(
+                            [("cuda", (lambda: _cuda_par(scr))), ("triton", (lambda: _triton_par(scr)))]) or "triton"
+                        del scr
+                    except torch.cuda.OutOfMemoryError:
+                        choice = "triton"
+                    self._cached_bk_par_choice[choice_key] = choice
+                if choice == "cuda":
+                    _cuda_par(param_flows)
+                    return None
+                # choice == "triton": fall through to the Triton dispatch below
 
         for pid_m_start in range(0, grid[1], 32768):
             pid_m_end = min(pid_m_start + 32768, grid[1])

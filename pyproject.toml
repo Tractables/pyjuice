@@ -23,6 +23,12 @@ authors = [
 ]
 
 [project.optional-dependencies]
+# Optional CuTe/CUTLASS + TMA sum-layer fast-path kernels (sm_90+; falls back to Triton otherwise).
+# `pip install pyjuice[cuda]` ships the header-only CUTLASS so the fast path can JIT-compile; a plain
+# install stays Triton-only and needs no CUDA toolchain. See pyjuice/layer/kernels/c/__init__.py.
+cuda = [
+    "nvidia-cutlass>=3.5",
+]
 dev = [
     "pytest",
     "pytest-xdist",
@@ -37,6 +43,11 @@ where = "src"
 
 [tool.setuptools.dynamic]
 readme = {file = "README.md"}
+
+# Ship the CUDA source for the optional JIT-compiled fast-path kernels with the package, so it is
+# present in installed trees / wheels (it is compiled at runtime via torch.utils.cpp_extension).
+[tool.setuptools.package-data]
+"pyjuice.layer.kernels.c" = ["*.cu", "*.cuh", "*.h"]
 
 [tool.pytest.ini_options]
 addopts = [
