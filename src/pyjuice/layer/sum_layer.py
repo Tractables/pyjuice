@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 
+import os
 import torch
 import torch.nn as nn
 import triton
@@ -90,6 +91,17 @@ FORWARD_SUM_TUNED = True
 # unsupported layer shape, it transparently falls back to the Triton kernel. Set False to disable.
 FORWARD_SUM_CUDA = True
 from .kernels import c as cuda_kernels
+
+# Node-tile sizes for the small-batch (batch < 16) block-sparse path. At tiny batch the GPU is
+# filled by splitting the *node* dimension into many tiles (the batch dimension is too short to
+# provide parallelism), so these are deliberately small. Tuned on an RTX PRO 6000; overridable via
+# env for experimentation.
+_SMALL_BATCH_FW_TILE_M = int(os.environ.get("PYJUICE_SB_FW_TM", 8))
+_SMALL_BATCH_ELE_TILE_M = int(os.environ.get("PYJUICE_SB_ELE_TM", 8))
+# Minimum block size for the small-batch (batch < 16) block-sparse path. Below this the sparse
+# kernel is actually faster (its lower launch/tiling overhead beats the node-tiling parallelism when
+# the node dimension is small) -- measured crossover is ~128 on an RTX PRO 6000. Tunable via env.
+_SMALL_BATCH_MIN_BLOCK_SIZE = int(os.environ.get("PYJUICE_SB_MIN_BS", 128))
 
 
 class SumLayer(Layer, nn.Module):
@@ -514,6 +526,12 @@ class SumLayer(Layer, nn.Module):
         elif params.dim() == 1 and self.block_size >= 16 and num_edges >= 16 and batch_size >= 16:
             # In this case, we should definitely use the block-sparse implementation
             mode = self.BLOCK_SPARSE
+        elif params.dim() == 1 and self.block_size >= _SMALL_BATCH_MIN_BLOCK_SIZE and num_edges >= 16:
+            # Small batch (< 16): the sparse kernel leaves the large node dimension un-tiled (one
+            # program per node block -> ~1 SM busy, >10x slowdown). For a large enough block size the
+            # block-sparse small-batch tiling is far faster; smaller blocks fall through to the sparse
+            # kernel below (its lower launch/tiling overhead wins there -- measured crossover ~128).
+            mode = self.BLOCK_SPARSE
         elif self.block_size == 1 or num_edges < 4:
             # In this case, we should definitely use the sparse implementation
             mode = self.SPARSE
@@ -592,20 +610,33 @@ class SumLayer(Layer, nn.Module):
             }
 
         # Heuristic to set `TILE_SIZE_M`, `TILE_SIZE_K`, and `BLOCK_B`
-        base_size = min(self.block_size, num_edges, BATCH_SIZE_NP2, 128)
-        if base_size >= 64:
-            TILE_SIZE_K = min(2048 // 32, num_edges)
+        if batch_size < 16 and self.block_size >= _SMALL_BATCH_MIN_BLOCK_SIZE:
+            # Small-batch path (the `else` below is the unchanged >=16 heuristic). That heuristic
+            # ties TILE_SIZE_K to BATCH_SIZE_NP2, which collapses to 1-2 huge node-tiles at tiny
+            # batch -> ~1 SM busy and a >10x slowdown. Instead keep a normal edge tile and split the
+            # node dimension into many small tiles (high SM occupancy); the batch is a short, masked
+            # inner dim (BLOCK_B = BATCH_SIZE_NP2 < 16 -> no tensor-core dot, full fp32).
+            TILE_SIZE_K = min(64, num_edges)
+            while num_edges % TILE_SIZE_K != 0:
+                TILE_SIZE_K //= 2
+            TILE_SIZE_M = min(_SMALL_BATCH_FW_TILE_M, self.block_size)
+            BLOCK_B = BATCH_SIZE_NP2
+            K_NUM_TILES = num_edges // TILE_SIZE_K
         else:
-            remainder = 2048 // (base_size ** 2)
-            TILE_SIZE_K = min(2048 // remainder, base_size * remainder, num_edges)
-        # Larger TILE_SIZE_M / BLOCK_B (bit-exact) amortize the per-m-tile recomputation of
-        # `emars_max` / `exp` / the `emars` load and the per-batch-tile `epars` load. Gated to the
-        # LL (non-tempered) regime that was validated bit-exact; auto-disabled on a prior OOM.
-        _fw_tile_cap = 4096 if (FORWARD_SUM_TUNED and not getattr(self, "_fw_tuning_oom", False)
-                                and propagation_alg_id == 0 and not pflow_tempered_enabled) else 2048
-        TILE_SIZE_M = min(_fw_tile_cap // TILE_SIZE_K, self.block_size)
-        BLOCK_B = min(_fw_tile_cap // TILE_SIZE_K, BATCH_SIZE_NP2)
-        K_NUM_TILES = num_edges // TILE_SIZE_K
+            base_size = min(self.block_size, num_edges, BATCH_SIZE_NP2, 128)
+            if base_size >= 64:
+                TILE_SIZE_K = min(2048 // 32, num_edges)
+            else:
+                remainder = 2048 // (base_size ** 2)
+                TILE_SIZE_K = min(2048 // remainder, base_size * remainder, num_edges)
+            # Larger TILE_SIZE_M / BLOCK_B (bit-exact) amortize the per-m-tile recomputation of
+            # `emars_max` / `exp` / the `emars` load and the per-batch-tile `epars` load. Gated to the
+            # LL (non-tempered) regime that was validated bit-exact; auto-disabled on a prior OOM.
+            _fw_tile_cap = 4096 if (FORWARD_SUM_TUNED and not getattr(self, "_fw_tuning_oom", False)
+                                    and propagation_alg_id == 0 and not pflow_tempered_enabled) else 2048
+            TILE_SIZE_M = min(_fw_tile_cap // TILE_SIZE_K, self.block_size)
+            BLOCK_B = min(_fw_tile_cap // TILE_SIZE_K, BATCH_SIZE_NP2)
+            K_NUM_TILES = num_edges // TILE_SIZE_K
 
         assert TILE_SIZE_K >= 4, f"`TILE_SIZE_K` should be greater than 4 (but got {TILE_SIZE_K}) in order to use the block-sparse kernel. " \
                                   "This is an internal error of PyJuice. Please consider checking the kernel dispatching criterions and use the " \
@@ -1039,6 +1070,11 @@ class SumLayer(Layer, nn.Module):
         elif params.dim() == 1 and self.block_size >= 16 and num_edges >= 16 and batch_size >= 16:
             # In this case, we should definitely use the block-sparse implementation
             mode = self.BLOCK_SPARSE
+        elif params.dim() == 1 and self.block_size >= _SMALL_BATCH_MIN_BLOCK_SIZE and num_edges >= 16:
+            # Small batch (< 16) with a large block size: the sparse element-flow kernel leaves the
+            # large node dimension un-tiled (~1 SM busy, >10x slowdown). The block-sparse small-batch
+            # tiling is far faster here; smaller blocks fall through to the sparse kernel below.
+            mode = self.BLOCK_SPARSE
         elif cs_block_size == 1 or self.block_size == 1:
             # In this case, we should definitely use the sparse implementation
             mode = self.SPARSE
@@ -1209,17 +1245,33 @@ class SumLayer(Layer, nn.Module):
 
         # Flows w.r.t. parameters
         if param_flows is not None and nids is not None:
-            self._backward_block_sparse_par_flows(
-                node_flows, params, node_mars, element_mars, param_flows,
-                nids = nids, cids = cids, pids = pids, pfids = pfids,
-                allow_modify_flows = allow_modify_flows,
-                propagation_alg = propagation_alg, 
-                logspace_flows = logspace_flows,
-                negate_pflows = negate_pflows,
-                allow_neg_flows = allow_neg_flows,
-                force_use_fp32 = force_use_fp32,
-                pflow_temperature = pflow_temperature, **kwargs
-            )
+            if node_flows.size(1) < 16:
+                # The block-sparse parameter-flow kernel contracts the batch dimension into
+                # `B_NUM_TILES = batch_size // TILE_SIZE_B` tiles; for batch < 16 that is 0 whenever
+                # batch < TILE_SIZE_B (incl. all batch < 4, which also fail its TILE_SIZE_B >= 4
+                # assert), silently dropping the param flows. The sparse parameter-flow kernel handles
+                # any batch correctly and is already a tiny fraction of the backward, so use it here.
+                self._backward_sparse_par_flows(
+                    node_flows, params, node_mars, element_mars, param_flows,
+                    nids = nids, cids = cids, pids = pids, pfids = pfids,
+                    allow_modify_flows = allow_modify_flows,
+                    propagation_alg = propagation_alg,
+                    logspace_flows = logspace_flows,
+                    negate_pflows = negate_pflows,
+                    pflow_temperature = pflow_temperature, **kwargs
+                )
+            else:
+                self._backward_block_sparse_par_flows(
+                    node_flows, params, node_mars, element_mars, param_flows,
+                    nids = nids, cids = cids, pids = pids, pfids = pfids,
+                    allow_modify_flows = allow_modify_flows,
+                    propagation_alg = propagation_alg,
+                    logspace_flows = logspace_flows,
+                    negate_pflows = negate_pflows,
+                    allow_neg_flows = allow_neg_flows,
+                    force_use_fp32 = force_use_fp32,
+                    pflow_temperature = pflow_temperature, **kwargs
+                )
 
         return None
 
@@ -1245,15 +1297,26 @@ class SumLayer(Layer, nn.Module):
         propagation_alg_kwargs = self._get_propagation_alg_kwargs(propagation_alg, **kwargs)
 
         # Heuristic to set `TILE_SIZE_M`, `TILE_SIZE_K`, and `BLOCK_B`
-        base_size = min(self.block_size, num_edges, BATCH_SIZE_NP2, 64)
-        if base_size >= 64:
-            TILE_SIZE_K = min(2048 // 32, num_edges)
+        if batch_size < 16 and self.block_size >= _SMALL_BATCH_MIN_BLOCK_SIZE:
+            # Small-batch path (mirrors the forward; the `else` is the unchanged >=16 heuristic). Keep
+            # a normal edge tile and split the child-node dimension into many small tiles for high SM
+            # occupancy; the batch is a short masked inner dim (no tensor-core dot).
+            TILE_SIZE_K = min(64, num_edges)
+            while num_edges % TILE_SIZE_K != 0:
+                TILE_SIZE_K //= 2
+            TILE_SIZE_M = min(_SMALL_BATCH_ELE_TILE_M, cs_block_size)
+            BLOCK_B = BATCH_SIZE_NP2
+            K_NUM_TILES = num_edges // TILE_SIZE_K
         else:
-            remainder = 2048 // (base_size ** 2)
-            TILE_SIZE_K = min(512, base_size * remainder, num_edges)
-        TILE_SIZE_M = min(2048 // TILE_SIZE_K, cs_block_size)
-        BLOCK_B = min(2048 // TILE_SIZE_K, BATCH_SIZE_NP2)
-        K_NUM_TILES = num_edges // TILE_SIZE_K
+            base_size = min(self.block_size, num_edges, BATCH_SIZE_NP2, 64)
+            if base_size >= 64:
+                TILE_SIZE_K = min(2048 // 32, num_edges)
+            else:
+                remainder = 2048 // (base_size ** 2)
+                TILE_SIZE_K = min(512, base_size * remainder, num_edges)
+            TILE_SIZE_M = min(2048 // TILE_SIZE_K, cs_block_size)
+            BLOCK_B = min(2048 // TILE_SIZE_K, BATCH_SIZE_NP2)
+            K_NUM_TILES = num_edges // TILE_SIZE_K
 
         assert TILE_SIZE_K >= 4, f"`TILE_SIZE_K` should be greater than 4 (but got {TILE_SIZE_K}) in order to use the block-sparse kernel. " \
                                   "This is an internal error of PyJuice. Please consider checking the kernel dispatching criterions and use the " \

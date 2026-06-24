@@ -219,7 +219,53 @@ def test_sum_layer_backward_mode_and_fp32():
     assert (got - ref).abs().max() / (ref.abs().max() + 1e-12) < 2e-2
 
 
+def test_small_batch_block_sparse_fast_path():
+    """
+    Regression for the small-batch (batch < 16) block-sparse fast path.
+
+    For a large block size the sparse sum kernels leave the big node/edge dimensions un-tiled (one
+    program per node block -> ~1 SM busy, >10x slower than the block-sparse kernels). Layers with
+    `block_size >= 128` are therefore routed to the block-sparse forward / element-flow backward at
+    small batch too (with a small-batch tiling heuristic that splits the node dimension for SM
+    occupancy); the parameter-flow backward falls back to the sparse kernel (correct for any batch).
+    The results must match the sparse path (forced here as the reference), for both the forward LL
+    and the accumulated parameter flows.
+    """
+
+    device = torch.device("cuda:0")
+
+    for num_latents in [128, 512]:   # block_size = num_latents >= 128 -> small-batch block-sparse path
+        torch.manual_seed(num_latents)
+        ns = juice.structures.GeneralizedHMM(
+            seq_length = 4, num_latents = num_latents, homogeneous = True,
+            input_dist = juice.distributions.Categorical(num_cats = 6)
+        )
+        ns.init_parameters(perturbation = 2.0)
+        pc = juice.compile(ns)
+        pc.to(device)
+
+        for batch_size in [1, 2, 3, 8]:
+            data = torch.randint(0, 6, [batch_size, 4], device = device)
+
+            # Default routing -> small-batch block-sparse fast path.
+            ll = pc(data).clone()
+            pc.backward(data, flows_memory = 0.0, allow_modify_flows = False)
+            pf = pc.param_flows.clone()
+
+            # Reference: force the sparse kernels.
+            ll_s = pc(data, mode = "sparse").clone()
+            pc.backward(data, mode = "sparse", flows_memory = 0.0, allow_modify_flows = False)
+            pf_s = pc.param_flows.clone()
+
+            assert torch.isfinite(ll).all() and torch.isfinite(pf).all()
+            assert (ll - ll_s).abs().max() < 1e-3, \
+                f"forward LL mismatch (Nlat={num_latents}, batch={batch_size})"
+            assert (pf - pf_s).abs().max() / (pf_s.abs().max() + 1e-12) < 1e-3, \
+                f"parameter-flow mismatch (Nlat={num_latents}, batch={batch_size})"
+
+
 if __name__ == "__main__":
     test_hmm_batch_size_consistency()
     test_hmm_backward_small_batch()
     test_sum_layer_backward_mode_and_fp32()
+    test_small_batch_block_sparse_fast_path()
