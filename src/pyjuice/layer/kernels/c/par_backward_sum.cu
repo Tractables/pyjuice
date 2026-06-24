@@ -30,6 +30,7 @@
 #include <torch/extension.h>
 #include <cuda_fp16.h>
 #include <cuda.h>
+#include <c10/cuda/CUDAStream.h>
 #include <cute/tensor.hpp>
 #include <cute/atom/mma_atom.hpp>
 #include <cute/atom/copy_atom.hpp>
@@ -239,7 +240,7 @@ void par_backward_sum(torch::Tensor param_flows, torch::Tensor node_flows, torch
     for (int off = 0; off < total_y; off += MAX_Y) {
         int chunk = (total_y - off < MAX_Y) ? (total_y - off) : MAX_Y;
         dim3 grid(gx, chunk);
-        par_kernel<<<grid, NTH, smem>>>(param_flows.data_ptr<float>(), params.data_ptr<float>(),
+        par_kernel<<<grid, NTH, smem, c10::cuda::getCurrentCUDAStream()>>>(param_flows.data_ptr<float>(), params.data_ptr<float>(),
             nbase.data_ptr<long>(), cbase.data_ptr<long>(), pbase.data_ptr<long>(), fbase.data_ptr<long>(),
             (int)batch, (int)block_size, (int)num_edges, bnt, (int)use_atomic, off, g_dNf, g_dNm, g_dEm); }
 }

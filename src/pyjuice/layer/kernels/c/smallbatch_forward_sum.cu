@@ -22,6 +22,7 @@
 
 #include <torch/extension.h>
 #include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
 #include <vector>
 
 template <int SPLIT>
@@ -74,7 +75,9 @@ static void launch_sb(torch::Tensor node_mars, torch::Tensor element_mars, torch
     const long groups = block_size / 32;
     dim3 grid((unsigned int)(ng * groups), (unsigned int)batch);   // ng*groups << 2^31 in practice
     dim3 blk(32, SPLIT);
-    sb_fwd_kernel<SPLIT><<<grid, blk>>>(
+    // Launch on the current stream (not the default stream) so the kernel is captured correctly when
+    // pyjuice records a CUDA graph of the forward pass (see cat_backward.cu).
+    sb_fwd_kernel<SPLIT><<<grid, blk, 0, c10::cuda::getCurrentCUDAStream()>>>(
         node_mars.data_ptr<float>(), element_mars.data_ptr<float>(), params.data_ptr<float>(),
         nids.data_ptr<long>(), ebase.data_ptr<long>(), pbase.data_ptr<long>(),
         batch, block_size, num_edges);
