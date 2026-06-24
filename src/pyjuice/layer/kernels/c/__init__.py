@@ -215,9 +215,14 @@ def smallbatch_forward_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, 
                                         int(batch_size), int(block_size), int(num_edges), int(cfg))
 
 
+_sbfw_cfg_cache = None
 def smallbatch_fw_configs():
-    """List of SPLIT values per config id (index = the ``cfg`` arg)."""
-    return [int(c) for c in _sbfw_module.smallbatch_fw_configs()] if smallbatch_fw_is_available() else []
+    """List of SPLIT values per config id (index = the ``cfg`` arg). Memoized (constant) -- the value
+    is queried per layer per step in the dispatch, so it must not re-enter the pybind module."""
+    global _sbfw_cfg_cache
+    if _sbfw_cfg_cache is None:
+        _sbfw_cfg_cache = [int(c) for c in _sbfw_module.smallbatch_fw_configs()] if smallbatch_fw_is_available() else []
+    return _sbfw_cfg_cache
 
 
 def smallbatch_ele_is_available() -> bool:
@@ -245,9 +250,13 @@ def smallbatch_ele_backward_sum(element_flows: torch.Tensor, element_mars: torch
                                               int(cs_block_size), int(num_edges), int(cfg))
 
 
+_sbele_cfg_cache = None
 def smallbatch_ele_configs():
-    """List of WARPS values per config id (index = the ``cfg`` arg)."""
-    return [int(c) for c in _sbele_module.smallbatch_ele_configs()] if smallbatch_ele_is_available() else []
+    """List of WARPS values per config id (index = the ``cfg`` arg). Memoized (queried per layer/step)."""
+    global _sbele_cfg_cache
+    if _sbele_cfg_cache is None:
+        _sbele_cfg_cache = [int(c) for c in _sbele_module.smallbatch_ele_configs()] if smallbatch_ele_is_available() else []
+    return _sbele_cfg_cache
 
 
 def smallbatch_par_is_available() -> bool:
@@ -274,9 +283,13 @@ def smallbatch_par_backward_sum(param_flows: torch.Tensor, node_flows: torch.Ten
                                               int(num_edges), int(cfg))
 
 
+_sbpar_cfg_cache = None
 def smallbatch_par_configs():
-    """List of EY values per config id (index = the ``cfg`` arg)."""
-    return [int(c) for c in _sbpar_module.smallbatch_par_configs()] if smallbatch_par_is_available() else []
+    """List of EY values per config id (index = the ``cfg`` arg). Memoized (queried per layer/step)."""
+    global _sbpar_cfg_cache
+    if _sbpar_cfg_cache is None:
+        _sbpar_cfg_cache = [int(c) for c in _sbpar_module.smallbatch_par_configs()] if smallbatch_par_is_available() else []
+    return _sbpar_cfg_cache
 
 
 def par_backward_sum(param_flows: torch.Tensor, node_flows: torch.Tensor, node_mars: torch.Tensor,
