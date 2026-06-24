@@ -103,6 +103,13 @@ _SMALL_BATCH_ELE_TILE_M = int(os.environ.get("PYJUICE_SB_ELE_TM", 8))
 # sets BLOCK_M = cs_block_size -> one serial program per node-block (~1 SM busy); capping it fans the
 # node dimension across many programs. Pure tiling -> bit-identical. Tunable via env.
 _SMALL_BATCH_SPARSE_TILE_M = int(os.environ.get("PYJUICE_SB_SPARSE_TM", 8))
+# Gap-batch (16 <= batch < `_GAP_BATCH_MAX`) handling. Below batch 16 the small-batch tiling fires;
+# the >=16 block-sparse / >=64-aligned CUDA paths only fully fill the SMs at larger batch. In the gap
+# the budget heuristics balloon the tile sizes -> too few programs (e.g. the par kernel gets ~8 blocks
+# at batch=16). For the parameter-flow kernel, shrinking the OUTPUT-COLUMN tile `TILE_SIZE_K` adds
+# programs WITHOUT changing the bitwise result (only `TILE_SIZE_M` sets the max-stabilization group).
+_GAP_BATCH_MAX = int(os.environ.get("PYJUICE_GAP_BATCH_MAX", 64))
+_SMALL_BATCH_PAR_TILE_K = int(os.environ.get("PYJUICE_SB_PAR_TK", 16))
 # Minimum block size for the small-batch (batch < 16) block-sparse path. Below this the sparse
 # kernel is actually faster (its lower launch/tiling overhead beats the node-tiling parallelism when
 # the node dimension is small) -- measured crossover is ~128 on an RTX PRO 6000. Tunable via env.
@@ -1826,12 +1833,23 @@ class SumLayer(Layer, nn.Module):
         par_kernel_extra = {}
         if BACKWARD_PAR_FLOW_TUNED and not getattr(self, "_par_tuning_oom", False) \
                 and TL_DOT == 1 and propagation_alg_id == 0 \
-                and abs(pflow_temperature - 1.0) < 1e-6 and num_edges >= 2 * TILE_SIZE_K:
+                and abs(pflow_temperature - 1.0) < 1e-6 and num_edges >= 2 * TILE_SIZE_K \
+                and batch_size >= _GAP_BATCH_MAX:
+            # Large-batch tuning: double TILE_SIZE_K (halves redundant node_mars/node_flows reads) and
+            # use a smaller batch tile + num_warps=8. Restricted to batch >= `_GAP_BATCH_MAX` because
+            # at gap batch it shrinks the grid (fewer edge tiles) and worsens the under-tiling.
             TILE_SIZE_K = 2 * TILE_SIZE_K
             if TILE_SIZE_B > 32 and batch_size % 32 == 0:
                 TILE_SIZE_B = 32
                 B_NUM_TILES = batch_size // TILE_SIZE_B
             par_kernel_extra["num_warps"] = 8
+        elif batch_size < _GAP_BATCH_MAX and TILE_SIZE_K > _SMALL_BATCH_PAR_TILE_K:
+            # Gap batch (e.g. batch=16, not 64-aligned so the CUDA par is unavailable): the budget
+            # heuristic balloons TILE_SIZE_K -> ~8 programs (~1 SM). Shrink the OUTPUT-COLUMN tile so
+            # the edge dimension fans across more programs. TILE_SIZE_K only tiles outputs and does NOT
+            # change the per-element result (TILE_SIZE_M -- the max-stabilization group -- is left
+            # untouched), so this is bit-identical.
+            TILE_SIZE_K = _SMALL_BATCH_PAR_TILE_K
 
         grid = (triton.cdiv(num_edges, TILE_SIZE_K), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
 
@@ -2140,7 +2158,7 @@ class SumLayer(Layer, nn.Module):
                 # (otherwise one serial program per node-block -> ~1 SM busy). Pure tiling ->
                 # bit-identical (the tempered branch below keeps BLOCK_M = cs_block_size).
                 ele_BLOCK_M = BLOCK_M
-                if batch_size < 16:
+                if batch_size < _GAP_BATCH_MAX:
                     ele_BLOCK_M = min(ele_BLOCK_M, _SMALL_BATCH_SPARSE_TILE_M)
                     while cs_block_size % ele_BLOCK_M != 0:
                         ele_BLOCK_M //= 2

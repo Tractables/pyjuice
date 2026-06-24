@@ -308,9 +308,11 @@ class ProdLayer(Layer, nn.Module):
             BLOCK_B = min(2048 // num_edges, triton.next_power_of_2(batch_size))
             BLOCK_M = min(max(2048 // (BLOCK_B * num_edges), 1), self.block_size)
 
-            # Small-batch: cap BLOCK_M so the node dimension fans out across many programs (one serial
-            # program per node-block otherwise leaves ~1 SM busy). Pure tiling -> bit-identical.
-            if batch_size < 16:
+            # Small/gap-batch: cap BLOCK_M so the node dimension fans out across many programs (one
+            # serial program per node-block otherwise leaves ~1 SM busy). The budget heuristic above
+            # under-tiles up to batch ~128, well past the small-batch (<16) regime, so the cap is
+            # applied through the gap (< 64). Pure tiling -> bit-identical (BLOCK_M only tiles nodes).
+            if batch_size < 64:
                 BLOCK_M = min(BLOCK_M, _SMALL_BATCH_PROD_TILE_M)
 
             grid = (triton.cdiv(n_nblocks * self.block_size, BLOCK_M), triton.cdiv(batch_size, BLOCK_B))

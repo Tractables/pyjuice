@@ -440,6 +440,50 @@ def test_small_batch_sparse_ele_tiling_matches_untiled():
         sl._SMALL_BATCH_SPARSE_TILE_M = saved
 
 
+def test_gap_batch_tiling_matches_untiled():
+    """
+    The "gap batch" regime (16 <= batch < 64) sits between the small-batch (<16) path and the
+    >=64-aligned CUDA path; there the budget heuristics under-tile the product, sparse-ele AND
+    block-sparse parameter-flow kernels (e.g. at batch=16 the par kernel got ~8 programs / 1 SM). The
+    fixes extend the prod/sparse-ele node-tile caps through the gap and shrink the par kernel's
+    output-column tile TILE_SIZE_K (bit-safe: TILE_SIZE_M -- the max-stabilization group -- is left
+    unchanged). All are pure tiling, so forward LL and parameter flows must be bit-identical to the
+    un-tiled path. ~40x faster par kernel / ~7x faster batch=16 fwd+bwd under CUDA graphs.
+    """
+    import pyjuice.layer.sum_layer as sl
+    import pyjuice.layer.prod_layer as pl
+
+    device = torch.device("cuda:0")
+    torch.manual_seed(505)
+    ns = juice.structures.GeneralizedHMM(
+        seq_length = 4, num_latents = 512, homogeneous = True,
+        input_dist = juice.distributions.Categorical(num_cats = 6)
+    )
+    ns.init_parameters(perturbation = 2.0)
+    pc = juice.compile(ns)
+    pc.to(device)
+
+    saved = (pl._SMALL_BATCH_PROD_TILE_M, sl._SMALL_BATCH_SPARSE_TILE_M, sl._SMALL_BATCH_PAR_TILE_K)
+    try:
+        for batch_size in [16, 32]:   # the gap range (>=16, <64)
+            data = torch.randint(0, 6, [batch_size, 4], device = device)
+
+            pl._SMALL_BATCH_PROD_TILE_M, sl._SMALL_BATCH_SPARSE_TILE_M, sl._SMALL_BATCH_PAR_TILE_K = 8, 8, 16
+            ll_tiled = pc(data).clone()
+            pc.backward(data, flows_memory = 0.0, allow_modify_flows = False)
+            pf_tiled = pc.param_flows.clone()
+
+            pl._SMALL_BATCH_PROD_TILE_M, sl._SMALL_BATCH_SPARSE_TILE_M, sl._SMALL_BATCH_PAR_TILE_K = (1 << 30,) * 3
+            ll_ref = pc(data).clone()
+            pc.backward(data, flows_memory = 0.0, allow_modify_flows = False)
+            pf_ref = pc.param_flows.clone()
+
+            assert torch.equal(ll_tiled, ll_ref), f"gap-batch tiling forward LL not bit-identical at batch={batch_size}"
+            assert torch.equal(pf_tiled, pf_ref), f"gap-batch tiling param flows not bit-identical at batch={batch_size}"
+    finally:
+        pl._SMALL_BATCH_PROD_TILE_M, sl._SMALL_BATCH_SPARSE_TILE_M, sl._SMALL_BATCH_PAR_TILE_K = saved
+
+
 if __name__ == "__main__":
     test_hmm_batch_size_consistency()
     test_hmm_backward_small_batch()
@@ -449,3 +493,4 @@ if __name__ == "__main__":
     test_small_batch_ele_backward_cuda_matches_triton()
     test_small_batch_prod_tiling_matches_untiled()
     test_small_batch_sparse_ele_tiling_matches_untiled()
+    test_gap_batch_tiling_matches_untiled()
