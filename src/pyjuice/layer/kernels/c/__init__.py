@@ -38,6 +38,8 @@ _par_module = None      # parameter-flow backward
 _par_attempted = False
 _sbfw_module = None     # small-batch (batch<16) forward
 _sbfw_attempted = False
+_sbele_module = None    # small-batch (batch<16) element-flow backward
+_sbele_attempted = False
 _flags_cache = "unset"  # cached (cuda_cflags, ldflags) or None; computed once
 _plain_flags_cache = "unset"  # cached plain (no-CUTLASS) cuda_cflags or None
 
@@ -214,6 +216,36 @@ def smallbatch_forward_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, 
 def smallbatch_fw_configs():
     """List of SPLIT values per config id (index = the ``cfg`` arg)."""
     return [int(c) for c in _sbfw_module.smallbatch_fw_configs()] if smallbatch_fw_is_available() else []
+
+
+def smallbatch_ele_is_available() -> bool:
+    """Whether the small-batch (batch<16) CUDA element-flow backward kernel is usable (lazily
+    JIT-compiles once). Plain CUDA, so it needs no CUTLASS and no sm_90 -- only nvcc + a CUDA GPU."""
+    global _sbele_module, _sbele_attempted
+    if not _sbele_attempted:
+        _sbele_attempted = True
+        _sbele_module = _jit_plain("pyjuice_sum_backward_ele_smallbatch_cuda", "smallbatch_ele_backward.cu")
+    return _sbele_module is not None
+
+
+def smallbatch_ele_backward_sum(element_flows: torch.Tensor, element_mars: torch.Tensor,
+                                node_flows: torch.Tensor, node_mars: torch.Tensor, params: torch.Tensor,
+                                chids: torch.Tensor, ebase: torch.Tensor, pbase: torch.Tensor,
+                                batch_size: int, block_size: int, cs_block_size: int, num_edges: int,
+                                cfg: int = 0) -> None:
+    """Small-batch block-sparse sum-layer element-flow backward (overwrites ``element_flows``) using
+    WARPS config ``cfg``. Caller must guarantee the dispatch conditions hold (see
+    ``smallbatch_ele_is_available`` + the small-batch gate in
+    ``sum_layer._backward_block_sparse_ele_flows``): contiguous parents + edge-contiguous params (the
+    verified global-contiguity layout), LL propagation, ``allow_modify_flows`` off."""
+    _sbele_module.smallbatch_ele_backward_sum(element_flows, element_mars, node_flows, node_mars, params,
+                                              chids, ebase, pbase, int(batch_size), int(block_size),
+                                              int(cs_block_size), int(num_edges), int(cfg))
+
+
+def smallbatch_ele_configs():
+    """List of WARPS values per config id (index = the ``cfg`` arg)."""
+    return [int(c) for c in _sbele_module.smallbatch_ele_configs()] if smallbatch_ele_is_available() else []
 
 
 def par_backward_sum(param_flows: torch.Tensor, node_flows: torch.Tensor, node_mars: torch.Tensor,

@@ -289,6 +289,7 @@ class SumLayer(Layer, nn.Module):
         # batch) autotuned choice, and a reused scratch output buffer for corruption-safe autotuning.
         self._cached_bk_ele_cuda = dict()
         self._cached_bk_ele_choice = dict()
+        self._cached_bk_ele_sb = dict()
         self._bk_ele_scratch = None
 
         # Optional CUDA param-backward fast path: per-partition (nbase, cbase, pbase, fbase, cuda_ok),
@@ -1512,6 +1513,79 @@ class SumLayer(Layer, nn.Module):
                     self._cached_bk_ele_choice[choice_key] = choice
                 if choice[0] == "cuda":
                     _cuda_ele(element_flows)
+                    return None
+                # choice == ("triton", -1): fall through to the Triton launch below
+
+        # Small-batch (batch < 16) CUDA element-flow backward. The block-sparse Triton kernel (csmm2)
+        # under-tiles the node dimension at tiny batch; this plain-CUDA kernel gives each child node
+        # its own warp and streams its flows directly from global -- no shared staging, no barrier
+        # (a component ablation showed the staged variant spent ~88% of its time in that barrier),
+        # numerically equivalent ~3e-6. Gated to the same regime as the small-batch tiling heuristic
+        # above (batch<16, block_size>=128), LL, no tempering/partial-eval, contiguous layout, and
+        # allow_modify_flows / allow_neg_flows / accumulate_ch_flows off. Autotuned vs the Triton
+        # small-batch launch INTO A SCRATCH buffer (corruption-safe: the live element_flows is touched
+        # only by the single real run below); used only when it wins, else falls through to Triton.
+        if (BACKWARD_ELE_FLOW_CUDA and batch_size < 16 and self.block_size >= _SMALL_BATCH_MIN_BLOCK_SIZE
+                and propagation_alg_id == 0 and abs(eflow_temperature - 1.0) < 1e-6
+                and allow_modify_flows == 0 and logspace_flows and not allow_neg_flows
+                and not accumulate_ch_flows and local_ids is None and not force_use_fp32
+                and num_edges % TILE_SIZE_K == 0 and cs_block_size % 32 == 0
+                and node_flows.is_cuda and cuda_kernels.smallbatch_ele_is_available()):
+            sb = self._cached_bk_ele_sb.get(signature)
+            if sb is None:
+                # Per-node-block first parent / first param (column 0 of the cached per-tile
+                # ebase/pbase) and verify GLOBAL contiguity: parents step by 1 across edges and by
+                # TILE_SIZE_K across tiles; per-child params are edge-contiguous (the pbase steps by
+                # TILE_SIZE_K across tiles). cuda_ok already checked within-tile contiguity; here we
+                # also require the tiles to chain globally.
+                ele_ebase, ele_pbase, cuda_ok = self._cached_bk_ele_cuda[signature]
+                _art = torch.arange(K_NUM_TILES, device = ele_ebase.device, dtype = torch.int64).view(1, -1)
+                sb_ok = bool(cuda_ok
+                             and torch.equal(ele_ebase, ele_ebase[:, :1] + _art * TILE_SIZE_K)
+                             and torch.equal(ele_pbase, ele_pbase[:, :1] + _art * TILE_SIZE_K))
+                sb = (ele_ebase[:, 0].contiguous(), ele_pbase[:, 0].contiguous(), sb_ok)
+                self._cached_bk_ele_sb[signature] = sb
+            sb_ebase, sb_pbase, sb_ok = sb
+            if sb_ok:
+                n_sb_cfg = len(cuda_kernels.smallbatch_ele_configs())
+
+                def _cuda_ele_sb(tgt, c):
+                    cuda_kernels.smallbatch_ele_backward_sum(
+                        tgt, element_mars, node_flows, node_mars, params, chids, sb_ebase, sb_pbase,
+                        batch_size, self.block_size, cs_block_size, num_edges, c)
+
+                def _triton_ele_sb(tgt):
+                    for s in range(0, grid[1], 32768):
+                        cg = (grid[0], min(s + 32768, grid[1]) - s)
+                        bk_ele_bsparse._bk_triton_block_sparse_ele_csmm2_kernel[cg](
+                            node_flows = node_flows, element_flows = tgt, node_mars = node_mars,
+                            element_mars = element_mars, mparams = params, chids = chids,
+                            parids_start = parids_start, parids_increment = parids_increment,
+                            parpids_start = parpids_start, parpids_increment = parpids_increment,
+                            local_ids = local_ids, batch_size = batch_size, partial_eval = partial_eval,
+                            ptr_inc_step = ptr_inc_step, allow_modify_flows = allow_modify_flows,
+                            logspace_flows = logspace_flows, BLOCK_B = BLOCK_B, TILE_SIZE_K = TILE_SIZE_K,
+                            K_NUM_TILES = K_NUM_TILES, TILE_SIZE_M = TILE_SIZE_M,
+                            BLOCK_SIZE_M = BLOCK_SIZE_M, BLOCK_SIZE_K = BLOCK_SIZE_K, TL_DOT = TL_DOT,
+                            num_stages = 1, propagation_alg_id = propagation_alg_id,
+                            accumulate_ch_flows = accumulate_ch_flows, allow_neg_flows = allow_neg_flows,
+                            pid_m_offset = s, **propagation_alg_kwargs)
+
+                choice_key = (signature, batch_size, "sb")
+                choice = self._cached_bk_ele_choice.get(choice_key)
+                if choice is None:
+                    # autotune into a SCRATCH clone (corruption-safe); the live element_flows is
+                    # touched only by the single real run below.
+                    if (self._bk_ele_scratch is None or self._bk_ele_scratch.shape != element_flows.shape
+                            or self._bk_ele_scratch.dtype != element_flows.dtype):
+                        self._bk_ele_scratch = torch.empty_like(element_flows)
+                    scr = self._bk_ele_scratch
+                    cands = [(("cuda", c), (lambda c = c: _cuda_ele_sb(scr, c))) for c in range(n_sb_cfg)]
+                    cands.append((("triton", -1), (lambda: _triton_ele_sb(scr))))
+                    choice = cuda_kernels.autotune(cands) or ("triton", -1)
+                    self._cached_bk_ele_choice[choice_key] = choice
+                if choice[0] == "cuda":
+                    _cuda_ele_sb(element_flows, choice[1])
                     return None
                 # choice == ("triton", -1): fall through to the Triton launch below
 
