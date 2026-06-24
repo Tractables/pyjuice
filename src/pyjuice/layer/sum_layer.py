@@ -98,6 +98,11 @@ from .kernels import c as cuda_kernels
 # env for experimentation.
 _SMALL_BATCH_FW_TILE_M = int(os.environ.get("PYJUICE_SB_FW_TM", 8))
 _SMALL_BATCH_ELE_TILE_M = int(os.environ.get("PYJUICE_SB_ELE_TM", 8))
+# Small-batch node-tile cap for the SPARSE element-flow backward kernel (block_size==1 / small-edge
+# layers that miss the block-sparse path, e.g. HMM passthrough layers). The sparse kernel otherwise
+# sets BLOCK_M = cs_block_size -> one serial program per node-block (~1 SM busy); capping it fans the
+# node dimension across many programs. Pure tiling -> bit-identical. Tunable via env.
+_SMALL_BATCH_SPARSE_TILE_M = int(os.environ.get("PYJUICE_SB_SPARSE_TM", 8))
 # Minimum block size for the small-batch (batch < 16) block-sparse path. Below this the sparse
 # kernel is actually faster (its lower launch/tiling overhead beats the node-tiling parallelism when
 # the node dimension is small) -- measured crossover is ~128 on an RTX PRO 6000. Tunable via env.
@@ -2131,13 +2136,24 @@ class SumLayer(Layer, nn.Module):
 
             if abs(eflow_temperature - 1.0) < 1e-6:
 
-                bk_ele_sparse._bk_triton_sparse_ele_kernel[grid](
-                    node_flows = node_flows, 
-                    element_flows = element_flows, 
-                    node_mars = node_mars, 
-                    element_mars = element_mars, 
-                    mparams = params, 
-                    chids = chids, 
+                # Small-batch: cap BLOCK_M so each node-block is split into many tiles/programs
+                # (otherwise one serial program per node-block -> ~1 SM busy). Pure tiling ->
+                # bit-identical (the tempered branch below keeps BLOCK_M = cs_block_size).
+                ele_BLOCK_M = BLOCK_M
+                if batch_size < 16:
+                    ele_BLOCK_M = min(ele_BLOCK_M, _SMALL_BATCH_SPARSE_TILE_M)
+                    while cs_block_size % ele_BLOCK_M != 0:
+                        ele_BLOCK_M //= 2
+                TILES_PER_BLOCK = cs_block_size // ele_BLOCK_M
+                ele_grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, ele_BLOCK_M))
+
+                bk_ele_sparse._bk_triton_sparse_ele_kernel[ele_grid](
+                    node_flows = node_flows,
+                    element_flows = element_flows,
+                    node_mars = node_mars,
+                    element_mars = element_mars,
+                    mparams = params,
+                    chids = chids,
                     parids = parids,
                     parpids = parpids,
                     local_ids = local_ids,
@@ -2147,8 +2163,9 @@ class SumLayer(Layer, nn.Module):
                     allow_modify_flows = allow_modify_flows,
                     logspace_flows = logspace_flows,
                     BLOCK_B = BLOCK_B,
-                    BLOCK_M = BLOCK_M,
+                    BLOCK_M = ele_BLOCK_M,
                     BLOCK_SIZE_K = self.block_size,
+                    TILES_PER_BLOCK = TILES_PER_BLOCK,
                     propagation_alg_id = propagation_alg_id,
                     accumulate_ch_flows = accumulate_ch_flows,
                     **propagation_alg_kwargs

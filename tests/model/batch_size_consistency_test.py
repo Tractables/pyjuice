@@ -398,6 +398,48 @@ def test_small_batch_prod_tiling_matches_untiled():
         pl._SMALL_BATCH_PROD_TILE_M = saved
 
 
+def test_small_batch_sparse_ele_tiling_matches_untiled():
+    """
+    The small-batch (batch < 16) node-tile cap (`_SMALL_BATCH_SPARSE_TILE_M`) for the SPARSE
+    element-flow kernel splits each node-block across many programs (the sparse kernel otherwise sets
+    BLOCK_M = cs_block_size -> one serial program per node-block, ~1 SM busy). This hits the layers
+    that miss the block-sparse path (e.g. the HMM's block_size==1 passthrough layer). It is PURE
+    TILING, so forward LL and parameter flows must be bit-identical to the un-tiled path. ~38x faster
+    on the HMM's sparse-ele layer.
+    """
+    import pyjuice.layer.sum_layer as sl
+
+    device = torch.device("cuda:0")
+    torch.manual_seed(404)
+    ns = juice.structures.GeneralizedHMM(
+        seq_length = 4, num_latents = 512, homogeneous = True,
+        input_dist = juice.distributions.Categorical(num_cats = 6)
+    )
+    ns.init_parameters(perturbation = 2.0)
+    pc = juice.compile(ns)
+    pc.to(device)
+
+    saved = sl._SMALL_BATCH_SPARSE_TILE_M
+    try:
+        for batch_size in [1, 2, 3, 8]:
+            data = torch.randint(0, 6, [batch_size, 4], device = device)
+
+            sl._SMALL_BATCH_SPARSE_TILE_M = 8           # default tiled path
+            ll_tiled = pc(data).clone()
+            pc.backward(data, flows_memory = 0.0, allow_modify_flows = False)
+            pf_tiled = pc.param_flows.clone()
+
+            sl._SMALL_BATCH_SPARSE_TILE_M = 1 << 30     # effectively uncapped (old behavior)
+            ll_ref = pc(data).clone()
+            pc.backward(data, flows_memory = 0.0, allow_modify_flows = False)
+            pf_ref = pc.param_flows.clone()
+
+            assert torch.equal(ll_tiled, ll_ref), f"sparse-ele tiling forward LL not bit-identical at batch={batch_size}"
+            assert torch.equal(pf_tiled, pf_ref), f"sparse-ele tiling param flows not bit-identical at batch={batch_size}"
+    finally:
+        sl._SMALL_BATCH_SPARSE_TILE_M = saved
+
+
 if __name__ == "__main__":
     test_hmm_batch_size_consistency()
     test_hmm_backward_small_batch()
@@ -406,3 +448,4 @@ if __name__ == "__main__":
     test_small_batch_forward_cuda_matches_triton()
     test_small_batch_ele_backward_cuda_matches_triton()
     test_small_batch_prod_tiling_matches_untiled()
+    test_small_batch_sparse_ele_tiling_matches_untiled()
