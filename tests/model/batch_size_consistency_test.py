@@ -172,6 +172,54 @@ def test_hmm_backward_small_batch():
         assert rel < 1e-4, f"sparse parameter flows not tiling-invariant (batch {batch_size} vs 1, relmax={rel})"
 
 
+def test_sum_layer_backward_mode_and_fp32():
+    """
+    Regression for two sum-layer backward-dispatch fixes:
+
+    1. The `mode=` override (forcing the sparse / block-sparse / pytorch backend) referenced a bare
+       `STR2MODE` instead of `self.STR2MODE` -> NameError. `pc.forward` / `pc.backward` thread `mode=`
+       down to `SumLayer._forward` / `_backward`, so forcing a backend must not raise.
+    2. `force_use_fp32 = True` was silently dropped on the block-sparse *parameter*-flow backward
+       (swallowed by `**kwargs`), while the element-flow backward honored it. It must now be accepted
+       on the parameter-flow path and still produce correct (finite) parameter flows.
+    """
+
+    device = torch.device("cuda:0")
+    torch.manual_seed(7)
+
+    ns = juice.structures.GeneralizedHMM(
+        seq_length = 4, num_latents = 128, homogeneous = True,
+        input_dist = juice.distributions.Categorical(num_cats = 6)
+    )
+    ns.init_parameters(perturbation = 2.0)
+    pc = juice.compile(ns)
+    pc.to(device)
+
+    data = torch.randint(0, 6, [16, 4], device = device)
+
+    def param_flows(**kw):
+        fwd_kw = {k: v for k, v in kw.items() if k in ("mode", "force_use_fp32")}
+        pc(data, **fwd_kw)
+        pc.backward(data, flows_memory = 0.0, allow_modify_flows = False, **kw)
+        torch.cuda.synchronize()
+        return pc.param_flows.clone()
+
+    ref = param_flows()
+    assert torch.isfinite(ref).all() and ref.abs().sum() > 0
+
+    # (1) Forcing the sparse backend on both the forward and backward must not raise (the bare
+    # `STR2MODE` reference did). `sparse` is valid for every layer shape, so it can be forced globally.
+    got = param_flows(mode = "sparse")
+    assert torch.isfinite(got).all()
+    assert (got - ref).abs().max() / (ref.abs().max() + 1e-12) < 2e-2
+
+    # (2) `force_use_fp32` must be accepted on the parameter-flow path and stay correct.
+    got = param_flows(force_use_fp32 = True)
+    assert torch.isfinite(got).all()
+    assert (got - ref).abs().max() / (ref.abs().max() + 1e-12) < 2e-2
+
+
 if __name__ == "__main__":
     test_hmm_batch_size_consistency()
     test_hmm_backward_small_batch()
+    test_sum_layer_backward_mode_and_fp32()

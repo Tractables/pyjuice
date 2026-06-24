@@ -508,7 +508,7 @@ class SumLayer(Layer, nn.Module):
         batch_size = node_mars.size(1)
 
         if mode is not None:
-            assert mode in STR2MODE
+            assert mode in self.STR2MODE
             mode = self.STR2MODE[mode]
 
         elif params.dim() == 1 and self.block_size >= 16 and num_edges >= 16 and batch_size >= 16:
@@ -1033,7 +1033,7 @@ class SumLayer(Layer, nn.Module):
         batch_size = node_flows.size(1)
 
         if mode is not None:
-            assert mode in STR2MODE
+            assert mode in self.STR2MODE
             mode = self.STR2MODE[mode]
 
         elif params.dim() == 1 and self.block_size >= 16 and num_edges >= 16 and batch_size >= 16:
@@ -1214,9 +1214,10 @@ class SumLayer(Layer, nn.Module):
                 nids = nids, cids = cids, pids = pids, pfids = pfids,
                 allow_modify_flows = allow_modify_flows,
                 propagation_alg = propagation_alg, 
-                logspace_flows = logspace_flows, 
-                negate_pflows = negate_pflows, 
-                allow_neg_flows = allow_neg_flows, 
+                logspace_flows = logspace_flows,
+                negate_pflows = negate_pflows,
+                allow_neg_flows = allow_neg_flows,
+                force_use_fp32 = force_use_fp32,
                 pflow_temperature = pflow_temperature, **kwargs
             )
 
@@ -1545,9 +1546,10 @@ class SumLayer(Layer, nn.Module):
     def _backward_block_sparse_par_flows(self, node_flows: torch.Tensor, params: torch.Tensor, node_mars: torch.Tensor,
                                          element_mars: torch.Tensor, param_flows: torch.Tensor, nids: torch.Tensor, 
                                          cids: torch.Tensor, pids: torch.Tensor, pfids: torch.Tensor,
-                                         allow_modify_flows: bool = False, propagation_alg: str = "LL", 
-                                         logspace_flows: bool = False, negate_pflows: bool = False, 
-                                         allow_neg_flows: bool = False, pflow_temperature: float = 1.0, **kwargs) -> None:
+                                         allow_modify_flows: bool = False, propagation_alg: str = "LL",
+                                         logspace_flows: bool = False, negate_pflows: bool = False,
+                                         allow_neg_flows: bool = False, force_use_fp32: bool = False,
+                                         pflow_temperature: float = 1.0, **kwargs) -> None:
         """
         Backward pass of sum layers w.r.t. sum parameters with the block-sparse processing kernel.
         
@@ -1599,7 +1601,9 @@ class SumLayer(Layer, nn.Module):
                                   "This is an internal error of PyJuice. Please consider checking the kernel dispatching criterions and use the " \
                                   "corresponding sparse kernel instead."
 
-        if TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and TILE_SIZE_B >= 16:
+        # `force_use_fp32` disables the (TF32) tensor-core dot so the param flows are computed in
+        # full fp32, mirroring the element-flow backward (see `_backward_block_sparse_ele_flows`).
+        if TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and TILE_SIZE_B >= 16 and not force_use_fp32:
             TL_DOT = 1
         else:
             TL_DOT = 0
@@ -1629,6 +1633,7 @@ class SumLayer(Layer, nn.Module):
         # (which keeps the OOM-retry path). See BACKWARD_PAR_FLOW_CUDA.
         if (BACKWARD_PAR_FLOW_CUDA and propagation_alg_id == 0 and abs(pflow_temperature - 1.0) < 1e-6
                 and allow_modify_flows == 0 and logspace_flows and not allow_neg_flows and not negate_pflows
+                and not force_use_fp32
                 and self.block_size % 64 == 0 and num_edges % 128 == 0 and batch_size % 32 == 0
                 and node_flows.is_cuda and cuda_kernels.par_is_available()):
             par_sig = id(pfids)
@@ -1749,6 +1754,7 @@ class SumLayer(Layer, nn.Module):
                             nids, cids, pids, pfids, allow_modify_flows = allow_modify_flows,
                             propagation_alg = propagation_alg, logspace_flows = logspace_flows,
                             negate_pflows = negate_pflows, allow_neg_flows = allow_neg_flows,
+                            force_use_fp32 = force_use_fp32,
                             pflow_temperature = pflow_temperature, **kwargs)
 
                 else:
