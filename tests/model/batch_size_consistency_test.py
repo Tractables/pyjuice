@@ -264,8 +264,47 @@ def test_small_batch_block_sparse_fast_path():
                 f"parameter-flow mismatch (Nlat={num_latents}, batch={batch_size})"
 
 
+def test_small_batch_forward_cuda_matches_triton():
+    """
+    The optional small-batch (batch < 16) CUDA forward kernel (block_size >= 128 large-block layers,
+    a plain-CUDA 32-node-warp + edge-split online-logsumexp) must produce the same log-likelihoods as
+    the Triton small-batch path it is autotuned against. Skipped if the CUDA kernel can't be built
+    (no nvcc/ninja) -- then the dispatch transparently uses Triton anyway.
+    """
+    import pyjuice.layer.sum_layer as sl
+    from pyjuice.layer.kernels import c as cuda_kernels
+
+    if not (torch.cuda.is_available() and cuda_kernels.smallbatch_fw_is_available()):
+        pytest.skip("small-batch CUDA forward kernel unavailable (no nvcc/ninja); Triton fallback used")
+
+    device = torch.device("cuda:0")
+    torch.manual_seed(123)
+    ns = juice.structures.GeneralizedHMM(
+        seq_length = 4, num_latents = 512, homogeneous = True,   # block_size 512 >= 128 -> CUDA path
+        input_dist = juice.distributions.Categorical(num_cats = 6)
+    )
+    ns.init_parameters(perturbation = 2.0)
+    pc = juice.compile(ns)
+    pc.to(device)
+
+    saved = sl.FORWARD_SUM_CUDA
+    try:
+        for batch_size in [1, 2, 3, 8]:
+            data = torch.randint(0, 6, [batch_size, 4], device = device)
+            sl.FORWARD_SUM_CUDA = True
+            ll_cuda = pc(data).clone()
+            sl.FORWARD_SUM_CUDA = False
+            ll_triton = pc(data).clone()
+            assert torch.isfinite(ll_cuda).all()
+            assert (ll_cuda - ll_triton).abs().max() < 1e-3, \
+                f"small-batch CUDA forward mismatch vs Triton at batch={batch_size}"
+    finally:
+        sl.FORWARD_SUM_CUDA = saved
+
+
 if __name__ == "__main__":
     test_hmm_batch_size_consistency()
     test_hmm_backward_small_batch()
     test_sum_layer_backward_mode_and_fp32()
     test_small_batch_block_sparse_fast_path()
+    test_small_batch_forward_cuda_matches_triton()

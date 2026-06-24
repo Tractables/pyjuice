@@ -199,6 +199,10 @@ class SumLayer(Layer, nn.Module):
         # Per-signature autotuned dispatch choice: ("cuda", cfg_id) or ("triton", -1). Decided once
         # by benchmarking the valid CUDA tile configs against Triton for this layer's shape.
         self._cached_fw_cuda_choice = dict()
+        # Small-batch (batch<16) forward CUDA fast path: per-signature (sb_ebase, sb_pbase, sb_ok),
+        # where sb_ebase/sb_pbase are the per-node-block first child / first param and sb_ok records
+        # whether the layer's children are GLOBALLY contiguous + params block_size-strided.
+        self._cached_fw_sb = dict()
 
         # Layer info
         self._layer_nid_range = (layer_nid_start, layer_nid_start + self.num_nodes)
@@ -743,7 +747,69 @@ class SumLayer(Layer, nn.Module):
                         batch_size, self.block_size, K_NUM_TILES, choice[1])
                     return None
                 # choice == ("triton", -1): fall through to the Triton launch below
-        
+
+        # Small-batch (batch < 16) CUDA fast path. The big-block sparse/block-sparse Triton kernels
+        # under-tile the node dimension at tiny batch; this plain-CUDA kernel (32-node coalesced
+        # warps + edge-split online-logsumexp, numerically equivalent ~1.5e-6) is faster. Gated to the
+        # same regime as the small-batch tiling heuristic above (batch<16, block_size>=128), LL, no
+        # tempering / partial-eval, contiguous layout. Autotuned vs the Triton small-batch launch and
+        # only used when it wins; otherwise falls through to the Triton launch below.
+        if (FORWARD_SUM_CUDA and batch_size < 16 and self.block_size >= _SMALL_BATCH_MIN_BLOCK_SIZE
+                and propagation_alg_id == 0 and not pflow_tempered_enabled and local_ids is None
+                and node_mars.is_cuda and cuda_kernels.smallbatch_fw_is_available()):
+            sb = self._cached_fw_sb.get(signature)
+            if sb is None:
+                # Derive per-node-block first child / first param (column 0 of the cached per-tile
+                # ebase/pbase) and verify GLOBAL contiguity: children step by 1 across edges and by
+                # TILE_SIZE_K across tiles; params block_size-strided across edges. cuda_ok already
+                # checked within-tile contiguity; here we also require the tiles to chain globally.
+                ebase_t, pbase_t, cuda_ok = self._cached_fw_cuda[signature]
+                _art = torch.arange(K_NUM_TILES, device=ebase_t.device, dtype=torch.int64).view(1, -1)
+                sb_ok = bool(cuda_ok
+                             and torch.equal(ebase_t, ebase_t[:, :1] + _art * TILE_SIZE_K)
+                             and torch.equal(pbase_t, pbase_t[:, :1] + _art * (TILE_SIZE_K * self.block_size)))
+                sb = (ebase_t[:, 0].contiguous(), pbase_t[:, 0].contiguous(), sb_ok)
+                self._cached_fw_sb[signature] = sb
+            sb_ebase, sb_pbase, sb_ok = sb
+            if sb_ok:
+                n_sb_cfg = len(cuda_kernels.smallbatch_fw_configs())
+                choice_key = (signature, batch_size, "sb")
+                choice = self._cached_fw_cuda_choice.get(choice_key)
+                if choice is None:
+                    # Autotune the CUDA SPLIT configs against the Triton small-batch launch (csmm1/2,
+                    # whichever this tile shape selects -- mirrors the fall-through below). Every
+                    # candidate overwrites node_mars with the same result, so it stays correct.
+                    cands = [(("cuda", c), (lambda c=c: cuda_kernels.smallbatch_forward_sum(
+                                node_mars, element_mars, params, nids, sb_ebase, sb_pbase,
+                                batch_size, self.block_size, num_edges, c)))
+                             for c in range(n_sb_cfg)]
+
+                    def _triton_sb_cand():
+                        sb_kern = (fw_bsparse._fw_triton_block_sparse_csmm1_kernel
+                                   if (TILE_SIZE_M >= 8 and TILE_SIZE_K >= 8 and BLOCK_B >= 8)
+                                   else fw_bsparse._fw_triton_block_sparse_csmm2_kernel)
+                        for s in range(0, grid[1], 32768):
+                            cg = (grid[0], min(s + 32768, grid[1]) - s)
+                            sb_kern[cg](
+                                node_mars, element_mars, params, nids, cids_start, cids_increment,
+                                pids_start, pids_increment, local_ids, batch_size,
+                                partial_eval = partial_eval, BLOCK_B = BLOCK_B,
+                                TILE_SIZE_K = TILE_SIZE_K, K_NUM_TILES = K_NUM_TILES,
+                                TILE_SIZE_M = TILE_SIZE_M, BLOCK_SIZE_M = BLOCK_SIZE_M,
+                                use_bf16 = use_bf16, propagation_alg_id = propagation_alg_id,
+                                pflow_tempered_enabled = pflow_tempered_enabled, pid_m_offset = s,
+                                **propagation_alg_kwargs, **pflow_tempered_kwargs, num_stages = 1)
+                    cands.append((("triton", -1), _triton_sb_cand))
+                    choice = cuda_kernels.autotune(cands) or ("triton", -1)
+                    self._cached_fw_cuda_choice[choice_key] = choice
+
+                if choice[0] == "cuda":
+                    cuda_kernels.smallbatch_forward_sum(
+                        node_mars, element_mars, params, nids, sb_ebase, sb_pbase,
+                        batch_size, self.block_size, num_edges, choice[1])
+                    return None
+                # choice == ("triton", -1): fall through to the Triton launch below
+
         # OOM-safe tuned launch: if the larger tuned tiles exceed this GPU's shared-memory/
         # register budget, fall back to the default configuration (recompiled untuned).
         try:

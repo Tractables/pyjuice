@@ -36,7 +36,10 @@ _ele_module = None      # element-flow backward
 _ele_attempted = False
 _par_module = None      # parameter-flow backward
 _par_attempted = False
+_sbfw_module = None     # small-batch (batch<16) forward
+_sbfw_attempted = False
 _flags_cache = "unset"  # cached (cuda_cflags, ldflags) or None; computed once
+_plain_flags_cache = "unset"  # cached plain (no-CUTLASS) cuda_cflags or None
 
 
 def _find_cutlass_include() -> Optional[str]:
@@ -111,6 +114,38 @@ def _compile_flags():
     return _flags_cache
 
 
+def _plain_compile_flags():
+    """Flags for a PLAIN CUDA kernel (no CuTe/TMA/CUTLASS, no driver API). Unlike `_compile_flags`
+    this needs neither CUTLASS nor sm_90 -- it works on any CUDA GPU -- so the small-batch forward
+    fast path is usable far more broadly than the CuTe kernels. Computed once and cached."""
+    global _plain_flags_cache
+    if _plain_flags_cache != "unset":
+        return _plain_flags_cache
+    _plain_flags_cache = None
+    if not ENABLE_CUDA_KERNELS or not torch.cuda.is_available():
+        return None
+    cc = torch.cuda.get_device_capability()
+    # Plain arch (no `a` suffix): the kernel uses only ordinary CUDA, so no arch-specific features.
+    _plain_flags_cache = ["-O3", f"-arch=sm_{cc[0]}{cc[1]}", "--use_fast_math", "-DNDEBUG"]
+    return _plain_flags_cache
+
+
+def _jit_plain(name: str, source_file: str):
+    """JIT-compile a plain-CUDA .cu (no CUTLASS) into a loaded module, or None (warns once)."""
+    flags = _plain_compile_flags()
+    if flags is None:
+        return None
+    from torch.utils.cpp_extension import load
+    try:
+        return load(name=name, sources=[os.path.join(_THIS_DIR, source_file)],
+                    extra_cuda_cflags=flags, verbose=False)
+    except Exception as e:
+        warnings.warn(
+            f"pyjuice CUDA kernel '{name}' failed to compile ({type(e).__name__}: {e}). "
+            "Falling back to the Triton kernels.", RuntimeWarning)
+        return None
+
+
 def _jit(name: str, source_file: str):
     """JIT-compile one .cu into a loaded module, or None (warns once on failure)."""
     fl = _compile_flags()
@@ -153,6 +188,32 @@ def par_is_available() -> bool:
         _par_attempted = True
         _par_module = _jit("pyjuice_sum_backward_par_cuda", "par_backward_sum.cu")
     return _par_module is not None
+
+
+def smallbatch_fw_is_available() -> bool:
+    """Whether the small-batch (batch<16) CUDA forward kernel is usable (lazily JIT-compiles once).
+    Plain CUDA, so it needs no CUTLASS and no sm_90 -- only nvcc + a CUDA GPU."""
+    global _sbfw_module, _sbfw_attempted
+    if not _sbfw_attempted:
+        _sbfw_attempted = True
+        _sbfw_module = _jit_plain("pyjuice_sum_forward_smallbatch_cuda", "smallbatch_forward_sum.cu")
+    return _sbfw_module is not None
+
+
+def smallbatch_forward_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor,
+                           nids: torch.Tensor, ebase: torch.Tensor, pbase: torch.Tensor,
+                           batch_size: int, block_size: int, num_edges: int, cfg: int = 0) -> None:
+    """Small-batch block-sparse sum-layer forward (in-place into ``node_mars``) using SPLIT config
+    ``cfg``. Caller must guarantee the dispatch conditions hold (see ``smallbatch_fw_is_available``
+    + the small-batch gate in ``sum_layer._forward_block_sparse``): block_size a multiple of 32,
+    contiguous children + block_size-strided params, LL propagation."""
+    _sbfw_module.smallbatch_forward_sum(node_mars, element_mars, params, nids, ebase, pbase,
+                                        int(batch_size), int(block_size), int(num_edges), int(cfg))
+
+
+def smallbatch_fw_configs():
+    """List of SPLIT values per config id (index = the ``cfg`` arg)."""
+    return [int(c) for c in _sbfw_module.smallbatch_fw_configs()] if smallbatch_fw_is_available() else []
 
 
 def par_backward_sum(param_flows: torch.Tensor, node_flows: torch.Tensor, node_mars: torch.Tensor,
