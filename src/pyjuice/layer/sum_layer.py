@@ -2130,11 +2130,11 @@ class SumLayer(Layer, nn.Module):
         if num_edges <= 1024:
             BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
             BLOCK_K = num_edges
-            BLOCK_M = max(min(2048 // num_edges, self.block_size), 1)
+            BLOCK_M = self.block_size # The kernel recovers the node block via `pid_m // BLOCK_M`, so this must equal `block_size`
         else:
             BLOCK_B = min(512, BATCH_SIZE_NP2)
             BLOCK_K = min(2048 // BLOCK_B, num_edges)
-            BLOCK_M = max(min(2048 // num_edges, self.block_size), 1)
+            BLOCK_M = self.block_size # The kernel recovers the node block via `pid_m // BLOCK_M`, so this must equal `block_size`
         B_NUM_BLOCKS = triton.cdiv(batch_size, BLOCK_B)
         K_NUM_BLOCKS = triton.cdiv(num_edges, BLOCK_K)
 
