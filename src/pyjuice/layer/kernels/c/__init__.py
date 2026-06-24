@@ -40,6 +40,8 @@ _sbfw_module = None     # small-batch (batch<16) forward
 _sbfw_attempted = False
 _sbele_module = None    # small-batch (batch<16) element-flow backward
 _sbele_attempted = False
+_sbpar_module = None    # small-batch (batch<16) parameter-flow backward
+_sbpar_attempted = False
 _flags_cache = "unset"  # cached (cuda_cflags, ldflags) or None; computed once
 _plain_flags_cache = "unset"  # cached plain (no-CUTLASS) cuda_cflags or None
 
@@ -246,6 +248,35 @@ def smallbatch_ele_backward_sum(element_flows: torch.Tensor, element_mars: torch
 def smallbatch_ele_configs():
     """List of WARPS values per config id (index = the ``cfg`` arg)."""
     return [int(c) for c in _sbele_module.smallbatch_ele_configs()] if smallbatch_ele_is_available() else []
+
+
+def smallbatch_par_is_available() -> bool:
+    """Whether the small-batch (batch<16) CUDA parameter-flow backward kernel is usable (lazily
+    JIT-compiles once). Plain CUDA, so it needs no CUTLASS and no sm_90 -- only nvcc + a CUDA GPU."""
+    global _sbpar_module, _sbpar_attempted
+    if not _sbpar_attempted:
+        _sbpar_attempted = True
+        _sbpar_module = _jit_plain("pyjuice_sum_backward_par_smallbatch_cuda", "smallbatch_par_backward.cu")
+    return _sbpar_module is not None
+
+
+def smallbatch_par_backward_sum(param_flows: torch.Tensor, node_flows: torch.Tensor, node_mars: torch.Tensor,
+                                element_mars: torch.Tensor, params: torch.Tensor, nids: torch.Tensor,
+                                cids: torch.Tensor, pids: torch.Tensor, pfids: torch.Tensor,
+                                batch_size: int, block_size: int, num_edges: int, cfg: int = 0) -> None:
+    """Small-batch sparse sum-layer parameter-flow backward (accumulates into ``param_flows`` via a
+    collision-free read-add-store) using EY config ``cfg``. Caller must guarantee the dispatch
+    conditions hold (see ``smallbatch_par_is_available`` + the small-batch gate in
+    ``sum_layer._backward_sparse_par_flows``): LL, logspace flows, allow_modify_flows / negate off,
+    a single batch tile, collision-free (untied) flows, block_size a multiple of 32."""
+    _sbpar_module.smallbatch_par_backward_sum(param_flows, node_flows, node_mars, element_mars, params,
+                                              nids, cids, pids, pfids, int(batch_size), int(block_size),
+                                              int(num_edges), int(cfg))
+
+
+def smallbatch_par_configs():
+    """List of EY values per config id (index = the ``cfg`` arg)."""
+    return [int(c) for c in _sbpar_module.smallbatch_par_configs()] if smallbatch_par_is_available() else []
 
 
 def par_backward_sum(param_flows: torch.Tensor, node_flows: torch.Tensor, node_mars: torch.Tensor,

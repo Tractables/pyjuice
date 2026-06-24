@@ -484,6 +484,59 @@ def test_gap_batch_tiling_matches_untiled():
         pl._SMALL_BATCH_PROD_TILE_M, sl._SMALL_BATCH_SPARSE_TILE_M, sl._SMALL_BATCH_PAR_TILE_K = saved
 
 
+def test_small_batch_par_backward_cuda_matches_triton():
+    """
+    The optional small-batch (batch < 16) CUDA parameter-flow backward kernel (a plain-CUDA node-warp
+    with edges split across the grid -- coalesced node-contiguous param load/store, collision-free
+    read-add-store, no atomics) must produce the same parameter flows as the Triton sparse par kernel
+    it is autotuned against. Skipped if the CUDA kernel can't be built (no nvcc/ninja).
+    """
+    import pyjuice.layer.sum_layer as sl
+    from pyjuice.layer.kernels import c as cuda_kernels
+
+    if not (torch.cuda.is_available() and cuda_kernels.smallbatch_par_is_available()):
+        pytest.skip("small-batch CUDA par backward kernel unavailable (no nvcc/ninja); Triton fallback used")
+
+    device = torch.device("cuda:0")
+    torch.manual_seed(606)
+    ns = juice.structures.GeneralizedHMM(
+        seq_length = 4, num_latents = 512, homogeneous = True,   # block_size 512 (mult of 32) -> CUDA path
+        input_dist = juice.distributions.Categorical(num_cats = 6)
+    )
+    ns.init_parameters(perturbation = 2.0)
+    pc = juice.compile(ns)
+    pc.to(device)
+
+    saved = sl.BACKWARD_PAR_FLOW_CUDA
+    try:
+        for batch_size in [1, 2, 3, 8]:
+            data = torch.randint(0, 6, [batch_size, 4], device = device)
+
+            sl.BACKWARD_PAR_FLOW_CUDA = True
+            pc(data)
+            pc.backward(data, flows_memory = 0.0, allow_modify_flows = False)
+            pf_cuda = pc.param_flows.clone()
+
+            sl.BACKWARD_PAR_FLOW_CUDA = False
+            pc(data)
+            pc.backward(data, flows_memory = 0.0, allow_modify_flows = False)
+            pf_triton = pc.param_flows.clone()
+
+            assert torch.isfinite(pf_cuda).all()
+            assert (pf_cuda - pf_triton).abs().max() / (pf_triton.abs().max() + 1e-12) < 1e-3, \
+                f"small-batch CUDA par backward mismatch vs Triton at batch={batch_size}"
+
+        # Confirm the small-batch CUDA par dispatch was actually reached (a choice was cached).
+        reached = any(
+            len(getattr(layer, "_cached_bk_par_sparse_choice", {})) > 0
+            for lg in pc.inner_layer_groups for layer in lg
+            if type(layer).__name__ == "SumLayer"
+        )
+        assert reached, "small-batch CUDA par dispatch was never reached (check the gate conditions)"
+    finally:
+        sl.BACKWARD_PAR_FLOW_CUDA = saved
+
+
 if __name__ == "__main__":
     test_hmm_batch_size_consistency()
     test_hmm_backward_small_batch()
@@ -494,3 +547,4 @@ if __name__ == "__main__":
     test_small_batch_prod_tiling_matches_untiled()
     test_small_batch_sparse_ele_tiling_matches_untiled()
     test_gap_batch_tiling_matches_untiled()
+    test_small_batch_par_backward_cuda_matches_triton()

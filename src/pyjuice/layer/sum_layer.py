@@ -309,6 +309,7 @@ class SumLayer(Layer, nn.Module):
         # corruption-safe autotuning (the kernel is read-accumulate-write).
         self._cached_bk_par_cuda = dict()
         self._cached_bk_par_choice = dict()
+        self._cached_bk_par_sparse_choice = dict()
         self._bk_par_scratch = None
 
     def to(self, device):
@@ -2395,6 +2396,54 @@ class SumLayer(Layer, nn.Module):
         allow_modify_flows = 1 if allow_modify_flows else 0
 
         grid = (B_NUM_TILES, K_NUM_BLOCKS, layer_n_nodes)
+
+        # Small-batch CUDA parameter-flow backward. The sparse Triton par re-reads the shared children
+        # per node; this plain-CUDA kernel uses a node-warp (coalesced node-contiguous param load/store,
+        # like the forward) with the edges split across the grid -- each (node,edge) flow is independent,
+        # so with a single batch tile + collision-free (untied) flows the write is a plain read-add-store
+        # (no atomics). ~2.5x over Triton, numerically equivalent (~4e-11). Gated to LL, logspace flows,
+        # allow_modify_flows / negate / tempering off, block_size a multiple of 32, small batch.
+        # Autotuned vs the Triton launch INTO A SCRATCH buffer (param_flows is read-accumulate-write);
+        # used only when it wins, else falls through to the Triton launch below.
+        if (BACKWARD_PAR_FLOW_CUDA and propagation_alg_id == 0 and abs(pflow_temperature - 1.0) < 1e-6
+                and not allow_modify_flows and logspace_flows and not negate_pflows
+                and batch_size < 16 and self.block_size % 32 == 0 and B_NUM_TILES == 1
+                and node_flows.is_cuda and cuda_kernels.smallbatch_par_is_available()
+                and self._par_flow_collision_free(pfids)):
+            n_cfg = len(cuda_kernels.smallbatch_par_configs())
+
+            def _cuda_par_sb(tgt, cfg):
+                cuda_kernels.smallbatch_par_backward_sum(
+                    tgt, node_flows, node_mars, element_mars, params, nids, cids, pids, pfids,
+                    batch_size, self.block_size, num_edges, cfg)
+
+            def _triton_par_sb(tgt):
+                bk_par_sparse._bk_triton_sparse_par_kernel[grid](
+                    node_flows = node_flows, node_mars = node_mars, element_mars = element_mars,
+                    mparams = params, param_flows = tgt, nids = nids, cids = cids, pids = pids, pfids = pfids,
+                    pid_m_offset = 0, num_edges = num_edges, batch_size = batch_size,
+                    allow_modify_flows = allow_modify_flows, logspace_flows = logspace_flows,
+                    BLOCK_M = BLOCK_M, BLOCK_K = BLOCK_K, BLOCK_B = BLOCK_B, TILE_SIZE_B = TILE_SIZE_B,
+                    B_NUM_BLOCKS = B_NUM_BLOCKS, propagation_alg_id = propagation_alg_id,
+                    negate_pflows = negate_pflows, **propagation_alg_kwargs)
+
+            choice_key = (id(pfids), batch_size)
+            choice = self._cached_bk_par_sparse_choice.get(choice_key)
+            if choice is None:
+                # autotune into a SCRATCH clone (corruption-safe); the live param_flows is touched only
+                # by the single real run below.
+                if (self._bk_par_scratch is None or self._bk_par_scratch.shape != param_flows.shape
+                        or self._bk_par_scratch.dtype != param_flows.dtype):
+                    self._bk_par_scratch = torch.empty_like(param_flows)
+                scr = self._bk_par_scratch
+                cands = [(("cuda", cfg), (lambda cfg = cfg: _cuda_par_sb(scr, cfg))) for cfg in range(n_cfg)]
+                cands.append((("triton", -1), (lambda: _triton_par_sb(scr))))
+                choice = cuda_kernels.autotune(cands) or ("triton", -1)
+                self._cached_bk_par_sparse_choice[choice_key] = choice
+            if choice[0] == "cuda":
+                _cuda_par_sb(param_flows, choice[1])
+                return None
+            # choice == ("triton", -1): fall through to the Triton launch below
 
         # Triton seems to produce wrong results when using a (1, 1, 1) grid with BLOCK_B = 1 or 2...
         # if grid[0] == 1 and grid[1] == 1 and grid[2] == 1 and BLOCK_B < 4:
