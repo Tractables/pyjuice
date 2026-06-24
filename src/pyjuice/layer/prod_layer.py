@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+import os
 import torch
 import torch.nn as nn
 import triton
 import warnings
 import time
 from typing import Sequence, Optional
+
+# Small-batch (batch < 16) node-tile cap for the 2D product kernel. The default BLOCK_M heuristic
+# targets a fixed ~2048-element tile, which at tiny batch balloons BLOCK_M up to `block_size` -- one
+# serial program per node-block (~1 SM busy). Capping BLOCK_M fans the node dimension across many
+# programs to fill the SMs (the kernel walks BLOCK_M nodes serially, so this is pure tiling and leaves
+# results bit-identical). Env-overridable for tuning.
+_SMALL_BATCH_PROD_TILE_M = int(os.environ.get("PYJUICE_SB_PROD_TM", 8))
 
 from pyjuice.nodes import ProdNodes
 from pyjuice.utils.parameter_list import FastParamList
@@ -299,6 +307,11 @@ class ProdLayer(Layer, nn.Module):
 
             BLOCK_B = min(2048 // num_edges, triton.next_power_of_2(batch_size))
             BLOCK_M = min(max(2048 // (BLOCK_B * num_edges), 1), self.block_size)
+
+            # Small-batch: cap BLOCK_M so the node dimension fans out across many programs (one serial
+            # program per node-block otherwise leaves ~1 SM busy). Pure tiling -> bit-identical.
+            if batch_size < 16:
+                BLOCK_M = min(BLOCK_M, _SMALL_BATCH_PROD_TILE_M)
 
             grid = (triton.cdiv(n_nblocks * self.block_size, BLOCK_M), triton.cdiv(batch_size, BLOCK_B))
 
