@@ -36,7 +36,14 @@ _ele_module = None      # element-flow backward
 _ele_attempted = False
 _par_module = None      # parameter-flow backward
 _par_attempted = False
+_sbfw_module = None     # small-batch (batch<16) forward
+_sbfw_attempted = False
+_sbele_module = None    # small-batch (batch<16) element-flow backward
+_sbele_attempted = False
+_sbpar_module = None    # small-batch (batch<16) parameter-flow backward
+_sbpar_attempted = False
 _flags_cache = "unset"  # cached (cuda_cflags, ldflags) or None; computed once
+_plain_flags_cache = "unset"  # cached plain (no-CUTLASS) cuda_cflags or None
 
 
 def _find_cutlass_include() -> Optional[str]:
@@ -111,6 +118,38 @@ def _compile_flags():
     return _flags_cache
 
 
+def _plain_compile_flags():
+    """Flags for a PLAIN CUDA kernel (no CuTe/TMA/CUTLASS, no driver API). Unlike `_compile_flags`
+    this needs neither CUTLASS nor sm_90 -- it works on any CUDA GPU -- so the small-batch forward
+    fast path is usable far more broadly than the CuTe kernels. Computed once and cached."""
+    global _plain_flags_cache
+    if _plain_flags_cache != "unset":
+        return _plain_flags_cache
+    _plain_flags_cache = None
+    if not ENABLE_CUDA_KERNELS or not torch.cuda.is_available():
+        return None
+    cc = torch.cuda.get_device_capability()
+    # Plain arch (no `a` suffix): the kernel uses only ordinary CUDA, so no arch-specific features.
+    _plain_flags_cache = ["-O3", f"-arch=sm_{cc[0]}{cc[1]}", "--use_fast_math", "-DNDEBUG"]
+    return _plain_flags_cache
+
+
+def _jit_plain(name: str, source_file: str):
+    """JIT-compile a plain-CUDA .cu (no CUTLASS) into a loaded module, or None (warns once)."""
+    flags = _plain_compile_flags()
+    if flags is None:
+        return None
+    from torch.utils.cpp_extension import load
+    try:
+        return load(name=name, sources=[os.path.join(_THIS_DIR, source_file)],
+                    extra_cuda_cflags=flags, verbose=False)
+    except Exception as e:
+        warnings.warn(
+            f"pyjuice CUDA kernel '{name}' failed to compile ({type(e).__name__}: {e}). "
+            "Falling back to the Triton kernels.", RuntimeWarning)
+        return None
+
+
 def _jit(name: str, source_file: str):
     """JIT-compile one .cu into a loaded module, or None (warns once on failure)."""
     fl = _compile_flags()
@@ -153,6 +192,104 @@ def par_is_available() -> bool:
         _par_attempted = True
         _par_module = _jit("pyjuice_sum_backward_par_cuda", "par_backward_sum.cu")
     return _par_module is not None
+
+
+def smallbatch_fw_is_available() -> bool:
+    """Whether the small-batch (batch<16) CUDA forward kernel is usable (lazily JIT-compiles once).
+    Plain CUDA, so it needs no CUTLASS and no sm_90 -- only nvcc + a CUDA GPU."""
+    global _sbfw_module, _sbfw_attempted
+    if not _sbfw_attempted:
+        _sbfw_attempted = True
+        _sbfw_module = _jit_plain("pyjuice_sum_forward_smallbatch_cuda", "smallbatch_forward_sum.cu")
+    return _sbfw_module is not None
+
+
+def smallbatch_forward_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor,
+                           nids: torch.Tensor, ebase: torch.Tensor, pbase: torch.Tensor,
+                           batch_size: int, block_size: int, num_edges: int, cfg: int = 0) -> None:
+    """Small-batch block-sparse sum-layer forward (in-place into ``node_mars``) using SPLIT config
+    ``cfg``. Caller must guarantee the dispatch conditions hold (see ``smallbatch_fw_is_available``
+    + the small-batch gate in ``sum_layer._forward_block_sparse``): block_size a multiple of 32,
+    contiguous children + block_size-strided params, LL propagation."""
+    _sbfw_module.smallbatch_forward_sum(node_mars, element_mars, params, nids, ebase, pbase,
+                                        int(batch_size), int(block_size), int(num_edges), int(cfg))
+
+
+_sbfw_cfg_cache = None
+def smallbatch_fw_configs():
+    """List of SPLIT values per config id (index = the ``cfg`` arg). Memoized (constant) -- the value
+    is queried per layer per step in the dispatch, so it must not re-enter the pybind module."""
+    global _sbfw_cfg_cache
+    if _sbfw_cfg_cache is None:
+        _sbfw_cfg_cache = [int(c) for c in _sbfw_module.smallbatch_fw_configs()] if smallbatch_fw_is_available() else []
+    return _sbfw_cfg_cache
+
+
+def smallbatch_ele_is_available() -> bool:
+    """Whether the small-batch (batch<16) CUDA element-flow backward kernel is usable (lazily
+    JIT-compiles once). Plain CUDA, so it needs no CUTLASS and no sm_90 -- only nvcc + a CUDA GPU."""
+    global _sbele_module, _sbele_attempted
+    if not _sbele_attempted:
+        _sbele_attempted = True
+        _sbele_module = _jit_plain("pyjuice_sum_backward_ele_smallbatch_cuda", "smallbatch_ele_backward.cu")
+    return _sbele_module is not None
+
+
+def smallbatch_ele_backward_sum(element_flows: torch.Tensor, element_mars: torch.Tensor,
+                                node_flows: torch.Tensor, node_mars: torch.Tensor, params: torch.Tensor,
+                                chids: torch.Tensor, ebase: torch.Tensor, pbase: torch.Tensor,
+                                batch_size: int, block_size: int, cs_block_size: int, num_edges: int,
+                                cfg: int = 0) -> None:
+    """Small-batch block-sparse sum-layer element-flow backward (overwrites ``element_flows``) using
+    WARPS config ``cfg``. Caller must guarantee the dispatch conditions hold (see
+    ``smallbatch_ele_is_available`` + the small-batch gate in
+    ``sum_layer._backward_block_sparse_ele_flows``): contiguous parents + edge-contiguous params (the
+    verified global-contiguity layout), LL propagation, ``allow_modify_flows`` off."""
+    _sbele_module.smallbatch_ele_backward_sum(element_flows, element_mars, node_flows, node_mars, params,
+                                              chids, ebase, pbase, int(batch_size), int(block_size),
+                                              int(cs_block_size), int(num_edges), int(cfg))
+
+
+_sbele_cfg_cache = None
+def smallbatch_ele_configs():
+    """List of WARPS values per config id (index = the ``cfg`` arg). Memoized (queried per layer/step)."""
+    global _sbele_cfg_cache
+    if _sbele_cfg_cache is None:
+        _sbele_cfg_cache = [int(c) for c in _sbele_module.smallbatch_ele_configs()] if smallbatch_ele_is_available() else []
+    return _sbele_cfg_cache
+
+
+def smallbatch_par_is_available() -> bool:
+    """Whether the small-batch (batch<16) CUDA parameter-flow backward kernel is usable (lazily
+    JIT-compiles once). Plain CUDA, so it needs no CUTLASS and no sm_90 -- only nvcc + a CUDA GPU."""
+    global _sbpar_module, _sbpar_attempted
+    if not _sbpar_attempted:
+        _sbpar_attempted = True
+        _sbpar_module = _jit_plain("pyjuice_sum_backward_par_smallbatch_cuda", "smallbatch_par_backward.cu")
+    return _sbpar_module is not None
+
+
+def smallbatch_par_backward_sum(param_flows: torch.Tensor, node_flows: torch.Tensor, node_mars: torch.Tensor,
+                                element_mars: torch.Tensor, params: torch.Tensor, nids: torch.Tensor,
+                                cids: torch.Tensor, pids: torch.Tensor, pfids: torch.Tensor,
+                                batch_size: int, block_size: int, num_edges: int, cfg: int = 0) -> None:
+    """Small-batch sparse sum-layer parameter-flow backward (accumulates into ``param_flows`` via a
+    collision-free read-add-store) using EY config ``cfg``. Caller must guarantee the dispatch
+    conditions hold (see ``smallbatch_par_is_available`` + the small-batch gate in
+    ``sum_layer._backward_sparse_par_flows``): LL, logspace flows, allow_modify_flows / negate off,
+    a single batch tile, collision-free (untied) flows, block_size a multiple of 32."""
+    _sbpar_module.smallbatch_par_backward_sum(param_flows, node_flows, node_mars, element_mars, params,
+                                              nids, cids, pids, pfids, int(batch_size), int(block_size),
+                                              int(num_edges), int(cfg))
+
+
+_sbpar_cfg_cache = None
+def smallbatch_par_configs():
+    """List of EY values per config id (index = the ``cfg`` arg). Memoized (queried per layer/step)."""
+    global _sbpar_cfg_cache
+    if _sbpar_cfg_cache is None:
+        _sbpar_cfg_cache = [int(c) for c in _sbpar_module.smallbatch_par_configs()] if smallbatch_par_is_available() else []
+    return _sbpar_cfg_cache
 
 
 def par_backward_sum(param_flows: torch.Tensor, node_flows: torch.Tensor, node_mars: torch.Tensor,

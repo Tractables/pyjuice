@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 
+import os
 import torch
 import torch.nn as nn
 import triton
@@ -90,6 +91,29 @@ FORWARD_SUM_TUNED = True
 # unsupported layer shape, it transparently falls back to the Triton kernel. Set False to disable.
 FORWARD_SUM_CUDA = True
 from .kernels import c as cuda_kernels
+
+# Node-tile sizes for the small-batch (batch < 16) block-sparse path. At tiny batch the GPU is
+# filled by splitting the *node* dimension into many tiles (the batch dimension is too short to
+# provide parallelism), so these are deliberately small. Tuned on an RTX PRO 6000; overridable via
+# env for experimentation.
+_SMALL_BATCH_FW_TILE_M = int(os.environ.get("PYJUICE_SB_FW_TM", 8))
+_SMALL_BATCH_ELE_TILE_M = int(os.environ.get("PYJUICE_SB_ELE_TM", 8))
+# Small-batch node-tile cap for the SPARSE element-flow backward kernel (block_size==1 / small-edge
+# layers that miss the block-sparse path, e.g. HMM passthrough layers). The sparse kernel otherwise
+# sets BLOCK_M = cs_block_size -> one serial program per node-block (~1 SM busy); capping it fans the
+# node dimension across many programs. Pure tiling -> bit-identical. Tunable via env.
+_SMALL_BATCH_SPARSE_TILE_M = int(os.environ.get("PYJUICE_SB_SPARSE_TM", 8))
+# Gap-batch (16 <= batch < `_GAP_BATCH_MAX`) handling. Below batch 16 the small-batch tiling fires;
+# the >=16 block-sparse / >=64-aligned CUDA paths only fully fill the SMs at larger batch. In the gap
+# the budget heuristics balloon the tile sizes -> too few programs (e.g. the par kernel gets ~8 blocks
+# at batch=16). For the parameter-flow kernel, shrinking the OUTPUT-COLUMN tile `TILE_SIZE_K` adds
+# programs WITHOUT changing the bitwise result (only `TILE_SIZE_M` sets the max-stabilization group).
+_GAP_BATCH_MAX = int(os.environ.get("PYJUICE_GAP_BATCH_MAX", 64))
+_SMALL_BATCH_PAR_TILE_K = int(os.environ.get("PYJUICE_SB_PAR_TK", 16))
+# Minimum block size for the small-batch (batch < 16) block-sparse path. Below this the sparse
+# kernel is actually faster (its lower launch/tiling overhead beats the node-tiling parallelism when
+# the node dimension is small) -- measured crossover is ~128 on an RTX PRO 6000. Tunable via env.
+_SMALL_BATCH_MIN_BLOCK_SIZE = int(os.environ.get("PYJUICE_SB_MIN_BS", 128))
 
 
 class SumLayer(Layer, nn.Module):
@@ -187,6 +211,10 @@ class SumLayer(Layer, nn.Module):
         # Per-signature autotuned dispatch choice: ("cuda", cfg_id) or ("triton", -1). Decided once
         # by benchmarking the valid CUDA tile configs against Triton for this layer's shape.
         self._cached_fw_cuda_choice = dict()
+        # Small-batch (batch<16) forward CUDA fast path: per-signature (sb_ebase, sb_pbase, sb_ok),
+        # where sb_ebase/sb_pbase are the per-node-block first child / first param and sb_ok records
+        # whether the layer's children are GLOBALLY contiguous + params block_size-strided.
+        self._cached_fw_sb = dict()
 
         # Layer info
         self._layer_nid_range = (layer_nid_start, layer_nid_start + self.num_nodes)
@@ -273,6 +301,7 @@ class SumLayer(Layer, nn.Module):
         # batch) autotuned choice, and a reused scratch output buffer for corruption-safe autotuning.
         self._cached_bk_ele_cuda = dict()
         self._cached_bk_ele_choice = dict()
+        self._cached_bk_ele_sb = dict()
         self._bk_ele_scratch = None
 
         # Optional CUDA param-backward fast path: per-partition (nbase, cbase, pbase, fbase, cuda_ok),
@@ -280,6 +309,7 @@ class SumLayer(Layer, nn.Module):
         # corruption-safe autotuning (the kernel is read-accumulate-write).
         self._cached_bk_par_cuda = dict()
         self._cached_bk_par_choice = dict()
+        self._cached_bk_par_sparse_choice = dict()
         self._bk_par_scratch = None
 
     def to(self, device):
@@ -514,6 +544,12 @@ class SumLayer(Layer, nn.Module):
         elif params.dim() == 1 and self.block_size >= 16 and num_edges >= 16 and batch_size >= 16:
             # In this case, we should definitely use the block-sparse implementation
             mode = self.BLOCK_SPARSE
+        elif params.dim() == 1 and self.block_size >= _SMALL_BATCH_MIN_BLOCK_SIZE and num_edges >= 16:
+            # Small batch (< 16): the sparse kernel leaves the large node dimension un-tiled (one
+            # program per node block -> ~1 SM busy, >10x slowdown). For a large enough block size the
+            # block-sparse small-batch tiling is far faster; smaller blocks fall through to the sparse
+            # kernel below (its lower launch/tiling overhead wins there -- measured crossover ~128).
+            mode = self.BLOCK_SPARSE
         elif self.block_size == 1 or num_edges < 4:
             # In this case, we should definitely use the sparse implementation
             mode = self.SPARSE
@@ -592,20 +628,33 @@ class SumLayer(Layer, nn.Module):
             }
 
         # Heuristic to set `TILE_SIZE_M`, `TILE_SIZE_K`, and `BLOCK_B`
-        base_size = min(self.block_size, num_edges, BATCH_SIZE_NP2, 128)
-        if base_size >= 64:
-            TILE_SIZE_K = min(2048 // 32, num_edges)
+        if batch_size < 16 and self.block_size >= _SMALL_BATCH_MIN_BLOCK_SIZE:
+            # Small-batch path (the `else` below is the unchanged >=16 heuristic). That heuristic
+            # ties TILE_SIZE_K to BATCH_SIZE_NP2, which collapses to 1-2 huge node-tiles at tiny
+            # batch -> ~1 SM busy and a >10x slowdown. Instead keep a normal edge tile and split the
+            # node dimension into many small tiles (high SM occupancy); the batch is a short, masked
+            # inner dim (BLOCK_B = BATCH_SIZE_NP2 < 16 -> no tensor-core dot, full fp32).
+            TILE_SIZE_K = min(64, num_edges)
+            while num_edges % TILE_SIZE_K != 0:
+                TILE_SIZE_K //= 2
+            TILE_SIZE_M = min(_SMALL_BATCH_FW_TILE_M, self.block_size)
+            BLOCK_B = BATCH_SIZE_NP2
+            K_NUM_TILES = num_edges // TILE_SIZE_K
         else:
-            remainder = 2048 // (base_size ** 2)
-            TILE_SIZE_K = min(2048 // remainder, base_size * remainder, num_edges)
-        # Larger TILE_SIZE_M / BLOCK_B (bit-exact) amortize the per-m-tile recomputation of
-        # `emars_max` / `exp` / the `emars` load and the per-batch-tile `epars` load. Gated to the
-        # LL (non-tempered) regime that was validated bit-exact; auto-disabled on a prior OOM.
-        _fw_tile_cap = 4096 if (FORWARD_SUM_TUNED and not getattr(self, "_fw_tuning_oom", False)
-                                and propagation_alg_id == 0 and not pflow_tempered_enabled) else 2048
-        TILE_SIZE_M = min(_fw_tile_cap // TILE_SIZE_K, self.block_size)
-        BLOCK_B = min(_fw_tile_cap // TILE_SIZE_K, BATCH_SIZE_NP2)
-        K_NUM_TILES = num_edges // TILE_SIZE_K
+            base_size = min(self.block_size, num_edges, BATCH_SIZE_NP2, 128)
+            if base_size >= 64:
+                TILE_SIZE_K = min(2048 // 32, num_edges)
+            else:
+                remainder = 2048 // (base_size ** 2)
+                TILE_SIZE_K = min(2048 // remainder, base_size * remainder, num_edges)
+            # Larger TILE_SIZE_M / BLOCK_B (bit-exact) amortize the per-m-tile recomputation of
+            # `emars_max` / `exp` / the `emars` load and the per-batch-tile `epars` load. Gated to the
+            # LL (non-tempered) regime that was validated bit-exact; auto-disabled on a prior OOM.
+            _fw_tile_cap = 4096 if (FORWARD_SUM_TUNED and not getattr(self, "_fw_tuning_oom", False)
+                                    and propagation_alg_id == 0 and not pflow_tempered_enabled) else 2048
+            TILE_SIZE_M = min(_fw_tile_cap // TILE_SIZE_K, self.block_size)
+            BLOCK_B = min(_fw_tile_cap // TILE_SIZE_K, BATCH_SIZE_NP2)
+            K_NUM_TILES = num_edges // TILE_SIZE_K
 
         assert TILE_SIZE_K >= 4, f"`TILE_SIZE_K` should be greater than 4 (but got {TILE_SIZE_K}) in order to use the block-sparse kernel. " \
                                   "This is an internal error of PyJuice. Please consider checking the kernel dispatching criterions and use the " \
@@ -712,7 +761,69 @@ class SumLayer(Layer, nn.Module):
                         batch_size, self.block_size, K_NUM_TILES, choice[1])
                     return None
                 # choice == ("triton", -1): fall through to the Triton launch below
-        
+
+        # Small-batch (batch < 16) CUDA fast path. The big-block sparse/block-sparse Triton kernels
+        # under-tile the node dimension at tiny batch; this plain-CUDA kernel (32-node coalesced
+        # warps + edge-split online-logsumexp, numerically equivalent ~1.5e-6) is faster. Gated to the
+        # same regime as the small-batch tiling heuristic above (batch<16, block_size>=128), LL, no
+        # tempering / partial-eval, contiguous layout. Autotuned vs the Triton small-batch launch and
+        # only used when it wins; otherwise falls through to the Triton launch below.
+        if (FORWARD_SUM_CUDA and batch_size < 16 and self.block_size >= _SMALL_BATCH_MIN_BLOCK_SIZE
+                and propagation_alg_id == 0 and not pflow_tempered_enabled and local_ids is None
+                and node_mars.is_cuda and cuda_kernels.smallbatch_fw_is_available()):
+            sb = self._cached_fw_sb.get(signature)
+            if sb is None:
+                # Derive per-node-block first child / first param (column 0 of the cached per-tile
+                # ebase/pbase) and verify GLOBAL contiguity: children step by 1 across edges and by
+                # TILE_SIZE_K across tiles; params block_size-strided across edges. cuda_ok already
+                # checked within-tile contiguity; here we also require the tiles to chain globally.
+                ebase_t, pbase_t, cuda_ok = self._cached_fw_cuda[signature]
+                _art = torch.arange(K_NUM_TILES, device=ebase_t.device, dtype=torch.int64).view(1, -1)
+                sb_ok = bool(cuda_ok
+                             and torch.equal(ebase_t, ebase_t[:, :1] + _art * TILE_SIZE_K)
+                             and torch.equal(pbase_t, pbase_t[:, :1] + _art * (TILE_SIZE_K * self.block_size)))
+                sb = (ebase_t[:, 0].contiguous(), pbase_t[:, 0].contiguous(), sb_ok)
+                self._cached_fw_sb[signature] = sb
+            sb_ebase, sb_pbase, sb_ok = sb
+            if sb_ok:
+                n_sb_cfg = len(cuda_kernels.smallbatch_fw_configs())
+                choice_key = (signature, batch_size, "sb")
+                choice = self._cached_fw_cuda_choice.get(choice_key)
+                if choice is None:
+                    # Autotune the CUDA SPLIT configs against the Triton small-batch launch (csmm1/2,
+                    # whichever this tile shape selects -- mirrors the fall-through below). Every
+                    # candidate overwrites node_mars with the same result, so it stays correct.
+                    cands = [(("cuda", c), (lambda c=c: cuda_kernels.smallbatch_forward_sum(
+                                node_mars, element_mars, params, nids, sb_ebase, sb_pbase,
+                                batch_size, self.block_size, num_edges, c)))
+                             for c in range(n_sb_cfg)]
+
+                    def _triton_sb_cand():
+                        sb_kern = (fw_bsparse._fw_triton_block_sparse_csmm1_kernel
+                                   if (TILE_SIZE_M >= 8 and TILE_SIZE_K >= 8 and BLOCK_B >= 8)
+                                   else fw_bsparse._fw_triton_block_sparse_csmm2_kernel)
+                        for s in range(0, grid[1], 32768):
+                            cg = (grid[0], min(s + 32768, grid[1]) - s)
+                            sb_kern[cg](
+                                node_mars, element_mars, params, nids, cids_start, cids_increment,
+                                pids_start, pids_increment, local_ids, batch_size,
+                                partial_eval = partial_eval, BLOCK_B = BLOCK_B,
+                                TILE_SIZE_K = TILE_SIZE_K, K_NUM_TILES = K_NUM_TILES,
+                                TILE_SIZE_M = TILE_SIZE_M, BLOCK_SIZE_M = BLOCK_SIZE_M,
+                                use_bf16 = use_bf16, propagation_alg_id = propagation_alg_id,
+                                pflow_tempered_enabled = pflow_tempered_enabled, pid_m_offset = s,
+                                **propagation_alg_kwargs, **pflow_tempered_kwargs, num_stages = 1)
+                    cands.append((("triton", -1), _triton_sb_cand))
+                    choice = cuda_kernels.autotune(cands) or ("triton", -1)
+                    self._cached_fw_cuda_choice[choice_key] = choice
+
+                if choice[0] == "cuda":
+                    cuda_kernels.smallbatch_forward_sum(
+                        node_mars, element_mars, params, nids, sb_ebase, sb_pbase,
+                        batch_size, self.block_size, num_edges, choice[1])
+                    return None
+                # choice == ("triton", -1): fall through to the Triton launch below
+
         # OOM-safe tuned launch: if the larger tuned tiles exceed this GPU's shared-memory/
         # register budget, fall back to the default configuration (recompiled untuned).
         try:
@@ -1039,6 +1150,11 @@ class SumLayer(Layer, nn.Module):
         elif params.dim() == 1 and self.block_size >= 16 and num_edges >= 16 and batch_size >= 16:
             # In this case, we should definitely use the block-sparse implementation
             mode = self.BLOCK_SPARSE
+        elif params.dim() == 1 and self.block_size >= _SMALL_BATCH_MIN_BLOCK_SIZE and num_edges >= 16:
+            # Small batch (< 16) with a large block size: the sparse element-flow kernel leaves the
+            # large node dimension un-tiled (~1 SM busy, >10x slowdown). The block-sparse small-batch
+            # tiling is far faster here; smaller blocks fall through to the sparse kernel below.
+            mode = self.BLOCK_SPARSE
         elif cs_block_size == 1 or self.block_size == 1:
             # In this case, we should definitely use the sparse implementation
             mode = self.SPARSE
@@ -1209,17 +1325,33 @@ class SumLayer(Layer, nn.Module):
 
         # Flows w.r.t. parameters
         if param_flows is not None and nids is not None:
-            self._backward_block_sparse_par_flows(
-                node_flows, params, node_mars, element_mars, param_flows,
-                nids = nids, cids = cids, pids = pids, pfids = pfids,
-                allow_modify_flows = allow_modify_flows,
-                propagation_alg = propagation_alg, 
-                logspace_flows = logspace_flows,
-                negate_pflows = negate_pflows,
-                allow_neg_flows = allow_neg_flows,
-                force_use_fp32 = force_use_fp32,
-                pflow_temperature = pflow_temperature, **kwargs
-            )
+            if node_flows.size(1) < 16:
+                # The block-sparse parameter-flow kernel contracts the batch dimension into
+                # `B_NUM_TILES = batch_size // TILE_SIZE_B` tiles; for batch < 16 that is 0 whenever
+                # batch < TILE_SIZE_B (incl. all batch < 4, which also fail its TILE_SIZE_B >= 4
+                # assert), silently dropping the param flows. The sparse parameter-flow kernel handles
+                # any batch correctly and is already a tiny fraction of the backward, so use it here.
+                self._backward_sparse_par_flows(
+                    node_flows, params, node_mars, element_mars, param_flows,
+                    nids = nids, cids = cids, pids = pids, pfids = pfids,
+                    allow_modify_flows = allow_modify_flows,
+                    propagation_alg = propagation_alg,
+                    logspace_flows = logspace_flows,
+                    negate_pflows = negate_pflows,
+                    pflow_temperature = pflow_temperature, **kwargs
+                )
+            else:
+                self._backward_block_sparse_par_flows(
+                    node_flows, params, node_mars, element_mars, param_flows,
+                    nids = nids, cids = cids, pids = pids, pfids = pfids,
+                    allow_modify_flows = allow_modify_flows,
+                    propagation_alg = propagation_alg,
+                    logspace_flows = logspace_flows,
+                    negate_pflows = negate_pflows,
+                    allow_neg_flows = allow_neg_flows,
+                    force_use_fp32 = force_use_fp32,
+                    pflow_temperature = pflow_temperature, **kwargs
+                )
 
         return None
 
@@ -1245,15 +1377,26 @@ class SumLayer(Layer, nn.Module):
         propagation_alg_kwargs = self._get_propagation_alg_kwargs(propagation_alg, **kwargs)
 
         # Heuristic to set `TILE_SIZE_M`, `TILE_SIZE_K`, and `BLOCK_B`
-        base_size = min(self.block_size, num_edges, BATCH_SIZE_NP2, 64)
-        if base_size >= 64:
-            TILE_SIZE_K = min(2048 // 32, num_edges)
+        if batch_size < 16 and self.block_size >= _SMALL_BATCH_MIN_BLOCK_SIZE:
+            # Small-batch path (mirrors the forward; the `else` is the unchanged >=16 heuristic). Keep
+            # a normal edge tile and split the child-node dimension into many small tiles for high SM
+            # occupancy; the batch is a short masked inner dim (no tensor-core dot).
+            TILE_SIZE_K = min(64, num_edges)
+            while num_edges % TILE_SIZE_K != 0:
+                TILE_SIZE_K //= 2
+            TILE_SIZE_M = min(_SMALL_BATCH_ELE_TILE_M, cs_block_size)
+            BLOCK_B = BATCH_SIZE_NP2
+            K_NUM_TILES = num_edges // TILE_SIZE_K
         else:
-            remainder = 2048 // (base_size ** 2)
-            TILE_SIZE_K = min(512, base_size * remainder, num_edges)
-        TILE_SIZE_M = min(2048 // TILE_SIZE_K, cs_block_size)
-        BLOCK_B = min(2048 // TILE_SIZE_K, BATCH_SIZE_NP2)
-        K_NUM_TILES = num_edges // TILE_SIZE_K
+            base_size = min(self.block_size, num_edges, BATCH_SIZE_NP2, 64)
+            if base_size >= 64:
+                TILE_SIZE_K = min(2048 // 32, num_edges)
+            else:
+                remainder = 2048 // (base_size ** 2)
+                TILE_SIZE_K = min(512, base_size * remainder, num_edges)
+            TILE_SIZE_M = min(2048 // TILE_SIZE_K, cs_block_size)
+            BLOCK_B = min(2048 // TILE_SIZE_K, BATCH_SIZE_NP2)
+            K_NUM_TILES = num_edges // TILE_SIZE_K
 
         assert TILE_SIZE_K >= 4, f"`TILE_SIZE_K` should be greater than 4 (but got {TILE_SIZE_K}) in order to use the block-sparse kernel. " \
                                   "This is an internal error of PyJuice. Please consider checking the kernel dispatching criterions and use the " \
@@ -1383,6 +1526,79 @@ class SumLayer(Layer, nn.Module):
                     self._cached_bk_ele_choice[choice_key] = choice
                 if choice[0] == "cuda":
                     _cuda_ele(element_flows)
+                    return None
+                # choice == ("triton", -1): fall through to the Triton launch below
+
+        # Small-batch (batch < 16) CUDA element-flow backward. The block-sparse Triton kernel (csmm2)
+        # under-tiles the node dimension at tiny batch; this plain-CUDA kernel gives each child node
+        # its own warp and streams its flows directly from global -- no shared staging, no barrier
+        # (a component ablation showed the staged variant spent ~88% of its time in that barrier),
+        # numerically equivalent ~3e-6. Gated to the same regime as the small-batch tiling heuristic
+        # above (batch<16, block_size>=128), LL, no tempering/partial-eval, contiguous layout, and
+        # allow_modify_flows / allow_neg_flows / accumulate_ch_flows off. Autotuned vs the Triton
+        # small-batch launch INTO A SCRATCH buffer (corruption-safe: the live element_flows is touched
+        # only by the single real run below); used only when it wins, else falls through to Triton.
+        if (BACKWARD_ELE_FLOW_CUDA and batch_size < 16 and self.block_size >= _SMALL_BATCH_MIN_BLOCK_SIZE
+                and propagation_alg_id == 0 and abs(eflow_temperature - 1.0) < 1e-6
+                and allow_modify_flows == 0 and logspace_flows and not allow_neg_flows
+                and not accumulate_ch_flows and local_ids is None and not force_use_fp32
+                and num_edges % TILE_SIZE_K == 0 and cs_block_size % 32 == 0
+                and node_flows.is_cuda and cuda_kernels.smallbatch_ele_is_available()):
+            sb = self._cached_bk_ele_sb.get(signature)
+            if sb is None:
+                # Per-node-block first parent / first param (column 0 of the cached per-tile
+                # ebase/pbase) and verify GLOBAL contiguity: parents step by 1 across edges and by
+                # TILE_SIZE_K across tiles; per-child params are edge-contiguous (the pbase steps by
+                # TILE_SIZE_K across tiles). cuda_ok already checked within-tile contiguity; here we
+                # also require the tiles to chain globally.
+                ele_ebase, ele_pbase, cuda_ok = self._cached_bk_ele_cuda[signature]
+                _art = torch.arange(K_NUM_TILES, device = ele_ebase.device, dtype = torch.int64).view(1, -1)
+                sb_ok = bool(cuda_ok
+                             and torch.equal(ele_ebase, ele_ebase[:, :1] + _art * TILE_SIZE_K)
+                             and torch.equal(ele_pbase, ele_pbase[:, :1] + _art * TILE_SIZE_K))
+                sb = (ele_ebase[:, 0].contiguous(), ele_pbase[:, 0].contiguous(), sb_ok)
+                self._cached_bk_ele_sb[signature] = sb
+            sb_ebase, sb_pbase, sb_ok = sb
+            if sb_ok:
+                n_sb_cfg = len(cuda_kernels.smallbatch_ele_configs())
+
+                def _cuda_ele_sb(tgt, c):
+                    cuda_kernels.smallbatch_ele_backward_sum(
+                        tgt, element_mars, node_flows, node_mars, params, chids, sb_ebase, sb_pbase,
+                        batch_size, self.block_size, cs_block_size, num_edges, c)
+
+                def _triton_ele_sb(tgt):
+                    for s in range(0, grid[1], 32768):
+                        cg = (grid[0], min(s + 32768, grid[1]) - s)
+                        bk_ele_bsparse._bk_triton_block_sparse_ele_csmm2_kernel[cg](
+                            node_flows = node_flows, element_flows = tgt, node_mars = node_mars,
+                            element_mars = element_mars, mparams = params, chids = chids,
+                            parids_start = parids_start, parids_increment = parids_increment,
+                            parpids_start = parpids_start, parpids_increment = parpids_increment,
+                            local_ids = local_ids, batch_size = batch_size, partial_eval = partial_eval,
+                            ptr_inc_step = ptr_inc_step, allow_modify_flows = allow_modify_flows,
+                            logspace_flows = logspace_flows, BLOCK_B = BLOCK_B, TILE_SIZE_K = TILE_SIZE_K,
+                            K_NUM_TILES = K_NUM_TILES, TILE_SIZE_M = TILE_SIZE_M,
+                            BLOCK_SIZE_M = BLOCK_SIZE_M, BLOCK_SIZE_K = BLOCK_SIZE_K, TL_DOT = TL_DOT,
+                            num_stages = 1, propagation_alg_id = propagation_alg_id,
+                            accumulate_ch_flows = accumulate_ch_flows, allow_neg_flows = allow_neg_flows,
+                            pid_m_offset = s, **propagation_alg_kwargs)
+
+                choice_key = (signature, batch_size, "sb")
+                choice = self._cached_bk_ele_choice.get(choice_key)
+                if choice is None:
+                    # autotune into a SCRATCH clone (corruption-safe); the live element_flows is
+                    # touched only by the single real run below.
+                    if (self._bk_ele_scratch is None or self._bk_ele_scratch.shape != element_flows.shape
+                            or self._bk_ele_scratch.dtype != element_flows.dtype):
+                        self._bk_ele_scratch = torch.empty_like(element_flows)
+                    scr = self._bk_ele_scratch
+                    cands = [(("cuda", c), (lambda c = c: _cuda_ele_sb(scr, c))) for c in range(n_sb_cfg)]
+                    cands.append((("triton", -1), (lambda: _triton_ele_sb(scr))))
+                    choice = cuda_kernels.autotune(cands) or ("triton", -1)
+                    self._cached_bk_ele_choice[choice_key] = choice
+                if choice[0] == "cuda":
+                    _cuda_ele_sb(element_flows, choice[1])
                     return None
                 # choice == ("triton", -1): fall through to the Triton launch below
 
@@ -1618,12 +1834,23 @@ class SumLayer(Layer, nn.Module):
         par_kernel_extra = {}
         if BACKWARD_PAR_FLOW_TUNED and not getattr(self, "_par_tuning_oom", False) \
                 and TL_DOT == 1 and propagation_alg_id == 0 \
-                and abs(pflow_temperature - 1.0) < 1e-6 and num_edges >= 2 * TILE_SIZE_K:
+                and abs(pflow_temperature - 1.0) < 1e-6 and num_edges >= 2 * TILE_SIZE_K \
+                and batch_size >= _GAP_BATCH_MAX:
+            # Large-batch tuning: double TILE_SIZE_K (halves redundant node_mars/node_flows reads) and
+            # use a smaller batch tile + num_warps=8. Restricted to batch >= `_GAP_BATCH_MAX` because
+            # at gap batch it shrinks the grid (fewer edge tiles) and worsens the under-tiling.
             TILE_SIZE_K = 2 * TILE_SIZE_K
             if TILE_SIZE_B > 32 and batch_size % 32 == 0:
                 TILE_SIZE_B = 32
                 B_NUM_TILES = batch_size // TILE_SIZE_B
             par_kernel_extra["num_warps"] = 8
+        elif batch_size < _GAP_BATCH_MAX and TILE_SIZE_K > _SMALL_BATCH_PAR_TILE_K:
+            # Gap batch (e.g. batch=16, not 64-aligned so the CUDA par is unavailable): the budget
+            # heuristic balloons TILE_SIZE_K -> ~8 programs (~1 SM). Shrink the OUTPUT-COLUMN tile so
+            # the edge dimension fans across more programs. TILE_SIZE_K only tiles outputs and does NOT
+            # change the per-element result (TILE_SIZE_M -- the max-stabilization group -- is left
+            # untouched), so this is bit-identical.
+            TILE_SIZE_K = _SMALL_BATCH_PAR_TILE_K
 
         grid = (triton.cdiv(num_edges, TILE_SIZE_K), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
 
@@ -1928,13 +2155,24 @@ class SumLayer(Layer, nn.Module):
 
             if abs(eflow_temperature - 1.0) < 1e-6:
 
-                bk_ele_sparse._bk_triton_sparse_ele_kernel[grid](
-                    node_flows = node_flows, 
-                    element_flows = element_flows, 
-                    node_mars = node_mars, 
-                    element_mars = element_mars, 
-                    mparams = params, 
-                    chids = chids, 
+                # Small-batch: cap BLOCK_M so each node-block is split into many tiles/programs
+                # (otherwise one serial program per node-block -> ~1 SM busy). Pure tiling ->
+                # bit-identical (the tempered branch below keeps BLOCK_M = cs_block_size).
+                ele_BLOCK_M = BLOCK_M
+                if batch_size < _GAP_BATCH_MAX:
+                    ele_BLOCK_M = min(ele_BLOCK_M, _SMALL_BATCH_SPARSE_TILE_M)
+                    while cs_block_size % ele_BLOCK_M != 0:
+                        ele_BLOCK_M //= 2
+                TILES_PER_BLOCK = cs_block_size // ele_BLOCK_M
+                ele_grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, ele_BLOCK_M))
+
+                bk_ele_sparse._bk_triton_sparse_ele_kernel[ele_grid](
+                    node_flows = node_flows,
+                    element_flows = element_flows,
+                    node_mars = node_mars,
+                    element_mars = element_mars,
+                    mparams = params,
+                    chids = chids,
                     parids = parids,
                     parpids = parpids,
                     local_ids = local_ids,
@@ -1944,8 +2182,9 @@ class SumLayer(Layer, nn.Module):
                     allow_modify_flows = allow_modify_flows,
                     logspace_flows = logspace_flows,
                     BLOCK_B = BLOCK_B,
-                    BLOCK_M = BLOCK_M,
+                    BLOCK_M = ele_BLOCK_M,
                     BLOCK_SIZE_K = self.block_size,
+                    TILES_PER_BLOCK = TILES_PER_BLOCK,
                     propagation_alg_id = propagation_alg_id,
                     accumulate_ch_flows = accumulate_ch_flows,
                     **propagation_alg_kwargs
@@ -2157,6 +2396,54 @@ class SumLayer(Layer, nn.Module):
         allow_modify_flows = 1 if allow_modify_flows else 0
 
         grid = (B_NUM_TILES, K_NUM_BLOCKS, layer_n_nodes)
+
+        # Small-batch CUDA parameter-flow backward. The sparse Triton par re-reads the shared children
+        # per node; this plain-CUDA kernel uses a node-warp (coalesced node-contiguous param load/store,
+        # like the forward) with the edges split across the grid -- each (node,edge) flow is independent,
+        # so with a single batch tile + collision-free (untied) flows the write is a plain read-add-store
+        # (no atomics). ~2.5x over Triton, numerically equivalent (~4e-11). Gated to LL, logspace flows,
+        # allow_modify_flows / negate / tempering off, block_size a multiple of 32, small batch.
+        # Autotuned vs the Triton launch INTO A SCRATCH buffer (param_flows is read-accumulate-write);
+        # used only when it wins, else falls through to the Triton launch below.
+        if (BACKWARD_PAR_FLOW_CUDA and propagation_alg_id == 0 and abs(pflow_temperature - 1.0) < 1e-6
+                and not allow_modify_flows and logspace_flows and not negate_pflows
+                and batch_size < 16 and self.block_size % 32 == 0 and B_NUM_TILES == 1
+                and node_flows.is_cuda and cuda_kernels.smallbatch_par_is_available()
+                and self._par_flow_collision_free(pfids)):
+            n_cfg = len(cuda_kernels.smallbatch_par_configs())
+
+            def _cuda_par_sb(tgt, cfg):
+                cuda_kernels.smallbatch_par_backward_sum(
+                    tgt, node_flows, node_mars, element_mars, params, nids, cids, pids, pfids,
+                    batch_size, self.block_size, num_edges, cfg)
+
+            def _triton_par_sb(tgt):
+                bk_par_sparse._bk_triton_sparse_par_kernel[grid](
+                    node_flows = node_flows, node_mars = node_mars, element_mars = element_mars,
+                    mparams = params, param_flows = tgt, nids = nids, cids = cids, pids = pids, pfids = pfids,
+                    pid_m_offset = 0, num_edges = num_edges, batch_size = batch_size,
+                    allow_modify_flows = allow_modify_flows, logspace_flows = logspace_flows,
+                    BLOCK_M = BLOCK_M, BLOCK_K = BLOCK_K, BLOCK_B = BLOCK_B, TILE_SIZE_B = TILE_SIZE_B,
+                    B_NUM_BLOCKS = B_NUM_BLOCKS, propagation_alg_id = propagation_alg_id,
+                    negate_pflows = negate_pflows, **propagation_alg_kwargs)
+
+            choice_key = (id(pfids), batch_size)
+            choice = self._cached_bk_par_sparse_choice.get(choice_key)
+            if choice is None:
+                # autotune into a SCRATCH clone (corruption-safe); the live param_flows is touched only
+                # by the single real run below.
+                if (self._bk_par_scratch is None or self._bk_par_scratch.shape != param_flows.shape
+                        or self._bk_par_scratch.dtype != param_flows.dtype):
+                    self._bk_par_scratch = torch.empty_like(param_flows)
+                scr = self._bk_par_scratch
+                cands = [(("cuda", cfg), (lambda cfg = cfg: _cuda_par_sb(scr, cfg))) for cfg in range(n_cfg)]
+                cands.append((("triton", -1), (lambda: _triton_par_sb(scr))))
+                choice = cuda_kernels.autotune(cands) or ("triton", -1)
+                self._cached_bk_par_sparse_choice[choice_key] = choice
+            if choice[0] == "cuda":
+                _cuda_par_sb(param_flows, choice[1])
+                return None
+            # choice == ("triton", -1): fall through to the Triton launch below
 
         # Triton seems to produce wrong results when using a (1, 1, 1) grid with BLOCK_B = 1 or 2...
         # if grid[0] == 1 and grid[1] == 1 and grid[2] == 1 and BLOCK_B < 4:

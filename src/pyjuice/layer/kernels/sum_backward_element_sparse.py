@@ -24,15 +24,19 @@ from pyjuice.utils.kernel_launcher import triton_jit
 @triton_jit
 def _bk_triton_sparse_ele_kernel(node_flows, element_flows, node_mars, element_mars, mparams, 
                                  chids, parids, parpids, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
-                                 n_edge_blocks: tl.constexpr, allow_modify_flows: tl.constexpr, logspace_flows: tl.constexpr, 
-                                 BLOCK_B: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, 
-                                 propagation_alg_id: tl.constexpr, accumulate_ch_flows: tl.constexpr, alpha = 0.0):
+                                 n_edge_blocks: tl.constexpr, allow_modify_flows: tl.constexpr, logspace_flows: tl.constexpr,
+                                 BLOCK_B: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+                                 TILES_PER_BLOCK: tl.constexpr, propagation_alg_id: tl.constexpr, accumulate_ch_flows: tl.constexpr, alpha = 0.0):
 
     pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
     pid_m = tl.program_id(1) # ID of size-`BLOCK_M` nodes
 
-    # Get inferred node block id from `pid_m`
-    eleblock_id = pid_m
+    # Get inferred node block id + within-block tile id from `pid_m`. With `TILES_PER_BLOCK > 1`
+    # (small-batch tiling) each node-block is split into `TILES_PER_BLOCK` tiles of `BLOCK_M` nodes, so
+    # the node dimension fans across many programs instead of one serial program per block (~1 SM).
+    # `TILES_PER_BLOCK == 1` (BLOCK_M == cs_block_size) reproduces the original un-tiled indexing.
+    eleblock_id = pid_m // TILES_PER_BLOCK
+    ntile_id = pid_m % TILES_PER_BLOCK
 
     # Get the real node block id in the case of partial evaluation
     if partial_eval == 1:
@@ -43,7 +47,9 @@ def _bk_triton_sparse_ele_kernel(node_flows, element_flows, node_mars, element_m
     offs_edge_gid = offs_edge // BLOCK_SIZE_K
     offs_edge_nid = (offs_edge % BLOCK_SIZE_K)
     par_start = tl.load(parpids + eleblock_id * n_edge_blocks + offs_edge_gid)
-    epars_ptr = mparams + par_start + offs_edge_nid # [num_edges]
+    # Offset the per-node params by the within-block tile (`ntile_id`); the parents (`par_start`,
+    # `edge_start` below) are shared across the whole node-block, so they are NOT tile-offset.
+    epars_ptr = mparams + par_start + offs_edge_nid + ntile_id * BLOCK_M * BLOCK_SIZE_K # [num_edges]
 
     # Batch offsets and mask
     offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B
@@ -63,8 +69,8 @@ def _bk_triton_sparse_ele_kernel(node_flows, element_flows, node_mars, element_m
     else:
         nflows = tl.load(nflows_ptr, mask = mask_batch[None,:]) # [num_edges, BLOCK_B]
 
-    # Initialize pointers to `element_flows` and `element_mars`
-    off_eleids = tl.load(chids + eleblock_id)
+    # Initialize pointers to `element_flows` and `element_mars` (tile-offset within the node-block)
+    off_eleids = tl.load(chids + eleblock_id) + ntile_id * BLOCK_M
     eflows_ptr = element_flows + off_eleids * batch_size + offs_batch # [BLOCK_B]
     emars_ptr = element_mars + off_eleids * batch_size + offs_batch # [BLOCK_B]
 

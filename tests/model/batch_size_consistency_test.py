@@ -219,7 +219,332 @@ def test_sum_layer_backward_mode_and_fp32():
     assert (got - ref).abs().max() / (ref.abs().max() + 1e-12) < 2e-2
 
 
+def test_small_batch_block_sparse_fast_path():
+    """
+    Regression for the small-batch (batch < 16) block-sparse fast path.
+
+    For a large block size the sparse sum kernels leave the big node/edge dimensions un-tiled (one
+    program per node block -> ~1 SM busy, >10x slower than the block-sparse kernels). Layers with
+    `block_size >= 128` are therefore routed to the block-sparse forward / element-flow backward at
+    small batch too (with a small-batch tiling heuristic that splits the node dimension for SM
+    occupancy); the parameter-flow backward falls back to the sparse kernel (correct for any batch).
+    The results must match the sparse path (forced here as the reference), for both the forward LL
+    and the accumulated parameter flows.
+    """
+
+    device = torch.device("cuda:0")
+
+    for num_latents in [128, 512]:   # block_size = num_latents >= 128 -> small-batch block-sparse path
+        torch.manual_seed(num_latents)
+        ns = juice.structures.GeneralizedHMM(
+            seq_length = 4, num_latents = num_latents, homogeneous = True,
+            input_dist = juice.distributions.Categorical(num_cats = 6)
+        )
+        ns.init_parameters(perturbation = 2.0)
+        pc = juice.compile(ns)
+        pc.to(device)
+
+        for batch_size in [1, 2, 3, 8]:
+            data = torch.randint(0, 6, [batch_size, 4], device = device)
+
+            # Default routing -> small-batch block-sparse fast path.
+            ll = pc(data).clone()
+            pc.backward(data, flows_memory = 0.0, allow_modify_flows = False)
+            pf = pc.param_flows.clone()
+
+            # Reference: force the sparse kernels.
+            ll_s = pc(data, mode = "sparse").clone()
+            pc.backward(data, mode = "sparse", flows_memory = 0.0, allow_modify_flows = False)
+            pf_s = pc.param_flows.clone()
+
+            assert torch.isfinite(ll).all() and torch.isfinite(pf).all()
+            assert (ll - ll_s).abs().max() < 1e-3, \
+                f"forward LL mismatch (Nlat={num_latents}, batch={batch_size})"
+            assert (pf - pf_s).abs().max() / (pf_s.abs().max() + 1e-12) < 1e-3, \
+                f"parameter-flow mismatch (Nlat={num_latents}, batch={batch_size})"
+
+
+def test_small_batch_forward_cuda_matches_triton():
+    """
+    The optional small-batch (batch < 16) CUDA forward kernel (block_size >= 128 large-block layers,
+    a plain-CUDA 32-node-warp + edge-split online-logsumexp) must produce the same log-likelihoods as
+    the Triton small-batch path it is autotuned against. Skipped if the CUDA kernel can't be built
+    (no nvcc/ninja) -- then the dispatch transparently uses Triton anyway.
+    """
+    import pyjuice.layer.sum_layer as sl
+    from pyjuice.layer.kernels import c as cuda_kernels
+
+    if not (torch.cuda.is_available() and cuda_kernels.smallbatch_fw_is_available()):
+        pytest.skip("small-batch CUDA forward kernel unavailable (no nvcc/ninja); Triton fallback used")
+
+    device = torch.device("cuda:0")
+    torch.manual_seed(123)
+    ns = juice.structures.GeneralizedHMM(
+        seq_length = 4, num_latents = 512, homogeneous = True,   # block_size 512 >= 128 -> CUDA path
+        input_dist = juice.distributions.Categorical(num_cats = 6)
+    )
+    ns.init_parameters(perturbation = 2.0)
+    pc = juice.compile(ns)
+    pc.to(device)
+
+    saved = sl.FORWARD_SUM_CUDA
+    try:
+        for batch_size in [1, 2, 3, 8]:
+            data = torch.randint(0, 6, [batch_size, 4], device = device)
+            sl.FORWARD_SUM_CUDA = True
+            ll_cuda = pc(data).clone()
+            sl.FORWARD_SUM_CUDA = False
+            ll_triton = pc(data).clone()
+            assert torch.isfinite(ll_cuda).all()
+            assert (ll_cuda - ll_triton).abs().max() < 1e-3, \
+                f"small-batch CUDA forward mismatch vs Triton at batch={batch_size}"
+    finally:
+        sl.FORWARD_SUM_CUDA = saved
+
+
+def test_small_batch_ele_backward_cuda_matches_triton():
+    """
+    The optional small-batch (batch < 16) CUDA element-flow backward kernel (block_size >= 128 layers,
+    a plain-CUDA warp-per-child fused online-logsumexp) must produce the same parameter flows as the
+    Triton small-batch path (csmm2) it is autotuned against. Skipped if the CUDA kernel can't be built
+    (no nvcc/ninja) -- then the dispatch transparently uses Triton anyway.
+    """
+    import pyjuice.layer.sum_layer as sl
+    from pyjuice.layer.kernels import c as cuda_kernels
+
+    if not (torch.cuda.is_available() and cuda_kernels.smallbatch_ele_is_available()):
+        pytest.skip("small-batch CUDA ele backward kernel unavailable (no nvcc/ninja); Triton fallback used")
+
+    device = torch.device("cuda:0")
+    torch.manual_seed(321)
+    ns = juice.structures.GeneralizedHMM(
+        seq_length = 4, num_latents = 512, homogeneous = True,   # block_size 512 >= 128 -> CUDA path
+        input_dist = juice.distributions.Categorical(num_cats = 6)
+    )
+    ns.init_parameters(perturbation = 2.0)
+    pc = juice.compile(ns)
+    pc.to(device)
+
+    saved = sl.BACKWARD_ELE_FLOW_CUDA
+    try:
+        for batch_size in [1, 2, 3, 8]:
+            data = torch.randint(0, 6, [batch_size, 4], device = device)
+
+            sl.BACKWARD_ELE_FLOW_CUDA = True
+            pc(data)
+            pc.backward(data, flows_memory = 0.0, allow_modify_flows = False)
+            pf_cuda = pc.param_flows.clone()
+
+            sl.BACKWARD_ELE_FLOW_CUDA = False
+            pc(data)
+            pc.backward(data, flows_memory = 0.0, allow_modify_flows = False)
+            pf_triton = pc.param_flows.clone()
+
+            assert torch.isfinite(pf_cuda).all()
+            assert (pf_cuda - pf_triton).abs().max() / (pf_triton.abs().max() + 1e-12) < 1e-3, \
+                f"small-batch CUDA ele backward mismatch vs Triton at batch={batch_size}"
+
+        # Confirm the small-batch CUDA ele dispatch was actually reached (an "sb" choice was cached),
+        # so this test is not silently validating Triton-vs-Triton.
+        reached = any(
+            any(isinstance(k, tuple) and len(k) == 3 and k[2] == "sb"
+                for k in getattr(layer, "_cached_bk_ele_choice", {}))
+            for lg in pc.inner_layer_groups for layer in lg
+            if type(layer).__name__ == "SumLayer"
+        )
+        assert reached, "small-batch CUDA ele dispatch was never reached (check the gate conditions)"
+    finally:
+        sl.BACKWARD_ELE_FLOW_CUDA = saved
+
+
+def test_small_batch_prod_tiling_matches_untiled():
+    """
+    The small-batch (batch < 16) product-layer node-tile cap (`_SMALL_BATCH_PROD_TILE_M`) fans the
+    2D prod kernel's node dimension across many programs (the default budget heuristic leaves one
+    serial program per node-block -> ~1 SM busy at tiny batch). It is PURE TILING (the kernel walks
+    BLOCK_M nodes serially), so the forward LL and parameter flows must be bit-identical to the
+    un-capped path. ~22x faster prod kernel / ~1.9x faster small-batch fwd+bwd on an HMM.
+    """
+    import pyjuice.layer.prod_layer as pl
+
+    device = torch.device("cuda:0")
+    torch.manual_seed(202)
+    ns = juice.structures.GeneralizedHMM(
+        seq_length = 4, num_latents = 512, homogeneous = True,
+        input_dist = juice.distributions.Categorical(num_cats = 6)
+    )
+    ns.init_parameters(perturbation = 2.0)
+    pc = juice.compile(ns)
+    pc.to(device)
+
+    saved = pl._SMALL_BATCH_PROD_TILE_M
+    try:
+        for batch_size in [1, 2, 3, 8]:
+            data = torch.randint(0, 6, [batch_size, 4], device = device)
+
+            pl._SMALL_BATCH_PROD_TILE_M = 8           # default tiled path
+            ll_tiled = pc(data).clone()
+            pc.backward(data, flows_memory = 0.0, allow_modify_flows = False)
+            pf_tiled = pc.param_flows.clone()
+
+            pl._SMALL_BATCH_PROD_TILE_M = 1 << 30     # effectively uncapped (old behavior)
+            ll_ref = pc(data).clone()
+            pc.backward(data, flows_memory = 0.0, allow_modify_flows = False)
+            pf_ref = pc.param_flows.clone()
+
+            assert torch.equal(ll_tiled, ll_ref), f"prod-tiling forward LL not bit-identical at batch={batch_size}"
+            assert torch.equal(pf_tiled, pf_ref), f"prod-tiling param flows not bit-identical at batch={batch_size}"
+    finally:
+        pl._SMALL_BATCH_PROD_TILE_M = saved
+
+
+def test_small_batch_sparse_ele_tiling_matches_untiled():
+    """
+    The small-batch (batch < 16) node-tile cap (`_SMALL_BATCH_SPARSE_TILE_M`) for the SPARSE
+    element-flow kernel splits each node-block across many programs (the sparse kernel otherwise sets
+    BLOCK_M = cs_block_size -> one serial program per node-block, ~1 SM busy). This hits the layers
+    that miss the block-sparse path (e.g. the HMM's block_size==1 passthrough layer). It is PURE
+    TILING, so forward LL and parameter flows must be bit-identical to the un-tiled path. ~38x faster
+    on the HMM's sparse-ele layer.
+    """
+    import pyjuice.layer.sum_layer as sl
+
+    device = torch.device("cuda:0")
+    torch.manual_seed(404)
+    ns = juice.structures.GeneralizedHMM(
+        seq_length = 4, num_latents = 512, homogeneous = True,
+        input_dist = juice.distributions.Categorical(num_cats = 6)
+    )
+    ns.init_parameters(perturbation = 2.0)
+    pc = juice.compile(ns)
+    pc.to(device)
+
+    saved = sl._SMALL_BATCH_SPARSE_TILE_M
+    try:
+        for batch_size in [1, 2, 3, 8]:
+            data = torch.randint(0, 6, [batch_size, 4], device = device)
+
+            sl._SMALL_BATCH_SPARSE_TILE_M = 8           # default tiled path
+            ll_tiled = pc(data).clone()
+            pc.backward(data, flows_memory = 0.0, allow_modify_flows = False)
+            pf_tiled = pc.param_flows.clone()
+
+            sl._SMALL_BATCH_SPARSE_TILE_M = 1 << 30     # effectively uncapped (old behavior)
+            ll_ref = pc(data).clone()
+            pc.backward(data, flows_memory = 0.0, allow_modify_flows = False)
+            pf_ref = pc.param_flows.clone()
+
+            assert torch.equal(ll_tiled, ll_ref), f"sparse-ele tiling forward LL not bit-identical at batch={batch_size}"
+            assert torch.equal(pf_tiled, pf_ref), f"sparse-ele tiling param flows not bit-identical at batch={batch_size}"
+    finally:
+        sl._SMALL_BATCH_SPARSE_TILE_M = saved
+
+
+def test_gap_batch_tiling_matches_untiled():
+    """
+    The "gap batch" regime (16 <= batch < 64) sits between the small-batch (<16) path and the
+    >=64-aligned CUDA path; there the budget heuristics under-tile the product, sparse-ele AND
+    block-sparse parameter-flow kernels (e.g. at batch=16 the par kernel got ~8 programs / 1 SM). The
+    fixes extend the prod/sparse-ele node-tile caps through the gap and shrink the par kernel's
+    output-column tile TILE_SIZE_K (bit-safe: TILE_SIZE_M -- the max-stabilization group -- is left
+    unchanged). All are pure tiling, so forward LL and parameter flows must be bit-identical to the
+    un-tiled path. ~40x faster par kernel / ~7x faster batch=16 fwd+bwd under CUDA graphs.
+    """
+    import pyjuice.layer.sum_layer as sl
+    import pyjuice.layer.prod_layer as pl
+
+    device = torch.device("cuda:0")
+    torch.manual_seed(505)
+    ns = juice.structures.GeneralizedHMM(
+        seq_length = 4, num_latents = 512, homogeneous = True,
+        input_dist = juice.distributions.Categorical(num_cats = 6)
+    )
+    ns.init_parameters(perturbation = 2.0)
+    pc = juice.compile(ns)
+    pc.to(device)
+
+    saved = (pl._SMALL_BATCH_PROD_TILE_M, sl._SMALL_BATCH_SPARSE_TILE_M, sl._SMALL_BATCH_PAR_TILE_K)
+    try:
+        for batch_size in [16, 32]:   # the gap range (>=16, <64)
+            data = torch.randint(0, 6, [batch_size, 4], device = device)
+
+            pl._SMALL_BATCH_PROD_TILE_M, sl._SMALL_BATCH_SPARSE_TILE_M, sl._SMALL_BATCH_PAR_TILE_K = 8, 8, 16
+            ll_tiled = pc(data).clone()
+            pc.backward(data, flows_memory = 0.0, allow_modify_flows = False)
+            pf_tiled = pc.param_flows.clone()
+
+            pl._SMALL_BATCH_PROD_TILE_M, sl._SMALL_BATCH_SPARSE_TILE_M, sl._SMALL_BATCH_PAR_TILE_K = (1 << 30,) * 3
+            ll_ref = pc(data).clone()
+            pc.backward(data, flows_memory = 0.0, allow_modify_flows = False)
+            pf_ref = pc.param_flows.clone()
+
+            assert torch.equal(ll_tiled, ll_ref), f"gap-batch tiling forward LL not bit-identical at batch={batch_size}"
+            assert torch.equal(pf_tiled, pf_ref), f"gap-batch tiling param flows not bit-identical at batch={batch_size}"
+    finally:
+        pl._SMALL_BATCH_PROD_TILE_M, sl._SMALL_BATCH_SPARSE_TILE_M, sl._SMALL_BATCH_PAR_TILE_K = saved
+
+
+def test_small_batch_par_backward_cuda_matches_triton():
+    """
+    The optional small-batch (batch < 16) CUDA parameter-flow backward kernel (a plain-CUDA node-warp
+    with edges split across the grid -- coalesced node-contiguous param load/store, collision-free
+    read-add-store, no atomics) must produce the same parameter flows as the Triton sparse par kernel
+    it is autotuned against. Skipped if the CUDA kernel can't be built (no nvcc/ninja).
+    """
+    import pyjuice.layer.sum_layer as sl
+    from pyjuice.layer.kernels import c as cuda_kernels
+
+    if not (torch.cuda.is_available() and cuda_kernels.smallbatch_par_is_available()):
+        pytest.skip("small-batch CUDA par backward kernel unavailable (no nvcc/ninja); Triton fallback used")
+
+    device = torch.device("cuda:0")
+    torch.manual_seed(606)
+    ns = juice.structures.GeneralizedHMM(
+        seq_length = 4, num_latents = 512, homogeneous = True,   # block_size 512 (mult of 32) -> CUDA path
+        input_dist = juice.distributions.Categorical(num_cats = 6)
+    )
+    ns.init_parameters(perturbation = 2.0)
+    pc = juice.compile(ns)
+    pc.to(device)
+
+    saved = sl.BACKWARD_PAR_FLOW_CUDA
+    try:
+        for batch_size in [1, 2, 3, 8]:
+            data = torch.randint(0, 6, [batch_size, 4], device = device)
+
+            sl.BACKWARD_PAR_FLOW_CUDA = True
+            pc(data)
+            pc.backward(data, flows_memory = 0.0, allow_modify_flows = False)
+            pf_cuda = pc.param_flows.clone()
+
+            sl.BACKWARD_PAR_FLOW_CUDA = False
+            pc(data)
+            pc.backward(data, flows_memory = 0.0, allow_modify_flows = False)
+            pf_triton = pc.param_flows.clone()
+
+            assert torch.isfinite(pf_cuda).all()
+            assert (pf_cuda - pf_triton).abs().max() / (pf_triton.abs().max() + 1e-12) < 1e-3, \
+                f"small-batch CUDA par backward mismatch vs Triton at batch={batch_size}"
+
+        # Confirm the small-batch CUDA par dispatch was actually reached (a choice was cached).
+        reached = any(
+            len(getattr(layer, "_cached_bk_par_sparse_choice", {})) > 0
+            for lg in pc.inner_layer_groups for layer in lg
+            if type(layer).__name__ == "SumLayer"
+        )
+        assert reached, "small-batch CUDA par dispatch was never reached (check the gate conditions)"
+    finally:
+        sl.BACKWARD_PAR_FLOW_CUDA = saved
+
+
 if __name__ == "__main__":
     test_hmm_batch_size_consistency()
     test_hmm_backward_small_batch()
     test_sum_layer_backward_mode_and_fp32()
+    test_small_batch_block_sparse_fast_path()
+    test_small_batch_forward_cuda_matches_triton()
+    test_small_batch_ele_backward_cuda_matches_triton()
+    test_small_batch_prod_tiling_matches_untiled()
+    test_small_batch_sparse_ele_tiling_matches_untiled()
+    test_gap_batch_tiling_matches_untiled()
+    test_small_batch_par_backward_cuda_matches_triton()

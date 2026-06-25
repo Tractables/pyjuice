@@ -1,9 +1,122 @@
+import inspect
 import torch
 import triton
 from typing import Callable, Tuple, Union
 
 
-class FastJITFunction:
+# Triton launch meta-parameters: they affect COMPILATION (so they belong in the cache signature) but
+# are NOT kernel arguments (they are not passed to `CompiledKernel.run`).
+_TRITON_META_PARAMS = frozenset({
+    "num_warps", "num_stages", "num_ctas", "maxnregs", "enable_fp_fusion",
+    "launch_cooperative_grid", "launch_pdl", "grid", "warmup", "debug", "instrumentation_mode",
+})
+
+
+class FastJITFunction3x:
+    """Low-overhead Triton relaunch for triton >= 3.0.
+
+    Triton's ``JITFunction.run`` does a fair amount of per-launch Python (the "binder": unwrapping
+    constexprs + computing the alignment/divisibility specialization for every argument, building a
+    cache key, etc.). For PyJuice's hot loop -- the same kernels launched thousands of times on
+    persistent buffers -- that overhead dominates at small batch. This class caches the *compiled*
+    kernel under a cheap signature and, on a cache hit, calls ``CompiledKernel.run`` directly.
+
+    SAFETY (no silent mis-launch): the signature is a SUPERSET of everything Triton specializes on --
+    device, every constexpr value, every tensor's (dtype, 16-byte alignment class), every other arg's
+    value, and the launch meta-params -- so a cache hit provably corresponds to the identical compiled
+    kernel (a misaligned pointer, a changed constexpr, a different dtype, ... all change the signature
+    and force a fresh compile via the standard path). Anything unexpected (callable grid, unknown
+    kwarg, a missing required arg, any exception) falls back to the standard ``triton.jit`` launch, so
+    the result is always correct -- at worst it is merely the un-accelerated path.
+    """
+
+    def __init__(self, fn: Callable):
+        self.jit_fn = triton.jit(fn)
+        self.params = self.jit_fn.params
+        self.n_params = len(self.params)
+        self.is_constexpr = tuple(p.is_constexpr for p in self.params)
+        self.defaults = tuple(p.default for p in self.params)   # inspect._empty when required
+        self.name_to_idx = {p.name: i for i, p in enumerate(self.params)}
+        self.cache = dict()
+        # Imported here (not at module load) so plain `import pyjuice` never depends on these triton
+        # internals on triton versions where this fast path is unused.
+        from triton.runtime import driver as _driver
+        from triton import knobs as _knobs
+        self._driver = _driver
+        self._knobs = _knobs
+
+    def _gather(self, args, kernel_kwargs):
+        # Bind (*args, **kernel_kwargs) to the kernel parameters in declared order -- matching
+        # `bound_args.values()` that the standard path passes to `CompiledKernel.run`.
+        vals = list(self.defaults)
+        for i, a in enumerate(args):
+            vals[i] = a
+        n2i = self.name_to_idx
+        for name, v in kernel_kwargs.items():
+            vals[n2i[name]] = v                     # KeyError on unknown kwarg -> caught -> fallback
+        return vals
+
+    def _signature(self, vals, device, meta_items):
+        sig = [device]
+        is_cexpr = self.is_constexpr
+        for i in range(self.n_params):
+            v = vals[i]
+            if v is inspect._empty:                 # a required arg was not supplied -> force fallback
+                raise ValueError("missing required kernel argument")
+            if is_cexpr[i]:
+                sig.append(v)                       # constexpr value (baked into the compiled kernel)
+            elif isinstance(v, torch.Tensor):
+                sig.append((v.dtype, v.data_ptr() & 15))   # dtype + 16-byte alignment class
+            else:
+                sig.append(v)                       # int (divisibility) / float / bool / None
+        sig.append(meta_items)
+        return tuple(sig)
+
+    def __getitem__(self, grid: Union[Tuple, Callable]):
+        jit_fn = self.jit_fn
+
+        def wrapper(*args, **kwargs):
+            try:
+                if type(grid) is not tuple:          # callable grids: not fast-pathed
+                    return jit_fn[grid](*args, **kwargs)
+
+                if kwargs:
+                    meta_items = tuple(sorted((k, v) for k, v in kwargs.items() if k in _TRITON_META_PARAMS))
+                    kernel_kwargs = {k: v for k, v in kwargs.items() if k not in _TRITON_META_PARAMS} \
+                        if meta_items else kwargs
+                else:
+                    meta_items = ()
+                    kernel_kwargs = kwargs
+
+                vals = self._gather(args, kernel_kwargs)
+                device = self._driver.active.get_current_device()
+                sig = self._signature(vals, device, meta_items)
+
+                kernel = self.cache.get(sig)
+                if kernel is None:
+                    kernel = jit_fn[grid](*args, **kwargs)     # standard launch: compile + run + return
+                    if kernel is not None and hasattr(kernel, "result"):
+                        kernel = kernel.result()
+                    self.cache[sig] = kernel
+                    return
+
+                stream = self._driver.active.get_current_stream(device)
+                ng = len(grid)
+                g0 = grid[0]
+                g1 = grid[1] if ng > 1 else 1
+                g2 = grid[2] if ng > 2 else 1
+                # launch_metadata is only consumed by the (optional) launch hooks, never by the kernel
+                # itself, so None is correctness-safe: with no hooks (the default) it is unused, and a
+                # registered profiling hook would fail loudly rather than silently corrupt results.
+                kernel.run(g0, g1, g2, stream, kernel.function, kernel.packed_metadata, None,
+                           self._knobs.runtime.launch_enter_hook, self._knobs.runtime.launch_exit_hook, *vals)
+            except Exception:
+                return jit_fn[grid](*args, **kwargs)           # safe fallback: always correct
+
+        return wrapper
+
+
+class FastJITFunction2x:
     def __init__(self, fn: Callable, device_check: bool = False):
         self.jit_fn = triton.JITFunction(fn)
 
@@ -108,25 +221,43 @@ class FastJITFunction:
         return wrapper
 
 
+import os
+
+# Backward-compat alias for the renamed original launcher (imported by a few modules; never used
+# directly now that `triton_jit` dispatches by version).
+FastJITFunction = FastJITFunction2x
+
+# Low-overhead launch wrappers reduce Triton's per-launch Python overhead, which dominates PyJuice's
+# small-batch step. Opt out with PYJUICE_FAST_LAUNCH=0 (falls back to the stock triton.jit launch).
+_FAST_LAUNCH = os.environ.get("PYJUICE_FAST_LAUNCH", "1") != "0"
+
+
 def triton_jit(fn: Callable, device_check: bool = False):
-    # FastJITFunction manually packs kernel arguments on the cached path,
-    # which is incompatible with triton >= 3.0 (changed CUDA launch ABI).
-    # Check the triton version first and only use FastJITFunction for triton 2.x.
+    # The launch ABI changed across triton major versions, so the wrapper is version-specific:
+    #   - triton >= 3.0: FastJITFunction3x (cache compiled kernel + CompiledKernel.run, superset
+    #     signature + fallback -> correctness-safe).
+    #   - triton 2.x + torch <= 2.2: FastJITFunction2x (the original manual arg-packer).
+    #   - otherwise: stock triton.jit.
     try:
         _triton_major = int(triton.__version__.split(".")[0])
     except Exception:
         _triton_major = 3  # assume modern triton if version can't be parsed
 
     if _triton_major >= 3:
+        if _FAST_LAUNCH:
+            try:
+                return FastJITFunction3x(fn)
+            except Exception:
+                return triton.jit(fn)
         return triton.jit(fn)
 
-    # For triton 2.x with older torch, use the FastJITFunction optimisation
+    # For triton 2.x with older torch, use the FastJITFunction2x optimisation
     try:
         _torch_minor = int(torch.__version__.split(".")[1])
     except Exception:
         _torch_minor = 99
 
     if torch.__version__.startswith("2.") and _torch_minor <= 2:
-        return FastJITFunction(fn, device_check=device_check)
+        return FastJITFunction2x(fn, device_check=device_check)
     else:
         return triton.jit(fn)
