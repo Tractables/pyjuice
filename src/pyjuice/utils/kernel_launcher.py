@@ -116,7 +116,7 @@ class FastJITFunction3x:
         return wrapper
 
 
-class FastJITFunction2:
+class FastJITFunction2x:
     def __init__(self, fn: Callable, device_check: bool = False):
         self.jit_fn = triton.JITFunction(fn)
 
@@ -225,7 +225,7 @@ import os
 
 # Backward-compat alias for the renamed original launcher (imported by a few modules; never used
 # directly now that `triton_jit` dispatches by version).
-FastJITFunction = FastJITFunction2
+FastJITFunction = FastJITFunction2x
 
 # Low-overhead launch wrappers reduce Triton's per-launch Python overhead, which dominates PyJuice's
 # small-batch step. Opt out with PYJUICE_FAST_LAUNCH=0 (falls back to the stock triton.jit launch).
@@ -236,7 +236,7 @@ def triton_jit(fn: Callable, device_check: bool = False):
     # The launch ABI changed across triton major versions, so the wrapper is version-specific:
     #   - triton >= 3.0: FastJITFunction3x (cache compiled kernel + CompiledKernel.run, superset
     #     signature + fallback -> correctness-safe).
-    #   - triton 2.x + torch <= 2.2: FastJITFunction2 (the original manual arg-packer).
+    #   - triton 2.x + torch <= 2.2: FastJITFunction2x (the original manual arg-packer).
     #   - otherwise: stock triton.jit.
     try:
         _triton_major = int(triton.__version__.split(".")[0])
@@ -251,13 +251,13 @@ def triton_jit(fn: Callable, device_check: bool = False):
                 return triton.jit(fn)
         return triton.jit(fn)
 
-    # For triton 2.x with older torch, use the FastJITFunction2 optimisation
+    # For triton 2.x with older torch, use the FastJITFunction2x optimisation
     try:
         _torch_minor = int(torch.__version__.split(".")[1])
     except Exception:
         _torch_minor = 99
 
     if torch.__version__.startswith("2.") and _torch_minor <= 2:
-        return FastJITFunction2(fn, device_check=device_check)
+        return FastJITFunction2x(fn, device_check=device_check)
     else:
         return triton.jit(fn)
