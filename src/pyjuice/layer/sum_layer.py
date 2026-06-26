@@ -112,8 +112,11 @@ _GAP_BATCH_MAX = int(os.environ.get("PYJUICE_GAP_BATCH_MAX", 64))
 _SMALL_BATCH_PAR_TILE_K = int(os.environ.get("PYJUICE_SB_PAR_TK", 16))
 # Minimum block size for the small-batch (batch < 16) block-sparse path. Below this the sparse
 # kernel is actually faster (its lower launch/tiling overhead beats the node-tiling parallelism when
-# the node dimension is small) -- measured crossover is ~128 on an RTX PRO 6000. Tunable via env.
-_SMALL_BATCH_MIN_BLOCK_SIZE = int(os.environ.get("PYJUICE_SB_MIN_BS", 128))
+# the node dimension is small). Re-measured on an RTX PRO 6000 after the small-batch block-sparse
+# tiling/kernels landed: block_size >= 32 is now faster on the block-sparse path (eager +7..14%, and
+# up to ~2x under CUDA graphs at block_size 64), while block_size == 16 regresses ~8% in eager (and
+# is neutral under CUDA graphs) -- so the crossover dropped from ~128 to 32. Tunable via env.
+_SMALL_BATCH_MIN_BLOCK_SIZE = int(os.environ.get("PYJUICE_SB_MIN_BS", 32))
 
 
 class SumLayer(Layer, nn.Module):
@@ -546,9 +549,10 @@ class SumLayer(Layer, nn.Module):
             mode = self.BLOCK_SPARSE
         elif params.dim() == 1 and self.block_size >= _SMALL_BATCH_MIN_BLOCK_SIZE and num_edges >= 16:
             # Small batch (< 16): the sparse kernel leaves the large node dimension un-tiled (one
-            # program per node block -> ~1 SM busy, >10x slowdown). For a large enough block size the
-            # block-sparse small-batch tiling is far faster; smaller blocks fall through to the sparse
-            # kernel below (its lower launch/tiling overhead wins there -- measured crossover ~128).
+            # program per node block -> ~1 SM busy, >10x slowdown). For block_size >= 32 the
+            # block-sparse small-batch tiling is far faster; block_size == 16 falls through to the
+            # sparse kernel below (its lower launch/tiling overhead wins there -- measured crossover
+            # is 32, see `_SMALL_BATCH_MIN_BLOCK_SIZE`).
             mode = self.BLOCK_SPARSE
         elif self.block_size == 1 or num_edges < 4:
             # In this case, we should definitely use the sparse implementation

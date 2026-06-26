@@ -225,16 +225,17 @@ def test_small_batch_block_sparse_fast_path():
 
     For a large block size the sparse sum kernels leave the big node/edge dimensions un-tiled (one
     program per node block -> ~1 SM busy, >10x slower than the block-sparse kernels). Layers with
-    `block_size >= 128` are therefore routed to the block-sparse forward / element-flow backward at
-    small batch too (with a small-batch tiling heuristic that splits the node dimension for SM
-    occupancy); the parameter-flow backward falls back to the sparse kernel (correct for any batch).
-    The results must match the sparse path (forced here as the reference), for both the forward LL
-    and the accumulated parameter flows.
+    `block_size >= _SMALL_BATCH_MIN_BLOCK_SIZE` (=32 after re-profiling) are therefore routed to the
+    block-sparse forward / element-flow backward at small batch too (with a small-batch tiling
+    heuristic that splits the node dimension for SM occupancy); the parameter-flow backward falls
+    back to the sparse kernel (correct for any batch). The results must match the sparse path (forced
+    here as the reference), for both the forward LL and the accumulated parameter flows. The 32/64
+    cases pin the lowered crossover (these were on the sparse path before).
     """
 
     device = torch.device("cuda:0")
 
-    for num_latents in [128, 512]:   # block_size = num_latents >= 128 -> small-batch block-sparse path
+    for num_latents in [32, 64, 128, 512]:   # block_size = num_latents >= 32 -> small-batch block-sparse path
         torch.manual_seed(num_latents)
         ns = juice.structures.GeneralizedHMM(
             seq_length = 4, num_latents = num_latents, homogeneous = True,
