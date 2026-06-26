@@ -538,6 +538,140 @@ def test_small_batch_par_backward_cuda_matches_triton():
         sl.BACKWARD_PAR_FLOW_CUDA = saved
 
 
+def _clear_sum_caches(pc):
+    _names = ["_cached_fw_pcids", "_cached_fw_cuda", "_cached_fw_cuda_choice", "_cached_fw_sb",
+              "_cached_bk_parids", "_cached_bk_ele_cuda", "_cached_bk_ele_choice", "_cached_bk_ele_sb",
+              "_cached_bk_par_cuda", "_cached_bk_par_choice", "_cached_bk_par_sparse_choice",
+              "_cached_bk_par_trim"]
+    for lg in pc.inner_layer_groups:
+        for layer in lg:
+            if type(layer).__name__ == "SumLayer":
+                for nm in _names:
+                    if hasattr(layer, nm):
+                        getattr(layer, nm).clear()
+
+
+def _trim_fires(pc):
+    # the edge trim fires iff some partition's REAL max edge count (the last non-dummy cids column;
+    # padding is a contiguous zero suffix, real children point to elements >= 1) is below the
+    # pow2-padded width.
+    for lg in pc.inner_layer_groups:
+        for layer in lg:
+            if type(layer).__name__ == "SumLayer":
+                for cids in layer.partitioned_cids:
+                    if int((cids != 0).any(dim = 0).sum()) < int(cids.size(1)):
+                        return True
+    return False
+
+
+def test_edge_trim_block_sparse_bit_identical():
+    """
+    The block-sparse edge-tile trim (`_BLOCK_SPARSE_EDGE_TRIM`) drops the fully-padded edge tiles that
+    the pow2 padding adds. On the Triton path with a small block size (no bf16 tensor-core dot) it must
+    be exactly bit-identical to the untrimmed result -- forward LL AND accumulated parameter flows.
+    HCLT (block_size 32, fan-in 160 -> padded to 256) genuinely triggers the trim (asserted).
+    """
+    import pyjuice.layer.sum_layer as sl
+
+    device = torch.device("cuda:0")
+    torch.manual_seed(160)
+    xs = torch.randint(0, 256, [400, 16]).float()
+    ns = juice.structures.HCLT(xs, num_latents = 160)
+    ns.init_parameters(perturbation = 2.0)
+    pc = juice.compile(ns)
+    pc.to(device)
+
+    assert _trim_fires(pc), "edge trim did not fire on HCLT-160 (the test would be vacuous)"
+
+    saved = (sl.FORWARD_SUM_CUDA, sl.BACKWARD_ELE_FLOW_CUDA, sl.BACKWARD_PAR_FLOW_CUDA, sl._BLOCK_SPARSE_EDGE_TRIM)
+    try:
+        # CUDA off -> the exact Triton path (the CUDA kernels are only numerically equivalent).
+        # batch 64 (>= _GAP_BATCH_MAX) exercises the BACKWARD_PAR_FLOW_TUNED path, which doubles
+        # TILE_SIZE_K -- so the trim is checked against a changed tile size too.
+        sl.FORWARD_SUM_CUDA = sl.BACKWARD_ELE_FLOW_CUDA = sl.BACKWARD_PAR_FLOW_CUDA = False
+        for batch_size in [1, 2, 8, 16, 64]:
+            data = torch.randint(0, 256, [batch_size, 16], device = device)
+
+            sl._BLOCK_SPARSE_EDGE_TRIM = True
+            _clear_sum_caches(pc)
+            ll_trim = pc(data).clone()
+            pc.backward(data, flows_memory = 0.0, allow_modify_flows = False)
+            pf_trim = pc.param_flows.clone()
+
+            sl._BLOCK_SPARSE_EDGE_TRIM = False
+            _clear_sum_caches(pc)
+            ll_full = pc(data).clone()
+            pc.backward(data, flows_memory = 0.0, allow_modify_flows = False)
+            pf_full = pc.param_flows.clone()
+
+            assert torch.equal(ll_trim, ll_full), f"edge-trim forward LL not bit-identical at batch={batch_size}"
+            assert torch.equal(pf_trim, pf_full), f"edge-trim param flows not bit-identical at batch={batch_size}"
+    finally:
+        sl.FORWARD_SUM_CUDA, sl.BACKWARD_ELE_FLOW_CUDA, sl.BACKWARD_PAR_FLOW_CUDA, sl._BLOCK_SPARSE_EDGE_TRIM = saved
+
+
+def test_edge_trim_cuda_matches_sparse():
+    """
+    Guards the trim's interaction with the small-batch CUDA fast path: that kernel iterates
+    `child = sb_ebase + edge` over `edge in [0, num_edges)` assuming global contiguity, so if the trim
+    shrank the tile count without ALSO shrinking `num_edges` it would read PAST the real children (a
+    silent OOB). On a globally-contiguous, non-pow2-fan-in model (HMM, block_size 128, fan-in 640 ->
+    padded to 1024) the trimmed CUDA result must still match the exact sparse reference within the CUDA
+    kernels' tolerance. Asserts both the trim fires AND the small-batch CUDA path is actually reached.
+    Skipped if the CUDA kernels can't be built.
+    """
+    import pyjuice.layer.sum_layer as sl
+    from pyjuice.layer.kernels import c as cuda_kernels
+
+    if not (torch.cuda.is_available() and cuda_kernels.smallbatch_fw_is_available()):
+        pytest.skip("small-batch CUDA kernels unavailable (no nvcc/ninja)")
+
+    device = torch.device("cuda:0")
+    torch.manual_seed(640)
+    ns = juice.structures.GeneralizedHMM(
+        seq_length = 4, num_latents = 640, homogeneous = True,
+        input_dist = juice.distributions.Categorical(num_cats = 6)
+    )
+    ns.init_parameters(perturbation = 2.0)
+    pc = juice.compile(ns)
+    pc.to(device)
+
+    assert _trim_fires(pc), "edge trim did not fire on HMM-640 (the test would be vacuous)"
+
+    sums = [L for lg in pc.inner_layer_groups for L in lg if type(L).__name__ == "SumLayer"]
+    saved = (sl.FORWARD_SUM_CUDA, sl.BACKWARD_ELE_FLOW_CUDA, sl.BACKWARD_PAR_FLOW_CUDA, sl._BLOCK_SPARSE_EDGE_TRIM)
+    try:
+        sl._BLOCK_SPARSE_EDGE_TRIM = True
+        sb_cuda_reached = False
+        for batch_size in [1, 2, 8]:
+            data = torch.randint(0, 6, [batch_size, 4], device = device)
+
+            # exact reference: the sparse kernels (no trim, no CUDA, no bf16 tensor-core dot)
+            sl.FORWARD_SUM_CUDA = sl.BACKWARD_ELE_FLOW_CUDA = sl.BACKWARD_PAR_FLOW_CUDA = False
+            _clear_sum_caches(pc)
+            ll_ref = pc(data, mode = "sparse").clone()
+            pc.backward(data, mode = "sparse", flows_memory = 0.0, allow_modify_flows = False)
+            pf_ref = pc.param_flows.clone()
+
+            # under test: the trimmed CUDA fast paths
+            sl.FORWARD_SUM_CUDA = sl.BACKWARD_ELE_FLOW_CUDA = sl.BACKWARD_PAR_FLOW_CUDA = True
+            _clear_sum_caches(pc)
+            ll_cuda = pc(data).clone()
+            pc.backward(data, flows_memory = 0.0, allow_modify_flows = False)
+            pf_cuda = pc.param_flows.clone()
+            sb_cuda_reached = sb_cuda_reached or any(v[2] for L in sums for v in L._cached_fw_sb.values())
+
+            assert torch.isfinite(ll_cuda).all() and torch.isfinite(pf_cuda).all()
+            assert (ll_cuda - ll_ref).abs().max() < 1e-2, \
+                f"trimmed CUDA forward diverged from sparse at batch={batch_size}"
+            assert (pf_cuda - pf_ref).abs().max() / (pf_ref.abs().max() + 1e-9) < 1e-2, \
+                f"trimmed CUDA param flows diverged from sparse at batch={batch_size}"
+
+        assert sb_cuda_reached, "small-batch CUDA path never reached (test does not guard the num_edges fix)"
+    finally:
+        sl.FORWARD_SUM_CUDA, sl.BACKWARD_ELE_FLOW_CUDA, sl.BACKWARD_PAR_FLOW_CUDA, sl._BLOCK_SPARSE_EDGE_TRIM = saved
+
+
 if __name__ == "__main__":
     test_hmm_batch_size_consistency()
     test_hmm_backward_small_batch()
