@@ -1,7 +1,9 @@
 import torch
+import triton
 import pyjuice as juice
 import time
 import pyjuice.nodes.distributions as dists
+from pyjuice.nodes.distributions import softevi_categorical as softevi_cat
 import math
 
 import pytest
@@ -687,6 +689,262 @@ def test_soft_evidence_categorical_dist_dual_flow_em_momentum_no_nan():
     assert not math.isnan(pc(data, **kwargs).mean().item())
 
 
+def _value_mask_reference(input_layer, evi, data, num_cats, cat_ids = None):
+    # Pure-torch ground truth for the two quantities `fw_w_value_mask_kernel` selects between,
+    # each of shape [num_input_nodes, batch]:
+    #   obs  = log beta_z(d) + log p_theta(d)               (the unnormalized conditional)
+    #   logZ = log sum_c beta_z(c) p_theta(c)               (the evidence-weighted marginal)
+    # Everything is indexed off `vids` / `s_pids`, so this is independent of input-node ordering.
+    cat_offsets = torch.arange(num_cats, device = input_layer.params.device)
+    beta = input_layer.params[input_layer.s_pids[:,None] + cat_offsets[None,:]] # [N, num_cats]
+    logbeta = beta.clamp_min(1e-45).log()
+
+    lvids = input_layer.var_idmapping[input_layer.vids[:,0]].long() # [N]
+    e = evi[:,lvids,:].permute(1, 0, 2) # [N, B, K]
+    d = data[:,lvids].permute(1, 0) # [N, B]
+
+    lb = logbeta[:,None,:].expand(-1, e.size(1), -1) # [N, B, num_cats]
+    if cat_ids is None:
+        logZ = torch.logsumexp(lb + e, dim = 2)
+        obs = logbeta.gather(1, d) + e.gather(2, d[:,:,None]).squeeze(2)
+    else:
+        ids = cat_ids[:,lvids,:].permute(1, 0, 2) # [N, B, K]
+        lb = lb.gather(2, ids)
+        logZ = torch.logsumexp(lb + e, dim = 2)
+        is_match = (ids == d[:,:,None])
+        obs = torch.where(is_match, lb + e, torch.full_like(e, -float("inf"))).max(dim = 2).values
+
+    return obs, logZ
+
+
+def _make_topk_evidence(evi_full, data, k):
+    # Top-k soft evidence with the observed token forced into the candidate set, but ONLY where it is
+    # absent: duplicate ids are an invalid input for these kernels (`match_ids` is a sum over matches,
+    # so two hits select a bogus slot). Same idiom as the EM tests above.
+    vals, ids = evi_full.topk(k, dim = 2)
+    xid = data.unsqueeze(2)
+    miss = ~(ids == xid).any(dim = 2, keepdim = True)
+    ids[...,-1:] = torch.where(miss, xid, ids[...,-1:])
+    vals[...,-1:] = torch.where(miss, evi_full.gather(2, xid), vals[...,-1:])
+    return vals.contiguous(), ids.contiguous()
+
+
+def test_soft_evidence_categorical_value_mask_forward():
+    # Runtests for the opt-in generation forward (`soft_evidence_value_mask` -> `fw_w_value_mask_kernel`).
+    # Per variable the mask selects, for EVERY latent z:
+    #   True  (observed) -> log beta_z(d) + log p_theta(d)   [unnormalized conditional, NO -logZ]
+    #   False (masked)   -> logZ_z                           [evidence-weighted marginal]
+    # Correctness is asserted separately at the True and the False positions (a mask that is all-True
+    # or all-False would not catch a swapped `tl.where`), and the default forward -- which must keep
+    # using the untouched `fw_kernel` -- is checked to still be locally normalized.
+
+    torch.manual_seed(6721)
+
+    device = torch.device("cuda:0")
+
+    # (num_vars, num_nodes, num_cats, batch_size, k): full-vocab and top-k, small/large num_cats,
+    # single- and multi-node input layers, and batch sizes that do / don't divide the block size.
+    for num_vars, num_nodes, num_cats, batch_size, k in [
+        (16, 4, 4096, 32, None),
+        (16, 1, 64, 32, None),
+        (8, 8, 1000, 1, None),
+        (8, 4, 1000, 7, None),
+        (16, 4, 4096, 32, 32),
+        (8, 4, 300, 16, 64),
+    ]:
+
+        nis = [
+            juice.inputs(v, num_nodes = num_nodes, dist = dists.SoftEvidenceCategorical(num_cats = num_cats)) for v in range(num_vars)
+        ]
+        np = juice.multiply(*nis)
+        ns = juice.summate(np, num_nodes = 1)
+
+        ns.init_parameters(perturbation = 2.0)
+
+        pc = juice.compile(ns)
+        pc.to(device)
+
+        data = torch.randint(0, num_cats, [batch_size, num_vars], device = device)
+        evi_full = torch.log_softmax(torch.randn([batch_size, num_vars, num_cats], device = device), dim = 2).contiguous()
+
+        if k is None:
+            kwargs = dict(categorical_evidence_logp = evi_full)
+            evi, cat_ids = evi_full, None
+        else:
+            evi, cat_ids = _make_topk_evidence(evi_full, data, k)
+            kwargs = dict(categorical_evidence_logp = evi, soft_evidence_cat_ids = cat_ids)
+
+        input_layer = pc.input_layer_group[0]
+        sid, eid = input_layer._output_ind_range
+        obs, logZ = _value_mask_reference(input_layer, evi, data, num_cats, cat_ids = cat_ids)
+
+        def forward(**extra):
+            pc(data, **kwargs, **extra)
+            return pc.node_mars[sid:eid,:].clone()
+
+        ##################################
+        ## Mixed mask (the general case ##
+        ##################################
+
+        # A random mask, with both states forced to occur in every row and every column so that no
+        # degenerate layout can hide a stride bug in the mask load.
+        value_mask = torch.rand([batch_size, num_vars], device = device) > 0.5
+        value_mask[:,0::2] = True
+        value_mask[:,1::2] = False
+        assert value_mask.any() and (~value_mask).any()
+
+        node_mars = forward(soft_evidence_value_mask = value_mask)
+
+        # Expand the [B, num_vars] mask to the [num_input_nodes, B] layout of `node_mars`
+        lvids = input_layer.var_idmapping[input_layer.vids[:,0]].long()
+        mask_nb = value_mask[:,lvids].permute(1, 0)
+
+        assert torch.all(torch.abs(node_mars[mask_nb] - obs[mask_nb]) < 1e-3)
+        assert torch.all(torch.abs(node_mars[~mask_nb] - logZ[~mask_nb]) < 1e-3)
+
+        ############################################
+        ## The two extremes: all-True / all-False ##
+        ############################################
+
+        all_true = torch.ones([batch_size, num_vars], dtype = torch.bool, device = device)
+        assert torch.all(torch.abs(forward(soft_evidence_value_mask = all_true) - obs) < 1e-3)
+
+        all_false = torch.zeros([batch_size, num_vars], dtype = torch.bool, device = device)
+        assert torch.all(torch.abs(forward(soft_evidence_value_mask = all_false) - logZ) < 1e-3)
+
+        ##############################################################
+        ## Without the kwarg: the default (normalized) forward path ##
+        ##############################################################
+
+        assert torch.all(torch.abs(forward() - (obs - logZ)) < 1e-3)
+
+
+def test_soft_evidence_categorical_value_mask_matches_extern_product():
+    # `soft_evidence_value_mask` is defined to reproduce, in place, exactly what
+    # `ExternProductCategorical` computes in mode "unnormalized_ll" with a value mask -- so a PC using
+    # SoftEvidenceCategorical no longer has to be converted to that distribution for generation.
+    # With identical emission tables the two `node_mars` must agree.
+
+    torch.manual_seed(881)
+
+    device = torch.device("cuda:0")
+
+    batch_size = 32
+    num_vars = 16
+    num_nodes = 4
+
+    for num_cats in [64, 4096]:   # below / above the 128-category threshold that picks the Extern kernel
+
+        def build(dist_cls):
+            torch.manual_seed(5)   # identical structure for both PCs
+            nis = [juice.inputs(v, num_nodes = num_nodes, dist = dist_cls(num_cats = num_cats)) for v in range(num_vars)]
+            ns = juice.summate(juice.multiply(*nis), num_nodes = 1)
+            ns.init_parameters(perturbation = 2.0)
+            pc = juice.compile(ns)
+            return pc.to(device)
+
+        soft_pc = build(dists.SoftEvidenceCategorical)
+        ext_pc = build(dists.ExternProductCategorical)
+
+        soft_layer = soft_pc.input_layer_group[0]
+        ext_layer = ext_pc.input_layer_group[0]
+
+        assert torch.equal(ext_layer.vids, soft_layer.vids)
+        assert torch.equal(ext_layer.s_pids, soft_layer.s_pids)
+        ext_layer.params[:] = soft_layer.params   # identical emission tables
+
+        data = torch.randint(0, num_cats, [batch_size, num_vars], device = device)
+        evi = torch.log_softmax(torch.randn([batch_size, num_vars, num_cats], device = device), dim = 2).contiguous()
+        value_mask = torch.rand([batch_size, num_vars], device = device) > 0.5
+        assert value_mask.any() and (~value_mask).any()
+
+        soft_pc(data, categorical_evidence_logp = evi, soft_evidence_value_mask = value_mask)
+        ext_pc(data, external_categorical_logps = evi,
+               extern_product_categorical_mode = "unnormalized_ll",
+               external_categorical_value_mask = value_mask)
+
+        ssid, seid = soft_layer._output_ind_range
+        esid, eeid = ext_layer._output_ind_range
+
+        assert torch.all(torch.abs(soft_pc.node_mars[ssid:seid,:] - ext_pc.node_mars[esid:eeid,:]) < 1e-3)
+
+
+def test_soft_evidence_categorical_value_mask_no_slowdown():
+    # `fw_w_value_mask_kernel` is a copy of `fw_kernel` differing only in its final output, so it must
+    # cost essentially the same: it adds one [BLOCK_SIZE_B] bool load and a `tl.where`, and drops a
+    # subtraction. The two kernels are launched DIRECTLY with an identical common-argument block (the
+    # one `InputLayer.forward` builds), so this measures the kernels alone -- no PC/prod/sum overhead
+    # and no launch-path difference. A and B are interleaved so clock drift hits both equally, and the
+    # comparison uses the per-round minimum, which is the noise-robust statistic here.
+
+    torch.manual_seed(313)
+
+    device = torch.device("cuda:0")
+
+    batch_size = 64
+    num_vars = 16
+    num_nodes = 256
+    num_cats = 8192   # sized so a single launch is ~10^2 us, well above timer/clock noise
+
+    nis = [
+        juice.inputs(v, num_nodes = num_nodes, dist = dists.SoftEvidenceCategorical(num_cats = num_cats)) for v in range(num_vars)
+    ]
+    ns = juice.summate(juice.multiply(*nis), num_nodes = 1)
+    ns.init_parameters(perturbation = 2.0)
+
+    pc = juice.compile(ns)
+    pc.to(device)
+
+    input_layer = pc.input_layer_group[0]
+
+    data = torch.randint(0, num_cats, [batch_size, num_vars], device = device)
+    evi = torch.log_softmax(torch.randn([batch_size, num_vars, num_cats], device = device), dim = 2).contiguous()
+    value_mask = torch.rand([batch_size, num_vars], device = device) > 0.5
+
+    # Buffers allocated once, outside the timed region
+    node_mars = torch.zeros([pc.num_nodes, batch_size], device = device)
+    data_flat = data.permute(1, 0).reshape(-1).contiguous()
+
+    common_kwargs = dict(
+        params_ptr = input_layer.params, node_mars_ptr = node_mars, data_ptr = data_flat,
+        vids_ptr = input_layer.vids, s_pids_ptr = input_layer.s_pids, metadata_ptr = input_layer.metadata,
+        s_mids_ptr = input_layer.s_mids, nids_ptr = input_layer.nids, fw_local_ids_ptr = None,
+        layer_num_nodes = input_layer._output_ind_range[1] - input_layer._output_ind_range[0],
+        batch_size = batch_size, num_vars_per_node = input_layer.num_vars_per_node,
+        nv_block_size = triton.next_power_of_2(input_layer.num_vars_per_node),
+        node_offset = input_layer._output_ind_range[0], partial_eval = 0, num_warps = 8
+    )
+
+    prep_kwargs = dict(categorical_evidence_logp = evi, batch_size = batch_size)
+    plain_kwargs, plain_grid = softevi_cat._prep_args_apply_fw_kernel(input_layer, prep_kwargs)
+
+    prep_kwargs["soft_evidence_value_mask"] = value_mask
+    mask_kwargs, mask_grid = softevi_cat._prep_args_apply_fw_w_value_mask_kernel(input_layer, prep_kwargs)
+
+    run_plain = lambda: input_layer.dist.fw_kernel[plain_grid](**common_kwargs, **plain_kwargs)
+    run_mask = lambda: input_layer.dist.fw_w_value_mask_kernel[mask_grid](**common_kwargs, **mask_kwargs)
+
+    def bench(fn, iters = 30):
+        for _ in range(10):
+            fn()
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(iters):
+            fn()
+        torch.cuda.synchronize()
+        return (time.perf_counter() - t0) / iters
+
+    plain_ts, mask_ts = [], []
+    for _ in range(7):
+        plain_ts.append(bench(run_plain))
+        mask_ts.append(bench(run_mask))
+
+    ratio = min(mask_ts) / min(plain_ts)
+    assert ratio < 1.15, \
+        f"fw_w_value_mask_kernel is {ratio:.3f}x fw_kernel " \
+        f"({min(plain_ts)*1e6:.1f}us vs {min(mask_ts)*1e6:.1f}us)"
+
+
 if __name__ == "__main__":
     torch.manual_seed(4343442)
     torch.cuda.manual_seed(5434)
@@ -700,3 +958,6 @@ if __name__ == "__main__":
     test_soft_evidence_categorical_dist_dual_flow_em_uniform()
     test_soft_evidence_categorical_dist_dual_flow_em_monotonic()
     test_soft_evidence_categorical_dist_dual_flow_em_momentum_no_nan()
+    test_soft_evidence_categorical_value_mask_forward()
+    test_soft_evidence_categorical_value_mask_matches_extern_product()
+    test_soft_evidence_categorical_value_mask_no_slowdown()

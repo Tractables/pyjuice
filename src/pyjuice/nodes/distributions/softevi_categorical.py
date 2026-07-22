@@ -19,7 +19,8 @@ else:
 
 
 def _condition_apply_fw_kernel(layer, kwargs):
-    return "categorical_evidence_logp" in kwargs
+    return "categorical_evidence_logp" in kwargs and \
+        kwargs.get("soft_evidence_value_mask", None) is None
 
 
 def _prep_args_apply_fw_kernel(layer, kwargs):
@@ -80,6 +81,28 @@ def _prep_args_apply_fw_kernel(layer, kwargs):
     target_kwargs["BLOCK_SIZE_B"] = BLOCK_SIZE_B
     target_kwargs["BLOCK_SIZE_N"] = BLOCK_SIZE_N
     target_kwargs["use_tensor_core"] = use_tensor_core
+
+    return target_kwargs, grid
+
+
+def _condition_apply_fw_w_value_mask_kernel(layer, kwargs):
+    return "categorical_evidence_logp" in kwargs and \
+        kwargs.get("soft_evidence_value_mask", None) is not None
+
+
+def _prep_args_apply_fw_w_value_mask_kernel(layer, kwargs):
+    # Identical setup to the standard forward, plus the value mask. Delegating keeps the two
+    # kernels' launch configurations in lockstep.
+    target_kwargs, grid = _prep_args_apply_fw_kernel(layer, kwargs)
+
+    soft_evidence_value_mask = kwargs["soft_evidence_value_mask"]
+    assert soft_evidence_value_mask.dim() == 2
+    assert soft_evidence_value_mask.size(0) == kwargs["batch_size"], \
+        "Batch size doesn't match in `soft_evidence_value_mask`."
+    assert soft_evidence_value_mask.size(1) == target_kwargs["ext_num_vars"], \
+        "Number of variables doesn't match in `soft_evidence_value_mask`."
+
+    target_kwargs["soft_evidence_value_mask_ptr"] = soft_evidence_value_mask.contiguous()
 
     return target_kwargs, grid
 
@@ -248,7 +271,10 @@ class SoftEvidenceCategorical(Distribution):
         self.num_cats = num_cats
 
         self.post_fw_fns = [
-            (self.fw_kernel, _condition_apply_fw_kernel, _prep_args_apply_fw_kernel)
+            (self.fw_kernel, _condition_apply_fw_kernel, _prep_args_apply_fw_kernel),
+            # Opt-in generation forward; the two conditions are mutually exclusive on
+            # `soft_evidence_value_mask`, so the default path is untouched.
+            (self.fw_w_value_mask_kernel, _condition_apply_fw_w_value_mask_kernel, _prep_args_apply_fw_w_value_mask_kernel)
         ]
 
         self.post_bp_fns = [
@@ -485,6 +511,176 @@ class SoftEvidenceCategorical(Distribution):
 
         # Final output logprob
         log_p = log_in_p + log_ex_p[:,None] - logZ
+
+        # Store results
+        node_offsets = offsets_n + node_offset
+        tl.store(node_mars_ptr + node_offsets[None,:] * batch_size + offsets_b[:,None], log_p, mask = (mask_b[:,None] & mask_n[None,:]))
+
+    @staticmethod
+    @triton_jit
+    def fw_w_value_mask_kernel(params_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, metadata_ptr, s_mids_ptr, nids_ptr, fw_local_ids_ptr, layer_num_nodes,
+                               batch_size, num_vars_per_node: tl.constexpr, nv_block_size: tl.constexpr, node_offset, partial_eval: tl.constexpr,
+                               TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, BLOCK_SIZE_B: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, use_tensor_core: tl.constexpr,
+                               categorical_evidence_logp_ptr, soft_evidence_cat_ids_ptr, soft_evidence_value_mask_ptr, var_idmapping_ptr,
+                               num_cats: tl.constexpr, ext_num_vars: tl.constexpr, has_ext_ids: tl.constexpr):
+        """Forward pass with a per-variable value mask (used for generation/conditional queries).
+
+        A mirror of `fw_kernel` -- everything up to and including `logZ`, `log_in_p` and `log_ex_p` is
+        identical; only the final output differs. Per variable, `soft_evidence_value_mask` selects
+
+            observed (`True`)  -> log beta_z(d) + log p_theta(d)      [unnormalized conditional, no -logZ]
+            masked   (`False`) -> logZ_z = log sum_c beta_z(c) p_theta(c)   [evidence-weighted marginal]
+
+        which is exactly what `ExternProductCategorical` computes in mode "unnormalized_ll" with a
+        value mask. `fw_kernel` is deliberately left untouched so the training/LL forward keeps its
+        code path, kernel and performance unchanged.
+        """
+
+        pid_b = tl.program_id(axis = 0)
+        pid_n = tl.program_id(axis = 1)
+
+        offsets_b = pid_b * BLOCK_SIZE_B + tl.arange(0, BLOCK_SIZE_B)
+        offsets_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+
+        mask_b = offsets_b < batch_size
+        mask_n = offsets_n < layer_num_nodes
+
+        offset_n = pid_n * BLOCK_SIZE_N
+
+        # Get all variable ids
+        vid = tl.load(vids_ptr + offset_n) # Global variable ID
+        lvid = tl.load(var_idmapping_ptr + vid) # Variable ID for "this type of inputs"
+
+        # Get latent offset of all nodes
+        nids = tl.load(nids_ptr + offsets_n, mask = mask_n, other = 0)
+
+        # Get start parameter indices
+        s_pids = tl.load(s_pids_ptr + offsets_n, mask = mask_n, other = 0) # [BLOCK_SIZE_N]
+
+        # Ptrs pointing to external parameters
+        expars_ptr = categorical_evidence_logp_ptr + \
+            offsets_b[:,None] * (ext_num_vars * num_cats) + \
+            lvid * num_cats + \
+            tl.arange(0, TILE_SIZE_K)[None,:] # [BLOCK_SIZE_B, TILE_SIZE_K]
+
+        # Compute logZ
+        logZ = tl.zeros([BLOCK_SIZE_B, BLOCK_SIZE_N], dtype = tl.float32) - float("inf")
+
+        if has_ext_ids:
+            # Ptrs pointing to internal parameters
+            inpars_ptr = params_ptr + s_pids # [BLOCK_SIZE_N]
+
+            # Ptrs pointing to external parameter indices
+            catids_ptr = soft_evidence_cat_ids_ptr + \
+                offsets_b[:,None] * (ext_num_vars * num_cats) + \
+                lvid * num_cats + \
+                tl.arange(0, TILE_SIZE_K)[None,:] # [BLOCK_SIZE_B, TILE_SIZE_K]
+
+            for i in range(K_NUM_TILES):
+                mask_c = (i * TILE_SIZE_K + tl.arange(0, TILE_SIZE_K) < num_cats) # [TILE_SIZE_K]
+
+                # Load the category IDs from `soft_evidence_cat_ids`
+                catids = tl.load(catids_ptr + i * TILE_SIZE_K, mask = (mask_b[:,None] & mask_c[None,:]), other = 0) # [BLOCK_SIZE_B, TILE_SIZE_K]
+
+                # Load the internal parameters
+                in_catpars_ptr = inpars_ptr[None,None,:] + catids[:,:,None] # [BLOCK_SIZE_B, TILE_SIZE_K, BLOCK_SIZE_N]
+                inpars = tl.load(in_catpars_ptr, mask = (mask_b[:,None,None] & mask_c[None,:,None] & mask_n[None,None,:]), other = 0.0) # [BLOCK_SIZE_B, TILE_SIZE_K, BLOCK_SIZE_N]
+
+                # Load the external parameters
+                expars = tl.load(expars_ptr + i * TILE_SIZE_K, mask = (mask_b[:,None] & mask_c[None,:]), other = 0.0) # [BLOCK_SIZE_B, TILE_SIZE_K]
+
+                params = expars[:,:,None] + tl.log(inpars)
+                params_max = tl.max(params, axis = 1)
+                cum_params = tl.log(tl.sum(tl.exp(params - params_max[:,None,:]), axis = 1)) + params_max # [BLOCK_SIZE_B, BLOCK_SIZE_N]
+
+                # Compute logaddexp(logZ, cum_params)
+                maxval = tl.maximum(logZ, cum_params)
+                minval = tl.minimum(logZ, cum_params)
+                diff = minval - maxval
+
+                logZ = tl.where(logZ == -float("inf"),
+                    cum_params,
+                    maxval + tlmath.log1p(tl.exp(diff))
+                )
+
+        else:
+            # Ptrs pointing to internal parameters
+            inpars_ptr = params_ptr + \
+                tl.arange(0, TILE_SIZE_K)[:,None] + \
+                s_pids[None,:] # [TILE_SIZE_K, BLOCK_SIZE_N]
+
+            for i in range(K_NUM_TILES):
+                mask_c = (i * TILE_SIZE_K + tl.arange(0, TILE_SIZE_K) < num_cats) # [TILE_SIZE_K]
+
+                # Load the internal parameters
+                inpars = tl.load(inpars_ptr + i * TILE_SIZE_K, mask = (mask_c[:,None] & mask_n[None,:]), other = 0.0) # [TILE_SIZE_K, BLOCK_SIZE_N]
+
+                # Load the external parameters
+                expars = tl.load(expars_ptr + i * TILE_SIZE_K, mask = (mask_b[:,None] & mask_c[None,:]), other = 0.0) # [BLOCK_SIZE_B, TILE_SIZE_K]
+
+                expars_max = tl.max(expars, axis = 1)[:,None]
+                expars_sub = tl.exp(expars - expars_max)
+
+                if use_tensor_core:
+                    params = tl.dot(expars_sub, inpars).log() + expars_max
+                else:
+                    params = tl.sum(expars_sub[:,:,None] * inpars[None,:,:], axis = 1).log() + expars_max
+
+                # Compute logaddexp(logZ, params)
+                maxval = tl.maximum(logZ, params)
+                minval = tl.minimum(logZ, params)
+                diff = minval - maxval
+
+                logZ = tl.where(logZ == -float("inf"),
+                    params,
+                    maxval + tlmath.log1p(tl.exp(diff))
+                )
+
+        # Compute unnormalized logprobs
+        data = tl.load(data_ptr + vid * batch_size + offsets_b, mask = mask_b, other = 0) # [BLOCK_SIZE_B]
+
+        log_in_p = tl.load(params_ptr + s_pids[None,:] + data[:,None], mask = (mask_b[:,None] & mask_n[None,:]), other = 0.0).log() # [BLOCK_SIZE_B, BLOCK_SIZE_N]
+
+        if has_ext_ids:
+            # Ptrs pointing to external parameter indices
+            catids_ptr = soft_evidence_cat_ids_ptr + \
+                offsets_b[:,None] * (ext_num_vars * num_cats) + \
+                lvid * num_cats + \
+                tl.arange(0, TILE_SIZE_K)[None,:] # [BLOCK_SIZE_B, TILE_SIZE_K]
+
+            # Ptrs pointing to external parameters
+            expar_ptr = categorical_evidence_logp_ptr + \
+                offsets_b * (ext_num_vars * num_cats) + \
+                lvid * num_cats # [BLOCK_SIZE_B]
+
+            log_ex_p = tl.zeros([BLOCK_SIZE_B], dtype = tl.float32) - float("inf")
+            for i in range(K_NUM_TILES):
+                mask_c = (i * TILE_SIZE_K + tl.arange(0, TILE_SIZE_K) < num_cats) # [TILE_SIZE_K]
+
+                # Load the category IDs from `soft_evidence_cat_ids`
+                catids = tl.load(catids_ptr + i * TILE_SIZE_K, mask = (mask_b[:,None] & mask_c[None,:]), other = 0) # [BLOCK_SIZE_B, TILE_SIZE_K]
+
+                # Find matching ids (mask out padding categories so they can't spuriously match `data == 0`)
+                is_match = ((catids == data[:,None]) & mask_c[None,:]).to(tl.int64) # [BLOCK_SIZE_B, TILE_SIZE_K]
+                match_ids = tl.sum(is_match * tl.arange(0, TILE_SIZE_K), axis = 1) # [BLOCK_SIZE_B]
+                has_match = (tl.sum(is_match, axis = 1) > 0) # [BLOCK_SIZE_B]
+
+                # Load parameters if found
+                expar = tl.load(expar_ptr + i * TILE_SIZE_K + match_ids, mask = (mask_b & has_match), other = 0.0) # [BLOCK_SIZE_B]
+                log_ex_p = tl.where(has_match, expar, log_ex_p)
+
+        else:
+            ex_p_ptr = categorical_evidence_logp_ptr + \
+                offsets_b * (ext_num_vars * num_cats) + \
+                lvid * num_cats + \
+                data
+            log_ex_p = tl.load(ex_p_ptr, mask = mask_b, other = 0.0) # [BLOCK_SIZE_B]
+
+        # Get the value mask (`True` to condition on the observed value, `False` to marginalize)
+        value_mask = tl.load(soft_evidence_value_mask_ptr + offsets_b * ext_num_vars + lvid, mask = mask_b, other = False) # [BLOCK_SIZE_B]
+
+        # Final output logprob: unnormalized conditional where observed, logZ where masked
+        log_p = tl.where(value_mask[:,None], log_in_p + log_ex_p[:,None], logZ)
 
         # Store results
         node_offsets = offsets_n + node_offset
