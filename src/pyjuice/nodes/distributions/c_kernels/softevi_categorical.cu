@@ -1,4 +1,8 @@
-// Expected-category flow phase of the top-k soft-evidence backward, in plain CUDA.
+// CUDA kernels for the `SoftEvidenceCategorical` input distribution (see softevi_categorical.py).
+//
+// =====================================================================================
+//  Backward: expected-category flow phase of the top-k soft-evidence backward
+// =====================================================================================
 //
 // Computes, for every (param-flow row, category) pair that any soft-evidence slot references,
 //
