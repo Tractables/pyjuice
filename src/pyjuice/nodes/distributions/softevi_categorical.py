@@ -279,7 +279,48 @@ def _dense_topk_applicable(layer, kwargs):
         return False
     if layer.provided("bk_local_ids"):
         return False
+    if not _dense_worth_it(layer, kwargs):
+        return False
     return _build_dense_index(layer, kwargs) is not None
+
+
+def _dense_worth_it(layer, kwargs):
+    """
+    Is the dense path actually faster than just scattering?
+
+    The dense path carries a fixed cost (the inverted-index build plus the prologue that materializes the
+    per-slot ratio) of order 1 ms, independent of the top-k width. It buys that back only when the
+    scattered alternative is going to DRAM -- if `params` and the flow buffer fit in L2, random atomics
+    are already cheap and there is nothing to win. Measured backward, dense vs scattered:
+
+        8 vars,   64 latents,   2k cats, k=48   ->  0.96 vs 0.56 ms   (dense 1.7x SLOWER)
+        16 vars, 128 latents,   8k cats, k=64   ->  0.99 vs 0.57 ms   (dense 1.7x slower)
+        32 vars, 256 latents,  32k cats, k=128  ->  1.00 vs 0.70 ms   (dense 1.4x slower, ~67 MB, L2-resident)
+        32 vars, 1024 latents,126k cats, k=32   ->  1.68 vs 2.32 ms   (dense 1.4x faster, ~1 GB)
+        32 vars, 1024 latents,126k cats, k=1024 ->  2.71 vs 11.34 ms  (dense 4.2x faster)
+
+    The middle two have the SAME number of scatter operations (8.4M) and opposite verdicts, so the
+    footprint -- not the operation count -- is what decides it.
+    """
+    tot_num_cats = layer.nodes[0].dist.num_cats
+    lnn = layer._output_ind_range[1] - layer._output_ind_range[0]
+    ext_num_vars = kwargs["categorical_evidence_logp"].size(1)
+    if ext_num_vars == 0 or lnn % ext_num_vars != 0:
+        return False
+    num_latents = lnn // ext_num_vars
+
+    # What the scattered path touches at random: the emission parameters plus the phase-1 flow half
+    footprint = 2 * num_latents * tot_num_cats * 4
+
+    l2 = getattr(_dense_worth_it, "_l2", None)
+    if l2 is None:
+        try:
+            l2 = torch.cuda.get_device_properties(layer.params.device).L2_cache_size
+        except Exception:
+            l2 = 64 * 1024 * 1024
+        _dense_worth_it._l2 = l2
+
+    return footprint > l2
 
 
 def _dense_scratch(layer, ext_num_vars, batch_size, num_latents):
@@ -290,6 +331,57 @@ def _dense_scratch(layer, ext_num_vars, batch_size, num_latents):
         buf = torch.zeros(shape, dtype = torch.float32, device = layer.params.device)
         layer._dense_ratio_buf = buf
     return buf
+
+
+def _dense_layer_layout(layer, num_ext_vars):
+    """
+    How the layer's nodes map onto variables and param-flow blocks.
+
+    This depends only on the compiled layer, never on the step's data, so it is computed once and cached.
+    Doing it per step is what made the index build look expensive: grouping the variables by param-flow
+    block with `int(s_pfids[i])` costs one device->host sync PER VARIABLE (32 of them here, ~0.65 ms),
+    which dwarfed the ~0.2 ms of actual index work.
+
+    Returns `(num_latents, groups, lvid_of_head, pf_base, p_base)`, or None if the layout is not one
+    the dense kernels
+    support (the caller then falls back to the scattered kernel).
+    """
+    lnn = layer._output_ind_range[1] - layer._output_ind_range[0]
+    cached = getattr(layer, "_dense_layout_cache", None)
+    if cached is not None and cached[0] == (lnn, num_ext_vars):
+        return cached[1]
+
+    dev = layer.s_pfids.device
+    if num_ext_vars == 0 or lnn % num_ext_vars != 0:
+        return None
+    num_latents = lnn // num_ext_vars
+
+    # Every variable's nodes must be one contiguous run of `num_latents` slots sharing one param-flow
+    # block; that is what lets a block be described by a single (pf_base, p_base) pair per latent.
+    if not torch.equal(layer.nids.view(-1),
+                       torch.arange(num_latents, device = dev).repeat(num_ext_vars)):
+        layer._dense_layout_cache = ((lnn, num_ext_vars), None)
+        return None
+
+    head_slots = torch.arange(0, lnn, num_latents, device = dev)
+    lvid_of_head = layer.var_idmapping[layer.vids.view(-1)][head_slots]
+
+    # One host transfer for the whole thing, rather than one per variable
+    pf_of_head = layer.s_pfids[head_slots].tolist()
+
+    blocks = {}
+    for i, pf in enumerate(pf_of_head):
+        blocks.setdefault(int(pf), []).append(i)
+    groups = [sorted(v) for v in blocks.values()]
+
+    # The per-block parameter / parameter-flow row bases are static too
+    heads = [int(head_slots[g[0]]) for g in groups]
+    pf_base = torch.stack([layer.s_pfids[h : h + num_latents] for h in heads]).contiguous()
+    p_base = torch.stack([layer.s_pids[h : h + num_latents] for h in heads]).contiguous()
+
+    layout = (num_latents, groups, lvid_of_head, pf_base, p_base)
+    layer._dense_layout_cache = ((lnn, num_ext_vars), layout)
+    return layout
 
 
 def _build_dense_index(layer, kwargs):
@@ -315,27 +407,11 @@ def _build_dense_index(layer, kwargs):
 
     B, V, K = cat_ids.shape
     dev = cat_ids.device
-    lnn = layer._output_ind_range[1] - layer._output_ind_range[0]
-    if lnn % V != 0:
+
+    layout = _dense_layer_layout(layer, V)
+    if layout is None:
         return None
-    num_latents = lnn // V
-
-    # Slots of the layer, in layer order: each block of `num_latents` consecutive slots is one variable.
-    lvid_of_slot = layer.var_idmapping[layer.vids.view(-1)]
-    head_slots = torch.arange(0, lnn, num_latents, device = dev)
-    # Every variable's nodes must be one contiguous run of `num_latents` slots sharing one param-flow
-    # block; that is what lets a block be described by a single (pf_base, p_base) pair per latent.
-    if not torch.equal(layer.nids.view(-1),
-                       torch.arange(num_latents, device = dev).repeat(V)):
-        return None
-
-    lvid_of_head = lvid_of_slot[head_slots]
-    pf_of_head = layer.s_pfids[head_slots]
-
-    blocks = {}
-    for i in range(V):
-        blocks.setdefault(int(pf_of_head[i]), []).append(i)
-    groups = [sorted(v) for v in blocks.values()]
+    num_latents, groups, lvid_of_head, pf_base, p_base = layout
     G = len(groups)
 
     # ---- per block: sort the slots by category, then pad to [U, MAX_REFS] ----
@@ -371,13 +447,16 @@ def _build_dense_index(layer, kwargs):
         within = torch.arange(cat_s.numel(), device = dev) - starts[row]
 
         rc = counts.int().contiguous()
-        rs = torch.zeros([U, _DENSE_MAX_REFS], dtype = torch.int32, device = dev)
-        rp = torch.zeros([U, _DENSE_MAX_REFS], dtype = torch.float32, device = dev)
+        # [MAX_REFS, U] rather than [U, MAX_REFS]: the kernel assigns one CATEGORY per thread, so with
+        # the reference index innermost, lane-adjacent threads would read MAX_REFS apart and every lane
+        # would fetch its own sector. Transposed, a warp's reads of reference `j` are contiguous.
+        rs = torch.zeros([_DENSE_MAX_REFS, U], dtype = torch.int32, device = dev)
+        rp = torch.zeros([_DENSE_MAX_REFS, U], dtype = torch.float32, device = dev)
         # offsets are bounded by B * V * K, so 32 bits is plenty
-        rg = torch.zeros([U, _DENSE_MAX_REFS], dtype = torch.int32, device = dev)
-        rs[row, within] = slot.reshape(-1)[order].int()
-        rp[row, within] = pt_g.reshape(-1)[order]
-        rg[row, within] = goff.reshape(-1)[order].int()
+        rg = torch.zeros([_DENSE_MAX_REFS, U], dtype = torch.int32, device = dev)
+        rs[within, row] = slot.reshape(-1)[order].int()
+        rp[within, row] = pt_g.reshape(-1)[order]
+        rg[within, row] = goff.reshape(-1)[order].int()
 
         uniq_l.append(uniq.int()); slot_l.append(rs); pt_l.append(rp); goff_l.append(rg)
         cnt_l.append(rc)
@@ -385,25 +464,25 @@ def _build_dense_index(layer, kwargs):
 
     Umax = max(n_uniq)
 
-    def _pad(ts):
+    def _pad(ts, dim = 0):
         out = []
         for t in ts:
-            if t.size(0) < Umax:
-                pad = t.new_zeros((Umax - t.size(0),) + tuple(t.shape[1:]))
-                t = torch.cat([t, pad], dim = 0)
+            if t.size(dim) < Umax:
+                shape = list(t.shape)
+                shape[dim] = Umax - t.size(dim)
+                t = torch.cat([t, t.new_zeros(shape)], dim = dim)
             out.append(t)
         return torch.stack(out).contiguous()
 
-    heads = [head_slots[g[0]] for g in groups]
     index = dict(
         uniq = _pad(uniq_l),                                              # [G, Umax]
-        ref_slot = _pad(slot_l),                            # [G, Umax, MAX_REFS]
-        ref_pt = _pad(pt_l),
-        ref_goff = _pad(goff_l),
+        ref_slot = _pad(slot_l, dim = 1),                            # [G, Umax, MAX_REFS]
+        ref_pt = _pad(pt_l, dim = 1),
+        ref_goff = _pad(goff_l, dim = 1),
         ref_cnt = _pad(cnt_l),                                               # [G, Umax]
         num_uniq = torch.tensor(n_uniq, dtype = torch.int32, device = dev),   # [G]
-        pf_base = torch.stack([layer.s_pfids[h : h + num_latents] for h in heads]).contiguous(),
-        p_base = torch.stack([layer.s_pids[h : h + num_latents] for h in heads]).contiguous(),
+        pf_base = pf_base,
+        p_base = p_base,
         num_blocks = G,
         num_latents = num_latents,
         Umax = Umax,
@@ -460,6 +539,58 @@ def _prep_args_bk_dense_prologue(layer, kwargs):
     return target_kwargs, grid
 
 
+class _DenseDenomDispatch:
+    """Routes the expected-category flow phase to the CUDA kernel when enabled, else Triton.
+
+    `post_bp_fns` entries are launched as ``kernel[grid](**kwargs)``, so this mimics that protocol: the
+    CUDA path ignores the Triton launch geometry and reads what it needs out of the keyword arguments.
+    Falls back transparently if the extension will not compile (no nvcc / no ninja), so it is never
+    required for correctness.
+
+    :note: ON by default (disable with PYJUICE_SOFTEVI_DENSE_CUDA=0), and it wins for exactly one
+           reason. This phase is dominated by the `param_flows` read-modify-write (0.75 of 1.68 ms in
+           an ablation, against a 0.62 ms traffic floor). Expressed as `atomicAdd` with the result
+           unused, that lowers to RED.E.ADD.F32 -- the add happens in L2 and nothing returns to the SM,
+           halving the SM<->L2 traffic -- which takes the kernel 1.66 -> 1.37 ms. Triton cannot express
+           it: `tl.atomic_add` there is 1.5x SLOWER than load-add-store. Net on the input-layer
+           backward: ~1.85 ms CUDA vs ~2.09 ms Triton. Phase-1 output is bit-identical between the two.
+           Everything else tried made no difference (float4 ratio loads, shared-memory staging of the
+           ratio slice, streaming cache hints, thread counts 64-1024).
+    """
+
+    def __init__(self, triton_kernel):
+        self.triton_kernel = triton_kernel
+        self._use_cuda = None
+
+    def _cuda_ok(self):
+        if self._use_cuda is None:
+            if os.environ.get("PYJUICE_SOFTEVI_DENSE_CUDA", "1") == "0":
+                self._use_cuda = False
+            else:
+                try:
+                    from .c_kernels import dense_expected_flow_available
+                    self._use_cuda = dense_expected_flow_available()
+                except Exception:
+                    self._use_cuda = False
+        return self._use_cuda
+
+    def __getitem__(self, grid):
+        if not self._cuda_ok():
+            return self.triton_kernel[grid]
+
+        def launch(**kw):
+            from .c_kernels import dense_expected_flow
+            dense_expected_flow(
+                kw["params_ptr"], kw["param_flows_ptr"], kw["ratio_ptr"],
+                kw["uniq_ptr"], kw["ref_slot_ptr"], kw["ref_pt_ptr"], kw["ref_goff_ptr"],
+                kw["ref_cnt_ptr"], kw["num_uniq_ptr"], kw["pf_base_ptr"], kw["p_base_ptr"],
+                kw["categorical_evidence_logp_grad_ptr"] if kw["update_extflows"] else None,
+                kw["num_latents"], kw["tot_num_cats"], kw["UNIQ_STRIDE"], kw["MAX_REFS"],
+                grid[2], kw.get("CUDA_THREADS", 256), kw["ratio_ptr"].size(0), kw.get("CUDA_TL", 32))
+
+        return launch
+
+
 def _condition_bk_dense_denom(layer, kwargs):
     return _dense_topk_applicable(layer, kwargs)
 
@@ -492,6 +623,11 @@ def _prep_args_bk_dense_denom(layer, kwargs):
     target_kwargs["tot_num_cats"] = layer.nodes[0].dist.num_cats
     target_kwargs["pf_row_stride"] = 2 * layer.nodes[0].dist.num_cats
     target_kwargs["MAX_REFS"] = _DENSE_MAX_REFS
+    # CUDA-path launch geometry, kept separate from the Triton tile so each can be tuned on its own.
+    # TL = latents per thread: swept 4/8/16/32/64 -> 2.17/1.83/1.72/1.58/1.67 ms (32 is the optimum;
+    # 64 regresses on register pressure). Threads 64-256 are within noise, 256 marginally best.
+    target_kwargs["CUDA_TL"] = 32
+    target_kwargs["CUDA_THREADS"] = 256
     target_kwargs["UNIQ_STRIDE"] = index["Umax"]
     # Swept on the CoDD config with the evidence-gradient term folded in; the optimum differs from the
     # fold-off optimum (the fold adds live temporaries), so re-sweep if that term ever moves out.
@@ -654,7 +790,7 @@ class SoftEvidenceCategorical(Distribution):
             # `bk_softevi_kernel` above, which stays the fallback for every other case). Order matters:
             # the prologue writes the ratio scratch that the denominator kernel reads.
             (self.bk_dense_prologue_kernel, _condition_bk_dense_prologue, _prep_args_bk_dense_prologue),
-            (self.bk_dense_denom_kernel, _condition_bk_dense_denom, _prep_args_bk_dense_denom)
+            (_DenseDenomDispatch(self.bk_dense_denom_kernel), _condition_bk_dense_denom, _prep_args_bk_dense_denom)
         ]
 
         self.sampling_fns = [
@@ -1376,10 +1512,18 @@ class SoftEvidenceCategorical(Distribution):
         s_pids = tl.load(s_pids_ptr + offsets_n, mask = mask_n, other = 0)
         s_pfids = tl.load(s_pfids_ptr + offsets_n, mask = mask_n, other = 0)
 
-        nmars = tl.load(node_mars_ptr + (offsets_n + node_offset)[None,:] * batch_size + offsets_b[:,None],
-                        mask = mask_bn, other = 0.0)
-        nflows = tl.load(node_flows_ptr + (offsets_n + node_offset)[None,:] * batch_size + offsets_b[:,None],
-                         mask = mask_bn, other = 0.0)
+        # `node_mars` / `node_flows` are laid out [node, batch], so load them with the BATCH axis
+        # innermost and transpose in registers. Loading them directly as [batch, node] -- which is the
+        # orientation the rest of this kernel wants -- puts a stride of `batch_size` floats between
+        # adjacent lanes, so each lane pulls its own 32-byte sector for 4 useful bytes. That alone was
+        # 0.50 of the prologue's 0.63 ms.
+        mask_nb = mask_n[:,None] & mask_b[None,:]
+        nmars = tl.trans(tl.load(
+            node_mars_ptr + (offsets_n + node_offset)[:,None] * batch_size + offsets_b[None,:],
+            mask = mask_nb, other = 0.0))
+        nflows = tl.trans(tl.load(
+            node_flows_ptr + (offsets_n + node_offset)[:,None] * batch_size + offsets_b[None,:],
+            mask = mask_nb, other = 0.0))
 
         # Keep the log form for the ratio and the linear form for the observed-category flow, rather
         # than the exp -> log round trip the scattered kernel does.
@@ -1466,7 +1610,7 @@ class SoftEvidenceCategorical(Distribution):
         p_base = tl.load(p_base_ptr + pid_g * num_latents + offs_l, mask = mask_l, other = 0)
         beta = tl.load(params_ptr + p_base[:,None] + cats[None,:], mask = m, other = 0.0) # [BLOCK_L, BLOCK_C]
 
-        ref_base = pid_g * (UNIQ_STRIDE * MAX_REFS) + offs_c * MAX_REFS
+        ref_base = pid_g * (MAX_REFS * UNIQ_STRIDE) + offs_c   # + j * UNIQ_STRIDE below
 
         # Reference lists are padded to MAX_REFS but average ~2 entries, and the evidence-gradient term
         # below costs real work on every iteration (it scaled +1.1 ms from MAX_REFS=1 to 16). So bound the
@@ -1476,8 +1620,8 @@ class SoftEvidenceCategorical(Distribution):
 
         acc = tl.zeros([BLOCK_L, BLOCK_C], dtype = tl.float32)
         for j in range(num_refs):
-            s = tl.load(ref_slot_ptr + ref_base + j, mask = mask_c, other = 0).to(tl.int64)
-            p = tl.load(ref_pt_ptr + ref_base + j, mask = mask_c, other = 0.0)
+            s = tl.load(ref_slot_ptr + ref_base + j * UNIQ_STRIDE, mask = mask_c, other = 0).to(tl.int64)
+            p = tl.load(ref_pt_ptr + ref_base + j * UNIQ_STRIDE, mask = mask_c, other = 0.0)
 
             # ratio[slot, latent] out of a ~1 MB (L2-resident) scratch. Load it [C, L] so the LATENT axis
             # is innermost and each (cat, ref) reads a contiguous run, then transpose in registers --
@@ -1491,12 +1635,16 @@ class SoftEvidenceCategorical(Distribution):
             if update_extflows:
                 # expected-value term of the external evidence gradient, from the beta already in registers
                 part = tl.sum(r_t * beta, axis = 0)                          # [BLOCK_C]
-                goff = tl.load(ref_goff_ptr + ref_base + j, mask = mask_c, other = 0)
+                goff = tl.load(ref_goff_ptr + ref_base + j * UNIQ_STRIDE, mask = mask_c, other = 0)
                 tl.atomic_add(categorical_evidence_logp_grad_ptr + goff, -p * part,
                               mask = mask_c & (p != 0.0))
 
         pf_base = tl.load(pf_base_ptr + pid_g * num_latents + offs_l, mask = mask_l, other = 0)
         optr = param_flows_ptr + pf_base[:,None] + tot_num_cats + cats[None,:]
+        # One owner per (row, category), so this is a plain read-modify-write.
+        # :note: `tl.atomic_add` here is 1.5x SLOWER (2.09 -> 3.22 ms) even though the equivalent
+        #        `atomicAdd` in the CUDA kernel is 1.2x FASTER -- Triton does not lower it to a bare
+        #        RED (reduction) instruction. That asymmetry is the reason the CUDA path exists.
         tl.store(optr, tl.load(optr, mask = m, other = 0.0) + beta * acc, mask = m)
 
     @staticmethod
