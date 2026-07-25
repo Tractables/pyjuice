@@ -4,6 +4,7 @@ import torch
 import triton
 import triton.language as tl
 import math
+import os
 from typing import Tuple, Optional, Any
 
 from .distributions import Distribution
@@ -30,9 +31,14 @@ def sort_soft_evidence_candidates(categorical_evidence_logp: torch.Tensor, soft_
     consecutive `k` adjacent (~`num_cats/k` categories apart), which is a large win -- and it is what
     makes the kernels' candidate-innermost tile layout pay off.
 
-    Measured on the CoDD/latent config (homogeneous HMM, seq 32, 1024 latents, 126464 cats, top-k 1024,
-    batch 8, dual-flow backward), whole-PC forward+backward: **81.5 ms -> 20.7 ms (3.9x)**, for a sort
-    cost of 0.086 ms per step. The log-likelihood was bit-identical.
+Measured on the CoDD/latent config (homogeneous HMM, seq 32, 1024 latents, 126464 cats, top-k 1024,
+    batch 8, dual-flow backward), the FORWARD goes from 17.1 ms to 3.9 ms (4.3x) for a sort cost of
+    0.06 ms per step, with a bit-identical log-likelihood.
+
+    :note: this matters for the forward only. The backward's expensive phase now uses an inverted index
+           (see the note above `_dense_topk_applicable`) which is order-independent by construction --
+           it measured 5.34 ms unsorted vs 5.33 ms sorted. So sorting is worth it for the forward, and
+           harmless for the backward.
 
     Permuting the candidate axis is semantically a no-op: `k` is only ever used as an index into the
     paired (`soft_evidence_cat_ids`, `categorical_evidence_logp`) lists. Three things to keep in mind:
@@ -116,8 +122,9 @@ def _prep_args_apply_fw_kernel(layer, kwargs):
         K_NUM_TILES = triton.cdiv(num_cats, TILE_SIZE_K)
         BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
         BLOCK_SIZE_B = min(128, 1024 // TILE_SIZE_K, BATCH_SIZE_NP2)
-        # :note: the backward's F- phase wants a bigger tile (see `_prep_args_apply_bk_softevi_kernel`),
-        #        but the forward measured best at this 4096-element budget -- do not "fix" it to match.
+        # :note: the backward's expected-category flow phase wants a bigger tile (see
+        #        `_prep_args_apply_bk_softevi_kernel`), but the forward measured best at this
+        #        4096-element budget -- do not "fix" it to match.
         BLOCK_SIZE_N = min(n_block_size, max(4096 // BLOCK_SIZE_B // TILE_SIZE_K, 1))
     else:
         TILE_SIZE_K = min(64, triton.next_power_of_2(num_cats))
@@ -201,9 +208,298 @@ def _prep_args_apply_bk_params_kernel(layer, kwargs):
     return target_kwargs, grid
 
 
+###############################################################################################
+##  The two parameter-flow phases, and a dense kernel for the expensive one                  ##
+###############################################################################################
+#
+# WHAT THE TWO PHASES ARE
+#
+# With `_dual_flow_backward`, `num_param_flows()` is `2 * num_cats`, so each node's slice of
+# `param_flows` holds two concatenated accumulators of width `num_cats`:
+#
+#   phase 0, at offset 0            -- the OBSERVED-category flow. Exactly what a plain `Categorical`
+#                                      accumulates: the node flow added at the observed category, so it
+#                                      is nonzero in at most one category per (node, sample).
+#   phase 1, at offset `num_cats`   -- the EXPECTED-category flow. The same node flow, but spread across
+#                                      every category the leaf considers possible, in proportion to the
+#                                      leaf's own posterior over categories,
+#                                      `beta[node, c] * p_theta(c) / Z`. It is the model's expected
+#                                      sufficient statistic rather than an observed count, so it is
+#                                      dense over the candidate set.
+#
+# The M-step then forms roughly `beta * (phase0 + pseudocount/K) / (phase1 + pseudocount*beta)` -- an
+# observed count divided by an expected count. Dividing by the expected count is what makes the update
+# a NORMALIZED (conditional) one instead of the plain joint-likelihood update a single flow gives.
+# Elsewhere in this file the two phases are written `F+` / `F-`, or "numerator" / "denominator".
+#
+# WHY PHASE 1 IS THE EXPENSIVE ONE, AND HOW THIS KERNEL FIXES IT
+#
+# Being dense over the candidate set, phase 1 must be touched once per (node, candidate) rather than
+# once per (node, sample). The straightforward way -- what `bk_softevi_kernel` does -- is to walk the
+# soft-evidence slots and scatter:
+#     phase1[row(position, latent), cat] += ratio[position, batch, latent] * beta[latent, cat] * p_theta
+# one `atomic_add` per (position, batch, candidate) slot. On the CoDD config that is 268M random atomics
+# into a multi-GB buffer. But it is a NEARLY INJECTIVE scatter executed randomly: it writes only ~113M
+# distinct (row, cat) slots, i.e. ~1.3 slots reference each category. And the cost is the address
+# pattern, not the atomic -- those same 268M `atomic_add`s take 1.0 ms coalesced versus 44 ms scattered.
+#
+# So invert it. Group the slots by category once per step, then walk (latent x category) with the
+# CATEGORY axis innermost -- the only axis of `param_flows` that is contiguous -- which gives every
+# (row, cat) a single owner and needs no atomic at all:
+#     phase1[row, c] = beta[l, c] * sum over the slots referencing c of ratio[slot, l] * p_theta[slot]
+# The per-category reference lists are tiny, so they are padded to `MAX_REFS` and masked. The same
+# `beta` read also serves the external-evidence gradient's expected-value term, so that is folded into
+# the same walk rather than paying for the reads twice.
+#
+# Measured on the CoDD config (seq 32, 1024 latents, 126464 cats, top-k 1024, batch 8, one param-flow
+# block), whole-PC backward: 65.7 ms -> 5.3 ms. Being index-driven it is also insensitive to the order of
+# the candidate axis, unlike the scattered kernel it replaces.
+
+_DENSE_TOPK_BACKWARD = os.environ.get("PYJUICE_SOFTEVI_DENSE_BACKWARD", "1") != "0"
+
+# Cap on how many soft-evidence slots may reference one category. ~1.3 is typical; the index build
+# checks the real maximum and falls back to the scattered kernel if it is exceeded, so this only bounds
+# how much padding is wasted.
+_DENSE_MAX_REFS = 16
+
+
+def _dense_topk_applicable(layer, kwargs):
+    """Whether to use the dense kernels for the expected-category flow phase (see the note above).
+
+    Only that phase changes; the observed-category flow, the evidence gradient and the forward are
+    computed exactly as before, and any case this does not cover falls back to `bk_softevi_kernel`."""
+    if not _DENSE_TOPK_BACKWARD:
+        return False
+    if "categorical_evidence_logp" not in kwargs:
+        return False
+    if kwargs.get("soft_evidence_cat_ids", None) is None:
+        return False
+    if not kwargs["dual_flow_backward"]:
+        # Without the dual-flow denominator there is no scatter to eliminate.
+        return False
+    if layer.provided("bk_local_ids"):
+        return False
+    return _build_dense_index(layer, kwargs) is not None
+
+
+def _dense_scratch(layer, ext_num_vars, batch_size, num_latents):
+    """[ext_num_vars * batch_size, num_latents] scratch for the per-(slot, latent) flow/Z ratio (~1 MB)."""
+    shape = (ext_num_vars * batch_size, num_latents)
+    buf = getattr(layer, "_dense_ratio_buf", None)
+    if buf is None or tuple(buf.shape) != shape or buf.device != layer.params.device:
+        buf = torch.zeros(shape, dtype = torch.float32, device = layer.params.device)
+        layer._dense_ratio_buf = buf
+    return buf
+
+
+def _build_dense_index(layer, kwargs):
+    """
+    Invert (position, batch, candidate) -> category, once per step, per param-flow block.
+
+    Returns a dict of device tensors (padded over blocks so one launch covers all of them), or None if
+    the layout is not supported -- in which case the caller falls back to the scattered kernel.
+
+    Cached on the layer and keyed by the identity of `soft_evidence_cat_ids`, so the forward and the
+    backward of a step share one build.
+    """
+    cat_ids = kwargs["soft_evidence_cat_ids"]
+    evidence = kwargs["categorical_evidence_logp"]
+
+    # `batch_size` is injected into `kwargs` only after the condition check, so take it from the tensor
+    # (the layer asserts these agree in the prep functions).
+    key = (cat_ids.data_ptr(), cat_ids._version, evidence.data_ptr(), evidence._version,
+           tuple(cat_ids.shape))
+    cached = getattr(layer, "_dense_index_cache", None)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+
+    B, V, K = cat_ids.shape
+    dev = cat_ids.device
+    lnn = layer._output_ind_range[1] - layer._output_ind_range[0]
+    if lnn % V != 0:
+        return None
+    num_latents = lnn // V
+
+    # Slots of the layer, in layer order: each block of `num_latents` consecutive slots is one variable.
+    lvid_of_slot = layer.var_idmapping[layer.vids.view(-1)]
+    head_slots = torch.arange(0, lnn, num_latents, device = dev)
+    # Every variable's nodes must be one contiguous run of `num_latents` slots sharing one param-flow
+    # block; that is what lets a block be described by a single (pf_base, p_base) pair per latent.
+    if not torch.equal(layer.nids.view(-1),
+                       torch.arange(num_latents, device = dev).repeat(V)):
+        return None
+
+    lvid_of_head = lvid_of_slot[head_slots]
+    pf_of_head = layer.s_pfids[head_slots]
+
+    blocks = {}
+    for i in range(V):
+        blocks.setdefault(int(pf_of_head[i]), []).append(i)
+    groups = [sorted(v) for v in blocks.values()]
+    G = len(groups)
+
+    # ---- per block: sort the slots by category, then pad to [U, MAX_REFS] ----
+    uniq_l, slot_l, pt_l, goff_l, n_uniq = [], [], [], [], []
+    pt_all = evidence.exp()
+    for g in groups:
+        lv = lvid_of_head[torch.tensor(g, device = dev)]                     # [Gp] layer-local var ids
+
+        ids_g = cat_ids[:, lv, :]                                            # [B, Gp, K]
+        pt_g = pt_all[:, lv, :]
+        Gp = lv.numel()
+
+        # slot id indexes the [V*B, num_latents] ratio scratch
+        slot = (lv.view(1, Gp, 1) * B + torch.arange(B, device = dev).view(B, 1, 1)).expand(B, Gp, K)
+        # gradient offset into `categorical_evidence_logp_grad` [B, V, K]
+        goff = (torch.arange(B, device = dev).view(B, 1, 1) * (V * K) +
+                lv.view(1, Gp, 1) * K + torch.arange(K, device = dev).view(1, 1, K)).expand(B, Gp, K)
+
+        cat_f, slot_f, pt_f, goff_f = (ids_g.reshape(-1), slot.reshape(-1),
+                                       pt_g.reshape(-1), goff.reshape(-1))
+        order = cat_f.argsort()
+        cat_s = cat_f[order]
+
+        uniq, counts = torch.unique_consecutive(cat_s, return_counts = True)
+        if int(counts.max().item()) > _DENSE_MAX_REFS:
+            return None                                                      # -> scattered fallback
+
+        U = uniq.numel()
+        starts = torch.cat([counts.new_zeros(1), counts.cumsum(0)[:-1]])
+        within = torch.arange(cat_s.numel(), device = dev) - starts.repeat_interleave(counts)
+        row = torch.arange(U, device = dev).repeat_interleave(counts)
+
+        rs = torch.zeros([U, _DENSE_MAX_REFS], dtype = torch.int32, device = dev)
+        rp = torch.zeros([U, _DENSE_MAX_REFS], dtype = torch.float32, device = dev)
+        rg = torch.zeros([U, _DENSE_MAX_REFS], dtype = torch.int64, device = dev)
+        rs[row, within] = slot_f[order].int()
+        rp[row, within] = pt_f[order]
+        rg[row, within] = goff_f[order]
+
+        uniq_l.append(uniq.int()); slot_l.append(rs); pt_l.append(rp); goff_l.append(rg)
+        n_uniq.append(U)
+
+    Umax = max(n_uniq)
+
+    def _pad(ts):
+        out = []
+        for t in ts:
+            if t.size(0) < Umax:
+                pad = t.new_zeros((Umax - t.size(0),) + tuple(t.shape[1:]))
+                t = torch.cat([t, pad], dim = 0)
+            out.append(t)
+        return torch.stack(out).contiguous()
+
+    heads = [head_slots[g[0]] for g in groups]
+    index = dict(
+        uniq = _pad(uniq_l),                                              # [G, Umax]
+        ref_slot = _pad(slot_l),                            # [G, Umax, MAX_REFS]
+        ref_pt = _pad(pt_l),
+        ref_goff = _pad(goff_l),
+        num_uniq = torch.tensor(n_uniq, dtype = torch.int32, device = dev),   # [G]
+        pf_base = torch.stack([layer.s_pfids[h : h + num_latents] for h in heads]).contiguous(),
+        p_base = torch.stack([layer.s_pids[h : h + num_latents] for h in heads]).contiguous(),
+        num_blocks = G,
+        num_latents = num_latents,
+        Umax = Umax,
+    )
+
+    layer._dense_index_cache = (key, index)
+    return index
+
+
+def _condition_bk_dense_prologue(layer, kwargs):
+    return _dense_topk_applicable(layer, kwargs)
+
+
+def _prep_args_bk_dense_prologue(layer, kwargs):
+    """Everything the scattered kernel does except the expected-category flow phase: the observed-category
+    flow, the observed-token term of the external evidence gradient, and the per-(slot, latent) ratio that
+    the expected-flow kernel consumes."""
+    target_kwargs = dict()
+
+    batch_size = kwargs["batch_size"]
+    evidence = kwargs["categorical_evidence_logp"]
+    assert evidence.size(0) == batch_size, "Batch size doesn't match in `categorical_evidence_logp`."
+    index = _build_dense_index(layer, kwargs)
+
+    ext_num_vars = evidence.size(1)
+    num_cats = evidence.size(2)
+
+    target_kwargs["categorical_evidence_logp_ptr"] = evidence
+    target_kwargs["soft_evidence_cat_ids_ptr"] = kwargs["soft_evidence_cat_ids"]
+    target_kwargs["var_idmapping_ptr"] = layer.var_idmapping
+    target_kwargs["ext_num_vars"] = ext_num_vars
+    target_kwargs["num_cats"] = num_cats
+    target_kwargs["num_latents"] = index["num_latents"]
+
+    grad = kwargs.get("categorical_evidence_logp_grad", None)
+    target_kwargs["categorical_evidence_logp_grad_ptr"] = grad
+    target_kwargs["update_extflows"] = grad is not None
+
+    target_kwargs["ratio_ptr"] = _dense_scratch(layer, ext_num_vars, batch_size, index["num_latents"])
+
+    n_block_size = max_power_of_2_factor(layer.n_block_size)
+    TILE_SIZE_K = min(16, triton.next_power_of_2(num_cats))
+    BLOCK_SIZE_B = min(128, 1024 // TILE_SIZE_K, triton.next_power_of_2(batch_size))
+    BLOCK_SIZE_N = min(n_block_size, max(8192 // BLOCK_SIZE_B // TILE_SIZE_K, 1))
+
+    target_kwargs["TILE_SIZE_K"] = TILE_SIZE_K
+    target_kwargs["K_NUM_TILES"] = triton.cdiv(num_cats, TILE_SIZE_K)
+    target_kwargs["BLOCK_SIZE_B"] = BLOCK_SIZE_B
+    target_kwargs["BLOCK_SIZE_N"] = BLOCK_SIZE_N
+
+    layer_num_nodes = layer._output_ind_range[1] - layer._output_ind_range[0]
+    grid = (triton.cdiv(batch_size, BLOCK_SIZE_B), triton.cdiv(layer_num_nodes, BLOCK_SIZE_N))
+
+    return target_kwargs, grid
+
+
+def _condition_bk_dense_denom(layer, kwargs):
+    return _dense_topk_applicable(layer, kwargs)
+
+
+def _prep_args_bk_dense_denom(layer, kwargs):
+    target_kwargs = dict()
+
+    batch_size = kwargs["batch_size"]
+    evidence = kwargs["categorical_evidence_logp"]
+    assert evidence.size(0) == batch_size, "Batch size doesn't match in `categorical_evidence_logp`."
+    index = _build_dense_index(layer, kwargs)
+
+    num_latents = index["num_latents"]
+
+    target_kwargs["uniq_ptr"] = index["uniq"]
+    target_kwargs["ref_slot_ptr"] = index["ref_slot"]
+    target_kwargs["ref_pt_ptr"] = index["ref_pt"]
+    target_kwargs["ref_goff_ptr"] = index["ref_goff"]
+    target_kwargs["num_uniq_ptr"] = index["num_uniq"]
+    target_kwargs["pf_base_ptr"] = index["pf_base"]
+    target_kwargs["p_base_ptr"] = index["p_base"]
+    target_kwargs["ratio_ptr"] = _dense_scratch(layer, evidence.size(1), batch_size, num_latents)
+
+    grad = kwargs.get("categorical_evidence_logp_grad", None)
+    target_kwargs["categorical_evidence_logp_grad_ptr"] = grad
+    target_kwargs["update_extflows"] = grad is not None
+
+    target_kwargs["num_latents"] = num_latents
+    target_kwargs["tot_num_cats"] = layer.nodes[0].dist.num_cats
+    target_kwargs["pf_row_stride"] = 2 * layer.nodes[0].dist.num_cats
+    target_kwargs["MAX_REFS"] = _DENSE_MAX_REFS
+    target_kwargs["UNIQ_STRIDE"] = index["Umax"]
+    target_kwargs["BLOCK_L"] = 32
+    target_kwargs["BLOCK_C"] = 64
+
+    grid = (triton.cdiv(num_latents, target_kwargs["BLOCK_L"]),
+            triton.cdiv(index["Umax"], target_kwargs["BLOCK_C"]),
+            index["num_blocks"])
+
+    return target_kwargs, grid
+
+
 def _condition_apply_bk_softevi_kernel(layer, kwargs):
     return "categorical_evidence_logp" in kwargs and \
-        ("categorical_evidence_logp_grad" in kwargs or kwargs["dual_flow_backward"])
+        ("categorical_evidence_logp_grad" in kwargs or kwargs["dual_flow_backward"]) and \
+        not _dense_topk_applicable(layer, kwargs)
 
 
 def _prep_args_apply_bk_softevi_kernel(layer, kwargs):
@@ -258,11 +554,11 @@ def _prep_args_apply_bk_softevi_kernel(layer, kwargs):
         K_NUM_TILES = triton.cdiv(num_cats, TILE_SIZE_K)
         BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
         BLOCK_SIZE_B = min(128, 1024 // TILE_SIZE_K, BATCH_SIZE_NP2)
-        # A LARGER [B, N, K] tile wins here: every CTA pays a full K_NUM_TILES prologue (logZ + the
-        # observed-token search) before the F- phase, so shrinking BLOCK_SIZE_N multiplies that fixed
-        # cost by the extra CTA count -- more than it saves on the scatter. Budget 8192 tile elements
-        # rather than 4096. Measured on the CoDD config (T=32, L=1024, C=126464, top-k 1024, B=8) with
-        # sorted candidate ids: backward 20.0 -> 14.8 ms (BLOCK_SIZE_N 32 -> 64).
+        # A LARGER [B, N, K] tile wins here: every CTA pays a full K_NUM_TILES prologue (the local
+        # normalizer + the observed-token search) before the expected-category flow phase, so shrinking
+        # BLOCK_SIZE_N multiplies that fixed cost by the extra CTA count -- more than it saves on the
+        # scatter. Budget 8192 tile elements rather than 4096. Measured on the CoDD config (T=32,
+        # L=1024, C=126464, top-k 1024, B=8) with sorted candidate ids: backward 20.0 -> 14.8 ms.
         BLOCK_SIZE_N = min(n_block_size, max(8192 // BLOCK_SIZE_B // TILE_SIZE_K, 1))
     else:
         TILE_SIZE_K = min(64, triton.next_power_of_2(num_cats))
@@ -323,10 +619,9 @@ class SoftEvidenceCategorical(Distribution):
     A class representing a Categorical distribution that allows external soft evidence.
 
     :note: with top-k soft evidence (i.e. when `soft_evidence_cat_ids` is supplied), pass the candidate
-           axis SORTED BY CATEGORY ID -- see :func:`sort_soft_evidence_candidates`. The kernels are
-           bound by the scattered `params` / `param_flows` traffic addressed through `cat_ids`, so the
-           candidate order dominates their cost: 3.9x on a whole forward+backward of the CoDD/latent
-           config, for a 0.09 ms sort. Sorting is semantically a no-op.
+           axis SORTED BY CATEGORY ID -- see :func:`sort_soft_evidence_candidates`. The forward is bound
+           by the `params` gather addressed through `cat_ids`, so the candidate order dominates its cost:
+           4.3x on the CoDD/latent config for a 0.06 ms sort. Sorting is semantically a no-op.
 
     :param num_cats: number of categories
     :type num_cats: int
@@ -345,7 +640,12 @@ class SoftEvidenceCategorical(Distribution):
 
         self.post_bp_fns = [
             (self.bk_params_kernel, _condition_apply_bk_params_kernel, _prep_args_apply_bk_params_kernel),
-            (self.bk_softevi_kernel, _condition_apply_bk_softevi_kernel, _prep_args_apply_bk_softevi_kernel)
+            (self.bk_softevi_kernel, _condition_apply_bk_softevi_kernel, _prep_args_apply_bk_softevi_kernel),
+            # Dense top-k denominator path (dedicated kernels; mutually exclusive with the scattered
+            # `bk_softevi_kernel` above, which stays the fallback for every other case). Order matters:
+            # the prologue writes the ratio scratch that the denominator kernel reads.
+            (self.bk_dense_prologue_kernel, _condition_bk_dense_prologue, _prep_args_bk_dense_prologue),
+            (self.bk_dense_denom_kernel, _condition_bk_dense_denom, _prep_args_bk_dense_denom)
         ]
 
         self.sampling_fns = [
@@ -482,10 +782,10 @@ class SoftEvidenceCategorical(Distribution):
                 catids = tl.load(catids_ptr + i * TILE_SIZE_K, mask = (mask_b[:,None] & mask_c[None,:]), other = 0) # [BLOCK_SIZE_B, TILE_SIZE_K]
 
                 # Load the internal parameters
-                # :note: unlike `bk_softevi_kernel`'s F- phase, the [B, K, N] tile (node axis innermost)
-                #        measured FASTER here -- the forward only gathers, it does not also scatter, and
-                #        the logsumexp then reduces over the innermost axis. Flipping this to [B, N, K]
-                #        cost 43% on the sorted-candidate forward (3.3 -> 4.7 ms), so leave it.
+                # :note: unlike the backward's expected-category flow phase, the [B, K, N] tile (node
+                #        axis innermost) measured FASTER here -- the forward only gathers, it does not
+                #        also scatter, and the logsumexp then reduces over the innermost axis. Flipping
+                #        this to [B, N, K] cost 43% on the sorted-candidate forward (3.3 -> 4.7 ms).
                 in_catpars_ptr = inpars_ptr[None,None,:] + catids[:,:,None] # [BLOCK_SIZE_B, TILE_SIZE_K, BLOCK_SIZE_N]
                 inpars = tl.load(in_catpars_ptr, mask = (mask_b[:,None,None] & mask_c[None,:,None] & mask_n[None,None,:]), other = 0.0) # [BLOCK_SIZE_B, TILE_SIZE_K, BLOCK_SIZE_N]
 
@@ -653,10 +953,10 @@ class SoftEvidenceCategorical(Distribution):
                 catids = tl.load(catids_ptr + i * TILE_SIZE_K, mask = (mask_b[:,None] & mask_c[None,:]), other = 0) # [BLOCK_SIZE_B, TILE_SIZE_K]
 
                 # Load the internal parameters
-                # :note: unlike `bk_softevi_kernel`'s F- phase, the [B, K, N] tile (node axis innermost)
-                #        measured FASTER here -- the forward only gathers, it does not also scatter, and
-                #        the logsumexp then reduces over the innermost axis. Flipping this to [B, N, K]
-                #        cost 43% on the sorted-candidate forward (3.3 -> 4.7 ms), so leave it.
+                # :note: unlike the backward's expected-category flow phase, the [B, K, N] tile (node
+                #        axis innermost) measured FASTER here -- the forward only gathers, it does not
+                #        also scatter, and the logsumexp then reduces over the innermost axis. Flipping
+                #        this to [B, N, K] cost 43% on the sorted-candidate forward (3.3 -> 4.7 ms).
                 in_catpars_ptr = inpars_ptr[None,None,:] + catids[:,:,None] # [BLOCK_SIZE_B, TILE_SIZE_K, BLOCK_SIZE_N]
                 inpars = tl.load(in_catpars_ptr, mask = (mask_b[:,None,None] & mask_c[None,:,None] & mask_n[None,None,:]), other = 0.0) # [BLOCK_SIZE_B, TILE_SIZE_K, BLOCK_SIZE_N]
 
@@ -942,7 +1242,7 @@ class SoftEvidenceCategorical(Distribution):
             # axis is innermost -- rather than [B, K, N]. Both the `params` gather and the `param_flows`
             # scatter address `<row base>(n) + catids(b,k)`, so with N innermost each lane of a warp lands
             # in a different node row (~0.5-1 MB apart) and every access is its own sector; with K
-            # innermost a warp stays inside ONE row. Measured on the CoDD config: F- scatter 25.4 -> 16.6
+            # innermost a warp stays inside ONE row. Measured on the CoDD config: this phase 25.4 -> 16.6
             # ms (and this is what makes sorted candidate ids pay off -- see the class docstring).
             for i in range(K_NUM_TILES):
                 mask_c = (i * TILE_SIZE_K + tl.arange(0, TILE_SIZE_K) < num_cats) # [TILE_SIZE_K]
@@ -1028,6 +1328,161 @@ class SoftEvidenceCategorical(Distribution):
                         expars_grad = tl.sum(nflow_sub_logz_sub[:,None,:] * inpars[None,:,:], axis = 2).log() + nflow_sub_logz_max + expars
 
                     tl.atomic_add(expars_grad_ptr + i * TILE_SIZE_K, -tl.exp(expars_grad), mask = (mask_b[:,None] & mask_c[None,:]))
+
+    @staticmethod
+    @triton_jit
+    def bk_dense_prologue_kernel(params_ptr, param_flows_ptr, node_flows_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, s_pfids_ptr,
+                                 metadata_ptr, s_mids_ptr, nids_ptr, bk_local_ids_ptr, layer_num_nodes, batch_size,
+                                 num_vars_per_node: tl.constexpr, num_vars: tl.constexpr, nv_block_size: tl.constexpr,
+                                 node_offset, partial_eval: tl.constexpr, logspace_flows: tl.constexpr,
+                                 BLOCK_SIZE_B: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
+                                 TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
+                                 categorical_evidence_logp_ptr, soft_evidence_cat_ids_ptr,
+                                 categorical_evidence_logp_grad_ptr, var_idmapping_ptr, ratio_ptr,
+                                 num_cats: tl.constexpr, ext_num_vars: tl.constexpr, num_latents: tl.constexpr,
+                                 update_extflows: tl.constexpr):
+        """First half of the dense top-k backward: everything except the expected-category flow phase.
+
+        Accumulates the observed-category flow, adds the observed-token term of the external evidence
+        gradient, and stores `ratio[slot, latent] = node_flow / Z` for the second kernel to consume.
+        Identical to `bk_softevi_kernel` up to and including the local normalizer `logZ`; it just stores
+        that ratio instead of running the scattered expected-flow loop."""
+
+        pid_b = tl.program_id(axis = 0)
+        pid_n = tl.program_id(axis = 1)
+
+        offsets_b = pid_b * BLOCK_SIZE_B + tl.arange(0, BLOCK_SIZE_B)
+        offsets_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+
+        mask_b = offsets_b < batch_size
+        mask_n = offsets_n < layer_num_nodes
+        mask_bn = mask_b[:,None] & mask_n[None,:]
+
+        offset_n = pid_n * BLOCK_SIZE_N
+
+        vid = tl.load(vids_ptr + offset_n)
+        lvid = tl.load(var_idmapping_ptr + vid)
+
+        nids = tl.load(nids_ptr + offsets_n, mask = mask_n, other = 0)
+        s_pids = tl.load(s_pids_ptr + offsets_n, mask = mask_n, other = 0)
+        s_pfids = tl.load(s_pfids_ptr + offsets_n, mask = mask_n, other = 0)
+
+        nmars = tl.load(node_mars_ptr + (offsets_n + node_offset)[None,:] * batch_size + offsets_b[:,None],
+                        mask = mask_bn, other = 0.0)
+        nflows = tl.load(node_flows_ptr + (offsets_n + node_offset)[None,:] * batch_size + offsets_b[:,None],
+                         mask = mask_bn, other = 0.0)
+
+        # Keep the log form for the ratio and the linear form for the observed-category flow, rather
+        # than the exp -> log round trip the scattered kernel does.
+        if logspace_flows:
+            log_nflows = nflows
+            nflows = nflows.exp()
+        else:
+            log_nflows = nflows.log()
+
+        data = tl.load(data_ptr + vid * batch_size + offsets_b, mask = mask_b, other = 0)
+
+        # Observed-category flow (phase 0)
+        tl.atomic_add(param_flows_ptr + s_pfids[None,:] + data[:,None], nflows, mask = mask_bn)
+
+        catids_ptr = soft_evidence_cat_ids_ptr + \
+            offsets_b[:,None] * (ext_num_vars * num_cats) + lvid * num_cats + tl.arange(0, TILE_SIZE_K)[None,:]
+        expar_ptr = categorical_evidence_logp_ptr + offsets_b * (ext_num_vars * num_cats) + lvid * num_cats
+        if update_extflows:
+            expar_grad_ptr = categorical_evidence_logp_grad_ptr + offsets_b * (ext_num_vars * num_cats) + lvid * num_cats
+
+        # Locate the observed token among the candidates, and accumulate the numerator half of the
+        # external gradient onto its slot
+        log_ex_p = tl.zeros([BLOCK_SIZE_B], dtype = tl.float32) - float("inf")
+        for i in range(K_NUM_TILES):
+            mask_c = (i * TILE_SIZE_K + tl.arange(0, TILE_SIZE_K) < num_cats)
+            catids = tl.load(catids_ptr + i * TILE_SIZE_K, mask = (mask_b[:,None] & mask_c[None,:]), other = 0)
+
+            is_match = ((catids == data[:,None]) & mask_c[None,:]).to(tl.int64)
+            match_ids = tl.sum(is_match * tl.arange(0, TILE_SIZE_K), axis = 1)
+            has_match = (tl.sum(is_match, axis = 1) > 0)
+
+            expar = tl.load(expar_ptr + i * TILE_SIZE_K + match_ids, mask = (mask_b & has_match), other = 0.0)
+            log_ex_p = tl.where(has_match, expar, log_ex_p)
+
+            if update_extflows:
+                tl.atomic_add(expar_grad_ptr + i * TILE_SIZE_K + match_ids, tl.sum(nflows, axis = 1),
+                              mask = (mask_b & has_match))
+
+        log_in_p = tl.load(params_ptr + s_pids[None,:] + data[:,None], mask = mask_bn, other = 0.0).log()
+        logZ = log_in_p + log_ex_p[:,None] - nmars
+
+        # ratio[slot, latent], slot = lvid * batch_size + b; `nids` is the latent index, so the store is
+        # contiguous along the innermost axis
+        ratio = tl.exp(log_nflows - logZ)
+        tl.store(ratio_ptr + (lvid * batch_size + offsets_b)[:,None] * num_latents + nids[None,:],
+                 ratio, mask = mask_bn)
+
+    @staticmethod
+    @triton_jit
+    def bk_dense_denom_kernel(params_ptr, param_flows_ptr, node_flows_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, s_pfids_ptr,
+                              metadata_ptr, s_mids_ptr, nids_ptr, bk_local_ids_ptr, layer_num_nodes, batch_size,
+                              num_vars_per_node: tl.constexpr, num_vars: tl.constexpr, nv_block_size: tl.constexpr,
+                              node_offset, partial_eval: tl.constexpr, logspace_flows: tl.constexpr,
+                              uniq_ptr, ref_slot_ptr, ref_pt_ptr, ref_goff_ptr, num_uniq_ptr,
+                              pf_base_ptr, p_base_ptr, ratio_ptr, categorical_evidence_logp_grad_ptr,
+                              num_latents: tl.constexpr, tot_num_cats: tl.constexpr, pf_row_stride: tl.constexpr,
+                              MAX_REFS: tl.constexpr, UNIQ_STRIDE: tl.constexpr,
+                              BLOCK_L: tl.constexpr, BLOCK_C: tl.constexpr,
+                              update_extflows: tl.constexpr):
+        """Second half of the dense top-k backward: the expected-category flow phase (phase 1).
+
+        Walks (latent x category) so that every (param-flow row, category) has a single owner and needs
+        no atomic:
+            phase1[row, c] = beta[l, c] * sum_j ratio[slot_j, l] * p_theta_j
+        over the soft-evidence slots j whose candidate set contains category c. The same `beta` read
+        also gives the expected-value term of the external evidence gradient, so it is folded in here:
+            evidence_grad[slot_j, k_j] -= p_theta_j * sum_l ratio[slot_j, l] * beta[l, c]
+        """
+        pid_l = tl.program_id(axis = 0)
+        pid_c = tl.program_id(axis = 1)
+        pid_g = tl.program_id(axis = 2)
+
+        num_uniq = tl.load(num_uniq_ptr + pid_g)
+
+        offs_l = pid_l * BLOCK_L + tl.arange(0, BLOCK_L)
+        offs_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+        mask_l = offs_l < num_latents
+        mask_c = offs_c < num_uniq
+        m = mask_l[:,None] & mask_c[None,:]
+
+        cats = tl.load(uniq_ptr + pid_g * UNIQ_STRIDE + offs_c, mask = mask_c, other = 0).to(tl.int64)
+
+        # beta[l, cat]: `uniq` is sorted, so this is a near-contiguous run inside each params row
+        p_base = tl.load(p_base_ptr + pid_g * num_latents + offs_l, mask = mask_l, other = 0)
+        beta = tl.load(params_ptr + p_base[:,None] + cats[None,:], mask = m, other = 0.0) # [BLOCK_L, BLOCK_C]
+
+        ref_base = pid_g * (UNIQ_STRIDE * MAX_REFS) + offs_c * MAX_REFS
+
+        acc = tl.zeros([BLOCK_L, BLOCK_C], dtype = tl.float32)
+        for j in range(MAX_REFS):
+            s = tl.load(ref_slot_ptr + ref_base + j, mask = mask_c, other = 0).to(tl.int64)
+            p = tl.load(ref_pt_ptr + ref_base + j, mask = mask_c, other = 0.0)
+
+            # ratio[slot, latent] out of a ~1 MB (L2-resident) scratch. Load it [C, L] so the LATENT axis
+            # is innermost and each (cat, ref) reads a contiguous run, then transpose in registers --
+            # loading it [L, C] puts `slot` innermost, making every lane its own sector (3x slower).
+            r = tl.load(ratio_ptr + s[:,None] * num_latents + offs_l[None,:],
+                        mask = mask_c[:,None] & mask_l[None,:], other = 0.0) # [BLOCK_C, BLOCK_L]
+            r_t = tl.trans(r)                                                # [BLOCK_L, BLOCK_C]
+
+            acc += r_t * p[None,:]
+
+            if update_extflows:
+                # expected-value term of the external evidence gradient, from the beta already in registers
+                part = tl.sum(r_t * beta, axis = 0)                          # [BLOCK_C]
+                goff = tl.load(ref_goff_ptr + ref_base + j, mask = mask_c, other = 0)
+                tl.atomic_add(categorical_evidence_logp_grad_ptr + goff, -p * part,
+                              mask = mask_c & (p != 0.0))
+
+        pf_base = tl.load(pf_base_ptr + pid_g * num_latents + offs_l, mask = mask_l, other = 0)
+        optr = param_flows_ptr + pf_base[:,None] + tot_num_cats + cats[None,:]
+        tl.store(optr, tl.load(optr, mask = m, other = 0.0) + beta * acc, mask = m)
 
     @staticmethod
     @triton_jit
