@@ -339,7 +339,7 @@ def _build_dense_index(layer, kwargs):
     G = len(groups)
 
     # ---- per block: sort the slots by category, then pad to [U, MAX_REFS] ----
-    uniq_l, slot_l, pt_l, goff_l, n_uniq = [], [], [], [], []
+    uniq_l, slot_l, pt_l, goff_l, cnt_l, n_uniq = [], [], [], [], [], []
     pt_all = evidence.exp()
     for g in groups:
         lv = lvid_of_head[torch.tensor(g, device = dev)]                     # [Gp] layer-local var ids
@@ -354,28 +354,33 @@ def _build_dense_index(layer, kwargs):
         goff = (torch.arange(B, device = dev).view(B, 1, 1) * (V * K) +
                 lv.view(1, Gp, 1) * K + torch.arange(K, device = dev).view(1, 1, K)).expand(B, Gp, K)
 
-        cat_f, slot_f, pt_f, goff_f = (ids_g.reshape(-1), slot.reshape(-1),
-                                       pt_g.reshape(-1), goff.reshape(-1))
+        # Sort 32-bit keys (category ids are < num_cats) rather than 64-bit -- this is the single most
+        # expensive step of the build.
+        cat_f = ids_g.reshape(-1).int()
         order = cat_f.argsort()
         cat_s = cat_f[order]
 
-        uniq, counts = torch.unique_consecutive(cat_s, return_counts = True)
+        # `return_inverse` gives the per-element row directly, which avoids two `repeat_interleave`s
+        uniq, inverse, counts = torch.unique_consecutive(cat_s, return_inverse = True, return_counts = True)
         if int(counts.max().item()) > _DENSE_MAX_REFS:
             return None                                                      # -> scattered fallback
 
         U = uniq.numel()
         starts = torch.cat([counts.new_zeros(1), counts.cumsum(0)[:-1]])
-        within = torch.arange(cat_s.numel(), device = dev) - starts.repeat_interleave(counts)
-        row = torch.arange(U, device = dev).repeat_interleave(counts)
+        row = inverse
+        within = torch.arange(cat_s.numel(), device = dev) - starts[row]
 
+        rc = counts.int().contiguous()
         rs = torch.zeros([U, _DENSE_MAX_REFS], dtype = torch.int32, device = dev)
         rp = torch.zeros([U, _DENSE_MAX_REFS], dtype = torch.float32, device = dev)
-        rg = torch.zeros([U, _DENSE_MAX_REFS], dtype = torch.int64, device = dev)
-        rs[row, within] = slot_f[order].int()
-        rp[row, within] = pt_f[order]
-        rg[row, within] = goff_f[order]
+        # offsets are bounded by B * V * K, so 32 bits is plenty
+        rg = torch.zeros([U, _DENSE_MAX_REFS], dtype = torch.int32, device = dev)
+        rs[row, within] = slot.reshape(-1)[order].int()
+        rp[row, within] = pt_g.reshape(-1)[order]
+        rg[row, within] = goff.reshape(-1)[order].int()
 
         uniq_l.append(uniq.int()); slot_l.append(rs); pt_l.append(rp); goff_l.append(rg)
+        cnt_l.append(rc)
         n_uniq.append(U)
 
     Umax = max(n_uniq)
@@ -395,6 +400,7 @@ def _build_dense_index(layer, kwargs):
         ref_slot = _pad(slot_l),                            # [G, Umax, MAX_REFS]
         ref_pt = _pad(pt_l),
         ref_goff = _pad(goff_l),
+        ref_cnt = _pad(cnt_l),                                               # [G, Umax]
         num_uniq = torch.tensor(n_uniq, dtype = torch.int32, device = dev),   # [G]
         pf_base = torch.stack([layer.s_pfids[h : h + num_latents] for h in heads]).contiguous(),
         p_base = torch.stack([layer.s_pids[h : h + num_latents] for h in heads]).contiguous(),
@@ -472,6 +478,7 @@ def _prep_args_bk_dense_denom(layer, kwargs):
     target_kwargs["ref_slot_ptr"] = index["ref_slot"]
     target_kwargs["ref_pt_ptr"] = index["ref_pt"]
     target_kwargs["ref_goff_ptr"] = index["ref_goff"]
+    target_kwargs["ref_cnt_ptr"] = index["ref_cnt"]
     target_kwargs["num_uniq_ptr"] = index["num_uniq"]
     target_kwargs["pf_base_ptr"] = index["pf_base"]
     target_kwargs["p_base_ptr"] = index["p_base"]
@@ -486,8 +493,10 @@ def _prep_args_bk_dense_denom(layer, kwargs):
     target_kwargs["pf_row_stride"] = 2 * layer.nodes[0].dist.num_cats
     target_kwargs["MAX_REFS"] = _DENSE_MAX_REFS
     target_kwargs["UNIQ_STRIDE"] = index["Umax"]
-    target_kwargs["BLOCK_L"] = 32
-    target_kwargs["BLOCK_C"] = 64
+    # Swept on the CoDD config with the evidence-gradient term folded in; the optimum differs from the
+    # fold-off optimum (the fold adds live temporaries), so re-sweep if that term ever moves out.
+    target_kwargs["BLOCK_L"] = 64
+    target_kwargs["BLOCK_C"] = 128
 
     grid = (triton.cdiv(num_latents, target_kwargs["BLOCK_L"]),
             triton.cdiv(index["Umax"], target_kwargs["BLOCK_C"]),
@@ -1424,7 +1433,7 @@ class SoftEvidenceCategorical(Distribution):
                               metadata_ptr, s_mids_ptr, nids_ptr, bk_local_ids_ptr, layer_num_nodes, batch_size,
                               num_vars_per_node: tl.constexpr, num_vars: tl.constexpr, nv_block_size: tl.constexpr,
                               node_offset, partial_eval: tl.constexpr, logspace_flows: tl.constexpr,
-                              uniq_ptr, ref_slot_ptr, ref_pt_ptr, ref_goff_ptr, num_uniq_ptr,
+                              uniq_ptr, ref_slot_ptr, ref_pt_ptr, ref_goff_ptr, ref_cnt_ptr, num_uniq_ptr,
                               pf_base_ptr, p_base_ptr, ratio_ptr, categorical_evidence_logp_grad_ptr,
                               num_latents: tl.constexpr, tot_num_cats: tl.constexpr, pf_row_stride: tl.constexpr,
                               MAX_REFS: tl.constexpr, UNIQ_STRIDE: tl.constexpr,
@@ -1459,8 +1468,14 @@ class SoftEvidenceCategorical(Distribution):
 
         ref_base = pid_g * (UNIQ_STRIDE * MAX_REFS) + offs_c * MAX_REFS
 
+        # Reference lists are padded to MAX_REFS but average ~2 entries, and the evidence-gradient term
+        # below costs real work on every iteration (it scaled +1.1 ms from MAX_REFS=1 to 16). So bound the
+        # loop by the largest list actually present in THIS tile rather than by the global maximum.
+        cnt = tl.load(ref_cnt_ptr + pid_g * UNIQ_STRIDE + offs_c, mask = mask_c, other = 0)
+        num_refs = tl.max(cnt)
+
         acc = tl.zeros([BLOCK_L, BLOCK_C], dtype = tl.float32)
-        for j in range(MAX_REFS):
+        for j in range(num_refs):
             s = tl.load(ref_slot_ptr + ref_base + j, mask = mask_c, other = 0).to(tl.int64)
             p = tl.load(ref_pt_ptr + ref_base + j, mask = mask_c, other = 0.0)
 
