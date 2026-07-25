@@ -254,6 +254,11 @@ class InputLayer(Layer, nn.Module):
 
         self.param_flows = None
 
+        # Whether the JIT-built Triton kernels have been constructed yet. Separate from whether they are
+        # non-None: a distribution may legitimately have no kernel for a stage, and we must not retry.
+        self._mars_kernel_built = False
+        self._flows_kernel_built = False
+
         self.device = torch.device("cpu")
 
         self._used_external_params = False
@@ -337,11 +342,17 @@ class InputLayer(Layer, nn.Module):
                 layer_num_nodes = self.fw_local_ids.size(0)
                 fw_local_ids = self.fw_local_ids
 
-            if not self.provided("_mars_kernel"):
+            # :note: guard on whether the kernel has been BUILT, not on whether it is non-None.
+            #        `provided()` is False for a None value, so distributions whose `fw_mar_fn` compiles
+            #        to nothing (e.g. the base-class no-op) re-entered this every single call --  and
+            #        `_compile_triton_kernel` re-parses Python source with `inspect`/`tokenize`, costing
+            #        ~0.4 ms per call. Caching the None makes it happen once.
+            if not self._mars_kernel_built:
                 if self.fw_mar_fn is not None:
                     self._mars_kernel = self._compile_triton_kernel(self._mars_kernel_template, mar_fn = self.fw_mar_fn)
                 else:
                     self._mars_kernel = None
+                self._mars_kernel_built = True
 
             BLOCK_SIZE = 1024
 
@@ -494,11 +505,13 @@ class InputLayer(Layer, nn.Module):
                     self.param_flows, node_flows, data, self.vids, self.s_pfids,
                     layer_num_nodes, batch_size, node_offset, bool(logspace_flows))
 
-            if not cuda_handled and not self.provided("_flows_kernel"):
+            # See the note in `forward`: cache the built kernel even when it is None.
+            if not cuda_handled and not self._flows_kernel_built:
                 if self.bk_flow_fn is not None:
                     self._flows_kernel = self._compile_triton_kernel(self._flows_kernel_template, flow_fn = self.bk_flow_fn)
                 else:
                     self._flows_kernel = None
+                self._flows_kernel_built = True
 
             BLOCK_SIZE = 1024
             TILE_SIZE_K = 1
