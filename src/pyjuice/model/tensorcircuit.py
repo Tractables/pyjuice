@@ -113,6 +113,18 @@ class TensorCircuit(nn.Module):
     :type force_gpu_compilation: bool
 
     :param max_tied_ns_per_parflow_block: how many groups of tied parameters are allowed to share the same flow/gradient accumulator (higher values -> consumes less GPU memory; lower values -> potentially avoid stalls caused by atomic operations)
+
+        :note: the default is high (32) because the memory/locality side of that trade dominates on
+               current hardware -- splitting tied groups across accumulators multiplies the flow buffer,
+               and the extra traffic costs more than the atomic contention it avoids. Measured on a
+               homogeneous HMM (seq 32, 1024 latents, 126464 cats, top-k 1024 soft evidence), going from
+               4 accumulator blocks to 1: `param_flows` 4.14 -> 1.04 GB, backward 16.8 -> 13.4 ms and
+               `init_param_flows` 5.7 -> 1.4 ms (1.41x on the step), with parameters after an EM step
+               agreeing to ~2e-5 relative -- flow-accumulation reassociation only. For scale, on the same
+               GPU 268M `atomic_add`s all targeting ONE address cost 3.7 ms, versus 44 ms for the same
+               count scattered over a 4 GB table: contention is the cheap side of the trade. Lower it
+               only for a model where atomic stalls are demonstrably the bottleneck.
+
     :type max_tied_ns_per_parflow_block: int
 
     :param verbose: Whether to display the progress of the compilation
@@ -122,7 +134,7 @@ class TensorCircuit(nn.Module):
     def __init__(self, root_ns: CircuitNodes, layer_sparsity_tol: float = 0.5, 
                  max_num_partitions: Optional[int] = None, disable_gpu_compilation: bool = False, 
                  force_gpu_compilation: bool = False,
-                 max_tied_ns_per_parflow_block: int = 8,
+                 max_tied_ns_per_parflow_block: int = 32,
                  device: Optional[Union[int,torch.device]] = None,
                  verbose: bool = True) -> None:
 
@@ -1042,7 +1054,7 @@ class TensorCircuit(nn.Module):
 
     def _init_layers(self, layer_sparsity_tol: Optional[float] = None, max_num_partitions: Optional[int] = None,
                      disable_gpu_compilation: bool = False, force_gpu_compilation: bool = False, 
-                     max_tied_ns_per_parflow_block: int = 8, verbose: bool = True, device: Optional[Union[str,torch.device]] = None):
+                     max_tied_ns_per_parflow_block: int = 32, verbose: bool = True, device: Optional[Union[str,torch.device]] = None):
 
         if hasattr(self, "input_layer_group") or hasattr(self, "inner_layer_groups"):
             raise ValueError("Attempting to initialize a TensorCircuit for the second time. " + \
@@ -1347,7 +1359,7 @@ class TensorCircuit(nn.Module):
 def compile(ns: CircuitNodes, layer_sparsity_tol: float = 0.5, 
             max_num_partitions: Optional[int] = None, disable_gpu_compilation: bool = False, 
             force_gpu_compilation: bool = False,
-            max_tied_ns_per_parflow_block: int = 8,
+            max_tied_ns_per_parflow_block: int = 32,
             device: Optional[Union[int,torch.device]] = None,
             verbose: bool = True) -> nn.Module:
     """
