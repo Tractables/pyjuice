@@ -521,6 +521,75 @@ def test_soft_evidence_categorical_dist_dual_flow_topk():
     assert torch.all(torch.abs(pflows_denom - ref_denom) < 1e-4)
 
 
+def test_soft_evidence_categorical_candidate_order_invariance():
+    # The top-k kernels are bound by the scattered params/param_flows traffic addressed through
+    # `soft_evidence_cat_ids`, so `sort_soft_evidence_candidates` reorders the candidate axis to make
+    # that traffic local (3.9x on the CoDD config). That is only sound because the candidate axis is a
+    # pure index: `k` is never interpreted, only paired between the ids and the logps. This pins that
+    # invariance down -- the LL, the F+ and F- param flows, and the external gradient must all be
+    # unchanged by ANY permutation of the candidate axis (the gradient after un-permuting, since it is
+    # itself indexed by k).
+
+    torch.manual_seed(517)
+
+    device = torch.device("cuda:0")
+
+    batch_size = 16
+    num_vars = 6
+    num_cats = 300
+    k = 48
+
+    nis = [
+        juice.inputs(v, num_nodes = 4, dist = dists.SoftEvidenceCategorical(num_cats = num_cats, _dual_flow_backward = True)) for v in range(num_vars)
+    ]
+    ns = juice.summate(juice.multiply(*nis), num_nodes = 1)
+    ns.init_parameters(perturbation = 2.0)
+
+    pc = juice.compile(ns)
+    pc.to(device)
+
+    data = torch.randint(0, num_cats, [batch_size, num_vars], device = device)
+    logp = torch.rand([batch_size, num_vars, k], device = device).log_softmax(2).contiguous()
+
+    rnd = torch.rand([batch_size, num_vars, num_cats], device = device)
+    rnd.scatter_(2, data.unsqueeze(2), 2.0)  # force the ground-truth token into the candidate set
+    ids = rnd.topk(k, dim = 2).indices.contiguous()
+
+    def run(evi, cat_ids):
+        pc.init_param_flows(flows_memory = 0.0)
+        grad = torch.zeros_like(evi)
+        lls = pc(data, categorical_evidence_logp = evi, soft_evidence_cat_ids = cat_ids)
+        pc.backward(data, allow_modify_flows = False, logspace_flows = True,
+                    categorical_evidence_logp = evi, soft_evidence_cat_ids = cat_ids,
+                    categorical_evidence_logp_grad = grad)
+        return lls.clone(), pc.input_layer_group[0].param_flows.clone(), grad
+
+    ref_lls, ref_pflows, ref_grad = run(logp, ids)
+
+    ## The library helper (sort by category id) ##
+
+    logp_s, ids_s, inverse = dists.sort_soft_evidence_candidates(logp, ids, return_inverse = True)
+
+    assert torch.all(ids_s[..., 1:] >= ids_s[..., :-1]), "helper did not sort the candidate axis"
+    assert torch.equal(torch.gather(ids_s, 2, inverse), ids), "helper's inverse permutation is wrong"
+    assert torch.equal(torch.gather(logp_s, 2, inverse), logp), "helper permuted the two arrays differently"
+
+    ## A second, arbitrary permutation, to show it is order and not sortedness that is irrelevant ##
+
+    rand_perm = torch.rand([batch_size, num_vars, k], device = device).argsort(dim = 2)
+    logp_r = torch.gather(logp, 2, rand_perm).contiguous()
+    ids_r = torch.gather(ids, 2, rand_perm).contiguous()
+
+    for label, evi, cat_ids, inv in (("sorted", logp_s, ids_s, inverse),
+                                     ("shuffled", logp_r, ids_r, rand_perm.argsort(dim = 2))):
+        lls, pflows, grad = run(evi, cat_ids)
+
+        assert torch.all(torch.abs(lls - ref_lls) < 1e-3), f"{label}: LL changed"
+        assert torch.all(torch.abs(pflows - ref_pflows) < 1e-4), f"{label}: param flows changed"
+        assert torch.all(torch.abs(torch.gather(grad, 2, inv) - ref_grad) < 1e-4), \
+            f"{label}: external gradient changed"
+
+
 def test_soft_evidence_categorical_dist_dual_flow_em_uniform():
     # Guards the principled MAP denominator (F- + pseudocount * beta). With uniform soft evidence
     # (constant logits => p_theta uniform => Z_n = 1, F- = beta * Gamma), the dual-flow EM update

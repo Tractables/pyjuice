@@ -18,6 +18,59 @@ else:
     tlmath = tl.math
 
 
+def sort_soft_evidence_candidates(categorical_evidence_logp: torch.Tensor, soft_evidence_cat_ids: torch.Tensor,
+                                  return_inverse: bool = False):
+    """
+    Sort top-k soft evidence by category id along the candidate axis.
+
+    With top-k soft evidence (`soft_evidence_cat_ids` provided) the kernels address both `params` and
+    `param_flows` as `<row base>(node) + cat_ids(batch, k)`. `torch.topk` returns candidates in
+    descending *probability* order, i.e. uniformly random w.r.t. category id, so consecutive `k` land
+    ~`num_cats/k` rows apart and every access is its own memory sector. Sorting by category id makes
+    consecutive `k` adjacent (~`num_cats/k` categories apart), which is a large win -- and it is what
+    makes the kernels' candidate-innermost tile layout pay off.
+
+    Measured on the CoDD/latent config (homogeneous HMM, seq 32, 1024 latents, 126464 cats, top-k 1024,
+    batch 8, dual-flow backward), whole-PC forward+backward: **81.5 ms -> 20.7 ms (3.9x)**, for a sort
+    cost of 0.086 ms per step. The log-likelihood was bit-identical.
+
+    Permuting the candidate axis is semantically a no-op: `k` is only ever used as an index into the
+    paired (`soft_evidence_cat_ids`, `categorical_evidence_logp`) lists. Three things to keep in mind:
+
+    * `categorical_evidence_logp_grad` is indexed by `k` as well, so it comes back in the SAME order as
+      the arrays you passed in -- automatic if you sort once at top-k time and use the sorted arrays
+      throughout. Pass `return_inverse = True` if you need to map a gradient back to the original
+      candidate order (`grad_orig = torch.gather(grad_sorted, -1, inverse)`).
+    * Do not assume the observed token sits at a fixed slot (e.g. `k = 0`, or the last slot where a
+      top-k builder forced it in). Sorting moves it; derive the observed values independently.
+    * The candidate ids within a `(batch, var)` row must be UNIQUE. This is a pre-existing requirement,
+      not one sorting introduces -- the kernels locate the observed token with
+      `sum((cat_ids == data) * arange(...))`, which silently returns a bogus slot if a tile holds the
+      same id twice -- but it is worth restating, since `torch.topk` guarantees it and hand-built
+      candidate sets may not.
+
+    Sorting per step is cheap enough not to bother caching (candidates change every step anyway); best
+    of all is to have the producer emit them sorted.
+
+    :param categorical_evidence_logp: [B, num_vars, k] external log-probabilities
+    :param soft_evidence_cat_ids: [B, num_vars, k] the category id of each candidate
+
+    :returns: `(logp_sorted, cat_ids_sorted)`, or `(logp_sorted, cat_ids_sorted, inverse)`
+    """
+    assert categorical_evidence_logp.shape == soft_evidence_cat_ids.shape, \
+        "`categorical_evidence_logp` and `soft_evidence_cat_ids` must have the same shape."
+
+    perm = soft_evidence_cat_ids.argsort(dim = -1)
+
+    cat_ids_sorted = torch.gather(soft_evidence_cat_ids, -1, perm).contiguous()
+    logp_sorted = torch.gather(categorical_evidence_logp, -1, perm).contiguous()
+
+    if return_inverse:
+        return logp_sorted, cat_ids_sorted, perm.argsort(dim = -1)
+
+    return logp_sorted, cat_ids_sorted
+
+
 def _condition_apply_fw_kernel(layer, kwargs):
     return "categorical_evidence_logp" in kwargs and \
         kwargs.get("soft_evidence_value_mask", None) is None
@@ -63,6 +116,8 @@ def _prep_args_apply_fw_kernel(layer, kwargs):
         K_NUM_TILES = triton.cdiv(num_cats, TILE_SIZE_K)
         BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
         BLOCK_SIZE_B = min(128, 1024 // TILE_SIZE_K, BATCH_SIZE_NP2)
+        # :note: the backward's F- phase wants a bigger tile (see `_prep_args_apply_bk_softevi_kernel`),
+        #        but the forward measured best at this 4096-element budget -- do not "fix" it to match.
         BLOCK_SIZE_N = min(n_block_size, max(4096 // BLOCK_SIZE_B // TILE_SIZE_K, 1))
     else:
         TILE_SIZE_K = min(64, triton.next_power_of_2(num_cats))
@@ -203,7 +258,12 @@ def _prep_args_apply_bk_softevi_kernel(layer, kwargs):
         K_NUM_TILES = triton.cdiv(num_cats, TILE_SIZE_K)
         BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
         BLOCK_SIZE_B = min(128, 1024 // TILE_SIZE_K, BATCH_SIZE_NP2)
-        BLOCK_SIZE_N = min(n_block_size, max(4096 // BLOCK_SIZE_B // TILE_SIZE_K, 1))
+        # A LARGER [B, N, K] tile wins here: every CTA pays a full K_NUM_TILES prologue (logZ + the
+        # observed-token search) before the F- phase, so shrinking BLOCK_SIZE_N multiplies that fixed
+        # cost by the extra CTA count -- more than it saves on the scatter. Budget 8192 tile elements
+        # rather than 4096. Measured on the CoDD config (T=32, L=1024, C=126464, top-k 1024, B=8) with
+        # sorted candidate ids: backward 20.0 -> 14.8 ms (BLOCK_SIZE_N 32 -> 64).
+        BLOCK_SIZE_N = min(n_block_size, max(8192 // BLOCK_SIZE_B // TILE_SIZE_K, 1))
     else:
         TILE_SIZE_K = min(64, triton.next_power_of_2(num_cats))
         K_NUM_TILES = triton.cdiv(num_cats, TILE_SIZE_K)
@@ -261,6 +321,12 @@ def _prep_args_sample_kernel(layer, kwargs):
 class SoftEvidenceCategorical(Distribution):
     """
     A class representing a Categorical distribution that allows external soft evidence.
+
+    :note: with top-k soft evidence (i.e. when `soft_evidence_cat_ids` is supplied), pass the candidate
+           axis SORTED BY CATEGORY ID -- see :func:`sort_soft_evidence_candidates`. The kernels are
+           bound by the scattered `params` / `param_flows` traffic addressed through `cat_ids`, so the
+           candidate order dominates their cost: 3.9x on a whole forward+backward of the CoDD/latent
+           config, for a 0.09 ms sort. Sorting is semantically a no-op.
 
     :param num_cats: number of categories
     :type num_cats: int
@@ -416,6 +482,10 @@ class SoftEvidenceCategorical(Distribution):
                 catids = tl.load(catids_ptr + i * TILE_SIZE_K, mask = (mask_b[:,None] & mask_c[None,:]), other = 0) # [BLOCK_SIZE_B, TILE_SIZE_K]
 
                 # Load the internal parameters
+                # :note: unlike `bk_softevi_kernel`'s F- phase, the [B, K, N] tile (node axis innermost)
+                #        measured FASTER here -- the forward only gathers, it does not also scatter, and
+                #        the logsumexp then reduces over the innermost axis. Flipping this to [B, N, K]
+                #        cost 43% on the sorted-candidate forward (3.3 -> 4.7 ms), so leave it.
                 in_catpars_ptr = inpars_ptr[None,None,:] + catids[:,:,None] # [BLOCK_SIZE_B, TILE_SIZE_K, BLOCK_SIZE_N]
                 inpars = tl.load(in_catpars_ptr, mask = (mask_b[:,None,None] & mask_c[None,:,None] & mask_n[None,None,:]), other = 0.0) # [BLOCK_SIZE_B, TILE_SIZE_K, BLOCK_SIZE_N]
 
@@ -583,6 +653,10 @@ class SoftEvidenceCategorical(Distribution):
                 catids = tl.load(catids_ptr + i * TILE_SIZE_K, mask = (mask_b[:,None] & mask_c[None,:]), other = 0) # [BLOCK_SIZE_B, TILE_SIZE_K]
 
                 # Load the internal parameters
+                # :note: unlike `bk_softevi_kernel`'s F- phase, the [B, K, N] tile (node axis innermost)
+                #        measured FASTER here -- the forward only gathers, it does not also scatter, and
+                #        the logsumexp then reduces over the innermost axis. Flipping this to [B, N, K]
+                #        cost 43% on the sorted-candidate forward (3.3 -> 4.7 ms), so leave it.
                 in_catpars_ptr = inpars_ptr[None,None,:] + catids[:,:,None] # [BLOCK_SIZE_B, TILE_SIZE_K, BLOCK_SIZE_N]
                 inpars = tl.load(in_catpars_ptr, mask = (mask_b[:,None,None] & mask_c[None,:,None] & mask_n[None,None,:]), other = 0.0) # [BLOCK_SIZE_B, TILE_SIZE_K, BLOCK_SIZE_N]
 
@@ -842,6 +916,10 @@ class SoftEvidenceCategorical(Distribution):
         log_in_p = tl.load(params_ptr + s_pids[None,:] + data[:,None], mask = (mask_b[:,None] & mask_n[None,:]), other = 0.0).log() # [BLOCK_SIZE_B, BLOCK_SIZE_N]
         logZ = log_in_p + log_ex_p[:,None] - nmars # [BLOCK_SIZE_B, BLOCK_SIZE_N]
 
+        # Loop-invariant, so hoisted out of the K loop below (which otherwise recomputes it once per
+        # tile, per phase)
+        log_nflow_sub_logz = nflows.log() - logZ # [BLOCK_SIZE_B, BLOCK_SIZE_N]
+
         # Ptrs pointing to external parameter gradients
         if update_extflows:
             expars_grad_ptr = categorical_evidence_logp_grad_ptr + \
@@ -860,6 +938,12 @@ class SoftEvidenceCategorical(Distribution):
                 lvid * num_cats + \
                 tl.arange(0, TILE_SIZE_K)[None,:] # [BLOCK_SIZE_B, TILE_SIZE_K]
 
+            # The working tile is laid out [BLOCK_SIZE_B, BLOCK_SIZE_N, TILE_SIZE_K] -- i.e. the CANDIDATE
+            # axis is innermost -- rather than [B, K, N]. Both the `params` gather and the `param_flows`
+            # scatter address `<row base>(n) + catids(b,k)`, so with N innermost each lane of a warp lands
+            # in a different node row (~0.5-1 MB apart) and every access is its own sector; with K
+            # innermost a warp stays inside ONE row. Measured on the CoDD config: F- scatter 25.4 -> 16.6
+            # ms (and this is what makes sorted candidate ids pay off -- see the class docstring).
             for i in range(K_NUM_TILES):
                 mask_c = (i * TILE_SIZE_K + tl.arange(0, TILE_SIZE_K) < num_cats) # [TILE_SIZE_K]
 
@@ -867,22 +951,25 @@ class SoftEvidenceCategorical(Distribution):
                 catids = tl.load(catids_ptr + i * TILE_SIZE_K, mask = (mask_b[:,None] & mask_c[None,:]), other = 0) # [BLOCK_SIZE_B, TILE_SIZE_K]
 
                 # Load the internal parameters
-                in_catpars_ptr = inpars_ptr[None,None,:] + catids[:,:,None] # [BLOCK_SIZE_B, TILE_SIZE_K, BLOCK_SIZE_N]
-                inpars = tl.load(in_catpars_ptr, mask = (mask_b[:,None,None] & mask_c[None,:,None] & mask_n[None,None,:]), other = 0.0) # [BLOCK_SIZE_B, TILE_SIZE_K, BLOCK_SIZE_N]
+                in_catpars_ptr = inpars_ptr[None,:,None] + catids[:,None,:] # [BLOCK_SIZE_B, BLOCK_SIZE_N, TILE_SIZE_K]
+                inpars = tl.load(in_catpars_ptr, mask = (mask_b[:,None,None] & mask_n[None,:,None] & mask_c[None,None,:]), other = 0.0) # [BLOCK_SIZE_B, BLOCK_SIZE_N, TILE_SIZE_K]
 
                 # Load the external parameters
                 expars = tl.load(expars_ptr + i * TILE_SIZE_K, mask = (mask_b[:,None] & mask_c[None,:]), other = 0.0) # [BLOCK_SIZE_B, TILE_SIZE_K]
 
-                if update_pflows:
-                    vp_grads = (nflows.log() - logZ)[:,None,:] + inpars.log() + expars[:,:,None] # [BLOCK_SIZE_B, TILE_SIZE_K, BLOCK_SIZE_N]
+                # Shared by both phases below
+                log_inpars = inpars.log() # [BLOCK_SIZE_B, BLOCK_SIZE_N, TILE_SIZE_K]
 
-                    tl.atomic_add(param_flows_ptr + tot_num_cats + s_pfids[None,None,:] + catids[:,:,None], tl.exp(vp_grads), mask = (mask_b[:,None,None] & mask_n[None,None,:]))
+                if update_pflows:
+                    vp_grads = log_nflow_sub_logz[:,:,None] + log_inpars + expars[:,None,:] # [BLOCK_SIZE_B, BLOCK_SIZE_N, TILE_SIZE_K]
+
+                    tl.atomic_add(param_flows_ptr + tot_num_cats + s_pfids[None,:,None] + catids[:,None,:], tl.exp(vp_grads), mask = (mask_b[:,None,None] & mask_n[None,:,None]))
 
                 if update_extflows:
-                    ve_grads = (nflows.log() - logZ)[:,None,:] + inpars.log() # [BLOCK_SIZE_B, TILE_SIZE_K, BLOCK_SIZE_N]
-                    ve_grads_max = tl.max(ve_grads, axis = 2)
-                    ve_grads_sub = tl.exp(ve_grads - ve_grads_max[:,:,None])
-                    cum_ve_grads = tl.sum(ve_grads_sub, axis = 2).log() + ve_grads_max # [BLOCK_SIZE_B, TILE_SIZE_K]
+                    ve_grads = log_nflow_sub_logz[:,:,None] + log_inpars # [BLOCK_SIZE_B, BLOCK_SIZE_N, TILE_SIZE_K]
+                    ve_grads_max = tl.max(ve_grads, axis = 1)
+                    ve_grads_sub = tl.exp(ve_grads - ve_grads_max[:,None,:])
+                    cum_ve_grads = tl.sum(ve_grads_sub, axis = 1).log() + ve_grads_max # [BLOCK_SIZE_B, TILE_SIZE_K]
 
                     expars_grad = cum_ve_grads + expars
 

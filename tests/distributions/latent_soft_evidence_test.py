@@ -363,15 +363,22 @@ def test_hmm_latent_soft_evidence_does_not_perturb_em():
 
         return flows, params
 
-    flows_without, params_without = _run(with_grad = False)
+    # Control pair first: float-atomic accumulation makes two identical runs differ in the low bits,
+    # so that is the floor the with-grad run has to match (see the flat test for the same reasoning).
+    control_a, params_a = _run(with_grad = False)
+    control_b, params_b = _run(with_grad = False)
     flows_with, params_with = _run(with_grad = True)
 
-    assert len(flows_without) == len(flows_with) and len(flows_without) > 1
-    for a, b in zip(flows_without, flows_with):
-        assert torch.equal(a, b)
+    assert len(control_a) == len(flows_with) and len(control_a) > 1
 
-    for a, b in zip(params_without, params_with):
-        assert torch.equal(a, b)
+    for label, (a, b, w) in [("flows", (control_a, control_b, flows_with)),
+                             ("params", (params_a, params_b, params_with))]:
+        for ta, tb, tw in zip(a, b, w):
+            noise = (ta - tb).abs().max().item()
+            delta = (ta - tw).abs().max().item()
+            tol = max(4 * noise, 1e-7 * ta.abs().max().item())
+            assert delta <= tol, \
+                f"{label}: enabling the grad moved values by {delta:.3e} (noise floor {noise:.3e})"
 
 
 def test_latent_soft_evidence_forward():
@@ -568,12 +575,20 @@ def test_latent_soft_evidence_does_not_perturb_param_flows():
 
         return flows
 
-    flows_without = _run(with_grad = False)
+    # The flow kernels accumulate with float atomics, so two runs of the SAME computation are not
+    # bit-identical. Measure that nondeterminism floor with a control pair, then require that enabling
+    # the gradient moves the flows no further than the floor -- a real EM perturbation would be a
+    # relative O(1) effect, not a low-bit one.
+    control_a = _run(with_grad = False)
+    control_b = _run(with_grad = False)
     flows_with = _run(with_grad = True)
 
-    assert len(flows_without) == len(flows_with)
-    for a, b in zip(flows_without, flows_with):
-        assert torch.equal(a, b)
+    assert len(control_a) == len(flows_with)
+    for a, b, w in zip(control_a, control_b, flows_with):
+        noise = (a - b).abs().max().item()
+        delta = (a - w).abs().max().item()
+        tol = max(4 * noise, 1e-7 * a.abs().max().item())
+        assert delta <= tol, f"enabling the grad moved flows by {delta:.3e} (noise floor {noise:.3e})"
 
 
 def test_latent_soft_evidence_off_without_evidence():
