@@ -115,8 +115,14 @@
 <em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">pyjuice.nodes.distributions.</span></span><span class="sig-name descname"><span class="pre">SoftEvidenceCategorical</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">num_cats</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)"><span class="pre">int</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">_dual_flow_backward</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/library/functions.html#bool" title="(in Python v3.14)"><span class="pre">bool</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyjuice.nodes.distributions.SoftEvidenceCategorical" title="Link to this definition"></a></dt>
 <dd><p>A class representing a Categorical distribution that allows external soft evidence.</p>
 <dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>num_cats</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)"><em>int</em></a>) – number of categories</p>
+<dt class="field-odd">Note<span class="colon">:</span></dt>
+<dd class="field-odd"><p>with top-k soft evidence (i.e. when <cite>soft_evidence_cat_ids</cite> is supplied), pass the candidate
+axis SORTED BY CATEGORY ID – see <code class="xref py py-func docutils literal notranslate"><span class="pre">sort_soft_evidence_candidates()</span></code>. The forward is bound
+by the <cite>params</cite> gather addressed through <cite>cat_ids</cite>, so the candidate order dominates its cost:
+4.3x on the CoDD/latent config for a 0.06 ms sort. Sorting is semantically a no-op.</p>
+</dd>
+<dt class="field-even">Parameters<span class="colon">:</span></dt>
+<dd class="field-even"><p><strong>num_cats</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)"><em>int</em></a>) – number of categories</p>
 </dd>
 </dl>
 <dl class="py method">
