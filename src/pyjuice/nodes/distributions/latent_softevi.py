@@ -34,10 +34,14 @@ def _check_evidence_tensor(layer, tensor, name, batch_size):
     assert tensor.is_contiguous(), f"`{name}` should be contiguous."
 
     num_vars, num_latents = _layer_latent_dims(layer)
+    group_size = layer.nodes[0].dist.group_size
+    num_groups = (num_latents + group_size - 1) // group_size
+
     assert tensor.size(1) >= num_vars, \
         f"`{name}` has {tensor.size(1)} variables, but the layer defines {num_vars}."
-    assert tensor.size(2) >= num_latents, \
-        f"`{name}` has {tensor.size(2)} latent states, but the layer defines {num_latents} nodes per variable."
+    assert tensor.size(2) >= num_groups, \
+        f"`{name}` has {tensor.size(2)} latent groups, but the layer defines {num_groups} " \
+        f"({num_latents} nodes per variable at group_size {group_size})."
 
 
 def _condition_apply_fw_kernel(layer, kwargs):
@@ -56,7 +60,9 @@ def _prep_args_apply_fw_kernel(layer, kwargs):
 
     target_kwargs["ext_num_vars"] = latent_evidence_logp.size(1)
 
+    # last-dim stride of the evidence buffer; with grouping this is the number of GROUPS
     target_kwargs["num_latents"] = latent_evidence_logp.size(2)
+    target_kwargs["group_size"] = layer.nodes[0].dist.group_size
 
     target_kwargs["BLOCK_SIZE"] = 1024
 
@@ -73,8 +79,10 @@ def _prep_args_apply_bk_kernel(layer, kwargs):
     latent_evidence_logp_grad = kwargs["latent_evidence_logp_grad"]
     _check_evidence_tensor(layer, latent_evidence_logp_grad, "latent_evidence_logp_grad", kwargs["batch_size"])
 
-    # Every `(b, lvid, nid)` slot is written by exactly one node, so the kernel can use a plain store;
-    # zeroing here keeps the slots no node writes to (padding latents/variables) well-defined.
+    # At `group_size = 1` every `(b, lvid, nid)` slot is written by exactly one node and the kernel uses
+    # a plain store; above that, a slot is shared by a group and the kernel accumulates into it. Either
+    # way the zeroing is what makes untouched slots (padding latents/variables) well-defined -- and it is
+    # required for the accumulating case to be correct.
     latent_evidence_logp_grad.zero_()
 
     target_kwargs["latent_evidence_logp_grad_ptr"] = latent_evidence_logp_grad
@@ -83,7 +91,9 @@ def _prep_args_apply_bk_kernel(layer, kwargs):
 
     target_kwargs["ext_num_vars"] = latent_evidence_logp_grad.size(1)
 
+    # last-dim stride of the evidence buffer; with grouping this is the number of GROUPS
     target_kwargs["num_latents"] = latent_evidence_logp_grad.size(2)
+    target_kwargs["group_size"] = layer.nodes[0].dist.group_size
 
     target_kwargs["BLOCK_SIZE"] = 1024
 
@@ -114,10 +124,28 @@ class LatentSoftEvidence(Distribution):
 
     The distribution holds no parameters and produces no parameter flows, so it never participates in
     EM; it only reweights the latent posterior that drives the sum-node and emission EM updates.
+
+    :param group_size: how many consecutive latent states share one external value. With the default of
+                       1 every node has its own entry and the last axis of `latent_evidence_logp` is
+                       `num_latents`; with `group_size = g` node `i` reads entry `i // g` and that axis
+                       is `ceil(num_latents / g)` instead. Grouping lets a coarser head (one that
+                       predicts over `num_latents / g` groups rather than every state) drive the same
+                       PC. The gradient of a shared entry is the sum of its nodes' flows.
+
+                       :note: every `LatentSoftEvidence` node in one PC must use the SAME `group_size`.
+                              The value is part of the signature, so differing sizes split the nodes
+                              across input layers -- and each layer numbers variables from 0 in its own
+                              `var_idmapping`, so two such layers would both read
+                              `latent_evidence_logp[:, 0, :]` and silently collide. There is one
+                              evidence buffer per layer, not per variable.
+    :type group_size: int
     """
 
-    def __init__(self):
+    def __init__(self, group_size: int = 1):
         super(LatentSoftEvidence, self).__init__()
+
+        assert group_size >= 1, "`group_size` must be at least 1."
+        self.group_size = group_size
 
         self.post_fw_fns = [
             (self.fw_kernel, _condition_apply_fw_kernel, _prep_args_apply_fw_kernel)
@@ -130,8 +158,15 @@ class LatentSoftEvidence(Distribution):
     def get_signature(self):
         """
         Get the signature of the current distribution.
+
+        :note: the signature carries `group_size` because input nodes are grouped into layers by it, and
+               one layer compiles a single kernel with `group_size` baked in as a constexpr. Nodes with
+               different group sizes therefore have to land in different layers. The default keeps the
+               original string, so nothing changes for `group_size = 1`.
         """
-        return "LatentSoftEvidence"
+        if self.group_size == 1:
+            return "LatentSoftEvidence"
+        return f"LatentSoftEvidence_g{self.group_size}"
 
     def requires_external_inputs(self):
         """
@@ -182,7 +217,8 @@ class LatentSoftEvidence(Distribution):
     def fw_kernel(params_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, metadata_ptr, s_mids_ptr, nids_ptr,
                   fw_local_ids_ptr, partial_eval: tl.constexpr, layer_num_nodes: tl.constexpr, batch_size: tl.constexpr,
                   num_vars_per_node: tl.constexpr, nv_block_size: tl.constexpr, node_offset: tl.constexpr, BLOCK_SIZE: tl.constexpr,
-                  latent_evidence_logp_ptr, var_idmapping_ptr, ext_num_vars: tl.constexpr, num_latents: tl.constexpr):
+                  latent_evidence_logp_ptr, var_idmapping_ptr, ext_num_vars: tl.constexpr, num_latents: tl.constexpr,
+                  group_size: tl.constexpr):
         pid = tl.program_id(axis = 0)
         block_start = pid * BLOCK_SIZE
 
@@ -200,10 +236,10 @@ class LatentSoftEvidence(Distribution):
         vids = tl.load(vids_ptr + local_offsets, mask = mask, other = 0)
         lvids = tl.load(var_idmapping_ptr + vids, mask = mask, other = 0)
 
-        # Get all latent offsets (the node's structural latent state index)
-        nids = tl.load(nids_ptr + local_offsets, mask = mask, other = 0)
+        # Get all latent offsets (the node's structural latent state index), mapped to its group
+        nids = tl.load(nids_ptr + local_offsets, mask = mask, other = 0) // group_size
 
-        # Load the corresponding log-potential
+        # Load the corresponding log-potential (shared by every node of the group)
         latent_evi = tl.load(latent_evidence_logp_ptr + batch_offsets * (ext_num_vars * num_latents) + lvids * num_latents + nids, mask = mask, other = 0.0)
 
         node_offsets = local_offsets + node_offset
@@ -214,7 +250,8 @@ class LatentSoftEvidence(Distribution):
     def bk_kernel(params_ptr, param_flows_ptr, node_flows_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, s_pfids_ptr,
                   metadata_ptr, s_mids_ptr, nids_ptr, bk_local_ids_ptr, partial_eval: tl.constexpr, logspace_flows: tl.constexpr, layer_num_nodes: tl.constexpr,
                   batch_size: tl.constexpr, num_vars_per_node: tl.constexpr, num_vars: tl.constexpr, nv_block_size: tl.constexpr, node_offset: tl.constexpr,
-                  BLOCK_SIZE: tl.constexpr, latent_evidence_logp_grad_ptr, var_idmapping_ptr, ext_num_vars: tl.constexpr, num_latents: tl.constexpr):
+                  BLOCK_SIZE: tl.constexpr, latent_evidence_logp_grad_ptr, var_idmapping_ptr, ext_num_vars: tl.constexpr, num_latents: tl.constexpr,
+                  group_size: tl.constexpr):
         pid = tl.program_id(axis = 0)
         block_start = pid * BLOCK_SIZE
 
@@ -232,8 +269,8 @@ class LatentSoftEvidence(Distribution):
         vids = tl.load(vids_ptr + local_offsets, mask = mask, other = 0)
         lvids = tl.load(var_idmapping_ptr + vids, mask = mask, other = 0)
 
-        # Get all latent offsets (the node's structural latent state index)
-        nids = tl.load(nids_ptr + local_offsets, mask = mask, other = 0)
+        # Get all latent offsets (the node's structural latent state index), mapped to its group
+        nids = tl.load(nids_ptr + local_offsets, mask = mask, other = 0) // group_size
 
         # Load the flows
         ns_offsets = (local_offsets + node_offset) * batch_size + batch_offsets
@@ -244,8 +281,13 @@ class LatentSoftEvidence(Distribution):
         if logspace_flows:
             flows = tl.exp(flows)
 
-        # Store the corresponding gradient
-        tl.store(latent_evidence_logp_grad_ptr + batch_offsets * (ext_num_vars * num_latents) + lvids * num_latents + nids, flows, mask = mask)
+        # Store the corresponding gradient. With `group_size > 1` several nodes share one slot, and
+        # d/dE of a shared potential is the SUM of their flows, so accumulate rather than store.
+        grad_ptr = latent_evidence_logp_grad_ptr + batch_offsets * (ext_num_vars * num_latents) + lvids * num_latents + nids
+        if group_size == 1:
+            tl.store(grad_ptr, flows, mask = mask)
+        else:
+            tl.atomic_add(grad_ptr, flows, mask = mask)
 
     @staticmethod
     def fw_mar_fn(local_offsets, data, params_ptr, s_pids, metadata_ptr, s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE):
@@ -274,7 +316,7 @@ class LatentSoftEvidence(Distribution):
         pass
 
     def _get_constructor(self):
-        return LatentSoftEvidence, {}
+        return LatentSoftEvidence, {"group_size": self.group_size}
 
     def __reduce__(self):
-        return (self.__class__, ())
+        return (self.__class__, (self.group_size,))

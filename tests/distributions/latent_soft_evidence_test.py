@@ -5,7 +5,7 @@ import pyjuice.nodes.distributions as dists
 import pytest
 
 
-def _build_pc(num_latents, num_cats, emission_dist, seed = 42):
+def _build_pc(num_latents, num_cats, emission_dist, seed = 42, latent_dist = None):
     """
     A single-block-position PC:
 
@@ -17,7 +17,8 @@ def _build_pc(num_latents, num_cats, emission_dist, seed = 42):
     torch.manual_seed(seed)
 
     ni_emit = juice.inputs(0, num_nodes = num_latents, dist = emission_dist)
-    ni_lat = juice.inputs(1, num_nodes = num_latents, dist = dists.LatentSoftEvidence())
+    ni_lat = juice.inputs(1, num_nodes = num_latents,
+                          dist = latent_dist if latent_dist is not None else dists.LatentSoftEvidence())
 
     np_ = juice.multiply(ni_emit, ni_lat)
     ns = juice.summate(np_, num_nodes = 1)
@@ -33,6 +34,209 @@ def _log_w(ns, device):
 
 def _log_beta(ni_emit, num_latents, num_cats, device):
     return ni_emit._params.view(num_latents, num_cats).log().to(device)
+
+
+@pytest.mark.parametrize("group_size", [1, 2, 4])
+@pytest.mark.parametrize("logspace_flows", [True, False])
+def test_latent_soft_evidence_group_size(group_size, logspace_flows):
+    """`group_size = g` makes every g consecutive latent states share one external value.
+
+    Two things to pin down: the forward must broadcast one entry across the group, and the backward must
+    SUM the group's flows into that entry (a plain per-node store would have them overwrite each other).
+    """
+
+    device = torch.device("cuda:0")
+
+    batch_size = 16
+    num_latents = 8
+    num_cats = 5
+    num_groups = num_latents // group_size
+
+    ns, ni_emit, _ = _build_pc(num_latents, num_cats, dists.Categorical(num_cats = num_cats),
+                               latent_dist = dists.LatentSoftEvidence(group_size = group_size))
+
+    pc = juice.compile(ns)
+    pc.to(device)
+
+    data = torch.randint(0, num_cats, [batch_size, 2], device = device)
+    # the evidence axis is now num_groups, not num_latents
+    latent_evidence_logp = torch.randn([batch_size, 1, num_groups], device = device).log_softmax(dim = 2).contiguous()
+
+    lls = pc(data, latent_evidence_logp = latent_evidence_logp)
+
+    log_w = _log_w(ns, device)
+    log_beta = _log_beta(ni_emit, num_latents, num_cats, device)
+
+    # node i reads entry i // group_size
+    group_of = torch.arange(num_latents, device = device) // group_size
+    e_per_latent = latent_evidence_logp[:, 0, :][:, group_of]          # [B, num_latents]
+
+    logits = log_w[None,:] + log_beta[:,data[:,0]].permute(1, 0) + e_per_latent
+    assert torch.all(torch.abs(lls.view(-1) - logits.logsumexp(dim = 1)) < 1e-3)
+
+    ## backward: the gradient of a shared entry is the sum of its group's responsibilities ##
+
+    grad = torch.zeros_like(latent_evidence_logp)
+    pc.backward(data, logspace_flows = logspace_flows,
+                latent_evidence_logp = latent_evidence_logp,
+                latent_evidence_logp_grad = grad)
+
+    resp = logits.softmax(dim = 1)                                     # [B, num_latents]
+    target = torch.zeros_like(grad[:, 0, :]).index_add_(1, group_of, resp)
+
+    assert torch.all(torch.abs(grad[:, 0, :] - target) < 1e-4)
+    # sanity: responsibilities still sum to one across the (now coarser) axis
+    assert torch.all(torch.abs(grad[:, 0, :].sum(dim = 1) - 1.0) < 1e-4)
+
+
+
+@pytest.mark.parametrize("num_latents,group_size", [(8, 3), (12, 5), (9, 2)])
+def test_latent_soft_evidence_group_size_uneven(num_latents, group_size):
+    """`group_size` need not divide `num_latents`; the last group is just smaller."""
+
+    device = torch.device("cuda:0")
+    batch_size, num_cats = 8, 4
+    num_groups = (num_latents + group_size - 1) // group_size
+
+    ns, ni_emit, _ = _build_pc(num_latents, num_cats, dists.Categorical(num_cats = num_cats),
+                               latent_dist = dists.LatentSoftEvidence(group_size = group_size))
+    pc = juice.compile(ns); pc.to(device)
+
+    data = torch.randint(0, num_cats, [batch_size, 2], device = device)
+    E = torch.randn([batch_size, 1, num_groups], device = device).log_softmax(dim = 2).contiguous()
+
+    lls = pc(data, latent_evidence_logp = E)
+
+    group_of = torch.arange(num_latents, device = device) // group_size
+    assert int(group_of.max()) == num_groups - 1, "reference disagrees on the group count"
+
+    logits = (_log_w(ns, device)[None,:]
+              + _log_beta(ni_emit, num_latents, num_cats, device)[:,data[:,0]].permute(1, 0)
+              + E[:, 0, :][:, group_of])
+    assert torch.all(torch.abs(lls.view(-1) - logits.logsumexp(dim = 1)) < 1e-3)
+
+    grad = torch.zeros_like(E)
+    pc.backward(data, logspace_flows = True, latent_evidence_logp = E,
+                latent_evidence_logp_grad = grad)
+    target = torch.zeros_like(grad[:, 0, :]).index_add_(1, group_of, logits.softmax(dim = 1))
+    assert torch.all(torch.abs(grad[:, 0, :] - target) < 1e-4)
+
+
+def test_latent_soft_evidence_group_size_degenerate():
+    """`group_size == num_latents`: one value shared by every state. It then cancels out of the
+    normalized posterior, so the flows are unaffected and the whole gradient lands on that one entry."""
+
+    device = torch.device("cuda:0")
+    batch_size, num_latents, num_cats = 8, 8, 4
+
+    ns, ni_emit, _ = _build_pc(num_latents, num_cats, dists.Categorical(num_cats = num_cats),
+                               latent_dist = dists.LatentSoftEvidence(group_size = num_latents))
+    pc = juice.compile(ns); pc.to(device)
+
+    data = torch.randint(0, num_cats, [batch_size, 2], device = device)
+    E = torch.randn([batch_size, 1, 1], device = device).contiguous()
+
+    lls = pc(data, latent_evidence_logp = E)
+
+    base = (_log_w(ns, device)[None,:]
+            + _log_beta(ni_emit, num_latents, num_cats, device)[:,data[:,0]].permute(1, 0))
+    # a constant added to every state just shifts the LL by that constant
+    assert torch.all(torch.abs(lls.view(-1) - (base.logsumexp(dim = 1) + E[:, 0, 0])) < 1e-3)
+
+    grad = torch.zeros_like(E)
+    pc.backward(data, logspace_flows = True, latent_evidence_logp = E,
+                latent_evidence_logp_grad = grad)
+    # d/dE of (logsumexp + E) is exactly 1
+    assert torch.all(torch.abs(grad[:, 0, 0] - 1.0) < 1e-4)
+
+
+def test_latent_soft_evidence_group_size_off_and_masked():
+    """Grouping must not disturb the two structural behaviours: no kwarg => channel off, and a masked
+    emission variable still keeps the latent evidence."""
+
+    device = torch.device("cuda:0")
+    batch_size, num_latents, num_cats, group_size = 8, 8, 4, 2
+    num_groups = num_latents // group_size
+
+    ns, ni_emit, _ = _build_pc(num_latents, num_cats, dists.Categorical(num_cats = num_cats),
+                               latent_dist = dists.LatentSoftEvidence(group_size = group_size))
+    pc = juice.compile(ns); pc.to(device)
+
+    data = torch.randint(0, num_cats, [batch_size, 2], device = device)
+    log_w = _log_w(ns, device)
+    log_beta = _log_beta(ni_emit, num_latents, num_cats, device)
+    group_of = torch.arange(num_latents, device = device) // group_size
+
+    # (a) no evidence supplied -> the latent nodes contribute 0
+    lls_off = pc(data)
+    assert torch.all(torch.abs(lls_off.view(-1)
+                               - (log_w[None,:] + log_beta[:,data[:,0]].permute(1, 0)).logsumexp(dim = 1)) < 1e-3)
+
+    # (b) explicit zero evidence is the same thing
+    lls_zero = pc(data, latent_evidence_logp = torch.zeros([batch_size, 1, num_groups], device = device))
+    assert torch.all(torch.abs(lls_off.view(-1) - lls_zero.view(-1)) < 1e-5)
+
+    # (c) marginalizing the emission variable keeps the (grouped) latent evidence
+    E = torch.randn([batch_size, 1, num_groups], device = device).log_softmax(dim = 2).contiguous()
+    lls_marg = pc(data, missing_mask = torch.tensor([True, False], device = device),
+                  latent_evidence_logp = E)
+    assert torch.all(torch.abs(lls_marg.view(-1)
+                               - (log_w[None,:] + E[:, 0, :][:, group_of]).logsumexp(dim = 1)) < 1e-3)
+
+
+def test_latent_soft_evidence_group_size_roundtrips():
+    """`group_size` has to survive the constructor/pickle paths, and it has to change the signature so
+    that differing sizes cannot be merged into one input layer."""
+    import pickle
+
+    for g in (1, 3, 8):
+        d = dists.LatentSoftEvidence(group_size = g)
+        cls, kwargs = d._get_constructor()
+        assert cls is dists.LatentSoftEvidence and kwargs == {"group_size": g}
+        assert cls(**kwargs).group_size == g
+        assert pickle.loads(pickle.dumps(d)).group_size == g
+
+    # the default must keep the original signature so existing models are untouched
+    assert dists.LatentSoftEvidence().get_signature() == "LatentSoftEvidence"
+    assert len({dists.LatentSoftEvidence(group_size = g).get_signature() for g in (1, 2, 4)}) == 3
+
+    with pytest.raises(AssertionError):
+        dists.LatentSoftEvidence(group_size = 0)
+
+
+@pytest.mark.parametrize("group_size", [2, 4])
+def test_hmm_latent_soft_evidence_group_size(group_size):
+    """Grouping on the real HMM wiring: several positions sharing one latent-evidence layer, checked
+    against the torch forward recursion and against autograd through it."""
+
+    device = torch.device("cuda:0")
+    batch_size = 8
+    T, L, C = HMM_SEQ_LENGTH, HMM_NUM_LATENTS, HMM_NUM_CATS
+    num_groups = L // group_size
+
+    root, alpha, beta, gamma = _build_hmm(lambda: dists.Categorical(num_cats = C),
+                                          latent_group_size = group_size)
+    pc = juice.compile(root); pc.to(device)
+    alpha, beta, gamma = alpha.to(device), beta.to(device), gamma.to(device)
+
+    data = torch.randint(0, C, [batch_size, 2 * T], device = device)
+    E = torch.randn([batch_size, T, num_groups], device = device).log_softmax(dim = 2).contiguous()
+
+    lls = pc(data, latent_evidence_logp = E)
+
+    group_of = torch.arange(L, device = device) // group_size
+    Ef = E.clone().requires_grad_(True)
+    E_per_latent = Ef[:, :, group_of]                       # [B, T, L]
+    target_lls = _hmm_reference_lls(_categorical_log_emit(beta, data), alpha, gamma, E_per_latent)
+
+    assert torch.all(torch.abs(lls.view(-1) - target_lls) < 1e-3)
+
+    grad = torch.zeros_like(E)
+    pc.backward(data, logspace_flows = True, latent_evidence_logp = E,
+                latent_evidence_logp_grad = grad)
+
+    target_grad, = torch.autograd.grad(target_lls.sum(), Ef)
+    assert torch.all(torch.abs(grad - target_grad) < 1e-4)
 
 
 ########################################
@@ -52,7 +256,7 @@ HMM_NUM_CATS = 6
 
 def _build_hmm(emission_dist_fn, with_latent_evidence = True, seed = 1234,
                seq_length = HMM_SEQ_LENGTH, num_latents = HMM_NUM_LATENTS,
-               block_size = HMM_BLOCK_SIZE, num_cats = HMM_NUM_CATS):
+               block_size = HMM_BLOCK_SIZE, num_cats = HMM_NUM_CATS, latent_group_size = 1):
     """
     A homogeneous HMM mirroring `juice.structures.GeneralizedHMM`, optionally with a
     `LatentSoftEvidence` node multiplied into the latent branch at every position.
@@ -70,7 +274,7 @@ def _build_hmm(emission_dist_fn, with_latent_evidence = True, seed = 1234,
 
         def _latent_ns(v):
             return juice.inputs(seq_length + v, num_node_blocks = num_node_blocks,
-                                dist = dists.LatentSoftEvidence())
+                                dist = dists.LatentSoftEvidence(group_size = latent_group_size))
 
         if with_latent_evidence:
             curr_zs = juice.multiply(ns_input, _latent_ns(seq_length - 1))
