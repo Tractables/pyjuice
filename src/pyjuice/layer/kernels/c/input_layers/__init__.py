@@ -26,9 +26,9 @@ def _jit_plain(name: str, source_file: str):
         return None
     cc = torch.cuda.get_device_capability()
     cuda_cflags = ["-O3", f"-arch=sm_{cc[0]}{cc[1]}a", "--use_fast_math", "-DNDEBUG"]
-    from torch.utils.cpp_extension import load
+    from pyjuice.utils.cuda_ext import jit_load
     try:
-        return load(name=name, sources=[os.path.join(_THIS_DIR, source_file)],
+        return jit_load(name, sources=[os.path.join(_THIS_DIR, source_file)],
                     extra_cuda_cflags=cuda_cflags, verbose=False)
     except Exception as e:
         warnings.warn(

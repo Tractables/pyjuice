@@ -139,9 +139,9 @@ def _jit_plain(name: str, source_file: str):
     flags = _plain_compile_flags()
     if flags is None:
         return None
-    from torch.utils.cpp_extension import load
+    from pyjuice.utils.cuda_ext import jit_load
     try:
-        return load(name=name, sources=[os.path.join(_THIS_DIR, source_file)],
+        return jit_load(name, sources=[os.path.join(_THIS_DIR, source_file)],
                     extra_cuda_cflags=flags, verbose=False)
     except Exception as e:
         warnings.warn(
@@ -156,9 +156,9 @@ def _jit(name: str, source_file: str):
     if fl is None:
         return None
     cuda_cflags, ldflags = fl
-    from torch.utils.cpp_extension import load
+    from pyjuice.utils.cuda_ext import jit_load
     try:
-        return load(name=name, sources=[os.path.join(_THIS_DIR, source_file)],
+        return jit_load(name, sources=[os.path.join(_THIS_DIR, source_file)],
                     extra_cuda_cflags=cuda_cflags, extra_ldflags=ldflags, verbose=False)
     except Exception as e:  # nvcc missing, compile error, CUTLASS too old, etc.
         warnings.warn(
