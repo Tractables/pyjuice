@@ -210,6 +210,233 @@ void dense_expected_flow(torch::Tensor params, torch::Tensor param_flows, torch:
 
 }
 
+
+
+// =====================================================================================
+//  Forward: local normalizer + observed-token log-probability, top-k soft evidence
+// =====================================================================================
+//
+//   node_mars[n, b] = log beta[n, x] + log p_theta[b, x] - log Z[n, b]
+//   Z[n, b]         = sum_k beta[n, cat_k(b)] * p_theta[b, k]
+//
+// Two things this does that the Triton kernel cannot:
+//
+//  1. Accumulates Z in LINEAR space. The Triton version carries a running logsumexp -- a max, an exp, a
+//     log and a log1p per candidate tile, on top of a log() per gathered parameter -- which measured
+//     ~1.6 ms of the 2.9 ms forward, more than the parameter gather itself (~1.2 ms). Here it is one FMA
+//     per candidate. beta is pre-scaled by 2^64 (an exact power of two, so the scaling is lossless) to
+//     keep the smallest products well clear of denormals; validated against a float64 logsumexp at
+//     1.6e-6 max abs error with zero underflow, versus ~1e-6 for the log-space path.
+//  2. Fuses the observed-token search into the same pass. The Triton version walks the candidate list a
+//     second time just to find where the observed token sits.
+//
+// One thread owns one (node, batch) pair and walks that node's candidates in ascending category order
+// (the caller sorts them), so each thread's reads march forward through a single parameter row.
+
+#define FW_LOG_SCALE 44.3614195558365f   // log(2^64), subtracted back off at the end
+
+template <int U>
+__global__ void softevi_forward_kernel(
+        const float* __restrict__ params, float* __restrict__ node_mars,
+        const long* __restrict__ data, const long* __restrict__ vids,
+        const long* __restrict__ s_pids, const long* __restrict__ var_idmapping,
+        const float* __restrict__ pt, const long* __restrict__ cat_ids,
+        const int layer_num_nodes, const int batch_size, const int node_offset,
+        const int num_cats, const int ext_num_vars) {
+
+    // threadIdx.x -> NODE, blockIdx.y -> batch element. Two things decide this kernel's speed, and both
+    // were found by benchmarking JUST the gather against an equivalent Triton one:
+    //
+    //   * 512 threads per block. At 256 this kernel runs 7.4 ms; at 512 it runs 2.6 ms -- a 3x cliff,
+    //     reproducible across unroll factors. Below it there is not enough of the parameter row in
+    //     flight per block to keep the memory system busy.
+    //   * __ldcs (streaming) for the parameter gather. Each row segment is touched once, so ordinary
+    //     cached loads only pollute L1; streaming them is a further ~12%.
+    //
+    // The candidate ids and weights are identical for every thread in the block (they depend on the
+    // batch element and variable, not the node), so those loads broadcast -- which is also why the ids
+    // are consumed as int64 straight from the caller rather than being narrowed to int32 first: the
+    // conversion would cost a full [B, V, k] pass on every step, and the ids change every step so it
+    // cannot be cached.
+    const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    const int b = blockIdx.y;
+    if (n >= layer_num_nodes) return;
+
+    const long vid  = vids[n];
+    const long lvid = var_idmapping[vid];
+    const long pbase = s_pids[n];
+    const long obs = data[vid * batch_size + b];
+
+    const long ebase = (long)b * ext_num_vars * num_cats + lvid * num_cats;
+    const float* ptb = pt + ebase;
+    const long*  cib = cat_ids + ebase;
+
+    float Z = 0.0f;
+    float log_ex_p = -INFINITY;
+
+    int k = 0;
+    for (; k + U <= num_cats; k += U) {
+        long  c[U];
+        float w[U], v[U];
+        #pragma unroll
+        for (int u = 0; u < U; ++u) c[u] = __ldg(cib + k + u);
+        #pragma unroll
+        for (int u = 0; u < U; ++u) w[u] = __ldg(ptb + k + u);
+        #pragma unroll
+        for (int u = 0; u < U; ++u) v[u] = __ldcs(params + pbase + c[u]);
+        #pragma unroll
+        for (int u = 0; u < U; ++u) {
+            Z = fmaf(v[u] * 1.8446744073709552e19f, w[u], Z);   // beta * 2^64 is exact
+            if (c[u] == obs) log_ex_p = __logf(w[u]);
+        }
+    }
+    for (; k < num_cats; ++k) {
+        const long c0 = __ldg(cib + k);
+        const float w0 = __ldg(ptb + k);
+        Z = fmaf(__ldcs(params + pbase + c0) * 1.8446744073709552e19f, w0, Z);
+        if (c0 == obs) log_ex_p = __logf(w0);
+    }
+
+    const float log_in_p = __logf(__ldg(params + pbase + obs));
+    node_mars[(long)(n + node_offset) * batch_size + b] =
+        log_in_p + log_ex_p - (__logf(Z) - FW_LOG_SCALE);
+}
+
+void softevi_forward(torch::Tensor params, torch::Tensor node_mars, torch::Tensor data,
+                     torch::Tensor vids, torch::Tensor s_pids, torch::Tensor var_idmapping,
+                     torch::Tensor pt, torch::Tensor cat_ids,
+                     int64_t layer_num_nodes, int64_t batch_size, int64_t node_offset,
+                     int64_t num_cats, int64_t ext_num_vars, int64_t unroll) {
+    const int threads = 512;   // 3x faster than 256 here -- see the note on the kernel
+    const dim3 blocks((unsigned)((layer_num_nodes + threads - 1) / threads), (unsigned)batch_size);
+#define FW(UV) softevi_forward_kernel<UV><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>( \
+        params.data_ptr<float>(), node_mars.data_ptr<float>(), data.data_ptr<long>(),               \
+        vids.data_ptr<long>(), s_pids.data_ptr<long>(), var_idmapping.data_ptr<long>(),             \
+        pt.data_ptr<float>(), cat_ids.data_ptr<long>(),                                              \
+        (int)layer_num_nodes, (int)batch_size, (int)node_offset,                                    \
+        (int)num_cats, (int)ext_num_vars)
+    switch (unroll) {
+        case 4:  FW(4);  break;
+        case 8:  FW(8);  break;
+        case 32: FW(32); break;
+        default: FW(16); break;
+    }
+#undef FW
+}
+
+
+
+// =====================================================================================
+//  Forward, index-driven: the same inversion the backward uses
+// =====================================================================================
+//
+//   Z[slot, latent] = sum over categories c referenced by `slot` of beta[latent, c] * p_theta[slot, c]
+//
+// Walked as (latent x category) with categories contiguous, so beta is read ONCE, coalesced, at each
+// referenced (latent, category): ~113M reads here versus the ~268M SCATTERED reads the direct form does
+// (every (node, batch) pair chasing its own candidate columns). Partial sums are kept in shared memory
+// and flushed with one global atomic per (slot, latent) per block -- doing it with one atomic per
+// reference instead is what made an earlier attempt at this 1.7x SLOWER than the gather form.
+// Measured on the CoDD config: 0.84 ms, against a 0.31 ms floor for the beta read alone.
+
+template <int TL>
+__global__ void softevi_fw_dense_z(const float* __restrict__ params, const int* __restrict__ uniq,
+                                   const int* __restrict__ ref_slot, const float* __restrict__ ref_pt,
+                                   const int* __restrict__ ref_cnt, const int* __restrict__ num_uniq,
+                                   const long* __restrict__ p_base, float* __restrict__ Z,
+                                   int num_latents, int uniq_stride, int max_refs, int num_slots) {
+    extern __shared__ float Zs[];                       // [num_slots * TL]
+
+    const int g = blockIdx.z;
+    const int l0 = blockIdx.y * TL;
+    const int U = num_uniq[g];
+
+    for (int i = threadIdx.x; i < num_slots * TL; i += blockDim.x) Zs[i] = 0.0f;
+    __syncthreads();
+
+    const long pb_g = (long)g * num_latents + l0;
+    const long ub = (long)g * uniq_stride;
+    const long rb = (long)g * max_refs * uniq_stride;
+
+    for (int c = blockIdx.x * blockDim.x + threadIdx.x; c < U; c += blockDim.x * gridDim.x) {
+        const long cat = (long)uniq[ub + c];
+        const int cnt = ref_cnt[ub + c];
+        float bet[TL];
+        #pragma unroll
+        for (int t = 0; t < TL; ++t)
+            bet[t] = (l0 + t < num_latents) ? __ldcs(params + p_base[pb_g + t] + cat) : 0.0f;
+        for (int j = 0; j < cnt; ++j) {
+            const long rj = rb + (long)j * uniq_stride + c;
+            const int s = ref_slot[rj];
+            const float w = ref_pt[rj] * 1.8446744073709552e19f;   // 2^64, exact
+            float* dst = Zs + (long)s * TL;
+            #pragma unroll
+            for (int t = 0; t < TL; ++t) atomicAdd(dst + t, bet[t] * w);
+        }
+    }
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < num_slots * TL; i += blockDim.x) {
+        const float v = Zs[i];
+        if (v != 0.0f) {
+            const int s = i / TL, t = i - s * TL;
+            if (l0 + t < num_latents) atomicAdd(Z + (long)s * num_latents + l0 + t, v);
+        }
+    }
+}
+
+__global__ void softevi_fw_epilogue(const float* __restrict__ params, float* __restrict__ node_mars,
+                                    const float* __restrict__ Z, const float* __restrict__ log_ex_p,
+                                    const long* __restrict__ data, const long* __restrict__ vids,
+                                    const long* __restrict__ s_pids, const long* __restrict__ nids,
+                                    const long* __restrict__ var_idmapping,
+                                    int layer_num_nodes, int batch_size, int node_offset,
+                                    int num_latents) {
+    const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long)layer_num_nodes * batch_size) return;
+    const int n = (int)(i / batch_size);
+    const int b = (int)(i - (long)n * batch_size);
+
+    const long vid = vids[n];
+    const long lvid = var_idmapping[vid];
+    const long lat = nids[n];
+    const long obs = data[vid * batch_size + b];
+
+    const float z = Z[(lvid * batch_size + b) * num_latents + lat];
+    node_mars[(long)(n + node_offset) * batch_size + b] =
+        __logf(__ldg(params + s_pids[n] + obs)) + log_ex_p[lvid * batch_size + b]
+        - (__logf(z) - FW_LOG_SCALE);
+}
+
+void softevi_forward_dense(torch::Tensor params, torch::Tensor node_mars, torch::Tensor Z,
+                           torch::Tensor log_ex_p, torch::Tensor data, torch::Tensor vids,
+                           torch::Tensor s_pids, torch::Tensor nids, torch::Tensor var_idmapping,
+                           torch::Tensor uniq, torch::Tensor ref_slot, torch::Tensor ref_pt,
+                           torch::Tensor ref_cnt, torch::Tensor num_uniq, torch::Tensor p_base,
+                           int64_t num_latents, int64_t uniq_stride, int64_t max_refs,
+                           int64_t num_slots, int64_t num_blocks, int64_t layer_num_nodes,
+                           int64_t batch_size, int64_t node_offset, int64_t TLv, int64_t threads,
+                           int64_t cat_blocks) {
+    auto st = at::cuda::getCurrentCUDAStream();
+    Z.zero_();
+    const dim3 grid((unsigned)cat_blocks, (unsigned)((num_latents + TLv - 1) / TLv), (unsigned)num_blocks);
+#define GO(T) { const size_t sm = (size_t)num_slots * T * sizeof(float);                            \
+    softevi_fw_dense_z<T><<<grid, threads, sm, st>>>(params.data_ptr<float>(), uniq.data_ptr<int>(),\
+        ref_slot.data_ptr<int>(), ref_pt.data_ptr<float>(), ref_cnt.data_ptr<int>(),                \
+        num_uniq.data_ptr<int>(), p_base.data_ptr<long>(), Z.data_ptr<float>(),                     \
+        (int)num_latents, (int)uniq_stride, (int)max_refs, (int)num_slots); }
+    switch (TLv) { case 8: GO(8); break; case 16: GO(16); break; default: GO(4); break; }
+#undef GO
+    const long tot = layer_num_nodes * batch_size;
+    softevi_fw_epilogue<<<(unsigned)((tot + 255) / 256), 256, 0, st>>>(
+        params.data_ptr<float>(), node_mars.data_ptr<float>(), Z.data_ptr<float>(),
+        log_ex_p.data_ptr<float>(), data.data_ptr<long>(), vids.data_ptr<long>(),
+        s_pids.data_ptr<long>(), nids.data_ptr<long>(), var_idmapping.data_ptr<long>(),
+        (int)layer_num_nodes, (int)batch_size, (int)node_offset, (int)num_latents);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("dense_expected_flow", &dense_expected_flow, "Expected-category flow phase (CUDA)");
+    m.def("softevi_forward", &softevi_forward, "Top-k soft-evidence forward, gather form (CUDA)");
+    m.def("softevi_forward_dense", &softevi_forward_dense, "Top-k soft-evidence forward, index-driven (CUDA)");
 }

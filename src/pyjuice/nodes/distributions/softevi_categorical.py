@@ -77,9 +77,171 @@ Measured on the CoDD/latent config (homogeneous HMM, seq 32, 1024 latents, 12646
     return logp_sorted, cat_ids_sorted
 
 
+def _fw_cuda_applicable(layer, kwargs):
+    """Whether to take a CUDA forward at all.
+
+    Structural requirements first (top-k evidence, no value mask, no partial evaluation, extension
+    built), then the same "is it big enough" test the backward uses. Both CUDA forwards were tuned on a
+    configuration whose parameter table is far larger than L2 -- the gather form's 512-thread cliff and
+    its streaming loads are both about DRAM behaviour. When the table is L2-resident none of that
+    applies and the well-tuned Triton kernel is the safer choice, so fall back rather than extrapolate
+    from a regime that was never measured.
+    """
+    if os.environ.get("PYJUICE_SOFTEVI_FW_CUDA", "1") == "0":
+        return False
+    if kwargs.get("soft_evidence_cat_ids", None) is None:
+        return False
+    if kwargs.get("soft_evidence_value_mask", None) is not None:
+        return False
+    if layer.provided("fw_local_ids"):
+        return False
+    try:
+        from .c_kernels import dense_expected_flow_available
+        if not dense_expected_flow_available():
+            return False
+    except Exception:
+        return False
+
+    if _fw_use_dense(layer, kwargs):
+        return True
+
+    # Otherwise only the gather form is available, and it is NOT auto-selected: it has never been
+    # measured to be the best choice anywhere. Where the dense form applies (tied parameters, table
+    # larger than L2) dense beats it 0.95 vs 2.35 ms; where the dense form declines -- untied
+    # parameters, so 32768 distinct parameter rows instead of 1024 -- it LOSES to Triton, 17.2 vs
+    # 15.0 ms, because its whole design assumes few, heavily reused rows. Triton is the safe default
+    # in that regime. Kept reachable for experimentation on shapes not covered here.
+    return os.environ.get("PYJUICE_SOFTEVI_FW_GATHER", "0") == "1" \
+        and _params_exceed_l2(layer, kwargs)
+
+
+def _fw_use_dense(layer, kwargs):
+    """Whether the forward can use the index-driven form. It needs the same inverted index and the same
+    tying / L2 criterion as the backward; otherwise the gather form still applies."""
+    return _dense_worth_it(layer, kwargs) and _build_dense_index(layer, kwargs) is not None
+
+
+def _fw_linear_evidence(layer, kwargs):
+    """exp(categorical_evidence_logp), cached per step: the gather form accumulates the normalizer in
+    linear space and would otherwise redo this exp 268M times inside the kernel."""
+    evidence = kwargs["categorical_evidence_logp"]
+    key = (evidence.data_ptr(), evidence._version, tuple(evidence.shape))
+    cached = getattr(layer, "_fw_pt_cache", None)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    pt = evidence.exp().contiguous()
+    layer._fw_pt_cache = (key, pt)
+    return pt
+
+
+def _fw_scratch(layer, num_slots, num_latents):
+    """[num_slots, num_latents] accumulator for the local normalizer (~1 MB)."""
+    buf = getattr(layer, "_fw_z_buf", None)
+    if buf is None or tuple(buf.shape) != (num_slots, num_latents) or buf.device != layer.params.device:
+        buf = torch.zeros([num_slots, num_latents], dtype = torch.float32, device = layer.params.device)
+        layer._fw_z_buf = buf
+    return buf
+
+
+def _fw_observed_evidence(layer, kwargs):
+    """log p_theta at the observed token, per (variable, batch) -> [ext_num_vars * batch_size].
+
+    Done once per (variable, batch) rather than per node, which is why it is far cheaper here than the
+    per-node candidate re-scan the Triton kernel performs."""
+    evidence = kwargs["categorical_evidence_logp"]
+    cat_ids = kwargs["soft_evidence_cat_ids"]
+    B, V, K = cat_ids.shape
+
+    data = kwargs["_fw_data"].view(-1, B)                      # [pc_num_vars, batch]
+    gv = layer.layer_var_list
+    obs = torch.empty([V, B], dtype = data.dtype, device = data.device)
+    obs[layer.var_idmapping[gv]] = data[gv]
+
+    match = (cat_ids == obs.permute(1, 0).unsqueeze(2))         # [B, V, K]
+    kstar = match.float().argmax(dim = 2, keepdim = True)
+    lex = torch.gather(evidence, 2, kstar).squeeze(2)           # [B, V]
+    # `argmax` yields 0 when the observed token is absent from the candidate set, which would silently
+    # pick the wrong entry; the Triton kernel leaves the term at -inf in that case, so match it.
+    lex = torch.where(match.any(dim = 2), lex, torch.full_like(lex, -float("inf")))
+    return lex.permute(1, 0).contiguous().view(-1)
+
+
+def _condition_fw_cuda_kernel(layer, kwargs):
+    return "categorical_evidence_logp" in kwargs and _fw_cuda_applicable(layer, kwargs)
+
+
+def _prep_args_fw_cuda_kernel(layer, kwargs):
+    evidence = kwargs["categorical_evidence_logp"]
+    batch_size = kwargs["batch_size"]
+    assert evidence.size(0) == batch_size, "Batch size doesn't match in `categorical_evidence_logp`."
+
+    if not _fw_use_dense(layer, kwargs):
+        return dict(use_dense = False,
+                    pt_ptr = _fw_linear_evidence(layer, kwargs),
+                    cat_ids_ptr = kwargs["soft_evidence_cat_ids"],
+                    var_idmapping_ptr = layer.var_idmapping,
+                    ext_num_vars = evidence.size(1),
+                    num_cats = evidence.size(2),
+                    fw_unroll = 4), (1,)
+
+    index = _build_dense_index(layer, kwargs)
+    num_latents = index["num_latents"]
+    num_slots = evidence.size(1) * batch_size
+
+    return dict(use_dense = True,
+                Z_ptr = _fw_scratch(layer, num_slots, num_latents),
+                log_ex_p_ptr = _fw_observed_evidence(layer, kwargs),
+                var_idmapping_ptr = layer.var_idmapping,
+                index = index,
+                num_slots = num_slots,
+                num_latents = num_latents,
+                FW_TL = 4, FW_THREADS = 256, FW_CAT_BLOCKS = 64), (1,)
+
+
+class _FwCudaDispatch:
+    """Adapter so the CUDA forward can live in `post_fw_fns`, which launches ``kernel[grid](**kwargs)``.
+
+    Two implementations, chosen by `_fw_use_dense`:
+
+      * INDEX-DRIVEN (preferred). Inverts (variable, batch, candidate) -> category and walks
+        (latent x category), so `params` is read ONCE, coalesced, at each referenced position: ~113M
+        reads rather than the 268M SCATTERED ones the direct form does. Needs tied parameters to pay
+        off, exactly like the backward. The normalizer kernel measures 0.86 ms against a 0.31 ms floor
+        for the parameter read alone, versus 2.90 ms for the whole Triton forward.
+      * GATHER. One thread per (node, batch) walking its own candidate list; applies to any top-k
+        configuration. 2.35 ms versus Triton's 2.90 ms on the tied config, and its speed hinges on two
+        things found by benchmarking the gather in isolation against an equivalent Triton one: 512
+        threads per block (at 256 it runs 7.4 ms -- a 3x cliff) and `__ldcs` for the parameter read.
+        NOT auto-selected -- see `_fw_cuda_applicable` -- because it is never the best option in any
+        regime measured: dense wins where dense applies, and Triton wins where it does not.
+    """
+
+    def __getitem__(self, grid):
+        def launch(**kw):
+            if kw["use_dense"]:
+                from .c_kernels import softevi_forward_dense
+                ix = kw["index"]
+                softevi_forward_dense(
+                    kw["params_ptr"], kw["node_mars_ptr"], kw["Z_ptr"], kw["log_ex_p_ptr"],
+                    kw["data_ptr"], kw["vids_ptr"], kw["s_pids_ptr"], kw["nids_ptr"],
+                    kw["var_idmapping_ptr"], ix["uniq"], ix["ref_slot"], ix["ref_pt"], ix["ref_cnt"],
+                    ix["num_uniq"], ix["p_base"], kw["num_latents"], ix["Umax"], _DENSE_MAX_REFS,
+                    kw["num_slots"], ix["num_blocks"], kw["layer_num_nodes"], kw["batch_size"],
+                    kw["node_offset"], kw["FW_TL"], kw["FW_THREADS"], kw["FW_CAT_BLOCKS"])
+            else:
+                from .c_kernels import softevi_forward
+                softevi_forward(
+                    kw["params_ptr"], kw["node_mars_ptr"], kw["data_ptr"], kw["vids_ptr"],
+                    kw["s_pids_ptr"], kw["var_idmapping_ptr"], kw["pt_ptr"], kw["cat_ids_ptr"],
+                    kw["layer_num_nodes"], kw["batch_size"], kw["node_offset"],
+                    kw["num_cats"], kw["ext_num_vars"], kw["fw_unroll"])
+        return launch
+
+
 def _condition_apply_fw_kernel(layer, kwargs):
     return "categorical_evidence_logp" in kwargs and \
-        kwargs.get("soft_evidence_value_mask", None) is None
+        kwargs.get("soft_evidence_value_mask", None) is None and \
+        not _fw_cuda_applicable(layer, kwargs)
 
 
 def _prep_args_apply_fw_kernel(layer, kwargs):
@@ -284,6 +446,28 @@ def _dense_topk_applicable(layer, kwargs):
     return _build_dense_index(layer, kwargs) is not None
 
 
+def _l2_bytes(layer):
+    l2 = getattr(_l2_bytes, "_cached", None)
+    if l2 is None:
+        try:
+            l2 = torch.cuda.get_device_properties(layer.params.device).L2_cache_size
+        except Exception:
+            l2 = 64 * 1024 * 1024
+        _l2_bytes._cached = l2
+    return l2
+
+
+def _params_exceed_l2(layer, kwargs):
+    """Whether the emission parameter table is too big to sit in L2 -- the regime every CUDA path here
+    was tuned for. Below it, scattered reads are already cheap and Triton is the safer default."""
+    lnn = layer._output_ind_range[1] - layer._output_ind_range[0]
+    ext_num_vars = kwargs["categorical_evidence_logp"].size(1)
+    if ext_num_vars == 0 or lnn % ext_num_vars != 0:
+        return False
+    num_latents = lnn // ext_num_vars
+    return num_latents * layer.nodes[0].dist.num_cats * 4 > _l2_bytes(layer)
+
+
 def _dense_worth_it(layer, kwargs):
     """
     Is the dense path actually faster than just scattering?
@@ -301,26 +485,49 @@ def _dense_worth_it(layer, kwargs):
 
     The middle two have the SAME number of scatter operations (8.4M) and opposite verdicts, so the
     footprint -- not the operation count -- is what decides it.
+
+    The second condition is that the PARAMETERS MUST BE TIED across variables, which is the property the
+    dense form really runs on. The scattered form always does `num_nodes * batch * k` operations. The
+    dense form does `sum over param-flow groups of (latents * |unique categories in that group|)`, and
+    because the unique-category count saturates (coupon collector), merging many variables into one
+    group makes the dense form win big -- while untied parameters put every variable in its own group
+    and the two converge. At 32 vars / 1024 latents / 126464 cats / k=1024 / batch 8:
+
+        fully tied (1 group of 32 vars) -> ~113M dense slots vs 268M scattered ops -> dense wins
+        untied    (32 groups of 1 var)  -> ~260M dense slots vs 268M scattered ops -> no gain, and the
+                                           dense form would still pay to build its index
+
+    All of this is host-side arithmetic: no device sync, and no index build for cases we then reject.
     """
     tot_num_cats = layer.nodes[0].dist.num_cats
     lnn = layer._output_ind_range[1] - layer._output_ind_range[0]
-    ext_num_vars = kwargs["categorical_evidence_logp"].size(1)
+    evidence = kwargs["categorical_evidence_logp"]
+    ext_num_vars = evidence.size(1)
+    num_k = evidence.size(2)
+    batch_size = evidence.size(0)
     if ext_num_vars == 0 or lnn % ext_num_vars != 0:
         return False
     num_latents = lnn // ext_num_vars
 
-    # What the scattered path touches at random: the emission parameters plus the phase-1 flow half
+    # (1) What the scattered path touches at random: the emission parameters plus the phase-1 flow half
     footprint = 2 * num_latents * tot_num_cats * 4
 
-    l2 = getattr(_dense_worth_it, "_l2", None)
-    if l2 is None:
-        try:
-            l2 = torch.cuda.get_device_properties(layer.params.device).L2_cache_size
-        except Exception:
-            l2 = 64 * 1024 * 1024
-        _dense_worth_it._l2 = l2
+    if footprint <= _l2_bytes(layer):
+        return False
 
-    return footprint > l2
+    # (2) Does parameter tying give the dense form a real work advantage?
+    layout = _dense_layer_layout(layer, ext_num_vars)
+    if layout is None:
+        return False
+    num_groups = len(layout[1])
+    vars_per_group = max(1, ext_num_vars // num_groups)
+
+    slots_per_group = vars_per_group * batch_size * num_k
+    uniq_est = tot_num_cats * (1.0 - math.exp(-slots_per_group / tot_num_cats))
+    dense_ops = num_groups * num_latents * uniq_est
+    scattered_ops = lnn * batch_size * num_k
+
+    return dense_ops < 0.6 * scattered_ops
 
 
 def _dense_scratch(layer, ext_num_vars, batch_size, num_latents):
@@ -777,6 +984,9 @@ class SoftEvidenceCategorical(Distribution):
         self.num_cats = num_cats
 
         self.post_fw_fns = [
+            # CUDA top-k forward (index-driven, or the gather form); mutually exclusive with the Triton
+            # kernel below, which remains the fallback for value-mask / no-cat-ids / partial-eval cases.
+            (_FwCudaDispatch(), _condition_fw_cuda_kernel, _prep_args_fw_cuda_kernel),
             (self.fw_kernel, _condition_apply_fw_kernel, _prep_args_apply_fw_kernel),
             # Opt-in generation forward; the two conditions are mutually exclusive on
             # `soft_evidence_value_mask`, so the default path is untouched.

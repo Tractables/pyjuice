@@ -383,6 +383,7 @@ class InputLayer(Layer, nn.Module):
 
             # Apply post-processing kernels
             self.dist.set_custom_kernel_kwargs(kwargs)
+            kwargs["_fw_data"] = data
             for (kernel, cond_fn, prep_kwargs_fn) in self.post_fw_fns:
                 if not cond_fn(self, kwargs):
                     continue

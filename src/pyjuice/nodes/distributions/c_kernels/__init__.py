@@ -14,7 +14,10 @@ import warnings
 
 import torch
 
-ENABLE_CUDA_KERNELS = os.environ.get("PYJUICE_DISABLE_CUDA_KERNELS", "0") != "1"
+# Deliberately a DIFFERENT switch from the layer kernels' PYJUICE_DISABLE_CUDA_KERNELS: those need a
+# CUTLASS checkout for part of their set, so a user without one may well want them off while keeping
+# these (which are plain CUDA and compile anywhere).
+ENABLE_CUDA_KERNELS = os.environ.get("PYJUICE_DISABLE_DIST_CUDA_KERNELS", "0") != "1"
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -28,10 +31,10 @@ def _jit_plain(name: str, source_file: str):
         return None
     cc = torch.cuda.get_device_capability()
     cuda_cflags = ["-O3", f"-arch=sm_{cc[0]}{cc[1]}", "--use_fast_math", "-DNDEBUG"]
-    from torch.utils.cpp_extension import load
+    from pyjuice.utils.cuda_ext import jit_load
     try:
-        return load(name = name, sources = [os.path.join(_THIS_DIR, source_file)],
-                    extra_cuda_cflags = cuda_cflags, verbose = False)
+        return jit_load(name, [os.path.join(_THIS_DIR, source_file)],
+                        extra_cuda_cflags = cuda_cflags, verbose = False)
     except Exception as e:
         warnings.warn(
             f"pyjuice CUDA input-distribution kernel '{name}' failed to compile "
@@ -55,3 +58,23 @@ def dense_expected_flow(params, param_flows, ratio, uniq, ref_slot, ref_pt, ref_
         params, param_flows, ratio, uniq, ref_slot, ref_pt, ref_goff, ref_cnt, num_uniq,
         pf_base, p_base, grad, int(num_latents), int(tot_num_cats), int(uniq_stride),
         int(max_refs), int(num_blocks), int(block_c), int(num_slots), int(tl_size))
+
+
+def softevi_forward(params, node_mars, data, vids, s_pids, var_idmapping, pt, cat_ids,
+                    layer_num_nodes, batch_size, node_offset, num_cats, ext_num_vars,
+                    unroll):
+    _softevi_module.softevi_forward(
+        params, node_mars, data, vids, s_pids, var_idmapping, pt, cat_ids,
+        int(layer_num_nodes), int(batch_size), int(node_offset), int(num_cats),
+        int(ext_num_vars), int(unroll))
+
+
+def softevi_forward_dense(params, node_mars, Z, log_ex_p, data, vids, s_pids, nids, var_idmapping,
+                          uniq, ref_slot, ref_pt, ref_cnt, num_uniq, p_base, num_latents,
+                          uniq_stride, max_refs, num_slots, num_blocks, layer_num_nodes, batch_size,
+                          node_offset, TL, threads, cat_blocks):
+    _softevi_module.softevi_forward_dense(
+        params, node_mars, Z, log_ex_p, data, vids, s_pids, nids, var_idmapping,
+        uniq, ref_slot, ref_pt, ref_cnt, num_uniq, p_base, int(num_latents), int(uniq_stride),
+        int(max_refs), int(num_slots), int(num_blocks), int(layer_num_nodes), int(batch_size),
+        int(node_offset), int(TL), int(threads), int(cat_blocks))
