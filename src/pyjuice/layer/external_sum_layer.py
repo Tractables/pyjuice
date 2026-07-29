@@ -380,7 +380,13 @@ class ExternalParamsSumLayer(SumLayer):
 
         self._assert_supported(propagation_alg, is_backward = True, **kwargs)
 
-        batch_size = node_mars.size(1)
+        # Resolve the gradient buffers BEFORE anything runs: `pre_backward` may put the shared buffers
+        # into an intermediate form that only `post_backward` undoes, so a validation failure raised
+        # between the two would leave the circuit's state inconsistent.
+        ns_grad_tensors = [
+            self._resolve_external_grad_tensors(kwargs, ns_info, node_mars.size(1), node_mars.device)
+            for ns_info, _ in ns_tensors
+        ]
 
         for ns_info, tensors in ns_tensors:
             self.external_params.pre_backward(
@@ -394,10 +400,9 @@ class ExternalParamsSumLayer(SumLayer):
             param_flows = param_flows, propagation_alg = propagation_alg, **kwargs
         )
 
-        for ns_info, tensors in ns_tensors:
+        for (ns_info, tensors), grad_tensors in zip(ns_tensors, ns_grad_tensors):
             self.external_params.post_backward(
-                self, ns_info, tensors,
-                self._resolve_external_grad_tensors(kwargs, ns_info, batch_size, node_mars.device),
+                self, ns_info, tensors, grad_tensors,
                 node_flows, element_flows, node_mars, element_mars, params,
                 param_flows = param_flows, propagation_alg = propagation_alg, **kwargs
             )
