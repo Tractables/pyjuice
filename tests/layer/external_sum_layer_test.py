@@ -61,7 +61,7 @@ def test_external_sum_layer_compilation():
         assert isinstance(layer.external_params, LowRankSumParams)
 
     # The PC records which nodes take external parameters, so a bad kwarg key can be rejected
-    assert pc.external_params_nodes == {ns_ext, ns_ext2}
+    assert set(pc.external_params_nodes) == {ns_ext, ns_ext2}
 
 
 def test_external_node_info():
@@ -379,21 +379,23 @@ def test_external_sum_layer_grad_buffers():
     U = torch.full([batch_size, num_edge_blocks, 4, rank], -6.0, device = device)
     V = torch.full([batch_size, num_edge_blocks, 4, rank], -6.0, device = device)
 
-    dU = torch.full([batch_size, num_edge_blocks, 4, rank], 7.0, device = device)
-    dV = torch.full([batch_size, num_edge_blocks, 4, rank], 7.0, device = device)
-
-    pc(data)
+    with pytest.raises(NotImplementedError):
+        pc(data, sum_external_params = {ns: (U, V)})
 
     with pytest.raises(NotImplementedError):
-        pc.backward(data, sum_external_params = {ns: (U, V)},
-                    sum_external_params_grad = {ns: (dU, dV)})
+        pc.backward(data)
 
+    # The gradients are PC-owned views laid out exactly like the supplied tensors, allocated and
+    # zeroed once per backward so that the layers can accumulate into them
+    dU, dV = pc.get_external_params_grad(ns)
+
+    assert dU.size() == U.size() and dV.size() == V.size()
+    assert dU.is_contiguous() and dV.is_contiguous()
     assert torch.all(dU == 0.0) and torch.all(dV == 0.0)
 
-    # The gradient buffers are validated against the same declared layout
+    # Supplying them is not the caller's job
     with pytest.raises(AssertionError):
-        pc.backward(data, sum_external_params = {ns: (U, V)},
-                    sum_external_params_grad = {ns: (dU[:,:,:,:rank-1].contiguous(), dV)})
+        pc.backward(data, sum_external_params_grad = {ns: (dU.clone(), dV.clone())})
 
 
 if __name__ == "__main__":

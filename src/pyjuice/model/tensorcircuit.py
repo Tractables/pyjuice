@@ -14,7 +14,8 @@ from contextlib import contextmanager
 from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes, ExternalParamsSumNodes, \
                           foreach, summate, multiply
 from pyjuice.layer import Layer, InputLayer, ProdLayer, SumLayer, ExternalParamsSumLayer, LayerGroup, \
-                          EXTERNAL_PARAMS_KWARG, EXTERNAL_PARAMS_GRAD_KWARG
+                          StagedExternalParams, EXTERNAL_PARAMS_KWARG, EXTERNAL_PARAMS_GRAD_KWARG
+from pyjuice.layer.external_sum_layer import validate_external_tensors
 from pyjuice.utils.grad_fns import ReverseGrad
 from pyjuice.utils import BitSet
 
@@ -155,6 +156,12 @@ class TensorCircuit(nn.Module):
         self.element_flows = None
         self.param_flows = None
         self.node_mars_tempered = None
+
+        # Staging buffers for externally supplied per-sample sum parameters, and for the per-sample
+        # gradients returned for them. Like `node_mars`, they are flat and (re)allocated by
+        # `_init_buffer` whenever the batch size changes.
+        self.external_params = None
+        self.external_params_grad = None
         
         self._init_layers(
             layer_sparsity_tol = layer_sparsity_tol, 
@@ -272,6 +279,7 @@ class TensorCircuit(nn.Module):
             pflow_tempered_enabled = abs(pflow_temperature - 1.0) >= 1e-6
 
             self._check_external_params_kwargs(kwargs)
+            self._stage_external_params(kwargs, B)
 
             ## Initialize buffers for forward pass ##
 
@@ -331,7 +339,10 @@ class TensorCircuit(nn.Module):
                     else:
                         raise ValueError(f"Unknown layer type {type(layer)}.")
 
-            signature = (0, id(self.node_mars), id(self.element_mars), id(self.params), B)
+            # `external_params` is in the signature because the staging buffer is re-allocated when its
+            # layout changes, and a captured graph holds the old pointer
+            signature = (0, id(self.node_mars), id(self.element_mars), id(self.params), B,
+                         id(self.external_params))
             if record_cudagraph and signature not in self._recorded_cuda_graphs:
                 # Warmup
                 s = torch.cuda.Stream()
@@ -408,6 +419,7 @@ class TensorCircuit(nn.Module):
                  force_use_fp32: bool = False,
                  pflow_temperature: float = 1.0,
                  temper_eflow: bool = False,
+                 compute_external_grads: bool = True,
                  **kwargs):
         """
         Backward evaluation of the PC that computes node flows as well as parameter flows.
@@ -483,9 +495,10 @@ class TensorCircuit(nn.Module):
             if compute_param_flows:
                 self.init_param_flows(flows_memory = flows_memory)
 
-            ## Initialize external-parameter gradient buffers ##
+            ## External parameters: reuse what the forward staged; reset the gradient buffers ##
             self._check_external_params_kwargs(kwargs)
-            self._zero_external_params_grads(kwargs)
+            self._resolve_backward_external_params(kwargs)
+            self._init_external_params_grads(kwargs, B, compute_external_grads)
 
             ## Run backward pass ##
 
@@ -540,7 +553,8 @@ class TensorCircuit(nn.Module):
                         raise ValueError(f"Unknown layer type {type(layer)}.")
 
             signature = (1, id(self.node_flows), id(self.element_flows), id(self.node_mars), id(self.element_mars), id(self.params), id(self.param_flows), B, 
-                         allow_modify_flows, logspace_flows, ((abs(pflow_temperature) - 1.0) < 1e-6), temper_eflow)
+                         allow_modify_flows, logspace_flows, ((abs(pflow_temperature) - 1.0) < 1e-6), temper_eflow,
+                         id(self.external_params), id(self.external_params_grad))
             if record_cudagraph and signature not in self._recorded_cuda_graphs:
                 # Warmup
                 s = torch.cuda.Stream()
@@ -599,6 +613,132 @@ class TensorCircuit(nn.Module):
         else:
             return None
 
+    def _external_params_layout(self, batch_size: int):
+        """
+        Slot layout of the external-parameter staging buffer at `batch_size`.
+
+        Every node that takes external parameters gets its own contiguous slot for each tensor its
+        parameterization declares, laid out in `external_params_nodes` order. The shapes come from the
+        descriptor, so the layout is whatever the parameterization says it is; the buffer just gives
+        every tensor a known, contiguous home that the kernels can address and that keeps a stable
+        pointer across calls (which is what lets the caller pass freshly allocated tensors, and lets
+        the layers run under CUDA-graph capture).
+
+        Cached per batch size, since that is the only thing the layout depends on.
+
+        :returns: `(total_numel, {ns: [(offset, shape), ...]})`
+        """
+        layout = self._external_params_layouts.get(batch_size, None)
+        if layout is not None:
+            return layout
+
+        offset = 0
+        ns2slots = dict()
+        for ns in self.external_params_nodes:
+            slots = []
+            for shape in ns.external_params.tensor_shapes(ns, batch_size):
+                slots.append((offset, tuple(shape)))
+                offset += math.prod(shape)
+
+            ns2slots[ns] = slots
+
+        layout = (offset, ns2slots)
+        self._external_params_layouts[batch_size] = layout
+
+        return layout
+
+    def _external_params_views(self, name: str, batch_size: int, set_value: Optional[float] = None):
+        """
+        (Re)allocate the staging buffer `name` for `batch_size` and return one contiguous view per
+        tensor slot, as `{ns: (view, ...)}`.
+
+        The views are what the layers and kernels consume, so a parameterization never has to know
+        that a shared buffer exists -- it just receives correctly shaped, contiguous, correctly placed
+        tensors.
+        """
+        total_numel, ns2slots = self._external_params_layout(batch_size)
+
+        self._init_buffer(name = name, shape = (total_numel,), set_value = set_value)
+
+        buffer = self.__dict__[name]
+
+        return {ns: tuple(buffer[offset:offset + math.prod(shape)].view(shape) for offset, shape in slots)
+                for ns, slots in ns2slots.items()}
+
+    def _stage_external_params(self, kwargs: dict, batch_size: int) -> None:
+        """
+        Copy the caller's external tensors into the staging buffer and replace the `sum_external_params`
+        entry with views into it, so the layers only ever see the buffer.
+
+        This is what decouples the caller's memory layout from the kernels'. The caller may hand over
+        slices of whatever their own head produced -- strided, freshly allocated each step, in any
+        arrangement -- and the layers still receive contiguous tensors at a stable address. The copy is
+        issued as ONE batched op rather than one per tensor: a per-tensor `copy_` would cost a kernel
+        launch per node, which for a model with many tied copies would dominate the correction itself.
+
+        Called from the forward pass. The backward reuses what was staged here rather than asking for
+        the tensors again, which also makes it impossible to run a backward whose external parameters
+        disagree with the forward that produced `node_mars`.
+        """
+        ns2tensors = kwargs.get(EXTERNAL_PARAMS_KWARG, None)
+
+        if ns2tensors is None or isinstance(ns2tensors, StagedExternalParams):
+            # Nothing supplied, or already staged (e.g. re-entered through the autograd hook)
+            return None
+
+        views = StagedExternalParams(self._external_params_views(
+            name = "external_params", batch_size = batch_size
+        ))
+
+        # Validate against the buffer's own device rather than `self.device`, which may be index-less
+        # (`torch.device("cuda")`) and so compare unequal to an otherwise identical `cuda:0`
+        device = self.external_params.device
+
+        dsts, srcs = [], []
+        for ns, tensors in ns2tensors.items():
+            tensors = validate_external_tensors(
+                ns, ns.external_params, tensors, batch_size, device, require_contiguous = False
+            )
+            dsts.extend(views[ns])
+            srcs.extend(tensors)
+
+        torch._foreach_copy_(dsts, srcs)
+
+        # Nodes the caller did NOT supply keep whatever the buffer held; drop them so a layer sees
+        # exactly the set that was staged
+        for ns in list(views.keys()):
+            if ns not in ns2tensors:
+                del views[ns]
+
+        kwargs[EXTERNAL_PARAMS_KWARG] = views
+        self._staged_external_params = views
+
+    def _resolve_backward_external_params(self, kwargs: dict) -> None:
+        """
+        Point the backward pass at the external parameters the forward actually staged.
+
+        The forward leaves `node_mars` in a form that only the matching external backward interprets
+        correctly, so running a backward against *different* external parameters -- or none -- would
+        silently produce wrong flows. Taking them from the staging buffer makes that impossible: the
+        values used are, by construction, the ones the forward used, and they are pyjuice's own
+        snapshot, so nothing the caller does to their tensors in between can perturb them.
+
+        A caller may still pass `sum_external_params` (the autograd hook forwards it), but it only has
+        to name the same set of nodes; the staged values are what gets used.
+        """
+        staged = self._staged_external_params
+
+        ns2tensors = kwargs.get(EXTERNAL_PARAMS_KWARG, None)
+        if ns2tensors is not None and not isinstance(ns2tensors, StagedExternalParams):
+            assert staged is not None, \
+                f"`{EXTERNAL_PARAMS_KWARG}` was given to the backward pass, but the forward pass did " \
+                f"not receive any external parameters."
+            assert set(ns2tensors.keys()) == set(staged.keys()), \
+                f"`{EXTERNAL_PARAMS_KWARG}` names a different set of nodes than the forward pass did."
+
+        if staged is not None:
+            kwargs[EXTERNAL_PARAMS_KWARG] = staged
+
     def _check_external_params_kwargs(self, kwargs: dict) -> None:
         """
         Check that every `sum_external_params` / `sum_external_params_grad` entry names a node this PC
@@ -607,7 +747,7 @@ class TensorCircuit(nn.Module):
         Without this, a stale or mistyped `ns` key is silently ignored -- the PC runs on its shared
         parameters and quietly returns a different answer than intended.
         """
-        for kwarg_name in (EXTERNAL_PARAMS_KWARG, EXTERNAL_PARAMS_GRAD_KWARG):
+        for kwarg_name in (EXTERNAL_PARAMS_KWARG,):
             ns2tensors = kwargs.get(kwarg_name, None)
             if ns2tensors is None:
                 continue
@@ -620,23 +760,58 @@ class TensorCircuit(nn.Module):
                     f"`{kwarg_name}` contains a node that this PC did not compile with an external " \
                     f"parameterization: {ns}. Construct it with `pyjuice.summate(..., external_params = ...)`."
 
-    def _zero_external_params_grads(self, kwargs: dict) -> None:
+    def _init_external_params_grads(self, kwargs: dict, batch_size: int, compute_external_grads: bool) -> None:
         """
-        Zero the external-parameter gradient buffers once, before any layer runs.
+        Allocate and zero the gradient buffer for the staged external parameters, and hand the layers
+        views into it.
 
-        Layers ACCUMULATE into these, so that several nodes -- e.g. the per-timestep tied copies of a
-        homogeneous HMM transition -- can share one buffer and have their gradients summed. That only
-        works if the zeroing happens here rather than per layer.
+        It mirrors the value buffer slot for slot, so the gradient of a node's tensor lives at the
+        same offset as the tensor itself and :func:`get_external_params_grad` can hand back a view
+        rather than copying anything out. Zeroing happens once, here, because the layers ACCUMULATE --
+        which is what lets a node appear in several layers (a tied transition) and sum its
+        contributions.
         """
-        ns2grads = kwargs.get(EXTERNAL_PARAMS_GRAD_KWARG, None)
-        if ns2grads is None:
+        assert kwargs.get(EXTERNAL_PARAMS_GRAD_KWARG, None) is None, \
+            f"`{EXTERNAL_PARAMS_GRAD_KWARG}` is supplied by the PC, not by the caller. Run the backward " \
+            f"pass and read the gradients with `pc.get_external_params_grad(ns)`."
+
+        if self._staged_external_params is None or not compute_external_grads:
+            self._staged_external_params_grad = None
             return None
 
-        for grad_tensors in ns2grads.values():
-            if torch.is_tensor(grad_tensors):
-                grad_tensors = (grad_tensors,)
-            for grad_tensor in grad_tensors:
-                grad_tensor.zero_()
+        grad_views = StagedExternalParams(self._external_params_views(
+            name = "external_params_grad", batch_size = batch_size, set_value = 0.0
+        ))
+
+        # Only the nodes that actually got external parameters this pass
+        for ns in list(grad_views.keys()):
+            if ns not in self._staged_external_params:
+                del grad_views[ns]
+
+        kwargs[EXTERNAL_PARAMS_GRAD_KWARG] = grad_views
+        self._staged_external_params_grad = grad_views
+
+    def get_external_params_grad(self, ns: CircuitNodes):
+        """
+        Per-sample gradients of the external parameters of `ns`, as computed by the last backward pass.
+
+        Returned as views into the PC's gradient buffer, laid out exactly like the tensors that were
+        supplied for `ns` -- so there is nothing to allocate and nothing to copy out. They are valid
+        until the next backward pass overwrites them; clone if you need to keep them.
+
+        :param ns: a node that was given external parameters in the last forward pass
+        :type ns: CircuitNodes
+
+        :returns: a tuple of gradient tensors, matching the tensors supplied for `ns`
+        """
+        assert self._staged_external_params_grad is not None, \
+            "No external-parameter gradients are available. Run a forward pass with " \
+            f"`{EXTERNAL_PARAMS_KWARG}` and then a backward pass with `compute_external_grads = True`."
+        assert ns in self._staged_external_params_grad, \
+            f"No external-parameter gradients for {ns}; it was not given external parameters in the " \
+            f"last forward pass."
+
+        return self._staged_external_params_grad[ns]
 
     def forward_ll(self, *args, **kwargs):
         self.forward(*args, propagation_alg = "LL", **kwargs)
@@ -1141,9 +1316,19 @@ class TensorCircuit(nn.Module):
         # Stores distributed parameter flows
         node2tiednodes = dict()
 
-        # Every `ns` in this PC that takes external parameters. Used to reject `sum_external_params`
-        # entries keyed by a node the PC does not have -- which would otherwise be a silent no-op.
-        self.external_params_nodes = set()
+        # Every `ns` in this PC that takes external parameters, mapped to the layer that compiled it.
+        # Insertion-ordered, and the order is what fixes each node's slot in the staging buffer, so it
+        # must stay deterministic. Also used to reject `sum_external_params` entries keyed by a node
+        # the PC does not have -- which would otherwise be a silent no-op.
+        self.external_params_nodes = dict()
+
+        # (batch size) -> (total numel, {ns: [(offset, shape), ...]}) for the staging buffer
+        self._external_params_layouts = dict()
+
+        # Views staged by the most recent forward pass; the backward reuses them, and writes the
+        # matching per-sample gradients into views of the same shape
+        self._staged_external_params = None
+        self._staged_external_params_grad = None
 
         if verbose:
             print(f"Compiling {num_layers} TensorCircuit layers...")
@@ -1258,7 +1443,8 @@ class TensorCircuit(nn.Module):
                         num_param_flows += sum_layer.num_param_flows
 
                         if ext_signature is not None:
-                            self.external_params_nodes.update(sum_layer.nodes)
+                            for ns in sum_layer.nodes:
+                                self.external_params_nodes[ns] = sum_layer
 
                         sum_layers.append(sum_layer)
 

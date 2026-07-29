@@ -79,12 +79,29 @@ class ExternalNodeInfo():
                f"buffers={self.buffer_names})"
 
 
-def validate_external_tensors(ns, external_params, tensors: Any, batch_size: int, device) -> Tuple:
+class StagedExternalParams(dict):
+    """
+    An `{ns: tensors}` mapping whose tensors are views into the PC's external-parameter staging
+    buffer, i.e. already validated, contiguous and correctly placed.
+
+    Layers use the type as the marker that re-validation is unnecessary -- the per-call checks would
+    otherwise run over every tensor of every node on every forward and backward.
+    """
+    pass
+
+
+def validate_external_tensors(ns, external_params, tensors: Any, batch_size: int, device,
+                              require_contiguous: bool = True) -> Tuple:
     """
     Check externally supplied tensors against the layout the parameterization declares.
 
     Driven entirely by `external_params.tensor_shapes`, so it holds for any parameterization without
     the layer knowing what the tensors mean.
+
+    :param require_contiguous: whether the tensors must already be contiguous. False when they are
+                               about to be *copied* into the staging buffer, which handles arbitrary
+                               strides -- so the caller may hand over slices of whatever their own
+                               head produced without paying for a `.contiguous()` per node.
     """
     shapes = external_params.tensor_shapes(ns, batch_size)
 
@@ -103,7 +120,8 @@ def validate_external_tensors(ns, external_params, tensors: Any, batch_size: int
             f"External tensor {idx} should be of shape {tuple(shape)}, got {tuple(tensor.size())}."
         assert tensor.dtype == torch.float32, \
             f"External tensor {idx} should be of dtype `torch.float32`, got {tensor.dtype}."
-        assert tensor.is_contiguous(), f"External tensor {idx} should be contiguous."
+        if require_contiguous:
+            assert tensor.is_contiguous(), f"External tensor {idx} should be contiguous."
         assert tensor.device == device, \
             f"External tensor {idx} is on {tensor.device}, but the PC's buffers are on {device}."
 
@@ -273,16 +291,21 @@ class ExternalParamsSumLayer(SumLayer):
             f"`{EXTERNAL_PARAMS_KWARG}` should be a dict mapping nodes to their external tensors, " \
             f"got {type(ns2tensors)}."
 
+        # Tensors staged by the PC are views into its own buffer: already validated, contiguous and
+        # correctly shaped, so re-checking them on every call is pure overhead
+        pre_validated = isinstance(ns2tensors, StagedExternalParams)
+
         resolved = []
         for ns_info in self.external_node_infos:
             tensors = ns2tensors.get(ns_info.ns, None)
             if tensors is None:
                 continue
 
-            resolved.append((
-                ns_info,
-                validate_external_tensors(ns_info.ns, self.external_params, tensors, batch_size, device)
-            ))
+            if not pre_validated:
+                tensors = validate_external_tensors(ns_info.ns, self.external_params, tensors,
+                                                    batch_size, device)
+
+            resolved.append((ns_info, tensors))
 
         return resolved
 
@@ -303,6 +326,9 @@ class ExternalParamsSumLayer(SumLayer):
         grad_tensors = ns2grads.get(ns_info.ns, None)
         if grad_tensors is None:
             return None
+
+        if isinstance(ns2grads, StagedExternalParams):
+            return grad_tensors
 
         return validate_external_tensors(ns_info.ns, self.external_params, grad_tensors, batch_size, device)
 
