@@ -136,9 +136,9 @@ def prune_by_score(root_nodes: CircuitNodes, key: str = "_scores", scores: Optio
 
                 assert edge_ids.size(1) == params.size(0)
 
-                new_ns = SumNodes(
-                    num_node_blocks = ns.num_node_blocks, 
-                    chs = ch_outputs, 
+                new_ns = ns.rebuild(
+                    num_node_blocks = ns.num_node_blocks,
+                    chs = ch_outputs,
                     edge_ids = edge_ids,
                     params = params,
                     block_size = ns.block_size

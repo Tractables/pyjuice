@@ -2,10 +2,27 @@ from __future__ import annotations
 
 import torch
 from functools import partial
-from typing import Callable, Optional, Dict
+from typing import Callable, Optional, Dict, Sequence
 
 from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes
 from pyjuice.graph import RegionGraph, PartitionNode, InnerRegionNode, InputRegionNode
+
+
+def _merged_reference_ns(all_ns: Sequence[CircuitNodes]) -> CircuitNodes:
+    """
+    Pick the node whose concrete type and subclass configuration the merged node inherits.
+
+    Merging is only well defined if the inputs agree on both, since the merged node has to be one
+    node of one type; disagreement is reported rather than silently resolved to the base class.
+    """
+    ref_ns = all_ns[0]
+    ref_kwargs = ref_ns._construction_kwargs()
+    for ns in all_ns[1:]:
+        assert type(ns) == type(ref_ns) and ns._construction_kwargs() == ref_kwargs, \
+            f"Cannot merge nodes with different types or configurations: {type(ref_ns).__name__}" \
+            f"{ref_kwargs} vs {type(ns).__name__}{ns._construction_kwargs()}."
+
+    return ref_ns
 
 
 def merge_sum_nodes(ns1: SumNodes, ns2: SumNodes, *args) -> SumNodes:
@@ -17,6 +34,9 @@ def merge_sum_nodes(ns1: SumNodes, ns2: SumNodes, *args) -> SumNodes:
             edge_ids = torch.arange(0, ns.num_node_blocks).unsqueeze(0).repeat(2, 1)
             block_size = ns.block_size
             params = torch.eye(ns.block_size).unsqueeze(0).repeat(ns.num_node_blocks, 1, 1)
+            # A fresh passthrough node over a non-sum input: there is no source sum node to inherit a
+            # type or configuration from, so this is a plain `SumNodes` by construction. If the other
+            # to-be-merged nodes are of a different sum-node type, `_merged_reference_ns` reports it.
             new_ns = SumNodes(ns.num_node_blocks, [ns], edge_ids, params = params, block_size = block_size)
             all_ns[idx] = new_ns
 
@@ -63,7 +83,8 @@ def merge_sum_nodes(ns1: SumNodes, ns2: SumNodes, *args) -> SumNodes:
     else:
         params = None
     
-    return SumNodes(num_node_blocks, sum_chs, edge_ids, params = params, block_size = ns1.block_size)
+    return _merged_reference_ns(all_ns).rebuild(num_node_blocks, sum_chs, edge_ids, params = params,
+                                                block_size = ns1.block_size)
 
 
 def merge_prod_nodes(ns1: ProdNodes, ns2: ProdNodes, *args) -> ProdNodes:
@@ -118,7 +139,7 @@ def merge_prod_nodes(ns1: ProdNodes, ns2: ProdNodes, *args) -> ProdNodes:
     edge_ids = torch.cat(prod_edge_ids, dim = 0)
     num_node_blocks = edge_ids.size(0)
 
-    return ProdNodes(num_node_blocks, new_sum_chs, edge_ids, block_size = ns1.block_size)
+    return _merged_reference_ns(all_ns).rebuild(num_node_blocks, new_sum_chs, edge_ids, block_size = ns1.block_size)
 
 
 def merge_by_region_node(root_ns: CircuitNodes) -> CircuitNodes:
@@ -154,7 +175,7 @@ def merge_by_region_node(root_ns: CircuitNodes) -> CircuitNodes:
                     edge_ids[:,scope_id] += sid
                     chs.append(new_cs)
 
-                prod_ns.append(ProdNodes(ns.num_node_blocks, chs, edge_ids, block_size = ns.block_size))
+                prod_ns.append(ns.rebuild(ns.num_node_blocks, chs, edge_ids, block_size = ns.block_size))
 
             if len(prod_ns) == 1:
                 new_ns = prod_ns[0]
@@ -196,7 +217,7 @@ def merge_by_region_node(root_ns: CircuitNodes) -> CircuitNodes:
                     params = ns._params
                 else:
                     params = None
-                sum_ns.append(SumNodes(ns.num_node_blocks, chs, edge_ids, params = params, block_size = ns.block_size))
+                sum_ns.append(ns.rebuild(ns.num_node_blocks, chs, edge_ids, params = params, block_size = ns.block_size))
 
             if len(sum_ns) == 1:
                 new_ns = sum_ns[0]
