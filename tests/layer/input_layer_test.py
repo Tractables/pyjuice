@@ -307,7 +307,76 @@ def test_speed():
     print("--------------------------------------------------------------")
 
 
+def test_add_missing_flows_tied_nodes():
+    """
+    `add_missing_flows` has two paths that must agree: `_pre_accum_nflows = True` first accumulates
+    each tied node's flow into its source and then walks the SOURCE nodes, while `False` walks every
+    node directly into the same (shared) parameter slots.
+
+    The source-node path indexes `source_nids`, which holds one entry per source node rather than one
+    per node, so it has to be bounded by the number of source nodes. Bounding it by the node count
+    instead reads `source_nids` past its end whenever the layer has tied nodes, and the garbage node
+    ids it returns are used to gather `node_flows` / `s_pids` / `s_pfids` and to scatter into
+    `param_flows` -- silently corrupting them (and reading out of bounds).
+    """
+
+    device = torch.device("cuda:0")
+
+    seq_length, num_latents, num_cats = 4, 8, 5
+
+    torch.manual_seed(3920)
+
+    with juice.set_block_size(num_latents):
+
+        ns_input = inputs(seq_length - 1, num_node_blocks = 1, dist = dists.Categorical(num_cats = num_cats))
+
+        ns_sum, curr_zs = None, ns_input
+        for var in range(seq_length - 2, -1, -1):
+            # Tied input nodes: the layer ends up with more nodes than source nodes
+            curr_xs = ns_input.duplicate(var, tie_params = True)
+
+            if ns_sum is None:
+                ns_sum = summate(curr_zs, num_node_blocks = 1)
+                ns = ns_sum
+            else:
+                ns = ns_sum.duplicate(curr_zs, tie_params = True)
+
+            curr_zs = multiply(curr_xs, ns)
+
+        root_ns = summate(curr_zs, num_node_blocks = 1, block_size = 1)
+
+    root_ns.init_parameters(perturbation = 2.0)
+
+    pc = juice.compile(root_ns)
+    pc.to(device)
+
+    layer = pc.input_layer_group[0]
+    layer_num_nodes = layer._output_ind_range[1] - layer._output_ind_range[0]
+
+    # The paths only differ when some nodes are tied
+    assert layer.source_nids.size(0) < layer_num_nodes
+
+    data = torch.randint(0, num_cats, [16, seq_length]).to(device)
+
+    pc(data)
+    pc.backward(data)
+
+    torch.manual_seed(3920)
+    node_flows = torch.rand([pc.num_nodes], device = device)
+
+    param_flows = dict()
+    for pre_accum_nflows in [True, False]:
+        layer.param_flows[:] = 0.0
+
+        layer.add_missing_flows(node_flows.clone(), scale = 0.7, _pre_accum_nflows = pre_accum_nflows)
+
+        param_flows[pre_accum_nflows] = layer.param_flows.clone()
+
+    assert torch.all(torch.abs(param_flows[True] - param_flows[False]) < 1e-4)
+
+
 if __name__ == "__main__":
     test_input_layer()
     test_tied_bp()
+    test_add_missing_flows_tied_nodes()
     test_speed()

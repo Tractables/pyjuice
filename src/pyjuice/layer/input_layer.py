@@ -854,6 +854,11 @@ class InputLayer(Layer, nn.Module):
                 TILE_SIZE_K = 1
 
             if _pre_accum_nflows:
+                # This launch walks the SOURCE nodes -- it indexes `source_nids`, which has one entry
+                # per source node, not per node -- so its bound is `layer_num_source_nodes`. Bounding
+                # it by `layer_num_nodes` instead reads `source_nids` past its end whenever the layer
+                # has tied nodes, and the garbage node ids it returns are then used to gather
+                # `node_flows` / `s_pids` / `s_pfids` and to scatter into `param_flows`.
                 layer_num_source_nodes = self.source_nids.size(0)
 
                 self._accum_flows_to_tied_nodes(node_flows, logspace_flows)
@@ -871,7 +876,7 @@ class InputLayer(Layer, nn.Module):
                     source_nids_ptr = self.source_nids,
                     scale = scale,
                     node_offset = node_offset,
-                    layer_num_nodes = layer_num_nodes,
+                    num_active_nodes = layer_num_source_nodes,
                     logspace_flows = logspace_flows,
                     are_source_nodes = True,
                     BLOCK_SIZE = BLOCK_SIZE,
@@ -892,7 +897,7 @@ class InputLayer(Layer, nn.Module):
                     source_nids_ptr = self.source_nids,
                     scale = scale,
                     node_offset = node_offset,
-                    layer_num_nodes = layer_num_nodes,
+                    num_active_nodes = layer_num_nodes,
                     logspace_flows = logspace_flows,
                     are_source_nodes = False,
                     BLOCK_SIZE = BLOCK_SIZE,
@@ -1221,13 +1226,13 @@ class InputLayer(Layer, nn.Module):
 
     @staticmethod
     def _missing_flows_kernel_template(node_flows_ptr, params_ptr, param_flows_ptr, s_pids_ptr, s_pfids_ptr,
-                                       metadata_ptr, s_mids_ptr, source_nids_ptr, scale, node_offset: tl.constexpr, layer_num_nodes: tl.constexpr, 
+                                       metadata_ptr, s_mids_ptr, source_nids_ptr, scale, node_offset: tl.constexpr, num_active_nodes: tl.constexpr,
                                        logspace_flows: tl.constexpr, are_source_nodes: tl.constexpr, BLOCK_SIZE: tl.constexpr, TILE_SIZE_K: tl.constexpr):
         pid = tl.program_id(axis = 0)
         block_start = pid * BLOCK_SIZE
 
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < layer_num_nodes
+        mask = offsets < num_active_nodes
 
         # Get the local node ids
         if are_source_nodes:
