@@ -11,8 +11,10 @@ from functools import partial
 from typing import Optional, Sequence, Callable, Union, Tuple, Dict
 from contextlib import contextmanager
 
-from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes, foreach, summate, multiply
-from pyjuice.layer import Layer, InputLayer, ProdLayer, SumLayer, LayerGroup
+from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes, ExternalParamsSumNodes, \
+                          foreach, summate, multiply
+from pyjuice.layer import Layer, InputLayer, ProdLayer, SumLayer, ExternalParamsSumLayer, LayerGroup, \
+                          EXTERNAL_PARAMS_KWARG, EXTERNAL_PARAMS_GRAD_KWARG
 from pyjuice.utils.grad_fns import ReverseGrad
 from pyjuice.utils import BitSet
 
@@ -268,7 +270,9 @@ class TensorCircuit(nn.Module):
 
             # Tempered param flow
             pflow_tempered_enabled = abs(pflow_temperature - 1.0) >= 1e-6
-            
+
+            self._check_external_params_kwargs(kwargs)
+
             ## Initialize buffers for forward pass ##
 
             if not _no_buffer_reset:
@@ -479,6 +483,10 @@ class TensorCircuit(nn.Module):
             if compute_param_flows:
                 self.init_param_flows(flows_memory = flows_memory)
 
+            ## Initialize external-parameter gradient buffers ##
+            self._check_external_params_kwargs(kwargs)
+            self._zero_external_params_grads(kwargs)
+
             ## Run backward pass ##
 
             # Inner layers
@@ -590,6 +598,45 @@ class TensorCircuit(nn.Module):
             return cache
         else:
             return None
+
+    def _check_external_params_kwargs(self, kwargs: dict) -> None:
+        """
+        Check that every `sum_external_params` / `sum_external_params_grad` entry names a node this PC
+        actually compiled with an external parameterization.
+
+        Without this, a stale or mistyped `ns` key is silently ignored -- the PC runs on its shared
+        parameters and quietly returns a different answer than intended.
+        """
+        for kwarg_name in (EXTERNAL_PARAMS_KWARG, EXTERNAL_PARAMS_GRAD_KWARG):
+            ns2tensors = kwargs.get(kwarg_name, None)
+            if ns2tensors is None:
+                continue
+
+            assert isinstance(ns2tensors, dict), \
+                f"`{kwarg_name}` should be a dict mapping nodes to tensors, got {type(ns2tensors)}."
+
+            for ns in ns2tensors:
+                assert ns in self.external_params_nodes, \
+                    f"`{kwarg_name}` contains a node that this PC did not compile with an external " \
+                    f"parameterization: {ns}. Construct it with `pyjuice.summate(..., external_params = ...)`."
+
+    def _zero_external_params_grads(self, kwargs: dict) -> None:
+        """
+        Zero the external-parameter gradient buffers once, before any layer runs.
+
+        Layers ACCUMULATE into these, so that several nodes -- e.g. the per-timestep tied copies of a
+        homogeneous HMM transition -- can share one buffer and have their gradients summed. That only
+        works if the zeroing happens here rather than per layer.
+        """
+        ns2grads = kwargs.get(EXTERNAL_PARAMS_GRAD_KWARG, None)
+        if ns2grads is None:
+            return None
+
+        for grad_tensors in ns2grads.values():
+            if torch.is_tensor(grad_tensors):
+                grad_tensors = (grad_tensors,)
+            for grad_tensor in grad_tensors:
+                grad_tensor.zero_()
 
     def forward_ll(self, *args, **kwargs):
         self.forward(*args, propagation_alg = "LL", **kwargs)
@@ -873,9 +920,9 @@ class TensorCircuit(nn.Module):
 
         psid, peid = ns._param_range
         if clone:
-            ns_params = params[psid:peid].detach().clone()
+            ns_params = self.params[psid:peid].detach().clone()
         else:
-            ns_params = params[psid:peid]
+            ns_params = self.params[psid:peid]
 
         local_parids = (ns._param_ids - psid) // (ns.block_size * ns.ch_block_size)
         num_parblocks = local_parids.size(0)
@@ -901,9 +948,9 @@ class TensorCircuit(nn.Module):
 
         pfsid, pfeid = ns._param_flow_range
         if clone:
-            ns_param_flows = param_flows[pfsid:pfeid].detach().clone()
+            ns_param_flows = self.param_flows[pfsid:pfeid].detach().clone()
         else:
-            ns_param_flows = param_flows[pfsid:pfeid]
+            ns_param_flows = self.param_flows[pfsid:pfeid]
 
         local_parfids = (ns._param_flow_ids - pfsid) // (ns.block_size * ns.ch_block_size)
         num_parfblocks = local_parfids.size(0)
@@ -1094,6 +1141,10 @@ class TensorCircuit(nn.Module):
         # Stores distributed parameter flows
         node2tiednodes = dict()
 
+        # Every `ns` in this PC that takes external parameters. Used to reject `sum_external_params`
+        # entries keyed by a node the PC does not have -- which would otherwise be a silent no-op.
+        self.external_params_nodes = set()
+
         if verbose:
             print(f"Compiling {num_layers} TensorCircuit layers...")
 
@@ -1172,16 +1223,23 @@ class TensorCircuit(nn.Module):
                         num_elements = layer_num_elements
 
                     # Sum layer(s)
+                    # Nodes are grouped by (block size, external-parameter signature): one layer
+                    # compiles one set of kernels, so nodes whose effective parameters are formed
+                    # differently -- or not modified at all -- must not share a layer. This keeps the
+                    # standard sum-layer kernels free of any per-call branch on the parameterization.
                     gsize2sum_nodes = dict()
                     for ns in depth2nodes[depth]["sum"]:
-                        gsize = ns.block_size
+                        ext_signature = ns.get_external_signature() if isinstance(ns, ExternalParamsSumNodes) else None
+                        gsize = (ns.block_size, ext_signature)
                         if gsize not in gsize2sum_nodes:
                             gsize2sum_nodes[gsize] = []
                         gsize2sum_nodes[gsize].append(ns)
-                    
+
                     sum_layers = []
-                    for gsize, nodes in gsize2sum_nodes.items():
-                        sum_layer = SumLayer(
+                    for (gsize, ext_signature), nodes in gsize2sum_nodes.items():
+                        layer_class = SumLayer if ext_signature is None else ExternalParamsSumLayer
+
+                        sum_layer = layer_class(
                             nodes = nodes,
                             global_nid_start = num_nodes, 
                             global_pid_start = num_parameters,
@@ -1198,6 +1256,9 @@ class TensorCircuit(nn.Module):
                         num_edges += sum_layer.num_edges
                         num_parameters += sum_layer.num_parameters
                         num_param_flows += sum_layer.num_param_flows
+
+                        if ext_signature is not None:
+                            self.external_params_nodes.update(sum_layer.nodes)
 
                         sum_layers.append(sum_layer)
 

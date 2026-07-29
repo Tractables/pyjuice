@@ -17,8 +17,13 @@ class LayerGroup(nn.Module):
 
         assert len(layers) >= 1, "A `LayerGroup` must contains at least 1 layer."
 
+        # Layers of one group are evaluated interchangeably, so they must be of one kind -- but sum
+        # layers may legitimately be a mix of `SumLayer` and its external-parameter subclasses, which
+        # share its forward/backward interface and land at the same depth.
         for i in range(1, len(layers)):
-            assert type(layers[i]) == type(layers[0])
+            assert type(layers[i]) == type(layers[0]) or \
+                (isinstance(layers[i], SumLayer) and isinstance(layers[0], SumLayer)), \
+                f"A `LayerGroup` must contain layers of one kind, got {type(layers[0])} and {type(layers[i])}."
 
         if isinstance(layers[0], InputLayer):
             self.layer_type = "input"

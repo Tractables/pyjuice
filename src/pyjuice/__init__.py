@@ -13,7 +13,7 @@ import pyjuice.visualize
 from pyjuice.model import compile, TensorCircuit
 
 # TensorCircuit layers
-from pyjuice.layer import InputLayer, ProdLayer, SumLayer
+from pyjuice.layer import InputLayer, ProdLayer, SumLayer, ExternalParamsSumLayer
 
 # Construction methods
 from pyjuice.nodes import multiply, summate, inputs, set_block_size, structural_properties

@@ -59,6 +59,90 @@ class ExternalSumParams():
         """
         raise NotImplementedError()
 
+    def compile(self, layer) -> None:
+        """
+        Compile the indices and other tensors this parameterization's kernels need, called once when
+        `layer` is built.
+
+        By this point the layer has built the generic per-`ns` metadata -- one
+        :class:`~pyjuice.layer.external_sum_layer.ExternalNodeInfo` per `ns` in
+        `layer.external_node_infos`, giving the mapping from the node's `edge_ids` columns to global
+        node and element ids -- which is usually the starting point for anything further.
+
+        Register whatever is derived through the layer, not on `self`:
+
+        .. code-block:: python
+
+            def compile(self, layer):
+                tables = [build_table(ns_info) for ns_info in layer.external_node_infos]
+                layer.register_external_buffers("edge_table", tables)   # -> ns_info.edge_table
+
+        :func:`~pyjuice.layer.ExternalParamsSumLayer.register_external_buffers` takes one tensor per
+        `ns` and exposes it as an attribute of that `ns_info`;
+        :func:`~pyjuice.layer.ExternalParamsSumLayer.register_external_buffer` takes a single
+        layer-wide tensor. Either way the layer owns the storage, so `.to(device)` moves it and
+        `state_dict` sees it. Non-tensor state (caches, autotuned choices) can be set as a plain
+        attribute on `layer`.
+
+        :note: do NOT keep compiled state on the descriptor. One descriptor instance is shared by
+               every node constructed with it -- including tied duplicates, which live in *different*
+               layers -- so per-layer state stored on `self` would be overwritten by whichever layer
+               compiles last. The descriptor is stateless configuration.
+
+        :param layer: the layer that compiled these nodes
+        :type layer: ExternalParamsSumLayer
+        """
+        pass
+
+    def forward(self, layer, ns_info, tensors, node_mars, element_mars, params, **kwargs) -> None:
+        """
+        Turn the shared-parameter node values into the effective ones, in place.
+
+        Called once per `ns` after the standard sum-layer forward has run, so on entry
+        `node_mars[ns_info.nid_start:ns_info.nid_end]` holds the value each node takes under the
+        SHARED parameters alone. On exit it must hold the value under the effective parameters. The
+        shared kernels are not re-run and not modified, so a parameterization is responsible for
+        expressing its effect as a correction to what they produced.
+
+        :param layer: the layer being evaluated
+        :type layer: ExternalParamsSumLayer
+
+        :param ns_info: compiled metadata for the `ns` these tensors belong to
+        :type ns_info: ExternalNodeInfo
+
+        :param tensors: the validated external tensors supplied for `ns_info.ns`
+        :type tensors: Tuple[torch.Tensor,...]
+        """
+        raise NotImplementedError()
+
+    def pre_backward(self, layer, ns_info, tensors, node_flows, element_flows, node_mars,
+                     element_mars, params, **kwargs) -> None:
+        """
+        Prepare the buffers so that the *standard* sum-layer backward, run immediately afterwards and
+        unmodified, computes the flows of the SHARED component of the parameters.
+
+        Called once per `ns` before the standard backward. Anything changed here must be undone in
+        :func:`post_backward`, since the buffers are shared with the rest of the circuit.
+        """
+        raise NotImplementedError()
+
+    def post_backward(self, layer, ns_info, tensors, grad_tensors, node_flows, element_flows,
+                      node_mars, element_mars, params, param_flows = None, **kwargs) -> None:
+        """
+        Add the external contribution to the child flows, write the per-sample gradients of the
+        external tensors, and undo whatever :func:`pre_backward` changed.
+
+        Called once per `ns` after the standard backward.
+
+        :param grad_tensors: buffers to ACCUMULATE the per-sample gradients into, laid out exactly
+                             like the external tensors, or `None` if the caller did not request
+                             gradients for this `ns`. They are zeroed once per `pc.backward` before
+                             any layer runs, so several nodes may share one buffer and have their
+                             gradients summed into it.
+        :type grad_tensors: Optional[Tuple[torch.Tensor,...]]
+        """
+        raise NotImplementedError()
+
     def _get_constructor(self):
         raise NotImplementedError()
 

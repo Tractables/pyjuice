@@ -82,6 +82,72 @@ class LowRankSumParams(ExternalSumParams):
             (batch_size, num_edge_blocks, ns.block_size, self.rank),     # V
         )
 
+    def forward(self, layer, ns_info, tensors, node_mars, element_mars, params, **kwargs) -> None:
+        """
+        Rewrite `node_mars` from the shared-parameter value `log S1` to the effective value.
+
+        Writing `S1[n,b]` for what the standard kernel produced, `emars` for the child values, and
+        with the correction factored so the dense `[B, num_children, num_nodes]` tile is never built:
+
+        .. code-block:: text
+
+            logW[b,e,r] = logsumexp_c ( U[b,e,c,r] + emars[ch_eids[e] + c, b] )
+            logA[b,e,r] = logsumexp_c   U[b,e,c,r]
+
+            logS2[n,b]  = logsumexp_{e incident to n, r} ( V[b,e,n,r] + logW[b,e,r] )
+            logZ[n,b]   = logaddexp( 0, logsumexp_{e incident to n, r} ( V[b,e,n,r] + logA[b,e,r] ) )
+
+            node_mars[n,b] = logaddexp( logS1[n,b], logS2[n,b] ) - logZ[n,b]
+
+        The `0` in `logZ` is the shared parameters' own contribution: PyJuice keeps them normalized
+        over children at all times, so it is exactly 1.
+
+        Both terms cost `O(num_edge_blocks * block_size * rank * B)`; the shared block-sparse matmul
+        is untouched.
+        """
+        raise NotImplementedError("The `LowRankSumParams` forward kernel has not been implemented yet.")
+
+    def pre_backward(self, layer, ns_info, tensors, node_flows, element_flows, node_mars,
+                     element_mars, params, **kwargs) -> None:
+        """
+        Put `node_mars` back into its UNNORMALIZED form, `logT = logaddexp(logS1, logS2)`, by adding
+        `logZ` to this `ns`'s slice.
+
+        This is what lets the standard kernels compute the shared component's flows with no change at
+        all. They evaluate `param * exp(emars - node_mars)`; feeding them `theta_shared` and `logT`
+        yields `theta_shared * ch / T`, which is exactly the shared part's share of the flow, since
+        the effective parameter is `theta_shared / Z` and the node value is `T / Z`. The parameter
+        flows that come out are therefore the ordinary sum-node flows of `theta_shared`, so EM /
+        Anemone keep training it unchanged.
+        """
+        raise NotImplementedError("The `LowRankSumParams` backward kernels have not been implemented yet.")
+
+    def post_backward(self, layer, ns_info, tensors, grad_tensors, node_flows, element_flows,
+                      node_mars, element_mars, params, param_flows = None, **kwargs) -> None:
+        """
+        Add the correction's share of the child flows, write `dLL/dU` and `dLL/dV`, and restore
+        `node_mars` to the normalized value the forward left.
+
+        With `f[n,b]` the node flow and every term below a bounded ratio times a flow (so nothing
+        overflows and no `[S,S]` object is formed):
+
+        .. code-block:: text
+
+            P[b,e,r] = sum_{n in par(e)} f[n,b] * exp( V[b,e,n,r] + logW[b,e,r] - logT[n,b] )
+            Q[b,e,r] = sum_{n in par(e)} f[n,b] * exp( V[b,e,n,r] + logA[b,e,r] - logZ[n,b] )
+
+            child flow  += sum_r P[b,e,r] * exp( U[b,e,c,r] + emars[c,b] - logW[b,e,r] )
+            dLL/dU      =  sum over incident e of the same term, minus Q[b,e,r] * exp( U - logA )
+            dLL/dV      =  f[n,b] * ( exp( V + logW - logT ) - exp( V + logA - logZ ) )
+
+        The first term of `dLL/dU` is the child-flow contribution itself, so one pass produces both.
+
+        :note: `U`, `V` of `-inf` (an exactly-zero correction) make `logW` and `logA` `-inf` too, so
+               the `U - logA` and `V - logA` differences are `-inf - -inf`. The kernels must mask
+               those to `0` rather than let them become `NaN`.
+        """
+        raise NotImplementedError("The `LowRankSumParams` backward kernels have not been implemented yet.")
+
     def _get_constructor(self):
         return LowRankSumParams, {"rank": self.rank}
 
