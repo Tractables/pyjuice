@@ -8,6 +8,20 @@ from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes
 from pyjuice.graph import RegionGraph, PartitionNode, InnerRegionNode, InputRegionNode
 
 
+def _resolved_params(ns: CircuitNodes) -> Optional[torch.Tensor]:
+    """
+    The parameters of `ns`, looked up through its source node when `ns` is tied.
+
+    A tied node deliberately stores none of its own, so reading `ns._params` directly yields `None`
+    and a node rebuilt from it would come out unparameterized -- and then be randomly initialized at
+    compile time, silently changing the PC. A tied node shares the source's parameter block
+    edge-for-edge, so the source's tensor is the one to carry over.
+    """
+    source_ns = ns.get_source_ns()
+
+    return getattr(source_ns, "_params", None)
+
+
 def _merged_reference_ns(all_ns: Sequence[CircuitNodes]) -> CircuitNodes:
     """
     Pick the node whose concrete type and subclass configuration the merged node inherits.
@@ -78,11 +92,17 @@ def merge_sum_nodes(ns1: SumNodes, ns2: SumNodes, *args) -> SumNodes:
 
     num_node_blocks = ns_start_id
     edge_ids = torch.cat(sum_edge_ids, dim = 1)
-    if all([hasattr(ns, "_params") and ns._params is not None for ns in all_ns]):
-        params = torch.cat([ns._params for ns in all_ns], dim = 0)
+
+    # A merged node is one node, so it cannot stay tied to the several sources its inputs had; the
+    # parameters are carried over instead, which keeps the merged PC equivalent (it just no longer
+    # shares them with the sources).
+    all_params = [_resolved_params(ns) for ns in all_ns]
+    if all([params is not None for params in all_params]):
+        params = torch.cat(all_params, dim = 0)
     else:
         params = None
-    
+
+
     return _merged_reference_ns(all_ns).rebuild(num_node_blocks, sum_chs, edge_ids, params = params,
                                                 block_size = ns1.block_size)
 
@@ -144,30 +164,45 @@ def merge_prod_nodes(ns1: ProdNodes, ns2: ProdNodes, *args) -> ProdNodes:
 
 def merge_by_region_node(root_ns: CircuitNodes) -> CircuitNodes:
 
+    # Longest-path depth of every node, counting from the input nodes. `root_ns` iterates in
+    # post-order, so every node's children are already assigned when it is reached.
+    ns2depth = dict()
+    for ns in root_ns:
+        ns2depth[ns] = 0 if ns.is_input() else max(ns2depth[cs] for cs in ns.chs) + 1
+
+    # Group the nodes that will be merged into one. `RegionGraph.__hash__` is derived purely from
+    # scopes, so it does NOT separate nodes that sit over the same scope at different depths -- as
+    # happens whenever a PC stacks layers over one scope. Grouping on the hash alone would then put a
+    # node and one of its own descendants in the same group, which is both an invalid merge (they are
+    # different layers, and may even differ in block size) and unorderable: the groups would depend on
+    # each other cyclically, so no processing order exists. Keying on (region, depth) as well keeps
+    # such nodes apart. It is a refinement, so PCs whose regions each live at a single depth -- the
+    # layered PCs this function is normally applied to -- group exactly as before.
     rg2nodes = dict()
     rgs_list = list()
-    rgs_set = set()
     for ns in root_ns:
         rg = ns.region_node
-        rg_hash = hash(rg)
-        scope = ns.scope
-        if rg_hash in rgs_set:
-            rg2nodes[rg_hash].append(ns)
+        rg_key = (hash(rg), ns2depth[ns])
+        if rg_key in rg2nodes:
+            rg2nodes[rg_key].append(ns)
         else:
-            rg2nodes[rg_hash] = [ns]
+            rg2nodes[rg_key] = [ns]
 
-            rgs_list.append(rg)
-            rgs_set.add(rg_hash)
+            rgs_list.append((rg_key, rg))
+
+    # Process the groups shallowest-first, which is a topological order of the groups: every node's
+    # children have a strictly smaller depth, so their group is guaranteed to be mapped already. The
+    # sort is stable, so groups of equal depth keep the order they were discovered in.
+    rgs_list.sort(key = lambda rg_key_and_rg: rg_key_and_rg[0][1])
 
     ns_old2new = dict()
-    for rg in rgs_list:
-        rg_hash = hash(rg)
+    for rg_key, rg in rgs_list:
         if isinstance(rg, InputRegionNode):
-            for ns in rg2nodes[rg_hash]:
+            for ns in rg2nodes[rg_key]:
                 ns_old2new[ns] = (ns, (0, ns.num_node_blocks))
         elif isinstance(rg, PartitionNode):
             prod_ns = []
-            for ns in rg2nodes[rg_hash]:
+            for ns in rg2nodes[rg_key]:
                 chs = []
                 edge_ids = ns.edge_ids.clone()
                 for scope_id, cs in enumerate(ns.chs):
@@ -182,14 +217,14 @@ def merge_by_region_node(root_ns: CircuitNodes) -> CircuitNodes:
             else:
                 new_ns = merge_prod_nodes(*prod_ns)
             sid = 0
-            for ns in rg2nodes[rg_hash]:
+            for ns in rg2nodes[rg_key]:
                 nid = sid + ns.num_node_blocks
                 ns_old2new[ns] = (new_ns, (sid, nid))
                 sid = nid
 
         elif isinstance(rg, InnerRegionNode):
             sum_ns = []
-            for ns in rg2nodes[rg_hash]:
+            for ns in rg2nodes[rg_key]:
                 chs = []
                 ch2sid = dict()
                 edge_ids = ns.edge_ids.clone()
@@ -213,23 +248,73 @@ def merge_by_region_node(root_ns: CircuitNodes) -> CircuitNodes:
 
                     origin_sid = origin_eid
 
-                if hasattr(ns, "_params") and ns._params is not None:
-                    params = ns._params
-                else:
-                    params = None
-                sum_ns.append(ns.rebuild(ns.num_node_blocks, chs, edge_ids, params = params, block_size = ns.block_size))
+                sum_ns.append(ns.rebuild(ns.num_node_blocks, chs, edge_ids, params = _resolved_params(ns),
+                                         block_size = ns.block_size))
 
             if len(sum_ns) == 1:
                 new_ns = sum_ns[0]
             else:
                 new_ns = merge_sum_nodes(*sum_ns)
             sid = 0
-            for ns in rg2nodes[rg_hash]:
+            for ns in rg2nodes[rg_key]:
                 nid = sid + ns.num_node_blocks
                 ns_old2new[ns] = (new_ns, (sid, nid))
                 sid = nid
 
+    _restore_tying(rgs_list, rg2nodes, ns_old2new)
+
     return ns_old2new[root_ns][0]
+
+
+def _restore_tying(rgs_list, rg2nodes, ns_old2new) -> None:
+    """
+    Re-establish parameter tying on the merged nodes.
+
+    Each group collapses into a single node, so a tie only survives when the whole group is tied and
+    its sources were themselves rebuilt into a single node that lines up with it block-for-block.
+    Where that holds the merged node is tied and drops its own parameters; where it does not, it
+    keeps the parameters resolved from its sources, so the PC stays equivalent but no longer shares
+    them. Either way the parameters are never lost.
+
+    Input nodes are reused as-is rather than rebuilt, so their tying is already intact and is skipped.
+    """
+
+    for rg_key, rg in rgs_list:
+        if isinstance(rg, InputRegionNode):
+            continue
+
+        nodes = rg2nodes[rg_key]
+        if not all([ns.is_tied() for ns in nodes]):
+            continue
+
+        source_nss = [ns.get_source_ns() for ns in nodes]
+        if any([source_ns not in ns_old2new for source_ns in source_nss]):
+            # Tied to something outside this PC, which the merge cannot speak about
+            continue
+
+        new_ns = ns_old2new[nodes[0]][0]
+        new_source_nss = {ns_old2new[source_ns][0] for source_ns in source_nss}
+        if len(new_source_nss) != 1:
+            # The group's sources ended up in different merged nodes
+            continue
+
+        new_source_ns = next(iter(new_source_nss))
+
+        # The tie is only meaningful if the two merged nodes agree block-for-block: same type and
+        # configuration, same shape, same edges, and every member sitting at the same offset within
+        # its merged node as its source does within the merged source node.
+        if new_source_ns is new_ns or type(new_source_ns) is not type(new_ns) or \
+                new_source_ns._construction_kwargs() != new_ns._construction_kwargs() or \
+                new_source_ns.num_node_blocks != new_ns.num_node_blocks or \
+                new_source_ns.block_size != new_ns.block_size or \
+                new_source_ns.num_chs != new_ns.num_chs or \
+                not torch.equal(new_source_ns.edge_ids, new_ns.edge_ids) or \
+                any([ns_old2new[ns][1] != ns_old2new[source_ns][1] for ns, source_ns in zip(nodes, source_nss)]):
+            continue
+
+        # A tied node holds no parameters of its own; they live on the source
+        new_ns._params = None
+        new_ns.set_source_ns(new_source_ns.get_source_ns())
 
 
 def merge(ns1: CircuitNodes, *args) -> CircuitNodes:
