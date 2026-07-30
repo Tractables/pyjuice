@@ -53,13 +53,14 @@ def get_module():
 
     from pyjuice.utils.cuda_ext import jit_load
     try:
-        _module = jit_load("pyjuice_lowrank_forward_cuda",
+        _module = jit_load("pyjuice_external_params_cuda",
                            sources = [os.path.join(_THIS_DIR, "lowrank_forward.cu"),
-                                      os.path.join(_THIS_DIR, "lowrank_backward.cu")],
+                                      os.path.join(_THIS_DIR, "lowrank_backward.cu"),
+                                      os.path.join(_THIS_DIR, "bindings.cu")],
                            extra_cuda_cflags = flags, verbose = False)
     except Exception as e:
         warnings.warn(
-            f"pyjuice CUDA kernel 'pyjuice_lowrank_forward_cuda' failed to compile "
+            f"pyjuice CUDA kernel 'pyjuice_external_params_cuda' failed to compile "
             f"({type(e).__name__}: {e}). Falling back to the Triton kernels.", RuntimeWarning)
         _module = None
 
@@ -68,3 +69,53 @@ def get_module():
 
 def is_available() -> bool:
     return get_module() is not None
+
+
+# --------------------------------------------------------------------------- CuTe / TMA extension
+
+# Separate from the plain one: the block-scale forward is a fork of pyjuice's CuTe sum kernel and needs
+# CUTLASS headers, an arch-specific `sm_XXa` flag and the driver API, none of which the plain kernels
+# want. Two extensions also means a CUTLASS-related failure cannot disable the low-rank kernels.
+_cute_module = None
+_cute_attempted = False
+
+
+def get_cute_module():
+    """The CuTe/TMA extension, or None if its toolchain is unavailable (warns once)."""
+    global _cute_module, _cute_attempted
+
+    if _cute_attempted:
+        return _cute_module
+
+    _cute_attempted = True
+
+    if not ENABLE_CUDA_KERNELS:
+        return None
+
+    # Reuse the sum layer's toolchain probe: same requirements, already cached, and it warns once with
+    # a message that names the actual missing piece (CUTLASS path, compute capability, nvcc).
+    from pyjuice.layer.kernels.c import _compile_flags
+
+    flags = _compile_flags()
+    if flags is None:
+        return None
+
+    cuda_cflags, ldflags = flags
+
+    from pyjuice.utils.cuda_ext import jit_load
+    try:
+        _cute_module = jit_load("pyjuice_blockscale_cuda",
+                                sources = [os.path.join(_THIS_DIR, "blockscale_forward.cu")],
+                                extra_cuda_cflags = cuda_cflags, extra_ldflags = ldflags,
+                                verbose = False)
+    except Exception as e:
+        warnings.warn(
+            f"pyjuice CUDA kernel 'pyjuice_blockscale_cuda' failed to compile "
+            f"({type(e).__name__}: {e}). `BlockScaleSumParams` will be unavailable.", RuntimeWarning)
+        _cute_module = None
+
+    return _cute_module
+
+
+def cute_is_available() -> bool:
+    return get_cute_module() is not None

@@ -8,6 +8,18 @@ from typing import Optional, Tuple
 from .external_params import ExternalSumParams
 
 
+_BUFFER_KWARG = None
+
+
+def _buffer_kwarg() -> str:
+    """The staging-buffer kwarg name, resolved once (a per-call import shows up in profiles)."""
+    global _BUFFER_KWARG
+    if _BUFFER_KWARG is None:
+        from pyjuice.layer.external_sum_layer import EXTERNAL_PARAMS_BUFFER_KWARG
+        _BUFFER_KWARG = EXTERNAL_PARAMS_BUFFER_KWARG
+    return _BUFFER_KWARG
+
+
 class BlockScaleSumParams(ExternalSumParams):
     """
     A per-sample **multiplicative gate** on each parameter block, supplied externally at call time.
@@ -208,8 +220,140 @@ class BlockScaleSumParams(ExternalSumParams):
             "`BlockScaleSumParams` has no per-node reference path; it is served by `forward_layer`."
         )
 
+    def _build_plan(self, layer, ns_tensors, node_mars, element_mars, params, external_params):
+        """
+        Resolve every per-layer launch argument once, and check the CuTe kernel's assumptions.
+
+        This parameterization has no fallback: the forward is a fork of pyjuice's CuTe/TMA sum kernel,
+        so wherever that kernel does not apply, neither does this. Everything unsupported raises rather
+        than silently running something slower or, worse, something wrong.
+        """
+        from .kernels.c import get_cute_module
+
+        mod = get_cute_module()
+        if mod is None:
+            raise NotImplementedError(
+                "`BlockScaleSumParams` needs the CuTe/TMA CUDA extension, which is unavailable here "
+                "(it requires nvcc, CUTLASS headers and a TMA-capable GPU, sm_90+). There is no Triton "
+                "fallback for this parameterization -- see the compile warning above."
+            )
+
+        if getattr(layer, "ext_slots", None) is None:
+            raise NotImplementedError(
+                "`BlockScaleSumParams` needs the compiled edge-block tables, which require a "
+                "batch-innermost storage layout."
+            )
+
+        ns0 = ns_tensors[0][0].ns
+        batch_size = node_mars.size(1)
+        block_size = layer.block_size
+
+        n_node_gates, n_child_gates = self.gate_counts(ns0)
+        _, gate_cbs = self.gate_sizes(ns0)
+        node_cbs = ns0.ch_block_size
+
+        if n_node_gates != 1:
+            raise NotImplementedError(
+                f"a gate spanning fewer nodes than the block cannot share the staged tile; got "
+                f"{n_node_gates} node gates per block."
+            )
+
+        # Same tile shapes as the kernel's `configs()`; the gate is the standard kernel's own.
+        cfgs = [tuple(c) for c in mod.configs()]
+        valid = [i for i, c in enumerate(cfgs)
+                 if block_size % c[0] == 0 and batch_size % c[1] == 0]
+        if not valid:
+            raise NotImplementedError(
+                f"no CuTe tile fits this layer: block_size={block_size}, batch={batch_size}, tiles="
+                f"{[(c[0], c[1]) for c in cfgs]}. The gate needs `block_size % BM == 0` and "
+                f"`batch % BN == 0` -- a larger node `block_size` (>= 64) is usually the fix; the gate "
+                f"can still be made fine through its own `ch_block_size`, which costs nothing."
+            )
+        cfg = valid[0]
+
+        first_view = ns_tensors[0][1][0]
+        ext_base = ((first_view.data_ptr() - external_params.data_ptr())
+                    // external_params.element_size()) // batch_size
+
+        dev = node_mars.device
+        calls = []
+        for partition_id in range(layer.num_fw_partitions):
+            nids = layer.partitioned_nids[partition_id]
+            cids = layer.partitioned_cids[partition_id]
+            pids = layer.partitioned_pids[partition_id]
+            gate = layer.ext_slots[0][partition_id]
+
+            num_edges = cids.size(1)
+            if num_edges % 64 != 0:
+                raise NotImplementedError(
+                    f"the CuTe forward iterates the edge dimension in tiles of 64; this partition has "
+                    f"{num_edges} edges."
+                )
+            if num_edges % node_cbs != 0:
+                raise NotImplementedError(
+                    f"the compiled edge count ({num_edges}) must be a whole number of child blocks "
+                    f"({node_cbs})."
+                )
+
+            # The kernel reads `element_mars[ebase + e]` and `params[pbase + e * block_size + m]`, so
+            # the tile's children must be contiguous rows and its parameters must stride by
+            # `block_size`. Checked rather than assumed -- exactly as the standard kernel checks it.
+            knt = num_edges // 64
+            c3 = cids.view(-1, knt, 64).to(torch.int64)
+            p3 = pids.view(-1, knt, 64).to(torch.int64)
+            ebase = c3[:, :, 0].contiguous()
+            pbase = p3[:, :, 0].contiguous()
+            ar = torch.arange(64, device = cids.device, dtype = torch.int64)
+
+            if not (torch.equal(c3, ebase.unsqueeze(-1) + ar.view(1, 1, -1))
+                    and torch.equal(p3, pbase.unsqueeze(-1) + ar.view(1, 1, -1) * block_size)):
+                raise NotImplementedError(
+                    "`BlockScaleSumParams` needs the CuTe layout: each edge tile's children contiguous "
+                    "and its parameters strided by `block_size`."
+                )
+
+            rows = nids.size(0)
+            n_eblks = num_edges // node_cbs
+
+            sigma = torch.empty([rows * n_eblks * n_child_gates * block_size], dtype = torch.float32,
+                                device = dev)
+            log_z = torch.empty([rows * block_size * batch_size], dtype = torch.float32, device = dev)
+
+            calls.append((nids, ebase, pbase, pids, gate, sigma, log_z,
+                          block_size, num_edges, node_cbs, gate_cbs, n_node_gates, ext_base, cfg))
+
+        layer._bs_bw_state = (block_size, batch_size, calls)
+
+        return mod, calls
+
     def forward_layer(self, layer, ns_tensors, node_mars, element_mars, params, **kwargs) -> None:
-        raise NotImplementedError("BlockScaleSumParams forward: not wired up yet.")
+        """
+        Compute this layer's node values under the gate, REPLACING the standard sum forward.
+
+        Unlike a corrective parameterization this owns the whole computation: it reweights the
+        per-edge-block partial sums, and those do not survive the standard kernel.
+        """
+        if len(ns_tensors) == 0:
+            return None
+
+        external_params = kwargs.get(_buffer_kwarg(), None)
+        if external_params is None:
+            return None
+
+        ptrs = (node_mars.data_ptr(), element_mars.data_ptr(), params.data_ptr(),
+                external_params.data_ptr(), node_mars.size(1))
+
+        entry = getattr(layer, "_bs_fw_plan", None)
+        if entry is None or entry[0] != ptrs:
+            entry = (ptrs, self._build_plan(layer, ns_tensors, node_mars, element_mars, params,
+                                            external_params))
+            layer._bs_fw_plan = entry
+
+        mod, calls = entry[1]
+        for args in calls:
+            mod.blockscale_forward(node_mars, element_mars, params, external_params, *args)
+
+        return None
 
     def pre_backward_layer(self, layer, ns_tensors, node_flows, element_flows, node_mars,
                            element_mars, params, **kwargs) -> None:

@@ -1,8 +1,12 @@
-// The single pybind module for the external-parameter CUDA kernels.
+// The pybind module for the PLAIN-CUDA external-parameter kernels.
 //
-// Kept apart from the kernel sources so that each of those stays a self-contained translation unit --
-// `PYBIND11_MODULE` may appear only once per extension, and hanging every new kernel's declaration off
+// Kept apart from the kernel sources so each of those stays a self-contained translation unit: the
+// module macro may appear only once per extension, and hanging every new kernel's declaration off
 // whichever file happens to own it makes the ownership arbitrary.
+//
+// The CuTe/TMA block-scale forward is NOT here -- it is its own extension, because it needs CUTLASS
+// headers, an arch-specific flag and the driver API, and because a CUTLASS failure should not take the
+// low-rank kernels down with it.
 
 #include <torch/extension.h>
 
@@ -29,14 +33,6 @@ void lowrank_backward(torch::Tensor node_flows, torch::Tensor element_flows,
 void lowrank_shift_logz(torch::Tensor node_mars, torch::Tensor nids, torch::Tensor log_z,
                         int64_t block_size, double sign);
 
-// ---- blockscale_forward.cu ----
-void blockscale_forward(torch::Tensor node_mars, torch::Tensor element_mars, torch::Tensor params,
-                        torch::Tensor ext, torch::Tensor nids, torch::Tensor cids,
-                        torch::Tensor pids, torch::Tensor gate, torch::Tensor log_z,
-                        int64_t block_size, int64_t node_ch_block_size, int64_t gate_ch_block_size,
-                        int64_t n_node_gates, int64_t ext_base,
-                        int64_t tm, int64_t tb, int64_t tk);
-
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("lowrank_forward", &lowrank_forward,
@@ -45,6 +41,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Per-sample low-rank sum-layer backward: child-flow correction + dLL/dU, dLL/dV");
     m.def("lowrank_shift_logz", &lowrank_shift_logz,
           "Add (or subtract) logZ over a layer's node range, turning node_mars into logT");
-    m.def("blockscale_forward", &blockscale_forward,
-          "Per-block multiplicative gate: computes node_mars = log N - log Z for a whole partition");
 }
