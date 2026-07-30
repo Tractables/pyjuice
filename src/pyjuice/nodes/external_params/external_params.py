@@ -42,6 +42,14 @@ class ExternalSumParams():
         """
         raise NotImplementedError()
 
+    #: Whether this parameterization computes the layer's node values ITSELF, making the standard
+    #: sum-layer forward redundant. `False` -- the default -- means the standard forward runs first and
+    #: the descriptor then corrects what it wrote, which is possible whenever the correction can be
+    #: recovered from the shared total. A parameterization that reweights the per-edge-block partial
+    #: sums cannot do that (the partials are gone once the standard kernel has summed them), so it sets
+    #: this and takes over the whole computation.
+    replaces_shared_forward: bool = False
+
     def storage_owner(self, ns):
         """
         The node whose staging slots `ns` uses.

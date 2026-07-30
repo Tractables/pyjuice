@@ -282,9 +282,12 @@ class ExternalParamsSumLayer(SumLayer):
         `cids[ng, e]` are its child nodes. The external tensors are indexed by edge block instead, so
         each row needs to know which edge blocks it owns and where their factors live:
 
-            `xu[pid][ng, j]`, `xv[pid][ng, j]` -- offsets of the `U` / `V` factors of row `ng`'s j-th
-            incident edge block, in PER-BATCH units (multiply by the batch size at launch), `-1` where
-            a row has fewer than `max_n_eblks` edge blocks.
+            `ext_slots[s][pid][ng, j]` -- offset of storage slot `s` of row `ng`'s j-th incident edge
+            block, in PER-BATCH units (multiply by the batch size at launch), `-1` where a row has
+            fewer than `max_n_eblks` edge blocks.
+
+        One table per slot the parameterization declares, so a descriptor with one tensor per edge
+        block (a scalar gate) and one with two (low-rank factors) are served by the same machinery.
 
         Offsets are per-batch units precisely so this table is independent of the batch size, and can
         therefore be compiled once rather than rebuilt whenever the batch changes.
@@ -297,7 +300,7 @@ class ExternalParamsSumLayer(SumLayer):
         # The tables address the buffer as `(index + within-slot offset) * batch_size + b`, which is
         # only meaningful when the storage layout is batch-innermost. A parameterization that keeps
         # the caller's order simply does not get them -- it is served by its own (torch) path.
-        self.ext_xu, self.ext_xv, self.ext_max_n_eblks = None, None, None
+        self.ext_slots, self.ext_max_n_eblks = None, None
 
         for ns in self.nodes:
             if any([shape[-1] != 1 for shape in ns.external_params.storage_shapes(ns, 1)]):
@@ -329,18 +332,23 @@ class ExternalParamsSumLayer(SumLayer):
 
         max_n_eblks = max([ns_info.max_n_eblks for ns_info in self.external_node_infos])
 
-        xu, xv = [], []
+        # NOT `n_slots`: that name is taken below for the child-block count within `cids`, and shadowing
+        # it here silently truncated the table list.
+        n_ext_slots = len(self.nodes[0].external_params.storage_shapes(self.nodes[0], 1))
+        assert all(len(ns.external_params.storage_shapes(ns, 1)) == n_ext_slots for ns in self.nodes), \
+            "All nodes of a layer must declare the same number of external storage slots."
+
+        tables = [[] for _ in range(n_ext_slots)]
         for partition_id in range(self.num_fw_partitions):
             nids = self.partitioned_nids[partition_id].cpu()
             cids = self.partitioned_cids[partition_id].cpu()
 
-            curr_xu = torch.full([nids.size(0), max_n_eblks], -1, dtype = torch.long)
-            curr_xv = torch.full([nids.size(0), max_n_eblks], -1, dtype = torch.long)
+            curr = [torch.full([nids.size(0), max_n_eblks], -1, dtype = torch.long)
+                    for _ in range(n_ext_slots)]
 
             for ns_info in self.external_node_infos:
                 ns = ns_info.ns
                 block_size, ch_block_size = ns.block_size, ns.ch_block_size
-                rank = ns.external_params.storage_shapes(ns, 1)[0][2]
 
                 rows = torch.nonzero((nids >= ns_info.nid_start) & (nids < ns_info.nid_end),
                                      as_tuple = False).flatten()
@@ -372,14 +380,22 @@ class ExternalParamsSumLayer(SumLayer):
                 assert torch.all(blocked[:,:max_n_eblks,0][valid] == ns_info.ch_eids.cpu()[eblks][valid]), \
                     "External sum parameters require `cids` to list edge blocks in `par_ptr` order."
 
-                curr_xu[rows] = torch.where(valid, ns2unit[ns][0] + eblks * ch_block_size * rank, -1)
-                curr_xv[rows] = torch.where(valid, ns2unit[ns][1] + eblks * block_size * rank, -1)
+                # Each slot is stored `[E, ...rest, B]`, so its per-edge-block stride in per-batch
+                # units is the product of everything between the edge-block axis and the batch axis.
+                for slot, shape in enumerate(ns.external_params.storage_shapes(ns, 1)):
+                    stride = 1
+                    for d in shape[1:-1]:
+                        stride *= int(d)
 
-            xu.append(curr_xu)
-            xv.append(curr_xv)
+                    curr[slot][rows] = torch.where(valid, ns2unit[ns][slot] + eblks * stride, -1)
 
-        self.register_external_partition_buffers("xu", xu)
-        self.register_external_partition_buffers("xv", xv)
+            for slot in range(n_ext_slots):
+                tables[slot].append(curr[slot])
+
+        for slot in range(n_ext_slots):
+            self.register_external_partition_buffers(f"slot{slot}", tables[slot])
+
+        self.ext_slots = [getattr(self, f"ext_slot{slot}") for slot in range(n_ext_slots)]
         self.ext_max_n_eblks = max_n_eblks
 
     def register_external_partition_buffers(self, name: str, tensors: Sequence[torch.Tensor]) -> None:
@@ -493,14 +509,17 @@ class ExternalParamsSumLayer(SumLayer):
         descriptor then turns the values it wrote into the effective ones.
         """
 
-        # Shared-parameter term -- the standard kernels, untouched
-        super(ExternalParamsSumLayer, self).forward(
-            node_mars, element_mars, params, propagation_alg = propagation_alg, **kwargs
-        )
-
         ns_tensors = self._resolve_external_tensors(kwargs, node_mars.size(1), node_mars.device)
+
+        # Some parameterizations compute the node values themselves, in which case the standard forward
+        # would be redundant work whose result is thrown away. It still has to run when nothing was
+        # supplied for this layer, since then the layer IS a plain sum layer.
+        if len(ns_tensors) == 0 or not self.external_params.replaces_shared_forward:
+            super(ExternalParamsSumLayer, self).forward(
+                node_mars, element_mars, params, propagation_alg = propagation_alg, **kwargs
+            )
+
         if len(ns_tensors) == 0:
-            # Nothing supplied for this layer -> it is a plain sum layer
             return None
 
         self._assert_supported(propagation_alg, is_backward = False, **kwargs)

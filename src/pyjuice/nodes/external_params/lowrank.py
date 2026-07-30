@@ -271,7 +271,7 @@ class LowRankSumParams(ExternalSumParams):
         for partition_id in range(layer.num_fw_partitions):
             nids = layer.partitioned_nids[partition_id]
             cids = layer.partitioned_cids[partition_id]
-            xu, xv = layer.ext_xu[partition_id], layer.ext_xv[partition_id]
+            xu, xv = layer.ext_slots[0][partition_id], layer.ext_slots[1][partition_id]
 
             rows, num_eblks = xu.size(0), xu.size(1)
             numel = rows * num_eblks * self.rank * n_ctiles * batch_size
@@ -324,8 +324,8 @@ class LowRankSumParams(ExternalSumParams):
         numel = external_params.numel()
 
         for partition_id in range(layer.num_fw_partitions):
-            for table, span in ((layer.ext_xu[partition_id], ch_block_size * self.rank),
-                                (layer.ext_xv[partition_id], block_size * self.rank)):
+            for table, span in ((layer.ext_slots[0][partition_id], ch_block_size * self.rank),
+                                (layer.ext_slots[1][partition_id], block_size * self.rank)):
                 valid = table[table >= 0]
                 if valid.numel() == 0:
                     continue
@@ -456,8 +456,8 @@ class LowRankSumParams(ExternalSumParams):
                 external_params = external_params,
                 nids = layer.partitioned_nids[partition_id],
                 cids = layer.partitioned_cids[partition_id],
-                xu = layer.ext_xu[partition_id],
-                xv = layer.ext_xv[partition_id],
+                xu = layer.ext_slots[0][partition_id],
+                xv = layer.ext_slots[1][partition_id],
                 block_size = block_size,
                 ch_block_size = ch_block_size,
                 rank = self.rank,
@@ -633,7 +633,7 @@ class LowRankSumParams(ExternalSumParams):
         rather than being served by a kernel that was not tuned for it.
         """
         # The compiled index tables are only built for a batch-innermost storage layout
-        if getattr(layer, "ext_xu", None) is None:
+        if getattr(layer, "ext_slots", None) is None:
             return False
 
         # Every node of the layer must be corrected: the kernel walks whole partitions
