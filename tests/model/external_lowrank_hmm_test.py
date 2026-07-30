@@ -432,7 +432,7 @@ def test_lowrank_hmm_kernel_matches_torch_reference():
     mapping = {ns: (U, V) for ns in copies}
 
     ext_layer = [layer for layer_group in pc.inner_layer_groups if layer_group.is_sum()
-                 for layer in layer_group.layers if getattr(layer, "ext_xu", None) is not None][0]
+                 for layer in layer_group.layers if getattr(layer, "ext_slots", None) is not None][0]
 
     assert trans_ns.external_params._kernel_applicable(
         ext_layer, [(None, None)] * len(ext_layer.external_node_infos),
