@@ -259,16 +259,19 @@ class BlockScaleSumParams(ExternalSumParams):
                 f"{n_node_gates} node gates per block."
             )
 
-        # Same tile shapes as the kernel's `configs()`; the gate is the standard kernel's own.
+        # The tiles that fit BOTH this layer's shape and this DEVICE. The kernel decides the second
+        # part: its shared-memory need depends on the gate width, and the opt-in ceiling is a property
+        # of the part (48 / 64 / 100 / 227 KB), not something to hardcode.
         cfgs = [tuple(c) for c in mod.configs()]
-        valid = [i for i, c in enumerate(cfgs)
-                 if block_size % c[0] == 0 and batch_size % c[1] == 0]
+        valid = [int(i) for i in mod.fitting_configs(block_size, batch_size, gate_cbs)]
         if not valid:
             raise NotImplementedError(
-                f"no CuTe tile fits this layer: block_size={block_size}, batch={batch_size}, tiles="
+                f"no CuTe tile fits this layer on this device: block_size={block_size}, "
+                f"batch={batch_size}, gate ch_block_size={gate_cbs}, tiles="
                 f"{[(c[0], c[1]) for c in cfgs]}. The gate needs `block_size % BM == 0` and "
-                f"`batch % BN == 0` -- a larger node `block_size` (>= 64) is usually the fix; the gate "
-                f"can still be made fine through its own `ch_block_size`, which costs nothing."
+                f"`batch % BN == 0`, and the tile's shared memory must fit -- a larger node "
+                f"`block_size` (>= 64) is usually the fix; the gate can still be made fine through its "
+                f"own `ch_block_size`, which costs nothing."
             )
         cfg = valid[0]      # provisional; the real one is measured once the launch args exist
 

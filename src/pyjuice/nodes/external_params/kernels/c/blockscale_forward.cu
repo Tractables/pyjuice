@@ -42,6 +42,7 @@
 #include <cuda.h>
 #include <c10/cuda/CUDAStream.h>
 #include <vector>
+#include <cmath>
 #include <cute/tensor.hpp>
 #include <cute/atom/mma_atom.hpp>
 #include <cute/atom/copy_atom.hpp>
@@ -203,6 +204,15 @@ __host__ __device__ __forceinline__ int ngt_of(int gate_cbs) {
 }
 
 
+// Shared memory a tile needs: operands + element_mars scratch + the six per-batch-column scalars +
+// the barrier, then the gates (staged and exponentiated) and the tile's parameter mass.
+int smem_bytes(int BM, int BN, int gate_cbs) {
+    const int ngt = ngt_of(gate_cbs);
+    return BM * BK * 2 + BN * BK * 2 + BK * BN * 4 + 6 * BN * 4 + 64
+           + 2 * ngt * BN * 4 + ngt * BM * 4;
+}
+
+
 template <int BM, int BN, int WM, int WN>
 __global__ void __launch_bounds__(WM * WN * 32) blockscale_tlmm_kernel(
         float* __restrict__ node_mars, const float* __restrict__ mp,
@@ -211,7 +221,7 @@ __global__ void __launch_bounds__(WM * WN * 32) blockscale_tlmm_kernel(
         const long* __restrict__ gate, const float* __restrict__ sigma,
         float* __restrict__ log_z_out,
         int batch, int block_size, int knt, int gate_stride, int n_gates,
-        int node_cbs, int gate_cbs, long ext_base, int pid_m_offset,
+        int node_cbs, int gate_cbs, int node_sh, int gate_sh, long ext_base, int pid_m_offset,
         const __grid_constant__ CUtensorMap desc) {
     constexpr int NTH = WM * WN * 32;
 
@@ -283,7 +293,6 @@ __global__ void __launch_bounds__(WM * WN * 32) blockscale_tlmm_kernel(
     if (tid == 0) mbar_init(bar, 1);
     for (int b = tid; b < BN; b += NTH) { sMz[b] = -INFINITY; sMrun[b] = -INFINITY; }
     __syncthreads();
-    int phase = 0;
 
     for (int kt = 0; kt < knt; kt++) {
         long pc = pb[kt] + (long)tile_id * BM;
@@ -306,8 +315,8 @@ __global__ void __launch_bounds__(WM * WN * 32) blockscale_tlmm_kernel(
         for (int i = tid; i < ngt * BN; i += NTH) {
             const int gi = i / BN, b = i % BN;
             const int ge0 = kt * BK + gi * gcbs_eff;
-            const int j = ge0 / node_cbs;
-            const int d = (ge0 % node_cbs) / gate_cbs;
+            const int j = ge0 >> node_sh;
+            const int d = (ge0 & (node_cbs - 1)) >> gate_sh;
 
             const long gb = (j < gate_stride) ? gt[j] : -1;
             sPh[i] = (gb >= 0) ? ext[(gb + ext_base + d) * (long)batch + b0 + b] : -INFINITY;
@@ -322,12 +331,12 @@ __global__ void __launch_bounds__(WM * WN * 32) blockscale_tlmm_kernel(
         if (sig_here) {
             for (int i = tid; i < ngt * BM; i += NTH) {
                 const int gi = i / BM, mm = i % BM;
-                const int g = (kt * BK + gi * gcbs_eff) / gate_cbs;
+                const int g = (kt * BK + gi * gcbs_eff) >> gate_sh;
                 sSg[i] = sigma[sig_row + (long)g * block_size + tile_id * BM + mm];
             }
         }
 
-        mbar_wait(bar, phase); phase ^= 1;
+        mbar_wait(bar, kt & 1);      // one buffer, so the phase just alternates
         __syncthreads();
 
         // ---- ADD THE GATES INTO THE STAGED `element_mars` ----
@@ -487,7 +496,7 @@ static void launch_cfg(torch::Tensor node_mars, torch::Tensor element_mars, torc
                        torch::Tensor pbase, torch::Tensor gate, torch::Tensor sigma,
                        torch::Tensor log_z,
                        int batch, int block_size, int knt, int n_gates, int node_cbs, int gate_cbs,
-                       long ext_base) {
+                       int node_sh, int gate_sh, long ext_base) {
     // `gcbs_eff` mirrors the kernel: a gate may be wider than one edge tile
     constexpr int NTH = WM * WN * 32;
     int n_edge_rows = element_mars.size(0);
@@ -509,13 +518,12 @@ static void launch_cfg(torch::Tensor node_mars, torch::Tensor element_mars, torc
         desc_ptr = base; desc_rows = n_edge_rows; desc_batch = batch;
     }
 
-    // operands + element_mars scratch + the six per-batch-column scalars + the barrier, then the gates
-    // (staged and exponentiated) and this tile's parameter mass
-    const int ngt = ngt_of(gate_cbs);
-    int smem = BM * BK * 2 + BN * BK * 2 + BK * BN * 4 + 6 * BN * 4 + 64
-               + 2 * ngt * BN * 4 + ngt * BM * 4;
-    cudaFuncSetAttribute(blockscale_tlmm_kernel<BM, BN, WM, WN>,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    const int smem = smem_bytes(BM, BN, gate_cbs);
+    TORCH_CHECK(cudaFuncSetAttribute(blockscale_tlmm_kernel<BM, BN, WM, WN>,
+                                     cudaFuncAttributeMaxDynamicSharedMemorySize, smem)
+                    == cudaSuccess,
+                "blockscale forward: this tile needs ", smem, " B of shared memory, which this device "
+                "will not grant. `fitting_configs` should have excluded it.");
 
     int total_m = nids.size(0) * (block_size / BM);
     const int MAX_Y = 65535;
@@ -528,8 +536,32 @@ static void launch_cfg(torch::Tensor node_mars, torch::Tensor element_mars, torc
             gate.data_ptr<long>(), sigma.data_ptr<float>(),
             log_z.numel() ? log_z.data_ptr<float>() : nullptr,
             batch, block_size, knt, (int)gate.size(1), n_gates,
-            node_cbs, gate_cbs, ext_base, off, desc);
+            node_cbs, gate_cbs, node_sh, gate_sh, ext_base, off, desc);
     }
+}
+
+
+std::vector<std::vector<int>> configs();
+
+
+// The tiles this DEVICE can actually run, for this layer's shape. The opt-in shared-memory ceiling is
+// not a constant of the architecture family -- it is 48 KB, 64 KB, 100 KB or 227 KB depending on the
+// part -- so it is queried rather than assumed. Filtering here keeps a tile that cannot fit out of the
+// autotuner, where its launch failure would be an async, sticky CUDA error rather than a skipped
+// candidate.
+std::vector<int> fitting_configs(int64_t block_size, int64_t batch, int64_t gate_cbs) {
+    int dev = 0, smax = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&smax, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+
+    std::vector<int> out;
+    const auto cfgs = configs();
+    for (int i = 0; i < (int)cfgs.size(); ++i) {
+        const int BM = cfgs[i][0], BN = cfgs[i][1];
+        if (block_size % BM != 0 || batch % BN != 0) continue;
+        if (smem_bytes(BM, BN, (int)gate_cbs) <= smax) out.push_back(i);
+    }
+    return out;
 }
 
 
@@ -562,6 +594,15 @@ void blockscale_forward(torch::Tensor node_mars, torch::Tensor element_mars, tor
     TORCH_CHECK(node_cbs % gate_cbs == 0,
                 "blockscale forward: the gate's ch_block_size must divide the node's");
 
+    // Both block sizes are powers of two, so the kernel indexes gates with shifts. Left as runtime
+    // divisors they cost ~480 integer instructions per thread per edge tile -- ptxas has to emit the
+    // full IABS/MUFU.RCP/IMAD.HI reciprocal sequence -- to produce four floats.
+    TORCH_CHECK((node_cbs & (node_cbs - 1)) == 0 && (gate_cbs & (gate_cbs - 1)) == 0,
+                "blockscale forward: both child block sizes must be powers of two; got node_cbs=",
+                node_cbs, ", gate_cbs=", gate_cbs);
+    const int node_sh = (int)std::log2((double)node_cbs);
+    const int gate_sh = (int)std::log2((double)gate_cbs);
+
     // sigma: one pass over the parameters, then Z is a small batch-independent contraction
     {
         const long total = (long)rows * n_eblks * n_child_gates * block_size;
@@ -577,22 +618,22 @@ void blockscale_forward(torch::Tensor node_mars, torch::Tensor element_mars, tor
     switch (cfg) {
         case 0: launch_cfg<128, 64, 2, 2>(node_mars, element_mars, params, ext, nids, ebase, pbase,
                                           gate, sigma, log_z, batch, (int)block_size, knt, n_gates,
-                                          (int)node_cbs, (int)gate_cbs, (long)ext_base); break;
+                                          (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base); break;
         case 1: launch_cfg<64, 64, 2, 2>(node_mars, element_mars, params, ext, nids, ebase, pbase,
                                          gate, sigma, log_z, batch, (int)block_size, knt, n_gates,
-                                         (int)node_cbs, (int)gate_cbs, (long)ext_base); break;
+                                         (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base); break;
         case 2: launch_cfg<256, 64, 4, 2>(node_mars, element_mars, params, ext, nids, ebase, pbase,
                                           gate, sigma, log_z, batch, (int)block_size, knt, n_gates,
-                                          (int)node_cbs, (int)gate_cbs, (long)ext_base); break;
+                                          (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base); break;
         case 3: launch_cfg<128, 128, 2, 4>(node_mars, element_mars, params, ext, nids, ebase, pbase,
                                            gate, sigma, log_z, batch, (int)block_size, knt, n_gates,
-                                           (int)node_cbs, (int)gate_cbs, (long)ext_base); break;
+                                           (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base); break;
         case 4: launch_cfg<64, 64, 4, 2>(node_mars, element_mars, params, ext, nids, ebase, pbase,
                                          gate, sigma, log_z, batch, (int)block_size, knt, n_gates,
-                                         (int)node_cbs, (int)gate_cbs, (long)ext_base); break;
+                                         (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base); break;
         default: launch_cfg<128, 64, 4, 2>(node_mars, element_mars, params, ext, nids, ebase, pbase,
                                            gate, sigma, log_z, batch, (int)block_size, knt, n_gates,
-                                           (int)node_cbs, (int)gate_cbs, (long)ext_base); break;
+                                           (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base); break;
     }
 }
 
@@ -601,4 +642,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("blockscale_forward", &blockscale_forward,
           "CuTe/TMA forward for the per-block multiplicative gate (log N - log Z)");
     m.def("configs", &configs, "Tile shapes {BM, BN, WM, WN} per config id");
+    m.def("fitting_configs", &fitting_configs,
+          "Config ids whose tile divides this shape AND whose shared memory this device will grant");
 }
