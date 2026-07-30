@@ -256,15 +256,17 @@ def test_lowrank_hmm_staging():
 
     assert not any([t.is_contiguous() for t in mapping[copies[0]]])      # batch-major slices are strided
 
-    with pytest.raises(NotImplementedError):
-        pc(data, sum_external_params = mapping)
+    pc(data, sum_external_params = mapping)
 
     staged = pc._staged_external_params
 
     assert set(staged.keys()) == set(copies)
+
+    # Staged in the kernels' storage order (batch-innermost), so compare against the permuted source
+    perm = trans_ns.external_params.storage_perm()
     for ns, tensors in mapping.items():
         for staged_tensor, tensor in zip(staged[ns], tensors):
-            assert torch.equal(staged_tensor, tensor)
+            assert torch.equal(staged_tensor, tensor.permute(perm))
             assert staged_tensor.is_contiguous()
 
     # Timesteps do not share storage, so a per-timestep correction really is per-timestep
@@ -275,12 +277,12 @@ def test_lowrank_hmm_staging():
     big, _ = _router_factors(BATCH_SIZE, 1, seed = 5)
     U, V = big[:,0,0].contiguous(), big[:,0,1].contiguous()
 
-    with pytest.raises(NotImplementedError):
-        pc(data, sum_external_params = {ns: (U, V) for ns in copies})
+    pc(data, sum_external_params = {ns: (U, V) for ns in copies})
 
+    perm = trans_ns.external_params.storage_perm()
     for ns in copies:
-        assert torch.equal(pc._staged_external_params[ns][0], U)
-        assert torch.equal(pc._staged_external_params[ns][1], V)
+        assert torch.equal(pc._staged_external_params[ns][0], U.permute(perm))
+        assert torch.equal(pc._staged_external_params[ns][1], V.permute(perm))
 
 
 def test_lowrank_hmm_shared_params_unaffected():
@@ -313,36 +315,91 @@ def test_lowrank_hmm_shared_params_unaffected():
     assert torch.equal(pc_plain.params, pc_ext.params)
 
 
-def test_lowrank_hmm_reaches_kernels():
+def test_lowrank_hmm_forward_matches_reference():
     """
-    The forward reaches the low-rank kernels with everything staged.
-
-    Once they are implemented, this is where the equivalence assertion goes:
-    `pc(data, sum_external_params = ...)` must match `_reference_lls(...)` on the plain PC, and
-    `-inf` factors must reproduce the baseline exactly.
+    The two acceptance criteria for the forward, against the materialized oracle on the plain PC:
+    a vanishing correction reproduces the baseline, and a finite one reproduces the per-example
+    transition it stands for.
     """
 
     device = torch.device("cuda:0")
+
+    pc_plain, _, trans_plain = _compiled(external = False)
+    pc_ext, _, trans_ext = _compiled(external = True)
+
+    copies = list(pc_ext.external_params_nodes)
+
+    torch.manual_seed(7)
+    data = torch.randint(0, NUM_EMITS, [BATCH_SIZE, SEQ_LENGTH]).to(device)
+
+    ## A vanishing correction leaves the shared model untouched, exactly ##
+
+    neg_inf = torch.full([BATCH_SIZE, 1, NUM_LATENTS, RANK], -float("inf"), device = device)
+
+    baseline_lls = pc_ext(data)
+    noop_lls = pc_ext(data, sum_external_params = {ns: (neg_inf, neg_inf) for ns in copies})
+
+    assert torch.equal(noop_lls, baseline_lls)
+
+    ## A finite correction reproduces the materialized per-example transition ##
+
+    torch.manual_seed(8)
+    U = torch.randn([BATCH_SIZE, NUM_LATENTS, RANK], device = device) - 2.0
+    V = torch.randn([BATCH_SIZE, NUM_LATENTS, RANK], device = device) - 2.0
+
+    reference_lls = _reference_lls(pc_plain, trans_plain, U, V, data)
+    lls = pc_ext(data, sum_external_params = {ns: (U[:,None].contiguous(), V[:,None].contiguous())
+                                              for ns in copies})
+
+    assert torch.all(torch.abs(reference_lls - lls) < 1e-4)
+    assert not torch.allclose(lls, baseline_lls)
+
+
+def test_lowrank_hmm_kernel_matches_torch_reference():
+    """
+    At a batch size the Triton kernel covers, it must agree with the torch reference it replaces.
+
+    The comparison is against the torch path rather than the per-example oracle because the SHARED
+    forward itself changes numerics with batch size (a bf16 tensor-core dot above the small-batch
+    threshold); that difference is present with no external parameters at all, so comparing to a
+    batch-1 oracle here would measure the shared kernel, not this correction.
+    """
+
+    device = torch.device("cuda:0")
+
+    batch_size = 64
 
     pc, root_ns, trans_ns = _compiled(external = True)
 
     copies = list(pc.external_params_nodes)
 
-    torch.manual_seed(7)
-    data = torch.randint(0, NUM_EMITS, [BATCH_SIZE, SEQ_LENGTH]).to(device)
+    torch.manual_seed(11)
+    data = torch.randint(0, NUM_EMITS, [batch_size, SEQ_LENGTH]).to(device)
 
-    big, _ = _router_factors(BATCH_SIZE, 1, seed = 8)
-    U, V = big[:,0,0].contiguous(), big[:,0,1].contiguous()
+    U = torch.randn([batch_size, 1, NUM_LATENTS, RANK], device = device) - 2.0
+    V = torch.randn([batch_size, 1, NUM_LATENTS, RANK], device = device) - 2.0
 
     mapping = {ns: (U, V) for ns in copies}
 
-    with pytest.raises(NotImplementedError):
-        pc(data, sum_external_params = mapping)
+    ext_layer = [layer for layer_group in pc.inner_layer_groups if layer_group.is_sum()
+                 for layer in layer_group.layers if getattr(layer, "ext_xu", None) is not None][0]
 
-    # Everything up to the kernel is in place
-    assert pc.external_params is not None
-    assert pc.external_params.numel() == pc._external_params_layout(BATCH_SIZE)[0]
-    assert all([torch.equal(pc._staged_external_params[ns][0], U) for ns in copies])
+    assert trans_ns.external_params._kernel_applicable(
+        ext_layer, [(None, None)] * len(ext_layer.external_node_infos),
+        torch.zeros([1, batch_size], device = device)
+    )
+
+    kernel_lls = pc(data, sum_external_params = mapping)
+
+    # Same computation through the reference path
+    applicable = LowRankSumParams._kernel_applicable
+    try:
+        LowRankSumParams._kernel_applicable = lambda *args, **kwargs: False
+        torch_lls = pc(data, sum_external_params = mapping)
+    finally:
+        LowRankSumParams._kernel_applicable = applicable
+
+    assert torch.all(torch.abs(kernel_lls - torch_lls) < 1e-4)
 
 
 if __name__ == "__main__":

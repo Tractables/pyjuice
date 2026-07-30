@@ -296,10 +296,8 @@ def test_external_sum_layer_tensor_validation():
     with pytest.raises(AssertionError):
         pc(data, sum_external_params = (U, V))
 
-    # The layout the descriptor declares is the one that is accepted -- reaching the (unimplemented)
-    # kernel means validation passed
-    with pytest.raises(NotImplementedError):
-        pc(data, sum_external_params = {ns: (U, V)})
+    # The layout the descriptor declares is the one that is accepted
+    assert torch.all(torch.isfinite(pc(data, sum_external_params = {ns: (U, V)})))
 
 
 def test_external_sum_layer_unsupported_settings():
@@ -379,18 +377,18 @@ def test_external_sum_layer_grad_buffers():
     U = torch.full([batch_size, num_edge_blocks, 4, rank], -6.0, device = device)
     V = torch.full([batch_size, num_edge_blocks, 4, rank], -6.0, device = device)
 
-    with pytest.raises(NotImplementedError):
-        pc(data, sum_external_params = {ns: (U, V)})
+    pc(data, sum_external_params = {ns: (U, V)})
 
+    # The backward kernels are not implemented yet; the gradient buffers are still set up first
     with pytest.raises(NotImplementedError):
         pc.backward(data)
 
     # The gradients are PC-owned views laid out exactly like the supplied tensors, allocated and
-    # zeroed once per backward so that the layers can accumulate into them
+    # zeroed once per backward so that the layers can accumulate into them. They are views rather
+    # than contiguous tensors, since the buffer holds them in the kernels' axis order.
     dU, dV = pc.get_external_params_grad(ns)
 
     assert dU.size() == U.size() and dV.size() == V.size()
-    assert dU.is_contiguous() and dV.is_contiguous()
     assert torch.all(dU == 0.0) and torch.all(dV == 0.0)
 
     # Supplying them is not the caller's job

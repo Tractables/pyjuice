@@ -519,7 +519,7 @@ def test_external_params_usage():
 
 def test_lowrank_params_reaches_kernels():
     """
-    The real parameterization is staged the same way; only its kernels are still missing.
+    The real parameterization is staged the same way, and its forward runs off the staged values.
     """
 
     device = torch.device("cuda:0")
@@ -531,13 +531,15 @@ def test_lowrank_params_reaches_kernels():
     data = torch.randint(0, 5, [batch_size, 4]).to(device)
     tensors = _make_tensors(pc, batch_size)
 
-    with pytest.raises(NotImplementedError):
-        pc(data, sum_external_params = tensors)
+    lls = pc(data, sum_external_params = tensors)
 
-    # Staging happened before the kernel was reached
+    assert torch.all(torch.isfinite(lls))
+
+    # ... from the staged values, held in the kernels' storage order
+    perm = trans_ns.external_params.storage_perm()
     for ns, ns_tensors in tensors.items():
         for staged_tensor, tensor in zip(pc._staged_external_params[ns], ns_tensors):
-            assert torch.equal(staged_tensor, tensor)
+            assert torch.equal(staged_tensor, tensor.permute(perm))
 
 
 if __name__ == "__main__":
