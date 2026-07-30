@@ -161,6 +161,25 @@ class ExternalSumParams():
         """
         raise NotImplementedError()
 
+    def pre_backward_layer(self, layer, ns_tensors, node_flows, element_flows, node_mars,
+                           element_mars, params, **kwargs) -> None:
+        """
+        Layer-level counterpart of :func:`pre_backward`, mirroring :func:`forward_layer`.
+
+        Defaults to looping over the layer's nodes; override when the whole layer can be prepared in
+        one shot (the compiled tables span every node in it, so a per-node loop repeats work).
+        """
+        for ns_info, tensors in ns_tensors:
+            self.pre_backward(layer, ns_info, tensors, node_flows, element_flows, node_mars,
+                              element_mars, params, **kwargs)
+
+    def post_backward_layer(self, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows,
+                            node_mars, element_mars, params, param_flows = None, **kwargs) -> None:
+        """Layer-level counterpart of :func:`post_backward`."""
+        for (ns_info, tensors), grad_tensors in zip(ns_tensors, ns_grad_tensors):
+            self.post_backward(layer, ns_info, tensors, grad_tensors, node_flows, element_flows,
+                               node_mars, element_mars, params, param_flows = param_flows, **kwargs)
+
     def post_backward(self, layer, ns_info, tensors, grad_tensors, node_flows, element_flows,
                       node_mars, element_mars, params, param_flows = None, **kwargs) -> None:
         """

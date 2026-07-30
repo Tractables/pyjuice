@@ -15,7 +15,7 @@ from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes, Externa
                           foreach, summate, multiply
 from pyjuice.layer import Layer, InputLayer, ProdLayer, SumLayer, ExternalParamsSumLayer, LayerGroup, \
                           StagedExternalParams, EXTERNAL_PARAMS_KWARG, EXTERNAL_PARAMS_GRAD_KWARG, \
-                          EXTERNAL_PARAMS_BUFFER_KWARG
+                          EXTERNAL_PARAMS_BUFFER_KWARG, EXTERNAL_PARAMS_GRAD_BUFFER_KWARG
 from pyjuice.layer.external_sum_layer import validate_external_tensors
 from pyjuice.utils.grad_fns import ReverseGrad
 from pyjuice.utils import BitSet
@@ -800,6 +800,9 @@ class TensorCircuit(nn.Module):
                 del grad_views[ns]
 
         kwargs[EXTERNAL_PARAMS_GRAD_KWARG] = grad_views
+        # The flat buffer too: a kernel that writes gradients addresses it with the same compiled
+        # offsets as the forward uses for the tensors themselves (the two buffers share a layout).
+        kwargs[EXTERNAL_PARAMS_GRAD_BUFFER_KWARG] = self.external_params_grad
         self._staged_external_params_grad = grad_views
 
     def get_external_params_grad(self, ns: CircuitNodes):

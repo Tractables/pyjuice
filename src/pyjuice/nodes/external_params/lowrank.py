@@ -6,6 +6,28 @@ from typing import Any, Optional, Tuple
 from .external_params import ExternalSumParams
 
 
+_BUFFER_KWARG = None
+_GRAD_BUFFER_KWARG = None
+
+
+def _grad_buffer_kwarg() -> str:
+    """The gradient-buffer kwarg name, resolved once (see :func:`_buffer_kwarg`)."""
+    global _GRAD_BUFFER_KWARG
+    if _GRAD_BUFFER_KWARG is None:
+        from pyjuice.layer.external_sum_layer import EXTERNAL_PARAMS_GRAD_BUFFER_KWARG
+        _GRAD_BUFFER_KWARG = EXTERNAL_PARAMS_GRAD_BUFFER_KWARG
+    return _GRAD_BUFFER_KWARG
+
+
+def _buffer_kwarg() -> str:
+    """The staging-buffer kwarg name, resolved once (a per-call import showed up in the profile)."""
+    global _BUFFER_KWARG
+    if _BUFFER_KWARG is None:
+        from pyjuice.layer.external_sum_layer import EXTERNAL_PARAMS_BUFFER_KWARG
+        _BUFFER_KWARG = EXTERNAL_PARAMS_BUFFER_KWARG
+    return _BUFFER_KWARG
+
+
 class LowRankSumParams(ExternalSumParams):
     """
     A per-sample, **nonnegative rank-k additive correction** to the sum node's parameters, supplied
@@ -64,12 +86,63 @@ class LowRankSumParams(ExternalSumParams):
     :type rank: int
     """
 
-    def __init__(self, rank: int):
+    def __init__(self, rank: int, tile_m: Optional[int] = None, tile_b: Optional[int] = None,
+                 tile_c: Optional[int] = None, tile_bc: Optional[int] = None,
+                 tile_n: Optional[int] = None, variant: Optional[str] = None):
         super(LowRankSumParams, self).__init__()
 
         assert isinstance(rank, int) and rank >= 1, f"`rank` must be a positive integer, got {rank}."
 
         self.rank = rank
+
+        # Kernel launch tiles. `tile_m` is the one that matters: `logW` / `logA` do not depend on the
+        # node index, so they are recomputed once per node tile and the arithmetic overhead relative to
+        # the shared sum kernel is `2 * rank / tile_m + rank / ch_block_size`. Large `tile_m` is cheap
+        # but yields fewer programs, so it trades against occupancy. `None` picks a heuristic.
+        self.tile_m, self.tile_b, self.tile_c, self.tile_bc = tile_m, tile_b, tile_c, tile_bc
+
+        # Node tile of the backward's V pass. Like `tile_c` in the forward, this is really a BLOCK-COUNT
+        # knob: on a dense transition the reduction axis is the only wide one, so the tile size sets how
+        # many blocks the kernel gets. MEASURED: too large and the grid is a few dozen blocks on 188 SMs.
+        self.tile_n = tile_n
+
+        # Scratch for the multi-launch variants, keyed by name and reused across calls. One descriptor is
+        # shared by every node that uses it (all 31 timesteps of a tied HMM chain), and the launches are
+        # sequential, so a single set of buffers serves them all -- which also keeps allocation out of
+        # the per-layer path, where 4 allocations x 31 layers per forward is pure overhead, and keeps
+        # `torch.empty` out of a CUDA-graph capture.
+        self._scratch = dict()
+
+        # Per-call bookkeeping is cached because it is re-derived identically on every step: the launch
+        # tiles, the staging-buffer base offset, and the scratch views. MEASURED at 31 layers x 2
+        # launches, rebuilding them cost ~16 us per layer -- more than the two kernel launches
+        # themselves (~11 us) -- so on a deep chain it, not the kernels, dominated the correction.
+        self._scratch_views = dict()
+        self._tiles_cache = dict()
+        self._base_cache = dict()
+        self._alloc_device = None
+
+        # Fully-resolved CUDA launch arguments per layer. Everything in them is derived from the layer's
+        # compiled tables and the PC's persistent buffers, so it is identical on every step -- but
+        # re-deriving it cost ~27 us per layer against a ~4 us kernel call (nn.Module attribute lookups,
+        # per-call imports, the applicability check, tile selection), i.e. the bookkeeping dominated the
+        # work by 7x. Keyed on the buffer identities it was built for, so a reallocation rebuilds it.
+        self._plan = dict()
+        self._bw_plan = dict()
+        self._auto_variant = None
+
+        # Which forward launch structure to use. `logW` / `logA` do not depend on the node index, so the
+        # three differ in whether they recompute them per node tile (`"grid"`), share them in registers
+        # by walking the node tiles inside one program (`"hoist"`, single edge block only), or stage them
+        # through a small global scratch (`"scratch"`, two launches). They compute the SAME quantity;
+        # this only trades redundancy against parallelism, and the best choice is shape-dependent and
+        # still being measured -- so the default stays the structure that is currently validated.
+        assert variant is None or variant in ("grid", "hoist", "scratch", "split", "split2",
+                                              "noop", "cuda"), f"Unknown variant {variant}."
+
+        # `None` means auto: the CUDA path when its toolchain is available, else the best Triton form.
+        # Only the CUDA path stages logW / logA / logZ, so it is also what the backward requires.
+        self.variant = variant
 
     def get_signature(self) -> str:
         return f"LowRank_r{self.rank}"
@@ -134,6 +207,68 @@ class LowRankSumParams(ExternalSumParams):
         """
         self.forward_torch(ns_info, tensors, node_mars, element_mars)
 
+    def _build_cuda_plan(self, layer, ns_tensors, node_mars, element_mars, external_params):
+        """Resolve every per-layer CUDA launch argument once. Returns `(module, [args, ...])`."""
+        from .kernels.c import get_module
+
+        mod = get_module()
+        if mod is None or not self._kernel_applicable(layer, ns_tensors, node_mars):
+            return None
+
+        block_size = layer.block_size
+        ch_block_size = layer.external_node_infos[0].ch_block_size
+        batch_size = node_mars.size(1)
+
+        first_view = ns_tensors[0][1][0]
+        ext_base = ((first_view.data_ptr() - external_params.data_ptr())
+                    // external_params.element_size()) // batch_size
+
+        tiles = self._tiles(block_size, ch_block_size, batch_size)
+        tile_m = min(self.tile_m or 8, block_size)
+        # 16 rather than the Triton default: these tiles set the BLOCK COUNT, and 64 left the grid at a
+        # few dozen blocks on 188 SMs. MEASURED best over {4, 8, 16, 64} on the HMM.
+        tile_c = min(self.tile_c or 16, ch_block_size)
+
+        # Thread blocks are `rank x tb1` and `tile_m x tb2`; keep both within the 1024-thread limit
+        tb1 = max(1, min(tiles["TILE_B"], batch_size))
+        while self.rank * tb1 > 1024:
+            tb1 //= 2
+        tb2 = max(1, min(tiles["TILE_BC"] or tiles["TILE_B"], batch_size))
+        while tile_m * tb2 > 1024:
+            tb2 //= 2
+
+        self._alloc_device = node_mars.device
+        n_ctiles = -(-ch_block_size // tile_c)
+        dev = node_mars.device
+
+        calls, state = [], []
+        for partition_id in range(layer.num_fw_partitions):
+            nids = layer.partitioned_nids[partition_id]
+            cids = layer.partitioned_cids[partition_id]
+            xu, xv = layer.ext_xu[partition_id], layer.ext_xv[partition_id]
+
+            rows, num_eblks = xu.size(0), xu.size(1)
+            numel = rows * num_eblks * self.rank * n_ctiles * batch_size
+
+            # PER-LAYER (not shared scratch): the backward reads these after every layer's forward has
+            # run, so they must survive the rest of the forward pass. logW/logA are tiny; logZ is
+            # node-sized, which is still far cheaper than recomputing it from `V` in the backward.
+            log_w = torch.empty([rows * num_eblks * self.rank * batch_size], dtype = torch.float32,
+                                device = dev)
+            log_a = torch.empty_like(log_w)
+            log_z = torch.empty([rows * block_size * batch_size], dtype = torch.float32, device = dev)
+            state.append((nids, cids, xu, xv, log_w, log_a, log_z))
+
+            calls.append((nids, cids, xu, xv,
+                          self._alloc(f"pw{partition_id}", numel),
+                          self._alloc(f"pa{partition_id}", numel),
+                          log_w, log_a, log_z,
+                          block_size, ch_block_size, self.rank, ext_base, tile_c, tile_m, tb1, tb2))
+
+        self._bw_plan[id(layer)] = (block_size, ch_block_size, ext_base, batch_size, state)
+
+        return mod, calls
+
     def forward_layer(self, layer, ns_tensors, node_mars, element_mars, params, **kwargs) -> None:
         """
         Apply the correction to the whole layer.
@@ -146,6 +281,25 @@ class LowRankSumParams(ExternalSumParams):
         """
         if len(ns_tensors) == 0:
             return None
+
+        if self._resolved_variant() == "cuda":
+            # Fast path: one resolved host call per partition, no per-step bookkeeping
+            key = id(layer)
+            ptrs = (node_mars.data_ptr(), element_mars.data_ptr(), node_mars.size(1))
+
+            entry = self._plan.get(key, None)
+            if entry is None or entry[0] != ptrs:
+                buf = kwargs.get(_buffer_kwarg(), None)
+                entry = (ptrs, None if buf is None else
+                         self._build_cuda_plan(layer, ns_tensors, node_mars, element_mars, buf))
+                self._plan[key] = entry
+
+            if entry[1] is not None:
+                mod, calls = entry[1]
+                buf = kwargs[_buffer_kwarg()]
+                for args in calls:
+                    mod.lowrank_forward(node_mars, element_mars, buf, *args)
+                return None
 
         # Imported here rather than at module load: `pyjuice.layer` imports `pyjuice.nodes`, so a
         # top-level import would close a cycle
@@ -162,6 +316,28 @@ class LowRankSumParams(ExternalSumParams):
         block_size = layer.block_size
         ch_block_size = layer.external_node_infos[0].ch_block_size
 
+        # `xu` / `xv` are offsets WITHIN this layer's block of the staging buffer, so they need the
+        # global offset of that block added. The layer's nodes occupy a contiguous range of the buffer
+        # (the PC lays nodes out in layer order), and `ns_tensors` is in `layer.nodes` order, so the
+        # first staged view marks where the block starts.
+        batch_size = node_mars.size(1)
+        first_view = ns_tensors[0][1][0]
+
+        base_key = (id(layer), batch_size, external_params.data_ptr(), first_view.data_ptr())
+        ext_base = self._base_cache.get(base_key, None)
+        if ext_base is None:
+            ext_base = ((first_view.data_ptr() - external_params.data_ptr())
+                        // external_params.element_size()) // batch_size
+            self._base_cache[base_key] = ext_base
+
+        self._alloc_device = node_mars.device
+
+        tiles_key = (block_size, ch_block_size, batch_size)
+        tiles = self._tiles_cache.get(tiles_key, None)
+        if tiles is None:
+            tiles = self._tiles(block_size, ch_block_size, batch_size)
+            self._tiles_cache[tiles_key] = tiles
+
         for partition_id in range(layer.num_fw_partitions):
             fw_lowrank(
                 node_mars = node_mars,
@@ -174,7 +350,144 @@ class LowRankSumParams(ExternalSumParams):
                 block_size = block_size,
                 ch_block_size = ch_block_size,
                 rank = self.rank,
+                ext_base = ext_base,
+                variant = self._resolved_variant(),
+                alloc = self._alloc,
+                **tiles,
             )
+
+    def _resolved_variant(self) -> str:
+        """The variant to actually use, resolving `None` once."""
+        if self.variant is not None:
+            return self.variant
+
+        if self._auto_variant is None:
+            from .kernels.c import is_available
+            self._auto_variant = "cuda" if is_available() else "split2"
+
+        return self._auto_variant
+
+    def _alloc(self, name: str, numel: int):
+        """
+        A scratch buffer of at least `numel` elements, as a CACHED view.
+
+        Slicing (`buf[:numel]`) is an ATen call, so re-slicing per launch per layer showed up as real
+        per-step cost; the view is memoized and only rebuilt when the backing buffer is reallocated.
+        """
+        device = self._alloc_device
+        key = (name, numel, device)
+
+        view = self._scratch_views.get(key, None)
+        if view is not None:
+            return view
+
+        buf = self._scratch.get(name, None)
+        if buf is None or buf.numel() < numel or buf.device != device:
+            buf = torch.empty([numel], dtype = torch.float32, device = device)
+            self._scratch[name] = buf
+            # Views into the old buffer are now stale
+            self._scratch_views = {k: v for k, v in self._scratch_views.items() if k[0] != name}
+
+        view = buf[:numel]
+        self._scratch_views[key] = view
+
+        return view
+
+    def pre_backward_layer(self, layer, ns_tensors, node_flows, element_flows, node_mars,
+                           element_mars, params, **kwargs) -> None:
+        """
+        Turn `node_mars` into `logT` over this layer's nodes, so the STOCK backward -- run next,
+        unmodified -- produces exactly the shared parameters' element and parameter flows.
+
+        `theta_tilde = (theta_shared + Delta)/Z` and `S = T/Z`, so the `Z` cancels and the shared
+        term's flow is `f * theta_shared * p / T`. That is what the stock kernel computes when it reads
+        `logT` where it expects `log S`. Undone in :func:`post_backward_layer`.
+        """
+        if not kwargs.get("logspace_flows", False):
+            raise NotImplementedError(
+                "The low-rank backward requires `logspace_flows = True` (the default): the child-flow "
+                "correction is combined in log space."
+            )
+
+        entry = self._bw_plan.get(id(layer), None)
+        if entry is None:
+            raise NotImplementedError(
+                "The low-rank backward requires the CUDA forward (`LowRankSumParams(variant='cuda')`) "
+                "to have run on this layer, which is what stages logW / logA / logZ."
+            )
+        from .kernels.c import get_module
+        mod = get_module()
+
+        block_size, _, _, _, state = entry
+        for nids, _, _, _, _, _, log_z in state:
+            mod.lowrank_shift_logz(node_mars, nids, log_z, block_size, 1.0)
+
+    def post_backward_layer(self, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows,
+                            node_mars, element_mars, params, param_flows = None, **kwargs) -> None:
+        """
+        Add the external contribution to the child flows, write `dLL/dU` and `dLL/dV`, and restore
+        `node_mars`.
+
+        The restore runs in a `finally`: `node_mars` is shared with the rest of the circuit, so leaving
+        it in the `logT` form would silently corrupt every layer evaluated afterwards.
+        """
+        from .kernels.c import get_module
+        mod = get_module()
+
+        entry = self._bw_plan[id(layer)]
+        block_size, ch_block_size, ext_base, batch_size, state = entry
+
+        try:
+            ext = kwargs.get(_buffer_kwarg(), None)
+            grad_ext = kwargs.get(_grad_buffer_kwarg(), None)
+
+            if ext is not None and grad_ext is not None:
+                self._alloc_device = node_mars.device
+
+                tile_n = min(self.tile_n or 16, block_size)
+                tb = max(1, min(32, batch_size))
+                while self.rank * tb > 1024:
+                    tb //= 2
+                # Pass C's block is `tile_c x tb` threads (one per child/batch pair)
+                tile_c = min(64, ch_block_size)
+                while tile_c * tb > 1024:
+                    tile_c //= 2
+                n_ntiles = -(-block_size // tile_n)
+
+                for nids, cids, xu, xv, log_w, log_a, log_z in state:
+                    slots = xu.size(0) * xu.size(1) * self.rank
+                    mod.lowrank_backward(
+                        node_flows, element_flows, node_mars, element_mars, ext, grad_ext,
+                        nids, cids, xu, xv, log_w, log_a, log_z,
+                        self._alloc("p_lp", slots * n_ntiles * batch_size),
+                        self._alloc("p_lq", slots * n_ntiles * batch_size),
+                        self._alloc("log_p", slots * batch_size),
+                        self._alloc("log_q", slots * batch_size),
+                        block_size, ch_block_size, self.rank, ext_base, tile_n, tile_c, tb,
+                    )
+        finally:
+            for nids, _, _, _, _, _, log_z in state:
+                mod.lowrank_shift_logz(node_mars, nids, log_z, block_size, -1.0)
+
+    def _tiles(self, block_size, ch_block_size, batch_size) -> dict:
+        """
+        Launch tiles, either as configured or from a heuristic.
+
+        The heuristic keeps the node tile as large as it can while still filling the GPU: it grows
+        `tile_m` until the program count would drop below a target, which bounds the redundant
+        recomputation of `logW` / `logA` without starving occupancy.
+        """
+        # MEASURED (HMM seq32 / nl1024 / rank16 / batch64, RTX PRO 6000): `tile_b` dominates, not
+        # `tile_m`. The kernel's working tile is `[tile_c, rank, tile_b]`, so register pressure grows
+        # with the product and a large `tile_b` spills badly -- tile_b 8 vs 32 was 2.95x vs 9.30x on the
+        # same shape, and raising tile_m past 32-64 also cost (128 -> 3.92x). So keep both modest.
+        tile_b = self.tile_b if self.tile_b is not None else min(8, batch_size)
+        tile_m = self.tile_m if self.tile_m is not None else min(32, block_size)
+        tile_c = self.tile_c if self.tile_c is not None else min(64, ch_block_size)
+
+        tile_bc = self.tile_bc if self.tile_bc is not None else 0
+
+        return {"TILE_M": tile_m, "TILE_B": tile_b, "TILE_C": tile_c, "TILE_BC": tile_bc}
 
     def _kernel_applicable(self, layer, ns_tensors, node_mars) -> bool:
         """

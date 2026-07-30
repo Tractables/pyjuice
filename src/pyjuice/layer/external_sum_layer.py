@@ -20,6 +20,7 @@ EXTERNAL_PARAMS_GRAD_KWARG = "sum_external_params_grad"
 # The flat staging buffer the views point into, supplied by the PC so that kernels spanning several
 # nodes can address it directly instead of taking one pointer per node
 EXTERNAL_PARAMS_BUFFER_KWARG = "sum_external_params_buffer"
+EXTERNAL_PARAMS_GRAD_BUFFER_KWARG = "sum_external_params_grad_buffer"
 
 
 class ExternalNodeInfo():
@@ -527,11 +528,10 @@ class ExternalParamsSumLayer(SumLayer):
             for ns_info, _ in ns_tensors
         ]
 
-        for ns_info, tensors in ns_tensors:
-            self.external_params.pre_backward(
-                self, ns_info, tensors, node_flows, element_flows, node_mars, element_mars, params,
-                param_flows = param_flows, propagation_alg = propagation_alg, **kwargs
-            )
+        self.external_params.pre_backward_layer(
+            self, ns_tensors, node_flows, element_flows, node_mars, element_mars, params,
+            param_flows = param_flows, propagation_alg = propagation_alg, **kwargs
+        )
 
         # Shared-parameter flows -- the standard kernels, untouched
         super(ExternalParamsSumLayer, self).backward(
@@ -539,12 +539,11 @@ class ExternalParamsSumLayer(SumLayer):
             param_flows = param_flows, propagation_alg = propagation_alg, **kwargs
         )
 
-        for (ns_info, tensors), grad_tensors in zip(ns_tensors, ns_grad_tensors):
-            self.external_params.post_backward(
-                self, ns_info, tensors, grad_tensors,
-                node_flows, element_flows, node_mars, element_mars, params,
-                param_flows = param_flows, propagation_alg = propagation_alg, **kwargs
-            )
+        self.external_params.post_backward_layer(
+            self, ns_tensors, ns_grad_tensors,
+            node_flows, element_flows, node_mars, element_mars, params,
+            param_flows = param_flows, propagation_alg = propagation_alg, **kwargs
+        )
 
         return None
 
