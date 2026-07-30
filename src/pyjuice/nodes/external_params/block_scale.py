@@ -229,6 +229,7 @@ class BlockScaleSumParams(ExternalSumParams):
         than silently running something slower or, worse, something wrong.
         """
         from .kernels.c import get_cute_module
+        import pyjuice.layer.kernels.c as ck
 
         mod = get_cute_module()
         if mod is None:
@@ -269,7 +270,7 @@ class BlockScaleSumParams(ExternalSumParams):
                 f"`batch % BN == 0` -- a larger node `block_size` (>= 64) is usually the fix; the gate "
                 f"can still be made fine through its own `ch_block_size`, which costs nothing."
             )
-        cfg = valid[0]
+        cfg = valid[0]      # provisional; the real one is measured once the launch args exist
 
         first_view = ns_tensors[0][1][0]
         ext_base = ((first_view.data_ptr() - external_params.data_ptr())
@@ -318,10 +319,36 @@ class BlockScaleSumParams(ExternalSumParams):
             sigma = torch.empty([rows * n_eblks * n_child_gates * block_size], dtype = torch.float32,
                                 device = dev)
             log_z = torch.empty([rows * block_size * batch_size], dtype = torch.float32, device = dev)
-            gmax = torch.empty([rows * batch_size], dtype = torch.float32, device = dev)
 
-            calls.append((nids, ebase, pbase, pids, gate, sigma, gmax, log_z,
+            calls.append((nids, ebase, pbase, pids, gate, sigma, log_z,
                           block_size, num_edges, node_cbs, gate_cbs, n_node_gates, ext_base, cfg))
+
+        # ---- PICK THE TILE BY MEASURING IT ----
+        #
+        # There is no rule that gets this right. The kernel is latency bound at these grid sizes, so a
+        # narrower tile -- more blocks, each doing less -- usually wins; but the accumulator fragment is
+        # `BM * BN / threads` registers, and the fork carries three of them, so a tile with twice the
+        # WARPS halves the fragment and doubles the warps that fit per SM. The two pull in opposite
+        # directions and which wins flips with the batch size: at K=2048 batch=256 the narrow 8-warp
+        # tile is fastest, at batch=512 the wide one is, by 11%.
+        #
+        # Safe to run: every config computes bit-identical values (they differ only in how the same
+        # contraction is tiled), and `forward_layer` runs the real launch after this returns, so
+        # whatever the trial launches leave in `node_mars` is overwritten with the same numbers.
+        def with_cfg(i):
+            return [tuple(a[:-1]) + (i,) for a in calls]
+
+        def runner(i):
+            tuned = with_cfg(i)
+
+            def run():
+                for args in tuned:
+                    mod.blockscale_forward(node_mars, element_mars, params, external_params, *args)
+
+            return run
+
+        best = ck.autotune([(i, runner(i)) for i in valid])
+        calls = with_cfg(best if best is not None else valid[0])
 
         layer._bs_bw_state = (block_size, batch_size, calls)
 
