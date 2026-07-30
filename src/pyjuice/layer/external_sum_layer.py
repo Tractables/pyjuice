@@ -17,6 +17,10 @@ EXTERNAL_PARAMS_KWARG = "sum_external_params"
 #   `pc.backward(x, sum_external_params_grad = {ns: grad_tensors})`
 EXTERNAL_PARAMS_GRAD_KWARG = "sum_external_params_grad"
 
+# The flat staging buffer the views point into, supplied by the PC so that kernels spanning several
+# nodes can address it directly instead of taking one pointer per node
+EXTERNAL_PARAMS_BUFFER_KWARG = "sum_external_params_buffer"
+
 
 class ExternalNodeInfo():
     """
@@ -267,6 +271,116 @@ class ExternalParamsSumLayer(SumLayer):
         self.register_external_buffers("eblk_ids", eblk_ids)
         self.register_external_buffers("par_ptr", par_ptr)
 
+        self._compile_partition_edge_block_ids()
+
+    def _compile_partition_edge_block_ids(self) -> None:
+        """
+        Build, per FORWARD PARTITION, the table that ties the external tensors to `nids` / `cids`.
+
+        The kernels work in the compiled partition layout: a row `ng` of `nids` is a node block, and
+        `cids[ng, e]` are its child nodes. The external tensors are indexed by edge block instead, so
+        each row needs to know which edge blocks it owns and where their factors live:
+
+            `xu[pid][ng, j]`, `xv[pid][ng, j]` -- offsets of the `U` / `V` factors of row `ng`'s j-th
+            incident edge block, in PER-BATCH units (multiply by the batch size at launch), `-1` where
+            a row has fewer than `max_n_eblks` edge blocks.
+
+        Offsets are per-batch units precisely so this table is independent of the batch size, and can
+        therefore be compiled once rather than rebuilt whenever the batch changes.
+
+        Edge block `j` occupies compiled edge slots `[j * ch_block_size, (j+1) * ch_block_size)` of
+        the row, which is what makes `cids` usable directly by the external kernels; that contiguity
+        is asserted below rather than assumed.
+        """
+
+        # The tables address the buffer as `(index + within-slot offset) * batch_size + b`, which is
+        # only meaningful when the storage layout is batch-innermost. A parameterization that keeps
+        # the caller's order simply does not get them -- it is served by its own (torch) path.
+        self.ext_xu, self.ext_xv, self.ext_max_n_eblks = None, None, None
+
+        for ns in self.nodes:
+            if any([shape[-1] != 1 for shape in ns.external_params.storage_shapes(ns, 1)]):
+                return None
+
+        # Per-batch base of every node's storage slots, in the staging buffer's node order. Taking the
+        # shapes at `batch_size = 1` gives sizes in per-batch units directly.
+        unit_base, ns2unit = 0, dict()
+        for ns in self.nodes:
+            slots = []
+            for shape in ns.external_params.storage_shapes(ns, 1):
+                slots.append(unit_base)
+                unit_base += int(torch.tensor(shape).prod())
+
+            ns2unit[ns] = slots
+
+        max_n_eblks = max([ns_info.max_n_eblks for ns_info in self.external_node_infos])
+
+        xu, xv = [], []
+        for partition_id in range(self.num_fw_partitions):
+            nids = self.partitioned_nids[partition_id].cpu()
+            cids = self.partitioned_cids[partition_id].cpu()
+
+            curr_xu = torch.full([nids.size(0), max_n_eblks], -1, dtype = torch.long)
+            curr_xv = torch.full([nids.size(0), max_n_eblks], -1, dtype = torch.long)
+
+            for ns_info in self.external_node_infos:
+                ns = ns_info.ns
+                block_size, ch_block_size = ns.block_size, ns.ch_block_size
+                rank = ns.external_params.storage_shapes(ns, 1)[0][2]
+
+                rows = torch.nonzero((nids >= ns_info.nid_start) & (nids < ns_info.nid_end),
+                                     as_tuple = False).flatten()
+                if rows.size(0) == 0:
+                    continue
+
+                nblock_ids = (nids[rows] - ns_info.nid_start) // block_size
+
+                par_ptr = ns_info.par_ptr.cpu()
+                starts = par_ptr[nblock_ids]
+                counts = par_ptr[nblock_ids + 1] - starts
+
+                # Edge block ids of each row, padded out to `max_n_eblks`
+                all_eblks = ns_info.eblk_ids.cpu()
+                slot_ids = torch.arange(0, max_n_eblks)[None,:]
+                valid = slot_ids < counts[:,None]
+                eblks = all_eblks[(starts[:,None] + slot_ids).clamp(max = all_eblks.size(0) - 1)]
+
+                # `cids` must lay each edge block's children out contiguously, in edge-block order, so
+                # that the kernel can derive the child of (j, c) as `cids[ng, j*ch_block_size + c]`
+                n_slots = cids.size(1) // ch_block_size
+                blocked = cids[rows,:n_slots * ch_block_size].reshape(-1, n_slots, ch_block_size)
+                blk_valid = torch.arange(0, n_slots)[None,:] < counts[:,None]
+
+                expected = blocked[:,:,:1] + torch.arange(0, ch_block_size)[None,None,:]
+                assert torch.all(blocked[blk_valid] == expected[blk_valid]), \
+                    "External sum parameters require each edge block's children to occupy a " \
+                    "contiguous run of `cids`."
+                assert torch.all(blocked[:,:max_n_eblks,0][valid] == ns_info.ch_eids.cpu()[eblks][valid]), \
+                    "External sum parameters require `cids` to list edge blocks in `par_ptr` order."
+
+                curr_xu[rows] = torch.where(valid, ns2unit[ns][0] + eblks * ch_block_size * rank, -1)
+                curr_xv[rows] = torch.where(valid, ns2unit[ns][1] + eblks * block_size * rank, -1)
+
+            xu.append(curr_xu)
+            xv.append(curr_xv)
+
+        self.register_external_partition_buffers("xu", xu)
+        self.register_external_partition_buffers("xv", xv)
+        self.ext_max_n_eblks = max_n_eblks
+
+    def register_external_partition_buffers(self, name: str, tensors: Sequence[torch.Tensor]) -> None:
+        """
+        Register one compile-time tensor per FORWARD PARTITION, exposed as `layer.ext_<name>[pid]`.
+
+        The per-partition counterpart of :func:`register_external_buffers`: for tensors laid out like
+        `nids` / `cids` rather than per `ns`.
+        """
+        assert getattr(self, f"ext_{name}", None) is None, \
+            f"External buffer `{name}` is already registered."
+
+        setattr(self, f"ext_{name}",
+                FastParamList([nn.Parameter(tensor.contiguous(), requires_grad = False) for tensor in tensors]))
+
     @property
     def external_nodes(self) -> List[ExternalParamsSumNodes]:
         """
@@ -377,11 +491,10 @@ class ExternalParamsSumLayer(SumLayer):
 
         self._assert_supported(propagation_alg, is_backward = False, **kwargs)
 
-        for ns_info, tensors in ns_tensors:
-            self.external_params.forward(
-                self, ns_info, tensors, node_mars, element_mars, params,
-                propagation_alg = propagation_alg, **kwargs
-            )
+        self.external_params.forward_layer(
+            self, ns_tensors, node_mars, element_mars, params,
+            propagation_alg = propagation_alg, **kwargs
+        )
 
         return None
 

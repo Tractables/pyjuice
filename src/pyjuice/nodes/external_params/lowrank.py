@@ -82,6 +82,33 @@ class LowRankSumParams(ExternalSumParams):
             (batch_size, num_edge_blocks, ns.block_size, self.rank),     # V
         )
 
+    def storage_shapes(self, ns, batch_size: int):
+        """
+        Stored BATCH-INNERMOST, `[E, states, rank, B]`.
+
+        The kernels tile the child / node axis against the batch axis, and `element_mars` / `node_mars`
+        are themselves `[·, batch]`. Storing the factors batch-innermost gives them the same access
+        shape -- runs of consecutive batch elements -- rather than striding a whole `E*K*rank` block
+        between batch elements, which the caller's `[B, E, K, rank]` order would force.
+
+        It also collapses the addressing to one compiled index per edge block, because the per-node
+        base and the state / rank offsets fold together:
+
+        .. code-block:: text
+
+            U[e, c, rr, b] = external_params[ (xu[ng, j] + c * rank + rr) * B + b ]
+            V[e, m, rr, b] = external_params[ (xv[ng, j] + m * rank + rr) * B + b ]
+        """
+        num_edge_blocks = ns.edge_ids.size(1)
+
+        return (
+            (num_edge_blocks, ns.ch_block_size, self.rank, batch_size),   # U
+            (num_edge_blocks, ns.block_size, self.rank, batch_size),      # V
+        )
+
+    def storage_perm(self):
+        return (1, 2, 3, 0)      # (B, E, states, rank) -> (E, states, rank, B)
+
     def forward(self, layer, ns_info, tensors, node_mars, element_mars, params, **kwargs) -> None:
         """
         Rewrite `node_mars` from the shared-parameter value `log S1` to the effective value.
@@ -105,7 +132,123 @@ class LowRankSumParams(ExternalSumParams):
         Both terms cost `O(num_edge_blocks * block_size * rank * B)`; the shared block-sparse matmul
         is untouched.
         """
-        raise NotImplementedError("The `LowRankSumParams` forward kernel has not been implemented yet.")
+        self.forward_torch(ns_info, tensors, node_mars, element_mars)
+
+    def forward_layer(self, layer, ns_tensors, node_mars, element_mars, params, **kwargs) -> None:
+        """
+        Apply the correction to the whole layer.
+
+        The compiled `xu` / `xv` tables are laid out per forward partition and already carry each
+        row's node identity in their offsets, so one launch per partition covers every node -- no
+        per-node arguments, and the kernel's signature does not grow with the number of nodes.
+
+        Falls back to the per-node torch reference when the kernel's assumptions do not hold.
+        """
+        if len(ns_tensors) == 0:
+            return None
+
+        # Imported here rather than at module load: `pyjuice.layer` imports `pyjuice.nodes`, so a
+        # top-level import would close a cycle
+        from pyjuice.layer.external_sum_layer import EXTERNAL_PARAMS_BUFFER_KWARG
+        from .kernels import fw_lowrank
+
+        external_params = kwargs.get(EXTERNAL_PARAMS_BUFFER_KWARG, None)
+
+        if external_params is None or not self._kernel_applicable(layer, ns_tensors, node_mars):
+            for ns_info, tensors in ns_tensors:
+                self.forward_torch(ns_info, tensors, node_mars, element_mars)
+            return None
+
+        block_size = layer.block_size
+        ch_block_size = layer.external_node_infos[0].ch_block_size
+
+        for partition_id in range(layer.num_fw_partitions):
+            fw_lowrank(
+                node_mars = node_mars,
+                element_mars = element_mars,
+                external_params = external_params,
+                nids = layer.partitioned_nids[partition_id],
+                cids = layer.partitioned_cids[partition_id],
+                xu = layer.ext_xu[partition_id],
+                xv = layer.ext_xv[partition_id],
+                block_size = block_size,
+                ch_block_size = ch_block_size,
+                rank = self.rank,
+            )
+
+    def _kernel_applicable(self, layer, ns_tensors, node_mars) -> bool:
+        """
+        Whether the Triton kernel covers this layer's shape.
+
+        It is written for the regime the feature targets -- a large batch with a large per-node
+        workload and a moderate rank -- so anything outside that falls back to the torch reference
+        rather than being served by a kernel that was not tuned for it.
+        """
+        # The compiled index tables are only built for a batch-innermost storage layout
+        if getattr(layer, "ext_xu", None) is None:
+            return False
+
+        # Every node of the layer must be corrected: the kernel walks whole partitions
+        if len(ns_tensors) != len(layer.external_node_infos):
+            return False
+
+        # One `ch_block_size` and one `max_n_eblks` for the whole layer, since both are constexprs
+        ch_block_sizes = set([ns_info.ch_block_size for ns_info in layer.external_node_infos])
+        if len(ch_block_sizes) != 1:
+            return False
+
+        ch_block_size = ch_block_sizes.pop()
+
+        return (
+            self.rank <= 64 and (self.rank & (self.rank - 1)) == 0   # power-of-2 rank, tile-friendly
+            and layer.block_size >= 16 and ch_block_size >= 16
+            and node_mars.size(1) >= 16                              # tuned for large batch
+        )
+
+    def forward_torch(self, ns_info, tensors, node_mars, element_mars) -> None:
+        """
+        Reference implementation of :func:`forward`, in plain torch.
+
+        Correctness-first and deliberately unfused -- it is the oracle the kernels are validated
+        against, and the fallback for shapes they do not cover.
+        """
+        U, V = tensors                      # [E, Kc, r, B] and [E, K, r, B], batch-innermost
+
+        block_size, ch_block_size = ns_info.block_size, ns_info.ch_block_size
+
+        par_ptr = ns_info.par_ptr
+        child_offsets = torch.arange(0, ch_block_size, device = U.device)
+
+        for nblock_id in range(ns_info.num_node_blocks):
+            eblk_ids = ns_info.eblk_ids[par_ptr[nblock_id]:par_ptr[nblock_id + 1]]
+
+            log_s2, log_zt = None, None
+            for eblk_id in eblk_ids.tolist():
+                # Children of this edge block, and their values
+                cids = ns_info.ch_eids[eblk_id] + child_offsets
+                emars = element_mars[cids,:]                                   # [Kc, B]
+
+                u = U[eblk_id]                                                 # [Kc, r, B]
+                log_w = torch.logsumexp(u + emars[:,None,:], dim = 0)          # [r, B]
+                log_a = torch.logsumexp(u, dim = 0)                            # [r, B]
+
+                v = V[eblk_id]                                                 # [K, r, B]
+                s2 = torch.logsumexp(v + log_w[None,:,:], dim = 1)             # [K, B]
+                zt = torch.logsumexp(v + log_a[None,:,:], dim = 1)             # [K, B]
+
+                log_s2 = s2 if log_s2 is None else torch.logaddexp(log_s2, s2)
+                log_zt = zt if log_zt is None else torch.logaddexp(log_zt, zt)
+
+            nid_sid = ns_info.nid_start + nblock_id * block_size
+            nid_eid = nid_sid + block_size
+
+            log_s1 = node_mars[nid_sid:nid_eid,:]                              # written by the shared kernel
+
+            # `log Z` -- the shared parameters contribute exactly 1, since PyJuice keeps them
+            # child-normalized, so their log-contribution is 0
+            log_z = torch.logaddexp(torch.zeros_like(log_zt), log_zt)
+
+            node_mars[nid_sid:nid_eid,:] = torch.logaddexp(log_s1, log_s2) - log_z
 
     def pre_backward(self, layer, ns_info, tensors, node_flows, element_flows, node_mars,
                      element_mars, params, **kwargs) -> None:

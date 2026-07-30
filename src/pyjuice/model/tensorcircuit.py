@@ -14,7 +14,8 @@ from contextlib import contextmanager
 from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes, ExternalParamsSumNodes, \
                           foreach, summate, multiply
 from pyjuice.layer import Layer, InputLayer, ProdLayer, SumLayer, ExternalParamsSumLayer, LayerGroup, \
-                          StagedExternalParams, EXTERNAL_PARAMS_KWARG, EXTERNAL_PARAMS_GRAD_KWARG
+                          StagedExternalParams, EXTERNAL_PARAMS_KWARG, EXTERNAL_PARAMS_GRAD_KWARG, \
+                          EXTERNAL_PARAMS_BUFFER_KWARG
 from pyjuice.layer.external_sum_layer import validate_external_tensors
 from pyjuice.utils.grad_fns import ReverseGrad
 from pyjuice.utils import BitSet
@@ -636,7 +637,7 @@ class TensorCircuit(nn.Module):
         ns2slots = dict()
         for ns in self.external_params_nodes:
             slots = []
-            for shape in ns.external_params.tensor_shapes(ns, batch_size):
+            for shape in ns.external_params.storage_shapes(ns, batch_size):
                 slots.append((offset, tuple(shape)))
                 offset += math.prod(shape)
 
@@ -699,6 +700,14 @@ class TensorCircuit(nn.Module):
             tensors = validate_external_tensors(
                 ns, ns.external_params, tensors, batch_size, device, require_contiguous = False
             )
+
+            # The staging buffer may hold the tensors in a different axis order than the caller uses
+            # (e.g. batch-innermost, so the kernels read them like `element_mars`). The copy absorbs
+            # the permutation, so the caller never has to know about it.
+            perm = ns.external_params.storage_perm()
+            if perm is not None:
+                tensors = tuple(tensor.permute(perm) for tensor in tensors)
+
             dsts.extend(views[ns])
             srcs.extend(tensors)
 
@@ -711,6 +720,7 @@ class TensorCircuit(nn.Module):
                 del views[ns]
 
         kwargs[EXTERNAL_PARAMS_KWARG] = views
+        kwargs[EXTERNAL_PARAMS_BUFFER_KWARG] = self.external_params
         self._staged_external_params = views
 
     def _resolve_backward_external_params(self, kwargs: dict) -> None:
@@ -738,6 +748,7 @@ class TensorCircuit(nn.Module):
 
         if staged is not None:
             kwargs[EXTERNAL_PARAMS_KWARG] = staged
+            kwargs[EXTERNAL_PARAMS_BUFFER_KWARG] = self.external_params
 
     def _check_external_params_kwargs(self, kwargs: dict) -> None:
         """
@@ -811,7 +822,16 @@ class TensorCircuit(nn.Module):
             f"No external-parameter gradients for {ns}; it was not given external parameters in the " \
             f"last forward pass."
 
-        return self._staged_external_params_grad[ns]
+        grad_tensors = self._staged_external_params_grad[ns]
+
+        # Stored in the kernels' axis order; hand them back in the caller's, so they line up with the
+        # tensors that were supplied. That makes them views rather than contiguous tensors.
+        perm = ns.external_params.storage_perm()
+        if perm is not None:
+            inverse_perm = tuple(perm.index(axis) for axis in range(len(perm)))
+            grad_tensors = tuple(grad.permute(inverse_perm) for grad in grad_tensors)
+
+        return grad_tensors
 
     def forward_ll(self, *args, **kwargs):
         self.forward(*args, propagation_alg = "LL", **kwargs)

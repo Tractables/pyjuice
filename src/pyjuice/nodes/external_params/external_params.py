@@ -59,6 +59,27 @@ class ExternalSumParams():
         """
         raise NotImplementedError()
 
+    def storage_shapes(self, ns, batch_size) -> Tuple[Tuple[int,...],...]:
+        """
+        Shapes the external tensors are *stored* in inside the PC's staging buffer.
+
+        The caller's layout and the kernels' preferred layout need not agree: staging copies, so it
+        can transpose for free-ish while the caller still hands over whatever their own head produced.
+        Defaults to storing exactly what the caller supplies.
+
+        :note: every axis except the batch axis must be batch-independent, so that a slot's size is
+               proportional to the batch size. That is what lets the compiled index tensors express
+               offsets in per-batch units and stay valid across batch sizes.
+        """
+        return self.tensor_shapes(ns, batch_size)
+
+    def storage_perm(self) -> Optional[Tuple[int,...]]:
+        """
+        Permutation taking the caller's axis order to :func:`storage_shapes`' order, or `None` when
+        they agree. Applied to the caller's tensor during staging.
+        """
+        return None
+
     def compile(self, layer) -> None:
         """
         Compile the indices and other tensors this parameterization's kernels need, called once when
@@ -114,6 +135,20 @@ class ExternalSumParams():
         :type tensors: Tuple[torch.Tensor,...]
         """
         raise NotImplementedError()
+
+    def forward_layer(self, layer, ns_tensors, node_mars, element_mars, params, **kwargs) -> None:
+        """
+        Apply the parameterization to a whole layer, once per forward pass.
+
+        The default loops the layer's nodes and calls :func:`forward` per node, which is the simplest
+        thing to implement. Override it when the kernels can span several nodes in one launch -- the
+        compiled index tensors are laid out per FORWARD PARTITION, covering every node of the layer,
+        so a partition-level launch needs no per-node arguments at all.
+
+        :param ns_tensors: `[(ns_info, tensors), ...]` for the nodes that were given external tensors
+        """
+        for ns_info, tensors in ns_tensors:
+            self.forward(layer, ns_info, tensors, node_mars, element_mars, params, **kwargs)
 
     def pre_backward(self, layer, ns_info, tensors, node_flows, element_flows, node_mars,
                      element_mars, params, **kwargs) -> None:
