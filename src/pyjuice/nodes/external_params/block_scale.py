@@ -318,8 +318,9 @@ class BlockScaleSumParams(ExternalSumParams):
             sigma = torch.empty([rows * n_eblks * n_child_gates * block_size], dtype = torch.float32,
                                 device = dev)
             log_z = torch.empty([rows * block_size * batch_size], dtype = torch.float32, device = dev)
+            gmax = torch.empty([rows * batch_size], dtype = torch.float32, device = dev)
 
-            calls.append((nids, ebase, pbase, pids, gate, sigma, log_z,
+            calls.append((nids, ebase, pbase, pids, gate, sigma, gmax, log_z,
                           block_size, num_edges, node_cbs, gate_cbs, n_node_gates, ext_base, cfg))
 
         layer._bs_bw_state = (block_size, batch_size, calls)

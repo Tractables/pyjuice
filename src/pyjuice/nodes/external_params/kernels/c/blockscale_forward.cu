@@ -82,12 +82,64 @@ extern __shared__ char smem_raw[];
 
 // ============================================================ main kernel: log N
 
+// Add each staged log-gate onto every element of `element_mars` it covers, and fold the gates' own max
+// into `sMz`. `GC` -- the gate's child-block width, clamped to the edge tile -- is a template parameter
+// so `BK / GC`, `e / GC` and the trip counts are all compile-time; see the call site.
+template <int BN, int NTH, int GC>
+__device__ __forceinline__ void fold_gates(float* __restrict__ sEm, const float* __restrict__ sPh,
+                                           float* __restrict__ sMz, int tid) {
+    constexpr int NGT = BK / GC;
+
+    CUTE_UNROLL
+    for (int i = tid * 4; i < BK * BN; i += NTH * 4) {
+        const int e = i / BN, b = i % BN;
+        float4 v = *(const float4*)&sEm[i];
+        const float4 g = *(const float4*)&sPh[(e / GC) * BN + b];
+        v.x += g.x; v.y += g.y; v.z += g.z; v.w += g.w;
+        *(float4*)&sEm[i] = v;
+    }
+
+    // The stabilizer for `Z`: the max log-gate over all of the row's gates. Free here -- the gates are
+    // in shared already and the block visits every edge tile of its row. In its own kernel it cost 27 us
+    // flat, since a standalone pass re-reads `phi` from DRAM and chases `gate[j]` before it can issue
+    // each load, with too few warps in flight to hide either.
+    for (int b = tid; b < BN; b += NTH) {
+        float gm = -INFINITY;
+        CUTE_UNROLL
+        for (int gi = 0; gi < NGT; gi++) gm = fmaxf(gm, sPh[gi * BN + b]);
+        sMz[b] = fmaxf(sMz[b], gm);
+    }
+}
+
+
+// Fallback for a gate width outside the specialized set; correct, just not unrolled.
+template <int BN, int NTH>
+__device__ __forceinline__ void fold_gates_rt(float* __restrict__ sEm, const float* __restrict__ sPh,
+                                              float* __restrict__ sMz, int tid, int gc) {
+    const int ngt = BK / gc;
+
+    for (int i = tid * 4; i < BK * BN; i += NTH * 4) {
+        const int e = i / BN, b = i % BN;
+        float4 v = *(const float4*)&sEm[i];
+        const float4 g = *(const float4*)&sPh[(e / gc) * BN + b];
+        v.x += g.x; v.y += g.y; v.z += g.z; v.w += g.w;
+        *(float4*)&sEm[i] = v;
+    }
+
+    for (int b = tid; b < BN; b += NTH) {
+        float gm = -INFINITY;
+        for (int gi = 0; gi < ngt; gi++) gm = fmaxf(gm, sPh[gi * BN + b]);
+        sMz[b] = fmaxf(sMz[b], gm);
+    }
+}
+
+
 template <int BM, int BN, int WM, int WN>
 __global__ void __launch_bounds__(WM * WN * 32) blockscale_tlmm_kernel(
         float* __restrict__ node_mars, const float* __restrict__ mp,
         const float* __restrict__ ext, const long* __restrict__ nids,
         const long* __restrict__ ebase, const long* __restrict__ pbase,
-        const long* __restrict__ gate,
+        const long* __restrict__ gate, float* __restrict__ mz_out,
         int batch, int block_size, int knt, int gate_stride,
         int node_cbs, int gate_cbs, long ext_base, int pid_m_offset,
         const __grid_constant__ CUtensorMap desc) {
@@ -111,7 +163,9 @@ __global__ void __launch_bounds__(WM * WN * 32) blockscale_tlmm_kernel(
     bfloat16_t* pBs = pA + cosize(sAl);
     float* sEm = (float*)(pBs + cosize(sBl));
     float* sMx = sEm + BK * BN;
-    uint64_t* bar = (uint64_t*)(sMx + BN + 4);
+    float* sMz = sMx + BN;                       // [BN] running max log-gate
+    uint64_t* bar = (uint64_t*)(sMz + BN + 4);
+    float* sPh = (float*)(bar + 4);              // [ngt, BN] per tile, or [knt * ngt, BN] preloaded
 
     Tensor sAt = make_tensor(make_smem_ptr(pA), sAl);
     Tensor sBt = make_tensor(make_smem_ptr(pBs), sBl);
@@ -135,27 +189,59 @@ __global__ void __launch_bounds__(WM * WN * 32) blockscale_tlmm_kernel(
     CUTE_UNROLL
     for (int i = 0; i < size(tCrM); i++) tCrM(i) = -INFINITY;
 
+    const int gcbs_eff = (gate_cbs < BK) ? gate_cbs : BK;
+    const int ngt = BK / gcbs_eff;
+
     if (tid == 0) mbar_init(bar, 1);
+    for (int b = tid; b < BN; b += NTH) sMz[b] = -INFINITY;
     __syncthreads();
     int phase = 0;
 
     for (int kt = 0; kt < knt; kt++) {
         long pc = pb[kt] + (long)tile_id * BM;
         if (tid == 0) { mbar_expect(bar, BK * BN * 4); tma_load_2d(sEm, &desc, b0, (int)eb[kt], bar); }
+
+        // ---- STAGE THE GATES for this tile ----
+        //
+        // Issued BEFORE waiting on the barrier: the gates do not depend on `element_mars`, so these
+        // loads overlap the TMA transfer instead of queueing behind it.
+        //
+        // Per (GATE, batch), not per (edge, batch): a tile spans only `BK / gate_cbs` distinct gates and
+        // every edge under one takes the same value. The per-element form loaded each `phi` `gate_cbs`
+        // times over and paid two integer divisions per element -- 4096 loads and 8192 divisions per
+        // tile at `gate_cbs = 8`, against 512 and 1024 here.
+        for (int i = tid; i < ngt * BN; i += NTH) {
+            const int gi = i / BN, b = i % BN;
+            const int ge0 = kt * BK + gi * gcbs_eff;
+            const int j = ge0 / node_cbs;
+            const int d = (ge0 % node_cbs) / gate_cbs;
+
+            const long gb = (j < gate_stride) ? gt[j] : -1;
+            sPh[i] = (gb >= 0) ? ext[(gb + ext_base + d) * (long)batch + b0 + b] : -INFINITY;
+        }
+
         mbar_wait(bar, phase); phase ^= 1;
+        __syncthreads();
 
-        // ---- THE FOLD: log phi added to the child values, before max-stabilization ----
-        // `sEm` is [edge, batch]; the gate of edge `kt*BK + e` is its edge block `j` and, within that,
-        // the child gate `d`. `-inf + anything = -inf`, so a padded edge (child 0, the dummy) and a row
-        // with fewer edge blocks (`gate == -1`) both stay -inf and contribute exactly nothing.
-        for (int i = tid; i < BK * BN; i += NTH) {
-            int e = i / BN, b = i % BN;
-            int ge = kt * BK + e;
-            int j = ge / node_cbs;
-            int d = (ge % node_cbs) / gate_cbs;
-
-            long gb = (j < gate_stride) ? gt[j] : -1;
-            sEm[i] += (gb >= 0) ? ext[(gb + ext_base + d) * (long)batch + b0 + b] : -INFINITY;
+        // ---- ADD THE GATES INTO THE STAGED `element_mars` ----
+        //
+        // Specialized on the gate width so `BK / GC` and `e / GC` are compile-time. Consuming the gates
+        // in place in the max and exponent loops instead -- which reads each one rather than writing it
+        // back, and looks like strictly less work -- made both loops' trip counts runtime values, so
+        // neither unrolled and every shared load paid its full latency. That cost 31 us against the
+        // standard kernel, more than the entire normalizer.
+        //
+        // With the gates folded in, the two loops below are the standard kernel's, unchanged: same
+        // compile-time bounds, same unrolling, and `(sEm + lp) - mx` in the same order as before, so the
+        // arithmetic is unchanged too. `-inf + anything = -inf`, so a padded edge (child 0, the dummy)
+        // and a row with fewer edge blocks (`gate == -1`) both stay -inf and contribute exactly nothing.
+        switch (gcbs_eff) {
+            case  4: fold_gates<BN, NTH,  4>(sEm, sPh, sMz, tid); break;
+            case  8: fold_gates<BN, NTH,  8>(sEm, sPh, sMz, tid); break;
+            case 16: fold_gates<BN, NTH, 16>(sEm, sPh, sMz, tid); break;
+            case 32: fold_gates<BN, NTH, 32>(sEm, sPh, sMz, tid); break;
+            case 64: fold_gates<BN, NTH, 64>(sEm, sPh, sMz, tid); break;
+            default: fold_gates_rt<BN, NTH>(sEm, sPh, sMz, tid, gcbs_eff); break;
         }
         __syncthreads();
 
@@ -213,6 +299,11 @@ __global__ void __launch_bounds__(WM * WN * 32) blockscale_tlmm_kernel(
         __syncthreads();
     }
 
+    // One m-tile publishes the stabilizer: every tile of a row computed it from the same gates, so the
+    // others would only rewrite the same bytes.
+    if (tile_id == 0)
+        for (int b = tid; b < BN; b += NTH) mz_out[(long)nblock * batch + b0 + b] = sMz[b];
+
     // Writes log N; `blockscale_normalize` turns it into log N - log Z.
     CUTE_UNROLL
     for (int i = 0; i < size(tCrL); i++) {
@@ -255,50 +346,131 @@ __global__ void blockscale_sigma_kernel(
 
 // ============================================================ normalize: Z, and log N -> log N - log Z
 
-__global__ void blockscale_normalize_kernel(
+// `mz[row, b] = max_g log phi[g, b]`, the stabilizer for `Z`, comes out of the main kernel -- see the
+// max loop there.
+
+template <int TM, int TB, int GT, int RM, int RB>
+__global__ void __launch_bounds__((TM / RM) * (TB / RB)) blockscale_normalize_kernel(
         float* __restrict__ node_mars, const float* __restrict__ ext,
         const float* __restrict__ sigma, const long* __restrict__ nids,
-        const long* __restrict__ gate, float* __restrict__ log_z_out,
-        int rows, int batch, int block_size, int n_eblks, int n_child_gates,
-        int gate_stride, long ext_base) {
+        const long* __restrict__ gate, const float* __restrict__ mz_in,
+        float* __restrict__ log_z_out,
+        int batch, int block_size, int n_gates, int n_child_gates, int gate_stride, long ext_base) {
 
-    const long total = (long)rows * block_size * batch;
+    // `Z[m,b] = sum_g sigma[g,m] * phi[g,b]` is a GEMM: [block_size x n_gates] . [n_gates x batch].
+    // Written as a triple loop it re-read every gate's `sigma` and `phi` from global for each output --
+    // ~100M load instructions for 2.7 MB of distinct data, and 20x its own IO bound.
+    //
+    // REGISTER-TILED, `RM x RB` outputs per thread. One output per thread instead made every thread walk
+    // all `n_gates` gates as a serial dependent FMA chain, two shared loads per FMA, and needed `TM * TB`
+    // threads -- 1024-thread blocks, of which there were barely one wave. Here each staged pair of
+    // shared values feeds `RM * RB` FMAs, so the same arithmetic costs 8x fewer shared accesses and the
+    // block is small enough to fill the machine.
+    constexpr int NTH = (TM / RM) * (TB / RB);
 
-    for (long i = (long)blockIdx.x * blockDim.x + threadIdx.x; i < total;
-         i += (long)gridDim.x * blockDim.x) {
-        const int b = i % batch;
-        const int m = (i / batch) % block_size;
-        const int row = i / ((long)batch * block_size);
+    __shared__ float s_sig[GT][TM];
+    __shared__ float s_phe[GT][TB];
+    __shared__ float s_mz[TB];
 
-        // Max-stabilized over the gates: one exp per gate, one log at the end
-        float mz = -INFINITY;
-        for (int j = 0; j < n_eblks; ++j) {
-            const long gb = (j < gate_stride) ? gate[(long)row * gate_stride + j] : -1;
-            if (gb < 0) continue;
-            for (int d = 0; d < n_child_gates; ++d)
-                mz = fmaxf(mz, ext[(gb + ext_base + d) * (long)batch + b]);
-        }
+    const int row = blockIdx.x;
+    const int m0 = blockIdx.y * TM;
+    const int b0 = blockIdx.z * TB;
 
-        float acc = 0.0f;
-        if (mz != -INFINITY) {
-            for (int j = 0; j < n_eblks; ++j) {
-                const long gb = (j < gate_stride) ? gate[(long)row * gate_stride + j] : -1;
-                if (gb < 0) continue;
-                for (int d = 0; d < n_child_gates; ++d) {
-                    const float lphi = ext[(gb + ext_base + d) * (long)batch + b];
-                    const long si = (((long)row * n_eblks + j) * n_child_gates + d) * block_size + m;
-                    acc = fmaf(__expf(lphi - mz), sigma[si], acc);
-                }
+    const int tid = threadIdx.x;
+
+    // The BATCH index runs along `threadIdx.x` so the epilogue's stores stay coalesced: `node_mars` is
+    // batch-innermost, and indexing the other way round would give adjacent threads addresses `batch`
+    // floats apart.
+    const int bt = (tid % (TB / RB)) * RB;
+    const int mt = (tid / (TB / RB)) * RM;
+
+    const long* gt = gate + (long)row * gate_stride;
+
+    for (int i = tid; i < TB; i += NTH)
+        s_mz[i] = (b0 + i < batch) ? mz_in[(long)row * batch + b0 + i] : -INFINITY;
+    __syncthreads();
+
+    float acc[RM][RB];
+    #pragma unroll
+    for (int i = 0; i < RM; ++i)
+        #pragma unroll
+        for (int j = 0; j < RB; ++j) acc[i][j] = 0.0f;
+
+    for (int g0 = 0; g0 < n_gates; g0 += GT) {
+        const int ng = min(GT, n_gates - g0);
+
+        // float4: `sigma` is contiguous along the node axis and `phi` along the batch axis, and both
+        // tiles are multiples of 4, so each staging load moves 16 bytes instead of 4.
+        for (int i = tid; i < ng * (TM / 4); i += NTH) {
+            const int gg = i / (TM / 4), mm = (i % (TM / 4)) * 4;
+            const long base = ((long)row * n_gates + g0 + gg) * block_size + m0 + mm;
+
+            if (m0 + mm + 3 < block_size) {
+                *(float4*)&s_sig[gg][mm] = *(const float4*)&sigma[base];
+            } else {
+                for (int c = 0; c < 4; ++c)
+                    s_sig[gg][mm + c] = (m0 + mm + c < block_size) ? sigma[base + c] : 0.0f;
             }
         }
+        for (int i = tid; i < ng * (TB / 4); i += NTH) {
+            const int gg = i / (TB / 4), bb = (i % (TB / 4)) * 4;
+            const int g = g0 + gg;
+            const long gb = gt[g / n_child_gates];
 
-        const float log_z = (acc <= 0.0f) ? -INFINITY : mz + logf(acc);
-        const long o = (nids[row] + m) * (long)batch + b;
+            float v[4] = {0.f, 0.f, 0.f, 0.f};
+            if (gb >= 0 && b0 + bb + 3 < batch) {
+                *(float4*)v = *(const float4*)&ext[(gb + ext_base + g % n_child_gates) * (long)batch
+                                                   + b0 + bb];
+            } else if (gb >= 0) {
+                for (int c = 0; c < 4; ++c)
+                    if (b0 + bb + c < batch)
+                        v[c] = ext[(gb + ext_base + g % n_child_gates) * (long)batch + b0 + bb + c];
+            }
 
-        node_mars[o] = (node_mars[o] == -INFINITY || log_z == -INFINITY)
-                       ? -INFINITY : node_mars[o] - log_z;
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                const float mzc = s_mz[bb + c];
+                s_phe[gg][bb + c] = (gb < 0 || b0 + bb + c >= batch || mzc == -INFINITY)
+                                    ? 0.0f : __expf(v[c] - mzc);
+            }
+        }
+        __syncthreads();
 
-        if (log_z_out != nullptr) log_z_out[i] = log_z;
+        for (int gg = 0; gg < ng; ++gg) {
+            float a[RM], p[RB];
+            #pragma unroll
+            for (int i = 0; i < RM; ++i) a[i] = s_sig[gg][mt + i];
+            #pragma unroll
+            for (int j = 0; j < RB; ++j) p[j] = s_phe[gg][bt + j];
+            #pragma unroll
+            for (int i = 0; i < RM; ++i)
+                #pragma unroll
+                for (int j = 0; j < RB; ++j) acc[i][j] = fmaf(a[i], p[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int i = 0; i < RM; ++i) {
+        const int m = m0 + mt + i;
+        if (m >= block_size) break;
+
+        #pragma unroll
+        for (int j = 0; j < RB; ++j) {
+            const int b = b0 + bt + j;
+            if (b >= batch) break;
+
+            const float mz = s_mz[bt + j];
+            const float log_z = (acc[i][j] <= 0.0f || mz == -INFINITY) ? -INFINITY
+                                                                       : mz + logf(acc[i][j]);
+            const long o = (nids[row] + m) * (long)batch + b;
+
+            node_mars[o] = (node_mars[o] == -INFINITY || log_z == -INFINITY)
+                           ? -INFINITY : node_mars[o] - log_z;
+
+            if (log_z_out != nullptr)
+                log_z_out[((long)row * block_size + m) * (long)batch + b] = log_z;
+        }
     }
 }
 
@@ -308,9 +480,10 @@ __global__ void blockscale_normalize_kernel(
 template <int BM, int BN, int WM, int WN>
 static void launch_cfg(torch::Tensor node_mars, torch::Tensor element_mars, torch::Tensor params,
                        torch::Tensor ext, torch::Tensor nids, torch::Tensor ebase,
-                       torch::Tensor pbase, torch::Tensor gate,
+                       torch::Tensor pbase, torch::Tensor gate, torch::Tensor gmax,
                        int batch, int block_size, int knt, int node_cbs, int gate_cbs,
                        long ext_base) {
+    // `gcbs_eff` mirrors the kernel: a gate may be wider than one edge tile
     constexpr int NTH = WM * WN * 32;
     int n_edge_rows = element_mars.size(0);
     void* base = (void*)element_mars.data_ptr<float>();
@@ -331,7 +504,9 @@ static void launch_cfg(torch::Tensor node_mars, torch::Tensor element_mars, torc
         desc_ptr = base; desc_rows = n_edge_rows; desc_batch = batch;
     }
 
-    int smem = BM * BK * 2 + BN * BK * 2 + BK * BN * 4 + BN * 4 + 64;
+    const int gcbs_eff = (gate_cbs < BK) ? gate_cbs : BK;
+    int smem = BM * BK * 2 + BN * BK * 2 + BK * BN * 4 + BN * 4 + BN * 4 + 64
+               + (BK / gcbs_eff) * BN * 4;      // operands, the two maxes, the staged gates
     cudaFuncSetAttribute(blockscale_tlmm_kernel<BM, BN, WM, WN>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
 
@@ -343,7 +518,8 @@ static void launch_cfg(torch::Tensor node_mars, torch::Tensor element_mars, torc
         blockscale_tlmm_kernel<BM, BN, WM, WN><<<grid, NTH, smem, c10::cuda::getCurrentCUDAStream()>>>(
             node_mars.data_ptr<float>(), params.data_ptr<float>(), ext.data_ptr<float>(),
             nids.data_ptr<long>(), ebase.data_ptr<long>(), pbase.data_ptr<long>(),
-            gate.data_ptr<long>(), batch, block_size, knt, (int)gate.size(1),
+            gate.data_ptr<long>(), gmax.data_ptr<float>(),
+            batch, block_size, knt, (int)gate.size(1),
             node_cbs, gate_cbs, ext_base, off, desc);
     }
 }
@@ -357,7 +533,7 @@ std::vector<std::vector<int>> configs() {
 void blockscale_forward(torch::Tensor node_mars, torch::Tensor element_mars, torch::Tensor params,
                         torch::Tensor ext, torch::Tensor nids, torch::Tensor ebase,
                         torch::Tensor pbase, torch::Tensor pids, torch::Tensor gate,
-                        torch::Tensor sigma, torch::Tensor log_z,
+                        torch::Tensor sigma, torch::Tensor gmax, torch::Tensor log_z,
                         int64_t block_size, int64_t num_edges, int64_t node_cbs, int64_t gate_cbs,
                         int64_t n_node_gates, int64_t ext_base, int64_t cfg) {
 
@@ -386,29 +562,30 @@ void blockscale_forward(torch::Tensor node_mars, torch::Tensor element_mars, tor
 
     switch (cfg) {
         case 0: launch_cfg<128, 64, 2, 2>(node_mars, element_mars, params, ext, nids, ebase, pbase,
-                                          gate, batch, (int)block_size, knt, (int)node_cbs,
+                                          gate, gmax, batch, (int)block_size, knt, (int)node_cbs,
                                           (int)gate_cbs, (long)ext_base); break;
         case 1: launch_cfg<64, 64, 2, 2>(node_mars, element_mars, params, ext, nids, ebase, pbase,
-                                         gate, batch, (int)block_size, knt, (int)node_cbs,
+                                         gate, gmax, batch, (int)block_size, knt, (int)node_cbs,
                                          (int)gate_cbs, (long)ext_base); break;
         case 2: launch_cfg<256, 64, 4, 2>(node_mars, element_mars, params, ext, nids, ebase, pbase,
-                                          gate, batch, (int)block_size, knt, (int)node_cbs,
+                                          gate, gmax, batch, (int)block_size, knt, (int)node_cbs,
                                           (int)gate_cbs, (long)ext_base); break;
         default: launch_cfg<128, 128, 2, 4>(node_mars, element_mars, params, ext, nids, ebase, pbase,
-                                            gate, batch, (int)block_size, knt, (int)node_cbs,
+                                            gate, gmax, batch, (int)block_size, knt, (int)node_cbs,
                                             (int)gate_cbs, (long)ext_base); break;
     }
 
+    const int n_gates = n_eblks * n_child_gates;
     {
-        const long total = (long)rows * block_size * batch;
-        const int threads = 256;
-        const int blocks = (int)std::min<long>(4096, (total + threads - 1) / threads);
-        blockscale_normalize_kernel<<<blocks, threads, 0, c10::cuda::getCurrentCUDAStream()>>>(
+        constexpr int TM = 64, TB = 64, GT = 32, RM = 4, RB = 4;
+        constexpr int NTH = (TM / RM) * (TB / RB);
+        dim3 g(rows, (int)((block_size + TM - 1) / TM), (batch + TB - 1) / TB);
+        blockscale_normalize_kernel<TM, TB, GT, RM, RB><<<g, NTH, 0,
+                                                          c10::cuda::getCurrentCUDAStream()>>>(
             node_mars.data_ptr<float>(), ext.data_ptr<float>(), sigma.data_ptr<float>(),
-            nids.data_ptr<long>(), gate.data_ptr<long>(),
+            nids.data_ptr<long>(), gate.data_ptr<long>(), gmax.data_ptr<float>(),
             log_z.numel() ? log_z.data_ptr<float>() : nullptr,
-            rows, batch, (int)block_size, n_eblks, n_child_gates, (int)gate.size(1),
-            (long)ext_base);
+            batch, (int)block_size, n_gates, n_child_gates, (int)gate.size(1), (long)ext_base);
     }
 }
 
