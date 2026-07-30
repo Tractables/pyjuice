@@ -74,7 +74,8 @@ def HCLT(x: torch.Tensor, num_latents: int,
          input_node_type: Type[Distribution] = Categorical, 
          input_node_params: dict = {"num_cats": 256},
          tie_input_params: bool = False,
-         sum_edge_ids_constructor: Optional[Callable] = None):
+         sum_edge_ids_constructor: Optional[Callable] = None,
+         external_params = None):
     """
     Construct Hidden Chow-Liu Trees (https://arxiv.org/pdf/2106.02264.pdf).
 
@@ -105,6 +106,11 @@ def HCLT(x: torch.Tensor, num_latents: int,
     :param tie_input_params: whether to tie the input parameters
     :type tie_input_params: bool
 
+    :param external_params: if given, an :class:`~pyjuice.nodes.external_params.ExternalSumParams`
+        descriptor applied to every INNER sum node, so their effective parameters take per-sample
+        external tensors (see :class:`~pyjuice.nodes.ExternalParamsSumNodes`). The root sum node is
+        left plain, being a single node of block size 1.
+
     :param sum_edge_ids_constructor: optional helper functions to create special edge patterns (e.g., block-sparse)
     :type sum_edge_ids_constructor: Callable
     """
@@ -120,7 +126,8 @@ def HCLT(x: torch.Tensor, num_latents: int,
         T, root, num_latents, input_node_type, 
         input_node_params, num_root_ns = num_root_ns,
         block_size = block_size, tie_input_params = tie_input_params,
-        sum_edge_ids_constructor = sum_edge_ids_constructor
+        sum_edge_ids_constructor = sum_edge_ids_constructor,
+        external_params = external_params
     )
     
     return root_r
