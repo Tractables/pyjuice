@@ -305,12 +305,18 @@ class ExternalParamsSumLayer(SumLayer):
 
         # Per-batch base of every node's storage slots, in the staging buffer's node order. Taking the
         # shapes at `batch_size = 1` gives sizes in per-batch units directly.
-        unit_base, ns2unit = 0, dict()
+        # Keyed by STORAGE OWNER, not by node -- and not by "is the owner one of this layer's nodes",
+        # which is the subtly wrong test: an owner may live in a DIFFERENT layer (a tied chain puts the
+        # source at one depth and its copies at others), and then two copies sharing this layer would
+        # each advance the cursor and address different slots while the circuit gave them the same one.
+        # That read past the end of the buffer, and the symptom was whatever the allocator happened to
+        # be holding there -- correct-looking whenever a previous run had left the same factors behind.
+        unit_base, ns2unit, owner2unit = 0, dict(), dict()
         for ns in self.nodes:
-            # Nodes that share storage share their offsets too, and must not advance the cursor
             owner = ns.external_params.storage_owner(ns)
-            if owner is not ns and owner in ns2unit:
-                ns2unit[ns] = ns2unit[owner]
+
+            if owner in owner2unit:
+                ns2unit[ns] = owner2unit[owner]
                 continue
 
             slots = []
@@ -318,6 +324,7 @@ class ExternalParamsSumLayer(SumLayer):
                 slots.append(unit_base)
                 unit_base += int(torch.tensor(shape).prod())
 
+            owner2unit[owner] = slots
             ns2unit[ns] = slots
 
         max_n_eblks = max([ns_info.max_n_eblks for ns_info in self.external_node_infos])

@@ -136,9 +136,14 @@ class LowRankSumParams(ExternalSumParams):
         # re-deriving it cost ~27 us per layer against a ~4 us kernel call (nn.Module attribute lookups,
         # per-call imports, the applicability check, tile selection), i.e. the bookkeeping dominated the
         # work by 7x. Keyed on the buffer identities it was built for, so a reallocation rebuilds it.
-        self._plan = dict()
-        self._bw_plan = dict()
         self._auto_variant = None
+
+        # Shared cached intermediates, keyed by (owner node, batch size). `logZ` depends only on `U` and
+        # `V` -- not on `element_mars` -- so with `tie_external` it is IDENTICAL at every node that
+        # shares the factors, and one copy serves them all. Keyed by node rather than by layer, so the
+        # entries live exactly as long as the model does. (Per-LAYER state lives on the layer itself; a
+        # dict keyed by `id(layer)` here would both leak and risk id reuse.)
+        self._shared_logz = dict()
 
         # Which forward launch structure to use. `logW` / `logA` do not depend on the node index, so the
         # three differ in whether they recompute them per node tile (`"grid"`), share them in registers
@@ -241,6 +246,9 @@ class LowRankSumParams(ExternalSumParams):
         ext_base = ((first_view.data_ptr() - external_params.data_ptr())
                     // external_params.element_size()) // batch_size
 
+        self._assert_offsets_in_bounds(layer, external_params, ext_base, batch_size,
+                                       block_size, ch_block_size)
+
         tiles = self._tiles(block_size, ch_block_size, batch_size)
         tile_m = min(self.tile_m or 8, block_size)
         # 16 rather than the Triton default: these tiles set the BLOCK COUNT, and 64 left the grid at a
@@ -268,24 +276,107 @@ class LowRankSumParams(ExternalSumParams):
             rows, num_eblks = xu.size(0), xu.size(1)
             numel = rows * num_eblks * self.rank * n_ctiles * batch_size
 
-            # PER-LAYER (not shared scratch): the backward reads these after every layer's forward has
-            # run, so they must survive the rest of the forward pass. logW/logA are tiny; logZ is
-            # node-sized, which is still far cheaper than recomputing it from `V` in the backward.
-            log_w = torch.empty([rows * num_eblks * self.rank * batch_size], dtype = torch.float32,
-                                device = dev)
-            log_a = torch.empty_like(log_w)
-            log_z = torch.empty([rows * block_size * batch_size], dtype = torch.float32, device = dev)
+            # These must survive the rest of the FORWARD pass -- the backward reads them once every
+            # layer has run -- so they cannot come from the shared scratch, which the next layer reuses.
+            # They are registered on the layer (non-persistent, so they stay out of `state_dict`) so
+            # that they are visible in `named_buffers` and die with the layer.
+            log_w = self._layer_buffer(layer, f"_lr_log_w{partition_id}",
+                                       rows * num_eblks * self.rank * batch_size, dev)
+            log_a = self._layer_buffer(layer, f"_lr_log_a{partition_id}",
+                                       rows * num_eblks * self.rank * batch_size, dev)
+
+            # `logZ` is node-sized and the largest of the three. Shared across layers when the factors
+            # are, in which case only the first layer to claim it writes it and the rest read it -- an
+            # empty tensor tells the kernel to skip the store (`log_z.numel() ? ptr : nullptr`).
+            log_z, writes_logz = self._logz_buffer(layer, partition_id,
+                                                   rows * block_size * batch_size, dev)
+            log_z_write = log_z if writes_logz else torch.empty([0], dtype = torch.float32,
+                                                                device = dev)
+
             state.append((nids, cids, xu, xv, log_w, log_a, log_z))
 
             calls.append((nids, cids, xu, xv,
                           self._alloc(f"pw{partition_id}", numel),
                           self._alloc(f"pa{partition_id}", numel),
-                          log_w, log_a, log_z,
+                          log_w, log_a, log_z_write,
                           block_size, ch_block_size, self.rank, ext_base, tile_c, tile_m, tb1, tb2))
 
-        self._bw_plan[id(layer)] = (block_size, ch_block_size, ext_base, batch_size, state)
+        layer._lr_bw_state = (block_size, ch_block_size, ext_base, batch_size, state)
 
         return mod, calls
+
+    def _assert_offsets_in_bounds(self, layer, external_params, ext_base, batch_size,
+                                  block_size, ch_block_size) -> None:
+        """
+        Check the compiled `xu` / `xv` address memory that is actually inside the staging buffer.
+
+        The tables are built at compile time from the layer's own nodes, while the slots are assigned by
+        the circuit across all of them; they agree only if the layer's nodes occupy consecutive slots in
+        `layer.nodes` order. When that broke -- a tied node whose storage owner lives in a different
+        layer, so two copies here each advanced the cursor instead of sharing one slot -- the kernels read
+        PAST the end of the buffer and returned whatever was there. That is invisible in a test whenever
+        the memory beyond the buffer happens to hold the right values, which is exactly what happened.
+
+        A bounds check catches that class of mistake without needing to re-derive which edge block of
+        which node each row owns (a row's first incident edge block is not in general the node's first).
+        Run once per plan build.
+        """
+        numel = external_params.numel()
+
+        for partition_id in range(layer.num_fw_partitions):
+            for table, span in ((layer.ext_xu[partition_id], ch_block_size * self.rank),
+                                (layer.ext_xv[partition_id], block_size * self.rank)):
+                valid = table[table >= 0]
+                if valid.numel() == 0:
+                    continue
+
+                last = (int(valid.max()) + ext_base + span) * batch_size
+                assert last <= numel, (
+                    f"compiled external offsets run past the staging buffer: highest addressed element "
+                    f"{last} but the buffer holds {numel}. The layer's slot offsets disagree with the "
+                    f"circuit's layout (see `ExternalSumParams.storage_owner`)."
+                )
+
+    @staticmethod
+    def _layer_buffer(layer, name: str, numel: int, device):
+        """A non-persistent buffer of `numel` floats on `layer`, reused if it already fits."""
+        existing = getattr(layer, name, None)
+        if existing is not None and existing.numel() == numel and existing.device == device:
+            return existing
+
+        buf = torch.empty([numel], dtype = torch.float32, device = device)
+        if name in layer._buffers:
+            layer._buffers[name] = buf
+        else:
+            layer.register_buffer(name, buf, persistent = False)
+
+        return buf
+
+    def _logz_buffer(self, layer, partition_id: int, numel: int, device):
+        """
+        The `logZ` cache for one partition, and whether this layer is the one that WRITES it.
+
+        Shared only when the factors are shared and the layer holds a single node -- the case a tied
+        chain produces. With several nodes per layer the partition rows can span different nodes, so the
+        cache stays per-layer rather than reasoning about which row belongs to which owner.
+        """
+        if self.tie_external and len(layer.nodes) == 1:
+            key = (self.storage_owner(layer.nodes[0]), numel, device)
+
+            # The WRITER is recorded explicitly. Deriving it from "was this buffer already allocated"
+            # breaks as soon as the owner's plan is rebuilt (a batch change, a moved buffer): the entry
+            # would already exist, so every layer would decide someone else writes it and `logZ` would
+            # never be written at all.
+            entry = self._shared_logz.get(key, None)
+            if entry is None:
+                buf = torch.empty([numel], dtype = torch.float32, device = device)
+                self._shared_logz[key] = (buf, layer)
+                return buf, True
+
+            buf, writer = entry
+            return buf, writer is layer
+
+        return self._layer_buffer(layer, f"_lr_log_z{partition_id}", numel, device), True
 
     def forward_layer(self, layer, ns_tensors, node_mars, element_mars, params, **kwargs) -> None:
         """
@@ -302,15 +393,14 @@ class LowRankSumParams(ExternalSumParams):
 
         if self._resolved_variant() == "cuda":
             # Fast path: one resolved host call per partition, no per-step bookkeeping
-            key = id(layer)
             ptrs = (node_mars.data_ptr(), element_mars.data_ptr(), node_mars.size(1))
 
-            entry = self._plan.get(key, None)
+            entry = getattr(layer, "_lr_fw_plan", None)
             if entry is None or entry[0] != ptrs:
                 buf = kwargs.get(_buffer_kwarg(), None)
                 entry = (ptrs, None if buf is None else
                          self._build_cuda_plan(layer, ns_tensors, node_mars, element_mars, buf))
-                self._plan[key] = entry
+                layer._lr_fw_plan = entry
 
             if entry[1] is not None:
                 mod, calls = entry[1]
@@ -353,6 +443,9 @@ class LowRankSumParams(ExternalSumParams):
         tiles_key = (block_size, ch_block_size, batch_size)
         tiles = self._tiles_cache.get(tiles_key, None)
         if tiles is None:
+            self._assert_offsets_in_bounds(layer, external_params, ext_base, batch_size,
+                                           block_size, ch_block_size)
+
             tiles = self._tiles(block_size, ch_block_size, batch_size)
             self._tiles_cache[tiles_key] = tiles
 
@@ -439,7 +532,7 @@ class LowRankSumParams(ExternalSumParams):
                 "correction is combined in log space."
             )
 
-        entry = self._bw_plan.get(id(layer), None)
+        entry = getattr(layer, "_lr_bw_state", None)
         if entry is None:
             from .kernels.c import is_available
 
@@ -476,8 +569,7 @@ class LowRankSumParams(ExternalSumParams):
         from .kernels.c import get_module
         mod = get_module()
 
-        entry = self._bw_plan[id(layer)]
-        block_size, ch_block_size, ext_base, batch_size, state = entry
+        block_size, ch_block_size, ext_base, batch_size, state = layer._lr_bw_state
 
         try:
             ext = kwargs.get(_buffer_kwarg(), None)

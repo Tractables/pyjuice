@@ -259,3 +259,63 @@ def test_tie_external_gradient_sums_over_timesteps():
         rel = abs(num - ana) / max(abs(num), abs(ana), 1e-9)
 
         assert rel < 0.15, f"shared gradient: finite-diff {num:.6f} vs analytic {ana:.6f} (rel {rel:.3f})"
+
+
+def test_tie_external_shared_owner_across_layers():
+    """
+    `tie_external` where two copies share a LAYER while their source sits in a different one.
+
+    The compiled `xu`/`xv` offsets are built per layer, so this is the case where "share with the owner"
+    has to mean the owner wherever it lives -- not just an owner among this layer's own nodes. Getting it
+    wrong made the two copies address different slots while the circuit had given them the same one,
+    reading past the end of the staging buffer. The symptom was data-dependent: it returned the right
+    answer whenever the memory beyond the buffer happened to hold the same factors from an earlier run,
+    which is why this is checked against the per-node path rather than against a golden value.
+    """
+    device = torch.device("cuda:0")
+    batch_size, num_latents, rank = 32, 64, 4
+
+    def build(tie_external):
+        torch.manual_seed(0)
+        with juice.set_block_size(num_latents):
+            ni = [inputs(v, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_EMITS))
+                  for v in range(4)]
+            # `src` at depth 1; `nsa` and `nsc` both at depth 2, so they group into one layer
+            src = summate(multiply(ni[0]), num_node_blocks = 1,
+                          external_params = LowRankSumParams(rank = rank,
+                                                             tie_external = tie_external))
+            nsb = src.duplicate(multiply(ni[3]), tie_params = True)
+            nsa = src.duplicate(multiply(ni[1], src), tie_params = True)
+            nsc = src.duplicate(multiply(ni[2], nsb), tie_params = True)
+            root = summate(multiply(nsa, nsc), num_node_blocks = 1, block_size = 1)
+
+        torch.manual_seed(0)
+        root.init_parameters(perturbation = 2.0)
+        return root, [src, nsb, nsa, nsc]
+
+    torch.manual_seed(5)
+    data = torch.randint(0, NUM_EMITS, [batch_size, 4], device = device)
+
+    out = {}
+    for tie_external in (False, True):
+        root, nss = build(tie_external)
+        pc = juice.compile(root, verbose = False).to(device)
+
+        torch.manual_seed(1)
+        shape_u, shape_v = nss[0].external_params.tensor_shapes(nss[0], batch_size)
+        U = torch.randn(shape_u, device = device) - 1.0
+        V = torch.randn(shape_v, device = device) - 1.0
+
+        # Shared: supplied once for the owner. Per-node: the same factors at every node, so the two
+        # must agree exactly.
+        ext = {nss[0]: (U, V)} if tie_external else {ns: (U, V) for ns in nss}
+
+        pc(data, sum_external_params = ext)
+        out[tie_external] = [pc.node_mars[slice(*ns._output_ind_range), :].clone() for ns in nss]
+
+        del pc
+        torch.cuda.empty_cache()
+
+    for name, a, b in zip(("src", "nsb", "nsa", "nsc"), out[True], out[False]):
+        assert torch.equal(a, b), \
+            f"{name}: shared factors disagree with per-node ones, max {float((a - b).abs().max())}"
