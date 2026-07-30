@@ -74,8 +74,10 @@ def _dense_reference(pc, ns, U, V, element_mars, log_s1 = None):
     block_size, ch_block_size = ns.block_size, ns.ch_block_size
     batch_size = element_mars.size(1)
 
-    # [edge block, parent, child] -> the shared parameter tile of each edge block
-    theta_blocks = pc.get_node_params(ns).double().to(device)
+    # [edge block, parent, child] -> the shared parameter tile of each edge block. A tied `ns` holds no
+    # parameters of its own (`get_node_params` returns None for it by design), so resolve to the source
+    # it shares them with -- that is the whole point of tying, and it is what the kernel reads via `pids`.
+    theta_blocks = pc.get_node_params(ns.get_source_ns() if ns.is_tied() else ns).double().to(device)
 
     ch_start = ns.chs[0]._output_ind_range[0]
 

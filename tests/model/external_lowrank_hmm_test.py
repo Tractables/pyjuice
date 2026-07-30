@@ -288,7 +288,7 @@ def test_lowrank_hmm_staging():
 def test_lowrank_hmm_shared_params_unaffected():
     """
     Staging external parameters must not disturb the shared model: an HMM with an external transition
-    and no factors supplied is the plain HMM, bit for bit, through forward, backward and EM.
+    and no factors supplied is the plain HMM through forward, backward and EM, to float32 rounding.
     """
 
     device = torch.device("cuda:0")
@@ -302,17 +302,23 @@ def test_lowrank_hmm_shared_params_unaffected():
     torch.manual_seed(6)
     data = torch.randint(0, NUM_EMITS, [BATCH_SIZE, SEQ_LENGTH]).to(device)
 
-    assert torch.equal(pc_plain(data), pc_ext(data))
+    # NOT bit equality. The external signature is part of the layer-grouping key, so the two circuits
+    # group differently and pyjuice may pick a different kernel implementation for the transition -- its
+    # CUDA fast path versus the Triton one, chosen by a runtime autotune. MEASURED difference: 9.5e-07 at
+    # a log-likelihood of ~12.5, i.e. exactly one float32 ULP.
+    assert torch.allclose(pc_plain(data), pc_ext(data), atol = 1e-5, rtol = 1e-5)
 
     pc_plain.backward(data)
     pc_ext.backward(data)
 
-    assert torch.equal(pc_plain.param_flows, pc_ext.param_flows)
+    # Same reason as the forward, plus a flow accumulation order that differs between the two kernel
+    # implementations. MEASURED at 3.7e-08 absolute on a 2.8e-01 scale, i.e. float32 rounding.
+    assert torch.allclose(pc_plain.param_flows, pc_ext.param_flows, atol = 1e-6, rtol = 1e-4)
 
     pc_plain.mini_batch_em(step_size = 0.5, pseudocount = 0.01)
     pc_ext.mini_batch_em(step_size = 0.5, pseudocount = 0.01)
 
-    assert torch.equal(pc_plain.params, pc_ext.params)
+    assert torch.allclose(pc_plain.params, pc_ext.params, atol = 1e-6, rtol = 1e-4)
 
 
 def test_lowrank_hmm_forward_matches_reference():
@@ -353,6 +359,50 @@ def test_lowrank_hmm_forward_matches_reference():
 
     assert torch.all(torch.abs(reference_lls - lls) < 1e-4)
     assert not torch.allclose(lls, baseline_lls)
+
+
+def test_lowrank_hmm_distinct_per_timestep():
+    """
+    A correction that DIFFERS per timestep.
+
+    This is the case that catches a wrong staging offset: passing the same factors to every copy makes
+    every slot hold identical data, so reading the wrong one still gives the right answer. Only
+    distinct factors per copy expose it.
+    """
+
+    device = torch.device("cuda:0")
+
+    batch_size = 64
+
+    pc_plain, _, trans_plain = _compiled(external = False)
+    pc_ext, _, trans_ext = _compiled(external = True)
+
+    copies = list(pc_ext.external_params_nodes)
+
+    torch.manual_seed(21)
+    data = torch.randint(0, NUM_EMITS, [batch_size, SEQ_LENGTH]).to(device)
+
+    # One distinct factor pair per timestep
+    _, per_step = _router_factors(batch_size, len(copies), seed = 22)
+    mapping = {ns: (tensors[0].contiguous(), tensors[1].contiguous())
+               for ns, tensors in zip(copies, per_step)}
+
+    kernel_lls = pc_ext(data, sum_external_params = mapping)
+
+    applicable = LowRankSumParams._kernel_applicable
+    try:
+        LowRankSumParams._kernel_applicable = lambda *args, **kwargs: False
+        torch_lls = pc_ext(data, sum_external_params = mapping)
+    finally:
+        LowRankSumParams._kernel_applicable = applicable
+
+    assert torch.all(torch.abs(kernel_lls - torch_lls) < 1e-4)
+
+    # Every timestep's factors must actually matter: perturbing just one changes the answer
+    perturbed = dict(mapping)
+    perturbed[copies[-1]] = (mapping[copies[-1]][0] + 1.0, mapping[copies[-1]][1])
+
+    assert not torch.allclose(pc_ext(data, sum_external_params = perturbed), kernel_lls)
 
 
 def test_lowrank_hmm_kernel_matches_torch_reference():
