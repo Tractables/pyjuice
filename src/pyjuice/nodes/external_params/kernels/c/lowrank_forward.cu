@@ -288,7 +288,7 @@ void lowrank_backward(torch::Tensor node_flows, torch::Tensor element_flows,
                       torch::Tensor p_lp, torch::Tensor p_lq,
                       torch::Tensor log_p, torch::Tensor log_q,
                       int64_t block_size, int64_t ch_block_size, int64_t rank, int64_t ext_base,
-                      int64_t tile_n, int64_t tile_c, int64_t tb);
+                      int64_t tile_n, int64_t tile_c, int64_t tb, bool accumulate);
 
 void lowrank_shift_logz(torch::Tensor node_mars, torch::Tensor nids, torch::Tensor log_z,
                         int64_t block_size, double sign);

@@ -633,15 +633,29 @@ class TensorCircuit(nn.Module):
         if layout is not None:
             return layout
 
+        # Two passes so that a node may share another node's slots (see
+        # `ExternalSumParams.storage_owner`): allocate for the owners first, then alias the rest onto
+        # them. Aliased nodes still appear in the map, so the layers and kernels need no special case --
+        # they look up their own `ns` and simply find the same memory.
         offset = 0
         ns2slots = dict()
         for ns in self.external_params_nodes:
+            if ns.external_params.storage_owner(ns) is not ns:
+                continue
+
             slots = []
             for shape in ns.external_params.storage_shapes(ns, batch_size):
                 slots.append((offset, tuple(shape)))
                 offset += math.prod(shape)
 
             ns2slots[ns] = slots
+
+        for ns in self.external_params_nodes:
+            owner = ns.external_params.storage_owner(ns)
+            if owner is not ns:
+                assert owner in ns2slots, \
+                    f"`storage_owner` of {ns} is not itself an external-parameter node of this circuit."
+                ns2slots[ns] = ns2slots[owner]
 
         layout = (offset, ns2slots)
         self._external_params_layouts[batch_size] = layout
@@ -714,9 +728,16 @@ class TensorCircuit(nn.Module):
         torch._foreach_copy_(dsts, srcs)
 
         # Nodes the caller did NOT supply keep whatever the buffer held; drop them so a layer sees
-        # exactly the set that was staged
+        # exactly the set that was staged.
+        #
+        # Membership is by STORAGE GROUP, not by node: when several nodes share one set of tensors (see
+        # `ExternalSumParams.storage_owner`) the caller supplies them once, and every node in that group
+        # is staged. Comparing node-by-node would keep only the one that was named and silently turn the
+        # rest into plain sum layers -- correct-looking output with the correction applied to one
+        # timestep out of many.
+        supplied_groups = {ns.external_params.storage_owner(ns) for ns in ns2tensors}
         for ns in list(views.keys()):
-            if ns not in ns2tensors:
+            if ns.external_params.storage_owner(ns) not in supplied_groups:
                 del views[ns]
 
         kwargs[EXTERNAL_PARAMS_KWARG] = views

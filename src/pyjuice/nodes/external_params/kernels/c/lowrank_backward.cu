@@ -48,7 +48,7 @@ __global__ void lowrank_bw_v_kernel(
         const int64_t* __restrict__ nids, const int64_t* __restrict__ xv,
         float* __restrict__ grad_ext, float* __restrict__ p_lp, float* __restrict__ p_lq,
         int batch_size, int num_eblks, int block_size, int rank,
-        int n_ntiles, int tile_n, long ext_base, int TB) {
+        int n_ntiles, int tile_n, long ext_base, int TB, int accumulate) {
 
     const int re = blockIdx.x;                    // row * num_eblks + edge block
     const int nt = blockIdx.y;                    // node tile
@@ -118,11 +118,21 @@ __global__ void lowrank_bw_v_kernel(
         const long vo = (xv_v + (long)n * rank + r) * batch_size + b;
         const float v = ext[vo];
 
-        // Each (n, r, b) is touched by exactly one thread (nids partition the nodes), so a plain store
-        // is safe and avoids reading a gradient buffer that is as large as `V` itself. Kept in the
-        // exponent rather than forming `f` first, so a tiny flow does not lose the factor.
+        // Kept in the exponent rather than forming `f` first, so a tiny flow does not lose the factor.
         const float lfv = lf + v;
-        grad_ext[vo] = safe_exp_diff(lfv + lw, lt) - safe_exp_diff(lfv + la, lz);
+        const float g = safe_exp_diff(lfv + lw, lt) - safe_exp_diff(lfv + la, lz);
+
+        // A plain STORE is correct when this node owns its factors: `nids` partition the nodes, so each
+        // (n, r, b) is touched exactly once, and it avoids reading a gradient buffer as large as `V`.
+        // When several nodes SHARE one factor pair, every one of them contributes to the same gradient,
+        // so it has to accumulate. Layers run sequentially and each element is still written once per
+        // layer, so a plain read-modify-write suffices -- no atomics -- and the buffer is zeroed once
+        // per backward pass, which is the precondition this relies on.
+        if (accumulate) {
+            grad_ext[vo] += g;
+        } else {
+            grad_ext[vo] = g;
+        }
 
         lse_add(acc_p[w], safe_log_diff(lfv, lt));
         lse_add(acc_q[w], safe_log_diff(lfv, lz));
@@ -181,7 +191,7 @@ __global__ void lowrank_bw_u_kernel(
         const int64_t* __restrict__ cids, const int64_t* __restrict__ xu,
         float* __restrict__ grad_ext, float* __restrict__ element_flows,
         int batch_size, int num_edges, int num_eblks, int ch_block_size, int rank,
-        int tile_c, long ext_base, int TB) {
+        int tile_c, long ext_base, int TB, int accumulate) {
 
     const int re = blockIdx.x;
     const int ct = blockIdx.y;
@@ -214,8 +224,16 @@ __global__ void lowrank_bw_u_kernel(
         const float u = ext[uo];
 
         // The positive term is both dLL/dU's first part and this child's share of the flow
-        grad_ext[uo] = expf(u + e + lp) - expf(u + lq);
-        lse_add(log_corr, u + e + lp);
+        const float log_t1 = u + e + lp;                   // LOG space -- `log_corr` accumulates logs
+        const float g = expf(log_t1) - expf(u + lq);
+
+        if (accumulate) {                          // see the note in pass A
+            grad_ext[uo] += g;
+        } else {
+            grad_ext[uo] = g;
+        }
+
+        lse_add(log_corr, log_t1);
     }
 
     // Atomic because several parent blocks may share a child block: unlike `node_mars` in the forward,
@@ -266,7 +284,7 @@ void lowrank_backward(torch::Tensor node_flows, torch::Tensor element_flows,
                       torch::Tensor p_lp, torch::Tensor p_lq,
                       torch::Tensor log_p, torch::Tensor log_q,
                       int64_t block_size, int64_t ch_block_size, int64_t rank, int64_t ext_base,
-                      int64_t tile_n, int64_t tile_c, int64_t tb) {
+                      int64_t tile_n, int64_t tile_c, int64_t tb, bool accumulate) {
 
     const int batch_size = node_flows.size(1);
     const int rows = xu.size(0);
@@ -285,7 +303,7 @@ void lowrank_backward(torch::Tensor node_flows, torch::Tensor element_flows,
         nids.data_ptr<int64_t>(), xv.data_ptr<int64_t>(),
         grad_ext.data_ptr<float>(), p_lp.data_ptr<float>(), p_lq.data_ptr<float>(),
         batch_size, num_eblks, (int)block_size, (int)rank,
-        n_ntiles, (int)tile_n, (long)ext_base, (int)tb);
+        n_ntiles, (int)tile_n, (long)ext_base, (int)tb, accumulate ? 1 : 0);
 
     const int n_outputs = rows * num_eblks * (int)rank * batch_size;
     lowrank_bw_pq_reduce_kernel<<<bw_cdiv(n_outputs * 32, 256), 256, 0, stream>>>(
@@ -301,5 +319,5 @@ void lowrank_backward(torch::Tensor node_flows, torch::Tensor element_flows,
         cids.data_ptr<int64_t>(), xu.data_ptr<int64_t>(),
         grad_ext.data_ptr<float>(), element_flows.data_ptr<float>(),
         batch_size, num_edges, num_eblks, (int)ch_block_size, (int)rank,
-        (int)tile_c, (long)ext_base, (int)tb);
+        (int)tile_c, (long)ext_base, (int)tb, accumulate ? 1 : 0);
 }

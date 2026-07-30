@@ -307,6 +307,12 @@ class ExternalParamsSumLayer(SumLayer):
         # shapes at `batch_size = 1` gives sizes in per-batch units directly.
         unit_base, ns2unit = 0, dict()
         for ns in self.nodes:
+            # Nodes that share storage share their offsets too, and must not advance the cursor
+            owner = ns.external_params.storage_owner(ns)
+            if owner is not ns and owner in ns2unit:
+                ns2unit[ns] = ns2unit[owner]
+                continue
+
             slots = []
             for shape in ns.external_params.storage_shapes(ns, 1):
                 slots.append(unit_base)

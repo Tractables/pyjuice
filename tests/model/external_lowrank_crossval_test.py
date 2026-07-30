@@ -28,8 +28,9 @@ from pyjuice.nodes import LowRankSumParams
 NUM_EMITS = 5
 
 
-def _build(seq_length, num_latents, rank, external, seed = 0):
-    """An HMM whose transition is either external+tied (A) or plain and untied per timestep (B)."""
+def _build(seq_length, num_latents, rank, external, seed = 0, tie_external = False,
+           tie_plain = False):
+    """An HMM whose transition is either external+tied (A) or plain (B, tied only if `tie_plain`)."""
 
     torch.manual_seed(seed)
 
@@ -44,8 +45,13 @@ def _build(seq_length, num_latents, rank, external, seed = 0):
             if external:
                 # One tied transition, as the real model would have
                 ns = summate(cur, num_node_blocks = 1,
-                             external_params = LowRankSumParams(rank = rank)) \
+                             external_params = LowRankSumParams(rank = rank,
+                                                                tie_external = tie_external)) \
                      if not transitions else transitions[0].duplicate(cur, tie_params = True)
+            elif tie_plain:
+                # One shared matrix suffices when the factors are shared across timesteps
+                ns = summate(cur, num_node_blocks = 1) if not transitions \
+                     else transitions[0].duplicate(cur, tie_params = True)
             else:
                 # Untied: every timestep needs its own materialized matrix
                 ns = summate(cur, num_node_blocks = 1)
@@ -151,3 +157,105 @@ if __name__ == "__main__":
     test_lowrank_crossvalidates_materialized_pc(4, 64, 4)
     test_lowrank_crossvalidates_materialized_pc(5, 32, 8)
     print("cross-validation OK")
+
+
+@pytest.mark.parametrize("seq_length,num_latents,rank", [(4, 64, 4), (5, 32, 8)])
+def test_tie_external_crossvalidates_materialized_pc(seq_length, num_latents, rank):
+    """
+    Same oracle, with `tie_external`: ONE factor pair shared by every timestep.
+
+    Because the effective matrix is then the same at every timestep, the materialized reference is an
+    ordinary TIED HMM -- which also means this test would fail loudly if the shared factors were being
+    applied to only one timestep, or to the wrong one.
+    """
+    device = torch.device("cuda:0")
+    batch_size, sample = 32, 5
+
+    root_a, trans_a = _build(seq_length, num_latents, rank, external = True, tie_external = True)
+    root_b, trans_b = _build(seq_length, num_latents, rank, external = False, tie_plain = True)
+
+    pc_a = juice.compile(root_a, verbose = False).to(device)
+    pc_b = juice.compile(root_b, verbose = False).to(device)
+
+    pc_b.input_layer_group.layers[0].params.copy_(pc_a.input_layer_group.layers[0].params)
+    _set_node_params(pc_b, root_b, pc_a.get_node_params(root_a))
+
+    torch.manual_seed(3)
+    data = torch.randint(0, NUM_EMITS, [batch_size, seq_length], device = device)
+
+    src = trans_a[0]
+    num_edge_blocks = src.edge_ids.size(1)
+    U = torch.randn([batch_size, num_edge_blocks, src.ch_block_size, rank], device = device) - 1.0
+    V = torch.randn([batch_size, num_edge_blocks, src.block_size, rank], device = device) - 1.0
+
+    # Supplied ONCE, for the owner; every tied copy reads the same slots
+    ext = {src: (U, V)}
+
+    theta = pc_a.get_node_params(src)
+    _set_node_params(pc_b, trans_b[0], _effective_params(theta, U[sample], V[sample]))
+
+    lls_a = pc_a(data, sum_external_params = ext)
+    lls_b = pc_b(data[sample:sample + 1, :])
+
+    assert torch.abs(lls_a[sample] - lls_b[0]) < 2e-3, \
+        f"forward: A {lls_a[sample].item()} vs materialized B {lls_b[0].item()}"
+
+    pc_a.init_param_flows(flows_memory = 0.0)
+    pc_b.init_param_flows(flows_memory = 0.0)
+    pc_a.backward(data, allow_modify_flows = False)
+    pc_b.backward(data[sample:sample + 1, :], allow_modify_flows = False)
+
+    for ns_a, ns_b in zip(trans_a, trans_b):
+        ma = pc_a.node_mars[slice(*ns_a._output_ind_range), sample]
+        mb = pc_b.node_mars[slice(*ns_b._output_ind_range), 0]
+        assert torch.all(torch.abs(ma - mb) < 2e-3)
+
+        fa = pc_a.node_flows[slice(*ns_a._output_ind_range), sample].exp()
+        fb = pc_b.node_flows[slice(*ns_b._output_ind_range), 0].exp()
+        assert torch.all(torch.abs(fa - fb) < 2e-3)
+
+
+def test_tie_external_gradient_sums_over_timesteps():
+    """
+    A shared factor influences every timestep, so its gradient must be the SUM of the per-timestep
+    contributions -- which is what makes the accumulate (rather than store) in the backward necessary.
+    Checked against a central finite difference of the circuit's own log-likelihood.
+    """
+    device = torch.device("cuda:0")
+    seq_length, num_latents, rank, batch_size = 5, 64, 4, 32
+
+    root, trans = _build(seq_length, num_latents, rank, external = True, tie_external = True)
+    pc = juice.compile(root, verbose = False).to(device)
+
+    torch.manual_seed(4)
+    data = torch.randint(0, NUM_EMITS, [batch_size, seq_length], device = device)
+
+    src = trans[0]
+    E = src.edge_ids.size(1)
+    U = torch.randn([batch_size, E, src.ch_block_size, rank], device = device) - 1.0
+    V = torch.randn([batch_size, E, src.block_size, rank], device = device) - 1.0
+    ext = {src: (U, V)}
+
+    pc.init_param_flows(flows_memory = 0.0)
+    pc(data, sum_external_params = ext)
+    pc.backward(data, allow_modify_flows = False)
+    gu, gv = (g.clone() for g in pc.get_external_params_grad(src))
+
+    eps = 1e-2
+    for tensor, grad in ((U, gu), (V, gv)):
+        flat = grad.abs().flatten()
+        idx = torch.unravel_index(torch.topk(flat, 1).indices[0], grad.shape)
+        idx = tuple(int(i) for i in idx)
+
+        base = tensor[idx].item()
+        tensor[idx] = base + eps
+        lp = pc(data, sum_external_params = ext).sum().item()
+        tensor[idx] = base - eps
+        lm = pc(data, sum_external_params = ext).sum().item()
+        tensor[idx] = base
+
+        num = (lp - lm) / (2 * eps)
+        ana = grad[idx].item()
+        rel = abs(num - ana) / max(abs(num), abs(ana), 1e-9)
+
+        assert rel < 0.15, f"shared gradient: finite-diff {num:.6f} vs analytic {ana:.6f} (rel {rel:.3f})"

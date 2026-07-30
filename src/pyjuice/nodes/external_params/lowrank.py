@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import warnings
+
 import torch
 from typing import Any, Optional, Tuple
 
@@ -88,7 +90,8 @@ class LowRankSumParams(ExternalSumParams):
 
     def __init__(self, rank: int, tile_m: Optional[int] = None, tile_b: Optional[int] = None,
                  tile_c: Optional[int] = None, tile_bc: Optional[int] = None,
-                 tile_n: Optional[int] = None, variant: Optional[str] = None):
+                 tile_n: Optional[int] = None, variant: Optional[str] = None,
+                 tie_external: bool = False):
         super(LowRankSumParams, self).__init__()
 
         assert isinstance(rank, int) and rank >= 1, f"`rank` must be a positive integer, got {rank}."
@@ -105,6 +108,12 @@ class LowRankSumParams(ExternalSumParams):
         # knob: on a dense transition the reduction axis is the only wide one, so the tile size sets how
         # many blocks the kernel gets. MEASURED: too large and the grid is a few dozen blocks on 188 SMs.
         self.tile_n = tile_n
+
+        # Share ONE factor pair across every copy of a tied node, instead of one per copy. For a chain
+        # like an HMM that divides the unique factor data by the number of timesteps -- which also brings
+        # it inside L2, turning the per-timestep re-reads into cache hits -- at the cost of accumulating
+        # the gradient across copies rather than storing it.
+        self.tie_external = bool(tie_external)
 
         # Scratch for the multi-launch variants, keyed by name and reused across calls. One descriptor is
         # shared by every node that uses it (all 31 timesteps of a tied HMM chain), and the launches are
@@ -137,15 +146,24 @@ class LowRankSumParams(ExternalSumParams):
         # through a small global scratch (`"scratch"`, two launches). They compute the SAME quantity;
         # this only trades redundancy against parallelism, and the best choice is shape-dependent and
         # still being measured -- so the default stays the structure that is currently validated.
-        assert variant is None or variant in ("grid", "hoist", "scratch", "split", "split2",
-                                              "noop", "cuda"), f"Unknown variant {variant}."
+        assert variant is None or variant in ("cuda", "split2"), \
+            f"Unknown variant {variant}; expected None (auto), \"cuda\" or \"split2\"."
 
         # `None` means auto: the CUDA path when its toolchain is available, else the best Triton form.
         # Only the CUDA path stages logW / logA / logZ, so it is also what the backward requires.
         self.variant = variant
 
     def get_signature(self) -> str:
-        return f"LowRank_r{self.rank}"
+        # `tie_external` changes the storage layout, so nodes that disagree about it must not share a
+        # layer -- putting it in the signature is what keeps them apart.
+        return f"LowRank_r{self.rank}_tied" if self.tie_external else f"LowRank_r{self.rank}"
+
+    def storage_owner(self, ns):
+        """With `tie_external`, every copy of a tied node reads one shared factor pair -- the source's."""
+        if self.tie_external and ns.is_tied():
+            return ns.get_source_ns()
+
+        return ns
 
     def tensor_shapes(self, ns, batch_size: int):
         num_edge_blocks = ns.edge_ids.size(1)
@@ -363,7 +381,19 @@ class LowRankSumParams(ExternalSumParams):
 
         if self._auto_variant is None:
             from .kernels.c import is_available
-            self._auto_variant = "cuda" if is_available() else "split2"
+
+            if is_available():
+                self._auto_variant = "cuda"
+            else:
+                # The forward degrades silently to Triton, but the BACKWARD has no Triton implementation
+                # -- and it is the CUDA forward that stages logW / logA / logZ for it. Say so now rather
+                # than at the first `backward()`, which is a long way from the cause.
+                warnings.warn(
+                    "pyjuice: the low-rank CUDA extension is unavailable, so the forward will use the "
+                    "Triton fallback and the BACKWARD will not be available for external low-rank "
+                    "parameters. This usually means `nvcc` or `ninja` is not on PATH -- check the "
+                    "compile warning above.", RuntimeWarning)
+                self._auto_variant = "split2"
 
         return self._auto_variant
 
@@ -411,9 +441,21 @@ class LowRankSumParams(ExternalSumParams):
 
         entry = self._bw_plan.get(id(layer), None)
         if entry is None:
+            from .kernels.c import is_available
+
+            if not is_available():
+                raise NotImplementedError(
+                    "The low-rank backward requires the CUDA extension, which is unavailable on this "
+                    "system (usually `nvcc` or `ninja` not on PATH). The forward runs on the Triton "
+                    "fallback, but only the CUDA forward stages logW / logA / logZ, and there is no "
+                    "Triton backward."
+                )
+
             raise NotImplementedError(
-                "The low-rank backward requires the CUDA forward (`LowRankSumParams(variant='cuda')`) "
-                "to have run on this layer, which is what stages logW / logA / logZ."
+                f"The low-rank backward did not run on this layer because the CUDA forward kernel does "
+                f"not apply to its shape. It requires a single child block size, a power-of-two rank "
+                f"<= 64 (got {self.rank}), block_size >= 16, ch_block_size >= 16, and batch >= 16, with "
+                f"external parameters supplied for every node of the layer."
             )
         from .kernels.c import get_module
         mod = get_module()
@@ -464,6 +506,7 @@ class LowRankSumParams(ExternalSumParams):
                         self._alloc("log_p", slots * batch_size),
                         self._alloc("log_q", slots * batch_size),
                         block_size, ch_block_size, self.rank, ext_base, tile_n, tile_c, tb,
+                        self.tie_external,
                     )
         finally:
             for nids, _, _, _, _, _, log_z in state:

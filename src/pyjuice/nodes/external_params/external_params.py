@@ -42,6 +42,18 @@ class ExternalSumParams():
         """
         raise NotImplementedError()
 
+    def storage_owner(self, ns):
+        """
+        The node whose staging slots `ns` uses.
+
+        Identity by default: every node gets its own slots. A parameterization may return a DIFFERENT
+        node to make several nodes share one set of external tensors -- e.g. along a parameter-tying
+        relation, so one factor pair serves every copy of a tied layer. Sharing changes two things for
+        the caller: tensors are supplied once, for the owner, and the gradient returned for the owner is
+        the SUM over every node that shares it.
+        """
+        return ns
+
     def validate_ns(self, ns) -> None:
         """
         Check that `ns` is compatible with this parameterization. Called once, at node construction.
