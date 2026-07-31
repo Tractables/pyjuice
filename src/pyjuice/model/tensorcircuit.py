@@ -710,8 +710,235 @@ class TensorCircuit(nn.Module):
 
         buffer = self.__dict__[name]
 
-        return {ns: tuple(buffer[offset:offset + math.prod(shape)].view(shape) for offset, shape in slots)
-                for ns, slots in ns2slots.items()}
+        # Building these is pure Python -- one slice and one view per node -- and it runs on every
+        # forward. On a 32-timestep gated HMM it was 67 us of the 111 us the whole staging cost, six
+        # times what the copy itself takes, so it is cached. The views depend only on the layout (fixed
+        # per batch size) and the buffer's identity, so the check is `is` against the tensor the
+        # allocation just returned: a reallocation -- a new batch size, a `.to(device)` -- hands back a
+        # different object and rebuilds. `_init_buffer` still runs every time, since it is also what
+        # zeroes the gradient buffer.
+        #
+        # The returned dict is SHARED between calls. Both callers copy it into a `StagedExternalParams`
+        # before deleting entries, so nothing mutates it; a new caller must do the same.
+        key = (name, batch_size)
+        cached = self._external_params_views_cache.get(key)
+        if cached is not None and cached[0] is buffer:
+            return cached[1]
+
+        views = {ns: tuple(buffer[offset:offset + math.prod(shape)].view(shape)
+                           for offset, shape in slots)
+                 for ns, slots in ns2slots.items()}
+        self._external_params_views_cache[key] = (buffer, views)
+        return views
+
+    def register_external_params_group(self, name: str, nodes: Sequence[CircuitNodes],
+                                       dim: int = 1) -> None:
+        """
+        Address several nodes' external parameters with ONE concatenated tensor, under a name.
+
+        Nodes that share a parameterization usually share a shape too -- an HMM's per-timestep
+        transitions being the case this exists for -- and a head producing them naturally emits one
+        tensor already. Without a group the caller has to slice that tensor apart before every call,
+        once per node, only for the PC to copy each piece separately.
+
+        Once registered, the name is usable wherever an `ns` key is:
+
+        .. code-block:: python
+
+            pc.register_external_params_group("router", [t0, t1, t2])
+            pc(x, sum_external_params = {"router": phi})        # phi: [B, 3 * Nk, Ck]
+
+        and may be mixed freely with per-node entries in the same dict.
+
+        Members are split along `dim` by their OWN extents, so they need not have equal shapes there --
+        only on every other axis. Nothing is copied: each member receives a view.
+
+        :note: order is significant. `nodes[i]` receives the i-th slice, so the list is the contract.
+
+        :note: for a parameterization with several tensors per node (low-rank factors, say) the value
+               is a tuple of concatenated tensors, one per slot, each split the same way.
+
+        :param name: the key to use in `sum_external_params`
+        :type name: str
+
+        :param nodes: the nodes this group addresses, in slice order
+        :type nodes: Sequence[CircuitNodes]
+
+        :param dim: axis of the concatenation. Defaults to 1, the first non-batch axis; `0` is the
+                    batch and is rejected.
+        :type dim: int
+        """
+        assert isinstance(name, str) and name != "", "An external-parameter group needs a non-empty name."
+        assert name not in self.external_params_groups, \
+            f"External-parameter group '{name}' is already registered."
+        assert len(nodes) > 0, f"External-parameter group '{name}' is empty."
+        assert dim != 0, \
+            "`dim = 0` is the batch axis; a group concatenates along a PARAMETER axis (default 1)."
+
+        seen = set()
+        for ns in nodes:
+            assert ns in self.external_params_nodes, \
+                f"External-parameter group '{name}' contains a node this PC did not compile with an " \
+                f"external parameterization. Construct it with `pyjuice.summate(..., external_params = ...)`."
+            if id(ns) in seen:
+                raise AssertionError(f"External-parameter group '{name}' lists the same node twice.")
+            seen.add(id(ns))
+
+        sigs = {ns.external_params.get_signature() for ns in nodes}
+        assert len(sigs) == 1, \
+            f"External-parameter group '{name}' mixes parameterizations {sigs}; one concatenated " \
+            f"tensor cannot serve nodes whose layouts differ."
+
+        # Members that SHARE storage (a tied node and its copies) are fed once, by the owner. Handing
+        # such a pair two different slices is a contradiction, and silently letting one win would apply
+        # the wrong gate to the other -- so it is rejected here rather than resolved arbitrarily.
+        owners = [ns.external_params.storage_owner(ns) for ns in nodes]
+        if len(set(id(o) for o in owners)) != len(owners):
+            raise AssertionError(
+                f"External-parameter group '{name}' contains nodes that share one external tensor "
+                f"(`tie_external`). They are supplied once, through the storage owner, so they cannot "
+                f"also take separate slices of a concatenated tensor."
+            )
+
+        # Shapes must agree everywhere except along `dim`. Checked once, at registration, on a nominal
+        # batch of 1: the shapes are affine in the batch, so the comparison holds for every batch.
+        shapes = [ns.external_params.tensor_shapes(ns, 1) for ns in nodes]
+        n_slots = len(shapes[0])
+        assert all(len(sh) == n_slots for sh in shapes), \
+            f"External-parameter group '{name}' mixes nodes with different numbers of tensors."
+        for slot in range(n_slots):
+            ref = list(shapes[0][slot])
+            nd = len(ref)
+            assert -nd <= dim < nd, \
+                f"`dim = {dim}` is out of range for slot {slot} of group '{name}', whose tensors " \
+                f"have {nd} axes."
+            axis = dim % nd
+            for i, sh in enumerate(shapes[1:], start = 1):
+                got = list(sh[slot])
+                if [d for a, d in enumerate(got) if a != axis] != [d for a, d in enumerate(ref) if a != axis]:
+                    raise AssertionError(
+                        f"External-parameter group '{name}': node {i}'s slot-{slot} shape {tuple(got)} "
+                        f"disagrees with node 0's {tuple(ref)} on an axis other than {axis}."
+                    )
+
+        self.external_params_groups[name] = (list(nodes), int(dim))
+
+    def unregister_external_params_group(self, name: str) -> None:
+        """Remove a group registered by :func:`register_external_params_group`."""
+        assert name in self.external_params_groups, \
+            f"No external-parameter group named '{name}'."
+        del self.external_params_groups[name]
+
+    def _group_fast_stage(self, name: str, tensors, views: dict, batch_size: int):
+        """
+        `(destination, source)` staging a WHOLE group in one transpose, or None if it cannot.
+
+        Splitting a group into per-node views is correct but costs: each slice of a batch-first
+        concatenated tensor is strided, so every member falls off the tiled-transpose path onto the
+        generic copy, and the group ends up SLOWER to stage than the per-node form it replaces.
+
+        It does not have to. When the members' slots happen to be adjacent in the staging buffer and
+        in the group's own order -- which is what compiling an HMM's transitions in depth order
+        produces -- the whole group is one contiguous destination, and `[B, sum Nk, Ck]` maps onto it
+        by exactly the transpose the fast kernel already does. One copy instead of T.
+
+        Every precondition is checked rather than assumed; anything unmet just returns None and the
+        per-member path runs.
+        """
+        nodes, dim = self.external_params_groups[name]
+
+        # `dim = 1` is what makes the concatenated axis the OUTERMOST storage axis, so that
+        # concatenating along it is the same thing as laying the members out back to back.
+        if dim != 1 or len(nodes) < 2:
+            return None
+
+        ep = nodes[0].external_params
+        perm = ep.storage_perm()
+        if not (perm is not None
+                and type(ep).to_storage is ExternalSumParams.to_storage
+                and tuple(perm) == tuple(range(1, len(perm))) + (0,)):
+            return None
+
+        if torch.is_tensor(tensors):
+            tensors = (tensors,)
+        if len(tensors) != 1:                       # one slot per node; the multi-slot case splits
+            return None
+        cat = tensors[0]
+        if not (cat.is_contiguous() and cat.dtype == torch.float32 and cat.dim() >= 3):
+            return None
+
+        base = views[nodes[0]][0]
+        buf = self.external_params
+        elem = buf.element_size()
+        total = 0
+        for ns in nodes:
+            d = views[ns][0]
+            if d.data_ptr() != base.data_ptr() + total * elem:
+                return None                          # not adjacent, or not in the group's order
+            total += d.numel()
+
+        if total != cat.numel():
+            return None
+        start = (base.data_ptr() - buf.data_ptr()) // elem
+        return buf.narrow(0, start, total), cat
+
+    def _expand_external_params_groups(self, ns2tensors: dict, batch_size: int) -> dict:
+        """
+        Replace every group-name key with one entry per member, holding a VIEW of the caller's tensor.
+
+        Splitting rather than copying is the point: the per-node staging below already accepts
+        arbitrary strides, so the views cost nothing here and the single batched copy absorbs them.
+        """
+        if not any(isinstance(k, str) for k in ns2tensors):
+            return ns2tensors
+
+        # Collected up front, because dict order is the caller's: a node supplied both directly and
+        # through a group must be caught whichever key comes first.
+        bare = {k for k in ns2tensors if not isinstance(k, str)}
+        claimed = {}
+
+        out = {}
+        for key, tensors in ns2tensors.items():
+            if not isinstance(key, str):
+                out[key] = tensors
+                continue
+
+            assert key in self.external_params_groups, \
+                f"`{EXTERNAL_PARAMS_KWARG}` names an unregistered external-parameter group: '{key}'. " \
+                f"Register it with `pc.register_external_params_group('{key}', [...])`."
+            nodes, dim = self.external_params_groups[key]
+
+            if torch.is_tensor(tensors):
+                tensors = (tensors,)
+            n_slots = len(nodes[0].external_params.tensor_shapes(nodes[0], batch_size))
+            assert len(tensors) == n_slots, \
+                f"External-parameter group '{key}' expects {n_slots} concatenated tensor(s), got " \
+                f"{len(tensors)}."
+
+            splits = []
+            for slot, cat in enumerate(tensors):
+                assert torch.is_tensor(cat), \
+                    f"External-parameter group '{key}', slot {slot}: expected a tensor, got {type(cat)}."
+                sizes = [ns.external_params.tensor_shapes(ns, batch_size)[slot] for ns in nodes]
+                axis = dim % len(sizes[0])
+                want = list(sizes[0])
+                want[axis] = sum(int(s[axis]) for s in sizes)
+                assert tuple(cat.size()) == tuple(want), \
+                    f"External-parameter group '{key}', slot {slot}: expected the concatenation of " \
+                    f"{len(nodes)} tensors along axis {axis}, i.e. shape {tuple(want)}, got " \
+                    f"{tuple(cat.size())}."
+                splits.append(torch.split(cat, [int(s[axis]) for s in sizes], dim = axis))
+
+            for i, ns in enumerate(nodes):
+                assert ns not in bare, \
+                    f"`{EXTERNAL_PARAMS_KWARG}` supplies a node both directly and through group '{key}'."
+                assert ns not in claimed, \
+                    f"`{EXTERNAL_PARAMS_KWARG}` supplies a node through two groups, "\
+                    f"'{claimed[ns]}' and '{key}'."
+                claimed[ns] = key
+                out[ns] = tuple(sp[i] for sp in splits)
+
+        return out
 
     def _stage_external_params(self, kwargs: dict, batch_size: int) -> None:
         """
@@ -738,11 +965,54 @@ class TensorCircuit(nn.Module):
             name = "external_params", batch_size = batch_size
         ))
 
+        # A group whose members land on a contiguous run of the buffer stages as ONE transpose; the
+        # rest resolve to per-node views and go through the loop below, which never learns that groups
+        # exist. Tried before the expansion because it is the concatenated tensor that is contiguous,
+        # not the slices of it.
+        # Conflicts are checked HERE, on the caller's dict, before either staging path touches it: a
+        # group taken wholesale is dropped before the expansion below, so the expansion's own check
+        # would never see it.
+        _bare = {k for k in ns2tensors if not isinstance(k, str)}
+        _claimed = {}
+        for key in ns2tensors:
+            if not isinstance(key, str):
+                continue
+            assert key in self.external_params_groups, \
+                f"`{EXTERNAL_PARAMS_KWARG}` names an unregistered external-parameter group: '{key}'. " \
+                f"Register it with `pc.register_external_params_group('{key}', [...])`."
+            for ns in self.external_params_groups[key][0]:
+                assert ns not in _bare, \
+                    f"`{EXTERNAL_PARAMS_KWARG}` supplies a node both directly and through group '{key}'."
+                assert ns not in _claimed, \
+                    f"`{EXTERNAL_PARAMS_KWARG}` supplies a node through two groups, " \
+                    f"'{_claimed[ns]}' and '{key}'."
+                _claimed[ns] = key
+
+        group_fast, group_done, fast_keys = [], set(), set()
+        for key, tensors in ns2tensors.items():
+            if not isinstance(key, str):
+                continue
+            assert key in self.external_params_groups, \
+                f"`{EXTERNAL_PARAMS_KWARG}` names an unregistered external-parameter group: '{key}'. " \
+                f"Register it with `pc.register_external_params_group('{key}', [...])`."
+            whole = self._group_fast_stage(key, tensors, views, batch_size)
+            if whole is not None:
+                group_fast.append(whole)
+                group_done.update(self.external_params_groups[key][0])
+                fast_keys.add(key)
+
+        # A group staged wholesale is dropped BEFORE the expansion: splitting it into T views and
+        # validating each, only for the loop below to skip them, was most of what was left of the cost.
+        if fast_keys:
+            ns2tensors = {k: v for k, v in ns2tensors.items() if k not in fast_keys}
+
+        ns2tensors = self._expand_external_params_groups(ns2tensors, batch_size)
+
         # Validate against the buffer's own device rather than `self.device`, which may be index-less
         # (`torch.device("cuda")`) and so compare unequal to an otherwise identical `cuda:0`
         device = self.external_params.device
 
-        dsts, srcs, fast = [], [], []
+        dsts, srcs, fast = [], [], list(group_fast)
         for ns, tensors in ns2tensors.items():
             tensors = validate_external_tensors(
                 ns, ns.external_params, tensors, batch_size, device, require_contiguous = False
@@ -786,7 +1056,8 @@ class TensorCircuit(nn.Module):
         # is staged. Comparing node-by-node would keep only the one that was named and silently turn the
         # rest into plain sum layers -- correct-looking output with the correction applied to one
         # timestep out of many.
-        supplied_groups = {ns.external_params.storage_owner(ns) for ns in ns2tensors}
+        supplied_groups = {ns.external_params.storage_owner(ns)
+                           for ns in (set(ns2tensors) | group_done)}
         for ns in list(views.keys()):
             if ns.external_params.storage_owner(ns) not in supplied_groups:
                 del views[ns]
@@ -815,7 +1086,10 @@ class TensorCircuit(nn.Module):
             assert staged is not None, \
                 f"`{EXTERNAL_PARAMS_KWARG}` was given to the backward pass, but the forward pass did " \
                 f"not receive any external parameters."
-            assert set(ns2tensors.keys()) == set(staged.keys()), \
+            named = set()
+            for k in ns2tensors:
+                named.update(self.external_params_groups[k][0] if isinstance(k, str) else [k])
+            assert named == set(staged.keys()), \
                 f"`{EXTERNAL_PARAMS_KWARG}` names a different set of nodes than the forward pass did."
 
         if staged is not None:
@@ -839,6 +1113,11 @@ class TensorCircuit(nn.Module):
                 f"`{kwarg_name}` should be a dict mapping nodes to tensors, got {type(ns2tensors)}."
 
             for ns in ns2tensors:
+                if isinstance(ns, str):
+                    assert ns in self.external_params_groups, \
+                        f"`{kwarg_name}` names an unregistered external-parameter group: '{ns}'. " \
+                        f"Register it with `pc.register_external_params_group('{ns}', [...])`."
+                    continue
                 assert ns in self.external_params_nodes, \
                     f"`{kwarg_name}` contains a node that this PC did not compile with an external " \
                     f"parameterization: {ns}. Construct it with `pyjuice.summate(..., external_params = ...)`."
@@ -888,8 +1167,21 @@ class TensorCircuit(nn.Module):
         :param ns: a node that was given external parameters in the last forward pass
         :type ns: CircuitNodes
 
+        A group name registered with :func:`register_external_params_group` is also accepted, and
+        returns the members' gradients concatenated along the group's axis -- laid out exactly like the
+        tensor that was supplied. Unlike the forward, this one COPIES: the per-node gradients are views
+        into a buffer in which a group's members are not generally adjacent.
+
         :returns: a tuple of gradient tensors, matching the tensors supplied for `ns`
         """
+        if isinstance(ns, str):
+            assert ns in self.external_params_groups, f"No external-parameter group named '{ns}'."
+            nodes, dim = self.external_params_groups[ns]
+            per_node = [self.get_external_params_grad(m) for m in nodes]
+            n_slots = len(per_node[0])
+            axis = dim % per_node[0][0].dim()
+            return tuple(torch.cat([g[slot] for g in per_node], dim = axis) for slot in range(n_slots))
+
         assert self._staged_external_params_grad is not None, \
             "No external-parameter gradients are available. Run a forward pass with " \
             f"`{EXTERNAL_PARAMS_KWARG}` and then a backward pass with `compute_external_grads = True`."
@@ -1430,6 +1722,13 @@ class TensorCircuit(nn.Module):
         # matching per-sample gradients into views of the same shape
         self._staged_external_params = None
         self._staged_external_params_grad = None
+
+        # name -> (nodes, dim): several `ns` addressed by ONE concatenated tensor. See
+        # `register_external_params_group`.
+        self.external_params_groups = dict()
+
+        # (buffer name, batch size) -> (buffer, {ns: views}); see `_external_params_views`
+        self._external_params_views_cache = dict()
 
         if verbose:
             print(f"Compiling {num_layers} TensorCircuit layers...")
