@@ -897,6 +897,17 @@ class TensorCircuit(nn.Module):
             f"No external-parameter gradients for {ns}; it was not given external parameters in the " \
             f"last forward pass."
 
+        # Refused HERE rather than in the backward, because the buffer is allocated and zeroed by
+        # default (`compute_external_grads = True`): a parameterization that computes the element and
+        # parameter flows but not its own gradient would otherwise either break every backward or hand
+        # back a plausible-looking tensor of zeros.
+        if not ns.external_params.computes_external_grads:
+            raise NotImplementedError(
+                f"`{ns.external_params.get_signature()}` does not compute gradients with respect to "
+                f"its own parameters yet. The element and parameter flows it contributes ARE computed, "
+                f"so `pc.backward()` and the EM optimizers work; only this read is unavailable."
+            )
+
         grad_tensors = self._staged_external_params_grad[ns]
 
         # Stored in the kernels' layout; hand them back in the caller's, so they line up

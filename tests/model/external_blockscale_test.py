@@ -546,6 +546,185 @@ def test_unsupported_shapes_raise(num_latents, block_size, batch, gate_bs, why):
         pc(data, sum_external_params = {ns: phi})
 
 
+# --------------------------------------------------------------------------------- backward
+
+def _ch_element_ids(ns):
+    """Global `element_mars` row of each child block's first element, indexed by `edge_ids[1]`.
+
+    Derived here from `_output_ind_range` rather than read off the layer, so the reference does not
+    inherit the layer's own view of where a child block lives."""
+    out = torch.zeros([ns.num_ch_node_blocks], dtype = torch.long)
+    cum = 0
+    for cs in ns.chs:
+        out[cum:cum + cs.num_node_blocks] = (cs._output_ind_range[0]
+                                             + torch.arange(cs.num_node_blocks) * ns.ch_block_size)
+        cum += cs.num_node_blocks
+    return out
+
+
+def _flow_reference(pc, ns, phi, gate_cbs, batch):
+    """
+    float64 element and parameter flows under the effective per-sample parameters.
+
+    Built from the circuit's own `node_flows` / `node_mars` / `element_mars`, which the layers ABOVE
+    this one produced and the gate does not touch, plus the definition of `theta_tilde`:
+
+        edge_flow[e,n,c,b] = exp(node_flows[n,b]) * theta_tilde[b,e,n,c]
+                             * exp(element_mars[c,b] - node_mars[n,b])
+        element_flows[c,b] = log sum_{e,n} edge_flow        (log space)
+        param_flows[e,n,c] = sum_b edge_flow
+
+    `node_mars` is the node's value under the EFFECTIVE parameters, so it already carries `1/Z`.
+    Pairing it with an unnormalized `theta` -- or with `theta_tilde` AND a `Z`-shifted `node_mars` --
+    puts a `log Z` offset on every flow, which is invisible at `phi = 1` because `Z` is then 1.
+    """
+    dev = pc.node_mars.device
+    bs, cbs = ns.block_size, ns.ch_block_size
+    E = ns.edge_ids.size(1)
+    nid0 = ns._output_ind_range[0]
+
+    theta = pc.get_node_params(ns)                                      # [E, bs, cbs]
+    ch_eids = _ch_element_ids(ns)
+    ar_n = torch.arange(bs, device = dev)
+    ar_c = torch.arange(cbs, device = dev)
+
+    ef = torch.zeros([pc.element_flows.size(0), batch], dtype = torch.float64, device = dev)
+    pf = torch.zeros([E, bs, cbs], dtype = torch.float64, device = dev)
+
+    for b in range(batch):
+        eff = _effective(theta, phi[b], ns, gate_cbs)                   # [E, bs, cbs], float64
+        for e in range(E):
+            nrows = nid0 + int(ns.edge_ids[0, e]) * bs + ar_n
+            crows = int(ch_eids[int(ns.edge_ids[1, e])]) + ar_c
+
+            f = pc.node_flows[nrows, b].double().exp()                  # [bs]
+            nm = pc.node_mars[nrows, b].double()                        # [bs]
+            em = pc.element_mars[crows, b].double()                     # [cbs]
+
+            w = f[:, None] * eff[e] * (em[None, :] - nm[:, None]).exp()
+            pf[e] += w
+            ef[crows, b] += w.sum(dim = 0)
+
+    return ef.log(), pf
+
+
+@cuda_only
+@needs_cute
+@pytest.mark.parametrize("num_latents,block_size,gate_cbs,batch,scale", [
+    (128, 128, 8, 64, 0.0),
+    (128, 128, 8, 64, 1.0),
+    (128, 128, 8, 64, 3.0),
+    (128, 128, 16, 128, 2.0),
+    (256, 128, 32, 64, 2.0),
+])
+def test_backward_matches_reference(num_latents, block_size, gate_cbs, batch, scale):
+    """`pc.backward()` against the float64 reference: both flows, gates from a no-op to a strong one.
+
+    This is the end-to-end statement that the wiring is right -- the `log Z` shift, the backward gate
+    table (which is the TRANSPOSE of the forward's indexing, one row per child block), the forward
+    table the param flows reuse, and both fork kernels."""
+    pc, root, ns, data, phi, _ = _run(num_latents, block_size, gate_cbs, batch, scale = scale)
+    pc.backward(data, flows_memory = 0.0)
+
+    ref_ef, ref_pf = _flow_reference(pc, ns, phi, gate_cbs, batch)
+
+    live = torch.isfinite(ref_ef)
+    d_ef = float((pc.element_flows[:, :batch].double()[live] - ref_ef[live]).abs().max())
+
+    ns.update_param_flows(pc.param_flows)
+    got_pf = ns.get_param_flows().double().to(ref_pf.device)
+    d_pf = float(((got_pf - ref_pf).abs() / ref_pf.clamp(min = 1e-30)).max())
+
+    # The fp16 tensor-core floor of the kernels these fork (~1e-3 log space for the element flows).
+    assert d_ef < 2e-3, f"element flows off by {d_ef}"
+    assert d_pf < 3e-3, f"param flows off by {d_pf} (relative)"
+
+
+@cuda_only
+@needs_cute
+@pytest.mark.parametrize("block_size,batch", [(128, 64), (128, 128)])
+def test_backward_with_unit_gates_matches_the_plain_pc(block_size, batch):
+    """`log phi = 0` makes the gate the identity, so every flow must match the ungated circuit's.
+
+    Necessary but NOT sufficient on its own: at `phi = 1` the normalizer is 1, so this case cannot see
+    a wrong `log Z` shift, and every gate index gives the same answer so it cannot see a wrong table.
+    `test_backward_matches_reference` covers both; this one pins the reduction."""
+    dev = torch.device("cuda:0")
+    num_latents = 128
+
+    root_a, ns_a = _build(num_latents, block_size, 8, seed = 0)
+    root_b, ns_b = _build(num_latents, block_size, None, seed = 0)
+    pc_a = juice.compile(root_a, verbose = False).to(dev)
+    pc_b = juice.compile(root_b, verbose = False).to(dev)
+
+    torch.manual_seed(7)
+    data = torch.randint(0, NUM_CATS, [batch, 2], device = dev)
+    phi = torch.zeros(_gate_shape(ns_a, batch), device = dev)
+
+    pc_a(data, sum_external_params = {ns_a: phi})
+    pc_a.backward(data, flows_memory = 0.0)
+    pc_b(data)
+    pc_b.backward(data, flows_memory = 0.0)
+
+    live = torch.isfinite(pc_b.element_flows[:, :batch])
+    d_ef = float((pc_a.element_flows[:, :batch][live] - pc_b.element_flows[:, :batch][live]).abs().max())
+
+    ns_a.update_param_flows(pc_a.param_flows)
+    ns_b.update_param_flows(pc_b.param_flows)
+    ref = ns_b.get_param_flows().double()
+    d_pf = float(((ns_a.get_param_flows().double() - ref).abs() / ref.clamp(min = 1e-30)).max())
+
+    assert d_ef < 2e-3, f"element flows differ from the ungated circuit by {d_ef}"
+    assert d_pf < 3e-3, f"param flows differ from the ungated circuit by {d_pf} (relative)"
+
+
+@cuda_only
+@needs_cute
+def test_backward_leaves_node_mars_as_the_forward_wrote_it():
+    """The backward turns `node_mars` into `log N` and must put it back.
+
+    `node_mars` is a circuit-wide buffer that later work reads, so a shift left in place would corrupt
+    everything downstream -- and by exactly `log Z`, which is 0 at `phi = 1`, so only a non-trivial
+    gate can catch it."""
+    pc, root, ns, data, phi, _ = _run(128, 128, 8, 64, scale = 2.0)
+    before = pc.node_mars.clone()
+    pc.backward(data, flows_memory = 0.0)
+
+    lo, hi = ns._output_ind_range
+    d = float((pc.node_mars[lo:hi] - before[lo:hi]).abs().max())
+    assert d == 0.0, f"node_mars was left shifted by up to {d}"
+
+
+@cuda_only
+@needs_cute
+def test_gate_gradients_are_refused_rather_than_returned_as_zeros():
+    """`d LL / d log phi` is not implemented, and the gradient buffer is allocated and zeroed by
+    default -- so the read must say so instead of handing back a plausible tensor of zeros."""
+    pc, root, ns, data, phi, _ = _run(128, 128, 8, 64, scale = 1.0)
+    pc.backward(data, flows_memory = 0.0)
+
+    with pytest.raises(NotImplementedError, match = "gradients"):
+        pc.get_external_params_grad(ns)
+
+
+@cuda_only
+@needs_cute
+def test_backward_outside_the_supported_regime_raises():
+    """The forked kernels have no Triton fallback, so a shape the standard backward would serve with
+    its own (UNGATED) kernels has to raise. A batch the CuTe element-flow kernel cannot tile is such a
+    shape -- the forward still runs, via the small-batch kernel."""
+    pc, root, ns, data, phi, _ = _run(128, 128, 8, 8, scale = 1.0)
+
+    with pytest.raises(NotImplementedError, match = "block-sparse CUDA regime"):
+        pc.backward(data, flows_memory = 0.0)
+
+    # and the interception must not survive the failure, or the next backward inherits it
+    layer = [l for g in pc.inner_layer_groups if g.is_sum() for l in g.layers
+             if hasattr(l, "external_node_infos")][0]
+    assert layer._ext_bw_ele_hook is None and layer._ext_bw_par_hook is None
+
+
+
 if __name__ == "__main__":
     test_single_gate_is_a_no_op(64, 64)
     test_matches_materialized_pc(256, 64, 8, 64)

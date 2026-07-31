@@ -300,7 +300,7 @@ class ExternalParamsSumLayer(SumLayer):
         # The tables address the buffer as `(index + within-slot offset) * batch_size + b`, which is
         # only meaningful when the storage layout is batch-innermost. A parameterization that keeps
         # the caller's order simply does not get them -- it is served by its own (torch) path.
-        self.ext_slots, self.ext_max_n_eblks = None, None
+        self.ext_slots, self.ext_max_n_eblks, self.ext_unit_bases = None, None, None
 
         for ns in self.nodes:
             if any([shape[-1] != 1 for shape in ns.external_params.storage_shapes(ns, 1)]):
@@ -329,6 +329,12 @@ class ExternalParamsSumLayer(SumLayer):
 
             owner2unit[owner] = slots
             ns2unit[ns] = slots
+
+        # Kept because a BACKWARD table is indexed by (parent block, child block) rather than by the
+        # forward's (row, edge slot), so it cannot be read off `ext_slots`. With these bases a
+        # parameterization can pair `storage_offsets(ns)` with `par_nids` / `ch_eids` directly and get
+        # the same per-batch offsets `ext_slots` holds -- one number per ns per slot, in `self.nodes` order.
+        self.ext_unit_bases = [ns2unit[ns] for ns in self.nodes]
 
         max_n_eblks = max([ns_info.max_n_eblks for ns_info in self.external_node_infos])
 
@@ -569,25 +575,33 @@ class ExternalParamsSumLayer(SumLayer):
             for ns_info, _ in ns_tensors
         ]
 
-        self.external_params.pre_backward_layer(
-            self, ns_tensors, node_flows, element_flows, node_mars, element_mars, params,
-            param_flows = param_flows, propagation_alg = propagation_alg, **kwargs
-        )
-
-        # Shared-parameter flows -- the standard kernels, untouched. Skipped entirely when the
-        # parameterization owns the flows: its effective parameters vary per edge block, and the
-        # standard kernels would sum the parents together before any correction could separate them.
-        if not self.external_params.replaces_shared_backward:
-            super(ExternalParamsSumLayer, self).backward(
-                node_flows, element_flows, node_mars, element_mars, params,
+        try:
+            self.external_params.pre_backward_layer(
+                self, ns_tensors, node_flows, element_flows, node_mars, element_mars, params,
                 param_flows = param_flows, propagation_alg = propagation_alg, **kwargs
             )
 
-        self.external_params.post_backward_layer(
-            self, ns_tensors, ns_grad_tensors,
-            node_flows, element_flows, node_mars, element_mars, params,
-            param_flows = param_flows, propagation_alg = propagation_alg, **kwargs
-        )
+            # Shared-parameter flows -- the standard kernels, untouched. Skipped entirely when the
+            # parameterization owns the flows: its effective parameters vary per edge block, and the
+            # standard kernels would sum the parents together before any correction could separate them.
+            if not self.external_params.replaces_shared_backward:
+                super(ExternalParamsSumLayer, self).backward(
+                    node_flows, element_flows, node_mars, element_mars, params,
+                    param_flows = param_flows, propagation_alg = propagation_alg, **kwargs
+                )
+
+            self.external_params.post_backward_layer(
+                self, ns_tensors, ns_grad_tensors,
+                node_flows, element_flows, node_mars, element_mars, params,
+                param_flows = param_flows, propagation_alg = propagation_alg, **kwargs
+            )
+        finally:
+            # A parameterization may redirect the standard backward's CUDA kernels at its own for the
+            # duration of this call (see `SumLayer._ext_bw_ele_hook`). Left installed after a raise
+            # they would make the NEXT backward -- possibly an ungated one -- fail or, worse, run a
+            # gated kernel against a stale plan.
+            self._ext_bw_ele_hook = None
+            self._ext_bw_par_hook = None
 
         return None
 

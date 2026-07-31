@@ -58,6 +58,13 @@ class ExternalSumParams():
     #: `replaces_shared_forward` makes it own the node values.
     replaces_shared_backward: bool = False
 
+    #: Whether the backward writes `d LL / d(external parameters)` into the gradient buffer. `True` --
+    #: the default -- is the complete parameterization. A descriptor that contributes the element and
+    #: parameter flows but not yet its own gradient sets this to `False`, which leaves `pc.backward()`
+    #: and the EM optimizers fully working and makes `pc.get_external_params_grad` say plainly that the
+    #: gradient is unavailable, rather than returning the zeroed buffer as though it were an answer.
+    computes_external_grads: bool = True
+
     def storage_owner(self, ns):
         """
         The node whose staging slots `ns` uses.

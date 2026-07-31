@@ -10,6 +10,11 @@ from .external_params import ExternalSumParams
 
 _BUFFER_KWARG = None
 
+# Packs (parent node id, child element id) into one int64 key for the backward gate lookup. Node and
+# element ids are global row indices into `node_mars` / `element_mars`, so this holds for any circuit
+# that fits in memory; asserted where the keys are built.
+_KEY_STRIDE = 1 << 32
+
 
 def _buffer_kwarg() -> str:
     """The staging-buffer kwarg name, resolved once (a per-call import shows up in profiles)."""
@@ -97,6 +102,13 @@ class BlockScaleSumParams(ExternalSumParams):
     #: standard kernel has summed them -- `sum_e phi_e M_e` cannot be recovered from `sum_e M_e`. So it
     #: computes the node values itself instead of correcting them afterwards.
     replaces_shared_forward = True
+
+    #: The element and parameter flows ARE computed (by two forks of the standard backward kernels, so
+    #: `replaces_shared_backward` stays False and the standard backward's own table derivation is
+    #: reused -- see `pre_backward_layer`). `d LL / d log phi` is not: its second term carries
+    #: `sigma[g,n] = sum_{c in g} theta[n,c]`, which the forward stopped materializing once the
+    #: normalizer became a second contraction against the same operand, so it needs its own kernel.
+    computes_external_grads = False
 
     def __init__(self, block_size: Optional[int] = None, ch_block_size: Optional[int] = None,
                  apply_z_correction: bool = False, tie_external: bool = False):
@@ -314,7 +326,7 @@ class BlockScaleSumParams(ExternalSumParams):
                     // external_params.element_size()) // batch_size
 
         dev = node_mars.device
-        calls, sb_calls = [], []
+        calls, sb_calls, shift_args = [], [], []
         for partition_id in range(layer.num_fw_partitions):
             nids = layer.partitioned_nids[partition_id]
             cids = layer.partitioned_cids[partition_id]
@@ -331,6 +343,11 @@ class BlockScaleSumParams(ExternalSumParams):
             rows = nids.size(0)
             n_eblks = num_edges // node_cbs
             log_z = torch.empty([rows * block_size * batch_size], dtype = torch.float32, device = dev)
+
+            # `log Z` is what the backward needs to turn the stored `log N - log Z` back into `log N`
+            # (see `pre_backward_layer`). Collected here rather than dug out of `calls` afterwards,
+            # because the two kernels order their arguments differently.
+            shift_args.append((nids, log_z, rows))
 
             c2 = cids.to(torch.int64)
             p2 = pids.to(torch.int64)
@@ -430,7 +447,16 @@ class BlockScaleSumParams(ExternalSumParams):
         else:
             out_mod, fname, calls = sb_mod, "blockscale_sb_forward", _with_cfg(sb_calls, best_cfg)
 
-        layer._bs_bw_state = (block_size, batch_size, calls)
+        # Everything the backward needs that only the forward knows: where this layer's gates start in
+        # the staging buffer, the gate geometry the kernels specialize on, and the per-partition `log Z`.
+        layer._bs_bw_state = {
+            "block_size": block_size,
+            "batch_size": batch_size,
+            "ext_base": ext_base,
+            "gate_cbs": gate_cbs,
+            "node_cbs": node_cbs,
+            "shift_args": shift_args,
+        }
 
         return out_mod, fname, calls
 
@@ -464,10 +490,186 @@ class BlockScaleSumParams(ExternalSumParams):
 
         return None
 
+    # ------------------------------------------------------------------ backward
+
+    def _gate_bw_table(self, layer, chids, ele_ebase):
+        """
+        `gate_bw[eb, kt]` -- the staging row of the gate on the edge from the parent block of tile `kt`
+        into child block `eb`, in per-batch units, `-1` where the two are not connected.
+
+        The element-flow kernel walks the TRANSPOSE of the forward's indexing: one row per CHILD block
+        and one column per incident parent tile, where the forward has one row per node block. So the
+        forward's `ext_slots` cannot be reused, but its *key* can -- an edge block is identified
+        globally by (first node id of its parent block, first element id of its child block), which
+        `par_nids` and `ch_eids` already hold, and `storage_offsets` gives the row it maps to.
+
+        Built by lookup rather than by re-deriving the backward tables: `ele_ebase` has already been
+        through partitioning, `parids` reconstruction and edge trimming, and a second derivation that
+        had to track all three would be one more thing to keep in step with `SumLayer`.
+        """
+        dev = chids.device
+        chids = chids.to(torch.long)
+
+        keys, vals, ch_all = [], [], []
+        for ns_info in layer.external_node_infos:
+            ns = ns_info.ns
+            par = ns_info.par_nids.to(dev).to(torch.long)
+            ch = ns_info.ch_eids.to(dev).to(torch.long)
+            off = ns.external_params.storage_offsets(ns)[0].to(dev).to(torch.long)
+
+            keys.append(par * _KEY_STRIDE + ch)
+            vals.append(off + layer.ext_unit_bases[ns_info.ns_idx][0])
+            ch_all.append(ch)
+
+        key = torch.cat(keys)
+        val = torch.cat(vals)
+        assert int(torch.cat(ch_all).max()) < _KEY_STRIDE, \
+            "circuit too large for the packed (parent, child) backward gate key."
+        order = torch.argsort(key)
+        key, val = key[order], val[order]
+
+        # The parent BLOCK a tile belongs to: tiles are `TILE_SIZE_K`-wide slices of a node block, so
+        # the block is the greatest node-block start not exceeding the tile's first node. Found by
+        # search rather than by arithmetic on `block_size`, which would assume every `ns` in the layer
+        # starts on the same grid.
+        nid_all = torch.cat([layer.partitioned_nids[p].to(dev).to(torch.long)
+                             for p in range(layer.num_fw_partitions)])
+        nid_sorted = torch.sort(nid_all)[0]
+        flat = ele_ebase.reshape(-1).to(torch.long)
+        blk = nid_sorted[(torch.searchsorted(nid_sorted, flat, right = True) - 1).clamp(min = 0)]
+
+        q = blk * _KEY_STRIDE + chids.view(-1, 1).expand_as(ele_ebase).reshape(-1)
+
+        pos = torch.searchsorted(key, q).clamp(max = key.numel() - 1)
+        hit = key[pos] == q
+        gate = torch.where(hit, val[pos], torch.full_like(q, -1))
+
+        # Every edge block whose child this partition owns must have been found. A miss would not
+        # crash -- the kernel reads `-1` as "no gate" and drops the parent's contribution entirely --
+        # so without this check a mis-derived key would surface as quietly missing flows.
+        n_expect = int(torch.isin(torch.cat(ch_all), chids).sum())
+        n_found = int(torch.unique(q[hit]).numel()) if bool(hit.any()) else 0
+        assert n_found == n_expect, \
+            f"the block-scale backward gate table matched {n_found} of {n_expect} edge blocks; " \
+            f"`par_nids` / `ch_eids` and the compiled backward tables disagree."
+
+        return gate.view(ele_ebase.shape).contiguous()
+
+    def _bw_state(self, layer, node_mars, kwargs):
+        """The forward's leftovers, checked against the call the backward is running under."""
+        state = getattr(layer, "_bs_bw_state", None)
+        if state is None:
+            raise RuntimeError(
+                "`BlockScaleSumParams` backward ran without a matching forward: the normalizer "
+                "`log Z` is produced by the forward kernel and is not recomputed here."
+            )
+        if state["batch_size"] != node_mars.size(1):
+            raise RuntimeError(
+                f"`BlockScaleSumParams` backward at batch {node_mars.size(1)} but the last forward "
+                f"ran at batch {state['batch_size']}; the cached `log Z` does not apply."
+            )
+        if not kwargs.get("logspace_flows", False):
+            raise NotImplementedError(
+                "`BlockScaleSumParams` requires `logspace_flows = True`; the gate enters the element "
+                "flows as a shift of a log-space running maximum, which the linear-space kernels have "
+                "no place for."
+            )
+        return state
+
     def pre_backward_layer(self, layer, ns_tensors, node_flows, element_flows, node_mars,
                            element_mars, params, **kwargs) -> None:
-        raise NotImplementedError("BlockScaleSumParams backward: not implemented yet (milestone B).")
+        """
+        Put `node_mars` back into the form the standard kernels expect, and hand them the gated kernels.
+
+        The flow through an edge is `f[n,b] * theta_b[n,c] * em[c,b] / N_b[n]` with `theta_b = phi
+        theta / Z`, and the forward stored `node_mars = log N - log Z`. The two normalizers cancel:
+
+        .. code-block:: text
+
+            f * (phi theta / Z) * e^em / (N / Z) = f * phi * theta * e^(em - log N)
+
+        so the kernels need `log N`, i.e. `node_mars + log Z` -- one elementwise add over this layer's
+        rows, undone in :func:`post_backward_layer`. What is left, `phi`, is the only thing the forked
+        kernels do that the standard ones do not.
+        """
+        if len(ns_tensors) == 0:
+            return None
+
+        # Refused BEFORE anything is perturbed, so a caller asking for something unimplemented does not
+        # get a circuit whose `node_mars` was left shifted.
+        if self.apply_z_correction:
+            raise NotImplementedError(
+                "`apply_z_correction = True` is not implemented: the parameter flows this writes are "
+                "the first term only, `sum_b f phi theta e^em / N`, which is the expected count "
+                "PyJuice's EM optimizers consume."
+            )
+
+        external_params = kwargs.get(_buffer_kwarg(), None)
+        if external_params is None:
+            raise RuntimeError("the external-parameter staging buffer was not supplied to the backward.")
+
+        state = self._bw_state(layer, node_mars, kwargs)
+
+        from .kernels.c import get_module, get_ele_bw_module, get_par_bw_module
+
+        plain, ele_mod, par_mod = get_module(), get_ele_bw_module(), get_par_bw_module()
+        if plain is None or ele_mod is None or par_mod is None:
+            raise NotImplementedError(
+                "the block-scale backward needs its CUDA extensions (the two CuTe/TMA fork kernels and "
+                "the plain one holding the normalizer shift), and at least one is unavailable here. "
+                "There is no Triton fallback."
+            )
+
+        batch_size, block_size = state["batch_size"], state["block_size"]
+        ext_base, gate_cbs, node_cbs = state["ext_base"], state["gate_cbs"], state["node_cbs"]
+
+        for nids, log_z, rows in state["shift_args"]:
+            plain.lowrank_shift_logz(node_mars, nids, log_z, block_size, 1.0)
+
+        cache = getattr(layer, "_bs_bw_gate_cache", None)
+        if cache is None:
+            cache = layer._bs_bw_gate_cache = dict()
+
+        def _ele_hook(element_flows, element_mars, node_flows, node_mars, params, chids, ele_ebase,
+                      ele_pbase, batch, blk_size, cs_block_size, knt, partition_id):
+            key = (partition_id, id(chids), int(knt))
+            gate_bw = cache.get(key)
+            if gate_bw is None:
+                gate_bw = self._gate_bw_table(layer, chids, ele_ebase)
+                cache[key] = gate_bw
+
+            ele_mod.blockscale_ele_backward(
+                element_flows, element_mars, node_flows, node_mars, params, external_params,
+                chids, ele_ebase, ele_pbase, gate_bw,
+                batch, blk_size, cs_block_size, knt, gate_cbs, ext_base)
+
+        def _par_hook(param_flows, node_flows, node_mars, element_mars, params, nbase, cbase, pbase,
+                      fbase, batch, blk_size, num_edges, partition_id):
+            # The parameter flows are indexed exactly as the forward is -- one row per node block, one
+            # column per incident edge block -- so the forward's own table serves them unchanged.
+            par_mod.blockscale_par_backward(
+                param_flows, node_flows, node_mars, element_mars, params, external_params,
+                nbase, cbase, pbase, fbase, layer.ext_slots[0][partition_id],
+                batch, blk_size, num_edges, node_cbs, gate_cbs, ext_base, 0)
+
+        layer._ext_bw_ele_hook = _ele_hook
+        layer._ext_bw_par_hook = _par_hook
+
+        return None
 
     def post_backward_layer(self, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows,
                             node_mars, element_mars, params, param_flows = None, **kwargs) -> None:
-        raise NotImplementedError("BlockScaleSumParams backward: not implemented yet (milestone B).")
+        """Undo the normalizer shift and take the kernels back off the standard backward."""
+        if len(ns_tensors) == 0:
+            return None
+
+        layer._ext_bw_ele_hook = None
+        layer._ext_bw_par_hook = None
+
+        from .kernels.c import get_module
+
+        state = layer._bs_bw_state
+        for nids, log_z, rows in state["shift_args"]:
+            get_module().lowrank_shift_logz(node_mars, nids, log_z, state["block_size"], -1.0)
+
+        return None
