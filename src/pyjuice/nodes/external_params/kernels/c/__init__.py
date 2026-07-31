@@ -76,6 +76,54 @@ def get_sb_module():
     return _sb_module
 
 
+_bw_modules = {}
+
+
+def _get_bw_module(name: str, source: str):
+    """
+    Load one of the block-scale BACKWARD kernels, or None if unavailable (warns once).
+
+    Each is its OWN extension rather than one module holding both: they are forks of two different
+    standard kernels and each carries that kernel's file-scope TMA descriptor cache and PTX helpers, so
+    compiling them into a single translation unit would collide at link time. They need the same
+    CuTe/CUTLASS/TMA toolchain as the forward.
+    """
+    if name in _bw_modules:
+        return _bw_modules[name]
+
+    _bw_modules[name] = None
+    if not ENABLE_CUDA_KERNELS:
+        return None
+
+    from pyjuice.layer.kernels.c import _compile_flags as _cute_flags
+    flags = _cute_flags()
+    if flags is None:
+        return None
+    cuda_cflags, ldflags = flags
+
+    from pyjuice.utils.cuda_ext import jit_load
+    try:
+        _bw_modules[name] = jit_load(name, sources = [os.path.join(_THIS_DIR, source)],
+                                     extra_cuda_cflags = cuda_cflags, extra_ldflags = ldflags,
+                                     verbose = False)
+    except Exception as e:
+        warnings.warn(f"pyjuice CUDA kernel '{name}' failed to compile ({type(e).__name__}: {e}). "
+                      f"The block-scale backward is unavailable.", RuntimeWarning)
+        _bw_modules[name] = None
+
+    return _bw_modules[name]
+
+
+def get_ele_bw_module():
+    """Element-flow backward for the per-block multiplicative gate."""
+    return _get_bw_module("pyjuice_blockscale_ele_bw_cuda", "blockscale_ele_backward.cu")
+
+
+def get_par_bw_module():
+    """Parameter-flow backward for the per-block multiplicative gate."""
+    return _get_bw_module("pyjuice_blockscale_par_bw_cuda", "blockscale_par_backward.cu")
+
+
 def get_module():
     """The loaded extension, or None if it is unavailable (warns once)."""
     global _module, _attempted
