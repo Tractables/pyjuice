@@ -50,6 +50,14 @@ class ExternalSumParams():
     #: this and takes over the whole computation.
     replaces_shared_forward: bool = False
 
+    #: The backward counterpart. `False` -- the default -- means the standard element-flow and
+    #: param-flow kernels run and the descriptor corrects what they wrote. A parameterization whose
+    #: effective parameters vary PER EDGE BLOCK cannot be served that way: the standard kernels sum
+    #: every parent of a child before the correction could be applied, and `sum_e w_e X_e` is not
+    #: recoverable from `sum_e X_e`. Such a parameterization sets this and owns both flows, exactly as
+    #: `replaces_shared_forward` makes it own the node values.
+    replaces_shared_backward: bool = False
+
     def storage_owner(self, ns):
         """
         The node whose staging slots `ns` uses.

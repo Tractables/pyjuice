@@ -346,9 +346,7 @@ class BlockScaleSumParams(ExternalSumParams):
 
                 if (torch.equal(c3, ebase.unsqueeze(-1) + ar.view(1, 1, -1))
                         and torch.equal(p3, pbase.unsqueeze(-1) + ar.view(1, 1, -1) * block_size)):
-                    sigma = torch.empty([rows * n_eblks * n_child_gates * block_size],
-                                        dtype = torch.float32, device = dev)
-                    calls.append((nids, ebase, pbase, pids, gate, sigma, log_z,
+                    calls.append((nids, ebase, pbase, pids, gate, log_z,
                                   block_size, num_edges, node_cbs, gate_cbs, n_node_gates,
                                   ext_base, cfg))
 
@@ -389,8 +387,8 @@ class BlockScaleSumParams(ExternalSumParams):
         # WARPS halves the fragment and doubles the warps resident per SM. Those pull opposite ways and
         # which wins flips with the batch size.
         #
-        # Safe to run on the LIVE buffers because every write is an assignment: `node_mars`, `log_z`
-        # and `sigma` are overwritten, never accumulated, so a repeated trial leaves exactly what one
+        # Safe to run on the LIVE buffers because every write is an assignment: `node_mars` and
+        # `log_z` are overwritten, never accumulated, so a repeated trial leaves exactly what one
         # run would. `forward_layer` then does the real launch.
         #
         # A read-accumulate-write kernel must NOT be tuned this way -- each trial would add its

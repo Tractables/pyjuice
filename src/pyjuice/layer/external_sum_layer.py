@@ -574,11 +574,14 @@ class ExternalParamsSumLayer(SumLayer):
             param_flows = param_flows, propagation_alg = propagation_alg, **kwargs
         )
 
-        # Shared-parameter flows -- the standard kernels, untouched
-        super(ExternalParamsSumLayer, self).backward(
-            node_flows, element_flows, node_mars, element_mars, params,
-            param_flows = param_flows, propagation_alg = propagation_alg, **kwargs
-        )
+        # Shared-parameter flows -- the standard kernels, untouched. Skipped entirely when the
+        # parameterization owns the flows: its effective parameters vary per edge block, and the
+        # standard kernels would sum the parents together before any correction could separate them.
+        if not self.external_params.replaces_shared_backward:
+            super(ExternalParamsSumLayer, self).backward(
+                node_flows, element_flows, node_mars, element_mars, params,
+                param_flows = param_flows, propagation_alg = propagation_alg, **kwargs
+            )
 
         self.external_params.post_backward_layer(
             self, ns_tensors, ns_grad_tensors,

@@ -103,7 +103,7 @@ extern __shared__ char smem_raw[];
 // `BK / GC`, `e / GC` and every trip count are compile-time; see the call site.
 template <int BN, int NTH, int GC>
 __device__ __forceinline__ void gate_pass(float* __restrict__ sEm, const float* __restrict__ sPh,
-                                          float* __restrict__ sPe, float* __restrict__ sMz,
+                                          float* __restrict__ sMz,
                                           float* __restrict__ sScale, int tid) {
     constexpr int NGT = BK / GC;
 
@@ -128,10 +128,6 @@ __device__ __forceinline__ void gate_pass(float* __restrict__ sEm, const float* 
         // would be inf - inf = NaN. There `Z` must stay 0, which makes `log_z` -inf, which is what the
         // standalone normalizer produced for the same column.
         sScale[b] = (mzn == -INFINITY || mzo == -INFINITY) ? 0.0f : __expf(mzo - mzn);
-
-        CUTE_UNROLL
-        for (int gi = 0; gi < NGT; gi++)
-            sPe[gi * BN + b] = (mzn == -INFINITY) ? 0.0f : __expf(sPh[gi * BN + b] - mzn);
     }
 }
 
@@ -139,7 +135,7 @@ __device__ __forceinline__ void gate_pass(float* __restrict__ sEm, const float* 
 // Fallback for a gate width outside the specialized set; correct, just not unrolled.
 template <int BN, int NTH>
 __device__ __forceinline__ void gate_pass_rt(float* __restrict__ sEm, const float* __restrict__ sPh,
-                                             float* __restrict__ sPe, float* __restrict__ sMz,
+                                             float* __restrict__ sMz,
                                              float* __restrict__ sScale, int tid, int gc) {
     const int ngt = BK / gc;
 
@@ -158,42 +154,6 @@ __device__ __forceinline__ void gate_pass_rt(float* __restrict__ sEm, const floa
         const float mzo = sMz[b], mzn = fmaxf(mzo, gm);
         sMz[b] = mzn;
         sScale[b] = (mzn == -INFINITY || mzo == -INFINITY) ? 0.0f : __expf(mzo - mzn);
-
-        for (int gi = 0; gi < ngt; gi++)
-            sPe[gi * BN + b] = (mzn == -INFINITY) ? 0.0f : __expf(sPh[gi * BN + b] - mzn);
-    }
-}
-
-
-// `Z[m,b] += sum over this tile's gates of sigma[g,m] * exp(log phi[g,b] - mz)`.
-//
-// Accumulated straight into the MMA's C-fragment coordinates, so the epilogue can pair each `Z` with
-// the `N` it divides without a shared round trip. Each thread's fragment coordinates form a cartesian
-// product of a few distinct `m` and a few distinct `b`, so the unrolled body needs only that many
-// distinct shared loads per gate rather than two per element.
-template <int BM, int BN, int NGT, class TZ, class TC>
-__device__ __forceinline__ void accum_z(TZ& z, TC const& cc, const float* __restrict__ sSg,
-                                        const float* __restrict__ sPe) {
-    CUTE_UNROLL
-    for (int i = 0; i < size(z); i++) {
-        const int m = get<0>(cc(i)), b = get<1>(cc(i));
-        float a = 0.0f;
-        CUTE_UNROLL
-        for (int gi = 0; gi < NGT; gi++) a = fmaf(sSg[gi * BM + m], sPe[gi * BN + b], a);
-        z(i) += a;
-    }
-}
-
-
-template <int BM, int BN, class TZ, class TC>
-__device__ __forceinline__ void accum_z_rt(TZ& z, TC const& cc, const float* __restrict__ sSg,
-                                           const float* __restrict__ sPe, int ngt) {
-    CUTE_UNROLL
-    for (int i = 0; i < size(z); i++) {
-        const int m = get<0>(cc(i)), b = get<1>(cc(i));
-        float a = 0.0f;
-        for (int gi = 0; gi < ngt; gi++) a = fmaf(sSg[gi * BM + m], sPe[gi * BN + b], a);
-        z(i) += a;
     }
 }
 
@@ -209,8 +169,7 @@ __host__ __device__ __forceinline__ int ngt_of(int gate_cbs) {
 // the barrier, then the gates (staged and exponentiated) and the tile's parameter mass.
 int smem_bytes(int BM, int BN, int gate_cbs) {
     const int ngt = ngt_of(gate_cbs);
-    return BM * BK * 2 + BN * BK * 2 + BK * BN * 4 + 6 * BN * 4 + 64
-           + 2 * ngt * BN * 4 + ngt * BM * 4;
+    return BM * BK * 2 + 2 * BN * BK * 2 + BK * BN * 4 + 6 * BN * 4 + 64 + ngt * BN * 4;
 }
 
 
@@ -219,9 +178,8 @@ __global__ void __launch_bounds__(WM * WN * 32) blockscale_tlmm_kernel(
         float* __restrict__ node_mars, const float* __restrict__ mp,
         const float* __restrict__ ext, const long* __restrict__ nids,
         const long* __restrict__ ebase, const long* __restrict__ pbase,
-        const long* __restrict__ gate, const float* __restrict__ sigma,
-        float* __restrict__ log_z_out,
-        int batch, int block_size, int knt, int gate_stride, int n_gates,
+        const long* __restrict__ gate, float* __restrict__ log_z_out,
+        int batch, int block_size, int knt, int gate_stride,
         int node_cbs, int gate_cbs, int node_sh, int gate_sh, long ext_base, int pid_m_offset,
         const __grid_constant__ CUtensorMap desc) {
     constexpr int NTH = WM * WN * 32;
@@ -242,7 +200,8 @@ __global__ void __launch_bounds__(WM * WN * 32) blockscale_tlmm_kernel(
     auto sBl = tile_to_shape(swz, make_shape(Int<BN>{}, Int<BK>{}));
     bfloat16_t* pA = (bfloat16_t*)smem_raw;
     bfloat16_t* pBs = pA + cosize(sAl);
-    float* sEm = (float*)(pBs + cosize(sBl));
+    bfloat16_t* pB2 = pBs + cosize(sBl);         // the normalizer's operand: exp(log phi - mz)
+    float* sEm = (float*)(pB2 + cosize(sBl));
     float* sMx = sEm + BK * BN;
     float* sMz = sMx + BN;                       // [BN] running max log-gate
     float* sScale = sMz + BN;                    // [BN] rescale for Z when that max moves
@@ -251,22 +210,24 @@ __global__ void __launch_bounds__(WM * WN * 32) blockscale_tlmm_kernel(
     float* sPS = sLS + BN;                       // [BN] weight of this tile's partial
     uint64_t* bar = (uint64_t*)(sPS + BN + 4);
     float* sPh = (float*)(bar + 4);              // [ngt, BN] staged log-gates
-    float* sPe = sPh + ngt_of(gate_cbs) * BN;    // [ngt, BN] the same, exponentiated for Z
-    float* sSg = sPe + ngt_of(gate_cbs) * BN;    // [ngt, BM] this tile's gates' parameter mass
 
     Tensor sAt = make_tensor(make_smem_ptr(pA), sAl);
     Tensor sBt = make_tensor(make_smem_ptr(pBs), sBl);
+    Tensor sB2t = make_tensor(make_smem_ptr(pB2), sBl);
     TiledMMA mma = make_tiled_mma(SM80_16x8x16_F32BF16BF16F32_TN{},
                                   Layout<Shape<Int<WM>, Int<WN>, _1>>{});
     ThrMMA thr = mma.get_thread_slice(tid);
     Tensor tCrA = thr.partition_fragment_A(sAt);
     Tensor tCrB = thr.partition_fragment_B(sBt);
+    Tensor tCrB2 = thr.partition_fragment_B(sB2t);
     auto s2rA = make_tiled_copy_A(Copy_Atom<SM75_U16x8_LDSM_T, bfloat16_t>{}, mma);
     auto s2rB = make_tiled_copy_B(Copy_Atom<SM75_U16x4_LDSM_T, bfloat16_t>{}, mma);
     Tensor tXsA = s2rA.get_thread_slice(tid).partition_S(sAt);
     Tensor tXrA = s2rA.get_thread_slice(tid).retile_D(tCrA);
     Tensor tXsB = s2rB.get_thread_slice(tid).partition_S(sBt);
     Tensor tXrB = s2rB.get_thread_slice(tid).retile_D(tCrB);
+    Tensor tXsB2 = s2rB.get_thread_slice(tid).partition_S(sB2t);
+    Tensor tXrB2 = s2rB.get_thread_slice(tid).retile_D(tCrB2);
     Tensor cC = make_identity_tensor(Shape<Int<BM>, Int<BN>>{});
     Tensor tCcC = thr.partition_C(cC);
     Tensor tCrS = thr.partition_fragment_C(cC);
@@ -283,7 +244,6 @@ __global__ void __launch_bounds__(WM * WN * 32) blockscale_tlmm_kernel(
 
     const int gcbs_eff = (gate_cbs < BK) ? gate_cbs : BK;
     const int ngt = BK / gcbs_eff;
-    const long sig_row = (long)nblock * n_gates * block_size;
 
     // A SECOND STAGING BUFFER DOES NOT PAY. Issuing tile `kt+1`'s transfer before waiting on `kt`, so
     // it lands during `kt`'s compute, is the textbook fix for a latency-bound mainloop -- and here it
@@ -299,10 +259,6 @@ __global__ void __launch_bounds__(WM * WN * 32) blockscale_tlmm_kernel(
         long pc = pb[kt] + (long)tile_id * BM;
         if (tid == 0) { mbar_expect(bar, BK * BN * 4); tma_load_2d(sEm, &desc, b0, (int)eb[kt], bar); }
 
-        // A gate WIDER than an edge tile spans several tiles, and its parameter mass must be counted
-        // once, not once per tile. Narrower than a tile -- the case the gate is designed for -- every
-        // tile starts a fresh set of gates and this is always true.
-        const bool sig_here = ((kt * BK) % gate_cbs) == 0;
 
         // ---- STAGE THE GATES for this tile ----
         //
@@ -323,20 +279,6 @@ __global__ void __launch_bounds__(WM * WN * 32) blockscale_tlmm_kernel(
             sPh[i] = (gb >= 0) ? ext[(gb + ext_base + d) * (long)batch + b0 + b] : -INFINITY;
         }
 
-        // ---- STAGE THIS TILE'S PARAMETER MASS ----
-        //
-        // `sigma[row, g, m]`, the parameters under gate `g` summed over its children, is what lets the
-        // normalizer ride along here instead of costing a second pass: it is batch-independent, so `Z`
-        // is a contraction over gates rather than over edges, and its operand is `ngt * BM` floats per
-        // tile against the `BK * BN` the GEMM already moves. Contiguous in `m`, so the loads coalesce.
-        if (sig_here) {
-            for (int i = tid; i < ngt * BM; i += NTH) {
-                const int gi = i / BM, mm = i % BM;
-                const int g = (kt * BK + gi * gcbs_eff) >> gate_sh;
-                sSg[i] = sigma[sig_row + (long)g * block_size + tile_id * BM + mm];
-            }
-        }
-
         mbar_wait(bar, kt & 1);      // one buffer, so the phase just alternates
         __syncthreads();
 
@@ -353,18 +295,14 @@ __global__ void __launch_bounds__(WM * WN * 32) blockscale_tlmm_kernel(
         // arithmetic is unchanged too. `-inf + anything = -inf`, so a padded edge (child 0, the dummy)
         // and a row with fewer edge blocks (`gate == -1`) both stay -inf and contribute exactly nothing.
         switch (gcbs_eff) {
-            case  4: gate_pass<BN, NTH,  4>(sEm, sPh, sPe, sMz, sScale, tid); break;
-            case  8: gate_pass<BN, NTH,  8>(sEm, sPh, sPe, sMz, sScale, tid); break;
-            case 16: gate_pass<BN, NTH, 16>(sEm, sPh, sPe, sMz, sScale, tid); break;
-            case 32: gate_pass<BN, NTH, 32>(sEm, sPh, sPe, sMz, sScale, tid); break;
-            case 64: gate_pass<BN, NTH, 64>(sEm, sPh, sPe, sMz, sScale, tid); break;
-            default: gate_pass_rt<BN, NTH>(sEm, sPh, sPe, sMz, sScale, tid, gcbs_eff); break;
+            case  4: gate_pass<BN, NTH,  4>(sEm, sPh, sMz, sScale, tid); break;
+            case  8: gate_pass<BN, NTH,  8>(sEm, sPh, sMz, sScale, tid); break;
+            case 16: gate_pass<BN, NTH, 16>(sEm, sPh, sMz, sScale, tid); break;
+            case 32: gate_pass<BN, NTH, 32>(sEm, sPh, sMz, sScale, tid); break;
+            case 64: gate_pass<BN, NTH, 64>(sEm, sPh, sMz, sScale, tid); break;
+            default: gate_pass_rt<BN, NTH>(sEm, sPh, sMz, sScale, tid, gcbs_eff); break;
         }
         __syncthreads();
-
-        // Rebase what `Z` has already accumulated onto this tile's stabilizer.
-        CUTE_UNROLL
-        for (int i = 0; i < size(tCrZ); i++) tCrZ(i) *= sScale[get<1>(tCcC(i))];
 
         // The tile's max, and with it the two factors that merge this tile into the running
         // log-sum-exp. Both depend only on the batch column, so one thread per column computes them
@@ -397,6 +335,24 @@ __global__ void __launch_bounds__(WM * WN * 32) blockscale_tlmm_kernel(
             r[7] = static_cast<bfloat16_t>((mx7 == -INFINITY) ? 0.f : __expf(s[7] - mx7));
             *(float4*)&sBt(bb, e) = *(const float4*)r;
         }
+
+        // The normalizer's operand: `exp(log phi - mz)` over the SAME children the matmul contracts.
+        // `Z = sum_c theta * phi` is `N` with `element_mars` dropped, so it reuses the `A` operand and
+        // needs only this second `B`. Computed instead as a gate-wise outer product on CUDA cores --
+        // which is what this replaces -- every thread re-read shared memory for its own (m, b) pair:
+        // 2560 floats per gate where 128 are distinct, a 20x re-read costing ~16 us per block at a
+        // gate width of 4. `LDSM` moves each operand once, and the cost stops depending on gate width.
+        for (int i = tid; i < (BN * BK) / 8; i += NTH) {
+            int e = i / (BN / 8), bb = (i % (BN / 8)) * 8;
+            bfloat16_t r[8];
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const float mz = sMz[bb + j];
+                const float lp = sPh[(e / gcbs_eff) * BN + bb + j];
+                r[j] = static_cast<bfloat16_t>((mz == -INFINITY) ? 0.f : __expf(lp - mz));
+            }
+            *(float4*)&sB2t(bb, e) = *(const float4*)r;
+        }
         for (int i = tid; i < (BM * BK) / 8; i += NTH) {
             int e = i / (BM / 8), mm = (i % (BM / 8)) * 8;
             const float* g = &mp[pc + (long)e * block_size + mm];
@@ -409,22 +365,6 @@ __global__ void __launch_bounds__(WM * WN * 32) blockscale_tlmm_kernel(
             *(float4*)&sAt(mm, e) = *(const float4*)r;
         }
 
-        // ---- THE NORMALIZER RIDES ALONG HERE ----
-        //
-        // Placed after the A-operand's global loads and before the barrier that gates the GEMM, so its
-        // fp32 FMAs issue into the shadow of those loads. The kernel is latency bound -- its time is
-        // flat as the batch grows from 64 to 256 -- so these cycles were being spent stalled anyway,
-        // which is why `Z` costs far less here than the separate pass it replaces.
-        if (sig_here) {
-            switch (BK / gcbs_eff) {
-                case  1: accum_z<BM, BN,  1>(tCrZ, tCcC, sSg, sPe); break;
-                case  2: accum_z<BM, BN,  2>(tCrZ, tCcC, sSg, sPe); break;
-                case  4: accum_z<BM, BN,  4>(tCrZ, tCcC, sSg, sPe); break;
-                case  8: accum_z<BM, BN,  8>(tCrZ, tCcC, sSg, sPe); break;
-                case 16: accum_z<BM, BN, 16>(tCrZ, tCcC, sSg, sPe); break;
-                default: accum_z_rt<BM, BN>(tCrZ, tCcC, sSg, sPe, ngt); break;
-            }
-        }
         __syncthreads();
 
         copy(s2rA, tXsA, tXrA); copy(s2rB, tXsB, tXrB);
@@ -434,6 +374,16 @@ __global__ void __launch_bounds__(WM * WN * 32) blockscale_tlmm_kernel(
         for (int i = 0; i < size(tCrS); i++) {
             const int b = get<1>(tCcC(i));
             tCrL(i) = tCrL(i) * sLS[b] + tCrS(i) * sPS[b];
+        }
+
+        // ...and the same matmul again for `Z`, against the `A` operand already in registers. The
+        // partial is already stated in this tile's stabilizer, so merging is one rescale.
+        copy(s2rB, tXsB2, tXrB2);
+        clear(tCrS); cute::gemm(mma, tCrA, tCrB2, tCrS);
+        CUTE_UNROLL
+        for (int i = 0; i < size(tCrS); i++) {
+            const int b = get<1>(tCcC(i));
+            tCrZ(i) = tCrZ(i) * sScale[b] + tCrS(i);
         }
         __syncthreads();
     }
@@ -460,43 +410,13 @@ __global__ void __launch_bounds__(WM * WN * 32) blockscale_tlmm_kernel(
 }
 
 
-// ============================================================ sigma: per-gate parameter mass
-
-// `sigma[row, j, d, m] = sum_{c in child gate d of edge block j} theta[row's node m, c]`.
-// Batch-independent, so it is the whole reason `Z` needs no second MMA. Recomputed each forward: it is
-// one pass over the parameters, which removes any question of staleness after an EM update.
-__global__ void blockscale_sigma_kernel(
-        const float* __restrict__ mp, const long* __restrict__ pids, float* __restrict__ sigma,
-        int rows, int num_edges, int block_size, int node_cbs, int gate_cbs, int n_child_gates) {
-
-    const int n_eblks = num_edges / node_cbs;
-    const long total = (long)rows * n_eblks * n_child_gates * block_size;
-
-    for (long i = (long)blockIdx.x * blockDim.x + threadIdx.x; i < total;
-         i += (long)gridDim.x * blockDim.x) {
-        const int m = i % block_size;
-        const int d = (i / block_size) % n_child_gates;
-        const int j = (i / ((long)block_size * n_child_gates)) % n_eblks;
-        const int row = i / ((long)block_size * n_child_gates * n_eblks);
-
-        const long e0 = (long)row * num_edges + (long)j * node_cbs + (long)d * gate_cbs;
-
-        float s = 0.0f;
-        for (int c = 0; c < gate_cbs; ++c) s += mp[pids[e0 + c] + m];
-
-        sigma[i] = s;
-    }
-}
-
-
 // ============================================================ launchers
 
 template <int BM, int BN, int WM, int WN>
 static void launch_cfg(torch::Tensor node_mars, torch::Tensor element_mars, torch::Tensor params,
                        torch::Tensor ext, torch::Tensor nids, torch::Tensor ebase,
-                       torch::Tensor pbase, torch::Tensor gate, torch::Tensor sigma,
-                       torch::Tensor log_z,
-                       int batch, int block_size, int knt, int n_gates, int node_cbs, int gate_cbs,
+                       torch::Tensor pbase, torch::Tensor gate, torch::Tensor log_z,
+                       int batch, int block_size, int knt, int node_cbs, int gate_cbs,
                        int node_sh, int gate_sh, long ext_base) {
     // `gcbs_eff` mirrors the kernel: a gate may be wider than one edge tile
     constexpr int NTH = WM * WN * 32;
@@ -534,9 +454,9 @@ static void launch_cfg(torch::Tensor node_mars, torch::Tensor element_mars, torc
         blockscale_tlmm_kernel<BM, BN, WM, WN><<<grid, NTH, smem, c10::cuda::getCurrentCUDAStream()>>>(
             node_mars.data_ptr<float>(), params.data_ptr<float>(), ext.data_ptr<float>(),
             nids.data_ptr<long>(), ebase.data_ptr<long>(), pbase.data_ptr<long>(),
-            gate.data_ptr<long>(), sigma.data_ptr<float>(),
+            gate.data_ptr<long>(),
             log_z.numel() ? log_z.data_ptr<float>() : nullptr,
-            batch, block_size, knt, (int)gate.size(1), n_gates,
+            batch, block_size, knt, (int)gate.size(1),
             node_cbs, gate_cbs, node_sh, gate_sh, ext_base, off, desc);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
@@ -579,7 +499,7 @@ std::vector<std::vector<int>> configs() {
 void blockscale_forward(torch::Tensor node_mars, torch::Tensor element_mars, torch::Tensor params,
                         torch::Tensor ext, torch::Tensor nids, torch::Tensor ebase,
                         torch::Tensor pbase, torch::Tensor pids, torch::Tensor gate,
-                        torch::Tensor sigma, torch::Tensor log_z,
+                        torch::Tensor log_z,
                         int64_t block_size, int64_t num_edges, int64_t node_cbs, int64_t gate_cbs,
                         int64_t n_node_gates, int64_t ext_base, int64_t cfg) {
 
@@ -605,37 +525,24 @@ void blockscale_forward(torch::Tensor node_mars, torch::Tensor element_mars, tor
     const int node_sh = (int)std::log2((double)node_cbs);
     const int gate_sh = (int)std::log2((double)gate_cbs);
 
-    // sigma: one pass over the parameters, then Z is a small batch-independent contraction
-    {
-        const long total = (long)rows * n_eblks * n_child_gates * block_size;
-        const int threads = 256;
-        const int blocks = (int)std::min<long>(1024, (total + threads - 1) / threads);
-        blockscale_sigma_kernel<<<blocks, threads, 0, c10::cuda::getCurrentCUDAStream()>>>(
-            params.data_ptr<float>(), pids.data_ptr<long>(), sigma.data_ptr<float>(),
-            rows, (int)num_edges, (int)block_size, (int)node_cbs, (int)gate_cbs, n_child_gates);
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
-    }
-
-    const int n_gates = n_eblks * n_child_gates;
-
     switch (cfg) {
         case 0: launch_cfg<128, 64, 2, 2>(node_mars, element_mars, params, ext, nids, ebase, pbase,
-                                          gate, sigma, log_z, batch, (int)block_size, knt, n_gates,
+                                          gate, log_z, batch, (int)block_size, knt,
                                           (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base); break;
         case 1: launch_cfg<64, 64, 2, 2>(node_mars, element_mars, params, ext, nids, ebase, pbase,
-                                         gate, sigma, log_z, batch, (int)block_size, knt, n_gates,
+                                         gate, log_z, batch, (int)block_size, knt,
                                          (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base); break;
         case 2: launch_cfg<256, 64, 4, 2>(node_mars, element_mars, params, ext, nids, ebase, pbase,
-                                          gate, sigma, log_z, batch, (int)block_size, knt, n_gates,
+                                          gate, log_z, batch, (int)block_size, knt,
                                           (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base); break;
         case 3: launch_cfg<128, 128, 2, 4>(node_mars, element_mars, params, ext, nids, ebase, pbase,
-                                           gate, sigma, log_z, batch, (int)block_size, knt, n_gates,
+                                           gate, log_z, batch, (int)block_size, knt,
                                            (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base); break;
         case 4: launch_cfg<64, 64, 4, 2>(node_mars, element_mars, params, ext, nids, ebase, pbase,
-                                         gate, sigma, log_z, batch, (int)block_size, knt, n_gates,
+                                         gate, log_z, batch, (int)block_size, knt,
                                          (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base); break;
         default: launch_cfg<128, 64, 4, 2>(node_mars, element_mars, params, ext, nids, ebase, pbase,
-                                           gate, sigma, log_z, batch, (int)block_size, knt, n_gates,
+                                           gate, log_z, batch, (int)block_size, knt,
                                            (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base); break;
     }
 }
