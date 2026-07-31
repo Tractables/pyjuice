@@ -341,6 +341,7 @@ class SumLayer(Layer, nn.Module):
         self._ext_bw_ele_hook = None
         self._ext_bw_par_hook = None
         self._ext_bw_par_sb_hook = None
+        self._ext_bw_par_triton_hook = None
 
     def to(self, device):
         super(SumLayer, self).to(device)
@@ -2055,6 +2056,19 @@ class SumLayer(Layer, nn.Module):
                     return None
                 # choice == "triton": fall through to the Triton dispatch below
 
+        if self._ext_bw_par_triton_hook is not None:
+            # The CuTe fork did not claim this shape (it needs num_edges % 128 and block_size % 64).
+            # The Triton fork has neither requirement, so it covers what the CUDA forks cannot.
+            self._ext_bw_par_triton_hook(dict(
+                node_flows = node_flows, node_mars = node_mars, element_mars = element_mars,
+                params = params, param_flows = param_flows, nids = nids, cids = cids, pids = pids,
+                pfids = pfids, batch_size = batch_size, num_edges = num_edges,
+                block_size = self.block_size, TILE_SIZE_B = TILE_SIZE_B, B_NUM_TILES = B_NUM_TILES,
+                TILE_SIZE_K = TILE_SIZE_K, TILE_SIZE_M = TILE_SIZE_M, TL_DOT = TL_DOT, grid = grid,
+                partition_id = partition_id,
+            ))
+            return None
+
         if self._ext_bw_par_hook is not None:
             # See the matching guard in `_backward_block_sparse_ele_flows`.
             raise NotImplementedError(
@@ -2596,6 +2610,20 @@ class SumLayer(Layer, nn.Module):
                 _cuda_par_sb(param_flows, choice[1])
                 return None
             # choice == ("triton", -1): fall through to the Triton launch below
+
+        if self._ext_bw_par_triton_hook is not None:
+            # Neither CUDA fork claimed this shape. The Triton fork has no `num_edges % 128` or
+            # `block_size % 64` requirement, so it covers what they cannot -- a 64-state layer, say,
+            # whose element flows are already served.
+            self._ext_bw_par_triton_hook(dict(
+                node_flows = node_flows, node_mars = node_mars, element_mars = element_mars,
+                params = params, param_flows = param_flows, nids = nids, cids = cids, pids = pids,
+                pfids = pfids, batch_size = batch_size, num_edges = num_edges,
+                block_size = self.block_size, TILE_SIZE_B = TILE_SIZE_B, B_NUM_TILES = B_NUM_TILES,
+                TILE_SIZE_K = TILE_SIZE_K, TILE_SIZE_M = TILE_SIZE_M, TL_DOT = TL_DOT, grid = grid,
+                partition_id = partition_id,
+            ))
+            return None
 
         if self._ext_bw_par_sb_hook is not None or self._ext_bw_par_hook is not None:
             # As in the element-flow path: everything below writes the SHARED-parameter flows.

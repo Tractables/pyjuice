@@ -129,3 +129,89 @@ def _bs_triton_ele_kernel(node_flows, element_flows, node_mars, element_mars, mp
 
     offs_elemfs = (off_eleids + offs_ele[:,None]) * batch_size + offs_batch[None,:]
     tl.store(element_flows + offs_elemfs, acc, mask = mask_batch[None,:])
+
+
+@triton_jit
+def _bs_triton_par_kernel(node_flows, node_mars, element_mars, mparams, param_flows,
+                          ext, gate, nids, cids, pids, pfids,
+                          batch_size: tl.constexpr, num_edges: tl.constexpr,
+                          TILE_SIZE_B: tl.constexpr, B_NUM_TILES: tl.constexpr,
+                          TILE_SIZE_K: tl.constexpr, TILE_SIZE_M: tl.constexpr,
+                          BLOCK_SIZE_M: tl.constexpr, TL_DOT: tl.constexpr,
+                          NODE_CBS: tl.constexpr, GATE_CBS: tl.constexpr,
+                          gate_stride: tl.constexpr, ext_base, pid_m_offset = 0):
+    """
+    Gated parameter-flow backward, a fork of `_bk_triton_block_sparse_par_kernel_rmw`.
+
+    The counterpart of `_bs_triton_ele_kernel`, and the reason it exists is the same: without it the
+    param flows have no Triton path, so their supported regime is narrower than the element flows' --
+    `num_edges % 128 == 0` (the CuTe kernel's edge subtile) and `block_size % 64 == 0`, which a
+    64-state layer fails while its element flows are served fine.
+
+    `phi` depends on the CONTRACTED index `b`, so unlike the element kernel it cannot be pulled out of
+    the reduction. It folds onto `element_mars` instead -- `emars` here is already `[batch, edge]`,
+    exactly the gate's shape -- which is where the CuTe fork puts it too, and leaves the
+    `node_mars == -inf` branch untouched. `-inf` for an absent gate zeroes the edge through
+    `exp(emars + ...)`, matching what the ungated kernel computes for a padded edge.
+
+    Non-atomic read-add-store, so it inherits the parent's requirement that `pfids` be collision-free.
+    """
+    pid_k = tl.program_id(0)
+    pid_m = tl.program_id(1) + pid_m_offset
+
+    nblock_id = pid_m // (BLOCK_SIZE_M // TILE_SIZE_M)
+    tile_id = pid_m % (BLOCK_SIZE_M // TILE_SIZE_M)
+
+    offs_batch = tl.arange(0, TILE_SIZE_B)
+    mask_batch = offs_batch < batch_size
+
+    offs_edge = tl.arange(0, TILE_SIZE_K) + pid_k * TILE_SIZE_K
+    edge_start = tl.load(cids + nblock_id * num_edges + offs_edge)
+    emars_ptr = element_mars + edge_start[None,:] * batch_size + offs_batch[:,None]
+
+    offs_node = tl.arange(0, TILE_SIZE_M) + tile_id * TILE_SIZE_M
+    off_nids = tl.load(nids + nblock_id)
+    nmars_ptr = node_mars + (off_nids + offs_node[:,None]) * batch_size + offs_batch[None,:]
+    nflows_ptr = node_flows + (off_nids + offs_node[:,None]) * batch_size + offs_batch[None,:]
+
+    # Each edge's gate row. Constant across the batch loop, so resolved once: which child block the
+    # edge falls in picks the row, and where it sits inside that block picks the gate.
+    gbase = tl.load(gate + nblock_id * gate_stride + (offs_edge // NODE_CBS))
+    grow = gbase + ext_base + ((offs_edge % NODE_CBS) // GATE_CBS)
+    ghas = gbase >= 0
+
+    acc = tl.zeros([TILE_SIZE_M, TILE_SIZE_K], dtype = tl.float32)
+
+    for b in range(0, B_NUM_TILES):
+        emars = tl.load(emars_ptr, mask = mask_batch[:,None], other = 0.0)
+        lphi = tl.load(ext + grow[None,:] * batch_size + offs_batch[:,None],
+                       mask = mask_batch[:,None] & ghas[None,:], other = 0.0)
+        emars = tl.where(ghas[None,:], emars + lphi, -float("inf"))
+
+        nmars = tl.load(nmars_ptr, mask = mask_batch[None,:], other = 0.0)
+        nflows = tl.load(nflows_ptr, mask = mask_batch[None,:], other = 0.0)
+        log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), nflows - nmars)
+
+        log_n_fdm_max = tl.max(log_n_fdm, axis = 0)
+        n_fdm_sub = tl.where(log_n_fdm_max[None,:] != -float("inf"),
+                             tl.exp(log_n_fdm - log_n_fdm_max[None,:]), 0.0)
+        scaled_emars = tl.exp(emars + log_n_fdm_max[:,None])
+
+        if TL_DOT == 1:
+            acc += tl.dot(n_fdm_sub, scaled_emars)
+        else:
+            acc += tl.sum(n_fdm_sub[:,:,None] * scaled_emars[None,:,:], axis = 1)
+
+        emars_ptr += TILE_SIZE_B
+        nmars_ptr += TILE_SIZE_B
+        nflows_ptr += TILE_SIZE_B
+        offs_batch += TILE_SIZE_B
+        mask_batch = offs_batch < batch_size
+
+    par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
+    epars = tl.load(mparams + offs_node[:,None] + par_start[None,:])
+    pflows = acc * epars
+
+    parflow_start = tl.load(pfids + nblock_id * num_edges + offs_edge)
+    offsets = offs_node[:,None] + parflow_start[None,:]
+    tl.store(param_flows + offsets, tl.load(param_flows + offsets) + pflows)

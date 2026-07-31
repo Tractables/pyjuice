@@ -603,6 +603,7 @@ class ExternalParamsSumLayer(SumLayer):
             self._ext_bw_ele_hook = None
             self._ext_bw_par_hook = None
             self._ext_bw_par_sb_hook = None
+            self._ext_bw_par_triton_hook = None
 
         return None
 

@@ -136,11 +136,13 @@ def _reference(pc, ns, prod, phi, gate_cbs, batch):
 
 # The grid. Each row is a distinct path: which fork runs, how many parent blocks a child block has,
 # how many gates tile a child block, and the register state the small-batch kernels size to the batch.
+# `(128, 64)` and `(64, 64)` have `num_edges % 128 != 0`, so no CUDA param fork applies and the
+# Triton one has to carry them -- the shapes that motivated writing it.
 LARGE = [(K, bs, g, b)
-         for K, bs in ((128, 128), (256, 128), (256, 256), (512, 128))
+         for K, bs in ((128, 128), (256, 128), (256, 256), (512, 128), (128, 64), (64, 64))
          for g in (4, 8, 16, 32, 64)
          for b in (64, 128)
-         if g <= bs]
+         if g <= bs and g <= 64]
 
 SMALL = [(K, K, g, b)
          for K in (128, 256, 512)

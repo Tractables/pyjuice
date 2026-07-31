@@ -91,7 +91,8 @@ class BlockScaleSumParams(ExternalSumParams):
     :type ch_block_size: Optional[int]
 
     :param apply_z_correction: whether the parameter flows include the term coming from `Z`'s own
-                               dependence on `theta`. See :func:`post_backward_layer`.
+                               dependence on `theta`. **Not implemented, and measured not to be worth
+                               implementing** -- see below.
     :type apply_z_correction: bool
 
     :param tie_external: share one gate tensor across every copy of a tied node, instead of one per copy.
@@ -125,10 +126,30 @@ class BlockScaleSumParams(ExternalSumParams):
         self.ch_block_size = ch_block_size
 
         # `Z = sum_c phi * theta` depends on `theta`, unlike the low-rank parameterization where the
-        # shared parameters' contribution to the normalizer was the constant 1. So the exact derivative
-        # w.r.t. `log theta` carries a second term, `- theta * sum_b f phi / Z`. Off by default: the first
-        # term alone still sums to `sum_b f` per node, so it drops straight into PyJuice's EM optimizers,
-        # whereas the corrected quantity sums to zero and is a gradient, not an expected count.
+        # shared parameters' contribution to the normalizer was the constant 1. So the M-step pyjuice
+        # performs -- normalize the flows per node -- solves a stationarity condition missing the term
+        # `sum_b f_b * theta_b`, and is therefore not exactly EM under a live gate.
+        #
+        # MEASURED, not assumed. A corrected M-step (exact normalization within each gate, plus an MM
+        # update on the gate masses) was prototyped and compared against the shipped one:
+        #
+        #   * it is REAL: +0.09 to +0.13 train LL, at every data-to-parameter ratio over a 100x sweep
+        #     (256 to 32768 samples against 16384 parameters). So the dropped term is not negligible.
+        #   * it does NOT generalize: held-out LL was worse in 6 of 6 runs, by 0.04 to 0.10. It is a
+        #     better optimizer of the training objective, and what that extra fit buys is the training
+        #     set's particular gate configuration -- gates are per-sample, so it does not transfer.
+        #   * for scale: the gate itself is worth +0.5 to +1.25 nats of held-out LL over an ungated
+        #     model, with the UNCORRECTED M-step. The correction is an order of magnitude smaller and
+        #     points the wrong way.
+        #
+        # Full-batch EM was also verified monotone under live gates (no decrease in 12 steps at gate
+        # scales 0, 1 and 3, with `pseudocount = 0` so that exact EM would be provably monotone).
+        #
+        # So the uncorrected M-step is the better default, not merely the convenient one, and this flag
+        # raises rather than silently doing nothing. The prototype is ~20 lines of PyTorch and the
+        # comparison is cheap to re-run if a setting arises where it might differ -- in particular a
+        # multi-timestep HMM, where gates are correlated ACROSS timesteps within a sample, which the
+        # single-layer test that produced these numbers does not exercise.
         self.apply_z_correction = bool(apply_z_correction)
 
         # Share one gate tensor across the copies of a tied node (see `storage_owner`).
@@ -599,9 +620,12 @@ class BlockScaleSumParams(ExternalSumParams):
         # get a circuit whose `node_mars` was left shifted.
         if self.apply_z_correction:
             raise NotImplementedError(
-                "`apply_z_correction = True` is not implemented: the parameter flows this writes are "
-                "the first term only, `sum_b f phi theta e^em / N`, which is the expected count "
-                "PyJuice's EM optimizers consume."
+                "`apply_z_correction = True` is not implemented, and was measured not to be worth "
+                "implementing: a prototype of the corrected M-step gains +0.09 to +0.13 TRAIN LL at "
+                "every data-to-parameter ratio, but was WORSE on held-out LL in 6 of 6 runs (by 0.04 "
+                "to 0.10) -- it fits the training set's per-sample gate configuration, which does not "
+                "transfer. For scale, the gate itself is worth +0.5 to +1.25 nats held-out with the "
+                "uncorrected M-step. See `BlockScaleSumParams.__init__` for the full measurement."
             )
 
         external_params = kwargs.get(_buffer_kwarg(), None)
@@ -768,9 +792,28 @@ class BlockScaleSumParams(ExternalSumParams):
                 nids, cids, pids, pfids, layer.ext_slots[0][partition_id],
                 batch, blk_size, num_edges, node_cbs, gate_cbs, ext_base, 0)
 
+        def _par_triton_hook(ctx):
+            """The gated param flows via Triton, for shapes no CUDA fork covers."""
+            from .kernels.blockscale_backward import _bs_triton_par_kernel
+            gb, grid = layer.ext_slots[0][ctx["partition_id"]], ctx["grid"]
+            for s0 in range(0, grid[1], 32768):
+                cg = (grid[0], min(s0 + 32768, grid[1]) - s0)
+                _bs_triton_par_kernel[cg](
+                    node_flows = ctx["node_flows"], node_mars = ctx["node_mars"],
+                    element_mars = ctx["element_mars"], mparams = ctx["params"],
+                    param_flows = ctx["param_flows"], ext = external_params, gate = gb,
+                    nids = ctx["nids"], cids = ctx["cids"], pids = ctx["pids"], pfids = ctx["pfids"],
+                    batch_size = ctx["batch_size"], num_edges = ctx["num_edges"],
+                    TILE_SIZE_B = ctx["TILE_SIZE_B"], B_NUM_TILES = ctx["B_NUM_TILES"],
+                    TILE_SIZE_K = ctx["TILE_SIZE_K"], TILE_SIZE_M = ctx["TILE_SIZE_M"],
+                    BLOCK_SIZE_M = ctx["block_size"], TL_DOT = ctx["TL_DOT"],
+                    NODE_CBS = node_cbs, GATE_CBS = gate_cbs, gate_stride = gb.size(1),
+                    ext_base = ext_base, pid_m_offset = s0, num_stages = 1)
+
         layer._ext_bw_ele_hook = _ele_hook
         layer._ext_bw_par_hook = _par_hook if par_mod is not None else None
         layer._ext_bw_par_sb_hook = _par_sb_hook if sb_mod is not None else None
+        layer._ext_bw_par_triton_hook = _par_triton_hook
 
         return None
 
@@ -783,6 +826,7 @@ class BlockScaleSumParams(ExternalSumParams):
         layer._ext_bw_ele_hook = None
         layer._ext_bw_par_hook = None
         layer._ext_bw_par_sb_hook = None
+        layer._ext_bw_par_triton_hook = None
 
         from .kernels.c import get_module
 
