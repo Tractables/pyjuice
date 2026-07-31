@@ -725,6 +725,345 @@ def test_backward_outside_the_supported_regime_raises():
 
 
 
+# ------------------------------------------------------------------- backward, in wider circuits
+
+def _two_gated_layers(K, bs, batch, dev, g0_cbs = 8, g1_cbs = 16, plain_second = False):
+    """A circuit with two gated sum layers stacked (or one gated and one plain)."""
+    torch.manual_seed(0)
+    nb = K // bs
+    with juice.set_block_size(bs):
+        n0 = inputs(0, num_node_blocks = nb, dist = dists.Categorical(num_cats = NUM_CATS))
+        n1 = inputs(1, num_node_blocks = nb, dist = dists.Categorical(num_cats = NUM_CATS))
+        s0 = summate(multiply(n0, n1), num_node_blocks = nb,
+                     external_params = BlockScaleSumParams(ch_block_size = g0_cbs))
+        n2 = inputs(2, num_node_blocks = nb, dist = dists.Categorical(num_cats = NUM_CATS))
+        kw = {} if plain_second else {"external_params": BlockScaleSumParams(ch_block_size = g1_cbs)}
+        s1 = summate(multiply(s0, n2), num_node_blocks = nb, **kw)
+        root = summate(multiply(s1), num_node_blocks = 1, block_size = 1)
+
+    torch.manual_seed(0)
+    root.init_parameters(perturbation = 2.0)
+    pc = juice.compile(root, verbose = False).to(dev)
+
+    torch.manual_seed(7)
+    data = torch.randint(0, NUM_CATS, [batch, 3], device = dev)
+    return pc, s0, s1, data
+
+
+@cuda_only
+@needs_cute
+def test_backward_through_two_gated_layers():
+    """Two gated layers stacked: the lower one's flows come from the upper one's backward, so its
+    reference has to hold with a gated layer above it, not just a plain one."""
+    dev = torch.device("cuda:0")
+    batch = 64
+    pc, s0, s1, data = _two_gated_layers(256, 128, batch, dev)
+
+    g0 = torch.randn(_gate_shape(s0, batch), device = dev) * 1.0
+    g1 = torch.randn(_gate_shape(s1, batch), device = dev) * 1.0
+
+    pc(data, sum_external_params = {s0: g0, s1: g1})
+    pc.backward(data, flows_memory = 0.0)
+
+    # The reference is checked for the DEEPER layer only, and that is the interesting one here: its
+    # node flows come from a gated layer rather than a plain one. The upper layer cannot be checked
+    # the same way -- `element_mars` and `element_flows` are circuit-wide buffers whose rows are
+    # REUSED across layer groups (both product layers here occupy the same rows), so after the pass
+    # they hold the last-processed group's values, not the upper layer's.
+    ref_ef, ref_pf = _flow_reference(pc, s0, g0, 8, batch)
+
+    s0.update_param_flows(pc.param_flows)
+    got_pf = s0.get_param_flows().double().to(ref_pf.device)
+    assert float(((got_pf - ref_pf).abs() / ref_pf.clamp(min = 1e-30)).max()) < 3e-3
+
+    live = torch.isfinite(ref_ef)
+    assert float((pc.element_flows[:, :batch].double()[live] - ref_ef[live]).abs().max()) < 2e-3
+
+    # For the upper layer: its flows must be real and must respond to its OWN gate, which is what
+    # rules out the two layers sharing a plan or a gate table.
+    s1.update_param_flows(pc.param_flows)
+    upper = s1.get_param_flows().clone()
+    assert torch.isfinite(upper).all() and float(upper.abs().sum()) > 0.0
+
+    pc(data, sum_external_params = {s0: g0, s1: g1 * 0.0})
+    pc.backward(data, flows_memory = 0.0)
+    s1.update_param_flows(pc.param_flows)
+    assert not torch.allclose(upper, s1.get_param_flows()), \
+        "the upper layer's own gate did not reach its parameter flows"
+
+    s0.update_param_flows(pc.param_flows)
+    assert not torch.allclose(got_pf.float().cpu(), s0.get_param_flows()), \
+        "the upper layer's gate did not propagate down to the lower layer's flows"
+
+
+@cuda_only
+@needs_cute
+def test_backward_with_a_plain_layer_above_the_gated_one():
+    """A plain sum layer in the same circuit must take the STANDARD kernels while the gated one takes
+    the forks. The interception is installed per layer and only for the duration of that layer's
+    backward, so a leak would show up here as the plain layer's flows going through a gated kernel."""
+    dev = torch.device("cuda:0")
+    batch = 64
+    pc_a, s0, plain, data = _two_gated_layers(256, 128, batch, dev, plain_second = True)
+    phi = torch.randn(_gate_shape(s0, batch), device = dev) * 1.0
+
+    pc_a(data, sum_external_params = {s0: phi})
+    pc_a.backward(data, flows_memory = 0.0)
+
+    ref_ef, ref_pf = _flow_reference(pc_a, s0, phi, 8, batch)
+    live = torch.isfinite(ref_ef)
+    assert float((pc_a.element_flows[:, :batch].double()[live] - ref_ef[live]).abs().max()) < 2e-3
+
+    # the plain layer's own flows must match what the same circuit computes with a unit gate, where
+    # the gated layer is the identity and the whole circuit is an ordinary PC
+    plain.update_param_flows(pc_a.param_flows)
+    with_gate = plain.get_param_flows().clone()
+
+    pc_a(data, sum_external_params = {s0: torch.zeros_like(phi)})
+    pc_a.backward(data, flows_memory = 0.0)
+    plain.update_param_flows(pc_a.param_flows)
+    assert not torch.allclose(with_gate, plain.get_param_flows()), \
+        "the gate below did not reach the plain layer's flows at all"
+    assert torch.isfinite(plain.get_param_flows()).all()
+
+
+@cuda_only
+@needs_cute
+def test_backward_with_tied_external_gates():
+    """A tied node and its copy share one gate tensor, and both layers' backwards read it."""
+    dev = torch.device("cuda:0")
+    batch, K, bs = 64, 256, 128
+    torch.manual_seed(0)
+
+    with juice.set_block_size(bs):
+        n0 = inputs(0, num_node_blocks = K // bs, dist = dists.Categorical(num_cats = NUM_CATS))
+        n1 = inputs(1, num_node_blocks = K // bs, dist = dists.Categorical(num_cats = NUM_CATS))
+        s0 = summate(multiply(n0, n1), num_node_blocks = K // bs,
+                     external_params = BlockScaleSumParams(ch_block_size = 8, tie_external = True))
+        n2 = inputs(2, num_node_blocks = K // bs, dist = dists.Categorical(num_cats = NUM_CATS))
+        s1 = s0.duplicate(multiply(s0, n2), tie_params = True)
+        root = summate(multiply(s1), num_node_blocks = 1, block_size = 1)
+
+    torch.manual_seed(0)
+    root.init_parameters(perturbation = 2.0)
+    pc = juice.compile(root, verbose = False).to(dev)
+
+    torch.manual_seed(7)
+    data = torch.randint(0, NUM_CATS, [batch, 3], device = dev)
+    phi = torch.randn(_gate_shape(s0, batch), device = dev) * 1.0
+
+    pc(data, sum_external_params = {s0: phi})
+    pc.backward(data, flows_memory = 0.0)
+    # `-inf` is the resting value of `element_flows` for rows no layer wrote, so NaN is the failure
+    # mode to look for here, not non-finiteness.
+    assert not torch.isnan(pc.element_flows[:, :batch]).any()
+    assert torch.isfinite(pc.param_flows).all() and float(pc.param_flows.abs().sum()) > 0.0
+
+    # the shared gate must reach BOTH layers' flows: zeroing it changes them
+    ref = pc.param_flows.clone()
+    pc(data, sum_external_params = {s0: torch.zeros_like(phi)})
+    pc.backward(data, flows_memory = 0.0)
+    assert not torch.allclose(ref, pc.param_flows)
+
+
+# ------------------------------------------------------------------- backward, accumulation & repeats
+
+@cuda_only
+@needs_cute
+def test_param_flows_accumulate_across_backwards():
+    """The param-flow kernel is READ-ACCUMULATE-WRITE, which is what lets one EM step span several
+    mini-batches. A store-only kernel would pass every single-batch test and silently drop everything
+    but the last batch here."""
+    pc, root, ns, data, phi, _ = _run(128, 128, 8, 64, scale = 1.0)
+
+    pc.backward(data, flows_memory = 0.0)
+    ns.update_param_flows(pc.param_flows)
+    once = ns.get_param_flows().clone()
+
+    pc.backward(data, flows_memory = 1.0)          # keep what is there and add the same batch again
+    ns.update_param_flows(pc.param_flows)
+    twice = ns.get_param_flows()
+
+    assert float(once.abs().sum()) > 0.0
+    d = float(((twice - 2.0 * once).abs() / once.clamp(min = 1e-30)).max())
+    assert d < 1e-5, f"a second accumulation did not double the flows (off by {d} relative)"
+
+
+@cuda_only
+@needs_cute
+def test_backward_is_deterministic():
+    """Same inputs, same flows. The forks accumulate without atomics, so this is exact -- a drift here
+    would mean a race, not rounding."""
+    pc, root, ns, data, phi, _ = _run(128, 128, 8, 64, scale = 1.5)
+
+    pc.backward(data, flows_memory = 0.0)
+    ef0, pf0 = pc.element_flows.clone(), pc.param_flows.clone()
+
+    pc(data, sum_external_params = {ns: phi})
+    pc.backward(data, flows_memory = 0.0)
+
+    assert torch.equal(ef0, pc.element_flows), "element flows differ between identical runs"
+    assert torch.equal(pf0, pc.param_flows), "param flows differ between identical runs"
+
+
+@cuda_only
+@needs_cute
+@pytest.mark.parametrize("scale", [8.0, 30.0])
+def test_extreme_gates_keep_the_backward_finite(scale):
+    """Gates far outside the sane range must not produce NaN. The element flows run through an online
+    log-sum-exp whose running maximum the gate SHIFTS, so an unguarded `-inf + x` there surfaces here."""
+    pc, root, ns, data, phi, lls = _run(128, 128, 8, 64, scale = scale)
+    pc.backward(data, flows_memory = 0.0)
+
+    assert not torch.isnan(pc.element_flows[:, :64]).any(), "NaN in the element flows"
+    assert not torch.isnan(pc.param_flows).any(), "NaN in the param flows"
+    assert torch.isfinite(pc.param_flows).all(), "non-finite param flows"
+
+
+@cuda_only
+@needs_cute
+def test_backward_after_a_batch_size_change():
+    """The forward caches `log Z` and the launch plan per batch size; the backward must follow it
+    rather than reuse the previous pass's."""
+    dev = torch.device("cuda:0")
+    root, ns = _build(128, 128, 8, seed = 0)
+    pc = juice.compile(root, verbose = False).to(dev)
+
+    for batch in (64, 128, 64):
+        torch.manual_seed(7)
+        data = torch.randint(0, NUM_CATS, [batch, 2], device = dev)
+        phi = torch.randn(_gate_shape(ns, batch), device = dev) * 1.0
+
+        pc(data, sum_external_params = {ns: phi})
+        pc.backward(data, flows_memory = 0.0)
+
+        ref_ef, _ = _flow_reference(pc, ns, phi, 8, batch)
+        live = torch.isfinite(ref_ef)
+        d = float((pc.element_flows[:, :batch].double()[live] - ref_ef[live]).abs().max())
+        assert d < 2e-3, f"element flows off by {d} at batch {batch}"
+
+
+# --------------------------------------------------------------------------------- EM training
+
+def _em_history(pc, ns, data, phi, steps):
+    """Full-batch EM; the log-likelihood before each step, and once more after the last."""
+    kw = {} if phi is None else {"sum_external_params": {ns: phi}}
+    hist = []
+    for _ in range(steps):
+        hist.append(float(pc(data, **kw).mean()))
+        pc.backward(data, flows_memory = 0.0)
+        pc.mini_batch_em(step_size = 1.0, pseudocount = 0.01)
+    hist.append(float(pc(data, **kw).mean()))
+    return hist
+
+
+@cuda_only
+@needs_cute
+def test_em_training_with_unit_gates_reproduces_the_plain_pc():
+    """`log phi = 0` makes the circuit an ordinary PC, so a whole EM trajectory must match one.
+
+    This is the integration statement the unit tests cannot make: the param flows the forks write are
+    what the optimizer consumes, so a constant factor or a mis-scaled block -- invisible in a relative
+    comparison of a single backward -- would pull the two trajectories apart step by step."""
+    dev = torch.device("cuda:0")
+    batch = 64
+
+    root_a, ns_a = _build(128, 128, 8, seed = 0)
+    root_b, ns_b = _build(128, 128, None, seed = 0)
+    pc_a = juice.compile(root_a, verbose = False).to(dev)
+    pc_b = juice.compile(root_b, verbose = False).to(dev)
+
+    torch.manual_seed(7)
+    data = torch.randint(0, NUM_CATS, [batch, 2], device = dev)
+    phi = torch.zeros(_gate_shape(ns_a, batch), device = dev)
+
+    ha = _em_history(pc_a, ns_a, data, phi, steps = 5)
+    hb = _em_history(pc_b, ns_b, data, None, steps = 5)
+
+    d = max(abs(x - y) for x, y in zip(ha, hb))
+    assert d < 2e-3, f"EM trajectories diverge by {d}: gated {ha} vs plain {hb}"
+
+
+@cuda_only
+@needs_cute
+def test_em_training_improves_the_likelihood_under_a_live_gate():
+    """EM on the shared parameters with a fixed, non-trivial gate must still climb.
+
+    The gate makes the effective parameters depend on `theta` through `Z`, so this is no longer exact
+    EM and monotonicity is not guaranteed step by step -- what is asserted is that the flows point
+    uphill, which they cannot do if they are wrong."""
+    dev = torch.device("cuda:0")
+    batch = 128
+
+    root, ns = _build(128, 128, 8, seed = 1)
+    pc = juice.compile(root, verbose = False).to(dev)
+
+    # structured data, so there is something to fit
+    g = torch.Generator().manual_seed(3)
+    joint = torch.rand([NUM_CATS, NUM_CATS], generator = g) ** 3
+    idx = torch.multinomial(joint.reshape(-1), batch, replacement = True, generator = g)
+    data = torch.stack([idx // NUM_CATS, idx % NUM_CATS], dim = 1).to(dev)
+
+    torch.manual_seed(11)
+    phi = torch.randn(_gate_shape(ns, batch), device = dev) * 1.0
+
+    hist = _em_history(pc, ns, data, phi, steps = 8)
+    assert all(x == x for x in hist), f"NaN in the EM trajectory: {hist}"
+    assert hist[-1] > hist[0] + 1e-3, f"EM did not improve the likelihood: {hist}"
+
+
+# --------------------------------------------------------------------------------- the boundary
+
+@cuda_only
+@needs_cute
+@pytest.mark.parametrize("num_latents,block_size,batch,why", [
+    (256, 64, 64, "child block below the element-flow kernel's 128-row tile"),
+    (128, 128, 8, "batch the element-flow kernel cannot tile"),
+])
+def test_backward_outside_the_kernels_regime_raises(num_latents, block_size, batch, why):
+    """The forward serves shapes the backward does not -- the small-batch forward kernel needs neither
+    `batch % 64` nor a 128-row child block. Where the backward cannot follow it must raise, because
+    the standard kernels it would otherwise fall through to compute the UNGATED flows.
+
+    This pins the supported region: when one of these starts passing, a case has been implemented."""
+    pc, root, ns, data, phi, _ = _run(num_latents, block_size, 8, batch, scale = 1.0)
+
+    with pytest.raises(NotImplementedError, match = "block-sparse CUDA regime"):
+        pc.backward(data, flows_memory = 0.0)
+
+
+@cuda_only
+@needs_cute
+@pytest.mark.parametrize("edge_ids,why", [
+    (torch.tensor([[0, 0, 1], [0, 1, 1]]), "a row with fewer edge blocks than the widest"),
+])
+def test_ragged_edge_structures_raise(edge_ids, why):
+    """Rows that do not all carry the same dense run of edge blocks get PADDED into a partition, and
+    padding breaks the contiguity both kernels index by. Rejected at the forward, before any of this
+    reaches the backward -- recorded here so the boundary is visible if it moves."""
+    dev = torch.device("cuda:0")
+    torch.manual_seed(0)
+
+    with juice.set_block_size(128):
+        ni = [inputs(v, num_node_blocks = 2, dist = dists.Categorical(num_cats = NUM_CATS))
+              for v in range(2)]
+        ns = summate(multiply(*ni), num_node_blocks = 2, edge_ids = edge_ids,
+                     external_params = BlockScaleSumParams(ch_block_size = 8))
+        root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
+
+    torch.manual_seed(0)
+    root.init_parameters(perturbation = 2.0)
+    pc = juice.compile(root, verbose = False).to(dev)
+
+    torch.manual_seed(7)
+    data = torch.randint(0, NUM_CATS, [64, 2], device = dev)
+    phi = torch.randn(_gate_shape(ns, 64), device = dev)
+
+    with pytest.raises(NotImplementedError, match = "no block-scale forward applies"):
+        pc(data, sum_external_params = {ns: phi})
+
+
+
 if __name__ == "__main__":
     test_single_gate_is_a_no_op(64, 64)
     test_matches_materialized_pc(256, 64, 8, 64)
