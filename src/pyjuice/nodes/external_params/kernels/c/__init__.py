@@ -35,6 +35,47 @@ def _compile_flags():
     return ["-O3", f"-arch=sm_{cc[0]}{cc[1]}", "--use_fast_math", "-DNDEBUG"]
 
 
+_sb_module = None
+_sb_attempted = False
+
+
+def get_sb_module():
+    """The SMALL-BATCH block-scale extension, or None if unavailable (warns once).
+
+    Deliberately its own extension, and plain CUDA: it uses no CuTe, no TMA and no CUTLASS, so unlike
+    `get_cute_module` it compiles on any CUDA GPU and must not be taken down by a CUTLASS failure. It
+    serves the batches the CuTe fork cannot tile at all (`batch % 64 != 0`).
+    """
+    global _sb_module, _sb_attempted
+
+    if _sb_attempted:
+        return _sb_module
+
+    _sb_attempted = True
+
+    if not ENABLE_CUDA_KERNELS:
+        return None
+
+    flags = _compile_flags()
+    if flags is None:
+        return None
+
+    from pyjuice.utils.cuda_ext import jit_load
+    try:
+        _sb_module = jit_load(
+            "pyjuice_blockscale_sb_cuda",
+            sources = [os.path.join(_THIS_DIR, "blockscale_smallbatch_forward.cu")],
+            extra_cuda_cflags = flags, verbose = False)
+    except Exception as e:
+        warnings.warn(
+            f"pyjuice CUDA kernel 'pyjuice_blockscale_sb_cuda' failed to compile "
+            f"({type(e).__name__}: {e}). The small-batch block-scale path is unavailable.",
+            RuntimeWarning)
+        _sb_module = None
+
+    return _sb_module
+
+
 def get_module():
     """The loaded extension, or None if it is unavailable (warns once)."""
     global _module, _attempted

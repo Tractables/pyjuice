@@ -222,21 +222,29 @@ class BlockScaleSumParams(ExternalSumParams):
 
     def _build_plan(self, layer, ns_tensors, node_mars, element_mars, params, external_params):
         """
-        Resolve every per-layer launch argument once, and check the CuTe kernel's assumptions.
+        Resolve every per-layer launch argument once, and check each kernel's assumptions.
 
-        This parameterization has no fallback: the forward is a fork of pyjuice's CuTe/TMA sum kernel,
-        so wherever that kernel does not apply, neither does this. Everything unsupported raises rather
-        than silently running something slower or, worse, something wrong.
+        TWO kernels serve this type, and which applies is a property of the shape:
+
+          * the CuTe/TMA fork, for batches it can tile (`batch % 64 == 0`) on sm_90+ with CUTLASS. It
+            carries the normalizer as a gate-factored contraction against a precomputed `sigma`;
+          * a plain-CUDA small-batch kernel, one warp per 32 nodes, which accumulates the normalizer
+            inline and needs neither `batch % 64` nor `num_edges % 64` nor CUTLASS.
+
+        Both are collected here and the choice is MEASURED, so where they overlap the faster one wins
+        rather than the one that happened to be checked first. Where neither applies this raises: there
+        is no Triton fallback for this parameterization.
         """
-        from .kernels.c import get_cute_module
+        from .kernels.c import get_cute_module, get_sb_module
         import pyjuice.layer.kernels.c as ck
 
         mod = get_cute_module()
-        if mod is None:
+        sb_mod = get_sb_module()
+        if mod is None and sb_mod is None:
             raise NotImplementedError(
-                "`BlockScaleSumParams` needs the CuTe/TMA CUDA extension, which is unavailable here "
-                "(it requires nvcc, CUTLASS headers and a TMA-capable GPU, sm_90+). There is no Triton "
-                "fallback for this parameterization -- see the compile warning above."
+                "`BlockScaleSumParams` needs one of its CUDA extensions, and neither is available here "
+                "(the CuTe forward needs nvcc, CUTLASS and sm_90+; the small-batch forward needs only "
+                "nvcc). There is no Triton fallback -- see the compile warning above."
             )
 
         if getattr(layer, "ext_slots", None) is None:
@@ -262,25 +270,21 @@ class BlockScaleSumParams(ExternalSumParams):
         # The tiles that fit BOTH this layer's shape and this DEVICE. The kernel decides the second
         # part: its shared-memory need depends on the gate width, and the opt-in ceiling is a property
         # of the part (48 / 64 / 100 / 227 KB), not something to hardcode.
-        cfgs = [tuple(c) for c in mod.configs()]
-        valid = [int(i) for i in mod.fitting_configs(block_size, batch_size, gate_cbs)]
-        if not valid:
-            raise NotImplementedError(
-                f"no CuTe tile fits this layer on this device: block_size={block_size}, "
-                f"batch={batch_size}, gate ch_block_size={gate_cbs}, tiles="
-                f"{[(c[0], c[1]) for c in cfgs]}. The gate needs `block_size % BM == 0` and "
-                f"`batch % BN == 0`, and the tile's shared memory must fit -- a larger node "
-                f"`block_size` (>= 64) is usually the fix; the gate can still be made fine through its "
-                f"own `ch_block_size`, which costs nothing."
-            )
-        cfg = valid[0]      # provisional; the real one is measured once the launch args exist
+        cfgs = [tuple(c) for c in mod.configs()] if mod is not None else []
+        valid = ([int(i) for i in mod.fitting_configs(block_size, batch_size, gate_cbs)]
+                 if mod is not None else [])
+        cfg = valid[0] if valid else 0    # provisional; measured once the launch args exist
+
+        # The small-batch kernel needs only 32-node groups, but its children must be contiguous across
+        # the WHOLE row rather than within each edge tile -- it walks the edge axis with a single base.
+        sb_ok = (sb_mod is not None) and (block_size % 32 == 0)
 
         first_view = ns_tensors[0][1][0]
         ext_base = ((first_view.data_ptr() - external_params.data_ptr())
                     // external_params.element_size()) // batch_size
 
         dev = node_mars.device
-        calls = []
+        calls, sb_calls = [], []
         for partition_id in range(layer.num_fw_partitions):
             nids = layer.partitioned_nids[partition_id]
             cids = layer.partitioned_cids[partition_id]
@@ -288,79 +292,119 @@ class BlockScaleSumParams(ExternalSumParams):
             gate = layer.ext_slots[0][partition_id]
 
             num_edges = cids.size(1)
-            if num_edges % 64 != 0:
-                raise NotImplementedError(
-                    f"the CuTe forward iterates the edge dimension in tiles of 64; this partition has "
-                    f"{num_edges} edges."
-                )
             if num_edges % node_cbs != 0:
                 raise NotImplementedError(
                     f"the compiled edge count ({num_edges}) must be a whole number of child blocks "
                     f"({node_cbs})."
                 )
 
-            # The kernel reads `element_mars[ebase + e]` and `params[pbase + e * block_size + m]`, so
-            # the tile's children must be contiguous rows and its parameters must stride by
-            # `block_size`. Checked rather than assumed -- exactly as the standard kernel checks it.
-            knt = num_edges // 64
-            c3 = cids.view(-1, knt, 64).to(torch.int64)
-            p3 = pids.view(-1, knt, 64).to(torch.int64)
-            ebase = c3[:, :, 0].contiguous()
-            pbase = p3[:, :, 0].contiguous()
-            ar = torch.arange(64, device = cids.device, dtype = torch.int64)
-
-            if not (torch.equal(c3, ebase.unsqueeze(-1) + ar.view(1, 1, -1))
-                    and torch.equal(p3, pbase.unsqueeze(-1) + ar.view(1, 1, -1) * block_size)):
-                raise NotImplementedError(
-                    "`BlockScaleSumParams` needs the CuTe layout: each edge tile's children contiguous "
-                    "and its parameters strided by `block_size`."
-                )
-
             rows = nids.size(0)
             n_eblks = num_edges // node_cbs
-
-            sigma = torch.empty([rows * n_eblks * n_child_gates * block_size], dtype = torch.float32,
-                                device = dev)
             log_z = torch.empty([rows * block_size * batch_size], dtype = torch.float32, device = dev)
 
-            calls.append((nids, ebase, pbase, pids, gate, sigma, log_z,
-                          block_size, num_edges, node_cbs, gate_cbs, n_node_gates, ext_base, cfg))
+            c2 = cids.to(torch.int64)
+            p2 = pids.to(torch.int64)
+            ar_e = torch.arange(num_edges, device = cids.device, dtype = torch.int64)
 
-        # ---- PICK THE TILE BY MEASURING IT ----
+            # ---- the CuTe fork's layout: contiguous children and block_size-strided params PER TILE
+            if valid and num_edges % 64 == 0:
+                knt = num_edges // 64
+                c3, p3 = c2.view(-1, knt, 64), p2.view(-1, knt, 64)
+                ebase = c3[:, :, 0].contiguous()
+                pbase = p3[:, :, 0].contiguous()
+                ar = torch.arange(64, device = cids.device, dtype = torch.int64)
+
+                if (torch.equal(c3, ebase.unsqueeze(-1) + ar.view(1, 1, -1))
+                        and torch.equal(p3, pbase.unsqueeze(-1) + ar.view(1, 1, -1) * block_size)):
+                    sigma = torch.empty([rows * n_eblks * n_child_gates * block_size],
+                                        dtype = torch.float32, device = dev)
+                    calls.append((nids, ebase, pbase, pids, gate, sigma, log_z,
+                                  block_size, num_edges, node_cbs, gate_cbs, n_node_gates,
+                                  ext_base, cfg))
+
+            # ---- the small-batch kernel's layout: the same, but across the WHOLE row at once
+            if sb_ok:
+                eb_row = c2[:, 0].contiguous()
+                pb_row = p2[:, 0].contiguous()
+                if (torch.equal(c2, eb_row.unsqueeze(-1) + ar_e.view(1, -1))
+                        and torch.equal(p2, pb_row.unsqueeze(-1) + ar_e.view(1, -1) * block_size)):
+                    sb_calls.append((nids, eb_row, pb_row, gate, log_z,
+                                     block_size, num_edges, node_cbs, gate_cbs, ext_base, 0))
+
+        # Every partition must be served by the same kernel -- a plan that covers only some of them
+        # would silently leave the rest of the layer unevaluated.
+        if len(calls) != layer.num_fw_partitions:
+            calls = []
+        if len(sb_calls) != layer.num_fw_partitions:
+            sb_calls = []
+
+        if not calls and not sb_calls:
+            raise NotImplementedError(
+                f"no block-scale forward applies to this layer: block_size={block_size}, "
+                f"batch={batch_size}, gate ch_block_size={gate_cbs}, CuTe tiles="
+                f"{[(c[0], c[1]) for c in cfgs]}. The CuTe forward needs `block_size % BM == 0`, "
+                f"`batch % BN == 0`, `num_edges % 64 == 0` and enough shared memory; the small-batch "
+                f"forward needs `block_size % 32 == 0`. Both need each row's children contiguous and "
+                f"its parameters strided by `block_size`."
+            )
+
+        # ---- PICK THE KERNEL AND ITS CONFIG BY MEASURING THEM ----
         #
-        # There is no rule that gets this right. The kernel is latency bound at these grid sizes, so a
-        # narrower tile -- more blocks, each doing less -- usually wins; but the accumulator fragment is
-        # `BM * BN / threads` registers, and the fork carries three of them, so a tile with twice the
-        # WARPS halves the fragment and doubles the warps that fit per SM. The two pull in opposite
-        # directions and which wins flips with the batch size: at K=2048 batch=256 the narrow 8-warp
-        # tile is fastest, at batch=512 the wide one is, by 11%.
+        # No rule gets this right, for either choice. Between the two kernels: the CuTe fork wins
+        # comfortably at large batch, but its cost is a serial walk over each row's edge tiles, so as
+        # the batch shrinks towards its 64-wide tile it stops being obviously better than the
+        # small-batch kernel, which tiles the node axis instead. Within the CuTe fork: a narrower tile
+        # gives more blocks, which a latency-bound kernel wants, but the accumulator fragment is
+        # `BM * BN / threads` registers and the fork carries three of them, so a tile with twice the
+        # WARPS halves the fragment and doubles the warps resident per SM. Those pull opposite ways and
+        # which wins flips with the batch size.
         #
-        # Safe to run on the LIVE buffers because every write here is an assignment: `node_mars`,
-        # `log_z` and `sigma` are overwritten, never accumulated, so running a tile twice leaves
-        # exactly what running it once would (and every config computes bit-identical values -- they
-        # differ only in how the same contraction is tiled). `forward_layer` then does the real launch.
+        # Safe to run on the LIVE buffers because every write is an assignment: `node_mars`, `log_z`
+        # and `sigma` are overwritten, never accumulated, so a repeated trial leaves exactly what one
+        # run would. `forward_layer` then does the real launch.
         #
         # A read-accumulate-write kernel must NOT be tuned this way -- each trial would add its
         # contribution again. The backward is exactly that, so when it is autotuned it has to run into
         # a scratch clone, as `sum_layer`'s param-flow and element-flow tuners already do.
-        def with_cfg(i):
-            return [tuple(a[:-1]) + (i,) for a in calls]
+        def _with_cfg(argslist, i):
+            return [tuple(a[:-1]) + (i,) for a in argslist]
 
-        def runner(i):
-            tuned = with_cfg(i)
+        # Each trial launches the layer REPEATS times. The candidates differ by a few microseconds and
+        # a single launch spends comparable time in Python and in the driver, so timing one launch
+        # measures mostly that: with eight candidates the tuner mis-picked three of eight shapes,
+        # costing 29% on the worst. Repeating inside the timed region amortizes the overhead away, and
+        # is only safe because every launch here is idempotent (see the note above).
+        REPEATS = 10
+
+        def _runner(fn, argslist, i):
+            tuned = _with_cfg(argslist, i)
 
             def run():
-                for args in tuned:
-                    mod.blockscale_forward(node_mars, element_mars, params, external_params, *args)
+                for _ in range(REPEATS):
+                    for args in tuned:
+                        fn(node_mars, element_mars, params, external_params, *args)
 
             return run
 
-        best = ck.autotune([(i, runner(i)) for i in valid])
-        calls = with_cfg(best if best is not None else valid[0])
+        cands = []
+        if calls:
+            for i in valid:
+                cands.append((("cute", i), _runner(mod.blockscale_forward, calls, i)))
+        if sb_calls:
+            for i in range(len(sb_mod.blockscale_sb_configs())):
+                cands.append((("sb", i), _runner(sb_mod.blockscale_sb_forward, sb_calls, i)))
+
+        best = ck.autotune(cands, warmup = 2, reps = 9) or cands[0][0]
+        kind, best_cfg = best
+
+        if kind == "cute":
+            out_mod, fname, calls = mod, "blockscale_forward", _with_cfg(calls, best_cfg)
+        else:
+            out_mod, fname, calls = sb_mod, "blockscale_sb_forward", _with_cfg(sb_calls, best_cfg)
 
         layer._bs_bw_state = (block_size, batch_size, calls)
 
-        return mod, calls
+        return out_mod, fname, calls
 
     def forward_layer(self, layer, ns_tensors, node_mars, element_mars, params, **kwargs) -> None:
         """
@@ -385,9 +429,10 @@ class BlockScaleSumParams(ExternalSumParams):
                                             external_params))
             layer._bs_fw_plan = entry
 
-        mod, calls = entry[1]
+        mod, fname, calls = entry[1]
+        fn = getattr(mod, fname)
         for args in calls:
-            mod.blockscale_forward(node_mars, element_mars, params, external_params, *args)
+            fn(node_mars, element_mars, params, external_params, *args)
 
         return None
 
