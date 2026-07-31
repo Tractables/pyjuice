@@ -28,6 +28,7 @@
 // registers, which is far more register traffic than this needs.
 
 #include <torch/extension.h>
+#include <c10/cuda/CUDAException.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -204,6 +205,7 @@ void dense_expected_flow(torch::Tensor params, torch::Tensor param_flows, torch:
         case 64: DISPATCH(64); break;
         default: DISPATCH(8);  break;
     }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 #undef DISPATCH
 #undef LAUNCH_TL
     return;
@@ -321,6 +323,7 @@ void softevi_forward(torch::Tensor params, torch::Tensor node_mars, torch::Tenso
         case 32: FW(32); break;
         default: FW(16); break;
     }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 #undef FW
 }
 
@@ -426,6 +429,7 @@ void softevi_forward_dense(torch::Tensor params, torch::Tensor node_mars, torch:
         num_uniq.data_ptr<int>(), p_base.data_ptr<long>(), Z.data_ptr<float>(),                     \
         (int)num_latents, (int)uniq_stride, (int)max_refs, (int)num_slots); }
     switch (TLv) { case 8: GO(8); break; case 16: GO(16); break; default: GO(4); break; }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 #undef GO
     const long tot = layer_num_nodes * batch_size;
     softevi_fw_epilogue<<<(unsigned)((tot + 255) / 256), 256, 0, st>>>(
@@ -433,6 +437,7 @@ void softevi_forward_dense(torch::Tensor params, torch::Tensor node_mars, torch:
         log_ex_p.data_ptr<float>(), data.data_ptr<long>(), vids.data_ptr<long>(),
         s_pids.data_ptr<long>(), nids.data_ptr<long>(), var_idmapping.data_ptr<long>(),
         (int)layer_num_nodes, (int)batch_size, (int)node_offset, (int)num_latents);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

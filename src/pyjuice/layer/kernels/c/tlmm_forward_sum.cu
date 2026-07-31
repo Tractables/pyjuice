@@ -24,6 +24,7 @@
 #include <cuda_bf16.h>
 #include <cuda.h>
 #include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAException.h>
 #include <vector>
 #include <cute/tensor.hpp>
 #include <cute/atom/mma_atom.hpp>
@@ -228,6 +229,7 @@ static void launch_cfg(torch::Tensor node_mars, torch::Tensor element_mars, torc
         tlmm_kernel<BM, BN, WM, WN><<<grid, NTH, smem, c10::cuda::getCurrentCUDAStream()>>>(
             node_mars.data_ptr<float>(), params.data_ptr<float>(), nids.data_ptr<long>(),
             ebase.data_ptr<long>(), pbase.data_ptr<long>(), batch, block_size, knt, off, desc);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 }
 

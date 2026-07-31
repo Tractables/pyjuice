@@ -23,6 +23,7 @@
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 #include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAException.h>
 #include <vector>
 
 template <int SPLIT>
@@ -81,6 +82,7 @@ static void launch_sb(torch::Tensor node_mars, torch::Tensor element_mars, torch
         node_mars.data_ptr<float>(), element_mars.data_ptr<float>(), params.data_ptr<float>(),
         nids.data_ptr<long>(), ebase.data_ptr<long>(), pbase.data_ptr<long>(),
         batch, block_size, num_edges);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 // cfg id -> SPLIT (edge-warps). SPLIT=32 was the sweep winner; the autotuner picks per layer/batch.

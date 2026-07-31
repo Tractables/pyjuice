@@ -41,6 +41,7 @@
 #include <cuda_bf16.h>
 #include <cuda.h>
 #include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAException.h>
 #include <vector>
 #include <cmath>
 #include <cute/tensor.hpp>
@@ -537,6 +538,7 @@ static void launch_cfg(torch::Tensor node_mars, torch::Tensor element_mars, torc
             log_z.numel() ? log_z.data_ptr<float>() : nullptr,
             batch, block_size, knt, (int)gate.size(1), n_gates,
             node_cbs, gate_cbs, node_sh, gate_sh, ext_base, off, desc);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 }
 
@@ -611,6 +613,7 @@ void blockscale_forward(torch::Tensor node_mars, torch::Tensor element_mars, tor
         blockscale_sigma_kernel<<<blocks, threads, 0, c10::cuda::getCurrentCUDAStream()>>>(
             params.data_ptr<float>(), pids.data_ptr<long>(), sigma.data_ptr<float>(),
             rows, (int)num_edges, (int)block_size, (int)node_cbs, (int)gate_cbs, n_child_gates);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 
     const int n_gates = n_eblks * n_child_gates;

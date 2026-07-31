@@ -36,6 +36,7 @@
 
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAException.h>
 
 #include "lowrank_common.cuh"
 
@@ -269,6 +270,7 @@ void lowrank_shift_logz(torch::Tensor node_mars, torch::Tensor nids, torch::Tens
                                 at::cuda::getCurrentCUDAStream()>>>(
         node_mars.data_ptr<float>(), nids.data_ptr<int64_t>(), log_z.data_ptr<float>(),
         batch_size, (int)block_size, rows, (float)sign);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 // --------------------------------------------------------------------------------------- launcher
@@ -304,12 +306,14 @@ void lowrank_backward(torch::Tensor node_flows, torch::Tensor element_flows,
         grad_ext.data_ptr<float>(), p_lp.data_ptr<float>(), p_lq.data_ptr<float>(),
         batch_size, num_eblks, (int)block_size, (int)rank,
         n_ntiles, (int)tile_n, (long)ext_base, (int)tb, accumulate ? 1 : 0);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     const int n_outputs = rows * num_eblks * (int)rank * batch_size;
     lowrank_bw_pq_reduce_kernel<<<bw_cdiv(n_outputs * 32, 256), 256, 0, stream>>>(
         p_lp.data_ptr<float>(), p_lq.data_ptr<float>(),
         log_p.data_ptr<float>(), log_q.data_ptr<float>(),
         batch_size, n_ntiles, n_outputs);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     dim3 gC(rows * num_eblks, bw_cdiv((int)ch_block_size, (int)tile_c),
             bw_cdiv(batch_size, (int)tb));
@@ -320,4 +324,5 @@ void lowrank_backward(torch::Tensor node_flows, torch::Tensor element_flows,
         grad_ext.data_ptr<float>(), element_flows.data_ptr<float>(),
         batch_size, num_edges, num_eblks, (int)ch_block_size, (int)rank,
         (int)tile_c, (long)ext_base, (int)tb, accumulate ? 1 : 0);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

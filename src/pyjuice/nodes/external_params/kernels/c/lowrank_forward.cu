@@ -31,6 +31,7 @@
 
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAException.h>
 
 #include "lowrank_common.cuh"
 
@@ -260,12 +261,14 @@ void lowrank_forward(torch::Tensor node_mars, torch::Tensor element_mars, torch:
         pw.data_ptr<float>(), pa.data_ptr<float>(),
         batch_size, num_edges, num_eblks, (int)ch_block_size,
         (int)rank, n_ctiles, (int)tile_c, (long)ext_base, (int)tb1);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     const int n_outputs = rows * num_eblks * (int)rank * batch_size;
     lowrank_wa_reduce_kernel<<<cdiv(n_outputs * 32, 256), 256, 0, stream>>>(
         pw.data_ptr<float>(), pa.data_ptr<float>(),
         log_w.data_ptr<float>(), log_a.data_ptr<float>(),
         batch_size, n_ctiles, n_outputs);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     dim3 g2(rows, cdiv((int)block_size, (int)tile_m), cdiv(batch_size, (int)tb2));
     const size_t smem = 2 * num_eblks * rank * tb2 * sizeof(float);
@@ -276,4 +279,5 @@ void lowrank_forward(torch::Tensor node_mars, torch::Tensor element_mars, torch:
         log_z.numel() ? log_z.data_ptr<float>() : nullptr,
         batch_size, num_eblks, (int)block_size, (int)rank,
         (long)ext_base, (int)tile_m, (int)tb2);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

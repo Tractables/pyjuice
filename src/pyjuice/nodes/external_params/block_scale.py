@@ -335,9 +335,14 @@ class BlockScaleSumParams(ExternalSumParams):
         # directions and which wins flips with the batch size: at K=2048 batch=256 the narrow 8-warp
         # tile is fastest, at batch=512 the wide one is, by 11%.
         #
-        # Safe to run: every config computes bit-identical values (they differ only in how the same
-        # contraction is tiled), and `forward_layer` runs the real launch after this returns, so
-        # whatever the trial launches leave in `node_mars` is overwritten with the same numbers.
+        # Safe to run on the LIVE buffers because every write here is an assignment: `node_mars`,
+        # `log_z` and `sigma` are overwritten, never accumulated, so running a tile twice leaves
+        # exactly what running it once would (and every config computes bit-identical values -- they
+        # differ only in how the same contraction is tiled). `forward_layer` then does the real launch.
+        #
+        # A read-accumulate-write kernel must NOT be tuned this way -- each trial would add its
+        # contribution again. The backward is exactly that, so when it is autotuned it has to run into
+        # a scratch clone, as `sum_layer`'s param-flow and element-flow tuners already do.
         def with_cfg(i):
             return [tuple(a[:-1]) + (i,) for a in calls]
 
