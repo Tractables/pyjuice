@@ -97,6 +97,7 @@ def get_module():
         _module = jit_load("pyjuice_external_params_cuda",
                            sources = [os.path.join(_THIS_DIR, "lowrank_forward.cu"),
                                       os.path.join(_THIS_DIR, "lowrank_backward.cu"),
+                                      os.path.join(_THIS_DIR, "staging_transpose.cu"),
                                       os.path.join(_THIS_DIR, "bindings.cu")],
                            extra_cuda_cflags = flags, verbose = False)
     except Exception as e:

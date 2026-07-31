@@ -97,6 +97,39 @@ def device_grad_controller(device, no_grad = True):
                 yield
 
 
+from pyjuice.nodes.external_params.external_params import ExternalSumParams
+
+
+def _staged_copy(plain_d: list, plain_s: list, fast: list) -> None:
+    """
+    Issue the staging copies: a tiled transpose for the pairs that are one, a batched `copy_` for the
+    rest.
+
+    `Tensor.copy_` on a transposed view goes through TensorIterator, which handles arbitrary strides but
+    does not tile, so one side of the transpose is uncoalesced -- 8.2 us against 2.1 us for the same
+    4 MB. Staging is worth optimizing because it was 37-59% of the whole cost of applying a gate at
+    batch 256.
+
+    Which pairs qualify is decided by the CALLER from the parameterization's declared layout, not by
+    inspecting strides here: this runs on every forward, and building a permuted view per tensor just to
+    test it cost more Python than the kernel saved in GPU time.
+    """
+    if fast:
+        from pyjuice.nodes.external_params.kernels.c import get_module
+        mod = get_module()
+        if mod is None:
+            for dst, src in fast:                     # no extension: fall back, still correct
+                plain_d.append(dst)
+                plain_s.append(src.permute(*range(1, src.dim()), 0))
+        else:
+            for dst, src in fast:
+                batch = src.size(0)
+                mod.staging_transpose(dst, src, batch, src.numel() // max(batch, 1))
+
+    if plain_d:
+        torch._foreach_copy_(plain_d, plain_s)
+
+
 class TensorCircuit(nn.Module):
     """
     A class for compiled PCs. It is a subclass of `torch.nn.Module`.
@@ -709,7 +742,7 @@ class TensorCircuit(nn.Module):
         # (`torch.device("cuda")`) and so compare unequal to an otherwise identical `cuda:0`
         device = self.external_params.device
 
-        dsts, srcs = [], []
+        dsts, srcs, fast = [], [], []
         for ns, tensors in ns2tensors.items():
             tensors = validate_external_tensors(
                 ns, ns.external_params, tensors, batch_size, device, require_contiguous = False
@@ -720,12 +753,30 @@ class TensorCircuit(nn.Module):
             # or a different shape entirely, where the caller's layout is the one that reads naturally
             # for the model and storage keeps only the entries the kernels index. The copy absorbs
             # whichever it is, so the caller never has to know about it.
+            #
+            # When that layout change is exactly "rotate the batch axis to the end", the copy is a
+            # transpose and gets the tiled kernel. Recognized from the DECLARED permutation -- a tuple
+            # comparison -- rather than from the tensors, so the test costs nothing per forward.
+            perm = ns.external_params.storage_perm()
+            rotates_batch = (perm is not None
+                             and type(ns.external_params).to_storage is ExternalSumParams.to_storage
+                             and tuple(perm) == tuple(range(1, len(perm))) + (0,))
+
+            if rotates_batch:
+                for dst, tensor in zip(views[ns], tensors):
+                    if tensor.is_contiguous() and tensor.dtype == torch.float32 and tensor.dim() >= 2:
+                        fast.append((dst, tensor))
+                    else:
+                        dsts.append(dst)
+                        srcs.append(tensor.permute(*range(1, tensor.dim()), 0))
+                continue
+
             tensors = ns.external_params.to_storage(ns, tensors)
 
             dsts.extend(views[ns])
             srcs.extend(tensors)
 
-        torch._foreach_copy_(dsts, srcs)
+        _staged_copy(dsts, srcs, fast)
 
         # Nodes the caller did NOT supply keep whatever the buffer held; drop them so a layer sees
         # exactly the set that was staged.

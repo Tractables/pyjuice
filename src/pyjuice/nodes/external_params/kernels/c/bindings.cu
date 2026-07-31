@@ -33,6 +33,9 @@ void lowrank_backward(torch::Tensor node_flows, torch::Tensor element_flows,
 void lowrank_shift_logz(torch::Tensor node_mars, torch::Tensor nids, torch::Tensor log_z,
                         int64_t block_size, double sign);
 
+// ---- staging_transpose.cu ----
+void staging_transpose(torch::Tensor dst, torch::Tensor src, int64_t B, int64_t N);
+
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("lowrank_forward", &lowrank_forward,
@@ -41,4 +44,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Per-sample low-rank sum-layer backward: child-flow correction + dLL/dU, dLL/dV");
     m.def("lowrank_shift_logz", &lowrank_shift_logz,
           "Add (or subtract) logZ over a layer's node range, turning node_mars into logT");
+    m.def("staging_transpose", &staging_transpose,
+          "Tiled [B, N] -> [N, B] copy for staging batch-innermost external parameters");
 }
