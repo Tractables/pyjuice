@@ -100,6 +100,41 @@ class ExternalSumParams():
         """
         return None
 
+    def to_storage(self, ns, tensors: Tuple) -> Tuple:
+        """
+        Map the caller's tensors into :func:`storage_shapes`' layout, ready to be copied.
+
+        The default applies :func:`storage_perm`, which covers any parameterization whose two layouts
+        differ only in axis order. Override when they differ in SHAPE -- when the caller's layout is
+        the one that reads naturally for the model and the storage layout is the one the kernels index,
+        and getting from one to the other needs a gather rather than a transpose.
+
+        :param tensors: the caller's tensors, already validated against :func:`tensor_shapes`.
+        :returns: one tensor per storage slot, each matching :func:`storage_shapes`. They are copied,
+                  so arbitrary strides are fine and a contiguous result is not required.
+        """
+        perm = self.storage_perm()
+        if perm is None:
+            return tuple(tensors)
+
+        return tuple(tensor.permute(perm) for tensor in tensors)
+
+    def from_storage(self, ns, tensors: Tuple) -> Tuple:
+        """
+        The inverse of :func:`to_storage`, used to hand gradients back in the caller's layout.
+
+        Must invert `to_storage` exactly, so that a gradient lines up element-for-element with the
+        tensor the caller supplied. Where `to_storage` gathers, this scatters -- and any entry of the
+        caller's layout that storage has no slot for takes a zero gradient, which is correct: nothing
+        in the model read it.
+        """
+        perm = self.storage_perm()
+        if perm is None:
+            return tuple(tensors)
+
+        inverse = tuple(perm.index(axis) for axis in range(len(perm)))
+        return tuple(tensor.permute(inverse) for tensor in tensors)
+
     def compile(self, layer) -> None:
         """
         Compile the indices and other tensors this parameterization's kernels need, called once when

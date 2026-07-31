@@ -56,12 +56,16 @@ class BlockScaleSumParams(ExternalSumParams):
 
     **Tensor layout.** One `float32` tensor of LOG gates:
 
-    * `phi`: `[B, num_edge_blocks, n_node_gates, n_child_gates]`, where a parameter block is tiled by
-      `n_node_gates = ns.block_size / block_size` gates along the node axis and
-      `n_child_gates = ns.ch_block_size / ch_block_size` along the child axis.
+    * `phi`: `[B, Nk, Ck]`, a dense grid with `Nk = ns.num_nodes / block_size` gates along the node axis
+      and `Ck = ns.num_ch_nodes / ch_block_size` along the child axis. `phi[b, i, j]` scales the
+      parameters from child gate-block `j` into node gate-block `i`, for sample `b`.
 
-    Axis 1 follows the column order of `ns.edge_ids`. Log space keeps the gate positive for free and makes
-    the fold an add rather than a multiply.
+    The grid is indexed by the GATE's own block sizes and the layer's node counts -- it does not depend
+    on `ns.block_size`, so asking for gates of a given size gives a grid of exactly that many whatever
+    blocking pyjuice happens to use inside. Entries for (node block, child block) pairs the layer does
+    not connect are ignored, and their gradients come back zero.
+
+    Log space keeps the gate positive for free and makes the fold an add rather than a multiply.
 
     :note: the gate tile is deliberately NOT forced to equal the parameter block. Refining along the CHILD axis
            is free (the fold is elementwise in the child index), while refining along the NODE axis costs
@@ -188,10 +192,23 @@ class BlockScaleSumParams(ExternalSumParams):
                 f"it to have any effect.", RuntimeWarning)
 
     def tensor_shapes(self, ns, batch_size: int):
-        num_edge_blocks = ns.edge_ids.size(1)
-        n_node_gates, n_child_gates = self.gate_counts(ns)
+        """
+        `[B, Nk, Ck]`: one gate per (node gate-block, child gate-block), for every sample.
 
-        return ((batch_size, num_edge_blocks, n_node_gates, n_child_gates),)
+        `Nk = ns.num_nodes // block_size` and `Ck = ns.num_ch_nodes // ch_block_size` are the gate
+        counts along each axis -- a function of the GATE's block sizes and the layer's node counts, and
+        deliberately NOT of `ns.block_size`. Whatever blocking pyjuice uses internally, a caller who
+        asks for gates of a given size gets a grid of exactly that many.
+
+        The grid is dense: it has an entry for every (node block, child block) pair, including pairs
+        this layer's `edge_ids` do not connect. Those entries are ignored -- staging keeps only the
+        ones the kernels index (see :func:`storage_shapes`), and their gradients come back zero.
+        Paying for them costs a little memory and buys an indexing scheme that does not depend on the
+        order or sparsity of `edge_ids`.
+        """
+        gate_bs, gate_cbs = self.gate_sizes(ns)
+
+        return ((batch_size, ns.num_nodes // gate_bs, ns.num_ch_nodes // gate_cbs),)
 
     def storage_shapes(self, ns, batch_size: int):
         """
@@ -210,8 +227,54 @@ class BlockScaleSumParams(ExternalSumParams):
 
         return ((num_edge_blocks, n_node_gates, n_child_gates, batch_size),)
 
-    def storage_perm(self):
-        return (1, 2, 3, 0)      # (B, E, A, D) -> (E, A, D, B)
+    def _storage_index(self, ns, device):
+        """
+        Flat index into the caller's `[Nk, Ck]` grid for each `(edge block, node gate, child gate)`
+        slot of the storage layout. Built once per `(ns, device)`; it depends only on `edge_ids`.
+        """
+        cached = getattr(ns, "_bs_storage_index", None)
+        if cached is not None and cached[0] == str(device):
+            return cached[1]
+
+        n_node_gates, n_child_gates = self.gate_counts(ns)
+        ck = ns.num_ch_nodes // self.gate_sizes(ns)[1]
+
+        nb = ns.edge_ids[0].to(device = device, dtype = torch.long)      # [E] node block per edge block
+        cb = ns.edge_ids[1].to(device = device, dtype = torch.long)      # [E] child block per edge block
+        a = torch.arange(n_node_gates, device = device, dtype = torch.long)
+        d = torch.arange(n_child_gates, device = device, dtype = torch.long)
+
+        index = ((nb[:, None, None] * n_node_gates + a[None, :, None]) * ck
+                 + (cb[:, None, None] * n_child_gates + d[None, None, :])).reshape(-1)
+
+        ns._bs_storage_index = (str(device), index)
+        return index
+
+    def to_storage(self, ns, tensors):
+        """`[B, Nk, Ck]` -> `[E, A, D, B]`: keep the connected entries, batch innermost."""
+        phi = tensors[0]
+        batch_size = phi.size(0)
+        n_node_gates, n_child_gates = self.gate_counts(ns)
+        num_edge_blocks = ns.edge_ids.size(1)
+
+        index = self._storage_index(ns, phi.device)
+        gathered = phi.reshape(batch_size, -1)[:, index]
+
+        return (gathered.reshape(batch_size, num_edge_blocks, n_node_gates, n_child_gates)
+                        .permute(1, 2, 3, 0),)
+
+    def from_storage(self, ns, tensors):
+        """`[E, A, D, B]` -> `[B, Nk, Ck]`. Unconnected entries take a zero gradient: nothing read them."""
+        grad = tensors[0]
+        num_edge_blocks, n_node_gates, n_child_gates, batch_size = grad.shape
+        gate_bs, gate_cbs = self.gate_sizes(ns)
+        nk, ck = ns.num_nodes // gate_bs, ns.num_ch_nodes // gate_cbs
+
+        index = self._storage_index(ns, grad.device)
+        out = torch.zeros([batch_size, nk * ck], dtype = grad.dtype, device = grad.device)
+        out[:, index] = grad.permute(3, 0, 1, 2).reshape(batch_size, -1)
+
+        return (out.reshape(batch_size, nk, ck),)
 
     # ------------------------------------------------------------------ execution
 

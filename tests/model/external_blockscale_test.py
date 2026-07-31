@@ -75,6 +75,11 @@ def _build(num_latents, block_size, gate_cbs, n_vars = 2, seed = 0, tie_external
     return root, ns
 
 
+def _gate_shape(ns, batch):
+    """The gate grid the layer expects: one entry per (node gate-block, child gate-block, sample)."""
+    return ns.external_params.tensor_shapes(ns, batch)[0]
+
+
 def _set_node_params(pc, ns, vals):
     psid, peid = ns._param_range
     local = (ns._param_ids - psid) // (ns.block_size * ns.ch_block_size)
@@ -82,14 +87,29 @@ def _set_node_params(pc, ns, vals):
     buf[local, :, :] = vals.permute(0, 2, 1).to(buf.dtype)
 
 
+def _gates_per_edge_block(phi, ns):
+    """`[Nk, Ck]` grid for one sample -> `[E, D]`, the gates of each edge block, in `edge_ids` order.
+
+    This is the caller-facing layout translated to the one the maths below is written in; it is the
+    same mapping `to_storage` performs, done independently here so the test does not inherit a bug
+    from it."""
+    _, n_child_gates = ns.external_params.gate_counts(ns)
+    out = []
+    for e in range(ns.edge_ids.size(1)):
+        nb = int(ns.edge_ids[0, e])
+        cb = int(ns.edge_ids[1, e])
+        out.append(phi[nb, cb * n_child_gates:(cb + 1) * n_child_gates])
+    return torch.stack(out, dim = 0)                                       # [E, D]
+
+
 def _effective(theta, phi, ns, gate_cbs):
-    """`theta_tilde` for one sample: `[E, K, Kc]` from shared `[E, K, Kc]` and gates `[E, 1, D]`.
+    """`theta_tilde` for one sample: `[E, K, Kc]` from shared `[E, K, Kc]` and the gate grid `[Nk, Ck]`.
 
     Normalization runs over all children of a NODE -- the edge blocks incident to that node's block --
     not over every edge block in the layer, which would mix node blocks that share nothing."""
     E = theta.size(0)
 
-    g = phi[:, 0, :].double().exp().repeat_interleave(gate_cbs, dim = 1)   # [E, Kc]
+    g = _gates_per_edge_block(phi, ns).double().exp().repeat_interleave(gate_cbs, dim = 1)   # [E, Kc]
     eff = theta.double() * g[:, None, :]
 
     nblk = ns.edge_ids[0, :].tolist()
@@ -112,10 +132,8 @@ def _run(num_latents, block_size, gate_cbs, batch, n_vars = 2, scale = 0.7, seed
     torch.manual_seed(7)
     data = torch.randint(0, NUM_CATS, [batch, n_vars], device = dev)
 
-    E = ns.edge_ids.size(1)
-    D = ns.external_params.gate_counts(ns)[1]
     if phi is None:
-        phi = torch.randn([batch, E, 1, D], device = dev) * scale
+        phi = torch.randn(_gate_shape(ns, batch), device = dev) * scale
 
     lls = pc(data, sum_external_params = {ns: phi})
     return pc, root, ns, data, phi, lls
@@ -154,12 +172,12 @@ def test_single_gate_is_a_no_op(block_size, batch):
 
     torch.manual_seed(7)
     data = torch.randint(0, NUM_CATS, [batch, 2], device = dev)
-    E = ns_a.edge_ids.size(1)
 
     # The invariant, tested WITHIN the gated path: with one gate the output cannot depend on phi. Both
     # arms run whichever kernel the launcher chose, so this compares like with like and stays tight.
-    flat = torch.zeros([batch, E, 1, 1], device = dev)
-    phi = torch.randn([batch, E, 1, 1], device = dev) * 3.0
+    shape = _gate_shape(ns_a, batch)
+    flat = torch.zeros(shape, device = dev)
+    phi = torch.randn(shape, device = dev) * 3.0
     a0 = pc_a(data, sum_external_params = {ns_a: flat})
     a1 = pc_a(data, sum_external_params = {ns_a: phi})
     assert torch.allclose(a0, a1, atol = 1e-3), \
@@ -262,11 +280,8 @@ def test_zero_gates_do_not_produce_nan():
 
     torch.manual_seed(7)
     data = torch.randint(0, NUM_CATS, [64, 2], device = dev)
-    E = ns.edge_ids.size(1)
-    D = ns.external_params.gate_counts(ns)[1]
-
-    phi = torch.randn([64, E, 1, D], device = dev) * 0.5
-    phi[:, :, :, 0] = -float("inf")          # kill one child gate of every block, keep the rest
+    phi = torch.randn(_gate_shape(ns, 64), device = dev) * 0.5
+    phi[:, :, 0] = -float("inf")             # kill one child gate column, keep the rest
 
     lls = pc(data, sum_external_params = {ns: phi})
     assert not torch.isnan(lls).any(), "a zeroed gate produced NaN"
@@ -283,14 +298,11 @@ def test_gate_shifts_mass_towards_its_block():
 
     torch.manual_seed(7)
     data = torch.randint(0, NUM_CATS, [64, 2], device = dev)
-    E = ns.edge_ids.size(1)
-    D = ns.external_params.gate_counts(ns)[1]
-
-    flat = torch.zeros([64, E, 1, D], device = dev)
+    flat = torch.zeros(_gate_shape(ns, 64), device = dev)
     base = pc(data, sum_external_params = {ns: flat}).clone()
 
     boosted = flat.clone()
-    boosted[:, 0, 0, 0] = 4.0
+    boosted[:, 0, 0] = 4.0
     other = pc(data, sum_external_params = {ns: boosted})
 
     assert not torch.allclose(base, other), "the gate had no effect at all"
@@ -325,9 +337,7 @@ def test_two_gated_layers_are_independent():
     data = torch.randint(0, NUM_CATS, [batch, 3], device = dev)
 
     def gates(ns, scale):
-        E = ns.edge_ids.size(1)
-        D = ns.external_params.gate_counts(ns)[1]
-        return torch.randn([batch, E, 1, D], device = dev) * scale
+        return torch.randn(_gate_shape(ns, batch), device = dev) * scale
 
     g0, g1 = gates(s0, 0.5), gates(s1, 0.5)
     a = pc(data, sum_external_params = {s0: g0, s1: g1})
@@ -361,9 +371,7 @@ def test_gated_and_plain_layers_coexist():
 
     torch.manual_seed(7)
     data = torch.randint(0, NUM_CATS, [batch, 3], device = dev)
-    E = gated.edge_ids.size(1)
-    D = gated.external_params.gate_counts(gated)[1]
-    phi = torch.randn([batch, E, 1, D], device = dev) * 0.5
+    phi = torch.randn(_gate_shape(gated, batch), device = dev) * 0.5
 
     assert torch.isfinite(pc(data, sum_external_params = {gated: phi})).all()
 
@@ -391,9 +399,7 @@ def test_tie_external_shares_one_gate_tensor():
 
     torch.manual_seed(7)
     data = torch.randint(0, NUM_CATS, [batch, 3], device = dev)
-    E = s0.edge_ids.size(1)
-    D = s0.external_params.gate_counts(s0)[1]
-    phi = torch.randn([batch, E, 1, D], device = dev) * 0.5
+    phi = torch.randn(_gate_shape(s0, batch), device = dev) * 0.5
 
     lls = pc(data, sum_external_params = {s0: phi})
     assert torch.isfinite(lls).all()
@@ -401,6 +407,87 @@ def test_tie_external_shares_one_gate_tensor():
     # the tied copy has no tensor of its own -- one gate drives both layers
     other = pc(data, sum_external_params = {s0: phi * 0.0})
     assert not torch.allclose(lls, other)
+
+
+# --------------------------------------------------------------------------------- the API
+
+@cuda_only
+def test_gate_grid_shape_follows_the_gate_size_not_the_blocking():
+    """The grid is `num_nodes / gate block size` by `num_ch_nodes / gate ch_block_size`.
+
+    A caller who asks for gates spanning 16 children gets `num_ch_nodes / 16` of them, whatever
+    blocking pyjuice uses inside -- that is the point of this layout, and the child axis below is
+    identical across three different `ns.block_size` values.
+
+    The NODE axis tracks `ns.block_size` only because the gate's own node block size defaults to it;
+    setting it independently is the case that still raises `NotImplementedError`. When that case lands,
+    this axis becomes independent too and the assertion below should tighten."""
+    for num_latents, gate_cbs in ((256, 16), (512, 8)):
+        shapes = []
+        for block_size in (32, 64, 128):
+            _, ns = _build(num_latents, block_size, gate_cbs = gate_cbs)
+            shape = ns.external_params.tensor_shapes(ns, 8)[0]
+            gate_bs, _ = ns.external_params.gate_sizes(ns)
+
+            assert tuple(shape) == (8, ns.num_nodes // gate_bs, ns.num_ch_nodes // gate_cbs), shape
+            shapes.append(tuple(shape))
+
+        child_axis = {sh[2] for sh in shapes}
+        assert child_axis == {num_latents // gate_cbs}, \
+            f"the child axis moved with ns.block_size: {shapes}"
+
+
+@cuda_only
+def test_storage_round_trip_is_the_identity_on_connected_gates():
+    """`from_storage` must invert `to_storage` exactly -- it is how gradients get back to the caller.
+
+    Connected (node block, child block) pairs must come back bit-identical; pairs this layer does not
+    connect must come back ZERO, because nothing in the model read them."""
+    dev = torch.device("cuda:0")
+    batch = 5
+    _, ns = _build(256, 64, gate_cbs = 8)
+    ep = ns.external_params
+
+    torch.manual_seed(0)
+    phi = torch.randn(_gate_shape(ns, batch), device = dev)
+
+    back = ep.from_storage(ns, ep.to_storage(ns, (phi,)))[0]
+    assert back.shape == phi.shape
+
+    # mark which grid entries storage actually keeps, using edge_ids directly
+    a_gates, d_gates = ep.gate_counts(ns)
+    seen = torch.zeros_like(phi, dtype = torch.bool)
+    for e in range(ns.edge_ids.size(1)):
+        nb, cb = int(ns.edge_ids[0, e]), int(ns.edge_ids[1, e])
+        seen[:, nb * a_gates:(nb + 1) * a_gates, cb * d_gates:(cb + 1) * d_gates] = True
+
+    assert torch.equal(back[seen], phi[seen]), "a connected gate did not survive the round trip"
+    assert torch.all(back[~seen] == 0.0), "an unconnected gate came back non-zero"
+
+
+@cuda_only
+@needs_cute
+@pytest.mark.parametrize("bad", ["one_axis_short", "transposed", "extra_axis", "wrong_batch"])
+def test_wrong_gate_shape_is_rejected(bad):
+    """A mis-shaped gate tensor must fail loudly at the call, not be silently reinterpreted."""
+    dev = torch.device("cuda:0")
+    batch = 64
+    root, ns = _build(256, 64, gate_cbs = 8)
+    pc = juice.compile(root, verbose = False).to(dev)
+
+    torch.manual_seed(7)
+    data = torch.randint(0, NUM_CATS, [batch, 2], device = dev)
+    b, nk, ck = _gate_shape(ns, batch)
+
+    shape = {"one_axis_short": (b, nk, ck - 1),
+             "transposed": (b, ck, nk),
+             "extra_axis": (b, nk, ck, 1),
+             "wrong_batch": (b // 2, nk, ck)}[bad]
+    if shape[1:] == (ck, nk) and nk == ck:
+        pytest.skip("the grid is square here, so a transpose is not detectable by shape")
+
+    with pytest.raises(AssertionError, match = "shape"):
+        pc(data, sum_external_params = {ns: torch.zeros(shape, device = dev)})
 
 
 # --------------------------------------------------------------------------------- the boundary
@@ -436,9 +523,7 @@ def test_unsupported_shapes_raise(num_latents, block_size, batch, gate_bs, why):
 
     torch.manual_seed(7)
     data = torch.randint(0, NUM_CATS, [batch, 2], device = dev)
-    E = ns.edge_ids.size(1)
-    D = ns.external_params.gate_counts(ns)[1]
-    phi = torch.randn([batch, E, 1, D], device = dev) * 0.5
+    phi = torch.randn(_gate_shape(ns, batch), device = dev) * 0.5
 
     with pytest.raises(NotImplementedError):
         pc(data, sum_external_params = {ns: phi})
