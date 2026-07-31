@@ -631,18 +631,126 @@ class BlockScaleSumParams(ExternalSumParams):
         if cache is None:
             cache = layer._bs_bw_gate_cache = dict()
 
-        def _ele_hook(element_flows, element_mars, node_flows, node_mars, params, chids, ele_ebase,
-                      ele_pbase, batch, blk_size, cs_block_size, knt, partition_id):
-            key = (partition_id, id(chids), int(knt))
-            gate_bw = cache.get(key)
-            if gate_bw is None:
-                gate_bw = self._gate_bw_table(layer, chids, ele_ebase)
-                cache[key] = gate_bw
+        def _gate_for(kind, chids, ele_ebase, blk_size, num_edges, partition_id, knt):
+            key = (kind, partition_id, id(chids), int(knt))
+            g = cache.get(key)
+            if g is None:
+                if kind == "sb":
+                    nblk = num_edges // blk_size
+                    ele_ebase = (ele_ebase[:, :1]
+                                 + torch.arange(nblk, device = ele_ebase.device).view(1, -1) * blk_size)
+                g = self._gate_bw_table(layer, chids, ele_ebase)
+                cache[key] = g
+            return g
 
-            ele_mod.blockscale_ele_backward(
-                element_flows, element_mars, node_flows, node_mars, params, external_params,
-                chids, ele_ebase, ele_pbase, gate_bw,
-                batch, blk_size, cs_block_size, knt, gate_cbs, ext_base)
+        def _ele_hook(ctx):
+            """
+            Run this layer's gated element flows with whichever of the forks is fastest here.
+
+            Three may apply and which wins is not deducible: the CuTe fork is strongest at very large
+            batch, but the ungated layer's own autotuner prefers Triton to its CuTe kernel at many
+            shapes, and below batch 16 the plain-CUDA fork beats both. So they are MEASURED.
+
+            The whole decision -- eligibility, gate tables, winner -- is cached per
+            (signature, batch, partition) and only the winning launch is built per call. An earlier
+            version rebuilt the candidate list every time; its two `torch.equal` eligibility checks
+            forced a device sync per backward and cost more at small batch than the gate itself.
+            """
+            key = ("eleplan", ctx["signature"], ctx["batch_size"], ctx["partition_id"])
+            plan = cache.get(key)
+            if plan is None:
+                plan = _build_ele_plan(ctx)
+                cache[key] = plan
+            _launch_ele(ctx, plan, ctx["element_flows"])
+
+        def _build_ele_plan(ctx):
+            import pyjuice.layer.kernels.c as ck
+
+            chids, ebase, pbase = ctx["chids"], ctx["ele_ebase"], ctx["ele_pbase"]
+            batch, blk, cbs = ctx["batch_size"], ctx["block_size"], ctx["cs_block_size"]
+            ne, knt, tk = ctx["num_edges"], ctx["K_NUM_TILES"], ctx["TILE_SIZE_K"]
+            plan = {"gate_tile": None, "gate_sb": None, "sb": None}
+            kinds = []
+
+            if ctx["ptr_inc_step"] == 1:
+                plan["gate_tile"] = self._gate_bw_table(layer, chids, ebase)
+
+            if (ele_mod is not None and ctx["ele_cuda_ok"] and tk == 64
+                    and cbs % 128 == 0 and batch % 64 == 0 and plan["gate_tile"] is not None):
+                kinds.append("cute")
+
+            if sb_mod is not None and batch < 16 and ne % blk == 0 and ctx["ele_cuda_ok"]:
+                art = torch.arange(knt, device = ebase.device, dtype = torch.int64).view(1, -1)
+                if (torch.equal(ebase, ebase[:, :1] + art * tk)
+                        and torch.equal(pbase, pbase[:, :1] + art * tk)):
+                    nblk = ne // blk
+                    starts = (ebase[:, :1]
+                              + torch.arange(nblk, device = ebase.device).view(1, -1) * blk)
+                    plan["gate_sb"] = self._gate_bw_table(layer, chids, starts)
+                    plan["sb"] = (ebase[:, 0].contiguous(), pbase[:, 0].contiguous())
+                    kinds += [("sb", c) for c in range(len(sb_mod.blockscale_sb_ele_configs()))]
+
+            if plan["gate_tile"] is not None:
+                kinds.append("triton")
+
+            if not kinds:
+                raise NotImplementedError(
+                    f"no external element-flow backward applies here: cs_block_size={cbs}, "
+                    f"batch={batch}, TILE_SIZE_K={tk}, ptr_inc_step={ctx['ptr_inc_step']}. Every fork "
+                    f"needs each k-tile's parents to lie in ONE node block (ptr_inc_step == 1), which "
+                    f"is what lets the gate factor out of the contraction."
+                )
+
+            if len(kinds) == 1:
+                plan["kind"] = kinds[0]
+                return plan
+
+            # Measured into a SCRATCH clone. Every candidate STORES its output so a live trial would
+            # be harmless today, but the choice is cached forever and the scratch keeps that true.
+            scr = layer._bk_ele_scratch
+            if scr is None or scr.shape != ctx["element_flows"].shape:
+                scr = layer._bk_ele_scratch = torch.empty_like(ctx["element_flows"])
+            trials = [(k, (lambda k = k: _launch_ele(ctx, plan, scr, k))) for k in kinds]
+            plan["kind"] = ck.autotune(trials) or kinds[0]
+            return plan
+
+        def _launch_ele(ctx, plan, tgt, kind = None):
+            kind = kind if kind is not None else plan["kind"]
+            chids = ctx["chids"]
+            batch, blk, cbs = ctx["batch_size"], ctx["block_size"], ctx["cs_block_size"]
+            ne, knt = ctx["num_edges"], ctx["K_NUM_TILES"]
+
+            if kind == "cute":
+                ele_mod.blockscale_ele_backward(
+                    tgt, ctx["element_mars"], ctx["node_flows"], ctx["node_mars"], ctx["params"],
+                    external_params, chids, ctx["ele_ebase"], ctx["ele_pbase"], plan["gate_tile"],
+                    batch, blk, cbs, knt, gate_cbs, ext_base)
+
+            elif isinstance(kind, tuple):                     # ("sb", cfg)
+                e0, p0 = plan["sb"]
+                sb_mod.blockscale_sb_ele_backward(
+                    tgt, ctx["element_mars"], ctx["node_flows"], ctx["node_mars"], ctx["params"],
+                    external_params, chids, e0, p0, plan["gate_sb"],
+                    batch, blk, cbs, ne, gate_cbs, ext_base, kind[1])
+
+            else:                                             # "triton"
+                from .kernels.blockscale_backward import _bs_triton_ele_kernel
+                gb, grid = plan["gate_tile"], ctx["grid"]
+                for s0 in range(0, grid[1], 32768):
+                    cg = (grid[0], min(s0 + 32768, grid[1]) - s0)
+                    _bs_triton_ele_kernel[cg](
+                        node_flows = ctx["node_flows"], element_flows = tgt,
+                        node_mars = ctx["node_mars"], element_mars = ctx["element_mars"],
+                        mparams = ctx["params"], ext = external_params, gate = gb, chids = chids,
+                        parids_start = ctx["parids_start"], parids_increment = ctx["parids_increment"],
+                        parpids_start = ctx["parpids_start"],
+                        parpids_increment = ctx["parpids_increment"],
+                        batch_size = batch, ptr_inc_step = ctx["ptr_inc_step"],
+                        BLOCK_B = ctx["BLOCK_B"], TILE_SIZE_K = ctx["TILE_SIZE_K"],
+                        K_NUM_TILES = knt, TILE_SIZE_M = ctx["TILE_SIZE_M"],
+                        BLOCK_SIZE_M = cbs, BLOCK_SIZE_K = blk, TL_DOT = ctx["TL_DOT"],
+                        GATE_CBS = gate_cbs, gate_stride = gb.size(1), ext_base = ext_base,
+                        pid_m_offset = s0, num_stages = 1)
 
         def _par_hook(param_flows, node_flows, node_mars, element_mars, params, nbase, cbase, pbase,
                       fbase, batch, blk_size, num_edges, partition_id):
@@ -653,31 +761,6 @@ class BlockScaleSumParams(ExternalSumParams):
                 nbase, cbase, pbase, fbase, layer.ext_slots[0][partition_id],
                 batch, blk_size, num_edges, node_cbs, gate_cbs, ext_base, 0)
 
-        def _ele_sb_hook(element_flows, element_mars, node_flows, node_mars, params, chids, sb_ebase,
-                         sb_pbase, batch, blk_size, cs_block_size, num_edges, partition_id):
-            # The small-batch kernel walks a child block's parents as ONE contiguous run rather than as
-            # k-tiles, so its gate table is indexed by parent BLOCK. Same lookup, different column
-            # granularity: synthesize the per-block parent starts and hand them to the same builder.
-            key = ("sb", partition_id, id(chids), int(num_edges))
-            gate_bw = cache.get(key)
-            if gate_bw is None:
-                if num_edges % blk_size != 0:
-                    raise NotImplementedError(
-                        f"the small-batch external element-flow backward needs each child block's "
-                        f"parent list to be a whole number of node blocks; got {num_edges} parents "
-                        f"with block_size {blk_size}."
-                    )
-                nblk = num_edges // blk_size
-                starts = (sb_ebase.view(-1, 1)
-                          + torch.arange(nblk, device = sb_ebase.device).view(1, -1) * blk_size)
-                gate_bw = self._gate_bw_table(layer, chids, starts)
-                cache[key] = gate_bw
-
-            sb_mod.blockscale_sb_ele_backward(
-                element_flows, element_mars, node_flows, node_mars, params, external_params,
-                chids, sb_ebase, sb_pbase, gate_bw,
-                batch, blk_size, cs_block_size, num_edges, gate_cbs, ext_base, 0)
-
         def _par_sb_hook(param_flows, node_flows, node_mars, element_mars, params, nids, cids, pids,
                          pfids, batch, blk_size, num_edges, partition_id):
             sb_mod.blockscale_sb_par_backward(
@@ -685,9 +768,8 @@ class BlockScaleSumParams(ExternalSumParams):
                 nids, cids, pids, pfids, layer.ext_slots[0][partition_id],
                 batch, blk_size, num_edges, node_cbs, gate_cbs, ext_base, 0)
 
-        layer._ext_bw_ele_hook = _ele_hook if ele_mod is not None else None
+        layer._ext_bw_ele_hook = _ele_hook
         layer._ext_bw_par_hook = _par_hook if par_mod is not None else None
-        layer._ext_bw_ele_sb_hook = _ele_sb_hook if sb_mod is not None else None
         layer._ext_bw_par_sb_hook = _par_sb_hook if sb_mod is not None else None
 
         return None
@@ -700,7 +782,6 @@ class BlockScaleSumParams(ExternalSumParams):
 
         layer._ext_bw_ele_hook = None
         layer._ext_bw_par_hook = None
-        layer._ext_bw_ele_sb_hook = None
         layer._ext_bw_par_sb_hook = None
 
         from .kernels.c import get_module

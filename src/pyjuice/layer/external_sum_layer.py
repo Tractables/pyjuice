@@ -602,7 +602,6 @@ class ExternalParamsSumLayer(SumLayer):
             # gated kernel against a stale plan.
             self._ext_bw_ele_hook = None
             self._ext_bw_par_hook = None
-            self._ext_bw_ele_sb_hook = None
             self._ext_bw_par_sb_hook = None
 
         return None
