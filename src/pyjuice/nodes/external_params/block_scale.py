@@ -610,14 +610,15 @@ class BlockScaleSumParams(ExternalSumParams):
 
         state = self._bw_state(layer, node_mars, kwargs)
 
-        from .kernels.c import get_module, get_ele_bw_module, get_par_bw_module
+        from .kernels.c import get_module, get_ele_bw_module, get_par_bw_module, get_sb_bw_module
 
         plain, ele_mod, par_mod = get_module(), get_ele_bw_module(), get_par_bw_module()
-        if plain is None or ele_mod is None or par_mod is None:
+        sb_mod = get_sb_bw_module()
+        if plain is None or (ele_mod is None and sb_mod is None):
             raise NotImplementedError(
-                "the block-scale backward needs its CUDA extensions (the two CuTe/TMA fork kernels and "
-                "the plain one holding the normalizer shift), and at least one is unavailable here. "
-                "There is no Triton fallback."
+                "the block-scale backward needs its CUDA extensions -- the plain one holding the "
+                "normalizer shift, plus at least one of the CuTe/TMA forks (large batch) and the "
+                "small-batch forks -- and they are unavailable here. There is no Triton fallback."
             )
 
         batch_size, block_size = state["batch_size"], state["block_size"]
@@ -652,8 +653,42 @@ class BlockScaleSumParams(ExternalSumParams):
                 nbase, cbase, pbase, fbase, layer.ext_slots[0][partition_id],
                 batch, blk_size, num_edges, node_cbs, gate_cbs, ext_base, 0)
 
-        layer._ext_bw_ele_hook = _ele_hook
-        layer._ext_bw_par_hook = _par_hook
+        def _ele_sb_hook(element_flows, element_mars, node_flows, node_mars, params, chids, sb_ebase,
+                         sb_pbase, batch, blk_size, cs_block_size, num_edges, partition_id):
+            # The small-batch kernel walks a child block's parents as ONE contiguous run rather than as
+            # k-tiles, so its gate table is indexed by parent BLOCK. Same lookup, different column
+            # granularity: synthesize the per-block parent starts and hand them to the same builder.
+            key = ("sb", partition_id, id(chids), int(num_edges))
+            gate_bw = cache.get(key)
+            if gate_bw is None:
+                if num_edges % blk_size != 0:
+                    raise NotImplementedError(
+                        f"the small-batch external element-flow backward needs each child block's "
+                        f"parent list to be a whole number of node blocks; got {num_edges} parents "
+                        f"with block_size {blk_size}."
+                    )
+                nblk = num_edges // blk_size
+                starts = (sb_ebase.view(-1, 1)
+                          + torch.arange(nblk, device = sb_ebase.device).view(1, -1) * blk_size)
+                gate_bw = self._gate_bw_table(layer, chids, starts)
+                cache[key] = gate_bw
+
+            sb_mod.blockscale_sb_ele_backward(
+                element_flows, element_mars, node_flows, node_mars, params, external_params,
+                chids, sb_ebase, sb_pbase, gate_bw,
+                batch, blk_size, cs_block_size, num_edges, gate_cbs, ext_base, 0)
+
+        def _par_sb_hook(param_flows, node_flows, node_mars, element_mars, params, nids, cids, pids,
+                         pfids, batch, blk_size, num_edges, partition_id):
+            sb_mod.blockscale_sb_par_backward(
+                param_flows, node_flows, node_mars, element_mars, params, external_params,
+                nids, cids, pids, pfids, layer.ext_slots[0][partition_id],
+                batch, blk_size, num_edges, node_cbs, gate_cbs, ext_base, 0)
+
+        layer._ext_bw_ele_hook = _ele_hook if ele_mod is not None else None
+        layer._ext_bw_par_hook = _par_hook if par_mod is not None else None
+        layer._ext_bw_ele_sb_hook = _ele_sb_hook if sb_mod is not None else None
+        layer._ext_bw_par_sb_hook = _par_sb_hook if sb_mod is not None else None
 
         return None
 
@@ -665,6 +700,8 @@ class BlockScaleSumParams(ExternalSumParams):
 
         layer._ext_bw_ele_hook = None
         layer._ext_bw_par_hook = None
+        layer._ext_bw_ele_sb_hook = None
+        layer._ext_bw_par_sb_hook = None
 
         from .kernels.c import get_module
 

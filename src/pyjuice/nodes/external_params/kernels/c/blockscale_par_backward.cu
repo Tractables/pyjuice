@@ -70,7 +70,7 @@ __device__ __forceinline__ void mbar_wait(uint64_t* bar, int phase) {
 
 extern __shared__ char smem_raw[];
 
-__global__ void __launch_bounds__(NTH) par_kernel(
+__global__ void __launch_bounds__(NTH) bs_par_kernel(
         float* __restrict__ pflows, const float* __restrict__ mp,
         const long* __restrict__ nbase, const long* __restrict__ cbase,
         const long* __restrict__ pbase, const long* __restrict__ fbase,
@@ -100,8 +100,12 @@ __global__ void __launch_bounds__(NTH) par_kernel(
     float* sCmax = sEm + BN * BK;         // per-batch max_m lr[m,b]
     float* sS = sCmax + BK;               // per-batch balanced shift S[b]
     int*   sV = (int*)(sS + BK);          // per-batch valid flag (both lr and emar finite)
-    float* sPh = (float*)(sV + BK);       // [BN >> gate_sh, BK] this subtile's log-gates
     uint64_t* bar = (uint64_t*)(sV + BK + 4);
+    // AFTER the mbarrier, not before it: `sPh` spans (BN >> gate_sh) * BK floats, so placing it at
+    // `sV + BK` put `bar` 16 bytes inside it and the gate staging overwrote the barrier every k-tile.
+    // The symptom was an intermittent whole-CTA illegal TMA access -- rare enough to pass every
+    // correctness test and only reproduce under load.
+    float* sPh = (float*)(bar + 4);       // [BN >> gate_sh, BK] this subtile's log-gates
     if (tid == 0) mbar_init(bar, 1);
     __syncthreads();
     int phase = 0;
@@ -269,7 +273,7 @@ void blockscale_par_backward(torch::Tensor param_flows, torch::Tensor node_flows
         g_nf=nf; g_nm=nm; g_em=em; g_nr=n_node_rows; g_er=n_ele_rows; g_b=(int)batch; }
     int smem = (BM * BK + BM * BK + BN * BK) * 4 + BK * 4 + BK * 4 + BK * 4 + 64
                + (BN >> gate_sh) * BK * 4;          // + the staged gates
-    cudaFuncSetAttribute(par_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    cudaFuncSetAttribute(bs_par_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     int bnt = (int)batch / BK;
     int total_y = n_nblocks * ((int)block_size / BM);
     int gx = (int)num_edges / (EE * BN);
@@ -277,7 +281,7 @@ void blockscale_par_backward(torch::Tensor param_flows, torch::Tensor node_flows
     for (int off = 0; off < total_y; off += MAX_Y) {
         int chunk = (total_y - off < MAX_Y) ? (total_y - off) : MAX_Y;
         dim3 grid(gx, chunk);
-        par_kernel<<<grid, NTH, smem, c10::cuda::getCurrentCUDAStream()>>>(param_flows.data_ptr<float>(), params.data_ptr<float>(),
+        bs_par_kernel<<<grid, NTH, smem, c10::cuda::getCurrentCUDAStream()>>>(param_flows.data_ptr<float>(), params.data_ptr<float>(),
             nbase.data_ptr<long>(), cbase.data_ptr<long>(), pbase.data_ptr<long>(), fbase.data_ptr<long>(),
             (int)batch, (int)block_size, (int)num_edges, bnt, (int)use_atomic, off, g_dNf, g_dNm,
             ext.data_ptr<float>(), gate.data_ptr<long>(),

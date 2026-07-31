@@ -114,6 +114,49 @@ def _get_bw_module(name: str, source: str):
     return _bw_modules[name]
 
 
+_sb_bw_module = None
+_sb_bw_attempted = False
+
+
+def get_sb_bw_module():
+    """
+    The SMALL-BATCH block-scale backward extension, or None if unavailable (warns once).
+
+    Plain CUDA, like `get_sb_module`: forks of the standard small-batch backward kernels, which use no
+    CuTe, TMA or CUTLASS, so this compiles on any CUDA GPU and a CUTLASS failure cannot take it down.
+    Both kernels share one extension -- unlike the CuTe forks neither carries a file-scope TMA
+    descriptor cache to collide over, so one build serves both.
+    """
+    global _sb_bw_module, _sb_bw_attempted
+
+    if _sb_bw_attempted:
+        return _sb_bw_module
+
+    _sb_bw_attempted = True
+
+    if not ENABLE_CUDA_KERNELS:
+        return None
+
+    flags = _compile_flags()
+    if flags is None:
+        return None
+
+    from pyjuice.utils.cuda_ext import jit_load
+    try:
+        _sb_bw_module = jit_load(
+            "pyjuice_blockscale_sb_bw_cuda",
+            sources = [os.path.join(_THIS_DIR, "blockscale_smallbatch_backward.cu")],
+            extra_cuda_cflags = flags, verbose = False)
+    except Exception as e:
+        warnings.warn(
+            f"pyjuice CUDA kernel 'pyjuice_blockscale_sb_bw_cuda' failed to compile "
+            f"({type(e).__name__}: {e}). The small-batch block-scale backward is unavailable.",
+            RuntimeWarning)
+        _sb_bw_module = None
+
+    return _sb_bw_module
+
+
 def get_ele_bw_module():
     """Element-flow backward for the per-block multiplicative gate."""
     return _get_bw_module("pyjuice_blockscale_ele_bw_cuda", "blockscale_ele_backward.cu")
