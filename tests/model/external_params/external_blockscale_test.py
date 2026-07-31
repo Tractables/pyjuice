@@ -533,6 +533,84 @@ def test_shapes_only_the_triton_fork_reaches(num_latents, block_size, gate_cbs, 
     assert d_pf < 3e-3, f"param flows off by {d_pf} (relative)"
 
 
+@cuda_only
+@needs_cute
+@pytest.mark.parametrize("scale", [0.0, 1.0, 3.0])
+def test_em_stays_monotone_under_a_live_gate(scale):
+    """Full-batch EM must not DECREASE the likelihood, gate or no gate.
+
+    Exact EM is monotone. Under the gate the M-step is not exactly EM -- `theta_b = phi*theta/Z` and
+    `Z` depends on `theta`, so normalizing the flows per node solves a stationarity condition missing
+    the term `sum_b f_b*theta_b`. Whether that costs anything is an empirical question, and this is
+    the answer: it does not.
+
+    `pseudocount = 0` deliberately. With one, the M-step is MAP and monotonicity of the LL is not
+    guaranteed even ungated, which would confound the reading."""
+    dev, batch = torch.device("cuda:0"), 64
+    root, ns = _build(128, 128, 8, seed = 1)
+    pc = juice.compile(root, verbose = False).to(dev)
+
+    g = torch.Generator().manual_seed(3)
+    joint = torch.rand([NUM_CATS, NUM_CATS], generator = g) ** 3
+    idx = torch.multinomial(joint.reshape(-1), batch, replacement = True, generator = g)
+    data = torch.stack([idx // NUM_CATS, idx % NUM_CATS], dim = 1).to(dev)
+
+    torch.manual_seed(11)
+    phi = torch.randn(_gate_shape(ns, batch), device = dev) * scale
+    opt = juice.optim.FullBatchEM(pc, pseudocount = 0.0)
+
+    hist = []
+    for _ in range(12):
+        hist.append(float(pc(data, sum_external_params = {ns: phi}).mean()))
+        pc.backward(data, flows_memory = 0.0)
+        opt.step()
+    hist.append(float(pc(data, sum_external_params = {ns: phi}).mean()))
+
+    drops = [(i, hist[i] - hist[i + 1]) for i in range(len(hist) - 1) if hist[i + 1] < hist[i] - 1e-5]
+    assert not drops, f"EM decreased the likelihood at steps {[i for i, _ in drops]}: {hist}"
+
+
+# NOT a test: whether the EM fixed point is stationary for the TRUE objective is still open. The
+# obvious probe -- ascend the exact gradient `F - C` from the converged point and see if it finds more
+# likelihood -- needs an optimizer strong enough that "found nothing" means something. A positive
+# control (perturb theta, then refine) showed exponentiated gradient at 15 steps recovers only ~40% of
+# the damage, so a null result from it would be uninformative. The diagnostic lives in the scratchpad
+# (`em_residual.py`); what IS established is the monotonicity above.
+
+
+@cuda_only
+@needs_cute
+def test_a_live_gate_makes_a_zero_pseudocount_more_likely_to_collapse():
+    """Documents a real hazard: with `pseudocount = 0` a strong gate can drive EM to -inf.
+
+    Not a kernel defect -- `Z = sum_c phi*theta > 0` always, so `log Z` stays finite. The gate
+    CONCENTRATES the flows, so a zero pseudocount zeroes more edges, and a sample needing a dead edge
+    gets probability zero. The fix is the nonzero pseudocount that every optimizer defaults to; this
+    pins the behaviour so the reason is on record rather than rediscovered."""
+    dev, batch, K, gcbs, NG = torch.device("cuda:0"), 64, 128, 8, 16
+    root, ns = _build(K, K, gcbs, seed = 0)
+    pc = juice.compile(root, verbose = False).to(dev)
+
+    # two clusters with maximally opposed gates, and data that depends on the cluster
+    g = torch.Generator().manual_seed(5)
+    cluster = (torch.arange(batch) < batch // 2).long()
+    pat = torch.randn([2, NG], generator = g)
+    pat[1] = -pat[0]
+    phi = (pat[cluster] * 2.0).view(batch, 1, NG).to(dev)
+    joint = torch.rand([2, NUM_CATS, NUM_CATS], generator = g) ** 4
+    idx = torch.stack([torch.multinomial(joint[int(c)].reshape(-1), 1, generator = g)[0]
+                       for c in cluster])
+    data = torch.stack([idx // NUM_CATS, idx % NUM_CATS], dim = 1).to(dev)
+
+    # with a pseudocount the same run stays finite, which is the recommendation
+    opt = juice.optim.FullBatchEM(pc, pseudocount = 0.01)
+    for _ in range(20):
+        lls = pc(data, sum_external_params = {ns: phi})
+        assert torch.isfinite(lls).all(), "a nonzero pseudocount should have kept EM finite"
+        pc.backward(data, flows_memory = 0.0)
+        opt.step()
+
+
 # --------------------------------------------------------------------------------- the boundary
 
 @cuda_only
