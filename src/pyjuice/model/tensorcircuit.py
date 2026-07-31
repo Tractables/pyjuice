@@ -715,12 +715,12 @@ class TensorCircuit(nn.Module):
                 ns, ns.external_params, tensors, batch_size, device, require_contiguous = False
             )
 
-            # The staging buffer may hold the tensors in a different axis order than the caller uses
-            # (e.g. batch-innermost, so the kernels read them like `element_mars`). The copy absorbs
-            # the permutation, so the caller never has to know about it.
-            perm = ns.external_params.storage_perm()
-            if perm is not None:
-                tensors = tuple(tensor.permute(perm) for tensor in tensors)
+            # The staging buffer may hold the tensors in a different LAYOUT than the caller uses --
+            # a different axis order (batch-innermost, so the kernels read them like `element_mars`),
+            # or a different shape entirely, where the caller's layout is the one that reads naturally
+            # for the model and storage keeps only the entries the kernels index. The copy absorbs
+            # whichever it is, so the caller never has to know about it.
+            tensors = ns.external_params.to_storage(ns, tensors)
 
             dsts.extend(views[ns])
             srcs.extend(tensors)
@@ -848,14 +848,9 @@ class TensorCircuit(nn.Module):
 
         grad_tensors = self._staged_external_params_grad[ns]
 
-        # Stored in the kernels' axis order; hand them back in the caller's, so they line up with the
-        # tensors that were supplied. That makes them views rather than contiguous tensors.
-        perm = ns.external_params.storage_perm()
-        if perm is not None:
-            inverse_perm = tuple(perm.index(axis) for axis in range(len(perm)))
-            grad_tensors = tuple(grad.permute(inverse_perm) for grad in grad_tensors)
-
-        return grad_tensors
+        # Stored in the kernels' layout; hand them back in the caller's, so they line up
+        # element-for-element with the tensors that were supplied.
+        return ns.external_params.from_storage(ns, grad_tensors)
 
     def forward_ll(self, *args, **kwargs):
         self.forward(*args, propagation_alg = "LL", **kwargs)
