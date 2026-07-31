@@ -9,7 +9,7 @@ import pytest
 
 
 @pytest.mark.slow
-def nested_blk_sparse_test():
+def test_nested_blk_sparse():
 
     device = torch.device("cuda:0")
 
@@ -58,4 +58,4 @@ def nested_blk_sparse_test():
 
 
 if __name__ == "__main__":
-    nested_blk_sparse_test()
+    test_nested_blk_sparse()
