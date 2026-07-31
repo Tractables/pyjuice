@@ -507,6 +507,32 @@ def test_wrong_gate_shape_is_rejected(bad):
         pc(data, sum_external_params = {ns: torch.zeros(shape, device = dev)})
 
 
+@cuda_only
+@needs_cute
+@pytest.mark.parametrize("num_latents,block_size,gate_cbs,batch,why", [
+    (256, 64, 8, 64, "child block below the CuTe element kernel's 128-row tile"),
+    (256, 128, 8, 8, "small batch, but several parent blocks per child block"),
+])
+def test_shapes_only_the_triton_fork_reaches(num_latents, block_size, gate_cbs, batch, why):
+    """Shapes NO CUDA fork can serve, which the Triton fork exists to cover.
+
+    Both used to raise. They are the reason the Triton kernel was written -- alongside the shapes where
+    a CUDA fork applies but is simply slower than Triton, which the autotuner now also picks up."""
+    pc, root, ns, data, phi, _ = _run(num_latents, block_size, gate_cbs, batch, scale = 1.5)
+    pc.backward(data, flows_memory = 0.0)
+
+    ref_ef, ref_pf = _flow_reference(pc, ns, phi, gate_cbs, batch)
+    live = torch.isfinite(ref_ef)
+    d_ef = float((pc.element_flows[:, :batch].double()[live] - ref_ef[live]).abs().max())
+
+    ns.update_param_flows(pc.param_flows)
+    got_pf = ns.get_param_flows().double().to(ref_pf.device)
+    d_pf = float(((got_pf - ref_pf).abs() / ref_pf.clamp(min = 1e-30)).max())
+
+    assert d_ef < 2e-3, f"element flows off by {d_ef}"
+    assert d_pf < 3e-3, f"param flows off by {d_pf} (relative)"
+
+
 # --------------------------------------------------------------------------------- the boundary
 
 @cuda_only
@@ -616,6 +642,13 @@ def _flow_reference(pc, ns, phi, gate_cbs, batch):
     (128, 128, 8, 64, 3.0),
     (128, 128, 16, 128, 2.0),
     (256, 128, 32, 64, 2.0),
+    # Small batch -> the plain-CUDA forks rather than the CuTe/TMA ones. Reaching the reference at all
+    # is itself the proof that they ran: the CuTe forks cannot tile these batches, and without the
+    # small-batch forks installed the backward raises rather than falling back.
+    (128, 128, 8, 1, 2.0),
+    (128, 128, 8, 8, 2.0),
+    (128, 128, 16, 13, 1.0),
+    (256, 256, 32, 4, 2.0),
 ])
 def test_backward_matches_reference(num_latents, block_size, gate_cbs, batch, scale):
     """`pc.backward()` against the float64 reference: both flows, gates from a no-op to a strong one.
@@ -636,6 +669,7 @@ def test_backward_matches_reference(num_latents, block_size, gate_cbs, batch, sc
     d_pf = float(((got_pf - ref_pf).abs() / ref_pf.clamp(min = 1e-30)).max())
 
     # The fp16 tensor-core floor of the kernels these fork (~1e-3 log space for the element flows).
+    # The small-batch forks are pure fp32 and land ~1e-6, but one bar covers both.
     assert d_ef < 2e-3, f"element flows off by {d_ef}"
     assert d_pf < 3e-3, f"param flows off by {d_pf} (relative)"
 
@@ -709,19 +743,19 @@ def test_gate_gradients_are_refused_rather_than_returned_as_zeros():
 
 @cuda_only
 @needs_cute
-def test_backward_outside_the_supported_regime_raises():
-    """The forked kernels have no Triton fallback, so a shape the standard backward would serve with
-    its own (UNGATED) kernels has to raise. A batch the CuTe element-flow kernel cannot tile is such a
-    shape -- the forward still runs, via the small-batch kernel."""
-    pc, root, ns, data, phi, _ = _run(128, 128, 8, 8, scale = 1.0)
+def test_a_failed_backward_does_not_leave_the_kernels_installed():
+    """The forks are installed on the layer for the duration of one backward. Left behind after a
+    raise they would make the NEXT backward -- possibly an ungated one -- run a gated kernel against
+    a stale plan."""
+    pc, root, ns, data, phi, _ = _run(256, 32, 8, 64, scale = 1.0)
 
-    with pytest.raises(NotImplementedError, match = "block-sparse CUDA regime"):
+    with pytest.raises(NotImplementedError):
         pc.backward(data, flows_memory = 0.0)
 
-    # and the interception must not survive the failure, or the next backward inherits it
     layer = [l for g in pc.inner_layer_groups if g.is_sum() for l in g.layers
              if hasattr(l, "external_node_infos")][0]
     assert layer._ext_bw_ele_hook is None and layer._ext_bw_par_hook is None
+    assert layer._ext_bw_par_sb_hook is None
 
 
 
@@ -870,11 +904,12 @@ def test_backward_with_tied_external_gates():
 
 @cuda_only
 @needs_cute
-def test_param_flows_accumulate_across_backwards():
+@pytest.mark.parametrize("batch", [64, 8])
+def test_param_flows_accumulate_across_backwards(batch):
     """The param-flow kernel is READ-ACCUMULATE-WRITE, which is what lets one EM step span several
     mini-batches. A store-only kernel would pass every single-batch test and silently drop everything
     but the last batch here."""
-    pc, root, ns, data, phi, _ = _run(128, 128, 8, 64, scale = 1.0)
+    pc, root, ns, data, phi, _ = _run(128, 128, 8, batch, scale = 1.0)
 
     pc.backward(data, flows_memory = 0.0)
     ns.update_param_flows(pc.param_flows)
@@ -891,10 +926,11 @@ def test_param_flows_accumulate_across_backwards():
 
 @cuda_only
 @needs_cute
-def test_backward_is_deterministic():
+@pytest.mark.parametrize("batch", [64, 8])
+def test_backward_is_deterministic(batch):
     """Same inputs, same flows. The forks accumulate without atomics, so this is exact -- a drift here
     would mean a race, not rounding."""
-    pc, root, ns, data, phi, _ = _run(128, 128, 8, 64, scale = 1.5)
+    pc, root, ns, data, phi, _ = _run(128, 128, 8, batch, scale = 1.5)
 
     pc.backward(data, flows_memory = 0.0)
     ef0, pf0 = pc.element_flows.clone(), pc.param_flows.clone()
@@ -1012,23 +1048,52 @@ def test_em_training_improves_the_likelihood_under_a_live_gate():
     assert hist[-1] > hist[0] + 1e-3, f"EM did not improve the likelihood: {hist}"
 
 
+@cuda_only
+@needs_cute
+@pytest.mark.parametrize("num_latents,block_size,gate_cbs,batch,why", [
+    (256, 64, 8, 64, "child block below the CuTe element kernel's 128-row tile"),
+    (256, 128, 8, 8, "small batch, but several parent blocks per child block"),
+])
+def test_shapes_only_the_triton_fork_reaches(num_latents, block_size, gate_cbs, batch, why):
+    """Shapes NO CUDA fork can serve, which the Triton fork exists to cover.
+
+    Both used to raise. They are the reason the Triton kernel was written -- alongside the shapes where
+    a CUDA fork applies but is simply slower than Triton, which the autotuner now also picks up."""
+    pc, root, ns, data, phi, _ = _run(num_latents, block_size, gate_cbs, batch, scale = 1.5)
+    pc.backward(data, flows_memory = 0.0)
+
+    ref_ef, ref_pf = _flow_reference(pc, ns, phi, gate_cbs, batch)
+    live = torch.isfinite(ref_ef)
+    d_ef = float((pc.element_flows[:, :batch].double()[live] - ref_ef[live]).abs().max())
+
+    ns.update_param_flows(pc.param_flows)
+    got_pf = ns.get_param_flows().double().to(ref_pf.device)
+    d_pf = float(((got_pf - ref_pf).abs() / ref_pf.clamp(min = 1e-30)).max())
+
+    assert d_ef < 2e-3, f"element flows off by {d_ef}"
+    assert d_pf < 3e-3, f"param flows off by {d_pf} (relative)"
+
+
 # --------------------------------------------------------------------------------- the boundary
 
 @cuda_only
 @needs_cute
 @pytest.mark.parametrize("num_latents,block_size,batch,why", [
-    (256, 64, 64, "child block below the element-flow kernel's 128-row tile"),
-    (128, 128, 8, "batch the element-flow kernel cannot tile"),
+    (256, 32, 64, "a k-tile spanning several parent blocks (ptr_inc_step != 1)"),
 ])
 def test_backward_outside_the_kernels_regime_raises(num_latents, block_size, batch, why):
-    """The forward serves shapes the backward does not -- the small-batch forward kernel needs neither
-    `batch % 64` nor a 128-row child block. Where the backward cannot follow it must raise, because
-    the standard kernels it would otherwise fall through to compute the UNGATED flows.
+    """The forward serves shapes the backward does not. Where the backward cannot follow it must raise,
+    because the standard kernels it would otherwise fall through to compute the UNGATED flows.
 
-    This pins the supported region: when one of these starts passing, a case has been implemented."""
+    One case is left. All three forks need every parent in a k-tile to belong to ONE parent node
+    block, because that is exactly what lets the gate factor out of the contraction -- so a small
+    `block_size`, where the tiling heuristic picks a k-tile wider than a node block, has no gated
+    kernel at all.
+
+    This pins the supported region: when this starts passing, a case has been implemented."""
     pc, root, ns, data, phi, _ = _run(num_latents, block_size, 8, batch, scale = 1.0)
 
-    with pytest.raises(NotImplementedError, match = "block-sparse CUDA regime"):
+    with pytest.raises(NotImplementedError, match = "no external element-flow backward applies"):
         pc.backward(data, flows_memory = 0.0)
 
 
