@@ -100,6 +100,18 @@ class ExternalSumParams():
         """
         return None
 
+    def storage_offsets(self, ns):
+        """
+        Where each edge block's entry begins within each storage slot, in per-batch units, as one
+        `long` tensor per slot indexed by edge-block id -- or `None` for the default layout.
+
+        The default is `[E, ...rest, B]`: one contiguous entry per edge block, in edge-block order, so
+        the offset is `edge_block * prod(rest)` and the layer computes it itself. Override when storage
+        is indexed by something other than the edge block, so that the compiled tables point at the
+        right place and staging stays a copy rather than a gather.
+        """
+        return None
+
     def to_storage(self, ns, tensors: Tuple) -> Tuple:
         """
         Map the caller's tensors into :func:`storage_shapes`' layout, ready to be copied.

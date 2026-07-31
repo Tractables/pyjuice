@@ -212,69 +212,36 @@ class BlockScaleSumParams(ExternalSumParams):
 
     def storage_shapes(self, ns, batch_size: int):
         """
-        Stored BATCH-INNERMOST, `[E, A, D, B]`.
+        Stored `[Nk, Ck, B]` -- the caller's own grid, batch innermost.
 
         The kernel reads a gate for a `(child, batch)` tile, so consecutive threads -- which differ in
-        the batch index -- must read consecutive addresses. It also collapses the addressing to one
-        compiled index per edge block, since the subgroup offsets fold in:
-
-        .. code-block:: text
-
-            phi[e, a, d, b] = external_params[ (gate[ng, j] + a * D + d) * B + b ]
+        the batch index -- must read consecutive addresses. Nothing else about the layout changes,
+        which is what makes staging a permuted copy and not a gather: the compiled table (see
+        :func:`storage_offsets`) points each edge block at its own row of the grid, and the kernel's
+        `(base + d) * batch + b` addressing then walks the child gates from there exactly as before.
         """
-        num_edge_blocks = ns.edge_ids.size(1)
-        n_node_gates, n_child_gates = self.gate_counts(ns)
+        gate_bs, gate_cbs = self.gate_sizes(ns)
 
-        return ((num_edge_blocks, n_node_gates, n_child_gates, batch_size),)
+        return ((ns.num_nodes // gate_bs, ns.num_ch_nodes // gate_cbs, batch_size),)
 
-    def _storage_index(self, ns, device):
+    def storage_perm(self):
+        return (1, 2, 0)         # (B, Nk, Ck) -> (Nk, Ck, B)
+
+    def storage_offsets(self, ns):
         """
-        Flat index into the caller's `[Nk, Ck]` grid for each `(edge block, node gate, child gate)`
-        slot of the storage layout. Built once per `(ns, device)`; it depends only on `edge_ids`.
-        """
-        cached = getattr(ns, "_bs_storage_index", None)
-        if cached is not None and cached[0] == str(device):
-            return cached[1]
+        Edge block `e` connects node block `edge_ids[0,e]` to child block `edge_ids[1,e]`, so its gates
+        start at row `nb * n_node_gates` and column `cb * n_child_gates` of the grid.
 
+        Returning this is what lets the caller's layout be the dense grid at no cost: the indirection
+        the kernel already performs -- one compiled base per (row, edge block) -- absorbs it.
+        """
         n_node_gates, n_child_gates = self.gate_counts(ns)
         ck = ns.num_ch_nodes // self.gate_sizes(ns)[1]
 
-        nb = ns.edge_ids[0].to(device = device, dtype = torch.long)      # [E] node block per edge block
-        cb = ns.edge_ids[1].to(device = device, dtype = torch.long)      # [E] child block per edge block
-        a = torch.arange(n_node_gates, device = device, dtype = torch.long)
-        d = torch.arange(n_child_gates, device = device, dtype = torch.long)
+        nb = ns.edge_ids[0].to(torch.long)
+        cb = ns.edge_ids[1].to(torch.long)
 
-        index = ((nb[:, None, None] * n_node_gates + a[None, :, None]) * ck
-                 + (cb[:, None, None] * n_child_gates + d[None, None, :])).reshape(-1)
-
-        ns._bs_storage_index = (str(device), index)
-        return index
-
-    def to_storage(self, ns, tensors):
-        """`[B, Nk, Ck]` -> `[E, A, D, B]`: keep the connected entries, batch innermost."""
-        phi = tensors[0]
-        batch_size = phi.size(0)
-        n_node_gates, n_child_gates = self.gate_counts(ns)
-        num_edge_blocks = ns.edge_ids.size(1)
-
-        index = self._storage_index(ns, phi.device)
-        gathered = phi.reshape(batch_size, -1)[:, index]
-
-        return (gathered.reshape(batch_size, num_edge_blocks, n_node_gates, n_child_gates)
-                        .permute(1, 2, 3, 0),)
-
-    def from_storage(self, ns, tensors):
-        """`[E, A, D, B]` -> `[B, Nk, Ck]`. Unconnected entries take a zero gradient: nothing read them."""
-        grad = tensors[0]
-        num_edge_blocks, n_node_gates, n_child_gates, batch_size = grad.shape
-        gate_bs, gate_cbs = self.gate_sizes(ns)
-        nk, ck = ns.num_nodes // gate_bs, ns.num_ch_nodes // gate_cbs
-
-        index = self._storage_index(ns, grad.device)
-        out = torch.zeros([batch_size, nk * ck], dtype = grad.dtype, device = grad.device)
-        out[:, index] = grad.permute(3, 0, 1, 2).reshape(batch_size, -1)
-
-        return (out.reshape(batch_size, nk, ck),)
+        return ((nb * n_node_gates) * ck + cb * n_child_gates,)
 
     # ------------------------------------------------------------------ execution
 

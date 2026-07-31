@@ -380,14 +380,23 @@ class ExternalParamsSumLayer(SumLayer):
                 assert torch.all(blocked[:,:max_n_eblks,0][valid] == ns_info.ch_eids.cpu()[eblks][valid]), \
                     "External sum parameters require `cids` to list edge blocks in `par_ptr` order."
 
-                # Each slot is stored `[E, ...rest, B]`, so its per-edge-block stride in per-batch
-                # units is the product of everything between the edge-block axis and the batch axis.
-                for slot, shape in enumerate(ns.external_params.storage_shapes(ns, 1)):
-                    stride = 1
-                    for d in shape[1:-1]:
-                        stride *= int(d)
+                # Where each edge block's entry starts within its slot, in per-batch units. The
+                # parameterization decides: the default layout is `[E, ...rest, B]`, one entry per edge
+                # block in edge-block order, so the offset is just `eblk * stride`. A layout that stores
+                # something OTHER than one contiguous entry per edge block -- a dense grid indexed by
+                # (node block, child block), say -- supplies its own map, which is what keeps staging a
+                # permute instead of a gather.
+                offsets = ns.external_params.storage_offsets(ns)
+                for slot in range(n_ext_slots):
+                    off = offsets[slot].cpu()[eblks] if offsets is not None else None
+                    if off is None:
+                        shape = ns.external_params.storage_shapes(ns, 1)[slot]
+                        stride = 1
+                        for d in shape[1:-1]:
+                            stride *= int(d)
+                        off = eblks * stride
 
-                    curr[slot][rows] = torch.where(valid, ns2unit[ns][slot] + eblks * stride, -1)
+                    curr[slot][rows] = torch.where(valid, ns2unit[ns][slot] + off, -1)
 
             for slot in range(n_ext_slots):
                 tables[slot].append(curr[slot])

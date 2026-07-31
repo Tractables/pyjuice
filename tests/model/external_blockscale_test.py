@@ -438,11 +438,13 @@ def test_gate_grid_shape_follows_the_gate_size_not_the_blocking():
 
 
 @cuda_only
-def test_storage_round_trip_is_the_identity_on_connected_gates():
-    """`from_storage` must invert `to_storage` exactly -- it is how gradients get back to the caller.
+def test_storage_round_trip_is_the_identity():
+    """`from_storage` must invert `to_storage` exactly -- it is how gradients reach the caller.
 
-    Connected (node block, child block) pairs must come back bit-identical; pairs this layer does not
-    connect must come back ZERO, because nothing in the model read them."""
+    Storage holds the caller's own grid, batch innermost, so the two are a permutation and its inverse
+    and the round trip is bit-exact. Entries for (node block, child block) pairs the layer does not
+    connect simply go unread: the compiled table never points at them, and the gradient buffer is
+    zero-initialized each backward, so they read back as zero rather than as stale values."""
     dev = torch.device("cuda:0")
     batch = 5
     _, ns = _build(256, 64, gate_cbs = 8)
@@ -451,18 +453,33 @@ def test_storage_round_trip_is_the_identity_on_connected_gates():
     torch.manual_seed(0)
     phi = torch.randn(_gate_shape(ns, batch), device = dev)
 
-    back = ep.from_storage(ns, ep.to_storage(ns, (phi,)))[0]
-    assert back.shape == phi.shape
+    stored = ep.to_storage(ns, (phi,))[0]
+    assert tuple(stored.shape) == tuple(ep.storage_shapes(ns, batch)[0])
 
-    # mark which grid entries storage actually keeps, using edge_ids directly
-    a_gates, d_gates = ep.gate_counts(ns)
-    seen = torch.zeros_like(phi, dtype = torch.bool)
+    back = ep.from_storage(ns, (stored,))[0]
+    assert back.shape == phi.shape
+    assert torch.equal(back, phi), "the round trip is not the identity"
+
+
+@cuda_only
+def test_storage_offsets_agree_with_the_grid_layout():
+    """Each edge block's compiled base must be where its gates actually live in the grid.
+
+    This is what replaced a per-forward gather: the kernel's existing indirection absorbs the layout,
+    so the offsets have to be right or the kernel reads the wrong gates -- silently, since every offset
+    is in bounds."""
+    _, ns = _build(512, 64, gate_cbs = 8)
+    ep = ns.external_params
+
+    n_node_gates, n_child_gates = ep.gate_counts(ns)
+    ck = ns.num_ch_nodes // ep.gate_sizes(ns)[1]
+    offsets = ep.storage_offsets(ns)[0]
+
     for e in range(ns.edge_ids.size(1)):
         nb, cb = int(ns.edge_ids[0, e]), int(ns.edge_ids[1, e])
-        seen[:, nb * a_gates:(nb + 1) * a_gates, cb * d_gates:(cb + 1) * d_gates] = True
-
-    assert torch.equal(back[seen], phi[seen]), "a connected gate did not survive the round trip"
-    assert torch.all(back[~seen] == 0.0), "an unconnected gate came back non-zero"
+        # the flat position of grid entry (nb * A, cb * D) in a [Nk, Ck] row-major grid
+        assert int(offsets[e]) == (nb * n_node_gates) * ck + cb * n_child_gates, \
+            f"edge block {e} -> ({nb}, {cb}) has offset {int(offsets[e])}"
 
 
 @cuda_only
