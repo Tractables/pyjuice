@@ -37,13 +37,14 @@ from pyjuice.utils.kernel_launcher import triton_jit
 @triton_jit
 def _bs_triton_ele_kernel(node_flows, element_flows, node_mars, element_mars, mparams,
                           ext, gate, chids, parids_start, parids_increment,
-                          parpids_start, parpids_increment,
+                          parpids_start, parpids_increment, grad_ext,
                           batch_size: tl.constexpr, ptr_inc_step: tl.constexpr,
                           BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr,
                           K_NUM_TILES: tl.constexpr, TILE_SIZE_M: tl.constexpr,
                           BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
                           TL_DOT: tl.constexpr, GATE_CBS: tl.constexpr,
-                          gate_stride: tl.constexpr, ext_base, pid_m_offset = 0):
+                          gate_stride: tl.constexpr, ext_base, WRITE_GRAD: tl.constexpr = 0,
+                          pid_m_offset = 0):
 
     pid_b = tl.program_id(0)                            # ID of size-`BLOCK_B` batches
     pid_m = tl.program_id(1) + pid_m_offset             # ID of size-`TILE_SIZE_M` nodes
@@ -108,6 +109,33 @@ def _bs_triton_ele_kernel(node_flows, element_flows, node_mars, element_mars, mp
                     mask = mask_batch[None,:], other = 0.0),
             -float("inf")
         )                                                   # [TILE_SIZE_M, BLOCK_B]
+
+        # The Ntilde half of `d LL / d log phi`. `partial_flows * exp(partial_flows_max)` IS
+        # `sum_{n in this parent block} edge_flow[n, c, b]` -- the per-(parent block, child, sample)
+        # sum -- which this kernel forms anyway on its way to the log-sum-exp below. Summing it over
+        # the GATE_CBS children of each gate is all the first term needs, so it costs a reduction and
+        # an atomic rather than a second pass over the operands.
+        #
+        # Linear space is safe here: edge flows are bounded by the node flow, which is O(1).
+        if WRITE_GRAD:
+            contrib = partial_flows * tl.exp(emars + log_n_fdm_max + lphi)
+            # Two cases, both resolved at compile time, so the tile size need not relate to the gate
+            # size at all. Requiring `TILE_SIZE_M % GATE_CBS == 0` was an artefact of reaching for
+            # `tl.reshape` first, and it made every shape whose element tile is narrower than a gate
+            # raise -- including ones that never asked for a gradient.
+            if TILE_SIZE_M >= GATE_CBS:
+                red = tl.sum(tl.reshape(contrib, (TILE_SIZE_M // GATE_CBS, GATE_CBS, BLOCK_B)),
+                             axis = 1)
+                grow_g = gbase + ext_base + (tile_id * TILE_SIZE_M) // GATE_CBS \
+                         + tl.arange(0, TILE_SIZE_M // GATE_CBS)
+                tl.atomic_add(grad_ext + grow_g[:,None] * batch_size + offs_batch[None,:], red,
+                              mask = mask_batch[None,:] & (gbase >= 0))
+            else:
+                # the whole tile sits inside ONE gate
+                red1 = tl.sum(contrib, axis = 0)
+                grow1 = gbase + ext_base + (tile_id * TILE_SIZE_M) // GATE_CBS
+                tl.atomic_add(grad_ext + grow1 * batch_size + offs_batch, red1,
+                              mask = mask_batch & (gbase >= 0))
 
         partial_flows_max = emars + log_n_fdm_max + lphi
         acc = tl.where(partial_flows_max == -float("inf"),
@@ -215,3 +243,53 @@ def _bs_triton_par_kernel(node_flows, node_mars, element_mars, mparams, param_fl
     parflow_start = tl.load(pfids + nblock_id * num_edges + offs_edge)
     offsets = offs_node[:,None] + parflow_start[None,:]
     tl.store(param_flows + offsets, tl.load(param_flows + offsets) + pflows)
+
+
+@triton_jit
+def _bs_triton_phigrad_logz_kernel(node_flows, log_z, sigma, ext, gate, grad_ext, nids,
+                                   batch_size: tl.constexpr, n_gates: tl.constexpr,
+                                   N_CHILD_GATES: tl.constexpr, BLOCK_SIZE_M: tl.constexpr,
+                                   BLOCK_B: tl.constexpr, gate_stride: tl.constexpr, ext_base):
+    """
+    The log-Z half of `d LL / d log phi`:
+
+        term2[b, nk, g] = sum_n f_b[n] * phi_b[g] * sigma[g,n] / Z_b[n]
+
+    Standalone rather than fused, because it shares no operand with the element backward -- it needs
+    `sigma[g,n] = sum_{c in g} theta[n,c]` and `Z`, and no `element_mars` at all. `log Z` comes free:
+    the forward already caches it for the `node_mars` shift. `sigma` is cached per EM step, since it
+    changes only when theta does.
+
+    One program per (gate, node block, batch tile); the reduction is over the block's nodes.
+    """
+    pid_g = tl.program_id(0)
+    pid_nb = tl.program_id(1)
+    pid_b = tl.program_id(2)
+
+    offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B
+    mask_batch = offs_batch < batch_size
+    offs_node = tl.arange(0, BLOCK_SIZE_M)
+
+    # `pid_g` is the FLAT gate index across the row: which edge block, then which gate inside it.
+    # A node's gates span all its edge blocks, so indexing column 0 alone would only ever be right for
+    # a single-edge-block row.
+    j = pid_g // N_CHILD_GATES
+    d = pid_g % N_CHILD_GATES
+    gbase = tl.load(gate + pid_nb * gate_stride + j)
+    row = gbase + ext_base + d
+
+    off_nids = tl.load(nids + pid_nb)
+    nf = tl.load(node_flows + (off_nids + offs_node[:,None]) * batch_size + offs_batch[None,:],
+                 mask = mask_batch[None,:], other = -float("inf"))
+    lz = tl.load(log_z + (pid_nb * BLOCK_SIZE_M + offs_node[:,None]) * batch_size + offs_batch[None,:],
+                 mask = mask_batch[None,:], other = 0.0)
+    sg = tl.load(sigma + (pid_nb * BLOCK_SIZE_M + offs_node) * n_gates + pid_g)
+    lphi = tl.load(ext + row * batch_size + offs_batch, mask = mask_batch, other = -float("inf"))
+
+    val = tl.exp(nf + lphi[None,:] - lz) * sg[:,None]
+    out = tl.sum(tl.where(mask_batch[None,:] & (gbase >= 0), val, 0.0), axis = 0)
+
+    # SUBTRACTED: the gradient is (Ntilde term - logZ term), and the element kernel already added the
+    # first. Getting this sign wrong makes the two terms sum to 2*(total node flow) instead of 0, which
+    # is exactly what the `sum over a node's gates == 0` invariant exists to catch.
+    tl.atomic_add(grad_ext + row * batch_size + offs_batch, -out, mask = mask_batch & (gbase >= 0))

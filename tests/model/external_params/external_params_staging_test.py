@@ -341,10 +341,13 @@ def test_external_params_grad_buffer():
     with pytest.raises(AssertionError):
         pc.get_external_params_grad(trans_ns)
 
-    # Supplying the gradient buffers is not the caller's job
+    # The caller MAY supply their own destination buffers, keyed exactly like the forward. They are
+    # filled from the PC's internal ones, which stay readable through `get_external_params_grad`.
     pc(data, sum_external_params = tensors)
-    with pytest.raises(AssertionError):
-        pc.backward(data, sum_external_params_grad = {trans_ns: tensors[trans_ns]})
+    mine = tuple(torch.zeros_like(t) for t in tensors[trans_ns])
+    pc.backward(data, sum_external_params_grad = {trans_ns: mine})
+    for got, ref in zip(mine, pc.get_external_params_grad(trans_ns)):
+        assert torch.equal(got, ref)
 
 
 def test_external_params_backward_reuses_forward():

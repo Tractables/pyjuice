@@ -326,3 +326,45 @@ def test_a_contiguous_group_stages_in_one_copy():
     ll_r = pc(data_, sum_external_params = {"rev": torch.cat(list(reversed(gates)), dim = 1)}).clone()
     ll_p = pc(data_, sum_external_params = dict(zip(trans, gates))).clone()
     assert torch.equal(ll_g, ll_p) and torch.equal(ll_r, ll_p)
+
+
+@cuda_only
+def test_backward_can_fill_caller_supplied_gradient_buffers():
+    """`sum_external_params_grad` mirrors the forward: a dict keyed by `ns` OR by group name, whose
+    tensors the backward fills.
+
+    The kernels always write the PC's internal buffer -- they address it by compiled offset -- so this
+    is a copy-out afterwards, and `get_external_params_grad` keeps working alongside it. Asking for
+    destinations implies `compute_external_grads`, so there is no second flag to remember."""
+    dev, batch = torch.device("cuda:0"), 64
+    root, s0, s1 = _two_gated()
+    pc = juice.compile(root, verbose = False).to(dev)
+
+    torch.manual_seed(7)
+    data = torch.randint(0, NUM_CATS, [batch, 3], device = dev)
+    g0, g1 = _gates(s0, batch, dev, 11), _gates(s1, batch, dev, 12)
+
+    pc(data, sum_external_params = {s0: g0, s1: g1})
+    pc.backward(data, flows_memory = 0.0)
+    ref0 = pc.get_external_params_grad(s0)[0].clone()
+    ref1 = pc.get_external_params_grad(s1)[0].clone()
+    assert float(ref0.abs().max()) > 0.0, "the gradient is identically zero; nothing was computed"
+
+    mine0, mine1 = torch.zeros_like(ref0), torch.zeros_like(ref1)
+    pc(data, sum_external_params = {s0: g0, s1: g1})
+    pc.backward(data, flows_memory = 0.0, sum_external_params_grad = {s0: mine0, s1: mine1})
+    assert torch.equal(mine0, ref0) and torch.equal(mine1, ref1)
+    # the internal read still works after a copy-out
+    assert torch.equal(pc.get_external_params_grad(s0)[0], ref0)
+
+    # and by group name, in the group's own layout
+    pc.register_external_params_group("both", [s0, s1])
+    cat = torch.zeros_like(torch.cat([ref0, ref1], dim = 1))
+    pc(data, sum_external_params = {"both": torch.cat([g0, g1], dim = 1)})
+    pc.backward(data, flows_memory = 0.0, sum_external_params_grad = {"both": cat})
+    assert torch.equal(cat, torch.cat([ref0, ref1], dim = 1))
+
+    with pytest.raises(AssertionError, match = "shape"):
+        pc(data, sum_external_params = {s0: g0, s1: g1})
+        pc.backward(data, flows_memory = 0.0,
+                    sum_external_params_grad = {s0: torch.zeros([batch, 1, 1], device = dev)})

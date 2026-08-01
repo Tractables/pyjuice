@@ -104,12 +104,17 @@ class BlockScaleSumParams(ExternalSumParams):
     #: computes the node values itself instead of correcting them afterwards.
     replaces_shared_forward = True
 
-    #: The element and parameter flows ARE computed (by two forks of the standard backward kernels, so
-    #: `replaces_shared_backward` stays False and the standard backward's own table derivation is
-    #: reused -- see `pre_backward_layer`). `d LL / d log phi` is not: its second term carries
-    #: `sigma[g,n] = sum_{c in g} theta[n,c]`, which the forward stopped materializing once the
-    #: normalizer became a second contraction against the same operand, so it needs its own kernel.
-    computes_external_grads = False
+    #: `d LL / d log phi` IS computed, in two halves (see `post_backward_layer`): the `Ntilde` term is
+    #: fused into the Triton element-flow fork, where the per-(parent block, child, sample) partial it
+    #: needs is already in registers, and the `log Z` term is a small standalone kernel using the
+    #: forward's cached `log Z` and a `sigma[g,n]` that is recomputed only when `params` changes.
+    #:
+    #: This flag is a STATIC claim -- "this parameterization implements gradients at all" -- and cannot
+    #: express that support is shape-dependent: only the Triton element fork carries the first term, so
+    #: a shape it cannot serve (`ptr_inc_step != 1`, or an element tile that is not a whole number of
+    #: gates) RAISES during the backward rather than returning a silent zero. That is the same contract
+    #: the flow kernels use, and it is why the flag stays a plain bool.
+    computes_external_grads = True
 
     def __init__(self, block_size: Optional[int] = None, ch_block_size: Optional[int] = None,
                  apply_z_correction: bool = False, tie_external: bool = False):
@@ -632,6 +637,15 @@ class BlockScaleSumParams(ExternalSumParams):
         if external_params is None:
             raise RuntimeError("the external-parameter staging buffer was not supplied to the backward.")
 
+        from pyjuice.layer.external_sum_layer import EXTERNAL_PARAMS_GRAD_KWARG, \
+            EXTERNAL_PARAMS_GRAD_BUFFER_KWARG
+        grads = kwargs.get(EXTERNAL_PARAMS_GRAD_KWARG, None)
+        want_grad = grads is not None and any(ns_info.ns in grads for ns_info, _ in ns_tensors)
+        layer._bs_grad_ext = kwargs.get(EXTERNAL_PARAMS_GRAD_BUFFER_KWARG, None) if want_grad else None
+        if want_grad and layer._bs_grad_ext is None:
+            raise RuntimeError("external-parameter gradients were requested but no gradient buffer "
+                               "was supplied to the backward.")
+
         state = self._bw_state(layer, node_mars, kwargs)
 
         from .kernels.c import get_module, get_ele_bw_module, get_par_bw_module, get_sb_bw_module
@@ -725,6 +739,22 @@ class BlockScaleSumParams(ExternalSumParams):
                     f"is what lets the gate factor out of the contraction."
                 )
 
+            if layer._bs_grad_ext is not None:
+                # Gradients no longer force one fork: any candidate that implements `d LL / d log phi`
+                # stays in, so the choice is still made on speed. A fork that does NOT implement it is
+                # dropped rather than silently returning no gradient -- and if that empties the list,
+                # the guard above has already reported the shape.
+                #
+                # This block sits AFTER that guard on purpose: an unsupported shape has no gate table,
+                # and returning a kind for it reached the launch with a null table and died with an
+                # AttributeError instead of a clear NotImplementedError.
+                kinds = [k for k in kinds if k == "triton" or isinstance(k, tuple)]
+                if not kinds:
+                    raise NotImplementedError(
+                        "external-parameter gradients are implemented for the Triton and small-batch "
+                        "element forks; no gradient-capable fork applies to this shape."
+                    )
+
             if len(kinds) == 1:
                 plan["kind"] = kinds[0]
                 return plan
@@ -755,6 +785,8 @@ class BlockScaleSumParams(ExternalSumParams):
                 sb_mod.blockscale_sb_ele_backward(
                     tgt, ctx["element_mars"], ctx["node_flows"], ctx["node_mars"], ctx["params"],
                     external_params, chids, e0, p0, plan["gate_sb"],
+                    (layer._bs_grad_ext if layer._bs_grad_ext is not None
+                     else external_params.new_empty(0)),
                     batch, blk, cbs, ne, gate_cbs, ext_base, kind[1])
 
             else:                                             # "triton"
@@ -774,6 +806,9 @@ class BlockScaleSumParams(ExternalSumParams):
                         K_NUM_TILES = knt, TILE_SIZE_M = ctx["TILE_SIZE_M"],
                         BLOCK_SIZE_M = cbs, BLOCK_SIZE_K = blk, TL_DOT = ctx["TL_DOT"],
                         GATE_CBS = gate_cbs, gate_stride = gb.size(1), ext_base = ext_base,
+                        grad_ext = (layer._bs_grad_ext if layer._bs_grad_ext is not None
+                                    else external_params),
+                        WRITE_GRAD = (1 if layer._bs_grad_ext is not None else 0),
                         pid_m_offset = s0, num_stages = 1)
 
         def _par_hook(param_flows, node_flows, node_mars, element_mars, params, nbase, cbase, pbase,
@@ -831,7 +866,57 @@ class BlockScaleSumParams(ExternalSumParams):
         from .kernels.c import get_module
 
         state = layer._bs_bw_state
+
+        # The log-Z half of `d LL / d log phi`. Runs here, not in the element kernel, because it shares
+        # no operand with it. Uses `log Z` straight from the forward's cache, so nothing is recomputed.
+        grad_ext = getattr(layer, "_bs_grad_ext", None)
+        if grad_ext is not None:
+            import triton
+            from .kernels.blockscale_backward import _bs_triton_phigrad_logz_kernel
+
+            external_params = kwargs.get(_buffer_kwarg(), None)
+            bs_, gate_cbs = state["block_size"], state["gate_cbs"]
+            batch = state["batch_size"]
+            BLOCK_B = min(1024, max(16, triton.next_power_of_2(batch)))
+
+            for pid, (nids, log_z, rows) in enumerate(state["shift_args"]):
+                sigma, n_gates = self._sigma(layer, params, pid, bs_, gate_cbs)
+                gb = layer.ext_slots[0][pid]
+                _bs_triton_phigrad_logz_kernel[(n_gates, rows, triton.cdiv(batch, BLOCK_B))](
+                    node_flows = node_flows, log_z = log_z, sigma = sigma, ext = external_params,
+                    gate = gb, grad_ext = grad_ext, nids = nids,
+                    batch_size = batch, n_gates = n_gates,
+                    N_CHILD_GATES = state["node_cbs"] // gate_cbs, BLOCK_SIZE_M = bs_,
+                    BLOCK_B = BLOCK_B, gate_stride = gb.size(1), ext_base = state["ext_base"],
+                    num_stages = 1)
+
+            layer._bs_grad_ext = None
+
         for nids, log_z, rows in state["shift_args"]:
             get_module().lowrank_shift_logz(node_mars, nids, log_z, state["block_size"], -1.0)
 
         return None
+
+    def _sigma(self, layer, params, pid, block_size, gate_cbs):
+        """
+        `sigma[node, flat gate] = sum_{c in that gate} theta[node, c]`, cached until `params` changes.
+
+        Recomputing it every backward would be a full read of theta for a quantity that only moves when
+        the parameters do -- i.e. once per EM step, not once per batch. `Tensor._version` bumps on the
+        in-place parameter update, which is exactly the invalidation signal.
+        """
+        cache = getattr(layer, "_bs_sigma_cache", None)
+        key = (pid, params._version, block_size, gate_cbs)
+        if cache is not None and cache[0] == key:
+            return cache[1], cache[2]
+
+        pids = layer.partitioned_pids[pid].to(torch.int64)
+        rows, num_edges = pids.shape
+        ar = torch.arange(block_size, device = params.device, dtype = torch.int64)
+        th = params[pids[:, :, None] + ar[None, None, :]]              # [rows, edges, block_size]
+        n_gates = num_edges // gate_cbs
+        sg = th.view(rows, n_gates, gate_cbs, block_size).sum(dim = 2)  # [rows, gates, block_size]
+        sigma = sg.permute(0, 2, 1).reshape(rows * block_size, n_gates).contiguous()
+
+        layer._bs_sigma_cache = (key, sigma, n_gates)
+        return sigma, n_gates

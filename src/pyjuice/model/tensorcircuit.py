@@ -636,6 +636,8 @@ class TensorCircuit(nn.Module):
                     else:
                         raise ValueError(f"Custom input function should be either a `str` or a `Callable`. Found {type(input_layer_fn)} instead.")
 
+        self._write_external_params_grads()
+
         if return_cache:
             if cache is None:
                 cache = dict()
@@ -646,6 +648,33 @@ class TensorCircuit(nn.Module):
             return cache
         else:
             return None
+
+    def _write_external_params_grads(self) -> None:
+        """
+        Copy the gradients into the buffers the caller supplied to `sum_external_params_grad`.
+
+        The kernels write the PC's internal buffer, which is in STORAGE layout (batch innermost); the
+        caller's tensors are in the layout they supplied the gates in. `from_storage` is what maps
+        between the two, so this is the exact inverse of what staging does on the forward, batched into
+        one `_foreach_copy_` rather than one op per node.
+        """
+        dsts = getattr(self, "_external_grad_dsts", None)
+        if not dsts:
+            return None
+
+        d, s = [], []
+        for ns, tensors in dsts.items():
+            src = ns.external_params.from_storage(ns, self._staged_external_params_grad[ns])
+            if torch.is_tensor(tensors):
+                tensors = (tensors,)
+            for dst, one in zip(tensors, src):
+                d.append(dst)
+                s.append(one)
+
+        if d:
+            torch._foreach_copy_(d, s)
+
+        self._external_grad_dsts = None
 
     def _external_params_layout(self, batch_size: int):
         """
@@ -1133,9 +1162,29 @@ class TensorCircuit(nn.Module):
         which is what lets a node appear in several layers (a tied transition) and sum its
         contributions.
         """
-        assert kwargs.get(EXTERNAL_PARAMS_GRAD_KWARG, None) is None, \
-            f"`{EXTERNAL_PARAMS_GRAD_KWARG}` is supplied by the PC, not by the caller. Run the backward " \
-            f"pass and read the gradients with `pc.get_external_params_grad(ns)`."
+        # The caller may supply DESTINATIONS -- `{ns: buffer}` or `{group: buffer}`, exactly the
+        # forward's shape -- to have the gradients written into their own tensors. The kernels still
+        # write the PC's internal buffer (they address it by compiled offset), so this records the
+        # destinations and the copy-out happens once the backward is done; `get_external_params_grad`
+        # keeps working either way.
+        dsts = kwargs.pop(EXTERNAL_PARAMS_GRAD_KWARG, None)
+        self._external_grad_dsts = None
+        if dsts is not None:
+            assert isinstance(dsts, dict), \
+                f"`{EXTERNAL_PARAMS_GRAD_KWARG}` should be a dict mapping nodes (or group names) to " \
+                f"the buffers to fill, got {type(dsts)}."
+            assert self._staged_external_params is not None, \
+                f"`{EXTERNAL_PARAMS_GRAD_KWARG}` was given, but the forward pass received no external " \
+                f"parameters."
+            dsts = self._expand_external_params_groups(dsts, batch_size)
+            for ns, tensors in dsts.items():
+                assert ns in self._staged_external_params, \
+                    f"`{EXTERNAL_PARAMS_GRAD_KWARG}` names {ns}, which was not given external " \
+                    f"parameters in the forward pass."
+                validate_external_tensors(ns, ns.external_params, tensors, batch_size,
+                                          self.external_params.device, require_contiguous = False)
+            self._external_grad_dsts = dsts
+            compute_external_grads = True          # asking for them is asking for them
 
         if self._staged_external_params is None or not compute_external_grads:
             self._staged_external_params_grad = None
@@ -1722,6 +1771,7 @@ class TensorCircuit(nn.Module):
         # matching per-sample gradients into views of the same shape
         self._staged_external_params = None
         self._staged_external_params_grad = None
+        self._external_grad_dsts = None
 
         # name -> (nodes, dim): several `ns` addressed by ONE concatenated tensor. See
         # `register_external_params_group`.

@@ -50,12 +50,13 @@ __device__ __forceinline__ void lse_merge(float& m, float& l, float om, float ol
 
 // --------------------------------------------------------------------------------- element flows
 
-template <int WARPS, int BMAX>
+template <int WARPS, int BMAX, bool WGRAD>
 __global__ void bs_sb_ele_kernel(float* __restrict__ element_flows, const float* __restrict__ element_mars,
                                  const float* __restrict__ node_flows, const float* __restrict__ node_mars,
                                  const float* __restrict__ params, const float* __restrict__ ext,
                                  const long* __restrict__ chids, const long* __restrict__ ebase,
                                  const long* __restrict__ pbase, const long* __restrict__ gate,
+                                 float* __restrict__ grad_ext,
                                  int batch, int block_size, int cs_block_size, int num_edges,
                                  int gate_sh, int gstride, long ext_base) {
     const int lane = threadIdx.x;                       // 0..31  -> a 1/32 stride of the edges
@@ -77,6 +78,17 @@ __global__ void bs_sb_ele_kernel(float* __restrict__ element_flows, const float*
     #pragma unroll
     for (int b = 0; b < BMAX; b++) { mm[b] = -INFINITY; ll[b] = 0.f; }
 
+    // `d LL / d log phi`, first term. Needs this child's own value, which the epilogue reads anyway.
+    const long node_g = chids[eb] + m_local;
+    float emb[BMAX];
+    if (WGRAD) {
+        #pragma unroll
+        for (int b = 0; b < BMAX; b++) {
+            if (b >= batch) break;
+            emb[b] = element_mars[node_g * (long)batch + b];
+        }
+    }
+
     // Parent blocks on the outside: `phi` is constant across a block's `block_size` parents, so it is
     // read once per (block, sample) instead of once per edge. Lanes still stride by 32 WITHIN a block,
     // so the params / node_flows / node_mars loads stay coalesced exactly as in the parent kernel.
@@ -88,6 +100,15 @@ __global__ void bs_sb_ele_kernel(float* __restrict__ element_flows, const float*
         for (int b = 0; b < BMAX; b++) {
             if (b >= batch) break;
             lphi[b] = (gb >= 0) ? ext[(gb + ext_base + gidx) * (long)batch + b] : -INFINITY;
+        }
+
+        // Per-PARENT-BLOCK accumulator, kept ALONGSIDE the running one rather than replacing it: the
+        // gradient needs this block's contribution warp-reduced on its own, while `mm`/`ll` must stay
+        // per-lane so the epilogue's reduction below is exactly what it was.
+        float mj[BMAX], lj[BMAX];
+        if (WGRAD) {
+            #pragma unroll
+            for (int b = 0; b < BMAX; b++) { mj[b] = -INFINITY; lj[b] = 0.f; }
         }
 
         const int e0 = j * block_size, e1 = e0 + block_size;
@@ -102,6 +123,25 @@ __global__ void bs_sb_ele_kernel(float* __restrict__ element_flows, const float*
                 float nmar = nm[b];
                 float term = (nmar == -INFINITY) ? nf[b] : (nf[b] - nmar);   // log_n_fdm[par, b]
                 lse_merge(mm[b], ll[b], term + lphi[b], wgt);
+                if (WGRAD) lse_merge(mj[b], lj[b], term + lphi[b], wgt);
+            }
+        }
+
+        // sum over {parents in this block} x {children in this gate} of the edge flows, atomically
+        // into the gate's row. Children of one gate live in DIFFERENT warps here (one warp per child),
+        // so the sum across a gate is the atomic; the sum across parents is the warp reduction.
+        if (WGRAD) {
+            #pragma unroll
+            for (int b = 0; b < BMAX; b++) {
+                if (b >= batch) break;
+                float m = mj[b], l = lj[b];
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1)
+                    lse_merge(m, l, __shfl_xor_sync(0xffffffff, m, off),
+                                    __shfl_xor_sync(0xffffffff, l, off));
+                if (lane == 0 && gb >= 0 && m != -INFINITY)
+                    atomicAdd(grad_ext + (gb + ext_base + gidx) * (long)batch + b,
+                              l * __expf(m + emb[b]));
             }
         }
     }
@@ -126,6 +166,7 @@ template <int WARPS, int BMAX>
 static void launch_sb_ele(torch::Tensor element_flows, torch::Tensor element_mars, torch::Tensor node_flows,
                           torch::Tensor node_mars, torch::Tensor params, torch::Tensor ext,
                           torch::Tensor chids, torch::Tensor ebase, torch::Tensor pbase, torch::Tensor gate,
+                          torch::Tensor grad_ext,
                           int batch, int block_size, int cs_block_size, int num_edges,
                           int gate_sh, long ext_base) {
     const long neb = chids.size(0);
@@ -133,28 +174,39 @@ static void launch_sb_ele(torch::Tensor element_flows, torch::Tensor element_mar
     dim3 blk(32, WARPS);
     // Launch on the current stream (not the default stream) so the kernel is captured correctly when
     // pyjuice records a CUDA graph of the backward pass.
-    bs_sb_ele_kernel<WARPS, BMAX><<<grid, blk, 0, c10::cuda::getCurrentCUDAStream()>>>(
-        element_flows.data_ptr<float>(), element_mars.data_ptr<float>(), node_flows.data_ptr<float>(),
-        node_mars.data_ptr<float>(), params.data_ptr<float>(), ext.data_ptr<float>(),
-        chids.data_ptr<long>(), ebase.data_ptr<long>(), pbase.data_ptr<long>(), gate.data_ptr<long>(),
-        batch, block_size, cs_block_size, num_edges, gate_sh, (int)gate.size(1), ext_base);
+    // WGRAD is a TEMPLATE parameter, so the no-gradient path compiles to exactly the kernel it was
+    // before: no extra registers, no occupancy change.
+    if (grad_ext.numel() > 0)
+        bs_sb_ele_kernel<WARPS, BMAX, true><<<grid, blk, 0, c10::cuda::getCurrentCUDAStream()>>>(
+            element_flows.data_ptr<float>(), element_mars.data_ptr<float>(), node_flows.data_ptr<float>(),
+            node_mars.data_ptr<float>(), params.data_ptr<float>(), ext.data_ptr<float>(),
+            chids.data_ptr<long>(), ebase.data_ptr<long>(), pbase.data_ptr<long>(), gate.data_ptr<long>(),
+            grad_ext.data_ptr<float>(),
+            batch, block_size, cs_block_size, num_edges, gate_sh, (int)gate.size(1), ext_base);
+    else
+        bs_sb_ele_kernel<WARPS, BMAX, false><<<grid, blk, 0, c10::cuda::getCurrentCUDAStream()>>>(
+            element_flows.data_ptr<float>(), element_mars.data_ptr<float>(), node_flows.data_ptr<float>(),
+            node_mars.data_ptr<float>(), params.data_ptr<float>(), ext.data_ptr<float>(),
+            chids.data_ptr<long>(), ebase.data_ptr<long>(), pbase.data_ptr<long>(), gate.data_ptr<long>(),
+            nullptr,
+            batch, block_size, cs_block_size, num_edges, gate_sh, (int)gate.size(1), ext_base);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 #define BS_SB_ELE_DISPATCH_BMAX(WW)                                                                    \
     switch (bmax) {                                                                                     \
-        case 1:  launch_sb_ele<WW, 1 >(element_flows, element_mars, node_flows, node_mars, params, ext, chids, ebase, pbase, gate, b, bs, cs, ne, gsh, eb_); break; \
-        case 2:  launch_sb_ele<WW, 2 >(element_flows, element_mars, node_flows, node_mars, params, ext, chids, ebase, pbase, gate, b, bs, cs, ne, gsh, eb_); break; \
-        case 4:  launch_sb_ele<WW, 4 >(element_flows, element_mars, node_flows, node_mars, params, ext, chids, ebase, pbase, gate, b, bs, cs, ne, gsh, eb_); break; \
-        case 8:  launch_sb_ele<WW, 8 >(element_flows, element_mars, node_flows, node_mars, params, ext, chids, ebase, pbase, gate, b, bs, cs, ne, gsh, eb_); break; \
-        case 16: launch_sb_ele<WW, 16>(element_flows, element_mars, node_flows, node_mars, params, ext, chids, ebase, pbase, gate, b, bs, cs, ne, gsh, eb_); break; \
+        case 1:  launch_sb_ele<WW, 1 >(element_flows, element_mars, node_flows, node_mars, params, ext, chids, ebase, pbase, gate, grad_ext, b, bs, cs, ne, gsh, eb_); break; \
+        case 2:  launch_sb_ele<WW, 2 >(element_flows, element_mars, node_flows, node_mars, params, ext, chids, ebase, pbase, gate, grad_ext, b, bs, cs, ne, gsh, eb_); break; \
+        case 4:  launch_sb_ele<WW, 4 >(element_flows, element_mars, node_flows, node_mars, params, ext, chids, ebase, pbase, gate, grad_ext, b, bs, cs, ne, gsh, eb_); break; \
+        case 8:  launch_sb_ele<WW, 8 >(element_flows, element_mars, node_flows, node_mars, params, ext, chids, ebase, pbase, gate, grad_ext, b, bs, cs, ne, gsh, eb_); break; \
+        case 16: launch_sb_ele<WW, 16>(element_flows, element_mars, node_flows, node_mars, params, ext, chids, ebase, pbase, gate, grad_ext, b, bs, cs, ne, gsh, eb_); break; \
         default: TORCH_CHECK(false, "blockscale_sb_ele_backward: invalid batch ", b);                   \
     }
 
 void blockscale_sb_ele_backward(torch::Tensor element_flows, torch::Tensor element_mars,
                                 torch::Tensor node_flows, torch::Tensor node_mars, torch::Tensor params,
                                 torch::Tensor ext, torch::Tensor chids, torch::Tensor ebase,
-                                torch::Tensor pbase, torch::Tensor gate,
+                                torch::Tensor pbase, torch::Tensor gate, torch::Tensor grad_ext,
                                 int64_t batch, int64_t block_size, int64_t cs_block_size,
                                 int64_t num_edges, int64_t gate_cbs, int64_t ext_base, int64_t cfg) {
     int b = (int)batch, bs = (int)block_size, cs = (int)cs_block_size, ne = (int)num_edges;

@@ -809,14 +809,22 @@ def test_backward_leaves_node_mars_as_the_forward_wrote_it():
 
 @cuda_only
 @needs_cute
-def test_gate_gradients_are_refused_rather_than_returned_as_zeros():
-    """`d LL / d log phi` is not implemented, and the gradient buffer is allocated and zeroed by
-    default -- so the read must say so instead of handing back a plausible tensor of zeros."""
+def test_gate_gradients_are_real_not_zeros():
+    """`d LL / d log phi` is computed now, so the check is that it is REAL rather than an untouched
+    buffer: non-zero, and summing to zero over a node's gates -- scaling all of a node's gates by a
+    constant cancels in `theta_b`, so any other value means the two terms are wrongly balanced."""
     pc, root, ns, data, phi, _ = _run(128, 128, 8, 64, scale = 1.0)
     pc.backward(data, flows_memory = 0.0)
 
-    with pytest.raises(NotImplementedError, match = "gradients"):
-        pc.get_external_params_grad(ns)
+    g = pc.get_external_params_grad(ns)[0]
+    assert g.shape == phi.shape
+    assert float(g.abs().max()) > 0.0, "the gradient buffer was never written"
+    # To the KERNEL's precision, not fp32's: the first term comes through Triton's `tl.dot`, which is
+    # TF32 once the batch is wide enough for `TL_DOT`, while the second is exact fp32 -- so the two
+    # cannot cancel more closely than the dot's ~1e-3. At small batch (`TL_DOT = 0`) this same check
+    # lands at ~1e-7; see `scratchpad/phi_grad_ref.py`.
+    assert float(g.sum(dim = 2).abs().max()) < 1e-2 * float(g.abs().max()) + 1e-5, \
+        "the gradient does not sum to zero over a node's gates"
 
 
 @cuda_only
