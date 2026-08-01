@@ -2006,11 +2006,20 @@ class SumLayer(Layer, nn.Module):
                 self._cached_bk_par_cuda[par_sig] = cache
             nbase, cbase, pbase, fbase, par_ok = cache
             if par_ok and self._ext_bw_par_hook is not None:
-                # See `_ext_bw_ele_hook`. Read-accumulate-write, exactly like the vanilla kernel, so it
-                # runs once on the live `param_flows` and is never autotuned against anything.
-                self._ext_bw_par_hook(
-                    param_flows, node_flows, node_mars, element_mars, params, nbase, cbase, pbase,
-                    fbase, batch_size, self.block_size, num_edges, partition_id)
+                # Both fork operand sets in one place, so the descriptor can CHOOSE between them the
+                # way the element flows already do. Handing it only the CuTe operands forced that fork
+                # even where the ungated layer's own autotuner prefers Triton -- 63 -> 123 us at batch
+                # 1024, the single largest item in the gated backward's overhead.
+                self._ext_bw_par_hook(dict(
+                    param_flows = param_flows, node_flows = node_flows, node_mars = node_mars,
+                    element_mars = element_mars, params = params,
+                    nbase = nbase, cbase = cbase, pbase = pbase, fbase = fbase, cute_ok = True,
+                    nids = nids, cids = cids, pids = pids, pfids = pfids,
+                    batch_size = batch_size, block_size = self.block_size, num_edges = num_edges,
+                    TILE_SIZE_B = TILE_SIZE_B, B_NUM_TILES = B_NUM_TILES, TILE_SIZE_K = TILE_SIZE_K,
+                    TILE_SIZE_M = TILE_SIZE_M, TL_DOT = TL_DOT, grid = grid,
+                    partition_id = partition_id, signature = id(pfids),
+                ))
                 return None
 
             if par_ok:
@@ -2611,21 +2620,15 @@ class SumLayer(Layer, nn.Module):
                 return None
             # choice == ("triton", -1): fall through to the Triton launch below
 
-        if self._ext_bw_par_triton_hook is not None:
-            # Neither CUDA fork claimed this shape. The Triton fork has no `num_edges % 128` or
-            # `block_size % 64` requirement, so it covers what they cannot -- a 64-state layer, say,
-            # whose element flows are already served.
-            self._ext_bw_par_triton_hook(dict(
-                node_flows = node_flows, node_mars = node_mars, element_mars = element_mars,
-                params = params, param_flows = param_flows, nids = nids, cids = cids, pids = pids,
-                pfids = pfids, batch_size = batch_size, num_edges = num_edges,
-                block_size = self.block_size, TILE_SIZE_B = TILE_SIZE_B, B_NUM_TILES = B_NUM_TILES,
-                TILE_SIZE_K = TILE_SIZE_K, TILE_SIZE_M = TILE_SIZE_M, TL_DOT = TL_DOT, grid = grid,
-                partition_id = partition_id,
-            ))
-            return None
-
-        if self._ext_bw_par_sb_hook is not None or self._ext_bw_par_hook is not None:
+        # NO Triton fallback here, unlike the block-sparse path. The gated Triton param kernel is a
+        # fork of the BLOCK-SPARSE one and needs that kernel's tiling (`TILE_SIZE_K`, `TILE_SIZE_M`,
+        # `TL_DOT`), which this function never computes -- it tiles the batch instead, and the
+        # block-sparse derivation asserts `TILE_SIZE_B >= 4` and would give `B_NUM_TILES == 0` at the
+        # batch < 16 that routes here in the first place. An earlier attempt to call the hook from
+        # here read those three names out of the enclosing module and could only ever raise
+        # `NameError`. Refuse plainly instead, so the failure names the shape.
+        if (self._ext_bw_par_sb_hook is not None or self._ext_bw_par_hook is not None
+                or self._ext_bw_par_triton_hook is not None):
             # As in the element-flow path: everything below writes the SHARED-parameter flows.
             raise NotImplementedError(
                 f"no external param-flow backward applies here: block_size={self.block_size}, "

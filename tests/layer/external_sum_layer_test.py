@@ -391,9 +391,17 @@ def test_external_sum_layer_grad_buffers():
     assert dU.size() == U.size() and dV.size() == V.size()
     assert torch.all(dU == 0.0) and torch.all(dV == 0.0)
 
-    # Supplying them is not the caller's job
-    with pytest.raises(AssertionError):
+    # The caller MAY supply destinations of their own -- `{ns: buffers}` or `{group: buffers}`, in
+    # exactly the shape the forward takes the parameters -- and the gradients are copied into them
+    # once the backward is done. Accepted and validated here; this parameterization still has no
+    # backward kernels, so the same `NotImplementedError` is what comes back.
+    with pytest.raises(NotImplementedError):
         pc.backward(data, sum_external_params_grad = {ns: (dU.clone(), dV.clone())})
+
+    # ...but the shape is checked before any of that, so a mis-shaped destination is caught outright
+    # rather than being silently filled with the wrong thing.
+    with pytest.raises(AssertionError):
+        pc.backward(data, sum_external_params_grad = {ns: (dU.clone()[:, :-1], dV.clone())})
 
 
 if __name__ == "__main__":

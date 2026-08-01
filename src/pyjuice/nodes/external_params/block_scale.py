@@ -105,14 +105,15 @@ class BlockScaleSumParams(ExternalSumParams):
     replaces_shared_forward = True
 
     #: `d LL / d log phi` IS computed, in two halves (see `post_backward_layer`): the `Ntilde` term is
-    #: fused into the Triton element-flow fork, where the per-(parent block, child, sample) partial it
-    #: needs is already in registers, and the `log Z` term is a small standalone kernel using the
-    #: forward's cached `log Z` and a `sigma[g,n]` that is recomputed only when `params` changes.
+    #: fused into the element-flow backward -- all three forks carry it, Triton, CuTe and small-batch,
+    #: since they must agree and the launcher picks between them by speed alone -- where the
+    #: per-(parent block, child, sample) partial it needs is already in registers. The `log Z` term is
+    #: a small standalone kernel using the forward's cached `log Z` and a `sigma[g,n]` that is
+    #: recomputed only when `params` changes.
     #:
     #: This flag is a STATIC claim -- "this parameterization implements gradients at all" -- and cannot
-    #: express that support is shape-dependent: only the Triton element fork carries the first term, so
-    #: a shape it cannot serve (`ptr_inc_step != 1`, or an element tile that is not a whole number of
-    #: gates) RAISES during the backward rather than returning a silent zero. That is the same contract
+    #: express that support is shape-dependent: a shape no element fork can serve (`ptr_inc_step != 1`,
+    #: say) RAISES during the backward rather than returning a silent zero. That is the same contract
     #: the flow kernels use, and it is why the flag stays a plain bool.
     computes_external_grads = True
 
@@ -828,14 +829,76 @@ class BlockScaleSumParams(ExternalSumParams):
                         WRITE_GRAD = (1 if layer._bs_grad_ext is not None else 0),
                         pid_m_offset = s0, num_stages = 1)
 
-        def _par_hook(param_flows, node_flows, node_mars, element_mars, params, nbase, cbase, pbase,
-                      fbase, batch, blk_size, num_edges, partition_id):
-            # The parameter flows are indexed exactly as the forward is -- one row per node block, one
-            # column per incident edge block -- so the forward's own table serves them unchanged.
-            par_mod.blockscale_par_backward(
-                param_flows, node_flows, node_mars, element_mars, params, external_params,
-                nbase, cbase, pbase, fbase, layer.ext_slots[0][partition_id],
-                batch, blk_size, num_edges, node_cbs, gate_cbs, ext_base, 0)
+        def _par_hook(ctx):
+            """
+            The gated parameter flows, choosing between the CuTe fork and the Triton one by measuring.
+
+            The forward's own table serves both -- one row per node block, one column per incident edge
+            block -- so only the launch differs. Measured rather than assumed for the same reason as
+            the element flows: the ungated layer's autotuner prefers Triton to its CuTe param kernel at
+            some shapes, and forcing CuTe there cost 63 -> 123 us at batch 1024.
+            """
+            import pyjuice.layer.kernels.c as ck
+
+            gb = layer.ext_slots[0][ctx["partition_id"]]
+            batch, blk, ne = ctx["batch_size"], ctx["block_size"], ctx["num_edges"]
+
+            def _cute(tgt):
+                par_mod.blockscale_par_backward(
+                    tgt, ctx["node_flows"], ctx["node_mars"], ctx["element_mars"], ctx["params"],
+                    external_params, ctx["nbase"], ctx["cbase"], ctx["pbase"], ctx["fbase"], gb,
+                    batch, blk, ne, node_cbs, gate_cbs, ext_base, 0)
+
+            def _triton(tgt):
+                from .kernels.blockscale_backward import _bs_triton_par_kernel
+                grid = ctx["grid"]
+                for s0 in range(0, grid[1], 32768):
+                    cg = (grid[0], min(s0 + 32768, grid[1]) - s0)
+                    _bs_triton_par_kernel[cg](
+                        node_flows = ctx["node_flows"], node_mars = ctx["node_mars"],
+                        element_mars = ctx["element_mars"], mparams = ctx["params"],
+                        param_flows = tgt, ext = external_params, gate = gb,
+                        nids = ctx["nids"], cids = ctx["cids"], pids = ctx["pids"],
+                        pfids = ctx["pfids"], batch_size = batch, num_edges = ne,
+                        TILE_SIZE_B = ctx["TILE_SIZE_B"], B_NUM_TILES = ctx["B_NUM_TILES"],
+                        TILE_SIZE_K = ctx["TILE_SIZE_K"], TILE_SIZE_M = ctx["TILE_SIZE_M"],
+                        BLOCK_SIZE_M = blk, TL_DOT = ctx["TL_DOT"], NODE_CBS = node_cbs,
+                        GATE_CBS = gate_cbs, gate_stride = gb.size(1), ext_base = ext_base,
+                        pid_m_offset = s0, num_stages = 1)
+
+            cands = ([("cute", _cute)] if (par_mod is not None and ctx["cute_ok"]) else []) \
+                    + [("triton", _triton)]
+
+            key = ("parplan", ctx["signature"], batch, ctx["partition_id"])
+            pick = cache.get(key)
+            if pick is None:
+                if len(cands) == 1:
+                    pick = cands[0][0]
+                else:
+                    # A SCRATCH clone: these kernels are read-accumulate-write, so trials on the live
+                    # `param_flows` would each add their contribution again.
+                    try:
+                        scr = torch.empty_like(ctx["param_flows"])
+                        # Each trial launches the kernel REPEATS times inside the timed region. These
+                        # candidates differ by only 6-25%, and a single launch spends comparable time
+                        # in Python and in the driver -- enough noise to mis-pick, which is exactly
+                        # what happened at K=2048 (CuTe chosen where Triton is 6% faster). Safe to
+                        # repeat because the target is a scratch buffer.
+                        REPEATS = 5
+
+                        def _rep(f):
+                            def go():
+                                for _ in range(REPEATS):
+                                    f(scr)
+                            return go
+
+                        pick = ck.autotune([(n, _rep(f)) for n, f in cands]) or cands[0][0]
+                        del scr
+                    except torch.cuda.OutOfMemoryError:
+                        pick = cands[0][0]
+                cache[key] = pick
+
+            dict(cands)[pick](ctx["param_flows"])
 
         def _par_sb_hook(param_flows, node_flows, node_mars, element_mars, params, nids, cids, pids,
                          pfids, batch, blk_size, num_edges, partition_id):
@@ -863,7 +926,12 @@ class BlockScaleSumParams(ExternalSumParams):
                     ext_base = ext_base, pid_m_offset = s0, num_stages = 1)
 
         layer._ext_bw_ele_hook = _ele_hook
-        layer._ext_bw_par_hook = _par_hook if par_mod is not None else None
+        # Installed UNCONDITIONALLY, even without the CuTe param module: `_par_hook` falls back to its
+        # own Triton candidate when `par_mod` is None. Making the hook itself conditional left a hole
+        # -- the layer's CUDA param regime is gated on a DIFFERENT extension, so it can be available
+        # while `par_mod` is not, and the backward would then run the ungated kernel and return
+        # SHARED-parameter flows for a gated layer. Silently, with no error.
+        layer._ext_bw_par_hook = _par_hook
         layer._ext_bw_par_sb_hook = _par_sb_hook if sb_mod is not None else None
         layer._ext_bw_par_triton_hook = _par_triton_hook
 
@@ -894,18 +962,60 @@ class BlockScaleSumParams(ExternalSumParams):
             external_params = kwargs.get(_buffer_kwarg(), None)
             bs_, gate_cbs = state["block_size"], state["gate_cbs"]
             batch = state["batch_size"]
-            BLOCK_B = min(1024, max(16, triton.next_power_of_2(batch)))
+            # This kernel holds several [BLOCK_SIZE_M, BLOCK_B] tiles, so BLOCK_B has to be bounded by
+            # the NODE BLOCK SIZE, not chosen from the batch alone. Letting it follow the batch put
+            # 512 KB in shared memory at batch 1024; capping it at 128 still overflowed at block_size
+            # 256 (three [256,128] tiles ~ 400 KB against a 101 KB limit) and the launch failed with
+            # OutOfResources. The product is what matters, so budget that directly.
+            BLOCK_B = max(16, min(128, triton.next_power_of_2(batch),
+                                  triton.next_power_of_2(max(1, 16384 // max(bs_, 1)))))
 
             for pid, (nids, log_z, rows) in enumerate(state["shift_args"]):
                 sigma, n_gates = self._sigma(layer, params, pid, bs_, gate_cbs)
                 gb = layer.ext_slots[0][pid]
-                _bs_triton_phigrad_logz_kernel[(n_gates, rows, triton.cdiv(batch, BLOCK_B))](
+                # WHY THE FIRST TERM STAYS FUSED. Fusing it costs the element kernel ~13 us -- far more
+                # than the ~0.8 us of arithmetic it adds -- which looks like an occupancy penalty from
+                # carrying its accumulator through that kernel's k loop. So a standalone kernel
+                # computing BOTH terms was written and measured against it. It lost everywhere: at
+                # K=1024 / block 128 / gate 8 it ran the gated backward at 1.38x the ungated one
+                # against the fused path's 1.34x, and at batch 8 at 3.6x against ~1.2x, because the
+                # separate kernel re-reads `node_flows`, `node_mars` and the parameters that the
+                # element kernel already has in registers. Reading them twice costs more than the
+                # occupancy does. Do not re-split this without re-measuring.
+                #
+                # Only two useful tile widths, not a sweep: 16 is the SMALLEST that enables `tl.dot`,
+                # and 1 keeps the broadcast-sum intermediate at its minimum. The widths in between are
+                # the worst of both -- no dot, and an [M, G, B] intermediate that grows with G
+                # (measured 2.6% of peak, 37.9x off roofline, at G=8).
+                #
+                # A WIDER tile amortizes the per-block `nf`/`log_z` load over more gates: at gate 8 and
+                # K=2048 a 16-wide tile re-read each block 16 times, 33 MB of loads against 2 MB
+                # compulsory. Widen while the grid still fills; 16 remains the floor that keeps
+                # `tl.dot`, and 1 is the fallback when even that would starve the grid.
+                btiles = (batch + BLOCK_B - 1) // BLOCK_B
+                GT = 1
+                for cand, need in ((32, 128), (16, 32)):
+                    if n_gates >= cand and ((n_gates + cand - 1) // cand) * rows * btiles >= need:
+                        GT = cand
+                        break
+
+                # `rows` is the y axis, which CUDA caps at 65535. The kernel reads `pid_nb` straight
+                # from `program_id(1)` with no offset argument, so it cannot be chunked the way the
+                # flow launches above are -- refuse rather than let the driver truncate the grid and
+                # silently drop the gradient of every node block past the cap.
+                assert rows <= 65535, \
+                    f"partition {pid} has {rows} node blocks, past the 65535 CUDA grid-y limit for " \
+                    f"the external-gradient kernel. Split the partition, or use a larger block size."
+                _bs_triton_phigrad_logz_kernel[
+                        (triton.cdiv(n_gates, GT), rows, triton.cdiv(batch, BLOCK_B))](
                     node_flows = node_flows, log_z = log_z, sigma = sigma, ext = external_params,
                     gate = gb, grad_ext = grad_ext, nids = nids,
                     batch_size = batch, n_gates = n_gates,
                     N_CHILD_GATES = state["node_cbs"] // gate_cbs, BLOCK_SIZE_M = bs_,
-                    BLOCK_B = BLOCK_B, gate_stride = gb.size(1), ext_base = state["ext_base"],
-                    num_stages = 1)
+                    BLOCK_B = BLOCK_B, GATE_TILE = GT,
+                    USE_DOT = (1 if (GT >= 16 and bs_ >= 16 and batch >= 64) else 0),
+                    gate_stride = gb.size(1),
+                    ext_base = state["ext_base"], num_stages = 1)
 
             layer._bs_grad_ext = None
 

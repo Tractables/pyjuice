@@ -83,6 +83,10 @@ def _bs_triton_ele_kernel(node_flows, element_flows, node_mars, element_mars, mp
     gate_ptr = gate + eleblock_id * gate_stride
 
     acc = tl.zeros([TILE_SIZE_M, BLOCK_B], dtype = tl.float32) - float("inf")
+    # k-tiles per PARENT BLOCK: the tiles that share one gate row.
+    TPB: tl.constexpr = BLOCK_SIZE_K // TILE_SIZE_K if BLOCK_SIZE_K > TILE_SIZE_K else 1
+    GROWS: tl.constexpr = TILE_SIZE_M // GATE_CBS if TILE_SIZE_M >= GATE_CBS else 1
+    gacc = tl.zeros([GROWS, BLOCK_B], dtype = tl.float32)
 
     for k in range(0, K_NUM_TILES):
         epars = tl.load(epars_ptr)                          # [TILE_SIZE_M, TILE_SIZE_K]
@@ -103,41 +107,60 @@ def _bs_triton_ele_kernel(node_flows, element_flows, node_mars, element_mars, mp
         # parent block and this child block are not connected; the `-inf` it produces drops the tile
         # in the accumulate below, which is what the ungated kernel computes for a padded tile too.
         gbase = tl.load(gate_ptr + k)
+        # `gbase >= 0` has to be in the LOAD MASK, not only in the `tl.where`: Triton evaluates both
+        # arms, so the sentinel would otherwise be read at a negative row offset -- out of bounds
+        # whenever `gbase + ext_base < 0`, which is every disconnected block in the first slot.
         lphi = tl.where(
             gbase >= 0,
             tl.load(ext + (gbase + ext_base + offs_gate)[:,None] * batch_size + offs_batch[None,:],
-                    mask = mask_batch[None,:], other = 0.0),
+                    mask = mask_batch[None,:] & (gbase >= 0), other = 0.0),
             -float("inf")
         )                                                   # [TILE_SIZE_M, BLOCK_B]
 
         # The Ntilde half of `d LL / d log phi`. `partial_flows * exp(partial_flows_max)` IS
-        # `sum_{n in this parent block} edge_flow[n, c, b]` -- the per-(parent block, child, sample)
-        # sum -- which this kernel forms anyway on its way to the log-sum-exp below. Summing it over
-        # the GATE_CBS children of each gate is all the first term needs, so it costs a reduction and
-        # an atomic rather than a second pass over the operands.
+        # `sum_{n in this parent block} edge_flow[n, c, b]`, which this kernel forms anyway.
         #
-        # Linear space is safe here: edge flows are bounded by the node flow, which is O(1).
-        if WRITE_GRAD:
-            contrib = partial_flows * tl.exp(emars + log_n_fdm_max + lphi)
-            # Two cases, both resolved at compile time, so the tile size need not relate to the gate
-            # size at all. Requiring `TILE_SIZE_M % GATE_CBS == 0` was an artefact of reaching for
-            # `tl.reshape` first, and it made every shape whose element tile is narrower than a gate
-            # raise -- including ones that never asked for a gradient.
-            if TILE_SIZE_M >= GATE_CBS:
-                red = tl.sum(tl.reshape(contrib, (TILE_SIZE_M // GATE_CBS, GATE_CBS, BLOCK_B)),
-                             axis = 1)
-                grow_g = gbase + ext_base + (tile_id * TILE_SIZE_M) // GATE_CBS \
-                         + tl.arange(0, TILE_SIZE_M // GATE_CBS)
-                tl.atomic_add(grad_ext + grow_g[:,None] * batch_size + offs_batch[None,:], red,
-                              mask = mask_batch[None,:] & (gbase >= 0))
-            else:
-                # the whole tile sits inside ONE gate
-                red1 = tl.sum(contrib, axis = 0)
-                grow1 = gbase + ext_base + (tile_id * TILE_SIZE_M) // GATE_CBS
-                tl.atomic_add(grad_ext + grow1 * batch_size + offs_batch, red1,
-                              mask = mask_batch & (gbase >= 0))
-
+        # The emission is what makes or breaks this, and the cost is the NUMBER of emissions, not
+        # their kind: emitting per k-tile cost 5-15x on the whole backward -- ~2M global atomics at
+        # ~2ns each -- and the tell was that the cost scaled as 1/GATE_CBS while `contrib` and its
+        # `exp` do not. Only the number of emitted rows does. So accumulate over the TPB consecutive
+        # k-tiles that share a parent block (and hence a gate row) and emit once per parent block.
+        #
+        # Still an ATOMIC, though. A plain store is a lost update in three separate ways. It IS
+        # cheaper -- measured over the sweep in `grad_speed`, the gradient's cost against the ungated
+        # backward goes 1.12-1.40x with the atomic and 1.12-1.32x with a store, so a few percent --
+        # but the accumulation above already took the 5-15x, and these are the three collisions a
+        # store loses:
+        #   * when TILE_SIZE_M < GATE_CBS, `(tile_id * TILE_SIZE_M) // GATE_CBS` maps
+        #     GATE_CBS // TILE_SIZE_M distinct `pid_m` programs onto ONE row, each holding its own
+        #     partial sum over its own slice of that gate's children;
+        #   * `tie_external` aliases a node's gradient rows across every layer holding a copy, and the
+        #     buffer is zeroed once per backward (tensorcircuit.py) precisely so layers can accumulate;
+        #   * two tied copies can even share a single layer, colliding two `eleblock_id` in one launch.
+        # The two CUDA element forks `atomicAdd` for the same reasons, and the three forks have to
+        # agree -- `_build_ele_plan` picks between them by speed alone.
+        # Computed ONCE and shared with the flow accumulate below, which needs the same sum.
         partial_flows_max = emars + log_n_fdm_max + lphi
+
+        if WRITE_GRAD:
+            contrib = partial_flows * tl.exp(partial_flows_max)
+            if TILE_SIZE_M >= GATE_CBS:
+                gacc += tl.sum(tl.reshape(contrib, (TILE_SIZE_M // GATE_CBS, GATE_CBS, BLOCK_B)),
+                               axis = 1)
+            else:
+                gacc += tl.sum(contrib, axis = 0)[None,:]   # the whole tile sits inside ONE gate
+
+            if (k % TPB) == TPB - 1:
+                if TILE_SIZE_M >= GATE_CBS:
+                    grow = gbase + ext_base + (tile_id * TILE_SIZE_M) // GATE_CBS \
+                           + tl.arange(0, TILE_SIZE_M // GATE_CBS)
+                else:
+                    grow = gbase + ext_base + (tile_id * TILE_SIZE_M) // GATE_CBS \
+                           + tl.arange(0, 1)
+                tl.atomic_add(grad_ext + grow[:,None] * batch_size + offs_batch[None,:], gacc,
+                              mask = mask_batch[None,:] & (gbase >= 0))
+                gacc = gacc * 0.0
+
         acc = tl.where(partial_flows_max == -float("inf"),
             acc,
             tl.where(partial_flows_max > acc,
@@ -249,47 +272,73 @@ def _bs_triton_par_kernel(node_flows, node_mars, element_mars, mparams, param_fl
 def _bs_triton_phigrad_logz_kernel(node_flows, log_z, sigma, ext, gate, grad_ext, nids,
                                    batch_size: tl.constexpr, n_gates: tl.constexpr,
                                    N_CHILD_GATES: tl.constexpr, BLOCK_SIZE_M: tl.constexpr,
-                                   BLOCK_B: tl.constexpr, gate_stride: tl.constexpr, ext_base):
+                                   BLOCK_B: tl.constexpr, GATE_TILE: tl.constexpr,
+                                   USE_DOT: tl.constexpr, gate_stride: tl.constexpr, ext_base):
     """
     The log-Z half of `d LL / d log phi`:
 
-        term2[b, nk, g] = sum_n f_b[n] * phi_b[g] * sigma[g,n] / Z_b[n]
+        term2[g, b] = phi_b[g] * sum_n sigma[g,n] * exp(node_flows[n,b] - log Z[n,b])
 
-    Standalone rather than fused, because it shares no operand with the element backward -- it needs
-    `sigma[g,n] = sum_{c in g} theta[n,c]` and `Z`, and no `element_mars` at all. `log Z` comes free:
-    the forward already caches it for the `node_mars` shift. `sigma` is cached per EM step, since it
-    changes only when theta does.
+    which is a MATMUL over the node axis, `sigma @ v`. Recognising that is the whole point: the first
+    version ran one program per (gate, node block, batch tile) and re-loaded the entire
+    [BLOCK_SIZE_M, BLOCK_B] block of `node_flows` and `log Z` for EVERY gate -- 128x redundant at
+    gate_cbs=8 -- which made it 96-99% of the gradient's cost and scaled with 1/gate_cbs, batch and K,
+    the three things that set the number of gates and the block size.
 
-    One program per (gate, node block, batch tile); the reduction is over the block's nodes.
+    Tiling the gate axis loads that block once per GATE_TILE gates instead of once per gate.
+
+    `log Z` comes free from the forward's cache; `sigma` is recomputed only when `params` changes.
     """
     pid_g = tl.program_id(0)
     pid_nb = tl.program_id(1)
     pid_b = tl.program_id(2)
 
+    offs_g = pid_g * GATE_TILE + tl.arange(0, GATE_TILE)
+    mask_g = offs_g < n_gates
     offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B
     mask_batch = offs_batch < batch_size
     offs_node = tl.arange(0, BLOCK_SIZE_M)
 
-    # `pid_g` is the FLAT gate index across the row: which edge block, then which gate inside it.
-    # A node's gates span all its edge blocks, so indexing column 0 alone would only ever be right for
-    # a single-edge-block row.
-    j = pid_g // N_CHILD_GATES
-    d = pid_g % N_CHILD_GATES
-    gbase = tl.load(gate + pid_nb * gate_stride + j)
-    row = gbase + ext_base + d
-
+    # loaded ONCE for the whole gate tile
     off_nids = tl.load(nids + pid_nb)
     nf = tl.load(node_flows + (off_nids + offs_node[:,None]) * batch_size + offs_batch[None,:],
                  mask = mask_batch[None,:], other = -float("inf"))
     lz = tl.load(log_z + (pid_nb * BLOCK_SIZE_M + offs_node[:,None]) * batch_size + offs_batch[None,:],
                  mask = mask_batch[None,:], other = 0.0)
-    sg = tl.load(sigma + (pid_nb * BLOCK_SIZE_M + offs_node) * n_gates + pid_g)
-    lphi = tl.load(ext + row * batch_size + offs_batch, mask = mask_batch, other = -float("inf"))
+    j = offs_g // N_CHILD_GATES
+    d = offs_g % N_CHILD_GATES
+    gbase = tl.load(gate + pid_nb * gate_stride + j, mask = mask_g, other = -1)
+    row = gbase + ext_base + d
+    lphi = tl.load(ext + row[:,None] * batch_size + offs_batch[None,:],
+                   mask = mask_g[:,None] & mask_batch[None,:] & (gbase >= 0)[:,None],
+                   other = -float("inf"))
 
-    val = tl.exp(nf + lphi[None,:] - lz) * sg[:,None]
-    out = tl.sum(tl.where(mask_batch[None,:] & (gbase >= 0), val, 0.0), axis = 0)
+    # SHIFTED by the tile's largest gate, because the matmul cannot carry `phi` inside the exponent
+    # the way a per-element form can (the [M, B] operand has no gate axis). Unshifted, `exp(nf - lz)`
+    # underflows to exactly 0 for any gate past ~88 -- `log Z >= log phi` -- and the whole log-Z term
+    # silently vanishes, which shows up as the zero-sum invariant going to 1.0 rather than 0. The
+    # shift cancels exactly, and both halves are then bounded: `log Z >= mx + log sigma`, so the
+    # exponent here is at most `-log sigma`, and `lphi - mx <= 0` below.
+    mx = tl.max(lphi, axis = 0)[None,:]                                 # [1, B]
+    mx = tl.where(mx == -float("inf"), 0.0, mx)
+    v = tl.where(mask_batch[None,:], tl.exp(nf - lz + mx), 0.0)         # [M, B]
 
-    # SUBTRACTED: the gradient is (Ntilde term - logZ term), and the element kernel already added the
-    # first. Getting this sign wrong makes the two terms sum to 2*(total node flow) instead of 0, which
-    # is exactly what the `sum over a node's gates == 0` invariant exists to catch.
-    tl.atomic_add(grad_ext + row * batch_size + offs_batch, -out, mask = mask_batch & (gbase >= 0))
+    sg = tl.load(sigma + (pid_nb * BLOCK_SIZE_M + offs_node[:,None]) * n_gates + offs_g[None,:],
+                 mask = mask_g[None,:], other = 0.0)                    # [M, G]
+
+    # A DOT, not a broadcast-sum: `tl.sum(sg[:,:,None] * v[:,None,:], axis=0)` materializes an
+    # [M, G, B] intermediate -- half a million elements here -- and was the dominant cost even after
+    # the redundant loads were tiled away. `sigma^T @ v` is the same contraction on tensor cores.
+    #
+    # Only where it pays. `tl.dot` is TF32, and at small batch this kernel is already cheap while the
+    # rest of the gradient path is exact fp32 -- so trading that accuracy away there buys nothing.
+    if USE_DOT:
+        out = tl.dot(tl.trans(sg), v)                                   # [G, B]
+    else:
+        out = tl.sum(sg[:,:,None] * v[:,None,:], axis = 0)
+
+    # SUBTRACTED: the gradient is (Ntilde term - logZ term) and the element kernel added the first.
+    # `exp(lphi - mx)` undoes the shift applied to `v` above, and is bounded by 1.
+    tl.atomic_add(grad_ext + row[:,None] * batch_size + offs_batch[None,:],
+                  -tl.exp(lphi - mx) * out,
+                  mask = mask_g[:,None] & mask_batch[None,:] & (gbase >= 0)[:,None])
