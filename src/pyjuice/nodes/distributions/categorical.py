@@ -112,9 +112,12 @@ class Categorical(Distribution):
         from pyjuice.layer.kernels.c.input_layers import cat_backward_is_available, cat_backward
         if not cat_backward_is_available():
             return False
-        cat_backward(param_flows, node_flows, data, vids, s_pfids, layer_num_nodes,
-                     batch_size, node_offset, self.num_cats, logspace)
-        return True
+        # The kernel's own answer, not an assumption: its histogram is `num_cats` floats of shared
+        # memory, and it returns False when that exceeds what the device will grant a block. Reporting
+        # True regardless is what made a too-large vocabulary silently skip BOTH paths and leave
+        # `param_flows` unaccumulated.
+        return bool(cat_backward(param_flows, node_flows, data, vids, s_pfids, layer_num_nodes,
+                                 batch_size, node_offset, self.num_cats, logspace))
 
     @staticmethod
     def bk_flow_mask_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr,

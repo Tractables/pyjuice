@@ -13,6 +13,7 @@
 // bases (s_pfids multiples of 4, node_offset & batch_size multiples of 4) — enforced by the input_layer gate.
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAException.h>
 #include <cuda_runtime.h>
 
 #ifndef NTH
@@ -51,17 +52,43 @@ __global__ void cat_backward_kernel(float* __restrict__ param_flows, const float
     }
 }
 
-void cat_backward(torch::Tensor param_flows, torch::Tensor node_flows, torch::Tensor data,
+// The histogram is `num_cats` floats, which for a large vocabulary is well past the 48 KB a block gets
+// by default. That ceiling is not a fixed property of the machine -- a block can opt in to most of the
+// SM's shared memory, and how much that is varies by part (64 KB, 100 KB, 227 KB) -- so it is queried,
+// and the opt-in is requested, rather than either assumed or given up on.
+//
+// Returns false when even the opt-in ceiling is too small; the caller then falls back to Triton. It is
+// a return value and not a `TORCH_CHECK` because this is an optional fast path, and a silent one before:
+// the launch was issued unopted-in and unchecked, so past ~12288 categories it failed, `param_flows`
+// was never accumulated, and the caller reported success anyway.
+bool cat_backward_fits(int num_cats) {
+    int dev = 0, smax = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&smax, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+    return (size_t)num_cats * sizeof(float) <= (size_t)smax;
+}
+
+
+bool cat_backward(torch::Tensor param_flows, torch::Tensor node_flows, torch::Tensor data,
                   torch::Tensor vids, torch::Tensor s_pfids, int layer_num_nodes, int batch_size,
                   long node_offset, int num_cats, int logspace) {
     int smem = num_cats * sizeof(float);
+    if (!cat_backward_fits(num_cats)) return false;
     auto stream = c10::cuda::getCurrentCUDAStream();
     float* pf = param_flows.data_ptr<float>();
     const float* nf = node_flows.data_ptr<float>();
     const long* vp = vids.data_ptr<long>();
     const long* sp = s_pfids.data_ptr<long>();
-#define LAUNCH(T) cat_backward_kernel<T><<<layer_num_nodes, NTH, smem, stream>>>( \
-        pf, nf, data.data_ptr<T>(), vp, sp, layer_num_nodes, batch_size, node_offset, num_cats, logspace)
+#define LAUNCH(T)                                                                                      \
+    do {                                                                                               \
+        if (smem > 48 * 1024)                                                                          \
+            TORCH_CHECK(cudaFuncSetAttribute(cat_backward_kernel<T>,                                   \
+                            cudaFuncAttributeMaxDynamicSharedMemorySize, smem) == cudaSuccess,         \
+                        "cat_backward: device refused ", smem, " B of shared memory");                 \
+        cat_backward_kernel<T><<<layer_num_nodes, NTH, smem, stream>>>(                                \
+            pf, nf, data.data_ptr<T>(), vp, sp, layer_num_nodes, batch_size, node_offset, num_cats,    \
+            logspace);                                                                                 \
+    } while (0)
     switch (data.scalar_type()) {
         case torch::kByte:  LAUNCH(uint8_t);  break;
         case torch::kChar:  LAUNCH(int8_t);   break;
@@ -70,9 +97,14 @@ void cat_backward(torch::Tensor param_flows, torch::Tensor node_flows, torch::Te
         case torch::kLong:  LAUNCH(int64_t);  break;
         default: TORCH_CHECK(false, "cat_backward: unsupported data dtype ", data.scalar_type());
     }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 #undef LAUNCH
+    return true;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("cat_backward", &cat_backward, "Categorical input-layer backward (smem-histogram)");
+    m.def("cat_backward", &cat_backward,
+          "Categorical input-layer backward (smem-histogram); false if the histogram does not fit");
+    m.def("cat_backward_fits", &cat_backward_fits,
+          "Whether this device grants enough shared memory for a num_cats histogram");
 }

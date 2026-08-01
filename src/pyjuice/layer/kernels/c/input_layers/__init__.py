@@ -25,7 +25,10 @@ def _jit_plain(name: str, source_file: str):
     if not ENABLE_CUDA_KERNELS or not torch.cuda.is_available():
         return None
     cc = torch.cuda.get_device_capability()
-    cuda_cflags = ["-O3", f"-arch=sm_{cc[0]}{cc[1]}a", "--use_fast_math", "-DNDEBUG"]
+    # NO `a` suffix. These kernels use nothing arch-specific, and the suffix only exists for the
+    # accelerated targets (90a, 100a, 120a, ...) -- there is no `sm_80a` or `sm_86a`, so asking for one
+    # fails the compile on every pre-Hopper GPU and silently drops the layer onto the Triton path.
+    cuda_cflags = ["-O3", f"-arch=sm_{cc[0]}{cc[1]}", "--use_fast_math", "-DNDEBUG"]
     from pyjuice.utils.cuda_ext import jit_load
     try:
         return jit_load(name, sources=[os.path.join(_THIS_DIR, source_file)],
@@ -48,10 +51,14 @@ def cat_backward_is_available() -> bool:
 
 def cat_backward(param_flows: torch.Tensor, node_flows: torch.Tensor, data: torch.Tensor,
                  vids: torch.Tensor, s_pfids: torch.Tensor, layer_num_nodes: int, batch_size: int,
-                 node_offset: int, num_cats: int, logspace: bool) -> None:
+                 node_offset: int, num_cats: int, logspace: bool) -> bool:
     """Categorical input-layer backward: param_flows[node, cat] += sum_b (exp if logspace) node_flows
     where data[vid[node], b] == cat. The flush is NON-ATOMIC, so the caller must guarantee distinct
     (untied), 4-aligned ``s_pfids`` and num_cats/batch divisible by 4 (see the gate in
-    ``input_layer.backward``)."""
-    _cat_module.cat_backward(param_flows, node_flows, data, vids, s_pfids, int(layer_num_nodes),
-                             int(batch_size), int(node_offset), int(num_cats), int(logspace))
+    ``input_layer.backward``).
+
+    Returns False WITHOUT running if the ``num_cats``-float histogram exceeds the shared memory this
+    device grants a block; the caller must then use the Triton path."""
+    return bool(_cat_module.cat_backward(param_flows, node_flows, data, vids, s_pfids,
+                                         int(layer_num_nodes), int(batch_size), int(node_offset),
+                                         int(num_cats), int(logspace)))

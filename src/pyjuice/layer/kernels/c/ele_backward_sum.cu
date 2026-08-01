@@ -26,6 +26,7 @@
 #include <cuda_fp16.h>
 #include <cuda.h>
 #include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAException.h>
 #include <cute/tensor.hpp>
 #include <cute/atom/mma_atom.hpp>
 #include <cute/atom/copy_atom.hpp>
@@ -200,6 +201,7 @@ void ele_backward_sum(torch::Tensor element_flows, torch::Tensor element_mars, t
             element_flows.data_ptr<float>(), element_mars.data_ptr<float>(), params.data_ptr<float>(),
             chids.data_ptr<long>(), ebase.data_ptr<long>(), pbase.data_ptr<long>(),
             (int)batch, (int)BSK, (int)BSM, (int)knt, off, g_descNf, g_descNm);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 }
 

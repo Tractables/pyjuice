@@ -77,7 +77,7 @@ def deepcopy(root_ns: CircuitNodes, tie_params: bool = False, max_block_size: Op
                         num_edges = params.size(0)
                         params = params.reshape(num_edges, blk_factor, new_blk_size, ch_blk_factor, new_ch_blk_size).permute(0, 1, 3, 2, 4).flatten(0, 2)
 
-                new_ns = SumNodes(
+                new_ns = ns.rebuild(
                     ns.num_nodes // block_size,
                     new_chs,
                     edge_ids,
@@ -114,7 +114,7 @@ def deepcopy(root_ns: CircuitNodes, tie_params: bool = False, max_block_size: Op
                     else:
                         raise NotImplementedError()
 
-            new_ns = ProdNodes(
+            new_ns = ns.rebuild(
                 ns.num_nodes // block_size,
                 new_chs,
                 edge_ids,
@@ -140,7 +140,7 @@ def deepcopy(root_ns: CircuitNodes, tie_params: bool = False, max_block_size: Op
                 block_size = min(ns.block_size, max_block_size)
 
             if not tie_params:
-                new_ns = InputNodes(
+                new_ns = ns.rebuild(
                     num_node_blocks = ns.num_nodes // block_size,
                     scope = pydeepcopy(scope),
                     dist = pydeepcopy(ns.dist),

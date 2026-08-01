@@ -188,7 +188,7 @@ def blockify(root_ns: CircuitNodes, sparsity_tolerance: float = 0.25, max_target
         assert new_num_nblocks * new_block_size == ns.num_node_blocks * ns.block_size
 
         if ns.is_input():
-            new_ns = InputNodes(
+            new_ns = ns.rebuild(
                 num_node_blocks = new_num_nblocks,
                 scope = pydeepcopy(ns.scope),
                 dist = pydeepcopy(ns.dist),
@@ -213,7 +213,7 @@ def blockify(root_ns: CircuitNodes, sparsity_tolerance: float = 0.25, max_target
                     torch.arange(0, ns.block_size)[None,:,None]).flatten(0, 1)
                 mode = "sparse"
 
-            new_ns = ProdNodes(
+            new_ns = ns.rebuild(
                 num_node_blocks = new_num_nblocks,
                 chs = ns_chs,
                 edge_ids = edge_ids,
@@ -243,13 +243,13 @@ def blockify(root_ns: CircuitNodes, sparsity_tolerance: float = 0.25, max_target
             grid_edge_ids = grid_edge_ids.reshape(new_num_nblocks, block_mul_size, new_num_cblocks, ch_block_mul_size)
             new_edge_ids = torch.nonzero(grid_edge_ids.any(dim = 3).any(dim = 1), as_tuple = False).permute(1, 0)
 
-            new_ns = SumNodes(
+            new_ns = ns.rebuild(
                 num_node_blocks = new_num_nblocks,
                 chs = ns_chs,
                 edge_ids = new_edge_ids,
                 block_size = new_block_size
             )
-            
+
             if not ns.is_tied():
                 # Collect selected blocks
                 grid_edge_ids = grid_edge_ids.permute(0, 2, 1, 3).flatten(0, 1)
@@ -363,7 +363,7 @@ def unblockify(root_ns: CircuitNodes, block_size: int = 1, recursive: bool = Tru
         new_num_nblocks = ns.num_nodes // new_block_size
 
         if ns.is_input():
-            new_ns = InputNodes(
+            new_ns = ns.rebuild(
                 num_node_blocks = new_num_nblocks,
                 scope = pydeepcopy(ns.scope),
                 dist = pydeepcopy(ns.dist),
@@ -385,7 +385,7 @@ def unblockify(root_ns: CircuitNodes, block_size: int = 1, recursive: bool = Tru
             else:
                 edge_ids = ns.edge_ids.clone()
 
-            new_ns = ProdNodes(
+            new_ns = ns.rebuild(
                 num_node_blocks = new_num_nblocks,
                 chs = ns_chs,
                 edge_ids = edge_ids,
@@ -411,7 +411,7 @@ def unblockify(root_ns: CircuitNodes, block_size: int = 1, recursive: bool = Tru
             edge_ids[1,:,:] = edge_ids[1,:,:] * ch_gsize_redu + grid_y.reshape(-1)[:,None]
             edge_ids = edge_ids.reshape(2, ns.edge_ids.size(1) * gsize_redu * ch_gsize_redu)
 
-            new_ns = SumNodes(
+            new_ns = ns.rebuild(
                 num_node_blocks = new_num_nblocks,
                 chs = ns_chs,
                 edge_ids = edge_ids,
@@ -490,7 +490,7 @@ def bump_block_size(ns: CircuitNodes, block_size: int, use_cuda: bool = True):
     block_mul_size = block_size // ns.block_size
 
     if ns.is_input():
-        new_ns = InputNodes(
+        new_ns = ns.rebuild(
             num_node_blocks = new_num_nblocks,
             scope = pydeepcopy(ns.scope),
             dist = pydeepcopy(ns.dist),
@@ -515,7 +515,7 @@ def bump_block_size(ns: CircuitNodes, block_size: int, use_cuda: bool = True):
                 torch.arange(0, ns.block_size)[None,:,None]).flatten(0, 1)
             mode = "sparse"
         
-        new_ns = ProdNodes(
+        new_ns = ns.rebuild(
             num_node_blocks = new_num_nblocks,
             chs = ns_chs,
             edge_ids = edge_ids,
@@ -543,7 +543,7 @@ def bump_block_size(ns: CircuitNodes, block_size: int, use_cuda: bool = True):
         grid_edge_ids = grid_edge_ids.reshape(new_num_nblocks, block_mul_size, num_cblocks, 1)
         new_edge_ids = torch.nonzero(grid_edge_ids.any(dim = 3).any(dim = 1), as_tuple = False).permute(1, 0)
 
-        new_ns = SumNodes(
+        new_ns = ns.rebuild(
             num_node_blocks = new_num_nblocks,
             chs = ns_chs,
             edge_ids = new_edge_ids,

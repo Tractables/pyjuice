@@ -7,7 +7,7 @@ import pytest
 
 
 @pytest.mark.slow
-def hmm_optim_speed_test():
+def test_hmm_optim_speed():
 
     seq_length = 128
     num_latents = 1024
@@ -168,4 +168,4 @@ def hmm_optim_speed_test():
 
 
 if __name__ == "__main__":
-    hmm_optim_speed_test()
+    test_hmm_optim_speed()

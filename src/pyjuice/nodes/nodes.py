@@ -152,6 +152,30 @@ class CircuitNodes():
     def duplicate(self, *args, **kwargs):
         raise ValueError(f"{type(self)} does not support `duplicate`.")
 
+    def _construction_kwargs(self) -> dict:
+        """
+        Subclass-specific constructor arguments that must be carried over whenever this node is
+        rebuilt -- by :func:`duplicate`, by `pyjuice.deepcopy`, or by a structural transformation.
+
+        Subclasses that add required constructor arguments (for instance
+        :class:`~pyjuice.nodes.ExternalParamsSumNodes`, which requires an `external_params`
+        descriptor) should override this, so that every rebuild path preserves them without each
+        call site having to know about them.
+        """
+        return {}
+
+    def rebuild(self, *args, **kwargs) -> CircuitNodes:
+        """
+        Construct a new node of the same concrete type as `self`, carrying over the subclass-specific
+        configuration reported by :func:`_construction_kwargs`.
+
+        Code that reconstructs a node from an existing one -- transformations such as `deepcopy`,
+        `merge`, `prune` and `blockify` -- should build it through this method rather than naming a
+        node class directly, so that node subclasses survive the transformation instead of being
+        silently downgraded to their base class.
+        """
+        return type(self)(*args, **kwargs, **self._construction_kwargs())
+
     def init_parameters(self, perturbation: float = 2.0, recursive: bool = True, visited: set = set(), 
                         is_root = True, **kwargs):
         if recursive:

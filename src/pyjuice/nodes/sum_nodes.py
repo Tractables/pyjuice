@@ -111,7 +111,10 @@ class SumNodes(CircuitNodes):
             # We also do not copy parameters explicitly if this is a tied node
             params = None
 
-        return SumNodes(self.num_node_blocks, chs, edge_ids, params = params, block_size = self.block_size, source_node = self if tie_params else None)
+        # Rebuild through `self.rebuild` (rather than naming `SumNodes`) so that subclasses such as
+        # `ExternalParamsSumNodes` duplicate into their own type, carrying their configuration
+        return self.rebuild(self.num_node_blocks, chs, edge_ids, params = params, block_size = self.block_size,
+                            source_node = self if tie_params else None)
 
     def get_params(self, as_matrix: bool = False):
         """

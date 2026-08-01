@@ -24,6 +24,7 @@
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 #include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAException.h>
 #include <vector>
 
 template <int EY, int BMAX>
@@ -80,6 +81,7 @@ static void launch_par(torch::Tensor param_flows, torch::Tensor node_flows, torc
         param_flows.data_ptr<float>(), node_flows.data_ptr<float>(), node_mars.data_ptr<float>(),
         element_mars.data_ptr<float>(), params.data_ptr<float>(), nids.data_ptr<long>(),
         cids.data_ptr<long>(), pids.data_ptr<long>(), pfids.data_ptr<long>(), batch, block_size, num_edges);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 // Dispatch on (EY from `cfg`) x (BMAX = next pow2 of batch, for register-tight state).

@@ -326,6 +326,23 @@ class SumLayer(Layer, nn.Module):
         self._cached_bk_par_trim = dict()
         self._bk_par_scratch = None
 
+        # Optional interception of the two CUDA backward kernels by an external parameterization.
+        # `None` on every plain layer, so the fast paths below are unchanged for them. When set (by
+        # `ExternalParamsSumLayer` for the duration of one backward), the hook is called INSTEAD of the
+        # vanilla kernel with the very same operands plus the partition id -- which is what lets a
+        # parameterization reuse this class's whole table derivation (partitioning, edge trimming,
+        # `parids` reconstruction) rather than reimplement it. A hook that cannot be reached because
+        # the CUDA guards do not hold raises rather than falling through to Triton, which would
+        # silently compute the UNGATED flows.
+        # One pair per regime, because the two regimes hand their kernels different operands: the
+        # block-sparse path passes per-tile [neb, K_NUM_TILES] tables, the small-batch path the 1-D
+        # per-block ones plus `num_edges`. Separate slots rather than one overloaded hook, so a
+        # parameterization that implements only one regime fails loudly in the other.
+        self._ext_bw_ele_hook = None
+        self._ext_bw_par_hook = None
+        self._ext_bw_par_sb_hook = None
+        self._ext_bw_par_triton_hook = None
+
     def to(self, device):
         super(SumLayer, self).to(device)
 
@@ -1198,6 +1215,17 @@ class SumLayer(Layer, nn.Module):
         else:
             mode = self.BLOCK_SPARSE
 
+        if mode != self.BLOCK_SPARSE and (self._ext_bw_ele_hook is not None
+                                          or self._ext_bw_par_hook is not None
+                                          or self._ext_bw_par_sb_hook is not None):
+            # The hooks live on the block-sparse CUDA paths only. Every other mode would compute the
+            # SHARED-parameter flows and return them as if they were the gated ones.
+            raise NotImplementedError(
+                f"external sum parameters need the block-sparse backward, but this layer's shape "
+                f"selected mode '{mode}' (block_size={self.block_size}, cs_block_size={cs_block_size}, "
+                f"batch={batch_size}, num_edges={num_edges})."
+            )
+
         if mode == self.BLOCK_SPARSE:
             self._backward_block_sparse(
                 node_flows, element_flows, params, node_mars, element_mars, param_flows, 
@@ -1369,7 +1397,7 @@ class SumLayer(Layer, nn.Module):
                     allow_modify_flows = allow_modify_flows,
                     propagation_alg = propagation_alg,
                     logspace_flows = logspace_flows,
-                    negate_pflows = negate_pflows,
+                    negate_pflows = negate_pflows, partition_id = partition_id,
                     pflow_temperature = pflow_temperature, **kwargs
                 )
             else:
@@ -1381,7 +1409,7 @@ class SumLayer(Layer, nn.Module):
                     logspace_flows = logspace_flows,
                     negate_pflows = negate_pflows,
                     allow_neg_flows = allow_neg_flows,
-                    force_use_fp32 = force_use_fp32,
+                    force_use_fp32 = force_use_fp32, partition_id = partition_id,
                     pflow_temperature = pflow_temperature, **kwargs
                 )
 
@@ -1518,6 +1546,35 @@ class SumLayer(Layer, nn.Module):
             TL_DOT = 0
 
         grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
+
+        # An external parameterization owns this computation. ONE interception for every regime: it is
+        # handed the operands of all of them -- the per-tile tables the CuTe kernel wants, the general
+        # `parids` walk a Triton kernel wants, and the shapes -- and picks among whichever of its own
+        # kernels apply, by measuring. Deliberately BEFORE the CuTe guard below: which kernel is fastest
+        # is not the same question as which regime this layer happens to fall in, and the ungated
+        # autotuner already demonstrates that (it prefers Triton to its own CuTe kernel at some shapes).
+        if self._ext_bw_ele_hook is not None:
+            if not (propagation_alg_id == 0 and abs(eflow_temperature - 1.0) < 1e-6
+                    and allow_modify_flows == 0 and logspace_flows and not allow_neg_flows
+                    and not accumulate_ch_flows and local_ids is None and not force_use_fp32):
+                raise NotImplementedError(
+                    "external sum parameters need the plain LL element-flow regime (log-space flows, "
+                    "no tempering, no partial evaluation, and allow_modify_flows / allow_neg_flows / "
+                    "accumulate_ch_flows off)."
+                )
+            ele_ebase, ele_pbase, ele_cuda_ok = self._cached_bk_ele_cuda[signature]
+            self._ext_bw_ele_hook(dict(
+                element_flows = element_flows, element_mars = element_mars, node_flows = node_flows,
+                node_mars = node_mars, params = params, chids = chids,
+                ele_ebase = ele_ebase, ele_pbase = ele_pbase, ele_cuda_ok = ele_cuda_ok,
+                parids_start = parids_start, parids_increment = parids_increment,
+                parpids_start = parpids_start, parpids_increment = parpids_increment,
+                ptr_inc_step = ptr_inc_step, batch_size = batch_size, block_size = self.block_size,
+                cs_block_size = cs_block_size, num_edges = num_edges, signature = signature,
+                BLOCK_B = BLOCK_B, TILE_SIZE_K = TILE_SIZE_K, K_NUM_TILES = K_NUM_TILES,
+                TILE_SIZE_M = TILE_SIZE_M, TL_DOT = TL_DOT, grid = grid, partition_id = partition_id,
+            ))
+            return None
 
         # Optional CUDA (CuTe/fp16/TMA) fast path for the element-flow backward `tlmm` regime. It is
         # numerically equivalent to the Triton ele kernel (fp16 dot + fp32 accumulate; ~1.07e-3
@@ -1812,7 +1869,8 @@ class SumLayer(Layer, nn.Module):
                                          allow_modify_flows: bool = False, propagation_alg: str = "LL",
                                          logspace_flows: bool = False, negate_pflows: bool = False,
                                          allow_neg_flows: bool = False, force_use_fp32: bool = False,
-                                         pflow_temperature: float = 1.0, **kwargs) -> None:
+                                         pflow_temperature: float = 1.0, partition_id: int = -1,
+                                         **kwargs) -> None:
         """
         Backward pass of sum layers w.r.t. sum parameters with the block-sparse processing kernel.
         
@@ -1947,6 +2005,14 @@ class SumLayer(Layer, nn.Module):
                     cache = (None, None, None, None, False)
                 self._cached_bk_par_cuda[par_sig] = cache
             nbase, cbase, pbase, fbase, par_ok = cache
+            if par_ok and self._ext_bw_par_hook is not None:
+                # See `_ext_bw_ele_hook`. Read-accumulate-write, exactly like the vanilla kernel, so it
+                # runs once on the live `param_flows` and is never autotuned against anything.
+                self._ext_bw_par_hook(
+                    param_flows, node_flows, node_mars, element_mars, params, nbase, cbase, pbase,
+                    fbase, batch_size, self.block_size, num_edges, partition_id)
+                return None
+
             if par_ok:
                 def _cuda_par(tgt):
                     # mode 0 = read-accumulate-write (RMW): always correct (accumulates onto prior
@@ -1989,6 +2055,30 @@ class SumLayer(Layer, nn.Module):
                     _cuda_par(param_flows)
                     return None
                 # choice == "triton": fall through to the Triton dispatch below
+
+        if self._ext_bw_par_triton_hook is not None:
+            # The CuTe fork did not claim this shape (it needs num_edges % 128 and block_size % 64).
+            # The Triton fork has neither requirement, so it covers what the CUDA forks cannot.
+            self._ext_bw_par_triton_hook(dict(
+                node_flows = node_flows, node_mars = node_mars, element_mars = element_mars,
+                params = params, param_flows = param_flows, nids = nids, cids = cids, pids = pids,
+                pfids = pfids, batch_size = batch_size, num_edges = num_edges,
+                block_size = self.block_size, TILE_SIZE_B = TILE_SIZE_B, B_NUM_TILES = B_NUM_TILES,
+                TILE_SIZE_K = TILE_SIZE_K, TILE_SIZE_M = TILE_SIZE_M, TL_DOT = TL_DOT, grid = grid,
+                partition_id = partition_id,
+            ))
+            return None
+
+        if self._ext_bw_par_hook is not None:
+            # See the matching guard in `_backward_block_sparse_ele_flows`.
+            raise NotImplementedError(
+                f"the external param-flow backward needs the block-sparse CUDA regime "
+                f"(block_size % 64 == 0, num_edges % 128 == 0, batch % 32 == 0, contiguous cids and "
+                f"block_size-strided pids/pfids, collision-free param flows, logspace flows, no "
+                f"tempering / allow_modify_flows / negate_pflows), which does not hold here: "
+                f"block_size={self.block_size}, num_edges={num_edges}, batch={batch_size}. There is "
+                f"no Triton fallback for this parameterization."
+            )
 
         for pid_m_start in range(0, grid[1], 32768):
             pid_m_end = min(pid_m_start + 32768, grid[1])
@@ -2182,9 +2272,9 @@ class SumLayer(Layer, nn.Module):
                 node_flows, params, node_mars, element_mars, param_flows,
                 nids = nids, cids = cids, pids = pids, pfids = pfids,
                 allow_modify_flows = allow_modify_flows,
-                propagation_alg = propagation_alg, 
-                logspace_flows = logspace_flows, 
-                negate_pflows = negate_pflows, 
+                propagation_alg = propagation_alg,
+                logspace_flows = logspace_flows,
+                negate_pflows = negate_pflows, partition_id = partition_id,
                 pflow_temperature = pflow_temperature, **kwargs
             )
 
@@ -2411,9 +2501,10 @@ class SumLayer(Layer, nn.Module):
     def _backward_sparse_par_flows(self, node_flows: torch.Tensor, params: torch.Tensor, node_mars: torch.Tensor, 
                                    element_mars: torch.Tensor, param_flows: torch.Tensor, nids: torch.Tensor, 
                                    cids: torch.Tensor, pids: torch.Tensor, pfids: torch.Tensor,
-                                   allow_modify_flows: bool = False, propagation_alg: str = "LL", 
-                                   logspace_flows: bool = False, negate_pflows: bool = False, 
-                                   pflow_temperature: float = 1.0, **kwargs) -> None:
+                                   allow_modify_flows: bool = False, propagation_alg: str = "LL",
+                                   logspace_flows: bool = False, negate_pflows: bool = False,
+                                   pflow_temperature: float = 1.0, partition_id: int = -1,
+                                   **kwargs) -> None:
         """
         Backward pass of sum layers w.r.t. sum parameters with the block-sparse processing kernel.
         
@@ -2479,6 +2570,12 @@ class SumLayer(Layer, nn.Module):
                 and batch_size < 16 and self.block_size % 32 == 0 and B_NUM_TILES == 1
                 and node_flows.is_cuda and cuda_kernels.smallbatch_par_is_available()
                 and self._par_flow_collision_free(pfids)):
+            if self._ext_bw_par_sb_hook is not None:
+                self._ext_bw_par_sb_hook(
+                    param_flows, node_flows, node_mars, element_mars, params, nids, cids, pids, pfids,
+                    batch_size, self.block_size, num_edges, partition_id)
+                return None
+
             n_cfg = len(cuda_kernels.smallbatch_par_configs())
 
             def _cuda_par_sb(tgt, cfg):
@@ -2513,6 +2610,30 @@ class SumLayer(Layer, nn.Module):
                 _cuda_par_sb(param_flows, choice[1])
                 return None
             # choice == ("triton", -1): fall through to the Triton launch below
+
+        if self._ext_bw_par_triton_hook is not None:
+            # Neither CUDA fork claimed this shape. The Triton fork has no `num_edges % 128` or
+            # `block_size % 64` requirement, so it covers what they cannot -- a 64-state layer, say,
+            # whose element flows are already served.
+            self._ext_bw_par_triton_hook(dict(
+                node_flows = node_flows, node_mars = node_mars, element_mars = element_mars,
+                params = params, param_flows = param_flows, nids = nids, cids = cids, pids = pids,
+                pfids = pfids, batch_size = batch_size, num_edges = num_edges,
+                block_size = self.block_size, TILE_SIZE_B = TILE_SIZE_B, B_NUM_TILES = B_NUM_TILES,
+                TILE_SIZE_K = TILE_SIZE_K, TILE_SIZE_M = TILE_SIZE_M, TL_DOT = TL_DOT, grid = grid,
+                partition_id = partition_id,
+            ))
+            return None
+
+        if self._ext_bw_par_sb_hook is not None or self._ext_bw_par_hook is not None:
+            # As in the element-flow path: everything below writes the SHARED-parameter flows.
+            raise NotImplementedError(
+                f"no external param-flow backward applies here: block_size={self.block_size}, "
+                f"batch={batch_size}, num_edges={num_edges}. The small-batch fork needs batch < 16, "
+                f"block_size % 32 == 0, a single batch tile, collision-free (untied) param flows, "
+                f"logspace flows and no tempering / allow_modify_flows / negate_pflows. There is no "
+                f"Triton fallback."
+            )
 
         # Triton seems to produce wrong results when using a (1, 1, 1) grid with BLOCK_B = 1 or 2...
         # if grid[0] == 1 and grid[1] == 1 and grid[2] == 1 and BLOCK_B < 4:

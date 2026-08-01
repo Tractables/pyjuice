@@ -29,6 +29,7 @@
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 #include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAException.h>
 #include <vector>
 
 // Combine two online-logsumexp accumulators (max `m`, linear-sum `l`) with a second point/accumulator
@@ -105,6 +106,7 @@ static void launch_ele(torch::Tensor element_flows, torch::Tensor element_mars, 
         element_flows.data_ptr<float>(), element_mars.data_ptr<float>(), node_flows.data_ptr<float>(),
         node_mars.data_ptr<float>(), params.data_ptr<float>(), chids.data_ptr<long>(),
         ebase.data_ptr<long>(), pbase.data_ptr<long>(), batch, block_size, cs_block_size, num_edges);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 // Dispatch on (WARPS from `cfg`) x (BMAX = next pow2 of batch, for register-tight state).

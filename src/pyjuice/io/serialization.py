@@ -5,7 +5,7 @@ import pickle
 from functools import partial
 from typing import Sequence
 
-from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes, inputs, multiply, summate
+from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes, ExternalParamsSumNodes, inputs, multiply, summate
 
 
 def serialize_nodes(root_ns: CircuitNodes):
@@ -29,6 +29,9 @@ def serialize_nodes(root_ns: CircuitNodes):
 
         if ns.is_prod() or ns.is_sum():
             ns_info["edge_ids"] = ns.edge_ids.detach().cpu().numpy().copy()
+
+        if isinstance(ns, ExternalParamsSumNodes):
+            ns_info["external_params"] = pickle.dumps(ns.external_params)
 
         if hasattr(ns, "_params") and ns._params is not None:
             ns_info["params"] = ns._params.detach().cpu().numpy().copy()
@@ -102,7 +105,12 @@ def deserialize_nodes(nodes_list: Sequence):
             else:
                 params = None
 
-            ns = summate(*chs, edge_ids = edge_ids, params = params, block_size = block_size)
+            external_params = ns_info.get("external_params", None)
+            if external_params is not None:
+                external_params = pickle.loads(external_params)
+
+            ns = summate(*chs, edge_ids = edge_ids, params = params, block_size = block_size,
+                         external_params = external_params)
 
             if "zero_param_mask" in ns_info:
                 zero_param_mask = torch.from_numpy(ns_info["zero_param_mask"])
