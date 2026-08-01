@@ -748,7 +748,9 @@ class BlockScaleSumParams(ExternalSumParams):
                 # This block sits AFTER that guard on purpose: an unsupported shape has no gate table,
                 # and returning a kind for it reached the launch with a null table and died with an
                 # AttributeError instead of a clear NotImplementedError.
-                kinds = [k for k in kinds if k == "triton" or isinstance(k, tuple)]
+                # Every fork implements the gradient; the filter stays as the place to drop one that
+                # does not.
+                kinds = [k for k in kinds if k in ("triton", "cute") or isinstance(k, tuple)]
                 if not kinds:
                     raise NotImplementedError(
                         "external-parameter gradients are implemented for the Triton and small-batch "
@@ -764,8 +766,21 @@ class BlockScaleSumParams(ExternalSumParams):
             scr = layer._bk_ele_scratch
             if scr is None or scr.shape != ctx["element_flows"].shape:
                 scr = layer._bk_ele_scratch = torch.empty_like(ctx["element_flows"])
-            trials = [(k, (lambda k = k: _launch_ele(ctx, plan, scr, k))) for k in kinds]
-            plan["kind"] = ck.autotune(trials) or kinds[0]
+            # The gradient is OFF for the trials. Its writes are atomic ACCUMULATIONS into the real
+            # gradient buffer, so measuring N candidates over warmup+reps would add the gradient tens
+            # of times over -- which is exactly what it did: the value came out ~128x too large, and
+            # the zero-sum invariant blew up. The flow output already goes to a scratch buffer for the
+            # same reason; the gradient needed the same treatment and did not have it.
+            #
+            # Choosing on flow cost alone is a small inaccuracy (it ignores the gradient's share of
+            # each candidate) and is the conservative trade against corrupting the answer.
+            saved_grad = layer._bs_grad_ext
+            layer._bs_grad_ext = None
+            try:
+                trials = [(k, (lambda k = k: _launch_ele(ctx, plan, scr, k))) for k in kinds]
+                plan["kind"] = ck.autotune(trials) or kinds[0]
+            finally:
+                layer._bs_grad_ext = saved_grad
             return plan
 
         def _launch_ele(ctx, plan, tgt, kind = None):
@@ -778,6 +793,8 @@ class BlockScaleSumParams(ExternalSumParams):
                 ele_mod.blockscale_ele_backward(
                     tgt, ctx["element_mars"], ctx["node_flows"], ctx["node_mars"], ctx["params"],
                     external_params, chids, ctx["ele_ebase"], ctx["ele_pbase"], plan["gate_tile"],
+                    (layer._bs_grad_ext if layer._bs_grad_ext is not None
+                     else external_params.new_empty(0)),
                     batch, blk, cbs, knt, gate_cbs, ext_base)
 
             elif isinstance(kind, tuple):                     # ("sb", cfg)

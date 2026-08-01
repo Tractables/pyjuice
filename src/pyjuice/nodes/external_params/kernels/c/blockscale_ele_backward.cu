@@ -46,6 +46,7 @@ using namespace cute;
 #define WM 4
 #define WN 2
 #define NTH (WM * WN * 32)
+#define FRAGC (BM * BN / NTH)   // C-fragment elements per thread
 
 __device__ __forceinline__ void mbar_init(uint64_t* bar, int cnt) {
     uint32_t a = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
@@ -74,9 +75,10 @@ __device__ __forceinline__ void mbar_wait(uint64_t* bar, int phase) {
 
 extern __shared__ char smem_raw[];
 
+template <bool WGRAD>
 __global__ void __launch_bounds__(NTH) bs_ele_kernel(
         float* __restrict__ eflows, const float* __restrict__ emars_g, const float* __restrict__ mp,
-        const float* __restrict__ ext,
+        const float* __restrict__ ext, float* __restrict__ grad_ext,
         const long* __restrict__ chids, const long* __restrict__ ebase, const long* __restrict__ pbase,
         const long* __restrict__ gate,
         int batch, int BSK, int BSM, int knt, int gate_sh, long ext_base, int pid_m_offset,
@@ -120,6 +122,17 @@ __global__ void __launch_bounds__(NTH) bs_ele_kernel(
     clear(tCrL);
     CUTE_UNROLL
     for (int i = 0; i < size(tCrM); i++) tCrM(i) = -INFINITY;
+
+    // `d LL / d log phi`, first term. The C fragment's (m, b) coordinates are LOOP-INVARIANT, so this
+    // child's own value is fetched once per thread rather than re-read on every k-tile.
+    float emb[FRAGC];
+    if (WGRAD) {
+        CUTE_UNROLL
+        for (int i = 0; i < size(tCrS); i++) {
+            int m = get<0>(tCcC(i)), b = get<1>(tCcC(i));
+            emb[i] = (m < BM && b < BN) ? emars_g[(off_ele + m) * (long)batch + b0 + b] : 0.f;
+        }
+    }
 
     for (int kt = 0; kt < knt; kt++) {
         long ec = ebp[kt]; long pc = pbp[kt] + (long)tile_id * BM * BSK;
@@ -169,12 +182,20 @@ __global__ void __launch_bounds__(NTH) bs_ele_kernel(
         copy(s2rA, tXsA, tXrA); copy(s2rB, tXsB, tXrB);
         clear(tCrS); cute::gemm(mma, tCrA, tCrB, tCrS);
         // online log-sum-exp merge of this k-tile's (partial, max=pfm) into the running (L=tCrL, M=tCrM).
+        const long gbr = WGRAD ? gtp[kt] : -1;
         CUTE_UNROLL
         for (int i = 0; i < size(tCrS); i++) { int b = get<1>(tCcC(i));
             // the gate enters as a shift of this tile's max -- see the header
             const int m_i = get<0>(tCcC(i));
             const float lphi = sPh[(m_i >> gate_sh) * BN + b];
             float partial = tCrS(i); float pfm = (lphi == -INFINITY) ? -INFINITY : sMx[b] + lphi;
+            // `partial * exp(pfm + emars)` IS this parent block's contribution to edge_flow[.,m_i,b].
+            // Summing it over a gate's children is the first term; done with one atomic per fragment
+            // element, which needs no reasoning about how CuTe distributes (m, b) across threads.
+            if (WGRAD && gbr >= 0 && pfm != -INFINITY && m_i < BM && b < BN)
+                atomicAdd(grad_ext + (gbr + ext_base + ((tile_id * BM) >> gate_sh)
+                                      + (m_i >> gate_sh)) * (long)batch + b0 + b,
+                          partial * __expf(pfm + emb[i]));
             float Mo = tCrM(i), Lo = tCrL(i); float nM = fmaxf(Mo, pfm);
             if (nM != -INFINITY) { float pa = (Mo == -INFINITY) ? 0.f : Lo * __expf(Mo - nM); float pc2 = (pfm == -INFINITY) ? 0.f : partial * __expf(pfm - nM); tCrL(i) = pa + pc2; tCrM(i) = nM; } }
         __syncthreads();
@@ -206,7 +227,7 @@ static bool build_desc(CUtensorMap* d, void* base, int n_rows, int batch) {
 void blockscale_ele_backward(torch::Tensor element_flows, torch::Tensor element_mars,
                              torch::Tensor node_flows, torch::Tensor node_mars, torch::Tensor params,
                              torch::Tensor ext, torch::Tensor chids, torch::Tensor ebase,
-                             torch::Tensor pbase, torch::Tensor gate,
+                             torch::Tensor pbase, torch::Tensor gate, torch::Tensor grad_ext,
                              int64_t batch, int64_t BSK, int64_t BSM, int64_t knt,
                              int64_t gate_cbs, int64_t ext_base) {
     TORCH_CHECK((gate_cbs & (gate_cbs - 1)) == 0 && gate_cbs > 0,
@@ -228,19 +249,30 @@ void blockscale_ele_backward(torch::Tensor element_flows, torch::Tensor element_
     }
     int smem = BM * BK * 2 + BN * BK * 2 + BK * BN * 4 + BN * 4 + 1024;   // pA(fp16)+pBs(fp16)+sLf(f32)+sMx+bar
     smem += (BM >> gate_sh) * BN * 4;                                     // + the staged gates
-    cudaFuncSetAttribute(bs_ele_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    cudaFuncSetAttribute(bs_ele_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    cudaFuncSetAttribute(bs_ele_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     int total_m = n_nblocks * (BSM / BM);
     const int MAX_Y = 65535;
     for (int off = 0; off < total_m; off += MAX_Y) {
         int chunk = (total_m - off < MAX_Y) ? (total_m - off) : MAX_Y;
         dim3 grid(batch / BN, chunk);
-        bs_ele_kernel<<<grid, NTH, smem, c10::cuda::getCurrentCUDAStream()>>>(
-            element_flows.data_ptr<float>(), element_mars.data_ptr<float>(), params.data_ptr<float>(),
-            ext.data_ptr<float>(),
-            chids.data_ptr<long>(), ebase.data_ptr<long>(), pbase.data_ptr<long>(),
-            gate.data_ptr<long>(),
-            (int)batch, (int)BSK, (int)BSM, (int)knt, gate_sh, (long)ext_base, off,
-            g_descNf, g_descNm);
+        // WGRAD is a TEMPLATE parameter: the no-gradient path keeps its register count and occupancy.
+        if (grad_ext.numel() > 0)
+            bs_ele_kernel<true><<<grid, NTH, smem, c10::cuda::getCurrentCUDAStream()>>>(
+                element_flows.data_ptr<float>(), element_mars.data_ptr<float>(), params.data_ptr<float>(),
+                ext.data_ptr<float>(), grad_ext.data_ptr<float>(),
+                chids.data_ptr<long>(), ebase.data_ptr<long>(), pbase.data_ptr<long>(),
+                gate.data_ptr<long>(),
+                (int)batch, (int)BSK, (int)BSM, (int)knt, gate_sh, (long)ext_base, off,
+                g_descNf, g_descNm);
+        else
+            bs_ele_kernel<false><<<grid, NTH, smem, c10::cuda::getCurrentCUDAStream()>>>(
+                element_flows.data_ptr<float>(), element_mars.data_ptr<float>(), params.data_ptr<float>(),
+                ext.data_ptr<float>(), nullptr,
+                chids.data_ptr<long>(), ebase.data_ptr<long>(), pbase.data_ptr<long>(),
+                gate.data_ptr<long>(),
+                (int)batch, (int)BSK, (int)BSM, (int)knt, gate_sh, (long)ext_base, off,
+                g_descNf, g_descNm);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 }
