@@ -78,9 +78,15 @@ def test_gated_hmm_forward_and_backward():
 def test_training_a_router_that_produces_the_gates():
     """The end-to-end loop the gate exists for: a head emits the gates, and its own weights learn.
 
-    `pc.backward` computes `d LL / d log phi` by default (`compute_external_grads = True`), and
-    `get_external_params_grad` hands it back laid out exactly like the tensor that was supplied -- so
-    the gates go into the circuit detached, and the gradient comes back out into ordinary autograd."""
+    The gradient is written straight into a buffer we own: `pc.backward(..., sum_external_params_grad
+    = {name: buffer})` takes destinations in exactly the shape the forward takes gates -- per node or,
+    as here, one concatenated tensor per group -- and fills them in the layout they were supplied in.
+    So the gates go into the circuit detached, and `d LL / d log phi` comes back out into ordinary
+    autograd with nothing to read back afterwards.
+
+    (`pc.get_external_params_grad(...)` still works and returns the same numbers; it hands back views
+    into the circuit's own buffer instead, which is the right choice when the caller does not already
+    have somewhere to put them.)"""
     device = torch.device("cuda:0")
     torch.manual_seed(0)
 
@@ -105,19 +111,26 @@ def test_training_a_router_that_produces_the_gates():
 
     data = torch.randint(0, NUM_EMITS, [BATCH, SEQ_LEN], device = device)
 
+    # Allocated ONCE and reused: each backward overwrites it, so there is nothing to zero between
+    # steps. Shaped like the group's gate tensor, because that is the layout it is filled in.
+    grad = torch.zeros([BATCH, SEQ_LEN - 1, num_gates], device = device)
+
     before = None
     for step in range(15):
         log_phi = router(features).view(BATCH, SEQ_LEN - 1, num_gates)
 
         lls = pc(data, sum_external_params = {"transitions": log_phi.detach()})
-        pc.backward(data, flows_memory = 0.0)
+        pc.backward(data, flows_memory = 0.0,
+                    sum_external_params_grad = {"transitions": grad})
 
-        # d LL / d log phi, in the layout the gates were supplied in
-        g = pc.get_external_params_grad("transitions")[0]
-        assert g.shape == log_phi.shape
+        # Supplying a destination is itself the request for the gradient -- no `compute_external_grads`
+        # to remember. Checked once, because a buffer that is silently never written is the failure
+        # this API can have, and it would otherwise show up only as a router that does not learn.
+        if step == 0:
+            assert float(grad.abs().sum()) > 0.0, "the backward did not fill the gradient buffer"
 
         opt.zero_grad(set_to_none = True)
-        torch.autograd.backward([log_phi], [-g])      # ascend the likelihood
+        torch.autograd.backward([log_phi], [-grad])   # ascend the likelihood
         opt.step()
 
         if before is None:
