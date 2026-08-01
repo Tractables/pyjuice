@@ -182,6 +182,76 @@ def test_every_fork_computes_the_same_gradient():
 
 @cuda_only
 @needs_cute
+def test_a_block_size_no_log_z_tile_fits_widely_still_runs():
+    """REGRESSION. The log-Z tile is autotuned, and the candidates are ranked by a traffic model before
+    the finalists are timed. That model favours WIDE tiles, so at a large block size every shortlisted
+    candidate can be one that does not fit in shared memory (136-264 KB against 101 KB here), leaving
+    nothing measurable -- and the fallback then handed back one of the candidates that had just been
+    refused, so the real launch raised `OutOfResources`. The narrowest pair now always stays on the
+    shortlist."""
+    dev = torch.device("cuda:0")
+    K, gate_cbs, batch = 1024, 4, 64
+    torch.manual_seed(0)
+    with juice.set_block_size(K):
+        ni = [inputs(v, num_node_blocks = 2, dist = dists.Categorical(num_cats = NUM_CATS))
+              for v in range(2)]
+        ns = summate(multiply(*ni), num_node_blocks = 2,
+                     external_params = BlockScaleSumParams(ch_block_size = gate_cbs))
+        root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
+    torch.manual_seed(0)
+    root.init_parameters(perturbation = 2.0)
+    pc = juice.compile(root, verbose = False).to(dev)
+
+    torch.manual_seed(7)
+    data = torch.randint(0, NUM_CATS, [batch, 2], device = dev)
+    phi = torch.randn(ns.external_params.tensor_shapes(ns, batch)[0], device = dev) * 0.5
+
+    pc(data, sum_external_params = {ns: phi})
+    pc.backward(data, flows_memory = 0.0)               # used to raise OutOfResources
+    g = pc.get_external_params_grad(ns)[0]
+
+    assert torch.isfinite(g).all() and float(g.abs().sum()) > 0.0
+    assert float(g.sum(dim = 2).abs().max()) < 5e-2 * float(g.abs().max())
+
+
+@cuda_only
+@needs_cute
+def test_partial_supply_of_a_shared_layer_is_refused():
+    """REGRESSION. `ext_base` is measured from the first SUPPLIED node, but the gate tables it is added
+    to already carry the cursor over ALL of the layer's gated nodes -- so supplying gates for only a
+    later node shifted every address by the earlier nodes' slabs. That gave a finite, plausible, WRONG
+    log-likelihood (the forward read past the end of the buffer) and then an illegal access in the
+    gradient write. Refused up front now."""
+    dev = torch.device("cuda:0")
+    batch, K, gcbs = 32, 64, 8
+    torch.manual_seed(0)
+    with juice.set_block_size(K):
+        n = [inputs(v, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
+             for v in range(2)]
+        # Same variable scope and depth, so the two land on ONE layer
+        s0 = summate(multiply(n[0], n[1]), num_node_blocks = 1,
+                     external_params = BlockScaleSumParams(ch_block_size = gcbs))
+        s1 = summate(multiply(n[0], n[1]), num_node_blocks = 1,
+                     external_params = BlockScaleSumParams(ch_block_size = gcbs))
+        root = summate(multiply(s0), multiply(s1), num_node_blocks = 1, block_size = 1)
+    torch.manual_seed(0)
+    root.init_parameters(perturbation = 2.0)
+    pc = juice.compile(root, verbose = False).to(dev)
+
+    layer = [l for gg in pc.inner_layer_groups if gg.is_sum() for l in gg.layers
+             if hasattr(l, "external_node_infos")][0]
+    if len([i for i in layer.external_node_infos]) < 2:
+        pytest.skip("this build did not place both gated nodes on one layer")
+
+    data = torch.randint(0, NUM_CATS, [batch, 2], device = dev)
+    g1 = torch.randn(s1.external_params.tensor_shapes(s1, batch)[0], device = dev) * 0.5
+
+    with pytest.raises(NotImplementedError, match = "Partial supply"):
+        pc(data, sum_external_params = {s1: g1})
+
+
+@cuda_only
+@needs_cute
 @pytest.mark.parametrize("scale", [40.0, 120.0])
 def test_gradient_survives_gates_far_outside_the_exp_range(scale):
     """REGRESSION. `log phi` is a raw router output; nothing bounds it to the ~88 where `exp`

@@ -383,7 +383,13 @@ class ExternalParamsSumLayer(SumLayer):
                 assert torch.all(blocked[blk_valid] == expected[blk_valid]), \
                     "External sum parameters require each edge block's children to occupy a " \
                     "contiguous run of `cids`."
-                assert torch.all(blocked[:,:max_n_eblks,0][valid] == ns_info.ch_eids.cpu()[eblks][valid]), \
+                # CLIPPED to this partition's width. `valid` is sized by the LAYER-wide `max_n_eblks`
+                # while `blocked` is only as wide as the partition, so when the partitioner splits a
+                # gated layer into partitions of differing width the mask and the tensor disagree and
+                # this raises `IndexError` at compile time -- refusing shapes it was meant to validate.
+                keep = min(n_slots, max_n_eblks)
+                assert torch.all(blocked[:,:keep,0][valid[:,:keep]]
+                                 == ns_info.ch_eids.cpu()[eblks][:,:keep][valid[:,:keep]]), \
                     "External sum parameters require `cids` to list edge blocks in `par_ptr` order."
 
                 # Where each edge block's entry starts within its slot, in per-batch units. The

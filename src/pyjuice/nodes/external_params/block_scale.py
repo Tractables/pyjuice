@@ -348,6 +348,29 @@ class BlockScaleSumParams(ExternalSumParams):
         # the WHOLE row rather than within each edge tile -- it walks the edge axis with a single base.
         sb_ok = (sb_mod is not None) and (block_size % 32 == 0)
 
+        # PARTIAL SUPPLY IS REFUSED, and the check has to come before `ext_base`. That base is measured
+        # from the FIRST SUPPLIED node, but the gate tables it is added to already carry
+        # `layer.ext_unit_bases[ns_idx]`, the cursor over ALL of the layer's gated nodes -- so the two
+        # only compose when the first supplied node IS the layer's first. Supply gates for a later node
+        # alone and every row shifts by the earlier nodes' slabs: the unsupplied node is gated with the
+        # supplied one's `phi`, the supplied one reads past the end of the buffer (finite, plausible,
+        # wrong), and the backward's gradient write faults. Refusing is the honest fix -- correcting the
+        # base alone would not help, since the kernels still run over every row of the layer and would
+        # read whatever a previous call left staged for the nodes nobody supplied.
+        supplied = {id(t[0].ns) for t in ns_tensors}
+        missing = [i.ns for i in layer.external_node_infos
+                   if isinstance(i.ns.external_params, BlockScaleSumParams)
+                   and id(i.ns) not in supplied]
+        if missing:
+            raise NotImplementedError(
+                f"`BlockScaleSumParams`: {len(missing)} of "
+                f"{len(missing) + len(ns_tensors)} gated nodes sharing this sum layer were given no "
+                f"external parameters. Partial supply is not supported -- the layer's kernels run over "
+                f"every node in it, so an unsupplied node has no gate to read. Pass one tensor per "
+                f"gated node (a registered group is the convenient way), or give the nodes separate "
+                f"layers."
+            )
+
         first_view = ns_tensors[0][1][0]
         ext_base = ((first_view.data_ptr() - external_params.data_ptr())
                     // external_params.element_size()) // batch_size
@@ -582,6 +605,32 @@ class BlockScaleSumParams(ExternalSumParams):
 
         return gate.view(ele_ebase.shape).contiguous()
 
+    def _grad_store_ok(self, gate_tile, ctx, gate_cbs) -> bool:
+        """
+        May the Triton element fork emit the gradient with a plain STORE rather than an atomic?
+
+        Only if no two programs can ever write the same row. Two things can make them:
+
+        * an element tile NARROWER than a gate. Then `(tile_id * TILE_SIZE_M) // GATE_CBS` is constant
+          over the `GATE_CBS // TILE_SIZE_M` tiles inside one gate, and those are distinct `pid_m`
+          programs each holding a partial sum over its own children.
+        * two edge blocks sharing a storage row -- what `tie_external` does across every layer holding
+          a copy of a tied node, and even within one layer when two copies land in it.
+
+        The second is tested rather than inferred: a repeated value in the gate table IS the collision,
+        whatever produced it, so a future aliasing route cannot quietly slip past a `tie_external`
+        check. Only the rows actually emitted are compared -- the table repeats a gate across the TPB
+        k-tiles of one parent block BY DESIGN, and those are accumulated in-register before the write.
+        """
+        if ctx["TILE_SIZE_M"] < gate_cbs or self.tie_external:
+            return False
+
+        blk, tk = ctx["block_size"], ctx["TILE_SIZE_K"]
+        tpb = blk // tk if blk > tk else 1
+        emitted = gate_tile[:, tpb - 1::tpb]
+        pos = emitted[emitted >= 0]
+        return int(torch.unique(pos).numel()) == int(pos.numel())
+
     def _bw_state(self, layer, node_mars, kwargs):
         """The forward's leftovers, checked against the call the backward is running under."""
         state = getattr(layer, "_bs_bw_state", None)
@@ -731,6 +780,7 @@ class BlockScaleSumParams(ExternalSumParams):
 
             if plan["gate_tile"] is not None:
                 kinds.append("triton")
+                plan["grad_store_ok"] = self._grad_store_ok(plan["gate_tile"], ctx, gate_cbs)
 
             if not kinds:
                 raise NotImplementedError(
@@ -827,6 +877,7 @@ class BlockScaleSumParams(ExternalSumParams):
                         grad_ext = (layer._bs_grad_ext if layer._bs_grad_ext is not None
                                     else external_params),
                         WRITE_GRAD = (1 if layer._bs_grad_ext is not None else 0),
+                        GRAD_ATOMIC = (0 if plan.get("grad_store_ok") else 1),
                         pid_m_offset = s0, num_stages = 1)
 
         def _par_hook(ctx):
@@ -962,13 +1013,6 @@ class BlockScaleSumParams(ExternalSumParams):
             external_params = kwargs.get(_buffer_kwarg(), None)
             bs_, gate_cbs = state["block_size"], state["gate_cbs"]
             batch = state["batch_size"]
-            # This kernel holds several [BLOCK_SIZE_M, BLOCK_B] tiles, so BLOCK_B has to be bounded by
-            # the NODE BLOCK SIZE, not chosen from the batch alone. Letting it follow the batch put
-            # 512 KB in shared memory at batch 1024; capping it at 128 still overflowed at block_size
-            # 256 (three [256,128] tiles ~ 400 KB against a 101 KB limit) and the launch failed with
-            # OutOfResources. The product is what matters, so budget that directly.
-            BLOCK_B = max(16, min(128, triton.next_power_of_2(batch),
-                                  triton.next_power_of_2(max(1, 16384 // max(bs_, 1)))))
 
             for pid, (nids, log_z, rows) in enumerate(state["shift_args"]):
                 sigma, n_gates = self._sigma(layer, params, pid, bs_, gate_cbs)
@@ -983,22 +1027,6 @@ class BlockScaleSumParams(ExternalSumParams):
                 # element kernel already has in registers. Reading them twice costs more than the
                 # occupancy does. Do not re-split this without re-measuring.
                 #
-                # Only two useful tile widths, not a sweep: 16 is the SMALLEST that enables `tl.dot`,
-                # and 1 keeps the broadcast-sum intermediate at its minimum. The widths in between are
-                # the worst of both -- no dot, and an [M, G, B] intermediate that grows with G
-                # (measured 2.6% of peak, 37.9x off roofline, at G=8).
-                #
-                # A WIDER tile amortizes the per-block `nf`/`log_z` load over more gates: at gate 8 and
-                # K=2048 a 16-wide tile re-read each block 16 times, 33 MB of loads against 2 MB
-                # compulsory. Widen while the grid still fills; 16 remains the floor that keeps
-                # `tl.dot`, and 1 is the fallback when even that would starve the grid.
-                btiles = (batch + BLOCK_B - 1) // BLOCK_B
-                GT = 1
-                for cand, need in ((32, 128), (16, 32)):
-                    if n_gates >= cand and ((n_gates + cand - 1) // cand) * rows * btiles >= need:
-                        GT = cand
-                        break
-
                 # `rows` is the y axis, which CUDA caps at 65535. The kernel reads `pid_nb` straight
                 # from `program_id(1)` with no offset argument, so it cannot be chunked the way the
                 # flow launches above are -- refuse rather than let the driver truncate the grid and
@@ -1006,16 +1034,22 @@ class BlockScaleSumParams(ExternalSumParams):
                 assert rows <= 65535, \
                     f"partition {pid} has {rows} node blocks, past the 65535 CUDA grid-y limit for " \
                     f"the external-gradient kernel. Split the partition, or use a larger block size."
-                _bs_triton_phigrad_logz_kernel[
-                        (triton.cdiv(n_gates, GT), rows, triton.cdiv(batch, BLOCK_B))](
-                    node_flows = node_flows, log_z = log_z, sigma = sigma, ext = external_params,
-                    gate = gb, grad_ext = grad_ext, nids = nids,
-                    batch_size = batch, n_gates = n_gates,
-                    N_CHILD_GATES = state["node_cbs"] // gate_cbs, BLOCK_SIZE_M = bs_,
-                    BLOCK_B = BLOCK_B, GATE_TILE = GT,
-                    USE_DOT = (1 if (GT >= 16 and bs_ >= 16 and batch >= 64) else 0),
-                    gate_stride = gb.size(1),
-                    ext_base = state["ext_base"], num_stages = 1)
+
+                def _go(gt, bb, tgt, nids = nids, log_z = log_z, rows = rows, sigma = sigma,
+                        gb = gb, n_gates = n_gates):
+                    _bs_triton_phigrad_logz_kernel[
+                            (triton.cdiv(n_gates, gt), rows, triton.cdiv(batch, bb))](
+                        node_flows = node_flows, log_z = log_z, sigma = sigma, ext = external_params,
+                        gate = gb, grad_ext = tgt, nids = nids,
+                        batch_size = batch, n_gates = n_gates,
+                        N_CHILD_GATES = state["node_cbs"] // gate_cbs, BLOCK_SIZE_M = bs_,
+                        BLOCK_B = bb, GATE_TILE = gt,
+                        USE_DOT = (1 if (gt >= 16 and bs_ >= 16 and batch >= 64) else 0),
+                        gate_stride = gb.size(1),
+                        ext_base = state["ext_base"], num_stages = 1)
+
+                gt, bb = self._logz_tile(layer, _go, grad_ext, batch, bs_, n_gates, rows)
+                _go(gt, bb, grad_ext)
 
             layer._bs_grad_ext = None
 
@@ -1023,6 +1057,114 @@ class BlockScaleSumParams(ExternalSumParams):
             get_module().lowrank_shift_logz(node_mars, nids, log_z, state["block_size"], -1.0)
 
         return None
+
+    def _logz_tile(self, layer, launch, grad_ext, batch, block_size, n_gates, rows):
+        """
+        `(GATE_TILE, BLOCK_B)` for the log-Z gradient kernel, chosen by MEASUREMENT and cached.
+
+        The two axes trade against each other and neither dominates: a wider gate tile amortizes the
+        [M, B] `node_flows` / `log Z` load over more gates, a wider batch tile amortizes the [M, G]
+        `sigma` load over more samples, and their product sets how many programs there are. Picking
+        them independently -- a gate tile sized to fill the grid, a batch tile sized to fit shared
+        memory -- landed on (32, 128), and measuring the grid found (32, 16) and (64, 32) instead:
+        5.4 us against 10.4 at K=1024, 11.1 against 22.1 at K=2048, 3.0 against 12.2 at gate width 32.
+        Roughly 2x, and where the optimum sits moves with the shape, so it is measured rather than
+        ruled.
+
+        Below 16 the kernel loses `tl.dot` and falls back to a broadcast-sum with an [M, G, B]
+        intermediate, which at a wide batch tile measured 200-1200 us -- two orders of magnitude off,
+        and the reason a naive sweep must not simply take the smallest tile. Such tiles are therefore
+        offered only against the narrowest batch tile. But `GATE_TILE = 1` has to stay on the menu: a
+        single-node-block layer has one `rows` and, at small batch, one batch tile, so a 32-wide gate
+        tile leaves 2 programs for 188 SMs. Dropping it cost 1.2x -> 2.4x there, which is what the
+        [M, 1, B] intermediate buys back.
+
+        Trials run into a SCRATCH buffer. The kernel accumulates into the real one with `atomic_add`,
+        so timing candidates against it would add the log-Z term once per trial.
+        """
+        import triton
+        import pyjuice.layer.kernels.c as ck
+
+        key = ("logztile", batch, block_size, n_gates, rows)
+        pick = layer._bs_bw_gate_cache.get(key)
+        if pick is not None:
+            return pick
+
+        bcap = max(16, min(64, triton.next_power_of_2(batch)))
+        cands = [(gt, bb)
+                 for gt in (1, 8, 16, 32, 64) if gt <= max(1, triton.next_power_of_2(n_gates))
+                 for bb in (16, 32, 64) if bb <= bcap
+                 if gt >= 16 or bb == 16]
+
+        # RANKED before measuring, and only the finalists are timed. Every candidate that gets timed
+        # also gets COMPILED, and the constexprs differ per shape so nothing is reused between them --
+        # timing all of them put 230s of compilation into the test suite alone. The model only has to
+        # be good enough to keep the winner in the shortlist, which the measurement then confirms.
+        def _est(c):
+            gt, bb = c
+            gtiles = (n_gates + gt - 1) // gt
+            btiles = (batch + bb - 1) // bb
+            progs = gtiles * rows * btiles
+            # `node_flows` + `log Z` are [M, bb] per program and re-read once per gate tile; `sigma` is
+            # [M, gt] per program and re-read once per batch tile. Under-occupancy is what the two
+            # would otherwise be traded away for, so charge for it.
+            traffic = gtiles * rows * (batch * block_size * 8 + btiles * block_size * gt * 4)
+            starve = max(1.0, 376.0 / max(progs, 1))
+            # Below 16 gates the kernel loses `tl.dot` for a broadcast-sum over an [M, gt, B]
+            # intermediate, so its work grows with the tile rather than shrinking.
+            return traffic * starve * (gt if gt < 16 else 1)
+
+        # Ordered by FOOTPRINT for the fallback below: the narrowest tiles are the ones most likely to
+        # fit when the wide ones do not.
+        by_size = sorted(cands, key = lambda c: (c[1], c[0]))
+        short = sorted(cands, key = _est)[:4]
+        # The narrowest pair always stays on the shortlist. `_est` ranks by traffic, which favours WIDE
+        # tiles, so at a large block size every shortlisted candidate can be one that does not fit in
+        # shared memory -- measured at block_size 1024 / gate 4 / batch 1024, where all four needed
+        # 136-264 KB against a 101 KB limit, leaving nothing to measure.
+        if by_size and by_size[0] not in short:
+            short.append(by_size[0])
+
+        try:
+            scr = torch.empty_like(grad_ext)
+            # Shared memory is what rules a candidate out, and it is not worth modelling: Triton's own
+            # liveness decides which tiles are alive at once. Ask it, and drop what it refuses.
+            ok = []
+            for gt, bb in short:
+                try:
+                    launch(gt, bb, scr)
+                    ok.append((gt, bb))
+                except Exception:
+                    pass
+            # Every shortlisted candidate was refused. Widen to the whole set, narrowest first, and
+            # take the first that runs -- an unmeasured but WORKING tile beats the alternative, which
+            # was to return one of the candidates that had just raised and let the real launch fail.
+            if not ok:
+                for c in by_size:
+                    if c in short:
+                        continue
+                    try:
+                        launch(c[0], c[1], scr)
+                        ok.append(c)
+                        break
+                    except Exception:
+                        pass
+            torch.cuda.synchronize()
+            if len(ok) > 1:
+                trials = [(c, (lambda c = c: launch(c[0], c[1], scr))) for c in ok]
+                pick = ck.autotune(trials) or ok[0]
+            elif ok:
+                pick = ok[0]
+            del scr
+        except torch.cuda.OutOfMemoryError:
+            pick = None
+
+        if pick is None:
+            # Nothing fit, or the scratch buffer could not be allocated. Hand back the narrowest pair
+            # and let the real launch report the failure against the real operands.
+            pick = by_size[0] if by_size else (1, 16)
+        layer._bs_bw_gate_cache[key] = pick
+        return pick
 
     def _sigma(self, layer, params, pid, block_size, gate_cbs):
         """

@@ -44,7 +44,7 @@ def _bs_triton_ele_kernel(node_flows, element_flows, node_mars, element_mars, mp
                           BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
                           TL_DOT: tl.constexpr, GATE_CBS: tl.constexpr,
                           gate_stride: tl.constexpr, ext_base, WRITE_GRAD: tl.constexpr = 0,
-                          pid_m_offset = 0):
+                          GRAD_ATOMIC: tl.constexpr = 1, pid_m_offset = 0):
 
     pid_b = tl.program_id(0)                            # ID of size-`BLOCK_B` batches
     pid_m = tl.program_id(1) + pid_m_offset             # ID of size-`TILE_SIZE_M` nodes
@@ -126,19 +126,20 @@ def _bs_triton_ele_kernel(node_flows, element_flows, node_mars, element_mars, mp
         # `exp` do not. Only the number of emitted rows does. So accumulate over the TPB consecutive
         # k-tiles that share a parent block (and hence a gate row) and emit once per parent block.
         #
-        # Still an ATOMIC, though. A plain store is a lost update in three separate ways. It IS
-        # cheaper -- measured over the sweep in `grad_speed`, the gradient's cost against the ungated
-        # backward goes 1.12-1.40x with the atomic and 1.12-1.32x with a store, so a few percent --
-        # but the accumulation above already took the 5-15x, and these are the three collisions a
-        # store loses:
+        # A plain STORE where the rows are provably exclusive, an ATOMIC where they are not, decided
+        # at compile time by the launcher (`GRAD_ATOMIC`) -- the store is worth 4-7 us. A store is a
+        # lost update in three ways, and each is checkable before the launch:
         #   * when TILE_SIZE_M < GATE_CBS, `(tile_id * TILE_SIZE_M) // GATE_CBS` maps
         #     GATE_CBS // TILE_SIZE_M distinct `pid_m` programs onto ONE row, each holding its own
         #     partial sum over its own slice of that gate's children;
         #   * `tie_external` aliases a node's gradient rows across every layer holding a copy, and the
         #     buffer is zeroed once per backward (tensorcircuit.py) precisely so layers can accumulate;
         #   * two tied copies can even share a single layer, colliding two `eleblock_id` in one launch.
-        # The two CUDA element forks `atomicAdd` for the same reasons, and the three forks have to
-        # agree -- `_build_ele_plan` picks between them by speed alone.
+        # The last two show up as REPEATED VALUES in the gate table, which is what the launcher tests,
+        # rather than being reasoned about from `tie_external` alone.
+        #
+        # The two CUDA element forks always `atomicAdd`; the three forks have to agree numerically to
+        # within their own tolerance, and `_build_ele_plan` picks between them by speed alone.
         # Computed ONCE and shared with the flow accumulate below, which needs the same sum.
         partial_flows_max = emars + log_n_fdm_max + lphi
 
@@ -157,8 +158,12 @@ def _bs_triton_ele_kernel(node_flows, element_flows, node_mars, element_mars, mp
                 else:
                     grow = gbase + ext_base + (tile_id * TILE_SIZE_M) // GATE_CBS \
                            + tl.arange(0, 1)
-                tl.atomic_add(grad_ext + grow[:,None] * batch_size + offs_batch[None,:], gacc,
-                              mask = mask_batch[None,:] & (gbase >= 0))
+                if GRAD_ATOMIC:
+                    tl.atomic_add(grad_ext + grow[:,None] * batch_size + offs_batch[None,:], gacc,
+                                  mask = mask_batch[None,:] & (gbase >= 0))
+                else:
+                    tl.store(grad_ext + grow[:,None] * batch_size + offs_batch[None,:], gacc,
+                             mask = mask_batch[None,:] & (gbase >= 0))
                 gacc = gacc * 0.0
 
         acc = tl.where(partial_flows_max == -float("inf"),
