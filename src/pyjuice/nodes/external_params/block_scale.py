@@ -430,27 +430,45 @@ class BlockScaleSumParams(ExternalSumParams):
                 "`cids == 0` and `pids == 0` disagree on which compiled slots are padding; the " \
                 "padding convention this relaxation depends on has changed."
 
-            # ---- the CuTe fork's layout: contiguous children and block_size-strided params PER TILE
+            # ---- the CuTe fork reads the COMPILED TABLES at step-run granularity ----
+            #
+            # `step = min(node_cbs, 64)` is the widest run of compiled edge slots that the compile
+            # step GUARANTEES is contiguous in `element_mars` and `block_size`-strided in `params`:
+            # `_compile_partition_edge_block_ids` asserts "each edge block's children occupy a
+            # contiguous run of `cids`". So the kernel takes one `cids` / `pids` entry per step-run
+            # and issues one bulk transfer per run, instead of assuming a whole 64-wide tile is one
+            # run. That holds for ANY topology -- dense, ragged or block-sparse -- and it is why this
+            # fork no longer needs a contiguity test, a padding mask, or a bounds clamp:
+            #
+            #   * a padded run has `cids == 0` / `pids == 0`, the dummy `-inf` element and the dummy
+            #     zero parameter, exactly as the plain sum layer's padding works;
+            #   * a block-sparse row's runs simply sit at unrelated offsets, which is now expressible.
+            #
+            # The within-run property is still VERIFIED rather than trusted -- it is an invariant of
+            # another module, and a silent violation would be a wrong answer rather than a crash.
             if valid and num_edges % 64 == 0:
-                knt = num_edges // 64
-                c3, p3 = c2.view(-1, knt, 64), p2.view(-1, knt, 64)
-                pad3 = pad.view(-1, knt, 64)
-                # A wholly padded tile's base is the dummy (0), which is what the kernel wants: its
-                # derived lanes then land inside the dummy element / dummy parameter regions.
-                ebase = c3[:, :, 0].contiguous()
-                pbase = p3[:, :, 0].contiguous()
-                ar = torch.arange(64, device = cids.device, dtype = torch.int64)
+                step = min(node_cbs, 64)
+                nrun = num_edges // step
+                c3, p3 = c2.view(-1, nrun, step), p2.view(-1, nrun, step)
+                ar = torch.arange(step, device = cids.device, dtype = torch.int64)
 
-                if (bool(((c3 == ebase.unsqueeze(-1) + ar.view(1, 1, -1)) | pad3).all())
-                        and bool(((p3 == pbase.unsqueeze(-1) + ar.view(1, 1, -1) * block_size)
-                                  | pad3).all())):
-                    # A PART-PADDED tile keeps its REAL base, so its padded lanes derive
-                    # `pbase + j * block_size` past the row's own parameters -- and past the end of
-                    # `params` itself on the last row of the last gated layer. The kernel CLAMPS that
-                    # read (it takes `params.numel()`); see the note at its parameter-staging loop for
-                    # why the value does not matter and why `memcheck` cannot see the unclamped
-                    # version. Nothing to check here.
-                    calls.append((nids, ebase, pbase, gate, log_z,
+                # A run is all-or-nothing padded: padding is applied by whole edge blocks and a run
+                # lies inside one, so it cannot be part real and part padding. Asserted, because the
+                # verification below relies on it -- a padded run is all zeros rather than a
+                # contiguous run starting at zero, so it has to be excused rather than checked.
+                pad3 = pad.view(-1, nrun, step)
+                assert bool((pad3.any(-1) == pad3.all(-1)).all()), \
+                    "a step-run is part real and part padding, which the compiled layout should " \
+                    "make impossible (padding is by whole edge blocks)."
+                run_pad = pad3.all(-1).unsqueeze(-1)
+
+                if (bool(((c3 == c3[:, :, :1] + ar.view(1, 1, -1)) | run_pad).all())
+                        and bool(((p3 == p3[:, :, :1]
+                                   + ar.view(1, 1, -1) * block_size) | run_pad).all())):
+                    # The COMPILED TABLES go to the kernel unchanged -- no derived `ebase` / `pbase`
+                    # slices to build here or to drift from what the layer compiled.
+                    calls.append((nids, c3[:, :, 0].contiguous(), p3[:, :, 0].contiguous(),
+                                  gate, log_z,
                                   block_size, num_edges, node_cbs, gate_cbs, n_node_gates,
                                   ext_base, cfg))
 

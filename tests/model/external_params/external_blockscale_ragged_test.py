@@ -92,9 +92,20 @@ TOPOLOGIES = {
     "pad_tiles": (_eids([[0, 1, 2, 3], [0, 1, 2], [0, 1, 2], [0, 1, 2]]), 64,  64, 4),
     "mixed":     (_eids([[0, 1, 2, 3], [0, 1, 2], [0, 1, 2], [0, 1, 2]]), 64,  32, 4),
     "split":     (_eids([[0, 1, 2, 3, 4, 5, 6, 7], [0, 1, 2], [0, 1, 2], [0, 1, 2]]), 64, 32, 8),
+    # BLOCK-SPARSE: rows whose child blocks are NOT adjacent, so a 64-wide tile spans two runs that
+    # sit at unrelated offsets. Expressible only because the kernel reads `cids` per step-run.
+    "sparse":        (_eids([[0, 2], [0, 2], [1, 3], [1, 3]]),                   64, 32, 4),
+    "sparse_ragged": (_eids([[0, 1, 3], [0, 2], [1, 2, 3], [3]]),                64, 32, 4),
 }
 
+# PADDED topologies -- rows with differing edge-block counts. The padding-specific structural tests
+# below are parameterized over these.
 RAGGED = ["pad_tiles", "mixed", "split"]
+# BLOCK-SPARSE topologies -- non-adjacent child blocks. `sparse` is rectangular (every row has the
+# same count) so it carries NO padding; `sparse_ragged` has both.
+SPARSE = ["sparse", "sparse_ragged"]
+# Everything the numeric tests must cover.
+NONDENSE = RAGGED + SPARSE
 
 
 def _build(name, gate_cbs = 8, seed = 0, gated = True):
@@ -172,8 +183,11 @@ def test_the_topologies_compile_to_the_shapes_they_are_here_for(name):
     _, _, _, layer = _compile(name)
     census = _tile_census(layer)
 
-    if name == "dense":
-        assert census["padded_slots"] == 0, f"the control is not padding-free: {census}"
+    # `sparse` is deliberately RECTANGULAR -- every row has the same edge-block count -- so it carries
+    # no padding at all. It is here for non-adjacent child blocks, which is an independent axis; the
+    # two are combined in `sparse_ragged`.
+    if name in ("dense", "sparse"):
+        assert census["padded_slots"] == 0, f"{name} should be padding-free, got {census}"
     else:
         assert census["padded_slots"] > 0, f"{name} produced no padding at all: {census}"
 
@@ -245,57 +259,46 @@ def test_pfids_collide_only_through_padding(name):
             f"{name} partition {p}: real-slot pfids collide; masking alone will not make the " \
             f"non-atomic write safe"
 
-
 @cuda_only
 @needs_cute
-def test_block_sparse_topologies_are_still_refused():
-    """Relaxing the check for PADDING must not accidentally admit genuine block-sparsity: a row whose
-    child blocks are not adjacent has non-contiguous `cids` across REAL edges, which the base+stride
-    addressing cannot express at all.
+def test_block_sparse_topologies_are_supported():
+    """Rows whose child blocks are NOT adjacent, so a 64-wide tile spans two runs sitting at
+    unrelated offsets in `element_mars`.
 
-    The child block size matters here and is not incidental. Contiguity is checked WITHIN each 64-wide
-    tile, so at `ch_block_size == 64` every edge block is exactly one tile and is trivially contiguous
-    however sparse the topology is -- a first version of this test used 64 and passed against a
-    topology it believed it was rejecting. Non-adjacency is only expressible to the kernel when a tile
-    SPANS several edge blocks, i.e. `ch_block_size < 64`."""
-    dev = torch.device("cuda:0")
-    edge_ids = _eids([[0, 2], [0, 2], [1, 3], [1, 3]])
-    torch.manual_seed(0)
-    with juice.set_block_size(32):
-        ni = [inputs(v, num_node_blocks = 4, dist = dists.Categorical(num_cats = NUM_CATS))
-              for v in range(2)]
-        prod = multiply(*ni)
-    ns = summate(prod, num_node_blocks = 4, edge_ids = edge_ids, block_size = 64,
-                 external_params = BlockScaleSumParams(ch_block_size = 8))
-    root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
+    These used to be refused, and not incidentally: the fork took ONE base per 64-wide tile and
+    derived every lane from it, which cannot express a tile that straddles a gap. Reading `cids` /
+    `pids` per step-run removes the assumption instead of working around it -- a run's base comes
+    from the table, so where the runs sit relative to one another stops mattering.
 
-    torch.manual_seed(0)
-    root.init_parameters(perturbation = 2.0)
-    pc = juice.compile(root, verbose = False).to(dev)
+    The child block size is load-bearing in the other direction here: at `ch_block_size >= 64` each
+    edge block IS one tile, so any sparsity is trivially expressible and proves nothing. The gap is
+    only visible when a tile spans several edge blocks. An earlier version of this test used 64 and
+    passed against a topology it believed it was rejecting, which is why the straddle is asserted."""
+    for name in ("sparse", "sparse_ragged"):
+        pc, root, ns, layer, data, phi = _run(name, batch = 64)
 
-    # The topology must actually be non-contiguous for real edges, or this proves nothing.
-    layer = [l for gg in pc.inner_layer_groups if gg.is_sum() for l in gg.layers
-             if hasattr(l, "external_node_infos")][0]
-    noncontig = False
-    for p in range(layer.num_fw_partitions):
-        cids = layer.partitioned_cids[p].to(torch.int64)
-        E = cids.size(1)
-        if E % 64:
-            continue
-        c3 = cids.view(-1, E // 64, 64)
-        ar = torch.arange(64, device = cids.device)
-        real = c3 != 0
-        if not bool((((c3 == c3[:, :, :1] + ar.view(1, 1, -1)) | ~real)).all()):
-            noncontig = True
-    assert noncontig, \
-        "this topology's real edges are still tile-contiguous, so it does not exercise block-sparsity"
+        straddles = False
+        for p in range(layer.num_fw_partitions):
+            cids = layer.partitioned_cids[p].to(torch.int64)
+            E = cids.size(1)
+            if E % 64:
+                continue
+            c3 = cids.view(-1, E // 64, 64)
+            ar = torch.arange(64, device = cids.device)
+            real = c3 != 0
+            if not bool(((c3 == c3[:, :, :1] + ar.view(1, 1, -1)) | ~real).all()):
+                straddles = True
+        assert straddles, f"{name} is tile-contiguous, so it does not exercise block-sparsity"
 
-    torch.manual_seed(7)
-    data = torch.randint(0, NUM_CATS, [64, 2], device = dev)
-    phi = torch.randn(_gate_shape(ns, 64), device = dev)
+        lls = pc(data, sum_external_params = {ns: phi})
+        assert torch.isfinite(lls).all(), f"{name}: non-finite lls"
+        pc.backward(data, flows_memory = 0.0)
+        ref_ef, ref_pf = _flow_reference(pc, ns, phi, 8, 64)
+        ns.update_param_flows(pc.param_flows)
+        got = ns.get_param_flows().double().to(ref_pf.device)
+        d = float(((got - ref_pf).abs() / ref_pf.clamp(min = 1e-30)).max())
+        assert d < 3e-3, f"{name}: param flows off by {d} (relative)"
 
-    with pytest.raises(NotImplementedError):
-        pc(data, sum_external_params = {ns: phi})
 
 
 # --------------------------------------------------------------------------------- numeric
@@ -303,7 +306,7 @@ def test_block_sparse_topologies_are_still_refused():
 
 @cuda_only
 @needs_cute
-@pytest.mark.parametrize("name", RAGGED)
+@pytest.mark.parametrize("name", NONDENSE)
 @pytest.mark.parametrize("batch", [64, 256])
 def test_forward_matches_materialized_pc(name, batch):
     """The gated ragged forward against a plain PC carrying the effective per-sample parameters --
@@ -411,7 +414,7 @@ def test_the_gradient_store_is_declined_where_padded_tiles_alias_a_real_gate(nam
 
 @cuda_only
 @needs_cute
-@pytest.mark.parametrize("name", RAGGED)
+@pytest.mark.parametrize("name", NONDENSE)
 def test_backward_matches_reference_over_repeats(name):
     """Both flows against the float64 reference, REPEATED -- the param-flow corruption this guards
     against appeared in as few as 1 run in 8, so each repeat is checked, not just the last."""
@@ -436,7 +439,7 @@ def test_backward_matches_reference_over_repeats(name):
 
 @cuda_only
 @needs_cute
-@pytest.mark.parametrize("name", RAGGED)
+@pytest.mark.parametrize("name", NONDENSE)
 def test_param_flows_are_bit_stable_across_repeats(name):
     """Structural companion to the tolerance check above: a lost update leaves an absolute error
     smaller than this suite's element-flow tolerance, so the tolerance alone cannot see it. Repeated
@@ -454,7 +457,7 @@ def test_param_flows_are_bit_stable_across_repeats(name):
 
 @cuda_only
 @needs_cute
-@pytest.mark.parametrize("name", RAGGED)
+@pytest.mark.parametrize("name", NONDENSE)
 def test_unconnected_gate_cells_get_exactly_zero_gradient(name):
     """A gate cell lies inside exactly one (node block, child block) pair -- `validate_ns` forbids a
     gate coarser than either -- so a cell whose pair is absent from `edge_ids` is wholly undefined and

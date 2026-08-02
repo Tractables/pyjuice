@@ -362,7 +362,14 @@ def _bs_triton_phigrad_logz_kernel(node_flows, log_z, sigma, ext, gate, grad_ext
                  mask = mask_batch[None,:], other = 0.0)
     j = offs_g // N_CHILD_GATES
     d = offs_g % N_CHILD_GATES
-    gbase = tl.load(gate + pid_nb * gate_stride + j, mask = mask_g, other = -1)
+    # BOUNDED by the gate table's width, exactly as in `_bs_triton_par_kernel`. `n_gates` is derived
+    # from the compiled `num_edges`, which is padded up to a power of two, while the table is only
+    # `ext_max_n_eblks` wide -- so whenever the widest row's edge-block count is not a power of two
+    # the column runs past the row and picks up the NEXT row's gate, which is a valid `>= 0` offset
+    # and therefore survives the `gbase >= 0` masks below. MEASURED on a block-sparse ragged layer
+    # (`n_eblks = 4`, `gate_stride = 3`): an out-of-bounds atomic 349 KB past the gradient buffer.
+    # Unreachable until the forward began accepting layers whose rows differ in edge-block count.
+    gbase = tl.load(gate + pid_nb * gate_stride + j, mask = mask_g & (j < gate_stride), other = -1)
     row = gbase + ext_base + d
     lphi = tl.load(ext + row[:,None] * batch_size + offs_batch[None,:],
                    mask = mask_g[:,None] & mask_batch[None,:] & (gbase >= 0)[:,None],
