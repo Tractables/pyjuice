@@ -677,3 +677,52 @@ def test_two_gated_ns_in_one_sum_layer(label, kwargs):
     pc.backward(data, flows_memory = 0.0)
     s1.update_param_flows(pc.param_flows)
     assert not torch.allclose(n0_before, n0_before * 0), "degenerate flows; the check is vacuous"
+
+
+@cuda_only
+@needs_cute
+@pytest.mark.parametrize("name", HAS_UNCONNECTED)
+def test_unconnected_gate_cells_are_never_read(name):
+    """The gate grid is DENSE -- an entry for every (node block, child block) pair, including ones
+    `edge_ids` does not connect -- so the caller supplies values that must be ignored. The staging
+    copy is topology-agnostic and copies them into the buffer regardless; what makes that sound is
+    that nothing ever reads them back, because `ext_slots` and `_gate_bw_table` only ever address
+    connected cells.
+
+    Poisoning them with NaN is what makes this a proof rather than a hope: a value that is merely
+    unused cannot be distinguished from one that is used and happens not to matter, but a NaN that is
+    read propagates through every subsequent `exp`, `max` and accumulate and cannot hide. Strictly
+    stronger than `test_unconnected_gate_cells_get_exactly_zero_gradient`, which only shows nothing
+    WRITES their gradient.
+
+    This is the property that lets the dense grid serve ragged and block-sparse topologies without a
+    flat per-parameter-block layout: the unused entries cost memory, and nothing else."""
+    gate_cbs, batch = 8, 64
+    pc, root, ns, layer, data, phi = _run(name, batch = batch, gate_cbs = gate_cbs)
+    _, n_child_gates = ns.external_params.gate_counts(ns)
+
+    def evaluate(gates):
+        lls = pc(data, sum_external_params = {ns: gates}).clone()
+        pc.backward(data, flows_memory = 0.0)
+        ns.update_param_flows(pc.param_flows)
+        return lls, ns.get_param_flows().clone()
+
+    lls_clean, pf_clean = evaluate(phi)
+
+    connected = {(int(a), int(b)) for a, b in zip(ns.edge_ids[0], ns.edge_ids[1])}
+    poisoned = phi.clone()
+    n = 0
+    for nb in range(int(ns.edge_ids[0].max()) + 1):
+        for cb in range(ns.num_ch_node_blocks):
+            if (nb, cb) in connected:
+                continue
+            poisoned[:, nb, cb * n_child_gates:(cb + 1) * n_child_gates] = float("nan")
+            n += 1
+    assert n > 0, f"{name} has no unconnected cells, so this proves nothing"
+
+    lls_poisoned, pf_poisoned = evaluate(poisoned)
+
+    assert torch.equal(lls_clean, lls_poisoned), \
+        f"{name}: NaN in {n} unconnected gate cells changed the likelihoods -- something reads them"
+    assert torch.equal(pf_clean, pf_poisoned), \
+        f"{name}: NaN in {n} unconnected gate cells changed the parameter flows"
