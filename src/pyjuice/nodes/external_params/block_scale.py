@@ -403,16 +403,53 @@ class BlockScaleSumParams(ExternalSumParams):
             p2 = pids.to(torch.int64)
             ar_e = torch.arange(num_edges, device = cids.device, dtype = torch.int64)
 
+            # PADDED SLOTS ARE EXCUSED from the contiguity requirements below, because the kernels
+            # already compute exactly nothing for them.
+            #
+            # A row with fewer edge blocks than the partition's width is padded out with `cids == 0`
+            # and `pids == 0` -- the dummy element and the dummy parameter -- and that is an EXACT
+            # test, not a heuristic: a real child is an element `>= num_dummy_eles > 0` and a real
+            # parameter is `>= num_dummy_params > 0`.
+            #
+            # Requiring contiguity over such a slot is what refused every ragged topology. It is not
+            # something the kernels need. `ext_slots` carries `-1` for a padded EDGE BLOCK, the
+            # forward reads that as `log phi = -inf`, and the fold happens BEFORE the max-stabilizer
+            # is taken -- so a padded lane is `-inf` in the staged `element_mars` and contributes
+            # exactly zero to `N`, while its normalizer operand `exp(log phi - mz)` is exactly zero
+            # and so it contributes nothing to `Z` either. Neither depends on what the lane's DERIVED
+            # addresses (`ebase + j`, `pbase + j * block_size`) happen to read, which is what lets the
+            # base+stride addressing survive a padded -- even a part-padded -- tile. The gate table is
+            # indexed per edge block, which is FINER than the 64-wide tile, so this covers a tile that
+            # is part real and part padding, not merely a wholly padded one.
+            #
+            # What must still be refused is genuine BLOCK-SPARSITY: a row whose REAL children are not
+            # a contiguous run cannot be addressed from one base at all. Hence the mask rather than
+            # dropping the check.
+            pad = (c2 == 0) & (p2 == 0)
+            assert bool((((c2 == 0) == (p2 == 0))).all()), \
+                "`cids == 0` and `pids == 0` disagree on which compiled slots are padding; the " \
+                "padding convention this relaxation depends on has changed."
+
             # ---- the CuTe fork's layout: contiguous children and block_size-strided params PER TILE
             if valid and num_edges % 64 == 0:
                 knt = num_edges // 64
                 c3, p3 = c2.view(-1, knt, 64), p2.view(-1, knt, 64)
+                pad3 = pad.view(-1, knt, 64)
+                # A wholly padded tile's base is the dummy (0), which is what the kernel wants: its
+                # derived lanes then land inside the dummy element / dummy parameter regions.
                 ebase = c3[:, :, 0].contiguous()
                 pbase = p3[:, :, 0].contiguous()
                 ar = torch.arange(64, device = cids.device, dtype = torch.int64)
 
-                if (torch.equal(c3, ebase.unsqueeze(-1) + ar.view(1, 1, -1))
-                        and torch.equal(p3, pbase.unsqueeze(-1) + ar.view(1, 1, -1) * block_size)):
+                if (bool(((c3 == ebase.unsqueeze(-1) + ar.view(1, 1, -1)) | pad3).all())
+                        and bool(((p3 == pbase.unsqueeze(-1) + ar.view(1, 1, -1) * block_size)
+                                  | pad3).all())):
+                    # A PART-PADDED tile keeps its REAL base, so its padded lanes derive
+                    # `pbase + j * block_size` past the row's own parameters -- and past the end of
+                    # `params` itself on the last row of the last gated layer. The kernel CLAMPS that
+                    # read (it takes `params.numel()`); see the note at its parameter-staging loop for
+                    # why the value does not matter and why `memcheck` cannot see the unclamped
+                    # version. Nothing to check here.
                     calls.append((nids, ebase, pbase, pids, gate, log_z,
                                   block_size, num_edges, node_cbs, gate_cbs, n_node_gates,
                                   ext_base, cfg))
@@ -421,8 +458,13 @@ class BlockScaleSumParams(ExternalSumParams):
             if sb_ok:
                 eb_row = c2[:, 0].contiguous()
                 pb_row = p2[:, 0].contiguous()
-                if (torch.equal(c2, eb_row.unsqueeze(-1) + ar_e.view(1, -1))
-                        and torch.equal(p2, pb_row.unsqueeze(-1) + ar_e.view(1, -1) * block_size)):
+                if (bool(((c2 == eb_row.unsqueeze(-1) + ar_e.view(1, -1)) | pad).all())
+                        and bool(((p2 == pb_row.unsqueeze(-1) + ar_e.view(1, -1) * block_size)
+                                  | pad).all())
+                        # Same bound as the CuTe fork, but this one walks the WHOLE row from a single
+                        # base, so a padded row's derived reach is the row's full width rather than
+                        # one tile's -- correspondingly further past the end.
+                        and int(pb_row.max()) + num_edges * block_size <= params.numel()):
                     sb_calls.append((nids, eb_row, pb_row, gate, log_z,
                                      block_size, num_edges, node_cbs, gate_cbs, ext_base, 0))
 
@@ -621,6 +663,26 @@ class BlockScaleSumParams(ExternalSumParams):
         whatever produced it, so a future aliasing route cannot quietly slip past a `tie_external`
         check. Only the rows actually emitted are compared -- the table repeats a gate across the TPB
         k-tiles of one parent block BY DESIGN, and those are accumulated in-register before the write.
+
+        THAT GENERALITY IS WHAT MAKES RAGGED LAYERS SAFE, and it is worth spelling out because the
+        third aliasing route arrived later and by a completely different road. On a padded layer
+        `_gate_bw_table` hands a wholly-padded k-tile a REAL gate row -- its `ele_ebase` is the dummy
+        node 0, and the `searchsorted(...).clamp(min = 0)` below maps that onto the FIRST node block,
+        which is usually connected. Call it a phantom. A phantom is inert for the flows and for an
+        ATOMIC gradient (the tile's parents are dummy nodes, so `log_n_fdm_max` is -inf, the tile
+        drops, and `contrib` is exactly 0), but a STORE of that 0 would overwrite whatever the real
+        owner of that row had accumulated. MEASURED with the store forced on such a shape: the
+        reference-free zero-sum invariant goes from 3e-5 to 1.2e-1, and the error exceeds the
+        gradient's own magnitude.
+
+        No special case is needed, because a phantom IS a duplicated emitted row and duplicates are
+        exactly what this tests. Verified rather than assumed: on the padded shapes the FIRST
+        condition is False (the tile is not narrower than a gate, so it is not what declines the
+        store) and the duplicate count equals the phantom count. It is structural, not luck -- padding
+        is by whole parent blocks, so a padded block's every k-tile is a phantom including the one
+        that gets emitted. If `_gate_bw_table` is ever changed to return `-1` for padded tiles the
+        phantoms disappear, this returns True on ragged layers, and that is CORRECT -- there would
+        then be nothing to overwrite.
         """
         if ctx["TILE_SIZE_M"] < gate_cbs or self.tie_external:
             return False

@@ -181,6 +181,7 @@ __global__ void __launch_bounds__(WM * WN * 32) blockscale_tlmm_kernel(
         const long* __restrict__ gate, float* __restrict__ log_z_out,
         int batch, int block_size, int knt, int gate_stride,
         int node_cbs, int gate_cbs, int node_sh, int gate_sh, long ext_base, int pid_m_offset,
+        long mp_numel,
         const __grid_constant__ CUtensorMap desc) {
     constexpr int NTH = WM * WN * 32;
 
@@ -353,9 +354,27 @@ __global__ void __launch_bounds__(WM * WN * 32) blockscale_tlmm_kernel(
             }
             *(float4*)&sB2t(bb, e) = *(const float4*)r;
         }
+        // THE PARAMETER OFFSET IS CLAMPED, for the padded lanes of a PART-PADDED edge tile.
+        //
+        // This kernel takes one base per tile and DERIVES each lane as `pbase + j * block_size`,
+        // which is exact for every real lane (the plan verifies that by equality and refuses the fork
+        // otherwise). A tile that is part real and part padding keeps its real base, so its padded
+        // lanes derive addresses past the row's own parameters -- and for the last row of the last
+        // gated layer, past the end of `params` itself (measured: 1792 floats). The VALUE does not
+        // matter, since a padded lane's gate is `-inf` and its operand `exp(log phi - mz)` is exactly
+        // zero, but the READ must stay in bounds. Note `compute-sanitizer memcheck` does NOT flag it:
+        // `params` lives inside a larger caching-allocator block, so the access lands in memory torch
+        // owns and no fault is raised.
+        //
+        // Clamped to a MULTIPLE OF 8 because these are `float4` loads: `mp_numel - 8` on its own can
+        // be misaligned, and a misaligned 16-byte load is a fault of its own. Every real offset here
+        // is already a multiple of 8, so the clamp is a no-op except on the lanes it exists for.
+        const long mp_lim = (mp_numel - 8) & ~7L;
         for (int i = tid; i < (BM * BK) / 8; i += NTH) {
             int e = i / (BM / 8), mm = (i % (BM / 8)) * 8;
-            const float* g = &mp[pc + (long)e * block_size + mm];
+            long moff = pc + (long)e * block_size + mm;
+            moff = (moff < mp_lim) ? moff : mp_lim;
+            const float* g = &mp[moff];
             float4 a = *(const float4*)g, b = *(const float4*)(g + 4);
             bfloat16_t r[8];
             r[0] = static_cast<bfloat16_t>(a.x); r[1] = static_cast<bfloat16_t>(a.y);
@@ -417,7 +436,7 @@ static void launch_cfg(torch::Tensor node_mars, torch::Tensor element_mars, torc
                        torch::Tensor ext, torch::Tensor nids, torch::Tensor ebase,
                        torch::Tensor pbase, torch::Tensor gate, torch::Tensor log_z,
                        int batch, int block_size, int knt, int node_cbs, int gate_cbs,
-                       int node_sh, int gate_sh, long ext_base) {
+                       int node_sh, int gate_sh, long ext_base, long mp_numel) {
     // `gcbs_eff` mirrors the kernel: a gate may be wider than one edge tile
     constexpr int NTH = WM * WN * 32;
     int n_edge_rows = element_mars.size(0);
@@ -457,7 +476,7 @@ static void launch_cfg(torch::Tensor node_mars, torch::Tensor element_mars, torc
             gate.data_ptr<long>(),
             log_z.numel() ? log_z.data_ptr<float>() : nullptr,
             batch, block_size, knt, (int)gate.size(1),
-            node_cbs, gate_cbs, node_sh, gate_sh, ext_base, off, desc);
+            node_cbs, gate_cbs, node_sh, gate_sh, ext_base, off, mp_numel, desc);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 }
@@ -528,22 +547,22 @@ void blockscale_forward(torch::Tensor node_mars, torch::Tensor element_mars, tor
     switch (cfg) {
         case 0: launch_cfg<128, 64, 2, 2>(node_mars, element_mars, params, ext, nids, ebase, pbase,
                                           gate, log_z, batch, (int)block_size, knt,
-                                          (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base); break;
+                                          (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base, params.numel()); break;
         case 1: launch_cfg<64, 64, 2, 2>(node_mars, element_mars, params, ext, nids, ebase, pbase,
                                          gate, log_z, batch, (int)block_size, knt,
-                                         (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base); break;
+                                         (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base, params.numel()); break;
         case 2: launch_cfg<256, 64, 4, 2>(node_mars, element_mars, params, ext, nids, ebase, pbase,
                                           gate, log_z, batch, (int)block_size, knt,
-                                          (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base); break;
+                                          (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base, params.numel()); break;
         case 3: launch_cfg<128, 128, 2, 4>(node_mars, element_mars, params, ext, nids, ebase, pbase,
                                            gate, log_z, batch, (int)block_size, knt,
-                                           (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base); break;
+                                           (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base, params.numel()); break;
         case 4: launch_cfg<64, 64, 4, 2>(node_mars, element_mars, params, ext, nids, ebase, pbase,
                                          gate, log_z, batch, (int)block_size, knt,
-                                         (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base); break;
+                                         (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base, params.numel()); break;
         default: launch_cfg<128, 64, 4, 2>(node_mars, element_mars, params, ext, nids, ebase, pbase,
                                            gate, log_z, batch, (int)block_size, knt,
-                                           (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base); break;
+                                           (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base, params.numel()); break;
     }
 }
 

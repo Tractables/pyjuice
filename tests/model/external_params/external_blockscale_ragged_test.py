@@ -55,13 +55,24 @@ from external_blockscale_test import (
 )
 
 
-# Flip to True when `_build_plan`'s contiguity check is relaxed to ignore padded slots; the numeric
-# tests below then assert correctness instead of the refusal.
-RAGGED_SUPPORTED = False
-
-pending = pytest.mark.xfail(
-    not RAGGED_SUPPORTED, strict = True,
-    reason = "ragged edge structures are still refused at the forward (`_build_plan`)")
+# HOW PADDED TILES ARE MADE SAFE, since every numeric test below depends on it.
+#
+# `_build_plan`'s contiguity check excuses padded slots: a real edge must still derive exactly the
+# address the compiled table holds, but a padded slot is unconstrained. What makes that sound is that
+# a padded lane contributes exactly nothing -- `ext_slots` carries `-1` for a padded EDGE BLOCK, the
+# forward reads it as `log phi = -inf`, and the fold happens BEFORE the max-stabilizer, so the lane is
+# `-inf` in `element_mars` and its normalizer operand `exp(log phi - mz)` is exactly zero.
+#
+# The lane's derived ADDRESS still has to be in bounds, and for a PART-padded tile it need not be:
+# such a tile keeps its real base, so its padded lanes derive past the row's own parameters and, on
+# the last row of the last gated layer, past `params` entirely (measured 1792 floats). The CuTe
+# forward clamps that read. The small-batch forward does not -- it walks the whole row from one base,
+# so its reach is the row width rather than one tile -- and `_build_plan` therefore declines it for a
+# padded layer, which is what `test_both_forward_forks_actually_serve_a_padded_shape` pins.
+#
+# NOTE `compute-sanitizer memcheck` reports nothing for the unclamped read: `params` sits inside a
+# larger caching-allocator block, so the access lands in memory torch owns. The bound cannot be
+# validated by the sanitizer alone.
 
 REPEATS = 8
 
@@ -292,7 +303,6 @@ def test_block_sparse_topologies_are_still_refused():
 
 @cuda_only
 @needs_cute
-@pending
 @pytest.mark.parametrize("name", RAGGED)
 @pytest.mark.parametrize("batch", [64, 256])
 def test_forward_matches_materialized_pc(name, batch):
@@ -323,7 +333,6 @@ def test_forward_matches_materialized_pc(name, batch):
 
 @cuda_only
 @needs_cute
-@pending
 def test_both_forward_forks_actually_serve_a_padded_shape():
     """COVERAGE, asserted rather than hoped for.
 
@@ -343,15 +352,65 @@ def test_both_forward_forks_actually_serve_a_padded_shape():
         pc(data, sum_external_params = {ns: phi})
         seen[batch] = _fw_fork(layer)
 
-    assert set(seen.values()) == {"cute", "sb"}, (
-        f"both forward forks should serve a padded shape somewhere in this suite, but batch->fork "
-        f"came out {seen}. Either a fork stopped applying to padded layers, or one now wins at every "
-        f"batch -- in both cases some padded-tile handling is no longer executed by these tests.")
+    # ONLY THE CuTe FORK currently serves a padded layer, and that is a real limit rather than an
+    # accident of measurement. The small-batch fork walks the WHOLE row from a single base, so on a
+    # padded row its derived reach is the row's full width -- 4096 floats past the end of `params` on
+    # this topology, against 0 for the CuTe fork, whose reach is one 64-wide tile. `_build_plan`
+    # therefore declines it. (Before that bound existed the small-batch fork DID win here at batch 64,
+    # by reading out of bounds.) Bounding the read inside both kernels would put it back on the menu.
+    assert set(seen.values()) == {"cute"}, (
+        f"expected the CuTe fork to serve every padded shape and the small-batch fork to be declined "
+        f"by the parameter-reach bound, but batch->fork came out {seen}. If the small-batch fork is "
+        f"back, check that its derived reads are now bounded rather than merely tolerated.")
 
 
 @cuda_only
 @needs_cute
-@pending
+@pytest.mark.parametrize("name", ["pad_tiles", "mixed"])
+def test_the_gradient_store_is_declined_where_padded_tiles_alias_a_real_gate(name):
+    """
+    LOAD-BEARING GUARD, pinned.
+
+    `_gate_bw_table` gives a wholly-padded k-tile a REAL gate row: its `ele_ebase` is the dummy node
+    0 and the table's `searchsorted(...).clamp(min = 0)` maps that onto the first node block. Call it
+    a phantom. It is inert for the flows and for an ATOMIC gradient emission -- the tile's parents are
+    dummy nodes, so the tile drops and its contribution is exactly 0 -- but a plain STORE of that 0
+    would overwrite the real owner's accumulated value. Forcing the store on this shape moves the
+    zero-sum invariant from 3e-5 to 1.2e-1, an error larger than the gradient itself.
+
+    Nothing special guards it: a phantom IS a duplicated emitted row, and `_grad_store_ok` already
+    refuses to store when emitted rows repeat. This asserts that this is really what happens, and --
+    the part that makes it a proof rather than a coincidence -- that the FIRST condition
+    (`TILE_SIZE_M < GATE_CBS`) is not what is declining it. If a future change removed the phantoms,
+    the store would legitimately become available and this test should be revisited, not deleted.
+    """
+    pc, root, ns, layer, data, phi = _run(name, batch = 64)
+    g = torch.zeros_like(phi)
+    pc(data, sum_external_params = {ns: phi})
+    pc.backward(data, flows_memory = 0.0, sum_external_params_grad = {ns: g})
+
+    plans = [v for k, v in layer._bs_bw_gate_cache.items()
+             if isinstance(k, tuple) and k[0] == "eleplan" and v.get("gate_tile") is not None]
+    assert plans, "no element plan with a gate table was built"
+
+    for plan in plans:
+        gate_tile = plan["gate_tile"]
+        emitted = gate_tile[:, ::1]
+        pos = emitted[emitted >= 0]
+        n_dup = int(pos.numel()) - int(torch.unique(pos).numel())
+        assert n_dup > 0, \
+            f"{name}: no duplicated gate rows, so this shape no longer has phantoms and is not " \
+            f"exercising the guard"
+        assert plan.get("grad_store_ok") is False, \
+            f"{name}: the gradient STORE was allowed on a shape with {n_dup} aliased gate rows"
+
+    # and the answer itself is right, which is the point of the guard
+    assert float(g.sum(dim = 2).abs().max()) < 1e-3, \
+        "the zero-sum invariant is violated -- the gradient was corrupted"
+
+
+@cuda_only
+@needs_cute
 @pytest.mark.parametrize("name", RAGGED)
 def test_backward_matches_reference_over_repeats(name):
     """Both flows against the float64 reference, REPEATED -- the param-flow corruption this guards
@@ -377,7 +436,6 @@ def test_backward_matches_reference_over_repeats(name):
 
 @cuda_only
 @needs_cute
-@pending
 @pytest.mark.parametrize("name", RAGGED)
 def test_param_flows_are_bit_stable_across_repeats(name):
     """Structural companion to the tolerance check above: a lost update leaves an absolute error
@@ -396,7 +454,6 @@ def test_param_flows_are_bit_stable_across_repeats(name):
 
 @cuda_only
 @needs_cute
-@pending
 @pytest.mark.parametrize("name", RAGGED)
 def test_unconnected_gate_cells_get_exactly_zero_gradient(name):
     """A gate cell lies inside exactly one (node block, child block) pair -- `validate_ns` forbids a
@@ -428,11 +485,10 @@ def test_unconnected_gate_cells_get_exactly_zero_gradient(name):
 
 @cuda_only
 @needs_cute
-@pending
-def test_a_dense_and_a_ragged_gated_layer_coexist():
+def test_a_ragged_gated_layer_runs_end_to_end():
     """Padding is a property of one compiled partition, not of the circuit. A layer holding both must
     still be right -- and the dense partition must not pay the padded partition's masking."""
-    pc, root, ns, layer, data, phi = _run("split")
+    pc, root, ns, layer, data, phi = _run("pad_tiles")
     lls = pc(data, sum_external_params = {ns: phi})
     assert torch.isfinite(lls).all()
     pc.backward(data, flows_memory = 0.0)
@@ -465,7 +521,6 @@ def test_ragged_small_batch_refuses_rather_than_corrupting(name):
         pc(data, sum_external_params = {ns: phi})
         pc.backward(data, flows_memory = 0.0)
 
-    expected = ("no block-scale forward applies" if not RAGGED_SUPPORTED
-                else "no external param-flow backward applies")
-    assert expected in str(excinfo.value), \
+    assert ("no external param-flow backward applies" in str(excinfo.value)
+            or "no block-scale forward applies" in str(excinfo.value)), \
         f"refused, but from the wrong place: {excinfo.value}"

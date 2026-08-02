@@ -1308,10 +1308,17 @@ def test_a_layer_split_into_forward_partitions_compiles():
     (torch.tensor([[0, 0, 1], [0, 1, 1]]), "a row with fewer edge blocks than the widest"),
     (torch.tensor([[0, 0, 1, 1], [0, 1, 0, 1]])[:, :3], "the last row missing its second edge block"),
 ])
-def test_ragged_edge_structures_raise(edge_ids, why):
-    """Rows that do not all carry the same dense run of edge blocks get PADDED into a partition, and
-    padding breaks the contiguity both kernels index by. Rejected at the forward, before any of this
-    reaches the backward -- recorded here so the boundary is visible if it moves."""
+def test_ragged_edge_structures_run(edge_ids, why):
+    """Rows that do not all carry the same dense run of edge blocks get PADDED into a partition.
+
+    This used to be the boundary of the supported envelope: padding broke the contiguity both forward
+    kernels index by, and the layer was refused. The plan-time check now excuses padded slots -- a
+    real edge must still derive exactly the address the compiled table holds, but a padded one is
+    unconstrained, because its gate is `-inf` and it contributes nothing. So these now RUN.
+
+    Kept as a smoke test at the old boundary; the real coverage is in
+    `external_blockscale_ragged_test.py`, which checks both flows and the gate gradient against
+    oracles over repeats."""
     dev = torch.device("cuda:0")
     torch.manual_seed(0)
 
@@ -1330,8 +1337,11 @@ def test_ragged_edge_structures_raise(edge_ids, why):
     data = torch.randint(0, NUM_CATS, [64, 2], device = dev)
     phi = torch.randn(_gate_shape(ns, 64), device = dev)
 
-    with pytest.raises(NotImplementedError, match = "no block-scale forward applies"):
-        pc(data, sum_external_params = {ns: phi})
+    lls = pc(data, sum_external_params = {ns: phi})
+    assert torch.isfinite(lls).all(), f"non-finite lls on a ragged layer ({why})"
+
+    pc.backward(data, flows_memory = 0.0)
+    assert torch.isfinite(pc.param_flows).all() and float(pc.param_flows.abs().sum()) > 0.0
 
 
 
