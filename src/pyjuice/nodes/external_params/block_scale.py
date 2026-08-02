@@ -307,14 +307,12 @@ class BlockScaleSumParams(ExternalSumParams):
         from .kernels.c import get_cute_module, get_sb_module
         import pyjuice.layer.kernels.c as ck
 
+        # NEITHER CUDA extension is required any more. The CuTe forward needs nvcc, CUTLASS and
+        # sm_90+, and the small-batch forward needs nvcc, so a machine without a CUDA toolchain used
+        # to be refused outright here. The portable Triton fork below serves those machines -- slower
+        # than either, but the alternative was not running at all.
         mod = get_cute_module()
         sb_mod = get_sb_module()
-        if mod is None and sb_mod is None:
-            raise NotImplementedError(
-                "`BlockScaleSumParams` needs one of its CUDA extensions, and neither is available here "
-                "(the CuTe forward needs nvcc, CUTLASS and sm_90+; the small-batch forward needs only "
-                "nvcc). There is no Triton fallback -- see the compile warning above."
-            )
 
         if getattr(layer, "ext_slots", None) is None:
             raise NotImplementedError(
@@ -376,7 +374,7 @@ class BlockScaleSumParams(ExternalSumParams):
                     // external_params.element_size()) // batch_size
 
         dev = node_mars.device
-        calls, sb_calls, shift_args = [], [], []
+        calls, sb_calls, shift_args, log_zs = [], [], [], []
         for partition_id in range(layer.num_fw_partitions):
             nids = layer.partitioned_nids[partition_id]
             cids = layer.partitioned_cids[partition_id]
@@ -398,6 +396,7 @@ class BlockScaleSumParams(ExternalSumParams):
             # (see `pre_backward_layer`). Collected here rather than dug out of `calls` afterwards,
             # because the two kernels order their arguments differently.
             shift_args.append((nids, log_z, rows))
+            log_zs.append(log_z)
 
             c2 = cids.to(torch.int64)
             p2 = pids.to(torch.int64)
@@ -507,7 +506,48 @@ class BlockScaleSumParams(ExternalSumParams):
         if len(sb_calls) != layer.num_fw_partitions:
             sb_calls = []
 
+        # ---- the PORTABLE Triton fallback ----
+        #
+        # A FALLBACK, deliberately not an autotune candidate. Offered only where neither CUDA fork
+        # applies, so a shape they do serve keeps exactly the candidate list, the measurement and the
+        # pick it had before this existed -- and never pays to COMPILE a Triton kernel it would not
+        # use, which is the mistake that once put 230s of compilation into the test suite.
+        #
+        # It exists for reach rather than speed: both CUDA forks need nvcc (and the CuTe one CUTLASS
+        # and sm_90+), so without a CUDA toolchain this parameterization was refused outright rather
+        # than merely being slow. It also has no layout requirements at all, reading `nids`/`cids`/
+        # `pids` per lane, so it serves any topology the compiler produces.
         if not calls and not sb_calls:
+            import triton
+            tri_calls = []
+            for partition_id in range(layer.num_fw_partitions):
+                nids = layer.partitioned_nids[partition_id]
+                cids = layer.partitioned_cids[partition_id]
+                pids = layer.partitioned_pids[partition_id]
+                gate = layer.ext_slots[0][partition_id]
+                ne = cids.size(1)
+
+                tile_m = min(block_size, 16 if block_size >= 16 else block_size)
+                tile_k = min(ne, 64)
+                blk_b = min(triton.next_power_of_2(batch_size), 64)
+                tl_dot = 1 if (tile_m >= 16 and tile_k >= 16 and blk_b >= 16) else 0
+                tri_calls.append(dict(
+                    nids = nids, cids = cids.to(torch.int64), pids = pids.to(torch.int64),
+                    gate = gate, log_z = log_zs[partition_id],
+                    num_edges = ne, BLOCK_B = blk_b, TILE_SIZE_K = tile_k,
+                    K_NUM_TILES = triton.cdiv(ne, tile_k), TILE_SIZE_M = tile_m,
+                    BLOCK_SIZE_M = block_size, TL_DOT = tl_dot,
+                    grid = (triton.cdiv(batch_size, blk_b),
+                            nids.size(0) * (block_size // tile_m)),
+                ))
+
+            layer._bs_bw_state = {
+                "block_size": block_size, "batch_size": batch_size, "ext_base": ext_base,
+                "gate_cbs": gate_cbs, "node_cbs": node_cbs, "shift_args": shift_args,
+            }
+            return "triton", "fw", tri_calls
+
+        if False:
             raise NotImplementedError(
                 f"no block-scale forward applies to this layer: block_size={block_size}, "
                 f"batch={batch_size}, gate ch_block_size={gate_cbs}, CuTe tiles="
@@ -608,6 +648,26 @@ class BlockScaleSumParams(ExternalSumParams):
             layer._bs_fw_plan = entry
 
         mod, fname, calls = entry[1]
+
+        if mod == "triton":
+            # The portable fallback: `calls` are kwarg dicts rather than positional tuples, since
+            # this kernel takes its tiling as constexprs rather than a config id.
+            from .kernels.blockscale_forward import _bs_triton_fw_kernel
+            for c in calls:
+                _bs_triton_fw_kernel[c["grid"]](
+                    node_mars = node_mars, element_mars = element_mars, mparams = params,
+                    ext = external_params, gate = c["gate"], log_z = c["log_z"],
+                    nids = c["nids"], cids = c["cids"], pids = c["pids"],
+                    batch_size = node_mars.size(1), num_edges = c["num_edges"],
+                    BLOCK_B = c["BLOCK_B"], TILE_SIZE_K = c["TILE_SIZE_K"],
+                    K_NUM_TILES = c["K_NUM_TILES"], TILE_SIZE_M = c["TILE_SIZE_M"],
+                    BLOCK_SIZE_M = c["BLOCK_SIZE_M"], TL_DOT = c["TL_DOT"],
+                    NODE_CBS = layer._bs_bw_state["node_cbs"],
+                    GATE_CBS = layer._bs_bw_state["gate_cbs"],
+                    gate_stride = c["gate"].size(1),
+                    ext_base = layer._bs_bw_state["ext_base"], num_stages = 1)
+            return None
+
         fn = getattr(mod, fname)
         for args in calls:
             fn(node_mars, element_mars, params, external_params, *args)

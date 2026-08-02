@@ -726,3 +726,49 @@ def test_unconnected_gate_cells_are_never_read(name):
         f"{name}: NaN in {n} unconnected gate cells changed the likelihoods -- something reads them"
     assert torch.equal(pf_clean, pf_poisoned), \
         f"{name}: NaN in {n} unconnected gate cells changed the parameter flows"
+
+
+@cuda_only
+@pytest.mark.parametrize("name", ["dense", "pad_tiles", "mixed", "sparse_ragged", "narrow"])
+@pytest.mark.parametrize("batch", [8, 64])
+def test_the_portable_triton_forward_serves_every_topology(name, batch):
+    """The PORTABLE forward, exercised by hiding both CUDA extensions.
+
+    Note this test is NOT marked `needs_cute`: its whole point is the machine that cannot build them.
+    Both other forks are CUDA -- the CuTe one wants nvcc, CUTLASS and sm_90+, the small-batch one
+    wants nvcc -- so without a CUDA toolchain `BlockScaleSumParams` used to be refused outright
+    rather than merely being slow.
+
+    It also has no layout requirements at all: it reads `nids` / `cids` / `pids` PER LANE instead of
+    deriving addresses from a per-tile base, so it needs neither contiguous children nor strided
+    parameters, and padding is inert for the reason it is in the plain sum layer -- a padded slot's
+    `cids` is the dummy `-inf` element and its `pids` the dummy zero parameter. Hence the sweep over
+    dense, padded, mixed-tile, block-sparse and narrow-block topologies with no per-case handling.
+
+    Checked against the MATERIALIZED-PC oracle rather than against the CUDA forks, so a shared
+    misunderstanding between them cannot pass."""
+    gate_cbs = 8
+    import pyjuice.nodes.external_params.kernels.c as _kc
+    saved = _kc.get_cute_module, _kc.get_sb_module
+    _kc.get_cute_module = lambda: None
+    _kc.get_sb_module = lambda: None
+    try:
+        pc_a, root_a, ns_a, layer, data, phi = _run(name, batch = batch, gate_cbs = gate_cbs)
+        lls_a = pc_a(data, sum_external_params = {ns_a: phi})
+        assert layer._bs_fw_plan[1][0] == "triton", \
+            "the CUDA forks were hidden but a CUDA fork still ran"
+    finally:
+        _kc.get_cute_module, _kc.get_sb_module = saved
+
+    dev = torch.device("cuda:0")
+    root_b, ns_b = _build(name, gate_cbs = gate_cbs, gated = False)
+    pc_b = juice.compile(root_b, verbose = False).to(dev)
+    pc_b.input_layer_group.layers[0].params.copy_(pc_a.input_layer_group.layers[0].params)
+    _set_node_params(pc_b, root_b, pc_a.get_node_params(root_a))
+
+    for sample in (0, min(3, batch - 1)):
+        _set_node_params(pc_b, ns_b,
+                         _effective(pc_a.get_node_params(ns_a), phi[sample], ns_a, gate_cbs))
+        lls_b = pc_b(data[sample:sample + 1, :])
+        d = float((lls_a[sample] - lls_b[0]).abs())
+        assert d < 2e-3, f"{name} b={batch} sample {sample}: |dLL| = {d:.3e}"
