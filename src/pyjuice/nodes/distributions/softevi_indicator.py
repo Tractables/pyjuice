@@ -168,8 +168,8 @@ class SoftEvidenceIndicator(Distribution):
         mask_n = offsets_n < layer_num_nodes
 
         # Get all variable ids
-        vids = tl.load(vids_ptr + offsets_n) # [BLOCK_SIZE_N]
-        lvids = tl.load(var_idmapping_ptr + vids) # Variable ID for "this type of inputs"
+        vids = tl.load(vids_ptr + offsets_n, mask = mask_n, other = 0) # [BLOCK_SIZE_N]
+        lvids = tl.load(var_idmapping_ptr + vids, mask = mask_n, other = 0) # Variable ID for "this type of inputs"
 
         # Get latent offset of all nodes
         nids = tl.load(nids_ptr + offsets_n, mask = mask_n, other = 0)
@@ -206,8 +206,8 @@ class SoftEvidenceIndicator(Distribution):
         mask_n = offsets_n < layer_num_nodes
 
         # Get all variable ids
-        vids = tl.load(vids_ptr + offsets_n) # [BLOCK_SIZE_B]
-        lvids = tl.load(var_idmapping_ptr + vids) # Variable ID for "this type of inputs"
+        vids = tl.load(vids_ptr + offsets_n, mask = mask_n, other = 0) # [BLOCK_SIZE_B]
+        lvids = tl.load(var_idmapping_ptr + vids, mask = mask_n, other = 0) # Variable ID for "this type of inputs"
 
         # Get latent offset of all nodes
         nids = tl.load(nids_ptr + offsets_n, mask = mask_n, other = 0)
