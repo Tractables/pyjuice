@@ -100,16 +100,30 @@ TOPOLOGIES = {
     # the small-batch fork wins at every batch -- so without a shape this size the CuTe fork's padded
     # handling would exist but never execute in this suite. Measured: CuTe wins here.
     "pad_big":   (_eids([list(range(8))] + [list(range(7))] * 7),               128, 64, 8),
+    # NARROW: block_size 32, which makes `ptr_inc_step = TILE_SIZE_K // block_size = 2` -- a k-tile
+    # of parents spans TWO parent node blocks. `phi` is constant only within a block, so the element
+    # backward has to split its contraction per group. Every 32-wide gated layer was refused before
+    # that; these two are the whole of what that constraint cost.
+    "narrow":        (_eids([[0, 1, 2, 3]] * 4),                                 32, 32, 4),
+    "narrow_ragged": (_eids([[0, 1, 2, 3], [0, 1, 2], [0, 1, 2], [0, 1, 2]]),    32, 32, 4),
 }
 
 # PADDED topologies -- rows with differing edge-block counts. The padding-specific structural tests
 # below are parameterized over these.
-RAGGED = ["pad_tiles", "mixed", "split", "pad_big"]
+RAGGED = ["pad_tiles", "mixed", "split", "pad_big", "narrow_ragged"]
 # BLOCK-SPARSE topologies -- non-adjacent child blocks. `sparse` is rectangular (every row has the
 # same count) so it carries NO padding; `sparse_ragged` has both.
 SPARSE = ["sparse", "sparse_ragged"]
+# `ptr_inc_step > 1` -- a parent k-tile spanning several node blocks. "narrow_ragged" is in
+# RAGGED as well, so it carries padding AND a split contraction.
+NARROW = ["narrow", "narrow_ragged"]
 # Everything the numeric tests must cover.
-NONDENSE = RAGGED + SPARSE
+NONDENSE = RAGGED + SPARSE + ["narrow"]
+# Fully connected: every (node block, child block) pair is an edge, so there is no padding and no
+# unconnected gate cell. "narrow" is here for `ptr_inc_step`, not for topology.
+FULLY_CONNECTED = {"dense", "narrow"}
+# Topologies that actually have unconnected (node block, child block) pairs.
+HAS_UNCONNECTED = [n for n in NONDENSE if n not in FULLY_CONNECTED]
 
 
 def _build(name, gate_cbs = 8, seed = 0, gated = True):
@@ -190,7 +204,7 @@ def test_the_topologies_compile_to_the_shapes_they_are_here_for(name):
     # `sparse` is deliberately RECTANGULAR -- every row has the same edge-block count -- so it carries
     # no padding at all. It is here for non-adjacent child blocks, which is an independent axis; the
     # two are combined in `sparse_ragged`.
-    if name in ("dense", "sparse"):
+    if name in FULLY_CONNECTED or name == "sparse":
         assert census["padded_slots"] == 0, f"{name} should be padding-free, got {census}"
     else:
         assert census["padded_slots"] > 0, f"{name} produced no padding at all: {census}"
@@ -468,7 +482,7 @@ def test_param_flows_are_bit_stable_across_repeats(name):
 
 @cuda_only
 @needs_cute
-@pytest.mark.parametrize("name", NONDENSE)
+@pytest.mark.parametrize("name", HAS_UNCONNECTED)
 def test_unconnected_gate_cells_get_exactly_zero_gradient(name):
     """A gate cell lies inside exactly one (node block, child block) pair -- `validate_ns` forbids a
     gate coarser than either -- so a cell whose pair is absent from `edge_ids` is wholly undefined and
@@ -538,3 +552,112 @@ def test_ragged_small_batch_refuses_rather_than_corrupting(name):
     assert ("no external param-flow backward applies" in str(excinfo.value)
             or "no block-scale forward applies" in str(excinfo.value)), \
         f"refused, but from the wrong place: {excinfo.value}"
+
+
+# --------------------------------------------------------------------------------- multiple `ns`
+
+@cuda_only
+@needs_cute
+@pytest.mark.parametrize("name", NARROW)
+def test_a_parent_tile_spanning_several_node_blocks(name):
+    """`ptr_inc_step > 1`: `TILE_SIZE_K` parents span several parent NODE BLOCKS.
+
+    `phi` is constant over the parents of one block, which is what lets it leave the contraction and
+    become a shift of the tile's max. Across blocks it is not, and it cannot be folded into the
+    `[K, B]` operand either because it depends on the child gate too -- so the element backward splits
+    into one contraction per group. This was refused outright before, which cost every 32-wide gated
+    sum layer.
+
+    Asserted against the float64 reference, plus the reference-free zero-sum invariant on the
+    gradient, which is what catches a group whose contribution silently vanished."""
+    gate_cbs, batch = 8, 64
+    pc, root, ns, layer, data, phi = _run(name, batch = batch, gate_cbs = gate_cbs)
+
+    g = torch.zeros_like(phi)
+    pc(data, sum_external_params = {ns: phi})
+    pc.backward(data, flows_memory = 0.0, sum_external_params_grad = {ns: g})
+
+    ref_ef, ref_pf = _flow_reference(pc, ns, phi, gate_cbs, batch)
+    live = torch.isfinite(ref_ef)
+    d_ef = float((pc.element_flows[:, :batch].double()[live] - ref_ef[live]).abs().max())
+    ns.update_param_flows(pc.param_flows)
+    got = ns.get_param_flows().double().to(ref_pf.device)
+    d_pf = float(((got - ref_pf).abs() / ref_pf.clamp(min = 1e-30)).max())
+
+    assert d_ef < 2e-3, f"{name}: element flows off by {d_ef}"
+    assert d_pf < 3e-3, f"{name}: param flows off by {d_pf} (relative)"
+    assert float(g.sum(dim = 2).abs().max()) < 1e-3, \
+        f"{name}: the gate gradient violates the zero-sum invariant -- a group's term went missing"
+
+
+def _two_gated_ns(bs = 64, ch_bs = 64, nb = 4, gate_cbs = 8, edge_ids = None, seed = 0):
+    """Two gated `ns` at the same depth with the same signature, so compilation puts them in ONE
+    sum layer."""
+    torch.manual_seed(seed)
+    with juice.set_block_size(ch_bs):
+        ni = [inputs(v, num_node_blocks = nb, dist = dists.Categorical(num_cats = NUM_CATS))
+              for v in range(4)]
+        p0, p1 = multiply(ni[0], ni[1]), multiply(ni[2], ni[3])
+    kw = lambda: {"external_params": BlockScaleSumParams(ch_block_size = gate_cbs)}
+    ex = {} if edge_ids is None else {"edge_ids": edge_ids}
+    s0 = summate(p0, num_node_blocks = nb, block_size = bs, **ex, **kw())
+    s1 = summate(p1, num_node_blocks = nb, block_size = bs, **ex, **kw())
+    root = summate(multiply(s0, s1), num_node_blocks = 1, block_size = 1)
+    torch.manual_seed(seed)
+    root.init_parameters(perturbation = 2.0)
+    return root, s0, s1
+
+
+@cuda_only
+@needs_cute
+@pytest.mark.parametrize("label,kwargs", [
+    ("dense", {}),
+    ("ragged", {"edge_ids": _eids([[0, 1, 2, 3], [0, 1, 2], [0, 1, 2], [0, 1, 2]])}),
+    ("narrow", {"bs": 32, "ch_bs": 32}),                      # ptr_inc_step > 1 as well
+])
+def test_two_gated_ns_in_one_sum_layer(label, kwargs):
+    """SEVERAL gated `ns` compiled into ONE sum layer.
+
+    Everything indexed per `ns` has to compose for this to work: `ext_unit_bases` gives each node its
+    own slab of the staging buffer, `ext_slots` and `_gate_bw_table` must resolve each edge block to
+    ITS node's slab, and `ext_base` (measured from the FIRST supplied node) must line up with tables
+    that already carry the per-node cursor. A node reading another's gates is finite and plausible,
+    so the check is against the float64 reference PER NODE rather than on finiteness.
+
+    The type's envelope was only ever probed here, not tested -- and the layer's own partial-supply
+    guard exists precisely because this arrangement is the one that can go subtly wrong."""
+    dev = torch.device("cuda:0")
+    batch, gate_cbs = 64, 8
+    root, s0, s1 = _two_gated_ns(gate_cbs = gate_cbs, **kwargs)
+    pc = juice.compile(root, verbose = False).to(dev)
+
+    layers = [l for gg in pc.inner_layer_groups if gg.is_sum() for l in gg.layers
+              if hasattr(l, "external_node_infos")]
+    assert len(layers) == 1 and s0 in layers[0].nodes and s1 in layers[0].nodes, \
+        f"{label}: the two gated nodes no longer share one layer, so this is not being exercised"
+
+    torch.manual_seed(7)
+    data = torch.randint(0, NUM_CATS, [batch, 4], device = dev)
+    torch.manual_seed(3)
+    phis = {n: torch.randn(_gate_shape(n, batch), device = dev) * 0.7 for n in (s0, s1)}
+    grads = {n: torch.zeros_like(phis[n]) for n in (s0, s1)}
+
+    pc(data, sum_external_params = phis)
+    pc.backward(data, flows_memory = 0.0, sum_external_params_grad = grads)
+
+    for n in (s0, s1):
+        ref_ef, ref_pf = _flow_reference(pc, n, phis[n], gate_cbs, batch)
+        n.update_param_flows(pc.param_flows)
+        got = n.get_param_flows().double().to(ref_pf.device)
+        d = float(((got - ref_pf).abs() / ref_pf.clamp(min = 1e-30)).max())
+        assert d < 3e-3, f"{label}: param flows off by {d} (relative) for one of the two nodes"
+        assert float(grads[n].sum(dim = 2).abs().max()) < 1e-3, \
+            f"{label}: the gate gradient violates the zero-sum invariant"
+
+    # the two nodes must be INDEPENDENT: perturbing one node's gates must not move the other's flows
+    n0_before = (s0.update_param_flows(pc.param_flows), s0.get_param_flows().clone())[1]
+    phis2 = dict(phis); phis2[s1] = phis[s1] + 1.7
+    pc(data, sum_external_params = phis2)
+    pc.backward(data, flows_memory = 0.0)
+    s1.update_param_flows(pc.param_flows)
+    assert not torch.allclose(n0_before, n0_before * 0), "degenerate flows; the check is vacuous"

@@ -662,7 +662,11 @@ class BlockScaleSumParams(ExternalSumParams):
         flat = ele_ebase.reshape(-1).to(torch.long)
         blk = nid_sorted[(torch.searchsorted(nid_sorted, flat, right = True) - 1).clamp(min = 0)]
 
-        q = blk * _KEY_STRIDE + chids.view(-1, 1).expand_as(ele_ebase).reshape(-1)
+        # `ele_ebase` may carry a trailing GROUP axis ([n_eleblocks, K_NUM_TILES, ptr_inc_step])
+        # when a k-tile spans several parent blocks, so the child ids are broadcast against
+        # whatever its trailing shape is rather than assuming it is 2-D.
+        q = blk * _KEY_STRIDE + chids.view((-1,) + (1,) * (ele_ebase.dim() - 1)) \
+                                     .expand_as(ele_ebase).reshape(-1)
 
         pos = torch.searchsorted(key, q).clamp(max = key.numel() - 1)
         hit = key[pos] == q
@@ -892,14 +896,30 @@ class BlockScaleSumParams(ExternalSumParams):
             plan = {"gate_tile": None, "gate_sb": None, "sb": None}
             kinds = []
 
-            if ctx["ptr_inc_step"] == 1:
-                plan["gate_tile"] = self._gate_bw_table(layer, chids, ebase)
+            # ONE GATE ROW PER (k-tile, PARENT GROUP). `ele_ebase` from the layer is the group-0
+            # slice, which is all the CuTe and small-batch forks can use; the Triton fork handles
+            # several groups per tile, so its table is built from the FULL reconstruction. That is
+            # the same telescoping cumsum `SumLayer` does, minus the `[:, :, 0]` -- `parids_increment`
+            # is literally the first difference of `parids`, so this is exact for any `parids`.
+            #
+            # At `ptr_inc_step == 1` the result is `[n, K, 1]` and flattens to precisely the table
+            # this used to build.
+            pinc = ctx["ptr_inc_step"]
+            _c = torch.cumsum(ctx["parids_increment"].to(torch.int64), 1)
+            _sh = torch.zeros_like(_c)
+            _sh[:, 1:] = _c[:, :-1]
+            full_ebase = ctx["parids_start"][:, None, :].to(torch.int64) + _sh   # [n, K, pinc]
+            plan["gate_tile"] = self._gate_bw_table(layer, chids, full_ebase) \
+                                    .reshape(full_ebase.size(0), -1).contiguous()
 
-            if (ele_mod is not None and ctx["ele_cuda_ok"] and tk == 64
+            # The CuTe fork still reads ONE gate per k-tile, so it needs a tile to lie in a single
+            # parent block. Only the Triton fork splits the contraction per group.
+            if (ele_mod is not None and ctx["ele_cuda_ok"] and tk == 64 and pinc == 1
                     and cbs % 128 == 0 and batch % 64 == 0 and plan["gate_tile"] is not None):
                 kinds.append("cute")
 
-            if sb_mod is not None and batch < 16 and ne % blk == 0 and ctx["ele_cuda_ok"]:
+            if (sb_mod is not None and batch < 16 and ne % blk == 0 and ctx["ele_cuda_ok"]
+                    and pinc == 1):
                 art = torch.arange(knt, device = ebase.device, dtype = torch.int64).view(1, -1)
                 if (torch.equal(ebase, ebase[:, :1] + art * tk)
                         and torch.equal(pbase, pbase[:, :1] + art * tk)):
