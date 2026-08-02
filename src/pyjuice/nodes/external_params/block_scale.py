@@ -219,9 +219,23 @@ class BlockScaleSumParams(ExternalSumParams):
         # reduction per subgroup. Rejected here rather than silently mis-computed in the kernel.
         if gate_bs != ns.block_size:
             raise NotImplementedError(
-                f"a gate `block_size` smaller than the node's is not supported yet (got {gate_bs} vs "
-                f"{ns.block_size}). Refining the gate's `ch_block_size` is free and is usually what is "
-                f"wanted; splitting the node axis needs a separate kernel."
+                f"a gate `block_size` ({gate_bs}) smaller than the node's ({ns.block_size}) would vary "
+                f"`phi` ACROSS the nodes of one block, which cannot share the staged tile: the gate "
+                f"stops factoring out of the contraction, because it would then depend on the matmul's "
+                f"output row as well as on the child.\n\n"
+                f"Two ways to get what you want, and the first is usually right:\n"
+                f"  * refine the gate's `ch_block_size` instead. That axis is FREE -- the fold is "
+                f"elementwise in the child index -- and is what the type is designed around.\n"
+                f"  * if you specifically need a gate finer than {ns.block_size} along the NODE axis, "
+                f"build the node AT that size: `summate(..., block_size = {gate_bs}, "
+                f"external_params = BlockScaleSumParams(ch_block_size = ...))`, leaving the gate's "
+                f"`block_size` to default. This expresses the same model and asks you for the SAME "
+                f"gate tensor -- its shape is `num_nodes // gate_block_size` either way, so nothing "
+                f"in your code changes but this call.\n\n"
+                f"The second is not done for you because it taxes the whole layer rather than just "
+                f"the gate: the node tile of the standard kernels collapses with `block_size` (below "
+                f"the 16 rows an efficient MMA wants), and the compiled index tensors grow as "
+                f"`K^2 / block_size`. That is a real cost and it should be yours to choose."
             )
 
         if ns.edge_ids.size(1) == 1 and gate_cbs == ns.ch_block_size:

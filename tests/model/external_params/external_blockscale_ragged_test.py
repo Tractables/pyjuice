@@ -772,3 +772,60 @@ def test_the_portable_triton_forward_serves_every_topology(name, batch):
         lls_b = pc_b(data[sample:sample + 1, :])
         d = float((lls_a[sample] - lls_b[0]).abs())
         assert d < 2e-3, f"{name} b={batch} sample {sample}: |dLL| = {d:.3e}"
+
+
+@cuda_only
+@needs_cute
+def test_a_node_axis_gate_is_reachable_by_blocking_the_node_at_the_gate_size():
+    """A gate finer than `ns.block_size` along the NODE axis is refused -- `phi` would then depend on
+    the matmul's output row as well as the child, so it stops factoring out of the contraction.
+
+    But the model it describes is reachable: build the node AT the gate's block size. This pins the
+    part that makes that a real answer rather than a consolation -- the CALLER-FACING GATE TENSOR IS
+    THE SAME SHAPE either way, because it is `num_nodes // gate_block_size` in both cases and neither
+    `num_nodes` nor the gate size changed. So nothing in a caller's code moves except the `summate`
+    call, which is what lets the refusal above simply name the fix.
+
+    Asserted rather than described, because if it ever stopped holding the error message would be
+    telling people to do something that silently changes their tensor shape."""
+    dev = torch.device("cuda:0")
+    K, gate_bs, gate_cbs, batch = 256, 32, 8, 64
+
+    # refused, and specifically for the node axis
+    with pytest.raises(NotImplementedError, match = "ACROSS the nodes of one block"):
+        with juice.set_block_size(K):
+            ni = [inputs(v, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
+                  for v in range(2)]
+            summate(multiply(*ni), num_node_blocks = 1,
+                    external_params = BlockScaleSumParams(block_size = gate_bs,
+                                                          ch_block_size = gate_cbs))
+
+    # the same model, blocked at the gate's size
+    torch.manual_seed(0)
+    with juice.set_block_size(gate_bs):
+        ni = [inputs(v, num_node_blocks = K // gate_bs, dist = dists.Categorical(num_cats = NUM_CATS))
+              for v in range(2)]
+        ns = summate(multiply(*ni), num_node_blocks = K // gate_bs,
+                     external_params = BlockScaleSumParams(ch_block_size = gate_cbs))
+        root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
+    torch.manual_seed(0)
+    root.init_parameters(perturbation = 2.0)
+
+    shape = tuple(_gate_shape(ns, batch))
+    assert shape == (batch, K // gate_bs, ns.num_ch_nodes // gate_cbs), \
+        f"blocking at the gate size changed the caller's gate shape to {shape}; the refusal message " \
+        f"above tells people to make a change it claims is transparent"
+
+    pc = juice.compile(root, verbose = False).to(dev)
+    torch.manual_seed(7)
+    data = torch.randint(0, NUM_CATS, [batch, 2], device = dev)
+    torch.manual_seed(3)
+    phi = torch.randn(shape, device = dev) * 0.7
+    pc(data, sum_external_params = {ns: phi})
+    pc.backward(data, flows_memory = 0.0)
+
+    ref_ef, ref_pf = _flow_reference(pc, ns, phi, gate_cbs, batch)
+    ns.update_param_flows(pc.param_flows)
+    got = ns.get_param_flows().double().to(ref_pf.device)
+    d = float(((got - ref_pf).abs() / ref_pf.clamp(min = 1e-30)).max())
+    assert d < 3e-3, f"node-axis gate via re-blocking: param flows off by {d} (relative)"
