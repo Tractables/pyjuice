@@ -100,6 +100,28 @@ def device_grad_controller(device, no_grad = True):
 from pyjuice.nodes.external_params.external_params import ExternalSumParams
 
 
+def _staging_transpose_fn():
+    """
+    The tiled-transpose backend for staging: the CUDA extension if it built, Triton otherwise, or None
+    to fall back to a generic strided `copy_`.
+
+    Behind ONE function so a test can force each tier. The fallbacks are otherwise unreachable on any
+    machine where the extension compiled -- which is how a shape bug lived in one of them: staging a
+    whole GROUP hands this a flat destination, the per-node path hands it a storage-shaped one, and the
+    fallback only ever handled the second.
+    """
+    from pyjuice.nodes.external_params.kernels.c import get_module
+    mod = get_module()
+    if mod is not None:
+        return mod.staging_transpose
+
+    try:
+        from pyjuice.nodes.external_params.kernels.staging import staging_transpose_triton
+        return staging_transpose_triton
+    except Exception:
+        return None
+
+
 def _staged_copy(plain_d: list, plain_s: list, fast: list) -> None:
     """
     Issue the staging copies: a tiled transpose for the pairs that are one, a batched `copy_` for the
@@ -115,16 +137,23 @@ def _staged_copy(plain_d: list, plain_s: list, fast: list) -> None:
     test it cost more Python than the kernel saved in GPU time.
     """
     if fast:
-        from pyjuice.nodes.external_params.kernels.c import get_module
-        mod = get_module()
-        if mod is None:
-            for dst, src in fast:                     # no extension: fall back, still correct
-                plain_d.append(dst)
-                plain_s.append(src.permute(*range(1, src.dim()), 0))
-        else:
-            for dst, src in fast:
-                batch = src.size(0)
-                mod.staging_transpose(dst, src, batch, src.numel() // max(batch, 1))
+        fn = _staging_transpose_fn()
+        for dst, src in fast:
+            batch = src.size(0)
+            n = src.numel() // max(batch, 1)
+            if fn is not None:
+                fn(dst, src, batch, n)
+            else:
+                # NORMALIZE both shapes rather than assuming either. `dst` is flat for a whole-group
+                # stage (`_group_fast_stage` returns a `narrow` of the buffer) and storage-shaped for a
+                # per-node one, so the old `src.permute(...)` matched only the second -- a group stage
+                # raised a shape mismatch here. It never showed up because this branch is unreachable
+                # wherever the CUDA extension built, which is everywhere it was tested.
+                #
+                # `view`, not `reshape`: a non-contiguous destination has to raise rather than quietly
+                # copy into a temporary that is then discarded.
+                plain_d.append(dst.view(n, batch))
+                plain_s.append(src.view(batch, n).permute(1, 0))
 
     if plain_d:
         torch._foreach_copy_(plain_d, plain_s)

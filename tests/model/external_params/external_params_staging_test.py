@@ -557,3 +557,50 @@ if __name__ == "__main__":
     test_external_params_partial_supply()
     test_external_params_usage()
     test_lowrank_params_reaches_kernels()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a GPU")
+def test_every_staging_transpose_tier_agrees():
+    """REGRESSION. Staging picks a tiled-transpose backend at runtime -- the CUDA extension if it
+    built, Triton otherwise, a generic strided `copy_` if neither. Only the first is reachable on a
+    machine where the extension compiled, so the other two were never exercised, and the generic one
+    carried a shape bug.
+
+    `_staged_copy` is handed TWO destination shapes: staging a whole GROUP passes a FLAT slice of the
+    buffer (`_group_fast_stage` returns a `narrow`), while the per-node path passes a storage-shaped
+    view. The fallback did `src.permute(...)` and so matched only the second, which made a group stage
+    raise a shape mismatch -- correct caller code refused because of a build detail. Both shapes are
+    checked here, against all three tiers, which is what the end-to-end tests cannot do: they only ever
+    reach whichever backend the machine happens to have.
+
+    All three compute the same pure permutation, so they must agree BIT FOR BIT."""
+    from pyjuice.model import tensorcircuit as tc
+    from pyjuice.nodes.external_params.kernels.c import get_module
+    from pyjuice.nodes.external_params.kernels.staging import staging_transpose_triton
+
+    device = torch.device("cuda:0")
+    batch, n_blk, gates = 32, 7, 4               # `src` is [B, 7, 4], as a 7-step group would give
+    n = n_blk * gates
+
+    torch.manual_seed(0)
+    src = torch.randn([batch, n_blk, gates], device = device)
+    expect = src.permute(1, 2, 0).reshape(-1)    # storage layout: batch innermost
+
+    tiers = {"triton": staging_transpose_triton, "torch": None}
+    if get_module() is not None:
+        tiers["cuda"] = get_module().staging_transpose
+
+    orig = tc._staging_transpose_fn
+    try:
+        for name, fn in tiers.items():
+            tc._staging_transpose_fn = (lambda fn = fn: fn)
+
+            flat = torch.zeros([batch * n], device = device)          # a whole-group destination
+            tc._staged_copy([], [], [(flat, src)])
+            assert torch.equal(flat, expect), f"'{name}' tier, flat destination"
+
+            shaped = torch.zeros([n_blk, gates, batch], device = device)   # a per-node destination
+            tc._staged_copy([], [], [(shaped, src)])
+            assert torch.equal(shaped.reshape(-1), expect), f"'{name}' tier, storage-shaped destination"
+    finally:
+        tc._staging_transpose_fn = orig
