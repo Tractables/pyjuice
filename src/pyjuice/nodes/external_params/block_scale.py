@@ -631,6 +631,44 @@ class BlockScaleSumParams(ExternalSumParams):
         pos = emitted[emitted >= 0]
         return int(torch.unique(pos).numel()) == int(pos.numel())
 
+    def _par_write_flags(self, layer, cids, pfids):
+        """
+        `(PADDED, PF_ATOMIC)` for `_bs_triton_par_kernel`, cached per compiled partition.
+
+        This kernel is the sum layer's UNCONDITIONAL param fallback, so it runs precisely where
+        `_par_flow_collision_free` failed and the guarded CuTe / small-batch forks were skipped. It
+        therefore has to decide for itself what made the write unsafe:
+
+        * `PADDED` -- the partition has padded slots (`cids == 0`, exact: a real child is an element
+          `>= num_dummy_eles > 0`). Their `pfids` are all 0, which `param_flows` gives to a REAL edge
+          block, so a padded lane's `+0.0` read-add-store can discard a real update. Masked out.
+        * `PF_ATOMIC` -- the slots that are actually WRITTEN still collide, which masking cannot fix.
+          Parameter tying does this: two members of one tie group in the same layer share a
+          `_param_flow_range` and so compile to identical `pfids` rows.
+
+        Judged on the real slots alone, which is the point: a ragged untied layer collides only
+        through its padding, so masking restores collision-freedom and the fast non-atomic
+        read-add-store survives. Atomics are then paid only where they are genuinely required.
+
+        Cached because `torch.unique` on every backward would be a per-call cost on the hot path;
+        keyed by tensor identity, like `SumLayer._par_flow_collision_free` itself.
+        """
+        cache = getattr(layer, "_bs_bw_gate_cache", None)
+        if cache is None:
+            cache = layer._bs_bw_gate_cache = dict()
+
+        key = ("parwrite", id(cids), id(pfids))
+        flags = cache.get(key)
+        if flags is None:
+            real = cids != 0
+            padded = not bool(real.all())
+            written = pfids[real] if padded else pfids
+            flags = (1 if padded else 0,
+                     0 if layer._par_flow_collision_free(written.contiguous()) else 1)
+            cache[key] = flags
+
+        return flags
+
     def _bw_state(self, layer, node_mars, kwargs):
         """The forward's leftovers, checked against the call the backward is running under."""
         state = getattr(layer, "_bs_bw_state", None)
@@ -894,10 +932,22 @@ class BlockScaleSumParams(ExternalSumParams):
             gb = layer.ext_slots[0][ctx["partition_id"]]
             batch, blk, ne = ctx["batch_size"], ctx["block_size"], ctx["num_edges"]
 
+            # BOTH candidates below write `param_flows` non-atomically, and neither takes a padding
+            # mask. That is sound only because the sum layer reaches this hook from behind `par_ok`,
+            # which requires collision-free `pfids` AND edge-contiguous `cids`. Restated here as an
+            # assertion rather than left as an assumption: the guard lives in another file, and if it
+            # is ever loosened the failure mode is a silent lost update, not a crash.
+            assert layer._par_flow_collision_free(ctx["pfids"]) \
+                and bool((ctx["cids"] != 0).all()), \
+                "`_par_hook`'s forks assume collision-free `pfids` and unpadded `cids`; the sum " \
+                "layer's `par_ok` guard is supposed to have established both."
+
             def _cute(tgt):
                 par_mod.blockscale_par_backward(
                     tgt, ctx["node_flows"], ctx["node_mars"], ctx["element_mars"], ctx["params"],
                     external_params, ctx["nbase"], ctx["cbase"], ctx["pbase"], ctx["fbase"], gb,
+                    # trailing 0 = `use_atomic`: 0 read-add-store, 1 atomicAdd, 2 store-only. Safe at
+                    # 0 only under the assertion above.
                     batch, blk, ne, node_cbs, gate_cbs, ext_base, 0)
 
             def _triton(tgt):
@@ -915,7 +965,13 @@ class BlockScaleSumParams(ExternalSumParams):
                         TILE_SIZE_K = ctx["TILE_SIZE_K"], TILE_SIZE_M = ctx["TILE_SIZE_M"],
                         BLOCK_SIZE_M = blk, TL_DOT = ctx["TL_DOT"], NODE_CBS = node_cbs,
                         GATE_CBS = gate_cbs, gate_stride = gb.size(1), ext_base = ext_base,
-                        pid_m_offset = s0, num_stages = 1)
+                        pid_m_offset = s0, num_stages = 1,
+                        # Reached only from behind `par_ok` (sum_layer.py), which already requires
+                        # `_par_flow_collision_free` AND edge-contiguous `cids` -- so neither hazard
+                        # can apply here, and passing constants keeps this launch generating exactly
+                        # the code it did before the flags existed. Asserted, not assumed: if that
+                        # dispatch guard is ever loosened, this fires instead of losing updates.
+                        PADDED = 0, PF_ATOMIC = 0)
 
             cands = ([("cute", _cute)] if (par_mod is not None and ctx["cute_ok"]) else []) \
                     + [("triton", _triton)]
@@ -953,15 +1009,29 @@ class BlockScaleSumParams(ExternalSumParams):
 
         def _par_sb_hook(param_flows, node_flows, node_mars, element_mars, params, nids, cids, pids,
                          pfids, batch, blk_size, num_edges, partition_id):
+            # As in `_par_hook`: the small-batch fork's write is a plain read-add-store with no
+            # padding mask, sound only because its dispatch conjunction already tested
+            # `_par_flow_collision_free`. Asserted so a loosened guard fails loudly.
+            assert layer._par_flow_collision_free(pfids) and bool((cids != 0).all()), \
+                "`blockscale_sb_par_backward` assumes collision-free `pfids` and unpadded `cids`."
             sb_mod.blockscale_sb_par_backward(
                 param_flows, node_flows, node_mars, element_mars, params, external_params,
                 nids, cids, pids, pfids, layer.ext_slots[0][partition_id],
                 batch, blk_size, num_edges, node_cbs, gate_cbs, ext_base, 0)
 
         def _par_triton_hook(ctx):
-            """The gated param flows via Triton, for shapes no CUDA fork covers."""
+            """
+            The gated param flows via Triton, for shapes no CUDA fork covers.
+
+            This is the UNCONDITIONAL fallback, so unlike `_par_hook` and `_par_sb_hook` it cannot
+            assume anything: it is reached exactly when `_par_flow_collision_free` failed and those
+            two were skipped. `_par_write_flags` works out which hazard applies -- padded slots whose
+            write must be masked, colliding written slots that need an atomic, or (the common case)
+            neither.
+            """
             from .kernels.blockscale_backward import _bs_triton_par_kernel
             gb, grid = layer.ext_slots[0][ctx["partition_id"]], ctx["grid"]
+            padded, pf_atomic = self._par_write_flags(layer, ctx["cids"], ctx["pfids"])
             for s0 in range(0, grid[1], 32768):
                 cg = (grid[0], min(s0 + 32768, grid[1]) - s0)
                 _bs_triton_par_kernel[cg](
@@ -974,7 +1044,8 @@ class BlockScaleSumParams(ExternalSumParams):
                     TILE_SIZE_K = ctx["TILE_SIZE_K"], TILE_SIZE_M = ctx["TILE_SIZE_M"],
                     BLOCK_SIZE_M = ctx["block_size"], TL_DOT = ctx["TL_DOT"],
                     NODE_CBS = node_cbs, GATE_CBS = gate_cbs, gate_stride = gb.size(1),
-                    ext_base = ext_base, pid_m_offset = s0, num_stages = 1)
+                    ext_base = ext_base, pid_m_offset = s0, num_stages = 1,
+                    PADDED = padded, PF_ATOMIC = pf_atomic)
 
         layer._ext_bw_ele_hook = _ele_hook
         # Installed UNCONDITIONALLY, even without the CuTe param module: `_par_hook` falls back to its

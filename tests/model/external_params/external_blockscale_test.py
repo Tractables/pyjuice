@@ -986,6 +986,84 @@ def test_backward_with_tied_external_gates():
     assert not torch.allclose(ref, pc.param_flows)
 
 
+@cuda_only
+@needs_cute
+def test_param_tying_within_one_layer_accumulates_both_copies():
+    """
+    REGRESSION. Two members of one tie group in the SAME layer share a `_param_flow_range`, so their
+    compiled `pfids` rows are IDENTICAL. `SumLayer._par_flow_collision_free` therefore fails, which
+    skips the two guarded param forks and drops through to `_ext_bw_par_triton_hook` -- whose kernel
+    wrote `param_flows` with a NON-ATOMIC read-add-store. One copy's contribution was then simply
+    lost, race-dependently: 11 of 12 identical runs differed bitwise, with a spread of 38% of the
+    value, and the flows came out at roughly HALF of the correct sum.
+
+    The distinction from `test_backward_with_tied_external_gates` above is the whole point: that one
+    ties ACROSS depths, so each layer holds one copy and stays collision-free. Only siblings at the
+    same depth put two copies in one layer, which is why this went uncaught.
+
+    Asserted against the float64 reference rather than by repetition alone -- with exactly two
+    contributors an atomic add is commutative and therefore bit-stable, so a determinism check would
+    pass even if the accumulation were wrong.
+    """
+    dev = torch.device("cuda:0")
+    batch, bs, nb, gate_cbs = 64, 64, 4, 8
+    torch.manual_seed(0)
+
+    with juice.set_block_size(bs):
+        ni = [inputs(v, num_node_blocks = nb, dist = dists.Categorical(num_cats = NUM_CATS))
+              for v in range(4)]
+        s0 = summate(multiply(ni[0], ni[1]), num_node_blocks = nb,
+                     external_params = BlockScaleSumParams(ch_block_size = gate_cbs))
+        s1 = s0.duplicate(multiply(ni[2], ni[3]), tie_params = True)   # SIBLING -> same layer
+        root = summate(multiply(s0, s1), num_node_blocks = 1, block_size = 1)
+
+    torch.manual_seed(0)
+    root.init_parameters(perturbation = 2.0)
+    pc = juice.compile(root, verbose = False).to(dev)
+
+    layer = [l for gg in pc.inner_layer_groups if gg.is_sum() for l in gg.layers
+             if hasattr(l, "external_node_infos")][0]
+    assert s0 in layer.nodes and s1 in layer.nodes, \
+        "this topology no longer puts both tied copies in one layer, so the regression is not exercised"
+    assert any(not layer._par_flow_collision_free(layer.partitioned_pfids[p])
+               for p in range(layer.num_fw_partitions)), \
+        "the tied copies no longer share param-flow slots; the collision this guards is not exercised"
+
+    torch.manual_seed(7)
+    data = torch.randint(0, NUM_CATS, [batch, 4], device = dev)
+    torch.manual_seed(3)
+    phi0 = torch.randn(_gate_shape(s0, batch), device = dev) * 0.7
+    phi1 = torch.randn(_gate_shape(s1, batch), device = dev) * 0.7
+
+    pc(data, sum_external_params = {s0: phi0, s1: phi1})
+    pc.backward(data, flows_memory = 0.0)
+
+    s0.update_param_flows(pc.param_flows)
+    got = s0.get_param_flows().double()
+
+    # The oracle, once per copy. A tied copy owns no parameters (`get_node_params` gives `None`), so
+    # the source's theta stands in -- which is what tying means -- while each copy keeps its own
+    # children and its own gate.
+    theta0 = pc.get_node_params(s0)
+    orig = type(pc).get_node_params
+    type(pc).get_node_params = lambda self, ns: (theta0 if orig(self, ns) is None else orig(self, ns))
+    try:
+        ref0 = _flow_reference(pc, s0, phi0, gate_cbs, batch)[1]
+        ref1 = _flow_reference(pc, s1, phi1, gate_cbs, batch)[1]
+    finally:
+        type(pc).get_node_params = orig
+
+    both = (ref0 + ref1).to(got.device)
+    d_both = float(((got - both).abs() / both.clamp(min = 1e-30)).max())
+    assert d_both < 3e-3, f"tied param flows off by {d_both} (relative) from the sum of both copies"
+
+    # and positively: it must NOT match either copy alone, which is what the bug produced
+    for name, one in (("s0", ref0), ("s1", ref1)):
+        d_one = float(((got - one.to(got.device)).abs() / one.clamp(min = 1e-30).to(got.device)).max())
+        assert d_one > 0.5, \
+            f"tied param flows match {name} ALONE (rel {d_one}); one copy's contribution was dropped"
+
+
 # ------------------------------------------------------------------- backward, accumulation & repeats
 
 @cuda_only

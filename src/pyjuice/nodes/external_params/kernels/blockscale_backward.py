@@ -195,7 +195,8 @@ def _bs_triton_par_kernel(node_flows, node_mars, element_mars, mparams, param_fl
                           TILE_SIZE_K: tl.constexpr, TILE_SIZE_M: tl.constexpr,
                           BLOCK_SIZE_M: tl.constexpr, TL_DOT: tl.constexpr,
                           NODE_CBS: tl.constexpr, GATE_CBS: tl.constexpr,
-                          gate_stride: tl.constexpr, ext_base, pid_m_offset = 0):
+                          gate_stride: tl.constexpr, ext_base, pid_m_offset = 0,
+                          PADDED: tl.constexpr = 0, PF_ATOMIC: tl.constexpr = 0):
     """
     Gated parameter-flow backward, a fork of `_bk_triton_block_sparse_par_kernel_rmw`.
 
@@ -210,7 +211,28 @@ def _bs_triton_par_kernel(node_flows, node_mars, element_mars, mparams, param_fl
     `node_mars == -inf` branch untouched. `-inf` for an absent gate zeroes the edge through
     `exp(emars + ...)`, matching what the ungated kernel computes for a padded edge.
 
-    Non-atomic read-add-store, so it inherits the parent's requirement that `pfids` be collision-free.
+    THE WRITE IS NOT UNCONDITIONALLY SAFE, and the two flags say which hazard applies. Unlike the CuTe
+    and small-batch param forks -- which the sum layer only dispatches to from BEHIND
+    `_par_flow_collision_free` -- this kernel is the unconditional fallback (`_ext_bw_par_triton_hook`,
+    `sum_layer.py`), so it is reached exactly when that predicate FAILS. Two things make it fail, and
+    each needs its own flag:
+
+    * `PF_ATOMIC` -- two programs genuinely accumulate into ONE `param_flows` slot. Ordinary parameter
+      tying does this whenever two members of a tie group land in the same layer: compilation gives
+      them one `_param_flow_range`, so their compiled `pfids` rows are identical. A read-add-store then
+      loses one contributor's update. MEASURED on such a layer: 11 of 12 identical runs differed
+      bitwise, spread 38% of the value -- while the same shape untied, and the same collision on an
+      UNGATED layer (which correctly picks its atomic kernel at `sum_layer.py`'s par dispatch), are
+      both bit-stable over 12 runs.
+    * `PADDED` -- some compiled slots are padding. A padded slot carries `cids == 0`, `pids == 0` and
+      `pfids == 0`; `param_flows` has no dummy prefix, so slot 0 is owned by a REAL edge block. The
+      padded lane's `pflows` is already exactly zero, but the WRITE is not free: its read-add-store of
+      `+0.0` racing a real program's discards the real update. Masking the lane out of the write --
+      rather than tolerating it with an atomic -- also restores collision-freedom over the slots that
+      ARE written, which is what lets a ragged untied layer keep the fast non-atomic path.
+
+    The two are orthogonal and both default off, so a dense untied layer compiles to exactly the code
+    this kernel had before either flag existed.
     """
     pid_k = tl.program_id(0)
     pid_m = tl.program_id(1) + pid_m_offset
@@ -232,7 +254,19 @@ def _bs_triton_par_kernel(node_flows, node_mars, element_mars, mparams, param_fl
 
     # Each edge's gate row. Constant across the batch loop, so resolved once: which child block the
     # edge falls in picks the row, and where it sits inside that block picks the gate.
-    gbase = tl.load(gate + nblock_id * gate_stride + (offs_edge // NODE_CBS))
+    #
+    # The column is BOUNDED. `offs_edge` runs over the compiled `num_edges`, which is padded up to a
+    # power of two, while the gate table is only `ext_max_n_eblks` columns wide -- so whenever the
+    # widest row's edge-block count is not a power of two the column runs past the row and reads the
+    # NEXT row's gate, which is a valid `>= 0` offset and therefore silently defeats `ghas`; on the
+    # last row it reads past the tensor entirely. MEASURED on a uniform 3-edge-block layer at
+    # `node_cbs = 32`: 4 columns indexed against a 3-wide table, rows 0-2 picking up gates 16/32/48
+    # and row 3 running off the end. The CuTe fork guards exactly this (`j < gate_stride ? gt[j] : -1`)
+    # and the small-batch fork host-checks it; this one did neither. Unreachable today only because the
+    # forward refuses every layer with a padded column, so the bound goes in before that changes.
+    offs_gcol = offs_edge // NODE_CBS
+    gbase = tl.load(gate + nblock_id * gate_stride + offs_gcol,
+                    mask = offs_gcol < gate_stride, other = -1)
     grow = gbase + ext_base + ((offs_edge % NODE_CBS) // GATE_CBS)
     ghas = gbase >= 0
 
@@ -270,7 +304,23 @@ def _bs_triton_par_kernel(node_flows, node_mars, element_mars, mparams, param_fl
 
     parflow_start = tl.load(pfids + nblock_id * num_edges + offs_edge)
     offsets = offs_node[:,None] + parflow_start[None,:]
-    tl.store(param_flows + offsets, tl.load(param_flows + offsets) + pflows)
+
+    # `edge_start != 0` -- not `ghas` -- is the padding predicate. Real children are elements
+    # `>= num_dummy_eles > 0` and padding is element 0, so this is exact by construction and, unlike
+    # `ghas`, does not depend on the gate table being indexed correctly.
+    if PADDED:
+        wmask = (edge_start != 0)[None,:]
+        if PF_ATOMIC:
+            tl.atomic_add(param_flows + offsets, pflows, mask = wmask)
+        else:
+            tl.store(param_flows + offsets,
+                     tl.load(param_flows + offsets, mask = wmask, other = 0.0) + pflows,
+                     mask = wmask)
+    else:
+        if PF_ATOMIC:
+            tl.atomic_add(param_flows + offsets, pflows)
+        else:
+            tl.store(param_flows + offsets, tl.load(param_flows + offsets) + pflows)
 
 
 @triton_jit
