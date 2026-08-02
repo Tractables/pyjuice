@@ -832,17 +832,32 @@ def test_gate_gradients_are_real_not_zeros():
 def test_a_failed_backward_does_not_leave_the_kernels_installed():
     """The forks are installed on the layer for the duration of one backward. Left behind after a
     raise they would make the NEXT backward -- possibly an ungated one -- run a gated kernel against
-    a stale plan."""
-    pc, root, ns, data, phi, _ = _run(256, 32, 8, 64, scale = 1.0)
+    a stale plan.
 
-    with pytest.raises(NotImplementedError):
-        pc.backward(data, flows_memory = 0.0)
+    The failure is INJECTED rather than found in a shape, because every shape that used to raise here
+    has since been implemented (`block_size = 32`, then ragged below batch 16). Tying the test to
+    whichever shape happens to be unsupported meant rewriting it each time the envelope moved, and it
+    was never the point: what is under test is the `finally` in `ExternalParamsSumLayer.backward`, and
+    injecting the raise exercises it directly and permanently."""
+    pc, root, ns, data, phi, _ = _run(256, 128, 8, 64, scale = 1.0)
+
+    import pyjuice.nodes.external_params.block_scale as _bs
+
+    def boom(*args, **kwargs):
+        raise NotImplementedError("injected")
+
+    original = _bs.BlockScaleSumParams.post_backward_layer
+    _bs.BlockScaleSumParams.post_backward_layer = boom
+    try:
+        with pytest.raises(NotImplementedError, match = "injected"):
+            pc.backward(data, flows_memory = 0.0)
+    finally:
+        _bs.BlockScaleSumParams.post_backward_layer = original
 
     layer = [l for g in pc.inner_layer_groups if g.is_sum() for l in g.layers
              if hasattr(l, "external_node_infos")][0]
     assert layer._ext_bw_ele_hook is None and layer._ext_bw_par_hook is None
-    assert layer._ext_bw_par_sb_hook is None
-
+    assert layer._ext_bw_par_sb_hook is None and layer._ext_bw_par_triton_hook is None
 
 
 # ------------------------------------------------------------------- backward, in wider circuits
@@ -984,6 +999,141 @@ def test_backward_with_tied_external_gates():
     pc(data, sum_external_params = {s0: torch.zeros_like(phi)})
     pc.backward(data, flows_memory = 0.0)
     assert not torch.allclose(ref, pc.param_flows)
+
+
+@cuda_only
+@needs_cute
+@pytest.mark.parametrize("batch", [8, 14])
+def test_tied_transitions_below_batch_16(batch):
+    """REGRESSION, a homogeneous HMM. Every transition is tied into ONE param-flow slot, so `pfids`
+    collide by construction -- and below batch 16 the param flows route to the sparse path, whose only
+    gated hook used to sit behind `_par_flow_collision_free`. The layer therefore RAISED on an
+    ordinary model.
+
+    MEASURED cause, which is not the one it looks like: an HMM ties ACROSS DEPTHS, so each layer holds
+    one copy and its `pfids` stay collision-free (the same distinction as
+    `test_param_tying_within_one_layer_accumulates_both_copies`, which needs SIBLINGS to collide). The
+    blocker was instead `B_NUM_TILES == 1` in the dispatch conjunction -- a TRITON tiling quantity the
+    gated CUDA fork does not use, since one launch covers the whole batch. At `num_edges = 1024`,
+    `BLOCK_B` is 2 and `TILE_SIZE_B` 8, so batch 14 chops into 2 tiles and the shape was refused for a
+    reason unrelated to what the kernel can serve. Hence both batches: 8 fits one tile, 14 does not.
+
+    Correctness is the assertion, not merely running."""
+    dev = torch.device("cuda:0")
+    bs, nb, T = 128, 8, 6
+    torch.manual_seed(0)
+    with juice.set_block_size(bs):
+        z = inputs(0, num_node_blocks = nb, dist = dists.Categorical(num_cats = NUM_CATS))
+        src = summate(z, num_node_blocks = nb,
+                      external_params = BlockScaleSumParams(ch_block_size = 8))
+        cur = src
+        for t in range(1, T):
+            x = inputs(t, num_node_blocks = nb, dist = dists.Categorical(num_cats = NUM_CATS))
+            cur = src.duplicate(multiply(cur, x), tie_params = True)
+        root = summate(multiply(cur), num_node_blocks = 1, block_size = 1)
+    torch.manual_seed(0)
+    root.init_parameters(perturbation = 2.0)
+    pc = juice.compile(root, verbose = False).to(dev)
+
+    gated = [l for gg in pc.inner_layer_groups if gg.is_sum() for l in gg.layers
+             if hasattr(l, "external_node_infos")]
+    assert len(gated) > 1, "the tied transitions no longer span several layers"
+
+    torch.manual_seed(7)
+    data = torch.randint(0, NUM_CATS, [batch, T], device = dev)
+    torch.manual_seed(3)
+    phis = {}
+    for l in gated:
+        for info in l.external_node_infos:
+            phis.setdefault(info.ns,
+                            torch.randn(_gate_shape(info.ns, batch), device = dev) * 0.5)
+
+    pc(data, sum_external_params = phis)
+    pc.backward(data, flows_memory = 0.0)
+
+    assert torch.isfinite(pc.param_flows).all() and float(pc.param_flows.abs().sum()) > 0.0
+    ref_ef, ref_pf = _flow_reference(pc, src, phis[src], 8, batch)
+    live = torch.isfinite(ref_ef)
+    d_ef = float((pc.element_flows[:, :batch].double()[live] - ref_ef[live]).abs().max())
+    assert d_ef < 1e-3, f"element flows off by {d_ef} on a tied HMM at batch {batch}"
+
+
+@cuda_only
+@needs_cute
+def test_param_tying_within_one_layer_accumulates_both_copies():
+    """
+    REGRESSION. Two members of one tie group in the SAME layer share a `_param_flow_range`, so their
+    compiled `pfids` rows are IDENTICAL. `SumLayer._par_flow_collision_free` therefore fails, which
+    skips the two guarded param forks and drops through to `_ext_bw_par_triton_hook` -- whose kernel
+    wrote `param_flows` with a NON-ATOMIC read-add-store. One copy's contribution was then simply
+    lost, race-dependently: 11 of 12 identical runs differed bitwise, with a spread of 38% of the
+    value, and the flows came out at roughly HALF of the correct sum.
+
+    The distinction from `test_backward_with_tied_external_gates` above is the whole point: that one
+    ties ACROSS depths, so each layer holds one copy and stays collision-free. Only siblings at the
+    same depth put two copies in one layer, which is why this went uncaught.
+
+    Asserted against the float64 reference rather than by repetition alone -- with exactly two
+    contributors an atomic add is commutative and therefore bit-stable, so a determinism check would
+    pass even if the accumulation were wrong.
+    """
+    dev = torch.device("cuda:0")
+    batch, bs, nb, gate_cbs = 64, 64, 4, 8
+    torch.manual_seed(0)
+
+    with juice.set_block_size(bs):
+        ni = [inputs(v, num_node_blocks = nb, dist = dists.Categorical(num_cats = NUM_CATS))
+              for v in range(4)]
+        s0 = summate(multiply(ni[0], ni[1]), num_node_blocks = nb,
+                     external_params = BlockScaleSumParams(ch_block_size = gate_cbs))
+        s1 = s0.duplicate(multiply(ni[2], ni[3]), tie_params = True)   # SIBLING -> same layer
+        root = summate(multiply(s0, s1), num_node_blocks = 1, block_size = 1)
+
+    torch.manual_seed(0)
+    root.init_parameters(perturbation = 2.0)
+    pc = juice.compile(root, verbose = False).to(dev)
+
+    layer = [l for gg in pc.inner_layer_groups if gg.is_sum() for l in gg.layers
+             if hasattr(l, "external_node_infos")][0]
+    assert s0 in layer.nodes and s1 in layer.nodes, \
+        "this topology no longer puts both tied copies in one layer, so the regression is not exercised"
+    assert any(not layer._par_flow_collision_free(layer.partitioned_pfids[p])
+               for p in range(layer.num_fw_partitions)), \
+        "the tied copies no longer share param-flow slots; the collision this guards is not exercised"
+
+    torch.manual_seed(7)
+    data = torch.randint(0, NUM_CATS, [batch, 4], device = dev)
+    torch.manual_seed(3)
+    phi0 = torch.randn(_gate_shape(s0, batch), device = dev) * 0.7
+    phi1 = torch.randn(_gate_shape(s1, batch), device = dev) * 0.7
+
+    pc(data, sum_external_params = {s0: phi0, s1: phi1})
+    pc.backward(data, flows_memory = 0.0)
+
+    s0.update_param_flows(pc.param_flows)
+    got = s0.get_param_flows().double()
+
+    # The oracle, once per copy. A tied copy owns no parameters (`get_node_params` gives `None`), so
+    # the source's theta stands in -- which is what tying means -- while each copy keeps its own
+    # children and its own gate.
+    theta0 = pc.get_node_params(s0)
+    orig = type(pc).get_node_params
+    type(pc).get_node_params = lambda self, ns: (theta0 if orig(self, ns) is None else orig(self, ns))
+    try:
+        ref0 = _flow_reference(pc, s0, phi0, gate_cbs, batch)[1]
+        ref1 = _flow_reference(pc, s1, phi1, gate_cbs, batch)[1]
+    finally:
+        type(pc).get_node_params = orig
+
+    both = (ref0 + ref1).to(got.device)
+    d_both = float(((got - both).abs() / both.clamp(min = 1e-30)).max())
+    assert d_both < 3e-3, f"tied param flows off by {d_both} (relative) from the sum of both copies"
+
+    # and positively: it must NOT match either copy alone, which is what the bug produced
+    for name, one in (("s0", ref0), ("s1", ref1)):
+        d_one = float(((got - one.to(got.device)).abs() / one.clamp(min = 1e-30).to(got.device)).max())
+        assert d_one > 0.5, \
+            f"tied param flows match {name} ALONE (rel {d_one}); one copy's contribution was dropped"
 
 
 # ------------------------------------------------------------------- backward, accumulation & repeats
@@ -1164,23 +1314,37 @@ def test_shapes_only_the_triton_fork_reaches(num_latents, block_size, gate_cbs, 
 
 @cuda_only
 @needs_cute
-@pytest.mark.parametrize("num_latents,block_size,batch,why", [
-    (256, 32, 64, "a k-tile spanning several parent blocks (ptr_inc_step != 1)"),
+@pytest.mark.parametrize("num_latents,block_size,batch", [
+    (256, 32, 64),
+    (256, 32, 256),
+    (512, 32, 64),
 ])
-def test_backward_outside_the_kernels_regime_raises(num_latents, block_size, batch, why):
-    """The forward serves shapes the backward does not. Where the backward cannot follow it must raise,
-    because the standard kernels it would otherwise fall through to compute the UNGATED flows.
+def test_backward_where_a_k_tile_spans_several_parent_blocks(num_latents, block_size, batch):
+    """`ptr_inc_step > 1`: the tiling heuristic picks a k-tile of parents WIDER than a node block, so
+    one tile straddles several parent blocks.
 
-    One case is left. All three forks need every parent in a k-tile to belong to ONE parent node
-    block, because that is exactly what lets the gate factor out of the contraction -- so a small
-    `block_size`, where the tiling heuristic picks a k-tile wider than a node block, has no gated
-    kernel at all.
+    This used to be the last shape the backward refused, and the refusal was principled: `phi` is
+    constant over the parents of one block, which is exactly what lets it leave the contraction and
+    become a shift of the tile's max. Across blocks it is not, and it cannot ride in the `[K, B]`
+    operand either because it depends on the child gate as well. The element fork now splits into one
+    contraction per group, so the factorization holds again -- per group instead of per tile.
 
-    This pins the supported region: when this starts passing, a case has been implemented."""
+    It cost every 32-wide gated sum layer, which is what these shapes are.
+
+    (The docstring this replaces said "when this starts passing, a case has been implemented". It has.)
+    """
     pc, root, ns, data, phi, _ = _run(num_latents, block_size, 8, batch, scale = 1.0)
+    pc.backward(data, flows_memory = 0.0)
 
-    with pytest.raises(NotImplementedError, match = "no external element-flow backward applies"):
-        pc.backward(data, flows_memory = 0.0)
+    ref_ef, ref_pf = _flow_reference(pc, ns, phi, 8, batch)
+    live = torch.isfinite(ref_ef)
+    d_ef = float((pc.element_flows[:, :batch].double()[live] - ref_ef[live]).abs().max())
+    ns.update_param_flows(pc.param_flows)
+    got = ns.get_param_flows().double().to(ref_pf.device)
+    d_pf = float(((got - ref_pf).abs() / ref_pf.clamp(min = 1e-30)).max())
+
+    assert d_ef < 2e-3, f"element flows off by {d_ef}"
+    assert d_pf < 3e-3, f"param flows off by {d_pf} (relative)"
 
 
 @cuda_only
@@ -1191,9 +1355,10 @@ def test_a_layer_split_into_forward_partitions_compiles():
     `[rows, n_slots]` tensor with the layer-wide `[rows, max_n_eblks]` mask, and `juice.compile` raised
     `IndexError` -- refusing, at build time, the very shapes the check exists to validate.
 
-    Compiling is the whole assertion. The kernels themselves still decline this layer: a k-tile spans
-    several parent blocks (`ptr_inc_step != 1`), which is what lets the gate factor out of the
-    contraction, so the backward refuses -- clearly, and only once the shape is actually run."""
+    It also RUNS now. The backward used to decline it because a k-tile spans several parent blocks
+    (`ptr_inc_step != 1`) and `phi` is constant only within a block; the element fork now splits its
+    contraction per group, so the gate still factors out -- one shift per group instead of one per
+    tile."""
     dev = torch.device("cuda:0")
     torch.manual_seed(0)
 
@@ -1218,10 +1383,15 @@ def test_a_layer_split_into_forward_partitions_compiles():
     data = torch.randint(0, NUM_CATS, [16, 2], device = dev)
     phi = torch.randn(_gate_shape(ns, 16), device = dev)
 
-    # Declined, but declined properly -- not IndexError, and not a silent wrong answer.
-    with pytest.raises(NotImplementedError):
-        pc(data, sum_external_params = {ns: phi})
-        pc.backward(data, flows_memory = 0.0)
+    lls = pc(data, sum_external_params = {ns: phi})
+    assert torch.isfinite(lls).all()
+    pc.backward(data, flows_memory = 0.0)
+
+    ref_ef, ref_pf = _flow_reference(pc, ns, phi, 8, 16)
+    ns.update_param_flows(pc.param_flows)
+    got = ns.get_param_flows().double().to(ref_pf.device)
+    d = float(((got - ref_pf).abs() / ref_pf.clamp(min = 1e-30)).max())
+    assert d < 3e-3, f"param flows off by {d} (relative) on a split, multi-parent-block layer"
 
 
 @cuda_only
@@ -1230,10 +1400,17 @@ def test_a_layer_split_into_forward_partitions_compiles():
     (torch.tensor([[0, 0, 1], [0, 1, 1]]), "a row with fewer edge blocks than the widest"),
     (torch.tensor([[0, 0, 1, 1], [0, 1, 0, 1]])[:, :3], "the last row missing its second edge block"),
 ])
-def test_ragged_edge_structures_raise(edge_ids, why):
-    """Rows that do not all carry the same dense run of edge blocks get PADDED into a partition, and
-    padding breaks the contiguity both kernels index by. Rejected at the forward, before any of this
-    reaches the backward -- recorded here so the boundary is visible if it moves."""
+def test_ragged_edge_structures_run(edge_ids, why):
+    """Rows that do not all carry the same dense run of edge blocks get PADDED into a partition.
+
+    This used to be the boundary of the supported envelope: padding broke the contiguity both forward
+    kernels index by, and the layer was refused. The plan-time check now excuses padded slots -- a
+    real edge must still derive exactly the address the compiled table holds, but a padded one is
+    unconstrained, because its gate is `-inf` and it contributes nothing. So these now RUN.
+
+    Kept as a smoke test at the old boundary; the real coverage is in
+    `external_blockscale_ragged_test.py`, which checks both flows and the gate gradient against
+    oracles over repeats."""
     dev = torch.device("cuda:0")
     torch.manual_seed(0)
 
@@ -1252,8 +1429,11 @@ def test_ragged_edge_structures_raise(edge_ids, why):
     data = torch.randint(0, NUM_CATS, [64, 2], device = dev)
     phi = torch.randn(_gate_shape(ns, 64), device = dev)
 
-    with pytest.raises(NotImplementedError, match = "no block-scale forward applies"):
-        pc(data, sum_external_params = {ns: phi})
+    lls = pc(data, sum_external_params = {ns: phi})
+    assert torch.isfinite(lls).all(), f"non-finite lls on a ragged layer ({why})"
+
+    pc.backward(data, flows_memory = 0.0)
+    assert torch.isfinite(pc.param_flows).all() and float(pc.param_flows.abs().sum()) > 0.0
 
 
 

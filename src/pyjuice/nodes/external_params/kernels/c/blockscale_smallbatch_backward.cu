@@ -208,7 +208,10 @@ void blockscale_sb_ele_backward(torch::Tensor element_flows, torch::Tensor eleme
                                 torch::Tensor ext, torch::Tensor chids, torch::Tensor ebase,
                                 torch::Tensor pbase, torch::Tensor gate, torch::Tensor grad_ext,
                                 int64_t batch, int64_t block_size, int64_t cs_block_size,
-                                int64_t num_edges, int64_t gate_cbs, int64_t ext_base, int64_t cfg) {
+                                int64_t num_edges, // `padded` / `pf_atomic` precede `cfg`: the Python autotuner substitutes the LAST
+                                // argument when trying configs, so `cfg` must stay last.
+                                int64_t gate_cbs, int64_t ext_base,
+                                int64_t padded, int64_t pf_atomic, int64_t cfg) {
     int b = (int)batch, bs = (int)block_size, cs = (int)cs_block_size, ne = (int)num_edges;
     long eb_ = (long)ext_base;
     int warps = (cfg == 0) ? 8 : (cfg == 1) ? 16 : (cfg == 2) ? 4 : -1;
@@ -245,7 +248,21 @@ std::vector<int64_t> blockscale_sb_ele_configs() { return {8, 16, 4}; }  // WARP
 
 // --------------------------------------------------------------------------------- parameter flows
 
-template <int EY, int BMAX>
+// `PADDED` / `PF_ATOMIC` -- the same two hazards `_bs_triton_par_kernel` carries, for the same
+// reason. This kernel is now reached even when `pfids` are NOT collision-free, which is what the
+// layer's dispatch used to establish on its behalf:
+//
+//   * `PADDED` -- a padded compiled slot has `cids == 0` / `pids == 0` / `pfids == 0`, and
+//     `param_flows` has no dummy prefix, so pfid 0 belongs to a REAL edge block. The padded lane's
+//     contribution is already exactly zero, but its read-add-store of `+0.0` racing a real one
+//     discards the real update. Masking it out also restores collision-freedom over the slots that
+//     ARE written, which is what lets a ragged untied layer keep the non-atomic path.
+//   * `PF_ATOMIC` -- the written slots genuinely collide. Parameter tying does this: a tie group
+//     shares one `_param_flow_range`, so its members compile to identical `pfids`. A homogeneous HMM
+//     ties every transition into one slot, which is an ordinary model, not an edge case.
+//
+// Both default off, so a dense untied layer generates exactly the code it did before.
+template <int EY, int BMAX, bool PADDED, bool PF_ATOMIC>
 __global__ void bs_sb_par_kernel(float* __restrict__ param_flows, const float* __restrict__ node_flows,
                                  const float* __restrict__ node_mars, const float* __restrict__ element_mars,
                                  const float* __restrict__ params, const float* __restrict__ ext,
@@ -291,11 +308,19 @@ __global__ void bs_sb_par_kernel(float* __restrict__ param_flows, const float* _
         for (int b = 0; b < BMAX; b++) { if (b >= batch) break; s += __expf(pl[b] - mx); }
         term = s * __expf(mx);
     }
+    // `cids != 0` is the padding predicate -- exact by construction, since a real child is an element
+    // `>= num_dummy_eles > 0`, and unlike the gate it does not depend on the table being indexed right.
+    if (PADDED && child == 0) return;
+
     float val = params[pids[cb + e] + tile_id] * term;          // coalesced across lanes (node-contiguous)
-    param_flows[pfids[cb + e] + tile_id] += val;                // collision-free RMW, coalesced
+    if (PF_ATOMIC) {
+        atomicAdd(&param_flows[pfids[cb + e] + tile_id], val);
+    } else {
+        param_flows[pfids[cb + e] + tile_id] += val;            // collision-free RMW, coalesced
+    }
 }
 
-template <int EY, int BMAX>
+template <int EY, int BMAX, bool PADDED, bool PF_ATOMIC>
 static void launch_sb_par(torch::Tensor param_flows, torch::Tensor node_flows, torch::Tensor node_mars,
                           torch::Tensor element_mars, torch::Tensor params, torch::Tensor ext,
                           torch::Tensor nids, torch::Tensor cids, torch::Tensor pids, torch::Tensor pfids,
@@ -306,7 +331,7 @@ static void launch_sb_par(torch::Tensor param_flows, torch::Tensor node_flows, t
     dim3 grid((unsigned int)(nb * groups), (unsigned int)((num_edges + EY - 1) / EY));
     dim3 blk(32, EY);
     // Launch on the current stream so the kernel is captured correctly under CUDA-graph recording.
-    bs_sb_par_kernel<EY, BMAX><<<grid, blk, 0, c10::cuda::getCurrentCUDAStream()>>>(
+    bs_sb_par_kernel<EY, BMAX, PADDED, PF_ATOMIC><<<grid, blk, 0, c10::cuda::getCurrentCUDAStream()>>>(
         param_flows.data_ptr<float>(), node_flows.data_ptr<float>(), node_mars.data_ptr<float>(),
         element_mars.data_ptr<float>(), params.data_ptr<float>(), ext.data_ptr<float>(),
         nids.data_ptr<long>(), cids.data_ptr<long>(), pids.data_ptr<long>(), pfids.data_ptr<long>(),
@@ -315,13 +340,13 @@ static void launch_sb_par(torch::Tensor param_flows, torch::Tensor node_flows, t
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-#define BS_SB_PAR_DISPATCH_BMAX(EE)                                                                    \
+#define BS_SB_PAR_DISPATCH_BMAX(EE, PD, PA)                                                                    \
     switch (bmax) {                                                                                     \
-        case 1:  launch_sb_par<EE, 1 >(param_flows, node_flows, node_mars, element_mars, params, ext, nids, cids, pids, pfids, gate, b, bs, ne, ncb, nsh, gsh, eb_); break; \
-        case 2:  launch_sb_par<EE, 2 >(param_flows, node_flows, node_mars, element_mars, params, ext, nids, cids, pids, pfids, gate, b, bs, ne, ncb, nsh, gsh, eb_); break; \
-        case 4:  launch_sb_par<EE, 4 >(param_flows, node_flows, node_mars, element_mars, params, ext, nids, cids, pids, pfids, gate, b, bs, ne, ncb, nsh, gsh, eb_); break; \
-        case 8:  launch_sb_par<EE, 8 >(param_flows, node_flows, node_mars, element_mars, params, ext, nids, cids, pids, pfids, gate, b, bs, ne, ncb, nsh, gsh, eb_); break; \
-        case 16: launch_sb_par<EE, 16>(param_flows, node_flows, node_mars, element_mars, params, ext, nids, cids, pids, pfids, gate, b, bs, ne, ncb, nsh, gsh, eb_); break; \
+        case 1:  launch_sb_par<EE, 1 , PD, PA>(param_flows, node_flows, node_mars, element_mars, params, ext, nids, cids, pids, pfids, gate, b, bs, ne, ncb, nsh, gsh, eb_); break; \
+        case 2:  launch_sb_par<EE, 2 , PD, PA>(param_flows, node_flows, node_mars, element_mars, params, ext, nids, cids, pids, pfids, gate, b, bs, ne, ncb, nsh, gsh, eb_); break; \
+        case 4:  launch_sb_par<EE, 4 , PD, PA>(param_flows, node_flows, node_mars, element_mars, params, ext, nids, cids, pids, pfids, gate, b, bs, ne, ncb, nsh, gsh, eb_); break; \
+        case 8:  launch_sb_par<EE, 8 , PD, PA>(param_flows, node_flows, node_mars, element_mars, params, ext, nids, cids, pids, pfids, gate, b, bs, ne, ncb, nsh, gsh, eb_); break; \
+        case 16: launch_sb_par<EE, 16, PD, PA>(param_flows, node_flows, node_mars, element_mars, params, ext, nids, cids, pids, pfids, gate, b, bs, ne, ncb, nsh, gsh, eb_); break; \
         default: TORCH_CHECK(false, "blockscale_sb_par_backward: invalid batch ", b);                   \
     }
 
@@ -330,7 +355,10 @@ void blockscale_sb_par_backward(torch::Tensor param_flows, torch::Tensor node_fl
                                 torch::Tensor nids, torch::Tensor cids, torch::Tensor pids,
                                 torch::Tensor pfids, torch::Tensor gate,
                                 int64_t batch, int64_t block_size, int64_t num_edges, int64_t node_cbs,
-                                int64_t gate_cbs, int64_t ext_base, int64_t cfg) {
+                                // `padded` / `pf_atomic` precede `cfg`: the Python autotuner substitutes the LAST
+                                // argument when trying configs, so `cfg` must stay last.
+                                int64_t gate_cbs, int64_t ext_base,
+                                int64_t padded, int64_t pf_atomic, int64_t cfg) {
     int b = (int)batch, bs = (int)block_size, ne = (int)num_edges, ncb = (int)node_cbs;
     long eb_ = (long)ext_base;
     int ey = (cfg == 0) ? 8 : (cfg == 1) ? 16 : (cfg == 2) ? 4 : -1;
@@ -353,12 +381,25 @@ void blockscale_sb_par_backward(torch::Tensor param_flows, torch::Tensor node_fl
     while ((1 << gsh) < (int)gate_cbs) ++gsh;
     int bmax = 1;
     while (bmax < b) bmax <<= 1;                       // next power of two >= batch
-    switch (ey) {
-        case 8:  BS_SB_PAR_DISPATCH_BMAX(8);  break;
-        case 16: BS_SB_PAR_DISPATCH_BMAX(16); break;
-        case 4:  BS_SB_PAR_DISPATCH_BMAX(4);  break;
-        default: TORCH_CHECK(false, "blockscale_sb_par_backward: invalid cfg ", cfg);
+    // `ey` picks the edge-tiling config; `padded` / `pf_atomic` pick the write specialization (see
+    // the note at the kernel). Both are compile-time, so a dense untied layer -- the overwhelmingly
+    // common case -- generates exactly the code it did before either flag existed.
+#define BS_SB_PAR_BY_EY(PD, PA)                                     \
+    switch (ey) {                                                   \
+        case 8:  BS_SB_PAR_DISPATCH_BMAX(8,  PD, PA); break;        \
+        case 16: BS_SB_PAR_DISPATCH_BMAX(16, PD, PA); break;        \
+        case 4:  BS_SB_PAR_DISPATCH_BMAX(4,  PD, PA); break;        \
+        default: TORCH_CHECK(false, "blockscale_sb_par_backward: invalid cfg ", cfg); \
     }
+
+    if (padded) {
+        if (pf_atomic) { BS_SB_PAR_BY_EY(true,  true ); }
+        else           { BS_SB_PAR_BY_EY(true,  false); }
+    } else {
+        if (pf_atomic) { BS_SB_PAR_BY_EY(false, true ); }
+        else           { BS_SB_PAR_BY_EY(false, false); }
+    }
+#undef BS_SB_PAR_BY_EY
 }
 
 std::vector<int64_t> blockscale_sb_par_configs() { return {8, 16, 4}; }  // EY per config id

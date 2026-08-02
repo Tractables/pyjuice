@@ -98,81 +98,87 @@ def _bs_triton_ele_kernel(node_flows, element_flows, node_mars, element_mars, mp
         log_n_fdm_max = tl.max(log_n_fdm, axis = 0)[None,:]
         n_fdm_sub = tl.where(log_n_fdm_max != -float("inf"), tl.exp(log_n_fdm - log_n_fdm_max), 0.0)
 
-        if TL_DOT == 1:
-            partial_flows = tl.dot(epars, n_fdm_sub)
-        else:
-            partial_flows = tl.sum(epars[:,:,None] * n_fdm_sub[None,:,:], axis = 1)
-
-        # The gate of THIS k-tile's parent block, one value per (child gate, sample). `-1` means the
-        # parent block and this child block are not connected; the `-inf` it produces drops the tile
-        # in the accumulate below, which is what the ungated kernel computes for a padded tile too.
-        gbase = tl.load(gate_ptr + k)
-        # `gbase >= 0` has to be in the LOAD MASK, not only in the `tl.where`: Triton evaluates both
-        # arms, so the sentinel would otherwise be read at a negative row offset -- out of bounds
-        # whenever `gbase + ext_base < 0`, which is every disconnected block in the first slot.
-        lphi = tl.where(
-            gbase >= 0,
-            tl.load(ext + (gbase + ext_base + offs_gate)[:,None] * batch_size + offs_batch[None,:],
-                    mask = mask_batch[None,:] & (gbase >= 0), other = 0.0),
-            -float("inf")
-        )                                                   # [TILE_SIZE_M, BLOCK_B]
-
-        # The Ntilde half of `d LL / d log phi`. `partial_flows * exp(partial_flows_max)` IS
-        # `sum_{n in this parent block} edge_flow[n, c, b]`, which this kernel forms anyway.
+        # ---- ONE CONTRACTION PER PARENT GROUP ----
         #
-        # The emission is what makes or breaks this, and the cost is the NUMBER of emissions, not
-        # their kind: emitting per k-tile cost 5-15x on the whole backward -- ~2M global atomics at
-        # ~2ns each -- and the tell was that the cost scaled as 1/GATE_CBS while `contrib` and its
-        # `exp` do not. Only the number of emitted rows does. So accumulate over the TPB consecutive
-        # k-tiles that share a parent block (and hence a gate row) and emit once per parent block.
+        # `phi` is constant over the parents of ONE node block, which is what lets it leave the
+        # contraction and become a shift of this tile's max. When `ptr_inc_step > 1` a k-tile spans
+        # `ptr_inc_step` DIFFERENT parent blocks (`TILE_SIZE_K > BLOCK_SIZE_K`), so one shift no longer
+        # describes the tile and the contraction has to split -- `phi` cannot be folded into the
+        # `[K, B]` operand either, because it depends on the child gate as well (the M axis).
         #
-        # A plain STORE where the rows are provably exclusive, an ATOMIC where they are not, decided
-        # at compile time by the launcher (`GRAD_ATOMIC`) -- the store is worth 4-7 us. A store is a
-        # lost update in three ways, and each is checkable before the launch:
-        #   * when TILE_SIZE_M < GATE_CBS, `(tile_id * TILE_SIZE_M) // GATE_CBS` maps
-        #     GATE_CBS // TILE_SIZE_M distinct `pid_m` programs onto ONE row, each holding its own
-        #     partial sum over its own slice of that gate's children;
-        #   * `tie_external` aliases a node's gradient rows across every layer holding a copy, and the
-        #     buffer is zeroed once per backward (tensorcircuit.py) precisely so layers can accumulate;
-        #   * two tied copies can even share a single layer, colliding two `eleblock_id` in one launch.
-        # The last two show up as REPEATED VALUES in the gate table, which is what the launcher tests,
-        # rather than being reasoned about from `tie_external` alone.
+        # This is why the layer used to be refused outright at `ptr_inc_step != 1`, which in practice
+        # meant EVERY 32-wide gated sum layer (`ptr_inc_step = TILE_SIZE_K // block_size`).
         #
-        # The two CUDA element forks always `atomicAdd`; the three forks have to agree numerically to
-        # within their own tolerance, and `_build_ele_plan` picks between them by speed alone.
-        # Computed ONCE and shared with the flow accumulate below, which needs the same sum.
-        partial_flows_max = emars + log_n_fdm_max + lphi
-
-        if WRITE_GRAD:
-            contrib = partial_flows * tl.exp(partial_flows_max)
-            if TILE_SIZE_M >= GATE_CBS:
-                gacc += tl.sum(tl.reshape(contrib, (TILE_SIZE_M // GATE_CBS, GATE_CBS, BLOCK_B)),
-                               axis = 1)
+        # `ptr_inc_step` is a constexpr, so the common case compiles to exactly the single dot and
+        # single merge it always did -- the split costs nothing where it is not needed. Everything
+        # else in this kernel already handled several groups: `offs_edge_gid` indexes the group and
+        # `par_start` / `edge_start` are already vectors over it.
+        for g in tl.static_range(ptr_inc_step):
+            if ptr_inc_step == 1:
+                nsub_g = n_fdm_sub
             else:
-                gacc += tl.sum(contrib, axis = 0)[None,:]   # the whole tile sits inside ONE gate
+                # Mask to this group's lanes rather than re-loading them: the operands are already in
+                # registers, and a masked-out lane contributes an exact zero to the dot.
+                nsub_g = tl.where((offs_edge_gid == g)[:,None], n_fdm_sub, 0.0)
 
-            if (k % TPB) == TPB - 1:
+            if TL_DOT == 1:
+                partial_flows = tl.dot(epars, nsub_g)
+            else:
+                partial_flows = tl.sum(epars[:,:,None] * nsub_g[None,:,:], axis = 1)
+
+            # The gate of THIS group's parent block, one value per (child gate, sample). `-1` means
+            # the parent block and this child block are not connected; the `-inf` it produces drops
+            # the group in the accumulate below, which is what the ungated kernel computes for a
+            # padded tile too. The table carries one entry per (k-tile, group); at `ptr_inc_step == 1`
+            # that is one per k-tile, exactly as before.
+            gbase = tl.load(gate_ptr + k * ptr_inc_step + g)
+            # `gbase >= 0` has to be in the LOAD MASK, not only in the `tl.where`: Triton evaluates
+            # both arms, so the sentinel would otherwise be read at a negative row offset -- out of
+            # bounds whenever `gbase + ext_base < 0`, which is every disconnected block in the first
+            # slot.
+            lphi = tl.where(
+                gbase >= 0,
+                tl.load(ext + (gbase + ext_base + offs_gate)[:,None] * batch_size + offs_batch[None,:],
+                        mask = mask_batch[None,:] & (gbase >= 0), other = 0.0),
+                -float("inf")
+            )                                               # [TILE_SIZE_M, BLOCK_B]
+
+            partial_flows_max = emars + log_n_fdm_max + lphi
+
+            if WRITE_GRAD:
+                contrib = partial_flows * tl.exp(partial_flows_max)
                 if TILE_SIZE_M >= GATE_CBS:
-                    grow = gbase + ext_base + (tile_id * TILE_SIZE_M) // GATE_CBS \
-                           + tl.arange(0, TILE_SIZE_M // GATE_CBS)
+                    gacc += tl.sum(tl.reshape(contrib, (TILE_SIZE_M // GATE_CBS, GATE_CBS, BLOCK_B)),
+                                   axis = 1)
                 else:
-                    grow = gbase + ext_base + (tile_id * TILE_SIZE_M) // GATE_CBS \
-                           + tl.arange(0, 1)
-                if GRAD_ATOMIC:
-                    tl.atomic_add(grad_ext + grow[:,None] * batch_size + offs_batch[None,:], gacc,
-                                  mask = mask_batch[None,:] & (gbase >= 0))
-                else:
-                    tl.store(grad_ext + grow[:,None] * batch_size + offs_batch[None,:], gacc,
-                             mask = mask_batch[None,:] & (gbase >= 0))
-                gacc = gacc * 0.0
+                    gacc += tl.sum(contrib, axis = 0)[None,:]
 
-        acc = tl.where(partial_flows_max == -float("inf"),
-            acc,
-            tl.where(partial_flows_max > acc,
-                tl.log(partial_flows + tl.exp(acc - partial_flows_max) + 1e-32) + partial_flows_max,
-                tl.log(tl.exp(partial_flows_max - acc) * partial_flows + 1.0) + acc
+                # Emit once per parent block. At `ptr_inc_step == 1` that is every TPB k-tiles, the
+                # in-register accumulation that made this affordable. At `ptr_inc_step > 1` a k-tile
+                # is WIDER than a parent block, so `TPB` is 1 and every group emits its own row --
+                # there is nothing to accumulate across.
+                if (ptr_inc_step > 1) or ((k % TPB) == TPB - 1):
+                    if TILE_SIZE_M >= GATE_CBS:
+                        grow = gbase + ext_base + (tile_id * TILE_SIZE_M) // GATE_CBS \
+                               + tl.arange(0, TILE_SIZE_M // GATE_CBS)
+                    else:
+                        grow = gbase + ext_base + (tile_id * TILE_SIZE_M) // GATE_CBS \
+                               + tl.arange(0, 1)
+                    if GRAD_ATOMIC:
+                        tl.atomic_add(grad_ext + grow[:,None] * batch_size + offs_batch[None,:], gacc,
+                                      mask = mask_batch[None,:] & (gbase >= 0))
+                    else:
+                        tl.store(grad_ext + grow[:,None] * batch_size + offs_batch[None,:], gacc,
+                                 mask = mask_batch[None,:] & (gbase >= 0))
+                    gacc = gacc * 0.0
+
+            acc = tl.where(partial_flows_max == -float("inf"),
+                acc,
+                tl.where(partial_flows_max > acc,
+                    tl.log(partial_flows + tl.exp(acc - partial_flows_max) + 1e-32) + partial_flows_max,
+                    tl.log(tl.exp(partial_flows_max - acc) * partial_flows + 1.0) + acc
+                )
             )
-        )
 
         parpids_inc = tl.load(parpids_inc_ptr)
         epars_ptr += parpids_inc[None,:]
@@ -195,7 +201,8 @@ def _bs_triton_par_kernel(node_flows, node_mars, element_mars, mparams, param_fl
                           TILE_SIZE_K: tl.constexpr, TILE_SIZE_M: tl.constexpr,
                           BLOCK_SIZE_M: tl.constexpr, TL_DOT: tl.constexpr,
                           NODE_CBS: tl.constexpr, GATE_CBS: tl.constexpr,
-                          gate_stride: tl.constexpr, ext_base, pid_m_offset = 0):
+                          gate_stride: tl.constexpr, ext_base, pid_m_offset = 0,
+                          PADDED: tl.constexpr = 0, PF_ATOMIC: tl.constexpr = 0):
     """
     Gated parameter-flow backward, a fork of `_bk_triton_block_sparse_par_kernel_rmw`.
 
@@ -210,7 +217,28 @@ def _bs_triton_par_kernel(node_flows, node_mars, element_mars, mparams, param_fl
     `node_mars == -inf` branch untouched. `-inf` for an absent gate zeroes the edge through
     `exp(emars + ...)`, matching what the ungated kernel computes for a padded edge.
 
-    Non-atomic read-add-store, so it inherits the parent's requirement that `pfids` be collision-free.
+    THE WRITE IS NOT UNCONDITIONALLY SAFE, and the two flags say which hazard applies. Unlike the CuTe
+    and small-batch param forks -- which the sum layer only dispatches to from BEHIND
+    `_par_flow_collision_free` -- this kernel is the unconditional fallback (`_ext_bw_par_triton_hook`,
+    `sum_layer.py`), so it is reached exactly when that predicate FAILS. Two things make it fail, and
+    each needs its own flag:
+
+    * `PF_ATOMIC` -- two programs genuinely accumulate into ONE `param_flows` slot. Ordinary parameter
+      tying does this whenever two members of a tie group land in the same layer: compilation gives
+      them one `_param_flow_range`, so their compiled `pfids` rows are identical. A read-add-store then
+      loses one contributor's update. MEASURED on such a layer: 11 of 12 identical runs differed
+      bitwise, spread 38% of the value -- while the same shape untied, and the same collision on an
+      UNGATED layer (which correctly picks its atomic kernel at `sum_layer.py`'s par dispatch), are
+      both bit-stable over 12 runs.
+    * `PADDED` -- some compiled slots are padding. A padded slot carries `cids == 0`, `pids == 0` and
+      `pfids == 0`; `param_flows` has no dummy prefix, so slot 0 is owned by a REAL edge block. The
+      padded lane's `pflows` is already exactly zero, but the WRITE is not free: its read-add-store of
+      `+0.0` racing a real program's discards the real update. Masking the lane out of the write --
+      rather than tolerating it with an atomic -- also restores collision-freedom over the slots that
+      ARE written, which is what lets a ragged untied layer keep the fast non-atomic path.
+
+    The two are orthogonal and both default off, so a dense untied layer compiles to exactly the code
+    this kernel had before either flag existed.
     """
     pid_k = tl.program_id(0)
     pid_m = tl.program_id(1) + pid_m_offset
@@ -232,7 +260,19 @@ def _bs_triton_par_kernel(node_flows, node_mars, element_mars, mparams, param_fl
 
     # Each edge's gate row. Constant across the batch loop, so resolved once: which child block the
     # edge falls in picks the row, and where it sits inside that block picks the gate.
-    gbase = tl.load(gate + nblock_id * gate_stride + (offs_edge // NODE_CBS))
+    #
+    # The column is BOUNDED. `offs_edge` runs over the compiled `num_edges`, which is padded up to a
+    # power of two, while the gate table is only `ext_max_n_eblks` columns wide -- so whenever the
+    # widest row's edge-block count is not a power of two the column runs past the row and reads the
+    # NEXT row's gate, which is a valid `>= 0` offset and therefore silently defeats `ghas`; on the
+    # last row it reads past the tensor entirely. MEASURED on a uniform 3-edge-block layer at
+    # `node_cbs = 32`: 4 columns indexed against a 3-wide table, rows 0-2 picking up gates 16/32/48
+    # and row 3 running off the end. The CuTe fork guards exactly this (`j < gate_stride ? gt[j] : -1`)
+    # and the small-batch fork host-checks it; this one did neither. Unreachable today only because the
+    # forward refuses every layer with a padded column, so the bound goes in before that changes.
+    offs_gcol = offs_edge // NODE_CBS
+    gbase = tl.load(gate + nblock_id * gate_stride + offs_gcol,
+                    mask = offs_gcol < gate_stride, other = -1)
     grow = gbase + ext_base + ((offs_edge % NODE_CBS) // GATE_CBS)
     ghas = gbase >= 0
 
@@ -270,7 +310,23 @@ def _bs_triton_par_kernel(node_flows, node_mars, element_mars, mparams, param_fl
 
     parflow_start = tl.load(pfids + nblock_id * num_edges + offs_edge)
     offsets = offs_node[:,None] + parflow_start[None,:]
-    tl.store(param_flows + offsets, tl.load(param_flows + offsets) + pflows)
+
+    # `edge_start != 0` -- not `ghas` -- is the padding predicate. Real children are elements
+    # `>= num_dummy_eles > 0` and padding is element 0, so this is exact by construction and, unlike
+    # `ghas`, does not depend on the gate table being indexed correctly.
+    if PADDED:
+        wmask = (edge_start != 0)[None,:]
+        if PF_ATOMIC:
+            tl.atomic_add(param_flows + offsets, pflows, mask = wmask)
+        else:
+            tl.store(param_flows + offsets,
+                     tl.load(param_flows + offsets, mask = wmask, other = 0.0) + pflows,
+                     mask = wmask)
+    else:
+        if PF_ATOMIC:
+            tl.atomic_add(param_flows + offsets, pflows)
+        else:
+            tl.store(param_flows + offsets, tl.load(param_flows + offsets) + pflows)
 
 
 @triton_jit
@@ -312,7 +368,14 @@ def _bs_triton_phigrad_logz_kernel(node_flows, log_z, sigma, ext, gate, grad_ext
                  mask = mask_batch[None,:], other = 0.0)
     j = offs_g // N_CHILD_GATES
     d = offs_g % N_CHILD_GATES
-    gbase = tl.load(gate + pid_nb * gate_stride + j, mask = mask_g, other = -1)
+    # BOUNDED by the gate table's width, exactly as in `_bs_triton_par_kernel`. `n_gates` is derived
+    # from the compiled `num_edges`, which is padded up to a power of two, while the table is only
+    # `ext_max_n_eblks` wide -- so whenever the widest row's edge-block count is not a power of two
+    # the column runs past the row and picks up the NEXT row's gate, which is a valid `>= 0` offset
+    # and therefore survives the `gbase >= 0` masks below. MEASURED on a block-sparse ragged layer
+    # (`n_eblks = 4`, `gate_stride = 3`): an out-of-bounds atomic 349 KB past the gradient buffer.
+    # Unreachable until the forward began accepting layers whose rows differ in edge-block count.
+    gbase = tl.load(gate + pid_nb * gate_stride + j, mask = mask_g & (j < gate_stride), other = -1)
     row = gbase + ext_base + d
     lphi = tl.load(ext + row[:,None] * batch_size + offs_batch[None,:],
                    mask = mask_g[:,None] & mask_batch[None,:] & (gbase >= 0)[:,None],

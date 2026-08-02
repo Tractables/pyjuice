@@ -59,7 +59,23 @@ __global__ void lowrank_wa_partial_kernel(
     const int bb = tid % TB;
     const int b = b0 + bb;
 
-    const long xu_v = xu[re] + ext_base;
+    // A PADDED edge block. Compilation marks one with a -1 slot: `edge_ids` has no such edge, so no
+    // factor is stored for it and it must contribute nothing. Without this the address below goes
+    // NEGATIVE and reads before the buffer. Guarded here, ahead of the staging loops, because
+    // `xu[re]` depends only on `blockIdx.x` -- the whole block takes the branch together, so the
+    // `__syncthreads()` below stays uniform. `-inf` is the identity of the log-sum-exp that phase 1b
+    // reduces these into, so a padded block drops out of the reduction rather than biasing it.
+    const long xu_raw = xu[re];
+    if (xu_raw < 0) {
+        if (b < batch_size) {
+            const long o = (((long)re * rank + r) * n_ctiles + ct) * batch_size + b;
+            pw[o] = -INFINITY;
+            pa[o] = -INFINITY;
+        }
+        return;
+    }
+
+    const long xu_v = xu_raw + ext_base;
     const long cid_base = (long)row * num_edges + (long)j * ch_block_size;
 
     const int c0 = ct * tile_c;
@@ -212,7 +228,13 @@ __global__ void lowrank_combine_kernel(
     float log_s2 = -INFINITY, log_zt = -INFINITY;
 
     for (int j = 0; j < num_eblks; ++j) {
-        const long xv_v = xv[(long)row * num_eblks + j] + ext_base;
+        // Padded edge block -- see the note in phase 1. CLAMPED rather than skipped: phase 1 already
+        // put `-inf` in `s_w` / `s_a` for a padded block, so `v + s_w` is `-inf` and the block drops
+        // out of both accumulators whatever `v` holds. All this has to do is keep the `ext` read in
+        // bounds, and a select does that without a branch -- a `continue` here cost 7% on a dense
+        // layer by breaking the pipelining of this loop, which is the hot one.
+        const long xv_raw = xv[(long)row * num_eblks + j];
+        const long xv_v = (xv_raw < 0 ? 0 : xv_raw) + ext_base;
         for (int rr = 0; rr < rank; ++rr) {
             const float v = ext[(xv_v + (long)m * rank + rr) * batch_size + b];
             const int si = (j * rank + rr) * TB + bb;

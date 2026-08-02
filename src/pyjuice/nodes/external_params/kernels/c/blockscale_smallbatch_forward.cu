@@ -49,15 +49,20 @@ __device__ __forceinline__ void lse_add(float& m, float& l, float x, float w) {
 }
 
 
-template <int SPLIT, bool TWOPASS>
+// `ROW_CONTIG` -- whether this partition's whole row is ONE contiguous run, which is the dense
+// fully-connected case. It is a template parameter, not a runtime test, because the alternative costs
+// TWO extra dependent global loads per gate standing in front of the parameter address -- the same
+// mistake the note below warns about for `gate[j]`, and measured here at +9.5% on two shapes.
+// Specialized, the dense path keeps the single pair of row bases it always had.
+template <int SPLIT, bool TWOPASS, bool ROW_CONTIG>
 __global__ void __launch_bounds__(32 * SPLIT) bs_sb_fwd_kernel(
         float* __restrict__ node_mars, const float* __restrict__ element_mars,
         const float* __restrict__ params, const float* __restrict__ ext,
-        const long* __restrict__ nids, const long* __restrict__ ebase,
-        const long* __restrict__ pbase, const long* __restrict__ gate,
+        const long* __restrict__ nids, const long* __restrict__ cids,
+        const long* __restrict__ pids, const long* __restrict__ gate,
         float* __restrict__ log_z_out,
         int batch, int block_size, int n_gates, int gate_cbs, int node_cbs, int node_sh,
-        int gate_sh, int gate_stride, long ext_base) {
+        int gate_sh, int gate_stride, int n_eblks, long ext_base) {
 
     const int groups = block_size >> 5;            // block_size / 32
     const int gx = blockIdx.x;
@@ -68,8 +73,19 @@ __global__ void __launch_bounds__(32 * SPLIT) bs_sb_fwd_kernel(
     const int ty = threadIdx.y;                    // edge warp
     const int m_local = grp * 32 + lane;
 
-    const long eb = ebase[nb], pb = pbase[nb];
+    // ONE ENTRY PER EDGE BLOCK, read from the compiled tables. This kernel used to take a single
+    // base for the WHOLE row and walk it, which assumed every edge of the row was one contiguous run
+    // -- true only for a dense, fully-connected row, and the reason padded and block-sparse layers
+    // were declined here. A gate lies inside one edge block (`gate_cbs` divides `node_cbs`), so the
+    // per-gate loop below can take its bases from the edge block it belongs to, which is contiguous
+    // by the compile-time invariant. `n_eblks` is the tables' stride; note it is NOT `gate_stride`,
+    // which is the layer-wide `ext_max_n_eblks` and can be smaller.
+    const long* ec = cids + (long)nb * n_eblks;
+    const long* ep = pids + (long)nb * n_eblks;
     const long* gt = gate + (long)nb * gate_stride;
+    // Hoisted for the contiguous case: the row's single pair of bases, read once.
+    const long eb0 = ROW_CONTIG ? ec[0] : 0;
+    const long pb0 = ROW_CONTIG ? ep[0] : 0;
 
     float mn = -INFINITY, ln = 0.0f;               // the node value N
     float mz = -INFINITY, lz = 0.0f;               // its normalizer Z
@@ -99,8 +115,24 @@ __global__ void __launch_bounds__(32 * SPLIT) bs_sb_fwd_kernel(
         const long gb = (j < gate_stride) ? gt[j] : -1;
         const float lp = (gb >= 0) ? ext[(gb + ext_base + d) * (long)batch + b] : -INFINITY;
 
-        const float* pe = &params[pb + (long)e0 * block_size + m_local];
-        const float* em = &element_mars[(eb + e0) * (long)batch + b];
+        // Where this gate's parameters and children start. For a contiguous row that is the row's
+        // base plus the gate's own offset -- what this kernel always did. Otherwise it is the base of
+        // the EDGE BLOCK the gate sits in, plus the gate's offset inside that block: `j` already
+        // indexes it for the gate lookup above, and the inner loop stays within the block because
+        // `gate_cbs` divides `node_cbs`, so it never leaves the run the compile step guarantees is
+        // contiguous. A padded block's entries are 0 -- the dummy `-inf` element and the dummy zero
+        // parameter -- so padding needs no special case here either.
+        long bp, be;
+        if (ROW_CONTIG) {
+            bp = pb0 + (long)e0 * block_size;
+            be = eb0 + e0;
+        } else {
+            const int w = e0 & (node_cbs - 1);
+            bp = ep[j] + (long)w * block_size;
+            be = ec[j] + w;
+        }
+        const float* pe = &params[bp + m_local];
+        const float* em = &element_mars[be * (long)batch + b];
 
         // The gate's own log-sum-exp first, WITHOUT the gate: `log phi` is constant across these
         // edges, so adding it per edge is `gate_cbs` adds to achieve what one shift of the merged max
@@ -232,9 +264,9 @@ __global__ void __launch_bounds__(32 * SPLIT) bs_sb_fwd_kernel(
 }
 
 
-template <int SPLIT, bool TWOPASS>
+template <int SPLIT, bool TWOPASS, bool ROW_CONTIG>
 static void launch(torch::Tensor node_mars, torch::Tensor element_mars, torch::Tensor params,
-                   torch::Tensor ext, torch::Tensor nids, torch::Tensor ebase, torch::Tensor pbase,
+                   torch::Tensor ext, torch::Tensor nids, torch::Tensor cids, torch::Tensor pids,
                    torch::Tensor gate, torch::Tensor log_z,
                    int batch, int block_size, int n_gates, int gate_cbs, int node_cbs, int node_sh,
                    int gate_sh, long ext_base) {
@@ -242,22 +274,24 @@ static void launch(torch::Tensor node_mars, torch::Tensor element_mars, torch::T
     dim3 grid((unsigned)(ng * (block_size / 32)), (unsigned)batch);
     dim3 blk(32, SPLIT);
 
-    bs_sb_fwd_kernel<SPLIT, TWOPASS><<<grid, blk, 0, c10::cuda::getCurrentCUDAStream()>>>(
+    bs_sb_fwd_kernel<SPLIT, TWOPASS, ROW_CONTIG><<<grid, blk, 0, c10::cuda::getCurrentCUDAStream()>>>(
         node_mars.data_ptr<float>(), element_mars.data_ptr<float>(), params.data_ptr<float>(),
-        ext.data_ptr<float>(), nids.data_ptr<long>(), ebase.data_ptr<long>(),
-        pbase.data_ptr<long>(), gate.data_ptr<long>(),
+        ext.data_ptr<float>(), nids.data_ptr<long>(), cids.data_ptr<long>(),
+        pids.data_ptr<long>(), gate.data_ptr<long>(),
         log_z.numel() ? log_z.data_ptr<float>() : nullptr,
         batch, block_size, n_gates, gate_cbs, node_cbs, node_sh, gate_sh, (int)gate.size(1),
-        ext_base);
+        (int)cids.size(1), ext_base);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 
 void blockscale_sb_forward(torch::Tensor node_mars, torch::Tensor element_mars, torch::Tensor params,
-                           torch::Tensor ext, torch::Tensor nids, torch::Tensor ebase,
-                           torch::Tensor pbase, torch::Tensor gate, torch::Tensor log_z,
+                           torch::Tensor ext, torch::Tensor nids, torch::Tensor cids,
+                           torch::Tensor pids, torch::Tensor gate, torch::Tensor log_z,
                            int64_t block_size, int64_t num_edges, int64_t node_cbs, int64_t gate_cbs,
-                           int64_t ext_base, int64_t cfg) {
+                           // `row_contig` precedes `cfg` deliberately: the Python autotuner substitutes the LAST
+                           // argument when trying configs, so `cfg` must stay last.
+                           int64_t ext_base, int64_t row_contig, int64_t cfg) {
 
     const int batch = node_mars.size(1);
     const int bs = (int)block_size, ne = (int)num_edges;
@@ -279,23 +313,29 @@ void blockscale_sb_forward(torch::Tensor node_mars, torch::Tensor element_mars, 
                                 "whole number of gates (", gcbs, ")");
     const int n_gates = ne / gcbs;
 
-#define BS_SB_ARGS node_mars, element_mars, params, ext, nids, ebase, pbase, gate, log_z,            \
+#define BS_SB_ARGS node_mars, element_mars, params, ext, nids, cids, pids, gate, log_z,            \
                    batch, bs, n_gates, gcbs, ncbs, node_sh, gate_sh, (long)ext_base
 
-    // cfg = SPLIT x inner-loop form; see `blockscale_sb_configs`.
-    switch (cfg) {
-        case 0: launch<32, false>(BS_SB_ARGS); break;
-        case 1: launch<16, false>(BS_SB_ARGS); break;
-        case 2: launch< 8, false>(BS_SB_ARGS); break;
-        case 3: launch< 4, false>(BS_SB_ARGS); break;
-        case 4: launch<32, true >(BS_SB_ARGS); break;
-        case 5: launch<16, true >(BS_SB_ARGS); break;
-        case 6: launch< 8, true >(BS_SB_ARGS); break;
-        case 7: launch< 4, true >(BS_SB_ARGS); break;
-        // No silent default: an unknown cfg must not run zero kernels, which against a reused output
-        // buffer can masquerade as a correct -- and very fast -- result to the autotuner.
-        default: TORCH_CHECK(false, "blockscale small-batch forward: invalid cfg ", cfg);
+    // cfg = SPLIT x inner-loop form; see `blockscale_sb_configs`. `row_contig` selects the
+    // addressing specialization: see the note on `ROW_CONTIG` at the kernel.
+#define BS_SB_DISPATCH(RC)                                                                         \
+    switch (cfg) {                                                                                 \
+        case 0: launch<32, false, RC>(BS_SB_ARGS); break;                                          \
+        case 1: launch<16, false, RC>(BS_SB_ARGS); break;                                          \
+        case 2: launch< 8, false, RC>(BS_SB_ARGS); break;                                          \
+        case 3: launch< 4, false, RC>(BS_SB_ARGS); break;                                          \
+        case 4: launch<32, true , RC>(BS_SB_ARGS); break;                                          \
+        case 5: launch<16, true , RC>(BS_SB_ARGS); break;                                          \
+        case 6: launch< 8, true , RC>(BS_SB_ARGS); break;                                          \
+        case 7: launch< 4, true , RC>(BS_SB_ARGS); break;                                          \
+        /* No silent default: an unknown cfg must not run zero kernels, which against a reused   */ \
+        /* output buffer can masquerade as a correct -- and very fast -- result to the autotuner.*/ \
+        default: TORCH_CHECK(false, "blockscale small-batch forward: invalid cfg ", cfg);           \
     }
+
+    if (row_contig) { BS_SB_DISPATCH(true); } else { BS_SB_DISPATCH(false); }
+
+#undef BS_SB_DISPATCH
 #undef BS_SB_ARGS
 }
 

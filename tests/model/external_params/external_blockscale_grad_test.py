@@ -219,13 +219,76 @@ def test_tied_gates_accumulate_across_every_layer_that_shares_them():
     torch.manual_seed(11)
     phi = torch.randn([batch, 1, K // gate_cbs], device = dev) * 0.5
 
+    # THE TWO ARMS MUST TAKE THE SAME NUMERICAL PATH, or this measures the wrong thing.
+    #
+    # `_logz_tile` picks the log-Z gradient kernel's (GATE_TILE, BLOCK_B) by MEASUREMENT, separately
+    # for each circuit -- and the candidates are not equally accurate. Scored against the reference-
+    # free zero-sum invariant on this shape, the `USE_DOT = 0` tiles (GATE_TILE 1 and 8, which fall
+    # back to a broadcast-sum over an [M, G, B] intermediate) come out at 7.8e-3 relative against
+    # 8.8e-4 for the `tl.dot` tiles -- about 9x worse. When the tied arm happened to pick one and the
+    # untied arm the other, the difference between them was 1e-3 to 2.6e-3 and this assert failed;
+    # when they happened to agree it was 7.8e-8. That is what made this test flaky (2 of 5 runs), and
+    # it was never about the accumulation this test exists to check.
+    #
+    # So the second arm REPLAYS the first arm's choices. Recorded rather than hardcoded, so the test
+    # does not silently stop exercising the autotuner's real selection if the shape changes.
+    # EVERY autotuned choice is replayed, not just the log-Z tile: the element fork is chosen the
+    # same way and produces this gradient's first term, and the forks differ in precision (fp16 dot
+    # vs pure fp32). Replaying only the log-Z tile took this from 2-of-5 runs passing to 8-of-10 --
+    # better, and still flaky, because the element pick was free to diverge.
+    import pyjuice.nodes.external_params.block_scale as _bs
+    import pyjuice.layer.kernels.c as _ck
+    original_tile = _bs.BlockScaleSumParams._logz_tile
+    original_autotune = _ck.autotune
+    recorded, recorded_at = [], []
+
+    def record(self, layer, launch, grad_ext, b, bs_, n_gates, rows):
+        pick = original_tile(self, layer, launch, grad_ext, b, bs_, n_gates, rows)
+        recorded.append(pick)
+        return pick
+
+    def replay(self, layer, launch, grad_ext, b, bs_, n_gates, rows):
+        assert replay.i < len(recorded), "the untied arm built more log-Z plans than the tied one"
+        pick = recorded[replay.i]
+        replay.i += 1
+        return pick
+    replay.i = 0
+
+    def record_at(cands, **kw):
+        pick = original_autotune(cands, **kw)
+        recorded_at.append(pick)
+        return pick
+
+    def replay_at(cands, **kw):
+        # Replay only where the recorded choice is still on offer; the two circuits are structurally
+        # identical, so a mismatch means the assumption behind this test has broken and is worth
+        # falling back loudly rather than silently comparing different paths.
+        if replay_at.i < len(recorded_at):
+            pick = recorded_at[replay_at.i]
+            replay_at.i += 1
+            if any(n == pick for n, _ in cands):
+                return pick
+        return original_autotune(cands, **kw)
+    replay_at.i = 0
+
     def run(tie):
         pc, copies = build(tie)
         pc(data, sum_external_params = {n: phi for n in copies})
         pc.backward(data, flows_memory = 0.0)
         return [pc.get_external_params_grad(n)[0].clone() for n in copies]
 
-    tied, untied = run(True), run(False)
+    try:
+        _bs.BlockScaleSumParams._logz_tile, _ck.autotune = record, record_at
+        tied = run(True)
+        _bs.BlockScaleSumParams._logz_tile, _ck.autotune = replay, replay_at
+        untied = run(False)
+    finally:
+        _bs.BlockScaleSumParams._logz_tile = original_tile
+        _ck.autotune = original_autotune
+
+    assert recorded and replay.i == len(recorded), \
+        f"the two arms built different numbers of log-Z plans ({len(recorded)} vs {replay.i}), so " \
+        f"they did not take the same numerical path and the comparison below is not apples-to-apples"
 
     # Every copy reads back the SAME storage when tied -- if they did not, there would be nothing to
     # accumulate and the rest of the check would pass vacuously.

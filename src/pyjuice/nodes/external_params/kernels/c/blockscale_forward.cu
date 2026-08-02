@@ -173,14 +173,21 @@ int smem_bytes(int BM, int BN, int gate_cbs) {
 }
 
 
-template <int BM, int BN, int WM, int WN>
+// `SINGLE_RUN` -- whether a k-tile is exactly ONE step-run, i.e. `ch_block_size >= 64`. It is a
+// template parameter and not a runtime test because it decides the TRIP COUNTS below: left
+// runtime, the operand-staging loop's bound `(BM * step) / 8` stops being compile-time and the
+// loop no longer unrolls, which measured +2.6 to +2.9% on dense shapes. Specialized, the common
+// case generates exactly the single-transfer, fully-unrolled code it did before this kernel
+// learned to read the tables. Same reason `gate_pass` is specialized on the gate width.
+template <int BM, int BN, int WM, int WN, bool SINGLE_RUN>
 __global__ void __launch_bounds__(WM * WN * 32) blockscale_tlmm_kernel(
         float* __restrict__ node_mars, const float* __restrict__ mp,
         const float* __restrict__ ext, const long* __restrict__ nids,
-        const long* __restrict__ ebase, const long* __restrict__ pbase,
+        const long* __restrict__ cids, const long* __restrict__ pids,
         const long* __restrict__ gate, float* __restrict__ log_z_out,
         int batch, int block_size, int knt, int gate_stride,
         int node_cbs, int gate_cbs, int node_sh, int gate_sh, long ext_base, int pid_m_offset,
+        int step_sh,
         const __grid_constant__ CUtensorMap desc) {
     constexpr int NTH = WM * WN * 32;
 
@@ -189,10 +196,28 @@ __global__ void __launch_bounds__(WM * WN * 32) blockscale_tlmm_kernel(
     int nblock = pid_m / mtiles, tile_id = pid_m % mtiles;
     int b0 = pid_b * BN;
     long off_nid = nids[nblock];
-    const long* eb = ebase + (long)nblock * knt;
-    const long* pb = pbase + (long)nblock * knt;
-    const long* gt = gate + (long)nblock * gate_stride;
     int tid = threadIdx.x;
+
+    // ---- THE TABLES ARE READ AT EDGE-BLOCK GRANULARITY, NOT TILE GRANULARITY ----
+    //
+    // `step = min(node_cbs, BK)` is the widest run of compiled edge slots that is guaranteed to be
+    // contiguous in `element_mars` and `block_size`-strided in `params`. The compile step ASSERTS
+    // exactly that ("each edge block's children occupy a contiguous run of `cids`"), so a run of this
+    // width is safe for any topology -- ragged, block-sparse or dense. So the kernel indexes the
+    // COMPILED TABLES at that stride rather than deriving addresses across the whole tile.
+    //
+    // At `step == BK` (every `ch_block_size >= 64`, the common case) `neb` is 1 and this reduces
+    // EXACTLY to one bulk transfer per k-tile off `eb[kt]` -- the code this replaces. Only a child
+    // block narrower than the k-tile pays anything, and that is precisely the case that used to be
+    // refused outright.
+    const int step = SINGLE_RUN ? BK : (1 << step_sh);
+    const int neb  = SINGLE_RUN ? 1  : (BK >> step_sh);   // step-runs per k-tile
+    // The COMPILED TABLES themselves, at their own row stride (`num_edges == knt * BK`). The kernel
+    // reads the first slot of each step-run out of `cids` / `pids`; nothing is precomputed for it and
+    // nothing can drift out of step with what the layer compiled.
+    const long* ec = cids + (long)nblock * (knt * neb);
+    const long* ep = pids + (long)nblock * (knt * neb);
+    const long* gt = gate + (long)nblock * gate_stride;
 
     auto swz = composition(Swizzle<3, 3, 3>{},
                            Layout<Shape<Shape<_8, _8>, _8>, Stride<Stride<_1, _64>, _8>>{});
@@ -256,8 +281,21 @@ __global__ void __launch_bounds__(WM * WN * 32) blockscale_tlmm_kernel(
     __syncthreads();
 
     for (int kt = 0; kt < knt; kt++) {
-        long pc = pb[kt] + (long)tile_id * BM;
-        if (tid == 0) { mbar_expect(bar, BK * BN * 4); tma_load_2d(sEm, &desc, b0, (int)eb[kt], bar); }
+        // ONE BULK TRANSFER PER STEP-RUN. The box is `[BN, step]`, so `neb` of them fill the same
+        // `[BK, BN]` scratch this kernel always used, at the same total byte count -- the barrier
+        // accounting is unchanged, and at `neb == 1` this is bit-for-bit the single transfer it
+        // replaces. Each run's first child comes from `cids`, so nothing is assumed about how the
+        // runs relate to one another: they may be adjacent (dense), separated (block-sparse), or the
+        // dummy row 0 (padding).
+        if (tid == 0) {
+            mbar_expect(bar, BK * BN * 4);
+            if (SINGLE_RUN) {
+                tma_load_2d(sEm, &desc, b0, (int)ec[kt], bar);
+            } else {
+                for (int i = 0; i < neb; i++)
+                    tma_load_2d(sEm + (long)i * step * BN, &desc, b0, (int)ec[kt * neb + i], bar);
+            }
+        }
 
 
         // ---- STAGE THE GATES for this tile ----
@@ -353,16 +391,44 @@ __global__ void __launch_bounds__(WM * WN * 32) blockscale_tlmm_kernel(
             }
             *(float4*)&sB2t(bb, e) = *(const float4*)r;
         }
-        for (int i = tid; i < (BM * BK) / 8; i += NTH) {
-            int e = i / (BM / 8), mm = (i % (BM / 8)) * 8;
-            const float* g = &mp[pc + (long)e * block_size + mm];
-            float4 a = *(const float4*)g, b = *(const float4*)(g + 4);
-            bfloat16_t r[8];
-            r[0] = static_cast<bfloat16_t>(a.x); r[1] = static_cast<bfloat16_t>(a.y);
-            r[2] = static_cast<bfloat16_t>(a.z); r[3] = static_cast<bfloat16_t>(a.w);
-            r[4] = static_cast<bfloat16_t>(b.x); r[5] = static_cast<bfloat16_t>(b.y);
-            r[6] = static_cast<bfloat16_t>(b.z); r[7] = static_cast<bfloat16_t>(b.w);
-            *(float4*)&sAt(mm, e) = *(const float4*)r;
+        // The parameter base is per STEP-RUN, so the loop is nested BY RUN with the base hoisted out
+        // of the inner body. Writing it the obvious way instead -- one flat loop indexing
+        // `sPb[e >> step_sh]` per element -- cost 3.4-5.4% on DENSE shapes, because the shared-memory
+        // lookup and the two shifts land in the innermost body of the operand staging and the
+        // compiler cannot know that `neb == 1` collapses them. Nested, the common case is one pass
+        // with a single hoisted base, i.e. exactly the addressing this replaced.
+        //
+        // No clamp is needed any more either: a padded run's base is the dummy parameter 0, so the
+        // read lands in the dummy region rather than off the end of `params`.
+        if (SINGLE_RUN) {
+            const long pcr = ep[kt] + (long)tile_id * BM;
+            for (int i = tid; i < (BM * BK) / 8; i += NTH) {
+                int e = i / (BM / 8), mm = (i % (BM / 8)) * 8;
+                const float* g = &mp[pcr + (long)e * block_size + mm];
+                float4 a = *(const float4*)g, b = *(const float4*)(g + 4);
+                bfloat16_t r[8];
+                r[0] = static_cast<bfloat16_t>(a.x); r[1] = static_cast<bfloat16_t>(a.y);
+                r[2] = static_cast<bfloat16_t>(a.z); r[3] = static_cast<bfloat16_t>(a.w);
+                r[4] = static_cast<bfloat16_t>(b.x); r[5] = static_cast<bfloat16_t>(b.y);
+                r[6] = static_cast<bfloat16_t>(b.z); r[7] = static_cast<bfloat16_t>(b.w);
+                *(float4*)&sAt(mm, e) = *(const float4*)r;
+            }
+        } else {
+            for (int r0 = 0; r0 < neb; r0++) {
+                const long pcr = ep[kt * neb + r0] + (long)tile_id * BM;
+                const int e_off = r0 * step;
+                for (int i = tid; i < (BM * step) / 8; i += NTH) {
+                    int e = i / (BM / 8), mm = (i % (BM / 8)) * 8;
+                    const float* g = &mp[pcr + (long)e * block_size + mm];
+                    float4 a = *(const float4*)g, b = *(const float4*)(g + 4);
+                    bfloat16_t r[8];
+                    r[0] = static_cast<bfloat16_t>(a.x); r[1] = static_cast<bfloat16_t>(a.y);
+                    r[2] = static_cast<bfloat16_t>(a.z); r[3] = static_cast<bfloat16_t>(a.w);
+                    r[4] = static_cast<bfloat16_t>(b.x); r[5] = static_cast<bfloat16_t>(b.y);
+                    r[6] = static_cast<bfloat16_t>(b.z); r[7] = static_cast<bfloat16_t>(b.w);
+                    *(float4*)&sAt(mm, e_off + e) = *(const float4*)r;
+                }
+            }
         }
 
         __syncthreads();
@@ -414,33 +480,38 @@ __global__ void __launch_bounds__(WM * WN * 32) blockscale_tlmm_kernel(
 
 template <int BM, int BN, int WM, int WN>
 static void launch_cfg(torch::Tensor node_mars, torch::Tensor element_mars, torch::Tensor params,
-                       torch::Tensor ext, torch::Tensor nids, torch::Tensor ebase,
-                       torch::Tensor pbase, torch::Tensor gate, torch::Tensor log_z,
+                       torch::Tensor ext, torch::Tensor nids, torch::Tensor cids,
+                       torch::Tensor pids, torch::Tensor gate, torch::Tensor log_z,
                        int batch, int block_size, int knt, int node_cbs, int gate_cbs,
-                       int node_sh, int gate_sh, long ext_base) {
+                       int node_sh, int gate_sh, long ext_base, int step_sh) {
     // `gcbs_eff` mirrors the kernel: a gate may be wider than one edge tile
     constexpr int NTH = WM * WN * 32;
     int n_edge_rows = element_mars.size(0);
     void* base = (void*)element_mars.data_ptr<float>();
 
+    // The box is `[BN, step]`: one bulk transfer per step-run, so `step` is part of the descriptor's
+    // identity and therefore of its cache key.
+    const int step = 1 << step_sh;
     static CUtensorMap desc;
     static void* desc_ptr = nullptr;
-    static int desc_rows = 0, desc_batch = 0;
-    if (base != desc_ptr || n_edge_rows != desc_rows || batch != desc_batch) {
+    static int desc_rows = 0, desc_batch = 0, desc_step = 0;
+    if (base != desc_ptr || n_edge_rows != desc_rows || batch != desc_batch || step != desc_step) {
         cuuint64_t gdim[2] = {(cuuint64_t)batch, (cuuint64_t)n_edge_rows};
         cuuint64_t gstride[1] = {(cuuint64_t)batch * 4};
-        cuuint32_t bdim[2] = {(cuuint32_t)BN, (cuuint32_t)BK};
+        cuuint32_t bdim[2] = {(cuuint32_t)BN, (cuuint32_t)step};
         cuuint32_t estride[2] = {1, 1};
         CUresult r = cuTensorMapEncodeTiled(
             &desc, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, 2, base, gdim, gstride, bdim, estride,
             CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
             CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
         TORCH_CHECK(r == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed: ", (int)r);
-        desc_ptr = base; desc_rows = n_edge_rows; desc_batch = batch;
+        desc_ptr = base; desc_rows = n_edge_rows; desc_batch = batch; desc_step = step;
     }
 
+    const bool single = (step == BK);
     const int smem = smem_bytes(BM, BN, gate_cbs);
-    TORCH_CHECK(cudaFuncSetAttribute(blockscale_tlmm_kernel<BM, BN, WM, WN>,
+    TORCH_CHECK(cudaFuncSetAttribute(single ? (const void*)blockscale_tlmm_kernel<BM, BN, WM, WN, true>
+                                            : (const void*)blockscale_tlmm_kernel<BM, BN, WM, WN, false>,
                                      cudaFuncAttributeMaxDynamicSharedMemorySize, smem)
                     == cudaSuccess,
                 "blockscale forward: this tile needs ", smem, " B of shared memory, which this device "
@@ -451,13 +522,17 @@ static void launch_cfg(torch::Tensor node_mars, torch::Tensor element_mars, torc
     for (int off = 0; off < total_m; off += MAX_Y) {
         int chunk = (total_m - off < MAX_Y) ? (total_m - off) : MAX_Y;
         dim3 grid(batch / BN, chunk);
-        blockscale_tlmm_kernel<BM, BN, WM, WN><<<grid, NTH, smem, c10::cuda::getCurrentCUDAStream()>>>(
-            node_mars.data_ptr<float>(), params.data_ptr<float>(), ext.data_ptr<float>(),
-            nids.data_ptr<long>(), ebase.data_ptr<long>(), pbase.data_ptr<long>(),
-            gate.data_ptr<long>(),
-            log_z.numel() ? log_z.data_ptr<float>() : nullptr,
-            batch, block_size, knt, (int)gate.size(1),
-            node_cbs, gate_cbs, node_sh, gate_sh, ext_base, off, desc);
+#define BS_LAUNCH(SR)                                                                              \
+        blockscale_tlmm_kernel<BM, BN, WM, WN, SR><<<grid, NTH, smem,                              \
+                                                     c10::cuda::getCurrentCUDAStream()>>>(         \
+            node_mars.data_ptr<float>(), params.data_ptr<float>(), ext.data_ptr<float>(),          \
+            nids.data_ptr<long>(), cids.data_ptr<long>(), pids.data_ptr<long>(),                   \
+            gate.data_ptr<long>(),                                                                 \
+            log_z.numel() ? log_z.data_ptr<float>() : nullptr,                                     \
+            batch, block_size, knt, (int)gate.size(1),                                             \
+            node_cbs, gate_cbs, node_sh, gate_sh, ext_base, off, step_sh, desc)
+        if (single) { BS_LAUNCH(true); } else { BS_LAUNCH(false); }
+#undef BS_LAUNCH
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 }
@@ -497,8 +572,8 @@ std::vector<std::vector<int>> configs() {
 
 
 void blockscale_forward(torch::Tensor node_mars, torch::Tensor element_mars, torch::Tensor params,
-                        torch::Tensor ext, torch::Tensor nids, torch::Tensor ebase,
-                        torch::Tensor pbase, torch::Tensor pids, torch::Tensor gate,
+                        torch::Tensor ext, torch::Tensor nids, torch::Tensor cids,
+                        torch::Tensor pids, torch::Tensor gate,
                         torch::Tensor log_z,
                         int64_t block_size, int64_t num_edges, int64_t node_cbs, int64_t gate_cbs,
                         int64_t n_node_gates, int64_t ext_base, int64_t cfg) {
@@ -525,25 +600,35 @@ void blockscale_forward(torch::Tensor node_mars, torch::Tensor element_mars, tor
     const int node_sh = (int)std::log2((double)node_cbs);
     const int gate_sh = (int)std::log2((double)gate_cbs);
 
+    // `step` -- the widest run of compiled edge slots guaranteed contiguous in `element_mars` and
+    // `block_size`-strided in `params`. That is one edge block, clamped to the k-tile. The kernel
+    // reads the first slot of each step-run straight out of the compiled `cids` / `pids`, so it makes
+    // no assumption about how the runs relate to one another.
+    const int step = ((int)node_cbs < BK) ? (int)node_cbs : BK;
+    const int step_sh = (int)std::log2((double)step);
+    TORCH_CHECK(cids.size(1) == num_edges / step && pids.size(1) == cids.size(1),
+                "blockscale forward: cids/pids must hold one entry per step-run (",
+                num_edges / step, "), got ", cids.size(1));
+
     switch (cfg) {
-        case 0: launch_cfg<128, 64, 2, 2>(node_mars, element_mars, params, ext, nids, ebase, pbase,
+        case 0: launch_cfg<128, 64, 2, 2>(node_mars, element_mars, params, ext, nids, cids, pids,
                                           gate, log_z, batch, (int)block_size, knt,
-                                          (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base); break;
-        case 1: launch_cfg<64, 64, 2, 2>(node_mars, element_mars, params, ext, nids, ebase, pbase,
+                                          (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base, step_sh); break;
+        case 1: launch_cfg<64, 64, 2, 2>(node_mars, element_mars, params, ext, nids, cids, pids,
                                          gate, log_z, batch, (int)block_size, knt,
-                                         (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base); break;
-        case 2: launch_cfg<256, 64, 4, 2>(node_mars, element_mars, params, ext, nids, ebase, pbase,
+                                         (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base, step_sh); break;
+        case 2: launch_cfg<256, 64, 4, 2>(node_mars, element_mars, params, ext, nids, cids, pids,
                                           gate, log_z, batch, (int)block_size, knt,
-                                          (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base); break;
-        case 3: launch_cfg<128, 128, 2, 4>(node_mars, element_mars, params, ext, nids, ebase, pbase,
+                                          (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base, step_sh); break;
+        case 3: launch_cfg<128, 128, 2, 4>(node_mars, element_mars, params, ext, nids, cids, pids,
                                            gate, log_z, batch, (int)block_size, knt,
-                                           (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base); break;
-        case 4: launch_cfg<64, 64, 4, 2>(node_mars, element_mars, params, ext, nids, ebase, pbase,
+                                           (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base, step_sh); break;
+        case 4: launch_cfg<64, 64, 4, 2>(node_mars, element_mars, params, ext, nids, cids, pids,
                                          gate, log_z, batch, (int)block_size, knt,
-                                         (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base); break;
-        default: launch_cfg<128, 64, 4, 2>(node_mars, element_mars, params, ext, nids, ebase, pbase,
+                                         (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base, step_sh); break;
+        default: launch_cfg<128, 64, 4, 2>(node_mars, element_mars, params, ext, nids, cids, pids,
                                            gate, log_z, batch, (int)block_size, knt,
-                                           (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base); break;
+                                           (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base, step_sh); break;
     }
 }
 

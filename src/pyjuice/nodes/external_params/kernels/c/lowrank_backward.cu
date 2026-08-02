@@ -94,7 +94,18 @@ __global__ void lowrank_bw_v_kernel(
 
     if (b >= batch_size) return;
 
-    const long xv_v = xv[re] + ext_base;
+    // Padded edge block -- no factor is stored for it, so there is no gradient to write and nothing to
+    // contribute. Placed after the `__syncthreads()` above so the staging stays uniform; `-inf` is the
+    // identity of the log-sum-exp that pass B reduces these partials into.
+    const long xv_raw = xv[re];
+    if (xv_raw < 0) {
+        const long po = (((long)re * rank + r) * n_ntiles + nt) * batch_size + b;
+        p_lp[po] = -INFINITY;
+        p_lq[po] = -INFINITY;
+        return;
+    }
+
+    const long xv_v = xv_raw + ext_base;
     const long wa = ((long)re * rank + r) * batch_size + b;
     const float lw = log_w[wa];
     const float la = log_a[wa];
@@ -210,7 +221,13 @@ __global__ void lowrank_bw_u_kernel(
     const int b = b0 + (tid % TB);
     if (c >= ch_block_size || b >= batch_size) return;
 
-    const long xu_v = xu[re] + ext_base;
+    // Padded edge block -- no `dLL/dU` to write, and no child flow either: the slot's `cids` point at
+    // the dummy element, whose flow must stay untouched. Nothing above this line has written anything
+    // and there is no `__syncthreads()` in this kernel, so returning outright is safe.
+    const long xu_raw = xu[re];
+    if (xu_raw < 0) return;
+
+    const long xu_v = xu_raw + ext_base;
     const long cid_base = (long)row * num_edges + (long)j * ch_block_size;
     const float e = emars[cids[cid_base + c] * batch_size + b];
 

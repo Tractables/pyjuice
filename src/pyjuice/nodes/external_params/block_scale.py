@@ -219,9 +219,23 @@ class BlockScaleSumParams(ExternalSumParams):
         # reduction per subgroup. Rejected here rather than silently mis-computed in the kernel.
         if gate_bs != ns.block_size:
             raise NotImplementedError(
-                f"a gate `block_size` smaller than the node's is not supported yet (got {gate_bs} vs "
-                f"{ns.block_size}). Refining the gate's `ch_block_size` is free and is usually what is "
-                f"wanted; splitting the node axis needs a separate kernel."
+                f"a gate `block_size` ({gate_bs}) smaller than the node's ({ns.block_size}) would vary "
+                f"`phi` ACROSS the nodes of one block, which cannot share the staged tile: the gate "
+                f"stops factoring out of the contraction, because it would then depend on the matmul's "
+                f"output row as well as on the child.\n\n"
+                f"Two ways to get what you want, and the first is usually right:\n"
+                f"  * refine the gate's `ch_block_size` instead. That axis is FREE -- the fold is "
+                f"elementwise in the child index -- and is what the type is designed around.\n"
+                f"  * if you specifically need a gate finer than {ns.block_size} along the NODE axis, "
+                f"build the node AT that size: `summate(..., block_size = {gate_bs}, "
+                f"external_params = BlockScaleSumParams(ch_block_size = ...))`, leaving the gate's "
+                f"`block_size` to default. This expresses the same model and asks you for the SAME "
+                f"gate tensor -- its shape is `num_nodes // gate_block_size` either way, so nothing "
+                f"in your code changes but this call.\n\n"
+                f"The second is not done for you because it taxes the whole layer rather than just "
+                f"the gate: the node tile of the standard kernels collapses with `block_size` (below "
+                f"the 16 rows an efficient MMA wants), and the compiled index tensors grow as "
+                f"`K^2 / block_size`. That is a real cost and it should be yours to choose."
             )
 
         if ns.edge_ids.size(1) == 1 and gate_cbs == ns.ch_block_size:
@@ -307,14 +321,12 @@ class BlockScaleSumParams(ExternalSumParams):
         from .kernels.c import get_cute_module, get_sb_module
         import pyjuice.layer.kernels.c as ck
 
+        # NEITHER CUDA extension is required any more. The CuTe forward needs nvcc, CUTLASS and
+        # sm_90+, and the small-batch forward needs nvcc, so a machine without a CUDA toolchain used
+        # to be refused outright here. The portable Triton fork below serves those machines -- slower
+        # than either, but the alternative was not running at all.
         mod = get_cute_module()
         sb_mod = get_sb_module()
-        if mod is None and sb_mod is None:
-            raise NotImplementedError(
-                "`BlockScaleSumParams` needs one of its CUDA extensions, and neither is available here "
-                "(the CuTe forward needs nvcc, CUTLASS and sm_90+; the small-batch forward needs only "
-                "nvcc). There is no Triton fallback -- see the compile warning above."
-            )
 
         if getattr(layer, "ext_slots", None) is None:
             raise NotImplementedError(
@@ -376,7 +388,7 @@ class BlockScaleSumParams(ExternalSumParams):
                     // external_params.element_size()) // batch_size
 
         dev = node_mars.device
-        calls, sb_calls, shift_args = [], [], []
+        calls, sb_calls, shift_args, log_zs = [], [], [], []
         for partition_id in range(layer.num_fw_partitions):
             nids = layer.partitioned_nids[partition_id]
             cids = layer.partitioned_cids[partition_id]
@@ -398,33 +410,108 @@ class BlockScaleSumParams(ExternalSumParams):
             # (see `pre_backward_layer`). Collected here rather than dug out of `calls` afterwards,
             # because the two kernels order their arguments differently.
             shift_args.append((nids, log_z, rows))
+            log_zs.append(log_z)
 
             c2 = cids.to(torch.int64)
             p2 = pids.to(torch.int64)
             ar_e = torch.arange(num_edges, device = cids.device, dtype = torch.int64)
 
-            # ---- the CuTe fork's layout: contiguous children and block_size-strided params PER TILE
-            if valid and num_edges % 64 == 0:
-                knt = num_edges // 64
-                c3, p3 = c2.view(-1, knt, 64), p2.view(-1, knt, 64)
-                ebase = c3[:, :, 0].contiguous()
-                pbase = p3[:, :, 0].contiguous()
-                ar = torch.arange(64, device = cids.device, dtype = torch.int64)
+            # PADDED SLOTS ARE EXCUSED from the contiguity requirements below, because the kernels
+            # already compute exactly nothing for them.
+            #
+            # A row with fewer edge blocks than the partition's width is padded out with `cids == 0`
+            # and `pids == 0` -- the dummy element and the dummy parameter -- and that is an EXACT
+            # test, not a heuristic: a real child is an element `>= num_dummy_eles > 0` and a real
+            # parameter is `>= num_dummy_params > 0`.
+            #
+            # Requiring contiguity over such a slot is what refused every ragged topology. It is not
+            # something the kernels need. `ext_slots` carries `-1` for a padded EDGE BLOCK, the
+            # forward reads that as `log phi = -inf`, and the fold happens BEFORE the max-stabilizer
+            # is taken -- so a padded lane is `-inf` in the staged `element_mars` and contributes
+            # exactly zero to `N`, while its normalizer operand `exp(log phi - mz)` is exactly zero
+            # and so it contributes nothing to `Z` either. Neither depends on what the lane's DERIVED
+            # addresses (`ebase + j`, `pbase + j * block_size`) happen to read, which is what lets the
+            # base+stride addressing survive a padded -- even a part-padded -- tile. The gate table is
+            # indexed per edge block, which is FINER than the 64-wide tile, so this covers a tile that
+            # is part real and part padding, not merely a wholly padded one.
+            #
+            # What must still be refused is genuine BLOCK-SPARSITY: a row whose REAL children are not
+            # a contiguous run cannot be addressed from one base at all. Hence the mask rather than
+            # dropping the check.
+            pad = (c2 == 0) & (p2 == 0)
+            assert bool((((c2 == 0) == (p2 == 0))).all()), \
+                "`cids == 0` and `pids == 0` disagree on which compiled slots are padding; the " \
+                "padding convention this relaxation depends on has changed."
 
-                if (torch.equal(c3, ebase.unsqueeze(-1) + ar.view(1, 1, -1))
-                        and torch.equal(p3, pbase.unsqueeze(-1) + ar.view(1, 1, -1) * block_size)):
-                    calls.append((nids, ebase, pbase, pids, gate, log_z,
+            # ---- the CuTe fork reads the COMPILED TABLES at step-run granularity ----
+            #
+            # `step = min(node_cbs, 64)` is the widest run of compiled edge slots that the compile
+            # step GUARANTEES is contiguous in `element_mars` and `block_size`-strided in `params`:
+            # `_compile_partition_edge_block_ids` asserts "each edge block's children occupy a
+            # contiguous run of `cids`". So the kernel takes one `cids` / `pids` entry per step-run
+            # and issues one bulk transfer per run, instead of assuming a whole 64-wide tile is one
+            # run. That holds for ANY topology -- dense, ragged or block-sparse -- and it is why this
+            # fork no longer needs a contiguity test, a padding mask, or a bounds clamp:
+            #
+            #   * a padded run has `cids == 0` / `pids == 0`, the dummy `-inf` element and the dummy
+            #     zero parameter, exactly as the plain sum layer's padding works;
+            #   * a block-sparse row's runs simply sit at unrelated offsets, which is now expressible.
+            #
+            # The within-run property is still VERIFIED rather than trusted -- it is an invariant of
+            # another module, and a silent violation would be a wrong answer rather than a crash.
+            if valid and num_edges % 64 == 0:
+                step = min(node_cbs, 64)
+                nrun = num_edges // step
+                c3, p3 = c2.view(-1, nrun, step), p2.view(-1, nrun, step)
+                ar = torch.arange(step, device = cids.device, dtype = torch.int64)
+
+                # A run is all-or-nothing padded: padding is applied by whole edge blocks and a run
+                # lies inside one, so it cannot be part real and part padding. Asserted, because the
+                # verification below relies on it -- a padded run is all zeros rather than a
+                # contiguous run starting at zero, so it has to be excused rather than checked.
+                pad3 = pad.view(-1, nrun, step)
+                assert bool((pad3.any(-1) == pad3.all(-1)).all()), \
+                    "a step-run is part real and part padding, which the compiled layout should " \
+                    "make impossible (padding is by whole edge blocks)."
+                run_pad = pad3.all(-1).unsqueeze(-1)
+
+                if (bool(((c3 == c3[:, :, :1] + ar.view(1, 1, -1)) | run_pad).all())
+                        and bool(((p3 == p3[:, :, :1]
+                                   + ar.view(1, 1, -1) * block_size) | run_pad).all())):
+                    # The COMPILED TABLES go to the kernel unchanged -- no derived `ebase` / `pbase`
+                    # slices to build here or to drift from what the layer compiled.
+                    calls.append((nids, c3[:, :, 0].contiguous(), p3[:, :, 0].contiguous(),
+                                  gate, log_z,
                                   block_size, num_edges, node_cbs, gate_cbs, n_node_gates,
                                   ext_base, cfg))
 
-            # ---- the small-batch kernel's layout: the same, but across the WHOLE row at once
-            if sb_ok:
-                eb_row = c2[:, 0].contiguous()
-                pb_row = p2[:, 0].contiguous()
-                if (torch.equal(c2, eb_row.unsqueeze(-1) + ar_e.view(1, -1))
-                        and torch.equal(p2, pb_row.unsqueeze(-1) + ar_e.view(1, -1) * block_size)):
-                    sb_calls.append((nids, eb_row, pb_row, gate, log_z,
-                                     block_size, num_edges, node_cbs, gate_cbs, ext_base, 0))
+            # ---- the small-batch kernel reads the same tables, at EDGE-BLOCK granularity
+            #
+            # It loops per gate and already resolves the edge block for its gate lookup, so it takes
+            # that block's `cids` / `pids` entry directly. A gate lies inside one edge block
+            # (`gate_cbs` divides `node_cbs`), so its inner loop stays within the run the compile step
+            # guarantees is contiguous -- the same invariant the CuTe fork relies on, at the same
+            # granularity. It therefore needs no whole-row contiguity, no padding mask and no reach
+            # bound; a padded block's entries are the dummies and contribute nothing.
+            if sb_ok and num_edges % node_cbs == 0:
+                nblk = num_edges // node_cbs
+                cb, pbk = c2.view(-1, nblk, node_cbs), p2.view(-1, nblk, node_cbs)
+                arb = torch.arange(node_cbs, device = cids.device, dtype = torch.int64)
+                blk_pad = ((cb == 0) & (pbk == 0)).all(-1).unsqueeze(-1)
+                if (bool(((cb == cb[:, :, :1] + arb.view(1, 1, -1)) | blk_pad).all())
+                        and bool(((pbk == pbk[:, :, :1]
+                                   + arb.view(1, 1, -1) * block_size) | blk_pad).all())):
+                    # Whether the WHOLE row is one contiguous run -- the dense fully-connected case.
+                    # The kernel specializes on it: reading a base per edge block costs two dependent
+                    # global loads per gate, standing in front of the parameter address, which
+                    # measured +9.5% where it is not needed. When it holds, the kernel keeps the
+                    # single pair of row bases it always used.
+                    row_contig = bool((c2 == c2[:, :1] + ar_e.view(1, -1)).all()
+                                      and (p2 == p2[:, :1] + ar_e.view(1, -1) * block_size).all())
+                    sb_calls.append((nids, cb[:, :, 0].contiguous(), pbk[:, :, 0].contiguous(),
+                                     gate, log_z,
+                                     block_size, num_edges, node_cbs, gate_cbs, ext_base,
+                                     int(row_contig), 0))
 
         # Every partition must be served by the same kernel -- a plan that covers only some of them
         # would silently leave the rest of the layer unevaluated.
@@ -433,7 +520,49 @@ class BlockScaleSumParams(ExternalSumParams):
         if len(sb_calls) != layer.num_fw_partitions:
             sb_calls = []
 
-        if not calls and not sb_calls:
+        # ---- the PORTABLE Triton fallback ----
+        #
+        # A FALLBACK, deliberately not an autotune candidate. Offered only where neither CUDA fork
+        # applies, so a shape they do serve keeps exactly the candidate list, the measurement and the
+        # pick it had before this existed -- and never pays to COMPILE a Triton kernel it would not
+        # use, which is the mistake that once put 230s of compilation into the test suite.
+        #
+        # It exists for reach rather than speed: both CUDA forks need nvcc (and the CuTe one CUTLASS
+        # and sm_90+), so without a CUDA toolchain this parameterization was refused outright rather
+        # than merely being slow. It also has no layout requirements at all, reading `nids`/`cids`/
+        # `pids` per lane, so it serves any topology the compiler produces.
+        tri_calls = []
+        if not calls:
+            import triton
+            for partition_id in range(layer.num_fw_partitions):
+                nids = layer.partitioned_nids[partition_id]
+                cids = layer.partitioned_cids[partition_id]
+                pids = layer.partitioned_pids[partition_id]
+                gate = layer.ext_slots[0][partition_id]
+                ne = cids.size(1)
+
+                tile_m = min(block_size, 16 if block_size >= 16 else block_size)
+                tile_k = min(ne, 64)
+                blk_b = min(triton.next_power_of_2(batch_size), 64)
+                tl_dot = 1 if (tile_m >= 16 and tile_k >= 16 and blk_b >= 16) else 0
+                tri_calls.append(dict(
+                    nids = nids, cids = cids.to(torch.int64), pids = pids.to(torch.int64),
+                    gate = gate, log_z = log_zs[partition_id],
+                    num_edges = ne, BLOCK_B = blk_b, TILE_SIZE_K = tile_k,
+                    K_NUM_TILES = triton.cdiv(ne, tile_k), TILE_SIZE_M = tile_m,
+                    BLOCK_SIZE_M = block_size, TL_DOT = tl_dot,
+                    grid = (triton.cdiv(batch_size, blk_b),
+                            nids.size(0) * (block_size // tile_m)),
+                ))
+
+            if not sb_calls:
+                layer._bs_bw_state = {
+                    "block_size": block_size, "batch_size": batch_size, "ext_base": ext_base,
+                    "gate_cbs": gate_cbs, "node_cbs": node_cbs, "shift_args": shift_args,
+                }
+                return "triton", "fw", tri_calls
+
+        if False:
             raise NotImplementedError(
                 f"no block-scale forward applies to this layer: block_size={block_size}, "
                 f"batch={batch_size}, gate ch_block_size={gate_cbs}, CuTe tiles="
@@ -481,6 +610,24 @@ class BlockScaleSumParams(ExternalSumParams):
 
             return run
 
+        def _tri_runner(tcalls):
+            from .kernels.blockscale_forward import _bs_triton_fw_kernel
+
+            def run():
+                for _ in range(REPEATS):
+                    for c in tcalls:
+                        _bs_triton_fw_kernel[c["grid"]](
+                            node_mars = node_mars, element_mars = element_mars, mparams = params,
+                            ext = external_params, gate = c["gate"], log_z = c["log_z"],
+                            nids = c["nids"], cids = c["cids"], pids = c["pids"],
+                            batch_size = batch_size, num_edges = c["num_edges"],
+                            BLOCK_B = c["BLOCK_B"], TILE_SIZE_K = c["TILE_SIZE_K"],
+                            K_NUM_TILES = c["K_NUM_TILES"], TILE_SIZE_M = c["TILE_SIZE_M"],
+                            BLOCK_SIZE_M = c["BLOCK_SIZE_M"], TL_DOT = c["TL_DOT"],
+                            NODE_CBS = node_cbs, GATE_CBS = gate_cbs,
+                            gate_stride = c["gate"].size(1), ext_base = ext_base, num_stages = 1)
+            return run
+
         cands = []
         if calls:
             for i in valid:
@@ -489,8 +636,27 @@ class BlockScaleSumParams(ExternalSumParams):
             for i in range(len(sb_mod.blockscale_sb_configs())):
                 cands.append((("sb", i), _runner(sb_mod.blockscale_sb_forward, sb_calls, i)))
 
+        # The portable fork is a CANDIDATE only where the CuTe fork is ineligible -- which is where
+        # the small-batch one otherwise takes shapes it was never meant for. Its grid is one block per
+        # (node group, SAMPLE), so the parameters are re-read once per sample: at `block_size = 32`,
+        # where `block_size % BM == 0` rules the CuTe fork out for every BM >= 64, that made a
+        # K=1024 / batch-512 forward 455us against Triton's 158us. Measured rather than ruled, since
+        # below batch ~64 the small-batch fork is still the better of the two.
+        #
+        # Deliberately NOT offered where the CuTe fork applies: those shapes keep exactly the
+        # candidates and the pick they had, and never pay to compile a kernel they will not use.
+        if tri_calls and not calls:
+            cands.append((("tri", 0), _tri_runner(tri_calls)))
+
         best = ck.autotune(cands, warmup = 2, reps = 9) or cands[0][0]
         kind, best_cfg = best
+
+        if kind == "tri":
+            layer._bs_bw_state = {
+                "block_size": block_size, "batch_size": batch_size, "ext_base": ext_base,
+                "gate_cbs": gate_cbs, "node_cbs": node_cbs, "shift_args": shift_args,
+            }
+            return "triton", "fw", tri_calls
 
         if kind == "cute":
             out_mod, fname, calls = mod, "blockscale_forward", _with_cfg(calls, best_cfg)
@@ -534,6 +700,26 @@ class BlockScaleSumParams(ExternalSumParams):
             layer._bs_fw_plan = entry
 
         mod, fname, calls = entry[1]
+
+        if mod == "triton":
+            # The portable fallback: `calls` are kwarg dicts rather than positional tuples, since
+            # this kernel takes its tiling as constexprs rather than a config id.
+            from .kernels.blockscale_forward import _bs_triton_fw_kernel
+            for c in calls:
+                _bs_triton_fw_kernel[c["grid"]](
+                    node_mars = node_mars, element_mars = element_mars, mparams = params,
+                    ext = external_params, gate = c["gate"], log_z = c["log_z"],
+                    nids = c["nids"], cids = c["cids"], pids = c["pids"],
+                    batch_size = node_mars.size(1), num_edges = c["num_edges"],
+                    BLOCK_B = c["BLOCK_B"], TILE_SIZE_K = c["TILE_SIZE_K"],
+                    K_NUM_TILES = c["K_NUM_TILES"], TILE_SIZE_M = c["TILE_SIZE_M"],
+                    BLOCK_SIZE_M = c["BLOCK_SIZE_M"], TL_DOT = c["TL_DOT"],
+                    NODE_CBS = layer._bs_bw_state["node_cbs"],
+                    GATE_CBS = layer._bs_bw_state["gate_cbs"],
+                    gate_stride = c["gate"].size(1),
+                    ext_base = layer._bs_bw_state["ext_base"], num_stages = 1)
+            return None
+
         fn = getattr(mod, fname)
         for args in calls:
             fn(node_mars, element_mars, params, external_params, *args)
@@ -588,7 +774,11 @@ class BlockScaleSumParams(ExternalSumParams):
         flat = ele_ebase.reshape(-1).to(torch.long)
         blk = nid_sorted[(torch.searchsorted(nid_sorted, flat, right = True) - 1).clamp(min = 0)]
 
-        q = blk * _KEY_STRIDE + chids.view(-1, 1).expand_as(ele_ebase).reshape(-1)
+        # `ele_ebase` may carry a trailing GROUP axis ([n_eleblocks, K_NUM_TILES, ptr_inc_step])
+        # when a k-tile spans several parent blocks, so the child ids are broadcast against
+        # whatever its trailing shape is rather than assuming it is 2-D.
+        q = blk * _KEY_STRIDE + chids.view((-1,) + (1,) * (ele_ebase.dim() - 1)) \
+                                     .expand_as(ele_ebase).reshape(-1)
 
         pos = torch.searchsorted(key, q).clamp(max = key.numel() - 1)
         hit = key[pos] == q
@@ -621,6 +811,26 @@ class BlockScaleSumParams(ExternalSumParams):
         whatever produced it, so a future aliasing route cannot quietly slip past a `tie_external`
         check. Only the rows actually emitted are compared -- the table repeats a gate across the TPB
         k-tiles of one parent block BY DESIGN, and those are accumulated in-register before the write.
+
+        THAT GENERALITY IS WHAT MAKES RAGGED LAYERS SAFE, and it is worth spelling out because the
+        third aliasing route arrived later and by a completely different road. On a padded layer
+        `_gate_bw_table` hands a wholly-padded k-tile a REAL gate row -- its `ele_ebase` is the dummy
+        node 0, and the `searchsorted(...).clamp(min = 0)` below maps that onto the FIRST node block,
+        which is usually connected. Call it a phantom. A phantom is inert for the flows and for an
+        ATOMIC gradient (the tile's parents are dummy nodes, so `log_n_fdm_max` is -inf, the tile
+        drops, and `contrib` is exactly 0), but a STORE of that 0 would overwrite whatever the real
+        owner of that row had accumulated. MEASURED with the store forced on such a shape: the
+        reference-free zero-sum invariant goes from 3e-5 to 1.2e-1, and the error exceeds the
+        gradient's own magnitude.
+
+        No special case is needed, because a phantom IS a duplicated emitted row and duplicates are
+        exactly what this tests. Verified rather than assumed: on the padded shapes the FIRST
+        condition is False (the tile is not narrower than a gate, so it is not what declines the
+        store) and the duplicate count equals the phantom count. It is structural, not luck -- padding
+        is by whole parent blocks, so a padded block's every k-tile is a phantom including the one
+        that gets emitted. If `_gate_bw_table` is ever changed to return `-1` for padded tiles the
+        phantoms disappear, this returns True on ragged layers, and that is CORRECT -- there would
+        then be nothing to overwrite.
         """
         if ctx["TILE_SIZE_M"] < gate_cbs or self.tie_external:
             return False
@@ -630,6 +840,44 @@ class BlockScaleSumParams(ExternalSumParams):
         emitted = gate_tile[:, tpb - 1::tpb]
         pos = emitted[emitted >= 0]
         return int(torch.unique(pos).numel()) == int(pos.numel())
+
+    def _par_write_flags(self, layer, cids, pfids):
+        """
+        `(PADDED, PF_ATOMIC)` for `_bs_triton_par_kernel`, cached per compiled partition.
+
+        This kernel is the sum layer's UNCONDITIONAL param fallback, so it runs precisely where
+        `_par_flow_collision_free` failed and the guarded CuTe / small-batch forks were skipped. It
+        therefore has to decide for itself what made the write unsafe:
+
+        * `PADDED` -- the partition has padded slots (`cids == 0`, exact: a real child is an element
+          `>= num_dummy_eles > 0`). Their `pfids` are all 0, which `param_flows` gives to a REAL edge
+          block, so a padded lane's `+0.0` read-add-store can discard a real update. Masked out.
+        * `PF_ATOMIC` -- the slots that are actually WRITTEN still collide, which masking cannot fix.
+          Parameter tying does this: two members of one tie group in the same layer share a
+          `_param_flow_range` and so compile to identical `pfids` rows.
+
+        Judged on the real slots alone, which is the point: a ragged untied layer collides only
+        through its padding, so masking restores collision-freedom and the fast non-atomic
+        read-add-store survives. Atomics are then paid only where they are genuinely required.
+
+        Cached because `torch.unique` on every backward would be a per-call cost on the hot path;
+        keyed by tensor identity, like `SumLayer._par_flow_collision_free` itself.
+        """
+        cache = getattr(layer, "_bs_bw_gate_cache", None)
+        if cache is None:
+            cache = layer._bs_bw_gate_cache = dict()
+
+        key = ("parwrite", id(cids), id(pfids))
+        flags = cache.get(key)
+        if flags is None:
+            real = cids != 0
+            padded = not bool(real.all())
+            written = pfids[real] if padded else pfids
+            flags = (1 if padded else 0,
+                     0 if layer._par_flow_collision_free(written.contiguous()) else 1)
+            cache[key] = flags
+
+        return flags
 
     def _bw_state(self, layer, node_mars, kwargs):
         """The forward's leftovers, checked against the call the backward is running under."""
@@ -760,14 +1008,30 @@ class BlockScaleSumParams(ExternalSumParams):
             plan = {"gate_tile": None, "gate_sb": None, "sb": None}
             kinds = []
 
-            if ctx["ptr_inc_step"] == 1:
-                plan["gate_tile"] = self._gate_bw_table(layer, chids, ebase)
+            # ONE GATE ROW PER (k-tile, PARENT GROUP). `ele_ebase` from the layer is the group-0
+            # slice, which is all the CuTe and small-batch forks can use; the Triton fork handles
+            # several groups per tile, so its table is built from the FULL reconstruction. That is
+            # the same telescoping cumsum `SumLayer` does, minus the `[:, :, 0]` -- `parids_increment`
+            # is literally the first difference of `parids`, so this is exact for any `parids`.
+            #
+            # At `ptr_inc_step == 1` the result is `[n, K, 1]` and flattens to precisely the table
+            # this used to build.
+            pinc = ctx["ptr_inc_step"]
+            _c = torch.cumsum(ctx["parids_increment"].to(torch.int64), 1)
+            _sh = torch.zeros_like(_c)
+            _sh[:, 1:] = _c[:, :-1]
+            full_ebase = ctx["parids_start"][:, None, :].to(torch.int64) + _sh   # [n, K, pinc]
+            plan["gate_tile"] = self._gate_bw_table(layer, chids, full_ebase) \
+                                    .reshape(full_ebase.size(0), -1).contiguous()
 
-            if (ele_mod is not None and ctx["ele_cuda_ok"] and tk == 64
+            # The CuTe fork still reads ONE gate per k-tile, so it needs a tile to lie in a single
+            # parent block. Only the Triton fork splits the contraction per group.
+            if (ele_mod is not None and ctx["ele_cuda_ok"] and tk == 64 and pinc == 1
                     and cbs % 128 == 0 and batch % 64 == 0 and plan["gate_tile"] is not None):
                 kinds.append("cute")
 
-            if sb_mod is not None and batch < 16 and ne % blk == 0 and ctx["ele_cuda_ok"]:
+            if (sb_mod is not None and batch < 16 and ne % blk == 0 and ctx["ele_cuda_ok"]
+                    and pinc == 1):
                 art = torch.arange(knt, device = ebase.device, dtype = torch.int64).view(1, -1)
                 if (torch.equal(ebase, ebase[:, :1] + art * tk)
                         and torch.equal(pbase, pbase[:, :1] + art * tk)):
@@ -894,10 +1158,27 @@ class BlockScaleSumParams(ExternalSumParams):
             gb = layer.ext_slots[0][ctx["partition_id"]]
             batch, blk, ne = ctx["batch_size"], ctx["block_size"], ctx["num_edges"]
 
+            # BOTH candidates below write `param_flows` non-atomically, and neither takes a padding
+            # mask. That is sound only because the sum layer reaches this hook from behind `par_ok`,
+            # which requires collision-free `pfids` AND edge-contiguous `cids`. Restated here as an
+            # assertion rather than left as an assumption: the guard lives in another file, and if it
+            # is ever loosened the failure mode is a silent lost update, not a crash.
+            #
+            # Asked of `_par_write_flags`, which CACHES per compiled tensor, rather than recomputing
+            # the predicates here. Written the obvious way -- `bool((ctx["cids"] != 0).all())` inline
+            # -- this ran a full device reduction AND forced a sync on every backward, and cost 16%
+            # of the whole gated backward at batch 512. A correctness assert on a hot path has to be
+            # free, or it stops being worth having.
+            assert self._par_write_flags(layer, ctx["cids"], ctx["pfids"]) == (0, 0), \
+                "`_par_hook`'s forks assume collision-free `pfids` and unpadded `cids`; the sum " \
+                "layer's `par_ok` guard is supposed to have established both."
+
             def _cute(tgt):
                 par_mod.blockscale_par_backward(
                     tgt, ctx["node_flows"], ctx["node_mars"], ctx["element_mars"], ctx["params"],
                     external_params, ctx["nbase"], ctx["cbase"], ctx["pbase"], ctx["fbase"], gb,
+                    # trailing 0 = `use_atomic`: 0 read-add-store, 1 atomicAdd, 2 store-only. Safe at
+                    # 0 only under the assertion above.
                     batch, blk, ne, node_cbs, gate_cbs, ext_base, 0)
 
             def _triton(tgt):
@@ -915,7 +1196,13 @@ class BlockScaleSumParams(ExternalSumParams):
                         TILE_SIZE_K = ctx["TILE_SIZE_K"], TILE_SIZE_M = ctx["TILE_SIZE_M"],
                         BLOCK_SIZE_M = blk, TL_DOT = ctx["TL_DOT"], NODE_CBS = node_cbs,
                         GATE_CBS = gate_cbs, gate_stride = gb.size(1), ext_base = ext_base,
-                        pid_m_offset = s0, num_stages = 1)
+                        pid_m_offset = s0, num_stages = 1,
+                        # Reached only from behind `par_ok` (sum_layer.py), which already requires
+                        # `_par_flow_collision_free` AND edge-contiguous `cids` -- so neither hazard
+                        # can apply here, and passing constants keeps this launch generating exactly
+                        # the code it did before the flags existed. Asserted, not assumed: if that
+                        # dispatch guard is ever loosened, this fires instead of losing updates.
+                        PADDED = 0, PF_ATOMIC = 0)
 
             cands = ([("cute", _cute)] if (par_mod is not None and ctx["cute_ok"]) else []) \
                     + [("triton", _triton)]
@@ -953,15 +1240,31 @@ class BlockScaleSumParams(ExternalSumParams):
 
         def _par_sb_hook(param_flows, node_flows, node_mars, element_mars, params, nids, cids, pids,
                          pfids, batch, blk_size, num_edges, partition_id):
+            # This fork is now offered whatever `pfids` look like -- the layer no longer decides on
+            # the descriptor's behalf -- so it works out its own write mode, exactly as the Triton
+            # fork does. `PADDED` masks padded lanes out (their contribution is zero, but their
+            # read-add-store of `+0.0` would race a real one for pfid 0), and `PF_ATOMIC` covers slots
+            # that still collide afterwards, which is what parameter tying produces.
+            padded, pf_atomic = self._par_write_flags(layer, cids, pfids)
             sb_mod.blockscale_sb_par_backward(
                 param_flows, node_flows, node_mars, element_mars, params, external_params,
                 nids, cids, pids, pfids, layer.ext_slots[0][partition_id],
-                batch, blk_size, num_edges, node_cbs, gate_cbs, ext_base, 0)
+                batch, blk_size, num_edges, node_cbs, gate_cbs, ext_base,
+                padded, pf_atomic, 0)
 
         def _par_triton_hook(ctx):
-            """The gated param flows via Triton, for shapes no CUDA fork covers."""
+            """
+            The gated param flows via Triton, for shapes no CUDA fork covers.
+
+            This is the UNCONDITIONAL fallback, so unlike `_par_hook` and `_par_sb_hook` it cannot
+            assume anything: it is reached exactly when `_par_flow_collision_free` failed and those
+            two were skipped. `_par_write_flags` works out which hazard applies -- padded slots whose
+            write must be masked, colliding written slots that need an atomic, or (the common case)
+            neither.
+            """
             from .kernels.blockscale_backward import _bs_triton_par_kernel
             gb, grid = layer.ext_slots[0][ctx["partition_id"]], ctx["grid"]
+            padded, pf_atomic = self._par_write_flags(layer, ctx["cids"], ctx["pfids"])
             for s0 in range(0, grid[1], 32768):
                 cg = (grid[0], min(s0 + 32768, grid[1]) - s0)
                 _bs_triton_par_kernel[cg](
@@ -974,7 +1277,8 @@ class BlockScaleSumParams(ExternalSumParams):
                     TILE_SIZE_K = ctx["TILE_SIZE_K"], TILE_SIZE_M = ctx["TILE_SIZE_M"],
                     BLOCK_SIZE_M = ctx["block_size"], TL_DOT = ctx["TL_DOT"],
                     NODE_CBS = node_cbs, GATE_CBS = gate_cbs, gate_stride = gb.size(1),
-                    ext_base = ext_base, pid_m_offset = s0, num_stages = 1)
+                    ext_base = ext_base, pid_m_offset = s0, num_stages = 1,
+                    PADDED = padded, PF_ATOMIC = pf_atomic)
 
         layer._ext_bw_ele_hook = _ele_hook
         # Installed UNCONDITIONALLY, even without the CuTe param module: `_par_hook` falls back to its
@@ -1095,6 +1399,29 @@ class BlockScaleSumParams(ExternalSumParams):
                  for gt in (1, 8, 16, 32, 64) if gt <= max(1, triton.next_power_of_2(n_gates))
                  for bb in (16, 32, 64) if bb <= bcap
                  if gt >= 16 or bb == 16]
+
+        # PREFER A TILE THAT CAN USE `tl.dot`, on ACCURACY, wherever one exists.
+        #
+        # Below 16 the kernel loses `tl.dot` and falls back to a broadcast-sum over an [M, G, B]
+        # intermediate, and that fallback is measurably less accurate: scored against the
+        # reference-free zero-sum invariant, 3.99e-3 against 5.79e-4 on a 128-wide layer at gate 8,
+        # and 4.70e-3 against 5.68e-4 at gate 4 -- 7x to 8x. `GATE_TILE` itself has NO effect on
+        # accuracy (1, 8 and 16 all give 3.96e-3 with the fallback); it is purely whether `tl.dot` is
+        # reachable, which needs an output tile of 16.
+        #
+        # The narrow tiles exist for OCCUPANCY -- a single-node-block layer at small batch leaves the
+        # grid nearly empty with a wide gate tile -- so this used to look like a trade. MEASURED, it
+        # is not one: forcing the dot-capable tile on exactly those shapes costs 1.001x and 0.999x
+        # END TO END, because this kernel is a few microseconds of a step that is milliseconds. The
+        # accuracy is worth having for a gate gradient that a router is trained on.
+        #
+        # Narrow tiles stay on the menu where `tl.dot` is unreachable anyway (`USE_DOT` also needs
+        # `block_size >= 16` and `batch >= 64`), and where no wide tile fits the gate count -- so the
+        # single-node-block case that motivated them is still served.
+        if block_size >= 16 and batch >= 64:
+            dot_capable = [c for c in cands if c[0] >= 16]
+            if dot_capable:
+                cands = dot_capable
 
         # RANKED before measuring, and only the finalists are timed. Every candidate that gets timed
         # also gets COMPILED, and the constexprs differ per shape so nothing is reused between them --

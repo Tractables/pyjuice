@@ -63,7 +63,13 @@ def _fw_lowrank_wa_partial_kernel(element_mars_ptr, ext_ptr, cids_ptr, xu_ptr, p
 
     offs_rank = tl.arange(0, RANK)
 
-    xu = tl.load(xu_ptr + pid_re) + ext_base
+    # A PADDED edge block carries a -1 slot: `edge_ids` has no such edge, so no factor is stored for
+    # it and it must contribute nothing. The offset is clamped so the address stays in bounds and the
+    # load is masked off, which leaves `u` at `-inf` -- the identity of the log-sum-exp below, so both
+    # partials come out `-inf` and the block drops out of the reduction.
+    xu_raw = tl.load(xu_ptr + pid_re)
+    live = xu_raw >= 0
+    xu = tl.where(live, xu_raw, 0) + ext_base
 
     cids = tl.load(cids_ptr + row * num_edges + j * CH_BLOCK_SIZE + offs_c)
     emars = tl.load(element_mars_ptr + cids[:,None] * batch_size + offs_b[None,:],
@@ -71,7 +77,7 @@ def _fw_lowrank_wa_partial_kernel(element_mars_ptr, ext_ptr, cids_ptr, xu_ptr, p
 
     u_offs = xu + offs_c[:,None] * RANK + offs_rank[None,:]
     u = tl.load(ext_ptr + u_offs[:,:,None] * batch_size + offs_b[None,None,:],
-                mask = mask_b[None,None,:], other = float("-inf"))
+                mask = mask_b[None,None,:] & live, other = float("-inf"))
 
     pw = _logsumexp(u + emars[:,None,:], 0)
     pa = _logsumexp(u, 0)
@@ -121,10 +127,15 @@ def _fw_lowrank_combine_reduce_kernel(node_mars_ptr, ext_ptr, nids_ptr, xv_ptr, 
             log_a = _logaddexp(log_a, tl.load(pa_ptr + offs, mask = mask_b[None,:],
                                               other = float("-inf")))
 
-        xv = tl.load(xv_ptr + pid_re) + ext_base
+        # Padded edge block -- see the note in the partial kernel. `log_w` / `log_a` are already
+        # `-inf` here, so the accumulators would be unchanged anyway; masking `v` is what keeps the
+        # read in bounds.
+        xv_raw = tl.load(xv_ptr + pid_re)
+        live = xv_raw >= 0
+        xv = tl.where(live, xv_raw, 0) + ext_base
         v_offs = xv + offs_m[:,None] * RANK + offs_rank[None,:]
         v = tl.load(ext_ptr + v_offs[:,:,None] * batch_size + offs_b[None,None,:],
-                    mask = mask_b[None,None,:], other = float("-inf"))
+                    mask = mask_b[None,None,:] & live, other = float("-inf"))
 
         log_s2 = _logaddexp(log_s2, _logsumexp(v + log_w[None,:,:], 1))
         log_zt = _logaddexp(log_zt, _logsumexp(v + log_a[None,:,:], 1))
