@@ -472,19 +472,33 @@ class BlockScaleSumParams(ExternalSumParams):
                                   block_size, num_edges, node_cbs, gate_cbs, n_node_gates,
                                   ext_base, cfg))
 
-            # ---- the small-batch kernel's layout: the same, but across the WHOLE row at once
-            if sb_ok:
-                eb_row = c2[:, 0].contiguous()
-                pb_row = p2[:, 0].contiguous()
-                if (bool(((c2 == eb_row.unsqueeze(-1) + ar_e.view(1, -1)) | pad).all())
-                        and bool(((p2 == pb_row.unsqueeze(-1) + ar_e.view(1, -1) * block_size)
-                                  | pad).all())
-                        # Same bound as the CuTe fork, but this one walks the WHOLE row from a single
-                        # base, so a padded row's derived reach is the row's full width rather than
-                        # one tile's -- correspondingly further past the end.
-                        and int(pb_row.max()) + num_edges * block_size <= params.numel()):
-                    sb_calls.append((nids, eb_row, pb_row, gate, log_z,
-                                     block_size, num_edges, node_cbs, gate_cbs, ext_base, 0))
+            # ---- the small-batch kernel reads the same tables, at EDGE-BLOCK granularity
+            #
+            # It loops per gate and already resolves the edge block for its gate lookup, so it takes
+            # that block's `cids` / `pids` entry directly. A gate lies inside one edge block
+            # (`gate_cbs` divides `node_cbs`), so its inner loop stays within the run the compile step
+            # guarantees is contiguous -- the same invariant the CuTe fork relies on, at the same
+            # granularity. It therefore needs no whole-row contiguity, no padding mask and no reach
+            # bound; a padded block's entries are the dummies and contribute nothing.
+            if sb_ok and num_edges % node_cbs == 0:
+                nblk = num_edges // node_cbs
+                cb, pbk = c2.view(-1, nblk, node_cbs), p2.view(-1, nblk, node_cbs)
+                arb = torch.arange(node_cbs, device = cids.device, dtype = torch.int64)
+                blk_pad = ((cb == 0) & (pbk == 0)).all(-1).unsqueeze(-1)
+                if (bool(((cb == cb[:, :, :1] + arb.view(1, 1, -1)) | blk_pad).all())
+                        and bool(((pbk == pbk[:, :, :1]
+                                   + arb.view(1, 1, -1) * block_size) | blk_pad).all())):
+                    # Whether the WHOLE row is one contiguous run -- the dense fully-connected case.
+                    # The kernel specializes on it: reading a base per edge block costs two dependent
+                    # global loads per gate, standing in front of the parameter address, which
+                    # measured +9.5% where it is not needed. When it holds, the kernel keeps the
+                    # single pair of row bases it always used.
+                    row_contig = bool((c2 == c2[:, :1] + ar_e.view(1, -1)).all()
+                                      and (p2 == p2[:, :1] + ar_e.view(1, -1) * block_size).all())
+                    sb_calls.append((nids, cb[:, :, 0].contiguous(), pbk[:, :, 0].contiguous(),
+                                     gate, log_z,
+                                     block_size, num_edges, node_cbs, gate_cbs, ext_base,
+                                     int(row_contig), 0))
 
         # Every partition must be served by the same kernel -- a plan that covers only some of them
         # would silently leave the rest of the layer unevaluated.

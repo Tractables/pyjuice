@@ -96,11 +96,15 @@ TOPOLOGIES = {
     # sit at unrelated offsets. Expressible only because the kernel reads `cids` per step-run.
     "sparse":        (_eids([[0, 2], [0, 2], [1, 3], [1, 3]]),                   64, 32, 4),
     "sparse_ragged": (_eids([[0, 1, 3], [0, 2], [1, 2, 3], [3]]),                64, 32, 4),
+    # LARGE and padded. The forward fork is chosen by measurement, and on the small topologies above
+    # the small-batch fork wins at every batch -- so without a shape this size the CuTe fork's padded
+    # handling would exist but never execute in this suite. Measured: CuTe wins here.
+    "pad_big":   (_eids([list(range(8))] + [list(range(7))] * 7),               128, 64, 8),
 }
 
 # PADDED topologies -- rows with differing edge-block counts. The padding-specific structural tests
 # below are parameterized over these.
-RAGGED = ["pad_tiles", "mixed", "split"]
+RAGGED = ["pad_tiles", "mixed", "split", "pad_big"]
 # BLOCK-SPARSE topologies -- non-adjacent child blocks. `sparse` is rectangular (every row has the
 # same count) so it carries NO padding; `sparse_ragged` has both.
 SPARSE = ["sparse", "sparse_ragged"]
@@ -349,22 +353,24 @@ def test_both_forward_forks_actually_serve_a_padded_shape():
     on the same padded topology. If an autotuner or kernel change makes one fork win everywhere, this
     fails and says so, instead of quietly halving the coverage.
     """
+    # Scanned across topologies AND batches rather than asserting that a particular batch picks a
+    # particular fork. The choice is made by MEASUREMENT, so which fork wins where is a property of
+    # the hardware and shifts when either kernel changes; what must hold is that both are exercised
+    # somewhere, which is the actual coverage question.
     seen = {}
-    for batch in (64, 256):
-        pc, root, ns, layer, data, phi = _run("pad_tiles", batch = batch)
-        pc(data, sum_external_params = {ns: phi})
-        seen[batch] = _fw_fork(layer)
+    for name in NONDENSE:
+        for batch in (64, 256):
+            pc, root, ns, layer, data, phi = _run(name, batch = batch)
+            pc(data, sum_external_params = {ns: phi})
+            seen[(name, batch)] = _fw_fork(layer)
 
-    # ONLY THE CuTe FORK currently serves a padded layer, and that is a real limit rather than an
-    # accident of measurement. The small-batch fork walks the WHOLE row from a single base, so on a
-    # padded row its derived reach is the row's full width -- 4096 floats past the end of `params` on
-    # this topology, against 0 for the CuTe fork, whose reach is one 64-wide tile. `_build_plan`
-    # therefore declines it. (Before that bound existed the small-batch fork DID win here at batch 64,
-    # by reading out of bounds.) Bounding the read inside both kernels would put it back on the menu.
-    assert set(seen.values()) == {"cute"}, (
-        f"expected the CuTe fork to serve every padded shape and the small-batch fork to be declined "
-        f"by the parameter-reach bound, but batch->fork came out {seen}. If the small-batch fork is "
-        f"back, check that its derived reads are now bounded rather than merely tolerated.")
+    # BOTH forks serve padded and sparse layers, and each handles them differently -- the CuTe fork
+    # issues one bulk transfer per step-run off `cids`, the small-batch fork takes its bases per edge
+    # block inside its per-gate loop -- so a suite exercising only one of them tests half the feature.
+    assert set(seen.values()) == {"cute", "sb"}, (
+        f"both forward forks should serve a non-dense shape somewhere in this scan, but the forks "
+        f"chosen were {sorted(set(seen.values()))}. Full map: {seen}. Either a fork stopped applying "
+        f"to these layers, or one now wins everywhere -- in both cases some handling is untested.")
 
 
 @cuda_only
@@ -449,7 +455,12 @@ def test_param_flows_are_bit_stable_across_repeats(name):
     for _ in range(REPEATS):
         pc(data, sum_external_params = {ns: phi})
         pc.backward(data, flows_memory = 0.0)
-        outs.append(pc.param_flows.clone())
+        # THIS NODE'S flows, not the whole `param_flows`. That tensor also holds the INPUT layers',
+        # which are accumulated with `atomicAdd` and so are legitimately not bit-reproducible -- on a
+        # topology with enough input nodes the ordering varies and the whole-tensor comparison fails
+        # at ~2e-07 relative, which is fp32 ULP noise and not the defect this is looking for.
+        ns.update_param_flows(pc.param_flows)
+        outs.append(ns.get_param_flows().clone())
     base = outs[0]
     ndiff = sum(1 for o in outs if not torch.equal(o, base))
     assert ndiff == 0, f"{name}: {ndiff} of {REPEATS} runs differ bitwise -- a lost update"
