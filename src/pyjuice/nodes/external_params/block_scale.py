@@ -1051,8 +1051,13 @@ class BlockScaleSumParams(ExternalSumParams):
             # which requires collision-free `pfids` AND edge-contiguous `cids`. Restated here as an
             # assertion rather than left as an assumption: the guard lives in another file, and if it
             # is ever loosened the failure mode is a silent lost update, not a crash.
-            assert layer._par_flow_collision_free(ctx["pfids"]) \
-                and bool((ctx["cids"] != 0).all()), \
+            #
+            # Asked of `_par_write_flags`, which CACHES per compiled tensor, rather than recomputing
+            # the predicates here. Written the obvious way -- `bool((ctx["cids"] != 0).all())` inline
+            # -- this ran a full device reduction AND forced a sync on every backward, and cost 16%
+            # of the whole gated backward at batch 512. A correctness assert on a hot path has to be
+            # free, or it stops being worth having.
+            assert self._par_write_flags(layer, ctx["cids"], ctx["pfids"]) == (0, 0), \
                 "`_par_hook`'s forks assume collision-free `pfids` and unpadded `cids`; the sum " \
                 "layer's `par_ok` guard is supposed to have established both."
 
