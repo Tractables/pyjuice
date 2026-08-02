@@ -450,7 +450,7 @@ class BlockScaleSumParams(ExternalSumParams):
                     # read (it takes `params.numel()`); see the note at its parameter-staging loop for
                     # why the value does not matter and why `memcheck` cannot see the unclamped
                     # version. Nothing to check here.
-                    calls.append((nids, ebase, pbase, pids, gate, log_z,
+                    calls.append((nids, ebase, pbase, gate, log_z,
                                   block_size, num_edges, node_cbs, gate_cbs, n_node_gates,
                                   ext_base, cfg))
 

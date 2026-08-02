@@ -517,7 +517,14 @@ std::vector<std::vector<int>> configs() {
 
 void blockscale_forward(torch::Tensor node_mars, torch::Tensor element_mars, torch::Tensor params,
                         torch::Tensor ext, torch::Tensor nids, torch::Tensor ebase,
-                        torch::Tensor pbase, torch::Tensor pids, torch::Tensor gate,
+                        // NO `pids`. This kernel does not index the parameter table: it takes one
+                        // base per 64-wide tile (`pbase`) and DERIVES lane `j` as
+                        // `pbase + j * block_size`. `_build_plan` licenses that by checking the
+                        // derivation equals the compiled `pids` exactly on every real edge, and
+                        // refuses the fork otherwise -- so the table itself is never needed here.
+                        // It used to be passed and silently ignored, which read as though the kernel
+                        // were indexing it.
+                        torch::Tensor pbase, torch::Tensor gate,
                         torch::Tensor log_z,
                         int64_t block_size, int64_t num_edges, int64_t node_cbs, int64_t gate_cbs,
                         int64_t n_node_gates, int64_t ext_base, int64_t cfg) {
