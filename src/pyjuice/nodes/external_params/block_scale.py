@@ -1283,6 +1283,29 @@ class BlockScaleSumParams(ExternalSumParams):
                  for bb in (16, 32, 64) if bb <= bcap
                  if gt >= 16 or bb == 16]
 
+        # PREFER A TILE THAT CAN USE `tl.dot`, on ACCURACY, wherever one exists.
+        #
+        # Below 16 the kernel loses `tl.dot` and falls back to a broadcast-sum over an [M, G, B]
+        # intermediate, and that fallback is measurably less accurate: scored against the
+        # reference-free zero-sum invariant, 3.99e-3 against 5.79e-4 on a 128-wide layer at gate 8,
+        # and 4.70e-3 against 5.68e-4 at gate 4 -- 7x to 8x. `GATE_TILE` itself has NO effect on
+        # accuracy (1, 8 and 16 all give 3.96e-3 with the fallback); it is purely whether `tl.dot` is
+        # reachable, which needs an output tile of 16.
+        #
+        # The narrow tiles exist for OCCUPANCY -- a single-node-block layer at small batch leaves the
+        # grid nearly empty with a wide gate tile -- so this used to look like a trade. MEASURED, it
+        # is not one: forcing the dot-capable tile on exactly those shapes costs 1.001x and 0.999x
+        # END TO END, because this kernel is a few microseconds of a step that is milliseconds. The
+        # accuracy is worth having for a gate gradient that a router is trained on.
+        #
+        # Narrow tiles stay on the menu where `tl.dot` is unreachable anyway (`USE_DOT` also needs
+        # `block_size >= 16` and `batch >= 64`), and where no wide tile fits the gate count -- so the
+        # single-node-block case that motivated them is still served.
+        if block_size >= 16 and batch >= 64:
+            dot_capable = [c for c in cands if c[0] >= 16]
+            if dot_capable:
+                cands = dot_capable
+
         # RANKED before measuring, and only the finalists are timed. Every candidate that gets timed
         # also gets COMPILED, and the constexprs differ per shape so nothing is reused between them --
         # timing all of them put 230s of compilation into the test suite alone. The model only has to
