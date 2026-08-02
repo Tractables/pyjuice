@@ -834,37 +834,30 @@ def test_a_failed_backward_does_not_leave_the_kernels_installed():
     raise they would make the NEXT backward -- possibly an ungated one -- run a gated kernel against
     a stale plan.
 
-    Needs a shape that still REFUSES between installing the hooks and the post-backward that removes
-    them. `block_size = 32` used to be one (`ptr_inc_step != 1`) and no longer is, so this uses the
-    remaining refusal: a RAGGED layer below batch 16, whose param flows route to the sparse path whose
-    only gated hook sits behind `_par_flow_collision_free` -- which padding defeats."""
-    dev = torch.device("cuda:0")
-    torch.manual_seed(0)
-    edge_ids = torch.tensor([[0, 0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3],
-                             [0, 1, 2, 3, 0, 1, 2, 0, 1, 2, 0, 1, 2]])
-    with juice.set_block_size(64):
-        ni = [inputs(v, num_node_blocks = 4, dist = dists.Categorical(num_cats = NUM_CATS))
-              for v in range(2)]
-        ns = summate(multiply(*ni), num_node_blocks = 4, edge_ids = edge_ids, block_size = 64,
-                     external_params = BlockScaleSumParams(ch_block_size = 8))
-        root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
-    torch.manual_seed(0)
-    root.init_parameters(perturbation = 2.0)
-    pc = juice.compile(root, verbose = False).to(dev)
+    The failure is INJECTED rather than found in a shape, because every shape that used to raise here
+    has since been implemented (`block_size = 32`, then ragged below batch 16). Tying the test to
+    whichever shape happens to be unsupported meant rewriting it each time the envelope moved, and it
+    was never the point: what is under test is the `finally` in `ExternalParamsSumLayer.backward`, and
+    injecting the raise exercises it directly and permanently."""
+    pc, root, ns, data, phi, _ = _run(256, 128, 8, 64, scale = 1.0)
 
-    torch.manual_seed(7)
-    data = torch.randint(0, NUM_CATS, [8, 2], device = dev)
-    phi = torch.randn(_gate_shape(ns, 8), device = dev)
-    pc(data, sum_external_params = {ns: phi})
+    import pyjuice.nodes.external_params.block_scale as _bs
 
-    with pytest.raises(NotImplementedError):
-        pc.backward(data, flows_memory = 0.0)
+    def boom(*args, **kwargs):
+        raise NotImplementedError("injected")
+
+    original = _bs.BlockScaleSumParams.post_backward_layer
+    _bs.BlockScaleSumParams.post_backward_layer = boom
+    try:
+        with pytest.raises(NotImplementedError, match = "injected"):
+            pc.backward(data, flows_memory = 0.0)
+    finally:
+        _bs.BlockScaleSumParams.post_backward_layer = original
 
     layer = [l for g in pc.inner_layer_groups if g.is_sum() for l in g.layers
              if hasattr(l, "external_node_infos")][0]
     assert layer._ext_bw_ele_hook is None and layer._ext_bw_par_hook is None
-    assert layer._ext_bw_par_sb_hook is None
-
+    assert layer._ext_bw_par_sb_hook is None and layer._ext_bw_par_triton_hook is None
 
 
 # ------------------------------------------------------------------- backward, in wider circuits
@@ -1006,6 +999,63 @@ def test_backward_with_tied_external_gates():
     pc(data, sum_external_params = {s0: torch.zeros_like(phi)})
     pc.backward(data, flows_memory = 0.0)
     assert not torch.allclose(ref, pc.param_flows)
+
+
+@cuda_only
+@needs_cute
+@pytest.mark.parametrize("batch", [8, 14])
+def test_tied_transitions_below_batch_16(batch):
+    """REGRESSION, a homogeneous HMM. Every transition is tied into ONE param-flow slot, so `pfids`
+    collide by construction -- and below batch 16 the param flows route to the sparse path, whose only
+    gated hook used to sit behind `_par_flow_collision_free`. The layer therefore RAISED on an
+    ordinary model.
+
+    MEASURED cause, which is not the one it looks like: an HMM ties ACROSS DEPTHS, so each layer holds
+    one copy and its `pfids` stay collision-free (the same distinction as
+    `test_param_tying_within_one_layer_accumulates_both_copies`, which needs SIBLINGS to collide). The
+    blocker was instead `B_NUM_TILES == 1` in the dispatch conjunction -- a TRITON tiling quantity the
+    gated CUDA fork does not use, since one launch covers the whole batch. At `num_edges = 1024`,
+    `BLOCK_B` is 2 and `TILE_SIZE_B` 8, so batch 14 chops into 2 tiles and the shape was refused for a
+    reason unrelated to what the kernel can serve. Hence both batches: 8 fits one tile, 14 does not.
+
+    Correctness is the assertion, not merely running."""
+    dev = torch.device("cuda:0")
+    bs, nb, T = 128, 8, 6
+    torch.manual_seed(0)
+    with juice.set_block_size(bs):
+        z = inputs(0, num_node_blocks = nb, dist = dists.Categorical(num_cats = NUM_CATS))
+        src = summate(z, num_node_blocks = nb,
+                      external_params = BlockScaleSumParams(ch_block_size = 8))
+        cur = src
+        for t in range(1, T):
+            x = inputs(t, num_node_blocks = nb, dist = dists.Categorical(num_cats = NUM_CATS))
+            cur = src.duplicate(multiply(cur, x), tie_params = True)
+        root = summate(multiply(cur), num_node_blocks = 1, block_size = 1)
+    torch.manual_seed(0)
+    root.init_parameters(perturbation = 2.0)
+    pc = juice.compile(root, verbose = False).to(dev)
+
+    gated = [l for gg in pc.inner_layer_groups if gg.is_sum() for l in gg.layers
+             if hasattr(l, "external_node_infos")]
+    assert len(gated) > 1, "the tied transitions no longer span several layers"
+
+    torch.manual_seed(7)
+    data = torch.randint(0, NUM_CATS, [batch, T], device = dev)
+    torch.manual_seed(3)
+    phis = {}
+    for l in gated:
+        for info in l.external_node_infos:
+            phis.setdefault(info.ns,
+                            torch.randn(_gate_shape(info.ns, batch), device = dev) * 0.5)
+
+    pc(data, sum_external_params = phis)
+    pc.backward(data, flows_memory = 0.0)
+
+    assert torch.isfinite(pc.param_flows).all() and float(pc.param_flows.abs().sum()) > 0.0
+    ref_ef, ref_pf = _flow_reference(pc, src, phis[src], 8, batch)
+    live = torch.isfinite(ref_ef)
+    d_ef = float((pc.element_flows[:, :batch].double()[live] - ref_ef[live]).abs().max())
+    assert d_ef < 1e-3, f"element flows off by {d_ef} on a tied HMM at batch {batch}"
 
 
 @cuda_only

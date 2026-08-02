@@ -2574,16 +2574,36 @@ class SumLayer(Layer, nn.Module):
         # allow_modify_flows / negate / tempering off, block_size a multiple of 32, small batch.
         # Autotuned vs the Triton launch INTO A SCRATCH buffer (param_flows is read-accumulate-write);
         # used only when it wins, else falls through to the Triton launch below.
+        # The EXTERNAL hook is offered before `_par_flow_collision_free` is consulted, unlike the
+        # shared-parameter kernel below it. That predicate decides whether THIS layer's own kernel may
+        # use its non-atomic write; an external parameterization owns its write and decides for itself
+        # (`BlockScaleSumParams` picks a padding mask and/or an atomic accumulate from the same
+        # information). Leaving the hook behind the test meant the two things that defeat it --
+        # parameter tying, and the padding of a ragged layer -- made the gated backward RAISE at
+        # batch < 16 rather than be served, even though the descriptor could serve it. A homogeneous
+        # HMM ties every transition into one param-flow slot, so this was an ordinary model shape.
+        # NOTE it does not require `B_NUM_TILES == 1` either, unlike the shared kernel below. That is
+        # a TRITON tiling quantity -- how this function would chop the batch for its own kernel -- and
+        # the gated CUDA fork does not use it: one launch covers the whole batch (`for b < BMAX`,
+        # `BMAX = next_pow2(batch) <= 16`), and its real requirement, `batch < 16`, is checked here and
+        # again in the kernel. Carrying it meant an ordinary shape was refused for an unrelated
+        # reason: at `num_edges = 1024`, `BLOCK_B` is 2, so `TILE_SIZE_B` is 8 and batch 14 chops into
+        # 2 tiles -- which has nothing to do with what the gated kernel can serve.
+        if (BACKWARD_PAR_FLOW_CUDA and propagation_alg_id == 0 and abs(pflow_temperature - 1.0) < 1e-6
+                and not allow_modify_flows and logspace_flows and not negate_pflows
+                and batch_size < 16 and self.block_size % 32 == 0
+                and node_flows.is_cuda and cuda_kernels.smallbatch_par_is_available()
+                and self._ext_bw_par_sb_hook is not None):
+            self._ext_bw_par_sb_hook(
+                param_flows, node_flows, node_mars, element_mars, params, nids, cids, pids, pfids,
+                batch_size, self.block_size, num_edges, partition_id)
+            return None
+
         if (BACKWARD_PAR_FLOW_CUDA and propagation_alg_id == 0 and abs(pflow_temperature - 1.0) < 1e-6
                 and not allow_modify_flows and logspace_flows and not negate_pflows
                 and batch_size < 16 and self.block_size % 32 == 0 and B_NUM_TILES == 1
                 and node_flows.is_cuda and cuda_kernels.smallbatch_par_is_available()
                 and self._par_flow_collision_free(pfids)):
-            if self._ext_bw_par_sb_hook is not None:
-                self._ext_bw_par_sb_hook(
-                    param_flows, node_flows, node_mars, element_mars, params, nids, cids, pids, pfids,
-                    batch_size, self.block_size, num_edges, partition_id)
-                return None
 
             n_cfg = len(cuda_kernels.smallbatch_par_configs())
 

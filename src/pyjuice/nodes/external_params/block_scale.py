@@ -1123,15 +1123,17 @@ class BlockScaleSumParams(ExternalSumParams):
 
         def _par_sb_hook(param_flows, node_flows, node_mars, element_mars, params, nids, cids, pids,
                          pfids, batch, blk_size, num_edges, partition_id):
-            # As in `_par_hook`: the small-batch fork's write is a plain read-add-store with no
-            # padding mask, sound only because its dispatch conjunction already tested
-            # `_par_flow_collision_free`. Asserted so a loosened guard fails loudly.
-            assert layer._par_flow_collision_free(pfids) and bool((cids != 0).all()), \
-                "`blockscale_sb_par_backward` assumes collision-free `pfids` and unpadded `cids`."
+            # This fork is now offered whatever `pfids` look like -- the layer no longer decides on
+            # the descriptor's behalf -- so it works out its own write mode, exactly as the Triton
+            # fork does. `PADDED` masks padded lanes out (their contribution is zero, but their
+            # read-add-store of `+0.0` would race a real one for pfid 0), and `PF_ATOMIC` covers slots
+            # that still collide afterwards, which is what parameter tying produces.
+            padded, pf_atomic = self._par_write_flags(layer, cids, pfids)
             sb_mod.blockscale_sb_par_backward(
                 param_flows, node_flows, node_mars, element_mars, params, external_params,
                 nids, cids, pids, pfids, layer.ext_slots[0][partition_id],
-                batch, blk_size, num_edges, node_cbs, gate_cbs, ext_base, 0)
+                batch, blk_size, num_edges, node_cbs, gate_cbs, ext_base,
+                padded, pf_atomic, 0)
 
         def _par_triton_hook(ctx):
             """
