@@ -129,6 +129,16 @@ def _tile_census(layer):
     return out
 
 
+def _fw_fork(layer):
+    """Which forward fork the plan actually chose -- read from the cached plan, never inferred from
+    timing. `_build_plan` picks by MEASUREMENT, so which one runs is a property of the shape AND the
+    machine, and a test that means to cover a fork has to check it got it."""
+    plan = getattr(layer, "_bs_fw_plan", None)
+    assert plan is not None, "no forward plan was built"
+    fname = plan[1][1]
+    return {"blockscale_forward": "cute", "blockscale_sb_forward": "sb"}[fname]
+
+
 def _run(name, batch = 64, gate_cbs = 8, scale = 0.7, seed = 0):
     pc, root, ns, layer = _compile(name, gate_cbs = gate_cbs, seed = seed)
     dev = torch.device("cuda:0")
@@ -284,11 +294,17 @@ def test_block_sparse_topologies_are_still_refused():
 @needs_cute
 @pending
 @pytest.mark.parametrize("name", RAGGED)
-def test_forward_matches_materialized_pc(name):
+@pytest.mark.parametrize("batch", [64, 256])
+def test_forward_matches_materialized_pc(name, batch):
     """The gated ragged forward against a plain PC carrying the effective per-sample parameters --
-    the same oracle the dense tests use, which shares no code with the kernels."""
+    the same oracle the dense tests use, which shares no code with the kernels.
+
+    BOTH batches are needed, and not for the batch itself: the two forward forks are chosen by
+    measurement, and on these topologies the small-batch fork wins at 64 while the CuTe/TMA fork wins
+    at 256 (measured 82 vs 177 us, and 185 vs 204 us respectively). Testing one batch would leave one
+    fork's padded-tile handling entirely unexecuted."""
     dev = torch.device("cuda:0")
-    gate_cbs, batch = 8, 64
+    gate_cbs = 8
     pc_a, root_a, ns_a, layer, data, phi = _run(name, batch = batch, gate_cbs = gate_cbs)
     lls_a = pc_a(data, sum_external_params = {ns_a: phi})
 
@@ -303,6 +319,34 @@ def test_forward_matches_materialized_pc(name):
         lls_b = pc_b(data[sample:sample + 1, :])
         d = float((lls_a[sample] - lls_b[0]).abs())
         assert d < 2e-3, f"{name} sample {sample}: |dLL| = {d:.3e}"
+
+
+@cuda_only
+@needs_cute
+@pending
+def test_both_forward_forks_actually_serve_a_padded_shape():
+    """COVERAGE, asserted rather than hoped for.
+
+    `_build_plan` collects the CuTe/TMA fork and the plain-CUDA small-batch fork and picks between
+    them by MEASURING, so which one runs is a property of the shape and the machine. Both must handle
+    padding, and each does it differently -- the CuTe fork walks 64-wide tiles from a per-tile base,
+    the small-batch fork walks the whole row from one base -- so a suite that only ever exercises one
+    of them is testing half the feature.
+
+    Measured on this hardware: the small-batch fork wins at batch 64 and the CuTe fork at batch 256,
+    on the same padded topology. If an autotuner or kernel change makes one fork win everywhere, this
+    fails and says so, instead of quietly halving the coverage.
+    """
+    seen = {}
+    for batch in (64, 256):
+        pc, root, ns, layer, data, phi = _run("pad_tiles", batch = batch)
+        pc(data, sum_external_params = {ns: phi})
+        seen[batch] = _fw_fork(layer)
+
+    assert set(seen.values()) == {"cute", "sb"}, (
+        f"both forward forks should serve a padded shape somewhere in this suite, but batch->fork "
+        f"came out {seen}. Either a fork stopped applying to padded layers, or one now wins at every "
+        f"batch -- in both cases some padded-tile handling is no longer executed by these tests.")
 
 
 @cuda_only
