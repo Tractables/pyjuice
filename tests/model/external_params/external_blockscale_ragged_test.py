@@ -629,9 +629,11 @@ def _two_gated_ns(bs = 64, ch_bs = 64, nb = 4, gate_cbs = 8, edge_ids = None, se
 @pytest.mark.parametrize("label,kwargs", [
     ("dense", {}),
     ("ragged", {"edge_ids": _eids([[0, 1, 2, 3], [0, 1, 2], [0, 1, 2], [0, 1, 2]])}),
+    ("sparse", {"edge_ids": _eids([[0, 2], [0, 2], [1, 3], [1, 3]]), "ch_bs": 32}),
     ("narrow", {"bs": 32, "ch_bs": 32}),                      # ptr_inc_step > 1 as well
 ])
-def test_two_gated_ns_in_one_sum_layer(label, kwargs):
+@pytest.mark.parametrize("batch", [8, 64, 256])
+def test_two_gated_ns_in_one_sum_layer(label, kwargs, batch):
     """SEVERAL gated `ns` compiled into ONE sum layer.
 
     Everything indexed per `ns` has to compose for this to work: `ext_unit_bases` gives each node its
@@ -643,7 +645,7 @@ def test_two_gated_ns_in_one_sum_layer(label, kwargs):
     The type's envelope was only ever probed here, not tested -- and the layer's own partial-supply
     guard exists precisely because this arrangement is the one that can go subtly wrong."""
     dev = torch.device("cuda:0")
-    batch, gate_cbs = 64, 8
+    gate_cbs = 8
     root, s0, s1 = _two_gated_ns(gate_cbs = gate_cbs, **kwargs)
     pc = juice.compile(root, verbose = False).to(dev)
 
