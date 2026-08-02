@@ -531,9 +531,9 @@ class BlockScaleSumParams(ExternalSumParams):
         # and sm_90+), so without a CUDA toolchain this parameterization was refused outright rather
         # than merely being slow. It also has no layout requirements at all, reading `nids`/`cids`/
         # `pids` per lane, so it serves any topology the compiler produces.
-        if not calls and not sb_calls:
+        tri_calls = []
+        if not calls:
             import triton
-            tri_calls = []
             for partition_id in range(layer.num_fw_partitions):
                 nids = layer.partitioned_nids[partition_id]
                 cids = layer.partitioned_cids[partition_id]
@@ -555,11 +555,12 @@ class BlockScaleSumParams(ExternalSumParams):
                             nids.size(0) * (block_size // tile_m)),
                 ))
 
-            layer._bs_bw_state = {
-                "block_size": block_size, "batch_size": batch_size, "ext_base": ext_base,
-                "gate_cbs": gate_cbs, "node_cbs": node_cbs, "shift_args": shift_args,
-            }
-            return "triton", "fw", tri_calls
+            if not sb_calls:
+                layer._bs_bw_state = {
+                    "block_size": block_size, "batch_size": batch_size, "ext_base": ext_base,
+                    "gate_cbs": gate_cbs, "node_cbs": node_cbs, "shift_args": shift_args,
+                }
+                return "triton", "fw", tri_calls
 
         if False:
             raise NotImplementedError(
@@ -609,6 +610,24 @@ class BlockScaleSumParams(ExternalSumParams):
 
             return run
 
+        def _tri_runner(tcalls):
+            from .kernels.blockscale_forward import _bs_triton_fw_kernel
+
+            def run():
+                for _ in range(REPEATS):
+                    for c in tcalls:
+                        _bs_triton_fw_kernel[c["grid"]](
+                            node_mars = node_mars, element_mars = element_mars, mparams = params,
+                            ext = external_params, gate = c["gate"], log_z = c["log_z"],
+                            nids = c["nids"], cids = c["cids"], pids = c["pids"],
+                            batch_size = batch_size, num_edges = c["num_edges"],
+                            BLOCK_B = c["BLOCK_B"], TILE_SIZE_K = c["TILE_SIZE_K"],
+                            K_NUM_TILES = c["K_NUM_TILES"], TILE_SIZE_M = c["TILE_SIZE_M"],
+                            BLOCK_SIZE_M = c["BLOCK_SIZE_M"], TL_DOT = c["TL_DOT"],
+                            NODE_CBS = node_cbs, GATE_CBS = gate_cbs,
+                            gate_stride = c["gate"].size(1), ext_base = ext_base, num_stages = 1)
+            return run
+
         cands = []
         if calls:
             for i in valid:
@@ -617,8 +636,27 @@ class BlockScaleSumParams(ExternalSumParams):
             for i in range(len(sb_mod.blockscale_sb_configs())):
                 cands.append((("sb", i), _runner(sb_mod.blockscale_sb_forward, sb_calls, i)))
 
+        # The portable fork is a CANDIDATE only where the CuTe fork is ineligible -- which is where
+        # the small-batch one otherwise takes shapes it was never meant for. Its grid is one block per
+        # (node group, SAMPLE), so the parameters are re-read once per sample: at `block_size = 32`,
+        # where `block_size % BM == 0` rules the CuTe fork out for every BM >= 64, that made a
+        # K=1024 / batch-512 forward 455us against Triton's 158us. Measured rather than ruled, since
+        # below batch ~64 the small-batch fork is still the better of the two.
+        #
+        # Deliberately NOT offered where the CuTe fork applies: those shapes keep exactly the
+        # candidates and the pick they had, and never pay to compile a kernel they will not use.
+        if tri_calls and not calls:
+            cands.append((("tri", 0), _tri_runner(tri_calls)))
+
         best = ck.autotune(cands, warmup = 2, reps = 9) or cands[0][0]
         kind, best_cfg = best
+
+        if kind == "tri":
+            layer._bs_bw_state = {
+                "block_size": block_size, "batch_size": batch_size, "ext_base": ext_base,
+                "gate_cbs": gate_cbs, "node_cbs": node_cbs, "shift_args": shift_args,
+            }
+            return "triton", "fw", tri_calls
 
         if kind == "cute":
             out_mod, fname, calls = mod, "blockscale_forward", _with_cfg(calls, best_cfg)
