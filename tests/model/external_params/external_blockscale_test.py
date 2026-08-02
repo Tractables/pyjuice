@@ -1185,8 +1185,50 @@ def test_backward_outside_the_kernels_regime_raises(num_latents, block_size, bat
 
 @cuda_only
 @needs_cute
+def test_a_layer_split_into_forward_partitions_compiles():
+    """REGRESSION, compile-time. Edge-block counts of (4, 1, 1, 1) make the partitioner SPLIT the layer
+    into partitions of different widths. The gate-table check then masked a partition-local
+    `[rows, n_slots]` tensor with the layer-wide `[rows, max_n_eblks]` mask, and `juice.compile` raised
+    `IndexError` -- refusing, at build time, the very shapes the check exists to validate.
+
+    Compiling is the whole assertion. The kernels themselves still decline this layer: a k-tile spans
+    several parent blocks (`ptr_inc_step != 1`), which is what lets the gate factor out of the
+    contraction, so the backward refuses -- clearly, and only once the shape is actually run."""
+    dev = torch.device("cuda:0")
+    torch.manual_seed(0)
+
+    edge_ids = torch.tensor([(0, 0), (0, 1), (0, 2), (0, 3), (1, 0), (2, 0), (3, 0)]).T.contiguous()
+    with juice.set_block_size(32):
+        ni = [inputs(v, num_node_blocks = 4, dist = dists.Categorical(num_cats = NUM_CATS))
+              for v in range(2)]
+        ns = summate(multiply(*ni), num_node_blocks = 4, edge_ids = edge_ids,
+                     external_params = BlockScaleSumParams(ch_block_size = 8))
+        root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
+
+    torch.manual_seed(0)
+    root.init_parameters(perturbation = 2.0)
+    pc = juice.compile(root, verbose = False).to(dev)          # used to raise IndexError
+
+    layer = [l for gg in pc.inner_layer_groups if gg.is_sum() for l in gg.layers
+             if hasattr(l, "external_node_infos")][0]
+    assert layer.num_fw_partitions > 1, \
+        "this topology no longer splits the layer, so the regression is not being exercised"
+
+    torch.manual_seed(7)
+    data = torch.randint(0, NUM_CATS, [16, 2], device = dev)
+    phi = torch.randn(_gate_shape(ns, 16), device = dev)
+
+    # Declined, but declined properly -- not IndexError, and not a silent wrong answer.
+    with pytest.raises(NotImplementedError):
+        pc(data, sum_external_params = {ns: phi})
+        pc.backward(data, flows_memory = 0.0)
+
+
+@cuda_only
+@needs_cute
 @pytest.mark.parametrize("edge_ids,why", [
     (torch.tensor([[0, 0, 1], [0, 1, 1]]), "a row with fewer edge blocks than the widest"),
+    (torch.tensor([[0, 0, 1, 1], [0, 1, 0, 1]])[:, :3], "the last row missing its second edge block"),
 ])
 def test_ragged_edge_structures_raise(edge_ids, why):
     """Rows that do not all carry the same dense run of edge blocks get PADDED into a partition, and

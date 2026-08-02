@@ -182,6 +182,63 @@ def test_every_fork_computes_the_same_gradient():
 
 @cuda_only
 @needs_cute
+def test_tied_gates_accumulate_across_every_layer_that_shares_them():
+    """`tie_external` points every copy of a tied node at the SOURCE's gate tensor, so one gradient row
+    is written by one layer per copy. The buffer is zeroed once per backward precisely so those add up,
+    and the tied gradient must therefore equal the SUM of what the copies contribute separately.
+
+    This is the invariant behind the emission being an atomic rather than a store, and it is checked
+    against an UNTIED build of the same circuit fed the same gates -- an oracle that needs no reference
+    implementation and no assumption about what the right answer is."""
+    dev = torch.device("cuda:0")
+    K, gate_cbs, batch, steps = 128, 8, 64, 4
+
+    def build(tie):
+        torch.manual_seed(0)
+        with juice.set_block_size(K):
+            ns = inputs(0, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
+            src, copies = None, []
+            for t in range(1, steps):
+                emit = inputs(t, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
+                prod = multiply(ns, emit)
+                if src is None:
+                    ns = summate(prod, num_node_blocks = 1,
+                                 external_params = BlockScaleSumParams(ch_block_size = gate_cbs,
+                                                                       tie_external = tie))
+                    src = ns
+                else:
+                    ns = src.duplicate(prod, tie_params = True)
+                copies.append(ns)
+            root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
+        torch.manual_seed(0)
+        root.init_parameters(perturbation = 2.0)
+        return juice.compile(root, verbose = False).to(dev), copies
+
+    torch.manual_seed(7)
+    data = torch.randint(0, NUM_CATS, [batch, steps], device = dev)
+    torch.manual_seed(11)
+    phi = torch.randn([batch, 1, K // gate_cbs], device = dev) * 0.5
+
+    def run(tie):
+        pc, copies = build(tie)
+        pc(data, sum_external_params = {n: phi for n in copies})
+        pc.backward(data, flows_memory = 0.0)
+        return [pc.get_external_params_grad(n)[0].clone() for n in copies]
+
+    tied, untied = run(True), run(False)
+
+    # Every copy reads back the SAME storage when tied -- if they did not, there would be nothing to
+    # accumulate and the rest of the check would pass vacuously.
+    assert all(torch.equal(tied[0], g) for g in tied), "tied copies do not share one gradient tensor"
+    assert not torch.equal(untied[0], untied[1]), "untied copies unexpectedly share a gradient"
+
+    total = torch.stack(untied).sum(dim = 0)
+    d = float((tied[0] - total).abs().max() / total.abs().max())
+    assert d < 1e-4, f"the tied gradient is not the sum over its copies (off by {d} relative)"
+
+
+@cuda_only
+@needs_cute
 def test_a_block_size_no_log_z_tile_fits_widely_still_runs():
     """REGRESSION. The log-Z tile is autotuned, and the candidates are ranked by a traffic model before
     the finalists are timed. That model favours WIDE tiles, so at a large block size every shortlisted
