@@ -173,9 +173,9 @@ def _fw_fork(layer):
     """Which forward fork the plan actually chose -- read from the cached plan, never inferred from
     timing. `_build_plan` picks by MEASUREMENT, so which one runs is a property of the shape AND the
     machine, and a test that means to cover a fork has to check it got it."""
-    plan = getattr(layer, "_bs_fw_plan", None)
-    assert plan is not None, "no forward plan was built"
-    fname = plan[1][1]
+    plans = getattr(layer, "_bs_fw_plans", None)
+    assert plans, "no forward plan was built"
+    fname = next(iter(plans.values()))[0][1]
     return {"blockscale_forward": "cute", "blockscale_sb_forward": "sb"}[fname]
 
 
@@ -757,7 +757,7 @@ def test_the_portable_triton_forward_serves_every_topology(name, batch):
     try:
         pc_a, root_a, ns_a, layer, data, phi = _run(name, batch = batch, gate_cbs = gate_cbs)
         lls_a = pc_a(data, sum_external_params = {ns_a: phi})
-        assert layer._bs_fw_plan[1][0] == "triton", \
+        assert next(iter(layer._bs_fw_plans.values()))[0][0] == "triton", \
             "the CUDA forks were hidden but a CUDA fork still ran"
     finally:
         _kc.get_cute_module, _kc.get_sb_module = saved
