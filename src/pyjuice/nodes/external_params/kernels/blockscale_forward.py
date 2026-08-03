@@ -26,13 +26,14 @@ from pyjuice.utils.kernel_launcher import triton_jit
 
 @triton_jit
 def _bs_triton_fw_kernel(node_mars, element_mars, mparams, ext, gate, log_z,
-                         nids, cids, pids,
+                         nids, cids, pids, gate_nstride,
                          batch_size: tl.constexpr, num_edges: tl.constexpr,
                          BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr,
                          K_NUM_TILES: tl.constexpr, TILE_SIZE_M: tl.constexpr,
                          BLOCK_SIZE_M: tl.constexpr, TL_DOT: tl.constexpr,
                          NODE_CBS: tl.constexpr, GATE_CBS: tl.constexpr,
                          gate_stride: tl.constexpr, ext_base, WRITE_LOGZ: tl.constexpr = 1,
+                         GATE_BS: tl.constexpr = 0, N_NODE_GATES: tl.constexpr = 1,
                          pid_m_offset = 0):
     """
     PORTABLE forward for the per-block multiplicative gate: `node_mars = log N - log Z`.
@@ -72,6 +73,23 @@ def _bs_triton_fw_kernel(node_mars, element_mars, mparams, ext, gate, log_z,
 
     off_nids = tl.load(nids + nblock_id)
 
+    # The gate's NODE-axis row. `storage_offsets` already lays the grid out as `row * Ck + col` and
+    # points each edge block at the row of its node block's FIRST node gate, so a gate finer than
+    # `ns.block_size` along the node axis is reachable by adding the row within that block -- nothing
+    # about the grid or the table has to change.
+    #
+    # It is a SCALAR because the launcher keeps `TILE_SIZE_M <= GATE_BS`: one M tile then lies inside a
+    # single node gate, `phi` is constant over the tile's rows, and `lphi` stays the [K, B] operand that
+    # folds onto `element_mars`. That is the whole reason this needs no extra contraction -- the gate
+    # only stops factoring out when a tile SPANS two node gates.
+    #
+    # `Ck` comes from a per-row tensor rather than a constexpr because two `ns` sharing a layer may have
+    # different child counts, and it is read only when there is more than one node gate, so the common
+    # case compiles to nothing.
+    node_gate_off = 0
+    if N_NODE_GATES > 1:
+        node_gate_off = ((tile_id * TILE_SIZE_M) // GATE_BS) * tl.load(gate_nstride + nblock_id)
+
     # Running (max, linear sum) for both accumulators. The max is per batch column only.
     mn = tl.zeros([BLOCK_B], dtype = tl.float32) - float("inf")
     mz = tl.zeros([BLOCK_B], dtype = tl.float32) - float("inf")
@@ -93,7 +111,7 @@ def _bs_triton_fw_kernel(node_mars, element_mars, mparams, ext, gate, log_z,
         offs_gcol = offs_edge // NODE_CBS
         gbase = tl.load(gate + nblock_id * gate_stride + offs_gcol,
                         mask = mask_edge & (offs_gcol < gate_stride), other = -1)
-        grow = gbase + ext_base + ((offs_edge % NODE_CBS) // GATE_CBS)
+        grow = gbase + ext_base + node_gate_off + ((offs_edge % NODE_CBS) // GATE_CBS)
         ghas = gbase >= 0
 
         lphi = tl.load(ext + grow[:,None] * batch_size + offs_batch[None,:],

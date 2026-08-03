@@ -793,14 +793,26 @@ def test_a_node_axis_gate_is_reachable_by_blocking_the_node_at_the_gate_size():
     dev = torch.device("cuda:0")
     K, gate_bs, gate_cbs, batch = 256, 32, 8, 64
 
-    # refused, and specifically for the node axis
-    with pytest.raises(NotImplementedError, match = "ACROSS the nodes of one block"):
-        with juice.set_block_size(K):
-            ni = [inputs(v, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
-                  for v in range(2)]
-            summate(multiply(*ni), num_node_blocks = 1,
-                    external_params = BlockScaleSumParams(block_size = gate_bs,
-                                                          ch_block_size = gate_cbs))
+    # Building it is no longer refused: the portable Triton forward keeps its M tile inside one node
+    # gate, so `phi` still folds onto the child operand and the forward serves this directly. The
+    # BACKWARD does not yet carry a node-gate axis and refuses there instead -- which is the point of
+    # what follows, since re-blocking remains the fully served route.
+    torch.manual_seed(0)
+    with juice.set_block_size(K):
+        ni = [inputs(v, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
+              for v in range(2)]
+        fine = summate(multiply(*ni), num_node_blocks = 1,
+                       external_params = BlockScaleSumParams(block_size = gate_bs,
+                                                             ch_block_size = gate_cbs))
+        fine_root = summate(multiply(fine), num_node_blocks = 1, block_size = 1)
+    fine_root.init_parameters(perturbation = 2.0)
+    fine_pc = juice.compile(fine_root, verbose = False).to(dev)
+    fine_data = torch.randint(0, NUM_CATS, [batch, 2], device = dev)
+    fine_phi = torch.randn(fine.external_params.tensor_shapes(fine, batch)[0], device = dev)
+    fine_pc(fine_data, sum_external_params = {fine: fine_phi})          # forward: served
+    with pytest.raises(NotImplementedError, match = "NODE axis"):
+        fine_pc.backward(fine_data, flows_memory = 0.0)
+    del fine_pc
 
     # the same model, blocked at the gate's size
     torch.manual_seed(0)
