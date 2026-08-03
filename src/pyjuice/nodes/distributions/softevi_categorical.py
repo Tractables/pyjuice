@@ -129,9 +129,58 @@ def _fw_linear_evidence(layer, kwargs):
     cached = getattr(layer, "_fw_pt_cache", None)
     if cached is not None and cached[0] == key:
         return cached[1]
-    pt = evidence.exp().contiguous()
+    # The CUDA kernels read this as float32, and half-precision evidence is a reasonable thing for a
+    # caller to hand over (it comes straight off a language model), so widen rather than reject. `.float()`
+    # is a no-op when the evidence is already float32.
+    pt = evidence.float().exp().contiguous()
     layer._fw_pt_cache = (key, pt)
     return pt
+
+
+def _grad_scratch(layer, grad):
+    """A float32 buffer for the kernels to accumulate the external evidence gradient into.
+
+    The caller's gradient buffer is frequently half precision -- it goes back to a language model that
+    runs in bf16 -- but every kernel here accumulates into it with an atomic add and reads it as float.
+    Accumulating in half precision would be both lossy (thousands of small atomic adds land on the same
+    slot, which is exactly where bf16's 8 mantissa bits give out) and slower. So accumulate in float32
+    and fold the result back once, in `_GradCastEpilogue`.
+
+    Returns the caller's own tensor when it is already float32, so the common path allocates nothing."""
+    if grad is None or grad.dtype == torch.float32:
+        return grad
+    buf = getattr(layer, "_grad_f32_buf", None)
+    if buf is None or buf.shape != grad.shape or buf.device != grad.device:
+        buf = torch.zeros(grad.shape, dtype = torch.float32, device = grad.device)
+        layer._grad_f32_buf = buf
+    return buf
+
+
+class _GradCastEpilogue:
+    """Fold the float32 evidence-gradient scratch back into the caller's half-precision buffer.
+
+    Runs last in `post_bp_fns`, after every kernel that touches the gradient. Leaves the scratch zeroed
+    so the next step starts clean."""
+
+    def __getitem__(self, grid):
+        def launch(**kw):
+            dst, src = kw["grad_dst"], kw["grad_src"]
+            dst += src.to(dst.dtype)
+            src.zero_()
+        return launch
+
+
+def _condition_grad_cast(layer, kwargs):
+    grad = kwargs.get("categorical_evidence_logp_grad", None)
+    if grad is None or grad.dtype == torch.float32:
+        return False
+    buf = getattr(layer, "_grad_f32_buf", None)
+    return buf is not None and buf.shape == grad.shape and buf.device == grad.device
+
+
+def _prep_args_grad_cast(layer, kwargs):
+    return dict(grad_dst = kwargs["categorical_evidence_logp_grad"],
+                grad_src = layer._grad_f32_buf), (1,)
 
 
 def _fw_scratch(layer, num_slots, num_latents):
@@ -163,7 +212,8 @@ def _fw_observed_evidence(layer, kwargs):
     # `argmax` yields 0 when the observed token is absent from the candidate set, which would silently
     # pick the wrong entry; the Triton kernel leaves the term at -inf in that case, so match it.
     lex = torch.where(match.any(dim = 2), lex, torch.full_like(lex, -float("inf")))
-    return lex.permute(1, 0).contiguous().view(-1)
+    # float32 regardless of the evidence dtype: the epilogue reads this as float (see `_fw_linear_evidence`)
+    return lex.float().permute(1, 0).contiguous().view(-1)
 
 
 def _condition_fw_cuda_kernel(layer, kwargs):
@@ -749,7 +799,9 @@ def _build_dense_index(layer, kwargs):
     # deferred to pass 2 -- sorting twice to avoid holding the sorted payloads would cost far more than
     # the few MB they occupy.
     sorted_l, n_uniq, stats = [], [], []
-    pt_all = evidence.exp()
+    # `ref_pt` is a float32 table both kernels read as float, so widen half-precision evidence here
+    # rather than at the scatter (see `_fw_linear_evidence`).
+    pt_all = evidence.float().exp()
     for g in groups:
         lv = lvid_of_head[torch.tensor(g, device = dev)]                     # [Gp] layer-local var ids
 
@@ -948,7 +1000,7 @@ def _prep_args_bk_dense_prologue(layer, kwargs):
     target_kwargs["num_latents"] = index["num_latents"]
 
     grad = kwargs.get("categorical_evidence_logp_grad", None)
-    target_kwargs["categorical_evidence_logp_grad_ptr"] = grad
+    target_kwargs["categorical_evidence_logp_grad_ptr"] = _grad_scratch(layer, grad)
     target_kwargs["update_extflows"] = grad is not None
 
     target_kwargs["ratio_ptr"] = _dense_scratch(layer, ext_num_vars, batch_size, index["num_latents"])
@@ -1065,7 +1117,7 @@ def _prep_args_bk_dense_denom(layer, kwargs):
     target_kwargs["ratio_ptr"] = _dense_scratch(layer, evidence.size(1), batch_size, num_latents)
 
     grad = kwargs.get("categorical_evidence_logp_grad", None)
-    target_kwargs["categorical_evidence_logp_grad_ptr"] = grad
+    target_kwargs["categorical_evidence_logp_grad_ptr"] = _grad_scratch(layer, grad)
     target_kwargs["update_extflows"] = grad is not None
 
     target_kwargs["num_latents"] = num_latents
@@ -1122,7 +1174,7 @@ def _prep_args_apply_bk_softevi_kernel(layer, kwargs):
         categorical_evidence_logp_grad = None
 
     target_kwargs["categorical_evidence_logp_ptr"] = categorical_evidence_logp
-    target_kwargs["categorical_evidence_logp_grad_ptr"] = categorical_evidence_logp_grad
+    target_kwargs["categorical_evidence_logp_grad_ptr"] = _grad_scratch(layer, categorical_evidence_logp_grad)
     target_kwargs["var_idmapping_ptr"] = layer.var_idmapping
 
     # (Optional) soft_evidence_cat_ids
@@ -1242,7 +1294,9 @@ class SoftEvidenceCategorical(Distribution):
             # `bk_softevi_kernel` above, which stays the fallback for every other case). Order matters:
             # the prologue writes the ratio scratch that the denominator kernel reads.
             (self.bk_dense_prologue_kernel, _condition_bk_dense_prologue, _prep_args_bk_dense_prologue),
-            (_DenseDenomDispatch(self.bk_dense_denom_kernel), _condition_bk_dense_denom, _prep_args_bk_dense_denom)
+            (_DenseDenomDispatch(self.bk_dense_denom_kernel), _condition_bk_dense_denom, _prep_args_bk_dense_denom),
+            # Last: only fires when the caller's evidence gradient is not float32 (see `_grad_scratch`).
+            (_GradCastEpilogue(), _condition_grad_cast, _prep_args_grad_cast)
         ]
 
         self.sampling_fns = [
