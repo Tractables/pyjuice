@@ -15,6 +15,10 @@ _BUFFER_KWARG = None
 # that fits in memory; asserted where the keys are built.
 _KEY_STRIDE = 1 << 32
 
+#: How many forward plans to keep per layer, keyed by batch size. Each holds a `log Z` buffer per
+#: partition sized by that batch, so this bounds memory; rebuilding an evicted one costs an autotune.
+_FW_PLAN_CACHE = 8
+
 
 def _buffer_kwarg() -> str:
     """The staging-buffer kwarg name, resolved once (a per-call import shows up in profiles)."""
@@ -217,26 +221,10 @@ class BlockScaleSumParams(ExternalSumParams):
 
         # A gate that varies across the nodes of a block cannot share one staged tile, so it needs one
         # reduction per subgroup. Rejected here rather than silently mis-computed in the kernel.
-        if gate_bs != ns.block_size:
-            raise NotImplementedError(
-                f"a gate `block_size` ({gate_bs}) smaller than the node's ({ns.block_size}) would vary "
-                f"`phi` ACROSS the nodes of one block, which cannot share the staged tile: the gate "
-                f"stops factoring out of the contraction, because it would then depend on the matmul's "
-                f"output row as well as on the child.\n\n"
-                f"Two ways to get what you want, and the first is usually right:\n"
-                f"  * refine the gate's `ch_block_size` instead. That axis is FREE -- the fold is "
-                f"elementwise in the child index -- and is what the type is designed around.\n"
-                f"  * if you specifically need a gate finer than {ns.block_size} along the NODE axis, "
-                f"build the node AT that size: `summate(..., block_size = {gate_bs}, "
-                f"external_params = BlockScaleSumParams(ch_block_size = ...))`, leaving the gate's "
-                f"`block_size` to default. This expresses the same model and asks you for the SAME "
-                f"gate tensor -- its shape is `num_nodes // gate_block_size` either way, so nothing "
-                f"in your code changes but this call.\n\n"
-                f"The second is not done for you because it taxes the whole layer rather than just "
-                f"the gate: the node tile of the standard kernels collapses with `block_size` (below "
-                f"the 16 rows an efficient MMA wants), and the compiled index tensors grow as "
-                f"`K^2 / block_size`. That is a real cost and it should be yours to choose."
-            )
+        # A gate FINER than the node block along the node axis is served by the portable Triton
+        # forward, which keeps its M tile inside one node gate so `phi` still folds onto the child
+        # operand. The CUDA forward forks and the whole backward do not carry a node-gate axis yet and
+        # refuse at their own dispatch, so this is no longer decided here.
 
         if ns.edge_ids.size(1) == 1 and gate_cbs == ns.ch_block_size:
             warnings.warn(
@@ -303,6 +291,40 @@ class BlockScaleSumParams(ExternalSumParams):
             "`BlockScaleSumParams` has no per-node reference path; it is served by `forward_layer`."
         )
 
+    @staticmethod
+    def _ext_base(ns_tensors, external_params, batch_size: int) -> int:
+        """
+        Where this layer's gates start in the staging buffer, in per-batch rows.
+
+        RELATIVE to the buffer, so it is a property of the layout and the batch and not of any address:
+        reallocate the buffer and this is unchanged. That is what lets `forward_layer` key its plan
+        cache on shape alone.
+        """
+        first_view = ns_tensors[0][1][0]
+        return ((first_view.data_ptr() - external_params.data_ptr())
+                // external_params.element_size()) // batch_size
+
+    def _gate_nstride(self, layer, nids):
+        """
+        `Ck` -- the gate grid's row length -- for each compiled row of a partition.
+
+        One node gate down the grid is `Ck` entries along, so this is what turns a node-gate INDEX into
+        the row offset the kernel adds. Per row rather than a constexpr because two `ns` sharing a layer
+        can have different child counts, and the kernel only reads it when a node block holds more than
+        one gate.
+        """
+        dev = nids.device
+        starts = torch.tensor([i.ns._output_ind_range[0] for i in layer.external_node_infos],
+                              device = dev, dtype = torch.long)
+        cks = torch.tensor([i.ns.num_ch_nodes // self.gate_sizes(i.ns)[1]
+                            for i in layer.external_node_infos], device = dev, dtype = torch.long)
+
+        # Which `ns` owns each row: the last one starting at or before it.
+        order = torch.argsort(starts)
+        starts, cks = starts[order], cks[order]
+        pos = (torch.searchsorted(starts, nids.to(dev).to(torch.long), right = True) - 1).clamp(min = 0)
+        return cks[pos].contiguous()
+
     def _build_plan(self, layer, ns_tensors, node_mars, element_mars, params, external_params):
         """
         Resolve every per-layer launch argument once, and check each kernel's assumptions.
@@ -339,26 +361,30 @@ class BlockScaleSumParams(ExternalSumParams):
         block_size = layer.block_size
 
         n_node_gates, n_child_gates = self.gate_counts(ns0)
-        _, gate_cbs = self.gate_sizes(ns0)
+        gate_bs, gate_cbs = self.gate_sizes(ns0)
         node_cbs = ns0.ch_block_size
 
-        if n_node_gates != 1:
-            raise NotImplementedError(
-                f"a gate spanning fewer nodes than the block cannot share the staged tile; got "
-                f"{n_node_gates} node gates per block."
-            )
+        # A gate spanning fewer nodes than the block is served by the portable Triton forward alone: it
+        # keeps its M tile inside one node gate, so `phi` is still constant over the tile's rows and
+        # folds onto the child operand. The two CUDA forks apply one gate per edge block to a whole node
+        # block and are declined above, so `calls` / `sb_calls` come back empty and the Triton path is
+        # what remains -- no separate dispatch needed here.
 
         # The tiles that fit BOTH this layer's shape and this DEVICE. The kernel decides the second
         # part: its shared-memory need depends on the gate width, and the opt-in ceiling is a property
         # of the part (48 / 64 / 100 / 227 KB), not something to hardcode.
         cfgs = [tuple(c) for c in mod.configs()] if mod is not None else []
         valid = ([int(i) for i in mod.fitting_configs(block_size, batch_size, gate_cbs)]
-                 if mod is not None else [])
+                 if (mod is not None and block_size == gate_bs) else [])
         cfg = valid[0] if valid else 0    # provisional; measured once the launch args exist
 
         # The small-batch kernel needs only 32-node groups, but its children must be contiguous across
         # the WHOLE row rather than within each edge tile -- it walks the edge axis with a single base.
-        sb_ok = (sb_mod is not None) and (block_size % 32 == 0)
+        # Neither CUDA fork carries a node-gate axis: each derives one gate per edge block and applies
+        # it to a whole node block. A finer node gate falls to the portable Triton forward, which
+        # indexes the gate per M tile.
+        node_gates = block_size // gate_bs
+        sb_ok = (sb_mod is not None) and (block_size % 32 == 0) and node_gates == 1
 
         # PARTIAL SUPPLY IS REFUSED, and the check has to come before `ext_base`. That base is measured
         # from the FIRST SUPPLIED node, but the gate tables it is added to already carry
@@ -383,9 +409,7 @@ class BlockScaleSumParams(ExternalSumParams):
                 f"layers."
             )
 
-        first_view = ns_tensors[0][1][0]
-        ext_base = ((first_view.data_ptr() - external_params.data_ptr())
-                    // external_params.element_size()) // batch_size
+        ext_base = self._ext_base(ns_tensors, external_params, batch_size)
 
         dev = node_mars.device
         calls, sb_calls, shift_args, log_zs = [], [], [], []
@@ -542,15 +566,21 @@ class BlockScaleSumParams(ExternalSumParams):
                 ne = cids.size(1)
 
                 tile_m = min(block_size, 16 if block_size >= 16 else block_size)
+                # CAPPED at the gate: an M tile that spanned two node gates would need `phi` to vary
+                # with the matmul's output row, which is the one thing that stops it factoring out of
+                # the contraction. Inside one gate it stays a [K, B] fold and costs nothing extra.
+                tile_m = min(tile_m, gate_bs)
                 tile_k = min(ne, 64)
                 blk_b = min(triton.next_power_of_2(batch_size), 64)
                 tl_dot = 1 if (tile_m >= 16 and tile_k >= 16 and blk_b >= 16) else 0
                 tri_calls.append(dict(
                     nids = nids, cids = cids.to(torch.int64), pids = pids.to(torch.int64),
                     gate = gate, log_z = log_zs[partition_id],
+                    gate_nstride = self._gate_nstride(layer, nids),
                     num_edges = ne, BLOCK_B = blk_b, TILE_SIZE_K = tile_k,
                     K_NUM_TILES = triton.cdiv(ne, tile_k), TILE_SIZE_M = tile_m,
                     BLOCK_SIZE_M = block_size, TL_DOT = tl_dot,
+                    GATE_BS = gate_bs, N_NODE_GATES = block_size // gate_bs,
                     grid = (triton.cdiv(batch_size, blk_b),
                             nids.size(0) * (block_size // tile_m)),
                 ))
@@ -625,6 +655,8 @@ class BlockScaleSumParams(ExternalSumParams):
                             K_NUM_TILES = c["K_NUM_TILES"], TILE_SIZE_M = c["TILE_SIZE_M"],
                             BLOCK_SIZE_M = c["BLOCK_SIZE_M"], TL_DOT = c["TL_DOT"],
                             NODE_CBS = node_cbs, GATE_CBS = gate_cbs,
+                            gate_nstride = c["gate_nstride"], GATE_BS = c["GATE_BS"],
+                            N_NODE_GATES = c["N_NODE_GATES"],
                             gate_stride = c["gate"].size(1), ext_base = ext_base, num_stages = 1)
             return run
 
@@ -690,16 +722,34 @@ class BlockScaleSumParams(ExternalSumParams):
         if external_params is None:
             return None
 
-        ptrs = (node_mars.data_ptr(), element_mars.data_ptr(), params.data_ptr(),
-                external_params.data_ptr(), node_mars.size(1))
+        # Keyed by SHAPE, and a dict. This was one entry keyed partly on data POINTERS, which was wrong
+        # twice over: alternating between two batch sizes missed on every call, and any reallocation --
+        # a batch resize, allocator churn between PC calls, `empty_cache` -- threw away a plan that was
+        # still valid. Neither is cheap to get wrong, because `_build_plan` AUTOTUNES: ~66 ms a layer,
+        # so a caller whose batch varies step to step paid ~2 s per step across 31 tied layers, and a
+        # gated run came out 2.3x an ungated one whose steady-state cost is nil.
+        #
+        # Nothing in a plan is pointer-dependent. The four buffers are passed at launch, and `ext_base`
+        # is an offset RELATIVE to the staging buffer, so it survives the whole thing moving. It is
+        # re-derived and compared anyway -- a pointer subtraction against a rebuild that autotunes.
+        batch = node_mars.size(1)
+        plans = layer.__dict__.setdefault("_bs_fw_plans", {})
+        entry = plans.get(batch)
+        if entry is not None and entry[1]["ext_base"] != self._ext_base(ns_tensors, external_params,
+                                                                       batch):
+            entry = None
+        if entry is None:
+            built = self._build_plan(layer, ns_tensors, node_mars, element_mars, params,
+                                     external_params)
+            # `_build_plan` also allocates a `log Z` buffer per partition, sized by batch, so an
+            # unbounded cache would hold one set per batch size ever seen. Oldest out first.
+            if len(plans) >= _FW_PLAN_CACHE:
+                del plans[next(iter(plans))]
+            entry = plans[batch] = (built, layer._bs_bw_state)
 
-        entry = getattr(layer, "_bs_fw_plan", None)
-        if entry is None or entry[0] != ptrs:
-            entry = (ptrs, self._build_plan(layer, ns_tensors, node_mars, element_mars, params,
-                                            external_params))
-            layer._bs_fw_plan = entry
-
-        mod, fname, calls = entry[1]
+        mod, fname, calls = entry[0]
+        # The backward reads this, and on a cache HIT `_build_plan` did not run to set it.
+        layer._bs_bw_state = entry[1]
 
         if mod == "triton":
             # The portable fallback: `calls` are kwarg dicts rather than positional tuples, since
@@ -716,6 +766,8 @@ class BlockScaleSumParams(ExternalSumParams):
                     BLOCK_SIZE_M = c["BLOCK_SIZE_M"], TL_DOT = c["TL_DOT"],
                     NODE_CBS = layer._bs_bw_state["node_cbs"],
                     GATE_CBS = layer._bs_bw_state["gate_cbs"],
+                    gate_nstride = c["gate_nstride"], GATE_BS = c["GATE_BS"],
+                    N_NODE_GATES = c["N_NODE_GATES"],
                     gate_stride = c["gate"].size(1),
                     ext_base = layer._bs_bw_state["ext_base"], num_stages = 1)
             return None
@@ -921,6 +973,20 @@ class BlockScaleSumParams(ExternalSumParams):
 
         # Refused BEFORE anything is perturbed, so a caller asking for something unimplemented does not
         # get a circuit whose `node_mars` was left shifted.
+        #
+        # The NODE-AXIS gate is forward-only for now. Every backward kernel derives one gate per edge
+        # block and applies it to a whole node block, so a finer node gate would silently use the wrong
+        # row rather than fail -- refuse until the gate table carries a node-gate axis.
+        ngates = self.gate_counts(ns_tensors[0][0].ns)[0]
+        if ngates != 1:
+            raise NotImplementedError(
+                f"a gate finer than `ns.block_size` along the NODE axis ({ngates} node gates per "
+                f"block) is implemented in the FORWARD only. The backward's element, parameter and "
+                f"gradient kernels all index the gate per edge block, one gate to a node block, so "
+                f"they would read the wrong gate row rather than refuse. Build the node at the gate's "
+                f"block size for a fully served equivalent -- the gate tensor has the same shape."
+            )
+
         if self.apply_z_correction:
             raise NotImplementedError(
                 "`apply_z_correction = True` is not implemented, and was measured not to be worth "

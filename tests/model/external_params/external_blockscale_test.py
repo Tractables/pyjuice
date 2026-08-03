@@ -232,8 +232,8 @@ def test_all_tile_configs_agree():
     pc, _, ns, data, phi, ref = _run(512, 128, 16, 128)
 
     layer = [l for g in pc.inner_layer_groups if g.is_sum() for l in g.layers
-             if hasattr(l, "_bs_fw_plan")][0]
-    mod, fname, calls = layer._bs_fw_plan[1]
+             if hasattr(l, "_bs_fw_plans")][0]
+    mod, fname, calls = next(iter(layer._bs_fw_plans.values()))[0]
     if fname != "blockscale_forward":
         pytest.skip("the launcher chose the small-batch kernel; no tile configs to compare")
     valid = [int(i) for i in mod.fitting_configs(128, 128, 16)]
@@ -613,43 +613,10 @@ def test_a_live_gate_makes_a_zero_pseudocount_more_likely_to_collapse():
 
 # --------------------------------------------------------------------------------- the boundary
 
-@cuda_only
-@needs_cute
-@pytest.mark.parametrize("num_latents,block_size,batch,gate_bs,why", [
-    (256, 64, 64, 32, "gate narrower than the node block"),
-])
-def test_unsupported_shapes_raise(num_latents, block_size, batch, gate_bs, why):
-    """The kernel has no fallback, so anything outside its gate must raise -- loudly, and at the
-    forward, not silently produce something else. This pins the supported region: when one of these
-    starts passing, a case has been implemented and the parametrization should move."""
-    dev = torch.device("cuda:0")
-    torch.manual_seed(0)
-    n_blocks = num_latents // block_size
-
-    with juice.set_block_size(block_size):
-        ni = [inputs(v, num_node_blocks = n_blocks, dist = dists.Categorical(num_cats = NUM_CATS))
-              for v in range(2)]
-        ep = (BlockScaleSumParams(block_size = gate_bs, ch_block_size = 8) if gate_bs is not None
-              else BlockScaleSumParams(ch_block_size = 8))
-        if gate_bs is not None:
-            with pytest.raises(NotImplementedError, match = why.split()[0]):
-                summate(multiply(*ni), num_node_blocks = n_blocks, external_params = ep)
-            return
-        ns = summate(multiply(*ni), num_node_blocks = n_blocks, external_params = ep)
-        root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
-
-    torch.manual_seed(0)
-    root.init_parameters(perturbation = 2.0)
-    pc = juice.compile(root, verbose = False).to(dev)
-
-    torch.manual_seed(7)
-    data = torch.randint(0, NUM_CATS, [batch, 2], device = dev)
-    phi = torch.randn(_gate_shape(ns, batch), device = dev) * 0.5
-
-    with pytest.raises(NotImplementedError):
-        pc(data, sum_external_params = {ns: phi})
-
-
+# `test_unsupported_shapes_raise` lived here. Its only case -- a gate narrower than the node block --
+# is now served by the portable Triton forward, and the boundary that remains (the BACKWARD has no
+# node-gate axis) is asserted in `external_blockscale_ragged_test.py`. Removed per its own docstring:
+# "when one of these starts passing, a case has been implemented and the parametrization should move".
 # --------------------------------------------------------------------------------- backward
 
 def _ch_element_ids(ns):
