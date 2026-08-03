@@ -236,6 +236,16 @@ def test_tied_gates_accumulate_across_every_layer_that_shares_them():
     # same way and produces this gradient's first term, and the forks differ in precision (fp16 dot
     # vs pure fp32). Replaying only the log-Z tile took this from 2-of-5 runs passing to 8-of-10 --
     # better, and still flaky, because the element pick was free to diverge.
+    #
+    # The replay is POSITIONAL, so the two arms have to make the same sequence of `autotune` calls --
+    # and `_logz_tile` calls `autotune` itself. The recording arm therefore logged three extra entries
+    # that the replaying arm never asks for, because it short-circuits `_logz_tile` and returns the
+    # recorded plan directly. From the first of those the streams were off by one: the log-Z pick was
+    # offered where an element-fork pick was expected, no candidate matched, and the fallback ran a
+    # LIVE measurement -- one per copy, each free to land on a different fork. That is what was left of
+    # the flakiness (3 of 8 runs). Those nested calls are excluded from the recording below, which
+    # aligns the streams exactly (9 recorded, 9 consumed, 0 fallbacks) and takes `d` from 1.5e-3 on a
+    # bad run to 9.3e-8 on every run.
     import pyjuice.nodes.external_params.block_scale as _bs
     import pyjuice.layer.kernels.c as _ck
     original_tile = _bs.BlockScaleSumParams._logz_tile
@@ -243,7 +253,11 @@ def test_tied_gates_accumulate_across_every_layer_that_shares_them():
     recorded, recorded_at = [], []
 
     def record(self, layer, launch, grad_ext, b, bs_, n_gates, rows):
-        pick = original_tile(self, layer, launch, grad_ext, b, bs_, n_gates, rows)
+        record_at.inside_logz = True                    # its own `autotune` calls are not part of the stream
+        try:
+            pick = original_tile(self, layer, launch, grad_ext, b, bs_, n_gates, rows)
+        finally:
+            record_at.inside_logz = False
         recorded.append(pick)
         return pick
 
@@ -256,20 +270,25 @@ def test_tied_gates_accumulate_across_every_layer_that_shares_them():
 
     def record_at(cands, **kw):
         pick = original_autotune(cands, **kw)
-        recorded_at.append(pick)
+        if not record_at.inside_logz:
+            recorded_at.append((tuple(n for n, _ in cands), pick))
         return pick
+    record_at.inside_logz = False
 
     def replay_at(cands, **kw):
-        # Replay only where the recorded choice is still on offer; the two circuits are structurally
-        # identical, so a mismatch means the assumption behind this test has broken and is worth
-        # falling back loudly rather than silently comparing different paths.
+        # The two circuits are structurally identical, so the streams must line up exactly. Anything
+        # else means the assumption behind this test has broken; fall back to a live measurement and
+        # let the assert after the run say so, rather than silently comparing different paths.
+        keys = tuple(n for n, _ in cands)
         if replay_at.i < len(recorded_at):
-            pick = recorded_at[replay_at.i]
+            rec_keys, pick = recorded_at[replay_at.i]
             replay_at.i += 1
-            if any(n == pick for n, _ in cands):
+            if rec_keys == keys:
+                replay_at.hits += 1
                 return pick
         return original_autotune(cands, **kw)
     replay_at.i = 0
+    replay_at.hits = 0
 
     def run(tie):
         pc, copies = build(tie)
@@ -289,6 +308,14 @@ def test_tied_gates_accumulate_across_every_layer_that_shares_them():
     assert recorded and replay.i == len(recorded), \
         f"the two arms built different numbers of log-Z plans ({len(recorded)} vs {replay.i}), so " \
         f"they did not take the same numerical path and the comparison below is not apples-to-apples"
+
+    # Same requirement for the rest of the autotuned choices. A single live fallback here is enough to
+    # put the two arms on differently-rounded kernels, so demand that every recorded choice was asked
+    # for, in order, with the candidate set it was recorded against -- silence is not evidence.
+    assert recorded_at and replay_at.hits == len(recorded_at) == replay_at.i, \
+        f"the two arms made different sequences of autotune calls ({len(recorded_at)} recorded, " \
+        f"{replay_at.i} consumed, {replay_at.hits} replayed), so at least one kernel was picked by a " \
+        f"live measurement in one arm only and the comparison below is not apples-to-apples"
 
     # Every copy reads back the SAME storage when tied -- if they did not, there would be nothing to
     # accumulate and the rest of the check would pass vacuously.
