@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import warnings
+from collections import OrderedDict
 
 import torch
 from typing import Optional, Tuple
@@ -16,8 +17,19 @@ _BUFFER_KWARG = None
 _KEY_STRIDE = 1 << 32
 
 #: How many forward plans to keep per layer, keyed by batch size. Each holds a `log Z` buffer per
-#: partition sized by that batch, so this bounds memory; rebuilding an evicted one costs an autotune.
-_FW_PLAN_CACHE = 8
+#: partition sized by that batch, so this bounds memory; rebuilding an evicted one costs an AUTOTUNE,
+#: ~66 ms a layer, which is why the bound is generous and the eviction is LRU rather than FIFO.
+#:
+#: 8 was far too small, and it failed discontinuously rather than gracefully. A caller whose batch is a
+#: block count cycles through its distinct values, and FIFO against a cyclic pattern evicts precisely
+#: the entry needed next: measured, 9 distinct shapes against 8 slots gave a 0%% hit rate, not 8/9 --
+#: 750 ms a call against 4.3 ms at 8 shapes. A real workload (GSM8K micro-batches) has 20 distinct
+#: values spanning 6-25, so this covers it outright with headroom.
+#:
+#: NOT keyed on a coarser bucket such as `next_power_of_2(batch)`, tempting as that is: CuTe
+#: eligibility is gated on `batch %% 64 == 0`, so batches 96 and 128 share a bucket but not a set of
+#: candidate forks, and they would silently share a plan built for the wrong one.
+_FW_PLAN_CACHE = 32
 
 
 def _buffer_kwarg() -> str:
@@ -733,8 +745,10 @@ class BlockScaleSumParams(ExternalSumParams):
         # is an offset RELATIVE to the staging buffer, so it survives the whole thing moving. It is
         # re-derived and compared anyway -- a pointer subtraction against a rebuild that autotunes.
         batch = node_mars.size(1)
-        plans = layer.__dict__.setdefault("_bs_fw_plans", {})
+        plans = layer.__dict__.setdefault("_bs_fw_plans", OrderedDict())
         entry = plans.get(batch)
+        if entry is not None:
+            plans.move_to_end(batch)          # LRU: a hit has to protect the entry, or it cannot help
         if entry is not None and entry[1]["ext_base"] != self._ext_base(ns_tensors, external_params,
                                                                        batch):
             entry = None
@@ -743,8 +757,8 @@ class BlockScaleSumParams(ExternalSumParams):
                                      external_params)
             # `_build_plan` also allocates a `log Z` buffer per partition, sized by batch, so an
             # unbounded cache would hold one set per batch size ever seen. Oldest out first.
-            if len(plans) >= _FW_PLAN_CACHE:
-                del plans[next(iter(plans))]
+            while len(plans) >= _FW_PLAN_CACHE:
+                plans.popitem(last = False)
             entry = plans[batch] = (built, layer._bs_bw_state)
 
         mod, fname, calls = entry[0]

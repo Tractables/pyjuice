@@ -3,6 +3,7 @@ from __future__ import annotations
 import warnings
 
 import torch
+from collections import OrderedDict
 from typing import Any, Optional, Tuple
 
 from .external_params import ExternalSumParams
@@ -399,14 +400,16 @@ class LowRankSumParams(ExternalSumParams):
             # Cheaper to get wrong than the block-scale version -- `_build_cuda_plan` does not autotune,
             # so a rebuild is tens of microseconds rather than ~66 ms -- but wrong the same way.
             batch = node_mars.size(1)
-            plans = layer.__dict__.setdefault("_lr_fw_plans", {})
+            plans = layer.__dict__.setdefault("_lr_fw_plans", OrderedDict())
             entry = plans.get(batch)
+            if entry is not None:
+                plans.move_to_end(batch)
             if entry is None:
                 buf = kwargs.get(_buffer_kwarg(), None)
                 entry = (None if buf is None else
                          self._build_cuda_plan(layer, ns_tensors, node_mars, element_mars, buf))
-                if len(plans) >= 8:
-                    del plans[next(iter(plans))]
+                while len(plans) >= 32:
+                    plans.popitem(last = False)
                 plans[batch] = entry
 
             if entry is not None:
