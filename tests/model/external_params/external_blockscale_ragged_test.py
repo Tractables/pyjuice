@@ -843,3 +843,78 @@ def test_a_node_axis_gate_is_reachable_by_blocking_the_node_at_the_gate_size():
     got = ns.get_param_flows().double().to(ref_pf.device)
     d = float(((got - ref_pf).abs() / ref_pf.clamp(min = 1e-30)).max())
     assert d < 3e-3, f"node-axis gate via re-blocking: param flows off by {d} (relative)"
+
+
+@cuda_only
+@pytest.mark.parametrize("K,block_size,gate_bs,gate_cbs", [
+    (256, 256, 256, 8),      # control: one gate per node block, the long-supported case
+    (256, 256, 32, 8),
+    (256, 256, 128, 32),
+    (128, 128, 16, 16),
+])
+def test_a_node_axis_gate_computes_the_right_forward(K, block_size, gate_bs, gate_cbs):
+    """A gate FINER than `ns.block_size` along the node axis, against a float64 reference.
+
+    The forward serves this by keeping its M tile inside one node gate, so `phi` is still constant over
+    a tile's rows and folds onto the child operand -- no extra contraction. What the kernel adds is the
+    node-gate ROW, and getting that wrong reads a real gate belonging to different nodes, which is a
+    plausible finite number rather than a failure. Hence a reference rather than an invariant.
+
+    NOT `needs_cute`: both CUDA forks apply one gate per edge block to a whole node block and decline a
+    finer one, so this is exactly the path that exists for machines without a CUDA toolchain.
+
+    The reference recomputes the product layer's element values from its children's `node_mars` instead
+    of reading `element_mars`. That buffer is SCRATCH and is reused across layer groups, so after the
+    forward returns it no longer holds every product layer's output -- reading it made three separate
+    attempts at this reference disagree with shapes that already worked."""
+    dev = torch.device("cuda:0")
+    batch = 16
+
+    torch.manual_seed(0)
+    with juice.set_block_size(block_size):
+        a = inputs(0, num_node_blocks = K // block_size,
+                   dist = dists.Categorical(num_cats = NUM_CATS))
+        e = inputs(1, num_node_blocks = K // block_size,
+                   dist = dists.Categorical(num_cats = NUM_CATS))
+        ns = summate(multiply(a, e), num_node_blocks = K // block_size,
+                     external_params = BlockScaleSumParams(block_size = gate_bs,
+                                                           ch_block_size = gate_cbs))
+        root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
+    torch.manual_seed(0)
+    root.init_parameters(perturbation = 2.0)
+    pc = juice.compile(root, verbose = False).to(dev)
+
+    torch.manual_seed(7)
+    data = torch.randint(0, NUM_CATS, [batch, 2], device = dev)
+    torch.manual_seed(11)
+    phi = torch.randn(ns.external_params.tensor_shapes(ns, batch)[0], device = dev) * 0.7
+
+    pc(data, sum_external_params = {ns: phi})
+
+    lo, hi = ns._output_ind_range
+    got = pc.node_mars[lo:hi, :batch].double()
+    em = (pc.node_mars[a._output_ind_range[0]:a._output_ind_range[1], :batch].double()
+          + pc.node_mars[e._output_ind_range[0]:e._output_ind_range[1], :batch].double())
+    theta = pc.get_node_params(ns).double()                      # [E, K, Kc], node-major
+    ephi = phi.double().exp()                                    # [B, Nk, Ck]
+
+    ref = torch.empty_like(got)
+    for nb in range(K // block_size):
+        rows = [i for i in range(ns.edge_ids.size(1)) if int(ns.edge_ids[0, i]) == nb]
+        num = torch.zeros([block_size, batch], dtype = torch.float64, device = dev)
+        den = torch.zeros([block_size, batch], dtype = torch.float64, device = dev)
+        nidx = (nb * block_size + torch.arange(block_size, device = dev)) // gate_bs
+        for ei in rows:
+            cols = (int(ns.edge_ids[1, ei]) * ns.ch_block_size
+                    + torch.arange(ns.ch_block_size, device = dev))
+            g = ephi[:, :, cols // gate_cbs][:, nidx, :].permute(1, 2, 0)     # [K, Kc, B]
+            w = theta[ei][:, :, None] * g
+            num += (w * em[cols].exp()[None]).sum(1)
+            den += w.sum(1)
+        ref[nb * block_size:(nb + 1) * block_size] = num.log() - den.log()
+
+    # 3e-4, not tighter: a fine node gate falls to the portable Triton forward, whose `tl.dot` is TF32,
+    # and this kernel's own cross-fork band is 1.1e-4 to 2.6e-4. The control, served by a CUDA fork at
+    # this batch, lands near 1e-7 -- so a real indexing error cannot hide inside this tolerance.
+    d = float((got - ref).abs().max() / ref.abs().max())
+    assert d < 3e-4, f"node-axis gate forward off by {d} (relative)"
