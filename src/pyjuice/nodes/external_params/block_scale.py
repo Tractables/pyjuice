@@ -331,7 +331,7 @@ class BlockScaleSumParams(ExternalSumParams):
         # Its own dict, via `__dict__` -- the forward reaches this before `_bs_bw_gate_cache` exists,
         # and `nn.Module.__getattr__` raises rather than returning None for a missing attribute.
         cache = layer.__dict__.setdefault("_bs_nstride_cache", {})
-        key = id(nids)
+        key = (int(nids.data_ptr()), int(nids.numel()), int(nids[0]), int(nids[-1]))
         if key in cache:
             return cache[key]
 
@@ -1327,7 +1327,9 @@ class BlockScaleSumParams(ExternalSumParams):
                         TILE_SIZE_K = ctx["TILE_SIZE_K"], TILE_SIZE_M = ctx["TILE_SIZE_M"],
                         BLOCK_SIZE_M = blk, TL_DOT = ctx["TL_DOT"], NODE_CBS = node_cbs,
                         GATE_CBS = gate_cbs, gate_stride = gb.size(1), ext_base = ext_base,
-
+                        GATE_BS = gate_bs_, N_NODE_GATES = n_ngates_,
+                        gate_nstride = (self._gate_nstride(layer, ctx["nids"])
+                                        if n_ngates_ > 1 else None),
                         pid_m_offset = s0, num_stages = 1,
                         # Reached only from behind `par_ok` (sum_layer.py), which already requires
                         # `_par_flow_collision_free` AND edge-contiguous `cids` -- so neither hazard
