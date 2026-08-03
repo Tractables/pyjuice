@@ -102,15 +102,32 @@ def _gates_per_edge_block(phi, ns):
     return torch.stack(out, dim = 0)                                       # [E, D]
 
 
-def _effective(theta, phi, ns, gate_cbs):
+def _effective(theta, phi, ns, gate_cbs, gate_bs = None):
     """`theta_tilde` for one sample: `[E, K, Kc]` from shared `[E, K, Kc]` and the gate grid `[Nk, Ck]`.
 
     Normalization runs over all children of a NODE -- the edge blocks incident to that node's block --
-    not over every edge block in the layer, which would mix node blocks that share nothing."""
-    E = theta.size(0)
+    not over every edge block in the layer, which would mix node blocks that share nothing.
 
-    g = _gates_per_edge_block(phi, ns).double().exp().repeat_interleave(gate_cbs, dim = 1)   # [E, Kc]
-    eff = theta.double() * g[:, None, :]
+    `gate_bs` is the gate's NODE-axis block size, defaulting to the node's own. When it is finer, the
+    gate row is picked per NODE rather than once per edge block, so `g` gains a node axis. Verified
+    bit-identical to the per-edge-block form wherever `gate_bs == ns.block_size`."""
+    E = theta.size(0)
+    gate_bs = ns.block_size if gate_bs is None else gate_bs
+
+    if gate_bs != ns.block_size:
+        bs, cbs = ns.block_size, ns.ch_block_size
+        dev = theta.device
+        n_loc = torch.arange(bs, device = dev)
+        c_loc = torch.arange(cbs, device = dev)
+        g = torch.empty([E, bs, cbs], dtype = torch.float64, device = dev)
+        for e in range(E):
+            rows = (int(ns.edge_ids[0, e]) * bs + n_loc) // gate_bs
+            cols = (int(ns.edge_ids[1, e]) * cbs + c_loc) // gate_cbs
+            g[e] = phi.double()[rows][:, cols].exp()
+        eff = theta.double() * g
+    else:
+        g = _gates_per_edge_block(phi, ns).double().exp().repeat_interleave(gate_cbs, dim = 1)
+        eff = theta.double() * g[:, None, :]
 
     nblk = ns.edge_ids[0, :].tolist()
     out = torch.empty_like(eff)
@@ -633,7 +650,7 @@ def _ch_element_ids(ns):
     return out
 
 
-def _flow_reference(pc, ns, phi, gate_cbs, batch):
+def _flow_reference(pc, ns, phi, gate_cbs, batch, gate_bs = None):
     """
     float64 element and parameter flows under the effective per-sample parameters.
 
@@ -663,7 +680,7 @@ def _flow_reference(pc, ns, phi, gate_cbs, batch):
     pf = torch.zeros([E, bs, cbs], dtype = torch.float64, device = dev)
 
     for b in range(batch):
-        eff = _effective(theta, phi[b], ns, gate_cbs)                   # [E, bs, cbs], float64
+        eff = _effective(theta, phi[b], ns, gate_cbs, gate_bs)          # [E, bs, cbs], float64
         for e in range(E):
             nrows = nid0 + int(ns.edge_ids[0, e]) * bs + ar_n
             crows = int(ch_eids[int(ns.edge_ids[1, e])]) + ar_c

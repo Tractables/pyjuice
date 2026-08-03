@@ -920,8 +920,55 @@ def test_a_node_axis_gate_computes_the_right_forward(K, block_size, gate_bs, gat
     assert d < 3e-4, f"node-axis gate forward off by {d} (relative)"
 
 
-# The node-axis BACKWARD is not implemented -- it is refused, with a working equivalent (build the node
-# at the gate's block size). That is a feature gap, not a bug, and the refusal is already pinned by
-# `test_a_node_axis_gate_is_reachable_by_blocking_the_node_at_the_gate_size` above. Target tests for the
-# unimplemented path used to sit here as strict xfails; they were redundant with that, and a suite that
-# is green is worth more than a to-do marker inside it. The design is recorded outside the tests.
+@cuda_only
+@pytest.mark.parametrize("K,block_size,gate_bs,gate_cbs,batch", [
+    (256, 256, 128, 32, 64),
+    (256, 256, 128, 8, 64),
+    (256, 256, 64, 8, 64),
+    (512, 512, 256, 16, 64),
+])
+def test_a_node_axis_gate_computes_the_right_flows(K, block_size, gate_bs, gate_cbs, batch):
+    """The BACKWARD flows under a gate finer than `ns.block_size` on the node axis, against the float64
+    reference the coarse-gate tests already use. `_effective` now takes the gate's node block size and
+    is bit-identical to its previous form wherever that equals the node's, so this shares an oracle
+    with the rest of the suite rather than introducing one.
+
+    A reference and NOT an invariant, deliberately. A wrong node-gate row reads a REAL gate belonging
+    to different nodes, so the flows stay finite and plausible. Two invariants were tried first and
+    both are unsound here: gating one row does not leave other nodes' flows alone, because flows arrive
+    from above and the root redistributes when any child's value moves; and normalizing each node's
+    distribution does not rescue it, because the flows sum over the BATCH before normalizing, so a
+    changed `f[n,b]` reweights a mixture of samples with different `element_mars`.
+
+    `d LL / d log phi` is still refused for these shapes and is not exercised here."""
+    dev = torch.device("cuda:0")
+
+    torch.manual_seed(0)
+    with juice.set_block_size(block_size):
+        ni = [inputs(v, num_node_blocks = K // block_size,
+                     dist = dists.Categorical(num_cats = NUM_CATS)) for v in range(2)]
+        ns = summate(multiply(*ni), num_node_blocks = K // block_size,
+                     external_params = BlockScaleSumParams(block_size = gate_bs,
+                                                           ch_block_size = gate_cbs))
+        root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
+    torch.manual_seed(0)
+    root.init_parameters(perturbation = 2.0)
+    pc = juice.compile(root, verbose = False).to(dev)
+
+    torch.manual_seed(7)
+    data = torch.randint(0, NUM_CATS, [batch, 2], device = dev)
+    torch.manual_seed(11)
+    phi = torch.randn(ns.external_params.tensor_shapes(ns, batch)[0], device = dev) * 1.2
+
+    pc(data, sum_external_params = {ns: phi})
+    pc.backward(data, flows_memory = 0.0, compute_external_grads = False)
+
+    got = pc.get_node_param_flows(ns).double()
+    _, ref = _flow_reference(pc, ns, phi, gate_cbs, batch, gate_bs = gate_bs)
+    d = float((got - ref).abs().max() / ref.abs().max())
+    assert d < 3e-3, f"node-axis param flows off by {d} (relative)"
+
+
+# Still refused, each with a message naming the reason: `d LL / d log phi` (its log-Z term sums
+# `sigma[n, g]` over a whole node block, which a node gate splits), and a gate narrower than the
+# element kernel's k-tile. Re-blocking the node at the gate size is the served equivalent for both.
