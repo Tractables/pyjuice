@@ -918,3 +918,55 @@ def test_a_node_axis_gate_computes_the_right_forward(K, block_size, gate_bs, gat
     # this batch, lands near 1e-7 -- so a real indexing error cannot hide inside this tolerance.
     d = float((got - ref).abs().max() / ref.abs().max())
     assert d < 3e-4, f"node-axis gate forward off by {d} (relative)"
+
+
+@cuda_only
+@pytest.mark.xfail(raises = NotImplementedError, strict = True,
+                   reason = "the backward has no node-gate axis yet; see pre_backward_layer")
+@pytest.mark.parametrize("K,block_size,gate_bs,gate_cbs,batch", [
+    (256, 256, 32, 8, 16),
+    (256, 256, 128, 32, 16),
+    (128, 128, 16, 16, 64),
+])
+def test_a_node_axis_gate_computes_the_right_backward(K, block_size, gate_bs, gate_cbs, batch):
+    """TARGET behaviour for the node-axis backward. `xfail(strict)` with `raises` pinned, so removing
+    the marker is the whole visible diff of the change that implements it, and a test that starts
+    passing early cannot pass unnoticed -- while a failure for any OTHER reason is an ERROR, not an
+    xfail. That distinction is the point: the refusal these currently hit must be the one in
+    `pre_backward_layer`, not an unrelated break on the way there.
+
+    The check is the reference-free ZERO-SUM invariant rather than a float64 oracle. Scaling all of a
+    node's child gates by a constant cancels against the normalizer, so `d LL / d log phi` must sum to
+    zero along the child-gate axis -- and it must do so per NODE-GATE ROW once that axis exists, which
+    is exactly what a wrong row would break. It needs no reference, holds on every shape, and is what
+    caught the two gradient terms being added rather than subtracted."""
+    dev = torch.device("cuda:0")
+
+    torch.manual_seed(0)
+    with juice.set_block_size(block_size):
+        ni = [inputs(v, num_node_blocks = K // block_size,
+                     dist = dists.Categorical(num_cats = NUM_CATS)) for v in range(2)]
+        ns = summate(multiply(*ni), num_node_blocks = K // block_size,
+                     external_params = BlockScaleSumParams(block_size = gate_bs,
+                                                           ch_block_size = gate_cbs))
+        root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
+    torch.manual_seed(0)
+    root.init_parameters(perturbation = 2.0)
+    pc = juice.compile(root, verbose = False).to(dev)
+
+    torch.manual_seed(7)
+    data = torch.randint(0, NUM_CATS, [batch, 2], device = dev)
+    torch.manual_seed(11)
+    phi = torch.randn(ns.external_params.tensor_shapes(ns, batch)[0], device = dev) * 0.7
+
+    pc(data, sum_external_params = {ns: phi})
+    pc.backward(data, flows_memory = 0.0)
+
+    assert float(pc.param_flows.abs().sum()) > 0.0, "the backward wrote no parameter flows"
+
+    g = pc.get_external_params_grad(ns)[0]
+    assert torch.isfinite(g).all(), "the gate gradient is not finite"
+    scale = float(g.abs().max())
+    assert scale > 0.0, "the gate gradient was never written"
+    assert float(g.sum(dim = 2).abs().max()) < 5e-2 * scale, \
+        "the gate gradient does not cancel along the child-gate axis"
