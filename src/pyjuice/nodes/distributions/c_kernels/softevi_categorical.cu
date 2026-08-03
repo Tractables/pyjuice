@@ -342,13 +342,25 @@ void softevi_forward(torch::Tensor params, torch::Tensor node_mars, torch::Tenso
 // reference instead is what made an earlier attempt at this 1.7x SLOWER than the gather form.
 // Measured on the CoDD config: 0.84 ms, against a 0.31 ms floor for the beta read alone.
 
-template <int TL>
+template <int TL, bool SWZ>
 __global__ void softevi_fw_dense_z(const float* __restrict__ params, const int* __restrict__ uniq,
                                    const int* __restrict__ ref_slot, const float* __restrict__ ref_pt,
                                    const int* __restrict__ ref_cnt, const int* __restrict__ num_uniq,
                                    const long* __restrict__ p_base, float* __restrict__ Z,
                                    int num_latents, int uniq_stride, int max_refs, int num_slots) {
-    extern __shared__ float Zs[];                       // [num_slots * TL]
+    extern __shared__ float Zs[];                       // [num_slots * TL], latent axis XOR-swizzled
+
+    // The lanes of a warp hold DIFFERENT slots (that is what the rotation below arranges), and at the
+    // natural layout `s * TL + t` the address reaches only 32/TL distinct shared-memory banks -- at TL=4,
+    // 32 distinct slots collapse onto 8 banks, so every atomic below is a 4-way conflict. Padding the row
+    // to TL+1 fixes the banking (2.17 -> 1.33 ms at 256 slots) but costs a float per slot. Permuting the
+    // latent axis instead is free: XOR `t` with the bits of `s` that the bank index would otherwise
+    // ignore. Measured 2.17 -> 1.11 ms at 256 slots -- better than padding, and no extra memory. The
+    // flush below inverts it (XOR is its own inverse).
+    // Only worth it while the `Zs` tile is small. At a 32 KB tile the kernel is limited by something
+    // other than banking and the extra address arithmetic in the hot loop shows up as a few percent, so
+    // the launcher turns it off there (same threshold that picks TL).
+    constexpr int SPR = 32 / TL;                        // slots per 32-bank cycle
 
     const int g = blockIdx.z;
     const int l0 = blockIdx.y * TL;
@@ -384,8 +396,9 @@ __global__ void softevi_fw_dense_z(const float* __restrict__ params, const int* 
             const int s = ref_slot[rj];
             const float w = ref_pt[rj] * 1.8446744073709552e19f;   // 2^64, exact
             float* dst = Zs + (long)s * TL;
+            const int sw = SWZ ? ((s / SPR) & (TL - 1)) : 0;
             #pragma unroll
-            for (int t = 0; t < TL; ++t) atomicAdd(dst + t, bet[t] * w);
+            for (int t = 0; t < TL; ++t) atomicAdd(dst + (t ^ sw), bet[t] * w);
         }
     }
     __syncthreads();
@@ -393,7 +406,8 @@ __global__ void softevi_fw_dense_z(const float* __restrict__ params, const int* 
     for (int i = threadIdx.x; i < num_slots * TL; i += blockDim.x) {
         const float v = Zs[i];
         if (v != 0.0f) {
-            const int s = i / TL, t = i - s * TL;
+            const int s = i / TL, u = i - s * TL;
+            const int t = u ^ (SWZ ? ((s / SPR) & (TL - 1)) : 0);   // undo the swizzle
             if (l0 + t < num_latents) atomicAdd(Z + (long)s * num_latents + l0 + t, v);
         }
     }
@@ -430,21 +444,24 @@ void softevi_forward_dense(torch::Tensor params, torch::Tensor node_mars, torch:
                            int64_t num_latents, int64_t uniq_stride, int64_t max_refs,
                            int64_t num_slots, int64_t num_blocks, int64_t layer_num_nodes,
                            int64_t batch_size, int64_t node_offset, int64_t TLv, int64_t threads,
-                           int64_t cat_blocks, int64_t zero_z, int64_t run_epilogue) {
+                           int64_t cat_blocks, int64_t zero_z, int64_t run_epilogue, int64_t swizzle) {
     // `Z` accumulates across shards (the category set is split by reference-list length so that warps
     // are homogeneous -- see `_choose_shard_split`), so the caller zeroes it on the first shard and
     // takes the epilogue on the last.
     auto st = at::cuda::getCurrentCUDAStream();
     if (zero_z) Z.zero_();
     const dim3 grid((unsigned)cat_blocks, (unsigned)((num_latents + TLv - 1) / TLv), (unsigned)num_blocks);
-#define GO(T) { const size_t sm = (size_t)num_slots * T * sizeof(float);                            \
-    softevi_fw_dense_z<T><<<grid, threads, sm, st>>>(params.data_ptr<float>(), uniq.data_ptr<int>(),\
+    const bool swz = (swizzle != 0);
+#define GO_S(T, S) { const size_t sm = (size_t)num_slots * T * sizeof(float);                        \
+    softevi_fw_dense_z<T, S><<<grid, threads, sm, st>>>(params.data_ptr<float>(), uniq.data_ptr<int>(),\
         ref_slot.data_ptr<int>(), ref_pt.data_ptr<float>(), ref_cnt.data_ptr<int>(),                \
         num_uniq.data_ptr<int>(), p_base.data_ptr<long>(), Z.data_ptr<float>(),                     \
         (int)num_latents, (int)uniq_stride, (int)max_refs, (int)num_slots); }
+#define GO(T) { if (swz) GO_S(T, true) else GO_S(T, false) }
     switch (TLv) { case 8: GO(8); break; case 16: GO(16); break; default: GO(4); break; }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 #undef GO
+#undef GO_S
     if (!run_epilogue) return;
     const long tot = layer_num_nodes * batch_size;
     softevi_fw_epilogue<<<(unsigned)((tot + 255) / 256), 256, 0, st>>>(

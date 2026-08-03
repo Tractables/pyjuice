@@ -245,7 +245,88 @@ def _prep_args_fw_cuda_kernel(layer, kwargs):
                 index = index,
                 num_slots = num_slots,
                 num_latents = num_latents,
-                FW_TL = 4, FW_THREADS = 256, FW_CAT_BLOCKS = 64), (1,)
+                # `FW_TL` and the swizzle are chosen by `_fw_autotune`, once per shape.
+                _fw_layer = layer,
+                FW_THREADS = 256, FW_CAT_BLOCKS = 64), (1,)
+
+
+# Latents per thread for the normalizer. Larger amortizes the per-reference index loads over more
+# latents but grows the shared `Zs` tile; 16 needs an opt-in above 48 KB, so it is only offered while the
+# tile fits without one.
+_FW_TL_CANDIDATES = (4, 8, 16)
+_FW_SMEM_CAP = 48 * 1024
+
+
+def _fw_launch_dense(kw, tl, swizzle):
+    """One forward normalizer pass: every shard, then the epilogue once."""
+    from .c_kernels import softevi_forward_dense
+    ix = kw["index"]
+    shards = ix["shards"]
+    for si, sh in enumerate(shards):
+        # Every block zeroes and then flushes a [num_slots, TL] shared tile regardless of how many
+        # categories it gets, so a shard holding only the few hundred long lists must not be launched
+        # over the full category grid -- that flush would cost more than the work it saves.
+        blocks = max(1, min(kw["FW_CAT_BLOCKS"], -(-sh["Umax"] // kw["FW_THREADS"])))
+        softevi_forward_dense(
+            kw["params_ptr"], kw["node_mars_ptr"], kw["Z_ptr"], kw["log_ex_p_ptr"],
+            kw["data_ptr"], kw["vids_ptr"], kw["s_pids_ptr"], kw["nids_ptr"],
+            kw["var_idmapping_ptr"], sh["uniq"], sh["ref_slot"], sh["ref_pt"], sh["ref_cnt"],
+            sh["num_uniq"], ix["p_base"], kw["num_latents"], sh["Umax"], sh["max_refs"],
+            kw["num_slots"], ix["num_blocks"], kw["layer_num_nodes"], kw["batch_size"],
+            kw["node_offset"], tl, kw["FW_THREADS"], blocks,
+            si == 0, si == len(shards) - 1, swizzle)
+
+
+def _fw_autotune(kw):
+    """Pick (latents-per-thread, XOR swizzle) for the normalizer by timing them once per shape.
+
+    These two interact and neither has a threshold that survived contact with more than a couple of
+    configurations. A larger `TL` amortizes the per-reference index loads but grows the shared tile; the
+    swizzle removes a shared-memory bank conflict (`s * TL + t` reaches only 32/TL banks, so 32 distinct
+    slots collapse onto 8 at TL=4) that is worth 1.95x on this kernel at a 4 KB tile and is a wash by
+    16 KB. Hand-picking a cutoff from three measured points produced a few-percent regression at the
+    fourth, so measure instead.
+
+    Runs ONCE per (shape, shard layout) and is cached on the layer; every later step reads the cache.
+    Timing repeats the real launch, which is idempotent -- `Z` is re-zeroed by the first shard of each
+    pass and the epilogue recomputes `node_mars` from it -- so the state left behind is the correct one
+    either way."""
+    ix = kw["index"]
+    shards = ix["shards"]
+    # Bucket `Umax` to a power of two: it drifts a little every step with the candidate data, and
+    # re-tuning on each drift would cost far more than it could recover.
+    key = (kw["num_slots"], kw["num_latents"], ix["num_blocks"],
+           tuple(s["max_refs"] for s in shards),
+           tuple(1 << max(0, s["Umax"] - 1).bit_length() for s in shards))
+
+    layer = kw["_fw_layer"]
+    cache = getattr(layer, "_fw_tune_cache", None)
+    if cache is None:
+        cache = layer._fw_tune_cache = {}
+    hit = cache.get(key)
+    if hit is not None:
+        return hit
+
+    cands = [(tl, swz) for tl in _FW_TL_CANDIDATES for swz in (0, 1)
+             if kw["num_slots"] * tl * 4 <= _FW_SMEM_CAP]
+    best, best_t = None, None
+    for tl, swz in cands:
+        for _ in range(2):                                   # warm up this instantiation
+            _fw_launch_dense(kw, tl, swz)
+        torch.cuda.synchronize()
+        t0 = torch.cuda.Event(enable_timing = True)
+        t1 = torch.cuda.Event(enable_timing = True)
+        t0.record()
+        for _ in range(3):
+            _fw_launch_dense(kw, tl, swz)
+        t1.record()
+        torch.cuda.synchronize()
+        el = t0.elapsed_time(t1)
+        if best_t is None or el < best_t:
+            best, best_t = (tl, swz), el
+
+    cache[key] = best
+    return best
 
 
 class _FwCudaDispatch:
@@ -269,24 +350,8 @@ class _FwCudaDispatch:
     def __getitem__(self, grid):
         def launch(**kw):
             if kw["use_dense"]:
-                from .c_kernels import softevi_forward_dense
-                ix = kw["index"]
-                shards = ix["shards"]
-                for si, sh in enumerate(shards):
-                    # Every block zeroes and then flushes a [num_slots, TL] shared tile regardless of how
-                    # many categories it gets, so a shard holding only the few hundred long lists must
-                    # not be launched over the full category grid -- that flush would cost more than the
-                    # work it saves.
-                    blocks = max(1, min(kw["FW_CAT_BLOCKS"],
-                                        -(-sh["Umax"] // kw["FW_THREADS"])))
-                    softevi_forward_dense(
-                        kw["params_ptr"], kw["node_mars_ptr"], kw["Z_ptr"], kw["log_ex_p_ptr"],
-                        kw["data_ptr"], kw["vids_ptr"], kw["s_pids_ptr"], kw["nids_ptr"],
-                        kw["var_idmapping_ptr"], sh["uniq"], sh["ref_slot"], sh["ref_pt"], sh["ref_cnt"],
-                        sh["num_uniq"], ix["p_base"], kw["num_latents"], sh["Umax"], sh["max_refs"],
-                        kw["num_slots"], ix["num_blocks"], kw["layer_num_nodes"], kw["batch_size"],
-                        kw["node_offset"], kw["FW_TL"], kw["FW_THREADS"], blocks,
-                        si == 0, si == len(shards) - 1)
+                tl, swz = _fw_autotune(kw)
+                _fw_launch_dense(kw, tl, swz)
             else:
                 from .c_kernels import softevi_forward
                 softevi_forward(
