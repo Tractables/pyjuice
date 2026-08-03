@@ -325,6 +325,16 @@ class BlockScaleSumParams(ExternalSumParams):
         can have different child counts, and the kernel only reads it when a node block holds more than
         one gate.
         """
+        # CACHED, and only ever called when there is more than one node gate. It builds tensors and
+        # runs a sort plus a searchsorted, which is nothing per plan but was measured at 1.02-1.07x ->
+        # 1.17-1.30x on the gated backward when it ran on every launch of the param kernel.
+        # Its own dict, via `__dict__` -- the forward reaches this before `_bs_bw_gate_cache` exists,
+        # and `nn.Module.__getattr__` raises rather than returning None for a missing attribute.
+        cache = layer.__dict__.setdefault("_bs_nstride_cache", {})
+        key = (int(nids.data_ptr()), int(nids.numel()), int(nids[0]), int(nids[-1]))
+        if key in cache:
+            return cache[key]
+
         dev = nids.device
         starts = torch.tensor([i.ns._output_ind_range[0] for i in layer.external_node_infos],
                               device = dev, dtype = torch.long)
@@ -335,7 +345,9 @@ class BlockScaleSumParams(ExternalSumParams):
         order = torch.argsort(starts)
         starts, cks = starts[order], cks[order]
         pos = (torch.searchsorted(starts, nids.to(dev).to(torch.long), right = True) - 1).clamp(min = 0)
-        return cks[pos].contiguous()
+        out = cks[pos].contiguous()
+        cache[key] = out
+        return out
 
     def _build_plan(self, layer, ns_tensors, node_mars, element_mars, params, external_params):
         """
@@ -812,7 +824,7 @@ class BlockScaleSumParams(ExternalSumParams):
         dev = chids.device
         chids = chids.to(torch.long)
 
-        keys, vals, ch_all = [], [], []
+        keys, vals, ch_all, cks = [], [], [], []
         for ns_info in layer.external_node_infos:
             ns = ns_info.ns
             par = ns_info.par_nids.to(dev).to(torch.long)
@@ -822,13 +834,17 @@ class BlockScaleSumParams(ExternalSumParams):
             keys.append(par * _KEY_STRIDE + ch)
             vals.append(off + layer.ext_unit_bases[ns_info.ns_idx][0])
             ch_all.append(ch)
+            # One grid ROW per node gate, so a node-axis gate can offset by it below. Per `ns`, since
+            # two sharing a layer may have different child counts.
+            cks.append(torch.full_like(off, ns.num_ch_nodes // ns.external_params.gate_sizes(ns)[1]))
 
         key = torch.cat(keys)
         val = torch.cat(vals)
+        ck = torch.cat(cks)
         assert int(torch.cat(ch_all).max()) < _KEY_STRIDE, \
             "circuit too large for the packed (parent, child) backward gate key."
         order = torch.argsort(key)
-        key, val = key[order], val[order]
+        key, val, ck = key[order], val[order], ck[order]
 
         # The parent BLOCK a tile belongs to: tiles are `TILE_SIZE_K`-wide slices of a node block, so
         # the block is the greatest node-block start not exceeding the tile's first node. Found by
@@ -848,7 +864,26 @@ class BlockScaleSumParams(ExternalSumParams):
 
         pos = torch.searchsorted(key, q).clamp(max = key.numel() - 1)
         hit = key[pos] == q
-        gate = torch.where(hit, val[pos], torch.full_like(q, -1))
+        # The NODE-AXIS row. `blk` is the parent block's first node and `flat` the tile's first
+        # parent, so their difference in units of `gate_bs` is which node gate this tile's parents sit
+        # in. The kernel is unchanged: a tile carries ONE row, which is exact as long as it does not
+        # SPAN two node gates -- enforced where the fork is chosen.
+        # Unconditional: `nrow` is identically zero when there is one gate per node block, so this is
+        # the same table there. A branch on `layer.block_size` was tried and is WRONG -- that is the
+        # layer's block size, not the gated `ns`'s, so node-axis shapes took the coarse arm and lost
+        # the row (flows off by 0.8 relative).
+        # Gated on the GATED `ns`'s block size, not `layer.block_size` and not unconditionally --
+        # both were tried and both are wrong. Unconditional perturbs PADDED coarse tables, because
+        # `blk` comes from a searchsorted that does not land cleanly on a padded entry, so `flat - blk`
+        # is not zero there and rows that were duplicated stop being so. Keying on `layer.block_size`
+        # takes this arm for node-axis shapes and drops the row entirely (flows off by 0.8).
+        ns0 = layer.external_node_infos[0].ns
+        gbs0 = self.gate_sizes(ns0)[0]
+        if ns0.block_size // gbs0 > 1:
+            nrow = (flat - blk) // gbs0
+            gate = torch.where(hit, val[pos] + nrow * ck[pos], torch.full_like(q, -1))
+        else:
+            gate = torch.where(hit, val[pos], torch.full_like(q, -1))
 
         # Every edge block whose child this partition owns must have been found. A miss would not
         # crash -- the kernel reads `-1` as "no gate" and drops the parent's contribution entirely --
@@ -988,18 +1023,8 @@ class BlockScaleSumParams(ExternalSumParams):
         # Refused BEFORE anything is perturbed, so a caller asking for something unimplemented does not
         # get a circuit whose `node_mars` was left shifted.
         #
-        # The NODE-AXIS gate is forward-only for now. Every backward kernel derives one gate per edge
-        # block and applies it to a whole node block, so a finer node gate would silently use the wrong
-        # row rather than fail -- refuse until the gate table carries a node-gate axis.
-        ngates = self.gate_counts(ns_tensors[0][0].ns)[0]
-        if ngates != 1:
-            raise NotImplementedError(
-                f"a gate finer than `ns.block_size` along the NODE axis ({ngates} node gates per "
-                f"block) is implemented in the FORWARD only. The backward's element, parameter and "
-                f"gradient kernels all index the gate per edge block, one gate to a node block, so "
-                f"they would read the wrong gate row rather than refuse. Build the node at the gate's "
-                f"block size for a fully served equivalent -- the gate tensor has the same shape."
-            )
+        gate_bs_ = self.gate_sizes(ns_tensors[0][0].ns)[0]
+        n_ngates_ = self.gate_counts(ns_tensors[0][0].ns)[0]
 
         if self.apply_z_correction:
             raise NotImplementedError(
@@ -1023,6 +1048,18 @@ class BlockScaleSumParams(ExternalSumParams):
         if want_grad and layer._bs_grad_ext is None:
             raise RuntimeError("external-parameter gradients were requested but no gradient buffer "
                                "was supplied to the backward.")
+
+        # The FLOWS now serve a node-axis gate; `d LL / d log phi` does not. Its log-Z term sums
+        # `sigma[n, g]` over a whole node block, which a node gate splits, so that kernel needs a
+        # structure change rather than the row offset the flows take.
+        if n_ngates_ > 1 and layer._bs_grad_ext is not None:
+            raise NotImplementedError(
+                f"`d LL / d log phi` is not implemented for a gate finer than `ns.block_size` along "
+                f"the NODE axis ({n_ngates_} node gates per block). The forward and both flows ARE "
+                f"served, so EM and the circuit's own parameters train; only the gradient with respect "
+                f"to the gate is missing. Build the node at the gate's block size for a fully served "
+                f"equivalent -- the gate tensor has the same shape."
+            )
 
         state = self._bw_state(layer, node_mars, kwargs)
 
@@ -1124,6 +1161,20 @@ class BlockScaleSumParams(ExternalSumParams):
 
             if plan["gate_tile"] is not None:
                 kinds.append("triton")
+                plan["grad_store_ok"] = self._grad_store_ok(plan["gate_tile"], ctx, gate_cbs)
+
+            if n_ngates_ > 1:
+                # The CuTe and small-batch element forks apply one gate per edge block to a whole node
+                # block; only Triton takes the table's per-(k-tile, group) row. And a k-tile carries
+                # ONE row, so it must not span two node gates.
+                span = min(blk, tk)
+                kinds = [k for k in kinds if k == "triton"] if span <= gate_bs_ else []
+                if not kinds:
+                    raise NotImplementedError(
+                        f"a node-axis gate of {gate_bs_} needs each k-tile of parents inside one node "
+                        f"gate, but this layer's tile spans {span} (block_size={blk}, "
+                        f"TILE_SIZE_K={tk}). Build the node at the gate's block size instead."
+                    )
                 plan["grad_store_ok"] = self._grad_store_ok(plan["gate_tile"], ctx, gate_cbs)
 
             if not kinds:
@@ -1276,6 +1327,9 @@ class BlockScaleSumParams(ExternalSumParams):
                         TILE_SIZE_K = ctx["TILE_SIZE_K"], TILE_SIZE_M = ctx["TILE_SIZE_M"],
                         BLOCK_SIZE_M = blk, TL_DOT = ctx["TL_DOT"], NODE_CBS = node_cbs,
                         GATE_CBS = gate_cbs, gate_stride = gb.size(1), ext_base = ext_base,
+                        GATE_BS = gate_bs_, N_NODE_GATES = n_ngates_,
+                        gate_nstride = (self._gate_nstride(layer, ctx["nids"])
+                                        if n_ngates_ > 1 else None),
                         pid_m_offset = s0, num_stages = 1,
                         # Reached only from behind `par_ok` (sum_layer.py), which already requires
                         # `_par_flow_collision_free` AND edge-contiguous `cids` -- so neither hazard
@@ -1286,6 +1340,14 @@ class BlockScaleSumParams(ExternalSumParams):
 
             cands = ([("cute", _cute)] if (par_mod is not None and ctx["cute_ok"]) else []) \
                     + [("triton", _triton)]
+
+            if n_ngates_ > 1:
+                if ctx["TILE_SIZE_M"] > gate_bs_:
+                    raise NotImplementedError(
+                        f"a node-axis gate of {gate_bs_} needs the parameter kernel's node tile inside "
+                        f"one node gate, but TILE_SIZE_M is {ctx['TILE_SIZE_M']}."
+                    )
+                cands = [c for c in cands if c[0] == "triton"]
 
             key = ("parplan", ctx["signature"], batch, ctx["partition_id"])
             pick = cache.get(key)
@@ -1320,6 +1382,12 @@ class BlockScaleSumParams(ExternalSumParams):
 
         def _par_sb_hook(param_flows, node_flows, node_mars, element_mars, params, nids, cids, pids,
                          pfids, batch, blk_size, num_edges, partition_id):
+            # The small-batch CUDA fork applies one gate per edge block to a whole node block.
+            if n_ngates_ > 1:
+                raise NotImplementedError(
+                    f"a node-axis gate of {gate_bs_} is not served by the small-batch parameter fork. "
+                    f"Build the node at the gate's block size instead."
+                )
             # This fork is now offered whatever `pfids` look like -- the layer no longer decides on
             # the descriptor's behalf -- so it works out its own write mode, exactly as the Triton
             # fork does. `PADDED` masks padded lanes out (their contribution is zero, but their
@@ -1344,6 +1412,13 @@ class BlockScaleSumParams(ExternalSumParams):
             """
             from .kernels.blockscale_backward import _bs_triton_par_kernel
             gb, grid = layer.ext_slots[0][ctx["partition_id"]], ctx["grid"]
+            # The UNCONDITIONAL fallback, so it must check too: a shape `_par_hook` refuses arrives
+            # here anyway, and would apply one gate row to a whole node block silently.
+            if n_ngates_ > 1 and ctx["TILE_SIZE_M"] > gate_bs_:
+                raise NotImplementedError(
+                    f"a node-axis gate of {gate_bs_} needs the parameter kernel's node tile inside one "
+                    f"node gate, but TILE_SIZE_M is {ctx['TILE_SIZE_M']}."
+                )
             padded, pf_atomic = self._par_write_flags(layer, ctx["cids"], ctx["pfids"])
             for s0 in range(0, grid[1], 32768):
                 cg = (grid[0], min(s0 + 32768, grid[1]) - s0)
@@ -1357,6 +1432,9 @@ class BlockScaleSumParams(ExternalSumParams):
                     TILE_SIZE_K = ctx["TILE_SIZE_K"], TILE_SIZE_M = ctx["TILE_SIZE_M"],
                     BLOCK_SIZE_M = ctx["block_size"], TL_DOT = ctx["TL_DOT"],
                     NODE_CBS = node_cbs, GATE_CBS = gate_cbs, gate_stride = gb.size(1),
+                    GATE_BS = gate_bs_, N_NODE_GATES = n_ngates_,
+                    gate_nstride = (self._gate_nstride(layer, ctx["nids"])
+                                        if n_ngates_ > 1 else None),
                     ext_base = ext_base, pid_m_offset = s0, num_stages = 1,
                     PADDED = padded, PF_ATOMIC = pf_atomic)
 

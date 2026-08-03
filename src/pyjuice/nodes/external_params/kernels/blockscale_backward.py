@@ -202,7 +202,9 @@ def _bs_triton_par_kernel(node_flows, node_mars, element_mars, mparams, param_fl
                           BLOCK_SIZE_M: tl.constexpr, TL_DOT: tl.constexpr,
                           NODE_CBS: tl.constexpr, GATE_CBS: tl.constexpr,
                           gate_stride: tl.constexpr, ext_base, pid_m_offset = 0,
-                          PADDED: tl.constexpr = 0, PF_ATOMIC: tl.constexpr = 0):
+                          PADDED: tl.constexpr = 0, PF_ATOMIC: tl.constexpr = 0,
+                          GATE_BS: tl.constexpr = 0, N_NODE_GATES: tl.constexpr = 1,
+                          gate_nstride = None):
     """
     Gated parameter-flow backward, a fork of `_bk_triton_block_sparse_par_kernel_rmw`.
 
@@ -273,7 +275,13 @@ def _bs_triton_par_kernel(node_flows, node_mars, element_mars, mparams, param_fl
     offs_gcol = offs_edge // NODE_CBS
     gbase = tl.load(gate + nblock_id * gate_stride + offs_gcol,
                     mask = offs_gcol < gate_stride, other = -1)
-    grow = gbase + ext_base + ((offs_edge % NODE_CBS) // GATE_CBS)
+    # The NODE-AXIS gate row, as in the forward. A SCALAR because the launcher keeps
+    # `TILE_SIZE_M <= GATE_BS`, so one M tile lies inside a single node gate; `Ck` is per row because
+    # two `ns` on a layer can differ. Compiled away entirely when there is one gate per node block.
+    node_gate_off = 0
+    if N_NODE_GATES > 1:
+        node_gate_off = ((tile_id * TILE_SIZE_M) // GATE_BS) * tl.load(gate_nstride + nblock_id)
+    grow = gbase + ext_base + node_gate_off + ((offs_edge % NODE_CBS) // GATE_CBS)
     ghas = gbase >= 0
 
     acc = tl.zeros([TILE_SIZE_M, TILE_SIZE_K], dtype = tl.float32)
