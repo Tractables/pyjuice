@@ -393,17 +393,24 @@ class LowRankSumParams(ExternalSumParams):
 
         if self._resolved_variant() == "cuda":
             # Fast path: one resolved host call per partition, no per-step bookkeeping
-            ptrs = (node_mars.data_ptr(), element_mars.data_ptr(), node_mars.size(1))
-
-            entry = getattr(layer, "_lr_fw_plan", None)
-            if entry is None or entry[0] != ptrs:
+            # Keyed by SHAPE and held per shape, not one entry keyed on data POINTERS: alternating
+            # between two batch sizes missed on every call, and any reallocation discarded a plan that
+            # was still valid. The buffers are passed at launch, so nothing here depends on an address.
+            # Cheaper to get wrong than the block-scale version -- `_build_cuda_plan` does not autotune,
+            # so a rebuild is tens of microseconds rather than ~66 ms -- but wrong the same way.
+            batch = node_mars.size(1)
+            plans = layer.__dict__.setdefault("_lr_fw_plans", {})
+            entry = plans.get(batch)
+            if entry is None:
                 buf = kwargs.get(_buffer_kwarg(), None)
-                entry = (ptrs, None if buf is None else
+                entry = (None if buf is None else
                          self._build_cuda_plan(layer, ns_tensors, node_mars, element_mars, buf))
-                layer._lr_fw_plan = entry
+                if len(plans) >= 8:
+                    del plans[next(iter(plans))]
+                plans[batch] = entry
 
-            if entry[1] is not None:
-                mod, calls = entry[1]
+            if entry is not None:
+                mod, calls = entry
                 buf = kwargs[_buffer_kwarg()]
                 for args in calls:
                     mod.lowrank_forward(node_mars, element_mars, buf, *args)

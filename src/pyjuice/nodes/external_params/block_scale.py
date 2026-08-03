@@ -15,6 +15,10 @@ _BUFFER_KWARG = None
 # that fits in memory; asserted where the keys are built.
 _KEY_STRIDE = 1 << 32
 
+#: How many forward plans to keep per layer, keyed by batch size. Each holds a `log Z` buffer per
+#: partition sized by that batch, so this bounds memory; rebuilding an evicted one costs an autotune.
+_FW_PLAN_CACHE = 8
+
 
 def _buffer_kwarg() -> str:
     """The staging-buffer kwarg name, resolved once (a per-call import shows up in profiles)."""
@@ -287,6 +291,19 @@ class BlockScaleSumParams(ExternalSumParams):
             "`BlockScaleSumParams` has no per-node reference path; it is served by `forward_layer`."
         )
 
+    @staticmethod
+    def _ext_base(ns_tensors, external_params, batch_size: int) -> int:
+        """
+        Where this layer's gates start in the staging buffer, in per-batch rows.
+
+        RELATIVE to the buffer, so it is a property of the layout and the batch and not of any address:
+        reallocate the buffer and this is unchanged. That is what lets `forward_layer` key its plan
+        cache on shape alone.
+        """
+        first_view = ns_tensors[0][1][0]
+        return ((first_view.data_ptr() - external_params.data_ptr())
+                // external_params.element_size()) // batch_size
+
     def _gate_nstride(self, layer, nids):
         """
         `Ck` -- the gate grid's row length -- for each compiled row of a partition.
@@ -392,9 +409,7 @@ class BlockScaleSumParams(ExternalSumParams):
                 f"layers."
             )
 
-        first_view = ns_tensors[0][1][0]
-        ext_base = ((first_view.data_ptr() - external_params.data_ptr())
-                    // external_params.element_size()) // batch_size
+        ext_base = self._ext_base(ns_tensors, external_params, batch_size)
 
         dev = node_mars.device
         calls, sb_calls, shift_args, log_zs = [], [], [], []
@@ -707,16 +722,34 @@ class BlockScaleSumParams(ExternalSumParams):
         if external_params is None:
             return None
 
-        ptrs = (node_mars.data_ptr(), element_mars.data_ptr(), params.data_ptr(),
-                external_params.data_ptr(), node_mars.size(1))
+        # Keyed by SHAPE, and a dict. This was one entry keyed partly on data POINTERS, which was wrong
+        # twice over: alternating between two batch sizes missed on every call, and any reallocation --
+        # a batch resize, allocator churn between PC calls, `empty_cache` -- threw away a plan that was
+        # still valid. Neither is cheap to get wrong, because `_build_plan` AUTOTUNES: ~66 ms a layer,
+        # so a caller whose batch varies step to step paid ~2 s per step across 31 tied layers, and a
+        # gated run came out 2.3x an ungated one whose steady-state cost is nil.
+        #
+        # Nothing in a plan is pointer-dependent. The four buffers are passed at launch, and `ext_base`
+        # is an offset RELATIVE to the staging buffer, so it survives the whole thing moving. It is
+        # re-derived and compared anyway -- a pointer subtraction against a rebuild that autotunes.
+        batch = node_mars.size(1)
+        plans = layer.__dict__.setdefault("_bs_fw_plans", {})
+        entry = plans.get(batch)
+        if entry is not None and entry[1]["ext_base"] != self._ext_base(ns_tensors, external_params,
+                                                                       batch):
+            entry = None
+        if entry is None:
+            built = self._build_plan(layer, ns_tensors, node_mars, element_mars, params,
+                                     external_params)
+            # `_build_plan` also allocates a `log Z` buffer per partition, sized by batch, so an
+            # unbounded cache would hold one set per batch size ever seen. Oldest out first.
+            if len(plans) >= _FW_PLAN_CACHE:
+                del plans[next(iter(plans))]
+            entry = plans[batch] = (built, layer._bs_bw_state)
 
-        entry = getattr(layer, "_bs_fw_plan", None)
-        if entry is None or entry[0] != ptrs:
-            entry = (ptrs, self._build_plan(layer, ns_tensors, node_mars, element_mars, params,
-                                            external_params))
-            layer._bs_fw_plan = entry
-
-        mod, fname, calls = entry[1]
+        mod, fname, calls = entry[0]
+        # The backward reads this, and on a cache HIT `_build_plan` did not run to set it.
+        layer._bs_bw_state = entry[1]
 
         if mod == "triton":
             # The portable fallback: `calls` are kwarg dicts rather than positional tuples, since
