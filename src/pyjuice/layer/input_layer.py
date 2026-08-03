@@ -543,13 +543,24 @@ class InputLayer(Layer, nn.Module):
                     partial_eval = 1 if bk_local_ids is not None else 0,
                     logspace_flows = logspace_flows,
                     missing_mask_mode = missing_mask_mode,
-                    pass_type = 0,
                     TILE_SIZE_K = 1,
                     num_warps = 8
                 )
 
             # Apply post-processing kernels
             self.dist.set_custom_kernel_kwargs(kwargs)
+
+            # A post-processing kernel that accumulates its own flows must not fire at a MASKED position:
+            # the forward marginalizes such a leaf (`_fw_missing_mask_kernel` overwrites `node_mars` with
+            # 0), so the only correct statistic there is the one `bk_flow_mask_fn` writes below, and
+            # anything else double counts against a normalizer the forward already discarded. `backward`
+            # takes `missing_mask` as a named argument, so it is NOT in `**kwargs` -- hand it to the prep
+            # functions explicitly. They pass it on only to the kernels that need it, so distributions
+            # whose post-processing is mask-independent are unaffected.
+            kwargs["_missing_mask"] = missing_mask
+            kwargs["_missing_mask_mode"] = missing_mask_mode
+            kwargs["_missing_mask_num_vars"] = num_vars if num_vars is not None else 0
+
             for (kernel, cond_fn, prep_kwargs_fn) in self.post_bp_fns:
                 if not cond_fn(self, kwargs):
                     continue
@@ -587,47 +598,69 @@ class InputLayer(Layer, nn.Module):
 
             # Handle the masked input nodes
             if missing_mask is not None and self.bk_flow_mask_fn is not None:
-                if not self.provided("_flows_mask_kernel"):
-                    self._flows_mask_kernel = self._compile_triton_kernel(self._flows_kernel_template, flow_fn = self.bk_flow_mask_fn)
-
-                if self._need_2nd_kernel_dim():
-                    BLOCK_SIZE = 32
-                    TILE_SIZE_K = 32
-                else:
-                    BLOCK_SIZE = 1024
-                    TILE_SIZE_K = 1
-
-                grid = (triton.cdiv(layer_num_nodes * batch_size, BLOCK_SIZE),)
-
-                self._flows_mask_kernel[grid](
-                    params_ptr = self.params,
-                    param_flows_ptr = self.param_flows,
-                    node_flows_ptr = node_flows, 
-                    node_mars_ptr = node_mars,
-                    data_ptr = data, 
-                    missing_mask_ptr = missing_mask,
-                    vids_ptr = self.vids, 
-                    s_pids_ptr = self.s_pids,
-                    s_pfids_ptr = self.s_pfids,
-                    metadata_ptr = self.metadata, 
-                    s_mids_ptr = self.s_mids, 
-                    bk_local_ids_ptr = bk_local_ids,
-                    layer_num_nodes = layer_num_nodes, 
-                    batch_size = batch_size, 
-                    num_vars_per_node = self.num_vars_per_node, 
-                    num_vars = num_vars,
-                    nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
-                    node_offset = node_offset, 
-                    BLOCK_SIZE = BLOCK_SIZE, 
-                    partial_eval = 1 if bk_local_ids is not None else 0,
-                    logspace_flows = logspace_flows,
-                    missing_mask_mode = missing_mask_mode,
-                    pass_type = 1,
-                    TILE_SIZE_K = TILE_SIZE_K,
-                    num_warps = 8
-                )
+                self._backward_missing(node_flows, missing_mask, missing_mask_mode, num_vars,
+                                       bk_local_ids, logspace_flows)
         else:
             raise NotImplementedError("CPU backward fn for input nodes is not implemented.")
+
+    def _backward_missing(self, node_flows: torch.Tensor, missing_mask: torch.Tensor,
+                          missing_mask_mode: int, num_vars: Optional[int],
+                          bk_local_ids: Optional[torch.Tensor], logspace_flows: bool):
+        """Accumulate the flows of the MARGINALIZED positions.
+
+        A marginalized leaf has no observation, so `bk_flow_mask_fn` spreads its flow over the whole
+        support -- every category of a `Categorical`, both moments of a `Gaussian`. Doing that once per
+        (node, batch, category) is what made a `missing_mask` cost 40-150x a plain backward: at 126464
+        categories and 1024 latents a single masked position is 130M flow updates, and because the loop
+        bound comes from `num_cats` rather than from the mask, the walk ran even where nothing was masked.
+
+        Every `bk_flow_mask_fn` is LINEAR in `flows` -- it adds `flow * g(theta_n)` for some `g` that
+        depends only on the node's own parameters -- so the batch axis can be summed away first:
+
+            sum over masked b of  flow[n, b] * g(theta_n)  ==  (sum over masked b of flow[n, b]) * g(theta_n)
+
+        which is exactly the per-node form `add_missing_flows` already walks. That collapses the work to
+        one pass over (source node, category): the batch axis disappears, tied nodes collapse onto their
+        source (8x and 32x respectively on a homogeneous HMM), the mask decides which nodes have any flow
+        at all instead of which lanes may write, and the scatter loses its atomics because each
+        (row, category) then has a single owner.
+
+        Summing before scattering also makes the result deterministic, where the atomics it replaces were
+        not; it is not bit-identical to the old path for that reason.
+        """
+        assert self.num_vars_per_node == 1, "`missing_mask` only supported for univariate distributions."
+
+        sid, eid = self._output_ind_range
+
+        flows = node_flows[sid:eid]                                # [layer_num_nodes, batch_size]
+        if logspace_flows:
+            flows = flows.exp()
+
+        vids = self.vids.view(-1)                                  # univariate, so one id per node
+        if missing_mask_mode == 1:
+            node_miss = missing_mask[vids].unsqueeze(1)            # [layer_num_nodes, 1]
+        elif missing_mask_mode == 2:
+            node_miss = missing_mask[:,vids].t()                   # [layer_num_nodes, batch_size]
+        else:
+            node_miss = missing_mask[vids]                         # [layer_num_nodes, batch_size]
+
+        miss_flows = (flows * node_miss).sum(dim = 1)
+
+        if bk_local_ids is not None:
+            # Partial evaluation: nodes outside `bk_local_ids` did not take part in this backward
+            keep = torch.zeros_like(miss_flows)
+            keep[bk_local_ids] = 1.0
+            miss_flows = miss_flows * keep
+
+        # `add_missing_flows` indexes `node_flows` globally, so hand it a full-length vector. Cached
+        # because it is one float per node in the WHOLE circuit -- small, but not worth reallocating.
+        buf = getattr(self, "_missing_nflows_buf", None)
+        if buf is None or buf.size(0) != node_flows.size(0) or buf.device != node_flows.device:
+            buf = torch.zeros([node_flows.size(0)], dtype = torch.float32, device = node_flows.device)
+            self._missing_nflows_buf = buf
+        buf[sid:eid] = miss_flows
+
+        self.add_missing_flows(buf, logspace_flows = False, scale = 1.0)
 
     def sample(self, samples: torch.Tensor, node_flows: torch.Tensor, missing_mask: Optional[torch.Tensor] = None, 
                params: Optional[torch.Tensor] = None, seed: Optional[int] = None, **kwargs):
@@ -827,7 +860,38 @@ class InputLayer(Layer, nn.Module):
         else:
             raise NotImplementedError("CPU minibatch partition fn for input nodes is not implemented.")
 
-    def add_missing_flows(self, node_flows: torch.Tensor, node_mars: Optional[torch.Tensor] = None, logspace_flows: bool = False, 
+    def _missing_flows_tile(self, are_source_nodes: bool):
+        """[BLOCK_SIZE, TILE_SIZE_K] for the missing-flow walk over (node, category).
+
+        Spend the tile on the CATEGORY axis first and give each program as few nodes as possible. The
+        grid is one dimensional over nodes, so BLOCK_SIZE alone decides how many CTAs there are, and the
+        [BLOCK_SIZE, TILE_SIZE_K] tile lives in registers -- widening it over nodes costs occupancy while
+        buying nothing, because the loop still runs `num_cats / TILE_SIZE_K` times either way. Measured on
+        1024 source nodes x 126464 categories, the whole walk:
+
+            BLOCK_SIZE  1 / TILE 1024 ->  2.36 ms      (grid 1024)
+            BLOCK_SIZE  2 / TILE 1024 ->  3.36 ms      (grid  512)
+            BLOCK_SIZE  4 / TILE 1024 ->  5.77 ms      (grid  256)
+            BLOCK_SIZE  8 / TILE 1024 -> 10.24 ms      (grid  128)
+            BLOCK_SIZE 32 / TILE   32 -> 40.24 ms      (grid   32)  <- what this used to be
+
+        TILE 2048 regresses to 3.43 ms, so the tile is capped at 1024 elements.
+        """
+        # Depends only on the compiled layer, and `metadata.max()` is a device -> host sync, so do it once
+        cached = getattr(self, "_missing_flows_tile_cache", {})
+        if are_source_nodes in cached:
+            return cached[are_source_nodes]
+
+        num_cats = triton.next_power_of_2(int(self.metadata.max().item())) if self.metadata.numel() > 0 else 1
+        TILE_SIZE_K = max(32, min(1024, num_cats))
+        # Only a support narrower than the tile leaves room for more than one node per program
+        BLOCK_SIZE = max(1, min(32, 1024 // TILE_SIZE_K))
+
+        cached[are_source_nodes] = (BLOCK_SIZE, TILE_SIZE_K)
+        self._missing_flows_tile_cache = cached
+        return BLOCK_SIZE, TILE_SIZE_K
+
+    def add_missing_flows(self, node_flows: torch.Tensor, node_mars: Optional[torch.Tensor] = None, logspace_flows: bool = False,
                           scale: float = 1.0, pc_is_normalized: bool = True, _pre_accum_nflows: bool = True):
         """
         Add missing flows specified by `node_flows` to the input node parameters.
@@ -847,8 +911,7 @@ class InputLayer(Layer, nn.Module):
                 self._missing_flows_kernel = self._compile_triton_kernel(self._missing_flows_kernel_template, flow_fn = self.bk_flow_mask_fn)
 
             if self._need_2nd_kernel_dim():
-                BLOCK_SIZE = 32
-                TILE_SIZE_K = 32
+                BLOCK_SIZE, TILE_SIZE_K = self._missing_flows_tile(_pre_accum_nflows)
             else:
                 BLOCK_SIZE = 1024
                 TILE_SIZE_K = 1
@@ -1168,7 +1231,7 @@ class InputLayer(Layer, nn.Module):
     def _flows_kernel_template(flow_fn, params_ptr, param_flows_ptr, node_flows_ptr, node_mars_ptr, data_ptr, missing_mask_ptr, vids_ptr, s_pids_ptr, s_pfids_ptr,
                                metadata_ptr, s_mids_ptr, bk_local_ids_ptr, partial_eval: tl.constexpr, logspace_flows: tl.constexpr, layer_num_nodes: tl.constexpr, 
                                batch_size: tl.constexpr, num_vars_per_node: tl.constexpr, num_vars: tl.constexpr, nv_block_size: tl.constexpr, node_offset: tl.constexpr, 
-                               missing_mask_mode: tl.constexpr, pass_type: tl.constexpr, BLOCK_SIZE: tl.constexpr, TILE_SIZE_K: tl.constexpr):
+                               missing_mask_mode: tl.constexpr, BLOCK_SIZE: tl.constexpr, TILE_SIZE_K: tl.constexpr):
         pid = tl.program_id(axis = 0)
         block_start = pid * BLOCK_SIZE
 
@@ -1189,18 +1252,17 @@ class InputLayer(Layer, nn.Module):
             # Load the corresponding data
             data = tl.load(data_ptr + vids * batch_size + batch_offsets, mask = mask, other = 0)
 
+            # Marginalized positions are dropped here and picked up by `_backward_missing`, which sums
+            # their flow over the batch and hands it to `_missing_flows_kernel_template` once per node.
             if missing_mask_mode == 1:
                 missing_mask = tl.load(missing_mask_ptr + vids, mask = mask, other = False).to(tl.int1)
-                if pass_type == 0:
-                    mask &= (missing_mask == False)
+                mask &= (missing_mask == False)
             elif missing_mask_mode == 2:
                 missing_mask = tl.load(missing_mask_ptr + batch_offsets * num_vars + vids, mask = mask, other = False).to(tl.int1)
-                if pass_type == 0:
-                    mask &= (missing_mask == False)
+                mask &= (missing_mask == False)
             elif missing_mask_mode == 3:
                 missing_mask = tl.load(missing_mask_ptr + vids * batch_size + batch_offsets, mask = mask, other = False).to(tl.int1)
-                if pass_type == 0:
-                    mask &= (missing_mask == False)
+                mask &= (missing_mask == False)
         else:
             # Get all variable ids
             vids_offsets = tl.broadcast_to(local_offsets[:,None], (BLOCK_SIZE, nv_block_size)) * num_vars_per_node + \
@@ -1251,10 +1313,18 @@ class InputLayer(Layer, nn.Module):
 
         flows *= scale
 
+        # A node with no flow adds exactly zero to every statistic, and `flow_fn` below walks the node's
+        # ENTIRE support (all `num_cats` categories) -- so skipping those nodes is what keeps a sparse
+        # `missing_mask` proportional to the nodes it actually touches, and an all-False one free. The
+        # `tl.max` is a scalar, so a tile with no live node skips the whole walk rather than masking it
+        # off lane by lane.
+        mask = mask & (flows != 0.0)
+
         missing_mask = True
 
-        flow_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, 
-                s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE)
+        if tl.max(tl.abs(flows)) > 0.0:
+            flow_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr,
+                    s_mids_ptr, mask, num_vars_per_node, BLOCK_SIZE)
 
     @staticmethod
     @triton_jit

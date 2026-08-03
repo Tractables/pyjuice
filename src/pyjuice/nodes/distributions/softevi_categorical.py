@@ -699,6 +699,34 @@ def _build_dense_index(layer, kwargs):
     return index
 
 
+@triton.jit
+def _missing_slot_mask(missing_mask_ptr, vid, offsets_b, batch_size, num_vars: tl.constexpr,
+                       missing_mask_mode: tl.constexpr):
+    """`True` where this leaf's variable is marginalized for that batch element.
+
+    Decodes the same three `missing_mask` layouts as `_flows_kernel_template`. Every kernel here runs one
+    VARIABLE per program (`vid` is a scalar), so the result is a [BLOCK_SIZE_B] vector; the `offsets_b * 0`
+    in mode 1 is just how a scalar is broadcast to that shape."""
+    if missing_mask_mode == 1:
+        return tl.load(missing_mask_ptr + vid + offsets_b * 0).to(tl.int1)
+    elif missing_mask_mode == 2:
+        return tl.load(missing_mask_ptr + offsets_b * num_vars + vid).to(tl.int1)
+    else:
+        return tl.load(missing_mask_ptr + vid * batch_size + offsets_b).to(tl.int1)
+
+
+def _missing_mask_kwargs(kwargs):
+    """Hand `backward`'s `missing_mask` to a post-processing kernel.
+
+    `missing_mask_mode` is a `tl.constexpr`, and mode 0 means "no mask", so the unmasked case specializes
+    back to exactly the code it compiled to before -- no extra load, no extra branch."""
+    return {
+        "missing_mask_ptr": kwargs.get("_missing_mask", None),
+        "missing_mask_mode": kwargs.get("_missing_mask_mode", 0),
+        "missing_mask_num_vars": kwargs.get("_missing_mask_num_vars", 0),
+    }
+
+
 def _condition_bk_dense_prologue(layer, kwargs):
     return _dense_topk_applicable(layer, kwargs)
 
@@ -729,6 +757,7 @@ def _prep_args_bk_dense_prologue(layer, kwargs):
     target_kwargs["update_extflows"] = grad is not None
 
     target_kwargs["ratio_ptr"] = _dense_scratch(layer, ext_num_vars, batch_size, index["num_latents"])
+    target_kwargs.update(_missing_mask_kwargs(kwargs))
 
     n_block_size = max_power_of_2_factor(layer.n_block_size)
     TILE_SIZE_K = min(16, triton.next_power_of_2(num_cats))
@@ -781,9 +810,21 @@ class _DenseDenomDispatch:
                     self._use_cuda = False
         return self._use_cuda
 
+    # Launch geometry that only the CUDA kernel understands. `_prep_args_bk_dense_denom` always puts
+    # these in `target_kwargs`, so the Triton fallback has to drop them -- Triton rejects unknown
+    # keywords outright (`KeyError: Keyword argument CUDA_TL was specified but unrecognised`).
+    _CUDA_ONLY_KWARGS = ("CUDA_TL", "CUDA_THREADS")
+
     def __getitem__(self, grid):
         if not self._cuda_ok():
-            return self.triton_kernel[grid]
+            triton_launch = self.triton_kernel[grid]
+
+            def launch(**kw):
+                for k in self._CUDA_ONLY_KWARGS:
+                    kw.pop(k, None)
+                return triton_launch(**kw)
+
+            return launch
 
         def launch(**kw):
             from .c_kernels import dense_expected_flow
@@ -933,6 +974,8 @@ def _prep_args_apply_bk_softevi_kernel(layer, kwargs):
     # Whether to update `pflow` and `extflow`
     target_kwargs["update_pflows"] = kwargs["dual_flow_backward"]
     target_kwargs["update_extflows"] = ("categorical_evidence_logp_grad" in kwargs)
+
+    target_kwargs.update(_missing_mask_kwargs(kwargs))
 
     return target_kwargs, grid
 
@@ -1460,8 +1503,9 @@ class SoftEvidenceCategorical(Distribution):
                           node_offset, partial_eval: tl.constexpr, logspace_flows: tl.constexpr, BLOCK_SIZE_B: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, 
                           TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, use_tensor_core: tl.constexpr,
                           categorical_evidence_logp_ptr, soft_evidence_cat_ids_ptr, categorical_evidence_logp_grad_ptr, var_idmapping_ptr,
-                          num_cats: tl.constexpr, tot_num_cats: tl.constexpr, ext_num_vars: tl.constexpr, has_ext_ids: tl.constexpr, update_pflows: tl.constexpr, update_extflows: tl.constexpr):
-        
+                          num_cats: tl.constexpr, tot_num_cats: tl.constexpr, ext_num_vars: tl.constexpr, has_ext_ids: tl.constexpr, update_pflows: tl.constexpr, update_extflows: tl.constexpr,
+                          missing_mask_ptr = None, missing_mask_mode: tl.constexpr = 0, missing_mask_num_vars: tl.constexpr = 0):
+
         pid_b = tl.program_id(axis = 0)
         pid_n = tl.program_id(axis = 1)
 
@@ -1489,6 +1533,16 @@ class SoftEvidenceCategorical(Distribution):
             lvid * num_cats + \
             tl.arange(0, TILE_SIZE_K)[None,:] # [BLOCK_SIZE_B, TILE_SIZE_K]
 
+        # A marginalized leaf never had its soft evidence applied (the forward overwrote `node_mars` with
+        # 0), so `logZ` below is meaningless there and none of this kernel's statistics are valid.
+        # `bk_(dual_)flow_mask_fn` writes what those positions should get instead. Every accumulation here
+        # is gated on `mask_b`, so narrowing it covers all of them -- except the batch-REDUCED scatter in
+        # the no-`ext_ids` branch, which the guard on `nflow_sub_logz_p_max` below handles.
+        if missing_mask_mode > 0:
+            miss_b = _missing_slot_mask(missing_mask_ptr, vid, offsets_b, batch_size,
+                                        missing_mask_num_vars, missing_mask_mode)
+            mask_b = mask_b & (miss_b == False)
+
         # Load nmars
         nmars_ptr = node_mars_ptr + \
             (offsets_n + node_offset)[None,:] * batch_size + \
@@ -1503,6 +1557,11 @@ class SoftEvidenceCategorical(Distribution):
 
         if logspace_flows:
             nflows = nflows.exp()
+            # `other = 0.0` is a zero flow in linear space but log(1) in log space, so an out-of-range or
+            # masked lane would come back as a flow of ONE. Force it to zero either way: `logZ` is -inf on
+            # those lanes, and `log(1) - -inf = +inf` (rather than `-inf - -inf = NaN`) is just as
+            # poisonous to the batch-reduced scatter below.
+            nflows = tl.where(mask_b[:,None] & mask_n[None,:], nflows, 0.0)
 
         # Compute unnormalized logprobs & backprop the "nominator" parts of the gradients
         data = tl.load(data_ptr + vid * batch_size + offsets_b, mask = mask_b, other = 0) # [BLOCK_SIZE_B]
@@ -1570,6 +1629,11 @@ class SoftEvidenceCategorical(Distribution):
         # Retrieve logZ
         log_in_p = tl.load(params_ptr + s_pids[None,:] + data[:,None], mask = (mask_b[:,None] & mask_n[None,:]), other = 0.0).log() # [BLOCK_SIZE_B, BLOCK_SIZE_N]
         logZ = log_in_p + log_ex_p[:,None] - nmars # [BLOCK_SIZE_B, BLOCK_SIZE_N]
+        # An out-of-range or masked lane loads `params` as 0, so its `logZ` is -inf and every
+        # `nflows.log() - logZ` below would be NaN -- which the batch-reduced scatter in the
+        # no-`ext_ids` branch then spreads over lanes that ARE valid. `nflows` is exactly 0 on those
+        # lanes, so any finite `logZ` leaves them at -inf, i.e. contributing nothing.
+        logZ = tl.where(mask_b[:,None] & mask_n[None,:], logZ, 0.0)
 
         # Loop-invariant, so hoisted out of the K loop below (which otherwise recomputes it once per
         # tile, per phase)
@@ -1644,6 +1708,13 @@ class SoftEvidenceCategorical(Distribution):
             if update_pflows:
                 nflow_sub_logz_p = tl.trans(nflows.log() - logZ) # [BLOCK_SIZE_N, BLOCK_SIZE_B]
                 nflow_sub_logz_p_max = tl.max(nflow_sub_logz_p, axis = 1)[:,None]
+                # This max runs over the BATCH axis, and the scatter it feeds is batch-reduced -- so
+                # unlike everywhere else in this kernel, `mask_b` cannot keep a bad lane out of the
+                # result. When every batch element of the tile contributes zero flow (all masked, or a
+                # node with no flow at all) the max is -inf and `-inf - -inf` would put a NaN into
+                # `tl.dot`, which then spreads across the whole [N, K] tile. Pin it to a finite value:
+                # every lane is then exp(-inf) = 0, the reduction is 0, and the scatter adds 0.
+                nflow_sub_logz_p_max = tl.where(nflow_sub_logz_p_max == float("-inf"), 0.0, nflow_sub_logz_p_max)
                 nflow_sub_logz_p_sub = tl.exp(nflow_sub_logz_p - nflow_sub_logz_p_max)
 
             if update_extflows:
@@ -1695,7 +1766,8 @@ class SoftEvidenceCategorical(Distribution):
                                  categorical_evidence_logp_ptr, soft_evidence_cat_ids_ptr,
                                  categorical_evidence_logp_grad_ptr, var_idmapping_ptr, ratio_ptr,
                                  num_cats: tl.constexpr, ext_num_vars: tl.constexpr, num_latents: tl.constexpr,
-                                 update_extflows: tl.constexpr):
+                                 update_extflows: tl.constexpr, missing_mask_ptr,
+                                 missing_mask_mode: tl.constexpr, missing_mask_num_vars: tl.constexpr):
         """First half of the dense top-k backward: everything except the expected-category flow phase.
 
         Accumulates the observed-category flow, adds the observed-token term of the external evidence
@@ -1717,6 +1789,19 @@ class SoftEvidenceCategorical(Distribution):
 
         vid = tl.load(vids_ptr + offset_n)
         lvid = tl.load(var_idmapping_ptr + vid)
+
+        # A marginalized leaf contributes nothing through the evidence: its soft evidence was never
+        # applied (the forward overwrote `node_mars` with 0), so `logZ` below is meaningless there. Drop
+        # those batch elements from every accumulation, and store a zero ratio so the expected-flow
+        # kernel skips them too. `bk_dual_flow_mask_fn` writes the statistic they should get instead.
+        if missing_mask_mode > 0:
+            miss_b = _missing_slot_mask(missing_mask_ptr, vid, offsets_b, batch_size,
+                                        missing_mask_num_vars, missing_mask_mode)
+            mask_b_ev = mask_b & (miss_b == False)
+            mask_bn_ev = mask_b_ev[:,None] & mask_n[None,:]
+        else:
+            mask_b_ev = mask_b
+            mask_bn_ev = mask_bn
 
         nids = tl.load(nids_ptr + offsets_n, mask = mask_n, other = 0)
         s_pids = tl.load(s_pids_ptr + offsets_n, mask = mask_n, other = 0)
@@ -1746,7 +1831,7 @@ class SoftEvidenceCategorical(Distribution):
         data = tl.load(data_ptr + vid * batch_size + offsets_b, mask = mask_b, other = 0)
 
         # Observed-category flow (phase 0)
-        tl.atomic_add(param_flows_ptr + s_pfids[None,:] + data[:,None], nflows, mask = mask_bn)
+        tl.atomic_add(param_flows_ptr + s_pfids[None,:] + data[:,None], nflows, mask = mask_bn_ev)
 
         catids_ptr = soft_evidence_cat_ids_ptr + \
             offsets_b[:,None] * (ext_num_vars * num_cats) + lvid * num_cats + tl.arange(0, TILE_SIZE_K)[None,:]
@@ -1770,7 +1855,7 @@ class SoftEvidenceCategorical(Distribution):
 
             if update_extflows:
                 tl.atomic_add(expar_grad_ptr + i * TILE_SIZE_K + match_ids, tl.sum(nflows, axis = 1),
-                              mask = (mask_b & has_match))
+                              mask = (mask_b_ev & has_match))
 
         log_in_p = tl.load(params_ptr + s_pids[None,:] + data[:,None], mask = mask_bn, other = 0.0).log()
         logZ = log_in_p + log_ex_p[:,None] - nmars
@@ -1778,6 +1863,10 @@ class SoftEvidenceCategorical(Distribution):
         # ratio[slot, latent], slot = lvid * batch_size + b; `nids` is the latent index, so the store is
         # contiguous along the innermost axis
         ratio = tl.exp(log_nflows - logZ)
+        if missing_mask_mode > 0:
+            # Store, do not skip: `ratio_ptr` is scratch that is reused across steps, so a skipped slot
+            # would keep whatever the previous step left there.
+            ratio = tl.where(mask_bn_ev, ratio, 0.0)
         tl.store(ratio_ptr + (lvid * batch_size + offsets_b)[:,None] * num_latents + nids[None,:],
                  ratio, mask = mask_bn)
 
@@ -1960,7 +2049,12 @@ class SoftEvidenceCategorical(Distribution):
                 param = tl.load(params_ptr + p_offsets, mask = cat_mask, other = 0)
 
                 pf_offsets = s_pfids[:,None] + cat_ids[None,:]
-                tl.atomic_add(param_flows_ptr + pf_offsets, flows[:,None] * param, mask = cat_mask)
+                if are_source_nodes:
+                    # Single writer per (row, category) -- see `bk_dual_flow_mask_fn`
+                    pf_ptr = param_flows_ptr + pf_offsets
+                    tl.store(pf_ptr, tl.load(pf_ptr, mask = cat_mask, other = 0.0) + flows[:,None] * param, mask = cat_mask)
+                else:
+                    tl.atomic_add(param_flows_ptr + pf_offsets, flows[:,None] * param, mask = cat_mask)
 
                 cat_ids += TILE_SIZE_K
         else:
@@ -1998,8 +2092,18 @@ class SoftEvidenceCategorical(Distribution):
                 anchor = flows[:,None] * param
 
                 pf_offsets = s_pfids[:,None] + cat_ids[None,:]
-                tl.atomic_add(param_flows_ptr + pf_offsets,                    anchor, mask = cat_mask)  # F⁺
-                tl.atomic_add(param_flows_ptr + pf_offsets + num_cats[:,None], anchor, mask = cat_mask)  # F⁻
+                if are_source_nodes:
+                    # One writer per (row, category): the caller walks SOURCE nodes only, having already
+                    # folded the tied nodes' flow onto them, so no two programs touch the same slot.
+                    # Triton does not lower `atomic_add` to a bare reduction, so it costs a round trip to
+                    # the SM anyway -- a plain read-modify-write is the same traffic without the atomic.
+                    fp_ptr = param_flows_ptr + pf_offsets
+                    fm_ptr = param_flows_ptr + pf_offsets + num_cats[:,None]
+                    tl.store(fp_ptr, tl.load(fp_ptr, mask = cat_mask, other = 0.0) + anchor, mask = cat_mask)  # F⁺
+                    tl.store(fm_ptr, tl.load(fm_ptr, mask = cat_mask, other = 0.0) + anchor, mask = cat_mask)  # F⁻
+                else:
+                    tl.atomic_add(param_flows_ptr + pf_offsets,                    anchor, mask = cat_mask)  # F⁺
+                    tl.atomic_add(param_flows_ptr + pf_offsets + num_cats[:,None], anchor, mask = cat_mask)  # F⁻
 
                 cat_ids += TILE_SIZE_K
         else:
@@ -2212,6 +2316,14 @@ class SoftEvidenceCategorical(Distribution):
             tl.store(params_ptr + s_pids[:,None] + cat_ids[None,:], new_param, mask = cat_mask)
 
             cat_ids += 128
+
+    def _need_2nd_kernel_dim(self):
+        # The mask / missing-flow path walks all `num_cats` categories per node, which for this
+        # distribution is a full vocabulary. Take the [BLOCK_SIZE, TILE_SIZE_K] tiled branch of
+        # `bk_(dual_)flow_mask_fn` rather than the scalar `for cat_id in range(num_cats)` one, as
+        # `Categorical` does. (This distribution has no `fw_partition_fn`, so the flag's other reader
+        # never fires for it.)
+        return True
 
     def _get_constructor(self):
         return SoftEvidenceCategorical, {"num_cats": self.num_cats, "_dual_flow_backward": self._dual_flow_backward}
