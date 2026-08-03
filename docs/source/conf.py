@@ -8,8 +8,8 @@ project = 'PyJuice'
 copyright = '2021, StarAI'
 author = 'StarAI'
 
-release = '2.6.2'
-version = '2.6.2'
+release = '2.6.3'
+version = '2.6.3'
 
 # -- General configuration
 
