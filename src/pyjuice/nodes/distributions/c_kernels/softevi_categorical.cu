@@ -368,7 +368,18 @@ __global__ void softevi_fw_dense_z(const float* __restrict__ params, const int* 
         #pragma unroll
         for (int t = 0; t < TL; ++t)
             bet[t] = (l0 + t < num_latents) ? __ldcs(params + p_base[pb_g + t] + cat) : 0.0f;
-        for (int j = 0; j < cnt; ++j) {
+        // Each lane starts at a DIFFERENT point in its reference list. The lists are built by sorting
+        // the slots, so without this every lane walks them in the same slot order -- and when candidate
+        // lists overlap across the batch (a language model's top-k puts the same common tokens at every
+        // position) the whole warp lands on the same `Zs` address at the same `j` and the shared-memory
+        // atomic below serializes. Rotating decorrelates the lanes at no cost and does not touch the
+        // ascending `uniq` order the coalesced `params` read depends on. Measured on the CoDD config:
+        // 0.82 -> 0.71 ms nearly-disjoint, 4.15 -> 3.30 ms realistic overlap, 3.93 -> 2.25 ms fully
+        // shared. Reassociates the sum, so `Z` moves within float rounding.
+        const int rot = (cnt > 1) ? (threadIdx.x % cnt) : 0;
+        for (int jj = 0; jj < cnt; ++jj) {
+            int j = jj + rot;
+            if (j >= cnt) j -= cnt;
             const long rj = rb + (long)j * uniq_stride + c;
             const int s = ref_slot[rj];
             const float w = ref_pt[rj] * 1.8446744073709552e19f;   // 2^64, exact
@@ -419,9 +430,12 @@ void softevi_forward_dense(torch::Tensor params, torch::Tensor node_mars, torch:
                            int64_t num_latents, int64_t uniq_stride, int64_t max_refs,
                            int64_t num_slots, int64_t num_blocks, int64_t layer_num_nodes,
                            int64_t batch_size, int64_t node_offset, int64_t TLv, int64_t threads,
-                           int64_t cat_blocks) {
+                           int64_t cat_blocks, int64_t zero_z, int64_t run_epilogue) {
+    // `Z` accumulates across shards (the category set is split by reference-list length so that warps
+    // are homogeneous -- see `_choose_shard_split`), so the caller zeroes it on the first shard and
+    // takes the epilogue on the last.
     auto st = at::cuda::getCurrentCUDAStream();
-    Z.zero_();
+    if (zero_z) Z.zero_();
     const dim3 grid((unsigned)cat_blocks, (unsigned)((num_latents + TLv - 1) / TLv), (unsigned)num_blocks);
 #define GO(T) { const size_t sm = (size_t)num_slots * T * sizeof(float);                            \
     softevi_fw_dense_z<T><<<grid, threads, sm, st>>>(params.data_ptr<float>(), uniq.data_ptr<int>(),\
@@ -431,6 +445,7 @@ void softevi_forward_dense(torch::Tensor params, torch::Tensor node_mars, torch:
     switch (TLv) { case 8: GO(8); break; case 16: GO(16); break; default: GO(4); break; }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 #undef GO
+    if (!run_epilogue) return;
     const long tot = layer_num_nodes * batch_size;
     softevi_fw_epilogue<<<(unsigned)((tot + 255) / 256), 256, 0, st>>>(
         params.data_ptr<float>(), node_mars.data_ptr<float>(), Z.data_ptr<float>(),

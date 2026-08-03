@@ -221,13 +221,22 @@ class _FwCudaDispatch:
             if kw["use_dense"]:
                 from .c_kernels import softevi_forward_dense
                 ix = kw["index"]
-                softevi_forward_dense(
-                    kw["params_ptr"], kw["node_mars_ptr"], kw["Z_ptr"], kw["log_ex_p_ptr"],
-                    kw["data_ptr"], kw["vids_ptr"], kw["s_pids_ptr"], kw["nids_ptr"],
-                    kw["var_idmapping_ptr"], ix["uniq"], ix["ref_slot"], ix["ref_pt"], ix["ref_cnt"],
-                    ix["num_uniq"], ix["p_base"], kw["num_latents"], ix["Umax"], _DENSE_MAX_REFS,
-                    kw["num_slots"], ix["num_blocks"], kw["layer_num_nodes"], kw["batch_size"],
-                    kw["node_offset"], kw["FW_TL"], kw["FW_THREADS"], kw["FW_CAT_BLOCKS"])
+                shards = ix["shards"]
+                for si, sh in enumerate(shards):
+                    # Every block zeroes and then flushes a [num_slots, TL] shared tile regardless of how
+                    # many categories it gets, so a shard holding only the few hundred long lists must
+                    # not be launched over the full category grid -- that flush would cost more than the
+                    # work it saves.
+                    blocks = max(1, min(kw["FW_CAT_BLOCKS"],
+                                        -(-sh["Umax"] // kw["FW_THREADS"])))
+                    softevi_forward_dense(
+                        kw["params_ptr"], kw["node_mars_ptr"], kw["Z_ptr"], kw["log_ex_p_ptr"],
+                        kw["data_ptr"], kw["vids_ptr"], kw["s_pids_ptr"], kw["nids_ptr"],
+                        kw["var_idmapping_ptr"], sh["uniq"], sh["ref_slot"], sh["ref_pt"], sh["ref_cnt"],
+                        sh["num_uniq"], ix["p_base"], kw["num_latents"], sh["Umax"], sh["max_refs"],
+                        kw["num_slots"], ix["num_blocks"], kw["layer_num_nodes"], kw["batch_size"],
+                        kw["node_offset"], kw["FW_TL"], kw["FW_THREADS"], blocks,
+                        si == 0, si == len(shards) - 1)
             else:
                 from .c_kernels import softevi_forward
                 softevi_forward(
@@ -409,7 +418,8 @@ def _prep_args_apply_bk_params_kernel(layer, kwargs):
 # CATEGORY axis innermost -- the only axis of `param_flows` that is contiguous -- which gives every
 # (row, cat) a single owner and needs no atomic at all:
 #     phase1[row, c] = beta[l, c] * sum over the slots referencing c of ratio[slot, l] * p_theta[slot]
-# The per-category reference lists are tiny, so they are padded to `MAX_REFS` and masked. The same
+# The per-category reference lists are padded to a common `MAX_REFS` and masked, and both kernels bound
+# their inner loop by the longest list actually present rather than by that width. The same
 # `beta` read also serves the external-evidence gradient's expected-value term, so that is folded into
 # the same walk rather than paying for the reads twice.
 #
@@ -419,10 +429,123 @@ def _prep_args_apply_bk_params_kernel(layer, kwargs):
 
 _DENSE_TOPK_BACKWARD = os.environ.get("PYJUICE_SOFTEVI_DENSE_BACKWARD", "1") != "0"
 
-# Cap on how many soft-evidence slots may reference one category. ~1.3 is typical; the index build
-# checks the real maximum and falls back to the scattered kernel if it is exceeded, so this only bounds
-# how much padding is wasted.
-_DENSE_MAX_REFS = 16
+# How many soft-evidence slots may reference one category. The reference arrays are padded to this
+# width, so it is purely a space/padding bound -- both kernels bound their inner loop by the largest
+# list actually present (`tl.max(cnt)` per tile in Triton, `cnt` per thread in CUDA), not by this.
+#
+# It is sized PER BUILD to the maximum actually observed, rounded up to a power of two. A fixed value
+# is wrong in both directions. Too small and the build bails to the scattered kernel: with a cap of 16,
+# a top-k drawn from a language model -- which puts common tokens near the top at nearly every position,
+# so the same category is referenced by up to `batch * seq` slots -- always exceeds it and loses the
+# dense path for the forward AND the backward, which share this index. Measured (seq 32, 1024 latents,
+# 126464 cats, k=1024, batch 8), whole step: 17.7 -> 8.8 ms once the realistic overlap is admitted.
+# Too large and the padding is paid for nothing: pinning it at 512 costs the nearly-disjoint regime
+# 4.9 -> 6.2 ms in index allocation and zeroing alone. Sized to the observed maximum, that regime is
+# unchanged (its true maximum is ~10) and the overlapping ones get the dense path.
+#
+# Rounded to a power of two so `MAX_REFS`, a `tl.constexpr`, takes only a handful of distinct values
+# across a run rather than re-triggering a Triton compile every time the candidate lists shift.
+_DENSE_MAX_REFS_CEIL = 4096
+
+# The padded reference arrays are `12 * max_refs * Umax * num_blocks` bytes (three [max_refs, Umax]
+# tables: slot, p_theta, grad offset). Heavily-overlapping candidate lists at a large batch can push
+# that into the hundreds of MB, which is worth it -- but not unboundedly, and not at the cost of an OOM
+# in a path that has a working fallback. Over budget, decline and let the scattered kernel run.
+_DENSE_INDEX_BUDGET_FRAC = 1.0 / 16.0
+
+
+# Length buckets used to pick a shard split: 1, 2, 4, ... 4096, one past `_DENSE_MAX_REFS_CEIL`.
+_LADDER_N = 13
+_WARP = 32
+
+# Only split when the model says the inner loop drops to at most this fraction of its un-split cost.
+# A shard costs an extra launch of both kernels and an extra reference table, so the split has to remove
+# a large multiple of the work, not a marginal one. The bimodal case this exists for lands at 0.06-0.07;
+# candidate lists that are all the same length -- where the shards would just be "the tail" and "almost
+# everything" -- land at 0.50 and measured 3% SLOWER than leaving them alone, which is what sets the bar.
+_DENSE_SHARD_GAIN = 0.4
+
+
+def _warp_work(counts):
+    """Inner-loop cost of a category ORDER. Both kernels give one category to one thread and loop over
+    that category's reference list, so a 32-lane warp runs to the longest list any of its lanes holds
+    and a few long lists drag whole warps with them."""
+    pad = (-counts.numel()) % _WARP
+    if pad:
+        counts = torch.cat([counts, counts.new_zeros(pad)])
+    return counts.view(-1, _WARP).max(dim = 1).values.sum() * _WARP
+
+
+def _shard_sizes(st, split, gi):
+    """Categories in each shard, for block `gi`."""
+    total = sum(st[gi][:_LADDER_N])
+    if split is None:
+        return [total]
+    n_light = sum(st[gi][:split + 1])
+    return [n_light, total - n_light]
+
+
+def _shard_elems(st, split, gi):
+    """References (list entries) in each shard, for block `gi`."""
+    total = sum(st[gi][_LADDER_N:2 * _LADDER_N])
+    n_light = sum(st[gi][_LADDER_N:_LADDER_N + split + 1])
+    return [n_light, total - n_light]
+
+
+def _choose_shard_split(st, max_refs, n_uniq):
+    """Pick a list-length threshold to split the categories at, or None to keep them in one piece.
+
+    Top-k candidate lists out of a language model are bimodal: a few hundred common tokens are proposed
+    at nearly every position, so their reference lists are `batch * positions` long, while the tail of
+    the vocabulary is proposed once or twice. Ordered by category id the two populations interleave, so
+    nearly every warp catches one long list and runs to it, and the single rectangular reference table
+    has to be as wide as the longest list in the whole vocabulary. At batch 32 that is 23.6x the
+    necessary inner-loop work and a 948 MiB table that is 1.3% occupied.
+
+    Splitting at a length threshold makes each warp homogeneous. Both shards keep ascending category
+    order internally, so the coalescing of the `params` reads and `param_flows` writes is untouched;
+    the cost is one extra launch of each kernel.
+
+    `work_single` is the exact warp-max cost of the un-split order, while the per-threshold figure is
+    an upper bound (every light warp charged the full threshold). Comparing an upper bound against an
+    exact baseline can pass up a real win, but it can never split where splitting would not have helped
+    -- which is the direction that matters, since the un-split layout is what everything was tuned on."""
+    if os.environ.get("PYJUICE_SOFTEVI_DENSE_SHARD", "1") == "0":
+        return None
+
+    # Plain Python arithmetic over the already-transferred counts: this runs on every build, and at
+    # tens of microseconds a tensor op per candidate it was measurably denting the small configs.
+    hist = [sum(row[i] for row in st) for i in range(_LADDER_N)]
+    U = sum(hist)
+    work_single = sum(row[2 * _LADDER_N + 1] for row in st)
+
+    best, n_light = None, 0
+    for i in range(_LADDER_N):
+        n_light += hist[i]
+        thr = 1 << i
+        if thr >= max_refs:
+            break
+        n_heavy = U - n_light
+        if n_heavy == 0:
+            break
+        est = n_light * thr + n_heavy * max_refs
+        if best is None or est < best[0]:
+            best = (est, i)
+
+    if best is None or best[0] >= _DENSE_SHARD_GAIN * work_single:
+        return None
+    return best[1]
+
+
+def _dense_index_budget(dev):
+    override = os.environ.get("PYJUICE_SOFTEVI_DENSE_INDEX_BYTES", None)
+    if override is not None:
+        return int(override)
+    try:
+        total = torch.cuda.get_device_properties(dev).total_memory
+    except Exception:
+        return 1 << 30
+    return int(total * _DENSE_INDEX_BUDGET_FRAC)
 
 
 def _dense_topk_applicable(layer, kwargs):
@@ -621,8 +744,11 @@ def _build_dense_index(layer, kwargs):
     num_latents, groups, lvid_of_head, pf_base, p_base = layout
     G = len(groups)
 
-    # ---- per block: sort the slots by category, then pad to [U, MAX_REFS] ----
-    uniq_l, slot_l, pt_l, goff_l, cnt_l, n_uniq = [], [], [], [], [], []
+    # ---- pass 1, per block: sort the slots by category and invert ----
+    # The reference width is only known once every block has been counted, so the scatter itself is
+    # deferred to pass 2 -- sorting twice to avoid holding the sorted payloads would cost far more than
+    # the few MB they occupy.
+    sorted_l, n_uniq, stats = [], [], []
     pt_all = evidence.exp()
     for g in groups:
         lv = lvid_of_head[torch.tensor(g, device = dev)]                     # [Gp] layer-local var ids
@@ -645,54 +771,123 @@ def _build_dense_index(layer, kwargs):
 
         # `return_inverse` gives the per-element row directly, which avoids two `repeat_interleave`s
         uniq, inverse, counts = torch.unique_consecutive(cat_s, return_inverse = True, return_counts = True)
-        if int(counts.max().item()) > _DENSE_MAX_REFS:
-            return None                                                      # -> scattered fallback
 
-        U = uniq.numel()
         starts = torch.cat([counts.new_zeros(1), counts.cumsum(0)[:-1]])
         row = inverse
         within = torch.arange(cat_s.numel(), device = dev) - starts[row]
 
-        rc = counts.int().contiguous()
-        # [MAX_REFS, U] rather than [U, MAX_REFS]: the kernel assigns one CATEGORY per thread, so with
-        # the reference index innermost, lane-adjacent threads would read MAX_REFS apart and every lane
-        # would fetch its own sector. Transposed, a warp's reads of reference `j` are contiguous.
-        rs = torch.zeros([_DENSE_MAX_REFS, U], dtype = torch.int32, device = dev)
-        rp = torch.zeros([_DENSE_MAX_REFS, U], dtype = torch.float32, device = dev)
-        # offsets are bounded by B * V * K, so 32 bits is plenty
-        rg = torch.zeros([_DENSE_MAX_REFS, U], dtype = torch.int32, device = dev)
-        rs[within, row] = slot.reshape(-1)[order].int()
-        rp[within, row] = pt_g.reshape(-1)[order]
-        rg[within, row] = goff.reshape(-1)[order].int()
+        # Everything the shard decision needs, in one row so the whole build costs a single transfer:
+        # how many categories and how many references fall in each power-of-two length bucket, the
+        # longest list, and the cost of leaving the categories in one piece.
+        bidx = torch.ceil(torch.log2(counts.to(torch.float64))).long().clamp_(0, _LADDER_N - 1)
+        hist = torch.zeros(_LADDER_N, dtype = torch.long, device = dev).scatter_add_(
+            0, bidx, torch.ones_like(bidx))
+        rhist = torch.zeros(_LADDER_N, dtype = torch.long, device = dev).scatter_add_(0, bidx, counts)
 
-        uniq_l.append(uniq.int()); slot_l.append(rs); pt_l.append(rp); goff_l.append(rg)
-        cnt_l.append(rc)
-        n_uniq.append(U)
+        sorted_l.append((uniq, counts, within, row,
+                         slot.reshape(-1)[order].int(),
+                         pt_g.reshape(-1)[order],
+                         goff.reshape(-1)[order].int()))
+        n_uniq.append(uniq.numel())
+        stats.append(torch.cat([hist, rhist, counts.max().view(1).long(),
+                                _warp_work(counts).view(1).long()]))
 
     Umax = max(n_uniq)
 
-    def _pad(ts, dim = 0):
-        out = []
-        for t in ts:
-            if t.size(dim) < Umax:
-                shape = list(t.shape)
-                shape[dim] = Umax - t.size(dim)
-                t = torch.cat([t, t.new_zeros(shape)], dim = dim)
-            out.append(t)
-        return torch.stack(out).contiguous()
+    # One sync for the whole build rather than one per block
+    st = torch.stack(stats).cpu().tolist()                                   # [G][2 * _LADDER_N + 2]
+    max_refs = max(row[2 * _LADDER_N] for row in st)
+    max_refs = 1 << max(0, max_refs - 1).bit_length()                        # round up to a power of two
+    if max_refs > _DENSE_MAX_REFS_CEIL:
+        return None                                                          # -> scattered fallback
+
+    split = _choose_shard_split(st, max_refs, n_uniq)
+    if split is None:
+        shard_widths = [max_refs]
+    else:
+        shard_widths = [1 << split, max_refs]
+
+    n_bytes = 0
+    for si, w in enumerate(shard_widths):
+        n_bytes += 12 * w * max(_shard_sizes(st, split, gi)[si] for gi in range(G)) * G
+    if n_bytes > _dense_index_budget(dev):
+        return None                                                          # -> scattered fallback
+
+    # ---- pass 2: pad each block's reference lists to [width, U] within each shard ----
+    per_shard = [dict(uniq = [], slot = [], pt = [], goff = [], cnt = [], n = []) for _ in shard_widths]
+    for gi, (uniq, counts, within, row, s_sorted, p_sorted, g_sorted) in enumerate(sorted_l):
+        U = uniq.numel()
+
+        if split is None:
+            pieces = [(uniq, counts, within, row, s_sorted, p_sorted, g_sorted)]
+        else:
+            thr = 1 << split
+            n_cat, n_elem = _shard_sizes(st, split, gi), _shard_elems(st, split, gi)
+            # Stable partition on "is this list longer than the threshold", so the ASCENDING category
+            # order -- which is what makes the `params` reads and `param_flows` writes coalesce -- is
+            # preserved inside each shard.
+            heavy_c = (counts > thr).int()
+            perm_c = torch.argsort(heavy_c, stable = True)
+            pos = torch.empty_like(perm_c)
+            pos[perm_c] = torch.arange(U, device = dev)
+            perm_e = torch.argsort(heavy_c[row], stable = True)
+
+            pieces = []
+            for si in range(2):
+                cs = perm_c[:n_cat[0]] if si == 0 else perm_c[n_cat[0]:]
+                es = perm_e[:n_elem[0]] if si == 0 else perm_e[n_elem[0]:]
+                pieces.append((uniq[cs], counts[cs], within[es], pos[row[es]] - (0 if si == 0 else n_cat[0]),
+                               s_sorted[es], p_sorted[es], g_sorted[es]))
+
+        for si, (u, c, wi, r, ss, ps, gs) in enumerate(pieces):
+            Us = u.numel()
+            width = shard_widths[si]
+            # [width, U] rather than [U, width]: the kernel assigns one CATEGORY per thread, so with the
+            # reference index innermost, lane-adjacent threads would read `width` apart and every lane
+            # would fetch its own sector. Transposed, a warp's reads of reference `j` are contiguous.
+            rs = torch.zeros([width, Us], dtype = torch.int32, device = dev)
+            rp = torch.zeros([width, Us], dtype = torch.float32, device = dev)
+            # offsets are bounded by B * V * K, so 32 bits is plenty
+            rg = torch.zeros([width, Us], dtype = torch.int32, device = dev)
+            rs[wi, r] = ss
+            rp[wi, r] = ps
+            rg[wi, r] = gs
+
+            sh = per_shard[si]
+            sh["uniq"].append(u.int()); sh["slot"].append(rs); sh["pt"].append(rp); sh["goff"].append(rg)
+            sh["cnt"].append(c.int().contiguous()); sh["n"].append(Us)
+
+    shards = []
+    for si, sh in enumerate(per_shard):
+        Us_max = max(sh["n"])
+
+        def _pad(ts, dim = 0):
+            out = []
+            for t in ts:
+                if t.size(dim) < Us_max:
+                    shape = list(t.shape)
+                    shape[dim] = Us_max - t.size(dim)
+                    t = torch.cat([t, t.new_zeros(shape)], dim = dim)
+                out.append(t)
+            return torch.stack(out).contiguous()
+
+        shards.append(dict(
+            uniq = _pad(sh["uniq"]),                                          # [G, Us_max]
+            ref_slot = _pad(sh["slot"], dim = 1),                             # [G, width, Us_max]
+            ref_pt = _pad(sh["pt"], dim = 1),
+            ref_goff = _pad(sh["goff"], dim = 1),
+            ref_cnt = _pad(sh["cnt"]),                                        # [G, Us_max]
+            num_uniq = torch.tensor(sh["n"], dtype = torch.int32, device = dev),   # [G]
+            Umax = Us_max,
+            max_refs = shard_widths[si],
+        ))
 
     index = dict(
-        uniq = _pad(uniq_l),                                              # [G, Umax]
-        ref_slot = _pad(slot_l, dim = 1),                            # [G, Umax, MAX_REFS]
-        ref_pt = _pad(pt_l, dim = 1),
-        ref_goff = _pad(goff_l, dim = 1),
-        ref_cnt = _pad(cnt_l),                                               # [G, Umax]
-        num_uniq = torch.tensor(n_uniq, dtype = torch.int32, device = dev),   # [G]
+        shards = shards,
         pf_base = pf_base,
         p_base = p_base,
         num_blocks = G,
         num_latents = num_latents,
-        Umax = Umax,
     )
 
     layer._dense_index_cache = (key, index)
@@ -815,26 +1010,37 @@ class _DenseDenomDispatch:
     # keywords outright (`KeyError: Keyword argument CUDA_TL was specified but unrecognised`).
     _CUDA_ONLY_KWARGS = ("CUDA_TL", "CUDA_THREADS")
 
+    # Per-shard tensors and dimensions; everything else in `target_kwargs` is common to all shards.
+    _SHARD_KWARGS = (("uniq_ptr", "uniq"), ("ref_slot_ptr", "ref_slot"), ("ref_pt_ptr", "ref_pt"),
+                     ("ref_goff_ptr", "ref_goff"), ("ref_cnt_ptr", "ref_cnt"),
+                     ("num_uniq_ptr", "num_uniq"), ("UNIQ_STRIDE", "Umax"), ("MAX_REFS", "max_refs"))
+
     def __getitem__(self, grid):
-        if not self._cuda_ok():
-            triton_launch = self.triton_kernel[grid]
-
-            def launch(**kw):
-                for k in self._CUDA_ONLY_KWARGS:
-                    kw.pop(k, None)
-                return triton_launch(**kw)
-
-            return launch
-
+        # Each shard covers a disjoint set of categories, so every (row, category) still has exactly one
+        # owning thread across the whole set and the shards may run in any order.
         def launch(**kw):
-            from .c_kernels import dense_expected_flow
-            dense_expected_flow(
-                kw["params_ptr"], kw["param_flows_ptr"], kw["ratio_ptr"],
-                kw["uniq_ptr"], kw["ref_slot_ptr"], kw["ref_pt_ptr"], kw["ref_goff_ptr"],
-                kw["ref_cnt_ptr"], kw["num_uniq_ptr"], kw["pf_base_ptr"], kw["p_base_ptr"],
-                kw["categorical_evidence_logp_grad_ptr"] if kw["update_extflows"] else None,
-                kw["num_latents"], kw["tot_num_cats"], kw["UNIQ_STRIDE"], kw["MAX_REFS"],
-                grid[2], kw.get("CUDA_THREADS", 256), kw["ratio_ptr"].size(0), kw.get("CUDA_TL", 32))
+            shards = kw.pop("shards")
+            for sh in shards:
+                skw = dict(kw)
+                for key, field in self._SHARD_KWARGS:
+                    skw[key] = sh[field]
+                sgrid = (grid[0], triton.cdiv(sh["Umax"], kw["BLOCK_C"]), grid[2])
+
+                if not self._cuda_ok():
+                    for k in self._CUDA_ONLY_KWARGS:
+                        skw.pop(k, None)
+                    self.triton_kernel[sgrid](**skw)
+                    continue
+
+                from .c_kernels import dense_expected_flow
+                dense_expected_flow(
+                    skw["params_ptr"], skw["param_flows_ptr"], skw["ratio_ptr"],
+                    skw["uniq_ptr"], skw["ref_slot_ptr"], skw["ref_pt_ptr"], skw["ref_goff_ptr"],
+                    skw["ref_cnt_ptr"], skw["num_uniq_ptr"], skw["pf_base_ptr"], skw["p_base_ptr"],
+                    skw["categorical_evidence_logp_grad_ptr"] if skw["update_extflows"] else None,
+                    skw["num_latents"], skw["tot_num_cats"], skw["UNIQ_STRIDE"], skw["MAX_REFS"],
+                    sgrid[2], skw.get("CUDA_THREADS", 256), skw["ratio_ptr"].size(0),
+                    skw.get("CUDA_TL", 32))
 
         return launch
 
@@ -853,12 +1059,7 @@ def _prep_args_bk_dense_denom(layer, kwargs):
 
     num_latents = index["num_latents"]
 
-    target_kwargs["uniq_ptr"] = index["uniq"]
-    target_kwargs["ref_slot_ptr"] = index["ref_slot"]
-    target_kwargs["ref_pt_ptr"] = index["ref_pt"]
-    target_kwargs["ref_goff_ptr"] = index["ref_goff"]
-    target_kwargs["ref_cnt_ptr"] = index["ref_cnt"]
-    target_kwargs["num_uniq_ptr"] = index["num_uniq"]
+    target_kwargs["shards"] = index["shards"]
     target_kwargs["pf_base_ptr"] = index["pf_base"]
     target_kwargs["p_base_ptr"] = index["p_base"]
     target_kwargs["ratio_ptr"] = _dense_scratch(layer, evidence.size(1), batch_size, num_latents)
@@ -870,21 +1071,19 @@ def _prep_args_bk_dense_denom(layer, kwargs):
     target_kwargs["num_latents"] = num_latents
     target_kwargs["tot_num_cats"] = layer.nodes[0].dist.num_cats
     target_kwargs["pf_row_stride"] = 2 * layer.nodes[0].dist.num_cats
-    target_kwargs["MAX_REFS"] = _DENSE_MAX_REFS
     # CUDA-path launch geometry, kept separate from the Triton tile so each can be tuned on its own.
     # TL = latents per thread: swept 4/8/16/32/64 -> 2.17/1.83/1.72/1.58/1.67 ms (32 is the optimum;
     # 64 regresses on register pressure). Threads 64-256 are within noise, 256 marginally best.
     target_kwargs["CUDA_TL"] = 32
     target_kwargs["CUDA_THREADS"] = 256
-    target_kwargs["UNIQ_STRIDE"] = index["Umax"]
     # Swept on the CoDD config with the evidence-gradient term folded in; the optimum differs from the
     # fold-off optimum (the fold adds live temporaries), so re-sweep if that term ever moves out.
     target_kwargs["BLOCK_L"] = 64
     target_kwargs["BLOCK_C"] = 128
 
-    grid = (triton.cdiv(num_latents, target_kwargs["BLOCK_L"]),
-            triton.cdiv(index["Umax"], target_kwargs["BLOCK_C"]),
-            index["num_blocks"])
+    # `UNIQ_STRIDE` and `MAX_REFS` vary per shard, so the dispatch fills them in per launch; only the
+    # category-axis extent of the grid changes with them.
+    grid = (triton.cdiv(num_latents, target_kwargs["BLOCK_L"]), 1, index["num_blocks"])
 
     return target_kwargs, grid
 

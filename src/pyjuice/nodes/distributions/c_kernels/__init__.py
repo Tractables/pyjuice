@@ -72,9 +72,9 @@ def softevi_forward(params, node_mars, data, vids, s_pids, var_idmapping, pt, ca
 def softevi_forward_dense(params, node_mars, Z, log_ex_p, data, vids, s_pids, nids, var_idmapping,
                           uniq, ref_slot, ref_pt, ref_cnt, num_uniq, p_base, num_latents,
                           uniq_stride, max_refs, num_slots, num_blocks, layer_num_nodes, batch_size,
-                          node_offset, TL, threads, cat_blocks):
+                          node_offset, TL, threads, cat_blocks, zero_z = True, run_epilogue = True):
     _softevi_module.softevi_forward_dense(
         params, node_mars, Z, log_ex_p, data, vids, s_pids, nids, var_idmapping,
         uniq, ref_slot, ref_pt, ref_cnt, num_uniq, p_base, int(num_latents), int(uniq_stride),
         int(max_refs), int(num_slots), int(num_blocks), int(layer_num_nodes), int(batch_size),
-        int(node_offset), int(TL), int(threads), int(cat_blocks))
+        int(node_offset), int(TL), int(threads), int(cat_blocks), int(zero_z), int(run_epilogue))
