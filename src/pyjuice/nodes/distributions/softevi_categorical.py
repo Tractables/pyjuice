@@ -5,6 +5,7 @@ import triton
 import triton.language as tl
 import math
 import os
+import weakref
 from typing import Tuple, Optional, Any
 
 from .distributions import Distribution
@@ -121,13 +122,44 @@ def _fw_use_dense(layer, kwargs):
     return _dense_worth_it(layer, kwargs) and _build_dense_index(layer, kwargs) is not None
 
 
+def _evidence_cache_key(*tensors):
+    """An identity key for caller-supplied tensors that survives allocator address reuse.
+
+    `data_ptr()` IS NOT AN IDENTITY, and keying on it is a correctness bug rather than a stale-cache
+    inefficiency. The caching allocator hands a freed block straight back out, so under
+    `torch.no_grad()` -- where a step's evidence dies the moment the forward returns -- the next call's
+    tensors routinely land on the same addresses with the same shapes and a fresh `_version` of 0. The
+    key then matches BYTE FOR BYTE while the data is entirely different, and the cache serves the
+    previous call's answer: the circuit is evaluated against the previous step's evidence, which can
+    return a POSITIVE log-likelihood. Measured on a 32-step gated HMM, 256 of 616 hits were stale.
+
+    Under autograd the graph keeps the evidence alive until the backward, so the next step's tensors
+    get fresh addresses and the collision does not arise -- which is why this only ever showed up in
+    evaluation, never in training.
+
+    A weak reference distinguishes the two cases exactly. While the tensor is alive its address cannot
+    be reused, so `ref() is tensor` means the same tensor and nothing else; once it dies the reference
+    reads back as `None` and the entry simply misses. `_version` is still carried, to catch in-place
+    mutation of a tensor that IS the same object.
+    """
+    return tuple((weakref.ref(t), t._version, tuple(t.shape)) for t in tensors)
+
+
+def _evidence_cache_hit(key, tensors):
+    """Whether `key` (from :func:`_evidence_cache_key`) still refers to exactly `tensors`."""
+    return key is not None and len(key) == len(tensors) and all(
+        ref() is t and version == t._version and shape == tuple(t.shape)
+        for (ref, version, shape), t in zip(key, tensors)
+    )
+
+
 def _fw_linear_evidence(layer, kwargs):
     """exp(categorical_evidence_logp), cached per step: the gather form accumulates the normalizer in
     linear space and would otherwise redo this exp 268M times inside the kernel."""
     evidence = kwargs["categorical_evidence_logp"]
-    key = (evidence.data_ptr(), evidence._version, tuple(evidence.shape))
+    key = _evidence_cache_key(evidence)
     cached = getattr(layer, "_fw_pt_cache", None)
-    if cached is not None and cached[0] == key:
+    if cached is not None and _evidence_cache_hit(cached[0], (evidence,)):
         return cached[1]
     # The CUDA kernels read this as float32, and half-precision evidence is a reasonable thing for a
     # caller to hand over (it comes straight off a language model), so widen rather than reject. `.float()`
@@ -844,10 +876,12 @@ def _build_dense_index(layer, kwargs):
 
     # `batch_size` is injected into `kwargs` only after the condition check, so take it from the tensor
     # (the layer asserts these agree in the prep functions).
-    key = (cat_ids.data_ptr(), cat_ids._version, evidence.data_ptr(), evidence._version,
-           tuple(cat_ids.shape))
+    #
+    # Keyed by tensor IDENTITY, not by address -- see `_evidence_cache_key` for why a `data_ptr()` key
+    # silently serves the previous call's index once the allocator recycles a block.
+    key = _evidence_cache_key(cat_ids, evidence)
     cached = getattr(layer, "_dense_index_cache", None)
-    if cached is not None and cached[0] == key:
+    if cached is not None and _evidence_cache_hit(cached[0], (cat_ids, evidence)):
         return cached[1]
 
     B, V, K = cat_ids.shape
