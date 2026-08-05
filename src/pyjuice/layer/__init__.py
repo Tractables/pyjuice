@@ -6,3 +6,4 @@ from .external_sum_layer import ExternalParamsSumLayer, ExternalNodeInfo, Staged
                                EXTERNAL_PARAMS_BUFFER_KWARG, EXTERNAL_PARAMS_GRAD_BUFFER_KWARG, \
                                EXTERNAL_PARAMS_KWARG, EXTERNAL_PARAMS_GRAD_KWARG
 from .layer_group import LayerGroup
+from .kernels.autotune import set_autotune
