@@ -11,6 +11,7 @@ import pyjuice as juice
 import pyjuice.nodes.distributions as dists
 import pyjuice.layer.kernels.sum_backward_param_block_sparse as parmod
 from pyjuice.layer.sum_layer import SumLayer
+from pyjuice.layer.kernels import autotune
 
 
 def _build_small_hclt(num_latents=64, num_cats=8, num_vars=16, device="cuda:0"):
@@ -65,9 +66,13 @@ def test_par_flow_rmw_matches_atomic():
     assert torch.all((pf_rmw - pf_atomic).abs() < 1e-3)
 
 
-def test_par_flow_oom_fallback():
-    # If the tuned launch raises OutOfResources (simulating a smaller GPU), the backward
-    # must transparently fall back to the default configuration and stay correct.
+@pytest.mark.parametrize("tuning", [True, False])
+def test_par_flow_oom_fallback(tuning):
+    # If the tuned launch raises OutOfResources (simulating a smaller GPU), the backward must
+    # transparently avoid that configuration and stay correct. Two mechanisms cover this, and both
+    # are exercised here: with the autotuner ON, the offending config simply loses the benchmark
+    # (`OutOfResources` is raised at compile time, so the candidate is skipped); with it OFF, the
+    # launch itself raises and `_par_tuning_oom` triggers a retry on the untuned config.
     from triton.runtime.errors import OutOfResources
 
     pc, device = _build_small_hclt()
@@ -90,23 +95,29 @@ def test_par_flow_oom_fallback():
             if l.is_sum() and hasattr(l, "_par_tuning_oom"):
                 del l._par_tuning_oom
 
+    was_enabled, cache = autotune.ENABLED, dict(autotune._CACHE)
     try:
+        # A fresh cache, so the proxy is actually benchmarked rather than served a prior choice.
+        autotune.ENABLED, autotune._CACHE = tuning, dict()
         parmod._bk_triton_block_sparse_par_kernel_rmw = OOMProxy()
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            got = _backward(pc, x)    # must fall back, not crash
-            got2 = _backward(pc, x)   # cached fallback path
+            got = _backward(pc, x)    # must avoid the failing config, not crash
+            got2 = _backward(pc, x)   # cached choice / cached fallback path
     finally:
         parmod._bk_triton_block_sparse_par_kernel_rmw = real_rmw
+        autotune.ENABLED, autotune._CACHE = was_enabled, cache
 
     assert torch.all((got - ref).abs() < 1e-3)
     assert torch.all((got2 - ref).abs() < 1e-3)
-    n_oom = sum(1 for g in pc.inner_layer_groups for l in g
-                if l.is_sum() and getattr(l, "_par_tuning_oom", False))
-    assert n_oom >= 1
+    if not tuning:
+        n_oom = sum(1 for g in pc.inner_layer_groups for l in g
+                    if l.is_sum() and getattr(l, "_par_tuning_oom", False))
+        assert n_oom >= 1
 
 
 if __name__ == "__main__":
     test_par_flow_collision_free_gate()
     test_par_flow_rmw_matches_atomic()
-    test_par_flow_oom_fallback()
+    test_par_flow_oom_fallback(True)
+    test_par_flow_oom_fallback(False)
