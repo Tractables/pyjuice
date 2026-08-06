@@ -19,9 +19,12 @@ Two invariants come for free and pin down what the oracle cannot:
   * every tile config computes the same contraction, so they must all agree -- which is what makes the
     launcher's autotuning safe.
 
-There is no Triton fallback for this parameterization: it is a fork of the CuTe/TMA sum kernel, so the
-tests skip wholesale where that kernel does not apply, and the last test pins the boundary of what is
-supported so it is visible when it moves.
+A portable Triton fork now covers every shape, so the parameterization itself needs no CUDA toolchain
+apart from the normalizer shift (`lowrank_shift_logz`, the one kernel here with no Triton port). These
+tests still skip wholesale without the CuTe/TMA extension, because what they check is that all the
+forks agree with the oracle -- and the CuTe one is the fork most of them exercise. The Triton fork is
+pinned separately by `test_shapes_only_the_triton_fork_reaches` and
+`test_backward_needs_only_the_normalizer_shift_extension`.
 """
 
 import pytest
@@ -734,6 +737,50 @@ def test_backward_matches_reference(num_latents, block_size, gate_cbs, batch, sc
     # The small-batch forks are pure fp32 and land ~1e-6, but one bar covers both.
     assert d_ef < 2e-3, f"element flows off by {d_ef}"
     assert d_pf < 3e-3, f"param flows off by {d_pf} (relative)"
+
+
+@cuda_only
+@needs_cute
+def test_backward_needs_only_the_normalizer_shift_extension():
+    """The backward must run with EVERY optional CUDA flow fork gone.
+
+    Of the kernels this path uses, only `lowrank_shift_logz` -- the +-log-Z shift that moves
+    `node_mars` into log-T and back -- has no Triton port. The element and parameter flow forks all
+    do, so a machine with no CUTLASS and no small-batch build should still get correct flows, just
+    slower. The guard used to demand at least one CUDA flow fork as well and refused those machines
+    with a message saying no fallback existed, which was not true; this pins the relaxed version.
+    """
+    import pyjuice.nodes.external_params.kernels.c as ck
+
+    num_latents, block_size, gate_cbs, batch = 256, 128, 8, 128
+    optional = ["get_ele_bw_module", "get_sb_bw_module", "get_par_bw_module",
+                "get_cute_module", "get_sb_module"]
+
+    pc, root, ns, data, phi, _ = _run(num_latents, block_size, gate_cbs, batch, scale = 1.5)
+    pc.backward(data, flows_memory = 0.0)
+    ns.update_param_flows(pc.param_flows)
+    with_cuda = ns.get_param_flows().double()
+
+    saved = {n: getattr(ck, n) for n in optional}
+    try:
+        for n in optional:
+            setattr(ck, n, lambda: None)
+        # A fresh circuit: the forks are chosen (and cached) per layer at the first pass.
+        pc2, _, ns2, data2, phi2, _ = _run(num_latents, block_size, gate_cbs, batch, scale = 1.5)
+        pc2.backward(data2, flows_memory = 0.0)
+        ns2.update_param_flows(pc2.param_flows)
+        triton_only = ns2.get_param_flows().double()
+    finally:
+        for n, f in saved.items():
+            setattr(ck, n, f)
+
+    ref_ef, ref_pf = _flow_reference(pc, ns, phi, gate_cbs, batch)
+    d_pf = float(((triton_only.to(ref_pf.device) - ref_pf).abs() / ref_pf.clamp(min = 1e-30)).max())
+    assert d_pf < 3e-3, f"Triton-only param flows off by {d_pf} (relative)"
+
+    # And they agree with what the CUDA forks produced, to those kernels' fp16 floor.
+    d = float(((triton_only - with_cuda).abs() / with_cuda.abs().clamp(min = 1e-30)).max())
+    assert d < 3e-3, f"Triton-only and CUDA-served param flows differ by {d} (relative)"
 
 
 @cuda_only

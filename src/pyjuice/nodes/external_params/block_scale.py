@@ -353,16 +353,18 @@ class BlockScaleSumParams(ExternalSumParams):
         """
         Resolve every per-layer launch argument once, and check each kernel's assumptions.
 
-        TWO kernels serve this type, and which applies is a property of the shape:
+        THREE kernels serve this type, and which apply is a property of the shape:
 
           * the CuTe/TMA fork, for batches it can tile (`batch % 64 == 0`) on sm_90+ with CUTLASS. It
             carries the normalizer as a gate-factored contraction against a precomputed `sigma`;
           * a plain-CUDA small-batch kernel, one warp per 32 nodes, which accumulates the normalizer
-            inline and needs neither `batch % 64` nor `num_edges % 64` nor CUTLASS.
+            inline and needs neither `batch % 64` nor `num_edges % 64` nor CUTLASS;
+          * the portable Triton fork, which needs no CUDA toolchain at all and applies everywhere,
+            including the shapes the other two decline (a gate finer than the node block, in
+            particular, is served by it alone).
 
-        Both are collected here and the choice is MEASURED, so where they overlap the faster one wins
-        rather than the one that happened to be checked first. Where neither applies this raises: there
-        is no Triton fallback for this parameterization.
+        All three are collected here and the choice is MEASURED, so where they overlap the faster one
+        wins rather than the one that happened to be checked first.
         """
         from .kernels.c import get_cute_module, get_sb_module
         import pyjuice.layer.kernels.c as ck
@@ -1067,11 +1069,20 @@ class BlockScaleSumParams(ExternalSumParams):
 
         plain, ele_mod, par_mod = get_module(), get_ele_bw_module(), get_par_bw_module()
         sb_mod = get_sb_bw_module()
-        if plain is None or (ele_mod is None and sb_mod is None):
+        # Only the NORMALIZER SHIFT is required: `lowrank_shift_logz` moves `node_mars` into log-T
+        # and back, and it is the one kernel on this path with no Triton port. The flow kernels
+        # themselves are all optional -- the CuTe and small-batch forks are accelerators, and both
+        # the element and parameter flows keep a Triton fork that applies wherever they do not (a
+        # gate table is always built, so `"triton"` is always among the element candidates, and
+        # `_par_triton_hook` is installed unconditionally). Requiring a CUDA flow fork here used to
+        # turn away machines those Triton forks serve perfectly well, and say so in a message that
+        # claimed no fallback existed. Every use of `ele_mod` / `sb_mod` / `par_mod` below checks
+        # for itself, so a missing one costs speed, not correctness.
+        if plain is None:
             raise NotImplementedError(
-                "the block-scale backward needs its CUDA extensions -- the plain one holding the "
-                "normalizer shift, plus at least one of the CuTe/TMA forks (large batch) and the "
-                "small-batch forks -- and they are unavailable here. There is no Triton fallback."
+                "the block-scale backward needs the CUDA extension holding the normalizer shift "
+                "(`lowrank_shift_logz`), which is unavailable here -- it has no Triton fallback. "
+                "The flow kernels themselves do have one, so this is the only piece missing."
             )
 
         batch_size, block_size = state["batch_size"], state["block_size"]
