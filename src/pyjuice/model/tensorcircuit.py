@@ -98,6 +98,7 @@ def device_grad_controller(device, no_grad = True):
 
 
 from pyjuice.nodes.external_params.external_params import ExternalSumParams
+from pyjuice.nodes.methods import is_structured_decomposable
 
 
 def _staging_transpose_fn():
@@ -212,6 +213,13 @@ class TensorCircuit(nn.Module):
         self.device = torch.device("cpu")
 
         self.num_vars = self._get_num_vars(self.root_ns)
+
+        # Whether every product node decomposes its scope the same way, i.e. whether the circuit
+        # respects a single vtree. Computed once here because it is a property of the structure and
+        # several passes want it: the top-down sampler, in particular, can precompute its whole index
+        # plan when it holds, since the frontier's shape is then a function of the scopes alone and
+        # never of which node a draw happened to select.
+        self.is_structured_decomposable = is_structured_decomposable(self.root_ns)
 
         self.node_mars = None
         self.element_mars = None
