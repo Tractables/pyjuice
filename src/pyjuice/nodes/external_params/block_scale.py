@@ -1065,31 +1065,24 @@ class BlockScaleSumParams(ExternalSumParams):
 
         state = self._bw_state(layer, node_mars, kwargs)
 
-        from .kernels.c import get_module, get_ele_bw_module, get_par_bw_module, get_sb_bw_module
+        from .kernels.c import get_ele_bw_module, get_par_bw_module, get_sb_bw_module
+        from .kernels.shift_logz import shift_logz
 
-        plain, ele_mod, par_mod = get_module(), get_ele_bw_module(), get_par_bw_module()
+        # NO CUDA extension is required here. The CuTe and small-batch forks are accelerators, and
+        # every kernel on this path also has a Triton fork: a gate table is always built, so
+        # `"triton"` is always among the element candidates; `_par_triton_hook` is installed
+        # unconditionally; and the normalizer shift -- the last piece that used to pin the whole
+        # gated backward to nvcc -- is now `shift_logz`, which falls back to Triton on its own.
+        # Every use of `ele_mod` / `sb_mod` / `par_mod` below checks for itself, so a missing one
+        # costs speed, not correctness.
+        ele_mod, par_mod = get_ele_bw_module(), get_par_bw_module()
         sb_mod = get_sb_bw_module()
-        # Only the NORMALIZER SHIFT is required: `lowrank_shift_logz` moves `node_mars` into log-T
-        # and back, and it is the one kernel on this path with no Triton port. The flow kernels
-        # themselves are all optional -- the CuTe and small-batch forks are accelerators, and both
-        # the element and parameter flows keep a Triton fork that applies wherever they do not (a
-        # gate table is always built, so `"triton"` is always among the element candidates, and
-        # `_par_triton_hook` is installed unconditionally). Requiring a CUDA flow fork here used to
-        # turn away machines those Triton forks serve perfectly well, and say so in a message that
-        # claimed no fallback existed. Every use of `ele_mod` / `sb_mod` / `par_mod` below checks
-        # for itself, so a missing one costs speed, not correctness.
-        if plain is None:
-            raise NotImplementedError(
-                "the block-scale backward needs the CUDA extension holding the normalizer shift "
-                "(`lowrank_shift_logz`), which is unavailable here -- it has no Triton fallback. "
-                "The flow kernels themselves do have one, so this is the only piece missing."
-            )
 
         batch_size, block_size = state["batch_size"], state["block_size"]
         ext_base, gate_cbs, node_cbs = state["ext_base"], state["gate_cbs"], state["node_cbs"]
 
         for nids, log_z, rows in state["shift_args"]:
-            plain.lowrank_shift_logz(node_mars, nids, log_z, block_size, 1.0)
+            shift_logz(node_mars, nids, log_z, block_size, 1.0)
 
         cache = getattr(layer, "_bs_bw_gate_cache", None)
         if cache is None:
@@ -1472,7 +1465,7 @@ class BlockScaleSumParams(ExternalSumParams):
         layer._ext_bw_par_sb_hook = None
         layer._ext_bw_par_triton_hook = None
 
-        from .kernels.c import get_module
+        from .kernels.shift_logz import shift_logz
 
         state = layer._bs_bw_state
 
@@ -1527,7 +1520,7 @@ class BlockScaleSumParams(ExternalSumParams):
             layer._bs_grad_ext = None
 
         for nids, log_z, rows in state["shift_args"]:
-            get_module().lowrank_shift_logz(node_mars, nids, log_z, state["block_size"], -1.0)
+            shift_logz(node_mars, nids, log_z, state["block_size"], -1.0)
 
         return None
 
