@@ -45,7 +45,11 @@ def sample_sum_layer_kernel(nids, cids, pids, node_mars, element_mars, mparams, 
         mask_nids = offs_nids < num_nblocks
 
         ref_nid = tl.load(nids + offs_nids, mask = mask_nids, other = 0)
-        is_match = (node_id[:,None] >= ref_nid[None,:]) & (node_id[:,None] < ref_nid[None,:] + block_size) # [BLOCK_S, BLOCK_M]
+        # `& mask_nids` because a padded slot reads as node id 0, which any node in the first block
+        # would otherwise match -- selecting a row past the end of `nids`, whose `cids` / `pids` are
+        # another layer's. Reachable whenever `num_nblocks` does not fill `BLOCK_M`.
+        is_match = (node_id[:,None] >= ref_nid[None,:]) & \
+                   (node_id[:,None] < ref_nid[None,:] + block_size) & mask_nids[None,:] # [BLOCK_S, BLOCK_M]
 
         match_local_id = tl.sum(is_match * (offs_nids[None,:] + 1), axis = 1)
         match_local_offset = tl.sum(is_match * (node_id[:,None] - ref_nid[None,:]), axis = 1)
@@ -135,7 +139,12 @@ def sample_sum_layer(pc, layer, nids, cids, pids, node_mars, element_mars, param
     seed = random.randint(0, 2**31)
 
     BLOCK_K = min(512, triton.next_power_of_2(num_edges))
-    BLOCK_M = min(512, triton.next_power_of_2(num_nblocks))
+    # FLOORED AT 2. With a single node block `BLOCK_M` would be 1, and the `nids` scan then reduces a
+    # `[BLOCK_S, 1]` tile along its degenerate axis -- which Triton fails to compile ("PassManager::run
+    # failed") once `BLOCK_S` reaches 32, i.e. for `num_samples >= 4096`. That made sampling large
+    # batches impossible on any layer with one node block, which is every HMM-shaped chain. A second,
+    # masked-off column costs nothing and sidesteps it.
+    BLOCK_M = max(2, min(512, triton.next_power_of_2(num_nblocks)))
     BLOCK_S = min(2048 // BLOCK_K, 2048 // BLOCK_M, max(triton.next_power_of_2(num_samples // 128), 1))
 
     M_NUM_BLKS = triton.cdiv(num_nblocks, BLOCK_M)

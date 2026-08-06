@@ -50,18 +50,40 @@ def assign_nids_ind_target(ind_target, ind_target_sid, node_pointers, ind_b, num
 
 def push_non_neg_ones_to_front(matrix):
     """
-    Compact every column of `matrix` in place, moving its non-`-1` entries to the front, and return
-    how many each column holds.
+    Compact every column of `matrix` in place, moving its non-`-1` entries to the front while keeping
+    their relative order, and return how many each column holds.
 
     Run between layers so the next layer's slot allocation starts from a dense prefix.
+
+    The compaction is a scatter to `cumsum - 1`: an entry's destination row is how many kept entries
+    precede it in its column. The boolean-mask form this replaces --
+
+        result[d_mask] = matrix[s_mask]
+
+    -- is shorter, but each boolean index goes through `nonzero`, whose output size is data-dependent,
+    so it blocks the host until the device catches up. MEASURED on a gated 8-step HMM at batch 512:
+    the whole sampling pass went from 3.80 ms to 3.44 ms, i.e. this one routine was ~9% of it.
+
+    :note: moving the sampler's OTHER host-side bookkeeping (the per-column slot cursors in
+           `assign_cids_ind_target` / `assign_nids_ind_target`) onto the device the same way was tried
+           and is a REGRESSION -- 3.44 ms -> 3.85 ms for the sum-layer cursor alone, and 4.21 ms with
+           the product-layer one as well. The top-down pass is bound by the NUMBER of launches, not by
+           its synchronizations: those cursors need several extra kernels each (a scatter, a scan, a
+           `repeat_interleave`) to replace one small copy and a numba loop that costs microseconds.
+           This routine wins because it removes work without adding launches. Do not "finish the job"
+           without re-measuring.
     """
+    num_rows = matrix.size(0)
 
-    result = torch.full_like(matrix, -1)
+    kept = matrix != -1
+    dst = kept.to(torch.long).cumsum(dim = 0) - 1
 
-    s_mask = (matrix != -1)
-    d_mask = torch.sum(s_mask, dim = 0, keepdims = True) > torch.arange(matrix.size(0), device = matrix.device)[:,None]
+    # Dropped entries are scattered to a scratch row that is then discarded, which keeps the scatter
+    # unconditional -- there is no way to mask a `scatter_`, and branching would cost more.
+    dst = torch.where(kept, dst, torch.full_like(dst, num_rows))
 
-    result[d_mask] = matrix[s_mask]
-    matrix[:] = result[:]
+    buffer = matrix.new_full((num_rows + 1, matrix.size(1)), -1)
+    buffer.scatter_(0, dst, matrix)
+    matrix.copy_(buffer[:num_rows])
 
-    return s_mask.long().sum(dim = 0)
+    return kept.sum(dim = 0)

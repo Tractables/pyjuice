@@ -29,16 +29,23 @@ entirely passed every other check here. `test_one_hot_gates_survive_exp_overflow
 to it. `test_a_padded_edge_axis_does_not_read_past_the_gate_table` has the same origin: every other
 shape here has a power-of-two child-block count, where the gate column can never run off the table.
 
-**Known gaps**, deliberate rather than overlooked. Mutating the kernel catches 7 of 9 seeded faults;
-the two it does not are both guards for states these tests cannot construct:
+**Known gaps**, deliberate rather than overlooked. Mutating the kernel catches 6 of 9 seeded faults.
+The three it does not are all defensive guards whose removal provably cannot change an answer, so no
+output-based test can detect them:
 
+  * the `offs_gcol < gate_stride` bound, which stops a padded edge column reading past the gate
+    table. The lane it protects has the dummy parameter, and `params[0:block_size]` is exactly zero,
+    so its weight is zero whatever gate it reads -- the bound buys MEMORY SAFETY, not correctness;
   * the `mask_nids` term in the `nids` scan, which needs a sum layer whose node ids are below
-    `block_size` -- impossible while the dummy and input nodes occupy the start of `node_mars`;
+    `block_size` -- impossible while the dummy and input nodes occupy the start of `node_mars`. The
+    same guard in the shared-parameter PRODUCT kernel is very much load-bearing, since element ids
+    do start low; it is there because omitting it corrupted the frontier outright;
   * the `chids` fallback, which needs `r == sum` in fp32 after the two passes accumulate in
     different orders.
 
-Both are cheap insurance against a wrong answer rather than a crash, and neither is reachable from a
-circuit this file can build. Say so rather than implying coverage.
+Say so rather than implying coverage. An earlier version of this file appeared to catch the first of
+them, but that turned out to depend on what the allocator had left past the table -- it passed or
+failed with the test ORDERING, not with the kernel.
 """
 
 import pytest
@@ -357,13 +364,20 @@ def test_a_padded_edge_axis_does_not_read_past_the_gate_table(n_ch_blocks):
     A child-block count that is not a power of two pads `num_edges` (3 blocks -> 12 edges -> 16), so
     the last edge tile derives gate COLUMNS beyond the table's width.
 
-    Unbounded, those read the next row's entry -- a valid, `>= 0` offset that the `-1` padding test
-    would happily accept -- and the padded slot then gets a finite weight instead of `-inf`. Since a
-    padded slot's `cids` is the dummy element, a draw can leave the circuit entirely. The bound in
-    `_gate_weights` is what stops it, and every other shape in this file has a power-of-two child
-    count, where the column can never run past the table.
+    This is the only shape in this file that exercises those columns at all -- every other one has a
+    power-of-two child count, where `num_edges` is exactly `n_eblks * NODE_CBS` and the column can
+    never run past the table.
+
+    :note: it does NOT prove the bound in `_gate_weights` is load-bearing, and measurement says it is
+           not, for the OUTPUT: a padded slot's `pids` is the dummy parameter and `params[0:block_size]`
+           is exactly zero, so such a lane has weight zero and is unselectable no matter which gate it
+           reads. What the bound buys is memory safety -- on the last row an unbounded column reads
+           past the end of the `gate` tensor. Removing it is invisible to every assertion here, and
+           two node blocks rather than one does not change that; it was tried. Recorded so nobody
+           re-derives it.
     """
-    pc, ns, _, K = _build(block_size = 4, gate_cbs = 2, n_ch_blocks = n_ch_blocks, seed = 15)
+    pc, ns, _, K = _build(block_size = 4, gate_cbs = 2, n_ch_blocks = n_ch_blocks,
+                          n_node_blocks = 2, seed = 15)
     _pin_root(pc, 1)
     Nk, Ck = _gate_shape(ns)
     N = 100_000

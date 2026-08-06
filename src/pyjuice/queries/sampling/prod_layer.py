@@ -44,7 +44,10 @@ def count_prod_nch_kernel(nids, cids, element_samples, ind_ch_count, ind_nids, i
         mask_nids = offs_nids < num_nblocks
 
         ref_nid = tl.load(nids + offs_nids, mask = mask_nids, other = 0)
-        is_match = (ele_id[:,None] >= ref_nid[None,:]) & (ele_id[:,None] < ref_nid[None,:] + block_size)
+        # `& mask_nids`: see the note in `sample_sum_layer_kernel` -- a padded slot reads as element 0
+        # and would match anything in the first block.
+        is_match = (ele_id[:,None] >= ref_nid[None,:]) & \
+                   (ele_id[:,None] < ref_nid[None,:] + block_size) & mask_nids[None,:]
 
         match_local_id = tl.sum(is_match * (offs_nids[None,:] + 1), axis = 1)
         match_local_offset = tl.sum(is_match * (ele_id[:,None] - ref_nid[None,:]), axis = 1)
@@ -89,7 +92,9 @@ def count_prod_nch(layer, nids, cids, element_samples, ind_ch_count, ind_nids, i
     num_edges = cids.size(1)
 
     BLOCK_C = min(128, triton.next_power_of_2(num_edges))
-    BLOCK_M = min(512, triton.next_power_of_2(num_nblocks))
+    # Floored at 2 for the same reason as in `sample_sum_layer`: a degenerate `[BLOCK_S, 1]` reduction
+    # in the `nids` scan fails to compile once `BLOCK_S` reaches 32.
+    BLOCK_M = max(2, min(512, triton.next_power_of_2(num_nblocks)))
     BLOCK_S = min(2048 // BLOCK_C, 2048 // BLOCK_M, max(triton.next_power_of_2(num_samples // 128), 1))
 
     M_NUM_BLKS = triton.cdiv(num_nblocks, BLOCK_M)
