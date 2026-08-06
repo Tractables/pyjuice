@@ -18,6 +18,7 @@ _SMALL_BATCH_PROD_TILE_M = int(os.environ.get("PYJUICE_SB_PROD_TM", 8))
 from pyjuice.nodes import ProdNodes
 from pyjuice.utils.parameter_list import FastParamList
 from .kernels import prod as kernels
+from .kernels import autotune
 from .layer import Layer
 from .backend.node_partition import partition_nodes_by_n_edges
 from .backend.index_set import batched_index_set, batched_index_cum
@@ -315,26 +316,57 @@ class ProdLayer(Layer, nn.Module):
             if batch_size < 64:
                 BLOCK_M = min(BLOCK_M, _SMALL_BATCH_PROD_TILE_M)
 
-            grid = (triton.cdiv(n_nblocks * self.block_size, BLOCK_M), triton.cdiv(batch_size, BLOCK_B))
+            def _launch_2d(cfg, out):
+                bm, bb = cfg
+                grid = (triton.cdiv(n_nblocks * self.block_size, bm), triton.cdiv(batch_size, bb))
+                kernels._forward_backward_kernel_2d[grid](
+                    node_vals_ptr = out,
+                    element_vals_ptr = element_vals,
+                    local_ids_ptr = local_ids,
+                    nids_ptr = nids,
+                    cids_ptr = cids,
+                    tot_n_nodes = tot_n_nodes,
+                    tot_n_eles = tot_n_eles,
+                    n_nblocks = n_nblocks,
+                    num_edges = num_edges,
+                    batch_size = batch_size,
+                    BLOCK_M = bm,
+                    BLOCK_B = bb,
+                    block_size = block_size,
+                    accum = accum,
+                    partial_eval = partial_eval,
+                    prop_logsumexp = prop_logsumexp
+                )
 
-            kernels._forward_backward_kernel_2d[grid](
-                node_vals_ptr = node_vals, 
-                element_vals_ptr = element_vals,
-                local_ids_ptr = local_ids,
-                nids_ptr = nids, 
-                cids_ptr = cids, 
-                tot_n_nodes = tot_n_nodes,
-                tot_n_eles = tot_n_eles,
-                n_nblocks = n_nblocks,
-                num_edges = num_edges,
-                batch_size = batch_size,
-                BLOCK_M = BLOCK_M, 
-                BLOCK_B = BLOCK_B,
-                block_size = block_size,
-                accum = accum,
-                partial_eval = partial_eval,
-                prop_logsumexp = prop_logsumexp
-            )
+            # Both knobs are pure OUTPUT tiling -- each program owns a distinct (node, batch) slice
+            # and reduces over all `num_edges` on its own -- so the candidates differ only in
+            # reduction layout, and only the heuristic's two guesses are in question: how far to cap
+            # the node tile, and whether a fatter batch tile pays for the lower program count.
+            # `BLOCK_M` must divide `block_size` (the kernel derives the node block from `pid_m`),
+            # so it stays a power of two <= `block_size`. See `kernels/autotune.py`.
+            cfgs = [(BLOCK_M, BLOCK_B)]
+            budget_BLOCK_M = min(max(2048 // (BLOCK_B * num_edges), 1), self.block_size)
+            for bm in (8, 32, budget_BLOCK_M):
+                bm = min(bm, self.block_size)
+                if (bm, BLOCK_B) not in cfgs:
+                    cfgs.append((bm, BLOCK_B))
+            wide_BLOCK_B = min(BLOCK_B * 2, triton.next_power_of_2(batch_size))
+            if (BLOCK_M, wide_BLOCK_B) not in cfgs:
+                cfgs.append((BLOCK_M, wide_BLOCK_B))
+
+            # `accum` makes the output read-accumulate-write, so the timing runs must go to a
+            # scratch buffer; without it the kernel just overwrites `node_vals` with the same values
+            # it is about to write anyway, so it can be timed in place.
+            key = (kernels._forward_backward_kernel_2d, n_nblocks, num_edges, block_size,
+                   batch_size, accum, partial_eval, prop_logsumexp, cfgs[0])
+            cfg = autotune.cached(key)
+            if cfg is None:
+                bench_out = node_vals if not accum else autotune.scratch_like(node_vals)
+                cfg = cfgs[0] if bench_out is None else \
+                    autotune.pick(key, cfgs, lambda c: _launch_2d(c, bench_out))
+                del bench_out
+
+            _launch_2d(cfg, node_vals)
 
         else:
 

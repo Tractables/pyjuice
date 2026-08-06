@@ -15,6 +15,9 @@ from pyjuice.model import compile, TensorCircuit
 # TensorCircuit layers
 from pyjuice.layer import InputLayer, ProdLayer, SumLayer, ExternalParamsSumLayer
 
+# Kernel launch-config autotuning (on by default; see `layer/kernels/autotune.py`)
+from pyjuice.layer import set_autotune
+
 # Construction methods
 from pyjuice.nodes import multiply, summate, inputs, set_block_size, structural_properties
 

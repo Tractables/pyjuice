@@ -67,6 +67,13 @@ def pytest_configure(config):
     import torch
     torch.set_num_threads(8)
 
+    # Kernel launch-config autotuning off for the suite. Each test builds a short-lived model, so it
+    # would pay the one-off benchmark (several Triton compiles per launch signature) and never
+    # amortize it; and the tuned configs are only equal up to floating-point reduction order, which
+    # tests comparing two independently-built models against each other assert away. Tests that
+    # exercise the tuner itself turn it back on locally.
+    os.environ.setdefault("PYJUICE_AUTOTUNE", "0")
+
 
 def pytest_collection_modifyitems(session, config, items):
     # LPT scheduling: reorder the collected tests slowest-first using the cached durations, so the

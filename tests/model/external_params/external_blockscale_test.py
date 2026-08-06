@@ -19,9 +19,12 @@ Two invariants come for free and pin down what the oracle cannot:
   * every tile config computes the same contraction, so they must all agree -- which is what makes the
     launcher's autotuning safe.
 
-There is no Triton fallback for this parameterization: it is a fork of the CuTe/TMA sum kernel, so the
-tests skip wholesale where that kernel does not apply, and the last test pins the boundary of what is
-supported so it is visible when it moves.
+A portable Triton fork now covers every shape, so the parameterization itself needs no CUDA toolchain
+apart from the normalizer shift (`lowrank_shift_logz`, the one kernel here with no Triton port). These
+tests still skip wholesale without the CuTe/TMA extension, because what they check is that all the
+forks agree with the oracle -- and the CuTe one is the fork most of them exercise. The Triton fork is
+pinned separately by `test_shapes_only_the_triton_fork_reaches` and
+`test_backward_needs_only_the_normalizer_shift_extension`.
 """
 
 import pytest
@@ -50,7 +53,8 @@ def _cute_available():
 
 needs_cute = pytest.mark.skipif(
     not _cute_available(),
-    reason = "needs the CuTe/TMA extension (nvcc + CUTLASS + sm_90+); no fallback exists")
+    reason = "compares the CuTe/TMA fork (nvcc + CUTLASS + sm_90+) against the oracle; the "
+             "Triton fork that covers a machine without it is pinned separately")
 
 
 # --------------------------------------------------------------------------------- circuits
@@ -734,6 +738,82 @@ def test_backward_matches_reference(num_latents, block_size, gate_cbs, batch, sc
     # The small-batch forks are pure fp32 and land ~1e-6, but one bar covers both.
     assert d_ef < 2e-3, f"element flows off by {d_ef}"
     assert d_pf < 3e-3, f"param flows off by {d_pf} (relative)"
+
+
+@cuda_only
+@needs_cute
+def test_the_whole_path_runs_without_any_cuda_extension():
+    """Forward AND backward with EVERY CUDA extension gone -- the state of a machine with no nvcc.
+
+    Every kernel this parameterization needs has a Triton fork: the forward, the element flows, the
+    parameter flows, and (since it was ported) the +-log-Z normalizer shift. So the CUDA extensions
+    are accelerators, and a toolchain-less machine must get the same answers, just slower. Two
+    things used to break that -- a guard demanding at least one CUDA flow fork, and the shift being
+    CUDA-only -- and this pins both.
+    """
+    import pyjuice.nodes.external_params.kernels.c as ck
+
+    num_latents, block_size, gate_cbs, batch = 256, 128, 8, 128
+    accessors = ["get_module", "get_ele_bw_module", "get_sb_bw_module", "get_par_bw_module",
+                 "get_cute_module", "get_sb_module"]
+
+    pc, root, ns, data, phi, lls = _run(num_latents, block_size, gate_cbs, batch, scale = 1.5)
+    pc.backward(data, flows_memory = 0.0)
+    ns.update_param_flows(pc.param_flows)
+    with_cuda_lls, with_cuda_pf = lls.detach().double(), ns.get_param_flows().double()
+
+    saved = {n: getattr(ck, n) for n in accessors}
+    try:
+        for n in accessors:
+            setattr(ck, n, lambda: None)
+        # A fresh circuit: the forks are chosen (and cached) per layer at the first pass.
+        pc2, _, ns2, data2, phi2, lls2 = _run(num_latents, block_size, gate_cbs, batch, scale = 1.5)
+        pc2.backward(data2, flows_memory = 0.0)
+        ns2.update_param_flows(pc2.param_flows)
+        triton_lls, triton_pf = lls2.detach().double(), ns2.get_param_flows().double()
+    finally:
+        for n, f in saved.items():
+            setattr(ck, n, f)
+
+    ref_ef, ref_pf = _flow_reference(pc, ns, phi, gate_cbs, batch)
+    d_pf = float(((triton_pf.to(ref_pf.device) - ref_pf).abs() / ref_pf.clamp(min = 1e-30)).max())
+    assert d_pf < 3e-3, f"Triton-only param flows off by {d_pf} (relative)"
+
+    # And they agree with what the CUDA forks produced, to those kernels' fp16/bf16 floor.
+    d_lls = float((triton_lls - with_cuda_lls).abs().max())
+    d = float(((triton_pf - with_cuda_pf).abs() / with_cuda_pf.abs().clamp(min = 1e-30)).max())
+    assert d_lls < 2e-3, f"Triton-only and CUDA-served lls differ by {d_lls}"
+    assert d < 3e-3, f"Triton-only and CUDA-served param flows differ by {d} (relative)"
+
+
+@cuda_only
+@pytest.mark.parametrize("rows,block_size,batch", [(4, 128, 128), (7, 64, 1), (3, 256, 512)])
+def test_the_logz_shift_port_matches_the_cuda_kernel(rows, block_size, batch):
+    """`shift_logz_triton` against `lowrank_shift_logz`, BIT for bit.
+
+    `sign` is exactly +-1, so the multiply is a negation or a no-op and the remaining add rounds once
+    either way -- there is no reason for these to differ, and if they ever do, the gated backward's
+    `log N` is wrong by exactly that much on machines without the extension."""
+    from pyjuice.nodes.external_params.kernels.c import get_module
+    from pyjuice.nodes.external_params.kernels.shift_logz import shift_logz_triton
+
+    mod = get_module()
+    if mod is None:
+        pytest.skip("needs the CUDA extension to compare against")
+
+    dev = torch.device("cuda:0")
+    torch.manual_seed(0)
+    num_nodes = 8192
+    nids = (torch.randperm(num_nodes // block_size, device = dev)[:rows] * block_size).to(torch.int64)
+    base = torch.randn(num_nodes, batch, device = dev)
+    log_z = torch.randn(rows * block_size * batch, device = dev)
+
+    for sign in (1.0, -1.0):
+        cuda_out, triton_out = base.clone(), base.clone()
+        mod.lowrank_shift_logz(cuda_out, nids, log_z, block_size, sign)
+        shift_logz_triton(triton_out, nids, log_z, block_size, sign)
+        assert torch.equal(cuda_out, triton_out), \
+            f"sign={sign}: max|d| = {(cuda_out - triton_out).abs().max().item()}"
 
 
 @cuda_only

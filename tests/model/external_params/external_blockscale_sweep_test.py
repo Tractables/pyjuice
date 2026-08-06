@@ -43,7 +43,8 @@ def _cute_available():
 
 needs_cute = pytest.mark.skipif(
     not _cute_available(),
-    reason = "needs the CuTe/TMA extension (nvcc + CUTLASS + sm_90+); no fallback exists")
+    reason = "compares the CuTe/TMA fork (nvcc + CUTLASS + sm_90+) against the oracle; the "
+             "Triton fork that covers a machine without it is pinned separately")
 
 
 def _build(num_latents, block_size, gate_cbs, seed):

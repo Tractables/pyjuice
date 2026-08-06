@@ -353,16 +353,18 @@ class BlockScaleSumParams(ExternalSumParams):
         """
         Resolve every per-layer launch argument once, and check each kernel's assumptions.
 
-        TWO kernels serve this type, and which applies is a property of the shape:
+        THREE kernels serve this type, and which apply is a property of the shape:
 
           * the CuTe/TMA fork, for batches it can tile (`batch % 64 == 0`) on sm_90+ with CUTLASS. It
             carries the normalizer as a gate-factored contraction against a precomputed `sigma`;
           * a plain-CUDA small-batch kernel, one warp per 32 nodes, which accumulates the normalizer
-            inline and needs neither `batch % 64` nor `num_edges % 64` nor CUTLASS.
+            inline and needs neither `batch % 64` nor `num_edges % 64` nor CUTLASS;
+          * the portable Triton fork, which needs no CUDA toolchain at all and applies everywhere,
+            including the shapes the other two decline (a gate finer than the node block, in
+            particular, is served by it alone).
 
-        Both are collected here and the choice is MEASURED, so where they overlap the faster one wins
-        rather than the one that happened to be checked first. Where neither applies this raises: there
-        is no Triton fallback for this parameterization.
+        All three are collected here and the choice is MEASURED, so where they overlap the faster one
+        wins rather than the one that happened to be checked first.
         """
         from .kernels.c import get_cute_module, get_sb_module
         import pyjuice.layer.kernels.c as ck
@@ -1063,22 +1065,24 @@ class BlockScaleSumParams(ExternalSumParams):
 
         state = self._bw_state(layer, node_mars, kwargs)
 
-        from .kernels.c import get_module, get_ele_bw_module, get_par_bw_module, get_sb_bw_module
+        from .kernels.c import get_ele_bw_module, get_par_bw_module, get_sb_bw_module
+        from .kernels.shift_logz import shift_logz
 
-        plain, ele_mod, par_mod = get_module(), get_ele_bw_module(), get_par_bw_module()
+        # NO CUDA extension is required here. The CuTe and small-batch forks are accelerators, and
+        # every kernel on this path also has a Triton fork: a gate table is always built, so
+        # `"triton"` is always among the element candidates; `_par_triton_hook` is installed
+        # unconditionally; and the normalizer shift -- the last piece that used to pin the whole
+        # gated backward to nvcc -- is now `shift_logz`, which falls back to Triton on its own.
+        # Every use of `ele_mod` / `sb_mod` / `par_mod` below checks for itself, so a missing one
+        # costs speed, not correctness.
+        ele_mod, par_mod = get_ele_bw_module(), get_par_bw_module()
         sb_mod = get_sb_bw_module()
-        if plain is None or (ele_mod is None and sb_mod is None):
-            raise NotImplementedError(
-                "the block-scale backward needs its CUDA extensions -- the plain one holding the "
-                "normalizer shift, plus at least one of the CuTe/TMA forks (large batch) and the "
-                "small-batch forks -- and they are unavailable here. There is no Triton fallback."
-            )
 
         batch_size, block_size = state["batch_size"], state["block_size"]
         ext_base, gate_cbs, node_cbs = state["ext_base"], state["gate_cbs"], state["node_cbs"]
 
         for nids, log_z, rows in state["shift_args"]:
-            plain.lowrank_shift_logz(node_mars, nids, log_z, block_size, 1.0)
+            shift_logz(node_mars, nids, log_z, block_size, 1.0)
 
         cache = getattr(layer, "_bs_bw_gate_cache", None)
         if cache is None:
@@ -1461,7 +1465,7 @@ class BlockScaleSumParams(ExternalSumParams):
         layer._ext_bw_par_sb_hook = None
         layer._ext_bw_par_triton_hook = None
 
-        from .kernels.c import get_module
+        from .kernels.shift_logz import shift_logz
 
         state = layer._bs_bw_state
 
@@ -1516,7 +1520,7 @@ class BlockScaleSumParams(ExternalSumParams):
             layer._bs_grad_ext = None
 
         for nids, log_z, rows in state["shift_args"]:
-            get_module().lowrank_shift_logz(node_mars, nids, log_z, state["block_size"], -1.0)
+            shift_logz(node_mars, nids, log_z, state["block_size"], -1.0)
 
         return None
 
