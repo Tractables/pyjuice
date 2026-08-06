@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 import warnings
 from collections import OrderedDict
 
@@ -349,6 +350,34 @@ class BlockScaleSumParams(ExternalSumParams):
         cache[key] = out
         return out
 
+    @staticmethod
+    def _require_full_supply(layer, ns_tensors) -> None:
+        """
+        Refuse a layer whose gated nodes were only PARTLY supplied. Must run before `_ext_base`.
+
+        That base is measured from the FIRST SUPPLIED node, but the gate tables it is added to already
+        carry `layer.ext_unit_bases[ns_idx]`, the cursor over ALL of the layer's gated nodes -- so the
+        two only compose when the first supplied node IS the layer's first. Supply gates for a later
+        node alone and every row shifts by the earlier nodes' slabs: the unsupplied node is gated with
+        the supplied one's `phi`, the supplied one reads past the end of the buffer (finite,
+        plausible, wrong), and the backward's gradient write faults. Refusing is the honest fix --
+        correcting the base alone would not help, since the kernels still run over every row of the
+        layer and would read whatever a previous call left staged for the nodes nobody supplied.
+        """
+        supplied = {id(t[0].ns) for t in ns_tensors}
+        missing = [i.ns for i in layer.external_node_infos
+                   if isinstance(i.ns.external_params, BlockScaleSumParams)
+                   and id(i.ns) not in supplied]
+        if missing:
+            raise NotImplementedError(
+                f"`BlockScaleSumParams`: {len(missing)} of "
+                f"{len(missing) + len(ns_tensors)} gated nodes sharing this sum layer were given no "
+                f"external parameters. Partial supply is not supported -- the layer's kernels run over "
+                f"every node in it, so an unsupplied node has no gate to read. Pass one tensor per "
+                f"gated node (a registered group is the convenient way), or give the nodes separate "
+                f"layers."
+            )
+
     def _build_plan(self, layer, ns_tensors, node_mars, element_mars, params, external_params):
         """
         Resolve every per-layer launch argument once, and check each kernel's assumptions.
@@ -412,28 +441,7 @@ class BlockScaleSumParams(ExternalSumParams):
         node_gates = block_size // gate_bs
         sb_ok = (sb_mod is not None) and (block_size % 32 == 0) and node_gates == 1
 
-        # PARTIAL SUPPLY IS REFUSED, and the check has to come before `ext_base`. That base is measured
-        # from the FIRST SUPPLIED node, but the gate tables it is added to already carry
-        # `layer.ext_unit_bases[ns_idx]`, the cursor over ALL of the layer's gated nodes -- so the two
-        # only compose when the first supplied node IS the layer's first. Supply gates for a later node
-        # alone and every row shifts by the earlier nodes' slabs: the unsupplied node is gated with the
-        # supplied one's `phi`, the supplied one reads past the end of the buffer (finite, plausible,
-        # wrong), and the backward's gradient write faults. Refusing is the honest fix -- correcting the
-        # base alone would not help, since the kernels still run over every row of the layer and would
-        # read whatever a previous call left staged for the nodes nobody supplied.
-        supplied = {id(t[0].ns) for t in ns_tensors}
-        missing = [i.ns for i in layer.external_node_infos
-                   if isinstance(i.ns.external_params, BlockScaleSumParams)
-                   and id(i.ns) not in supplied]
-        if missing:
-            raise NotImplementedError(
-                f"`BlockScaleSumParams`: {len(missing)} of "
-                f"{len(missing) + len(ns_tensors)} gated nodes sharing this sum layer were given no "
-                f"external parameters. Partial supply is not supported -- the layer's kernels run over "
-                f"every node in it, so an unsupplied node has no gate to read. Pass one tensor per "
-                f"gated node (a registered group is the convenient way), or give the nodes separate "
-                f"layers."
-            )
+        self._require_full_supply(layer, ns_tensors)
 
         ext_base = self._ext_base(ns_tensors, external_params, batch_size)
 
@@ -1548,10 +1556,71 @@ class BlockScaleSumParams(ExternalSumParams):
         The weights are still normalized, just locally: `phi` is a log gate with unbounded values (a
         router's logits), so `sum_c` has to be accumulated with a running max exactly as the forward
         does, and the inverse-CDF walk then runs against that sum.
+
+        One portable Triton kernel serves this, with no CUDA forks, no plan cache and no autotuner --
+        unlike the forward, where those buy a real fraction of a training step. Sampling is bounded by
+        the driver, not by this: every sum layer of the top-down pass already costs a `torch.where`, a
+        device-to-host sync, a numba loop over the frontier and a host-to-device copy, which together
+        run to hundreds of microseconds against a kernel measured in single digits. Forks would buy
+        nothing measurable and would cost the property that makes this reviewable -- that it is the
+        shared-parameter sampler plus a gate.
         """
-        raise NotImplementedError(
-            "`BlockScaleSumParams` sampling is not implemented yet."
-        )
+        from .kernels.blockscale_sample import bs_sample_sum_layer
+
+        external_params = kwargs.get(_buffer_kwarg(), None)
+        if external_params is None:
+            return None
+
+        if getattr(layer, "ext_slots", None) is None:
+            raise NotImplementedError(
+                "`BlockScaleSumParams` needs the compiled edge-block tables, which require a "
+                "batch-innermost storage layout."
+            )
+
+        self._require_full_supply(layer, ns_tensors)
+
+        ns0 = ns_tensors[0][0].ns
+        num_samples = node_samples.size(1)
+        block_size = layer.block_size
+        gate_bs, gate_cbs = self.gate_sizes(ns0)
+        node_cbs = ns0.ch_block_size
+
+        # RELATIVE to the staging buffer, so it depends on the layout and the batch and not on any
+        # address -- the same quantity the forward resolves, re-derived here because sampling shares
+        # no state with it.
+        ext_base = self._ext_base(ns_tensors, external_params, num_samples)
+
+        # `_gate_nstride` is cached, but building its key costs two DEVICE SYNCS (`int(nids[0])`,
+        # `int(nids[-1])`) on every call including a hit. The forward pays that once per plan; the
+        # sampler would pay it per partition per layer per draw, in a loop whose cost is already
+        # dominated by host round-trips. Keyed on the partition and the buffer's address, which
+        # answers the same question -- compiled `nids` never change in place, and a device move
+        # hands back a different pointer.
+        nstride_cache = layer.__dict__.setdefault("_bs_sample_nstride", {})
+
+        for partition_id in range(layer.num_fw_partitions):
+            nids = layer.partitioned_nids[partition_id]
+            cids = layer.partitioned_cids[partition_id]
+            pids = layer.partitioned_pids[partition_id]
+
+            key = (partition_id, nids.data_ptr())
+            nstride = nstride_cache.get(key)
+            if nstride is None:
+                nstride = nstride_cache[key] = self._gate_nstride(layer, nids)
+
+            # A fresh seed per partition, as the shared-parameter launcher draws one per launch. The
+            # partitions serve disjoint sets of lanes -- a node lives in exactly one -- so they never
+            # have to agree.
+            bs_sample_sum_layer(
+                nids, cids, pids, element_mars, params, external_params,
+                layer.ext_slots[0][partition_id], nstride,
+                node_samples, element_samples, ind_target, ind_n, ind_b,
+                random.randint(0, 2**31),
+                block_size = block_size, node_cbs = node_cbs, gate_cbs = gate_cbs,
+                gate_bs = gate_bs, ext_base = ext_base, conditional = conditional,
+            )
+
+        return None
 
     def _logz_tile(self, layer, launch, grad_ext, batch, block_size, n_gates, rows):
         """

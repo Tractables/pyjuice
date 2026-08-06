@@ -5,67 +5,15 @@ import numpy as np
 import random
 from typing import Optional
 
-from pyjuice.layer.external_sum_layer import ExternalParamsSumLayer, \
-                                             EXTERNAL_PARAMS_KWARG, EXTERNAL_PARAMS_BUFFER_KWARG
+from pyjuice.layer.external_sum_layer import ExternalParamsSumLayer
 from pyjuice.model import TensorCircuit
 
 from .sampling import assign_cids_ind_target, assign_nids_ind_target, push_non_neg_ones_to_front, \
                       count_prod_nch, sample_prod_layer, sample_sum_layer
 
 
-def _resolve_external_params(pc: TensorCircuit, num_samples: int, conditional: bool,
-                             sum_external_params) -> dict:
-    """
-    Work out which per-sample external sum parameters this pass runs against, and hand back the
-    kwargs the layers read them through -- empty when there are none, in which case every sum layer
-    is sampled from its shared parameters alone.
-
-    The two modes get the tensors from different places, for the same reason the forward and the
-    backward do:
-
-    * **unconditional** -- there is no preceding forward pass to have staged anything, so the
-      caller's tensors are staged here, at `batch_size = num_samples`. One gate per drawn sample.
-    * **conditional** -- the samples are drawn against the `node_mars` / `element_mars` a forward
-      pass left behind, so the external parameters must be the ones THAT pass used; anything else
-      would be sampling from one distribution conditioned on another. They are taken from the PC's
-      staging buffer exactly as :func:`TensorCircuit.backward` takes them, and a caller who passes
-      `sum_external_params` anyway only has to name the same set of nodes.
-    """
-    if not conditional:
-        if sum_external_params is None:
-            return {}
-
-        kwargs = {EXTERNAL_PARAMS_KWARG: sum_external_params}
-        pc._check_external_params_kwargs(kwargs)
-        pc._stage_external_params(kwargs, num_samples)
-
-        return kwargs
-
-    staged = pc._staged_external_params
-
-    if sum_external_params is not None:
-        pc._check_external_params_kwargs({EXTERNAL_PARAMS_KWARG: sum_external_params})
-
-        assert staged is not None, \
-            "`sum_external_params` was given for conditional sampling, but the forward pass did " \
-            "not receive any external parameters."
-
-        named = set()
-        for key in sum_external_params:
-            named.update(pc.external_params_groups[key][0] if isinstance(key, str) else [key])
-
-        assert named == set(staged.keys()), \
-            "`sum_external_params` names a different set of nodes than the forward pass did."
-
-    if staged is None:
-        return {}
-
-    return {EXTERNAL_PARAMS_KWARG: staged, EXTERNAL_PARAMS_BUFFER_KWARG: pc.external_params}
-
-
 def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bool = False,
-           sum_external_params = None, _sample_input_ns: bool = True,
-           _do_calibration: bool = False, **kwargs):
+           _sample_input_ns: bool = True, _do_calibration: bool = False, **kwargs):
     """
     Draw samples from a PC by performing a top-down ancestral sampling pass.
 
@@ -83,14 +31,18 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
     :param conditional: whether to sample conditioned on the evidence cached by a preceding forward pass
     :type conditional: bool
 
-    :param sum_external_params: per-sample external sum parameters, laid out exactly as for
-                                :func:`TensorCircuit.forward` -- one entry per node (or per
-                                registered group). Required for a gated sum layer to be sampled
-                                under its gate; without it the layer is sampled from its shared
-                                parameters, which is what an ungated forward pass would also do.
-                                Under `conditional = True` the values are taken from the forward
-                                pass that produced `pc.node_mars`, so this only has to name the same
-                                nodes.
+    Per-sample external sum parameters are supplied through `sum_external_params`, in `kwargs`,
+    exactly as they are to :func:`TensorCircuit.forward`
+
+    .. code-block:: python
+
+        samples = juice.queries.sample(pc, num_samples = 1024, sum_external_params = {ns: phi})
+
+    with one gate per DRAWN SAMPLE, so their batch axis is `num_samples`. A sum layer that is given
+    none is sampled from its shared parameters, which is what an ungated forward pass computes for
+    it too. Under `conditional = True` they are instead taken from the forward pass that produced
+    `pc.node_mars` -- `element_mars` was built under those gates, so the draw has to use them -- and
+    passing them here only has to name the same nodes.
 
     :returns: a tensor of samples of size [num_samples, num_vars]
     :rtype: torch.Tensor
@@ -103,9 +55,22 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
     root_ns = pc.root_ns
     assert root_ns._output_ind_range[1] - root_ns._output_ind_range[0] == 1, "It is ambiguous to sample from multi-head PCs."
 
-    # Per-sample external sum parameters, if any. Resolved before anything runs, so a mismatch with
-    # the forward pass is reported before half a pass has been drawn.
-    ext_kwargs = _resolve_external_params(pc, num_samples, conditional, sum_external_params)
+    # Per-sample external sum parameters, if any -- handled by the PC's own staging, so that they are
+    # fed exactly as they are to a forward or a backward pass and end up in the same buffer.
+    #
+    # Which of the two applies is not a matter of taste. An unconditional pass is a forward: nothing
+    # has been staged, and the caller's tensors are copied in at `batch_size = num_samples`, one gate
+    # per drawn sample. A conditional pass is a backward: it runs against the `node_mars` /
+    # `element_mars` a forward pass left behind, which were built under THAT pass's gates, so the
+    # draw has to use the same ones -- and taking them from the staging buffer makes using any
+    # others impossible rather than merely discouraged.
+    #
+    # Both are no-ops when no external parameters were supplied, so an ordinary PC pays nothing.
+    pc._check_external_params_kwargs(kwargs)
+    if conditional:
+        pc._resolve_backward_external_params(kwargs)
+    else:
+        pc._stage_external_params(kwargs, num_samples)
 
     if hasattr(pc, "_num_nscopes") and hasattr(pc, "_num_escopes"):
         num_nscopes = pc._num_nscopes
@@ -171,7 +136,7 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
                 if isinstance(layer, ExternalParamsSumLayer):
                     handled = layer.sample_layer(
                         pc.node_mars, pc.element_mars, pc.params, node_samples, element_samples,
-                        ind_target, ind_n, ind_b, conditional = conditional, **ext_kwargs
+                        ind_target, ind_n, ind_b, conditional = conditional, **kwargs
                     )
 
                 # Sample child indices

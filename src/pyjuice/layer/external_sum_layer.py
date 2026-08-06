@@ -635,10 +635,25 @@ class ExternalParamsSumLayer(SumLayer):
                being conditioned on.
         """
 
-        ns_tensors = self._resolve_external_tensors(kwargs, node_samples.size(1), node_samples.device)
+        num_samples = node_samples.size(1)
+        ns_tensors = self._resolve_external_tensors(kwargs, num_samples, node_samples.device)
 
         if len(ns_tensors) == 0:
             return False
+
+        # The compiled tables express offsets in PER-BATCH units and the kernels multiply by the
+        # sample count, so tensors staged for a different batch would be read at addresses scaled by
+        # the wrong stride -- in bounds, plausible, and someone else's gate. `_resolve_external_tensors`
+        # skips validation for already-staged views, which is exactly the case this can arise in:
+        # `pc._staged_external_params` is never cleared, so a conditional draw can reach views a much
+        # older forward pass left behind.
+        for ns_info, tensors in ns_tensors:
+            shapes = self.external_params.storage_shapes(ns_info.ns, num_samples)
+            for tensor, shape in zip(tensors, shapes):
+                assert tuple(tensor.size()) == tuple(shape), \
+                    f"External tensors staged for {ns_info.ns} are shaped {tuple(tensor.size())}, but " \
+                    f"drawing {num_samples} samples needs {tuple(shape)}. They were staged by a " \
+                    f"forward pass at a different batch size."
 
         self.external_params.sample_layer(
             self, ns_tensors, node_mars, element_mars, params, node_samples, element_samples,
