@@ -91,11 +91,17 @@ def count_prod_nch(layer, nids, cids, element_samples, ind_ch_count, ind_nids, i
     batch_size = element_samples.size(1)
     num_edges = cids.size(1)
 
-    BLOCK_C = min(128, triton.next_power_of_2(num_edges))
-    # Floored at 2 for the same reason as in `sample_sum_layer`: a degenerate `[BLOCK_S, 1]` reduction
-    # in the `nids` scan fails to compile once `BLOCK_S` reaches 32.
+    # EVERY tile dimension is floored at 2. Triton's `TritonGPURemoveLayoutConversions` pass fails to
+    # compile these kernels whenever a tile has a size-1 dimension that takes part in a reduction --
+    # "PassManager::run failed", at compile time, so it is a hard crash rather than a slow path. It is
+    # reachable from both ends and was: `BLOCK_M == 1` (a single node block) with `BLOCK_S == 32`
+    # (`num_samples >= 4096`) broke every HMM-shaped chain, and `BLOCK_S == 1` (`num_samples < 256`)
+    # broke `PD`-structured circuits at small batch, including every conditional draw on them. A
+    # second, masked-off lane costs nothing and removes the whole class.
+    BLOCK_C = max(2, min(128, triton.next_power_of_2(num_edges)))
     BLOCK_M = max(2, min(512, triton.next_power_of_2(num_nblocks)))
-    BLOCK_S = min(2048 // BLOCK_C, 2048 // BLOCK_M, max(triton.next_power_of_2(num_samples // 128), 1))
+    BLOCK_S = max(2, min(2048 // BLOCK_C, 2048 // BLOCK_M,
+                         max(triton.next_power_of_2(num_samples // 128), 1)))
 
     M_NUM_BLKS = triton.cdiv(num_nblocks, BLOCK_M)
     C_NUM_BLKS = triton.cdiv(num_edges, BLOCK_C)
@@ -160,8 +166,8 @@ def sample_prod_layer(layer, nids, cids, node_samples, element_samples, ind_targ
     num_edges = cids.size(1)
     batch_size = node_samples.size(1)
 
-    BLOCK_C = min(1024, triton.next_power_of_2(num_edges))
-    BLOCK_S = min(1024 // BLOCK_C, max(triton.next_power_of_2(num_samples // 128), 1))
+    BLOCK_C = max(2, min(1024, triton.next_power_of_2(num_edges)))
+    BLOCK_S = max(2, min(1024 // BLOCK_C, max(triton.next_power_of_2(num_samples // 128), 1)))
 
     C_NUM_BLKS = triton.cdiv(num_edges, BLOCK_C)
 

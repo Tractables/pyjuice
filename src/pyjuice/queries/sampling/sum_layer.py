@@ -138,14 +138,17 @@ def sample_sum_layer(pc, layer, nids, cids, pids, node_mars, element_mars, param
     batch_size = node_samples.size(1)
     seed = random.randint(0, 2**31)
 
-    BLOCK_K = min(512, triton.next_power_of_2(num_edges))
-    # FLOORED AT 2. With a single node block `BLOCK_M` would be 1, and the `nids` scan then reduces a
-    # `[BLOCK_S, 1]` tile along its degenerate axis -- which Triton fails to compile ("PassManager::run
-    # failed") once `BLOCK_S` reaches 32, i.e. for `num_samples >= 4096`. That made sampling large
-    # batches impossible on any layer with one node block, which is every HMM-shaped chain. A second,
-    # masked-off column costs nothing and sidesteps it.
+    # EVERY tile dimension is floored at 2. Triton's `TritonGPURemoveLayoutConversions` pass fails to
+    # compile these kernels whenever a tile has a size-1 dimension that takes part in a reduction --
+    # "PassManager::run failed", at compile time, so it is a hard crash rather than a slow path. It is
+    # reachable from both ends and was: `BLOCK_M == 1` (a single node block) with `BLOCK_S == 32`
+    # (`num_samples >= 4096`) broke every HMM-shaped chain, and `BLOCK_S == 1` (`num_samples < 256`)
+    # broke `PD`-structured circuits at small batch, including every conditional draw on them. A
+    # second, masked-off lane costs nothing and removes the whole class.
+    BLOCK_K = max(2, min(512, triton.next_power_of_2(num_edges)))
     BLOCK_M = max(2, min(512, triton.next_power_of_2(num_nblocks)))
-    BLOCK_S = min(2048 // BLOCK_K, 2048 // BLOCK_M, max(triton.next_power_of_2(num_samples // 128), 1))
+    BLOCK_S = max(2, min(2048 // BLOCK_K, 2048 // BLOCK_M,
+                         max(triton.next_power_of_2(num_samples // 128), 1)))
 
     M_NUM_BLKS = triton.cdiv(num_nblocks, BLOCK_M)
     K_NUM_BLKS = triton.cdiv(num_edges, BLOCK_K)
