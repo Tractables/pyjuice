@@ -48,7 +48,7 @@ def assign_nids_ind_target(ind_target, ind_target_sid, node_pointers, ind_b, num
         node_pointers[bid] = ind_t + 1
 
 
-def push_non_neg_ones_to_front(matrix):
+def push_non_neg_ones_to_front(matrix, dst = None, buffer = None):
     """
     Compact every column of `matrix` in place, moving its non-`-1` entries to the front while keeping
     their relative order, and return how many each column holds.
@@ -72,18 +72,34 @@ def push_non_neg_ones_to_front(matrix):
            `repeat_interleave`) to replace one small copy and a numba loop that costs microseconds.
            This routine wins because it removes work without adding launches. Do not "finish the job"
            without re-measuring.
+
+    :param dst: a destination-row map from a previous, identical call. Supplying it skips deriving
+                one -- which is four of the seven operations here -- and is what the plan cache does
+                on a structured-decomposable circuit, where the map is the same on every call.
+    :param buffer: scratch of shape `[rows + 1, cols]` to scatter through, so the cached path does
+                   not allocate one per layer per call.
+
+    :returns: `(counts, dst)`. `counts` is the number of kept entries per column, or `None` when
+              `dst` was supplied -- the caller then already has it cached too.
     """
     num_rows = matrix.size(0)
 
-    kept = matrix != -1
-    dst = kept.to(torch.long).cumsum(dim = 0) - 1
+    counts = None
+    if dst is None:
+        kept = matrix != -1
+        dst = kept.to(torch.long).cumsum(dim = 0) - 1
 
-    # Dropped entries are scattered to a scratch row that is then discarded, which keeps the scatter
-    # unconditional -- there is no way to mask a `scatter_`, and branching would cost more.
-    dst = torch.where(kept, dst, torch.full_like(dst, num_rows))
+        # Dropped entries are scattered to a scratch row that is then discarded, which keeps the
+        # scatter unconditional -- there is no way to mask a `scatter_`, and branching would cost more
+        dst = torch.where(kept, dst, torch.full_like(dst, num_rows))
+        counts = kept.sum(dim = 0)
 
-    buffer = matrix.new_full((num_rows + 1, matrix.size(1)), -1)
+    if buffer is None:
+        buffer = matrix.new_full((num_rows + 1, matrix.size(1)), -1)
+    else:
+        buffer.fill_(-1)
+
     buffer.scatter_(0, dst, matrix)
     matrix.copy_(buffer[:num_rows])
 
-    return kept.sum(dim = 0)
+    return counts, dst

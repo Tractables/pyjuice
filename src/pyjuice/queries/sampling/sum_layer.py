@@ -22,7 +22,7 @@ import triton.language as tl
 @triton.jit
 def sample_sum_layer_kernel(nids, cids, pids, node_mars, element_mars, mparams, node_samples, element_samples,
                             ind_target, ind_n, ind_b, seed, block_size: tl.constexpr, batch_size: tl.constexpr,
-                            num_edges: tl.constexpr, num_samples: tl.constexpr, num_nblocks: tl.constexpr, BLOCK_S: tl.constexpr,
+                            num_edges: tl.constexpr, num_samples, num_nblocks: tl.constexpr, BLOCK_S: tl.constexpr,
                             BLOCK_M: tl.constexpr, M_NUM_BLKS: tl.constexpr, BLOCK_K: tl.constexpr, K_NUM_BLKS: tl.constexpr,
                             conditional: tl.constexpr, do_calibration: tl.constexpr):
 

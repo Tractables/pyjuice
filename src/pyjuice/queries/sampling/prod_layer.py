@@ -21,7 +21,7 @@ import triton.language as tl
 
 @triton.jit
 def count_prod_nch_kernel(nids, cids, element_samples, ind_ch_count, ind_nids, ind_nid_offs, ind_mask, ind_n, ind_b, partition_id,
-                          block_size: tl.constexpr, num_samples: tl.constexpr, num_nblocks: tl.constexpr,
+                          block_size: tl.constexpr, num_samples, num_nblocks: tl.constexpr,
                           batch_size: tl.constexpr, num_edges: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_C: tl.constexpr,
                           BLOCK_S: tl.constexpr, M_NUM_BLKS: tl.constexpr, C_NUM_BLKS: tl.constexpr):
 
@@ -119,7 +119,7 @@ def count_prod_nch(layer, nids, cids, element_samples, ind_ch_count, ind_nids, i
 @triton.jit
 def sample_prod_layer_kernel(nids, cids, node_samples, element_samples, ind_target, ind_target_sid, ind_n, ind_b,
                              ind_nids, ind_nid_offs, ind_mask, partition_id, block_size: tl.constexpr,
-                             num_samples: tl.constexpr, num_nblocks: tl.constexpr, batch_size: tl.constexpr, num_edges: tl.constexpr,
+                             num_samples, num_nblocks: tl.constexpr, batch_size: tl.constexpr, num_edges: tl.constexpr,
                              BLOCK_S: tl.constexpr, BLOCK_C: tl.constexpr, C_NUM_BLKS: tl.constexpr):
 
     pid_s = tl.program_id(0) # ID of size-`BLOCK_S` batches

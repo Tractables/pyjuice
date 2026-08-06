@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 import numpy as np
 import random
+from collections import OrderedDict
 from typing import Optional
 
 from pyjuice.layer.external_sum_layer import ExternalParamsSumLayer
@@ -10,6 +11,102 @@ from pyjuice.model import TensorCircuit
 
 from .sampling import assign_cids_ind_target, assign_nids_ind_target, push_non_neg_ones_to_front, \
                       count_prod_nch, sample_prod_layer, sample_sum_layer
+
+
+#: How many recorded sampling plans to keep per circuit, keyed by (num_samples, conditional).
+#: Each holds a handful of index tensors per layer, so this bounds the memory a plan cache can hold.
+_PLAN_CACHE_SIZE = 8
+
+
+class _PlanTape():
+    """
+    Records the sampler's per-layer index tensors on one pass and replays them on the next.
+
+    The top-down pass spends most of its time deriving *where* things go rather than drawing them:
+    per layer a `torch.where`, a device-to-host copy, a serial slot allocation and a copy back, all
+    to compute indices that -- on a structured-decomposable circuit -- are the same on every call.
+    That is the point of :attr:`TensorCircuit.is_structured_decomposable`: with one vtree, the shape
+    of the frontier after each layer is a function of the scopes alone, never of which node a draw
+    happened to select, so the indices repeat exactly and only the node ids inside them differ.
+
+    The tape keeps the driver a single code path: each step asks for its indices and gets either the
+    freshly computed ones (recording) or the cached ones (replaying), so the two cannot drift.
+
+    :note: what is NOT cached, because it is genuinely data-dependent: `ind_nids` / `ind_nid_offs`
+           from `count_prod_nch`, which say which compiled row a *sampled* element fell in. That
+           kernel therefore still runs on every pass; the cache removes the host round-trips around
+           it, not the kernel.
+    """
+
+    __slots__ = ("steps", "cursor", "replaying", "scratch")
+
+    def __init__(self, replaying: bool = False):
+        self.steps = []
+        self.cursor = 0
+        self.replaying = replaying
+        # Buffers the pass would otherwise reallocate per layer per call. Keyed by name, and by
+        # length where the shape varies with the layer.
+        self.scratch = {"compact": None}
+
+    def next(self):
+        """The next recorded value. Only valid while replaying."""
+        value = self.steps[self.cursor]
+        self.cursor += 1
+        return value
+
+    def record(self, value):
+        self.steps.append(value)
+
+    def step(self, compute):
+        """The next step's cached value, or `compute()`'s result when recording."""
+        if self.replaying:
+            return self.next()
+
+        value = compute()
+        self.steps.append(value)
+        return value
+
+    def buffers(self, key, n, device, count = 1):
+        """`count` zeroed `[n]` int64 scratch tensors under `key`, allocated once and reused."""
+        entry = self.scratch.get(key)
+        if entry is None or entry.size(1) != n:
+            entry = torch.zeros([count, n], dtype = torch.long, device = device)
+            self.scratch[key] = entry
+        else:
+            entry.zero_()
+        return entry
+
+
+def _plan_tape(pc: TensorCircuit, num_samples: int, conditional: bool) -> _PlanTape:
+    """
+    The recorded plan for this shape, or a fresh recorder.
+
+    Only structured-decomposable circuits get one. Elsewhere a sum node can choose between products
+    that decompose its scope differently, and then how many nodes land on the frontier depends on the
+    draw -- the plan genuinely changes call to call, and replaying it would be wrong rather than
+    merely stale. `PD` is the everyday example. Circuits without the property simply take the
+    original path, at the original cost.
+    """
+    if not getattr(pc, "is_structured_decomposable", False):
+        return _PlanTape()
+
+    plans = pc.__dict__.setdefault("_sample_plans", OrderedDict())
+    key = (int(num_samples), bool(conditional))
+
+    tape = plans.get(key)
+    if tape is None:
+        # A plan holds a few index tensors per layer, sized by the frontier, so it is proportional to
+        # `num_samples`. LRU-bounded rather than unbounded: a caller sweeping batch sizes would
+        # otherwise accumulate one plan per size for the lifetime of the circuit.
+        while len(plans) >= _PLAN_CACHE_SIZE:
+            plans.popitem(last = False)
+        tape = plans[key] = _PlanTape()
+    else:
+        plans.move_to_end(key)          # LRU: a hit has to protect the entry, or it cannot help
+        tape.cursor = 0
+        tape.replaying = True
+
+    return tape
 
 
 def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bool = False,
@@ -103,6 +200,14 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
     node_samples[:,:] = -1
     node_samples[0,:] = root_ns._output_ind_range[0]
 
+    # The index plan repeats across calls exactly when the circuit respects one vtree (see
+    # `_PlanTape`), so it is recorded on the first pass at a given shape and replayed afterwards.
+    # `_do_calibration` is excluded only because it is a debugging switch not worth a second cache.
+    tape = _plan_tape(pc, num_samples, conditional) if not _do_calibration else _PlanTape()
+    if tape.scratch["compact"] is None:
+        tape.scratch["compact"] = torch.empty([num_nscopes + 1, num_samples], dtype = torch.long,
+                                              device = pc.device)
+
     # Iterate (backward) through layers
     for layer_id in range(len(pc.inner_layer_groups)-1, -1, -1):
         layer_group = pc.inner_layer_groups[layer_id]
@@ -114,15 +219,18 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
             # Iterate over sum layers in the current layer group
             for layer in layer_group:
 
-                # Gather the indices to be processed
-                lsid, leid = layer._layer_nid_range
-                ind_n, ind_b = torch.where((node_samples >= lsid) & (node_samples < leid))
+                # Gather the indices to be processed, and pre-compute the target indices in
+                # `element_samples` -- the sampled child node indices are put where `ind_target` says
+                def _sum_indices(layer = layer):
+                    lsid, leid = layer._layer_nid_range
+                    ind_n, ind_b = torch.where((node_samples >= lsid) & (node_samples < leid))
 
-                # Pre-compute the target indices in `element_samples`
-                # The sampled child node indices will be put into the indices presented in `ind_target`
-                ind_target = np.zeros([ind_n.size(0)], dtype = np.int64)
-                assign_cids_ind_target(ind_target, element_pointers, ind_b.detach().cpu().numpy(), num_samples)
-                ind_target = torch.from_numpy(ind_target).to(pc.device)
+                    ind_target = np.zeros([ind_n.size(0)], dtype = np.int64)
+                    assign_cids_ind_target(ind_target, element_pointers,
+                                           ind_b.detach().cpu().numpy(), num_samples)
+                    return ind_n, ind_b, torch.from_numpy(ind_target).to(pc.device)
+
+                ind_n, ind_b, ind_target = tape.step(_sum_indices)
 
                 # In the case of conditional sampling, recompute to get the `element_mars`
                 if conditional:
@@ -158,18 +266,30 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
 
             # Iterate over product layers in the current layer group
             for layer in layer_group:
-                # Re-align `node_samples` by pushing all values to the front
-                node_pointers = push_non_neg_ones_to_front(node_samples)
+                # Re-align `node_samples` by pushing all values to the front. Unlike the other steps
+                # this one has to RUN either way -- it moves the frontier -- so only the destination
+                # map is cached, which is four of the routine's seven operations.
+                if tape.replaying:
+                    node_pointers = None
+                    push_non_neg_ones_to_front(node_samples, dst = tape.next(),
+                                               buffer = tape.scratch["compact"])
+                else:
+                    node_pointers, compact_dst = push_non_neg_ones_to_front(
+                        node_samples, buffer = tape.scratch["compact"])
+                    tape.record(compact_dst)
 
-                # Gather the indices to be processed
-                lsid, leid = layer._layer_nid_range
-                ind_n, ind_b = torch.where((element_samples >= lsid) & (element_samples < leid))
+                # Indices to process
+                def _prod_indices(layer = layer):
+                    lsid, leid = layer._layer_nid_range
+                    return torch.where((element_samples >= lsid) & (element_samples < leid))
 
-                # Get the number of children for the selected sample indices
-                ind_ch_count = torch.zeros_like(ind_n)
-                ind_nids = torch.zeros_like(ind_n)
-                ind_nid_offs = torch.zeros_like(ind_n)
-                ind_mask = torch.zeros_like(ind_n)
+                ind_n, ind_b = tape.step(_prod_indices)
+
+                # `ind_nids` / `ind_nid_offs` / `ind_mask` say which compiled row each SAMPLED element
+                # fell in, so they are data-dependent and this kernel runs on every pass. The buffers
+                # are reused rather than reallocated per layer.
+                ind_ch_count, ind_nids, ind_nid_offs, ind_mask = tape.buffers(
+                    ("prod", layer_id, id(layer)), ind_n.size(0), pc.device, count = 4)
                 for partition_id in range(layer.num_fw_partitions):
                     nids = layer.partitioned_nids[partition_id]
                     cids = layer.partitioned_cids[partition_id]
@@ -178,14 +298,17 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
                                    ind_nid_offs, ind_mask, ind_n, ind_b, layer.block_size, partition_id)
 
                 # Pre-compute the target indices in `node_samples`
-                ind_target_sid = np.zeros([ind_n.size(0)], dtype = np.int64)
-                ind_target_sid[1:] = ind_ch_count[:-1].cumsum(dim = 0).detach().cpu().numpy()
-                ind_target = np.zeros([ind_ch_count.sum()], dtype = np.int64)
-                assign_nids_ind_target(ind_target, ind_target_sid,
-                                       node_pointers.detach().cpu().numpy(),
-                                       ind_b.detach().cpu().numpy(), num_samples)
-                ind_target_sid = torch.from_numpy(ind_target_sid).to(pc.device)
-                ind_target = torch.from_numpy(ind_target).to(pc.device)
+                def _prod_targets(node_pointers = node_pointers):
+                    ind_target_sid = np.zeros([ind_n.size(0)], dtype = np.int64)
+                    ind_target_sid[1:] = ind_ch_count[:-1].cumsum(dim = 0).detach().cpu().numpy()
+                    ind_target = np.zeros([ind_ch_count.sum()], dtype = np.int64)
+                    assign_nids_ind_target(ind_target, ind_target_sid,
+                                           node_pointers.detach().cpu().numpy(),
+                                           ind_b.detach().cpu().numpy(), num_samples)
+                    return (torch.from_numpy(ind_target_sid).to(pc.device),
+                            torch.from_numpy(ind_target).to(pc.device))
+
+                ind_target_sid, ind_target = tape.step(_prod_targets)
 
                 # Store child indices
                 for partition_id in range(layer.num_fw_partitions):
