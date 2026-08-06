@@ -151,6 +151,10 @@ class ExternalParamsSumLayer(SumLayer):
     * after it, to add the external contribution to the child flows, write the per-sample gradients,
       and undo anything the pre-hook changed.
 
+    Ancestral sampling is handed over the same way, through :func:`sample_layer`, with the one
+    difference that the descriptor REPLACES the standard draw rather than correcting it -- a
+    categorical draw already made under the shared parameters cannot be corrected after the fact.
+
     All the nodes of one layer share an external signature (that is what compilation groups them by),
     so exactly one descriptor -- and one set of kernels -- applies to the whole layer. The standard
     sum-layer kernels are never branched on.
@@ -612,6 +616,36 @@ class ExternalParamsSumLayer(SumLayer):
             self._ext_bw_par_triton_hook = None
 
         return None
+
+    def sample_layer(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor,
+                     node_samples: torch.Tensor, element_samples: torch.Tensor,
+                     ind_target: torch.Tensor, ind_n: torch.Tensor, ind_b: torch.Tensor,
+                     conditional: bool = False, **kwargs) -> bool:
+        """
+        Draw one child for every node of this layer the ancestral sampler has selected.
+
+        Returns whether this layer handled the draw. `False` means no external tensors were supplied
+        for it, in which case it IS a plain sum layer and the caller falls back to the
+        shared-parameter kernel -- the same rule the forward and backward passes follow, so a layer
+        is sampled under exactly the parameterization it would have been scored under.
+
+        :note: `num_samples` plays the role the batch size plays elsewhere, and the external tensors
+               are validated against it. Unconditionally that is the number of samples requested, so
+               there is one gate per drawn sample; conditionally it is the batch of the forward pass
+               being conditioned on.
+        """
+
+        ns_tensors = self._resolve_external_tensors(kwargs, node_samples.size(1), node_samples.device)
+
+        if len(ns_tensors) == 0:
+            return False
+
+        self.external_params.sample_layer(
+            self, ns_tensors, node_mars, element_mars, params, node_samples, element_samples,
+            ind_target, ind_n, ind_b, conditional = conditional, **kwargs
+        )
+
+        return True
 
     def __repr__(self):
         return f"ExternalParamsSumLayer(nid_range=({self._layer_nid_range[0]}, {self._layer_nid_range[1]}), " \

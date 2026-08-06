@@ -279,6 +279,54 @@ class ExternalSumParams():
         """
         raise NotImplementedError()
 
+    def sample_layer(self, layer, ns_tensors, node_mars, element_mars, params, node_samples,
+                     element_samples, ind_target, ind_n, ind_b, conditional: bool = False,
+                     **kwargs) -> None:
+        """
+        Draw one child per selected node of this layer, under the EFFECTIVE parameters.
+
+        The top-down ancestral pass (:func:`pyjuice.queries.sample`) reaches this once per sum layer
+        that was given external tensors, in place of the shared-parameter kernel -- which would
+        otherwise draw from `theta_shared` and return samples from a different distribution than the
+        forward pass scores. So this is the sampling counterpart of :func:`forward_layer`, and it
+        owns the whole draw rather than correcting one: a normalized categorical distribution is not
+        recoverable from a draw already made under different weights.
+
+        The distribution to draw from is the node's effective conditional. Note that the normalizer
+        cancels: for `theta_b[n,c] = w_b[n,c] / Z_b[n]`, drawing `c` in proportion to `w_b[n,c]`
+        (times `exp(element_mars[c,b])` when conditioning) is the same draw, so a parameterization
+        needs no normalizer from its forward pass -- only its own per-sample weights.
+
+        Not implemented by default. A parameterization that leaves it that way makes
+        :func:`pyjuice.queries.sample` raise rather than silently sample the shared parameters.
+
+        :param ns_tensors: `[(ns_info, tensors), ...]` for the nodes that were given external
+                           tensors, as in :func:`forward_layer`
+
+        :param node_samples: `[scopes, num_samples]`, the sampler's frontier of selected node ids
+
+        :param element_samples: `[scopes, num_samples]`, where the drawn child ids are written
+
+        :param ind_target: flat index into `element_samples` at which each selected node's drawn
+                           child belongs
+
+        :param ind_n: index into `node_samples`' first axis of each selected node
+        :param ind_b: sample (column) index of each selected node
+
+        :param conditional: whether to condition on the evidence a forward pass left in
+                            `element_mars`. Unconditionally the child of `n` is drawn in proportion
+                            to the effective parameters alone; conditionally, to those times
+                            `exp(element_mars[c,b])`.
+        """
+        raise NotImplementedError(
+            f"`{self.get_signature()}` does not implement ancestral sampling. Sampling it with the "
+            f"shared-parameter kernel would ignore the per-sample parameters entirely and quietly "
+            f"return samples from a different distribution than the forward pass scores, so it is "
+            f"refused instead. Implement `sample_layer`, or draw samples without supplying external "
+            f"parameters, which samples the shared parameters and is what an ungated forward pass "
+            f"also computes."
+        )
+
     def _get_constructor(self):
         raise NotImplementedError()
 

@@ -2,337 +2,69 @@ from __future__ import annotations
 
 import torch
 import numpy as np
-import triton
-import triton.language as tl
 import random
-from typing import Union, Callable, Optional
-from functools import partial
-from numba import njit
+from typing import Optional
 
-from pyjuice.nodes import CircuitNodes
+from pyjuice.layer.external_sum_layer import ExternalParamsSumLayer, \
+                                             EXTERNAL_PARAMS_KWARG, EXTERNAL_PARAMS_BUFFER_KWARG
 from pyjuice.model import TensorCircuit
 
+from .sampling import assign_cids_ind_target, assign_nids_ind_target, push_non_neg_ones_to_front, \
+                      count_prod_nch, sample_prod_layer, sample_sum_layer
 
-@njit
-def _assign_cids_ind_target(ind_target, element_pointers, ind_b, num_samples):
-    for i in range(ind_target.shape[0]):
-        bid = ind_b[i]
-        ind_t = element_pointers[bid]
-        ind_target[i] = ind_t * num_samples + bid
-        element_pointers[bid] = ind_t + 1
 
+def _resolve_external_params(pc: TensorCircuit, num_samples: int, conditional: bool,
+                             sum_external_params) -> dict:
+    """
+    Work out which per-sample external sum parameters this pass runs against, and hand back the
+    kwargs the layers read them through -- empty when there are none, in which case every sum layer
+    is sampled from its shared parameters alone.
 
-@njit
-def _assign_nids_ind_target(ind_target, ind_target_sid, node_pointers, ind_b, num_samples):
-    nid = 0
-    for i in range(ind_target.shape[0]):
-        if nid < ind_target_sid.shape[0] - 1 and i >= ind_target_sid[nid+1]:
-            nid += 1
-        bid = ind_b[nid]
-        ind_t = node_pointers[bid]
-        ind_target[i] = ind_t * num_samples + bid
-        node_pointers[bid] = ind_t + 1
+    The two modes get the tensors from different places, for the same reason the forward and the
+    backward do:
 
+    * **unconditional** -- there is no preceding forward pass to have staged anything, so the
+      caller's tensors are staged here, at `batch_size = num_samples`. One gate per drawn sample.
+    * **conditional** -- the samples are drawn against the `node_mars` / `element_mars` a forward
+      pass left behind, so the external parameters must be the ones THAT pass used; anything else
+      would be sampling from one distribution conditioned on another. They are taken from the PC's
+      staging buffer exactly as :func:`TensorCircuit.backward` takes them, and a caller who passes
+      `sum_external_params` anyway only has to name the same set of nodes.
+    """
+    if not conditional:
+        if sum_external_params is None:
+            return {}
 
-@triton.jit
-def sample_sum_layer_kernel(nids, cids, pids, node_mars, element_mars, mparams, node_samples, element_samples, 
-                            ind_target, ind_n, ind_b, seed, block_size: tl.constexpr, batch_size: tl.constexpr, 
-                            num_edges: tl.constexpr, num_samples: tl.constexpr, num_nblocks: tl.constexpr, BLOCK_S: tl.constexpr, 
-                            BLOCK_M: tl.constexpr, M_NUM_BLKS: tl.constexpr, BLOCK_K: tl.constexpr, K_NUM_BLKS: tl.constexpr,
-                            conditional: tl.constexpr, do_calibration: tl.constexpr):
-    
-    pid_s = tl.program_id(0) # ID of size-`BLOCK_S` batches
+        kwargs = {EXTERNAL_PARAMS_KWARG: sum_external_params}
+        pc._check_external_params_kwargs(kwargs)
+        pc._stage_external_params(kwargs, num_samples)
 
-    # Sample offsets and mask
-    offs_sample = tl.arange(0, BLOCK_S) + pid_s * BLOCK_S
-    mask_sample = offs_sample < num_samples
+        return kwargs
 
-    # Load node and batch ids
-    node_sample_id = tl.load(ind_n + offs_sample, mask = mask_sample, other = 0)
-    batch_id = tl.load(ind_b + offs_sample, mask = mask_sample, other = 0)
-    node_id = tl.load(node_samples + node_sample_id * batch_size + batch_id)
+    staged = pc._staged_external_params
 
-    # Locate node ids in `nids`
-    offs_nids = tl.arange(0, BLOCK_M)
-    local_nids = tl.zeros([BLOCK_S], dtype = tl.int64) - 1
-    local_nid_offs = tl.zeros([BLOCK_S], dtype = tl.int64)
-    for i in range(M_NUM_BLKS):
-        mask_nids = offs_nids < num_nblocks
+    if sum_external_params is not None:
+        pc._check_external_params_kwargs({EXTERNAL_PARAMS_KWARG: sum_external_params})
 
-        ref_nid = tl.load(nids + offs_nids, mask = mask_nids, other = 0)
-        is_match = (node_id[:,None] >= ref_nid[None,:]) & (node_id[:,None] < ref_nid[None,:] + block_size) # [BLOCK_S, BLOCK_M]
+        assert staged is not None, \
+            "`sum_external_params` was given for conditional sampling, but the forward pass did " \
+            "not receive any external parameters."
 
-        match_local_id = tl.sum(is_match * (offs_nids[None,:] + 1), axis = 1)
-        match_local_offset = tl.sum(is_match * (node_id[:,None] - ref_nid[None,:]), axis = 1)
+        named = set()
+        for key in sum_external_params:
+            named.update(pc.external_params_groups[key][0] if isinstance(key, str) else [key])
 
-        local_nids = tl.where(match_local_id > 0, match_local_id - 1, local_nids)
-        local_nid_offs = tl.where(match_local_id > 0, match_local_offset, local_nid_offs)
+        assert named == set(staged.keys()), \
+            "`sum_external_params` names a different set of nodes than the forward pass did."
 
-        offs_nids += BLOCK_M
+    if staged is None:
+        return {}
 
-    # Update sample mask to filter out inactive ones
-    mask_sample = mask_sample & (local_nids >= 0)
+    return {EXTERNAL_PARAMS_KWARG: staged, EXTERNAL_PARAMS_BUFFER_KWARG: pc.external_params}
 
-    # Sample random probabilities uniform between 0 and 1
-    rnd_val = tl.rand(seed, offs_sample)
 
-    if conditional:
-        nmars = tl.load(node_mars + node_id * batch_size + batch_id, mask = mask_sample, other = 0.0) # [Block_B]
-
-    # Calibration loop
-    if do_calibration:
-        sum_pars = tl.zeros([BLOCK_S], dtype = tl.float32)
-        offs_child = tl.arange(0, BLOCK_K)
-        mask_child = offs_child < num_edges
-        for i in range(K_NUM_BLKS):
-
-            # Load parameters
-            param_id = tl.load(pids + local_nids[None,:] * num_edges + offs_child[:,None], mask = (mask_sample[None,:] & mask_child[:,None]), other = 0)
-            epars = tl.load(mparams + param_id + local_nid_offs[None,:], mask = (mask_sample[None,:] & mask_child[:,None]), other = 0.0) # [BLOCK_K, BLOCK_B]
-
-            if conditional:
-                # In this case, we use `param * cmar / nmar` as the "parameter"
-                emars_id = tl.load(cids + local_nids[None,:] * num_edges + offs_child[:,None], mask = (mask_sample[None,:] & mask_child[:,None]), other = 0)
-                emars = tl.load(element_mars + emars_id * batch_size + batch_id, mask = (mask_sample[None,:] & mask_child[:,None]), other = 0.0)
-
-                epars = epars * tl.exp(emars - nmars[None,:]) # [BLOCK_K, BLOCK_B]
-
-            sum_pars += tl.sum(epars, axis = 0)
-
-            offs_child += BLOCK_K
-            mask_child = offs_child < num_edges
-
-        rnd_val *= sum_pars
-        rnd_val -= 1e-12
-
-    # Main loop over blocks of child nodes
-    chids = tl.zeros([BLOCK_S], dtype = tl.int64) - 1
-    offs_child = tl.arange(0, BLOCK_K)
-    mask_child = offs_child < num_edges
-    for i in range(K_NUM_BLKS):
-
-        # Load parameters
-        param_id = tl.load(pids + local_nids[None,:] * num_edges + offs_child[:,None], mask = (mask_sample[None,:] & mask_child[:,None]), other = 0)
-        epars = tl.load(mparams + param_id + local_nid_offs[None,:], mask = (mask_sample[None,:] & mask_child[:,None]), other = 0.0) # [BLOCK_K, BLOCK_S]
-
-        if conditional:
-            # In this case, we use `param * cmar / nmar` as the "parameter"
-            emars_id = tl.load(cids + local_nids[None,:] * num_edges + offs_child[:,None], mask = (mask_sample[None,:] & mask_child[:,None]), other = 0)
-            emars = tl.load(element_mars + emars_id * batch_size + batch_id, mask = (mask_sample[None,:] & mask_child[:,None]), other = 0.0)
-
-            epars = epars * tl.exp(emars - nmars[None,:]) # [BLOCK_K, BLOCK_B]
-        
-        cum_probs = tl.cumsum(epars, axis = 0) # [BLOCK_K, BLOCK_S]
-        local_chids = tl.sum((rnd_val[None,:] >= cum_probs).to(tl.int64), axis = 0) # [BLOCK_K, BLOCK_S]
-
-        is_overflow = (local_chids == BLOCK_K)
-        rnd_val = tl.where(is_overflow, rnd_val - tl.sum(epars, axis = 0), rnd_val)
-
-        chids = tl.where(is_overflow | (chids > -1), chids, local_chids + i * BLOCK_K)
-
-        offs_child += BLOCK_K
-        mask_child = (offs_child < num_edges)
-
-    # Retrieve the global child ids and save them to `element_samples`
-    global_chids = tl.load(cids + local_nids * num_edges + chids, mask = mask_sample, other = 0)
-    target_id = tl.load(ind_target + offs_sample, mask = mask_sample, other = 0)
-
-    tl.store(element_samples + target_id, global_chids, mask = mask_sample)
-
-
-def sample_sum_layer(pc, layer, nids, cids, pids, node_mars, element_mars, params, node_samples, element_samples, 
-                     ind_target, ind_n, ind_b, block_size, conditional, do_calibration = False):
-    
-    num_samples = ind_n.size(0)
-    num_nblocks = nids.size(0)
-    num_edges = cids.size(1)
-    batch_size = node_samples.size(1)
-    seed = random.randint(0, 2**31)
-
-    BLOCK_K = min(512, triton.next_power_of_2(num_edges))
-    BLOCK_M = min(512, triton.next_power_of_2(num_nblocks))
-    BLOCK_S = min(2048 // BLOCK_K, 2048 // BLOCK_M, max(triton.next_power_of_2(num_samples // 128), 1))
-
-    M_NUM_BLKS = triton.cdiv(num_nblocks, BLOCK_M)
-    K_NUM_BLKS = triton.cdiv(num_edges, BLOCK_K)
-
-    grid = (triton.cdiv(num_samples, BLOCK_S),)
-
-    sample_sum_layer_kernel[grid](
-        nids, cids, pids, node_mars, element_mars, params, node_samples, element_samples, 
-        ind_target, ind_n, ind_b, seed, block_size, batch_size, num_edges, num_samples, num_nblocks, 
-        BLOCK_S, BLOCK_M, M_NUM_BLKS, BLOCK_K, K_NUM_BLKS, conditional, do_calibration
-    )
-
-    return None
-
-
-def push_non_neg_ones_to_front(matrix):
-
-    result = torch.full_like(matrix, -1)
-
-    s_mask = (matrix != -1)
-    d_mask = torch.sum(s_mask, dim = 0, keepdims = True) > torch.arange(matrix.size(0), device = matrix.device)[:,None]
-
-    result[d_mask] = matrix[s_mask]
-    matrix[:] = result[:]
-
-    return s_mask.long().sum(dim = 0)
-
-
-@triton.jit
-def count_prod_nch_kernel(nids, cids, element_samples, ind_ch_count, ind_nids, ind_nid_offs, ind_mask, ind_n, ind_b, partition_id,
-                          block_size: tl.constexpr, num_samples: tl.constexpr, num_nblocks: tl.constexpr, 
-                          batch_size: tl.constexpr, num_edges: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_C: tl.constexpr, 
-                          BLOCK_S: tl.constexpr, M_NUM_BLKS: tl.constexpr, C_NUM_BLKS: tl.constexpr):
-    
-    pid_s = tl.program_id(0) # ID of size-`BLOCK_S` batches
-
-    # Sample offsets and mask
-    offs_sample = tl.arange(0, BLOCK_S) + pid_s * BLOCK_S
-    mask_sample = offs_sample < num_samples
-
-    # Load node and batch ids
-    node_sample_id = tl.load(ind_n + offs_sample, mask = mask_sample, other = 0)
-    batch_id = tl.load(ind_b + offs_sample, mask = mask_sample, other = 0)
-    ele_id = tl.load(element_samples + node_sample_id * batch_size + batch_id)
-
-    # Locate node ids in `nids`
-    offs_nids = tl.arange(0, BLOCK_M)
-    local_nids = tl.zeros([BLOCK_S], dtype = tl.int64) - 1
-    local_nid_offs = tl.zeros([BLOCK_S], dtype = tl.int64)
-    for i in range(M_NUM_BLKS):
-        mask_nids = offs_nids < num_nblocks
-
-        ref_nid = tl.load(nids + offs_nids, mask = mask_nids, other = 0)
-        is_match = (ele_id[:,None] >= ref_nid[None,:]) & (ele_id[:,None] < ref_nid[None,:] + block_size)
-
-        match_local_id = tl.sum(is_match * (offs_nids[None,:] + 1), axis = 1)
-        match_local_offset = tl.sum(is_match * (ele_id[:,None] - ref_nid[None,:]), axis = 1)
-
-        local_nids = tl.where(match_local_id > 0, match_local_id - 1, local_nids)
-        local_nid_offs = tl.where(match_local_id > 0, match_local_offset, local_nid_offs)
-
-        offs_nids += BLOCK_M
-
-    # Store `local_nids` and `local_nid_offs` for future reuse
-    mask_sample = mask_sample & (local_nids >= 0)
-    tl.store(ind_nids + offs_sample, local_nids, mask = mask_sample)
-    tl.store(ind_nid_offs + offs_sample, local_nid_offs, mask = mask_sample)
-    tl.store(ind_mask + offs_sample, partition_id, mask = mask_sample)
-
-    # Handle triton bug.. (otherwise `local_nids` will be wrong)
-    local_nids = tl.load(ind_nids + offs_sample, mask = mask_sample, other = 0)
-
-    # Offset for children
-    offs_child = tl.arange(0, BLOCK_C)
-    mask_child = offs_child < num_edges
-
-    # Main loop over blocks of child nodes
-    ch_count = tl.zeros([BLOCK_S], dtype = tl.int64)
-    for i in range(C_NUM_BLKS):
-
-        c_ids = tl.load(cids + local_nids[:,None] * num_edges + offs_child[None,:], mask = (mask_sample[:,None] & mask_child[None,:]), other = 0)
-        ch_count += tl.sum((c_ids > 0).to(tl.int64), axis = 1)
-
-        offs_child += BLOCK_C
-        mask_child = offs_child < num_edges
-
-    # Store `ch_count`
-    tl.store(ind_ch_count + offs_sample, ch_count, mask = mask_sample)
-
-
-def count_prod_nch(layer, nids, cids, element_samples, ind_ch_count, ind_nids, ind_nid_offs, ind_mask, ind_n, ind_b, block_size, partition_id):
-
-    num_samples = ind_n.size(0)
-    num_nblocks = nids.size(0)
-    batch_size = element_samples.size(1)
-    num_edges = cids.size(1)
-
-    BLOCK_C = min(128, triton.next_power_of_2(num_edges))
-    BLOCK_M = min(512, triton.next_power_of_2(num_nblocks))
-    BLOCK_S = min(2048 // BLOCK_C, 2048 // BLOCK_M, max(triton.next_power_of_2(num_samples // 128), 1))
-
-    M_NUM_BLKS = triton.cdiv(num_nblocks, BLOCK_M)
-    C_NUM_BLKS = triton.cdiv(num_edges, BLOCK_C)
-
-    grid = (triton.cdiv(num_samples, BLOCK_S),)
-
-    count_prod_nch_kernel[grid](
-        nids, cids, element_samples, ind_ch_count, ind_nids, ind_nid_offs, ind_mask, ind_n, ind_b, partition_id, 
-        block_size, num_samples, num_nblocks, batch_size, num_edges, BLOCK_M, BLOCK_C, BLOCK_S, M_NUM_BLKS, C_NUM_BLKS
-    )
-
-    return None
-
-
-@triton.jit
-def sample_prod_layer_kernel(nids, cids, node_samples, element_samples, ind_target, ind_target_sid, ind_n, ind_b, 
-                             ind_nids, ind_nid_offs, ind_mask, partition_id, block_size: tl.constexpr, 
-                             num_samples: tl.constexpr, num_nblocks: tl.constexpr, batch_size: tl.constexpr, num_edges: tl.constexpr,
-                             BLOCK_S: tl.constexpr, BLOCK_C: tl.constexpr, C_NUM_BLKS: tl.constexpr):
-
-    pid_s = tl.program_id(0) # ID of size-`BLOCK_S` batches
-
-    # Sample offsets and mask
-    offs_sample = tl.arange(0, BLOCK_S) + pid_s * BLOCK_S
-    mask_sample = offs_sample < num_samples
-
-    # Load node and batch ids
-    node_sample_id = tl.load(ind_n + offs_sample, mask = mask_sample, other = 0)
-    batch_id = tl.load(ind_b + offs_sample, mask = mask_sample, other = 0)
-    ele_id = tl.load(element_samples + node_sample_id * batch_size + batch_id)
-
-    # Load offsets of `nids` and the node offsets
-    local_nids = tl.load(ind_nids + offs_sample, mask = mask_sample, other = 0)
-    local_nid_offs = tl.load(ind_nid_offs + offs_sample, mask = mask_sample, other = 0)
-    local_partition_id = tl.load(ind_mask + offs_sample, mask = mask_sample, other = 0)
-
-    # Update sample mask
-    mask_sample = mask_sample & (local_partition_id == partition_id)
-
-    # Offset for children
-    offs_child = tl.arange(0, BLOCK_C)
-    mask_child = offs_child < num_edges
-
-    # Main loop over blocks of child nodes
-    target_sid = tl.load(ind_target_sid + offs_sample, mask = mask_sample, other = 0)
-    for i in range(C_NUM_BLKS):
-
-        c_ids = tl.load(cids + local_nids[:,None] * num_edges + offs_child[None,:], mask = (mask_sample[:,None] & mask_child[None,:]), other = 0)
-        target_id = tl.load(ind_target + target_sid[:,None] + offs_child[None,:], mask = (mask_sample[:,None] & mask_child[None,:] & (c_ids > 0)), other = 0)
-
-        tl.store(node_samples + target_id, c_ids + local_nid_offs[:,None], mask = (mask_sample[:,None] & mask_child[None,:] & (c_ids > 0)))
-
-        offs_child += BLOCK_C
-        mask_child = offs_child < num_edges
-
-
-def sample_prod_layer(layer, nids, cids, node_samples, element_samples, ind_target, ind_target_sid, 
-                      ind_n, ind_b, ind_nids, ind_nid_offs, ind_mask, block_size, partition_id):
-    
-    num_samples = ind_n.size(0)
-    num_nblocks = nids.size(0)
-    num_edges = cids.size(1)
-    batch_size = node_samples.size(1)
-
-    BLOCK_C = min(1024, triton.next_power_of_2(num_edges))
-    BLOCK_S = min(1024 // BLOCK_C, max(triton.next_power_of_2(num_samples // 128), 1))
-
-    C_NUM_BLKS = triton.cdiv(num_edges, BLOCK_C)
-
-    grid = (triton.cdiv(num_samples, BLOCK_S),)
-
-    sample_prod_layer_kernel[grid](
-        nids, cids, node_samples, element_samples, ind_target, ind_target_sid, ind_n, ind_b, 
-        ind_nids, ind_nid_offs, ind_mask, partition_id, block_size, num_samples, 
-        num_nblocks, batch_size, num_edges, BLOCK_S, BLOCK_C, C_NUM_BLKS
-    )
-
-    return None
-
-
-def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bool = False, _sample_input_ns: bool = True,
+def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bool = False,
+           sum_external_params = None, _sample_input_ns: bool = True,
            _do_calibration: bool = False, **kwargs):
     """
     Draw samples from a PC by performing a top-down ancestral sampling pass.
@@ -351,6 +83,15 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
     :param conditional: whether to sample conditioned on the evidence cached by a preceding forward pass
     :type conditional: bool
 
+    :param sum_external_params: per-sample external sum parameters, laid out exactly as for
+                                :func:`TensorCircuit.forward` -- one entry per node (or per
+                                registered group). Required for a gated sum layer to be sampled
+                                under its gate; without it the layer is sampled from its shared
+                                parameters, which is what an ungated forward pass would also do.
+                                Under `conditional = True` the values are taken from the forward
+                                pass that produced `pc.node_mars`, so this only has to name the same
+                                nodes.
+
     :returns: a tensor of samples of size [num_samples, num_vars]
     :rtype: torch.Tensor
     """
@@ -361,6 +102,10 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
 
     root_ns = pc.root_ns
     assert root_ns._output_ind_range[1] - root_ns._output_ind_range[0] == 1, "It is ambiguous to sample from multi-head PCs."
+
+    # Per-sample external sum parameters, if any. Resolved before anything runs, so a mismatch with
+    # the forward pass is reported before half a pass has been drawn.
+    ext_kwargs = _resolve_external_params(pc, num_samples, conditional, sum_external_params)
 
     if hasattr(pc, "_num_nscopes") and hasattr(pc, "_num_escopes"):
         num_nscopes = pc._num_nscopes
@@ -411,22 +156,34 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
                 # Pre-compute the target indices in `element_samples`
                 # The sampled child node indices will be put into the indices presented in `ind_target`
                 ind_target = np.zeros([ind_n.size(0)], dtype = np.int64)
-                _assign_cids_ind_target(ind_target, element_pointers, ind_b.detach().cpu().numpy(), num_samples)
+                assign_cids_ind_target(ind_target, element_pointers, ind_b.detach().cpu().numpy(), num_samples)
                 ind_target = torch.from_numpy(ind_target).to(pc.device)
 
                 # In the case of conditional sampling, recompute to get the `element_mars`
                 if conditional:
                     pc.inner_layer_groups[layer_id-1](pc.node_mars, pc.element_mars)
 
+                # A layer whose parameters are modified per sample owns its own sampler, exactly as it
+                # owns its forward and its backward -- the shared-parameter kernel below would draw
+                # from a different distribution. It declines (returning `False`) when no external
+                # tensors were supplied for it, in which case it IS a plain sum layer.
+                handled = False
+                if isinstance(layer, ExternalParamsSumLayer):
+                    handled = layer.sample_layer(
+                        pc.node_mars, pc.element_mars, pc.params, node_samples, element_samples,
+                        ind_target, ind_n, ind_b, conditional = conditional, **ext_kwargs
+                    )
+
                 # Sample child indices
-                for partition_id in range(layer.num_fw_partitions):
-                    nids = layer.partitioned_nids[partition_id]
-                    cids = layer.partitioned_cids[partition_id]
-                    pids = layer.partitioned_pids[partition_id]
-                    
-                    sample_sum_layer(pc, layer, nids, cids, pids, pc.node_mars, pc.element_mars, pc.params, 
-                                     node_samples, element_samples, ind_target, ind_n, ind_b, 
-                                     layer.block_size, conditional, do_calibration = _do_calibration)
+                if not handled:
+                    for partition_id in range(layer.num_fw_partitions):
+                        nids = layer.partitioned_nids[partition_id]
+                        cids = layer.partitioned_cids[partition_id]
+                        pids = layer.partitioned_pids[partition_id]
+
+                        sample_sum_layer(pc, layer, nids, cids, pids, pc.node_mars, pc.element_mars, pc.params,
+                                         node_samples, element_samples, ind_target, ind_n, ind_b,
+                                         layer.block_size, conditional, do_calibration = _do_calibration)
 
                 # Clear completed nodes
                 node_samples[ind_n, ind_b] = -1
@@ -452,16 +209,16 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
                     nids = layer.partitioned_nids[partition_id]
                     cids = layer.partitioned_cids[partition_id]
 
-                    count_prod_nch(layer, nids, cids, element_samples, ind_ch_count, ind_nids, 
+                    count_prod_nch(layer, nids, cids, element_samples, ind_ch_count, ind_nids,
                                    ind_nid_offs, ind_mask, ind_n, ind_b, layer.block_size, partition_id)
 
                 # Pre-compute the target indices in `node_samples`
                 ind_target_sid = np.zeros([ind_n.size(0)], dtype = np.int64)
                 ind_target_sid[1:] = ind_ch_count[:-1].cumsum(dim = 0).detach().cpu().numpy()
                 ind_target = np.zeros([ind_ch_count.sum()], dtype = np.int64)
-                _assign_nids_ind_target(ind_target, ind_target_sid, 
-                                        node_pointers.detach().cpu().numpy(),
-                                        ind_b.detach().cpu().numpy(), num_samples)
+                assign_nids_ind_target(ind_target, ind_target_sid,
+                                       node_pointers.detach().cpu().numpy(),
+                                       ind_b.detach().cpu().numpy(), num_samples)
                 ind_target_sid = torch.from_numpy(ind_target_sid).to(pc.device)
                 ind_target = torch.from_numpy(ind_target).to(pc.device)
 
@@ -470,7 +227,7 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
                     nids = layer.partitioned_nids[partition_id]
                     cids = layer.partitioned_cids[partition_id]
 
-                    sample_prod_layer(layer, nids, cids, node_samples, element_samples, ind_target, ind_target_sid, 
+                    sample_prod_layer(layer, nids, cids, node_samples, element_samples, ind_target, ind_target_sid,
                                       ind_n, ind_b, ind_nids, ind_nid_offs, ind_mask, layer.block_size, partition_id)
 
     # Create tensor for the samples

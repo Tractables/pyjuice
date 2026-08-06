@@ -1524,6 +1524,35 @@ class BlockScaleSumParams(ExternalSumParams):
 
         return None
 
+    # ------------------------------------------------------------------ sampling
+
+    def sample_layer(self, layer, ns_tensors, node_mars, element_mars, params, node_samples,
+                     element_samples, ind_target, ind_n, ind_b, conditional: bool = False,
+                     **kwargs) -> None:
+        """
+        Draw one child per selected node, in proportion to the GATED parameters.
+
+        The gate reweights the gate-level mixture weights per sample, so the child of `n` is drawn
+        from
+
+        .. code-block:: text
+
+            P(c | n, b)  propto  phi[b, g(n,c)] * theta_shared[n, c]                 (unconditional)
+            P(c | n, b)  propto  phi[b, g(n,c)] * theta_shared[n, c] * exp(element_mars[c, b])
+
+        `Z_b[n]` divides both and so cancels: the draw needs no normalizer from the forward pass, and
+        in particular none of the cached `log Z` -- which is why this path shares no state with
+        :func:`forward_layer` and works for an unconditional draw, where no forward pass has run at
+        all.
+
+        The weights are still normalized, just locally: `phi` is a log gate with unbounded values (a
+        router's logits), so `sum_c` has to be accumulated with a running max exactly as the forward
+        does, and the inverse-CDF walk then runs against that sum.
+        """
+        raise NotImplementedError(
+            "`BlockScaleSumParams` sampling is not implemented yet."
+        )
+
     def _logz_tile(self, layer, launch, grad_ext, batch, block_size, n_gates, rows):
         """
         `(GATE_TILE, BLOCK_B)` for the log-Z gradient kernel, chosen by MEASUREMENT and cached.
