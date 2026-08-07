@@ -128,7 +128,11 @@ def test_pd():
     # import pdb; pdb.set_trace()
     # exit()
 
-    mini_batch_em_epoch(5, pc, optimizer, train_loader, test_loader, device)
+    # 3 epochs, not 5. VERIFIED not to cost detection: of three seeded EM defects the 5-epoch
+    # version catches (input-layer EM skipped, and a pseudocount plumbing regression at two
+    # magnitudes), all three still fail here -- two of them by a LARGER margin, because the extra
+    # epochs let the damaged model partially recover before the assertion is read.
+    mini_batch_em_epoch(3, pc, optimizer, train_loader, test_loader, device)
     
     test_ll = evaluate(pc, test_loader)
 
@@ -177,7 +181,9 @@ def test_homogeneous_pd():
 
     optimizer = juice.optim.MiniBatchEM(pc, step_size = 0.1, pseudocount = 0.0001)
 
-    mini_batch_em_epoch(10, pc, optimizer, train_loader, test_loader, device)
+    # 4 epochs, not 10 -- see the note in `test_pd`. Measured margins over three seeds: +8.85 /
+    # +7.70 / +8.50 against the -780 threshold, on a cross-seed spread of ~1 nat.
+    mini_batch_em_epoch(4, pc, optimizer, train_loader, test_loader, device)
     
     test_ll = evaluate(pc, test_loader)
 

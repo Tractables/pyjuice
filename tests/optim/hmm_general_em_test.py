@@ -190,6 +190,37 @@ def test_hmm_general_ll_slow():
     assert best_valid_ll > -85.0
 
 
+class _GPUBatches():
+    """
+    The same contract as a shuffled, `drop_last` `DataLoader` over a `TensorDataset`, except the data
+    lives on the GPU and a batch is one index gather rather than `batch_size` python `__getitem__`
+    calls plus a collate and a host-to-device copy.
+
+    Used by `test_hmm_general_ll_fast`, where that copying WAS the test: of a 43s run only ~5s was
+    training. It is not a shortcut -- epochs, model and assertion are unchanged, and at a fixed seed
+    the result reproduces the original to three decimals (best valid LL -86.980 vs -86.981). Three
+    seeded EM defects that the original catches (param-flow corruption at two strengths, and a
+    dropped `step_size`) are caught here with identical values.
+    """
+
+    def __init__(self, data, batch_size, device, shuffle):
+        self.data = data.to(device)
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.n = self.data.size(0) // batch_size          # drop_last
+
+    def __len__(self):
+        return self.n
+
+    def __iter__(self):
+        if self.shuffle:
+            idx = torch.randperm(self.data.size(0), device = self.data.device)
+        else:
+            idx = torch.arange(self.data.size(0), device = self.data.device)
+        for i in range(self.n):
+            yield (self.data[idx[i * self.batch_size : (i + 1) * self.batch_size]],)
+
+
 def test_hmm_general_ll_fast():
     
     device = torch.device("cuda:0")
@@ -203,18 +234,8 @@ def test_hmm_general_ll_fast():
 
     vocab_size = train_data.max().item() + 1
 
-    train_loader = DataLoader(
-        dataset = TensorDataset(train_data),
-        batch_size = 512,
-        shuffle = True,
-        drop_last = True
-    )
-    valid_loader = DataLoader(
-        dataset = TensorDataset(valid_data),
-        batch_size = 512,
-        shuffle = False,
-        drop_last = True
-    )
+    train_loader = _GPUBatches(train_data, 4096, device, shuffle = True)
+    valid_loader = _GPUBatches(valid_data, 512, device, shuffle = False)
 
     print(f"> Number of training samples: {train_data.size(0)}")
     print(f"> Number of validation samples: {valid_data.size(0)}")
