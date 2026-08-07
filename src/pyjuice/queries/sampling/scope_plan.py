@@ -150,9 +150,22 @@ def build_scope_plan(pc) -> ScopePlan:
         for layer in layer_group:
             rows = []
             for scope in layer.scopes:
-                elem_row_of_scope[_scope_key(scope)] = cursor
-                rows.append(cursor)
-                cursor += 1
+                key = _scope_key(scope)
+                # ONE row per scope for the whole GROUP, not per (layer, scope). Several product
+                # layers of a group can own the same scope -- an ordinary mixture of two sub-circuits
+                # with different block sizes puts them in different layers -- and the sum layer above
+                # has a single destination for that scope. Giving each layer its own row made
+                # `sum_erows` point at one of them while the other layer's kernel scanned the other,
+                # so that branch's elements were written and never read: samples silently came back
+                # with variables missing (zero-filled), 2915 of 4096 on a 12-variable mixture.
+                #
+                # Sharing is safe because the layers read the row through their own `nids`: an element
+                # belonging to the other layer matches nothing and is masked off, which is the same
+                # mechanism that already lets one layer's partitions share a row.
+                if key not in elem_row_of_scope:
+                    elem_row_of_scope[key] = cursor
+                    cursor += 1
+                rows.append(elem_row_of_scope[key])
             plan.prod_rows[id(layer)] = torch.tensor(rows, dtype = torch.long)
 
             # Each child slot writes to the row of ITS OWN scope

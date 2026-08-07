@@ -30,7 +30,7 @@ def _scoped_sum_kernel(nids, cids, pids, node_mars, element_mars, mparams,
                        block_size: tl.constexpr, num_edges: tl.constexpr,
                        num_nblocks: tl.constexpr, BLOCK_B: tl.constexpr, BLOCK_M: tl.constexpr,
                        M_NUM_TILES: tl.constexpr, BLOCK_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
-                       CONDITIONAL: tl.constexpr):
+                       CONDITIONAL: tl.constexpr, DO_CALIBRATION: tl.constexpr):
     """One program per (frontier row, tile of samples). Draws a child for every live sample of a row."""
     pid_r = tl.program_id(0)
     pid_b = tl.program_id(1)
@@ -73,6 +73,37 @@ def _scoped_sum_kernel(nids, cids, pids, node_mars, element_mars, mparams,
 
     if CONDITIONAL:
         nmars = tl.load(node_mars + node_id * batch_size + offs_b, mask = mask_lane, other = 0.0)
+
+    # ---- the normalizer, when the edge weights are not known to sum to one
+    #
+    # The walk below compares `rnd_val` drawn on `[0, 1)` against a running cumsum, which is only a
+    # draw from the right distribution if the weights total one. They do for a circuit built the
+    # usual way, and for any conditional pass (`theta * exp(emars - nmars)` sums to one by the
+    # definition of `nmars`), so this costs a second trip through the gathers and is opt-in. Where
+    # the totals are NOT one, skipping it biases the draw toward the early edges and sends the tail
+    # into the `last_edge` fallback.
+    if DO_CALIBRATION:
+        sum_pars = tl.zeros([BLOCK_B], dtype = tl.float32)
+        offs_cal = tl.arange(0, BLOCK_K)
+        mask_cal = offs_cal < num_edges
+        for i in range(K_NUM_TILES):
+            m1 = mask_lane[None,:] & mask_cal[:,None]
+
+            cal_par_id = tl.load(pids + local_nids[None,:] * num_edges + offs_cal[:,None], mask = m1, other = 0)
+            cal_pars = tl.load(mparams + cal_par_id + local_nid_offs[None,:], mask = m1, other = 0.0)
+
+            if CONDITIONAL:
+                cal_ch_id = tl.load(cids + local_nids[None,:] * num_edges + offs_cal[:,None], mask = m1, other = 0)
+                cal_mars = tl.load(element_mars + cal_ch_id * batch_size + offs_b[None,:], mask = m1, other = 0.0)
+                cal_pars = cal_pars * tl.exp(cal_mars - nmars[None,:])
+
+            sum_pars += tl.sum(cal_pars, axis = 0)
+
+            offs_cal += BLOCK_K
+            mask_cal = offs_cal < num_edges
+
+        # The epsilon keeps `rnd_val == sum_pars` from walking off the end when the two agree exactly
+        rnd_val = rnd_val * sum_pars - 1e-12
 
     # ---- inverse-CDF walk over the edges
     chids = tl.zeros([BLOCK_B], dtype = tl.int64) - 1
@@ -171,7 +202,8 @@ def _scoped_prod_kernel(nids, cids, crows, node_samples, element_samples, rows, 
 
 
 def scoped_sum_layer(layer, nids, cids, pids, node_mars, element_mars, params,
-                     node_samples, element_samples, rows, erows, seed_ptr, conditional):
+                     node_samples, element_samples, rows, erows, seed_ptr, conditional,
+                     do_calibration = False):
     num_rows = rows.numel()
     if num_rows == 0:
         return None
@@ -189,7 +221,7 @@ def scoped_sum_layer(layer, nids, cids, pids, node_mars, element_mars, params,
         rows, erows, seed_ptr, batch_size,
         layer.block_size, num_edges, num_nblocks, BLOCK_B, BLOCK_M,
         triton.cdiv(num_nblocks, BLOCK_M), BLOCK_K, triton.cdiv(num_edges, BLOCK_K),
-        1 if conditional else 0,
+        1 if conditional else 0, 1 if do_calibration else 0,
     )
     return None
 

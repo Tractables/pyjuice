@@ -40,7 +40,8 @@ class _PlanTape():
            it, not the kernel.
     """
 
-    __slots__ = ("steps", "cursor", "replaying", "scratch", "graph", "uniforms", "_frontier")
+    __slots__ = ("steps", "cursor", "replaying", "scratch", "graph", "bindings", "uniforms",
+                 "_frontier")
 
     def __init__(self, replaying: bool = False):
         self.steps = []
@@ -48,6 +49,8 @@ class _PlanTape():
         self.replaying = replaying
         # Set only on the opt-in CUDA-graph path; see `sample(use_cudagraph = True)`
         self.graph = None
+        # The device pointers `graph` was captured with; see `_graph_bindings`
+        self.bindings = None
         self.uniforms = None
         self._frontier = None
         # Buffers the pass would otherwise reallocate per layer per call. Keyed by name, and by
@@ -149,12 +152,65 @@ def _assert_graphable(pc, do_calibration, requires_sd: bool) -> None:
         )
 
 
+def _drop_caches_if_moved(pc: TensorCircuit) -> None:
+    """
+    Discard everything the sampler caches on the circuit when the circuit has changed device.
+
+    All three caches hold DEVICE TENSORS -- the scope plan's row tables, the persistent frontier
+    buffers, the recorded index plans -- and none of them is consulted for where it lives. After a
+    `pc.to(other_device)` they would be handed to kernels launched against the new one, which is a
+    hard failure at best and reads another device's memory through peer access at worst.
+
+    Cheap to get right and cheap to check: one comparison per call, and a rebuild only when the
+    circuit actually moved.
+    """
+    device = pc.device
+    if pc.__dict__.get("_sample_cache_device") == device:
+        return
+
+    pc.__dict__["_sample_cache_device"] = device
+    for name in ("_sample_scope_plan", "_sample_scoped_states", "_sample_plans"):
+        pc.__dict__.pop(name, None)
+
+
 def _scope_plan(pc: TensorCircuit):
     """The circuit's frontier layout, derived once and cached on it."""
     plan = pc.__dict__.get("_sample_scope_plan")
     if plan is None:
         plan = pc.__dict__["_sample_scope_plan"] = build_scope_plan(pc).to(pc.device)
     return plan
+
+
+def _graph_bindings(pc, conditional: bool):
+    """
+    Everything about the circuit that a captured pass BAKES IN, as a comparable signature.
+
+    A CUDA graph records the device addresses its kernels were launched with. The buffers this pass
+    reads from the circuit -- `node_mars`, `element_mars`, the external-parameter staging buffer --
+    are all `_init_buffer`-backed, so a forward pass at a different batch size REALLOCATES them and a
+    graph captured beforehand goes on reading memory the allocator has since given to somebody else.
+
+    That fails silently. The draw is merely wrong, by however much the recycled pages happen to
+    differ from what was there at capture, so it can look fine on one run and not the next; MEASURED
+    on a conditional draw whose evidence had changed, the replay came back 10.5 sigma from the live
+    answer with `node_mars` sitting at a different address. Interleaving two batch sizes on one
+    circuit is an ordinary thing for a decode loop to do, which is how this is reached.
+
+    The staged external parameters are in the signature by IDENTITY, not just by address: a pass
+    captured with no gates has no gate kernels in it at all, so replaying it for a gated draw would
+    drop the gate entirely rather than read it from the wrong place.
+
+    :returns: a hashable signature; when it changes, the graph has to be recaptured.
+    """
+    staged = getattr(pc, "_staged_external_params", None) or {}
+    external = tuple(sorted(
+        (id(ns), tuple(t.data_ptr() for t in tensors))
+        for ns, tensors in staged.items()
+    ))
+
+    return (pc.node_mars.data_ptr() if pc.node_mars is not None else 0,
+            pc.element_mars.data_ptr() if pc.element_mars is not None else 0,
+            pc.params.data_ptr(), bool(conditional), external)
 
 
 def _scoped_state(pc, plan, num_samples: int, conditional: bool, persistent: bool):
@@ -170,7 +226,7 @@ def _scoped_state(pc, plan, num_samples: int, conditional: bool, persistent: boo
                                  device = pc.device),
              "elem": torch.empty([plan.num_elem_rows, num_samples], dtype = torch.long,
                                  device = pc.device),
-             "seed": seed, "graph": None}
+             "seed": seed, "graph": None, "bindings": None}
     if not persistent:
         return fresh
 
@@ -186,7 +242,8 @@ def _scoped_state(pc, plan, num_samples: int, conditional: bool, persistent: boo
     return state
 
 
-def _scoped_top_down(pc, plan, node_samples, element_samples, seed_ptr, conditional, kwargs):
+def _scoped_top_down(pc, plan, node_samples, element_samples, seed_ptr, conditional, kwargs,
+                     do_calibration = False):
     """
     The top-down pass over a STRUCTURAL frontier layout.
 
@@ -226,7 +283,8 @@ def _scoped_top_down(pc, plan, node_samples, element_samples, seed_ptr, conditio
                             layer.partitioned_cids[partition_id],
                             layer.partitioned_pids[partition_id],
                             pc.node_mars, pc.element_mars, pc.params,
-                            node_samples, element_samples, rows, erows, seed_ptr, conditional
+                            node_samples, element_samples, rows, erows, seed_ptr, conditional,
+                            do_calibration
                         )
 
                 # Cleared here rather than inside the kernel: a row may be served by any partition,
@@ -308,6 +366,8 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
     # others impossible rather than merely discouraged.
     #
     # Both are no-ops when no external parameters were supplied, so an ordinary PC pays nothing.
+    _drop_caches_if_moved(pc)
+
     pc._check_external_params_kwargs(kwargs)
     if conditional:
         pc._resolve_backward_external_params(kwargs)
@@ -509,28 +569,46 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
         seed_ptr.fill_(random.randint(0, 2**31 - 1))
 
         if not use_cudagraph:
-            _scoped_top_down(pc, plan, node_samples, element_samples, seed_ptr, conditional, kwargs)
+            _scoped_top_down(pc, plan, node_samples, element_samples, seed_ptr, conditional, kwargs,
+                             _do_calibration)
         else:
-            if state["graph"] is None:
+            # A graph is only replayable while the buffers it baked in are still where they were.
+            # Recapture rather than refuse: whether they moved is a consequence of what the CALLER
+            # did with the circuit in between (a forward at another batch size), which is not
+            # something they should have to track to keep a draw correct.
+            bindings = _graph_bindings(pc, conditional)
+            if state["graph"] is None or state["bindings"] != bindings:
+                state["graph"] = None                       # release the old pool before capturing
+
                 # One live pass so every buffer exists and every kernel is compiled -- capture
                 # tolerates neither an allocation nor a JIT compile -- then capture on a side stream.
-                _scoped_top_down(pc, plan, node_samples, element_samples, seed_ptr, conditional, kwargs)
+                _scoped_top_down(pc, plan, node_samples, element_samples, seed_ptr, conditional, kwargs,
+                             _do_calibration)
                 stream = torch.cuda.Stream()
                 stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(stream):
                     _scoped_top_down(pc, plan, node_samples, element_samples, seed_ptr,
-                                     conditional, kwargs)
+                                     conditional, kwargs, _do_calibration)
                 torch.cuda.current_stream().wait_stream(stream)
 
-                graph = state["graph"] = torch.cuda.CUDAGraph()
+                graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
                     _scoped_top_down(pc, plan, node_samples, element_samples, seed_ptr,
-                                     conditional, kwargs)
+                                     conditional, kwargs, _do_calibration)
+
+                # Recorded only after a capture that completed: a half-captured graph must not be
+                # taken for a valid one on the next call.
+                state["graph"], state["bindings"] = graph, bindings
             state["graph"].replay()
     elif not use_cudagraph:
         _top_down_pass()
     else:
         graph = tape.graph
+        bindings = _graph_bindings(pc, conditional)
+        if graph is not None and tape.bindings != bindings:
+            # The buffers this graph baked in have moved -- see `_graph_bindings`. Recapture rather
+            # than replay against memory the allocator has handed to somebody else.
+            graph = tape.graph = None
         if graph is None:
             # Two live passes before capturing: the first records the index plan, the second runs the
             # replay path so that every buffer and every Triton kernel it needs already exists --
@@ -552,6 +630,7 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
             torch.cuda.current_stream().wait_stream(stream)
             with torch.cuda.graph(graph):
                 _top_down_pass()
+            tape.bindings = bindings
 
         # A captured launch holds the scalar arguments it was recorded with, so the draw cannot come
         # from a seed inside the kernels -- it comes from this buffer, refilled outside the graph.
