@@ -21,10 +21,12 @@ import triton.language as tl
 
 @triton.jit
 def sample_sum_layer_kernel(nids, cids, pids, node_mars, element_mars, mparams, node_samples, element_samples,
-                            ind_target, ind_n, ind_b, seed, block_size: tl.constexpr, batch_size: tl.constexpr,
+                            ind_target, ind_n, ind_b, seed, rnd, rnd_offset,
+                            block_size: tl.constexpr, batch_size: tl.constexpr,
                             num_edges: tl.constexpr, num_samples, num_nblocks: tl.constexpr, BLOCK_S: tl.constexpr,
                             BLOCK_M: tl.constexpr, M_NUM_BLKS: tl.constexpr, BLOCK_K: tl.constexpr, K_NUM_BLKS: tl.constexpr,
-                            conditional: tl.constexpr, do_calibration: tl.constexpr):
+                            conditional: tl.constexpr, do_calibration: tl.constexpr,
+                            RND_BUF: tl.constexpr = 0):
 
     pid_s = tl.program_id(0) # ID of size-`BLOCK_S` batches
 
@@ -62,8 +64,17 @@ def sample_sum_layer_kernel(nids, cids, pids, node_mars, element_mars, mparams, 
     # Update sample mask to filter out inactive ones
     mask_sample = mask_sample & (local_nids >= 0)
 
-    # Sample random probabilities uniform between 0 and 1
-    rnd_val = tl.rand(seed, offs_sample)
+    # Sample random probabilities uniform between 0 and 1.
+    #
+    # From a BUFFER when one is supplied, rather than from `tl.rand(seed, ...)`. A seed is a scalar
+    # kernel argument, and CUDA-graph capture bakes scalar arguments into the graph -- every replay
+    # would then redraw the identical sample. Filling the buffer outside the graph keeps the draw
+    # fresh while the captured launches stay byte-identical. `rnd_offset` gives each launch its own
+    # slice, so layers do not share a stream.
+    if RND_BUF:
+        rnd_val = tl.load(rnd + rnd_offset + offs_sample, mask = mask_sample, other = 0.0)
+    else:
+        rnd_val = tl.rand(seed, offs_sample)
 
     if conditional:
         nmars = tl.load(node_mars + node_id * batch_size + batch_id, mask = mask_sample, other = 0.0) # [Block_B]
@@ -130,13 +141,17 @@ def sample_sum_layer_kernel(nids, cids, pids, node_mars, element_mars, mparams, 
 
 
 def sample_sum_layer(pc, layer, nids, cids, pids, node_mars, element_mars, params, node_samples, element_samples,
-                     ind_target, ind_n, ind_b, block_size, conditional, do_calibration = False):
+                     ind_target, ind_n, ind_b, block_size, conditional, do_calibration = False,
+                     rnd = None, rnd_offset = 0):
 
     num_samples = ind_n.size(0)
     num_nblocks = nids.size(0)
     num_edges = cids.size(1)
     batch_size = node_samples.size(1)
-    seed = random.randint(0, 2**31)
+    # A CONSTANT seed when the uniforms come from a buffer -- the kernel ignores it then, and Triton
+    # specializes integer arguments on 16-divisibility, so a varying one produces two kernel variants
+    # and a fresh compile can land inside a CUDA-graph capture and invalidate it.
+    seed = 0 if rnd is not None else random.randint(0, 2**31)
 
     # EVERY tile dimension is floored at 2. Triton's `TritonGPURemoveLayoutConversions` pass fails to
     # compile these kernels whenever a tile has a size-1 dimension that takes part in a reduction --
@@ -157,8 +172,10 @@ def sample_sum_layer(pc, layer, nids, cids, pids, node_mars, element_mars, param
 
     sample_sum_layer_kernel[grid](
         nids, cids, pids, node_mars, element_mars, params, node_samples, element_samples,
-        ind_target, ind_n, ind_b, seed, block_size, batch_size, num_edges, num_samples, num_nblocks,
-        BLOCK_S, BLOCK_M, M_NUM_BLKS, BLOCK_K, K_NUM_BLKS, conditional, do_calibration
+        ind_target, ind_n, ind_b, seed, rnd if rnd is not None else ind_n, rnd_offset,
+        block_size, batch_size, num_edges, num_samples, num_nblocks,
+        BLOCK_S, BLOCK_M, M_NUM_BLKS, BLOCK_K, K_NUM_BLKS, conditional, do_calibration,
+        1 if rnd is not None else 0
     )
 
     return None

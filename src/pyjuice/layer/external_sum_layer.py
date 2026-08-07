@@ -620,7 +620,8 @@ class ExternalParamsSumLayer(SumLayer):
     def sample_layer(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor,
                      node_samples: torch.Tensor, element_samples: torch.Tensor,
                      ind_target: torch.Tensor, ind_n: torch.Tensor, ind_b: torch.Tensor,
-                     conditional: bool = False, **kwargs) -> bool:
+                     conditional: bool = False, rnd = None, rnd_offset = 0,
+                     **kwargs) -> bool:
         """
         Draw one child for every node of this layer the ancestral sampler has selected.
 
@@ -657,7 +658,8 @@ class ExternalParamsSumLayer(SumLayer):
 
         self.external_params.sample_layer(
             self, ns_tensors, node_mars, element_mars, params, node_samples, element_samples,
-            ind_target, ind_n, ind_b, conditional = conditional, **kwargs
+            ind_target, ind_n, ind_b, conditional = conditional,
+            rnd = rnd, rnd_offset = rnd_offset, **kwargs
         )
 
         return True

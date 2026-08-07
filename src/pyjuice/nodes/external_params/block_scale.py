@@ -1536,7 +1536,7 @@ class BlockScaleSumParams(ExternalSumParams):
 
     def sample_layer(self, layer, ns_tensors, node_mars, element_mars, params, node_samples,
                      element_samples, ind_target, ind_n, ind_b, conditional: bool = False,
-                     **kwargs) -> None:
+                     rnd = None, rnd_offset = 0, **kwargs) -> None:
         """
         Draw one child per selected node, in proportion to the GATED parameters.
 
@@ -1615,7 +1615,7 @@ class BlockScaleSumParams(ExternalSumParams):
                 nids, cids, pids, element_mars, params, external_params,
                 layer.ext_slots[0][partition_id], nstride,
                 node_samples, element_samples, ind_target, ind_n, ind_b,
-                random.randint(0, 2**31),
+                0 if rnd is not None else random.randint(0, 2**31), rnd, rnd_offset,
                 block_size = block_size, node_cbs = node_cbs, gate_cbs = gate_cbs,
                 gate_bs = gate_bs, ext_base = ext_base, conditional = conditional,
             )

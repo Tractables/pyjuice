@@ -281,7 +281,7 @@ class ExternalSumParams():
 
     def sample_layer(self, layer, ns_tensors, node_mars, element_mars, params, node_samples,
                      element_samples, ind_target, ind_n, ind_b, conditional: bool = False,
-                     **kwargs) -> None:
+                     rnd = None, rnd_offset = 0, **kwargs) -> None:
         """
         Draw one child per selected node of this layer, under the EFFECTIVE parameters.
 

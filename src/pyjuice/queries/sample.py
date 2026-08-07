@@ -38,12 +38,16 @@ class _PlanTape():
            it, not the kernel.
     """
 
-    __slots__ = ("steps", "cursor", "replaying", "scratch")
+    __slots__ = ("steps", "cursor", "replaying", "scratch", "graph", "uniforms", "_frontier")
 
     def __init__(self, replaying: bool = False):
         self.steps = []
         self.cursor = 0
         self.replaying = replaying
+        # Set only on the opt-in CUDA-graph path; see `sample(use_cudagraph = True)`
+        self.graph = None
+        self.uniforms = None
+        self._frontier = None
         # Buffers the pass would otherwise reallocate per layer per call. Keyed by name, and by
         # length where the shape varies with the layer.
         self.scratch = {"compact": None}
@@ -65,6 +69,20 @@ class _PlanTape():
         value = compute()
         self.steps.append(value)
         return value
+
+    def frontier(self, num_nscopes, num_escopes, num_samples, device):
+        """
+        The `node_samples` / `element_samples` buffers, held across calls.
+
+        A captured launch keeps the pointers it was recorded with, so the graph path needs these at
+        fixed addresses. Everything else allocates them per call and lets them go.
+        """
+        if self._frontier is None:
+            self._frontier = (
+                torch.zeros([num_nscopes, num_samples], dtype = torch.long, device = device),
+                torch.zeros([num_escopes, num_samples], dtype = torch.long, device = device),
+            )
+        return self._frontier
 
     def buffers(self, key, n, device, count = 1):
         """`count` zeroed `[n]` int64 scratch tensors under `key`, allocated once and reused."""
@@ -109,8 +127,22 @@ def _plan_tape(pc: TensorCircuit, num_samples: int, conditional: bool) -> _PlanT
     return tape
 
 
+def _assert_graphable(pc, tape, do_calibration) -> None:
+    """Refuse a CUDA-graph capture that would be wrong, rather than capturing it."""
+    assert torch.cuda.is_available(), "`use_cudagraph` needs a CUDA device."
+    assert not do_calibration, "`use_cudagraph` is not supported together with `_do_calibration`."
+    assert getattr(pc, "is_structured_decomposable", False), (
+        "`use_cudagraph = True` needs a structured-decomposable circuit. Without one vtree a sum "
+        "node can choose between products that decompose its scope differently, so how many nodes "
+        "land on the frontier depends on the draw -- the index plan changes call to call and a "
+        "captured pass would replay the wrong one. `pc.is_structured_decomposable` says which you "
+        "have; `PD`-style circuits do not qualify."
+    )
+
+
 def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bool = False,
-           _sample_input_ns: bool = True, _do_calibration: bool = False, **kwargs):
+           use_cudagraph: bool = False, _sample_input_ns: bool = True,
+           _do_calibration: bool = False, **kwargs):
     """
     Draw samples from a PC by performing a top-down ancestral sampling pass.
 
@@ -140,6 +172,14 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
     it too. Under `conditional = True` they are instead taken from the forward pass that produced
     `pc.node_mars` -- `element_mars` was built under those gates, so the draw has to use them -- and
     passing them here only has to name the same nodes.
+
+    :param use_cudagraph: capture the top-down pass into a CUDA graph and replay it. OPT-IN, because
+                          a graph owns a private memory pool and the frontier buffers it was captured
+                          with, held for the circuit's lifetime -- worth it for a sampling loop, not
+                          for a one-off draw. Needs `pc.is_structured_decomposable` (the index plan
+                          must repeat, or a replay is simply wrong) and is refused otherwise. One
+                          graph is kept per `(num_samples, conditional)`, bounded with the plans.
+    :type use_cudagraph: bool
 
     :returns: a tensor of samples of size [num_samples, num_vars]
     :rtype: torch.Tensor
@@ -189,17 +229,6 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
         pc._num_nscopes = num_nscopes
         pc._num_escopes = num_escopes
 
-    # Stores selected node indices by the sampler
-    node_samples = torch.zeros([num_nscopes, num_samples], dtype = torch.long, device = pc.device)
-    # Stores selected element indices by the sampler
-    element_samples = torch.zeros([num_escopes, num_samples], dtype = torch.long, device = pc.device)
-    # Pointers indicating how many elements are used in each column of `element_samples`
-    element_pointers = np.zeros([num_samples], dtype = np.int64)
-
-    # Initialize pointers to the root node
-    node_samples[:,:] = -1
-    node_samples[0,:] = root_ns._output_ind_range[0]
-
     # The index plan repeats across calls exactly when the circuit respects one vtree (see
     # `_PlanTape`), so it is recorded on the first pass at a given shape and replayed afterwards.
     # `_do_calibration` is excluded only because it is a debugging switch not worth a second cache.
@@ -208,115 +237,190 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
         tape.scratch["compact"] = torch.empty([num_nscopes + 1, num_samples], dtype = torch.long,
                                               device = pc.device)
 
-    # Iterate (backward) through layers
-    for layer_id in range(len(pc.inner_layer_groups)-1, -1, -1):
-        layer_group = pc.inner_layer_groups[layer_id]
-        if layer_group.is_sum():
-            # Initialize `element_samples` and `element_pointers`
-            element_samples[:,:] = -1
-            element_pointers[:] = 0
+    if use_cudagraph:
+        _assert_graphable(pc, tape, _do_calibration)
 
-            # Iterate over sum layers in the current layer group
-            for layer in layer_group:
+    # Under CUDA-graph capture the frontier buffers have to live at fixed addresses across calls,
+    # since a captured launch holds the pointers it was recorded with. Elsewhere they are per-call,
+    # which keeps an ordinary `sample()` from holding memory after it returns.
+    if use_cudagraph:
+        node_samples, element_samples = tape.frontier(num_nscopes, num_escopes, num_samples, pc.device)
+    else:
+        node_samples = torch.zeros([num_nscopes, num_samples], dtype = torch.long, device = pc.device)
+        element_samples = torch.zeros([num_escopes, num_samples], dtype = torch.long, device = pc.device)
 
-                # Gather the indices to be processed, and pre-compute the target indices in
-                # `element_samples` -- the sampled child node indices are put where `ind_target` says
-                def _sum_indices(layer = layer):
-                    lsid, leid = layer._layer_nid_range
-                    ind_n, ind_b = torch.where((node_samples >= lsid) & (node_samples < leid))
+    # Pointers indicating how many elements are used in each column of `element_samples`
+    element_pointers = np.zeros([num_samples], dtype = np.int64)
 
-                    ind_target = np.zeros([ind_n.size(0)], dtype = np.int64)
-                    assign_cids_ind_target(ind_target, element_pointers,
-                                           ind_b.detach().cpu().numpy(), num_samples)
-                    return ind_n, ind_b, torch.from_numpy(ind_target).to(pc.device)
+    # Uniforms for the sum layers' inverse-CDF draws. Only the graph path uses a buffer -- see the
+    # note in `sample_sum_layer_kernel` -- so an ordinary call keeps drawing inside the kernel and is
+    # bit-for-bit what it was.
+    rnd_buf, rnd_cursor = (tape.uniforms, 0) if use_cudagraph else (None, 0)
 
-                ind_n, ind_b, ind_target = tape.step(_sum_indices)
+    def _top_down_pass():
+        nonlocal rnd_cursor
+        rnd_cursor = 0
 
-                # In the case of conditional sampling, recompute to get the `element_mars`
-                if conditional:
-                    pc.inner_layer_groups[layer_id-1](pc.node_mars, pc.element_mars)
+        # Initialize pointers to the root node. Inside the pass, so that a captured graph resets the
+        # frontier itself rather than depending on the caller having done it.
+        node_samples[:,:] = -1
+        node_samples[0,:] = root_ns._output_ind_range[0]
 
-                # A layer whose parameters are modified per sample owns its own sampler, exactly as it
-                # owns its forward and its backward -- the shared-parameter kernel below would draw
-                # from a different distribution. It declines (returning `False`) when no external
-                # tensors were supplied for it, in which case it IS a plain sum layer.
-                handled = False
-                if isinstance(layer, ExternalParamsSumLayer):
-                    handled = layer.sample_layer(
-                        pc.node_mars, pc.element_mars, pc.params, node_samples, element_samples,
-                        ind_target, ind_n, ind_b, conditional = conditional, **kwargs
-                    )
+        # Iterate (backward) through layers
+        for layer_id in range(len(pc.inner_layer_groups)-1, -1, -1):
+            layer_group = pc.inner_layer_groups[layer_id]
+            if layer_group.is_sum():
+                # Initialize `element_samples` and `element_pointers`
+                element_samples[:,:] = -1
+                element_pointers[:] = 0
 
-                # Sample child indices
-                if not handled:
+                # Iterate over sum layers in the current layer group
+                for layer in layer_group:
+
+                    # Gather the indices to be processed, and pre-compute the target indices in
+                    # `element_samples` -- the sampled child node indices are put where `ind_target` says
+                    def _sum_indices(layer = layer):
+                        lsid, leid = layer._layer_nid_range
+                        ind_n, ind_b = torch.where((node_samples >= lsid) & (node_samples < leid))
+
+                        ind_target = np.zeros([ind_n.size(0)], dtype = np.int64)
+                        assign_cids_ind_target(ind_target, element_pointers,
+                                               ind_b.detach().cpu().numpy(), num_samples)
+                        # Flat positions of this layer's frontier entries, for the clear below.
+                        # Part of the plan because it is derived from indices that are.
+                        clear_at = (ind_n * num_samples + ind_b).contiguous()
+                        return ind_n, ind_b, torch.from_numpy(ind_target).to(pc.device), clear_at
+
+                    ind_n, ind_b, ind_target, clear_at = tape.step(_sum_indices)
+
+                    # This layer's slice of the uniforms buffer (graph path only). Every partition of
+                    # the layer shares it: a lane belongs to exactly one partition, so each uniform is
+                    # consumed once.
+                    rnd_offset, rnd_cursor = rnd_cursor, rnd_cursor + ind_n.size(0)
+
+                    # In the case of conditional sampling, recompute to get the `element_mars`
+                    if conditional:
+                        pc.inner_layer_groups[layer_id-1](pc.node_mars, pc.element_mars)
+
+                    # A layer whose parameters are modified per sample owns its own sampler, exactly as it
+                    # owns its forward and its backward -- the shared-parameter kernel below would draw
+                    # from a different distribution. It declines (returning `False`) when no external
+                    # tensors were supplied for it, in which case it IS a plain sum layer.
+                    handled = False
+                    if isinstance(layer, ExternalParamsSumLayer):
+                        handled = layer.sample_layer(
+                            pc.node_mars, pc.element_mars, pc.params, node_samples, element_samples,
+                            ind_target, ind_n, ind_b, conditional = conditional,
+                            rnd = rnd_buf, rnd_offset = rnd_offset, **kwargs
+                        )
+
+                    # Sample child indices
+                    if not handled:
+                        for partition_id in range(layer.num_fw_partitions):
+                            nids = layer.partitioned_nids[partition_id]
+                            cids = layer.partitioned_cids[partition_id]
+                            pids = layer.partitioned_pids[partition_id]
+
+                            sample_sum_layer(pc, layer, nids, cids, pids, pc.node_mars, pc.element_mars, pc.params,
+                                             node_samples, element_samples, ind_target, ind_n, ind_b,
+                                             layer.block_size, conditional, do_calibration = _do_calibration,
+                                             rnd = rnd_buf, rnd_offset = rnd_offset)
+
+                    # Clear completed nodes. A flat `scatter_` rather than `node_samples[ind_n,
+                    # ind_b] = -1`: advanced-index assignment is NOT capturable into a CUDA graph
+                    # (it invalidates the capture), while a scatter is, and the two write exactly the
+                    # same positions since the indices are unique.
+                    node_samples.view(-1).scatter_(0, clear_at, -1)
+
+            else:
+                assert layer_group.is_prod()
+
+                # Iterate over product layers in the current layer group
+                for layer in layer_group:
+                    # Re-align `node_samples` by pushing all values to the front. Unlike the other steps
+                    # this one has to RUN either way -- it moves the frontier -- so only the destination
+                    # map is cached, which is four of the routine's seven operations.
+                    if tape.replaying:
+                        node_pointers = None
+                        push_non_neg_ones_to_front(node_samples, dst = tape.next(),
+                                                   buffer = tape.scratch["compact"])
+                    else:
+                        node_pointers, compact_dst = push_non_neg_ones_to_front(
+                            node_samples, buffer = tape.scratch["compact"])
+                        tape.record(compact_dst)
+
+                    # Indices to process
+                    def _prod_indices(layer = layer):
+                        lsid, leid = layer._layer_nid_range
+                        return torch.where((element_samples >= lsid) & (element_samples < leid))
+
+                    ind_n, ind_b = tape.step(_prod_indices)
+
+                    # `ind_nids` / `ind_nid_offs` / `ind_mask` say which compiled row each SAMPLED element
+                    # fell in, so they are data-dependent and this kernel runs on every pass. The buffers
+                    # are reused rather than reallocated per layer.
+                    ind_ch_count, ind_nids, ind_nid_offs, ind_mask = tape.buffers(
+                        ("prod", layer_id, id(layer)), ind_n.size(0), pc.device, count = 4)
                     for partition_id in range(layer.num_fw_partitions):
                         nids = layer.partitioned_nids[partition_id]
                         cids = layer.partitioned_cids[partition_id]
-                        pids = layer.partitioned_pids[partition_id]
 
-                        sample_sum_layer(pc, layer, nids, cids, pids, pc.node_mars, pc.element_mars, pc.params,
-                                         node_samples, element_samples, ind_target, ind_n, ind_b,
-                                         layer.block_size, conditional, do_calibration = _do_calibration)
+                        count_prod_nch(layer, nids, cids, element_samples, ind_ch_count, ind_nids,
+                                       ind_nid_offs, ind_mask, ind_n, ind_b, layer.block_size, partition_id)
 
-                # Clear completed nodes
-                node_samples[ind_n, ind_b] = -1
+                    # Pre-compute the target indices in `node_samples`
+                    def _prod_targets(node_pointers = node_pointers):
+                        ind_target_sid = np.zeros([ind_n.size(0)], dtype = np.int64)
+                        ind_target_sid[1:] = ind_ch_count[:-1].cumsum(dim = 0).detach().cpu().numpy()
+                        ind_target = np.zeros([ind_ch_count.sum()], dtype = np.int64)
+                        assign_nids_ind_target(ind_target, ind_target_sid,
+                                               node_pointers.detach().cpu().numpy(),
+                                               ind_b.detach().cpu().numpy(), num_samples)
+                        return (torch.from_numpy(ind_target_sid).to(pc.device),
+                                torch.from_numpy(ind_target).to(pc.device))
 
-        else:
-            assert layer_group.is_prod()
+                    ind_target_sid, ind_target = tape.step(_prod_targets)
 
-            # Iterate over product layers in the current layer group
-            for layer in layer_group:
-                # Re-align `node_samples` by pushing all values to the front. Unlike the other steps
-                # this one has to RUN either way -- it moves the frontier -- so only the destination
-                # map is cached, which is four of the routine's seven operations.
-                if tape.replaying:
-                    node_pointers = None
-                    push_non_neg_ones_to_front(node_samples, dst = tape.next(),
-                                               buffer = tape.scratch["compact"])
-                else:
-                    node_pointers, compact_dst = push_non_neg_ones_to_front(
-                        node_samples, buffer = tape.scratch["compact"])
-                    tape.record(compact_dst)
+                    # Store child indices
+                    for partition_id in range(layer.num_fw_partitions):
+                        nids = layer.partitioned_nids[partition_id]
+                        cids = layer.partitioned_cids[partition_id]
 
-                # Indices to process
-                def _prod_indices(layer = layer):
-                    lsid, leid = layer._layer_nid_range
-                    return torch.where((element_samples >= lsid) & (element_samples < leid))
+                        sample_prod_layer(layer, nids, cids, node_samples, element_samples, ind_target, ind_target_sid,
+                                          ind_n, ind_b, ind_nids, ind_nid_offs, ind_mask, layer.block_size, partition_id)
 
-                ind_n, ind_b = tape.step(_prod_indices)
+    
+    if not use_cudagraph:
+        _top_down_pass()
+    else:
+        graph = tape.graph
+        if graph is None:
+            # Two live passes before capturing: the first records the index plan, the second runs the
+            # replay path so that every buffer and every Triton kernel it needs already exists --
+            # capture tolerates neither an allocation nor a JIT compile.
+            _top_down_pass()
+            tape.cursor, tape.replaying = 0, True
+            rnd_buf = tape.uniforms = torch.empty([max(rnd_cursor, 1)], dtype = torch.float32,
+                                                  device = pc.device)
+            rnd_buf.uniform_()
+            _top_down_pass()
 
-                # `ind_nids` / `ind_nid_offs` / `ind_mask` say which compiled row each SAMPLED element
-                # fell in, so they are data-dependent and this kernel runs on every pass. The buffers
-                # are reused rather than reallocated per layer.
-                ind_ch_count, ind_nids, ind_nid_offs, ind_mask = tape.buffers(
-                    ("prod", layer_id, id(layer)), ind_n.size(0), pc.device, count = 4)
-                for partition_id in range(layer.num_fw_partitions):
-                    nids = layer.partitioned_nids[partition_id]
-                    cids = layer.partitioned_cids[partition_id]
+            tape.cursor = 0
+            graph = tape.graph = torch.cuda.CUDAGraph()
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                _top_down_pass()
+                tape.cursor = 0
+            torch.cuda.current_stream().wait_stream(stream)
+            with torch.cuda.graph(graph):
+                _top_down_pass()
 
-                    count_prod_nch(layer, nids, cids, element_samples, ind_ch_count, ind_nids,
-                                   ind_nid_offs, ind_mask, ind_n, ind_b, layer.block_size, partition_id)
-
-                # Pre-compute the target indices in `node_samples`
-                def _prod_targets(node_pointers = node_pointers):
-                    ind_target_sid = np.zeros([ind_n.size(0)], dtype = np.int64)
-                    ind_target_sid[1:] = ind_ch_count[:-1].cumsum(dim = 0).detach().cpu().numpy()
-                    ind_target = np.zeros([ind_ch_count.sum()], dtype = np.int64)
-                    assign_nids_ind_target(ind_target, ind_target_sid,
-                                           node_pointers.detach().cpu().numpy(),
-                                           ind_b.detach().cpu().numpy(), num_samples)
-                    return (torch.from_numpy(ind_target_sid).to(pc.device),
-                            torch.from_numpy(ind_target).to(pc.device))
-
-                ind_target_sid, ind_target = tape.step(_prod_targets)
-
-                # Store child indices
-                for partition_id in range(layer.num_fw_partitions):
-                    nids = layer.partitioned_nids[partition_id]
-                    cids = layer.partitioned_cids[partition_id]
-
-                    sample_prod_layer(layer, nids, cids, node_samples, element_samples, ind_target, ind_target_sid,
-                                      ind_n, ind_b, ind_nids, ind_nid_offs, ind_mask, layer.block_size, partition_id)
+        # A captured launch holds the scalar arguments it was recorded with, so the draw cannot come
+        # from a seed inside the kernels -- it comes from this buffer, refilled outside the graph.
+        tape.uniforms.uniform_()
+        graph.replay()
+        tape.cursor = 0
 
     # Create tensor for the samples
     data_dtype = pc.input_layer_group[0].get_data_dtype()

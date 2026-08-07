@@ -91,13 +91,13 @@ def _gate_weights(cids, pids, element_mars, mparams, ext, gate,
 @triton_jit
 def _bs_sample_kernel(nids, cids, pids, element_mars, mparams, ext, gate, gate_nstride,
                       node_samples, element_samples, ind_target, ind_n, ind_b,
-                      seed, ext_base, num_sel, batch_size,
+                      seed, rnd, rnd_offset, ext_base, num_sel, batch_size,
                       block_size: tl.constexpr, num_edges: tl.constexpr, num_nblocks: tl.constexpr,
                       BLOCK_S: tl.constexpr, BLOCK_M: tl.constexpr, M_NUM_TILES: tl.constexpr,
                       BLOCK_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
                       NODE_CBS: tl.constexpr, GATE_CBS: tl.constexpr, GATE_BS: tl.constexpr,
                       N_NODE_GATES: tl.constexpr, gate_stride: tl.constexpr,
-                      CONDITIONAL: tl.constexpr):
+                      CONDITIONAL: tl.constexpr, RND_BUF: tl.constexpr = 0):
     """
     One lane per selected (node, sample) pair; each draws one child of its node.
 
@@ -148,7 +148,13 @@ def _bs_sample_kernel(nids, cids, pids, element_mars, mparams, ext, gate, gate_n
         node_gate_off = (local_nid_offs // GATE_BS) * tl.load(gate_nstride + local_nids,
                                                               mask = mask_lane, other = 0)
 
-    rnd = tl.rand(seed, offs_sample)
+    # From a BUFFER when one is supplied. A seed is a scalar kernel argument and CUDA-graph capture
+    # bakes those in, so a captured pass would redraw the identical sample on every replay; filling
+    # the buffer outside the graph keeps the draw fresh. See the note in the shared-parameter kernel.
+    if RND_BUF:
+        rnd_val = tl.load(rnd + rnd_offset + offs_sample, mask = mask_lane, other = 0.0)
+    else:
+        rnd_val = tl.rand(seed, offs_sample)
 
     chids = tl.zeros([BLOCK_S], dtype = tl.int64) - 1
     last_edge = tl.zeros([BLOCK_S], dtype = tl.int64) - 1
@@ -169,7 +175,7 @@ def _bs_sample_kernel(nids, cids, pids, element_mars, mparams, ext, gate, gate_n
         # Guarded for the all-`-inf` lane, where the difference would be `inf - inf = NaN`
         w = tl.where(mx[None,:] == -float("inf"), 0.0, epars * tl.exp(a - mx[None,:]))
 
-        r = rnd * tl.sum(w, axis = 0)
+        r = rnd_val * tl.sum(w, axis = 0)
         chids = tl.sum((r[None,:] >= tl.cumsum(w, axis = 0)).to(tl.int64), axis = 0)
         last_edge = tl.max(tl.where(w > 0.0, offs_edge[:,None], -1), axis = 0).to(tl.int64)
 
@@ -197,7 +203,7 @@ def _bs_sample_kernel(nids, cids, pids, element_mars, mparams, ext, gate, gate_n
 
         # ---- PASS 2: the inverse-CDF walk, against the final shift so that every tile's weights are
         # on one scale and the per-tile carry below is a plain subtraction.
-        r = rnd * acc
+        r = rnd_val * acc
 
         for k in range(K_NUM_TILES):
             offs_edge = tl.arange(0, BLOCK_K) + k * BLOCK_K
@@ -235,6 +241,7 @@ def _bs_sample_kernel(nids, cids, pids, element_mars, mparams, ext, gate, gate_n
 
 def bs_sample_sum_layer(nids, cids, pids, element_mars, params, ext, gate, gate_nstride,
                         node_samples, element_samples, ind_target, ind_n, ind_b, seed,
+                        rnd, rnd_offset,
                         block_size: int, node_cbs: int, gate_cbs: int, gate_bs: int,
                         ext_base: int, conditional: bool) -> None:
     """
@@ -273,13 +280,14 @@ def bs_sample_sum_layer(nids, cids, pids, element_mars, params, ext, gate, gate_
         ext = ext, gate = gate, gate_nstride = gate_nstride,
         node_samples = node_samples, element_samples = element_samples,
         ind_target = ind_target, ind_n = ind_n, ind_b = ind_b,
-        seed = seed, ext_base = ext_base, num_sel = num_sel, batch_size = batch_size,
+        seed = seed, rnd = rnd if rnd is not None else ind_n, rnd_offset = rnd_offset,
+        ext_base = ext_base, num_sel = num_sel, batch_size = batch_size,
         block_size = block_size, num_edges = num_edges, num_nblocks = num_nblocks,
         BLOCK_S = BLOCK_S, BLOCK_M = BLOCK_M, M_NUM_TILES = M_NUM_TILES,
         BLOCK_K = BLOCK_K, K_NUM_TILES = K_NUM_TILES,
         NODE_CBS = node_cbs, GATE_CBS = gate_cbs, GATE_BS = gate_bs,
         N_NODE_GATES = block_size // gate_bs, gate_stride = gate.size(1),
-        CONDITIONAL = (1 if conditional else 0),
+        CONDITIONAL = (1 if conditional else 0), RND_BUF = (1 if rnd is not None else 0),
     )
 
     return None
