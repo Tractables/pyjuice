@@ -148,11 +148,11 @@ def test_a_graph_is_reused_rather_than_recaptured():
     pc = _sd_circuit()
 
     juice.queries.sample(pc, num_samples = 64, use_cudagraph = True)
-    graph = pc.__dict__["_sample_scoped_states"][(64, False)]["graph"]
+    graph = pc.__dict__["_sample_scoped_states"][(None, False)]["graph"]
     assert graph is not None
 
     juice.queries.sample(pc, num_samples = 64, use_cudagraph = True)
-    assert pc.__dict__["_sample_scoped_states"][(64, False)]["graph"] is graph
+    assert pc.__dict__["_sample_scoped_states"][(None, False)]["graph"] is graph
 
 
 @cuda_only
@@ -214,16 +214,23 @@ def test_a_graph_is_recaptured_when_the_circuits_buffers_move():
         pc(x, missing_mask = missing)
 
     condition(0)
-    before = pc.node_mars.data_ptr()
     torch.manual_seed(1)
     juice.queries.sample(pc, conditional = True, use_cudagraph = True)          # capture
+
+    # HOLD the captured buffer alive. Without this the caching allocator is free to hand the same
+    # block back when `node_mars` is reallocated below, and then the stale pointer still happens to
+    # be valid and the test silently proves nothing -- which is exactly how it failed under `-n 8`,
+    # where memory pressure changed which block came back.
+    keepalive = pc.node_mars
+    before = keepalive.data_ptr()
 
     # a forward at another batch size, then back -- what a decode loop does between draws
     pc(torch.zeros([777, pc.num_vars], dtype = torch.long, device = pc.device),
        missing_mask = torch.ones([pc.num_vars], dtype = torch.bool, device = pc.device))
     condition(3)
     assert pc.node_mars.data_ptr() != before, \
-        "the allocator reused the same address -- this test cannot see the defect it exists for"
+        "the allocator reused the same address despite the keepalive -- this test cannot see the " \
+        "defect it exists for"
 
     torch.manual_seed(2)
     graphed = juice.queries.sample(pc, conditional = True, use_cudagraph = True)
@@ -233,6 +240,7 @@ def test_a_graph_is_recaptured_when_the_circuits_buffers_move():
 
     z = _max_z(graphed, live, N)
     assert z < 5.0, f"the replay read stale buffers: max |z| = {z:.2f}"
+    del keepalive
 
 
 @cuda_only
@@ -275,8 +283,121 @@ def test_a_graph_survives_repeated_draws_at_one_batch_size():
     pc = _sd_circuit()
 
     juice.queries.sample(pc, num_samples = 64, use_cudagraph = True)
-    graph = pc.__dict__["_sample_scoped_states"][(64, False)]["graph"]
+    graph = pc.__dict__["_sample_scoped_states"][(None, False)]["graph"]
 
     for _ in range(4):
         juice.queries.sample(pc, num_samples = 64, use_cudagraph = True)
-        assert pc.__dict__["_sample_scoped_states"][(64, False)]["graph"] is graph
+        assert pc.__dict__["_sample_scoped_states"][(None, False)]["graph"] is graph
+
+
+# ------------------------------------------------------ one graph across a shrinking batch size
+
+def _unconditional_state(pc):
+    return pc.__dict__.get("_sample_scoped_states", {}).get((None, False))
+
+
+@cuda_only
+def test_a_shrinking_batch_reuses_one_graph():
+    """
+    A decode loop's batch falls as sequences finish. Capturing a graph per size costs three live
+    passes each and then thrashes an 8-entry cache, which is slower than not using a graph at all --
+    so a smaller request replays the wider graph and reads the first `num_samples` columns.
+    """
+    torch.manual_seed(0)
+    pc = _sd_circuit()
+
+    juice.queries.sample(pc, num_samples = 4096, use_cudagraph = True)
+    graph = _unconditional_state(pc)["graph"]
+    assert graph is not None
+
+    for n in (2048, 1024, 512, 64, 3):
+        samples = juice.queries.sample(pc, num_samples = n, use_cudagraph = True)
+        assert samples.size(0) == n, f"asked for {n} samples, got {samples.size(0)}"
+        assert _unconditional_state(pc)["graph"] is graph, f"recaptured for batch {n}"
+
+    assert len(pc.__dict__["_sample_scoped_states"]) == 1, \
+        "a shrinking batch should not accumulate one state per size"
+
+
+@cuda_only
+def test_a_growing_batch_recaptures():
+    """The other direction has to reallocate: the buffers a wider draw needs do not exist yet, and
+    the old graph holds pointers into the ones being replaced."""
+    torch.manual_seed(0)
+    pc = _sd_circuit()
+
+    juice.queries.sample(pc, num_samples = 256, use_cudagraph = True)
+    graph = _unconditional_state(pc)["graph"]
+
+    samples = juice.queries.sample(pc, num_samples = 1024, use_cudagraph = True)
+    assert samples.size(0) == 1024
+    assert _unconditional_state(pc)["graph"] is not graph, "a wider draw must not replay the old graph"
+
+
+@cuda_only
+def test_a_reused_graph_still_draws_the_right_distribution():
+    """
+    The correctness half. Replaying a wider graph computes lanes this draw does not want; if the
+    slicing were off by so much as a column the answer would be another sample's.
+    """
+    torch.manual_seed(0)
+    pc = _sd_circuit()
+    N = 40_000
+
+    juice.queries.sample(pc, num_samples = 200_000, use_cudagraph = True)    # capture wide
+
+    torch.manual_seed(1)
+    narrow = juice.queries.sample(pc, num_samples = N, use_cudagraph = True).float()
+    torch.manual_seed(1)
+    plain = juice.queries.sample(pc, num_samples = N).float()
+
+    se = ((narrow.var(dim = 0) + plain.var(dim = 0)) / N).sqrt().clamp(min = 1e-9)
+    z = float(((narrow.mean(dim = 0) - plain.mean(dim = 0)) / se).abs().max())
+    assert z < 5.0, f"a draw off the shared buffer differs from a plain one: max |z| = {z:.2f}"
+
+
+@cuda_only
+def test_a_reused_graph_still_reaches_every_variable():
+    """`_sample_input_ns = False` returns the frontier itself, which is where an off-by-one column
+    would show as a missing variable rather than as a shifted distribution."""
+    torch.manual_seed(0)
+    pc = _sd_circuit()
+
+    juice.queries.sample(pc, num_samples = 2048, use_cudagraph = True, _sample_input_ns = False)
+    frontier = juice.queries.sample(pc, num_samples = 512, use_cudagraph = True,
+                                    _sample_input_ns = False)
+
+    assert frontier.size(1) == 512
+    assert bool(((frontier != -1).sum(dim = 0) == pc.num_vars).all())
+
+
+@cuda_only
+def test_conditional_graphs_stay_keyed_by_batch_size():
+    """
+    Conditional draws must NOT share a buffer: their kernels read `pc.node_mars` with the batch size
+    frozen at capture, so a graph replayed against a forward pass run at another batch would read it
+    with the wrong stride. Pinned as a wrong ANSWER, not just as a cache-key check.
+    """
+    torch.manual_seed(0)
+    pc = _sd_circuit()
+
+    def condition(batch):
+        x = torch.randint(0, 5, [batch, pc.num_vars], device = pc.device)
+        missing = torch.zeros([pc.num_vars], dtype = torch.bool, device = pc.device)
+        missing[::2] = True
+        pc(x, missing_mask = missing)
+
+    condition(4096)
+    juice.queries.sample(pc, conditional = True, use_cudagraph = True)
+    condition(1024)
+    graphed = juice.queries.sample(pc, conditional = True, use_cudagraph = True).float()
+    condition(1024)
+    plain = juice.queries.sample(pc, conditional = True).float()
+
+    assert graphed.size(0) == 1024
+    se = ((graphed.var(dim = 0) + plain.var(dim = 0)) / 1024).sqrt().clamp(min = 1e-9)
+    z = float(((graphed.mean(dim = 0) - plain.mean(dim = 0)) / se).abs().max())
+    assert z < 5.0, f"a conditional replay at another batch size is wrong: max |z| = {z:.2f}"
+
+    keys = set(pc.__dict__["_sample_scoped_states"])
+    assert (4096, True) in keys and (1024, True) in keys
