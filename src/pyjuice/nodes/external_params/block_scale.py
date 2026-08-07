@@ -1000,8 +1000,16 @@ class BlockScaleSumParams(ExternalSumParams):
             )
         if state["batch_size"] != node_mars.size(1):
             raise RuntimeError(
-                f"`BlockScaleSumParams` backward at batch {node_mars.size(1)} but the last forward "
-                f"ran at batch {state['batch_size']}; the cached `log Z` does not apply."
+                f"`BlockScaleSumParams` backward at batch {node_mars.size(1)}, but the last GATED "
+                f"forward ran at batch {state['batch_size']}, so its cached `log Z` does not apply.\n\n"
+                f"A forward given no `sum_external_params` runs this layer as a plain sum layer and "
+                f"leaves the previous staging -- and this `log Z` -- in place rather than replacing "
+                f"them, so the usual cause is an intervening ungated forward at another batch size:\n"
+                f"    pc(x_a, sum_external_params = ...)   # gated, batch {state['batch_size']}\n"
+                f"    pc(x_b)                              # no gate -> state left stale\n"
+                f"    pc.backward(x_b)                     # <- here, at batch {node_mars.size(1)}\n\n"
+                f"Pass `sum_external_params` on every forward of this circuit, or re-run the gated "
+                f"forward immediately before the backward that consumes it."
             )
         if not kwargs.get("logspace_flows", False):
             raise NotImplementedError(
