@@ -163,6 +163,13 @@ def test_hclt_zero_preserving():
     test_ll = evaluate(pc, test_loader)
     assert test_ll > -780
 
+    # Copy the TRAINED parameters back to the nodes before checking them. Without this the loop
+    # below reads `ns._params`, which still holds the values the test itself wrote with
+    # `set_params` -- including the zeros it is about to assert are still zero. The check passed
+    # unconditionally: seeding a genuine zero-leak (an `em_par_update` that ignores
+    # `keep_zero_params`) left it green.
+    pc.update_parameters()
+
     for ns in root_ns:
         if ns.is_sum() and ns.has_params():
             num_node_blocks = ns.num_node_blocks
@@ -252,6 +259,13 @@ def test_hmm_zero_preserving():
     test_ll = evaluate(pc, valid_loader)
     assert test_ll > -90
 
+    # Copy the TRAINED parameters back to the nodes before checking them. Without this the loop
+    # below reads `ns._params`, which still holds the values the test itself wrote with
+    # `set_params` -- including the zeros it is about to assert are still zero. The check passed
+    # unconditionally: seeding a genuine zero-leak (an `em_par_update` that ignores
+    # `keep_zero_params`) left it green.
+    pc.update_parameters()
+
     for ns in root_ns:
         if ns.is_sum() and ns.has_params() and not ns.is_tied():
             num_node_blocks = ns.num_node_blocks
@@ -340,6 +354,13 @@ def test_hmm_zero_preserving_node_zeroling():
 
     test_ll = evaluate(pc, valid_loader)
     assert test_ll > -90
+
+    # Copy the TRAINED parameters back to the nodes before checking them. Without this the loop
+    # below reads `ns._params`, which still holds the values the test itself wrote with
+    # `set_params` -- including the zeros it is about to assert are still zero. The check passed
+    # unconditionally: seeding a genuine zero-leak (an `em_par_update` that ignores
+    # `keep_zero_params`) left it green.
+    pc.update_parameters()
 
     for ns in root_ns:
         if ns.is_sum() and ns.has_params() and not ns.is_tied():
