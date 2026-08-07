@@ -299,6 +299,44 @@ def test_external_categorical_dist_fw_w_mask_speed():
     print(f"Reference computation time on A40: {12.8716:.3f}ms.")
     print("==============================================================")
 
+    # The timing above is FYI; this is the test. Without an assertion a regression that made the
+    # forward skip its work reported a 29x speed-up and still passed green, which is the opposite
+    # of what a benchmark should do.
+    #
+    # Checked on the MASKED half only, and deliberately: there the answer is a single category per
+    # row, so it costs two gathers. The unmasked half is a log-sum-exp over all `num_cats` and its
+    # closed form would materialise a [nodes, 329800] tensor -- about 2.7 GiB -- which is why the
+    # neighbouring correctness tests use a small alphabet instead.
+    layer = pc.input_layer_group[0]
+    num_latents = 2 * 1024
+    vids = layer.vids[::num_latents, 0]
+
+    for i in range(pc.num_vars):
+        v = int(vids[i])
+        sid = layer._output_ind_range[0] + i * num_latents
+        eid = layer._output_ind_range[0] + (i + 1) * num_latents
+
+        observed = data[:, v]                                       # [16]
+        # the internal parameter each node assigns to the value that was actually observed
+        internal = layer.params[layer.s_pids[i * num_latents : (i + 1) * num_latents][None, :]
+                                + observed[:, None]]                # [16, num_latents]
+        external = external_categorical_logps[torch.arange(16, device = device), v, observed]
+
+        expected = internal.log() + external[:, None]                # unnormalized_ll, masked rows
+        actual = pc.node_mars[sid:eid, :].permute(1, 0)
+
+        masked = external_categorical_value_mask[:, v]
+        assert torch.all((actual[masked] - expected[masked]).abs() < 1e-4), \
+            f"variable {v}: masked rows disagree by up to " \
+            f"{float((actual[masked] - expected[masked]).abs().max()):.3e}"
+
+        # and the unmasked half must NOT be that same quantity -- it is a normalizer over every
+        # category, so a dispatch that collapsed the two branches would show up right here
+        assert torch.isfinite(actual[~masked]).all()
+        assert float((actual[~masked] - expected[~masked]).abs().max()) > 1e-3, \
+            f"variable {v}: the unmasked rows equal the masked closed form -- the two branches " \
+            f"have collapsed into one"
+
 
 def test_external_categorical_dist_bk_param_only():
 

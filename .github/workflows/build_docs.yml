@@ -3,7 +3,11 @@ name: Build the documentation
 on:
   workflow_dispatch:
 
+  # `main` only. Without a branch filter this ran on every push to every branch, and the publish step
+  # below force-pushes `gh-pages` with `CLEAN: true` -- so the public site was being rebuilt from
+  # whatever feature branch was last pushed, documenting APIs that are not on `main`.
   push:
+    branches: [main]
 
   pull_request:
     branches: [main]
@@ -38,7 +42,11 @@ jobs:
         run: |
           sphinx-build -b html docs/source docs/build/html
 
+      # Pull requests build the docs but do NOT publish them: the build is worth having as a check
+      # (it catches Sphinx errors before merge), while publishing from a PR would put an unmerged
+      # branch's documentation on the live site.
       - name: Publish the documentation
+        if: github.event_name != 'pull_request'
         uses: JamesIves/github-pages-deploy-action@3.6.2
         with:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

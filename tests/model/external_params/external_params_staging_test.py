@@ -604,3 +604,104 @@ def test_every_staging_transpose_tier_agrees():
             assert torch.equal(shaped.reshape(-1), expect), f"'{name}' tier, storage-shaped destination"
     finally:
         tc._staging_transpose_fn = orig
+
+
+def test_an_ungated_forward_drops_a_previously_staged_gate():
+    """
+    What is staged always describes the MOST RECENT forward.
+
+    `pc.backward()` and a conditional `queries.sample()` both take the staged tensors
+    unconditionally -- they must, since `node_mars` was computed with them. So a forward that
+    supplies none has to drop what an earlier one staged, or those two consumers silently apply a
+    gate the forward they follow never used. That went wrong in a decode loop that interleaved a
+    1-row gated forward with a 10-row ungated one: at a matching batch it was silent, at a differing
+    one it surfaced as a shape error from inside the sampler.
+    """
+    device = torch.device("cuda:0")
+
+    ext_params = EchoParams()
+    pc, root_ns, trans_ns = _compiled(ext_params)
+
+    data = torch.randint(0, 5, [8, 4]).to(device)
+    pc(data, sum_external_params = _make_tensors(pc, 8))
+    assert pc._staged_external_params is not None
+
+    pc(data)                                             # same batch, no external parameters
+    assert pc._staged_external_params is None, \
+        "an ungated forward must not leave the previous forward's tensors staged"
+
+
+def test_an_ungated_forward_at_another_batch_size_drops_them_too():
+    """The case that was reported: the ungated call is also at a different batch size."""
+    device = torch.device("cuda:0")
+
+    ext_params = EchoParams()
+    pc, root_ns, trans_ns = _compiled(ext_params)
+
+    pc(torch.randint(0, 5, [8, 4]).to(device), sum_external_params = _make_tensors(pc, 8))
+    pc(torch.randint(0, 5, [3, 4]).to(device))           # ungated, different batch
+
+    assert pc._staged_external_params is None
+
+
+def test_a_backward_after_an_ungated_forward_runs_ungated():
+    """It runs the SHARED-parameter backward -- consistent with the forward it follows -- rather than
+    applying the stale gate or raising."""
+    device = torch.device("cuda:0")
+
+    ext_params = EchoParams()
+    pc, root_ns, trans_ns = _compiled(ext_params)
+
+    data = torch.randint(0, 5, [8, 4]).to(device)
+    pc(data, sum_external_params = _make_tensors(pc, 8))
+    pc.backward(data)
+    gated_calls = ext_params.calls["pre_backward"]
+    assert gated_calls > 0
+
+    pc(data)                                             # ungated
+    pc.backward(data)                                    # must not reach the parameterization
+    assert ext_params.calls["pre_backward"] == gated_calls
+
+
+def test_the_autograd_hook_still_sees_its_own_forwards_tensors():
+    """
+    `forward` mutates `kwargs` in place and registers the backward hook with `**kwargs`, so a staged
+    dict comes back round to `_stage_external_params`. That branch must NOT be treated as "nothing
+    supplied", or `lls.backward()` would silently lose the gate.
+    """
+    device = torch.device("cuda:0")
+
+    ext_params = EchoParams()
+    pc, root_ns, trans_ns = _compiled(ext_params)
+
+    data = torch.randint(0, 5, [8, 4]).to(device)
+    before = ext_params.calls["pre_backward"]
+
+    lls = pc(data, sum_external_params = _make_tensors(pc, 8))
+    lls.mean().backward()
+
+    assert ext_params.calls["pre_backward"] > before, \
+        "the autograd hook's backward lost the gate its own forward staged"
+    assert pc._staged_external_params is not None
+
+    # and handing a staged dict straight back to a forward keeps it staged
+    staged = pc._staged_external_params
+    assert isinstance(staged, StagedExternalParams)
+    pc(data, sum_external_params = staged)
+    assert pc._staged_external_params is staged
+
+
+def test_interleaved_batch_sizes_are_fine_when_every_forward_is_gated():
+    """Interleaving batch sizes is not itself a problem -- each gated forward re-stages."""
+    device = torch.device("cuda:0")
+
+    ext_params = EchoParams()
+    pc, root_ns, trans_ns = _compiled(ext_params)
+
+    for batch_size in (1, 10, 1, 4, 10):
+        data = torch.randint(0, 5, [batch_size, 4]).to(device)
+        pc(data, sum_external_params = _make_tensors(pc, batch_size))
+
+        staged = next(iter(pc._staged_external_params.values()))[0]
+        assert staged.size(0) == batch_size, \
+            f"staged tensors describe batch {staged.size(0)}, but the forward ran at {batch_size}"

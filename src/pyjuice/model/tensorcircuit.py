@@ -98,6 +98,7 @@ def device_grad_controller(device, no_grad = True):
 
 
 from pyjuice.nodes.external_params.external_params import ExternalSumParams
+from pyjuice.nodes.methods import is_structured_decomposable
 
 
 def _staging_transpose_fn():
@@ -212,6 +213,13 @@ class TensorCircuit(nn.Module):
         self.device = torch.device("cpu")
 
         self.num_vars = self._get_num_vars(self.root_ns)
+
+        # Whether every product node decomposes its scope the same way, i.e. whether the circuit
+        # respects a single vtree. Computed once here because it is a property of the structure and
+        # several passes want it: the top-down sampler, in particular, can precompute its whole index
+        # plan when it holds, since the frontier's shape is then a function of the scopes alone and
+        # never of which node a draw happened to select.
+        self.is_structured_decomposable = is_structured_decomposable(self.root_ns)
 
         self.node_mars = None
         self.element_mars = None
@@ -887,7 +895,8 @@ class TensorCircuit(nn.Module):
             f"No external-parameter group named '{name}'."
         del self.external_params_groups[name]
 
-    def _group_fast_stage(self, name: str, tensors, views: dict, batch_size: int):
+    def _group_fast_stage(self, name: str, tensors, views: dict, batch_size: int,
+                          buffer: Optional[torch.Tensor] = None):
         """
         `(destination, source)` staging a WHOLE group in one transpose, or None if it cannot.
 
@@ -926,7 +935,11 @@ class TensorCircuit(nn.Module):
             return None
 
         base = views[nodes[0]][0]
-        buf = self.external_params
+        # The buffer being staged INTO, which is not always the forward's: an unconditional
+        # `queries.sample()` stages into a private slab so it cannot disturb what the forward left
+        # for its backward, and `self.external_params` is then `None` on a circuit that has only
+        # ever been sampled from.
+        buf = buffer if buffer is not None else self.external_params
         elem = buf.element_size()
         total = 0
         for ns in nodes:
@@ -998,7 +1011,8 @@ class TensorCircuit(nn.Module):
 
         return out
 
-    def _stage_external_params(self, kwargs: dict, batch_size: int) -> None:
+    def _stage_external_params(self, kwargs: dict, batch_size: int,
+                               name: str = "external_params") -> None:
         """
         Copy the caller's external tensors into the staging buffer and replace the `sum_external_params`
         entry with views into it, so the layers only ever see the buffer.
@@ -1012,15 +1026,49 @@ class TensorCircuit(nn.Module):
         Called from the forward pass. The backward reuses what was staged here rather than asking for
         the tensors again, which also makes it impossible to run a backward whose external parameters
         disagree with the forward that produced `node_mars`.
+
+        :note: what is staged always describes the MOST RECENT forward, including when that forward
+               supplied nothing -- see below.
+
+        :param name: which staging buffer to use. A caller that is NOT a forward pass -- an
+                     unconditional `queries.sample()` -- must pass its own name and gets a private
+                     slab, leaving `_staged_external_params` and the forward's views untouched.
+                     Sharing the default buffer is not merely untidy: `_external_params_views`
+                     reallocates it whenever the batch size differs, so a draw between a forward and
+                     its backward would invalidate the forward's views IN PLACE, and clearing the
+                     field would make the backward run ungated against gated `node_mars`.
         """
+        owns_forward_state = (name == "external_params")
         ns2tensors = kwargs.get(EXTERNAL_PARAMS_KWARG, None)
 
-        if ns2tensors is None or isinstance(ns2tensors, StagedExternalParams):
-            # Nothing supplied, or already staged (e.g. re-entered through the autograd hook)
+        if ns2tensors is None:
+            # This forward runs the gated layers as plain sum layers, so whatever was staged earlier
+            # no longer describes the state `node_mars` was computed in. DROPPING it is what keeps the
+            # staged tensors a description of the latest forward rather than of some earlier one.
+            #
+            # Leaving them in place is a quiet trap, because the two consumers that read this field --
+            # `pc.backward()` and a conditional `queries.sample()` -- take it unconditionally. An
+            # ungated forward between a gated one and its consumer then applied a stale gate: at a
+            # matching batch size silently, and at a differing one as a confusing shape error from
+            # deep inside the sampler. `lls.backward()` was never exposed to it, since the hook
+            # carries the kwargs of the forward that registered it.
+            #
+            # The cost is that a FORGOTTEN gate is now silent rather than loud: the backward or draw
+            # simply runs ungated, consistent with the forward it follows. That is the honest reading
+            # of "no external parameters were supplied", and alternating gated and ungated forwards is
+            # legitimate (an ungated baseline likelihood, a marginal query), so it is not warned about.
+            if owns_forward_state:
+                self._staged_external_params = None
+            return None
+
+        if isinstance(ns2tensors, StagedExternalParams):
+            # Already staged: the caller handed back a dict this method produced. Not hypothetical --
+            # `forward` mutates `kwargs` in place and then registers the backward hook with `**kwargs`,
+            # so a staged dict really does come back round, and clearing here would break it.
             return None
 
         views = StagedExternalParams(self._external_params_views(
-            name = "external_params", batch_size = batch_size
+            name = name, batch_size = batch_size
         ))
 
         # A group whose members land on a contiguous run of the buffer stages as ONE transpose; the
@@ -1053,7 +1101,8 @@ class TensorCircuit(nn.Module):
             assert key in self.external_params_groups, \
                 f"`{EXTERNAL_PARAMS_KWARG}` names an unregistered external-parameter group: '{key}'. " \
                 f"Register it with `pc.register_external_params_group('{key}', [...])`."
-            whole = self._group_fast_stage(key, tensors, views, batch_size)
+            whole = self._group_fast_stage(key, tensors, views, batch_size,
+                                           buffer = self.__dict__[name])
             if whole is not None:
                 group_fast.append(whole)
                 group_done.update(self.external_params_groups[key][0])
@@ -1068,7 +1117,7 @@ class TensorCircuit(nn.Module):
 
         # Validate against the buffer's own device rather than `self.device`, which may be index-less
         # (`torch.device("cuda")`) and so compare unequal to an otherwise identical `cuda:0`
-        device = self.external_params.device
+        device = self.__dict__[name].device
 
         dsts, srcs, fast = [], [], list(group_fast)
         for ns, tensors in ns2tensors.items():
@@ -1121,8 +1170,9 @@ class TensorCircuit(nn.Module):
                 del views[ns]
 
         kwargs[EXTERNAL_PARAMS_KWARG] = views
-        kwargs[EXTERNAL_PARAMS_BUFFER_KWARG] = self.external_params
-        self._staged_external_params = views
+        kwargs[EXTERNAL_PARAMS_BUFFER_KWARG] = self.__dict__[name]
+        if owns_forward_state:
+            self._staged_external_params = views
 
     def _resolve_backward_external_params(self, kwargs: dict) -> None:
         """
@@ -1688,7 +1738,10 @@ class TensorCircuit(nn.Module):
         if not name in self.__dict__:
             flag = True
 
-        tensor = self.__dict__[name]
+        # `.get`, not `[...]`: the guard above exists precisely for a name this circuit has never
+        # allocated, and indexing threw a `KeyError` before reaching the allocation it had just
+        # decided to make -- so the branch was dead and any new buffer name was unusable.
+        tensor = self.__dict__.get(name)
         if not flag and not isinstance(tensor, torch.Tensor):
             flag = True
 

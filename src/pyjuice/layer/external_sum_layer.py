@@ -151,6 +151,10 @@ class ExternalParamsSumLayer(SumLayer):
     * after it, to add the external contribution to the child flows, write the per-sample gradients,
       and undo anything the pre-hook changed.
 
+    Ancestral sampling is handed over the same way, through :func:`sample_layer`, with the one
+    difference that the descriptor REPLACES the standard draw rather than correcting it -- a
+    categorical draw already made under the shared parameters cannot be corrected after the fact.
+
     All the nodes of one layer share an external signature (that is what compilation groups them by),
     so exactly one descriptor -- and one set of kernels -- applies to the whole layer. The standard
     sum-layer kernels are never branched on.
@@ -612,6 +616,95 @@ class ExternalParamsSumLayer(SumLayer):
             self._ext_bw_par_triton_hook = None
 
         return None
+
+    def _check_staged_batch(self, ns_tensors, num_samples: int) -> None:
+        """
+        The staged tensors must describe THIS many samples.
+
+        The compiled tables express offsets in per-batch units and the kernels multiply by the sample
+        count, so tensors staged for another batch would be read at addresses scaled by the wrong
+        stride -- in bounds, plausible, and someone else's gate. `_resolve_external_tensors` skips
+        validation for already-staged views, which is exactly the case this can arise in.
+        """
+        for ns_info, tensors in ns_tensors:
+            shapes = self.external_params.storage_shapes(ns_info.ns, num_samples)
+            for tensor, shape in zip(tensors, shapes):
+                if tuple(tensor.size()) == tuple(shape):
+                    continue
+
+                staged_batch = tensor.size(-1)
+                raise AssertionError(
+                    f"Sampling {num_samples} sample(s) from this circuit, but the external sum "
+                    f"parameters staged on it are for a batch of {staged_batch}.\n\n"
+                    f"`sample()` does not take `{EXTERNAL_PARAMS_KWARG}` from its own arguments -- it "
+                    f"uses whatever the FORWARD pass staged, because the `node_mars` / `element_mars` "
+                    f"it conditions on were computed with those values, and drawing against any other "
+                    f"gate would be sampling one distribution conditioned on another.\n\n"
+                    f"A forward pass that is given no `{EXTERNAL_PARAMS_KWARG}` runs this layer as a "
+                    f"PLAIN sum layer and drops the previous staging, so the usual cause is a forward "
+                    f"at one batch size followed by a draw at another.\n\n"
+                    f"  node:   {ns_info.ns}\n"
+                    f"  staged: {tuple(tensor.size())}\n"
+                    f"  needed: {tuple(shape)}"
+                )
+
+    def sample_layer(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor,
+                     node_samples: torch.Tensor, element_samples: torch.Tensor,
+                     rows: torch.Tensor, erows: torch.Tensor, seed_ptr: torch.Tensor,
+                     conditional: bool = False, **kwargs) -> bool:
+        """
+        Draw a child for every live sample of the frontier rows this layer owns.
+
+        The counterpart of :func:`sample_layer_pairs` for the structural frontier layout. Returns
+        whether this layer handled the draw; `False` means no external tensors were supplied, so it
+        IS a plain sum layer and the caller falls back to the shared-parameter kernel.
+        """
+        ns_tensors = self._resolve_external_tensors(kwargs, node_samples.size(1), node_samples.device)
+        if len(ns_tensors) == 0:
+            return False
+
+        self._check_staged_batch(ns_tensors, node_samples.size(1))
+        self.external_params.sample_layer(
+            self, ns_tensors, node_mars, element_mars, params, node_samples, element_samples,
+            rows, erows, seed_ptr, conditional = conditional, **kwargs
+        )
+        return True
+
+    def sample_layer_pairs(self, node_mars: torch.Tensor, element_mars: torch.Tensor,
+                     params: torch.Tensor,
+                     node_samples: torch.Tensor, element_samples: torch.Tensor,
+                     ind_target: torch.Tensor, ind_n: torch.Tensor, ind_b: torch.Tensor,
+                     conditional: bool = False, rnd = None, rnd_offset = 0,
+                     **kwargs) -> bool:
+        """
+        Draw one child for every node of this layer the ancestral sampler has selected.
+
+        Returns whether this layer handled the draw. `False` means no external tensors were supplied
+        for it, in which case it IS a plain sum layer and the caller falls back to the
+        shared-parameter kernel -- the same rule the forward and backward passes follow, so a layer
+        is sampled under exactly the parameterization it would have been scored under.
+
+        :note: `num_samples` plays the role the batch size plays elsewhere, and the external tensors
+               are validated against it. Unconditionally that is the number of samples requested, so
+               there is one gate per drawn sample; conditionally it is the batch of the forward pass
+               being conditioned on.
+        """
+
+        num_samples = node_samples.size(1)
+        ns_tensors = self._resolve_external_tensors(kwargs, num_samples, node_samples.device)
+
+        if len(ns_tensors) == 0:
+            return False
+
+        self._check_staged_batch(ns_tensors, num_samples)
+
+        self.external_params.sample_layer_pairs(
+            self, ns_tensors, node_mars, element_mars, params, node_samples, element_samples,
+            ind_target, ind_n, ind_b, conditional = conditional,
+            rnd = rnd, rnd_offset = rnd_offset, **kwargs
+        )
+
+        return True
 
     def __repr__(self):
         return f"ExternalParamsSumLayer(nid_range=({self._layer_nid_range[0]}, {self._layer_nid_range[1]}), " \
