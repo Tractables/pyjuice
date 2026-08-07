@@ -1543,7 +1543,8 @@ class BlockScaleSumParams(ExternalSumParams):
     # ------------------------------------------------------------------ sampling
 
     def sample_layer(self, layer, ns_tensors, node_mars, element_mars, params, node_samples,
-                     element_samples, rows, erows, conditional: bool = False, **kwargs) -> None:
+                     element_samples, rows, erows, seed_ptr, conditional: bool = False,
+                     **kwargs) -> None:
         """
         The gated draw against the structural frontier layout.
 
@@ -1585,7 +1586,7 @@ class BlockScaleSumParams(ExternalSumParams):
                 nids, layer.partitioned_cids[partition_id], layer.partitioned_pids[partition_id],
                 element_mars, params, external_params,
                 layer.ext_slots[0][partition_id], nstride,
-                node_samples, element_samples, rows, erows, random.randint(0, 2**31),
+                node_samples, element_samples, rows, erows, seed_ptr,
                 block_size = block_size, node_cbs = ns0.ch_block_size, gate_cbs = gate_cbs,
                 gate_bs = gate_bs, ext_base = ext_base, conditional = conditional,
             )

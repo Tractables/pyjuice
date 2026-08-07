@@ -3,15 +3,18 @@ The sampler's index-plan cache.
 
 Most of a top-down pass is spent deriving WHERE things go rather than drawing them: per layer a
 `torch.where`, a device-to-host copy, a serial slot allocation and a copy back. On a structured
-decomposable circuit those indices are the same on every call -- one vtree means the frontier's shape
-after each layer is a function of the scopes alone, never of which node a draw selected -- so they are
-recorded once and replayed.
+decomposable circuit those indices are the same on every call, so they are recorded once and replayed.
 
 The correctness risk is entirely in the GATE. Replaying a plan on a circuit whose plan actually
 varies would not be slightly stale, it would be wrong: the sampler would write children into slots
 belonging to other nodes. So these tests pin (a) that the cache engages only when
 `pc.is_structured_decomposable`, (b) that cached draws follow the same distribution as uncached ones,
 and (c) that plans of different shapes never serve each other.
+
+:note: the plan cache belongs to the PAIR-LIST sampling path, which is no longer the default -- the
+       structural frontier layout (`scope_plan.py`) supersedes it, is faster, and applies uniformly
+       to every circuit rather than only to structured-decomposable ones. These tests therefore ask
+       for that path explicitly, and go when it does.
 """
 
 import pytest
@@ -61,11 +64,11 @@ def test_the_cache_engages_on_a_structured_decomposable_circuit():
     pc = _sd_circuit()
     assert pc.is_structured_decomposable
 
-    juice.queries.sample(pc, num_samples = 64)
+    juice.queries.sample(pc, num_samples = 64, _use_scope_plan = False)
     assert (64, False) in _plans(pc), "the first pass should have recorded a plan"
     assert not _plans(pc)[(64, False)].replaying
 
-    juice.queries.sample(pc, num_samples = 64)
+    juice.queries.sample(pc, num_samples = 64, _use_scope_plan = False)
     assert _plans(pc)[(64, False)].replaying, "the second pass should have replayed it"
 
 
@@ -85,7 +88,7 @@ def test_the_cache_refuses_a_non_structured_decomposable_circuit():
     assert not pc.is_structured_decomposable
 
     for _ in range(3):
-        juice.queries.sample(pc, num_samples = 64)
+        juice.queries.sample(pc, num_samples = 64, _use_scope_plan = False)
 
     assert not _plans(pc), "a circuit whose plan varies must not get a cached one"
 
@@ -104,8 +107,8 @@ def test_cached_draws_match_uncached_ones(conditional):
             missing = torch.zeros([pc.num_vars], dtype = torch.bool, device = pc.device)
             missing[::2] = True
             pc(x, missing_mask = missing)
-            return juice.queries.sample(pc, conditional = True).float()
-        return juice.queries.sample(pc, num_samples = N).float()
+            return juice.queries.sample(pc, conditional = True, _use_scope_plan = False).float()
+        return juice.queries.sample(pc, num_samples = N, _use_scope_plan = False).float()
 
     torch.manual_seed(1)
     draw()                                                  # records the plan
@@ -129,13 +132,13 @@ def test_plans_do_not_leak_across_shapes():
     pc = _sd_circuit()
 
     for n in (16, 64, 256):
-        juice.queries.sample(pc, num_samples = n)
-        juice.queries.sample(pc, num_samples = n)
+        juice.queries.sample(pc, num_samples = n, _use_scope_plan = False)
+        juice.queries.sample(pc, num_samples = n, _use_scope_plan = False)
 
     x = torch.randint(0, 5, [64, pc.num_vars], device = pc.device)
     missing = torch.ones([pc.num_vars], dtype = torch.bool, device = pc.device)
     pc(x, missing_mask = missing)
-    juice.queries.sample(pc, conditional = True)
+    juice.queries.sample(pc, conditional = True, _use_scope_plan = False)
 
     keys = set(_plans(pc))
     assert {(16, False), (64, False), (256, False), (64, True)} <= keys
@@ -153,7 +156,7 @@ def test_the_cache_is_bounded():
     pc = _sd_circuit()
 
     for n in range(1, _PLAN_CACHE_SIZE + 5):
-        juice.queries.sample(pc, num_samples = n)
+        juice.queries.sample(pc, num_samples = n, _use_scope_plan = False)
 
     assert len(_plans(pc)) <= _PLAN_CACHE_SIZE
 
@@ -164,8 +167,8 @@ def test_a_replayed_pass_still_reaches_every_variable():
     torch.manual_seed(0)
     pc = _sd_circuit()
 
-    juice.queries.sample(pc, num_samples = 32, _sample_input_ns = False)
-    frontier = juice.queries.sample(pc, num_samples = 32, _sample_input_ns = False)
+    juice.queries.sample(pc, num_samples = 32, _sample_input_ns = False, _use_scope_plan = False)
+    frontier = juice.queries.sample(pc, num_samples = 32, _sample_input_ns = False, _use_scope_plan = False)
 
     selected = (frontier != -1).sum(dim = 0)
     assert bool((selected == pc.num_vars).all())

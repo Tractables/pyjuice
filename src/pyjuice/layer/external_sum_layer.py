@@ -650,8 +650,8 @@ class ExternalParamsSumLayer(SumLayer):
 
     def sample_layer(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor,
                      node_samples: torch.Tensor, element_samples: torch.Tensor,
-                     rows: torch.Tensor, erows: torch.Tensor, conditional: bool = False,
-                     **kwargs) -> bool:
+                     rows: torch.Tensor, erows: torch.Tensor, seed_ptr: torch.Tensor,
+                     conditional: bool = False, **kwargs) -> bool:
         """
         Draw a child for every live sample of the frontier rows this layer owns.
 
@@ -666,7 +666,7 @@ class ExternalParamsSumLayer(SumLayer):
         self._check_staged_batch(ns_tensors, node_samples.size(1))
         self.external_params.sample_layer(
             self, ns_tensors, node_mars, element_mars, params, node_samples, element_samples,
-            rows, erows, conditional = conditional, **kwargs
+            rows, erows, seed_ptr, conditional = conditional, **kwargs
         )
         return True
 

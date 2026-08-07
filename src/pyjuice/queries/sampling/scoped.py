@@ -20,14 +20,13 @@ An inactive row holds `-1`, matches no compiled node, and costs a masked-off lan
 
 from __future__ import annotations
 
-import random
 import triton
 import triton.language as tl
 
 
-@triton.jit(do_not_specialize = ["batch_size", "seed"])
+@triton.jit(do_not_specialize = ["batch_size"])
 def _scoped_sum_kernel(nids, cids, pids, node_mars, element_mars, mparams,
-                       node_samples, element_samples, rows, erows, seed, batch_size,
+                       node_samples, element_samples, rows, erows, seed_ptr, batch_size,
                        block_size: tl.constexpr, num_edges: tl.constexpr,
                        num_nblocks: tl.constexpr, BLOCK_B: tl.constexpr, BLOCK_M: tl.constexpr,
                        M_NUM_TILES: tl.constexpr, BLOCK_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
@@ -67,8 +66,10 @@ def _scoped_sum_kernel(nids, cids, pids, node_mars, element_mars, mparams,
 
     mask_lane = mask_lane & (local_nids >= 0)
 
-    # Unique per (row, sample), so rows do not share a random stream
-    rnd_val = tl.rand(seed, row * batch_size + offs_b)
+    # The seed is LOADED, not passed as a scalar: CUDA-graph capture bakes scalar kernel arguments
+    # in, so a captured pass seeded that way would redraw the identical sample on every replay. The
+    # offset is unique per (row, sample), so rows do not share a stream.
+    rnd_val = tl.rand(tl.load(seed_ptr), row * batch_size + offs_b)
 
     if CONDITIONAL:
         nmars = tl.load(node_mars + node_id * batch_size + offs_b, mask = mask_lane, other = 0.0)
@@ -170,7 +171,7 @@ def _scoped_prod_kernel(nids, cids, crows, node_samples, element_samples, rows, 
 
 
 def scoped_sum_layer(layer, nids, cids, pids, node_mars, element_mars, params,
-                     node_samples, element_samples, rows, erows, conditional):
+                     node_samples, element_samples, rows, erows, seed_ptr, conditional):
     num_rows = rows.numel()
     if num_rows == 0:
         return None
@@ -185,7 +186,7 @@ def scoped_sum_layer(layer, nids, cids, pids, node_mars, element_mars, params,
 
     _scoped_sum_kernel[(num_rows, triton.cdiv(batch_size, BLOCK_B))](
         nids, cids, pids, node_mars, element_mars, params, node_samples, element_samples,
-        rows, erows, random.randint(0, 2**31), batch_size,
+        rows, erows, seed_ptr, batch_size,
         layer.block_size, num_edges, num_nblocks, BLOCK_B, BLOCK_M,
         triton.cdiv(num_nblocks, BLOCK_M), BLOCK_K, triton.cdiv(num_edges, BLOCK_K),
         1 if conditional else 0,

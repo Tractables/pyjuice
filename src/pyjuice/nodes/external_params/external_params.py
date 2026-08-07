@@ -280,7 +280,8 @@ class ExternalSumParams():
         raise NotImplementedError()
 
     def sample_layer(self, layer, ns_tensors, node_mars, element_mars, params, node_samples,
-                     element_samples, rows, erows, conditional: bool = False, **kwargs) -> None:
+                     element_samples, rows, erows, seed_ptr, conditional: bool = False,
+                     **kwargs) -> None:
         """
         Draw one child per live sample of every frontier ROW this layer owns, under the EFFECTIVE
         parameters.

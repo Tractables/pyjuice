@@ -129,17 +129,24 @@ def _plan_tape(pc: TensorCircuit, num_samples: int, conditional: bool) -> _PlanT
     return tape
 
 
-def _assert_graphable(pc, tape, do_calibration) -> None:
-    """Refuse a CUDA-graph capture that would be wrong, rather than capturing it."""
+def _assert_graphable(pc, do_calibration, requires_sd: bool) -> None:
+    """
+    Refuse a CUDA-graph capture that would be wrong, rather than capturing it.
+
+    :param requires_sd: whether the pass being captured replays a recorded index plan. The pair-list
+                        pass does, so capturing it is only correct where that plan repeats -- i.e. on
+                        a structured-decomposable circuit. The scoped pass derives its layout from the
+                        circuit instead, so its shapes are static for ANY circuit and the requirement
+                        does not apply.
+    """
     assert torch.cuda.is_available(), "`use_cudagraph` needs a CUDA device."
     assert not do_calibration, "`use_cudagraph` is not supported together with `_do_calibration`."
-    assert getattr(pc, "is_structured_decomposable", False), (
-        "`use_cudagraph = True` needs a structured-decomposable circuit. Without one vtree a sum "
-        "node can choose between products that decompose its scope differently, so how many nodes "
-        "land on the frontier depends on the draw -- the index plan changes call to call and a "
-        "captured pass would replay the wrong one. `pc.is_structured_decomposable` says which you "
-        "have; `PD`-style circuits do not qualify."
-    )
+    if requires_sd:
+        assert getattr(pc, "is_structured_decomposable", False), (
+            "`use_cudagraph = True` with `_use_scope_plan = False` needs a structured-decomposable "
+            "circuit: that pass replays a recorded index plan, and without one vtree the plan changes "
+            "from call to call. The default (scoped) pass has no such restriction."
+        )
 
 
 def _scope_plan(pc: TensorCircuit):
@@ -150,7 +157,36 @@ def _scope_plan(pc: TensorCircuit):
     return plan
 
 
-def _scoped_top_down(pc, plan, node_samples, element_samples, conditional, kwargs):
+def _scoped_state(pc, plan, num_samples: int, conditional: bool, persistent: bool):
+    """
+    The scoped pass's buffers, and its CUDA graph when one was asked for.
+
+    Held across calls only when capturing: a captured launch keeps the pointers it was recorded with,
+    so those buffers must not move. An ordinary draw allocates and lets go, which keeps `sample()`
+    from pinning memory it no longer needs.
+    """
+    seed = torch.zeros([1], dtype = torch.int32, device = pc.device)
+    fresh = {"node": torch.empty([plan.num_node_rows, num_samples], dtype = torch.long,
+                                 device = pc.device),
+             "elem": torch.empty([plan.num_elem_rows, num_samples], dtype = torch.long,
+                                 device = pc.device),
+             "seed": seed, "graph": None}
+    if not persistent:
+        return fresh
+
+    states = pc.__dict__.setdefault("_sample_scoped_states", OrderedDict())
+    key = (int(num_samples), bool(conditional))
+    state = states.get(key)
+    if state is None:
+        while len(states) >= _PLAN_CACHE_SIZE:
+            states.popitem(last = False)
+        state = states[key] = fresh
+    else:
+        states.move_to_end(key)
+    return state
+
+
+def _scoped_top_down(pc, plan, node_samples, element_samples, seed_ptr, conditional, kwargs):
     """
     The top-down pass over a STRUCTURAL frontier layout.
 
@@ -180,7 +216,7 @@ def _scoped_top_down(pc, plan, node_samples, element_samples, conditional, kwarg
                 if isinstance(layer, ExternalParamsSumLayer):
                     handled = layer.sample_layer(
                         pc.node_mars, pc.element_mars, pc.params, node_samples, element_samples,
-                        rows, erows, conditional = conditional, **kwargs
+                        rows, erows, seed_ptr, conditional = conditional, **kwargs
                     )
 
                 if not handled:
@@ -190,7 +226,7 @@ def _scoped_top_down(pc, plan, node_samples, element_samples, conditional, kwarg
                             layer.partitioned_cids[partition_id],
                             layer.partitioned_pids[partition_id],
                             pc.node_mars, pc.element_mars, pc.params,
-                            node_samples, element_samples, rows, erows, conditional
+                            node_samples, element_samples, rows, erows, seed_ptr, conditional
                         )
 
                 # Cleared here rather than inside the kernel: a row may be served by any partition,
@@ -210,7 +246,7 @@ def _scoped_top_down(pc, plan, node_samples, element_samples, conditional, kwarg
 
 
 def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bool = False,
-           use_cudagraph: bool = False, _use_scope_plan: bool = False,
+           use_cudagraph: bool = False, _use_scope_plan: bool = True,
            _sample_input_ns: bool = True, _do_calibration: bool = False, **kwargs):
     """
     Draw samples from a PC by performing a top-down ancestral sampling pass.
@@ -311,7 +347,7 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
                                               device = pc.device)
 
     if use_cudagraph:
-        _assert_graphable(pc, tape, _do_calibration)
+        _assert_graphable(pc, _do_calibration, requires_sd = not _use_scope_plan)
 
     # Under CUDA-graph capture the frontier buffers have to live at fixed addresses across calls,
     # since a captured launch holds the pointers it was recorded with. Elsewhere they are per-call,
@@ -464,20 +500,33 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
 
     
     if _use_scope_plan:
-        # Not silently ignored: the scoped pass has static shapes and no data-dependent ops, so it is
-        # capturable in principle, but the capture below is written against the pair-list pass and
-        # its plan cache. Until that is ported, asking for both has to say so.
-        assert not use_cudagraph, (
-            "`use_cudagraph = True` is not yet supported together with `_use_scope_plan = True`; "
-            "the capture is written against the pair-list pass. Use one or the other."
-        )
-
         plan = _scope_plan(pc)
-        node_samples = torch.empty([plan.num_node_rows, num_samples], dtype = torch.long,
-                                   device = pc.device)
-        element_samples = torch.empty([plan.num_elem_rows, num_samples], dtype = torch.long,
-                                      device = pc.device)
-        _scoped_top_down(pc, plan, node_samples, element_samples, conditional, kwargs)
+        state = _scoped_state(pc, plan, num_samples, conditional, use_cudagraph)
+        node_samples, element_samples, seed_ptr = state["node"], state["elem"], state["seed"]
+
+        # A fresh seed per call, written OUTSIDE any capture -- the kernels load it rather than
+        # taking it as a scalar argument, precisely so a replay redraws
+        seed_ptr.fill_(random.randint(0, 2**31 - 1))
+
+        if not use_cudagraph:
+            _scoped_top_down(pc, plan, node_samples, element_samples, seed_ptr, conditional, kwargs)
+        else:
+            if state["graph"] is None:
+                # One live pass so every buffer exists and every kernel is compiled -- capture
+                # tolerates neither an allocation nor a JIT compile -- then capture on a side stream.
+                _scoped_top_down(pc, plan, node_samples, element_samples, seed_ptr, conditional, kwargs)
+                stream = torch.cuda.Stream()
+                stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(stream):
+                    _scoped_top_down(pc, plan, node_samples, element_samples, seed_ptr,
+                                     conditional, kwargs)
+                torch.cuda.current_stream().wait_stream(stream)
+
+                graph = state["graph"] = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    _scoped_top_down(pc, plan, node_samples, element_samples, seed_ptr,
+                                     conditional, kwargs)
+            state["graph"].replay()
     elif not use_cudagraph:
         _top_down_pass()
     else:

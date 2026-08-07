@@ -296,7 +296,7 @@ def bs_sample_sum_layer(nids, cids, pids, element_mars, params, ext, gate, gate_
 @triton_jit
 def _bs_scoped_sample_kernel(nids, cids, pids, element_mars, mparams, ext, gate, gate_nstride,
                              node_samples, element_samples, rows, erows,
-                             seed, ext_base, batch_size,
+                             seed_ptr, ext_base, batch_size,
                              block_size: tl.constexpr, num_edges: tl.constexpr,
                              num_nblocks: tl.constexpr, BLOCK_B: tl.constexpr, BLOCK_M: tl.constexpr,
                              M_NUM_TILES: tl.constexpr, BLOCK_K: tl.constexpr,
@@ -349,7 +349,9 @@ def _bs_scoped_sample_kernel(nids, cids, pids, element_mars, mparams, ext, gate,
         node_gate_off = (local_nid_offs // GATE_BS) * tl.load(gate_nstride + local_nids,
                                                               mask = mask_lane, other = 0)
 
-    rnd = tl.rand(seed, row * batch_size + offs_b)
+    # Loaded rather than passed as a scalar, so a CUDA-graph replay redraws; see the note in
+    # `queries/sampling/scoped.py`.
+    rnd = tl.rand(tl.load(seed_ptr), row * batch_size + offs_b)
 
     # ---- PASS 1: the normalizer, against a running max (`log phi` is unbounded)
     mx = tl.zeros([BLOCK_B], dtype = tl.float32) - float("inf")
@@ -399,7 +401,7 @@ def _bs_scoped_sample_kernel(nids, cids, pids, element_mars, mparams, ext, gate,
 
 
 def bs_scoped_sum_layer(nids, cids, pids, element_mars, params, ext, gate, gate_nstride,
-                        node_samples, element_samples, rows, erows, seed,
+                        node_samples, element_samples, rows, erows, seed_ptr,
                         block_size: int, node_cbs: int, gate_cbs: int, gate_bs: int,
                         ext_base: int, conditional: bool) -> None:
     """Draw a child for every live sample of every row this gated layer owns."""
@@ -419,7 +421,7 @@ def bs_scoped_sum_layer(nids, cids, pids, element_mars, params, ext, gate, gate_
         nids = nids, cids = cids, pids = pids, element_mars = element_mars, mparams = params,
         ext = ext, gate = gate, gate_nstride = gate_nstride,
         node_samples = node_samples, element_samples = element_samples, rows = rows, erows = erows,
-        seed = seed, ext_base = ext_base, batch_size = batch_size,
+        seed_ptr = seed_ptr, ext_base = ext_base, batch_size = batch_size,
         block_size = block_size, num_edges = num_edges, num_nblocks = num_nblocks,
         BLOCK_B = BLOCK_B, BLOCK_M = BLOCK_M, M_NUM_TILES = triton.cdiv(num_nblocks, BLOCK_M),
         BLOCK_K = BLOCK_K, K_NUM_TILES = triton.cdiv(num_edges, BLOCK_K),

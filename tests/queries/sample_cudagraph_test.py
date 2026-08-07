@@ -58,9 +58,9 @@ def test_no_graph_is_captured_by_default():
     for _ in range(3):
         juice.queries.sample(pc, num_samples = 64)
 
-    for tape in pc.__dict__.get("_sample_plans", {}).values():
-        assert tape.graph is None
-        assert tape.uniforms is None
+    assert not pc.__dict__.get("_sample_plans", {}), "an ordinary draw recorded a pair-list plan"
+    assert not pc.__dict__.get("_sample_scoped_states", {}), \
+        "an ordinary draw pinned buffers or captured a graph"
 
 
 @cuda_only
@@ -108,15 +108,38 @@ def test_graphed_draws_match_ungraphed_ones(conditional):
 
 
 @cuda_only
-def test_a_non_structured_decomposable_circuit_is_refused():
-    """A captured pass replays one specific index plan, so it is wrong wherever the plan varies. The
-    plan cache silently declines such a circuit; an explicit `use_cudagraph = True` says so instead."""
+def test_a_non_structured_decomposable_circuit_can_be_captured_too():
+    """
+    The default pass derives its frontier layout from the circuit, so its shapes are static for ANY
+    circuit and capture no longer needs structured decomposability.
+
+    That requirement belonged to the PAIR-LIST pass, which replays a recorded index plan and is
+    therefore only correct where the plan repeats -- it is still enforced for that path. Getting this
+    backwards is a wrong answer rather than a crash, so both directions are pinned: here, and in
+    `test_the_pair_list_pass_still_requires_it` below.
+    """
     torch.manual_seed(0)
     pc = _non_sd_circuit()
     assert not pc.is_structured_decomposable
 
+    N = 40_000
+    juice.queries.sample(pc, num_samples = N, use_cudagraph = True)         # capture
+    graphed = juice.queries.sample(pc, num_samples = N, use_cudagraph = True).float()
+    plain = juice.queries.sample(pc, num_samples = N).float()
+
+    se = ((graphed.var(dim = 0) + plain.var(dim = 0)) / N).sqrt().clamp(min = 1e-9)
+    z = float(((graphed.mean(dim = 0) - plain.mean(dim = 0)) / se).abs().max())
+    assert z < 5.0, f"captured draws on a non-SD circuit differ: max |z| = {z:.2f}"
+
+
+@cuda_only
+def test_the_pair_list_pass_still_requires_it():
+    """The legacy pass replays one specific plan, so capturing it where the plan varies is wrong."""
+    torch.manual_seed(0)
+    pc = _non_sd_circuit()
+
     with pytest.raises(AssertionError, match = "structured-decomposable"):
-        juice.queries.sample(pc, num_samples = 64, use_cudagraph = True)
+        juice.queries.sample(pc, num_samples = 64, use_cudagraph = True, _use_scope_plan = False)
 
 
 @cuda_only
@@ -125,11 +148,11 @@ def test_a_graph_is_reused_rather_than_recaptured():
     pc = _sd_circuit()
 
     juice.queries.sample(pc, num_samples = 64, use_cudagraph = True)
-    graph = pc.__dict__["_sample_plans"][(64, False)].graph
+    graph = pc.__dict__["_sample_scoped_states"][(64, False)]["graph"]
     assert graph is not None
 
     juice.queries.sample(pc, num_samples = 64, use_cudagraph = True)
-    assert pc.__dict__["_sample_plans"][(64, False)].graph is graph
+    assert pc.__dict__["_sample_scoped_states"][(64, False)]["graph"] is graph
 
 
 @cuda_only
