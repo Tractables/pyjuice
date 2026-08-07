@@ -464,6 +464,14 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
 
     
     if _use_scope_plan:
+        # Not silently ignored: the scoped pass has static shapes and no data-dependent ops, so it is
+        # capturable in principle, but the capture below is written against the pair-list pass and
+        # its plan cache. Until that is ported, asking for both has to say so.
+        assert not use_cudagraph, (
+            "`use_cudagraph = True` is not yet supported together with `_use_scope_plan = True`; "
+            "the capture is written against the pair-list pass. Use one or the other."
+        )
+
         plan = _scope_plan(pc)
         node_samples = torch.empty([plan.num_node_rows, num_samples], dtype = torch.long,
                                    device = pc.device)
