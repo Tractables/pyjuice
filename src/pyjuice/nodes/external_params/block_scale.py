@@ -1543,6 +1543,56 @@ class BlockScaleSumParams(ExternalSumParams):
     # ------------------------------------------------------------------ sampling
 
     def sample_layer(self, layer, ns_tensors, node_mars, element_mars, params, node_samples,
+                     element_samples, rows, erows, conditional: bool = False, **kwargs) -> None:
+        """
+        The gated draw against the structural frontier layout.
+
+        Same distribution and same launch arguments as :func:`sample_layer_pairs` -- the two kernels
+        share `_gate_weights`, so they cannot disagree about what an edge weighs -- addressed by
+        (frontier row, tile of samples) instead of by a list of selected pairs.
+        """
+        from .kernels.blockscale_sample import bs_scoped_sum_layer
+
+        external_params = kwargs.get(_buffer_kwarg(), None)
+        if external_params is None:
+            return None
+
+        if getattr(layer, "ext_slots", None) is None:
+            raise NotImplementedError(
+                "`BlockScaleSumParams` needs the compiled edge-block tables, which require a "
+                "batch-innermost storage layout."
+            )
+
+        self._require_full_supply(layer, ns_tensors)
+
+        ns0 = ns_tensors[0][0].ns
+        num_samples = node_samples.size(1)
+        block_size = layer.block_size
+        gate_bs, gate_cbs = self.gate_sizes(ns0)
+        ext_base = self._ext_base(ns_tensors, external_params, num_samples)
+
+        nstride_cache = layer.__dict__.setdefault("_bs_sample_nstride", {})
+
+        for partition_id in range(layer.num_fw_partitions):
+            nids = layer.partitioned_nids[partition_id]
+
+            key = (partition_id, nids.data_ptr())
+            nstride = nstride_cache.get(key)
+            if nstride is None:
+                nstride = nstride_cache[key] = self._gate_nstride(layer, nids)
+
+            bs_scoped_sum_layer(
+                nids, layer.partitioned_cids[partition_id], layer.partitioned_pids[partition_id],
+                element_mars, params, external_params,
+                layer.ext_slots[0][partition_id], nstride,
+                node_samples, element_samples, rows, erows, random.randint(0, 2**31),
+                block_size = block_size, node_cbs = ns0.ch_block_size, gate_cbs = gate_cbs,
+                gate_bs = gate_bs, ext_base = ext_base, conditional = conditional,
+            )
+
+        return None
+
+    def sample_layer_pairs(self, layer, ns_tensors, node_mars, element_mars, params, node_samples,
                      element_samples, ind_target, ind_n, ind_b, conditional: bool = False,
                      rnd = None, rnd_offset = 0, **kwargs) -> None:
         """

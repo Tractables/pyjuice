@@ -617,7 +617,61 @@ class ExternalParamsSumLayer(SumLayer):
 
         return None
 
+    def _check_staged_batch(self, ns_tensors, num_samples: int) -> None:
+        """
+        The staged tensors must describe THIS many samples.
+
+        The compiled tables express offsets in per-batch units and the kernels multiply by the sample
+        count, so tensors staged for another batch would be read at addresses scaled by the wrong
+        stride -- in bounds, plausible, and someone else's gate. `_resolve_external_tensors` skips
+        validation for already-staged views, which is exactly the case this can arise in.
+        """
+        for ns_info, tensors in ns_tensors:
+            shapes = self.external_params.storage_shapes(ns_info.ns, num_samples)
+            for tensor, shape in zip(tensors, shapes):
+                if tuple(tensor.size()) == tuple(shape):
+                    continue
+
+                staged_batch = tensor.size(-1)
+                raise AssertionError(
+                    f"Sampling {num_samples} sample(s) from this circuit, but the external sum "
+                    f"parameters staged on it are for a batch of {staged_batch}.\n\n"
+                    f"`sample()` does not take `{EXTERNAL_PARAMS_KWARG}` from its own arguments -- it "
+                    f"uses whatever the FORWARD pass staged, because the `node_mars` / `element_mars` "
+                    f"it conditions on were computed with those values, and drawing against any other "
+                    f"gate would be sampling one distribution conditioned on another.\n\n"
+                    f"A forward pass that is given no `{EXTERNAL_PARAMS_KWARG}` runs this layer as a "
+                    f"PLAIN sum layer and drops the previous staging, so the usual cause is a forward "
+                    f"at one batch size followed by a draw at another.\n\n"
+                    f"  node:   {ns_info.ns}\n"
+                    f"  staged: {tuple(tensor.size())}\n"
+                    f"  needed: {tuple(shape)}"
+                )
+
     def sample_layer(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor,
+                     node_samples: torch.Tensor, element_samples: torch.Tensor,
+                     rows: torch.Tensor, erows: torch.Tensor, conditional: bool = False,
+                     **kwargs) -> bool:
+        """
+        Draw a child for every live sample of the frontier rows this layer owns.
+
+        The counterpart of :func:`sample_layer_pairs` for the structural frontier layout. Returns
+        whether this layer handled the draw; `False` means no external tensors were supplied, so it
+        IS a plain sum layer and the caller falls back to the shared-parameter kernel.
+        """
+        ns_tensors = self._resolve_external_tensors(kwargs, node_samples.size(1), node_samples.device)
+        if len(ns_tensors) == 0:
+            return False
+
+        self._check_staged_batch(ns_tensors, node_samples.size(1))
+        self.external_params.sample_layer(
+            self, ns_tensors, node_mars, element_mars, params, node_samples, element_samples,
+            rows, erows, conditional = conditional, **kwargs
+        )
+        return True
+
+    def sample_layer_pairs(self, node_mars: torch.Tensor, element_mars: torch.Tensor,
+                     params: torch.Tensor,
                      node_samples: torch.Tensor, element_samples: torch.Tensor,
                      ind_target: torch.Tensor, ind_n: torch.Tensor, ind_b: torch.Tensor,
                      conditional: bool = False, rnd = None, rnd_offset = 0,
@@ -642,44 +696,9 @@ class ExternalParamsSumLayer(SumLayer):
         if len(ns_tensors) == 0:
             return False
 
-        # The compiled tables express offsets in PER-BATCH units and the kernels multiply by the
-        # sample count, so tensors staged for a different batch would be read at addresses scaled by
-        # the wrong stride -- in bounds, plausible, and someone else's gate. `_resolve_external_tensors`
-        # skips validation for already-staged views, which is exactly the case this can arise in:
-        # `pc._staged_external_params` is never cleared, so a conditional draw can reach views a much
-        # older forward pass left behind.
-        for ns_info, tensors in ns_tensors:
-            shapes = self.external_params.storage_shapes(ns_info.ns, num_samples)
-            for tensor, shape in zip(tensors, shapes):
-                if tuple(tensor.size()) == tuple(shape):
-                    continue
+        self._check_staged_batch(ns_tensors, num_samples)
 
-                staged_batch = tensor.size(-1)
-                raise AssertionError(
-                    f"Sampling {num_samples} sample(s) from this circuit, but the external sum "
-                    f"parameters staged on it are for a batch of {staged_batch}.\n\n"
-                    f"`sample()` does not take `{EXTERNAL_PARAMS_KWARG}` from its own arguments -- it "
-                    f"uses whatever the FORWARD pass staged, because the `node_mars` / `element_mars` "
-                    f"it conditions on were computed with those values, and drawing against any other "
-                    f"gate would be sampling one distribution conditioned on another.\n\n"
-                    f"A forward pass that is given no `{EXTERNAL_PARAMS_KWARG}` runs this layer as a "
-                    f"PLAIN sum layer and leaves the previous staging in place rather than replacing "
-                    f"it, so the usual cause is an intervening ungated forward at a different batch "
-                    f"size:\n"
-                    f"    pc(x_a, {EXTERNAL_PARAMS_KWARG} = ...)        # staged at batch {staged_batch}\n"
-                    f"    pc(x_b)                                  # no gate -> staging left stale\n"
-                    f"    sample(pc, conditional = True)           # <- here, at batch {num_samples}\n\n"
-                    f"Pass `{EXTERNAL_PARAMS_KWARG}` on EVERY forward of this circuit (batched ones "
-                    f"included), or, if that call is deliberately ungated, repeat the gated forward "
-                    f"immediately before sampling. Note the input-layer kwargs -- "
-                    f"`categorical_evidence_logp`, `soft_evidence_value_mask` and the like -- are a "
-                    f"different mechanism and do not stage a gate.\n\n"
-                    f"  node:   {ns_info.ns}\n"
-                    f"  staged: {tuple(tensor.size())}\n"
-                    f"  needed: {tuple(shape)}"
-                )
-
-        self.external_params.sample_layer(
+        self.external_params.sample_layer_pairs(
             self, ns_tensors, node_mars, element_mars, params, node_samples, element_samples,
             ind_target, ind_n, ind_b, conditional = conditional,
             rnd = rnd, rnd_offset = rnd_offset, **kwargs

@@ -280,8 +280,29 @@ class ExternalSumParams():
         raise NotImplementedError()
 
     def sample_layer(self, layer, ns_tensors, node_mars, element_mars, params, node_samples,
-                     element_samples, ind_target, ind_n, ind_b, conditional: bool = False,
-                     rnd = None, rnd_offset = 0, **kwargs) -> None:
+                     element_samples, rows, erows, conditional: bool = False, **kwargs) -> None:
+        """
+        Draw one child per live sample of every frontier ROW this layer owns, under the EFFECTIVE
+        parameters.
+
+        The rows come from the circuit's structural frontier layout
+        (:mod:`pyjuice.queries.sampling.scope_plan`): `rows` are the `node_samples` rows this layer
+        owns and `erows` where each one's drawn child is written. A row holds `-1` where its scope is
+        not on that sample's path, so liveness is a mask rather than a shape.
+
+        Everything else matches :func:`sample_layer_pairs`, which this replaces -- see there for what
+        the draw has to be, and why the normalizer cancels out of it.
+        """
+        raise NotImplementedError(
+            f"`{self.get_signature()}` does not implement ancestral sampling against the structural "
+            f"frontier layout. Sampling it with the shared-parameter kernel would ignore the "
+            f"per-sample parameters and quietly return samples from a different distribution than "
+            f"the forward pass scores, so it is refused instead."
+        )
+
+    def sample_layer_pairs(self, layer, ns_tensors, node_mars, element_mars, params, node_samples,
+                           element_samples, ind_target, ind_n, ind_b, conditional: bool = False,
+                           rnd = None, rnd_offset = 0, **kwargs) -> None:
         """
         Draw one child per selected node of this layer, under the EFFECTIVE parameters.
 

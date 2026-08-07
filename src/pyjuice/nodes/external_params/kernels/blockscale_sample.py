@@ -291,3 +291,140 @@ def bs_sample_sum_layer(nids, cids, pids, element_mars, params, ext, gate, gate_
     )
 
     return None
+
+
+@triton_jit
+def _bs_scoped_sample_kernel(nids, cids, pids, element_mars, mparams, ext, gate, gate_nstride,
+                             node_samples, element_samples, rows, erows,
+                             seed, ext_base, batch_size,
+                             block_size: tl.constexpr, num_edges: tl.constexpr,
+                             num_nblocks: tl.constexpr, BLOCK_B: tl.constexpr, BLOCK_M: tl.constexpr,
+                             M_NUM_TILES: tl.constexpr, BLOCK_K: tl.constexpr,
+                             K_NUM_TILES: tl.constexpr, NODE_CBS: tl.constexpr,
+                             GATE_CBS: tl.constexpr, GATE_BS: tl.constexpr,
+                             N_NODE_GATES: tl.constexpr, gate_stride: tl.constexpr,
+                             CONDITIONAL: tl.constexpr):
+    """
+    The gated draw against the STRUCTURAL frontier layout (`queries/sampling/scope_plan.py`).
+
+    Same mathematics as `_bs_sample_kernel` -- it shares `_gate_weights`, so the two cannot disagree
+    about what an edge weighs -- but addressed by (frontier row, tile of samples) rather than by a
+    list of selected pairs. The row is a scalar per program, which makes `node_samples[row, b]`
+    contiguous along `b`, and every shape is static.
+    """
+    pid_r = tl.program_id(0)
+    pid_b = tl.program_id(1)
+
+    row = tl.load(rows + pid_r)
+    erow = tl.load(erows + pid_r)
+
+    offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
+    mask_b = offs_b < batch_size
+
+    node_id = tl.load(node_samples + row * batch_size + offs_b, mask = mask_b, other = -1)
+    mask_lane = mask_b & (node_id >= 0)
+
+    offs_nids = tl.arange(0, BLOCK_M)
+    local_nids = tl.zeros([BLOCK_B], dtype = tl.int64) - 1
+    local_nid_offs = tl.zeros([BLOCK_B], dtype = tl.int64)
+    for i in range(M_NUM_TILES):
+        mask_nids = offs_nids < num_nblocks
+
+        ref_nid = tl.load(nids + offs_nids, mask = mask_nids, other = 0)
+        is_match = (node_id[:,None] >= ref_nid[None,:]) & \
+                   (node_id[:,None] < ref_nid[None,:] + block_size) & mask_nids[None,:]
+
+        match_local_id = tl.sum(is_match * (offs_nids[None,:] + 1), axis = 1)
+        match_local_offset = tl.sum(is_match * (node_id[:,None] - ref_nid[None,:]), axis = 1)
+
+        local_nids = tl.where(match_local_id > 0, match_local_id - 1, local_nids)
+        local_nid_offs = tl.where(match_local_id > 0, match_local_offset, local_nid_offs)
+
+        offs_nids += BLOCK_M
+
+    mask_lane = mask_lane & (local_nids >= 0)
+
+    node_gate_off = tl.zeros([BLOCK_B], dtype = tl.int64)
+    if N_NODE_GATES > 1:
+        node_gate_off = (local_nid_offs // GATE_BS) * tl.load(gate_nstride + local_nids,
+                                                              mask = mask_lane, other = 0)
+
+    rnd = tl.rand(seed, row * batch_size + offs_b)
+
+    # ---- PASS 1: the normalizer, against a running max (`log phi` is unbounded)
+    mx = tl.zeros([BLOCK_B], dtype = tl.float32) - float("inf")
+    acc = tl.zeros([BLOCK_B], dtype = tl.float32)
+    for k in range(K_NUM_TILES):
+        offs_edge = tl.arange(0, BLOCK_K) + k * BLOCK_K
+        mask_edge = offs_edge < num_edges
+
+        epars, a = _gate_weights(cids, pids, element_mars, mparams, ext, gate,
+                                 local_nids, local_nid_offs, node_gate_off, offs_b, offs_edge,
+                                 mask_lane, mask_edge, batch_size, ext_base,
+                                 num_edges, NODE_CBS, GATE_CBS, gate_stride, CONDITIONAL)
+
+        nmx = tl.maximum(mx, tl.max(a, axis = 0))
+        rescale = tl.where(nmx == -float("inf"), 0.0, tl.exp(mx - nmx))
+        w = tl.where(nmx[None,:] == -float("inf"), 0.0, epars * tl.exp(a - nmx[None,:]))
+        acc = acc * rescale + tl.sum(w, axis = 0)
+        mx = nmx
+
+    # ---- PASS 2: the inverse-CDF walk, against the final shift
+    r = rnd * acc
+    chids = tl.zeros([BLOCK_B], dtype = tl.int64) - 1
+    last_edge = tl.zeros([BLOCK_B], dtype = tl.int64) - 1
+    for k in range(K_NUM_TILES):
+        offs_edge = tl.arange(0, BLOCK_K) + k * BLOCK_K
+        mask_edge = offs_edge < num_edges
+
+        epars, a = _gate_weights(cids, pids, element_mars, mparams, ext, gate,
+                                 local_nids, local_nid_offs, node_gate_off, offs_b, offs_edge,
+                                 mask_lane, mask_edge, batch_size, ext_base,
+                                 num_edges, NODE_CBS, GATE_CBS, gate_stride, CONDITIONAL)
+
+        w = tl.where(mx[None,:] == -float("inf"), 0.0, epars * tl.exp(a - mx[None,:]))
+        local_chids = tl.sum((r[None,:] >= tl.cumsum(w, axis = 0)).to(tl.int64), axis = 0)
+
+        is_overflow = (local_chids == BLOCK_K)
+        r = tl.where(is_overflow, r - tl.sum(w, axis = 0), r)
+        chids = tl.where(is_overflow | (chids > -1), chids, local_chids + k * BLOCK_K)
+        last_edge = tl.maximum(last_edge,
+                               tl.max(tl.where(w > 0.0, offs_edge[:,None], -1), axis = 0).to(tl.int64))
+
+    chids = tl.where((chids < 0) | (chids >= num_edges), last_edge, chids)
+    chids = tl.where(chids < 0, 0, chids)
+
+    global_chids = tl.load(cids + local_nids * num_edges + chids, mask = mask_lane, other = 0)
+    tl.store(element_samples + erow * batch_size + offs_b, global_chids, mask = mask_lane)
+
+
+def bs_scoped_sum_layer(nids, cids, pids, element_mars, params, ext, gate, gate_nstride,
+                        node_samples, element_samples, rows, erows, seed,
+                        block_size: int, node_cbs: int, gate_cbs: int, gate_bs: int,
+                        ext_base: int, conditional: bool) -> None:
+    """Draw a child for every live sample of every row this gated layer owns."""
+    num_rows = rows.numel()
+    if num_rows == 0:
+        return None
+
+    batch_size = node_samples.size(1)
+    num_edges = cids.size(1)
+    num_nblocks = nids.size(0)
+
+    BLOCK_K = max(2, min(512, triton.next_power_of_2(num_edges)))
+    BLOCK_M = max(2, min(512, triton.next_power_of_2(num_nblocks)))
+    BLOCK_B = max(2, min(2048 // BLOCK_K, 2048 // BLOCK_M, triton.next_power_of_2(batch_size)))
+
+    _bs_scoped_sample_kernel[(num_rows, triton.cdiv(batch_size, BLOCK_B))](
+        nids = nids, cids = cids, pids = pids, element_mars = element_mars, mparams = params,
+        ext = ext, gate = gate, gate_nstride = gate_nstride,
+        node_samples = node_samples, element_samples = element_samples, rows = rows, erows = erows,
+        seed = seed, ext_base = ext_base, batch_size = batch_size,
+        block_size = block_size, num_edges = num_edges, num_nblocks = num_nblocks,
+        BLOCK_B = BLOCK_B, BLOCK_M = BLOCK_M, M_NUM_TILES = triton.cdiv(num_nblocks, BLOCK_M),
+        BLOCK_K = BLOCK_K, K_NUM_TILES = triton.cdiv(num_edges, BLOCK_K),
+        NODE_CBS = node_cbs, GATE_CBS = gate_cbs, GATE_BS = gate_bs,
+        N_NODE_GATES = block_size // gate_bs, gate_stride = gate.size(1),
+        CONDITIONAL = (1 if conditional else 0),
+    )
+    return None

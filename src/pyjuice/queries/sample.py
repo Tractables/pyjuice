@@ -158,23 +158,6 @@ def _scoped_top_down(pc, plan, node_samples, element_samples, conditional, kwarg
     cursor -- the three things that account for ~92% of the ordinary pass's GPU time. What is left is
     the sampling kernels themselves, one launch per layer per partition.
     """
-    # NOT YET WIRED for per-sample external parameters: this path calls the shared-parameter kernels
-    # directly rather than going through `ExternalParamsSumLayer.sample_layer`, so a gated layer would
-    # be drawn from `theta_shared` and quietly return samples from a different distribution than the
-    # forward scores. Refused until the dispatch is added.
-    for layer_group in pc.inner_layer_groups:
-        if not layer_group.is_sum():
-            continue
-        for layer in layer_group:
-            if isinstance(layer, ExternalParamsSumLayer) and \
-                    len(layer._resolve_external_tensors(kwargs, node_samples.size(1),
-                                                        node_samples.device)) > 0:
-                raise NotImplementedError(
-                    "`_use_scope_plan = True` does not yet serve sum layers with per-sample external "
-                    "parameters; it would sample their shared parameters instead. Use the default "
-                    "path for gated circuits."
-                )
-
     node_samples.fill_(-1)
     node_samples[plan.root_row, :] = pc.root_ns._output_ind_range[0]
 
@@ -190,13 +173,25 @@ def _scoped_top_down(pc, plan, node_samples, element_samples, conditional, kwarg
                 if conditional:
                     pc.inner_layer_groups[layer_id - 1](pc.node_mars, pc.element_mars)
 
-                for partition_id in range(layer.num_fw_partitions):
-                    scoped_sum_layer(
-                        layer, layer.partitioned_nids[partition_id],
-                        layer.partitioned_cids[partition_id], layer.partitioned_pids[partition_id],
-                        pc.node_mars, pc.element_mars, pc.params,
-                        node_samples, element_samples, rows, erows, conditional
+                # A layer whose parameters are modified per sample owns its own kernel, exactly as
+                # it owns its forward and its backward. It declines (returning `False`) when no
+                # external tensors were supplied, in which case it IS a plain sum layer.
+                handled = False
+                if isinstance(layer, ExternalParamsSumLayer):
+                    handled = layer.sample_layer(
+                        pc.node_mars, pc.element_mars, pc.params, node_samples, element_samples,
+                        rows, erows, conditional = conditional, **kwargs
                     )
+
+                if not handled:
+                    for partition_id in range(layer.num_fw_partitions):
+                        scoped_sum_layer(
+                            layer, layer.partitioned_nids[partition_id],
+                            layer.partitioned_cids[partition_id],
+                            layer.partitioned_pids[partition_id],
+                            pc.node_mars, pc.element_mars, pc.params,
+                            node_samples, element_samples, rows, erows, conditional
+                        )
 
                 # Cleared here rather than inside the kernel: a row may be served by any partition,
                 # and clearing it in one launch would hide it from the next.
@@ -386,7 +381,7 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
                     # tensors were supplied for it, in which case it IS a plain sum layer.
                     handled = False
                     if isinstance(layer, ExternalParamsSumLayer):
-                        handled = layer.sample_layer(
+                        handled = layer.sample_layer_pairs(
                             pc.node_mars, pc.element_mars, pc.params, node_samples, element_samples,
                             ind_target, ind_n, ind_b, conditional = conditional,
                             rnd = rnd_buf, rnd_offset = rnd_offset, **kwargs
