@@ -45,7 +45,7 @@ def pytest_configure(config):
         else:
             # No restriction provided: enumerate all physical GPUs WITHOUT initializing CUDA.
             try:
-                out = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True)
+                out = subprocess.run(["nvidia-smi", "-L"], capture_output = True, text = True)
                 num_gpus = len(out.stdout.strip().splitlines())
             except FileNotFoundError:
                 num_gpus = 1
@@ -91,7 +91,36 @@ def pytest_collection_modifyitems(session, config, items):
         return   # no cache yet (first run) -> leave collection order untouched
 
     INF = float("inf")
-    items.sort(key = lambda it: durations.get(it.nodeid, INF), reverse = True)
+    ordered = sorted(items, key = lambda it: durations.get(it.nodeid, INF), reverse = True)
+
+    # INTERLEAVE the sorted list into one bucket per worker, then concatenate.
+    #
+    # Sorting slowest-first is only half the job, and on its own it does the OPPOSITE of what it
+    # intends: xdist's `load` scheduler seeds each worker with a CONSECUTIVE chunk of
+    # `len(pending) // 4 // nodes` tests, and a consecutive slice of a slowest-first list is simply
+    # the slowest tests. MEASURED on this suite at `-n 8`: gw0 received the 30 heaviest tests, 444
+    # seconds of them, while the other seven finished ~30s each and idled -- a 15x imbalance, and a
+    # wall time of 490s against an 86s theoretical floor.
+    #
+    # Round-robining into `n` buckets makes each of those initial chunks a balanced mix (the 1st,
+    # 9th, 17th ... slowest go to one worker), which is LPT assignment expressed as an ordering,
+    # since the ordering is the only thing this hook controls.
+    # The worker count has DIFFERENT sources in the two kinds of process, and getting this wrong is
+    # silent: `config.option.numprocesses` is set only in the controller, while the scheduler builds
+    # its plan from `next(iter(node2collection.values()))` -- a WORKER's order. An interleave applied
+    # only in the controller therefore changes nothing at all, which is exactly how the first
+    # version of this failed (490s -> 458s, i.e. noise). xdist exports the count to workers in the
+    # environment; both processes must reach the same number or xdist aborts on differing
+    # collections.
+    workers = os.environ.get("PYTEST_XDIST_WORKER_COUNT")
+    workers = int(workers) if workers else getattr(config.option, "numprocesses", None)
+    if isinstance(workers, int) and workers > 1:
+        buckets = [[] for _ in range(workers)]
+        for i, item in enumerate(ordered):
+            buckets[i % workers].append(item)
+        ordered = [item for bucket in buckets for item in bucket]
+
+    items[:] = ordered
 
 
 def pytest_runtest_logreport(report):
