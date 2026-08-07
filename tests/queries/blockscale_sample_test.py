@@ -540,21 +540,31 @@ def test_a_gated_pc_sampled_without_gates_uses_the_shared_parameters():
 
 
 @cuda_only
-def test_gates_staged_at_another_batch_size_are_refused():
-    """`pc._staged_external_params` is never cleared, so a conditional draw can reach views an older
-    forward pass left behind. Read at the wrong batch they would be in bounds and plausible."""
+def test_an_ungated_forward_makes_the_following_draw_ungated():
+    """
+    A conditional draw uses whatever the forward staged, so an ungated forward -- which runs the
+    gated layers as plain sum layers -- must leave nothing staged, and the draw that follows is from
+    the shared parameters. Consistent with the `node_mars` it conditions on, which is the point.
+
+    This used to raise instead: the staged tensors were never dropped, so the draw found an earlier
+    forward's gate at an unrelated batch size. Read at a matching batch they would have been in
+    bounds and plausible, which is why the mismatch is now made unreachable rather than merely
+    detected. See `tests/model/external_params/external_params_staging_test.py`.
+    """
     pc, ns, _, K = _build(seed = 13)
     Nk, Ck = _gate_shape(ns)
     dev = pc.device
 
-    x8 = torch.randint(0, K, [8, 2], device = dev)
-    pc(x8, sum_external_params = {ns: torch.randn([8, Nk, Ck], device = dev)})
+    pc(torch.randint(0, K, [8, 2], device = dev),
+       sum_external_params = {ns: torch.randn([8, Nk, Ck], device = dev)})
+    assert pc._staged_external_params is not None
 
-    # A LATER, ungated forward at a different batch leaves `node_mars` at 32 and the gates at 8
+    # A LATER, ungated forward at a different batch size
     pc(torch.randint(0, K, [32, 2], device = dev))
+    assert pc._staged_external_params is None
 
-    with pytest.raises(AssertionError, match = "different batch size"):
-        juice.queries.sample(pc, conditional = True)
+    samples = juice.queries.sample(pc, conditional = True)
+    assert samples.shape == (32, pc.num_vars)
 
 
 @cuda_only

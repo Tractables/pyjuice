@@ -1020,11 +1020,35 @@ class TensorCircuit(nn.Module):
         Called from the forward pass. The backward reuses what was staged here rather than asking for
         the tensors again, which also makes it impossible to run a backward whose external parameters
         disagree with the forward that produced `node_mars`.
+
+        :note: what is staged always describes the MOST RECENT forward, including when that forward
+               supplied nothing -- see below.
         """
         ns2tensors = kwargs.get(EXTERNAL_PARAMS_KWARG, None)
 
-        if ns2tensors is None or isinstance(ns2tensors, StagedExternalParams):
-            # Nothing supplied, or already staged (e.g. re-entered through the autograd hook)
+        if ns2tensors is None:
+            # This forward runs the gated layers as plain sum layers, so whatever was staged earlier
+            # no longer describes the state `node_mars` was computed in. DROPPING it is what keeps the
+            # staged tensors a description of the latest forward rather than of some earlier one.
+            #
+            # Leaving them in place is a quiet trap, because the two consumers that read this field --
+            # `pc.backward()` and a conditional `queries.sample()` -- take it unconditionally. An
+            # ungated forward between a gated one and its consumer then applied a stale gate: at a
+            # matching batch size silently, and at a differing one as a confusing shape error from
+            # deep inside the sampler. `lls.backward()` was never exposed to it, since the hook
+            # carries the kwargs of the forward that registered it.
+            #
+            # The cost is that a FORGOTTEN gate is now silent rather than loud: the backward or draw
+            # simply runs ungated, consistent with the forward it follows. That is the honest reading
+            # of "no external parameters were supplied", and alternating gated and ungated forwards is
+            # legitimate (an ungated baseline likelihood, a marginal query), so it is not warned about.
+            self._staged_external_params = None
+            return None
+
+        if isinstance(ns2tensors, StagedExternalParams):
+            # Already staged: the caller handed back a dict this method produced. Not hypothetical --
+            # `forward` mutates `kwargs` in place and then registers the backward hook with `**kwargs`,
+            # so a staged dict really does come back round, and clearing here would break it.
             return None
 
         views = StagedExternalParams(self._external_params_views(
