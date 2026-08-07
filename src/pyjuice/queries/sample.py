@@ -220,23 +220,41 @@ def _scoped_state(pc, plan, num_samples: int, conditional: bool, persistent: boo
     Held across calls only when capturing: a captured launch keeps the pointers it was recorded with,
     so those buffers must not move. An ordinary draw allocates and lets go, which keeps `sample()`
     from pinning memory it no longer needs.
+
+    **One buffer serves every batch size, for an UNCONDITIONAL draw.** A graph captured at width `W`
+    always computes `W` lanes, so a request for fewer can replay it and read the first `num_samples`
+    columns; only a request for MORE has to reallocate and recapture. A decode loop whose batch
+    shrinks as sequences finish would otherwise capture a graph per size -- each capture costing
+    three live passes -- and then evict them through an 8-entry cache, which is slower than not using
+    a graph at all.
+
+    **A conditional draw cannot share.** Its kernels address `pc.node_mars` as
+    `node_id * batch_size + b`, and `batch_size` is frozen at capture; replaying a width-`W` graph
+    after a forward pass run at some other batch would read that tensor with the wrong stride -- not
+    a truncated answer but a wrong one. Those stay keyed by batch size, as before.
     """
-    seed = torch.zeros([1], dtype = torch.int32, device = pc.device)
-    fresh = {"node": torch.empty([plan.num_node_rows, num_samples], dtype = torch.long,
-                                 device = pc.device),
-             "elem": torch.empty([plan.num_elem_rows, num_samples], dtype = torch.long,
-                                 device = pc.device),
-             "seed": seed, "graph": None, "bindings": None}
+    def allocate(width):
+        return {"node": torch.empty([plan.num_node_rows, width], dtype = torch.long,
+                                    device = pc.device),
+                "elem": torch.empty([plan.num_elem_rows, width], dtype = torch.long,
+                                    device = pc.device),
+                "seed": torch.zeros([1], dtype = torch.int32, device = pc.device),
+                "graph": None, "bindings": None}
+
     if not persistent:
-        return fresh
+        return allocate(num_samples)
 
     states = pc.__dict__.setdefault("_sample_scoped_states", OrderedDict())
-    key = (int(num_samples), bool(conditional))
+    key = (int(num_samples), True) if conditional else (None, False)
+
     state = states.get(key)
     if state is None:
         while len(states) >= _PLAN_CACHE_SIZE:
             states.popitem(last = False)
-        state = states[key] = fresh
+        state = states[key] = allocate(num_samples)
+    elif state["node"].size(1) < num_samples:
+        # Grow. The old graph held pointers into buffers that are about to go, so it cannot survive.
+        state = states[key] = allocate(num_samples)
     else:
         states.move_to_end(key)
     return state
@@ -638,13 +656,19 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
         graph.replay()
         tape.cursor = 0
 
+    # The frontier buffer may be WIDER than this call asked for -- a captured unconditional pass is
+    # shared across batch sizes (see `_scoped_state`), so only its first `num_samples` columns belong
+    # to this draw. Everything downstream is sized by `num_samples`, so take that view here.
+    oversized = node_samples.size(1) != num_samples
+    frontier = node_samples[:, :num_samples] if oversized else node_samples
+
     # Create tensor for the samples
     data_dtype = pc.input_layer_group[0].get_data_dtype()
     samples = torch.zeros([pc.num_vars, num_samples], dtype = data_dtype, device = pc.device)
 
     pc._init_buffer(name = "node_flows", shape = (pc.num_nodes, num_samples), set_value = 0.0)
-    ind_n, ind_b = torch.where(node_samples != -1)
-    ind_node = node_samples[ind_n, ind_b]
+    ind_n, ind_b = torch.where(frontier != -1)
+    ind_node = frontier[ind_n, ind_b]
     pc.node_flows[ind_node, ind_b] = 1.0
 
     if _sample_input_ns:
@@ -654,6 +678,8 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
 
         return samples.permute(1, 0).contiguous()
     else:
-        # In this case, we do not explicitly sample input nodes
+        # In this case, we do not explicitly sample input nodes. The compaction runs per column, so
+        # it is applied to the whole buffer and the caller's share sliced out afterwards -- as a COPY
+        # when the buffer is shared, since a view of it would alias the next draw's workspace.
         push_non_neg_ones_to_front(node_samples)
-        return node_samples
+        return node_samples[:, :num_samples].contiguous() if oversized else node_samples
