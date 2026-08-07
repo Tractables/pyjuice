@@ -401,3 +401,51 @@ def test_conditional_graphs_stay_keyed_by_batch_size():
 
     keys = set(pc.__dict__["_sample_scoped_states"])
     assert (4096, True) in keys and (1024, True) in keys
+
+
+# --------------------------------------------------- gates, graphs and a changing batch size
+
+@cuda_only
+def test_a_gated_draw_survives_a_shrinking_batch_under_a_graph():
+    """
+    REGRESSION. The shared workspace above is keyed `(None, False)` and stays at the widest batch
+    seen, but the GATED kernels take the frontier's width as their sample count -- using it both to
+    validate the staged tensors and to stride the gate table. A width-4096 replay of an 8-sample
+    gated draw was therefore rejected outright ("staged ... for a batch of 8 ... needed 4096"), and
+    had it not been, it would have read past the end of the gate buffer.
+
+    Gated draws consequently keep one workspace per batch size; only ungated ones share. Both
+    directions are exercised, because growing reallocates and shrinking is what a decode loop does.
+    """
+    pc, gated_ns, (num_node_gates, num_ch_gates) = _gated_circuit()
+
+    def gate(n):
+        torch.manual_seed(9)
+        return (torch.randn([1, num_node_gates, num_ch_gates], device = pc.device) * 2.0
+                ).expand(n, -1, -1).contiguous()
+
+    for n in (4096, 512, 8, 4096, 16384):
+        samples = juice.queries.sample(pc, num_samples = n, use_cudagraph = True,
+                                       sum_external_params = {gated_ns: gate(n)})
+        assert samples.size(0) == n, f"asked for {n} samples, got {samples.size(0)}"
+
+
+@cuda_only
+def test_a_returned_frontier_is_not_the_live_workspace():
+    """
+    REGRESSION. `_sample_input_ns = False` returns the frontier itself, and under `use_cudagraph`
+    that buffer is pinned for the circuit's lifetime -- so the caller's result was being overwritten
+    by their next draw. Two frontiers held at once must not share storage.
+
+    :note: the first attempt at this fix used `.contiguous()`, which on an already-contiguous slice
+           returns the SAME object and so changed nothing. It needs an explicit copy.
+    """
+    torch.manual_seed(0)
+    pc = _sd_circuit()
+
+    first = juice.queries.sample(pc, num_samples = 256, use_cudagraph = True, _sample_input_ns = False)
+    snapshot = first.clone()
+    second = juice.queries.sample(pc, num_samples = 256, use_cudagraph = True, _sample_input_ns = False)
+
+    assert first.data_ptr() != second.data_ptr(), "two frontiers share one buffer"
+    assert torch.equal(first, snapshot), "the first frontier was overwritten by the second draw"

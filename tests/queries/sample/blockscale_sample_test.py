@@ -48,6 +48,8 @@ them, but that turned out to depend on what the allocator had left past the tabl
 failed with the test ORDERING, not with the kernel.
 """
 
+import random
+
 import pytest
 import torch
 
@@ -70,6 +72,12 @@ def _build(block_size = 4, gate_bs = None, gate_cbs = 2, n_ch_blocks = 4, n_node
            edge_ids = None, seed = 0):
     """A gated sum node whose drawn child is readable off the sampler's frontier."""
     torch.manual_seed(seed)
+    # `random` too, not just torch: `queries.sample` draws its kernel seed from the `random` MODULE
+    # (`sample.py`, `random.randint`), which `torch.manual_seed` does not touch. Seeding only torch
+    # left every draw in this file depending on how many times OTHER tests had called `random`, so a
+    # test's outcome moved with its neighbours -- `test_conditional_multi_tile_edge_axis` failed
+    # about 2 runs in 14 when this file ran after another, and never when it ran alone.
+    random.seed(seed)
     K = n_ch_blocks * block_size
     with juice.set_block_size(block_size):
         i0 = inputs(0, num_node_blocks = n_ch_blocks, dist = dists.Categorical(num_cats = K))
@@ -627,3 +635,52 @@ def test_a_parameterization_without_a_sampler_refuses_rather_than_ignoring_its_p
                     for shape in ns.external_params.tensor_shapes(ns, 32))
     with pytest.raises(NotImplementedError, match = "does not implement ancestral sampling"):
         juice.queries.sample(pc, num_samples = 32, sum_external_params = {ns: tensors})
+
+
+# ------------------------------------------- a draw must not disturb the forward it sits after
+
+@cuda_only
+@pytest.mark.parametrize("interposed", ["ungated", "gated"])
+def test_a_draw_between_a_forward_and_its_backward_keeps_the_forward_s_gates(interposed):
+    """
+    REGRESSION, and a training-loop corruption rather than a crash.
+
+    `pc.backward()` deliberately takes its external parameters from whatever the forward staged --
+    that is what stops a backward being run against gates its `node_mars` was not built with. An
+    unconditional `queries.sample()` also stages, into the same buffer, and so a draw placed between
+    a forward and its backward rewrote that state: an UNGATED draw cleared it, so the backward ran
+    ungated against gated marginals, and a GATED draw substituted its own gates. Neither raised.
+    Measured before the fix as flow differences of 17-21 against a truth of 0.
+
+    The draw now stages into a private buffer. Sharing the default one is not enough to fix by
+    saving and restoring the field, either: the buffer is REALLOCATED whenever the batch size
+    differs, which invalidates the forward's views in place.
+    """
+    batch = 512
+
+    def flows(interpose):
+        pc, ns, i0, K = _build(seed = 0)
+        num_node_gates, num_ch_gates = _gate_shape(ns)
+        torch.manual_seed(9)
+        gate_a = (torch.randn([1, num_node_gates, num_ch_gates], device = pc.device) * 2.0
+                  ).expand(batch, -1, -1).contiguous()
+
+        data = torch.randint(0, K, [batch, pc.num_vars], device = pc.device)
+        pc(data, sum_external_params = {ns: gate_a})
+
+        if interpose == "ungated":
+            juice.queries.sample(pc, num_samples = 777)
+        elif interpose == "gated":
+            torch.manual_seed(4)
+            gate_b = (torch.randn([1, num_node_gates, num_ch_gates], device = pc.device) * 2.0
+                      ).expand(333, -1, -1).contiguous()
+            juice.queries.sample(pc, num_samples = 333, sum_external_params = {ns: gate_b})
+
+        pc.backward(data)
+        return pc.param_flows.clone()
+
+    undisturbed = flows(None)
+    after_draw = flows(interposed)
+
+    diff = float((after_draw - undisturbed).abs().max())
+    assert diff < 1e-4, f"a {interposed} draw changed the backward's param flows by {diff:.3e}"

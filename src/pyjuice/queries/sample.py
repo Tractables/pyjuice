@@ -181,7 +181,7 @@ def _scope_plan(pc: TensorCircuit):
     return plan
 
 
-def _graph_bindings(pc, conditional: bool):
+def _graph_bindings(pc, conditional: bool, staged = None):
     """
     Everything about the circuit that a captured pass BAKES IN, as a comparable signature.
 
@@ -202,7 +202,13 @@ def _graph_bindings(pc, conditional: bool):
 
     :returns: a hashable signature; when it changes, the graph has to be recaptured.
     """
-    staged = getattr(pc, "_staged_external_params", None) or {}
+    # An unconditional draw stages into its OWN buffer and deliberately does not touch
+    # `_staged_external_params` (see `sample`), so reading only that field would leave this signature
+    # blind to the draw's own gates -- and therefore unable to notice when their buffer moves. The
+    # caller passes what IT staged; the field is the fallback, which is what a conditional draw uses.
+    if staged is None:
+        staged = getattr(pc, "_staged_external_params", None)
+    staged = staged or {}
     external = tuple(sorted(
         (id(ns), tuple(t.data_ptr() for t in tensors))
         for ns, tensors in staged.items()
@@ -213,7 +219,8 @@ def _graph_bindings(pc, conditional: bool):
             pc.params.data_ptr(), bool(conditional), external)
 
 
-def _scoped_state(pc, plan, num_samples: int, conditional: bool, persistent: bool):
+def _scoped_state(pc, plan, num_samples: int, conditional: bool, persistent: bool,
+                  gated: bool = False):
     """
     The scoped pass's buffers, and its CUDA graph when one was asked for.
 
@@ -245,7 +252,8 @@ def _scoped_state(pc, plan, num_samples: int, conditional: bool, persistent: boo
         return allocate(num_samples)
 
     states = pc.__dict__.setdefault("_sample_scoped_states", OrderedDict())
-    key = (int(num_samples), True) if conditional else (None, False)
+    key = (int(num_samples), True) if conditional else ((int(num_samples), False) if gated
+                                                       else (None, False))
 
     state = states.get(key)
     if state is None:
@@ -390,7 +398,13 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
     if conditional:
         pc._resolve_backward_external_params(kwargs)
     else:
-        pc._stage_external_params(kwargs, num_samples)
+        # Into a PRIVATE buffer, not the forward's. An unconditional draw is a forward in its own
+        # right, but it does not recompute `node_mars`, so it must not be mistaken for the forward
+        # that did. Staging into the shared slab made an ordinary `forward -> sample -> backward`
+        # loop compute its flows against the wrong gates: the draw either cleared the staging (an
+        # ungated draw) or overwrote it (a gated one), and the backward then ran against a
+        # `node_mars` built under gates that were no longer there.
+        pc._stage_external_params(kwargs, num_samples, name = "sample_external_params")
 
     if hasattr(pc, "_num_nscopes") and hasattr(pc, "_num_escopes"):
         num_nscopes = pc._num_nscopes
@@ -579,7 +593,13 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
     
     if _use_scope_plan:
         plan = _scope_plan(pc)
-        state = _scoped_state(pc, plan, num_samples, conditional, use_cudagraph)
+        # A gated draw cannot use a workspace WIDER than it asked for: the gated kernels take the
+        # frontier's width as the sample count and use it both to validate the staged tensors and to
+        # stride the gate table, so a width-64 replay of an 8-sample draw is rejected (and, were it
+        # not, would read past the gate buffer). Gated draws therefore keep a buffer per batch size;
+        # only ungated ones share. See `_scoped_state`.
+        gated = bool(getattr(pc, "external_params_nodes", ()) and kwargs.get("sum_external_params"))
+        state = _scoped_state(pc, plan, num_samples, conditional, use_cudagraph, gated = gated)
         node_samples, element_samples, seed_ptr = state["node"], state["elem"], state["seed"]
 
         # A fresh seed per call, written OUTSIDE any capture -- the kernels load it rather than
@@ -594,7 +614,7 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
             # Recapture rather than refuse: whether they moved is a consequence of what the CALLER
             # did with the circuit in between (a forward at another batch size), which is not
             # something they should have to track to keep a draw correct.
-            bindings = _graph_bindings(pc, conditional)
+            bindings = _graph_bindings(pc, conditional, kwargs.get("sum_external_params"))
             if state["graph"] is None or state["bindings"] != bindings:
                 state["graph"] = None                       # release the old pool before capturing
 
@@ -622,7 +642,7 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
         _top_down_pass()
     else:
         graph = tape.graph
-        bindings = _graph_bindings(pc, conditional)
+        bindings = _graph_bindings(pc, conditional, kwargs.get("sum_external_params"))
         if graph is not None and tape.bindings != bindings:
             # The buffers this graph baked in have moved -- see `_graph_bindings`. Recapture rather
             # than replay against memory the allocator has handed to somebody else.
@@ -682,4 +702,12 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
         # it is applied to the whole buffer and the caller's share sliced out afterwards -- as a COPY
         # when the buffer is shared, since a view of it would alias the next draw's workspace.
         push_non_neg_ones_to_front(node_samples)
-        return node_samples[:, :num_samples].contiguous() if oversized else node_samples
+
+        # A COPY whenever the buffer outlives the call. `use_cudagraph` pins the frontier for the
+        # circuit's lifetime, so returning a view of it hands the caller a tensor the next draw
+        # overwrites in place -- two "different" frontiers that share storage. `.contiguous()` does
+        # NOT do this: on an already-contiguous slice it returns the same object, which is why the
+        # first attempt at this fix changed nothing. An ordinary draw allocates fresh each call and
+        # can hand its buffer over directly.
+        frontier = node_samples[:, :num_samples]
+        return frontier.clone() if use_cudagraph else frontier
