@@ -54,15 +54,26 @@ class ScopePlan():
                           be addressed without a cursor, and `-1` marks a padded slot.
     """
 
-    __slots__ = ("num_node_rows", "num_elem_rows", "sum_rows", "sum_erows", "prod_rows", "prod_crows")
+    __slots__ = ("num_node_rows", "num_elem_rows", "sum_rows", "sum_erows", "prod_rows",
+                 "prod_crows", "root_row")
 
     def __init__(self):
         self.num_node_rows = 0
         self.num_elem_rows = 0
+        self.root_row = -1                  # where the pass seeds the root node
         self.sum_rows: Dict[int, torch.Tensor] = {}
         self.sum_erows: Dict[int, torch.Tensor] = {}
         self.prod_rows: Dict[int, torch.Tensor] = {}
         self.prod_crows: Dict[int, List[torch.Tensor]] = {}
+
+    def to(self, device):
+        """Move every table onto `device`; they are indexed by kernels, not by the host."""
+        for table in (self.sum_rows, self.sum_erows, self.prod_rows):
+            for key, value in table.items():
+                table[key] = value.to(device)
+        for key, value in self.prod_crows.items():
+            self.prod_crows[key] = [v.to(device) for v in value]
+        return self
 
 
 def _scope_key(scope) -> Tuple[int, ...]:
@@ -108,6 +119,11 @@ def build_scope_plan(pc) -> ScopePlan:
 
             if layer_group.is_sum():
                 plan.sum_rows[id(layer)] = torch.tensor(rows, dtype = torch.long)
+
+            # The pass seeds the root at its own scope's row rather than at row 0
+            for ns in getattr(layer, "nodes", []):
+                if ns is pc.root_ns:
+                    plan.root_row = node_row_of_scope[_scope_key(ns.scope)]
 
             # Where each of this layer's nodes lives, so a product child can be resolved to its row
             for ns in getattr(layer, "nodes", []):

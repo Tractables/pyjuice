@@ -11,6 +11,8 @@ from pyjuice.model import TensorCircuit
 
 from .sampling import assign_cids_ind_target, assign_nids_ind_target, push_non_neg_ones_to_front, \
                       count_prod_nch, sample_prod_layer, sample_sum_layer
+from .sampling.scope_plan import build_scope_plan
+from .sampling.scoped import scoped_prod_layer, scoped_sum_layer
 
 
 #: How many recorded sampling plans to keep per circuit, keyed by (num_samples, conditional).
@@ -140,9 +142,81 @@ def _assert_graphable(pc, tape, do_calibration) -> None:
     )
 
 
+def _scope_plan(pc: TensorCircuit):
+    """The circuit's frontier layout, derived once and cached on it."""
+    plan = pc.__dict__.get("_sample_scope_plan")
+    if plan is None:
+        plan = pc.__dict__["_sample_scope_plan"] = build_scope_plan(pc).to(pc.device)
+    return plan
+
+
+def _scoped_top_down(pc, plan, node_samples, element_samples, conditional, kwargs):
+    """
+    The top-down pass over a STRUCTURAL frontier layout.
+
+    Every index it needs comes from `plan`, so there is no `torch.where`, no compaction and no slot
+    cursor -- the three things that account for ~92% of the ordinary pass's GPU time. What is left is
+    the sampling kernels themselves, one launch per layer per partition.
+    """
+    # NOT YET WIRED for per-sample external parameters: this path calls the shared-parameter kernels
+    # directly rather than going through `ExternalParamsSumLayer.sample_layer`, so a gated layer would
+    # be drawn from `theta_shared` and quietly return samples from a different distribution than the
+    # forward scores. Refused until the dispatch is added.
+    for layer_group in pc.inner_layer_groups:
+        if not layer_group.is_sum():
+            continue
+        for layer in layer_group:
+            if isinstance(layer, ExternalParamsSumLayer) and \
+                    len(layer._resolve_external_tensors(kwargs, node_samples.size(1),
+                                                        node_samples.device)) > 0:
+                raise NotImplementedError(
+                    "`_use_scope_plan = True` does not yet serve sum layers with per-sample external "
+                    "parameters; it would sample their shared parameters instead. Use the default "
+                    "path for gated circuits."
+                )
+
+    node_samples.fill_(-1)
+    node_samples[plan.root_row, :] = pc.root_ns._output_ind_range[0]
+
+    for layer_id in range(len(pc.inner_layer_groups) - 1, -1, -1):
+        layer_group = pc.inner_layer_groups[layer_id]
+
+        if layer_group.is_sum():
+            element_samples.fill_(-1)
+
+            for layer in layer_group:
+                rows, erows = plan.sum_rows[id(layer)], plan.sum_erows[id(layer)]
+
+                if conditional:
+                    pc.inner_layer_groups[layer_id - 1](pc.node_mars, pc.element_mars)
+
+                for partition_id in range(layer.num_fw_partitions):
+                    scoped_sum_layer(
+                        layer, layer.partitioned_nids[partition_id],
+                        layer.partitioned_cids[partition_id], layer.partitioned_pids[partition_id],
+                        pc.node_mars, pc.element_mars, pc.params,
+                        node_samples, element_samples, rows, erows, conditional
+                    )
+
+                # Cleared here rather than inside the kernel: a row may be served by any partition,
+                # and clearing it in one launch would hide it from the next.
+                node_samples.index_fill_(0, rows, -1)
+
+        else:
+            for layer in layer_group:
+                rows = plan.prod_rows[id(layer)]
+                for partition_id in range(layer.num_fw_partitions):
+                    scoped_prod_layer(
+                        layer, layer.partitioned_nids[partition_id],
+                        layer.partitioned_cids[partition_id],
+                        plan.prod_crows[id(layer)][partition_id],
+                        node_samples, element_samples, rows
+                    )
+
+
 def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bool = False,
-           use_cudagraph: bool = False, _sample_input_ns: bool = True,
-           _do_calibration: bool = False, **kwargs):
+           use_cudagraph: bool = False, _use_scope_plan: bool = False,
+           _sample_input_ns: bool = True, _do_calibration: bool = False, **kwargs):
     """
     Draw samples from a PC by performing a top-down ancestral sampling pass.
 
@@ -232,8 +306,12 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
     # The index plan repeats across calls exactly when the circuit respects one vtree (see
     # `_PlanTape`), so it is recorded on the first pass at a given shape and replayed afterwards.
     # `_do_calibration` is excluded only because it is a debugging switch not worth a second cache.
-    tape = _plan_tape(pc, num_samples, conditional) if not _do_calibration else _PlanTape()
-    if tape.scratch["compact"] is None:
+    # The scoped path derives its indices from the circuit, so it neither records nor replays a
+    # plan. It must not take one from the cache either: leaving a tape marked "replaying" with no
+    # steps in it would make the NEXT ordinary call index off the end of an empty list.
+    tape = (_PlanTape() if (_do_calibration or _use_scope_plan)
+            else _plan_tape(pc, num_samples, conditional))
+    if not _use_scope_plan and tape.scratch["compact"] is None:
         tape.scratch["compact"] = torch.empty([num_nscopes + 1, num_samples], dtype = torch.long,
                                               device = pc.device)
 
@@ -390,7 +468,14 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
                                           ind_n, ind_b, ind_nids, ind_nid_offs, ind_mask, layer.block_size, partition_id)
 
     
-    if not use_cudagraph:
+    if _use_scope_plan:
+        plan = _scope_plan(pc)
+        node_samples = torch.empty([plan.num_node_rows, num_samples], dtype = torch.long,
+                                   device = pc.device)
+        element_samples = torch.empty([plan.num_elem_rows, num_samples], dtype = torch.long,
+                                      device = pc.device)
+        _scoped_top_down(pc, plan, node_samples, element_samples, conditional, kwargs)
+    elif not use_cudagraph:
         _top_down_pass()
     else:
         graph = tape.graph
