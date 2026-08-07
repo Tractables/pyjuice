@@ -19,7 +19,13 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+# `num_samples` (the number of SELECTED nodes) and `seed` are excluded from Triton's integer
+# specialization. Triton otherwise compiles a separate kernel per divisibility class (`% 16 == 0`,
+# `== 1`) of every integer argument, and both of these change from call to call: the frontier size
+# varies on any circuit whose index plan is not fixed, and the seed is random. MEASURED on a `PD`
+# circuit: 21 compiled variants of this kernel where the layer shapes alone need 12, at ~75 ms each,
+# still arriving after 40 calls. Neither value is used to index or to size a tile, so nothing is lost.
+@triton.jit(do_not_specialize = ["num_samples", "seed", "rnd_offset"])
 def sample_sum_layer_kernel(nids, cids, pids, node_mars, element_mars, mparams, node_samples, element_samples,
                             ind_target, ind_n, ind_b, seed, rnd, rnd_offset,
                             block_size: tl.constexpr, batch_size: tl.constexpr,

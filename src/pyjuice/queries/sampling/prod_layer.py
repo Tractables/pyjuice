@@ -19,7 +19,9 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+# See the note in `sample_sum_layer_kernel`: the frontier size changes per call whenever the index
+# plan is not fixed, and specializing on it multiplies the compiled variants for no benefit.
+@triton.jit(do_not_specialize = ["num_samples", "partition_id"])
 def count_prod_nch_kernel(nids, cids, element_samples, ind_ch_count, ind_nids, ind_nid_offs, ind_mask, ind_n, ind_b, partition_id,
                           block_size: tl.constexpr, num_samples, num_nblocks: tl.constexpr,
                           batch_size: tl.constexpr, num_edges: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_C: tl.constexpr,
@@ -116,7 +118,7 @@ def count_prod_nch(layer, nids, cids, element_samples, ind_ch_count, ind_nids, i
     return None
 
 
-@triton.jit
+@triton.jit(do_not_specialize = ["num_samples", "partition_id"])
 def sample_prod_layer_kernel(nids, cids, node_samples, element_samples, ind_target, ind_target_sid, ind_n, ind_b,
                              ind_nids, ind_nid_offs, ind_mask, partition_id, block_size: tl.constexpr,
                              num_samples, num_nblocks: tl.constexpr, batch_size: tl.constexpr, num_edges: tl.constexpr,
