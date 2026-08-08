@@ -370,8 +370,42 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
                           graph is kept per `(num_samples, conditional)`, bounded with the plans.
     :type use_cudagraph: bool
 
-    :returns: a tensor of samples of size [num_samples, num_vars]
+    :param _sample_input_ns: whether to finish the draw by emitting a value from each selected input
+                             node. Default `True`, which is what makes the return a tensor of
+                             VALUES. Setting it `False` stops one step earlier and returns the
+                             FRONTIER instead -- see the note below, which is the whole contract.
+    :type _sample_input_ns: bool
+
+    :returns: with `_sample_input_ns = True` (the default), samples of size `[num_samples, num_vars]`
+              in the input distributions' own dtype.
+
+              With `_sample_input_ns = False`, the frontier: an int64 tensor of shape
+              `[rows, num_samples]` holding the NODE ID each sample selected, padded with `-1`.
+              `rows` is the frontier's height, which is at least `num_vars` and usually more; each
+              column is a dense prefix of live ids followed by nothing but `-1`, so `>= 0` selects
+              exactly the live entries, and every column of one draw holds exactly `num_vars` of
+              them -- one per variable, never two.
     :rtype: torch.Tensor
+
+    :note: **the frontier's ids are GLOBAL node ids**, and a circuit may have more than one input
+           layer -- it has one per distribution TYPE, so a model mixing, say, `Categorical` and
+           `Bernoulli` variables has two. Decoding therefore has to attribute each id to its owning
+           layer BEFORE subtracting a start index:
+
+           .. code-block:: python
+
+               for node_id in frontier[frontier[:, j] >= 0, j].tolist():
+                   for layer in pc.input_layer_group:
+                       start, end = layer._output_ind_range
+                       if start <= node_id < end:
+                           var = int(layer.vids[node_id - start, 0])
+                           params_start = int(layer.s_pids[node_id - start])
+                           break
+
+           The shortcut of subtracting `pc.input_layer_group[0]._output_ind_range[0]` and indexing
+           that layer's `vids` is correct only while the circuit has ONE input layer. It does not
+           fail gracefully when it stops being true: ids from the second layer index past the end of
+           the first layer's `vids`, which is a device-side assert that poisons the CUDA context.
     """
     if not conditional:
         assert num_samples is not None, "`num_samples` should be specified when doing unconditioned sampling."
