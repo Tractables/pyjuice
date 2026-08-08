@@ -124,20 +124,53 @@ none is sampled from its shared parameters, which is what an ungated forward pas
 it too. Under <cite>conditional = True</cite> they are instead taken from the forward pass that produced
 <cite>pc.node_mars</cite> – <cite>element_mars</cite> was built under those gates, so the draw has to use them – and
 passing them here only has to name the same nodes.</p>
-<dl class="field-list simple">
+<dl class="field-list">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>use_cudagraph</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#bool" title="(in Python v3.14)"><em>bool</em></a>) – capture the top-down pass into a CUDA graph and replay it. OPT-IN, because
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>use_cudagraph</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#bool" title="(in Python v3.14)"><em>bool</em></a>) – capture the top-down pass into a CUDA graph and replay it. OPT-IN, because
 a graph owns a private memory pool and the frontier buffers it was captured
 with, held for the circuit’s lifetime – worth it for a sampling loop, not
 for a one-off draw. Needs <cite>pc.is_structured_decomposable</cite> (the index plan
 must repeat, or a replay is simply wrong) and is refused otherwise. One
-graph is kept per <cite>(num_samples, conditional)</cite>, bounded with the plans.</p>
+graph is kept per <cite>(num_samples, conditional)</cite>, bounded with the plans.</p></li>
+<li><p><strong>_sample_input_ns</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#bool" title="(in Python v3.14)"><em>bool</em></a>) – whether to finish the draw by emitting a value from each selected input
+node. Default <cite>True</cite>, which is what makes the return a tensor of
+VALUES. Setting it <cite>False</cite> stops one step earlier and returns the
+FRONTIER instead – see the note below, which is the whole contract.</p></li>
+</ul>
 </dd>
 <dt class="field-even">Returns<span class="colon">:</span></dt>
-<dd class="field-even"><p>a tensor of samples of size [num_samples, num_vars]</p>
+<dd class="field-even"><p><p>with <cite>_sample_input_ns = True</cite> (the default), samples of size <cite>[num_samples, num_vars]</cite>
+in the input distributions’ own dtype.</p>
+<p>With <cite>_sample_input_ns = False</cite>, the frontier: an int64 tensor of shape
+<cite>[rows, num_samples]</cite> holding the NODE ID each sample selected, padded with <cite>-1</cite>.
+<cite>rows</cite> is the frontier’s height, which is at least <cite>num_vars</cite> and usually more; each
+column is a dense prefix of live ids followed by nothing but <cite>-1</cite>, so <cite>&gt;= 0</cite> selects
+exactly the live entries, and every column of one draw holds exactly <cite>num_vars</cite> of
+them – one per variable, never two.</p>
+</p>
 </dd>
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
 <dd class="field-odd"><p>torch.Tensor</p>
+</dd>
+<dt class="field-even">Note<span class="colon">:</span></dt>
+<dd class="field-even"><p><strong>the frontier’s ids are GLOBAL node ids</strong>, and a circuit may have more than one input
+layer – it has one per distribution TYPE, so a model mixing, say, <cite>Categorical</cite> and
+<cite>Bernoulli</cite> variables has two. Decoding therefore has to attribute each id to its owning
+layer BEFORE subtracting a start index:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">for</span> <span class="n">node_id</span> <span class="ow">in</span> <span class="n">frontier</span><span class="p">[</span><span class="n">frontier</span><span class="p">[:,</span> <span class="n">j</span><span class="p">]</span> <span class="o">&gt;=</span> <span class="mi">0</span><span class="p">,</span> <span class="n">j</span><span class="p">]</span><span class="o">.</span><span class="n">tolist</span><span class="p">():</span>
+    <span class="k">for</span> <span class="n">layer</span> <span class="ow">in</span> <span class="n">pc</span><span class="o">.</span><span class="n">input_layer_group</span><span class="p">:</span>
+        <span class="n">start</span><span class="p">,</span> <span class="n">end</span> <span class="o">=</span> <span class="n">layer</span><span class="o">.</span><span class="n">_output_ind_range</span>
+        <span class="k">if</span> <span class="n">start</span> <span class="o">&lt;=</span> <span class="n">node_id</span> <span class="o">&lt;</span> <span class="n">end</span><span class="p">:</span>
+            <span class="n">var</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">vids</span><span class="p">[</span><span class="n">node_id</span> <span class="o">-</span> <span class="n">start</span><span class="p">,</span> <span class="mi">0</span><span class="p">])</span>
+            <span class="n">params_start</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">s_pids</span><span class="p">[</span><span class="n">node_id</span> <span class="o">-</span> <span class="n">start</span><span class="p">])</span>
+            <span class="k">break</span>
+</pre></div>
+</div>
+<p>The shortcut of subtracting <cite>pc.input_layer_group[0]._output_ind_range[0]</cite> and indexing
+that layer’s <cite>vids</cite> is correct only while the circuit has ONE input layer. It does not
+fail gracefully when it stops being true: ids from the second layer index past the end of
+the first layer’s <cite>vids</cite>, which is a device-side assert that poisons the CUDA context.</p>
 </dd>
 </dl>
 </dd></dl>
