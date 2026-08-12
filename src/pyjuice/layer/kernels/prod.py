@@ -289,7 +289,7 @@ def _forward_backward_kernel_large(node_vals_ptr, element_vals_ptr, local_ids_pt
         mask_edge = (offs_edge < num_edges)
 
         # Re-compute the ch value ids
-        offs_egstart = tl.load(cids_ptr + nblock_id * num_edges + offs_edge) # [BLOCK_N]
+        offs_egstart = tl.load(cids_ptr + nblock_id * num_edges + offs_edge, mask = mask_edge, other = 0) # [BLOCK_N]
         offs_evals = (offs_egstart[:,None] + ntile_id) * batch_size + offs_batch[None,:] # [BLOCK_N, BLOCK_B]
 
     # Accumulate the `node_vals` if required
