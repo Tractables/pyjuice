@@ -295,7 +295,7 @@ class ProdLayer(Layer, nn.Module):
                 batch_size = batch_size, 
                 BLOCK_N = BLOCK_N, 
                 BLOCK_B = BLOCK_B, 
-                N_NUM_BLKS = triton.cdiv(num_edges, BLOCK_B), 
+                N_NUM_BLKS = triton.cdiv(num_edges, BLOCK_N), 
                 block_size = block_size, 
                 accum = accum, 
                 partial_eval = partial_eval,
