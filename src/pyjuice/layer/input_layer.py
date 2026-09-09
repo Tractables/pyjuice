@@ -382,6 +382,7 @@ class InputLayer(Layer, nn.Module):
                 assert missing_mask is not None, "`missing_mask` should be provided when `_apply_missing_mask_only = True`."
 
             # Apply post-processing kernels
+            self.dist.preprocess_fw_kwargs(self, kwargs)
             self.dist.set_custom_kernel_kwargs(kwargs)
             kwargs["_fw_data"] = data
             for (kernel, cond_fn, prep_kwargs_fn) in self.post_fw_fns:

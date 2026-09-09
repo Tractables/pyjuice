@@ -124,6 +124,16 @@ class Distribution():
     def set_custom_kernel_kwargs(self, kwargs):
         pass
 
+    def preprocess_fw_kwargs(self, layer, kwargs):
+        """
+        Rewrite the forward's `kwargs` in place, before any post-processing kernel is dispatched.
+
+        Unlike :func:`set_custom_kernel_kwargs`, which runs on the forward AND the backward, this runs
+        on the forward only -- so it is the place for a rewrite that is a no-op for the forward's result
+        but would change the meaning of a backward's outputs (anything indexed by a candidate slot, say).
+        """
+        pass
+
     @staticmethod
     def fw_mar_fn(*args, **kwargs):
         """

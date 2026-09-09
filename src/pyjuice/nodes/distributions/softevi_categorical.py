@@ -78,6 +78,27 @@ Measured on the CoDD/latent config (homogeneous HMM, seq 32, 1024 latents, 12646
     return logp_sorted, cat_ids_sorted
 
 
+def _sorted_soft_evidence(layer, kwargs):
+    """
+    This step's candidate arrays in category-id order, cached on the layer by input identity.
+
+    The cache is not (only) about avoiding a repeated sort -- it is about returning the SAME tensor
+    objects every time. `_build_dense_index` and `_fw_linear_evidence` are keyed by tensor identity, so
+    handing them a freshly sorted pair on each call would silently cost a rebuild per call.
+    """
+    evidence = kwargs["categorical_evidence_logp"]
+    cat_ids = kwargs["soft_evidence_cat_ids"]
+
+    cached = getattr(layer, "_fw_sorted_cache", None)
+    if cached is not None and _evidence_cache_hit(cached[0], (evidence, cat_ids)):
+        return cached[1]
+
+    key = _evidence_cache_key(evidence, cat_ids)
+    out = sort_soft_evidence_candidates(evidence, cat_ids)
+    layer._fw_sorted_cache = (key, out)
+    return out
+
+
 def _fw_cuda_applicable(layer, kwargs):
     """Whether to take a CUDA forward at all.
 
@@ -1363,18 +1384,33 @@ class SoftEvidenceCategorical(Distribution):
     """
     A class representing a Categorical distribution that allows external soft evidence.
 
-    :note: with top-k soft evidence (i.e. when `soft_evidence_cat_ids` is supplied), pass the candidate
-           axis SORTED BY CATEGORY ID -- see :func:`sort_soft_evidence_candidates`. The forward is bound
-           by the `params` gather addressed through `cat_ids`, so the candidate order dominates its cost:
-           4.3x on the CoDD/latent config for a 0.06 ms sort. Sorting is semantically a no-op.
+    :note: with top-k soft evidence (i.e. when `soft_evidence_cat_ids` is supplied) the forward is bound
+           by the `params` gather addressed through `cat_ids`, so the candidate ORDER dominates its cost:
+           4.3x on the CoDD/latent training config, 1.67x on the CoDD decode config, for a ~0.05 ms sort.
+           The forward now sorts by category id itself (`sort_soft_evidence`, on by default) -- see
+           :func:`sort_soft_evidence_candidates` for why this is semantically a no-op.
+
+           The BACKWARD is deliberately left in the caller's order, because
+           `categorical_evidence_logp_grad` is indexed by candidate slot and belongs to the caller. A
+           training loop that wants the backward sorted too should sort once at top-k time with
+           :func:`sort_soft_evidence_candidates` and pass the sorted arrays through both passes; that
+           also lets the two passes share one `_build_dense_index` build.
 
     :param num_cats: number of categories
     :type num_cats: int
+    :param sort_soft_evidence: sort the candidate axis by category id inside the forward. On by default;
+                               override per call with `sort_soft_evidence = False` in the forward's
+                               kwargs, or process-wide with `PYJUICE_SOFTEVI_SORT=0`.
+    :type sort_soft_evidence: bool
     """
-    def __init__(self, num_cats: int, _dual_flow_backward: bool = True):
+    def __init__(self, num_cats: int, _dual_flow_backward: bool = True, sort_soft_evidence: bool = True):
         super(SoftEvidenceCategorical, self).__init__()
 
         self.num_cats = num_cats
+        # Not part of `get_metadata`, so it is not persisted: it is a performance knob, and a circuit
+        # loaded from a checkpoint should pick up the current default rather than one frozen at save
+        # time. See `preprocess_fw_kwargs`.
+        self.sort_soft_evidence = sort_soft_evidence
 
         self.post_fw_fns = [
             # CUDA top-k forward (index-driven, or the gather form); mutually exclusive with the Triton
@@ -1477,6 +1513,31 @@ class SoftEvidenceCategorical(Distribution):
 
     def set_custom_kernel_kwargs(self, kwargs):
         kwargs["dual_flow_backward"] = self._dual_flow_backward
+
+    def preprocess_fw_kwargs(self, layer, kwargs):
+        """
+        Sort top-k soft evidence by category id, which the forward is bound by -- see
+        :func:`sort_soft_evidence_candidates` for why, and for the guarantee that it is a no-op.
+
+        FORWARD ONLY, and deliberately so. `node_mars` is a log-sum over the candidate axis, so the
+        forward cannot observe the order; the backward's `categorical_evidence_logp_grad` is indexed BY
+        candidate slot and belongs to the caller, so reordering it there would hand back a gradient
+        permuted out of the caller's own layout. A caller that wants both passes sorted should sort at
+        top-k time and pass the sorted arrays throughout, as the class docstring says.
+
+        Disable per call with `sort_soft_evidence = False`, per circuit with the constructor argument,
+        or process-wide with `PYJUICE_SOFTEVI_SORT=0`.
+        """
+        if kwargs.get("soft_evidence_cat_ids", None) is None:
+            return
+        if not kwargs.get("sort_soft_evidence", getattr(self, "sort_soft_evidence", True)):
+            return
+        if os.environ.get("PYJUICE_SOFTEVI_SORT", "1") == "0":
+            return
+
+        logp, cat_ids = _sorted_soft_evidence(layer, kwargs)
+        kwargs["categorical_evidence_logp"] = logp
+        kwargs["soft_evidence_cat_ids"] = cat_ids
 
     @staticmethod
     @triton_jit
@@ -2678,7 +2739,8 @@ class SoftEvidenceCategorical(Distribution):
         return True
 
     def _get_constructor(self):
-        return SoftEvidenceCategorical, {"num_cats": self.num_cats, "_dual_flow_backward": self._dual_flow_backward}
+        return SoftEvidenceCategorical, {"num_cats": self.num_cats, "_dual_flow_backward": self._dual_flow_backward,
+                                         "sort_soft_evidence": self.sort_soft_evidence}
 
     def __reduce__(self):
-        return (self.__class__, (self.num_cats, self._dual_flow_backward))
+        return (self.__class__, (self.num_cats, self._dual_flow_backward, self.sort_soft_evidence))
