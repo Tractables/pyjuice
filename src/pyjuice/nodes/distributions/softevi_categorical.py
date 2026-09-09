@@ -34,7 +34,13 @@ def sort_soft_evidence_candidates(categorical_evidence_logp: torch.Tensor, soft_
 
 Measured on the CoDD/latent config (homogeneous HMM, seq 32, 1024 latents, 126464 cats, top-k 1024,
     batch 8, dual-flow backward), the FORWARD goes from 17.1 ms to 3.9 ms (4.3x) for a sort cost of
-    0.06 ms per step, with a bit-identical log-likelihood.
+    0.06 ms per step.
+
+    Semantically a no-op, but NOT bit-exact: permuting the candidate axis permutes the order the
+    logsumexp accumulates in, so float32 non-associativity shows. Measured over 180 configurations,
+    the input layer moves by up to 1.4e-5 in log space and the root log-likelihood by up to 6.1e-5 on
+    an |LL| of ~675 (relative ~1e-7) -- below the run-to-run spread the inner layers already have.
+    Do not write an exact-equality assertion against an unsorted reference.
 
     :note: this matters for the forward only. The backward's expensive phase now uses an inverted index
            (see the note above `_dense_topk_applicable`) which is order-independent by construction --
@@ -1744,6 +1750,21 @@ class SoftEvidenceCategorical(Distribution):
             lvid * num_cats + \
             tl.arange(0, TILE_SIZE_K)[None,:] # [BLOCK_SIZE_B, TILE_SIZE_K]
 
+        # Which half of this program's work is actually needed.
+        #
+        # `log_p` below keeps `logZ` at masked positions and `log_in_p + log_ex_p` at observed ones and
+        # DISCARDS the other -- yet both were computed unconditionally, and `logZ` is the full
+        # K-candidate sum, by far the most expensive thing in this kernel. A block whose value mask is
+        # uniform can skip the unused half outright. That is ALWAYS the case at batch 1, where `vid` is
+        # a single variable and `value_mask` a single scalar -- i.e. the whole decode path -- and a
+        # block being decoded runs from fully masked to fully observed, so on average about half of
+        # this kernel's work was being thrown away. Where a block genuinely mixes the two (batch > 1)
+        # both flags are true and the behaviour is exactly as before.
+        value_mask = tl.load(soft_evidence_value_mask_ptr + offsets_b * ext_num_vars + lvid, mask = mask_b, other = False) # [BLOCK_SIZE_B]
+        mask_bi = mask_b.to(tl.int32)
+        any_masked = tl.sum(tl.where(value_mask, 0, 1) * mask_bi) > 0
+        any_observed = tl.sum(tl.where(value_mask, 1, 0) * mask_bi) > 0
+
         # Compute logZ
         logZ = tl.zeros([BLOCK_SIZE_B, BLOCK_SIZE_N], dtype = tl.float32) - float("inf")
 
@@ -1757,36 +1778,37 @@ class SoftEvidenceCategorical(Distribution):
                 lvid * num_cats + \
                 tl.arange(0, TILE_SIZE_K)[None,:] # [BLOCK_SIZE_B, TILE_SIZE_K]
 
-            for i in range(K_NUM_TILES):
-                mask_c = (i * TILE_SIZE_K + tl.arange(0, TILE_SIZE_K) < num_cats) # [TILE_SIZE_K]
+            if any_masked:
+                for i in range(K_NUM_TILES):
+                    mask_c = (i * TILE_SIZE_K + tl.arange(0, TILE_SIZE_K) < num_cats) # [TILE_SIZE_K]
 
-                # Load the category IDs from `soft_evidence_cat_ids`
-                catids = tl.load(catids_ptr + i * TILE_SIZE_K, mask = (mask_b[:,None] & mask_c[None,:]), other = 0) # [BLOCK_SIZE_B, TILE_SIZE_K]
+                    # Load the category IDs from `soft_evidence_cat_ids`
+                    catids = tl.load(catids_ptr + i * TILE_SIZE_K, mask = (mask_b[:,None] & mask_c[None,:]), other = 0) # [BLOCK_SIZE_B, TILE_SIZE_K]
 
-                # Load the internal parameters
-                # :note: unlike the backward's expected-category flow phase, the [B, K, N] tile (node
-                #        axis innermost) measured FASTER here -- the forward only gathers, it does not
-                #        also scatter, and the logsumexp then reduces over the innermost axis. Flipping
-                #        this to [B, N, K] cost 43% on the sorted-candidate forward (3.3 -> 4.7 ms).
-                in_catpars_ptr = inpars_ptr[None,None,:] + catids[:,:,None] # [BLOCK_SIZE_B, TILE_SIZE_K, BLOCK_SIZE_N]
-                inpars = tl.load(in_catpars_ptr, mask = (mask_b[:,None,None] & mask_c[None,:,None] & mask_n[None,None,:]), other = 0.0) # [BLOCK_SIZE_B, TILE_SIZE_K, BLOCK_SIZE_N]
+                    # Load the internal parameters
+                    # :note: unlike the backward's expected-category flow phase, the [B, K, N] tile (node
+                    #        axis innermost) measured FASTER here -- the forward only gathers, it does not
+                    #        also scatter, and the logsumexp then reduces over the innermost axis. Flipping
+                    #        this to [B, N, K] cost 43% on the sorted-candidate forward (3.3 -> 4.7 ms).
+                    in_catpars_ptr = inpars_ptr[None,None,:] + catids[:,:,None] # [BLOCK_SIZE_B, TILE_SIZE_K, BLOCK_SIZE_N]
+                    inpars = tl.load(in_catpars_ptr, mask = (mask_b[:,None,None] & mask_c[None,:,None] & mask_n[None,None,:]), other = 0.0) # [BLOCK_SIZE_B, TILE_SIZE_K, BLOCK_SIZE_N]
 
-                # Load the external parameters
-                expars = tl.load(expars_ptr + i * TILE_SIZE_K, mask = (mask_b[:,None] & mask_c[None,:]), other = 0.0) # [BLOCK_SIZE_B, TILE_SIZE_K]
+                    # Load the external parameters
+                    expars = tl.load(expars_ptr + i * TILE_SIZE_K, mask = (mask_b[:,None] & mask_c[None,:]), other = 0.0) # [BLOCK_SIZE_B, TILE_SIZE_K]
 
-                params = expars[:,:,None] + tl.log(inpars)
-                params_max = tl.max(params, axis = 1)
-                cum_params = tl.log(tl.sum(tl.exp(params - params_max[:,None,:]), axis = 1)) + params_max # [BLOCK_SIZE_B, BLOCK_SIZE_N]
+                    params = expars[:,:,None] + tl.log(inpars)
+                    params_max = tl.max(params, axis = 1)
+                    cum_params = tl.log(tl.sum(tl.exp(params - params_max[:,None,:]), axis = 1)) + params_max # [BLOCK_SIZE_B, BLOCK_SIZE_N]
 
-                # Compute logaddexp(logZ, cum_params)
-                maxval = tl.maximum(logZ, cum_params)
-                minval = tl.minimum(logZ, cum_params)
-                diff = minval - maxval
+                    # Compute logaddexp(logZ, cum_params)
+                    maxval = tl.maximum(logZ, cum_params)
+                    minval = tl.minimum(logZ, cum_params)
+                    diff = minval - maxval
 
-                logZ = tl.where(logZ == -float("inf"),
-                    cum_params,
-                    maxval + tlmath.log1p(tl.exp(diff))
-                )
+                    logZ = tl.where(logZ == -float("inf"),
+                        cum_params,
+                        maxval + tlmath.log1p(tl.exp(diff))
+                    )
 
         else:
             # Ptrs pointing to internal parameters
@@ -1794,32 +1816,33 @@ class SoftEvidenceCategorical(Distribution):
                 tl.arange(0, TILE_SIZE_K)[:,None] + \
                 s_pids[None,:] # [TILE_SIZE_K, BLOCK_SIZE_N]
 
-            for i in range(K_NUM_TILES):
-                mask_c = (i * TILE_SIZE_K + tl.arange(0, TILE_SIZE_K) < num_cats) # [TILE_SIZE_K]
+            if any_masked:
+                for i in range(K_NUM_TILES):
+                    mask_c = (i * TILE_SIZE_K + tl.arange(0, TILE_SIZE_K) < num_cats) # [TILE_SIZE_K]
 
-                # Load the internal parameters
-                inpars = tl.load(inpars_ptr + i * TILE_SIZE_K, mask = (mask_c[:,None] & mask_n[None,:]), other = 0.0) # [TILE_SIZE_K, BLOCK_SIZE_N]
+                    # Load the internal parameters
+                    inpars = tl.load(inpars_ptr + i * TILE_SIZE_K, mask = (mask_c[:,None] & mask_n[None,:]), other = 0.0) # [TILE_SIZE_K, BLOCK_SIZE_N]
 
-                # Load the external parameters
-                expars = tl.load(expars_ptr + i * TILE_SIZE_K, mask = (mask_b[:,None] & mask_c[None,:]), other = 0.0) # [BLOCK_SIZE_B, TILE_SIZE_K]
+                    # Load the external parameters
+                    expars = tl.load(expars_ptr + i * TILE_SIZE_K, mask = (mask_b[:,None] & mask_c[None,:]), other = 0.0) # [BLOCK_SIZE_B, TILE_SIZE_K]
 
-                expars_max = tl.max(expars, axis = 1)[:,None]
-                expars_sub = tl.exp(expars - expars_max)
+                    expars_max = tl.max(expars, axis = 1)[:,None]
+                    expars_sub = tl.exp(expars - expars_max)
 
-                if use_tensor_core:
-                    params = tl.dot(expars_sub, inpars).log() + expars_max
-                else:
-                    params = tl.sum(expars_sub[:,:,None] * inpars[None,:,:], axis = 1).log() + expars_max
+                    if use_tensor_core:
+                        params = tl.dot(expars_sub, inpars).log() + expars_max
+                    else:
+                        params = tl.sum(expars_sub[:,:,None] * inpars[None,:,:], axis = 1).log() + expars_max
 
-                # Compute logaddexp(logZ, params)
-                maxval = tl.maximum(logZ, params)
-                minval = tl.minimum(logZ, params)
-                diff = minval - maxval
+                    # Compute logaddexp(logZ, params)
+                    maxval = tl.maximum(logZ, params)
+                    minval = tl.minimum(logZ, params)
+                    diff = minval - maxval
 
-                logZ = tl.where(logZ == -float("inf"),
-                    params,
-                    maxval + tlmath.log1p(tl.exp(diff))
-                )
+                    logZ = tl.where(logZ == -float("inf"),
+                        params,
+                        maxval + tlmath.log1p(tl.exp(diff))
+                    )
 
         # Compute unnormalized logprobs
         data = tl.load(data_ptr + vid * batch_size + offsets_b, mask = mask_b, other = 0) # [BLOCK_SIZE_B]
@@ -1839,20 +1862,21 @@ class SoftEvidenceCategorical(Distribution):
                 lvid * num_cats # [BLOCK_SIZE_B]
 
             log_ex_p = tl.zeros([BLOCK_SIZE_B], dtype = tl.float32) - float("inf")
-            for i in range(K_NUM_TILES):
-                mask_c = (i * TILE_SIZE_K + tl.arange(0, TILE_SIZE_K) < num_cats) # [TILE_SIZE_K]
+            if any_observed:
+                for i in range(K_NUM_TILES):
+                    mask_c = (i * TILE_SIZE_K + tl.arange(0, TILE_SIZE_K) < num_cats) # [TILE_SIZE_K]
 
-                # Load the category IDs from `soft_evidence_cat_ids`
-                catids = tl.load(catids_ptr + i * TILE_SIZE_K, mask = (mask_b[:,None] & mask_c[None,:]), other = 0) # [BLOCK_SIZE_B, TILE_SIZE_K]
+                    # Load the category IDs from `soft_evidence_cat_ids`
+                    catids = tl.load(catids_ptr + i * TILE_SIZE_K, mask = (mask_b[:,None] & mask_c[None,:]), other = 0) # [BLOCK_SIZE_B, TILE_SIZE_K]
 
-                # Find matching ids (mask out padding categories so they can't spuriously match `data == 0`)
-                is_match = ((catids == data[:,None]) & mask_c[None,:]).to(tl.int64) # [BLOCK_SIZE_B, TILE_SIZE_K]
-                match_ids = tl.sum(is_match * tl.arange(0, TILE_SIZE_K), axis = 1) # [BLOCK_SIZE_B]
-                has_match = (tl.sum(is_match, axis = 1) > 0) # [BLOCK_SIZE_B]
+                    # Find matching ids (mask out padding categories so they can't spuriously match `data == 0`)
+                    is_match = ((catids == data[:,None]) & mask_c[None,:]).to(tl.int64) # [BLOCK_SIZE_B, TILE_SIZE_K]
+                    match_ids = tl.sum(is_match * tl.arange(0, TILE_SIZE_K), axis = 1) # [BLOCK_SIZE_B]
+                    has_match = (tl.sum(is_match, axis = 1) > 0) # [BLOCK_SIZE_B]
 
-                # Load parameters if found
-                expar = tl.load(expar_ptr + i * TILE_SIZE_K + match_ids, mask = (mask_b & has_match), other = 0.0) # [BLOCK_SIZE_B]
-                log_ex_p = tl.where(has_match, expar, log_ex_p)
+                    # Load parameters if found
+                    expar = tl.load(expar_ptr + i * TILE_SIZE_K + match_ids, mask = (mask_b & has_match), other = 0.0) # [BLOCK_SIZE_B]
+                    log_ex_p = tl.where(has_match, expar, log_ex_p)
 
         else:
             ex_p_ptr = categorical_evidence_logp_ptr + \
@@ -1861,8 +1885,6 @@ class SoftEvidenceCategorical(Distribution):
                 data
             log_ex_p = tl.load(ex_p_ptr, mask = mask_b, other = 0.0) # [BLOCK_SIZE_B]
 
-        # Get the value mask (`True` to condition on the observed value, `False` to marginalize)
-        value_mask = tl.load(soft_evidence_value_mask_ptr + offsets_b * ext_num_vars + lvid, mask = mask_b, other = False) # [BLOCK_SIZE_B]
 
         # Final output logprob: unnormalized conditional where observed, logZ where masked
         log_p = tl.where(value_mask[:,None], log_in_p + log_ex_p[:,None], logZ)
