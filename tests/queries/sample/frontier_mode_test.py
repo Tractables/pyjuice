@@ -18,10 +18,11 @@ That makes four unwritten assumptions load-bearing, and this file writes them do
     because the natural shortcut -- subtract `input_layer_group[0]`'s start and index its `vids` --
     reads out of bounds the moment a circuit has more than one input layer.
 
-:note: the emission step is what is skipped, not the bookkeeping: `sample()` still fills
-       `pc.node_flows` before the branch, so a frontier draw overwrites it. A caller holding flows
-       from a backward gets them replaced. Pinned in `test_a_frontier_draw_does_not_disturb_a_backward`
-       -- what matters is that a later `backward()` recomputes rather than trusting them.
+:note: the mode skips the emission step AND the `pc.node_flows` bookkeeping that only fed it, so a
+       frontier draw leaves the flows alone (it used to overwrite them; that cost 44.9 us of a 478 us
+       draw and nothing on this path read the result). `test_a_frontier_draw_does_not_disturb_a_backward`
+       is unchanged and still passes -- what it pins down is that a later `backward()` recomputes
+       rather than trusting whatever a draw left behind, which holds either way.
 """
 
 import random
@@ -230,10 +231,11 @@ def test_two_frontiers_held_at_once_do_not_share_storage(use_cudagraph):
 @cuda_only
 def test_a_frontier_draw_does_not_disturb_a_backward():
     """
-    Frontier mode still fills `pc.node_flows` before returning -- the emission step is what it skips,
-    not the bookkeeping -- so a draw between a forward and its backward overwrites the flows a
-    caller may be holding. What must NOT happen is the backward itself coming out different, which
-    it does not, because it recomputes.
+    A draw interposed between a forward and its backward must not change the backward's answer.
+
+    That holds however the draw treats `pc.node_flows` -- because the backward recomputes them rather
+    than trusting what is there -- which is why this test kept passing unchanged when frontier mode
+    stopped writing the flows at all (they only ever fed the emission step it skips).
     """
     torch.manual_seed(0)
     data = torch.randint(0, NUM_CATS, [512, _hmm().num_vars], device = torch.device("cuda:0"))
