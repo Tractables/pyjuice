@@ -26,6 +26,7 @@ from pyjuice.utils.grad_fns import ReverseGrad
 from pyjuice.utils import BitSet
 from pyjuice.utils.source2fn import make_function_from_src
 from pyjuice.utils.kernel_launcher import triton_jit
+from pyjuice.utils.fast_inference import param_copies_allowed, register_layer
 from .layer import Layer
 
 
@@ -254,6 +255,10 @@ class InputLayer(Layer, nn.Module):
 
         self.param_flows = None
 
+        # A derived rearrangement of `params` held only inside a `pyjuice.fast_inference` scope; see
+        # `_ensure_fast_inference_params`. Not a buffer and not saved: it is recomputed per scope.
+        self._fast_inference_params = None
+
         # Whether the JIT-built Triton kernels have been constructed yet. Separate from whether they are
         # non-None: a distribution may legitimately have no kernel for a stage, and we must not retry.
         self._mars_kernel_built = False
@@ -276,6 +281,10 @@ class InputLayer(Layer, nn.Module):
         else:
             device = torch.device(device)
 
+        # The copy is derived from `params` and lives on the old device; a move must not leave a
+        # kernel on the new one reading it.
+        self._release_fast_inference_params()
+
         nn.Module.to(self, device = device)
 
         # Take special care to `tied2source_nids`
@@ -283,6 +292,42 @@ class InputLayer(Layer, nn.Module):
             self.tied2source_nids[i][2] = self.tied2source_nids[i][2].to(device)
 
         self.device = device
+
+    def _ensure_fast_inference_params(self):
+        """
+        Build this layer's derived parameter copy if a `pyjuice.fast_inference` scope wants one.
+
+        Lazy, and called from the forward, so a circuit that is never run inside the scope never
+        pays for a copy. Returns the copy, or `None` when there is no scope, when the scope forbade
+        copies, or when the distribution has no use for one.
+        """
+        if self._fast_inference_params is not None:
+            return self._fast_inference_params
+        if not param_copies_allowed():
+            return None
+
+        derived = self.dist.build_fast_inference_params(self)
+        if derived is None:
+            return None
+
+        self._fast_inference_params = derived
+        register_layer(self)
+        return derived
+
+    def _release_fast_inference_params(self, poison: bool = False):
+        """
+        Drop the derived copy. Called when the scope exits, and defensively from every in-repo path
+        that writes `params` -- a copy that outlived a parameter change would be silently stale.
+        """
+        derived = self._fast_inference_params
+        if derived is None:
+            return
+        self._fast_inference_params = None
+        if poison:
+            # Keep the allocation alive and make it NaN, so a reader that somehow still holds this
+            # pointer produces an obvious result instead of whatever the allocator recycles into it.
+            derived.fill_(float("nan"))
+            self._poisoned_fast_inference_params = derived
 
     def init_param_flows(self, flows_memory: float = 1.0):
         batch_size = self._param_batch_size
@@ -382,6 +427,10 @@ class InputLayer(Layer, nn.Module):
                 assert missing_mask is not None, "`missing_mask` should be provided when `_apply_missing_mask_only = True`."
 
             # Apply post-processing kernels
+            #
+            # Built here rather than at scope entry so that a circuit never run inside the scope
+            # never pays for a copy, and so the scope needs no list of the circuits it covers.
+            self._ensure_fast_inference_params()
             self.dist.preprocess_fw_kwargs(self, kwargs)
             self.dist.set_custom_kernel_kwargs(kwargs)
             kwargs["_fw_data"] = data
@@ -754,6 +803,10 @@ class InputLayer(Layer, nn.Module):
                 )
 
     def mini_batch_em(self, step_size: float, pseudocount: float = 0.0, keep_zero_params: bool = False):
+        # This writes `params` from a Triton kernel, which PyTorch's version counter never sees, so
+        # nothing downstream could notice a derived copy going stale. Drop it here instead.
+        self._release_fast_inference_params()
+
         if not self._used_external_params:
             # Normalize and update parameters
             with torch.no_grad():
@@ -1130,6 +1183,8 @@ class InputLayer(Layer, nn.Module):
         return reordered_nodes
 
     def _init_parameters(self, perturbation):
+
+        self._release_fast_inference_params()   # rewrites `params` wholesale
 
         p_start, p_end = 0, 0
         for ns_id, ns in enumerate(self.nodes):

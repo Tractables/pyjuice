@@ -1520,6 +1520,36 @@ class SoftEvidenceCategorical(Distribution):
     def set_custom_kernel_kwargs(self, kwargs):
         kwargs["dual_flow_backward"] = self._dual_flow_backward
 
+    def build_fast_inference_params(self, layer):
+        """
+        The emission table transposed to `[num_cats, num_rows]`, for the forward's candidate gather.
+
+        The kernels address an emission entry as `params[s_pids[n] + cat]`, so with the natural
+        `[rows, cats]` layout two consecutive NODES -- the innermost axis of the forward's tile --
+        are `num_cats` floats apart (505 KB on the CoDD circuit). Every useful float then costs its
+        own 32-byte sector, and MEASURED, the kernel sits at ~50 GB/s of useful bandwidth no matter
+        how its tiles are shaped. Transposed, those same two nodes are 1 float apart.
+
+        Returns `None` unless the layout assumption actually holds, rather than assuming it: every
+        node's row must start at a multiple of `num_cats`, and the rows must tile the table exactly.
+        Both are true for the circuits this is for, and a layer where they are not simply keeps the
+        ordinary path.
+        """
+        params = layer.params
+        num_cats = self.num_cats
+        if params.numel() % num_cats != 0:
+            return None
+        num_rows = params.numel() // num_cats
+
+        s_pids = layer.s_pids
+        if s_pids.numel() == 0 or bool((s_pids % num_cats != 0).any()):
+            return None
+        rows = s_pids // num_cats
+        if int(rows.max()) >= num_rows:
+            return None
+
+        return params.detach().view(num_rows, num_cats).t().contiguous()
+
     def preprocess_fw_kwargs(self, layer, kwargs):
         """
         Sort top-k soft evidence by category id, which the forward is bound by -- see
