@@ -13,6 +13,7 @@ from .sampling import assign_cids_ind_target, assign_nids_ind_target, push_non_n
                       count_prod_nch, sample_prod_layer, sample_sum_layer
 from .sampling.scope_plan import build_scope_plan
 from .sampling.scoped import scoped_prod_layer, scoped_sum_layer
+from .sampling.fused import build_fused_plan, fused_top_down, fusion_applicability
 
 
 #: How many recorded sampling plans to keep per circuit, keyed by (num_samples, conditional).
@@ -169,7 +170,8 @@ def _drop_caches_if_moved(pc: TensorCircuit) -> None:
         return
 
     pc.__dict__["_sample_cache_device"] = device
-    for name in ("_sample_scope_plan", "_sample_scoped_states", "_sample_plans"):
+    for name in ("_sample_scope_plan", "_sample_scoped_states", "_sample_plans",
+                 "_sample_fused_plan"):
         pc.__dict__.pop(name, None)
 
 
@@ -181,7 +183,21 @@ def _scope_plan(pc: TensorCircuit):
     return plan
 
 
-def _graph_bindings(pc, conditional: bool, staged = None):
+def _fused_plan(pc: TensorCircuit, plan):
+    """
+    The fused pass's level-indexed tables, derived once and cached on the circuit.
+
+    `False` (not `None`) marks a circuit the fast path declined, so the applicability test is not
+    re-run on every draw.
+    """
+    fp = pc.__dict__.get("_sample_fused_plan")
+    if fp is None:
+        fp = build_fused_plan(pc, plan)
+        pc.__dict__["_sample_fused_plan"] = fp if fp is not None else False
+    return fp or None
+
+
+def _graph_bindings(pc, conditional: bool, staged = None, fused: bool = False):
     """
     Everything about the circuit that a captured pass BAKES IN, as a comparable signature.
 
@@ -214,9 +230,14 @@ def _graph_bindings(pc, conditional: bool, staged = None):
         for ns, tensors in staged.items()
     ))
 
+    # `fused` is in the signature because the two passes are DIFFERENT kernel sequences captured into
+    # the same per-(num_samples, conditional) state slot. Without it, flipping `fuse_top_down`
+    # between calls finds the other mode's graph already captured and replays that one instead --
+    # which reads as "the flag does nothing" (MEASURED: 1.00x, identical to three decimals) and, on a
+    # circuit where only one of the two is correct, would be silently wrong rather than merely slow.
     return (pc.node_mars.data_ptr() if pc.node_mars is not None else 0,
             pc.element_mars.data_ptr() if pc.element_mars is not None else 0,
-            pc.params.data_ptr(), bool(conditional), external)
+            pc.params.data_ptr(), bool(conditional), bool(fused), external)
 
 
 def _scoped_state(pc, plan, num_samples: int, conditional: bool, persistent: bool,
@@ -330,7 +351,7 @@ def _scoped_top_down(pc, plan, node_samples, element_samples, seed_ptr, conditio
 
 
 def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bool = False,
-           use_cudagraph: bool = False, _use_scope_plan: bool = True,
+           use_cudagraph: bool = False, fuse_top_down: bool = False, _use_scope_plan: bool = True,
            _sample_input_ns: bool = True, _do_calibration: bool = False, **kwargs):
     """
     Draw samples from a PC by performing a top-down ancestral sampling pass.
@@ -369,6 +390,22 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
                           must repeat, or a replay is simply wrong) and is refused otherwise. One
                           graph is kept per `(num_samples, conditional)`, bounded with the plans.
     :type use_cudagraph: bool
+
+    :param fuse_top_down: run the whole CONDITIONAL top-down as one kernel instead of the ~5 launches
+                          per level the ordinary walk needs. OPT-IN and SHAPE-GATED: it declines --
+                          silently, falling back to the ordinary walk -- on anything outside
+                          :func:`~pyjuice.queries.sampling.fused.fusion_applicability`, whose gate is
+                          per-level WORK rather than structured decomposability. It is for DEEP
+                          NARROW circuits, where the pass is pure launch overhead; a shallow wide one
+                          does more per level than a single program should serialise and is better
+                          served by the ordinary parallel launches.
+
+                          It needs no CUDA graph of its own -- one launch has nothing to amortise --
+                          and it reproduces the ordinary pass's per-(row, sample) RNG offsets, so
+                          under one seed the two draw the same frontier bar a rare inverse-CDF
+                          boundary (MEASURED: 0.017% of entries, on 2 of 200 seeds). Ignored for an
+                          unconditional draw, under `_do_calibration`, and for gated circuits.
+    :type fuse_top_down: bool
 
     :param _sample_input_ns: whether to finish the draw by emitting a value from each selected input
                              node. Default `True`, which is what makes the return a tensor of
@@ -640,33 +677,42 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
         # taking it as a scalar argument, precisely so a replay redraws
         seed_ptr.fill_(random.randint(0, 2**31 - 1))
 
+        # The fused pass is a shape-gated fast path for deep narrow circuits; `fused` is None
+        # whenever it does not apply, and the ordinary per-layer walk runs instead.
+        fused = _fused_plan(pc, plan) if (fuse_top_down and conditional and not _do_calibration
+                                          and not kwargs.get("sum_external_params")) else None
+
+        def _pass():
+            if fused is not None:
+                fused_top_down(pc, fused, node_samples, seed_ptr)
+            else:
+                _scoped_top_down(pc, plan, node_samples, element_samples, seed_ptr, conditional,
+                                 kwargs, _do_calibration)
+
         if not use_cudagraph:
-            _scoped_top_down(pc, plan, node_samples, element_samples, seed_ptr, conditional, kwargs,
-                             _do_calibration)
+            _pass()
         else:
             # A graph is only replayable while the buffers it baked in are still where they were.
             # Recapture rather than refuse: whether they moved is a consequence of what the CALLER
             # did with the circuit in between (a forward at another batch size), which is not
             # something they should have to track to keep a draw correct.
-            bindings = _graph_bindings(pc, conditional, kwargs.get("sum_external_params"))
+            bindings = _graph_bindings(pc, conditional, kwargs.get("sum_external_params"),
+                                       fused = fused is not None)
             if state["graph"] is None or state["bindings"] != bindings:
                 state["graph"] = None                       # release the old pool before capturing
 
                 # One live pass so every buffer exists and every kernel is compiled -- capture
                 # tolerates neither an allocation nor a JIT compile -- then capture on a side stream.
-                _scoped_top_down(pc, plan, node_samples, element_samples, seed_ptr, conditional, kwargs,
-                             _do_calibration)
+                _pass()
                 stream = torch.cuda.Stream()
                 stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(stream):
-                    _scoped_top_down(pc, plan, node_samples, element_samples, seed_ptr,
-                                     conditional, kwargs, _do_calibration)
+                    _pass()
                 torch.cuda.current_stream().wait_stream(stream)
 
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
-                    _scoped_top_down(pc, plan, node_samples, element_samples, seed_ptr,
-                                     conditional, kwargs, _do_calibration)
+                    _pass()
 
                 # Recorded only after a capture that completed: a half-captured graph must not be
                 # taken for a valid one on the next call.
@@ -716,16 +762,24 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
     oversized = node_samples.size(1) != num_samples
     frontier = node_samples[:, :num_samples] if oversized else node_samples
 
-    # Create tensor for the samples
-    data_dtype = pc.input_layer_group[0].get_data_dtype()
-    samples = torch.zeros([pc.num_vars, num_samples], dtype = data_dtype, device = pc.device)
-
-    pc._init_buffer(name = "node_flows", shape = (pc.num_nodes, num_samples), set_value = 0.0)
-    ind_n, ind_b = torch.where(frontier != -1)
-    ind_node = frontier[ind_n, ind_b]
-    pc.node_flows[ind_node, ind_b] = 1.0
-
     if _sample_input_ns:
+        # `node_flows` and `samples` exist ONLY to drive the emission step below, so both are built
+        # here rather than before the branch. Frontier mode used to pay for them and throw them away:
+        # MEASURED at 44.9 us of a 478 us draw (a zero-fill over `num_nodes`, an index_put, an unused
+        # allocation, and a `torch.where` that SYNCHRONIZES because its output size is host-visible).
+        #
+        # This does mean a frontier draw no longer overwrites `pc.node_flows`. That is a deliberate
+        # narrowing of the mode's side effects, not a lost feature -- nothing reads the flows on this
+        # path, and `backward()` recomputes them rather than trusting whatever a draw left behind
+        # (which is what `test_a_frontier_draw_does_not_disturb_a_backward` actually pins down).
+        data_dtype = pc.input_layer_group[0].get_data_dtype()
+        samples = torch.zeros([pc.num_vars, num_samples], dtype = data_dtype, device = pc.device)
+
+        pc._init_buffer(name = "node_flows", shape = (pc.num_nodes, num_samples), set_value = 0.0)
+        ind_n, ind_b = torch.where(frontier != -1)
+        ind_node = frontier[ind_n, ind_b]
+        pc.node_flows[ind_node, ind_b] = 1.0
+
         for layer in pc.input_layer_group:
             seed = random.randint(0, 2**31)
             layer.sample(samples, pc.node_flows, seed = seed, **kwargs)
