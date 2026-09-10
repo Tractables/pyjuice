@@ -762,24 +762,39 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
     oversized = node_samples.size(1) != num_samples
     frontier = node_samples[:, :num_samples] if oversized else node_samples
 
+    # Built on BOTH paths, before the branch. Only the emission step below reads them, so building
+    # them in frontier mode is 44.9 us of a 478 us draw that nothing consumes (a zero-fill over
+    # `num_nodes`, an index_put, an unused allocation, and a `torch.where` that SYNCHRONIZES because
+    # its output size is host-visible) -- and skipping it was measured and then REVERTED.
+    #
+    # The reason is that `pc.node_flows` is a public attribute that outlives the call. Skipping the
+    # write does not leave it empty; it leaves whatever the LAST BACKWARD put there, so a caller
+    # reading `pc.node_flows` after a frontier draw gets a plausible tensor of the wrong quantity
+    # instead of this draw's frontier. That is a silent wrong answer, and it is worth 44.9 us to not
+    # have one. `test_a_frontier_draw_does_not_disturb_a_backward` never covered this: it pins only
+    # that a LATER backward is unaffected, which held either way.
+    #
+    # The write below is the SYNC-FREE form of what used to be
+    #
+    #     ind_n, ind_b = torch.where(frontier != -1)
+    #     pc.node_flows[frontier[ind_n, ind_b], ind_b] = 1.0
+    #
+    # and is bit-identical to it. `torch.where` has a host-visible output size, so it synchronises:
+    # measured on the CoDD circuit at batch 32, that pair cost 555 us of a 790 us draw, of which the
+    # zero-fill is only 6 us -- the rest is the stall. Scattering the frontier directly costs 23.9 us.
+    #
+    # `clamp(min = 0)` sends the -1 padding to row 0 and pairs it with a source value of 0.0, so a
+    # padded slot writes nothing. `amax` (not plain scatter) is what makes that safe: were row 0 also
+    # a real frontier node, an unordered 0.0 could otherwise land on top of its 1.0.
+    data_dtype = pc.input_layer_group[0].get_data_dtype()
+    samples = torch.zeros([pc.num_vars, num_samples], dtype = data_dtype, device = pc.device)
+
+    pc._init_buffer(name = "node_flows", shape = (pc.num_nodes, num_samples), set_value = 0.0)
+    pc.node_flows.scatter_reduce_(0, frontier.clamp(min = 0),
+                                  (frontier != -1).to(pc.node_flows.dtype),
+                                  reduce = "amax", include_self = True)
+
     if _sample_input_ns:
-        # `node_flows` and `samples` exist ONLY to drive the emission step below, so both are built
-        # here rather than before the branch. Frontier mode used to pay for them and throw them away:
-        # MEASURED at 44.9 us of a 478 us draw (a zero-fill over `num_nodes`, an index_put, an unused
-        # allocation, and a `torch.where` that SYNCHRONIZES because its output size is host-visible).
-        #
-        # This does mean a frontier draw no longer overwrites `pc.node_flows`. That is a deliberate
-        # narrowing of the mode's side effects, not a lost feature -- nothing reads the flows on this
-        # path, and `backward()` recomputes them rather than trusting whatever a draw left behind
-        # (which is what `test_a_frontier_draw_does_not_disturb_a_backward` actually pins down).
-        data_dtype = pc.input_layer_group[0].get_data_dtype()
-        samples = torch.zeros([pc.num_vars, num_samples], dtype = data_dtype, device = pc.device)
-
-        pc._init_buffer(name = "node_flows", shape = (pc.num_nodes, num_samples), set_value = 0.0)
-        ind_n, ind_b = torch.where(frontier != -1)
-        ind_node = frontier[ind_n, ind_b]
-        pc.node_flows[ind_node, ind_b] = 1.0
-
         for layer in pc.input_layer_group:
             seed = random.randint(0, 2**31)
             layer.sample(samples, pc.node_flows, seed = seed, **kwargs)
