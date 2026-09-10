@@ -188,6 +188,66 @@ def test_repeated_entries_do_not_accumulate():
     assert torch.cuda.memory_allocated() <= base + 1024, "entries leak"
 
 
+def _topk_evidence(pc, batch, num_masked, K = 8, mask_id = None):
+    """Top-k soft evidence plus a value mask -- the configuration the transposed forward serves."""
+    dev = torch.device("cuda:0")
+    mask_id = NUM_CATS - 1 if mask_id is None else mask_id
+    x = torch.randint(0, NUM_CATS - 1, [batch, pc.num_vars], device = dev)
+    for r in range(batch):
+        if num_masked:
+            x[r, torch.randperm(pc.num_vars)[:num_masked]] = mask_id
+    value_mask = ~(x == mask_id)
+    evi = torch.log_softmax(torch.randn(batch, pc.num_vars, NUM_CATS, device = dev), dim = -1)
+    lp, idx = evi.topk(K, dim = -1)
+    # the conditioned token must be inside the candidate set, or the query is nan
+    tok = x.unsqueeze(-1)
+    need = value_mask.unsqueeze(-1) & ~(idx == tok).any(dim = -1, keepdim = True)
+    idx = torch.cat([idx[..., :-1], torch.where(need, tok, idx[..., -1:])], dim = -1)
+    lp = torch.cat([lp[..., :-1], torch.where(need, evi.gather(-1, tok), lp[..., -1:])], dim = -1)
+    return x, dict(categorical_evidence_logp = lp.contiguous(),
+                   soft_evidence_cat_ids = idx.contiguous(),
+                   soft_evidence_value_mask = value_mask)
+
+
+@cuda_only
+@pytest.mark.parametrize("batch,num_masked", [(1, 0), (1, 2), (1, 4), (4, 2), (16, 2)])
+def test_the_transposed_forward_gives_the_identical_answer(batch, num_masked):
+    """
+    The whole safety claim of the transposed emission table: it changes WHERE a value is read from,
+    never which value, so the forward must agree to the BIT -- root log-likelihood and the input
+    layer's own `node_mars` slice alike. Anything less would mean the layout change is not a
+    rearrangement but a different computation.
+    """
+    pc = _softevi_pc()
+    layer = pc.input_layer_group[0]
+    sid, eid = layer._output_ind_range
+    x, kw = _topk_evidence(pc, batch, num_masked)
+
+    ll_plain = pc(x, **kw).clone()
+    mars_plain = pc.node_mars[sid:eid].clone()
+
+    with juice.fast_inference():
+        pc(x, **kw)                                     # first forward builds the copy
+        assert layer._fast_inference_params is not None
+        ll_fast = pc(x, **kw).clone()
+        mars_fast = pc.node_mars[sid:eid].clone()
+
+    assert torch.equal(ll_plain, ll_fast), \
+        f"root LL differs by {(ll_plain - ll_fast).abs().max().item():.3e}"
+    assert torch.equal(mars_plain, mars_fast), \
+        f"input-layer node_mars differs by {(mars_plain - mars_fast).abs().max().item():.3e}"
+
+
+@cuda_only
+def test_the_ordinary_forward_is_unchanged_when_copies_are_forbidden():
+    """`allow_param_copy = False` must leave the ordinary kernel and its tiling exactly as they were."""
+    pc = _softevi_pc()
+    x, kw = _topk_evidence(pc, 4, 2)
+    plain = pc(x, **kw).clone()
+    with juice.fast_inference(allow_param_copy = False):
+        assert torch.equal(plain, pc(x, **kw))
+
+
 @cuda_only
 def test_a_distribution_with_no_use_for_a_copy_builds_nothing():
     with juice.set_block_size(8):
