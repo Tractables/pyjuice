@@ -323,6 +323,13 @@ class InputLayer(Layer, nn.Module):
         Drop the derived copy. Called when the scope exits, and defensively from every in-repo path
         that writes `params` -- a copy that outlived a parameter change would be silently stale.
         """
+        # The sorted-candidate cache holds a full-size COPY of the caller's evidence (3 MiB at
+        # B=8/V=32/K=1024, 12 MiB at B=32) and is keyed by input identity, so nothing ever evicts it:
+        # without this it stays resident for the layer's lifetime, and survives `pc.to('cpu')` still
+        # pinning device memory. It is a per-step cache; every path that reaches here has invalidated
+        # the step it belonged to.
+        self._fw_sorted_cache = None
+
         derived = self._fast_inference_params
         if derived is None:
             return
