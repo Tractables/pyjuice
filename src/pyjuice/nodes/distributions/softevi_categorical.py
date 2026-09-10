@@ -1576,7 +1576,7 @@ class SoftEvidenceCategorical(Distribution):
     def set_custom_kernel_kwargs(self, kwargs):
         kwargs["dual_flow_backward"] = self._dual_flow_backward
 
-    def build_fast_inference_params(self, layer):
+    def build_fast_inference_params(self, layer, kwargs = None):
         """
         The emission table transposed to `[num_cats, num_rows]`, for the forward's candidate gather.
 
@@ -1591,6 +1591,11 @@ class SoftEvidenceCategorical(Distribution):
         Both are true for the circuits this is for, and a layer where they are not simply keeps the
         ordinary path.
         """
+        # Only the TOP-K gather reads the transposed table (see `_fw_transposed_args`), so a
+        # full-vocabulary forward would allocate a duplicate of the emission table and never touch it.
+        if kwargs is not None and kwargs.get("soft_evidence_cat_ids", None) is None:
+            return None
+
         params = layer.params
         num_cats = self.num_cats
 

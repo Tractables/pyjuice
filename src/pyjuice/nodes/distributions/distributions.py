@@ -124,13 +124,14 @@ class Distribution():
     def set_custom_kernel_kwargs(self, kwargs):
         pass
 
-    def build_fast_inference_params(self, layer):
+    def build_fast_inference_params(self, layer, kwargs = None):
         """
         A derived, read-only rearrangement of `layer.params` for use inside
         :func:`pyjuice.fast_inference`, or `None` when this distribution has no use for one.
 
         Only ever called inside that scope, where parameters are promised not to change; the result
-        is freed when the scope exits. A distribution that returns something here must also be able
+        is freed when the scope exits. `kwargs` are the forward's, so a distribution can decline for a
+        call that would not read the copy rather than pay for it. A distribution that returns something here must also be able
         to read it in its kernels -- the layer only holds it, it does not interpret it.
         """
         return None

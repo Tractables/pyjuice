@@ -74,13 +74,13 @@ def test_the_scope_unwinds_on_an_exception():
 @cuda_only
 def test_a_copy_is_built_lazily_and_freed_on_exit():
     pc = _softevi_pc()
-    data = _data(pc)
+    x, kw = _topk_evidence(pc, 8, 2)
 
     assert all(c is None for c in _copies(pc))
     with juice.fast_inference():
         # LAZY: entering the scope alone builds nothing ...
         assert all(c is None for c in _copies(pc))
-        pc(data)
+        pc(x, **kw)
         # ... the first forward inside it does
         built = _copies(pc)
         assert all(c is not None for c in built)
@@ -92,15 +92,17 @@ def test_a_copy_is_built_lazily_and_freed_on_exit():
 @cuda_only
 def test_no_copy_when_the_scope_forbids_it():
     pc = _softevi_pc()
+    x, kw = _topk_evidence(pc, 8, 2)
     with juice.fast_inference(allow_param_copy = False):
-        pc(_data(pc))
+        pc(x, **kw)
         assert all(c is None for c in _copies(pc))
 
 
 @cuda_only
 def test_no_copy_outside_a_scope():
     pc = _softevi_pc()
-    pc(_data(pc))
+    x, kw = _topk_evidence(pc, 8, 2)
+    pc(x, **kw)
     assert all(c is None for c in _copies(pc))
 
 
@@ -108,8 +110,9 @@ def test_no_copy_outside_a_scope():
 def test_the_copy_is_the_transposed_emission_table():
     pc = _softevi_pc()
     layer = pc.input_layer_group[0]
+    x, kw = _topk_evidence(pc, 8, 2)
     with juice.fast_inference():
-        pc(_data(pc))
+        pc(x, **kw)
         rows = layer.params.numel() // NUM_CATS
         assert torch.equal(layer._fast_inference_params,
                            layer.params.detach().view(rows, NUM_CATS).t().contiguous())
@@ -125,13 +128,13 @@ def test_every_in_repo_parameter_write_drops_the_copy(write):
     would be silent, so each path is pinned separately rather than trusted.
     """
     pc = _softevi_pc()
-    data = _data(pc)
+    x, kw = _topk_evidence(pc, 8, 2)
     with juice.fast_inference():
-        pc(data)
+        pc(x, **kw)
         assert pc.input_layer_group[0]._fast_inference_params is not None
 
         if write == "mini_batch_em":
-            pc.backward(data, flows_memory = 0.0)
+            pc.backward(x, flows_memory = 0.0, **kw)
             pc.mini_batch_em(step_size = 0.5, pseudocount = 0.1)
         elif write == "_init_parameters":
             for layer in pc.input_layer_group:
@@ -159,13 +162,13 @@ def test_the_copy_does_not_change_the_answer():
 def test_the_memory_is_actually_returned():
     """A freed copy has to give the allocator its block back, or the scope leaks per entry."""
     pc = _softevi_pc(num_vars = 6, states = 32)
-    data = _data(pc)
-    pc(data)
+    x, kw = _topk_evidence(pc, 8, 2)
+    pc(x, **kw)
     torch.cuda.synchronize()
     base = torch.cuda.memory_allocated()
 
     with juice.fast_inference():
-        pc(data)
+        pc(x, **kw)
         torch.cuda.synchronize()
         inside = torch.cuda.memory_allocated()
         expected = sum(l.params.numel() * l.params.element_size() for l in pc.input_layer_group)
@@ -178,12 +181,12 @@ def test_the_memory_is_actually_returned():
 @cuda_only
 def test_repeated_entries_do_not_accumulate():
     pc = _softevi_pc()
-    data = _data(pc)
-    pc(data); torch.cuda.synchronize()
+    x, kw = _topk_evidence(pc, 8, 2)
+    pc(x, **kw); torch.cuda.synchronize()
     base = torch.cuda.memory_allocated()
     for _ in range(5):
         with juice.fast_inference():
-            pc(data)
+            pc(x, **kw)
     torch.cuda.synchronize()
     assert torch.cuda.memory_allocated() <= base + 1024, "entries leak"
 
@@ -263,6 +266,27 @@ def test_a_distribution_with_no_use_for_a_copy_builds_nothing():
         pc(_data(pc))
         assert all(c is None for c in _copies(pc))
 
+
+@cuda_only
+def test_a_forward_that_would_not_read_the_copy_does_not_build_one():
+    """
+    Only the TOP-K gather reads the transposed table, so a full-vocabulary forward must not allocate
+    one -- it is a duplicate of the whole emission table (494 MB on the CoDD circuit) that nothing
+    would touch. The scope being open is not on its own a reason to pay for it.
+    """
+    pc = _softevi_pc()
+    dev = torch.device("cuda:0")
+    x = torch.randint(0, NUM_CATS, [8, pc.num_vars], device = dev)
+    dense = torch.log_softmax(torch.randn(8, pc.num_vars, NUM_CATS, device = dev), dim = -1)
+    with juice.fast_inference():
+        pc(x, categorical_evidence_logp = dense)          # no `soft_evidence_cat_ids`
+        assert all(c is None for c in _copies(pc))
+        # ... and a top-k forward on the same circuit in the same scope still does build one
+        xt, kw = _topk_evidence(pc, 8, 2)
+        pc(xt, **kw)
+        assert all(c is not None for c in _copies(pc))
+
+
 @cuda_only
 def test_a_layer_mixing_num_cats_declines_the_copy():
     """
@@ -297,4 +321,3 @@ def test_a_layer_mixing_num_cats_declines_the_copy():
         assert all(l._fast_inference_params is None for l in mixed), \
             "a mixed-num_cats layer built a table it cannot address correctly"
         assert torch.equal(plain, pc(x, **kw))
-

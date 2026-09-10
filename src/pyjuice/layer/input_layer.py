@@ -293,20 +293,24 @@ class InputLayer(Layer, nn.Module):
 
         self.device = device
 
-    def _ensure_fast_inference_params(self):
+    def _ensure_fast_inference_params(self, kwargs = None):
         """
         Build this layer's derived parameter copy if a `pyjuice.fast_inference` scope wants one.
 
         Lazy, and called from the forward, so a circuit that is never run inside the scope never
         pays for a copy. Returns the copy, or `None` when there is no scope, when the scope forbade
         copies, or when the distribution has no use for one.
+
+        The forward's `kwargs` are handed on so the distribution can decline for THIS call: the copy
+        is only worth its memory when the call actually reads it, and a full emission-table duplicate
+        (494 MB on the CoDD circuit) allocated for a forward that never touches it is pure waste.
         """
         if self._fast_inference_params is not None:
             return self._fast_inference_params
         if not param_copies_allowed():
             return None
 
-        derived = self.dist.build_fast_inference_params(self)
+        derived = self.dist.build_fast_inference_params(self, kwargs)
         if derived is None:
             return None
 
@@ -430,7 +434,7 @@ class InputLayer(Layer, nn.Module):
             #
             # Built here rather than at scope entry so that a circuit never run inside the scope
             # never pays for a copy, and so the scope needs no list of the circuits it covers.
-            self._ensure_fast_inference_params()
+            self._ensure_fast_inference_params(kwargs)
             self.dist.preprocess_fw_kwargs(self, kwargs)
             self.dist.set_custom_kernel_kwargs(kwargs)
             kwargs["_fw_data"] = data
