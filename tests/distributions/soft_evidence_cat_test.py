@@ -1030,3 +1030,53 @@ if __name__ == "__main__":
     test_soft_evidence_categorical_value_mask_forward()
     test_soft_evidence_categorical_value_mask_matches_extern_product()
     test_soft_evidence_categorical_value_mask_no_slowdown()
+    test_soft_evidence_categorical_duplicate_candidate_id_is_bounded()
+
+
+def test_soft_evidence_categorical_duplicate_candidate_id_is_bounded():
+    # `soft_evidence_cat_ids` is documented to hold DISTINCT ids per row, and `torch.topk` -- the
+    # normal producer -- guarantees it. A hand-built candidate set can violate it, and until the
+    # `match_ids` clamp that violation was not merely wrong but memory-unsafe: the Triton kernels
+    # locate the observed token with `sum((cat_ids == data) * arange(K))`, so two matches at slots i
+    # and j address slot i + j. With the duplicate at high slots that runs off the end of the
+    # parameter row -- silently reading the NEXT node's emissions, and past the tensor entirely on
+    # the last row, which compute-sanitizer flags as an invalid global read.
+    #
+    # Nothing can recover the right answer here (the duplicate destroyed the information), so this
+    # does NOT pin a value. It pins the two properties a caller can still rely on: the result stays
+    # finite, and it is the SAME every run rather than a function of whatever the allocator left
+    # next door.
+
+    device = torch.device("cuda:0")
+
+    num_vars, num_cats, k, batch_size = 2, 64, 64, 4
+
+    torch.manual_seed(931)
+
+    nis = [
+        juice.inputs(v, num_nodes = 4, dist = dists.SoftEvidenceCategorical(num_cats = num_cats)) for v in range(num_vars)
+    ]
+    ns = juice.summate(juice.multiply(*nis), num_nodes = 1)
+    ns.init_parameters(perturbation = 2.0)
+    pc = juice.compile(ns, verbose = False).to(device)
+
+    data = torch.randint(0, num_cats, [batch_size, num_vars], device = device)
+    logp = torch.log_softmax(torch.randn([batch_size, num_vars, k], device = device), dim = -1)
+
+    cat_ids = torch.arange(k, device = device).view(1, 1, k).repeat(batch_size, num_vars, 1).contiguous()
+    # The observed token twice, at slots whose SUM (90) overruns the k = 64 wide tile.
+    cat_ids[:, :, 40] = data
+    cat_ids[:, :, 50] = data
+
+    lls = []
+    for _ in range(6):
+        # Churn the allocator between runs: were the read still out of bounds, what it lands on would
+        # change, and this is what would expose it.
+        torch.empty([2 ** 20], device = device).normal_()
+        pc.input_layer_group[0]._fw_sorted_cache = None
+        pc.input_layer_group[0]._fw_pt_cache = None
+        lls.append(pc(data, categorical_evidence_logp = logp, soft_evidence_cat_ids = cat_ids).sum().item())
+
+    assert all(math.isfinite(v) for v in lls), f"duplicate candidate id produced a non-finite LL: {lls}"
+    assert max(lls) - min(lls) == 0.0, \
+        f"duplicate candidate id gave a run-dependent LL (spread {max(lls) - min(lls):.3e}): {lls}"

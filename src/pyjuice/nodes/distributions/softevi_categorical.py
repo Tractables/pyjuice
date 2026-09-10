@@ -1793,7 +1793,17 @@ class SoftEvidenceCategorical(Distribution):
 
                 # Find matching ids (mask out padding categories so they can't spuriously match `data == 0`)
                 is_match = ((catids == data[:,None]) & mask_c[None,:]).to(tl.int64) # [BLOCK_SIZE_B, TILE_SIZE_K]
+                # CLAMPED. This is a SUM over matching slots, so it is the intended slot only when the
+                # tile holds `data` at most once -- the documented precondition. Two matches at slots
+                # i and j yield i + j, which for i + j >= TILE_SIZE_K addresses PAST the tile: an
+                # out-of-bounds read (confirmed under compute-sanitizer), and the value it lands on
+                # varies with allocator layout, so the log-likelihood is nondeterministic run to run.
+                # The clamp cannot restore the right answer for a duplicated id -- nothing can, the
+                # information is already gone -- but it keeps the read in bounds and the result
+                # deterministic. Branchless on purpose: a `tl.where`/early-out here costs real
+                # throughput on the dominant no-duplicate path (cf. the LowRank padded-slot clamp).
                 match_ids = tl.sum(is_match * tl.arange(0, TILE_SIZE_K), axis = 1) # [BLOCK_SIZE_B]
+                match_ids = tl.minimum(match_ids, TILE_SIZE_K - 1)
                 has_match = (tl.sum(is_match, axis = 1) > 0) # [BLOCK_SIZE_B]
 
                 # Load parameters if found
@@ -1991,7 +2001,17 @@ class SoftEvidenceCategorical(Distribution):
 
                     # Find matching ids (mask out padding categories so they can't spuriously match `data == 0`)
                     is_match = ((catids == data[:,None]) & mask_c[None,:]).to(tl.int64) # [BLOCK_SIZE_B, TILE_SIZE_K]
+                    # CLAMPED. This is a SUM over matching slots, so it is the intended slot only when the
+                    # tile holds `data` at most once -- the documented precondition. Two matches at slots
+                    # i and j yield i + j, which for i + j >= TILE_SIZE_K addresses PAST the tile: an
+                    # out-of-bounds read (confirmed under compute-sanitizer), and the value it lands on
+                    # varies with allocator layout, so the log-likelihood is nondeterministic run to run.
+                    # The clamp cannot restore the right answer for a duplicated id -- nothing can, the
+                    # information is already gone -- but it keeps the read in bounds and the result
+                    # deterministic. Branchless on purpose: a `tl.where`/early-out here costs real
+                    # throughput on the dominant no-duplicate path (cf. the LowRank padded-slot clamp).
                     match_ids = tl.sum(is_match * tl.arange(0, TILE_SIZE_K), axis = 1) # [BLOCK_SIZE_B]
+                    match_ids = tl.minimum(match_ids, TILE_SIZE_K - 1)
                     has_match = (tl.sum(is_match, axis = 1) > 0) # [BLOCK_SIZE_B]
 
                     # Load parameters if found
@@ -2155,7 +2175,17 @@ class SoftEvidenceCategorical(Distribution):
 
                 # Find matching ids (mask out padding categories so they can't spuriously match `data == 0`)
                 is_match = ((catids == data[:,None]) & mask_c[None,:]).to(tl.int64) # [BLOCK_SIZE_B, TILE_SIZE_K]
+                # CLAMPED. This is a SUM over matching slots, so it is the intended slot only when the
+                # tile holds `data` at most once -- the documented precondition. Two matches at slots
+                # i and j yield i + j, which for i + j >= TILE_SIZE_K addresses PAST the tile: an
+                # out-of-bounds read (confirmed under compute-sanitizer), and the value it lands on
+                # varies with allocator layout, so the log-likelihood is nondeterministic run to run.
+                # The clamp cannot restore the right answer for a duplicated id -- nothing can, the
+                # information is already gone -- but it keeps the read in bounds and the result
+                # deterministic. Branchless on purpose: a `tl.where`/early-out here costs real
+                # throughput on the dominant no-duplicate path (cf. the LowRank padded-slot clamp).
                 match_ids = tl.sum(is_match * tl.arange(0, TILE_SIZE_K), axis = 1) # [BLOCK_SIZE_B]
+                match_ids = tl.minimum(match_ids, TILE_SIZE_K - 1)
                 has_match = (tl.sum(is_match, axis = 1) > 0) # [BLOCK_SIZE_B]
 
                 # Load parameters if found
@@ -2402,7 +2432,17 @@ class SoftEvidenceCategorical(Distribution):
             catids = tl.load(catids_ptr + i * TILE_SIZE_K, mask = (mask_b[:,None] & mask_c[None,:]), other = 0)
 
             is_match = ((catids == data[:,None]) & mask_c[None,:]).to(tl.int64)
+            # CLAMPED. This is a SUM over matching slots, so it is the intended slot only when the
+            # tile holds `data` at most once -- the documented precondition. Two matches at slots
+            # i and j yield i + j, which for i + j >= TILE_SIZE_K addresses PAST the tile: an
+            # out-of-bounds read (confirmed under compute-sanitizer), and the value it lands on
+            # varies with allocator layout, so the log-likelihood is nondeterministic run to run.
+            # The clamp cannot restore the right answer for a duplicated id -- nothing can, the
+            # information is already gone -- but it keeps the read in bounds and the result
+            # deterministic. Branchless on purpose: a `tl.where`/early-out here costs real
+            # throughput on the dominant no-duplicate path (cf. the LowRank padded-slot clamp).
             match_ids = tl.sum(is_match * tl.arange(0, TILE_SIZE_K), axis = 1)
+            match_ids = tl.minimum(match_ids, TILE_SIZE_K - 1)
             has_match = (tl.sum(is_match, axis = 1) > 0)
 
             expar = tl.load(expar_ptr + i * TILE_SIZE_K + match_ids, mask = (mask_b & has_match), other = 0.0)
