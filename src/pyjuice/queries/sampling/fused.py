@@ -126,11 +126,15 @@ def build_fused_plan(pc, plan):
     sum_layers = [list(groups[i])[0] for i in idxs]
     prod_layers = [list(groups[i - 1])[0] for i in idxs]
 
-    E_S = max(l.partitioned_cids[0].size(1) for l in sum_layers)
-    E_P = max(l.partitioned_cids[0].size(1) for l in prod_layers)
-    NB = max(max(l.partitioned_nids[0].size(0) for l in sum_layers),
-             max(l.partitioned_nids[0].size(0) for l in prod_layers))
-    R = max(plan.sum_rows[id(l)].numel() for l in sum_layers)
+    # ROUNDED UP TO POWERS OF TWO. Every one of these becomes a `tl.arange` extent in the kernel, and
+    # Triton requires those to be powers of two -- `scoped.py` wraps each of its own in
+    # `next_power_of_2` for the same reason. A circuit with, say, 3 node blocks is perfectly ordinary
+    # and would otherwise pass the gate and then fail to compile.
+    E_S = triton.next_power_of_2(max(l.partitioned_cids[0].size(1) for l in sum_layers))
+    E_P = triton.next_power_of_2(max(l.partitioned_cids[0].size(1) for l in prod_layers))
+    NB = triton.next_power_of_2(max(max(l.partitioned_nids[0].size(0) for l in sum_layers),
+                                    max(l.partitioned_nids[0].size(0) for l in prod_layers)))
+    R = triton.next_power_of_2(max(plan.sum_rows[id(l)].numel() for l in sum_layers))
 
     def z(*shape, fill = 0):
         return torch.full(shape, fill, dtype = torch.long, device = dev)

@@ -145,3 +145,30 @@ def test_a_declined_circuit_still_draws():
     pc, data = _ready(4)
     pc.__dict__["_sample_fused_plan"] = False          # force the decline
     assert torch.equal(_draw(pc, data, True, 1), _draw(pc, data, False, 1))
+
+
+@cuda_only
+@pytest.mark.parametrize("num_node_blocks", [3, 5, 6])
+def test_a_non_power_of_two_node_block_count_still_works(num_node_blocks):
+    """
+    Every extent the fused kernel turns into a `tl.arange` must be a power of two -- Triton requires
+    it. The plan's extents come from the circuit's own table widths, which are under no such
+    obligation: a circuit with 3 node blocks is entirely ordinary, passed the gate, and then failed
+    to COMPILE. `scoped.py` rounds each of its own extents up for exactly this reason.
+    """
+    with juice.set_block_size(4):
+        ni = [inputs(v, num_node_blocks = num_node_blocks,
+                     dist = dists.Categorical(num_cats = NUM_CATS)) for v in range(2)]
+        ns = summate(multiply(*ni), num_node_blocks = num_node_blocks)
+        root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
+    root.init_parameters(perturbation = 2.0)
+    pc = juice.compile(root, verbose = False).to(torch.device("cuda:0"))
+
+    data = torch.randint(0, NUM_CATS, [4, pc.num_vars], device = torch.device("cuda:0"))
+    for fuse in (False, True):
+        _draw(pc, data, fuse, 0)                      # warm both passes
+    for seed in range(4):
+        a = _draw(pc, data, False, seed)
+        b = _draw(pc, data, True, seed)
+        assert torch.equal(a, b), \
+            f"{num_node_blocks} node blocks: {int((a != b).sum())} of {a.numel()} entries differ"
