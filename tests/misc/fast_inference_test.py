@@ -262,3 +262,39 @@ def test_a_distribution_with_no_use_for_a_copy_builds_nothing():
     with juice.fast_inference():
         pc(_data(pc))
         assert all(c is None for c in _copies(pc))
+
+@cuda_only
+def test_a_layer_mixing_num_cats_declines_the_copy():
+    """
+    `get_signature` does not include `num_cats`, so one input layer happily holds
+    `SoftEvidenceCategorical(4)` and `SoftEvidenceCategorical(8)` together. A transposed table built
+    from either one is the wrong shape for the other's rows and reads past the end of the table --
+    silently, and only inside the scope. The ordinary path handles that layout, so the copy must be
+    declined rather than approximated.
+    """
+    dev = torch.device("cuda:0")
+    torch.manual_seed(0)
+    with juice.set_block_size(2):
+        a = inputs(0, num_node_blocks = 1, dist = dists.SoftEvidenceCategorical(num_cats = 4))
+        b = inputs(1, num_node_blocks = 1, dist = dists.SoftEvidenceCategorical(num_cats = 8))
+        root = summate(multiply(a, b), num_node_blocks = 1, block_size = 1)
+    root.init_parameters(perturbation = 2.0)
+    pc = juice.compile(root, verbose = False).to(dev)
+
+    mixed = [l for l in pc.input_layer_group
+             if len({n.dist.num_cats for n in l.nodes}) > 1]
+    if not mixed:
+        pytest.skip("this build does not put mixed num_cats in one layer")
+
+    x = torch.randint(0, 4, [4, pc.num_vars], device = dev)
+    evi = torch.log_softmax(torch.randn(4, pc.num_vars, 8, device = dev), dim = -1)
+    lp, idx = evi.topk(4, dim = -1)
+    kw = dict(categorical_evidence_logp = lp.contiguous(), soft_evidence_cat_ids = idx.contiguous())
+
+    plain = pc(x, **kw).clone()
+    with juice.fast_inference():
+        pc(x, **kw)
+        assert all(l._fast_inference_params is None for l in mixed), \
+            "a mixed-num_cats layer built a table it cannot address correctly"
+        assert torch.equal(plain, pc(x, **kw))
+

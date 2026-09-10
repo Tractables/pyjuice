@@ -1587,6 +1587,16 @@ class SoftEvidenceCategorical(Distribution):
         """
         params = layer.params
         num_cats = self.num_cats
+
+        # EVERY node in the layer must use this `num_cats`. `get_signature` does not include it, so a
+        # layer happily holds `SoftEvidenceCategorical(4)` and `SoftEvidenceCategorical(8)` together --
+        # and then a table built from one of them is the wrong shape for the other's rows, which reads
+        # past the end of the table rather than failing. The ordinary path handles that layout, so the
+        # only correct thing here is to decline and let it run.
+        for ns in getattr(layer, "nodes", ()):
+            if getattr(ns.dist, "num_cats", num_cats) != num_cats:
+                return None
+
         if params.numel() % num_cats != 0:
             return None
         num_rows = params.numel() // num_cats
