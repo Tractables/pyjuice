@@ -142,7 +142,12 @@ def build_fused_plan(pc, plan):
     fp = FusedPlan()
     fp.num_levels = L
     fp.num_sum_edges, fp.num_prod_edges, fp.max_nblocks, fp.max_rows = E_S, E_P, NB, R
-    fp.sum_nids, fp.sum_cids, fp.sum_pids = z(L, NB), z(L, NB, E_S), z(L, NB, E_S)
+    # `sum_cids` is filled with -1, NOT 0. The kernel admits a candidate on `ch_id >= 0`, so a padded
+    # slot left at 0 would be taken for element 0 and contribute real weight to the draw. This bites
+    # wherever a level has fewer edges than the widest one, or the width was rounded up above -- both
+    # invisible on a circuit whose levels are uniform, which is exactly what this was developed on.
+    fp.sum_nids, fp.sum_pids = z(L, NB), z(L, NB, E_S)
+    fp.sum_cids = z(L, NB, E_S, fill = -1)
     fp.sum_rows = z(L, R, fill = -1)
     fp.sum_nblocks, fp.sum_bsize = z(L), z(L)
     fp.num_rows = z(L)
