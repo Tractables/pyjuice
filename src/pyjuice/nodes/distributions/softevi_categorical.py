@@ -105,6 +105,46 @@ def _sorted_soft_evidence(layer, kwargs):
     return out
 
 
+def _row_index(layer, num_cats):
+    """
+    `s_pids` expressed as emission-ROW indices, for addressing the transposed table.
+
+    Depends only on the compiled layout, which never changes, so unlike the transposed table itself
+    this is cached for the layer's lifetime rather than for the `fast_inference` scope.
+    """
+    idx = getattr(layer, "_softevi_row_index", None)
+    if idx is None:
+        idx = layer._softevi_row_index = (layer.s_pids // num_cats).contiguous()
+    return idx
+
+
+def _fw_transposed_args(layer, target_kwargs, num_cats):
+    """
+    Point the forward at the transposed emission table when `pyjuice.fast_inference` built one.
+
+    Only for the top-k path: it is the `cat_ids` gather that suffers, because there the innermost
+    tile axis is the NODE axis and two consecutive nodes are `num_cats` floats apart. The dense
+    branch streams whole rows and is a different regime, so it keeps the ordinary layout.
+
+    Returns whether the transposed path was taken; the caller re-tiles if so, because the tile that
+    is right for a scattered gather is not the one that is right for a coalesced one.
+    """
+    table = getattr(layer, "_fast_inference_params", None)
+    if table is None or not target_kwargs["has_ext_ids"]:
+        # Unused under `TRANSPOSED = 0`, but Triton still needs real pointers for the arguments.
+        target_kwargs["params_t_ptr"] = layer.params
+        target_kwargs["row_idx_ptr"] = layer.s_pids
+        target_kwargs["num_rows"] = 1
+        target_kwargs["TRANSPOSED"] = 0
+        return False
+
+    target_kwargs["params_t_ptr"] = table
+    target_kwargs["row_idx_ptr"] = _row_index(layer, num_cats)
+    target_kwargs["num_rows"] = layer.params.numel() // num_cats
+    target_kwargs["TRANSPOSED"] = 1
+    return True
+
+
 def _fw_cuda_applicable(layer, kwargs):
     """Whether to take a CUDA forward at all.
 
@@ -479,6 +519,16 @@ def _prep_args_apply_fw_kernel(layer, kwargs):
         BLOCK_SIZE_N = max(min(n_block_size, 2048 // TILE_SIZE_K, 2048 // BLOCK_SIZE_B), 1)
 
     use_tensor_core = (TILE_SIZE_K >= 16) and (BLOCK_SIZE_B >= 16) and (BLOCK_SIZE_N >= 16) and not target_kwargs["has_ext_ids"]
+
+    if _fw_transposed_args(layer, target_kwargs, num_cats = layer.dist.num_cats):
+        # RE-TILE. The node axis is innermost, so under the ordinary layout consecutive nodes are
+        # `num_cats` floats apart, and the tile shape then barely matters -- MEASURED flat across all
+        # 16 shapes tried, because every useful float costs its own 32-byte sector regardless.
+        # Transposed they are adjacent, and the shape matters a great deal: the same loop went
+        # 1.77 ms at BLOCK_SIZE_N = 256 (what the scattered layout wants) to 0.14 ms at 32 -- 19.8x
+        # over the ordinary path, against the 1.68x the untuned tile gives. Shipping the transpose
+        # without re-tiling would capture under a tenth of it.
+        BLOCK_SIZE_N = min(n_block_size, 32)
 
     layer_num_nodes = layer._output_ind_range[1] - layer._output_ind_range[0]
     grid = (triton.cdiv(batch_size, BLOCK_SIZE_B), triton.cdiv(layer_num_nodes, BLOCK_SIZE_N))
@@ -1580,7 +1630,8 @@ class SoftEvidenceCategorical(Distribution):
     def fw_kernel(params_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, metadata_ptr, s_mids_ptr, nids_ptr, fw_local_ids_ptr, layer_num_nodes,
                   batch_size, num_vars_per_node: tl.constexpr, nv_block_size: tl.constexpr, node_offset, partial_eval: tl.constexpr,
                   TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, BLOCK_SIZE_B: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, use_tensor_core: tl.constexpr,
-                  categorical_evidence_logp_ptr, soft_evidence_cat_ids_ptr, var_idmapping_ptr, num_cats: tl.constexpr, ext_num_vars: tl.constexpr, has_ext_ids: tl.constexpr):
+                  categorical_evidence_logp_ptr, soft_evidence_cat_ids_ptr, var_idmapping_ptr, num_cats: tl.constexpr, ext_num_vars: tl.constexpr, has_ext_ids: tl.constexpr,
+                  params_t_ptr, row_idx_ptr, num_rows, TRANSPOSED: tl.constexpr):
 
         pid_b = tl.program_id(axis = 0)
         pid_n = tl.program_id(axis = 1)
@@ -1602,6 +1653,10 @@ class SoftEvidenceCategorical(Distribution):
 
         # Get start parameter indices
         s_pids = tl.load(s_pids_ptr + offsets_n, mask = mask_n, other = 0) # [BLOCK_SIZE_N]
+
+        # Same nodes, addressed as emission ROWS -- what the transposed table is indexed by.
+        if TRANSPOSED:
+            rows = tl.load(row_idx_ptr + offsets_n, mask = mask_n, other = 0) # [BLOCK_SIZE_N]
 
         # Ptrs pointing to external parameters
         expars_ptr = categorical_evidence_logp_ptr + \
@@ -1633,7 +1688,12 @@ class SoftEvidenceCategorical(Distribution):
                 #        axis innermost) measured FASTER here -- the forward only gathers, it does not
                 #        also scatter, and the logsumexp then reduces over the innermost axis. Flipping
                 #        this to [B, N, K] cost 43% on the sorted-candidate forward (3.3 -> 4.7 ms).
-                in_catpars_ptr = inpars_ptr[None,None,:] + catids[:,:,None] # [BLOCK_SIZE_B, TILE_SIZE_K, BLOCK_SIZE_N]
+                if TRANSPOSED:
+                    # Candidate-major table: consecutive nodes are ADJACENT rather than `num_cats`
+                    # floats apart, so this tile is contiguous instead of one sector per element.
+                    in_catpars_ptr = params_t_ptr + catids[:,:,None] * num_rows + rows[None,None,:]
+                else:
+                    in_catpars_ptr = inpars_ptr[None,None,:] + catids[:,:,None] # [BLOCK_SIZE_B, TILE_SIZE_K, BLOCK_SIZE_N]
                 inpars = tl.load(in_catpars_ptr, mask = (mask_b[:,None,None] & mask_c[None,:,None] & mask_n[None,None,:]), other = 0.0) # [BLOCK_SIZE_B, TILE_SIZE_K, BLOCK_SIZE_N]
 
                 # Load the external parameters
@@ -1739,7 +1799,8 @@ class SoftEvidenceCategorical(Distribution):
                                batch_size, num_vars_per_node: tl.constexpr, nv_block_size: tl.constexpr, node_offset, partial_eval: tl.constexpr,
                                TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, BLOCK_SIZE_B: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, use_tensor_core: tl.constexpr,
                                categorical_evidence_logp_ptr, soft_evidence_cat_ids_ptr, soft_evidence_value_mask_ptr, var_idmapping_ptr,
-                               num_cats: tl.constexpr, ext_num_vars: tl.constexpr, has_ext_ids: tl.constexpr):
+                               num_cats: tl.constexpr, ext_num_vars: tl.constexpr, has_ext_ids: tl.constexpr,
+                               params_t_ptr, row_idx_ptr, num_rows, TRANSPOSED: tl.constexpr):
         """Forward pass with a per-variable value mask (used for generation/conditional queries).
 
         A mirror of `fw_kernel` -- everything up to and including `logZ`, `log_in_p` and `log_ex_p` is
@@ -1773,6 +1834,10 @@ class SoftEvidenceCategorical(Distribution):
 
         # Get start parameter indices
         s_pids = tl.load(s_pids_ptr + offsets_n, mask = mask_n, other = 0) # [BLOCK_SIZE_N]
+
+        # Same nodes, addressed as emission ROWS -- what the transposed table is indexed by.
+        if TRANSPOSED:
+            rows = tl.load(row_idx_ptr + offsets_n, mask = mask_n, other = 0) # [BLOCK_SIZE_N]
 
         # Ptrs pointing to external parameters
         expars_ptr = categorical_evidence_logp_ptr + \
@@ -1820,7 +1885,11 @@ class SoftEvidenceCategorical(Distribution):
                     #        axis innermost) measured FASTER here -- the forward only gathers, it does not
                     #        also scatter, and the logsumexp then reduces over the innermost axis. Flipping
                     #        this to [B, N, K] cost 43% on the sorted-candidate forward (3.3 -> 4.7 ms).
-                    in_catpars_ptr = inpars_ptr[None,None,:] + catids[:,:,None] # [BLOCK_SIZE_B, TILE_SIZE_K, BLOCK_SIZE_N]
+                    if TRANSPOSED:
+                        # See the note in `fw_kernel`: candidate-major makes this tile contiguous.
+                        in_catpars_ptr = params_t_ptr + catids[:,:,None] * num_rows + rows[None,None,:]
+                    else:
+                        in_catpars_ptr = inpars_ptr[None,None,:] + catids[:,:,None] # [BLOCK_SIZE_B, TILE_SIZE_K, BLOCK_SIZE_N]
                     inpars = tl.load(in_catpars_ptr, mask = (mask_b[:,None,None] & mask_c[None,:,None] & mask_n[None,None,:]), other = 0.0) # [BLOCK_SIZE_B, TILE_SIZE_K, BLOCK_SIZE_N]
 
                     # Load the external parameters
