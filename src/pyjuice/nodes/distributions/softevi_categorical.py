@@ -1469,9 +1469,19 @@ class SoftEvidenceCategorical(Distribution):
         super(SoftEvidenceCategorical, self).__init__()
 
         self.num_cats = num_cats
-        # Not part of `get_metadata`, so it is not persisted: it is a performance knob, and a circuit
-        # loaded from a checkpoint should pick up the current default rather than one frozen at save
-        # time. See `preprocess_fw_kwargs`.
+        # ON BY DEFAULT (1.67x on the CoDD decode forward, ~1.2x on training at K>=256). A
+        # differential audit against the pre-sort baseline confirmed the sort is ALGEBRAICALLY exact
+        # whenever the candidate ids in a row are UNIQUE -- this argument's documented precondition,
+        # which `torch.topk` satisfies. It is not bit-identical at scale: permuting the candidate axis
+        # permutes the log-sum-exp accumulation order, worth ~1e-5 on the input layer and up to 6.1e-5
+        # on the root LL at K = 1024 (small circuits do come out bit-identical, so do not calibrate
+        # this on a toy).
+        # With a DUPLICATED id the sorted and unsorted answers differ (measured 2.44 nats), because
+        # the kernels' slot search sums over matches; neither answer is right, the duplicate has
+        # already destroyed the information. That path is now at least memory-safe and deterministic
+        # -- see the clamp on `match_ids` in `fw_kernel` -- where before it read out of bounds.
+        # See `preprocess_fw_kwargs` and `sort_soft_evidence_candidates`.
+        # Not part of `get_metadata`, so it is not persisted.
         self.sort_soft_evidence = sort_soft_evidence
 
         self.post_fw_fns = [
@@ -2921,8 +2931,12 @@ class SoftEvidenceCategorical(Distribution):
         return True
 
     def _get_constructor(self):
-        return SoftEvidenceCategorical, {"num_cats": self.num_cats, "_dual_flow_backward": self._dual_flow_backward,
-                                         "sort_soft_evidence": self.sort_soft_evidence}
+        return SoftEvidenceCategorical, {"num_cats": self.num_cats, "_dual_flow_backward": self._dual_flow_backward}
 
     def __reduce__(self):
-        return (self.__class__, (self.num_cats, self._dual_flow_backward, self.sort_soft_evidence))
+        # DELIBERATELY 2 ARGS. Adding `sort_soft_evidence` here made every .jpc written by this tree
+        # unloadable by any older pyjuice (`TypeError: __init__() takes from 2 to 3 positional
+        # arguments but 4 were given`) -- including a checkpoint merely round-tripped through it --
+        # and froze the knob into the file, contradicting the comment on `__init__`. A performance
+        # flag does not belong in the serialised form.
+        return (self.__class__, (self.num_cats, self._dual_flow_backward))
