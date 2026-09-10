@@ -131,7 +131,23 @@ def _bs_triton_fw_kernel(node_mars, element_mars, mparams, ext, gate, log_z,
         rescale = tl.where(nmn == -float("inf"), 0.0, tl.exp(mn - nmn))
         vexp = tl.where(nmn[None,:] == -float("inf"), 0.0, tl.exp(v - nmn[None,:]))
         if TL_DOT == 1:
-            ln = ln * rescale[None,:] + tl.dot(epars, vexp)
+            # `input_precision = "ieee"` -- do not drop it. Triton defaults an fp32 `tl.dot` to TF32,
+            # whose 10-bit mantissa costs ~1e-4 relative here; `d LL / d log phi` is a cancelling
+            # difference of two near-equal terms, so that lands as ~5e-4 in the gradient. The rival
+            # CUDA fork (`blockscale_smallbatch_forward.cu`) accumulates in scalar fp32 and reaches
+            # ~1e-6, and the launcher picks between the two BY MEASUREMENT -- so under TF32 the same
+            # program returned gradients 500x apart depending on which kernel was faster that run.
+            #
+            # It is FREE: measured over 34 shapes, including the compute-dominated end (block 1024,
+            # 8 node blocks, batch 8192 = 550 GMAC, 40 ms) where it is 0.99x. This contraction lives
+            # inside a log-sum-exp loop with rescaling, masks and exps, so it is never tensor-core-
+            # rate bound and TF32 buys it nothing. Set HERE and not via `TRITON_F32_DEFAULT=ieee`,
+            # which is process-wide and would also hit the 12 sum-layer dots -- ~40% on a fwd+bwd.
+            #
+            # Do NOT make this a runtime `tl.constexpr` switch: tried, and the extra constexpr
+            # perturbs codegen enough to change which fork the autotuner picks. Same suite, same
+            # load: HEAD/TF32 4 failures, constexpr switch 21, this 1.
+            ln = ln * rescale[None,:] + tl.dot(epars, vexp, input_precision = "ieee")
         else:
             ln = ln * rescale[None,:] + tl.sum(epars[:,:,None] * vexp[None,:,:], axis = 1)
         mn = nmn
@@ -142,7 +158,7 @@ def _bs_triton_fw_kernel(node_mars, element_mars, mparams, ext, gate, log_z,
         rescale_z = tl.where(nmz == -float("inf"), 0.0, tl.exp(mz - nmz))
         zexp = tl.where(nmz[None,:] == -float("inf"), 0.0, tl.exp(lphi - nmz[None,:]))
         if TL_DOT == 1:
-            lz = lz * rescale_z[None,:] + tl.dot(epars, zexp)
+            lz = lz * rescale_z[None,:] + tl.dot(epars, zexp, input_precision = "ieee")
         else:
             lz = lz * rescale_z[None,:] + tl.sum(epars[:,:,None] * zexp[None,:,:], axis = 1)
         mz = nmz
