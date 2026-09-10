@@ -112,9 +112,15 @@ def _row_index(layer, num_cats):
     Depends only on the compiled layout, which never changes, so unlike the transposed table itself
     this is cached for the layer's lifetime rather than for the `fast_inference` scope.
     """
-    idx = getattr(layer, "_softevi_row_index", None)
-    if idx is None:
-        idx = layer._softevi_row_index = (layer.s_pids // num_cats).contiguous()
+    # Keyed by DEVICE, not merely cached. It is derived from `s_pids`, which `InputLayer.to()` moves;
+    # `to()` drops the transposed table but has no reason to know about this one, so a bare cache
+    # would hand a Triton launch a tensor still sitting on the old device.
+    cached = getattr(layer, "_softevi_row_index", None)
+    if cached is not None and cached[0] == layer.s_pids.device:
+        return cached[1]
+
+    idx = (layer.s_pids // num_cats).contiguous()
+    layer._softevi_row_index = (idx.device, idx)
     return idx
 
 
