@@ -235,7 +235,8 @@ def test_a_frontier_draw_does_not_disturb_a_backward():
 
     That holds however the draw treats `pc.node_flows` -- because the backward recomputes them rather
     than trusting what is there -- which is why this test kept passing unchanged when frontier mode
-    stopped writing the flows at all (they only ever fed the emission step it skips).
+    briefly stopped writing the flows at all. It is therefore NOT evidence that skipping the write is
+    safe; `test_a_frontier_draw_overwrites_node_flows` below is what covers that.
     """
     torch.manual_seed(0)
     data = torch.randint(0, NUM_CATS, [512, _hmm().num_vars], device = torch.device("cuda:0"))
@@ -275,3 +276,38 @@ def test_repeated_frontier_draws_do_not_accumulate_state():
     last = seeded_draw()
 
     assert torch.equal(first, last), "the 1st and 51st draw at one seed differ -- state accumulated"
+
+
+@cuda_only
+def test_a_frontier_draw_overwrites_node_flows():
+    """
+    `pc.node_flows` must describe THIS draw's frontier once the draw returns.
+
+    It is a public attribute that outlives the call, so the failure mode when a draw skips the write
+    is not an empty tensor -- it is the LAST BACKWARD's flows left in place, which is a plausible
+    tensor of an entirely different quantity. Populate them for real first: reading `node_flows` on a
+    circuit that has never run a backward yields `None` either way, which is what made an earlier
+    version of this check vacuous.
+    """
+    torch.manual_seed(0)
+    pc = _hmm()
+    data = torch.randint(0, NUM_CATS, [128, pc.num_vars], device = torch.device("cuda:0"))
+
+    pc(data)
+    pc.backward(data)
+    after_backward = pc.node_flows.clone()
+
+    pc(data)
+    frontier = juice.queries.sample(pc, num_samples = 128, _sample_input_ns = False)
+
+    assert pc.node_flows is not None, "the draw left `node_flows` unset"
+    assert not torch.equal(pc.node_flows, after_backward), \
+        "`node_flows` still holds the previous backward's values -- the draw did not write them"
+
+    # and what it wrote is exactly the frontier: 1.0 at every live id, 0.0 everywhere else
+    expected = torch.zeros_like(pc.node_flows)
+    live = frontier >= 0
+    rows, cols = torch.where(live)
+    expected[frontier[rows, cols], cols] = 1.0
+    assert torch.equal(pc.node_flows, expected), \
+        "`node_flows` does not match the frontier the draw returned"
