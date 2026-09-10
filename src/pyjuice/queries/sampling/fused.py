@@ -109,6 +109,17 @@ def fusion_applicability(pc, plan):
     if work > _MAX_LEVEL_WORK:
         return False, (f"{work} elements per level per sample exceeds {_MAX_LEVEL_WORK}; this "
                        f"circuit is too wide for a single program to serialise")
+
+    # The kernel's PEAK tile is not that product. Locating each candidate in the product layer below
+    # materialises `[BLOCK_B, E_S, NB]`, and `NB` appears nowhere in `work` -- so a circuit with few
+    # frontier rows and many node blocks sails through the test above and then fails to COMPILE.
+    # MEASURED: 64 node blocks at block_size 4 gives work = 256 (trivially under the limit) and a
+    # 16384-element tile, which Triton rejects; 8192 is the largest that builds.
+    tile = triton.next_power_of_2(max_se) * triton.next_power_of_2(max_nb)
+    if tile > _MAX_LEVEL_WORK:
+        return False, (f"the candidate-location tile is {tile} elements "
+                       f"({max_se} edges x {max_nb} node blocks, each rounded up to a power of two), "
+                       f"over the {_MAX_LEVEL_WORK} one program can hold")
     return True, None
 
 

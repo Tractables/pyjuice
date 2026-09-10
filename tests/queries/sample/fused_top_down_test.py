@@ -172,3 +172,35 @@ def test_a_non_power_of_two_node_block_count_still_works(num_node_blocks):
         b = _draw(pc, data, True, seed)
         assert torch.equal(a, b), \
             f"{num_node_blocks} node blocks: {int((a != b).sum())} of {a.numel()} entries differ"
+
+
+@cuda_only
+@pytest.mark.parametrize("block_size,num_node_blocks", [(8, 32), (8, 64), (4, 64)])
+def test_the_gate_bounds_the_tile_the_kernel_actually_builds(block_size, num_node_blocks):
+    """
+    The work gate bounds `rows * sum_edges`, but locating each candidate in the product layer below
+    materialises `[BLOCK_B, E_S, NB]` -- and NB is not in that product. A circuit with one frontier
+    row and many node blocks therefore passed the gate and then failed to COMPILE (measured: 64 node
+    blocks at block_size 4 => work 256, tile 16384, `PassManager::run failed`).
+
+    Whichever side of the limit a shape falls, the outcome has to be a decision and not a crash: run
+    it, or decline it with a reason.
+    """
+    with juice.set_block_size(block_size):
+        ni = [inputs(v, num_node_blocks = num_node_blocks,
+                     dist = dists.Categorical(num_cats = NUM_CATS)) for v in range(2)]
+        ns = summate(multiply(*ni), num_node_blocks = num_node_blocks)
+        root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
+    root.init_parameters(perturbation = 2.0)
+    pc = juice.compile(root, verbose = False).to(torch.device("cuda:0"))
+
+    ok, why = fusion_applicability(pc, _scope_plan(pc))
+    data = torch.randint(0, NUM_CATS, [2, pc.num_vars], device = torch.device("cuda:0"))
+    for fuse in (False, True):
+        _draw(pc, data, fuse, 0)          # warm both: a cold first draw does not reproduce
+    if not ok:
+        assert isinstance(why, str) and why
+        # declining must be a no-op, not a refusal to draw
+        assert torch.equal(_draw(pc, data, True, 1), _draw(pc, data, False, 1))
+        return
+    assert torch.equal(_draw(pc, data, False, 1), _draw(pc, data, True, 1))
