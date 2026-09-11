@@ -571,7 +571,15 @@ def _prep_args_apply_fw_w_value_mask_kernel(layer, kwargs):
 
 
 def _condition_apply_bk_params_kernel(layer, kwargs):
-    return "categorical_evidence_logp" in kwargs and not kwargs["dual_flow_backward"]
+    # `layer.param_flows is not None` -- this kernel exists ONLY to accumulate param flows, so with no
+    # buffer to accumulate into there is nothing for it to do. Declining here rather than guarding
+    # inside the kernel, because unlike `bk_softevi_kernel` it has no other work to contribute.
+    # A caller that asks for `backward(compute_param_flows = False)` -- which is what
+    # `pyjuice.queries.base.query` does, hence every `marginal`/`conditional` query -- otherwise
+    # reaches `tl.atomic_add(param_flows_ptr + ...)` with a null pointer and dies at Triton COMPILE
+    # time with a bare `AttributeError("'NoneType' object has no attribute 'type'")`.
+    return ("categorical_evidence_logp" in kwargs and not kwargs["dual_flow_backward"]
+            and layer.param_flows is not None)
 
 
 def _prep_args_apply_bk_params_kernel(layer, kwargs):
@@ -1404,8 +1412,17 @@ def _prep_args_apply_bk_softevi_kernel(layer, kwargs):
     target_kwargs["BLOCK_SIZE_N"] = BLOCK_SIZE_N
     target_kwargs["use_tensor_core"] = use_tensor_core
 
-    # Whether to update `pflow` and `extflow`
-    target_kwargs["update_pflows"] = kwargs["dual_flow_backward"]
+    # Whether to update `pflow` and `extflow`.
+    #
+    # `layer.param_flows is not None` is NOT redundant with `dual_flow_backward`. A caller that asks
+    # for `backward(compute_param_flows = False)` -- which is exactly what `pyjuice.queries.base.query`
+    # does, and therefore every `marginal`/`conditional` query -- gets no param-flow buffer, but
+    # `dual_flow_backward` is the DISTRIBUTION's own flag and knows nothing about that. Without this
+    # guard the kernel still takes its `if update_pflows` branch and dereferences a null
+    # `param_flows_ptr`, which fails at Triton COMPILE time with a bare
+    # `AttributeError("'NoneType' object has no attribute 'type'")` -- no mention of param flows, and
+    # nothing to connect it to the flag the caller actually passed.
+    target_kwargs["update_pflows"] = kwargs["dual_flow_backward"] and (layer.param_flows is not None)
     target_kwargs["update_extflows"] = ("categorical_evidence_logp_grad" in kwargs)
 
     target_kwargs.update(_missing_mask_kwargs(kwargs))
