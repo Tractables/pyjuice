@@ -608,8 +608,13 @@ def _fw_gemm_applicable(layer, kwargs):
         return False
     if layer.provided("fw_local_ids"):
         return False                                     # partial evaluation: not this layout
-    if kwargs.get("missing_mask", None) is not None:
-        return False                                     # handled by a separate kernel
+    # NO `missing_mask` CHECK HERE, deliberately. An earlier version had one and it was DEAD:
+    # `missing_mask` is a named parameter of `InputLayer.forward`, not part of `**kwargs`, so
+    # `kwargs.get("missing_mask")` is always None and the guard never fired. It is also unnecessary --
+    # `_fw_missing_mask_kernel` runs AFTER the `post_fw_fns` loop and overwrites `node_mars` at
+    # marginalised positions whatever wrote them first. VERIFIED: a forward with a 1-D or 2-D
+    # `missing_mask` matches the Triton path to 1.5e-07 relative. Do not re-add the guard believing it
+    # protects something; if a real one is ever needed it has to read the named argument.
     num_cats = getattr(layer.dist, "num_cats", None)
     if num_cats is None or num_cats < _GEMM_MIN_CATS:
         return False
