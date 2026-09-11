@@ -321,3 +321,127 @@ def test_a_layer_mixing_num_cats_declines_the_copy():
         assert all(l._fast_inference_params is None for l in mixed), \
             "a mixed-num_cats layer built a table it cannot address correctly"
         assert torch.equal(plain, pc(x, **kw))
+
+
+# ------------------------------------------------------------------------------------------------
+#  `allow_bf16_params`: the OTHER derived copy, and how it composes with `allow_param_copy`
+# ------------------------------------------------------------------------------------------------
+#
+# These two flags are deliberately not the same kind of thing -- `allow_param_copy` spends MEMORY,
+# `allow_bf16_params` spends ACCURACY -- so what matters is that they compose without surprises.
+# Three rules, and each is a separate way to be silently wrong:
+#   * bf16 is a derived copy, so it must obey `allow_param_copy` too;
+#   * neither flag may be WIDENED by a nested scope (that would spend something the outer caller
+#     deliberately kept);
+#   * a nested scope that says nothing must CHANGE nothing -- which is why `allow_bf16_params`
+#     defaults to `None`/inherit rather than `False`. With a `False` default a plain nested
+#     `fast_inference()` would switch bf16 off for its duration without ever being asked to, while
+#     `allow_param_copy`'s `True` default leaves the enclosing choice alone. Same word, opposite
+#     behaviour, and only for want of a sentinel.
+
+
+def _bf16_circuit(dev, num_cats = 4096):
+    torch.manual_seed(0)
+    with juice.set_block_size(2):
+        ns = [inputs(v, num_node_blocks = 2, dist = dists.SoftEvidenceCategorical(num_cats = num_cats))
+              for v in range(2)]
+        root = summate(multiply(*ns), num_node_blocks = 1, block_size = 1)
+    root.init_parameters(perturbation = 2.0)
+    return juice.compile(root, verbose = False).to(dev)
+
+
+@cuda_only
+def test_bf16_params_is_off_unless_asked_for():
+    from pyjuice.utils.fast_inference import bf16_params_allowed
+
+    assert not bf16_params_allowed(), "bf16 must be off outside any scope"
+    with juice.fast_inference():
+        assert not bf16_params_allowed(), \
+            "`fast_inference()` must NOT enable bf16 -- it trades accuracy, so it is opt-in"
+    with juice.fast_inference(allow_bf16_params = True):
+        assert bf16_params_allowed()
+    assert not bf16_params_allowed(), "bf16 leaked past the scope"
+
+
+@cuda_only
+def test_bf16_params_obeys_allow_param_copy():
+    """The bf16 table IS a derived copy, so a caller who forbade copies must not get one."""
+    from pyjuice.utils.fast_inference import bf16_params_allowed
+
+    with juice.fast_inference(allow_param_copy = False, allow_bf16_params = True):
+        assert not bf16_params_allowed(), \
+            "`allow_param_copy = False` must still forbid the bf16 copy"
+
+
+@cuda_only
+def test_nested_scopes_may_narrow_bf16_but_never_widen_it():
+    from pyjuice.utils.fast_inference import bf16_params_allowed
+
+    with juice.fast_inference(allow_bf16_params = True):
+        with juice.fast_inference():
+            assert bf16_params_allowed(), \
+                "a nested scope that said nothing about bf16 must INHERIT, not silently disable it"
+        with juice.fast_inference(allow_bf16_params = False):
+            assert not bf16_params_allowed(), "a nested scope must be able to narrow to fp32"
+        assert bf16_params_allowed(), "the outer scope's choice must come back"
+
+    with juice.fast_inference():
+        with juice.fast_inference(allow_bf16_params = True):
+            assert not bf16_params_allowed(), \
+                "a nested scope must NOT be able to turn bf16 on when the outer scope is fp32"
+
+
+@cuda_only
+def test_bf16_table_is_built_only_for_the_dense_forward_and_freed_on_exit():
+    """Each forward builds only the copy IT reads: dense -> bf16 table, top-k -> transposed table."""
+    dev = torch.device("cuda:0")
+    pc = _bf16_circuit(dev)
+    layer = pc.input_layer_group[0]
+    num_cats = layer.dist.num_cats
+    x = torch.randint(0, num_cats, [2, pc.num_vars], device = dev)
+    vm = torch.ones(2, pc.num_vars, dtype = torch.bool, device = dev)
+    vm[0, 0] = False                                     # something must be marginalised
+    evi = torch.log_softmax(torch.randn(2, pc.num_vars, num_cats, device = dev), dim = -1)
+
+    def held():
+        return (getattr(layer, "_fast_inference_params", None) is not None,
+                getattr(layer, "_gemm_bf16_params", None) is not None)
+
+    with juice.fast_inference(allow_bf16_params = True):
+        pc(x, soft_evidence_value_mask = vm, categorical_evidence_logp = evi)
+        assert held() == (False, True), f"dense forward should hold the bf16 table only, got {held()}"
+        assert layer._gemm_bf16_params.dtype is torch.bfloat16
+    assert held() == (False, False), "the bf16 table outlived its scope"
+
+    lp, idx = evi.topk(16, dim = -1)
+    with juice.fast_inference(allow_bf16_params = True):
+        pc(x, soft_evidence_value_mask = vm, categorical_evidence_logp = lp,
+           soft_evidence_cat_ids = idx)
+        assert held() == (True, False), \
+            f"top-k forward should hold the transposed table only, got {held()}"
+    assert held() == (False, False), "the transposed table outlived its scope"
+
+
+@cuda_only
+def test_bf16_params_changes_the_answer_only_slightly():
+    """It is an accuracy trade, so pin that it IS a trade and that the size of it stays sane."""
+    dev = torch.device("cuda:0")
+    pc = _bf16_circuit(dev)
+    layer = pc.input_layer_group[0]
+    num_cats = layer.dist.num_cats
+    sid, eid = layer._output_ind_range
+    x = torch.randint(0, num_cats, [2, pc.num_vars], device = dev)
+    vm = torch.ones(2, pc.num_vars, dtype = torch.bool, device = dev)
+    vm[:, 0] = False
+    evi = torch.log_softmax(torch.randn(2, pc.num_vars, num_cats, device = dev), dim = -1)
+
+    pc(x, soft_evidence_value_mask = vm, categorical_evidence_logp = evi)
+    ref = pc.node_mars[sid:eid].clone()
+    with juice.fast_inference(allow_bf16_params = True):
+        pc(x, soft_evidence_value_mask = vm, categorical_evidence_logp = evi)
+        got = pc.node_mars[sid:eid].clone()
+
+    fin = torch.isfinite(ref) & torch.isfinite(got)
+    assert torch.equal(torch.isfinite(ref), torch.isfinite(got)), "bf16 moved an inf/nan"
+    rel = ((ref[fin] - got[fin]).abs() / (ref[fin].abs() + 1e-9)).max().item()
+    assert rel < 1e-2, f"bf16 error {rel:.2e} is far larger than the ~1e-3 measured; something is wrong"

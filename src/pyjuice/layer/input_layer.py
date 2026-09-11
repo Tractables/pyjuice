@@ -258,6 +258,10 @@ class InputLayer(Layer, nn.Module):
         # A derived rearrangement of `params` held only inside a `pyjuice.fast_inference` scope; see
         # `_ensure_fast_inference_params`. Not a buffer and not saved: it is recomputed per scope.
         self._fast_inference_params = None
+        # Its sibling: the bf16 emission table the dense GEMM forward may hold under
+        # `fast_inference(allow_bf16_params = True)`. Declared here for the same reason -- so the
+        # attribute always exists and the two derived copies are visibly one family.
+        self._gemm_bf16_params = None
 
         # Whether the JIT-built Triton kernels have been constructed yet. Separate from whether they are
         # non-None: a distribution may legitimately have no kernel for a stage, and we must not retry.
@@ -329,6 +333,17 @@ class InputLayer(Layer, nn.Module):
         # pinning device memory. It is a per-step cache; every path that reaches here has invalidated
         # the step it belonged to.
         self._fw_sorted_cache = None
+
+        # The bf16 emission table the dense GEMM forward may hold (see `_gemm_emission_table`). It is
+        # DERIVED FROM `params`, so every path that reaches here -- scope exit, `to`, `mini_batch_em`,
+        # `_init_parameters` -- must drop it or the next forward reads a stale copy of parameters that
+        # have since changed, silently and in reduced precision. Poisoned on the same terms as the
+        # transposed table below: the two are one family and must fail the same way.
+        bf16 = self._gemm_bf16_params
+        self._gemm_bf16_params = None
+        if poison and bf16 is not None:
+            bf16.fill_(float("nan"))
+            self._poisoned_gemm_bf16_params = bf16
 
         derived = self._fast_inference_params
         if derived is None:

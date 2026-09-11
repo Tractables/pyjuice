@@ -35,15 +35,16 @@ from __future__ import annotations
 
 import os
 from contextlib import contextmanager
-from typing import List
+from typing import List, Optional
 
 
 class _FastInferenceState():
-    __slots__ = ("depth", "allow_param_copy", "layers")
+    __slots__ = ("depth", "allow_param_copy", "allow_bf16_params", "layers")
 
     def __init__(self):
         self.depth = 0
         self.allow_param_copy = False
+        self.allow_bf16_params = False
         # The layers that actually built something, so exit frees exactly those. Held by strong
         # reference only for the duration of the block, which is bounded by construction.
         self.layers: List = []
@@ -67,6 +68,15 @@ def param_copies_allowed() -> bool:
     return _STATE.depth > 0 and _STATE.allow_param_copy
 
 
+def bf16_params_allowed() -> bool:
+    """Whether layers inside the current scope may hold a bf16 copy of their parameters.
+
+    Separate from :func:`param_copies_allowed` because it is a different KIND of trade: that one
+    spends memory, this one spends ACCURACY. Off unless asked for.
+    """
+    return _STATE.depth > 0 and _STATE.allow_param_copy and _STATE.allow_bf16_params
+
+
 def register_layer(layer) -> None:
     """Record that `layer` built a derived copy, so the scope's exit can free it."""
     if _STATE.depth > 0:
@@ -82,20 +92,43 @@ def _release_all() -> None:
 
 
 @contextmanager
-def fast_inference(allow_param_copy: bool = True):
+def fast_inference(allow_param_copy: bool = True, allow_bf16_params: Optional[bool] = None):
     """
     Open a scope in which the circuit's parameters will not change.
 
     Inside it, layers may trade memory for speed by holding derived copies of their parameters --
-    today, a transposed emission table for the soft-evidence forward. Copies are built LAZILY, on the
-    first forward inside the scope that would use one, so a circuit that is never run never pays; and
-    they are freed on exit.
+    today a transposed emission table for the top-k soft-evidence forward, and optionally a bfloat16
+    emission table for the dense one. Copies are built LAZILY, on the first forward inside the scope
+    that would use one, so a circuit that is never run never pays; and they are freed on exit.
 
     :param allow_param_copy: permit copies that cost extra device memory. The transposed emission
                              table is the size of the emission table itself (494 MB on the CoDD
                              circuit). Set `False` to enter the scope without paying that, which
                              leaves the ordinary kernels in place.
     :type allow_param_copy: bool
+
+    :param allow_bf16_params: permit a bfloat16 copy of the emission table for the dense soft-evidence
+                              forward. **OFF BY DEFAULT, and unlike `allow_param_copy` this one costs
+                              ACCURACY, not memory** -- it halves the bytes the forward reads, which
+                              is the only lever left once that forward is at the memory roofline.
+                              MEASURED on the CoDD circuit: the logZ GEMM 0.73 -> 0.30 ms (2.4x, and
+                              below the fp32 streaming floor because it reads half the table), at a
+                              maximum RELATIVE error of 8.9e-03 on logZ. For calibration that is ~100x
+                              looser than the tf32 `tl.dot` path already in the Triton kernels
+                              (8.6e-05). It also SAVES memory rather than costing it -- the bf16 copy
+                              is half the table, against the transposed copy's full size.
+                              Run an eval before turning this on; it changes answers.
+                              `None` (the default) means INHERIT: off at the outermost scope, and
+                              whatever the enclosing scope permitted for a nested one. That is what
+                              makes it behave like `allow_param_copy`, whose `True` default already
+                              leaves an enclosing scope's choice alone -- without the sentinel, a
+                              nested plain `fast_inference()` would silently switch bf16 off for its
+                              duration, having never been asked to.
+                              (float16 was measured and is UNUSABLE here: emission probabilities over
+                              a 126k vocabulary underflow its exponent range and the forward returns
+                              `inf`. bfloat16 keeps fp32's exponent range, which is the whole reason
+                              it works.)
+    :type allow_bf16_params: bool
 
     :note: THE CONTRACT: parameters must not change inside the block. Nothing can enforce this --
            an EM step writes through a raw pointer that PyTorch's version counter never sees -- so a
@@ -109,10 +142,19 @@ def fast_inference(allow_param_copy: bool = True):
     # with `allow_param_copy = False` did so to bound memory, and a nested call should not overrule
     # that. It can, however, narrow it.
     _STATE.allow_param_copy = (allow_param_copy and outer_allow) if _STATE.depth > 1 else allow_param_copy
+    outer_bf16 = _STATE.allow_bf16_params
+    # Same narrowing rule as above: an inner scope may turn bf16 OFF but never on. A caller that
+    # opened the outer scope in fp32 did so for accuracy, and a nested call must not quietly spend it.
+    if allow_bf16_params is None:
+        _STATE.allow_bf16_params = outer_bf16 if _STATE.depth > 1 else False
+    else:
+        _STATE.allow_bf16_params = (allow_bf16_params and outer_bf16) if _STATE.depth > 1 \
+            else allow_bf16_params
     try:
         yield
     finally:
         _STATE.depth -= 1
         _STATE.allow_param_copy = outer_allow
+        _STATE.allow_bf16_params = outer_bf16
         if _STATE.depth == 0:
             _release_all()

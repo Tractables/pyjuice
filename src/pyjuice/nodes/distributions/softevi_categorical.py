@@ -629,6 +629,34 @@ def _fw_gemm_applicable(layer, kwargs):
     return cache
 
 
+def _gemm_emission_table(layer, params, n_rows, num_cats):
+    """The emission table as the GEMM's left operand -- in bf16 when the scope asked for it.
+
+    This forward reads the whole table once and is AT the memory roofline in fp32 (0.73 ms against a
+    0.70 ms `params.sum()` on the same tensor). At the roofline the only remaining lever is to read
+    fewer BYTES, which is what bf16 buys: 0.30 ms, i.e. below the fp32 streaming floor, for a maximum
+    relative error of 8.9e-03 on logZ.
+
+    That is an ACCURACY trade, not a memory one, so it is gated on `allow_bf16_params` and is OFF
+    unless a caller explicitly asks. The copy is built lazily, cached on the layer, and freed by
+    exactly the same hooks as the transposed table -- including every in-repo path that writes
+    `params`, since a stale copy would be silently wrong.
+    """
+    from pyjuice.utils.fast_inference import bf16_params_allowed, register_layer
+
+    if not bf16_params_allowed():
+        return params.view(n_rows, num_cats)
+
+    cached = getattr(layer, "_gemm_bf16_params", None)
+    if cached is not None and cached.shape == (n_rows, num_cats):
+        return cached
+
+    cached = params.view(n_rows, num_cats).to(torch.bfloat16)
+    layer._gemm_bf16_params = cached
+    register_layer(layer)          # so scope exit frees it
+    return cached
+
+
 def _fw_dense_gemm(layer, kwargs, kw):
     """Write this layer's `node_mars` from ONE GEMM plus one gather.
 
@@ -656,7 +684,7 @@ def _fw_dense_gemm(layer, kwargs, kw):
     sid, eid = layer._output_ind_range
     params = layer.params
     n_rows = params.numel() // num_cats
-    Pm = params.view(n_rows, num_cats)
+    Pm = _gemm_emission_table(layer, params, n_rows, num_cats)
     n_ext = evi.size(1)
 
     vids = layer.vids[:, 0]                                      # global variable id per node
@@ -679,7 +707,10 @@ def _fw_dense_gemm(layer, kwargs, kw):
     m = e.max(dim = -1, keepdim = True).values
     # `Pm @ ...` and NOT `... @ Pm.t()`: measured 1.4x faster and the orientation that sits on the
     # memory roofline, because it walks `params` in its natural row-major order.
-    logZ = _torch.log(Pm @ _torch.exp(e - m).t()) + m.t()        # [n_rows, n_ext] or [n_rows, B*n_ext]
+    El = _torch.exp(e - m)
+    if Pm.dtype != El.dtype:
+        El = El.to(Pm.dtype)                                     # bf16 table -> bf16 operand
+    logZ = _torch.log((Pm @ El.t()).float()) + m.t()             # accumulate/log in fp32 regardless
 
     bstep = 0 if bcast else n_ext
     bcol = _torch.arange(batch_size, device = evi.device)[None, :] * bstep
