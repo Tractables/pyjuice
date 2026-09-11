@@ -470,7 +470,8 @@ class _FwCudaDispatch:
 def _condition_apply_fw_kernel(layer, kwargs):
     return "categorical_evidence_logp" in kwargs and \
         kwargs.get("soft_evidence_value_mask", None) is None and \
-        not _fw_cuda_applicable(layer, kwargs)
+        not _fw_cuda_applicable(layer, kwargs) and \
+        not _fw_gemm_applicable(layer, kwargs)
 
 
 def _prep_args_apply_fw_kernel(layer, kwargs):
@@ -480,6 +481,16 @@ def _prep_args_apply_fw_kernel(layer, kwargs):
 
     categorical_evidence_logp = kwargs["categorical_evidence_logp"]
     assert categorical_evidence_logp.size(0) == batch_size, "Batch size doesn't match in `categorical_evidence_logp`."
+
+    # SAFETY NET for batch-broadcast evidence. The GEMM path (see `_fw_gemm_applicable`) wants callers
+    # to hand it `evi.expand(B, -1, -1)` UNMATERIALISED, because batch stride 0 is how it detects that
+    # every row shares one evidence tensor. These kernels cannot take that: they address it
+    # `ptr + b * (ext_num_vars * num_cats)`, so on a stride-0 tensor every row past the first reads
+    # beyond the single row that actually exists. Materialise here rather than forbid the caller --
+    # the copy only happens when the fast path declined, which is exactly when it is needed.
+    if batch_size > 1 and categorical_evidence_logp.stride(0) == 0:
+        categorical_evidence_logp = categorical_evidence_logp.contiguous()
+        kwargs["categorical_evidence_logp"] = categorical_evidence_logp
 
     ext_num_vars = categorical_evidence_logp.size(1)
     target_kwargs["ext_num_vars"] = ext_num_vars
@@ -548,9 +559,174 @@ def _prep_args_apply_fw_kernel(layer, kwargs):
     return target_kwargs, grid
 
 
+# ---------------------------------------------------------------------------------------------
+#  Dense (full-vocab) forward as a single GEMM
+# ---------------------------------------------------------------------------------------------
+#
+# For a MARGINALISED variable the forward wants, over every emission row `r`,
+#
+#     logZ[v, r] = logsumexp_c ( log p[r, c] + evi[v, c] )
+#                = log( sum_c p[r, c] * exp(evi[v, c] - m_v) ) + m_v
+#
+# which is a matrix product between the emission table and the evidence of the marginalised
+# variables. The Triton kernel does NOT compute it as one: it contracts over categories with the
+# BATCH on the other axis, so the 494 MiB table is re-read once per marginalised VARIABLE. Measured
+# on the CoDD circuit: `1.01 ms + 0.18 ms * n_masked`, and 0.18 ms is exactly one L2-served pass over
+# the table.
+#
+# Training never noticed, because at batch >= 16 the batch axis supplies that reuse. Decode runs at
+# batch 1 with 16-32 marginalised positions and gets none -- which is why the PC costs ~25-45% of a
+# dLLM step at decode against ~3% in training. Same kernel; wrong axis.
+#
+# As one GEMM the table is read ONCE, so cost is FLAT in `n_masked` and lands on the memory roofline:
+# 0.66 ms against a 0.70 ms streaming read of the same tensor.
+#
+# Two things that were measured, not assumed:
+#   * ORIENTATION. `Pm @ El.t()` -> [n_rows, n_pairs] is 1.4x faster than `El @ Pm.t()` and is the one
+#     on the floor, because it walks `params` in its natural row-major order.
+#   * NOT tf32: 0.03 ms for 8e-4 of relative error. See [[tf32-fork-nondeterminism]].
+
+
+_GEMM_MIN_CATS = 4096     # below this the Triton kernel is fine and there is little table to amortise
+
+
+def _fw_gemm_applicable(layer, kwargs):
+    """Whether the dense forward can be served by the GEMM path.
+
+    Deliberately narrow: it has to reproduce exactly what the Triton kernel writes into `node_mars`,
+    so every layout assumption it makes is checked rather than hoped for.
+    """
+    if kwargs.get("soft_evidence_value_mask", None) is None:
+        # SCOPED TO THE GENERATION PATH ON PURPOSE. Without a value mask every variable is observed,
+        # there is no logZ to amortise, and the ordinary likelihood forward -- the one training runs --
+        # keeps its Triton kernel untouched. This is a decode optimisation; it should not be able to
+        # move a training step at all.
+        return False
+    if kwargs.get("soft_evidence_cat_ids", None) is not None:
+        return False                                     # top-k: no dense table pass to amortise
+    if kwargs.get("categorical_evidence_logp", None) is None:
+        return False
+    if layer.provided("fw_local_ids"):
+        return False                                     # partial evaluation: not this layout
+    if kwargs.get("missing_mask", None) is not None:
+        return False                                     # handled by a separate kernel
+    num_cats = getattr(layer.dist, "num_cats", None)
+    if num_cats is None or num_cats < _GEMM_MIN_CATS:
+        return False
+    # `get_signature` excludes num_cats, so one layer can mix them; the table view would be wrong.
+    for ns in layer.nodes:
+        if getattr(ns.dist, "num_cats", num_cats) != num_cats:
+            return False
+    params = layer.params
+    if params is None or params.numel() % num_cats != 0:
+        return False
+    if layer.num_vars_per_node != 1:
+        return False
+    cache = getattr(layer, "_gemm_rows_ok", None)
+    if cache is None:
+        cache = bool((layer.s_pids % num_cats == 0).all())   # else s_pids//num_cats is not a row id
+        layer._gemm_rows_ok = cache
+    return cache
+
+
+def _fw_dense_gemm(layer, kwargs, kw):
+    """Write this layer's `node_mars` from ONE GEMM plus one gather.
+
+    NO host-side branching anywhere in here. An earlier version asked `bool(need.any())` and
+    `bool(sel.all())` to skip halves it did not need; each of those is a device-to-host SYNC, and on a
+    loaded GPU three syncs per forward cost more than the work they save -- the profiler read 0.92 ms
+    of GPU work against 15 ms of wall. So both halves are computed unconditionally and combined with
+    `torch.where`.
+
+    The logZ is taken over EVERY (batch, variable) pair rather than only the marginalised ones. That
+    is not waste: the GEMM is bandwidth-bound on reading `params` once, and the pair count only widens
+    the skinny side. It costs the same and removes the last reason to look at the mask on the host.
+    """
+    import torch as _torch
+
+    num_cats = layer.dist.num_cats
+    evi = kwargs["categorical_evidence_logp"]                    # [B, ext_num_vars, num_cats]
+    batch_size = kw["batch_size"]
+    # Addressed `data_ptr + vid * batch_size + b`, i.e. [num_vars, B], but it arrives FLAT.
+    data = kw["data_ptr"]
+    data = data.view(-1, batch_size) if data.dim() == 1 else data
+    node_mars = kw["node_mars_ptr"]
+    vmask = kwargs["soft_evidence_value_mask"]                    # [B, ext_num_vars]; see the gate
+
+    sid, eid = layer._output_ind_range
+    params = layer.params
+    n_rows = params.numel() // num_cats
+    Pm = params.view(n_rows, num_cats)
+    n_ext = evi.size(1)
+
+    vids = layer.vids[:, 0]                                      # global variable id per node
+    rows = layer.s_pids // num_cats                              # emission row per node
+    lvids = vids if layer.var_idmapping is None else layer.var_idmapping[vids]
+
+    # ---- marginalised half: ONE GEMM, `params` read exactly once ----
+    #
+    # BATCH-BROADCAST EVIDENCE. logZ depends on (variable, emission row) and NOT on the batch row, so
+    # when every row shares one evidence tensor the [B * n_ext] columns hold only n_ext distinct ones.
+    # `_pc_group_deps` is exactly this case -- its 2C+2 rows differ ONLY in the value mask -- so at
+    # C=4 that is 320 columns for 32 distinct answers, and the GEMM goes from bandwidth-bound to
+    # compute-bound computing the other 288 for nothing.
+    #
+    # Detected by STRIDE, which costs nothing and needs no device sync: a tensor built with
+    # `.expand(B, -1, -1)` has batch stride 0. A caller that materialises it with `.contiguous()`
+    # loses the signal and simply gets the general path -- correct either way, just slower.
+    bcast = (batch_size == 1) or (evi.stride(0) == 0)
+    e = evi[0] if bcast else evi.reshape(batch_size * n_ext, num_cats)
+    m = e.max(dim = -1, keepdim = True).values
+    # `Pm @ ...` and NOT `... @ Pm.t()`: measured 1.4x faster and the orientation that sits on the
+    # memory roofline, because it walks `params` in its natural row-major order.
+    logZ = _torch.log(Pm @ _torch.exp(e - m).t()) + m.t()        # [n_rows, n_ext] or [n_rows, B*n_ext]
+
+    bstep = 0 if bcast else n_ext
+    bcol = _torch.arange(batch_size, device = evi.device)[None, :] * bstep
+    col = bcol + lvids[:, None]                                  # [num_nodes, B] -> pair column
+    marg = logZ[rows[:, None].expand(-1, batch_size), col]       # [num_nodes, B]
+
+    # ---- observed half: two gathers, no intermediate ----
+    tok = data[vids, :]                                          # [num_nodes, B]
+    vexp = lvids[:, None].expand(-1, batch_size)
+    if bcast:
+        # Index the SINGLE row, never the expanded batch axis. Advanced-indexing a stride-0 tensor
+        # makes PyTorch materialise it first -- 550 MB at batch 34 on this circuit, and it turned a
+        # 1.3 ms call into 90 ms. Found only by driving the real `_pc_group_deps`, not the harness.
+        lp = evi[0][vexp, tok]                                   # [num_nodes, B]
+    else:
+        bidx = _torch.arange(batch_size, device = evi.device)[None, :].expand(tok.size(0), batch_size)
+        lp = evi[bidx, vexp, tok]                                # evidence at the token
+    inp = _torch.log(params[rows[:, None] * num_cats + tok])     # emission at the token
+
+    out = _torch.where(vmask.t()[lvids], lp + inp, marg)
+
+    node_mars[sid:eid, :batch_size] = out
+
+
+class _FwDenseGemmDispatch:
+    """Adapter so the GEMM forward can live in `post_fw_fns`, which calls ``kernel[grid](**kw)``."""
+
+    def __getitem__(self, grid):
+        def launch(**kw):
+            gk = kw["_gemm_kwargs"]
+            _fw_dense_gemm(kw["_gemm_layer"], gk, kw)
+        return launch
+
+
+def _condition_apply_fw_gemm(layer, kwargs):
+    return _fw_gemm_applicable(layer, kwargs)
+
+
+def _prep_args_apply_fw_gemm(layer, kwargs):
+    # Tensors, not pointers: `node_mars_ptr`/`data_ptr`/`batch_size` already come from the launcher.
+    return {"_gemm_kwargs": kwargs, "_gemm_layer": layer, "BLOCK_SIZE": 1}, (1,)
+
+
 def _condition_apply_fw_w_value_mask_kernel(layer, kwargs):
     return "categorical_evidence_logp" in kwargs and \
-        kwargs.get("soft_evidence_value_mask", None) is not None
+        kwargs.get("soft_evidence_value_mask", None) is not None and \
+        not _fw_gemm_applicable(layer, kwargs)
 
 
 def _prep_args_apply_fw_w_value_mask_kernel(layer, kwargs):
@@ -1502,6 +1678,10 @@ class SoftEvidenceCategorical(Distribution):
         self.sort_soft_evidence = sort_soft_evidence
 
         self.post_fw_fns = [
+            # Dense (full-vocab) forward as ONE GEMM. First in the list and mutually exclusive with
+            # both Triton dense paths, which negate `_fw_gemm_applicable`. See the block comment above
+            # that function for why the kernel's tiling cannot get this reuse.
+            (_FwDenseGemmDispatch(), _condition_apply_fw_gemm, _prep_args_apply_fw_gemm),
             # CUDA top-k forward (index-driven, or the gather form); mutually exclusive with the Triton
             # kernel below, which remains the fallback for value-mask / no-cat-ids / partial-eval cases.
             (_FwCudaDispatch(), _condition_fw_cuda_kernel, _prep_args_fw_cuda_kernel),
