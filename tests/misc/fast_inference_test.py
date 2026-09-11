@@ -445,3 +445,113 @@ def test_bf16_params_changes_the_answer_only_slightly():
     assert torch.equal(torch.isfinite(ref), torch.isfinite(got)), "bf16 moved an inf/nan"
     rel = ((ref[fin] - got[fin]).abs() / (ref[fin].abs() + 1e-9)).max().item()
     assert rel < 1e-2, f"bf16 error {rel:.2e} is far larger than the ~1e-3 measured; something is wrong"
+
+
+# ------------------------------------------------------------------------------------------------
+#  `allow_cudagraph`: the third thing the scope holds
+# ------------------------------------------------------------------------------------------------
+#
+# A captured CUDA graph bakes in the POINTERS it was recorded with, so it is sound only while the
+# buffers behind them do not move -- which is this scope's contract, and the reason the scope is the
+# right owner for one. It is freed on exit for the same reason the derived copies are: it pins every
+# buffer it captured.
+
+
+@cuda_only
+def test_cudagraphs_follow_the_scope():
+    from pyjuice.utils.fast_inference import cudagraphs_allowed
+
+    assert not cudagraphs_allowed(), "graphs must not be on outside a scope"
+    with juice.fast_inference():
+        assert cudagraphs_allowed(), "graphs are ON by default in the scope -- they cost no accuracy"
+    with juice.fast_inference(allow_cudagraph = False):
+        assert not cudagraphs_allowed()
+    assert not cudagraphs_allowed(), "graphs leaked past the scope"
+
+
+@cuda_only
+def test_nested_scopes_may_narrow_cudagraphs_but_never_widen_them():
+    from pyjuice.utils.fast_inference import cudagraphs_allowed
+
+    with juice.fast_inference():
+        with juice.fast_inference(allow_cudagraph = False):
+            assert not cudagraphs_allowed()
+        assert cudagraphs_allowed(), "the outer scope's choice must come back"
+    with juice.fast_inference(allow_cudagraph = False):
+        with juice.fast_inference(allow_cudagraph = True):
+            assert not cudagraphs_allowed(), "a nested scope must not be able to turn graphs on"
+
+
+@cuda_only
+def test_graphs_are_captured_in_the_scope_and_freed_on_exit():
+    dev = torch.device("cuda:0")
+    pc = _bf16_circuit(dev)
+    num_cats = pc.input_layer_group[0].dist.num_cats
+    x = torch.randint(0, num_cats, [2, pc.num_vars], device = dev)
+    vm = torch.ones(2, pc.num_vars, dtype = torch.bool, device = dev)
+    vm[0, 0] = False
+    evi = torch.log_softmax(torch.randn(2, pc.num_vars, num_cats, device = dev), dim = -1)
+    run = lambda: pc(x, soft_evidence_value_mask = vm, categorical_evidence_logp = evi)
+
+    pc._recorded_cuda_graphs.clear()
+    run()
+    assert len(pc._recorded_cuda_graphs) == 0, "a forward outside any scope captured a graph"
+
+    with juice.fast_inference():
+        run()
+        assert len(pc._recorded_cuda_graphs) == 1, "the scope did not capture a graph"
+    assert len(pc._recorded_cuda_graphs) == 0, \
+        "the graph outlived its scope -- it pins every buffer it baked a pointer to"
+
+    with juice.fast_inference(allow_cudagraph = False):
+        run()
+        assert len(pc._recorded_cuda_graphs) == 0, "`allow_cudagraph = False` still captured"
+
+
+@cuda_only
+def test_alternating_batch_sizes_never_replay_a_stale_graph():
+    """The signature keys on (data_ptr, shape), not `id()`, and this pins WHY that matters.
+
+    `id()` was wrong in both directions. Too STRICT: a new batch size reallocates `node_mars`, so the
+    old graph was never reused and an alternating loop re-captured on nearly every call -- measured on
+    the CoDD circuit, 31 graphs over 40 alternating steps where 2 would do. Too LOOSE: CPython
+    recycles ids, so a fresh tensor can inherit the id of a freed one -- measured, 7 of 24 observed
+    `id(node_mars)` values came back for a different batch size -- and the signature then matches a
+    graph captured against memory since handed to something else. Adaptive decoding alternates a
+    batch-1 refine with a batch-(2C+2) dependence call every step, so it is exactly the shape that
+    trips both.
+
+    What is GUARANTEED is the correctness half: a graph is replayed only when the buffers it baked
+    pointers to are still at that address and shape, so an alternating loop can never get a stale
+    one. Reuse is a separate, best-effort matter -- it depends on the caching allocator returning the
+    same addresses, which it does on a large circuit and need not on a small one -- so this does NOT
+    assert a graph count.
+    """
+    dev = torch.device("cuda:0")
+    pc = _bf16_circuit(dev)
+    num_cats = pc.input_layer_group[0].dist.num_cats
+    torch.manual_seed(3)
+    evi1 = torch.log_softmax(torch.randn(1, pc.num_vars, num_cats, device = dev), dim = -1)
+    data = {b: torch.randint(0, num_cats, [b, pc.num_vars], device = dev) for b in (1, 4)}
+    masks = {}
+    for b in (1, 4):
+        m = torch.ones(b, pc.num_vars, dtype = torch.bool, device = dev)
+        m[:, 0] = False
+        masks[b] = m
+
+    def run(b):
+        return pc(data[b], soft_evidence_value_mask = masks[b],
+                  categorical_evidence_logp = evi1.expand(b, -1, -1).contiguous()).clone()
+
+    pc._recorded_cuda_graphs.clear()
+    want = {b: run(b) for b in (1, 4)}          # no scope -> no graphs -> the reference
+    assert len(pc._recorded_cuda_graphs) == 0
+
+    with juice.fast_inference():
+        for _ in range(8):
+            for b in (1, 4):
+                got = run(b)
+                assert torch.equal(got, want[b]), \
+                    f"a graphed forward at batch {b} disagreed with the ungraphed one -- a stale " \
+                    f"graph was replayed"
+    assert len(pc._recorded_cuda_graphs) == 0, "graphs outlived the scope"

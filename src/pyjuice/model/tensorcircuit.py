@@ -25,6 +25,33 @@ from .backend import compile_cum_par_flows_fn, compute_cum_par_flows, cum_par_fl
                      normalize_parameters, eval_top_down_probs
 
 
+def _cuda_graph_key(t):
+    """Identify a buffer the way a CAPTURED GRAPH does -- by the memory it baked in, not by the
+    Python object that happens to wrap it.
+
+    `id()` was used here and is wrong in BOTH directions.
+
+    Too STRICT: reallocating `node_mars` for a different batch size produces a new Python object, so
+    the old graph is never reused and a batch-alternating loop re-captures on nearly every call.
+    Measured on the CoDD circuit alternating batch 1 and batch 10: **31 graphs recorded over 40
+    steps** where 2 would do -- and each capture is 3 warm-up runs plus the capture itself, so the
+    "graphed" path can end up SLOWER than eager.
+
+    Too LOOSE: CPython recycles ids. Measured in the same run, **7 of 24 observed `id(node_mars)`
+    values came back for a DIFFERENT batch size**. A recycled id paired with the same batch size
+    matches a graph captured against memory that has since been freed and handed to something else --
+    an illegal access, or silent corruption when the allocator kept it mapped. This is exactly the
+    pattern adaptive decoding produces, since it alternates a batch-1 refine with a batch-(2C+2)
+    dependence call every step.
+
+    `(data_ptr, shape)` is what a graph actually depends on: if the address and the shape both match,
+    the pointers baked into the capture still refer to the buffer we mean.
+    """
+    if t is None:
+        return None
+    return (t.data_ptr(), tuple(t.shape))
+
+
 def _pc_model_backward_hook(grad, pc, inputs, record_cudagraph, apply_cudagraph, propagation_alg, **kwargs):
     grad = grad.permute(1, 0)
     pc.backward(
@@ -412,9 +439,15 @@ class TensorCircuit(nn.Module):
 
             # `external_params` is in the signature because the staging buffer is re-allocated when its
             # layout changes, and a captured graph holds the old pointer
-            signature = (0, id(self.node_mars), id(self.element_mars), id(self.params), B,
-                         id(self.external_params))
-            if record_cudagraph and signature not in self._recorded_cuda_graphs:
+            signature = (0, _cuda_graph_key(self.node_mars), _cuda_graph_key(self.element_mars),
+                         _cuda_graph_key(self.params), B, _cuda_graph_key(self.external_params))
+            # A `fast_inference` scope may turn graphs on for the whole block, so callers need not
+            # thread `record_cudagraph` through every call. Its contract -- parameters, and the
+            # buffers a capture bakes pointers to, do not move -- is what makes that sound, and the
+            # scope frees what it captured on exit.
+            from pyjuice.utils.fast_inference import cudagraphs_allowed, register_cudagraph_owner
+            _record = record_cudagraph or cudagraphs_allowed()
+            if _record and signature not in self._recorded_cuda_graphs:
                 # Warmup
                 s = torch.cuda.Stream()
                 s.wait_stream(torch.cuda.current_stream())
@@ -430,6 +463,7 @@ class TensorCircuit(nn.Module):
 
                 # Save
                 self._recorded_cuda_graphs[signature] = g
+                register_cudagraph_owner(self)
 
             if apply_cudagraph and signature in self._recorded_cuda_graphs:
                 g = self._recorded_cuda_graphs[signature]
@@ -623,9 +657,11 @@ class TensorCircuit(nn.Module):
                     else:
                         raise ValueError(f"Unknown layer type {type(layer)}.")
 
-            signature = (1, id(self.node_flows), id(self.element_flows), id(self.node_mars), id(self.element_mars), id(self.params), id(self.param_flows), B, 
+            signature = (1, _cuda_graph_key(self.node_flows), _cuda_graph_key(self.element_flows),
+                         _cuda_graph_key(self.node_mars), _cuda_graph_key(self.element_mars),
+                         _cuda_graph_key(self.params), _cuda_graph_key(self.param_flows), B,
                          allow_modify_flows, logspace_flows, ((abs(pflow_temperature) - 1.0) < 1e-6), temper_eflow,
-                         id(self.external_params), id(self.external_params_grad))
+                         _cuda_graph_key(self.external_params), _cuda_graph_key(self.external_params_grad))
             if record_cudagraph and signature not in self._recorded_cuda_graphs:
                 # Warmup
                 s = torch.cuda.Stream()

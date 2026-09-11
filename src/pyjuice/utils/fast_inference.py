@@ -39,15 +39,19 @@ from typing import List, Optional
 
 
 class _FastInferenceState():
-    __slots__ = ("depth", "allow_param_copy", "allow_bf16_params", "layers")
+    __slots__ = ("depth", "allow_param_copy", "allow_bf16_params", "allow_cudagraph",
+                 "layers", "graph_owners")
 
     def __init__(self):
         self.depth = 0
         self.allow_param_copy = False
         self.allow_bf16_params = False
+        self.allow_cudagraph = False
         # The layers that actually built something, so exit frees exactly those. Held by strong
         # reference only for the duration of the block, which is bounded by construction.
         self.layers: List = []
+        #: Circuits that captured a CUDA graph inside this scope, so exit frees exactly those.
+        self.graph_owners: List = []
 
 
 _STATE = _FastInferenceState()
@@ -77,6 +81,22 @@ def bf16_params_allowed() -> bool:
     return _STATE.depth > 0 and _STATE.allow_param_copy and _STATE.allow_bf16_params
 
 
+def cudagraphs_allowed() -> bool:
+    """Whether a circuit may capture and replay CUDA graphs for the current pass.
+
+    This is the scope's reason to exist, applied to graphs: a capture bakes in the POINTERS it was
+    recorded with, so it is sound only while the buffers behind them do not move -- which is exactly
+    what this block promises.
+    """
+    return _STATE.depth > 0 and _STATE.allow_cudagraph
+
+
+def register_cudagraph_owner(pc) -> None:
+    """Record that `pc` captured a graph inside this scope, so the scope's exit can free it."""
+    if _STATE.depth > 0 and not any(o is pc for o in _STATE.graph_owners):
+        _STATE.graph_owners.append(pc)
+
+
 def register_layer(layer) -> None:
     """Record that `layer` built a derived copy, so the scope's exit can free it."""
     if _STATE.depth > 0:
@@ -84,6 +104,16 @@ def register_layer(layer) -> None:
 
 
 def _release_all() -> None:
+    # Graphs captured inside the scope are freed with it: a capture pins every buffer it baked a
+    # pointer to -- node_mars, element_mars, params -- and keeping them would hold that memory for the
+    # process's lifetime against a scope the caller explicitly closed. Re-entering and re-capturing
+    # costs a few ms once, against a scope that then runs for a whole generation.
+    owners, _STATE.graph_owners = _STATE.graph_owners, []
+    for pc in owners:
+        graphs = getattr(pc, "_recorded_cuda_graphs", None)
+        if graphs is not None:
+            graphs.clear()
+
     layers, _STATE.layers = _STATE.layers, []
     for layer in layers:
         release = getattr(layer, "_release_fast_inference_params", None)
@@ -92,7 +122,8 @@ def _release_all() -> None:
 
 
 @contextmanager
-def fast_inference(allow_param_copy: bool = True, allow_bf16_params: Optional[bool] = None):
+def fast_inference(allow_param_copy: bool = True, allow_bf16_params: Optional[bool] = None,
+                   allow_cudagraph: Optional[bool] = None):
     """
     Open a scope in which the circuit's parameters will not change.
 
@@ -130,6 +161,28 @@ def fast_inference(allow_param_copy: bool = True, allow_bf16_params: Optional[bo
                               it works.)
     :type allow_bf16_params: bool
 
+    :param allow_cudagraph: capture and replay CUDA graphs for the circuit's inner layers, without
+                            the caller passing `record_cudagraph` on every call. ON by default in the
+                            scope: a graph costs no accuracy, and the scope's contract -- parameters,
+                            and so the buffers a capture bakes pointers to, do not move -- is
+                            precisely what makes holding one sound.
+                            WORTH 1.26x on the decode forward, and it GREW as everything else got
+                            faster: the inner layers are 63 launches of ~3.6 us each, which is latency
+                            rather than work, and a graph is what collapses them. The same measurement
+                            read 1.01x before the logZ GEMM landed, when the input layer dominated.
+                            Graphs are FREED on exit with the derived copies. `None` means inherit,
+                            as for `allow_bf16_params`.
+                            **ENTER THE SCOPE ONCE, AROUND THE WHOLE GENERATION -- NOT PER CALL.**
+                            Freeing on exit means the next entry re-captures, and a capture is three
+                            warm-up runs plus the capture itself: MEASURED 6.31 ms for a forward whose
+                            scope is entered per call, against 1.63 ms for the same forward with no
+                            graphs at all. Entered once and reused, the same forward is 1.44 ms. So
+                            per-call entry is nearly 4x SLOWER than not using this at all, which is
+                            the opposite of what it looks like you are asking for.
+                            The freeing itself is right: a capture pins every buffer it baked a
+                            pointer to, and the scope is where that lifetime belongs.
+    :type allow_cudagraph: Optional[bool]
+
     :note: THE CONTRACT: parameters must not change inside the block. Nothing can enforce this --
            an EM step writes through a raw pointer that PyTorch's version counter never sees -- so a
            derived copy would go stale silently. The in-repo parameter-writing paths
@@ -150,11 +203,20 @@ def fast_inference(allow_param_copy: bool = True, allow_bf16_params: Optional[bo
     else:
         _STATE.allow_bf16_params = (allow_bf16_params and outer_bf16) if _STATE.depth > 1 \
             else allow_bf16_params
+    outer_graph = _STATE.allow_cudagraph
+    # Same rules once more, but the outermost DEFAULT is True rather than False: unlike bf16 this
+    # costs no accuracy, only the memory a graph pins -- which the scope frees on exit.
+    if allow_cudagraph is None:
+        _STATE.allow_cudagraph = outer_graph if _STATE.depth > 1 else True
+    else:
+        _STATE.allow_cudagraph = (allow_cudagraph and outer_graph) if _STATE.depth > 1 \
+            else allow_cudagraph
     try:
         yield
     finally:
         _STATE.depth -= 1
         _STATE.allow_param_copy = outer_allow
         _STATE.allow_bf16_params = outer_bf16
+        _STATE.allow_cudagraph = outer_graph
         if _STATE.depth == 0:
             _release_all()
