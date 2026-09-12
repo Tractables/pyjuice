@@ -340,7 +340,15 @@ def test_a_layer_mixing_num_cats_declines_the_copy():
 #     behaviour, and only for want of a sentinel.
 
 
-def _bf16_circuit(dev, num_cats = 4096):
+def _bf16_circuit(dev, num_cats = None):
+    # num_cats must clear `_GEMM_MIN_CATS`, or the dense forward keeps its Triton kernel and there is
+    # no GEMM to give a bf16 table to. Read from the constant rather than duplicated: when that
+    # threshold was raised from 4096 to 32768 this helper's hardcoded 4096 fell below it, which made
+    # one test fail loudly and -- worse -- made `test_bf16_params_changes_the_answer_only_slightly`
+    # pass VACUOUSLY, since fp32 and bf16 are trivially equal when neither takes the GEMM.
+    from pyjuice.nodes.distributions.softevi_categorical import _GEMM_MIN_CATS
+    if num_cats is None:
+        num_cats = _GEMM_MIN_CATS
     torch.manual_seed(0)
     with juice.set_block_size(2):
         ns = [inputs(v, num_node_blocks = 2, dist = dists.SoftEvidenceCategorical(num_cats = num_cats))

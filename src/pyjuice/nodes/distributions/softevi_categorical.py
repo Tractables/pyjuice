@@ -587,7 +587,28 @@ def _prep_args_apply_fw_kernel(layer, kwargs):
 #   * NOT tf32: 0.03 ms for 8e-4 of relative error. See [[tf32-fork-nondeterminism]].
 
 
-_GEMM_MIN_CATS = 4096     # below this the Triton kernel is fine and there is little table to amortise
+# Below this the Triton kernel wins and the GEMM is a REGRESSION. 4096 was a guess and it was wrong:
+# measured against the Triton dense forward on this GPU, batch 1, two masked variables --
+#
+#     num_cats    32 nodes   128 nodes   512 nodes
+#        4096       0.49x      0.60x       0.56x      <- GEMM loses everywhere
+#        8192       0.76x      1.30x       0.89x      <- near-tie, and not monotone in node count
+#       16384       0.76x      1.01x       1.79x      <- near-tie
+#       65536       5.71x          -           -
+#      126464    4-7x (the CoDD circuit, 32768 nodes)
+#
+# so the threshold sits above the near-tie band rather than inside it. The GEMM only pays once the
+# emission-table read dominates, and below that its fixed costs -- the max, the exp, the scatter back
+# into node_mars -- are the whole of it.
+#
+# DELIBERATELY A FIXED THRESHOLD, NOT AUTOTUNED, even though pyjuice has `c.autotune` and the softevi
+# CUDA fork uses it for its own launch config. The two paths here are not numerically identical
+# (3e-7 to 9e-7 relative, growing with num_cats), so a timing-chosen fork would make the ANSWER depend
+# on which path happened to be faster on that run -- exactly the defect recorded in
+# `tf32-fork-nondeterminism`, where a fork picked by measurement silently changed precision and the
+# failure rate tracked machine load. Autotune launch configs, which are bit-equivalent; do not
+# autotune a choice between paths that disagree.
+_GEMM_MIN_CATS = 32768
 
 
 def _fw_gemm_applicable(layer, kwargs):
