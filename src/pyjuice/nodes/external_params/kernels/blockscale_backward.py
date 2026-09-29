@@ -350,7 +350,8 @@ def _bs_triton_phigrad_logz_kernel(node_flows, log_z, sigma, ext, gate, grad_ext
                                    batch_size: tl.constexpr, n_gates: tl.constexpr,
                                    N_CHILD_GATES: tl.constexpr, BLOCK_SIZE_M: tl.constexpr,
                                    BLOCK_B: tl.constexpr, GATE_TILE: tl.constexpr,
-                                   USE_DOT: tl.constexpr, gate_stride: tl.constexpr, ext_base):
+                                   USE_DOT: tl.constexpr, gate_stride: tl.constexpr, ext_base,
+                                   TILE_SIZE_M: tl.constexpr = 0):
     """
     The log-Z half of `d LL / d log phi`:
 
@@ -367,14 +368,27 @@ def _bs_triton_phigrad_logz_kernel(node_flows, log_z, sigma, ext, gate, grad_ext
     `log Z` comes free from the forward's cache; `sigma` is recomputed only when `params` changes.
     """
     pid_g = tl.program_id(0)
-    pid_nb = tl.program_id(1)
+    pid_y = tl.program_id(1)
     pid_b = tl.program_id(2)
+
+    # The NODE axis is tiled, and grid-y carries `(node block, node tile)`. Holding the whole block
+    # put `node_flows` and `log Z` -- `[BLOCK_SIZE_M, BLOCK_B]` each -- beyond shared memory once the
+    # block got wide: at `block_size = 2048` EVERY `(GATE_TILE, BLOCK_B)` candidate was refused
+    # (`Required: 139264, Hardware limit: 101376`), so a 2048-state HMM could not run its gate
+    # gradient at all, with or without `apply_z_correction`.
+    #
+    # Safe because the contraction reduces over the NODE axis: each tile produces a PARTIAL `out`, and
+    # the emission below is already `tl.atomic_add`. The shift `mx` is taken over `lphi`, which has no
+    # node index, so every tile shares it and the partial sums are commensurate.
+    M_TILES: tl.constexpr = BLOCK_SIZE_M // TILE_SIZE_M
+    pid_nb = pid_y // M_TILES
+    pid_m = pid_y % M_TILES
 
     offs_g = pid_g * GATE_TILE + tl.arange(0, GATE_TILE)
     mask_g = offs_g < n_gates
     offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B
     mask_batch = offs_batch < batch_size
-    offs_node = tl.arange(0, BLOCK_SIZE_M)
+    offs_node = pid_m * TILE_SIZE_M + tl.arange(0, TILE_SIZE_M)
 
     # loaded ONCE for the whole gate tile
     off_nids = tl.load(nids + pid_nb)

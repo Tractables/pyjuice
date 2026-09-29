@@ -1513,21 +1513,21 @@ class BlockScaleSumParams(ExternalSumParams):
                     f"partition {pid} has {rows} node blocks, past the 65535 CUDA grid-y limit for " \
                     f"the external-gradient kernel. Split the partition, or use a larger block size."
 
-                def _go(gt, bb, tgt, nids = nids, log_z = log_z, rows = rows, sigma = sigma,
+                def _go(gt, bb, tm, tgt, nids = nids, log_z = log_z, rows = rows, sigma = sigma,
                         gb = gb, n_gates = n_gates):
                     _bs_triton_phigrad_logz_kernel[
-                            (triton.cdiv(n_gates, gt), rows, triton.cdiv(batch, bb))](
+                            (triton.cdiv(n_gates, gt), rows * (bs_ // tm), triton.cdiv(batch, bb))](
                         node_flows = node_flows, log_z = log_z, sigma = sigma, ext = external_params,
                         gate = gb, grad_ext = tgt, nids = nids,
                         batch_size = batch, n_gates = n_gates,
                         N_CHILD_GATES = state["node_cbs"] // gate_cbs, BLOCK_SIZE_M = bs_,
-                        BLOCK_B = bb, GATE_TILE = gt,
-                        USE_DOT = (1 if (gt >= 16 and bs_ >= 16 and batch >= 64) else 0),
+                        BLOCK_B = bb, GATE_TILE = gt, TILE_SIZE_M = tm,
+                        USE_DOT = (1 if (gt >= 16 and tm >= 16 and batch >= 64) else 0),
                         gate_stride = gb.size(1),
                         ext_base = state["ext_base"], num_stages = 1)
 
-                gt, bb = self._logz_tile(layer, _go, grad_ext, batch, bs_, n_gates, rows)
-                _go(gt, bb, grad_ext)
+                gt, bb, tm = self._logz_tile(layer, _go, grad_ext, batch, bs_, n_gates, rows)
+                _go(gt, bb, tm, grad_ext)
 
             layer._bs_grad_ext = None
 
@@ -1777,33 +1777,50 @@ class BlockScaleSumParams(ExternalSumParams):
         if by_size and by_size[0] not in short:
             short.append(by_size[0])
 
+        # NODE-TILE LADDER, widest first. `node_flows` and `log Z` are `[TILE_SIZE_M, bb]` per program,
+        # so at a wide block they exhaust shared memory for EVERY `(GATE_TILE, BLOCK_B)` pair and the
+        # search below has nothing to return -- measured at `block_size = 2048`, where the narrowest
+        # candidate still wanted 139264 bytes against a 101376 limit and a 2048-state HMM therefore
+        # could not run its gate gradient at all. Splitting the node axis is the only axis left.
+        #
+        # The full block is tried FIRST, so every shape that already fits keeps exactly the tile it
+        # had; the ladder only descends when the whole `(gt, bb)` search comes back empty.
+        tm_ladder = [block_size]
+        t = block_size
+        while t > 16:
+            t //= 2
+            tm_ladder.append(t)
+
         try:
             scr = torch.empty_like(grad_ext)
-            # Shared memory is what rules a candidate out, and it is not worth modelling: Triton's own
-            # liveness decides which tiles are alive at once. Ask it, and drop what it refuses.
             ok = []
-            for gt, bb in short:
-                try:
-                    launch(gt, bb, scr)
-                    ok.append((gt, bb))
-                except Exception:
-                    pass
-            # Every shortlisted candidate was refused. Widen to the whole set, narrowest first, and
-            # take the first that runs -- an unmeasured but WORKING tile beats the alternative, which
-            # was to return one of the candidates that had just raised and let the real launch fail.
-            if not ok:
-                for c in by_size:
-                    if c in short:
-                        continue
+            for tm in tm_ladder:
+                # Shared memory is what rules a candidate out, and it is not worth modelling: Triton's
+                # own liveness decides which tiles are alive at once. Ask it, and drop what it refuses.
+                for gt, bb in short:
                     try:
-                        launch(c[0], c[1], scr)
-                        ok.append(c)
-                        break
+                        launch(gt, bb, tm, scr)
+                        ok.append((gt, bb, tm))
                     except Exception:
                         pass
+                # Every shortlisted candidate was refused. Widen to the whole set, narrowest first, and
+                # take the first that runs -- an unmeasured but WORKING tile beats the alternative,
+                # which was to return one that had just raised and let the real launch fail.
+                if not ok:
+                    for c in by_size:
+                        if c in short:
+                            continue
+                        try:
+                            launch(c[0], c[1], tm, scr)
+                            ok.append((c[0], c[1], tm))
+                            break
+                        except Exception:
+                            pass
+                if ok:
+                    break
             torch.cuda.synchronize()
             if len(ok) > 1:
-                trials = [(c, (lambda c = c: launch(c[0], c[1], scr))) for c in ok]
+                trials = [(c, (lambda c = c: launch(c[0], c[1], c[2], scr))) for c in ok]
                 pick = ck.autotune(trials) or ok[0]
             elif ok:
                 pick = ok[0]
@@ -1814,7 +1831,7 @@ class BlockScaleSumParams(ExternalSumParams):
         if pick is None:
             # Nothing fit, or the scratch buffer could not be allocated. Hand back the narrowest pair
             # and let the real launch report the failure against the real operands.
-            pick = by_size[0] if by_size else (1, 16)
+            pick = (by_size[0][0], by_size[0][1], tm_ladder[-1]) if by_size else (1, 16, min(16, block_size))
         layer._bs_bw_gate_cache[key] = pick
         return pick
 
