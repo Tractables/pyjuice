@@ -595,7 +595,15 @@ class InputLayer(Layer, nn.Module):
 
             grid = (triton.cdiv(layer_num_nodes * batch_size, BLOCK_SIZE),)
 
-            if (not cuda_handled) and self.provided("_flows_kernel") and self._flows_kernel is not None:
+            # `param_flows is not None` guards the same hazard the CUDA fast-path above already checks:
+            # `backward(compute_param_flows = False)` never allocates `param_flows`, so this emission-flow
+            # kernel -- whose sole job is to accumulate into it -- would dereference a null pointer and
+            # die at Triton COMPILE time with a bare `NoneType has no attribute 'type'`. Nothing to
+            # accumulate into means nothing to do; node / element flows come from the inner layers and are
+            # unaffected. (A direct `pc.backward(compute_param_flows = False)`; queries take a flow-only
+            # `input_layer_fn` and never reach here.)
+            if (not cuda_handled) and self.provided("_flows_kernel") and self._flows_kernel is not None \
+                    and self.param_flows is not None:
                 self._flows_kernel[grid](
                     params_ptr = self.params,
                     param_flows_ptr = self.param_flows,
