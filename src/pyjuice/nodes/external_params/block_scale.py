@@ -1850,14 +1850,45 @@ class BlockScaleSumParams(ExternalSumParams):
                 f"partition {pid} has {rows} node blocks, past the 65535 CUDA grid-y limit for the " \
                 f"denominator kernel. Use a larger block size."
 
-            _bs_triton_denom_kernel[(num_edges, rows)](
+            # EDGE TILING is what makes this kernel affordable: `node_flows` and `log Z` are read once
+            # per tile instead of once per edge. The tile is bounded by an accumulator budget --
+            # `acc` is `[block_size, TILE_SIZE_K]` and lives in registers, so a 128-wide block gets a
+            # 32-wide edge tile while a 32-wide block gets 64.
+            TILE_SIZE_K = max(1, min(triton.next_power_of_2(num_edges),
+                                     max(1, 4096 // block_size), 64))
+            # `tl.dot` needs all three tile dims >= 16; below that the broadcast-sum fallback is used
+            # (narrow blocks are cheap anyway, so there is nothing to win there).
+            use_dot = 1 if (block_size >= 16 and TILE_SIZE_K >= 16 and TILE_SIZE_B >= 16) else 0
+            # `tl.dot` defaults to TF32, which costs ~1e-3 RELATIVE on `F-` (MEASURED: 9.1e-4 against
+            # the torch reference, versus 8.8e-7 under `ieee`). `F-` is an EM DENOMINATOR, so that
+            # error lands directly in the `theta * F+ / F-` ratio; `ieee` is kept unless
+            # `PYJUICE_BLOCKSCALE_DENOM_TF32=1` asks for the faster, looser dot.
+            dot_ieee = 0 if os.environ.get("PYJUICE_BLOCKSCALE_DENOM_TF32", "0") == "1" else 1
+
+            # SPLIT THE BATCH REDUCTION across programs until the grid is big enough to fill the
+            # device. Edge tiling on its own shrinks the grid by `TILE_SIZE_K`, which at a small node
+            # count leaves single-digit programs; splitting the batch restores the program count at no
+            # extra memory traffic (each program just reads a shorter batch range). The partial sums
+            # are combined atomically, so `B_SPLITS > 1` forces the atomic write.
+            n_edge_tiles = triton.cdiv(num_edges, TILE_SIZE_K)
+            target = 4 * torch.cuda.get_device_properties(params.device).multi_processor_count
+            max_splits = max(1, min(B_NUM_TILES, triton.cdiv(target, max(1, n_edge_tiles * rows))))
+            B_SPLITS = max(1, min(max_splits, B_NUM_TILES))
+            B_TILES_PER_PROG = triton.cdiv(B_NUM_TILES, B_SPLITS)
+            B_SPLITS = triton.cdiv(B_NUM_TILES, B_TILES_PER_PROG)     # re-derive after rounding
+
+            _bs_triton_denom_kernel[(n_edge_tiles, rows, B_SPLITS)](
                 node_flows = node_flows, log_z = log_z, mparams = params,
                 denom_param_flows = denom_param_flows, ext = external_params, gate = gate,
                 nids = nids, cids = cids, pids = pids, pfids = pfids,
                 batch_size = batch, num_edges = num_edges,
                 TILE_SIZE_B = TILE_SIZE_B, B_NUM_TILES = B_NUM_TILES,
-                BLOCK_SIZE_M = block_size, NODE_CBS = node_cbs, GATE_CBS = gate_cbs,
-                gate_stride = gate.size(1), ext_base = ext_base, PF_ATOMIC = pf_atomic,
+                TILE_SIZE_K = TILE_SIZE_K, BLOCK_SIZE_M = block_size,
+                NODE_CBS = node_cbs, GATE_CBS = gate_cbs,
+                gate_stride = gate.size(1), ext_base = ext_base,
+                B_TILES_PER_PROG = B_TILES_PER_PROG,
+                USE_DOT = use_dot, DOT_IEEE = dot_ieee,
+                PF_ATOMIC = 1 if (pf_atomic or B_SPLITS > 1) else 0,
                 num_stages = 1)
 
     def _accumulate_denom_torch(self, layer, node_flows, params, external_params, denom_param_flows):
