@@ -43,6 +43,13 @@ def _buffer_kwarg() -> str:
     return _BUFFER_KWARG
 
 
+# `F-` in GATE space (two passes) rather than fused per edge tile. The contraction depends only on the
+# gate and `gate_cbs` edges share one, so the fused form repeats it `gate_cbs`-fold -- MEASURED as a
+# 16x re-read of `node_flows` / `log Z` at block_size 128 / 512 edges, 32 MB of the kernel's 38 MB.
+# Toggle for A/B; set `PYJUICE_BLOCKSCALE_DENOM_GATE_SPACE=0` to fall back to the fused kernel.
+_DENOM_GATE_SPACE = os.environ.get("PYJUICE_BLOCKSCALE_DENOM_GATE_SPACE", "1") != "0"
+
+
 class BlockScaleSumParams(ExternalSumParams):
     """
     A per-sample **multiplicative gate** on each parameter block, supplied externally at call time.
@@ -1850,6 +1857,19 @@ class BlockScaleSumParams(ExternalSumParams):
                 f"partition {pid} has {rows} node blocks, past the 65535 CUDA grid-y limit for the " \
                 f"denominator kernel. Use a larger block size."
 
+            # GATE-SPACE two-pass form. The contraction depends only on the GATE, and `GATE_CBS` edges
+            # share one, so doing it per edge tile repeats it `GATE_CBS`-fold. Splitting into
+            # "contract into W[node, gate]" and "scatter theta * W" reads `node_flows` / `log Z` once
+            # instead of once per edge tile. Only reachable when the gate divides the edge axis evenly,
+            # which is what makes `g(c) = c // gate_cbs` exact.
+            if _DENOM_GATE_SPACE and num_edges % gate_cbs == 0 and node_cbs % gate_cbs == 0:
+                self._accumulate_denom_gate_space(
+                    layer, node_flows, params, external_params, denom_param_flows,
+                    pid, nids, log_z, rows, cids, pids, pfids, gate, num_edges,
+                    block_size, batch, node_cbs, gate_cbs, ext_base,
+                    TILE_SIZE_B, B_NUM_TILES, pf_atomic)
+                continue
+
             # EDGE TILING is what makes this kernel affordable: `node_flows` and `log Z` are read once
             # per tile instead of once per edge. The tile is bounded by an accumulator budget --
             # `acc` is `[block_size, TILE_SIZE_K]` and lives in registers, so a 128-wide block gets a
@@ -1890,6 +1910,75 @@ class BlockScaleSumParams(ExternalSumParams):
                 USE_DOT = use_dot, DOT_IEEE = dot_ieee,
                 PF_ATOMIC = 1 if (pf_atomic or B_SPLITS > 1) else 0,
                 num_stages = 1)
+
+    def _accumulate_denom_gate_space(self, layer, node_flows, params, external_params,
+                                     denom_param_flows, pid, nids, log_z, rows, cids, pids, pfids,
+                                     gate, num_edges, block_size, batch, node_cbs, gate_cbs,
+                                     ext_base, TILE_SIZE_B, B_NUM_TILES, pf_atomic):
+        """
+        `F-` in two passes: contract into `W[node, gate]`, then scatter `theta * W` at the `pfid`s.
+
+        The contraction is over the GATE axis, which is `gate_cbs` times shorter than the edge axis,
+        so `node_flows` / `log Z` are read once per GATE tile rather than once per EDGE tile. See
+        `_bs_triton_denom_w_kernel` for the identity and the shift.
+
+        `W` is small -- `nodes x (num_edges / gate_cbs)` -- and is cached on the layer, keyed by shape,
+        so the allocation is not repaid every backward. It must be ZEROED whenever the batch reduction
+        is split, because the slices combine into it atomically.
+        """
+        import triton
+        from .kernels.blockscale_backward import (_bs_triton_denom_w_kernel,
+                                                  _bs_triton_denom_scatter_kernel)
+
+        n_gates = num_edges // gate_cbs
+        dev = params.device
+
+        cache = getattr(layer, "_bs_denom_w_cache", None)
+        if cache is None:
+            cache = layer._bs_denom_w_cache = dict()
+        key = (pid, rows, block_size, n_gates)
+        W = cache.get(key)
+        if W is None or W.device != dev:
+            W = torch.empty((rows * block_size, n_gates), device = dev, dtype = torch.float32)
+            cache[key] = W
+
+        # ---- pass 1: W[node, gate] ----
+        TILE_SIZE_G = min(triton.next_power_of_2(n_gates), 64)
+        # `acc` is `[TILE_SIZE_M, TILE_SIZE_G]` in registers; the gate axis is short, so the node tile
+        # can stay wide, which is what keeps `node_flows` / `log Z` contiguous per program.
+        TILE_SIZE_M = max(1, min(block_size, max(1, 4096 // max(1, TILE_SIZE_G))))
+        m_tiles = max(1, block_size // TILE_SIZE_M)
+        g_tiles = triton.cdiv(n_gates, TILE_SIZE_G)
+        w_use_dot = 1 if (TILE_SIZE_M >= 16 and TILE_SIZE_G >= 16 and TILE_SIZE_B >= 16) else 0
+        dot_ieee = 0 if os.environ.get("PYJUICE_BLOCKSCALE_DENOM_TF32", "0") == "1" else 1
+
+        target = 4 * torch.cuda.get_device_properties(dev).multi_processor_count
+        base_progs = max(1, rows * m_tiles * g_tiles)
+        B_SPLITS = max(1, min(B_NUM_TILES, triton.cdiv(target, base_progs)))
+        B_TILES_PER_PROG = triton.cdiv(B_NUM_TILES, B_SPLITS)
+        B_SPLITS = triton.cdiv(B_NUM_TILES, B_TILES_PER_PROG)
+        if B_SPLITS > 1:
+            W.zero_()
+
+        _bs_triton_denom_w_kernel[(rows * m_tiles, g_tiles, B_SPLITS)](
+            node_flows = node_flows, log_z = log_z, W = W, ext = external_params, gate = gate,
+            nids = nids, batch_size = batch, n_gates = n_gates,
+            TILE_SIZE_B = TILE_SIZE_B, TILE_SIZE_G = TILE_SIZE_G, TILE_SIZE_M = TILE_SIZE_M,
+            BLOCK_SIZE_M = block_size, NODE_CBS = node_cbs, GATE_CBS = gate_cbs,
+            gate_stride = gate.size(1), ext_base = ext_base,
+            B_TILES_PER_PROG = B_TILES_PER_PROG, USE_DOT = w_use_dot, DOT_IEEE = dot_ieee,
+            W_ATOMIC = 1 if B_SPLITS > 1 else 0, num_stages = 1)
+
+        # ---- pass 2: theta * W, scattered ----
+        S_TILE_K = max(1, min(triton.next_power_of_2(num_edges), 64))
+        S_TILE_M = max(1, min(block_size, max(1, 4096 // S_TILE_K)))
+        s_m_tiles = max(1, block_size // S_TILE_M)
+        _bs_triton_denom_scatter_kernel[(triton.cdiv(num_edges, S_TILE_K), rows * s_m_tiles)](
+            W = W, mparams = params, denom_param_flows = denom_param_flows,
+            cids = cids, pids = pids, pfids = pfids,
+            num_edges = num_edges, n_gates = n_gates,
+            TILE_SIZE_K = S_TILE_K, TILE_SIZE_M = S_TILE_M, BLOCK_SIZE_M = block_size,
+            GATE_CBS = gate_cbs, PF_ATOMIC = 1 if pf_atomic else 0, num_stages = 1)
 
     def _accumulate_denom_torch(self, layer, node_flows, params, external_params, denom_param_flows):
         """

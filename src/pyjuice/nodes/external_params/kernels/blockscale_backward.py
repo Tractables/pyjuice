@@ -555,3 +555,139 @@ def _bs_triton_denom_kernel(node_flows, log_z, mparams, denom_param_flows, ext, 
         tl.atomic_add(ptr, fminus, mask = wmask)
     else:
         tl.store(ptr, tl.load(ptr, mask = wmask, other = 0.0) + fminus, mask = wmask)
+
+
+@triton_jit
+def _bs_triton_denom_w_kernel(node_flows, log_z, W, ext, gate, nids,
+                              batch_size: tl.constexpr, n_gates: tl.constexpr,
+                              TILE_SIZE_B: tl.constexpr, TILE_SIZE_G: tl.constexpr,
+                              TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr,
+                              NODE_CBS: tl.constexpr, GATE_CBS: tl.constexpr,
+                              gate_stride: tl.constexpr, ext_base,
+                              B_TILES_PER_PROG: tl.constexpr, USE_DOT: tl.constexpr = 1,
+                              DOT_IEEE: tl.constexpr = 1, W_ATOMIC: tl.constexpr = 0):
+    """
+    Pass 1 of `F-`: the contraction, done in GATE space.
+
+        W[n, g] = sum_b u[n,b] * phi[g,b],       u[n,b] = exp(node_flows[n,b] - log Z[n,b])
+
+    `theta[n,c]` has no batch index, so it leaves the batch sum entirely and
+
+        F-[n,c] = sum_b f_b[n] * theta_b[n,c] = theta[n,c] * W[n, g(c)]
+
+    The contraction therefore depends on the GATE, of which there are only
+    `num_edges / GATE_CBS`. The previous kernel contracted per EDGE tile, so at `gate_cbs = 32` it
+    repeated the same contraction for all 32 edges sharing a gate: MEASURED at block_size 128 /
+    512 edges / batch 512, `node_flows` and `log Z` were re-read 16x, 32 MB of the kernel's 38 MB,
+    leaving it ~9x above its traffic floor. Here they are read once per GATE tile, and the gate axis
+    usually fits one tile (16 gates at that shape), so once in total.
+
+    `g(c) = c // GATE_CBS` exactly, because `NODE_CBS` is a multiple of `GATE_CBS`:
+    `(c // NODE_CBS) * (NODE_CBS // GATE_CBS) + (c % NODE_CBS) // GATE_CBS == c // GATE_CBS`.
+    Pass 2 uses that identity to find a gate without consulting the gate table at all.
+
+    SHIFT, exactly as the fused kernel needed it: `phi` cannot ride inside the exponent because the
+    `[M, B]` operand has no gate axis, and router logits are unbounded, so each batch column is
+    shifted by the largest `log phi` over the tile's gates. The shift cancels within each `W[n,g]`,
+    so tiles need not agree on it, and both factors stay bounded.
+    """
+    pid_y = tl.program_id(0)                       # (node block, node tile)
+    pid_g = tl.program_id(1)                       # which gate tile
+    pid_s = tl.program_id(2)                       # which slice of the batch reduction
+
+    M_TILES: tl.constexpr = BLOCK_SIZE_M // TILE_SIZE_M
+    nblock_id = pid_y // M_TILES
+    pid_m = pid_y % M_TILES
+    offs_node = pid_m * TILE_SIZE_M + tl.arange(0, TILE_SIZE_M)
+
+    offs_g = pid_g * TILE_SIZE_G + tl.arange(0, TILE_SIZE_G)
+    gmask = offs_g < n_gates
+    # The first edge carrying each gate is what locates it in the gate table.
+    c_rep = offs_g * GATE_CBS
+    gcol = c_rep // NODE_CBS
+    gbase = tl.load(gate + nblock_id * gate_stride + gcol,
+                    mask = gmask & (gcol < gate_stride), other = -1)
+    grow = gbase + ext_base + (c_rep % NODE_CBS) // GATE_CBS
+    ghas = (gbase >= 0) & gmask
+
+    off_nids = tl.load(nids + nblock_id)
+    offs_batch = pid_s * (B_TILES_PER_PROG * TILE_SIZE_B) + tl.arange(0, TILE_SIZE_B)
+    nf_ptr = node_flows + (off_nids + offs_node[:,None].to(tl.int64)) * batch_size + offs_batch[None,:]
+    lz_ptr = log_z + (nblock_id.to(tl.int64) * BLOCK_SIZE_M + offs_node[:,None]) * batch_size \
+             + offs_batch[None,:]
+
+    acc = tl.zeros([TILE_SIZE_M, TILE_SIZE_G], dtype = tl.float32)
+    for _ in range(B_TILES_PER_PROG):
+        mask_b = offs_batch < batch_size
+        nf = tl.load(nf_ptr, mask = mask_b[None,:], other = -float("inf"))      # [M, B]
+        lz = tl.load(lz_ptr, mask = mask_b[None,:], other = 0.0)                # [M, B]
+        lphi = tl.load(ext + grow[None,:] * batch_size + offs_batch[:,None],
+                       mask = mask_b[:,None] & ghas[None,:], other = -float("inf"))   # [B, G]
+
+        mx = tl.max(lphi, axis = 1)                                             # [B]
+        mx = tl.where(mx == -float("inf"), 0.0, mx)
+        u = tl.where(mask_b[None,:], tl.exp(nf - lz + mx[None,:]), 0.0)         # [M, B]
+        p = tl.where(mask_b[:,None] & ghas[None,:], tl.exp(lphi - mx[:,None]), 0.0)   # [B, G]
+
+        if USE_DOT:
+            if DOT_IEEE:
+                acc += tl.dot(u, p, input_precision = "ieee")
+            else:
+                acc += tl.dot(u, p)
+        else:
+            acc += tl.sum(u[:,:,None] * p[None,:,:], axis = 1)
+
+        offs_batch += TILE_SIZE_B
+        nf_ptr += TILE_SIZE_B
+        lz_ptr += TILE_SIZE_B
+
+    wptr = W + (nblock_id * BLOCK_SIZE_M + offs_node)[:,None] * n_gates + offs_g[None,:]
+    # Several batch slices hold PARTIAL sums for the same `W[n,g]`, so their combine must be atomic.
+    if W_ATOMIC:
+        tl.atomic_add(wptr, acc, mask = gmask[None,:])
+    else:
+        tl.store(wptr, acc, mask = gmask[None,:])
+
+
+@triton_jit
+def _bs_triton_denom_scatter_kernel(W, mparams, denom_param_flows, cids, pids, pfids,
+                                    num_edges: tl.constexpr, n_gates: tl.constexpr,
+                                    TILE_SIZE_K: tl.constexpr, TILE_SIZE_M: tl.constexpr,
+                                    BLOCK_SIZE_M: tl.constexpr, GATE_CBS: tl.constexpr,
+                                    PF_ATOMIC: tl.constexpr = 0):
+    """
+    Pass 2 of `F-`: `F-[n,c] = theta[n,c] * W[n, g(c)]`, scattered at the edge's `pfid`.
+
+    No batch axis at all -- it streams `theta`, gathers from the (tiny, cache-resident) `W`, and
+    writes `denom_param_flows`. `g(c) = c // GATE_CBS` (see `_bs_triton_denom_w_kernel`), so the gate
+    table is not consulted again and no gate arithmetic is repeated per edge.
+
+    A padded edge (`cids == 0`, the dummy child) has `pfids == 0`, a slot a REAL edge owns, so it is
+    masked out of the write rather than storing a zero into someone else's slot.
+    """
+    pid_k = tl.program_id(0)
+    pid_y = tl.program_id(1)
+
+    M_TILES: tl.constexpr = BLOCK_SIZE_M // TILE_SIZE_M
+    nblock_id = pid_y // M_TILES
+    pid_m = pid_y % M_TILES
+    offs_node = pid_m * TILE_SIZE_M + tl.arange(0, TILE_SIZE_M)
+    offs_edge = pid_k * TILE_SIZE_K + tl.arange(0, TILE_SIZE_K)
+    emask = offs_edge < num_edges
+
+    cid = tl.load(cids + nblock_id * num_edges + offs_edge, mask = emask, other = 0)
+    real = emask & (cid != 0)
+
+    gidx = offs_edge // GATE_CBS
+    w = tl.load(W + (nblock_id * BLOCK_SIZE_M + offs_node)[:,None] * n_gates + gidx[None,:],
+                mask = emask[None,:] & (gidx < n_gates)[None,:], other = 0.0)    # [M, K]
+
+    par = tl.load(pids + nblock_id * num_edges + offs_edge, mask = emask, other = 0)
+    theta = tl.load(mparams + par[None,:] + offs_node[:,None], mask = emask[None,:], other = 0.0)
+
+    pf = tl.load(pfids + nblock_id * num_edges + offs_edge, mask = emask, other = 0)
+    ptr = denom_param_flows + pf[None,:] + offs_node[:,None]
+    if PF_ATOMIC:
+        tl.atomic_add(ptr, theta * w, mask = real[None,:])
+    else:
+        tl.store(ptr, tl.load(ptr, mask = real[None,:], other = 0.0) + theta * w, mask = real[None,:])
