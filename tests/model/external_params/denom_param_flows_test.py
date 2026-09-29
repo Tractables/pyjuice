@@ -418,19 +418,133 @@ def test_one_gate_correction_matches_standard_em():
         (pc_on.params - pc_off.params).abs().max().item()
 
 
+def _anemone_step(pc, ns, x, phi, step_size, pseudocount = 0.0):
+    """One Anemone (`step_size_rescaling`) EM step under a live gate."""
+    pc(x, sum_external_params = {ns: phi})
+    pc.backward(x, sum_external_params = {ns: phi}, logspace_flows = True,
+                flows_memory = 0.0, allow_modify_flows = False)
+    pc.mini_batch_em(step_size = step_size, pseudocount = pseudocount,
+                     step_size_rescaling = True, use_cudagraph = False)
+
+
 @cuda_only
-def test_anemone_step_size_rescaling_with_correction_raises():
-    """`step_size_rescaling` (Anemone) with `apply_z_correction` must refuse: its top-down pass does not
-    yet adjust `denom_param_flows`, so the correction would divide by an inconsistent denominator."""
+@pytest.mark.parametrize("step_size", [0.2, 0.5, 1.0])
+def test_anemone_with_correction_runs_and_stays_normalized(step_size):
+    """`step_size_rescaling` (Anemone) with `apply_z_correction` used to REFUSE, because the top-down
+    pass fed `param_flows` a term that `denom_param_flows` never saw. It now feeds both, so the
+    conditional M-step sees a numerator and denominator built the same way."""
     dev = torch.device("cuda:0")
-    root, ns = _build(gated = True); pc = juice.compile(root, verbose = False).to(dev)
-    B = 32
+    root, ns = _build(gated = True)
+    pc = juice.compile(root, verbose = False).to(dev)
+    B = 64
+    torch.manual_seed(3)
     x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
     phi = _phi(ns, B, dev)
+
+    for _ in range(3):
+        _anemone_step(pc, ns, x, phi, step_size, pseudocount = 0.1)
+        assert torch.isfinite(pc.params).all()
+
+    # each node's parameters still sum to one over its children
+    ps, pe = ns._param_range
+    E, cbs, bs = ns.edge_ids.size(1), ns.ch_block_size, ns.block_size
+    theta = pc.params[ps:pe].reshape(E, cbs, bs)
+    nb = ns.edge_ids[0].to(device = theta.device, dtype = torch.long)
+    tot = torch.zeros(ns.num_node_blocks, bs, device = theta.device, dtype = theta.dtype)
+    tot.index_add_(0, nb, theta.sum(dim = 1))
+    assert (tot - 1.0).abs().max().item() < 1e-4, (tot - 1.0).abs().max().item()
+
+
+@cuda_only
+def test_anemone_one_gate_correction_matches_standard():
+    """With ONE gate the correction is an exact no-op, so Anemone WITH it must reproduce Anemone
+    without it.
+
+    This is a CONSISTENCY check, not a pin on the top-down term: with a single gate `F- = theta * S`,
+    so `theta * (F+ + T) / (theta * S)` normalizes to `normalize(F+ + T)` whether or not `F-` also
+    receives `T` -- `theta` cancels either way. VERIFIED by negative control: it passes even with the
+    `F-` top-down emission disabled. `test_anemone_top_down_term_reaches_both_flows` and
+    `test_anemone_small_step_size_barely_moves_parameters` are the two that actually fail without it."""
+    import warnings
+    dev = torch.device("cuda:0")
+    B = 64
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    out = {}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")                       # the "single gate is a no-op" warning
+        for corr in (False, True):
+            root, ns = _build_one_gate(corr = corr)
+            pc = juice.compile(root, verbose = False).to(dev)
+            phi = torch.randn(B, ns.num_nodes // 4, ns.num_ch_nodes // ns.ch_block_size,
+                              device = dev) * 1.5
+            for _ in range(3):
+                _anemone_step(pc, ns, x, phi, step_size = 0.5, pseudocount = 0.1)
+            out[corr] = pc.params.detach().clone()
+    assert torch.allclose(out[True], out[False], atol = 1e-4, rtol = 1e-4), \
+        (out[True] - out[False]).abs().max().item()
+
+
+@cuda_only
+def test_anemone_top_down_term_reaches_both_flows():
+    """The top-down pass must add the SAME increment to `denom_param_flows` as to `param_flows`.
+
+    Checked at the buffer level rather than through a trained model, because that is the property the
+    M-step actually depends on: `F+` and `F-` have to be built the same way or the ratio
+    `theta * F+ / F-` compares a flow that saw the top-down term against one that did not, and a node
+    with little data gets rescaled instead of left alone.
+    """
+    from pyjuice.model.backend.top_down_prob import eval_top_down_probs
+
+    dev = torch.device("cuda:0")
+    root, ns = _build(gated = True)
+    pc = juice.compile(root, verbose = False).to(dev)
+    B = 32
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    phi = _phi(ns, B, dev)
+
+    # one backward so the flow buffers exist and `_cum_flow` is set
     pc(x, sum_external_params = {ns: phi})
-    pc.backward(x, sum_external_params = {ns: phi}, logspace_flows = True, flows_memory = 1.0)
-    with pytest.raises(NotImplementedError, match = "step_size_rescaling"):
-        pc.mini_batch_em(step_size = 0.5, pseudocount = 0.1, step_size_rescaling = True)
+    pc.backward(x, sum_external_params = {ns: phi}, logspace_flows = True,
+                flows_memory = 0.0, allow_modify_flows = False)
+
+    pc.param_flows[:] = 0.0
+    pc.denom_param_flows[:] = 0.0
+    eval_top_down_probs(pc, update_pflow = True, scale = 0.25, use_cudagraph = False)
+
+    ps, pe = ns._param_flow_range
+    fp, fm = pc.param_flows[ps:pe], pc.denom_param_flows[ps:pe]
+    assert torch.count_nonzero(fp) > 0, "the top-down pass wrote nothing to `param_flows`"
+    assert torch.allclose(fp, fm, atol = 0.0, rtol = 0.0), \
+        f"top-down term differs between F+ and F-: max |diff| = {(fp - fm).abs().max().item()}"
+
+
+@cuda_only
+def test_anemone_small_step_size_barely_moves_parameters():
+    """The whole point of the top-down term is that it interpolates toward the CURRENT parameters, so
+    a small `step_size` must barely move them -- and it has to keep doing that with the correction on,
+    which is the property that would break if `F-` missed the term (the ratio would then be
+    `T_numerator / nothing` and a data-free node would be rescaled rather than left alone)."""
+    dev = torch.device("cuda:0")
+    root, ns = _build(gated = True)
+    pc = juice.compile(root, verbose = False).to(dev)
+    B = 64
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    phi = _phi(ns, B, dev)
+
+    moves = {}
+    for step_size in (0.01, 0.5):
+        root_i, ns_i = _build(gated = True)
+        pc_i = juice.compile(root_i, verbose = False).to(dev)
+        before = pc_i.params.detach().clone()
+        _anemone_step(pc_i, ns_i, x, _phi(ns_i, B, dev), step_size)
+        moves[step_size] = (pc_i.params - before).abs().max().item()
+
+    assert torch.isfinite(pc.params).all()
+    assert moves[0.01] < moves[0.5], moves
+    assert moves[0.01] < 0.05, moves
 
 
 @cuda_only

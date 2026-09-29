@@ -1416,16 +1416,11 @@ class TensorCircuit(nn.Module):
         assert not step_size_rescaling or self._cum_flow > 0.0, "Please perform a backward pass before calling `mini_batch_em`."
         assert 0.0 < step_size <= 1.0, "`step_size` should be between 0 and 1."
 
-        # `apply_z_correction`'s denominator `F-` is accumulated by the ORDINARY backward, but the
-        # step-size-rescaling (Anemone) path below adds a TOP-DOWN pass to `param_flows` that `F-` has no
-        # counterpart for yet -- so the correction would divide by an inconsistent denominator. Refuse
-        # rather than silently mis-correct; the top-down `F-` adjustment is future work.
-        if self._requests_denom_param_flows and step_size_rescaling:
-            raise NotImplementedError(
-                "`apply_z_correction` with `step_size_rescaling = True` (Anemone) is not yet supported: "
-                "the top-down probability pass must also adjust `denom_param_flows`."
-            )
-
+        # `apply_z_correction` + `step_size_rescaling` (Anemone) now agree: `init_param_flows` scales
+        # BOTH flows by `step_size / cum_flow`, and `eval_top_down_probs` adds the same
+        # `(1 - step_size) * P_td[n] * theta[n,c]` term to `denom_param_flows` as it does to
+        # `param_flows` (see the note there for why the identical term is the right one). The
+        # conditional M-step below therefore sees a numerator and denominator built the same way.
         with device_grad_controller(device = self.device, no_grad = True):
 
             # Apply step size rescaling according to the mini-batch EM objective derivation

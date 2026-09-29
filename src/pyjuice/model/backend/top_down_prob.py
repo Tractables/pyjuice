@@ -309,6 +309,19 @@ def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0, pc_is
     element_flows = pc._single_element_flows
     hyperparameters = pc._tdp_hyperparams
 
+    # `F-` (`apply_z_correction`) must receive the SAME top-down term as `F+`, so the Anemone
+    # rescaling leaves the CONDITIONAL M-step `theta <- normalize(theta * F+ / F-)` consistent.
+    #
+    # The top-down pass adds `(1 - step_size) * P_td[n] * theta[n,c]` -- the model's own expected
+    # counts with no data -- which is what makes the plain M-step interpolate toward `theta_old`.
+    # Adding the identical term to `F-` is forced by three properties, not chosen: a node that sees
+    # no data gets `ratio = T / T = 1` and is left alone; `step_size = 1` reduces to the corrected
+    # M-step exactly; and the stationary point `F+ == F-` (i.e. `d LL / d log theta == 0`) is
+    # preserved, so the rescaling cannot move where corrected EM converges.
+    #
+    # `None` for an ordinary PC, which is why nothing below changes for one.
+    denom_param_flows = getattr(pc, "denom_param_flows", None) if update_pflow else None
+
     node_flows[:] = 0.0
     element_flows[:] = 0.0
 
@@ -348,12 +361,18 @@ def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0, pc_is
                         sum_layer_td_pflow(layer, node_flows, node_mars, element_mars, pc.params, pc.param_flows, hyperparameters,
                                            pc_is_normalized = pc_is_normalized)
 
+                        if denom_param_flows is not None:
+                            sum_layer_td_pflow(layer, node_flows, node_mars, element_mars, pc.params,
+                                               denom_param_flows, hyperparameters,
+                                               pc_is_normalized = pc_is_normalized)
+
     if not hasattr(pc, "_tdp_cudagraph"):
         pc._tdp_cudagraph = dict()
 
     key = (update_pflow, pc_is_normalized, (None if node_mars is None else id(node_mars)), 
            (None if element_mars is None else id(element_mars)), id(node_flows), id(pc.params), 
-           id(pc.param_flows), id(hyperparameters))
+           id(pc.param_flows), id(hyperparameters),
+           (None if denom_param_flows is None else id(denom_param_flows)))
     if use_cudagraph and key in pc._tdp_cudagraph:
         g = pc._tdp_cudagraph[key]
         g.replay()
@@ -365,6 +384,8 @@ def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0, pc_is
         backup_element_flows = element_flows.detach().cpu().clone()
         if update_pflow:
             backup_param_flows = pc.param_flows.detach().cpu().clone()
+            backup_denom_param_flows = (None if denom_param_flows is None
+                                        else denom_param_flows.detach().cpu().clone())
             backup_input_param_flows = []
             for layer in pc.input_layer_group:
                 backup_input_param_flows.append(layer.param_flows.detach().cpu().clone())
@@ -388,6 +409,8 @@ def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0, pc_is
         element_flows.copy_(backup_element_flows, non_blocking = True)
         if update_pflow:
             pc.param_flows.copy_(backup_param_flows, non_blocking = True)
+            if denom_param_flows is not None:
+                denom_param_flows.copy_(backup_denom_param_flows, non_blocking = True)
             for layer, backup_pfs in zip(pc.input_layer_group, backup_input_param_flows):
                 layer.param_flows.copy_(backup_pfs, non_blocking = True)
         torch.cuda.synchronize()
