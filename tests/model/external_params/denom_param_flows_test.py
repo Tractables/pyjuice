@@ -119,8 +119,13 @@ def test_correction_pc_allocates_denom_matching_param_flows():
     pc.init_param_flows(flows_memory = 0.0)
     d, p = pc.denom_param_flows, pc.param_flows
     assert d is not None
+    assert d is not p and d.data_ptr() != p.data_ptr()          # a SEPARATE buffer, not an alias of F+
     assert d.shape == p.shape and d.dtype == p.dtype and d.device == p.device
     assert torch.count_nonzero(d) == 0
+    # independent storage: writing one must not disturb the other (an alias would fail this)
+    d[:] = 5.0
+    p[:] = 9.0
+    assert bool((pc.denom_param_flows == 5.0).all()) and bool((pc.param_flows == 9.0).all())
 
 
 def test_denom_rides_zero_and_scale_cadence():
@@ -213,6 +218,44 @@ def test_correction_on_threads_the_denom_buffer_to_post_backward_layer():
     assert torch.is_tensor(d)
     assert d is pc.denom_param_flows                                           # the exact allocated buffer
     assert d.shape == pc.param_flows.shape
+
+
+def _build_mixed(block_size = 4, n_blocks = 2, seed = 0):
+    """Two sum layers at the SAME depth and block size -- one plain, one gated (correction off) -- so
+    they land in ONE `LayerGroup`, and the group's backward hands the `denom_param_flows` kwarg to the
+    plain `SumLayer` too."""
+    torch.manual_seed(seed)
+    with juice.set_block_size(block_size):
+        i0 = inputs(0, num_node_blocks = n_blocks, dist = dists.Categorical(num_cats = NUM_CATS))
+        i1 = inputs(1, num_node_blocks = n_blocks, dist = dists.Categorical(num_cats = NUM_CATS))
+        m = multiply(i0, i1)
+        ns_plain = summate(m, num_node_blocks = n_blocks)
+        ns_gated = summate(m, num_node_blocks = n_blocks,
+                           external_params = BlockScaleSumParams(ch_block_size = 2))
+        root = summate(multiply(ns_plain), multiply(ns_gated), num_node_blocks = 1, block_size = 1)
+    root.init_parameters(perturbation = 2.0)
+    return root, ns_gated
+
+
+@cuda_only
+def test_mixed_gated_and_plain_sum_layers_in_one_group():
+    dev = torch.device("cuda:0")
+    root, ns_gated = _build_mixed()
+    pc = juice.compile(root, verbose = False).to(dev)
+
+    # exactly one sum group holds BOTH a plain SumLayer and an ExternalParamsSumLayer
+    sum_groups = [g for g in pc.inner_layer_groups if g.is_sum()]
+    mixed = [g for g in sum_groups
+             if any(isinstance(l, ExternalParamsSumLayer) for l in g.layers)
+             and any(not isinstance(l, ExternalParamsSumLayer) for l in g.layers)]
+    assert len(mixed) == 1, [[type(l).__name__ for l in g.layers] for g in sum_groups]
+
+    x = torch.randint(0, NUM_CATS, [16, 2], device = dev)
+    phi = _gate(ns_gated, 16, dev)
+    pc(x, sum_external_params = {ns_gated: phi})
+    # the plain SumLayer in the group also receives `denom_param_flows` (via **kwargs) -- must not choke
+    pc.backward(x, sum_external_params = {ns_gated: phi}, logspace_flows = True, flows_memory = 1.0)
+    assert pc.denom_param_flows is None                # correction off -> not requested
 
 
 if __name__ == "__main__":
