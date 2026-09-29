@@ -1792,7 +1792,22 @@ class SumLayer(Layer, nn.Module):
             TILE_SIZE_K = min(TILE_SIZE_K, 16)
             TILE_SIZE_B = min(TILE_SIZE_B, 16)
 
-        B_NUM_TILES = batch_size // TILE_SIZE_B
+        # CEIL, not floor. With floor the trailing `batch_size % TILE_SIZE_B` samples are never
+        # visited by the kernel's batch loop and their parameter flows are SILENTLY DROPPED -- at
+        # `block_size = 8` a batch of 96 lost 34% of the flow, and a batch of 33/40/48 lost ALL of it
+        # (`TILE_SIZE_B = 64` there, so floor gave zero tiles). Every batch size that is not a multiple
+        # of `TILE_SIZE_B` was affected, which includes the final partial batch of an ordinary epoch.
+        #
+        # The guard at the dispatch site only routed `batch < 16` to the sparse kernel, so the general
+        # case stayed live. It went unnoticed because every batch size in the consistency tests
+        # (1, 2, 3, 4, 6, 8, 16) is SMALLER than `TILE_SIZE_B`, which is one masked tile and correct.
+        #
+        # The extra tile is only safe because the kernels re-mask the batch each iteration AND read
+        # `node_mars` as `-inf` on a masked-out lane (see `sum_backward_param_block_sparse`): that
+        # forces `log_n_fdm = -inf`, hence `n_fdm_sub = 0` and `scaled_emars = 0`, an exact zero
+        # contribution. Reading `0.0` there instead makes a padded lane contribute `1 * exp(0)` to the
+        # dot -- measured as a 21x OVER-count, so the two changes have to travel together.
+        B_NUM_TILES = triton.cdiv(batch_size, TILE_SIZE_B)
 
         allow_modify_flows = 1 if allow_modify_flows else 0
 

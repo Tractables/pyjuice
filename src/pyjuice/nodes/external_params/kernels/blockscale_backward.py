@@ -292,7 +292,15 @@ def _bs_triton_par_kernel(node_flows, node_mars, element_mars, mparams, param_fl
                        mask = mask_batch[:,None] & ghas[None,:], other = 0.0)
         emars = tl.where(ghas[None,:], emars + lphi, -float("inf"))
 
-        nmars = tl.load(nmars_ptr, mask = mask_batch[None,:], other = 0.0)
+        # `-inf` on a masked-out BATCH lane, not 0.0 -- the same requirement as the ungated
+        # `sum_backward_param_block_sparse` kernels, and for the same reason. `B_NUM_TILES` is
+        # `cdiv(batch, TILE_SIZE_B)`, so the last tile is partial whenever the batch does not divide
+        # evenly; with `other = 0.0` such a lane gets `log_n_fdm = 0 - 0 = 0`, hence `n_fdm_sub = 1`
+        # and `scaled_emars = exp(0) = 1`, and contributes a spurious 1 to the dot for EVERY padded
+        # lane. MEASURED on this layer at `block_size = 8`, batch 96: the parameter flows came out
+        # 15.7x too large. `-inf` makes `log_n_fdm = -inf`, so the column's max is `-inf`,
+        # `n_fdm_sub = 0` and `scaled_emars = 0` -- an exact zero contribution.
+        nmars = tl.load(nmars_ptr, mask = mask_batch[None,:], other = -float("inf"))
         nflows = tl.load(nflows_ptr, mask = mask_batch[None,:], other = 0.0)
         log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), nflows - nmars)
 
