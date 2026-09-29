@@ -108,8 +108,7 @@ class BlockScaleSumParams(ExternalSumParams):
     :type ch_block_size: Optional[int]
 
     :param apply_z_correction: whether the parameter flows include the term coming from `Z`'s own
-                               dependence on `theta`. **Not implemented, and measured not to be worth
-                               implementing** -- see below.
+                               dependence on `theta`. Not yet implemented (raises if set).
     :type apply_z_correction: bool
 
     :param tie_external: share one gate tensor across every copy of a tied node, instead of one per copy.
@@ -151,28 +150,8 @@ class BlockScaleSumParams(ExternalSumParams):
         # `Z = sum_c phi * theta` depends on `theta`, unlike the low-rank parameterization where the
         # shared parameters' contribution to the normalizer was the constant 1. So the M-step pyjuice
         # performs -- normalize the flows per node -- solves a stationarity condition missing the term
-        # `sum_b f_b * theta_b`, and is therefore not exactly EM under a live gate.
-        #
-        # MEASURED, not assumed. A corrected M-step (exact normalization within each gate, plus an MM
-        # update on the gate masses) was prototyped and compared against the shipped one:
-        #
-        #   * it is REAL: +0.09 to +0.13 train LL, at every data-to-parameter ratio over a 100x sweep
-        #     (256 to 32768 samples against 16384 parameters). So the dropped term is not negligible.
-        #   * it does NOT generalize: held-out LL was worse in 6 of 6 runs, by 0.04 to 0.10. It is a
-        #     better optimizer of the training objective, and what that extra fit buys is the training
-        #     set's particular gate configuration -- gates are per-sample, so it does not transfer.
-        #   * for scale: the gate itself is worth +0.5 to +1.25 nats of held-out LL over an ungated
-        #     model, with the UNCORRECTED M-step. The correction is an order of magnitude smaller and
-        #     points the wrong way.
-        #
-        # Full-batch EM was also verified monotone under live gates (no decrease in 12 steps at gate
-        # scales 0, 1 and 3, with `pseudocount = 0` so that exact EM would be provably monotone).
-        #
-        # So the uncorrected M-step is the better default, not merely the convenient one, and this flag
-        # raises rather than silently doing nothing. The prototype is ~20 lines of PyTorch and the
-        # comparison is cheap to re-run if a setting arises where it might differ -- in particular a
-        # multi-timestep HMM, where gates are correlated ACROSS timesteps within a sample, which the
-        # single-layer test that produced these numbers does not exercise.
+        # `sum_b f_b * theta_b`, and is therefore not exactly EM under a live gate. Correcting for it is
+        # work in progress; `apply_z_correction = True` raises until it lands.
         self.apply_z_correction = bool(apply_z_correction)
 
         # Share one gate tensor across the copies of a tied node (see `storage_owner`).
@@ -1046,12 +1025,7 @@ class BlockScaleSumParams(ExternalSumParams):
 
         if self.apply_z_correction:
             raise NotImplementedError(
-                "`apply_z_correction = True` is not implemented, and was measured not to be worth "
-                "implementing: a prototype of the corrected M-step gains +0.09 to +0.13 TRAIN LL at "
-                "every data-to-parameter ratio, but was WORSE on held-out LL in 6 of 6 runs (by 0.04 "
-                "to 0.10) -- it fits the training set's per-sample gate configuration, which does not "
-                "transfer. For scale, the gate itself is worth +0.5 to +1.25 nats held-out with the "
-                "uncorrected M-step. See `BlockScaleSumParams.__init__` for the full measurement."
+                "`apply_z_correction = True` is not yet implemented."
             )
 
         external_params = kwargs.get(_buffer_kwarg(), None)
