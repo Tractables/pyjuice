@@ -672,9 +672,163 @@ def test_edge_trim_cuda_matches_sparse():
         sl.FORWARD_SUM_CUDA, sl.BACKWARD_ELE_FLOW_CUDA, sl.BACKWARD_PAR_FLOW_CUDA, sl._BLOCK_SPARSE_EDGE_TRIM = saved
 
 
+def _partial_tile_pc(device, block_size = 32, num_node_blocks = 4, num_cats = 8):
+    """A PC whose inner sum layer has `block_size = 32` / `num_edges = 128`, which makes the
+    block-sparse parameter-flow launcher pick `TILE_SIZE_B = 64`. Returns `(pc, ns, layer)`."""
+    from pyjuice.nodes import inputs, multiply, summate
+    import pyjuice.nodes.distributions as dists
+
+    torch.manual_seed(0)
+    with juice.set_block_size(block_size):
+        ins = [inputs(v, num_node_blocks = num_node_blocks,
+                      dist = dists.Categorical(num_cats = num_cats)) for v in range(4)]
+        s0 = summate(multiply(ins[0], ins[1]), num_node_blocks = num_node_blocks)
+        s1 = summate(multiply(ins[2], ins[3]), num_node_blocks = num_node_blocks)
+        ns = summate(multiply(s0, s1), num_node_blocks = num_node_blocks)
+        root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
+    root.init_parameters(perturbation = 2.0)
+    pc = juice.compile(root, verbose = False).to(device)
+
+    layer = None
+    for g in pc.inner_layer_groups:
+        for l in g.layers:
+            if hasattr(l, "partitioned_pfids") and getattr(l, "nodes", None) and ns in l.nodes:
+                layer = l
+    assert layer is not None
+    return pc, ns, layer
+
+
+def _node_flow_conservation(pc, ns, layer):
+    """`max_n | sum_c F+[n,c] / sum_b f_b[n] - 1 |`, summed over every partition.
+
+    A sum node's posterior flows split its own flow across its children exactly
+    (`sum_c P(c|n,b) == 1`), so this is 0 up to floating point -- and it needs no reference
+    implementation, which is what makes it a usable regression bar.
+
+    Reads `node_flows` as the true log flow, which requires `allow_modify_flows = False`
+    (otherwise the backward overwrites it in place with the `log f - log m` form).
+    """
+    bs = ns.block_size
+    ar = torch.arange(bs, device = pc.param_flows.device)
+    parts = range(len(layer.partitioned_pfids))
+    gmin = min(int(layer.partitioned_nids[p].min()) for p in parts)
+    n_nodes = ns.num_node_blocks * bs
+    got = torch.zeros(n_nodes, device = pc.param_flows.device, dtype = torch.float64)
+    want = torch.zeros_like(got)
+    for p in parts:
+        pfids, cids = layer.partitioned_pfids[p], layer.partitioned_cids[p]
+        nids = layer.partitioned_nids[p].long()
+        rows, E = pfids.shape
+        idx = (pfids[:, None, :] + ar[None, :, None]).long()
+        real = (cids != 0)[:, None, :].expand(rows, bs, E)
+        loc = (nids[:, None] + ar[None, :] - gmin).reshape(-1)
+        got.index_add_(0, loc, (pc.param_flows[idx].double() * real).sum(-1).reshape(-1))
+        gid = (nids[:, None] + ar[None, :]).reshape(-1)
+        want.index_add_(0, loc, pc.node_flows[gid].double().exp().sum(-1))
+    keep = want.abs() > 1e-8
+    assert bool(keep.any())
+    return ((got - want).abs()[keep] / want.abs()[keep]).max().item()
+
+
+def test_param_flows_include_the_final_partial_batch_tile():
+    """
+    Regression: the block-sparse parameter-flow backward silently DROPPED the trailing
+    `batch_size % TILE_SIZE_B` samples.
+
+    `SumLayer._backward_block_sparse_par_flows` contracted the batch into
+    `B_NUM_TILES = batch_size // TILE_SIZE_B` tiles -- floor, not ceil -- so the kernel's batch
+    loop never visited the final partial tile and those samples contributed no parameter flow at
+    all. MEASURED on this layer (`TILE_SIZE_B = 64`): batch 100 lost 36% of the flow, batch 300
+    lost 15%, batch 1000 lost 4%; on a `block_size = 8` layer batches of 33/40/48 lost ALL of it
+    (floor gave zero tiles). The dispatch site only special-cased `batch < 16`, so every larger
+    non-multiple stayed broken -- including the final partial batch of an ordinary epoch.
+
+    It survived because it is invisible wherever `batch_size % TILE_SIZE_B == 0`: `TILE_SIZE_B`
+    is a power of two, benchmark batch sizes are powers of two, and every batch size in the other
+    tests here (1, 2, 3, 4, 6, 8, 16) is SMALLER than `TILE_SIZE_B`, i.e. one fully masked tile,
+    which was always correct. So the batch sizes below are deliberately chosen to be multiples of
+    NO plausible tile size (100, 300, 1000 are not multiples of 16, 32 or 64).
+
+    Checked with the reference-free conservation identity rather than against another batch size,
+    so the test cannot be satisfied by two paths being wrong in the same way.
+    """
+    device = torch.device("cuda:0")
+    pc, ns, layer = _partial_tile_pc(device)
+
+    torch.manual_seed(3)
+    worst = {}
+    for batch_size in [64, 100, 128, 300, 512, 1000]:
+        x = torch.randint(0, 8, [batch_size, 4], device = device)
+        pc(x)
+        pc.backward(x, logspace_flows = True, flows_memory = 0.0, allow_modify_flows = False)
+        worst[batch_size] = _node_flow_conservation(pc, ns, layer)
+
+    # The fp32 accumulation floor on this layer is ~1e-3; the bug was 4%-36%, so 5e-3 separates
+    # them cleanly without being sensitive to the (TF32) dot's precision.
+    for batch_size, rel in worst.items():
+        assert rel < 5e-3, \
+            f"parameter flows do not conserve node flow at batch_size={batch_size} " \
+            f"(relmax={rel:.4f}); the final partial batch tile is being dropped. All: {worst}"
+
+
+def test_param_flows_invariant_to_batch_chunking():
+    """
+    The same pool of samples must give the same total parameter flows however it is CHUNKED --
+    the user-facing form of the partial-tile bug above, and the thing that silently biased EM
+    whenever the dataset size was not a multiple of the batch size.
+
+    Every chunk size divides the pool, so the accumulated totals are comparable. Chunk sizes
+    96/120/160/480 are NOT multiples of `TILE_SIZE_B = 64` and each dropped a different number of
+    trailing samples before the fix, so they disagreed with each other and with the aligned 64.
+
+    Compared with a tolerance, NOT bit-identity: the parameter-flow kernels accumulate through
+    `tl.atomic_add`, whose ordering varies between runs, so this layer is not bitwise reproducible
+    at larger batch (MEASURED: identical source, different sha1 at batch 256 and 512).
+    """
+    device = torch.device("cuda:0")
+    pc, ns, layer = _partial_tile_pc(device)
+
+    n_pool = 960
+    torch.manual_seed(5)
+    data = torch.randint(0, 8, [n_pool, 4], device = device)
+
+    def accumulate(chunk):
+        for i, s in enumerate(range(0, n_pool, chunk)):
+            x = data[s:s + chunk].contiguous()
+            pc(x)
+            pc.backward(x, logspace_flows = True, allow_modify_flows = False,
+                        flows_memory = 0.0 if i == 0 else 1.0)
+        torch.cuda.synchronize()
+        return pc.param_flows.clone()
+
+    ref = accumulate(64)                      # 960 = 15 * 64, an exact number of tiles
+    assert torch.isfinite(ref).all() and ref.abs().sum() > 0
+
+    # PER-ELEMENT relative error, over the entries that carry real mass. Normalising by the GLOBAL
+    # max instead (`(got-ref).max() / ref.max()`) hides the defect: the root layer's flows are ~1e3
+    # while this layer's are ~1, so dropping half of a sum layer's flow showed up as 9e-3 and only
+    # just cleared the bar. Elementwise, the same run reads ~0.4.
+    def relerr(got):
+        keep = ref.abs() > 1e-6 * ref.abs().max()
+        return float(((got - ref).abs()[keep] / ref.abs()[keep]).max())
+
+    # 120 and 240 are the discriminating chunk sizes: the large-batch launch tuning resets
+    # `TILE_SIZE_B` to 32 whenever `batch_size % 32 == 0`, which accidentally re-aligns 96/160/480/960,
+    # so those cannot see the bug. 120 % 64 = 56 and 240 % 64 = 48 keep a genuinely partial tile.
+    for chunk in [96, 120, 160, 240, 480, 960]:
+        assert n_pool % chunk == 0
+        got = accumulate(chunk)
+        assert torch.isfinite(got).all(), f"non-finite parameter flows at chunk={chunk}"
+        rel = relerr(got)
+        assert rel < 5e-3, \
+            f"total parameter flows depend on the batch chunking (chunk={chunk} vs 64, relmax={rel:.4f})"
+
+
 if __name__ == "__main__":
     test_hmm_batch_size_consistency()
     test_hmm_backward_small_batch()
+    test_param_flows_include_the_final_partial_batch_tile()
+    test_param_flows_invariant_to_batch_chunking()
     test_sum_layer_backward_mode_and_fp32()
     test_small_batch_block_sparse_fast_path()
     test_small_batch_forward_cuda_matches_triton()
