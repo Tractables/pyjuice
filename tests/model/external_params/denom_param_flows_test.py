@@ -380,6 +380,76 @@ def test_apply_z_correction_node_axis_gate_raises():
         pc.backward(x, sum_external_params = {ns: phi}, logspace_flows = True, flows_memory = 1.0)
 
 
+# ------------------------------------------------------ step 6: the conditional dual-flow M-step
+
+def _build_one_gate(corr, seed = 0):
+    """One node block, one child block -> ONE edge block -> one gate (an exact no-op gate)."""
+    torch.manual_seed(seed)
+    with juice.set_block_size(4):
+        i0 = inputs(0, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
+        i1 = inputs(1, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
+        ns = summate(multiply(i0, i1), num_node_blocks = 1,
+                     external_params = BlockScaleSumParams(apply_z_correction = corr))
+        root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
+    torch.manual_seed(seed)
+    root.init_parameters(perturbation = 2.0)
+    return root, ns
+
+
+@cuda_only
+def test_one_gate_correction_matches_standard_em():
+    """With one gate the correction is an exact no-op, so the dual M-step must equal pyjuice's standard
+    M-step (correction off) -- validated against the trusted standard update, not a re-derivation."""
+    import warnings
+    dev = torch.device("cuda:0")
+    B = 64
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")                              # the "single gate is a no-op" warning
+        r_off, ns_off = _build_one_gate(corr = False); pc_off = juice.compile(r_off, verbose = False).to(dev)
+        r_on, ns_on = _build_one_gate(corr = True); pc_on = juice.compile(r_on, verbose = False).to(dev)
+        phi = torch.randn(B, ns_off.num_nodes // 4, ns_off.num_ch_nodes // ns_off.ch_block_size,
+                          device = dev) * 1.5
+        for pc, ns in [(pc_off, ns_off), (pc_on, ns_on)]:
+            pc(x, sum_external_params = {ns: phi})
+            pc.backward(x, sum_external_params = {ns: phi}, logspace_flows = True, flows_memory = 0.0)
+            pc.mini_batch_em(step_size = 0.5, pseudocount = 0.1)
+    assert torch.allclose(pc_on.params, pc_off.params, atol = 1e-4, rtol = 1e-4), \
+        (pc_on.params - pc_off.params).abs().max().item()
+
+
+@cuda_only
+def test_anemone_step_size_rescaling_with_correction_raises():
+    """`step_size_rescaling` (Anemone) with `apply_z_correction` must refuse: its top-down pass does not
+    yet adjust `denom_param_flows`, so the correction would divide by an inconsistent denominator."""
+    dev = torch.device("cuda:0")
+    root, ns = _build(gated = True); pc = juice.compile(root, verbose = False).to(dev)
+    B = 32
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    phi = _phi(ns, B, dev)
+    pc(x, sum_external_params = {ns: phi})
+    pc.backward(x, sum_external_params = {ns: phi}, logspace_flows = True, flows_memory = 1.0)
+    with pytest.raises(NotImplementedError, match = "step_size_rescaling"):
+        pc.mini_batch_em(step_size = 0.5, pseudocount = 0.1, step_size_rescaling = True)
+
+
+@cuda_only
+def test_corrected_em_is_monotone_under_a_live_gate():
+    """Exact EM (pseudocount 0) with the correction on a live multi-gate must not decrease the train LL."""
+    dev = torch.device("cuda:0")
+    root, ns = _build(gated = True, seed = 1); pc = juice.compile(root, verbose = False).to(dev)
+    B = 64
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    phi = _phi(ns, B, dev)
+    lls = []
+    for _ in range(6):
+        lls.append(pc(x, sum_external_params = {ns: phi}).mean().item())
+        pc.backward(x, sum_external_params = {ns: phi}, logspace_flows = True, flows_memory = 0.0)
+        pc.mini_batch_em(step_size = 1.0, pseudocount = 0.0)
+    assert min(lls[i + 1] - lls[i] for i in range(len(lls) - 1)) > -1e-3, lls
+    assert torch.isfinite(pc.params).all()
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
