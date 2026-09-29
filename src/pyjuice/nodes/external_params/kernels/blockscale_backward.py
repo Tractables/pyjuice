@@ -418,3 +418,88 @@ def _bs_triton_phigrad_logz_kernel(node_flows, log_z, sigma, ext, gate, grad_ext
     tl.atomic_add(grad_ext + row[:,None] * batch_size + offs_batch[None,:],
                   -tl.exp(lphi - mx) * out,
                   mask = mask_g[:,None] & mask_batch[None,:] & (gbase >= 0)[:,None])
+
+
+@triton_jit
+def _bs_triton_denom_kernel(node_flows, log_z, mparams, denom_param_flows, ext, gate,
+                            nids, cids, pids, pfids,
+                            batch_size: tl.constexpr, num_edges: tl.constexpr,
+                            TILE_SIZE_B: tl.constexpr, B_NUM_TILES: tl.constexpr,
+                            BLOCK_SIZE_M: tl.constexpr, NODE_CBS: tl.constexpr,
+                            GATE_CBS: tl.constexpr, gate_stride: tl.constexpr, ext_base,
+                            PF_ATOMIC: tl.constexpr = 0):
+    """
+    The DENOMINATOR flow `F-` for `BlockScaleSumParams(apply_z_correction = True)`:
+
+        denom_param_flows[pfid(n,c)] += F-[n,c],
+        F-[n,c] = sum_b exp(node_flows[n,b] + log phi_b[g(c)] + log theta[n,c] - log Z_b[n])
+                = sum_b f_b[n] * theta_b[n,c].
+
+    `log theta` is kept INSIDE the exponent on purpose: `log phi + log theta - log Z = log theta_b <= 0`,
+    so the summand is `<= exp(node_flows) = f_b[n]` and cannot overflow, however large the router logit
+    `log phi` is (it cancels against `log Z`). The batch sum still carries an online max for safety.
+
+    Reduces over the BATCH axis to produce one `F-` per `(node, edge)`, scattered at the edge's `pfid`
+    exactly as the numerator kernel scatters `F+`. `element_mars` is not read -- `F-` is the node flow
+    spread over the effective PRIOR, not the posterior. Validated against the torch reference
+    `BlockScaleSumParams._accumulate_denom` and, end to end, by a finite-difference check on
+    `d LL / d log theta = F+ - F-`.
+
+    One program per `(edge, node block)`; all `BLOCK_SIZE_M` nodes of the block are handled together
+    (one node gate per block, enforced by `pre_backward_layer`).
+    """
+    pid_e = tl.program_id(0)                       # which edge
+    nblock_id = tl.program_id(1)                   # which node block
+
+    # A padded edge (`cids == 0`, the dummy child) has `pfids == 0`, a slot a REAL edge owns -- skip it
+    # entirely rather than store a zero into someone else's slot.
+    cid0 = tl.load(cids + nblock_id * num_edges + pid_e)
+    if cid0 != 0:
+        offs_node = tl.arange(0, BLOCK_SIZE_M)
+        off_nids = tl.load(nids + nblock_id)
+
+        # gate row of this edge, bounded by the table width (see `_bs_triton_par_kernel`)
+        gcol = pid_e // NODE_CBS
+        gbase = tl.load(gate + nblock_id * gate_stride + gcol, mask = gcol < gate_stride, other = -1)
+        grow = gbase + ext_base + (pid_e % NODE_CBS) // GATE_CBS
+        ghas = gbase >= 0
+
+        par = tl.load(pids + nblock_id * num_edges + pid_e)
+        theta = tl.load(mparams + par + offs_node)                          # [M]
+        logtheta = tl.where(theta > 0.0, tl.log(theta + 1e-38), -float("inf"))
+
+        offs_batch = tl.arange(0, TILE_SIZE_B)
+        # int64 offsets: `num_rows * block_size * batch_size` passes 2^31 on a large model at a large
+        # batch (the reason `shift_logz` casts too). `off_nids` is already int64 from the `nids` load.
+        nf_ptr = node_flows + (off_nids + offs_node[:,None].to(tl.int64)) * batch_size + offs_batch[None,:]
+        lz_ptr = log_z + (nblock_id.to(tl.int64) * BLOCK_SIZE_M + offs_node[:,None]) * batch_size \
+                 + offs_batch[None,:]
+
+        mx = tl.zeros([BLOCK_SIZE_M], dtype = tl.float32) - float("inf")
+        acc = tl.zeros([BLOCK_SIZE_M], dtype = tl.float32)
+        for _ in range(B_NUM_TILES):
+            mask_b = offs_batch < batch_size
+            nf = tl.load(nf_ptr, mask = mask_b[None,:], other = -float("inf"))     # [M, B]
+            lz = tl.load(lz_ptr, mask = mask_b[None,:], other = 0.0)               # [M, B]
+            lphi = tl.load(ext + grow * batch_size + offs_batch,
+                           mask = mask_b & ghas, other = -float("inf"))            # [B]
+            expo = nf - lz + lphi[None,:] + logtheta[:,None]                       # [M, B] = log(f_b theta_b)
+            expo = tl.where(mask_b[None,:] & ghas, expo, -float("inf"))
+            tmx = tl.max(expo, axis = 1)                                          # [M]
+            nmx = tl.maximum(mx, tmx)
+            rescale = tl.where(nmx == -float("inf"), 0.0, tl.exp(mx - nmx))
+            contrib = tl.where(nmx[:,None] == -float("inf"), 0.0, tl.exp(expo - nmx[:,None]))
+            acc = acc * rescale + tl.sum(contrib, axis = 1)
+            mx = nmx
+            offs_batch += TILE_SIZE_B
+            nf_ptr += TILE_SIZE_B
+            lz_ptr += TILE_SIZE_B
+
+        fminus = tl.where(mx == -float("inf"), 0.0, acc * tl.exp(mx))             # [M]
+
+        pf = tl.load(pfids + nblock_id * num_edges + pid_e)
+        ptr = denom_param_flows + pf + offs_node
+        if PF_ATOMIC:
+            tl.atomic_add(ptr, fminus)
+        else:
+            tl.store(ptr, tl.load(ptr) + fminus)

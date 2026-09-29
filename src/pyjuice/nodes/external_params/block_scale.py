@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import random
 import warnings
 from collections import OrderedDict
@@ -1030,9 +1031,15 @@ class BlockScaleSumParams(ExternalSumParams):
         gate_bs_ = self.gate_sizes(ns_tensors[0][0].ns)[0]
         n_ngates_ = self.gate_counts(ns_tensors[0][0].ns)[0]
 
-        if self.apply_z_correction:
+        # `apply_z_correction` accumulates the denominator flow `F-` (see `_accumulate_denom` /
+        # `post_backward_layer`); the M-step then normalizes `theta * F+ / F-`. `F-` sums over a whole
+        # node block, which a node-axis gate splits -- so, exactly like `d LL / d log phi`, it is served
+        # only at one node gate per block. Refused here, before `node_mars` is perturbed.
+        if self.apply_z_correction and n_ngates_ > 1:
             raise NotImplementedError(
-                "`apply_z_correction = True` is not yet implemented."
+                f"`apply_z_correction = True` is not implemented for a gate finer than `ns.block_size` "
+                f"along the NODE axis ({n_ngates_} node gates per block). Build the node at the gate's "
+                f"block size for a served equivalent -- the gate tensor has the same shape."
             )
 
         external_params = kwargs.get(_buffer_kwarg(), None)
@@ -1452,7 +1459,8 @@ class BlockScaleSumParams(ExternalSumParams):
         return None
 
     def post_backward_layer(self, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows,
-                            node_mars, element_mars, params, param_flows = None, **kwargs) -> None:
+                            node_mars, element_mars, params, param_flows = None,
+                            denom_param_flows = None, **kwargs) -> None:
         """Undo the normalizer shift and take the kernels back off the standard backward."""
         if len(ns_tensors) == 0:
             return None
@@ -1515,6 +1523,16 @@ class BlockScaleSumParams(ExternalSumParams):
                 _go(gt, bb, grad_ext)
 
             layer._bs_grad_ext = None
+
+        # The denominator flow `F-` for `apply_z_correction`. Present exactly when the PC allocated
+        # `denom_param_flows` (i.e. a layer requested it), so an ordinary gated model does nothing here.
+        # Uses the forward's cached `log Z`, so it is independent of the `node_mars` shift about to be
+        # undone below.
+        if denom_param_flows is not None:
+            external_params = kwargs.get(_buffer_kwarg(), None)
+            if external_params is None:
+                raise RuntimeError("`apply_z_correction` needs the external-parameter staging buffer.")
+            self._accumulate_denom(layer, node_flows, params, external_params, denom_param_flows)
 
         for nids, log_z, rows in state["shift_args"]:
             shift_logz(node_mars, nids, log_z, state["block_size"], -1.0)
@@ -1792,6 +1810,121 @@ class BlockScaleSumParams(ExternalSumParams):
             pick = by_size[0] if by_size else (1, 16)
         layer._bs_bw_gate_cache[key] = pick
         return pick
+
+    def _accumulate_denom(self, layer, node_flows, params, external_params, denom_param_flows):
+        """
+        Accumulate the denominator flow `F-` into `denom_param_flows` (see `requests_denom_param_flows`).
+
+        Dispatches to the Triton kernel `_bs_triton_denom_kernel`. Set `PYJUICE_BLOCKSCALE_DENOM_REF=1`
+        to force the torch reference `_accumulate_denom_torch` instead -- what the kernel is validated
+        against, and a no-Triton escape hatch.
+        """
+        if os.environ.get("PYJUICE_BLOCKSCALE_DENOM_REF", "0") == "1":
+            return self._accumulate_denom_torch(layer, node_flows, params, external_params,
+                                                denom_param_flows)
+
+        import triton
+        from .kernels.blockscale_backward import _bs_triton_denom_kernel
+
+        state = layer._bs_bw_state
+        block_size, batch = state["block_size"], state["batch_size"]
+        node_cbs, gate_cbs, ext_base = state["node_cbs"], state["gate_cbs"], state["ext_base"]
+
+        TILE_SIZE_B = min(triton.next_power_of_2(batch), 64)
+        B_NUM_TILES = triton.cdiv(batch, TILE_SIZE_B)
+
+        for pid, (nids, log_z, rows) in enumerate(state["shift_args"]):
+            cids = layer.partitioned_cids[pid]
+            pids = layer.partitioned_pids[pid]
+            pfids = layer.partitioned_pfids[pid]
+            gate = layer.ext_slots[0][pid]
+            num_edges = cids.size(1)
+
+            # Same write hazards the numerator faces: padded edges (`cids == 0`) are skipped IN-KERNEL,
+            # and an atomic is used only when REAL edges still collide (parameter tying). `_par_write_flags`
+            # decides the latter on the written slots alone -- the padded flag is not needed here.
+            pf_atomic = self._par_write_flags(layer, cids, pfids)[1]
+
+            # `rows` is the CUDA grid-y, capped at 65535 (as in the phigrad launch above).
+            assert rows <= 65535, \
+                f"partition {pid} has {rows} node blocks, past the 65535 CUDA grid-y limit for the " \
+                f"denominator kernel. Use a larger block size."
+
+            _bs_triton_denom_kernel[(num_edges, rows)](
+                node_flows = node_flows, log_z = log_z, mparams = params,
+                denom_param_flows = denom_param_flows, ext = external_params, gate = gate,
+                nids = nids, cids = cids, pids = pids, pfids = pfids,
+                batch_size = batch, num_edges = num_edges,
+                TILE_SIZE_B = TILE_SIZE_B, B_NUM_TILES = B_NUM_TILES,
+                BLOCK_SIZE_M = block_size, NODE_CBS = node_cbs, GATE_CBS = gate_cbs,
+                gate_stride = gate.size(1), ext_base = ext_base, PF_ATOMIC = pf_atomic,
+                num_stages = 1)
+
+    def _accumulate_denom_torch(self, layer, node_flows, params, external_params, denom_param_flows):
+        """
+        The denominator flow `F-` for `apply_z_correction`:
+
+        .. code-block:: text
+
+            denom_param_flows[pfid(n,c)] += sum_b f_b[n] * theta_b[n,c],
+            theta_b[n,c] = phi_b[g(c)] * theta[n,c] / Z_b[n]
+
+        so each summand is `exp(node_flows[n,b] + log phi_b[g] + log theta[n,c] - log Z_b[n])`, which is
+        `f_b[n] * theta_b[n,c] <= f_b[n]` -- the log-space form is stabilized by its per-`(n,c)` max over
+        the batch. `f_b[n]` is the node flow, `Z_b[n]` the forward's cached `log Z`; neither needs
+        `element_mars`. The M-step then forms `theta * F+ / F-` (see `requests_denom_param_flows`).
+
+        REFERENCE implementation (torch), used to validate `_bs_triton_denom_kernel` and as its
+        no-Triton fallback. It materializes a `[rows, block_size, edges, batch]` tile per partition, so
+        the kernel replaces it on the hot path.
+
+        Only one node gate per block is served (`gate_counts(ns)[0] == 1`), which `pre_backward_layer`
+        has already enforced when `apply_z_correction` is on.
+        """
+        state = layer._bs_bw_state
+        block_size, batch = state["block_size"], state["batch_size"]
+        node_cbs, gate_cbs, ext_base = state["node_cbs"], state["gate_cbs"], state["ext_base"]
+
+        dev = params.device
+        ar_m = torch.arange(block_size, device = dev, dtype = torch.long)
+        ar_b = torch.arange(batch, device = dev, dtype = torch.long)
+
+        for pid, (nids, log_z, rows) in enumerate(state["shift_args"]):
+            cids = layer.partitioned_cids[pid].to(torch.long)              # [rows, E]
+            pids = layer.partitioned_pids[pid].to(torch.long)
+            pfids = layer.partitioned_pfids[pid].to(torch.long)
+            gate = layer.ext_slots[0][pid].to(torch.long)                  # [rows, max_n_eblks], -1 padded
+            E = cids.size(1)
+
+            # log f and log Z, laid out [rows, block_size, batch]
+            gid = nids.to(torch.long)[:, None] + ar_m[None, :]             # global node ids
+            nf = node_flows[gid.reshape(-1)].reshape(rows, block_size, batch)
+            lz = log_z.reshape(rows, block_size, batch)
+
+            # log phi of each edge, per (row, edge, batch); -inf on a padded edge block
+            e = torch.arange(E, device = dev, dtype = torch.long)
+            gbase = gate[:, e // node_cbs]                                 # [rows, E], per-batch base
+            ghas = gbase >= 0
+            grow = (gbase + ext_base + ((e % node_cbs) // gate_cbs)[None, :]).clamp(min = 0)
+            phi = external_params[grow[:, :, None] * batch + ar_b[None, None, :]]   # [rows, E, batch]
+            phi = torch.where(ghas[:, :, None], phi, torch.full_like(phi, -float("inf")))
+
+            theta = params[pids[:, None, :] + ar_m[None, :, None]]         # [rows, block_size, E]
+            logtheta = torch.where(theta > 0, theta.clamp_min(1e-38).log(),
+                                   torch.full_like(theta, -float("inf")))
+
+            # log(f_b[n] * theta_b[n,c]) per (row, m, edge, batch); stabilized over the batch axis
+            expo = (nf[:, :, None, :] + phi[:, None, :, :]
+                    + logtheta[:, :, :, None] - lz[:, :, None, :])
+            mx = expo.amax(dim = -1, keepdim = True)
+            mx = torch.where(torch.isinf(mx), torch.zeros_like(mx), mx)
+            fminus = (expo - mx).exp().sum(dim = -1) * mx.squeeze(-1).exp()   # [rows, block_size, E]
+
+            # accumulate at pfid(n,c), skipping padded edges (`cids == 0`, whose slot 0 a real edge owns)
+            real = (cids != 0)
+            idx = pfids[:, None, :] + ar_m[None, :, None]                  # [rows, block_size, E]
+            keep = real[:, None, :].expand(rows, block_size, E)
+            denom_param_flows.index_add_(0, idx[keep].reshape(-1), fminus[keep].reshape(-1))
 
     def _sigma(self, layer, params, pid, block_size, gate_cbs):
         """
