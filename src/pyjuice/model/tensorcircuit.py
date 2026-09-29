@@ -641,9 +641,10 @@ class TensorCircuit(nn.Module):
                         )
 
                         # Backward sum layer
-                        layer_group.backward(self.node_flows, self.element_flows, self.node_mars, self.element_mars, self.params, 
+                        layer_group.backward(self.node_flows, self.element_flows, self.node_mars, self.element_mars, self.params,
                                              param_flows = self.param_flows if compute_param_flows else None,
-                                             allow_modify_flows = allow_modify_flows, 
+                                             denom_param_flows = self.denom_param_flows if compute_param_flows else None,
+                                             allow_modify_flows = allow_modify_flows,
                                              propagation_alg = propagation_alg if isinstance(propagation_alg, str) else propagation_alg[layer_id], 
                                              logspace_flows = logspace_flows, negate_pflows = negate_pflows, force_use_fp32 = force_use_fp32, 
                                              pflow_temperature = pflow_temperature, temper_eflow = temper_eflow, **kwargs)

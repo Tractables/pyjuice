@@ -267,14 +267,17 @@ class ExternalSumParams():
                               element_mars, params, **kwargs)
 
     def post_backward_layer(self, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows,
-                            node_mars, element_mars, params, param_flows = None, **kwargs) -> None:
+                            node_mars, element_mars, params, param_flows = None,
+                            denom_param_flows = None, **kwargs) -> None:
         """Layer-level counterpart of :func:`post_backward`."""
         for (ns_info, tensors), grad_tensors in zip(ns_tensors, ns_grad_tensors):
             self.post_backward(layer, ns_info, tensors, grad_tensors, node_flows, element_flows,
-                               node_mars, element_mars, params, param_flows = param_flows, **kwargs)
+                               node_mars, element_mars, params, param_flows = param_flows,
+                               denom_param_flows = denom_param_flows, **kwargs)
 
     def post_backward(self, layer, ns_info, tensors, grad_tensors, node_flows, element_flows,
-                      node_mars, element_mars, params, param_flows = None, **kwargs) -> None:
+                      node_mars, element_mars, params, param_flows = None,
+                      denom_param_flows = None, **kwargs) -> None:
         """
         Add the external contribution to the child flows, write the per-sample gradients of the
         external tensors, and undo whatever :func:`pre_backward` changed.
@@ -287,6 +290,15 @@ class ExternalSumParams():
                              any layer runs, so several nodes may share one buffer and have their
                              gradients summed into it.
         :type grad_tensors: Optional[Tuple[torch.Tensor,...]]
+
+        :param denom_param_flows: the PC's denominator param-flow buffer `F-`, shaped like
+                             `param_flows` and addressed by the same `pfids`, or `None` when no layer
+                             requested it (see :attr:`requests_denom_param_flows`). A parameterization
+                             that requested it accumulates its expected/normalizer flow into
+                             `denom_param_flows[pfid]` here, exactly as the standard backward
+                             accumulates `F+` into `param_flows[pfid]`; the M-step then reads the two
+                             together as `theta <- normalize(theta * F+ / F-)`.
+        :type denom_param_flows: Optional[torch.Tensor]
         """
         raise NotImplementedError()
 

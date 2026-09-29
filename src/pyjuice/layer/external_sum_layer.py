@@ -564,6 +564,7 @@ class ExternalParamsSumLayer(SumLayer):
     def backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor,
                  node_mars: torch.Tensor, element_mars: torch.Tensor,
                  params: torch.Tensor, param_flows: Optional[torch.Tensor] = None,
+                 denom_param_flows: Optional[torch.Tensor] = None,
                  propagation_alg: str = "LL", **kwargs) -> None:
         """
         Backward pass. The descriptor is given a chance to prepare the buffers so that the *standard*
@@ -608,7 +609,8 @@ class ExternalParamsSumLayer(SumLayer):
             self.external_params.post_backward_layer(
                 self, ns_tensors, ns_grad_tensors,
                 node_flows, element_flows, node_mars, element_mars, params,
-                param_flows = param_flows, propagation_alg = propagation_alg, **kwargs
+                param_flows = param_flows, denom_param_flows = denom_param_flows,
+                propagation_alg = propagation_alg, **kwargs
             )
         finally:
             # A parameterization may redirect the standard backward's CUDA kernels at its own for the
