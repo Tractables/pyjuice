@@ -19,6 +19,9 @@ buffer to reach `post_backward_layer` isolates the PASS-THROUGH by stubbing the 
 backward hooks; the F- math itself is validated separately once it lands.
 """
 
+import math
+import os
+
 import pytest
 import torch
 
@@ -190,9 +193,9 @@ def test_gated_off_threads_none_to_post_backward_layer():
 
 @cuda_only
 def test_correction_on_threads_the_denom_buffer_to_post_backward_layer():
-    """Step-4 pass-through in ISOLATION. The F- math is not implemented (the descriptor's backward
-    raises for `apply_z_correction`), so stub its two backward hooks and check only that the allocated
-    `denom_param_flows` buffer -- the exact PC object -- reaches `post_backward_layer`."""
+    """Step-4 pass-through in ISOLATION: stub the descriptor's two backward hooks so the check depends
+    only on the plumbing (not on the F- math, which its own tests below cover) -- the allocated
+    `denom_param_flows` buffer, the exact PC object, must reach `post_backward_layer`."""
     dev = torch.device("cuda:0")
     root, ns = _build(gated = True)
     pc = juice.compile(root, verbose = False).to(dev)
@@ -256,6 +259,125 @@ def test_mixed_gated_and_plain_sum_layers_in_one_group():
     # the plain SumLayer in the group also receives `denom_param_flows` (via **kwargs) -- must not choke
     pc.backward(x, sum_external_params = {ns_gated: phi}, logspace_flows = True, flows_memory = 1.0)
     assert pc.denom_param_flows is None                # correction off -> not requested
+
+
+# ------------------------------------------------------ step 5: the F- accumulation (apply_z_correction)
+
+def _phi(ns, batch, dev, scale = 1.5):
+    return torch.randn(ns.external_params.tensor_shapes(ns, batch)[0], device = dev) * scale
+
+
+def _corr_flows(pc, ns, x, phi, ref = False):
+    """One gated fwd+bwd with `apply_z_correction`; returns (F+, F-) fresh for this batch.
+    `ref=True` forces the torch reference `_accumulate_denom_torch` via the env switch."""
+    os.environ["PYJUICE_BLOCKSCALE_DENOM_REF"] = "1" if ref else "0"
+    try:
+        pc(x, sum_external_params = {ns: phi})
+        pc.backward(x, sum_external_params = {ns: phi}, logspace_flows = True, flows_memory = 0.0)
+    finally:
+        os.environ.pop("PYJUICE_BLOCKSCALE_DENOM_REF", None)
+    return pc.param_flows.clone(), pc.denom_param_flows.clone()
+
+
+@cuda_only
+def test_denom_accumulation_matches_finite_differences():
+    """The decisive check: `F+ - F-` equals the exact gradient d(sum_b log P(x_b)) / d log theta[n,c],
+    validated numerically. This is what makes `F-` the right denominator for the conditional M-step
+    `theta <- normalize(theta * F+ / F-)` -- and it shares no indexing with the kernel."""
+    dev = torch.device("cuda:0")
+    root, ns = _build(gated = True)                                   # apply_z_correction = True
+    pc = juice.compile(root, verbose = False).to(dev)
+    lay = pc.external_params_nodes[ns]
+    B = 32
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    phi = _phi(ns, B, dev)
+    Fp, Fm = _corr_flows(pc, ns, x, phi)
+
+    pids, pfids, cids = lay.partitioned_pids[0], lay.partitioned_pfids[0], lay.partitioned_cids[0]
+    rows, E = pids.shape
+
+    def ll():
+        with torch.no_grad():                                         # perturb theta, no autograd graph
+            return pc(x, sum_external_params = {ns: phi}).double().sum().item()
+
+    eps, worst, n = 1e-2, 0.0, 0
+    for r in range(min(rows, 2)):
+        for e in range(min(E, 4)):
+            if int(cids[r, e]) == 0:
+                continue
+            for m in (0, 2):
+                pid, pf = int(pids[r, e]) + m, int(pfids[r, e]) + m
+                g_an = float(Fp[pf] - Fm[pf])
+                with torch.no_grad():
+                    o = float(pc.params[pid]); pc.params[pid] = o * math.exp(eps); lp = ll()
+                    pc.params[pid] = o * math.exp(-eps); lm = ll(); pc.params[pid] = o
+                g_fd = (lp - lm) / (2 * eps)
+                worst = max(worst, abs(g_fd - g_an) / max(abs(g_fd), abs(g_an), 1e-6))
+                n += 1
+    assert n > 0
+    assert worst < 5e-2, worst
+
+
+@cuda_only
+def test_denom_kernel_matches_torch_reference():
+    """The shipped Triton kernel must agree with the finite-difference-validated torch reference."""
+    dev = torch.device("cuda:0")
+    root, ns = _build(gated = True)
+    pc = juice.compile(root, verbose = False).to(dev)
+    B = 32
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    phi = _phi(ns, B, dev)
+
+    Fp_k, Fm_k = _corr_flows(pc, ns, x, phi, ref = False)             # Triton kernel
+    Fp_r, Fm_r = _corr_flows(pc, ns, x, phi, ref = True)             # torch reference
+    assert torch.allclose(Fp_k, Fp_r)                                # numerator unaffected by denom path
+    assert torch.count_nonzero(Fm_k) > 0
+    rel = ((Fm_k - Fm_r).abs() / (Fm_r.abs() + 1e-6)).max().item()
+    assert rel < 1e-4, rel
+
+
+@cuda_only
+def test_denom_conservation_per_node():
+    """`sum_c F+ == sum_c F-` for every node (both == sum_b f_b): the correction only REALLOCATES a
+    node's mass across its gates, so a one-gate node is an exact no-op."""
+    dev = torch.device("cuda:0")
+    root, ns = _build(gated = True)
+    pc = juice.compile(root, verbose = False).to(dev)
+    lay = pc.external_params_nodes[ns]
+    B = 32
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    phi = _phi(ns, B, dev)
+    Fp, Fm = _corr_flows(pc, ns, x, phi)
+    pids, pfids, cids = lay.partitioned_pids[0], lay.partitioned_pfids[0], lay.partitioned_cids[0]
+    rows, E = pids.shape
+    worst = 0.0
+    for r in range(rows):
+        for m in range(4):
+            sp = sum(float(Fp[int(pfids[r, e]) + m]) for e in range(E) if int(cids[r, e]) != 0)
+            sm = sum(float(Fm[int(pfids[r, e]) + m]) for e in range(E) if int(cids[r, e]) != 0)
+            worst = max(worst, abs(sp - sm))
+    assert worst < 1e-3, worst
+
+
+@cuda_only
+def test_apply_z_correction_node_axis_gate_raises():
+    """`F-` reweights gate MASSES per node block, so a gate finer than the block along the NODE axis is
+    refused (as `d LL / d log phi` is) -- and BEFORE `node_mars` is perturbed."""
+    dev = torch.device("cuda:0")
+    with juice.set_block_size(8):
+        i0 = inputs(0, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
+        i1 = inputs(1, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
+        ns = summate(multiply(i0, i1), num_node_blocks = 1,
+                     external_params = BlockScaleSumParams(block_size = 4, apply_z_correction = True))
+        root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
+    root.init_parameters(perturbation = 2.0)
+    pc = juice.compile(root, verbose = False).to(dev)
+    B = 16
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    phi = torch.zeros(ns.external_params.tensor_shapes(ns, B)[0], device = dev)
+    pc(x, sum_external_params = {ns: phi})
+    with pytest.raises(NotImplementedError, match = "NODE axis"):
+        pc.backward(x, sum_external_params = {ns: phi}, logspace_flows = True, flows_memory = 1.0)
 
 
 if __name__ == "__main__":
