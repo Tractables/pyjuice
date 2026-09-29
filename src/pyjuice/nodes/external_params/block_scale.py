@@ -1926,6 +1926,48 @@ class BlockScaleSumParams(ExternalSumParams):
             keep = real[:, None, :].expand(rows, block_size, E)
             denom_param_flows.index_add_(0, idx[keep].reshape(-1), fminus[keep].reshape(-1))
 
+    def compute_em_correction(self, ns, params, param_flows, denom_param_flows, step_size,
+                              pseudocount, keep_zero_params):
+        """
+        The conditional dual-flow M-step for one gated `ns`: `theta <- normalize(theta * F+ / F-)`,
+        in the multiplicative MAP form that mirrors `SoftEvidenceCategorical`'s dual EM. Returns the new
+        parameters for `ns._param_range`; the PC writes them back over the standard update.
+
+        Torch, not a kernel: it runs ONCE PER EM STEP and has no batch axis (F+, F-, theta are all
+        param-sized), so it is a sliver of a training step. Node-level layout `[E, ch_block_size,
+        block_size]` (edge block, child-in-block, node-in-block), the same `params` uses.
+        """
+        ps, pe = ns._param_range
+        pfs, pfe = ns._param_flow_range
+        bs, cbs = ns.block_size, ns.ch_block_size
+        E = ns.edge_ids.size(1)
+
+        theta = params[ps:pe].reshape(E, cbs, bs)
+        Fp = param_flows[pfs:pfe].reshape(E, cbs, bs)
+        Fm = denom_param_flows[pfs:pfe].reshape(E, cbs, bs)
+
+        # A node's children are all edge blocks of its node block, times `ch_block_size`; the
+        # per-node normalizer sums over exactly those. `K` (children per node) sets the pseudocount split.
+        nb = ns.edge_ids[0].to(device = theta.device, dtype = torch.long)   # node block of each edge block
+        eblk_per_nb = torch.bincount(nb, minlength = ns.num_node_blocks)
+        K = (eblk_per_nb[nb].to(theta.dtype) * cbs)[:, None, None]          # [E,1,1]
+
+        # ratio = (F+ + pc/K) / (F- + pc*theta) -- the MAP form (denominator `pc*theta`, not `pc`), so a
+        # never-observed child floors instead of underflowing (as in the SoftEvidence dual EM).
+        ratio = (Fp + pseudocount / K) / (Fm + pseudocount * theta).clamp_min(1e-38)
+        flow = theta * ratio                                                # [E, cbs, bs]
+
+        # cum[node block, m] = (1-s) + s * sum over the node's children of theta*ratio
+        cum = torch.zeros(ns.num_node_blocks, bs, device = theta.device, dtype = theta.dtype)
+        cum.index_add_(0, nb, flow.sum(dim = 1))                            # sum over cbs, scatter over nb
+        cum = ((1.0 - step_size) + step_size * cum).clamp_min(1e-38)
+
+        new_theta = theta * ((1.0 - step_size) + step_size * ratio) / cum[nb][:, None, :]
+        new_theta = new_theta.clamp_min(1e-30)                              # momentum-underflow guard
+        if keep_zero_params:
+            new_theta = torch.where(theta < 1e-12, torch.zeros_like(new_theta), new_theta)
+        return new_theta.reshape(-1)
+
     def _sigma(self, layer, params, pid, block_size, gate_cbs):
         """
         `sigma[node, flat gate] = sum_{c in that gate} theta[node, c]`, cached until `params` changes.

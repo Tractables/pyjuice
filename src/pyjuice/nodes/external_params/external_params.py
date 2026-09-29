@@ -302,6 +302,24 @@ class ExternalSumParams():
         """
         raise NotImplementedError()
 
+    def compute_em_correction(self, ns, params, param_flows, denom_param_flows, step_size,
+                              pseudocount, keep_zero_params):
+        """
+        The conditional dual-flow EM update for `ns`, returning the new parameters for
+        `ns._param_range` as a flat tensor -- or `None` (the default) to leave the standard
+        `normalize(F+)` update in place.
+
+        Called once per EM step, ONLY when this parameterization :attr:`requests_denom_param_flows`,
+        after both `param_flows` (F+) and `denom_param_flows` (F-) have been accumulated over the
+        mini-batch AND tied-fused. `params` still holds the PRE-update parameters. The PC runs the
+        standard M-step for every node and then overwrites this `ns`'s range with what is returned
+        here, so the returned tensor replaces -- not adds to -- the standard update.
+
+        The generic conditional M-step is `theta <- normalize(theta * F+ / F-)`; with one gate
+        `F- = theta * sum(F+)`, so it collapses to `normalize(F+)` and the correction is an exact no-op.
+        """
+        return None
+
     def sample_layer(self, layer, ns_tensors, node_mars, element_mars, params, node_samples,
                      element_samples, rows, erows, seed_ptr, conditional: bool = False,
                      **kwargs) -> None:

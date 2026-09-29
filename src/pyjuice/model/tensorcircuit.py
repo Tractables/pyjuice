@@ -1385,6 +1385,17 @@ class TensorCircuit(nn.Module):
     def forward_general_ll(self, *args, alpha: float = 1.0, **kwargs):
         self.forward(*args, propagation_alg = "GeneralLL", **kwargs)
 
+    def _denom_correction_nss(self):
+        """The non-tied sum nodes whose parameterization requests the denominator flow `F-` -- the ones
+        whose EM update is the conditional `theta <- normalize(theta * F+ / F-)`. Structural, so cached."""
+        cached = getattr(self, "_denom_requesting_ns_cache", None)
+        if cached is None:
+            cached = [ns for ns in self.root_ns
+                      if ns.is_sum() and not ns.is_tied()
+                      and getattr(getattr(ns, "external_params", None), "requests_denom_param_flows", False)]
+            self._denom_requesting_ns_cache = cached
+        return cached
+
     def mini_batch_em(self, step_size: float, pseudocount: float = 0.0, keep_zero_params: bool = False,
                       step_size_rescaling: bool = False, use_cudagraph: bool = False):
         """
@@ -1405,6 +1416,16 @@ class TensorCircuit(nn.Module):
         assert not step_size_rescaling or self._cum_flow > 0.0, "Please perform a backward pass before calling `mini_batch_em`."
         assert 0.0 < step_size <= 1.0, "`step_size` should be between 0 and 1."
 
+        # `apply_z_correction`'s denominator `F-` is accumulated by the ORDINARY backward, but the
+        # step-size-rescaling (Anemone) path below adds a TOP-DOWN pass to `param_flows` that `F-` has no
+        # counterpart for yet -- so the correction would divide by an inconsistent denominator. Refuse
+        # rather than silently mis-correct; the top-down `F-` adjustment is future work.
+        if self._requests_denom_param_flows and step_size_rescaling:
+            raise NotImplementedError(
+                "`apply_z_correction` with `step_size_rescaling = True` (Anemone) is not yet supported: "
+                "the top-down probability pass must also adjust `denom_param_flows`."
+            )
+
         with device_grad_controller(device = self.device, no_grad = True):
 
             # Apply step size rescaling according to the mini-batch EM objective derivation
@@ -1423,10 +1444,29 @@ class TensorCircuit(nn.Module):
             # Accumulate parameter flows of tied nodes
             compute_cum_par_flows(self.param_flows, self.parflow_fusing_kwargs)
 
+            # Conditional dual-flow M-step (`apply_z_correction`): compute the corrected parameters for
+            # each requesting `ns` from the PRE-update `theta`, F+ and (tied-fused) F-, run the standard
+            # M-step unchanged, then overwrite ONLY the requesting ranges. All gated on
+            # `denom_param_flows` -- an ordinary PC does none of this and pays nothing.
+            denom_param_flows = self.denom_param_flows
+            corrections = []
+            if denom_param_flows is not None:
+                compute_cum_par_flows(denom_param_flows, self.parflow_fusing_kwargs)   # fuse F- over ties
+                for ns in self._denom_correction_nss():
+                    new_pars = ns.external_params.compute_em_correction(
+                        ns, self.params, self.param_flows, denom_param_flows,
+                        step_size, pseudocount, keep_zero_params)
+                    if new_pars is not None:
+                        corrections.append((ns._param_range, new_pars))
+
             # Normalize and update parameters
-            em_par_update(self.params, self.param_flows, self.par_update_kwargs, 
+            em_par_update(self.params, self.param_flows, self.par_update_kwargs,
                         step_size = step_size, pseudocount = pseudocount,
                         keep_zero_params = keep_zero_params)
+
+            # Replace the standard update with the dual one on the requesting ranges
+            for (ps, pe), new_pars in corrections:
+                self.params[ps:pe] = new_pars
 
     def cumulate_flows(self, inputs: torch.Tensor, params: Optional[torch.Tensor] = None):
         with torch.no_grad():
