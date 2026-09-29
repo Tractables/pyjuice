@@ -1903,8 +1903,17 @@ class BlockScaleSumParams(ExternalSumParams):
 
             # log phi of each edge, per (row, edge, batch); -inf on a padded edge block
             e = torch.arange(E, device = dev, dtype = torch.long)
-            gbase = gate[:, e // node_cbs]                                 # [rows, E], per-batch base
-            ghas = gbase >= 0
+            # BOUNDED by the gate table's width, exactly as `_bs_triton_denom_kernel` bounds its own
+            # `gcol` load. `E` is the compiled `num_edges`, padded up to a power of two, while the
+            # table is only `ext_max_n_eblks` columns wide -- so whenever the widest row's edge-block
+            # count is not a power of two the column runs PAST the row. Unlike the kernel (whose load
+            # mask makes it read the sentinel) this is a torch gather, so it raised a device-side
+            # assert instead: MEASURED on `num_node_blocks = 3` (4 columns against a 3-wide table).
+            # The kernel was already right here; only this reference was not.
+            gcol = e // node_cbs
+            in_table = gcol < gate.size(1)
+            gbase = gate[:, gcol.clamp(max = gate.size(1) - 1)]            # [rows, E], per-batch base
+            ghas = (gbase >= 0) & in_table[None, :]
             grow = (gbase + ext_base + ((e % node_cbs) // gate_cbs)[None, :]).clamp(min = 0)
             phi = external_params[grow[:, :, None] * batch + ar_b[None, None, :]]   # [rows, E, batch]
             phi = torch.where(ghas[:, :, None], phi, torch.full_like(phi, -float("inf")))
