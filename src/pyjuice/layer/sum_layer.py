@@ -128,6 +128,30 @@ _SMALL_BATCH_MIN_BLOCK_SIZE = int(os.environ.get("PYJUICE_SB_MIN_BS", 32))
 # unaffected. Toggle for A/B; bit-identical so on by default.
 _BLOCK_SPARSE_EDGE_TRIM = os.environ.get("PYJUICE_EDGE_TRIM", "1") != "0"
 
+# Precision of the parameter-flow `tl.dot`. Triton defaults to TF32, and that is the dominant error
+# term in the param flows once the tiles are wide enough to reach tensor cores: MEASURED on a
+# block_size=16 layer, `sum_c F+ / sum_b f_b` sits at 8.0e-4 for EVERY batch size -- constant in the
+# batch, so it is precision and not the tiling.
+#
+# OFF BY DEFAULT, because it is a trade and not a fix. MEASURED at block_size 16 / batch 512, per
+# kernel (profiler, so the comparison is the param kernel alone rather than everything else that
+# `force_use_fp32` also switches):
+#
+#     tf32 (default)   26.2 us   error 8.0e-4
+#     ieee             53.0 us   error 9.6e-5
+#
+# i.e. 8x the accuracy for 2x the kernel (~26% of the whole fwd+bwd at this shape). The error is
+# RELATIVE and spread over a node's children, which is the benign kind for EM -- the M-step
+# renormalizes, and only an absolute error on a small probability would bite -- so paying 2x by
+# default would be the wrong call. Set `PYJUICE_PAR_DOT_IEEE=1` where the flows themselves are the
+# object of study (e.g. validating a new kernel against a reference, or a gradient check).
+#
+# `force_use_fp32` drops `tl.dot` altogether for a broadcast sum. That is NOT a reliable accuracy
+# route: it also changes the forward and element-flow forks, and its measured error moved between
+# 6.2e-6 and 7.0e-4 across runs of the same shape, because the timing-based autotuner picks
+# differently from run to run.
+_PAR_DOT_IEEE = os.environ.get("PYJUICE_PAR_DOT_IEEE", "0") != "0"
+
 
 class SumLayer(Layer, nn.Module):
 
@@ -1931,6 +1955,7 @@ class SumLayer(Layer, nn.Module):
                     TILE_SIZE_M = TILE_SIZE_M,
                     BLOCK_SIZE_M = self.block_size,
                     TL_DOT = TL_DOT,
+                    DOT_IEEE = 1 if _PAR_DOT_IEEE else 0,
                     negate_pflows = negate_pflows,
                     pid_m_offset = pid_m_start,
                     num_stages = 1,
