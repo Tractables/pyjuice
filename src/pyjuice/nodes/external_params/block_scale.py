@@ -133,6 +133,13 @@ class BlockScaleSumParams(ExternalSumParams):
     #: the flow kernels use, and it is why the flag stays a plain bool.
     computes_external_grads = True
 
+    @property
+    def requests_denom_param_flows(self) -> bool:
+        # The gate makes `Z = sum_c phi * theta` depend on `theta`, so `normalize(F+)` is not exact EM
+        # under a live gate (see `__init__`). The exact M-step needs the denominator flow `F-`; request
+        # it only when `apply_z_correction` is on, so an ordinary gated model still pays nothing.
+        return self.apply_z_correction
+
     def __init__(self, block_size: Optional[int] = None, ch_block_size: Optional[int] = None,
                  apply_z_correction: bool = False, tie_external: bool = False):
         super(BlockScaleSumParams, self).__init__()

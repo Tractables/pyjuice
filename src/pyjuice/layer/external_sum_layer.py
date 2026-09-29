@@ -187,6 +187,11 @@ class ExternalParamsSumLayer(SumLayer):
         # owned and moved by this layer rather than by the (shared, stateless) descriptor.
         self.external_params.compile(self)
 
+    @property
+    def requests_denom_param_flows(self) -> bool:
+        """Delegated to the descriptor: a gated M-step may need the denominator flow `F-`."""
+        return self.external_params.requests_denom_param_flows
+
     def register_external_buffers(self, name: str, tensors: Sequence[torch.Tensor]) -> None:
         """
         Register one compile-time tensor per `ns`, in `self.external_node_infos` order, under `name`.

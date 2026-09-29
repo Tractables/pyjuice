@@ -65,6 +65,17 @@ class ExternalSumParams():
     #: gradient is unavailable, rather than returning the zeroed buffer as though it were an answer.
     computes_external_grads: bool = True
 
+    #: Whether this parameterization's M-step needs the DENOMINATOR param-flow buffer -- a second
+    #: accumulator laid out exactly like `param_flows` (addressed by the same `pfids`), holding the
+    #: expected/normalizer flow `F-` alongside the ordinary observed flow `F+`. `False` -- the default
+    #: -- trains through the plain single-flow M-step `theta <- normalize(F+)`. A parameterization whose
+    #: per-sample effective parameters carry a normalizer that itself depends on `theta` (so
+    #: `normalize(F+)` is not exact EM) sets this: the PC then allocates `pc.denom_param_flows`, the
+    #: layer accumulates `F-` into it, and the M-step becomes the conditional
+    #: `theta <- normalize(theta * F+ / F-)`. A plain sum layer -- and any PC with no such
+    #: parameterization -- never allocates the buffer and pays nothing.
+    requests_denom_param_flows: bool = False
+
     def storage_owner(self, ns):
         """
         The node whose staging slots `ns` uses.
