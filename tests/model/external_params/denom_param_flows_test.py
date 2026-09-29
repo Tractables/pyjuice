@@ -450,6 +450,268 @@ def test_corrected_em_is_monotone_under_a_live_gate():
     assert torch.isfinite(pc.params).all()
 
 
+# ------------------------------------------------- F- across the shape space
+#
+# The tests above all run ONE shape (block_size 4, 2 node blocks, ch_block_size 2, batch 32), which
+# leaves most of `_bs_triton_denom_kernel` unexercised: batch 32 is a single batch tile, so the
+# kernel's online-max rescaling never runs; 2 node blocks is a power of two, so the gate table is
+# never narrower than the (power-of-two padded) edge count; and `log phi ~ N(0, 1.5)` never
+# approaches the range where `exp` would overflow. Each of those is a place a kernel goes wrong
+# silently, so they get their own coverage here.
+
+def _build_shape(block_size, n_blocks, ch_block_size, seed = 0):
+    """A gated PC with `apply_z_correction`, with every shape axis of the kernel exposed."""
+    torch.manual_seed(seed)
+    with juice.set_block_size(block_size):
+        i0 = inputs(0, num_node_blocks = n_blocks, dist = dists.Categorical(num_cats = NUM_CATS))
+        i1 = inputs(1, num_node_blocks = n_blocks, dist = dists.Categorical(num_cats = NUM_CATS))
+        ns = summate(multiply(i0, i1), num_node_blocks = n_blocks,
+                     external_params = BlockScaleSumParams(ch_block_size = ch_block_size,
+                                                           apply_z_correction = True))
+        root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
+    root.init_parameters(perturbation = 2.0)
+    return root, ns
+
+
+def _run(pc, ns, x, phi, ref = False):
+    """One gated fwd+bwd; returns `(F+, F-, sum_b f_b per node)`.
+
+    `allow_modify_flows = False` is REQUIRED for the third return value: otherwise the backward
+    overwrites `node_flows` in place with the `log f - log m` form and the "flow" read back is a
+    different quantity entirely.
+    """
+    os.environ["PYJUICE_BLOCKSCALE_DENOM_REF"] = "1" if ref else "0"
+    try:
+        pc(x, sum_external_params = {ns: phi})
+        pc.backward(x, sum_external_params = {ns: phi}, logspace_flows = True,
+                    flows_memory = 0.0, allow_modify_flows = False)
+    finally:
+        os.environ.pop("PYJUICE_BLOCKSCALE_DENOM_REF", None)
+
+    lay = pc.external_params_nodes[ns]
+    bs = ns.block_size
+    ar = torch.arange(bs, device = pc.params.device)
+    gid = torch.cat([(lay.partitioned_nids[p].long()[:, None] + ar[None, :]).reshape(-1)
+                     for p in range(len(lay.partitioned_nids))])
+    flow_sum = pc.node_flows[gid].double().exp().sum(-1)
+    return pc.param_flows.clone(), pc.denom_param_flows.clone(), flow_sum
+
+
+def _sum_over_children(pc, ns, F):
+    """`sum_c F[n,c]` per node, accumulated over every partition (a node's children can split)."""
+    lay = pc.external_params_nodes[ns]
+    bs = ns.block_size
+    ar = torch.arange(bs, device = F.device)
+    parts = range(len(lay.partitioned_pfids))
+    gmin = min(int(lay.partitioned_nids[p].min()) for p in parts)
+    out = torch.zeros(ns.num_node_blocks * bs, device = F.device, dtype = torch.float64)
+    for p in parts:
+        pfids, cids = lay.partitioned_pfids[p], lay.partitioned_cids[p]
+        nids = lay.partitioned_nids[p].long()
+        rows, E = pfids.shape
+        idx = (pfids[:, None, :] + ar[None, :, None]).long()
+        real = (cids != 0)[:, None, :].expand(rows, bs, E)
+        loc = (nids[:, None] + ar[None, :] - gmin).reshape(-1)
+        out.index_add_(0, loc, (F[idx].double() * real).sum(-1).reshape(-1))
+    return out
+
+
+# block_size, n_blocks, ch_block_size, batch
+_SHAPES = [
+    (2,  2, 1,  32),     # narrowest block
+    (4,  2, 2,  96),     # > 1 batch tile
+    (4,  2, 2,  65),     # partial batch tile with a single live lane
+    (4,  3, 2,  96),     # RAGGED: 3 node blocks -> the gate table is narrower than padded num_edges
+    (4,  5, 2,  64),     # ragged again, wider
+    (8,  2, 2, 128),
+    (8,  4, 4, 257),     # partial tile, several node blocks, coarse gate
+    (16, 2, 2,  64),
+    (16, 8, 2,  96),
+    (32, 2, 4,  33),     # partial tile far smaller than the tile size
+]
+
+
+@cuda_only
+@pytest.mark.parametrize("block_size,n_blocks,ch_block_size,batch", _SHAPES)
+def test_denom_kernel_matches_reference_across_shapes(block_size, n_blocks, ch_block_size, batch):
+    """The Triton `F-` and the torch reference must agree at every shape, not just the one the
+    original tests used. The ragged rows (`n_blocks` 3 and 5) are the regression for the reference's
+    unbounded gate-column gather: the compiled `num_edges` is padded to a power of two while the
+    gate table is only as wide as the widest row's edge-block count, so `e // node_cbs` ran PAST the
+    table and raised a device-side assert (the kernel already clamped, only the reference did not).
+    """
+    dev = torch.device("cuda:0")
+    root, ns = _build_shape(block_size, n_blocks, ch_block_size)
+    pc = juice.compile(root, verbose = False).to(dev)
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [batch, 2], device = dev)
+    phi = _phi(ns, batch, dev)
+
+    _, Fm_k, _ = _run(pc, ns, x, phi, ref = False)
+    _, Fm_r, _ = _run(pc, ns, x, phi, ref = True)
+    assert torch.isfinite(Fm_k).all()
+    assert torch.count_nonzero(Fm_k) > 0
+    rel = ((Fm_k - Fm_r).abs() / (Fm_r.abs() + 1e-6)).max().item()
+    assert rel < 1e-4, rel
+
+
+@cuda_only
+@pytest.mark.parametrize("batch", [32, 64, 65, 96, 128, 257])
+def test_denom_conserves_node_flow_across_batch_tiling(batch):
+    """`sum_c F-[n,c] == sum_b f_b[n]`, because `sum_c theta_b[n,c] == 1` for every sample.
+
+    Reference-free, so it cannot be satisfied by the kernel and the reference being wrong together
+    -- and it is exactly what a dropped or double-counted batch tile breaks. `F-`'s launcher uses
+    `cdiv` and the kernel re-masks the batch each iteration, which is what the non-multiples of the
+    64-wide batch tile (65, 96, 257) pin here.
+    """
+    dev = torch.device("cuda:0")
+    root, ns = _build_shape(4, 2, 2)
+    pc = juice.compile(root, verbose = False).to(dev)
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [batch, 2], device = dev)
+    phi = _phi(ns, batch, dev)
+
+    _, Fm, flow_sum = _run(pc, ns, x, phi)
+    got = _sum_over_children(pc, ns, Fm)
+    keep = flow_sum.abs() > 1e-8
+    rel = ((got - flow_sum).abs()[keep] / flow_sum.abs()[keep]).max().item()
+    assert rel < 1e-4, f"F- does not conserve node flow at batch={batch} (relmax={rel})"
+
+
+@cuda_only
+@pytest.mark.parametrize("scale", [0.0, 20.0, 90.0, 300.0])
+def test_denom_survives_extreme_gate_logits(scale):
+    """`log phi` is a router logit and therefore UNBOUNDED, which is the trap that already bit the
+    log-Z half of `d LL / d log phi` (there `exp(nf - log Z)` underflowed to 0 past ~88 and the term
+    silently vanished with no inf/NaN to show for it).
+
+    `F-` is built to be safe by construction -- `log phi` is kept INSIDE the exponent, where it
+    cancels against `log Z`, so the summand never exceeds `f_b[n]` however large the logit. This
+    pins that: the result stays finite AND still conserves, at logits far past the overflow point.
+    `scale = 0` is the neutral gate at the other end.
+    """
+    dev = torch.device("cuda:0")
+    root, ns = _build_shape(4, 2, 2)
+    pc = juice.compile(root, verbose = False).to(dev)
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [96, 2], device = dev)
+    phi = _phi(ns, 96, dev, scale = scale)
+
+    _, Fm, flow_sum = _run(pc, ns, x, phi)
+    assert torch.isfinite(Fm).all(), f"non-finite F- at gate scale {scale}"
+    got = _sum_over_children(pc, ns, Fm)
+    keep = flow_sum.abs() > 1e-8
+    rel = ((got - flow_sum).abs()[keep] / flow_sum.abs()[keep]).max().item()
+    assert rel < 1e-3, f"F- lost mass at gate scale {scale} (relmax={rel})"
+
+
+@cuda_only
+def test_denom_matches_finite_differences_at_a_larger_shape():
+    """`F+ - F- == d(sum_b log P(x_b)) / d log theta` at a shape with several batch tiles and a
+    coarser gate -- the original FD test ran only the single-tile shape."""
+    dev = torch.device("cuda:0")
+    root, ns = _build_shape(8, 2, 4)
+    pc = juice.compile(root, verbose = False).to(dev)
+    lay = pc.external_params_nodes[ns]
+    B = 96
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    phi = _phi(ns, B, dev)
+    Fp, Fm, _ = _run(pc, ns, x, phi)
+
+    pids, pfids, cids = lay.partitioned_pids[0], lay.partitioned_pfids[0], lay.partitioned_cids[0]
+
+    def ll():
+        with torch.no_grad():
+            return pc(x, sum_external_params = {ns: phi}).double().sum().item()
+
+    eps, n, dmax, gmax = 1e-2, 0, 0.0, 0.0
+    for e in range(0, pids.size(1), max(1, pids.size(1) // 5)):
+        if int(cids[0, e]) == 0:
+            continue
+        for m in (0, ns.block_size // 2):
+            pid, pf = int(pids[0, e]) + m, int(pfids[0, e]) + m
+            g_an = float(Fp[pf] - Fm[pf])
+            with torch.no_grad():
+                o = float(pc.params[pid])
+                pc.params[pid] = o * math.exp(eps); lp = ll()
+                pc.params[pid] = o * math.exp(-eps); lm = ll()
+                pc.params[pid] = o
+            g_fd = (lp - lm) / (2 * eps)
+            dmax = max(dmax, abs(g_fd - g_an))
+            gmax = max(gmax, abs(g_an), abs(g_fd))
+            n += 1
+    assert n >= 4
+    # Judged against the LARGEST gradient probed, not per-edge. A per-edge relative error is
+    # meaningless where the gradient is near zero -- the central difference resolves about 1e-4 here
+    # (the LL is accumulated in fp32), so an edge with |g| ~ 1e-4 reads as 100% error no matter how
+    # correct the kernel is. MEASURED: shapes whose worst per-edge ratio was 0.46 and 1.00 had a
+    # `dmax` of 1e-4, i.e. they were exact; the genuinely broken shape had `dmax` 3.06 against a
+    # `gmax` of 3.2. Scaling by `gmax` separates those cleanly.
+    assert dmax / gmax < 5e-2, f"dmax={dmax:.3e} gmax={gmax:.3e} ratio={dmax / gmax:.3e}"
+
+
+# ------------------------------------------------- the dual M-step, at its corners
+
+@cuda_only
+@pytest.mark.parametrize("step_size,pseudocount", [(1.0, 0.0), (0.5, 0.0), (0.5, 0.1), (1.0, 2.0)])
+def test_em_correction_keeps_parameters_normalized(step_size, pseudocount):
+    """The corrected M-step must leave each node's parameters summing to 1 over its children, for
+    every `(step_size, pseudocount)` -- the dual update renormalizes through `cum`, and an error
+    there shows up as drift rather than as anything obviously wrong."""
+    dev = torch.device("cuda:0")
+    root, ns = _build_shape(4, 2, 2)
+    pc = juice.compile(root, verbose = False).to(dev)
+    B = 96
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    phi = _phi(ns, B, dev)
+
+    for _ in range(3):
+        pc(x, sum_external_params = {ns: phi})
+        pc.backward(x, sum_external_params = {ns: phi}, logspace_flows = True,
+                    flows_memory = 0.0, allow_modify_flows = False)
+        pc.mini_batch_em(step_size = step_size, pseudocount = pseudocount)
+        assert torch.isfinite(pc.params).all(), "non-finite parameters after the corrected M-step"
+
+    ps, pe = ns._param_range
+    E, cbs, bs = ns.edge_ids.size(1), ns.ch_block_size, ns.block_size
+    theta = pc.params[ps:pe].reshape(E, cbs, bs)
+    nb = ns.edge_ids[0].to(device = theta.device, dtype = torch.long)
+    tot = torch.zeros(ns.num_node_blocks, bs, device = theta.device, dtype = theta.dtype)
+    tot.index_add_(0, nb, theta.sum(dim = 1))
+    assert (tot - 1.0).abs().max().item() < 1e-4, (tot - 1.0).abs().max().item()
+
+
+@cuda_only
+def test_em_correction_finite_when_a_parameter_is_zero():
+    """A structurally zero `theta` makes the dual ratio `(F+ + pc/K) / (F- + pc*theta)` a finite
+    number over a clamped zero, and `theta * ratio` must stay 0 rather than becoming `0 * inf`.
+    With `keep_zero_params` the zeros must also survive the update."""
+    dev = torch.device("cuda:0")
+    root, ns = _build_shape(4, 2, 2)
+    pc = juice.compile(root, verbose = False).to(dev)
+    B = 64
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    phi = _phi(ns, B, dev)
+
+    ps, pe = ns._param_range
+    with torch.no_grad():                          # zero out a slice of this ns's parameters
+        pc.params[ps:ps + (pe - ps) // 4] = 0.0
+    zeroed = (pc.params[ps:pe] == 0.0).clone()
+    assert bool(zeroed.any())
+
+    pc(x, sum_external_params = {ns: phi})
+    pc.backward(x, sum_external_params = {ns: phi}, logspace_flows = True,
+                flows_memory = 0.0, allow_modify_flows = False)
+    pc.mini_batch_em(step_size = 1.0, pseudocount = 1.0, keep_zero_params = True)
+
+    assert torch.isfinite(pc.params).all(), "the corrected M-step produced inf/NaN on a zero parameter"
+    assert bool((pc.params[ps:pe][zeroed] == 0.0).all()), "`keep_zero_params` did not hold the zeros"
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
