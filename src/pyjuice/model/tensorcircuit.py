@@ -253,6 +253,11 @@ class TensorCircuit(nn.Module):
         self.node_flows = None
         self.element_flows = None
         self.param_flows = None
+        # Denominator param-flow buffer `F-` (see `ExternalSumParams.requests_denom_param_flows`): a
+        # second accumulator shaped exactly like `param_flows`, allocated only when some layer requests
+        # it. `None` on an ordinary PC, which then pays nothing. The flag is finalized at compile.
+        self.denom_param_flows = None
+        self._requests_denom_param_flows = False
         self.node_mars_tempered = None
 
         # Staging buffers for externally supplied per-sample sum parameters, and for the per-sample
@@ -1447,6 +1452,16 @@ class TensorCircuit(nn.Module):
         if flows_memory != 1.0:
             self.param_flows[:] *= flows_memory
 
+        # The denominator flow `F-` mirrors `param_flows` exactly (same shape, same `pfids`), so a
+        # requesting layer accumulates into `denom_param_flows[pfid]` just as it does `param_flows`, and
+        # the M-step reads the two together. Allocated only on request -- an ordinary PC keeps it `None`
+        # and pays nothing -- and it rides the identical reset/scale cadence, so `zero_param_flows`
+        # (which routes through here) zeros it too.
+        if self._requests_denom_param_flows:
+            self._init_buffer(name = "denom_param_flows", shape = pflow_shape)
+            if flows_memory != 1.0:
+                self.denom_param_flows[:] *= flows_memory
+
         # For input layers
         for layer in self.input_layer_group:
             layer.init_param_flows(flows_memory = flows_memory)
@@ -1484,6 +1499,10 @@ class TensorCircuit(nn.Module):
         tensors = []
         if getattr(self, "param_flows", None) is not None:
             tensors.append(self.param_flows)
+        # The denominator flow is additive across data shards exactly like the numerator, so it must be
+        # reduced too -- otherwise a DDP M-step would divide by a partial `F-`.
+        if getattr(self, "denom_param_flows", None) is not None:
+            tensors.append(self.denom_param_flows)
         for layer in self.input_layer_group:
             pf = getattr(layer, "param_flows", None)
             if pf is not None:
@@ -2027,6 +2046,14 @@ class TensorCircuit(nn.Module):
         self.num_elements = num_elements
         self.num_sum_params = num_parameters
         self.num_param_flows = num_param_flows
+
+        # Does any layer need the denominator flow `F-`? Resolved once here, so `init_param_flows`
+        # allocates `denom_param_flows` only when it is actually used -- an ordinary PC never does and
+        # keeps `denom_param_flows = None`.
+        self._requests_denom_param_flows = any(
+            layer.requests_denom_param_flows
+            for group in self.inner_layer_groups for layer in group.layers
+        )
 
         # For parameter flow accumulation
         self.parflow_fusing_kwargs = compile_cum_par_flows_fn(node2tiednodes, MAX_NBLOCKS = 2048, BLOCK_SIZE = 2048)
