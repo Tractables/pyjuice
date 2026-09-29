@@ -1943,16 +1943,30 @@ class BlockScaleSumParams(ExternalSumParams):
             cache[key] = W
 
         # ---- pass 1: W[node, gate] ----
+        #
+        # BOTH passes are OCCUPANCY-bound, not bandwidth-bound, so the tiles are chosen to fill the
+        # device rather than to be as large as the register budget allows. MEASURED before this: the
+        # widest legal tiles left pass 1 with 32 programs and pass 2 with 64 on a ~188-SM GPU, and the
+        # two ran at ~10% of achievable bandwidth (7.54 us and 6.17 us against ~0.75 us of traffic).
+        #
+        # Shrinking the NODE tile here is free in traffic, unlike in the fused kernel where it was a
+        # disaster: `node_flows` / `log Z` are PARTITIONED by node, so m-tiling moves them between
+        # programs rather than replicating them, and the only replicated operand is `lphi`, which is
+        # `n_gates` wide (16 here) rather than an edge tile (256 there).
+        target = 4 * torch.cuda.get_device_properties(dev).multi_processor_count
         TILE_SIZE_G = min(triton.next_power_of_2(n_gates), 64)
-        # `acc` is `[TILE_SIZE_M, TILE_SIZE_G]` in registers; the gate axis is short, so the node tile
-        # can stay wide, which is what keeps `node_flows` / `log Z` contiguous per program.
-        TILE_SIZE_M = max(1, min(block_size, max(1, 4096 // max(1, TILE_SIZE_G))))
-        m_tiles = max(1, block_size // TILE_SIZE_M)
         g_tiles = triton.cdiv(n_gates, TILE_SIZE_G)
+
+        # Widest node tile the register budget allows, then halved while the grid is under-filled.
+        TILE_SIZE_M = max(1, min(block_size, max(1, 4096 // max(1, TILE_SIZE_G))))
+        m_floor = 16 if block_size >= 16 else 1          # `tl.dot` needs 16
+        while TILE_SIZE_M > m_floor and \
+                rows * (block_size // TILE_SIZE_M) * g_tiles * B_NUM_TILES < target:
+            TILE_SIZE_M //= 2
+        m_tiles = max(1, block_size // TILE_SIZE_M)
         w_use_dot = 1 if (TILE_SIZE_M >= 16 and TILE_SIZE_G >= 16 and TILE_SIZE_B >= 16) else 0
         dot_ieee = 0 if os.environ.get("PYJUICE_BLOCKSCALE_DENOM_TF32", "0") == "1" else 1
 
-        target = 4 * torch.cuda.get_device_properties(dev).multi_processor_count
         base_progs = max(1, rows * m_tiles * g_tiles)
         B_SPLITS = max(1, min(B_NUM_TILES, triton.cdiv(target, base_progs)))
         B_TILES_PER_PROG = triton.cdiv(B_NUM_TILES, B_SPLITS)
@@ -1970,8 +1984,20 @@ class BlockScaleSumParams(ExternalSumParams):
             W_ATOMIC = 1 if B_SPLITS > 1 else 0, num_stages = 1)
 
         # ---- pass 2: theta * W, scattered ----
+        #
+        # A pure elementwise map over the parameter array, so it partitions perfectly and the only
+        # thing that matters is filling the device. Both tiles shrink until the grid is big enough;
+        # 16 is the floor so the `theta` runs stay long enough to be worth a memory transaction
+        # (consecutive nodes are contiguous in `mparams`, consecutive edges are not).
         S_TILE_K = max(1, min(triton.next_power_of_2(num_edges), 64))
         S_TILE_M = max(1, min(block_size, max(1, 4096 // S_TILE_K)))
+        s_floor = 16 if block_size >= 16 else 1
+        while S_TILE_M > s_floor and \
+                triton.cdiv(num_edges, S_TILE_K) * rows * (block_size // S_TILE_M) < target:
+            S_TILE_M //= 2
+        while S_TILE_K > 16 and \
+                triton.cdiv(num_edges, S_TILE_K) * rows * (block_size // S_TILE_M) < target:
+            S_TILE_K //= 2
         s_m_tiles = max(1, block_size // S_TILE_M)
         _bs_triton_denom_scatter_kernel[(triton.cdiv(num_edges, S_TILE_K), rows * s_m_tiles)](
             W = W, mparams = params, denom_param_flows = denom_param_flows,
