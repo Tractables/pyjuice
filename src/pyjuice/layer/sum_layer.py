@@ -152,6 +152,18 @@ _BLOCK_SPARSE_EDGE_TRIM = os.environ.get("PYJUICE_EDGE_TRIM", "1") != "0"
 # differently from run to run.
 _PAR_DOT_IEEE = os.environ.get("PYJUICE_PAR_DOT_IEEE", "0") != "0"
 
+# SM count, cached: the occupancy heuristics below consult it per launch, and
+# `torch.cuda.get_device_properties` is far too slow to call on a hot path.
+_SM_COUNT = {}
+
+
+def _sm_count(device) -> int:
+    idx = device.index if getattr(device, "index", None) is not None else torch.cuda.current_device()
+    n = _SM_COUNT.get(idx)
+    if n is None:
+        n = _SM_COUNT[idx] = torch.cuda.get_device_properties(idx).multi_processor_count
+    return n
+
 
 class SumLayer(Layer, nn.Module):
 
@@ -2214,6 +2226,26 @@ class SumLayer(Layer, nn.Module):
                     ele_BLOCK_M = min(ele_BLOCK_M, _SMALL_BATCH_SPARSE_TILE_M)
                     while cs_block_size % ele_BLOCK_M != 0:
                         ele_BLOCK_M //= 2
+
+                # The same tiling, but driven by the GRID rather than only by a small batch. With
+                # `BLOCK_M = cs_block_size` and a batch tile spanning the whole batch, a layer with
+                # few node blocks collapses to a SINGLE program however large the batch is. MEASURED
+                # on an HMM root (one node over 1024 children, batch 256): grid (1, 1), 300 us to move
+                # ~2 MB, which was 25% of the entire backward -- ~300x off the memory roofline purely
+                # from running on one SM.
+                #
+                # Shrinking the node tile is what the small-batch branch above already does, and is
+                # bit-identical for the same reason: programs own DISJOINT `(node, batch)` outputs and
+                # the reduction is over EDGES inside a program, so nothing crosses a program boundary.
+                # `cs_block_size % ele_BLOCK_M == 0` is preserved so `TILES_PER_BLOCK` stays exact.
+                target = 4 * _sm_count(node_flows.device)
+                while ele_BLOCK_M > 1 and \
+                        triton.cdiv(batch_size, BLOCK_B) * triton.cdiv(layer_n_nodes, ele_BLOCK_M) < target:
+                    nxt = ele_BLOCK_M // 2
+                    if cs_block_size % nxt != 0:
+                        break
+                    ele_BLOCK_M = nxt
+
                 TILES_PER_BLOCK = cs_block_size // ele_BLOCK_M
                 ele_grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, ele_BLOCK_M))
 
