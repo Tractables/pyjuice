@@ -253,11 +253,14 @@ class TensorCircuit(nn.Module):
         self.node_flows = None
         self.element_flows = None
         self.param_flows = None
-        # Denominator param-flow buffer `F-` (see `ExternalSumParams.requests_denom_param_flows`): a
-        # second accumulator shaped exactly like `param_flows`, allocated only when some layer requests
-        # it. `None` on an ordinary PC, which then pays nothing. The flag is finalized at compile.
+        # Denominator flow buffer (see `ExternalSumParams.requests_denom_param_flows`): a second
+        # accumulator, allocated only when some layer requests it. `None` on an ordinary PC, which then
+        # pays nothing. Its LAYOUT belongs to the requesting parameterization -- it is NOT a
+        # `param_flows` mirror and is not addressed by `pfids` -- so the PC only owns the flat tensor
+        # and the per-layer slice offsets. Both are finalized at compile.
         self.denom_param_flows = None
         self._requests_denom_param_flows = False
+        self.num_denom_flows = 0
         self.node_mars_tempered = None
 
         # Staging buffers for externally supplied per-sample sum parameters, and for the per-sample
@@ -1386,15 +1389,12 @@ class TensorCircuit(nn.Module):
         self.forward(*args, propagation_alg = "GeneralLL", **kwargs)
 
     def _denom_correction_nss(self):
-        """The non-tied sum nodes whose parameterization requests the denominator flow `F-` -- the ones
-        whose EM update is the conditional `theta <- normalize(theta * F+ / F-)`. Structural, so cached."""
-        cached = getattr(self, "_denom_requesting_ns_cache", None)
-        if cached is None:
-            cached = [ns for ns in self.root_ns
-                      if ns.is_sum() and not ns.is_tied()
-                      and getattr(getattr(ns, "external_params", None), "requests_denom_param_flows", False)]
-            self._denom_requesting_ns_cache = cached
-        return cached
+        """The sum nodes whose EM update is the conditional `theta <- normalize(theta * F+ / F-)`, each
+        with every `(layer, member_ns)` holding denominator flow for its parameters.
+
+        These are the OWNERS of the parameters -- a tied copy is folded into its source, which is the
+        node whose `_param_range` the M-step writes. Structural, built at compile."""
+        return getattr(self, "_denom_sources_of_ns", {})
 
     def mini_batch_em(self, step_size: float, pseudocount: float = 0.0, keep_zero_params: bool = False,
                       step_size_rescaling: bool = False, use_cudagraph: bool = False):
@@ -1412,15 +1412,17 @@ class TensorCircuit(nn.Module):
 
         :param step_size_rescaling: whether to rescale the step size by flows
         :type step_size_rescaling: bool
+
         """
         assert not step_size_rescaling or self._cum_flow > 0.0, "Please perform a backward pass before calling `mini_batch_em`."
         assert 0.0 < step_size <= 1.0, "`step_size` should be between 0 and 1."
 
         # `apply_z_correction` + `step_size_rescaling` (Anemone) now agree: `init_param_flows` scales
         # BOTH flows by `step_size / cum_flow`, and `eval_top_down_probs` adds the same
-        # `(1 - step_size) * P_td[n] * theta[n,c]` term to `denom_param_flows` as it does to
-        # `param_flows` (see the note there for why the identical term is the right one). The
-        # conditional M-step below therefore sees a numerator and denominator built the same way.
+        # `(1 - step_size) * P_td[n] * theta[n,c]` term to the denominator as it does to `param_flows`
+        # (see the note there for why the identical term is the right one) -- through
+        # `accumulate_denom_top_down`, since the denominator has its own layout. The conditional M-step
+        # below therefore sees a numerator and denominator built the same way.
         with device_grad_controller(device = self.device, no_grad = True):
 
             # Apply step size rescaling according to the mini-batch EM objective derivation
@@ -1440,17 +1442,20 @@ class TensorCircuit(nn.Module):
             compute_cum_par_flows(self.param_flows, self.parflow_fusing_kwargs)
 
             # Conditional dual-flow M-step (`apply_z_correction`): compute the corrected parameters for
-            # each requesting `ns` from the PRE-update `theta`, F+ and (tied-fused) F-, run the standard
-            # M-step unchanged, then overwrite ONLY the requesting ranges. All gated on
-            # `denom_param_flows` -- an ordinary PC does none of this and pays nothing.
+            # each requesting `ns` from the PRE-update `theta`, F+ and F-, run the standard M-step
+            # unchanged, then overwrite ONLY the requesting ranges. All gated on `denom_param_flows` --
+            # an ordinary PC does none of this and pays nothing.
+            #
+            # No `compute_cum_par_flows` on the denominator: it is not laid out in `pfid` space, so the
+            # numerator's tie fusing does not apply to it. The tie group is passed to the descriptor
+            # instead (`denom_sources`), which sums the copies' flow as it reconstructs `F-`.
             denom_param_flows = self.denom_param_flows
             corrections = []
             if denom_param_flows is not None:
-                compute_cum_par_flows(denom_param_flows, self.parflow_fusing_kwargs)   # fuse F- over ties
-                for ns in self._denom_correction_nss():
+                for ns, sources in self._denom_correction_nss().items():
                     new_pars = ns.external_params.compute_em_correction(
                         ns, self.params, self.param_flows, denom_param_flows,
-                        step_size, pseudocount, keep_zero_params)
+                        step_size, pseudocount, keep_zero_params, denom_sources = sources)
                     if new_pars is not None:
                         corrections.append((ns._param_range, new_pars))
 
@@ -1488,13 +1493,18 @@ class TensorCircuit(nn.Module):
         if flows_memory != 1.0:
             self.param_flows[:] *= flows_memory
 
-        # The denominator flow `F-` mirrors `param_flows` exactly (same shape, same `pfids`), so a
-        # requesting layer accumulates into `denom_param_flows[pfid]` just as it does `param_flows`, and
-        # the M-step reads the two together. Allocated only on request -- an ordinary PC keeps it `None`
-        # and pays nothing -- and it rides the identical reset/scale cadence, so `zero_param_flows`
-        # (which routes through here) zeros it too.
+        # The denominator flow buffer rides the identical reset/scale cadence, so `zero_param_flows`
+        # (which routes through here) zeros it too, and Anemone's `flows_memory = step_size / cum_flow`
+        # scales numerator and denominator by the same factor. Allocated only on request -- an ordinary
+        # PC keeps it `None` and pays nothing.
+        #
+        # Its size is `num_denom_flows`, fixed at compile by the requesting parameterizations, NOT
+        # `pflow_shape`: the denominator is not a `param_flows` mirror. `BlockScaleSumParams` keeps the
+        # gate-space contraction `W[node, gate]` instead, which is `gate_cbs` times smaller (MEASURED
+        # 64x at a 1024-state gated HMM, 128x at 2048) and reconstructs `F-` at M-step time. Scaling
+        # still commutes with the reconstruction because `F- = theta * W` is linear in `W`.
         if self._requests_denom_param_flows:
-            self._init_buffer(name = "denom_param_flows", shape = pflow_shape)
+            self._init_buffer(name = "denom_param_flows", shape = (self.num_denom_flows,))
             if flows_memory != 1.0:
                 self.denom_param_flows[:] *= flows_memory
 
@@ -1536,7 +1546,11 @@ class TensorCircuit(nn.Module):
         if getattr(self, "param_flows", None) is not None:
             tensors.append(self.param_flows)
         # The denominator flow is additive across data shards exactly like the numerator, so it must be
-        # reduced too -- otherwise a DDP M-step would divide by a partial `F-`.
+        # reduced too -- otherwise a DDP M-step would divide by a partial `F-`. It stays a single
+        # collective even though its layout is the parameterization's own: the PC keeps every requesting
+        # layer's slices in ONE flat tensor, and a gate-space accumulator sums over samples like any
+        # other flow. (`BlockScaleSumParams` also makes this the CHEAPER reduce of the two, since `W` is
+        # `gate_cbs` times smaller than the param-flow mirror it replaced.)
         if getattr(self, "denom_param_flows", None) is not None:
             tensors.append(self.denom_param_flows)
         for layer in self.input_layer_group:
@@ -2086,10 +2100,26 @@ class TensorCircuit(nn.Module):
         # Does any layer need the denominator flow `F-`? Resolved once here, so `init_param_flows`
         # allocates `denom_param_flows` only when it is actually used -- an ordinary PC never does and
         # keeps `denom_param_flows = None`.
-        self._requests_denom_param_flows = any(
-            layer.requests_denom_param_flows
-            for group in self.inner_layer_groups for layer in group.layers
-        )
+        #
+        # Requesting layers are laid out end to end in ONE flat buffer, each getting the slices its
+        # parameterization asked for (`assign_denom_flow_offsets`). Sizing happens HERE, at compile,
+        # not at first forward, because `init_param_flows` may run before any forward pass.
+        #
+        # `_denom_sources_of_ns` is the denominator's answer to `compute_cum_par_flows`: tied copies
+        # share one `_param_range`, so every copy's flow has to reach the M-step of the node that owns
+        # those parameters. The numerator is fused in the `pfid` space it shares; the denominator, whose
+        # layout is the parameterization's own, is combined while `compute_em_correction` reconstructs
+        # `F-`, which is why the copies are collected rather than summed here.
+        denom_layers = [layer for group in self.inner_layer_groups for layer in group.layers
+                        if layer.requests_denom_param_flows]
+        self._requests_denom_param_flows = len(denom_layers) > 0
+        self.num_denom_flows = 0
+        self._denom_sources_of_ns = dict()
+        for layer in denom_layers:
+            self.num_denom_flows = layer.assign_denom_flow_offsets(self.num_denom_flows)
+            for ns in layer.nodes:
+                target = ns.get_source_ns() if ns.is_tied() else ns
+                self._denom_sources_of_ns.setdefault(target, []).append((layer, ns))
 
         # For parameter flow accumulation
         self.parflow_fusing_kwargs = compile_cum_par_flows_fn(node2tiednodes, MAX_NBLOCKS = 2048, BLOCK_SIZE = 2048)

@@ -322,6 +322,16 @@ def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0, pc_is
     # `None` for an ordinary PC, which is why nothing below changes for one.
     denom_param_flows = getattr(pc, "denom_param_flows", None) if update_pflow else None
 
+    # The denominator's own layout is generally a COMPRESSED form of `F-` (gate space, for
+    # `BlockScaleSumParams`), and the top-down term can only be expressed there when it is `theta[n,c]`
+    # times a factor with no child index. A normalized PC's term is exactly that; an unnormalized one's
+    # carries `exp(cmars[c] - nmars[n])` per child and is not. Refuse rather than write a denominator
+    # that does not match its numerator.
+    assert denom_param_flows is None or pc_is_normalized, \
+        "`eval_top_down_probs` cannot add the mini-batch-EM top-down term to the denominator flow of " \
+        "an unnormalized PC: the term is not separable in the parameterization's own layout. Normalize " \
+        "the circuit, or turn off `step_size_rescaling`."
+
     node_flows[:] = 0.0
     element_flows[:] = 0.0
 
@@ -361,10 +371,15 @@ def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0, pc_is
                         sum_layer_td_pflow(layer, node_flows, node_mars, element_mars, pc.params, pc.param_flows, hyperparameters,
                                            pc_is_normalized = pc_is_normalized)
 
-                        if denom_param_flows is not None:
-                            sum_layer_td_pflow(layer, node_flows, node_mars, element_mars, pc.params,
-                                               denom_param_flows, hyperparameters,
-                                               pc_is_normalized = pc_is_normalized)
+                        # ONLY layers that actually accumulate the denominator, and through their own
+                        # parameterization -- the buffer is NOT a `param_flows` mirror, so the generic
+                        # param-flow kernel cannot write it. The hook adds the same term in whatever
+                        # layout the parameterization keeps (for `BlockScaleSumParams`, a rank-one
+                        # update of `W[node, gate]`).
+                        if denom_param_flows is not None and \
+                                getattr(layer, "requests_denom_param_flows", False):
+                            layer.external_params.accumulate_denom_top_down(
+                                layer, node_flows, denom_param_flows, hyperparameters[0])
 
     if not hasattr(pc, "_tdp_cudagraph"):
         pc._tdp_cudagraph = dict()

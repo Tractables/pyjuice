@@ -65,16 +65,39 @@ class ExternalSumParams():
     #: gradient is unavailable, rather than returning the zeroed buffer as though it were an answer.
     computes_external_grads: bool = True
 
-    #: Whether this parameterization's M-step needs the DENOMINATOR param-flow buffer -- a second
-    #: accumulator laid out exactly like `param_flows` (addressed by the same `pfids`), holding the
-    #: expected/normalizer flow `F-` alongside the ordinary observed flow `F+`. `False` -- the default
-    #: -- trains through the plain single-flow M-step `theta <- normalize(F+)`. A parameterization whose
+    #: Whether this parameterization's M-step needs the DENOMINATOR flow buffer -- a second
+    #: accumulator, alongside the ordinary observed flow `F+` in `param_flows`, holding whatever
+    #: per-mini-batch statistic the conditional M-step divides by. `False` -- the default -- trains
+    #: through the plain single-flow M-step `theta <- normalize(F+)`. A parameterization whose
     #: per-sample effective parameters carry a normalizer that itself depends on `theta` (so
     #: `normalize(F+)` is not exact EM) sets this: the PC then allocates `pc.denom_param_flows`, the
-    #: layer accumulates `F-` into it, and the M-step becomes the conditional
+    #: layer accumulates into it, and the M-step becomes the conditional
     #: `theta <- normalize(theta * F+ / F-)`. A plain sum layer -- and any PC with no such
     #: parameterization -- never allocates the buffer and pays nothing.
+    #:
+    #: The buffer's LAYOUT belongs to the parameterization, not to the PC: it is sized by
+    #: :func:`denom_flow_sizes` and is NOT addressed by `pfids`. That is what keeps it cheap -- `F-` is
+    #: usually far more compressible than `F+`. `BlockScaleSumParams` stores the gate-space contraction
+    #: `W[node, gate]`, `gate_cbs` times smaller than a param-flow mirror (MEASURED 64x at a 1024-state
+    #: gated HMM, 128x at 2048, where the mirror was 13.6% / 18.5% of peak training memory), and
+    #: reconstructs `F-[n,c] = theta[n,c] * W[n, g(c)]` at M-step time.
     requests_denom_param_flows: bool = False
+
+    def denom_flow_sizes(self, layer) -> "list":
+        """
+        How many floats of `pc.denom_param_flows` this layer needs, one entry per FORWARD PARTITION.
+
+        Called once, at compile time, for every layer whose parameterization
+        :attr:`requests_denom_param_flows`. The PC concatenates the sizes over layers, allocates one
+        flat buffer, and hands each layer the offsets of its slices (`layer.denom_flow_offsets`); the
+        parameterization decides what lives inside. Sizes must be derivable from the compiled tables
+        alone -- `layer.partitioned_nids[pid].size(0)`, `layer.partitioned_cids[pid].size(1)`,
+        `layer.block_size` -- because the buffer is allocated before the first forward pass.
+        """
+        raise NotImplementedError(
+            f"{self.get_signature()} requests the denominator flow buffer but does not implement "
+            "`denom_flow_sizes`, so the PC cannot size it."
+        )
 
     def storage_owner(self, ns):
         """
@@ -291,29 +314,58 @@ class ExternalSumParams():
                              gradients summed into it.
         :type grad_tensors: Optional[Tuple[torch.Tensor,...]]
 
-        :param denom_param_flows: the PC's denominator param-flow buffer `F-`, shaped like
-                             `param_flows` and addressed by the same `pfids`, or `None` when no layer
-                             requested it (see :attr:`requests_denom_param_flows`). A parameterization
-                             that requested it accumulates its expected/normalizer flow into
-                             `denom_param_flows[pfid]` here, exactly as the standard backward
-                             accumulates `F+` into `param_flows[pfid]`; the M-step then reads the two
-                             together as `theta <- normalize(theta * F+ / F-)`.
+        :param denom_param_flows: the PC's denominator flow buffer, or `None` when no layer requested
+                             it (see :attr:`requests_denom_param_flows`). A parameterization that
+                             requested it accumulates its expected/normalizer statistic into its own
+                             slices -- `denom_param_flows[off : off + size]` for each
+                             `(off, size)` in `zip(layer.denom_flow_offsets,
+                             self.denom_flow_sizes(layer))` -- here, alongside the standard backward's
+                             `F+` into `param_flows[pfid]`. The layout is the parameterization's own;
+                             :func:`compute_em_correction` turns it back into `F-`.
         :type denom_param_flows: Optional[torch.Tensor]
         """
         raise NotImplementedError()
 
+    def accumulate_denom_top_down(self, layer, node_flows, denom_param_flows, scale: float) -> None:
+        """
+        Add the mini-batch-EM top-down term to this layer's denominator slices.
+
+        Called only under `step_size_rescaling` (Anemone), from `eval_top_down_probs`, and only for
+        layers that :attr:`requests_denom_param_flows`. The top-down pass adds
+        `scale * P_td[n] * theta[n,c]` to `param_flows[pfid(n,c)]`; the numerator and the denominator
+        of the conditional M-step must be built the same way, so the SAME term has to reach `F-`.
+        `node_flows[n, 0]` holds `P_td[n]` (the pass runs one "sample").
+
+        A parameterization whose denominator is not a param-flow mirror cannot let the generic
+        param-flow kernel do this -- it has to add the term in its own layout, which is why this is a
+        hook rather than a second call into the standard kernel.
+        """
+        raise NotImplementedError(
+            f"{self.get_signature()} requests the denominator flow buffer but does not implement "
+            "`accumulate_denom_top_down`, so `mini_batch_em(step_size_rescaling = True)` cannot build "
+            "a denominator that matches the numerator."
+        )
+
     def compute_em_correction(self, ns, params, param_flows, denom_param_flows, step_size,
-                              pseudocount, keep_zero_params):
+                              pseudocount, keep_zero_params, denom_sources = ()):
         """
         The conditional dual-flow EM update for `ns`, returning the new parameters for
         `ns._param_range` as a flat tensor -- or `None` (the default) to leave the standard
         `normalize(F+)` update in place.
 
         Called once per EM step, ONLY when this parameterization :attr:`requests_denom_param_flows`,
-        after both `param_flows` (F+) and `denom_param_flows` (F-) have been accumulated over the
-        mini-batch AND tied-fused. `params` still holds the PRE-update parameters. The PC runs the
-        standard M-step for every node and then overwrites this `ns`'s range with what is returned
-        here, so the returned tensor replaces -- not adds to -- the standard update.
+        after `param_flows` (F+, tied-fused) and `denom_param_flows` have been accumulated over the
+        mini-batch. `params` still holds the PRE-update parameters. The PC runs the standard M-step for
+        every node and then overwrites this `ns`'s range with what is returned here, so the returned
+        tensor replaces -- not adds to -- the standard update.
+
+        :param denom_sources: every `(layer, member_ns)` whose denominator slices carry flow for THESE
+                             parameters -- `ns` itself plus every copy of it under parameter tying,
+                             which share `ns._param_range` and so must have their flow summed here.
+                             This is the denominator's counterpart of `compute_cum_par_flows`: the
+                             numerator is fused in the `pfid` space it shares, while the denominator,
+                             whose layout is the parameterization's own, is combined during this
+                             reconstruction.
 
         The generic conditional M-step is `theta <- normalize(theta * F+ / F-)`; with one gate
         `F- = theta * sum(F+)`, so it collapses to `normalize(F+)` and the correction is an exact no-op.
