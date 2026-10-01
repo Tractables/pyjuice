@@ -484,6 +484,55 @@ def test_anemone_momentum_smooths_the_denominator_too():
 
 
 @cuda_only
+@pytest.mark.parametrize("opt_cls", ["SGD", "Adam"])
+def test_gradient_optimizer_renormalizes_without_the_correction(opt_cls):
+    """A gradient optimizer's step must survive a circuit that requests the denominator flow.
+
+    Its step 7 renormalizes by calling `mini_batch_em` with `param_flows` holding the PARTITION flow and
+    the denominator just zeroed by `zero_flows()`. Applying the conditional update there divides by
+    `pseudocount * theta` -- 1e-38 at `renorm_pseudocount = 0` -- so the parameters came back inf. It
+    must run the PLAIN projection instead, which is what `_apply_denom_correction = False` selects.
+
+    Checked on the parameters rather than on a mock, because `inf`/`NaN` is exactly what the bug
+    produced; a warning is also expected, since the gradient itself is still uncorrected.
+    """
+    import warnings as _w
+
+    dev = torch.device("cuda:0")
+    root, ns = _build(gated = True)
+    pc = juice.compile(root, verbose = False).to(dev)
+
+    with _w.catch_warnings(record = True) as caught:
+        _w.simplefilter("always")
+        opt = getattr(juice.optim, opt_cls)(pc, lr = 1e-3)
+    assert any("apply_z_correction" in str(c.message) for c in caught), \
+        "constructing a gradient optimizer on a corrected circuit should warn that the gradient is " \
+        "not the corrected one"
+
+    B = 32
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    phi = _phi(ns, B, dev)
+
+    for _ in range(2):
+        opt.zero_flows()
+        lls = pc(x, sum_external_params = {ns: phi})
+        pc.backward(x, sum_external_params = {ns: phi}, flows_memory = 1.0,
+                    allow_modify_flows = False, logspace_flows = True)
+        opt.step()
+        assert torch.isfinite(pc.params).all(), f"{opt_cls} produced non-finite parameters"
+
+    # still on the normalized manifold, which is the whole point of step 7
+    ps, pe = ns._param_range
+    E, cbs, bs = ns.edge_ids.size(1), ns.ch_block_size, ns.block_size
+    theta = pc.params[ps:pe].reshape(E, cbs, bs)
+    nb = ns.edge_ids[0].to(device = dev, dtype = torch.long)
+    tot = torch.zeros(ns.num_node_blocks, bs, device = dev)
+    tot.index_add_(0, nb, theta.sum(dim = 1))
+    assert (tot - 1.0).abs().max().item() < 1e-3, (tot - 1.0).abs().max().item()
+
+
+@cuda_only
 def test_em_correction_preserves_zero_parameters():
     """`keep_zero_params = True` must leave an exactly-zero parameter at zero through the CORRECTED
     M-step, and the surviving children must still renormalize to one without it.

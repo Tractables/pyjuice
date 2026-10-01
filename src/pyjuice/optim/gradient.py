@@ -53,6 +53,22 @@ class GradientOptimizer(CircuitOptimizer):
             assert hasattr(layer.nodes[0].dist, "num_cats"), \
                 "Gradient optimizers (SGD / Adam) currently support only categorical input layers."
 
+        # The renormalization in `step` is now safe on such a circuit (it runs the PLAIN projection --
+        # see step 7), but the GRADIENT itself is not corrected: this optimizer forms
+        # `F+ - partition flow`, while under a live gate `d LL / d log theta = F+ - F-`, with `F-`
+        # carrying the gate's contribution to `Z`. Nothing here subtracts `F-`, and no test validates
+        # the direction for a gated circuit, so say so rather than let it look supported.
+        if getattr(pc, "_requests_denom_param_flows", False):
+            import warnings
+            warnings.warn(
+                "This circuit requests the denominator flow (`apply_z_correction`), whose M-step is "
+                "the conditional `theta <- normalize(theta * F+ / F-)`. Gradient optimizers do not "
+                "use `F-` in the gradient (they subtract the partition flow instead), so the descent "
+                "direction is NOT the corrected `F+ - F-` and is unvalidated for this circuit. EM "
+                "(`FullBatchEM` / `MiniBatchEM` / `Anemone`) is the supported route.",
+                RuntimeWarning,
+            )
+
         super().__init__(pc, pseudocount = renorm_pseudocount, keep_zero_params = False,
                          ddp = ddp, ddp_dtype = ddp_dtype, ddp_group = ddp_group)
 
@@ -124,9 +140,16 @@ class GradientOptimizer(CircuitOptimizer):
         self._clamp_params()
 
         # (7) renormalize the (now unnormalized) circuit back onto the normalized manifold.
+        #
+        # `_apply_denom_correction = False`: this is a RENORMALIZATION, not an EM step. `param_flows`
+        # holds the PARTITION flow, and `zero_flows()` has just zeroed the denominator -- so a circuit
+        # with `apply_z_correction` would run the conditional update `theta * F+ / F-` against
+        # `F- == 0`, i.e. divide by `pseudocount * theta` (and by 1e-38 at `renorm_pseudocount = 0`) and
+        # return inf. The plain projection is what is wanted here regardless of the parameterization.
         self.zero_flows()
         eval_partition_grad(self.pc, negate_pflows = False)
-        self.pc.mini_batch_em(step_size = 1.0, pseudocount = self.renorm_pseudocount)
+        self.pc.mini_batch_em(step_size = 1.0, pseudocount = self.renorm_pseudocount,
+                              _apply_denom_correction = False)
 
         self.zero_flows()
         self._samples_consumed = 0

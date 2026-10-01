@@ -1397,7 +1397,8 @@ class TensorCircuit(nn.Module):
         return getattr(self, "_denom_sources_of_ns", {})
 
     def mini_batch_em(self, step_size: float, pseudocount: float = 0.0, keep_zero_params: bool = False,
-                      step_size_rescaling: bool = False, use_cudagraph: bool = False):
+                      step_size_rescaling: bool = False, use_cudagraph: bool = False,
+                      _apply_denom_correction: bool = True):
         """
         Perform an EM parameter update step using the accumulated parameter flows.
 
@@ -1413,6 +1414,14 @@ class TensorCircuit(nn.Module):
         :param step_size_rescaling: whether to rescale the step size by flows
         :type step_size_rescaling: bool
 
+        :param _apply_denom_correction: internal. `False` runs the PLAIN M-step even on a circuit whose
+            parameterization requests the denominator flow (``apply_z_correction``). For callers that use
+            this method as a RENORMALIZER rather than as an EM step -- the gradient optimizers project
+            back onto the normalized manifold with ``param_flows`` holding the partition flow and the
+            denominator deliberately zeroed -- the conditional update is not merely inappropriate, it
+            divides by `pseudocount * theta` and returns inf at ``pseudocount = 0``. Not for user code;
+            an EM caller always wants the default.
+        :type _apply_denom_correction: bool
         """
         assert not step_size_rescaling or self._cum_flow > 0.0, "Please perform a backward pass before calling `mini_batch_em`."
         assert 0.0 < step_size <= 1.0, "`step_size` should be between 0 and 1."
@@ -1449,7 +1458,7 @@ class TensorCircuit(nn.Module):
             # No `compute_cum_par_flows` on the denominator: it is not laid out in `pfid` space, so the
             # numerator's tie fusing does not apply to it. The tie group is passed to the descriptor
             # instead (`denom_sources`), which sums the copies' flow as it reconstructs `F-`.
-            denom_param_flows = self.denom_param_flows
+            denom_param_flows = self.denom_param_flows if _apply_denom_correction else None
             corrections = []
             if denom_param_flows is not None:
                 for ns, sources in self._denom_correction_nss().items():
