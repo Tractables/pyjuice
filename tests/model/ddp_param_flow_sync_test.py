@@ -191,6 +191,184 @@ def test_sync_param_flows_noop_without_dist():
     assert pc._cum_flow == cum_before
 
 
+# --------------------------------------------------------------- the DENOMINATOR flow under DDP
+#
+# `apply_z_correction` adds a second accumulator, `pc.denom_param_flows`, which is additive over samples
+# exactly like `param_flows` and so must be all-reduced with it -- otherwise a DDP M-step divides a
+# GLOBAL numerator by a LOCAL denominator, which is a smooth rescaling rather than a crash and would not
+# show up as a failure anywhere. Its layout is the parameterization's own (gate space for
+# `BlockScaleSumParams`), which is the reason this needs its own coverage rather than riding the
+# `param_flows` assertions above: a reduce that handled only the `param_flows` SHAPE would still pass them.
+
+
+def _build_gated_pc(device):
+    import pyjuice as juice
+    import pyjuice.nodes.distributions as dists
+    from pyjuice.nodes import inputs, multiply, summate, BlockScaleSumParams
+
+    torch.manual_seed(0)   # identical structure AND parameters on every rank
+    with juice.set_block_size(4):
+        i0 = inputs(0, num_node_blocks = 2, dist = dists.Categorical(num_cats = 5))
+        i1 = inputs(1, num_node_blocks = 2, dist = dists.Categorical(num_cats = 5))
+        ns = summate(multiply(i0, i1), num_node_blocks = 2,
+                     external_params = BlockScaleSumParams(ch_block_size = 2,
+                                                           apply_z_correction = True))
+        root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
+    torch.manual_seed(0)
+    root.init_parameters(perturbation = 2.0)
+    pc = juice.compile(root, verbose = False).to(device)
+    return pc, ns
+
+
+def _ddp_denom_worker(rank, world_size, init_file, errdir):
+    fd = os.open(os.path.join(errdir, f"rank{rank}.err"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    os.dup2(fd, 2)
+    os.environ.setdefault("NCCL_DEBUG", "WARN")
+    os.environ["PYJUICE_DISABLE_CUDA_KERNELS"] = "1"
+
+    try:
+        import torch.distributed as dist
+
+        torch.cuda.set_device(rank)
+        dist.init_process_group(backend = "nccl", init_method = f"file://{init_file}",
+                                rank = rank, world_size = world_size,
+                                timeout = timedelta(seconds = 120))
+        device = torch.device(f"cuda:{rank}")
+
+        pc, ns = _build_gated_pc(device)
+        init_params = pc.params.detach().clone()
+
+        # One global batch, SHARDED across ranks. Same seed everywhere, so every rank knows the whole
+        # batch and can compute the single-process reference for itself.
+        B = 32
+        torch.manual_seed(7)
+        x_all = torch.randint(0, 5, (world_size * B, 2), device = device)
+        torch.manual_seed(11)
+        phi_all = torch.randn(ns.external_params.tensor_shapes(ns, world_size * B)[0], device = device)
+        lo, hi = rank * B, (rank + 1) * B
+
+        def em(xx, pp, sync, rescale):
+            """One independent EM arm. Returns `(F+, F-, params)` -- the flows as well, so a failure says
+            WHERE it went wrong: flows that differ mean an incomplete reduce, flows that agree while
+            params differ mean the M-step itself.
+
+            REBUILDS the circuit rather than resetting `pc.params`. A `TensorCircuit` carries more
+            mutable state than the sum parameters, and two separate leaks made this comparison lie before
+            the arms were isolated this way: `mini_batch_em` also updates the INPUT layers' parameters,
+            and `_cum_flow` ACCUMULATES across backward calls (`init_param_flows` does not reset it --
+            only a rescaled update consumes it), so the `step_size / _cum_flow` scaling of a later arm
+            saw the earlier arms' flow mass. Enumerating state to restore is how both were missed; a
+            fresh circuit cannot leak any of it, and the fixed seeds make every build identical."""
+            pc_i, ns_i = _build_gated_pc(device)
+            pc_i(xx, sum_external_params = {ns_i: pp})
+            pc_i.backward(xx, sum_external_params = {ns_i: pp}, logspace_flows = True,
+                          flows_memory = 0.0, allow_modify_flows = False)
+            if sync:
+                pc_i.sync_param_flows()
+            fp = pc_i.param_flows.detach().clone()
+            fm = ns_i.external_params.materialize_denom_flows(
+                ns_i, pc_i.params, pc_i.denom_param_flows,
+                pc_i._denom_correction_nss()[ns_i]).detach().clone()
+            pc_i.mini_batch_em(step_size = 1.0, pseudocount = 0.01,
+                               step_size_rescaling = rescale, use_cudagraph = False)
+            return fp, fm, pc_i.params.detach().clone()
+
+        # (a) the reduce itself. The batch must be IDENTICAL on every rank for `sum == world_size *
+        # local` to hold -- with the shards of (b) each rank's flows differ and that identity is simply
+        # false, which is what this assertion first reported as "not all-reduced".
+        pc.params[:] = init_params
+        pc(x_all[:B], sum_external_params = {ns: phi_all[:B]})
+        pc.backward(x_all[:B], sum_external_params = {ns: phi_all[:B]},
+                    logspace_flows = True, flows_memory = 0.0, allow_modify_flows = False)
+        local_denom = pc.denom_param_flows.clone()
+        pc.sync_param_flows()
+        synced_denom = pc.denom_param_flows.clone()
+
+        # (b) sharded + synced EM must equal single-process full-batch EM, plain and rescaled
+        results = {}
+        for rescale in (False, True):
+            ref = em(x_all, phi_all, sync = False, rescale = rescale)      # full batch, no reduce
+            got = em(x_all[lo:hi], phi_all[lo:hi], sync = True, rescale = rescale)
+            results[rescale] = (ref, got)
+
+        dist.barrier()   # every collective done before any assert, or the other ranks deadlock
+
+        m = local_denom.abs() > local_denom.abs().max() * 1e-4
+        assert torch.allclose(synced_denom[m], world_size * local_denom[m], rtol = 1e-4, atol = 1e-6), \
+            f"[rank {rank}] denom_param_flows was not all-reduced"
+
+        for rescale, (ref, got) in results.items():
+            for name, a, b in zip(("F+", "F-", "params"), ref, got):
+                rel = ((b - a).abs() / a.abs().clamp_min(1e-12)).max().item()
+                assert rel < 5e-3, \
+                    f"[rank {rank}] sharded+synced {name} != full-batch {name} " \
+                    f"(step_size_rescaling={rescale}, relmax={rel:.3e})"
+
+        dist.destroy_process_group()
+    except Exception:
+        traceback.print_exc()
+        sys.stderr.flush()
+        raise
+
+
+@pytest.mark.skipif(_ddp_gpus() is None, reason = "requires >= 2 GPUs")
+def test_sync_denom_param_flows_ddp():
+    import torch.multiprocessing as mp
+
+    world_size = 2
+    gpus = _ddp_gpus(world_size)
+    prev = os.environ.get("CUDA_VISIBLE_DEVICES")
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(gpus)
+
+    last_err = ""
+    try:
+        for attempt in range(3):
+            errdir = tempfile.mkdtemp(prefix = "pyjuice_ddp_denom_")
+            init_file = os.path.join(errdir, "store")
+            try:
+                mp.spawn(_ddp_denom_worker, args = (world_size, init_file, errdir),
+                         nprocs = world_size, join = True)
+                return
+            except Exception as e:
+                last_err = f"attempt {attempt} failed: {e}\n{_read_child_errs(errdir)}"
+                # A child that died on an ASSERTION is a correctness failure, not DDP flakiness, and
+                # must not be retried into a skip -- that is how a genuinely broken reduce looked like
+                # "transient infra issue" the first time this test ran.
+                if "AssertionError" in last_err:
+                    pytest.fail(last_err)
+            finally:
+                shutil.rmtree(errdir, ignore_errors = True)
+        pytest.skip(f"DDP denominator sync test could not establish a working process group after 3 "
+                    f"attempts (transient infra issue, not a correctness failure).\n{last_err}")
+    finally:
+        if prev is None:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = prev
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "requires a GPU")
+def test_sync_denom_param_flows_noop_without_dist():
+    # Same no-op contract as `param_flows`: without a process group the denominator must be untouched.
+    device = torch.device("cuda:0")
+    pc, ns = _build_gated_pc(device)
+    B = 16
+    torch.manual_seed(7)
+    x = torch.randint(0, 5, (B, 2), device = device)
+    phi = torch.randn(ns.external_params.tensor_shapes(ns, B)[0], device = device)
+    pc(x, sum_external_params = {ns: phi})
+    pc.backward(x, sum_external_params = {ns: phi}, logspace_flows = True,
+                flows_memory = 0.0, allow_modify_flows = False)
+
+    assert pc.denom_param_flows is not None
+    before = pc.denom_param_flows.clone()
+    pc.sync_param_flows()
+    pc.sync_param_flows(dtype = torch.bfloat16)
+    assert torch.equal(pc.denom_param_flows, before)
+
+
 if __name__ == "__main__":
     test_sync_param_flows_noop_without_dist()
     test_sync_param_flows_ddp()
+    test_sync_denom_param_flows_noop_without_dist()
+    test_sync_denom_param_flows_ddp()
