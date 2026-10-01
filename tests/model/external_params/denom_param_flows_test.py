@@ -431,6 +431,59 @@ def test_denom_accumulates_across_backward_calls(split):
 
 
 @cuda_only
+def test_anemone_momentum_smooths_the_denominator_too():
+    """Momentum must pass the DENOMINATOR through the same EMA as the numerator.
+
+    The conditional M-step forms `theta * F+ / F-` and its stationary point is `F+ == F-`. Smoothing
+    only the numerator divides an averaged quantity by an instantaneous one, which breaks that identity
+    and rescales parameters that exact EM would leave alone. Legitimate in the stored gate space because
+    `F- = theta * W` is linear in `W`.
+
+    Pinned at the buffer level: feed numerator and denominator the SAME value each round, so equal in
+    must mean equal out. A trained-model check could not see this -- the error is a smooth rescaling,
+    not a blow-up.
+
+    The fed value MUST VARY between rounds. A bias-corrected EMA returns a constant input exactly --
+    that is what the correction is for -- so feeding the same number every round makes the EMA an
+    identity and the test passes whether or not the denominator rides it. VERIFIED by negative control:
+    with a constant 3.0 this test passed with the denominator's EMA disabled; with the ramp below it
+    fails, numerator 3.105 against denominator 5.0.
+    """
+    dev = torch.device("cuda:0")
+    root, ns = _build(gated = True)
+    pc = juice.compile(root, verbose = False).to(dev)
+    opt = juice.optim.Anemone(pc, step_size = 0.4, momentum = 0.9, pseudocount = 0.01)
+
+    B = 32
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    phi = _phi(ns, B, dev)
+    pc(x, sum_external_params = {ns: phi})
+    pc.backward(x, sum_external_params = {ns: phi}, logspace_flows = True,
+                flows_memory = 0.0, allow_modify_flows = False)
+    assert pc.denom_param_flows is not None
+
+    seen_smoothing = False
+    for update, fed in enumerate((1.0, 5.0, 2.0)):       # VARYING -- see the docstring
+        pc.param_flows[:] = fed
+        pc.denom_param_flows[:] = fed
+        opt._apply_momentum()
+        opt._num_updates += 1
+
+        fp, fm = pc.param_flows, pc.denom_param_flows
+        assert float(fp.std()) < 1e-5 and float(fm.std()) < 1e-5, "the EMA should keep a constant flat"
+        a, b = float(fp.mean()), float(fm.mean())
+        assert abs(a - b) / max(abs(a), 1e-20) < 1e-5, \
+            f"update {update}: numerator scaled to {a} but denominator to {b}"
+        if abs(a - fed) / fed > 1e-3:
+            seen_smoothing = True
+
+    # the arm that makes the equality above meaningful: the EMA has to have actually CHANGED something,
+    # or "equal in, equal out" holds trivially and the test cannot see a missing denominator EMA
+    assert seen_smoothing, "the EMA never moved a value, so this test would pass either way"
+
+
+@cuda_only
 def test_em_correction_preserves_zero_parameters():
     """`keep_zero_params = True` must leave an exactly-zero parameter at zero through the CORRECTED
     M-step, and the surviving children must still renormalize to one without it.

@@ -23,7 +23,8 @@ class Anemone(CircuitOptimizer):
             lls.mean().backward()
             opt.step()              # fires the update every `niters_per_update` minibatches
 
-    The momentum is applied to both ``pc.param_flows`` and each input layer's ``param_flows`` as::
+    The momentum is applied to ``pc.param_flows``, each input layer's ``param_flows``, and --- when a
+    parameterization requests it (``apply_z_correction``) --- ``pc.denom_param_flows``, as::
 
         f       <- (1 - momentum) * f
         buffer  <- momentum * buffer + f
@@ -62,6 +63,7 @@ class Anemone(CircuitOptimizer):
         self._num_updates = 0          # number of EM updates performed (for momentum bias correction)
         self._momentum_sum = None      # EMA buffer for pc.param_flows
         self._momentum_input = None    # EMA buffers for the input layers' param_flows
+        self._momentum_denom = None    # EMA buffer for pc.denom_param_flows (apply_z_correction only)
 
     def step(self, step_size: Optional[float] = None):
         self._iter += 1
@@ -103,3 +105,15 @@ class Anemone(CircuitOptimizer):
             _ema(self.pc.param_flows, self._momentum_sum)
             for layer, buffer in zip(self.pc.input_layer_group, self._momentum_input):
                 _ema(layer.param_flows, buffer)
+
+            # The DENOMINATOR flow must ride the SAME EMA as the numerator (`apply_z_correction` only;
+            # `None` otherwise, so an ordinary circuit is untouched). The conditional M-step forms
+            # `theta * F+ / F-`, and its stationary point is `F+ == F-`; smoothing only the numerator
+            # divides an averaged quantity by an instantaneous one, which breaks that identity and moves
+            # parameters that exact EM would leave alone. Averaging is legitimate in the stored gate
+            # space because `F- = theta * W` is LINEAR in `W`, so an EMA of `W` is an EMA of `F-`.
+            denom = getattr(self.pc, "denom_param_flows", None)
+            if denom is not None:
+                if self._momentum_denom is None:
+                    self._momentum_denom = torch.zeros_like(denom)
+                _ema(denom, self._momentum_denom)
