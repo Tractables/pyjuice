@@ -837,6 +837,135 @@ def test_em_optimizer_classes_train_a_corrected_circuit(opt_name):
 
 
 @cuda_only
+@pytest.mark.parametrize("block_size,n_blocks,ch_block_size", [
+    (2, 2, 1),      # narrowest block, one-wide gate
+    (4, 2, 2),
+    (4, 3, 2),      # ragged
+    (4, 5, 2),      # ragged, wider
+    (8, 4, 4),
+    (16, 8, 2),
+    (32, 2, 4),
+])
+@pytest.mark.parametrize("step_size,pseudocount,keep_zero",
+                         [(1.0, 0.0, False), (0.5, 0.1, False), (1.0, 2.0, False), (0.5, 0.1, True)])
+def test_fused_em_correction_matches_the_torch_reference(block_size, n_blocks, ch_block_size,
+                                                         step_size, pseudocount, keep_zero):
+    """The FUSED conditional M-step must reproduce the torch reference it replaced.
+
+    The torch body of `compute_em_correction` is the implementation the finite-difference and
+    one-gate-equals-standard tests validated; the two Triton kernels are an optimization of it (~38 ATen
+    ops per `ns` down to two launches), so the reference is the oracle and this is the pin. Both paths run
+    in ONE process against the SAME flows and parameters, so nothing but the code path differs.
+
+    `_fused_em_correction` returning non-None is asserted as well: it declines shapes it cannot serve and
+    the caller then runs the reference, which would make a comparison of "both paths" vacuous.
+    """
+    import pyjuice.nodes.external_params.block_scale as bsmod
+
+    dev = torch.device("cuda:0")
+    root, ns = _build_shape(block_size, n_blocks, ch_block_size)
+    pc = juice.compile(root, verbose = False).to(dev)
+    B = 96
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    phi = _phi(ns, B, dev)
+    pc(x, sum_external_params = {ns: phi})
+    pc.backward(x, sum_external_params = {ns: phi}, logspace_flows = True,
+                flows_memory = 0.0, allow_modify_flows = False)
+
+    sources = pc._denom_correction_nss()[ns]
+    desc = ns.external_params
+    args = (ns, pc.params, pc.param_flows, pc.denom_param_flows, step_size, pseudocount, keep_zero)
+
+    assert desc._fused_em_correction(*args, sources) is not None, \
+        "the fused path declined this shape, so this test would compare the reference with itself"
+
+    prev = bsmod._EM_FUSED
+    try:
+        bsmod._EM_FUSED = True
+        fused = desc.compute_em_correction(*args, denom_sources = sources).clone()
+        bsmod._EM_FUSED = False
+        ref = desc.compute_em_correction(*args, denom_sources = sources).clone()
+    finally:
+        bsmod._EM_FUSED = prev
+
+    assert torch.isfinite(fused).all()
+    rel = ((fused - ref).abs() / ref.abs().clamp_min(1e-20)).max().item()
+    assert rel < 1e-5, f"fused M-step differs from the torch reference: relmax={rel}"
+
+
+@cuda_only
+def test_fused_em_correction_matches_reference_for_shared_layer_and_ties():
+    """The two structural cases the per-shape test above cannot build: several gated `ns` in ONE layer
+    (so `row_map` has to separate them) and a TIE GROUP (so the members' `W` have to be summed)."""
+    import pyjuice.nodes.external_params.block_scale as bsmod
+
+    dev = torch.device("cuda:0")
+    B = 96
+
+    # (a) two gated ns sharing one layer
+    root, ga, gb = _build_two_gated()
+    pc = juice.compile(root, verbose = False).to(dev)
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [B, 4], device = dev)
+    ext = {g: _phi(g, B, dev) for g in (ga, gb)}
+    pc(x, sum_external_params = ext)
+    pc.backward(x, sum_external_params = ext, logspace_flows = True,
+                flows_memory = 0.0, allow_modify_flows = False)
+    cases = [(pc, g, pc._denom_correction_nss()[g]) for g in (ga, gb)]
+
+    # (b) a tied chain -- one correction target, several members contributing W
+    K, gate_cbs, steps = 16, 2, 4
+    torch.manual_seed(0)
+    with juice.set_block_size(K):
+        nsx = inputs(0, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
+        src, copies = None, []
+        for t in range(1, steps):
+            emit = inputs(t, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
+            prod = multiply(nsx, emit)
+            if src is None:
+                nsx = src = summate(prod, num_node_blocks = 1,
+                                    external_params = BlockScaleSumParams(
+                                        ch_block_size = gate_cbs, apply_z_correction = True))
+            else:
+                nsx = src.duplicate(prod, tie_params = True)
+            copies.append(nsx)
+        root2 = summate(multiply(nsx), num_node_blocks = 1, block_size = 1)
+    torch.manual_seed(0)
+    root2.init_parameters(perturbation = 2.0)
+    pc2 = juice.compile(root2, verbose = False).to(dev)
+    torch.manual_seed(7)
+    x2 = torch.randint(0, NUM_CATS, [B, steps], device = dev)
+    torch.manual_seed(11)
+    phi2 = torch.randn([B, 1, K // gate_cbs], device = dev)
+    ext2 = {c: phi2 for c in copies}
+    pc2(x2, sum_external_params = ext2)
+    pc2.backward(x2, sum_external_params = ext2, logspace_flows = True,
+                 flows_memory = 0.0, allow_modify_flows = False)
+    from pyjuice.model.backend.parflow_fusing import compute_cum_par_flows
+    compute_cum_par_flows(pc2.param_flows, pc2.parflow_fusing_kwargs)
+    srcs2 = pc2._denom_correction_nss()
+    assert len(srcs2[src]) == len(copies) > 1, srcs2[src]
+    cases.append((pc2, src, srcs2[src]))
+
+    prev = bsmod._EM_FUSED
+    try:
+        for pcx, tgt, sources in cases:
+            desc = tgt.external_params
+            args = (tgt, pcx.params, pcx.param_flows, pcx.denom_param_flows, 0.5, 0.1, False)
+            assert desc._fused_em_correction(*args, sources) is not None, \
+                f"the fused path declined {tgt}; this case would compare the reference with itself"
+            bsmod._EM_FUSED = True
+            fused = desc.compute_em_correction(*args, denom_sources = sources).clone()
+            bsmod._EM_FUSED = False
+            ref = desc.compute_em_correction(*args, denom_sources = sources).clone()
+            rel = ((fused - ref).abs() / ref.abs().clamp_min(1e-20)).max().item()
+            assert rel < 1e-5, f"{tgt}: fused differs from the reference (relmax={rel})"
+    finally:
+        bsmod._EM_FUSED = prev
+
+
+@cuda_only
 def test_denom_sums_over_a_tie_group():
     """A tied copy shares `ns._param_range`, so EVERY copy's flow has to reach the M-step of the node
     that owns those parameters.
