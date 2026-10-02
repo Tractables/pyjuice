@@ -62,6 +62,28 @@ def _buffer_kwarg() -> str:
 # `storage_shapes`) and the compiled edge count is a whole number of child blocks (checked in
 # `_build_plan`), which is what makes the gate axis a clean quotient of the edge axis.
 
+# The conditional M-step as two Triton kernels instead of ~38 eager ATen ops per `ns` (MEASURED
+# dispatch-bound, growing with the NODE count rather than the parameter count). `=0` restores the torch
+# reference, which is what the fused path is validated against -- keep it working, it is the oracle.
+_EM_FUSED = os.environ.get("PYJUICE_BLOCKSCALE_EM_FUSED", "1") != "0"
+# Elements per tile of the fused M-step kernels. See the note at the launch site: this kernel
+# carries ~3x the live tiles of the scatter, so it needs a smaller budget than 4096.
+_EM_TILE_BUDGET = int(os.environ.get("PYJUICE_BLOCKSCALE_EM_TILE", "1024"))
+
+# `torch.cuda.get_device_properties` is cheap here (~1.3 us, PyTorch caches it) but the fused
+# M-step asks for the SM count once per `ns` per partition, so it is cached anyway.
+_EM_SM_COUNT = {}
+
+
+def _em_sm_count(device):
+    idx = torch.cuda.current_device() if device is None else torch.device(device).index
+    if idx is None:
+        idx = torch.cuda.current_device()
+    n = _EM_SM_COUNT.get(idx)
+    if n is None:
+        n = _EM_SM_COUNT[idx] = torch.cuda.get_device_properties(idx).multi_processor_count
+    return n
+
 
 class BlockScaleSumParams(ExternalSumParams):
     """
@@ -2184,6 +2206,227 @@ class BlockScaleSumParams(ExternalSumParams):
 
         return out
 
+    def _fused_em_correction(self, ns, params, param_flows, denom_param_flows, step_size,
+                             pseudocount, keep_zero_params, denom_sources):
+        """
+        The conditional M-step as two Triton kernels, or `None` when this shape is not served (the caller
+        then runs the torch reference).
+
+        Replaces the eager chain AND the `F-` reconstruction: `F-[n,c] = theta[n,c] * W[n,g(c)]`, so `W`
+        is gathered in-kernel and `F-` is never materialized.
+
+        A TIE GROUP needs `F- = theta * sum over members of W`, and the members' `W` live in their own
+        layers' slices. They are summed here, which is only meaningful if every member's gate geometry
+        and row count line up with the source's -- checked, and the shape is declined if not. Everything
+        else about the group already works through the source: `pids` address the shared `_param_range`,
+        and `pfids` address the source's param-flow range, which `compute_cum_par_flows` has already
+        fused.
+        """
+        import triton
+        from .kernels.blockscale_backward import (_bs_triton_em_cum_kernel,
+                                                  _bs_triton_em_update_kernel)
+
+        sources = list(denom_sources)
+        if len(sources) == 0:
+            return None
+
+        layer = sources[0][0]
+        geom = self.denom_gate_geometry(layer)
+        gate_cbs = self.gate_sizes(layer.nodes[0])[1]
+        block_size = layer.block_size
+        dev = params.device
+
+        # Every member must be elementwise-addable onto the source's `W`, or the sum below is meaningless.
+        for other_layer, _ in sources[1:]:
+            if other_layer.num_fw_partitions != layer.num_fw_partitions:
+                return None
+            if self.denom_gate_geometry(other_layer) != geom:
+                return None
+            if self.gate_sizes(other_layer.nodes[0])[1] != gate_cbs:
+                return None
+            if other_layer.block_size != block_size:
+                return None
+
+        ps, pe = ns._param_range
+        pfs, pfe = ns._param_flow_range
+        size = pfe - pfs
+        if size != pe - ps:
+            return None                      # the caller's reshape contract would not hold
+
+        cache = layer.__dict__.setdefault("_bs_em_fused_cache", {})
+        key = (ps, pe)
+        plan = cache.get(key)
+        if plan is None or plan["dev"] != str(dev):
+            # ROWS OF THIS `ns` ONLY. A partition may hold node blocks of several `ns`; selecting rows
+            # here (rather than masking writes afterwards) is what keeps them separate.
+            plan = {"dev": str(dev), "parts": []}
+            for pid in range(layer.num_fw_partitions):
+                pids = layer.partitioned_pids[pid]
+                cids = layer.partitioned_cids[pid]
+                mine = ((pids[:, 0] >= ps) & (pids[:, 0] < pe)).nonzero().flatten()
+                if mine.numel() == 0:
+                    plan["parts"].append(None)
+                    continue
+                kcount = (cids != 0).sum(dim = 1).to(torch.int32)      # children per node, per row
+                plan["parts"].append({"row_map": mine.to(torch.int32).contiguous().to(dev),
+                                      "kcount": kcount.contiguous().to(dev)})
+            nid_min = min(int(layer.partitioned_nids[pid][plan["parts"][pid]["row_map"].long()].min())
+                          for pid in range(layer.num_fw_partitions) if plan["parts"][pid] is not None)
+            nid_max = max(int(layer.partitioned_nids[pid][plan["parts"][pid]["row_map"].long()].max())
+                          for pid in range(layer.num_fw_partitions) if plan["parts"][pid] is not None)
+            plan["cum_base"] = nid_min
+            plan["cum_size"] = nid_max + block_size - nid_min
+            cache[key] = plan
+
+        if all(p is None for p in plan["parts"]):
+            return None
+
+        out = torch.zeros(size, device = dev, dtype = torch.float32)
+        cum = torch.zeros(plan["cum_size"], device = dev, dtype = torch.float32)
+
+        from pyjuice.layer.kernels import autotune
+
+        # ---- pass 1: the per-node normalizer, into `cum` ----
+        for pid in range(layer.num_fw_partitions):
+            part = plan["parts"][pid]
+            if part is None:
+                continue
+            rows, _, n_gates = geom[pid]
+            cids = layer.partitioned_cids[pid]
+            num_edges = cids.size(1)
+            n_rows = part["row_map"].numel()
+
+            W = self._denom_slice(layer, denom_param_flows, pid)
+            if len(sources) > 1:
+                W = W.clone()
+                for other_layer, _ in sources[1:]:
+                    W = W + self._denom_slice(other_layer, denom_param_flows, pid)
+
+            common = dict(mparams = params, param_flows = param_flows, W = W,
+                          cids = cids, pids = layer.partitioned_pids[pid],
+                          pfids = layer.partitioned_pfids[pid],
+                          nids = layer.partitioned_nids[pid], row_map = part["row_map"],
+                          kcount = part["kcount"], num_edges = num_edges, n_gates = n_gates,
+                          BLOCK_SIZE_M = block_size, GATE_CBS = gate_cbs,
+                          pseudocount = float(pseudocount), cum_base = plan["cum_base"],
+                          num_stages = 1)
+            cands = self._em_tile_candidates(block_size, num_edges, n_rows, dev)
+
+            def _cum(cfg, target_cum):
+                tm, tk = cfg
+                _bs_triton_em_cum_kernel[(triton.cdiv(num_edges, tk), n_rows * (block_size // tm))](
+                    cum = target_cum, TILE_SIZE_K = tk, TILE_SIZE_M = tm, **common)
+
+            # BENCHMARK INTO A SCRATCH. This kernel is read-accumulate-write (`tl.atomic_add` into
+            # `cum`), so timing it on the live buffer would add its contribution once per trial and
+            # leave the normalizer several times too large -- a silent wrong answer, not a crash. No
+            # scratch (OOM) means no tuning, never a tainted `cum`.
+            cfg = autotune.cached(("bs_em_cum", num_edges, n_gates, block_size, gate_cbs, n_rows))
+            if cfg is None:
+                sc = autotune.scratch_like(cum)
+                cfg = cands[0] if sc is None else autotune.pick(
+                    ("bs_em_cum", num_edges, n_gates, block_size, gate_cbs, n_rows), cands,
+                    lambda c: _cum(c, sc))
+            _cum(cfg, cum)
+            part["_common"] = common
+            part["_cands"] = cands
+            part["_shape"] = (num_edges, n_gates, n_rows)
+
+        # ---- pass 2: the update, into `out`. Runs only once every partition's `cum` is complete,
+        #      because a node's children may be split across partitions. ----
+        for pid in range(layer.num_fw_partitions):
+            part = plan["parts"][pid]
+            if part is None:
+                continue
+            common = part.pop("_common")
+            cands = part.pop("_cands")
+            num_edges, n_gates, n_rows = part.pop("_shape")
+
+            def _upd(cfg, target_out):
+                tm, tk = cfg
+                _bs_triton_em_update_kernel[(triton.cdiv(num_edges, tk),
+                                             n_rows * (block_size // tm))](
+                    cum = cum, out = target_out, step_size = float(step_size), out_base = pfs,
+                    out_size = size, KEEP_ZERO = 1 if keep_zero_params else 0,
+                    TILE_SIZE_K = tk, TILE_SIZE_M = tm, **common)
+
+            # A pure overwrite, so re-running it is harmless -- but it is still benchmarked into a
+            # scratch, because it reads `cum` and writes the buffer this function RETURNS, and a trial
+            # left in `out` for a partition the real launch then skips would be returned as a result.
+            key = ("bs_em_upd", num_edges, n_gates, block_size, gate_cbs, n_rows,
+                   bool(keep_zero_params))
+            cfg = autotune.cached(key)
+            if cfg is None:
+                so = autotune.scratch_like(out)
+                cfg = cands[0] if so is None else autotune.pick(key, cands,
+                                                                lambda c: _upd(c, so))
+            _upd(cfg, out)
+
+        return out
+
+    @staticmethod
+    def _em_tile_candidates(block_size, num_edges, n_rows, dev):
+        """`(TILE_SIZE_M, TILE_SIZE_K)` candidates for the fused M-step kernels, heuristic default first.
+
+        `TILE_SIZE_M` MUST divide `block_size`: the kernels derive `M_TILES = BLOCK_SIZE_M //
+        TILE_SIZE_M` and index `pid_m * TILE_SIZE_M + arange(TILE_SIZE_M)` unmasked, so a tile that does
+        not tile the block exactly would both miss nodes and read past it. Only powers of two are
+        offered, which guarantees it for pyjuice's power-of-two block sizes.
+
+        WHY THE SPLIT IS WORTH MEASURING: `offs_node` is the CONTIGUOUS axis of `mparams`/`param_flows`
+        (consecutive edges stride by `block_size`), so `TILE_SIZE_M` sets the length of each coalesced
+        run while `TILE_SIZE_K` only adds strided rows. MEASURED at HMM 2048 -- these kernels reached
+        330-390 GB/s at a 32x32 tile where the scatter kernel, same access pattern but ~2 live tiles
+        instead of ~6, reached 753 GB/s at 64x64. Which (TM, TK) wins therefore trades coalescing
+        against register pressure, and that trade moves with the shape; a budget heuristic picked TK
+        first and gave TM the remainder, which is backwards.
+
+        `TILE_SIZE_K` groups the normalizer's REDUCTION, so varying it reassociates `sum_c theta*ratio`.
+        That is benign here and nowhere else would be: the summands are non-negative (no cancellation)
+        and carry no max-stabilization, and the cross-tile combine is already `tl.atomic_add`, i.e.
+        order-nondeterministic from run to run -- so TK only reorders a sum that was never
+        deterministic. The fused-vs-reference test bounds the whole path at 1e-5 while candidates
+        differ at ~1e-7.
+        """
+        import triton
+
+        target = 4 * _em_sm_count(dev)
+        ne_pow2 = triton.next_power_of_2(num_edges)
+
+        def legal(tm, tk):
+            tm = max(1, min(tm, block_size))
+            if block_size % tm != 0:
+                return None
+            return (tm, max(1, min(tk, ne_pow2)))
+
+        # the heuristic default, kept as candidates[0] so tuning off reproduces today's behaviour
+        tk0 = max(1, min(ne_pow2, 32))
+        tm0 = max(1, min(block_size, max(1, _EM_TILE_BUDGET // tk0)))
+        floor = 16 if block_size >= 16 else 1
+        while tm0 > floor and triton.cdiv(num_edges, tk0) * n_rows * (block_size // tm0) < target:
+            tm0 //= 2
+        while tk0 > 8 and triton.cdiv(num_edges, tk0) * n_rows * (block_size // tm0) < target:
+            tk0 //= 2
+
+        # Spans tile BUDGETS 1024-8192 as well as the TM/TK split, because neither alone is right
+        # everywhere: MEASURED, HMM 2048 prefers a 1024-element tile (3315 us against 4123 at 4096)
+        # while HMM 512 prefers 4096 (901 us against 1086 at 1024) -- a 20% swing in OPPOSITE
+        # directions. Picking one budget globally is what made 512 regress, and is why this is tuned
+        # per shape rather than reasoned about. `(64, 64)` is the config the scatter kernel settles on.
+        out, seen = [], set()
+        # Small tiles are in the list for a reason: at HMM 512 a 64x64 tile leaves only 64 programs
+        # against a ~752-program target, so the grid, not the tile, is the binding constraint there --
+        # MEASURED, the shape prefers ~16x16 (901 us) over 32x32 (1086). At 2048 the same shape space
+        # prefers 32x32. The optimum therefore moves with the GRID as well as the register budget,
+        # which is the whole reason this is measured per shape instead of being a formula.
+        for cand in [(tm0, tk0), (64, 64), (128, 32), (64, 32), (128, 16), (64, 16), (32, 32),
+                     (32, 16), (16, 16), (16, 32), (256, 16), (32, 64)]:
+            c = legal(*cand)
+            if c is not None and c not in seen:
+                seen.add(c)
+                out.append(c)
+        return out
+
     def compute_em_correction(self, ns, params, param_flows, denom_param_flows, step_size,
                               pseudocount, keep_zero_params, denom_sources = ()):
         """
@@ -2191,10 +2434,24 @@ class BlockScaleSumParams(ExternalSumParams):
         in the multiplicative MAP form that mirrors `SoftEvidenceCategorical`'s dual EM. Returns the new
         parameters for `ns._param_range`; the PC writes them back over the standard update.
 
-        Torch, not a kernel: it runs ONCE PER EM STEP and has no batch axis (F+, F-, theta are all
-        param-sized), so it is a sliver of a training step. Node-level layout `[E, ch_block_size,
-        block_size]` (edge block, child-in-block, node-in-block), the same `params` uses.
+        FUSED into two Triton kernels when the shape allows (`_fused_em_correction`); the torch body
+        below is the reference it is validated against, and the fallback. It is reached for a tie group
+        whose members' gate geometry does not line up, and under
+        `PYJUICE_BLOCKSCALE_EM_FUSED=0`.
+
+        The torch form runs ONCE PER EM STEP and has no batch axis (F+, F-, theta are all param-sized),
+        which is why it was torch to begin with -- but it is ~38 ATen ops PER `ns` and MEASURED
+        dispatch-bound (2964 us of a 4887 us M step at HMM 2048 / 15 nodes, growing 319 us per `ns`), so
+        the node count, not the parameter count, set its cost. Node-level layout
+        `[E, ch_block_size, block_size]` (edge block, child-in-block, node-in-block), the same `params`
+        uses.
         """
+        if _EM_FUSED:
+            fused = self._fused_em_correction(ns, params, param_flows, denom_param_flows, step_size,
+                                              pseudocount, keep_zero_params, denom_sources)
+            if fused is not None:
+                return fused
+
         ps, pe = ns._param_range
         pfs, pfe = ns._param_flow_range
         bs, cbs = ns.block_size, ns.ch_block_size

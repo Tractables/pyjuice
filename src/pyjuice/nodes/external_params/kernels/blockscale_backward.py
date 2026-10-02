@@ -608,3 +608,129 @@ def _bs_triton_denom_scatter_kernel(W, mparams, out, cids, pids, pfids,
         tl.atomic_add(ptr, theta * w, mask = inside)
     else:
         tl.store(ptr, tl.load(ptr, mask = inside, other = 0.0) + theta * w, mask = inside)
+
+
+# ---------------------------------------------------------------- the fused conditional M-step
+#
+# `compute_em_correction` was ~38 ATen ops PER `ns`, and MEASURED purely dispatch-bound: at HMM 2048 with
+# 15 gated nodes the eager arithmetic was 2964 us of a 4887 us M step with cpu >= wall, and it grew
+# linearly in the node count (319 us per `ns`) rather than in the parameter count. These two kernels
+# replace all of it with the same two-pass shape `em_par_update` already uses -- a per-node normalizer
+# pass, then an update pass -- so the cost becomes one pass of traffic instead of ~18.
+#
+# They also subsume the `F-` RECONSTRUCTION: `F-[n,c] = theta[n,c] * W[n, g(c)]`, so `W` is gathered
+# in-kernel and `F-` is never materialized. That removes both the extra read/write pair and the
+# parameter-sized scratch it needed.
+#
+# COORDINATES. Both work in the layer's COMPILED space -- `pids` / `pfids` / `cids` per (row, edge slot),
+# plus `offs_node` within the block -- exactly as `_bs_triton_denom_scatter_kernel` does, so no new index
+# derivation is introduced and padded slots (`cids == 0`) are masked out as everywhere else. `row_map`
+# selects the rows of the ONE `ns` being updated, which is what keeps several `ns` in one layer separate.
+#
+# `kcount[row]` is the number of children of each node of that row (the count of real edge slots), i.e.
+# the torch path's `eblk_per_nb[nb] * ch_block_size`. It sets the pseudocount split.
+
+
+@triton_jit
+def _bs_triton_em_cum_kernel(mparams, param_flows, W, cum, cids, pids, pfids, nids, row_map, kcount,
+                             num_edges: tl.constexpr, n_gates: tl.constexpr,
+                             TILE_SIZE_K: tl.constexpr, TILE_SIZE_M: tl.constexpr,
+                             BLOCK_SIZE_M: tl.constexpr, GATE_CBS: tl.constexpr,
+                             pseudocount, cum_base):
+    """
+    Pass 1: `cum[n] += sum_c theta[n,c] * ratio[n,c]`, the per-node normalizer of the dual M-step, with
+
+        ratio[n,c] = (F+[n,c] + pseudocount / K[n]) / (theta[n,c] * W[n,g(c)] + pseudocount * theta[n,c])
+
+    ATOMIC into `cum`, because a node's children may be split across edge tiles AND across forward
+    partitions -- the normalizer has to sum over all of them before pass 2 divides by it. Indexed by
+    GLOBAL node id minus `cum_base` for the same reason: the buffer has to be shared across partitions.
+    """
+    pid_k = tl.program_id(0)
+    pid_y = tl.program_id(1)
+
+    M_TILES: tl.constexpr = BLOCK_SIZE_M // TILE_SIZE_M
+    nblock_id = tl.load(row_map + pid_y // M_TILES)
+    pid_m = pid_y % M_TILES
+    offs_node = pid_m * TILE_SIZE_M + tl.arange(0, TILE_SIZE_M)
+    offs_edge = pid_k * TILE_SIZE_K + tl.arange(0, TILE_SIZE_K)
+    emask = offs_edge < num_edges
+
+    cid = tl.load(cids + nblock_id * num_edges + offs_edge, mask = emask, other = 0)
+    real = emask & (cid != 0)
+
+    par = tl.load(pids + nblock_id * num_edges + offs_edge, mask = emask, other = 0)
+    pf = tl.load(pfids + nblock_id * num_edges + offs_edge, mask = emask, other = 0)
+    theta = tl.load(mparams + par[None,:] + offs_node[:,None], mask = real[None,:], other = 0.0)
+    fp = tl.load(param_flows + pf[None,:] + offs_node[:,None], mask = real[None,:], other = 0.0)
+
+    gidx = offs_edge // GATE_CBS
+    w = tl.load(W + (nblock_id * BLOCK_SIZE_M + offs_node)[:,None] * n_gates + gidx[None,:],
+                mask = real[None,:] & (gidx < n_gates)[None,:], other = 0.0)
+
+    k = tl.load(kcount + nblock_id).to(tl.float32)
+    # the MAP form: denominator `F- + pseudocount * theta`, not `+ pseudocount`
+    den = tl.maximum(theta * w + pseudocount * theta, 1e-38)
+    ratio = (fp + pseudocount / k) / den
+    acc = tl.sum(tl.where(real[None,:], theta * ratio, 0.0), axis = 1)          # [M]
+
+    nid = tl.load(nids + nblock_id)
+    tl.atomic_add(cum + (nid + offs_node - cum_base), acc)
+
+
+@triton_jit
+def _bs_triton_em_update_kernel(mparams, param_flows, W, cum, out, cids, pids, pfids, nids, row_map,
+                                kcount, num_edges: tl.constexpr, n_gates: tl.constexpr,
+                                TILE_SIZE_K: tl.constexpr, TILE_SIZE_M: tl.constexpr,
+                                BLOCK_SIZE_M: tl.constexpr, GATE_CBS: tl.constexpr,
+                                pseudocount, cum_base, step_size, out_base, out_size,
+                                KEEP_ZERO: tl.constexpr):
+    """
+    Pass 2: `out[pfid] = clamp(theta * ((1-s) + s*ratio) / ((1-s) + s*cum[n]), min = 1e-30)`.
+
+    `ratio` is RECOMPUTED rather than stored. It is three flops over values this kernel has to read
+    anyway, against a parameter-sized round trip to keep it -- and keeping it is what the eager path did.
+
+    Writes to `out` (a buffer the caller sizes for `ns._param_range`) at `pfid - out_base`, NOT to
+    `mparams`: the PC's contract is that this returns the new parameters and applies them AFTER the
+    standard `em_par_update`, so writing `mparams` here would be overwritten. The offset is masked and
+    clamped, as in the scatter kernel.
+    """
+    pid_k = tl.program_id(0)
+    pid_y = tl.program_id(1)
+
+    M_TILES: tl.constexpr = BLOCK_SIZE_M // TILE_SIZE_M
+    nblock_id = tl.load(row_map + pid_y // M_TILES)
+    pid_m = pid_y % M_TILES
+    offs_node = pid_m * TILE_SIZE_M + tl.arange(0, TILE_SIZE_M)
+    offs_edge = pid_k * TILE_SIZE_K + tl.arange(0, TILE_SIZE_K)
+    emask = offs_edge < num_edges
+
+    cid = tl.load(cids + nblock_id * num_edges + offs_edge, mask = emask, other = 0)
+    real = emask & (cid != 0)
+
+    par = tl.load(pids + nblock_id * num_edges + offs_edge, mask = emask, other = 0)
+    pf = tl.load(pfids + nblock_id * num_edges + offs_edge, mask = emask, other = 0)
+    theta = tl.load(mparams + par[None,:] + offs_node[:,None], mask = real[None,:], other = 0.0)
+    fp = tl.load(param_flows + pf[None,:] + offs_node[:,None], mask = real[None,:], other = 0.0)
+
+    gidx = offs_edge // GATE_CBS
+    w = tl.load(W + (nblock_id * BLOCK_SIZE_M + offs_node)[:,None] * n_gates + gidx[None,:],
+                mask = real[None,:] & (gidx < n_gates)[None,:], other = 0.0)
+
+    k = tl.load(kcount + nblock_id).to(tl.float32)
+    den = tl.maximum(theta * w + pseudocount * theta, 1e-38)
+    ratio = (fp + pseudocount / k) / den
+
+    nid = tl.load(nids + nblock_id)
+    c = tl.load(cum + (nid + offs_node - cum_base))                            # [M]
+    c = tl.maximum((1.0 - step_size) + step_size * c, 1e-38)
+
+    new = theta * ((1.0 - step_size) + step_size * ratio) / c[:,None]
+    new = tl.maximum(new, 1e-30)                                               # momentum-underflow guard
+    if KEEP_ZERO:
+        new = tl.where(theta < 1e-12, 0.0, new)
+
+    off = pf[None,:] + offs_node[:,None] - out_base
+    inside = real[None,:] & (off >= 0) & (off < out_size)
+    tl.store(out + tl.maximum(tl.minimum(off, out_size - 1), 0), new, mask = inside)
