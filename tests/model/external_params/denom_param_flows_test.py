@@ -584,6 +584,258 @@ def test_em_correction_preserves_zero_parameters():
         "`keep_zero_params = False` left the zeros at zero, so the True arm proves nothing"
 
 
+def _build_two_gated(seed = 0):
+    """Two INDEPENDENT gated `ns` that compile into ONE layer (verified by the test)."""
+    torch.manual_seed(seed)
+    with juice.set_block_size(4):
+        i = [inputs(v, num_node_blocks = 2, dist = dists.Categorical(num_cats = NUM_CATS))
+             for v in range(4)]
+        ga = summate(multiply(i[0], i[1]), num_node_blocks = 2,
+                     external_params = BlockScaleSumParams(ch_block_size = 2,
+                                                           apply_z_correction = True))
+        gb = summate(multiply(i[2], i[3]), num_node_blocks = 2,
+                     external_params = BlockScaleSumParams(ch_block_size = 2,
+                                                           apply_z_correction = True))
+        root = summate(multiply(ga, gb), num_node_blocks = 1, block_size = 1)
+    torch.manual_seed(seed)
+    root.init_parameters(perturbation = 2.0)
+    return root, ga, gb
+
+
+@cuda_only
+def test_two_gated_ns_sharing_one_layer_do_not_mix_denominators():
+    """Two gated `ns` in the SAME layer share one `W` slice, and only a bound mask separates them.
+
+    The reconstruction is called once per `ns` with that `ns`'s `pfid` base, over a partition holding
+    BOTH nodes' blocks; rows belonging to the other `ns` land outside `[0, out_size)` and are dropped
+    (`materialize_denom_flows`' branchless clamp exists for exactly this). If the mask leaked, one `ns`
+    would absorb the other's flow -- and every other test in this file has one gated `ns` per layer, so
+    nothing exercised it.
+
+    Checked by per-`ns` CONSERVATION (`sum_c F-[n,c] == sum_b f_b[n]`) plus finite differences, both
+    reference-free, and both covering the shared-layer reconstruction: a zero-`theta` break in the scatter
+    kernel fails this test, so the values really do come from it.
+
+    WHAT THIS TEST DOES *NOT* PIN: the bound mask itself. MEASURED -- deleting
+    `(off >= 0) & (off < out_size)` (keeping the clamp) leaves the output BITWISE identical, and neither
+    arm notices. The reason is a lost-update race, not invariance: the foreign rows all clamp onto one
+    element, and the program that legitimately owns it loads before they store and then stores over them.
+    So the mask is still necessary -- without it the result is a race whose outcome is undefined, it just
+    happens to resolve favourably at this shape -- but no deterministic assertion here can detect its
+    absence. Do not read a pass as evidence that the mask is intact.
+    """
+    dev = torch.device("cuda:0")
+    root, ga, gb = _build_two_gated()
+    pc = juice.compile(root, verbose = False).to(dev)
+
+    lay_a, lay_b = pc.external_params_nodes[ga], pc.external_params_nodes[gb]
+    assert lay_a is lay_b, "the fixture no longer puts both gated ns in one layer; this test is moot"
+    assert len(lay_a.denom_flow_slices) == lay_a.num_fw_partitions
+    assert set(pc._denom_correction_nss()) == {ga, gb}
+
+    B = 64
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [B, 4], device = dev)
+    phis = {ga: _phi(ga, B, dev), gb: _phi(gb, B, dev)}
+
+    pc(x, sum_external_params = phis)
+    pc.backward(x, sum_external_params = phis, logspace_flows = True,
+                flows_memory = 0.0, allow_modify_flows = False)
+    Fp = pc.param_flows.clone()
+    Fm = {g: _fminus(pc, g) for g in (ga, gb)}
+    for g in (ga, gb):
+        a, b = g._param_flow_range
+        assert torch.count_nonzero(Fm[g][a:b]) > 0, "a gated ns got no F-"
+
+    # ---- per-ns conservation, restricted to THIS ns's rows of the shared partition ----
+    ar = torch.arange(4, device = dev)
+    for g in (ga, gb):
+        ps, pe = g._param_range
+        pfids, cids = lay_a.partitioned_pfids[0], lay_a.partitioned_cids[0]
+        pids, nids = lay_a.partitioned_pids[0], lay_a.partitioned_nids[0].long()
+        mine = [r for r in range(pids.size(0)) if ps <= int(pids[r, 0]) < pe]
+        assert len(mine) == g.num_node_blocks, (len(mine), g.num_node_blocks)
+        worst = 0.0
+        for r in mine:
+            gid = nids[r] + ar
+            flow = pc.node_flows[gid].double().exp().sum(-1)            # sum_b f_b per node
+            idx = (pfids[r][None, :] + ar[:, None]).long()              # [block_size, E]
+            real = (cids[r] != 0)[None, :].expand(4, pfids.size(1))
+            got = (Fm[g][idx].double() * real).sum(-1)                  # sum_c F- per node
+            keep = flow.abs() > 1e-8
+            if bool(keep.any()):
+                worst = max(worst, float(((got - flow).abs()[keep] / flow.abs()[keep]).max()))
+        assert worst < 1e-4, \
+            f"ns at {ps}:{pe} does not conserve node flow (relmax={worst}) -- its F- absorbed " \
+            f"another ns's rows from the shared partition"
+
+    def ll():
+        with torch.no_grad():
+            return pc(x, sum_external_params = phis).double().sum().item()
+
+    eps = 1e-2
+    for g in (ga, gb):
+        pids = lay_a.partitioned_pids[0]
+        pfids, cids = lay_a.partitioned_pfids[0], lay_a.partitioned_cids[0]
+        ps, pe = g._param_range
+        n, dmax, gmax = 0, 0.0, 0.0
+        for r in range(pids.size(0)):
+            for e in range(pids.size(1)):
+                pid = int(pids[r, e])
+                if int(cids[r, e]) == 0 or not (ps <= pid < pe):      # this ns's rows only
+                    continue
+                for m in (0, 2):
+                    pf = int(pfids[r, e]) + m
+                    g_an = float(Fp[pf] - Fm[g][pf])
+                    with torch.no_grad():
+                        o = float(pc.params[pid + m])
+                        pc.params[pid + m] = o * math.exp(eps); lp = ll()
+                        pc.params[pid + m] = o * math.exp(-eps); lm = ll()
+                        pc.params[pid + m] = o
+                    g_fd = (lp - lm) / (2 * eps)
+                    dmax = max(dmax, abs(g_fd - g_an))
+                    gmax = max(gmax, abs(g_an), abs(g_fd))
+                    n += 1
+        assert n >= 4, n
+        assert dmax / gmax < 5e-2, f"ns at {ps}:{pe}: dmax={dmax:.3e} gmax={gmax:.3e}"
+
+
+@cuda_only
+@pytest.mark.parametrize("step_size,pseudocount", [(1.0, 0.0), (0.5, 0.1)])
+def test_denom_correction_opt_out_matches_an_uncorrected_build(step_size, pseudocount):
+    """`mini_batch_em(_apply_denom_correction = False)` on a corrected circuit must reproduce the PLAIN
+    M-step exactly -- i.e. the same parameters as the identical circuit built with
+    `apply_z_correction = False`.
+
+    That is the contract the gradient optimizers' renormalization depends on, and it is also the
+    statement that having the correction AVAILABLE does not perturb the uncorrected path.
+    """
+    dev = torch.device("cuda:0")
+    B = 64
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+
+    out = {}
+    for corr in (True, False):
+        root, ns = _build(gated = corr, seed = 0)
+        pc = juice.compile(root, verbose = False).to(dev)
+        torch.manual_seed(5)
+        phi = _phi(ns, B, dev)
+        pc(x, sum_external_params = {ns: phi})
+        pc.backward(x, sum_external_params = {ns: phi}, logspace_flows = True,
+                    flows_memory = 0.0, allow_modify_flows = False)
+        assert (pc.denom_param_flows is not None) is corr
+        # the corrected circuit opts OUT; the uncorrected one has nothing to opt out of
+        pc.mini_batch_em(step_size = step_size, pseudocount = pseudocount,
+                         _apply_denom_correction = False)
+        out[corr] = pc.params.detach().clone()
+
+    rel = ((out[True] - out[False]).abs() / out[False].abs().clamp_min(1e-20)).max().item()
+    assert rel < 1e-5, f"opting out did not reproduce the plain M-step: relmax={rel}"
+
+
+@cuda_only
+@pytest.mark.parametrize("gated", [None, False], ids = ["plain", "gated_without_correction"])
+@pytest.mark.parametrize("rescale", [False, True], ids = ["mini_batch", "anemone"])
+def test_uncorrected_circuits_never_touch_the_denominator_machinery(gated, rescale):
+    """A circuit that does not request the denominator must not pay for it, in either EM mode.
+
+    Structural rather than numerical: nothing is allocated, and neither the top-down hook nor the `F-`
+    reconstruction is ever invoked. The reference-based checks that the PLAIN results are right live in
+    `tests/optim` (`top_down_prob_test`, `em_optimizers_test`); what is pinned here is that the gate-space
+    work stays inert, so a later change cannot start charging ordinary circuits for it.
+    """
+    dev = torch.device("cuda:0")
+    root, ns = _build(gated = gated)
+    pc = juice.compile(root, verbose = False).to(dev)
+    assert pc._requests_denom_param_flows is False
+    assert pc.num_denom_flows == 0
+
+    desc = BlockScaleSumParams
+    calls = []
+    orig_td, orig_mat = desc.accumulate_denom_top_down, desc.materialize_denom_flows
+    desc.accumulate_denom_top_down = lambda self, *a, **k: calls.append("top_down")
+    desc.materialize_denom_flows = lambda self, *a, **k: calls.append("materialize")
+    try:
+        B = 32
+        torch.manual_seed(3)
+        x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+        ext = {} if gated is None else {ns: _phi(ns, B, dev)}
+        for _ in range(2):
+            pc(x, sum_external_params = ext) if ext else pc(x)
+            pc.backward(x, sum_external_params = ext, logspace_flows = True,
+                        flows_memory = 0.0, allow_modify_flows = False) if ext else \
+                pc.backward(x, logspace_flows = True, flows_memory = 0.0,
+                            allow_modify_flows = False)
+            pc.mini_batch_em(step_size = 0.5, pseudocount = 0.01,
+                             step_size_rescaling = rescale, use_cudagraph = False)
+    finally:
+        desc.accumulate_denom_top_down, desc.materialize_denom_flows = orig_td, orig_mat
+
+    assert pc.denom_param_flows is None
+    assert calls == [], f"the denominator machinery ran on an uncorrected circuit: {calls}"
+    assert torch.isfinite(pc.params).all()
+
+
+@cuda_only
+@pytest.mark.parametrize("opt_name", ["FullBatchEM", "MiniBatchEM", "Anemone"])
+def test_em_optimizer_classes_train_a_corrected_circuit(opt_name):
+    """The three EM optimizers, through their PUBLIC interface, on a circuit with `apply_z_correction`.
+
+    The routing was verified by reading the code -- there is no separate `pc.full_batch_em`, all three
+    funnel into `mini_batch_em` -- but nothing drove them end to end, so a future change to any
+    optimizer's flow bookkeeping could silently bypass the correction. `FullBatchEM` is exact EM, so its
+    train LL must not decrease; the others get the structural checks.
+    """
+    dev = torch.device("cuda:0")
+    B = 64
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+
+    def train(corr):
+        root, ns = _build(gated = corr, seed = 1)
+        pc = juice.compile(root, verbose = False).to(dev)
+        kw = dict(pseudocount = 0.01)
+        if opt_name == "Anemone":
+            kw.update(step_size = 0.4, momentum = 0.9)
+        opt = getattr(juice.optim, opt_name)(pc, **kw)
+        torch.manual_seed(5)
+        phi = _phi(ns, B, dev)
+
+        lls = []
+        for _ in range(4):
+            opt.zero_flows()
+            lls.append(pc(x, sum_external_params = {ns: phi}).mean().item())
+            pc.backward(x, sum_external_params = {ns: phi}, logspace_flows = True,
+                        flows_memory = 1.0, allow_modify_flows = False)
+            opt.step()
+            assert torch.isfinite(pc.params).all(), f"{opt_name} produced non-finite parameters"
+
+        ps, pe = ns._param_range
+        E, cbs, bs = ns.edge_ids.size(1), ns.ch_block_size, ns.block_size
+        theta = pc.params[ps:pe].reshape(E, cbs, bs)
+        nb = ns.edge_ids[0].to(device = dev, dtype = torch.long)
+        tot = torch.zeros(ns.num_node_blocks, bs, device = dev)
+        tot.index_add_(0, nb, theta.sum(dim = 1))
+        assert (tot - 1.0).abs().max().item() < 1e-4, (tot - 1.0).abs().max().item()
+        return lls, pc.params.detach().clone()
+
+    lls, pars_on = train(corr = True)
+    _, pars_off = train(corr = False)
+
+    if opt_name == "FullBatchEM":        # exact EM: monotone in the train LL
+        assert min(lls[i + 1] - lls[i] for i in range(len(lls) - 1)) > -1e-3, lls
+
+    # THE CORRECTION MUST ACTUALLY REACH THIS OPTIMIZER. Without this arm the test is satisfied by the
+    # PLAIN M-step -- it is monotone and normalized too -- so a change that silently bypassed
+    # `compute_em_correction` would pass. The two runs are otherwise identical (same seeds, same data,
+    # same gate), and this fixture has two gates per node block, so the correction is not a no-op.
+    rel = ((pars_on - pars_off).abs() / pars_off.abs().clamp_min(1e-20)).max().item()
+    assert rel > 1e-3, \
+        f"{opt_name} gave the same parameters with and without the correction (relmax={rel}): the " \
+        f"conditional M-step did not reach this optimizer"
+
+
 @cuda_only
 def test_denom_sums_over_a_tie_group():
     """A tied copy shares `ns._param_range`, so EVERY copy's flow has to reach the M-step of the node
