@@ -70,6 +70,7 @@ _EM_FUSED = os.environ.get("PYJUICE_BLOCKSCALE_EM_FUSED", "1") != "0"
 # carries ~3x the live tiles of the scatter, so it needs a smaller budget than 4096.
 _EM_TILE_BUDGET = int(os.environ.get("PYJUICE_BLOCKSCALE_EM_TILE", "1024"))
 
+
 # `torch.cuda.get_device_properties` is cheap here (~1.3 us, PyTorch caches it) but the fused
 # M-step asks for the SM count once per `ns` per partition, so it is cached anyway.
 _EM_SM_COUNT = {}
@@ -2282,7 +2283,29 @@ class BlockScaleSumParams(ExternalSumParams):
             return None
 
         out = torch.zeros(size, device = dev, dtype = torch.float32)
+        out_base, out_size_ = pfs, size
         cum = torch.zeros(plan["cum_size"], device = dev, dtype = torch.float32)
+        # EVERY scalar the kernels use, fp32, on the DEVICE -- including the clamp thresholds.
+        # Triton types a Python float KERNEL ARGUMENT as fp64, and a Python float LITERAL inside the
+        # kernel (`tl.maximum(x, 1e-38)`) promotes too, so either one silently turns the whole
+        # `den`/`ratio`/`new` chain into double precision. That cost ~2x and was invisible until the
+        # single-kernel form made the accumulator loop-carried and Triton refused the type change.
+        # `em_par_update_kernel` loads its step size and pseudocount from a float32 tensor for the same
+        # reason. Order must match the `tl.load(consts + i)` offsets.
+        # CACHED by value: every `ns` of one EM step is called with the same step size and pseudocount,
+        # so building this per `ns` was 15 host-to-device copies per step. That is invisible at HMM 2048
+        # and it is not at 512, where this path is dispatch-bound -- MEASURED 1007 -> 1185 us when the
+        # allocation was per `ns`.
+        ckey = (float(pseudocount), float(step_size), str(dev))
+        cache_c = self.__dict__.setdefault("_bs_em_consts", {})
+        consts = cache_c.get(ckey)
+        if consts is None:
+            consts = cache_c[ckey] = torch.tensor(
+                [float(pseudocount), float(step_size), 1.0 - float(step_size),
+                 1e-38, 1e-30, 1e-12, 0.0], dtype = torch.float32, device = dev)
+            if len(cache_c) > 8:                      # a schedule sweeping step sizes must not grow it
+                for k in list(cache_c)[:-4]:
+                    del cache_c[k]
 
         from pyjuice.layer.kernels import autotune
 
@@ -2308,8 +2331,7 @@ class BlockScaleSumParams(ExternalSumParams):
                           nids = layer.partitioned_nids[pid], row_map = part["row_map"],
                           kcount = part["kcount"], num_edges = num_edges, n_gates = n_gates,
                           BLOCK_SIZE_M = block_size, GATE_CBS = gate_cbs,
-                          pseudocount = float(pseudocount), cum_base = plan["cum_base"],
-                          num_stages = 1)
+                          consts = consts, cum_base = plan["cum_base"], num_stages = 1)
             cands = self._em_tile_candidates(block_size, num_edges, n_rows, dev)
 
             def _cum(cfg, target_cum):
@@ -2346,8 +2368,8 @@ class BlockScaleSumParams(ExternalSumParams):
                 tm, tk = cfg
                 _bs_triton_em_update_kernel[(triton.cdiv(num_edges, tk),
                                              n_rows * (block_size // tm))](
-                    cum = cum, out = target_out, step_size = float(step_size), out_base = pfs,
-                    out_size = size, KEEP_ZERO = 1 if keep_zero_params else 0,
+                    cum = cum, out = target_out, out_base = out_base,
+                    out_size = out_size_, KEEP_ZERO = 1 if keep_zero_params else 0,
                     TILE_SIZE_K = tk, TILE_SIZE_M = tm, **common)
 
             # A pure overwrite, so re-running it is harmless -- but it is still benchmarked into a

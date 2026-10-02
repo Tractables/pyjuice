@@ -636,7 +636,7 @@ def _bs_triton_em_cum_kernel(mparams, param_flows, W, cum, cids, pids, pfids, ni
                              num_edges: tl.constexpr, n_gates: tl.constexpr,
                              TILE_SIZE_K: tl.constexpr, TILE_SIZE_M: tl.constexpr,
                              BLOCK_SIZE_M: tl.constexpr, GATE_CBS: tl.constexpr,
-                             pseudocount, cum_base):
+                             consts, cum_base):
     """
     Pass 1: `cum[n] += sum_c theta[n,c] * ratio[n,c]`, the per-node normalizer of the dual M-step, with
 
@@ -669,8 +669,20 @@ def _bs_triton_em_cum_kernel(mparams, param_flows, W, cum, cids, pids, pfids, ni
                 mask = real[None,:] & (gidx < n_gates)[None,:], other = 0.0)
 
     k = tl.load(kcount + nblock_id).to(tl.float32)
+    # fp32, NOT Python float arguments. Triton types a float argument as fp64, which silently promoted
+    # the whole `den` / `ratio` chain here to DOUBLE precision -- caught only because the single-kernel
+    # form made `acc` loop-carried and Triton then refused the type change. This is why
+    # `em_par_update_kernel` loads its step size and pseudocount from a float32 tensor rather than
+    # taking them as arguments.
+    pseudocount = tl.load(consts)
+    step_size = tl.load(consts + 1)
+    one_m_s = tl.load(consts + 2)
+    tiny_den = tl.load(consts + 3)       # 1e-38, the division guard
+    tiny_par = tl.load(consts + 4)       # 1e-30, the momentum-underflow floor
+    zero_thr = tl.load(consts + 5)       # 1e-12, the `keep_zero_params` threshold
+    zero = tl.load(consts + 6)           # 0.0
     # the MAP form: denominator `F- + pseudocount * theta`, not `+ pseudocount`
-    den = tl.maximum(theta * w + pseudocount * theta, 1e-38)
+    den = tl.maximum(theta * w + pseudocount * theta, tiny_den)
     ratio = (fp + pseudocount / k) / den
     acc = tl.sum(tl.where(real[None,:], theta * ratio, 0.0), axis = 1)          # [M]
 
@@ -683,7 +695,7 @@ def _bs_triton_em_update_kernel(mparams, param_flows, W, cum, out, cids, pids, p
                                 kcount, num_edges: tl.constexpr, n_gates: tl.constexpr,
                                 TILE_SIZE_K: tl.constexpr, TILE_SIZE_M: tl.constexpr,
                                 BLOCK_SIZE_M: tl.constexpr, GATE_CBS: tl.constexpr,
-                                pseudocount, cum_base, step_size, out_base, out_size,
+                                consts, cum_base, out_base, out_size,
                                 KEEP_ZERO: tl.constexpr):
     """
     Pass 2: `out[pfid] = clamp(theta * ((1-s) + s*ratio) / ((1-s) + s*cum[n]), min = 1e-30)`.
@@ -719,17 +731,29 @@ def _bs_triton_em_update_kernel(mparams, param_flows, W, cum, out, cids, pids, p
                 mask = real[None,:] & (gidx < n_gates)[None,:], other = 0.0)
 
     k = tl.load(kcount + nblock_id).to(tl.float32)
-    den = tl.maximum(theta * w + pseudocount * theta, 1e-38)
+    # fp32, NOT Python float arguments. Triton types a float argument as fp64, which silently promoted
+    # the whole `den` / `ratio` chain here to DOUBLE precision -- caught only because the single-kernel
+    # form made `acc` loop-carried and Triton then refused the type change. This is why
+    # `em_par_update_kernel` loads its step size and pseudocount from a float32 tensor rather than
+    # taking them as arguments.
+    pseudocount = tl.load(consts)
+    step_size = tl.load(consts + 1)
+    one_m_s = tl.load(consts + 2)
+    tiny_den = tl.load(consts + 3)       # 1e-38, the division guard
+    tiny_par = tl.load(consts + 4)       # 1e-30, the momentum-underflow floor
+    zero_thr = tl.load(consts + 5)       # 1e-12, the `keep_zero_params` threshold
+    zero = tl.load(consts + 6)           # 0.0
+    den = tl.maximum(theta * w + pseudocount * theta, tiny_den)
     ratio = (fp + pseudocount / k) / den
 
     nid = tl.load(nids + nblock_id)
     c = tl.load(cum + (nid + offs_node - cum_base))                            # [M]
-    c = tl.maximum((1.0 - step_size) + step_size * c, 1e-38)
+    c = tl.maximum(one_m_s + step_size * c, tiny_den)
 
-    new = theta * ((1.0 - step_size) + step_size * ratio) / c[:,None]
-    new = tl.maximum(new, 1e-30)                                               # momentum-underflow guard
+    new = theta * (one_m_s + step_size * ratio) / c[:,None]
+    new = tl.maximum(new, tiny_par)                                               # momentum-underflow guard
     if KEEP_ZERO:
-        new = tl.where(theta < 1e-12, 0.0, new)
+        new = tl.where(theta < zero_thr, zero, new)
 
     off = pf[None,:] + offs_node[:,None] - out_base
     inside = real[None,:] & (off >= 0) & (off < out_size)
