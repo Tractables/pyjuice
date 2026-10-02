@@ -1396,6 +1396,41 @@ class TensorCircuit(nn.Module):
         node whose `_param_range` the M-step writes. Structural, built at compile."""
         return getattr(self, "_denom_sources_of_ns", {})
 
+    def _par_update_kwargs_excluding(self, ranges):
+        """`par_update_kwargs` with the blocks of `ranges` (parameter ranges) removed, cached.
+
+        `compile_par_update_fn` emits its blocks PER `ns` -- each entry's `par_start_ids` is that node's
+        `_param_range[0]` plus an offset, and tied nodes are skipped -- so no block straddles a range
+        boundary and selecting on `par_start_ids` is exact rather than approximate.
+
+        Used so the standard M-step does not compute an update for parameters the conditional one is
+        about to overwrite. That work was previously done and discarded: on a gated HMM the corrected
+        ranges are ~94% of the sum parameters, so almost the whole pass was wasted.
+
+        Returns the unfiltered kwargs when `ranges` is empty, which is every circuit without the
+        correction -- their behaviour is untouched.
+        """
+        if not ranges:
+            return self.par_update_kwargs
+
+        key = tuple(sorted(ranges))
+        cache = self.__dict__.setdefault("_par_update_excl_cache", {})
+        kwargs = cache.get(key)
+        if kwargs is None:
+            par_start_ids, pflow_start_ids, blk_sizes, blk_intervals, global_nids, nchs, \
+                cum_pflows, metadata = self.par_update_kwargs
+            keep = torch.ones(par_start_ids.size(0), dtype = torch.bool,
+                              device = par_start_ids.device)
+            for ps, pe in key:
+                keep &= ~((par_start_ids >= ps) & (par_start_ids < pe))
+            kwargs = cache[key] = [par_start_ids[keep].contiguous(),
+                                   pflow_start_ids[keep].contiguous(),
+                                   blk_sizes[keep].contiguous(),
+                                   blk_intervals[keep].contiguous(),
+                                   global_nids[keep].contiguous(),
+                                   nchs[keep].contiguous(), cum_pflows, metadata]
+        return kwargs
+
     def mini_batch_em(self, step_size: float, pseudocount: float = 0.0, keep_zero_params: bool = False,
                       step_size_rescaling: bool = False, use_cudagraph: bool = False,
                       _apply_denom_correction: bool = True):
@@ -1450,9 +1485,9 @@ class TensorCircuit(nn.Module):
             # Accumulate parameter flows of tied nodes
             compute_cum_par_flows(self.param_flows, self.parflow_fusing_kwargs)
 
-            # Conditional dual-flow M-step (`apply_z_correction`): compute the corrected parameters for
-            # each requesting `ns` from the PRE-update `theta`, F+ and F-, run the standard M-step
-            # unchanged, then overwrite ONLY the requesting ranges. All gated on `denom_param_flows` --
+            # Conditional dual-flow M-step (`apply_z_correction`): the standard M-step runs on every
+            # range it still OWNS, and each requesting `ns` then computes its own parameters from the
+            # pre-update `theta`, F+ and F- and writes them in place. All gated on `denom_param_flows` --
             # an ordinary PC does none of this and pays nothing.
             #
             # No `compute_cum_par_flows` on the denominator: it is not laid out in `pfid` space, so the
@@ -1462,20 +1497,28 @@ class TensorCircuit(nn.Module):
             corrections = []
             if denom_param_flows is not None:
                 for ns, sources in self._denom_correction_nss().items():
-                    new_pars = ns.external_params.compute_em_correction(
-                        ns, self.params, self.param_flows, denom_param_flows,
-                        step_size, pseudocount, keep_zero_params, denom_sources = sources)
-                    if new_pars is not None:
-                        corrections.append((ns._param_range, new_pars))
+                    corrections.append((ns, sources))
 
-            # Normalize and update parameters
-            em_par_update(self.params, self.param_flows, self.par_update_kwargs,
-                        step_size = step_size, pseudocount = pseudocount,
-                        keep_zero_params = keep_zero_params)
+            # Normalize and update parameters -- SKIPPING the ranges the conditional update owns.
+            # Their result was previously computed here and then overwritten, which on a gated HMM is
+            # ~94% of the sum parameters; the conditional step writes `params` directly instead, so the
+            # discarded pass and the separate write-back both disappear. `corrections` is empty for every
+            # circuit without the correction, and `_par_update_kwargs_excluding` then returns the
+            # unfiltered tables, so nothing changes for them.
+            kwargs = self._par_update_kwargs_excluding([ns._param_range for ns, _ in corrections])
+            if kwargs[0].size(0) > 0:            # every block may belong to a corrected range
+                em_par_update(self.params, self.param_flows, kwargs,
+                            step_size = step_size, pseudocount = pseudocount,
+                            keep_zero_params = keep_zero_params)
 
-            # Replace the standard update with the dual one on the requesting ranges
-            for (ps, pe), new_pars in corrections:
-                self.params[ps:pe] = new_pars
+            # The conditional update, in place. It reads the PRE-update `theta` of its own range, which
+            # the call above no longer writes, so the ordering is safe either way round.
+            for ns, sources in corrections:
+                ps, pe = ns._param_range
+                ns.external_params.compute_em_correction(
+                    ns, self.params, self.param_flows, denom_param_flows,
+                    step_size, pseudocount, keep_zero_params, denom_sources = sources,
+                    out = self.params[ps:pe])
 
     def cumulate_flows(self, inputs: torch.Tensor, params: Optional[torch.Tensor] = None):
         with torch.no_grad():

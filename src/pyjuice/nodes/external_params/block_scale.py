@@ -2208,7 +2208,7 @@ class BlockScaleSumParams(ExternalSumParams):
         return out
 
     def _fused_em_correction(self, ns, params, param_flows, denom_param_flows, step_size,
-                             pseudocount, keep_zero_params, denom_sources):
+                             pseudocount, keep_zero_params, denom_sources, out = None):
         """
         The conditional M-step as two Triton kernels, or `None` when this shape is not served (the caller
         then runs the torch reference).
@@ -2282,8 +2282,18 @@ class BlockScaleSumParams(ExternalSumParams):
         if all(p is None for p in plan["parts"]):
             return None
 
-        out = torch.zeros(size, device = dev, dtype = torch.float32)
-        out_base, out_size_ = pfs, size
+        # The caller may hand us `params[ps:pe]` to write in place, which is what removes BOTH the
+        # separate write-back and the discarded `em_par_update` work on these ranges. It is NOT zeroed:
+        # every element of a node's parameter range is covered by exactly one real edge slot (the torch
+        # reference reshapes the whole range, so a gap would already have been a wrong answer), so each
+        # is written exactly once.
+        by_par = out is not None
+        if by_par:
+            assert out.numel() == pe - ps, (out.numel(), pe - ps)
+            out_base, out_size_ = ps, pe - ps
+        else:
+            out = torch.zeros(size, device = dev, dtype = torch.float32)
+            out_base, out_size_ = pfs, size
         cum = torch.zeros(plan["cum_size"], device = dev, dtype = torch.float32)
         # EVERY scalar the kernels use, fp32, on the DEVICE -- including the clamp thresholds.
         # Triton types a Python float KERNEL ARGUMENT as fp64, and a Python float LITERAL inside the
@@ -2370,13 +2380,14 @@ class BlockScaleSumParams(ExternalSumParams):
                                              n_rows * (block_size // tm))](
                     cum = cum, out = target_out, out_base = out_base,
                     out_size = out_size_, KEEP_ZERO = 1 if keep_zero_params else 0,
+                    OUT_BY_PAR = 1 if by_par else 0,
                     TILE_SIZE_K = tk, TILE_SIZE_M = tm, **common)
 
             # A pure overwrite, so re-running it is harmless -- but it is still benchmarked into a
             # scratch, because it reads `cum` and writes the buffer this function RETURNS, and a trial
             # left in `out` for a partition the real launch then skips would be returned as a result.
             key = ("bs_em_upd", num_edges, n_gates, block_size, gate_cbs, n_rows,
-                   bool(keep_zero_params))
+                   bool(keep_zero_params), by_par)
             cfg = autotune.cached(key)
             if cfg is None:
                 so = autotune.scratch_like(out)
@@ -2450,7 +2461,7 @@ class BlockScaleSumParams(ExternalSumParams):
         return out
 
     def compute_em_correction(self, ns, params, param_flows, denom_param_flows, step_size,
-                              pseudocount, keep_zero_params, denom_sources = ()):
+                              pseudocount, keep_zero_params, denom_sources = (), out = None):
         """
         The conditional dual-flow M-step for one gated `ns`: `theta <- normalize(theta * F+ / F-)`,
         in the multiplicative MAP form that mirrors `SoftEvidenceCategorical`'s dual EM. Returns the new
@@ -2470,7 +2481,7 @@ class BlockScaleSumParams(ExternalSumParams):
         """
         if _EM_FUSED:
             fused = self._fused_em_correction(ns, params, param_flows, denom_param_flows, step_size,
-                                              pseudocount, keep_zero_params, denom_sources)
+                                              pseudocount, keep_zero_params, denom_sources, out = out)
             if fused is not None:
                 return fused
 
@@ -2504,7 +2515,11 @@ class BlockScaleSumParams(ExternalSumParams):
         new_theta = new_theta.clamp_min(1e-30)                              # momentum-underflow guard
         if keep_zero_params:
             new_theta = torch.where(theta < 1e-12, torch.zeros_like(new_theta), new_theta)
-        return new_theta.reshape(-1)
+        new_theta = new_theta.reshape(-1)
+        if out is not None:                  # the caller wants it written in place (see `out` above)
+            out.copy_(new_theta)
+            return out
+        return new_theta
 
     def _sigma(self, layer, params, pid, block_size, gate_cbs):
         """

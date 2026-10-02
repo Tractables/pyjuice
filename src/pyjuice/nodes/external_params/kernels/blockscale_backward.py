@@ -696,7 +696,7 @@ def _bs_triton_em_update_kernel(mparams, param_flows, W, cum, out, cids, pids, p
                                 TILE_SIZE_K: tl.constexpr, TILE_SIZE_M: tl.constexpr,
                                 BLOCK_SIZE_M: tl.constexpr, GATE_CBS: tl.constexpr,
                                 consts, cum_base, out_base, out_size,
-                                KEEP_ZERO: tl.constexpr):
+                                KEEP_ZERO: tl.constexpr, OUT_BY_PAR: tl.constexpr = 0):
     """
     Pass 2: `out[pfid] = clamp(theta * ((1-s) + s*ratio) / ((1-s) + s*cum[n]), min = 1e-30)`.
 
@@ -755,6 +755,13 @@ def _bs_triton_em_update_kernel(mparams, param_flows, W, cum, out, cids, pids, p
     if KEEP_ZERO:
         new = tl.where(theta < zero_thr, zero, new)
 
-    off = pf[None,:] + offs_node[:,None] - out_base
+    # `OUT_BY_PAR` writes `params[par - out_base]`, i.e. back into the very parameter `theta` was read
+    # from, which is what lets the caller hand us `params[ps:pe]` and skip the separate write-back.
+    # Addressing by `pfid` instead would rely on the parameter and param-flow ranges inducing the same
+    # local order; they do, but there is no reason to depend on it when `par` is already in hand.
+    if OUT_BY_PAR:
+        off = par[None,:] + offs_node[:,None] - out_base
+    else:
+        off = pf[None,:] + offs_node[:,None] - out_base
     inside = real[None,:] & (off >= 0) & (off < out_size)
     tl.store(out + tl.maximum(tl.minimum(off, out_size - 1), 0), new, mask = inside)
