@@ -8,6 +8,7 @@ from typing import Optional
 
 from pyjuice.layer.external_sum_layer import ExternalParamsSumLayer
 from pyjuice.model import TensorCircuit
+from pyjuice.model.tensorcircuit import device_grad_controller
 
 from .sampling import assign_cids_ind_target, assign_nids_ind_target, push_non_neg_ones_to_front, \
                       count_prod_nch, sample_prod_layer, sample_sum_layer
@@ -443,6 +444,30 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
            that layer's `vids` is correct only while the circuit has ONE input layer. It does not
            fail gracefully when it stops being true: ids from the second layer index past the end of
            the first layer's `vids`, which is a device-side assert that poisons the CUDA context.
+    """
+
+    # PIN THE CURRENT DEVICE to the circuit's own, the way `forward` / `backward` / `mini_batch_em`
+    # do (`device_grad_controller`, tensorcircuit.py). `pc.to("cuda:1")` does NOT move the current
+    # device -- it stays wherever it was -- and this pass launches its own kernels rather than going
+    # through `pc.forward`, so without this Triton validates the pointers against the wrong context.
+    # It then either refuses them ("Pointer argument (at 0) cannot be accessed from Triton (cpu
+    # tensor?)", which is misleading: the tensor is on a GPU, just not the current one) or, where
+    # peer access happens to map them, launches anyway and faults with an illegal memory access
+    # surfacing at an unrelated later kernel load. The silent third case is the reason this is a
+    # guard and not an assert: with peer access the draw can SUCCEED while reading across devices.
+    #
+    # `no_grad = False`: sampling never ran under `no_grad` and this is only about the device.
+    with device_grad_controller(device = pc.device, no_grad = False):
+        return _sample(pc, num_samples, conditional, use_cudagraph, fuse_top_down,
+                       _use_scope_plan, _sample_input_ns, _do_calibration, kwargs)
+
+
+def _sample(pc, num_samples, conditional, use_cudagraph, fuse_top_down, _use_scope_plan,
+            _sample_input_ns, _do_calibration, kwargs):
+    """
+    The body of :func:`sample`, which is only the device guard around this. `kwargs` arrives as a
+    PLAIN DICT rather than by `**`, so that the guard can hand it over unexamined; the body both
+    subscripts it and splats it onward, and a dict serves either.
     """
     if not conditional:
         assert num_samples is not None, "`num_samples` should be specified when doing unconditioned sampling."
