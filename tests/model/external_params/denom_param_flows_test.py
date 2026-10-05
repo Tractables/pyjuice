@@ -965,6 +965,121 @@ def test_fused_em_correction_matches_reference_for_shared_layer_and_ties():
         bsmod._EM_FUSED = prev
 
 
+def _build_mixed_gated_plain(seed = 0):
+    """One gated `ns` and one PLAIN one. The range filter must spare the plain layer's blocks."""
+    torch.manual_seed(seed)
+    with juice.set_block_size(4):
+        i = [inputs(v, num_node_blocks = 2, dist = dists.Categorical(num_cats = NUM_CATS))
+             for v in range(4)]
+        g = summate(multiply(i[0], i[1]), num_node_blocks = 2,
+                    external_params = BlockScaleSumParams(ch_block_size = 2,
+                                                          apply_z_correction = True))
+        pl = summate(multiply(i[2], i[3]), num_node_blocks = 2)
+        root = summate(multiply(g, pl), num_node_blocks = 1, block_size = 1)
+    torch.manual_seed(seed)
+    root.init_parameters(perturbation = 2.0)
+    return root, [g], 4
+
+
+def _build_tied_gated(seed = 0, steps = 4, K = 16, gate_cbs = 2):
+    torch.manual_seed(seed)
+    with juice.set_block_size(K):
+        ns = inputs(0, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
+        src, copies = None, []
+        for t in range(1, steps):
+            emit = inputs(t, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
+            prod = multiply(ns, emit)
+            if src is None:
+                ns = src = summate(prod, num_node_blocks = 1,
+                                   external_params = BlockScaleSumParams(
+                                       ch_block_size = gate_cbs, apply_z_correction = True))
+            else:
+                ns = src.duplicate(prod, tie_params = True)
+            copies.append(ns)
+        root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
+    torch.manual_seed(seed)
+    root.init_parameters(perturbation = 2.0)
+    return root, copies, steps
+
+
+_ORCH_CIRCUITS = {
+    "mixed": _build_mixed_gated_plain,
+    "two_gated_one_layer": lambda: (lambda r: (r[0], [r[1], r[2]], 4))(_build_two_gated()),
+    "tied": _build_tied_gated,
+    "ragged": lambda: (lambda r: (r[0], [r[1]], 2))(_build_shape(4, 3, 2)),
+}
+
+
+@cuda_only
+@pytest.mark.parametrize("circuit", sorted(_ORCH_CIRCUITS))
+@pytest.mark.parametrize("step_size,pseudocount,keep_zero",
+                         [(1.0, 0.0, False), (0.5, 0.1, True)])
+def test_mini_batch_em_matches_the_pre_restructuring_sequence(circuit, step_size, pseudocount,
+                                                              keep_zero):
+    """`mini_batch_em` must give the same parameters as the sequence it replaced.
+
+    It used to run the standard M-step over EVERY parameter and then overwrite the corrected ranges. It
+    now runs `em_par_update` only on the ranges it still OWNS -- `_par_update_kwargs_excluding` drops the
+    corrected blocks -- and has the conditional step write `params` IN PLACE. Three things could go wrong
+    silently, and none is visible to the kernel-level tests, which call `compute_em_correction` directly
+    and never go through `mini_batch_em`:
+
+      * over-filtering, leaving a range nobody updates (the `mixed` circuit is the one that shows it: a
+        plain layer's blocks must survive the filter);
+      * under-filtering, so the standard update overwrites a corrected range after the fact;
+      * the in-place write landing at the wrong offsets (it addresses `params` by parameter id now).
+
+    The reference is the old sequence spelled out. Each arm REBUILDS the circuit: a `TensorCircuit` also
+    carries input-layer parameters and `_cum_flow`, and restoring only `pc.params` leaks both.
+    """
+    from pyjuice.model.backend.parflow_fusing import compute_cum_par_flows
+    from pyjuice.model.backend.par_update import em_par_update
+    import pyjuice.nodes.external_params.block_scale as bsmod
+
+    dev = torch.device("cuda:0")
+    B = 96
+
+    def arm(old):
+        root, gated, nvars = _ORCH_CIRCUITS[circuit]()
+        pc = juice.compile(root, verbose = False).to(dev)
+        torch.manual_seed(3)
+        x = torch.randint(0, NUM_CATS, [B, nvars], device = dev)
+        torch.manual_seed(11)
+        ext = {g: _phi(g, B, dev) for g in gated}
+        pc(x, sum_external_params = ext)
+        pc.backward(x, sum_external_params = ext, logspace_flows = True,
+                    flows_memory = 0.0, allow_modify_flows = False)
+
+        if not old:
+            pc.mini_batch_em(step_size = step_size, pseudocount = pseudocount,
+                             keep_zero_params = keep_zero)
+            return pc.params.detach().clone()
+
+        with torch.no_grad():
+            for layer in pc.input_layer_group:
+                layer.mini_batch_em(step_size = step_size, pseudocount = pseudocount,
+                                    keep_zero_params = keep_zero)
+            compute_cum_par_flows(pc.param_flows, pc.parflow_fusing_kwargs)
+            prev, bsmod._EM_FUSED = bsmod._EM_FUSED, False      # the validated torch correction
+            try:
+                corr = [(ns._param_range, ns.external_params.compute_em_correction(
+                            ns, pc.params, pc.param_flows, pc.denom_param_flows, step_size,
+                            pseudocount, keep_zero, denom_sources = sources))
+                        for ns, sources in pc._denom_correction_nss().items()]
+            finally:
+                bsmod._EM_FUSED = prev
+            em_par_update(pc.params, pc.param_flows, pc.par_update_kwargs, step_size = step_size,
+                          pseudocount = pseudocount, keep_zero_params = keep_zero)
+            for (ps, pe), new in corr:
+                pc.params[ps:pe] = new
+        return pc.params.detach().clone()
+
+    new, ref = arm(old = False), arm(old = True)
+    assert torch.isfinite(new).all()
+    rel = ((new - ref).abs() / ref.abs().clamp_min(1e-20)).max().item()
+    assert rel < 1e-5, f"{circuit}: restructured mini_batch_em differs from the old sequence: {rel}"
+
+
 @cuda_only
 def test_denom_sums_over_a_tie_group():
     """A tied copy shares `ns._param_range`, so EVERY copy's flow has to reach the M-step of the node
