@@ -12,6 +12,10 @@ derivation, since everything downstream will address the frontier through it: a 
 crash, it writes one node's child into another node's slot.
 """
 
+import os
+import sys
+import subprocess
+
 import pytest
 import torch
 
@@ -23,6 +27,79 @@ from pyjuice.queries.sampling.scope_plan import build_scope_plan
 
 cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a GPU")
 NUM_CATS = 8
+
+
+def _num_real_gpus():
+    try:
+        out = subprocess.run(["nvidia-smi", "-L"], capture_output = True, text = True)
+        return len(out.stdout.strip().splitlines())
+    except (FileNotFoundError, OSError):
+        return 0
+
+
+def _two_gpus():
+    """
+    Two GPU ids for the real cross-device check, or `None` if the box cannot serve it.
+
+    NOT `torch.cuda.device_count()`, which is the trap this replaces: the conftest pins each process
+    to ONE GPU (`CUDA_VISIBLE_DEVICES = gpus[worker_id % len(gpus)]`) BEFORE torch is imported, so
+    `device_count()` is 1 however many the machine has. A `skipif(device_count() < 2)` is therefore
+    always true -- serially, under `pytest -n`, and even under the `CUDA_VISIBLE_DEVICES=0,1 pytest`
+    invocation this test used to recommend. It had never run.
+
+    So read the POOL the conftest published, exactly as `_ddp_gpus` does in the DDP tests, and prefer
+    the ids beyond the worker count (idle under `-n N`) so this does not fight a concurrent worker
+    for its device. The pair is handed to a CHILD process, which re-reads `CUDA_VISIBLE_DEVICES` when
+    it imports torch and so can actually see both.
+    """
+    pool = os.environ.get("PYJUICE_TEST_GPU_POOL")
+    gpus = [g for g in pool.split(",") if g] if pool else [str(i) for i in range(_num_real_gpus())]
+    if len(gpus) < 2:
+        return None
+    n_workers = int(os.environ.get("PYTEST_XDIST_WORKER_COUNT", "1"))
+    idle = gpus[n_workers:]
+    return idle[:2] if len(idle) >= 2 else gpus[-2:]
+
+
+# Run in a child with two GPUs visible. Keep the assertions here, not in the parent: the parent
+# cannot see `cuda:1` at all, so there is nothing for it to check beyond the child's exit code.
+_CROSS_DEVICE_CHILD = r"""
+import torch
+import pyjuice as juice
+import pyjuice.nodes.distributions as dists
+from pyjuice.nodes import inputs, multiply, summate
+
+with juice.set_block_size(4):
+    i = [inputs(v, num_node_blocks = 2, dist = dists.Categorical(num_cats = 5)) for v in range(4)]
+    root = summate(multiply(summate(multiply(i[0], i[1]), num_node_blocks = 2),
+                            summate(multiply(i[2], i[3]), num_node_blocks = 2)),
+                   num_node_blocks = 1, block_size = 1)
+root.init_parameters(perturbation = 2.0)
+pc = juice.compile(root, verbose = False).to(torch.device("cuda:0"))
+
+juice.queries.sample(pc, num_samples = 256)                             # warms the scope plan
+juice.queries.sample(pc, num_samples = 256, _use_scope_plan = False)    # warms the index plans
+assert "_sample_scope_plan" in pc.__dict__ and "_sample_plans" in pc.__dict__
+
+pc = pc.to(torch.device("cuda:1"))
+
+# THE PREMISE. `.to()` moves the circuit's tensors and leaves the CURRENT device where it was, so
+# every kernel `sample` launches from here on is launched into the wrong context unless `sample`
+# pins it. Assert the premise, or a future torch that moves the current device would turn this whole
+# test into a tautology that passes without exercising anything.
+assert torch.cuda.current_device() == 0,     "`.to(cuda:1)` moved the current device; this test no longer covers what it was written for"
+
+for kwargs in ({}, {"_use_scope_plan": False}):
+    samples = juice.queries.sample(pc, num_samples = 256, **kwargs)
+    assert samples.device.index == 1
+
+plan = pc.__dict__["_sample_scope_plan"]
+rows = plan.sum_rows[next(iter(plan.sum_rows))]
+assert rows.device.index == 1, "the scope plan was reused from the old device"
+
+torch.cuda.synchronize(1)       # surface an async fault here rather than in the next test
+print("CHILD_OK")
+"""
 
 
 def _hmm(num_vars = 6, K = 32):
@@ -295,7 +372,8 @@ def test_the_caches_are_dropped_when_the_circuit_changes_device():
 
     The DEVICE CHANGE is simulated rather than performed: this suite's `conftest` pins each worker to
     a single GPU before torch is imported, so an in-process `pc.to("cuda:1")` is not reachable here
-    (`test_a_real_cross_device_move_rebuilds_the_plan` does it for real and is normally skipped).
+    (`test_a_real_cross_device_move_rebuilds_the_plan` does it for real, in a child process with two
+    GPUs visible, and runs whenever the pool has two to give).
     What is checked is the mechanism itself, in both directions -- caches are dropped when the
     recorded device no longer matches, and kept when it does, since dropping them unconditionally
     would also "pass" while quietly rebuilding the layout on every single call.
@@ -332,34 +410,35 @@ def test_the_caches_are_dropped_when_the_circuit_changes_device():
 
 
 @cuda_only
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason = "needs two GPUs")
+@pytest.mark.skipif(_two_gpus() is None, reason = "requires >= 2 GPUs")
 def test_a_real_cross_device_move_rebuilds_the_plan():
     """
-    The same thing performed rather than simulated. Normally SKIPPED -- see the note above -- so it
-    is a manual check (`CUDA_VISIBLE_DEVICES=0,1 pytest -p no:cacheprovider <this file> -k real`),
-    not something the suite's green tick stands behind.
+    REGRESSION, and the one the simulation above cannot stand in for. Performs the move instead of
+    assigning `_sample_cache_device`, in a CHILD process so that two GPUs are actually visible (see
+    :func:`_two_gpus` for why the parent can never see them).
+
+    It caught a real bug: `sample` launched its kernels without pinning the current device to the
+    circuit's, so after `pc.to("cuda:1")` Triton validated the pointers against device 0's context.
+    That surfaced as either `Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)`
+    -- the tensor is on a GPU, just not the current one -- or an illegal memory access reported at
+    an unrelated later kernel load. Worst of all it sometimes SUCCEEDED, because peer access can map
+    the other device's memory, so the draw read across devices instead of failing. The simulated
+    sibling passed throughout.
+
+    NO RETRY. There is no rendezvous here and nothing transient to absorb, so a non-zero exit is a
+    real failure and is reported as one rather than being turned into a skip.
     """
-    with juice.set_block_size(4):
-        i = [inputs(v, num_node_blocks = 2, dist = dists.Categorical(num_cats = 5)) for v in range(4)]
-        root = summate(multiply(summate(multiply(i[0], i[1]), num_node_blocks = 2),
-                                summate(multiply(i[2], i[3]), num_node_blocks = 2)),
-                       num_node_blocks = 1, block_size = 1)
-    root.init_parameters(perturbation = 2.0)
-    pc = juice.compile(root, verbose = False).to(torch.device("cuda:0"))
+    gpus = _two_gpus()
+    env = dict(os.environ)
+    env["CUDA_VISIBLE_DEVICES"] = ",".join(gpus)
+    env.pop("PYJUICE_TEST_GPU_POOL", None)      # the child runs no conftest; keep it unambiguous
 
-    juice.queries.sample(pc, num_samples = 256)                             # warms the scope plan
-    juice.queries.sample(pc, num_samples = 256, _use_scope_plan = False)    # warms the index plans
-    assert "_sample_scope_plan" in pc.__dict__ and "_sample_plans" in pc.__dict__
+    proc = subprocess.run([sys.executable, "-c", _CROSS_DEVICE_CHILD],
+                          capture_output = True, text = True, timeout = 900, env = env)
 
-    pc = pc.to(torch.device("cuda:1"))
-
-    for kwargs in ({}, {"_use_scope_plan": False}):
-        samples = juice.queries.sample(pc, num_samples = 256, **kwargs)
-        assert samples.device.index == 1
-
-    plan = pc.__dict__["_sample_scope_plan"]
-    rows = plan.sum_rows[next(iter(plan.sum_rows))]
-    assert rows.device.index == 1, "the scope plan was reused from the old device"
+    assert proc.returncode == 0 and "CHILD_OK" in proc.stdout, (
+        f"the cross-device draw failed on GPUs {gpus} (exit {proc.returncode})\n"
+        f"--- child stdout ---\n{proc.stdout}\n--- child stderr ---\n{proc.stderr}")
 
 
 @cuda_only
