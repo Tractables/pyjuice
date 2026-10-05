@@ -1215,8 +1215,15 @@ def test_apply_z_correction_node_axis_gate_raises():
     x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
     phi = torch.zeros(ns.external_params.tensor_shapes(ns, B)[0], device = dev)
     pc(x, sum_external_params = {ns: phi})
+    before = pc.node_mars.clone()
     with pytest.raises(NotImplementedError, match = "NODE axis"):
         pc.backward(x, sum_external_params = {ns: phi}, logspace_flows = True, flows_memory = 1.0)
+
+    # The refusal is only useful if it leaves the circuit usable. This backward shifts `node_mars` by
+    # `log Z` and shifts it back in a `finally`, so a raise from the MIDDLE of that window would strand
+    # the forward values -- which is why the check sits before the shift rather than in the kernel.
+    assert torch.equal(pc.node_mars, before), \
+        "the refusal left `node_mars` shifted; it must happen before the `log Z` shift"
 
 
 # ------------------------------------------------------ step 6: the conditional dual-flow M-step
