@@ -346,35 +346,124 @@ class ExternalSumParams():
             "a denominator that matches the numerator."
         )
 
+    def materialize_denom_flows(self, ns, params, denom_param_flows, denom_sources, out = None):
+        """
+        Rebuild `F-` for `ns`'s parameter-flow range, laid out exactly like `param_flows[pfs:pfe]`.
+
+        THE ONE HOOK the generic conditional M-step needs. `denom_param_flows` holds whatever
+        :func:`denom_flow_sizes` asked for, which is deliberately NOT required to be `F-` itself --
+        a parameterization is free to accumulate any sufficient statistic and expand it here. If its
+        statistic already IS `F-` in param-flow layout, this is a view:
+
+        .. code-block:: python
+
+            off, size = layer.denom_flow_slices[0]
+            return denom_param_flows[off : off + size]
+
+        `BlockScaleSumParams` instead keeps the gate-space contraction `W[node, gate]` and expands
+        `F-[n,c] = theta[n,c] * W[n, g(c)]` with a scatter kernel, which is `ch_block_size` times less
+        memory to carry between backward calls.
+
+        :param denom_sources: every `(layer, member_ns)` whose slices hold flow for THESE parameters
+            -- `ns` plus every tied copy of it. Their contributions must be SUMMED here: the PC does
+            not run `compute_cum_par_flows` on the denominator, because its layout is yours and not
+            `pfid`-indexed. A parameterization that does store it in `pfid` space may simply fuse the
+            members the same way the numerator does.
+        :param out: a `pfe - pfs` tensor to write into, or `None` to return a fresh/cached one.
+        """
+        raise NotImplementedError(
+            f"{self.get_signature()} requests the denominator flow buffer but does not implement "
+            "`materialize_denom_flows`, so the conditional M-step cannot reconstruct `F-`."
+        )
+
+    def _fused_em_correction(self, ns, params, param_flows, denom_param_flows, step_size,
+                             pseudocount, keep_zero_params, denom_sources, out = None):
+        """
+        Optional fast path for :func:`compute_em_correction`: return the new parameters, or `None` to
+        fall through to the generic torch implementation.
+
+        The generic path is ~38 ATen ops per `ns` and MEASURED dispatch-bound (it grew with the NODE
+        count, not the parameter count), so a parameterization whose M-step shows up in a profile can
+        override this with its own kernels. `BlockScaleSumParams` does, and also uses it to subsume the
+        `F-` reconstruction so that `F-` is never materialized at all.
+        """
+        return None
+
     def compute_em_correction(self, ns, params, param_flows, denom_param_flows, step_size,
                               pseudocount, keep_zero_params, denom_sources = (), out = None):
         """
-        The conditional dual-flow EM update for `ns`, returning the new parameters for
-        `ns._param_range` as a flat tensor -- or `None` (the default) to leave the standard
-        `normalize(F+)` update in place.
+        The conditional dual-flow EM update for `ns`: `theta <- normalize(theta * F+ / F-)`, in the
+        multiplicative MAP form. Returns the new parameters for `ns._param_range` as a flat tensor --
+        or `None` when this parameterization does not request the denominator flow, which leaves the
+        standard `normalize(F+)` update in place.
 
-        Called once per EM step, ONLY when this parameterization :attr:`requests_denom_param_flows`,
-        after `param_flows` (F+, tied-fused) and `denom_param_flows` have been accumulated over the
-        mini-batch. `params` still holds the PRE-update parameters: the PC SKIPS the standard M-step on
-        `ns._param_range` and takes what is returned here instead, so the returned tensor replaces --
-        not adds to -- the standard update.
+        IMPLEMENTED HERE, GENERICALLY, because it is the definition of dual-flow EM rather than a
+        property of any one parameterization: it needs only `ns`'s compiled geometry and `F-`. So a
+        parameterization that sets :attr:`requests_denom_param_flows` gets a correct M-step by
+        implementing :func:`denom_flow_sizes`, accumulating its statistic in :func:`post_backward`,
+        and expanding it in :func:`materialize_denom_flows` -- no M-step code of its own. Override
+        :func:`_fused_em_correction` to go faster.
 
-        The generic form is `theta <- normalize(theta * F+ / F-)`; with a single gate
-        `F- = theta * sum(F+)`, so it collapses to `normalize(F+)` and the correction is an exact no-op.
+        Called once per EM step, after `param_flows` (F+, tied-fused) and `denom_param_flows` have been
+        accumulated over the mini-batch. `params` still holds the PRE-update parameters: the PC SKIPS
+        the standard M-step on `ns._param_range` and takes what is returned here instead, so the
+        returned tensor replaces -- not adds to -- the standard update.
 
-        :param denom_sources: every `(layer, member_ns)` whose denominator slices carry flow for THESE
-                             parameters -- `ns` itself plus every copy of it under parameter tying,
-                             which share `ns._param_range` and so must have their flow summed here.
-                             This is the denominator's counterpart of `compute_cum_par_flows`: the
-                             numerator is fused in the `pfid` space it shares, while the denominator,
-                             whose layout is the parameterization's own, is combined during this
-                             reconstruction.
+        With a single gate `F- = theta * sum(F+)`, so this collapses to `normalize(F+)` and the
+        correction is an exact no-op -- a useful check when implementing a new parameterization.
+
+        :param denom_sources: see :func:`materialize_denom_flows`.
         :param out: a `pe - ps` tensor to write the result into, in place of allocating one. The PC
-                             passes `params[ps:pe]`, i.e. the very range being updated, which is safe
-                             because every element of it is written exactly once and this is the only
-                             writer. An implementation may ignore it and return a fresh tensor.
+            passes `params[ps:pe]`, i.e. the very range being updated, which is safe because every
+            element of it is written exactly once and this is the only writer.
         """
-        return None
+        if not self.requests_denom_param_flows:
+            return None
+
+        fused = self._fused_em_correction(ns, params, param_flows, denom_param_flows, step_size,
+                                          pseudocount, keep_zero_params, denom_sources, out = out)
+        if fused is not None:
+            return fused
+
+        import torch
+
+        ps, pe = ns._param_range
+        pfs, pfe = ns._param_flow_range
+        bs, cbs = ns.block_size, ns.ch_block_size
+        E = ns.edge_ids.size(1)
+
+        # Node-level layout `[E, ch_block_size, block_size]` (edge block, child-in-block,
+        # node-in-block) -- the same one `params` uses.
+        theta = params[ps:pe].reshape(E, cbs, bs)
+        Fp = param_flows[pfs:pfe].reshape(E, cbs, bs)
+        Fm = self.materialize_denom_flows(ns, params, denom_param_flows,
+                                          denom_sources).reshape(E, cbs, bs)
+
+        # A node's children are all edge blocks of its node block, times `ch_block_size`; the per-node
+        # normalizer sums over exactly those. `K` (children per node) sets the pseudocount split.
+        nb = ns.edge_ids[0].to(device = theta.device, dtype = torch.long)
+        eblk_per_nb = torch.bincount(nb, minlength = ns.num_node_blocks)
+        K = (eblk_per_nb[nb].to(theta.dtype) * cbs)[:, None, None]          # [E,1,1]
+
+        # ratio = (F+ + pc/K) / (F- + pc*theta) -- the MAP form (denominator `pc*theta`, not `pc`), so
+        # a never-observed child floors instead of underflowing.
+        ratio = (Fp + pseudocount / K) / (Fm + pseudocount * theta).clamp_min(1e-38)
+        flow = theta * ratio                                                # [E, cbs, bs]
+
+        # cum[node block, m] = (1-s) + s * sum over the node's children of theta*ratio
+        cum = torch.zeros(ns.num_node_blocks, bs, device = theta.device, dtype = theta.dtype)
+        cum.index_add_(0, nb, flow.sum(dim = 1))
+        cum = ((1.0 - step_size) + step_size * cum).clamp_min(1e-38)
+
+        new_theta = theta * ((1.0 - step_size) + step_size * ratio) / cum[nb][:, None, :]
+        new_theta = new_theta.clamp_min(1e-30)                              # momentum-underflow guard
+        if keep_zero_params:
+            new_theta = torch.where(theta < 1e-12, torch.zeros_like(new_theta), new_theta)
+        new_theta = new_theta.reshape(-1)
+        if out is not None:
+            out.copy_(new_theta)
+            return out
+        return new_theta
 
     def sample_layer(self, layer, ns_tensors, node_mars, element_mars, params, node_samples,
                      element_samples, rows, erows, seed_ptr, conditional: bool = False,

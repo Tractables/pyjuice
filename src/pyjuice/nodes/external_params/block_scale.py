@@ -2290,13 +2290,17 @@ class BlockScaleSumParams(ExternalSumParams):
     def _fused_em_correction(self, ns, params, param_flows, denom_param_flows, step_size,
                              pseudocount, keep_zero_params, denom_sources, out = None):
         """
-        The conditional M-step as two Triton kernels, or `None` when this shape is not served (the caller
-        then runs the torch reference).
+        Overrides :func:`ExternalSumParams._fused_em_correction`: the conditional M-step as two Triton
+        kernels, or `None` when this shape is not served -- the generic torch M-step on the base class
+        then runs, which is also what this is validated against.
 
         Replaces the eager chain AND the `F-` reconstruction: `F-[n,c] = theta[n,c] * W[n,g(c)]`, so `W`
         is gathered in-kernel and `F-` is never materialized. A tie group sums its members' `W` below;
         `_em_plan` is what decides whether that sum is well defined.
         """
+        if not _EM_FUSED:
+            return None                       # `PYJUICE_BLOCKSCALE_EM_FUSED=0` -> the generic path
+
         import triton
         from .kernels.blockscale_backward import (_bs_triton_em_cum_kernel,
                                                   _bs_triton_em_update_kernel)
@@ -2485,70 +2489,6 @@ class BlockScaleSumParams(ExternalSumParams):
                 seen.add(c)
                 out.append(c)
         return out
-
-    def compute_em_correction(self, ns, params, param_flows, denom_param_flows, step_size,
-                              pseudocount, keep_zero_params, denom_sources = (), out = None):
-        """
-        The conditional dual-flow M-step for one gated `ns`: `theta <- normalize(theta * F+ / F-)`,
-        in the multiplicative MAP form that mirrors `SoftEvidenceCategorical`'s dual EM. Returns the new
-        parameters for `ns._param_range`; the PC writes them back over the standard update.
-
-        FUSED into two Triton kernels when the shape allows (`_fused_em_correction`); the torch body
-        below is the reference it is validated against, and the fallback. It is reached under
-        `PYJUICE_BLOCKSCALE_EM_FUSED=0` and for the shapes `_em_plan` declines.
-
-        The torch form runs ONCE PER EM STEP and has no batch axis (F+, F-, theta are all param-sized),
-        which is why it was torch to begin with -- but it is ~38 ATen ops PER `ns` and MEASURED
-        dispatch-bound (2964 us of a 4887 us M step at HMM 2048 / 15 nodes, growing 319 us per `ns`), so
-        the node count, not the parameter count, set its cost. Node-level layout
-        `[E, ch_block_size, block_size]` (edge block, child-in-block, node-in-block), the same `params`
-        uses.
-
-        :param out: where to write the result, in place of a fresh tensor -- in practice
-            `params[ps:pe]`, which is what lets the PC skip the standard update on this range instead
-            of computing it and throwing it away. Must be `pe - ps` elements.
-        """
-        if _EM_FUSED:
-            fused = self._fused_em_correction(ns, params, param_flows, denom_param_flows, step_size,
-                                              pseudocount, keep_zero_params, denom_sources, out = out)
-            if fused is not None:
-                return fused
-
-        ps, pe = ns._param_range
-        pfs, pfe = ns._param_flow_range
-        bs, cbs = ns.block_size, ns.ch_block_size
-        E = ns.edge_ids.size(1)
-
-        theta = params[ps:pe].reshape(E, cbs, bs)
-        Fp = param_flows[pfs:pfe].reshape(E, cbs, bs)
-        Fm = self.materialize_denom_flows(ns, params, denom_param_flows,
-                                          denom_sources).reshape(E, cbs, bs)
-
-        # A node's children are all edge blocks of its node block, times `ch_block_size`; the
-        # per-node normalizer sums over exactly those. `K` (children per node) sets the pseudocount split.
-        nb = ns.edge_ids[0].to(device = theta.device, dtype = torch.long)   # node block of each edge block
-        eblk_per_nb = torch.bincount(nb, minlength = ns.num_node_blocks)
-        K = (eblk_per_nb[nb].to(theta.dtype) * cbs)[:, None, None]          # [E,1,1]
-
-        # ratio = (F+ + pc/K) / (F- + pc*theta) -- the MAP form (denominator `pc*theta`, not `pc`), so a
-        # never-observed child floors instead of underflowing (as in the SoftEvidence dual EM).
-        ratio = (Fp + pseudocount / K) / (Fm + pseudocount * theta).clamp_min(1e-38)
-        flow = theta * ratio                                                # [E, cbs, bs]
-
-        # cum[node block, m] = (1-s) + s * sum over the node's children of theta*ratio
-        cum = torch.zeros(ns.num_node_blocks, bs, device = theta.device, dtype = theta.dtype)
-        cum.index_add_(0, nb, flow.sum(dim = 1))                            # sum over cbs, scatter over nb
-        cum = ((1.0 - step_size) + step_size * cum).clamp_min(1e-38)
-
-        new_theta = theta * ((1.0 - step_size) + step_size * ratio) / cum[nb][:, None, :]
-        new_theta = new_theta.clamp_min(1e-30)                              # momentum-underflow guard
-        if keep_zero_params:
-            new_theta = torch.where(theta < 1e-12, torch.zeros_like(new_theta), new_theta)
-        new_theta = new_theta.reshape(-1)
-        if out is not None:                  # the caller wants it written in place (see `out` above)
-            out.copy_(new_theta)
-            return out
-        return new_theta
 
     def _sigma(self, layer, params, pid, block_size, gate_cbs):
         """
