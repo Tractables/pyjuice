@@ -1485,34 +1485,29 @@ class TensorCircuit(nn.Module):
             # Accumulate parameter flows of tied nodes
             compute_cum_par_flows(self.param_flows, self.parflow_fusing_kwargs)
 
-            # Conditional dual-flow M-step (`apply_z_correction`): the standard M-step runs on every
-            # range it still OWNS, and each requesting `ns` then computes its own parameters from the
-            # pre-update `theta`, F+ and F- and writes them in place. All gated on `denom_param_flows` --
-            # an ordinary PC does none of this and pays nothing.
+            # Conditional dual-flow M-step (`apply_z_correction`): each requesting `ns` computes its own
+            # parameters from the pre-update `theta`, F+ and F-, and the standard M-step below runs only
+            # on the ranges it still OWNS. All gated on `denom_param_flows` -- an ordinary PC has none,
+            # `corrections` is empty, and nothing here changes its behaviour.
             #
             # No `compute_cum_par_flows` on the denominator: it is not laid out in `pfid` space, so the
             # numerator's tie fusing does not apply to it. The tie group is passed to the descriptor
             # instead (`denom_sources`), which sums the copies' flow as it reconstructs `F-`.
             denom_param_flows = self.denom_param_flows if _apply_denom_correction else None
-            corrections = []
-            if denom_param_flows is not None:
-                for ns, sources in self._denom_correction_nss().items():
-                    corrections.append((ns, sources))
+            corrections = ([] if denom_param_flows is None
+                           else list(self._denom_correction_nss().items()))
 
-            # Normalize and update parameters -- SKIPPING the ranges the conditional update owns.
-            # Their result was previously computed here and then overwritten, which on a gated HMM is
-            # ~94% of the sum parameters; the conditional step writes `params` directly instead, so the
-            # discarded pass and the separate write-back both disappear. `corrections` is empty for every
-            # circuit without the correction, and `_par_update_kwargs_excluding` then returns the
-            # unfiltered tables, so nothing changes for them.
+            # Normalize and update parameters. The skipped ranges' results were previously computed here
+            # and then overwritten -- ~94% of the sum parameters on a gated HMM.
             kwargs = self._par_update_kwargs_excluding([ns._param_range for ns, _ in corrections])
             if kwargs[0].size(0) > 0:            # every block may belong to a corrected range
                 em_par_update(self.params, self.param_flows, kwargs,
-                            step_size = step_size, pseudocount = pseudocount,
-                            keep_zero_params = keep_zero_params)
+                              step_size = step_size, pseudocount = pseudocount,
+                              keep_zero_params = keep_zero_params)
 
-            # The conditional update, in place. It reads the PRE-update `theta` of its own range, which
-            # the call above no longer writes, so the ordering is safe either way round.
+            # The conditional update, writing `params` in place -- which is what removes BOTH the
+            # discarded pass above and a separate write-back. It reads the PRE-update `theta` of its own
+            # range, which the call above no longer touches, so the ordering is safe either way round.
             for ns, sources in corrections:
                 ps, pe = ns._param_range
                 ns.external_params.compute_em_correction(
