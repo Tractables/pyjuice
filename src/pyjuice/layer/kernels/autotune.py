@@ -126,6 +126,27 @@ def cached(key):
     return _CACHE.get(_full_key(key))
 
 
+def should_tune(key, num_candidates: int = 2) -> bool:
+    """Whether `pick` would actually BENCHMARK this key -- i.e. whether a scratch output is worth
+    allocating for it.
+
+    The complement of `cached`, and the distinction matters. `cached` answers "is the choice already
+    known"; this also covers the cases where `pick` declines WITHOUT caching: autotuning switched off,
+    nothing to choose between, and CUDA-graph capture (deliberately uncached, since capture is
+    transient and a later ordinary call should still tune). A caller that only consulted `cached`
+    therefore allocated its benchmark buffer on EVERY call in those cases -- and at the param-flow and
+    element-flow sites that buffer is the whole flow array.
+
+    MEASURED on an HCLT with 256 latents at batch 512, `PYJUICE_AUTOTUNE=0`: the backward's transient
+    peak was 696 MB with 102 allocations per iteration, against 3.06 MB and 3 with tuning on, i.e.
+    227x the peak for buffers that were never benchmarked into. Wall time was unchanged (21.4 vs
+    21.3 ms -- the caching allocator just reuses the block), so this never showed up in a profile.
+    """
+    if _full_key(key) in _CACHE:
+        return False
+    return ENABLED and num_candidates >= 2 and not _capturing()
+
+
 def pick(key, candidates: list, bench, warmup: int = 3, reps: int = 7):
     """Return the best of `candidates` (config values), benchmarking them at most ONCE per `key`.
 

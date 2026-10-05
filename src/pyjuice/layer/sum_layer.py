@@ -1615,6 +1615,8 @@ class SumLayer(Layer, nn.Module):
             # `accumulate_ch_flows` makes `element_flows` read-accumulate-write, so the timing runs
             # must go to a scratch buffer; otherwise the kernel overwrites it with the values it is
             # about to write for real anyway and can be timed in place.
+            if not autotune.should_tune(ele_key, len(ele_cfgs)):
+                return ele_cfgs[0]                     # `pick` would decline; do not allocate for it
             out = element_flows if not accumulate_ch_flows else autotune.scratch_like(element_flows)
             if out is None:
                 return ele_cfgs[0]                     # no scratch -> leave this launch untuned
@@ -2009,6 +2011,13 @@ class SumLayer(Layer, nn.Module):
             # `param_flows` is read-accumulate-write, so the timing runs must go to a scratch clone.
             # It is the full parameter array (can be GBs), so the scratch is local and freed right
             # after; if it cannot be allocated, this launch is simply left untuned.
+            #
+            # ASK FIRST whether tuning will actually happen. `pick` also declines -- without caching --
+            # when autotuning is off or a graph is being captured, so checking only `cached` above
+            # allocated this clone on EVERY call in those cases: MEASURED 696 MB of transient peak per
+            # backward against 3 MB, invisible in wall time because the allocator reuses the block.
+            if not autotune.should_tune(par_key, len(par_cfgs)):
+                return par_cfgs[0]
             scr = autotune.scratch_like(param_flows)
             if scr is None:
                 return par_cfgs[0]
