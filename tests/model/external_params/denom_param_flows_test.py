@@ -19,10 +19,12 @@ and `BlockScaleSumParams` keeps the gate-space contraction `W[node, gate]` -- `g
 `F-` itself goes through `_fminus`, which runs that same reconstruction; the value-level assertions are
 therefore about `F-`, exactly as before, and none of them depend on where it is stored.
 
-`BlockScaleSumParams(apply_z_correction = True)` is the one shipped requester. Its correction math is
-not implemented yet (the descriptor's backward raises), so the single test that needs a live non-None
-buffer to reach `post_backward_layer` isolates the PASS-THROUGH by stubbing the descriptor's two
-backward hooks; the F- math itself is validated separately once it lands.
+`BlockScaleSumParams(apply_z_correction = True)` is the one shipped requester, and its correction math
+IS implemented -- both the gate-space `F-` accumulation and the conditional M-step, which the tests
+below validate against a torch reference and against finite differences. The M-step itself now lives
+GENERICALLY on `ExternalSumParams`: see `test_the_generic_m_step_needs_only_materialize_denom_flows`
+at the end of this file, which pins that a parameterization implementing one hook gets a correct
+update with no M-step code of its own.
 """
 
 import math
@@ -953,9 +955,13 @@ def test_fused_em_correction_matches_reference_for_shared_layer_and_ties():
         for pcx, tgt, sources in cases:
             desc = tgt.external_params
             args = (tgt, pcx.params, pcx.param_flows, pcx.denom_param_flows, 0.5, 0.1, False)
+            # `_fused_em_correction` now also carries the `_EM_FUSED` gate (it moved there when the
+            # generic M-step was lifted to `ExternalSumParams`, which must not know BlockScale's env
+            # flag), so enable it BEFORE probing whether the shape is served -- the previous loop
+            # iteration leaves it False.
+            bsmod._EM_FUSED = True
             assert desc._fused_em_correction(*args, sources) is not None, \
                 f"the fused path declined {tgt}; this case would compare the reference with itself"
-            bsmod._EM_FUSED = True
             fused = desc.compute_em_correction(*args, denom_sources = sources).clone()
             bsmod._EM_FUSED = False
             ref = desc.compute_em_correction(*args, denom_sources = sources).clone()
@@ -1879,3 +1885,149 @@ def test_multi_partition_layer_uses_distinct_denom_slices():
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# --------------------------------------------------------- the generic M-step's contract
+#
+# `ExternalSumParams.compute_em_correction` implements the conditional dual-flow M-step GENERICALLY:
+# it needs only `ns`'s compiled geometry plus `F-`, so a parameterization that can produce `F-` gets a
+# correct update with no M-step code of its own. These two tests pin that, because it is the promise a
+# future dual-flow parameterization (low-rank, say) would be written against.
+
+
+class _DenseDenomParams(ExternalSumParams):
+    """A deliberately MINIMAL dual-flow parameterization: it keeps `F-` densely, in param-flow layout,
+    and implements neither `compute_em_correction` nor `_fused_em_correction`.
+
+    This is the whole EM-side surface a new parameterization has to implement -- one hook. It is not a
+    useful model (nothing here touches the forward); it exists so the base class's promise is tested
+    without `BlockScaleSumParams`' gate-space reconstruction in the way."""
+
+    requests_denom_param_flows = True
+
+    def __init__(self, fminus):
+        super(_DenseDenomParams, self).__init__()
+        self._fminus = fminus
+
+    def get_signature(self) -> str:
+        return "DenseDenom"
+
+    def materialize_denom_flows(self, ns, params, denom_param_flows, denom_sources, out = None):
+        if out is not None:
+            out.copy_(self._fminus)
+            return out
+        return self._fminus
+
+
+def _ref_dual_m_step(ns, theta, fp, fm, step_size, pseudocount, keep_zero_params):
+    """`theta <- normalize(theta * F+ / F-)`, written as an explicit per-node loop in float64.
+
+    Deliberately NOT the implementation's vectorised form: it walks each node block's edge blocks and
+    each node within the block, so a bug in the real path's `index_add_` / broadcasting cannot be
+    reproduced here by construction."""
+    bs, cbs = ns.block_size, ns.ch_block_size
+    E = ns.edge_ids.size(1)
+    th = theta.reshape(E, cbs, bs).double()
+    fpl = fp.reshape(E, cbs, bs).double()
+    fml = fm.reshape(E, cbs, bs).double()
+    nb = ns.edge_ids[0].tolist()
+    out = torch.zeros_like(th)
+    for blk in range(ns.num_node_blocks):
+        es = [e for e in range(E) if nb[e] == blk]
+        K = len(es) * cbs                                   # children of every node in this block
+        for m in range(bs):                                 # each node within the block
+            ratios, tot = {}, 0.0
+            for e in es:
+                den = torch.clamp(fml[e, :, m] + pseudocount * th[e, :, m], min = 1e-38)
+                r = (fpl[e, :, m] + pseudocount / K) / den
+                ratios[e] = r
+                tot += float((th[e, :, m] * r).sum())
+            cum = max((1.0 - step_size) + step_size * tot, 1e-38)
+            for e in es:
+                out[e, :, m] = th[e, :, m] * ((1.0 - step_size) + step_size * ratios[e]) / cum
+    out = torch.clamp(out, min = 1e-30)
+    if keep_zero_params:
+        out = torch.where(th < 1e-12, torch.zeros_like(out), out)
+    return out.reshape(-1)
+
+
+def _plain_ns_for_geometry(seed = 0, nb = 3, cb = 2):
+    """A compiled `ns` whose geometry the M-step can be exercised against (several edge blocks per
+    node block, so the per-node normalizer actually sums over more than one)."""
+    torch.manual_seed(seed)
+    with juice.set_block_size(4):
+        i0 = inputs(0, num_node_blocks = cb, dist = dists.Categorical(num_cats = NUM_CATS))
+        i1 = inputs(1, num_node_blocks = cb, dist = dists.Categorical(num_cats = NUM_CATS))
+        ns = summate(multiply(i0, i1), num_node_blocks = nb)
+        root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
+    root.init_parameters(perturbation = 2.0)
+    pc = juice.compile(root, verbose = False).to(torch.device("cuda:0"))
+    return pc, ns
+
+
+@cuda_only
+@pytest.mark.parametrize("step_size,pseudocount,keep_zero",
+                         [(1.0, 0.0, False), (0.5, 0.1, False), (0.3, 0.01, True)])
+def test_the_generic_m_step_needs_only_materialize_denom_flows(step_size, pseudocount, keep_zero):
+    """A parameterization that implements ONE hook gets the correct conditional M-step from the base."""
+    dev = torch.device("cuda:0")
+    pc, ns = _plain_ns_for_geometry()
+    ps, pe = ns._param_range
+    pfs, pfe = ns._param_flow_range
+    size = pe - ps
+
+    torch.manual_seed(7)
+    theta = pc.params[ps:pe].clone()
+    fp = torch.rand(size, device = dev) + 0.05
+    fm = torch.rand(size, device = dev) + 0.05
+    pc.param_flows = torch.zeros(pfe, device = dev)
+    pc.param_flows[pfs:pfe] = fp
+
+    desc = _DenseDenomParams(fm)
+    # the point of the exercise: this subclass defines NEITHER of these
+    assert "compute_em_correction" not in _DenseDenomParams.__dict__
+    assert "_fused_em_correction" not in _DenseDenomParams.__dict__
+
+    got = desc.compute_em_correction(ns, pc.params, pc.param_flows, None, step_size,
+                                     pseudocount, keep_zero, denom_sources = ())
+    assert got is not None, "the base class declined to run the conditional M-step"
+    exp = _ref_dual_m_step(ns, theta, fp, fm, step_size, pseudocount, keep_zero)
+    rel = ((got.double() - exp).abs() / exp.abs().clamp_min(1e-20)).max().item()
+    assert rel < 1e-5, f"generic M-step differs from the explicit reference (relmax = {rel})"
+
+
+@cuda_only
+def test_the_generic_m_step_reduces_to_normalize_fplus_when_fminus_is_theta_times_the_total():
+    """The analytic check worth running first on any new parameterization.
+
+    If `F-[n,c] = theta[n,c] * sum_c' F+[n,c']` -- which is what a SINGLE gate produces, because the
+    gate then cancels against the normalizer -- then at `step_size = 1`, `pseudocount = 0` the
+    conditional update must collapse to the plain `normalize(F+)`. It pins the generic math against a
+    closed form rather than against another implementation."""
+    dev = torch.device("cuda:0")
+    pc, ns = _plain_ns_for_geometry(seed = 1)
+    ps, pe = ns._param_range
+    pfs, pfe = ns._param_flow_range
+    size = pe - ps
+    bs, cbs = ns.block_size, ns.ch_block_size
+    E = ns.edge_ids.size(1)
+
+    torch.manual_seed(11)
+    theta = pc.params[ps:pe].clone()
+    fp = torch.rand(size, device = dev) + 0.05
+    pc.param_flows = torch.zeros(pfe, device = dev)
+    pc.param_flows[pfs:pfe] = fp
+
+    # F-[n,c] = theta[n,c] * S[n], with S[n] the total F+ over that node's children
+    nb = ns.edge_ids[0].to(device = dev, dtype = torch.long)
+    fp3 = fp.reshape(E, cbs, bs)
+    S = torch.zeros(ns.num_node_blocks, bs, device = dev)
+    S.index_add_(0, nb, fp3.sum(dim = 1))
+    fm = (theta.reshape(E, cbs, bs) * S[nb][:, None, :]).reshape(-1).contiguous()
+
+    got = _DenseDenomParams(fm).compute_em_correction(
+        ns, pc.params, pc.param_flows, None, 1.0, 0.0, False, denom_sources = ())
+
+    expected = (fp3 / S[nb][:, None, :]).reshape(-1)        # normalize(F+) over each node's children
+    rel = ((got - expected).abs() / expected.abs().clamp_min(1e-20)).max().item()
+    assert rel < 1e-5, f"the correction is not a no-op for a single-gate F- (relmax = {rel})"
