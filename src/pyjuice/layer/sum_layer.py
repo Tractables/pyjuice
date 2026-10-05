@@ -150,6 +150,9 @@ _BLOCK_SPARSE_EDGE_TRIM = os.environ.get("PYJUICE_EDGE_TRIM", "1") != "0"
 # route: it also changes the forward and element-flow forks, and its measured error moved between
 # 6.2e-6 and 7.0e-4 across runs of the same shape, because the timing-based autotuner picks
 # differently from run to run.
+#
+# Every par kernel takes `DOT_IEEE` so the one launch site below can stay uniform, but it is inert in
+# the `csmm2` forks: those reduce with `tl.sum`, not `tl.dot`, and have no precision to set.
 _PAR_DOT_IEEE = os.environ.get("PYJUICE_PAR_DOT_IEEE", "0") != "0"
 
 # SM count, cached: the occupancy heuristics below consult it per launch, and

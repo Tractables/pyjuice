@@ -1,4 +1,5 @@
 import torch
+import warnings
 from typing import Optional
 
 from pyjuice.model import TensorCircuit
@@ -59,7 +60,6 @@ class GradientOptimizer(CircuitOptimizer):
         # carrying the gate's contribution to `Z`. Nothing here subtracts `F-`, and no test validates
         # the direction for a gated circuit, so say so rather than let it look supported.
         if getattr(pc, "_requests_denom_param_flows", False):
-            import warnings
             warnings.warn(
                 "This circuit requests the denominator flow (`apply_z_correction`), whose M-step is "
                 "the conditional `theta <- normalize(theta * F+ / F-)`. Gradient optimizers do not "

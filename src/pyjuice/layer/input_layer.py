@@ -599,9 +599,9 @@ class InputLayer(Layer, nn.Module):
             # `backward(compute_param_flows = False)` never allocates `param_flows`, so this emission-flow
             # kernel -- whose sole job is to accumulate into it -- would dereference a null pointer and
             # die at Triton COMPILE time with a bare `NoneType has no attribute 'type'`. Nothing to
-            # accumulate into means nothing to do; node / element flows come from the inner layers and are
-            # unaffected. (A direct `pc.backward(compute_param_flows = False)`; queries take a flow-only
-            # `input_layer_fn` and never reach here.)
+            # accumulate into means nothing to do; node / element flows come from the inner layers and
+            # are unaffected. Reached by a direct `pc.backward(compute_param_flows = False)`; queries
+            # pass a flow-only `input_layer_fn` and never come through here.
             if (not cuda_handled) and self.provided("_flows_kernel") and self._flows_kernel is not None \
                     and self.param_flows is not None:
                 self._flows_kernel[grid](
