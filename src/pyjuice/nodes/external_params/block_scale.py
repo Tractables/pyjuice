@@ -154,8 +154,18 @@ class BlockScaleSumParams(ExternalSumParams):
                           the axis to refine.
     :type ch_block_size: Optional[int]
 
-    :param apply_z_correction: whether the parameter flows include the term coming from `Z`'s own
-                               dependence on `theta`. Not yet implemented (raises if set).
+    :param apply_z_correction: make EM exact under a live gate. The gate makes the normalizer
+                               `Z = sum_c phi * theta` depend on `theta`, so pyjuice's plain M-step
+                               `theta <- normalize(F+)` solves a stationarity condition that is missing
+                               the term `sum_b f_b * theta_b`. With this set, the backward also
+                               accumulates that term as a DENOMINATOR flow `F-` and the M-step becomes
+                               the conditional `theta <- normalize(theta * F+ / F-)`, whose fixed point
+                               is the true one (and whose `F+ - F-` is `d LL / d log theta`). Costs a
+                               second flow accumulator -- kept in gate space, `ch_block_size` times
+                               smaller than `param_flows` -- and ~1% of an EM step. Off by default, so
+                               an ordinary gated model allocates nothing and behaves exactly as before.
+                               Supported by `FullBatchEM` / `MiniBatchEM` / `Anemone`; the gradient
+                               optimizers warn, since their descent direction is uncorrected.
     :type apply_z_correction: bool
 
     :param tie_external: share one gate tensor across every copy of a tied node, instead of one per copy.
@@ -197,8 +207,10 @@ class BlockScaleSumParams(ExternalSumParams):
         # `Z = sum_c phi * theta` depends on `theta`, unlike the low-rank parameterization where the
         # shared parameters' contribution to the normalizer was the constant 1. So the M-step pyjuice
         # performs -- normalize the flows per node -- solves a stationarity condition missing the term
-        # `sum_b f_b * theta_b`, and is therefore not exactly EM under a live gate. Correcting for it is
-        # work in progress; `apply_z_correction = True` raises until it lands.
+        # `sum_b f_b * theta_b`, and is therefore not exactly EM under a live gate. Setting this makes
+        # the layer accumulate that term too (`requests_denom_param_flows` ->
+        # `denominator flow (apply_z_correction)` below) and switches the M-step to the conditional
+        # `theta <- normalize(theta * F+ / F-)`.
         self.apply_z_correction = bool(apply_z_correction)
 
         # Share one gate tensor across the copies of a tied node (see `storage_owner`).
