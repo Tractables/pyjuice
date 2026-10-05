@@ -59,30 +59,33 @@ def _buffer_kwarg() -> str:
 #     as a 16x re-read of `node_flows` / `log Z` at block_size 128 / 512 edges, 32 MB of a 38 MB kernel.
 #
 # `g(c) = c // gate_cbs` is exact because the gate's `ch_block_size` divides the node's (asserted in
-# `storage_shapes`) and the compiled edge count is a whole number of child blocks (checked in
-# `_build_plan`), which is what makes the gate axis a clean quotient of the edge axis.
+# `validate_ns`) and the compiled edge count is a whole number of child blocks (asserted in
+# `denom_gate_geometry`), which is what makes the gate axis a clean quotient of the edge axis.
 
 # The conditional M-step as two Triton kernels instead of ~38 eager ATen ops per `ns` (MEASURED
 # dispatch-bound, growing with the NODE count rather than the parameter count). `=0` restores the torch
 # reference, which is what the fused path is validated against -- keep it working, it is the oracle.
 _EM_FUSED = os.environ.get("PYJUICE_BLOCKSCALE_EM_FUSED", "1") != "0"
-# Elements per tile of the fused M-step kernels. See the note at the launch site: this kernel
-# carries ~3x the live tiles of the scatter, so it needs a smaller budget than 4096.
+# Elements per tile for the fused M-step's HEURISTIC default -- `candidates[0]` in
+# `_em_tile_candidates`, i.e. what runs with `PYJUICE_AUTOTUNE=0`. The autotuner spans a wider range
+# than this, so it is a seed rather than a cap; 1024 because this kernel keeps ~3x the live tiles of the
+# scatter and 4096 spills.
 _EM_TILE_BUDGET = int(os.environ.get("PYJUICE_BLOCKSCALE_EM_TILE", "1024"))
 
 
-# `torch.cuda.get_device_properties` is cheap here (~1.3 us, PyTorch caches it) but the fused
-# M-step asks for the SM count once per `ns` per partition, so it is cached anyway.
-_EM_SM_COUNT = {}
+# Every launcher in this file sizes its grid against the SM count, so it lives in one place. The query
+# itself is cheap (~1.3 us -- PyTorch caches it), but it is asked once per `ns` per partition per call,
+# and a single accessor is one fewer thing to get inconsistent.
+_SM_COUNT = {}
 
 
-def _em_sm_count(device):
+def _sm_count(device):
     idx = torch.cuda.current_device() if device is None else torch.device(device).index
     if idx is None:
         idx = torch.cuda.current_device()
-    n = _EM_SM_COUNT.get(idx)
+    n = _SM_COUNT.get(idx)
     if n is None:
-        n = _EM_SM_COUNT[idx] = torch.cuda.get_device_properties(idx).multi_processor_count
+        n = _SM_COUNT[idx] = torch.cuda.get_device_properties(idx).multi_processor_count
     return n
 
 
@@ -176,51 +179,6 @@ class BlockScaleSumParams(ExternalSumParams):
     #: say) RAISES during the backward rather than returning a silent zero. That is the same contract
     #: the flow kernels use, and it is why the flag stays a plain bool.
     computes_external_grads = True
-
-    @property
-    def requests_denom_param_flows(self) -> bool:
-        # The gate makes `Z = sum_c phi * theta` depend on `theta`, so `normalize(F+)` is not exact EM
-        # under a live gate (see `__init__`). The exact M-step needs the denominator flow `F-`; request
-        # it only when `apply_z_correction` is on, so an ordinary gated model still pays nothing.
-        return self.apply_z_correction
-
-    def denom_gate_geometry(self, layer):
-        """
-        `(rows, block_size, n_gates)` of the gate-space accumulator `W`, per forward partition.
-
-        Read off the COMPILED tables only, so it is available before the first forward pass -- which is
-        what lets the PC size `denom_param_flows` at compile time. `n_gates` counts the compiled edge
-        slots, padding included, exactly as the kernels index them.
-
-        Cached on the layer: structural, and the backward asks for it on every call.
-        """
-        cached = getattr(layer, "_bs_denom_geom", None)
-        if cached is not None:
-            return cached
-
-        gate_cbs = self.gate_sizes(layer.nodes[0])[1]
-        out = []
-        for pid in range(layer.num_fw_partitions):
-            rows = layer.partitioned_nids[pid].size(0)
-            num_edges = layer.partitioned_cids[pid].size(1)
-            assert num_edges % gate_cbs == 0, \
-                f"the compiled edge count ({num_edges}) of partition {pid} must be a whole number of " \
-                f"gate blocks ({gate_cbs})."
-            out.append((rows, layer.block_size, num_edges // gate_cbs))
-
-        layer._bs_denom_geom = out
-        return out
-
-    def denom_flow_sizes(self, layer) -> list:
-        """One `W[rows * block_size, n_gates]` per forward partition -- see the module note on why the
-        gate-space contraction is a sufficient (and `gate_cbs` times smaller) accumulator for `F-`."""
-        return [rows * bs * n_gates for rows, bs, n_gates in self.denom_gate_geometry(layer)]
-
-    def _denom_slice(self, layer, denom_param_flows, pid):
-        """This partition's `W`, as a `[rows * block_size, n_gates]` view into the PC's flat buffer."""
-        off, size = layer.denom_flow_slices[pid]
-        rows, bs, n_gates = self.denom_gate_geometry(layer)[pid]
-        return denom_param_flows[off : off + size].view(rows * bs, n_gates)
 
     def __init__(self, block_size: Optional[int] = None, ch_block_size: Optional[int] = None,
                  apply_z_correction: bool = False, tie_external: bool = False):
@@ -1909,47 +1867,62 @@ class BlockScaleSumParams(ExternalSumParams):
         layer._bs_bw_gate_cache[key] = pick
         return pick
 
+    # ------------------------------------------------- denominator flow (apply_z_correction)
+    #
+    # Everything the exact M-step under a live gate needs: the layout of the gate-space
+    # accumulator `W`, the backward that fills it, and the conditional update that consumes it.
+    # Inert unless `apply_z_correction` is set.
+
+    @property
+    def requests_denom_param_flows(self) -> bool:
+        # The gate makes `Z = sum_c phi * theta` depend on `theta`, so `normalize(F+)` is not exact EM
+        # under a live gate (see `__init__`). The exact M-step needs the denominator flow `F-`; request
+        # it only when `apply_z_correction` is on, so an ordinary gated model still pays nothing.
+        return self.apply_z_correction
+
+    def denom_gate_geometry(self, layer):
+        """
+        `(rows, block_size, n_gates)` of the gate-space accumulator `W`, per forward partition.
+
+        Read off the COMPILED tables only, so it is available before the first forward pass -- which is
+        what lets the PC size `denom_param_flows` at compile time. `n_gates` counts the compiled edge
+        slots, padding included, exactly as the kernels index them.
+
+        Cached on the layer: structural, and the backward asks for it on every call.
+        """
+        cached = getattr(layer, "_bs_denom_geom", None)
+        if cached is not None:
+            return cached
+
+        gate_cbs = self.gate_sizes(layer.nodes[0])[1]
+        out = []
+        for pid in range(layer.num_fw_partitions):
+            rows = layer.partitioned_nids[pid].size(0)
+            num_edges = layer.partitioned_cids[pid].size(1)
+            assert num_edges % gate_cbs == 0, \
+                f"the compiled edge count ({num_edges}) of partition {pid} must be a whole number of " \
+                f"gate blocks ({gate_cbs})."
+            out.append((rows, layer.block_size, num_edges // gate_cbs))
+
+        layer._bs_denom_geom = out
+        return out
+
+    def denom_flow_sizes(self, layer) -> list:
+        """One `W[rows * block_size, n_gates]` per forward partition -- see the module note on why the
+        gate-space contraction is a sufficient (and `gate_cbs` times smaller) accumulator for `F-`."""
+        return [rows * bs * n_gates for rows, bs, n_gates in self.denom_gate_geometry(layer)]
+
+    def _denom_slice(self, layer, denom_param_flows, pid):
+        """This partition's `W`, as a `[rows * block_size, n_gates]` view into the PC's flat buffer."""
+        off, size = layer.denom_flow_slices[pid]
+        rows, bs, n_gates = self.denom_gate_geometry(layer)[pid]
+        return denom_param_flows[off : off + size].view(rows * bs, n_gates)
+
     def _accumulate_denom(self, layer, node_flows, params, external_params, denom_param_flows):
         """
-        Accumulate this layer's denominator flow into `denom_param_flows`, in GATE space (see the
-        module note on why `W[node, gate]` is a sufficient and far smaller accumulator than `F-`).
-
-        Set `PYJUICE_BLOCKSCALE_DENOM_REF=1` to force the torch reference `_accumulate_denom_torch`
-        instead -- what the kernel is validated against, and a no-Triton escape hatch.
-        """
-        if os.environ.get("PYJUICE_BLOCKSCALE_DENOM_REF", "0") == "1":
-            return self._accumulate_denom_torch(layer, node_flows, params, external_params,
-                                                denom_param_flows)
-
-        import triton
-
-        state = layer._bs_bw_state
-        block_size, batch = state["block_size"], state["batch_size"]
-        node_cbs, gate_cbs, ext_base = state["node_cbs"], state["gate_cbs"], state["ext_base"]
-
-        TILE_SIZE_B = min(triton.next_power_of_2(batch), 64)
-        B_NUM_TILES = triton.cdiv(batch, TILE_SIZE_B)
-
-        for pid, (nids, log_z, rows) in enumerate(state["shift_args"]):
-            gate = layer.ext_slots[0][pid]
-            num_edges = layer.partitioned_cids[pid].size(1)
-
-            # `rows` is the CUDA grid-y, capped at 65535 (as in the phigrad launch above).
-            assert rows <= 65535, \
-                f"partition {pid} has {rows} node blocks, past the 65535 CUDA grid-y limit for the " \
-                f"denominator kernel. Use a larger block size."
-
-            self._accumulate_denom_gate_space(
-                layer, node_flows, params, external_params, denom_param_flows,
-                pid, nids, log_z, rows, gate, num_edges,
-                block_size, batch, node_cbs, gate_cbs, ext_base, TILE_SIZE_B, B_NUM_TILES)
-
-    def _accumulate_denom_gate_space(self, layer, node_flows, params, external_params,
-                                     denom_param_flows, pid, nids, log_z, rows, gate, num_edges,
-                                     block_size, batch, node_cbs, gate_cbs,
-                                     ext_base, TILE_SIZE_B, B_NUM_TILES):
-        """
-        Contract this mini-batch into `W[node, gate] += sum_b u[n,b] * phi[g,b]`.
+        Contract this mini-batch into `W[node, gate] += sum_b u[n,b] * phi[g,b]`, this layer's share of
+        the denominator flow, in GATE space -- see the module note on why `W` is a sufficient and far
+        smaller accumulator than `F-` itself.
 
         The contraction is over the GATE axis, which is `gate_cbs` times shorter than the edge axis, so
         `node_flows` / `log Z` are read once per GATE tile rather than once per EDGE tile. See
@@ -1959,56 +1932,78 @@ class BlockScaleSumParams(ExternalSumParams):
         `W` is a VIEW into the PC's flat denominator buffer, so it persists across backward calls and
         rides `init_param_flows`' reset/scale cadence -- which is what makes this an ACCUMULATION (`+=`)
         rather than a store: several mini-batches may feed one EM step.
+
+        Set `PYJUICE_BLOCKSCALE_DENOM_REF=1` to force the torch reference `_accumulate_denom_torch`
+        instead -- what the kernel is validated against, and a no-Triton escape hatch.
         """
+        if os.environ.get("PYJUICE_BLOCKSCALE_DENOM_REF", "0") == "1":
+            return self._accumulate_denom_torch(layer, node_flows, params, external_params,
+                                                denom_param_flows)
+
         import triton
         from .kernels.blockscale_backward import _bs_triton_denom_w_kernel
 
-        n_gates = num_edges // gate_cbs
+        state = layer._bs_bw_state
+        block_size, batch = state["block_size"], state["batch_size"]
+        node_cbs, gate_cbs, ext_base = state["node_cbs"], state["gate_cbs"], state["ext_base"]
         dev = params.device
-        W = self._denom_slice(layer, denom_param_flows, pid)
 
-        # ---- W[node, gate] ----
-        #
-        # OCCUPANCY-bound, not bandwidth-bound, so the tiles are chosen to fill the device rather than
-        # to be as large as the register budget allows. MEASURED before this: the widest legal tiles
-        # left the kernel with 32 programs on a ~188-SM GPU, running at ~10% of achievable bandwidth
-        # (7.54 us against ~0.75 us of traffic).
-        #
-        # Shrinking the NODE tile here is free in traffic, unlike in the fused per-edge kernel this
-        # replaced, where it was a disaster: `node_flows` / `log Z` are PARTITIONED by node, so m-tiling
-        # moves them between programs rather than replicating them, and the only replicated operand is
-        # `lphi`, which is `n_gates` wide (16 here) rather than an edge tile (256 there).
-        target = 4 * torch.cuda.get_device_properties(dev).multi_processor_count
-        TILE_SIZE_G = min(triton.next_power_of_2(n_gates), 64)
-        g_tiles = triton.cdiv(n_gates, TILE_SIZE_G)
+        TILE_SIZE_B = min(triton.next_power_of_2(batch), 64)
+        B_NUM_TILES = triton.cdiv(batch, TILE_SIZE_B)
 
-        # Widest node tile the register budget allows, then halved while the grid is under-filled.
-        TILE_SIZE_M = max(1, min(block_size, max(1, 4096 // max(1, TILE_SIZE_G))))
-        m_floor = 16 if block_size >= 16 else 1          # `tl.dot` needs 16
-        while TILE_SIZE_M > m_floor and \
-                rows * (block_size // TILE_SIZE_M) * g_tiles * B_NUM_TILES < target:
-            TILE_SIZE_M //= 2
-        m_tiles = max(1, block_size // TILE_SIZE_M)
-        w_use_dot = 1 if (TILE_SIZE_M >= 16 and TILE_SIZE_G >= 16 and TILE_SIZE_B >= 16) else 0
-        dot_ieee = 0 if os.environ.get("PYJUICE_BLOCKSCALE_DENOM_TF32", "0") == "1" else 1
+        for pid, (nids, log_z, rows) in enumerate(state["shift_args"]):
+            gate = layer.ext_slots[0][pid]
+            num_edges = layer.partitioned_cids[pid].size(1)
+            n_gates = num_edges // gate_cbs
+            W = self._denom_slice(layer, denom_param_flows, pid)
 
-        # SPLIT THE BATCH REDUCTION across programs until the grid is big enough to fill the device.
-        # Each slice holds a PARTIAL sum for the same `W[n,g]`, so their combine must be atomic; with a
-        # single slice every `(n,g)` belongs to exactly one program and a read-add-write is safe. Either
-        # way it is an accumulation, never a store -- `W` is the persistent buffer, not a scratch.
-        base_progs = max(1, rows * m_tiles * g_tiles)
-        B_SPLITS = max(1, min(B_NUM_TILES, triton.cdiv(target, base_progs)))
-        B_TILES_PER_PROG = triton.cdiv(B_NUM_TILES, B_SPLITS)
-        B_SPLITS = triton.cdiv(B_NUM_TILES, B_TILES_PER_PROG)
+            # `rows` is the CUDA grid-y, capped at 65535 (as in the phigrad launch above).
+            assert rows <= 65535, \
+                f"partition {pid} has {rows} node blocks, past the 65535 CUDA grid-y limit for the " \
+                f"denominator kernel. Use a larger block size."
 
-        _bs_triton_denom_w_kernel[(rows * m_tiles, g_tiles, B_SPLITS)](
-            node_flows = node_flows, log_z = log_z, W = W, ext = external_params, gate = gate,
-            nids = nids, batch_size = batch, n_gates = n_gates,
-            TILE_SIZE_B = TILE_SIZE_B, TILE_SIZE_G = TILE_SIZE_G, TILE_SIZE_M = TILE_SIZE_M,
-            BLOCK_SIZE_M = block_size, NODE_CBS = node_cbs, GATE_CBS = gate_cbs,
-            gate_stride = gate.size(1), ext_base = ext_base,
-            B_TILES_PER_PROG = B_TILES_PER_PROG, USE_DOT = w_use_dot, DOT_IEEE = dot_ieee,
-            W_ATOMIC = 1 if B_SPLITS > 1 else 0, num_stages = 1)
+            # OCCUPANCY-bound, not bandwidth-bound, so the tiles are chosen to fill the device
+            # rather than to be as large as the register budget allows. MEASURED before this: the
+            # widest legal tiles left the kernel with 32 programs on a ~188-SM GPU, running at ~10%
+            # of achievable bandwidth (7.54 us against ~0.75 us of traffic).
+            #
+            # Shrinking the NODE tile here is free in traffic, unlike in the fused per-edge kernel
+            # this replaced, where it was a disaster: `node_flows` / `log Z` are PARTITIONED by node,
+            # so m-tiling moves them between programs rather than replicating them, and the only
+            # replicated operand is `lphi`, which is `n_gates` wide (16 here) rather than an edge
+            # tile (256 there).
+            target = 4 * _sm_count(dev)
+            TILE_SIZE_G = min(triton.next_power_of_2(n_gates), 64)
+            g_tiles = triton.cdiv(n_gates, TILE_SIZE_G)
+
+            # Widest node tile the register budget allows, then halved while the grid is under-filled.
+            TILE_SIZE_M = max(1, min(block_size, max(1, 4096 // max(1, TILE_SIZE_G))))
+            m_floor = 16 if block_size >= 16 else 1          # `tl.dot` needs 16
+            while TILE_SIZE_M > m_floor and \
+                    rows * (block_size // TILE_SIZE_M) * g_tiles * B_NUM_TILES < target:
+                TILE_SIZE_M //= 2
+            m_tiles = max(1, block_size // TILE_SIZE_M)
+            w_use_dot = 1 if (TILE_SIZE_M >= 16 and TILE_SIZE_G >= 16 and TILE_SIZE_B >= 16) else 0
+            dot_ieee = 0 if os.environ.get("PYJUICE_BLOCKSCALE_DENOM_TF32", "0") == "1" else 1
+
+            # SPLIT THE BATCH REDUCTION across programs until the grid is big enough to fill the
+            # device. Each slice holds a PARTIAL sum for the same `W[n,g]`, so their combine must be
+            # atomic; with a single slice every `(n,g)` belongs to exactly one program and a
+            # read-add-write is safe. Either way it is an accumulation, never a store -- `W` is the
+            # persistent buffer, not a scratch.
+            base_progs = max(1, rows * m_tiles * g_tiles)
+            B_SPLITS = max(1, min(B_NUM_TILES, triton.cdiv(target, base_progs)))
+            B_TILES_PER_PROG = triton.cdiv(B_NUM_TILES, B_SPLITS)
+            B_SPLITS = triton.cdiv(B_NUM_TILES, B_TILES_PER_PROG)
+
+            _bs_triton_denom_w_kernel[(rows * m_tiles, g_tiles, B_SPLITS)](
+                node_flows = node_flows, log_z = log_z, W = W, ext = external_params, gate = gate,
+                nids = nids, batch_size = batch, n_gates = n_gates,
+                TILE_SIZE_B = TILE_SIZE_B, TILE_SIZE_G = TILE_SIZE_G, TILE_SIZE_M = TILE_SIZE_M,
+                BLOCK_SIZE_M = block_size, NODE_CBS = node_cbs, GATE_CBS = gate_cbs,
+                gate_stride = gate.size(1), ext_base = ext_base,
+                B_TILES_PER_PROG = B_TILES_PER_PROG, USE_DOT = w_use_dot, DOT_IEEE = dot_ieee,
+                W_ATOMIC = 1 if B_SPLITS > 1 else 0, num_stages = 1)
 
     def _accumulate_denom_torch(self, layer, node_flows, params, external_params, denom_param_flows):
         """
@@ -2169,7 +2164,7 @@ class BlockScaleSumParams(ExternalSumParams):
             block_size = layer.block_size
             geom = self.denom_gate_geometry(layer)
             gate_cbs = self.gate_sizes(layer.nodes[0])[1]
-            target = 4 * torch.cuda.get_device_properties(params.device).multi_processor_count
+            target = 4 * _sm_count(params.device)
 
             for pid in range(layer.num_fw_partitions):
                 rows, _, n_gates = geom[pid]
@@ -2207,26 +2202,27 @@ class BlockScaleSumParams(ExternalSumParams):
 
         return out
 
-    def _fused_em_correction(self, ns, params, param_flows, denom_param_flows, step_size,
-                             pseudocount, keep_zero_params, denom_sources, out = None):
+    def _em_plan(self, ns, denom_sources, device):
         """
-        The conditional M-step as two Triton kernels, or `None` when this shape is not served (the caller
-        then runs the torch reference).
+        Everything the fused M-step needs that depends only on the COMPILED structure, or `None` if this
+        shape is not served (the caller then runs the torch reference).
 
-        Replaces the eager chain AND the `F-` reconstruction: `F-[n,c] = theta[n,c] * W[n,g(c)]`, so `W`
-        is gathered in-kernel and `F-` is never materialized.
+        Cached on the layer per parameter range and device. Everything in it is STRUCTURAL -- which rows
+        of each partition belong to this `ns`, how many children each of their nodes has, and the span
+        of `cum` -- so nothing that varies call to call (the tie group, the step size) belongs here.
 
-        A TIE GROUP needs `F- = theta * sum over members of W`, and the members' `W` live in their own
-        layers' slices. They are summed here, which is only meaningful if every member's gate geometry
-        and row count line up with the source's -- checked, and the shape is declined if not. Everything
-        else about the group already works through the source: `pids` address the shared `_param_range`,
-        and `pfids` address the source's param-flow range, which `compute_cum_par_flows` has already
-        fused.
+        Declines two shapes rather than guessing at them:
+
+          * a TIE GROUP whose members' gate geometry does not line up with the source's. `F-` for the
+            group is `theta * sum over members of W`, and the members' `W` live in their own layers'
+            slices, so summing them is only meaningful when those slices are elementwise-addable.
+          * an `ns` whose parameter and param-flow ranges differ in length, which would break the
+            caller's reshape contract.
+
+        Everything else about a tie group already works through the source: `pids` address the shared
+        `_param_range`, and `pfids` address the source's param-flow range, which `compute_cum_par_flows`
+        has already fused.
         """
-        import triton
-        from .kernels.blockscale_backward import (_bs_triton_em_cum_kernel,
-                                                  _bs_triton_em_update_kernel)
-
         sources = list(denom_sources)
         if len(sources) == 0:
             return None
@@ -2235,52 +2231,76 @@ class BlockScaleSumParams(ExternalSumParams):
         geom = self.denom_gate_geometry(layer)
         gate_cbs = self.gate_sizes(layer.nodes[0])[1]
         block_size = layer.block_size
-        dev = params.device
 
-        # Every member must be elementwise-addable onto the source's `W`, or the sum below is meaningless.
-        for other_layer, _ in sources[1:]:
-            if other_layer.num_fw_partitions != layer.num_fw_partitions:
-                return None
-            if self.denom_gate_geometry(other_layer) != geom:
-                return None
-            if self.gate_sizes(other_layer.nodes[0])[1] != gate_cbs:
-                return None
-            if other_layer.block_size != block_size:
+        for other, _ in sources[1:]:
+            if (other.num_fw_partitions != layer.num_fw_partitions
+                    or self.denom_gate_geometry(other) != geom
+                    or self.gate_sizes(other.nodes[0])[1] != gate_cbs
+                    or other.block_size != block_size):
                 return None
 
         ps, pe = ns._param_range
         pfs, pfe = ns._param_flow_range
-        size = pfe - pfs
-        if size != pe - ps:
-            return None                      # the caller's reshape contract would not hold
+        if pfe - pfs != pe - ps:
+            return None
 
-        cache = layer.__dict__.setdefault("_bs_em_fused_cache", {})
-        key = (ps, pe)
+        cache = layer.__dict__.setdefault("_bs_em_plan_cache", {})
+        key = (ps, pe, str(device))
         plan = cache.get(key)
-        if plan is None or plan["dev"] != str(dev):
+        if plan is None:
             # ROWS OF THIS `ns` ONLY. A partition may hold node blocks of several `ns`; selecting rows
-            # here (rather than masking writes afterwards) is what keeps them separate.
-            plan = {"dev": str(dev), "parts": []}
+            # here, rather than masking writes afterwards, is what keeps them separate.
+            parts = []
             for pid in range(layer.num_fw_partitions):
-                pids = layer.partitioned_pids[pid]
-                cids = layer.partitioned_cids[pid]
+                pids, cids = layer.partitioned_pids[pid], layer.partitioned_cids[pid]
                 mine = ((pids[:, 0] >= ps) & (pids[:, 0] < pe)).nonzero().flatten()
                 if mine.numel() == 0:
-                    plan["parts"].append(None)
+                    parts.append(None)
                     continue
-                kcount = (cids != 0).sum(dim = 1).to(torch.int32)      # children per node, per row
-                plan["parts"].append({"row_map": mine.to(torch.int32).contiguous().to(dev),
-                                      "kcount": kcount.contiguous().to(dev)})
-            nid_min = min(int(layer.partitioned_nids[pid][plan["parts"][pid]["row_map"].long()].min())
-                          for pid in range(layer.num_fw_partitions) if plan["parts"][pid] is not None)
-            nid_max = max(int(layer.partitioned_nids[pid][plan["parts"][pid]["row_map"].long()].max())
-                          for pid in range(layer.num_fw_partitions) if plan["parts"][pid] is not None)
-            plan["cum_base"] = nid_min
-            plan["cum_size"] = nid_max + block_size - nid_min
-            cache[key] = plan
+                parts.append({
+                    "row_map": mine.to(torch.int32).contiguous().to(device),
+                    # children per node of each row, i.e. the torch path's `eblk_per_nb[nb] * cbs`
+                    "kcount": (cids != 0).sum(dim = 1).to(torch.int32).contiguous().to(device),
+                })
+            if all(p is None for p in parts):
+                return None
 
-        if all(p is None for p in plan["parts"]):
+            # `cum` is indexed by GLOBAL node id so it can be shared across partitions, which it must be:
+            # a node's children may be split across them.
+            live = [pid for pid in range(layer.num_fw_partitions) if parts[pid] is not None]
+            nids = [layer.partitioned_nids[pid][parts[pid]["row_map"].long()] for pid in live]
+            nid_min = min(int(t.min()) for t in nids)
+            nid_max = max(int(t.max()) for t in nids)
+            plan = cache[key] = {"layer": layer, "parts": parts, "cum_base": nid_min,
+                                 "cum_size": nid_max + block_size - nid_min}
+        return plan
+
+    def _fused_em_correction(self, ns, params, param_flows, denom_param_flows, step_size,
+                             pseudocount, keep_zero_params, denom_sources, out = None):
+        """
+        The conditional M-step as two Triton kernels, or `None` when this shape is not served (the caller
+        then runs the torch reference).
+
+        Replaces the eager chain AND the `F-` reconstruction: `F-[n,c] = theta[n,c] * W[n,g(c)]`, so `W`
+        is gathered in-kernel and `F-` is never materialized. A tie group sums its members' `W` below;
+        `_em_plan` is what decides whether that sum is well defined.
+        """
+        import triton
+        from .kernels.blockscale_backward import (_bs_triton_em_cum_kernel,
+                                                  _bs_triton_em_update_kernel)
+
+        dev = params.device
+        plan = self._em_plan(ns, denom_sources, dev)
+        if plan is None:
             return None
+
+        layer, sources = plan["layer"], list(denom_sources)
+        geom = self.denom_gate_geometry(layer)
+        gate_cbs = self.gate_sizes(layer.nodes[0])[1]
+        block_size = layer.block_size
+        ps, pe = ns._param_range
+        pfs, pfe = ns._param_flow_range
+        size = pfe - pfs
 
         # The caller may hand us `params[ps:pe]` to write in place, which is what removes BOTH the
         # separate write-back and the discarded `em_par_update` work on these ranges. It is NOT zeroed:
@@ -2320,14 +2340,17 @@ class BlockScaleSumParams(ExternalSumParams):
         from pyjuice.layer.kernels import autotune
 
         # ---- pass 1: the per-node normalizer, into `cum` ----
+        # What each partition's pass-2 launch needs, built here so the tile search and the `W` sum are
+        # not repeated. It is a LOCAL: `plan["parts"]` is cached on the layer and holds structure only.
+        staged = []
         for pid in range(layer.num_fw_partitions):
             part = plan["parts"][pid]
             if part is None:
                 continue
-            rows, _, n_gates = geom[pid]
+            _, _, n_gates = geom[pid]
             cids = layer.partitioned_cids[pid]
             num_edges = cids.size(1)
-            n_rows = part["row_map"].numel()
+            n_rows = part["row_map"].numel()      # rows of THIS `ns`, not of the whole partition
 
             W = self._denom_slice(layer, denom_param_flows, pid)
             if len(sources) > 1:
@@ -2360,20 +2383,11 @@ class BlockScaleSumParams(ExternalSumParams):
                     ("bs_em_cum", num_edges, n_gates, block_size, gate_cbs, n_rows), cands,
                     lambda c: _cum(c, sc))
             _cum(cfg, cum)
-            part["_common"] = common
-            part["_cands"] = cands
-            part["_shape"] = (num_edges, n_gates, n_rows)
+            staged.append((common, cands, num_edges, n_gates, n_rows))
 
         # ---- pass 2: the update, into `out`. Runs only once every partition's `cum` is complete,
         #      because a node's children may be split across partitions. ----
-        for pid in range(layer.num_fw_partitions):
-            part = plan["parts"][pid]
-            if part is None:
-                continue
-            common = part.pop("_common")
-            cands = part.pop("_cands")
-            num_edges, n_gates, n_rows = part.pop("_shape")
-
+        for common, cands, num_edges, n_gates, n_rows in staged:
             def _upd(cfg, target_out):
                 tm, tk = cfg
                 _bs_triton_em_update_kernel[(triton.cdiv(num_edges, tk),
@@ -2423,7 +2437,7 @@ class BlockScaleSumParams(ExternalSumParams):
         """
         import triton
 
-        target = 4 * _em_sm_count(dev)
+        target = 4 * _sm_count(dev)
         ne_pow2 = triton.next_power_of_2(num_edges)
 
         def legal(tm, tk):
@@ -2444,14 +2458,14 @@ class BlockScaleSumParams(ExternalSumParams):
         # Spans tile BUDGETS 1024-8192 as well as the TM/TK split, because neither alone is right
         # everywhere: MEASURED, HMM 2048 prefers a 1024-element tile (3315 us against 4123 at 4096)
         # while HMM 512 prefers 4096 (901 us against 1086 at 1024) -- a 20% swing in OPPOSITE
-        # directions. Picking one budget globally is what made 512 regress, and is why this is tuned
-        # per shape rather than reasoned about. `(64, 64)` is the config the scatter kernel settles on.
+        # directions, and picking one budget globally is what made 512 regress.
+        #
+        # The small tiles earn their place the same way: at HMM 512 a 64x64 tile leaves only 64
+        # programs against a ~752-program target, so there the GRID is the binding constraint rather
+        # than the tile, and the shape prefers 16x16 (901 us) over 32x32 (1086) -- while 2048 prefers
+        # 32x32. The optimum moves with the grid AND the register budget, which is why this is measured
+        # per shape instead of being a formula. `(64, 64)` is where the scatter kernel settles.
         out, seen = [], set()
-        # Small tiles are in the list for a reason: at HMM 512 a 64x64 tile leaves only 64 programs
-        # against a ~752-program target, so the grid, not the tile, is the binding constraint there --
-        # MEASURED, the shape prefers ~16x16 (901 us) over 32x32 (1086). At 2048 the same shape space
-        # prefers 32x32. The optimum therefore moves with the GRID as well as the register budget,
-        # which is the whole reason this is measured per shape instead of being a formula.
         for cand in [(tm0, tk0), (64, 64), (128, 32), (64, 32), (128, 16), (64, 16), (32, 32),
                      (32, 16), (16, 16), (16, 32), (256, 16), (32, 64)]:
             c = legal(*cand)
@@ -2468,9 +2482,8 @@ class BlockScaleSumParams(ExternalSumParams):
         parameters for `ns._param_range`; the PC writes them back over the standard update.
 
         FUSED into two Triton kernels when the shape allows (`_fused_em_correction`); the torch body
-        below is the reference it is validated against, and the fallback. It is reached for a tie group
-        whose members' gate geometry does not line up, and under
-        `PYJUICE_BLOCKSCALE_EM_FUSED=0`.
+        below is the reference it is validated against, and the fallback. It is reached under
+        `PYJUICE_BLOCKSCALE_EM_FUSED=0` and for the shapes `_em_plan` declines.
 
         The torch form runs ONCE PER EM STEP and has no batch axis (F+, F-, theta are all param-sized),
         which is why it was torch to begin with -- but it is ~38 ATen ops PER `ns` and MEASURED
@@ -2478,6 +2491,10 @@ class BlockScaleSumParams(ExternalSumParams):
         the node count, not the parameter count, set its cost. Node-level layout
         `[E, ch_block_size, block_size]` (edge block, child-in-block, node-in-block), the same `params`
         uses.
+
+        :param out: where to write the result, in place of a fresh tensor -- in practice
+            `params[ps:pe]`, which is what lets the PC skip the standard update on this range instead
+            of computing it and throwing it away. Must be `pe - ps` elements.
         """
         if _EM_FUSED:
             fused = self._fused_em_correction(ns, params, param_flows, denom_param_flows, step_size,
