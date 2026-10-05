@@ -1,7 +1,30 @@
 from __future__ import annotations
 
+import os
 import torch
 from typing import Any, Optional, Sequence, Tuple
+
+
+# Elements per tile for the shared dual-EM kernels' HEURISTIC default -- `candidates[0]` in
+# `_em_tile_candidates`, i.e. what runs with `PYJUICE_AUTOTUNE=0`. The autotuner spans a wider range,
+# so it is a seed rather than a cap; 1024 because these kernels keep ~3x the live tiles of a plain
+# scatter and 4096 spills. The older BlockScale-specific name is still honoured.
+_EM_TILE_BUDGET = int(os.environ.get("PYJUICE_DUAL_EM_TILE",
+                                     os.environ.get("PYJUICE_BLOCKSCALE_EM_TILE", "1024")))
+
+_SM_COUNT = {}
+
+
+def _sm_count(device):
+    """SM count, cached: the dual-EM launcher sizes its grid against it once per partition per call."""
+    import torch
+    idx = torch.cuda.current_device() if device is None else torch.device(device).index
+    if idx is None:
+        idx = torch.cuda.current_device()
+    n = _SM_COUNT.get(idx)
+    if n is None:
+        n = _SM_COUNT[idx] = torch.cuda.get_device_properties(idx).multi_processor_count
+    return n
 
 
 class ExternalSumParams():
@@ -376,18 +399,289 @@ class ExternalSumParams():
             "`materialize_denom_flows`, so the conditional M-step cannot reconstruct `F-`."
         )
 
+    def denom_kernel_spec(self, layer, denom_param_flows, pid):
+        """
+        How the SHARED dual-EM kernels should form `F-` for one forward partition, or `None` to
+        decline the fast path (the generic torch M-step then runs).
+
+        Returns `(mode, tensor, n_groups, group_cbs, denom_base)`:
+
+        * `mode` -- `DENOM_DENSE` if `tensor[pfid - denom_base]` IS `F-`, or `DENOM_ROWGROUP` if
+          `F-[n,c] = theta[n,c] * tensor[n, c // group_cbs]` (a per-(node, group-of-children) factor,
+          laid out `[rows * block_size, n_groups]`). See `kernels/dual_em.py`.
+        * `n_groups` / `group_cbs` -- the row-group geometry; `(0, 1)` when unused.
+        * `denom_base` -- the `pfid` origin of `tensor` in dense mode; `0` when unused.
+
+        Implementing this is what buys a parameterization the FAST M-step. It is worth doing for
+        MEMORY and not only for speed: the generic torch path has to materialize `F-` and then builds
+        `ratio` / `flow` / `new_theta` on top of it, MEASURED at ~5x the parameter range in transients
+        against ~1x here (20.1 MB vs 4.1 MB at a 4 MB `ns`), and 2.2x the time.
+
+        Under parameter tying the base calls this once per member and SUMS the tensors, so every
+        member's must be elementwise-addable onto the source's -- same mode, same geometry, same
+        shape. It declines the fast path rather than guessing when they are not.
+        """
+        return None
+
+    def _em_plan(self, ns, layer, device):
+        """
+        Everything the fused M-step needs that depends only on the COMPILED structure, or `None` if
+        this shape is not served.
+
+        Cached on the layer per parameter range and device. Everything in it is STRUCTURAL -- which
+        rows of each partition belong to this `ns`, how many children each of their nodes has, and the
+        span of `cum` -- so nothing that varies call to call belongs here.
+
+        Declines an `ns` whose parameter and param-flow ranges differ in length, which would break the
+        caller's reshape contract.
+        """
+        ps, pe = ns._param_range
+        pfs, pfe = ns._param_flow_range
+        if pfe - pfs != pe - ps:
+            return None
+
+        block_size = layer.block_size
+        cache = layer.__dict__.setdefault("_dual_em_plan_cache", {})
+        key = (ps, pe, str(device))
+        plan = cache.get(key)
+        if plan is not None:
+            return plan
+
+        # ROWS OF THIS `ns` ONLY. A partition may hold node blocks of several `ns`; selecting rows
+        # here, rather than masking writes afterwards, is what keeps them separate.
+        parts = []
+        for pid in range(layer.num_fw_partitions):
+            pids, cids = layer.partitioned_pids[pid], layer.partitioned_cids[pid]
+            mine = ((pids[:, 0] >= ps) & (pids[:, 0] < pe)).nonzero().flatten()
+            if mine.numel() == 0:
+                parts.append(None)
+                continue
+            parts.append({
+                "row_map": mine.to(torch.int32).contiguous().to(device),
+                # children per node of each row, i.e. the torch path's `eblk_per_nb[nb] * cbs`
+                "kcount": (cids != 0).sum(dim = 1).to(torch.int32).contiguous().to(device),
+            })
+        if all(x is None for x in parts):
+            return None
+
+        # `cum` is indexed by GLOBAL node id so it can be shared across partitions, which it must be:
+        # a node's children may be split across them.
+        live = [pid for pid in range(layer.num_fw_partitions) if parts[pid] is not None]
+        nids = [layer.partitioned_nids[pid][parts[pid]["row_map"].long()] for pid in live]
+        nid_min = min(int(t.min()) for t in nids)
+        nid_max = max(int(t.max()) for t in nids)
+        plan = cache[key] = {"parts": parts, "cum_base": nid_min,
+                             "cum_size": nid_max + block_size - nid_min}
+        return plan
+
+    @staticmethod
+    def _em_tile_candidates(block_size, num_edges, n_rows, dev):
+        """
+        `(TILE_SIZE_M, TILE_SIZE_K)` candidates for the shared dual-EM kernels, heuristic default first.
+
+        `TILE_SIZE_M` MUST divide `block_size`: the kernels derive `M_TILES = BLOCK_SIZE_M //
+        TILE_SIZE_M` and address `pid_y // M_TILES`, so a remainder would mis-map rows.
+
+        Spans tile BUDGETS 1024-8192 as well as the TM/TK split, because neither alone is right
+        everywhere: MEASURED, HMM 2048 prefers a 1024-element tile (3315 us against 4123 at 4096)
+        while HMM 512 prefers 4096 (901 us against 1086 at 1024) -- a 20% swing in OPPOSITE
+        directions, and picking one budget globally is what made 512 regress. The small tiles earn
+        their place the same way: at HMM 512 a 64x64 tile leaves only 64 programs against a
+        ~752-program target, so there the GRID binds rather than the tile.
+
+        `TILE_SIZE_K` groups the normalizer's REDUCTION, so varying it reassociates
+        `sum_c theta*ratio`. That is benign here and nowhere else would be: the summands are
+        non-negative (no cancellation) and carry no max-stabilization, and the cross-tile combine is
+        already `tl.atomic_add`, i.e. order-nondeterministic from run to run -- so TK only reorders a
+        sum that was never deterministic.
+        """
+        import triton
+
+        target = 4 * _sm_count(dev)
+        ne_pow2 = triton.next_power_of_2(num_edges)
+
+        def legal(tm, tk):
+            tm = max(1, min(tm, block_size))
+            if block_size % tm != 0:
+                return None
+            return (tm, max(1, min(tk, ne_pow2)))
+
+        tk0 = max(1, min(ne_pow2, 32))
+        tm0 = max(1, min(block_size, max(1, _EM_TILE_BUDGET // tk0)))
+        floor = 16 if block_size >= 16 else 1
+        while tm0 > floor and triton.cdiv(num_edges, tk0) * n_rows * (block_size // tm0) < target:
+            tm0 //= 2
+        while tk0 > 8 and triton.cdiv(num_edges, tk0) * n_rows * (block_size // tm0) < target:
+            tk0 //= 2
+
+        out, seen = [], set()
+        for cand in [(tm0, tk0), (64, 64), (128, 32), (64, 32), (128, 16), (64, 16), (32, 32),
+                     (32, 16), (16, 16), (16, 32), (256, 16), (32, 64)]:
+            c = legal(*cand)
+            if c is not None and c not in seen:
+                seen.add(c)
+                out.append(c)
+        return out
+
     def _fused_em_correction(self, ns, params, param_flows, denom_param_flows, step_size,
                              pseudocount, keep_zero_params, denom_sources, out = None):
         """
-        Optional fast path for :func:`compute_em_correction`: return the new parameters, or `None` to
-        fall through to the generic torch implementation.
+        The conditional M-step as two shared Triton kernels, or `None` when this shape is not served
+        (:func:`compute_em_correction` then runs the generic torch path, which is also what this is
+        validated against).
 
-        The generic path is ~38 ATen ops per `ns` and MEASURED dispatch-bound (it grew with the NODE
-        count, not the parameter count), so a parameterization whose M-step shows up in a profile can
-        override this with its own kernels. `BlockScaleSumParams` does, and also uses it to subsume the
-        `F-` reconstruction so that `F-` is never materialized at all.
+        Generic in the parameterization: how `F-` is formed is the `DENOM_MODE` constexpr that
+        :func:`denom_kernel_spec` selects, and `F-` is never materialized -- it is computed inside the
+        kernels from whatever statistic was stored. A parameterization gets all of this by
+        implementing that one method.
         """
-        return None
+        import triton
+        from .kernels.dual_em import _dual_em_cum_kernel, _dual_em_update_kernel
+
+        sources = list(denom_sources)
+        if len(sources) == 0:
+            return None
+        layer = sources[0][0]
+        dev = params.device
+        block_size = layer.block_size
+
+        # ---- gather the per-partition `F-` recipes, and the tie group's addends ----
+        specs = []
+        for pid in range(layer.num_fw_partitions):
+            s0 = self.denom_kernel_spec(layer, denom_param_flows, pid)
+            if s0 is None:
+                return None
+            mode, tensor, n_groups, group_cbs, denom_base = s0
+            addends = [tensor]
+            for other, _ in sources[1:]:
+                if (other.num_fw_partitions != layer.num_fw_partitions
+                        or other.block_size != block_size):
+                    return None
+                so = self.denom_kernel_spec(other, denom_param_flows, pid)
+                if so is None or so[0] != mode or so[2] != n_groups or so[3] != group_cbs \
+                        or so[1].shape != tensor.shape:
+                    return None                  # not elementwise-addable onto the source's
+                addends.append(so[1])
+            specs.append((mode, addends, n_groups, group_cbs, denom_base))
+
+        plan = self._em_plan(ns, layer, dev)
+        if plan is None:
+            return None
+
+        ps, pe = ns._param_range
+        pfs, pfe = ns._param_flow_range
+        size = pfe - pfs
+
+        # The caller may hand us `params[ps:pe]` to write in place, which is what removes BOTH the
+        # separate write-back and the discarded `em_par_update` work on these ranges. It is NOT zeroed:
+        # every element of a node's parameter range is covered by exactly one real edge slot, so each
+        # is written exactly once.
+        by_par = out is not None
+        if by_par:
+            assert out.numel() == pe - ps, (out.numel(), pe - ps)
+            out_base, out_size_ = ps, pe - ps
+        else:
+            out = torch.zeros(size, device = dev, dtype = torch.float32)
+            out_base, out_size_ = pfs, size
+        cum = torch.zeros(plan["cum_size"], device = dev, dtype = torch.float32)
+
+        # EVERY scalar the kernels use, fp32, on the DEVICE -- including the clamp thresholds. Triton
+        # types a Python float KERNEL ARGUMENT as fp64, and a float LITERAL inside the kernel promotes
+        # too, so either one silently turns the whole `den`/`ratio`/`new` chain into double precision.
+        # Order must match the `tl.load(consts + i)` offsets in `kernels/dual_em.py`.
+        # CACHED by value: every `ns` of one EM step uses the same step size and pseudocount, so
+        # building this per `ns` was 15 host-to-device copies per step -- MEASURED 1007 -> 1185 us.
+        ckey = (float(pseudocount), float(step_size), str(dev))
+        cache_c = self.__dict__.setdefault("_dual_em_consts", {})
+        consts = cache_c.get(ckey)
+        if consts is None:
+            consts = cache_c[ckey] = torch.tensor(
+                [float(pseudocount), float(step_size), 1.0 - float(step_size),
+                 1e-38, 1e-30, 1e-12, 0.0], dtype = torch.float32, device = dev)
+            if len(cache_c) > 8:                  # a schedule sweeping step sizes must not grow it
+                for k in list(cache_c)[:-4]:
+                    del cache_c[k]
+
+        from pyjuice.layer.kernels import autotune
+
+        # ---- pass 1: the per-node normalizer, into `cum` ----
+        # What each partition's pass-2 launch needs, built here so the tile search and the member sum
+        # are not repeated. It is a LOCAL: `plan["parts"]` is cached on the layer, structure only.
+        staged = []
+        for pid in range(layer.num_fw_partitions):
+            part = plan["parts"][pid]
+            if part is None:
+                continue
+            mode, addends, n_groups, group_cbs, denom_base = specs[pid]
+            cids = layer.partitioned_cids[pid]
+            num_edges = cids.size(1)
+            n_rows = part["row_map"].numel()      # rows of THIS `ns`, not of the whole partition
+
+            denom = addends[0]
+            if len(addends) > 1:
+                denom = denom.clone()
+                for extra in addends[1:]:
+                    denom = denom + extra
+
+            common = dict(mparams = params, param_flows = param_flows, denom = denom,
+                          cids = cids, pids = layer.partitioned_pids[pid],
+                          pfids = layer.partitioned_pfids[pid],
+                          nids = layer.partitioned_nids[pid], row_map = part["row_map"],
+                          kcount = part["kcount"], num_edges = num_edges, n_groups = n_groups,
+                          BLOCK_SIZE_M = block_size, GROUP_CBS = group_cbs,
+                          consts = consts, cum_base = plan["cum_base"], denom_base = denom_base,
+                          DENOM_MODE = mode, num_stages = 1)
+            cands = self._em_tile_candidates(block_size, num_edges, n_rows, dev)
+            akey = (num_edges, n_groups, block_size, group_cbs, n_rows, mode)
+
+            def _cum(cfg, target_cum):
+                tm, tk = cfg
+                _dual_em_cum_kernel[(triton.cdiv(num_edges, tk), n_rows * (block_size // tm))](
+                    cum = target_cum, TILE_SIZE_K = tk, TILE_SIZE_M = tm, **common)
+
+            # BENCHMARK INTO A SCRATCH. This kernel is read-accumulate-write (`tl.atomic_add` into
+            # `cum`), so timing it on the live buffer would add its contribution once per trial and
+            # leave the normalizer several times too large -- a silent wrong answer, not a crash. No
+            # scratch (OOM) means no tuning, never a tainted `cum`.
+            cfg = autotune.cached(("dual_em_cum",) + akey)
+            if cfg is None:
+                # Only allocate the benchmark scratch when tuning will actually happen: `pick`
+                # declines when `autotune.ENABLED` is false, so allocating first would have cost a
+                # buffer the size of the output for nothing. MEASURED as 4 MB of an 8 MB transient at
+                # a 4 MB `ns` with `PYJUICE_AUTOTUNE=0`, i.e. half the M-step's peak.
+                sc = (autotune.scratch_like(cum)
+                      if autotune.should_tune(("dual_em_cum",) + akey, len(cands)) else None)
+                cfg = cands[0] if sc is None else autotune.pick(
+                    ("dual_em_cum",) + akey, cands, lambda c: _cum(c, sc))
+            _cum(cfg, cum)
+            staged.append((common, cands, akey, n_rows))
+
+        # ---- pass 2: the update, into `out`. Runs only once every partition's `cum` is complete,
+        #      because a node's children may be split across partitions. ----
+        for common, cands, akey, n_rows in staged:
+            num_edges = common["num_edges"]
+
+            def _upd(cfg, target_out):
+                tm, tk = cfg
+                _dual_em_update_kernel[(triton.cdiv(num_edges, tk),
+                                        n_rows * (block_size // tm))](
+                    cum = cum, out = target_out, out_base = out_base,
+                    out_size = out_size_, KEEP_ZERO = 1 if keep_zero_params else 0,
+                    OUT_BY_PAR = 1 if by_par else 0,
+                    TILE_SIZE_K = tk, TILE_SIZE_M = tm, **common)
+
+            # A pure overwrite, so re-running it is harmless -- but it is still benchmarked into a
+            # scratch, because it reads `cum` and writes the buffer this function RETURNS, and a trial
+            # left in `out` for a partition the real launch then skips would be returned as a result.
+            key = ("dual_em_upd",) + akey + (bool(keep_zero_params), by_par)
+            cfg = autotune.cached(key)
+            if cfg is None:
+                so = autotune.scratch_like(out) if autotune.should_tune(key, len(cands)) else None
+                cfg = cands[0] if so is None else autotune.pick(key, cands,
+                                                                lambda c: _upd(c, so))
+            _upd(cfg, out)
+
+        return out
 
     def compute_em_correction(self, ns, params, param_flows, denom_param_flows, step_size,
                               pseudocount, keep_zero_params, denom_sources = (), out = None):
