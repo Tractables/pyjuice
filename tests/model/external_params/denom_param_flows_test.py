@@ -2031,3 +2031,91 @@ def test_the_generic_m_step_reduces_to_normalize_fplus_when_fminus_is_theta_time
     expected = (fp3 / S[nb][:, None, :]).reshape(-1)        # normalize(F+) over each node's children
     rel = ((got - expected).abs() / expected.abs().clamp_min(1e-20)).max().item()
     assert rel < 1e-5, f"the correction is not a no-op for a single-gate F- (relmax = {rel})"
+
+
+class _DenseModeDescriptor(ExternalSumParams):
+    """Routes the SHARED dual-EM kernels through `DENOM_DENSE` over a given param-flow-shaped `F-`.
+
+    Everything else -- the plan, the tiles, the const table, both launches -- is inherited from
+    `ExternalSumParams`, so this is exactly what a parameterization that stores `F-` densely has to
+    write to get the fast M-step. It exists to cover that kernel branch, which `BlockScaleSumParams`
+    (row-group mode) never reaches."""
+
+    requests_denom_param_flows = True
+
+    def __init__(self, fminus, denom_base):
+        super(_DenseModeDescriptor, self).__init__()
+        self._fm = fminus
+        self._base = denom_base
+
+    def get_signature(self) -> str:
+        return "DenseMode"
+
+    def denom_kernel_spec(self, layer, denom_param_flows, pid):
+        from pyjuice.nodes.external_params.kernels.dual_em import DENOM_DENSE
+        return (DENOM_DENSE, self._fm, 0, 1, self._base)
+
+    def materialize_denom_flows(self, ns, params, denom_param_flows, denom_sources, out = None):
+        if out is not None:
+            out.copy_(self._fm)
+            return out
+        return self._fm
+
+
+@cuda_only
+@pytest.mark.parametrize("bs,nb,gcbs,step,pcount,kz",
+                         [(4, 3, 2, 0.5, 0.1, False), (16, 4, 4, 1.0, 0.0, False),
+                          (32, 2, 8, 0.3, 0.01, True)])
+def test_dense_and_rowgroup_denom_modes_agree(bs, nb, gcbs, step, pcount, kz):
+    """`DENOM_DENSE` and `DENOM_ROWGROUP` must produce the same M-step from the same `F-`.
+
+    Row-group mode computes `F- = theta * W[n, g(c)]` inside the kernel; dense mode reads `F-` from a
+    param-flow-shaped buffer. Feeding the SECOND the expansion of the first's `W` makes them the same
+    mathematical quantity, so any disagreement is a bug in one of the two branches rather than a
+    difference in the statistic."""
+    dev = torch.device("cuda:0")
+    torch.manual_seed(bs)
+    with juice.set_block_size(bs):
+        i0 = inputs(0, num_node_blocks = nb, dist = dists.Categorical(num_cats = NUM_CATS))
+        i1 = inputs(1, num_node_blocks = nb, dist = dists.Categorical(num_cats = NUM_CATS))
+        ns = summate(multiply(i0, i1), num_node_blocks = nb,
+                     external_params = BlockScaleSumParams(ch_block_size = gcbs,
+                                                           apply_z_correction = True))
+        root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
+    torch.manual_seed(bs)
+    root.init_parameters(perturbation = 2.0)
+    pc = juice.compile(root, verbose = False).to(dev)
+
+    B = 32
+    torch.manual_seed(bs + 1)
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    phi = torch.randn(ns.external_params.tensor_shapes(ns, B)[0], device = dev) * 1.5
+    ext = {ns: phi}
+    pc(x, sum_external_params = ext)
+    pc.backward(x, sum_external_params = ext, logspace_flows = True, flows_memory = 0.0,
+                allow_modify_flows = False)
+    from pyjuice.model.backend.parflow_fusing import compute_cum_par_flows
+    compute_cum_par_flows(pc.param_flows, pc.parflow_fusing_kwargs)
+
+    srcs = pc._denom_correction_nss()
+    tgt = next(iter(srcs))
+    bsdesc = tgt.external_params
+    args = (tgt, pc.params, pc.param_flows, pc.denom_param_flows, step, pcount, kz)
+
+    rowgroup = bsdesc._fused_em_correction(*args, srcs[tgt])
+    assert rowgroup is not None, "the row-group fast path declined; nothing to compare against"
+    rowgroup = rowgroup.clone()
+
+    # the same `F-`, expanded into param-flow layout, fed to the dense branch
+    fm = bsdesc.materialize_denom_flows(tgt, pc.params, pc.denom_param_flows, srcs[tgt]).clone()
+    dense_desc = _DenseModeDescriptor(fm, tgt._param_flow_range[0])
+    dense = dense_desc._fused_em_correction(*args, srcs[tgt])
+    assert dense is not None, "the dense branch declined the fast path"
+
+    rel = ((dense - rowgroup).abs() / rowgroup.abs().clamp_min(1e-20)).max().item()
+    assert rel < 1e-5, f"DENOM_DENSE disagrees with DENOM_ROWGROUP (relmax = {rel})"
+
+    # and both must agree with the generic torch M-step, which is the independent reference
+    ref = dense_desc.compute_em_correction(*args, denom_sources = srcs[tgt])
+    rel2 = ((rowgroup - ref).abs() / ref.abs().clamp_min(1e-20)).max().item()
+    assert rel2 < 1e-5, f"the fused modes disagree with the torch M-step (relmax = {rel2})"
