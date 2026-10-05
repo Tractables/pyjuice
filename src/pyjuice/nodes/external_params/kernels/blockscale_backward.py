@@ -629,6 +629,13 @@ def _bs_triton_denom_scatter_kernel(W, mparams, out, cids, pids, pfids,
 #
 # `kcount[row]` is the number of children of each node of that row (the count of real edge slots), i.e.
 # the torch path's `eblk_per_nb[nb] * ch_block_size`. It sets the pseudocount split.
+#
+# SCALARS COME FROM A DEVICE TABLE (`consts`), not from arguments. Triton types a Python float argument
+# as fp64, and so does a float LITERAL inside a kernel, either of which silently promotes the whole
+# `den` / `ratio` chain to DOUBLE precision -- measured at ~1.8x, and caught only because an earlier
+# single-kernel form made the accumulator loop-carried and Triton then refused the type change. Every
+# threshold is in the table for the same reason; `em_par_update_kernel` does this too. The offsets are
+# laid out in `_fused_em_correction`.
 
 
 @triton_jit
@@ -669,18 +676,8 @@ def _bs_triton_em_cum_kernel(mparams, param_flows, W, cum, cids, pids, pfids, ni
                 mask = real[None,:] & (gidx < n_gates)[None,:], other = 0.0)
 
     k = tl.load(kcount + nblock_id).to(tl.float32)
-    # fp32, NOT Python float arguments. Triton types a float argument as fp64, which silently promoted
-    # the whole `den` / `ratio` chain here to DOUBLE precision -- caught only because the single-kernel
-    # form made `acc` loop-carried and Triton then refused the type change. This is why
-    # `em_par_update_kernel` loads its step size and pseudocount from a float32 tensor rather than
-    # taking them as arguments.
-    pseudocount = tl.load(consts)
-    step_size = tl.load(consts + 1)
-    one_m_s = tl.load(consts + 2)
+    pseudocount = tl.load(consts + 0)
     tiny_den = tl.load(consts + 3)       # 1e-38, the division guard
-    tiny_par = tl.load(consts + 4)       # 1e-30, the momentum-underflow floor
-    zero_thr = tl.load(consts + 5)       # 1e-12, the `keep_zero_params` threshold
-    zero = tl.load(consts + 6)           # 0.0
     # the MAP form: denominator `F- + pseudocount * theta`, not `+ pseudocount`
     den = tl.maximum(theta * w + pseudocount * theta, tiny_den)
     ratio = (fp + pseudocount / k) / den
@@ -731,18 +728,11 @@ def _bs_triton_em_update_kernel(mparams, param_flows, W, cum, out, cids, pids, p
                 mask = real[None,:] & (gidx < n_gates)[None,:], other = 0.0)
 
     k = tl.load(kcount + nblock_id).to(tl.float32)
-    # fp32, NOT Python float arguments. Triton types a float argument as fp64, which silently promoted
-    # the whole `den` / `ratio` chain here to DOUBLE precision -- caught only because the single-kernel
-    # form made `acc` loop-carried and Triton then refused the type change. This is why
-    # `em_par_update_kernel` loads its step size and pseudocount from a float32 tensor rather than
-    # taking them as arguments.
-    pseudocount = tl.load(consts)
+    pseudocount = tl.load(consts + 0)
     step_size = tl.load(consts + 1)
-    one_m_s = tl.load(consts + 2)
+    one_m_s = tl.load(consts + 2)        # 1 - step_size
     tiny_den = tl.load(consts + 3)       # 1e-38, the division guard
     tiny_par = tl.load(consts + 4)       # 1e-30, the momentum-underflow floor
-    zero_thr = tl.load(consts + 5)       # 1e-12, the `keep_zero_params` threshold
-    zero = tl.load(consts + 6)           # 0.0
     den = tl.maximum(theta * w + pseudocount * theta, tiny_den)
     ratio = (fp + pseudocount / k) / den
 
@@ -751,9 +741,10 @@ def _bs_triton_em_update_kernel(mparams, param_flows, W, cum, out, cids, pids, p
     c = tl.maximum(one_m_s + step_size * c, tiny_den)
 
     new = theta * (one_m_s + step_size * ratio) / c[:,None]
-    new = tl.maximum(new, tiny_par)                                               # momentum-underflow guard
+    new = tl.maximum(new, tiny_par)                            # momentum-underflow guard
     if KEEP_ZERO:
-        new = tl.where(theta < zero_thr, zero, new)
+        zero_thr = tl.load(consts + 5)                         # 1e-12, the `keep_zero_params` threshold
+        new = tl.where(theta < zero_thr, tl.load(consts + 6), new)
 
     # `OUT_BY_PAR` writes `params[par - out_base]`, i.e. back into the very parameter `theta` was read
     # from, which is what lets the caller hand us `params[ps:pe]` and skip the separate write-back.
