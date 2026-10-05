@@ -89,7 +89,8 @@ class ExternalSumParams():
 
         Called once, at compile time, for every layer whose parameterization
         :attr:`requests_denom_param_flows`. The PC concatenates the sizes over layers, allocates one
-        flat buffer, and hands each layer the offsets of its slices (`layer.denom_flow_offsets`); the
+        flat buffer, and hands each layer where its slices sit (`layer.denom_flow_slices`, one
+        `(offset, size)` per forward partition); the
         parameterization decides what lives inside. Sizes must be derivable from the compiled tables
         alone -- `layer.partitioned_nids[pid].size(0)`, `layer.partitioned_cids[pid].size(1)`,
         `layer.block_size` -- because the buffer is allocated before the first forward pass.
@@ -317,9 +318,8 @@ class ExternalSumParams():
         :param denom_param_flows: the PC's denominator flow buffer, or `None` when no layer requested
                              it (see :attr:`requests_denom_param_flows`). A parameterization that
                              requested it accumulates its expected/normalizer statistic into its own
-                             slices -- `denom_param_flows[off : off + size]` for each
-                             `(off, size)` in `zip(layer.denom_flow_offsets,
-                             self.denom_flow_sizes(layer))` -- here, alongside the standard backward's
+                             slices -- `denom_param_flows[off : off + size]` for each `(off, size)`
+                             in `layer.denom_flow_slices` -- here, alongside the standard backward's
                              `F+` into `param_flows[pfid]`. The layout is the parameterization's own;
                              :func:`compute_em_correction` turns it back into `F-`.
         :type denom_param_flows: Optional[torch.Tensor]
@@ -347,7 +347,7 @@ class ExternalSumParams():
         )
 
     def compute_em_correction(self, ns, params, param_flows, denom_param_flows, step_size,
-                              pseudocount, keep_zero_params, denom_sources = ()):
+                              pseudocount, keep_zero_params, denom_sources = (), out = None):
         """
         The conditional dual-flow EM update for `ns`, returning the new parameters for
         `ns._param_range` as a flat tensor -- or `None` (the default) to leave the standard
@@ -355,9 +355,12 @@ class ExternalSumParams():
 
         Called once per EM step, ONLY when this parameterization :attr:`requests_denom_param_flows`,
         after `param_flows` (F+, tied-fused) and `denom_param_flows` have been accumulated over the
-        mini-batch. `params` still holds the PRE-update parameters. The PC runs the standard M-step for
-        every node and then overwrites this `ns`'s range with what is returned here, so the returned
-        tensor replaces -- not adds to -- the standard update.
+        mini-batch. `params` still holds the PRE-update parameters: the PC SKIPS the standard M-step on
+        `ns._param_range` and takes what is returned here instead, so the returned tensor replaces --
+        not adds to -- the standard update.
+
+        The generic form is `theta <- normalize(theta * F+ / F-)`; with a single gate
+        `F- = theta * sum(F+)`, so it collapses to `normalize(F+)` and the correction is an exact no-op.
 
         :param denom_sources: every `(layer, member_ns)` whose denominator slices carry flow for THESE
                              parameters -- `ns` itself plus every copy of it under parameter tying,
@@ -366,9 +369,10 @@ class ExternalSumParams():
                              numerator is fused in the `pfid` space it shares, while the denominator,
                              whose layout is the parameterization's own, is combined during this
                              reconstruction.
-
-        The generic conditional M-step is `theta <- normalize(theta * F+ / F-)`; with one gate
-        `F- = theta * sum(F+)`, so it collapses to `normalize(F+)` and the correction is an exact no-op.
+        :param out: a `pe - ps` tensor to write the result into, in place of allocating one. The PC
+                             passes `params[ps:pe]`, i.e. the very range being updated, which is safe
+                             because every element of it is written exactly once and this is the only
+                             writer. An implementation may ignore it and return a fresh tensor.
         """
         return None
 
