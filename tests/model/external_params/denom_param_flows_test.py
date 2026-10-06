@@ -353,7 +353,14 @@ def test_denom_accumulation_matches_finite_differences():
         with torch.no_grad():                                         # perturb theta, no autograd graph
             return pc(x, sum_external_params = {ns: phi}).double().sum().item()
 
-    eps, worst, n = 1e-2, 0.0, 0
+    # The finite difference is of a float32 LL summed over the batch (~-100 here), so it carries a noise
+    # floor of roughly ulp / (2 eps) -- MEASURED ~5e-5 at eps = 1e-2: two numerically equivalent forwards
+    # gave -0.00058 and -0.00063 for an entry whose analytic value is -0.00058 (both forwards agreed
+    # with the analytic gradient on every entry at eps = 3e-2). Hence the larger eps, where every entry
+    # agreed to ~1e-5 and the O(eps^2) truncation is still far below that, and a floor of 1e-2 on the
+    # denominator, so a near-zero gradient is judged by its absolute error rather than by noise / ~0.
+    # A wrong `F-` is an error of the order of the gradient itself on the large entries (0.02-0.17).
+    eps, worst, n = 3e-2, 0.0, 0
     for r in range(min(rows, 2)):
         for e in range(min(E, 4)):
             if int(cids[r, e]) == 0:
@@ -365,7 +372,7 @@ def test_denom_accumulation_matches_finite_differences():
                     o = float(pc.params[pid]); pc.params[pid] = o * math.exp(eps); lp = ll()
                     pc.params[pid] = o * math.exp(-eps); lm = ll(); pc.params[pid] = o
                 g_fd = (lp - lm) / (2 * eps)
-                worst = max(worst, abs(g_fd - g_an) / max(abs(g_fd), abs(g_an), 1e-6))
+                worst = max(worst, abs(g_fd - g_an) / max(abs(g_fd), abs(g_an), 1e-2))
                 n += 1
     assert n > 0
     assert worst < 5e-2, worst

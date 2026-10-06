@@ -151,9 +151,7 @@ def _bk_triton_block_sparse_ele_kernel(node_flows, element_flows, node_mars, ele
                 if TL_DOT == 1:
                     partial_flows = tl.dot(_round_to_tf32(epars), _round_to_tf32(n_fdm_sub))
                 else:
-                    # Reduced over axis 0 ON PURPOSE: Triton rewrites `tl.sum(a[:,:,None] * b[None,:,:],
-                    # axis = 1)` into a TF32 dot -- with the truncation bias `_round_to_tf32` exists for, and
-                    # in a branch that is meant to be fp32. This form is not matched, so it stays in fp32.
+                    # axis-0 form on purpose -- see `_BROADCAST_SUM_NOTE` in pyjuice/layer/kernels/__init__.py
                     partial_flows = tl.sum(tl.trans(epars)[:,:,None] * n_fdm_sub[:,None,:], axis = 0)
 
             if logspace_flows:
@@ -318,9 +316,11 @@ def _bk_triton_block_sparse_ele_csmm2_kernel(node_flows, element_flows, node_mar
             n_fdm_sub = tl.where(log_n_fdm_max[:,None] != -float("inf"), tl.exp(log_n_fdm - log_n_fdm_max[:,None]), 0.0)
 
             if allow_neg_flows:
-                partial_flows = tl.sum(epars[:,:,None] * tl.trans(n_fdm_sub * nflows)[None,:,:], axis = 1)
+                # axis-0 form on purpose -- see `_BROADCAST_SUM_NOTE` in pyjuice/layer/kernels/__init__.py
+                partial_flows = tl.sum(tl.trans(epars)[:,:,None] * tl.trans(n_fdm_sub * nflows)[:,None,:], axis = 0)
             else:
-                partial_flows = tl.sum(epars[:,:,None] * tl.trans(n_fdm_sub)[None,:,:], axis = 1)
+                # axis-0 form on purpose -- see `_BROADCAST_SUM_NOTE` in pyjuice/layer/kernels/__init__.py
+                partial_flows = tl.sum(tl.trans(epars)[:,:,None] * tl.trans(n_fdm_sub)[:,None,:], axis = 0)
 
             if logspace_flows:
                 partial_flows_max = emars + log_n_fdm_max[None,:]
@@ -530,7 +530,8 @@ def _bk_triton_block_sparse_tempered_ele_csmm2_kernel(node_flows, element_flows,
         log_n_fdm_max = tl.max(log_n_fdm, axis = 1)
         n_fdm_sub = tl.where(log_n_fdm_max[:,None] != -float("inf"), tl.exp(log_n_fdm - log_n_fdm_max[:,None]), 0.0)
 
-        partial_flows = tl.sum(epars[:,:,None] * tl.trans(n_fdm_sub)[None,:,:], axis = 1)
+        # axis-0 form on purpose -- see `_BROADCAST_SUM_NOTE` in pyjuice/layer/kernels/__init__.py
+        partial_flows = tl.sum(tl.trans(epars)[:,:,None] * tl.trans(n_fdm_sub)[:,None,:], axis = 0)
 
         partial_flows_max = emars / eflow_temperature + log_n_fdm_max[None,:]
         acc = tl.where(partial_flows_max == -float("inf"),

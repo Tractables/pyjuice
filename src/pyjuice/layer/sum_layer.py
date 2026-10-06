@@ -145,9 +145,9 @@ _BLOCK_SPARSE_EDGE_TRIM = os.environ.get("PYJUICE_EDGE_TRIM", "1") != "0"
 # `force_use_fp32` drops `tl.dot` altogether for a broadcast sum. That is NOT a reliable accuracy
 # route: it also changes the forward and element-flow forks, and its measured error moved between
 # 6.2e-6 and 7.0e-4 across runs of the same shape, because the timing-based autotuner picks
-# differently from run to run. (Likely the same TF32 story: Triton rewrites the broadcast sum
-# `tl.sum(a[:,:,None] * b[None,:,:], axis = 1)` into a TF32 dot once the tile is big enough, and only
-# some tuned tiles are. The kernels now reduce over axis 0, which the rewrite does not match.)
+# differently from run to run. (Likely Triton rewriting the fp32 broadcast sums into TF32 dots once a
+# tuned tile was big enough; the kernels no longer use that form -- see `_BROADCAST_SUM_NOTE` in
+# `layer/kernels/__init__.py`.)
 #
 # Every par kernel takes `DOT_IEEE` so the one launch site below can stay uniform, but it is inert in
 # the `csmm2` forks: those reduce with `tl.sum`, not `tl.dot`, and have no precision to set.

@@ -124,7 +124,8 @@ def _bs_triton_ele_kernel(node_flows, element_flows, node_mars, element_mars, mp
             if TL_DOT == 1:
                 partial_flows = tl.dot(epars, nsub_g)
             else:
-                partial_flows = tl.sum(epars[:,:,None] * nsub_g[None,:,:], axis = 1)
+                # axis-0 form on purpose -- see `_BROADCAST_SUM_NOTE` in pyjuice/layer/kernels/__init__.py
+                partial_flows = tl.sum(tl.trans(epars)[:,:,None] * nsub_g[:,None,:], axis = 0)
 
             # The gate of THIS group's parent block, one value per (child gate, sample). `-1` means
             # the parent block and this child block are not connected; the `-inf` it produces drops
@@ -312,7 +313,8 @@ def _bs_triton_par_kernel(node_flows, node_mars, element_mars, mparams, param_fl
         if TL_DOT == 1:
             acc += tl.dot(n_fdm_sub, scaled_emars)
         else:
-            acc += tl.sum(n_fdm_sub[:,:,None] * scaled_emars[None,:,:], axis = 1)
+            # axis-0 form on purpose -- see `_BROADCAST_SUM_NOTE` in pyjuice/layer/kernels/__init__.py
+            acc += tl.sum(tl.trans(n_fdm_sub)[:,:,None] * scaled_emars[:,None,:], axis = 0)
 
         emars_ptr += TILE_SIZE_B
         nmars_ptr += TILE_SIZE_B
@@ -536,7 +538,8 @@ def _bs_triton_denom_w_kernel(node_flows, log_z, W, ext, gate, nids,
             else:
                 acc += tl.dot(u, p)
         else:
-            acc += tl.sum(u[:,:,None] * p[None,:,:], axis = 1)
+            # axis-0 form on purpose -- see `_BROADCAST_SUM_NOTE` in pyjuice/layer/kernels/__init__.py
+            acc += tl.sum(tl.trans(u)[:,:,None] * p[:,None,:], axis = 0)
 
         offs_batch += TILE_SIZE_B
         nf_ptr += TILE_SIZE_B

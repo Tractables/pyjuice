@@ -2035,7 +2035,8 @@ class SoftEvidenceCategorical(Distribution):
                 if use_tensor_core:
                     params = tl.dot(expars_sub, inpars).log() + expars_max
                 else:
-                    params = tl.sum(expars_sub[:,:,None] * inpars[None,:,:], axis = 1).log() + expars_max
+                    # axis-0 form on purpose -- see `_BROADCAST_SUM_NOTE` in pyjuice/layer/kernels/__init__.py
+                    params = tl.sum(tl.trans(expars_sub)[:,:,None] * inpars[:,None,:], axis = 0).log() + expars_max
 
                 # Compute logaddexp(logZ, params)
                 maxval = tl.maximum(logZ, params)
@@ -2242,7 +2243,8 @@ class SoftEvidenceCategorical(Distribution):
                     if use_tensor_core:
                         params = tl.dot(expars_sub, inpars).log() + expars_max
                     else:
-                        params = tl.sum(expars_sub[:,:,None] * inpars[None,:,:], axis = 1).log() + expars_max
+                        # axis-0 form on purpose -- see `_BROADCAST_SUM_NOTE` in pyjuice/layer/kernels/__init__.py
+                        params = tl.sum(tl.trans(expars_sub)[:,:,None] * inpars[:,None,:], axis = 0).log() + expars_max
 
                     # Compute logaddexp(logZ, params)
                     maxval = tl.maximum(logZ, params)

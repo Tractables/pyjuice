@@ -365,9 +365,11 @@ def _bk_triton_block_sparse_par_csmm2_kernel(node_flows, node_mars, element_mars
             scaled_emars = tl.exp(emars + log_n_fdm_max[:,None])
 
             if allow_neg_flows:
-                partial_flows = tl.sum(tl.trans(n_fdm_sub * nflows)[:,:,None] * scaled_emars[None,:,:], axis = 1)
+                # axis-0 form on purpose -- see `_BROADCAST_SUM_NOTE` in pyjuice/layer/kernels/__init__.py
+                partial_flows = tl.sum((n_fdm_sub * nflows)[:,:,None] * scaled_emars[:,None,:], axis = 0)
             else:
-                partial_flows = tl.sum(tl.trans(n_fdm_sub)[:,:,None] * scaled_emars[None,:,:], axis = 1)
+                # axis-0 form on purpose -- see `_BROADCAST_SUM_NOTE` in pyjuice/layer/kernels/__init__.py
+                partial_flows = tl.sum(n_fdm_sub[:,:,None] * scaled_emars[:,None,:], axis = 0)
 
             acc += partial_flows
 
@@ -528,7 +530,8 @@ def _bk_triton_block_sparse_tempered_par_csmm2_kernel(node_flows, node_mars_temp
 
         scaled_emars = tl.exp(emars / pflow_temperature + log_n_fdm_max[:,None])
 
-        partial_flows = tl.sum(tl.trans(n_fdm_sub)[:,:,None] * scaled_emars[None,:,:], axis = 1)
+        # axis-0 form on purpose -- see `_BROADCAST_SUM_NOTE` in pyjuice/layer/kernels/__init__.py
+        partial_flows = tl.sum(n_fdm_sub[:,:,None] * scaled_emars[:,None,:], axis = 0)
 
         acc += partial_flows
 

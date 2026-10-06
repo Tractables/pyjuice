@@ -1009,7 +1009,8 @@ class ExternProductCategorical(Distribution):
             if use_tensor_core:
                 lpar = tl.dot(expar_sub, inpar).log() + expar_max
             else:
-                lpar = tl.sum(expar_sub[:,:,None] * inpar[None,:,:], axis = 1).log() + expar_max
+                # axis-0 form on purpose -- see `_BROADCAST_SUM_NOTE` in pyjuice/layer/kernels/__init__.py
+                lpar = tl.sum(tl.trans(expar_sub)[:,:,None] * inpar[:,None,:], axis = 0).log() + expar_max
 
             # Compute log-add-exp(logZ, lpar)
             maxval = tl.maximum(logZ, lpar)
@@ -1383,7 +1384,8 @@ class ExternProductCategorical(Distribution):
                 if use_tensor_core:
                     acc = tl.dot(fsublogZ_sub, inpar).log() + fsublogZ_max
                 else:
-                    acc = tl.sum(fsublogZ_sub[:,:,None] * inpar[None,:,:], axis = 1).log() + fsublogZ_max
+                    # axis-0 form on purpose -- see `_BROADCAST_SUM_NOTE` in pyjuice/layer/kernels/__init__.py
+                    acc = tl.sum(tl.trans(fsublogZ_sub)[:,:,None] * inpar[:,None,:], axis = 0).log() + fsublogZ_max
 
                 if compute_unnorm_logp:
                     parflows = -1.0 * tl.exp(acc + expar) # [BLOCK_SIZE_B, TILE_SIZE_K]
@@ -1494,7 +1496,8 @@ class ExternProductCategorical(Distribution):
             if use_tensor_core:
                 acc = tl.dot(fsublogZ_sub, inpar).log() + fsublogZ_max
             else:
-                acc = tl.sum(fsublogZ_sub[:,:,None] * inpar[None,:,:], axis = 1).log() + fsublogZ_max
+                # axis-0 form on purpose -- see `_BROADCAST_SUM_NOTE` in pyjuice/layer/kernels/__init__.py
+                acc = tl.sum(tl.trans(fsublogZ_sub)[:,:,None] * inpar[:,None,:], axis = 0).log() + fsublogZ_max
 
             parflows = tl.exp(acc + expar) # [BLOCK_SIZE_B, TILE_SIZE_K]
 
@@ -1528,7 +1531,8 @@ class ExternProductCategorical(Distribution):
                 if use_tensor_core:
                     acc = tl.dot(fsublogZ_sub, inpar).log() + fsublogZ_max
                 else:
-                    acc = tl.sum(fsublogZ_sub[:,:,None] * inpar[None,:,:], axis = 1).log() + fsublogZ_max
+                    # axis-0 form on purpose -- see `_BROADCAST_SUM_NOTE` in pyjuice/layer/kernels/__init__.py
+                    acc = tl.sum(tl.trans(fsublogZ_sub)[:,:,None] * inpar[:,None,:], axis = 0).log() + fsublogZ_max
 
                 parflows = -tl.exp(acc + expar) # [BLOCK_SIZE_B, TILE_SIZE_K]
 

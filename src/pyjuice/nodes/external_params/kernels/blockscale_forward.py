@@ -149,7 +149,8 @@ def _bs_triton_fw_kernel(node_mars, element_mars, mparams, ext, gate, log_z,
             # load: HEAD/TF32 4 failures, constexpr switch 21, this 1.
             ln = ln * rescale[None,:] + tl.dot(epars, vexp, input_precision = "ieee")
         else:
-            ln = ln * rescale[None,:] + tl.sum(epars[:,:,None] * vexp[None,:,:], axis = 1)
+            # axis-0 form on purpose -- see `_BROADCAST_SUM_NOTE` in pyjuice/layer/kernels/__init__.py
+            ln = ln * rescale[None,:] + tl.sum(tl.trans(epars)[:,:,None] * vexp[:,None,:], axis = 0)
         mn = nmn
 
         # ---- Z: the same contraction with `element_mars` dropped
@@ -160,7 +161,8 @@ def _bs_triton_fw_kernel(node_mars, element_mars, mparams, ext, gate, log_z,
         if TL_DOT == 1:
             lz = lz * rescale_z[None,:] + tl.dot(epars, zexp, input_precision = "ieee")
         else:
-            lz = lz * rescale_z[None,:] + tl.sum(epars[:,:,None] * zexp[None,:,:], axis = 1)
+            # axis-0 form on purpose -- see `_BROADCAST_SUM_NOTE` in pyjuice/layer/kernels/__init__.py
+            lz = lz * rescale_z[None,:] + tl.sum(tl.trans(epars)[:,:,None] * zexp[:,None,:], axis = 0)
         mz = nmz
 
     log_n = tl.where((mn[None,:] == -float("inf")) | (ln <= 0.0), -float("inf"),

@@ -6,6 +6,37 @@ import triton.language as tl
 from pyjuice.utils.kernel_launcher import triton_jit
 
 
+_BROADCAST_SUM_NOTE = """
+Never write a small matmul as `tl.sum(X[:,:,None] * Y[None,:,:], axis = 1)` with fp32 operands.
+
+Triton (3.7) pattern-matches exactly that spelling -- operand order and reduction axis -- and rewrites
+it into a tensor-core `tl.dot`. For fp32 operands that is wrong twice over, MEASURED with X: [M, K],
+Y: [K, N], M and N >= 16:
+  * K in {1, 2, 4}: the result is multiplied by 8 / K (8x, 4x, 2x). The MMA's reduction is 8 wide and
+    the short dimension is padded by REPEATING it. In pyjuice this gave a log-likelihood off by ln 2
+    per sum layer with fewer than 8 children per block and by ln 2 per variable for a soft-evidence
+    leaf with fewer than 8 categories (both at batch >= 16), and it would have doubled the block-sparse
+    parameter flows at batch 4.
+  * K >= 8: a TF32 dot, which truncates the operands -- a ~6e-4 LOW bias per product that compounds
+    through the layers (see `_round_to_tf32`).
+These are exactly the small-tile fallback branches of kernels whose large-tile branch is a `tl.dot`,
+i.e. code written to be exact fp32.
+
+The equivalent `tl.sum(tl.trans(X)[:,:,None] * Y[:,None,:], axis = 0)` is not matched and stays in fp32
+FMAs; it measured exact at every shape and costs nothing measurable. (Reducing over axis 2, swapping the
+operands, or a three-operand product are not matched either -- but use the axis-0 form, so there is one
+spelling to recognise.) bf16 operands are fine: the rewrite is then a bf16 dot, exact for bf16 inputs;
+the one such site is marked `# broadcast-sum ok: bf16`.
+
+`tests/misc/broadcast_sum_rewrite_test.py` forbids the spelling in the source tree and re-checks, against
+the installed Triton, that the axis-0 form is still exact -- so an upgrade that starts matching it too
+fails loudly instead of silently.
+"""
+
+# The forbidden spelling, on one line, as the guard test searches for it.
+_BROADCAST_SUM_FORBIDDEN = r"tl\.sum\(.*\[\s*:\s*,\s*:\s*,\s*None\s*\]\s*\*.*\[\s*None\s*,\s*:\s*,\s*:\s*\].*axis\s*=\s*1\s*\)"
+
+
 @triton.jit
 def _round_to_tf32(x):
     # Round-to-nearest onto the TF32 grid (10 mantissa bits), for the operands of an fp32 `tl.dot`.
