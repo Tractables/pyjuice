@@ -466,7 +466,13 @@ void softevi_forward_dense(torch::Tensor params, torch::Tensor node_mars, torch:
     if (zero_z) Z.zero_();
     const dim3 grid((unsigned)cat_blocks, (unsigned)((num_latents + TLv - 1) / TLv), (unsigned)num_blocks);
     const bool swz = (swizzle != 0);
+    // A `Zs` tile past 48 KB needs the kernel's opt-in raised first; the caller only asks for tiles within
+    // the device's opt-in limit (`_fw_smem_cap`). Without it, batch * positions above ~3072 slots could
+    // not launch at all.
 #define GO_S(T, S) { const size_t sm = (size_t)num_slots * T * sizeof(float);                        \
+    if (sm > 48 * 1024)                                                                             \
+        C10_CUDA_CHECK(cudaFuncSetAttribute(softevi_fw_dense_z<T, S>,                               \
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm)); \
     softevi_fw_dense_z<T, S><<<grid, threads, sm, st>>>(params.data_ptr<float>(), uniq.data_ptr<int>(),\
         ref_slot.data_ptr<int>(), ref_pt.data_ptr<float>(), ref_cnt.data_ptr<int>(),                \
         num_uniq.data_ptr<int>(), p_base.data_ptr<long>(), Z.data_ptr<float>(),                     \

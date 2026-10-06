@@ -196,9 +196,10 @@ def _fw_cuda_applicable(layer, kwargs):
 
 
 def _fw_use_dense(layer, kwargs):
-    """Whether the forward can use the index-driven form. It needs the same inverted index and the same
-    tying / L2 criterion as the backward; otherwise the gather form still applies."""
-    return _dense_worth_it(layer, kwargs) and _build_dense_index(layer, kwargs) is not None
+    """Whether the forward can use the index-driven form. It needs its shared tile to fit, and the same
+    inverted index and tying / L2 criterion as the backward; otherwise the gather form still applies."""
+    return _fw_dense_fits(layer, kwargs) and _dense_worth_it(layer, kwargs) and \
+        _build_dense_index(layer, kwargs) is not None
 
 
 def _evidence_cache_key(*tensors):
@@ -367,10 +368,31 @@ def _fw_dense_target(layer, kwargs, index):
 
 
 # Latents per thread for the normalizer. Larger amortizes the per-reference index loads over more
-# latents but grows the shared `Zs` tile; 16 needs an opt-in above 48 KB, so it is only offered while the
-# tile fits without one.
+# latents but grows the shared `Zs` tile, `num_slots * TL` floats; every one that fits the device's
+# opt-in shared memory (`_fw_smem_cap`) is a candidate, and `_fw_autotune` times them.
 _FW_TL_CANDIDATES = (4, 8, 16)
-_FW_SMEM_CAP = 48 * 1024
+
+
+def _fw_smem_cap(layer):
+    """Shared memory one block of the dense forward may use: the device's opt-in limit (99 KB on the
+    RTX PRO 6000, 227 KB on an H100). It used to be a fixed 48 KB -- the limit without opting in -- and
+    at batch * positions above 3072 slots no tile fit, so the forward crashed."""
+    cap = getattr(_fw_smem_cap, "_cached", None)
+    if cap is None:
+        try:
+            cap = torch.cuda.get_device_properties(layer.params.device).shared_memory_per_block_optin
+        except Exception:
+            cap = 48 * 1024
+        _fw_smem_cap._cached = cap
+    return cap
+
+
+def _fw_dense_fits(layer, kwargs):
+    """Whether the dense forward's smallest `Zs` tile fits. Past that it declines and the forward takes
+    the Triton kernel -- while the BACKWARD's dense kernels, which keep no such tile, still apply."""
+    evidence = kwargs["categorical_evidence_logp"]
+    num_slots = evidence.size(0) * evidence.size(1)
+    return num_slots * min(_FW_TL_CANDIDATES) * 4 <= _fw_smem_cap(layer)
 
 
 def _fw_launch_dense(kw, tl, swizzle):
@@ -424,7 +446,8 @@ def _fw_autotune(kw):
         return hit
 
     cands = [(tl, swz) for tl in _FW_TL_CANDIDATES for swz in (0, 1)
-             if kw["num_slots"] * tl * 4 <= _FW_SMEM_CAP]
+             if kw["num_slots"] * tl * 4 <= _fw_smem_cap(layer)]
+    assert cands, "the dense forward was taken with no `Zs` tile that fits (see `_fw_dense_fits`)"
     best, best_t = None, None
     for tl, swz in cands:
         for _ in range(2):                                   # warm up this instantiation

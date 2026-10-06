@@ -163,7 +163,8 @@ def test_no_nan_with_a_partially_padded_batch_tile(batch_size):
     assert torch.isfinite(pf).all(), "non-finite param_flows with a padded batch tile"
 
 
-def _dense_setup(monkeypatch, use_dense, dual_flow = True, with_grad = False, force = True, homogeneous = True):
+def _dense_setup(monkeypatch, use_dense, dual_flow = True, with_grad = False, force = True, homogeneous = True,
+                 batch_size = 4):
     """The dense top-k path only engages when the parameter table overflows L2 and the emissions are tied
     across variables, so shrink the L2 figure it gates on instead of building a multi-GB model.
 
@@ -172,7 +173,7 @@ def _dense_setup(monkeypatch, use_dense, dual_flow = True, with_grad = False, fo
     that means to exercise the dense kernels must not depend on how that call goes for a toy shape.
     `force = False` leaves the real decision in place (for testing the decision itself)."""
     device = torch.device("cuda:0")
-    S, L, C, B, K = 4, 8, 64, 4, 32
+    S, L, C, B, K = 4, 8, 64, batch_size, 32
 
     monkeypatch.setattr(_softevi._l2_bytes, "_cached", 512, raising = False)
     if not use_dense:
@@ -421,6 +422,45 @@ def test_conditional_sampling_after_a_tuned_forward_only_call():
     assert torch.allclose(nm_t, nm_u, rtol = 1e-5, atol = 1e-5), \
         f"node marginals changed by tuning (max abs diff {float((nm_t - nm_u).abs().max()):.3e})"
     assert torch.equal(fr_t, fr_u), "the conditional draw changed with tuning"
+
+
+@pytest.mark.parametrize("fits", [True, False])
+def test_dense_forward_shared_memory_limit(fits):
+    """The dense forward keeps a `[batch * positions, TL]` tile in shared memory. At 800 x 4 = 3200 slots
+    even the smallest one (TL = 4) is 51 KB: past the 48 KB a kernel gets without opting in, which is
+    where every forward of that size used to crash (`_fw_autotune` found no tile and returned None).
+    `fits`: it runs with the opt-in raised. Otherwise -- the cap shrunk below the tile -- the forward
+    must decline to the Triton kernel while the backward keeps its dense kernels, which hold no such
+    tile. Either way the step must match the scattered one."""
+    from pyjuice.nodes.distributions import c_kernels
+    if not c_kernels.dense_expected_flow_available():
+        pytest.skip("the softevi CUDA extension is not available")
+    if fits and torch.cuda.get_device_properties(0).shared_memory_per_block_optin < 3200 * 4 * 4:
+        pytest.skip("this GPU's opt-in shared memory is below 51 KB")
+
+    out = {}
+    for choice in ("scattered", "single"):
+        with pytest.MonkeyPatch.context() as mp:
+            if not fits:
+                mp.setattr(_softevi._fw_smem_cap, "_cached", 1024, raising = False)
+            pc, layer, data, kw, (S, L, C, B) = _dense_setup(mp, True, with_grad = True, force = False, batch_size = 800)
+            layer._dense_choice_override = choice
+            dense_fw = []
+            real_launch = _softevi._fw_launch_dense
+            mp.setattr(_softevi, "_fw_launch_dense", lambda *a: dense_fw.append(1) or real_launch(*a))
+            pc.init_param_flows(flows_memory = 0.0)
+            lls = pc(data, **kw).clone()
+            grad = torch.zeros_like(kw["categorical_evidence_logp"])
+            pc.backward(data, allow_modify_flows = False, logspace_flows = True, categorical_evidence_logp_grad = grad, **kw)
+            out[choice] = (lls, layer.param_flows.clone(), grad)
+            if choice == "single":
+                assert bool(dense_fw) == fits, f"dense forward ran: {bool(dense_fw)}"
+                assert _softevi._dense_topk_applicable(layer, dict(kw, dual_flow_backward = True,
+                                                                   categorical_evidence_logp_grad = grad))
+
+    for name, a, b in zip(("LL", "param flows", "evidence gradient"), out["single"], out["scattered"]):
+        assert torch.allclose(a, b, rtol = 1e-4, atol = 1e-6), \
+            f"{name}: dense vs scattered (max abs diff {float((a - b).abs().max()):.3e})"
 
 
 @pytest.mark.parametrize("homogeneous", [True, False])
