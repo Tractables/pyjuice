@@ -229,6 +229,37 @@ def _grad_step(pc, data, mask, **kw):
     return pc.input_layer_group[0].param_flows.clone(), grad
 
 
+@pytest.mark.parametrize("dual_flow", [True, False])
+def test_dense_triton_fallback_reads_only_valid_references(dual_flow, monkeypatch):
+    """The dense index's reference tables are NOT zero-filled: a category's list is padded to the
+    longest one in its shard, and every reader must stop at the category's own count. The CUDA kernels
+    loop `j < cnt`; the Triton fallback (taken without a CUDA toolchain) masks `j < cnt`. Nothing else
+    in the suite runs that fallback, so force it here, and poison `torch.empty` -- NaN for floats -- so
+    that a read past a list's end shows up as NaN rather than passing on freshly zeroed memory."""
+    real_empty = torch.empty
+
+    def poisoned_empty(*args, **kwargs):
+        t = real_empty(*args, **kwargs)
+        return t.fill_(float("nan")) if t.is_floating_point() else t.fill_(0)
+
+    flows = {}
+    for use_dense in (True, False):
+        with pytest.MonkeyPatch.context() as mp:
+            pc, layer, data, kw, (S, L, C, B) = _dense_setup(mp, use_dense, dual_flow = dual_flow, with_grad = True)
+            if use_dense:
+                mp.setattr(_softevi._DenseDenomDispatch, "_cuda_ok", lambda self: False)
+                mp.setattr(torch, "empty", poisoned_empty)
+            flows[use_dense] = _grad_step(pc, data, None, **kw)
+
+    (pf_d, g_d), (pf_s, g_s) = flows[True], flows[False]
+    assert torch.isfinite(pf_d).all() and torch.isfinite(g_d).all(), \
+        "the Triton dense fallback read past a reference list (NaN from the uninitialized padding)"
+    assert torch.allclose(pf_d, pf_s, rtol = 1e-4, atol = 1e-6), \
+        f"param flows: Triton dense vs scattered (max abs diff {float((pf_d - pf_s).abs().max()):.3e})"
+    assert torch.allclose(g_d, g_s, rtol = 1e-4, atol = 1e-6), \
+        f"evidence gradient: Triton dense vs scattered (max abs diff {float((g_d - g_s).abs().max()):.3e})"
+
+
 @pytest.mark.parametrize("masked", [False, True])
 def test_nondual_dense_path_matches_scattered_and_dual(masked):
     """Without dual flows the dense top-k kernels run for the evidence gradient alone (`update_pflows`

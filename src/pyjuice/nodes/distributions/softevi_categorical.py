@@ -1104,6 +1104,7 @@ def _dense_worth_it(layer, kwargs):
                                            dense form would still pay to build its index
 
     All of this is host-side arithmetic: no device sync, and no index build for cases we then reject.
+
     """
     tot_num_cats = layer.nodes[0].dist.num_cats
     lnn = layer._output_ind_range[1] - layer._output_ind_range[0]
@@ -1300,8 +1301,28 @@ def _build_dense_index(layer, kwargs):
     if n_bytes > _dense_index_budget(dev):
         return None                                                          # -> scattered fallback
 
-    # ---- pass 2: pad each block's reference lists to [width, U] within each shard ----
-    per_shard = [dict(uniq = [], slot = [], pt = [], goff = [], cnt = [], n = []) for _ in shard_widths]
+    # ---- pass 2: scatter each block's reference lists into its shard's [G, width, Us_max] tables ----
+    # Filled IN PLACE and NOT zeroed. Every reader stops at a category's own count (`ref_cnt`): the CUDA
+    # kernels loop `j < cnt`, the Triton fallback masks `j < cnt`. So the padding past a list's end is
+    # never read. Zeroing it, plus the copy the per-block `torch.stack` made, scaled with `width` (the
+    # LONGEST list, rounded up to a power of two -- a token proposed at every position makes that
+    # `batch * positions`), not with the references actually present: on the CoDD PC it was ~1.4 ms
+    # of a 10.9 ms fwd+bwd at batch 16, and 2.9 ms at batch 17, where `width` jumps from 512 to 1024.
+    shards = []
+    for si, width in enumerate(shard_widths):
+        Us_max = max(_shard_sizes(st, split, gi)[si] for gi in range(G))
+        shards.append(dict(
+            uniq = torch.zeros([G, Us_max], dtype = torch.int32, device = dev),
+            ref_slot = torch.empty([G, width, Us_max], dtype = torch.int32, device = dev),
+            ref_pt = torch.empty([G, width, Us_max], dtype = torch.float32, device = dev),
+            # offsets are bounded by B * V * K, so 32 bits is plenty
+            ref_goff = torch.empty([G, width, Us_max], dtype = torch.int32, device = dev),
+            ref_cnt = torch.zeros([G, Us_max], dtype = torch.int32, device = dev),
+            num_uniq = [0] * G,
+            Umax = Us_max,
+            max_refs = width,
+        ))
+
     for gi, (uniq, counts, within, row, s_sorted, p_sorted, g_sorted) in enumerate(sorted_l):
         U = uniq.numel()
 
@@ -1328,46 +1349,19 @@ def _build_dense_index(layer, kwargs):
 
         for si, (u, c, wi, r, ss, ps, gs) in enumerate(pieces):
             Us = u.numel()
-            width = shard_widths[si]
+            sh = shards[si]
             # [width, U] rather than [U, width]: the kernel assigns one CATEGORY per thread, so with the
             # reference index innermost, lane-adjacent threads would read `width` apart and every lane
             # would fetch its own sector. Transposed, a warp's reads of reference `j` are contiguous.
-            rs = torch.zeros([width, Us], dtype = torch.int32, device = dev)
-            rp = torch.zeros([width, Us], dtype = torch.float32, device = dev)
-            # offsets are bounded by B * V * K, so 32 bits is plenty
-            rg = torch.zeros([width, Us], dtype = torch.int32, device = dev)
-            rs[wi, r] = ss
-            rp[wi, r] = ps
-            rg[wi, r] = gs
+            sh["ref_slot"][gi, wi, r] = ss
+            sh["ref_pt"][gi, wi, r] = ps
+            sh["ref_goff"][gi, wi, r] = gs
+            sh["uniq"][gi, :Us] = u.int()
+            sh["ref_cnt"][gi, :Us] = c.int()
+            sh["num_uniq"][gi] = Us
 
-            sh = per_shard[si]
-            sh["uniq"].append(u.int()); sh["slot"].append(rs); sh["pt"].append(rp); sh["goff"].append(rg)
-            sh["cnt"].append(c.int().contiguous()); sh["n"].append(Us)
-
-    shards = []
-    for si, sh in enumerate(per_shard):
-        Us_max = max(sh["n"])
-
-        def _pad(ts, dim = 0):
-            out = []
-            for t in ts:
-                if t.size(dim) < Us_max:
-                    shape = list(t.shape)
-                    shape[dim] = Us_max - t.size(dim)
-                    t = torch.cat([t, t.new_zeros(shape)], dim = dim)
-                out.append(t)
-            return torch.stack(out).contiguous()
-
-        shards.append(dict(
-            uniq = _pad(sh["uniq"]),                                          # [G, Us_max]
-            ref_slot = _pad(sh["slot"], dim = 1),                             # [G, width, Us_max]
-            ref_pt = _pad(sh["pt"], dim = 1),
-            ref_goff = _pad(sh["goff"], dim = 1),
-            ref_cnt = _pad(sh["cnt"]),                                        # [G, Us_max]
-            num_uniq = torch.tensor(sh["n"], dtype = torch.int32, device = dev),   # [G]
-            Umax = Us_max,
-            max_refs = shard_widths[si],
-        ))
+    for sh in shards:
+        sh["num_uniq"] = torch.tensor(sh["num_uniq"], dtype = torch.int32, device = dev)   # [G]
 
     index = dict(
         shards = shards,
@@ -2798,8 +2792,12 @@ class SoftEvidenceCategorical(Distribution):
 
         acc = tl.zeros([BLOCK_L, BLOCK_C], dtype = tl.float32)
         for j in range(num_refs):
-            s = tl.load(ref_slot_ptr + ref_base + j * UNIQ_STRIDE, mask = mask_c, other = 0).to(tl.int64)
-            p = tl.load(ref_pt_ptr + ref_base + j * UNIQ_STRIDE, mask = mask_c, other = 0.0)
+            # `j < cnt`, not just `mask_c`: past a category's own list the tables are UNINITIALIZED (see
+            # `_build_dense_index`), so a shorter list in this tile must read nothing there. A masked lane
+            # gets slot 0 (a valid row) and p = 0, so it contributes nothing to `acc` or the gradient.
+            mask_j = mask_c & (j < cnt)
+            s = tl.load(ref_slot_ptr + ref_base + j * UNIQ_STRIDE, mask = mask_j, other = 0).to(tl.int64)
+            p = tl.load(ref_pt_ptr + ref_base + j * UNIQ_STRIDE, mask = mask_j, other = 0.0)
 
             # ratio[slot, latent] out of a ~1 MB (L2-resident) scratch. Load it [C, L] so the LATENT axis
             # is innermost and each (cat, ref) reads a contiguous run, then transpose in registers --
@@ -2814,9 +2812,9 @@ class SoftEvidenceCategorical(Distribution):
             if update_extflows:
                 # expected-value term of the external evidence gradient, from the beta already in registers
                 part = tl.sum(r_t * beta, axis = 0)                          # [BLOCK_C]
-                goff = tl.load(ref_goff_ptr + ref_base + j * UNIQ_STRIDE, mask = mask_c, other = 0)
+                goff = tl.load(ref_goff_ptr + ref_base + j * UNIQ_STRIDE, mask = mask_j, other = 0)
                 tl.atomic_add(categorical_evidence_logp_grad_ptr + goff, -p * part,
-                              mask = mask_c & (p != 0.0))
+                              mask = mask_j & (p != 0.0))
 
         if update_pflows:
             pf_base = tl.load(pf_base_ptr + pid_g * num_latents + offs_l, mask = mask_l, other = 0)
