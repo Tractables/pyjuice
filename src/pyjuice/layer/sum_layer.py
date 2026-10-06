@@ -914,13 +914,19 @@ class SumLayer(Layer, nn.Module):
                     return None
                 # choice == ("triton", -1): fall through to the Triton launch below
 
-        # Small-batch (batch < 16) CUDA fast path. The big-block sparse/block-sparse Triton kernels
-        # under-tile the node dimension at tiny batch; this plain-CUDA kernel (32-node coalesced
-        # warps + edge-split online-logsumexp, numerically equivalent ~1.5e-6) is faster. Gated to the
-        # same regime as the small-batch tiling heuristic above (batch<16, block_size>=128), LL, no
-        # tempering / partial-eval, contiguous layout. Autotuned vs the Triton small-batch launch and
-        # only used when it wins; otherwise falls through to the Triton launch below.
-        if (FORWARD_SUM_CUDA and batch_size < 16 and self.block_size >= _SMALL_BATCH_MIN_BLOCK_SIZE
+        # Small-batch CUDA fast path. The big-block sparse/block-sparse Triton kernels under-tile the
+        # node dimension at tiny batch; this plain-CUDA kernel (32-node coalesced warps + edge-split
+        # online-logsumexp, numerically equivalent ~1.5e-6) is faster. LL, no tempering / partial-eval,
+        # contiguous layout. Autotuned vs the Triton launch and only used when it wins; otherwise falls
+        # through to the Triton launch below.
+        #
+        # Offered through the gap batch too (`_GAP_BATCH_MAX`), not just below 16. It has no batch
+        # tile -- one block per sample, cost linear in the batch -- while Triton's `tl.dot` tile is a
+        # power of two, so at batch 17 Triton pays for 32 columns, half of them empty. MEASURED on a
+        # 1024-latent HMM layer, forward ms, Triton -> this kernel: batch 17 1.19 -> 0.54, 20 0.85 ->
+        # 0.66, 24 0.86 -> 0.73, 33 ~1.6 -> 0.93, 48 1.6 -> 1.28; Triton wins again from 64, where its
+        # tiles fill.
+        if (FORWARD_SUM_CUDA and batch_size < _GAP_BATCH_MAX and self.block_size >= _SMALL_BATCH_MIN_BLOCK_SIZE
                 and propagation_alg_id == 0 and not pflow_tempered_enabled and local_ids is None
                 and node_mars.is_cuda and cuda_kernels.smallbatch_fw_is_available()):
             sb = self._cached_fw_sb.get(signature)
@@ -939,19 +945,23 @@ class SumLayer(Layer, nn.Module):
             sb_ebase, sb_pbase, sb_ok = sb
             if sb_ok:
                 n_sb_cfg = len(cuda_kernels.smallbatch_fw_configs())
-                choice_key = (signature, batch_size, "sb")
-                choice = self._cached_fw_cuda_choice.get(choice_key)
-                if choice is None:
-                    # Autotune the CUDA SPLIT configs against the Triton small-batch launch (csmm1/2,
-                    # whichever this tile shape selects -- mirrors the fall-through below). Every
-                    # candidate overwrites node_mars with the same result, so it stays correct.
-                    cands = [(("triton", -1), (lambda: _launch_fw(fw_cfgs[0])))]
-                    cands += [(("cuda", c), (lambda c=c: cuda_kernels.smallbatch_forward_sum(
-                                 node_mars, element_mars, params, nids, sb_ebase, sb_pbase,
-                                 batch_size, self.block_size, num_edges, c)))
-                              for c in range(n_sb_cfg)]
-                    choice = autotune.best_of(cands) or ("triton", -1)
-                    self._cached_fw_cuda_choice[choice_key] = choice
+
+                def _launch_sb(cfg):
+                    if cfg[0] == "cuda":
+                        cuda_kernels.smallbatch_forward_sum(
+                            node_mars, element_mars, params, nids, sb_ebase, sb_pbase,
+                            batch_size, self.block_size, num_edges, cfg[1])
+                    else:
+                        _launch_fw(fw_cfgs[0])
+
+                # Autotune the CUDA SPLIT configs against the Triton launch that would run on
+                # fall-through. Every candidate overwrites node_mars with the same result, so it stays
+                # correct. Keyed by SHAPE and cached process-wide (`autotune.pick`), not per layer: the
+                # two sides agree only to ~1.5e-6, so structurally identical layers that tuned on their
+                # own could each take a different one and disagree in the last bits -- a cross-model
+                # bit-identity test caught exactly that (2.4e-7) once this path reached batch 32.
+                choice = autotune.pick(("sum_fw_smallbatch_cuda", num_edges) + fw_key,
+                                       [("triton", -1)] + [("cuda", c) for c in range(n_sb_cfg)], _launch_sb)
 
                 if choice[0] == "cuda":
                     cuda_kernels.smallbatch_forward_sum(
