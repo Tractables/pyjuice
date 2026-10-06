@@ -26,6 +26,16 @@ from .backend import compile_cum_par_flows_fn, compute_cum_par_flows, cum_par_fl
                      normalize_parameters, eval_top_down_probs
 
 
+def _graph_option(value):
+    """An option of a captured pass as a hashable signature entry: tensors by the memory a capture bakes
+    in (`cuda_graph_key`), sequences elementwise, anything else as it is."""
+    if isinstance(value, torch.Tensor):
+        return cuda_graph_key(value)
+    if isinstance(value, (list, tuple)):
+        return tuple(_graph_option(v) for v in value)
+    return value
+
+
 def _pc_model_backward_hook(grad, pc, inputs, record_cudagraph, apply_cudagraph, propagation_alg, **kwargs):
     grad = grad.permute(1, 0)
     pc.backward(
@@ -419,10 +429,16 @@ class TensorCircuit(nn.Module):
                     else:
                         raise ValueError(f"Unknown layer type {type(layer)}.")
 
-            # `external_params` is in the signature because the staging buffer is re-allocated when its
-            # layout changes, and a captured graph holds the old pointer
+            # Everything the captured work depends on: the buffers it bakes in, by address (`external_params`
+            # because the staging buffer is re-allocated when its layout changes), and every option that
+            # changes which kernels run or what they compute. A recorded graph is replayed whenever its
+            # signature matches (`apply_cudagraph` is on by default), so an option missing here replays
+            # the wrong computation -- an MPE forward after a recorded LL one used to replay LL.
             signature = (0, cuda_graph_key(self.node_mars), cuda_graph_key(self.element_mars),
-                         cuda_graph_key(self.params), B, cuda_graph_key(self.external_params))
+                         cuda_graph_key(self.params), B, cuda_graph_key(self.external_params),
+                         _graph_option(propagation_alg), _graph_option(kwargs.get("alpha")),
+                         force_use_bf16, force_use_fp32, pflow_temperature,
+                         _graph_option(kwargs.get("node_mars_tempered")))
             # A `fast_inference` scope may turn graphs on for the whole block, so callers need not
             # thread `record_cudagraph` through every call. Its contract -- parameters, and the
             # buffers a capture bakes pointers to, do not move -- is what makes that sound, and the
@@ -640,33 +656,53 @@ class TensorCircuit(nn.Module):
                     else:
                         raise ValueError(f"Unknown layer type {type(layer)}.")
 
+            # As in `forward`: the buffers the capture bakes in, and every option that changes the captured
+            # work. A query's `compute_param_flows = False` used to replay a training step's graph, which
+            # writes parameter flows.
+            denom_param_flows = self.denom_param_flows if compute_param_flows else None
             signature = (1, cuda_graph_key(self.node_flows), cuda_graph_key(self.element_flows),
                          cuda_graph_key(self.node_mars), cuda_graph_key(self.element_mars),
-                         cuda_graph_key(self.params), cuda_graph_key(self.param_flows), B,
-                         allow_modify_flows, logspace_flows, ((abs(pflow_temperature) - 1.0) < 1e-6), temper_eflow,
+                         cuda_graph_key(self.params), cuda_graph_key(self.param_flows if compute_param_flows else None),
+                         cuda_graph_key(denom_param_flows), B, allow_modify_flows, logspace_flows, negate_pflows,
+                         force_use_fp32, pflow_temperature, temper_eflow, _graph_option(propagation_alg),
+                         _graph_option(kwargs.get("alpha")), _graph_option(kwargs.get("node_mars_tempered")),
                          cuda_graph_key(self.external_params), cuda_graph_key(self.external_params_grad))
-            if record_cudagraph and signature not in self._recorded_cuda_graphs:
+            # Callbacks run inside the captured region and could do anything, so they make the pass eager.
+            use_graphs = sum_layer_pre_backward_callback is None and sum_layer_post_backward_callback is None
+
+            if use_graphs and record_cudagraph and signature not in self._recorded_cuda_graphs:
+                # Warm up and capture without leaving a trace on this step. The pass reads `node_flows` as
+                # its initial state and ACCUMULATES into the flows and gradients below, and the warm-up
+                # runs execute it for real -- three times. They used to re-initialize `node_flows` with 0.0
+                # (an all-ones flow in log space) and leave their accumulations behind, so the step that
+                # recorded a graph came out with ~4x its parameter flows, hundreds of times more in log
+                # space. Snapshot to the host, as `eval_top_down_probs` does, so recording takes no device
+                # memory; it happens once per signature.
+                state = [t for t in (self.node_flows, self.element_flows,
+                                     self.param_flows if compute_param_flows else None,
+                                     denom_param_flows, self.external_params_grad) if isinstance(t, torch.Tensor)]
+                saved = [t.cpu() for t in state]
+
                 # Warmup
                 s = torch.cuda.Stream()
                 s.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(s):
                     for _ in range(3):
-                        self.node_flows[:,:] = 0.0
-                        _set_root_node_flows()
                         _run_inner_layers()
                 torch.cuda.current_stream().wait_stream(s)
 
                 # Capture
-                self.node_flows[:,:] = 0.0
-                _set_root_node_flows()
                 g = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(g):
                     _run_inner_layers()
 
+                for t, t_saved in zip(state, saved):
+                    t.copy_(t_saved)
+
                 # Save
                 self._recorded_cuda_graphs[signature] = g
 
-            if apply_cudagraph and signature in self._recorded_cuda_graphs:
+            if use_graphs and apply_cudagraph and signature in self._recorded_cuda_graphs:
                 g = self._recorded_cuda_graphs[signature]
                 g.replay()
             else:
