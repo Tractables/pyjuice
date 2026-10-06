@@ -458,6 +458,47 @@ def test_dense_layouts_agree_with_scattered(homogeneous, split):
                 f"{choice} vs scattered, {name} (max abs diff {float((a - b).abs().max()):.3e})"
 
 
+def test_forward_and_backward_share_one_dense_index():
+    """The forward sorts the candidates for the gather kernel, but NOT when it takes the dense path:
+    the index is order-independent, and it is cached by tensor identity, so a forward on sorted copies
+    and a backward on the caller's arrays used to build it twice per step (and the choice key used to
+    change between `preprocess_fw_kwargs` and the forward's own condition, a third way to miss).
+    Count the builds of one step with fresh tensors, in steady state: the choice already tuned."""
+    from pyjuice.layer.kernels import autotune
+
+    saved = dict(autotune._CACHE)
+    try:
+        with pytest.MonkeyPatch.context() as mp:
+            pc, layer, data, kw, (S, L, C, B) = _dense_setup(mp, True, with_grad = True, force = False)
+            # As if tuned to the dense ladder -- through the choice CACHE, under the step's own key, which is
+            # the path whose key once changed mid-forward (a forced override would bypass it).
+            key = _softevi._dense_choice_key(layer, dict(kw, dual_flow_backward = True))
+            autotune._CACHE[autotune._full_key(key)] = "ladder"
+            builds = []
+            real = _softevi._build_dense_index
+
+            def counting(layer_, kwargs, ladder = None):
+                cached = getattr(layer_, "_dense_index_cache", None)
+                before = None if cached is None else (cached[1], len(cached[1]))
+                index = real(layer_, kwargs, ladder)
+                after = layer_._dense_index_cache
+                if before is None or after[1] is not before[0] or len(after[1]) != before[1]:
+                    builds.append(ladder)
+                return index
+
+            mp.setattr(_softevi, "_build_dense_index", counting)
+            for _ in range(3):                                   # the first steps may tune; then steady state
+                _grad_step(pc, data, None, **{k: v.clone() for k, v in kw.items()})
+            builds.clear()
+            _grad_step(pc, data, None, **{k: v.clone() for k, v in kw.items()})
+            index = layer._dense_index_cache[1].get(True, None)
+    finally:
+        autotune._CACHE.clear()
+        autotune._CACHE.update(saved)
+    assert len(builds) == 1, f"{len(builds)} index builds in one step"
+    assert index is not None and len(index["shards"]) > 1, "the step did not use the tuned ladder layout"
+
+
 @pytest.mark.parametrize("dual_flow", [True, False])
 @pytest.mark.parametrize("split", [None, 3])
 def test_dense_triton_fallback_reads_only_valid_references(dual_flow, split, monkeypatch):

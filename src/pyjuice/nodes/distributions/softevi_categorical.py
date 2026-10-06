@@ -151,6 +151,24 @@ def _fw_transposed_args(layer, target_kwargs, num_cats):
     return True
 
 
+def _fw_cuda_structural(layer, kwargs):
+    """The structural half of `_fw_cuda_applicable`: top-k evidence, no value mask, no partial
+    evaluation, extension built."""
+    if os.environ.get("PYJUICE_SOFTEVI_FW_CUDA", "1") == "0":
+        return False
+    if kwargs.get("soft_evidence_cat_ids", None) is None or "categorical_evidence_logp" not in kwargs:
+        return False
+    if kwargs.get("soft_evidence_value_mask", None) is not None:
+        return False
+    if layer.provided("fw_local_ids"):
+        return False
+    try:
+        from .c_kernels import dense_expected_flow_available
+        return dense_expected_flow_available()
+    except Exception:
+        return False
+
+
 def _fw_cuda_applicable(layer, kwargs):
     """Whether to take a CUDA forward at all.
 
@@ -161,19 +179,7 @@ def _fw_cuda_applicable(layer, kwargs):
     applies and the well-tuned Triton kernel is the safer choice, so fall back rather than extrapolate
     from a regime that was never measured.
     """
-    if os.environ.get("PYJUICE_SOFTEVI_FW_CUDA", "1") == "0":
-        return False
-    if kwargs.get("soft_evidence_cat_ids", None) is None:
-        return False
-    if kwargs.get("soft_evidence_value_mask", None) is not None:
-        return False
-    if layer.provided("fw_local_ids"):
-        return False
-    try:
-        from .c_kernels import dense_expected_flow_available
-        if not dense_expected_flow_available():
-            return False
-    except Exception:
+    if not _fw_cuda_structural(layer, kwargs):
         return False
 
     if _fw_use_dense(layer, kwargs):
@@ -1152,7 +1158,10 @@ def _dense_choice_key(layer, kwargs):
     if layout is None:
         return None
     shape = (lnn, V, B, K, layer.nodes[0].dist.num_cats, len(layout[1]))
-    return ("softevi_dense_vs_scattered",) + shape + (bool(kwargs.get("dual_flow_backward", False)),)
+    # The flag comes from the distribution, not from `kwargs`: `set_custom_kernel_kwargs` copies it in
+    # only AFTER `preprocess_fw_kwargs`, which consults this choice too, and a key that changed between
+    # the two calls built the index twice per forward.
+    return ("softevi_dense_vs_scattered",) + shape + (bool(layer.dist._dual_flow_backward),)
 
 
 def _dense_choice(layer, kwargs, default):
@@ -2134,6 +2143,13 @@ class SoftEvidenceCategorical(Distribution):
         if not kwargs.get("sort_soft_evidence", getattr(self, "sort_soft_evidence", True)):
             return
         if os.environ.get("PYJUICE_SOFTEVI_SORT", "1") == "0":
+            return
+        # The dense forward reads the candidates through the inverted index, which is order-independent,
+        # so sorting buys it nothing -- and costs it the index: the index is cached by tensor IDENTITY,
+        # so a forward on the sorted copies and a backward on the caller's arrays each built their own.
+        # MEASURED on the CoDD PC at batch 12: a second build per step, 1.9 ms of host time out of 8.9.
+        # Leaving the caller's arrays in place lets the backward find the forward's build.
+        if _fw_cuda_structural(layer, kwargs) and _fw_use_dense(layer, kwargs):
             return
 
         logp, cat_ids = _sorted_soft_evidence(layer, kwargs)
