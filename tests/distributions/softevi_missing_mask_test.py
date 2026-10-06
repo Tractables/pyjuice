@@ -154,7 +154,7 @@ def test_no_nan_with_a_partially_padded_batch_tile(batch_size):
     assert torch.isfinite(pf).all(), "non-finite param_flows with a padded batch tile"
 
 
-def _dense_setup(monkeypatch, use_dense):
+def _dense_setup(monkeypatch, use_dense, dual_flow = True, with_grad = False):
     """The dense top-k path only engages when the parameter table overflows L2 and the emissions are tied
     across variables, so shrink the L2 figure it gates on instead of building a multi-GB model."""
     device = torch.device("cuda:0")
@@ -164,14 +164,17 @@ def _dense_setup(monkeypatch, use_dense):
     if not use_dense:
         monkeypatch.setattr(_softevi, "_DENSE_TOPK_BACKWARD", False)
 
-    pc = _build(S, L, C, homogeneous = True)
+    pc = _build(S, L, C, dual_flow = dual_flow, homogeneous = True)
     layer = pc.input_layer_group[0]
 
+    torch.manual_seed(3)
     data = torch.randint(0, C, (B, S), device = device)
     kw = dict(categorical_evidence_logp = _evidence(B, S, K, device),
               soft_evidence_cat_ids = _topk_ids(B, S, K, C, data, device))
 
-    probe = dict(kw, dual_flow_backward = True)
+    probe = dict(kw, dual_flow_backward = dual_flow)
+    if with_grad:
+        probe["categorical_evidence_logp_grad"] = torch.zeros_like(kw["categorical_evidence_logp"])
     assert _softevi._dense_topk_applicable(layer, probe) == use_dense, \
         f"expected dense={use_dense}, got the other path"
 
@@ -214,6 +217,50 @@ def test_dense_and_scattered_paths_agree_under_a_mask(monkeypatch):
     assert torch.isfinite(a).all() and torch.isfinite(b).all()
     assert torch.allclose(a, b, rtol = 1e-4, atol = 1e-6), \
         f"dense vs scattered disagree under a mask (max abs diff {float((a - b).abs().max()):.3e})"
+
+
+def _grad_step(pc, data, mask, **kw):
+    pc.init_param_flows(flows_memory = 0.0)
+    if mask is not None:
+        kw["missing_mask"] = mask
+    pc(data, **kw)
+    grad = torch.zeros_like(kw["categorical_evidence_logp"])
+    pc.backward(data, allow_modify_flows = False, logspace_flows = True, categorical_evidence_logp_grad = grad, **kw)
+    return pc.input_layer_group[0].param_flows.clone(), grad
+
+
+@pytest.mark.parametrize("masked", [False, True])
+def test_nondual_dense_path_matches_scattered_and_dual(masked):
+    """Without dual flows the dense top-k kernels run for the evidence gradient alone (`update_pflows`
+    off: there is no denominator half to write, and the observed-category flow stays with
+    `bk_params_kernel`). Before, this case always took the scattered `bk_softevi_kernel`, ~2.3x slower
+    on the CoDD shape. So: dense must equal scattered, in both the param flows and the gradient -- and
+    the gradient must equal the dual-flow run's, which does not depend on how the flows are stored."""
+    def mask_for(data):
+        if not masked:
+            return None
+        mask = torch.zeros_like(data, dtype = torch.bool)
+        mask[:, 0] = True
+        mask[0, 2] = True
+        return mask
+
+    out = {}
+    for dual_flow, use_dense in ((False, True), (False, False), (True, True)):
+        with pytest.MonkeyPatch.context() as mp:
+            pc, layer, data, kw, (S, L, C, B) = _dense_setup(mp, use_dense, dual_flow = dual_flow, with_grad = True)
+            out[(dual_flow, use_dense)] = _grad_step(pc, data, mask_for(data), **kw)
+
+    (pf_dense, g_dense), (pf_scat, g_scat), (pf_dual, g_dual) = out[(False, True)], out[(False, False)], out[(True, True)]
+    for t in (pf_dense, g_dense, pf_scat, g_scat, g_dual):
+        assert torch.isfinite(t).all()
+    assert g_dense.abs().max() > 0, "the evidence gradient came out all zero"
+
+    assert torch.allclose(pf_dense, pf_scat, rtol = 1e-4, atol = 1e-6), \
+        f"non-dual param flows: dense vs scattered (max abs diff {float((pf_dense - pf_scat).abs().max()):.3e})"
+    assert torch.allclose(g_dense, g_scat, rtol = 1e-4, atol = 1e-6), \
+        f"non-dual evidence gradient: dense vs scattered (max abs diff {float((g_dense - g_scat).abs().max()):.3e})"
+    assert torch.allclose(g_dense, g_dual, rtol = 1e-4, atol = 1e-6), \
+        f"evidence gradient: non-dual vs dual (max abs diff {float((g_dense - g_dual).abs().max()):.3e})"
 
 
 if __name__ == "__main__":

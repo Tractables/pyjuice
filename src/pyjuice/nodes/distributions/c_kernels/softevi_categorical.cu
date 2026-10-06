@@ -45,7 +45,10 @@
 // slice in shared memory once per block removes essentially all of it. This is the part Triton cannot
 // express -- it has no explicit shared-memory control, so it re-reads the ratio tile from global on every
 // reference.
-template <int TL, bool UPDATE_GRAD, bool SMEM_RATIO>
+// `UPDATE_FLOW = false` computes only the evidence-gradient term (no dual flows to write): the same walk,
+// minus the accumulator and the phase-1 write. That walk is what replaces the scattered [batch, latent,
+// candidate] `params` gather, so the gradient alone is worth it.
+template <int TL, bool UPDATE_GRAD, bool SMEM_RATIO, bool UPDATE_FLOW = true>
 __global__ void dense_expected_flow_kernel(
         const float* __restrict__ params,
         float* __restrict__ param_flows,
@@ -131,8 +134,10 @@ __global__ void dense_expected_flow_kernel(
             for (int t = 0; t < TL; ++t) rv[t] = (t < nl) ? __ldg(r + t) : 0.0f;
         }
 
-        #pragma unroll
-        for (int t = 0; t < TL; ++t) acc[t] += rv[t] * pt;
+        if (UPDATE_FLOW) {
+            #pragma unroll
+            for (int t = 0; t < TL; ++t) acc[t] += rv[t] * pt;
+        }
 
         if (UPDATE_GRAD) {
             float part = 0.0f;
@@ -141,6 +146,8 @@ __global__ void dense_expected_flow_kernel(
             if (part != 0.0f) atomicAdd(grad + ref_goff[rj], -pt * part);
         }
     }
+
+    if (!UPDATE_FLOW) return;
 
     // one owner per (row, cat): plain read-modify-write, coalesced across the warp
     #pragma unroll
@@ -155,7 +162,7 @@ __global__ void dense_expected_flow_kernel(
     }
 }
 
-void dense_expected_flow(torch::Tensor params, torch::Tensor param_flows, torch::Tensor ratio,
+void dense_expected_flow(torch::Tensor params, c10::optional<torch::Tensor> param_flows, torch::Tensor ratio,
                          torch::Tensor uniq, torch::Tensor ref_slot, torch::Tensor ref_pt,
                          torch::Tensor ref_goff, torch::Tensor ref_cnt, torch::Tensor num_uniq,
                          torch::Tensor pf_base, torch::Tensor p_base,
@@ -171,6 +178,9 @@ void dense_expected_flow(torch::Tensor params, torch::Tensor param_flows, torch:
 
     const bool do_grad = grad.has_value();
     float* grad_ptr = do_grad ? grad->data_ptr<float>() : nullptr;
+    const bool do_flow = param_flows.has_value();
+    float* pf_ptr = do_flow ? param_flows->data_ptr<float>() : nullptr;
+    if (!do_flow && !do_grad) return;
 
     auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -184,19 +194,21 @@ void dense_expected_flow(torch::Tensor params, torch::Tensor param_flows, torch:
     const bool use_smem = (getenv("PYJUICE_SOFTEVI_SMEM_RATIO") != nullptr) && (smem <= 48 * 1024);
     const size_t smem_bytes = use_smem ? smem : 0;
 
-#define LAUNCH_TL(TLV, GRAD, SMEM)                                                                \
-    dense_expected_flow_kernel<TLV, GRAD, SMEM><<<grid, threads, smem_bytes, stream>>>(           \
-        params.data_ptr<float>(), param_flows.data_ptr<float>(), ratio.data_ptr<float>(),         \
+#define LAUNCH_TL(TLV, GRAD, SMEM, FLOW)                                                          \
+    dense_expected_flow_kernel<TLV, GRAD, SMEM, FLOW><<<grid, threads, smem_bytes, stream>>>(     \
+        params.data_ptr<float>(), pf_ptr, ratio.data_ptr<float>(),                                \
         uniq.data_ptr<int>(), ref_slot.data_ptr<int>(), ref_pt.data_ptr<float>(),                 \
         ref_goff.data_ptr<int>(), ref_cnt.data_ptr<int>(), num_uniq.data_ptr<int>(),              \
         pf_base.data_ptr<long>(), p_base.data_ptr<long>(), grad_ptr,                              \
         (int)num_latents, (int)tot_num_cats, (int)uniq_stride, (int)max_refs, (int)num_slots)
 
 #define DISPATCH(TLV)                                                                             \
-    if (do_grad && use_smem)      { LAUNCH_TL(TLV, true,  true);  }                               \
-    else if (do_grad)             { LAUNCH_TL(TLV, true,  false); }                               \
-    else if (use_smem)            { LAUNCH_TL(TLV, false, true);  }                               \
-    else                          { LAUNCH_TL(TLV, false, false); }
+    if (!do_flow && use_smem)     { LAUNCH_TL(TLV, true,  true,  false); }                        \
+    else if (!do_flow)            { LAUNCH_TL(TLV, true,  false, false); }                        \
+    else if (do_grad && use_smem) { LAUNCH_TL(TLV, true,  true,  true);  }                        \
+    else if (do_grad)             { LAUNCH_TL(TLV, true,  false, true);  }                        \
+    else if (use_smem)            { LAUNCH_TL(TLV, false, true,  true);  }                        \
+    else                          { LAUNCH_TL(TLV, false, false, true);  }
 
     switch (tl_size) {
         case 4:  DISPATCH(4);  break;

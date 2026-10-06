@@ -1030,14 +1030,26 @@ def _dense_topk_applicable(layer, kwargs):
         return False
     if kwargs.get("soft_evidence_cat_ids", None) is None:
         return False
-    if not kwargs["dual_flow_backward"]:
-        # Without the dual-flow denominator there is no scatter to eliminate.
+    if not kwargs["dual_flow_backward"] and kwargs.get("categorical_evidence_logp_grad", None) is None:
+        # Without the dual-flow denominator the walk's only remaining output is the evidence gradient's
+        # expected-value term, so with no gradient requested there is nothing for it to do. WITH one, the
+        # scattered kernel pays the same [batch, latent, candidate] gather of `params` for it that the
+        # denominator did, and the same inversion removes it: the dense kernels run with `update_pflows`
+        # off. CoDD shape, fwd+bwd, dual-flow off: 29.8 -> 12.7 ms at batch 14, 64.7 -> 27.4 at 32.
         return False
     if layer.provided("bk_local_ids"):
         return False
     if not _dense_worth_it(layer, kwargs):
         return False
     return _build_dense_index(layer, kwargs) is not None
+
+
+def _dense_update_pflows(layer, kwargs):
+    """Whether the dense kernels write param flows (both phases), or only the evidence gradient.
+
+    `layer.param_flows is not None` for the same reason as in `_prep_args_apply_bk_softevi_kernel`: a
+    `backward(compute_param_flows = False)` allocates no buffer to write into."""
+    return kwargs["dual_flow_backward"] and (layer.param_flows is not None)
 
 
 def _l2_bytes(layer):
@@ -1425,6 +1437,9 @@ def _prep_args_bk_dense_prologue(layer, kwargs):
     grad = kwargs.get("categorical_evidence_logp_grad", None)
     target_kwargs["categorical_evidence_logp_grad_ptr"] = _grad_scratch(layer, grad)
     target_kwargs["update_extflows"] = grad is not None
+    # Without dual flows the observed-category flow belongs to `bk_params_kernel`, which still runs (see
+    # `_condition_apply_bk_params_kernel`), so writing it here as well would count it twice.
+    target_kwargs["update_pflows"] = _dense_update_pflows(layer, kwargs)
 
     target_kwargs["ratio_ptr"] = _dense_scratch(layer, ext_num_vars, batch_size, index["num_latents"])
     target_kwargs.update(_missing_mask_kwargs(kwargs))
@@ -1509,7 +1524,7 @@ class _DenseDenomDispatch:
 
                 from .c_kernels import dense_expected_flow
                 dense_expected_flow(
-                    skw["params_ptr"], skw["param_flows_ptr"], skw["ratio_ptr"],
+                    skw["params_ptr"], skw["param_flows_ptr"] if skw["update_pflows"] else None, skw["ratio_ptr"],
                     skw["uniq_ptr"], skw["ref_slot_ptr"], skw["ref_pt_ptr"], skw["ref_goff_ptr"],
                     skw["ref_cnt_ptr"], skw["num_uniq_ptr"], skw["pf_base_ptr"], skw["p_base_ptr"],
                     skw["categorical_evidence_logp_grad_ptr"] if skw["update_extflows"] else None,
@@ -1542,6 +1557,7 @@ def _prep_args_bk_dense_denom(layer, kwargs):
     grad = kwargs.get("categorical_evidence_logp_grad", None)
     target_kwargs["categorical_evidence_logp_grad_ptr"] = _grad_scratch(layer, grad)
     target_kwargs["update_extflows"] = grad is not None
+    target_kwargs["update_pflows"] = _dense_update_pflows(layer, kwargs)
 
     target_kwargs["num_latents"] = num_latents
     target_kwargs["tot_num_cats"] = layer.nodes[0].dist.num_cats
@@ -2616,7 +2632,8 @@ class SoftEvidenceCategorical(Distribution):
                                  categorical_evidence_logp_grad_ptr, var_idmapping_ptr, ratio_ptr,
                                  num_cats: tl.constexpr, ext_num_vars: tl.constexpr, num_latents: tl.constexpr,
                                  update_extflows: tl.constexpr, missing_mask_ptr,
-                                 missing_mask_mode: tl.constexpr, missing_mask_num_vars: tl.constexpr):
+                                 missing_mask_mode: tl.constexpr, missing_mask_num_vars: tl.constexpr,
+                                 update_pflows: tl.constexpr = True):
         """First half of the dense top-k backward: everything except the expected-category flow phase.
 
         Accumulates the observed-category flow, adds the observed-token term of the external evidence
@@ -2680,7 +2697,8 @@ class SoftEvidenceCategorical(Distribution):
         data = tl.load(data_ptr + vid * batch_size + offsets_b, mask = mask_b, other = 0)
 
         # Observed-category flow (phase 0)
-        tl.atomic_add(param_flows_ptr + s_pfids[None,:] + data[:,None], nflows, mask = mask_bn_ev)
+        if update_pflows:
+            tl.atomic_add(param_flows_ptr + s_pfids[None,:] + data[:,None], nflows, mask = mask_bn_ev)
 
         catids_ptr = soft_evidence_cat_ids_ptr + \
             offsets_b[:,None] * (ext_num_vars * num_cats) + lvid * num_cats + tl.arange(0, TILE_SIZE_K)[None,:]
@@ -2740,7 +2758,7 @@ class SoftEvidenceCategorical(Distribution):
                               num_latents: tl.constexpr, tot_num_cats: tl.constexpr, pf_row_stride: tl.constexpr,
                               MAX_REFS: tl.constexpr, UNIQ_STRIDE: tl.constexpr,
                               BLOCK_L: tl.constexpr, BLOCK_C: tl.constexpr,
-                              update_extflows: tl.constexpr):
+                              update_extflows: tl.constexpr, update_pflows: tl.constexpr = True):
         """Second half of the dense top-k backward: the expected-category flow phase (phase 1).
 
         Walks (latent x category) so that every (param-flow row, category) has a single owner and needs
@@ -2788,7 +2806,8 @@ class SoftEvidenceCategorical(Distribution):
                         mask = mask_c[:,None] & mask_l[None,:], other = 0.0) # [BLOCK_C, BLOCK_L]
             r_t = tl.trans(r)                                                # [BLOCK_L, BLOCK_C]
 
-            acc += r_t * p[None,:]
+            if update_pflows:
+                acc += r_t * p[None,:]
 
             if update_extflows:
                 # expected-value term of the external evidence gradient, from the beta already in registers
@@ -2797,13 +2816,14 @@ class SoftEvidenceCategorical(Distribution):
                 tl.atomic_add(categorical_evidence_logp_grad_ptr + goff, -p * part,
                               mask = mask_c & (p != 0.0))
 
-        pf_base = tl.load(pf_base_ptr + pid_g * num_latents + offs_l, mask = mask_l, other = 0)
-        optr = param_flows_ptr + pf_base[:,None] + tot_num_cats + cats[None,:]
-        # One owner per (row, category), so this is a plain read-modify-write.
-        # :note: `tl.atomic_add` here is 1.5x SLOWER (2.09 -> 3.22 ms) even though the equivalent
-        #        `atomicAdd` in the CUDA kernel is 1.2x FASTER -- Triton does not lower it to a bare
-        #        RED (reduction) instruction. That asymmetry is the reason the CUDA path exists.
-        tl.store(optr, tl.load(optr, mask = m, other = 0.0) + beta * acc, mask = m)
+        if update_pflows:
+            pf_base = tl.load(pf_base_ptr + pid_g * num_latents + offs_l, mask = mask_l, other = 0)
+            optr = param_flows_ptr + pf_base[:,None] + tot_num_cats + cats[None,:]
+            # One owner per (row, category), so this is a plain read-modify-write.
+            # :note: `tl.atomic_add` here is 1.5x SLOWER (2.09 -> 3.22 ms) even though the equivalent
+            #        `atomicAdd` in the CUDA kernel is 1.2x FASTER -- Triton does not lower it to a bare
+            #        RED (reduction) instruction. That asymmetry is the reason the CUDA path exists.
+            tl.store(optr, tl.load(optr, mask = m, other = 0.0) + beta * acc, mask = m)
 
     @staticmethod
     @triton_jit
