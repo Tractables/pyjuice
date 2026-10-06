@@ -13,6 +13,66 @@ def _hmm(device, seed = 0):
     return juice.compile(ns).to(device)
 
 
+def _step(pc, data, graphs):
+    pc.init_param_flows(flows_memory = 0.0)
+    lls = pc(data, record_cudagraph = graphs, apply_cudagraph = graphs).clone()
+    pc.backward(data, allow_modify_flows = False, logspace_flows = True,
+                record_cudagraph = graphs, apply_cudagraph = graphs)
+    return lls, pc.param_flows.clone()
+
+
+def test_alternating_batch_sizes_keep_one_graph_per_size():
+    device = torch.device("cuda:0")
+    pc = _hmm(device)
+    batches = [12, 5, 9, 5, 12, 9, 5, 9, 12, 5]           # the largest first: no storage grows after it
+    data = {B: torch.randint(0, 10, [B, 8], device = device) for B in set(batches)}
+
+    reference = {B: _step(pc, data[B], graphs = False) for B in set(batches)}
+
+    pc._drop_cuda_graphs()
+    addresses = set()
+    for B in batches:
+        lls, pflows = _step(pc, data[B], graphs = True)
+        addresses.add((pc.node_mars.data_ptr(), pc.element_mars.data_ptr(),
+                       pc.node_flows.data_ptr(), pc.element_flows.data_ptr()))
+        ref_lls, ref_pflows = reference[B]
+        assert torch.allclose(lls, ref_lls, atol = 1e-5), f"graphed LL differs from eager at batch {B}"
+        assert torch.allclose(pflows, ref_pflows, rtol = 1e-4, atol = 1e-6), \
+            f"graphed param flows differ from eager at batch {B}"
+
+    assert len(addresses) == 1, "a buffer moved although no batch exceeded the first"
+    assert len(pc._recorded_cuda_graphs) == 2 * len(set(batches)), \
+        f"{len(pc._recorded_cuda_graphs)} graphs for {len(set(batches))} batch sizes (forward + backward each)"
+
+
+def test_a_larger_batch_moves_the_buffers_and_drops_stale_graphs():
+    """Past the largest batch so far the storage must grow, which moves every view of it: the graphs
+    recorded against the old storage are dropped (each holds a memory pool), and results stay right."""
+    device = torch.device("cuda:0")
+    pc = _hmm(device)
+    small, large = torch.randint(0, 10, [4, 8], device = device), torch.randint(0, 10, [20, 8], device = device)
+
+    ref_small = _step(pc, small, graphs = False)
+    ref_large = _step(pc, large, graphs = False)
+
+    pc2 = _hmm(device)
+    _step(pc2, small, graphs = True)
+    assert len(pc2._recorded_cuda_graphs) == 2
+    before = pc2.node_mars.data_ptr()
+
+    lls, pflows = _step(pc2, large, graphs = True)
+    assert pc2.node_mars.data_ptr() != before
+    # at most the forward and backward graphs of the new storage (a freed block may legitimately come
+    # back as another buffer's storage, so this counts graphs rather than matching addresses)
+    assert len(pc2._recorded_cuda_graphs) <= 2, "graphs recorded against the outgrown storage were kept"
+    assert torch.allclose(lls, ref_large[0], atol = 1e-5)
+    assert torch.allclose(pflows, ref_large[1], rtol = 1e-4, atol = 1e-6)
+
+    lls, pflows = _step(pc2, small, graphs = True)
+    assert torch.allclose(lls, ref_small[0], atol = 1e-5)
+    assert torch.allclose(pflows, ref_small[1], rtol = 1e-4, atol = 1e-6)
+
+
 # ---- a recorded graph must compute exactly what the eager pass would ----
 
 @pytest.mark.parametrize("logspace_flows", [False, True])
