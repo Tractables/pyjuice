@@ -153,6 +153,20 @@ _BLOCK_SPARSE_EDGE_TRIM = os.environ.get("PYJUICE_EDGE_TRIM", "1") != "0"
 # the `csmm2` forks: those reduce with `tl.sum`, not `tl.dot`, and have no precision to set.
 _PAR_DOT_IEEE = os.environ.get("PYJUICE_PAR_DOT_IEEE", "0") != "0"
 
+# Smallest batch whose parameter flows take the block-sparse kernel rather than the sparse one. Both
+# are correct at any batch >= 3 (the block-sparse kernel needs `TILE_SIZE_B >= 4`). This used to be 16,
+# as a guard against two block-sparse bugs that are both fixed: the partial batch tile (floor ->
+# ceil, see `_backward_block_sparse_par_flows`) and the fp32 broadcast-sum miscompile that doubled
+# its flows at batch 4 (see `_BROADCAST_SUM_NOTE` in `layer/kernels/__init__.py`).
+#
+# 9 is the measured crossover on an RTX PRO 6000 (fwd+bwd, 32 x 1024 HMMs): from 9 the batch tile is
+# 16 wide and takes the tensor-core dot, so block-sparse wins -- CoDD's tied soft-evidence HMM
+# 12.66 -> 10.27 ms at batch 14, an untied Categorical HMM 5.37 -> 4.11 ms -- while at <= 8 the sparse
+# path (and its CUDA small-batch kernel, for untied layers) is 5-13% faster. A fixed threshold rather
+# than a timed choice ON PURPOSE: the two paths differ numerically (the block-sparse one carries the
+# same TF32 param-flow error as every batch >= 16), and numerics picked by a timing race are a trap.
+_BLOCK_SPARSE_PAR_MIN_BATCH = int(os.environ.get("PYJUICE_BLOCK_SPARSE_PAR_MIN_BATCH", 9))
+
 # SM count, cached: the occupancy heuristics below consult it per launch, and
 # `torch.cuda.get_device_properties` is far too slow to call on a hot path.
 _SM_COUNT = {}
@@ -1373,12 +1387,10 @@ class SumLayer(Layer, nn.Module):
 
         # Flows w.r.t. parameters
         if param_flows is not None and nids is not None:
-            if node_flows.size(1) < 16:
-                # The block-sparse parameter-flow kernel contracts the batch dimension into
-                # `B_NUM_TILES = batch_size // TILE_SIZE_B` tiles; for batch < 16 that is 0 whenever
-                # batch < TILE_SIZE_B (incl. all batch < 4, which also fail its TILE_SIZE_B >= 4
-                # assert), silently dropping the param flows. The sparse parameter-flow kernel handles
-                # any batch correctly and is already a tiny fraction of the backward, so use it here.
+            batch_size = node_flows.size(1)
+            if batch_size < _BLOCK_SPARSE_PAR_MIN_BATCH or (batch_size < 16 and self._ext_bw_par_hook is not None):
+                # See `_BLOCK_SPARSE_PAR_MIN_BATCH`. External (gated) parameterizations keep the sparse
+                # path below 16, where their small-batch hook lives.
                 self._backward_sparse_par_flows(
                     node_flows, params, node_mars, element_mars, param_flows,
                     nids = nids, cids = cids, pids = pids, pfids = pfids,
@@ -1837,8 +1849,8 @@ class SumLayer(Layer, nn.Module):
         # (`TILE_SIZE_B = 64` there, so floor gave zero tiles). Every batch size that is not a multiple
         # of `TILE_SIZE_B` was affected, which includes the final partial batch of an ordinary epoch.
         #
-        # The guard at the dispatch site only routed `batch < 16` to the sparse kernel, so the general
-        # case stayed live. It went unnoticed because every batch size in the consistency tests
+        # The guard at the dispatch site (then `batch < 16`) only routed small batches to the sparse
+        # kernel, so the general case stayed live. It went unnoticed because every batch size in the consistency tests
         # (1, 2, 3, 4, 6, 8, 16) is SMALLER than `TILE_SIZE_B`, which is one masked tile and correct.
         #
         # The extra tile is only safe because the kernels re-mask the batch each iteration AND read
