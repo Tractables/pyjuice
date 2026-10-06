@@ -1105,6 +1105,13 @@ def _dense_worth_it(layer, kwargs):
 
     All of this is host-side arithmetic: no device sync, and no index build for cases we then reject.
 
+    That work ratio is only the DEFAULT, though -- the answer before a shape has been measured, and with
+    autotuning off. It prices a random scattered atomic the same as a coalesced dense op, while the
+    first costs ~9x more here, and it has no term for the index build's fixed cost per group. Both
+    errors are large. MEASURED fwd+bwd, CoDD PC (tied, 32 vars, 1024 latents, 126464 cats, k=1024): at
+    batch 1-4 it picks scattered, at 10.7-30.9 ms, while dense takes 5.5-5.9 ms. Yet for an untied
+    8-var model at batch 1, dense is SLOWER (8.0 vs 4.6 ms: an index build per group). So whenever the
+    backward can measure, both sides are timed once per shape and the choice is cached (`_dense_choice`).
     """
     tot_num_cats = layer.nodes[0].dist.num_cats
     lnn = layer._output_ind_range[1] - layer._output_ind_range[0]
@@ -1134,7 +1141,74 @@ def _dense_worth_it(layer, kwargs):
     dense_ops = num_groups * num_latents * uniq_est
     scattered_ops = lnn * batch_size * num_k
 
-    return dense_ops < 0.6 * scattered_ops
+    return _dense_choice(layer, kwargs, dense_ops < 0.6 * scattered_ops,
+                         (lnn, ext_num_vars, batch_size, num_k, tot_num_cats, num_groups))
+
+
+def _dense_choice(layer, kwargs, default, shape):
+    """Dense or scattered, by measurement where possible (see the end of `_dense_worth_it`).
+
+    The choice is keyed by SHAPE and cached process-wide in the launch autotuner, so the forward and the
+    backward of every later step, and every layer of the same shape, follow it. It can only be MEASURED
+    in a backward: that is where both sides run (they accumulate the parameter flows and the evidence
+    gradient, so they are timed into scratch), and where the input layer hands over the kernels' shared
+    launch arguments (`_bk_launch_common`). Until then -- the first forward of a shape, a forward-only
+    caller, autotuning off -- the work-ratio `default` decides. Like every tuned choice, the two sides
+    agree only to rounding (~6e-5 relative here), so which one won is part of the numerics.
+
+    The key carries the dual-flow flag (the backward does different work with and without it) but not
+    whether an evidence gradient is requested, so the forward -- which never has one -- finds the
+    backward's answer."""
+    from pyjuice.layer.kernels import autotune
+
+    key = ("softevi_dense_vs_scattered",) + tuple(shape) + (bool(kwargs.get("dual_flow_backward", False)),)
+    choice = autotune.cached(key)
+    if choice is not None:
+        return choice
+    common = kwargs.get("_bk_launch_common", None)
+    if common is None or not autotune.should_tune(key, 2):
+        return default
+    return _tune_dense_choice(layer, kwargs, common, key, default)
+
+
+def _tune_dense_choice(layer, kwargs, common, key, default):
+    """Time the dense backward (index build + prologue + expected-flow kernel) against the scattered one
+    (`bk_softevi_kernel`), both into scratch, and cache the winner under `key`."""
+    from pyjuice.layer.kernels import autotune
+
+    if _build_dense_index(layer, kwargs) is None:
+        return False                                   # the dense side cannot run here at all
+
+    grad = kwargs.get("categorical_evidence_logp_grad", None)
+    pf_scr = autotune.scratch_like(layer.param_flows)
+    grad_scr = autotune.scratch_like(_grad_scratch(layer, grad)) if grad is not None else None
+    if pf_scr is None or (grad is not None and grad_scr is None):
+        return default                                 # no room to benchmark: leave it untuned
+
+    dist = layer.dist
+    kw = dict(kwargs, batch_size = common["batch_size"])
+    base = dict(common, param_flows_ptr = pf_scr)
+
+    def launch(kernel, prep):
+        target, grid = prep(layer, kw)
+        if grad_scr is not None:
+            target["categorical_evidence_logp_grad_ptr"] = grad_scr
+        kernel[grid](**base, **target)
+
+    def run(use_dense):
+        if use_dense:
+            # Charge the index build to this side: in steady state each step builds it once, and only
+            # when dense is in use (the forward shares it).
+            layer._dense_index_cache = None
+            launch(dist.bk_dense_prologue_kernel, _prep_args_bk_dense_prologue)
+            launch(dist._dense_denom_dispatch, _prep_args_bk_dense_denom)
+        else:
+            launch(dist.bk_softevi_kernel, _prep_args_apply_bk_softevi_kernel)
+
+    try:
+        return autotune.pick(key, [default, not default], run)
+    finally:
+        del pf_scr, grad_scr
 
 
 def _dense_scratch(layer, ext_num_vars, batch_size, num_latents):
@@ -1758,6 +1832,9 @@ class SoftEvidenceCategorical(Distribution):
             (self.fw_w_value_mask_kernel, _condition_apply_fw_w_value_mask_kernel, _prep_args_apply_fw_w_value_mask_kernel)
         ]
 
+        # Kept as an attribute: `_tune_dense_choice` launches it directly when timing dense vs scattered.
+        self._dense_denom_dispatch = _DenseDenomDispatch(self.bk_dense_denom_kernel)
+
         self.post_bp_fns = [
             (self.bk_params_kernel, _condition_apply_bk_params_kernel, _prep_args_apply_bk_params_kernel),
             (self.bk_softevi_kernel, _condition_apply_bk_softevi_kernel, _prep_args_apply_bk_softevi_kernel),
@@ -1765,7 +1842,7 @@ class SoftEvidenceCategorical(Distribution):
             # `bk_softevi_kernel` above, which stays the fallback for every other case). Order matters:
             # the prologue writes the ratio scratch that the denominator kernel reads.
             (self.bk_dense_prologue_kernel, _condition_bk_dense_prologue, _prep_args_bk_dense_prologue),
-            (_DenseDenomDispatch(self.bk_dense_denom_kernel), _condition_bk_dense_denom, _prep_args_bk_dense_denom),
+            (self._dense_denom_dispatch, _condition_bk_dense_denom, _prep_args_bk_dense_denom),
             # Last: only fires when the caller's evidence gradient is not float32 (see `_grad_scratch`).
             (_GradCastEpilogue(), _condition_grad_cast, _prep_args_grad_cast)
         ]

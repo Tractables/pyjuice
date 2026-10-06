@@ -44,10 +44,17 @@ def _evidence(B, V, K, device, seed = 1):
 
 
 def _topk_ids(B, V, K, num_cats, data, device, seed = 2):
+    """Candidate ids as `torch.topk` would give them: UNIQUE within a row, and containing the observed
+    token. Unique matters -- it is the kernels' documented precondition, and with a repeated id the
+    implementations legitimately disagree (the dense CUDA forward and the Triton forward differed by
+    3 nats here). This helper used to draw with `randint`, which repeated an id in every row; that went
+    unseen while both arms of a comparison ran the same forward."""
     torch.manual_seed(seed)
-    ids = torch.randint(0, num_cats, (B, V, K), device = device).long().sort(dim = 2)[0].contiguous()
-    ids[:, :, -1] = data      # the observed token must be among the candidates
-    return ids
+    ids = torch.stack([torch.randperm(num_cats, device = device)[:K] for _ in range(B * V)]).view(B, V, K)
+    obs = data.view(B, V)
+    missing = ~(ids == obs.unsqueeze(-1)).any(dim = -1)
+    ids[:, :, -1] = torch.where(missing, obs, ids[:, :, -1])   # the observed token must be a candidate
+    return ids.sort(dim = 2)[0].long().contiguous()
 
 
 @pytest.mark.parametrize("has_topk", [False, True])
@@ -154,15 +161,22 @@ def test_no_nan_with_a_partially_padded_batch_tile(batch_size):
     assert torch.isfinite(pf).all(), "non-finite param_flows with a padded batch tile"
 
 
-def _dense_setup(monkeypatch, use_dense, dual_flow = True, with_grad = False):
+def _dense_setup(monkeypatch, use_dense, dual_flow = True, with_grad = False, force = True):
     """The dense top-k path only engages when the parameter table overflows L2 and the emissions are tied
-    across variables, so shrink the L2 figure it gates on instead of building a multi-GB model."""
+    across variables, so shrink the L2 figure it gates on instead of building a multi-GB model.
+
+    With `use_dense` the dense path is also FORCED (`force`): past the structural checks, dense vs
+    scattered is a performance call -- a work-ratio guess, or a timed choice in the backward -- and a test
+    that means to exercise the dense kernels must not depend on how that call goes for a toy shape.
+    `force = False` leaves the real decision in place (for testing the decision itself)."""
     device = torch.device("cuda:0")
     S, L, C, B, K = 4, 8, 64, 4, 32
 
     monkeypatch.setattr(_softevi._l2_bytes, "_cached", 512, raising = False)
     if not use_dense:
         monkeypatch.setattr(_softevi, "_DENSE_TOPK_BACKWARD", False)
+    elif force:
+        monkeypatch.setattr(_softevi, "_dense_worth_it", lambda layer, kwargs: True)
 
     pc = _build(S, L, C, dual_flow = dual_flow, homogeneous = True)
     layer = pc.input_layer_group[0]
@@ -175,8 +189,9 @@ def _dense_setup(monkeypatch, use_dense, dual_flow = True, with_grad = False):
     probe = dict(kw, dual_flow_backward = dual_flow)
     if with_grad:
         probe["categorical_evidence_logp_grad"] = torch.zeros_like(kw["categorical_evidence_logp"])
-    assert _softevi._dense_topk_applicable(layer, probe) == use_dense, \
-        f"expected dense={use_dense}, got the other path"
+    if force or not use_dense:
+        assert _softevi._dense_topk_applicable(layer, probe) == use_dense, \
+            f"expected dense={use_dense}, got the other path"
 
     return pc, layer, data, kw, (S, L, C, B)
 
@@ -227,6 +242,40 @@ def _grad_step(pc, data, mask, **kw):
     grad = torch.zeros_like(kw["categorical_evidence_logp"])
     pc.backward(data, allow_modify_flows = False, logspace_flows = True, categorical_evidence_logp_grad = grad, **kw)
     return pc.input_layer_group[0].param_flows.clone(), grad
+
+
+@pytest.mark.parametrize("dual_flow", [True, False])
+def test_timed_dense_choice_benchmarks_into_scratch(dual_flow):
+    """Dense vs scattered is timed on the first backward of a shape (`_tune_dense_choice`). Both sides
+    ACCUMULATE into the parameter flows and the evidence gradient, so the timing runs must go to scratch:
+    one that leaked into the live buffers would add each side's contribution ~20 more times. Checked
+    against the same step with tuning off. The two may pick different sides, which agree only to
+    rounding, hence a tolerance rather than equality."""
+    from pyjuice.layer.kernels import autotune
+
+    out = {}
+    saved = (autotune.ENABLED, dict(autotune._CACHE))
+    try:
+        for tuned in (False, True):
+            autotune.ENABLED = tuned
+            autotune._CACHE.clear()
+            with pytest.MonkeyPatch.context() as mp:
+                pc, layer, data, kw, (S, L, C, B) = _dense_setup(mp, True, dual_flow = dual_flow, with_grad = True,
+                                                                 force = False)
+                out[tuned] = _grad_step(pc, data, None, **kw)
+                if tuned:
+                    keys = [k for k in autotune._CACHE if k[1][0] == "softevi_dense_vs_scattered"]
+                    assert keys, "the backward did not time dense vs scattered"
+    finally:
+        autotune.ENABLED = saved[0]
+        autotune._CACHE.clear()
+        autotune._CACHE.update(saved[1])
+
+    (pf_t, g_t), (pf_u, g_u) = out[True], out[False]
+    assert torch.allclose(pf_t, pf_u, rtol = 1e-4, atol = 1e-6), \
+        f"param flows changed by tuning (max abs diff {float((pf_t - pf_u).abs().max()):.3e})"
+    assert torch.allclose(g_t, g_u, rtol = 1e-4, atol = 1e-6), \
+        f"evidence gradient changed by tuning (max abs diff {float((g_t - g_u).abs().max()):.3e})"
 
 
 @pytest.mark.parametrize("dual_flow", [True, False])

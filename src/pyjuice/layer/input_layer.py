@@ -645,6 +645,35 @@ class InputLayer(Layer, nn.Module):
             kwargs["_missing_mask_mode"] = missing_mask_mode
             kwargs["_missing_mask_num_vars"] = num_vars if num_vars is not None else 0
 
+            # The launch arguments every post-processing kernel shares. Also handed to the distribution
+            # (as `_bk_launch_common`) so it can time alternative kernel sets against each other into
+            # scratch buffers before committing to one -- see `SoftEvidenceCategorical`'s
+            # `_dense_worth_it`.
+            bk_launch_common = dict(
+                params_ptr = self.params,
+                param_flows_ptr = self.param_flows,
+                node_flows_ptr = node_flows,
+                node_mars_ptr = node_mars,
+                data_ptr = data,
+                vids_ptr = self.vids,
+                s_pids_ptr = self.s_pids,
+                s_pfids_ptr = self.s_pfids,
+                metadata_ptr = self.metadata,
+                s_mids_ptr = self.s_mids,
+                nids_ptr = self.nids,
+                bk_local_ids_ptr = bk_local_ids,
+                layer_num_nodes = layer_num_nodes,
+                batch_size = batch_size,
+                num_vars_per_node = self.num_vars_per_node,
+                num_vars = num_vars,
+                nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
+                node_offset = node_offset,
+                partial_eval = 1 if bk_local_ids is not None else 0,
+                logspace_flows = logspace_flows,
+                num_warps = 8,
+            )
+            kwargs["_bk_launch_common"] = bk_launch_common
+
             for (kernel, cond_fn, prep_kwargs_fn) in self.post_bp_fns:
                 if not cond_fn(self, kwargs):
                     continue
@@ -655,30 +684,9 @@ class InputLayer(Layer, nn.Module):
                 if grid is None:
                     grid = (triton.cdiv(layer_num_nodes * batch_size, target_kwargs["BLOCK_SIZE"]),)
 
-                kernel[grid](
-                    params_ptr = self.params,
-                    param_flows_ptr = self.param_flows,
-                    node_flows_ptr = node_flows, 
-                    node_mars_ptr = node_mars,
-                    data_ptr = data, 
-                    vids_ptr = self.vids, 
-                    s_pids_ptr = self.s_pids,
-                    s_pfids_ptr = self.s_pfids,
-                    metadata_ptr = self.metadata, 
-                    s_mids_ptr = self.s_mids, 
-                    nids_ptr = self.nids,
-                    bk_local_ids_ptr = bk_local_ids,
-                    layer_num_nodes = layer_num_nodes, 
-                    batch_size = batch_size, 
-                    num_vars_per_node = self.num_vars_per_node, 
-                    num_vars = num_vars,
-                    nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
-                    node_offset = node_offset,
-                    partial_eval = 1 if bk_local_ids is not None else 0,
-                    logspace_flows = logspace_flows,
-                    num_warps = 8,
-                    **target_kwargs
-                )
+                kernel[grid](**bk_launch_common, **target_kwargs)
+
+            kwargs.pop("_bk_launch_common", None)
 
             # Handle the masked input nodes
             if missing_mask is not None and self.bk_flow_mask_fn is not None:
