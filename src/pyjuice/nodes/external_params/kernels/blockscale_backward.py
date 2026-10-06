@@ -124,7 +124,8 @@ def _bs_triton_ele_kernel(node_flows, element_flows, node_mars, element_mars, mp
             if TL_DOT == 1:
                 partial_flows = tl.dot(epars, nsub_g)
             else:
-                partial_flows = tl.sum(epars[:,:,None] * nsub_g[None,:,:], axis = 1)
+                # axis-0 form on purpose -- see `_BROADCAST_SUM_NOTE` in pyjuice/layer/kernels/__init__.py
+                partial_flows = tl.sum(tl.trans(epars)[:,:,None] * nsub_g[:,None,:], axis = 0)
 
             # The gate of THIS group's parent block, one value per (child gate, sample). `-1` means
             # the parent block and this child block are not connected; the `-inf` it produces drops
@@ -292,7 +293,15 @@ def _bs_triton_par_kernel(node_flows, node_mars, element_mars, mparams, param_fl
                        mask = mask_batch[:,None] & ghas[None,:], other = 0.0)
         emars = tl.where(ghas[None,:], emars + lphi, -float("inf"))
 
-        nmars = tl.load(nmars_ptr, mask = mask_batch[None,:], other = 0.0)
+        # `-inf` on a masked-out BATCH lane, not 0.0 -- the same requirement as the ungated
+        # `sum_backward_param_block_sparse` kernels, and for the same reason. `B_NUM_TILES` is
+        # `cdiv(batch, TILE_SIZE_B)`, so the last tile is partial whenever the batch does not divide
+        # evenly; with `other = 0.0` such a lane gets `log_n_fdm = 0 - 0 = 0`, hence `n_fdm_sub = 1`
+        # and `scaled_emars = exp(0) = 1`, and contributes a spurious 1 to the dot for EVERY padded
+        # lane. MEASURED on this layer at `block_size = 8`, batch 96: the parameter flows came out
+        # 15.7x too large. `-inf` makes `log_n_fdm = -inf`, so the column's max is `-inf`,
+        # `n_fdm_sub = 0` and `scaled_emars = 0` -- an exact zero contribution.
+        nmars = tl.load(nmars_ptr, mask = mask_batch[None,:], other = -float("inf"))
         nflows = tl.load(nflows_ptr, mask = mask_batch[None,:], other = 0.0)
         log_n_fdm = tl.where(nmars == -float("inf"), -float("inf"), nflows - nmars)
 
@@ -304,7 +313,8 @@ def _bs_triton_par_kernel(node_flows, node_mars, element_mars, mparams, param_fl
         if TL_DOT == 1:
             acc += tl.dot(n_fdm_sub, scaled_emars)
         else:
-            acc += tl.sum(n_fdm_sub[:,:,None] * scaled_emars[None,:,:], axis = 1)
+            # axis-0 form on purpose -- see `_BROADCAST_SUM_NOTE` in pyjuice/layer/kernels/__init__.py
+            acc += tl.sum(tl.trans(n_fdm_sub)[:,:,None] * scaled_emars[:,None,:], axis = 0)
 
         emars_ptr += TILE_SIZE_B
         nmars_ptr += TILE_SIZE_B
@@ -342,7 +352,8 @@ def _bs_triton_phigrad_logz_kernel(node_flows, log_z, sigma, ext, gate, grad_ext
                                    batch_size: tl.constexpr, n_gates: tl.constexpr,
                                    N_CHILD_GATES: tl.constexpr, BLOCK_SIZE_M: tl.constexpr,
                                    BLOCK_B: tl.constexpr, GATE_TILE: tl.constexpr,
-                                   USE_DOT: tl.constexpr, gate_stride: tl.constexpr, ext_base):
+                                   USE_DOT: tl.constexpr, gate_stride: tl.constexpr, ext_base,
+                                   TILE_SIZE_M: tl.constexpr = 0):
     """
     The log-Z half of `d LL / d log phi`:
 
@@ -359,14 +370,27 @@ def _bs_triton_phigrad_logz_kernel(node_flows, log_z, sigma, ext, gate, grad_ext
     `log Z` comes free from the forward's cache; `sigma` is recomputed only when `params` changes.
     """
     pid_g = tl.program_id(0)
-    pid_nb = tl.program_id(1)
+    pid_y = tl.program_id(1)
     pid_b = tl.program_id(2)
+
+    # The NODE axis is tiled, and grid-y carries `(node block, node tile)`. Holding the whole block
+    # put `node_flows` and `log Z` -- `[BLOCK_SIZE_M, BLOCK_B]` each -- beyond shared memory once the
+    # block got wide: at `block_size = 2048` EVERY `(GATE_TILE, BLOCK_B)` candidate was refused
+    # (`Required: 139264, Hardware limit: 101376`), so a 2048-state HMM could not run its gate
+    # gradient at all, with or without `apply_z_correction`.
+    #
+    # Safe because the contraction reduces over the NODE axis: each tile produces a PARTIAL `out`, and
+    # the emission below is already `tl.atomic_add`. The shift `mx` is taken over `lphi`, which has no
+    # node index, so every tile shares it and the partial sums are commensurate.
+    M_TILES: tl.constexpr = BLOCK_SIZE_M // TILE_SIZE_M
+    pid_nb = pid_y // M_TILES
+    pid_m = pid_y % M_TILES
 
     offs_g = pid_g * GATE_TILE + tl.arange(0, GATE_TILE)
     mask_g = offs_g < n_gates
     offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B
     mask_batch = offs_batch < batch_size
-    offs_node = tl.arange(0, BLOCK_SIZE_M)
+    offs_node = pid_m * TILE_SIZE_M + tl.arange(0, TILE_SIZE_M)
 
     # loaded ONCE for the whole gate tile
     off_nids = tl.load(nids + pid_nb)
@@ -418,3 +442,172 @@ def _bs_triton_phigrad_logz_kernel(node_flows, log_z, sigma, ext, gate, grad_ext
     tl.atomic_add(grad_ext + row[:,None] * batch_size + offs_batch[None,:],
                   -tl.exp(lphi - mx) * out,
                   mask = mask_g[:,None] & mask_batch[None,:] & (gbase >= 0)[:,None])
+
+
+@triton_jit
+def _bs_triton_denom_w_kernel(node_flows, log_z, W, ext, gate, nids,
+                              batch_size: tl.constexpr, n_gates: tl.constexpr,
+                              TILE_SIZE_B: tl.constexpr, TILE_SIZE_G: tl.constexpr,
+                              TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr,
+                              NODE_CBS: tl.constexpr, GATE_CBS: tl.constexpr,
+                              gate_stride: tl.constexpr, ext_base,
+                              B_TILES_PER_PROG: tl.constexpr, USE_DOT: tl.constexpr = 1,
+                              DOT_IEEE: tl.constexpr = 1, W_ATOMIC: tl.constexpr = 0):
+    """
+    The whole of `F-`'s per-batch work: the contraction, done in GATE space.
+
+        W[n, g] += sum_b u[n,b] * phi[g,b],      u[n,b] = exp(node_flows[n,b] - log Z[n,b])
+
+    `theta[n,c]` has no batch index, so it leaves the batch sum entirely and
+
+        F-[n,c] = sum_b f_b[n] * theta_b[n,c] = theta[n,c] * W[n, g(c)]
+
+    `W` is therefore a SUFFICIENT accumulator for `F-`, and the only one the circuit stores:
+    `_bs_triton_denom_scatter_kernel` rebuilds `F-` from it once per EM step. That is both the memory
+    argument (`W` is `gate_cbs` times smaller than a per-edge `F-` -- MEASURED 240.0 MB -> 1.88 MB on a
+    2048-state gated HMM, 18.5% of peak training memory) and the traffic one: the contraction depends
+    only on the GATE, of which there are `num_edges / GATE_CBS`. The kernel this replaced contracted per
+    EDGE tile, repeating the same contraction for all `gate_cbs` edges sharing a gate -- MEASURED at
+    block_size 128 / 512 edges / batch 512, `node_flows` and `log Z` were re-read 16x, 32 MB of that
+    kernel's 38 MB, leaving it ~9x above its traffic floor. Here they are read once per GATE tile, and
+    the gate axis usually fits one tile (16 gates at that shape), so once in total.
+
+    `g(c) = c // GATE_CBS` exactly, because `NODE_CBS` is a multiple of `GATE_CBS`:
+    `(c // NODE_CBS) * (NODE_CBS // GATE_CBS) + (c % NODE_CBS) // GATE_CBS == c // GATE_CBS`.
+    The scatter uses that identity to find a gate without consulting the gate table at all.
+
+    THE SHIFT IS LOAD-BEARING. `phi` cannot ride inside the exponent, because the `[M, B]` operand has
+    no gate axis -- so `exp(log phi)` would overflow for any router logit past ~88, and a router logit is
+    unbounded. Each batch column is therefore shifted by the largest `log phi` over the tile's gates:
+
+        u[n,b] = exp(node_flows - log Z + mx[b]),   p[b,g] = exp(log phi[g,b] - mx[b])
+
+    The shift cancels exactly within each `W[n,g]`, so tiles need NOT agree on it, and both factors stay
+    bounded: `p <= 1`, and `log Z >= mx + log sigma` gives `node_flows - log Z + mx <= node_flows - log
+    sigma` (the bound `_bs_triton_phigrad_logz_kernel` also relies on). Where a tile's gates are all far
+    below the global maximum `u` underflows to 0, which is correct -- the true contribution is then
+    equally negligible.
+
+    A masked-out batch lane contributes an exact zero (both operands are zeroed), so a partial final
+    batch tile is safe; `B_NUM_TILES` is a `cdiv`.
+
+    Validated against the torch reference `BlockScaleSumParams._accumulate_denom_torch` and, end to end,
+    by a finite-difference check on `d LL / d log theta = F+ - F-`.
+    """
+    pid_y = tl.program_id(0)                       # (node block, node tile)
+    pid_g = tl.program_id(1)                       # which gate tile
+    pid_s = tl.program_id(2)                       # which slice of the batch reduction
+
+    M_TILES: tl.constexpr = BLOCK_SIZE_M // TILE_SIZE_M
+    nblock_id = pid_y // M_TILES
+    pid_m = pid_y % M_TILES
+    offs_node = pid_m * TILE_SIZE_M + tl.arange(0, TILE_SIZE_M)
+
+    offs_g = pid_g * TILE_SIZE_G + tl.arange(0, TILE_SIZE_G)
+    gmask = offs_g < n_gates
+    # The first edge carrying each gate is what locates it in the gate table.
+    c_rep = offs_g * GATE_CBS
+    gcol = c_rep // NODE_CBS
+    gbase = tl.load(gate + nblock_id * gate_stride + gcol,
+                    mask = gmask & (gcol < gate_stride), other = -1)
+    grow = gbase + ext_base + (c_rep % NODE_CBS) // GATE_CBS
+    ghas = (gbase >= 0) & gmask
+
+    off_nids = tl.load(nids + nblock_id)
+    offs_batch = pid_s * (B_TILES_PER_PROG * TILE_SIZE_B) + tl.arange(0, TILE_SIZE_B)
+    nf_ptr = node_flows + (off_nids + offs_node[:,None].to(tl.int64)) * batch_size + offs_batch[None,:]
+    lz_ptr = log_z + (nblock_id.to(tl.int64) * BLOCK_SIZE_M + offs_node[:,None]) * batch_size \
+             + offs_batch[None,:]
+
+    acc = tl.zeros([TILE_SIZE_M, TILE_SIZE_G], dtype = tl.float32)
+    for _ in range(B_TILES_PER_PROG):
+        mask_b = offs_batch < batch_size
+        nf = tl.load(nf_ptr, mask = mask_b[None,:], other = -float("inf"))      # [M, B]
+        lz = tl.load(lz_ptr, mask = mask_b[None,:], other = 0.0)                # [M, B]
+        lphi = tl.load(ext + grow[None,:] * batch_size + offs_batch[:,None],
+                       mask = mask_b[:,None] & ghas[None,:], other = -float("inf"))   # [B, G]
+
+        mx = tl.max(lphi, axis = 1)                                             # [B]
+        mx = tl.where(mx == -float("inf"), 0.0, mx)
+        u = tl.where(mask_b[None,:], tl.exp(nf - lz + mx[None,:]), 0.0)         # [M, B]
+        p = tl.where(mask_b[:,None] & ghas[None,:], tl.exp(lphi - mx[:,None]), 0.0)   # [B, G]
+
+        if USE_DOT:
+            if DOT_IEEE:
+                acc += tl.dot(u, p, input_precision = "ieee")
+            else:
+                acc += tl.dot(u, p)
+        else:
+            # axis-0 form on purpose -- see `_BROADCAST_SUM_NOTE` in pyjuice/layer/kernels/__init__.py
+            acc += tl.sum(tl.trans(u)[:,:,None] * p[:,None,:], axis = 0)
+
+        offs_batch += TILE_SIZE_B
+        nf_ptr += TILE_SIZE_B
+        lz_ptr += TILE_SIZE_B
+
+    wptr = W + (nblock_id * BLOCK_SIZE_M + offs_node)[:,None] * n_gates + offs_g[None,:]
+    # ACCUMULATE, never store: `W` is the PC's persistent denominator buffer, so several mini-batches
+    # may feed one EM step. Several batch slices also hold PARTIAL sums for the same `W[n,g]`, and only
+    # then does the combine have to be atomic -- with one slice each `(n,g)` belongs to exactly one
+    # program, so the cheaper read-add-write is safe.
+    if W_ATOMIC:
+        tl.atomic_add(wptr, acc, mask = gmask[None,:])
+    else:
+        tl.store(wptr, tl.load(wptr, mask = gmask[None,:], other = 0.0) + acc, mask = gmask[None,:])
+
+
+@triton_jit
+def _bs_triton_denom_scatter_kernel(W, mparams, out, cids, pids, pfids,
+                                    num_edges: tl.constexpr, n_gates: tl.constexpr,
+                                    TILE_SIZE_K: tl.constexpr, TILE_SIZE_M: tl.constexpr,
+                                    BLOCK_SIZE_M: tl.constexpr, GATE_CBS: tl.constexpr,
+                                    pf_base, out_size, PF_ATOMIC: tl.constexpr = 0):
+    """
+    Reconstruct `F-[n,c] = theta[n,c] * W[n, g(c)]` and scatter it at the edge's `pfid`.
+
+    Runs ONCE PER EM STEP (from `compute_em_correction`), not once per backward: the batch dependence
+    lives entirely in `W`, so this has no batch axis at all -- it streams `theta`, gathers from the
+    (tiny, cache-resident) `W`, and writes `out`. `g(c) = c // GATE_CBS` (see
+    `_bs_triton_denom_w_kernel`), so the gate table is not consulted again and no gate arithmetic is
+    repeated per edge.
+
+    `out` is one `ns`'s slice of the param-flow space, and `pf_base` / `out_size` are its `pfid` range:
+    the write goes to `pfid - pf_base`, masked to `[0, out_size)`. That is what keeps the peak at ONE
+    node's worth of `F-` rather than the whole PC's, and it is also how a tie group is summed -- each
+    member is scattered with its OWN `pf_base` into the same buffer, since the members' `pfids` are the
+    same layout at different offsets.
+
+    A padded edge (`cids == 0`, the dummy child) has `pfids == 0`, a slot a REAL edge owns, so it is
+    masked out of the write rather than storing a zero into someone else's slot.
+    """
+    pid_k = tl.program_id(0)
+    pid_y = tl.program_id(1)
+
+    M_TILES: tl.constexpr = BLOCK_SIZE_M // TILE_SIZE_M
+    nblock_id = pid_y // M_TILES
+    pid_m = pid_y % M_TILES
+    offs_node = pid_m * TILE_SIZE_M + tl.arange(0, TILE_SIZE_M)
+    offs_edge = pid_k * TILE_SIZE_K + tl.arange(0, TILE_SIZE_K)
+    emask = offs_edge < num_edges
+
+    cid = tl.load(cids + nblock_id * num_edges + offs_edge, mask = emask, other = 0)
+    real = emask & (cid != 0)
+
+    gidx = offs_edge // GATE_CBS
+    w = tl.load(W + (nblock_id * BLOCK_SIZE_M + offs_node)[:,None] * n_gates + gidx[None,:],
+                mask = emask[None,:] & (gidx < n_gates)[None,:], other = 0.0)    # [M, K]
+
+    par = tl.load(pids + nblock_id * num_edges + offs_edge, mask = emask, other = 0)
+    theta = tl.load(mparams + par[None,:] + offs_node[:,None], mask = emask[None,:], other = 0.0)
+
+    pf = tl.load(pfids + nblock_id * num_edges + offs_edge, mask = emask, other = 0)
+    # Rebase into `out` and mask to it. A partition may hold node blocks of SEVERAL `ns`, and only the
+    # one being reconstructed belongs here; the others land outside `[0, out_size)` and are dropped.
+    # The offset is clamped as well as masked, so an out-of-range lane never forms a wild address.
+    off = pf[None,:] + offs_node[:,None] - pf_base
+    inside = real[None,:] & (off >= 0) & (off < out_size)
+    ptr = out + tl.maximum(tl.minimum(off, out_size - 1), 0)
+    if PF_ATOMIC:
+        tl.atomic_add(ptr, theta * w, mask = inside)
+    else:
+        tl.store(ptr, tl.load(ptr, mask = inside, other = 0.0) + theta * w, mask = inside)

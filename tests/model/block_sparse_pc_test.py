@@ -15,8 +15,9 @@ import pytest
 
 
 def test_block_sparse_pc():
-    
+
     device = torch.device("cuda:0")
+    torch.manual_seed(3890)
 
     num_node_blocks = 4
     batch_size = 512
@@ -105,9 +106,12 @@ def test_block_sparse_pc():
         ref_np1_flows = element_flows[block_size*(num_node_blocks+1):block_size*(num_node_blocks*2+1),:].reshape(num_node_blocks, block_size, batch_size)
         ref_np2_flows = element_flows[block_size*(num_node_blocks*2+1):block_size*(num_node_blocks*3+1),:].reshape(num_node_blocks, block_size, batch_size)
 
-        assert torch.all(torch.abs(np0_flows - ref_np0_flows) < 1e-3)
-        assert torch.all(torch.abs(np1_flows - ref_np1_flows) < 1e-3)
-        assert torch.all(torch.abs(np2_flows - ref_np2_flows) < 1e-3)
+        # RELATIVE, like the param-flow check below. At block_size 16 the element flows come from the
+        # tensor-core (TF32) dot, whose error is relative: measured ~2.2e-4..2.6e-4 of the flow on every
+        # topology. Their magnitude is set by the random topology, though (max 5 on one seed, 11 on
+        # another), so an absolute 1e-3 bar failed whenever a flow exceeded ~6 -- about 1 seed in 40.
+        for ours, ref in ((np0_flows, ref_np0_flows), (np1_flows, ref_np1_flows), (np2_flows, ref_np2_flows)):
+            assert torch.all(torch.abs(ours - ref) <= 1e-3 * ours.abs() + 1e-6)
 
         param_flows = param_flows.reshape(edge_ids.size(1), block_size, block_size).permute(0, 2, 1)
 

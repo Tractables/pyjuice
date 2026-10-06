@@ -187,6 +187,35 @@ class ExternalParamsSumLayer(SumLayer):
         # owned and moved by this layer rather than by the (shared, stateless) descriptor.
         self.external_params.compile(self)
 
+    @property
+    def requests_denom_param_flows(self) -> bool:
+        """Delegated to the descriptor: a gated M-step may need the denominator flow `F-`."""
+        return self.external_params.requests_denom_param_flows
+
+    def assign_denom_flow_offsets(self, base: int) -> int:
+        """
+        Carve this layer's slices out of the PC's denominator flow buffer, starting at `base`, and
+        return the next free offset.
+
+        Called once at compile time by the PC, which lays the layers out end to end so the whole
+        denominator is ONE flat tensor -- that is what lets `init_param_flows` scale it and
+        `sync_param_flows` all-reduce it with a single op, exactly as for `param_flows`. The sizes come
+        from the descriptor (:func:`ExternalSumParams.denom_flow_sizes`), which owns the layout inside
+        each slice; the layer only owns where the slices sit. Leaves `self.denom_flow_slices` --
+        `(offset, size)` per forward partition -- for the descriptor's kernels to slice with.
+        """
+        sizes = list(self.external_params.denom_flow_sizes(self))
+        assert len(sizes) == self.num_fw_partitions, \
+            f"`denom_flow_sizes` returned {len(sizes)} sizes for {self.num_fw_partitions} forward " \
+            f"partitions of {self}."
+
+        self.denom_flow_slices = []
+        for size in sizes:
+            self.denom_flow_slices.append((base, int(size)))
+            base += int(size)
+
+        return base
+
     def register_external_buffers(self, name: str, tensors: Sequence[torch.Tensor]) -> None:
         """
         Register one compile-time tensor per `ns`, in `self.external_node_infos` order, under `name`.
@@ -559,6 +588,7 @@ class ExternalParamsSumLayer(SumLayer):
     def backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor,
                  node_mars: torch.Tensor, element_mars: torch.Tensor,
                  params: torch.Tensor, param_flows: Optional[torch.Tensor] = None,
+                 denom_param_flows: Optional[torch.Tensor] = None,
                  propagation_alg: str = "LL", **kwargs) -> None:
         """
         Backward pass. The descriptor is given a chance to prepare the buffers so that the *standard*
@@ -603,7 +633,8 @@ class ExternalParamsSumLayer(SumLayer):
             self.external_params.post_backward_layer(
                 self, ns_tensors, ns_grad_tensors,
                 node_flows, element_flows, node_mars, element_mars, params,
-                param_flows = param_flows, propagation_alg = propagation_alg, **kwargs
+                param_flows = param_flows, denom_param_flows = denom_param_flows,
+                propagation_alg = propagation_alg, **kwargs
             )
         finally:
             # A parameterization may redirect the standard backward's CUDA kernels at its own for the

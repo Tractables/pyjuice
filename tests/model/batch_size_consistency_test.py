@@ -570,8 +570,14 @@ def test_edge_trim_block_sparse_bit_identical():
     the pow2 padding adds. On the Triton path with a small block size (no bf16 tensor-core dot) it must
     be exactly bit-identical to the untrimmed result -- forward LL AND accumulated parameter flows.
     HCLT (block_size 32, fan-in 160 -> padded to 256) genuinely triggers the trim (asserted).
+
+    Launch tuning is OFF for the duration: trimmed and untrimmed launches have different shape keys, so
+    each is tuned on its own, and tile candidates agree only to reduction order (~1e-7, see
+    `autotune.pick`). Bit-identity is a property of the trim at a FIXED configuration -- MEASURED: with
+    tuning on, one run in five differed at batch 1; with it off, 6 of 6 identical.
     """
     import pyjuice.layer.sum_layer as sl
+    from pyjuice.layer.kernels import autotune
 
     device = torch.device("cuda:0")
     torch.manual_seed(160)
@@ -584,11 +590,13 @@ def test_edge_trim_block_sparse_bit_identical():
     assert _trim_fires(pc), "edge trim did not fire on HCLT-160 (the test would be vacuous)"
 
     saved = (sl.FORWARD_SUM_CUDA, sl.BACKWARD_ELE_FLOW_CUDA, sl.BACKWARD_PAR_FLOW_CUDA, sl._BLOCK_SPARSE_EDGE_TRIM)
+    saved_tune = autotune.ENABLED
     try:
         # CUDA off -> the exact Triton path (the CUDA kernels are only numerically equivalent).
         # batch 64 (>= _GAP_BATCH_MAX) exercises the BACKWARD_PAR_FLOW_TUNED path, which doubles
         # TILE_SIZE_K -- so the trim is checked against a changed tile size too.
         sl.FORWARD_SUM_CUDA = sl.BACKWARD_ELE_FLOW_CUDA = sl.BACKWARD_PAR_FLOW_CUDA = False
+        autotune.ENABLED = False
         for batch_size in [1, 2, 8, 16, 64]:
             data = torch.randint(0, 256, [batch_size, 16], device = device)
 
@@ -608,6 +616,7 @@ def test_edge_trim_block_sparse_bit_identical():
             assert torch.equal(pf_trim, pf_full), f"edge-trim param flows not bit-identical at batch={batch_size}"
     finally:
         sl.FORWARD_SUM_CUDA, sl.BACKWARD_ELE_FLOW_CUDA, sl.BACKWARD_PAR_FLOW_CUDA, sl._BLOCK_SPARSE_EDGE_TRIM = saved
+        autotune.ENABLED = saved_tune
 
 
 def test_edge_trim_cuda_matches_sparse():
@@ -672,9 +681,351 @@ def test_edge_trim_cuda_matches_sparse():
         sl.FORWARD_SUM_CUDA, sl.BACKWARD_ELE_FLOW_CUDA, sl.BACKWARD_PAR_FLOW_CUDA, sl._BLOCK_SPARSE_EDGE_TRIM = saved
 
 
+def _partial_tile_pc(device, block_size = 32, num_node_blocks = 4, num_cats = 8):
+    """A PC whose inner sum layer has `block_size = 32` / `num_edges = 128`, which makes the
+    block-sparse parameter-flow launcher pick `TILE_SIZE_B = 64`. Returns `(pc, ns, layer)`."""
+    from pyjuice.nodes import inputs, multiply, summate
+    import pyjuice.nodes.distributions as dists
+
+    torch.manual_seed(0)
+    with juice.set_block_size(block_size):
+        ins = [inputs(v, num_node_blocks = num_node_blocks,
+                      dist = dists.Categorical(num_cats = num_cats)) for v in range(4)]
+        s0 = summate(multiply(ins[0], ins[1]), num_node_blocks = num_node_blocks)
+        s1 = summate(multiply(ins[2], ins[3]), num_node_blocks = num_node_blocks)
+        ns = summate(multiply(s0, s1), num_node_blocks = num_node_blocks)
+        root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
+    root.init_parameters(perturbation = 2.0)
+    pc = juice.compile(root, verbose = False).to(device)
+
+    layer = None
+    for g in pc.inner_layer_groups:
+        for l in g.layers:
+            if hasattr(l, "partitioned_pfids") and getattr(l, "nodes", None) and ns in l.nodes:
+                layer = l
+    assert layer is not None
+    return pc, ns, layer
+
+
+def _node_flow_conservation(pc, ns, layer):
+    """`max_n | sum_c F+[n,c] / sum_b f_b[n] - 1 |`, summed over every partition.
+
+    A sum node's posterior flows split its own flow across its children exactly
+    (`sum_c P(c|n,b) == 1`), so this is 0 up to floating point -- and it needs no reference
+    implementation, which is what makes it a usable regression bar.
+
+    Reads `node_flows` as the true log flow, which requires `allow_modify_flows = False`
+    (otherwise the backward overwrites it in place with the `log f - log m` form).
+    """
+    bs = ns.block_size
+    ar = torch.arange(bs, device = pc.param_flows.device)
+    parts = range(len(layer.partitioned_pfids))
+    gmin = min(int(layer.partitioned_nids[p].min()) for p in parts)
+    n_nodes = ns.num_node_blocks * bs
+    got = torch.zeros(n_nodes, device = pc.param_flows.device, dtype = torch.float64)
+    want = torch.zeros_like(got)
+    for p in parts:
+        pfids, cids = layer.partitioned_pfids[p], layer.partitioned_cids[p]
+        nids = layer.partitioned_nids[p].long()
+        rows, E = pfids.shape
+        idx = (pfids[:, None, :] + ar[None, :, None]).long()
+        real = (cids != 0)[:, None, :].expand(rows, bs, E)
+        loc = (nids[:, None] + ar[None, :] - gmin).reshape(-1)
+        got.index_add_(0, loc, (pc.param_flows[idx].double() * real).sum(-1).reshape(-1))
+        gid = (nids[:, None] + ar[None, :]).reshape(-1)
+        want.index_add_(0, loc, pc.node_flows[gid].double().exp().sum(-1))
+    keep = want.abs() > 1e-8
+    assert bool(keep.any())
+    return ((got - want).abs()[keep] / want.abs()[keep]).max().item()
+
+
+def test_param_flows_include_the_final_partial_batch_tile():
+    """
+    Regression: the block-sparse parameter-flow backward silently DROPPED the trailing
+    `batch_size % TILE_SIZE_B` samples.
+
+    `SumLayer._backward_block_sparse_par_flows` contracted the batch into
+    `B_NUM_TILES = batch_size // TILE_SIZE_B` tiles -- floor, not ceil -- so the kernel's batch
+    loop never visited the final partial tile and those samples contributed no parameter flow at
+    all. MEASURED on this layer (`TILE_SIZE_B = 64`): batch 100 lost 36% of the flow, batch 300
+    lost 15%, batch 1000 lost 4%; on a `block_size = 8` layer batches of 33/40/48 lost ALL of it
+    (floor gave zero tiles). The dispatch site only special-cased `batch < 16`, so every larger
+    non-multiple stayed broken -- including the final partial batch of an ordinary epoch.
+
+    It survived because it is invisible wherever `batch_size % TILE_SIZE_B == 0`: `TILE_SIZE_B`
+    is a power of two, benchmark batch sizes are powers of two, and every batch size in the other
+    tests here (1, 2, 3, 4, 6, 8, 16) is SMALLER than `TILE_SIZE_B`, i.e. one fully masked tile,
+    which was always correct. So the batch sizes below are deliberately chosen to be multiples of
+    NO plausible tile size (100, 300, 1000 are not multiples of 16, 32 or 64).
+
+    Checked with the reference-free conservation identity rather than against another batch size,
+    so the test cannot be satisfied by two paths being wrong in the same way.
+    """
+    device = torch.device("cuda:0")
+    pc, ns, layer = _partial_tile_pc(device)
+
+    torch.manual_seed(3)
+    worst = {}
+    for batch_size in [64, 100, 128, 300, 512, 1000]:
+        x = torch.randint(0, 8, [batch_size, 4], device = device)
+        pc(x)
+        pc.backward(x, logspace_flows = True, flows_memory = 0.0, allow_modify_flows = False)
+        worst[batch_size] = _node_flow_conservation(pc, ns, layer)
+
+    # The fp32 accumulation floor on this layer is ~1e-3; the bug was 4%-36%, so 5e-3 separates
+    # them cleanly without being sensitive to the (TF32) dot's precision.
+    for batch_size, rel in worst.items():
+        assert rel < 5e-3, \
+            f"parameter flows do not conserve node flow at batch_size={batch_size} " \
+            f"(relmax={rel:.4f}); the final partial batch tile is being dropped. All: {worst}"
+
+
+def test_param_flows_invariant_to_batch_chunking():
+    """
+    The same pool of samples must give the same total parameter flows however it is CHUNKED --
+    the user-facing form of the partial-tile bug above, and the thing that silently biased EM
+    whenever the dataset size was not a multiple of the batch size.
+
+    Every chunk size divides the pool, so the accumulated totals are comparable. Chunk sizes
+    96/120/160/480 are NOT multiples of `TILE_SIZE_B = 64` and each dropped a different number of
+    trailing samples before the fix, so they disagreed with each other and with the aligned 64.
+
+    Compared with a tolerance, NOT bit-identity: the parameter-flow kernels accumulate through
+    `tl.atomic_add`, whose ordering varies between runs, so this layer is not bitwise reproducible
+    at larger batch (MEASURED: identical source, different sha1 at batch 256 and 512).
+    """
+    device = torch.device("cuda:0")
+    pc, ns, layer = _partial_tile_pc(device)
+
+    n_pool = 960
+    torch.manual_seed(5)
+    data = torch.randint(0, 8, [n_pool, 4], device = device)
+
+    def accumulate(chunk):
+        for i, s in enumerate(range(0, n_pool, chunk)):
+            x = data[s:s + chunk].contiguous()
+            pc(x)
+            pc.backward(x, logspace_flows = True, allow_modify_flows = False,
+                        flows_memory = 0.0 if i == 0 else 1.0)
+        torch.cuda.synchronize()
+        return pc.param_flows.clone()
+
+    ref = accumulate(64)                      # 960 = 15 * 64, an exact number of tiles
+    assert torch.isfinite(ref).all() and ref.abs().sum() > 0
+
+    # PER-ELEMENT relative error, over the entries that carry real mass. Normalising by the GLOBAL
+    # max instead (`(got-ref).max() / ref.max()`) hides the defect: the root layer's flows are ~1e3
+    # while this layer's are ~1, so dropping half of a sum layer's flow showed up as 9e-3 and only
+    # just cleared the bar. Elementwise, the same run reads ~0.4.
+    def relerr(got):
+        keep = ref.abs() > 1e-6 * ref.abs().max()
+        return float(((got - ref).abs()[keep] / ref.abs()[keep]).max())
+
+    # 120 and 240 are the discriminating chunk sizes: the large-batch launch tuning resets
+    # `TILE_SIZE_B` to 32 whenever `batch_size % 32 == 0`, which accidentally re-aligns 96/160/480/960,
+    # so those cannot see the bug. 120 % 64 = 56 and 240 % 64 = 48 keep a genuinely partial tile.
+    for chunk in [96, 120, 160, 240, 480, 960]:
+        assert n_pool % chunk == 0
+        got = accumulate(chunk)
+        assert torch.isfinite(got).all(), f"non-finite parameter flows at chunk={chunk}"
+        rel = relerr(got)
+        assert rel < 5e-3, \
+            f"total parameter flows depend on the batch chunking (chunk={chunk} vs 64, relmax={rel:.4f})"
+
+
+def _deep_hmm(device):
+    torch.manual_seed(11)
+    ns = juice.structures.GeneralizedHMM(
+        seq_length = 32, num_latents = 256, homogeneous = True,   # 32 sum layers, block_size 256
+        input_dist = juice.distributions.Categorical(num_cats = 16)
+    )
+    ns.init_parameters(perturbation = 2.0)
+    pc = juice.compile(ns)
+    pc.to(device)
+    return pc
+
+
+@pytest.mark.parametrize("batch_size", [12, 64])
+def test_flows_do_not_leak_with_depth(batch_size):
+    """
+    Regression: the sum layers' flow propagation was biased LOW by ~6e-4 per layer, so a deep
+    circuit lost flow geometrically with depth -- 1% of the total at 32 layers, and an HMM's
+    log-likelihood depended on the batch it was evaluated in (0.018 nats at 32 layers, batch 12).
+
+    Cause: TF32 truncation. A TF32 `tl.dot` hands fp32 registers to the tensor core, which ignores
+    the low 13 mantissa bits -- truncation, so for the all-positive operands here a bias, not noise.
+    Two sites: the element-flow kernel's explicit `tl.dot` (batch >= 16), and -- in the paths written
+    as fp32 (`csmm1` forward and the element-flow `TL_DOT = 0` branch, batch 9..15) -- Triton
+    rewriting `tl.sum(a[:,:,None] * b[None,:,:], axis = 1)` into a TF32 dot by itself.
+
+    Why the other tests here missed it: they use 4-layer HMMs (4 x 6e-4 is under their 1e-3 bar)
+    and batches <= 8, which take the exact `csmm2` kernels.
+
+    The instrument is pinned, because both of its free choices are made by TIMING: at batch < 16 the
+    exact CUDA small-batch kernels may win the fork, and the launch-config tuner picks the tile shape.
+    The tile matters: at batch 12 only the tuner's 16-row candidate is big enough for Triton's TF32
+    rewrite -- the heuristic 8-row tile is exact -- and it is also the faster one, so the real tuner
+    usually takes it. So the Triton paths are forced and the tuner always takes the LARGEST candidate.
+
+    Reference-free: in an HMM each sum layer passes exactly one unit of flow per sample, so the
+    total parameter flow of a one-shot backward must equal that of `batch_size` batch-1 backwards.
+    """
+    import pyjuice.layer.sum_layer as sl
+    from pyjuice.layer.kernels import autotune
+
+    device = torch.device("cuda:0")
+    pc = _deep_hmm(device)
+    torch.manual_seed(batch_size)
+    x = torch.randint(0, 16, [batch_size, 32], device = device)
+
+    saved = (sl.FORWARD_SUM_CUDA, sl.BACKWARD_ELE_FLOW_CUDA, autotune.ENABLED, autotune.best_of,
+             dict(autotune._CACHE))
+    try:
+        sl.FORWARD_SUM_CUDA = sl.BACKWARD_ELE_FLOW_CUDA = False
+        autotune.ENABLED = True
+        autotune._CACHE.clear()
+        autotune.best_of = lambda candidates, *a, **k: max(c for c, _ in candidates)
+
+        def total(chunk):
+            lls = []
+            for i, s in enumerate(range(0, batch_size, chunk)):
+                xs = x[s:s + chunk].contiguous()
+                lls.append(pc(xs).view(-1).clone())
+                pc.backward(xs, logspace_flows = True, allow_modify_flows = False,
+                            flows_memory = 0.0 if i == 0 else 1.0)
+            torch.cuda.synchronize()
+            return pc.param_flows.double().sum().item(), torch.cat(lls).double()
+
+        ref_flow, ref_ll = total(1)
+        got_flow, got_ll = total(batch_size)
+    finally:
+        sl.FORWARD_SUM_CUDA, sl.BACKWARD_ELE_FLOW_CUDA, autotune.ENABLED, autotune.best_of, cache = saved
+        autotune._CACHE.clear()
+        autotune._CACHE.update(cache)
+
+    # 32 sum layers x 1 unit per sample
+    assert abs(ref_flow / batch_size - 32.0) < 1e-3, f"batch-1 reference itself is off: {ref_flow / batch_size}"
+
+    rel = abs(got_flow / ref_flow - 1.0)
+    assert rel < 3e-3, f"sum-layer flow leaks with depth at batch_size={batch_size}: {got_flow / batch_size:.5f} of 32 units/sample"
+
+    # Only where the forward is meant to be fp32. From 16 up it is a bf16 dot BY DESIGN (rounded to
+    # nearest, so unbiased), which on its own puts ~1.7e-3 between batch 64 and batch 1 here.
+    if batch_size < 16:
+        dll = (got_ll - ref_ll).abs().max().item()
+        assert dll < 2e-3, f"log-likelihood depends on the batch size at batch_size={batch_size}: max |dLL| = {dll:.5f}"
+
+
+def _sweep_circuit(kind, device):
+    """Small circuits that each put a different kernel regime at a dispatch boundary."""
+    import pyjuice.nodes.distributions as dists
+    from pyjuice.nodes import inputs, multiply, summate
+
+    torch.manual_seed(7)
+    evidence = None
+    if kind in ("hmm_untied", "hmm_tied"):           # block_size 64: the small-batch (< 16) kernels
+        root = juice.structures.GeneralizedHMM(seq_length = 8, num_latents = 64, homogeneous = (kind == "hmm_tied"),
+                                               input_dist = dists.Categorical(num_cats = 16))
+        num_vars, num_cats = 8, 16
+    elif kind == "few_children":                     # block-16 sums over 4 children: the forward reduces over 4
+        with juice.set_block_size(1):
+            np0 = multiply(inputs(0, num_node_blocks = 4, dist = dists.Categorical(num_cats = 6)),
+                           inputs(1, num_node_blocks = 4, dist = dists.Categorical(num_cats = 6)))
+        ns = summate(np0, num_node_blocks = 1, block_size = 16)
+        root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
+        num_vars, num_cats = 2, 6
+    elif kind == "softevi_few_cats":                 # a soft-evidence leaf over 4 categories, dense evidence
+        root = juice.structures.GeneralizedHMM(seq_length = 4, num_latents = 32, homogeneous = True,
+                                               input_dist = dists.SoftEvidenceCategorical(num_cats = 4, _dual_flow_backward = False))
+        num_vars, num_cats = 4, 4
+        evidence = True
+    else:
+        raise ValueError(kind)
+    root.init_parameters(perturbation = 2.0)
+    pc = juice.compile(root, verbose = False).to(device)
+    return pc, num_vars, num_cats, evidence
+
+
+@pytest.mark.parametrize("tuned", [True, False])
+@pytest.mark.parametrize("kind", ["hmm_untied", "hmm_tied", "few_children", "softevi_few_cats"])
+def test_results_do_not_depend_on_the_batch_size(kind, tuned):
+    """
+    A sample's log-likelihood, and the parameter flows of a set of samples, cannot depend on how many
+    samples share the call. Checked at every dispatch boundary (powers of two +-1, the small-batch
+    thresholds) against a reference built from batch-1 calls, which take the sparse kernels.
+
+    Every bug of this family found so far was invisible except at particular batch sizes: the dropped
+    partial batch tile (any batch not a multiple of `TILE_SIZE_B`), TF32 flows leaking with depth (only
+    from batch 9 up), and the fp32 broadcast-sum miscompile -- ln 2 per layer with fewer than 8 children
+    and per soft-evidence variable with fewer than 8 categories at batch >= 16, double flows at batch 4.
+
+    Two bars, for two kinds of bug: the TOTAL parameter flow (bias, which does not average out) to 1e-3,
+    and every element to 5e-3 (a misrouted or miscounted element). Batch >= 16 runs the forward in bf16
+    by design, hence the 3e-3 on the log-likelihood.
+
+    Run with the launch tuner on (what users get) AND off (the heuristic tiles, `PYJUICE_AUTOTUNE=0`):
+    whether a tile-shape-dependent bug shows can depend on which tile the timing picks. MEASURED: with
+    the batch-4 double count re-introduced, the tuned HMM runs passed in one process and failed in the
+    next, while the heuristic tiles failed every time.
+    """
+    from pyjuice.layer.kernels import autotune
+
+    device = torch.device("cuda:0")
+    saved = (autotune.ENABLED, dict(autotune._CACHE))
+    autotune.ENABLED = tuned
+    autotune._CACHE.clear()
+    try:
+        _check_batch_size_invariance(kind, device)
+    finally:
+        autotune.ENABLED = saved[0]
+        autotune._CACHE.clear()
+        autotune._CACHE.update(saved[1])
+
+
+def _check_batch_size_invariance(kind, device):
+    pc, num_vars, num_cats, evidence = _sweep_circuit(kind, device)
+
+    sizes = [1, 2, 3, 4, 5, 8, 9, 15, 16, 17, 32, 33, 64, 65]
+    n_max = max(sizes)
+    torch.manual_seed(11)
+    x = torch.randint(0, num_cats, (n_max, num_vars), device = device)
+    ev = torch.log_softmax(torch.randn(n_max, num_vars, num_cats, device = device), dim = 2) if evidence else None
+
+    def call(sl, first):
+        kw = {} if ev is None else dict(categorical_evidence_logp = ev[sl].contiguous())
+        lls = pc(x[sl].contiguous(), **kw).view(-1).clone()
+        pc.backward(x[sl].contiguous(), logspace_flows = True, allow_modify_flows = False,
+                    flows_memory = 0.0 if first else 1.0, **kw)
+        return lls
+
+    # Batch-1 reference, accumulated sample by sample; snapshot the flows at every size in the sweep.
+    ref_lls, ref_flows = [], {}
+    for i in range(n_max):
+        ref_lls.append(call(slice(i, i + 1), i == 0))
+        if i + 1 in sizes:
+            torch.cuda.synchronize()
+            ref_flows[i + 1] = pc.param_flows.double().clone()
+    ref_lls = torch.cat(ref_lls).double()
+
+    failures = []
+    for n in sizes:
+        lls = call(slice(0, n), True).double()
+        torch.cuda.synchronize()
+        flows, ref = pc.param_flows.double(), ref_flows[n]
+        dll = (lls - ref_lls[:n]).abs().max().item()
+        total = abs(flows.sum().item() / ref.sum().item() - 1.0)
+        keep = ref.abs() > 1e-6 * ref.abs().max()
+        elem = ((flows - ref).abs()[keep] / ref.abs()[keep]).max().item()
+        if not (dll < 3e-3 and total < 1e-3 and elem < 5e-3):
+            failures.append(f"batch {n}: max |dLL| {dll:.2e}, total flow off by {total:.2e}, worst element {elem:.2e}")
+    assert not failures, f"{kind}: results depend on the batch size\n" + "\n".join(failures)
+
+
 if __name__ == "__main__":
     test_hmm_batch_size_consistency()
     test_hmm_backward_small_batch()
+    test_param_flows_include_the_final_partial_batch_tile()
+    test_param_flows_invariant_to_batch_chunking()
     test_sum_layer_backward_mode_and_fp32()
     test_small_batch_block_sparse_fast_path()
     test_small_batch_forward_cuda_matches_triton()

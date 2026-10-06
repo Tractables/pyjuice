@@ -241,7 +241,44 @@ def test_sparse_pc_backward():
            pc.node_flows[8,0]) < 1e-4
 
 
+def test_backward_without_param_flows():
+    # Regression: a DIRECT `pc.backward(compute_param_flows = False)` (default input backward,
+    # `input_layer_fn = None`) leaves `param_flows` unallocated, and the input layer's Triton
+    # emission-flow kernel dereferenced the null pointer -- a Triton COMPILE-time
+    # `AttributeError("'NoneType' object has no attribute 'type'")`. The CUDA fast-path already guarded
+    # `param_flows is not None`; the Triton path did not. Node / element flows come from the inner
+    # layers, so they must be identical with and without param-flow accumulation.
+    ni0 = inputs(0, num_nodes = 2, dist = dists.Categorical(num_cats = 5))
+    ni1 = inputs(1, num_nodes = 2, dist = dists.Categorical(num_cats = 5))
+    n = summate(multiply(ni0, ni1), num_nodes = 2)
+    root = summate(multiply(n), num_nodes = 1)
+
+    pc = TensorCircuit(root)
+    device = torch.device("cuda:0")
+    pc.to(device)
+
+    data = torch.randint(0, 5, [16, 2]).to(device)
+
+    # baseline: compute_param_flows = True accumulates param flows
+    pc(data)
+    pc.backward(data, flows_memory = 1.0)
+    node_flows_with = pc.node_flows.clone()
+    assert pc.param_flows is not None and torch.count_nonzero(pc.param_flows) > 0
+
+    # the fix: compute_param_flows = False no longer crashes, and node flows are identical
+    pc(data)
+    pc.backward(data, compute_param_flows = False)
+    assert torch.allclose(node_flows_with, pc.node_flows)
+
+    # and under a missing mask (Categorical folds the mask into the same emission-flow kernel)
+    missing_mask = torch.zeros(16, 2, dtype = torch.bool, device = device)
+    missing_mask[:, 0] = True
+    pc(data, missing_mask = missing_mask)
+    pc.backward(data, compute_param_flows = False, missing_mask = missing_mask)
+
+
 if __name__ == "__main__":
     test_backward()
     test_non_sd_pc_backward()
     test_sparse_pc_backward()
+    test_backward_without_param_flows()

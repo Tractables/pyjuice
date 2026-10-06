@@ -361,10 +361,18 @@ class ProdLayer(Layer, nn.Module):
                    batch_size, accum, partial_eval, prop_logsumexp, cfgs[0])
             cfg = autotune.cached(key)
             if cfg is None:
-                bench_out = node_vals if not accum else autotune.scratch_like(node_vals)
-                cfg = cfgs[0] if bench_out is None else \
-                    autotune.pick(key, cfgs, lambda c: _launch_2d(c, bench_out))
-                del bench_out
+                # Only allocate a benchmark buffer when `pick` will really benchmark it:
+                # `autotune.should_tune` also declines, UNCACHED, when tuning is off or a graph is
+                # being captured, so gating on `cached` alone allocated a `node_vals`-sized clone on
+                # every call in those cases. NB this is inline, not inside a config helper -- it must
+                # fall through to the launch below, not return.
+                if accum and not autotune.should_tune(key, len(cfgs)):
+                    cfg = cfgs[0]
+                else:
+                    bench_out = node_vals if not accum else autotune.scratch_like(node_vals)
+                    cfg = cfgs[0] if bench_out is None else \
+                        autotune.pick(key, cfgs, lambda c: _launch_2d(c, bench_out))
+                    del bench_out
 
             _launch_2d(cfg, node_vals)
 

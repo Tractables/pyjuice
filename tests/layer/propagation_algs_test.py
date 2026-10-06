@@ -239,6 +239,23 @@ def test_general_ll_prop():
 
 def test_mpe_prop():
 
+    # SEEDED, because this test is ill-posed on an MPE TIE and was therefore order-dependent.
+    #
+    # The reference below selects the argmax with `|epars * emars - nmars| < 1e-6` and sums the
+    # matching parents' flows. When a parent's maximum is attained by TWO children (to within that
+    # threshold), the reference -- applied once per child -- credits that parent's whole flow to BOTH
+    # of them, which no single-argmax kernel can reproduce. The kernel's own criterion is the same
+    # threshold applied in LOG space, so the two resolve a near-tie differently.
+    #
+    # MEASURED over 100 draws: 1 failed, and it had exactly ONE tied (parent, sample) pair out of
+    # 1536 -- reference 1.4719 vs kernel 1.1017, the difference being that parent's node flow.
+    # Ties are not rare here by accident: ~64 children with products spread over O(1) have a
+    # neighbour gap of ~1/64, so a gap under 1e-6 turns up in a few percent of draws.
+    #
+    # Without a seed the draw depended on RNG state left by whatever test ran before, so this failed
+    # roughly one full-suite run in four while passing every time it was run alone.
+    torch.manual_seed(20260929)
+
     device = torch.device("cuda:0")
 
     batch_size = 16

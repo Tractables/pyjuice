@@ -17,6 +17,7 @@ else:
     tlmath = tl.math
 
 from pyjuice.utils.kernel_launcher import triton_jit
+from pyjuice.layer.kernels import _round_to_tf32
 
 
 
@@ -26,7 +27,7 @@ def _bk_triton_block_sparse_par_kernel(node_flows, node_mars, element_mars, mpar
                                        batch_size: tl.constexpr, num_edges: tl.constexpr, allow_modify_flows: tl.constexpr, 
                                        logspace_flows: tl.constexpr, TILE_SIZE_B: tl.constexpr, B_NUM_TILES: tl.constexpr, 
                                        TILE_SIZE_K: tl.constexpr, TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, 
-                                       TL_DOT: tl.constexpr, propagation_alg_id: tl.constexpr, negate_pflows: tl.constexpr, 
+                                       TL_DOT: tl.constexpr, DOT_IEEE: tl.constexpr, propagation_alg_id: tl.constexpr, negate_pflows: tl.constexpr, 
                                        allow_neg_flows: tl.constexpr, pid_m_offset = 0, alpha = 0.0):
 
     pid_k = tl.program_id(0) # ID of size-`TILE_SIZE_K` edges
@@ -68,7 +69,7 @@ def _bk_triton_block_sparse_par_kernel(node_flows, node_mars, element_mars, mpar
 
         if propagation_alg_id == 1:
             nflows = tl.load(nflows_ptr, mask = mask_batch[None,:], other = 0.0) # [TILE_SIZE_M, TILE_SIZE_B]
-            nmars = tl.load(nmars_ptr, mask = mask_batch[None,:], other = 0.0) # [TILE_SIZE_M, TILE_SIZE_B]
+            nmars = tl.load(nmars_ptr, mask = mask_batch[None,:], other = -float("inf")) # [TILE_SIZE_M, TILE_SIZE_B]
 
             cond = tl.abs(elpars[:,None,:] + emars[None,:,:] - nmars[:,:,None]) < 1e-6
             if logspace_flows:
@@ -78,7 +79,7 @@ def _bk_triton_block_sparse_par_kernel(node_flows, node_mars, element_mars, mpar
 
         else:
 
-            nmars = tl.load(nmars_ptr, mask = mask_batch[None,:], other = 0.0) # [TILE_SIZE_M, TILE_SIZE_B]
+            nmars = tl.load(nmars_ptr, mask = mask_batch[None,:], other = -float("inf")) # [TILE_SIZE_M, TILE_SIZE_B]
 
             if allow_modify_flows == 1:
                 log_n_fdm = tl.load(nflows_ptr, mask = mask_batch[None,:], other = -float("inf")) # [TILE_SIZE_M, TILE_SIZE_B]
@@ -102,14 +103,20 @@ def _bk_triton_block_sparse_par_kernel(node_flows, node_mars, element_mars, mpar
 
             if allow_neg_flows:
                 if TL_DOT == 1:
-                    partial_flows = tl.dot(n_fdm_sub * nflows, scaled_emars)
+                    if DOT_IEEE:
+                        partial_flows = tl.dot(n_fdm_sub * nflows, scaled_emars, input_precision = "ieee")
+                    else:
+                        partial_flows = tl.dot(_round_to_tf32(n_fdm_sub * nflows), _round_to_tf32(scaled_emars))
                 else:
-                    partial_flows = tl.sum(n_fdm_sub[:,:,None] * nflows[:,:,None] * scaled_emars[None,:,:], axis = 1)
+                    partial_flows = tl.sum(tl.trans(n_fdm_sub * nflows)[:,:,None] * scaled_emars[:,None,:], axis = 0)
             else:
                 if TL_DOT == 1:
-                    partial_flows = tl.dot(n_fdm_sub, scaled_emars)
+                    if DOT_IEEE:
+                        partial_flows = tl.dot(n_fdm_sub, scaled_emars, input_precision = "ieee")
+                    else:
+                        partial_flows = tl.dot(_round_to_tf32(n_fdm_sub), _round_to_tf32(scaled_emars))
                 else:
-                    partial_flows = tl.sum(n_fdm_sub[:,:,None] * scaled_emars[None,:,:], axis = 1)
+                    partial_flows = tl.sum(tl.trans(n_fdm_sub)[:,:,None] * scaled_emars[:,None,:], axis = 0)
 
             acc += partial_flows
 
@@ -148,7 +155,7 @@ def _bk_triton_block_sparse_par_kernel_rmw(node_flows, node_mars, element_mars, 
                                            batch_size: tl.constexpr, num_edges: tl.constexpr, allow_modify_flows: tl.constexpr,
                                            logspace_flows: tl.constexpr, TILE_SIZE_B: tl.constexpr, B_NUM_TILES: tl.constexpr,
                                            TILE_SIZE_K: tl.constexpr, TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr,
-                                           TL_DOT: tl.constexpr, propagation_alg_id: tl.constexpr, negate_pflows: tl.constexpr,
+                                           TL_DOT: tl.constexpr, DOT_IEEE: tl.constexpr, propagation_alg_id: tl.constexpr, negate_pflows: tl.constexpr,
                                            allow_neg_flows: tl.constexpr, pid_m_offset = 0, alpha = 0.0):
     """
     Faster variant of `_bk_triton_block_sparse_par_kernel`: identical computation, but the
@@ -198,7 +205,7 @@ def _bk_triton_block_sparse_par_kernel_rmw(node_flows, node_mars, element_mars, 
 
         if propagation_alg_id == 1:
             nflows = tl.load(nflows_ptr, mask = mask_batch[None,:], other = 0.0) # [TILE_SIZE_M, TILE_SIZE_B]
-            nmars = tl.load(nmars_ptr, mask = mask_batch[None,:], other = 0.0) # [TILE_SIZE_M, TILE_SIZE_B]
+            nmars = tl.load(nmars_ptr, mask = mask_batch[None,:], other = -float("inf")) # [TILE_SIZE_M, TILE_SIZE_B]
 
             cond = tl.abs(elpars[:,None,:] + emars[None,:,:] - nmars[:,:,None]) < 1e-6
             if logspace_flows:
@@ -208,7 +215,7 @@ def _bk_triton_block_sparse_par_kernel_rmw(node_flows, node_mars, element_mars, 
 
         else:
 
-            nmars = tl.load(nmars_ptr, mask = mask_batch[None,:], other = 0.0) # [TILE_SIZE_M, TILE_SIZE_B]
+            nmars = tl.load(nmars_ptr, mask = mask_batch[None,:], other = -float("inf")) # [TILE_SIZE_M, TILE_SIZE_B]
 
             if allow_modify_flows == 1:
                 log_n_fdm = tl.load(nflows_ptr, mask = mask_batch[None,:], other = -float("inf")) # [TILE_SIZE_M, TILE_SIZE_B]
@@ -232,14 +239,20 @@ def _bk_triton_block_sparse_par_kernel_rmw(node_flows, node_mars, element_mars, 
 
             if allow_neg_flows:
                 if TL_DOT == 1:
-                    partial_flows = tl.dot(n_fdm_sub * nflows, scaled_emars)
+                    if DOT_IEEE:
+                        partial_flows = tl.dot(n_fdm_sub * nflows, scaled_emars, input_precision = "ieee")
+                    else:
+                        partial_flows = tl.dot(_round_to_tf32(n_fdm_sub * nflows), _round_to_tf32(scaled_emars))
                 else:
-                    partial_flows = tl.sum(n_fdm_sub[:,:,None] * nflows[:,:,None] * scaled_emars[None,:,:], axis = 1)
+                    partial_flows = tl.sum(tl.trans(n_fdm_sub * nflows)[:,:,None] * scaled_emars[:,None,:], axis = 0)
             else:
                 if TL_DOT == 1:
-                    partial_flows = tl.dot(n_fdm_sub, scaled_emars)
+                    if DOT_IEEE:
+                        partial_flows = tl.dot(n_fdm_sub, scaled_emars, input_precision = "ieee")
+                    else:
+                        partial_flows = tl.dot(_round_to_tf32(n_fdm_sub), _round_to_tf32(scaled_emars))
                 else:
-                    partial_flows = tl.sum(n_fdm_sub[:,:,None] * scaled_emars[None,:,:], axis = 1)
+                    partial_flows = tl.sum(tl.trans(n_fdm_sub)[:,:,None] * scaled_emars[:,None,:], axis = 0)
 
             acc += partial_flows
 
@@ -280,7 +293,7 @@ def _bk_triton_block_sparse_par_csmm2_kernel(node_flows, node_mars, element_mars
                                              batch_size: tl.constexpr, num_edges: tl.constexpr, allow_modify_flows: tl.constexpr, 
                                              logspace_flows: tl.constexpr, TILE_SIZE_B: tl.constexpr, B_NUM_TILES: tl.constexpr, 
                                              TILE_SIZE_K: tl.constexpr, TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, 
-                                             TL_DOT: tl.constexpr, propagation_alg_id: tl.constexpr, negate_pflows: tl.constexpr, 
+                                             TL_DOT: tl.constexpr, DOT_IEEE: tl.constexpr, propagation_alg_id: tl.constexpr, negate_pflows: tl.constexpr, 
                                              allow_neg_flows: tl.constexpr, pid_m_offset = 0, alpha = 0.0):
 
     pid_k = tl.program_id(0) # ID of size-`TILE_SIZE_K` edges
@@ -319,7 +332,7 @@ def _bk_triton_block_sparse_par_csmm2_kernel(node_flows, node_mars, element_mars
     
     for b in range(0, B_NUM_TILES):
         emars = tl.load(emars_ptr, mask = mask_batch[:,None], other = 0.0) # [TILE_SIZE_B, TILE_SIZE_K]
-        nmars = tl.load(nmars_ptr, mask = mask_batch[:,None], other = 0.0) # [TILE_SIZE_B, TILE_SIZE_M]
+        nmars = tl.load(nmars_ptr, mask = mask_batch[:,None], other = -float("inf")) # [TILE_SIZE_B, TILE_SIZE_M]
 
         if propagation_alg_id == 1:
             nflows = tl.load(nflows_ptr, mask = mask_batch[:,None], other = 0.0) # [TILE_SIZE_B, TILE_SIZE_M]
@@ -352,9 +365,11 @@ def _bk_triton_block_sparse_par_csmm2_kernel(node_flows, node_mars, element_mars
             scaled_emars = tl.exp(emars + log_n_fdm_max[:,None])
 
             if allow_neg_flows:
-                partial_flows = tl.sum(tl.trans(n_fdm_sub * nflows)[:,:,None] * scaled_emars[None,:,:], axis = 1)
+                # axis-0 form on purpose -- see `_BROADCAST_SUM_NOTE` in pyjuice/layer/kernels/__init__.py
+                partial_flows = tl.sum((n_fdm_sub * nflows)[:,:,None] * scaled_emars[:,None,:], axis = 0)
             else:
-                partial_flows = tl.sum(tl.trans(n_fdm_sub)[:,:,None] * scaled_emars[None,:,:], axis = 1)
+                # axis-0 form on purpose -- see `_BROADCAST_SUM_NOTE` in pyjuice/layer/kernels/__init__.py
+                partial_flows = tl.sum(n_fdm_sub[:,:,None] * scaled_emars[:,None,:], axis = 0)
 
             acc += partial_flows
 
@@ -391,7 +406,7 @@ def _bk_triton_block_sparse_par_csmm2_kernel(node_flows, node_mars, element_mars
 def _bk_triton_block_sparse_tempered_par_kernel(node_flows, node_mars_tempered, element_mars, mparams, param_flows, nids, cids, pids, pfids,
                                                 batch_size: tl.constexpr, num_edges: tl.constexpr, TILE_SIZE_B: tl.constexpr, B_NUM_TILES: tl.constexpr, 
                                                 TILE_SIZE_K: tl.constexpr, TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, 
-                                                TL_DOT: tl.constexpr, negate_pflows: tl.constexpr, pid_m_offset = 0, pflow_temperature = 1.0):
+                                                TL_DOT: tl.constexpr, DOT_IEEE: tl.constexpr, negate_pflows: tl.constexpr, pid_m_offset = 0, pflow_temperature = 1.0):
 
     pid_k = tl.program_id(0) # ID of size-`TILE_SIZE_K` edges
     pid_m = tl.program_id(1) + pid_m_offset # ID of size-`TILE_SIZE_M` nodes
@@ -423,7 +438,7 @@ def _bk_triton_block_sparse_tempered_par_kernel(node_flows, node_mars_tempered, 
     for b in range(0, B_NUM_TILES):
         emars = tl.load(emars_ptr, mask = mask_batch[:,None], other = 0.0) # [TILE_SIZE_B, TILE_SIZE_K]
 
-        nmars_tempered = tl.load(nmars_tempered_ptr, mask = mask_batch[None,:], other = 0.0) # [TILE_SIZE_M, TILE_SIZE_B]
+        nmars_tempered = tl.load(nmars_tempered_ptr, mask = mask_batch[None,:], other = -float("inf")) # [TILE_SIZE_M, TILE_SIZE_B]
 
         nflows = tl.load(nflows_ptr, mask = mask_batch[None,:], other = 0.0) # [TILE_SIZE_M, TILE_SIZE_B]
             
@@ -435,9 +450,12 @@ def _bk_triton_block_sparse_tempered_par_kernel(node_flows, node_mars_tempered, 
         scaled_emars = tl.exp(emars / pflow_temperature + log_n_fdm_max[:,None])
 
         if TL_DOT == 1:
-            partial_flows = tl.dot(n_fdm_sub, scaled_emars)
+            if DOT_IEEE:
+                partial_flows = tl.dot(n_fdm_sub, scaled_emars, input_precision = "ieee")
+            else:
+                partial_flows = tl.dot(_round_to_tf32(n_fdm_sub), _round_to_tf32(scaled_emars))
         else:
-            partial_flows = tl.sum(n_fdm_sub[:,:,None] * scaled_emars[None,:,:], axis = 1)
+            partial_flows = tl.sum(tl.trans(n_fdm_sub)[:,:,None] * scaled_emars[:,None,:], axis = 0)
 
         acc += partial_flows
 
@@ -470,7 +488,7 @@ def _bk_triton_block_sparse_tempered_par_kernel(node_flows, node_mars_tempered, 
 def _bk_triton_block_sparse_tempered_par_csmm2_kernel(node_flows, node_mars_tempered, element_mars, mparams, param_flows, nids, cids, pids, pfids,
                                                       batch_size: tl.constexpr, num_edges: tl.constexpr, TILE_SIZE_B: tl.constexpr, B_NUM_TILES: tl.constexpr, 
                                                       TILE_SIZE_K: tl.constexpr, TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, 
-                                                      TL_DOT: tl.constexpr, negate_pflows: tl.constexpr, pid_m_offset = 0, pflow_temperature = 1.0):
+                                                      TL_DOT: tl.constexpr, DOT_IEEE: tl.constexpr, negate_pflows: tl.constexpr, pid_m_offset = 0, pflow_temperature = 1.0):
 
     pid_k = tl.program_id(0) # ID of size-`TILE_SIZE_K` edges
     pid_m = tl.program_id(1) + pid_m_offset # ID of size-`TILE_SIZE_M` nodes
@@ -501,7 +519,7 @@ def _bk_triton_block_sparse_tempered_par_csmm2_kernel(node_flows, node_mars_temp
     
     for b in range(0, B_NUM_TILES):
         emars = tl.load(emars_ptr, mask = mask_batch[:,None], other = 0.0) # [TILE_SIZE_B, TILE_SIZE_K]
-        nmars_tempered = tl.load(nmars_tempered_ptr, mask = mask_batch[:,None], other = 0.0) # [TILE_SIZE_B, TILE_SIZE_M]
+        nmars_tempered = tl.load(nmars_tempered_ptr, mask = mask_batch[:,None], other = -float("inf")) # [TILE_SIZE_B, TILE_SIZE_M]
 
         nflows = tl.load(nflows_ptr, mask = mask_batch[:,None], other = 0.0) # [TILE_SIZE_B, TILE_SIZE_M]
 
@@ -512,7 +530,8 @@ def _bk_triton_block_sparse_tempered_par_csmm2_kernel(node_flows, node_mars_temp
 
         scaled_emars = tl.exp(emars / pflow_temperature + log_n_fdm_max[:,None])
 
-        partial_flows = tl.sum(tl.trans(n_fdm_sub)[:,:,None] * scaled_emars[None,:,:], axis = 1)
+        # axis-0 form on purpose -- see `_BROADCAST_SUM_NOTE` in pyjuice/layer/kernels/__init__.py
+        partial_flows = tl.sum(n_fdm_sub[:,:,None] * scaled_emars[:,None,:], axis = 0)
 
         acc += partial_flows
 

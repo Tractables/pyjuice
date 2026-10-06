@@ -128,6 +128,57 @@ _SMALL_BATCH_MIN_BLOCK_SIZE = int(os.environ.get("PYJUICE_SB_MIN_BS", 32))
 # unaffected. Toggle for A/B; bit-identical so on by default.
 _BLOCK_SPARSE_EDGE_TRIM = os.environ.get("PYJUICE_EDGE_TRIM", "1") != "0"
 
+# Precision of the parameter-flow `tl.dot`. Triton defaults to TF32, which TRUNCATES the operands --
+# a bias, ~6e-4 low per product. The default path now rounds the operands onto the TF32 grid first
+# (`_round_to_tf32` in `layer/kernels`), which removes the bias at TF32 speed. MEASURED at block_size
+# 16 / batch 512, param kernels only (profiler), per-node `max |sum_c F+ / sum_b f_b - 1|`:
+#
+#     tf32, truncated (before)   32.3 us   error 1.7e-3
+#     tf32, rounded (default)    33.0 us   error 8.3e-4
+#     ieee                       60.5 us   error 7.8e-4
+#
+# so IEEE no longer buys anything measurable here: what is left is the same with it on, i.e. it comes
+# from upstream of this dot, not from it. Kept OFF BY DEFAULT and available as
+# `PYJUICE_PAR_DOT_IEEE=1` for when the flows themselves are the object of study (validating a new
+# kernel against a reference, a gradient check).
+#
+# `force_use_fp32` drops `tl.dot` altogether for a broadcast sum. That is NOT a reliable accuracy
+# route: it also changes the forward and element-flow forks, and its measured error moved between
+# 6.2e-6 and 7.0e-4 across runs of the same shape, because the timing-based autotuner picks
+# differently from run to run. (Likely Triton rewriting the fp32 broadcast sums into TF32 dots once a
+# tuned tile was big enough; the kernels no longer use that form -- see `_BROADCAST_SUM_NOTE` in
+# `layer/kernels/__init__.py`.)
+#
+# Every par kernel takes `DOT_IEEE` so the one launch site below can stay uniform, but it is inert in
+# the `csmm2` forks: those reduce with `tl.sum`, not `tl.dot`, and have no precision to set.
+_PAR_DOT_IEEE = os.environ.get("PYJUICE_PAR_DOT_IEEE", "0") != "0"
+
+# Smallest batch whose parameter flows take the block-sparse kernel rather than the sparse one. Both
+# are correct at any batch >= 3 (the block-sparse kernel needs `TILE_SIZE_B >= 4`). This used to be 16,
+# as a guard against two block-sparse bugs that are both fixed: the partial batch tile (floor ->
+# ceil, see `_backward_block_sparse_par_flows`) and the fp32 broadcast-sum miscompile that doubled
+# its flows at batch 4 (see `_BROADCAST_SUM_NOTE` in `layer/kernels/__init__.py`).
+#
+# 9 is the measured crossover on an RTX PRO 6000 (fwd+bwd, 32 x 1024 HMMs): from 9 the batch tile is
+# 16 wide and takes the tensor-core dot, so block-sparse wins -- CoDD's tied soft-evidence HMM
+# 12.66 -> 10.27 ms at batch 14, an untied Categorical HMM 5.37 -> 4.11 ms -- while at <= 8 the sparse
+# path (and its CUDA small-batch kernel, for untied layers) is 5-13% faster. A fixed threshold rather
+# than a timed choice ON PURPOSE: the two paths differ numerically (the block-sparse one carries the
+# same TF32 param-flow error as every batch >= 16), and numerics picked by a timing race are a trap.
+_BLOCK_SPARSE_PAR_MIN_BATCH = int(os.environ.get("PYJUICE_BLOCK_SPARSE_PAR_MIN_BATCH", 9))
+
+# SM count, cached: the occupancy heuristics below consult it per launch, and
+# `torch.cuda.get_device_properties` is far too slow to call on a hot path.
+_SM_COUNT = {}
+
+
+def _sm_count(device) -> int:
+    idx = device.index if getattr(device, "index", None) is not None else torch.cuda.current_device()
+    n = _SM_COUNT.get(idx)
+    if n is None:
+        n = _SM_COUNT[idx] = torch.cuda.get_device_properties(idx).multi_processor_count
+    return n
+
 
 class SumLayer(Layer, nn.Module):
 
@@ -863,13 +914,19 @@ class SumLayer(Layer, nn.Module):
                     return None
                 # choice == ("triton", -1): fall through to the Triton launch below
 
-        # Small-batch (batch < 16) CUDA fast path. The big-block sparse/block-sparse Triton kernels
-        # under-tile the node dimension at tiny batch; this plain-CUDA kernel (32-node coalesced
-        # warps + edge-split online-logsumexp, numerically equivalent ~1.5e-6) is faster. Gated to the
-        # same regime as the small-batch tiling heuristic above (batch<16, block_size>=128), LL, no
-        # tempering / partial-eval, contiguous layout. Autotuned vs the Triton small-batch launch and
-        # only used when it wins; otherwise falls through to the Triton launch below.
-        if (FORWARD_SUM_CUDA and batch_size < 16 and self.block_size >= _SMALL_BATCH_MIN_BLOCK_SIZE
+        # Small-batch CUDA fast path. The big-block sparse/block-sparse Triton kernels under-tile the
+        # node dimension at tiny batch; this plain-CUDA kernel (32-node coalesced warps + edge-split
+        # online-logsumexp, numerically equivalent ~1.5e-6) is faster. LL, no tempering / partial-eval,
+        # contiguous layout. Autotuned vs the Triton launch and only used when it wins; otherwise falls
+        # through to the Triton launch below.
+        #
+        # Offered through the gap batch too (`_GAP_BATCH_MAX`), not just below 16. It has no batch
+        # tile -- one block per sample, cost linear in the batch -- while Triton's `tl.dot` tile is a
+        # power of two, so at batch 17 Triton pays for 32 columns, half of them empty. MEASURED on a
+        # 1024-latent HMM layer, forward ms, Triton -> this kernel: batch 17 1.19 -> 0.54, 20 0.85 ->
+        # 0.66, 24 0.86 -> 0.73, 33 ~1.6 -> 0.93, 48 1.6 -> 1.28; Triton wins again from 64, where its
+        # tiles fill.
+        if (FORWARD_SUM_CUDA and batch_size < _GAP_BATCH_MAX and self.block_size >= _SMALL_BATCH_MIN_BLOCK_SIZE
                 and propagation_alg_id == 0 and not pflow_tempered_enabled and local_ids is None
                 and node_mars.is_cuda and cuda_kernels.smallbatch_fw_is_available()):
             sb = self._cached_fw_sb.get(signature)
@@ -888,19 +945,23 @@ class SumLayer(Layer, nn.Module):
             sb_ebase, sb_pbase, sb_ok = sb
             if sb_ok:
                 n_sb_cfg = len(cuda_kernels.smallbatch_fw_configs())
-                choice_key = (signature, batch_size, "sb")
-                choice = self._cached_fw_cuda_choice.get(choice_key)
-                if choice is None:
-                    # Autotune the CUDA SPLIT configs against the Triton small-batch launch (csmm1/2,
-                    # whichever this tile shape selects -- mirrors the fall-through below). Every
-                    # candidate overwrites node_mars with the same result, so it stays correct.
-                    cands = [(("triton", -1), (lambda: _launch_fw(fw_cfgs[0])))]
-                    cands += [(("cuda", c), (lambda c=c: cuda_kernels.smallbatch_forward_sum(
-                                 node_mars, element_mars, params, nids, sb_ebase, sb_pbase,
-                                 batch_size, self.block_size, num_edges, c)))
-                              for c in range(n_sb_cfg)]
-                    choice = autotune.best_of(cands) or ("triton", -1)
-                    self._cached_fw_cuda_choice[choice_key] = choice
+
+                def _launch_sb(cfg):
+                    if cfg[0] == "cuda":
+                        cuda_kernels.smallbatch_forward_sum(
+                            node_mars, element_mars, params, nids, sb_ebase, sb_pbase,
+                            batch_size, self.block_size, num_edges, cfg[1])
+                    else:
+                        _launch_fw(fw_cfgs[0])
+
+                # Autotune the CUDA SPLIT configs against the Triton launch that would run on
+                # fall-through. Every candidate overwrites node_mars with the same result, so it stays
+                # correct. Keyed by SHAPE and cached process-wide (`autotune.pick`), not per layer: the
+                # two sides agree only to ~1.5e-6, so structurally identical layers that tuned on their
+                # own could each take a different one and disagree in the last bits -- a cross-model
+                # bit-identity test caught exactly that (2.4e-7) once this path reached batch 32.
+                choice = autotune.pick(("sum_fw_smallbatch_cuda", num_edges) + fw_key,
+                                       [("triton", -1)] + [("cuda", c) for c in range(n_sb_cfg)], _launch_sb)
 
                 if choice[0] == "cuda":
                     cuda_kernels.smallbatch_forward_sum(
@@ -1336,12 +1397,10 @@ class SumLayer(Layer, nn.Module):
 
         # Flows w.r.t. parameters
         if param_flows is not None and nids is not None:
-            if node_flows.size(1) < 16:
-                # The block-sparse parameter-flow kernel contracts the batch dimension into
-                # `B_NUM_TILES = batch_size // TILE_SIZE_B` tiles; for batch < 16 that is 0 whenever
-                # batch < TILE_SIZE_B (incl. all batch < 4, which also fail its TILE_SIZE_B >= 4
-                # assert), silently dropping the param flows. The sparse parameter-flow kernel handles
-                # any batch correctly and is already a tiny fraction of the backward, so use it here.
+            batch_size = node_flows.size(1)
+            if batch_size < _BLOCK_SPARSE_PAR_MIN_BATCH or (batch_size < 16 and self._ext_bw_par_hook is not None):
+                # See `_BLOCK_SPARSE_PAR_MIN_BATCH`. External (gated) parameterizations keep the sparse
+                # path below 16, where their small-batch hook lives.
                 self._backward_sparse_par_flows(
                     node_flows, params, node_mars, element_mars, param_flows,
                     nids = nids, cids = cids, pids = pids, pfids = pfids,
@@ -1576,6 +1635,8 @@ class SumLayer(Layer, nn.Module):
             # `accumulate_ch_flows` makes `element_flows` read-accumulate-write, so the timing runs
             # must go to a scratch buffer; otherwise the kernel overwrites it with the values it is
             # about to write for real anyway and can be timed in place.
+            if not autotune.should_tune(ele_key, len(ele_cfgs)):
+                return ele_cfgs[0]                     # `pick` would decline; do not allocate for it
             out = element_flows if not accumulate_ch_flows else autotune.scratch_like(element_flows)
             if out is None:
                 return ele_cfgs[0]                     # no scratch -> leave this launch untuned
@@ -1792,7 +1853,22 @@ class SumLayer(Layer, nn.Module):
             TILE_SIZE_K = min(TILE_SIZE_K, 16)
             TILE_SIZE_B = min(TILE_SIZE_B, 16)
 
-        B_NUM_TILES = batch_size // TILE_SIZE_B
+        # CEIL, not floor. With floor the trailing `batch_size % TILE_SIZE_B` samples are never
+        # visited by the kernel's batch loop and their parameter flows are SILENTLY DROPPED -- at
+        # `block_size = 8` a batch of 96 lost 34% of the flow, and a batch of 33/40/48 lost ALL of it
+        # (`TILE_SIZE_B = 64` there, so floor gave zero tiles). Every batch size that is not a multiple
+        # of `TILE_SIZE_B` was affected, which includes the final partial batch of an ordinary epoch.
+        #
+        # The guard at the dispatch site (then `batch < 16`) only routed small batches to the sparse
+        # kernel, so the general case stayed live. It went unnoticed because every batch size in the consistency tests
+        # (1, 2, 3, 4, 6, 8, 16) is SMALLER than `TILE_SIZE_B`, which is one masked tile and correct.
+        #
+        # The extra tile is only safe because the kernels re-mask the batch each iteration AND read
+        # `node_mars` as `-inf` on a masked-out lane (see `sum_backward_param_block_sparse`): that
+        # forces `log_n_fdm = -inf`, hence `n_fdm_sub = 0` and `scaled_emars = 0`, an exact zero
+        # contribution. Reading `0.0` there instead makes a padded lane contribute `1 * exp(0)` to the
+        # dot -- measured as a 21x OVER-count, so the two changes have to travel together.
+        B_NUM_TILES = triton.cdiv(batch_size, TILE_SIZE_B)
 
         allow_modify_flows = 1 if allow_modify_flows else 0
 
@@ -1916,6 +1992,7 @@ class SumLayer(Layer, nn.Module):
                     TILE_SIZE_M = TILE_SIZE_M,
                     BLOCK_SIZE_M = self.block_size,
                     TL_DOT = TL_DOT,
+                    DOT_IEEE = 1 if _PAR_DOT_IEEE else 0,
                     negate_pflows = negate_pflows,
                     pid_m_offset = pid_m_start,
                     num_stages = 1,
@@ -1954,6 +2031,13 @@ class SumLayer(Layer, nn.Module):
             # `param_flows` is read-accumulate-write, so the timing runs must go to a scratch clone.
             # It is the full parameter array (can be GBs), so the scratch is local and freed right
             # after; if it cannot be allocated, this launch is simply left untuned.
+            #
+            # ASK FIRST whether tuning will actually happen. `pick` also declines -- without caching --
+            # when autotuning is off or a graph is being captured, so checking only `cached` above
+            # allocated this clone on EVERY call in those cases: MEASURED 696 MB of transient peak per
+            # backward against 3 MB, invisible in wall time because the allocator reuses the block.
+            if not autotune.should_tune(par_key, len(par_cfgs)):
+                return par_cfgs[0]
             scr = autotune.scratch_like(param_flows)
             if scr is None:
                 return par_cfgs[0]
@@ -2174,6 +2258,26 @@ class SumLayer(Layer, nn.Module):
                     ele_BLOCK_M = min(ele_BLOCK_M, _SMALL_BATCH_SPARSE_TILE_M)
                     while cs_block_size % ele_BLOCK_M != 0:
                         ele_BLOCK_M //= 2
+
+                # The same tiling, but driven by the GRID rather than only by a small batch. With
+                # `BLOCK_M = cs_block_size` and a batch tile spanning the whole batch, a layer with
+                # few node blocks collapses to a SINGLE program however large the batch is. MEASURED
+                # on an HMM root (one node over 1024 children, batch 256): grid (1, 1), 300 us to move
+                # ~2 MB, which was 25% of the entire backward -- ~300x off the memory roofline purely
+                # from running on one SM.
+                #
+                # Shrinking the node tile is what the small-batch branch above already does, and is
+                # bit-identical for the same reason: programs own DISJOINT `(node, batch)` outputs and
+                # the reduction is over EDGES inside a program, so nothing crosses a program boundary.
+                # `cs_block_size % ele_BLOCK_M == 0` is preserved so `TILES_PER_BLOCK` stays exact.
+                target = 4 * _sm_count(node_flows.device)
+                while ele_BLOCK_M > 1 and \
+                        triton.cdiv(batch_size, BLOCK_B) * triton.cdiv(layer_n_nodes, ele_BLOCK_M) < target:
+                    nxt = ele_BLOCK_M // 2
+                    if cs_block_size % nxt != 0:
+                        break
+                    ele_BLOCK_M = nxt
+
                 TILES_PER_BLOCK = cs_block_size // ele_BLOCK_M
                 ele_grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, ele_BLOCK_M))
 

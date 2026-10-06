@@ -17,6 +17,7 @@ else:
     tlmath = tl.math
 
 from pyjuice.utils.kernel_launcher import triton_jit
+from pyjuice.layer.kernels import _round_to_tf32
 
 
 
@@ -143,14 +144,15 @@ def _bk_triton_block_sparse_ele_kernel(node_flows, element_flows, node_mars, ele
 
             if allow_neg_flows:
                 if TL_DOT == 1:
-                    partial_flows = tl.dot(epars, n_fdm_sub * nflows)
+                    partial_flows = tl.dot(_round_to_tf32(epars), _round_to_tf32(n_fdm_sub * nflows))
                 else:
-                    partial_flows = tl.sum(epars[:,:,None] * n_fdm_sub[None,:,:] * nflows[None,:,:], axis = 1)
+                    partial_flows = tl.sum(tl.trans(epars)[:,:,None] * (n_fdm_sub * nflows)[:,None,:], axis = 0)
             else:
                 if TL_DOT == 1:
-                    partial_flows = tl.dot(epars, n_fdm_sub)
+                    partial_flows = tl.dot(_round_to_tf32(epars), _round_to_tf32(n_fdm_sub))
                 else:
-                    partial_flows = tl.sum(epars[:,:,None] * n_fdm_sub[None,:,:], axis = 1)
+                    # axis-0 form on purpose -- see `_BROADCAST_SUM_NOTE` in pyjuice/layer/kernels/__init__.py
+                    partial_flows = tl.sum(tl.trans(epars)[:,:,None] * n_fdm_sub[:,None,:], axis = 0)
 
             if logspace_flows:
                 partial_flows_max = emars + log_n_fdm_max
@@ -314,9 +316,11 @@ def _bk_triton_block_sparse_ele_csmm2_kernel(node_flows, element_flows, node_mar
             n_fdm_sub = tl.where(log_n_fdm_max[:,None] != -float("inf"), tl.exp(log_n_fdm - log_n_fdm_max[:,None]), 0.0)
 
             if allow_neg_flows:
-                partial_flows = tl.sum(epars[:,:,None] * tl.trans(n_fdm_sub * nflows)[None,:,:], axis = 1)
+                # axis-0 form on purpose -- see `_BROADCAST_SUM_NOTE` in pyjuice/layer/kernels/__init__.py
+                partial_flows = tl.sum(tl.trans(epars)[:,:,None] * tl.trans(n_fdm_sub * nflows)[:,None,:], axis = 0)
             else:
-                partial_flows = tl.sum(epars[:,:,None] * tl.trans(n_fdm_sub)[None,:,:], axis = 1)
+                # axis-0 form on purpose -- see `_BROADCAST_SUM_NOTE` in pyjuice/layer/kernels/__init__.py
+                partial_flows = tl.sum(tl.trans(epars)[:,:,None] * tl.trans(n_fdm_sub)[:,None,:], axis = 0)
 
             if logspace_flows:
                 partial_flows_max = emars + log_n_fdm_max[None,:]
@@ -423,9 +427,9 @@ def _bk_triton_block_sparse_tempered_ele_kernel(node_flows, element_flows, node_
         n_fdm_sub = tl.where(log_n_fdm_max != -float("inf"), tl.exp(log_n_fdm - log_n_fdm_max), 0.0)
 
         if TL_DOT == 1:
-            partial_flows = tl.dot(epars, n_fdm_sub)
+            partial_flows = tl.dot(_round_to_tf32(epars), _round_to_tf32(n_fdm_sub))
         else:
-            partial_flows = tl.sum(epars[:,:,None] * n_fdm_sub[None,:,:], axis = 1)
+            partial_flows = tl.sum(tl.trans(epars)[:,:,None] * n_fdm_sub[:,None,:], axis = 0)
 
         partial_flows_max = emars / eflow_temperature + log_n_fdm_max
         acc = tl.where(partial_flows_max == -float("inf"),
@@ -526,7 +530,8 @@ def _bk_triton_block_sparse_tempered_ele_csmm2_kernel(node_flows, element_flows,
         log_n_fdm_max = tl.max(log_n_fdm, axis = 1)
         n_fdm_sub = tl.where(log_n_fdm_max[:,None] != -float("inf"), tl.exp(log_n_fdm - log_n_fdm_max[:,None]), 0.0)
 
-        partial_flows = tl.sum(epars[:,:,None] * tl.trans(n_fdm_sub)[None,:,:], axis = 1)
+        # axis-0 form on purpose -- see `_BROADCAST_SUM_NOTE` in pyjuice/layer/kernels/__init__.py
+        partial_flows = tl.sum(tl.trans(epars)[:,:,None] * tl.trans(n_fdm_sub)[:,None,:], axis = 0)
 
         partial_flows_max = emars / eflow_temperature + log_n_fdm_max[None,:]
         acc = tl.where(partial_flows_max == -float("inf"),

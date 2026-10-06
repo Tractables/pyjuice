@@ -17,6 +17,7 @@ else:
     tlmath = tl.math
 
 from pyjuice.utils.kernel_launcher import triton_jit
+from pyjuice.layer.kernels import _round_to_tf32
 
 
 
@@ -112,8 +113,8 @@ def _fw_triton_block_sparse_tlmm_kernel(node_mars, element_mars, mparams, nids, 
                 emars_bf16 = emars_sub.to(tl.bfloat16)
                 nmars = tl.dot(epars_bf16, emars_bf16).to(tl.float32)
             else:
-                # Built-in matmul kernel of triton + float32
-                nmars = tl.dot(epars, emars_sub)
+                # Built-in matmul kernel of triton + float32 (a TF32 dot: see `_round_to_tf32`)
+                nmars = tl.dot(_round_to_tf32(epars), _round_to_tf32(emars_sub))
 
             acc = tl.where(emars_max > acc,
                 tl.log(nmars + tl.exp(acc - emars_max) + 1e-24) + emars_max,
@@ -134,8 +135,8 @@ def _fw_triton_block_sparse_tlmm_kernel(node_mars, element_mars, mparams, nids, 
                     emars_bf16 = emars_sub.to(tl.bfloat16)
                     nmars = tl.dot(epars_bf16, emars_bf16).to(tl.float32)
                 else:
-                    # Built-in matmul kernel of triton + float32
-                    nmars = tl.dot(epars, emars_sub)
+                    # Built-in matmul kernel of triton + float32 (a TF32 dot: see `_round_to_tf32`)
+                    nmars = tl.dot(_round_to_tf32(epars), _round_to_tf32(emars_sub))
 
                 acc_tempered = tl.where(emars_max > acc_tempered,
                     tl.log(nmars + tl.exp(acc_tempered - emars_max) + 1e-24) + emars_max,
@@ -255,13 +256,16 @@ def _fw_triton_block_sparse_csmm1_kernel(node_mars, element_mars, mparams, nids,
                 emars_max *= alpha
 
             if use_bf16 == 1:
-                # Simulated matmul kernel + bfloat16
+                # Simulated matmul kernel + bfloat16. The one place the axis-1 form is KEPT: Triton turns it
+                # into a bf16 tensor-core dot, which is exact for bf16 inputs at every tile shape (unlike the
+                # fp32 case -- see `_BROADCAST_SUM_NOTE` in pyjuice/layer/kernels/__init__.py).
                 epars = epars.to(tl.bfloat16)
                 emars_sub = emars_sub.to(tl.bfloat16)
-                nmars = tl.sum(epars[:,:,None] * emars_sub[None,:,:], axis = 1).to(tl.float32)
+                nmars = tl.sum(epars[:,:,None] * emars_sub[None,:,:], axis = 1).to(tl.float32)  # broadcast-sum ok: bf16
             else:
                 # Simulated matmul kernel + float32
-                nmars = tl.sum(epars[:,:,None] * emars_sub[None,:,:], axis = 1)
+                # axis-0 form on purpose -- see `_BROADCAST_SUM_NOTE` in pyjuice/layer/kernels/__init__.py
+                nmars = tl.sum(tl.trans(epars)[:,:,None] * emars_sub[:,None,:], axis = 0)
 
             acc = tl.where(emars_max > acc,
                 tl.log(nmars + tl.exp(acc - emars_max) + 1e-24) + emars_max,
@@ -280,10 +284,11 @@ def _fw_triton_block_sparse_csmm1_kernel(node_mars, element_mars, mparams, nids,
                     # Simulated matmul kernel + bfloat16
                     epars = epars.to(tl.bfloat16)
                     emars_sub = emars_sub.to(tl.bfloat16)
-                    nmars = tl.sum(epars[:,:,None] * emars_sub[None,:,:], axis = 1).to(tl.float32)
+                    nmars = tl.sum(epars[:,:,None] * emars_sub[None,:,:], axis = 1).to(tl.float32)  # broadcast-sum ok: bf16
                 else:
                     # Simulated matmul kernel + float32
-                    nmars = tl.sum(epars[:,:,None] * emars_sub[None,:,:], axis = 1)
+                    # axis-0 form on purpose -- see `_BROADCAST_SUM_NOTE` in pyjuice/layer/kernels/__init__.py
+                    nmars = tl.sum(tl.trans(epars)[:,:,None] * emars_sub[:,None,:], axis = 0)
 
                 acc_tempered = tl.where(emars_max > acc_tempered,
                     tl.log(nmars + tl.exp(acc_tempered - emars_max) + 1e-24) + emars_max,
@@ -403,7 +408,8 @@ def _fw_triton_block_sparse_csmm2_kernel(node_mars, element_mars, mparams, nids,
                 emars_max *= alpha
 
             # Simulated matmul kernel + float32
-            nmars = tl.sum(epars[:,:,None] * tl.trans(emars_sub)[None,:,:], axis = 1)
+            # axis-0 form on purpose -- see `_BROADCAST_SUM_NOTE` in pyjuice/layer/kernels/__init__.py
+            nmars = tl.sum(tl.trans(epars)[:,:,None] * tl.trans(emars_sub)[:,None,:], axis = 0)
 
             acc = tl.where(emars_max[None,:] > acc,
                 tl.log(nmars + tl.exp(acc - emars_max[None,:]) + 1e-24) + emars_max[None,:],
@@ -419,7 +425,8 @@ def _fw_triton_block_sparse_csmm2_kernel(node_mars, element_mars, mparams, nids,
                 emars_max /= pflow_temperature
 
                 # Simulated matmul kernel + float32
-                nmars = tl.sum(epars[:,:,None] * tl.trans(emars_sub)[None,:,:], axis = 1)
+                # axis-0 form on purpose -- see `_BROADCAST_SUM_NOTE` in pyjuice/layer/kernels/__init__.py
+                nmars = tl.sum(tl.trans(epars)[:,:,None] * tl.trans(emars_sub)[:,None,:], axis = 0)
 
                 acc_tempered = tl.where(emars_max[None,:] > acc_tempered,
                     tl.log(nmars + tl.exp(acc_tempered - emars_max[None,:]) + 1e-24) + emars_max[None,:],

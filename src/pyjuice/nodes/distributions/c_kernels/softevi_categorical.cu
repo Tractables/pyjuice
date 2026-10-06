@@ -13,9 +13,10 @@
 //
 //     grad[goff_j] -= p_theta_j * sum_l ratio[slot_j, l] * beta[l, cat]
 //
-// Each (row, cat) has exactly one owning thread, so the phase-1 update is a plain read-modify-write
-// with no atomics. See the long note in softevi_categorical.py for why the computation is organised
-// this way rather than as a scatter over slots.
+// Each (row, cat) is owned by the thread(s) holding its reference list -- one, unless the list was long
+// enough to be cut into pieces -- so the phase-1 update is one coalesced atomic per owner rather than
+// one scattered atomic per reference. See the long note in softevi_categorical.py for why the
+// computation is organised this way rather than as a scatter over slots.
 //
 // Thread mapping (this is the whole point of the hand-written version):
 //   threadIdx.x  -> category within the tile, so the `params` and `param_flows` accesses -- which are
@@ -45,7 +46,10 @@
 // slice in shared memory once per block removes essentially all of it. This is the part Triton cannot
 // express -- it has no explicit shared-memory control, so it re-reads the ratio tile from global on every
 // reference.
-template <int TL, bool UPDATE_GRAD, bool SMEM_RATIO>
+// `UPDATE_FLOW = false` computes only the evidence-gradient term (no dual flows to write): the same walk,
+// minus the accumulator and the phase-1 write. That walk is what replaces the scattered [batch, latent,
+// candidate] `params` gather, so the gradient alone is worth it.
+template <int TL, bool UPDATE_GRAD, bool SMEM_RATIO, bool UPDATE_FLOW = true>
 __global__ void dense_expected_flow_kernel(
         const float* __restrict__ params,
         float* __restrict__ param_flows,
@@ -131,8 +135,10 @@ __global__ void dense_expected_flow_kernel(
             for (int t = 0; t < TL; ++t) rv[t] = (t < nl) ? __ldg(r + t) : 0.0f;
         }
 
-        #pragma unroll
-        for (int t = 0; t < TL; ++t) acc[t] += rv[t] * pt;
+        if (UPDATE_FLOW) {
+            #pragma unroll
+            for (int t = 0; t < TL; ++t) acc[t] += rv[t] * pt;
+        }
 
         if (UPDATE_GRAD) {
             float part = 0.0f;
@@ -142,20 +148,23 @@ __global__ void dense_expected_flow_kernel(
         }
     }
 
-    // one owner per (row, cat): plain read-modify-write, coalesced across the warp
+    if (!UPDATE_FLOW) return;
+
+    // coalesced across the warp
     #pragma unroll
     for (int t = 0; t < TL; ++t) {
         if (t < nl) {
             float* dst = param_flows + pfb[t] + tot_num_cats + cat;
             // RED.E.ADD.F32: the add is done in L2 and nothing is returned to the SM, which halves the
-            // SM<->L2 traffic versus load-add-store. Not needed for correctness (one owner per slot) --
-            // purely faster: 1.66 -> 1.37 ms on the CoDD config.
+            // SM<->L2 traffic versus load-add-store: 1.66 -> 1.37 ms on the CoDD config. It is also
+            // REQUIRED for correctness: a long reference list is cut into pieces (`_DENSE_LIST_SPLIT`),
+            // each its own entry of `uniq`, so one (row, cat) can have several owning threads.
             atomicAdd(dst, beta[t] * acc[t]);
         }
     }
 }
 
-void dense_expected_flow(torch::Tensor params, torch::Tensor param_flows, torch::Tensor ratio,
+void dense_expected_flow(torch::Tensor params, c10::optional<torch::Tensor> param_flows, torch::Tensor ratio,
                          torch::Tensor uniq, torch::Tensor ref_slot, torch::Tensor ref_pt,
                          torch::Tensor ref_goff, torch::Tensor ref_cnt, torch::Tensor num_uniq,
                          torch::Tensor pf_base, torch::Tensor p_base,
@@ -171,6 +180,9 @@ void dense_expected_flow(torch::Tensor params, torch::Tensor param_flows, torch:
 
     const bool do_grad = grad.has_value();
     float* grad_ptr = do_grad ? grad->data_ptr<float>() : nullptr;
+    const bool do_flow = param_flows.has_value();
+    float* pf_ptr = do_flow ? param_flows->data_ptr<float>() : nullptr;
+    if (!do_flow && !do_grad) return;
 
     auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -184,19 +196,21 @@ void dense_expected_flow(torch::Tensor params, torch::Tensor param_flows, torch:
     const bool use_smem = (getenv("PYJUICE_SOFTEVI_SMEM_RATIO") != nullptr) && (smem <= 48 * 1024);
     const size_t smem_bytes = use_smem ? smem : 0;
 
-#define LAUNCH_TL(TLV, GRAD, SMEM)                                                                \
-    dense_expected_flow_kernel<TLV, GRAD, SMEM><<<grid, threads, smem_bytes, stream>>>(           \
-        params.data_ptr<float>(), param_flows.data_ptr<float>(), ratio.data_ptr<float>(),         \
+#define LAUNCH_TL(TLV, GRAD, SMEM, FLOW)                                                          \
+    dense_expected_flow_kernel<TLV, GRAD, SMEM, FLOW><<<grid, threads, smem_bytes, stream>>>(     \
+        params.data_ptr<float>(), pf_ptr, ratio.data_ptr<float>(),                                \
         uniq.data_ptr<int>(), ref_slot.data_ptr<int>(), ref_pt.data_ptr<float>(),                 \
         ref_goff.data_ptr<int>(), ref_cnt.data_ptr<int>(), num_uniq.data_ptr<int>(),              \
         pf_base.data_ptr<long>(), p_base.data_ptr<long>(), grad_ptr,                              \
         (int)num_latents, (int)tot_num_cats, (int)uniq_stride, (int)max_refs, (int)num_slots)
 
 #define DISPATCH(TLV)                                                                             \
-    if (do_grad && use_smem)      { LAUNCH_TL(TLV, true,  true);  }                               \
-    else if (do_grad)             { LAUNCH_TL(TLV, true,  false); }                               \
-    else if (use_smem)            { LAUNCH_TL(TLV, false, true);  }                               \
-    else                          { LAUNCH_TL(TLV, false, false); }
+    if (!do_flow && use_smem)     { LAUNCH_TL(TLV, true,  true,  false); }                        \
+    else if (!do_flow)            { LAUNCH_TL(TLV, true,  false, false); }                        \
+    else if (do_grad && use_smem) { LAUNCH_TL(TLV, true,  true,  true);  }                        \
+    else if (do_grad)             { LAUNCH_TL(TLV, true,  false, true);  }                        \
+    else if (use_smem)            { LAUNCH_TL(TLV, false, true,  true);  }                        \
+    else                          { LAUNCH_TL(TLV, false, false, true);  }
 
     switch (tl_size) {
         case 4:  DISPATCH(4);  break;
@@ -446,13 +460,19 @@ void softevi_forward_dense(torch::Tensor params, torch::Tensor node_mars, torch:
                            int64_t batch_size, int64_t node_offset, int64_t TLv, int64_t threads,
                            int64_t cat_blocks, int64_t zero_z, int64_t run_epilogue, int64_t swizzle) {
     // `Z` accumulates across shards (the category set is split by reference-list length so that warps
-    // are homogeneous -- see `_choose_shard_split`), so the caller zeroes it on the first shard and
+    // are homogeneous -- see `_choose_shards`), so the caller zeroes it on the first shard and
     // takes the epilogue on the last.
     auto st = at::cuda::getCurrentCUDAStream();
     if (zero_z) Z.zero_();
     const dim3 grid((unsigned)cat_blocks, (unsigned)((num_latents + TLv - 1) / TLv), (unsigned)num_blocks);
     const bool swz = (swizzle != 0);
+    // A `Zs` tile past 48 KB needs the kernel's opt-in raised first; the caller only asks for tiles within
+    // the device's opt-in limit (`_fw_smem_cap`). Without it, batch * positions above ~3072 slots could
+    // not launch at all.
 #define GO_S(T, S) { const size_t sm = (size_t)num_slots * T * sizeof(float);                        \
+    if (sm > 48 * 1024)                                                                             \
+        C10_CUDA_CHECK(cudaFuncSetAttribute(softevi_fw_dense_z<T, S>,                               \
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm)); \
     softevi_fw_dense_z<T, S><<<grid, threads, sm, st>>>(params.data_ptr<float>(), uniq.data_ptr<int>(),\
         ref_slot.data_ptr<int>(), ref_pt.data_ptr<float>(), ref_cnt.data_ptr<int>(),                \
         num_uniq.data_ptr<int>(), p_base.data_ptr<long>(), Z.data_ptr<float>(),                     \

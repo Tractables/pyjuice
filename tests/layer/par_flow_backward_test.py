@@ -121,3 +121,60 @@ if __name__ == "__main__":
     test_par_flow_rmw_matches_atomic()
     test_par_flow_oom_fallback(True)
     test_par_flow_oom_fallback(False)
+
+
+def test_a_declined_tuning_allocates_no_benchmark_scratch():
+    """REGRESSION: the autotuner's benchmark buffer was allocated even when it would never be used.
+
+    `autotune.pick` declines -- and deliberately does NOT cache that -- when tuning is switched off,
+    when there is nothing to choose between, and during CUDA-graph capture (capture is transient, so
+    a later ordinary call should still tune). The call sites consulted only `autotune.cached`, which
+    therefore stays empty forever in those cases, so each one cloned its own output as a scratch on
+    EVERY call and threw it away. At the param-flow and element-flow sites that clone is the whole
+    flow array.
+
+    MEASURED on a 256-latent HCLT at batch 512 with `PYJUICE_AUTOTUNE=0`: 696 MB of transient peak per
+    backward and 102 allocations per iteration, against 3.06 MB and 3 with tuning on -- 227x. Wall
+    time was IDENTICAL (21.4 vs 21.3 ms; the caching allocator just hands the block back), which is
+    why this is asserted on the peak and the allocation count. A timing test would have passed
+    throughout, and did.
+    """
+    # A wide-ish layer and a real batch, so the flow arrays the old code cloned are large enough for
+    # the control below to separate clearly from the fixed path.
+    pc, device = _build_small_hclt(num_latents = 256)
+    x = torch.randint(0, 8, (512, 16), device = device)
+    _backward(pc, x)                     # the flow buffers do not exist until a backward runs
+    flow_bytes = max(pc.param_flows.numel(), pc.element_flows.numel()) * 4
+
+    def peak_over(n = 4):
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        for _ in range(n):
+            _backward(pc, x)
+        torch.cuda.synchronize()
+        return torch.cuda.max_memory_allocated() - base
+
+    was_enabled, cache = autotune.ENABLED, dict(autotune._CACHE)
+    real_should_tune = autotune.should_tune
+    try:
+        autotune.ENABLED, autotune._CACHE = False, dict()
+        _backward(pc, x)                       # warm up under the new setting before measuring
+        quiet = peak_over()
+
+        # POSITIVE CONTROL: restore the old behaviour (ask for a scratch even though `pick` will
+        # decline) and require the peak to blow up. Without this the assertion below could pass
+        # simply because nothing allocates anything on this shape.
+        autotune.should_tune = lambda *a, **k: True
+        autotune._CACHE = dict()
+        noisy = peak_over()
+    finally:
+        autotune.should_tune = real_should_tune
+        autotune.ENABLED, autotune._CACHE = was_enabled, cache
+
+    assert noisy > flow_bytes, (
+        f"the control did not reproduce the bug (peak {noisy} <= one flow array {flow_bytes}); "
+        f"this shape cannot detect the regression, so the assertion below proves nothing")
+    assert quiet < flow_bytes // 2, (
+        f"a declined tuning still allocated a benchmark scratch: peak {quiet} bytes against a flow "
+        f"array of {flow_bytes} (the control, with the old behaviour, reached {noisy})")

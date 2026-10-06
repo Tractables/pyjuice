@@ -457,38 +457,15 @@ class InputLayer(Layer, nn.Module):
             # Built here rather than at scope entry so that a circuit never run inside the scope
             # never pays for a copy, and so the scope needs no list of the circuits it covers.
             self._ensure_fast_inference_params(kwargs)
+            # Handed to the distribution like the backward's `_bk_launch_common`, and from the start:
+            # `preprocess_fw_kwargs` is where a distribution may first decide between kernel sets.
+            fw_launch_common = self._fw_launch_common(data, node_mars)
+            kwargs["_fw_launch_common"] = fw_launch_common
             self.dist.preprocess_fw_kwargs(self, kwargs)
             self.dist.set_custom_kernel_kwargs(kwargs)
             kwargs["_fw_data"] = data
-            for (kernel, cond_fn, prep_kwargs_fn) in self.post_fw_fns:
-                if not cond_fn(self, kwargs):
-                    continue
-
-                kwargs["batch_size"] = batch_size
-                target_kwargs, grid = prep_kwargs_fn(self, kwargs)
-
-                if grid is None:
-                    grid = (triton.cdiv(layer_num_nodes * batch_size, target_kwargs["BLOCK_SIZE"]),)
-
-                kernel[grid](
-                    params_ptr = self.params, 
-                    node_mars_ptr = node_mars, 
-                    data_ptr = data, 
-                    vids_ptr = self.vids, 
-                    s_pids_ptr = self.s_pids, 
-                    metadata_ptr = self.metadata, 
-                    s_mids_ptr = self.s_mids, 
-                    nids_ptr = self.nids,
-                    fw_local_ids_ptr = fw_local_ids,
-                    layer_num_nodes = layer_num_nodes, 
-                    batch_size = batch_size, 
-                    num_vars_per_node = self.num_vars_per_node, 
-                    nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
-                    node_offset = node_offset, 
-                    partial_eval = 1 if fw_local_ids is not None else 0,
-                    num_warps = 8,
-                    **target_kwargs
-                )
+            self._run_post(self.post_fw_fns, kwargs, fw_launch_common)
+            kwargs.pop("_fw_launch_common", None)
 
             # Apply missing mask if required
             if missing_mask is not None:
@@ -521,6 +498,56 @@ class InputLayer(Layer, nn.Module):
 
         else:
             raise NotImplementedError("CPU forward fn for input nodes is not implemented.")
+
+    def _fw_launch_common(self, data: torch.Tensor, node_mars: torch.Tensor):
+        """The launch arguments every forward post-processing kernel shares, for a flattened `data` and a
+        `node_mars` to write. A method rather than a dict built inline (as the backward's is) because a
+        distribution timing alternative kernel sets from inside the BACKWARD has to run the forward too,
+        into a scratch `node_mars` -- see `SoftEvidenceCategorical`'s `_tune_dense_choice`."""
+        if not self.provided("fw_local_ids"):
+            layer_num_nodes = self._output_ind_range[1] - self._output_ind_range[0]
+            fw_local_ids = None
+        else:
+            layer_num_nodes = self.fw_local_ids.size(0)
+            fw_local_ids = self.fw_local_ids
+
+        return dict(
+            params_ptr = self.params,
+            node_mars_ptr = node_mars,
+            data_ptr = data,
+            vids_ptr = self.vids,
+            s_pids_ptr = self.s_pids,
+            metadata_ptr = self.metadata,
+            s_mids_ptr = self.s_mids,
+            nids_ptr = self.nids,
+            fw_local_ids_ptr = fw_local_ids,
+            layer_num_nodes = layer_num_nodes,
+            batch_size = node_mars.size(1),
+            num_vars_per_node = self.num_vars_per_node,
+            nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
+            node_offset = self._output_ind_range[0],
+            partial_eval = 1 if fw_local_ids is not None else 0,
+            num_warps = 8,
+        )
+
+    def _run_post(self, fns, kwargs, launch_common):
+        """Launch a post-processing list (`post_fw_fns` / `post_bp_fns`) as the forward / backward do.
+
+        Each `(kernel, cond_fn, prep_kwargs_fn)` fires when `cond_fn` holds, with `launch_common` plus
+        what `prep_kwargs_fn` returns. Factored out so a distribution can replay exactly this, into
+        scratch buffers, to time alternatives."""
+        batch_size = launch_common["batch_size"]
+        for (kernel, cond_fn, prep_kwargs_fn) in fns:
+            if not cond_fn(self, kwargs):
+                continue
+
+            kwargs["batch_size"] = batch_size
+            target_kwargs, grid = prep_kwargs_fn(self, kwargs)
+
+            if grid is None:
+                grid = (triton.cdiv(launch_common["layer_num_nodes"] * batch_size, target_kwargs["BLOCK_SIZE"]),)
+
+            kernel[grid](**launch_common, **target_kwargs)
 
     def backward(self, data: torch.Tensor, node_flows: torch.Tensor, 
                  node_mars: torch.Tensor, params: Optional[Dict] = None,
@@ -595,7 +622,15 @@ class InputLayer(Layer, nn.Module):
 
             grid = (triton.cdiv(layer_num_nodes * batch_size, BLOCK_SIZE),)
 
-            if (not cuda_handled) and self.provided("_flows_kernel") and self._flows_kernel is not None:
+            # `param_flows is not None` guards the same hazard the CUDA fast-path above already checks:
+            # `backward(compute_param_flows = False)` never allocates `param_flows`, so this emission-flow
+            # kernel -- whose sole job is to accumulate into it -- would dereference a null pointer and
+            # die at Triton COMPILE time with a bare `NoneType has no attribute 'type'`. Nothing to
+            # accumulate into means nothing to do; node / element flows come from the inner layers and
+            # are unaffected. Reached by a direct `pc.backward(compute_param_flows = False)`; queries
+            # pass a flow-only `input_layer_fn` and never come through here.
+            if (not cuda_handled) and self.provided("_flows_kernel") and self._flows_kernel is not None \
+                    and self.param_flows is not None:
                 self._flows_kernel[grid](
                     params_ptr = self.params,
                     param_flows_ptr = self.param_flows,
@@ -637,40 +672,36 @@ class InputLayer(Layer, nn.Module):
             kwargs["_missing_mask_mode"] = missing_mask_mode
             kwargs["_missing_mask_num_vars"] = num_vars if num_vars is not None else 0
 
-            for (kernel, cond_fn, prep_kwargs_fn) in self.post_bp_fns:
-                if not cond_fn(self, kwargs):
-                    continue
-
-                kwargs["batch_size"] = batch_size
-                target_kwargs, grid = prep_kwargs_fn(self, kwargs)
-
-                if grid is None:
-                    grid = (triton.cdiv(layer_num_nodes * batch_size, target_kwargs["BLOCK_SIZE"]),)
-
-                kernel[grid](
-                    params_ptr = self.params,
-                    param_flows_ptr = self.param_flows,
-                    node_flows_ptr = node_flows, 
-                    node_mars_ptr = node_mars,
-                    data_ptr = data, 
-                    vids_ptr = self.vids, 
-                    s_pids_ptr = self.s_pids,
-                    s_pfids_ptr = self.s_pfids,
-                    metadata_ptr = self.metadata, 
-                    s_mids_ptr = self.s_mids, 
-                    nids_ptr = self.nids,
-                    bk_local_ids_ptr = bk_local_ids,
-                    layer_num_nodes = layer_num_nodes, 
-                    batch_size = batch_size, 
-                    num_vars_per_node = self.num_vars_per_node, 
-                    num_vars = num_vars,
-                    nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
-                    node_offset = node_offset,
-                    partial_eval = 1 if bk_local_ids is not None else 0,
-                    logspace_flows = logspace_flows,
-                    num_warps = 8,
-                    **target_kwargs
-                )
+            # The launch arguments every post-processing kernel shares. Also handed to the distribution
+            # (as `_bk_launch_common`) so it can time alternative kernel sets against each other into
+            # scratch buffers before committing to one -- see `SoftEvidenceCategorical`'s
+            # `_dense_worth_it`.
+            bk_launch_common = dict(
+                params_ptr = self.params,
+                param_flows_ptr = self.param_flows,
+                node_flows_ptr = node_flows,
+                node_mars_ptr = node_mars,
+                data_ptr = data,
+                vids_ptr = self.vids,
+                s_pids_ptr = self.s_pids,
+                s_pfids_ptr = self.s_pfids,
+                metadata_ptr = self.metadata,
+                s_mids_ptr = self.s_mids,
+                nids_ptr = self.nids,
+                bk_local_ids_ptr = bk_local_ids,
+                layer_num_nodes = layer_num_nodes,
+                batch_size = batch_size,
+                num_vars_per_node = self.num_vars_per_node,
+                num_vars = num_vars,
+                nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
+                node_offset = node_offset,
+                partial_eval = 1 if bk_local_ids is not None else 0,
+                logspace_flows = logspace_flows,
+                num_warps = 8,
+            )
+            kwargs["_bk_launch_common"] = bk_launch_common
+            self._run_post(self.post_bp_fns, kwargs, bk_launch_common)
+            kwargs.pop("_bk_launch_common", None)
 
             # Handle the masked input nodes
             if missing_mask is not None and self.bk_flow_mask_fn is not None:

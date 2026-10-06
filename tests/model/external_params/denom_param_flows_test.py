@@ -1,0 +1,2128 @@
+"""
+Regression tests for the `denom_param_flows` infrastructure -- the optional second flow buffer a layer
+requests when its M-step is a conditional dual-flow update `theta <- normalize(theta * F+ / F-)`
+(see `ExternalSumParams.requests_denom_param_flows`).
+
+These pin the generic PLUMBING, independent of the F- math (which a requesting layer's own backward
+writes, and which is validated where that layer is tested):
+
+  * the request signal defaults False on every descriptor and every layer, so an ordinary PC is
+    untouched and pays nothing;
+  * `pc.denom_param_flows` is allocated only when some layer requests it, is sized by the requesting
+    parameterizations, and rides the same zero / `flows_memory`-scale cadence as `param_flows`;
+  * a backward threads `denom_param_flows` from the PC through `layer.backward` to the descriptor's
+    `post_backward_layer`, while the plain and ungated paths keep threading `None`.
+
+NOTE on layout: the buffer is NOT a `param_flows` mirror. Its layout belongs to the parameterization,
+and `BlockScaleSumParams` keeps the gate-space contraction `W[node, gate]` -- `gate_cbs` times smaller
+-- reconstructing `F-[n,c] = theta[n,c] * W[n, g(c)]` once per EM step. Every test below that wants
+`F-` itself goes through `_fminus`, which runs that same reconstruction; the value-level assertions are
+therefore about `F-`, exactly as before, and none of them depend on where it is stored.
+
+`BlockScaleSumParams(apply_z_correction = True)` is the one shipped requester, and its correction math
+IS implemented -- both the gate-space `F-` accumulation and the conditional M-step, which the tests
+below validate against a torch reference and against finite differences. The M-step itself now lives
+GENERICALLY on `ExternalSumParams`: see `test_the_generic_m_step_needs_only_materialize_denom_flows`
+at the end of this file, which pins that a parameterization implementing one hook gets a correct
+update with no M-step code of its own.
+"""
+
+import math
+import os
+import pathlib
+import sys
+
+import pytest
+import torch
+
+import pyjuice as juice
+import pyjuice.nodes.distributions as dists
+from pyjuice.nodes import inputs, multiply, summate, BlockScaleSumParams
+from pyjuice.nodes.external_params.external_params import ExternalSumParams
+from pyjuice.nodes.external_params.lowrank import LowRankSumParams
+from pyjuice.layer.layer import Layer
+from pyjuice.layer.sum_layer import SumLayer
+from pyjuice.layer.prod_layer import ProdLayer
+from pyjuice.layer.input_layer import InputLayer
+from pyjuice.layer.external_sum_layer import ExternalParamsSumLayer
+
+
+cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a GPU")
+
+NUM_CATS = 5
+
+
+def _build(gated = None, block_size = 4, n_blocks = 2, seed = 0):
+    """Small PC. `gated=None` -> plain sum layer; else a BlockScale gate with `apply_z_correction=gated`."""
+    torch.manual_seed(seed)
+    with juice.set_block_size(block_size):
+        i0 = inputs(0, num_node_blocks = n_blocks, dist = dists.Categorical(num_cats = NUM_CATS))
+        i1 = inputs(1, num_node_blocks = n_blocks, dist = dists.Categorical(num_cats = NUM_CATS))
+        m = multiply(i0, i1)
+        if gated is None:
+            ns = summate(m, num_node_blocks = n_blocks)
+        else:
+            ns = summate(m, num_node_blocks = n_blocks,
+                         external_params = BlockScaleSumParams(ch_block_size = 2, apply_z_correction = gated))
+        root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
+    root.init_parameters(perturbation = 2.0)
+    return root, ns
+
+
+def _gate(ns, batch, device):
+    return torch.zeros(ns.external_params.tensor_shapes(ns, batch)[0], device = device)
+
+
+def _ext_layer(pc):
+    layers = [l for g in pc.inner_layer_groups for l in g.layers
+              if isinstance(l, ExternalParamsSumLayer)]
+    assert len(layers) == 1
+    return layers[0]
+
+
+def _fminus(pc, ns):
+    """`F-` for `ns`, rebuilt from the stored gate-space accumulator and placed at its `pfid`s.
+
+    Returned full-length (zero outside `ns._param_flow_range`) so a test can index it with the
+    compiled `pfids` exactly as it indexes `param_flows` -- the buffer itself is `gate_cbs` times
+    smaller and differently laid out, but `F-` is the quantity under test.
+    """
+    sources = pc._denom_correction_nss()[ns]
+    local = ns.external_params.materialize_denom_flows(
+        ns, pc.params, pc.denom_param_flows, sources)
+    out = torch.zeros_like(pc.param_flows)
+    pfs, pfe = ns._param_flow_range
+    out[pfs:pfe] = local
+    return out
+
+
+# ---------------------------------------------------------------- step 1: the request signal
+
+def test_request_signal_defaults_false_on_descriptors():
+    assert ExternalSumParams.requests_denom_param_flows is False
+    assert LowRankSumParams(rank = 4).requests_denom_param_flows is False
+    assert BlockScaleSumParams().requests_denom_param_flows is False          # correction off by default
+
+
+def test_blockscale_requests_denom_iff_correction():
+    assert BlockScaleSumParams(apply_z_correction = False).requests_denom_param_flows is False
+    assert BlockScaleSumParams(apply_z_correction = True).requests_denom_param_flows is True
+
+
+def test_every_layer_class_defaults_false():
+    for L in (Layer, SumLayer, ProdLayer, InputLayer):
+        assert L.requests_denom_param_flows is False
+
+
+@pytest.mark.parametrize("corr", [False, True])
+def test_external_layer_delegates_request_to_descriptor(corr):
+    # The layer must READ the descriptor, not fall back to the Layer class default.
+    root, _ = _build(gated = corr)
+    pc = juice.compile(root, verbose = False)
+    assert _ext_layer(pc).requests_denom_param_flows is corr
+
+
+# ---------------------------------------------------------------- step 2: allocation + lifecycle
+
+def test_plain_pc_allocates_no_denom_buffer():
+    root, _ = _build(gated = None)
+    pc = juice.compile(root, verbose = False)
+    assert pc._requests_denom_param_flows is False
+    pc.init_param_flows(flows_memory = 0.0)
+    assert pc.param_flows is not None                                          # unchanged
+    assert pc.denom_param_flows is None                                        # pays nothing
+
+
+def test_gated_without_correction_allocates_no_denom_buffer():
+    root, _ = _build(gated = False)
+    pc = juice.compile(root, verbose = False)
+    assert pc._requests_denom_param_flows is False
+    pc.init_param_flows(flows_memory = 0.0)
+    assert pc.denom_param_flows is None
+
+
+def test_correction_pc_allocates_a_compact_denom_buffer():
+    """Allocated, separate from `F+`, and SMALLER than it -- the gate-space accumulator holds one entry
+    per (node, gate), not per (node, child), so the gated range shrinks by exactly `gate_cbs`."""
+    root, ns = _build(gated = True)                                  # ch_block_size = 2
+    pc = juice.compile(root, verbose = False)
+    assert pc._requests_denom_param_flows is True
+    pc.init_param_flows(flows_memory = 0.0)
+    d, p = pc.denom_param_flows, pc.param_flows
+    assert d is not None
+    assert d is not p and d.data_ptr() != p.data_ptr()          # a SEPARATE buffer, not an alias of F+
+    assert d.dtype == p.dtype and d.device == p.device
+    assert d.numel() == pc.num_denom_flows
+    assert torch.count_nonzero(d) == 0
+
+    # exactly `gate_cbs` times smaller than the range it replaces
+    gate_cbs = ns.external_params.gate_sizes(ns)[1]
+    pfs, pfe = ns._param_flow_range
+    assert d.numel() * gate_cbs == pfe - pfs, (d.numel(), gate_cbs, pfe - pfs)
+    assert d.numel() < p.numel()
+
+    # independent storage: writing one must not disturb the other (an alias would fail this)
+    d[:] = 5.0
+    p[:] = 9.0
+    assert bool((pc.denom_param_flows == 5.0).all()) and bool((pc.param_flows == 9.0).all())
+
+
+def test_denom_slices_tile_the_buffer_without_gaps_or_overlap():
+    """The PC lays requesting layers end to end, so every float belongs to exactly one partition of one
+    layer. A gap would be wasted memory; an overlap would silently mix two layers' denominators."""
+    root, _ = _build(gated = True)
+    pc = juice.compile(root, verbose = False)
+    slices = [s for g in pc.inner_layer_groups for l in g.layers
+              if getattr(l, "requests_denom_param_flows", False)
+              for s in l.denom_flow_slices]
+    assert len(slices) > 0
+    cursor = 0
+    for off, size in sorted(slices):
+        assert off == cursor, (off, cursor)
+        assert size > 0
+        cursor = off + size
+    assert cursor == pc.num_denom_flows
+
+
+def test_denom_rides_zero_and_scale_cadence():
+    root, _ = _build(gated = True)
+    pc = juice.compile(root, verbose = False)
+    pc.init_param_flows(flows_memory = 0.0)
+
+    # zero_param_flows() must zero denom too (it routes through init_param_flows(0.0))
+    pc.denom_param_flows[:] = 7.0
+    pc.param_flows[:] = 3.0
+    pc.zero_param_flows()
+    assert torch.count_nonzero(pc.denom_param_flows) == 0
+    assert torch.count_nonzero(pc.param_flows) == 0
+
+    # flows_memory scales denom exactly as it scales param_flows
+    pc.denom_param_flows[:] = 4.0
+    pc.param_flows[:] = 4.0
+    pc.init_param_flows(flows_memory = 0.5)
+    assert torch.allclose(pc.denom_param_flows, torch.full_like(pc.denom_param_flows, 2.0))
+    assert torch.allclose(pc.param_flows, torch.full_like(pc.param_flows, 2.0))
+
+
+# ---------------------------------------------------------------- step 4: pass-through to the descriptor
+
+@cuda_only
+def test_plain_backward_unaffected_by_new_signature():
+    dev = torch.device("cuda:0")
+    root, _ = _build(gated = None)
+    pc = juice.compile(root, verbose = False).to(dev)
+    x = torch.randint(0, NUM_CATS, [16, 2], device = dev)
+    pc(x)
+    pc.backward(x, flows_memory = 1.0)                                          # threads None, no error
+    assert pc.denom_param_flows is None
+    p0 = pc.params.detach().clone()
+    pc.mini_batch_em(step_size = 0.5, pseudocount = 0.1)
+    assert torch.isfinite(pc.params).all() and not torch.allclose(p0, pc.params)
+
+
+@cuda_only
+def test_gated_off_threads_none_to_post_backward_layer():
+    dev = torch.device("cuda:0")
+    root, ns = _build(gated = False)
+    pc = juice.compile(root, verbose = False).to(dev)
+    x = torch.randint(0, NUM_CATS, [16, 2], device = dev)
+    phi = _gate(ns, 16, dev)
+
+    seen = {}
+    orig = BlockScaleSumParams.post_backward_layer
+    def cap(self, *a, **k):
+        seen["denom"] = k.get("denom_param_flows", "MISSING")
+        return orig(self, *a, **k)
+    BlockScaleSumParams.post_backward_layer = cap
+    try:
+        pc(x, sum_external_params = {ns: phi})
+        pc.backward(x, sum_external_params = {ns: phi}, logspace_flows = True, flows_memory = 1.0)
+    finally:
+        BlockScaleSumParams.post_backward_layer = orig
+
+    assert seen["denom"] is None                       # kwarg threaded; None because it was not requested
+    assert pc.denom_param_flows is None
+
+
+@cuda_only
+def test_correction_on_threads_the_denom_buffer_to_post_backward_layer():
+    """Step-4 pass-through in ISOLATION: stub the descriptor's two backward hooks so the check depends
+    only on the plumbing (not on the F- math, which its own tests below cover) -- the allocated
+    `denom_param_flows` buffer, the exact PC object, must reach `post_backward_layer`."""
+    dev = torch.device("cuda:0")
+    root, ns = _build(gated = True)
+    pc = juice.compile(root, verbose = False).to(dev)
+    x = torch.randint(0, NUM_CATS, [16, 2], device = dev)
+    phi = _gate(ns, 16, dev)
+
+    seen = {}
+    orig_pre, orig_post = BlockScaleSumParams.pre_backward_layer, BlockScaleSumParams.post_backward_layer
+    BlockScaleSumParams.pre_backward_layer = lambda self, *a, **k: None         # skip the WIP raise + setup
+    def cap(self, *a, **k):
+        seen["denom"] = k.get("denom_param_flows", "MISSING")
+        return None
+    BlockScaleSumParams.post_backward_layer = cap
+    try:
+        assert pc.denom_param_flows is None                                    # lazy: allocated in backward
+        pc(x, sum_external_params = {ns: phi})
+        pc.backward(x, sum_external_params = {ns: phi}, logspace_flows = True, flows_memory = 1.0)
+    finally:
+        BlockScaleSumParams.pre_backward_layer = orig_pre
+        BlockScaleSumParams.post_backward_layer = orig_post
+
+    d = seen.get("denom")
+    assert torch.is_tensor(d)
+    assert d is pc.denom_param_flows                                           # the exact allocated buffer
+    assert d.numel() == pc.num_denom_flows and d.dtype == pc.param_flows.dtype
+
+
+def _build_mixed(block_size = 4, n_blocks = 2, seed = 0):
+    """Two sum layers at the SAME depth and block size -- one plain, one gated (correction off) -- so
+    they land in ONE `LayerGroup`, and the group's backward hands the `denom_param_flows` kwarg to the
+    plain `SumLayer` too."""
+    torch.manual_seed(seed)
+    with juice.set_block_size(block_size):
+        i0 = inputs(0, num_node_blocks = n_blocks, dist = dists.Categorical(num_cats = NUM_CATS))
+        i1 = inputs(1, num_node_blocks = n_blocks, dist = dists.Categorical(num_cats = NUM_CATS))
+        m = multiply(i0, i1)
+        ns_plain = summate(m, num_node_blocks = n_blocks)
+        ns_gated = summate(m, num_node_blocks = n_blocks,
+                           external_params = BlockScaleSumParams(ch_block_size = 2))
+        root = summate(multiply(ns_plain), multiply(ns_gated), num_node_blocks = 1, block_size = 1)
+    root.init_parameters(perturbation = 2.0)
+    return root, ns_gated
+
+
+@cuda_only
+def test_mixed_gated_and_plain_sum_layers_in_one_group():
+    dev = torch.device("cuda:0")
+    root, ns_gated = _build_mixed()
+    pc = juice.compile(root, verbose = False).to(dev)
+
+    # exactly one sum group holds BOTH a plain SumLayer and an ExternalParamsSumLayer
+    sum_groups = [g for g in pc.inner_layer_groups if g.is_sum()]
+    mixed = [g for g in sum_groups
+             if any(isinstance(l, ExternalParamsSumLayer) for l in g.layers)
+             and any(not isinstance(l, ExternalParamsSumLayer) for l in g.layers)]
+    assert len(mixed) == 1, [[type(l).__name__ for l in g.layers] for g in sum_groups]
+
+    x = torch.randint(0, NUM_CATS, [16, 2], device = dev)
+    phi = _gate(ns_gated, 16, dev)
+    pc(x, sum_external_params = {ns_gated: phi})
+    # the plain SumLayer in the group also receives `denom_param_flows` (via **kwargs) -- must not choke
+    pc.backward(x, sum_external_params = {ns_gated: phi}, logspace_flows = True, flows_memory = 1.0)
+    assert pc.denom_param_flows is None                # correction off -> not requested
+
+
+# ------------------------------------------------------ step 5: the F- accumulation (apply_z_correction)
+
+def _phi(ns, batch, dev, scale = 1.5):
+    return torch.randn(ns.external_params.tensor_shapes(ns, batch)[0], device = dev) * scale
+
+
+def _corr_flows(pc, ns, x, phi, ref = False):
+    """One gated fwd+bwd with `apply_z_correction`; returns (F+, F-) fresh for this batch.
+    `ref=True` forces the torch reference `_accumulate_denom_torch` via the env switch."""
+    os.environ["PYJUICE_BLOCKSCALE_DENOM_REF"] = "1" if ref else "0"
+    try:
+        pc(x, sum_external_params = {ns: phi})
+        pc.backward(x, sum_external_params = {ns: phi}, logspace_flows = True, flows_memory = 0.0)
+    finally:
+        os.environ.pop("PYJUICE_BLOCKSCALE_DENOM_REF", None)
+    return pc.param_flows.clone(), _fminus(pc, ns)
+
+
+@cuda_only
+def test_denom_accumulation_matches_finite_differences():
+    """The decisive check: `F+ - F-` equals the exact gradient d(sum_b log P(x_b)) / d log theta[n,c],
+    validated numerically. This is what makes `F-` the right denominator for the conditional M-step
+    `theta <- normalize(theta * F+ / F-)` -- and it shares no indexing with the kernel."""
+    dev = torch.device("cuda:0")
+    root, ns = _build(gated = True)                                   # apply_z_correction = True
+    pc = juice.compile(root, verbose = False).to(dev)
+    lay = pc.external_params_nodes[ns]
+    B = 32
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    phi = _phi(ns, B, dev)
+    Fp, Fm = _corr_flows(pc, ns, x, phi)
+
+    pids, pfids, cids = lay.partitioned_pids[0], lay.partitioned_pfids[0], lay.partitioned_cids[0]
+    rows, E = pids.shape
+
+    def ll():
+        with torch.no_grad():                                         # perturb theta, no autograd graph
+            return pc(x, sum_external_params = {ns: phi}).double().sum().item()
+
+    # The finite difference is of a float32 LL summed over the batch (~-100 here), so it carries a noise
+    # floor of roughly ulp / (2 eps) -- MEASURED ~5e-5 at eps = 1e-2: two numerically equivalent forwards
+    # gave -0.00058 and -0.00063 for an entry whose analytic value is -0.00058 (both forwards agreed
+    # with the analytic gradient on every entry at eps = 3e-2). Hence the larger eps, where every entry
+    # agreed to ~1e-5 and the O(eps^2) truncation is still far below that, and a floor of 1e-2 on the
+    # denominator, so a near-zero gradient is judged by its absolute error rather than by noise / ~0.
+    # A wrong `F-` is an error of the order of the gradient itself on the large entries (0.02-0.17).
+    eps, worst, n = 3e-2, 0.0, 0
+    for r in range(min(rows, 2)):
+        for e in range(min(E, 4)):
+            if int(cids[r, e]) == 0:
+                continue
+            for m in (0, 2):
+                pid, pf = int(pids[r, e]) + m, int(pfids[r, e]) + m
+                g_an = float(Fp[pf] - Fm[pf])
+                with torch.no_grad():
+                    o = float(pc.params[pid]); pc.params[pid] = o * math.exp(eps); lp = ll()
+                    pc.params[pid] = o * math.exp(-eps); lm = ll(); pc.params[pid] = o
+                g_fd = (lp - lm) / (2 * eps)
+                worst = max(worst, abs(g_fd - g_an) / max(abs(g_fd), abs(g_an), 1e-2))
+                n += 1
+    assert n > 0
+    assert worst < 5e-2, worst
+
+
+@cuda_only
+def test_denom_kernel_matches_torch_reference():
+    """The shipped Triton kernel must agree with the finite-difference-validated torch reference."""
+    dev = torch.device("cuda:0")
+    root, ns = _build(gated = True)
+    pc = juice.compile(root, verbose = False).to(dev)
+    B = 32
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    phi = _phi(ns, B, dev)
+
+    Fp_k, Fm_k = _corr_flows(pc, ns, x, phi, ref = False)             # Triton kernel
+    Fp_r, Fm_r = _corr_flows(pc, ns, x, phi, ref = True)             # torch reference
+    assert torch.allclose(Fp_k, Fp_r)                                # numerator unaffected by denom path
+    assert torch.count_nonzero(Fm_k) > 0
+    rel = ((Fm_k - Fm_r).abs() / (Fm_r.abs() + 1e-6)).max().item()
+    assert rel < 1e-4, rel
+
+
+@cuda_only
+@pytest.mark.parametrize("split", [(48, 48), (64, 32), (33, 63)])
+def test_denom_accumulates_across_backward_calls(split):
+    """`F-` over two minibatches must equal `F-` over their concatenation.
+
+    This is the property the GATE-SPACE accumulator rests on -- `W[n,g] = sum_b u[n,b] phi[g,b]` is
+    additive over samples, so `F- = theta * W` is too (`theta` does not change until the M-step) -- and
+    it is what makes FULL-BATCH EM work at all: flows accumulate over a whole epoch of backward calls
+    before one M-step. It is also what the `W` kernel's read-add-write exists for; a `tl.store` there
+    would keep only the LAST minibatch and every single-backward test in this file would still pass.
+
+    The two arms use different batch sizes, so the kernel's batch tiling and its `B_SPLITS` reduction
+    differ between them -- the equality has to hold across that too, not just across the summation.
+    """
+    dev = torch.device("cuda:0")
+    b1, b2 = split
+    root, ns = _build(gated = True)
+    pc = juice.compile(root, verbose = False).to(dev)
+
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [b1 + b2, 2], device = dev)
+    phi = _phi(ns, b1 + b2, dev)
+
+    def bwd(xx, pp, memory):
+        pc(xx, sum_external_params = {ns: pp})
+        pc.backward(xx, sum_external_params = {ns: pp}, logspace_flows = True,
+                    flows_memory = memory, allow_modify_flows = False)
+
+    # one call over the whole batch
+    bwd(x, phi, 0.0)
+    Fp_one, Fm_one = pc.param_flows.clone(), _fminus(pc, ns)
+
+    # two calls, accumulating (`flows_memory = 1.0` on the second keeps what the first left)
+    bwd(x[:b1], phi[:b1], 0.0)
+    bwd(x[b1:], phi[b1:], 1.0)
+    Fp_two, Fm_two = pc.param_flows.clone(), _fminus(pc, ns)
+
+    assert torch.count_nonzero(Fm_one) > 0
+    for name, a, b in (("F+", Fp_one, Fp_two), ("F-", Fm_one, Fm_two)):
+        rel = ((a - b).abs() / a.abs().clamp_min(1e-20)).max().item()
+        assert rel < 1e-4, f"{name} differs between one batch of {b1 + b2} and {b1}+{b2}: relmax={rel}"
+
+
+@cuda_only
+def test_anemone_momentum_smooths_the_denominator_too():
+    """Momentum must pass the DENOMINATOR through the same EMA as the numerator.
+
+    The conditional M-step forms `theta * F+ / F-` and its stationary point is `F+ == F-`. Smoothing
+    only the numerator divides an averaged quantity by an instantaneous one, which breaks that identity
+    and rescales parameters that exact EM would leave alone. Legitimate in the stored gate space because
+    `F- = theta * W` is linear in `W`.
+
+    Pinned at the buffer level: feed numerator and denominator the SAME value each round, so equal in
+    must mean equal out. A trained-model check could not see this -- the error is a smooth rescaling,
+    not a blow-up.
+
+    The fed value MUST VARY between rounds. A bias-corrected EMA returns a constant input exactly --
+    that is what the correction is for -- so feeding the same number every round makes the EMA an
+    identity and the test passes whether or not the denominator rides it. VERIFIED by negative control:
+    with a constant 3.0 this test passed with the denominator's EMA disabled; with the ramp below it
+    fails, numerator 3.105 against denominator 5.0.
+    """
+    dev = torch.device("cuda:0")
+    root, ns = _build(gated = True)
+    pc = juice.compile(root, verbose = False).to(dev)
+    opt = juice.optim.Anemone(pc, step_size = 0.4, momentum = 0.9, pseudocount = 0.01)
+
+    B = 32
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    phi = _phi(ns, B, dev)
+    pc(x, sum_external_params = {ns: phi})
+    pc.backward(x, sum_external_params = {ns: phi}, logspace_flows = True,
+                flows_memory = 0.0, allow_modify_flows = False)
+    assert pc.denom_param_flows is not None
+
+    seen_smoothing = False
+    for update, fed in enumerate((1.0, 5.0, 2.0)):       # VARYING -- see the docstring
+        pc.param_flows[:] = fed
+        pc.denom_param_flows[:] = fed
+        opt._apply_momentum()
+        opt._num_updates += 1
+
+        fp, fm = pc.param_flows, pc.denom_param_flows
+        assert float(fp.std()) < 1e-5 and float(fm.std()) < 1e-5, "the EMA should keep a constant flat"
+        a, b = float(fp.mean()), float(fm.mean())
+        assert abs(a - b) / max(abs(a), 1e-20) < 1e-5, \
+            f"update {update}: numerator scaled to {a} but denominator to {b}"
+        if abs(a - fed) / fed > 1e-3:
+            seen_smoothing = True
+
+    # the arm that makes the equality above meaningful: the EMA has to have actually CHANGED something,
+    # or "equal in, equal out" holds trivially and the test cannot see a missing denominator EMA
+    assert seen_smoothing, "the EMA never moved a value, so this test would pass either way"
+
+
+@cuda_only
+@pytest.mark.parametrize("opt_cls", ["SGD", "Adam"])
+def test_gradient_optimizer_renormalizes_without_the_correction(opt_cls):
+    """A gradient optimizer's step must survive a circuit that requests the denominator flow.
+
+    Its step 7 renormalizes by calling `mini_batch_em` with `param_flows` holding the PARTITION flow and
+    the denominator just zeroed by `zero_flows()`. Applying the conditional update there divides by
+    `pseudocount * theta` -- 1e-38 at `renorm_pseudocount = 0` -- so the parameters came back inf. It
+    must run the PLAIN projection instead, which is what `_apply_denom_correction = False` selects.
+
+    Checked on the parameters rather than on a mock, because `inf`/`NaN` is exactly what the bug
+    produced; a warning is also expected, since the gradient itself is still uncorrected.
+    """
+    import warnings as _w
+
+    dev = torch.device("cuda:0")
+    root, ns = _build(gated = True)
+    pc = juice.compile(root, verbose = False).to(dev)
+
+    with _w.catch_warnings(record = True) as caught:
+        _w.simplefilter("always")
+        opt = getattr(juice.optim, opt_cls)(pc, lr = 1e-3)
+    assert any("apply_z_correction" in str(c.message) for c in caught), \
+        "constructing a gradient optimizer on a corrected circuit should warn that the gradient is " \
+        "not the corrected one"
+
+    B = 32
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    phi = _phi(ns, B, dev)
+
+    for _ in range(2):
+        opt.zero_flows()
+        lls = pc(x, sum_external_params = {ns: phi})
+        pc.backward(x, sum_external_params = {ns: phi}, flows_memory = 1.0,
+                    allow_modify_flows = False, logspace_flows = True)
+        opt.step()
+        assert torch.isfinite(pc.params).all(), f"{opt_cls} produced non-finite parameters"
+
+    # still on the normalized manifold, which is the whole point of step 7
+    ps, pe = ns._param_range
+    E, cbs, bs = ns.edge_ids.size(1), ns.ch_block_size, ns.block_size
+    theta = pc.params[ps:pe].reshape(E, cbs, bs)
+    nb = ns.edge_ids[0].to(device = dev, dtype = torch.long)
+    tot = torch.zeros(ns.num_node_blocks, bs, device = dev)
+    tot.index_add_(0, nb, theta.sum(dim = 1))
+    assert (tot - 1.0).abs().max().item() < 1e-3, (tot - 1.0).abs().max().item()
+
+
+@cuda_only
+def test_em_correction_preserves_zero_parameters():
+    """`keep_zero_params = True` must leave an exactly-zero parameter at zero through the CORRECTED
+    M-step, and the surviving children must still renormalize to one without it.
+
+    The correction computes `new_theta` itself and overwrites the standard update, so the flag has to be
+    honored in `compute_em_correction` too -- `em_par_update`'s own `keep_zero_params` handling never
+    reaches these ranges. The `False` arm is the control: it must actually revive the zeros, otherwise
+    the `True` arm proves nothing.
+    """
+    dev = torch.device("cuda:0")
+    B = 64
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+
+    out = {}
+    for keep in (True, False):
+        root, ns = _build(gated = True)
+        pc = juice.compile(root, verbose = False).to(dev)
+        ps, pe = ns._param_range
+        E, cbs, bs = ns.edge_ids.size(1), ns.ch_block_size, ns.block_size
+
+        # zero one child block of every node block, then renormalize what is left
+        theta = pc.params[ps:pe].reshape(E, cbs, bs)
+        theta[:, 0, :] = 0.0
+        nb = ns.edge_ids[0].to(device = dev, dtype = torch.long)
+        tot = torch.zeros(ns.num_node_blocks, bs, device = dev)
+        tot.index_add_(0, nb, theta.sum(dim = 1))
+        theta /= tot[nb][:, None, :]
+        zeroed = theta == 0.0
+        assert int(zeroed.sum()) > 0
+
+        phi = _phi(ns, B, dev)
+        pc(x, sum_external_params = {ns: phi})
+        pc.backward(x, sum_external_params = {ns: phi}, logspace_flows = True,
+                    flows_memory = 0.0, allow_modify_flows = False)
+        pc.mini_batch_em(step_size = 1.0, pseudocount = 0.1, keep_zero_params = keep)
+
+        after = pc.params[ps:pe].reshape(E, cbs, bs)
+        tot = torch.zeros(ns.num_node_blocks, bs, device = dev)
+        tot.index_add_(0, nb, after.sum(dim = 1))
+        out[keep] = dict(revived = float(after[zeroed].abs().max()),
+                         norm_dev = float((tot - 1.0).abs().max()))
+
+    assert out[True]["revived"] == 0.0, \
+        f"`keep_zero_params = True` revived a zero parameter to {out[True]['revived']}"
+    assert out[True]["norm_dev"] < 1e-4, out[True]["norm_dev"]
+    # control: without the flag the pseudocount must revive them, or the assert above is vacuous
+    assert out[False]["revived"] > 0.0, \
+        "`keep_zero_params = False` left the zeros at zero, so the True arm proves nothing"
+
+
+def _build_two_gated(seed = 0):
+    """Two INDEPENDENT gated `ns` that compile into ONE layer (verified by the test)."""
+    torch.manual_seed(seed)
+    with juice.set_block_size(4):
+        i = [inputs(v, num_node_blocks = 2, dist = dists.Categorical(num_cats = NUM_CATS))
+             for v in range(4)]
+        ga = summate(multiply(i[0], i[1]), num_node_blocks = 2,
+                     external_params = BlockScaleSumParams(ch_block_size = 2,
+                                                           apply_z_correction = True))
+        gb = summate(multiply(i[2], i[3]), num_node_blocks = 2,
+                     external_params = BlockScaleSumParams(ch_block_size = 2,
+                                                           apply_z_correction = True))
+        root = summate(multiply(ga, gb), num_node_blocks = 1, block_size = 1)
+    torch.manual_seed(seed)
+    root.init_parameters(perturbation = 2.0)
+    return root, ga, gb
+
+
+@cuda_only
+def test_two_gated_ns_sharing_one_layer_do_not_mix_denominators():
+    """Two gated `ns` in the SAME layer share one `W` slice, and only a bound mask separates them.
+
+    The reconstruction is called once per `ns` with that `ns`'s `pfid` base, over a partition holding
+    BOTH nodes' blocks; rows belonging to the other `ns` land outside `[0, out_size)` and are dropped
+    (`materialize_denom_flows`' branchless clamp exists for exactly this). If the mask leaked, one `ns`
+    would absorb the other's flow -- and every other test in this file has one gated `ns` per layer, so
+    nothing exercised it.
+
+    Checked by per-`ns` CONSERVATION (`sum_c F-[n,c] == sum_b f_b[n]`) plus finite differences, both
+    reference-free, and both covering the shared-layer reconstruction: a zero-`theta` break in the scatter
+    kernel fails this test, so the values really do come from it.
+
+    WHAT THIS TEST DOES *NOT* PIN: the bound mask itself. MEASURED -- deleting
+    `(off >= 0) & (off < out_size)` (keeping the clamp) leaves the output BITWISE identical, and neither
+    arm notices. The reason is a lost-update race, not invariance: the foreign rows all clamp onto one
+    element, and the program that legitimately owns it loads before they store and then stores over them.
+    So the mask is still necessary -- without it the result is a race whose outcome is undefined, it just
+    happens to resolve favourably at this shape -- but no deterministic assertion here can detect its
+    absence. Do not read a pass as evidence that the mask is intact.
+    """
+    dev = torch.device("cuda:0")
+    root, ga, gb = _build_two_gated()
+    pc = juice.compile(root, verbose = False).to(dev)
+
+    lay_a, lay_b = pc.external_params_nodes[ga], pc.external_params_nodes[gb]
+    assert lay_a is lay_b, "the fixture no longer puts both gated ns in one layer; this test is moot"
+    assert len(lay_a.denom_flow_slices) == lay_a.num_fw_partitions
+    assert set(pc._denom_correction_nss()) == {ga, gb}
+
+    B = 64
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [B, 4], device = dev)
+    phis = {ga: _phi(ga, B, dev), gb: _phi(gb, B, dev)}
+
+    pc(x, sum_external_params = phis)
+    pc.backward(x, sum_external_params = phis, logspace_flows = True,
+                flows_memory = 0.0, allow_modify_flows = False)
+    Fp = pc.param_flows.clone()
+    Fm = {g: _fminus(pc, g) for g in (ga, gb)}
+    for g in (ga, gb):
+        a, b = g._param_flow_range
+        assert torch.count_nonzero(Fm[g][a:b]) > 0, "a gated ns got no F-"
+
+    # ---- per-ns conservation, restricted to THIS ns's rows of the shared partition ----
+    ar = torch.arange(4, device = dev)
+    for g in (ga, gb):
+        ps, pe = g._param_range
+        pfids, cids = lay_a.partitioned_pfids[0], lay_a.partitioned_cids[0]
+        pids, nids = lay_a.partitioned_pids[0], lay_a.partitioned_nids[0].long()
+        mine = [r for r in range(pids.size(0)) if ps <= int(pids[r, 0]) < pe]
+        assert len(mine) == g.num_node_blocks, (len(mine), g.num_node_blocks)
+        worst = 0.0
+        for r in mine:
+            gid = nids[r] + ar
+            flow = pc.node_flows[gid].double().exp().sum(-1)            # sum_b f_b per node
+            idx = (pfids[r][None, :] + ar[:, None]).long()              # [block_size, E]
+            real = (cids[r] != 0)[None, :].expand(4, pfids.size(1))
+            got = (Fm[g][idx].double() * real).sum(-1)                  # sum_c F- per node
+            keep = flow.abs() > 1e-8
+            if bool(keep.any()):
+                worst = max(worst, float(((got - flow).abs()[keep] / flow.abs()[keep]).max()))
+        assert worst < 1e-4, \
+            f"ns at {ps}:{pe} does not conserve node flow (relmax={worst}) -- its F- absorbed " \
+            f"another ns's rows from the shared partition"
+
+    def ll():
+        with torch.no_grad():
+            return pc(x, sum_external_params = phis).double().sum().item()
+
+    eps = 1e-2
+    for g in (ga, gb):
+        pids = lay_a.partitioned_pids[0]
+        pfids, cids = lay_a.partitioned_pfids[0], lay_a.partitioned_cids[0]
+        ps, pe = g._param_range
+        n, dmax, gmax = 0, 0.0, 0.0
+        for r in range(pids.size(0)):
+            for e in range(pids.size(1)):
+                pid = int(pids[r, e])
+                if int(cids[r, e]) == 0 or not (ps <= pid < pe):      # this ns's rows only
+                    continue
+                for m in (0, 2):
+                    pf = int(pfids[r, e]) + m
+                    g_an = float(Fp[pf] - Fm[g][pf])
+                    with torch.no_grad():
+                        o = float(pc.params[pid + m])
+                        pc.params[pid + m] = o * math.exp(eps); lp = ll()
+                        pc.params[pid + m] = o * math.exp(-eps); lm = ll()
+                        pc.params[pid + m] = o
+                    g_fd = (lp - lm) / (2 * eps)
+                    dmax = max(dmax, abs(g_fd - g_an))
+                    gmax = max(gmax, abs(g_an), abs(g_fd))
+                    n += 1
+        assert n >= 4, n
+        assert dmax / gmax < 5e-2, f"ns at {ps}:{pe}: dmax={dmax:.3e} gmax={gmax:.3e}"
+
+
+@cuda_only
+@pytest.mark.parametrize("step_size,pseudocount", [(1.0, 0.0), (0.5, 0.1)])
+def test_denom_correction_opt_out_matches_an_uncorrected_build(step_size, pseudocount):
+    """`mini_batch_em(_apply_denom_correction = False)` on a corrected circuit must reproduce the PLAIN
+    M-step exactly -- i.e. the same parameters as the identical circuit built with
+    `apply_z_correction = False`.
+
+    That is the contract the gradient optimizers' renormalization depends on, and it is also the
+    statement that having the correction AVAILABLE does not perturb the uncorrected path.
+    """
+    dev = torch.device("cuda:0")
+    B = 64
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+
+    out = {}
+    for corr in (True, False):
+        root, ns = _build(gated = corr, seed = 0)
+        pc = juice.compile(root, verbose = False).to(dev)
+        torch.manual_seed(5)
+        phi = _phi(ns, B, dev)
+        pc(x, sum_external_params = {ns: phi})
+        pc.backward(x, sum_external_params = {ns: phi}, logspace_flows = True,
+                    flows_memory = 0.0, allow_modify_flows = False)
+        assert (pc.denom_param_flows is not None) is corr
+        # the corrected circuit opts OUT; the uncorrected one has nothing to opt out of
+        pc.mini_batch_em(step_size = step_size, pseudocount = pseudocount,
+                         _apply_denom_correction = False)
+        out[corr] = pc.params.detach().clone()
+
+    rel = ((out[True] - out[False]).abs() / out[False].abs().clamp_min(1e-20)).max().item()
+    assert rel < 1e-5, f"opting out did not reproduce the plain M-step: relmax={rel}"
+
+
+@cuda_only
+@pytest.mark.parametrize("gated", [None, False], ids = ["plain", "gated_without_correction"])
+@pytest.mark.parametrize("rescale", [False, True], ids = ["mini_batch", "anemone"])
+def test_uncorrected_circuits_never_touch_the_denominator_machinery(gated, rescale):
+    """A circuit that does not request the denominator must not pay for it, in either EM mode.
+
+    Structural rather than numerical: nothing is allocated, and neither the top-down hook nor the `F-`
+    reconstruction is ever invoked. The reference-based checks that the PLAIN results are right live in
+    `tests/optim` (`top_down_prob_test`, `em_optimizers_test`); what is pinned here is that the gate-space
+    work stays inert, so a later change cannot start charging ordinary circuits for it.
+    """
+    dev = torch.device("cuda:0")
+    root, ns = _build(gated = gated)
+    pc = juice.compile(root, verbose = False).to(dev)
+    assert pc._requests_denom_param_flows is False
+    assert pc.num_denom_flows == 0
+
+    desc = BlockScaleSumParams
+    calls = []
+    orig_td, orig_mat = desc.accumulate_denom_top_down, desc.materialize_denom_flows
+    desc.accumulate_denom_top_down = lambda self, *a, **k: calls.append("top_down")
+    desc.materialize_denom_flows = lambda self, *a, **k: calls.append("materialize")
+    try:
+        B = 32
+        torch.manual_seed(3)
+        x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+        ext = {} if gated is None else {ns: _phi(ns, B, dev)}
+        for _ in range(2):
+            pc(x, sum_external_params = ext) if ext else pc(x)
+            pc.backward(x, sum_external_params = ext, logspace_flows = True,
+                        flows_memory = 0.0, allow_modify_flows = False) if ext else \
+                pc.backward(x, logspace_flows = True, flows_memory = 0.0,
+                            allow_modify_flows = False)
+            pc.mini_batch_em(step_size = 0.5, pseudocount = 0.01,
+                             step_size_rescaling = rescale, use_cudagraph = False)
+    finally:
+        desc.accumulate_denom_top_down, desc.materialize_denom_flows = orig_td, orig_mat
+
+    assert pc.denom_param_flows is None
+    assert calls == [], f"the denominator machinery ran on an uncorrected circuit: {calls}"
+    assert torch.isfinite(pc.params).all()
+
+
+@cuda_only
+@pytest.mark.parametrize("opt_name", ["FullBatchEM", "MiniBatchEM", "Anemone"])
+def test_em_optimizer_classes_train_a_corrected_circuit(opt_name):
+    """The three EM optimizers, through their PUBLIC interface, on a circuit with `apply_z_correction`.
+
+    The routing was verified by reading the code -- there is no separate `pc.full_batch_em`, all three
+    funnel into `mini_batch_em` -- but nothing drove them end to end, so a future change to any
+    optimizer's flow bookkeeping could silently bypass the correction. `FullBatchEM` is exact EM, so its
+    train LL must not decrease; the others get the structural checks.
+    """
+    dev = torch.device("cuda:0")
+    B = 64
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+
+    def train(corr):
+        root, ns = _build(gated = corr, seed = 1)
+        pc = juice.compile(root, verbose = False).to(dev)
+        kw = dict(pseudocount = 0.01)
+        if opt_name == "Anemone":
+            kw.update(step_size = 0.4, momentum = 0.9)
+        opt = getattr(juice.optim, opt_name)(pc, **kw)
+        torch.manual_seed(5)
+        phi = _phi(ns, B, dev)
+
+        lls = []
+        for _ in range(4):
+            opt.zero_flows()
+            lls.append(pc(x, sum_external_params = {ns: phi}).mean().item())
+            pc.backward(x, sum_external_params = {ns: phi}, logspace_flows = True,
+                        flows_memory = 1.0, allow_modify_flows = False)
+            opt.step()
+            assert torch.isfinite(pc.params).all(), f"{opt_name} produced non-finite parameters"
+
+        ps, pe = ns._param_range
+        E, cbs, bs = ns.edge_ids.size(1), ns.ch_block_size, ns.block_size
+        theta = pc.params[ps:pe].reshape(E, cbs, bs)
+        nb = ns.edge_ids[0].to(device = dev, dtype = torch.long)
+        tot = torch.zeros(ns.num_node_blocks, bs, device = dev)
+        tot.index_add_(0, nb, theta.sum(dim = 1))
+        assert (tot - 1.0).abs().max().item() < 1e-4, (tot - 1.0).abs().max().item()
+        return lls, pc.params.detach().clone()
+
+    lls, pars_on = train(corr = True)
+    _, pars_off = train(corr = False)
+
+    if opt_name == "FullBatchEM":        # exact EM: monotone in the train LL
+        assert min(lls[i + 1] - lls[i] for i in range(len(lls) - 1)) > -1e-3, lls
+
+    # THE CORRECTION MUST ACTUALLY REACH THIS OPTIMIZER. Without this arm the test is satisfied by the
+    # PLAIN M-step -- it is monotone and normalized too -- so a change that silently bypassed
+    # `compute_em_correction` would pass. The two runs are otherwise identical (same seeds, same data,
+    # same gate), and this fixture has two gates per node block, so the correction is not a no-op.
+    rel = ((pars_on - pars_off).abs() / pars_off.abs().clamp_min(1e-20)).max().item()
+    assert rel > 1e-3, \
+        f"{opt_name} gave the same parameters with and without the correction (relmax={rel}): the " \
+        f"conditional M-step did not reach this optimizer"
+
+
+@cuda_only
+@pytest.mark.parametrize("block_size,n_blocks,ch_block_size", [
+    (2, 2, 1),      # narrowest block, one-wide gate
+    (4, 2, 2),
+    (4, 3, 2),      # ragged
+    (4, 5, 2),      # ragged, wider
+    (8, 4, 4),
+    (16, 8, 2),
+    (32, 2, 4),
+])
+@pytest.mark.parametrize("step_size,pseudocount,keep_zero",
+                         [(1.0, 0.0, False), (0.5, 0.1, False), (1.0, 2.0, False), (0.5, 0.1, True)])
+def test_fused_em_correction_matches_the_torch_reference(block_size, n_blocks, ch_block_size,
+                                                         step_size, pseudocount, keep_zero):
+    """The FUSED conditional M-step must reproduce the torch reference it replaced.
+
+    The torch body of `compute_em_correction` is the implementation the finite-difference and
+    one-gate-equals-standard tests validated; the two Triton kernels are an optimization of it (~38 ATen
+    ops per `ns` down to two launches), so the reference is the oracle and this is the pin. Both paths run
+    in ONE process against the SAME flows and parameters, so nothing but the code path differs.
+
+    `_fused_em_correction` returning non-None is asserted as well: it declines shapes it cannot serve and
+    the caller then runs the reference, which would make a comparison of "both paths" vacuous.
+    """
+    import pyjuice.nodes.external_params.block_scale as bsmod
+
+    dev = torch.device("cuda:0")
+    root, ns = _build_shape(block_size, n_blocks, ch_block_size)
+    pc = juice.compile(root, verbose = False).to(dev)
+    B = 96
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    phi = _phi(ns, B, dev)
+    pc(x, sum_external_params = {ns: phi})
+    pc.backward(x, sum_external_params = {ns: phi}, logspace_flows = True,
+                flows_memory = 0.0, allow_modify_flows = False)
+
+    sources = pc._denom_correction_nss()[ns]
+    desc = ns.external_params
+    args = (ns, pc.params, pc.param_flows, pc.denom_param_flows, step_size, pseudocount, keep_zero)
+
+    assert desc._fused_em_correction(*args, sources) is not None, \
+        "the fused path declined this shape, so this test would compare the reference with itself"
+
+    prev = bsmod._EM_FUSED
+    try:
+        bsmod._EM_FUSED = True
+        fused = desc.compute_em_correction(*args, denom_sources = sources).clone()
+        bsmod._EM_FUSED = False
+        ref = desc.compute_em_correction(*args, denom_sources = sources).clone()
+    finally:
+        bsmod._EM_FUSED = prev
+
+    assert torch.isfinite(fused).all()
+    rel = ((fused - ref).abs() / ref.abs().clamp_min(1e-20)).max().item()
+    assert rel < 1e-5, f"fused M-step differs from the torch reference: relmax={rel}"
+
+
+@cuda_only
+def test_fused_em_correction_matches_reference_for_shared_layer_and_ties():
+    """The two structural cases the per-shape test above cannot build: several gated `ns` in ONE layer
+    (so `row_map` has to separate them) and a TIE GROUP (so the members' `W` have to be summed)."""
+    import pyjuice.nodes.external_params.block_scale as bsmod
+
+    dev = torch.device("cuda:0")
+    B = 96
+
+    # (a) two gated ns sharing one layer
+    root, ga, gb = _build_two_gated()
+    pc = juice.compile(root, verbose = False).to(dev)
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [B, 4], device = dev)
+    ext = {g: _phi(g, B, dev) for g in (ga, gb)}
+    pc(x, sum_external_params = ext)
+    pc.backward(x, sum_external_params = ext, logspace_flows = True,
+                flows_memory = 0.0, allow_modify_flows = False)
+    cases = [(pc, g, pc._denom_correction_nss()[g]) for g in (ga, gb)]
+
+    # (b) a tied chain -- one correction target, several members contributing W
+    K, gate_cbs, steps = 16, 2, 4
+    torch.manual_seed(0)
+    with juice.set_block_size(K):
+        nsx = inputs(0, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
+        src, copies = None, []
+        for t in range(1, steps):
+            emit = inputs(t, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
+            prod = multiply(nsx, emit)
+            if src is None:
+                nsx = src = summate(prod, num_node_blocks = 1,
+                                    external_params = BlockScaleSumParams(
+                                        ch_block_size = gate_cbs, apply_z_correction = True))
+            else:
+                nsx = src.duplicate(prod, tie_params = True)
+            copies.append(nsx)
+        root2 = summate(multiply(nsx), num_node_blocks = 1, block_size = 1)
+    torch.manual_seed(0)
+    root2.init_parameters(perturbation = 2.0)
+    pc2 = juice.compile(root2, verbose = False).to(dev)
+    torch.manual_seed(7)
+    x2 = torch.randint(0, NUM_CATS, [B, steps], device = dev)
+    torch.manual_seed(11)
+    phi2 = torch.randn([B, 1, K // gate_cbs], device = dev)
+    ext2 = {c: phi2 for c in copies}
+    pc2(x2, sum_external_params = ext2)
+    pc2.backward(x2, sum_external_params = ext2, logspace_flows = True,
+                 flows_memory = 0.0, allow_modify_flows = False)
+    from pyjuice.model.backend.parflow_fusing import compute_cum_par_flows
+    compute_cum_par_flows(pc2.param_flows, pc2.parflow_fusing_kwargs)
+    srcs2 = pc2._denom_correction_nss()
+    assert len(srcs2[src]) == len(copies) > 1, srcs2[src]
+    cases.append((pc2, src, srcs2[src]))
+
+    prev = bsmod._EM_FUSED
+    try:
+        for pcx, tgt, sources in cases:
+            desc = tgt.external_params
+            args = (tgt, pcx.params, pcx.param_flows, pcx.denom_param_flows, 0.5, 0.1, False)
+            # `_fused_em_correction` now also carries the `_EM_FUSED` gate (it moved there when the
+            # generic M-step was lifted to `ExternalSumParams`, which must not know BlockScale's env
+            # flag), so enable it BEFORE probing whether the shape is served -- the previous loop
+            # iteration leaves it False.
+            bsmod._EM_FUSED = True
+            assert desc._fused_em_correction(*args, sources) is not None, \
+                f"the fused path declined {tgt}; this case would compare the reference with itself"
+            fused = desc.compute_em_correction(*args, denom_sources = sources).clone()
+            bsmod._EM_FUSED = False
+            ref = desc.compute_em_correction(*args, denom_sources = sources).clone()
+            rel = ((fused - ref).abs() / ref.abs().clamp_min(1e-20)).max().item()
+            assert rel < 1e-5, f"{tgt}: fused differs from the reference (relmax={rel})"
+    finally:
+        bsmod._EM_FUSED = prev
+
+
+def _build_mixed_gated_plain(seed = 0):
+    """One gated `ns` and one PLAIN one. The range filter must spare the plain layer's blocks."""
+    torch.manual_seed(seed)
+    with juice.set_block_size(4):
+        i = [inputs(v, num_node_blocks = 2, dist = dists.Categorical(num_cats = NUM_CATS))
+             for v in range(4)]
+        g = summate(multiply(i[0], i[1]), num_node_blocks = 2,
+                    external_params = BlockScaleSumParams(ch_block_size = 2,
+                                                          apply_z_correction = True))
+        pl = summate(multiply(i[2], i[3]), num_node_blocks = 2)
+        root = summate(multiply(g, pl), num_node_blocks = 1, block_size = 1)
+    torch.manual_seed(seed)
+    root.init_parameters(perturbation = 2.0)
+    return root, [g], 4
+
+
+def _build_tied_gated(seed = 0, steps = 4, K = 16, gate_cbs = 2):
+    torch.manual_seed(seed)
+    with juice.set_block_size(K):
+        ns = inputs(0, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
+        src, copies = None, []
+        for t in range(1, steps):
+            emit = inputs(t, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
+            prod = multiply(ns, emit)
+            if src is None:
+                ns = src = summate(prod, num_node_blocks = 1,
+                                   external_params = BlockScaleSumParams(
+                                       ch_block_size = gate_cbs, apply_z_correction = True))
+            else:
+                ns = src.duplicate(prod, tie_params = True)
+            copies.append(ns)
+        root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
+    torch.manual_seed(seed)
+    root.init_parameters(perturbation = 2.0)
+    return root, copies, steps
+
+
+_ORCH_CIRCUITS = {
+    "mixed": _build_mixed_gated_plain,
+    "two_gated_one_layer": lambda: (lambda r: (r[0], [r[1], r[2]], 4))(_build_two_gated()),
+    "tied": _build_tied_gated,
+    "ragged": lambda: (lambda r: (r[0], [r[1]], 2))(_build_shape(4, 3, 2)),
+}
+
+
+@cuda_only
+@pytest.mark.parametrize("circuit", sorted(_ORCH_CIRCUITS))
+@pytest.mark.parametrize("step_size,pseudocount,keep_zero",
+                         [(1.0, 0.0, False), (0.5, 0.1, True)])
+def test_mini_batch_em_matches_the_pre_restructuring_sequence(circuit, step_size, pseudocount,
+                                                              keep_zero):
+    """`mini_batch_em` must give the same parameters as the sequence it replaced.
+
+    It used to run the standard M-step over EVERY parameter and then overwrite the corrected ranges. It
+    now runs `em_par_update` only on the ranges it still OWNS -- `_par_update_kwargs_excluding` drops the
+    corrected blocks -- and has the conditional step write `params` IN PLACE. Three things could go wrong
+    silently, and none is visible to the kernel-level tests, which call `compute_em_correction` directly
+    and never go through `mini_batch_em`:
+
+      * over-filtering, leaving a range nobody updates (the `mixed` circuit is the one that shows it: a
+        plain layer's blocks must survive the filter);
+      * under-filtering, so the standard update overwrites a corrected range after the fact;
+      * the in-place write landing at the wrong offsets (it addresses `params` by parameter id now).
+
+    The reference is the old sequence spelled out. Each arm REBUILDS the circuit: a `TensorCircuit` also
+    carries input-layer parameters and `_cum_flow`, and restoring only `pc.params` leaks both.
+    """
+    from pyjuice.model.backend.parflow_fusing import compute_cum_par_flows
+    from pyjuice.model.backend.par_update import em_par_update
+    import pyjuice.nodes.external_params.block_scale as bsmod
+
+    dev = torch.device("cuda:0")
+    B = 96
+
+    def arm(old):
+        root, gated, nvars = _ORCH_CIRCUITS[circuit]()
+        pc = juice.compile(root, verbose = False).to(dev)
+        torch.manual_seed(3)
+        x = torch.randint(0, NUM_CATS, [B, nvars], device = dev)
+        torch.manual_seed(11)
+        ext = {g: _phi(g, B, dev) for g in gated}
+        pc(x, sum_external_params = ext)
+        pc.backward(x, sum_external_params = ext, logspace_flows = True,
+                    flows_memory = 0.0, allow_modify_flows = False)
+
+        if not old:
+            pc.mini_batch_em(step_size = step_size, pseudocount = pseudocount,
+                             keep_zero_params = keep_zero)
+            return pc.params.detach().clone()
+
+        with torch.no_grad():
+            for layer in pc.input_layer_group:
+                layer.mini_batch_em(step_size = step_size, pseudocount = pseudocount,
+                                    keep_zero_params = keep_zero)
+            compute_cum_par_flows(pc.param_flows, pc.parflow_fusing_kwargs)
+            prev, bsmod._EM_FUSED = bsmod._EM_FUSED, False      # the validated torch correction
+            try:
+                corr = [(ns._param_range, ns.external_params.compute_em_correction(
+                            ns, pc.params, pc.param_flows, pc.denom_param_flows, step_size,
+                            pseudocount, keep_zero, denom_sources = sources))
+                        for ns, sources in pc._denom_correction_nss().items()]
+            finally:
+                bsmod._EM_FUSED = prev
+            em_par_update(pc.params, pc.param_flows, pc.par_update_kwargs, step_size = step_size,
+                          pseudocount = pseudocount, keep_zero_params = keep_zero)
+            for (ps, pe), new in corr:
+                pc.params[ps:pe] = new
+        return pc.params.detach().clone()
+
+    new, ref = arm(old = False), arm(old = True)
+    assert torch.isfinite(new).all()
+    rel = ((new - ref).abs() / ref.abs().clamp_min(1e-20)).max().item()
+    assert rel < 1e-5, f"{circuit}: restructured mini_batch_em differs from the old sequence: {rel}"
+
+
+@cuda_only
+def test_denom_sums_over_a_tie_group():
+    """A tied copy shares `ns._param_range`, so EVERY copy's flow has to reach the M-step of the node
+    that owns those parameters.
+
+    The numerator gets this from `compute_cum_par_flows`, which fuses in the `pfid` space it shares. The
+    denominator is not in `pfid` space -- it is a per-layer gate-space accumulator -- so it is summed
+    while `F-` is reconstructed, over each DISTINCT `(layer, pfid base)` of the group.
+
+    Pinned by finite differences on the SHARED parameter, which is reference-free and cannot be fooled:
+    perturbing one `theta[n,c]` moves every timestep that uses it, so `d(sum_b log P)/d log theta` picks
+    up all three copies, and an `F-` that saw only one cannot match it. (It would also catch the
+    opposite error -- scattering a copy once per member and multiplying its flow.)
+    """
+    dev = torch.device("cuda:0")
+    K, gate_cbs, B, steps = 16, 2, 64, 4
+    torch.manual_seed(0)
+    with juice.set_block_size(K):
+        ns = inputs(0, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
+        src, copies = None, []
+        for t in range(1, steps):
+            emit = inputs(t, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
+            prod = multiply(ns, emit)
+            if src is None:
+                ns = src = summate(prod, num_node_blocks = 1,
+                                   external_params = BlockScaleSumParams(
+                                       ch_block_size = gate_cbs, apply_z_correction = True))
+            else:
+                ns = src.duplicate(prod, tie_params = True)
+            copies.append(ns)
+        root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
+    torch.manual_seed(0)
+    root.init_parameters(perturbation = 2.0)
+    pc = juice.compile(root, verbose = False).to(dev)
+
+    # the group really is tied, and really does span several layers
+    sources = pc._denom_correction_nss()
+    assert list(sources) == [src], list(sources)
+    assert len(sources[src]) == len(copies) > 1, sources[src]
+    assert all(c._param_range == src._param_range for c in copies)
+
+    torch.manual_seed(7)
+    x = torch.randint(0, NUM_CATS, [B, steps], device = dev)
+    torch.manual_seed(11)
+    phi = torch.randn([B, 1, K // gate_cbs], device = dev) * 1.0
+    ext = {c: phi for c in copies}
+
+    pc(x, sum_external_params = ext)
+    pc.backward(x, sum_external_params = ext, logspace_flows = True,
+                flows_memory = 0.0, allow_modify_flows = False)
+    from pyjuice.model.backend.parflow_fusing import compute_cum_par_flows
+    compute_cum_par_flows(pc.param_flows, pc.parflow_fusing_kwargs)      # as the M-step does
+    Fp = pc.param_flows.clone()
+    Fm = _fminus(pc, src)
+    assert torch.count_nonzero(Fm) > 0
+
+    # IDEMPOTENT per distinct `(layer, pfid base)`. Compilation reuses one param-flow range once a tie
+    # group outgrows `max_tied_ns_per_parflow_block`, and then several members name the same base -- one
+    # scatter already collects all of their rows, so a second would double their flow. This group is
+    # small enough that every member has its own range, so the collapse is checked directly.
+    desc, dup = src.external_params, list(sources[src]) * 2
+    again = desc.materialize_denom_flows(src, pc.params, pc.denom_param_flows, dup).clone()
+    pfs, pfe = src._param_flow_range
+    assert torch.equal(again, Fm[pfs:pfe]), \
+        "a repeated `(layer, pfid base)` was scattered twice"
+
+    lay = pc.external_params_nodes[src]
+    pids, pfids, cids = lay.partitioned_pids[0], lay.partitioned_pfids[0], lay.partitioned_cids[0]
+
+    def ll():
+        with torch.no_grad():
+            return pc(x, sum_external_params = ext).double().sum().item()
+
+    eps, n, dmax, gmax = 1e-2, 0, 0.0, 0.0
+    for e in range(0, pids.size(1), max(1, pids.size(1) // 5)):
+        if int(cids[0, e]) == 0:
+            continue
+        for m in (0, K // 2):
+            pid, pf = int(pids[0, e]) + m, int(pfids[0, e]) + m
+            g_an = float(Fp[pf] - Fm[pf])
+            with torch.no_grad():
+                o = float(pc.params[pid])
+                pc.params[pid] = o * math.exp(eps); lp = ll()
+                pc.params[pid] = o * math.exp(-eps); lm = ll()
+                pc.params[pid] = o
+            g_fd = (lp - lm) / (2 * eps)
+            dmax = max(dmax, abs(g_fd - g_an))
+            gmax = max(gmax, abs(g_an), abs(g_fd))
+            n += 1
+    assert n >= 4
+    # Scaled by the largest gradient probed, for the reason given in
+    # `test_denom_matches_finite_differences_at_a_larger_shape`.
+    assert dmax / gmax < 5e-2, f"dmax={dmax:.3e} gmax={gmax:.3e} ratio={dmax / gmax:.3e}"
+
+
+@cuda_only
+def test_denom_conservation_per_node():
+    """`sum_c F+ == sum_c F-` for every node (both == sum_b f_b): the correction only REALLOCATES a
+    node's mass across its gates, so a one-gate node is an exact no-op."""
+    dev = torch.device("cuda:0")
+    root, ns = _build(gated = True)
+    pc = juice.compile(root, verbose = False).to(dev)
+    lay = pc.external_params_nodes[ns]
+    B = 32
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    phi = _phi(ns, B, dev)
+    Fp, Fm = _corr_flows(pc, ns, x, phi)
+    pids, pfids, cids = lay.partitioned_pids[0], lay.partitioned_pfids[0], lay.partitioned_cids[0]
+    rows, E = pids.shape
+    worst = 0.0
+    for r in range(rows):
+        for m in range(4):
+            sp = sum(float(Fp[int(pfids[r, e]) + m]) for e in range(E) if int(cids[r, e]) != 0)
+            sm = sum(float(Fm[int(pfids[r, e]) + m]) for e in range(E) if int(cids[r, e]) != 0)
+            worst = max(worst, abs(sp - sm))
+    assert worst < 1e-3, worst
+
+
+@cuda_only
+def test_apply_z_correction_node_axis_gate_raises():
+    """`F-` reweights gate MASSES per node block, so a gate finer than the block along the NODE axis is
+    refused (as `d LL / d log phi` is) -- and BEFORE `node_mars` is perturbed."""
+    dev = torch.device("cuda:0")
+    with juice.set_block_size(8):
+        i0 = inputs(0, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
+        i1 = inputs(1, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
+        ns = summate(multiply(i0, i1), num_node_blocks = 1,
+                     external_params = BlockScaleSumParams(block_size = 4, apply_z_correction = True))
+        root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
+    root.init_parameters(perturbation = 2.0)
+    pc = juice.compile(root, verbose = False).to(dev)
+    B = 16
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    phi = torch.zeros(ns.external_params.tensor_shapes(ns, B)[0], device = dev)
+    pc(x, sum_external_params = {ns: phi})
+    before = pc.node_mars.clone()
+    with pytest.raises(NotImplementedError, match = "NODE axis"):
+        pc.backward(x, sum_external_params = {ns: phi}, logspace_flows = True, flows_memory = 1.0)
+
+    # The refusal is only useful if it leaves the circuit usable. This backward shifts `node_mars` by
+    # `log Z` and shifts it back in a `finally`, so a raise from the MIDDLE of that window would strand
+    # the forward values -- which is why the check sits before the shift rather than in the kernel.
+    assert torch.equal(pc.node_mars, before), \
+        "the refusal left `node_mars` shifted; it must happen before the `log Z` shift"
+
+
+# ------------------------------------------------------ step 6: the conditional dual-flow M-step
+
+def _build_one_gate(corr, seed = 0):
+    """One node block, one child block -> ONE edge block -> one gate (an exact no-op gate)."""
+    torch.manual_seed(seed)
+    with juice.set_block_size(4):
+        i0 = inputs(0, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
+        i1 = inputs(1, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
+        ns = summate(multiply(i0, i1), num_node_blocks = 1,
+                     external_params = BlockScaleSumParams(apply_z_correction = corr))
+        root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
+    torch.manual_seed(seed)
+    root.init_parameters(perturbation = 2.0)
+    return root, ns
+
+
+@cuda_only
+def test_one_gate_correction_matches_standard_em():
+    """With one gate the correction is an exact no-op, so the dual M-step must equal pyjuice's standard
+    M-step (correction off) -- validated against the trusted standard update, not a re-derivation."""
+    import warnings
+    dev = torch.device("cuda:0")
+    B = 64
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")                              # the "single gate is a no-op" warning
+        r_off, ns_off = _build_one_gate(corr = False); pc_off = juice.compile(r_off, verbose = False).to(dev)
+        r_on, ns_on = _build_one_gate(corr = True); pc_on = juice.compile(r_on, verbose = False).to(dev)
+        phi = torch.randn(B, ns_off.num_nodes // 4, ns_off.num_ch_nodes // ns_off.ch_block_size,
+                          device = dev) * 1.5
+        for pc, ns in [(pc_off, ns_off), (pc_on, ns_on)]:
+            pc(x, sum_external_params = {ns: phi})
+            pc.backward(x, sum_external_params = {ns: phi}, logspace_flows = True, flows_memory = 0.0)
+            pc.mini_batch_em(step_size = 0.5, pseudocount = 0.1)
+    assert torch.allclose(pc_on.params, pc_off.params, atol = 1e-4, rtol = 1e-4), \
+        (pc_on.params - pc_off.params).abs().max().item()
+
+
+def _anemone_step(pc, ns, x, phi, step_size, pseudocount = 0.0):
+    """One Anemone (`step_size_rescaling`) EM step under a live gate."""
+    pc(x, sum_external_params = {ns: phi})
+    pc.backward(x, sum_external_params = {ns: phi}, logspace_flows = True,
+                flows_memory = 0.0, allow_modify_flows = False)
+    pc.mini_batch_em(step_size = step_size, pseudocount = pseudocount,
+                     step_size_rescaling = True, use_cudagraph = False)
+
+
+@cuda_only
+@pytest.mark.parametrize("step_size", [0.2, 0.5, 1.0])
+def test_anemone_with_correction_runs_and_stays_normalized(step_size):
+    """`step_size_rescaling` (Anemone) with `apply_z_correction` used to REFUSE, because the top-down
+    pass fed `param_flows` a term that `denom_param_flows` never saw. It now feeds both, so the
+    conditional M-step sees a numerator and denominator built the same way."""
+    dev = torch.device("cuda:0")
+    root, ns = _build(gated = True)
+    pc = juice.compile(root, verbose = False).to(dev)
+    B = 64
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    phi = _phi(ns, B, dev)
+
+    for _ in range(3):
+        _anemone_step(pc, ns, x, phi, step_size, pseudocount = 0.1)
+        assert torch.isfinite(pc.params).all()
+
+    # each node's parameters still sum to one over its children
+    ps, pe = ns._param_range
+    E, cbs, bs = ns.edge_ids.size(1), ns.ch_block_size, ns.block_size
+    theta = pc.params[ps:pe].reshape(E, cbs, bs)
+    nb = ns.edge_ids[0].to(device = theta.device, dtype = torch.long)
+    tot = torch.zeros(ns.num_node_blocks, bs, device = theta.device, dtype = theta.dtype)
+    tot.index_add_(0, nb, theta.sum(dim = 1))
+    assert (tot - 1.0).abs().max().item() < 1e-4, (tot - 1.0).abs().max().item()
+
+
+@cuda_only
+def test_anemone_one_gate_correction_matches_standard():
+    """With ONE gate the correction is an exact no-op, so Anemone WITH it must reproduce Anemone
+    without it.
+
+    This is a CONSISTENCY check, not a pin on the top-down term: with a single gate `F- = theta * S`,
+    so `theta * (F+ + T) / (theta * S)` normalizes to `normalize(F+ + T)` whether or not `F-` also
+    receives `T` -- `theta` cancels either way. VERIFIED by negative control: it passes even with the
+    `F-` top-down emission disabled. `test_anemone_top_down_term_reaches_both_flows` and
+    `test_anemone_small_step_size_barely_moves_parameters` are the two that actually fail without it."""
+    import warnings
+    dev = torch.device("cuda:0")
+    B = 64
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    out = {}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")                       # the "single gate is a no-op" warning
+        for corr in (False, True):
+            root, ns = _build_one_gate(corr = corr)
+            pc = juice.compile(root, verbose = False).to(dev)
+            phi = torch.randn(B, ns.num_nodes // 4, ns.num_ch_nodes // ns.ch_block_size,
+                              device = dev) * 1.5
+            for _ in range(3):
+                _anemone_step(pc, ns, x, phi, step_size = 0.5, pseudocount = 0.1)
+            out[corr] = pc.params.detach().clone()
+    assert torch.allclose(out[True], out[False], atol = 1e-4, rtol = 1e-4), \
+        (out[True] - out[False]).abs().max().item()
+
+
+@cuda_only
+def test_anemone_top_down_term_reaches_both_flows():
+    """The top-down pass must add the SAME increment to `F-` as to `param_flows`.
+
+    Checked at the flow level rather than through a trained model, because that is the property the
+    M-step actually depends on: `F+` and `F-` have to be built the same way or the ratio
+    `theta * F+ / F-` compares a flow that saw the top-down term against one that did not, and a node
+    with little data gets rescaled instead of left alone.
+
+    The two are built by completely different code -- `sum_layer_td_pflow` scatters
+    `scale * P_td[n] * theta[n,c]` per edge, while `accumulate_denom_top_down` adds `scale * P_td[n]` to
+    every gate column of `W` and lets the reconstruction supply `theta` -- so agreeing to fp32 rounding
+    is a real check on the rank-one identity, not a tautology.
+    """
+    from pyjuice.model.backend.top_down_prob import eval_top_down_probs
+
+    dev = torch.device("cuda:0")
+    root, ns = _build(gated = True)
+    pc = juice.compile(root, verbose = False).to(dev)
+    B = 32
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    phi = _phi(ns, B, dev)
+
+    # one backward so the flow buffers exist and `_cum_flow` is set
+    pc(x, sum_external_params = {ns: phi})
+    pc.backward(x, sum_external_params = {ns: phi}, logspace_flows = True,
+                flows_memory = 0.0, allow_modify_flows = False)
+
+    pc.param_flows[:] = 0.0
+    pc.denom_param_flows[:] = 0.0
+    eval_top_down_probs(pc, update_pflow = True, scale = 0.25, use_cudagraph = False)
+
+    ps, pe = ns._param_flow_range
+    fp, fm = pc.param_flows[ps:pe], _fminus(pc, ns)[ps:pe]
+    assert torch.count_nonzero(fp) > 0, "the top-down pass wrote nothing to `param_flows`"
+    rel = ((fp - fm).abs() / fp.abs().clamp_min(1e-20)).max().item()
+    assert rel < 1e-5, f"top-down term differs between F+ and F-: max relative diff = {rel}"
+
+
+@cuda_only
+def test_anemone_top_down_leaves_non_requesting_layers_alone():
+    """The top-down term must land ONLY on layers that actually accumulate `F-`.
+
+    It once went through the generic param-flow kernel for EVERY sum layer, which put a denominator
+    under ranges that have no numerator counterpart -- inert for the M-step itself, but
+    `compute_cum_par_flows` fused tied flows across the whole buffer, so a plain layer tied to a gated
+    one folded its spurious term into the gated layer's denominator.
+
+    The buffer now only has room for requesting layers, so the write CANNOT land anywhere else; what is
+    still worth pinning is the guard in `eval_top_down_probs` -- it must invoke the hook for exactly the
+    requesting layers and no others, since a plain `SumLayer` has no denominator layout at all and
+    reaching one would raise (or, worse, alias another layer's slice).
+    """
+    from pyjuice.model.backend.top_down_prob import eval_top_down_probs
+
+    dev = torch.device("cuda:0")
+    torch.manual_seed(0)
+    with juice.set_block_size(4):
+        i0 = inputs(0, num_node_blocks = 2, dist = dists.Categorical(num_cats = NUM_CATS))
+        i1 = inputs(1, num_node_blocks = 2, dist = dists.Categorical(num_cats = NUM_CATS))
+        i2 = inputs(2, num_node_blocks = 2, dist = dists.Categorical(num_cats = NUM_CATS))
+        i3 = inputs(3, num_node_blocks = 2, dist = dists.Categorical(num_cats = NUM_CATS))
+        gated = summate(multiply(i0, i1), num_node_blocks = 2,
+                        external_params = BlockScaleSumParams(ch_block_size = 2,
+                                                              apply_z_correction = True))
+        plain = summate(multiply(i2, i3), num_node_blocks = 2)       # never accumulates F-
+        root = summate(multiply(gated, plain), num_node_blocks = 1, block_size = 1)
+    root.init_parameters(perturbation = 2.0)
+    pc = juice.compile(root, verbose = False).to(dev)
+
+    B = 32
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [B, 4], device = dev)
+    phi = _phi(gated, B, dev)
+    pc(x, sum_external_params = {gated: phi})
+    pc.backward(x, sum_external_params = {gated: phi}, logspace_flows = True,
+                flows_memory = 0.0, allow_modify_flows = False)
+
+    all_sum_layers = [l for g in pc.inner_layer_groups for l in g.layers if l.is_sum()]
+    requesting = [l for l in all_sum_layers if getattr(l, "requests_denom_param_flows", False)]
+    assert len(requesting) == 1 and len(all_sum_layers) > len(requesting), \
+        "the fixture must mix requesting and non-requesting sum layers for this to test anything"
+
+    # Spy on the hook: record which layers it is called for.
+    desc = type(gated.external_params)
+    called = []
+    original = desc.accumulate_denom_top_down
+    desc.accumulate_denom_top_down = lambda self, layer, *a, **k: (
+        called.append(layer), original(self, layer, *a, **k))[1]
+    try:
+        pc.denom_param_flows[:] = 0.0
+        eval_top_down_probs(pc, update_pflow = True, scale = 0.25, use_cudagraph = False)
+    finally:
+        desc.accumulate_denom_top_down = original
+
+    assert called == requesting, \
+        f"the top-down denominator hook ran for {len(called)} layers, expected exactly the requesting one"
+    assert torch.count_nonzero(pc.denom_param_flows) > 0, "the gated layer got no term"
+
+    # and the plain layers still got their NUMERATOR term -- the guard must not have skipped that
+    for name, ns_i in (("plain", plain), ("root", root)):
+        a, b = ns_i._param_flow_range
+        assert torch.count_nonzero(pc.param_flows[a:b]) > 0, \
+            f"the {name} layer got no top-down `param_flows` term"
+
+
+@cuda_only
+def test_anemone_with_correction_under_cudagraph():
+    """The Anemone path is CUDA-graph captured, and the capture both records the denominator write and
+    has to restore the buffer afterwards (the warm-up runs mutate it). Exercised here because every
+    other Anemone test runs with `use_cudagraph = False`."""
+    dev = torch.device("cuda:0")
+    root, ns = _build(gated = True)
+    pc = juice.compile(root, verbose = False).to(dev)
+    B = 64
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    phi = _phi(ns, B, dev)
+
+    for _ in range(3):
+        pc(x, sum_external_params = {ns: phi})
+        pc.backward(x, sum_external_params = {ns: phi}, logspace_flows = True,
+                    flows_memory = 0.0, allow_modify_flows = False)
+        pc.mini_batch_em(step_size = 0.5, pseudocount = 0.1,
+                         step_size_rescaling = True, use_cudagraph = True)
+        assert torch.isfinite(pc.params).all()
+
+    ps, pe = ns._param_range
+    E, cbs, bs = ns.edge_ids.size(1), ns.ch_block_size, ns.block_size
+    theta = pc.params[ps:pe].reshape(E, cbs, bs)
+    nb = ns.edge_ids[0].to(device = theta.device, dtype = torch.long)
+    tot = torch.zeros(ns.num_node_blocks, bs, device = theta.device, dtype = theta.dtype)
+    tot.index_add_(0, nb, theta.sum(dim = 1))
+    assert (tot - 1.0).abs().max().item() < 1e-4, (tot - 1.0).abs().max().item()
+
+
+@cuda_only
+def test_anemone_small_step_size_barely_moves_parameters():
+    """The whole point of the top-down term is that it interpolates toward the CURRENT parameters, so
+    a small `step_size` must barely move them -- and it has to keep doing that with the correction on,
+    which is the property that would break if `F-` missed the term (the ratio would then be
+    `T_numerator / nothing` and a data-free node would be rescaled rather than left alone)."""
+    dev = torch.device("cuda:0")
+    root, ns = _build(gated = True)
+    pc = juice.compile(root, verbose = False).to(dev)
+    B = 64
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    phi = _phi(ns, B, dev)
+
+    moves = {}
+    for step_size in (0.01, 0.5):
+        root_i, ns_i = _build(gated = True)
+        pc_i = juice.compile(root_i, verbose = False).to(dev)
+        before = pc_i.params.detach().clone()
+        _anemone_step(pc_i, ns_i, x, _phi(ns_i, B, dev), step_size)
+        moves[step_size] = (pc_i.params - before).abs().max().item()
+
+    assert torch.isfinite(pc.params).all()
+    assert moves[0.01] < moves[0.5], moves
+    assert moves[0.01] < 0.05, moves
+
+
+@cuda_only
+def test_corrected_em_is_monotone_under_a_live_gate():
+    """Exact EM (pseudocount 0) with the correction on a live multi-gate must not decrease the train LL."""
+    dev = torch.device("cuda:0")
+    root, ns = _build(gated = True, seed = 1); pc = juice.compile(root, verbose = False).to(dev)
+    B = 64
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    phi = _phi(ns, B, dev)
+    lls = []
+    for _ in range(6):
+        lls.append(pc(x, sum_external_params = {ns: phi}).mean().item())
+        pc.backward(x, sum_external_params = {ns: phi}, logspace_flows = True, flows_memory = 0.0)
+        pc.mini_batch_em(step_size = 1.0, pseudocount = 0.0)
+    assert min(lls[i + 1] - lls[i] for i in range(len(lls) - 1)) > -1e-3, lls
+    assert torch.isfinite(pc.params).all()
+
+
+# ------------------------------------------------- F- across the shape space
+#
+# The tests above all run ONE shape (block_size 4, 2 node blocks, ch_block_size 2, batch 32), which
+# leaves most of the `F-` kernels unexercised: batch 32 is a single batch tile, so the
+# kernel's online-max rescaling never runs; 2 node blocks is a power of two, so the gate table is
+# never narrower than the (power-of-two padded) edge count; and `log phi ~ N(0, 1.5)` never
+# approaches the range where `exp` would overflow. Each of those is a place a kernel goes wrong
+# silently, so they get their own coverage here.
+
+def _build_shape(block_size, n_blocks, ch_block_size, seed = 0):
+    """A gated PC with `apply_z_correction`, with every shape axis of the kernel exposed."""
+    torch.manual_seed(seed)
+    with juice.set_block_size(block_size):
+        i0 = inputs(0, num_node_blocks = n_blocks, dist = dists.Categorical(num_cats = NUM_CATS))
+        i1 = inputs(1, num_node_blocks = n_blocks, dist = dists.Categorical(num_cats = NUM_CATS))
+        ns = summate(multiply(i0, i1), num_node_blocks = n_blocks,
+                     external_params = BlockScaleSumParams(ch_block_size = ch_block_size,
+                                                           apply_z_correction = True))
+        root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
+    root.init_parameters(perturbation = 2.0)
+    return root, ns
+
+
+def _run(pc, ns, x, phi, ref = False):
+    """One gated fwd+bwd; returns `(F+, F-, sum_b f_b per node)`.
+
+    `allow_modify_flows = False` is REQUIRED for the third return value: otherwise the backward
+    overwrites `node_flows` in place with the `log f - log m` form and the "flow" read back is a
+    different quantity entirely.
+    """
+    os.environ["PYJUICE_BLOCKSCALE_DENOM_REF"] = "1" if ref else "0"
+    try:
+        pc(x, sum_external_params = {ns: phi})
+        pc.backward(x, sum_external_params = {ns: phi}, logspace_flows = True,
+                    flows_memory = 0.0, allow_modify_flows = False)
+    finally:
+        os.environ.pop("PYJUICE_BLOCKSCALE_DENOM_REF", None)
+
+    lay = pc.external_params_nodes[ns]
+    bs = ns.block_size
+    # Indexed by GLOBAL node id from the layer's first node, which is the order `_sum_over_children`
+    # returns. Concatenating the partitions' `nids` instead happens to agree only while there is ONE
+    # partition: `split` puts node blocks 1-3 in partition 0 and block 0 in partition 1, so the
+    # concatenated order is 1,2,3,0 and the conservation check silently compared one node's flow against
+    # another's. That read as a 4.8 relative error from the kernels, which were right.
+    gmin = min(int(lay.partitioned_nids[p].min()) for p in range(len(lay.partitioned_nids)))
+    gid = gmin + torch.arange(ns.num_node_blocks * bs, device = pc.params.device)
+    flow_sum = pc.node_flows[gid].double().exp().sum(-1)
+    return pc.param_flows.clone(), _fminus(pc, ns), flow_sum
+
+
+def _sum_over_children(pc, ns, F):
+    """`sum_c F[n,c]` per node, accumulated over every partition (a node's children can split)."""
+    lay = pc.external_params_nodes[ns]
+    bs = ns.block_size
+    ar = torch.arange(bs, device = F.device)
+    parts = range(len(lay.partitioned_pfids))
+    gmin = min(int(lay.partitioned_nids[p].min()) for p in parts)
+    out = torch.zeros(ns.num_node_blocks * bs, device = F.device, dtype = torch.float64)
+    for p in parts:
+        pfids, cids = lay.partitioned_pfids[p], lay.partitioned_cids[p]
+        nids = lay.partitioned_nids[p].long()
+        rows, E = pfids.shape
+        idx = (pfids[:, None, :] + ar[None, :, None]).long()
+        real = (cids != 0)[:, None, :].expand(rows, bs, E)
+        loc = (nids[:, None] + ar[None, :] - gmin).reshape(-1)
+        out.index_add_(0, loc, (F[idx].double() * real).sum(-1).reshape(-1))
+    return out
+
+
+# block_size, n_blocks, ch_block_size, batch
+_SHAPES = [
+    (2,  2, 1,  32),     # narrowest block
+    (4,  2, 2,  96),     # > 1 batch tile
+    (4,  2, 2,  65),     # partial batch tile with a single live lane
+    (4,  3, 2,  96),     # RAGGED: 3 node blocks -> the gate table is narrower than padded num_edges
+    (4,  5, 2,  64),     # ragged again, wider
+    (8,  2, 2, 128),
+    (8,  4, 4, 257),     # partial tile, several node blocks, coarse gate
+    (16, 2, 2,  64),
+    (16, 8, 2,  96),
+    (32, 2, 4,  33),     # partial tile far smaller than the tile size
+]
+
+
+@cuda_only
+@pytest.mark.parametrize("block_size,n_blocks,ch_block_size,batch", _SHAPES)
+def test_denom_kernel_matches_reference_across_shapes(block_size, n_blocks, ch_block_size, batch):
+    """The Triton `F-` and the torch reference must agree at every shape, not just the one the
+    original tests used. The ragged rows (`n_blocks` 3 and 5) are the regression for the reference's
+    unbounded gate-column gather: the compiled `num_edges` is padded to a power of two while the
+    gate table is only as wide as the widest row's edge-block count, so `e // node_cbs` ran PAST the
+    table and raised a device-side assert (the kernel already clamped, only the reference did not).
+    """
+    dev = torch.device("cuda:0")
+    root, ns = _build_shape(block_size, n_blocks, ch_block_size)
+    pc = juice.compile(root, verbose = False).to(dev)
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [batch, 2], device = dev)
+    phi = _phi(ns, batch, dev)
+
+    _, Fm_k, _ = _run(pc, ns, x, phi, ref = False)
+    _, Fm_r, _ = _run(pc, ns, x, phi, ref = True)
+    assert torch.isfinite(Fm_k).all()
+    assert torch.count_nonzero(Fm_k) > 0
+    rel = ((Fm_k - Fm_r).abs() / (Fm_r.abs() + 1e-6)).max().item()
+    assert rel < 1e-4, rel
+
+
+@cuda_only
+@pytest.mark.parametrize("batch", [32, 64, 65, 96, 128, 257])
+def test_denom_conserves_node_flow_across_batch_tiling(batch):
+    """`sum_c F-[n,c] == sum_b f_b[n]`, because `sum_c theta_b[n,c] == 1` for every sample.
+
+    Reference-free, so it cannot be satisfied by the kernel and the reference being wrong together
+    -- and it is exactly what a dropped or double-counted batch tile breaks. `F-`'s launcher uses
+    `cdiv` and the kernel re-masks the batch each iteration, which is what the non-multiples of the
+    64-wide batch tile (65, 96, 257) pin here.
+    """
+    dev = torch.device("cuda:0")
+    root, ns = _build_shape(4, 2, 2)
+    pc = juice.compile(root, verbose = False).to(dev)
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [batch, 2], device = dev)
+    phi = _phi(ns, batch, dev)
+
+    _, Fm, flow_sum = _run(pc, ns, x, phi)
+    got = _sum_over_children(pc, ns, Fm)
+    keep = flow_sum.abs() > 1e-8
+    rel = ((got - flow_sum).abs()[keep] / flow_sum.abs()[keep]).max().item()
+    assert rel < 1e-4, f"F- does not conserve node flow at batch={batch} (relmax={rel})"
+
+
+@cuda_only
+@pytest.mark.parametrize("scale", [0.0, 20.0, 90.0, 300.0])
+def test_denom_survives_extreme_gate_logits(scale):
+    """`log phi` is a router logit and therefore UNBOUNDED, which is the trap that already bit the
+    log-Z half of `d LL / d log phi` (there `exp(nf - log Z)` underflowed to 0 past ~88 and the term
+    silently vanished with no inf/NaN to show for it).
+
+    `F-` is built to be safe by construction -- `log phi` is kept INSIDE the exponent, where it
+    cancels against `log Z`, so the summand never exceeds `f_b[n]` however large the logit. This
+    pins that: the result stays finite AND still conserves, at logits far past the overflow point.
+    `scale = 0` is the neutral gate at the other end.
+    """
+    dev = torch.device("cuda:0")
+    root, ns = _build_shape(4, 2, 2)
+    pc = juice.compile(root, verbose = False).to(dev)
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [96, 2], device = dev)
+    phi = _phi(ns, 96, dev, scale = scale)
+
+    _, Fm, flow_sum = _run(pc, ns, x, phi)
+    assert torch.isfinite(Fm).all(), f"non-finite F- at gate scale {scale}"
+    got = _sum_over_children(pc, ns, Fm)
+    keep = flow_sum.abs() > 1e-8
+    rel = ((got - flow_sum).abs()[keep] / flow_sum.abs()[keep]).max().item()
+    assert rel < 1e-3, f"F- lost mass at gate scale {scale} (relmax={rel})"
+
+
+@cuda_only
+def test_denom_matches_finite_differences_at_a_larger_shape():
+    """`F+ - F- == d(sum_b log P(x_b)) / d log theta` at a shape with several batch tiles and a
+    coarser gate -- the original FD test ran only the single-tile shape."""
+    dev = torch.device("cuda:0")
+    root, ns = _build_shape(8, 2, 4)
+    pc = juice.compile(root, verbose = False).to(dev)
+    lay = pc.external_params_nodes[ns]
+    B = 96
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    phi = _phi(ns, B, dev)
+    Fp, Fm, _ = _run(pc, ns, x, phi)
+
+    pids, pfids, cids = lay.partitioned_pids[0], lay.partitioned_pfids[0], lay.partitioned_cids[0]
+
+    def ll():
+        with torch.no_grad():
+            return pc(x, sum_external_params = {ns: phi}).double().sum().item()
+
+    eps, n, dmax, gmax = 1e-2, 0, 0.0, 0.0
+    for e in range(0, pids.size(1), max(1, pids.size(1) // 5)):
+        if int(cids[0, e]) == 0:
+            continue
+        for m in (0, ns.block_size // 2):
+            pid, pf = int(pids[0, e]) + m, int(pfids[0, e]) + m
+            g_an = float(Fp[pf] - Fm[pf])
+            with torch.no_grad():
+                o = float(pc.params[pid])
+                pc.params[pid] = o * math.exp(eps); lp = ll()
+                pc.params[pid] = o * math.exp(-eps); lm = ll()
+                pc.params[pid] = o
+            g_fd = (lp - lm) / (2 * eps)
+            dmax = max(dmax, abs(g_fd - g_an))
+            gmax = max(gmax, abs(g_an), abs(g_fd))
+            n += 1
+    assert n >= 4
+    # Judged against the LARGEST gradient probed, not per-edge. A per-edge relative error is
+    # meaningless where the gradient is near zero -- the central difference resolves about 1e-4 here
+    # (the LL is accumulated in fp32), so an edge with |g| ~ 1e-4 reads as 100% error no matter how
+    # correct the kernel is. MEASURED: shapes whose worst per-edge ratio was 0.46 and 1.00 had a
+    # `dmax` of 1e-4, i.e. they were exact; the genuinely broken shape had `dmax` 3.06 against a
+    # `gmax` of 3.2. Scaling by `gmax` separates those cleanly.
+    assert dmax / gmax < 5e-2, f"dmax={dmax:.3e} gmax={gmax:.3e} ratio={dmax / gmax:.3e}"
+
+
+# ------------------------------------------------- the dual M-step, at its corners
+
+@cuda_only
+@pytest.mark.parametrize("step_size,pseudocount", [(1.0, 0.0), (0.5, 0.0), (0.5, 0.1), (1.0, 2.0)])
+def test_em_correction_keeps_parameters_normalized(step_size, pseudocount):
+    """The corrected M-step must leave each node's parameters summing to 1 over its children, for
+    every `(step_size, pseudocount)` -- the dual update renormalizes through `cum`, and an error
+    there shows up as drift rather than as anything obviously wrong."""
+    dev = torch.device("cuda:0")
+    root, ns = _build_shape(4, 2, 2)
+    pc = juice.compile(root, verbose = False).to(dev)
+    B = 96
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    phi = _phi(ns, B, dev)
+
+    for _ in range(3):
+        pc(x, sum_external_params = {ns: phi})
+        pc.backward(x, sum_external_params = {ns: phi}, logspace_flows = True,
+                    flows_memory = 0.0, allow_modify_flows = False)
+        pc.mini_batch_em(step_size = step_size, pseudocount = pseudocount)
+        assert torch.isfinite(pc.params).all(), "non-finite parameters after the corrected M-step"
+
+    ps, pe = ns._param_range
+    E, cbs, bs = ns.edge_ids.size(1), ns.ch_block_size, ns.block_size
+    theta = pc.params[ps:pe].reshape(E, cbs, bs)
+    nb = ns.edge_ids[0].to(device = theta.device, dtype = torch.long)
+    tot = torch.zeros(ns.num_node_blocks, bs, device = theta.device, dtype = theta.dtype)
+    tot.index_add_(0, nb, theta.sum(dim = 1))
+    assert (tot - 1.0).abs().max().item() < 1e-4, (tot - 1.0).abs().max().item()
+
+
+@cuda_only
+def test_em_correction_finite_when_a_parameter_is_zero():
+    """A structurally zero `theta` makes the dual ratio `(F+ + pc/K) / (F- + pc*theta)` a finite
+    number over a clamped zero, and `theta * ratio` must stay 0 rather than becoming `0 * inf`.
+    With `keep_zero_params` the zeros must also survive the update."""
+    dev = torch.device("cuda:0")
+    root, ns = _build_shape(4, 2, 2)
+    pc = juice.compile(root, verbose = False).to(dev)
+    B = 64
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    phi = _phi(ns, B, dev)
+
+    ps, pe = ns._param_range
+    with torch.no_grad():                          # zero out a slice of this ns's parameters
+        pc.params[ps:ps + (pe - ps) // 4] = 0.0
+    zeroed = (pc.params[ps:pe] == 0.0).clone()
+    assert bool(zeroed.any())
+
+    pc(x, sum_external_params = {ns: phi})
+    pc.backward(x, sum_external_params = {ns: phi}, logspace_flows = True,
+                flows_memory = 0.0, allow_modify_flows = False)
+    pc.mini_batch_em(step_size = 1.0, pseudocount = 1.0, keep_zero_params = True)
+
+    assert torch.isfinite(pc.params).all(), "the corrected M-step produced inf/NaN on a zero parameter"
+    assert bool((pc.params[ps:pe][zeroed] == 0.0).all()), "`keep_zero_params` did not hold the zeros"
+
+
+# ------------------------------------------- F- across the TOPOLOGY space
+#
+# The shapes above are all fully connected and all compile to a SINGLE forward partition, which leaves
+# two things in the denominator's addressing unexercised:
+#
+#   * the per-partition slicing of `pc.denom_param_flows`. The buffer is carved up one `(offset, size)`
+#     per forward partition, and a layer with one partition cannot tell a correct offset from a
+#     hardcoded zero. `"split"` below compiles to two.
+#   * ragged and BLOCK-SPARSE rows. The reconstruction streams `theta` by compiled edge slot and gathers
+#     `W` at `offs_edge // GATE_CBS`, so a row whose child blocks are not adjacent, or which is padded
+#     out to the widest row, is a different path through the same arithmetic.
+#
+# Reuses the topology table the gated layer's own ragged tests are built on, so this tracks whatever
+# they cover rather than a second, drifting list.
+
+# The suite runs under `--import-mode=importlib`, which does NOT put a test file's own directory on
+# `sys.path`. A sibling import then resolves only if that module happens to be in `sys.modules` already
+# -- i.e. only when a file sorting earlier pulled it in. This one sorts BEFORE `external_*`, so it has
+# to put the directory on the path itself rather than depend on collection order.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))           # noqa: E402
+from external_blockscale_ragged_test import TOPOLOGIES                     # noqa: E402
+
+
+def _build_topology(name, gate_cbs = 8, seed = 0):
+    edge_ids, bs, ch_bs, n_ch = TOPOLOGIES[name]
+    n_nb = int(edge_ids[0].max()) + 1
+    torch.manual_seed(seed)
+    with juice.set_block_size(ch_bs):
+        ni = [inputs(v, num_node_blocks = n_ch, dist = dists.Categorical(num_cats = NUM_CATS))
+              for v in range(2)]
+        prod = multiply(*ni)
+    ns = summate(prod, num_node_blocks = n_nb, edge_ids = edge_ids, block_size = bs,
+                 external_params = BlockScaleSumParams(ch_block_size = gate_cbs,
+                                                       apply_z_correction = True))
+    root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
+    torch.manual_seed(seed)
+    root.init_parameters(perturbation = 2.0)
+    return root, ns
+
+
+@cuda_only
+@pytest.mark.parametrize("name", sorted(TOPOLOGIES))
+def test_denom_across_topologies(name):
+    """Kernel vs torch reference, AND the reference-free `sum_c F-[n,c] == sum_b f_b[n]`, on every
+    topology the gated layer supports -- ragged, padded, block-sparse, narrow, and the one that
+    compiles to two forward partitions."""
+    dev = torch.device("cuda:0")
+    root, ns = _build_topology(name)
+    pc = juice.compile(root, verbose = False).to(dev)
+    B = 96
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    phi = _phi(ns, B, dev)
+
+    _, Fm_k, flow_sum = _run(pc, ns, x, phi, ref = False)
+    _, Fm_r, _ = _run(pc, ns, x, phi, ref = True)
+    assert torch.isfinite(Fm_k).all()
+    assert torch.count_nonzero(Fm_k) > 0
+    rel = ((Fm_k - Fm_r).abs() / (Fm_r.abs() + 1e-6)).max().item()
+    assert rel < 1e-4, f"{name}: kernel vs reference relmax={rel}"
+
+    got = _sum_over_children(pc, ns, Fm_k)
+    keep = flow_sum.abs() > 1e-8
+    cons = ((got - flow_sum).abs()[keep] / flow_sum.abs()[keep]).max().item()
+    assert cons < 1e-4, f"{name}: F- does not conserve node flow (relmax={cons})"
+
+
+@cuda_only
+def test_multi_partition_layer_uses_distinct_denom_slices():
+    """A layer with several forward partitions must get several DISTINCT, non-overlapping slices, and
+    every one of them must receive flow -- a reconstruction that read partition 0's `W` for every
+    partition would still look plausible, since the values have the right magnitude."""
+    dev = torch.device("cuda:0")
+    root, ns = _build_topology("split")
+    pc = juice.compile(root, verbose = False).to(dev)
+    lay = pc.external_params_nodes[ns]
+    assert lay.num_fw_partitions > 1, \
+        f"the `split` topology stopped producing several partitions ({lay.num_fw_partitions}); this " \
+        f"test no longer covers the per-partition slicing"
+
+    offs = [o for o, _ in lay.denom_flow_slices]
+    assert len(set(offs)) == len(offs) and offs[0] == 0
+    cursor = 0
+    for off, size in lay.denom_flow_slices:
+        assert off == cursor and size > 0
+        cursor = off + size
+
+    B = 96
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    phi = _phi(ns, B, dev)
+    _run(pc, ns, x, phi)
+
+    for pid, (off, size) in enumerate(lay.denom_flow_slices):
+        assert torch.count_nonzero(pc.denom_param_flows[off:off + size]) > 0, \
+            f"partition {pid}'s slice got no flow"
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(pytest.main([__file__, "-v"]))
+
+
+# --------------------------------------------------------- the generic M-step's contract
+#
+# `ExternalSumParams.compute_em_correction` implements the conditional dual-flow M-step GENERICALLY:
+# it needs only `ns`'s compiled geometry plus `F-`, so a parameterization that can produce `F-` gets a
+# correct update with no M-step code of its own. These two tests pin that, because it is the promise a
+# future dual-flow parameterization (low-rank, say) would be written against.
+
+
+class _DenseDenomParams(ExternalSumParams):
+    """A deliberately MINIMAL dual-flow parameterization: it keeps `F-` densely, in param-flow layout,
+    and implements neither `compute_em_correction` nor `_fused_em_correction`.
+
+    This is the whole EM-side surface a new parameterization has to implement -- one hook. It is not a
+    useful model (nothing here touches the forward); it exists so the base class's promise is tested
+    without `BlockScaleSumParams`' gate-space reconstruction in the way."""
+
+    requests_denom_param_flows = True
+
+    def __init__(self, fminus):
+        super(_DenseDenomParams, self).__init__()
+        self._fminus = fminus
+
+    def get_signature(self) -> str:
+        return "DenseDenom"
+
+    def materialize_denom_flows(self, ns, params, denom_param_flows, denom_sources, out = None):
+        if out is not None:
+            out.copy_(self._fminus)
+            return out
+        return self._fminus
+
+
+def _ref_dual_m_step(ns, theta, fp, fm, step_size, pseudocount, keep_zero_params):
+    """`theta <- normalize(theta * F+ / F-)`, written as an explicit per-node loop in float64.
+
+    Deliberately NOT the implementation's vectorised form: it walks each node block's edge blocks and
+    each node within the block, so a bug in the real path's `index_add_` / broadcasting cannot be
+    reproduced here by construction."""
+    bs, cbs = ns.block_size, ns.ch_block_size
+    E = ns.edge_ids.size(1)
+    th = theta.reshape(E, cbs, bs).double()
+    fpl = fp.reshape(E, cbs, bs).double()
+    fml = fm.reshape(E, cbs, bs).double()
+    nb = ns.edge_ids[0].tolist()
+    out = torch.zeros_like(th)
+    for blk in range(ns.num_node_blocks):
+        es = [e for e in range(E) if nb[e] == blk]
+        K = len(es) * cbs                                   # children of every node in this block
+        for m in range(bs):                                 # each node within the block
+            ratios, tot = {}, 0.0
+            for e in es:
+                den = torch.clamp(fml[e, :, m] + pseudocount * th[e, :, m], min = 1e-38)
+                r = (fpl[e, :, m] + pseudocount / K) / den
+                ratios[e] = r
+                tot += float((th[e, :, m] * r).sum())
+            cum = max((1.0 - step_size) + step_size * tot, 1e-38)
+            for e in es:
+                out[e, :, m] = th[e, :, m] * ((1.0 - step_size) + step_size * ratios[e]) / cum
+    out = torch.clamp(out, min = 1e-30)
+    if keep_zero_params:
+        out = torch.where(th < 1e-12, torch.zeros_like(out), out)
+    return out.reshape(-1)
+
+
+def _plain_ns_for_geometry(seed = 0, nb = 3, cb = 2):
+    """A compiled `ns` whose geometry the M-step can be exercised against (several edge blocks per
+    node block, so the per-node normalizer actually sums over more than one)."""
+    torch.manual_seed(seed)
+    with juice.set_block_size(4):
+        i0 = inputs(0, num_node_blocks = cb, dist = dists.Categorical(num_cats = NUM_CATS))
+        i1 = inputs(1, num_node_blocks = cb, dist = dists.Categorical(num_cats = NUM_CATS))
+        ns = summate(multiply(i0, i1), num_node_blocks = nb)
+        root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
+    root.init_parameters(perturbation = 2.0)
+    pc = juice.compile(root, verbose = False).to(torch.device("cuda:0"))
+    return pc, ns
+
+
+@cuda_only
+@pytest.mark.parametrize("step_size,pseudocount,keep_zero",
+                         [(1.0, 0.0, False), (0.5, 0.1, False), (0.3, 0.01, True)])
+def test_the_generic_m_step_needs_only_materialize_denom_flows(step_size, pseudocount, keep_zero):
+    """A parameterization that implements ONE hook gets the correct conditional M-step from the base."""
+    dev = torch.device("cuda:0")
+    pc, ns = _plain_ns_for_geometry()
+    ps, pe = ns._param_range
+    pfs, pfe = ns._param_flow_range
+    size = pe - ps
+
+    torch.manual_seed(7)
+    theta = pc.params[ps:pe].clone()
+    fp = torch.rand(size, device = dev) + 0.05
+    fm = torch.rand(size, device = dev) + 0.05
+    pc.param_flows = torch.zeros(pfe, device = dev)
+    pc.param_flows[pfs:pfe] = fp
+
+    desc = _DenseDenomParams(fm)
+    # the point of the exercise: this subclass defines NEITHER of these
+    assert "compute_em_correction" not in _DenseDenomParams.__dict__
+    assert "_fused_em_correction" not in _DenseDenomParams.__dict__
+
+    got = desc.compute_em_correction(ns, pc.params, pc.param_flows, None, step_size,
+                                     pseudocount, keep_zero, denom_sources = ())
+    assert got is not None, "the base class declined to run the conditional M-step"
+    exp = _ref_dual_m_step(ns, theta, fp, fm, step_size, pseudocount, keep_zero)
+    rel = ((got.double() - exp).abs() / exp.abs().clamp_min(1e-20)).max().item()
+    assert rel < 1e-5, f"generic M-step differs from the explicit reference (relmax = {rel})"
+
+
+@cuda_only
+def test_the_generic_m_step_reduces_to_normalize_fplus_when_fminus_is_theta_times_the_total():
+    """The analytic check worth running first on any new parameterization.
+
+    If `F-[n,c] = theta[n,c] * sum_c' F+[n,c']` -- which is what a SINGLE gate produces, because the
+    gate then cancels against the normalizer -- then at `step_size = 1`, `pseudocount = 0` the
+    conditional update must collapse to the plain `normalize(F+)`. It pins the generic math against a
+    closed form rather than against another implementation."""
+    dev = torch.device("cuda:0")
+    pc, ns = _plain_ns_for_geometry(seed = 1)
+    ps, pe = ns._param_range
+    pfs, pfe = ns._param_flow_range
+    size = pe - ps
+    bs, cbs = ns.block_size, ns.ch_block_size
+    E = ns.edge_ids.size(1)
+
+    torch.manual_seed(11)
+    theta = pc.params[ps:pe].clone()
+    fp = torch.rand(size, device = dev) + 0.05
+    pc.param_flows = torch.zeros(pfe, device = dev)
+    pc.param_flows[pfs:pfe] = fp
+
+    # F-[n,c] = theta[n,c] * S[n], with S[n] the total F+ over that node's children
+    nb = ns.edge_ids[0].to(device = dev, dtype = torch.long)
+    fp3 = fp.reshape(E, cbs, bs)
+    S = torch.zeros(ns.num_node_blocks, bs, device = dev)
+    S.index_add_(0, nb, fp3.sum(dim = 1))
+    fm = (theta.reshape(E, cbs, bs) * S[nb][:, None, :]).reshape(-1).contiguous()
+
+    got = _DenseDenomParams(fm).compute_em_correction(
+        ns, pc.params, pc.param_flows, None, 1.0, 0.0, False, denom_sources = ())
+
+    expected = (fp3 / S[nb][:, None, :]).reshape(-1)        # normalize(F+) over each node's children
+    rel = ((got - expected).abs() / expected.abs().clamp_min(1e-20)).max().item()
+    assert rel < 1e-5, f"the correction is not a no-op for a single-gate F- (relmax = {rel})"
+
+
+class _DenseModeDescriptor(ExternalSumParams):
+    """Routes the SHARED dual-EM kernels through `DENOM_DENSE` over a given param-flow-shaped `F-`.
+
+    Everything else -- the plan, the tiles, the const table, both launches -- is inherited from
+    `ExternalSumParams`, so this is exactly what a parameterization that stores `F-` densely has to
+    write to get the fast M-step. It exists to cover that kernel branch, which `BlockScaleSumParams`
+    (row-group mode) never reaches."""
+
+    requests_denom_param_flows = True
+
+    def __init__(self, fminus, denom_base):
+        super(_DenseModeDescriptor, self).__init__()
+        self._fm = fminus
+        self._base = denom_base
+
+    def get_signature(self) -> str:
+        return "DenseMode"
+
+    def denom_kernel_spec(self, layer, denom_param_flows, pid):
+        from pyjuice.nodes.external_params.kernels.dual_em import DENOM_DENSE
+        return (DENOM_DENSE, self._fm, 0, 1, self._base)
+
+    def materialize_denom_flows(self, ns, params, denom_param_flows, denom_sources, out = None):
+        if out is not None:
+            out.copy_(self._fm)
+            return out
+        return self._fm
+
+
+@cuda_only
+@pytest.mark.parametrize("bs,nb,gcbs,step,pcount,kz",
+                         [(4, 3, 2, 0.5, 0.1, False), (16, 4, 4, 1.0, 0.0, False),
+                          (32, 2, 8, 0.3, 0.01, True)])
+def test_dense_and_rowgroup_denom_modes_agree(bs, nb, gcbs, step, pcount, kz):
+    """`DENOM_DENSE` and `DENOM_ROWGROUP` must produce the same M-step from the same `F-`.
+
+    Row-group mode computes `F- = theta * W[n, g(c)]` inside the kernel; dense mode reads `F-` from a
+    param-flow-shaped buffer. Feeding the SECOND the expansion of the first's `W` makes them the same
+    mathematical quantity, so any disagreement is a bug in one of the two branches rather than a
+    difference in the statistic."""
+    dev = torch.device("cuda:0")
+    torch.manual_seed(bs)
+    with juice.set_block_size(bs):
+        i0 = inputs(0, num_node_blocks = nb, dist = dists.Categorical(num_cats = NUM_CATS))
+        i1 = inputs(1, num_node_blocks = nb, dist = dists.Categorical(num_cats = NUM_CATS))
+        ns = summate(multiply(i0, i1), num_node_blocks = nb,
+                     external_params = BlockScaleSumParams(ch_block_size = gcbs,
+                                                           apply_z_correction = True))
+        root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
+    torch.manual_seed(bs)
+    root.init_parameters(perturbation = 2.0)
+    pc = juice.compile(root, verbose = False).to(dev)
+
+    B = 32
+    torch.manual_seed(bs + 1)
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    phi = torch.randn(ns.external_params.tensor_shapes(ns, B)[0], device = dev) * 1.5
+    ext = {ns: phi}
+    pc(x, sum_external_params = ext)
+    pc.backward(x, sum_external_params = ext, logspace_flows = True, flows_memory = 0.0,
+                allow_modify_flows = False)
+    from pyjuice.model.backend.parflow_fusing import compute_cum_par_flows
+    compute_cum_par_flows(pc.param_flows, pc.parflow_fusing_kwargs)
+
+    srcs = pc._denom_correction_nss()
+    tgt = next(iter(srcs))
+    bsdesc = tgt.external_params
+    args = (tgt, pc.params, pc.param_flows, pc.denom_param_flows, step, pcount, kz)
+
+    rowgroup = bsdesc._fused_em_correction(*args, srcs[tgt])
+    assert rowgroup is not None, "the row-group fast path declined; nothing to compare against"
+    rowgroup = rowgroup.clone()
+
+    # the same `F-`, expanded into param-flow layout, fed to the dense branch
+    fm = bsdesc.materialize_denom_flows(tgt, pc.params, pc.denom_param_flows, srcs[tgt]).clone()
+    dense_desc = _DenseModeDescriptor(fm, tgt._param_flow_range[0])
+    dense = dense_desc._fused_em_correction(*args, srcs[tgt])
+    assert dense is not None, "the dense branch declined the fast path"
+
+    rel = ((dense - rowgroup).abs() / rowgroup.abs().clamp_min(1e-20)).max().item()
+    assert rel < 1e-5, f"DENOM_DENSE disagrees with DENOM_ROWGROUP (relmax = {rel})"
+
+    # and both must agree with the generic torch M-step, which is the independent reference
+    ref = dense_desc.compute_em_correction(*args, denom_sources = srcs[tgt])
+    rel2 = ((rowgroup - ref).abs() / ref.abs().clamp_min(1e-20)).max().item()
+    assert rel2 < 1e-5, f"the fused modes disagree with the torch M-step (relmax = {rel2})"
