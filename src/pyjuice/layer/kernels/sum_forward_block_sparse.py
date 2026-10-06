@@ -17,6 +17,7 @@ else:
     tlmath = tl.math
 
 from pyjuice.utils.kernel_launcher import triton_jit
+from pyjuice.layer.kernels import _round_to_tf32
 
 
 
@@ -112,8 +113,8 @@ def _fw_triton_block_sparse_tlmm_kernel(node_mars, element_mars, mparams, nids, 
                 emars_bf16 = emars_sub.to(tl.bfloat16)
                 nmars = tl.dot(epars_bf16, emars_bf16).to(tl.float32)
             else:
-                # Built-in matmul kernel of triton + float32
-                nmars = tl.dot(epars, emars_sub)
+                # Built-in matmul kernel of triton + float32 (a TF32 dot: see `_round_to_tf32`)
+                nmars = tl.dot(_round_to_tf32(epars), _round_to_tf32(emars_sub))
 
             acc = tl.where(emars_max > acc,
                 tl.log(nmars + tl.exp(acc - emars_max) + 1e-24) + emars_max,
@@ -134,8 +135,8 @@ def _fw_triton_block_sparse_tlmm_kernel(node_mars, element_mars, mparams, nids, 
                     emars_bf16 = emars_sub.to(tl.bfloat16)
                     nmars = tl.dot(epars_bf16, emars_bf16).to(tl.float32)
                 else:
-                    # Built-in matmul kernel of triton + float32
-                    nmars = tl.dot(epars, emars_sub)
+                    # Built-in matmul kernel of triton + float32 (a TF32 dot: see `_round_to_tf32`)
+                    nmars = tl.dot(_round_to_tf32(epars), _round_to_tf32(emars_sub))
 
                 acc_tempered = tl.where(emars_max > acc_tempered,
                     tl.log(nmars + tl.exp(acc_tempered - emars_max) + 1e-24) + emars_max,
@@ -260,8 +261,12 @@ def _fw_triton_block_sparse_csmm1_kernel(node_mars, element_mars, mparams, nids,
                 emars_sub = emars_sub.to(tl.bfloat16)
                 nmars = tl.sum(epars[:,:,None] * emars_sub[None,:,:], axis = 1).to(tl.float32)
             else:
-                # Simulated matmul kernel + float32
-                nmars = tl.sum(epars[:,:,None] * emars_sub[None,:,:], axis = 1)
+                # Simulated matmul kernel + float32. Reduced over axis 0 ON PURPOSE: Triton rewrites the
+                # textbook `tl.sum(a[:,:,None] * b[None,:,:], axis = 1)` into a TF32 tensor-core dot, which
+                # truncates every operand. That made this "fp32" path ~6e-4 low per layer, compounding with
+                # depth (an HMM's log-likelihood depended on the batch size: 0.018 nats at 32 layers). This
+                # form does not match the rewrite, so it stays in fp32 FMAs -- at no measured cost.
+                nmars = tl.sum(tl.trans(epars)[:,:,None] * emars_sub[:,None,:], axis = 0)
 
             acc = tl.where(emars_max > acc,
                 tl.log(nmars + tl.exp(acc - emars_max) + 1e-24) + emars_max,
@@ -282,8 +287,8 @@ def _fw_triton_block_sparse_csmm1_kernel(node_mars, element_mars, mparams, nids,
                     emars_sub = emars_sub.to(tl.bfloat16)
                     nmars = tl.sum(epars[:,:,None] * emars_sub[None,:,:], axis = 1).to(tl.float32)
                 else:
-                    # Simulated matmul kernel + float32
-                    nmars = tl.sum(epars[:,:,None] * emars_sub[None,:,:], axis = 1)
+                    # Simulated matmul kernel + float32 (axis-0 form: see the note above)
+                    nmars = tl.sum(tl.trans(epars)[:,:,None] * emars_sub[:,None,:], axis = 0)
 
                 acc_tempered = tl.where(emars_max > acc_tempered,
                     tl.log(nmars + tl.exp(acc_tempered - emars_max) + 1e-24) + emars_max,

@@ -17,6 +17,7 @@ else:
     tlmath = tl.math
 
 from pyjuice.utils.kernel_launcher import triton_jit
+from pyjuice.layer.kernels import _round_to_tf32
 
 
 
@@ -105,17 +106,17 @@ def _bk_triton_block_sparse_par_kernel(node_flows, node_mars, element_mars, mpar
                     if DOT_IEEE:
                         partial_flows = tl.dot(n_fdm_sub * nflows, scaled_emars, input_precision = "ieee")
                     else:
-                        partial_flows = tl.dot(n_fdm_sub * nflows, scaled_emars)
+                        partial_flows = tl.dot(_round_to_tf32(n_fdm_sub * nflows), _round_to_tf32(scaled_emars))
                 else:
-                    partial_flows = tl.sum(n_fdm_sub[:,:,None] * nflows[:,:,None] * scaled_emars[None,:,:], axis = 1)
+                    partial_flows = tl.sum(tl.trans(n_fdm_sub * nflows)[:,:,None] * scaled_emars[:,None,:], axis = 0)
             else:
                 if TL_DOT == 1:
                     if DOT_IEEE:
                         partial_flows = tl.dot(n_fdm_sub, scaled_emars, input_precision = "ieee")
                     else:
-                        partial_flows = tl.dot(n_fdm_sub, scaled_emars)
+                        partial_flows = tl.dot(_round_to_tf32(n_fdm_sub), _round_to_tf32(scaled_emars))
                 else:
-                    partial_flows = tl.sum(n_fdm_sub[:,:,None] * scaled_emars[None,:,:], axis = 1)
+                    partial_flows = tl.sum(tl.trans(n_fdm_sub)[:,:,None] * scaled_emars[:,None,:], axis = 0)
 
             acc += partial_flows
 
@@ -241,17 +242,17 @@ def _bk_triton_block_sparse_par_kernel_rmw(node_flows, node_mars, element_mars, 
                     if DOT_IEEE:
                         partial_flows = tl.dot(n_fdm_sub * nflows, scaled_emars, input_precision = "ieee")
                     else:
-                        partial_flows = tl.dot(n_fdm_sub * nflows, scaled_emars)
+                        partial_flows = tl.dot(_round_to_tf32(n_fdm_sub * nflows), _round_to_tf32(scaled_emars))
                 else:
-                    partial_flows = tl.sum(n_fdm_sub[:,:,None] * nflows[:,:,None] * scaled_emars[None,:,:], axis = 1)
+                    partial_flows = tl.sum(tl.trans(n_fdm_sub * nflows)[:,:,None] * scaled_emars[:,None,:], axis = 0)
             else:
                 if TL_DOT == 1:
                     if DOT_IEEE:
                         partial_flows = tl.dot(n_fdm_sub, scaled_emars, input_precision = "ieee")
                     else:
-                        partial_flows = tl.dot(n_fdm_sub, scaled_emars)
+                        partial_flows = tl.dot(_round_to_tf32(n_fdm_sub), _round_to_tf32(scaled_emars))
                 else:
-                    partial_flows = tl.sum(n_fdm_sub[:,:,None] * scaled_emars[None,:,:], axis = 1)
+                    partial_flows = tl.sum(tl.trans(n_fdm_sub)[:,:,None] * scaled_emars[:,None,:], axis = 0)
 
             acc += partial_flows
 
@@ -450,9 +451,9 @@ def _bk_triton_block_sparse_tempered_par_kernel(node_flows, node_mars_tempered, 
             if DOT_IEEE:
                 partial_flows = tl.dot(n_fdm_sub, scaled_emars, input_precision = "ieee")
             else:
-                partial_flows = tl.dot(n_fdm_sub, scaled_emars)
+                partial_flows = tl.dot(_round_to_tf32(n_fdm_sub), _round_to_tf32(scaled_emars))
         else:
-            partial_flows = tl.sum(n_fdm_sub[:,:,None] * scaled_emars[None,:,:], axis = 1)
+            partial_flows = tl.sum(tl.trans(n_fdm_sub)[:,:,None] * scaled_emars[:,None,:], axis = 0)
 
         acc += partial_flows
 

@@ -824,6 +824,89 @@ def test_param_flows_invariant_to_batch_chunking():
             f"total parameter flows depend on the batch chunking (chunk={chunk} vs 64, relmax={rel:.4f})"
 
 
+def _deep_hmm(device):
+    torch.manual_seed(11)
+    ns = juice.structures.GeneralizedHMM(
+        seq_length = 32, num_latents = 256, homogeneous = True,   # 32 sum layers, block_size 256
+        input_dist = juice.distributions.Categorical(num_cats = 16)
+    )
+    ns.init_parameters(perturbation = 2.0)
+    pc = juice.compile(ns)
+    pc.to(device)
+    return pc
+
+
+@pytest.mark.parametrize("batch_size", [12, 64])
+def test_flows_do_not_leak_with_depth(batch_size):
+    """
+    Regression: the sum layers' flow propagation was biased LOW by ~6e-4 per layer, so a deep
+    circuit lost flow geometrically with depth -- 1% of the total at 32 layers, and an HMM's
+    log-likelihood depended on the batch it was evaluated in (0.018 nats at 32 layers, batch 12).
+
+    Cause: TF32 truncation. A TF32 `tl.dot` hands fp32 registers to the tensor core, which ignores
+    the low 13 mantissa bits -- truncation, so for the all-positive operands here a bias, not noise.
+    Two sites: the element-flow kernel's explicit `tl.dot` (batch >= 16), and -- in the paths written
+    as fp32 (`csmm1` forward and the element-flow `TL_DOT = 0` branch, batch 9..15) -- Triton
+    rewriting `tl.sum(a[:,:,None] * b[None,:,:], axis = 1)` into a TF32 dot by itself.
+
+    Why the other tests here missed it: they use 4-layer HMMs (4 x 6e-4 is under their 1e-3 bar)
+    and batches <= 8, which take the exact `csmm2` kernels.
+
+    The instrument is pinned, because both of its free choices are made by TIMING: at batch < 16 the
+    exact CUDA small-batch kernels may win the fork, and the launch-config tuner picks the tile shape.
+    The tile matters: at batch 12 only the tuner's 16-row candidate is big enough for Triton's TF32
+    rewrite -- the heuristic 8-row tile is exact -- and it is also the faster one, so the real tuner
+    usually takes it. So the Triton paths are forced and the tuner always takes the LARGEST candidate.
+
+    Reference-free: in an HMM each sum layer passes exactly one unit of flow per sample, so the
+    total parameter flow of a one-shot backward must equal that of `batch_size` batch-1 backwards.
+    """
+    import pyjuice.layer.sum_layer as sl
+    from pyjuice.layer.kernels import autotune
+
+    device = torch.device("cuda:0")
+    pc = _deep_hmm(device)
+    torch.manual_seed(batch_size)
+    x = torch.randint(0, 16, [batch_size, 32], device = device)
+
+    saved = (sl.FORWARD_SUM_CUDA, sl.BACKWARD_ELE_FLOW_CUDA, autotune.ENABLED, autotune.best_of,
+             dict(autotune._CACHE))
+    try:
+        sl.FORWARD_SUM_CUDA = sl.BACKWARD_ELE_FLOW_CUDA = False
+        autotune.ENABLED = True
+        autotune._CACHE.clear()
+        autotune.best_of = lambda candidates, *a, **k: max(c for c, _ in candidates)
+
+        def total(chunk):
+            lls = []
+            for i, s in enumerate(range(0, batch_size, chunk)):
+                xs = x[s:s + chunk].contiguous()
+                lls.append(pc(xs).view(-1).clone())
+                pc.backward(xs, logspace_flows = True, allow_modify_flows = False,
+                            flows_memory = 0.0 if i == 0 else 1.0)
+            torch.cuda.synchronize()
+            return pc.param_flows.double().sum().item(), torch.cat(lls).double()
+
+        ref_flow, ref_ll = total(1)
+        got_flow, got_ll = total(batch_size)
+    finally:
+        sl.FORWARD_SUM_CUDA, sl.BACKWARD_ELE_FLOW_CUDA, autotune.ENABLED, autotune.best_of, cache = saved
+        autotune._CACHE.clear()
+        autotune._CACHE.update(cache)
+
+    # 32 sum layers x 1 unit per sample
+    assert abs(ref_flow / batch_size - 32.0) < 1e-3, f"batch-1 reference itself is off: {ref_flow / batch_size}"
+
+    rel = abs(got_flow / ref_flow - 1.0)
+    assert rel < 3e-3, f"sum-layer flow leaks with depth at batch_size={batch_size}: {got_flow / batch_size:.5f} of 32 units/sample"
+
+    # Only where the forward is meant to be fp32. From 16 up it is a bf16 dot BY DESIGN (rounded to
+    # nearest, so unbiased), which on its own puts ~1.7e-3 between batch 64 and batch 1 here.
+    if batch_size < 16:
+        dll = (got_ll - ref_ll).abs().max().item()
+        assert dll < 2e-3, f"log-likelihood depends on the batch size at batch_size={batch_size}: max |dLL| = {dll:.5f}"
+
+
 if __name__ == "__main__":
     test_hmm_batch_size_consistency()
     test_hmm_backward_small_batch()
