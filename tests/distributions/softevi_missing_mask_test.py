@@ -1,3 +1,5 @@
+import random
+
 import pytest
 import torch
 
@@ -161,7 +163,7 @@ def test_no_nan_with_a_partially_padded_batch_tile(batch_size):
     assert torch.isfinite(pf).all(), "non-finite param_flows with a padded batch tile"
 
 
-def _dense_setup(monkeypatch, use_dense, dual_flow = True, with_grad = False, force = True):
+def _dense_setup(monkeypatch, use_dense, dual_flow = True, with_grad = False, force = True, homogeneous = True):
     """The dense top-k path only engages when the parameter table overflows L2 and the emissions are tied
     across variables, so shrink the L2 figure it gates on instead of building a multi-GB model.
 
@@ -178,7 +180,7 @@ def _dense_setup(monkeypatch, use_dense, dual_flow = True, with_grad = False, fo
     elif force:
         monkeypatch.setattr(_softevi, "_dense_worth_it", lambda layer, kwargs: True)
 
-    pc = _build(S, L, C, dual_flow = dual_flow, homogeneous = True)
+    pc = _build(S, L, C, dual_flow = dual_flow, homogeneous = homogeneous)
     layer = pc.input_layer_group[0]
 
     torch.manual_seed(3)
@@ -278,13 +280,196 @@ def test_timed_dense_choice_benchmarks_into_scratch(dual_flow):
         f"evidence gradient changed by tuning (max abs diff {float((g_t - g_u).abs().max()):.3e})"
 
 
+def _record_dense_timings(mp):
+    """Collect every time the dense-vs-scattered tuner measures for a candidate (None: it raised).
+    Timings of other tuners nested inside a candidate's run are left out."""
+    from pyjuice.layer.kernels import autotune
+
+    times, depth, active = [], [0], [False]
+    real_time, real_tune = autotune._median_time, _softevi._tune_dense_choice
+
+    def timed(run, warmup, reps):
+        depth[0] += 1
+        try:
+            t = real_time(run, warmup, reps)
+        finally:
+            depth[0] -= 1
+        if active[0] and depth[0] == 0:
+            times.append(t)
+        return t
+
+    def tune(*args, **kwargs):
+        active[0] = True
+        try:
+            return real_tune(*args, **kwargs)
+        finally:
+            active[0] = False
+
+    mp.setattr(autotune, "_median_time", timed)
+    mp.setattr(_softevi, "_tune_dense_choice", tune)
+    return times
+
+
+def _no_toolchain(*args, **kwargs):
+    raise RuntimeError("the softevi CUDA extension cannot be built here")
+
+
+@pytest.mark.parametrize("cuda", [True, False])
+@pytest.mark.parametrize("mode", ["forward_only", "backward", "no_param_flows"])
+def test_dense_choice_times_every_candidate_as_the_step_runs_it(cuda, mode):
+    """The tuner times each candidate by replaying the input layer's own post-processing with the choice
+    forced (`_tune_dense_choice`), so every candidate must RUN in every configuration a step can be in.
+    A candidate that raises is silently skipped by the autotuner, so a broken replay does not fail
+    anything -- it just hands the choice to whichever candidate survived. So: count the timings and
+    require all of them to be real, here for
+
+      * a FORWARD-ONLY caller (evaluation, conditional sampling), timed on its own key;
+      * a training step (forward, then backward: the forward-only key, then the joint one);
+      * `backward(compute_param_flows = False)` -- what the queries do -- where `param_flows` is None;
+
+    each with and without the CUDA toolchain (without it the dense forward does not exist, so a forward
+    alone has nothing to choose, and the backward times the Triton kernels). And the step's own outputs
+    must match the same step untuned."""
+    from pyjuice.layer.kernels import autotune
+    from pyjuice.nodes.distributions import c_kernels
+
+    if cuda and not c_kernels.dense_expected_flow_available():
+        pytest.skip("the softevi CUDA extension is not available")
+
+    # timed choices: forward-only key, joint key
+    expected = {(True, "forward_only"): 3, (True, "backward"): 6, (True, "no_param_flows"): 6,
+                (False, "forward_only"): 0, (False, "backward"): 3, (False, "no_param_flows"): 3}[(cuda, mode)]
+
+    out = {}
+    saved = (autotune.ENABLED, dict(autotune._CACHE))
+    try:
+        for tuned in (False, True):
+            autotune.ENABLED = tuned
+            autotune._CACHE.clear()
+            with pytest.MonkeyPatch.context() as mp:
+                if not cuda:
+                    # As without a toolchain: the probe says no, and every entry point would fail to build
+                    # -- so a tuner that called one directly, rather than going through the gates, raises.
+                    mp.setattr(c_kernels, "dense_expected_flow_available", lambda: False)
+                    mp.setattr(_softevi._DenseDenomDispatch, "_cuda_ok", lambda self: False)
+                    for entry in ("dense_expected_flow", "softevi_forward", "softevi_forward_dense"):
+                        mp.setattr(c_kernels, entry, _no_toolchain)
+                times = _record_dense_timings(mp)
+                pc, layer, data, kw, (S, L, C, B) = _dense_setup(mp, True, with_grad = True, force = False)
+
+                lls = pc(data, **kw).clone()
+                pf = grad = None
+                if mode != "forward_only":
+                    grad = torch.zeros_like(kw["categorical_evidence_logp"])
+                    if mode == "backward":
+                        pc.init_param_flows(flows_memory = 0.0)
+                    pc.backward(data, allow_modify_flows = False, logspace_flows = True,
+                                compute_param_flows = (mode == "backward"), categorical_evidence_logp_grad = grad, **kw)
+                    assert (layer.param_flows is None) == (mode == "no_param_flows")
+                    if mode == "backward":
+                        pf = layer.param_flows.clone()
+                out[tuned] = (lls, pf, grad)
+
+                if tuned:
+                    assert len(times) == expected and all(t is not None for t in times), \
+                        f"expected {expected} candidate timings, all real; got {times}"
+                    kinds = sorted(str(k[1][-1]) for k in autotune._CACHE if k[1][0] == "softevi_dense_vs_scattered")
+                    want = {3: ["forward_only"] if mode == "forward_only" else ["True"],
+                            6: ["True", "forward_only"], 0: []}[expected]
+                    assert kinds == want, f"cached choices: {kinds}"
+    finally:
+        autotune.ENABLED = saved[0]
+        autotune._CACHE.clear()
+        autotune._CACHE.update(saved[1])
+
+    for name, a, b in zip(("LL", "param flows", "evidence gradient"), out[True], out[False]):
+        if a is not None:
+            assert torch.allclose(a, b, rtol = 1e-4, atol = 1e-6), \
+                f"{name} changed by tuning (max abs diff {float((a - b).abs().max()):.3e})"
+
+
+def test_conditional_sampling_after_a_tuned_forward_only_call():
+    """The decode loop: top-k evidence through a forward with NO backward, then a conditional draw. That
+    forward times its own choice (the forward-only key) by replaying the forward into a scratch
+    `node_mars`, so the circuit state the draw reads must be the one an untuned forward leaves: the same
+    marginals to rounding, and the same frontier under the same seed."""
+    from pyjuice.layer.kernels import autotune
+
+    out = {}
+    saved = (autotune.ENABLED, dict(autotune._CACHE))
+    try:
+        for tuned in (False, True):
+            autotune.ENABLED = tuned
+            autotune._CACHE.clear()
+            with pytest.MonkeyPatch.context() as mp:
+                pc, layer, data, kw, (S, L, C, B) = _dense_setup(mp, True, force = False)
+                pc(data, **kw)
+                node_mars = pc.node_mars.clone()
+                random.seed(7)                       # `sample` seeds its kernels from `random`
+                torch.manual_seed(7)
+                frontier = juice.queries.sample(pc, conditional = True, _sample_input_ns = False)
+                out[tuned] = (node_mars, frontier.clone())
+                if tuned:
+                    kinds = [k[1][-1] for k in autotune._CACHE if k[1][0] == "softevi_dense_vs_scattered"]
+                    assert kinds == ["forward_only"], f"cached choices: {kinds}"
+    finally:
+        autotune.ENABLED = saved[0]
+        autotune._CACHE.clear()
+        autotune._CACHE.update(saved[1])
+
+    (nm_t, fr_t), (nm_u, fr_u) = out[True], out[False]
+    assert torch.allclose(nm_t, nm_u, rtol = 1e-5, atol = 1e-5), \
+        f"node marginals changed by tuning (max abs diff {float((nm_t - nm_u).abs().max()):.3e})"
+    assert torch.equal(fr_t, fr_u), "the conditional draw changed with tuning"
+
+
+@pytest.mark.parametrize("homogeneous", [True, False])
+@pytest.mark.parametrize("split", [None, 3])
+def test_dense_layouts_agree_with_scattered(homogeneous, split):
+    """The dense index comes in two layouts: one category order ("single"), or shards by reference-list
+    length ("ladder", `_choose_shards`). Both are built in one vectorized pass over every param-flow
+    block and every shard. Force each, plus the scattered path, through a whole step -- tied emissions
+    (one block) and untied (a block per variable) -- and require the same LL, flows and gradient, with
+    the ladder really split into several shards. With `split`, long lists are also cut into pieces
+    (`_DENSE_LIST_SPLIT`), so a category is accumulated by several threads."""
+    out = {}
+    for choice in ("scattered", "single", "ladder"):
+        with pytest.MonkeyPatch.context() as mp:
+            if split is not None:
+                mp.setattr(_softevi, "_DENSE_LIST_SPLIT", split)
+            pc, layer, data, kw, (S, L, C, B) = _dense_setup(mp, True, with_grad = True, force = False,
+                                                             homogeneous = homogeneous)
+            layer._dense_choice_override = choice
+            pc.init_param_flows(flows_memory = 0.0)
+            lls = pc(data, **kw).clone()
+            grad = torch.zeros_like(kw["categorical_evidence_logp"])
+            pc.backward(data, allow_modify_flows = False, logspace_flows = True, categorical_evidence_logp_grad = grad, **kw)
+            out[choice] = (lls, layer.param_flows.clone(), grad)
+            if choice != "scattered":
+                index = layer._dense_index_cache[1][choice == "ladder"]
+                assert index["num_blocks"] == (1 if homogeneous else S)
+                assert index["split"] == (split is not None)
+                assert (len(index["shards"]) > 1) == (choice == "ladder"), \
+                    f"{choice}: {len(index['shards'])} shards"
+
+    for choice in ("single", "ladder"):
+        for name, a, b in zip(("LL", "param flows", "evidence gradient"), out[choice], out["scattered"]):
+            assert torch.allclose(a, b, rtol = 1e-4, atol = 1e-6), \
+                f"{choice} vs scattered, {name} (max abs diff {float((a - b).abs().max()):.3e})"
+
+
 @pytest.mark.parametrize("dual_flow", [True, False])
-def test_dense_triton_fallback_reads_only_valid_references(dual_flow, monkeypatch):
+@pytest.mark.parametrize("split", [None, 3])
+def test_dense_triton_fallback_reads_only_valid_references(dual_flow, split, monkeypatch):
     """The dense index's reference tables are NOT zero-filled: a category's list is padded to the
     longest one in its shard, and every reader must stop at the category's own count. The CUDA kernels
     loop `j < cnt`; the Triton fallback (taken without a CUDA toolchain) masks `j < cnt`. Nothing else
     in the suite runs that fallback, so force it here, and poison `torch.empty` -- NaN for floats -- so
-    that a read past a list's end shows up as NaN rather than passing on freshly zeroed memory."""
+    that a read past a list's end shows up as NaN rather than passing on freshly zeroed memory.
+
+    With `split`, every list longer than 3 is cut into pieces (`_DENSE_LIST_SPLIT`, 128 in production,
+    which these small lists never reach), so most categories have several owners -- and the fallback's
+    otherwise plain read-modify-write of the parameter flows must be atomic (`PF_ATOMIC`)."""
     real_empty = torch.empty
 
     def poisoned_empty(*args, **kwargs):
@@ -294,11 +479,15 @@ def test_dense_triton_fallback_reads_only_valid_references(dual_flow, monkeypatc
     flows = {}
     for use_dense in (True, False):
         with pytest.MonkeyPatch.context() as mp:
+            if split is not None:
+                mp.setattr(_softevi, "_DENSE_LIST_SPLIT", split)
             pc, layer, data, kw, (S, L, C, B) = _dense_setup(mp, use_dense, dual_flow = dual_flow, with_grad = True)
             if use_dense:
                 mp.setattr(_softevi._DenseDenomDispatch, "_cuda_ok", lambda self: False)
                 mp.setattr(torch, "empty", poisoned_empty)
             flows[use_dense] = _grad_step(pc, data, None, **kw)
+            if use_dense:
+                assert next(iter(layer._dense_index_cache[1].values()))["split"] == (split is not None)
 
     (pf_d, g_d), (pf_s, g_s) = flows[True], flows[False]
     assert torch.isfinite(pf_d).all() and torch.isfinite(g_d).all(), \

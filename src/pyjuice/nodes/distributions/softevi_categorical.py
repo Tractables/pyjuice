@@ -339,9 +339,14 @@ def _prep_args_fw_cuda_kernel(layer, kwargs):
                     num_cats = evidence.size(2),
                     fw_unroll = 4), (1,)
 
-    index = _build_dense_index(layer, kwargs)
+    return _fw_dense_target(layer, kwargs, _build_dense_index(layer, kwargs)), (1,)
+
+
+def _fw_dense_target(layer, kwargs, index):
+    """The dense forward's launch arguments for a given `index` (also used to time it, see
+    `_tune_dense_choice`)."""
     num_latents = index["num_latents"]
-    num_slots = evidence.size(1) * batch_size
+    num_slots = kwargs["categorical_evidence_logp"].size(1) * kwargs["batch_size"]
 
     return dict(use_dense = True,
                 Z_ptr = _fw_scratch(layer, num_slots, num_latents),
@@ -352,7 +357,7 @@ def _prep_args_fw_cuda_kernel(layer, kwargs):
                 num_latents = num_latents,
                 # `FW_TL` and the swizzle are chosen by `_fw_autotune`, once per shape.
                 _fw_layer = layer,
-                FW_THREADS = 256, FW_CAT_BLOCKS = 64), (1,)
+                FW_THREADS = 256, FW_CAT_BLOCKS = 64)
 
 
 # Latents per thread for the normalizer. Larger amortizes the per-reference index loads over more
@@ -887,7 +892,7 @@ def _prep_args_apply_bk_params_kernel(layer, kwargs):
 #
 # So invert it. Group the slots by category once per step, then walk (latent x category) with the
 # CATEGORY axis innermost -- the only axis of `param_flows` that is contiguous -- which gives every
-# (row, cat) a single owner and needs no atomic at all:
+# (row, cat) a single owner (or a few, once a long list is cut into pieces, see `_DENSE_LIST_SPLIT`):
 #     phase1[row, c] = beta[l, c] * sum over the slots referencing c of ratio[slot, l] * p_theta[slot]
 # The per-category reference lists are padded to a common `MAX_REFS` and masked, and both kernels bound
 # their inner loop by the longest list actually present rather than by that width. The same
@@ -900,23 +905,20 @@ def _prep_args_apply_bk_params_kernel(layer, kwargs):
 
 _DENSE_TOPK_BACKWARD = os.environ.get("PYJUICE_SOFTEVI_DENSE_BACKWARD", "1") != "0"
 
-# How many soft-evidence slots may reference one category. The reference arrays are padded to this
-# width, so it is purely a space/padding bound -- both kernels bound their inner loop by the largest
-# list actually present (`tl.max(cnt)` per tile in Triton, `cnt` per thread in CUDA), not by this.
+# The longest reference list either kernel walks: a category referenced by more soft-evidence slots than
+# this is cut into pieces (`_build_dense_index`), each its own list, accumulated atomically. A top-k
+# drawn from a language model puts common tokens near the top at nearly every position, so one category
+# can be referenced by `batch * seq` slots -- unbounded in the batch -- while the median list is ~2 long.
+# Walked by one thread each, those few long lists were pure latency; cut, they spread over threads like
+# any other. It also bounds the reference tables' width (`MAX_REFS`, the longest piece rounded up to a
+# power of two), so lists of any length are served: there used to be a ceiling past which the build gave
+# up and the scattered kernel ran instead.
 #
-# It is sized PER BUILD to the maximum actually observed, rounded up to a power of two. A fixed value
-# is wrong in both directions. Too small and the build bails to the scattered kernel: with a cap of 16,
-# a top-k drawn from a language model -- which puts common tokens near the top at nearly every position,
-# so the same category is referenced by up to `batch * seq` slots -- always exceeds it and loses the
-# dense path for the forward AND the backward, which share this index. Measured (seq 32, 1024 latents,
-# 126464 cats, k=1024, batch 8), whole step: 17.7 -> 8.8 ms once the realistic overlap is admitted.
-# Too large and the padding is paid for nothing: pinning it at 512 costs the nearly-disjoint regime
-# 4.9 -> 6.2 ms in index allocation and zeroing alone. Sized to the observed maximum, that regime is
-# unchanged (its true maximum is ~10) and the overlapping ones get the dense path.
-#
-# Rounded to a power of two so `MAX_REFS`, a `tl.constexpr`, takes only a handful of distinct values
-# across a run rather than re-triggering a Triton compile every time the candidate lists shift.
-_DENSE_MAX_REFS_CEIL = 4096
+# MEASURED, CoDD PC fwd+bwd per step (two interleaved runs, tuned), for W = 128 / 64 / 32 / 16 / 8:
+# batch 12: 9.0 / 7.5-7.7 / 7.4-7.7 / 7.5-7.6 / 7.7 ms; batch 32: 12.0 / 10.4-10.7 / 9.4-9.5 / 9.5 / 10.2.
+# Batch 1-8, where no list is that long, are unchanged by it. Bounded this short, the pieces also make
+# the warps nearly even on their own, and the tuner stopped picking the length-sharded layout.
+_DENSE_LIST_SPLIT = 32
 
 # The padded reference arrays are `12 * max_refs * Umax * num_blocks` bytes (three [max_refs, Umax]
 # tables: slot, p_theta, grad offset). Heavily-overlapping candidate lists at a large batch can push
@@ -925,8 +927,10 @@ _DENSE_MAX_REFS_CEIL = 4096
 _DENSE_INDEX_BUDGET_FRAC = 1.0 / 16.0
 
 
-# Length buckets used to pick a shard split: 1, 2, 4, ... 4096, one past `_DENSE_MAX_REFS_CEIL`.
+# Length buckets used to pick a shard split: 1, 2, 4, ... 4096 -- covering every list length up to
+# `_DENSE_LIST_SPLIT`.
 _LADDER_N = 13
+assert _DENSE_LIST_SPLIT <= (1 << (_LADDER_N - 1))
 _WARP = 32
 
 # Only split when the model says the inner loop drops to at most this fraction of its un-split cost.
@@ -937,75 +941,66 @@ _WARP = 32
 _DENSE_SHARD_GAIN = 0.4
 
 
-def _warp_work(counts):
-    """Inner-loop cost of a category ORDER. Both kernels give one category to one thread and loop over
-    that category's reference list, so a 32-lane warp runs to the longest list any of its lanes holds
-    and a few long lists drag whole warps with them."""
-    pad = (-counts.numel()) % _WARP
-    if pad:
-        counts = torch.cat([counts, counts.new_zeros(pad)])
-    return counts.view(-1, _WARP).max(dim = 1).values.sum() * _WARP
+# Length buckets per shard: lists within one shard differ in length by at most 2 ** this.
+_SHARD_BUCKETS = 2
 
 
-def _shard_sizes(st, split, gi):
+def _shard_sizes(st, shards, gi):
     """Categories in each shard, for block `gi`."""
-    total = sum(st[gi][:_LADDER_N])
-    if split is None:
-        return [total]
-    n_light = sum(st[gi][:split + 1])
-    return [n_light, total - n_light]
+    return [sum(st[gi][lo:hi + 1]) for lo, hi in shards]
 
 
-def _shard_elems(st, split, gi):
-    """References (list entries) in each shard, for block `gi`."""
-    total = sum(st[gi][_LADDER_N:2 * _LADDER_N])
-    n_light = sum(st[gi][_LADDER_N:_LADDER_N + split + 1])
-    return [n_light, total - n_light]
+def _choose_shards(st, ladder = None):
+    """Partition the categories into shards by reference-list length: a list of `(lo, hi)` length-bucket
+    ranges (bucket `b` holds lists of length `(2 ** (b - 1), 2 ** b]`), one per shard, or a single
+    shard spanning every bucket.
 
+    Both kernels give one category to one thread and loop over its list, so a warp runs to the longest
+    list among its 32 lanes, and the lists are anything but uniform: a language model proposes its
+    common tokens at nearly every position, so their lists grow like `batch * positions`, while the tail
+    of the vocabulary is proposed once or twice. Ordered by category id the two interleave, and nearly
+    every warp catches a long list. MEASURED on the CoDD PC (32 positions, top-k 1024): the warp-level
+    inner loop was 11x the references actually present at batch 8 and 14x at batch 32 -- growing with
+    the batch, which is what made both kernels super-linear in it.
 
-def _choose_shard_split(st, max_refs, n_uniq):
-    """Pick a list-length threshold to split the categories at, or None to keep them in one piece.
+    A LADDER of shards, `_SHARD_BUCKETS` length buckets each, makes every warp nearly homogeneous. The
+    lengths are spread continuously (median 2, 99th percentile ~7.5 per batch element, maximum 32 per
+    batch element at batch 32), so a single light/heavy split -- what this used to try -- cannot pay: one
+    side always keeps the spread. Each shard keeps ASCENDING category order, so the `params` reads and
+    `param_flows` writes stay coalesced within it. Cost: one launch of each kernel per shard.
 
-    Top-k candidate lists out of a language model are bimodal: a few hundred common tokens are proposed
-    at nearly every position, so their reference lists are `batch * positions` long, while the tail of
-    the vocabulary is proposed once or twice. Ordered by category id the two populations interleave, so
-    nearly every warp catches one long list and runs to it, and the single rectangular reference table
-    has to be as wide as the longest list in the whole vocabulary. At batch 32 that is 23.6x the
-    necessary inner-loop work and a 948 MiB table that is 1.3% occupied.
+    The figures above predate cutting lists into pieces of at most `_DENSE_LIST_SPLIT`, which bounds
+    the spread by itself: since then the tuner has picked the single layout on the CoDD PC at every batch
+    measured (1-32). The ladder stays a timed candidate for shapes where that is not enough.
 
-    Splitting at a length threshold makes each warp homogeneous. Both shards keep ascending category
-    order internally, so the coalescing of the `params` reads and `param_flows` writes is untouched;
-    the cost is one extra launch of each kernel.
-
-    `work_single` is the exact warp-max cost of the un-split order, while the per-threshold figure is
-    an upper bound (every light warp charged the full threshold). Comparing an upper bound against an
-    exact baseline can pass up a real win, but it can never split where splitting would not have helped
-    -- which is the direction that matters, since the un-split layout is what everything was tuned on."""
-    if os.environ.get("PYJUICE_SOFTEVI_DENSE_SHARD", "1") == "0":
-        return None
+    `ladder` True / False forces the layout (it is TIMED where it can be, see `_dense_choice`); None
+    takes the ladder only when its inner loop, bounded above (every warp in a shard charged that shard's
+    full width), is at most `_DENSE_SHARD_GAIN` of the exact single-shard one. That gate is a statement
+    about the forward, whose inner loop dominates it; the backward, dominated by per-category memory
+    traffic that sharding makes less coalesced, can prefer one shard at small batch."""
+    full = [(0, _LADDER_N - 1)]
+    if ladder is False or os.environ.get("PYJUICE_SOFTEVI_DENSE_SHARD", "1") == "0":
+        return full
 
     # Plain Python arithmetic over the already-transferred counts: this runs on every build, and at
     # tens of microseconds a tensor op per candidate it was measurably denting the small configs.
     hist = [sum(row[i] for row in st) for i in range(_LADDER_N)]
-    U = sum(hist)
-    work_single = sum(row[2 * _LADDER_N + 1] for row in st)
+    shards = []
+    for lo in range(0, _LADDER_N, _SHARD_BUCKETS):
+        present = [b for b in range(lo, min(lo + _SHARD_BUCKETS, _LADDER_N)) if hist[b] > 0]
+        if present:
+            shards.append((lo, max(present)))
+    if len(shards) <= 1:
+        return full
+    if ladder:
+        return shards
 
-    best, n_light = None, 0
-    for i in range(_LADDER_N):
-        n_light += hist[i]
-        thr = 1 << i
-        if thr >= max_refs:
-            break
-        n_heavy = U - n_light
-        if n_heavy == 0:
-            break
-        est = n_light * thr + n_heavy * max_refs
-        if best is None or est < best[0]:
-            best = (est, i)
-
-    if best is None or best[0] >= _DENSE_SHARD_GAIN * work_single:
-        return None
-    return best[1]
+    work_single = sum(row[2 * _LADDER_N] for row in st)
+    est = sum(-(-n // _WARP) * _WARP * (1 << hi)
+              for row in st for n, (lo, hi) in zip(_shard_sizes([row], shards, 0), shards))
+    if est >= _DENSE_SHARD_GAIN * work_single:
+        return full
+    return shards
 
 
 def _dense_index_budget(dev):
@@ -1110,8 +1105,10 @@ def _dense_worth_it(layer, kwargs):
     first costs ~9x more here, and it has no term for the index build's fixed cost per group. Both
     errors are large. MEASURED fwd+bwd, CoDD PC (tied, 32 vars, 1024 latents, 126464 cats, k=1024): at
     batch 1-4 it picks scattered, at 10.7-30.9 ms, while dense takes 5.5-5.9 ms. Yet for an untied
-    8-var model at batch 1, dense is SLOWER (8.0 vs 4.6 ms: an index build per group). So whenever the
-    backward can measure, both sides are timed once per shape and the choice is cached (`_dense_choice`).
+    8-var model at batch 1, dense was SLOWER (8.0 vs 4.6 ms: an index build per group, since vectorized
+    over the groups -- 2.5 -> 0.5 ms of build at 8 groups). So the candidates
+    are timed once per shape, by the first forward or backward that can, and the choice is cached
+    (`_dense_choice`).
     """
     tot_num_cats = layer.nodes[0].dist.num_cats
     lnn = layer._output_ind_range[1] - layer._output_ind_range[0]
@@ -1141,74 +1138,152 @@ def _dense_worth_it(layer, kwargs):
     dense_ops = num_groups * num_latents * uniq_est
     scattered_ops = lnn * batch_size * num_k
 
-    return _dense_choice(layer, kwargs, dense_ops < 0.6 * scattered_ops,
-                         (lnn, ext_num_vars, batch_size, num_k, tot_num_cats, num_groups))
+    return _dense_choice(layer, kwargs, dense_ops < 0.6 * scattered_ops)
 
 
-def _dense_choice(layer, kwargs, default, shape):
-    """Dense or scattered, by measurement where possible (see the end of `_dense_worth_it`).
+def _dense_choice_key(layer, kwargs):
+    """The shape key of the dense-vs-scattered choice, or None where the dense form cannot apply."""
+    lnn = layer._output_ind_range[1] - layer._output_ind_range[0]
+    evidence = kwargs["categorical_evidence_logp"]
+    B, V, K = evidence.shape
+    if V == 0 or lnn % V != 0:
+        return None
+    layout = _dense_layer_layout(layer, V)
+    if layout is None:
+        return None
+    shape = (lnn, V, B, K, layer.nodes[0].dist.num_cats, len(layout[1]))
+    return ("softevi_dense_vs_scattered",) + shape + (bool(kwargs.get("dual_flow_backward", False)),)
 
-    The choice is keyed by SHAPE and cached process-wide in the launch autotuner, so the forward and the
-    backward of every later step, and every layer of the same shape, follow it. It can only be MEASURED
-    in a backward: that is where both sides run (they accumulate the parameter flows and the evidence
-    gradient, so they are timed into scratch), and where the input layer hands over the kernels' shared
-    launch arguments (`_bk_launch_common`). Until then -- the first forward of a shape, a forward-only
-    caller, autotuning off -- the work-ratio `default` decides. Like every tuned choice, the two sides
-    agree only to rounding (~6e-5 relative here), so which one won is part of the numerics.
 
-    The key carries the dual-flow flag (the backward does different work with and without it) but not
-    whether an evidence gradient is requested, so the forward -- which never has one -- finds the
-    backward's answer."""
+def _dense_choice(layer, kwargs, default):
+    """Scattered, or dense with which index layout -- by measurement where possible (see the end of
+    `_dense_worth_it`). Returns whether to take the dense form; the layout is read by `_index_layout`.
+
+    Three candidates: "scattered", "single" (one category order, coalesced) and "ladder" (shards by
+    list length, see `_choose_shards`). The two dense layouts trade against each other: the ladder makes
+    the forward's inner loop balanced (3.2x on the CoDD forward at batch 32, before lists were cut into
+    pieces -- see `_DENSE_LIST_SPLIT`), but splitting the categories costs the backward coalescing, so at
+    small batch it is slower there. That crossover moves with the shape, hence timing.
+
+    Two choices are kept, both keyed by SHAPE and cached process-wide in the launch autotuner:
+      * the JOINT one (forward + backward), measured in a backward. Once it exists both passes follow
+        it, because a forward that is followed by a backward is what it was measured on.
+      * a FORWARD-ONLY one, measured in a forward while no joint one exists -- what a caller that never
+        runs a backward (evaluation, conditional sampling) gets.
+    With neither -- autotuning off, CUDA-graph capture -- the work-ratio `default` decides dense vs
+    scattered, and `_choose_shards`' gate the layout. Like every tuned choice, the candidates agree only
+    to rounding (~6e-5 relative here), so which one won is part of the numerics."""
+    if getattr(layer, "_dense_choice_override", None) is None:
+        from pyjuice.layer.kernels import autotune
+        key = _dense_choice_key(layer, kwargs)
+        if kwargs.get("_bk_launch_common", None) is not None:
+            if autotune.should_tune(key, 3):
+                _tune_dense_choice(layer, kwargs, key, default, backward = True)
+        elif kwargs.get("_fw_launch_common", None) is not None and autotune.cached(key) is None:
+            if autotune.should_tune(key + ("forward_only",), 3):
+                _tune_dense_choice(layer, kwargs, key + ("forward_only",), default, backward = False)
+
+    choice = _cached_dense_choice(layer, kwargs)
+    return default if choice is None else (choice != "scattered")
+
+
+def _cached_dense_choice(layer, kwargs):
+    """The choice in force: the one being timed, else the joint one, else the forward-only one; None
+    while there is none."""
+    override = getattr(layer, "_dense_choice_override", None)
+    if override is not None:
+        return override
+    key = _dense_choice_key(layer, kwargs)
+    if key is None:
+        return None
     from pyjuice.layer.kernels import autotune
-
-    key = ("softevi_dense_vs_scattered",) + tuple(shape) + (bool(kwargs.get("dual_flow_backward", False)),)
     choice = autotune.cached(key)
-    if choice is not None:
-        return choice
-    common = kwargs.get("_bk_launch_common", None)
-    if common is None or not autotune.should_tune(key, 2):
-        return default
-    return _tune_dense_choice(layer, kwargs, common, key, default)
+    return choice if choice is not None else autotune.cached(key + ("forward_only",))
 
 
-def _tune_dense_choice(layer, kwargs, common, key, default):
-    """Time the dense backward (index build + prologue + expected-flow kernel) against the scattered one
-    (`bk_softevi_kernel`), both into scratch, and cache the winner under `key`."""
+def _index_layout(layer, kwargs):
+    """The dense index layout to build: True (ladder), False (single) or None (let `_choose_shards`'
+    gate decide), per `_cached_dense_choice`."""
+    return {"ladder": True, "single": False}.get(_cached_dense_choice(layer, kwargs), None)
+
+
+def _tune_dense_choice(layer, kwargs, key, default, backward):
+    """Time each candidate and cache the winner under `key`; returns it.
+
+    A candidate is timed by REPLAYING the input layer's own post-processing lists with the choice forced
+    (`_dense_choice_override`) and every output redirected to scratch: the forward's into a scratch
+    `node_mars`, and in a backward the backward's too, into scratch parameter flows and evidence
+    gradient. So what is timed is exactly what a step runs under that choice -- the candidate sort the
+    scattered forward takes, the Triton fallbacks without a CUDA toolchain, a `missing_mask`, a
+    `backward(compute_param_flows = False)` with no parameter flows at all. Re-implementing the passes
+    here instead got all three of those wrong at one time or another."""
     from pyjuice.layer.kernels import autotune
 
-    if _build_dense_index(layer, kwargs) is None:
-        return False                                   # the dense side cannot run here at all
+    # Only the dense layouts whose index can actually be built here: one that cannot would time as the
+    # scattered path it falls back to, and could then win on noise and pay a failed build every step.
+    cands = ["scattered"] + [name for name, ladder in (("single", False), ("ladder", True))
+                             if _build_dense_index(layer, kwargs, ladder = ladder) is not None]
+    if len(cands) == 1:
+        return "scattered"
+    # The reference -- kept unless beaten by the autotuner's margin -- is what would run otherwise: a
+    # choice already in force (the forward-only one, when the joint one is being timed), else the
+    # untuned default with the gate's layout.
+    current = _cached_dense_choice(layer, kwargs)
+    if current in cands:
+        reference = current
+    elif default:
+        gate = _build_dense_index(layer, kwargs, ladder = None)
+        reference = "ladder" if (gate is not None and len(gate["shards"]) > 1 and "ladder" in cands) else cands[1]
+    else:
+        reference = "scattered"
+    candidates = [reference] + [c for c in cands if c != reference]
 
-    grad = kwargs.get("categorical_evidence_logp_grad", None)
-    pf_scr = autotune.scratch_like(layer.param_flows)
-    grad_scr = autotune.scratch_like(_grad_scratch(layer, grad)) if grad is not None else None
-    if pf_scr is None or (grad is not None and grad_scr is None):
-        return default                                 # no room to benchmark: leave it untuned
+    if backward:
+        bk = kwargs["_bk_launch_common"]
+        nm_scr = autotune.scratch_like(bk["node_mars_ptr"])
+        pf_scr = autotune.scratch_like(layer.param_flows) if layer.param_flows is not None else None
+        grad = kwargs.get("categorical_evidence_logp_grad", None)
+        # float32, so the kernels accumulate straight into it and `_GradCastEpilogue` stays out of it
+        grad_scr = autotune.scratch_like(_grad_scratch(layer, grad)) if grad is not None else None
+        if nm_scr is None or (pf_scr is None and layer.param_flows is not None) or \
+                (grad_scr is None and grad is not None):
+            return reference                           # no room to benchmark: leave it untuned
+        fw_common = layer._fw_launch_common(bk["data_ptr"], nm_scr)
+        bk_common = dict(bk, param_flows_ptr = pf_scr)
+    else:
+        fw = kwargs["_fw_launch_common"]
+        nm_scr = autotune.scratch_like(fw["node_mars_ptr"])
+        if nm_scr is None:
+            return reference
+        fw_common = dict(fw, node_mars_ptr = nm_scr)
 
-    dist = layer.dist
-    kw = dict(kwargs, batch_size = common["batch_size"])
-    base = dict(common, param_flows_ptr = pf_scr)
-
-    def launch(kernel, prep):
-        target, grid = prep(layer, kw)
-        if grad_scr is not None:
-            target["categorical_evidence_logp_grad_ptr"] = grad_scr
-        kernel[grid](**base, **target)
-
-    def run(use_dense):
-        if use_dense:
-            # Charge the index build to this side: in steady state each step builds it once, and only
-            # when dense is in use (the forward shares it).
+    def run(choice):
+        layer._dense_choice_override = choice
+        try:
+            # Charge each candidate the per-step work it causes: a step sorts the candidates (when its
+            # forward does) and builds the index once, shared by the forward and the backward.
             layer._dense_index_cache = None
-            launch(dist.bk_dense_prologue_kernel, _prep_args_bk_dense_prologue)
-            launch(dist._dense_denom_dispatch, _prep_args_bk_dense_denom)
-        else:
-            launch(dist.bk_softevi_kernel, _prep_args_apply_bk_softevi_kernel)
+            layer._fw_sorted_cache = None
+            fkw = dict(kwargs, _fw_launch_common = fw_common)
+            fkw.pop("_bk_launch_common", None)
+            layer.dist.preprocess_fw_kwargs(layer, fkw)
+            layer.dist.set_custom_kernel_kwargs(fkw)
+            fkw["_fw_data"] = fw_common["data_ptr"]
+            layer._run_post(layer.post_fw_fns, fkw, fw_common)
+            if backward:
+                bkw = dict(kwargs, _bk_launch_common = bk_common)
+                if grad is not None:
+                    bkw["categorical_evidence_logp_grad"] = grad_scr
+                layer._run_post(layer.post_bp_fns, bkw, bk_common)
+        finally:
+            layer._dense_choice_override = None
 
     try:
-        return autotune.pick(key, [default, not default], run)
+        return autotune.pick(key, candidates, run)
     finally:
-        del pf_scr, grad_scr
+        # The live call rebuilds for the winner.
+        layer._dense_index_cache = None
+        layer._fw_sorted_cache = None
 
 
 def _dense_scratch(layer, ext_num_vars, batch_size, num_latents):
@@ -1230,9 +1305,10 @@ def _dense_layer_layout(layer, num_ext_vars):
     block with `int(s_pfids[i])` costs one device->host sync PER VARIABLE (32 of them here, ~0.65 ms),
     which dwarfed the ~0.2 ms of actual index work.
 
-    Returns `(num_latents, groups, lvid_of_head, pf_base, p_base)`, or None if the layout is not one
-    the dense kernels
-    support (the caller then falls back to the scattered kernel).
+    Returns `(num_latents, groups, lvid_of_head, pf_base, p_base, var_group)`, or None if the layout is
+    not one the dense kernels support (the caller then falls back to the scattered kernel). `var_group`
+    maps each evidence variable (the middle axis of `categorical_evidence_logp`) to its block in
+    `groups`.
     """
     lnn = layer._output_ind_range[1] - layer._output_ind_range[0]
     cached = getattr(layer, "_dense_layout_cache", None)
@@ -1267,23 +1343,40 @@ def _dense_layer_layout(layer, num_ext_vars):
     pf_base = torch.stack([layer.s_pfids[h : h + num_latents] for h in heads]).contiguous()
     p_base = torch.stack([layer.s_pids[h : h + num_latents] for h in heads]).contiguous()
 
-    layout = (num_latents, groups, lvid_of_head, pf_base, p_base)
+    lvid_host = lvid_of_head.tolist()
+    # One run per evidence variable: the ratio scratch is indexed by (variable, batch) slot, so two runs
+    # of one variable would share a slot. Decline rather than mix them.
+    if sorted(lvid_host) != list(range(num_ext_vars)):
+        layer._dense_layout_cache = ((lnn, num_ext_vars), None)
+        return None
+    var_group = [0] * num_ext_vars
+    for gi, g in enumerate(groups):
+        for i in g:
+            var_group[lvid_host[i]] = gi
+    var_group = torch.tensor(var_group, dtype = torch.long, device = dev)
+
+    layout = (num_latents, groups, lvid_of_head, pf_base, p_base, var_group)
     layer._dense_layout_cache = ((lnn, num_ext_vars), layout)
     return layout
 
 
-def _build_dense_index(layer, kwargs):
+def _build_dense_index(layer, kwargs, ladder = None):
     """
     Invert (position, batch, candidate) -> category, once per step, per param-flow block.
 
     Returns a dict of device tensors (padded over blocks so one launch covers all of them), or None if
     the layout is not supported -- in which case the caller falls back to the scattered kernel.
 
-    Cached on the layer and keyed by the identity of `soft_evidence_cat_ids`, so the forward and the
-    backward of a step share one build.
+    `ladder` picks the layout: True shards the categories by list length (`_choose_shards`), False keeps
+    them in one piece, None defers to `_index_layout` (the tuned choice, else `_choose_shards`' gate).
+
+    Cached on the layer and keyed by the identity of `soft_evidence_cat_ids` (and the layout), so the
+    forward and the backward of a step share one build.
     """
     cat_ids = kwargs["soft_evidence_cat_ids"]
     evidence = kwargs["categorical_evidence_logp"]
+    if ladder is None:
+        ladder = _index_layout(layer, kwargs)
 
     # `batch_size` is injected into `kwargs` only after the condition check, so take it from the tensor
     # (the layer asserts these agree in the prep functions).
@@ -1293,7 +1386,10 @@ def _build_dense_index(layer, kwargs):
     key = _evidence_cache_key(cat_ids, evidence)
     cached = getattr(layer, "_dense_index_cache", None)
     if cached is not None and _evidence_cache_hit(cached[0], (cat_ids, evidence)):
-        return cached[1]
+        if ladder in cached[1]:
+            return cached[1][ladder]
+    else:
+        cached = layer._dense_index_cache = (key, {})
 
     B, V, K = cat_ids.shape
     dev = cat_ids.device
@@ -1301,141 +1397,184 @@ def _build_dense_index(layer, kwargs):
     layout = _dense_layer_layout(layer, V)
     if layout is None:
         return None
-    num_latents, groups, lvid_of_head, pf_base, p_base = layout
+    num_latents, groups, lvid_of_head, pf_base, p_base, var_group = layout
     G = len(groups)
+    num_cats = layer.nodes[0].dist.num_cats
 
-    # ---- pass 1, per block: sort the slots by category and invert ----
-    # The reference width is only known once every block has been counted, so the scatter itself is
-    # deferred to pass 2 -- sorting twice to avoid holding the sorted payloads would cost far more than
-    # the few MB they occupy.
-    sorted_l, n_uniq, stats = [], [], []
-    # `ref_pt` is a float32 table both kernels read as float, so widen half-precision evidence here
-    # rather than at the scatter (see `_fw_linear_evidence`).
-    pt_all = evidence.float().exp()
-    for g in groups:
-        lv = lvid_of_head[torch.tensor(g, device = dev)]                     # [Gp] layer-local var ids
+    # ---- pass 1: sort every block's references by category, all blocks at once ----
+    # One sort on a (block, category) key rather than one sort per block. The per-block form cost a
+    # `unique_consecutive` device sync and a dozen small launches PER BLOCK, so an untied model (a block
+    # per variable) paid ~`V` times the host time of a tied one for the same references -- 2.5 ms at 8
+    # blocks, 5.0 ms at 16, against 0.6 ms now -- and every shard of the ladder added another round of
+    # them. The whole build is a fixed number of launches and three host round trips.
+    #
+    # Element e = (b, v, k), in row-major [B, V, K] order. Its offset into
+    # `categorical_evidence_logp_grad` IS e, and its slot in the [V * B, num_latents] ratio scratch is
+    # `v * B + b`.
+    E = B * V * K
+    # 32-bit keys whenever they fit: the sort is the single most expensive step of the build.
+    kdt = torch.int32 if G * num_cats < 2 ** 31 else torch.long
+    key = cat_ids.to(kdt)
+    if G > 1:
+        key = key + (var_group.to(kdt) * num_cats).view(1, V, 1)
+    # Stable, so each list holds its references in element order and the build is reproducible.
+    key_s, order = torch.sort(key.reshape(-1), stable = True)
 
-        ids_g = cat_ids[:, lv, :]                                            # [B, Gp, K]
-        pt_g = pt_all[:, lv, :]
-        Gp = lv.numel()
+    # `return_inverse` gives the per-element list directly, which avoids two `repeat_interleave`s
+    ukey, row, counts = torch.unique_consecutive(key_s, return_inverse = True, return_counts = True)
+    e_pos = torch.arange(E, device = dev)
+    within = e_pos - (counts.cumsum(0) - counts)[row]                           # position in its list
 
-        # slot id indexes the [V*B, num_latents] ratio scratch
-        slot = (lv.view(1, Gp, 1) * B + torch.arange(B, device = dev).view(B, 1, 1)).expand(B, Gp, K)
-        # gradient offset into `categorical_evidence_logp_grad` [B, V, K]
-        goff = (torch.arange(B, device = dev).view(B, 1, 1) * (V * K) +
-                lv.view(1, Gp, 1) * K + torch.arange(K, device = dev).view(1, 1, K)).expand(B, Gp, K)
+    # A category's reference list, cut into PIECES of at most `_DENSE_LIST_SPLIT` references; each piece
+    # is a "list" from here on, so one category may own several consecutive ones. Both kernels give a list
+    # to one thread and walk it serially, and a token proposed at nearly every position has a list of
+    # `batch * positions` references: unsplit, those few lists were a shard of their own whose cost was
+    # all latency. MEASURED on the CoDD PC at batch 17: 11 lists of 513-544 references, 1.05 ms of a
+    # 9.2 ms step for 11 categories -- the batch-17 cliff. Pieces are accumulated atomically everywhere
+    # (see `PF_ATOMIC`).
+    #
+    # The pieces are derived arithmetically (a list of length c makes c // W full pieces and one of c % W),
+    # so their histograms come straight from the lists' lengths and the build still costs two host round
+    # trips: this one, for the number of lists, and the statistics below, which also bring back the
+    # number of pieces.
+    W = _DENSE_LIST_SPLIT
+    full = counts // W
+    rem = counts - full * W
+    n_pieces = full + (rem > 0).long()
+    g_r = ukey.long() // num_cats                                                # block of each list
 
-        # Sort 32-bit keys (category ids are < num_cats) rather than 64-bit -- this is the single most
-        # expensive step of the build.
-        cat_f = ids_g.reshape(-1).int()
-        order = cat_f.argsort()
-        cat_s = cat_f[order]
+    # Everything the shard decision needs, in one transfer: per block, how many pieces and how many
+    # references fall in each power-of-two length bucket; the longest list; and the number of pieces.
+    gb_full = g_r * _LADDER_N + (W - 1).bit_length()                             # a full piece: length W
+    gb_rem = g_r * _LADDER_N + torch.ceil(torch.log2(rem.clamp(min = 1).to(torch.float64))).long()
+    hist = torch.zeros(G * _LADDER_N, dtype = torch.long, device = dev)
+    hist.scatter_add_(0, gb_full, full).scatter_add_(0, gb_rem, (rem > 0).long())
+    rhist = torch.zeros(G * _LADDER_N, dtype = torch.long, device = dev)
+    rhist.scatter_add_(0, gb_full, full * W).scatter_add_(0, gb_rem, rem)
+    flat = torch.cat([hist, rhist, counts.max().view(1), n_pieces.sum().view(1)]).tolist()
+    st = [flat[gi * _LADDER_N:(gi + 1) * _LADDER_N] + flat[(G + gi) * _LADDER_N:(G + gi + 1) * _LADDER_N]
+          for gi in range(G)]
+    longest, U = flat[2 * G * _LADDER_N], flat[2 * G * _LADDER_N + 1]
+    split = longest > W                                                          # some category owns several pieces
+    max_refs = 1 << max(0, min(longest, W) - 1).bit_length()                    # round up to a power of two
 
-        # `return_inverse` gives the per-element row directly, which avoids two `repeat_interleave`s
-        uniq, inverse, counts = torch.unique_consecutive(cat_s, return_inverse = True, return_counts = True)
+    if split:
+        lst = torch.repeat_interleave(torch.arange(ukey.numel(), device = dev), n_pieces, output_size = U)
+        first_piece = n_pieces.cumsum(0) - n_pieces
+        k = torch.arange(U, device = dev) - first_piece[lst]                     # which piece of its list
+        ukey = ukey[lst]
+        counts = (counts[lst] - k * W).clamp_(max = W)
+        row = first_piece[row] + within // W
+        within = within % W
+    g_l = ukey.long() // num_cats                                                # block of each piece
+    # The pieces are in (block, category) order, so a block's first piece is where its id first appears.
+    g_start = torch.searchsorted(g_l, g_l)
+    pos = torch.arange(U, device = dev) - g_start                               # position in its block
+    bidx = torch.ceil(torch.log2(counts.to(torch.float64))).long().clamp_(0, _LADDER_N - 1)
 
-        starts = torch.cat([counts.new_zeros(1), counts.cumsum(0)[:-1]])
-        row = inverse
-        within = torch.arange(cat_s.numel(), device = dev) - starts[row]
+    if ladder is None:
+        # Only the untuned gate needs this, and it needs the pieces in order: the inner-loop cost of leaving
+        # them in one shard. That cost is per WARP -- both kernels give a piece to one thread and loop over
+        # it, so 32 lanes run to the longest piece among them. A block's warps start at its first piece;
+        # numbering them from `g_start // 32 + g` keeps every block's range disjoint from the next one's in
+        # at most `U / 32 + G` ids.
+        wid = g_start // _WARP + g_l + pos // _WARP
+        n_w = U // _WARP + G + 1
+        w_max = torch.zeros(n_w, dtype = torch.long, device = dev).scatter_reduce_(0, wid, counts, "amax")
+        w_blk = torch.zeros(n_w, dtype = torch.long, device = dev).scatter_(0, wid, g_l)
+        work = torch.zeros(G, dtype = torch.long, device = dev).scatter_add_(0, w_blk, w_max * _WARP).tolist()
+        st = [r + [w] for r, w in zip(st, work)]
 
-        # Everything the shard decision needs, in one row so the whole build costs a single transfer:
-        # how many categories and how many references fall in each power-of-two length bucket, the
-        # longest list, and the cost of leaving the categories in one piece.
-        bidx = torch.ceil(torch.log2(counts.to(torch.float64))).long().clamp_(0, _LADDER_N - 1)
-        hist = torch.zeros(_LADDER_N, dtype = torch.long, device = dev).scatter_add_(
-            0, bidx, torch.ones_like(bidx))
-        rhist = torch.zeros(_LADDER_N, dtype = torch.long, device = dev).scatter_add_(0, bidx, counts)
+    shard_ranges = _choose_shards(st, ladder)
+    S = len(shard_ranges)
+    # A shard is as wide as its longest possible list, capped at the longest list actually present
+    shard_widths = [min(1 << hi, max_refs) for lo, hi in shard_ranges]
+    shard_n = [_shard_sizes(st, shard_ranges, gi) for gi in range(G)]      # [G][S] lists per shard
+    shard_us = [max(shard_n[gi][si] for gi in range(G)) for si in range(S)]
 
-        sorted_l.append((uniq, counts, within, row,
-                         slot.reshape(-1)[order].int(),
-                         pt_g.reshape(-1)[order],
-                         goff.reshape(-1)[order].int()))
-        n_uniq.append(uniq.numel())
-        stats.append(torch.cat([hist, rhist, counts.max().view(1).long(),
-                                _warp_work(counts).view(1).long()]))
-
-    Umax = max(n_uniq)
-
-    # One sync for the whole build rather than one per block
-    st = torch.stack(stats).cpu().tolist()                                   # [G][2 * _LADDER_N + 2]
-    max_refs = max(row[2 * _LADDER_N] for row in st)
-    max_refs = 1 << max(0, max_refs - 1).bit_length()                        # round up to a power of two
-    if max_refs > _DENSE_MAX_REFS_CEIL:
+    if sum(12 * w * u * G for w, u in zip(shard_widths, shard_us)) > _dense_index_budget(dev):
         return None                                                          # -> scattered fallback
 
-    split = _choose_shard_split(st, max_refs, n_uniq)
-    if split is None:
-        shard_widths = [max_refs]
-    else:
-        shard_widths = [1 << split, max_refs]
-
-    n_bytes = 0
-    for si, w in enumerate(shard_widths):
-        n_bytes += 12 * w * max(_shard_sizes(st, split, gi)[si] for gi in range(G)) * G
-    if n_bytes > _dense_index_budget(dev):
-        return None                                                          # -> scattered fallback
-
-    # ---- pass 2: scatter each block's reference lists into its shard's [G, width, Us_max] tables ----
+    # ---- pass 2: scatter every reference into its shard's [G, width, Us] tables, all at once ----
+    # Every shard's tables are views into one flat buffer per field, so this is one indexed store per
+    # field however many shards and blocks there are. Each shard starts on a 128-byte boundary, as its
+    # own allocation used to.
+    #
     # Filled IN PLACE and NOT zeroed. Every reader stops at a category's own count (`ref_cnt`): the CUDA
     # kernels loop `j < cnt`, the Triton fallback masks `j < cnt`. So the padding past a list's end is
-    # never read. Zeroing it, plus the copy the per-block `torch.stack` made, scaled with `width` (the
+    # never read. Zeroing it, plus the copy a per-block `torch.stack` made, scaled with `width` (the
     # LONGEST list, rounded up to a power of two -- a token proposed at every position makes that
     # `batch * positions`), not with the references actually present: on the CoDD PC it was ~1.4 ms
     # of a 10.9 ms fwd+bwd at batch 16, and 2.9 ms at batch 17, where `width` jumps from 512 to 1024.
+    def _bases(sizes):
+        out, acc = [], 0
+        for n in sizes:
+            out.append(acc)
+            acc += -(-n // 32) * 32
+        return out, acc
+    rbase, r_tot = _bases([G * w * u for w, u in zip(shard_widths, shard_us)])
+    ubase, u_tot = _bases([G * u for u in shard_us])
+
+    # The small per-shard tables, in one host-to-device copy: lists per (shard, block), and for the
+    # ladder the bucket -> shard map and each shard's table geometry.
+    host = [shard_n[gi][si] for si in range(S) for gi in range(G)]
+    if S > 1:
+        b2s = [0] * _LADDER_N
+        for si, (lo, hi) in enumerate(shard_ranges):
+            for b in range(lo, hi + 1):
+                b2s[b] = si
+        host += b2s + rbase + shard_widths + shard_us + ubase
+    host = torch.tensor(host, dtype = torch.long, device = dev)
+    num_uniq = host[:(S * G)].view(S, G).int()
+
+    if S == 1:
+        rb, wd, us, ub = rbase[0], shard_widths[0], shard_us[0], ubase[0]
+        rank = pos                                    # the lists are already in (block, category) order
+        us_e = us
+    else:
+        sid = host[(S * G):(S * G + _LADDER_N)][bidx]                        # shard of each list
+        rb, wd, us, ub = host[(S * G + _LADDER_N):].view(4, S)[:, sid]
+        # Rank within (shard, block). A stable sort on that pair keeps the ASCENDING category order the
+        # lists already have inside each piece -- which is what makes the `params` reads and
+        # `param_flows` writes coalesce.
+        seg_s, perm = torch.sort(sid * G + g_l, stable = True)
+        rank = torch.empty_like(perm)
+        rank[perm] = torch.arange(U, device = dev) - torch.searchsorted(seg_s, seg_s)
+        us_e = us[row]
+
+    # [width, Us] rather than [Us, width]: the kernels assign one CATEGORY per thread, so with the
+    # reference index innermost, lane-adjacent threads would read `width` apart and every lane would
+    # fetch its own sector. Transposed, a warp's reads of reference `j` are contiguous.
+    r_dst = (rb + g_l * (wd * us) + rank)[row] + within * us_e
+    ref_slot = torch.empty(r_tot, dtype = torch.int32, device = dev)
+    ref_pt = torch.empty(r_tot, dtype = torch.float32, device = dev)
+    ref_goff = torch.empty(r_tot, dtype = torch.int32, device = dev)         # < B * V * K: 32 bits is plenty
+    t = order // K
+    ref_slot[r_dst] = ((t % V) * B + t // V).int()
+    # `ref_pt` is a float32 table both kernels read as float, so widen half-precision evidence here
+    # rather than in the kernels (see `_fw_linear_evidence`).
+    ref_pt[r_dst] = evidence.reshape(-1)[order].float().exp()
+    ref_goff[r_dst] = order.int()
+
+    u_dst = ub + g_l * us + rank
+    uniq = torch.zeros(u_tot, dtype = torch.int32, device = dev)
+    ref_cnt = torch.zeros(u_tot, dtype = torch.int32, device = dev)
+    uniq[u_dst] = (ukey % num_cats).int() if G > 1 else ukey.int()
+    ref_cnt[u_dst] = counts.int()
+
     shards = []
-    for si, width in enumerate(shard_widths):
-        Us_max = max(_shard_sizes(st, split, gi)[si] for gi in range(G))
+    for si, (w, u) in enumerate(zip(shard_widths, shard_us)):
+        r0, u0 = rbase[si], ubase[si]
         shards.append(dict(
-            uniq = torch.zeros([G, Us_max], dtype = torch.int32, device = dev),
-            ref_slot = torch.empty([G, width, Us_max], dtype = torch.int32, device = dev),
-            ref_pt = torch.empty([G, width, Us_max], dtype = torch.float32, device = dev),
-            # offsets are bounded by B * V * K, so 32 bits is plenty
-            ref_goff = torch.empty([G, width, Us_max], dtype = torch.int32, device = dev),
-            ref_cnt = torch.zeros([G, Us_max], dtype = torch.int32, device = dev),
-            num_uniq = [0] * G,
-            Umax = Us_max,
-            max_refs = width,
+            uniq = uniq[u0:(u0 + G * u)].view(G, u),
+            ref_slot = ref_slot[r0:(r0 + G * w * u)].view(G, w, u),
+            ref_pt = ref_pt[r0:(r0 + G * w * u)].view(G, w, u),
+            ref_goff = ref_goff[r0:(r0 + G * w * u)].view(G, w, u),
+            ref_cnt = ref_cnt[u0:(u0 + G * u)].view(G, u),
+            num_uniq = num_uniq[si],                                         # [G]
+            Umax = u,
+            max_refs = w,
         ))
-
-    for gi, (uniq, counts, within, row, s_sorted, p_sorted, g_sorted) in enumerate(sorted_l):
-        U = uniq.numel()
-
-        if split is None:
-            pieces = [(uniq, counts, within, row, s_sorted, p_sorted, g_sorted)]
-        else:
-            thr = 1 << split
-            n_cat, n_elem = _shard_sizes(st, split, gi), _shard_elems(st, split, gi)
-            # Stable partition on "is this list longer than the threshold", so the ASCENDING category
-            # order -- which is what makes the `params` reads and `param_flows` writes coalesce -- is
-            # preserved inside each shard.
-            heavy_c = (counts > thr).int()
-            perm_c = torch.argsort(heavy_c, stable = True)
-            pos = torch.empty_like(perm_c)
-            pos[perm_c] = torch.arange(U, device = dev)
-            perm_e = torch.argsort(heavy_c[row], stable = True)
-
-            pieces = []
-            for si in range(2):
-                cs = perm_c[:n_cat[0]] if si == 0 else perm_c[n_cat[0]:]
-                es = perm_e[:n_elem[0]] if si == 0 else perm_e[n_elem[0]:]
-                pieces.append((uniq[cs], counts[cs], within[es], pos[row[es]] - (0 if si == 0 else n_cat[0]),
-                               s_sorted[es], p_sorted[es], g_sorted[es]))
-
-        for si, (u, c, wi, r, ss, ps, gs) in enumerate(pieces):
-            Us = u.numel()
-            sh = shards[si]
-            # [width, U] rather than [U, width]: the kernel assigns one CATEGORY per thread, so with the
-            # reference index innermost, lane-adjacent threads would read `width` apart and every lane
-            # would fetch its own sector. Transposed, a warp's reads of reference `j` are contiguous.
-            sh["ref_slot"][gi, wi, r] = ss
-            sh["ref_pt"][gi, wi, r] = ps
-            sh["ref_goff"][gi, wi, r] = gs
-            sh["uniq"][gi, :Us] = u.int()
-            sh["ref_cnt"][gi, :Us] = c.int()
-            sh["num_uniq"][gi] = Us
-
-    for sh in shards:
-        sh["num_uniq"] = torch.tensor(sh["num_uniq"], dtype = torch.int32, device = dev)   # [G]
 
     index = dict(
         shards = shards,
@@ -1443,9 +1582,11 @@ def _build_dense_index(layer, kwargs):
         p_base = p_base,
         num_blocks = G,
         num_latents = num_latents,
+        # A category may own several lists: its parameter-flow update must then be atomic.
+        split = split,
     )
 
-    layer._dense_index_cache = (key, index)
+    cached[1][ladder] = index
     return index
 
 
@@ -1574,8 +1715,8 @@ class _DenseDenomDispatch:
                      ("num_uniq_ptr", "num_uniq"), ("UNIQ_STRIDE", "Umax"), ("MAX_REFS", "max_refs"))
 
     def __getitem__(self, grid):
-        # Each shard covers a disjoint set of categories, so every (row, category) still has exactly one
-        # owning thread across the whole set and the shards may run in any order.
+        # The shards partition the lists, and every update is an accumulation (atomic wherever a category
+        # can have more than one list), so the shards may run in any order.
         def launch(**kw):
             shards = kw.pop("shards")
             for sh in shards:
@@ -1626,6 +1767,8 @@ def _prep_args_bk_dense_denom(layer, kwargs):
     target_kwargs["categorical_evidence_logp_grad_ptr"] = _grad_scratch(layer, grad)
     target_kwargs["update_extflows"] = grad is not None
     target_kwargs["update_pflows"] = _dense_update_pflows(layer, kwargs)
+    # The CUDA kernel's update is always atomic; the Triton one only needs to be when lists were cut.
+    target_kwargs["PF_ATOMIC"] = index["split"]
 
     target_kwargs["num_latents"] = num_latents
     target_kwargs["tot_num_cats"] = layer.nodes[0].dist.num_cats
@@ -2831,10 +2974,12 @@ class SoftEvidenceCategorical(Distribution):
                               num_latents: tl.constexpr, tot_num_cats: tl.constexpr, pf_row_stride: tl.constexpr,
                               MAX_REFS: tl.constexpr, UNIQ_STRIDE: tl.constexpr,
                               BLOCK_L: tl.constexpr, BLOCK_C: tl.constexpr,
-                              update_extflows: tl.constexpr, update_pflows: tl.constexpr = True):
+                              update_extflows: tl.constexpr, update_pflows: tl.constexpr = True,
+                              PF_ATOMIC: tl.constexpr = False):
         """Second half of the dense top-k backward: the expected-category flow phase (phase 1).
 
-        Walks (latent x category) so that every (param-flow row, category) has a single owner and needs
+        Walks (latent x category) so that every (param-flow row, category) has a single owner -- unless a
+        long list was cut into pieces, `PF_ATOMIC` -- and needs
         no atomic:
             phase1[row, c] = beta[l, c] * sum_j ratio[slot_j, l] * p_theta_j
         over the soft-evidence slots j whose candidate set contains category c. The same `beta` read
@@ -2896,11 +3041,16 @@ class SoftEvidenceCategorical(Distribution):
         if update_pflows:
             pf_base = tl.load(pf_base_ptr + pid_g * num_latents + offs_l, mask = mask_l, other = 0)
             optr = param_flows_ptr + pf_base[:,None] + tot_num_cats + cats[None,:]
-            # One owner per (row, category), so this is a plain read-modify-write.
-            # :note: `tl.atomic_add` here is 1.5x SLOWER (2.09 -> 3.22 ms) even though the equivalent
-            #        `atomicAdd` in the CUDA kernel is 1.2x FASTER -- Triton does not lower it to a bare
-            #        RED (reduction) instruction. That asymmetry is the reason the CUDA path exists.
-            tl.store(optr, tl.load(optr, mask = m, other = 0.0) + beta * acc, mask = m)
+            if PF_ATOMIC:
+                # A long list was cut into pieces (`_DENSE_LIST_SPLIT`), so a category can have several
+                # owners -- in other programs, and in other lanes of this one.
+                tl.atomic_add(optr, beta * acc, mask = m)
+            else:
+                # One owner per (row, category), so this is a plain read-modify-write.
+                # :note: `tl.atomic_add` here is 1.5x SLOWER (2.09 -> 3.22 ms) even though the equivalent
+                #        `atomicAdd` in the CUDA kernel is 1.2x FASTER -- Triton does not lower it to a bare
+                #        RED (reduction) instruction. That asymmetry is the reason the CUDA path exists.
+                tl.store(optr, tl.load(optr, mask = m, other = 0.0) + beta * acc, mask = m)
 
     @staticmethod
     @triton_jit

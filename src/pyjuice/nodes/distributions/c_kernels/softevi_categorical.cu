@@ -13,9 +13,10 @@
 //
 //     grad[goff_j] -= p_theta_j * sum_l ratio[slot_j, l] * beta[l, cat]
 //
-// Each (row, cat) has exactly one owning thread, so the phase-1 update is a plain read-modify-write
-// with no atomics. See the long note in softevi_categorical.py for why the computation is organised
-// this way rather than as a scatter over slots.
+// Each (row, cat) is owned by the thread(s) holding its reference list -- one, unless the list was long
+// enough to be cut into pieces -- so the phase-1 update is one coalesced atomic per owner rather than
+// one scattered atomic per reference. See the long note in softevi_categorical.py for why the
+// computation is organised this way rather than as a scatter over slots.
 //
 // Thread mapping (this is the whole point of the hand-written version):
 //   threadIdx.x  -> category within the tile, so the `params` and `param_flows` accesses -- which are
@@ -149,14 +150,15 @@ __global__ void dense_expected_flow_kernel(
 
     if (!UPDATE_FLOW) return;
 
-    // one owner per (row, cat): plain read-modify-write, coalesced across the warp
+    // coalesced across the warp
     #pragma unroll
     for (int t = 0; t < TL; ++t) {
         if (t < nl) {
             float* dst = param_flows + pfb[t] + tot_num_cats + cat;
             // RED.E.ADD.F32: the add is done in L2 and nothing is returned to the SM, which halves the
-            // SM<->L2 traffic versus load-add-store. Not needed for correctness (one owner per slot) --
-            // purely faster: 1.66 -> 1.37 ms on the CoDD config.
+            // SM<->L2 traffic versus load-add-store: 1.66 -> 1.37 ms on the CoDD config. It is also
+            // REQUIRED for correctness: a long reference list is cut into pieces (`_DENSE_LIST_SPLIT`),
+            // each its own entry of `uniq`, so one (row, cat) can have several owning threads.
             atomicAdd(dst, beta[t] * acc[t]);
         }
     }
@@ -458,7 +460,7 @@ void softevi_forward_dense(torch::Tensor params, torch::Tensor node_mars, torch:
                            int64_t batch_size, int64_t node_offset, int64_t TLv, int64_t threads,
                            int64_t cat_blocks, int64_t zero_z, int64_t run_epilogue, int64_t swizzle) {
     // `Z` accumulates across shards (the category set is split by reference-list length so that warps
-    // are homogeneous -- see `_choose_shard_split`), so the caller zeroes it on the first shard and
+    // are homogeneous -- see `_choose_shards`), so the caller zeroes it on the first shard and
     // takes the epilogue on the last.
     auto st = at::cuda::getCurrentCUDAStream();
     if (zero_z) Z.zero_();
