@@ -369,10 +369,16 @@ class BlockScaleSumParams(ExternalSumParams):
         # 1.17-1.30x on the gated backward when it ran on every launch of the param kernel.
         # Its own dict, via `__dict__` -- the forward reaches this before `_bs_bw_gate_cache` exists,
         # and `nn.Module.__getattr__` raises rather than returning None for a missing attribute.
+        #
+        # Keyed by the rows' memory, and the entry keeps `nids` itself alive, so that memory cannot be
+        # handed to another tensor while the key exists: a hit is the same compiled rows. The key used to
+        # read `nids[0]` and `nids[-1]` to tell recycled addresses apart -- two device-to-host syncs on
+        # every call, which also made the gated passes impossible to capture in a CUDA graph.
         cache = layer.__dict__.setdefault("_bs_nstride_cache", {})
-        key = (int(nids.data_ptr()), int(nids.numel()), int(nids[0]), int(nids[-1]))
-        if key in cache:
-            return cache[key]
+        key = (nids.data_ptr(), tuple(nids.shape), tuple(nids.stride()), nids.dtype)
+        entry = cache.get(key)
+        if entry is not None:
+            return entry[1]
 
         dev = nids.device
         starts = torch.tensor([i.ns._output_ind_range[0] for i in layer.external_node_infos],
@@ -385,7 +391,7 @@ class BlockScaleSumParams(ExternalSumParams):
         starts, cks = starts[order], cks[order]
         pos = (torch.searchsorted(starts, nids.to(dev).to(torch.long), right = True) - 1).clamp(min = 0)
         out = cks[pos].contiguous()
-        cache[key] = out
+        cache[key] = (nids, out)
         return out
 
     @staticmethod
