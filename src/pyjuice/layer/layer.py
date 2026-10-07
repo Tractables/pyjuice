@@ -20,6 +20,12 @@ class Layer():
     #: see `ExternalSumParams.requests_denom_param_flows`.
     requests_denom_param_flows: bool = False
 
+    #: The partial-evaluation selections (see `enable_partial_evaluation`), None while the whole layer is
+    #: evaluated. Declared here so that `provided()` -- asked on every pass -- finds None rather than going
+    #: through `nn.Module.__getattr__`'s AttributeError: ~0.4 us per check, ~200 checks per step.
+    fw_partition_local_ids = None
+    bk_partition_local_ids = None
+
     def __init__(self, nodes: Sequence[CircuitNodes], disable_block_size_check: bool = False) -> None:
 
         # Nodes correspond to the current layer

@@ -29,6 +29,9 @@ from .compilation import next_power_of_2, get_prod_layer_stats, prod_layer_forwa
 
 class ProdLayer(Layer, nn.Module):
 
+    # As `Layer.fw_partition_local_ids`: None until partial evaluation sets it
+    bk_fw_partition_local_ids = None
+
     def __init__(self, nodes: Sequence[ProdNodes], global_nid_start: Optional[int] = None, 
                  layer_sparsity_tol: Optional[float] = None, max_num_partitions: Optional[int] = None, 
                  disable_gpu_compilation: bool = False, force_gpu_compilation: bool = False) -> None:
@@ -344,24 +347,27 @@ class ProdLayer(Layer, nn.Module):
             # reduction layout, and only the heuristic's two guesses are in question: how far to cap
             # the node tile, and whether a fatter batch tile pays for the lower program count.
             # `BLOCK_M` must divide `block_size` (the kernel derives the node block from `pid_m`),
-            # so it stays a power of two <= `block_size`. See `kernels/autotune.py`.
-            cfgs = [(BLOCK_M, BLOCK_B)]
-            budget_BLOCK_M = min(max(2048 // (BLOCK_B * num_edges), 1), self.block_size)
-            for bm in (8, 32, budget_BLOCK_M):
-                bm = min(bm, self.block_size)
-                if (bm, BLOCK_B) not in cfgs:
-                    cfgs.append((bm, BLOCK_B))
-            wide_BLOCK_B = min(BLOCK_B * 2, host_next_power_of_2(batch_size))
-            if (BLOCK_M, wide_BLOCK_B) not in cfgs:
-                cfgs.append((BLOCK_M, wide_BLOCK_B))
+            # so it stays a power of two <= `block_size`. See `kernels/autotune.py`. The candidates are
+            # only listed when the choice is not cached yet, not on every call.
+            default_cfg = (BLOCK_M, BLOCK_B)
 
             # `accum` makes the output read-accumulate-write, so the timing runs must go to a
             # scratch buffer; without it the kernel just overwrites `node_vals` with the same values
             # it is about to write anyway, so it can be timed in place.
             key = (kernels._forward_backward_kernel_2d, n_nblocks, num_edges, block_size,
-                   batch_size, accum, partial_eval, prop_logsumexp, cfgs[0])
+                   batch_size, accum, partial_eval, prop_logsumexp, default_cfg)
             cfg = autotune.cached(key)
             if cfg is None:
+                cfgs = [default_cfg]
+                budget_BLOCK_M = min(max(2048 // (BLOCK_B * num_edges), 1), self.block_size)
+                for bm in (8, 32, budget_BLOCK_M):
+                    bm = min(bm, self.block_size)
+                    if (bm, BLOCK_B) not in cfgs:
+                        cfgs.append((bm, BLOCK_B))
+                wide_BLOCK_B = min(BLOCK_B * 2, host_next_power_of_2(batch_size))
+                if (BLOCK_M, wide_BLOCK_B) not in cfgs:
+                    cfgs.append((BLOCK_M, wide_BLOCK_B))
+
                 # Only allocate a benchmark buffer when `pick` will really benchmark it:
                 # `autotune.should_tune` also declines, UNCACHED, when tuning is off or a graph is
                 # being captured, so gating on `cached` alone allocated a `node_vals`-sized clone on

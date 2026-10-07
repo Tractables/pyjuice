@@ -379,6 +379,12 @@ class SumLayer(Layer, nn.Module):
         self._cached_bk_par_trim = dict()
         self._bk_par_scratch = None
 
+        # Set once a tuned launch config exceeded the GPU's shared memory (the defaults are used from then
+        # on). Read on every pass, so present from the start rather than found missing through
+        # `nn.Module.__getattr__`'s AttributeError.
+        self._fw_tuning_oom = False
+        self._par_tuning_oom = False
+
         # Optional interception of the two CUDA backward kernels by an external parameterization.
         # `None` on every plain layer, so the fast paths below are unchanged for them. When set (by
         # `ExternalParamsSumLayer` for the duration of one backward), the hook is called INSTEAD of the
@@ -863,20 +869,25 @@ class SumLayer(Layer, nn.Module):
         # AFTER the CUDA fast paths have declined this layer (`autotune.pick` at the bottom) --
         # benchmarking here would waste warmup on layers that end up on CUDA and, worse, perturb the
         # neighbouring {CUDA, Triton} measurement, whose two arms are numerically equivalent but not
-        # bit-identical, so nudging that tie shows up as a changed result.
-        fw_cfgs = [(TILE_SIZE_M, BLOCK_B)]
-        for tm in (TILE_SIZE_M // 2, TILE_SIZE_M * 2):
-            if tile_floor <= tm <= self.block_size and (tm, BLOCK_B) not in fw_cfgs:
-                fw_cfgs.append((tm, BLOCK_B))
-        for bb in (BLOCK_B // 2, BLOCK_B * 2):
-            if tile_floor <= bb <= BATCH_SIZE_NP2 and (TILE_SIZE_M, bb) not in fw_cfgs:
-                fw_cfgs.append((TILE_SIZE_M, bb))
+        # bit-identical, so nudging that tie shows up as a changed result. The list is only built when
+        # the choice is not cached yet (`_fw_candidates`), not on every call.
+        default_fw_cfg = (TILE_SIZE_M, BLOCK_B)
+
+        def _fw_candidates():
+            fw_cfgs = [default_fw_cfg]
+            for tm in (TILE_SIZE_M // 2, TILE_SIZE_M * 2):
+                if tile_floor <= tm <= self.block_size and (tm, BLOCK_B) not in fw_cfgs:
+                    fw_cfgs.append((tm, BLOCK_B))
+            for bb in (BLOCK_B // 2, BLOCK_B * 2):
+                if tile_floor <= bb <= BATCH_SIZE_NP2 and (TILE_SIZE_M, bb) not in fw_cfgs:
+                    fw_cfgs.append((TILE_SIZE_M, bb))
+            return fw_cfgs
 
         # The heuristic default is part of the key so that the `OutOfResources` retry below -- which
         # re-enters with a smaller default -- looks up a fresh entry instead of the config that just
         # failed (which would loop forever).
         fw_key = (fw_kernel, self.block_size, TILE_SIZE_K, K_NUM_TILES, batch_size, num_nblocks,
-                  partial_eval, use_bf16, propagation_alg_id, pflow_tempered_enabled, fw_cfgs[0])
+                  partial_eval, use_bf16, propagation_alg_id, pflow_tempered_enabled, default_fw_cfg)
 
         # Optional CUDA (CuTe/TMA) fast path for the `tlmm` regime. It is numerically equivalent to
         # the Triton tlmm kernel and only valid here: LL propagation (`propagation_alg_id == 0`), the
@@ -899,7 +910,7 @@ class SumLayer(Layer, nn.Module):
                 if choice is None:
                     # Autotune once: fastest of {valid CUDA tile configs} vs Triton. Every candidate
                     # computes the same result into `node_mars`, so it stays correct afterwards.
-                    cands = [(("triton", -1), (lambda: _launch_fw(fw_cfgs[0])))]
+                    cands = [(("triton", -1), (lambda: _launch_fw(default_fw_cfg)))]
                     cands += [(("cuda", c),
                                (lambda c=c: cuda_kernels.tlmm_forward_sum(
                                    node_mars, element_mars, params, nids, ebase, pbase,
@@ -953,7 +964,7 @@ class SumLayer(Layer, nn.Module):
                             node_mars, element_mars, params, nids, sb_ebase, sb_pbase,
                             batch_size, self.block_size, num_edges, cfg[1])
                     else:
-                        _launch_fw(fw_cfgs[0])
+                        _launch_fw(default_fw_cfg)
 
                 # Autotune the CUDA SPLIT configs against the Triton launch that would run on
                 # fall-through. Every candidate overwrites node_mars with the same result, so it stays
@@ -961,8 +972,9 @@ class SumLayer(Layer, nn.Module):
                 # two sides agree only to ~1.5e-6, so structurally identical layers that tuned on their
                 # own could each take a different one and disagree in the last bits -- a cross-model
                 # bit-identity test caught exactly that (2.4e-7) once this path reached batch 32.
-                choice = autotune.pick(("sum_fw_smallbatch_cuda", num_edges) + fw_key,
-                                       [("triton", -1)] + [("cuda", c) for c in range(n_sb_cfg)], _launch_sb)
+                sb_key = ("sum_fw_smallbatch_cuda", num_edges) + fw_key
+                choice = autotune.cached(sb_key) or autotune.pick(
+                    sb_key, [("triton", -1)] + [("cuda", c) for c in range(n_sb_cfg)], _launch_sb)
 
                 if choice[0] == "cuda":
                     cuda_kernels.smallbatch_forward_sum(
@@ -974,7 +986,7 @@ class SumLayer(Layer, nn.Module):
         # OOM-safe tuned launch: if the larger tuned tiles exceed this GPU's shared-memory/
         # register budget, fall back to the default configuration (recompiled untuned).
         try:
-            _launch_fw(autotune.pick(fw_key, fw_cfgs, _launch_fw))
+            _launch_fw(autotune.cached(fw_key) or autotune.pick(fw_key, _fw_candidates(), _launch_fw))
         except _TritonOutOfResources:
             # `OutOfResources` is raised at compile time before any write, so retry is safe.
             if not (FORWARD_SUM_TUNED and not getattr(self, "_fw_tuning_oom", False)
@@ -1532,12 +1544,16 @@ class SumLayer(Layer, nn.Module):
         # 0.79/0.80/0.80/0.79/1.04 -> 0.48/0.47/0.48/0.60/0.87; 256-latent untied HMM 0.25/0.31/0.31/0.33/
         # 0.38 -> 0.17/0.16/0.17/0.19/0.30; HCLT-256 0.067/0.071/0.075/0.115/0.180 -> 0.050/0.050/0.058/
         # 0.107/0.188; PD 28x28 0.076 -> 0.084 at batch 64 -- so it is offered, not imposed.
+        # Only computed when there is something to tune (`_ele_candidates`); `num_edges_full` because
+        # `num_edges` is reassigned to the trimmed width below.
         num_edges_full = num_edges
-        alt_family = None
-        if not (batch_size < 16 and self.block_size >= _SMALL_BATCH_MIN_BLOCK_SIZE) and BATCH_SIZE_NP2 > 16:
-            alt = self._ele_tile_family(num_edges, cs_block_size, 16)
-            if alt[0] != TILE_SIZE_K and num_edges % alt[0] == 0:
-                alt_family = alt
+
+        def _alt_family():
+            if not (batch_size < 16 and self.block_size >= _SMALL_BATCH_MIN_BLOCK_SIZE) and BATCH_SIZE_NP2 > 16:
+                alt = self._ele_tile_family(num_edges_full, cs_block_size, 16)
+                if alt[0] != TILE_SIZE_K and num_edges_full % alt[0] == 0:
+                    return alt
+            return None
 
         def _parent_tables(tk):
             """The `parids` / `parpids` walk for an edge tile of `tk`: start, per-tile increments,
@@ -1649,40 +1665,47 @@ class SumLayer(Layer, nn.Module):
         # node tile) and `_SMALL_BATCH_ELE_TILE_M` answer with a constant above; here it is measured
         # instead -- but only once the CUDA fast paths below have declined this layer (see
         # `_tuned_ele_cfg`), for the reason spelled out in the forward: measuring here would perturb the
-        # neighbouring {CUDA, Triton} tie. A config is `(TILE_SIZE_K, TILE_SIZE_M, BLOCK_B)`.
-        ele_cfgs = [(TILE_SIZE_K, TILE_SIZE_M, BLOCK_B)]
-        for tm in (TILE_SIZE_M // 2, TILE_SIZE_M * 2):
-            if ele_floor <= tm <= cs_block_size and (TILE_SIZE_K, tm, BLOCK_B) not in ele_cfgs:
-                ele_cfgs.append((TILE_SIZE_K, tm, BLOCK_B))
-        for bb in (BLOCK_B // 2, BLOCK_B * 2):
-            if ele_floor <= bb <= BATCH_SIZE_NP2 and (TILE_SIZE_K, TILE_SIZE_M, bb) not in ele_cfgs:
-                ele_cfgs.append((TILE_SIZE_K, TILE_SIZE_M, bb))
-        # The other tile family (see `alt_family` above). Its edge tile differs, so its reduction is
-        # grouped differently and agrees with the reference to rounding (~1e-7), like any tuned choice
-        # here; it must also keep the kernel and the `TL_DOT` decided above.
-        if alt_family is not None:
-            tk, tm, bb = alt_family
-            tm = _doubled_m(tm, tk, bb)
-            if min(tk, tm, bb) >= (16 if TL_DOT else ele_floor) and tm <= cs_block_size:
-                ele_cfgs.append((tk, tm, bb))
+        # neighbouring {CUDA, Triton} tie. A config is `(TILE_SIZE_K, TILE_SIZE_M, BLOCK_B)`; the list
+        # is only built when there is something to tune (`_ele_candidates`), not on every call.
+        default_ele_cfg = (TILE_SIZE_K, TILE_SIZE_M, BLOCK_B)
+
+        def _ele_candidates():
+            ele_cfgs = [default_ele_cfg]
+            for tm in (TILE_SIZE_M // 2, TILE_SIZE_M * 2):
+                if ele_floor <= tm <= cs_block_size and (TILE_SIZE_K, tm, BLOCK_B) not in ele_cfgs:
+                    ele_cfgs.append((TILE_SIZE_K, tm, BLOCK_B))
+            for bb in (BLOCK_B // 2, BLOCK_B * 2):
+                if ele_floor <= bb <= BATCH_SIZE_NP2 and (TILE_SIZE_K, TILE_SIZE_M, bb) not in ele_cfgs:
+                    ele_cfgs.append((TILE_SIZE_K, TILE_SIZE_M, bb))
+            # The other tile family (see `_alt_family` above). Its edge tile differs, so its reduction is
+            # grouped differently and agrees with the reference to rounding (~1e-7), like any tuned
+            # choice here; it must also keep the kernel and the `TL_DOT` decided above.
+            alt_family = _alt_family()
+            if alt_family is not None:
+                tk, tm, bb = alt_family
+                tm = _doubled_m(tm, tk, bb)
+                if min(tk, tm, bb) >= (16 if TL_DOT else ele_floor) and tm <= cs_block_size:
+                    ele_cfgs.append((tk, tm, bb))
+            return ele_cfgs
 
         ele_key = (ele_kernel, self.block_size, cs_block_size, TILE_SIZE_K, K_NUM_TILES,
                    ptr_inc_step, batch_size, num_nblocks, partial_eval, TL_DOT, accumulate_ch_flows,
                    allow_modify_flows, logspace_flows, allow_neg_flows, propagation_alg_id,
-                   ele_cfgs[0])
+                   default_ele_cfg)
 
         def _tuned_ele_cfg():
             cfg = autotune.cached(ele_key)
             if cfg is not None:
                 return cfg
+            ele_cfgs = _ele_candidates()
             # `accumulate_ch_flows` makes `element_flows` read-accumulate-write, so the timing runs
             # must go to a scratch buffer; otherwise the kernel overwrites it with the values it is
             # about to write for real anyway and can be timed in place.
             if not autotune.should_tune(ele_key, len(ele_cfgs)):
-                return ele_cfgs[0]                     # `pick` would decline; do not allocate for it
+                return default_ele_cfg                 # `pick` would decline; do not allocate for it
             out = element_flows if not accumulate_ch_flows else autotune.scratch_like(element_flows)
             if out is None:
-                return ele_cfgs[0]                     # no scratch -> leave this launch untuned
+                return default_ele_cfg                 # no scratch -> leave this launch untuned
             return autotune.pick(ele_key, ele_cfgs, lambda c: _launch_ele(c, out))
 
         # An external parameterization owns this computation. ONE interception for every regime: it is
@@ -1737,7 +1760,7 @@ class SumLayer(Layer, nn.Module):
                         batch_size, self.block_size, cs_block_size, K_NUM_TILES)
 
                 def _triton_ele(tgt):
-                    _launch_ele(ele_cfgs[0], tgt)
+                    _launch_ele(default_ele_cfg, tgt)
 
                 choice_key = (signature, batch_size)
                 choice = self._cached_bk_ele_choice.get(choice_key)
@@ -1798,7 +1821,7 @@ class SumLayer(Layer, nn.Module):
                 # Compare against the Triton launch that would actually run on fall-through (the
                 # tuned config and the kernel `ele_kernel` selects), not a hard-coded csmm2 one.
                 def _triton_ele_sb(tgt):
-                    _launch_ele(ele_cfgs[0], tgt)
+                    _launch_ele(default_ele_cfg, tgt)
 
                 choice_key = (signature, batch_size, "sb")
                 choice = self._cached_bk_ele_choice.get(choice_key)
@@ -2052,25 +2075,30 @@ class SumLayer(Layer, nn.Module):
         # candidates are exactly the alternatives `BACKWARD_PAR_FLOW_TUNED` / `_SMALL_BATCH_PAR_TILE_K`
         # pick between with a hard-coded, GPU-specific rule: a wider edge tile (fewer redundant
         # node_mars/node_flows reads) or a narrower one (more programs, better occupancy).
-        # `None` means "leave `num_warps` to Triton" -- the default the untuned launches use.
+        # `None` means "leave `num_warps` to Triton" -- the default the untuned launches use. The list is
+        # only built when there is something to tune (`_par_candidates`), not on every call.
         default_warps = par_kernel_extra.get("num_warps")
-        par_cfgs = [(TILE_SIZE_K, default_warps)]
-        for tk in (TILE_SIZE_K // 2, TILE_SIZE_K * 2):
-            if par_floor <= tk <= raw_num_edges and (TL_DOT == 0 or tk >= 16):
-                par_cfgs.append((tk, default_warps))
-        par_cfgs.append((TILE_SIZE_K, 8 if default_warps is None else None))
-        par_cfgs = list(dict.fromkeys(par_cfgs))
+        default_par_cfg = (TILE_SIZE_K, default_warps)
+
+        def _par_candidates():
+            par_cfgs = [default_par_cfg]
+            for tk in (TILE_SIZE_K // 2, TILE_SIZE_K * 2):
+                if par_floor <= tk <= raw_num_edges and (TL_DOT == 0 or tk >= 16):
+                    par_cfgs.append((tk, default_warps))
+            par_cfgs.append((TILE_SIZE_K, 8 if default_warps is None else None))
+            return list(dict.fromkeys(par_cfgs))
 
         # Like the forward, the heuristic default is part of the key so the `OutOfResources` retry --
         # which re-enters with the untuned default -- cannot look up the config that just failed.
         par_key = (par_kernel, self.block_size, raw_num_edges, num_nblocks, batch_size,
                    TILE_SIZE_M, TILE_SIZE_B, B_NUM_TILES, TL_DOT, allow_modify_flows,
-                   logspace_flows, negate_pflows, allow_neg_flows, propagation_alg_id, par_cfgs[0])
+                   logspace_flows, negate_pflows, allow_neg_flows, propagation_alg_id, default_par_cfg)
 
         def _tuned_par_cfg():
             cfg = autotune.cached(par_key)
             if cfg is not None:
                 return cfg
+            par_cfgs = _par_candidates()
             # `param_flows` is read-accumulate-write, so the timing runs must go to a scratch clone.
             # It is the full parameter array (can be GBs), so the scratch is local and freed right
             # after; if it cannot be allocated, this launch is simply left untuned.
@@ -2080,10 +2108,10 @@ class SumLayer(Layer, nn.Module):
             # allocated this clone on EVERY call in those cases: MEASURED 696 MB of transient peak per
             # backward against 3 MB, invisible in wall time because the allocator reuses the block.
             if not autotune.should_tune(par_key, len(par_cfgs)):
-                return par_cfgs[0]
+                return default_par_cfg
             scr = autotune.scratch_like(param_flows)
             if scr is None:
-                return par_cfgs[0]
+                return default_par_cfg
             try:
                 return autotune.pick(par_key, par_cfgs, lambda c: _launch_par(c, scr))
             finally:
@@ -2140,7 +2168,7 @@ class SumLayer(Layer, nn.Module):
                         nbase, cbase, pbase, fbase, batch_size, self.block_size, num_edges, 0)
 
                 def _triton_par(tgt):
-                    _launch_par(par_cfgs[0], tgt)
+                    _launch_par(default_par_cfg, tgt)
 
                 choice_key = (par_sig, batch_size)
                 choice = self._cached_bk_par_choice.get(choice_key)
@@ -2191,7 +2219,7 @@ class SumLayer(Layer, nn.Module):
         try:
             _launch_par(_tuned_par_cfg(), param_flows)
         except _TritonOutOfResources:
-            if par_cfgs[0][1] is None:
+            if default_par_cfg[1] is None:
                 raise
             self._par_tuning_oom = True
             warnings.warn("pyjuice: tuned parameter-flow backward launch exceeds GPU "
