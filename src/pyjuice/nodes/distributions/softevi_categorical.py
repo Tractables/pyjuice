@@ -2012,6 +2012,10 @@ class SoftEvidenceCategorical(Distribution):
                                kwargs, or process-wide with `PYJUICE_SOFTEVI_SORT=0`.
     :type sort_soft_evidence: bool
     """
+
+    call_kwargs = ("categorical_evidence_logp", "soft_evidence_cat_ids", "soft_evidence_value_mask",
+                   "categorical_evidence_logp_grad")   # see `Distribution.call_kwargs`
+
     def __init__(self, num_cats: int, _dual_flow_backward: bool = True, sort_soft_evidence: bool = True):
         super(SoftEvidenceCategorical, self).__init__()
 

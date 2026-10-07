@@ -77,9 +77,10 @@ def test_a_larger_batch_moves_the_buffers_and_drops_stale_graphs():
 
 @pytest.mark.parametrize("logspace_flows", [False, True])
 def test_the_step_that_records_a_graph_matches_eager(logspace_flows):
-    """Recording runs the backward three times to warm up, for real. Those runs used to accumulate into
-    the parameter flows and to reset `node_flows` to 0.0 -- an all-ones flow in log space -- so the step
-    that recorded a graph came out with ~4x its parameter flows, and far more in log space."""
+    """Recording used to run the backward three times to warm up, for real: those runs accumulated into
+    the parameter flows and reset `node_flows` to 0.0 -- an all-ones flow in log space -- so the step that
+    recorded a graph came out with ~4x its parameter flows, and far more in log space. It now runs the
+    pass once, as the call's own work, before a capture that executes nothing."""
     device = torch.device("cuda:0")
     pc = _hmm(device)
     data = torch.randint(0, 10, [6, 8], device = device)

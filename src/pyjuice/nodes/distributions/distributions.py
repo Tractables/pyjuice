@@ -6,6 +6,14 @@ from typing import Optional, Any
 
 
 class Distribution():
+
+    #: Keyword arguments of `TensorCircuit.forward` / `backward` that this distribution reads -- typically
+    #: the evidence it is handed on every call. They are for the input layers only: the circuit does not
+    #: pass them to its inner layers, so a CUDA graph of the inner layers does not depend on them and is
+    #: still replayed when they are fresh tensors on every call. A name missing here is merely keyed on
+    #: (graphs are recorded per value); one listed here must never be read by an inner layer.
+    call_kwargs: tuple = ()
+
     def __init__(self):
         self.post_fw_fns = []
         self.post_bp_fns = []

@@ -36,6 +36,11 @@ INPUT_FLOW_CUDA = True
 
 
 class InputLayer(Layer, nn.Module):
+
+    #: The circuit's call kwargs that `forward` / `backward` below take themselves; those of the
+    #: distributions are added per layer (see `Distribution.call_kwargs`).
+    call_kwargs = ("missing_mask", "_batch_first", "_apply_missing_mask_only")
+
     def __init__(self, nodes: Sequence[InputNodes], cum_nodes: int = 0, pc_num_vars: int = 0, max_tied_ns_per_parflow_block: int = 4) -> None:
         """
         Compiler flags:

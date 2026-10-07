@@ -786,6 +786,16 @@ class BlockScaleSumParams(ExternalSumParams):
 
         return out_mod, fname, calls
 
+    # Its hooks' only host-side handoff is `_bs_bw_state` (below); the rest is shape-keyed caches
+    cuda_graph_safe = True
+
+    def cuda_graph_state(self, layer):
+        # What the forward leaves for the backward and the sampler: its plan's `log Z` and geometry
+        return getattr(layer, "_bs_bw_state", None)
+
+    def restore_cuda_graph_state(self, layer, state) -> None:
+        layer._bs_bw_state = state
+
     def forward_layer(self, layer, ns_tensors, node_mars, element_mars, params, **kwargs) -> None:
         """
         Compute this layer's node values under the gate, REPLACING the standard sum forward.

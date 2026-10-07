@@ -83,6 +83,28 @@ class Layer():
     def provided(self, var_name):
         return hasattr(self, var_name) and getattr(self, var_name) is not None
 
+    #: Whether the circuit may capture this layer's passes in a CUDA graph. A replay runs no Python, so a
+    #: layer is graph-safe when its per-call Python leaves nothing behind but what `cuda_graph_state`
+    #: hands over (a host sync is fine: the capture fails and the pass stays eager).
+    cuda_graph_safe: bool = True
+
+    def cuda_graph_state(self):
+        """
+        Host-side state a pass of this layer leaves for a LATER pass to read -- a forward's leftovers
+        that its backward needs, say -- or None.
+
+        A replayed CUDA graph runs no Python, so state a recorded pass sets would otherwise keep
+        describing whichever call last ran eagerly. The circuit saves this after recording a graph and
+        hands it back through :func:`restore_cuda_graph_state` after every replay, and a backward graph
+        is only replayed against the state it was recorded with. A plain layer keeps nothing between
+        passes.
+        """
+        return None
+
+    def restore_cuda_graph_state(self, state) -> None:
+        """Put back what :func:`cuda_graph_state` returned right after a graph of this pass was recorded."""
+        pass
+
     def is_sum(self):
         return False
 
