@@ -28,6 +28,11 @@ from .backend import compile_cum_par_flows_fn, compute_cum_par_flows, cum_par_fl
                      normalize_parameters, eval_top_down_probs
 
 
+# A buffer's backing storage is reallocated at the needed size once it is more than this many times larger
+# (see `TensorCircuit._init_buffer`)
+_BUFFER_SHRINK_RATIO = 4
+
+
 def _graph_option(value):
     """An option of a captured pass as a hashable signature entry: tensors by the memory a capture bakes
     in (`cuda_graph_key`), mappings and sequences elementwise, anything else as it is."""
@@ -1941,6 +1946,13 @@ class TensorCircuit(nn.Module):
         one graph per batch size. The views of different shapes share memory, which nothing holds across
         calls (outputs are cloned). Growing a storage moves its buffer, so the graphs recorded against it
         are dropped.
+
+        A storage more than `_BUFFER_SHRINK_RATIO` times what the shape needs is reallocated at the needed
+        size, unless graphs of the inner layers are recorded (their replays need the addresses to stay).
+        Grow-only, one large batch -- an evaluation pass, say -- held its buffers for the rest of the
+        process: MEASURED on an HMM with 1024 latents, 3.1 GB still allocated back at batch 16 after one
+        batch-4096 step, against 1.0 GB when every shape got its own allocation. Batch sizes that vary
+        within the ratio (CoDD's 10-26) keep one storage, as before.
         """
         tensor = self.__dict__.get(name)
         on_device = lambda t: not check_device or self.device.index is None or t.device == self.device
@@ -1948,7 +1960,9 @@ class TensorCircuit(nn.Module):
         if not (isinstance(tensor, torch.Tensor) and tuple(tensor.shape) == tuple(shape) and on_device(tensor)):
             numel = math.prod(shape)
             storage = self.__dict__.setdefault("_buffer_storage", dict()).get(name)
-            if storage is None or storage.numel() < numel or not on_device(storage):
+            oversized = (storage is not None and storage.numel() > _BUFFER_SHRINK_RATIO * numel
+                         and not self.__dict__.get("_recorded_cuda_graphs"))
+            if storage is None or storage.numel() < numel or not on_device(storage) or oversized:
                 if storage is not None:
                     self._drop_cuda_graphs()    # the old storage moves; a first allocation strands nothing
                 storage = torch.empty(numel, device = self.device)

@@ -135,3 +135,39 @@ def test_backward_callbacks_run_on_every_call():
                     sum_layer_pre_backward_callback = lambda layer, **kw: calls.append(layer))
     num_sum_layers = sum(1 for g in pc.inner_layer_groups if g.is_sum() for _ in g)
     assert len(calls) == 2 * num_sum_layers, f"{len(calls)} callback calls, expected {2 * num_sum_layers}"
+
+
+def test_one_large_batch_does_not_keep_its_buffers():
+    """Buffers are cut from one storage per name, so batch sizes that vary keep one address (and their
+    graphs). Grow-only, one large batch -- an evaluation pass -- held its buffers for the rest of the
+    process (3.1 GB against 1.0 GB per-shape allocation, measured on a 1024-latent HMM). A storage more
+    than `_BUFFER_SHRINK_RATIO` times the need is now reallocated -- unless graphs are recorded, whose
+    replays need the addresses to stay."""
+    from pyjuice.model.tensorcircuit import _BUFFER_SHRINK_RATIO
+    device = torch.device("cuda:0")
+    pc = _hmm(device)
+    small, large = torch.randint(0, 10, [4, 8], device = device), torch.randint(0, 10, [200, 8], device = device)
+    names = ("node_mars", "element_mars", "node_flows", "element_flows")
+
+    reference = _step(pc, small, graphs = False)
+    _step(pc, large, graphs = False)
+    lls, pflows = _step(pc, small, graphs = False)
+    for name in names:
+        need = getattr(pc, name).numel()
+        assert pc._buffer_storage[name].numel() == need, f"{name} still holds a batch-200 storage"
+    assert torch.allclose(lls, reference[0], atol = 1e-5)
+    assert torch.allclose(pflows, reference[1], rtol = 1e-4, atol = 1e-6)
+
+    # Within the ratio the storage stays put
+    medium = torch.randint(0, 10, [4 * _BUFFER_SHRINK_RATIO, 8], device = device)
+    _step(pc, medium, graphs = False)
+    address = pc.node_mars.data_ptr()
+    _step(pc, small, graphs = False)
+    assert pc.node_mars.data_ptr() == address, "a batch within the ratio reallocated"
+
+    # With graphs recorded, a small batch after a large one keeps the large storage (and the graphs)
+    _step(pc, large, graphs = True)
+    _step(pc, small, graphs = True)
+    assert pc._buffer_storage["node_mars"].numel() == pc.num_nodes * 200
+    lls, pflows = _step(pc, small, graphs = True)
+    assert torch.allclose(lls, reference[0], atol = 1e-5)
