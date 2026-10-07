@@ -301,6 +301,9 @@ class TensorCircuit(nn.Module):
 
         self.device = device
 
+        # The layers' tables moved, and recorded graphs point at the old ones
+        self._drop_cuda_graphs()
+
         # For parameter flow accumulation
         self.parflow_fusing_kwargs = cum_par_flows_to_device(self.parflow_fusing_kwargs, device)
         
@@ -1870,6 +1873,9 @@ class TensorCircuit(nn.Module):
         if backward:
             self._bk_partial_eval_enabled = True
 
+        # A graph recorded before evaluates other nodes than the passes now should
+        self._drop_cuda_graphs()
+
     def disable_partial_evaluation(self, forward: bool = True, backward: bool = True):
         """
         Disable partial evaluation (see :func:`enable_partial_evaluation`), so that subsequent passes
@@ -1894,6 +1900,11 @@ class TensorCircuit(nn.Module):
 
         if backward:
             self._bk_partial_eval_enabled = False
+
+        # A graph recorded under partial evaluation computes only part of the circuit. MEASURED before
+        # this: after `disable_partial_evaluation()`, a plain `pc(x)` replayed the partial graph and
+        # returned log-likelihoods off by up to 38 nats.
+        self._drop_cuda_graphs()
 
     def _init_buffer(self, name: str, shape: Tuple, set_value: Optional[float] = None, check_device: bool = True):
         """Make `self.<name>` a contiguous `shape` buffer on the circuit's device, filled with `set_value`
