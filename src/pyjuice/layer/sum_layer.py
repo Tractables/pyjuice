@@ -1425,6 +1425,66 @@ class SumLayer(Layer, nn.Module):
 
         return None
 
+    def _ele_tile_family(self, num_edges: int, cs_block_size: int, batch_np2: int):
+        """`(TILE_SIZE_K, TILE_SIZE_M, BLOCK_B)` of the element-flow backward's heuristic for a batch tile of
+        `batch_np2` (the batch >= 16 regime): the edge tile shrinks as the batch tile grows, within a
+        2048-element tile budget."""
+        base_size = min(self.block_size, num_edges, batch_np2, 64)
+        if base_size >= 64:
+            tile_k = min(2048 // 32, num_edges)
+        else:
+            remainder = 2048 // (base_size ** 2)
+            tile_k = min(512, base_size * remainder, num_edges)
+        return tile_k, min(2048 // tile_k, cs_block_size), min(2048 // tile_k, batch_np2)
+
+    def _build_ele_parent_tables(self, parids: torch.Tensor, parpids: torch.Tensor, tk: int, num_edges: int):
+        """The element-flow backward's walk over parents for an edge tile of `tk`:
+        `[parids_start, parids_increment, parpids_start, parpids_increment, ptr_inc_step]`."""
+        TILE_SIZE_K = tk
+        K_NUM_TILES = num_edges // TILE_SIZE_K
+
+        # Pre-compute pointer increments for `parids` and `parpids`. Edge-tile trim (see
+        # `_BLOCK_SPARSE_EDGE_TRIM`): the parent dim maps to `num_edges = parids.size(1) * block_size`;
+        # tiles entirely beyond the REAL max parent count are pure padding (contribute 0), so they
+        # are dropped. The real count is read off `parids` (padding is a zero suffix -- the dummy
+        # parent is 0). Callers recover `K_NUM_TILES` from the increment table's second dimension.
+        if _BLOCK_SPARSE_EDGE_TRIM:
+            real_max = int((parids != 0).any(dim = 0).sum())
+            if real_max > 0:
+                K_NUM_TILES = min(K_NUM_TILES, triton.cdiv(real_max * self.block_size, TILE_SIZE_K))
+        eff_pars = (K_NUM_TILES * TILE_SIZE_K) // self.block_size
+
+        if TILE_SIZE_K < self.block_size:
+            ptr_inc_step = 1
+
+            num_rep = self.block_size // TILE_SIZE_K
+            parids = (parids[:, :eff_pars, None].repeat(1, 1, num_rep) + \
+                torch.arange(0, self.block_size, TILE_SIZE_K, device = parids.device)[None,None,:]).reshape(
+                    parids.size(0), K_NUM_TILES, 1)
+            parpids = (parpids[:, :eff_pars, None].repeat(1, 1, num_rep) + \
+                torch.arange(0, self.block_size, TILE_SIZE_K, device = parpids.device)[None,None,:]).reshape(
+                    parpids.size(0), K_NUM_TILES, 1)
+
+        else:
+            ptr_inc_step = TILE_SIZE_K // self.block_size
+
+            parids = parids[:, :eff_pars].reshape(parids.size(0), K_NUM_TILES, ptr_inc_step)
+            parpids = parpids[:, :eff_pars].reshape(parpids.size(0), K_NUM_TILES, ptr_inc_step)
+
+        parids_start = parids[:,0,:].contiguous()
+        parids_increment = torch.cat(
+            (parids[:,1:,:] - parids[:,:-1,:], parids[:,0:1,:] * 0),
+            dim = 1
+        ).contiguous()
+
+        parpids_start = parpids[:,0,:].contiguous()
+        parpids_increment = torch.cat(
+            (parpids[:,1:,:] - parpids[:,:-1,:], parpids[:,0:1,:] * 0),
+            dim = 1
+        ).contiguous()
+
+        return [parids_start, parids_increment, parpids_start, parpids_increment, ptr_inc_step]
+
     def _backward_block_sparse_ele_flows(self, node_flows: torch.Tensor, element_flows: torch.Tensor,
                                          params: torch.Tensor, node_mars: torch.Tensor,
                                          element_mars: torch.Tensor, chids: torch.Tensor, parids: torch.Tensor,
@@ -1458,64 +1518,38 @@ class SumLayer(Layer, nn.Module):
             BLOCK_B = BATCH_SIZE_NP2
             K_NUM_TILES = num_edges // TILE_SIZE_K
         else:
-            base_size = min(self.block_size, num_edges, BATCH_SIZE_NP2, 64)
-            if base_size >= 64:
-                TILE_SIZE_K = min(2048 // 32, num_edges)
-            else:
-                remainder = 2048 // (base_size ** 2)
-                TILE_SIZE_K = min(512, base_size * remainder, num_edges)
-            TILE_SIZE_M = min(2048 // TILE_SIZE_K, cs_block_size)
-            BLOCK_B = min(2048 // TILE_SIZE_K, BATCH_SIZE_NP2)
+            TILE_SIZE_K, TILE_SIZE_M, BLOCK_B = self._ele_tile_family(num_edges, cs_block_size, BATCH_SIZE_NP2)
             K_NUM_TILES = num_edges // TILE_SIZE_K
 
         assert TILE_SIZE_K >= 4, f"`TILE_SIZE_K` should be greater than 4 (but got {TILE_SIZE_K}) in order to use the block-sparse kernel. " \
                                   "This is an internal error of PyJuice. Please consider checking the kernel dispatching criterions and use the " \
                                   "corresponding sparse kernel instead."
 
+        # A second tile family for the autotuner: the one this heuristic picks for a 16-wide batch tile
+        # (`TILE_SIZE_K` 128 where the batch-sized one has 64). Neither family wins everywhere -- MEASURED,
+        # element-flow ms at batch 17/32/64/256/512, batch-sized -> 16-wide: 1024-latent HMM layer
+        # 0.79/0.80/0.80/0.79/1.04 -> 0.48/0.47/0.48/0.60/0.87; 256-latent untied HMM 0.25/0.31/0.31/0.33/
+        # 0.38 -> 0.17/0.16/0.17/0.19/0.30; HCLT-256 0.067/0.071/0.075/0.115/0.180 -> 0.050/0.050/0.058/
+        # 0.107/0.188; PD 28x28 0.076 -> 0.084 at batch 64 -- so it is offered, not imposed.
+        num_edges_full = num_edges
+        alt_family = None
+        if not (batch_size < 16 and self.block_size >= _SMALL_BATCH_MIN_BLOCK_SIZE) and BATCH_SIZE_NP2 > 16:
+            alt = self._ele_tile_family(num_edges, cs_block_size, 16)
+            if alt[0] != TILE_SIZE_K and num_edges % alt[0] == 0:
+                alt_family = alt
+
+        def _parent_tables(tk):
+            """The `parids` / `parpids` walk for an edge tile of `tk`: start, per-tile increments,
+            `ptr_inc_step` and the (trimmed) tile count. Built once per (partition, `tk`)."""
+            sig = ("block_sparse", partition_id, tk)
+            if sig not in self._cached_bk_parids:
+                self._cached_bk_parids[sig] = self._build_ele_parent_tables(parids, parpids, tk, num_edges_full)
+            return self._cached_bk_parids[sig]
+
         signature = ("block_sparse", partition_id, TILE_SIZE_K)
-        if signature not in self._cached_bk_parids:
-            # Pre-compute pointer increments for `parids` and `parpids`. Edge-tile trim (see
-            # `_BLOCK_SPARSE_EDGE_TRIM`): the parent dim maps to `num_edges = parids.size(1) * block_size`;
-            # tiles entirely beyond the REAL max parent count are pure padding (contribute 0), so they
-            # are dropped. The real count is read off `parids` (padding is a zero suffix -- the dummy
-            # parent is 0). On a cache hit `K_NUM_TILES` is recovered from the cached increment below.
-            if _BLOCK_SPARSE_EDGE_TRIM:
-                real_max = int((parids != 0).any(dim = 0).sum())
-                if real_max > 0:
-                    K_NUM_TILES = min(K_NUM_TILES, triton.cdiv(real_max * self.block_size, TILE_SIZE_K))
-            eff_pars = (K_NUM_TILES * TILE_SIZE_K) // self.block_size
-
-            if TILE_SIZE_K < self.block_size:
-                ptr_inc_step = 1
-
-                num_rep = self.block_size // TILE_SIZE_K
-                parids = (parids[:, :eff_pars, None].repeat(1, 1, num_rep) + \
-                    torch.arange(0, self.block_size, TILE_SIZE_K, device = parids.device)[None,None,:]).reshape(
-                        parids.size(0), K_NUM_TILES, 1)
-                parpids = (parpids[:, :eff_pars, None].repeat(1, 1, num_rep) + \
-                    torch.arange(0, self.block_size, TILE_SIZE_K, device = parpids.device)[None,None,:]).reshape(
-                        parpids.size(0), K_NUM_TILES, 1)
-
-            else:
-                ptr_inc_step = TILE_SIZE_K // self.block_size
-
-                parids = parids[:, :eff_pars].reshape(parids.size(0), K_NUM_TILES, ptr_inc_step)
-                parpids = parpids[:, :eff_pars].reshape(parpids.size(0), K_NUM_TILES, ptr_inc_step)
-
-            parids_start = parids[:,0,:].contiguous()
-            parids_increment = torch.cat(
-                (parids[:,1:,:] - parids[:,:-1,:], parids[:,0:1,:] * 0),
-                dim = 1
-            ).contiguous()
-
-            parpids_start = parpids[:,0,:].contiguous()
-            parpids_increment = torch.cat(
-                (parpids[:,1:,:] - parpids[:,:-1,:], parpids[:,0:1,:] * 0),
-                dim = 1
-            ).contiguous()
-
-            self._cached_bk_parids[signature] = [parids_start, parids_increment, parpids_start, parpids_increment, ptr_inc_step]
-
+        parids_start, parids_increment, parpids_start, parpids_increment, ptr_inc_step = _parent_tables(TILE_SIZE_K)
+        K_NUM_TILES = parids_increment.size(1)   # the (possibly trimmed) tile count
+        if signature not in self._cached_bk_ele_cuda:
             # Pre-compute the CUDA fast-path operands: per-tile first parent-node index (`ebase`) and
             # first param offset (`pbase`) = cumsum-reconstruction of the parids / parpids starts +
             # increments. The kernel reads node_*[ebase + e] and mp[pbase + m*BLOCK_SIZE_K + e] over
@@ -1529,9 +1563,6 @@ class SumLayer(Layer, nn.Module):
             ele_pbase = _cumbase(parpids_start, parpids_increment)
             ele_cuda_ok = (ptr_inc_step == 1)
             self._cached_bk_ele_cuda[signature] = [ele_ebase, ele_pbase, ele_cuda_ok]
-        else:
-            parids_start, parids_increment, parpids_start, parpids_increment, ptr_inc_step = self._cached_bk_parids[signature]
-            K_NUM_TILES = parids_increment.size(1)   # recover the (possibly trimmed) tile count
 
         # Keep `num_edges` consistent with the (possibly trimmed) tile count: the small-batch CUDA ele
         # backward iterates `edge in [0, num_edges)` off the per-block first child, so it must not run
@@ -1545,10 +1576,12 @@ class SumLayer(Layer, nn.Module):
 
         # Bit-exact tuning: a larger TILE_SIZE_M (element-output tiling only -> identical results)
         # improves throughput in the LL block-sparse-dot regime. See BACKWARD_ELE_FLOW_TUNED.
-        if BACKWARD_ELE_FLOW_TUNED and propagation_alg_id == 0 and abs(eflow_temperature - 1.0) < 1e-6 \
-                and TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and BLOCK_B >= 16 \
-                and 2 * TILE_SIZE_M <= cs_block_size:
-            TILE_SIZE_M = 2 * TILE_SIZE_M
+        def _doubled_m(tm, tk, bb):
+            if BACKWARD_ELE_FLOW_TUNED and propagation_alg_id == 0 and abs(eflow_temperature - 1.0) < 1e-6 \
+                    and tm >= 16 and tk >= 16 and bb >= 16 and 2 * tm <= cs_block_size:
+                return 2 * tm
+            return tm
+        TILE_SIZE_M = _doubled_m(TILE_SIZE_M, TILE_SIZE_K, BLOCK_B)
 
         if TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and BLOCK_B >= 16 and not force_use_fp32:
             TL_DOT = 1
@@ -1577,7 +1610,8 @@ class SumLayer(Layer, nn.Module):
                          propagation_alg_id = propagation_alg_id, **propagation_alg_kwargs)
 
         def _launch_ele(cfg, out):
-            tm, bb = cfg
+            tk, tm, bb = cfg
+            ps, pi, pps, ppi, step = _parent_tables(tk)
             g = (triton.cdiv(batch_size, bb), triton.cdiv(layer_n_nodes, tm))
             for pid_m_start in range(0, g[1], 32768):
                 curr_grid = (g[0], min(pid_m_start + 32768, g[1]) - pid_m_start)
@@ -1587,17 +1621,17 @@ class SumLayer(Layer, nn.Module):
                     element_mars = element_mars,
                     mparams = params,
                     chids = chids,
-                    parids_start = parids_start,
-                    parids_increment = parids_increment,
-                    parpids_start = parpids_start,
-                    parpids_increment = parpids_increment,
+                    parids_start = ps,
+                    parids_increment = pi,
+                    parpids_start = pps,
+                    parpids_increment = ppi,
                     local_ids = local_ids,
                     batch_size = batch_size,
                     partial_eval = partial_eval,
-                    ptr_inc_step = ptr_inc_step,
+                    ptr_inc_step = step,
                     BLOCK_B = bb,
-                    TILE_SIZE_K = TILE_SIZE_K,
-                    K_NUM_TILES = K_NUM_TILES,
+                    TILE_SIZE_K = tk,
+                    K_NUM_TILES = pi.size(1),
                     TILE_SIZE_M = tm,
                     BLOCK_SIZE_M = BLOCK_SIZE_M,
                     BLOCK_SIZE_K = BLOCK_SIZE_K,
@@ -1609,19 +1643,27 @@ class SumLayer(Layer, nn.Module):
                 )
 
         # `TILE_SIZE_M` tiles the child-node outputs and `BLOCK_B` the batch; the parent reduction
-        # (and its stabilizer) runs over `TILE_SIZE_K`, which is left untouched -- so the candidates
-        # only trade per-tile work against program count. That is precisely the question
-        # `BACKWARD_ELE_FLOW_TUNED` (double the node tile) and `_SMALL_BATCH_ELE_TILE_M` answer with
-        # a constant above; here it is measured instead -- but only once the CUDA fast paths below
-        # have declined this layer (see `_tuned_ele_cfg`), for the reason spelled out in the
-        # forward: measuring here would perturb the neighbouring {CUDA, Triton} tie.
-        ele_cfgs = [(TILE_SIZE_M, BLOCK_B)]
+        # (and its stabilizer) runs over `TILE_SIZE_K` -- so these candidates only trade per-tile work
+        # against program count. That is precisely the question `BACKWARD_ELE_FLOW_TUNED` (double the
+        # node tile) and `_SMALL_BATCH_ELE_TILE_M` answer with a constant above; here it is measured
+        # instead -- but only once the CUDA fast paths below have declined this layer (see
+        # `_tuned_ele_cfg`), for the reason spelled out in the forward: measuring here would perturb the
+        # neighbouring {CUDA, Triton} tie. A config is `(TILE_SIZE_K, TILE_SIZE_M, BLOCK_B)`.
+        ele_cfgs = [(TILE_SIZE_K, TILE_SIZE_M, BLOCK_B)]
         for tm in (TILE_SIZE_M // 2, TILE_SIZE_M * 2):
-            if ele_floor <= tm <= cs_block_size and (tm, BLOCK_B) not in ele_cfgs:
-                ele_cfgs.append((tm, BLOCK_B))
+            if ele_floor <= tm <= cs_block_size and (TILE_SIZE_K, tm, BLOCK_B) not in ele_cfgs:
+                ele_cfgs.append((TILE_SIZE_K, tm, BLOCK_B))
         for bb in (BLOCK_B // 2, BLOCK_B * 2):
-            if ele_floor <= bb <= BATCH_SIZE_NP2 and (TILE_SIZE_M, bb) not in ele_cfgs:
-                ele_cfgs.append((TILE_SIZE_M, bb))
+            if ele_floor <= bb <= BATCH_SIZE_NP2 and (TILE_SIZE_K, TILE_SIZE_M, bb) not in ele_cfgs:
+                ele_cfgs.append((TILE_SIZE_K, TILE_SIZE_M, bb))
+        # The other tile family (see `alt_family` above). Its edge tile differs, so its reduction is
+        # grouped differently and agrees with the reference to rounding (~1e-7), like any tuned choice
+        # here; it must also keep the kernel and the `TL_DOT` decided above.
+        if alt_family is not None:
+            tk, tm, bb = alt_family
+            tm = _doubled_m(tm, tk, bb)
+            if min(tk, tm, bb) >= (16 if TL_DOT else ele_floor) and tm <= cs_block_size:
+                ele_cfgs.append((tk, tm, bb))
 
         ele_key = (ele_kernel, self.block_size, cs_block_size, TILE_SIZE_K, K_NUM_TILES,
                    ptr_inc_step, batch_size, num_nblocks, partial_eval, TL_DOT, accumulate_ch_flows,
