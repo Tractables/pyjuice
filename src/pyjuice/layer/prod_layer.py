@@ -17,6 +17,7 @@ _SMALL_BATCH_PROD_TILE_M = int(os.environ.get("PYJUICE_SB_PROD_TM", 8))
 
 from pyjuice.nodes import ProdNodes
 from pyjuice.utils.parameter_list import FastParamList
+from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 from .kernels import prod as kernels
 from .kernels import autotune
 from .layer import Layer
@@ -295,7 +296,7 @@ class ProdLayer(Layer, nn.Module):
                 batch_size = batch_size, 
                 BLOCK_N = BLOCK_N, 
                 BLOCK_B = BLOCK_B, 
-                N_NUM_BLKS = triton.cdiv(num_edges, BLOCK_N), 
+                N_NUM_BLKS = host_cdiv(num_edges, BLOCK_N), 
                 block_size = block_size, 
                 accum = accum, 
                 partial_eval = partial_eval,
@@ -306,7 +307,7 @@ class ProdLayer(Layer, nn.Module):
 
         if not triton.__version__ == "2.0.0":
 
-            BLOCK_B = min(2048 // num_edges, triton.next_power_of_2(batch_size))
+            BLOCK_B = min(2048 // num_edges, host_next_power_of_2(batch_size))
             BLOCK_M = min(max(2048 // (BLOCK_B * num_edges), 1), self.block_size)
 
             # Small/gap-batch: cap BLOCK_M so the node dimension fans out across many programs (one
@@ -318,7 +319,7 @@ class ProdLayer(Layer, nn.Module):
 
             def _launch_2d(cfg, out):
                 bm, bb = cfg
-                grid = (triton.cdiv(n_nblocks * self.block_size, bm), triton.cdiv(batch_size, bb))
+                grid = (host_cdiv(n_nblocks * self.block_size, bm), host_cdiv(batch_size, bb))
                 kernels._forward_backward_kernel_2d[grid](
                     node_vals_ptr = out,
                     element_vals_ptr = element_vals,
@@ -350,7 +351,7 @@ class ProdLayer(Layer, nn.Module):
                 bm = min(bm, self.block_size)
                 if (bm, BLOCK_B) not in cfgs:
                     cfgs.append((bm, BLOCK_B))
-            wide_BLOCK_B = min(BLOCK_B * 2, triton.next_power_of_2(batch_size))
+            wide_BLOCK_B = min(BLOCK_B * 2, host_next_power_of_2(batch_size))
             if (BLOCK_M, wide_BLOCK_B) not in cfgs:
                 cfgs.append((BLOCK_M, wide_BLOCK_B))
 
@@ -378,10 +379,10 @@ class ProdLayer(Layer, nn.Module):
 
         else:
 
-            BLOCK_B = min(1024 // num_edges, triton.next_power_of_2(batch_size))
-            BLOCK_M = min(max(1024 // (BLOCK_B * num_edges), 1), triton.next_power_of_2(n_nblocks) * self.block_size)
+            BLOCK_B = min(1024 // num_edges, host_next_power_of_2(batch_size))
+            BLOCK_M = min(max(1024 // (BLOCK_B * num_edges), 1), host_next_power_of_2(n_nblocks) * self.block_size)
 
-            grid = (triton.cdiv(n_nblocks * self.block_size, BLOCK_M), triton.cdiv(batch_size, BLOCK_B))
+            grid = (host_cdiv(n_nblocks * self.block_size, BLOCK_M), host_cdiv(batch_size, BLOCK_B))
 
             kernels._forward_backward_kernel_3d[grid](
                 node_vals_ptr = node_vals, 

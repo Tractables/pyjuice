@@ -18,6 +18,7 @@ from typing import Sequence, List, Tuple, Optional
 from pyjuice.nodes import SumNodes
 from pyjuice.utils import BitSet
 from pyjuice.utils.parameter_list import FastParamList
+from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 from .kernels import sum_forward_block_sparse as fw_bsparse
 from .kernels import sum_forward_sparse as fw_sparse
 from .kernels import sum_backward_node_flows as bk_nflows
@@ -693,7 +694,7 @@ class SumLayer(Layer, nn.Module):
         layer_n_nodes = num_nblocks * self.block_size
         num_edges = cids.size(1)
         batch_size = node_mars.size(1)
-        BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
+        BATCH_SIZE_NP2 = host_next_power_of_2(batch_size)
 
         # Propagation algorithm
         propagation_alg_id = self.propagation_alg_mapping[propagation_alg]
@@ -756,7 +757,7 @@ class SumLayer(Layer, nn.Module):
             if _BLOCK_SPARSE_EDGE_TRIM:
                 real_max = int((cids != 0).any(dim = 0).sum())
                 if real_max > 0:
-                    K_NUM_TILES = min(K_NUM_TILES, triton.cdiv(real_max, TILE_SIZE_K))
+                    K_NUM_TILES = min(K_NUM_TILES, host_cdiv(real_max, TILE_SIZE_K))
             eff_num_edges = K_NUM_TILES * TILE_SIZE_K
 
             cids = cids[:, :eff_num_edges].clone().reshape(cids.size(0), K_NUM_TILES, TILE_SIZE_K)
@@ -823,7 +824,7 @@ class SumLayer(Layer, nn.Module):
 
         def _launch_fw(cfg):
             tm, bb = cfg
-            g = (triton.cdiv(batch_size, bb), triton.cdiv(layer_n_nodes, tm))
+            g = (host_cdiv(batch_size, bb), host_cdiv(layer_n_nodes, tm))
             for pid_m_start in range(0, g[1], 32768):
                 curr_grid = (g[0], min(pid_m_start + 32768, g[1]) - pid_m_start)
                 fw_kernel[curr_grid](
@@ -1010,7 +1011,7 @@ class SumLayer(Layer, nn.Module):
         layer_n_nodes = num_nblocks * self.block_size
         num_edges = cids.size(1)
         batch_size = node_mars.size(1)
-        BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
+        BATCH_SIZE_NP2 = host_next_power_of_2(batch_size)
 
         # Propagation algorithm
         propagation_alg_id = self.propagation_alg_mapping[propagation_alg]
@@ -1028,13 +1029,13 @@ class SumLayer(Layer, nn.Module):
                 "node_mars_tempered": kwargs["node_mars_tempered"]
             }
 
-        if triton.cdiv(layer_n_nodes, self.block_size) <= 2048:
+        if host_cdiv(layer_n_nodes, self.block_size) <= 2048:
             BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
 
             partial_eval = 1 if local_ids is not None else 0
             BLOCK_SIZE_M = self.block_size
 
-            grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, BLOCK_SIZE_M))
+            grid = (host_cdiv(batch_size, BLOCK_B), host_cdiv(layer_n_nodes, BLOCK_SIZE_M))
 
             fw_sparse._fw_triton_sparse_kernel[grid](
                 node_mars = node_mars, 
@@ -1057,12 +1058,12 @@ class SumLayer(Layer, nn.Module):
 
         else:
             BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
-            TILE_SIZE_M = max(min(4096 // num_edges // BLOCK_B, triton.next_power_of_2(layer_n_nodes)), 1)
+            TILE_SIZE_M = max(min(4096 // num_edges // BLOCK_B, host_next_power_of_2(layer_n_nodes)), 1)
 
             partial_eval = 1 if local_ids is not None else 0
             BLOCK_SIZE_M = self.block_size
 
-            grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
+            grid = (host_cdiv(batch_size, BLOCK_B), host_cdiv(layer_n_nodes, TILE_SIZE_M))
 
             if grid[1] <= 32768:
                 fw_sparse._fw_triton_large_sparse_kernel[grid](
@@ -1286,13 +1287,13 @@ class SumLayer(Layer, nn.Module):
         num_nblocks = nids.size(0) if local_ids is None else local_ids.size(0)
         layer_n_nodes = num_nblocks * self.block_size
         batch_size = node_mars.size(1)
-        BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
+        BATCH_SIZE_NP2 = host_next_power_of_2(batch_size)
 
         # Propagation algorithm
         propagation_alg_id = self.propagation_alg_mapping[propagation_alg]
         propagation_alg_kwargs = self._get_propagation_alg_kwargs(propagation_alg, **kwargs)
 
-        if triton.cdiv(layer_n_nodes, self.block_size) <= 4096:
+        if host_cdiv(layer_n_nodes, self.block_size) <= 4096:
 
             if BATCH_SIZE_NP2 >= 64 and self.block_size >= 64:
                 BLOCK_B = min(2048 // 64, BATCH_SIZE_NP2)
@@ -1304,7 +1305,7 @@ class SumLayer(Layer, nn.Module):
             partial_eval = 1 if local_ids is not None else 0
             BLOCK_SIZE_M = self.block_size
 
-            grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, BLOCK_M))
+            grid = (host_cdiv(batch_size, BLOCK_B), host_cdiv(layer_n_nodes, BLOCK_M))
 
             bk_nflows._bk_triton_modify_flow_kernel[grid](
                 node_flows = node_flows, 
@@ -1323,12 +1324,12 @@ class SumLayer(Layer, nn.Module):
         else:
 
             BLOCK_B = min(2048, BATCH_SIZE_NP2)
-            TILE_SIZE_M = min(4096 // BLOCK_B, triton.next_power_of_2(layer_n_nodes))
+            TILE_SIZE_M = min(4096 // BLOCK_B, host_next_power_of_2(layer_n_nodes))
 
             partial_eval = 1 if local_ids is not None else 0
             BLOCK_SIZE_M = self.block_size
 
-            grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
+            grid = (host_cdiv(batch_size, BLOCK_B), host_cdiv(layer_n_nodes, TILE_SIZE_M))
 
             for pid_m_start in range(0, grid[1], 32768):
                 pid_m_end = min(pid_m_start + 32768, grid[1])
@@ -1451,7 +1452,7 @@ class SumLayer(Layer, nn.Module):
         if _BLOCK_SPARSE_EDGE_TRIM:
             real_max = int((parids != 0).any(dim = 0).sum())
             if real_max > 0:
-                K_NUM_TILES = min(K_NUM_TILES, triton.cdiv(real_max * self.block_size, TILE_SIZE_K))
+                K_NUM_TILES = min(K_NUM_TILES, host_cdiv(real_max * self.block_size, TILE_SIZE_K))
         eff_pars = (K_NUM_TILES * TILE_SIZE_K) // self.block_size
 
         if TILE_SIZE_K < self.block_size:
@@ -1500,7 +1501,7 @@ class SumLayer(Layer, nn.Module):
         layer_n_nodes = num_nblocks * cs_block_size
         num_edges = parids.size(1) * self.block_size
         batch_size = node_flows.size(1)
-        BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
+        BATCH_SIZE_NP2 = host_next_power_of_2(batch_size)
 
         # Propagation algorithm
         propagation_alg_id = self.propagation_alg_mapping[propagation_alg]
@@ -1588,7 +1589,7 @@ class SumLayer(Layer, nn.Module):
         else:
             TL_DOT = 0
 
-        grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
+        grid = (host_cdiv(batch_size, BLOCK_B), host_cdiv(layer_n_nodes, TILE_SIZE_M))
 
         # As in the forward, which of the four element-flow kernels runs (tempered or not, dot or
         # csmm2) is decided ONCE from the heuristic config -- they differ numerically -- so the
@@ -1612,7 +1613,7 @@ class SumLayer(Layer, nn.Module):
         def _launch_ele(cfg, out):
             tk, tm, bb = cfg
             ps, pi, pps, ppi, step = _parent_tables(tk)
-            g = (triton.cdiv(batch_size, bb), triton.cdiv(layer_n_nodes, tm))
+            g = (host_cdiv(batch_size, bb), host_cdiv(layer_n_nodes, tm))
             for pid_m_start in range(0, g[1], 32768):
                 curr_grid = (g[0], min(pid_m_start + 32768, g[1]) - pid_m_start)
                 ele_kernel[curr_grid](
@@ -1873,7 +1874,7 @@ class SumLayer(Layer, nn.Module):
         layer_n_nodes = num_nblocks * self.block_size
         num_edges = cids.size(1)
         batch_size = node_mars.size(1)
-        BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
+        BATCH_SIZE_NP2 = host_next_power_of_2(batch_size)
 
         # Propagation algorithm
         propagation_alg_id = self.propagation_alg_mapping[propagation_alg]
@@ -1910,7 +1911,7 @@ class SumLayer(Layer, nn.Module):
         # forces `log_n_fdm = -inf`, hence `n_fdm_sub = 0` and `scaled_emars = 0`, an exact zero
         # contribution. Reading `0.0` there instead makes a padded lane contribute `1 * exp(0)` to the
         # dot -- measured as a 21x OVER-count, so the two changes have to travel together.
-        B_NUM_TILES = triton.cdiv(batch_size, TILE_SIZE_B)
+        B_NUM_TILES = host_cdiv(batch_size, TILE_SIZE_B)
 
         allow_modify_flows = 1 if allow_modify_flows else 0
 
@@ -1972,7 +1973,7 @@ class SumLayer(Layer, nn.Module):
             trimmed = self._cached_bk_par_trim.get(tkey)
             if trimmed is None:
                 real_max = int((raw_cids != 0).any(dim = 0).sum())
-                eff = triton.cdiv(real_max, tk) * tk
+                eff = host_cdiv(real_max, tk) * tk
                 if 0 < eff < raw_num_edges:
                     trimmed = (eff, raw_cids[:, :eff].contiguous(), raw_pids[:, :eff].contiguous(),
                                raw_pfids[:, :eff].contiguous())
@@ -1983,7 +1984,7 @@ class SumLayer(Layer, nn.Module):
 
         num_edges, cids, pids, pfids = _par_edges(TILE_SIZE_K)
 
-        grid = (triton.cdiv(num_edges, TILE_SIZE_K), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
+        grid = (host_cdiv(num_edges, TILE_SIZE_K), host_cdiv(layer_n_nodes, TILE_SIZE_M))
 
         # As in the forward / element-flow backward, which of the four parameter-flow kernels runs
         # (tempered or not, dot or csmm2) is decided ONCE from the heuristic config so the autotuned
@@ -2014,7 +2015,7 @@ class SumLayer(Layer, nn.Module):
         def _launch_par(cfg, out):
             tk, warps = cfg
             ne, cs, ps, fs = _par_edges(tk)
-            g = (triton.cdiv(ne, tk), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
+            g = (host_cdiv(ne, tk), host_cdiv(layer_n_nodes, TILE_SIZE_M))
             for pid_m_start in range(0, g[1], 32768):
                 curr_grid = (g[0], min(pid_m_start + 32768, g[1]) - pid_m_start)
                 par_kernel[curr_grid](
@@ -2273,7 +2274,7 @@ class SumLayer(Layer, nn.Module):
         n_edge_blocks = parids.size(1)
         num_edges = n_edge_blocks * self.block_size
         batch_size = node_flows.size(1)
-        BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
+        BATCH_SIZE_NP2 = host_next_power_of_2(batch_size)
 
         # Propagation algorithm
         propagation_alg_id = self.propagation_alg_mapping[propagation_alg]
@@ -2281,14 +2282,14 @@ class SumLayer(Layer, nn.Module):
 
         assert num_edges <= 16384, "The sparse backward kernel only support nodes with # edges smaller than 16384."
 
-        if triton.cdiv(layer_n_nodes, cs_block_size) <= 32768:
+        if host_cdiv(layer_n_nodes, cs_block_size) <= 32768:
 
             BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
             BLOCK_M = cs_block_size
 
             allow_modify_flows = 1 if allow_modify_flows else 0
 
-            grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, BLOCK_M))
+            grid = (host_cdiv(batch_size, BLOCK_B), host_cdiv(layer_n_nodes, BLOCK_M))
 
             if abs(eflow_temperature - 1.0) < 1e-6:
 
@@ -2314,14 +2315,14 @@ class SumLayer(Layer, nn.Module):
                 # `cs_block_size % ele_BLOCK_M == 0` is preserved so `TILES_PER_BLOCK` stays exact.
                 target = 4 * _sm_count(node_flows.device)
                 while ele_BLOCK_M > 1 and \
-                        triton.cdiv(batch_size, BLOCK_B) * triton.cdiv(layer_n_nodes, ele_BLOCK_M) < target:
+                        host_cdiv(batch_size, BLOCK_B) * host_cdiv(layer_n_nodes, ele_BLOCK_M) < target:
                     nxt = ele_BLOCK_M // 2
                     if cs_block_size % nxt != 0:
                         break
                     ele_BLOCK_M = nxt
 
                 TILES_PER_BLOCK = cs_block_size // ele_BLOCK_M
-                ele_grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, ele_BLOCK_M))
+                ele_grid = (host_cdiv(batch_size, BLOCK_B), host_cdiv(layer_n_nodes, ele_BLOCK_M))
 
                 bk_ele_sparse._bk_triton_sparse_ele_kernel[ele_grid](
                     node_flows = node_flows,
@@ -2372,11 +2373,11 @@ class SumLayer(Layer, nn.Module):
         else:
 
             BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
-            TILE_SIZE_M = max(min(4096 // num_edges // BLOCK_B, triton.next_power_of_2(layer_n_nodes)), 1)
+            TILE_SIZE_M = max(min(4096 // num_edges // BLOCK_B, host_next_power_of_2(layer_n_nodes)), 1)
 
             allow_modify_flows = 1 if allow_modify_flows else 0
 
-            grid = (triton.cdiv(batch_size, BLOCK_B), triton.cdiv(layer_n_nodes, TILE_SIZE_M))
+            grid = (host_cdiv(batch_size, BLOCK_B), host_cdiv(layer_n_nodes, TILE_SIZE_M))
 
             if abs(eflow_temperature - 1.0) < 1e-6:
 
@@ -2524,7 +2525,7 @@ class SumLayer(Layer, nn.Module):
         layer_n_nodes = num_nblocks * self.block_size
         num_edges = cids.size(1)
         batch_size = node_mars.size(1)
-        BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
+        BATCH_SIZE_NP2 = host_next_power_of_2(batch_size)
 
         # Propagation algorithm
         propagation_alg_id = self.propagation_alg_mapping[propagation_alg]
@@ -2538,8 +2539,8 @@ class SumLayer(Layer, nn.Module):
             BLOCK_B = min(512, BATCH_SIZE_NP2)
             BLOCK_K = min(2048 // BLOCK_B, num_edges)
             BLOCK_M = self.block_size # The kernel recovers the node block via `pid_m // BLOCK_M`, so this must equal `block_size`
-        B_NUM_BLOCKS = triton.cdiv(batch_size, BLOCK_B)
-        K_NUM_BLOCKS = triton.cdiv(num_edges, BLOCK_K)
+        B_NUM_BLOCKS = host_cdiv(batch_size, BLOCK_B)
+        K_NUM_BLOCKS = host_cdiv(num_edges, BLOCK_K)
 
         # When a thread-block is allocated for too much work, the overhead 
         # outweigh that incurred by `atomic_add`. Add more thread-blocks 
@@ -2549,7 +2550,7 @@ class SumLayer(Layer, nn.Module):
             B_NUM_BLOCKS = 4
         else:
             TILE_SIZE_B = BATCH_SIZE_NP2
-        B_NUM_TILES = triton.cdiv(batch_size, TILE_SIZE_B)
+        B_NUM_TILES = host_cdiv(batch_size, TILE_SIZE_B)
 
         allow_modify_flows = 1 if allow_modify_flows else 0
 
