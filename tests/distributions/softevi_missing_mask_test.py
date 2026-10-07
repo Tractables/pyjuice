@@ -282,8 +282,10 @@ def test_timed_dense_choice_benchmarks_into_scratch(dual_flow):
 
 
 def _record_dense_timings(mp):
-    """Collect every time the dense-vs-scattered tuner measures for a candidate (None: it raised).
-    Timings of other tuners nested inside a candidate's run are left out."""
+    """Collect, for every candidate the dense-vs-scattered tuner measures, its first timing (None: it
+    raised). `autotune.best_of` times each candidate once (`warmup = reps = 1`) and then measures the ones
+    it keeps in full, so that first call is the one per candidate. Timings of other tuners nested inside
+    a candidate's run are left out."""
     from pyjuice.layer.kernels import autotune
 
     times, depth, active = [], [0], [False]
@@ -295,7 +297,7 @@ def _record_dense_timings(mp):
             t = real_time(run, warmup, reps)
         finally:
             depth[0] -= 1
-        if active[0] and depth[0] == 0:
+        if active[0] and depth[0] == 0 and (warmup, reps) == (1, 1):
             times.append(t)
         return t
 
