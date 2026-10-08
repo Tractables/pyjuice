@@ -2,7 +2,7 @@
 Tokenizer-dependent helpers for building constraints over text.
 
 These read a Hugging Face tokenizer once and produce per-token tables; the automata themselves (in
-:mod:`pyjuice.constraints.dfa`) only ever see token ids.
+:mod:`pyjuice.constraints.language.dfa`) only ever see token ids.
 """
 
 from typing import Iterable, Optional

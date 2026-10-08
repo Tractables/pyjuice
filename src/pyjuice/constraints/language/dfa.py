@@ -13,7 +13,7 @@ merges identical columns of ``delta``), so the representation is as small as the
 keyword DFA has one class per keyword token plus "everything else". The DFA is complete: every
 ``(q, c)`` has a successor, with rejection represented by an explicit dead state.
 
-The DFA has every optional capability of :class:`~pyjuice.constraints.base.Constraint`: an exact
+The DFA has every optional capability of :class:`~pyjuice.constraints.language.base.Constraint`: an exact
 :class:`DFAMatcher`, ``wmc`` and ``sample`` under factorised weights (a forward pass over positions),
 and ``automaton`` (itself).
 
@@ -397,7 +397,7 @@ class DFA(Constraint):
     def word_count(cls, lo: int, hi: int, token_kind) -> "DFA":
         """
         Sequences containing between ``lo`` and ``hi`` words (inclusive), where word boundaries are
-        read off a per-token kind (see :func:`pyjuice.constraints.text.word_token_kinds`)::
+        read off a per-token kind (see :func:`pyjuice.constraints.language.text.word_token_kinds`)::
 
             token_kind[v] = 2 * (v starts with a separator) + (v contains a letter or digit)
 

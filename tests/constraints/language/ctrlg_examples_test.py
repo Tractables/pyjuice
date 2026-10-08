@@ -17,7 +17,7 @@ import pytest
 import torch
 
 from pyjuice.constraints import DFA, And, Concat
-from pyjuice.constraints.text import DEFAULT_SEPARATORS, word_token_kinds_from_strings
+from pyjuice.constraints.language.text import DEFAULT_SEPARATORS, word_token_kinds_from_strings
 
 VOCAB = ["<|endoftext|>", " a", " boy", " girl", " girls", " boys", " children", " is", " are", " riding",
          " ride", " rides", " bike", " bikes", " biking", " in", " the", " park", " beach", " dog", " dogs",
