@@ -394,6 +394,37 @@ class DFA(Constraint):
         return cls(vocab_size, token_class, delta, 0, accept).minimize()
 
     @classmethod
+    def word_count(cls, lo: int, hi: int, token_kind) -> "DFA":
+        """
+        Sequences containing between ``lo`` and ``hi`` words (inclusive), where word boundaries are
+        read off a per-token kind (see :func:`pyjuice.constraints.text.word_token_kinds`)::
+
+            token_kind[v] = 2 * (v starts with a separator) + (v contains a letter or digit)
+
+        A word starts at a token with a letter or digit that either begins with a separator or follows
+        a separator. This is the definition of Ctrl-G's ``WordCountBuilder``; the sequence is treated as
+        if preceded by a separator.
+
+        :param token_kind: int tensor of size [vocab_size] with values in {0, 1, 2, 3}
+        """
+        token_kind = torch.as_tensor(token_kind, dtype = torch.long)
+        if not 0 <= lo <= hi:
+            raise ValueError(f"Need 0 <= lo <= hi, got lo={lo}, hi={hi}.")
+        if token_kind.dim() != 1 or token_kind.min() < 0 or token_kind.max() > 3:
+            raise ValueError("`token_kind` must be a 1-D tensor with values in {0, 1, 2, 3}.")
+        # state 2k + s: k words so far, s = 1 if the previous token ended at a separator; 2(hi+1) = too many
+        sink = 2 * (hi + 1)
+        word = lambda k: 2 * (k + 1) if k + 1 <= hi else sink
+        delta = []
+        for k in range(hi + 1):
+            # kinds: 0 = no sep / no word char, 1 = no sep / word char, 2 = sep / no word char, 3 = sep / word char
+            delta.append([2 * k, 2 * k, 2 * k + 1, word(k)])            # s = 0: continue unless a separator
+            delta.append([2 * k + 1, word(k), 2 * k + 1, word(k)])      # s = 1: any word char starts a word
+        delta.append([sink] * 4)
+        accept = [2 * k + s for k in range(lo, hi + 1) for s in (0, 1)]
+        return cls(token_kind.numel(), token_kind, delta, 1, accept).minimize()
+
+    @classmethod
     def from_ctrlg(cls, graph: Mapping, vocab_size: int) -> "DFA":
         """
         From a Ctrl-G DFA graph ``{"edges": [(u, v, token_bitset), ...], "initial_state": ...,
