@@ -303,6 +303,55 @@ def test_small_batch_forward_cuda_matches_triton():
         sl.FORWARD_SUM_CUDA = saved
 
 
+def test_small_batch_forward_cuda_neg_inf_children():
+    """
+    The small-batch CUDA forward's online logsumexp must treat a -inf child as zero mass. Its running
+    max used to start at -inf, so a LEADING run of -inf children made the running sum NaN
+    (-inf - (-inf)) and poisoned the node even when finite children followed -- every node, once ~10%
+    of the children were -inf. Calls the kernel directly with every config, so the test does not depend
+    on the autotuner picking it over Triton.
+    """
+    from pyjuice.layer.kernels import c as cuda_kernels
+
+    if not (torch.cuda.is_available() and cuda_kernels.smallbatch_fw_is_available()):
+        pytest.skip("small-batch CUDA forward kernel unavailable (no nvcc/ninja); Triton fallback used")
+
+    device = torch.device("cuda:0")
+    torch.manual_seed(0)
+    block_size, num_nblocks, num_edges = 128, 2, 96
+    # node block nb: nodes nids[nb] + m, children ebase[nb] + e, params pbase[nb] + e * block_size + m
+    nids = torch.arange(num_nblocks, device = device) * block_size
+    ebase = torch.arange(num_nblocks, device = device) * num_edges
+    pbase = torch.arange(num_nblocks, device = device) * (num_edges * block_size)
+    params = torch.rand(num_nblocks * num_edges * block_size, device = device) + 0.01
+
+    for batch_size in (1, 3, 8, 33):
+        emars = torch.randn(num_nblocks * num_edges, batch_size, device = device) - 2.0
+        emars[torch.rand(emars.shape, device = device) < 0.3] = -float("inf")
+        for nb in range(num_nblocks):                                     # column 0: a leading -inf run, then finite
+            emars[nb * num_edges:nb * num_edges + num_edges // 2, 0] = -float("inf")
+            emars[nb * num_edges + num_edges // 2:(nb + 1) * num_edges, 0] = -1.0
+        if batch_size > 1:
+            emars[:, -1] = -float("inf")                                  # last column: every child -inf
+
+        # fp64 reference: log sum_e params * exp(emars), with -inf children contributing nothing
+        p = params.view(num_nblocks, num_edges, block_size).double()
+        em = emars.view(num_nblocks, num_edges, batch_size).double()
+        mx = em.amax(dim = 1, keepdim = True)
+        mx = torch.where(torch.isfinite(mx), mx, torch.zeros_like(mx))
+        ref = (torch.log(torch.einsum("nem,neb->nmb", p, torch.exp(em - mx))) + mx).reshape(-1, batch_size)
+
+        for cfg in range(len(cuda_kernels.smallbatch_fw_configs())):
+            node_mars = torch.zeros(num_nblocks * block_size, batch_size, device = device)
+            cuda_kernels.smallbatch_forward_sum(node_mars, emars, params, nids, ebase, pbase,
+                                                batch_size, block_size, num_edges, cfg)
+            assert not torch.isnan(node_mars).any(), (batch_size, cfg)
+            assert torch.equal(torch.isneginf(node_mars), torch.isneginf(ref)), (batch_size, cfg)
+            assert torch.isfinite(node_mars[:, 0]).all() and (batch_size == 1 or torch.isneginf(node_mars[:, -1]).all())
+            fin = torch.isfinite(ref)
+            assert (node_mars.double()[fin] - ref[fin]).abs().max() < 1e-5, (batch_size, cfg)
+
+
 def test_small_batch_ele_backward_cuda_matches_triton():
     """
     The optional small-batch (batch < 16) CUDA element-flow backward kernel (block_size >= 128 layers,
