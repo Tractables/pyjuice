@@ -285,16 +285,64 @@ class Constraint(ABC):
 # Composition nodes
 # -------------------------------------------------------------------------------------------------
 #
-# A composition node only advertises a capability once it is implemented for that node. What each
-# can gain, given its children's capabilities:
-#   automaton / relax: And, Or, Concat when every child has it (product / union / concatenation
-#                      automata); Not when its child's automaton is deterministic.
-#   matcher:           And, Or when every child has one (run the children's matchers side by side);
-#                      Concat needs a set of split points; Not needs a deterministic child.
-#   wmc / sample:      via the composite automaton when one exists; a mixed DFA & CFG needs the
-#                      grammar-automaton intersection and is left out until something needs it.
+# A composition node only advertises a capability once it is implemented for that node.
+#   implemented: when every child has an automaton, the node builds its own (product / union /
+#                subset-construction concatenation / complement, see dfa.py), caches it, and gets
+#                every capability from it.
+#   not yet:     a matcher for And / Or over children WITHOUT automata (run the children's matchers side
+#                by side), and wmc / sample for a mixed DFA & CFG (grammar-automaton intersection).
+#
+# The automaton built here is the full reachable one; compile-time construction will explore only the
+# (position, state) pairs reachable within the PC's n variables.
 
-class _Composite(Constraint):
+_ALL_CAPABILITIES = frozenset({"accepts"} | set(OPTIONAL_CAPABILITIES))
+
+
+class _ViaAutomaton:
+    """Capabilities served from a cached automaton built out of the children's automata."""
+
+    _automaton_cache = None
+
+    def _children_with_automata(self) -> bool:
+        raise NotImplementedError()
+
+    def _build_automaton(self, child_automata):
+        raise NotImplementedError()
+
+    def capabilities(self) -> FrozenSet[str]:
+        return _ALL_CAPABILITIES if self._children_with_automata() else frozenset({"accepts"})
+
+    def automaton(self):
+        if not self._children_with_automata():
+            raise NotImplementedError(f"{type(self).__name__} does not support `automaton` "
+                                      f"(some child has no automaton).")
+        if self._automaton_cache is None:
+            self._automaton_cache = self._build_automaton([c.automaton() for c in self._automaton_children()])
+        return self._automaton_cache
+
+    def matcher(self) -> Matcher:
+        if "matcher" not in self.capabilities():
+            raise NotImplementedError(f"{type(self).__name__} does not support `matcher`.")
+        return self.automaton().matcher()
+
+    def wmc(self, log_weights: torch.Tensor) -> torch.Tensor:
+        if "wmc" not in self.capabilities():
+            raise NotImplementedError(f"{type(self).__name__} does not support `wmc`.")
+        return self.automaton().wmc(log_weights)
+
+    def sample(self, log_weights: torch.Tensor, num_samples: int,
+               generator: Optional[torch.Generator] = None) -> torch.Tensor:
+        if "sample" not in self.capabilities():
+            raise NotImplementedError(f"{type(self).__name__} does not support `sample`.")
+        return self.automaton().sample(log_weights, num_samples, generator = generator)
+
+    def relax(self, budget: Optional[int] = None) -> Constraint:
+        if "relax" not in self.capabilities():
+            raise NotImplementedError(f"{type(self).__name__} does not support `relax`.")
+        return self
+
+
+class _Composite(_ViaAutomaton, Constraint):
     """Shared plumbing for composition nodes: vocabulary check, flattening, capabilities."""
 
     #: whether the operation is associative (nested nodes of the same type are flattened)
@@ -325,10 +373,11 @@ class _Composite(Constraint):
     def children(self) -> Tuple[Constraint, ...]:
         return self._children
 
-    def capabilities(self) -> FrozenSet[str]:
-        # Membership composes for every node; the rest is added as each composition is implemented
-        # (see the table above).
-        return frozenset({"accepts"})
+    def _automaton_children(self):
+        return self._children
+
+    def _children_with_automata(self) -> bool:
+        return all("automaton" in c.capabilities() for c in self._children)
 
     def _fingerprint_payload(self):
         fps = [c.fingerprint() for c in self._children]
@@ -349,6 +398,9 @@ class And(_Composite):
         toks = self._check_tokens(tokens)
         return all(c.accepts(toks) for c in self._children)
 
+    def _build_automaton(self, child_automata):
+        from .dfa import product
+        return product(child_automata, "and")
 
 
 class Or(_Composite):
@@ -360,6 +412,9 @@ class Or(_Composite):
         toks = self._check_tokens(tokens)
         return any(c.accepts(toks) for c in self._children)
 
+    def _build_automaton(self, child_automata):
+        from .dfa import product
+        return product(child_automata, "or")
 
 
 class Concat(_Composite):
@@ -376,11 +431,16 @@ class Concat(_Composite):
         return any(child.accepts(toks[:k]) and self._accepts_from(toks[k:], i + 1)
                    for k in range(len(toks) + 1))
 
+    def _build_automaton(self, child_automata):
+        from .dfa import concatenate
+        return concatenate(child_automata)
 
 
-class Not(Constraint):
+class Not(_ViaAutomaton, Constraint):
     """Complement: sequences not accepted by the child (relative to all sequences over the
-    vocabulary)."""
+    vocabulary). Its automaton flips the child's accepting states, which needs a complete DFA -- what
+    every `automaton()` returns today; an unambiguous non-deterministic automaton would need
+    determinising first."""
 
     def __init__(self, child: Constraint):
         if not isinstance(child, Constraint):
@@ -392,9 +452,15 @@ class Not(Constraint):
     def child(self) -> Constraint:
         return self._child
 
-    def capabilities(self) -> FrozenSet[str]:
-        # see the table above _Composite
-        return frozenset({"accepts"})
+    def _automaton_children(self):
+        return (self._child,)
+
+    def _children_with_automata(self) -> bool:
+        return "automaton" in self._child.capabilities()
+
+    def _build_automaton(self, child_automata):
+        from .dfa import complement
+        return complement(child_automata[0])
 
     def accepts(self, tokens: Tokens) -> bool:
         return not self._child.accepts(self._check_tokens(tokens))

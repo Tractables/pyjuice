@@ -5,3 +5,4 @@ A constraint is a formal language over token ids; see :mod:`pyjuice.constraints.
 """
 
 from .base import Constraint, Matcher, And, Or, Not, Concat, OPTIONAL_CAPABILITIES
+from .dfa import DFA, DFAMatcher

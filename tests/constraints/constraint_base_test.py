@@ -22,7 +22,8 @@ class _Pred(Constraint):
 
 
 class _PredWithWmc(_Pred):
-    """Test-only leaf that also implements `wmc` (by brute force) and claims an automaton."""
+    """Test-only leaf for "contains token 1" that also implements `wmc` (by brute force) and provides
+    its automaton."""
 
     def wmc(self, log_weights):
         B, n, V_ = log_weights.shape
@@ -33,7 +34,8 @@ class _PredWithWmc(_Pred):
         return out
 
     def automaton(self):
-        return "an automaton"
+        from pyjuice.constraints import DFA
+        return DFA.contains([[1]], self.vocab_size)
 
 
 V = 3
@@ -116,11 +118,19 @@ def test_every_claimed_capability_works_and_the_rest_raise():
     assert torch.allclose(rich.wmc(torch.zeros(1, 2, V)), torch.log(torch.tensor([5.0])))
 
 
-def test_composites_claim_only_membership_for_now():
+def test_composites_get_capabilities_from_their_children():
     rich = _PredWithWmc(V, "rich", lambda t: 1 in t)
-    for c in [rich & rich, rich | contains_1, ~rich, rich.concat(rich)]:
-        assert c.capabilities() == {"accepts"}
+    every = {"accepts", "matcher", "wmc", "sample", "automaton", "relax"}
+    # every child has an automaton -> the node builds its own and has every capability
+    for c in [rich & rich, ~rich, rich.concat(rich), (rich | ~rich) & rich]:
+        assert c.capabilities() == every, c
+    # a child without one -> membership only
+    for c in [rich | contains_1, ~contains_1, rich.concat(contains_1)]:
+        assert c.capabilities() == {"accepts"}, c
     assert "capabilities" in (rich & contains_1).info()
+    # the automaton is built once and cached
+    c = rich & ~rich
+    assert c.automaton() is c.automaton()
 
 
 def test_invalid_inputs_raise():
