@@ -28,9 +28,3 @@ Inspection
 .. automethod:: pyjuice.TensorCircuit.get_node_params
 .. automethod:: pyjuice.TensorCircuit.get_node_param_flows
 .. automethod:: pyjuice.TensorCircuit.print_statistics
-
-Partial Evaluation
-------------------
-
-.. automethod:: pyjuice.TensorCircuit.enable_partial_evaluation
-.. automethod:: pyjuice.TensorCircuit.disable_partial_evaluation

@@ -80,11 +80,6 @@
 <li class="toctree-l3"><a class="reference internal" href="#pyjuice.TensorCircuit.print_statistics"><code class="docutils literal notranslate"><span class="pre">TensorCircuit.print_statistics()</span></code></a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="#partial-evaluation">Partial Evaluation</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="#pyjuice.TensorCircuit.enable_partial_evaluation"><code class="docutils literal notranslate"><span class="pre">TensorCircuit.enable_partial_evaluation()</span></code></a></li>
-<li class="toctree-l3"><a class="reference internal" href="#pyjuice.TensorCircuit.disable_partial_evaluation"><code class="docutils literal notranslate"><span class="pre">TensorCircuit.disable_partial_evaluation()</span></code></a></li>
-</ul>
-</li>
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="queries.html">pyjuice.queries</a></li>
@@ -172,8 +167,8 @@ runs with these buffers and options (the call itself runs normally), so later id
 replay it without the per-layer Python. Worth it when the host, not the GPU, bounds a step –
 small batches. Graphs are keyed on everything the inner layers are given (buffers by address,
 every option and keyword argument except the input layers’ per-call evidence, see
-<cite>Distribution.call_kwargs</cite>), at most <cite>max_cuda_graphs</cite> are kept, partial evaluation or <cite>.to()</cite>
-drops them, and a pass that cannot be captured runs eagerly. None (the default): the circuit’s
+<cite>Distribution.call_kwargs</cite>), at most <cite>max_cuda_graphs</cite> are kept, <cite>.to()</cite> drops
+them, and a pass that cannot be captured runs eagerly. None (the default): the circuit’s
 <cite>cuda_graphs</cite> setting, which is off unless it was compiled with it. False: do not record</p></li>
 <li><p><strong>apply_cudagraph</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#bool" title="(in Python v3.14)"><em>bool</em></a>) – replay a graph recorded under exactly this call’s signature, if there is one</p></li>
 </ul>
@@ -340,43 +335,6 @@ an EM caller always wants the default.</p></li>
 <dt class="sig sig-object py" id="pyjuice.TensorCircuit.print_statistics">
 <span class="sig-prename descclassname"><span class="pre">TensorCircuit.</span></span><span class="sig-name descname"><span class="pre">print_statistics</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#pyjuice.TensorCircuit.print_statistics" title="Link to this definition"></a></dt>
 <dd><p>Print the statistics of the PC.</p>
-</dd></dl>
-
-</section>
-<section id="partial-evaluation">
-<h2>Partial Evaluation<a class="headerlink" href="#partial-evaluation" title="Link to this heading"></a></h2>
-<dl class="py method">
-<dt class="sig sig-object py" id="pyjuice.TensorCircuit.enable_partial_evaluation">
-<span class="sig-prename descclassname"><span class="pre">TensorCircuit.</span></span><span class="sig-name descname"><span class="pre">enable_partial_evaluation</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">scopes</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Sequence" title="(in Python v3.14)"><span class="pre">Sequence</span></a><span class="p"><span class="pre">[</span></span><span class="pre">BitSet</span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Sequence" title="(in Python v3.14)"><span class="pre">Sequence</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#int" title="(in Python v3.14)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">forward</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#bool" title="(in Python v3.14)"><span class="pre">bool</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">backward</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#bool" title="(in Python v3.14)"><span class="pre">bool</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">overwrite</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#bool" title="(in Python v3.14)"><span class="pre">bool</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyjuice.TensorCircuit.enable_partial_evaluation" title="Link to this definition"></a></dt>
-<dd><p>Restrict subsequent forward and/or backward passes to only the nodes whose scope is contained
-in <cite>scopes</cite>. This speeds up repeated queries that touch a fixed subset of variables (e.g.,
-evaluating or updating only part of the circuit). Call <a class="reference internal" href="#pyjuice.TensorCircuit.disable_partial_evaluation" title="pyjuice.TensorCircuit.disable_partial_evaluation"><code class="xref py py-func docutils literal notranslate"><span class="pre">disable_partial_evaluation()</span></code></a> to
-revert to evaluating the whole circuit.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>scopes</strong> (<em>Union</em><em>[</em><em>Sequence</em><em>[</em><em>BitSet</em><em>]</em><em>, </em><em>Sequence</em><em>[</em><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#int" title="(in Python v3.14)"><em>int</em></a><em>]</em><em>]</em>) – the scopes to evaluate, given either as a sequence of variable ids or <code class="xref py py-class docutils literal notranslate"><span class="pre">BitSet</span></code> scopes</p></li>
-<li><p><strong>forward</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#bool" title="(in Python v3.14)"><em>bool</em></a>) – whether to enable partial evaluation for the forward pass</p></li>
-<li><p><strong>backward</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#bool" title="(in Python v3.14)"><em>bool</em></a>) – whether to enable partial evaluation for the backward pass</p></li>
-<li><p><strong>overwrite</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#bool" title="(in Python v3.14)"><em>bool</em></a>) – whether to overwrite an already-enabled partial-evaluation configuration</p></li>
-</ul>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py method">
-<dt class="sig sig-object py" id="pyjuice.TensorCircuit.disable_partial_evaluation">
-<span class="sig-prename descclassname"><span class="pre">TensorCircuit.</span></span><span class="sig-name descname"><span class="pre">disable_partial_evaluation</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">forward</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#bool" title="(in Python v3.14)"><span class="pre">bool</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">backward</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#bool" title="(in Python v3.14)"><span class="pre">bool</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyjuice.TensorCircuit.disable_partial_evaluation" title="Link to this definition"></a></dt>
-<dd><p>Disable partial evaluation (see <a class="reference internal" href="#pyjuice.TensorCircuit.enable_partial_evaluation" title="pyjuice.TensorCircuit.enable_partial_evaluation"><code class="xref py py-func docutils literal notranslate"><span class="pre">enable_partial_evaluation()</span></code></a>), so that subsequent passes
-again evaluate the entire circuit.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>forward</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#bool" title="(in Python v3.14)"><em>bool</em></a>) – whether to disable partial evaluation for the forward pass</p></li>
-<li><p><strong>backward</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#bool" title="(in Python v3.14)"><em>bool</em></a>) – whether to disable partial evaluation for the backward pass</p></li>
-</ul>
-</dd>
-</dl>
 </dd></dl>
 
 </section>
