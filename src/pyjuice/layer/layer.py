@@ -20,13 +20,6 @@ class Layer():
     #: see `ExternalSumParams.requests_denom_param_flows`.
     requests_denom_param_flows: bool = False
 
-    #: Node-subset selections the layers' passes still accept. Always None now that partial evaluation is
-    #: gone; they are removed together with the code that reads them. Declared here so that
-    #: `provided()` -- asked on every pass -- finds None rather than going
-    #: through `nn.Module.__getattr__`'s AttributeError: ~0.4 us per check, ~200 checks per step.
-    fw_partition_local_ids = None
-    bk_partition_local_ids = None
-
     def __init__(self, nodes: Sequence[CircuitNodes], disable_block_size_check: bool = False) -> None:
 
         # Nodes correspond to the current layer

@@ -22,9 +22,9 @@ from pyjuice.utils.kernel_launcher import triton_jit
 
 # @triton.jit
 @triton_jit
-def _forward_backward_kernel_3d(node_vals_ptr, element_vals_ptr, local_ids_ptr, nids_ptr, cids_ptr, tot_n_nodes, tot_n_eles, n_nblocks,
+def _forward_backward_kernel_3d(node_vals_ptr, element_vals_ptr, nids_ptr, cids_ptr, tot_n_nodes, tot_n_eles, n_nblocks,
                                 num_edges: tl.constexpr, batch_size, BLOCK_M: tl.constexpr, BLOCK_B: tl.constexpr, 
-                                block_size: tl.constexpr, accum: tl.constexpr, partial_eval: tl.constexpr, prop_logsumexp: tl.constexpr):
+                                block_size: tl.constexpr, accum: tl.constexpr, prop_logsumexp: tl.constexpr):
     """
     This kernel implements the function with 3d tensors. However, it only work with `triton==2.0.0`.
     """
@@ -37,10 +37,6 @@ def _forward_backward_kernel_3d(node_vals_ptr, element_vals_ptr, local_ids_ptr, 
         # Get inferred node block id from `pid_m`
         nblock_id = pid_m // (block_size // BLOCK_M)
         ntile_id = pid_m % (block_size // BLOCK_M)
-
-        # For partial evaluation
-        if partial_eval:
-            nblock_id = tl.load(local_ids_ptr + nblock_id)
 
         # Batch offsets and mask
         offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B 
@@ -100,10 +96,6 @@ def _forward_backward_kernel_3d(node_vals_ptr, element_vals_ptr, local_ids_ptr, 
         # Inferred block ids
         nblock_ids = offs_node // block_size
 
-        # For partial evaluation
-        if partial_eval:
-            nblock_ids = tl.load(local_ids_ptr + nblock_ids, mask = mask_node)
-
         # Batch offsets and mask
         offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B 
         mask_batch = offs_batch < batch_size
@@ -155,9 +147,9 @@ def _forward_backward_kernel_3d(node_vals_ptr, element_vals_ptr, local_ids_ptr, 
 
 # @triton.jit
 @triton_jit
-def _forward_backward_kernel_2d(node_vals_ptr, element_vals_ptr, local_ids_ptr, nids_ptr, cids_ptr, tot_n_nodes, tot_n_eles, n_nblocks,
+def _forward_backward_kernel_2d(node_vals_ptr, element_vals_ptr, nids_ptr, cids_ptr, tot_n_nodes, tot_n_eles, n_nblocks,
                                 num_edges: tl.constexpr, batch_size, BLOCK_M: tl.constexpr, BLOCK_B: tl.constexpr, 
-                                block_size: tl.constexpr, accum: tl.constexpr, partial_eval: tl.constexpr, prop_logsumexp: tl.constexpr):
+                                block_size: tl.constexpr, accum: tl.constexpr, prop_logsumexp: tl.constexpr):
     """
     This kernel implements the function with 2d tensors. It works for all `triton` versions.
     """
@@ -168,10 +160,6 @@ def _forward_backward_kernel_2d(node_vals_ptr, element_vals_ptr, local_ids_ptr, 
     # Get inferred node block id from `pid_m`
     nblock_id = pid_m // (block_size // BLOCK_M)
     ntile_id = pid_m % (block_size // BLOCK_M)
-
-    # For partial evaluation
-    if partial_eval:
-        nblock_id = tl.load(local_ids_ptr + nblock_id)
 
     # Batch offsets and mask
     offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B # [BLOCK_B]
@@ -228,9 +216,9 @@ def _forward_backward_kernel_2d(node_vals_ptr, element_vals_ptr, local_ids_ptr, 
 
 # @triton.jit
 @triton_jit
-def _forward_backward_kernel_large(node_vals_ptr, element_vals_ptr, local_ids_ptr, nids_ptr, cids_ptr, tot_n_nodes, tot_n_eles, n_nblocks,
+def _forward_backward_kernel_large(node_vals_ptr, element_vals_ptr, nids_ptr, cids_ptr, tot_n_nodes, tot_n_eles, n_nblocks,
                                    num_edges: tl.constexpr, batch_size, BLOCK_N: tl.constexpr, BLOCK_B: tl.constexpr, 
-                                   N_NUM_BLKS: tl.constexpr, block_size: tl.constexpr, accum: tl.constexpr, partial_eval: tl.constexpr,
+                                   N_NUM_BLKS: tl.constexpr, block_size: tl.constexpr, accum: tl.constexpr, 
                                    prop_logsumexp: tl.constexpr):
     """
     This kernel implements the function with 2d tensors. It is designed for nodes with many edges.
@@ -242,10 +230,6 @@ def _forward_backward_kernel_large(node_vals_ptr, element_vals_ptr, local_ids_pt
     # Get inferred node block id from `pid_m`
     nblock_id = pid_m // block_size
     ntile_id = pid_m % block_size
-
-    # For partial evaluation
-    if partial_eval:
-        nblock_id = tl.load(local_ids_ptr + nblock_id)
 
     # Batch offsets and mask
     offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B # [BLOCK_B]

@@ -29,8 +29,6 @@ from .compilation import next_power_of_2, get_prod_layer_stats, prod_layer_forwa
 
 class ProdLayer(Layer, nn.Module):
 
-    # As `Layer.fw_partition_local_ids`: None until partial evaluation sets it
-    bk_fw_partition_local_ids = None
 
     def __init__(self, nodes: Sequence[ProdNodes], global_nid_start: Optional[int] = None, 
                  layer_sparsity_tol: Optional[float] = None, max_num_partitions: Optional[int] = None, 
@@ -162,7 +160,7 @@ class ProdLayer(Layer, nn.Module):
         self.partitioned_u_cids = FastParamList([nn.Parameter(tensor, requires_grad = False) for tensor in u_cids])
         self.partitioned_parids = FastParamList([nn.Parameter(tensor, requires_grad = False) for tensor in parids])
 
-    def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor, _for_backward: bool = False, **kwargs) -> None:
+    def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor, **kwargs) -> None:
         """
         Computes the forward pass of a product layer. If `block_size == 1`, it is equivalent to the following:
         ```
@@ -174,37 +172,13 @@ class ProdLayer(Layer, nn.Module):
         `element_mars`: [max_num_els, B]
         """
 
-        if not _for_backward and self.provided("fw_partition_local_ids"):
-            # Partial evaluation (for forward pass)
-            for partition_id in range(self.num_fw_partitions):
-                nids = self.partitioned_nids[partition_id]
-                cids = self.partitioned_cids[partition_id]
-                local_ids = self.fw_partition_local_ids[partition_id]
+        for partition_id in range(self.num_fw_partitions):
+            nids = self.partitioned_nids[partition_id]
+            cids = self.partitioned_cids[partition_id]
 
-                self._forward_backward(
-                    element_mars, node_mars, nids, cids, local_ids = local_ids, accum = False
-                )
-
-        elif _for_backward and self.provided("bk_fw_partition_local_ids"):
-            # Partial evaluation (for backward pass)
-            for partition_id in range(self.num_fw_partitions):
-                nids = self.partitioned_nids[partition_id]
-                cids = self.partitioned_cids[partition_id]
-                local_ids = self.bk_fw_partition_local_ids[partition_id]
-
-                self._forward_backward(
-                    element_mars, node_mars, nids, cids, local_ids = local_ids, accum = False
-                )
-
-        else:
-            # Evaluate the whole layer
-            for partition_id in range(self.num_fw_partitions):
-                nids = self.partitioned_nids[partition_id]
-                cids = self.partitioned_cids[partition_id]
-
-                self._forward_backward(
-                    element_mars, node_mars, nids, cids, accum = False
-                )
+            self._forward_backward(
+                element_mars, node_mars, nids, cids, accum = False
+            )
 
         return None
 
@@ -220,24 +194,12 @@ class ProdLayer(Layer, nn.Module):
         `element_flows`: [max_num_els, B]
         """
         
-        if self.provided("bk_partition_local_ids"):
-            # Partial evaluation
-            for partition_id in range(self.num_bk_partitions):
-                u_cids = self.partitioned_u_cids[partition_id]
-                parids = self.partitioned_parids[partition_id]
-                local_ids = self.bk_partition_local_ids[partition_id]
+        for partition_id in range(self.num_bk_partitions):
+            u_cids = self.partitioned_u_cids[partition_id]
+            parids = self.partitioned_parids[partition_id]
 
-                self._forward_backward(node_flows, element_flows, u_cids, parids, local_ids = local_ids, accum = True,
-                                       prop_logsumexp = logspace_flows)
-        
-        else:
-            # Evaluate the whole layer
-            for partition_id in range(self.num_bk_partitions):
-                u_cids = self.partitioned_u_cids[partition_id]
-                parids = self.partitioned_parids[partition_id]
-
-                self._forward_backward(node_flows, element_flows, u_cids, parids, accum = True,
-                                       prop_logsumexp = logspace_flows)
+            self._forward_backward(node_flows, element_flows, u_cids, parids, accum = True,
+                                   prop_logsumexp = logspace_flows)
         
         return None
 
@@ -248,16 +210,15 @@ class ProdLayer(Layer, nn.Module):
         return f"ProdLayer(nid_range=({self._layer_nid_range[0]}, {self._layer_nid_range[1]}), num_nodes={self.num_nodes}, num_edges={self.num_edges})"
 
     def _forward_backward(self, node_vals: torch.Tensor, element_vals: torch.Tensor,
-                          nids: torch.Tensor, cids: torch.Tensor, local_ids: Optional[torch.Tensor] = None,
+                          nids: torch.Tensor, cids: torch.Tensor,
                           accum: bool = False, prop_logsumexp: bool = False) -> None:
         tot_n_nodes = node_vals.size(0)
         tot_n_eles = element_vals.size(0)
-        n_nblocks = nids.size(0) if local_ids is None else local_ids.size(0)
+        n_nblocks = nids.size(0)
         num_edges = cids.size(1)
         batch_size = node_vals.size(1)
 
         block_size = self.block_size
-        partial_eval = local_ids is not None
 
         assert num_edges & (num_edges - 1) == 0, "`num_edges` must be a power of 2."
 
@@ -272,7 +233,6 @@ class ProdLayer(Layer, nn.Module):
             kernels._forward_backward_kernel_large[grid](
                 node_vals_ptr = node_vals, 
                 element_vals_ptr = element_vals,
-                local_ids_ptr = local_ids,
                 nids_ptr = nids, 
                 cids_ptr = cids, 
                 tot_n_nodes = tot_n_nodes,
@@ -285,7 +245,6 @@ class ProdLayer(Layer, nn.Module):
                 N_NUM_BLKS = host_cdiv(num_edges, BLOCK_N), 
                 block_size = block_size, 
                 accum = accum, 
-                partial_eval = partial_eval,
                 prop_logsumexp = prop_logsumexp
             )
 
@@ -309,7 +268,6 @@ class ProdLayer(Layer, nn.Module):
                 kernels._forward_backward_kernel_2d[grid](
                     node_vals_ptr = out,
                     element_vals_ptr = element_vals,
-                    local_ids_ptr = local_ids,
                     nids_ptr = nids,
                     cids_ptr = cids,
                     tot_n_nodes = tot_n_nodes,
@@ -321,7 +279,6 @@ class ProdLayer(Layer, nn.Module):
                     BLOCK_B = bb,
                     block_size = block_size,
                     accum = accum,
-                    partial_eval = partial_eval,
                     prop_logsumexp = prop_logsumexp
                 )
 
@@ -338,7 +295,7 @@ class ProdLayer(Layer, nn.Module):
             # scratch buffer; without it the kernel just overwrites `node_vals` with the same values
             # it is about to write anyway, so it can be timed in place.
             key = (kernels._forward_backward_kernel_2d, n_nblocks, num_edges, block_size,
-                   batch_size, accum, partial_eval, prop_logsumexp, default_cfg)
+                   batch_size, accum, prop_logsumexp, default_cfg)
             cfg = autotune.cached(key)
             if cfg is None:
                 cfgs = [default_cfg]
@@ -376,7 +333,6 @@ class ProdLayer(Layer, nn.Module):
             kernels._forward_backward_kernel_3d[grid](
                 node_vals_ptr = node_vals, 
                 element_vals_ptr = element_vals,
-                local_ids_ptr = local_ids,
                 nids_ptr = nids, 
                 cids_ptr = cids, 
                 tot_n_nodes = tot_n_nodes,
@@ -388,7 +344,6 @@ class ProdLayer(Layer, nn.Module):
                 BLOCK_B = BLOCK_B,
                 block_size = block_size,
                 accum = accum,
-                partial_eval = partial_eval,
                 prop_logsumexp = prop_logsumexp
             )
 

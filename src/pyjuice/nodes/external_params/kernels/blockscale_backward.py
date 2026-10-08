@@ -2,7 +2,7 @@
 Triton element-flow backward for the per-block multiplicative gate (`BlockScaleSumParams`).
 
 A fork of `pyjuice.layer.kernels.sum_backward_element_block_sparse._bk_triton_block_sparse_ele_kernel`,
-restricted to the regime the gate is defined for (LL, log-space flows, no partial eval, no tempering,
+restricted to the regime the gate is defined for (LL, log-space flows, no tempering,
 `allow_modify_flows` / `allow_neg_flows` / `accumulate_ch_flows` off) and with ONE addition.
 
 WHY THIS EXISTS ALONGSIDE THE CUDA FORKS. The gate has no Triton path at all otherwise, so a shape the

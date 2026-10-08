@@ -25,7 +25,7 @@ from pyjuice.layer.kernels import _round_to_tf32
 @triton_jit
 def _bk_triton_block_sparse_ele_kernel(node_flows, element_flows, node_mars, element_mars, mparams, 
                                        chids, parids_start, parids_increment, parpids_start, parpids_increment, 
-                                       local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr, ptr_inc_step: tl.constexpr, 
+                                       batch_size: tl.constexpr, ptr_inc_step: tl.constexpr, 
                                        allow_modify_flows: tl.constexpr, logspace_flows: tl.constexpr, BLOCK_B: tl.constexpr, 
                                        TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, TILE_SIZE_M: tl.constexpr, 
                                        BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, TL_DOT: tl.constexpr, 
@@ -38,10 +38,6 @@ def _bk_triton_block_sparse_ele_kernel(node_flows, element_flows, node_mars, ele
     # Get inferred node block id from `pid_m`
     eleblock_id = pid_m // (BLOCK_SIZE_M // TILE_SIZE_M)
     tile_id = pid_m % (BLOCK_SIZE_M // TILE_SIZE_M)
-
-    # Get the real node block id in the case of partial evaluation
-    if partial_eval == 1:
-        eleblock_id = tl.load(local_ids + eleblock_id)
 
     # Initialize pointers to `params`
     offs_ele = tl.arange(0, TILE_SIZE_M) + tile_id * TILE_SIZE_M
@@ -196,7 +192,7 @@ def _bk_triton_block_sparse_ele_kernel(node_flows, element_flows, node_mars, ele
 @triton_jit
 def _bk_triton_block_sparse_ele_csmm2_kernel(node_flows, element_flows, node_mars, element_mars, mparams, 
                                              chids, parids_start, parids_increment, parpids_start, parpids_increment, 
-                                             local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr, ptr_inc_step: tl.constexpr, 
+                                             batch_size: tl.constexpr, ptr_inc_step: tl.constexpr, 
                                              allow_modify_flows: tl.constexpr, logspace_flows: tl.constexpr, BLOCK_B: tl.constexpr, 
                                              TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, TILE_SIZE_M: tl.constexpr, 
                                              BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, TL_DOT: tl.constexpr, 
@@ -209,10 +205,6 @@ def _bk_triton_block_sparse_ele_csmm2_kernel(node_flows, element_flows, node_mar
     # Get inferred node block id from `pid_m`
     eleblock_id = pid_m // (BLOCK_SIZE_M // TILE_SIZE_M)
     tile_id = pid_m % (BLOCK_SIZE_M // TILE_SIZE_M)
-
-    # Get the real node block id in the case of partial evaluation
-    if partial_eval == 1:
-        eleblock_id = tl.load(local_ids + eleblock_id)
 
     # Initialize pointers to `params`
     offs_ele = tl.arange(0, TILE_SIZE_M) + tile_id * TILE_SIZE_M
@@ -363,7 +355,7 @@ def _bk_triton_block_sparse_ele_csmm2_kernel(node_flows, element_flows, node_mar
 @triton_jit
 def _bk_triton_block_sparse_tempered_ele_kernel(node_flows, element_flows, node_mars_tempered, element_mars, mparams, 
                                                 chids, parids_start, parids_increment, parpids_start, parpids_increment, 
-                                                local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr, ptr_inc_step: tl.constexpr, 
+                                                batch_size: tl.constexpr, ptr_inc_step: tl.constexpr, 
                                                 BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, TILE_SIZE_M: tl.constexpr, 
                                                 BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, TL_DOT: tl.constexpr, 
                                                 accumulate_ch_flows: tl.constexpr, pid_m_offset = 0, eflow_temperature = 1.0):
@@ -374,10 +366,6 @@ def _bk_triton_block_sparse_tempered_ele_kernel(node_flows, element_flows, node_
     # Get inferred node block id from `pid_m`
     eleblock_id = pid_m // (BLOCK_SIZE_M // TILE_SIZE_M)
     tile_id = pid_m % (BLOCK_SIZE_M // TILE_SIZE_M)
-
-    # Get the real node block id in the case of partial evaluation
-    if partial_eval == 1:
-        eleblock_id = tl.load(local_ids + eleblock_id)
 
     # Initialize pointers to `params`
     offs_ele = tl.arange(0, TILE_SIZE_M) + tile_id * TILE_SIZE_M
@@ -467,7 +455,7 @@ def _bk_triton_block_sparse_tempered_ele_kernel(node_flows, element_flows, node_
 @triton_jit
 def _bk_triton_block_sparse_tempered_ele_csmm2_kernel(node_flows, element_flows, node_mars_tempered, element_mars, mparams, 
                                                       chids, parids_start, parids_increment, parpids_start, parpids_increment, 
-                                                      local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr, ptr_inc_step: tl.constexpr, 
+                                                      batch_size: tl.constexpr, ptr_inc_step: tl.constexpr, 
                                                       BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, TILE_SIZE_M: tl.constexpr, 
                                                       BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, TL_DOT: tl.constexpr, 
                                                       accumulate_ch_flows: tl.constexpr, pid_m_offset = 0, eflow_temperature = 1.0):
@@ -478,10 +466,6 @@ def _bk_triton_block_sparse_tempered_ele_csmm2_kernel(node_flows, element_flows,
     # Get inferred node block id from `pid_m`
     eleblock_id = pid_m // (BLOCK_SIZE_M // TILE_SIZE_M)
     tile_id = pid_m % (BLOCK_SIZE_M // TILE_SIZE_M)
-
-    # Get the real node block id in the case of partial evaluation
-    if partial_eval == 1:
-        eleblock_id = tl.load(local_ids + eleblock_id)
 
     # Initialize pointers to `params`
     offs_ele = tl.arange(0, TILE_SIZE_M) + tile_id * TILE_SIZE_M

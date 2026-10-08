@@ -693,7 +693,7 @@ class TensorCircuit(nn.Module):
                         # Sum layer
 
                         # First recompute the previous product layer
-                        self.inner_layer_groups[layer_id-1].forward(self.node_mars, self.element_mars, _for_backward = True)
+                        self.inner_layer_groups[layer_id-1].forward(self.node_mars, self.element_mars)
 
                         # Execute pre-backward callback
                         layer_group.callback(
@@ -1774,7 +1774,7 @@ class TensorCircuit(nn.Module):
                     break
 
             # Rerun the corresponding product layer to get the node values
-            self.inner_layer_groups[layer_id].forward(self.node_mars, self.element_mars, _for_backward = True)
+            self.inner_layer_groups[layer_id].forward(self.node_mars, self.element_mars)
             self.inner_layer_groups[layer_id+1].backward(
                 self.node_flows, self.element_flows, self.node_mars, self.element_mars, self.params, 
                 param_flows = None, allow_modify_flows = self._run_params["allow_modify_flows"], 

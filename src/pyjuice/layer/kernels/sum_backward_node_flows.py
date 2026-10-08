@@ -22,7 +22,7 @@ from pyjuice.utils.kernel_launcher import triton_jit
 
 # @triton.jit
 @triton_jit
-def _bk_triton_modify_flow_kernel(node_flows, node_mars, local_ids, nids, batch_size: tl.constexpr, partial_eval: tl.constexpr, 
+def _bk_triton_modify_flow_kernel(node_flows, node_mars, nids, batch_size: tl.constexpr, 
                                   BLOCK_B: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, propagation_alg_id: tl.constexpr, alpha = 0.0):
 
     pid_b = tl.program_id(0) # ID of size-`BLOCK_B` examples
@@ -31,10 +31,6 @@ def _bk_triton_modify_flow_kernel(node_flows, node_mars, local_ids, nids, batch_
     # Get inferred node block id from `pid_m`
     nblock_id = pid_m // (BLOCK_SIZE_M // BLOCK_M)
     tile_id = pid_m % (BLOCK_SIZE_M // BLOCK_M)
-
-    # Get the real node block id in the case of partial evaluation
-    if partial_eval == 1:
-        nblock_id = tl.load(local_ids + nblock_id)
 
     # Batch offsets and mask
     offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B
@@ -64,7 +60,7 @@ def _bk_triton_modify_flow_kernel(node_flows, node_mars, local_ids, nids, batch_
 
 # @triton.jit
 @triton_jit
-def _bk_triton_large_modify_flow_kernel(node_flows, node_mars, local_ids, nids, num_nodes, batch_size: tl.constexpr, partial_eval: tl.constexpr, 
+def _bk_triton_large_modify_flow_kernel(node_flows, node_mars, nids, num_nodes, batch_size: tl.constexpr, 
                                         BLOCK_B: tl.constexpr, TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, propagation_alg_id: tl.constexpr, 
                                         pid_m_offset = 0, alpha = 0.0):
 
@@ -77,10 +73,6 @@ def _bk_triton_large_modify_flow_kernel(node_flows, node_mars, local_ids, nids, 
     # Get inferred node block id from `pid_m`
     nblock_ids = offs_m // BLOCK_SIZE_M
     tile_ids = offs_m % BLOCK_SIZE_M
-
-    # Get the real node block id in the case of partial evaluation
-    if partial_eval == 1:
-        nblock_ids = tl.load(local_ids + nblock_ids)
 
     # Batch offsets and mask
     offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B

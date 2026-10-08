@@ -152,7 +152,7 @@ def test_hclt_single_layer_backward():
         my_layer = pc.inner_layer_groups[layer_id][0]
         previous_layer = pc.inner_layer_groups[layer_id-1][0]
 
-        previous_layer.forward(node_mars, element_mars, _for_backward = True)
+        previous_layer.forward(node_mars, element_mars)
 
         my_layer.backward(node_flows, element_flows, node_mars, element_mars, params,
                           param_flows = param_flows, allow_modify_flows = False, propagation_alg = "LL", logspace_flows = False)
@@ -249,7 +249,7 @@ def test_hclt_single_layer_backward_general_em():
         my_layer = pc.inner_layer_groups[layer_id][0]
         previous_layer = pc.inner_layer_groups[layer_id-1][0]
 
-        previous_layer.forward(node_mars, element_mars, _for_backward = True)
+        previous_layer.forward(node_mars, element_mars)
 
         my_layer.backward(node_flows, element_flows, node_mars, element_mars, params,
                           param_flows = param_flows, allow_modify_flows = False,
@@ -494,7 +494,7 @@ def test_hclt_backward():
                 temp_node_flows[nsid:neid,:] = nflows
                 temp_param_flows[:] = 0.0
 
-                pc.inner_layer_groups[curr_layer_id - 1].forward(temp_node_mars, temp_element_mars, _for_backward = True)
+                pc.inner_layer_groups[curr_layer_id - 1].forward(temp_node_mars, temp_element_mars)
 
                 curr_layer.backward(temp_node_flows, temp_element_flows, temp_node_mars, temp_element_mars, temp_params,
                                     param_flows = temp_param_flows, allow_modify_flows = False, propagation_alg = "LL", logspace_flows = False)
