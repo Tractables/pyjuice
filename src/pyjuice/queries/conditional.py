@@ -22,9 +22,9 @@ from pyjuice.nodes.distributions.external_categorical import _condition_apply_ll
 ## Categorical layer ##
 
 @triton.jit
-def _soft_evi_categorical_fw_kernel(data_ptr, node_mars_ptr, params_ptr, vids_ptr, psids_ptr, node_nchs_ptr, local_ids,
+def _soft_evi_categorical_fw_kernel(data_ptr, node_mars_ptr, params_ptr, vids_ptr, psids_ptr, node_nchs_ptr,
                                     sid: tl.constexpr, num_nodes: tl.constexpr, num_cats: tl.constexpr, 
-                                    batch_size: tl.constexpr, partial: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+                                    batch_size: tl.constexpr, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(axis = 0)
     block_start = pid * BLOCK_SIZE
 
@@ -61,11 +61,7 @@ def _soft_evi_categorical_fw_kernel(data_ptr, node_mars_ptr, params_ptr, vids_pt
         node_vals += d_soft_evi * param
 
     # Write back
-    if not partial:
-        tl.store(node_mars_ptr + offsets + (sid * batch_size), tl.log(node_vals), mask = mask)
-    else:
-        global_nid = tl.load(local_ids + ns_offsets, mask = mask, other = 0) + sid
-        tl.store(node_mars_ptr + global_nid * batch_size + batch_offsets, tl.log(node_vals), mask = mask)
+    tl.store(node_mars_ptr + offsets + (sid * batch_size), tl.log(node_vals), mask = mask)
 
 
 def _categorical_forward(layer, inputs: torch.Tensor, node_mars: torch.Tensor,
@@ -106,7 +102,7 @@ def _categorical_forward(layer, inputs: torch.Tensor, node_mars: torch.Tensor,
 
         _soft_evi_categorical_fw_kernel[grid](
             inputs.reshape(-1).contiguous(), node_mars, layer.params, layer.vids.reshape(-1), layer.s_pids, node_nchs,
-            None, sid, num_nodes, num_cats, batch_size, partial = False, BLOCK_SIZE = 512
+            sid, num_nodes, num_cats, batch_size, BLOCK_SIZE = 512
         )
 
         node_mars[sid:eid,:] = node_mars[sid:eid,:].clip(max = 0.0)
@@ -127,8 +123,8 @@ def _external_categorical_forward(layer, inputs: torch.Tensor, node_mars: torch.
 
 @triton.jit
 def _soft_evi_discrete_logistic_fw_kernel(data_ptr, node_mars_ptr, params_ptr, vids_ptr, psids_ptr, s_mids_ptr, metadata_ptr, 
-                                          local_ids, sid: tl.constexpr, num_nodes: tl.constexpr, num_cats: tl.constexpr, 
-                                          batch_size: tl.constexpr, partial: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+                                          sid: tl.constexpr, num_nodes: tl.constexpr, num_cats: tl.constexpr, 
+                                          batch_size: tl.constexpr, BLOCK_SIZE: tl.constexpr):
 
     pid = tl.program_id(axis = 0)
     block_start = pid * BLOCK_SIZE
@@ -178,11 +174,7 @@ def _soft_evi_discrete_logistic_fw_kernel(data_ptr, node_mars_ptr, params_ptr, v
         node_vals += d_soft_evi * param
 
     # Write back
-    if not partial:
-        tl.store(node_mars_ptr + offsets + (sid * batch_size), tl.log(node_vals), mask = mask) # debug
-    else:
-        global_nid = tl.load(local_ids + ns_offsets, mask = mask, other = 0) + sid
-        tl.store(node_mars_ptr + global_nid * batch_size + batch_offsets, tl.log(node_vals), mask = mask)
+    tl.store(node_mars_ptr + offsets + (sid * batch_size), tl.log(node_vals), mask = mask) # debug
 
 
 def _discrete_logistic_forward(layer, inputs: torch.Tensor, node_mars: torch.Tensor,
@@ -225,8 +217,8 @@ def _discrete_logistic_forward(layer, inputs: torch.Tensor, node_mars: torch.Ten
 
         _soft_evi_discrete_logistic_fw_kernel[grid](
             inputs.reshape(-1).contiguous(), node_mars, layer.params, layer.vids.reshape(-1), layer.s_pids, 
-            layer.s_mids, layer.metadata, None, sid, num_nodes, num_cats, batch_size, 
-            partial = False, BLOCK_SIZE = 512
+            layer.s_mids, layer.metadata, sid, num_nodes, num_cats, batch_size, 
+            BLOCK_SIZE = 512
         )
 
         node_mars[sid:eid,:] = node_mars[sid:eid,:].clip(max = 0.0)

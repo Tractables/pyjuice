@@ -212,10 +212,7 @@ def _prep_args_apply_ll_w_mask_fast_kernel(layer, kwargs):
 
     n_block_size = max_power_of_2_factor(layer.n_block_size)
 
-    if not layer.provided("fw_local_ids"):
-        layer_num_nodes = layer._output_ind_range[1] - layer._output_ind_range[0]
-    else:
-        layer_num_nodes = layer.fw_local_ids.size(0)
+    layer_num_nodes = layer._output_ind_range[1] - layer._output_ind_range[0]
 
     # prepare BLOCK_SIZE and TILE_SIZE_K
     target_kwargs["TILE_SIZE_K"] = min(64, triton.next_power_of_2(target_kwargs["max_num_cats"]))
@@ -282,10 +279,7 @@ def _prep_args_apply_ll_bp_kernel(layer, kwargs):
 
         target_kwargs["max_num_cats"] = 1
 
-    if not layer.provided("fw_local_ids"):
-        layer_num_nodes = layer._output_ind_range[1] - layer._output_ind_range[0]
-    else:
-        layer_num_nodes = layer.fw_local_ids.size(0)
+    layer_num_nodes = layer._output_ind_range[1] - layer._output_ind_range[0]
 
     # prepare BLOCK_SIZE and TILE_SIZE_K
     if kwargs["extern_product_categorical_mode"] == "normalizing_constant":
@@ -349,10 +343,7 @@ def _prep_args_apply_ll_bp_w_mask_kernel1(layer, kwargs):
 
     target_kwargs["max_num_cats"] = 1
 
-    if not layer.provided("fw_local_ids"):
-        layer_num_nodes = layer._output_ind_range[1] - layer._output_ind_range[0]
-    else:
-        layer_num_nodes = layer.fw_local_ids.size(0)
+    layer_num_nodes = layer._output_ind_range[1] - layer._output_ind_range[0]
 
     target_kwargs["TILE_SIZE_K"] = 1
     target_kwargs["K_NUM_TILES"] = triton.cdiv(target_kwargs["max_num_cats"], target_kwargs["TILE_SIZE_K"])
@@ -411,10 +402,7 @@ def _prep_args_apply_ll_bp_w_mask_kernel2(layer, kwargs):
     assert external_categorical_value_mask.size(0) == kwargs["batch_size"]
     assert external_categorical_value_mask.size(1) == target_kwargs["ext_num_vars"]
 
-    if not layer.provided("fw_local_ids"):
-        layer_num_nodes = layer._output_ind_range[1] - layer._output_ind_range[0]
-    else:
-        layer_num_nodes = layer.fw_local_ids.size(0)
+    layer_num_nodes = layer._output_ind_range[1] - layer._output_ind_range[0]
 
     target_kwargs["TILE_SIZE_K"] = min(64, triton.next_power_of_2(target_kwargs["max_num_cats"]))
     target_kwargs["K_NUM_TILES"] = triton.cdiv(target_kwargs["max_num_cats"], target_kwargs["TILE_SIZE_K"])
@@ -476,10 +464,7 @@ def _prep_args_apply_ll_bp_extern_grad_kernel(layer, kwargs):
 
     n_block_size = max_power_of_2_factor(layer.n_block_size)
 
-    if not layer.provided("fw_local_ids"):
-        layer_num_nodes = layer._output_ind_range[1] - layer._output_ind_range[0]
-    else:
-        layer_num_nodes = layer.fw_local_ids.size(0)
+    layer_num_nodes = layer._output_ind_range[1] - layer._output_ind_range[0]
 
     target_kwargs["TILE_SIZE_K"] = min(64, triton.next_power_of_2(target_kwargs["max_num_cats"]))
     target_kwargs["K_NUM_TILES"] = triton.cdiv(target_kwargs["max_num_cats"], target_kwargs["TILE_SIZE_K"])
@@ -545,10 +530,7 @@ def _prep_args_apply_ll_bp_extern_grad_w_mask_kernel(layer, kwargs):
 
     n_block_size = max_power_of_2_factor(layer.n_block_size)
 
-    if not layer.provided("fw_local_ids"):
-        layer_num_nodes = layer._output_ind_range[1] - layer._output_ind_range[0]
-    else:
-        layer_num_nodes = layer.fw_local_ids.size(0)
+    layer_num_nodes = layer._output_ind_range[1] - layer._output_ind_range[0]
 
     target_kwargs["TILE_SIZE_K"] = min(64, triton.next_power_of_2(target_kwargs["max_num_cats"]))
     target_kwargs["K_NUM_TILES"] = triton.cdiv(target_kwargs["max_num_cats"], target_kwargs["TILE_SIZE_K"])
@@ -726,7 +708,7 @@ class ExternProductCategorical(Distribution):
     @staticmethod
     @triton_jit
     def ll_kernel(params_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, metadata_ptr, s_mids_ptr, nids_ptr, 
-                  fw_local_ids_ptr, partial_eval: tl.constexpr, layer_num_nodes: tl.constexpr, batch_size: tl.constexpr, 
+                  layer_num_nodes: tl.constexpr, batch_size: tl.constexpr, 
                   num_vars_per_node: tl.constexpr, nv_block_size: tl.constexpr, node_offset: tl.constexpr, BLOCK_SIZE: tl.constexpr,
                   TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, compute_unnorm_logp: tl.constexpr, compute_logz: tl.constexpr,
                   ext_softevi_indexing: tl.constexpr, external_categorical_logps_ptr, var_idmapping_ptr, ext_num_vars: tl.constexpr, 
@@ -741,8 +723,6 @@ class ExternProductCategorical(Distribution):
         batch_offsets = (offsets % batch_size)
         local_offsets = (offsets // batch_size)
 
-        if partial_eval > 0:
-            local_offsets = tl.load(fw_local_ids_ptr + local_offsets, mask = mask, other = 0)
 
         # Get all variable ids
         vids = tl.load(vids_ptr + local_offsets, mask = mask, other = 0)
@@ -838,7 +818,7 @@ class ExternProductCategorical(Distribution):
     @staticmethod
     @triton_jit
     def ll_w_mask_kernel(params_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, metadata_ptr, s_mids_ptr, nids_ptr, 
-                         fw_local_ids_ptr, partial_eval: tl.constexpr, layer_num_nodes: tl.constexpr, batch_size: tl.constexpr, 
+                         layer_num_nodes: tl.constexpr, batch_size: tl.constexpr, 
                          num_vars_per_node: tl.constexpr, nv_block_size: tl.constexpr, node_offset: tl.constexpr, BLOCK_SIZE: tl.constexpr,
                          TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, use_normalized: tl.constexpr,
                          external_categorical_logps_ptr, external_categorical_value_mask_ptr, var_idmapping_ptr, ext_num_vars: tl.constexpr, 
@@ -853,8 +833,6 @@ class ExternProductCategorical(Distribution):
         batch_offsets = (offsets % batch_size)
         local_offsets = (offsets // batch_size)
 
-        if partial_eval > 0:
-            local_offsets = tl.load(fw_local_ids_ptr + local_offsets, mask = mask, other = 0)
 
         # Get all variable ids
         vids = tl.load(vids_ptr + local_offsets, mask = mask, other = 0)
@@ -942,7 +920,7 @@ class ExternProductCategorical(Distribution):
     @staticmethod
     @triton_jit
     def ll_w_mask_fast_kernel(params_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, metadata_ptr, s_mids_ptr, nids_ptr, 
-                              fw_local_ids_ptr, partial_eval: tl.constexpr, layer_num_nodes: tl.constexpr, batch_size: tl.constexpr, 
+                              layer_num_nodes: tl.constexpr, batch_size: tl.constexpr, 
                               num_vars_per_node: tl.constexpr, nv_block_size: tl.constexpr, node_offset: tl.constexpr,
                               TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, BLOCK_SIZE_B: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, use_normalized: tl.constexpr,
                               external_categorical_logps_ptr, external_categorical_value_mask_ptr, var_idmapping_ptr, ext_num_vars: tl.constexpr, 
@@ -956,11 +934,7 @@ class ExternProductCategorical(Distribution):
         mask_b = offsets_b < batch_size
         mask_n = offsets_n < layer_num_nodes
 
-        if partial_eval > 0:
-            offsets_n = tl.load(fw_local_ids_ptr + offsets_n, mask = mask_n, other = 0)
-            offset_n = tl.load(fw_local_ids_ptr + pid_n * BLOCK_SIZE_N)
-        else:
-            offset_n = pid_n * BLOCK_SIZE_N
+        offset_n = pid_n * BLOCK_SIZE_N
 
         # Get all variable ids
         vid = tl.load(vids_ptr + offset_n) # [1]
@@ -1054,7 +1028,7 @@ class ExternProductCategorical(Distribution):
     @staticmethod
     @triton_jit
     def ll_bp_kernel(params_ptr, param_flows_ptr, node_flows_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, s_pfids_ptr,
-                     metadata_ptr, s_mids_ptr, nids_ptr, bk_local_ids_ptr, partial_eval: tl.constexpr, logspace_flows: tl.constexpr, layer_num_nodes: tl.constexpr, 
+                     metadata_ptr, s_mids_ptr, nids_ptr, logspace_flows: tl.constexpr, layer_num_nodes: tl.constexpr, 
                      batch_size: tl.constexpr, num_vars_per_node: tl.constexpr, num_vars: tl.constexpr, nv_block_size: tl.constexpr, node_offset: tl.constexpr, 
                      BLOCK_SIZE_B: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, compute_unnorm_logp: tl.constexpr, 
                      compute_logz: tl.constexpr, external_categorical_logps_ptr, var_idmapping_ptr, ext_num_vars: tl.constexpr, max_num_cats: tl.constexpr):
@@ -1067,8 +1041,6 @@ class ExternProductCategorical(Distribution):
         mask_b = offsets_b < batch_size
         mask_n = offsets_n < layer_num_nodes
 
-        if partial_eval > 0:
-            offsets_n = tl.load(bk_local_ids_ptr + offsets_n, mask = mask, other = 0)
 
         # Get all variable ids
         vids = tl.load(vids_ptr + offsets_n, mask = mask_n, other = 0) # [BLOCK_SIZE_N]
@@ -1136,7 +1108,7 @@ class ExternProductCategorical(Distribution):
     @staticmethod
     @triton_jit
     def ll_bp_w_mask_kernel1(params_ptr, param_flows_ptr, node_flows_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, s_pfids_ptr,
-                             metadata_ptr, s_mids_ptr, nids_ptr, bk_local_ids_ptr, partial_eval: tl.constexpr, logspace_flows: tl.constexpr, layer_num_nodes: tl.constexpr, 
+                             metadata_ptr, s_mids_ptr, nids_ptr, logspace_flows: tl.constexpr, layer_num_nodes: tl.constexpr, 
                              batch_size: tl.constexpr, num_vars_per_node: tl.constexpr, num_vars: tl.constexpr, nv_block_size: tl.constexpr, node_offset: tl.constexpr, 
                              BLOCK_SIZE_B: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, use_normalized: tl.constexpr, 
                              external_categorical_logps_ptr, external_categorical_value_mask_ptr, var_idmapping_ptr, ext_num_vars: tl.constexpr, max_num_cats: tl.constexpr):
@@ -1149,8 +1121,6 @@ class ExternProductCategorical(Distribution):
         mask_b = offsets_b < batch_size
         mask_n = offsets_n < layer_num_nodes
 
-        if partial_eval > 0:
-            offsets_n = tl.load(bk_local_ids_ptr + offsets_n, mask = mask, other = 0)
 
         # Get all variable ids
         vids = tl.load(vids_ptr + offsets_n, mask = mask_n, other = 0) # [BLOCK_SIZE_N]
@@ -1194,7 +1164,7 @@ class ExternProductCategorical(Distribution):
     @staticmethod
     @triton_jit
     def ll_bp_w_mask_kernel2(params_ptr, param_flows_ptr, node_flows_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, s_pfids_ptr,
-                             metadata_ptr, s_mids_ptr, nids_ptr, bk_local_ids_ptr, partial_eval: tl.constexpr, logspace_flows: tl.constexpr, layer_num_nodes: tl.constexpr, 
+                             metadata_ptr, s_mids_ptr, nids_ptr, logspace_flows: tl.constexpr, layer_num_nodes: tl.constexpr, 
                              batch_size: tl.constexpr, num_vars_per_node: tl.constexpr, num_vars: tl.constexpr, nv_block_size: tl.constexpr, node_offset: tl.constexpr, 
                              BLOCK_SIZE_B: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, use_normalized: tl.constexpr, 
                              external_categorical_logps_ptr, external_categorical_value_mask_ptr, var_idmapping_ptr, ext_num_vars: tl.constexpr, max_num_cats: tl.constexpr):
@@ -1207,8 +1177,6 @@ class ExternProductCategorical(Distribution):
         mask_b = offsets_b < batch_size
         mask_n = offsets_n < layer_num_nodes
 
-        if partial_eval > 0:
-            offsets_n = tl.load(bk_local_ids_ptr + offsets_n, mask = mask, other = 0)
 
         # Get all variable ids
         vids = tl.load(vids_ptr + offsets_n, mask = mask_n, other = 0) # [BLOCK_SIZE_N]
@@ -1284,7 +1252,7 @@ class ExternProductCategorical(Distribution):
     @staticmethod
     @triton_jit
     def ll_bp_extern_grad_kernel(params_ptr, param_flows_ptr, node_flows_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, s_pfids_ptr,
-                                 metadata_ptr, s_mids_ptr, nids_ptr, bk_local_ids_ptr, partial_eval: tl.constexpr, logspace_flows: tl.constexpr, layer_num_nodes: tl.constexpr, 
+                                 metadata_ptr, s_mids_ptr, nids_ptr, logspace_flows: tl.constexpr, layer_num_nodes: tl.constexpr, 
                                  batch_size: tl.constexpr, num_vars_per_node: tl.constexpr, num_vars: tl.constexpr, nv_block_size: tl.constexpr, node_offset: tl.constexpr, 
                                  BLOCK_SIZE_B: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, compute_unnorm_logp: tl.constexpr, 
                                  compute_logz: tl.constexpr, external_categorical_logps_ptr, external_categorical_logps_grad_ptr, var_idmapping_ptr, ext_num_vars: tl.constexpr, 
@@ -1298,11 +1266,7 @@ class ExternProductCategorical(Distribution):
         mask_b = offsets_b < batch_size
         mask_n = offsets_n < layer_num_nodes
 
-        if partial_eval > 0:
-            offsets_n = tl.load(bk_local_ids_ptr + offsets_n, mask = mask, other = 0)
-            offset_n = tl.load(bk_local_ids_ptr + pid_n * BLOCK_SIZE_N, other = 0)
-        else:
-            offset_n = pid_n * BLOCK_SIZE_N
+        offset_n = pid_n * BLOCK_SIZE_N
 
         # Get all variable ids
         vid = tl.load(vids_ptr + offset_n) # [1]
@@ -1402,7 +1366,7 @@ class ExternProductCategorical(Distribution):
     @staticmethod
     @triton_jit
     def ll_bp_extern_grad_w_mask_kernel(params_ptr, param_flows_ptr, node_flows_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, s_pfids_ptr,
-                                        metadata_ptr, s_mids_ptr, nids_ptr, bk_local_ids_ptr, partial_eval: tl.constexpr, logspace_flows: tl.constexpr, layer_num_nodes: tl.constexpr, 
+                                        metadata_ptr, s_mids_ptr, nids_ptr, logspace_flows: tl.constexpr, layer_num_nodes: tl.constexpr, 
                                         batch_size: tl.constexpr, num_vars_per_node: tl.constexpr, num_vars: tl.constexpr, nv_block_size: tl.constexpr, node_offset: tl.constexpr, 
                                         BLOCK_SIZE_B: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, use_normalized: tl.constexpr, 
                                         external_categorical_logps_ptr, external_categorical_logps_grad_ptr, external_categorical_value_mask_ptr, 
@@ -1416,11 +1380,7 @@ class ExternProductCategorical(Distribution):
         mask_b = offsets_b < batch_size
         mask_n = offsets_n < layer_num_nodes
 
-        if partial_eval > 0:
-            offsets_n = tl.load(bk_local_ids_ptr + offsets_n, mask = mask, other = 0)
-            offset_n = tl.load(bk_local_ids_ptr + pid_n * BLOCK_SIZE_N, mask = mask, other = 0)
-        else:
-            offset_n = pid_n * BLOCK_SIZE_N
+        offset_n = pid_n * BLOCK_SIZE_N
 
         # Get all variable ids
         vid = tl.load(vids_ptr + offset_n) # [1]
