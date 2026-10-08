@@ -181,7 +181,7 @@ def eval_partition_grad(pc, negate_pflows: bool = True, input_layer_norm_params:
             layer_group.backward(pc.node_flows, pc.element_flows, logspace_flows = True)
         elif layer_group.is_sum():
             # Recompute the preceding product layer, then back-propagate the sum layer.
-            pc.inner_layer_groups[layer_id - 1].forward(pc.node_mars, pc.element_mars, _for_backward = True)
+            pc.inner_layer_groups[layer_id - 1].forward(pc.node_mars, pc.element_mars)
             layer_group.backward(pc.node_flows, pc.element_flows, pc.node_mars, pc.element_mars, pc.params,
                                  param_flows = pc.param_flows, allow_modify_flows = False,
                                  propagation_alg = "LL", logspace_flows = True, negate_pflows = negate_pflows)

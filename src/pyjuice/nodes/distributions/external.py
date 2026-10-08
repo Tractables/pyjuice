@@ -116,7 +116,7 @@ class External(Distribution):
     @staticmethod
     @triton_jit
     def apply_soft_evi_kernel(params_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, metadata_ptr, s_mids_ptr, nids_ptr, 
-                              fw_local_ids_ptr, partial_eval: tl.constexpr, layer_num_nodes: tl.constexpr, batch_size: tl.constexpr, 
+                              layer_num_nodes: tl.constexpr, batch_size: tl.constexpr, 
                               num_vars_per_node: tl.constexpr, nv_block_size: tl.constexpr, node_offset: tl.constexpr, BLOCK_SIZE: tl.constexpr,
                               external_soft_evi_ptr, var_idmapping_ptr, ext_num_vars: tl.constexpr, max_num_latents: tl.constexpr):
         pid = tl.program_id(axis = 0)
@@ -129,8 +129,6 @@ class External(Distribution):
         batch_offsets = (offsets % batch_size)
         local_offsets = (offsets // batch_size)
 
-        if partial_eval > 0:
-            local_offsets = tl.load(fw_local_ids_ptr + local_offsets, mask = mask, other = 0)
 
         # Get all variable ids
         vids = tl.load(vids_ptr + local_offsets, mask = mask, other = 0)
@@ -148,7 +146,7 @@ class External(Distribution):
     @staticmethod
     @triton_jit
     def soft_evi_grad_kernel(params_ptr, param_flows_ptr, node_flows_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, s_pfids_ptr,
-                             metadata_ptr, s_mids_ptr, nids_ptr, bk_local_ids_ptr, partial_eval: tl.constexpr, logspace_flows: tl.constexpr, layer_num_nodes: tl.constexpr, 
+                             metadata_ptr, s_mids_ptr, nids_ptr, logspace_flows: tl.constexpr, layer_num_nodes: tl.constexpr, 
                              batch_size: tl.constexpr, num_vars_per_node: tl.constexpr, num_vars: tl.constexpr, nv_block_size: tl.constexpr, node_offset: tl.constexpr, 
                              BLOCK_SIZE: tl.constexpr, external_soft_evi_grad_ptr, var_idmapping_ptr, ext_num_vars: tl.constexpr, max_num_latents: tl.constexpr):
         pid = tl.program_id(axis = 0)
@@ -161,8 +159,6 @@ class External(Distribution):
         batch_offsets = (offsets % batch_size)
         local_offsets = (offsets // batch_size)
 
-        if partial_eval > 0:
-            local_offsets = tl.load(bk_local_ids_ptr + local_offsets, mask = mask, other = 0)
 
         # Get all variable ids
         vids = tl.load(vids_ptr + local_offsets, mask = mask, other = 0)

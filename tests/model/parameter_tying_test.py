@@ -199,7 +199,7 @@ def test_simple_structure_block1():
 
     assert torch.all(torch.abs(node_flows[19:21,:] - 1.0) < 1e-4)
 
-    pc.inner_layer_groups[4][0](pc.node_mars, pc.element_mars, _for_backward = True)
+    pc.inner_layer_groups[4][0](pc.node_mars, pc.element_mars)
     pc.inner_layer_groups[5][0].backward(
         pc.node_flows, pc.element_flows, pc.node_mars, pc.element_mars, 
         pc.params, pc.param_flows
@@ -220,7 +220,7 @@ def test_simple_structure_block1():
     ni0_flows = element_flows[3:5,:].clone()
     ni3_flows = element_flows[1:3,:].clone()
 
-    pc.inner_layer_groups[2][0](pc.node_mars, pc.element_mars, _for_backward = True)
+    pc.inner_layer_groups[2][0](pc.node_mars, pc.element_mars)
     pc.inner_layer_groups[3][0].backward(
         pc.node_flows, pc.element_flows, pc.node_mars, pc.element_mars, 
         pc.params, pc.param_flows
@@ -251,7 +251,7 @@ def test_simple_structure_block1():
     ni3_flows += np123_flows[0:2,:].clone()
     ni1_flows = np123_flows[2:4,:].clone()
 
-    pc.inner_layer_groups[0][0](pc.node_mars, pc.element_mars, _for_backward = True)
+    pc.inner_layer_groups[0][0](pc.node_mars, pc.element_mars)
     pc.inner_layer_groups[1][0].backward(
         pc.node_flows, pc.element_flows, pc.node_mars, pc.element_mars, 
         pc.params, pc.param_flows
@@ -499,7 +499,7 @@ def test_simple_structure_block16():
 
     assert torch.all(torch.abs(node_flows[304:336,:] - 1.0) < 1e-4)
 
-    pc.inner_layer_groups[4][0](pc.node_mars, pc.element_mars, _for_backward = True)
+    pc.inner_layer_groups[4][0](pc.node_mars, pc.element_mars)
     pc.inner_layer_groups[5][0].backward(
         pc.node_flows, pc.element_flows, pc.node_mars, pc.element_mars, 
         pc.params, pc.param_flows
@@ -520,7 +520,7 @@ def test_simple_structure_block16():
     ni0_flows = element_flows[48:80,:].clone()
     ni3_flows = element_flows[16:48,:].clone()
 
-    pc.inner_layer_groups[2][0](pc.node_mars, pc.element_mars, _for_backward = True)
+    pc.inner_layer_groups[2][0](pc.node_mars, pc.element_mars)
     pc.inner_layer_groups[3][0].backward(
         pc.node_flows, pc.element_flows, pc.node_mars, pc.element_mars, 
         pc.params, pc.param_flows
@@ -551,7 +551,7 @@ def test_simple_structure_block16():
     ni3_flows += np123_flows[0:32,:].clone()
     ni1_flows = np123_flows[32:64,:].clone()
 
-    pc.inner_layer_groups[0][0](pc.node_mars, pc.element_mars, _for_backward = True)
+    pc.inner_layer_groups[0][0](pc.node_mars, pc.element_mars)
     pc.inner_layer_groups[1][0].backward(
         pc.node_flows, pc.element_flows, pc.node_mars, pc.element_mars, 
         pc.params, pc.param_flows

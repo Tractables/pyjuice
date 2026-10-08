@@ -552,10 +552,6 @@ class ExternalParamsSumLayer(SumLayer):
             f"External sum parameters are only supported for the 'LL' propagation algorithm, got " \
             f"'{propagation_alg}'."
 
-        partition_ids = "bk_partition_local_ids" if is_backward else "fw_partition_local_ids"
-        assert not self.provided(partition_ids), \
-            "External sum parameters are not supported under partial evaluation."
-
         if is_backward:
             # `allow_modify_flows` overwrites `node_flows` with `log(flow) - node_mars` in place, so the
             # node flows the external gradients are built from would be gone by `post_backward`.
