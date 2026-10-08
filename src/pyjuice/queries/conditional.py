@@ -22,9 +22,9 @@ from pyjuice.nodes.distributions.external_categorical import _condition_apply_ll
 ## Categorical layer ##
 
 @triton.jit
-def _soft_evi_categorical_fw_kernel(data_ptr, node_mars_ptr, params_ptr, vids_ptr, psids_ptr, node_nchs_ptr, local_ids,
+def _soft_evi_categorical_fw_kernel(data_ptr, node_mars_ptr, params_ptr, vids_ptr, psids_ptr, node_nchs_ptr,
                                     sid: tl.constexpr, num_nodes: tl.constexpr, num_cats: tl.constexpr, 
-                                    batch_size: tl.constexpr, partial: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+                                    batch_size: tl.constexpr, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(axis = 0)
     block_start = pid * BLOCK_SIZE
 
@@ -61,11 +61,7 @@ def _soft_evi_categorical_fw_kernel(data_ptr, node_mars_ptr, params_ptr, vids_pt
         node_vals += d_soft_evi * param
 
     # Write back
-    if not partial:
-        tl.store(node_mars_ptr + offsets + (sid * batch_size), tl.log(node_vals), mask = mask)
-    else:
-        global_nid = tl.load(local_ids + ns_offsets, mask = mask, other = 0) + sid
-        tl.store(node_mars_ptr + global_nid * batch_size + batch_offsets, tl.log(node_vals), mask = mask)
+    tl.store(node_mars_ptr + offsets + (sid * batch_size), tl.log(node_vals), mask = mask)
 
 
 def _categorical_forward(layer, inputs: torch.Tensor, node_mars: torch.Tensor,
@@ -106,7 +102,7 @@ def _categorical_forward(layer, inputs: torch.Tensor, node_mars: torch.Tensor,
 
         _soft_evi_categorical_fw_kernel[grid](
             inputs.reshape(-1).contiguous(), node_mars, layer.params, layer.vids.reshape(-1), layer.s_pids, node_nchs,
-            None, sid, num_nodes, num_cats, batch_size, partial = False, BLOCK_SIZE = 512
+            sid, num_nodes, num_cats, batch_size, BLOCK_SIZE = 512
         )
 
         node_mars[sid:eid,:] = node_mars[sid:eid,:].clip(max = 0.0)
@@ -127,8 +123,8 @@ def _external_categorical_forward(layer, inputs: torch.Tensor, node_mars: torch.
 
 @triton.jit
 def _soft_evi_discrete_logistic_fw_kernel(data_ptr, node_mars_ptr, params_ptr, vids_ptr, psids_ptr, s_mids_ptr, metadata_ptr, 
-                                          local_ids, sid: tl.constexpr, num_nodes: tl.constexpr, num_cats: tl.constexpr, 
-                                          batch_size: tl.constexpr, partial: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+                                          sid: tl.constexpr, num_nodes: tl.constexpr, num_cats: tl.constexpr, 
+                                          batch_size: tl.constexpr, BLOCK_SIZE: tl.constexpr):
 
     pid = tl.program_id(axis = 0)
     block_start = pid * BLOCK_SIZE
@@ -178,11 +174,7 @@ def _soft_evi_discrete_logistic_fw_kernel(data_ptr, node_mars_ptr, params_ptr, v
         node_vals += d_soft_evi * param
 
     # Write back
-    if not partial:
-        tl.store(node_mars_ptr + offsets + (sid * batch_size), tl.log(node_vals), mask = mask) # debug
-    else:
-        global_nid = tl.load(local_ids + ns_offsets, mask = mask, other = 0) + sid
-        tl.store(node_mars_ptr + global_nid * batch_size + batch_offsets, tl.log(node_vals), mask = mask)
+    tl.store(node_mars_ptr + offsets + (sid * batch_size), tl.log(node_vals), mask = mask) # debug
 
 
 def _discrete_logistic_forward(layer, inputs: torch.Tensor, node_mars: torch.Tensor,
@@ -225,8 +217,8 @@ def _discrete_logistic_forward(layer, inputs: torch.Tensor, node_mars: torch.Ten
 
         _soft_evi_discrete_logistic_fw_kernel[grid](
             inputs.reshape(-1).contiguous(), node_mars, layer.params, layer.vids.reshape(-1), layer.s_pids, 
-            layer.s_mids, layer.metadata, None, sid, num_nodes, num_cats, batch_size, 
-            partial = False, BLOCK_SIZE = 512
+            layer.s_mids, layer.metadata, sid, num_nodes, num_cats, batch_size, 
+            BLOCK_SIZE = 512
         )
 
         node_mars[sid:eid,:] = node_mars[sid:eid,:].clip(max = 0.0)
@@ -237,10 +229,29 @@ def _discrete_logistic_forward(layer, inputs: torch.Tensor, node_mars: torch.Ten
     return None
 
 
+def _target_nodes(layer, target_vars, num_vars, device):
+    """
+    The input nodes a conditional query reads, and where each variable's result goes.
+
+    Returns ``node_ids`` (the layer-local ids of the nodes whose variable is a target, in node order),
+    ``rev_vars_mapping`` (variable id -> output row) and the number of target variables. Without
+    ``target_vars`` every node and every variable is a target. The kernels always go through
+    ``node_ids``, so a node's parameters, metadata and flow are all read at its own id.
+    """
+    if target_vars is None:
+        target_vars = list(range(num_vars))
+    rev_vars_mapping = torch.zeros([num_vars], dtype = torch.long)
+    for i, var in enumerate(target_vars):
+        rev_vars_mapping[var] = i
+    is_target = torch.isin(layer.vids[:, 0], torch.as_tensor(list(target_vars), dtype = torch.long, device = layer.vids.device))
+    node_ids = torch.nonzero(is_target).flatten().to(device)
+    return node_ids, rev_vars_mapping.to(device), len(target_vars)
+
+
 @triton.jit
-def _categorical_backward_kernel(cat_probs_ptr, node_flows_ptr, local_ids_ptr, rev_vars_mapping_ptr, vids_ptr, psids_ptr, 
-                                 node_nchs_ptr, params_ptr, sid, eid, num_target_nodes, batch_size: tl.constexpr, 
-                                 num_cats: tl.constexpr, partial_eval: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+def _categorical_backward_kernel(cat_probs_ptr, node_flows_ptr, node_ids_ptr, rev_vars_mapping_ptr, vids_ptr, psids_ptr,
+                                 node_nchs_ptr, params_ptr, sid, eid, num_target_nodes, batch_size: tl.constexpr,
+                                 num_cats: tl.constexpr, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(axis = 0)
     block_start = pid * BLOCK_SIZE
 
@@ -249,10 +260,7 @@ def _categorical_backward_kernel(cat_probs_ptr, node_flows_ptr, local_ids_ptr, r
 
     # Get node offsets and batch offsets
     local_offsets = (offsets // batch_size)
-    if partial_eval == 1: 
-        local_node_offsets = tl.load(local_ids_ptr + local_offsets, mask = mask, other = 0)
-    else:
-        local_node_offsets = local_offsets
+    local_node_offsets = tl.load(node_ids_ptr + local_offsets, mask = mask, other = 0)
     batch_offsets = (offsets % batch_size)
 
     global_node_offsets = local_node_offsets + sid
@@ -290,43 +298,23 @@ def _categorical_backward(layer, inputs: torch.Tensor, node_flows: torch.Tensor,
 
     sid, eid = layer._output_ind_range[0], layer._output_ind_range[1]
 
-    num_nodes = eid - sid
     num_vars = layer.vids.max().item() + 1
     num_cats = int(layer.metadata[layer.s_mids].max().item())
     batch_size = node_flows.size(1)
 
-    if "target_vars" in kwargs and kwargs["target_vars"] is not None:
-        target_vars = kwargs["target_vars"]
-
-        rev_vars_mapping = torch.zeros([num_vars], dtype = torch.long)
-        for i, var in enumerate(target_vars):
-            rev_vars_mapping[var] = i
-        rev_vars_mapping = rev_vars_mapping.to(node_flows.device)
-    else:
-        target_vars = [var for var in range(num_vars)]
-
-        rev_vars_mapping = torch.arange(0, num_vars, device = node_flows.device)
-
-    num_target_vars = len(target_vars)
+    node_ids, rev_vars_mapping, num_target_vars = _target_nodes(layer, kwargs.get("target_vars"), num_vars,
+                                                                node_flows.device)
+    num_target_nodes = node_ids.size(0)
 
     cat_probs = torch.zeros([num_target_vars * num_cats * batch_size], dtype = torch.float32, device = node_flows.device)
-
-    if len(target_vars) < num_vars:
-        local_ids = layer.enable_partial_evaluation(bk_scopes = target_vars, return_ids = True).to(node_flows.device)
-        num_target_nodes = local_ids.size(0)
-        partial_eval = 1
-    else:
-        local_ids = None
-        num_target_nodes = eid - sid
-        partial_eval = 0
 
     node_nchs = layer.metadata[layer.s_mids]
 
     grid = lambda meta: (triton.cdiv(num_target_nodes * batch_size, meta['BLOCK_SIZE']),)
 
     _categorical_backward_kernel[grid](
-        cat_probs, node_flows, local_ids, rev_vars_mapping, layer.vids, layer.s_pids, node_nchs, layer.params,
-        sid, eid, num_target_nodes, batch_size, num_cats, partial_eval = partial_eval, BLOCK_SIZE = 512
+        cat_probs, node_flows, node_ids, rev_vars_mapping, layer.vids, layer.s_pids, node_nchs, layer.params,
+        sid, eid, num_target_nodes, batch_size, num_cats, BLOCK_SIZE = 512
     )
 
     cat_probs = cat_probs.reshape(num_target_vars, num_cats, batch_size)
@@ -361,10 +349,9 @@ def _external_categorical_backward(layer, inputs: torch.Tensor, node_flows: torc
     return cat_probs
 
 @triton.jit
-def _discrete_logistic_backward_kernel(cat_probs_ptr, node_flows_ptr, local_ids_ptr, rev_vars_mapping_ptr, vids_ptr, psids_ptr, 
-                                       msids_ptr, metadata_ptr, params_ptr, sid, eid, num_target_nodes, 
-                                       batch_size: tl.constexpr, num_cats: tl.constexpr, partial_eval: tl.constexpr, 
-                                       BLOCK_SIZE: tl.constexpr):
+def _discrete_logistic_backward_kernel(cat_probs_ptr, node_flows_ptr, node_ids_ptr, rev_vars_mapping_ptr, vids_ptr, psids_ptr,
+                                       msids_ptr, metadata_ptr, params_ptr, sid, eid, num_target_nodes,
+                                       batch_size: tl.constexpr, num_cats: tl.constexpr, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(axis = 0)
     block_start = pid * BLOCK_SIZE
 
@@ -373,10 +360,7 @@ def _discrete_logistic_backward_kernel(cat_probs_ptr, node_flows_ptr, local_ids_
 
     # Get node offsets and batch offsets
     local_offsets = (offsets // batch_size)
-    if partial_eval == 1: 
-        local_node_offsets = tl.load(local_ids_ptr + local_offsets, mask = mask, other = 0)
-    else:
-        local_node_offsets = local_offsets
+    local_node_offsets = tl.load(node_ids_ptr + local_offsets, mask = mask, other = 0)
     batch_offsets = (offsets % batch_size)
 
     global_node_offsets = local_node_offsets + sid
@@ -385,13 +369,13 @@ def _discrete_logistic_backward_kernel(cat_probs_ptr, node_flows_ptr, local_ids_
     origin_vid = tl.load(vids_ptr + local_node_offsets, mask = mask, other = 0)
     vid = tl.load(rev_vars_mapping_ptr + origin_vid, mask = mask, other = 0)
 
-    # Get params
-    psid = tl.load(psids_ptr + local_offsets, mask = mask, other = 0)
+    # Get params (by node id: the i-th target node is not node i)
+    psid = tl.load(psids_ptr + local_node_offsets, mask = mask, other = 0)
     mu = tl.load(params_ptr + psid, mask = mask, other = 0)
     s = tl.load(params_ptr + psid + 1, mask = mask, other = 0)
 
     # Get metadata
-    s_mids = tl.load(msids_ptr + local_offsets, mask = mask, other = 0)
+    s_mids = tl.load(msids_ptr + local_node_offsets, mask = mask, other = 0)
     range_low = tl.load(metadata_ptr + s_mids, mask = mask, other = 0)
     range_high = tl.load(metadata_ptr + s_mids + 1, mask = mask, other = 0)
     node_nch = tl.load(metadata_ptr + s_mids + 2, mask = mask, other = 0).to(tl.int64)
@@ -427,42 +411,22 @@ def _discrete_logistic_backward(layer, inputs: torch.Tensor, node_flows: torch.T
 
     sid, eid = layer._output_ind_range[0], layer._output_ind_range[1]
 
-    num_nodes = eid - sid
     num_vars = layer.vids.max().item() + 1
     num_cats = int(layer.metadata[layer.s_mids + 2].max().item())
     batch_size = node_flows.size(1)
 
-    if "target_vars" in kwargs and kwargs["target_vars"] is not None:
-        target_vars = kwargs["target_vars"]
-
-        rev_vars_mapping = torch.zeros([num_vars], dtype = torch.long)
-        for i, var in enumerate(target_vars):
-            rev_vars_mapping[var] = i
-        rev_vars_mapping = rev_vars_mapping.to(node_flows.device)
-    else:
-        target_vars = [var for var in range(num_vars)]
-
-        rev_vars_mapping = torch.arange(0, num_vars, device = node_flows.device)
-
-    num_target_vars = len(target_vars)
+    node_ids, rev_vars_mapping, num_target_vars = _target_nodes(layer, kwargs.get("target_vars"), num_vars,
+                                                                node_flows.device)
+    num_target_nodes = node_ids.size(0)
 
     cat_probs = torch.zeros([num_target_vars * num_cats * batch_size], dtype = torch.float32, device = node_flows.device)
-
-    if len(target_vars) < num_vars:
-        local_ids = layer.enable_partial_evaluation(bk_scopes = target_vars, return_ids = True).to(node_flows.device)
-        num_target_nodes = local_ids.size(0)
-        partial_eval = 1
-    else:
-        local_ids = None
-        num_target_nodes = eid - sid
-        partial_eval = 0
 
     grid = lambda meta: (triton.cdiv(num_target_nodes * batch_size, meta['BLOCK_SIZE']),)
 
     _discrete_logistic_backward_kernel[grid](
-        cat_probs, node_flows, local_ids, rev_vars_mapping, layer.vids, layer.s_pids, 
+        cat_probs, node_flows, node_ids, rev_vars_mapping, layer.vids, layer.s_pids,
         layer.s_mids, layer.metadata, layer.params,
-        sid, eid, num_target_nodes, batch_size, num_cats, partial_eval = partial_eval, BLOCK_SIZE = 512
+        sid, eid, num_target_nodes, batch_size, num_cats, BLOCK_SIZE = 512
     )
 
     cat_probs = cat_probs.reshape(num_target_vars, num_cats, batch_size)

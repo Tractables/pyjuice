@@ -174,7 +174,7 @@ def test_structured_blk_sparse_pc():
 
     assert torch.all(torch.abs(node_flows[528,:] - 1.0) < 1e-4)
 
-    pc.inner_layer_groups[2].forward(pc.node_mars, pc.element_mars, _for_backward = True)
+    pc.inner_layer_groups[2].forward(pc.node_mars, pc.element_mars)
     pc.inner_layer_groups[3].backward(pc.node_flows, pc.element_flows, pc.node_mars, pc.element_mars, pc.params,
                                       param_flows = pc.param_flows, allow_modify_flows = False, logspace_flows = False)
     element_flows = pc.element_flows.clone().cpu()
@@ -188,7 +188,7 @@ def test_structured_blk_sparse_pc():
     assert torch.all(torch.abs(ns01_flows - node_flows[400:528,:]) < 1e-4)
     assert torch.all(torch.abs(ni2_flows - node_flows[272:400,:]) < 1e-4)
 
-    pc.inner_layer_groups[0].forward(pc.node_mars, pc.element_mars, _for_backward = True)
+    pc.inner_layer_groups[0].forward(pc.node_mars, pc.element_mars)
     pc.inner_layer_groups[1].backward(pc.node_flows, pc.element_flows, pc.node_mars, pc.element_mars, pc.params,
                                       param_flows = pc.param_flows, allow_modify_flows = False, logspace_flows = False)
     element_flows = pc.element_flows.clone().cpu()

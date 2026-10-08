@@ -142,7 +142,7 @@ def test_homogeneous_hmm():
 
     assert torch.all(torch.abs(node_flows[13:15,:] - 1.0) < 1e-4)
 
-    pc.inner_layer_groups[4][0](pc.node_mars, pc.element_mars, _for_backward = True)
+    pc.inner_layer_groups[4][0](pc.node_mars, pc.element_mars)
     pc.inner_layer_groups[5][0].backward(
         pc.node_flows, pc.element_flows, pc.node_mars, pc.element_mars, 
         pc.params, pc.param_flows
@@ -158,7 +158,7 @@ def test_homogeneous_hmm():
     ns012_flows = element_flows[1:3,:]
     assert torch.all(torch.abs(node_flows[11:13,:] - ns012_flows) < 1e-4)
 
-    pc.inner_layer_groups[2][0](pc.node_mars, pc.element_mars, _for_backward = True)
+    pc.inner_layer_groups[2][0](pc.node_mars, pc.element_mars)
     pc.inner_layer_groups[3][0].backward(
         pc.node_flows, pc.element_flows, pc.node_mars, pc.element_mars, 
         pc.params, pc.param_flows
@@ -174,7 +174,7 @@ def test_homogeneous_hmm():
     ns01_flows = element_flows[1:3,:]
     assert torch.all(torch.abs(node_flows[9:11,:] - ns01_flows) < 1e-4)
 
-    pc.inner_layer_groups[0][0](pc.node_mars, pc.element_mars, _for_backward = True)
+    pc.inner_layer_groups[0][0](pc.node_mars, pc.element_mars)
     pc.inner_layer_groups[1][0].backward(
         pc.node_flows, pc.element_flows, pc.node_mars, pc.element_mars, 
         pc.params, pc.param_flows

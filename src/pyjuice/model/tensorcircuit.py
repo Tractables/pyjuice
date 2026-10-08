@@ -335,10 +335,6 @@ class TensorCircuit(nn.Module):
             "flows_memory": 1.0
         }
 
-        # Partial evaluation
-        self._fw_partial_eval_enabled = False
-        self._bk_partial_eval_enabled = False
-
         # Recorded CUDA graphs of the inner layers, least recently replayed first (see `_run_inner_pass`)
         self._recorded_cuda_graphs = OrderedDict()
         self._cuda_graph_records = dict()
@@ -424,8 +420,8 @@ class TensorCircuit(nn.Module):
             replay it without the per-layer Python. Worth it when the host, not the GPU, bounds a step --
             small batches. Graphs are keyed on everything the inner layers are given (buffers by address,
             every option and keyword argument except the input layers' per-call evidence, see
-            `Distribution.call_kwargs`), at most `max_cuda_graphs` are kept, partial evaluation or `.to()`
-            drops them, and a pass that cannot be captured runs eagerly. None (the default): the circuit's
+            `Distribution.call_kwargs`), at most `max_cuda_graphs` are kept, `.to()` drops
+            them, and a pass that cannot be captured runs eagerly. None (the default): the circuit's
             `cuda_graphs` setting, which is off unless it was compiled with it. False: do not record
         :type record_cudagraph: Optional[bool]
 
@@ -697,7 +693,7 @@ class TensorCircuit(nn.Module):
                         # Sum layer
 
                         # First recompute the previous product layer
-                        self.inner_layer_groups[layer_id-1].forward(self.node_mars, self.element_mars, _for_backward = True)
+                        self.inner_layer_groups[layer_id-1].forward(self.node_mars, self.element_mars)
 
                         # Execute pre-backward callback
                         layer_group.callback(
@@ -1778,7 +1774,7 @@ class TensorCircuit(nn.Module):
                     break
 
             # Rerun the corresponding product layer to get the node values
-            self.inner_layer_groups[layer_id].forward(self.node_mars, self.element_mars, _for_backward = True)
+            self.inner_layer_groups[layer_id].forward(self.node_mars, self.element_mars)
             self.inner_layer_groups[layer_id+1].backward(
                 self.node_flows, self.element_flows, self.node_mars, self.element_mars, self.params, 
                 param_flows = None, allow_modify_flows = self._run_params["allow_modify_flows"], 
@@ -1854,85 +1850,6 @@ class TensorCircuit(nn.Module):
         """
         return layer_iterator(self, reverse = reverse, ret_layer_groups = ret_layer_groups, ignore_input_layers = ignore_input_layers)
 
-    def enable_partial_evaluation(self, scopes: Union[Sequence[BitSet],Sequence[int]],
-                                  forward: bool = False, backward: bool = False, overwrite: bool = False):
-        """
-        Restrict subsequent forward and/or backward passes to only the nodes whose scope is contained
-        in `scopes`. This speeds up repeated queries that touch a fixed subset of variables (e.g.,
-        evaluating or updating only part of the circuit). Call :func:`disable_partial_evaluation` to
-        revert to evaluating the whole circuit.
-
-        :param scopes: the scopes to evaluate, given either as a sequence of variable ids or :class:`~pyjuice.utils.BitSet` scopes
-        :type scopes: Union[Sequence[BitSet], Sequence[int]]
-
-        :param forward: whether to enable partial evaluation for the forward pass
-        :type forward: bool
-
-        :param backward: whether to enable partial evaluation for the backward pass
-        :type backward: bool
-
-        :param overwrite: whether to overwrite an already-enabled partial-evaluation configuration
-        :type overwrite: bool
-        """
-        # Create scope2nid cache
-        self._create_scope2nid_cache()
-
-        if not overwrite and (forward and self._fw_partial_eval_enabled or backward and self._bk_partial_eval_enabled):
-            raise RuntimeError("Partial evaluation already enabled, consider calling `disable_partial_evaluation` first.")
-
-        if isinstance(scopes[0], int):
-            scopes = [BitSet.from_array([var]) for var in scopes]
-
-        fw_scopes = scopes if forward else None
-        bk_scopes = scopes if backward else None
-
-        # Input layers
-        for layer in self.input_layer_group:
-            layer.enable_partial_evaluation(fw_scopes = fw_scopes, bk_scopes = bk_scopes)
-
-        # Inner layers
-        for layer_group in self.inner_layer_groups:
-            layer_group.enable_partial_evaluation(fw_scopes = fw_scopes, bk_scopes = bk_scopes)
-
-        if forward:
-            self._fw_partial_eval_enabled = True
-
-        if backward:
-            self._bk_partial_eval_enabled = True
-
-        # A graph recorded before evaluates other nodes than the passes now should
-        self._drop_cuda_graphs()
-
-    def disable_partial_evaluation(self, forward: bool = True, backward: bool = True):
-        """
-        Disable partial evaluation (see :func:`enable_partial_evaluation`), so that subsequent passes
-        again evaluate the entire circuit.
-
-        :param forward: whether to disable partial evaluation for the forward pass
-        :type forward: bool
-
-        :param backward: whether to disable partial evaluation for the backward pass
-        :type backward: bool
-        """
-        # Input layers
-        for layer in self.input_layer_group:
-            layer.disable_partial_evaluation(forward = forward, backward = backward)
-
-        # Inner layers
-        for layer_group in self.inner_layer_groups:
-            layer_group.disable_partial_evaluation(forward = forward, backward = backward)
-
-        if forward:
-            self._fw_partial_eval_enabled = False
-
-        if backward:
-            self._bk_partial_eval_enabled = False
-
-        # A graph recorded under partial evaluation computes only part of the circuit. MEASURED before
-        # this: after `disable_partial_evaluation()`, a plain `pc(x)` replayed the partial graph and
-        # returned log-likelihoods off by up to 38 nats.
-        self._drop_cuda_graphs()
-
     def _init_buffer(self, name: str, shape: Tuple, set_value: Optional[float] = None, check_device: bool = True):
         """Make `self.<name>` a contiguous `shape` buffer on the circuit's device, filled with `set_value`
         if one is given; a buffer that had to change shape (or device) comes back zeroed.
@@ -1976,7 +1893,7 @@ class TensorCircuit(nn.Module):
 
     def _drop_cuda_graphs(self):
         """Forget every recorded CUDA graph (inner layers and top-down): after a buffer they baked in has
-        moved, or when what the passes compute has changed in a way no key sees (partial evaluation)."""
+        moved, or when what the passes compute has changed in a way no key sees."""
         self._clear_inner_graphs()
         if hasattr(self, "_tdp_cudagraph"):
             self._tdp_cudagraph.clear()
@@ -2578,21 +2495,6 @@ class TensorCircuit(nn.Module):
             signature2nodes[signature].append(ns)
 
         return signature2nodes
-
-    def _create_scope2nid_cache(self):
-        # Input layers
-        for idx, layer in enumerate(self.input_layer_group):
-            layer._prepare_scope2nids()
-
-        # Inner layers
-        prod_scope_eleids = None
-        for layer_group in self.inner_layer_groups:
-            if layer_group.is_prod():
-                prod_scope_eleids = layer_group._prepare_scope2nids()
-            else:
-                assert layer_group.is_sum()
-
-                layer_group._prepare_scope2nids(prod_scope_eleids)
 
 
 def compile(ns: CircuitNodes, layer_sparsity_tol: float = 0.5, 

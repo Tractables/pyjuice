@@ -13,10 +13,9 @@ except Exception:  # pragma: no cover - guards across triton versions
     class _TritonOutOfResources(Exception):
         pass
 from copy import deepcopy
-from typing import Sequence, List, Tuple, Optional
+from typing import Sequence, List, Optional
 
 from pyjuice.nodes import SumNodes
-from pyjuice.utils import BitSet
 from pyjuice.utils.parameter_list import FastParamList
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 from .kernels import sum_forward_block_sparse as fw_bsparse
@@ -435,37 +434,18 @@ class SumLayer(Layer, nn.Module):
         """
         assert not (propagation_alg != "LL" and abs(pflow_temperature - 1.0) > 1e-6), "`pflow_temperature` can only be 1 if `propagation_alg` is not 'LL'."
 
-        if not self.provided("fw_partition_local_ids"):
-            # Evaluate the whole layer
-            for partition_id in range(self.num_fw_partitions):
-                nids = self.partitioned_nids[partition_id]
-                cids = self.partitioned_cids[partition_id]
-                pids = self.partitioned_pids[partition_id]
+        for partition_id in range(self.num_fw_partitions):
+            nids = self.partitioned_nids[partition_id]
+            cids = self.partitioned_cids[partition_id]
+            pids = self.partitioned_pids[partition_id]
 
-                self._forward(
-                    node_mars, element_mars, params, nids, cids, pids, 
-                    partition_id = partition_id, force_use_bf16 = force_use_bf16,
-                    force_use_fp32 = force_use_fp32, 
-                    propagation_alg = propagation_alg, 
-                    pflow_temperature = pflow_temperature, **kwargs
-                )
-
-        else:
-            # Partial evaluation
-            for partition_id in range(self.num_fw_partitions):
-                nids = self.partitioned_nids[partition_id]
-                cids = self.partitioned_cids[partition_id]
-                pids = self.partitioned_pids[partition_id]
-                local_ids = self.fw_partition_local_ids[partition_id]
-
-                self._forward(
-                    node_mars, element_mars, params, 
-                    nids, cids, pids, local_ids = local_ids,
-                    partition_id = partition_id, force_use_bf16 = force_use_bf16,
-                    force_use_fp32 = force_use_fp32,
-                    propagation_alg = propagation_alg, 
-                    pflow_temperature = pflow_temperature, **kwargs
-                )
+            self._forward(
+                node_mars, element_mars, params, nids, cids, pids, 
+                partition_id = partition_id, force_use_bf16 = force_use_bf16,
+                force_use_fp32 = force_use_fp32, 
+                propagation_alg = propagation_alg, 
+                pflow_temperature = pflow_temperature, **kwargs
+            )
 
         return None
 
@@ -505,74 +485,40 @@ class SumLayer(Layer, nn.Module):
         assert not (propagation_alg != "LL" and abs(pflow_temperature - 1.0) > 1e-6), "`pflow_temperature` can only be 1 if `propagation_alg` is not 'LL'."
         assert logspace_flows or abs(pflow_temperature - 1.0) < 1e-6, "`pflow_temperature` can only be enabled when `logspace_flows = True`."
 
-        # Disallow modifications of `node_flows` in case of partial evaluation
-        if self.provided("bk_partition_local_ids") and allow_modify_flows:
-            allow_modify_flows = False
-
         ## Pre-compute `nflows.log() - nmars` if needed ##
         if allow_modify_flows:
-            assert not self.provided("bk_partition_local_ids"), "Must set `allow_modify_flows = False` for partial evaluation."
             for partition_id in range(self.num_fw_partitions):
                 nids = self.partitioned_nids[partition_id]
 
                 self._bk_triton_modify_flow(
-                    node_flows, node_mars, nids, local_ids = None,
+                    node_flows, node_mars, nids,
                     propagation_alg = propagation_alg, **kwargs
                 )
         
         ## Compute flows w.r.t. elements (i.e., product nodes) ##
-        if not self.provided("bk_partition_local_ids"):
-            # Evaluate the whole layer
-            for partition_id in range(self.num_bk_partitions):
-                chids = self.partitioned_chids[partition_id]
-                parids = self.partitioned_parids[partition_id]
-                parpids = self.partitioned_parpids[partition_id]
-                cs_block_size = self.cs_block_sizes[partition_id]
+        for partition_id in range(self.num_bk_partitions):
+            chids = self.partitioned_chids[partition_id]
+            parids = self.partitioned_parids[partition_id]
+            parpids = self.partitioned_parpids[partition_id]
+            cs_block_size = self.cs_block_sizes[partition_id]
 
-                self._backward(
-                    node_flows, element_flows, params, node_mars, 
-                    element_mars, param_flows, 
-                    chids = chids, parids = parids, parpids = parpids,
-                    cs_block_size = cs_block_size,
-                    partition_id = partition_id,
-                    allow_modify_flows = allow_modify_flows,
-                    propagation_alg = propagation_alg,
-                    logspace_flows = logspace_flows,
-                    negate_pflows = negate_pflows, 
-                    accumulate_ch_flows = accumulate_ch_flows,
-                    allow_neg_flows = allow_neg_flows,
-                    force_use_fp32 = force_use_fp32,
-                    pflow_temperature = pflow_temperature,
-                    temper_eflow = temper_eflow,
-                    **kwargs
-                )
-
-        else:
-            # Partial evaluation
-            for partition_id in range(self.num_bk_partitions):
-                chids = self.partitioned_chids[partition_id]
-                parids = self.partitioned_parids[partition_id]
-                parpids = self.partitioned_parpids[partition_id]
-                cs_block_size = self.cs_block_sizes[partition_id]
-                local_ids = self.bk_partition_local_ids[partition_id]
-
-                self._backward(
-                    node_flows, element_flows, params, node_mars,
-                    element_mars, param_flows, 
-                    chids = chids, parids = parids, parpids = parpids,
-                    cs_block_size = cs_block_size, local_ids = local_ids,
-                    partition_id = partition_id,
-                    allow_modify_flows = allow_modify_flows,
-                    propagation_alg = propagation_alg,
-                    logspace_flows = logspace_flows,
-                    negate_pflows = negate_pflows, 
-                    accumulate_ch_flows = accumulate_ch_flows, 
-                    allow_neg_flows = allow_neg_flows,
-                    force_use_fp32 = force_use_fp32,
-                    pflow_temperature = pflow_temperature,
-                    temper_eflow = temper_eflow,
-                    **kwargs
-                )
+            self._backward(
+                node_flows, element_flows, params, node_mars, 
+                element_mars, param_flows, 
+                chids = chids, parids = parids, parpids = parpids,
+                cs_block_size = cs_block_size,
+                partition_id = partition_id,
+                allow_modify_flows = allow_modify_flows,
+                propagation_alg = propagation_alg,
+                logspace_flows = logspace_flows,
+                negate_pflows = negate_pflows, 
+                accumulate_ch_flows = accumulate_ch_flows,
+                allow_neg_flows = allow_neg_flows,
+                force_use_fp32 = force_use_fp32,
+                pflow_temperature = pflow_temperature,
+                temper_eflow = temper_eflow,
+                **kwargs
+            )
 
         ## Compute flows w.r.t. sum parameters ##
         if param_flows is not None:
@@ -608,7 +554,7 @@ class SumLayer(Layer, nn.Module):
 
     def _forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor,
                  params: torch.Tensor, nids: torch.Tensor, cids: torch.Tensor,
-                 pids: torch.Tensor, local_ids: Optional[torch.Tensor] = None,
+                 pids: torch.Tensor,
                  partition_id: int = -1, mode: Optional[str] = None,
                  force_use_bf16: bool = False, force_use_fp32: bool = False,
                  propagation_alg: str = "LL", pflow_temperature: float = 1.0, **kwargs) -> None:
@@ -652,7 +598,7 @@ class SumLayer(Layer, nn.Module):
 
         if mode == self.BLOCK_SPARSE:
             self._forward_block_sparse(
-                node_mars, element_mars, params, nids, cids, pids, local_ids,
+                node_mars, element_mars, params, nids, cids, pids,
                 partition_id = partition_id, force_use_bf16 = force_use_bf16,
                 force_use_fp32 = force_use_fp32, propagation_alg = propagation_alg, 
                 pflow_temperature = pflow_temperature, **kwargs
@@ -660,7 +606,7 @@ class SumLayer(Layer, nn.Module):
 
         elif mode == self.SPARSE:
             self._forward_sparse(
-                node_mars, element_mars, params, nids, cids, pids, local_ids,
+                node_mars, element_mars, params, nids, cids, pids,
                 partition_id = partition_id, propagation_alg = propagation_alg, 
                 pflow_temperature = pflow_temperature, **kwargs
             )
@@ -669,7 +615,7 @@ class SumLayer(Layer, nn.Module):
             assert abs(pflow_temperature - 1.0) < 1e-6, "`pflow_temperature != 1.0` not supported by the PyTorch backend."
 
             self._forward_pytorch(
-                node_mars, element_mars, params, nids, cids, pids, local_ids,
+                node_mars, element_mars, params, nids, cids, pids,
                 propagation_alg = propagation_alg, **kwargs
             )
         
@@ -678,7 +624,7 @@ class SumLayer(Layer, nn.Module):
 
     def _forward_block_sparse(self, node_mars: torch.Tensor, element_mars: torch.Tensor,
                               params: torch.Tensor, nids: torch.Tensor, cids: torch.Tensor,
-                              pids: torch.Tensor, local_ids: Optional[torch.Tensor] = None,
+                              pids: torch.Tensor,
                               partition_id: int = -1, force_use_bf16: bool = False,
                               force_use_fp32: bool = False, propagation_alg: str = "LL", 
                               pflow_temperature: float = 1.0, **kwargs) -> None:
@@ -696,7 +642,7 @@ class SumLayer(Layer, nn.Module):
 
         assert params.dim() == 1, "Expecting a 1D `params`."
 
-        num_nblocks = nids.size(0) if local_ids is None else local_ids.size(0)
+        num_nblocks = nids.size(0)
         layer_n_nodes = num_nblocks * self.block_size
         num_edges = cids.size(1)
         batch_size = node_mars.size(1)
@@ -804,7 +750,6 @@ class SumLayer(Layer, nn.Module):
         # past the trimmed (contiguity-verified) range. The tlmm CUDA / Triton paths use K_NUM_TILES.
         num_edges = K_NUM_TILES * TILE_SIZE_K
 
-        partial_eval = 1 if local_ids is not None else 0
         BLOCK_SIZE_M = self.block_size
 
         if force_use_bf16:
@@ -842,9 +787,7 @@ class SumLayer(Layer, nn.Module):
                     cids_increment,
                     pids_start,
                     pids_increment,
-                    local_ids,
                     batch_size,
-                    partial_eval = partial_eval,
                     BLOCK_B = bb,
                     TILE_SIZE_K = TILE_SIZE_K,
                     K_NUM_TILES = K_NUM_TILES,
@@ -887,17 +830,16 @@ class SumLayer(Layer, nn.Module):
         # re-enters with a smaller default -- looks up a fresh entry instead of the config that just
         # failed (which would loop forever).
         fw_key = (fw_kernel, self.block_size, TILE_SIZE_K, K_NUM_TILES, batch_size, num_nblocks,
-                  partial_eval, use_bf16, propagation_alg_id, pflow_tempered_enabled, default_fw_cfg)
+                  use_bf16, propagation_alg_id, pflow_tempered_enabled, default_fw_cfg)
 
         # Optional CUDA (CuTe/TMA) fast path for the `tlmm` regime. It is numerically equivalent to
         # the Triton tlmm kernel and only valid here: LL propagation (`propagation_alg_id == 0`), the
-        # bf16 dot path (`use_bf16`), no partial eval (`local_ids is None` <=> `partial_eval == 0`),
-        # no pflow tempering, TILE_SIZE_K == 64 with num_edges a multiple of it, and a contiguous
+        # bf16 dot path (`use_bf16`), no pflow tempering, TILE_SIZE_K == 64 with num_edges a multiple of it, and a contiguous
         # edge/param layout (`cuda_ok`). `is_available()` JIT-compiles on first call and self-disables
         # (-> Triton) on an unsuitable GPU/toolchain/CUTLASS, so this is a no-op without the CUDA
         # prerequisites. The best tile config (or Triton) is autotuned once per layer signature.
         if (FORWARD_SUM_CUDA and use_bf16 and propagation_alg_id == 0
-                and not pflow_tempered_enabled and local_ids is None
+                and not pflow_tempered_enabled
                 and TILE_SIZE_K == 64 and num_edges % TILE_SIZE_K == 0
                 and node_mars.is_cuda and cuda_kernels.is_available()):
             ebase, pbase, cuda_ok = self._cached_fw_cuda[signature]
@@ -939,7 +881,7 @@ class SumLayer(Layer, nn.Module):
         # 0.66, 24 0.86 -> 0.73, 33 ~1.6 -> 0.93, 48 1.6 -> 1.28; Triton wins again from 64, where its
         # tiles fill.
         if (FORWARD_SUM_CUDA and batch_size < _GAP_BATCH_MAX and self.block_size >= _SMALL_BATCH_MIN_BLOCK_SIZE
-                and propagation_alg_id == 0 and not pflow_tempered_enabled and local_ids is None
+                and propagation_alg_id == 0 and not pflow_tempered_enabled
                 and node_mars.is_cuda and cuda_kernels.smallbatch_fw_is_available()):
             sb = self._cached_fw_sb.get(signature)
             if sb is None:
@@ -996,7 +938,7 @@ class SumLayer(Layer, nn.Module):
             warnings.warn("Forward sum-layer tile tuning (FORWARD_SUM_TUNED) exceeded shared "
                           "memory on this GPU; falling back to the default launch config.", RuntimeWarning)
             return self._forward_block_sparse(
-                node_mars, element_mars, params, nids, cids, pids, local_ids=local_ids,
+                node_mars, element_mars, params, nids, cids, pids,
                 partition_id=partition_id, force_use_bf16=force_use_bf16,
                 force_use_fp32=force_use_fp32, propagation_alg=propagation_alg,
                 pflow_temperature=pflow_temperature, **kwargs)
@@ -1004,7 +946,7 @@ class SumLayer(Layer, nn.Module):
 
     def _forward_sparse(self, node_mars: torch.Tensor, element_mars: torch.Tensor,
                         params: torch.Tensor, nids: torch.Tensor, cids: torch.Tensor,
-                        pids: torch.Tensor, local_ids: Optional[torch.Tensor] = None,
+                        pids: torch.Tensor,
                         partition_id: int = -1, propagation_alg: str = "LL",
                         pflow_temperature: float = 1.0, **kwargs) -> None:
         """
@@ -1019,7 +961,7 @@ class SumLayer(Layer, nn.Module):
         `pids`:         [ng, c]
         """
 
-        num_nblocks = nids.size(0) if local_ids is None else local_ids.size(0)
+        num_nblocks = nids.size(0)
         layer_n_nodes = num_nblocks * self.block_size
         num_edges = cids.size(1)
         batch_size = node_mars.size(1)
@@ -1044,7 +986,6 @@ class SumLayer(Layer, nn.Module):
         if host_cdiv(layer_n_nodes, self.block_size) <= 2048:
             BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
 
-            partial_eval = 1 if local_ids is not None else 0
             BLOCK_SIZE_M = self.block_size
 
             grid = (host_cdiv(batch_size, BLOCK_B), host_cdiv(layer_n_nodes, BLOCK_SIZE_M))
@@ -1056,9 +997,7 @@ class SumLayer(Layer, nn.Module):
                 nids = nids, 
                 cids = cids,
                 pids = pids,
-                local_ids = local_ids, 
                 batch_size = batch_size, 
-                partial_eval = partial_eval, 
                 num_edges = num_edges, 
                 BLOCK_B = BLOCK_B, 
                 BLOCK_SIZE_M = BLOCK_SIZE_M,
@@ -1072,7 +1011,6 @@ class SumLayer(Layer, nn.Module):
             BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
             TILE_SIZE_M = max(min(4096 // num_edges // BLOCK_B, host_next_power_of_2(layer_n_nodes)), 1)
 
-            partial_eval = 1 if local_ids is not None else 0
             BLOCK_SIZE_M = self.block_size
 
             grid = (host_cdiv(batch_size, BLOCK_B), host_cdiv(layer_n_nodes, TILE_SIZE_M))
@@ -1085,11 +1023,9 @@ class SumLayer(Layer, nn.Module):
                     nids = nids,
                     cids = cids,
                     pids = pids,
-                    local_ids = local_ids,
                     batch_size = batch_size,
                     num_nodes = layer_n_nodes,
                     pid_m_offset = 0,
-                    partial_eval = partial_eval,
                     num_edges = num_edges,
                     BLOCK_B = BLOCK_B,
                     TILE_SIZE_M = TILE_SIZE_M,
@@ -1112,11 +1048,9 @@ class SumLayer(Layer, nn.Module):
                         nids = nids,
                         cids = cids,
                         pids = pids,
-                        local_ids = local_ids,
                         batch_size = batch_size,
                         num_nodes = layer_n_nodes,
                         pid_m_offset = pid_m_start,
-                        partial_eval = partial_eval,
                         num_edges = num_edges,
                         BLOCK_B = BLOCK_B,
                         TILE_SIZE_M = TILE_SIZE_M,
@@ -1132,13 +1066,7 @@ class SumLayer(Layer, nn.Module):
     @staticmethod
     @torch.compile
     def _forward_pytorch_kernel(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor, 
-                                nids: torch.Tensor, cids: torch.Tensor, pids: torch.Tensor,
-                                local_ids: torch.Tensor, propagation_alg_id: int, alpha: float = 0.0):
-
-        if local_ids is not None:
-            nids = nids[local_ids]
-            cids = cids[local_ids]
-            pids = pids[local_ids]
+                                nids: torch.Tensor, cids: torch.Tensor, pids: torch.Tensor, propagation_alg_id: int, alpha: float = 0.0):
 
         num_nblocks = nids.size(0)
         num_edges = cids.size(1)
@@ -1166,15 +1094,14 @@ class SumLayer(Layer, nn.Module):
         return None
 
     def _forward_pytorch(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor, 
-                         nids: torch.Tensor, cids: torch.Tensor, pids: torch.Tensor,
-                         local_ids: torch.Tensor, propagation_alg: str = "LL", **kwargs):
+                         nids: torch.Tensor, cids: torch.Tensor, pids: torch.Tensor, propagation_alg: str = "LL", **kwargs):
 
         # Propagation algorithm
         propagation_alg_id = self.propagation_alg_mapping[propagation_alg]
         propagation_alg_kwargs = self._get_propagation_alg_kwargs(propagation_alg, **kwargs)
 
         self._forward_pytorch_kernel(
-            node_mars, element_mars, params, nids, cids, pids, local_ids,
+            node_mars, element_mars, params, nids, cids, pids,
             propagation_alg_id = propagation_alg_id, **propagation_alg_kwargs
         )
 
@@ -1185,7 +1112,7 @@ class SumLayer(Layer, nn.Module):
                   pids: Optional[torch.Tensor] = None, pfids: Optional[torch.Tensor] = None, 
                   chids: Optional[torch.Tensor] = None, parids: Optional[torch.Tensor] = None, 
                   parpids: Optional[torch.Tensor] = None, 
-                  cs_block_size: int = 0, local_ids: Optional[torch.Tensor] = None, 
+                  cs_block_size: int = 0, 
                   partition_id: int = -1, mode: Optional[str] = None,
                   allow_modify_flows: bool = False,
                   propagation_alg: str = "LL", 
@@ -1254,7 +1181,7 @@ class SumLayer(Layer, nn.Module):
         if mode == self.BLOCK_SPARSE:
             self._backward_block_sparse(
                 node_flows, element_flows, params, node_mars, element_mars, param_flows, 
-                nids, cids, pids, pfids, chids, parids, parpids, cs_block_size, local_ids, 
+                nids, cids, pids, pfids, chids, parids, parpids, cs_block_size, 
                 partition_id = partition_id, allow_modify_flows = allow_modify_flows,
                 propagation_alg = propagation_alg, logspace_flows = logspace_flows, 
                 negate_pflows = negate_pflows, accumulate_ch_flows = accumulate_ch_flows, 
@@ -1265,7 +1192,7 @@ class SumLayer(Layer, nn.Module):
         elif mode == self.SPARSE:
             self._backward_sparse(
                 node_flows, element_flows, params, node_mars, element_mars, param_flows, 
-                nids, cids, pids, pfids, chids, parids, parpids, cs_block_size, local_ids, 
+                nids, cids, pids, pfids, chids, parids, parpids, cs_block_size, 
                 partition_id = partition_id, allow_modify_flows = allow_modify_flows,
                 propagation_alg = propagation_alg, logspace_flows = logspace_flows, 
                 negate_pflows = negate_pflows, accumulate_ch_flows = accumulate_ch_flows, 
@@ -1290,13 +1217,13 @@ class SumLayer(Layer, nn.Module):
         return None
 
     def _bk_triton_modify_flow(self, node_flows: torch.Tensor, node_mars: torch.Tensor,
-                               nids: torch.Tensor, local_ids: Optional[torch.Tensor] = None,
+                               nids: torch.Tensor,
                                propagation_alg: str = "LL", **kwargs):
         """
         Replace `node_flows[nids]` with `node_flows[nids].log() - node_mars[nids]`
         """
 
-        num_nblocks = nids.size(0) if local_ids is None else local_ids.size(0)
+        num_nblocks = nids.size(0)
         layer_n_nodes = num_nblocks * self.block_size
         batch_size = node_mars.size(1)
         BATCH_SIZE_NP2 = host_next_power_of_2(batch_size)
@@ -1314,7 +1241,6 @@ class SumLayer(Layer, nn.Module):
                 BLOCK_B = min(2048, BATCH_SIZE_NP2)
                 BLOCK_M = min(2048 // BLOCK_B, self.block_size)
 
-            partial_eval = 1 if local_ids is not None else 0
             BLOCK_SIZE_M = self.block_size
 
             grid = (host_cdiv(batch_size, BLOCK_B), host_cdiv(layer_n_nodes, BLOCK_M))
@@ -1322,10 +1248,8 @@ class SumLayer(Layer, nn.Module):
             bk_nflows._bk_triton_modify_flow_kernel[grid](
                 node_flows = node_flows, 
                 node_mars = node_mars, 
-                local_ids = local_ids, 
                 nids = nids, 
                 batch_size = batch_size, 
-                partial_eval = partial_eval, 
                 BLOCK_B = BLOCK_B, 
                 BLOCK_M = BLOCK_M, 
                 BLOCK_SIZE_M = BLOCK_SIZE_M,
@@ -1338,7 +1262,6 @@ class SumLayer(Layer, nn.Module):
             BLOCK_B = min(2048, BATCH_SIZE_NP2)
             TILE_SIZE_M = min(4096 // BLOCK_B, host_next_power_of_2(layer_n_nodes))
 
-            partial_eval = 1 if local_ids is not None else 0
             BLOCK_SIZE_M = self.block_size
 
             grid = (host_cdiv(batch_size, BLOCK_B), host_cdiv(layer_n_nodes, TILE_SIZE_M))
@@ -1352,11 +1275,9 @@ class SumLayer(Layer, nn.Module):
                 bk_nflows._bk_triton_large_modify_flow_kernel[grid](
                     node_flows = node_flows,
                     node_mars = node_mars,
-                    local_ids = local_ids,
                     nids = nids,
                     num_nodes = layer_n_nodes,
                     batch_size = batch_size,
-                    partial_eval = partial_eval,
                     BLOCK_B = BLOCK_B,
                     TILE_SIZE_M = TILE_SIZE_M,
                     BLOCK_SIZE_M = BLOCK_SIZE_M,
@@ -1372,7 +1293,7 @@ class SumLayer(Layer, nn.Module):
                                element_mars: torch.Tensor, param_flows: torch.Tensor, 
                                nids: Optional[torch.Tensor], cids: Optional[torch.Tensor], pids: Optional[torch.Tensor], pfids: Optional[torch.Tensor],
                                chids: Optional[torch.Tensor], parids: Optional[torch.Tensor], parpids: Optional[torch.Tensor], 
-                               cs_block_size: int, local_ids: Optional[torch.Tensor] = None,
+                               cs_block_size: int,
                                partition_id: int = -1, allow_modify_flows: bool = False, propagation_alg: str = "LL", 
                                logspace_flows: bool = False, negate_pflows: bool = False, accumulate_ch_flows: bool = False, 
                                allow_neg_flows: bool = False, force_use_fp32 = False, pflow_temperature: float = 1.0, 
@@ -1397,7 +1318,7 @@ class SumLayer(Layer, nn.Module):
             self._backward_block_sparse_ele_flows(
                 node_flows, element_flows, params, node_mars, element_mars,
                 chids = chids, parids = parids, parpids = parpids, 
-                cs_block_size = cs_block_size, local_ids = local_ids, 
+                cs_block_size = cs_block_size, 
                 partition_id = partition_id, allow_modify_flows = allow_modify_flows,
                 propagation_alg = propagation_alg, 
                 logspace_flows = logspace_flows, 
@@ -1501,7 +1422,7 @@ class SumLayer(Layer, nn.Module):
     def _backward_block_sparse_ele_flows(self, node_flows: torch.Tensor, element_flows: torch.Tensor,
                                          params: torch.Tensor, node_mars: torch.Tensor,
                                          element_mars: torch.Tensor, chids: torch.Tensor, parids: torch.Tensor,
-                                         parpids: torch.Tensor, cs_block_size: int, local_ids: Optional[torch.Tensor] = None,
+                                         parpids: torch.Tensor, cs_block_size: int,
                                          partition_id: int = -1, allow_modify_flows: bool = False,
                                          propagation_alg: str = "LL", logspace_flows: bool = False, 
                                          accumulate_ch_flows: bool = False, allow_neg_flows: bool = False, 
@@ -1509,7 +1430,7 @@ class SumLayer(Layer, nn.Module):
 
         assert params.dim() == 1, "Expecting a 1D `params`."
 
-        num_nblocks = chids.size(0) if local_ids is None else local_ids.size(0)
+        num_nblocks = chids.size(0)
         layer_n_nodes = num_nblocks * cs_block_size
         num_edges = parids.size(1) * self.block_size
         batch_size = node_flows.size(1)
@@ -1586,7 +1507,6 @@ class SumLayer(Layer, nn.Module):
         # past the trimmed (contiguity-verified) range. The tlmm CUDA / Triton paths use K_NUM_TILES.
         num_edges = K_NUM_TILES * TILE_SIZE_K
 
-        partial_eval = 1 if local_ids is not None else 0
         BLOCK_SIZE_M = cs_block_size
         BLOCK_SIZE_K = self.block_size
         allow_modify_flows = 1 if allow_modify_flows else 0
@@ -1642,9 +1562,7 @@ class SumLayer(Layer, nn.Module):
                     parids_increment = pi,
                     parpids_start = pps,
                     parpids_increment = ppi,
-                    local_ids = local_ids,
                     batch_size = batch_size,
-                    partial_eval = partial_eval,
                     ptr_inc_step = step,
                     BLOCK_B = bb,
                     TILE_SIZE_K = tk,
@@ -1689,7 +1607,7 @@ class SumLayer(Layer, nn.Module):
             return ele_cfgs
 
         ele_key = (ele_kernel, self.block_size, cs_block_size, TILE_SIZE_K, K_NUM_TILES,
-                   ptr_inc_step, batch_size, num_nblocks, partial_eval, TL_DOT, accumulate_ch_flows,
+                   ptr_inc_step, batch_size, num_nblocks, TL_DOT, accumulate_ch_flows,
                    allow_modify_flows, logspace_flows, allow_neg_flows, propagation_alg_id,
                    default_ele_cfg)
 
@@ -1717,10 +1635,10 @@ class SumLayer(Layer, nn.Module):
         if self._ext_bw_ele_hook is not None:
             if not (propagation_alg_id == 0 and abs(eflow_temperature - 1.0) < 1e-6
                     and allow_modify_flows == 0 and logspace_flows and not allow_neg_flows
-                    and not accumulate_ch_flows and local_ids is None and not force_use_fp32):
+                    and not accumulate_ch_flows and not force_use_fp32):
                 raise NotImplementedError(
                     "external sum parameters need the plain LL element-flow regime (log-space flows, "
-                    "no tempering, no partial evaluation, and allow_modify_flows / allow_neg_flows / "
+                    "no tempering, and allow_modify_flows / allow_neg_flows / "
                     "accumulate_ch_flows off)."
                 )
             ele_ebase, ele_pbase, ele_cuda_ok = self._cached_bk_ele_cuda[signature]
@@ -1740,7 +1658,7 @@ class SumLayer(Layer, nn.Module):
         # Optional CUDA (CuTe/fp16/TMA) fast path for the element-flow backward `tlmm` regime. It is
         # numerically equivalent to the Triton ele kernel (fp16 dot + fp32 accumulate; ~1.07e-3
         # log-space) and only valid here: LL, logspace flows, allow_modify_flows / allow_neg_flows /
-        # accumulate_ch_flows all off, no tempering / partial eval, the bf16/fp16 dot regime
+        # accumulate_ch_flows all off, no tempering, the bf16/fp16 dot regime
         # (TL_DOT, not force_use_fp32), TILE_SIZE_K == 64, ptr_inc_step == 1 (contiguous layout),
         # block_size % 128 == 0, batch % 64 == 0, and a TMA-capable GPU with CUTLASS. The best of
         # {CUDA, Triton} is autotuned once per (signature, batch) -- INTO A SCRATCH buffer, never the
@@ -1748,7 +1666,7 @@ class SumLayer(Layer, nn.Module):
         # cached. Otherwise it falls through to the Triton launch below.
         if (BACKWARD_ELE_FLOW_CUDA and propagation_alg_id == 0 and abs(eflow_temperature - 1.0) < 1e-6
                 and allow_modify_flows == 0 and logspace_flows and not allow_neg_flows
-                and not accumulate_ch_flows and local_ids is None and not force_use_fp32
+                and not accumulate_ch_flows and not force_use_fp32
                 and TILE_SIZE_K == 64 and num_edges % TILE_SIZE_K == 0
                 and cs_block_size % 128 == 0 and batch_size % 64 == 0
                 and node_flows.is_cuda and cuda_kernels.ele_is_available()):
@@ -1792,7 +1710,7 @@ class SumLayer(Layer, nn.Module):
         if (BACKWARD_ELE_FLOW_CUDA and batch_size < 16 and self.block_size >= _SMALL_BATCH_MIN_BLOCK_SIZE
                 and propagation_alg_id == 0 and abs(eflow_temperature - 1.0) < 1e-6
                 and allow_modify_flows == 0 and logspace_flows and not allow_neg_flows
-                and not accumulate_ch_flows and local_ids is None and not force_use_fp32
+                and not accumulate_ch_flows and not force_use_fp32
                 and num_edges % TILE_SIZE_K == 0 and cs_block_size % 32 == 0
                 and node_flows.is_cuda and cuda_kernels.smallbatch_ele_is_available()):
             sb = self._cached_bk_ele_sb.get(signature)
@@ -2239,7 +2157,7 @@ class SumLayer(Layer, nn.Module):
                          element_mars: torch.Tensor, param_flows: torch.Tensor, 
                          nids: Optional[torch.Tensor], cids: Optional[torch.Tensor], pids: Optional[torch.Tensor], pfids: Optional[torch.Tensor],
                          chids: Optional[torch.Tensor], parids: Optional[torch.Tensor], parpids: Optional[torch.Tensor], 
-                         cs_block_size: int, local_ids: Optional[torch.Tensor] = None,
+                         cs_block_size: int,
                          partition_id: int = -1, allow_modify_flows: bool = False, 
                          propagation_alg: str = "LL", logspace_flows: bool = False, 
                          negate_pflows: bool = False, accumulate_ch_flows: bool = False, 
@@ -2264,7 +2182,7 @@ class SumLayer(Layer, nn.Module):
             self._backward_sparse_ele_flows(
                 node_flows, element_flows, params, node_mars, element_mars,
                 chids = chids, parids = parids, parpids = parpids, 
-                cs_block_size = cs_block_size, local_ids = local_ids,
+                cs_block_size = cs_block_size,
                 allow_modify_flows = allow_modify_flows,
                 propagation_alg = propagation_alg, 
                 logspace_flows = logspace_flows, 
@@ -2290,14 +2208,14 @@ class SumLayer(Layer, nn.Module):
     def _backward_sparse_ele_flows(self, node_flows: torch.Tensor, element_flows: torch.Tensor,
                                    params: torch.Tensor, node_mars: torch.Tensor,
                                    element_mars: torch.Tensor, chids: torch.Tensor, parids: torch.Tensor,
-                                   parpids: torch.Tensor, cs_block_size: int, local_ids: Optional[torch.Tensor] = None,
+                                   parpids: torch.Tensor, cs_block_size: int,
                                    allow_modify_flows: bool = False, propagation_alg: str = "LL", 
                                    logspace_flows: bool = False, accumulate_ch_flows: bool = False, 
                                    eflow_temperature: float = 1.0, **kwargs) -> None:
 
         assert params.dim() == 1, "Expecting a 1D `params`."
 
-        num_nblocks = chids.size(0) if local_ids is None else local_ids.size(0)
+        num_nblocks = chids.size(0)
         layer_n_nodes = num_nblocks * cs_block_size
         n_edge_blocks = parids.size(1)
         num_edges = n_edge_blocks * self.block_size
@@ -2361,9 +2279,7 @@ class SumLayer(Layer, nn.Module):
                     chids = chids,
                     parids = parids,
                     parpids = parpids,
-                    local_ids = local_ids,
                     batch_size = batch_size,
-                    partial_eval = 1 if local_ids is not None else 0,
                     n_edge_blocks = n_edge_blocks,
                     allow_modify_flows = allow_modify_flows,
                     logspace_flows = logspace_flows,
@@ -2387,9 +2303,7 @@ class SumLayer(Layer, nn.Module):
                     chids = chids, 
                     parids = parids,
                     parpids = parpids,
-                    local_ids = local_ids,
                     batch_size = batch_size,
-                    partial_eval = 1 if local_ids is not None else 0,
                     n_edge_blocks = n_edge_blocks,
                     BLOCK_B = BLOCK_B,
                     BLOCK_M = BLOCK_M,
@@ -2419,11 +2333,9 @@ class SumLayer(Layer, nn.Module):
                         chids = chids,
                         parids = parids,
                         parpids = parpids,
-                        local_ids = local_ids,
                         num_eles = layer_n_nodes,
                         pid_m_offset = 0,
                         batch_size = batch_size,
-                        partial_eval = 1 if local_ids is not None else 0,
                         n_edge_blocks = n_edge_blocks,
                         allow_modify_flows = allow_modify_flows,
                         logspace_flows = logspace_flows,
@@ -2451,11 +2363,9 @@ class SumLayer(Layer, nn.Module):
                             chids = chids,
                             parids = parids,
                             parpids = parpids,
-                            local_ids = local_ids,
                             num_eles = layer_n_nodes,
                             pid_m_offset = pid_m_start,
                             batch_size = batch_size,
-                            partial_eval = 1 if local_ids is not None else 0,
                             n_edge_blocks = n_edge_blocks,
                             allow_modify_flows = allow_modify_flows,
                             logspace_flows = logspace_flows,
@@ -2480,11 +2390,9 @@ class SumLayer(Layer, nn.Module):
                         chids = chids,
                         parids = parids,
                         parpids = parpids,
-                        local_ids = local_ids,
                         num_eles = layer_n_nodes,
                         pid_m_offset = 0,
                         batch_size = batch_size,
-                        partial_eval = 1 if local_ids is not None else 0,
                         n_edge_blocks = n_edge_blocks,
                         BLOCK_B = BLOCK_B,
                         TILE_SIZE_M = TILE_SIZE_M,
@@ -2509,11 +2417,9 @@ class SumLayer(Layer, nn.Module):
                             chids = chids,
                             parids = parids,
                             parpids = parpids,
-                            local_ids = local_ids,
                             num_eles = layer_n_nodes,
                             pid_m_offset = pid_m_start,
                             batch_size = batch_size,
-                            partial_eval = 1 if local_ids is not None else 0,
                             n_edge_blocks = n_edge_blocks,
                             BLOCK_B = BLOCK_B,
                             TILE_SIZE_M = TILE_SIZE_M,
@@ -2897,53 +2803,3 @@ class SumLayer(Layer, nn.Module):
                 param_flows[pfids[sid:eid,:]] += parflows[sid:eid,:]
 
         return None
-
-    def _prepare_scope2nids(self, prod_scope_eleids: Sequence[Tuple[BitSet, torch.Tensor]]):
-        if not (hasattr(self, "fw_scope2localids") and hasattr(self, "bk_scope2localids")):
-            fw_scope2localids = dict()
-            bk_scope2localids = dict()
-
-            # Forward local indices
-            global_nid = self._layer_nid_range[0]
-            for ns in self.nodes:
-                scope = ns.scope
-
-                s_nid = global_nid
-                e_nid = global_nid + ns.num_nodes
-
-                with torch.no_grad():
-                    if scope not in fw_scope2localids:
-                        fw_scope2localids[scope] = [
-                            torch.zeros([0], dtype = torch.long).to(self.partitioned_nids[0].device) for _ in range(self.num_fw_partitions)
-                        ]
-
-                    for partition_id in range(self.num_fw_partitions):
-                        nids = self.partitioned_nids[partition_id]
-                        partition_local_ids = torch.where((nids >= s_nid) & (nids < e_nid))[0]
-
-                        fw_scope2localids[scope][partition_id] = torch.cat(
-                            (fw_scope2localids[scope][partition_id], partition_local_ids), dim = 0
-                        )
-
-                global_nid += ns.num_nodes
-
-            # Backward local indices
-            for scope, ele_id_range in prod_scope_eleids:
-                s_eid, e_eid = ele_id_range
-
-                with torch.no_grad():
-                    if scope not in bk_scope2localids:
-                        bk_scope2localids[scope] = [
-                            torch.zeros([0], dtype = torch.long).to(self.partitioned_chids[0].device) for _ in range(self.num_bk_partitions)
-                        ]
-
-                    for partition_id in range(self.num_bk_partitions):
-                        chids = self.partitioned_chids[partition_id]
-                        partition_local_ids = torch.where((chids >= s_eid) & (chids < e_eid))[0]
-
-                        bk_scope2localids[scope][partition_id] = torch.cat(
-                            (bk_scope2localids[scope][partition_id], partition_local_ids), dim = 0
-                        )
-
-            self.fw_scope2localids = fw_scope2localids
-            self.bk_scope2localids = bk_scope2localids

@@ -22,7 +22,7 @@ from pyjuice.utils.kernel_launcher import triton_jit
 
 @triton_jit
 def _fw_triton_sparse_kernel(node_mars, element_mars, mparams, nids, cids, pids,
-                             local_ids, batch_size, partial_eval: tl.constexpr, num_edges: tl.constexpr, 
+                             batch_size, num_edges: tl.constexpr, 
                              BLOCK_B: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, propagation_alg_id: tl.constexpr, 
                              pflow_tempered_enabled: tl.constexpr, alpha = 0.0, node_mars_tempered = None,
                              pflow_temperature = 1.0):
@@ -32,10 +32,6 @@ def _fw_triton_sparse_kernel(node_mars, element_mars, mparams, nids, cids, pids,
 
     # Get inferred node block id from `pid_m`
     nblock_id = pid_m
-
-    # Get the real node block id in the case of partial evaluation
-    if partial_eval == 1:
-        nblock_id = tl.load(local_ids + nblock_id)
 
     # Initialize pointers to `params`
     offs_edge = tl.arange(0, num_edges)
@@ -108,8 +104,8 @@ def _fw_triton_sparse_kernel(node_mars, element_mars, mparams, nids, cids, pids,
 
 # @triton.jit
 @triton_jit
-def _fw_triton_large_sparse_kernel(node_mars, element_mars, mparams, nids, cids, pids, local_ids, batch_size, 
-                                   num_nodes, pid_m_offset, partial_eval: tl.constexpr, num_edges: tl.constexpr, BLOCK_B: tl.constexpr, 
+def _fw_triton_large_sparse_kernel(node_mars, element_mars, mparams, nids, cids, pids, batch_size, 
+                                   num_nodes, pid_m_offset, num_edges: tl.constexpr, BLOCK_B: tl.constexpr, 
                                    TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, propagation_alg_id: tl.constexpr, 
                                    pflow_tempered_enabled: tl.constexpr, alpha = 0.0, node_mars_tempered = None,
                                    pflow_temperature = 1.0):
@@ -123,10 +119,6 @@ def _fw_triton_large_sparse_kernel(node_mars, element_mars, mparams, nids, cids,
     # Get inferred node block id from `pid_m`
     nblock_ids = offs_m // BLOCK_SIZE_M
     tile_ids = offs_m % BLOCK_SIZE_M
-
-    # Get the real node block id in the case of partial evaluation
-    if partial_eval == 1:
-        nblock_ids = tl.load(local_ids + nblock_ids, mask = mask_m)
 
     # Initialize pointers to `params`
     offs_edge = tl.arange(0, num_edges)

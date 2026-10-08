@@ -977,11 +977,11 @@ def test_soft_evidence_categorical_value_mask_no_slowdown():
     common_kwargs = dict(
         params_ptr = input_layer.params, node_mars_ptr = node_mars, data_ptr = data_flat,
         vids_ptr = input_layer.vids, s_pids_ptr = input_layer.s_pids, metadata_ptr = input_layer.metadata,
-        s_mids_ptr = input_layer.s_mids, nids_ptr = input_layer.nids, fw_local_ids_ptr = None,
+        s_mids_ptr = input_layer.s_mids, nids_ptr = input_layer.nids,
         layer_num_nodes = input_layer._output_ind_range[1] - input_layer._output_ind_range[0],
         batch_size = batch_size, num_vars_per_node = input_layer.num_vars_per_node,
         nv_block_size = triton.next_power_of_2(input_layer.num_vars_per_node),
-        node_offset = input_layer._output_ind_range[0], partial_eval = 0, num_warps = 8
+        node_offset = input_layer._output_ind_range[0], num_warps = 8
     )
 
     prep_kwargs = dict(categorical_evidence_logp = evi, batch_size = batch_size)

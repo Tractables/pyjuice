@@ -87,7 +87,7 @@ def test_hmm_flow_stability():
             pc.zero_param_flows()
 
             prod_layer = pc.inner_layer_groups[layer_id-1][0]
-            prod_layer.forward(pc.node_mars, pc.element_mars, _for_backward = True)
+            prod_layer.forward(pc.node_mars, pc.element_mars)
             layer = pc.inner_layer_groups[layer_id][0]
             layer.backward(pc.node_flows, pc.element_flows, pc.node_mars, pc.element_mars,
                         pc.params, pc.param_flows, logspace_flows = True)

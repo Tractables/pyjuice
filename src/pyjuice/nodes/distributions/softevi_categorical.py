@@ -160,8 +160,6 @@ def _fw_cuda_structural(layer, kwargs):
         return False
     if kwargs.get("soft_evidence_value_mask", None) is not None:
         return False
-    if layer.provided("fw_local_ids"):
-        return False
     try:
         from .c_kernels import dense_expected_flow_available
         return dense_expected_flow_available()
@@ -172,9 +170,9 @@ def _fw_cuda_structural(layer, kwargs):
 def _fw_cuda_applicable(layer, kwargs):
     """Whether to take a CUDA forward at all.
 
-    Structural requirements first (top-k evidence, no value mask, no partial evaluation, extension
-    built), then the same "is it big enough" test the backward uses. Both CUDA forwards were tuned on a
-    configuration whose parameter table is far larger than L2 -- the gather form's 512-thread cliff and
+    Structural requirements first (top-k evidence, no value mask, extension built), then the same
+    "is it big enough" test the backward uses. Both CUDA forwards were tuned on a configuration whose
+    parameter table is far larger than L2 -- the gather form's 512-thread cliff and
     its streaming loads are both about DRAM behaviour. When the table is L2-resident none of that
     applies and the well-tuned Triton kernel is the safer choice, so fall back rather than extrapolate
     from a regime that was never measured.
@@ -549,7 +547,6 @@ def _prep_args_apply_fw_kernel(layer, kwargs):
         target_kwargs["has_ext_ids"] = False
 
     # Prepare block/grid size
-    assert not layer.provided("fw_local_ids")
     n_block_size = max_power_of_2_factor(layer.n_block_size)
 
     # prepare BLOCK_SIZE and TILE_SIZE_K
@@ -661,8 +658,6 @@ def _fw_gemm_applicable(layer, kwargs):
         return False                                     # top-k: no dense table pass to amortise
     if kwargs.get("categorical_evidence_logp", None) is None:
         return False
-    if layer.provided("fw_local_ids"):
-        return False                                     # partial evaluation: not this layout
     # NO `missing_mask` CHECK HERE, deliberately. An earlier version had one and it was DEAD:
     # `missing_mask` is a named parameter of `InputLayer.forward`, not part of `**kwargs`, so
     # `kwargs.get("missing_mask")` is always None and the guard never fired. It is also unnecessary --
@@ -867,7 +862,6 @@ def _prep_args_apply_bk_params_kernel(layer, kwargs):
     target_kwargs["var_idmapping_ptr"] = layer.var_idmapping
 
     # Prepare block/grid size
-    assert not layer.provided("fw_local_ids")
     n_block_size = max_power_of_2_factor(layer.n_block_size)
 
     # prepare BLOCK_SIZE
@@ -1060,8 +1054,6 @@ def _dense_topk_applicable(layer, kwargs):
         # scattered kernel pays the same [batch, latent, candidate] gather of `params` for it that the
         # denominator did, and the same inversion removes it: the dense kernels run with `update_pflows`
         # off. CoDD shape, fwd+bwd, dual-flow off: 29.8 -> 12.7 ms at batch 14, 64.7 -> 27.4 at 32.
-        return False
-    if layer.provided("bk_local_ids"):
         return False
     if not _dense_worth_it(layer, kwargs):
         return False
@@ -1909,7 +1901,6 @@ def _prep_args_apply_bk_softevi_kernel(layer, kwargs):
         target_kwargs["has_ext_ids"] = False
 
     # Prepare block/grid size
-    assert not layer.provided("fw_local_ids")
     n_block_size = max_power_of_2_factor(layer.n_block_size)
 
     # prepare BLOCK_SIZE and TILE_SIZE_K
@@ -2223,8 +2214,8 @@ class SoftEvidenceCategorical(Distribution):
 
     @staticmethod
     @triton_jit
-    def fw_kernel(params_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, metadata_ptr, s_mids_ptr, nids_ptr, fw_local_ids_ptr, layer_num_nodes,
-                  batch_size, num_vars_per_node: tl.constexpr, nv_block_size: tl.constexpr, node_offset, partial_eval: tl.constexpr,
+    def fw_kernel(params_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, metadata_ptr, s_mids_ptr, nids_ptr, layer_num_nodes,
+                  batch_size, num_vars_per_node: tl.constexpr, nv_block_size: tl.constexpr, node_offset, 
                   TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, BLOCK_SIZE_B: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, use_tensor_core: tl.constexpr,
                   categorical_evidence_logp_ptr, soft_evidence_cat_ids_ptr, var_idmapping_ptr, num_cats: tl.constexpr, ext_num_vars: tl.constexpr, has_ext_ids: tl.constexpr,
                   params_t_ptr, row_idx_ptr, num_rows, TRANSPOSED: tl.constexpr):
@@ -2402,8 +2393,8 @@ class SoftEvidenceCategorical(Distribution):
 
     @staticmethod
     @triton_jit
-    def fw_w_value_mask_kernel(params_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, metadata_ptr, s_mids_ptr, nids_ptr, fw_local_ids_ptr, layer_num_nodes,
-                               batch_size, num_vars_per_node: tl.constexpr, nv_block_size: tl.constexpr, node_offset, partial_eval: tl.constexpr,
+    def fw_w_value_mask_kernel(params_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, metadata_ptr, s_mids_ptr, nids_ptr, layer_num_nodes,
+                               batch_size, num_vars_per_node: tl.constexpr, nv_block_size: tl.constexpr, node_offset, 
                                TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, BLOCK_SIZE_B: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, use_tensor_core: tl.constexpr,
                                categorical_evidence_logp_ptr, soft_evidence_cat_ids_ptr, soft_evidence_value_mask_ptr, var_idmapping_ptr,
                                num_cats: tl.constexpr, ext_num_vars: tl.constexpr, has_ext_ids: tl.constexpr,
@@ -2613,8 +2604,8 @@ class SoftEvidenceCategorical(Distribution):
     @staticmethod
     @triton_jit
     def bk_params_kernel(params_ptr, param_flows_ptr, node_flows_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, s_pfids_ptr, metadata_ptr, s_mids_ptr, nids_ptr,
-                         bk_local_ids_ptr, layer_num_nodes, batch_size, num_vars_per_node: tl.constexpr, num_vars: tl.constexpr, nv_block_size: tl.constexpr,
-                         node_offset, partial_eval: tl.constexpr, logspace_flows: tl.constexpr, BLOCK_SIZE_B: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, 
+                         layer_num_nodes, batch_size, num_vars_per_node: tl.constexpr, num_vars: tl.constexpr, nv_block_size: tl.constexpr,
+                         node_offset, logspace_flows: tl.constexpr, BLOCK_SIZE_B: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, 
                          categorical_evidence_logp_ptr, var_idmapping_ptr, num_cats: tl.constexpr, ext_num_vars: tl.constexpr):
 
         pid_b = tl.program_id(axis = 0)
@@ -2651,8 +2642,8 @@ class SoftEvidenceCategorical(Distribution):
     @staticmethod
     @triton_jit
     def bk_softevi_kernel(params_ptr, param_flows_ptr, node_flows_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, s_pfids_ptr, metadata_ptr, s_mids_ptr, nids_ptr,
-                          bk_local_ids_ptr, layer_num_nodes, batch_size, num_vars_per_node: tl.constexpr, num_vars: tl.constexpr, nv_block_size: tl.constexpr,
-                          node_offset, partial_eval: tl.constexpr, logspace_flows: tl.constexpr, BLOCK_SIZE_B: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, 
+                          layer_num_nodes, batch_size, num_vars_per_node: tl.constexpr, num_vars: tl.constexpr, nv_block_size: tl.constexpr,
+                          node_offset, logspace_flows: tl.constexpr, BLOCK_SIZE_B: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, 
                           TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr, use_tensor_core: tl.constexpr,
                           categorical_evidence_logp_ptr, soft_evidence_cat_ids_ptr, categorical_evidence_logp_grad_ptr, var_idmapping_ptr,
                           num_cats: tl.constexpr, tot_num_cats: tl.constexpr, ext_num_vars: tl.constexpr, has_ext_ids: tl.constexpr, update_pflows: tl.constexpr, update_extflows: tl.constexpr,
@@ -2920,9 +2911,9 @@ class SoftEvidenceCategorical(Distribution):
     @staticmethod
     @triton_jit
     def bk_dense_prologue_kernel(params_ptr, param_flows_ptr, node_flows_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, s_pfids_ptr,
-                                 metadata_ptr, s_mids_ptr, nids_ptr, bk_local_ids_ptr, layer_num_nodes, batch_size,
+                                 metadata_ptr, s_mids_ptr, nids_ptr, layer_num_nodes, batch_size,
                                  num_vars_per_node: tl.constexpr, num_vars: tl.constexpr, nv_block_size: tl.constexpr,
-                                 node_offset, partial_eval: tl.constexpr, logspace_flows: tl.constexpr,
+                                 node_offset, logspace_flows: tl.constexpr,
                                  BLOCK_SIZE_B: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
                                  TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
                                  categorical_evidence_logp_ptr, soft_evidence_cat_ids_ptr,
@@ -3047,9 +3038,9 @@ class SoftEvidenceCategorical(Distribution):
     @staticmethod
     @triton_jit
     def bk_dense_denom_kernel(params_ptr, param_flows_ptr, node_flows_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, s_pfids_ptr,
-                              metadata_ptr, s_mids_ptr, nids_ptr, bk_local_ids_ptr, layer_num_nodes, batch_size,
+                              metadata_ptr, s_mids_ptr, nids_ptr, layer_num_nodes, batch_size,
                               num_vars_per_node: tl.constexpr, num_vars: tl.constexpr, nv_block_size: tl.constexpr,
-                              node_offset, partial_eval: tl.constexpr, logspace_flows: tl.constexpr,
+                              node_offset, logspace_flows: tl.constexpr,
                               uniq_ptr, ref_slot_ptr, ref_pt_ptr, ref_goff_ptr, ref_cnt_ptr, num_uniq_ptr,
                               pf_base_ptr, p_base_ptr, ratio_ptr, categorical_evidence_logp_grad_ptr,
                               num_latents: tl.constexpr, tot_num_cats: tl.constexpr, pf_row_stride: tl.constexpr,

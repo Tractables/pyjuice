@@ -41,10 +41,6 @@ class InputLayer(Layer, nn.Module):
     #: distributions are added per layer (see `Distribution.call_kwargs`).
     call_kwargs = ("missing_mask", "_batch_first", "_apply_missing_mask_only")
 
-    # The partial-evaluation selections, None while every node is evaluated (see `Layer`)
-    fw_local_ids = None
-    bk_local_ids = None
-
     def __init__(self, nodes: Sequence[InputNodes], cum_nodes: int = 0, pc_num_vars: int = 0, max_tied_ns_per_parflow_block: int = 4) -> None:
         """
         Compiler flags:
@@ -415,12 +411,7 @@ class InputLayer(Layer, nn.Module):
             batch_size = node_mars.size(1)
             node_offset = self._output_ind_range[0]
 
-            if not self.provided("fw_local_ids"):
-                layer_num_nodes = self._output_ind_range[1] - self._output_ind_range[0]
-                fw_local_ids = None
-            else:
-                layer_num_nodes = self.fw_local_ids.size(0)
-                fw_local_ids = self.fw_local_ids
+            layer_num_nodes = self._output_ind_range[1] - self._output_ind_range[0]
 
             # :note: guard on whether the kernel has been BUILT, not on whether it is non-None.
             #        `provided()` is False for a None value, so distributions whose `fw_mar_fn` compiles
@@ -448,14 +439,12 @@ class InputLayer(Layer, nn.Module):
                         s_pids_ptr = self.s_pids, 
                         metadata_ptr = self.metadata, 
                         s_mids_ptr = self.s_mids, 
-                        fw_local_ids_ptr = fw_local_ids,
                         layer_num_nodes = layer_num_nodes, 
                         batch_size = batch_size, 
                         num_vars_per_node = self.num_vars_per_node, 
                         nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
                         node_offset = node_offset, 
                         BLOCK_SIZE = BLOCK_SIZE, 
-                        partial_eval = 1 if fw_local_ids is not None else 0,
                         num_warps = 8
                     )
             else:
@@ -494,13 +483,11 @@ class InputLayer(Layer, nn.Module):
                     missing_mask_ptr = missing_mask,
                     node_mars_ptr = node_mars, 
                     vids_ptr = self.vids, 
-                    fw_local_ids_ptr = fw_local_ids,
                     num_vars = self.pc_num_vars,
                     layer_num_nodes = layer_num_nodes, 
                     batch_size = batch_size, 
                     node_offset = node_offset, 
                     BLOCK_SIZE = 1024, 
-                    partial_eval = 1 if fw_local_ids is not None else 0,
                     mode = mode,
                     num_warps = 8
                 )
@@ -513,12 +500,7 @@ class InputLayer(Layer, nn.Module):
         `node_mars` to write. A method rather than a dict built inline (as the backward's is) because a
         distribution timing alternative kernel sets from inside the BACKWARD has to run the forward too,
         into a scratch `node_mars` -- see `SoftEvidenceCategorical`'s `_tune_dense_choice`."""
-        if not self.provided("fw_local_ids"):
-            layer_num_nodes = self._output_ind_range[1] - self._output_ind_range[0]
-            fw_local_ids = None
-        else:
-            layer_num_nodes = self.fw_local_ids.size(0)
-            fw_local_ids = self.fw_local_ids
+        layer_num_nodes = self._output_ind_range[1] - self._output_ind_range[0]
 
         return dict(
             params_ptr = self.params,
@@ -529,13 +511,11 @@ class InputLayer(Layer, nn.Module):
             metadata_ptr = self.metadata,
             s_mids_ptr = self.s_mids,
             nids_ptr = self.nids,
-            fw_local_ids_ptr = fw_local_ids,
             layer_num_nodes = layer_num_nodes,
             batch_size = node_mars.size(1),
             num_vars_per_node = self.num_vars_per_node,
             nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
             node_offset = self._output_ind_range[0],
-            partial_eval = 1 if fw_local_ids is not None else 0,
             num_warps = 8,
         )
 
@@ -583,12 +563,7 @@ class InputLayer(Layer, nn.Module):
             batch_size = node_flows.size(1)
             node_offset = self._output_ind_range[0]
 
-            if not self.provided("bk_local_ids"):
-                layer_num_nodes = self._output_ind_range[1] - self._output_ind_range[0]
-                bk_local_ids = None
-            else:
-                layer_num_nodes = self.bk_local_ids.size(0)
-                bk_local_ids = self.bk_local_ids
+            layer_num_nodes = self._output_ind_range[1] - self._output_ind_range[0]
 
             # Missing mask
             num_vars = None
@@ -609,7 +584,7 @@ class InputLayer(Layer, nn.Module):
             # replaces the Triton _flows kernel below when the gate holds. The post-processing kernels
             # and missing-mask handling are unaffected. Falls back to Triton otherwise.
             cuda_handled = False
-            if (INPUT_FLOW_CUDA and self.bk_flow_cuda_fn is not None and bk_local_ids is None
+            if (INPUT_FLOW_CUDA and self.bk_flow_cuda_fn is not None
                     and missing_mask is None and self.num_vars_per_node == 1
                     and node_flows.is_cuda and node_flows.is_contiguous() and node_flows.dtype == torch.float32
                     and self.param_flows is not None and self.param_flows.is_contiguous()
@@ -652,7 +627,6 @@ class InputLayer(Layer, nn.Module):
                     s_pfids_ptr = self.s_pfids,
                     metadata_ptr = self.metadata, 
                     s_mids_ptr = self.s_mids, 
-                    bk_local_ids_ptr = bk_local_ids,
                     layer_num_nodes = layer_num_nodes, 
                     batch_size = batch_size, 
                     num_vars_per_node = self.num_vars_per_node, 
@@ -660,7 +634,6 @@ class InputLayer(Layer, nn.Module):
                     nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
                     node_offset = node_offset, 
                     BLOCK_SIZE = BLOCK_SIZE, 
-                    partial_eval = 1 if bk_local_ids is not None else 0,
                     logspace_flows = logspace_flows,
                     missing_mask_mode = missing_mask_mode,
                     TILE_SIZE_K = 1,
@@ -697,14 +670,12 @@ class InputLayer(Layer, nn.Module):
                 metadata_ptr = self.metadata,
                 s_mids_ptr = self.s_mids,
                 nids_ptr = self.nids,
-                bk_local_ids_ptr = bk_local_ids,
                 layer_num_nodes = layer_num_nodes,
                 batch_size = batch_size,
                 num_vars_per_node = self.num_vars_per_node,
                 num_vars = num_vars,
                 nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
                 node_offset = node_offset,
-                partial_eval = 1 if bk_local_ids is not None else 0,
                 logspace_flows = logspace_flows,
                 num_warps = 8,
             )
@@ -715,13 +686,13 @@ class InputLayer(Layer, nn.Module):
             # Handle the masked input nodes
             if missing_mask is not None and self.bk_flow_mask_fn is not None:
                 self._backward_missing(node_flows, missing_mask, missing_mask_mode, num_vars,
-                                       bk_local_ids, logspace_flows)
+                                       logspace_flows)
         else:
             raise NotImplementedError("CPU backward fn for input nodes is not implemented.")
 
     def _backward_missing(self, node_flows: torch.Tensor, missing_mask: torch.Tensor,
                           missing_mask_mode: int, num_vars: Optional[int],
-                          bk_local_ids: Optional[torch.Tensor], logspace_flows: bool):
+                          logspace_flows: bool):
         """Accumulate the flows of the MARGINALIZED positions.
 
         A marginalized leaf has no observation, so `bk_flow_mask_fn` spreads its flow over the whole
@@ -761,12 +732,6 @@ class InputLayer(Layer, nn.Module):
             node_miss = missing_mask[vids]                         # [layer_num_nodes, batch_size]
 
         miss_flows = (flows * node_miss).sum(dim = 1)
-
-        if bk_local_ids is not None:
-            # Partial evaluation: nodes outside `bk_local_ids` did not take part in this backward
-            keep = torch.zeros_like(miss_flows)
-            keep[bk_local_ids] = 1.0
-            miss_flows = miss_flows * keep
 
         # `add_missing_flows` indexes `node_flows` globally, so hand it a full-length vector. Cached
         # because it is one float per node in the WHOLE circuit -- small, but not worth reallocating.
@@ -1129,53 +1094,6 @@ class InputLayer(Layer, nn.Module):
         """
         return self.nodes[0].dist
 
-    def enable_partial_evaluation(self, fw_scopes: Optional[Union[Sequence[BitSet],Sequence[int]]] = None, 
-                                  bk_scopes: Optional[Union[Sequence[BitSet],Sequence[int]]] = None, return_ids: bool = False):
-        # Create cache if needed
-        if not self.provided("scope2localgids"):
-            self._prepare_scope2nids()
-
-        # Filter forward nodes
-        if fw_scopes is not None:
-            fw_local_ids = []
-            for scope in fw_scopes:
-                if isinstance(scope, int):
-                    scope = BitSet.from_array([scope])
-
-                if scope not in self.scope2localgids:
-                    continue
-
-                fw_local_ids.append(self.scope2localgids[scope])
-
-            if return_ids:
-                return torch.cat(fw_local_ids, dim = 0)
-            else:
-                self.fw_local_ids = torch.cat(fw_local_ids, dim = 0)
-
-        # Filter backward nodes
-        if bk_scopes is not None:
-            bk_local_ids = []
-            for scope in bk_scopes:
-                if isinstance(scope, int):
-                    scope = BitSet.from_array([scope])
-
-                if scope not in self.scope2localgids:
-                    continue
-
-                bk_local_ids.append(self.scope2localgids[scope])
-
-            if return_ids:
-                return torch.cat(bk_local_ids, dim = 0)
-            else:
-                self.bk_local_ids = torch.cat(bk_local_ids, dim = 0)
-
-    def disable_partial_evaluation(self, forward: bool = True, backward: bool = True):
-        if forward:
-            self.fw_local_ids = None
-
-        if backward:
-            self.bk_local_ids = None
-
     def update_parameters(self):
         for idx, ns in enumerate(self.nodes):
             if ns.is_tied():
@@ -1183,34 +1101,6 @@ class InputLayer(Layer, nn.Module):
 
             par_start, par_end = ns._param_range
             ns._params = self.params.data[par_start:par_end].detach().cpu().clone()
-
-    def _prepare_scope2nids(self):
-        if not hasattr(self, "scope2localgids"):
-            scope2localgids = dict()
-
-            # Build per-node indices (not per-block): every InputLayer kernel that
-            # consumes `fw_local_ids` / `bk_local_ids` uses them as offsets into
-            # per-node tensors (`vids`, `s_pids`, ...), so they must count nodes.
-            # Counting blocks here silently drops `num_nodes - num_node_blocks`
-            # nodes per `InputNodes` whenever `block_size > 1`.
-            local_nid = 0
-            for ns in self.nodes:
-                scope = ns.scope
-
-                s_nid = local_nid
-                e_nid = local_nid + ns.num_nodes
-
-                with torch.no_grad():
-                    if scope not in scope2localgids:
-                        scope2localgids[scope] = [torch.zeros([0], dtype = torch.long)]
-
-                    scope2localgids[scope].append(torch.arange(s_nid, e_nid))
-
-                local_nid += ns.num_nodes
-
-            self.scope2localgids = {
-                scope: torch.cat(ids, dim = 0).to(self.params.device) for scope, ids in scope2localgids.items()
-            }
 
     def is_input(self):
         return True
@@ -1269,7 +1159,7 @@ class InputLayer(Layer, nn.Module):
 
     @staticmethod
     def _mars_kernel_template(mar_fn, params_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, metadata_ptr, s_mids_ptr, 
-                              fw_local_ids_ptr, partial_eval: tl.constexpr, layer_num_nodes: tl.constexpr, batch_size: tl.constexpr, 
+                              layer_num_nodes: tl.constexpr, batch_size: tl.constexpr, 
                               num_vars_per_node: tl.constexpr, nv_block_size: tl.constexpr, node_offset: tl.constexpr, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(axis = 0)
         block_start = pid * BLOCK_SIZE
@@ -1281,8 +1171,6 @@ class InputLayer(Layer, nn.Module):
         batch_offsets = (offsets % batch_size)
         local_offsets = (offsets // batch_size)
 
-        if partial_eval > 0:
-            local_offsets = tl.load(fw_local_ids_ptr + local_offsets, mask = mask, other = 0)
 
         if num_vars_per_node == 1:
             # Get all variable ids
@@ -1311,9 +1199,9 @@ class InputLayer(Layer, nn.Module):
     @staticmethod
     # @triton.jit
     @triton_jit
-    def _fw_missing_mask_kernel(missing_mask_ptr, node_mars_ptr, vids_ptr, fw_local_ids_ptr, num_vars,
+    def _fw_missing_mask_kernel(missing_mask_ptr, node_mars_ptr, vids_ptr, num_vars,
                                 layer_num_nodes: tl.constexpr, batch_size: tl.constexpr, node_offset: tl.constexpr, 
-                                BLOCK_SIZE: tl.constexpr, partial_eval: tl.constexpr, mode: tl.constexpr):
+                                BLOCK_SIZE: tl.constexpr, mode: tl.constexpr):
         pid = tl.program_id(axis = 0)
         block_start = pid * BLOCK_SIZE
 
@@ -1324,8 +1212,6 @@ class InputLayer(Layer, nn.Module):
         batch_offsets = (offsets % batch_size)
         local_offsets = (offsets // batch_size)
 
-        if partial_eval > 0:
-            local_offsets = tl.load(fw_local_ids_ptr + local_offsets, mask = mask, other = 0)
 
         # Get all variable ids
         vids = tl.load(vids_ptr + local_offsets, mask = mask, other = 0)
@@ -1351,7 +1237,7 @@ class InputLayer(Layer, nn.Module):
 
     @staticmethod
     def _flows_kernel_template(flow_fn, params_ptr, param_flows_ptr, node_flows_ptr, node_mars_ptr, data_ptr, missing_mask_ptr, vids_ptr, s_pids_ptr, s_pfids_ptr,
-                               metadata_ptr, s_mids_ptr, bk_local_ids_ptr, partial_eval: tl.constexpr, logspace_flows: tl.constexpr, layer_num_nodes: tl.constexpr, 
+                               metadata_ptr, s_mids_ptr, logspace_flows: tl.constexpr, layer_num_nodes: tl.constexpr, 
                                batch_size: tl.constexpr, num_vars_per_node: tl.constexpr, num_vars: tl.constexpr, nv_block_size: tl.constexpr, node_offset: tl.constexpr, 
                                missing_mask_mode: tl.constexpr, BLOCK_SIZE: tl.constexpr, TILE_SIZE_K: tl.constexpr):
         pid = tl.program_id(axis = 0)
@@ -1364,8 +1250,6 @@ class InputLayer(Layer, nn.Module):
         batch_offsets = (offsets % batch_size)
         local_offsets = (offsets // batch_size)
 
-        if partial_eval > 0:
-            local_offsets = tl.load(bk_local_ids_ptr + local_offsets, mask = mask, other = 0)
 
         if num_vars_per_node == 1:
             # Get all variable ids

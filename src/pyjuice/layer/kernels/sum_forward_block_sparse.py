@@ -24,7 +24,7 @@ from pyjuice.layer.kernels import _round_to_tf32
 # @triton.jit
 @triton_jit
 def _fw_triton_block_sparse_tlmm_kernel(node_mars, element_mars, mparams, nids, cids_start, cids_increment,
-                                        pids_start, pids_increment, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
+                                        pids_start, pids_increment, batch_size: tl.constexpr, 
                                         BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
                                         TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, use_bf16: tl.constexpr,
                                         propagation_alg_id: tl.constexpr, pflow_tempered_enabled: tl.constexpr, 
@@ -36,10 +36,6 @@ def _fw_triton_block_sparse_tlmm_kernel(node_mars, element_mars, mparams, nids, 
     # Get inferred node block id from `pid_m`
     nblock_id = pid_m // (BLOCK_SIZE_M // TILE_SIZE_M)
     tile_id = pid_m % (BLOCK_SIZE_M // TILE_SIZE_M)
-
-    # Get the real node block id in the case of partial evaluation
-    if partial_eval == 1:
-        nblock_id = tl.load(local_ids + nblock_id)
 
     # Node offsets
     offs_node = tl.arange(0, TILE_SIZE_M) + tile_id * TILE_SIZE_M
@@ -172,7 +168,7 @@ def _fw_triton_block_sparse_tlmm_kernel(node_mars, element_mars, mparams, nids, 
 # @triton.jit
 @triton_jit
 def _fw_triton_block_sparse_csmm1_kernel(node_mars, element_mars, mparams, nids, cids_start, cids_increment,
-                                        pids_start, pids_increment, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
+                                        pids_start, pids_increment, batch_size: tl.constexpr, 
                                         BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
                                         TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, use_bf16: tl.constexpr,
                                         propagation_alg_id: tl.constexpr, pflow_tempered_enabled: tl.constexpr, 
@@ -184,10 +180,6 @@ def _fw_triton_block_sparse_csmm1_kernel(node_mars, element_mars, mparams, nids,
     # Get inferred node block id from `pid_m`
     nblock_id = pid_m // (BLOCK_SIZE_M // TILE_SIZE_M)
     tile_id = pid_m % (BLOCK_SIZE_M // TILE_SIZE_M)
-
-    # Get the real node block id in the case of partial evaluation
-    if partial_eval == 1:
-        nblock_id = tl.load(local_ids + nblock_id)
 
     # Node offsets
     offs_node = tl.arange(0, TILE_SIZE_M) + tile_id * TILE_SIZE_M
@@ -324,7 +316,7 @@ def _fw_triton_block_sparse_csmm1_kernel(node_mars, element_mars, mparams, nids,
 # @triton.jit
 @triton_jit
 def _fw_triton_block_sparse_csmm2_kernel(node_mars, element_mars, mparams, nids, cids_start, cids_increment,
-                                         pids_start, pids_increment, local_ids, batch_size: tl.constexpr, partial_eval: tl.constexpr,
+                                         pids_start, pids_increment, batch_size: tl.constexpr, 
                                          BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
                                          TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, use_bf16: tl.constexpr,
                                          propagation_alg_id: tl.constexpr, pflow_tempered_enabled: tl.constexpr, 
@@ -336,10 +328,6 @@ def _fw_triton_block_sparse_csmm2_kernel(node_mars, element_mars, mparams, nids,
     # Get inferred node block id from `pid_m`
     nblock_id = pid_m // (BLOCK_SIZE_M // TILE_SIZE_M)
     tile_id = pid_m % (BLOCK_SIZE_M // TILE_SIZE_M)
-
-    # Get the real node block id in the case of partial evaluation
-    if partial_eval == 1:
-        nblock_id = tl.load(local_ids + nblock_id)
 
     # Node offsets
     offs_node = tl.arange(0, TILE_SIZE_M) + tile_id * TILE_SIZE_M
