@@ -1129,53 +1129,6 @@ class InputLayer(Layer, nn.Module):
         """
         return self.nodes[0].dist
 
-    def enable_partial_evaluation(self, fw_scopes: Optional[Union[Sequence[BitSet],Sequence[int]]] = None, 
-                                  bk_scopes: Optional[Union[Sequence[BitSet],Sequence[int]]] = None, return_ids: bool = False):
-        # Create cache if needed
-        if not self.provided("scope2localgids"):
-            self._prepare_scope2nids()
-
-        # Filter forward nodes
-        if fw_scopes is not None:
-            fw_local_ids = []
-            for scope in fw_scopes:
-                if isinstance(scope, int):
-                    scope = BitSet.from_array([scope])
-
-                if scope not in self.scope2localgids:
-                    continue
-
-                fw_local_ids.append(self.scope2localgids[scope])
-
-            if return_ids:
-                return torch.cat(fw_local_ids, dim = 0)
-            else:
-                self.fw_local_ids = torch.cat(fw_local_ids, dim = 0)
-
-        # Filter backward nodes
-        if bk_scopes is not None:
-            bk_local_ids = []
-            for scope in bk_scopes:
-                if isinstance(scope, int):
-                    scope = BitSet.from_array([scope])
-
-                if scope not in self.scope2localgids:
-                    continue
-
-                bk_local_ids.append(self.scope2localgids[scope])
-
-            if return_ids:
-                return torch.cat(bk_local_ids, dim = 0)
-            else:
-                self.bk_local_ids = torch.cat(bk_local_ids, dim = 0)
-
-    def disable_partial_evaluation(self, forward: bool = True, backward: bool = True):
-        if forward:
-            self.fw_local_ids = None
-
-        if backward:
-            self.bk_local_ids = None
-
     def update_parameters(self):
         for idx, ns in enumerate(self.nodes):
             if ns.is_tied():
@@ -1183,34 +1136,6 @@ class InputLayer(Layer, nn.Module):
 
             par_start, par_end = ns._param_range
             ns._params = self.params.data[par_start:par_end].detach().cpu().clone()
-
-    def _prepare_scope2nids(self):
-        if not hasattr(self, "scope2localgids"):
-            scope2localgids = dict()
-
-            # Build per-node indices (not per-block): every InputLayer kernel that
-            # consumes `fw_local_ids` / `bk_local_ids` uses them as offsets into
-            # per-node tensors (`vids`, `s_pids`, ...), so they must count nodes.
-            # Counting blocks here silently drops `num_nodes - num_node_blocks`
-            # nodes per `InputNodes` whenever `block_size > 1`.
-            local_nid = 0
-            for ns in self.nodes:
-                scope = ns.scope
-
-                s_nid = local_nid
-                e_nid = local_nid + ns.num_nodes
-
-                with torch.no_grad():
-                    if scope not in scope2localgids:
-                        scope2localgids[scope] = [torch.zeros([0], dtype = torch.long)]
-
-                    scope2localgids[scope].append(torch.arange(s_nid, e_nid))
-
-                local_nid += ns.num_nodes
-
-            self.scope2localgids = {
-                scope: torch.cat(ids, dim = 0).to(self.params.device) for scope, ids in scope2localgids.items()
-            }
 
     def is_input(self):
         return True

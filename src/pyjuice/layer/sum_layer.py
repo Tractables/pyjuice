@@ -13,10 +13,9 @@ except Exception:  # pragma: no cover - guards across triton versions
     class _TritonOutOfResources(Exception):
         pass
 from copy import deepcopy
-from typing import Sequence, List, Tuple, Optional
+from typing import Sequence, List, Optional
 
 from pyjuice.nodes import SumNodes
-from pyjuice.utils import BitSet
 from pyjuice.utils.parameter_list import FastParamList
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 from .kernels import sum_forward_block_sparse as fw_bsparse
@@ -2897,53 +2896,3 @@ class SumLayer(Layer, nn.Module):
                 param_flows[pfids[sid:eid,:]] += parflows[sid:eid,:]
 
         return None
-
-    def _prepare_scope2nids(self, prod_scope_eleids: Sequence[Tuple[BitSet, torch.Tensor]]):
-        if not (hasattr(self, "fw_scope2localids") and hasattr(self, "bk_scope2localids")):
-            fw_scope2localids = dict()
-            bk_scope2localids = dict()
-
-            # Forward local indices
-            global_nid = self._layer_nid_range[0]
-            for ns in self.nodes:
-                scope = ns.scope
-
-                s_nid = global_nid
-                e_nid = global_nid + ns.num_nodes
-
-                with torch.no_grad():
-                    if scope not in fw_scope2localids:
-                        fw_scope2localids[scope] = [
-                            torch.zeros([0], dtype = torch.long).to(self.partitioned_nids[0].device) for _ in range(self.num_fw_partitions)
-                        ]
-
-                    for partition_id in range(self.num_fw_partitions):
-                        nids = self.partitioned_nids[partition_id]
-                        partition_local_ids = torch.where((nids >= s_nid) & (nids < e_nid))[0]
-
-                        fw_scope2localids[scope][partition_id] = torch.cat(
-                            (fw_scope2localids[scope][partition_id], partition_local_ids), dim = 0
-                        )
-
-                global_nid += ns.num_nodes
-
-            # Backward local indices
-            for scope, ele_id_range in prod_scope_eleids:
-                s_eid, e_eid = ele_id_range
-
-                with torch.no_grad():
-                    if scope not in bk_scope2localids:
-                        bk_scope2localids[scope] = [
-                            torch.zeros([0], dtype = torch.long).to(self.partitioned_chids[0].device) for _ in range(self.num_bk_partitions)
-                        ]
-
-                    for partition_id in range(self.num_bk_partitions):
-                        chids = self.partitioned_chids[partition_id]
-                        partition_local_ids = torch.where((chids >= s_eid) & (chids < e_eid))[0]
-
-                        bk_scope2localids[scope][partition_id] = torch.cat(
-                            (bk_scope2localids[scope][partition_id], partition_local_ids), dim = 0
-                        )
-
-            self.fw_scope2localids = fw_scope2localids
-            self.bk_scope2localids = bk_scope2localids

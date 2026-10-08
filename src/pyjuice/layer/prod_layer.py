@@ -241,23 +241,6 @@ class ProdLayer(Layer, nn.Module):
         
         return None
 
-    def enable_partial_evaluation(self, fw_scopes: Optional[Sequence[BitSet]] = None, bk_scopes: Optional[Sequence[BitSet]] = None):
-        super(ProdLayer, self).enable_partial_evaluation(fw_scopes = fw_scopes, bk_scopes = bk_scopes)
-
-        # For product layers, we need a special forward pass during the backward process of the circuit
-        if bk_scopes is not None:
-            bk_fw_partition_local_ids = [[] for _ in range(self.num_fw_partitions)]
-            for scope in bk_scopes:
-                if scope not in self.fw_scope2localids:
-                    continue
-
-                for partition_id, ids in enumerate(self.fw_scope2localids[scope]):
-                    bk_fw_partition_local_ids[partition_id].append(self.fw_scope2localids[scope][partition_id])
-
-            self.bk_fw_partition_local_ids = [
-                torch.cat(ids, dim = 0) if len(ids) > 0 else torch.zeros([0], dtype = torch.long) for ids in bk_fw_partition_local_ids
-            ]
-
     def is_prod(self):
         return True
 
@@ -410,70 +393,3 @@ class ProdLayer(Layer, nn.Module):
             )
 
         return None
-
-    def _prepare_scope2nids(self):
-
-        # Saved for the next sum layer
-        prod_scope_eleids = list()
-        global_eid = 1
-        for ns in self.nodes:
-            s_eid = global_eid
-            e_eid = global_eid + ns.num_nodes
-
-            prod_scope_eleids.append((ns.scope, (s_eid, e_eid)))
-
-            global_eid += ns.num_nodes
-
-        if not (hasattr(self, "fw_scope2localids") and hasattr(self, "bk_scope2localids")):
-            fw_scope2localids = dict()
-            bk_scope2localids = dict()
-
-            # Forward local indices
-            global_eid = 1
-            for ns in self.nodes:
-                scope = ns.scope
-
-                s_eid = global_eid
-                e_eid = global_eid + ns.num_nodes
-
-                with torch.no_grad():
-                    if scope not in fw_scope2localids:
-                        fw_scope2localids[scope] = [
-                            torch.zeros([0], dtype = torch.long).to(self.partitioned_nids[0].device) for _ in range(self.num_fw_partitions)
-                        ]
-
-                    for partition_id in range(self.num_fw_partitions):
-                        nids = self.partitioned_nids[partition_id]
-                        partition_local_ids = torch.where((nids >= s_eid) & (nids < e_eid))[0]
-
-                        fw_scope2localids[scope][partition_id] = torch.cat(
-                            (fw_scope2localids[scope][partition_id], partition_local_ids), dim = 0
-                        )
-
-                global_eid += ns.num_nodes
-
-            # Backward local indices
-            for ns in self.nodes:
-                for cs in ns.chs:
-                    scope = cs.scope
-
-                    s_nid = cs._output_ind_range[0]
-                    e_nid = cs._output_ind_range[1]
-
-                    if scope not in bk_scope2localids:
-                        bk_scope2localids[scope] = [
-                            torch.zeros([0], dtype = torch.long).to(self.partitioned_nids[0].device) for _ in range(self.num_bk_partitions)
-                        ]
-
-                    for partition_id in range(self.num_bk_partitions):
-                        u_cids = self.partitioned_u_cids[partition_id]
-                        partition_local_ids = torch.where((u_cids >= s_nid) & (u_cids < e_nid))[0]
-
-                        bk_scope2localids[scope][partition_id] = torch.cat(
-                            (bk_scope2localids[scope][partition_id], partition_local_ids), dim = 0
-                        )
-
-            self.fw_scope2localids = fw_scope2localids
-            self.bk_scope2localids = bk_scope2localids
-
-        return prod_scope_eleids
