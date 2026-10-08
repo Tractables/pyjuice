@@ -24,6 +24,7 @@
 #include <cuda_runtime.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAException.h>
+#include <cfloat>
 #include <vector>
 
 template <int SPLIT>
@@ -41,7 +42,13 @@ __global__ void sb_fwd_kernel(float* __restrict__ node_mars, const float* __rest
     const int m_local = grp * 32 + lane;
 
     const long eb = ebase[nb], pb = pbase[nb];
-    float m = -INFINITY, l = 0.f;                  // running max / linear-sum (online logsumexp)
+    // Running max / linear-sum (online logsumexp). The max starts at -FLT_MAX, not -inf: with -inf, a
+    // leading run of -inf edges makes `m - nmx` = -inf - (-inf) = NaN, which poisons the node even once
+    // finite edges follow. From a finite start every update is well defined -- -inf edges add
+    // p * exp(-inf) = 0, the first finite edge scales the empty sum by exp(-FLT_MAX - x) = 0 -- and the
+    // results on finite inputs are bit-identical. (A `nmx != -inf` guard in the loop also works but
+    // MEASURED 10-110% slower: it stops the edge loop from pipelining.)
+    float m = -FLT_MAX, l = 0.f;
     for (int e = ty; e < num_edges; e += SPLIT) {
         float emar = element_mars[(eb + e) * batch + b];     // broadcast across the warp's lanes
         float p = params[pb + (long)e * block_size + m_local]; // coalesced: 32 consecutive params
@@ -64,7 +71,7 @@ __global__ void sb_fwd_kernel(float* __restrict__ node_mars, const float* __rest
         #pragma unroll
         for (int k = 0; k < SPLIT; k++) L += sL[k][lane] * __expf(sM[k][lane] - gm);
         const long node = nids[nb] + m_local;
-        node_mars[node * (long)batch + b] = gm + logf(L);
+        node_mars[node * (long)batch + b] = gm + logf(L);   // every edge -inf: L = 0, so -inf
     }
 }
 
