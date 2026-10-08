@@ -106,6 +106,26 @@ class ExternalSumParams():
     #: reconstructs `F-[n,c] = theta[n,c] * W[n, g(c)]` at M-step time.
     requests_denom_param_flows: bool = False
 
+    #: Whether a circuit may capture the passes of this parameterization's layers in a CUDA graph. OFF
+    #: unless a subclass declares it: a replay runs none of the hooks' Python, and a recording call runs
+    #: it twice, so a parameterization may set this only when its hooks leave nothing on the host beyond
+    #: what :func:`cuda_graph_state` returns -- no counters, no caches whose entries a later pass relies on
+    #: being refreshed. Host syncs are fine (the capture fails and the pass stays eager).
+    cuda_graph_safe: bool = False
+
+    def cuda_graph_state(self, layer):
+        """
+        The host-side state a pass of `layer` leaves for a later pass to read, or None (see
+        :func:`pyjuice.layer.Layer.cuda_graph_state`). A parameterization whose forward stores something
+        on the layer for its backward or its sampler must return it here, or a replayed forward would
+        leave the state of an earlier call in place.
+        """
+        return None
+
+    def restore_cuda_graph_state(self, layer, state) -> None:
+        """Put back what :func:`cuda_graph_state` returned after a graph of the pass was recorded."""
+        pass
+
     def denom_flow_sizes(self, layer) -> "list":
         """
         How many floats of `pc.denom_param_flows` this layer needs, one entry per FORWARD PARTITION.

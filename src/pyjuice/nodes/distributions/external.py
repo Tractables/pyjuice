@@ -63,6 +63,8 @@ class External(Distribution):
     A class representing user-define distributions (PyJuice only processes the incoming log-probabilities).
     """
 
+    call_kwargs = ("external_soft_evi", "external_soft_evi_grad")   # see `Distribution.call_kwargs`
+
     def __init__(self):
         super(External, self).__init__()
 

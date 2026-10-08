@@ -7,6 +7,7 @@ import triton.language as tl
 
 from pyjuice.layer import SumLayer, ProdLayer, InputLayer
 from pyjuice.utils.kernel_launcher import triton_jit
+from pyjuice.utils.util import cuda_graph_key
 
 from .eval_partition import eval_partition_fn, prod_layer_partition_fn
 
@@ -384,10 +385,13 @@ def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0, pc_is
     if not hasattr(pc, "_tdp_cudagraph"):
         pc._tdp_cudagraph = dict()
 
-    key = (update_pflow, pc_is_normalized, (None if node_mars is None else id(node_mars)), 
-           (None if element_mars is None else id(element_mars)), id(node_flows), id(pc.params), 
-           id(pc.param_flows), id(hyperparameters),
-           (None if denom_param_flows is None else id(denom_param_flows)))
+    # Every buffer the capture bakes in, identified by its memory (`cuda_graph_key`), never by `id()`:
+    # `node_mars` here is a fresh `.view(-1)` on every call, and a reallocated `param_flows` can come
+    # back under a recycled id, which would replay the graph into memory that has since been freed.
+    key = (update_pflow, pc_is_normalized, cuda_graph_key(node_mars), cuda_graph_key(element_mars),
+           cuda_graph_key(node_flows), cuda_graph_key(element_flows), cuda_graph_key(pc.params),
+           cuda_graph_key(pc.param_flows if update_pflow else None), cuda_graph_key(hyperparameters),
+           cuda_graph_key(denom_param_flows))
     if use_cudagraph and key in pc._tdp_cudagraph:
         g = pc._tdp_cudagraph[key]
         g.replay()

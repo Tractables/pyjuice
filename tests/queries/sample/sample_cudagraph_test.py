@@ -195,8 +195,9 @@ def _max_z(a, b, num_samples):
 def test_a_graph_is_recaptured_when_the_circuits_buffers_move():
     """
     REGRESSION. A captured pass holds the addresses of `node_mars` / `element_mars`, and those are
-    `_init_buffer`-backed: a forward at another batch size REALLOCATES them, so the replay would go
-    on reading memory the allocator has since handed to somebody else.
+    `_init_buffer`-backed: a forward at a LARGER batch size than any before grows their storage and
+    moves them, so the replay would go on reading memory the allocator has since handed to somebody
+    else. (A smaller batch re-cuts the same storage in place, so that is the case that moves them.)
 
     Interleaving two batch sizes on one circuit is ordinary in a decode loop, which is how this is
     reached. It fails SILENTLY -- how wrong the draw comes out depends on what landed in the recycled
@@ -224,8 +225,8 @@ def test_a_graph_is_recaptured_when_the_circuits_buffers_move():
     keepalive = pc.node_mars
     before = keepalive.data_ptr()
 
-    # a forward at another batch size, then back -- what a decode loop does between draws
-    pc(torch.zeros([777, pc.num_vars], dtype = torch.long, device = pc.device),
+    # a forward at a larger batch size, then back -- what a decode loop does between draws
+    pc(torch.zeros([2 * N, pc.num_vars], dtype = torch.long, device = pc.device),
        missing_mask = torch.ones([pc.num_vars], dtype = torch.bool, device = pc.device))
     condition(3)
     assert pc.node_mars.data_ptr() != before, \

@@ -45,32 +45,31 @@ class FastJITFunction3x:
         self._driver = _driver
         self._knobs = _knobs
 
-    def _gather(self, args, kernel_kwargs):
-        # Bind (*args, **kernel_kwargs) to the kernel parameters in declared order -- matching
-        # `bound_args.values()` that the standard path passes to `CompiledKernel.run`.
+    def _gather(self, args, kwargs):
+        # Bind (*args, **kwargs) to the kernel parameters in declared order -- matching
+        # `bound_args.values()` that the standard path passes to `CompiledKernel.run` -- and set the
+        # launch meta-parameters aside, sorted. One pass over `kwargs`: this runs on every launch.
         vals = list(self.defaults)
         for i, a in enumerate(args):
             vals[i] = a
         n2i = self.name_to_idx
-        for name, v in kernel_kwargs.items():
-            vals[n2i[name]] = v                     # KeyError on unknown kwarg -> caught -> fallback
-        return vals
+        meta = []
+        for name, v in kwargs.items():
+            if name in _TRITON_META_PARAMS:
+                meta.append((name, v))
+            else:
+                vals[n2i[name]] = v                 # KeyError on unknown kwarg -> caught -> fallback
+        return vals, (tuple(sorted(meta)) if meta else ())
 
     def _signature(self, vals, device, meta_items):
-        sig = [device]
-        is_cexpr = self.is_constexpr
-        for i in range(self.n_params):
-            v = vals[i]
-            if v is inspect._empty:                 # a required arg was not supplied -> force fallback
-                raise ValueError("missing required kernel argument")
-            if is_cexpr[i]:
-                sig.append(v)                       # constexpr value (baked into the compiled kernel)
-            elif isinstance(v, torch.Tensor):
-                sig.append((v.dtype, v.data_ptr() & 15))   # dtype + 16-byte alignment class
-            else:
-                sig.append(v)                       # int (divisibility) / float / bool / None
-        sig.append(meta_items)
-        return tuple(sig)
+        # Constexprs by value (baked into the compiled kernel), tensors by dtype + 16-byte alignment class,
+        # every other argument by value (int divisibility / float / bool / None). One comprehension rather
+        # than a loop of appends: this runs on every launch. A required argument that was not supplied
+        # stays `inspect._empty`, under which no successful launch is ever cached, so such a call goes to
+        # the standard launch and fails there.
+        Tensor = torch.Tensor
+        return (device, *[(v.dtype, v.data_ptr() & 15) if not c and isinstance(v, Tensor) else v
+                          for v, c in zip(vals, self.is_constexpr)], meta_items)
 
     def __getitem__(self, grid: Union[Tuple, Callable]):
         jit_fn = self.jit_fn
@@ -80,16 +79,9 @@ class FastJITFunction3x:
                 if type(grid) is not tuple:          # callable grids: not fast-pathed
                     return jit_fn[grid](*args, **kwargs)
 
-                if kwargs:
-                    meta_items = tuple(sorted((k, v) for k, v in kwargs.items() if k in _TRITON_META_PARAMS))
-                    kernel_kwargs = {k: v for k, v in kwargs.items() if k not in _TRITON_META_PARAMS} \
-                        if meta_items else kwargs
-                else:
-                    meta_items = ()
-                    kernel_kwargs = kwargs
-
-                vals = self._gather(args, kernel_kwargs)
-                device = self._driver.active.get_current_device()
+                vals, meta_items = self._gather(args, kwargs)
+                driver = self._driver.active
+                device = driver.get_current_device()
                 sig = self._signature(vals, device, meta_items)
 
                 kernel = self.cache.get(sig)
@@ -100,7 +92,7 @@ class FastJITFunction3x:
                     self.cache[sig] = kernel
                     return
 
-                stream = self._driver.active.get_current_stream(device)
+                stream = driver.get_current_stream(device)
                 ng = len(grid)
                 g0 = grid[0]
                 g1 = grid[1] if ng > 1 else 1

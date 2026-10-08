@@ -141,6 +141,8 @@ class LatentSoftEvidence(Distribution):
     :type group_size: int
     """
 
+    call_kwargs = ("latent_evidence_logp", "latent_evidence_logp_grad")   # see `Distribution.call_kwargs`
+
     def __init__(self, group_size: int = 1):
         super(LatentSoftEvidence, self).__init__()
 

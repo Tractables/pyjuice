@@ -110,9 +110,7 @@ def _release_all() -> None:
     # costs a few ms once, against a scope that then runs for a whole generation.
     owners, _STATE.graph_owners = _STATE.graph_owners, []
     for pc in owners:
-        graphs = getattr(pc, "_recorded_cuda_graphs", None)
-        if graphs is not None:
-            graphs.clear()
+        pc._clear_inner_graphs()
 
     layers, _STATE.layers = _STATE.layers, []
     for layer in layers:

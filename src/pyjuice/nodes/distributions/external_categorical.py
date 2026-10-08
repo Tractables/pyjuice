@@ -636,6 +636,11 @@ class ExternProductCategorical(Distribution):
     :param num_cats: number of categories
     :type num_cats: int
     """
+
+    call_kwargs = ("external_categorical_logps", "external_categorical_logps_grad",
+                   "external_categorical_logps_indices", "external_categorical_value_mask",
+                   "extern_product_categorical_mode")   # see `Distribution.call_kwargs`
+
     def __init__(self, num_cats: int):
         super(ExternProductCategorical, self).__init__()
 

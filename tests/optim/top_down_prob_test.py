@@ -15,12 +15,10 @@ from pyjuice.model.backend import eval_top_down_probs
 import pytest
 
 
-def test_simple_model_tdp():
-
-    device = torch.device("cuda:0")
-
+def _small_tdp_pc(device):
+    """A small hand-built PC (three sum layers over four variables), with batch-1 buffers allocated."""
     block_size = 16
-    
+
     with juice.set_block_size(block_size):
 
         ni0 = inputs(0, num_node_blocks = 2, dist = dists.Categorical(num_cats = 4))
@@ -52,6 +50,14 @@ def test_simple_model_tdp():
     pc._init_buffer(name = "element_mars", shape = (pc.num_elements, 1), set_value = 0.0)
     pc._init_buffer(name = "node_flows", shape = (pc.num_nodes, 1), set_value = 0.0)
     pc._init_buffer(name = "element_flows", shape = (pc.num_elements, 1), set_value = 0.0)
+
+    return pc, (ns, ns0, ns1, ns2, np0, np1, np2, np3, np4, np5, np6, ni0, ni1, ni2, ni3)
+
+
+def test_simple_model_tdp():
+
+    device = torch.device("cuda:0")
+    pc, (ns, ns0, ns1, ns2, np0, np1, np2, np3, np4, np5, np6, ni0, ni1, ni2, ni3) = _small_tdp_pc(device)
 
     for pc_is_normalized in [True, False]:
 
@@ -147,6 +153,32 @@ def test_simple_model_tdp():
 
         ni3_epars_tdp = ni3_tdp[:,None] * input_layer.params[32*4*2+32*6:32*4*2+32*6*2].reshape(32, 6).cpu()
         assert torch.all(torch.abs(ni3_epars_tdp - input_layer.param_flows[32*4*2+32*6:32*4*2+32*6*2].reshape(32, 6).cpu()) < 1e-5)
+
+
+def test_tdp_cudagraph_follows_the_buffer_not_the_python_object():
+    """The top-down pass caches one captured CUDA graph per set of buffers, and a captured graph
+    writes to the ADDRESSES it baked in. The cache was keyed on `id()` of the Python objects, so the
+    same object over different memory -- which is what a recycled id of a reallocated buffer looks like
+    -- replayed into the OLD memory, freed by then, and the new buffer was never written.
+    `Tensor.set_` produces that situation deterministically. The result must land in the new memory,
+    and a call over memory already seen must replay its graph rather than capture another."""
+    device = torch.device("cuda:0")
+    pc, _ = _small_tdp_pc(device)
+
+    pc.init_param_flows(flows_memory = 0.0)
+    eval_top_down_probs(pc, update_pflow = True, scale = 1.0, use_cudagraph = True)
+    expected = pc.param_flows.clone()
+    assert expected.abs().sum() > 0
+
+    pc.param_flows.set_(torch.zeros_like(pc.param_flows))     # same Python object, new memory
+    eval_top_down_probs(pc, update_pflow = True, scale = 1.0, use_cudagraph = True)
+    assert torch.allclose(pc.param_flows, expected), "the graph replayed into the buffer's old memory"
+
+    pc.param_flows.zero_()
+    num_graphs = len(pc._tdp_cudagraph)
+    eval_top_down_probs(pc, update_pflow = True, scale = 1.0, use_cudagraph = True)
+    assert len(pc._tdp_cudagraph) == num_graphs, "an unchanged buffer re-captured its graph"
+    assert torch.allclose(pc.param_flows, expected)
 
 
 def test_scaled_mini_batch_em():

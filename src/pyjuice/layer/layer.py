@@ -20,6 +20,12 @@ class Layer():
     #: see `ExternalSumParams.requests_denom_param_flows`.
     requests_denom_param_flows: bool = False
 
+    #: The partial-evaluation selections (see `enable_partial_evaluation`), None while the whole layer is
+    #: evaluated. Declared here so that `provided()` -- asked on every pass -- finds None rather than going
+    #: through `nn.Module.__getattr__`'s AttributeError: ~0.4 us per check, ~200 checks per step.
+    fw_partition_local_ids = None
+    bk_partition_local_ids = None
+
     def __init__(self, nodes: Sequence[CircuitNodes], disable_block_size_check: bool = False) -> None:
 
         # Nodes correspond to the current layer
@@ -82,6 +88,28 @@ class Layer():
 
     def provided(self, var_name):
         return hasattr(self, var_name) and getattr(self, var_name) is not None
+
+    #: Whether the circuit may capture this layer's passes in a CUDA graph. A replay runs no Python, so a
+    #: layer is graph-safe when its per-call Python leaves nothing behind but what `cuda_graph_state`
+    #: hands over (a host sync is fine: the capture fails and the pass stays eager).
+    cuda_graph_safe: bool = True
+
+    def cuda_graph_state(self):
+        """
+        Host-side state a pass of this layer leaves for a LATER pass to read -- a forward's leftovers
+        that its backward needs, say -- or None.
+
+        A replayed CUDA graph runs no Python, so state a recorded pass sets would otherwise keep
+        describing whichever call last ran eagerly. The circuit saves this after recording a graph and
+        hands it back through :func:`restore_cuda_graph_state` after every replay, and a backward graph
+        is only replayed against the state it was recorded with. A plain layer keeps nothing between
+        passes.
+        """
+        return None
+
+    def restore_cuda_graph_state(self, state) -> None:
+        """Put back what :func:`cuda_graph_state` returned right after a graph of this pass was recorded."""
+        pass
 
     def is_sum(self):
         return False

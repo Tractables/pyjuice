@@ -319,3 +319,41 @@ def test_tie_external_shared_owner_across_layers():
     for name, a, b in zip(("src", "nsb", "nsa", "nsc"), out[True], out[False]):
         assert torch.equal(a, b), \
             f"{name}: shared factors disagree with per-node ones, max {float((a - b).abs().max())}"
+
+
+def test_backward_after_alternating_batch_sizes():
+    """The backward consumes state its forward left on the layer (`log Z`, the batch size). Forwards at
+    batch 32, 16, 32 make the third one a plan-cache hit, and that path used to keep the batch-16
+    state, so the backward that followed produced parameter flows off by up to 737 and wrong node
+    flows. It must match a backward that directly follows its own forward."""
+    from pyjuice.nodes.external_params.kernels.c import is_available
+    if not is_available():
+        pytest.skip("the low-rank backward needs the CUDA extension")
+
+    device = torch.device("cuda:0")
+    root, trans = _build(4, 64, 4, external = True)
+    pc = juice.compile(root, verbose = False).to(device)
+
+    def inputs(batch_size, seed):
+        g = torch.Generator(device = device).manual_seed(seed)
+        data = torch.randint(0, NUM_EMITS, [batch_size, 4], device = device, generator = g)
+        ext = {ns: (torch.randn([batch_size, ns.edge_ids.size(1), ns.ch_block_size, 4], device = device,
+                                generator = g) - 1.0,
+                    torch.randn([batch_size, ns.edge_ids.size(1), ns.block_size, 4], device = device,
+                                generator = g) - 1.0)
+               for ns in trans}
+        return data, ext
+
+    def flows_after(forwards):
+        for data, ext in forwards:
+            pc(data, sum_external_params = ext)
+        pc.init_param_flows(flows_memory = 0.0)
+        pc.backward(forwards[-1][0], allow_modify_flows = False)
+        return pc.param_flows.clone(), pc.node_flows.clone()
+
+    a, b = inputs(32, 1), inputs(16, 2)
+    ref_pf, ref_nf = flows_after([a])
+    alt_pf, alt_nf = flows_after([a, b, a])
+
+    assert torch.equal(alt_pf, ref_pf), f"parameter flows off by {float((alt_pf - ref_pf).abs().max())}"
+    assert torch.equal(alt_nf, ref_nf), "node flows differ"

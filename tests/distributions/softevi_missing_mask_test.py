@@ -282,8 +282,10 @@ def test_timed_dense_choice_benchmarks_into_scratch(dual_flow):
 
 
 def _record_dense_timings(mp):
-    """Collect every time the dense-vs-scattered tuner measures for a candidate (None: it raised).
-    Timings of other tuners nested inside a candidate's run are left out."""
+    """Collect, for every candidate the dense-vs-scattered tuner measures, its first timing (None: it
+    raised). `autotune.best_of` times each candidate once (`warmup = reps = 1`) and then measures the ones
+    it keeps in full, so that first call is the one per candidate. Timings of other tuners nested inside
+    a candidate's run are left out."""
     from pyjuice.layer.kernels import autotune
 
     times, depth, active = [], [0], [False]
@@ -295,7 +297,7 @@ def _record_dense_timings(mp):
             t = real_time(run, warmup, reps)
         finally:
             depth[0] -= 1
-        if active[0] and depth[0] == 0:
+        if active[0] and depth[0] == 0 and (warmup, reps) == (1, 1):
             times.append(t)
         return t
 
@@ -461,6 +463,47 @@ def test_dense_forward_shared_memory_limit(fits):
     for name, a, b in zip(("LL", "param flows", "evidence gradient"), out["single"], out["scattered"]):
         assert torch.allclose(a, b, rtol = 1e-4, atol = 1e-6), \
             f"{name}: dense vs scattered (max abs diff {float((a - b).abs().max()):.3e})"
+
+
+@pytest.mark.parametrize("structure", ["hclt", "pd", "rat_spn"])
+def test_dense_path_on_other_structures(structure, monkeypatch):
+    """The dense top-k path serves any circuit whose soft-evidence leaves come as one run of nodes per
+    variable -- which every built-in structure produces, not just the HMMs it was written for. Force it
+    (both layouts) and compare a whole step with the scattered path."""
+    device = torch.device("cuda:0")
+    C, K, B, L = 64, 16, 6, 16
+    monkeypatch.setattr(_softevi._l2_bytes, "_cached", 512, raising = False)
+    torch.manual_seed(5)
+    leaf = lambda: dists.SoftEvidenceCategorical(num_cats = C, _dual_flow_backward = True)
+    if structure == "hclt":
+        ns = juice.structures.HCLT(torch.randint(0, C, (300, 8)), num_latents = L, input_dist = leaf())
+    elif structure == "pd":
+        ns = juice.structures.PD(data_shape = (2, 4), num_latents = L, split_intervals = (1, 2), input_dist = leaf())
+    else:
+        ns = juice.structures.RAT_SPN(num_vars = 8, num_latents = L, depth = 2, num_repetitions = 2, input_dist = leaf())
+    ns.init_parameters(perturbation = 2.0)
+    pc = juice.compile(ns, verbose = False).to(device)
+    layer = pc.input_layer_group[0]
+    V = pc.num_vars
+    assert _softevi._dense_layer_layout(layer, V) is not None, "the dense layout does not cover this structure"
+
+    data = torch.randint(0, C, (B, V), device = device)
+    kw = dict(categorical_evidence_logp = _evidence(B, V, K, device), soft_evidence_cat_ids = _topk_ids(B, V, K, C, data, device))
+    out = {}
+    for choice in ("scattered", "single", "ladder"):
+        layer._dense_choice_override = choice
+        pc.init_param_flows(flows_memory = 0.0)
+        lls = pc(data, **kw).clone()
+        grad = torch.zeros_like(kw["categorical_evidence_logp"])
+        pc.backward(data, allow_modify_flows = False, logspace_flows = True, categorical_evidence_logp_grad = grad, **kw)
+        out[choice] = (lls, layer.param_flows.clone(), grad)
+        if choice != "scattered":
+            assert layer._dense_index_cache is not None, f"{choice}: the dense path did not run"
+
+    for choice in ("single", "ladder"):
+        for name, a, b in zip(("LL", "param flows", "evidence gradient"), out[choice], out["scattered"]):
+            assert torch.allclose(a, b, rtol = 1e-4, atol = 1e-6), \
+                f"{structure} {choice} vs scattered, {name} (max abs diff {float((a - b).abs().max()):.3e})"
 
 
 @pytest.mark.parametrize("homogeneous", [True, False])

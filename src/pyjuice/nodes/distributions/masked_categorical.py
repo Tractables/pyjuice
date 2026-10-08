@@ -20,6 +20,8 @@ class MaskedCategorical(Distribution):
     :type num_cats: str
     """
 
+    call_kwargs = ("mask",)   # see `Distribution.call_kwargs`
+
     def __init__(self, num_cats: int, mask_mode: str):
         super(MaskedCategorical, self).__init__()
 

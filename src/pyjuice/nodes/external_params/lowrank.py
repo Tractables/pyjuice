@@ -379,6 +379,16 @@ class LowRankSumParams(ExternalSumParams):
 
         return self._layer_buffer(layer, f"_lr_log_z{partition_id}", numel, device), True
 
+    # Its hooks' only host-side handoff is `_lr_bw_state` (below); the rest is shape-keyed caches
+    cuda_graph_safe = True
+
+    def cuda_graph_state(self, layer):
+        # What the forward leaves for the backward: its plan's `log Z` and batch size
+        return getattr(layer, "_lr_bw_state", None)
+
+    def restore_cuda_graph_state(self, layer, state) -> None:
+        layer._lr_bw_state = state
+
     def forward_layer(self, layer, ns_tensors, node_mars, element_mars, params, **kwargs) -> None:
         """
         Apply the correction to the whole layer.
@@ -391,6 +401,11 @@ class LowRankSumParams(ExternalSumParams):
         """
         if len(ns_tensors) == 0:
             return None
+
+        # What the backward reads (`_lr_bw_state`) must describe THIS forward. Only the CUDA plan below
+        # produces it; every other path leaves none, so the backward refuses rather than reading a state
+        # left by an earlier forward.
+        layer._lr_bw_state = None
 
         if self._resolved_variant() == "cuda":
             # Fast path: one resolved host call per partition, no per-step bookkeeping
@@ -406,14 +421,21 @@ class LowRankSumParams(ExternalSumParams):
                 plans.move_to_end(batch)
             if entry is None:
                 buf = kwargs.get(_buffer_kwarg(), None)
-                entry = (None if buf is None else
-                         self._build_cuda_plan(layer, ns_tensors, node_mars, element_mars, buf))
+                plan = None if buf is None else \
+                    self._build_cuda_plan(layer, ns_tensors, node_mars, element_mars, buf)
+                if plan is not None:
+                    entry = (*plan, layer._lr_bw_state)
                 while len(plans) >= 32:
                     plans.popitem(last = False)
                 plans[batch] = entry
 
             if entry is not None:
-                mod, calls = entry
+                mod, calls, bw_state = entry
+                # A cache HIT does not run `_build_cuda_plan`, which is what sets the state, so it is
+                # kept with the plan and restored here. Without it, forwards at batch a, b, a left b's
+                # `log Z` and batch size for a's backward: MEASURED, parameter flows off by up to 737
+                # (against values of at most 1.1) and NaN node flows.
+                layer._lr_bw_state = bw_state
                 buf = kwargs[_buffer_kwarg()]
                 for args in calls:
                     mod.lowrank_forward(node_mars, element_mars, buf, *args)
@@ -559,6 +581,12 @@ class LowRankSumParams(ExternalSumParams):
                 f"not apply to its shape. It requires a single child block size, a power-of-two rank "
                 f"<= 64 (got {self.rank}), block_size >= 16, ch_block_size >= 16, and batch >= 16, with "
                 f"external parameters supplied for every node of the layer."
+            )
+        if entry[3] != node_mars.size(1):
+            raise RuntimeError(
+                f"The low-rank backward runs at batch {node_mars.size(1)}, but the last gated forward of "
+                f"this layer ran at batch {entry[3]}, so its `log Z` does not apply. Re-run the gated "
+                f"forward immediately before the backward that consumes it."
             )
         from .kernels.c import get_module
         mod = get_module()

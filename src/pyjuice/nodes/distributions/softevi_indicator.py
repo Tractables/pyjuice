@@ -103,6 +103,9 @@ class SoftEvidenceIndicator(Distribution):
     :param num_cats: number of categories
     :type num_cats: int
     """
+
+    call_kwargs = ("indicator_evidence_logp", "indicator_evidence_logp_grad")   # see `Distribution.call_kwargs`
+
     def __init__(self, num_states: int):
         super(SoftEvidenceIndicator, self).__init__()
 

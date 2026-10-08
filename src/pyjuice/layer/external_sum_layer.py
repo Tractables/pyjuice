@@ -192,6 +192,18 @@ class ExternalParamsSumLayer(SumLayer):
         """Delegated to the descriptor: a gated M-step may need the denominator flow `F-`."""
         return self.external_params.requests_denom_param_flows
 
+    @property
+    def cuda_graph_safe(self) -> bool:
+        """Delegated to the descriptor: only a parameterization that declares it is captured."""
+        return self.external_params.cuda_graph_safe
+
+    def cuda_graph_state(self):
+        """Delegated to the descriptor, which owns what its forward hands to its backward."""
+        return self.external_params.cuda_graph_state(self)
+
+    def restore_cuda_graph_state(self, state) -> None:
+        self.external_params.restore_cuda_graph_state(self, state)
+
     def assign_denom_flow_offsets(self, base: int) -> int:
         """
         Carve this layer's slices out of the PC's denominator flow buffer, starting at `base`, and

@@ -1392,6 +1392,46 @@ def _dense_layer_layout(layer, num_ext_vars):
     return layout
 
 
+@triton.jit
+def _dense_index_scatter_kernel(order_ptr, list_ptr, list_start_ptr, first_piece_ptr, piece_dst_ptr, piece_us_ptr,
+                                piece_us, evidence_ptr, ref_slot_ptr, ref_pt_ptr, ref_goff_ptr, num_refs,
+                                B, V, K, W: tl.constexpr, SPLIT: tl.constexpr, US_PER_PIECE: tl.constexpr,
+                                BLOCK: tl.constexpr):
+    """Pass 2 of `_build_dense_index`, one reference per lane: where the `i`-th reference in (block,
+    category) order goes in its shard's [G, width, Us] tables, and what it holds there.
+
+    `order[i]` is the reference's element index e = (b, v, k) in row-major [B, V, K] order; `list[i]` its
+    category list, which starts at `list_start`. Its position j in that list picks the piece -- the
+    `j // W`-th of the list, starting at `first_piece` -- and the row within it, `j % W`. A piece's row 0
+    sits at `piece_dst`, and rows are `us` apart (the tables are [width, Us]: see the build).
+
+    Stored: the slot `v * B + b` of the ratio scratch, `exp(evidence[e])` widened to float32, and e itself,
+    which IS the offset into `categorical_evidence_logp_grad`."""
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < num_refs
+
+    e = tl.load(order_ptr + offs, mask = mask, other = 0)
+    lst = tl.load(list_ptr + offs, mask = mask, other = 0)
+    j = offs - tl.load(list_start_ptr + lst, mask = mask, other = 0)
+    if SPLIT:
+        piece = tl.load(first_piece_ptr + lst, mask = mask, other = 0) + j // W
+        j = j % W
+    else:
+        piece = lst
+    if US_PER_PIECE:
+        us = tl.load(piece_us_ptr + piece, mask = mask, other = 0)
+    else:
+        us = piece_us
+    dst = tl.load(piece_dst_ptr + piece, mask = mask, other = 0) + j * us
+
+    t = e // K
+    tl.store(ref_slot_ptr + dst, ((t % V) * B + t // V).to(tl.int32), mask = mask)
+    # libdevice's exp, the accurate one torch uses: `tl.exp` is the fast approximation, off by a few ulp
+    pt = tlmath.exp(tl.load(evidence_ptr + e, mask = mask, other = 0.0).to(tl.float32))
+    tl.store(ref_pt_ptr + dst, pt, mask = mask)
+    tl.store(ref_goff_ptr + dst, e.to(tl.int32), mask = mask)
+
+
 def _build_dense_index(layer, kwargs, ladder = None):
     """
     Invert (position, batch, candidate) -> category, once per step, per param-flow block.
@@ -1454,8 +1494,7 @@ def _build_dense_index(layer, kwargs, ladder = None):
 
     # `return_inverse` gives the per-element list directly, which avoids two `repeat_interleave`s
     ukey, row, counts = torch.unique_consecutive(key_s, return_inverse = True, return_counts = True)
-    e_pos = torch.arange(E, device = dev)
-    within = e_pos - (counts.cumsum(0) - counts)[row]                           # position in its list
+    list_start = counts.cumsum(0) - counts                                       # first reference of each list
 
     # A category's reference list, cut into PIECES of at most `_DENSE_LIST_SPLIT` references; each piece
     # is a "list" from here on, so one category may own several consecutive ones. Both kernels give a list
@@ -1490,14 +1529,13 @@ def _build_dense_index(layer, kwargs, ladder = None):
     split = longest > W                                                          # some category owns several pieces
     max_refs = 1 << max(0, min(longest, W) - 1).bit_length()                    # round up to a power of two
 
+    first_piece = None
     if split:
         lst = torch.repeat_interleave(torch.arange(ukey.numel(), device = dev), n_pieces, output_size = U)
         first_piece = n_pieces.cumsum(0) - n_pieces
         k = torch.arange(U, device = dev) - first_piece[lst]                     # which piece of its list
         ukey = ukey[lst]
         counts = (counts[lst] - k * W).clamp_(max = W)
-        row = first_piece[row] + within // W
-        within = within % W
     g_l = ukey.long() // num_cats                                                # block of each piece
     # The pieces are in (block, category) order, so a block's first piece is where its id first appears.
     g_start = torch.searchsorted(g_l, g_l)
@@ -1562,7 +1600,6 @@ def _build_dense_index(layer, kwargs, ladder = None):
     if S == 1:
         rb, wd, us, ub = rbase[0], shard_widths[0], shard_us[0], ubase[0]
         rank = pos                                    # the lists are already in (block, category) order
-        us_e = us
     else:
         sid = host[(S * G):(S * G + _LADDER_N)][bidx]                        # shard of each list
         rb, wd, us, ub = host[(S * G + _LADDER_N):].view(4, S)[:, sid]
@@ -1572,21 +1609,22 @@ def _build_dense_index(layer, kwargs, ladder = None):
         seg_s, perm = torch.sort(sid * G + g_l, stable = True)
         rank = torch.empty_like(perm)
         rank[perm] = torch.arange(U, device = dev) - torch.searchsorted(seg_s, seg_s)
-        us_e = us[row]
 
     # [width, Us] rather than [Us, width]: the kernels assign one CATEGORY per thread, so with the
     # reference index innermost, lane-adjacent threads would read `width` apart and every lane would
-    # fetch its own sector. Transposed, a warp's reads of reference `j` are contiguous.
-    r_dst = (rb + g_l * (wd * us) + rank)[row] + within * us_e
+    # fetch its own sector. Transposed, a warp's reads of reference `j` are contiguous. So a piece's row
+    # 0 is at `piece_dst` and its rows are `us` apart.
+    piece_dst = rb + g_l * (wd * us) + rank
     ref_slot = torch.empty(r_tot, dtype = torch.int32, device = dev)
     ref_pt = torch.empty(r_tot, dtype = torch.float32, device = dev)
     ref_goff = torch.empty(r_tot, dtype = torch.int32, device = dev)         # < B * V * K: 32 bits is plenty
-    t = order // K
-    ref_slot[r_dst] = ((t % V) * B + t // V).int()
-    # `ref_pt` is a float32 table both kernels read as float, so widen half-precision evidence here
-    # rather than in the kernels (see `_fw_linear_evidence`).
-    ref_pt[r_dst] = evidence.reshape(-1)[order].float().exp()
-    ref_goff[r_dst] = order.int()
+    # One pass over the references (`_dense_index_scatter_kernel`), where a chain of torch ops took two
+    # dozen launches. `ref_pt` is a float32 table both kernels read as float, so half-precision evidence
+    # is widened here rather than in the kernels (see `_fw_linear_evidence`).
+    _dense_index_scatter_kernel[(triton.cdiv(E, 1024),)](
+        order, row, list_start, first_piece if split else list_start, piece_dst,
+        us if S > 1 else piece_dst, us if S == 1 else 0, evidence.contiguous(), ref_slot, ref_pt, ref_goff,
+        E, B, V, K, W = W, SPLIT = split, US_PER_PIECE = S > 1, BLOCK = 1024)
 
     u_dst = ub + g_l * us + rank
     uniq = torch.zeros(u_tot, dtype = torch.int32, device = dev)
@@ -1974,6 +2012,10 @@ class SoftEvidenceCategorical(Distribution):
                                kwargs, or process-wide with `PYJUICE_SOFTEVI_SORT=0`.
     :type sort_soft_evidence: bool
     """
+
+    call_kwargs = ("categorical_evidence_logp", "soft_evidence_cat_ids", "soft_evidence_value_mask",
+                   "categorical_evidence_logp_grad")   # see `Distribution.call_kwargs`
+
     def __init__(self, num_cats: int, _dual_flow_backward: bool = True, sort_soft_evidence: bool = True):
         super(SoftEvidenceCategorical, self).__init__()
 

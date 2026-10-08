@@ -48,6 +48,14 @@ ENABLED = os.environ.get("PYJUICE_AUTOTUNE", "1") != "0"
 MARGIN = float(os.environ.get("PYJUICE_AUTOTUNE_MARGIN", 1.10))
 
 
+# A candidate whose first timed run is this many times slower than the fastest candidate's is dropped
+# before the full measurement (see `best_of`): it cannot clear `MARGIN`, and its remaining runs were
+# where a slow candidate's tuning time went. MEASURED on the CoDD PC: the softevi dense-vs-scattered
+# choice took 1.1-2.7 s at every new batch size, nearly all of it running the scattered candidate --
+# 10-30x slower than the dense one -- ten times over.
+PRUNE = float(os.environ.get("PYJUICE_AUTOTUNE_PRUNE", 2.0))
+
+
 def _capturing() -> bool:
     """True while a CUDA graph is being captured. Benchmarking synchronizes (illegal during
     capture) and would bake the warmup launches into the graph, so tuning is skipped there."""
@@ -84,14 +92,25 @@ def best_of(candidates: list, warmup: int = 3, reps: int = 7):
     comparisons sit within a percent of each other, and the arms of a {CUDA, Triton} comparison are
     numerically equivalent but NOT bit-identical, so letting noise settle them makes a run's output
     depend on how warm the GPU happened to be. `run` may write into scratch; only timing matters.
-    """
-    ref_key, ref_run = candidates[0]
-    ref_t = _median_time(ref_run, warmup, reps)
 
+    Measured in two stages. Every candidate first runs once untimed -- compilation and any nested
+    first-call tuning land there -- and once timed; one that comes out `PRUNE` times slower than the
+    fastest cannot clear the margin against it, so it is dropped. The others get the remaining
+    `warmup - 2` warm-up runs and `reps` timed ones: the same number of runs as a single stage, so a
+    close race is measured exactly as before.
+    """
+    first = [_median_time(run, 1, 1) for _, run in candidates]
+    if all(t is None for t in first):
+        return None
+    cutoff = PRUNE * min(t for t in first if t is not None)
+    kept = [t is not None and t <= cutoff for t in first]
+    times = [_median_time(run, max(0, warmup - 2), reps) if keep else t
+             for (_, run), t, keep in zip(candidates, first, kept)]
+
+    ref_key, ref_t = candidates[0][0], times[0]
     best_key, best_t = None, None
-    for key, run in candidates[1:]:
-        t = _median_time(run, warmup, reps)
-        if t is not None and (best_t is None or t < best_t):
+    for (key, _), t, keep in zip(candidates[1:], times[1:], kept[1:]):
+        if keep and t is not None and (best_t is None or t < best_t):
             best_key, best_t = key, t
 
     if ref_t is None:                                    # the reference cannot run on this GPU
