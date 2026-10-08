@@ -26,7 +26,7 @@ import pytest
 import torch
 
 import pyjuice as juice
-from pyjuice.constraints import DFA, compile
+import pyjuice.constraints as jc
 from pyjuice.constraints.backends.lifted.plan import build_layout
 
 V = 4
@@ -75,17 +75,17 @@ def make_cases():
     t3, a3 = random_table(3, rng)
     t5, a5 = random_table(5, rng)
     tb, ab = random_table(3, rng)
-    rand = lambda t, a: DFA.from_dense(V, t, initial = 0, accept = a)
+    rand = lambda t, a: jc.DFA.from_dense(V, t, initial = 0, accept = a)
     keyword = lambda *ps: (lambda X: contains_any(X, ps))
     return {
         # name: (constraint M on x, its definition on x)
         "random3": (rand(t3, a3), lambda X: run_table(t3, a3, X)),
         "random5": (rand(t5, a5), lambda X: run_table(t5, a5, X)),
-        "keyword": (DFA.contains([[1, 2]], V), keyword([1, 2])),
-        "two_keywords_or": (DFA.contains([[0, 1], [3]], V), keyword([0, 1], [3])),
-        "ordered_keywords": (DFA.contains([[2]], V).concat(DFA.contains([[1, 1]], V)),
+        "keyword": (jc.DFA.contains([[1, 2]], V), keyword([1, 2])),
+        "two_keywords_or": (jc.DFA.contains([[0, 1], [3]], V), keyword([0, 1], [3])),
+        "ordered_keywords": (jc.DFA.contains([[2]], V).concat(jc.DFA.contains([[1, 1]], V)),
                              then(keyword([2]), keyword([1, 1]))),
-        "and_with_random": (DFA.contains([[2, 0]], V) & rand(tb, ab),
+        "and_with_random": (jc.DFA.contains([[2, 0]], V) & rand(tb, ab),
                             lambda X: contains_any(X, [[2, 0]]) & run_table(tb, ab, X)),
     }
 
@@ -96,7 +96,7 @@ CASES = make_cases()
 def exactly(m):
     """Any m tokens."""
     dense = torch.tensor([[min(q + 1, m + 1)] * V for q in range(m + 2)])      # state m + 1 is dead
-    return DFA.from_dense(V, dense, initial = 0, accept = [m])
+    return jc.DFA.from_dense(V, dense, initial = 0, accept = [m])
 
 
 def windowed(M, m, s):
@@ -145,7 +145,7 @@ def test_compile_a_ctrlg_case(case, setting):
         assert c.accepts(X[i]) == bool(want[i])
 
     # compile binds the PC's structure and the automaton; an HMM is right-linear
-    cc = compile(c, hmm(n))
+    cc = jc.compile(c, hmm(n))
     assert cc.n == n and cc.automaton is dfa and cc.satisfiable == bool(want.any())
     assert cc.structure.right_linear and cc.structure.unsupported == ()
     assert {k for k, v in cc.shape_counts.items() if v > 0} == {"suffix", "whole"}
@@ -194,7 +194,7 @@ def test_a_ctrlg_case_rebinds_to_an_hmm_with_other_parameters():
     c = windowed(CASES["ordered_keywords"][0], m, s)
     pa, pb = hmm(m + L + s, seed = 0), hmm(m + L + s, seed = 1)
     assert not torch.equal(pa.params, pb.params)
-    ca = compile(c, pa)
+    ca = jc.compile(c, pa)
     cb = ca.with_pc(pb)
     assert cb.pc is pb and cb.layout is ca.layout and cb.automaton is ca.automaton
-    assert compile(c, pb).layout is ca.layout                  # recompiling hits the layout cache
+    assert jc.compile(c, pb).layout is ca.layout                  # recompiling hits the layout cache

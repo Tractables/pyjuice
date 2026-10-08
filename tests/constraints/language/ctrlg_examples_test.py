@@ -16,7 +16,7 @@ import random
 import pytest
 import torch
 
-from pyjuice.constraints import DFA, And, Concat
+import pyjuice.constraints as jc
 from pyjuice.constraints.language.text import DEFAULT_SEPARATORS, word_token_kinds_from_strings
 
 VOCAB = ["<|endoftext|>", " a", " boy", " girl", " girls", " boys", " children", " is", " are", " riding",
@@ -37,16 +37,16 @@ def kinds():
 
 
 def example1():
-    bike = DFA.contains([enc([" riding", " a", " bike"]), enc([" ride", " bikes"]),
+    bike = jc.DFA.contains([enc([" riding", " a", " bike"]), enc([" ride", " bikes"]),
                          enc([" rides", " a", " bike"]), enc([" biking"]), enc([" bikes"])], V)
-    place = DFA.contains([enc([" park"]), enc([" beach"])], V)
-    return bike & place & DFA.word_count(10, 10, kinds())
+    place = jc.DFA.contains([enc([" park"]), enc([" beach"])], V)
+    return bike & place & jc.DFA.word_count(10, 10, kinds())
 
 
 def example2():
-    who = DFA.contains([enc([w]) for w in [" girl", " boy", " girls", " boys", " children"]], V)
-    pet = DFA.contains([enc([w]) for w in [" dogs", " cats", " dog", " cat"]], V)
-    return who.concat(pet) & DFA.word_count(7, 12, kinds())
+    who = jc.DFA.contains([enc([w]) for w in [" girl", " boy", " girls", " boys", " children"]], V)
+    pet = jc.DFA.contains([enc([w]) for w in [" dogs", " cats", " dog", " cat"]], V)
+    return who.concat(pet) & jc.DFA.word_count(7, 12, kinds())
 
 
 # Independent references, written from the definitions (not from the automata).
@@ -140,8 +140,8 @@ def test_hand_written_sentences():
 @pytest.mark.parametrize("which", [1, 2])
 def test_constraint_and_its_automaton_match_the_definition(which):
     c, ref = (example1(), ref1) if which == 1 else (example2(), ref2)
-    assert isinstance(c, And) and (which == 1 or isinstance(c.children[0], Concat) or
-                                   any(isinstance(ch, Concat) for ch in c.children))
+    assert isinstance(c, jc.And) and (which == 1 or isinstance(c.children[0], jc.Concat) or
+                                   any(isinstance(ch, jc.Concat) for ch in c.children))
     dfa = c.automaton()
     pos = 0
     for t in random_strings(4000, seed = which):

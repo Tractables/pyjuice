@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 import torch
 
-from pyjuice.constraints import DFA
+import pyjuice.constraints as jc
 
 
 def strings(V, max_len):
@@ -21,7 +21,7 @@ def random_dfa(K, V, seed):
     rng = random.Random(seed)
     dense = [[rng.randrange(K) for _ in range(V)] for _ in range(K)]
     accept = rng.sample(range(K), rng.randint(1, K))
-    return DFA.from_dense(V, dense, 0, accept), dense, set(accept)
+    return jc.DFA.from_dense(V, dense, 0, accept), dense, set(accept)
 
 
 def run_dense(dense, accept, t):
@@ -38,8 +38,8 @@ def run_dense(dense, accept, t):
 def test_basic_languages():
     V = 3
     for t in strings(V, 4):
-        assert DFA.anything(V).accepts(t)
-        assert not DFA.nothing(V).accepts(t)
+        assert jc.DFA.anything(V).accepts(t)
+        assert not jc.DFA.nothing(V).accepts(t)
     for seed in range(5):
         dfa, dense, accept = random_dfa(4, V, seed)
         for t in strings(V, 5):
@@ -52,14 +52,14 @@ def test_basic_languages():
                                       [[1, 1, 0]], [[0, 1, 0, 1, 1]], [[1, 2, 1, 2, 0], [2, 0, 0]]])
 def test_contains_matches_substring_semantics(patterns):
     V = 3
-    dfa = DFA.contains(patterns, V)
+    dfa = jc.DFA.contains(patterns, V)
     for t in strings(V, 7):
         assert dfa.accepts(t) == contains_ref(patterns, t), t
 
 
 def test_token_classes_are_compressed():
     V = 50
-    dfa = DFA.contains([[3, 7], [7, 9]], V)
+    dfa = jc.DFA.contains([[3, 7], [7, 9]], V)
     assert dfa.num_classes == 4                          # 3, 7, 9 and "everything else"
     sizes = dfa.class_sizes()
     assert sizes.sum() == V and sorted(sizes.tolist()) == [1, 1, 1, 47]
@@ -75,12 +75,12 @@ def test_from_transitions_partial_map_with_arbitrary_ids():
     V = 4
     trans = {512: {0: 512, 2: 512, 3: 512, 1: 640}, 640: {0: 640, 1: 640, 3: 640, 2: 768},
              768: {t: 768 for t in range(V)}}
-    dfa = DFA.from_transitions(V, trans, initial = 512, accept = [768])
+    dfa = jc.DFA.from_transitions(V, trans, initial = 512, accept = [768])
     ref = lambda t: any(t[i] == 1 and 2 in t[i + 1:] for i in range(len(t)))
     for t in strings(V, 5):
         assert dfa.accepts(t) == ref(t), t
     # a missing (state, token) pair goes to a dead state
-    sparse = DFA.from_transitions(V, {0: {1: 1}, 1: {}}, initial = 0, accept = [1])
+    sparse = jc.DFA.from_transitions(V, {0: {1: 1}, 1: {}}, initial = 0, accept = [1])
     assert sparse.accepts([1]) and not sparse.accepts([1, 0]) and not sparse.accepts([0, 1])
 
 
@@ -92,20 +92,20 @@ def test_from_ctrlg_graph():
     graph = {"edges": [(("a",), ("a",), bits([0, 2, 3])), (("a",), ("b",), bits([1])),
                        (("b",), ("b",), bits([0, 1, 2, 3]))],
              "initial_state": ("a",), "accept_states": {("b",)}}
-    dfa = DFA.from_ctrlg(graph, V)
+    dfa = jc.DFA.from_ctrlg(graph, V)
     for t in strings(V, 4):
         assert dfa.accepts(t) == (1 in t)
     with pytest.raises(ValueError, match = "not complete"):
-        DFA.from_ctrlg({"edges": [(0, 1, bits([1]))], "initial_state": 0, "accept_states": {1}}, V)
+        jc.DFA.from_ctrlg({"edges": [(0, 1, bits([1]))], "initial_state": 0, "accept_states": {1}}, V)
 
 
 def test_invalid_tables_raise():
     with pytest.raises(ValueError, match = "complete"):
-        DFA(2, [0, 0], [[1]], 0, [0])
+        jc.DFA(2, [0, 0], [[1]], 0, [0])
     with pytest.raises(ValueError, match = "token_class"):
-        DFA(2, [0, 1], [[0]], 0, [0])
+        jc.DFA(2, [0, 1], [[0]], 0, [0])
     with pytest.raises(ValueError, match = "initial"):
-        DFA(2, [0, 0], [[0]], 1, [0])
+        jc.DFA(2, [0, 0], [[0]], 1, [0])
 
 
 # -------------------------------------------------------------------------------------------------
@@ -125,7 +125,7 @@ def test_minimize_preserves_language_and_is_canonical():
         perm = list(range(6)); random.Random(seed).shuffle(perm)
         inv = {p: i for i, p in enumerate(perm)}
         dense2 = [[perm[dense[inv[i]][x]] for x in range(V)] for i in range(6)]
-        dfa2 = DFA.from_dense(V, dense2, perm[0], [perm[a] for a in accept])
+        dfa2 = jc.DFA.from_dense(V, dense2, perm[0], [perm[a] for a in accept])
         assert dfa2.minimize() == m and dfa2.equivalent(dfa)
 
 
@@ -142,8 +142,8 @@ def test_minimize_agrees_with_automata_lib_state_count():
 
 def test_inequivalent_dfas_are_told_apart():
     V = 3
-    assert not DFA.contains([[1, 2]], V).equivalent(DFA.contains([[2, 1]], V))
-    assert DFA.contains([[1], [1, 2]], V).equivalent(DFA.contains([[1]], V))
+    assert not jc.DFA.contains([[1, 2]], V).equivalent(jc.DFA.contains([[2, 1]], V))
+    assert jc.DFA.contains([[1], [1, 2]], V).equivalent(jc.DFA.contains([[1]], V))
 
 
 # -------------------------------------------------------------------------------------------------
@@ -165,8 +165,8 @@ def brute_allowed(dfa, prefix, V, remaining, max_extra):
 
 def test_matcher_masks_are_exact():
     V = 3
-    for seed, dfa in [(0, DFA.contains([[1, 2]], V)), (1, random_dfa(5, V, 1)[0]),
-                      (2, DFA.contains([[0, 0], [2, 1]], V)), (3, random_dfa(4, V, 7)[0])]:
+    for seed, dfa in [(0, jc.DFA.contains([[1, 2]], V)), (1, random_dfa(5, V, 1)[0]),
+                      (2, jc.DFA.contains([[0, 0], [2, 1]], V)), (3, random_dfa(4, V, 7)[0])]:
         for prefix in strings(V, 3):
             m = dfa.matcher()
             ok = all(m.advance(t) for t in prefix)
@@ -181,7 +181,7 @@ def test_matcher_masks_are_exact():
 
 def test_matcher_advance_rollback_clone():
     V = 3
-    dfa = DFA.from_transitions(V, {0: {1: 1}, 1: {2: 2}, 2: {}}, initial = 0, accept = [2])   # exactly [1, 2]
+    dfa = jc.DFA.from_transitions(V, {0: {1: 1}, 1: {2: 2}, 2: {}}, initial = 0, accept = [2])   # exactly [1, 2]
     m = dfa.matcher()
     assert not m.advance(0) and m.num_consumed == 0         # rejected tokens leave the state alone
     assert m.advance(1) and m.advance(2) and m.is_accepting()
@@ -212,8 +212,8 @@ def test_wmc_matches_brute_force(device):
         pytest.skip("no GPU")
     V, n = 3, 5
     torch.manual_seed(0)
-    for dfa in [DFA.contains([[1, 2]], V), DFA.contains([[0, 0], [2, 1, 2]], V), random_dfa(5, V, 3)[0],
-                DFA.nothing(V)]:
+    for dfa in [jc.DFA.contains([[1, 2]], V), jc.DFA.contains([[0, 0], [2, 1, 2]], V), random_dfa(5, V, 3)[0],
+                jc.DFA.nothing(V)]:
         lw = torch.randn(4, n, V, dtype = torch.float64)
         lw[0, 2, 1] = float("-inf")                          # a forbidden token
         got = dfa.wmc(lw.to(device)).cpu()
@@ -225,7 +225,7 @@ def test_wmc_matches_brute_force(device):
 
 def test_sample_matches_exact_distribution():
     V, n, S = 3, 4, 20000
-    dfa = DFA.contains([[1, 2]], V)
+    dfa = jc.DFA.contains([[1, 2]], V)
     torch.manual_seed(0)
     lw = torch.randn(2, n, V, dtype = torch.float64)
     gen = torch.Generator().manual_seed(1)
@@ -247,7 +247,7 @@ def test_sample_matches_exact_distribution():
 
 def test_sample_raises_when_nothing_is_accepted():
     with pytest.raises(ValueError, match = "No sequence"):
-        DFA.nothing(3).sample(torch.zeros(1, 2, 3), 1)
+        jc.DFA.nothing(3).sample(torch.zeros(1, 2, 3), 1)
 
 
 # -------------------------------------------------------------------------------------------------
@@ -257,8 +257,8 @@ def test_sample_raises_when_nothing_is_accepted():
 def test_composite_automata_match_definitions_on_all_short_strings():
     V = 3
     a = random_dfa(3, V, 11)[0]
-    b = DFA.contains([[1, 2]], V)
-    c = DFA.contains([[0, 0]], V)
+    b = jc.DFA.contains([[1, 2]], V)
+    c = jc.DFA.contains([[0, 0]], V)
     d = random_dfa(4, V, 12)[0]
     cases = {
         "and": (a & b, lambda t: a.accepts(t) and b.accepts(t)),
@@ -283,14 +283,14 @@ def test_composite_automata_match_definitions_on_all_short_strings():
 
 def test_equivalent_compositions_give_identical_automata():
     V = 3
-    a, b = DFA.contains([[1, 2]], V), DFA.contains([[0, 0]], V)
+    a, b = jc.DFA.contains([[1, 2]], V), jc.DFA.contains([[0, 0]], V)
     assert (a & b).automaton() == (b & a).automaton()
     assert (~(a | b)).automaton() == ((~a) & (~b)).automaton()          # De Morgan
-    assert (a & DFA.anything(V)).automaton() == a.minimize()
-    assert (a | DFA.nothing(V)).automaton() == a.minimize()
+    assert (a & jc.DFA.anything(V)).automaton() == a.minimize()
+    assert (a | jc.DFA.nothing(V)).automaton() == a.minimize()
 
 
 def test_capabilities():
-    assert DFA.anything(3).capabilities() == {"accepts", "matcher", "wmc", "sample", "automaton", "relax"}
-    d = DFA.contains([[1]], 3)
+    assert jc.DFA.anything(3).capabilities() == {"accepts", "matcher", "wmc", "sample", "automaton", "relax"}
+    d = jc.DFA.contains([[1]], 3)
     assert d.automaton() is d and d.relax() is d

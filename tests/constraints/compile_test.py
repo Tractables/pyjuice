@@ -4,7 +4,7 @@ import torch
 import pyjuice as juice
 import pyjuice.nodes.distributions as dists
 from pyjuice.nodes import inputs, multiply, summate
-from pyjuice.constraints import DFA, Constraint, CompiledConstraint, ConstraintCompileError, compile
+import pyjuice.constraints as jc
 from pyjuice.constraints.structure import analyze_structure
 from pyjuice.constraints.backends.lifted import plan
 from pyjuice.constraints.backends.lifted.plan import build_layout
@@ -29,7 +29,7 @@ def fragmented_circuit(leaf_dist = None):
     return juice.compile(summate(multiply(s02, s13), num_node_blocks = 1, block_size = 1), verbose = False)
 
 
-class OnlyAccepts(Constraint):
+class OnlyAccepts(jc.Constraint):
     """A constraint with membership only (no automaton)."""
 
     def accepts(self, tokens):
@@ -40,18 +40,18 @@ class OnlyAccepts(Constraint):
 
 
 def refusal(constraint, pc, **kwargs):
-    with pytest.raises(ConstraintCompileError) as e:
-        compile(constraint, pc, **kwargs)
+    with pytest.raises(jc.ConstraintCompileError) as e:
+        jc.compile(constraint, pc, **kwargs)
     return str(e.value)
 
 
 def test_hmm_compiles_with_the_lifted_backend():
     n = 6
     pc = hmm(n)
-    c = DFA.contains([[1, 2]], vocab_size = V)
-    cc = compile(c, pc)
+    c = jc.DFA.contains([[1, 2]], vocab_size = V)
+    cc = jc.compile(c, pc)
 
-    assert isinstance(cc, CompiledConstraint)
+    assert isinstance(cc, jc.CompiledConstraint)
     assert cc.pc is pc and cc.constraint is c and cc.structure is analyze_structure(pc)
     assert cc.backend == "lifted" and cc.exact and cc.n == n and cc.satisfiable
     assert cc.num_states == c.automaton().num_states and cc.num_classes == c.automaton().num_classes
@@ -70,7 +70,7 @@ def test_hmm_compiles_with_the_lifted_backend():
 def test_1d_pd_compiles_with_interval_scopes():
     pc = juice.compile(juice.structures.PD(data_shape = (8,), num_latents = 4, split_intervals = 1,
                                            input_node_params = {"num_cats": V}), verbose = False)
-    cc = compile(DFA.contains([[1, 2]], vocab_size = V), pc)
+    cc = jc.compile(jc.DFA.contains([[1, 2]], vocab_size = V), pc)
     assert cc.shape_counts["interval"] > 0 and cc.shape_counts["fragmented"] == 0
 
 
@@ -85,7 +85,7 @@ def test_bytes_per_sample_on_a_hand_counted_circuit():
     x = [inputs(v, num_node_blocks = 1, block_size = 2, dist = dists.Categorical(num_cats = 3)) for v in range(5)]
     s02 = mk(x[0], mk(x[1], x[2]))
     pc = juice.compile(summate(multiply(s02, mk(x[3], x[4])), num_node_blocks = 1, block_size = 1), verbose = False)
-    cc = compile(DFA.contains([[1, 1]], vocab_size = 3), pc)
+    cc = jc.compile(jc.DFA.contains([[1, 1]], vocab_size = 3), pc)
     assert cc.shape_counts == dict(whole = 2, suffix = 2, prefix = 2, interval = 2, fragmented = 0)
     C, W = cc.num_classes, cc.max_width
     assert (C, W) == (2, 3)                                     # distinct, so a mix-up shows
@@ -93,7 +93,7 @@ def test_bytes_per_sample_on_a_hand_counted_circuit():
 
 
 def test_fragmented_scopes_are_refused_with_a_clear_message():
-    msg = refusal(DFA.contains([[1, 2]], vocab_size = V), fragmented_circuit())
+    msg = refusal(jc.DFA.contains([[1, 2]], vocab_size = V), fragmented_circuit())
     assert "the node group over variables {0, 2} has 2 separate runs" in msg
     assert "4 node groups are fragmented, with up to 2 runs" in msg
     assert "K = 3 states and r = 2 that is 81 per node" in msg
@@ -103,7 +103,7 @@ def test_fragmented_scopes_are_refused_with_a_clear_message():
                                                input_node_params = {"num_cats": V}), verbose = False)
     max_runs = analyze_structure(hclt).max_runs
     assert max_runs > 1
-    msg = refusal(DFA.contains([[1, 2]], vocab_size = V), hclt)
+    msg = refusal(jc.DFA.contains([[1, 2]], vocab_size = V), hclt)
     assert f"has {max_runs} separate runs" in msg and "index order 0..11" in msg
 
 
@@ -111,12 +111,12 @@ def test_unsupported_leaves_are_refused():
     pc = juice.compile(juice.structures.GeneralizedHMM(seq_length = 4, num_latents = 4, homogeneous = False,
                                                        input_dist = dists.Gaussian(mu = 0.0, sigma = 1.0)),
                        verbose = False)
-    msg = refusal(DFA.anything(V), pc)
+    msg = refusal(jc.DFA.anything(V), pc)
     assert "4 node groups are not supported: input distribution Gaussian" in msg
 
 
 def test_a_vocabulary_mismatch_is_refused():
-    msg = refusal(DFA.contains([[1, 2]], vocab_size = V + 2), hmm(6))
+    msg = refusal(jc.DFA.contains([[1, 2]], vocab_size = V + 2), hmm(6))
     assert f"vocab_size {V + 2}" in msg and f"variables {{0..5}} have num_cats {V}" in msg
 
 
@@ -136,18 +136,18 @@ def test_every_reason_is_reported_at_once():
 
 def test_an_unknown_backend_or_wrong_types_are_refused():
     pc = hmm(6)
-    with pytest.raises(ConstraintCompileError, match = "known backends: 'lifted'"):
-        compile(DFA.anything(V), pc, backend = "smc")
+    with pytest.raises(jc.ConstraintCompileError, match = "known backends: 'lifted'"):
+        jc.compile(jc.DFA.anything(V), pc, backend = "smc")
     with pytest.raises(TypeError, match = "Constraint"):
-        compile("abc", pc)
+        jc.compile("abc", pc)
     with pytest.raises(TypeError, match = "pyjuice.compile"):
-        compile(DFA.anything(V), pc.root_ns)
+        jc.compile(jc.DFA.anything(V), pc.root_ns)
 
 
 def test_an_unsatisfiable_constraint_compiles():
     n = 4
-    for c in (DFA.nothing(V), DFA.contains([[1, 2, 3, 4, 1]], vocab_size = V)):    # pattern longer than n
-        cc = compile(c, hmm(n))
+    for c in (jc.DFA.nothing(V), jc.DFA.contains([[1, 2, 3, 4, 1]], vocab_size = V)):    # pattern longer than n
+        cc = jc.compile(c, hmm(n))
         assert not cc.satisfiable
         assert cc.max_width == 0 and cc.width_per_boundary.tolist() == [0] * (n + 1)
 
@@ -155,30 +155,30 @@ def test_an_unsatisfiable_constraint_compiles():
 def test_with_pc_rebinds_to_the_same_structure_only():
     pa, pb = hmm(6, seed = 0), hmm(6, seed = 1)
     assert not torch.equal(pa.params, pb.params)
-    cc = compile(DFA.contains([[1, 2]], vocab_size = V), pa)
+    cc = jc.compile(jc.DFA.contains([[1, 2]], vocab_size = V), pa)
 
     cb = cc.with_pc(pb)
     assert cb.pc is pb and cb.structure is analyze_structure(pb)
     assert cb.constraint is cc.constraint and cb.automaton is cc.automaton and cb.layout is cc.layout
 
-    with pytest.raises(ConstraintCompileError, match = "structure differs"):
+    with pytest.raises(jc.ConstraintCompileError, match = "structure differs"):
         cc.with_pc(hmm(7))
     with pytest.raises(TypeError, match = "pyjuice.compile"):
         cc.with_pc(pb.root_ns)
 
 
 def test_the_plan_does_not_depend_on_parameters():
-    c = DFA.contains([[1, 2]], vocab_size = V)
+    c = jc.DFA.contains([[1, 2]], vocab_size = V)
     pa, pb = hmm(6, seed = 0), hmm(6, seed = 1)
     plan._CACHE.clear()
-    ca = compile(c, pa)
+    ca = jc.compile(c, pa)
     tables = {k: v.clone() for k, v in vars(ca.layout).items() if isinstance(v, torch.Tensor)}
     info = {k: v for k, v in ca.info().items() if k != "compile_time_s"}
 
     with torch.no_grad():
         pa.params.uniform_(0.1, 1.0)                    # change the parameters in place
     plan._CACHE.clear()                                 # build the layout again, from scratch
-    for cc in (compile(c, pa), compile(c, pb)):
+    for cc in (jc.compile(c, pa), jc.compile(c, pb)):
         assert cc.layout is not ca.layout
         for k, v in tables.items():
             assert torch.equal(getattr(cc.layout, k), v), k
@@ -191,4 +191,4 @@ def test_the_plan_does_not_depend_on_parameters():
 
 def test_compile_is_exported_without_shadowing_a_module():
     import pyjuice.constraints.compiler as compiler_module         # a module, not the function
-    assert compiler_module.compile is compile and juice.constraints.compile is compile
+    assert compiler_module.compile is jc.compile and juice.constraints.compile is jc.compile

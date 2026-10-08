@@ -4,10 +4,10 @@ import pytest
 import torch
 
 import pyjuice as juice
-from pyjuice.constraints import Constraint, And, Or, Not, Concat
+import pyjuice.constraints as jc
 
 
-class _Pred(Constraint):
+class _Pred(jc.Constraint):
     """Test-only leaf: membership decided by a Python predicate, identified by `name`."""
 
     def __init__(self, vocab_size, name, pred):
@@ -34,8 +34,7 @@ class _PredWithWmc(_Pred):
         return out
 
     def automaton(self):
-        from pyjuice.constraints import DFA
-        return DFA.contains([[1]], self.vocab_size)
+        return jc.DFA.contains([[1]], self.vocab_size)
 
 
 V = 3
@@ -141,12 +140,12 @@ def test_invalid_inputs_raise():
     with pytest.raises(ValueError, match = "1-D"):
         contains_1.accepts(torch.zeros(2, 2, dtype = torch.long))
     with pytest.raises(TypeError):
-        And(contains_1, "not a constraint")
+        jc.And(contains_1, "not a constraint")
     with pytest.raises(ValueError, match = "at least two"):
-        Or(contains_1)
+        jc.Or(contains_1)
     with pytest.raises(ValueError):
         _Pred(0, "empty", lambda t: True)
 
 
 def test_exposed_as_juice_constraints():
-    assert juice.constraints.Constraint is Constraint
+    assert juice.constraints.Constraint is jc.Constraint
