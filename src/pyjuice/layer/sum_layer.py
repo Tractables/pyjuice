@@ -133,7 +133,7 @@ _BLOCK_SPARSE_EDGE_TRIM = os.environ.get("PYJUICE_EDGE_TRIM", "1") != "0"
 # layer), TF32 on dense layers that take cuBLAS (below); "tf32" never uses bf16 (round-to-nearest TF32 in the
 # Triton kernels, TF32 cuBLAS; ~5e-4); "fp32" gives fp32-level products (`tf32x3` in the Triton tlmm kernel,
 # exact fp32 cuBLAS; ~1e-6). Batches below 16 run fp32 kernels in every mode. Backward: "auto" and "tf32" keep
-# the round-to-nearest TF32 products; "fp32" computes the flows without tensor cores (exact fp32 sums).
+# the round-to-nearest TF32 products; "fp32" takes `tf32x3` products (fp32-level, on tensor cores).
 PRECISIONS = ("auto", "tf32", "fp32")
 
 
@@ -170,6 +170,8 @@ _DENSE_SCRATCH = 1 << 24
 # Extra keyword arguments of the forward tlmm launch, shared rather than built per call (never mutated)
 _FP32_DOT = {"fp32_dot": True}
 _NO_KWARGS = {}
+# ... and of the backward's element- / parameter-flow dot kernels in "fp32" mode (see `_PAR_DOT_IEEE`)
+_TF32X3_DOT = {"DOT_TF32X3": True}
 
 # Precision of the parameter-flow `tl.dot`. Triton defaults to TF32, which TRUNCATES the operands --
 # a bias, ~6e-4 low per product. The default path now rounds the operands onto the TF32 grid first
@@ -185,12 +187,14 @@ _NO_KWARGS = {}
 # `PYJUICE_PAR_DOT_IEEE=1` for when the flows themselves are the object of study (validating a new
 # kernel against a reference, a gradient check).
 #
-# `force_use_fp32` drops `tl.dot` altogether for a broadcast sum. That is NOT a reliable accuracy
-# route: it also changes the forward and element-flow forks, and its measured error moved between
-# 6.2e-6 and 7.0e-4 across runs of the same shape, because the timing-based autotuner picks
-# differently from run to run. (Likely Triton rewriting the fp32 broadcast sums into TF32 dots once a
-# tuned tile was big enough; the kernels no longer use that form -- see `_BROADCAST_SUM_NOTE` in
-# `layer/kernels/__init__.py`.)
+# In "fp32" mode (`force_use_fp32`) the element- and parameter-flow dots run in three TF32 passes
+# (`DOT_TF32X3`, `input_precision = "tf32x3"`): fp32-level, on tensor cores. `PYJUICE_PAR_DOT_IEEE`
+# still takes precedence in the parameter flows. That mode used to drop `tl.dot` altogether for
+# broadcast sums, 20-50x slower on large layers and NOT a reliable accuracy route: its measured error
+# moved between 6.2e-6 and 7.0e-4 across runs of the same shape, because the timing-based autotuner
+# picked differently from run to run. (Likely Triton rewriting the fp32 broadcast sums into TF32 dots
+# once a tuned tile was big enough; the kernels no longer use that form -- see `_BROADCAST_SUM_NOTE`
+# in `layer/kernels/__init__.py`.) Tiles below 16 still sum without dots, in every mode.
 #
 # Every par kernel takes `DOT_IEEE` so the one launch site below can stay uniform, but it is inert in
 # the `csmm2` forks: those reduce with `tl.sum`, not `tl.dot`, and have no precision to set.
@@ -536,7 +540,7 @@ class SumLayer(Layer, nn.Module):
             raise ValueError(f"`precision` must be one of {PRECISIONS}, got {precision!r}.")
         if "force_use_bf16" in kwargs or "force_use_fp32" in kwargs:      # the shim only when needed: hot path
             _pop_removed_precision_flags(kwargs)
-        force_use_fp32 = precision == "fp32"            # flows without tensor cores: exact fp32 sums
+        force_use_fp32 = precision == "fp32"            # fp32-level flows: tf32x3 dots, no TF32 / fp16 CUDA kernels
 
         ## Pre-compute `nflows.log() - nmars` if needed ##
         if allow_modify_flows:
@@ -1653,10 +1657,13 @@ class SumLayer(Layer, nn.Module):
             return tm
         TILE_SIZE_M = _doubled_m(TILE_SIZE_M, TILE_SIZE_K, BLOCK_B)
 
-        if TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and BLOCK_B >= 16 and not force_use_fp32:
+        if TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and BLOCK_B >= 16:
             TL_DOT = 1
         else:
             TL_DOT = 0
+        # "fp32": the same dots in three TF32 passes (see `_PAR_DOT_IEEE`); unset otherwise, so the other
+        # modes launch the kernels exactly as before
+        dot_kwargs = _TF32X3_DOT if (force_use_fp32 and TL_DOT) else _NO_KWARGS
 
         grid = (host_cdiv(batch_size, BLOCK_B), host_cdiv(layer_n_nodes, TILE_SIZE_M))
 
@@ -1707,6 +1714,7 @@ class SumLayer(Layer, nn.Module):
                     accumulate_ch_flows = accumulate_ch_flows,
                     pid_m_offset = pid_m_start,
                     num_stages = 1,
+                    **dot_kwargs,
                     **ele_extra
                 )
 
@@ -1740,7 +1748,7 @@ class SumLayer(Layer, nn.Module):
             return ele_cfgs
 
         ele_key = (ele_kernel, self.block_size, cs_block_size, TILE_SIZE_K, K_NUM_TILES,
-                   ptr_inc_step, batch_size, num_nblocks, TL_DOT, accumulate_ch_flows,
+                   ptr_inc_step, batch_size, num_nblocks, TL_DOT, bool(dot_kwargs), accumulate_ch_flows,
                    allow_modify_flows, logspace_flows, allow_neg_flows, propagation_alg_id,
                    default_ele_cfg)
 
@@ -1993,12 +2001,13 @@ class SumLayer(Layer, nn.Module):
                                   "This is an internal error of PyJuice. Please consider checking the kernel dispatching criterions and use the " \
                                   "corresponding sparse kernel instead."
 
-        # `force_use_fp32` disables the (TF32) tensor-core dot so the param flows are computed in
-        # full fp32, mirroring the element-flow backward (see `_backward_block_sparse_ele_flows`).
-        if TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and TILE_SIZE_B >= 16 and not force_use_fp32:
+        # `force_use_fp32` ("fp32") runs the same dots in three TF32 passes, as the element-flow backward
+        # does (see `_PAR_DOT_IEEE`); unset otherwise, so the other modes launch exactly as before.
+        if TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and TILE_SIZE_B >= 16:
             TL_DOT = 1
         else:
             TL_DOT = 0
+        dot_kwargs = _TF32X3_DOT if (force_use_fp32 and TL_DOT) else _NO_KWARGS
 
         # Launch tuning for the LL block-sparse-dot regime (see `BACKWARD_PAR_FLOW_TUNED`).
         # Bit-exactness note: results depend only on `TILE_SIZE_M` (it sets the node group
@@ -2113,6 +2122,7 @@ class SumLayer(Layer, nn.Module):
                     negate_pflows = negate_pflows,
                     pid_m_offset = pid_m_start,
                     num_stages = 1,
+                    **dot_kwargs,
                     **({"node_mars_tempered": kwargs["node_mars_tempered"]} if par_tempered
                        else {"node_mars": node_mars}),
                     **par_extra,
@@ -2142,7 +2152,7 @@ class SumLayer(Layer, nn.Module):
         # Like the forward, the heuristic default is part of the key so the `OutOfResources` retry --
         # which re-enters with the untuned default -- cannot look up the config that just failed.
         par_key = (par_kernel, self.block_size, raw_num_edges, num_nblocks, batch_size,
-                   TILE_SIZE_M, TILE_SIZE_B, B_NUM_TILES, TL_DOT, allow_modify_flows,
+                   TILE_SIZE_M, TILE_SIZE_B, B_NUM_TILES, TL_DOT, bool(dot_kwargs), allow_modify_flows,
                    logspace_flows, negate_pflows, allow_neg_flows, propagation_alg_id, default_par_cfg)
 
         def _tuned_par_cfg():

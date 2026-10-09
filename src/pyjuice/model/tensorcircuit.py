@@ -411,7 +411,7 @@ class TensorCircuit(nn.Module):
         * ``"auto"`` (the default): the fastest per layer -- bf16 products in the block-sparse kernels from batch 16
           (about 4e-3 in a log-likelihood), TF32 on large dense layers, which run through cuBLAS;
         * ``"tf32"``: never bf16 -- round-to-nearest TF32 products (about 5e-4);
-        * ``"fp32"``: fp32-level products in the forward (about 1e-6) and flows without tensor cores in the backward.
+        * ``"fp32"``: fp32-level products in the forward and the backward (about 1e-6; ``tf32x3`` on tensor cores).
 
         Batches below 16 run fp32 kernels in every mode. Settable at any time; a recorded CUDA graph is keyed on it.
         """

@@ -8,8 +8,12 @@ The sum layer's forward precision modes (`pyjuice.layer.sum_layer.PRECISIONS`), 
 * the dense cuBLAS path runs exactly when its gate holds (LL, no tempering, dense node blocks, sizes);
 * on that path, node blocks with their own, evenly strided children (HCLT) are one batched product, run in pieces
   when `_DENSE_SCRATCH` is small, and any other multi-group layout is left to the kernels;
+* the backward's element and parameter flows match float64 in each mode, and "fp32" takes `tf32x3` dots in both flow
+  kernels (the other modes launch them as before);
 * an unknown mode is refused.
 """
+import collections.abc
+
 import pytest
 import torch
 
@@ -68,6 +72,56 @@ def run(pc, layer, batch, seed = 0, prepare = None, **kw):
     exact = torch.log(W @ torch.exp(x.double() - m)) + m
     n0 = int(nids.min())
     return node_mars[n0:n0 + NB * BS].double(), exact
+
+
+def run_backward(pc, layer, batch, seed = 0, **kw):
+    """
+    The layer's backward (linear flows) on random children and parent flows; returns (element flows, parameter
+    flows) and the float64 values of the same, from the same `node_mars`.
+    """
+    nids, cids, pids, pfids = (layer.partitioned_nids[0], layer.partitioned_cids[0], layer.partitioned_pids[0],
+                               layer.partitioned_pfids[0])
+    NB, E, BS = cids.size(0), cids.size(1), layer.block_size
+    first = int(cids[cids > 0].min())
+    R = int(cids.max()) - first + 1
+    n0 = int(nids.min())
+    g = torch.Generator(device = DEV).manual_seed(seed)
+    x = torch.randn(R, batch, device = DEV, generator = g) * 3 - 5
+    node_mars = torch.zeros(pc.num_nodes, batch, device = DEV)
+    element_mars = torch.full((pc.num_elements, batch), -float("inf"), device = DEV)
+    element_mars[first:first + R] = x
+    layer.forward(node_mars, element_mars, pc.params)
+    node_flows = torch.zeros(pc.num_nodes, batch, device = DEV)
+    node_flows[n0:n0 + NB * BS] = torch.rand(NB * BS, batch, device = DEV, generator = g)
+    element_flows = torch.zeros(pc.num_elements, batch, device = DEV)
+    param_flows = torch.zeros(int(pfids.max()) + BS, device = DEV)
+    layer.backward(node_flows, element_flows, node_mars, element_mars, pc.params, param_flows, **kw)
+
+    i = torch.arange(BS, device = DEV)[None, :, None]
+    n = (torch.arange(NB, device = DEV)[:, None, None] * BS + i).expand(NB, BS, E)       # parent row
+    c = (cids - first)[:, None, :].expand(NB, BS, E).clamp(min = 0)                      # child row
+    w = pc.params[pids[:, None, :] + i].double() * (cids > 0)[:, None, :]                # padded edges: 0
+    F, NM = node_flows[n0:n0 + NB * BS].double(), node_mars[n0:n0 + NB * BS].double()
+    T = F[n] * w[..., None] * torch.exp(x.double()[c] - NM[n])                           # [NB, BS, E, batch]
+    eref = torch.zeros(R, batch, dtype = torch.float64, device = DEV).index_add_(0, c.reshape(-1), T.reshape(-1, batch))
+    pref = torch.zeros(param_flows.numel(), dtype = torch.float64, device = DEV)
+    pref.index_add_(0, (pfids[:, None, :] + i).reshape(-1), T.sum(-1).reshape(-1))
+    return (element_flows[first:first + R].double(), param_flows.double()), (eref, pref)
+
+
+class _CountedKwargs(collections.abc.Mapping):
+    """Launch keyword arguments that count how many launches unpack them."""
+    def __init__(self, **kw):
+        self.kw, self.unpacked = kw, 0
+    def __getitem__(self, key):
+        return self.kw[key]
+    def __iter__(self):
+        return iter(self.kw)
+    def __len__(self):
+        return len(self.kw)
+    def keys(self):
+        self.unpacked += 1
+        return self.kw.keys()
 
 
 #: max |log value - float64| per mode, with margin over the measured (5e-4 TF32, 3e-6 fp32 on a 4096-latent layer)
@@ -159,6 +213,21 @@ def test_the_gate(monkeypatch):
     monkeypatch.setattr(SL, "_DENSE_MIN_WORK", 64 * 64)            # 64 x 48: too little work
     run(pc, layer, 48)
     assert taken == [True]
+
+
+@pytest.mark.parametrize("precision", ["auto", "tf32", "fp32"])
+def test_backward_accuracy(precision, monkeypatch):
+    pc, layer = hmm_sum_layer(64)                                   # batch 48: the block-sparse dot kernels
+    tf32x3 = _CountedKwargs(DOT_TF32X3 = True)
+    monkeypatch.setattr(SL, "_TF32X3_DOT", tf32x3)
+    (eflows, pflows), (eref, pref) = run_backward(pc, layer, 48, precision = precision)
+    if precision == "fp32":
+        assert tf32x3.unpacked >= 2                                 # the element- and the parameter-flow kernel
+    else:
+        assert tf32x3.unpacked == 0
+    tol = TOL["fp32" if precision == "fp32" else "tf32"]
+    for got, ref in ((eflows, eref), (pflows, pref)):
+        assert (got - ref).abs().max() <= tol * ref.abs().max()
 
 
 def test_removed_layer_flags():
