@@ -11,7 +11,7 @@ import torch
 
 from .language.base import Constraint
 from .structure import SHAPES, PCStructure, analyze_structure
-from .backends.lifted.plan import BoundaryLayout
+from .backends.lifted.plan import BoundaryLayout, build_pc_tables
 
 
 class ConstrainedCircuit:
@@ -21,8 +21,8 @@ class ConstrainedCircuit:
 
     Everything it holds besides the PC depends only on the constraint and the PC's STRUCTURE, never on
     parameter values or evidence, so it stays valid while the PC's parameters change (e.g. CoDD's
-    external parameters at every step). :meth:`with_pc` binds the same plan to another PC with the same
-    structure.
+    external parameters at every step). :meth:`with_pc` puts the same constraint on another PC with the
+    same structure.
 
     Created by :func:`pyjuice.constraints.compile`; not meant to be constructed directly.
 
@@ -32,6 +32,11 @@ class ConstrainedCircuit:
     :ivar automaton: the constraint's automaton
     :ivar layout: the :class:`~pyjuice.constraints.backends.lifted.plan.BoundaryLayout` of the automaton
         over the PC's variables
+    :ivar columns_per_sample: S, the columns every sample takes in the PC's buffers during a lifted pass
+        (see :func:`~pyjuice.constraints.backends.lifted.plan.build_pc_tables`)
+    :ivar product_rows: per product layer and pattern, the rows and boundaries the lifted products read
+    :ivar input_range: the ``node_mars`` rows of all input nodes
+    :ivar root_rows: the ``node_mars`` rows of the root nodes
     :ivar compile_time_s: wall-clock seconds :func:`~pyjuice.constraints.compile` (or :meth:`with_pc`) took
     """
 
@@ -41,12 +46,16 @@ class ConstrainedCircuit:
     exact = True
 
     def __init__(self, pc, constraint: Constraint, structure: PCStructure, automaton,
-                 layout: BoundaryLayout, compile_time_s: float):
+                 layout: BoundaryLayout, tables: Dict[str, Any], compile_time_s: float):
         self.pc = pc
         self.constraint = constraint
         self.structure = structure
         self.automaton = automaton
         self.layout = layout
+        self.columns_per_sample = tables["columns_per_sample"]
+        self.product_rows = tables["product_rows"]
+        self.input_range = tables["input_range"]
+        self.root_rows = tables["root_rows"]
         self.compile_time_s = compile_time_s
 
     # ---------------------------------------------------------------------------------------------
@@ -95,29 +104,25 @@ class ConstrainedCircuit:
     @property
     def bytes_per_sample(self) -> int:
         """
-        Estimated node-value memory per sample under the lifted plan, in fp32 and padded to
-        :attr:`max_width` columns ``W``: a sum or product node holds 1 value if its scope is the whole
-        sequence, ``W`` for a prefix or suffix and ``W^2`` for an interval; an input node holds one mass
-        per token class.
+        Memory a lifted pass needs per sample, in fp32: the PC's ``node_mars`` and ``element_mars`` at
+        :attr:`columns_per_sample` columns, plus one mass per input node and token class.
         """
-        W, C = self.max_width, self.num_classes
-        per_node = {"whole": 1, "prefix": W, "suffix": W, "interval": W * W}
-        total = 0
-        for info in self.structure.nodes:
-            total += info.ns.num_nodes * (C if info.kind == "input" else per_node[info.shape])
-        return 4 * total
+        num_inputs = self.input_range[1] - self.input_range[0]
+        buffers = self.columns_per_sample * (self.pc.num_nodes + self.pc.num_elements)
+        return 4 * (buffers + num_inputs * self.num_classes)
 
     def info(self) -> Dict[str, Any]:
         """A summary of the constrained circuit."""
         return dict(backend = self.backend, exact = self.exact, n = self.n, satisfiable = self.satisfiable,
                     num_states = self.num_states, num_classes = self.num_classes, max_width = self.max_width,
                     width_per_boundary = self.width_per_boundary.tolist(), shape_counts = self.shape_counts,
-                    bytes_per_sample = self.bytes_per_sample, compile_time_s = self.compile_time_s,
-                    constraint = self.constraint.info())
+                    columns_per_sample = self.columns_per_sample, bytes_per_sample = self.bytes_per_sample,
+                    compile_time_s = self.compile_time_s, constraint = self.constraint.info())
 
     def __repr__(self) -> str:
         return (f"ConstrainedCircuit(backend={self.backend}, n={self.n}, num_states={self.num_states}, "
-                f"max_width={self.max_width}, satisfiable={self.satisfiable})")
+                f"max_width={self.max_width}, columns_per_sample={self.columns_per_sample}, "
+                f"satisfiable={self.satisfiable})")
 
     # ---------------------------------------------------------------------------------------------
     # Rebinding
@@ -125,9 +130,10 @@ class ConstrainedCircuit:
 
     def with_pc(self, pc) -> "ConstrainedCircuit":
         """
-        The same plan bound to another PC with the same structure (e.g. a drafter and a verifier, or a
-        copy of the PC on another device). Only the PCs' structural signatures are compared; nothing is
-        rebuilt.
+        The same constraint on another PC with the same structure (e.g. a drafter and a verifier, or a
+        copy of the PC on another device). The structure analysis is checked by signature and reused, as
+        are the automaton and its layout; only the PC's rows are read again (one pass over its node
+        groups), since nothing guarantees that two circuits number their nodes alike.
 
         :param pc: a compiled PC whose structure equals this one's (parameters may differ)
         :type pc: TensorCircuit
@@ -142,7 +148,8 @@ class ConstrainedCircuit:
                                          "from the one the constraint was compiled against. Compile the "
                                          "constraint against the new PC with `pyjuice.constraints.compile` "
                                          "instead.")
-        return ConstrainedCircuit(pc, self.constraint, structure, self.automaton, self.layout,
+        tables = build_pc_tables(structure, self.layout, pc)
+        return ConstrainedCircuit(pc, self.constraint, structure, self.automaton, self.layout, tables,
                                   compile_time_s = time.perf_counter() - t0)
 
     # ---------------------------------------------------------------------------------------------
@@ -151,16 +158,16 @@ class ConstrainedCircuit:
 
     def marginal(self, *args, **kwargs):
         """Probability of the constraint (and evidence). Not implemented yet."""
-        raise NotImplementedError("`marginal` under a constraint arrives with the reference backend.")
+        raise NotImplementedError("`marginal` under a constraint is not implemented yet.")
 
     def conditional(self, *args, **kwargs):
         """Per-variable distributions given the constraint (and evidence). Not implemented yet."""
-        raise NotImplementedError("`conditional` under a constraint arrives with the reference backend.")
+        raise NotImplementedError("`conditional` under a constraint is not implemented yet.")
 
     def sample(self, *args, **kwargs):
         """Samples from the PC conditioned on the constraint (and evidence). Not implemented yet."""
-        raise NotImplementedError("`sample` under a constraint arrives with the reference backend.")
+        raise NotImplementedError("`sample` under a constraint is not implemented yet.")
 
     def decoder(self, *args, **kwargs):
         """Incremental (token-by-token) constrained decoding. Not implemented yet."""
-        raise NotImplementedError("`decoder` under a constraint arrives with the incremental backend.")
+        raise NotImplementedError("`decoder` under a constraint is not implemented yet.")

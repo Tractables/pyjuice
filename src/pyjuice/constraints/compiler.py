@@ -16,7 +16,7 @@ from pyjuice.nodes.distributions import Categorical
 
 from .language.base import Constraint
 from .structure import PCStructure, _runs, analyze_structure
-from .backends.lifted.plan import build_layout
+from .backends.lifted.plan import build_layout, build_pc_tables
 from .constrained_circuit import ConstrainedCircuit
 
 
@@ -61,7 +61,8 @@ def compile(constraint: Constraint, pc: TensorCircuit, backend: Optional[str] = 
 
     automaton = constraint.automaton()
     layout = build_layout(automaton, structure.num_vars)
-    return ConstrainedCircuit(pc, constraint, structure, automaton, layout,
+    tables = build_pc_tables(structure, layout, pc)
+    return ConstrainedCircuit(pc, constraint, structure, automaton, layout, tables,
                               compile_time_s = time.perf_counter() - t0)
 
 

@@ -1,8 +1,10 @@
 import itertools
 import random
 
+import pytest
 import torch
 
+import pyjuice as juice
 import pyjuice.constraints as jc
 from pyjuice.constraints.backends.lifted.plan import build_layout
 
@@ -103,3 +105,117 @@ def test_pruning_on_a_word_count_constraint():
     L = build_layout(c, 12)
     print(f"{c.num_states} states; active width per boundary {L.width.tolist()}")
     assert L.satisfiable and int(L.width.max()) < c.num_states
+
+
+# -------------------------------------------------------------------------------------------------
+# The PC side: build_pc_tables, read through the constrained circuit's attributes
+# -------------------------------------------------------------------------------------------------
+
+V = 3
+PC_KINDS = {"hmm": 6, "hmm_untied": 6, "hmm_block_sparse": 6, "pd": 8, "pd_prod_dominated": 8,
+            "pd_blockified": 8, "hand": 5, "hand_permuted": 5, "hand_unit": 4}      # see conftest.py
+
+
+def rows_by_element(cc):
+    """(product layer index, element row) -> (pattern, child rows, boundaries), padding removed. Element
+    rows are only unique within a layer: every product layer reuses element_mars from its start."""
+    out = {}
+    for li, layer in enumerate(cc.product_rows):
+        for pattern, (rows, child, bounds) in layer.items():
+            for r, ch, bd in zip(rows.tolist(), child.tolist(), bounds.tolist()):
+                assert (li, r) not in out                                  # every product node once
+                k = sum(c >= 0 for c in ch)
+                assert ch[k:] == [-1] * (len(ch) - k) and bd[k + 1:] == [-1] * (len(bd) - k - 1)
+                out[li, r] = (pattern, ch[:k], bd[:k + 1])
+    return out
+
+
+@pytest.mark.parametrize("kind", list(PC_KINDS))
+def test_product_rows_follow_the_edges_in_scope_order(kind, build_pc, reference):
+    n = PC_KINDS[kind]
+    pc = build_pc(kind, n, V)
+    cc = jc.compile(jc.DFA.contains([[1, 2]], V), pc)
+    st = cc.structure
+    product_layers = [layer for lg in pc.inner_layer_groups if lg.is_prod() for layer in lg.layers]
+    layer_of = {ns: li for li, layer in enumerate(product_layers) for ns in layer.nodes}
+    got = rows_by_element(cc)
+    num_rows = 0
+    for ns in pc.root_ns:
+        if not ns.is_prod():
+            continue
+        (a, b), = st.node(ns).scope_runs
+        order = sorted(range(len(ns.chs)), key = lambda k: st.node(ns.chs[k]).scope_runs[0][0])
+        chs = [ns.chs[k] for k in order]
+        child_rows = [ns.chs[k]._output_ind_range[0] + reference.product_child_index(ns, k) for k in order]
+        bounds = [st.node(cs).scope_runs[0][0] for cs in chs] + [b + 1]
+        pattern = ("input_suffix" if len(chs) == 2 and chs[0].is_input() and not chs[1].is_input() and b == n - 1
+                   else "chain")
+        for p in range(ns.num_nodes):
+            pat, ch, bd = got[layer_of[ns], ns._output_ind_range[0] + p]
+            assert pat == pattern and bd == bounds
+            assert ch == [int(c[p]) for c in child_rows]
+            num_rows += 1
+    assert num_rows == len(got)
+
+
+def test_hmm_products_are_input_suffix_except_the_last_position(build_pc):
+    n = 6
+    cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc("hmm", n, V))
+    got = rows_by_element(cc)
+    lo, hi = cc.input_range
+    for pattern, ch, bd in got.values():
+        if bd == [n - 1, n]:                       # pyjuice's one-child product over the last input node
+            assert pattern == "chain" and len(ch) == 1 and lo <= ch[0] < hi
+        else:
+            a = bd[0]
+            assert pattern == "input_suffix" and bd == [a, a + 1, n]
+            assert lo <= ch[0] < hi and not lo <= ch[1] < hi            # the input node first, then the suffix
+
+
+def test_columns_per_sample(build_pc):
+    # an HMM keeps one vector over the entry columns per node: S = the widest boundary after the first
+    n = 6
+    cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc("hmm", n, V))
+    assert cc.columns_per_sample == max(cc.width_per_boundary[1:n].tolist())
+    # the hand-built circuit under "contains 1 1": widths 1, 2, 3, 3, 2, 1, and its interval nodes over
+    # [1, 2] (2 x 3 columns) and the one-child product over x3 (3 x 2) are the largest blocks
+    cc = jc.compile(jc.DFA.contains([[1, 1]], V), build_pc("hand", 5, V))
+    assert cc.width_per_boundary.tolist() == [1, 2, 3, 3, 2, 1] and cc.columns_per_sample == 6
+    # a one-state constraint keeps one column per sample everywhere
+    for kind, n in PC_KINDS.items():
+        assert jc.compile(jc.DFA.anything(V), build_pc(kind, n, V)).columns_per_sample == 1
+
+
+def test_tables_live_on_the_pcs_device_and_with_pc_reads_the_new_pc(build_pc):
+    c = jc.DFA.contains([[1, 2]], V)
+    # the same structure (PD draws its edges at random, so the same seed), another device and other
+    # compile options
+    pa = build_pc("pd", 8, V, seed = 0)
+    pb = build_pc("pd", 8, V, seed = 0, device = torch.device("cpu"), layer_sparsity_tol = 0.05)
+    ca = jc.compile(c, pa)
+    cb = ca.with_pc(pb)
+    assert cb.layout is ca.layout and cb.automaton is ca.automaton
+    assert cb.columns_per_sample == ca.columns_per_sample
+    assert [sorted(layer) for layer in cb.product_rows] == [sorted(layer) for layer in ca.product_rows]
+    for la, lb in zip(ca.product_rows, cb.product_rows):
+        for pattern in la:
+            for ta, tb in zip(la[pattern], lb[pattern]):
+                assert ta.dtype == tb.dtype == torch.int32
+                assert ta.device == pa.device and tb.device.type == "cpu"     # each PC's own tables
+                assert torch.equal(ta.cpu(), tb)
+
+
+def test_a_graph_compiled_again_is_refused():
+    torch.manual_seed(0)
+    ns = juice.structures.PD(data_shape = (8,), num_latents = 4, split_intervals = 1,
+                             input_node_params = {"num_cats": V})
+    first = juice.compile(ns, verbose = False)
+    juice.compile(ns, verbose = False)            # the same graph again: its node groups now describe this one
+    with pytest.raises(jc.ConstraintCompileError, match = "compiled again"):
+        jc.compile(jc.DFA.contains([[1, 2]], V), first)
+    # an HMM graph compiled again keeps its rows, so nothing is refused
+    torch.manual_seed(0)
+    ns = juice.structures.HMM(seq_length = 6, num_latents = 4, num_emits = V)
+    first = juice.compile(ns, verbose = False)
+    juice.compile(ns, verbose = False)
+    jc.compile(jc.DFA.contains([[1, 2]], V), first)

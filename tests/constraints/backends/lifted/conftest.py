@@ -209,6 +209,7 @@ def reference():
     import types
     return types.SimpleNamespace(marginal = reference_marginal, sum_weights = sum_weights,
                                  categorical_probs = categorical_probs, input_block = input_block,
+                                 product_child_index = product_child_index,
                                  log_matmul = log_matmul, log_weighted_sum = log_weighted_sum)
 
 

@@ -74,22 +74,23 @@ def test_1d_pd_compiles_with_interval_scopes():
     assert cc.shape_counts["interval"] > 0 and cc.shape_counts["fragmented"] == 0
 
 
-def test_bytes_per_sample_on_a_hand_counted_circuit():
-    # every group below has 2 nodes except the root (1):
-    #   input nodes x0..x4                    -> C masses each
-    #   prod(x1, x2), s12 over [1, 2]         -> interval, W^2
-    #   prod(x0, s12), s02 over [0, 2]        -> prefix, W
-    #   prod(x3, x4), s34 over [3, 4]         -> suffix, W
-    #   prod(s02, s34), root over [0, 4]      -> whole, 1
+def test_columns_and_memory_on_a_hand_counted_circuit():
+    # every group below has 2 nodes except the root (1); under "contains 1 1" the widths per boundary
+    # are 1, 2, 3, 3, 2, 1, so the blocks (entry x exit columns, a sequence end counting as one) are:
+    #   prod(x1, x2), s12 over [1, 2]         -> interval, 2 x 3 = 6
+    #   prod(x0, s12), s02 over [0, 2]        -> prefix,   1 x 3 = 3
+    #   prod(x3, x4), s34 over [3, 4]         -> suffix,   3 x 1 = 3
+    #   prod(s02, s34), root over [0, 4]      -> whole,    1
     mk = lambda *a: summate(multiply(*a), num_node_blocks = 1, block_size = 2)
     x = [inputs(v, num_node_blocks = 1, block_size = 2, dist = dists.Categorical(num_cats = 3)) for v in range(5)]
     s02 = mk(x[0], mk(x[1], x[2]))
     pc = juice.compile(summate(multiply(s02, mk(x[3], x[4])), num_node_blocks = 1, block_size = 1), verbose = False)
     cc = jc.compile(jc.DFA.contains([[1, 1]], vocab_size = 3), pc)
     assert cc.shape_counts == dict(whole = 2, suffix = 2, prefix = 2, interval = 2, fragmented = 0)
-    C, W = cc.num_classes, cc.max_width
-    assert (C, W) == (2, 3)                                     # distinct, so a mix-up shows
-    assert cc.bytes_per_sample == 4 * (10 * C + 4 * W * W + 4 * W + 4 * W + 2 + 1)
+    assert cc.width_per_boundary.tolist() == [1, 2, 3, 3, 2, 1] and cc.num_classes == 2
+    assert cc.columns_per_sample == 6
+    # the PC's node_mars and element_mars at 6 columns per sample, plus 2 class masses per input node (10)
+    assert cc.bytes_per_sample == 4 * (6 * (pc.num_nodes + pc.num_elements) + 10 * 2)
 
 
 def test_fragmented_scopes_are_refused_with_a_clear_message():
