@@ -3,10 +3,13 @@ Validates the test-side reference for constrained marginals (the `reference` fix
 which the library's GPU implementation is tested against. Like the compiler, the reference handles
 Categorical input nodes only, so every PC here has Categorical input nodes. Checks:
 
-* its parameters equal the node groups' own after `pc.update_parameters()`;
-* with the one-state constraint (anything goes) it reproduces `juice.queries.marginal` on every PC shape
-  that compiles: HMMs (tied and untied), a 1-D PD, and a hand-built circuit with a three-child product,
-  a sum over input nodes, prefix and interval scopes, node-level product edges and a sum over two products;
+* its sum weights are normalized for every node, and equal the node groups' own after
+  `pc.update_parameters()` (where their edge blocks are distinct);
+* with the one-state constraint (anything goes) it reproduces `juice.queries.marginal` on every kind of
+  PC in conftest.py's `PC_KINDS`: HMMs (tied, untied, with block-sparse transitions), 1-D PDs (plain,
+  sum-sharing with block-sparse sum edges, blockified), and hand-built circuits with three- and four-child
+  products, a sum over an input node, an input node next to an interval node, node-level and permuted
+  block-level product edges, explicit block-sparse sum edges and block size 1;
 * under real constraints it equals brute force -- the PC's own probabilities of every string, summed
   over the accepted ones consistent with the evidence -- including after an in-place parameter update;
 * its log-space block operations stay exact far outside exp's range.
@@ -18,46 +21,16 @@ import pytest
 import torch
 
 import pyjuice as juice
-import pyjuice.nodes.distributions as dists
-from pyjuice.nodes import inputs, multiply, summate
 import pyjuice.constraints as jc
 
 DEV = torch.device("cuda:0")
 
 
-def hand_built(V):
-    """Every construct a contiguous PC can have, over 5 variables."""
-    x = [inputs(v, num_node_blocks = 2, block_size = 2, dist = dists.Categorical(num_cats = V)) for v in range(5)]
-    s12 = summate(multiply(x[1], x[2]), num_node_blocks = 2, block_size = 2)          # interval [1, 2]
-    s01 = summate(multiply(x[0], x[1]), num_node_blocks = 2, block_size = 2)          # prefix [0, 1]
-    s3 = summate(x[3], num_node_blocks = 2, block_size = 2)                           # a sum over input nodes
-    p34 = multiply(s3, x[4], edge_ids = torch.tensor([[0, 3], [1, 2], [2, 1], [3, 0]]),
-                   sparse_edges = True)                                               # node-level edges
-    s34 = summate(p34, num_node_blocks = 2, block_size = 2)                           # suffix [3, 4]
-    p_a = multiply(s34, x[0], s12)                                                    # three children, listed
-    p_b = multiply(x[2], s34, s01)                                                    # out of scope order
-    return summate(p_a, p_b, num_node_blocks = 1, block_size = 1)                     # a sum over two products
-
-
-def build(kind, n, V, seed = 0):
-    torch.manual_seed(seed); random.seed(seed)
-    if kind == "hmm":
-        ns = juice.structures.HMM(seq_length = n, num_latents = 8, num_emits = V)
-    elif kind == "hmm_untied":
-        ns = juice.structures.GeneralizedHMM(seq_length = n, num_latents = 8, homogeneous = False,
-                                             input_dist = dists.Categorical(num_cats = V))
-    elif kind == "pd":
-        ns = juice.structures.PD(data_shape = (n,), num_latents = 4, split_intervals = 1,
-                                 input_node_params = {"num_cats": V})
-    else:
-        assert n == 5
-        ns = hand_built(V)
-    ns.init_parameters(perturbation = 2.0)
-    return juice.compile(ns, verbose = False).to(DEV)
-
-
-KINDS = {"hmm": 6, "hmm_untied": 6, "pd": 8, "hand": 5}                 # kind -> n for the identity tests
-TINY = {"hmm": 5, "hmm_untied": 5, "pd": 4, "hand": 5}                  # kind -> n for brute force
+# kind (see `PC_KINDS` in conftest.py) -> n, for the identity tests and for brute force
+KINDS = {"hmm": 6, "hmm_untied": 6, "hmm_block_sparse": 6, "pd": 8, "pd_prod_dominated": 8, "pd_blockified": 8,
+         "hand": 5, "hand_permuted": 5, "hand_unit": 4}
+TINY = {"hmm": 5, "hmm_untied": 5, "hmm_block_sparse": 5, "pd": 4, "pd_prod_dominated": 5, "pd_blockified": 5,
+        "hand": 5, "hand_permuted": 5, "hand_unit": 4}
 
 
 def evidence(n, V, B = 6, seed = 0):
@@ -70,21 +43,26 @@ def evidence(n, V, B = 6, seed = 0):
 
 
 @pytest.mark.parametrize("kind", list(KINDS))
-def test_parameters_are_read_from_the_compiled_pc(kind, reference):
-    pc = build(kind, KINDS[kind], V = 5)
+def test_parameters_are_read_from_the_compiled_pc(kind, reference, build_pc):
+    pc = build_pc(kind, KINDS[kind], V = 5)
     pc.update_parameters()                                              # writes the node groups' own copies
     for ns in pc.root_ns:
         src = ns.get_source_ns()
         if ns.is_sum():
-            assert torch.equal(reference.sum_weights(pc, ns).cpu(), src.get_params(as_matrix = True))
+            weights = reference.sum_weights(pc, ns).cpu()
+            assert torch.allclose(weights.sum(dim = 1), torch.ones(ns.num_nodes))     # every node normalized
+            # `get_params(as_matrix = True)` keeps one copy of a repeated edge block, so it is the expected
+            # value only where the edge blocks are distinct
+            if torch.unique(ns.edge_ids, dim = 1).size(1) == ns.edge_ids.size(1):
+                assert torch.equal(weights, src.get_params(as_matrix = True))
         elif ns.is_input():
             assert torch.equal(reference.categorical_probs(pc, ns).cpu(), src._params.reshape(ns.num_nodes, -1))
 
 
 @pytest.mark.parametrize("kind", list(KINDS))
-def test_one_state_constraint_reproduces_the_marginal(kind, reference):
+def test_one_state_constraint_reproduces_the_marginal(kind, reference, build_pc):
     n, V = KINDS[kind], 5
-    pc = build(kind, n, V)
+    pc = build_pc(kind, n, V)
     cc = jc.compile(jc.DFA.anything(V), pc)
     data, missing = evidence(n, V)
     for mask in (None, missing, missing[2]):                            # no mask, [B, n], [n]
@@ -169,9 +147,9 @@ def brute_force(pc, cc, data, missing, V):
 
 @pytest.mark.parametrize("name", list(constraints(3, 5)))
 @pytest.mark.parametrize("kind", list(TINY))
-def test_reference_equals_brute_force(kind, name, reference):
+def test_reference_equals_brute_force(kind, name, reference, build_pc):
     n, V = TINY[kind], 3
-    pc = build(kind, n, V)
+    pc = build_pc(kind, n, V)
     c = constraints(V, n)[name]
     cc = jc.compile(c, pc)
     data, missing = evidence(n, V)
@@ -182,11 +160,11 @@ def test_reference_equals_brute_force(kind, name, reference):
     assert (got[fin] - want[fin]).abs().max() < 1e-5 if fin.any() else name == "unsatisfiable"
 
 
-def test_reference_follows_in_place_parameter_updates(reference):
+def test_reference_follows_in_place_parameter_updates(reference, build_pc):
     """An in-place update, as training does between steps without recompiling: copy in the (normalized)
     parameters of the same structure built with another seed."""
     n, V = 5, 3
-    pc, other = build("hand", n, V, seed = 0), build("hand", n, V, seed = 1)
+    pc, other = build_pc("hand", n, V, seed = 0), build_pc("hand", n, V, seed = 1)
     cc = jc.compile(jc.DFA.contains([[1, 2]], V), pc)
     data, missing = evidence(n, V)
     before = reference.marginal(cc, data, missing)[:, 0]

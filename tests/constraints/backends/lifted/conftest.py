@@ -5,7 +5,8 @@ A slow but obviously correct reference for constrained queries on the lifted pla
 :class:`~pyjuice.constraints.ConstrainedCircuit` in plain PyTorch, straight from the definition, for
 every (PC, constraint) pair that compiles. The library's own implementation is tested against it; it is
 exposed to the tests in this directory through the ``reference`` fixture (the test suite runs with
-``--import-mode=importlib``, so test modules cannot import a helper module directly).
+``--import-mode=importlib``, so test modules cannot import a helper module directly). The PCs these tests
+share come from the ``build_pc`` fixture.
 
 INPUT NODES: CATEGORICAL ONLY. Like the first version of the compiler (which refuses every other input
 distribution), the reference only knows how to turn a Categorical input node into per-token-class
@@ -35,10 +36,17 @@ Parameters are read from the PC's live parameter tensors (never from the node ob
 kept in sync), so in-place parameter updates are seen by the next call.
 """
 
+import random
+from functools import partial
+
 import pytest
 import torch
 
+import pyjuice as juice
+import pyjuice.nodes.distributions as dists
+from pyjuice.nodes import inputs, multiply, summate
 from pyjuice.nodes.distributions import Categorical
+from pyjuice.nodes.methods.edge_constructors import block_sparse_rnd_blk_edge_constructor
 
 
 DTYPE = torch.float32
@@ -59,7 +67,9 @@ def sum_weights(pc, ns) -> torch.Tensor:
     num_ch_nblocks = sum(cs.num_node_blocks for cs in ns.chs)
     dense = torch.zeros(ns.num_node_blocks * num_ch_nblocks, bs, cbs, dtype = DTYPE, device = pc.params.device)
     edge_ids = ns.edge_ids.to(pc.params.device)
-    dense[edge_ids[0] * num_ch_nblocks + edge_ids[1]] = blocks
+    # accumulate: an edge block may appear twice (e.g. from `block_sparse_rnd_blk_edge_constructor`), and the
+    # forward adds both, while a plain assignment (as in `get_params(as_matrix = True)`) keeps only one
+    dense.index_put_((edge_ids[0] * num_ch_nblocks + edge_ids[1],), blocks, accumulate = True)
     return dense.reshape(ns.num_node_blocks, num_ch_nblocks, bs, cbs).permute(0, 2, 1, 3).reshape(
         ns.num_nodes, num_ch_nblocks * cbs)
 
@@ -200,3 +210,101 @@ def reference():
     return types.SimpleNamespace(marginal = reference_marginal, sum_weights = sum_weights,
                                  categorical_probs = categorical_probs, input_block = input_block,
                                  log_matmul = log_matmul, log_weighted_sum = log_weighted_sum)
+
+
+# -------------------------------------------------------------------------------------------------
+# PCs shared by the tests in this directory
+# -------------------------------------------------------------------------------------------------
+
+def hand_built(V):
+    """Every construct a contiguous PC can have, over 5 variables."""
+    x = [inputs(v, num_node_blocks = 2, block_size = 2, dist = dists.Categorical(num_cats = V)) for v in range(5)]
+    s12 = summate(multiply(x[1], x[2]), num_node_blocks = 2, block_size = 2)          # interval [1, 2]
+    s01 = summate(multiply(x[0], x[1]), num_node_blocks = 2, block_size = 2)          # prefix [0, 1]
+    s3 = summate(x[3], num_node_blocks = 2, block_size = 2)                           # a sum over an input node
+    p34 = multiply(s3, x[4], edge_ids = torch.tensor([[0, 3], [1, 2], [2, 1], [3, 0]]),
+                   sparse_edges = True)                                               # node-level edges
+    s34 = summate(p34, num_node_blocks = 2, block_size = 2)                           # suffix [3, 4]
+    p_a = multiply(s34, x[0], s12)                                                    # three children, listed
+    p_b = multiply(x[2], s34, s01)                                                    # out of scope order
+    s02 = summate(multiply(x[0], s12), num_node_blocks = 2, block_size = 2)          # an input node next to an
+    p_c = multiply(s02, s34)                                                          # interval node, [0, 2]
+    return summate(p_a, p_b, p_c, num_node_blocks = 1, block_size = 1)               # a sum over three products
+
+
+def hand_permuted(V):
+    """Block-level product edges that permute blocks or reuse a child's only block, explicit block-sparse
+    sum edges and a four-child product, over 5 variables."""
+    cat = lambda: dists.Categorical(num_cats = V)
+    x = [inputs(v, num_node_blocks = 2, block_size = 2, dist = cat()) for v in range(5)]
+    one = inputs(1, num_node_blocks = 1, block_size = 2, dist = cat())             # a single block
+    p12 = multiply(one, x[2], edge_ids = torch.tensor([[0, 1], [0, 0]]))            # reuses it, permutes x2's
+    s12 = summate(p12, num_node_blocks = 2, block_size = 2, edge_ids = torch.tensor([[0, 1], [1, 0]]))
+    p34 = multiply(x[3], x[4], edge_ids = torch.tensor([[1, 0], [0, 1]]))           # permuted blocks
+    s34 = summate(p34, num_node_blocks = 2, block_size = 2)
+    p_a = multiply(x[0], s12, s34)
+    p_b = multiply(s34, x[2], x[1], x[0], edge_ids = torch.tensor([[1, 0, 1, 0], [0, 1, 0, 1]]))   # four children
+    return summate(p_a, p_b, num_node_blocks = 1, block_size = 1)
+
+
+def hand_unit(V):
+    """Block size 1 everywhere, with node-level product edges, over 4 variables."""
+    cat = lambda: dists.Categorical(num_cats = V)
+    x = [inputs(v, num_node_blocks = 3, block_size = 1, dist = cat()) for v in range(4)]
+    p01 = multiply(x[0], x[1], edge_ids = torch.tensor([[0, 2], [1, 1], [2, 0]]), sparse_edges = True)
+    p23 = multiply(x[2], x[3], edge_ids = torch.tensor([[2, 1], [0, 0], [1, 2]]), sparse_edges = True)
+    s01 = summate(p01, num_node_blocks = 3, block_size = 1)
+    s23 = summate(p23, num_node_blocks = 3, block_size = 1)
+    return summate(multiply(s01, s23), num_node_blocks = 1, block_size = 1)
+
+
+#: Every kind :func:`build_pc` makes, with the number of variables its circuit needs (None: any).
+PC_KINDS = {
+    "hmm": None,                 # tied HMM, one node block per position
+    "hmm_untied": None,
+    "hmm_block_sparse": None,    # 4 node blocks per position, random block-sparse transitions (with
+                                 # repeated edge blocks), tied
+    "pd": None,                  # 1-D PD
+    "pd_prod_dominated": None,   # sums shared by several products, block-sparse sum edges
+    "pd_blockified": None,       # `juice.blockify` of a block-size-1 PD
+    "hand": 5,                   # :func:`hand_built`
+    "hand_permuted": 5,          # :func:`hand_permuted`
+    "hand_unit": 4,              # :func:`hand_unit`
+}
+
+
+def build_pc(kind, n, V, seed = 0, device = torch.device("cuda:0"), **compile_kwargs):
+    """A compiled PC of one of the :data:`PC_KINDS` over ``n`` variables with ``V`` categories."""
+    assert PC_KINDS[kind] in (None, n), (kind, n)
+    torch.manual_seed(seed); random.seed(seed)
+    if kind == "hmm":
+        ns = juice.structures.HMM(seq_length = n, num_latents = 8, num_emits = V)
+    elif kind == "hmm_untied":
+        ns = juice.structures.GeneralizedHMM(seq_length = n, num_latents = 8, homogeneous = False,
+                                             input_dist = dists.Categorical(num_cats = V))
+    elif kind == "hmm_block_sparse":
+        ns = juice.structures.HMM(seq_length = n, num_latents = 16, num_emits = V, block_size = 4,
+                                  sum_edge_ids_constructor = partial(block_sparse_rnd_blk_edge_constructor,
+                                                                     num_chs_per_block = 2))
+    elif kind == "pd":
+        ns = juice.structures.PD(data_shape = (n,), num_latents = 4, split_intervals = 1,
+                                 input_node_params = {"num_cats": V})
+    elif kind == "pd_prod_dominated":
+        ns = juice.structures.PD(data_shape = (n,), num_latents = 8, split_intervals = 1, block_size = 2,
+                                 structure_type = "prod_dominated", max_prod_block_conns = 2,
+                                 input_node_params = {"num_cats": V})
+    elif kind == "pd_blockified":
+        base = juice.structures.PD(data_shape = (n,), num_latents = 8, split_intervals = 1, block_size = 1,
+                                   input_node_params = {"num_cats": V})
+        base.init_parameters(perturbation = 2.0)
+        ns = juice.blockify(base, sparsity_tolerance = 0.5, max_target_block_size = 4)
+    else:
+        ns = {"hand": hand_built, "hand_permuted": hand_permuted, "hand_unit": hand_unit}[kind](V)
+    ns.init_parameters(perturbation = 2.0)
+    return juice.compile(ns, verbose = False, **compile_kwargs).to(device)
+
+
+@pytest.fixture(name = "build_pc")
+def build_pc_fixture():
+    """:func:`build_pc`, for tests in this directory."""
+    return build_pc
