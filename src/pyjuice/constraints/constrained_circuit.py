@@ -21,8 +21,9 @@ class ConstrainedCircuit:
 
     Everything it holds besides the PC depends only on the constraint and the PC's STRUCTURE, never on
     parameter values or evidence, so it stays valid while the PC's parameters change (e.g. CoDD's
-    external parameters at every step). :meth:`with_pc` puts the same constraint on another PC with the
-    same structure.
+    external parameters at every step). The PC itself is fixed: :attr:`pc` cannot be reassigned, and
+    once the PC has been moved to another device every query raises -- compile again, or use
+    :meth:`with_pc` to put the same constraint on another PC with the same structure.
 
     Created by :func:`pyjuice.constraints.compile`; not meant to be constructed directly.
 
@@ -47,7 +48,8 @@ class ConstrainedCircuit:
 
     def __init__(self, pc, constraint: Constraint, structure: PCStructure, automaton,
                  layout: BoundaryLayout, tables: Dict[str, Any], compile_time_s: float):
-        self.pc = pc
+        self._pc = pc
+        self._device = pc.params.device             # where the tables live
         self.constraint = constraint
         self.structure = structure
         self.automaton = automaton
@@ -57,6 +59,17 @@ class ConstrainedCircuit:
         self.input_range = tables["input_range"]
         self.root_rows = tables["root_rows"]
         self.compile_time_s = compile_time_s
+
+    @property
+    def pc(self):
+        """The PC queries run on (fixed; see the class docstring)."""
+        return self._pc
+
+    def _check_pc_unchanged(self):
+        """Refuse a query on a PC that moved since compiling (one attribute comparison per query)."""
+        if self._pc.params.device != self._device:
+            raise RuntimeError(f"The PC moved from {self._device} to {self._pc.params.device} after the constraint "
+                               f"was compiled against it. Compile the constraint again, or use `with_pc`.")
 
     # ---------------------------------------------------------------------------------------------
     # Report
@@ -158,16 +171,20 @@ class ConstrainedCircuit:
 
     def marginal(self, *args, **kwargs):
         """Probability of the constraint (and evidence). Not implemented yet."""
+        self._check_pc_unchanged()
         raise NotImplementedError("`marginal` under a constraint is not implemented yet.")
 
     def conditional(self, *args, **kwargs):
         """Per-variable distributions given the constraint (and evidence). Not implemented yet."""
+        self._check_pc_unchanged()
         raise NotImplementedError("`conditional` under a constraint is not implemented yet.")
 
     def sample(self, *args, **kwargs):
         """Samples from the PC conditioned on the constraint (and evidence). Not implemented yet."""
+        self._check_pc_unchanged()
         raise NotImplementedError("`sample` under a constraint is not implemented yet.")
 
     def decoder(self, *args, **kwargs):
         """Incremental (token-by-token) constrained decoding. Not implemented yet."""
+        self._check_pc_unchanged()
         raise NotImplementedError("`decoder` under a constraint is not implemented yet.")

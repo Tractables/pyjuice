@@ -168,6 +168,21 @@ def test_with_pc_rebinds_to_the_same_structure_only():
         cc.with_pc(pb.root_ns)
 
 
+def test_the_pc_is_fixed_once_compiled():
+    pc = hmm(6)                                                    # on the CPU
+    cc = jc.compile(jc.DFA.contains([[1, 2]], vocab_size = V), pc)
+    with pytest.raises(AttributeError):
+        cc.pc = hmm(6)                                             # switching PCs goes through `with_pc`
+    with pytest.raises(NotImplementedError):
+        cc.marginal()                                              # (queries are not implemented yet)
+    pc.to(torch.device("cuda:0"))
+    for query in (cc.marginal, cc.conditional, cc.sample, cc.decoder):
+        with pytest.raises(RuntimeError, match = "moved from cpu to cuda:0 .* Compile the constraint again"):
+            query()
+    with pytest.raises(NotImplementedError):                       # recompiling (or with_pc) fixes it
+        cc.with_pc(pc).marginal()
+
+
 def test_the_plan_does_not_depend_on_parameters():
     c = jc.DFA.contains([[1, 2]], vocab_size = V)
     pa, pb = hmm(6, seed = 0), hmm(6, seed = 1)
