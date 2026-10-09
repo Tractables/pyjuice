@@ -128,6 +128,51 @@ _SMALL_BATCH_MIN_BLOCK_SIZE = int(os.environ.get("PYJUICE_SB_MIN_BS", 32))
 # unaffected. Toggle for A/B; bit-identical so on by default.
 _BLOCK_SPARSE_EDGE_TRIM = os.environ.get("PYJUICE_EDGE_TRIM", "1") != "0"
 
+# Precision of a circuit's sum layers (`TensorCircuit.precision`). Forward: "auto" is the fastest per layer --
+# bf16 products in the block-sparse kernels from batch 16 (~4e-3 in the log-likelihood of a 4096-latent HMM
+# layer), TF32 on dense layers that take cuBLAS (below); "tf32" never uses bf16 (round-to-nearest TF32 in the
+# Triton kernels, TF32 cuBLAS; ~5e-4); "fp32" gives fp32-level products (`tf32x3` in the Triton tlmm kernel,
+# exact fp32 cuBLAS; ~1e-6). Batches below 16 run fp32 kernels in every mode. Backward: "auto" and "tf32" keep
+# the round-to-nearest TF32 products; "fp32" takes `tf32x3` products (fp32-level, on tensor cores).
+PRECISIONS = ("auto", "tf32", "fp32")
+
+
+def _pop_removed_precision_flags(kwargs: dict) -> None:
+    """
+    `force_use_bf16` / `force_use_fp32` were replaced by the circuit's `precision`. Passed as False (their old
+    default, a no-op) they are dropped; passed as True they raise, rather than silently computing in another
+    precision than the caller asked for.
+    """
+    for name in ("force_use_bf16", "force_use_fp32"):
+        if kwargs.pop(name, False):
+            raise TypeError(f"`{name}` was removed: set the circuit's precision instead (`pc.precision = 'tf32'` "
+                            f"or `'fp32'`, or `juice.compile(..., precision = ...)`).")
+
+# Dense node blocks -- children a contiguous run of element rows, parameters strided by the block size, every
+# block of the partition -- are matrix products with cuBLAS, on views of `params`: exponentiate the children,
+# multiply, take the log. Used, for LL without tempering, only where MEASURED faster than the Triton / CUDA
+# kernels' default (bf16) products. The gate is the work per child group (children x batch): a whole circuit
+# runs the layers back to back, so the cuBLAS path's extra launches (a reduction, two element-wise kernels, the
+# GEMMs) must be paid for by its faster product. Whole-HMM forward vs the kernels' default (latents x batch):
+# 1024 x 128 0.79 (2^17: excluded), 1024 x 512 1.10, 4096 x 128 2.25, 4096 x 512 1.57; single layers lose below
+# 1024-node blocks (256 latents 0.34-0.79). A fixed gate, never chosen by timing: the two sides differ numerically.
+#
+# Never a set of launches per child group (see `_dense_blocks`). Node blocks that share their children (an HMM
+# layer) exponentiate them once for all blocks. Blocks that each have their own, evenly strided (HCLT: 2-127 groups
+# per layer), are batched GEMMs over [groups, ...] views, each batch as many groups as `_DENSE_SCRATCH` child values
+# hold (at least one; 32 for HCLT-1024 at batch 512), which bounds the path's scratch at 64 MB however many groups a
+# layer has. Other layouts keep the kernels: a loop over HCLT-1024's 452 groups at batch 512 ran its forward at
+# 0.71x the kernels' speed, batched GEMMs at 1.20x.
+_DENSE_MIN_BLOCK_SIZE = 1024
+_DENSE_MIN_WORK = 1 << 19
+_DENSE_SCRATCH = 1 << 24
+
+# Extra keyword arguments of the forward tlmm launch, shared rather than built per call (never mutated)
+_FP32_DOT = {"fp32_dot": True}
+_NO_KWARGS = {}
+# ... and of the backward's element- / parameter-flow dot kernels in "fp32" mode (see `_PAR_DOT_IEEE`)
+_TF32X3_DOT = {"DOT_TF32X3": True}
+
 # Precision of the parameter-flow `tl.dot`. Triton defaults to TF32, which TRUNCATES the operands --
 # a bias, ~6e-4 low per product. The default path now rounds the operands onto the TF32 grid first
 # (`_round_to_tf32` in `layer/kernels`), which removes the bias at TF32 speed. MEASURED at block_size
@@ -142,12 +187,14 @@ _BLOCK_SPARSE_EDGE_TRIM = os.environ.get("PYJUICE_EDGE_TRIM", "1") != "0"
 # `PYJUICE_PAR_DOT_IEEE=1` for when the flows themselves are the object of study (validating a new
 # kernel against a reference, a gradient check).
 #
-# `force_use_fp32` drops `tl.dot` altogether for a broadcast sum. That is NOT a reliable accuracy
-# route: it also changes the forward and element-flow forks, and its measured error moved between
-# 6.2e-6 and 7.0e-4 across runs of the same shape, because the timing-based autotuner picks
-# differently from run to run. (Likely Triton rewriting the fp32 broadcast sums into TF32 dots once a
-# tuned tile was big enough; the kernels no longer use that form -- see `_BROADCAST_SUM_NOTE` in
-# `layer/kernels/__init__.py`.)
+# In "fp32" mode (`force_use_fp32`) the element- and parameter-flow dots run in three TF32 passes
+# (`DOT_TF32X3`, `input_precision = "tf32x3"`): fp32-level, on tensor cores. `PYJUICE_PAR_DOT_IEEE`
+# still takes precedence in the parameter flows. That mode used to drop `tl.dot` altogether for
+# broadcast sums, 20-50x slower on large layers and NOT a reliable accuracy route: its measured error
+# moved between 6.2e-6 and 7.0e-4 across runs of the same shape, because the timing-based autotuner
+# picked differently from run to run. (Likely Triton rewriting the fp32 broadcast sums into TF32 dots
+# once a tuned tile was big enough; the kernels no longer use that form -- see `_BROADCAST_SUM_NOTE`
+# in `layer/kernels/__init__.py`.) Tiles below 16 still sum without dots, in every mode.
 #
 # Every par kernel takes `DOT_IEEE` so the one launch site below can stay uniform, but it is inert in
 # the `csmm2` forks: those reduce with `tl.sum`, not `tl.dot`, and have no precision to set.
@@ -279,6 +326,9 @@ class SumLayer(Layer, nn.Module):
         # where sb_ebase/sb_pbase are the per-node-block first child / first param and sb_ok records
         # whether the layer's children are GLOBALLY contiguous + params block_size-strided.
         self._cached_fw_sb = dict()
+        # Per partition: its plan on the dense cuBLAS path, or None where that path does not take it (see
+        # `_dense_blocks`).
+        self._cached_fw_dense = dict()
 
         # Layer info
         self._layer_nid_range = (layer_nid_start, layer_nid_start + self.num_nodes)
@@ -422,8 +472,8 @@ class SumLayer(Layer, nn.Module):
         return self._layer_nid_range[0], self._layer_nid_range[1]
 
     def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor,
-                force_use_bf16: bool = False, force_use_fp32: bool = False,
-                propagation_alg: str = "LL", pflow_temperature: float = 1.0, **kwargs) -> None:
+                propagation_alg: str = "LL", pflow_temperature: float = 1.0, precision: str = "auto",
+                **kwargs) -> None:
         """
         Computes the forward pass of a sum layer.
 
@@ -433,6 +483,10 @@ class SumLayer(Layer, nn.Module):
         `params`:       [num_params, B] or [num_params]
         """
         assert not (propagation_alg != "LL" and abs(pflow_temperature - 1.0) > 1e-6), "`pflow_temperature` can only be 1 if `propagation_alg` is not 'LL'."
+        if precision not in PRECISIONS:
+            raise ValueError(f"`precision` must be one of {PRECISIONS}, got {precision!r}.")
+        if "force_use_bf16" in kwargs or "force_use_fp32" in kwargs:      # the shim only when needed: hot path
+            _pop_removed_precision_flags(kwargs)
 
         for partition_id in range(self.num_fw_partitions):
             nids = self.partitioned_nids[partition_id]
@@ -441,10 +495,8 @@ class SumLayer(Layer, nn.Module):
 
             self._forward(
                 node_mars, element_mars, params, nids, cids, pids, 
-                partition_id = partition_id, force_use_bf16 = force_use_bf16,
-                force_use_fp32 = force_use_fp32, 
-                propagation_alg = propagation_alg, 
-                pflow_temperature = pflow_temperature, **kwargs
+                partition_id = partition_id, propagation_alg = propagation_alg, 
+                pflow_temperature = pflow_temperature, precision = precision, **kwargs
             )
 
         return None
@@ -455,7 +507,7 @@ class SumLayer(Layer, nn.Module):
                  allow_modify_flows: bool = False, propagation_alg: str = "LL", 
                  logspace_flows: bool = False, negate_pflows: bool = False, 
                  accumulate_ch_flows: bool = False, allow_neg_flows: bool = False,
-                 force_use_fp32: bool = False, pflow_temperature: float = 1.0, 
+                 precision: str = "auto", pflow_temperature: float = 1.0, 
                  temper_eflow: bool = False, **kwargs) -> None:
         """
         Computes the forward pass of a sum layer:
@@ -484,6 +536,11 @@ class SumLayer(Layer, nn.Module):
         assert not (allow_neg_flows and allow_modify_flows), "`allow_neg_flows` should be set to `False` when `allow_modify_flows=True`."
         assert not (propagation_alg != "LL" and abs(pflow_temperature - 1.0) > 1e-6), "`pflow_temperature` can only be 1 if `propagation_alg` is not 'LL'."
         assert logspace_flows or abs(pflow_temperature - 1.0) < 1e-6, "`pflow_temperature` can only be enabled when `logspace_flows = True`."
+        if precision not in PRECISIONS:
+            raise ValueError(f"`precision` must be one of {PRECISIONS}, got {precision!r}.")
+        if "force_use_bf16" in kwargs or "force_use_fp32" in kwargs:      # the shim only when needed: hot path
+            _pop_removed_precision_flags(kwargs)
+        force_use_fp32 = precision == "fp32"            # fp32-level flows: tf32x3 dots, no TF32 / fp16 CUDA kernels
 
         ## Pre-compute `nflows.log() - nmars` if needed ##
         if allow_modify_flows:
@@ -556,8 +613,8 @@ class SumLayer(Layer, nn.Module):
                  params: torch.Tensor, nids: torch.Tensor, cids: torch.Tensor,
                  pids: torch.Tensor,
                  partition_id: int = -1, mode: Optional[str] = None,
-                 force_use_bf16: bool = False, force_use_fp32: bool = False,
-                 propagation_alg: str = "LL", pflow_temperature: float = 1.0, **kwargs) -> None:
+                 propagation_alg: str = "LL", pflow_temperature: float = 1.0, precision: str = "auto",
+                 **kwargs) -> None:
         """
         Forward pass of sum layers.
         
@@ -599,9 +656,8 @@ class SumLayer(Layer, nn.Module):
         if mode == self.BLOCK_SPARSE:
             self._forward_block_sparse(
                 node_mars, element_mars, params, nids, cids, pids,
-                partition_id = partition_id, force_use_bf16 = force_use_bf16,
-                force_use_fp32 = force_use_fp32, propagation_alg = propagation_alg, 
-                pflow_temperature = pflow_temperature, **kwargs
+                partition_id = partition_id, propagation_alg = propagation_alg, 
+                pflow_temperature = pflow_temperature, precision = precision, **kwargs
             )
 
         elif mode == self.SPARSE:
@@ -625,9 +681,8 @@ class SumLayer(Layer, nn.Module):
     def _forward_block_sparse(self, node_mars: torch.Tensor, element_mars: torch.Tensor,
                               params: torch.Tensor, nids: torch.Tensor, cids: torch.Tensor,
                               pids: torch.Tensor,
-                              partition_id: int = -1, force_use_bf16: bool = False,
-                              force_use_fp32: bool = False, propagation_alg: str = "LL", 
-                              pflow_temperature: float = 1.0, **kwargs) -> None:
+                              partition_id: int = -1, propagation_alg: str = "LL", 
+                              pflow_temperature: float = 1.0, precision: str = "auto", **kwargs) -> None:
         """
         Forward pass of sum layers with the block-sparse processing kernel.
         
@@ -663,6 +718,14 @@ class SumLayer(Layer, nn.Module):
                 "pflow_temperature": pflow_temperature,
                 "node_mars_tempered": kwargs["node_mars_tempered"]
             }
+
+        # Dense node blocks through cuBLAS where that is faster (see `_DENSE_MIN_BLOCK_SIZE`)
+        if (propagation_alg_id == 0 and not pflow_tempered_enabled and node_mars.is_cuda
+                and self.block_size >= _DENSE_MIN_BLOCK_SIZE and batch_size >= 16):
+            dense = self._dense_blocks(partition_id, nids, cids, pids)
+            if dense is not None and dense[1] * batch_size >= _DENSE_MIN_WORK:
+                self._forward_dense(node_mars, element_mars, params, dense, exact = (precision == "fp32"))
+                return None
 
         # Heuristic to set `TILE_SIZE_M`, `TILE_SIZE_K`, and `BLOCK_B`
         if batch_size < 16 and self.block_size >= _SMALL_BATCH_MIN_BLOCK_SIZE:
@@ -752,26 +815,25 @@ class SumLayer(Layer, nn.Module):
 
         BLOCK_SIZE_M = self.block_size
 
-        if force_use_bf16:
-            assert not force_use_fp32
-            use_bf16 = True
-        elif force_use_fp32:
+        if precision != "auto":
             use_bf16 = False
         else:
-            if TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and BLOCK_B >= 16:
-                use_bf16 = True
-            else:
-                use_bf16 = False
+            use_bf16 = TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and BLOCK_B >= 16
+        # fp32-level products in the tlmm kernel (the csmm kernels' fp32 sums are exact already)
+        fp32_dot = (precision == "fp32") and not use_bf16
 
         # Which of the three block-sparse forward kernels runs is decided ONCE, from the heuristic
         # config -- they differ numerically (different dot / reduction structure), so the autotuned
         # candidates below must not be able to flip it. `use_bf16` is likewise already fixed above.
         if TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and BLOCK_B >= 16:
             fw_kernel, tile_floor = fw_bsparse._fw_triton_block_sparse_tlmm_kernel, 16
+            dot_kwargs = _FP32_DOT if fp32_dot else _NO_KWARGS      # unset: the kernel's default (False)
         elif TILE_SIZE_M >= 8 and TILE_SIZE_K >= 8 and BLOCK_B >= 8:
             fw_kernel, tile_floor = fw_bsparse._fw_triton_block_sparse_csmm1_kernel, 8
+            dot_kwargs = _NO_KWARGS
         else:
             fw_kernel, tile_floor = fw_bsparse._fw_triton_block_sparse_csmm2_kernel, 1
+            dot_kwargs = _NO_KWARGS
 
         def _launch_fw(cfg):
             tm, bb = cfg
@@ -799,6 +861,7 @@ class SumLayer(Layer, nn.Module):
                     pid_m_offset = pid_m_start,
                     **propagation_alg_kwargs,
                     **pflow_tempered_kwargs,
+                    **dot_kwargs,
                     num_stages = 1
                 )
 
@@ -830,7 +893,7 @@ class SumLayer(Layer, nn.Module):
         # re-enters with a smaller default -- looks up a fresh entry instead of the config that just
         # failed (which would loop forever).
         fw_key = (fw_kernel, self.block_size, TILE_SIZE_K, K_NUM_TILES, batch_size, num_nblocks,
-                  use_bf16, propagation_alg_id, pflow_tempered_enabled, default_fw_cfg)
+                  use_bf16, fp32_dot, propagation_alg_id, pflow_tempered_enabled, default_fw_cfg)
 
         # Optional CUDA (CuTe/TMA) fast path for the `tlmm` regime. It is numerically equivalent to
         # the Triton tlmm kernel and only valid here: LL propagation (`propagation_alg_id == 0`), the
@@ -939,10 +1002,84 @@ class SumLayer(Layer, nn.Module):
                           "memory on this GPU; falling back to the default launch config.", RuntimeWarning)
             return self._forward_block_sparse(
                 node_mars, element_mars, params, nids, cids, pids,
-                partition_id=partition_id, force_use_bf16=force_use_bf16,
-                force_use_fp32=force_use_fp32, propagation_alg=propagation_alg,
-                pflow_temperature=pflow_temperature, **kwargs)
+                partition_id=partition_id, propagation_alg=propagation_alg,
+                pflow_temperature=pflow_temperature, precision=precision, **kwargs)
         return None
+
+    def _dense_blocks(self, partition_id: int, nids: torch.Tensor, cids: torch.Tensor, pids: torch.Tensor):
+        """
+        A partition's plan on the dense cuBLAS path, or None where that path does not take it. Every node block must
+        be dense -- its children a contiguous run of element rows and its parameters strided by the block size
+        (node ``i``, edge ``e`` at ``pids[k, 0] + e * block_size + i``), so that its weights are the
+        ``[E, block_size]`` matrix at ``params[pids[k, 0]]``. And either all blocks read the same children (one
+        group, exponentiated once), or each reads its own, with the children, node rows and parameters of
+        consecutive blocks ``E``, ``block_size`` and ``E * block_size`` apart, so that all of them are one batched
+        product over views. Checked once per partition.
+
+        :returns: ``(blocks, E, c0, G)`` -- the node blocks ``(nid, first param)`` in the order of their children,
+            the number of real (unpadded) edges, the first child row, and the number of child groups (1, or one per
+            block) -- or None
+        """
+        if partition_id not in self._cached_fw_dense:
+            real = int((cids != 0).any(dim = 0).sum())                   # padding is a zero suffix
+            c, p = cids[:, :real].long(), pids[:, :real].long()
+            e = torch.arange(real, device = cids.device)
+            plan = None
+            if real > 0 and bool(((c == c[:, :1] + e).all() & (p == p[:, :1] + e * self.block_size).all()).item()):
+                rows = sorted(zip(c[:, 0].tolist(), nids.tolist(), p[:, 0].tolist()))
+                c0, nid0, p0 = rows[0]
+                blocks = [(nid, pid) for _, nid, pid in rows]
+                if all(r[0] == c0 for r in rows):
+                    plan = (blocks, real, c0, 1)
+                elif all(r == (c0 + g * real, nid0 + g * self.block_size, p0 + g * real * self.block_size)
+                         for g, r in enumerate(rows)):
+                    plan = (blocks, real, c0, len(rows))
+            self._cached_fw_dense[partition_id] = plan
+        return self._cached_fw_dense[partition_id]
+
+    def _forward_dense(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor,
+                       dense, exact: bool) -> None:
+        """
+        LL forward of a dense partition (see `_dense_blocks`): ``log(W @ exp(X - m)) + m`` per node block, with
+        ``X`` its children's rows, ``m`` their column maximum and ``W`` read in place from ``params``. With one
+        child group, ``X`` is exponentiated once and multiplied by each block's ``W``. With several, runs of
+        groups take one batched product over ``[groups, ...]`` views, each run as many groups as `_DENSE_SCRATCH`
+        holds. The product is exact fp32 (``exact``) or TF32.
+        """
+        from .kernels.sum_forward_dense import dense_colmax, dense_exp, dense_log
+
+        blocks, E, c0, G = dense
+        BS = self.block_size
+        B = node_mars.size(1)
+        prev = torch.get_float32_matmul_precision()
+        torch.set_float32_matmul_precision("highest" if exact else "high")
+        try:
+            if G == 1:
+                colmax = element_mars[c0:c0 + E].amax(dim = 0)
+                ex = torch.empty(E, B, device = element_mars.device)
+                dense_exp(element_mars, colmax, ex, c0, E, B)
+                for nid, p0 in blocks:
+                    torch.mm(params[p0:p0 + E * BS].view(E, BS).t(), ex, out = node_mars[nid:nid + BS])
+                nids = [nid for nid, _ in blocks]
+                if nids == list(range(nids[0], nids[0] + len(nids) * BS, BS)):     # consecutive node blocks
+                    dense_log(node_mars, colmax, nids[0], len(nids) * BS, B)
+                else:
+                    for nid in nids:
+                        dense_log(node_mars, colmax, nid, BS, B)
+            else:
+                nid0, p0 = blocks[0]
+                per_run = min(G, max(1, _DENSE_SCRATCH // (E * B)))
+                ex = torch.empty(per_run * E, B, device = element_mars.device)               # reused by every run
+                for g in range(0, G, per_run):
+                    n = min(per_run, G - g)
+                    c, nid, p = c0 + g * E, nid0 + g * BS, p0 + g * E * BS
+                    colmax = dense_colmax(element_mars, c, n, E, B)                           # [n, B]
+                    dense_exp(element_mars, colmax, ex, c, n * E, B, rows_per_group = E)
+                    torch.bmm(params[p:p + n * E * BS].view(n, E, BS).transpose(1, 2), ex[:n * E].view(n, E, B),
+                              out = node_mars[nid:nid + n * BS].view(n, BS, B))
+                    dense_log(node_mars, colmax, nid, n * BS, B, rows_per_group = BS)
+        finally:
+            torch.set_float32_matmul_precision(prev)
 
     def _forward_sparse(self, node_mars: torch.Tensor, element_mars: torch.Tensor,
                         params: torch.Tensor, nids: torch.Tensor, cids: torch.Tensor,
@@ -1520,10 +1657,13 @@ class SumLayer(Layer, nn.Module):
             return tm
         TILE_SIZE_M = _doubled_m(TILE_SIZE_M, TILE_SIZE_K, BLOCK_B)
 
-        if TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and BLOCK_B >= 16 and not force_use_fp32:
+        if TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and BLOCK_B >= 16:
             TL_DOT = 1
         else:
             TL_DOT = 0
+        # "fp32": the same dots in three TF32 passes (see `_PAR_DOT_IEEE`); unset otherwise, so the other
+        # modes launch the kernels exactly as before
+        dot_kwargs = _TF32X3_DOT if (force_use_fp32 and TL_DOT) else _NO_KWARGS
 
         grid = (host_cdiv(batch_size, BLOCK_B), host_cdiv(layer_n_nodes, TILE_SIZE_M))
 
@@ -1574,6 +1714,7 @@ class SumLayer(Layer, nn.Module):
                     accumulate_ch_flows = accumulate_ch_flows,
                     pid_m_offset = pid_m_start,
                     num_stages = 1,
+                    **dot_kwargs,
                     **ele_extra
                 )
 
@@ -1607,7 +1748,7 @@ class SumLayer(Layer, nn.Module):
             return ele_cfgs
 
         ele_key = (ele_kernel, self.block_size, cs_block_size, TILE_SIZE_K, K_NUM_TILES,
-                   ptr_inc_step, batch_size, num_nblocks, TL_DOT, accumulate_ch_flows,
+                   ptr_inc_step, batch_size, num_nblocks, TL_DOT, bool(dot_kwargs), accumulate_ch_flows,
                    allow_modify_flows, logspace_flows, allow_neg_flows, propagation_alg_id,
                    default_ele_cfg)
 
@@ -1860,12 +2001,13 @@ class SumLayer(Layer, nn.Module):
                                   "This is an internal error of PyJuice. Please consider checking the kernel dispatching criterions and use the " \
                                   "corresponding sparse kernel instead."
 
-        # `force_use_fp32` disables the (TF32) tensor-core dot so the param flows are computed in
-        # full fp32, mirroring the element-flow backward (see `_backward_block_sparse_ele_flows`).
-        if TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and TILE_SIZE_B >= 16 and not force_use_fp32:
+        # `force_use_fp32` ("fp32") runs the same dots in three TF32 passes, as the element-flow backward
+        # does (see `_PAR_DOT_IEEE`); unset otherwise, so the other modes launch exactly as before.
+        if TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and TILE_SIZE_B >= 16:
             TL_DOT = 1
         else:
             TL_DOT = 0
+        dot_kwargs = _TF32X3_DOT if (force_use_fp32 and TL_DOT) else _NO_KWARGS
 
         # Launch tuning for the LL block-sparse-dot regime (see `BACKWARD_PAR_FLOW_TUNED`).
         # Bit-exactness note: results depend only on `TILE_SIZE_M` (it sets the node group
@@ -1980,6 +2122,7 @@ class SumLayer(Layer, nn.Module):
                     negate_pflows = negate_pflows,
                     pid_m_offset = pid_m_start,
                     num_stages = 1,
+                    **dot_kwargs,
                     **({"node_mars_tempered": kwargs["node_mars_tempered"]} if par_tempered
                        else {"node_mars": node_mars}),
                     **par_extra,
@@ -2009,7 +2152,7 @@ class SumLayer(Layer, nn.Module):
         # Like the forward, the heuristic default is part of the key so the `OutOfResources` retry --
         # which re-enters with the untuned default -- cannot look up the config that just failed.
         par_key = (par_kernel, self.block_size, raw_num_edges, num_nblocks, batch_size,
-                   TILE_SIZE_M, TILE_SIZE_B, B_NUM_TILES, TL_DOT, allow_modify_flows,
+                   TILE_SIZE_M, TILE_SIZE_B, B_NUM_TILES, TL_DOT, bool(dot_kwargs), allow_modify_flows,
                    logspace_flows, negate_pflows, allow_neg_flows, propagation_alg_id, default_par_cfg)
 
         def _tuned_par_cfg():

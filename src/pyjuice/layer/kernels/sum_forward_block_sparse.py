@@ -28,7 +28,10 @@ def _fw_triton_block_sparse_tlmm_kernel(node_mars, element_mars, mparams, nids, 
                                         BLOCK_B: tl.constexpr, TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
                                         TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, use_bf16: tl.constexpr,
                                         propagation_alg_id: tl.constexpr, pflow_tempered_enabled: tl.constexpr, 
-                                        pid_m_offset = 0, alpha = 0.0, pflow_temperature = 1.0, node_mars_tempered = None):
+                                        pid_m_offset = 0, alpha = 0.0, pflow_temperature = 1.0, node_mars_tempered = None,
+                                        fp32_dot: tl.constexpr = False):
+    # `fp32_dot` (with `use_bf16 == 0`): the products in fp32-level precision (`tf32x3`: three TF32 products)
+    # instead of one round-to-nearest TF32 product.
 
     pid_b = tl.program_id(0) # ID of size-`BLOCK_B` batches
     pid_m = tl.program_id(1) + pid_m_offset # ID of size-`TILE_SIZE_M` nodes
@@ -108,6 +111,8 @@ def _fw_triton_block_sparse_tlmm_kernel(node_mars, element_mars, mparams, nids, 
                 epars_bf16 = epars.to(tl.bfloat16)
                 emars_bf16 = emars_sub.to(tl.bfloat16)
                 nmars = tl.dot(epars_bf16, emars_bf16).to(tl.float32)
+            elif fp32_dot:
+                nmars = tl.dot(epars, emars_sub, input_precision = "tf32x3")
             else:
                 # Built-in matmul kernel of triton + float32 (a TF32 dot: see `_round_to_tf32`)
                 nmars = tl.dot(_round_to_tf32(epars), _round_to_tf32(emars_sub))
@@ -130,6 +135,8 @@ def _fw_triton_block_sparse_tlmm_kernel(node_mars, element_mars, mparams, nids, 
                     epars_bf16 = epars.to(tl.bfloat16)
                     emars_bf16 = emars_sub.to(tl.bfloat16)
                     nmars = tl.dot(epars_bf16, emars_bf16).to(tl.float32)
+                elif fp32_dot:
+                    nmars = tl.dot(epars, emars_sub, input_precision = "tf32x3")
                 else:
                     # Built-in matmul kernel of triton + float32 (a TF32 dot: see `_round_to_tf32`)
                     nmars = tl.dot(_round_to_tf32(epars), _round_to_tf32(emars_sub))
