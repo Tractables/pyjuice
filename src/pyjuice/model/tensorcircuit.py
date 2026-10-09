@@ -1891,6 +1891,25 @@ class TensorCircuit(nn.Module):
         if set_value is not None:
             tensor.fill_(set_value)
 
+    def free_activation_buffers(self):
+        """
+        Release the buffers a forward or backward pass fills -- `node_mars`, `element_mars`,
+        `node_mars_tempered`, `node_flows` and `element_flows` -- with their backing storage, and forget the
+        CUDA graphs recorded against them. The circuit is then as it was before its first pass: the next
+        pass allocates the buffers again, and whatever a query reads from the last pass (e.g. conditional
+        sampling) needs a new forward pass first.
+
+        The parameter flows (`param_flows`, `denom_param_flows`) are kept: they accumulate statistics across
+        batches for the next parameter update. A buffer that is still referenced elsewhere -- e.g. through the
+        autograd graph of a forward pass's output the caller keeps without `.detach()` -- is released when that
+        reference goes.
+        """
+        storage = self.__dict__.get("_buffer_storage", {})
+        for name in ("node_mars", "element_mars", "node_mars_tempered", "node_flows", "element_flows"):
+            self.__dict__.pop(name, None)
+            storage.pop(name, None)
+        self._drop_cuda_graphs()
+
     def _drop_cuda_graphs(self):
         """Forget every recorded CUDA graph (inner layers and top-down): after a buffer they baked in has
         moved, or when what the passes compute has changed in a way no key sees."""
