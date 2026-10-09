@@ -162,7 +162,7 @@
 <td><p>An edge constructor that connects sum and child node blocks in a one-to-one (block-diagonal) pattern: the i-th sum node block is connected only to the i-th child node block.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">edge_constructors.block_sparse_rnd_blk_edge_constructor</span></code></p></td>
-<td><p>An edge constructor that connects every sum node block to <cite>num_chs_per_block</cite> randomly chosen child node blocks, yielding a block-sparse (rather than fully-connected) sum layer.</p></td>
+<td><p>An edge constructor that connects every sum node block to <cite>num_chs_per_block</cite> randomly chosen, distinct child node blocks (all of them, if there are fewer), yielding a block-sparse (rather than fully-connected) sum layer.</p></td>
 </tr>
 </tbody>
 </table>
