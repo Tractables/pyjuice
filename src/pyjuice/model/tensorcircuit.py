@@ -409,7 +409,7 @@ class TensorCircuit(nn.Module):
         Precision of the sum layers' products, in the forward and the backward pass:
 
         * ``"auto"`` (the default): the fastest per layer -- bf16 products in the block-sparse kernels from batch 16
-          (about 4e-3 in a log-likelihood);
+          (about 4e-3 in a log-likelihood), TF32 on large dense layers, which run through cuBLAS;
         * ``"tf32"``: never bf16 -- round-to-nearest TF32 products (about 5e-4);
         * ``"fp32"``: fp32-level products in the forward (about 1e-6) and flows without tensor cores in the backward.
 

@@ -130,10 +130,10 @@ _BLOCK_SPARSE_EDGE_TRIM = os.environ.get("PYJUICE_EDGE_TRIM", "1") != "0"
 
 # Precision of a circuit's sum layers (`TensorCircuit.precision`). Forward: "auto" is the fastest per layer --
 # bf16 products in the block-sparse kernels from batch 16 (~4e-3 in the log-likelihood of a 4096-latent HMM
-# layer); "tf32" never uses bf16 (round-to-nearest TF32 in the Triton kernels; ~5e-4); "fp32" gives fp32-level
-# products (`tf32x3` in the Triton tlmm kernel; ~1e-6). Batches below 16 run fp32 kernels in every mode. Backward:
-# "auto" and "tf32" keep the round-to-nearest TF32 products; "fp32" computes the flows without tensor cores (exact
-# fp32 sums).
+# layer), TF32 on dense layers that take cuBLAS (below); "tf32" never uses bf16 (round-to-nearest TF32 in the
+# Triton kernels, TF32 cuBLAS; ~5e-4); "fp32" gives fp32-level products (`tf32x3` in the Triton tlmm kernel,
+# exact fp32 cuBLAS; ~1e-6). Batches below 16 run fp32 kernels in every mode. Backward: "auto" and "tf32" keep
+# the round-to-nearest TF32 products; "fp32" computes the flows without tensor cores (exact fp32 sums).
 PRECISIONS = ("auto", "tf32", "fp32")
 
 
@@ -147,6 +147,25 @@ def _pop_removed_precision_flags(kwargs: dict) -> None:
         if kwargs.pop(name, False):
             raise TypeError(f"`{name}` was removed: set the circuit's precision instead (`pc.precision = 'tf32'` "
                             f"or `'fp32'`, or `juice.compile(..., precision = ...)`).")
+
+# Dense node blocks -- children a contiguous run of element rows, parameters strided by the block size, every
+# block of the partition -- are matrix products with cuBLAS, on views of `params`: exponentiate the children,
+# multiply, take the log. Used, for LL without tempering, only where MEASURED faster than the Triton / CUDA
+# kernels' default (bf16) products. The gate is the work per child group (children x batch): a whole circuit
+# runs the layers back to back, so the cuBLAS path's extra launches (a reduction, two element-wise kernels, the
+# GEMMs) must be paid for by its faster product. Whole-HMM forward vs the kernels' default (latents x batch):
+# 1024 x 128 0.79 (2^17: excluded), 1024 x 512 1.10, 4096 x 128 2.25, 4096 x 512 1.57; single layers lose below
+# 1024-node blocks (256 latents 0.34-0.79). A fixed gate, never chosen by timing: the two sides differ numerically.
+#
+# Never a set of launches per child group (see `_dense_blocks`). Node blocks that share their children (an HMM
+# layer) exponentiate them once for all blocks. Blocks that each have their own, evenly strided (HCLT: 2-127 groups
+# per layer), are batched GEMMs over [groups, ...] views, each batch as many groups as `_DENSE_SCRATCH` child values
+# hold (at least one; 32 for HCLT-1024 at batch 512), which bounds the path's scratch at 64 MB however many groups a
+# layer has. Other layouts keep the kernels: a loop over HCLT-1024's 452 groups at batch 512 ran its forward at
+# 0.71x the kernels' speed, batched GEMMs at 1.20x.
+_DENSE_MIN_BLOCK_SIZE = 1024
+_DENSE_MIN_WORK = 1 << 19
+_DENSE_SCRATCH = 1 << 24
 
 # Extra keyword arguments of the forward tlmm launch, shared rather than built per call (never mutated)
 _FP32_DOT = {"fp32_dot": True}
@@ -303,6 +322,9 @@ class SumLayer(Layer, nn.Module):
         # where sb_ebase/sb_pbase are the per-node-block first child / first param and sb_ok records
         # whether the layer's children are GLOBALLY contiguous + params block_size-strided.
         self._cached_fw_sb = dict()
+        # Per partition: its plan on the dense cuBLAS path, or None where that path does not take it (see
+        # `_dense_blocks`).
+        self._cached_fw_dense = dict()
 
         # Layer info
         self._layer_nid_range = (layer_nid_start, layer_nid_start + self.num_nodes)
@@ -693,6 +715,14 @@ class SumLayer(Layer, nn.Module):
                 "node_mars_tempered": kwargs["node_mars_tempered"]
             }
 
+        # Dense node blocks through cuBLAS where that is faster (see `_DENSE_MIN_BLOCK_SIZE`)
+        if (propagation_alg_id == 0 and not pflow_tempered_enabled and node_mars.is_cuda
+                and self.block_size >= _DENSE_MIN_BLOCK_SIZE and batch_size >= 16):
+            dense = self._dense_blocks(partition_id, nids, cids, pids)
+            if dense is not None and dense[1] * batch_size >= _DENSE_MIN_WORK:
+                self._forward_dense(node_mars, element_mars, params, dense, exact = (precision == "fp32"))
+                return None
+
         # Heuristic to set `TILE_SIZE_M`, `TILE_SIZE_K`, and `BLOCK_B`
         if batch_size < 16 and self.block_size >= _SMALL_BATCH_MIN_BLOCK_SIZE:
             # Small-batch path (the `else` below is the unchanged >=16 heuristic). That heuristic
@@ -971,6 +1001,81 @@ class SumLayer(Layer, nn.Module):
                 partition_id=partition_id, propagation_alg=propagation_alg,
                 pflow_temperature=pflow_temperature, precision=precision, **kwargs)
         return None
+
+    def _dense_blocks(self, partition_id: int, nids: torch.Tensor, cids: torch.Tensor, pids: torch.Tensor):
+        """
+        A partition's plan on the dense cuBLAS path, or None where that path does not take it. Every node block must
+        be dense -- its children a contiguous run of element rows and its parameters strided by the block size
+        (node ``i``, edge ``e`` at ``pids[k, 0] + e * block_size + i``), so that its weights are the
+        ``[E, block_size]`` matrix at ``params[pids[k, 0]]``. And either all blocks read the same children (one
+        group, exponentiated once), or each reads its own, with the children, node rows and parameters of
+        consecutive blocks ``E``, ``block_size`` and ``E * block_size`` apart, so that all of them are one batched
+        product over views. Checked once per partition.
+
+        :returns: ``(blocks, E, c0, G)`` -- the node blocks ``(nid, first param)`` in the order of their children,
+            the number of real (unpadded) edges, the first child row, and the number of child groups (1, or one per
+            block) -- or None
+        """
+        if partition_id not in self._cached_fw_dense:
+            real = int((cids != 0).any(dim = 0).sum())                   # padding is a zero suffix
+            c, p = cids[:, :real].long(), pids[:, :real].long()
+            e = torch.arange(real, device = cids.device)
+            plan = None
+            if real > 0 and bool(((c == c[:, :1] + e).all() & (p == p[:, :1] + e * self.block_size).all()).item()):
+                rows = sorted(zip(c[:, 0].tolist(), nids.tolist(), p[:, 0].tolist()))
+                c0, nid0, p0 = rows[0]
+                blocks = [(nid, pid) for _, nid, pid in rows]
+                if all(r[0] == c0 for r in rows):
+                    plan = (blocks, real, c0, 1)
+                elif all(r == (c0 + g * real, nid0 + g * self.block_size, p0 + g * real * self.block_size)
+                         for g, r in enumerate(rows)):
+                    plan = (blocks, real, c0, len(rows))
+            self._cached_fw_dense[partition_id] = plan
+        return self._cached_fw_dense[partition_id]
+
+    def _forward_dense(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor,
+                       dense, exact: bool) -> None:
+        """
+        LL forward of a dense partition (see `_dense_blocks`): ``log(W @ exp(X - m)) + m`` per node block, with
+        ``X`` its children's rows, ``m`` their column maximum and ``W`` read in place from ``params``. With one
+        child group, ``X`` is exponentiated once and multiplied by each block's ``W``. With several, runs of
+        groups take one batched product over ``[groups, ...]`` views, each run as many groups as `_DENSE_SCRATCH`
+        holds. The product is exact fp32 (``exact``) or TF32.
+        """
+        from .kernels.sum_forward_dense import dense_colmax, dense_exp, dense_log
+
+        blocks, E, c0, G = dense
+        BS = self.block_size
+        B = node_mars.size(1)
+        prev = torch.get_float32_matmul_precision()
+        torch.set_float32_matmul_precision("highest" if exact else "high")
+        try:
+            if G == 1:
+                colmax = element_mars[c0:c0 + E].amax(dim = 0)
+                ex = torch.empty(E, B, device = element_mars.device)
+                dense_exp(element_mars, colmax, ex, c0, E, B)
+                for nid, p0 in blocks:
+                    torch.mm(params[p0:p0 + E * BS].view(E, BS).t(), ex, out = node_mars[nid:nid + BS])
+                nids = [nid for nid, _ in blocks]
+                if nids == list(range(nids[0], nids[0] + len(nids) * BS, BS)):     # consecutive node blocks
+                    dense_log(node_mars, colmax, nids[0], len(nids) * BS, B)
+                else:
+                    for nid in nids:
+                        dense_log(node_mars, colmax, nid, BS, B)
+            else:
+                nid0, p0 = blocks[0]
+                per_run = min(G, max(1, _DENSE_SCRATCH // (E * B)))
+                ex = torch.empty(per_run * E, B, device = element_mars.device)               # reused by every run
+                for g in range(0, G, per_run):
+                    n = min(per_run, G - g)
+                    c, nid, p = c0 + g * E, nid0 + g * BS, p0 + g * E * BS
+                    colmax = dense_colmax(element_mars, c, n, E, B)                           # [n, B]
+                    dense_exp(element_mars, colmax, ex, c, n * E, B, rows_per_group = E)
+                    torch.bmm(params[p:p + n * E * BS].view(n, E, BS).transpose(1, 2), ex[:n * E].view(n, E, B),
+                              out = node_mars[nid:nid + n * BS].view(n, BS, B))
+                    dense_log(node_mars, colmax, nid, n * BS, B, rows_per_group = BS)
+        finally:
+            torch.set_float32_matmul_precision(prev)
 
     def _forward_sparse(self, node_mars: torch.Tensor, element_mars: torch.Tensor,
                         params: torch.Tensor, nids: torch.Tensor, cids: torch.Tensor,
