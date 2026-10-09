@@ -128,6 +128,30 @@ _SMALL_BATCH_MIN_BLOCK_SIZE = int(os.environ.get("PYJUICE_SB_MIN_BS", 32))
 # unaffected. Toggle for A/B; bit-identical so on by default.
 _BLOCK_SPARSE_EDGE_TRIM = os.environ.get("PYJUICE_EDGE_TRIM", "1") != "0"
 
+# Precision of a circuit's sum layers (`TensorCircuit.precision`). Forward: "auto" is the fastest per layer --
+# bf16 products in the block-sparse kernels from batch 16 (~4e-3 in the log-likelihood of a 4096-latent HMM
+# layer); "tf32" never uses bf16 (round-to-nearest TF32 in the Triton kernels; ~5e-4); "fp32" gives fp32-level
+# products (`tf32x3` in the Triton tlmm kernel; ~1e-6). Batches below 16 run fp32 kernels in every mode. Backward:
+# "auto" and "tf32" keep the round-to-nearest TF32 products; "fp32" computes the flows without tensor cores (exact
+# fp32 sums).
+PRECISIONS = ("auto", "tf32", "fp32")
+
+
+def _pop_removed_precision_flags(kwargs: dict) -> None:
+    """
+    `force_use_bf16` / `force_use_fp32` were replaced by the circuit's `precision`. Passed as False (their old
+    default, a no-op) they are dropped; passed as True they raise, rather than silently computing in another
+    precision than the caller asked for.
+    """
+    for name in ("force_use_bf16", "force_use_fp32"):
+        if kwargs.pop(name, False):
+            raise TypeError(f"`{name}` was removed: set the circuit's precision instead (`pc.precision = 'tf32'` "
+                            f"or `'fp32'`, or `juice.compile(..., precision = ...)`).")
+
+# Extra keyword arguments of the forward tlmm launch, shared rather than built per call (never mutated)
+_FP32_DOT = {"fp32_dot": True}
+_NO_KWARGS = {}
+
 # Precision of the parameter-flow `tl.dot`. Triton defaults to TF32, which TRUNCATES the operands --
 # a bias, ~6e-4 low per product. The default path now rounds the operands onto the TF32 grid first
 # (`_round_to_tf32` in `layer/kernels`), which removes the bias at TF32 speed. MEASURED at block_size
@@ -422,8 +446,8 @@ class SumLayer(Layer, nn.Module):
         return self._layer_nid_range[0], self._layer_nid_range[1]
 
     def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor,
-                force_use_bf16: bool = False, force_use_fp32: bool = False,
-                propagation_alg: str = "LL", pflow_temperature: float = 1.0, **kwargs) -> None:
+                propagation_alg: str = "LL", pflow_temperature: float = 1.0, precision: str = "auto",
+                **kwargs) -> None:
         """
         Computes the forward pass of a sum layer.
 
@@ -433,6 +457,10 @@ class SumLayer(Layer, nn.Module):
         `params`:       [num_params, B] or [num_params]
         """
         assert not (propagation_alg != "LL" and abs(pflow_temperature - 1.0) > 1e-6), "`pflow_temperature` can only be 1 if `propagation_alg` is not 'LL'."
+        if precision not in PRECISIONS:
+            raise ValueError(f"`precision` must be one of {PRECISIONS}, got {precision!r}.")
+        if "force_use_bf16" in kwargs or "force_use_fp32" in kwargs:      # the shim only when needed: hot path
+            _pop_removed_precision_flags(kwargs)
 
         for partition_id in range(self.num_fw_partitions):
             nids = self.partitioned_nids[partition_id]
@@ -441,10 +469,8 @@ class SumLayer(Layer, nn.Module):
 
             self._forward(
                 node_mars, element_mars, params, nids, cids, pids, 
-                partition_id = partition_id, force_use_bf16 = force_use_bf16,
-                force_use_fp32 = force_use_fp32, 
-                propagation_alg = propagation_alg, 
-                pflow_temperature = pflow_temperature, **kwargs
+                partition_id = partition_id, propagation_alg = propagation_alg, 
+                pflow_temperature = pflow_temperature, precision = precision, **kwargs
             )
 
         return None
@@ -455,7 +481,7 @@ class SumLayer(Layer, nn.Module):
                  allow_modify_flows: bool = False, propagation_alg: str = "LL", 
                  logspace_flows: bool = False, negate_pflows: bool = False, 
                  accumulate_ch_flows: bool = False, allow_neg_flows: bool = False,
-                 force_use_fp32: bool = False, pflow_temperature: float = 1.0, 
+                 precision: str = "auto", pflow_temperature: float = 1.0, 
                  temper_eflow: bool = False, **kwargs) -> None:
         """
         Computes the forward pass of a sum layer:
@@ -484,6 +510,11 @@ class SumLayer(Layer, nn.Module):
         assert not (allow_neg_flows and allow_modify_flows), "`allow_neg_flows` should be set to `False` when `allow_modify_flows=True`."
         assert not (propagation_alg != "LL" and abs(pflow_temperature - 1.0) > 1e-6), "`pflow_temperature` can only be 1 if `propagation_alg` is not 'LL'."
         assert logspace_flows or abs(pflow_temperature - 1.0) < 1e-6, "`pflow_temperature` can only be enabled when `logspace_flows = True`."
+        if precision not in PRECISIONS:
+            raise ValueError(f"`precision` must be one of {PRECISIONS}, got {precision!r}.")
+        if "force_use_bf16" in kwargs or "force_use_fp32" in kwargs:      # the shim only when needed: hot path
+            _pop_removed_precision_flags(kwargs)
+        force_use_fp32 = precision == "fp32"            # flows without tensor cores: exact fp32 sums
 
         ## Pre-compute `nflows.log() - nmars` if needed ##
         if allow_modify_flows:
@@ -556,8 +587,8 @@ class SumLayer(Layer, nn.Module):
                  params: torch.Tensor, nids: torch.Tensor, cids: torch.Tensor,
                  pids: torch.Tensor,
                  partition_id: int = -1, mode: Optional[str] = None,
-                 force_use_bf16: bool = False, force_use_fp32: bool = False,
-                 propagation_alg: str = "LL", pflow_temperature: float = 1.0, **kwargs) -> None:
+                 propagation_alg: str = "LL", pflow_temperature: float = 1.0, precision: str = "auto",
+                 **kwargs) -> None:
         """
         Forward pass of sum layers.
         
@@ -599,9 +630,8 @@ class SumLayer(Layer, nn.Module):
         if mode == self.BLOCK_SPARSE:
             self._forward_block_sparse(
                 node_mars, element_mars, params, nids, cids, pids,
-                partition_id = partition_id, force_use_bf16 = force_use_bf16,
-                force_use_fp32 = force_use_fp32, propagation_alg = propagation_alg, 
-                pflow_temperature = pflow_temperature, **kwargs
+                partition_id = partition_id, propagation_alg = propagation_alg, 
+                pflow_temperature = pflow_temperature, precision = precision, **kwargs
             )
 
         elif mode == self.SPARSE:
@@ -625,9 +655,8 @@ class SumLayer(Layer, nn.Module):
     def _forward_block_sparse(self, node_mars: torch.Tensor, element_mars: torch.Tensor,
                               params: torch.Tensor, nids: torch.Tensor, cids: torch.Tensor,
                               pids: torch.Tensor,
-                              partition_id: int = -1, force_use_bf16: bool = False,
-                              force_use_fp32: bool = False, propagation_alg: str = "LL", 
-                              pflow_temperature: float = 1.0, **kwargs) -> None:
+                              partition_id: int = -1, propagation_alg: str = "LL", 
+                              pflow_temperature: float = 1.0, precision: str = "auto", **kwargs) -> None:
         """
         Forward pass of sum layers with the block-sparse processing kernel.
         
@@ -752,26 +781,25 @@ class SumLayer(Layer, nn.Module):
 
         BLOCK_SIZE_M = self.block_size
 
-        if force_use_bf16:
-            assert not force_use_fp32
-            use_bf16 = True
-        elif force_use_fp32:
+        if precision != "auto":
             use_bf16 = False
         else:
-            if TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and BLOCK_B >= 16:
-                use_bf16 = True
-            else:
-                use_bf16 = False
+            use_bf16 = TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and BLOCK_B >= 16
+        # fp32-level products in the tlmm kernel (the csmm kernels' fp32 sums are exact already)
+        fp32_dot = (precision == "fp32") and not use_bf16
 
         # Which of the three block-sparse forward kernels runs is decided ONCE, from the heuristic
         # config -- they differ numerically (different dot / reduction structure), so the autotuned
         # candidates below must not be able to flip it. `use_bf16` is likewise already fixed above.
         if TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and BLOCK_B >= 16:
             fw_kernel, tile_floor = fw_bsparse._fw_triton_block_sparse_tlmm_kernel, 16
+            dot_kwargs = _FP32_DOT if fp32_dot else _NO_KWARGS      # unset: the kernel's default (False)
         elif TILE_SIZE_M >= 8 and TILE_SIZE_K >= 8 and BLOCK_B >= 8:
             fw_kernel, tile_floor = fw_bsparse._fw_triton_block_sparse_csmm1_kernel, 8
+            dot_kwargs = _NO_KWARGS
         else:
             fw_kernel, tile_floor = fw_bsparse._fw_triton_block_sparse_csmm2_kernel, 1
+            dot_kwargs = _NO_KWARGS
 
         def _launch_fw(cfg):
             tm, bb = cfg
@@ -799,6 +827,7 @@ class SumLayer(Layer, nn.Module):
                     pid_m_offset = pid_m_start,
                     **propagation_alg_kwargs,
                     **pflow_tempered_kwargs,
+                    **dot_kwargs,
                     num_stages = 1
                 )
 
@@ -830,7 +859,7 @@ class SumLayer(Layer, nn.Module):
         # re-enters with a smaller default -- looks up a fresh entry instead of the config that just
         # failed (which would loop forever).
         fw_key = (fw_kernel, self.block_size, TILE_SIZE_K, K_NUM_TILES, batch_size, num_nblocks,
-                  use_bf16, propagation_alg_id, pflow_tempered_enabled, default_fw_cfg)
+                  use_bf16, fp32_dot, propagation_alg_id, pflow_tempered_enabled, default_fw_cfg)
 
         # Optional CUDA (CuTe/TMA) fast path for the `tlmm` regime. It is numerically equivalent to
         # the Triton tlmm kernel and only valid here: LL propagation (`propagation_alg_id == 0`), the
@@ -939,9 +968,8 @@ class SumLayer(Layer, nn.Module):
                           "memory on this GPU; falling back to the default launch config.", RuntimeWarning)
             return self._forward_block_sparse(
                 node_mars, element_mars, params, nids, cids, pids,
-                partition_id=partition_id, force_use_bf16=force_use_bf16,
-                force_use_fp32=force_use_fp32, propagation_alg=propagation_alg,
-                pflow_temperature=pflow_temperature, **kwargs)
+                partition_id=partition_id, propagation_alg=propagation_alg,
+                pflow_temperature=pflow_temperature, precision=precision, **kwargs)
         return None
 
     def _forward_sparse(self, node_mars: torch.Tensor, element_mars: torch.Tensor,

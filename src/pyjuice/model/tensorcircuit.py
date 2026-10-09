@@ -19,6 +19,7 @@ from pyjuice.layer import Layer, InputLayer, ProdLayer, SumLayer, ExternalParams
                           StagedExternalParams, EXTERNAL_PARAMS_KWARG, EXTERNAL_PARAMS_GRAD_KWARG, \
                           EXTERNAL_PARAMS_BUFFER_KWARG, EXTERNAL_PARAMS_GRAD_BUFFER_KWARG
 from pyjuice.layer.external_sum_layer import validate_external_tensors
+from pyjuice.layer.sum_layer import PRECISIONS, _pop_removed_precision_flags
 from pyjuice.utils.grad_fns import ReverseGrad
 from pyjuice.utils import BitSet
 from pyjuice.utils.util import cuda_graph_key
@@ -278,11 +279,12 @@ class TensorCircuit(nn.Module):
                  force_gpu_compilation: bool = False,
                  max_tied_ns_per_parflow_block: int = 32,
                  device: Optional[Union[int,torch.device]] = None,
-                 verbose: bool = True, cuda_graphs: bool = False) -> None:
+                 verbose: bool = True, cuda_graphs: bool = False, precision: str = "auto") -> None:
 
         super(TensorCircuit, self).__init__()
 
         self.cuda_graphs = bool(cuda_graphs)
+        self.precision = precision
 
         assert isinstance(root_ns, CircuitNodes), "`root_ns` should be an instance of `CircuitNodes`."
 
@@ -401,9 +403,29 @@ class TensorCircuit(nn.Module):
         else:
             raise NotImplementedError(f"Unknown propagation algorithm {propagation_alg}.")
         
+    @property
+    def precision(self) -> str:
+        """
+        Precision of the sum layers' products, in the forward and the backward pass:
+
+        * ``"auto"`` (the default): the fastest per layer -- bf16 products in the block-sparse kernels from batch 16
+          (about 4e-3 in a log-likelihood);
+        * ``"tf32"``: never bf16 -- round-to-nearest TF32 products (about 5e-4);
+        * ``"fp32"``: fp32-level products in the forward (about 1e-6) and flows without tensor cores in the backward.
+
+        Batches below 16 run fp32 kernels in every mode. Settable at any time; a recorded CUDA graph is keyed on it.
+        """
+        return self.__dict__.get("_precision", "auto")
+
+    @precision.setter
+    def precision(self, value: str):
+        if value not in PRECISIONS:
+            raise ValueError(f"`precision` must be one of {PRECISIONS}, got {value!r}.")
+        self.__dict__["_precision"] = value
+
     def forward(self, inputs: torch.Tensor, input_layer_fn: Optional[Union[str,Callable]] = None,
                 cache: Optional[dict] = None, return_cache: bool = False, record_cudagraph: Optional[bool] = None, 
-                apply_cudagraph: bool = True, force_use_bf16: bool = False, force_use_fp32: bool = False, 
+                apply_cudagraph: bool = True, 
                 propagation_alg: Optional[Union[str,Sequence[str]]] = None, pflow_temperature: float = 1.0, 
                 _inner_layers_only: bool = False, _no_buffer_reset: bool = False, **kwargs):
         """
@@ -428,6 +450,8 @@ class TensorCircuit(nn.Module):
         :param apply_cudagraph: replay a graph recorded under exactly this call's signature, if there is one
         :type apply_cudagraph: bool
         """
+
+        _pop_removed_precision_flags(kwargs)
 
         with device_grad_controller(device = self.device, no_grad = True):
         
@@ -492,8 +516,7 @@ class TensorCircuit(nn.Module):
             # Inner layers. Besides the buffers, everything they are given is in `sum_opts`, and a recorded
             # graph is keyed on that dict (`_graph_key_options`), so no option can reach a captured pass
             # without being part of its key.
-            sum_opts = dict(kwargs, force_use_bf16 = force_use_bf16, force_use_fp32 = force_use_fp32,
-                            pflow_temperature = pflow_temperature)
+            sum_opts = dict(kwargs, precision = self.precision, pflow_temperature = pflow_temperature)
 
             def _run_inner_layers():
                 for layer_id, layer_group in enumerate(self.inner_layer_groups):
@@ -577,7 +600,6 @@ class TensorCircuit(nn.Module):
                  negate_pflows: bool = False,
                  _inner_layers_only: bool = False,
                  _disable_buffer_init: bool = False,
-                 force_use_fp32: bool = False,
                  pflow_temperature: float = 1.0,
                  temper_eflow: bool = False,
                  compute_external_grads: bool = True,
@@ -605,7 +627,8 @@ class TensorCircuit(nn.Module):
         self._run_params["propagation_alg"] = propagation_alg
         self._run_params["logspace_flows"] = logspace_flows
         self._run_params["negate_pflows"] = negate_pflows
-        self._run_params["force_use_fp32"] = force_use_fp32
+        self._run_params["precision"] = self.precision
+        _pop_removed_precision_flags(kwargs)
         self._run_params["pflow_temperature"] = pflow_temperature
         self._run_params["temper_eflow"] = temper_eflow
 
@@ -676,7 +699,7 @@ class TensorCircuit(nn.Module):
                             param_flows = self.param_flows if compute_param_flows else None,
                             denom_param_flows = self.denom_param_flows if compute_param_flows else None,
                             allow_modify_flows = allow_modify_flows, logspace_flows = logspace_flows,
-                            negate_pflows = negate_pflows, force_use_fp32 = force_use_fp32,
+                            negate_pflows = negate_pflows, precision = self.precision,
                             pflow_temperature = pflow_temperature, temper_eflow = temper_eflow)
 
             def _run_inner_layers():
@@ -1781,7 +1804,7 @@ class TensorCircuit(nn.Module):
                 propagation_alg = self._run_params["propagation_alg"], 
                 logspace_flows = self._run_params["logspace_flows"], 
                 negate_pflows = self._run_params["negate_pflows"],
-                force_use_fp32 = self._run_params["force_use_fp32"], **kwargs
+                precision = self._run_params["precision"], **kwargs
             )
 
             return self.element_flows[nsid:neid,:].detach()
@@ -2502,7 +2525,7 @@ def compile(ns: CircuitNodes, layer_sparsity_tol: float = 0.5,
             force_gpu_compilation: bool = False,
             max_tied_ns_per_parflow_block: int = 32,
             device: Optional[Union[int,torch.device]] = None,
-            verbose: bool = True, cuda_graphs: bool = False) -> nn.Module:
+            verbose: bool = True, cuda_graphs: bool = False, precision: str = "auto") -> nn.Module:
     """
     Compile a PC represented by a DAG into an equivalent `torch.nn.Module`.
 
@@ -2534,9 +2557,13 @@ def compile(ns: CircuitNodes, layer_sparsity_tol: float = 0.5,
         by default
     :type cuda_graphs: bool
 
+    :param precision: precision of the sum layers' products: "auto" (the default; the fastest per layer), "tf32"
+        or "fp32" (see :attr:`TensorCircuit.precision`; settable after compiling)
+    :type precision: str
+
     :returns: the compiled PC with type `torch.nn.Module`
     """
     return TensorCircuit(ns, layer_sparsity_tol = layer_sparsity_tol, max_num_partitions = max_num_partitions,
                          disable_gpu_compilation = disable_gpu_compilation, force_gpu_compilation = force_gpu_compilation,
                          max_tied_ns_per_parflow_block = max_tied_ns_per_parflow_block, device = device, verbose = verbose,
-                         cuda_graphs = cuda_graphs)
+                         cuda_graphs = cuda_graphs, precision = precision)
