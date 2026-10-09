@@ -4,12 +4,13 @@ which the library's GPU implementation is tested against. Like the compiler, the
 Categorical input nodes only, so every PC here has Categorical input nodes. Checks:
 
 * its sum weights are normalized for every node, and equal the node groups' own after
-  `pc.update_parameters()` (where their edge blocks are distinct);
+  `pc.update_parameters()`, also where an edge block is listed twice;
 * with the one-state constraint (anything goes) it reproduces `juice.queries.marginal` on every kind of
   PC in conftest.py's `PC_KINDS`: HMMs (tied, untied, with block-sparse transitions), 1-D PDs (plain,
   sum-sharing with block-sparse sum edges, blockified), and hand-built circuits with three- and four-child
   products, a sum over an input node, an input node next to an interval node, node-level and permuted
-  block-level product edges, explicit block-sparse sum edges and block size 1;
+  block-level product edges, explicit block-sparse sum edges (one edge block listed twice) and block
+  size 1;
 * under real constraints it equals brute force -- the PC's own probabilities of every string, summed
   over the accepted ones consistent with the evidence -- including after an in-place parameter update;
 * its log-space block operations stay exact far outside exp's range.
@@ -51,10 +52,7 @@ def test_parameters_are_read_from_the_compiled_pc(kind, reference, build_pc):
         if ns.is_sum():
             weights = reference.sum_weights(pc, ns).cpu()
             assert torch.allclose(weights.sum(dim = 1), torch.ones(ns.num_nodes))     # every node normalized
-            # `get_params(as_matrix = True)` keeps one copy of a repeated edge block, so it is the expected
-            # value only where the edge blocks are distinct
-            if torch.unique(ns.edge_ids, dim = 1).size(1) == ns.edge_ids.size(1):
-                assert torch.equal(weights, src.get_params(as_matrix = True))
+            assert torch.allclose(weights, src.get_params(as_matrix = True))
         elif ns.is_input():
             assert torch.equal(reference.categorical_probs(pc, ns).cpu(), src._params.reshape(ns.num_nodes, -1))
 

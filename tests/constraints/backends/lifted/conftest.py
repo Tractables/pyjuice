@@ -67,8 +67,7 @@ def sum_weights(pc, ns) -> torch.Tensor:
     num_ch_nblocks = sum(cs.num_node_blocks for cs in ns.chs)
     dense = torch.zeros(ns.num_node_blocks * num_ch_nblocks, bs, cbs, dtype = DTYPE, device = pc.params.device)
     edge_ids = ns.edge_ids.to(pc.params.device)
-    # accumulate: an edge block may appear twice (e.g. from `block_sparse_rnd_blk_edge_constructor`), and the
-    # forward adds both, while a plain assignment (as in `get_params(as_matrix = True)`) keeps only one
+    # accumulate: an edge block may appear twice in `edge_ids`, and the forward adds both copies
     dense.index_put_((edge_ids[0] * num_ch_nblocks + edge_ids[1],), blocks, accumulate = True)
     return dense.reshape(ns.num_node_blocks, num_ch_nblocks, bs, cbs).permute(0, 2, 1, 3).reshape(
         ns.num_nodes, num_ch_nblocks * cbs)
@@ -235,12 +234,13 @@ def hand_built(V):
 
 def hand_permuted(V):
     """Block-level product edges that permute blocks or reuse a child's only block, explicit block-sparse
-    sum edges and a four-child product, over 5 variables."""
+    sum edges with an edge block listed twice, and a four-child product, over 5 variables."""
     cat = lambda: dists.Categorical(num_cats = V)
     x = [inputs(v, num_node_blocks = 2, block_size = 2, dist = cat()) for v in range(5)]
     one = inputs(1, num_node_blocks = 1, block_size = 2, dist = cat())             # a single block
     p12 = multiply(one, x[2], edge_ids = torch.tensor([[0, 1], [0, 0]]))            # reuses it, permutes x2's
-    s12 = summate(p12, num_node_blocks = 2, block_size = 2, edge_ids = torch.tensor([[0, 1], [1, 0]]))
+    s12 = summate(p12, num_node_blocks = 2, block_size = 2,
+                  edge_ids = torch.tensor([[0, 0, 1], [1, 1, 0]]))                  # (0, 1) twice
     p34 = multiply(x[3], x[4], edge_ids = torch.tensor([[1, 0], [0, 1]]))           # permuted blocks
     s34 = summate(p34, num_node_blocks = 2, block_size = 2)
     p_a = multiply(x[0], s12, s34)
@@ -263,8 +263,7 @@ def hand_unit(V):
 PC_KINDS = {
     "hmm": None,                 # tied HMM, one node block per position
     "hmm_untied": None,
-    "hmm_block_sparse": None,    # 4 node blocks per position, random block-sparse transitions (with
-                                 # repeated edge blocks), tied
+    "hmm_block_sparse": None,    # 4 node blocks per position, random block-sparse transitions, tied
     "pd": None,                  # 1-D PD
     "pd_prod_dominated": None,   # sums shared by several products, block-sparse sum edges
     "pd_blockified": None,       # `juice.blockify` of a block-size-1 PD
