@@ -133,8 +133,10 @@ class SumNodes(CircuitNodes):
 
             params = torch.zeros([num_node_blocks * num_ch_node_blocks, block_size, ch_block_size], dtype = torch.float32)
 
+            # Accumulate: an edge block may appear more than once in `edge_ids`, and the forward pass adds
+            # every copy, so a plain assignment (which keeps only one) would drop mass from the matrix
             idxs = self.edge_ids[0,:] * num_ch_node_blocks + self.edge_ids[1,:]
-            params[idxs,:,:] = self._params
+            params.index_put_((idxs,), self._params.to(params.dtype), accumulate = True)
 
             params = params.reshape(
                 num_node_blocks, num_ch_node_blocks, block_size, ch_block_size
@@ -161,8 +163,9 @@ class SumNodes(CircuitNodes):
 
             param_flows = torch.zeros([num_node_blocks * num_ch_node_blocks, block_size, ch_block_size], dtype = torch.float32)
 
+            # Accumulate, as in `get_params`: every copy of a repeated edge block carries its own flows
             idxs = self.edge_ids[0,:] * num_ch_node_blocks + self.edge_ids[1,:]
-            param_flows[idxs,:,:] = self._param_flows
+            param_flows.index_put_((idxs,), self._param_flows.to(param_flows.dtype), accumulate = True)
 
             param_flows = param_flows.reshape(
                 num_node_blocks, num_ch_node_blocks, block_size, ch_block_size
