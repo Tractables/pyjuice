@@ -162,7 +162,14 @@ def build_pc_tables(structure, layout: BoundaryLayout, pc) -> Dict[str, Any]:
           order, and the boundaries before, between and after them (``-1`` padding for rows with fewer
           than ``k`` children);
         * ``input_range`` -- the ``node_mars`` rows ``(first, last + 1)`` of all input nodes;
-        * ``root_rows`` -- the ``node_mars`` rows ``(first, last + 1)`` of the root nodes.
+        * ``root_rows`` -- the ``node_mars`` rows ``(first, last + 1)`` of the root nodes;
+        * ``sum_regions`` -- one ``(first_row, end_row, slots)`` per sum node group, in row order: its
+          ``node_mars`` rows and the slots its block takes per sample;
+        * ``element_regions`` -- one ``(first_row, end_row, slots)`` per product layer group, in
+          ``pc.inner_layer_groups`` order: its ``element_mars`` rows and the most slots any of its
+          products takes per sample.
+
+        :func:`buffer_layout` turns the regions into offsets and widths for a batch size.
     """
     n = structure.num_vars
     width = layout.width.tolist()
@@ -221,10 +228,68 @@ def build_pc_tables(structure, layout: BoundaryLayout, pc) -> Dict[str, Any]:
                 parts[pattern].append((out, child_rows, bounds))
             product_rows.append({p: _concat_padded(rows, dev) for p, rows in parts.items() if rows})
 
+    # buffer regions: every sum node group keeps exactly its own block per sample; a product layer group
+    # (scratch, consumed by the next sum layer) keeps its largest product's block
+    slots = lambda ns: block(*info_of[ns].scope_runs[0])
+    sum_regions = sorted((first_row[ns], first_row[ns] + ns.num_nodes, slots(ns))
+                         for lg in pc.inner_layer_groups if lg.is_sum() for layer in lg.layers for ns in layer.nodes)
+    element_regions = []
+    for lg in pc.inner_layer_groups:
+        if lg.is_prod():
+            rows = [layer._layer_nid_range for layer in lg.layers]
+            element_regions.append((min(r[0] for r in rows), max(r[1] for r in rows),
+                                    max(slots(ns) for layer in lg.layers for ns in layer.nodes)))
+
     ranges = [layer._output_ind_range for layer in pc.input_layer_group]
     return dict(columns_per_sample = S, product_rows = product_rows,
                 input_range = (min(r[0] for r in ranges), max(r[1] for r in ranges)),
-                root_rows = tuple(pc._root_node_range))
+                root_rows = tuple(pc._root_node_range),
+                sum_regions = tuple(sum_regions), element_regions = tuple(element_regions))
+
+
+#: Every region starts, and every sum and product row is padded, to a multiple of this many floats (64 bytes),
+#: which the kernels need to run with the column count as a run-time argument at full speed.
+ALIGN = 16
+
+
+def _align(x: int) -> int:
+    return (x + ALIGN - 1) // ALIGN * ALIGN
+
+
+def buffer_layout(input_range, sum_regions, element_regions, num_classes: int, batch_size: int) -> Dict[str, Any]:
+    """
+    Where every region of the lifted buffers sits for a batch of ``batch_size`` samples (in floats).
+
+    ``node_mars`` holds, one region after the other, each starting on an :data:`ALIGN` boundary:
+
+    * the input region: rows ``0 .. input_end`` (pyjuice's own row numbers, so that an input layer writes it
+      as it writes a :class:`TensorCircuit`'s ``node_mars``), ``batch_size`` columns, the log-probability of
+      every observed token;
+    * the class region: the input rows, ``num_classes`` columns, every class's log-mass for a missing token;
+    * one region per sum node group: its rows, ``align(batch_size * slots)`` columns, slot-major (slot ``s``
+      of sample ``b`` in column ``s * batch_size + b``).
+
+    ``element_mars`` holds the products of one product layer group at a time, ``align(batch_size * slots)``
+    columns per row; its size is that of the largest group.
+
+    :returns: a dict with ``input_offset``, ``class_offset``, ``sum_offsets`` and ``sum_widths`` (one per sum
+        region; row ``r`` of region ``i`` starts at ``sum_offsets[i] + (r - first_row) * sum_widths[i]``),
+        ``node_size``, ``element_widths`` (one per product layer group; row ``r`` starts at
+        ``(r - first_row) * width``) and ``element_size``
+    """
+    B = int(batch_size)
+    input_start, input_end = input_range
+    class_offset = _align(input_end * B)
+    offset = _align(class_offset + (input_end - input_start) * num_classes)
+    sum_offsets, sum_widths = [], []
+    for first, end, slots in sum_regions:
+        width = _align(B * slots)
+        sum_offsets.append(offset); sum_widths.append(width)
+        offset += (end - first) * width                                       # stays aligned
+    element_widths = [_align(B * slots) for _, _, slots in element_regions]
+    element_size = max(((end - first) * w for (first, end, _), w in zip(element_regions, element_widths)), default = 0)
+    return dict(input_offset = 0, class_offset = class_offset, sum_offsets = sum_offsets, sum_widths = sum_widths,
+                node_size = offset, element_widths = element_widths, element_size = element_size)
 
 
 def _product_child_index(ns, k) -> torch.Tensor:

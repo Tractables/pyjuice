@@ -11,7 +11,7 @@ import torch
 
 from .language.base import Constraint
 from .structure import SHAPES, PCStructure, analyze_structure
-from .backends.lifted.plan import BoundaryLayout, build_pc_tables
+from .backends.lifted.plan import BoundaryLayout, build_pc_tables, buffer_layout
 
 
 class ConstrainedCircuit:
@@ -26,9 +26,11 @@ class ConstrainedCircuit:
     another device together with everything compiled from the pair, through :meth:`to`. A PC moved on its
     own makes every query raise.
 
-    Constrained queries run in buffers of their own, laid out for the lifted plan, so creating a
-    constrained circuit releases the PC's activation buffers (:meth:`TensorCircuit.free_activation_buffers`;
-    its parameter flows are kept). The PC allocates them again on its next own pass.
+    Constrained queries run in buffers of their own, laid out for the lifted plan (see
+    :func:`~pyjuice.constraints.backends.lifted.plan.buffer_layout`) and allocated on the first query, so
+    creating a constrained circuit releases the PC's activation buffers
+    (:meth:`TensorCircuit.free_activation_buffers`; its parameter flows are kept). The PC allocates them
+    again on its next own pass.
 
     Created by :func:`pyjuice.constraints.compile`; not meant to be constructed directly.
 
@@ -38,11 +40,13 @@ class ConstrainedCircuit:
     :ivar automaton: the constraint's automaton
     :ivar layout: the :class:`~pyjuice.constraints.backends.lifted.plan.BoundaryLayout` of the automaton
         over the PC's variables
-    :ivar columns_per_sample: S, the columns every sample takes in the PC's buffers during a lifted pass
+    :ivar columns_per_sample: the most slots any sum or product node's block takes per sample
         (see :func:`~pyjuice.constraints.backends.lifted.plan.build_pc_tables`)
     :ivar product_rows: per product layer and pattern, the rows and boundaries the lifted products read
     :ivar input_range: the ``node_mars`` rows of all input nodes
     :ivar root_rows: the ``node_mars`` rows of the root nodes
+    :ivar sum_regions: ``(first_row, end_row, slots)`` of every sum node group's region in ``node_mars``
+    :ivar element_regions: ``(first_row, end_row, slots)`` of every product layer group in ``element_mars``
     :ivar compile_time_s: wall-clock seconds :func:`~pyjuice.constraints.compile` (or :meth:`with_pc`) took
     """
 
@@ -64,7 +68,11 @@ class ConstrainedCircuit:
         self.product_rows = tables["product_rows"]
         self.input_range = tables["input_range"]
         self.root_rows = tables["root_rows"]
+        self.sum_regions = tables["sum_regions"]
+        self.element_regions = tables["element_regions"]
         self.compile_time_s = compile_time_s
+        self._storage = {}                          # buffer name -> backing storage (see `_buffers`)
+        self._layouts = {}                          # batch size -> `buffer_layout` and its device tensors
 
     @property
     def pc(self):
@@ -89,8 +97,58 @@ class ConstrainedCircuit:
         device = self._pc.params.device
         self.product_rows = [{pattern: tuple(t.to(device) for t in rows) for pattern, rows in layer.items()}
                              for layer in self.product_rows]
+        self._storage, self._layouts = {}, {}       # the buffers are allocated again on the new device
         self._device = device
         return self
+
+    # ---------------------------------------------------------------------------------------------
+    # Buffers
+    # ---------------------------------------------------------------------------------------------
+
+    def _buffers(self, batch_size: int) -> Dict[str, Any]:
+        """
+        The lifted buffers for a batch of ``batch_size``, cut from storage this constrained circuit owns
+        (:func:`~pyjuice.constraints.backends.lifted.plan.buffer_layout` says where every region sits).
+
+        Each buffer has one backing storage, reused while it is large enough and at most 4 times larger
+        than needed (so a loop whose batch size varies does not reallocate, and keeps its addresses), and
+        filled with -inf only when allocated: every slot a kernel reads is written first, and padding is
+        never read.
+
+        :returns: a dict with ``node_mars`` and ``element_mars`` (flat), ``input_mars`` (a contiguous
+            ``[input_end, batch_size]`` view, which an input layer writes as it writes a
+            :class:`TensorCircuit`'s ``node_mars``), ``class_mars`` (``[num_input_rows, num_classes]``) and
+            ``layout`` (the :func:`buffer_layout` dict, plus ``sum_offsets`` / ``sum_widths`` as int64
+            tensors on the device for the kernels)
+        """
+        B = int(batch_size)
+        layout = self._layouts.get(B)
+        if layout is None:
+            layout = buffer_layout(self.input_range, self.sum_regions, self.element_regions, self.num_classes, B)
+            layout["sum_offsets_t"] = torch.tensor(layout["sum_offsets"], dtype = torch.int64, device = self._device)
+            layout["sum_widths_t"] = torch.tensor(layout["sum_widths"], dtype = torch.int64, device = self._device)
+            self._layouts[B] = layout
+        node_mars = self._storage_view("node_mars", layout["node_size"])
+        element_mars = self._storage_view("element_mars", layout["element_size"])
+        input_start, input_end = self.input_range
+        class_offset, num_input_rows = layout["class_offset"], input_end - input_start
+        return dict(node_mars = node_mars, element_mars = element_mars,
+                    input_mars = node_mars[:input_end * B].view(input_end, B),
+                    class_mars = node_mars[class_offset:class_offset + num_input_rows * self.num_classes].view(
+                        num_input_rows, self.num_classes),
+                    layout = layout)
+
+    def _storage_view(self, name: str, numel: int) -> torch.Tensor:
+        storage = self._storage.get(name)
+        if storage is None or storage.numel() < numel or storage.numel() > 4 * max(numel, 1):
+            storage = self._storage[name] = None                                    # free the old one first
+            storage = self._storage[name] = torch.full((max(numel, 1),), -float("inf"), device = self._device)
+        return storage[:numel]
+
+    def buffer_bytes(self, batch_size: int) -> int:
+        """Bytes of the lifted buffers for a batch of ``batch_size`` (fp32, alignment included)."""
+        layout = buffer_layout(self.input_range, self.sum_regions, self.element_regions, self.num_classes, batch_size)
+        return 4 * (layout["node_size"] + layout["element_size"])
 
     # ---------------------------------------------------------------------------------------------
     # Report
@@ -138,12 +196,13 @@ class ConstrainedCircuit:
     @property
     def bytes_per_sample(self) -> int:
         """
-        Memory a lifted pass needs per sample, in fp32: the PC's ``node_mars`` and ``element_mars`` at
-        :attr:`columns_per_sample` columns, plus one mass per input node and token class.
+        Memory the lifted buffers need per sample, in fp32: every sum node group's block, the largest product
+        layer group's blocks, and one log-probability per input row -- without the alignment padding and the
+        class masses, which do not grow with the batch (:meth:`buffer_bytes` has the exact size).
         """
-        num_inputs = self.input_range[1] - self.input_range[0]
-        buffers = self.columns_per_sample * (self.pc.num_nodes + self.pc.num_elements)
-        return 4 * (buffers + num_inputs * self.num_classes)
+        sums = sum((end - first) * slots for first, end, slots in self.sum_regions)
+        elements = max(((end - first) * slots for first, end, slots in self.element_regions), default = 0)
+        return 4 * (sums + elements + self.input_range[1])
 
     def info(self) -> Dict[str, Any]:
         """A summary of the constrained circuit."""

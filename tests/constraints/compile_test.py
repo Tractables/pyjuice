@@ -89,8 +89,10 @@ def test_columns_and_memory_on_a_hand_counted_circuit():
     assert cc.shape_counts == dict(whole = 2, suffix = 2, prefix = 2, interval = 2, fragmented = 0)
     assert cc.width_per_boundary.tolist() == [1, 2, 3, 3, 2, 1] and cc.num_classes == 2
     assert cc.columns_per_sample == 6
-    # the PC's node_mars and element_mars at 6 columns per sample, plus 2 class masses per input node (10)
-    assert cc.bytes_per_sample == 4 * (6 * (pc.num_nodes + pc.num_elements) + 10 * 2)
+    # per sample: the sum node groups' blocks (2 x 6 + 2 x 3 + 2 x 3 + 1 x 1 = 25), the largest product layer
+    # (x1 * x2 and x3 * x4: 4 nodes x 6 = 24) and the input rows (2 dummy rows, then the 10 input nodes)
+    assert cc.input_range == (2, 12)
+    assert cc.bytes_per_sample == 4 * (25 + 24 + 12)
 
 
 def test_fragmented_scopes_are_refused_with_a_clear_message():
