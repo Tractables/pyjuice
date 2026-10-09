@@ -1,12 +1,12 @@
 """
 Validates the test-side reference for constrained marginals (the `reference` fixture in conftest.py),
 which the library's GPU implementation is tested against. Like the compiler, the reference handles
-Categorical leaves only, so every PC here has Categorical leaves. Checks:
+Categorical input nodes only, so every PC here has Categorical input nodes. Checks:
 
 * its parameters equal the node groups' own after `pc.update_parameters()`;
 * with the one-state constraint (anything goes) it reproduces `juice.queries.marginal` on every PC shape
   that compiles: HMMs (tied and untied), a 1-D PD, and a hand-built circuit with a three-child product,
-  a sum over leaves, prefix and interval scopes, node-level product edges and a sum over two products;
+  a sum over input nodes, prefix and interval scopes, node-level product edges and a sum over two products;
 * under real constraints it equals brute force -- the PC's own probabilities of every string, summed
   over the accepted ones consistent with the evidence -- including after an in-place parameter update;
 * its log-space block operations stay exact far outside exp's range.
@@ -30,7 +30,7 @@ def hand_built(V):
     x = [inputs(v, num_node_blocks = 2, block_size = 2, dist = dists.Categorical(num_cats = V)) for v in range(5)]
     s12 = summate(multiply(x[1], x[2]), num_node_blocks = 2, block_size = 2)          # interval [1, 2]
     s01 = summate(multiply(x[0], x[1]), num_node_blocks = 2, block_size = 2)          # prefix [0, 1]
-    s3 = summate(x[3], num_node_blocks = 2, block_size = 2)                           # a sum over leaves
+    s3 = summate(x[3], num_node_blocks = 2, block_size = 2)                           # a sum over input nodes
     p34 = multiply(s3, x[4], edge_ids = torch.tensor([[0, 3], [1, 2], [2, 1], [3, 0]]),
                    sparse_edges = True)                                               # node-level edges
     s34 = summate(p34, num_node_blocks = 2, block_size = 2)                           # suffix [3, 4]

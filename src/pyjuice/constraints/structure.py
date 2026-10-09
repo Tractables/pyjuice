@@ -156,7 +156,7 @@ def _shape(runs, num_vars) -> str:
 def _unsupported_reason(ns: CircuitNodes, kind: str) -> Optional[str]:
     if kind == "input":
         if len(ns.scope) > 1:
-            return f"input nodes over {len(ns.scope)} variables (only single-variable leaves are supported)"
+            return f"input nodes over {len(ns.scope)} variables (only single-variable input nodes are supported)"
         if not isinstance(ns.dist, Categorical):
             return f"input distribution {type(ns.dist).__name__} (only Categorical is supported)"
         return None

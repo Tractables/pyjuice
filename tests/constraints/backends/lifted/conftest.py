@@ -7,9 +7,10 @@ every (PC, constraint) pair that compiles. The library's own implementation is t
 exposed to the tests in this directory through the ``reference`` fixture (the test suite runs with
 ``--import-mode=importlib``, so test modules cannot import a helper module directly).
 
-LEAVES: CATEGORICAL ONLY. Like the first version of the compiler (which refuses every other input
-distribution), the reference only knows how to turn a Categorical leaf into per-token-class masses; any
-other leaf raises ``NotImplementedError``. Other distributions need their own class-mass rule here.
+INPUT NODES: CATEGORICAL ONLY. Like the first version of the compiler (which refuses every other input
+distribution), the reference only knows how to turn a Categorical input node into per-token-class
+masses; any other input node raises ``NotImplementedError``. Other distributions need their own
+class-mass rule here.
 
 PRECISION: float32, the precision the library runs at. Every log-space step is max-shifted, so the
 reference's own rounding stays around 1e-7 relative -- far below the tolerances it is compared at.
@@ -23,7 +24,7 @@ where ``i`` is a column at boundary ``a`` and ``j`` a column at boundary ``b + 1
 active automaton states, see :mod:`pyjuice.constraints.backends.lifted.plan`). Only active columns are
 kept: an accepted string of length ``n`` passes through active states only. Then
 
-* a leaf at variable ``t`` sums its token probabilities per token class, and class ``c`` moves column
+* an input node at variable ``t`` sums its token probabilities per token class, and class ``c`` moves column
   ``i`` to ``next_col[t, i, c]``;
 * a product chains its children's blocks in scope order (a matrix product per node and sample);
 * a sum takes its weighted sum over children, block by block;
@@ -119,11 +120,11 @@ def _evidence(data, missing_mask, n):
     return data.cpu().long(), missing
 
 
-def leaf_block(cc, ns, data, missing):
-    """[num_nodes, B, W_t, W_{t+1}] block of a leaf at variable t. CATEGORICAL LEAVES ONLY: the per-class
+def input_block(cc, ns, data, missing):
+    """[num_nodes, B, W_t, W_{t+1}] block of an input node at variable t. CATEGORICAL ONLY: the per-class
     masses below are sums of Categorical token probabilities."""
     if not isinstance(ns.dist, Categorical):
-        raise NotImplementedError(f"The reference supports Categorical leaves only, got {type(ns.dist).__name__} "
+        raise NotImplementedError(f"The reference supports Categorical input nodes only, got {type(ns.dist).__name__} "
                                   f"over variable {ns.scope.to_list()}.")
     layout, dev = cc.layout, cc.pc.params.device
     t = ns.scope.to_list()[0]
@@ -155,7 +156,7 @@ def leaf_block(cc, ns, data, missing):
 
 def reference_marginal(cc, data, missing_mask = None) -> torch.Tensor:
     """
-    log p(C, e) for every sample, in float32. The PC's leaves must be Categorical.
+    log p(C, e) for every sample, in float32. The PC's input nodes must be Categorical.
 
     :param cc: a compiled constraint
     :param data: [B, n] token ids (ignored where missing)
@@ -175,7 +176,7 @@ def reference_marginal(cc, data, missing_mask = None) -> torch.Tensor:
         info = cc.structure.node(ns)
         (a, b), = info.scope_runs
         if ns.is_input():
-            v = leaf_block(cc, ns, data, missing)
+            v = input_block(cc, ns, data, missing)
         elif ns.is_prod():
             order = sorted(range(len(ns.chs)), key = lambda k: cc.structure.node(ns.chs[k]).scope_runs[0][0])
             v = None
@@ -197,5 +198,5 @@ def reference():
     """The reference implementation (this module's functions), for tests in this directory."""
     import types
     return types.SimpleNamespace(marginal = reference_marginal, sum_weights = sum_weights,
-                                 categorical_probs = categorical_probs, leaf_block = leaf_block,
+                                 categorical_probs = categorical_probs, input_block = input_block,
                                  log_matmul = log_matmul, log_weighted_sum = log_weighted_sum)

@@ -11,12 +11,12 @@ def hmm(n, seed = 0):
     return juice.structures.HMM(seq_length = n, num_latents = 4, num_emits = 5)
 
 
-def fragmented_circuit(leaf_dist = None):
+def fragmented_circuit(input_dist = None):
     """root over {0,1,2,3} = sum(prod(sum(prod(x0, x2)), sum(prod(x1, x3)))): the inner scopes {0,2}
     and {1,3} each have two runs."""
     mk = lambda v, d = None: inputs(v, num_node_blocks = 1, block_size = 2,
                                     dist = d if d is not None else dists.Categorical(num_cats = 3))
-    x0, x1, x2, x3 = mk(0), mk(1, leaf_dist), mk(2), mk(3)
+    x0, x1, x2, x3 = mk(0), mk(1, input_dist), mk(2), mk(3)
     s02 = summate(multiply(x0, x2), num_node_blocks = 1, block_size = 2)
     s13 = summate(multiply(x1, x3), num_node_blocks = 1, block_size = 2)
     return summate(multiply(s02, s13), num_node_blocks = 1, block_size = 1)
@@ -81,7 +81,7 @@ def test_signature_ignores_parameters_but_not_structure():
 
 
 def test_unsupported_features_are_reported():
-    st = analyze_structure(fragmented_circuit(leaf_dist = dists.Gaussian(mu = 0.0, sigma = 1.0)))
+    st = analyze_structure(fragmented_circuit(input_dist = dists.Gaussian(mu = 0.0, sigma = 1.0)))
     assert len(st.unsupported) == 1
     ns, reason = st.unsupported[0]
     assert ns.is_input() and "Gaussian" in reason

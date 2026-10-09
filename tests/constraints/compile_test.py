@@ -18,12 +18,12 @@ def hmm(n, seed = 0):
     return juice.compile(juice.structures.HMM(seq_length = n, num_latents = 4, num_emits = V), verbose = False)
 
 
-def fragmented_circuit(leaf_dist = None):
+def fragmented_circuit(input_dist = None):
     """root over {0,1,2,3} = sum(prod(sum(prod(x0, x2)), sum(prod(x1, x3)))): the inner scopes {0,2}
     and {1,3} each have two runs."""
     mk = lambda v, d = None: inputs(v, num_node_blocks = 1, block_size = 2,
                                     dist = d if d is not None else dists.Categorical(num_cats = V))
-    x0, x1, x2, x3 = mk(0), mk(1, leaf_dist), mk(2), mk(3)
+    x0, x1, x2, x3 = mk(0), mk(1, input_dist), mk(2), mk(3)
     s02 = summate(multiply(x0, x2), num_node_blocks = 1, block_size = 2)
     s13 = summate(multiply(x1, x3), num_node_blocks = 1, block_size = 2)
     return juice.compile(summate(multiply(s02, s13), num_node_blocks = 1, block_size = 1), verbose = False)
@@ -76,7 +76,7 @@ def test_1d_pd_compiles_with_interval_scopes():
 
 def test_bytes_per_sample_on_a_hand_counted_circuit():
     # every group below has 2 nodes except the root (1):
-    #   leaves x0..x4                         -> C masses each
+    #   input nodes x0..x4                    -> C masses each
     #   prod(x1, x2), s12 over [1, 2]         -> interval, W^2
     #   prod(x0, s12), s02 over [0, 2]        -> prefix, W
     #   prod(x3, x4), s34 over [3, 4]         -> suffix, W
@@ -107,7 +107,7 @@ def test_fragmented_scopes_are_refused_with_a_clear_message():
     assert f"has {max_runs} separate runs" in msg and "index order 0..11" in msg
 
 
-def test_unsupported_leaves_are_refused():
+def test_unsupported_input_nodes_are_refused():
     pc = juice.compile(juice.structures.GeneralizedHMM(seq_length = 4, num_latents = 4, homogeneous = False,
                                                        input_dist = dists.Gaussian(mu = 0.0, sigma = 1.0)),
                        verbose = False)
@@ -126,7 +126,7 @@ def test_a_constraint_without_an_automaton_is_refused():
 
 
 def test_every_reason_is_reported_at_once():
-    msg = refusal(OnlyAccepts(V), fragmented_circuit(leaf_dist = dists.Gaussian(mu = 0.0, sigma = 1.0)))
+    msg = refusal(OnlyAccepts(V), fragmented_circuit(input_dist = dists.Gaussian(mu = 0.0, sigma = 1.0)))
     lines = [line for line in msg.splitlines() if line.startswith("  - ")]
     assert len(lines) == 3
     assert "no `automaton` capability" in lines[0]

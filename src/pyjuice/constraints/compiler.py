@@ -97,7 +97,7 @@ def _lifted_refusals(constraint: Constraint, structure: PCStructure) -> List[str
     for num_cats, vs in sorted(vars_by_cats.items()):
         if num_cats != constraint.vocab_size:
             reasons.append(f"vocabulary mismatch: the constraint reads tokens 0..{constraint.vocab_size - 1} "
-                           f"(vocab_size {constraint.vocab_size}), but the Categorical leaves over variables "
+                           f"(vocab_size {constraint.vocab_size}), but the Categorical input nodes over variables "
                            f"{_format_vars(vs)} have num_cats {num_cats}")
 
     fragmented = [info for info in structure.nodes if info.shape == "fragmented"]
