@@ -179,7 +179,12 @@ class SumNodes(CircuitNodes):
         """
         Set the sum node parameters.
 
-        :param params: parameters to be set
+        :param params: parameters to be set: one block per edge block, ``[num_edge_blocks, block_size,
+            ch_block_size]`` (or ``[num_edge_blocks]`` when both block sizes are 1), or a dense matrix,
+            ``[num_nodes, num_ch_nodes]`` or ``[num_node_blocks, num_ch_node_blocks, block_size,
+            ch_block_size]``. A dense matrix is read at the sum's edge blocks only (other entries have no
+            edge to go to), and an edge block listed k times gets 1/k of its value in every copy, so the
+            copies add up to it again, as in the forward pass and in ``get_params(as_matrix = True)``.
         :type params: Union[torch.Tensor,Dict]
 
         :param normalize: whether to normalize the parameters
@@ -200,23 +205,28 @@ class SumNodes(CircuitNodes):
 
             self._params = params.clone().view(-1, 1, 1)
 
-        elif params.dim() == 2:
-            ch_num_nblocks = sum([cs.num_node_blocks for cs in self.chs])
-            assert params.size(0) == self.num_nodes
-            assert params.size(1) == self.ch_block_size * ch_num_nblocks
-
-            self._params = params.reshape(self.num_node_blocks, self.block_size, ch_num_nblocks, self.ch_block_size).permute(0, 2, 1, 3).flatten(0, 1).contiguous()
-
         elif params.dim() == 3:
             assert self.edge_ids.size(1) == params.size(0) and self.block_size == params.size(1) and self.ch_block_size == params.size(2)
 
             self._params = params.clone()
 
-        elif params.dim() == 4:
-            assert params.size(0) == self.num_node_blocks and params.size(1) == self.num_ch_node_blocks and \
-                self.block_size == params.size(2) and self.ch_block_size == params.size(3)
+        elif params.dim() in (2, 4):
+            # A dense matrix, viewed as [num_node_blocks, num_ch_node_blocks, block_size, ch_block_size] and read
+            # at the edge blocks: reshaping it as if every block pair were an edge holds only for a fully
+            # connected sum whose edges are listed in that order
+            if params.dim() == 2:
+                assert params.size(0) == self.num_nodes
+                assert params.size(1) == self.ch_block_size * self.num_ch_node_blocks
 
-            self._params = params[self.edge_ids[0,:],self.edge_ids[1,:],:,:].clone().contiguous()
+                params = params.reshape(self.num_node_blocks, self.block_size, self.num_ch_node_blocks,
+                                        self.ch_block_size).permute(0, 2, 1, 3)
+            else:
+                assert params.size(0) == self.num_node_blocks and params.size(1) == self.num_ch_node_blocks and \
+                    self.block_size == params.size(2) and self.ch_block_size == params.size(3)
+
+            pair_ids = self.edge_ids[0,:] * self.num_ch_node_blocks + self.edge_ids[1,:]
+            copies = torch.bincount(pair_ids)[pair_ids]
+            self._params = (params[self.edge_ids[0,:],self.edge_ids[1,:],:,:] / copies[:,None,None]).contiguous()
 
         else:
             raise ValueError("Unsupported parameter input.")
