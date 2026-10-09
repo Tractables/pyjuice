@@ -188,16 +188,16 @@ def test_compiling_releases_the_pcs_activation_buffers():
 def test_the_pc_is_fixed_once_compiled():
     pc = hmm(6)                                                    # on the CPU
     cc = jc.compile(jc.DFA.contains([[1, 2]], vocab_size = V), pc)
+    x = torch.randint(0, V, (3, 6))
     with pytest.raises(AttributeError):
         cc.pc = hmm(6)                                             # switching PCs goes through `with_pc`
-    with pytest.raises(NotImplementedError):
-        cc.marginal()                                              # (queries are not implemented yet)
+    with pytest.raises(NotImplementedError, match = "CUDA only"):
+        cc.marginal(x)                                             # (the lifted backend needs a GPU)
     pc.to(torch.device("cuda:0"))                                  # the PC moved on its own
-    for query in (cc.marginal, cc.conditional, cc.sample, cc.decoder):
+    for query in (lambda: cc.marginal(x), cc.conditional, cc.sample, cc.decoder):
         with pytest.raises(RuntimeError, match = "moved from cpu to cuda:0 on its own.*cc.to"):
             query()
-    with pytest.raises(NotImplementedError):                       # recompiling (or with_pc) fixes it
-        cc.with_pc(pc).marginal()
+    assert cc.with_pc(pc).marginal(x).shape == (3, 1)              # recompiling (or with_pc) fixes it
 
 
 def test_to_moves_the_pc_and_the_tables_together():
@@ -207,8 +207,12 @@ def test_to_moves_the_pc_and_the_tables_together():
         want = torch.device(device)
         assert cc.pc.params.device.type == want.type
         assert all(t.device == cc.pc.params.device for layer in cc.product_rows for rows in layer.values() for t in rows)
-        with pytest.raises(NotImplementedError):                   # the guard passes: queries may run
-            cc.marginal()
+        x = torch.randint(0, V, (3, 6))
+        if want.type == "cuda":                                    # the guard passes: queries run
+            assert torch.isfinite(cc.marginal(x, torch.ones(6, dtype = torch.bool))).all()
+        else:
+            with pytest.raises(NotImplementedError, match = "CUDA only"):
+                cc.marginal(x)
 
 
 def test_the_plan_does_not_depend_on_parameters():

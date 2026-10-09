@@ -5,7 +5,7 @@ The result of :func:`pyjuice.constraints.compile`: a PC under a constraint, read
 from __future__ import annotations
 
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import torch
 
@@ -73,6 +73,7 @@ class ConstrainedCircuit:
         self.compile_time_s = compile_time_s
         self._storage = {}                          # buffer name -> backing storage (see `_buffers`)
         self._layouts = {}                          # batch size -> `buffer_layout` and its device tensors
+        self._program = None                        # the lifted forward's tables (see `_lifted_program`)
 
     @property
     def pc(self):
@@ -98,6 +99,7 @@ class ConstrainedCircuit:
         self.product_rows = [{pattern: tuple(t.to(device) for t in rows) for pattern, rows in layer.items()}
                              for layer in self.product_rows]
         self._storage, self._layouts = {}, {}       # the buffers are allocated again on the new device
+        self._program = None                        # and the forward's tables built again there
         self._device = device
         return self
 
@@ -137,6 +139,14 @@ class ConstrainedCircuit:
                     class_mars = node_mars[class_offset:class_offset + num_input_rows * self.num_classes].view(
                         num_input_rows, self.num_classes),
                     layout = layout)
+
+    def _lifted_program(self):
+        """The lifted forward's tables (:class:`~pyjuice.constraints.backends.lifted.forward.Program`), built on
+        the first query and kept until the circuit moves."""
+        if self._program is None:
+            from .backends.lifted.forward import Program
+            self._program = Program(self)
+        return self._program
 
     def _storage_view(self, name: str, numel: int) -> torch.Tensor:
         storage = self._storage.get(name)
@@ -249,10 +259,27 @@ class ConstrainedCircuit:
     # Queries
     # ---------------------------------------------------------------------------------------------
 
-    def marginal(self, *args, **kwargs):
-        """Probability of the constraint (and evidence). Not implemented yet."""
+    def marginal(self, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None,
+                 precision: str = "fp32") -> torch.Tensor:
+        """
+        ``log p(C, e)`` for every sample: the log-probability that the PC generates a string that satisfies the
+        constraint and agrees with the observed tokens.
+
+        :param data: [B, n] token ids (ignored where missing)
+        :type data: torch.Tensor
+
+        :param missing_mask: None (everything observed), [n] or [B, n]; True where a token is marginalized
+        :type missing_mask: Optional[torch.Tensor]
+
+        :param precision: "fp32" (the default; fp32-level accuracy) or "tf32" for the sum layers' matrix
+            products
+        :type precision: str
+
+        :returns: [B, number of root nodes], as :func:`pyjuice.queries.marginal`
+        """
         self._check_pc_unchanged()
-        raise NotImplementedError("`marginal` under a constraint is not implemented yet.")
+        from .backends.lifted.forward import marginal
+        return marginal(self, data, missing_mask, precision = precision)
 
     def conditional(self, *args, **kwargs):
         """Per-variable distributions given the constraint (and evidence). Not implemented yet."""
