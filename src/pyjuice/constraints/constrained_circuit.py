@@ -1,5 +1,5 @@
 """
-The result of :func:`pyjuice.constraints.compile`: a constraint bound to a PC, ready for queries.
+The result of :func:`pyjuice.constraints.compile`: a PC under a constraint, ready for queries.
 """
 
 from __future__ import annotations
@@ -14,9 +14,10 @@ from .structure import SHAPES, PCStructure, analyze_structure
 from .backends.lifted.plan import BoundaryLayout
 
 
-class CompiledConstraint:
+class ConstrainedCircuit:
     """
-    A constraint compiled against a PC. Queries under the constraint are its methods.
+    A PC under a constraint: the PC, the constraint, and everything compiled from the pair. Queries
+    under the constraint are its methods.
 
     Everything it holds besides the PC depends only on the constraint and the PC's STRUCTURE, never on
     parameter values or evidence, so it stays valid while the PC's parameters change (e.g. CoDD's
@@ -26,7 +27,7 @@ class CompiledConstraint:
     Created by :func:`pyjuice.constraints.compile`; not meant to be constructed directly.
 
     :ivar pc: the PC queries run on
-    :ivar constraint: the compiled constraint
+    :ivar constraint: the constraint
     :ivar structure: the PC's :class:`~pyjuice.constraints.structure.PCStructure`
     :ivar automaton: the constraint's automaton
     :ivar layout: the :class:`~pyjuice.constraints.backends.lifted.plan.BoundaryLayout` of the automaton
@@ -107,7 +108,7 @@ class CompiledConstraint:
         return 4 * total
 
     def info(self) -> Dict[str, Any]:
-        """A summary of the compiled constraint."""
+        """A summary of the constrained circuit."""
         return dict(backend = self.backend, exact = self.exact, n = self.n, satisfiable = self.satisfiable,
                     num_states = self.num_states, num_classes = self.num_classes, max_width = self.max_width,
                     width_per_boundary = self.width_per_boundary.tolist(), shape_counts = self.shape_counts,
@@ -115,14 +116,14 @@ class CompiledConstraint:
                     constraint = self.constraint.info())
 
     def __repr__(self) -> str:
-        return (f"CompiledConstraint(backend={self.backend}, n={self.n}, num_states={self.num_states}, "
+        return (f"ConstrainedCircuit(backend={self.backend}, n={self.n}, num_states={self.num_states}, "
                 f"max_width={self.max_width}, satisfiable={self.satisfiable})")
 
     # ---------------------------------------------------------------------------------------------
     # Rebinding
     # ---------------------------------------------------------------------------------------------
 
-    def with_pc(self, pc) -> "CompiledConstraint":
+    def with_pc(self, pc) -> "ConstrainedCircuit":
         """
         The same plan bound to another PC with the same structure (e.g. a drafter and a verifier, or a
         copy of the PC on another device). Only the PCs' structural signatures are compared; nothing is
@@ -137,10 +138,11 @@ class CompiledConstraint:
         _check_pc(pc)
         structure = analyze_structure(pc)
         if structure.signature != self.structure.signature:
-            raise ConstraintCompileError("Cannot rebind the compiled constraint: the new PC's structure differs "
-                                         "from the one it was compiled against. Compile it against the new PC "
-                                         "with `pyjuice.constraints.compile` instead.")
-        return CompiledConstraint(pc, self.constraint, structure, self.automaton, self.layout,
+            raise ConstraintCompileError("Cannot rebind the constrained circuit: the new PC's structure differs "
+                                         "from the one the constraint was compiled against. Compile the "
+                                         "constraint against the new PC with `pyjuice.constraints.compile` "
+                                         "instead.")
+        return ConstrainedCircuit(pc, self.constraint, structure, self.automaton, self.layout,
                                   compile_time_s = time.perf_counter() - t0)
 
     # ---------------------------------------------------------------------------------------------

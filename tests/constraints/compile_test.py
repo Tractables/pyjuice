@@ -51,7 +51,7 @@ def test_hmm_compiles_with_the_lifted_backend():
     c = jc.DFA.contains([[1, 2]], vocab_size = V)
     cc = jc.compile(c, pc)
 
-    assert isinstance(cc, jc.CompiledConstraint)
+    assert isinstance(cc, jc.ConstrainedCircuit)
     assert cc.pc is pc and cc.constraint is c and cc.structure is analyze_structure(pc)
     assert cc.backend == "lifted" and cc.exact and cc.n == n and cc.satisfiable
     assert cc.num_states == c.automaton().num_states and cc.num_classes == c.automaton().num_classes

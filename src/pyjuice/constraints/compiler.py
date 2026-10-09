@@ -17,7 +17,7 @@ from pyjuice.nodes.distributions import Categorical
 from .language.base import Constraint
 from .structure import PCStructure, _runs, analyze_structure
 from .backends.lifted.plan import build_layout
-from .compiled import CompiledConstraint
+from .constrained_circuit import ConstrainedCircuit
 
 
 #: Backends :func:`compile` knows.
@@ -28,7 +28,7 @@ class ConstraintCompileError(ValueError):
     """Raised when a constraint cannot be compiled against a PC. The message lists every reason."""
 
 
-def compile(constraint: Constraint, pc: TensorCircuit, backend: Optional[str] = None) -> CompiledConstraint:
+def compile(constraint: Constraint, pc: TensorCircuit, backend: Optional[str] = None) -> ConstrainedCircuit:
     """
     Compile ``constraint`` against ``pc`` for constrained queries.
 
@@ -61,7 +61,7 @@ def compile(constraint: Constraint, pc: TensorCircuit, backend: Optional[str] = 
 
     automaton = constraint.automaton()
     layout = build_layout(automaton, structure.num_vars)
-    return CompiledConstraint(pc, constraint, structure, automaton, layout,
+    return ConstrainedCircuit(pc, constraint, structure, automaton, layout,
                               compile_time_s = time.perf_counter() - t0)
 
 

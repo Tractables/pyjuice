@@ -2,7 +2,7 @@
 A slow but obviously correct reference for constrained queries on the lifted plan, for tests only.
 
 ``reference_marginal(cc, data, missing_mask)`` computes ``log p(C, e)`` for a
-:class:`~pyjuice.constraints.CompiledConstraint` in plain PyTorch, straight from the definition, for
+:class:`~pyjuice.constraints.ConstrainedCircuit` in plain PyTorch, straight from the definition, for
 every (PC, constraint) pair that compiles. The library's own implementation is tested against it; it is
 exposed to the tests in this directory through the ``reference`` fixture (the test suite runs with
 ``--import-mode=importlib``, so test modules cannot import a helper module directly).
@@ -158,7 +158,7 @@ def reference_marginal(cc, data, missing_mask = None) -> torch.Tensor:
     """
     log p(C, e) for every sample, in float32. The PC's input nodes must be Categorical.
 
-    :param cc: a compiled constraint
+    :param cc: a constrained circuit
     :param data: [B, n] token ids (ignored where missing)
     :param missing_mask: None (everything observed), [n] or [B, n]; True = marginalized
     :returns: [B, num_root_nodes]
