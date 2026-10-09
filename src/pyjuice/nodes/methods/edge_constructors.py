@@ -41,11 +41,11 @@ def block_diagonal_edge_constructor(ns0, *args, num_node_blocks: int = 0, block_
 
 def block_sparse_rnd_blk_edge_constructor(ns0, *args, num_node_blocks: int = 0, block_size: int = 0, num_chs_per_block: int = 0, **kwargs):
     """
-    An edge constructor that connects every sum node block to `num_chs_per_block` randomly chosen child
-    node blocks, yielding a block-sparse (rather than fully-connected) sum layer. It is meant to be
-    passed as the `edge_ids` argument of :func:`~pyjuice.summate`, and is useful for building large,
-    sparsely-connected PCs. When enough edges are requested, every child block is guaranteed to be
-    connected at least once.
+    An edge constructor that connects every sum node block to `num_chs_per_block` randomly chosen,
+    distinct child node blocks (all of them, if there are fewer), yielding a block-sparse (rather than
+    fully-connected) sum layer. It is meant to be passed as the `edge_ids` argument of
+    :func:`~pyjuice.summate`, and is useful for building large, sparsely-connected PCs. When enough edges
+    are requested, every child block is guaranteed to be connected at least once.
 
     :param ns0: the first child node group; additional child node groups are passed as positional arguments
     :type ns0: CircuitNodes
@@ -69,22 +69,20 @@ def block_sparse_rnd_blk_edge_constructor(ns0, *args, num_node_blocks: int = 0, 
         assert isinstance(ns, CircuitNodes)
         ch_num_node_blocks += ns.num_node_blocks
 
+    # A sum block cannot connect to the same child block twice (the second edge would only add the same
+    # child's mass again), so it connects to at most every child block once
+    num_chs_per_block = min(num_chs_per_block, ch_num_node_blocks)
     total_edges_needed = num_node_blocks * num_chs_per_block
 
     if total_edges_needed >= ch_num_node_blocks:
-        guaranteed = torch.randperm(ch_num_node_blocks)
-        remaining_count = total_edges_needed - ch_num_node_blocks
-        
-        # Fill the rest with random indices
-        if remaining_count > 0:
-            extra = torch.randint(0, ch_num_node_blocks, (remaining_count,))
-            chs_indices = torch.cat([guaranteed, extra])
-        else:
-            chs_indices = guaranteed
-            
-        # Shuffle again so the "guaranteed" ones aren't always the first neighbors
-        chs_indices = chs_indices[torch.randperm(total_edges_needed)]
-        
+        # Every child block goes into one random slot, so each is connected at least once; the other slots
+        # of a sum block take its smallest random scores among the child blocks it does not have yet. The
+        # forced child blocks are distinct, so no sum block gets the same child block twice.
+        scores = torch.rand(num_node_blocks, ch_num_node_blocks)
+        slots = torch.randperm(total_edges_needed)[:ch_num_node_blocks]
+        scores[slots // num_chs_per_block, torch.randperm(ch_num_node_blocks)] = -1.0
+        chs_indices = torch.topk(scores, num_chs_per_block, dim = 1, largest = False).indices.reshape(-1)
+
     else:
         # Fallback: If we have fewer slots than children, we can't select everyone.
         # We just select a random subset without replacement.
