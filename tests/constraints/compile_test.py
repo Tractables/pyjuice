@@ -168,6 +168,21 @@ def test_with_pc_rebinds_to_the_same_structure_only():
         cc.with_pc(pb.root_ns)
 
 
+def test_compiling_releases_the_pcs_activation_buffers():
+    pc = hmm(6).to(torch.device("cuda:0"))
+    x = torch.randint(0, V, (4, 6), device = pc.device)
+    pc.init_param_flows(flows_memory = 0.0)
+    lls = pc(x).clone()
+    pc.backward(x, allow_modify_flows = False)
+    param_flows = pc.param_flows.clone()
+    cc = jc.compile(jc.DFA.contains([[1, 2]], vocab_size = V), pc)
+    assert not hasattr(pc, "node_mars") and not hasattr(pc, "element_flows")
+    assert torch.equal(pc.param_flows, param_flows)                 # EM statistics are kept
+    assert torch.equal(pc(x), lls)                                  # the PC still works on its own
+    cc.with_pc(pc)                                                  # rebinding releases them again
+    assert not hasattr(pc, "node_mars")
+
+
 def test_the_pc_is_fixed_once_compiled():
     pc = hmm(6)                                                    # on the CPU
     cc = jc.compile(jc.DFA.contains([[1, 2]], vocab_size = V), pc)
@@ -175,12 +190,23 @@ def test_the_pc_is_fixed_once_compiled():
         cc.pc = hmm(6)                                             # switching PCs goes through `with_pc`
     with pytest.raises(NotImplementedError):
         cc.marginal()                                              # (queries are not implemented yet)
-    pc.to(torch.device("cuda:0"))
+    pc.to(torch.device("cuda:0"))                                  # the PC moved on its own
     for query in (cc.marginal, cc.conditional, cc.sample, cc.decoder):
-        with pytest.raises(RuntimeError, match = "moved from cpu to cuda:0 .* Compile the constraint again"):
+        with pytest.raises(RuntimeError, match = "moved from cpu to cuda:0 on its own.*cc.to"):
             query()
     with pytest.raises(NotImplementedError):                       # recompiling (or with_pc) fixes it
         cc.with_pc(pc).marginal()
+
+
+def test_to_moves_the_pc_and_the_tables_together():
+    cc = jc.compile(jc.DFA.contains([[1, 2]], vocab_size = V), hmm(6))
+    for device in (torch.device("cuda:0"), torch.device("cpu"), "cuda:0"):
+        assert cc.to(device) is cc
+        want = torch.device(device)
+        assert cc.pc.params.device.type == want.type
+        assert all(t.device == cc.pc.params.device for layer in cc.product_rows for rows in layer.values() for t in rows)
+        with pytest.raises(NotImplementedError):                   # the guard passes: queries may run
+            cc.marginal()
 
 
 def test_the_plan_does_not_depend_on_parameters():

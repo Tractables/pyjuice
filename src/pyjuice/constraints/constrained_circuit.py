@@ -21,9 +21,14 @@ class ConstrainedCircuit:
 
     Everything it holds besides the PC depends only on the constraint and the PC's STRUCTURE, never on
     parameter values or evidence, so it stays valid while the PC's parameters change (e.g. CoDD's
-    external parameters at every step). The PC itself is fixed: :attr:`pc` cannot be reassigned, and
-    once the PC has been moved to another device every query raises -- compile again, or use
-    :meth:`with_pc` to put the same constraint on another PC with the same structure.
+    external parameters at every step). The PC itself is fixed: :attr:`pc` cannot be reassigned
+    (:meth:`with_pc` puts the same constraint on another PC with the same structure), and it moves to
+    another device together with everything compiled from the pair, through :meth:`to`. A PC moved on its
+    own makes every query raise.
+
+    Constrained queries run in buffers of their own, laid out for the lifted plan, so creating a
+    constrained circuit releases the PC's activation buffers (:meth:`TensorCircuit.free_activation_buffers`;
+    its parameter flows are kept). The PC allocates them again on its next own pass.
 
     Created by :func:`pyjuice.constraints.compile`; not meant to be constructed directly.
 
@@ -50,6 +55,7 @@ class ConstrainedCircuit:
                  layout: BoundaryLayout, tables: Dict[str, Any], compile_time_s: float):
         self._pc = pc
         self._device = pc.params.device             # where the tables live
+        pc.free_activation_buffers()                # constrained queries use buffers of their own
         self.constraint = constraint
         self.structure = structure
         self.automaton = automaton
@@ -66,10 +72,25 @@ class ConstrainedCircuit:
         return self._pc
 
     def _check_pc_unchanged(self):
-        """Refuse a query on a PC that moved since compiling (one attribute comparison per query)."""
+        """Refuse a query on a PC that moved on its own (one attribute comparison per query)."""
         if self._pc.params.device != self._device:
-            raise RuntimeError(f"The PC moved from {self._device} to {self._pc.params.device} after the constraint "
-                               f"was compiled against it. Compile the constraint again, or use `with_pc`.")
+            raise RuntimeError(f"The PC moved from {self._device} to {self._pc.params.device} on its own, but the "
+                               f"constrained circuit's tables are still on {self._device}. Move both with "
+                               f"`cc.to(device)`, or compile the constraint again.")
+
+    def to(self, device) -> "ConstrainedCircuit":
+        """
+        Move the PC and everything compiled from the pair to ``device`` (in place, like
+        :meth:`TensorCircuit.to`), and return this constrained circuit.
+
+        :param device: an int ordinal, a string such as ``"cuda:1"`` or ``"cpu"``, or a ``torch.device``
+        """
+        self._pc.to(device)
+        device = self._pc.params.device
+        self.product_rows = [{pattern: tuple(t.to(device) for t in rows) for pattern, rows in layer.items()}
+                             for layer in self.product_rows]
+        self._device = device
+        return self
 
     # ---------------------------------------------------------------------------------------------
     # Report
