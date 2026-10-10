@@ -34,11 +34,21 @@ DENSE_MIN_BLOCK = 64
 
 
 @triton.jit
+def _lse_dot_step(m, acc, x, w, PRECISION: tl.constexpr):
+    """One chunk of children of the online log-sum-exp: ``x`` [children, columns] in log space, ``w`` [nodes,
+    children] the weights."""
+    m_new = tl.maximum(m, tl.max(x, axis = 0))
+    scale = tl.where(m_new == float("-inf"), 1.0, tl.exp(m - m_new))
+    shift = tl.where(m_new == float("-inf"), 0.0, m_new)
+    return m_new, acc * scale[None, :] + tl.dot(w, tl.exp(x - shift[None, :]), input_precision = PRECISION)
+
+
+@triton.jit
 def _lifted_sum_kernel(node_mars, element_mars, weights, nids, cids, pids, nb_reg,
-                       reg_offset, reg_width, reg_first, reg_slots,
-                       elem_first, elem_width, B, num_edges, num_mtiles,
-                       BS: tl.constexpr, TILE_M: tl.constexpr, TILE_E: tl.constexpr, TILE_B: tl.constexpr,
-                       PRECISION: tl.constexpr):
+                       reg_offset, reg_width, reg_first, reg_slots, a_rows, a_regs, a_pids,
+                       elem_first, elem_width, B, num_edges, num_alias, num_mtiles,
+                       BS: tl.constexpr, TILE_M: tl.constexpr, TILE_E: tl.constexpr, TILE_A: tl.constexpr,
+                       TILE_B: tl.constexpr, PRECISION: tl.constexpr, ALIAS: tl.constexpr):
     pid_nm = tl.program_id(0)                                     # (node block, tile of its nodes)
     pid_c = tl.program_id(1)                                      # tile of columns
     pid_n = pid_nm // num_mtiles
@@ -63,11 +73,24 @@ def _lifted_sum_kernel(node_mars, element_mars, weights, nids, cids, pids, nb_re
                         mask = valid[:, None] & cmask[None, :], other = float("-inf"))           # [TILE_E, TILE_B]
             w = tl.load(weights + pid[None, :] + offs_m[:, None],
                         mask = mmask[:, None] & valid[None, :], other = 0.0)                    # [TILE_M, TILE_E]
-            m_new = tl.maximum(m, tl.max(x, axis = 0))
-            scale = tl.where(m_new == float("-inf"), 1.0, tl.exp(m - m_new))
-            shift = tl.where(m_new == float("-inf"), 0.0, m_new)
-            acc = acc * scale[None, :] + tl.dot(w, tl.exp(x - shift[None, :]), input_precision = PRECISION)
-            m = m_new
+            m, acc = _lse_dot_step(m, acc, x, w, PRECISION)
+        if ALIAS:
+            # children that copy a sum: read in the sum's own row (row a_rows within region a_regs)
+            for a0 in range(0, num_alias, TILE_A):
+                offs_a = a0 + tl.arange(0, TILE_A)
+                amask = offs_a < num_alias
+                row = tl.load(a_rows + pid_n * num_alias + offs_a, mask = amask, other = -1)
+                areg = tl.load(a_regs + pid_n * num_alias + offs_a, mask = amask, other = 0)
+                pid = tl.load(a_pids + pid_n * num_alias + offs_a, mask = amask, other = 0).to(tl.int64)
+                valid = amask & (row >= 0)
+                base = tl.load(reg_offset + areg, mask = valid, other = 0) + \
+                    row.to(tl.int64) * tl.load(reg_width + areg, mask = valid, other = 0)
+                base = tl.multiple_of(base, 16)                       # regions start and rows are padded to 16 floats
+                x = tl.load(node_mars + base[:, None] + cols[None, :], mask = valid[:, None] & cmask[None, :],
+                            other = float("-inf"))                                             # [TILE_A, TILE_B]
+                w = tl.load(weights + pid[None, :] + offs_m[:, None],
+                            mask = mmask[:, None] & valid[None, :], other = 0.0)                # [TILE_M, TILE_A]
+                m, acc = _lse_dot_step(m, acc, x, w, PRECISION)
         out = tl.log(acc) + tl.where(m == float("-inf"), 0.0, m)[None, :]
         nid = tl.load(nids + pid_n).to(tl.int64)
         width = tl.load(reg_width + reg)
@@ -78,7 +101,7 @@ def _lifted_sum_kernel(node_mars, element_mars, weights, nids, cids, pids, nb_re
 
 def fused_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor, nids: torch.Tensor,
               cids: torch.Tensor, pids: torch.Tensor, nb_reg: torch.Tensor, regions: dict, elem_first: int,
-              elem_width: int, batch_size: int, block_size: int, max_cols: int, precision: str):
+              elem_width: int, batch_size: int, block_size: int, max_cols: int, precision: str, aliased = None):
     """
     Node blocks of a sum layer partition with the fused Triton kernel, into ``node_mars``.
 
@@ -87,6 +110,9 @@ def fused_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch
     :param regions: ``offset``, ``width``, ``first`` and ``slots`` of every sum region, as device tensors
     :param elem_first, elem_width: the first row and row width of the product layer group's region
     :param max_cols: the most columns any of the node blocks has (``batch_size`` x its slots)
+    :param aliased: None, or the node blocks' children that copy a sum and are read in the sum's own row:
+        ``(rows, regions, pids)``, each [num node blocks, num aliased] int32 (``rows`` within the region, ``-1`` for
+        padding; ``pids`` as for ``cids``)
     """
     num_blocks, num_edges = cids.shape
     tm, te, tb, warps, stages = _TILES[precision]
@@ -94,12 +120,16 @@ def fused_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch
     TILE_E = min(te, max(16, triton.next_power_of_2(num_edges)))
     TILE_B = min(tb, max(16, triton.next_power_of_2(max_cols)))
     num_mtiles = triton.cdiv(block_size, TILE_M)
+    a_rows, a_regs, a_pids = aliased if aliased is not None else (cids, cids, cids)
+    num_alias = a_rows.size(1) if aliased is not None else 0
+    TILE_A = min(te, max(16, triton.next_power_of_2(num_alias)))
     grid = (num_blocks * num_mtiles, triton.cdiv(max_cols, TILE_B))
     _lifted_sum_kernel[grid](node_mars, element_mars, params, nids, cids, pids, nb_reg,
-                             regions["offset"], regions["width"], regions["first"], regions["slots"],
-                             elem_first, elem_width, batch_size, num_edges, num_mtiles,
-                             BS = block_size, TILE_M = TILE_M, TILE_E = TILE_E, TILE_B = TILE_B,
-                             PRECISION = precision, num_warps = warps, num_stages = stages)
+                             regions["offset"], regions["width"], regions["first"], regions["slots"], a_rows,
+                             a_regs, a_pids, elem_first, elem_width, batch_size, num_edges, num_alias, num_mtiles,
+                             BS = block_size, TILE_M = TILE_M, TILE_E = TILE_E, TILE_A = TILE_A, TILE_B = TILE_B,
+                             PRECISION = precision, ALIAS = aliased is not None, num_warps = warps,
+                             num_stages = stages)
 
 
 # -------------------------------------------------------------------------------------------------

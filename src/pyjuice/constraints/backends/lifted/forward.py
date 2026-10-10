@@ -30,6 +30,9 @@ from .plan import Reachability, _align
 #: Matrix-product precision of the kernels: "fp32" (three TF32 products, fp32-level accuracy) or "tf32".
 PRECISIONS = {"fp32": "tf32x3", "tf32": "tf32"}
 
+#: Read a one-child product over a sum straight from the sum's row instead of copying its block (see Program)
+ALIAS_COPIES = True
+
 
 class Program:
     """Everything the lifted forward pass of one constrained circuit reads besides buffers and parameters."""
@@ -80,7 +83,7 @@ class Program:
                             rest_regs = [regs[k] for k in rest.tolist()]
                             fused = (nids[rest].contiguous(), cids[rest].contiguous(), pids[rest].contiguous(),
                                      torch.tensor(rest_regs, dtype = torch.long, device = dev),
-                                     max(slots_of_reg[r] for r in rest_regs))
+                                     max(slots_of_reg[r] for r in rest_regs), None)
                         parts.append((dense, cids.size(1), fused))
                     layers.append((layer.block_size, parts))
                 self.steps.append(("sum", prod_index, layers))
@@ -88,6 +91,40 @@ class Program:
         root_first, root_end = pc._root_node_range
         self.root_region = region_of(root_first)
         self.root_rows = (root_first, root_end)
+
+        # a one-child product over a sum is a copy of the sum's block: the sum layer that reads it reads the sum's
+        # row instead, unless a dense node block reads it -- the dense path needs its children's rows contiguous --
+        # and the copy is not made. ``alias`` records, per product layer group, every element row's (row within its
+        # sum region, region), row -1 where the element is not aliased; the fused sum parts carry their aliased
+        # children as a separate edge list
+        self.alias = {}
+        for k in range(len(self.steps) - 1) if ALIAS_COPIES else ():
+            kind, prod_index, layers = self.steps[k]
+            if kind != "prod" or self.steps[k + 1][:2] != ("sum", prod_index):
+                continue
+            first, end, _ = cc.element_regions[prod_index]
+            dense_rows = {c0 + e for _, parts in self.steps[k + 1][2] for dense, E, _ in parts
+                          for (_, c0) in dense for e in range(E)}
+            alias_row = torch.full((end - first,), -1, dtype = torch.int32)
+            alias_reg = torch.zeros(end - first, dtype = torch.int32)
+            for stages, _, _ in layers:
+                for launches in stages:
+                    for li, (form, kinds, steps, E, X) in enumerate(launches):
+                        if form != "copy" or kinds != (SUM, False):
+                            continue
+                        st = steps.cpu().long()
+                        keep = torch.tensor([int(o) in dense_rows for o in st[:, 0].tolist()], dtype = torch.bool)
+                        regs = st[~keep, 2]
+                        alias_row[st[~keep, 0] - first] = (st[~keep, 1] - torch.tensor(firsts)[regs]).to(torch.int32)
+                        alias_reg[st[~keep, 0] - first] = regs.to(torch.int32)
+                        launches[li] = (form, kinds, st[keep].to(dev, torch.int32).contiguous(), E, X)
+                    launches[:] = [l for l in launches if l[0] != "copy" or l[2].size(0) > 0]
+            if (alias_row >= 0).any():
+                self.alias[prod_index] = (alias_row, alias_reg)
+                for _, parts in self.steps[k + 1][2]:
+                    for pi, (dense, E, fused) in enumerate(parts):
+                        if fused is not None:
+                            parts[pi] = (dense, E, _split_aliased(fused, alias_row, alias_reg, first, dev))
 
         # which (output tile, shared chunk) pairs every block @ block step can skip: one mask per boundary triple,
         # each step's launch carrying its triple's index
@@ -196,6 +233,32 @@ class Program:
         return out, temps[0], temps[1]
 
 
+def _split_aliased(fused, alias_row, alias_reg, elem_first: int, dev):
+    """A fused sum part's edges split in two: the children read in element_mars (left-packed, padded with element
+    row 0, below every region) and the children that copy a sum, read in the sum's own row."""
+    nids, cids, pids, nb_reg, max_slots, _ = fused
+    c, p = cids.cpu().long(), pids.cpu().long()
+    inside = c >= elem_first
+    row = torch.where(inside, alias_row[(c - elem_first).clamp(min = 0, max = alias_row.numel() - 1)].long(), -1)
+    is_alias = inside & (row >= 0)
+    if not is_alias.any():
+        return fused
+
+    def pack(keep, *cols, pad):
+        order = torch.argsort((~keep).to(torch.int8), dim = 1, stable = True)
+        k = max(1, int(keep.sum(dim = 1).max()))                       # never an empty table
+        out = []
+        for col, v in zip(cols, pad):
+            g = torch.gather(col, 1, order)[:, :k]
+            out.append(torch.where(torch.gather(keep, 1, order)[:, :k], g, torch.full_like(g, v)))
+        return [t.to(dev, torch.int32).contiguous() for t in out]
+
+    reg = torch.where(is_alias, alias_reg[(c - elem_first).clamp(min = 0, max = alias_row.numel() - 1)].long(), 0)
+    ce, pe = pack(~is_alias, c, p, pad = (0, 0))
+    ar, ag, ap = pack(is_alias, row, reg, p, pad = (-1, 0, 0))
+    return nids, ce, pe, nb_reg, max_slots, (ar, ag, ap)
+
+
 def _missing(missing_mask: Optional[torch.Tensor], B: int, n: int, dev) -> torch.Tensor:
     if missing_mask is None:
         return torch.zeros(B, n, dtype = torch.bool, device = dev)
@@ -266,9 +329,10 @@ def marginal(cc, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None
                             dense_sum(node_mars, element_mars, pc.params, {c0: blocks}, num_edges, block_size, region,
                                       elem_first, elem_width, B * prog.slots[r], dot)
                         if fused is not None:
-                            nids, cids, pids, nb_reg, max_slots = fused
+                            nids, cids, pids, nb_reg, max_slots, aliased = fused
                             fused_sum(node_mars, element_mars, pc.params, nids, cids, pids, nb_reg, regions, elem_first,
-                                      elem_width, B, block_size, max_cols = B * max_slots, precision = dot)
+                                      elem_width, B, block_size, max_cols = B * max_slots, precision = dot,
+                                      aliased = aliased)
 
         r = prog.root_region
         base = lay["sum_offsets"][r] + (root_first - cc.sum_regions[r][0]) * lay["sum_widths"][r]

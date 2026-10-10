@@ -162,3 +162,50 @@ def test_skipping_empty_tiles_changes_nothing(build_pc, monkeypatch):
     with_skip = cc.marginal(data, missing)
     monkeypatch.setattr(prod, "SKIP_EMPTY_TILES", False)
     assert_close(with_skip, cc.marginal(data, missing), n)
+
+
+def marginal_with_aliasing(cc, on, data, missing, monkeypatch):
+    """The marginal with copies of sums aliased or materialized (the Program is rebuilt either way)."""
+    import pyjuice.constraints.backends.lifted.forward as F
+    monkeypatch.setattr(F, "ALIAS_COPIES", on)
+    cc._program = None
+    return cc.marginal(data, missing), cc._lifted_program()
+
+
+def copy_launches(prog):
+    return [steps for k, _, layers in prog.steps if k == "prod" for stages, _, _ in layers
+            for launches in stages for form, _, steps, _, _ in launches if form == "copy"]
+
+
+@pytest.mark.parametrize("kind", list(KINDS))
+def test_aliased_copies_give_the_materialized_marginal(kind, sum_path, build_pc, monkeypatch):
+    """A sum layer reading a copied sum's row in place of the copy reads the same numbers (its aliased children
+    are mixed after the others, so up to the accumulation order)."""
+    n = KINDS[kind]
+    cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
+    data, missing = evidence(n, 3)
+    copied, _ = marginal_with_aliasing(cc, False, data, missing, monkeypatch)
+    aliased, prog = marginal_with_aliasing(cc, True, data, missing, monkeypatch)
+    assert_close(aliased, copied, n)
+    # a dense node block reads its children as one run of rows: none of them may be aliased
+    for k, (kind_, prod_index, layers) in enumerate(prog.steps[:-1]):
+        if kind_ == "prod" and prod_index in prog.alias:
+            alias_row = prog.alias[prod_index][0].cpu()
+            first = cc.element_regions[prod_index][0]
+            for _, parts in prog.steps[k + 1][2]:
+                for dense, E, _ in parts:
+                    for (_, c0) in dense:
+                        assert (alias_row[c0 - first:c0 - first + E] < 0).all()
+
+
+def test_copies_of_sums_are_not_materialized(build_pc, monkeypatch):
+    """On a PD (small node blocks: the fused sum path) every copy of a sum is aliased and no copy is launched."""
+    n = KINDS["pd"]
+    cc = jc.compile(CONSTRAINTS["contains"](), build_pc("pd", n, V))
+    data, missing = evidence(n, 2)
+    _, prog = marginal_with_aliasing(cc, False, data, missing, monkeypatch)
+    copies = sum(st.size(0) for st in copy_launches(prog))
+    assert copies > 0 and not prog.alias
+    _, prog = marginal_with_aliasing(cc, True, data, missing, monkeypatch)
+    assert copy_launches(prog) == []
+    assert sum(int((a >= 0).sum()) for a, _ in prog.alias.values()) == copies
