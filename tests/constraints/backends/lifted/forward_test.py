@@ -164,6 +164,31 @@ def test_skipping_empty_tiles_changes_nothing(build_pc, monkeypatch):
     assert_close(with_skip, cc.marginal(data, missing), n)
 
 
+@pytest.mark.parametrize("kind", ["hmm", "pd", "hand_left"])
+def test_kernels_launch_past_the_grid_limits(kind, sum_path, build_pc, monkeypatch):
+    """With CUDA's grid limits lowered to 3 programs on the first axis and 2 on the others, every kernel whose
+    program count grows with the batch or the automaton is launched in several parts: the same marginal, bit for
+    bit. A wide automaton gives each of them far more work than that (an HMM: input @ block; a PD: block
+    @ block; hand_left: block @ input; the dense path keeps copies). The buffers are filled with NaN before each
+    call, so a slot left unwritten shows instead of keeping the previous call's value."""
+    from pyjuice.constraints.backends.lifted.kernels import prod
+    rng = random.Random(0)
+    K, n = 48, KINDS[kind]
+    dfa = jc.DFA.from_dense(V, [[rng.randrange(K) for _ in range(V)] for _ in range(K)], 0, rng.sample(range(K), 12))
+    cc = jc.compile(dfa, build_pc(kind, n, V))
+    data, missing = evidence(n, 4)
+
+    def marginal():
+        bufs = cc._buffers(data.size(0))
+        bufs["node_mars"].fill_(float("nan"))
+        bufs["element_mars"].fill_(float("nan"))
+        return cc.marginal(data, missing)
+
+    want = marginal()
+    monkeypatch.setattr(prod, "MAX_GRID", (3, 2))
+    assert torch.equal(marginal(), want)
+
+
 def marginal_with_aliasing(cc, on, data, missing, monkeypatch):
     """The marginal with copies of sums aliased or materialized (the Program is rebuilt either way)."""
     import pyjuice.constraints.backends.lifted.forward as F

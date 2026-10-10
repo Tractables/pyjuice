@@ -25,6 +25,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .prod import grid_chunks
+
 #: The fused kernel's tiles (TILE_M, TILE_E, TILE_B, num_warps, num_stages) per product precision, from a sweep on
 #: a 4096-state HMM layer (4 x 1024 nodes, 4096 children) at 69 to 8832 columns.
 _TILES = {"tf32": (128, 32, 128, 8, 3), "tf32x3": (64, 32, 64, 4, 3), "bf16x3": (64, 32, 64, 4, 3)}
@@ -47,11 +49,11 @@ def _lse_dot_step(m, acc, x, w, PRECISION: tl.constexpr):
 @triton.jit
 def _lifted_sum_kernel(node_mars, element_mars, weights, nids, cids, pids, nb_reg,
                        reg_offset, reg_width, reg_first, reg_slots, a_rows, a_regs, a_pids,
-                       elem_first, elem_width, B, num_edges, num_alias, num_mtiles,
+                       elem_first, elem_width, B, num_edges, num_alias, num_mtiles, pid0,
                        BS: tl.constexpr, TILE_M: tl.constexpr, TILE_E: tl.constexpr, TILE_A: tl.constexpr,
                        TILE_B: tl.constexpr, PRECISION: tl.constexpr, ALIAS: tl.constexpr):
     pid_nm = tl.program_id(0)                                     # (node block, tile of its nodes)
-    pid_c = tl.program_id(1)                                      # tile of columns
+    pid_c = pid0 + tl.program_id(1)                               # tile of columns
     pid_n = pid_nm // num_mtiles
     mt = pid_nm % num_mtiles
     reg = tl.load(nb_reg + pid_n)
@@ -124,13 +126,13 @@ def fused_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch
     a_rows, a_regs, a_pids = aliased if aliased is not None else (cids, cids, cids)
     num_alias = a_rows.size(1) if aliased is not None else 0
     TILE_A = min(te, max(16, triton.next_power_of_2(num_alias)))
-    grid = (num_blocks * num_mtiles, triton.cdiv(max_cols, TILE_B))
-    _lifted_sum_kernel[grid](node_mars, element_mars, params, nids, cids, pids, nb_reg,
-                             regions["offset"], regions["width"], regions["first"], regions["slots"], a_rows,
-                             a_regs, a_pids, elem_first, elem_width, batch_size, num_edges, num_alias, num_mtiles,
-                             BS = block_size, TILE_M = TILE_M, TILE_E = TILE_E, TILE_A = TILE_A, TILE_B = TILE_B,
-                             PRECISION = precision, ALIAS = aliased is not None, num_warps = warps,
-                             num_stages = stages)
+    for first, size in grid_chunks(triton.cdiv(max_cols, TILE_B), 1):
+        _lifted_sum_kernel[(num_blocks * num_mtiles, size)](
+            node_mars, element_mars, params, nids, cids, pids, nb_reg, regions["offset"], regions["width"],
+            regions["first"], regions["slots"], a_rows, a_regs, a_pids, elem_first, elem_width, batch_size, num_edges,
+            num_alias, num_mtiles, first, BS = block_size, TILE_M = TILE_M, TILE_E = TILE_E, TILE_A = TILE_A,
+            TILE_B = TILE_B, PRECISION = precision, ALIAS = aliased is not None, num_warps = warps,
+            num_stages = stages)
 
 
 # -------------------------------------------------------------------------------------------------

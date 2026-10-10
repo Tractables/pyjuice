@@ -35,6 +35,16 @@ from ..plan import Reachability, _tile_any
 #: operand kinds: a sum node's block in ``node_mars``, an intermediate block in scratch, the identity
 SUM, TEMP, IDENTITY = 0, 1, 2
 
+#: CUDA's limit on the programs along a grid's first axis, and along each of the others
+MAX_GRID = (2 ** 31 - 1, 65535)
+
+
+def grid_chunks(count: int, axis: int):
+    """``(first, size)`` of every launch that ``count`` programs along grid ``axis`` take: one launch, unless the
+    count passes CUDA's limit there (each kernel adds ``first`` to its program id on that axis)."""
+    limit = MAX_GRID[axis]
+    return [(first, min(limit, count - first)) for first in range(0, count, limit)]
+
 #: fields of a step, per contraction (int32 rows of the step tables the Program builds)
 INPUT_BLOCK_FIELDS = ("out", "u", "t", "r_row", "r_reg", "t2")             # input u at t, then block over [t+1, t2)
 BLOCK_INPUT_FIELDS = ("out", "l_row", "l_reg", "t0", "u", "t")             # block over [t0, t), then input u at t
@@ -83,13 +93,13 @@ def _lse_value(m, acc):
 @triton.jit
 def _input_block_kernel(element_mars, node_mars, temp, input_mars, class_mars, obs_class, next_col, width, steps,
                         reg_offset, reg_width, reg_first, out_first, out_width, temp_width,
-                        B, n, W, C, input_start,
+                        B, n, W, C, input_start, pid0,
                         R_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, TILE: tl.constexpr):
     """One program per step and tile of its whole output, flattened (sample, entry column, exit column): with the
     samples' blocks contiguous, a step's output is one run of columns, and the lanes stay full whatever the
     widths."""
     s = tl.program_id(0)
-    tile = tl.program_id(1)
+    tile = pid0 + tl.program_id(1)
     out_row = tl.load(steps + s * 6 + 0)
     u = tl.load(steps + s * 6 + 1).to(tl.int64)
     t = tl.load(steps + s * 6 + 2)
@@ -141,11 +151,11 @@ def _input_block_kernel(element_mars, node_mars, temp, input_mars, class_mars, o
 @triton.jit
 def _block_input_kernel(element_mars, node_mars, temp, input_mars, class_mars, obs_class, width,
                         pred_ptr, pred_q, pred_c, steps, reg_offset, reg_width, reg_first, out_first, out_width,
-                        temp_width, B, n, W, C, input_start, X_MAX,
+                        temp_width, B, n, W, C, input_start, X_MAX, pid0,
                         L_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, TILE: tl.constexpr):
     """One program per (step, sample, exit column) and tile of entry columns: a log-sum over the exit column's
     predecessors (the same list for every lane)."""
-    pid = tl.program_id(0)
+    pid = pid0 + tl.program_id(0)
     s = pid // (B * X_MAX)
     r = pid % (B * X_MAX)
     b = (r // X_MAX).to(tl.int64)
@@ -236,13 +246,13 @@ def _block_block_tile(lp, rp, mb, i, j, ti, tj, E, M, X, TILES_I, TILES_J, WORDS
 
 @triton.jit
 def _block_block_kernel(element_mars, node_mars, temp, width, steps, triples, skip_bits, reg_offset, reg_width,
-                        reg_first, out_first, out_width, temp_width, B, n, TILES_I, TILES_J, WORDS,
+                        reg_first, out_first, out_width, temp_width, B, n, TILES_I, TILES_J, WORDS, pid0,
                         L_KIND: tl.constexpr, R_KIND: tl.constexpr, OUT_TEMP: tl.constexpr,
                         TM: tl.constexpr, TN: tl.constexpr, TK: tl.constexpr, SUB_I: tl.constexpr,
                         SUB_J: tl.constexpr, SKIP: tl.constexpr, PRECISION: tl.constexpr):
     """One program per (step, sample), every output tile in turn: the sample's two blocks are contiguous and stay
     in L1 across the tiles."""
-    pid = tl.program_id(0)
+    pid = pid0 + tl.program_id(0)
     s = pid // B
     b = (pid % B).to(tl.int64)
     out_row = tl.load(steps + s * 8 + 0)
@@ -271,9 +281,10 @@ def _block_block_kernel(element_mars, node_mars, temp, width, steps, triples, sk
 
 @triton.jit
 def _copy_kernel(element_mars, node_mars, temp, width, steps, reg_offset, reg_width, reg_first, out_first,
-                 out_width, temp_width, B, n, L_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, TILE: tl.constexpr):
+                 out_width, temp_width, B, n, pid0, L_KIND: tl.constexpr, OUT_TEMP: tl.constexpr,
+                 TILE: tl.constexpr):
     s = tl.program_id(0)
-    pid = tl.program_id(1)
+    pid = pid0 + tl.program_id(1)
     out_row = tl.load(steps + s * 5 + 0)
     t0 = tl.load(steps + s * 5 + 3)
     t2 = tl.load(steps + s * 5 + 4)
@@ -412,32 +423,37 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, input_mar
             if form == "input_block":
                 r_kind, out_temp = kinds
                 tile = min(512, max(128, triton.next_power_of_2(B * E_max * X_max) // 8))
-                _input_block_kernel[(S, triton.cdiv(B * E_max * X_max, tile))](
-                    element_mars, node_mars, temp, input_mars, class_mars, obs_class, prog.next_col, prog.width_t,
-                    steps, B = B, n = n, W = W, C = C, input_start = prog.input_start, R_KIND = r_kind,
-                    OUT_TEMP = out_temp, TILE = tile, num_warps = 4, **common)
+                for first, size in grid_chunks(triton.cdiv(B * E_max * X_max, tile), 1):
+                    _input_block_kernel[(S, size)](
+                        element_mars, node_mars, temp, input_mars, class_mars, obs_class, prog.next_col,
+                        prog.width_t, steps, B = B, n = n, W = W, C = C, input_start = prog.input_start, pid0 = first,
+                        R_KIND = r_kind, OUT_TEMP = out_temp, TILE = tile, num_warps = 4, **common)
             elif form == "block_input":
                 l_kind, out_temp = kinds
                 tile = _tile(E_max)
-                _block_input_kernel[(S * B * X_max, triton.cdiv(E_max, tile))](
-                    element_mars, node_mars, temp, input_mars, class_mars, obs_class, prog.width_t,
-                    prog.pred_ptr, prog.pred_q, prog.pred_c, steps, B = B, n = n, W = W, C = C,
-                    input_start = prog.input_start, X_MAX = X_max, L_KIND = l_kind, OUT_TEMP = out_temp, TILE = tile,
-                    num_warps = 4, **common)
+                for first, size in grid_chunks(S * B * X_max, 0):
+                    _block_input_kernel[(size, triton.cdiv(E_max, tile))](
+                        element_mars, node_mars, temp, input_mars, class_mars, obs_class, prog.width_t,
+                        prog.pred_ptr, prog.pred_q, prog.pred_c, steps, B = B, n = n, W = W, C = C,
+                        input_start = prog.input_start, X_MAX = X_max, pid0 = first, L_KIND = l_kind,
+                        OUT_TEMP = out_temp, TILE = tile, num_warps = 4, **common)
             elif form == "block_block":
                 l_kind, r_kind, out_temp = kinds
                 steps, triples = steps
                 cfg, skip = BLOCK_BLOCK_TILES, prog.skip
                 assert cfg["TK"] == skip.tk and cfg["TM"] % skip.tm == 0 and cfg["TN"] % skip.tn == 0
-                _block_block_kernel[(steps.size(0) * B,)](
-                    element_mars, node_mars, temp, prog.width_t, steps, triples, skip.bits, B = B, n = n,
-                    TILES_I = skip.tiles_i, TILES_J = skip.tiles_j, WORDS = skip.words, L_KIND = l_kind,
-                    R_KIND = r_kind, OUT_TEMP = out_temp, TM = cfg["TM"], TN = cfg["TN"], TK = cfg["TK"],
-                    SUB_I = cfg["TM"] // skip.tm, SUB_J = cfg["TN"] // skip.tn, SKIP = SKIP_EMPTY_TILES,
-                    PRECISION = PRODUCT_PRECISION, num_warps = cfg["warps"], num_stages = 1, **common)
+                for first, size in grid_chunks(S * B, 0):
+                    _block_block_kernel[(size,)](
+                        element_mars, node_mars, temp, prog.width_t, steps, triples, skip.bits, B = B, n = n,
+                        TILES_I = skip.tiles_i, TILES_J = skip.tiles_j, WORDS = skip.words, pid0 = first,
+                        L_KIND = l_kind, R_KIND = r_kind, OUT_TEMP = out_temp, TM = cfg["TM"], TN = cfg["TN"],
+                        TK = cfg["TK"], SUB_I = cfg["TM"] // skip.tm, SUB_J = cfg["TN"] // skip.tn,
+                        SKIP = SKIP_EMPTY_TILES, PRECISION = PRODUCT_PRECISION, num_warps = cfg["warps"],
+                        num_stages = 1, **common)
             else:                                                            # "copy"
                 l_kind, out_temp = kinds
                 tile = _tile(E_max * X_max * B)
-                _copy_kernel[(S, triton.cdiv(E_max * X_max * B, tile))](
-                    element_mars, node_mars, temp, prog.width_t, steps, B = B, n = n, L_KIND = l_kind,
-                    OUT_TEMP = out_temp, TILE = tile, num_warps = 4, **common)
+                for first, size in grid_chunks(triton.cdiv(E_max * X_max * B, tile), 1):
+                    _copy_kernel[(S, size)](
+                        element_mars, node_mars, temp, prog.width_t, steps, B = B, n = n, pid0 = first,
+                        L_KIND = l_kind, OUT_TEMP = out_temp, TILE = tile, num_warps = 4, **common)
