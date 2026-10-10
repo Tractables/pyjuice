@@ -14,7 +14,9 @@ paths:
   maximum and exponentiated once (one pass), multiplied by cuBLAS, and the log taken and the maximum added back
   (one pass over the product, in place). In fp32 this is cuBLAS's exact fp32
   product (measured faster than pyjuice's own sum layer at every batch size on a 4096-state HMM, with ~100x
-  smaller error);
+  smaller error). Node blocks that read the same children from consecutive rows can instead multiply their
+  weights stacked into one ``[K * BS, E]`` matrix (:func:`stacked_weights`, a copy) in one product;
+  :mod:`..forward` decides when the copy pays for itself;
 * every other node block runs the fused Triton kernel: an online log-sum-exp over chunks of children, with
   the products on tensor cores. Padded edges point at pyjuice's dummy element rows, which lie below the
   product layer group's region, and are skipped.
@@ -239,9 +241,24 @@ def _log_scatter_kernel(out, prod, m, rank, rows, ncols, ld, num_live, num_ctile
              mask = mask)
 
 
+def stacked_weights(params: torch.Tensor, p0s, E: int, block_size: int) -> torch.Tensor:
+    """``[K * block_size, E]``: the weights of K dense node blocks over the same ``E`` children (node block ``k``'s
+    ``[E, block_size]`` matrix at ``params[p0s[k]]``), transposed and stacked in the order of ``p0s`` -- a copy, as
+    the blocks' matrices are not one strided view of the parameter buffer."""
+    return torch.cat([params[p0:p0 + E * block_size].view(E, block_size).t() for p0 in p0s], dim = 0)
+
+
+def _products(blocks, params, E, BS, stacked):
+    """``(weights [rows, E], first node row)`` of every matrix product of a run of node blocks: one with their
+    ``stacked`` weights (the blocks then occupy consecutive rows), else one per block, read in place."""
+    if stacked is not None:
+        return [(stacked, blocks[0][1])]
+    return [(params[p0:p0 + E * BS].view(E, BS).t(), nid) for _, nid, p0 in blocks]
+
+
 def dense_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor, groups: dict, E: int,
               block_size: int, region: tuple, elem_first: int, elem_width: int, ncols: int, precision: str,
-              live = None):
+              live = None, stacked: dict = None):
     """
     Dense node blocks of one sum region (see :func:`dense_groups`), into ``node_mars``: per run of children,
     ``log(W_k @ exp(X - m)) + m`` with ``m`` the column maximum of the children ``X``.
@@ -249,15 +266,18 @@ def dense_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch
     :param region: ``(offset, width, first)`` of the node blocks' sum region (Python ints)
     :param live: None (every column), or the region's interval's ``(perm, rank, num_live)`` (see
         :meth:`~.live.Pruning.segment`): the live columns are gathered and multiplied, the others set to -inf
+    :param stacked: first child row -> the :func:`stacked_weights` of that run's node blocks, which occupy
+        consecutive rows in the order listed: one product for the run instead of one per block
     """
     offset, width, first = region
     BS = block_size
+    stacked = stacked or {}
     elems = element_mars[:element_mars.numel() // elem_width * elem_width].view(-1, elem_width)
     nodes = node_mars[offset:offset + (node_mars.numel() - offset) // width * width].view(-1, width)
     TILE_R, TILE_C = _EW_TILE
     num_ctiles = triton.cdiv(ncols, TILE_C)
     if live is not None:
-        _dense_sum_live(nodes, elems, params, groups, E, BS, first, elem_first, ncols, precision, live)
+        _dense_sum_live(nodes, elems, params, groups, E, BS, first, elem_first, ncols, precision, live, stacked)
         return
     with _matmul_precision(precision):
         for c0, blocks in groups.items():
@@ -266,15 +286,15 @@ def dense_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch
             ex = torch.empty(E, ncols, dtype = x.dtype, device = x.device)
             _shifted_exp_kernel[(triton.cdiv(E, TILE_R) * num_ctiles,)](x, ex, m, E, ncols, elem_width, num_ctiles,
                                                                        TILE_R = TILE_R, TILE_C = TILE_C)
-            for _, nid, p0 in blocks:
-                w = params[p0:p0 + E * BS].view(E, BS).t()                         # [BS, E], in place
-                out = nodes[nid - first:nid - first + BS, :ncols]
+            for w, nid in _products(blocks, params, E, BS, stacked.get(c0)):
+                rows = w.size(0)
+                out = nodes[nid - first:nid - first + rows, :ncols]
                 torch.mm(w, ex, out = out)
-                _log_add_kernel[(triton.cdiv(BS, TILE_R) * num_ctiles,)](out, m, BS, ncols, width, num_ctiles,
-                                                                        TILE_R = TILE_R, TILE_C = TILE_C)
+                _log_add_kernel[(triton.cdiv(rows, TILE_R) * num_ctiles,)](out, m, rows, ncols, width, num_ctiles,
+                                                                          TILE_R = TILE_R, TILE_C = TILE_C)
 
 
-def _dense_sum_live(nodes, elems, params, groups, E, BS, first, elem_first, ncols, precision, live):
+def _dense_sum_live(nodes, elems, params, groups, E, BS, first, elem_first, ncols, precision, live, stacked):
     perm, rank, num_live = live
     width = nodes.size(1)
     TILE_R, TILE_C = _EW_TILE
@@ -286,10 +306,10 @@ def _dense_sum_live(nodes, elems, params, groups, E, BS, first, elem_first, ncol
             if num_live > 0:
                 _shifted_exp_kernel[(triton.cdiv(E, TILE_R) * live_tiles,)](x, x, m, E, num_live, num_live, live_tiles,
                                                                            TILE_R = TILE_R, TILE_C = TILE_C)
-            for _, nid, p0 in blocks:
-                w = params[p0:p0 + E * BS].view(E, BS).t()                         # [BS, E], in place
-                prod = torch.mm(w, x)                                              # [BS, live]
+            for w, nid in _products(blocks, params, E, BS, stacked.get(c0)):
+                rows = w.size(0)
+                prod = torch.mm(w, x)                                              # [rows, live]
                 num_ctiles = triton.cdiv(ncols, TILE_C)
-                _log_scatter_kernel[(triton.cdiv(BS, TILE_R) * num_ctiles,)](
-                    nodes[nid - first:nid - first + BS], prod, m, rank, BS, ncols, width, num_live, num_ctiles,
+                _log_scatter_kernel[(triton.cdiv(rows, TILE_R) * num_ctiles,)](
+                    nodes[nid - first:nid - first + rows], prod, m, rank, rows, ncols, width, num_live, num_ctiles,
                     TILE_R = TILE_R, TILE_C = TILE_C)

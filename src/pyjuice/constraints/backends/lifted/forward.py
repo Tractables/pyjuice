@@ -25,7 +25,7 @@ from .kernels.prod import IDENTITY, SUM, TEMP, max_successors, skip_masks, trans
 from .kernels.prod import transition_tables
 from .kernels.prod import run_products as products
 from .kernels.live import prune
-from .kernels.sum import dense_groups, dense_sum, fused_sum
+from .kernels.sum import dense_groups, dense_sum, fused_sum, stacked_weights
 from .plan import _align, interval_tables
 
 #: Matrix-product precision of the kernels: "fp32" (three TF32 products, fp32-level accuracy) or "tf32".
@@ -46,6 +46,14 @@ GROUP_MIN_RATIO = 8
 #: (batch x slots); below, its product reads the weights whatever the columns, and pruning gains nothing but costs
 #: the host the live columns' count (a synchronization). Either is exact.
 DENSE_PRUNE_MIN_COLUMNS = 256
+
+#: Dense node blocks over the same children multiply their stacked weights in one product (see
+#: :func:`~.kernels.sum.stacked_weights`) only up to this many columns per precision (the live ones under evidence
+#: pruning); wider, one product per block. From an HMM4096 sweep (4 x 1024 rows) and lifted marginals on ex1-ex4 and
+#: 13.8k- / 49k-state automata: stacked wins in TF32 at every width (x1.04-1.46) but loses 1% at 49k columns; in fp32
+#: it wins up to ~2k (x1.1-1.3) and loses 1-3% wider (cuBLAS's fp32 kernel for the 4096-row shape, and the log pass
+#: no longer finding a block's product in L2).
+STACK_MAX_COLUMNS = {"fp32": 2048, "tf32": 16384}
 
 #: Floats of transition masses (see :func:`~.kernels.prod.transition_masses`) held at once: when every input step's
 #: fit, they are all kept, built once per computation of the class masses; else built launch by launch, in chunks
@@ -93,6 +101,7 @@ class Program:
         self.live_tables = {}                                          # batch size -> evidence pruning's lists
 
         self.steps = []
+        self.stack_uses = {}                                           # stack key -> dense runs reading it per query
         prod_index = -1
         prod_layers = iter(cc.product_rows)
         for lg in pc.inner_layer_groups:
@@ -112,6 +121,13 @@ class Program:
                         for c0, blocks in groups.items():
                             for k, nid, p0 in blocks:
                                 dense.setdefault((regs[k], c0), []).append((k, nid, p0))
+                        E = cids.size(1)
+                        for rc, blocks in dense.items():                # and the key of their stacked weights
+                            blocks.sort(key = lambda b: b[1])
+                            key = _stack_key(blocks, E, layer.block_size)
+                            dense[rc] = (blocks, key)
+                            if key is not None:
+                                self.stack_uses[key] = self.stack_uses.get(key, 0) + 1
                         fused = None
                         if rest.numel() > 0:
                             rest_regs = [regs[k] for k in rest.tolist()]
@@ -355,6 +371,15 @@ def _intervals(steps) -> set:
     return out
 
 
+def _stack_key(blocks, E: int, block_size: int):
+    """The key of a dense run's :func:`~.kernels.sum.stacked_weights` -- ``(E, block size, first weights in row
+    order)`` -- when two or more node blocks occupy consecutive rows (one product can write them all), else None."""
+    nids = [nid for _, nid, _ in blocks]
+    if len(blocks) < 2 or any(b - a != block_size for a, b in zip(nids, nids[1:])):
+        return None
+    return (E, block_size, tuple(p0 for _, _, p0 in blocks))
+
+
 def _split_aliased(fused, alias_row, alias_reg, elem_first: int, dev):
     """A fused sum part's edges split in two: the children read in element_mars (left-packed, padded with element
     row 0, below every region) and the children that copy a sum, read in the sum's own row."""
@@ -435,6 +460,7 @@ def marginal(cc, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None
             layer(x.permute(1, 0), input_mars, missing_mask = missing)
         class_mars = cc._class_masses()
         prog.transitions(class_mars, cc._class_mars_version)
+        stacks, kept = cc._weight_stacks()
 
         for kind, prod_index, layers in prog.steps:
             elem_first = cc.element_regions[prod_index][0]
@@ -450,15 +476,22 @@ def marginal(cc, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None
             else:
                 for block_size, parts in layers:
                     for dense, num_edges, fused in parts:
-                        for (r, c0), blocks in dense.items():
+                        for (r, c0), (blocks, key) in dense.items():
                             region = (lay["sum_offsets"][r], lay["sum_widths"][r], prog.firsts[r])
                             ncols = B * prog.slots[r]
                             cols = None                                  # every column live
                             if pruning is not None and ncols >= DENSE_PRUNE_MIN_COLUMNS and \
                                     pruning.num_live[prog.reg_iv_host[r]] < ncols:
                                 cols = pruning.segment(prog.reg_iv_host[r], ncols)
+                            stacked = None                  # stacked if narrow enough and the copy is kept or reused
+                            width = cols[2] if cols is not None else ncols                # the product's columns
+                            if key is not None and width <= STACK_MAX_COLUMNS[precision] and \
+                                    (kept or prog.stack_uses[key] > 1):
+                                if key not in stacks:
+                                    stacks[key] = stacked_weights(pc.params, key[2], num_edges, block_size)
+                                stacked = {c0: stacks[key]}
                             dense_sum(node_mars, element_mars, pc.params, {c0: blocks}, num_edges, block_size, region,
-                                      elem_first, elem_width, ncols, dot, live = cols)
+                                      elem_first, elem_width, ncols, dot, live = cols, stacked = stacked)
                         if fused is not None:
                             nids, cids, pids, nb_reg, max_slots, aliased = fused
                             fused_sum(node_mars, element_mars, pc.params, nids, cids, pids, nb_reg, regions, elem_first,

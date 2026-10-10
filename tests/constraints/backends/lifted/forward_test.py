@@ -6,6 +6,7 @@ node-level product edges, an edge block listed twice, block size 1). Also: the o
 pyjuice's own marginal, an unsatisfiable constraint or evidence that breaks the constraint gives -inf, and
 TF32 products stay close to the fp32 default.
 """
+import math
 import random
 
 import pytest
@@ -244,6 +245,112 @@ def test_fast_inference_keeps_the_class_masses(kind, build_pc, reference, monkey
     assert (updated - want)[torch.isfinite(want)].abs().max() > 1e-2
     assert_close(cc.marginal(data, missing), updated, n)
     assert len(calls) == 4 * per_query and len(builds) == 4
+
+
+def blocks_hmm(n, tied, seed):
+    """An HMM whose 128 latents are two node blocks of 64 per position (dense at the library's own threshold): every
+    transition is a run of two node blocks over the same children."""
+    torch.manual_seed(seed)
+    ns = juice.structures.HMM(seq_length = n, num_latents = 128, num_emits = V, homogeneous = tied, block_size = 64)
+    ns.init_parameters(perturbation = 2.0)
+    return juice.compile(ns, verbose = False).to("cuda:0")
+
+
+def stack_keys(cc):
+    """The stack key of every dense run the forward multiplies (None where its node blocks cannot be stacked)."""
+    return [key for kind, _, layers in cc._lifted_program().steps if kind == "sum" for _, parts in layers
+            for dense, _, _ in parts for _, key in dense.values()]
+
+
+def spy_dense_sums(monkeypatch):
+    """Record, per dense_sum call of the forward, whether it got stacked weights and live columns; and count the
+    stacked weights built."""
+    import pyjuice.constraints.backends.lifted.forward as F
+    calls, builds = [], []
+    dense_sum, stacked_weights = F.dense_sum, F.stacked_weights
+    monkeypatch.setattr(F, "dense_sum", lambda *a, **k: calls.append((k["stacked"] is not None, k["live"] is not None))
+                        or dense_sum(*a, **k))
+    monkeypatch.setattr(F, "stacked_weights", lambda *a: builds.append(1) or stacked_weights(*a))
+    return calls, builds
+
+
+@pytest.mark.parametrize("dense_pruning", [False, True])
+@pytest.mark.parametrize("tied", [True, False])
+def test_stacked_dense_weights(tied, dense_pruning, reference, monkeypatch):
+    """Dense node blocks over the same children multiply their stacked weights in one product. Outside
+    pyjuice.fast_inference a query stacks only the weights it reads more than once (an HMM's tied transitions),
+    copying each once; inside a scope every run is stacked, by the first query, and kept until the scope exits --
+    an in-place parameter update after it is read. The marginal matches the reference throughout, on all columns
+    and on the live ones only (evidence pruning)."""
+    import pyjuice.constraints.backends.lifted.forward as F
+    if dense_pruning:
+        monkeypatch.setattr(F, "DENSE_PRUNE_MIN_COLUMNS", 0)              # the live-column path at these sizes
+    n = 6
+    pc, other = blocks_hmm(n, tied, seed = 0), blocks_hmm(n, tied, seed = 1)
+    cc = jc.compile(CONSTRAINTS["contains"](), pc)
+    data, missing = evidence(n, 4)
+    keys = [key for key in stack_keys(cc) if key is not None]
+    assert len(keys) == n - 1 and len(set(keys)) == (1 if tied else n - 1)       # one run per transition
+    calls, builds = spy_dense_sums(monkeypatch)
+    stacked = lambda: sum(s for s, _ in calls)
+
+    want = reference.marginal(cc, data, missing)
+    for _ in range(2):
+        assert_close(cc.marginal(data, missing), want, n)
+    assert any(p for _, p in calls) == dense_pruning
+    assert stacked() == (2 * len(keys) if tied else 0) and len(builds) == (2 if tied else 0)
+    calls.clear(), builds.clear()
+    with juice.fast_inference():
+        for _ in range(2):
+            assert_close(cc.marginal(data, missing), want, n)
+    assert stacked() == 2 * len(keys) and len(builds) == len(set(keys))      # built by the first query only
+    assert cc._kept_stacks is None                                            # and dropped when the scope exits
+
+    calls.clear(), builds.clear()
+    with torch.no_grad():                                                     # an in-place update after the scope
+        pc.params.copy_(other.params)
+        for layer, src in zip(pc.input_layer_group, other.input_layer_group):
+            layer.params.copy_(src.params)
+    updated = reference.marginal(cc, data, missing)
+    assert (updated - want)[torch.isfinite(want)].abs().max() > 1e-2
+    assert_close(cc.marginal(data, missing), updated, n)
+    assert len(builds) == (1 if tied else 0)
+
+
+@pytest.mark.parametrize("dense_pruning", [False, True])
+def test_wide_products_are_not_stacked(dense_pruning, reference, monkeypatch):
+    """A product wider than STACK_MAX_COLUMNS (here every one) runs one product per block, inside a
+    pyjuice.fast_inference scope too, and copies no weights."""
+    import pyjuice.constraints.backends.lifted.forward as F
+    if dense_pruning:
+        monkeypatch.setattr(F, "DENSE_PRUNE_MIN_COLUMNS", 0)
+    monkeypatch.setattr(F, "STACK_MAX_COLUMNS", {"fp32": -1, "tf32": -1})
+    n = 6
+    cc = jc.compile(CONSTRAINTS["contains"](), blocks_hmm(n, tied = True, seed = 0))
+    data, missing = evidence(n, 4)
+    calls, builds = spy_dense_sums(monkeypatch)
+    want = reference.marginal(cc, data, missing)
+    assert_close(cc.marginal(data, missing), want, n)
+    with juice.fast_inference():
+        assert_close(cc.marginal(data, missing), want, n)
+    assert calls and not any(s for s, _ in calls) and not builds
+
+
+@pytest.mark.parametrize("dense_pruning", [False, True])
+def test_the_stacked_weights_are_what_is_multiplied(dense_pruning, monkeypatch):
+    """Doubling every stacked copy (and nothing else) doubles the sums of every stacked run: every path of the HMM
+    crosses each transition once, so the marginal moves by log 2 per run -- the product reads the copy."""
+    import pyjuice.constraints.backends.lifted.forward as F
+    if dense_pruning:
+        monkeypatch.setattr(F, "DENSE_PRUNE_MIN_COLUMNS", 0)
+    n = 6
+    cc = jc.compile(CONSTRAINTS["contains"](), blocks_hmm(n, tied = True, seed = 0))
+    data, missing = evidence(n, 4)
+    want = cc.marginal(data, missing)
+    stacked_weights = F.stacked_weights
+    monkeypatch.setattr(F, "stacked_weights", lambda *a: 2 * stacked_weights(*a))
+    runs = sum(key is not None for key in stack_keys(cc))
+    assert_close(cc.marginal(data, missing), want + runs * math.log(2), n)
 
 
 def test_transition_masses_match_brute_force(build_pc, monkeypatch):

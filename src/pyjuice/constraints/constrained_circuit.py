@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional
 
 import torch
 
-from pyjuice.utils.fast_inference import is_active, register_layer
+from pyjuice.utils.fast_inference import is_active, param_copies_allowed, register_layer
 
 from .distributions import TokenClasses, lookup
 from .language.base import Constraint
@@ -37,7 +37,10 @@ class ConstrainedCircuit:
 
     The input nodes' token-class masses depend only on the parameters, so inside :func:`pyjuice.fast_inference`
     (whose contract is that parameters do not change) they are computed by the first query and kept until the
-    scope exits; outside it, every query computes them.
+    scope exits; outside it, every query computes them. Likewise the stacked weights of dense sum node blocks
+    that read the same children (one matrix product instead of one per block, on products narrow enough for it to
+    pay): inside a scope that allows parameter copies, each is copied once and kept until the scope exits; outside
+    it, a query copies only the weights it reads more than once (tied ones) and drops them when it returns.
 
     Created by :func:`pyjuice.constraints.compile`; not meant to be constructed directly.
 
@@ -91,6 +94,7 @@ class ConstrainedCircuit:
         self._class_mars = None                     # the input nodes' class masses (see `_class_masses`)
         self._class_mars_kept = False               # kept by a `pyjuice.fast_inference` scope
         self._class_mars_version = 0                # counts their computations (what is derived from them follows)
+        self._kept_stacks = None                    # stacked dense weights kept by a scope (see `_weight_stacks`)
 
     @property
     def pc(self):
@@ -117,6 +121,7 @@ class ConstrainedCircuit:
         self.token_classes = self.token_classes.to(device)
         self._storage, self._layouts = {}, {}       # the buffers are allocated again on the new device
         self._class_rows, self._class_mars, self._class_mars_kept = None, None, False
+        self._kept_stacks = None
         self._program = None                        # and the forward's tables built again there
         self._device = device
         return self
@@ -192,10 +197,29 @@ class ConstrainedCircuit:
             register_layer(self)                                # its exit calls `_release_fast_inference_params`
         return self._class_mars
 
+    def _weight_stacks(self):
+        """
+        ``(stacks, kept)``: where a query finds and leaves the stacked weights of its dense sum node blocks
+        (stack key -> :func:`~pyjuice.constraints.backends.lifted.kernels.sum.stacked_weights`, see
+        :meth:`~pyjuice.constraints.backends.lifted.forward.Program`), and whether they outlive the query. Inside a
+        :func:`pyjuice.fast_inference` scope that allows parameter copies, the scope's: kept until it exits, so the
+        query stacks every run it can (see ``STACK_MAX_COLUMNS`` there); else an empty dict of the query's own, which
+        stacks only reused weights.
+        """
+        if self._kept_stacks is not None:
+            return self._kept_stacks, True
+        if param_copies_allowed():
+            self._kept_stacks = {}
+            register_layer(self)                                    # its exit calls `_release_fast_inference_params`
+            return self._kept_stacks, True
+        return {}, False
+
     def _release_fast_inference_params(self, poison: bool = False):
-        """The :func:`pyjuice.fast_inference` scope that kept the class masses exited: parameters may change from
-        now on (``poison``: fill the released masses with NaN, as the scope does for its layers' copies)."""
+        """The :func:`pyjuice.fast_inference` scope that kept the class masses or the stacked weights exited:
+        parameters may change from now on (``poison``: fill the released masses with NaN, as the scope does for its
+        layers' copies; the stacked weights are dropped)."""
         self._class_mars_kept = False
+        self._kept_stacks = None
         if poison and self._class_mars is not None:
             self._class_mars.fill_(float("nan"))
 
