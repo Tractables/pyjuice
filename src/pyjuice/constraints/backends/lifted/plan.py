@@ -323,9 +323,10 @@ def buffer_layout(input_range, sum_regions, element_regions, batch_size: int) ->
 
     ``node_mars`` holds, one region after the other, each starting on an :data:`ALIGN` boundary:
 
-    * the input region: rows ``0 .. input_end`` (pyjuice's own row numbers, so that an input layer writes it
-      as it writes a :class:`TensorCircuit`'s ``node_mars``), ``batch_size`` columns, the log-probability of
-      every observed token;
+    * the input region, at offset 0: rows ``0 .. input_end`` (pyjuice's own row numbers, so that an input layer
+      writes it as it writes a :class:`TensorCircuit`'s ``node_mars``, and a kernel reads input row ``u`` of sample
+      ``b`` at ``node_mars[u * batch_size + b]``), ``batch_size`` columns, the log-probability of every observed
+      token;
     * one region per sum node group: its rows, ``align(batch_size * slots)`` columns, sample-major (slot ``s``
       of sample ``b`` in column ``b * slots + s``: every sample's block is contiguous).
 

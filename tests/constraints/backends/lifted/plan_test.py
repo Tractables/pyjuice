@@ -6,7 +6,7 @@ import torch
 
 import pyjuice as juice
 import pyjuice.constraints as jc
-from pyjuice.constraints.backends.lifted.kernels.prod import skip_masks
+from pyjuice.constraints.backends.lifted.kernels.prod import max_successors, skip_masks, transition_tables
 from pyjuice.constraints.backends.lifted.plan import Reachability, _tile_any, build_layout
 
 
@@ -205,6 +205,46 @@ def test_skip_masks_span_several_words():
         for ti in range(I):
             for tj in range(J):
                 assert [mask_bits(m, s, ti, tj, c) for c in range(C)] == want[ti, tj].tolist()
+
+
+@pytest.mark.parametrize("grouped", [False, True])
+@pytest.mark.parametrize("seed", range(4))
+def test_transition_tables_against_next_col(seed, grouped):
+    """Against next_col directly. Ungrouped: every column's entries are its classes that lead somewhere (class
+    order), with their successors. Grouped: its distinct successors (one column at a sequence end), each entry's
+    mass index its pair's number within the boundary, and pair_of sends every class to its pair. Either way, every
+    exit column's predecessor entries are the entries that lead there, in column order."""
+    dfa = random_dfa(6, 7, seed)
+    n = 5
+    L = build_layout(dfa, n)
+    width = L.width.tolist()
+    tt = transition_tables(L.next_col, width, n, grouped)
+    ptr, succ, xs = tt.entry_ptr.long(), tt.entry_succ.long(), tt.entry_x.long()
+    pred_ptr, pred_col, pred_x = tt.pred_ptr.long(), tt.pred_col.long(), tt.pred_x.long()
+    for t in range(n):
+        lead = []                                                         # (column, successor, class), in order
+        for q in range(width[t]):
+            for c in range(L.next_col.size(2)):
+                s = int(L.next_col[t, q, c])
+                if s >= 0:
+                    lead.append((q, 0 if t + 1 == n else s, c))
+        if grouped:
+            want = sorted({(q, s) for q, s, _ in lead})                   # by column, then successor
+            want = [(q, s, k) for k, (q, s) in enumerate(want)]
+            assert tt.num_pairs[t] == len(want)
+            for q, s, c in lead:
+                assert (q, s) == want[int(tt.pair_of[t, q, c])][:2]
+        else:
+            want = lead
+        got = [(q, int(succ[e]), int(xs[e])) for q in range(width[t]) for e in range(int(ptr[t, q]), int(ptr[t, q + 1]))]
+        assert got == want
+        for j in range(width[t + 1] if t + 1 < n else 1):
+            preds = [(int(pred_col[e]), int(pred_x[e])) for e in range(int(pred_ptr[t, j]), int(pred_ptr[t, j + 1]))]
+            assert preds == [(q, x) for q, s, x in want if s == j]
+    if grouped:
+        assert tt.max_pairs == max(int(ptr[t, q + 1] - ptr[t, q]) for t in range(n) for q in range(width[t]))
+        assert max_successors(L.next_col, width, n) == max(1, max(int(ptr[t, q + 1] - ptr[t, q])
+                                                                  for t in range(n - 1) for q in range(width[t])))
 
 
 def test_unsatisfiable_constraint_has_empty_boundaries():

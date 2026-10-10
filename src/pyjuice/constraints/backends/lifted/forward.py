@@ -21,7 +21,8 @@ from typing import Optional
 
 import torch
 
-from .kernels.prod import IDENTITY, SUM, TEMP, predecessor_tables, skip_masks
+from .kernels.prod import IDENTITY, SUM, TEMP, max_successors, skip_masks, transition_job, transition_masses
+from .kernels.prod import transition_tables
 from .kernels.prod import run_products as products
 from .kernels.sum import dense_groups, dense_sum, fused_sum
 from .plan import Reachability, _align
@@ -31,6 +32,19 @@ PRECISIONS = {"fp32": "tf32x3", "tf32": "tf32"}
 
 #: Read a one-child product over a sum straight from the sum's row instead of copying its block (see Program)
 ALIAS_COPIES = True
+
+#: A missing token's transitions are grouped by successor (see :class:`~.kernels.prod.TransitionTables`) when the
+#: automaton has at least this many token classes per successor of its most branching column: its products then
+#: loop over successors, not classes, through transition masses built per query. Below it, they loop over the
+#: classes, and nothing more is built. 8 from a sweep on HMMs (grouped against class by class, batch 1 / 16):
+#: 512 classes, 16 successors x1.6-1.8 / x2.7-3.4; 128 and 16 x1.0-1.2 / x1.4-1.5; at 4 classes per successor
+#: and below, nothing gained or losses (64 successors: 256 classes x0.71-0.73 / x1.24, 64 classes x0.81-0.87).
+GROUP_MIN_RATIO = 8
+
+#: Floats of transition masses (see :func:`~.kernels.prod.transition_masses`) held at once: when every input step's
+#: fit, they are all kept, built once per computation of the class masses; else built launch by launch, in chunks
+#: of steps that fit, into one scratch
+TRANSITION_BUDGET = 1 << 26
 
 
 class Program:
@@ -45,7 +59,9 @@ class Program:
         self.width_t = layout.width.to(dev, torch.int32)
         self.next_col = layout.next_col.to(dev, torch.int32).contiguous()
         self.input_start, self.input_end = cc.input_range
-        self.pred_ptr, self.pred_q, self.pred_c = predecessor_tables(self.next_col, self.width, n)
+        grouped = cc.num_classes >= GROUP_MIN_RATIO * max_successors(self.next_col, self.width, n)
+        self.trans = transition_tables(self.next_col, self.width, n, grouped = grouped)
+        self.dev = dev
 
         firsts = [first for first, _, _ in cc.sum_regions]
         self.firsts = firsts
@@ -139,6 +155,58 @@ class Program:
             idx = torch.tensor([triples[tuple(t)] for t in steps[:, 5:8].tolist()], dtype = torch.int32, device = dev)
             launches[li] = (form, kinds, (steps, idx), E, X)
 
+        # grouped transitions: every input @ block / block @ input step's transition masses, a row of the boundary's
+        # pairs at t_off. All kept at once when they fit TRANSITION_BUDGET; else each launch in chunks of steps that
+        # fit, sharing one scratch (a chunk's masses are built just before its steps run)
+        cols = {"input_block": (1, 2), "block_input": (4, 5)}               # (input row, position) columns
+        ins = [(launches, li) for kind, _, layers in self.steps if kind == "prod" for stages, _, _ in layers
+               for launches in stages for li, launch in enumerate(launches) if launch[0] in cols]
+        tables = [launches[li][2].cpu().long() for launches, li in ins]
+        if self.trans.grouped:
+            pairs = torch.tensor(self.trans.num_pairs, dtype = torch.long)
+            sizes = [pairs[st[:, cols[launches[li][0]][1]]] for st, (launches, li) in zip(tables, ins)]
+        else:
+            sizes = [torch.zeros(st.size(0), dtype = torch.long) for st in tables]
+        self.trans_persistent = sum(int(z.sum()) for z in sizes) <= TRANSITION_BUDGET
+        self.trans_size, rows = 0, []
+        for st, z, (launches, li) in zip(tables, sizes, ins):
+            form, kinds, _, E, X = launches[li]
+            if not self.trans.grouped:
+                chunks = [(0, st.size(0), None)]
+            elif self.trans_persistent:
+                st[:, 6] = self.trans_size + torch.cumsum(z, 0) - z
+                self.trans_size += int(z.sum())
+                chunks = [(0, st.size(0), None)]
+                rows.append(st[:, [*cols[form], 6]])
+            else:
+                bounds, start, used = [], 0, 0
+                for k, size in enumerate(z.tolist()):
+                    if used + size > TRANSITION_BUDGET and k > start:
+                        bounds.append((start, k))
+                        start, used = k, 0
+                    st[k, 6] = used
+                    used += size
+                    self.trans_size = max(self.trans_size, used)
+                bounds.append((start, st.size(0)))
+                chunks = [(s0, s1, transition_job(st[s0:s1][:, [*cols[form], 6]], dev)) for s0, s1 in bounds]
+            launches[li] = (form, kinds, (st.to(dev, torch.int32).contiguous(), chunks), E, X)
+        self.trans_job = transition_job(torch.cat(rows), dev) if self.trans.grouped and rows else None
+        self._trans, self._trans_version = None, None
+
+    def transition_buffer(self) -> torch.Tensor:
+        """Where the transition masses go (all of them, or one chunk's; allocated on first use)."""
+        if self._trans is None:
+            self._trans = torch.empty(max(1, self.trans_size), dtype = torch.float32, device = self.dev)
+        return self._trans
+
+    def transitions(self, class_mars: torch.Tensor, version: int):
+        """When transitions are grouped and all their masses kept: build them from the class masses of computation
+        ``version``, unless they already are."""
+        if self.trans.grouped and self.trans_persistent and self.trans_job is not None and \
+                self._trans_version != version:
+            transition_masses(self.transition_buffer(), self.trans_job, class_mars, self)
+            self._trans_version = version
+
     def _entry(self, t: int) -> int:
         return self.width[t]                                         # boundary 0: the initial state alone
 
@@ -190,7 +258,7 @@ class Program:
             if k == 1:
                 if is_input[0]:                                      # the input's own block
                     emit(0, "input_block", (IDENTITY, False), [outs, kids[:, 0], full(bd[0]), zeros, zeros,
-                                                               full(bd[1])], bd[0], bd[1])
+                                                               full(bd[1]), zeros], bd[0], bd[1])
                 else:                                                # a product over one sum: its block as is
                     _, kind, l_rows, l_regs = block(kids[:, 0])
                     emit(0, "copy", (kind, False), [outs, l_rows, l_regs, full(bd[0]), full(bd[1])], bd[0], bd[1])
@@ -204,16 +272,16 @@ class Program:
                     if acc[0] == "input":                            # an input next to an input: materialize it
                         tmp = scratch(R, acc[2], bd[k])
                         emit(stage, "input_block", (IDENTITY, True), [tmp[2], acc[1], full(acc[2]), zeros, zeros,
-                                                                      full(bd[k])], acc[2], bd[k])
+                                                                      full(bd[k]), zeros], acc[2], bd[k])
                         stage += 1
                         acc = tmp
                     emit(stage, "input_block", (acc[1], out_temp), [dest[2], kids[:, m], full(bd[m]), acc[2], acc[3],
-                                                                    full(bd[k])], bd[m], bd[k])
+                                                                    full(bd[k]), zeros], bd[m], bd[k])
                 else:
                     _, l_kind, l_rows, l_regs = block(kids[:, m])
                     if acc[0] == "input":
                         emit(stage, "block_input", (l_kind, out_temp), [dest[2], l_rows, l_regs, full(bd[m]), acc[1],
-                                                                        full(acc[2])], bd[m], bd[k])
+                                                                        full(acc[2]), zeros], bd[m], bd[k])
                     else:
                         emit(stage, "block_block", (l_kind, acc[1], out_temp),
                              [dest[2], l_rows, l_regs, acc[2], acc[3], full(bd[m]), full(bd[m + 1]), full(bd[k])],
@@ -297,7 +365,7 @@ def marginal(cc, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None
     bufs = cc._buffers(B)
     lay = bufs["layout"]
     node_mars, element_mars = bufs["node_mars"], bufs["element_mars"]
-    input_mars = bufs["input_mars"]
+    input_mars = bufs["input_mars"]                                    # the input region: pyjuice's own layout
     regions = dict(offset = lay["sum_offsets_t"], width = lay["sum_widths_t"], first = prog.reg_first,
                    slots = prog.reg_slots)
     dot = PRECISIONS[precision]
@@ -306,6 +374,7 @@ def marginal(cc, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None
         for layer in pc.input_layer_group:
             layer(x.permute(1, 0), input_mars, missing_mask = missing)
         class_mars = cc._class_masses()
+        prog.transitions(class_mars, cc._class_mars_version)
         obs_class = torch.where(missing, -1, cc.token_classes.token_class[x]).contiguous()
 
         for kind, prod_index, layers in prog.steps:
@@ -317,7 +386,7 @@ def marginal(cc, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None
                     if num_temps > 0:
                         temp_width = _align(B * temp_slots)
                         temp = cc._storage_view("product_scratch", num_temps * temp_width)
-                    products(stages, (temp, temp_width), prog, regions, element_mars, node_mars, input_mars,
+                    products(stages, (temp, temp_width), prog, regions, element_mars, node_mars,
                              class_mars, obs_class, elem_first, elem_width, B)
             else:
                 for block_size, parts in layers:

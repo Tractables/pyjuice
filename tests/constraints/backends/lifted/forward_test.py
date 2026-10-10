@@ -53,10 +53,19 @@ def sum_path(request, monkeypatch):
     return request.param
 
 
+@pytest.fixture(params = ["classes", "grouped"])
+def transitions(request, monkeypatch):
+    """A missing token's transitions one class at a time, or grouped by successor through transition masses (the
+    test automata have far fewer classes than grouping is used from by default)."""
+    import pyjuice.constraints.backends.lifted.forward as F
+    monkeypatch.setattr(F, "GROUP_MIN_RATIO", 1 << 30 if request.param == "classes" else 0)
+    return request.param
+
+
 @pytest.mark.parametrize("constraint", list(CONSTRAINTS))
 @pytest.mark.parametrize("B", [1, 3, 16])
 @pytest.mark.parametrize("kind", list(KINDS))
-def test_marginal_matches_the_reference(kind, B, constraint, sum_path, build_pc, reference):
+def test_marginal_matches_the_reference(kind, B, constraint, sum_path, transitions, build_pc, reference):
     n = KINDS[kind]
     cc = jc.compile(CONSTRAINTS[constraint](), build_pc(kind, n, V))
     data, missing = evidence(n, B)
@@ -164,14 +173,17 @@ def test_skipping_empty_tiles_changes_nothing(build_pc, monkeypatch):
     assert_close(with_skip, cc.marginal(data, missing), n)
 
 
-def test_every_token_its_own_class(build_pc, reference):
+@pytest.mark.parametrize("kind", ["hmm", "hand_left"])
+def test_every_token_its_own_class(kind, transitions, build_pc, reference):
     """An automaton that sends every token of a 600-token vocabulary its own way: 600 token classes, so the
-    class masses take the class-order pass. The marginal still matches the reference."""
+    class masses take the class-order pass and every column has far fewer successors than classes (an HMM reads
+    its inputs before a block, hand_left after one), one class at a time or grouped. The marginal still matches
+    the reference."""
     from pyjuice.constraints.distributions import categorical
     rng = random.Random(0)
-    V2, K, n = 600, 6, 6
+    V2, K, n = 600, 6, KINDS[kind]
     dfa = jc.DFA.from_dense(V2, [[rng.randrange(K) for _ in range(V2)] for _ in range(K)], 0, rng.sample(range(K), 3))
-    cc = jc.compile(dfa, build_pc("hmm", n, V2))
+    cc = jc.compile(dfa, build_pc(kind, n, V2))
     assert cc.num_classes > categorical.NATURAL_ORDER_MAX_CLASSES             # the class-order pass
     g = torch.Generator().manual_seed(0)
     data = torch.randint(0, V2, (3, n), generator = g)
@@ -190,21 +202,25 @@ def test_fast_inference_keeps_the_class_masses(kind, build_pc, reference, monkey
     pc, other = build_pc(kind, n, V, seed = 0), build_pc(kind, n, V, seed = 1)
     cc = jc.compile(CONSTRAINTS["contains"](), pc)
     data, missing = evidence(n, 4)
+    import pyjuice.constraints.backends.lifted.forward as F
+    monkeypatch.setattr(F, "GROUP_MIN_RATIO", 0)                       # transitions grouped
     calls, computed = [], categorical.class_masses
     monkeypatch.setattr(categorical, "class_masses", lambda *a, **k: calls.append(1) or computed(*a, **k))
+    builds, built = [], F.transition_masses                              # the transition masses follow them
+    monkeypatch.setattr(F, "transition_masses", lambda *a, **k: builds.append(1) or built(*a, **k))
     per_query = len(pc.input_layer_group)                                # one call per input layer
 
     want = reference.marginal(cc, data, missing)
     for _ in range(2):
         assert_close(cc.marginal(data, missing), want, n)
-    assert len(calls) == 2 * per_query                                   # outside a scope: every query
+    assert len(calls) == 2 * per_query and len(builds) == 2              # outside a scope: every query
     with juice.fast_inference():
         for _ in range(2):
             assert_close(cc.marginal(data, missing), want, n)
         with juice.fast_inference():
             assert_close(cc.marginal(data, missing), want, n)
         assert_close(cc.marginal(data, missing), want, n)
-    assert len(calls) == 3 * per_query                                   # inside: the first query only
+    assert len(calls) == 3 * per_query and len(builds) == 3              # inside: the first query only
 
     with torch.no_grad():                                                # an in-place update after the scope
         pc.params.copy_(other.params)
@@ -213,7 +229,71 @@ def test_fast_inference_keeps_the_class_masses(kind, build_pc, reference, monkey
     updated = reference.marginal(cc, data, missing)
     assert (updated - want)[torch.isfinite(want)].abs().max() > 1e-2
     assert_close(cc.marginal(data, missing), updated, n)
-    assert len(calls) == 4 * per_query
+    assert len(calls) == 4 * per_query and len(builds) == 4
+
+
+def test_transition_masses_match_brute_force(build_pc, monkeypatch):
+    """Every transition mass -- log sum of the class masses that lead from a column to a successor -- against
+    float64, on an automaton whose columns have more successors than one pair tile takes and more classes than one
+    chunk, with token probabilities down to e^-100 and one emission row below e^-90 altogether (pairs whose class
+    masses are all below the fp32 normal range)."""
+    import pyjuice.constraints.backends.lifted.forward as F
+    from pyjuice.constraints.backends.lifted.kernels import prod
+    monkeypatch.setattr(F, "GROUP_MIN_RATIO", 0)
+    rng = random.Random(0)
+    V2, K, n = 600, 48, 6
+    dfa = jc.DFA.from_dense(V2, [[rng.randrange(K) for _ in range(V2)] for _ in range(K)], 0, rng.sample(range(K), 12))
+    pc = build_pc("hmm", n, V2)
+    g = torch.Generator(device = pc.params.device).manual_seed(0)
+    with torch.no_grad():
+        for layer in pc.input_layer_group:
+            layer.params.copy_(torch.exp(-torch.rand(layer.params.shape, device = pc.params.device, generator = g) * 100))
+            row = layer.s_pids[0]
+            layer.params[row:row + V2] = torch.exp(-90 - torch.rand(V2, device = pc.params.device, generator = g))
+    cc = jc.compile(dfa, pc)
+    cc.marginal(torch.zeros(1, n, dtype = torch.long), torch.ones(1, n, dtype = torch.bool))
+    prog = cc._lifted_program()
+    tt, width, nc = prog.trans, prog.width, cc.layout.next_col
+    ptr, succ = tt.entry_ptr.long().cpu(), tt.entry_succ.long().cpu()
+    assert tt.grouped and prog.trans_persistent and tt.max_pairs > 16    # several pair tiles at the narrowest
+    assert nc.size(2) > prod.TRANSITION_TILES["TC"]
+    T, cm = prog.transition_buffer().double().cpu(), cc._class_mars.double().cpu()
+    assert (cm[torch.isfinite(cm)] < -87.4).any()                       # class masses below the normal range
+    assert (cm.max(dim = 1).values < -87.4).any()                       # ... every class of a row
+    for u, t, off in prog.trans_job[0].long().cpu().tolist():
+        for q in range(width[t]):
+            to = nc[t, q].long()
+            for g in range(int(ptr[t, q]), int(ptr[t, q + 1])):
+                classes = (to >= 0) if t + 1 == n else (to == succ[g])
+                want = torch.logsumexp(cm[u - prog.input_start, classes], dim = 0)
+                got = T[off + g - int(ptr[t, 0])]
+                assert abs(float(got - want)) < 1e-5, (u, t, q, g, float(got), float(want))
+
+
+@pytest.mark.parametrize("kind", ["hmm", "pd", "hand_left"])
+def test_chunked_transition_masses_change_nothing(kind, build_pc, monkeypatch):
+    """Transitions grouped, with a budget of one float: every input step's transition masses are built on their own,
+    just before the step, into one shared scratch -- the marginal of keeping them all, bit for bit (a wide
+    automaton; the buffers filled with NaN before each call)."""
+    import pyjuice.constraints.backends.lifted.forward as F
+    monkeypatch.setattr(F, "GROUP_MIN_RATIO", 0)
+    rng = random.Random(0)
+    K, n = 48, KINDS[kind]
+    dfa = jc.DFA.from_dense(V, [[rng.randrange(K) for _ in range(V)] for _ in range(K)], 0, rng.sample(range(K), 12))
+    cc = jc.compile(dfa, build_pc(kind, n, V))
+    data, missing = evidence(n, 4)
+
+    def marginal(budget):
+        monkeypatch.setattr(F, "TRANSITION_BUDGET", budget)
+        cc._program = None
+        bufs = cc._buffers(data.size(0))
+        bufs["node_mars"].fill_(float("nan"))
+        bufs["element_mars"].fill_(float("nan"))
+        out = cc.marginal(data, missing)
+        assert cc._lifted_program().trans_persistent == (budget > 1)
+        return out
+
+    assert torch.equal(marginal(1), marginal(1 << 26))
 
 
 def test_splitting_block_block_tiles_changes_nothing(build_pc, monkeypatch):

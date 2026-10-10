@@ -89,6 +89,7 @@ class ConstrainedCircuit:
         self._program = None                        # the lifted forward's tables (see `_lifted_program`)
         self._class_mars = None                     # the input nodes' class masses (see `_class_masses`)
         self._class_mars_kept = False               # kept by a `pyjuice.fast_inference` scope
+        self._class_mars_version = 0                # counts their computations (what is derived from them follows)
 
     @property
     def pc(self):
@@ -165,6 +166,7 @@ class ConstrainedCircuit:
             first, end = layer._output_ind_range
             lookup(layer.dist).class_masses(layer, self.token_classes,
                                             out = self._class_mars[first - input_start:end - input_start])
+        self._class_mars_version += 1
         if is_active():
             self._class_mars_kept = True
             register_layer(self)                                # its exit calls `_release_fast_inference_params`
