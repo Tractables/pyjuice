@@ -10,7 +10,8 @@ Two paths:
 * DENSE node blocks -- children a contiguous run of element rows, weights strided by the block size (an HMM's
   transitions) -- are a matrix product with weights read in place from the parameter buffer: a node block's
   weights are the ``[E, BS]`` matrix at ``params[pids[k, 0]]``. The children are shifted by their column
-  maximum and exponentiated once, multiplied by cuBLAS, and the log taken. In fp32 this is cuBLAS's exact fp32
+  maximum and exponentiated once (one pass), multiplied by cuBLAS, and the log taken and the maximum added back
+  (one pass over the product, in place). In fp32 this is cuBLAS's exact fp32
   product (measured faster than pyjuice's own sum layer at every batch size on a 4096-state HMM, with ~100x
   smaller error);
 * every other node block runs the fused Triton kernel: an online log-sum-exp over chunks of children, with
@@ -169,6 +170,38 @@ def _matmul_precision(precision: str):
         torch.set_float32_matmul_precision(prev)
 
 
+#: The dense path's elementwise passes: (rows, columns) per program.
+_EW_TILE = (32, 128)
+
+
+@triton.jit
+def _shifted_exp_kernel(x, ex, m, rows, ncols, x_ld, num_ctiles, TILE_R: tl.constexpr, TILE_C: tl.constexpr):
+    """``ex = exp(x - m)`` (``ex`` contiguous [rows, ncols]), ``m`` the column maxima of ``x``; a column of -inf
+    is shifted by 0 and stays all 0."""
+    r = (tl.program_id(0) // num_ctiles) * TILE_R + tl.arange(0, TILE_R)
+    c = (tl.program_id(0) % num_ctiles) * TILE_C + tl.arange(0, TILE_C)
+    cmask = c < ncols
+    mask = (r < rows)[:, None] & cmask[None, :]
+    shift = tl.load(m + c, mask = cmask, other = 0.0)
+    shift = tl.where(shift == float("-inf"), 0.0, shift)
+    r = r.to(tl.int64)
+    v = tl.load(x + r[:, None] * x_ld + c[None, :], mask = mask, other = float("-inf"))
+    tl.store(ex + r[:, None] * ncols + c[None, :], tl.exp(v - shift[None, :]), mask = mask)
+
+
+@triton.jit
+def _log_add_kernel(out, m, rows, ncols, ld, num_ctiles, TILE_R: tl.constexpr, TILE_C: tl.constexpr):
+    """``out = log(out) + m`` in place, ``m`` the column maxima :func:`_shifted_exp_kernel` shifted by (a column of
+    -inf has a product of 0, and log 0 - inf = -inf: no guard needed)."""
+    r = (tl.program_id(0) // num_ctiles) * TILE_R + tl.arange(0, TILE_R)
+    c = (tl.program_id(0) % num_ctiles) * TILE_C + tl.arange(0, TILE_C)
+    cmask = c < ncols
+    mask = (r < rows)[:, None] & cmask[None, :]
+    shift = tl.load(m + c, mask = cmask, other = 0.0)
+    ptr = out + r.to(tl.int64)[:, None] * ld + c[None, :]
+    tl.store(ptr, tl.log(tl.load(ptr, mask = mask, other = 1.0)) + shift[None, :], mask = mask)
+
+
 def dense_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor, groups: dict, E: int,
               block_size: int, region: tuple, elem_first: int, elem_width: int, ncols: int, precision: str):
     """
@@ -181,14 +214,18 @@ def dense_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch
     BS = block_size
     elems = element_mars[:element_mars.numel() // elem_width * elem_width].view(-1, elem_width)
     nodes = node_mars[offset:offset + (node_mars.numel() - offset) // width * width].view(-1, width)
+    TILE_R, TILE_C = _EW_TILE
+    num_ctiles = triton.cdiv(ncols, TILE_C)
     with _matmul_precision(precision):
         for c0, blocks in groups.items():
             x = elems[c0 - elem_first:c0 - elem_first + E, :ncols]
-            m = x.amax(dim = 0, keepdim = True)
-            m = torch.where(torch.isfinite(m), m, torch.zeros_like(m))
-            ex = torch.exp(x - m)
+            m = x.amax(dim = 0)
+            ex = torch.empty(E, ncols, dtype = x.dtype, device = x.device)
+            _shifted_exp_kernel[(triton.cdiv(E, TILE_R) * num_ctiles,)](x, ex, m, E, ncols, elem_width, num_ctiles,
+                                                                       TILE_R = TILE_R, TILE_C = TILE_C)
             for _, nid, p0 in blocks:
                 w = params[p0:p0 + E * BS].view(E, BS).t()                         # [BS, E], in place
                 out = nodes[nid - first:nid - first + BS, :ncols]
                 torch.mm(w, ex, out = out)
-                out.log_().add_(m)
+                _log_add_kernel[(triton.cdiv(BS, TILE_R) * num_ctiles,)](out, m, BS, ncols, width, num_ctiles,
+                                                                        TILE_R = TILE_R, TILE_C = TILE_C)
