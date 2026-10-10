@@ -5,7 +5,8 @@ shape, so a sum acts on every column independently: it is pyjuice's sum over ``B
 (``partitioned_nids / cids / pids``): node ``i`` of the node block at ``nids[k]`` adds child element
 ``cids[k, e]`` with weight ``params[pids[k, e] + i]``.
 
-Two paths:
+Under evidence pruning (:mod:`.live`) only the live columns are computed, and the dead ones set to -inf. Two
+paths:
 
 * DENSE node blocks -- children a contiguous run of element rows, weights strided by the block size (an HMM's
   transitions) -- are a matrix product with weights read in place from the parameter buffer: a node block's
@@ -48,10 +49,12 @@ def _lse_dot_step(m, acc, x, w, PRECISION: tl.constexpr):
 
 @triton.jit
 def _lifted_sum_kernel(node_mars, element_mars, weights, nids, cids, pids, nb_reg,
-                       reg_offset, reg_width, reg_first, reg_slots, a_rows, a_regs, a_pids,
+                       reg_offset, reg_width, reg_first, reg_slots, a_rows, a_regs, a_pids, perm, reg_perm, reg_live,
                        elem_first, elem_width, B, num_edges, num_alias, num_mtiles, pid0,
                        BS: tl.constexpr, TILE_M: tl.constexpr, TILE_E: tl.constexpr, TILE_A: tl.constexpr,
-                       TILE_B: tl.constexpr, PRECISION: tl.constexpr, ALIAS: tl.constexpr):
+                       TILE_B: tl.constexpr, PRECISION: tl.constexpr, ALIAS: tl.constexpr, PRUNE: tl.constexpr):
+    """Pruned (``PRUNE``), the program's columns are positions in the region's interval's order of columns (live
+    ones first, see :mod:`.live`): a tile past the live ones is all -inf, without reading anything."""
     pid_nm = tl.program_id(0)                                     # (node block, tile of its nodes)
     pid_c = pid0 + tl.program_id(1)                               # tile of columns
     pid_n = pid_nm // num_mtiles
@@ -60,13 +63,23 @@ def _lifted_sum_kernel(node_mars, element_mars, weights, nids, cids, pids, nb_re
     ncols = B * tl.load(reg_slots + reg)
     col0 = pid_c * TILE_B
     if col0 < ncols:
-        cols = col0 + tl.arange(0, TILE_B)
-        cmask = cols < ncols
+        k = col0 + tl.arange(0, TILE_B)
+        kmask = k < ncols
+        n_edges, n_alias = num_edges, num_alias
+        if PRUNE:
+            num_live = tl.load(reg_live + reg)
+            cols = tl.load(perm + tl.load(reg_perm + reg) + k, mask = kmask, other = 0)
+            cmask = kmask & (k < num_live)
+            n_edges = tl.where(col0 < num_live, num_edges, 0)                # a dead tile reads nothing
+            n_alias = tl.where(col0 < num_live, num_alias, 0)
+        else:
+            cols = k
+            cmask = kmask
         offs_m = mt * TILE_M + tl.arange(0, TILE_M)
         mmask = offs_m < BS
         m = tl.full([TILE_B], float("-inf"), dtype = tl.float32)
         acc = tl.zeros([TILE_M, TILE_B], dtype = tl.float32)
-        for e0 in range(0, num_edges, TILE_E):
+        for e0 in range(0, n_edges, TILE_E):
             offs_e = e0 + tl.arange(0, TILE_E)
             emask = offs_e < num_edges
             cid = tl.load(cids + pid_n * num_edges + offs_e, mask = emask, other = 0).to(tl.int64)
@@ -79,7 +92,7 @@ def _lifted_sum_kernel(node_mars, element_mars, weights, nids, cids, pids, nb_re
             m, acc = _lse_dot_step(m, acc, x, w, PRECISION)
         if ALIAS:
             # children that copy a sum: read in the sum's own row (row a_rows within region a_regs)
-            for a0 in range(0, num_alias, TILE_A):
+            for a0 in range(0, n_alias, TILE_A):
                 offs_a = a0 + tl.arange(0, TILE_A)
                 amask = offs_a < num_alias
                 row = tl.load(a_rows + pid_n * num_alias + offs_a, mask = amask, other = -1)
@@ -99,12 +112,13 @@ def _lifted_sum_kernel(node_mars, element_mars, weights, nids, cids, pids, nb_re
         width = tl.load(reg_width + reg)
         base = tl.load(reg_offset + reg) + (nid - tl.load(reg_first + reg)) * width
         tl.store(node_mars + base + offs_m.to(tl.int64)[:, None] * width + cols[None, :], out,
-                 mask = mmask[:, None] & cmask[None, :])
+                 mask = mmask[:, None] & kmask[None, :])
 
 
 def fused_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor, nids: torch.Tensor,
               cids: torch.Tensor, pids: torch.Tensor, nb_reg: torch.Tensor, regions: dict, elem_first: int,
-              elem_width: int, batch_size: int, block_size: int, max_cols: int, precision: str, aliased = None):
+              elem_width: int, batch_size: int, block_size: int, max_cols: int, precision: str, aliased = None,
+              pruning = None):
     """
     Node blocks of a sum layer partition with the fused Triton kernel, into ``node_mars``.
 
@@ -116,6 +130,7 @@ def fused_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch
     :param aliased: None, or the node blocks' children that copy a sum and are read in the sum's own row:
         ``(rows, regions, pids)``, each [num node blocks, num aliased] int32 (``rows`` within the region, ``-1`` for
         padding; ``pids`` as for ``cids``)
+    :param pruning: None, or the query's :class:`~.live.Pruning`
     """
     num_blocks, num_edges = cids.shape
     tm, te, tb, warps, stages = _TILES[precision]
@@ -126,13 +141,15 @@ def fused_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch
     a_rows, a_regs, a_pids = aliased if aliased is not None else (cids, cids, cids)
     num_alias = a_rows.size(1) if aliased is not None else 0
     TILE_A = min(te, max(16, triton.next_power_of_2(num_alias)))
+    perm, reg_perm, reg_live = (pruning.perm, pruning.reg_first, pruning.reg_live) if pruning is not None else \
+        (cids, cids, cids)
     for first, size in grid_chunks(triton.cdiv(max_cols, TILE_B), 1):
         _lifted_sum_kernel[(num_blocks * num_mtiles, size)](
             node_mars, element_mars, params, nids, cids, pids, nb_reg, regions["offset"], regions["width"],
-            regions["first"], regions["slots"], a_rows, a_regs, a_pids, elem_first, elem_width, batch_size, num_edges,
-            num_alias, num_mtiles, first, BS = block_size, TILE_M = TILE_M, TILE_E = TILE_E, TILE_A = TILE_A,
-            TILE_B = TILE_B, PRECISION = precision, ALIAS = aliased is not None, num_warps = warps,
-            num_stages = stages)
+            regions["first"], regions["slots"], a_rows, a_regs, a_pids, perm, reg_perm, reg_live, elem_first,
+            elem_width, batch_size, num_edges, num_alias, num_mtiles, first, BS = block_size, TILE_M = TILE_M,
+            TILE_E = TILE_E, TILE_A = TILE_A, TILE_B = TILE_B, PRECISION = precision, ALIAS = aliased is not None,
+            PRUNE = pruning is not None, num_warps = warps, num_stages = stages)
 
 
 # -------------------------------------------------------------------------------------------------
@@ -204,13 +221,34 @@ def _log_add_kernel(out, m, rows, ncols, ld, num_ctiles, TILE_R: tl.constexpr, T
     tl.store(ptr, tl.log(tl.load(ptr, mask = mask, other = 1.0)) + shift[None, :], mask = mask)
 
 
+@triton.jit
+def _log_scatter_kernel(out, prod, m, rank, rows, ncols, ld, num_live, num_ctiles, TILE_R: tl.constexpr,
+                        TILE_C: tl.constexpr):
+    """``out[:, c] = log(prod[:, rank[c]]) + m[rank[c]]`` for every live column ``c`` of ``out``, -inf for the others
+    (``prod`` [rows, num_live], the products of the live columns)."""
+    r = (tl.program_id(0) // num_ctiles) * TILE_R + tl.arange(0, TILE_R)
+    c = (tl.program_id(0) % num_ctiles) * TILE_C + tl.arange(0, TILE_C)
+    cmask = c < ncols
+    mask = (r < rows)[:, None] & cmask[None, :]
+    k = tl.load(rank + c, mask = cmask, other = -1)
+    alive = k >= 0
+    shift = tl.load(m + k, mask = cmask & alive, other = 0.0)
+    r = r.to(tl.int64)
+    v = tl.load(prod + r[:, None] * num_live + k[None, :], mask = mask & alive[None, :], other = 1.0)
+    tl.store(out + r[:, None] * ld + c[None, :], tl.where(alive[None, :], tl.log(v) + shift[None, :], float("-inf")),
+             mask = mask)
+
+
 def dense_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor, groups: dict, E: int,
-              block_size: int, region: tuple, elem_first: int, elem_width: int, ncols: int, precision: str):
+              block_size: int, region: tuple, elem_first: int, elem_width: int, ncols: int, precision: str,
+              live = None):
     """
     Dense node blocks of one sum region (see :func:`dense_groups`), into ``node_mars``: per run of children,
     ``log(W_k @ exp(X - m)) + m`` with ``m`` the column maximum of the children ``X``.
 
     :param region: ``(offset, width, first)`` of the node blocks' sum region (Python ints)
+    :param live: None (every column), or the region's interval's ``(perm, rank, num_live)`` (see
+        :meth:`~.live.Pruning.segment`): the live columns are gathered and multiplied, the others set to -inf
     """
     offset, width, first = region
     BS = block_size
@@ -218,6 +256,9 @@ def dense_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch
     nodes = node_mars[offset:offset + (node_mars.numel() - offset) // width * width].view(-1, width)
     TILE_R, TILE_C = _EW_TILE
     num_ctiles = triton.cdiv(ncols, TILE_C)
+    if live is not None:
+        _dense_sum_live(nodes, elems, params, groups, E, BS, first, elem_first, ncols, precision, live)
+        return
     with _matmul_precision(precision):
         for c0, blocks in groups.items():
             x = elems[c0 - elem_first:c0 - elem_first + E, :ncols]
@@ -231,3 +272,24 @@ def dense_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch
                 torch.mm(w, ex, out = out)
                 _log_add_kernel[(triton.cdiv(BS, TILE_R) * num_ctiles,)](out, m, BS, ncols, width, num_ctiles,
                                                                         TILE_R = TILE_R, TILE_C = TILE_C)
+
+
+def _dense_sum_live(nodes, elems, params, groups, E, BS, first, elem_first, ncols, precision, live):
+    perm, rank, num_live = live
+    width = nodes.size(1)
+    TILE_R, TILE_C = _EW_TILE
+    with _matmul_precision(precision):
+        for c0, blocks in groups.items():
+            x = torch.index_select(elems[c0 - elem_first:c0 - elem_first + E, :ncols], 1, perm[:num_live])  # [E, live]
+            m = x.amax(dim = 0)
+            live_tiles = triton.cdiv(num_live, TILE_C)
+            if num_live > 0:
+                _shifted_exp_kernel[(triton.cdiv(E, TILE_R) * live_tiles,)](x, x, m, E, num_live, num_live, live_tiles,
+                                                                           TILE_R = TILE_R, TILE_C = TILE_C)
+            for _, nid, p0 in blocks:
+                w = params[p0:p0 + E * BS].view(E, BS).t()                         # [BS, E], in place
+                prod = torch.mm(w, x)                                              # [BS, live]
+                num_ctiles = triton.cdiv(ncols, TILE_C)
+                _log_scatter_kernel[(triton.cdiv(BS, TILE_R) * num_ctiles,)](
+                    nodes[nid - first:nid - first + BS], prod, m, rank, BS, ncols, width, num_live, num_ctiles,
+                    TILE_R = TILE_R, TILE_C = TILE_C)

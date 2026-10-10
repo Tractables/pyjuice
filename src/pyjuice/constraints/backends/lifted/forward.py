@@ -24,6 +24,7 @@ import torch
 from .kernels.prod import IDENTITY, SUM, TEMP, max_successors, skip_masks, transition_job, transition_masses
 from .kernels.prod import transition_tables
 from .kernels.prod import run_products as products
+from .kernels.live import prune
 from .kernels.sum import dense_groups, dense_sum, fused_sum
 from .plan import _align, interval_tables
 
@@ -40,6 +41,11 @@ ALIAS_COPIES = True
 #: 512 classes, 16 successors x1.6-1.8 / x2.7-3.4; 128 and 16 x1.0-1.2 / x1.4-1.5; at 4 classes per successor
 #: and below, nothing gained or losses (64 successors: 256 classes x0.71-0.73 / x1.24, 64 classes x0.81-0.87).
 GROUP_MIN_RATIO = 8
+
+#: Under evidence pruning, a dense sum region computes only its live columns when it has at least this many columns
+#: (batch x slots); below, its product reads the weights whatever the columns, and pruning gains nothing but costs
+#: the host the live columns' count (a synchronization). Either is exact.
+DENSE_PRUNE_MIN_COLUMNS = 256
 
 #: Floats of transition masses (see :func:`~.kernels.prod.transition_masses`) held at once: when every input step's
 #: fit, they are all kept, built once per computation of the class masses; else built launch by launch, in chunks
@@ -63,6 +69,8 @@ class Program:
         self.mass_row = cc._class_mass_rows()[2]                       # input node -> its row of the class masses
         grouped = cc.num_classes >= GROUP_MIN_RATIO * max_successors(self.next_col, self.width, n)
         self.trans = transition_tables(self.next_col, self.width, n, grouped = grouped)
+        # every column's distinct successors (evidence pruning's liveness sweeps)
+        self.succ = self.trans if grouped else transition_tables(self.next_col, self.width, n, grouped = True)
         self.dev = dev
 
         firsts = [first for first, _, _ in cc.sum_regions]
@@ -72,6 +80,17 @@ class Program:
         self.reg_slots = torch.tensor([slots for _, _, slots in cc.sum_regions], dtype = torch.long, device = dev)
         slots_of_reg = [slots for _, _, slots in cc.sum_regions]
         region_of = lambda row: bisect.bisect_right(firsts, row) - 1
+
+        # every sum region's interval (its node group's scope, as boundaries), for evidence pruning
+        interval_of_row = {info.ns._output_ind_range[0]: (info.scope_runs[0][0], info.scope_runs[0][1] + 1)
+                           for info in cc.structure.nodes if info.kind == "sum"}
+        reg_ivs = [interval_of_row[first] for first in firsts]
+        self.sum_ivs = sorted(set(reg_ivs))
+        self.sum_iv_slots = [self.reach.slots(a, b) for a, b in self.sum_ivs]
+        number = {iv: k for k, iv in enumerate(self.sum_ivs)}
+        self.reg_iv_host = [number[iv] for iv in reg_ivs]
+        self.reg_iv = torch.tensor(self.reg_iv_host, dtype = torch.long, device = dev)
+        self.live_tables = {}                                          # batch size -> evidence pruning's lists
 
         self.steps = []
         prod_index = -1
@@ -143,7 +162,7 @@ class Program:
                             parts[pi] = (dense, E, _split_aliased(fused, alias_row, alias_reg, first, dev))
 
         # where every interval a product reads or writes keeps its slots
-        self.intervals = interval_tables(self.reach, sorted(_intervals(self.steps)), dev)
+        self.intervals = interval_tables(self.reach, sorted(_intervals(self.steps) | set(self.sum_ivs)), dev)
 
         # which (output tile, shared chunk) pairs every block @ block step can skip: one mask per boundary triple,
         # each step's launch carrying its triple's index
@@ -408,11 +427,14 @@ def marginal(cc, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None
     dot = PRECISIONS[precision]
 
     with torch.no_grad():
+        obs_class = torch.where(missing, -1, cc.token_classes.token_class[x]).contiguous()
+        observed = missing_mask is None or not bool(missing.all())
+        pruning = prune(prog, obs_class, B) if observed else None        # nothing observed: nothing to prune
+        live = pruning.live if pruning is not None else None
         for layer in pc.input_layer_group:
             layer(x.permute(1, 0), input_mars, missing_mask = missing)
         class_mars = cc._class_masses()
         prog.transitions(class_mars, cc._class_mars_version)
-        obs_class = torch.where(missing, -1, cc.token_classes.token_class[x]).contiguous()
 
         for kind, prod_index, layers in prog.steps:
             elem_first = cc.element_regions[prod_index][0]
@@ -424,19 +446,24 @@ def marginal(cc, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None
                         temp_width = _align(B * temp_slots)
                         temp = cc._storage_view("product_scratch", num_temps * temp_width)
                     products(stages, (temp, temp_width), prog, regions, element_mars, node_mars,
-                             class_mars, obs_class, elem_first, elem_width, B)
+                             class_mars, obs_class, live, elem_first, elem_width, B)
             else:
                 for block_size, parts in layers:
                     for dense, num_edges, fused in parts:
                         for (r, c0), blocks in dense.items():
                             region = (lay["sum_offsets"][r], lay["sum_widths"][r], prog.firsts[r])
+                            ncols = B * prog.slots[r]
+                            cols = None                                  # every column live
+                            if pruning is not None and ncols >= DENSE_PRUNE_MIN_COLUMNS and \
+                                    pruning.num_live[prog.reg_iv_host[r]] < ncols:
+                                cols = pruning.segment(prog.reg_iv_host[r], ncols)
                             dense_sum(node_mars, element_mars, pc.params, {c0: blocks}, num_edges, block_size, region,
-                                      elem_first, elem_width, B * prog.slots[r], dot)
+                                      elem_first, elem_width, ncols, dot, live = cols)
                         if fused is not None:
                             nids, cids, pids, nb_reg, max_slots, aliased = fused
                             fused_sum(node_mars, element_mars, pc.params, nids, cids, pids, nb_reg, regions, elem_first,
                                       elem_width, B, block_size, max_cols = B * max_slots, precision = dot,
-                                      aliased = aliased)
+                                      aliased = aliased, pruning = pruning)
 
         r = prog.root_region
         base = lay["sum_offsets"][r] + (root_first - cc.sum_regions[r][0]) * lay["sum_widths"][r]
