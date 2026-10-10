@@ -246,15 +246,17 @@ def _block_block_tile(lp, rp, mb, i, j, ti, tj, E, M, X, TILES_I, TILES_J, WORDS
 
 @triton.jit
 def _block_block_kernel(element_mars, node_mars, temp, width, steps, triples, skip_bits, reg_offset, reg_width,
-                        reg_first, out_first, out_width, temp_width, B, n, TILES_I, TILES_J, WORDS, pid0,
-                        L_KIND: tl.constexpr, R_KIND: tl.constexpr, OUT_TEMP: tl.constexpr,
+                        reg_first, out_first, out_width, temp_width, B, n, TILES_I, TILES_J, WORDS, SPLIT, GROUP,
+                        pid0, L_KIND: tl.constexpr, R_KIND: tl.constexpr, OUT_TEMP: tl.constexpr,
                         TM: tl.constexpr, TN: tl.constexpr, TK: tl.constexpr, SUB_I: tl.constexpr,
                         SUB_J: tl.constexpr, SKIP: tl.constexpr, PRECISION: tl.constexpr):
-    """One program per (step, sample), every output tile in turn: the sample's two blocks are contiguous and stay
-    in L1 across the tiles."""
+    """One program per (step, sample, group of ``GROUP`` consecutive output tiles), its tiles in turn: the sample's
+    two blocks are contiguous and stay in L1 across them. A (step, sample) has ``SPLIT`` groups: 1 unless the
+    launch has too few (step, sample) pairs to fill the GPU."""
     pid = pid0 + tl.program_id(0)
-    s = pid // B
-    b = (pid % B).to(tl.int64)
+    g = pid % SPLIT
+    s = pid // SPLIT // B
+    b = (pid // SPLIT % B).to(tl.int64)
     out_row = tl.load(steps + s * 8 + 0)
     t0 = tl.load(steps + s * 8 + 5)
     t1 = tl.load(steps + s * 8 + 6)
@@ -269,7 +271,7 @@ def _block_block_kernel(element_mars, node_mars, temp, width, steps, triples, sk
     op = _out_ptr(out_row, element_mars, temp, out_first, out_width, temp_width, OUT_TEMP) + b * E * X
     mb = skip_bits + tl.load(triples + s).to(tl.int64) * TILES_I * TILES_J * WORDS
     NJ = tl.cdiv(X, TN)
-    for t in range(0, tl.cdiv(E, TM) * NJ):
+    for t in range(g * GROUP, tl.minimum(g * GROUP + GROUP, tl.cdiv(E, TM) * NJ)):
         ti = t // NJ
         tj = t % NJ
         i = ti * TM + tl.arange(0, TM)
@@ -395,6 +397,11 @@ BLOCK_BLOCK_TILES = dict(TM = 16, TN = 32, TK = 16, warps = 4)
 PRODUCT_PRECISION = "ieee"
 #: skip the (output tile, shared chunk) pairs the automaton cannot join; False computes every pair
 SKIP_EMPTY_TILES = True
+#: a ``block @ block`` launch with fewer (step, sample) pairs than this many per SM spreads each pair's output tiles
+#: over several programs (a tile's result does not depend on which program computes it). 16 from a sweep: a
+#: 600-state automaton x30 at batch 1, x8 at 4; Ctrl-G's on a 16-latent PD unchanged (more loses there: cheap tiles
+#: lose their operands' L1 reuse)
+BLOCK_BLOCK_PROGRAMS_PER_SM = 16
 
 
 def _tile(cols: int) -> int:
@@ -442,14 +449,18 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, input_mar
                 steps, triples = steps
                 cfg, skip = BLOCK_BLOCK_TILES, prog.skip
                 assert cfg["TK"] == skip.tk and cfg["TM"] % skip.tm == 0 and cfg["TN"] % skip.tn == 0
-                for first, size in grid_chunks(S * B, 0):
+                tiles = triton.cdiv(E_max, cfg["TM"]) * triton.cdiv(X_max, cfg["TN"])
+                split = min(tiles, triton.cdiv(BLOCK_BLOCK_PROGRAMS_PER_SM * prog.num_sms, S * B))
+                group = triton.cdiv(tiles, max(1, split))
+                split = triton.cdiv(tiles, group)                         # no group past the widest step's tiles
+                for first, size in grid_chunks(S * B * split, 0):
                     _block_block_kernel[(size,)](
                         element_mars, node_mars, temp, prog.width_t, steps, triples, skip.bits, B = B, n = n,
-                        TILES_I = skip.tiles_i, TILES_J = skip.tiles_j, WORDS = skip.words, pid0 = first,
-                        L_KIND = l_kind, R_KIND = r_kind, OUT_TEMP = out_temp, TM = cfg["TM"], TN = cfg["TN"],
-                        TK = cfg["TK"], SUB_I = cfg["TM"] // skip.tm, SUB_J = cfg["TN"] // skip.tn,
-                        SKIP = SKIP_EMPTY_TILES, PRECISION = PRODUCT_PRECISION, num_warps = cfg["warps"],
-                        num_stages = 1, **common)
+                        TILES_I = skip.tiles_i, TILES_J = skip.tiles_j, WORDS = skip.words, SPLIT = split,
+                        GROUP = group, pid0 = first, L_KIND = l_kind, R_KIND = r_kind, OUT_TEMP = out_temp,
+                        TM = cfg["TM"], TN = cfg["TN"], TK = cfg["TK"], SUB_I = cfg["TM"] // skip.tm,
+                        SUB_J = cfg["TN"] // skip.tn, SKIP = SKIP_EMPTY_TILES, PRECISION = PRODUCT_PRECISION,
+                        num_warps = cfg["warps"], num_stages = 1, **common)
             else:                                                            # "copy"
                 l_kind, out_temp = kinds
                 tile = _tile(E_max * X_max * B)

@@ -164,6 +164,28 @@ def test_skipping_empty_tiles_changes_nothing(build_pc, monkeypatch):
     assert_close(with_skip, cc.marginal(data, missing), n)
 
 
+def test_splitting_block_block_tiles_changes_nothing(build_pc, monkeypatch):
+    """Spreading every (step, sample)'s output tiles over as many programs as it has tiles gives what one program
+    per (step, sample) gives, bit for bit (a wide automaton: blocks of several tiles). The buffers are filled with
+    NaN before each call, so a tile no program writes shows."""
+    from pyjuice.constraints.backends.lifted.kernels import prod
+    rng = random.Random(0)
+    K, n = 48, 8
+    dfa = jc.DFA.from_dense(V, [[rng.randrange(K) for _ in range(V)] for _ in range(K)], 0, rng.sample(range(K), 12))
+    cc = jc.compile(dfa, build_pc("pd", n, V))
+    assert cc._lifted_program().skip.tiles_i > 1                          # blocks wider than one tile
+    data, missing = evidence(n, 4)
+
+    def marginal(per_sm):
+        monkeypatch.setattr(prod, "BLOCK_BLOCK_PROGRAMS_PER_SM", per_sm)
+        bufs = cc._buffers(data.size(0))
+        bufs["node_mars"].fill_(float("nan"))
+        bufs["element_mars"].fill_(float("nan"))
+        return cc.marginal(data, missing)
+
+    assert torch.equal(marginal(1 << 20), marginal(0))
+
+
 @pytest.mark.parametrize("kind", ["hmm", "pd", "hand_left"])
 def test_kernels_launch_past_the_grid_limits(kind, sum_path, build_pc, monkeypatch):
     """With CUDA's grid limits lowered to 3 programs on the first axis and 2 on the others, every kernel whose

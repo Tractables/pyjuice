@@ -91,6 +91,7 @@ class Program:
         root_first, root_end = pc._root_node_range
         self.root_region = region_of(root_first)
         self.root_rows = (root_first, root_end)
+        self.num_sms = torch.cuda.get_device_properties(dev).multi_processor_count if dev.type == "cuda" else 1
 
         # a one-child product over a sum is a copy of the sum's block: the sum layer that reads it reads the sum's
         # row instead, unless a dense node block reads it -- the dense path needs its children's rows contiguous --
