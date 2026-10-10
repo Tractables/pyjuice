@@ -113,20 +113,19 @@ def test_pruning_on_a_word_count_constraint():
 
 V = 3
 PC_KINDS = {"hmm": 6, "hmm_untied": 6, "hmm_block_sparse": 6, "pd": 8, "pd_prod_dominated": 8,
-            "pd_blockified": 8, "hand": 5, "hand_permuted": 5, "hand_unit": 4}      # see conftest.py
+            "pd_blockified": 8, "hand": 5, "hand_permuted": 5, "hand_unit": 4, "hand_left": 5}      # see conftest.py
 
 
 def rows_by_element(cc):
-    """(product layer index, element row) -> (pattern, child rows, boundaries), padding removed. Element
-    rows are only unique within a layer: every product layer reuses element_mars from its start."""
+    """(product layer index, element row) -> (child rows, boundaries), padding removed. Element rows are only
+    unique within a layer: every product layer reuses element_mars from its start."""
     out = {}
-    for li, layer in enumerate(cc.product_rows):
-        for pattern, (rows, child, bounds) in layer.items():
-            for r, ch, bd in zip(rows.tolist(), child.tolist(), bounds.tolist()):
-                assert (li, r) not in out                                  # every product node once
-                k = sum(c >= 0 for c in ch)
-                assert ch[k:] == [-1] * (len(ch) - k) and bd[k + 1:] == [-1] * (len(bd) - k - 1)
-                out[li, r] = (pattern, ch[:k], bd[:k + 1])
+    for li, (rows, child, bounds) in enumerate(cc.product_rows):
+        for r, ch, bd in zip(rows.tolist(), child.tolist(), bounds.tolist()):
+            assert (li, r) not in out                                      # every product node once
+            k = sum(c >= 0 for c in ch)
+            assert ch[k:] == [-1] * (len(ch) - k) and bd[k + 1:] == [-1] * (len(bd) - k - 1)
+            out[li, r] = (ch[:k], bd[:k + 1])
     return out
 
 
@@ -148,27 +147,25 @@ def test_product_rows_follow_the_edges_in_scope_order(kind, build_pc, reference)
         chs = [ns.chs[k] for k in order]
         child_rows = [ns.chs[k]._output_ind_range[0] + reference.product_child_index(ns, k) for k in order]
         bounds = [st.node(cs).scope_runs[0][0] for cs in chs] + [b + 1]
-        pattern = ("input_suffix" if len(chs) == 2 and chs[0].is_input() and not chs[1].is_input() and b == n - 1
-                   else "chain")
         for p in range(ns.num_nodes):
-            pat, ch, bd = got[layer_of[ns], ns._output_ind_range[0] + p]
-            assert pat == pattern and bd == bounds
+            ch, bd = got[layer_of[ns], ns._output_ind_range[0] + p]
+            assert bd == bounds
             assert ch == [int(c[p]) for c in child_rows]
             num_rows += 1
     assert num_rows == len(got)
 
 
-def test_hmm_products_are_input_suffix_except_the_last_position(build_pc):
+def test_hmm_products_are_an_input_then_a_suffix(build_pc):
     n = 6
     cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc("hmm", n, V))
     got = rows_by_element(cc)
     lo, hi = cc.input_range
-    for pattern, ch, bd in got.values():
+    for ch, bd in got.values():
         if bd == [n - 1, n]:                       # pyjuice's one-child product over the last input node
-            assert pattern == "chain" and len(ch) == 1 and lo <= ch[0] < hi
+            assert len(ch) == 1 and lo <= ch[0] < hi
         else:
             a = bd[0]
-            assert pattern == "input_suffix" and bd == [a, a + 1, n]
+            assert bd == [a, a + 1, n]
             assert lo <= ch[0] < hi and not lo <= ch[1] < hi            # the input node first, then the suffix
 
 
@@ -196,13 +193,12 @@ def test_tables_live_on_the_pcs_device_and_with_pc_reads_the_new_pc(build_pc):
     cb = ca.with_pc(pb)
     assert cb.layout is ca.layout and cb.automaton is ca.automaton
     assert cb.columns_per_sample == ca.columns_per_sample
-    assert [sorted(layer) for layer in cb.product_rows] == [sorted(layer) for layer in ca.product_rows]
+    assert len(cb.product_rows) == len(ca.product_rows)
     for la, lb in zip(ca.product_rows, cb.product_rows):
-        for pattern in la:
-            for ta, tb in zip(la[pattern], lb[pattern]):
-                assert ta.dtype == tb.dtype == torch.int32
-                assert ta.device == pa.device and tb.device.type == "cpu"     # each PC's own tables
-                assert torch.equal(ta.cpu(), tb)
+        for ta, tb in zip(la, lb):
+            assert ta.dtype == tb.dtype == torch.int32
+            assert ta.device == pa.device and tb.device.type == "cpu"         # each PC's own tables
+            assert torch.equal(ta.cpu(), tb)
 
 
 def test_a_graph_compiled_again_is_refused():

@@ -128,11 +128,6 @@ def _build(dfa: DFA, n: int) -> BoundaryLayout:
 # The PC side
 # -------------------------------------------------------------------------------------------------
 
-#: Product patterns. "input_suffix": an input node at position ``a`` followed by an inner node over
-#: ``[a + 1, n - 1]`` (every product of a right-linear PC, e.g. an HMM). "chain": any other product.
-PRODUCT_PATTERNS = ("input_suffix", "chain")
-
-
 def build_pc_tables(structure, layout: BoundaryLayout, pc) -> Dict[str, Any]:
     """
     Everything the lifted forward reads about the circuit, as int32 tensors on the PC's device.
@@ -156,11 +151,11 @@ def build_pc_tables(structure, layout: BoundaryLayout, pc) -> Dict[str, Any]:
     :returns: a dict with
 
         * ``columns_per_sample`` -- S, the most columns any node keeps per sample;
-        * ``product_rows`` -- one dict per product layer, in ``pc.inner_layer_groups`` order, mapping each
-          pattern in :data:`PRODUCT_PATTERNS` that occurs to ``(out_rows [R], child_rows [R, k],
-          boundaries [R, k + 1])``: every product node's element row, its children's node rows in scope
-          order, and the boundaries before, between and after them (``-1`` padding for rows with fewer
-          than ``k`` children);
+        * ``product_rows`` -- one ``(out_rows [R], child_rows [R, k], boundaries [R, k + 1])`` per product
+          layer, in ``pc.inner_layer_groups`` order: every product node's element row, its children's node
+          rows in scope order, and the boundaries before, between and after them (``-1`` padding for rows
+          with fewer than ``k`` children). Nothing about the circuit's shape is singled out: the lifted
+          product kernels read every product from this one table;
         * ``input_range`` -- the ``node_mars`` rows ``(first, last + 1)`` of all input nodes;
         * ``root_rows`` -- the ``node_mars`` rows ``(first, last + 1)`` of the root nodes;
         * ``sum_regions`` -- one ``(first_row, end_row, slots)`` per sum node group, in row order: its
@@ -213,20 +208,18 @@ def build_pc_tables(structure, layout: BoundaryLayout, pc) -> Dict[str, Any]:
         if not lg.is_prod():
             continue
         for layer in lg.layers:
-            parts = {p: [] for p in PRODUCT_PATTERNS}
+            parts = []
             for ns in layer.nodes:
                 (a, b), = info_of[ns].scope_runs
                 order = sorted(range(len(ns.chs)), key = lambda k: info_of[ns.chs[k]].scope_runs[0][0])
                 chs = [ns.chs[k] for k in order]
                 starts = [info_of[cs].scope_runs[0][0] for cs in chs]
-                pattern = ("input_suffix" if len(chs) == 2 and chs[0].is_input() and not chs[1].is_input()
-                           and b == n - 1 else "chain")
                 child_rows = torch.stack([first_row[cs] + _product_child_index(ns, k) for cs, k in zip(chs, order)],
                                          dim = 1)                                       # [num_nodes, k]
                 bounds = torch.tensor(starts + [b + 1]).expand(ns.num_nodes, -1)
                 out = first_row[ns] + torch.arange(ns.num_nodes)
-                parts[pattern].append((out, child_rows, bounds))
-            product_rows.append({p: _concat_padded(rows, dev) for p, rows in parts.items() if rows})
+                parts.append((out, child_rows, bounds))
+            product_rows.append(_concat_padded(parts, dev))
 
     # buffer regions: every sum node group keeps exactly its own block per sample; a product layer group
     # (scratch, consumed by the next sum layer) keeps its largest product's block

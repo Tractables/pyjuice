@@ -259,6 +259,19 @@ def hand_unit(V):
     return summate(multiply(s01, s23), num_node_blocks = 1, block_size = 1)
 
 
+def hand_left(V):
+    """Left-linear chains, over 5 variables. Prefix sums times the next input (`block @ input` before and at the
+    sequence end), and a three-child product with inputs at both ends, whose first step writes scratch."""
+    cat = lambda: dists.Categorical(num_cats = V)
+    x = [inputs(v, num_node_blocks = 2, block_size = 2, dist = cat()) for v in range(5)]
+    pre = summate(x[0], num_node_blocks = 2, block_size = 2)                          # [0, 0]
+    for v in (1, 2, 3):
+        pre = summate(multiply(pre, x[v]), num_node_blocks = 2, block_size = 2)       # [0, v]: a prefix, then an input
+    s12 = summate(multiply(x[1], x[2]), num_node_blocks = 2, block_size = 2)          # [1, 2]
+    s03 = summate(multiply(x[0], s12, x[3]), num_node_blocks = 2, block_size = 2)     # [0, 3]: inputs at both ends
+    return summate(multiply(pre, x[4]), multiply(s03, x[4]), num_node_blocks = 1, block_size = 1)
+
+
 #: Every kind :func:`build_pc` makes, with the number of variables its circuit needs (None: any).
 PC_KINDS = {
     "hmm": None,                 # tied HMM, one node block per position
@@ -270,6 +283,7 @@ PC_KINDS = {
     "hand": 5,                   # :func:`hand_built`
     "hand_permuted": 5,          # :func:`hand_permuted`
     "hand_unit": 4,              # :func:`hand_unit`
+    "hand_left": 5,              # :func:`hand_left`
 }
 
 
@@ -299,7 +313,7 @@ def build_pc(kind, n, V, seed = 0, device = torch.device("cuda:0"), **compile_kw
         base.init_parameters(perturbation = 2.0)
         ns = juice.blockify(base, sparsity_tolerance = 0.5, max_target_block_size = 4)
     else:
-        ns = {"hand": hand_built, "hand_permuted": hand_permuted, "hand_unit": hand_unit}[kind](V)
+        ns = {"hand": hand_built, "hand_permuted": hand_permuted, "hand_unit": hand_unit, "hand_left": hand_left}[kind](V)
     ns.init_parameters(perturbation = 2.0)
     return juice.compile(ns, verbose = False, **compile_kwargs).to(device)
 

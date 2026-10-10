@@ -29,9 +29,9 @@ DEV = torch.device("cuda:0")
 
 # kind (see `PC_KINDS` in conftest.py) -> n, for the identity tests and for brute force
 KINDS = {"hmm": 6, "hmm_untied": 6, "hmm_block_sparse": 6, "pd": 8, "pd_prod_dominated": 8, "pd_blockified": 8,
-         "hand": 5, "hand_permuted": 5, "hand_unit": 4}
+         "hand": 5, "hand_permuted": 5, "hand_unit": 4, "hand_left": 5}
 TINY = {"hmm": 5, "hmm_untied": 5, "hmm_block_sparse": 5, "pd": 4, "pd_prod_dominated": 5, "pd_blockified": 5,
-        "hand": 5, "hand_permuted": 5, "hand_unit": 4}
+        "hand": 5, "hand_permuted": 5, "hand_unit": 4, "hand_left": 5}
 
 
 def evidence(n, V, B = 6, seed = 0):

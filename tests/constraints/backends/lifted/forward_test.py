@@ -14,7 +14,7 @@ import pyjuice.constraints as jc
 
 V = 3
 KINDS = {"hmm": 6, "hmm_untied": 6, "hmm_block_sparse": 6, "pd": 8, "pd_prod_dominated": 8, "pd_blockified": 8,
-         "hand": 5, "hand_permuted": 5, "hand_unit": 4}                     # see conftest.py
+         "hand": 5, "hand_permuted": 5, "hand_unit": 4, "hand_left": 5}                     # see conftest.py
 
 CONSTRAINTS = {
     "contains": lambda: jc.DFA.contains([[1, 2]], V),

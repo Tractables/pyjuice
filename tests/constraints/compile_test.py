@@ -206,7 +206,7 @@ def test_to_moves_the_pc_and_the_tables_together():
         assert cc.to(device) is cc
         want = torch.device(device)
         assert cc.pc.params.device.type == want.type
-        assert all(t.device == cc.pc.params.device for layer in cc.product_rows for rows in layer.values() for t in rows)
+        assert all(t.device == cc.pc.params.device for rows in cc.product_rows for t in rows)
         x = torch.randint(0, V, (3, 6))
         if want.type == "cuda":                                    # the guard passes: queries run
             assert torch.isfinite(cc.marginal(x, torch.ones(6, dtype = torch.bool))).all()

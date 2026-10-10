@@ -42,7 +42,7 @@ class ConstrainedCircuit:
         over the PC's variables
     :ivar columns_per_sample: the most slots any sum or product node's block takes per sample
         (see :func:`~pyjuice.constraints.backends.lifted.plan.build_pc_tables`)
-    :ivar product_rows: per product layer and pattern, the rows and boundaries the lifted products read
+    :ivar product_rows: per product layer, the rows and boundaries the lifted products read
     :ivar input_range: the ``node_mars`` rows of all input nodes
     :ivar root_rows: the ``node_mars`` rows of the root nodes
     :ivar sum_regions: ``(first_row, end_row, slots)`` of every sum node group's region in ``node_mars``
@@ -96,8 +96,7 @@ class ConstrainedCircuit:
         """
         self._pc.to(device)
         device = self._pc.params.device
-        self.product_rows = [{pattern: tuple(t.to(device) for t in rows) for pattern, rows in layer.items()}
-                             for layer in self.product_rows]
+        self.product_rows = [tuple(t.to(device) for t in rows) for rows in self.product_rows]
         self._storage, self._layouts = {}, {}       # the buffers are allocated again on the new device
         self._program = None                        # and the forward's tables built again there
         self._device = device
