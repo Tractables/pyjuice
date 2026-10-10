@@ -62,6 +62,9 @@ STACK_MAX_COLUMNS = {"fp32": 2048, "tf32": 16384}
 #: program, bit-identical: 13.8k- / 49k-state automata x1.09-1.15 with a prefix, x1.16-1.31 on the 49k one without;
 #: batch 16 x1.02-1.18. 1: one step per program.
 INPUT_BLOCK_GROUP = 8
+#: the other group sizes the Program builds tables for: the autotuner times every one per launch shape (see
+#: :func:`~.kernels.prod.run_products`); 16 measured best on a 168-state automaton at batch 16 (x1.05 over 8)
+INPUT_BLOCK_GROUP_ALTERNATIVES = (16, 4)
 
 #: Floats of transition masses (see :func:`~.kernels.prod.transition_masses`) held at once: when every input step's
 #: fit, they are all kept, built once per computation of the class masses; else built launch by launch, in chunks
@@ -223,8 +226,9 @@ class Program:
             if not self.trans.grouped:
                 chunks = [(0, st.size(0), None)]
                 if form == "input_block" and kinds[0] != IDENTITY and INPUT_BLOCK_GROUP > 1:
-                    st, firsts = _step_groups(st, INPUT_BLOCK_GROUP)
-                    groups = (INPUT_BLOCK_GROUP, firsts.to(dev, torch.int32))
+                    sizes_g = dict.fromkeys((INPUT_BLOCK_GROUP, *INPUT_BLOCK_GROUP_ALTERNATIVES))   # default first
+                    st, firsts = _step_groups(st, [G for G in sizes_g if G > 1])
+                    groups = {G: f.to(dev, torch.int32) for G, f in firsts.items()}
             elif self.trans_persistent:
                 st[:, 6] = self.trans_size + torch.cumsum(z, 0) - z
                 self.trans_size += int(z.sum())
@@ -383,10 +387,10 @@ def _intervals(steps) -> set:
     return out
 
 
-def _step_groups(st: torch.Tensor, G: int):
+def _step_groups(st: torch.Tensor, sizes):
     """An ``input @ block`` launch's steps (host rows, see :data:`~.kernels.prod.INPUT_BLOCK_FIELDS`) sorted by their
-    position and block end, and ``firsts`` [groups + 1]: the first step of every group of at most ``G`` consecutive
-    steps that share both, then the end."""
+    position and block end, and per group size ``G`` of ``sizes``, ``firsts`` [groups + 1]: the first step of every
+    group of at most ``G`` consecutive steps that share both, then the end."""
     key = st[:, 2] * (int(st[:, 5].max()) + 1) + st[:, 5]
     order = torch.sort(key, stable = True).indices
     st, key = st[order], key[order]
@@ -394,8 +398,8 @@ def _step_groups(st: torch.Tensor, G: int):
     change = torch.ones(st.size(0), dtype = torch.bool)
     change[1:] = key[1:] != key[:-1]
     run_first = torch.cummax(torch.where(change, k, 0), 0).values           # the first step of each step's run
-    firsts = torch.nonzero((k - run_first) % G == 0).flatten()
-    return st, torch.cat([firsts, torch.tensor([st.size(0)])])
+    end = torch.tensor([st.size(0)])
+    return st, {G: torch.cat([torch.nonzero((k - run_first) % G == 0).flatten(), end]) for G in sizes}
 
 
 def _stack_key(blocks, E: int, block_size: int):

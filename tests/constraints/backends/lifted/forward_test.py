@@ -495,8 +495,9 @@ def input_block_launches(cc):
 
 
 def input_block_groups(cc):
-    """``(steps [S, 7], firsts)`` of every ``input @ block`` launch whose steps run in groups."""
-    return [(steps.cpu(), groups[1].cpu()) for _, steps, groups in input_block_launches(cc) if groups is not None]
+    """``(steps [S, 7], {G: firsts})`` of every ``input @ block`` launch whose steps run in groups."""
+    return [(steps.cpu(), {G: f.cpu() for G, f in groups.items()}) for _, steps, groups in input_block_launches(cc)
+            if groups is not None]
 
 
 class CountingKernel:
@@ -537,7 +538,8 @@ def test_grouped_input_steps_change_nothing(kind, B, G, build_pc, monkeypatch):
         kernel.launches = 0
         out = cc.marginal(data, missing)
         blocks = sum(kinds[0] != prod.IDENTITY for kinds, _, _ in input_block_launches(cc))
-        assert len(input_block_groups(cc)) == kernel.launches == (blocks if group > 1 else 0)
+        assert len(input_block_groups(cc)) == (blocks if group > 1 else 0)
+        assert (kernel.launches > 0) == (group > 1 and blocks > 0)                # (several when tuning)
         return out
 
     for miss in (missing, torch.ones_like(missing)):
@@ -566,10 +568,103 @@ def test_narrow_launches_run_one_step_per_program(build_pc, reference, monkeypat
         assert (kernel.launches > 0) == launched
 
 
+def tuned_sites(cc, B):
+    """The autotuned launch sites a query of ``B`` samples reaches (``GROUP_MIN_LANES`` 0): block @ block, and the
+    grouped input @ block steps."""
+    sites = set()
+    for kind, _, layers in cc._lifted_program().steps:
+        for stages, _, _ in (layers if kind == "prod" else []):
+            for launch in (l for launches in stages for l in launches):
+                if launch[0] == "block_block":
+                    sites.add("lifted_block_block")
+                elif launch[0] == "input_block" and launch[2][2] is not None:
+                    sites.add("lifted_input_block_group")
+    return sites
+
+
+@pytest.mark.parametrize("kind", list(KINDS))
+def test_every_tuned_candidate_gives_the_same_marginal(kind, build_pc, monkeypatch):
+    """The autotuned launch sites (block @ block's tiles; the grouped input @ block steps' group size and
+    log-sum-exp step) give the same marginal whichever candidate runs, and the chosen one is what launches: each
+    offered one forced in turn, with evidence (pruned) and without. The buffers are filled with NaN before each call.
+    Up to fp32 rounding: a block @ block tile sets its dots' accumulation order (on a 16-latent PD ~1e-7 relative);
+    the group candidates are bit-identical (test_grouped_input_steps_change_nothing,
+    test_one_exp_lse_step_is_the_two_exp_one)."""
+    import pyjuice.constraints.backends.lifted.forward as F
+    from pyjuice.constraints.backends.lifted.kernels import prod
+    monkeypatch.setattr(F, "GROUP_MIN_RATIO", 1 << 30)                       # transitions class by class
+    monkeypatch.setattr(prod, "GROUP_MIN_LANES", 0)                          # groups however narrow the launch
+    n, B = KINDS[kind], 4
+    cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
+    data, missing = evidence(n, B)
+    offered, chosen, launched = {}, set(), set()
+    for name, fields in (("_block_block_kernel", ("TM", "TN", "TK", "num_warps")),
+                         ("_input_block_group_kernel", ("G", "ONE_EXP"))):
+        kernel = getattr(prod, name)
+        monkeypatch.setattr(prod, name, type("Recording", (), {"__getitem__": lambda self, grid, kernel = kernel,
+            fields = fields: lambda *a, **k: launched.add(tuple(k[f] for f in fields)) or kernel[grid](*a, **k)})())
+
+    def marginal(k, missing):
+        def pick(key, candidates, bench, **kw):
+            offered.setdefault(key[0], set()).add(len(candidates))
+            chosen.add(candidates[min(k, len(candidates) - 1)])
+            return candidates[min(k, len(candidates) - 1)]
+        monkeypatch.setattr(prod.autotune, "pick", pick)
+        chosen.clear(), launched.clear()
+        bufs = cc._buffers(B)
+        bufs["node_mars"].fill_(float("nan"))
+        bufs["element_mars"].fill_(float("nan"))
+        out = cc.marginal(data, missing)
+        expected = set()                                              # what was chosen reached the kernels:
+        for c in chosen:
+            if len(c) == 2:                                           # (group size: launched as a power of 2,
+                expected.add((triton.next_power_of_2(c[0]), c[1]))    # one exp)
+            else:                                                     # (TM, TN, TK, warps)
+                expected.add(c)
+        assert launched == expected, (launched, chosen)
+        return out
+
+    for miss in (missing, torch.ones_like(missing)):
+        want = marginal(0, miss)
+        for k in range(1, max((max(c) for c in offered.values()), default = 1)):
+            assert_close(marginal(k, miss), want, n)
+    assert set(offered) == tuned_sites(cc, B)
+    assert all(c == {len(prod.BLOCK_BLOCK_TILES)} for site, c in offered.items() if site == "lifted_block_block")
+    assert all(c == {2 * (1 + len(F.INPUT_BLOCK_GROUP_ALTERNATIVES))} for site, c in offered.items()
+               if site == "lifted_input_block_group")
+
+
+@pytest.mark.parametrize("kind", ["hmm", "pd"])
+def test_tuning_runs_once_per_launch_shape(kind, build_pc, monkeypatch):
+    """The first query benchmarks each tuned launch shape once; later ones reuse the choice. With autotuning off,
+    nothing is benchmarked."""
+    import pyjuice.constraints.backends.lifted.forward as F
+    from pyjuice.constraints.backends.lifted.kernels import prod
+    from pyjuice.layer.kernels import autotune
+    monkeypatch.setattr(prod, "GROUP_MIN_LANES", 0)
+    monkeypatch.setattr(F, "GROUP_MIN_RATIO", 1 << 30)
+    monkeypatch.setattr(autotune, "_CACHE", {})                              # nothing tuned yet
+    timed, best_of = [], autotune.best_of
+    monkeypatch.setattr(autotune, "best_of", lambda *a, **k: timed.append(1) or best_of(*a, **k))
+    n = KINDS[kind]
+    cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
+    data, missing = evidence(n, 4)
+    monkeypatch.setattr(autotune, "ENABLED", False)
+    cc.marginal(data, missing)
+    assert timed == []
+    monkeypatch.setattr(autotune, "ENABLED", True)
+    cc.marginal(data, missing)
+    first = len(timed)
+    assert first > 0 and first == sum(1 for k in autotune._CACHE if k[1][0].startswith("lifted_"))
+    cc.marginal(data, missing)
+    assert len(timed) == first
+
+
 @pytest.mark.parametrize("kind", ["hmm", "hand", "hand_permuted"])
 def test_input_steps_group_by_position(kind, build_pc, monkeypatch):
-    """Groups of ``input @ block`` steps never mix positions or block ends, hold at most INPUT_BLOCK_GROUP steps,
-    and cover every step once -- also where one launch holds steps at several positions (one of "hand"'s)."""
+    """Groups of ``input @ block`` steps never mix positions or block ends, hold at most their table's group size
+    (INPUT_BLOCK_GROUP's, then every alternative's), and cover every step once -- also where one launch holds steps
+    at several positions (one of "hand"'s)."""
     import pyjuice.constraints.backends.lifted.forward as F
     monkeypatch.setattr(F, "GROUP_MIN_RATIO", 1 << 30)
     monkeypatch.setattr(F, "INPUT_BLOCK_GROUP", 3)
@@ -578,11 +673,13 @@ def test_input_steps_group_by_position(kind, build_pc, monkeypatch):
     launches = input_block_groups(cc)
     assert launches
     mixed = False
-    for steps, firsts in launches:
-        assert firsts[0] == 0 and firsts[-1] == steps.size(0) and (firsts[1:] > firsts[:-1]).all()
-        assert (firsts[1:] - firsts[:-1] <= 3).all()
-        for a, b in zip(firsts[:-1].tolist(), firsts[1:].tolist()):
-            assert len({(t, t2) for t, t2 in steps[a:b][:, [2, 5]].tolist()}) == 1
+    for steps, tables in launches:
+        assert list(tables) == [3, *F.INPUT_BLOCK_GROUP_ALTERNATIVES]                # the default first
+        for G, firsts in tables.items():
+            assert firsts[0] == 0 and firsts[-1] == steps.size(0) and (firsts[1:] > firsts[:-1]).all()
+            assert (firsts[1:] - firsts[:-1] <= G).all()
+            for a, b in zip(firsts[:-1].tolist(), firsts[1:].tolist()):
+                assert len({(t, t2) for t, t2 in steps[a:b][:, [2, 5]].tolist()}) == 1
         mixed |= len({(t, t2) for t, t2 in steps[:, [2, 5]].tolist()}) > 1
     assert mixed == (kind == "hand")
 
