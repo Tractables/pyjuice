@@ -6,8 +6,10 @@ rows and boundaries the lifted forward reads for every node of the circuit.
 Boundary ``t`` (``t = 0, ..., n``) is the point just before the PC reads ``x_t``. A state is ACTIVE at
 boundary ``t`` if it is reachable from the initial state in exactly ``t`` tokens and can still reach an
 accepting state in exactly ``n - t`` tokens; every other state contributes nothing to any accepted
-string of length ``n`` and gets no column. Columns at a boundary are its active states in increasing
-state id.
+string of length ``n`` and gets no column. Columns at a boundary are its active states, farthest from
+acceptance first (the automaton's shortest number of tokens to an accepting state), ties by state id: any order
+is valid, and this one gathers the (column, column) pairs the automaton cannot join into whole tiles, which the
+product kernels skip (:class:`Reachability`).
 
 The layout depends only on the automaton and ``n`` -- never on the PC, its parameters or evidence -- so it
 is built once and cached by the automaton's fingerprint.
@@ -15,9 +17,10 @@ is built once and cached by the automaton's fingerprint.
 
 from __future__ import annotations
 
+import math
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 import torch
 
@@ -32,7 +35,8 @@ class BoundaryLayout:
     :ivar n: number of positions
     :ivar token_class: [V] the automaton's token classes
     :ivar width: [n+1] number of active states (columns) per boundary
-    :ivar state_id: [n+1, W] automaton state of every column, ``-1`` for padding (``W`` = max width)
+    :ivar state_id: [n+1, W] automaton state of every column, ``-1`` for padding (``W`` = max width); a
+        boundary's columns run from the state farthest from acceptance to the nearest, ties by state id
     :ivar col_of_state: [n+1, K] column of every automaton state, ``-1`` if inactive
     :ivar next_col: [n, W, C] column at boundary ``t+1`` reached from column ``k`` at ``t`` by a token of
         class ``c``; ``-1`` if that successor is inactive (pruned or dead) or ``k`` is padding
@@ -99,15 +103,18 @@ def _build(dfa: DFA, n: int) -> BoundaryLayout:
     for t in range(n):
         reach[t + 1, delta[reach[t]].flatten()] = True
     # ... and able to reach acceptance in exactly n - t more tokens
-    co_reach = torch.stack([dfa.accept_within(n - t) for t in range(n + 1)], dim = 0)
-    active = reach & co_reach                                               # [n+1, K]
+    accept_in = torch.stack([dfa.accept_within(r) for r in range(n + 1)], dim = 0)     # [r, K]
+    active = reach & accept_in.flip(0)                                      # [n+1, K]
+    # the column order: the fewest tokens to acceptance (within n), descending, then the state id
+    to_accept = torch.where(accept_in.any(dim = 0), accept_in.to(torch.uint8).argmax(dim = 0), n + 1)
 
     width = active.sum(dim = 1)
     W = max(int(width.max()), 1)
     state_id = torch.full((n + 1, W), -1, dtype = torch.long)
     col_of_state = torch.full((n + 1, K), -1, dtype = torch.long)
     for t in range(n + 1):
-        ids = torch.nonzero(active[t]).flatten()                            # increasing state id
+        ids = torch.nonzero(active[t]).flatten()
+        ids = ids[torch.argsort((n + 1 - to_accept[ids]) * K + ids)]
         state_id[t, :ids.numel()] = ids
         col_of_state[t, ids] = torch.arange(ids.numel())
 
@@ -122,6 +129,67 @@ def _build(dfa: DFA, n: int) -> BoundaryLayout:
     return BoundaryLayout(n = n, token_class = dfa.token_class, width = width, state_id = state_id,
                           col_of_state = col_of_state, next_col = next_col,
                           satisfiable = bool(width[0] > 0))
+
+
+class Reachability:
+    """
+    Which (column at boundary ``a``, column at boundary ``b``) pairs the automaton joins in exactly ``b - a``
+    tokens -- the entries of a block over ``[a, b)`` that are not structurally ``-inf``. A sequence end (``b ==
+    n``) is one column, joined from every column that can still accept. The pairs are kept per interval only as
+    TILE OCCUPANCY (does tile ``(I, J)`` of ``tile x tile`` columns hold a pair?), computed on demand, one forward
+    sweep per entry boundary, with the pair matrices dropped as the sweep moves on.
+
+    :param layout: the constraint's layout
+    :param tile: the side of an occupancy tile, in columns
+    """
+
+    def __init__(self, layout: BoundaryLayout, tile: int = 16):
+        self.n = layout.n
+        self.width = [int(w) for w in layout.width.tolist()]
+        self.tile = tile
+        self._next_col = layout.next_col
+        self._occupancy: Dict[Tuple[int, int], torch.Tensor] = {}
+
+    def exit_width(self, b: int) -> int:
+        return 1 if b == self.n else self.width[b]
+
+    def _advance(self, cur: torch.Tensor, t: int) -> torch.Tensor:
+        """[R, width[t]] 0/1 -> [R, width[t + 1]]: the columns one token on (a scatter through next_col)."""
+        k, c = torch.nonzero(self._next_col[t, :self.width[t]] >= 0, as_tuple = True)
+        nxt = torch.zeros(cur.size(0), self.width[t + 1])
+        nxt.index_add_(1, self._next_col[t, k, c], cur[:, k])
+        return (nxt > 0).to(cur.dtype)
+
+    def _sweep(self, a: int):
+        """Every interval starting at ``a``: pairs (a, b) for b = a, ..., n, kept as occupancy."""
+        cur = torch.eye(self.width[a])
+        for b in range(a, self.n + 1):
+            if b > a:
+                cur = self._advance(cur, b - 1)
+            pairs = cur.amax(dim = 1, keepdim = True) if b == self.n else cur
+            self._occupancy[a, b] = _tile_any(pairs > 0, self.tile, self.tile)
+
+    def pairs(self, a: int, b: int) -> torch.Tensor:
+        """bool [width[a], exit width at b]: the joined pairs (computed afresh, not cached)."""
+        cur = torch.eye(self.width[a])
+        for t in range(a, b):
+            cur = self._advance(cur, t)
+        return (cur.amax(dim = 1, keepdim = True) if b == self.n else cur) > 0
+
+    def occupancy(self, a: int, b: int) -> torch.Tensor:
+        """bool [ceil(width[a] / tile), ceil(exit width at b / tile)]."""
+        if (a, b) not in self._occupancy:
+            self._sweep(a)
+        return self._occupancy[a, b]
+
+
+def _tile_any(m: torch.Tensor, tr: int, tc: int) -> torch.Tensor:
+    """[ceil(R / tr), ceil(C / tc)]: whether each tr x tc tile of the bool matrix ``m`` holds a True."""
+    R, C = m.shape
+    I, J = math.ceil(R / tr), math.ceil(C / tc)
+    p = torch.zeros(I * tr, J * tc, dtype = torch.bool)
+    p[:R, :C] = m
+    return p.view(I, tr, J, tc).any(dim = 3).any(dim = 1)
 
 
 # -------------------------------------------------------------------------------------------------

@@ -22,10 +22,10 @@ from typing import Optional
 import torch
 
 from .kernels.inputs import class_masses, input_class_tables
-from .kernels.prod import IDENTITY, SUM, TEMP, predecessor_tables
+from .kernels.prod import IDENTITY, SUM, TEMP, predecessor_tables, skip_masks
 from .kernels.prod import run_products as products
 from .kernels.sum import dense_groups, dense_sum, fused_sum
-from .plan import _align
+from .plan import Reachability, _align
 
 #: Matrix-product precision of the kernels: "fp32" (three TF32 products, fp32-level accuracy) or "tf32".
 PRECISIONS = {"fp32": "tf32x3", "tf32": "tf32"}
@@ -88,6 +88,21 @@ class Program:
         root_first, root_end = pc._root_node_range
         self.root_region = region_of(root_first)
         self.root_rows = (root_first, root_end)
+
+        # which (output tile, shared chunk) pairs every block @ block step can skip: one mask per boundary triple,
+        # each step's launch carrying its triple's index
+        triples = {}
+        bb = [(launches, li) for kind, _, layers in self.steps if kind == "prod" for stages, _, _ in layers
+              for launches in stages for li, launch in enumerate(launches) if launch[0] == "block_block"]
+        for launches, li in bb:
+            for tri in launches[li][2][0][:, 5:8].tolist():
+                triples.setdefault(tuple(tri), len(triples))
+        self.skip_triples = list(triples)
+        self.skip = skip_masks(Reachability(layout), self.skip_triples, device = dev)
+        for launches, li in bb:
+            form, kinds, steps, E, X = launches[li]
+            idx = torch.tensor([triples[tuple(t)] for t in steps[0][:, 5:8].tolist()], dtype = torch.int32, device = dev)
+            launches[li] = (form, kinds, steps + (idx,), E, X)
 
     def _entry(self, t: int) -> int:
         return self.width[t]                                         # boundary 0: the initial state alone

@@ -155,7 +155,7 @@ def test_compile_a_ctrlg_case(case, setting):
     for t in range(n + 1):
         w = int(lay.width[t])
         active = lay.state_id[t, :w]
-        assert active.tolist() == sorted(set(states[want, t].tolist())), t      # increasing state id
+        assert sorted(active.tolist()) == sorted(set(states[want, t].tolist())), t   # order: plan_test
         assert (lay.state_id[t, w:] == -1).all()
 
     # walking next_col: alive exactly while the prefix can still be completed, on the automaton's state

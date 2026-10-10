@@ -6,7 +6,8 @@ import torch
 
 import pyjuice as juice
 import pyjuice.constraints as jc
-from pyjuice.constraints.backends.lifted.plan import build_layout
+from pyjuice.constraints.backends.lifted.kernels.prod import skip_masks
+from pyjuice.constraints.backends.lifted.plan import Reachability, _tile_any, build_layout
 
 
 def random_dfa(K, V, seed):
@@ -82,6 +83,128 @@ def test_successors_are_consistent():
                     expect = int(L.col_of_state[t + 1, succ])
                     assert int(cols[c]) == expect                    # -1 exactly when inactive at t + 1
             assert (L.next_col[t, int(L.width[t]):] == -1).all()     # padding columns lead nowhere
+
+
+def to_accept(dfa, n):
+    """The fewest tokens from every state to an accepting state, n + 1 if more than n."""
+    acc = torch.stack([dfa.accept_within(r) for r in range(n + 1)])
+    return torch.where(acc.any(dim = 0), acc.to(torch.uint8).argmax(dim = 0), n + 1)
+
+
+def test_columns_are_ordered_by_distance_to_acceptance():
+    for seed in range(15):
+        dfa = random_dfa(6, 3, seed)
+        for n in (1, 3, 6):
+            L = build_layout(dfa, n)
+            d = to_accept(dfa, n)
+            for t in range(n + 1):
+                keys = [(-int(d[s]), s) for s in L.state_id[t, :int(L.width[t])].tolist()]
+                assert keys == sorted(keys), (seed, n, t)                  # farthest first, then by state id
+
+
+def brute_pairs(dfa, L, a, b, V):
+    """[width at a, exit width at b]: some string of b - a tokens leads column i to column j (b == n: accepts)."""
+    n = L.n
+    wb = 1 if b == n else int(L.width[b])
+    out = torch.zeros(int(L.width[a]), wb, dtype = torch.bool)
+    for i in range(int(L.width[a])):
+        for tokens in itertools.product(range(V), repeat = b - a):
+            e = dfa.run(list(tokens), state = int(L.state_id[a, i]))
+            if b == n:
+                out[i, 0] |= bool(dfa.accept[e])
+            elif L.col_of_state[b, e] >= 0:
+                out[i, L.col_of_state[b, e]] = True
+    return out
+
+
+def test_reachability_matches_brute_force():
+    V, n = 3, 5
+    for seed in range(10):
+        dfa = random_dfa(5, V, seed)
+        L = build_layout(dfa, n)
+        if not L.satisfiable:
+            continue
+        reach = Reachability(L, tile = 2)
+        for a in range(n + 1):
+            for b in range(a, n + 1):
+                want = brute_pairs(dfa, L, a, b, V)
+                assert torch.equal(reach.pairs(a, b), want), (seed, a, b)
+                assert torch.equal(reach.occupancy(a, b), _tile_any(want, 2, 2)), (seed, a, b)
+
+
+def definition_masks(reach, triples, tm, tn, tk):
+    """The SkipMasks bits, straight from the pairs: [triples, tiles_i, tiles_j, chunks] bool."""
+    out = []
+    for a, b, c in triples:
+        lp, rp = reach.pairs(a, b), reach.pairs(b, c)
+        I, J, C = -(-lp.size(0) // tm), -(-rp.size(1) // tn), -(-lp.size(1) // tk)
+        out.append(torch.tensor([[[bool(lp[ti * tm:(ti + 1) * tm, ch * tk:(ch + 1) * tk].any()) and
+                                   bool(rp[ch * tk:(ch + 1) * tk, tj * tn:(tj + 1) * tn].any())
+                                   for ch in range(C)] for tj in range(J)] for ti in range(I)]).view(I, J, C))
+    return out
+
+
+def mask_bits(m, s, ti, tj, c):
+    w = int(m.bits[((s * m.tiles_i + ti) * m.tiles_j + tj) * m.words + c // 32])
+    return bool((w >> (c % 32)) & 1)
+
+
+@pytest.mark.parametrize("tiles", [(1, 1, 1), (2, 2, 2), (2, 1, 3), (4, 2, 2)])
+def test_skip_masks_are_exact(tiles):
+    V, n = 3, 6
+    for seed in range(6):
+        dfa = random_dfa(6, V, seed)
+        L = build_layout(dfa, n)
+        if not L.satisfiable:
+            continue
+        reach = Reachability(L, tile = 1)
+        triples = [(a, b, c) for a in range(n) for b in range(a + 1, n) for c in range(b + 1, n + 1)]
+        m = skip_masks(reach, triples, *tiles)
+        for s, want in enumerate(definition_masks(reach, triples, *tiles)):
+            I, J, C = want.shape
+            for ti in range(m.tiles_i):
+                for tj in range(m.tiles_j):
+                    for c in range(32 * m.words):
+                        expect = ti < I and tj < J and c < C and bool(want[ti, tj, c])
+                        assert mask_bits(m, s, ti, tj, c) == expect, (seed, triples[s], ti, tj, c)
+
+
+def test_larger_tiles_or_their_sub_tiles():
+    """A kernel with 2x2 base tiles per output tile may OR the base masks: the result is the larger tile's mask."""
+    V, n = 3, 6
+    for seed in range(6):
+        dfa = random_dfa(8, V, seed)
+        L = build_layout(dfa, n)
+        if not L.satisfiable:
+            continue
+        reach = Reachability(L, tile = 1)
+        triples = [(a, b, c) for a in range(n) for b in range(a + 1, n) for c in range(b + 1, n + 1)]
+        base, big = skip_masks(reach, triples, 1, 1, 1), skip_masks(reach, triples, 2, 2, 1)
+        for s in range(len(triples)):
+            for ti in range(big.tiles_i):
+                for tj in range(big.tiles_j):
+                    for c in range(32 * big.words):
+                        ored = any(mask_bits(base, s, 2 * ti + di, 2 * tj + dj, c)
+                                   for di in range(2) for dj in range(2)
+                                   if 2 * ti + di < base.tiles_i and 2 * tj + dj < base.tiles_j)
+                        assert mask_bits(big, s, ti, tj, c) == ored, (seed, s, ti, tj, c)
+
+
+def test_skip_masks_span_several_words():
+    """A boundary with more than 32 chunks (here 1-column chunks of a wide automaton) needs several words."""
+    V, n = 4, 5
+    dfa = random_dfa(120, V, 3)
+    L = build_layout(dfa, n)
+    assert int(L.width.max()) > 64
+    reach = Reachability(L, tile = 1)
+    triples = [(1, 3, 5), (0, 2, 4), (2, 3, 4)]
+    m = skip_masks(reach, triples, 8, 8, 1)
+    assert m.words >= 2
+    for s, want in enumerate(definition_masks(reach, triples, 8, 8, 1)):
+        I, J, C = want.shape
+        for ti in range(I):
+            for tj in range(J):
+                assert [mask_bits(m, s, ti, tj, c) for c in range(C)] == want[ti, tj].tolist()
 
 
 def test_unsatisfiable_constraint_has_empty_boundaries():
@@ -199,6 +322,27 @@ def test_tables_live_on_the_pcs_device_and_with_pc_reads_the_new_pc(build_pc):
             assert ta.dtype == tb.dtype == torch.int32
             assert ta.device == pa.device and tb.device.type == "cpu"         # each PC's own tables
             assert torch.equal(ta.cpu(), tb)
+
+
+@pytest.mark.parametrize("kind", ["pd", "hand", "hand_left", "hmm"])
+def test_every_block_block_step_indexes_its_triple(kind, build_pc):
+    n = PC_KINDS[kind]
+    cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc(kind, n, V))
+    prog = cc._lifted_program()
+    seen = 0
+    for k, _, layers in prog.steps:
+        if k != "prod":
+            continue
+        for stages, _, _ in layers:
+            for launches in stages:
+                for form, _, steps, _, _ in launches:
+                    if form == "block_block":
+                        tri = [prog.skip_triples[i] for i in steps[3].tolist()]
+                        assert tri == [tuple(r) for r in steps[0][:, 5:8].tolist()]
+                        seen += 1
+    m = prog.skip
+    assert m.bits.numel() == max(1, len(prog.skip_triples) * m.tiles_i * m.tiles_j * m.words)
+    assert (seen > 0) == (len(prog.skip_triples) > 0)
 
 
 def test_a_graph_compiled_again_is_refused():

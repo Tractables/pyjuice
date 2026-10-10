@@ -20,9 +20,15 @@ read only as the log-probability of its observed token (pyjuice's own input laye
 log-mass of a token class when the token is missing (:mod:`.inputs`).
 """
 
+import math
+from dataclasses import dataclass
+from typing import Optional, Sequence, Tuple
+
 import torch
 import triton
 import triton.language as tl
+
+from ..plan import Reachability, _tile_any
 
 #: operand kinds: a sum node's block in ``node_mars``, an intermediate block in scratch, the identity
 SUM, TEMP, IDENTITY = 0, 1, 2
@@ -320,6 +326,68 @@ def predecessor_tables(next_col: torch.Tensor, width, n: int):
     return ptr.to(dev, torch.int32).contiguous(), cat(qs), cat(cs)
 
 
+@dataclass(frozen = True)
+class SkipMasks:
+    """
+    Which chunks of the shared boundary every output tile of a ``block @ block`` step needs. For triple ``s``
+    (boundaries ``(t0, t1, t2)``), word ``(s * tiles_i + ti) * tiles_j * words + tj * words + c // 32`` of
+    ``bits`` has bit ``c % 32`` set when some column of entry tile ``ti`` (at ``t0``) reaches some column of chunk
+    ``c`` (at ``t1``) that reaches some column of exit tile ``tj`` (at ``t2``). Every other (tile, chunk) pair is
+    structurally ``-inf`` on one side and adds exactly zero. Tiles are ``tm x tn`` columns, chunks ``tk``.
+
+    :ivar bits: int32 ``[triples * tiles_i * tiles_j * words]`` (one word if there are no triples)
+    """
+
+    bits: torch.Tensor
+    tiles_i: int
+    tiles_j: int
+    words: int
+    tm: int
+    tn: int
+    tk: int
+
+
+def skip_masks(reach: Reachability, triples: Sequence[Tuple[int, int, int]], tm: int = 16, tn: int = 16,
+               tk: int = 16, device = None) -> SkipMasks:
+    """
+    The :class:`SkipMasks` of ``triples`` (``(t0, t1, t2)`` boundaries, in the order their index refers to), from
+    the occupancy ``reach`` keeps; ``tm``, ``tn`` and ``tk`` are multiples of its tile.
+    """
+    T = reach.tile
+    if tm % T or tn % T or tk % T:
+        raise ValueError(f"Tiles ({tm}, {tn}, {tk}) must be multiples of the occupancy tile {T}.")
+    if len(triples) == 0:
+        return SkipMasks(torch.zeros(1, dtype = torch.int32, device = device), 0, 0, 1, tm, tn, tk)
+    lefts = sorted({(a, b) for a, b, _ in triples})
+    rights = sorted({(b, c) for _, b, c in triples})
+    L = [_tile_any(reach.occupancy(a, b), tm // T, tk // T) for a, b in lefts]     # [entry tiles, chunks]
+    R = [_tile_any(reach.occupancy(b, c), tk // T, tn // T) for b, c in rights]    # [chunks, exit tiles]
+    I = max(m.size(0) for m in L)
+    J = max(m.size(1) for m in R)
+    words = max(1, math.ceil(max(m.size(1) for m in L) / 32))
+    NC = 32 * words
+
+    def stack(ms, shape):
+        out = torch.zeros(len(ms), *shape, dtype = torch.bool)
+        for k, m in enumerate(ms):
+            out[k, :m.size(0), :m.size(1)] = m
+        return out
+
+    Ls, Rs = stack(L, (I, NC)), stack(R, (NC, J))
+    lpos = {iv: k for k, iv in enumerate(lefts)}
+    rpos = {iv: k for k, iv in enumerate(rights)}
+    li = torch.tensor([lpos[a, b] for a, b, _ in triples], dtype = torch.long)
+    ri = torch.tensor([rpos[b, c] for _, b, c in triples], dtype = torch.long)
+    shifts = torch.arange(32, dtype = torch.int64)
+    chunk = max(1, (1 << 26) // (I * J * NC))
+    parts = []
+    for g0 in range(0, len(triples), chunk):
+        need = Ls[li[g0:g0 + chunk], :, None, :] & Rs[ri[g0:g0 + chunk]].transpose(1, 2)[:, None, :, :]
+        w = (need.view(need.size(0), I, J, words, 32).to(torch.int64) << shifts).sum(dim = -1)
+        parts.append(torch.where(w >= 2 ** 31, w - 2 ** 32, w).to(torch.int32).flatten())
+    return SkipMasks(torch.cat(parts).to(device), I, J, words, tm, tn, tk)
+
+
 #: tiles of :func:`_block_block_kernel`: samples, entry and exit columns, shared columns per step; launch knobs
 BLOCK_BLOCK_CONFIG = dict(TB = 4, TM = 32, TN = 32, TK = 16, warps = 4, stages = 2)
 
@@ -348,7 +416,8 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, input_mar
     three TF32 passes (``tf32x3``), and the other contractions are exact fp32 log-sum-exps.
 
     :param stages: the layer's stages from :class:`~pyjuice.constraints.backends.lifted.forward.Program`: lists
-        of ``(form, kinds, steps, E_max, X_max)`` launches
+        of ``(form, kinds, steps, E_max, X_max)`` launches (``block @ block`` steps: ``(steps, left operands, right
+        operands, triple index)``, the last indexing ``Program.skip``)
     :param bufs: ``(temp, temp_width)``, the layer's scratch rows
     """
     temp, temp_width = bufs
@@ -375,7 +444,7 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, input_mar
                     **common)
             elif form == "block_block":
                 l_kind, r_kind, out_temp = kinds
-                steps, left_ops, right_ops = steps
+                steps, left_ops, right_ops = steps[:3]
                 S = steps.size(0)
                 maxima = []
                 for ops, kernel, kind, wmax in ((left_ops, _row_max_kernel, l_kind, E_max),
