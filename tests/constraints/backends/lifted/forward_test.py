@@ -180,6 +180,42 @@ def test_every_token_its_own_class(build_pc, reference):
     assert_close(cc.marginal(data, missing), reference.marginal(cc, data, missing), n)
 
 
+@pytest.mark.parametrize("kind", ["hmm", "pd"])
+def test_fast_inference_keeps_the_class_masses(kind, build_pc, reference, monkeypatch):
+    """Inside pyjuice.fast_inference (parameters do not change) the class masses are computed by the first query
+    and kept, through a nested scope, until the outer scope exits. Outside one every query computes them, so an
+    in-place parameter update -- here after the scope -- is read."""
+    from pyjuice.constraints.distributions import categorical
+    n = KINDS[kind]
+    pc, other = build_pc(kind, n, V, seed = 0), build_pc(kind, n, V, seed = 1)
+    cc = jc.compile(CONSTRAINTS["contains"](), pc)
+    data, missing = evidence(n, 4)
+    calls, computed = [], categorical.class_masses
+    monkeypatch.setattr(categorical, "class_masses", lambda *a, **k: calls.append(1) or computed(*a, **k))
+    per_query = len(pc.input_layer_group)                                # one call per input layer
+
+    want = reference.marginal(cc, data, missing)
+    for _ in range(2):
+        assert_close(cc.marginal(data, missing), want, n)
+    assert len(calls) == 2 * per_query                                   # outside a scope: every query
+    with juice.fast_inference():
+        for _ in range(2):
+            assert_close(cc.marginal(data, missing), want, n)
+        with juice.fast_inference():
+            assert_close(cc.marginal(data, missing), want, n)
+        assert_close(cc.marginal(data, missing), want, n)
+    assert len(calls) == 3 * per_query                                   # inside: the first query only
+
+    with torch.no_grad():                                                # an in-place update after the scope
+        pc.params.copy_(other.params)
+        for layer, src in zip(pc.input_layer_group, other.input_layer_group):
+            layer.params.copy_(src.params)
+    updated = reference.marginal(cc, data, missing)
+    assert (updated - want)[torch.isfinite(want)].abs().max() > 1e-2
+    assert_close(cc.marginal(data, missing), updated, n)
+    assert len(calls) == 4 * per_query
+
+
 def test_splitting_block_block_tiles_changes_nothing(build_pc, monkeypatch):
     """Spreading every (step, sample)'s output tiles over as many programs as it has tiles gives what one program
     per (step, sample) gives, bit for bit (a wide automaton: blocks of several tiles). The buffers are filled with

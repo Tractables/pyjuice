@@ -48,10 +48,9 @@ def test_regions_follow_the_pcs_layers(kind, build_pc):
 @pytest.mark.parametrize("B", [1, 3, 16, 33])
 def test_layout_is_aligned_disjoint_and_tight(kind, B, build_pc):
     cc, _ = compiled(build_pc, kind)
-    lay = buffer_layout(cc.input_range, cc.sum_regions, cc.element_regions, cc.num_classes, B)
+    lay = buffer_layout(cc.input_range, cc.sum_regions, cc.element_regions, B)
     input_start, input_end = cc.input_range
-    spans = [(0, input_end * B),
-             (lay["class_offset"], lay["class_offset"] + (input_end - input_start) * cc.num_classes)]
+    spans = [(0, input_end * B)]
     for (first, end, slots), offset, width in zip(cc.sum_regions, lay["sum_offsets"], lay["sum_widths"]):
         assert width == -(-B * slots // ALIGN) * ALIGN                        # the block, rounded up to ALIGN
         spans.append((offset, offset + (end - first) * width))
@@ -60,7 +59,7 @@ def test_layout_is_aligned_disjoint_and_tight(kind, B, build_pc):
     assert lay["node_size"] == spans[-1][1]
     assert lay["element_size"] == max((end - first) * w for (first, end, _), w in
                                       zip(cc.element_regions, lay["element_widths"]))
-    assert cc.buffer_bytes(B) == 4 * (lay["node_size"] + lay["element_size"])
+    assert cc.buffer_bytes(B) == 4 * (lay["node_size"] + lay["element_size"] + (input_end - input_start) * cc.num_classes)
 
 
 @pytest.mark.parametrize("kind", ["hmm", "pd", "hand_unit"])
@@ -85,7 +84,6 @@ def test_views_sit_in_their_regions(kind, build_pc):
     bufs = cc._buffers(B)
     lay, node_mars = bufs["layout"], bufs["node_mars"]
     assert bufs["input_mars"].data_ptr() == node_mars.data_ptr()                              # offset 0
-    assert bufs["class_mars"].data_ptr() == node_mars.data_ptr() + 4 * lay["class_offset"]
     # writing the input region (as an input layer does) leaves every other region untouched
     node_mars.fill_(7.0)
     x = torch.randint(0, V, (B, n), device = cc.pc.device)

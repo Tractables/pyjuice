@@ -317,7 +317,7 @@ def _align(x: int) -> int:
     return (x + ALIGN - 1) // ALIGN * ALIGN
 
 
-def buffer_layout(input_range, sum_regions, element_regions, num_classes: int, batch_size: int) -> Dict[str, Any]:
+def buffer_layout(input_range, sum_regions, element_regions, batch_size: int) -> Dict[str, Any]:
     """
     Where every region of the lifted buffers sits for a batch of ``batch_size`` samples (in floats).
 
@@ -326,22 +326,20 @@ def buffer_layout(input_range, sum_regions, element_regions, num_classes: int, b
     * the input region: rows ``0 .. input_end`` (pyjuice's own row numbers, so that an input layer writes it
       as it writes a :class:`TensorCircuit`'s ``node_mars``), ``batch_size`` columns, the log-probability of
       every observed token;
-    * the class region: the input rows, ``num_classes`` columns, every class's log-mass for a missing token;
     * one region per sum node group: its rows, ``align(batch_size * slots)`` columns, sample-major (slot ``s``
       of sample ``b`` in column ``b * slots + s``: every sample's block is contiguous).
 
     ``element_mars`` holds the products of one product layer group at a time, ``align(batch_size * slots)``
     columns per row; its size is that of the largest group.
 
-    :returns: a dict with ``input_offset``, ``class_offset``, ``sum_offsets`` and ``sum_widths`` (one per sum
+    :returns: a dict with ``input_offset``, ``sum_offsets`` and ``sum_widths`` (one per sum
         region; row ``r`` of region ``i`` starts at ``sum_offsets[i] + (r - first_row) * sum_widths[i]``),
         ``node_size``, ``element_widths`` (one per product layer group; row ``r`` starts at
         ``(r - first_row) * width``) and ``element_size``
     """
     B = int(batch_size)
     input_start, input_end = input_range
-    class_offset = _align(input_end * B)
-    offset = _align(class_offset + (input_end - input_start) * num_classes)
+    offset = _align(input_end * B)
     sum_offsets, sum_widths = [], []
     for first, end, slots in sum_regions:
         width = _align(B * slots)
@@ -349,7 +347,7 @@ def buffer_layout(input_range, sum_regions, element_regions, num_classes: int, b
         offset += (end - first) * width                                       # stays aligned
     element_widths = [_align(B * slots) for _, _, slots in element_regions]
     element_size = max(((end - first) * w for (first, end, _), w in zip(element_regions, element_widths)), default = 0)
-    return dict(input_offset = 0, class_offset = class_offset, sum_offsets = sum_offsets, sum_widths = sum_widths,
+    return dict(input_offset = 0, sum_offsets = sum_offsets, sum_widths = sum_widths,
                 node_size = offset, element_widths = element_widths, element_size = element_size)
 
 

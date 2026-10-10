@@ -3,8 +3,8 @@ The lifted forward pass: ``log p(C, e)`` for a batch of evidence, in the buffers
 :class:`~pyjuice.constraints.ConstrainedCircuit`.
 
 Layer by layer, as :meth:`TensorCircuit.forward`: the PC's own input layers write the log-probability of
-every observed token, the class masses of missing ones are summed per token class
-(:mod:`.kernels.inputs`), then every product layer group chains its children's blocks
+every observed token, the class masses of missing ones are summed per token class (by the circuit, see
+:meth:`ConstrainedCircuit._class_masses`), then every product layer group chains its children's blocks
 (:mod:`.kernels.prod`) and every sum layer group sums its children column by column (:mod:`.kernels.sum`).
 The root keeps a single value per sample. Like a :class:`TensorCircuit`, the pass is driven by tables: no
 kernel knows the circuit's shape.
@@ -21,7 +21,6 @@ from typing import Optional
 
 import torch
 
-from .kernels.inputs import class_masses
 from .kernels.prod import IDENTITY, SUM, TEMP, predecessor_tables, skip_masks
 from .kernels.prod import run_products as products
 from .kernels.sum import dense_groups, dense_sum, fused_sum
@@ -298,7 +297,7 @@ def marginal(cc, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None
     bufs = cc._buffers(B)
     lay = bufs["layout"]
     node_mars, element_mars = bufs["node_mars"], bufs["element_mars"]
-    input_mars, class_mars = bufs["input_mars"], bufs["class_mars"]
+    input_mars = bufs["input_mars"]
     regions = dict(offset = lay["sum_offsets_t"], width = lay["sum_widths_t"], first = prog.reg_first,
                    slots = prog.reg_slots)
     dot = PRECISIONS[precision]
@@ -306,7 +305,7 @@ def marginal(cc, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None
     with torch.no_grad():
         for layer in pc.input_layer_group:
             layer(x.permute(1, 0), input_mars, missing_mask = missing)
-        class_masses(pc, cc.token_classes, class_mars, prog.input_start)
+        class_mars = cc._class_masses()
         obs_class = torch.where(missing, -1, cc.token_classes.token_class[x]).contiguous()
 
         for kind, prod_index, layers in prog.steps:

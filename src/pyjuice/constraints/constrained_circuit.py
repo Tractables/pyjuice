@@ -9,7 +9,9 @@ from typing import Any, Dict, Optional
 
 import torch
 
-from .distributions import TokenClasses
+from pyjuice.utils.fast_inference import is_active, register_layer
+
+from .distributions import TokenClasses, lookup
 from .language.base import Constraint
 from .structure import SHAPES, PCStructure, analyze_structure
 from .backends.lifted.plan import BoundaryLayout, build_pc_tables, buffer_layout
@@ -32,6 +34,10 @@ class ConstrainedCircuit:
     creating a constrained circuit releases the PC's activation buffers
     (:meth:`TensorCircuit.free_activation_buffers`; its parameter flows are kept). The PC allocates them
     again on its next own pass.
+
+    The input nodes' token-class masses depend only on the parameters, so inside :func:`pyjuice.fast_inference`
+    (whose contract is that parameters do not change) they are computed by the first query and kept until the
+    scope exits; outside it, every query computes them.
 
     Created by :func:`pyjuice.constraints.compile`; not meant to be constructed directly.
 
@@ -81,6 +87,8 @@ class ConstrainedCircuit:
         self._storage = {}                          # buffer name -> backing storage (see `_buffers`)
         self._layouts = {}                          # batch size -> `buffer_layout` and its device tensors
         self._program = None                        # the lifted forward's tables (see `_lifted_program`)
+        self._class_mars = None                     # the input nodes' class masses (see `_class_masses`)
+        self._class_mars_kept = False               # kept by a `pyjuice.fast_inference` scope
 
     @property
     def pc(self):
@@ -106,6 +114,7 @@ class ConstrainedCircuit:
         self.product_rows = [tuple(t.to(device) for t in rows) for rows in self.product_rows]
         self.token_classes = self.token_classes.to(device)
         self._storage, self._layouts = {}, {}       # the buffers are allocated again on the new device
+        self._class_mars, self._class_mars_kept = None, False
         self._program = None                        # and the forward's tables built again there
         self._device = device
         return self
@@ -126,26 +135,47 @@ class ConstrainedCircuit:
 
         :returns: a dict with ``node_mars`` and ``element_mars`` (flat), ``input_mars`` (a contiguous
             ``[input_end, batch_size]`` view, which an input layer writes as it writes a
-            :class:`TensorCircuit`'s ``node_mars``), ``class_mars`` (``[num_input_rows, num_classes]``) and
-            ``layout`` (the :func:`buffer_layout` dict, plus ``sum_offsets`` / ``sum_widths`` as int64
-            tensors on the device for the kernels)
+            :class:`TensorCircuit`'s ``node_mars``) and ``layout`` (the :func:`buffer_layout` dict, plus
+            ``sum_offsets`` / ``sum_widths`` as int64 tensors on the device for the kernels)
         """
         B = int(batch_size)
         layout = self._layouts.get(B)
         if layout is None:
-            layout = buffer_layout(self.input_range, self.sum_regions, self.element_regions, self.num_classes, B)
+            layout = buffer_layout(self.input_range, self.sum_regions, self.element_regions, B)
             layout["sum_offsets_t"] = torch.tensor(layout["sum_offsets"], dtype = torch.int64, device = self._device)
             layout["sum_widths_t"] = torch.tensor(layout["sum_widths"], dtype = torch.int64, device = self._device)
             self._layouts[B] = layout
         node_mars = self._storage_view("node_mars", layout["node_size"])
         element_mars = self._storage_view("element_mars", layout["element_size"])
-        input_start, input_end = self.input_range
-        class_offset, num_input_rows = layout["class_offset"], input_end - input_start
         return dict(node_mars = node_mars, element_mars = element_mars,
-                    input_mars = node_mars[:input_end * B].view(input_end, B),
-                    class_mars = node_mars[class_offset:class_offset + num_input_rows * self.num_classes].view(
-                        num_input_rows, self.num_classes),
-                    layout = layout)
+                    input_mars = node_mars[:self.input_range[1] * B].view(self.input_range[1], B), layout = layout)
+
+    def _class_masses(self) -> torch.Tensor:
+        """
+        ``[num_input_rows, num_classes]``: the log-mass of every token class for every input node, by its
+        distribution's function in :mod:`pyjuice.constraints.distributions`. Computed on every query, except
+        inside :func:`pyjuice.fast_inference`: there by the first query, then kept until the scope exits.
+        """
+        if self._class_mars_kept:
+            return self._class_mars
+        input_start, input_end = self.input_range
+        if self._class_mars is None:
+            self._class_mars = torch.empty(input_end - input_start, self.num_classes, device = self._device)
+        for layer in self._pc.input_layer_group:
+            first, end = layer._output_ind_range
+            lookup(layer.dist).class_masses(layer, self.token_classes,
+                                            out = self._class_mars[first - input_start:end - input_start])
+        if is_active():
+            self._class_mars_kept = True
+            register_layer(self)                                # its exit calls `_release_fast_inference_params`
+        return self._class_mars
+
+    def _release_fast_inference_params(self, poison: bool = False):
+        """The :func:`pyjuice.fast_inference` scope that kept the class masses exited: parameters may change from
+        now on (``poison``: fill the released masses with NaN, as the scope does for its layers' copies)."""
+        self._class_mars_kept = False
+        if poison and self._class_mars is not None:
+            self._class_mars.fill_(float("nan"))
 
     def _lifted_program(self):
         """The lifted forward's tables (:class:`~pyjuice.constraints.backends.lifted.forward.Program`), built on
@@ -163,9 +193,11 @@ class ConstrainedCircuit:
         return storage[:numel]
 
     def buffer_bytes(self, batch_size: int) -> int:
-        """Bytes of the lifted buffers for a batch of ``batch_size`` (fp32, alignment included)."""
-        layout = buffer_layout(self.input_range, self.sum_regions, self.element_regions, self.num_classes, batch_size)
-        return 4 * (layout["node_size"] + layout["element_size"])
+        """Bytes of the lifted buffers for a batch of ``batch_size`` and of the class masses (fp32, alignment
+        included)."""
+        layout = buffer_layout(self.input_range, self.sum_regions, self.element_regions, batch_size)
+        num_input_rows = self.input_range[1] - self.input_range[0]
+        return 4 * (layout["node_size"] + layout["element_size"] + num_input_rows * self.num_classes)
 
     # ---------------------------------------------------------------------------------------------
     # Report
