@@ -55,6 +55,14 @@ DENSE_PRUNE_MIN_COLUMNS = 256
 #: no longer finding a block's product in L2).
 STACK_MAX_COLUMNS = {"fp32": 2048, "tf32": 16384}
 
+#: ``input @ block`` steps at the same position and block interval run this many to a program on the class-by-class
+#: path, when the block is not the identity (see :func:`~.kernels.prod._input_block_group_kernel`; launches wider than
+#: :data:`~.kernels.prod.GROUP_MIN_LANES`): every class's successors and slots are read once for all of them, not once
+#: per step. HMM4096 sweep over 1, 2, 4, 8, 16: 8 best or within 5% of it on every workload; against one step per
+#: program, bit-identical: 13.8k- / 49k-state automata x1.09-1.15 with a prefix, x1.16-1.31 on the 49k one without;
+#: batch 16 x1.02-1.18. 1: one step per program.
+INPUT_BLOCK_GROUP = 8
+
 #: Floats of transition masses (see :func:`~.kernels.prod.transition_masses`) held at once: when every input step's
 #: fit, they are all kept, built once per computation of the class masses; else built launch by launch, in chunks
 #: of steps that fit, into one scratch
@@ -211,8 +219,12 @@ class Program:
         self.trans_size, rows = 0, []
         for st, z, (launches, li) in zip(tables, sizes, ins):
             form, kinds, _, *sizes = launches[li]
+            groups = None                                               # input @ block steps, several to a program
             if not self.trans.grouped:
                 chunks = [(0, st.size(0), None)]
+                if form == "input_block" and kinds[0] != IDENTITY and INPUT_BLOCK_GROUP > 1:
+                    st, firsts = _step_groups(st, INPUT_BLOCK_GROUP)
+                    groups = (INPUT_BLOCK_GROUP, firsts.to(dev, torch.int32))
             elif self.trans_persistent:
                 st[:, 6] = self.trans_size + torch.cumsum(z, 0) - z
                 self.trans_size += int(z.sum())
@@ -229,7 +241,7 @@ class Program:
                     self.trans_size = max(self.trans_size, used)
                 bounds.append((start, st.size(0)))
                 chunks = [(s0, s1, transition_job(st[s0:s1][:, [*cols[form], 6]], dev)) for s0, s1 in bounds]
-            launches[li] = (form, kinds, (st.to(dev, torch.int32).contiguous(), chunks), *sizes)
+            launches[li] = (form, kinds, (st.to(dev, torch.int32).contiguous(), chunks, groups), *sizes)
         self.trans_job = transition_job(torch.cat(rows), dev) if self.trans.grouped and rows else None
         self._trans, self._trans_version = None, None
 
@@ -369,6 +381,21 @@ def _intervals(steps) -> set:
                     for a, b in ivs:
                         out.update(zip(a.tolist(), b.tolist()))
     return out
+
+
+def _step_groups(st: torch.Tensor, G: int):
+    """An ``input @ block`` launch's steps (host rows, see :data:`~.kernels.prod.INPUT_BLOCK_FIELDS`) sorted by their
+    position and block end, and ``firsts`` [groups + 1]: the first step of every group of at most ``G`` consecutive
+    steps that share both, then the end."""
+    key = st[:, 2] * (int(st[:, 5].max()) + 1) + st[:, 5]
+    order = torch.sort(key, stable = True).indices
+    st, key = st[order], key[order]
+    k = torch.arange(st.size(0))
+    change = torch.ones(st.size(0), dtype = torch.bool)
+    change[1:] = key[1:] != key[:-1]
+    run_first = torch.cummax(torch.where(change, k, 0), 0).values           # the first step of each step's run
+    firsts = torch.nonzero((k - run_first) % G == 0).flatten()
+    return st, torch.cat([firsts, torch.tensor([st.size(0)])])
 
 
 def _stack_key(blocks, E: int, block_size: int):

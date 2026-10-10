@@ -440,6 +440,106 @@ def test_splitting_block_block_tiles_changes_nothing(build_pc, monkeypatch):
     assert torch.equal(marginal(1 << 20), marginal(0))
 
 
+def input_block_launches(cc):
+    """Every ``input @ block`` launch: ``(kinds, steps, groups)``."""
+    return [(kinds, steps, groups) for kind, _, layers in cc._lifted_program().steps if kind == "prod"
+            for stages, _, _ in layers for launches in stages
+            for _, kinds, (steps, _, groups), *_ in (l for l in launches if l[0] == "input_block")]
+
+
+def input_block_groups(cc):
+    """``(steps [S, 7], firsts)`` of every ``input @ block`` launch whose steps run in groups."""
+    return [(steps.cpu(), groups[1].cpu()) for _, steps, groups in input_block_launches(cc) if groups is not None]
+
+
+class CountingKernel:
+    """A Triton kernel that counts its launches."""
+
+    def __init__(self, kernel):
+        self.kernel, self.launches = kernel, 0
+
+    def __getitem__(self, grid):
+        self.launches += 1
+        return self.kernel[grid]
+
+
+@pytest.mark.parametrize("G", [3, 8])
+@pytest.mark.parametrize("B", [1, 3, 16])
+@pytest.mark.parametrize("kind", list(KINDS))
+def test_grouped_input_steps_change_nothing(kind, B, G, build_pc, monkeypatch):
+    """Running ``input @ block`` steps G to a program (the class-by-class path) gives what one step per program gives,
+    bit for bit, with evidence (pruned) and without. Every launch whose block is not the identity runs in groups
+    (the PDs and the left-linear chain have none), here at any width. The buffers are filled with NaN before each
+    call, so an output no group writes shows."""
+    import pyjuice.constraints.backends.lifted.forward as F
+    from pyjuice.constraints.backends.lifted.kernels import prod
+    monkeypatch.setattr(F, "GROUP_MIN_RATIO", 1 << 30)                       # transitions class by class
+    monkeypatch.setattr(prod, "GROUP_MIN_LANES", 0)                          # groups however narrow the launch
+    kernel = CountingKernel(prod._input_block_group_kernel)
+    monkeypatch.setattr(prod, "_input_block_group_kernel", kernel)
+    n = KINDS[kind]
+    cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
+    data, missing = evidence(n, B)
+
+    def marginal(group, missing):
+        monkeypatch.setattr(F, "INPUT_BLOCK_GROUP", group)
+        cc._program = None                                                    # built again with this grouping
+        bufs = cc._buffers(B)
+        bufs["node_mars"].fill_(float("nan"))
+        bufs["element_mars"].fill_(float("nan"))
+        kernel.launches = 0
+        out = cc.marginal(data, missing)
+        blocks = sum(kinds[0] != prod.IDENTITY for kinds, _, _ in input_block_launches(cc))
+        assert len(input_block_groups(cc)) == kernel.launches == (blocks if group > 1 else 0)
+        return out
+
+    for miss in (missing, torch.ones_like(missing)):
+        assert torch.equal(marginal(G, miss), marginal(1, miss))
+
+
+def test_narrow_launches_run_one_step_per_program(build_pc, reference, monkeypatch):
+    """A launch whose steps' outputs have at most GROUP_MIN_LANES lanes runs one step per program even where the
+    Program grouped its steps; one just above it runs the groups."""
+    import pyjuice.constraints.backends.lifted.forward as F
+    from pyjuice.constraints.backends.lifted.kernels import prod
+    monkeypatch.setattr(F, "GROUP_MIN_RATIO", 1 << 30)
+    kernel = CountingKernel(prod._input_block_group_kernel)
+    monkeypatch.setattr(prod, "_input_block_group_kernel", kernel)
+    n = KINDS["hmm"]
+    cc = jc.compile(CONSTRAINTS["contains"](), build_pc("hmm", n, V))
+    data, missing = evidence(n, 4)
+    assert input_block_groups(cc)
+    lanes = max(4 * l[5] for kind, _, layers in cc._lifted_program().steps if kind == "prod" for stages, _, _ in layers
+                for launches in stages for l in launches if l[0] == "input_block" and l[2][2] is not None)
+    want = reference.marginal(cc, data, missing)
+    for limit, launched in ((lanes, False), (lanes - 1, True)):
+        monkeypatch.setattr(prod, "GROUP_MIN_LANES", limit)
+        kernel.launches = 0
+        assert_close(cc.marginal(data, missing), want, n)
+        assert (kernel.launches > 0) == launched
+
+
+@pytest.mark.parametrize("kind", ["hmm", "hand", "hand_permuted"])
+def test_input_steps_group_by_position(kind, build_pc, monkeypatch):
+    """Groups of ``input @ block`` steps never mix positions or block ends, hold at most INPUT_BLOCK_GROUP steps,
+    and cover every step once -- also where one launch holds steps at several positions (one of "hand"'s)."""
+    import pyjuice.constraints.backends.lifted.forward as F
+    monkeypatch.setattr(F, "GROUP_MIN_RATIO", 1 << 30)
+    monkeypatch.setattr(F, "INPUT_BLOCK_GROUP", 3)
+    n = KINDS[kind]
+    cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
+    launches = input_block_groups(cc)
+    assert launches
+    mixed = False
+    for steps, firsts in launches:
+        assert firsts[0] == 0 and firsts[-1] == steps.size(0) and (firsts[1:] > firsts[:-1]).all()
+        assert (firsts[1:] - firsts[:-1] <= 3).all()
+        for a, b in zip(firsts[:-1].tolist(), firsts[1:].tolist()):
+            assert len({(t, t2) for t, t2 in steps[a:b][:, [2, 5]].tolist()}) == 1
+        mixed |= len({(t, t2) for t, t2 in steps[:, [2, 5]].tolist()}) > 1
+    assert mixed == (kind == "hand")
+
+
 @pytest.mark.parametrize("kind", ["hmm", "left_linear", "pd", "hand_left"])
 def test_kernels_launch_past_the_grid_limits(kind, sum_path, build_pc, monkeypatch):
     """With CUDA's grid limits lowered to 3 programs on the first axis and 2 on the others, every kernel whose
