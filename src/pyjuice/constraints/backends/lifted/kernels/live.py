@@ -28,6 +28,45 @@ from .prod import _exit_width, _interval, _pair, grid_chunks
 
 
 @triton.jit
+def _mark_successors(live, base, q, f, oc, next_col, succ_ptr, succ, t, n, W, C, TILE: tl.constexpr):
+    """Forward sweep, boundary ``t`` -> ``t + 1``: the live columns ``q`` (``f``) mark their successors live at
+    ``t + 1``, through the observed class ``oc`` only, or every successor when the token is missing (``oc`` -1)."""
+    ones = tl.full([TILE], 1, dtype = tl.int8)
+    if oc >= 0:                                                             # through the observed class only
+        s = tl.load(next_col + (t * W + q) * C + oc, mask = f, other = -1)
+        s = tl.where((t + 1 == n) & (s >= 0), 0, s)
+        tl.store(live + base + (t + 1) * W + s, ones, mask = f & (s >= 0))
+    else:                                                                   # to every successor
+        e0 = tl.load(succ_ptr + t * (W + 1) + q, mask = f, other = 0)
+        e1 = tl.load(succ_ptr + t * (W + 1) + q + 1, mask = f, other = 0)
+        for k in range(0, tl.max(e1 - e0, axis = 0)):
+            em = f & (e0 + k < e1)
+            tl.store(live + base + (t + 1) * W + tl.load(succ + e0 + k, mask = em, other = 0), ones, mask = em)
+
+
+@triton.jit
+def _reach_back(live, back, base, q, qm, oc, next_col, succ_ptr, succ, t, n, W, C, TILE: tl.constexpr):
+    """Backward sweep, boundary ``t + 1`` -> ``t``: the columns ``q`` (``qm``) can reach acceptance if a successor
+    can (``back``, through the observed class ``oc`` or any class); stored in ``back`` and ANDed into ``live``."""
+    g = tl.zeros([TILE], dtype = tl.int32)
+    if oc >= 0:                                                             # the observed class's successor
+        s = tl.load(next_col + (t * W + q) * C + oc, mask = qm, other = -1)
+        s = tl.where((t + 1 == n) & (s >= 0), 0, s)
+        g = (qm & (s >= 0) & (tl.load(back + base + (t + 1) * W + s, mask = qm & (s >= 0), other = 0) != 0)
+             ).to(tl.int32)
+    else:                                                                   # any successor
+        e0 = tl.load(succ_ptr + t * (W + 1) + q, mask = qm, other = 0)
+        e1 = tl.load(succ_ptr + t * (W + 1) + q + 1, mask = qm, other = 0)
+        for k in range(0, tl.max(e1 - e0, axis = 0)):
+            em = qm & (e0 + k < e1)
+            s = tl.load(succ + e0 + k, mask = em, other = 0)
+            g = g | (em & (tl.load(back + base + (t + 1) * W + s, mask = em, other = 0) != 0)).to(tl.int32)
+    tl.store(back + base + t * W + q, g.to(tl.int8), mask = qm)
+    fwd = tl.load(live + base + t * W + q, mask = qm, other = 0)
+    tl.store(live + base + t * W + q, ((fwd != 0) & (g != 0)).to(tl.int8), mask = qm)
+
+
+@triton.jit
 def _liveness_kernel(live, back, obs_class, next_col, succ_ptr, succ, width, n, W, C, TILE: tl.constexpr):
     """One program per sample: ``live[b, t, q]`` (int8 [B, n + 1, W]; boundary ``n`` is the sequence end, column 0),
     forward reachability by a sweep over boundaries -- every live column marks its successors -- then ANDed with
@@ -37,7 +76,6 @@ def _liveness_kernel(live, back, obs_class, next_col, succ_ptr, succ, width, n, 
     b = tl.program_id(0).to(tl.int64)
     base = b * (n + 1) * W
     lanes = tl.arange(0, TILE)
-    ones = tl.full([TILE], 1, dtype = tl.int8)
     tl.store(live + base + lanes, (lanes == 0).to(tl.int8), mask = lanes < W)          # the initial column
     for t in range(0, n):
         nxt = _exit_width(width, t + 1, n)
@@ -48,16 +86,7 @@ def _liveness_kernel(live, back, obs_class, next_col, succ_ptr, succ, width, n, 
         for q0 in range(0, tl.load(width + t), TILE):
             q = q0 + lanes
             f = (q < tl.load(width + t)) & (tl.load(live + base + t * W + q, mask = q < W, other = 0) != 0)
-            if oc >= 0:                                                     # through the observed class only
-                s = tl.load(next_col + (t * W + q) * C + oc, mask = f, other = -1)
-                s = tl.where((t + 1 == n) & (s >= 0), 0, s)
-                tl.store(live + base + (t + 1) * W + s, ones, mask = f & (s >= 0))
-            else:                                                           # to every successor
-                e0 = tl.load(succ_ptr + t * (W + 1) + q, mask = f, other = 0)
-                e1 = tl.load(succ_ptr + t * (W + 1) + q + 1, mask = f, other = 0)
-                for k in range(0, tl.max(e1 - e0, axis = 0)):
-                    em = f & (e0 + k < e1)
-                    tl.store(live + base + (t + 1) * W + tl.load(succ + e0 + k, mask = em, other = 0), ones, mask = em)
+            _mark_successors(live, base, q, f, oc, next_col, succ_ptr, succ, t, n, W, C, TILE)
         tl.debug_barrier()
     tl.store(back + base + n * W, tl.full([], 1, dtype = tl.int8))
     for tt in range(0, n):
@@ -67,23 +96,31 @@ def _liveness_kernel(live, back, obs_class, next_col, succ_ptr, succ, width, n, 
         E = tl.load(width + t)
         for q0 in range(0, E, TILE):
             q = q0 + lanes
-            qm = q < E
-            g = tl.zeros([TILE], dtype = tl.int32)
-            if oc >= 0:                                                     # the observed class's successor
-                s = tl.load(next_col + (t * W + q) * C + oc, mask = qm, other = -1)
-                s = tl.where((t + 1 == n) & (s >= 0), 0, s)
-                g = (qm & (s >= 0) & (tl.load(back + base + (t + 1) * W + s, mask = qm & (s >= 0), other = 0) != 0)
-                     ).to(tl.int32)
-            else:                                                           # any successor
-                e0 = tl.load(succ_ptr + t * (W + 1) + q, mask = qm, other = 0)
-                e1 = tl.load(succ_ptr + t * (W + 1) + q + 1, mask = qm, other = 0)
-                for k in range(0, tl.max(e1 - e0, axis = 0)):
-                    em = qm & (e0 + k < e1)
-                    s = tl.load(succ + e0 + k, mask = em, other = 0)
-                    g = g | (em & (tl.load(back + base + (t + 1) * W + s, mask = em, other = 0) != 0)).to(tl.int32)
-            tl.store(back + base + t * W + q, g.to(tl.int8), mask = qm)
-            fwd = tl.load(live + base + t * W + q, mask = qm, other = 0)
-            tl.store(live + base + t * W + q, ((fwd != 0) & (g != 0)).to(tl.int8), mask = qm)
+            _reach_back(live, back, base, q, q < E, oc, next_col, succ_ptr, succ, t, n, W, C, TILE)
+
+
+@triton.jit
+def _live_forward_kernel(live, obs_class, next_col, succ_ptr, succ, width, t, n, W, C, TILE: tl.constexpr):
+    """Boundary ``t`` -> ``t + 1`` of :func:`_liveness_kernel`'s forward sweep as one launch, programs over (sample,
+    tile of the boundary's columns): ``live`` holds the boundaries up to ``t``, and zeros after (concurrent marks of a
+    column all write 1)."""
+    b = tl.program_id(0).to(tl.int64)
+    q = tl.program_id(1) * TILE + tl.arange(0, TILE)
+    base = b * (n + 1) * W
+    qm = q < tl.load(width + t)
+    f = qm & (tl.load(live + base + t * W + q, mask = qm, other = 0) != 0)
+    _mark_successors(live, base, q, f, tl.load(obs_class + b * n + t), next_col, succ_ptr, succ, t, n, W, C, TILE)
+
+
+@triton.jit
+def _live_backward_kernel(live, back, obs_class, next_col, succ_ptr, succ, width, t, n, W, C, TILE: tl.constexpr):
+    """Boundary ``t + 1`` -> ``t`` of :func:`_liveness_kernel`'s backward sweep as one launch, programs over (sample,
+    tile of the boundary's columns): ``back`` holds the boundaries after ``t``."""
+    b = tl.program_id(0).to(tl.int64)
+    q = tl.program_id(1) * TILE + tl.arange(0, TILE)
+    base = b * (n + 1) * W
+    _reach_back(live, back, base, q, q < tl.load(width + t), tl.load(obs_class + b * n + t), next_col, succ_ptr, succ,
+                t, n, W, C, TILE)
 
 
 @triton.jit
@@ -169,6 +206,14 @@ class Pruning:
 #: lanes of the list kernels
 LIST_TILE = 512
 
+#: The liveness sweeps run as a launch per boundary (:func:`_live_forward_kernel`, :func:`_live_backward_kernel`, on
+#: samples x tiles of LIVE_STEP_TILE columns) when the widest boundary has at least this many columns; below, one
+#: program per sample sweeps them all (:func:`_liveness_kernel`). HMM4096, batch 1: the sweep of a 47k-column
+#: automaton took 5-7 ms in one program per sample, 0.66 ms per boundary; below ~4k columns the 2n launches (~0.65 ms)
+#: cost more than the one-program sweep (0.12-0.2 ms).
+LIVE_STEPS_MIN_WIDTH = 4096
+LIVE_STEP_TILE = 256
+
 
 def prune(prog, obs_class: torch.Tensor, B: int) -> Pruning:
     """The :class:`Pruning` of a query whose observed token classes are ``obs_class`` ([B, n] int32, -1 where
@@ -177,9 +222,20 @@ def prune(prog, obs_class: torch.Tensor, B: int) -> Pruning:
     dev, ivs = prog.dev, prog.intervals
     live = torch.empty(B, n + 1, W, dtype = torch.int8, device = dev)
     back = torch.empty_like(live)
-    TILE = min(1024, max(32, triton.next_power_of_2(W)))
-    _liveness_kernel[(B,)](live, back, obs_class, prog.next_col, prog.succ.entry_ptr, prog.succ.entry_succ,
-                           prog.width_t, n, W, C, TILE = TILE, num_warps = 4)
+    tables = (obs_class, prog.next_col, prog.succ.entry_ptr, prog.succ.entry_succ, prog.width_t)
+    if W >= LIVE_STEPS_MIN_WIDTH:                    # a launch per boundary, programs over samples and columns
+        live.zero_()
+        live[:, 0, 0] = 1                                                   # the initial column
+        back[:, n, 0] = 1                                                   # the sequence end
+        for t in range(n):
+            _live_forward_kernel[(B, triton.cdiv(prog.width[t], LIVE_STEP_TILE))](
+                live, *tables, t, n, W, C, TILE = LIVE_STEP_TILE, num_warps = 4)
+        for t in range(n - 1, -1, -1):
+            _live_backward_kernel[(B, triton.cdiv(prog.width[t], LIVE_STEP_TILE))](
+                live, back, *tables, t, n, W, C, TILE = LIVE_STEP_TILE, num_warps = 4)
+    else:                                            # one program per sample, sweeping every boundary
+        TILE = min(1024, max(32, triton.next_power_of_2(W)))
+        _liveness_kernel[(B,)](live, back, *tables, n, W, C, TILE = TILE, num_warps = 4)
 
     if B not in prog.live_tables:                                           # where every sum interval's columns go
         sizes = [B * s for s in prog.sum_iv_slots]

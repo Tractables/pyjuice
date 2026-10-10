@@ -64,6 +64,15 @@ def transitions(request, monkeypatch):
     return request.param
 
 
+@pytest.fixture(params = ["per_sample", "per_boundary"])
+def liveness(request, monkeypatch):
+    """The liveness sweeps in one program per sample, or as a launch per boundary (used from far wider automata than
+    the test ones by default)."""
+    from pyjuice.constraints.backends.lifted.kernels import live
+    monkeypatch.setattr(live, "LIVE_STEPS_MIN_WIDTH", 1 << 30 if request.param == "per_sample" else 0)
+    return request.param
+
+
 def marginal(cc, data, missing):
     """The marginal with the buffers filled with NaN first."""
     bufs = cc._buffers(data.size(0))
@@ -100,7 +109,7 @@ def brute_live(dfa, L, data, missing):
     return out
 
 
-def test_liveness_matches_brute_force(build_pc):
+def test_liveness_matches_brute_force(build_pc, liveness):
     compared = 0
     for seed in range(6):
         rng = random.Random(seed)
@@ -136,7 +145,7 @@ def test_marginal_under_evidence_matches_the_reference(kind, pattern, sum_path, 
 
 @pytest.mark.parametrize("pattern", ["prefix", "suffix", "mixed"])
 @pytest.mark.parametrize("kind", ["pd", "pd_prod_dominated", "hmm", "hand_left"])
-def test_a_wide_automaton_under_evidence_matches_the_reference(kind, pattern, sum_path, build_pc, reference):
+def test_a_wide_automaton_under_evidence_matches_the_reference(kind, pattern, sum_path, liveness, build_pc, reference):
     """A 48-state automaton: blocks span several tiles, so block @ block skips tiles and chunks without a live
     column, and the fused sums whole tiles of dead columns."""
     rng = random.Random(0)
@@ -145,6 +154,37 @@ def test_a_wide_automaton_under_evidence_matches_the_reference(kind, pattern, su
     cc = jc.compile(dfa, build_pc(kind, n, V))
     data, missing = evidence(pattern, n)
     assert_close(marginal(cc, data, missing), reference.marginal(cc, data, missing), n)
+
+
+@pytest.mark.parametrize("kind", list(KINDS))
+def test_per_boundary_liveness_equals_per_sample(kind, build_pc, monkeypatch):
+    """The liveness sweeps as a launch per boundary give the one-program-per-sample sweeps' live columns, and so the
+    same live slots, under every pattern of evidence (a 48-state automaton: boundaries of several tiles)."""
+    from pyjuice.constraints.backends.lifted.kernels import live
+    rng = random.Random(0)
+    K, n = 48, KINDS[kind]
+    dfa = jc.DFA.from_dense(V, [[rng.randrange(K) for _ in range(V)] for _ in range(K)], 0, rng.sample(range(K), 12))
+    cc = jc.compile(dfa, build_pc(kind, n, V))
+    prog = cc._lifted_program()
+    widths = [int(w) for w in cc.layout.width.tolist()[:n]] + [1]
+    monkeypatch.setattr(live, "LIVE_STEP_TILE", 8)                          # several tiles per boundary
+    assert max(widths) > 8
+    launches, forward = [], live._live_forward_kernel
+    monkeypatch.setattr(live, "_live_forward_kernel", type("Counting", (), {
+        "__getitem__": lambda self, grid: launches.append(1) or forward[grid]})())
+    for pattern in PATTERNS:
+        data, missing = evidence(pattern, n)
+        oc = obs_classes(cc, data, missing)
+        got = {}
+        for name, min_width in (("per_sample", 1 << 30), ("per_boundary", 0)):
+            monkeypatch.setattr(live, "LIVE_STEPS_MIN_WIDTH", min_width)
+            launches.clear()
+            got[name] = prune(prog, oc, data.size(0))
+            assert len(launches) == (n if name == "per_boundary" else 0)
+        a, b = got["per_sample"], got["per_boundary"]
+        for t, w in enumerate(widths):
+            assert torch.equal(a.live[:, t, :w], b.live[:, t, :w]), (pattern, t)
+        assert torch.equal(a.perm, b.perm) and torch.equal(a.rank, b.rank) and torch.equal(a.counts, b.counts)
 
 
 def test_pruning_engages_only_under_evidence(build_pc, monkeypatch):
