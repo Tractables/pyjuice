@@ -171,17 +171,14 @@ def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
 @triton.jit
 def _block_input_kernel(element_mars, node_mars, temp, obs_class, next_col, class_mars, mass_row, trans, pred_ptr,
                         pred_col, pred_x, width, steps, reg_offset, reg_width, reg_first, out_first, out_width, temp_width,
-                        B, n, W, C, input_start, X_MAX, pid0, L_KIND: tl.constexpr, OUT_TEMP: tl.constexpr,
+                        B, n, W, C, input_start, pid0, L_KIND: tl.constexpr, OUT_TEMP: tl.constexpr,
                         GROUPED: tl.constexpr, TILE: tl.constexpr):
-    """One program per (step, sample, exit column) and tile of entry columns: a log-sum over the exit column's
-    predecessor entries (the same list for every lane), each through its mass for a missing token, or the
+    """One program per step and tile of its whole output, flattened (sample, entry column, exit column) as in
+    :func:`_input_block_kernel`: every lane takes a log-sum over its exit column's predecessor entries (the
+    program loops to the longest list among its lanes), each through its mass for a missing token, or the
     observed token's own log-probability when the entry holds its class."""
-    pid = pid0 + tl.program_id(0)
-    s = pid // (B * X_MAX)
-    r = pid % (B * X_MAX)
-    b = (r // X_MAX).to(tl.int64)
-    j = r % X_MAX                                                            # exit column (at boundary t + 1)
-    tile = tl.program_id(1)
+    s = tl.program_id(0)
+    tile = pid0 + tl.program_id(1)
     out_row = tl.load(steps + s * 7 + 0)
     t0 = tl.load(steps + s * 7 + 3)
     u = tl.load(steps + s * 7 + 4).to(tl.int64)
@@ -189,35 +186,42 @@ def _block_input_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
     E = tl.load(width + t0)
     M = tl.load(width + t)
     X = _exit_width(width, t + 1, n)
-    if (j < X) & (tile * TILE < E):
-        i = tile * TILE + tl.arange(0, TILE)
-        m = i < E
-        oc = tl.load(obs_class + b * n + t)
-        own = tl.load(node_mars + u * B + b)                                 # the input region of node_mars
+    EX = E * X
+    if tile * TILE < B * EX:
+        idx = tile * TILE + tl.arange(0, TILE)
+        m = idx < B * EX
+        b = (idx // EX).to(tl.int64)
+        pos = idx % EX
+        i = pos // X
+        j = pos % X                                                          # exit column (at boundary t + 1)
+        oc = tl.load(obs_class + b * n + t, mask = m, other = -1)
+        own = tl.load(node_mars + u * B + b, mask = m, other = float("-inf"))  # the input region of node_mars
         lp = _block_ptr(tl.load(steps + s * 7 + 1), tl.load(steps + s * 7 + 2), node_mars, temp, reg_offset,
-                        reg_width, reg_first, temp_width, L_KIND) + b * E * M
+                        reg_width, reg_first, temp_width, L_KIND) + (b * E + i) * M
         if GROUPED:
             masses = trans + tl.load(steps + s * 7 + 6).to(tl.int64)          # the step's transition masses
         else:                                                                # the input's class masses
             masses = class_mars + tl.load(mass_row + (u - input_start)).to(tl.int64) * C
         end = t + 1 == n
-        e0 = tl.load(pred_ptr + t * (W + 1) + j)
-        e1 = tl.load(pred_ptr + t * (W + 1) + j + 1)
+        e0 = tl.load(pred_ptr + t * (W + 1) + j, mask = m, other = 0)
+        e1 = tl.load(pred_ptr + t * (W + 1) + j + 1, mask = m, other = 0)
         mx = tl.full([TILE], float("-inf"), dtype = tl.float32)
         acc = tl.zeros([TILE], dtype = tl.float32)
-        for e in range(e0, e1):                                              # column q at t -> j
-            q = tl.load(pred_col + e)
-            x = tl.load(pred_x + e)
+        for k in range(0, tl.max(e1 - e0, axis = 0)):                        # column q at t -> j
+            em = m & (e0 + k < e1)
+            q = tl.load(pred_col + e0 + k, mask = em, other = 0)
+            x = tl.load(pred_x + e0 + k, mask = em, other = 0)
             if GROUPED:                                                      # does the observed class lead to j?
-                nq = tl.load(next_col + (t * W + q) * C + tl.maximum(oc, 0))
+                nq = tl.load(next_col + (t * W + q) * C + tl.maximum(oc, 0), mask = em, other = -1)
                 holds = (nq == j) | (end & (nq >= 0))
             else:                                                            # is it this entry's class?
                 holds = x == oc
-            mass = tl.where(oc >= 0, tl.where(holds, own, float("-inf")), tl.load(masses + x))
-            lv = tl.load(lp + i * M + q, mask = m, other = float("-inf"))
+            mass = tl.where(oc >= 0, tl.where(holds, own, float("-inf")),
+                            tl.load(masses + x, mask = em, other = float("-inf")))
+            lv = tl.load(lp + q, mask = em, other = float("-inf"))
             mx, acc = _lse_step(mx, acc, lv + mass)
-        op = _out_ptr(out_row, element_mars, temp, out_first, out_width, temp_width, OUT_TEMP) + b * E * X
-        tl.store(op + i * X + j, _lse_value(mx, acc), mask = m)
+        op = _out_ptr(out_row, element_mars, temp, out_first, out_width, temp_width, OUT_TEMP)
+        tl.store(op + idx, _lse_value(mx, acc), mask = m)
 
 
 @triton.jit
@@ -575,6 +579,11 @@ def _tile(cols: int) -> int:
     return min(256, max(16, triton.next_power_of_2(cols)))
 
 
+def _flat_tile(lanes: int) -> int:
+    """Lanes per program of a step whose output is flattened (sample, entry column, exit column)."""
+    return min(512, max(128, triton.next_power_of_2(lanes) // 8))
+
+
 def run_products(stages, bufs, prog, regions, element_mars, node_mars, class_mars, obs_class,
                  elem_first: int, elem_width: int, B: int):
     """
@@ -605,7 +614,7 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, class_mar
                         transition_masses(trans, job, class_mars, prog)
                     if form == "input_block":
                         r_kind, out_temp = kinds
-                        tile = min(512, max(128, triton.next_power_of_2(B * E_max * X_max) // 8))
+                        tile = _flat_tile(B * E_max * X_max)
                         for first, size in grid_chunks(triton.cdiv(B * E_max * X_max, tile), 1):
                             _input_block_kernel[(s1 - s0, size)](
                                 element_mars, node_mars, temp, obs_class, prog.next_col, class_mars, prog.mass_row,
@@ -614,14 +623,13 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, class_mar
                                 OUT_TEMP = out_temp, GROUPED = tt.grouped, TILE = tile, num_warps = 4, **common)
                     else:
                         l_kind, out_temp = kinds
-                        tile = _tile(E_max)
-                        for first, size in grid_chunks((s1 - s0) * B * X_max, 0):
-                            _block_input_kernel[(size, triton.cdiv(E_max, tile))](
+                        tile = _flat_tile(B * E_max * X_max)
+                        for first, size in grid_chunks(triton.cdiv(B * E_max * X_max, tile), 1):
+                            _block_input_kernel[(s1 - s0, size)](
                                 element_mars, node_mars, temp, obs_class, prog.next_col, class_mars, prog.mass_row,
                                 trans, tt.pred_ptr, tt.pred_col, tt.pred_x, prog.width_t, part, B = B, n = n, W = W,
-                                C = C, input_start = prog.input_start, X_MAX = X_max, pid0 = first,
-                                L_KIND = l_kind, OUT_TEMP = out_temp, GROUPED = tt.grouped, TILE = tile,
-                                num_warps = 4, **common)
+                                C = C, input_start = prog.input_start, pid0 = first, L_KIND = l_kind,
+                                OUT_TEMP = out_temp, GROUPED = tt.grouped, TILE = tile, num_warps = 4, **common)
             elif form == "block_block":
                 l_kind, r_kind, out_temp = kinds
                 steps, triples = steps

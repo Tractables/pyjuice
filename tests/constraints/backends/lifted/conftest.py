@@ -272,11 +272,23 @@ def hand_left(V):
     return summate(multiply(pre, x[4]), multiply(s03, x[4]), num_node_blocks = 1, block_size = 1)
 
 
+def left_linear(n, V, num_latents = 8):
+    """The mirror of an HMM: a sum over every prefix, each over the previous prefix times the next input (`block @
+    input`, whose left blocks have the initial state as their only entry column), every input tied to the first."""
+    x0 = inputs(0, num_node_blocks = 1, block_size = num_latents, dist = dists.Categorical(num_cats = V))
+    pre = summate(x0, num_node_blocks = 1, block_size = num_latents)                  # [0, 0]
+    for v in range(1, n):
+        x = x0.duplicate(v, tie_params = True)
+        pre = summate(multiply(pre, x), num_node_blocks = 1, block_size = num_latents if v < n - 1 else 1)
+    return pre
+
+
 #: Every kind :func:`build_pc` makes, with the number of variables its circuit needs (None: any).
 PC_KINDS = {
     "hmm": None,                 # tied HMM, one node block per position
     "hmm_untied": None,
     "hmm_block_sparse": None,    # 4 node blocks per position, random block-sparse transitions, tied
+    "left_linear": None,         # :func:`left_linear`: prefix sums, inputs tied
     "pd": None,                  # 1-D PD
     "pd_prod_dominated": None,   # sums shared by several products, block-sparse sum edges
     "pd_blockified": None,       # `juice.blockify` of a block-size-1 PD
@@ -300,6 +312,8 @@ def build_pc(kind, n, V, seed = 0, device = torch.device("cuda:0"), **compile_kw
         ns = juice.structures.HMM(seq_length = n, num_latents = 16, num_emits = V, block_size = 4,
                                   sum_edge_ids_constructor = partial(block_sparse_rnd_blk_edge_constructor,
                                                                      num_chs_per_block = 2))
+    elif kind == "left_linear":
+        ns = left_linear(n, V)
     elif kind == "pd":
         ns = juice.structures.PD(data_shape = (n,), num_latents = 4, split_intervals = 1,
                                  input_node_params = {"num_cats": V})

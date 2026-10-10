@@ -1,6 +1,6 @@
 """
 The lifted forward pass (`cc.marginal`) against the reference in conftest.py, on every kind of PC there:
-HMMs (tied, untied, block-sparse transitions), 1-D PDs (plain, sum-sharing with block-sparse sum edges,
+HMMs (tied, untied, block-sparse transitions), their left-linear mirror, 1-D PDs (plain, sum-sharing with block-sparse sum edges,
 blockified) and hand-built circuits (three- and four-child products, a sum over an input node, permuted and
 node-level product edges, an edge block listed twice, block size 1). Also: the one-state constraint gives
 pyjuice's own marginal, an unsatisfiable constraint or evidence that breaks the constraint gives -inf, and
@@ -15,7 +15,7 @@ import pyjuice as juice
 import pyjuice.constraints as jc
 
 V = 3
-KINDS = {"hmm": 6, "hmm_untied": 6, "hmm_block_sparse": 6, "pd": 8, "pd_prod_dominated": 8, "pd_blockified": 8,
+KINDS = {"hmm": 6, "hmm_untied": 6, "hmm_block_sparse": 6, "left_linear": 6, "pd": 8, "pd_prod_dominated": 8, "pd_blockified": 8,
          "hand": 5, "hand_permuted": 5, "hand_unit": 4, "hand_left": 5}                     # see conftest.py
 
 CONSTRAINTS = {
@@ -173,7 +173,7 @@ def test_skipping_empty_tiles_changes_nothing(build_pc, monkeypatch):
     assert_close(with_skip, cc.marginal(data, missing), n)
 
 
-@pytest.mark.parametrize("kind", ["hmm", "hand_left"])
+@pytest.mark.parametrize("kind", ["hmm", "left_linear", "hand_left"])
 def test_every_token_its_own_class(kind, transitions, build_pc, reference):
     """An automaton that sends every token of a 600-token vocabulary its own way: 600 token classes, so the
     class masses take the class-order pass and every column has far fewer successors than classes (an HMM reads
@@ -271,7 +271,7 @@ def test_transition_masses_match_brute_force(build_pc, monkeypatch):
                 assert abs(float(got - want)) < 1e-5, (u, t, q, g, float(got), float(want))
 
 
-@pytest.mark.parametrize("kind", ["hmm", "pd", "hand_left"])
+@pytest.mark.parametrize("kind", ["hmm", "left_linear", "pd", "hand_left"])
 def test_chunked_transition_masses_change_nothing(kind, build_pc, monkeypatch):
     """Transitions grouped, with a budget of one float: every input step's transition masses are built on their own,
     just before the step, into one shared scratch -- the marginal of keeping them all, bit for bit (a wide
@@ -319,12 +319,12 @@ def test_splitting_block_block_tiles_changes_nothing(build_pc, monkeypatch):
     assert torch.equal(marginal(1 << 20), marginal(0))
 
 
-@pytest.mark.parametrize("kind", ["hmm", "pd", "hand_left"])
+@pytest.mark.parametrize("kind", ["hmm", "left_linear", "pd", "hand_left"])
 def test_kernels_launch_past_the_grid_limits(kind, sum_path, build_pc, monkeypatch):
     """With CUDA's grid limits lowered to 3 programs on the first axis and 2 on the others, every kernel whose
     program count grows with the batch or the automaton is launched in several parts: the same marginal, bit for
     bit. A wide automaton gives each of them far more work than that (an HMM: input @ block; a PD: block
-    @ block; hand_left: block @ input; the dense path keeps copies). The buffers are filled with NaN before each
+    @ block; left_linear and hand_left: block @ input; the dense path keeps copies). The buffers are filled with NaN before each
     call, so a slot left unwritten shows instead of keeping the previous call's value."""
     from pyjuice.constraints.backends.lifted.kernels import prod
     rng = random.Random(0)
