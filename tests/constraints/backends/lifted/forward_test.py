@@ -72,6 +72,20 @@ def test_marginal_matches_the_reference(kind, B, constraint, sum_path, transitio
     assert_close(cc.marginal(data, missing), reference.marginal(cc, data, missing), n)
 
 
+@pytest.mark.parametrize("kind", ["pd", "pd_prod_dominated", "pd_blockified", "hand"])
+def test_a_wide_automaton_matches_the_reference(kind, sum_path, build_pc, reference):
+    """A 48-state random automaton: interval nodes keep only the pairs of columns it joins -- a fraction of them on
+    some intervals -- and the marginal matches the reference, which keeps every pair."""
+    rng = random.Random(0)
+    K, n = 48, KINDS[kind]
+    dfa = jc.DFA.from_dense(V, [[rng.randrange(K) for _ in range(V)] for _ in range(K)], 0, rng.sample(range(K), 12))
+    cc = jc.compile(dfa, build_pc(kind, n, V))
+    data, missing = evidence(n, 4)
+    got = cc.marginal(data, missing)
+    assert (cc._lifted_program().intervals.info[:, 1] >= 0).any()           # some interval keeps a fraction
+    assert_close(got, reference.marginal(cc, data, missing), n)
+
+
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_the_one_state_constraint_gives_pyjuices_marginal(kind, build_pc):
     n = KINDS[kind]
@@ -354,7 +368,7 @@ def marginal_with_aliasing(cc, on, data, missing, monkeypatch):
 
 def copy_launches(prog):
     return [steps for k, _, layers in prog.steps if k == "prod" for stages, _, _ in layers
-            for launches in stages for form, _, steps, _, _ in launches if form == "copy"]
+            for launches in stages for form, _, steps, *_ in launches if form == "copy"]
 
 
 @pytest.mark.parametrize("kind", list(KINDS))

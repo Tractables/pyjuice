@@ -7,7 +7,7 @@ import torch
 import pyjuice as juice
 import pyjuice.constraints as jc
 from pyjuice.constraints.backends.lifted.kernels.prod import max_successors, skip_masks, transition_tables
-from pyjuice.constraints.backends.lifted.plan import Reachability, _tile_any, build_layout
+from pyjuice.constraints.backends.lifted.plan import Reachability, _tile_any, build_layout, interval_tables
 
 
 def random_dfa(K, V, seed):
@@ -118,7 +118,10 @@ def brute_pairs(dfa, L, a, b, V):
 
 
 def test_reachability_matches_brute_force():
+    """The joined pairs of every interval, their tile occupancy, and the slots a block over the interval keeps: the
+    joined pairs in row-major order (positions None when every pair is joined, as on every prefix and suffix)."""
     V, n = 3, 5
+    partial = 0
     for seed in range(10):
         dfa = random_dfa(5, V, seed)
         L = build_layout(dfa, n)
@@ -130,6 +133,44 @@ def test_reachability_matches_brute_force():
                 want = brute_pairs(dfa, L, a, b, V)
                 assert torch.equal(reach.pairs(a, b), want), (seed, a, b)
                 assert torch.equal(reach.occupancy(a, b), _tile_any(want, 2, 2)), (seed, a, b)
+                if b == a:
+                    continue
+                assert reach.slots(a, b) == int(want.sum()), (seed, a, b)
+                positions = reach.positions(a, b)
+                if want.all():
+                    assert positions is None, (seed, a, b)
+                else:
+                    assert a > 0 and b < n                                  # prefixes and suffixes join every pair
+                    assert torch.equal(positions[want], torch.arange(int(want.sum()), dtype = torch.int32))
+                    assert (positions[~want] == -1).all()
+                    partial += 1
+    assert partial > 0
+
+
+def test_interval_tables_hold_every_intervals_slots():
+    V, n = 3, 6
+    dfa = random_dfa(8, V, 3)
+    reach = Reachability(build_layout(dfa, n))
+    intervals = [(a, b) for a in range(n) for b in range(a + 1, n + 1)]
+    ivs = interval_tables(reach, intervals[::2], "cpu")                    # every other one
+    used = set(intervals[::2])
+    partial = 0
+    for a in range(n + 1):
+        for b in range(n + 1):
+            k = int(ivs.of[a * (n + 1) + b])
+            if (a, b) not in used:
+                assert k == -1
+                continue
+            slots, positions, pairs = ivs.info[k].tolist()
+            want = reach.pairs(a, b)
+            assert slots == int(want.sum())
+            if want.all():
+                assert positions == pairs == -1
+            else:
+                assert torch.equal(ivs.table[positions:positions + want.numel()].view_as(want), reach.positions(a, b))
+                assert torch.equal(ivs.table[pairs:pairs + slots], torch.nonzero(want.flatten()).flatten().int())
+                partial += 1
+    assert partial > 0
 
 
 def definition_masks(reach, triples, tm, tn, tk):
@@ -375,7 +416,7 @@ def test_every_block_block_step_indexes_its_triple(kind, build_pc):
             continue
         for stages, _, _ in layers:
             for launches in stages:
-                for form, _, steps, _, _ in launches:
+                for form, _, steps, *_ in launches:
                     if form == "block_block":
                         table, index = steps
                         tri = [prog.skip_triples[i] for i in index.tolist()]

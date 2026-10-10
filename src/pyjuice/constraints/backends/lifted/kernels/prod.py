@@ -16,11 +16,13 @@ circuit's shape:
 
 Blocks are either sum nodes' rows in ``node_mars`` or intermediate results in a scratch buffer. Outputs go
 to the product layer's ``element_mars`` rows, or to scratch when another step reads them. A row holds one
-block per sample, sample-major: sample ``b``'s block in columns ``[b * slots, (b + 1) * slots)``, slot ``i *
-X + j`` for entry column ``i`` and exit column ``j``. An input child is read only as the log-probability of
-its observed token (pyjuice's own input layers wrote it) or, when the token is missing, through its transition
-masses (:func:`transition_masses`): for a column and one of its successors, the log-mass of the token classes
-that lead there -- so a missing token costs a gather per successor, not per class.
+block per sample, sample-major: sample ``b``'s block in columns ``[b * slots, (b + 1) * slots)``. A block keeps
+only the (entry column ``i``, exit column ``j``) pairs the automaton joins, in row-major order: slot ``i * X +
+j`` when it joins them all, else through its interval's tables (:class:`~..plan.IntervalTables`). An input child
+is read only as the log-probability of its observed token (pyjuice's own input layers wrote it) or, when the
+token is missing, through its transition masses (:func:`transition_masses`): for a column and one of its
+successors, the log-mass of the token classes that lead there -- so a missing token costs a gather per
+successor, not per class.
 """
 
 import math
@@ -80,6 +82,36 @@ def _exit_width(width, t2, n):
 
 
 @triton.jit
+def _interval(iv_of, iv_info, a, b, n):
+    """``(slots, positions, pairs)`` of the interval ``[a, b)``: its blocks' slots per sample, and where its
+    position and pair tables start (-1 when it keeps every pair; see :class:`~..plan.IntervalTables`)."""
+    k = tl.load(iv_of + a * (n + 1) + b).to(tl.int64) * 3
+    return tl.load(iv_info + k).to(tl.int32), tl.load(iv_info + k + 1), tl.load(iv_info + k + 2)  # 32-bit index math
+
+
+@triton.jit
+def _slot(iv_table, positions, r, c, ncols, mask, FULL: tl.constexpr):
+    """The slot of pair ``(r, c)`` in a block with ``ncols`` exit columns: negative where the automaton does not join
+    them, or ``r`` is negative. ``FULL``: the block's interval keeps every pair (known when the kernel is compiled);
+    else the interval's tables say (``positions`` -1: it keeps every pair)."""
+    if FULL:
+        return r * ncols + c
+    else:
+        return tl.where(positions < 0, r * ncols + c,
+                        tl.load(iv_table + positions + r * ncols + c, mask = mask & (r >= 0) & (positions >= 0),
+                                other = -1))
+
+
+@triton.jit
+def _pair(iv_table, pairs, p, mask, FULL: tl.constexpr):
+    """``i * X + j`` of the pair ``(i, j)`` in slot ``p`` (``FULL`` as for :func:`_slot`)."""
+    if FULL:
+        return p
+    else:
+        return tl.where(pairs < 0, p, tl.load(iv_table + pairs + p, mask = mask & (pairs >= 0), other = 0))
+
+
+@triton.jit
 def _lse_step(m, acc, v):
     """One step of an online log-sum-exp (``m``: running max, ``acc``: running sum scaled by ``exp(-m)``)."""
     m_new = tl.maximum(m, v)
@@ -95,33 +127,32 @@ def _lse_value(m, acc):
 
 @triton.jit
 def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, class_mars, mass_row, trans, entry_ptr,
-                        entry_succ, entry_x, width, steps, reg_offset, reg_width, reg_first, out_first, out_width, temp_width,
-                        B, n, W, C, input_start, pid0, R_KIND: tl.constexpr, OUT_TEMP: tl.constexpr,
-                        GROUPED: tl.constexpr, TILE: tl.constexpr):
-    """One program per step and tile of its whole output, flattened (sample, entry column, exit column): with the
-    samples' blocks contiguous, a step's output is one run of columns, and the lanes stay full whatever the
-    widths."""
+                        entry_succ, entry_x, width, iv_of, iv_info, iv_table, steps, reg_offset, reg_width, reg_first,
+                        out_first, out_width, temp_width, B, n, W, C, input_start, pid0, R_KIND: tl.constexpr,
+                        OUT_TEMP: tl.constexpr, GROUPED: tl.constexpr, OUT_FULL: tl.constexpr, R_FULL: tl.constexpr,
+                        TILE: tl.constexpr):
+    """One program per step and tile of its whole output, flattened (sample, slot): with the samples' blocks
+    contiguous, a step's output is one run of columns, and the lanes stay full whatever the widths."""
     s = tl.program_id(0)
     tile = pid0 + tl.program_id(1)
     out_row = tl.load(steps + s * 7 + 0)
     u = tl.load(steps + s * 7 + 1).to(tl.int64)
     t = tl.load(steps + s * 7 + 2)
     t2 = tl.load(steps + s * 7 + 5)
-    E = tl.load(width + t)
     X = _exit_width(width, t2, n)
-    EX = E * X
-    if tile * TILE < B * EX:
+    S, _, pairs = _interval(iv_of, iv_info, t, t2, n)
+    if tile * TILE < B * S:
         idx = tile * TILE + tl.arange(0, TILE)
-        m = idx < B * EX
-        b = (idx // EX).to(tl.int64)
-        pos = idx % EX
-        i = pos // X
-        j = pos % X
+        m = idx < B * S
+        b = (idx // S).to(tl.int64)
+        v = _pair(iv_table, pairs, idx % S, m, OUT_FULL)
+        i = v // X
+        j = v % X
         end = t + 1 == n
         if R_KIND != 2:
-            M = tl.load(width + t + 1)                                       # the block's entry columns
+            RS, rpos, _ = _interval(iv_of, iv_info, t + 1, t2, n)            # the block's slots
             rp = _block_ptr(tl.load(steps + s * 7 + 3), tl.load(steps + s * 7 + 4), node_mars, temp, reg_offset,
-                            reg_width, reg_first, temp_width, R_KIND) + b * M * X
+                            reg_width, reg_first, temp_width, R_KIND) + b * RS
         oc = tl.load(obs_class + b * n + t, mask = m, other = -1)            # observed token's class, -1 if missing
 
         # an observed token: its own log-probability (the input region of node_mars), then the block from the
@@ -131,7 +162,8 @@ def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
         if R_KIND == 2:
             rv = tl.where((q == j) | (end & (q >= 0)), 0.0, float("-inf"))
         else:
-            rv = tl.load(rp + q * X + j, mask = obs & (q >= 0), other = float("-inf"))
+            sl = _slot(iv_table, rpos, q, j, X, obs, R_FULL)
+            rv = tl.load(rp + sl, mask = obs & (sl >= 0), other = float("-inf"))
         val = tl.load(node_mars + u * B + b, mask = obs, other = float("-inf")) + rv
 
         # a missing token: log-sum over i's transitions of their mass + the block from their successor (skipped when
@@ -150,7 +182,8 @@ def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
                     if R_KIND == 2:
                         rv = tl.where(pm & (q == j), 0.0, float("-inf"))
                     else:
-                        rv = tl.load(rp + q * X + j, mask = pm, other = float("-inf"))
+                        sl = _slot(iv_table, rpos, q, j, X, pm, R_FULL)
+                        rv = tl.load(rp + sl, mask = pm & (sl >= 0), other = float("-inf"))
                     mass = tl.load(masses + tl.load(entry_x + p0 + k, mask = pm, other = 0), mask = pm,
                                    other = float("-inf"))
                     mx, acc = _lse_step(mx, acc, mass + rv)
@@ -161,7 +194,8 @@ def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
                     if R_KIND == 2:
                         rv = tl.where((q == j) | (end & (q >= 0)), 0.0, float("-inf"))
                     else:
-                        rv = tl.load(rp + q * X + j, mask = miss & (q >= 0), other = float("-inf"))
+                        sl = _slot(iv_table, rpos, q, j, X, miss, R_FULL)
+                        rv = tl.load(rp + sl, mask = miss & (sl >= 0), other = float("-inf"))
                     mx, acc = _lse_step(mx, acc, tl.load(masses + c) + rv)
             val = tl.where(oc >= 0, val, _lse_value(mx, acc))
         op = _out_ptr(out_row, element_mars, temp, out_first, out_width, temp_width, OUT_TEMP)
@@ -170,10 +204,11 @@ def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
 
 @triton.jit
 def _block_input_kernel(element_mars, node_mars, temp, obs_class, next_col, class_mars, mass_row, trans, pred_ptr,
-                        pred_col, pred_x, width, steps, reg_offset, reg_width, reg_first, out_first, out_width, temp_width,
-                        B, n, W, C, input_start, pid0, L_KIND: tl.constexpr, OUT_TEMP: tl.constexpr,
-                        GROUPED: tl.constexpr, TILE: tl.constexpr):
-    """One program per step and tile of its whole output, flattened (sample, entry column, exit column) as in
+                        pred_col, pred_x, width, iv_of, iv_info, iv_table, steps, reg_offset, reg_width, reg_first,
+                        out_first, out_width, temp_width, B, n, W, C, input_start, pid0, L_KIND: tl.constexpr,
+                        OUT_TEMP: tl.constexpr, GROUPED: tl.constexpr, OUT_FULL: tl.constexpr, L_FULL: tl.constexpr,
+                        TILE: tl.constexpr):
+    """One program per step and tile of its whole output, flattened (sample, slot) as in
     :func:`_input_block_kernel`: every lane takes a log-sum over its exit column's predecessor entries (the
     program loops to the longest list among its lanes), each through its mass for a missing token, or the
     observed token's own log-probability when the entry holds its class."""
@@ -183,21 +218,21 @@ def _block_input_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
     t0 = tl.load(steps + s * 7 + 3)
     u = tl.load(steps + s * 7 + 4).to(tl.int64)
     t = tl.load(steps + s * 7 + 5)
-    E = tl.load(width + t0)
     M = tl.load(width + t)
     X = _exit_width(width, t + 1, n)
-    EX = E * X
-    if tile * TILE < B * EX:
+    S, _, pairs = _interval(iv_of, iv_info, t0, t + 1, n)
+    LS, lpos, _ = _interval(iv_of, iv_info, t0, t, n)                       # the block's slots
+    if tile * TILE < B * S:
         idx = tile * TILE + tl.arange(0, TILE)
-        m = idx < B * EX
-        b = (idx // EX).to(tl.int64)
-        pos = idx % EX
-        i = pos // X
-        j = pos % X                                                          # exit column (at boundary t + 1)
+        m = idx < B * S
+        b = (idx // S).to(tl.int64)
+        v = _pair(iv_table, pairs, idx % S, m, OUT_FULL)
+        i = v // X
+        j = v % X                                                            # exit column (at boundary t + 1)
         oc = tl.load(obs_class + b * n + t, mask = m, other = -1)
         own = tl.load(node_mars + u * B + b, mask = m, other = float("-inf"))  # the input region of node_mars
         lp = _block_ptr(tl.load(steps + s * 7 + 1), tl.load(steps + s * 7 + 2), node_mars, temp, reg_offset,
-                        reg_width, reg_first, temp_width, L_KIND) + (b * E + i) * M
+                        reg_width, reg_first, temp_width, L_KIND) + b * LS
         if GROUPED:
             masses = trans + tl.load(steps + s * 7 + 6).to(tl.int64)          # the step's transition masses
         else:                                                                # the input's class masses
@@ -218,7 +253,8 @@ def _block_input_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
                 holds = x == oc
             mass = tl.where(oc >= 0, tl.where(holds, own, float("-inf")),
                             tl.load(masses + x, mask = em, other = float("-inf")))
-            lv = tl.load(lp + q, mask = em, other = float("-inf"))
+            sl = _slot(iv_table, lpos, i, q, M, em, L_FULL)
+            lv = tl.load(lp + sl, mask = em & (sl >= 0), other = float("-inf"))
             mx, acc = _lse_step(mx, acc, lv + mass)
         op = _out_ptr(out_row, element_mars, temp, out_first, out_width, temp_width, OUT_TEMP)
         tl.store(op + idx, _lse_value(mx, acc), mask = m)
@@ -239,31 +275,23 @@ def _chunk_needed(mb, ti, tj, c, TILES_I, TILES_J, WORDS, SUB_I: tl.constexpr, S
 
 
 @triton.jit
-def _block_block_tile(lp, rp, mb, i, j, ti, tj, E, M, X, TILES_I, TILES_J, WORDS,
+def _tile_load(ptr, iv_table, positions, r, c, ncols, rm, cm):
+    """The tile of a block at rows ``r`` and columns ``c``, -inf where not joined."""
+    mask = rm[:, None] & cm[None, :]
+    sl = _slot(iv_table, positions, r[:, None], c[None, :], ncols, mask, False)
+    return tl.load(ptr + sl, mask = mask & (sl >= 0), other = float("-inf"))
+
+
+@triton.jit
+def _block_block_tile(lp, rp, iv_table, lpos, rpos, mb, i, j, ti, tj, E, M, X, TILES_I, TILES_J, WORDS,
                       TM: tl.constexpr, TN: tl.constexpr, TK: tl.constexpr, SUB_I: tl.constexpr, SUB_J: tl.constexpr,
                       SKIP: tl.constexpr, PRECISION: tl.constexpr):
-    """``log(sum_q exp(L[i, q] + R[q, j]))`` for one output tile: every row's and column's maximum over the
-    shared chunks the tile needs, then the product of the shifted exponentials over those chunks."""
+    """``log(sum_q exp(L[i, q] + R[q, j]))`` for one output tile, in one pass over the shared chunks it needs: the
+    product of the operands' exponentials, shifted by every row's and column's running maximum, the sum rescaled
+    whenever a maximum grows (``lpos`` and ``rpos``: the operands' position tables)."""
     im, jm = i < E, j < X
-    runl = tl.full([TM, TK], float("-inf"), dtype = tl.float32)
-    runr = tl.full([TK, TN], float("-inf"), dtype = tl.float32)
-    for c in range(0, tl.cdiv(M, TK)):
-        need = True
-        if SKIP:
-            need = _chunk_needed(mb, ti, tj, c, TILES_I, TILES_J, WORDS, SUB_I, SUB_J)
-        if need:
-            q = c * TK + tl.arange(0, TK)
-            qm = q < M
-            # an elementwise running maximum, reduced once after the loop (a reduction inside the loop crashes
-            # Triton 3.7's TritonGPUOptimizeThreadLocality pass)
-            runl = tl.maximum(runl, tl.load(lp + (i[:, None] * M + q[None, :]), mask = im[:, None] & qm[None, :],
-                                            other = float("-inf")))
-            runr = tl.maximum(runr, tl.load(rp + (q[:, None] * X + j[None, :]), mask = qm[:, None] & jm[None, :],
-                                            other = float("-inf")))
-    sL = tl.max(runl, axis = 1)
-    sR = tl.max(runr, axis = 0)
-    sL = tl.where(sL == float("-inf"), 0.0, sL)
-    sR = tl.where(sR == float("-inf"), 0.0, sR)
+    mL = tl.full([TM], float("-inf"), dtype = tl.float32)
+    mR = tl.full([TN], float("-inf"), dtype = tl.float32)
     acc = tl.zeros([TM, TN], dtype = tl.float32)
     for c in range(0, tl.cdiv(M, TK)):
         need = True
@@ -272,15 +300,26 @@ def _block_block_tile(lp, rp, mb, i, j, ti, tj, E, M, X, TILES_I, TILES_J, WORDS
         if need:
             q = c * TK + tl.arange(0, TK)
             qm = q < M
-            lt = tl.load(lp + (i[:, None] * M + q[None, :]), mask = im[:, None] & qm[None, :], other = float("-inf"))
-            rt = tl.load(rp + (q[:, None] * X + j[None, :]), mask = qm[:, None] & jm[None, :], other = float("-inf"))
-            acc += tl.dot(tl.exp(lt - sL[:, None]), tl.exp(rt - sR[None, :]), input_precision = PRECISION)
+            lt = _tile_load(lp, iv_table, lpos, i, q, M, im, qm)
+            rt = _tile_load(rp, iv_table, rpos, q, j, X, qm, jm)
+            nL = tl.maximum(mL, tl.max(lt, axis = 1))
+            nR = tl.maximum(mR, tl.max(rt, axis = 0))
+            sL = tl.where(nL == float("-inf"), 0.0, nL)
+            sR = tl.where(nR == float("-inf"), 0.0, nR)
+            fL = tl.where(nL == float("-inf"), 1.0, tl.exp(mL - sL))
+            fR = tl.where(nR == float("-inf"), 1.0, tl.exp(mR - sR))
+            acc = acc * fL[:, None] * fR[None, :] + tl.dot(tl.exp(lt - sL[:, None]), tl.exp(rt - sR[None, :]),
+                                                            input_precision = PRECISION)
+            mL, mR = nL, nR
+    sL = tl.where(mL == float("-inf"), 0.0, mL)
+    sR = tl.where(mR == float("-inf"), 0.0, mR)
     return tl.log(acc) + sL[:, None] + sR[None, :]
 
 
 @triton.jit
-def _block_block_kernel(element_mars, node_mars, temp, width, steps, triples, skip_bits, reg_offset, reg_width,
-                        reg_first, out_first, out_width, temp_width, B, n, TILES_I, TILES_J, WORDS, SPLIT, GROUP,
+def _block_block_kernel(element_mars, node_mars, temp, width, iv_of, iv_info, iv_table, steps, triples, skip_bits,
+                        reg_offset, reg_width, reg_first, out_first, out_width, temp_width, B, n, TILES_I, TILES_J,
+                        WORDS, SPLIT, GROUP,
                         pid0, L_KIND: tl.constexpr, R_KIND: tl.constexpr, OUT_TEMP: tl.constexpr,
                         TM: tl.constexpr, TN: tl.constexpr, TK: tl.constexpr, SUB_I: tl.constexpr,
                         SUB_J: tl.constexpr, SKIP: tl.constexpr, PRECISION: tl.constexpr):
@@ -298,11 +337,14 @@ def _block_block_kernel(element_mars, node_mars, temp, width, steps, triples, sk
     E = tl.load(width + t0)
     M = tl.load(width + t1)
     X = _exit_width(width, t2, n)
+    LS, lpos, _ = _interval(iv_of, iv_info, t0, t1, n)
+    RS, rpos, _ = _interval(iv_of, iv_info, t1, t2, n)
+    OS, opos, _ = _interval(iv_of, iv_info, t0, t2, n)
     lp = _block_ptr(tl.load(steps + s * 8 + 1), tl.load(steps + s * 8 + 2), node_mars, temp, reg_offset,
-                    reg_width, reg_first, temp_width, L_KIND) + b * E * M
+                    reg_width, reg_first, temp_width, L_KIND) + b * LS
     rp = _block_ptr(tl.load(steps + s * 8 + 3), tl.load(steps + s * 8 + 4), node_mars, temp, reg_offset,
-                    reg_width, reg_first, temp_width, R_KIND) + b * M * X
-    op = _out_ptr(out_row, element_mars, temp, out_first, out_width, temp_width, OUT_TEMP) + b * E * X
+                    reg_width, reg_first, temp_width, R_KIND) + b * RS
+    op = _out_ptr(out_row, element_mars, temp, out_first, out_width, temp_width, OUT_TEMP) + b * OS
     mb = skip_bits + tl.load(triples + s).to(tl.int64) * TILES_I * TILES_J * WORDS
     NJ = tl.cdiv(X, TN)
     for t in range(g * GROUP, tl.minimum(g * GROUP + GROUP, tl.cdiv(E, TM) * NJ)):
@@ -310,13 +352,15 @@ def _block_block_kernel(element_mars, node_mars, temp, width, steps, triples, sk
         tj = t % NJ
         i = ti * TM + tl.arange(0, TM)
         j = tj * TN + tl.arange(0, TN)
-        out = _block_block_tile(lp, rp, mb, i, j, ti, tj, E, M, X, TILES_I, TILES_J, WORDS, TM, TN, TK, SUB_I,
-                                SUB_J, SKIP, PRECISION)
-        tl.store(op + (i[:, None] * X + j[None, :]), out, mask = (i < E)[:, None] & (j < X)[None, :])
+        out = _block_block_tile(lp, rp, iv_table, lpos, rpos, mb, i, j, ti, tj, E, M, X, TILES_I, TILES_J, WORDS,
+                                TM, TN, TK, SUB_I, SUB_J, SKIP, PRECISION)
+        om = (i < E)[:, None] & (j < X)[None, :]
+        sl = _slot(iv_table, opos, i[:, None], j[None, :], X, om, False)
+        tl.store(op + sl, out, mask = om & (sl >= 0))
 
 
 @triton.jit
-def _copy_kernel(element_mars, node_mars, temp, width, steps, reg_offset, reg_width, reg_first, out_first,
+def _copy_kernel(element_mars, node_mars, temp, iv_of, iv_info, steps, reg_offset, reg_width, reg_first, out_first,
                  out_width, temp_width, B, n, pid0, L_KIND: tl.constexpr, OUT_TEMP: tl.constexpr,
                  TILE: tl.constexpr):
     s = tl.program_id(0)
@@ -324,7 +368,8 @@ def _copy_kernel(element_mars, node_mars, temp, width, steps, reg_offset, reg_wi
     out_row = tl.load(steps + s * 5 + 0)
     t0 = tl.load(steps + s * 5 + 3)
     t2 = tl.load(steps + s * 5 + 4)
-    ncols = tl.load(width + t0) * _exit_width(width, t2, n) * B
+    S, _, _ = _interval(iv_of, iv_info, t0, t2, n)
+    ncols = S * B
     if pid * TILE < ncols:
         cols = pid * TILE + tl.arange(0, TILE)
         m = cols < ncols
@@ -592,7 +637,8 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, class_mar
     :data:`PRODUCT_PRECISION` (exact fp32 by default), the other contractions exact fp32 log-sum-exps.
 
     :param stages: the layer's stages from :class:`~pyjuice.constraints.backends.lifted.forward.Program`: lists
-        of ``(form, kinds, steps, E_max, X_max)`` launches (``block @ block`` steps: ``(steps, triple index)``,
+        of ``(form, kinds, steps, E_max, X_max, S_max)`` launches (the most entry columns, exit columns and slots of
+        their steps' outputs; ``block @ block`` steps: ``(steps, triple index)``,
         the latter indexing ``Program.skip``; ``input @ block`` and ``block @ input`` steps: ``(steps, chunks)``,
         ``(first, end, job)`` step ranges, ``job`` the :func:`transition_job` that builds their transition masses
         just before them, or None when the Program keeps them all)
@@ -602,8 +648,9 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, class_mar
     common = dict(reg_offset = regions["offset"], reg_width = regions["width"], reg_first = regions["first"],
                   out_first = elem_first, out_width = elem_width, temp_width = temp_width)
     n, W, C = prog.n, prog.next_col.size(1), prog.next_col.size(2)
+    ivs = prog.intervals
     for launches in stages:
-        for form, kinds, steps, E_max, X_max in launches:
+        for form, kinds, steps, E_max, X_max, S_max in launches:
             S = steps[0].size(0) if isinstance(steps, tuple) else steps.size(0)
             if form in ("input_block", "block_input"):
                 steps, chunks = steps
@@ -613,23 +660,27 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, class_mar
                     if job is not None:                              # this chunk's transition masses, in scratch
                         transition_masses(trans, job, class_mars, prog)
                     if form == "input_block":
-                        r_kind, out_temp = kinds
-                        tile = _flat_tile(B * E_max * X_max)
-                        for first, size in grid_chunks(triton.cdiv(B * E_max * X_max, tile), 1):
+                        r_kind, out_temp, (out_full, *r_full) = kinds
+                        tile = _flat_tile(B * S_max)
+                        for first, size in grid_chunks(triton.cdiv(B * S_max, tile), 1):
                             _input_block_kernel[(s1 - s0, size)](
                                 element_mars, node_mars, temp, obs_class, prog.next_col, class_mars, prog.mass_row,
-                                trans, tt.entry_ptr, tt.entry_succ, tt.entry_x, prog.width_t, part, B = B, n = n, W = W,
+                                trans, tt.entry_ptr, tt.entry_succ, tt.entry_x, prog.width_t, ivs.of, ivs.info,
+                                ivs.table, part, B = B, n = n, W = W,
                                 C = C, input_start = prog.input_start, pid0 = first, R_KIND = r_kind,
-                                OUT_TEMP = out_temp, GROUPED = tt.grouped, TILE = tile, num_warps = 4, **common)
+                                OUT_TEMP = out_temp, GROUPED = tt.grouped, OUT_FULL = out_full, R_FULL = all(r_full),
+                                TILE = tile, num_warps = 4, **common)
                     else:
-                        l_kind, out_temp = kinds
-                        tile = _flat_tile(B * E_max * X_max)
-                        for first, size in grid_chunks(triton.cdiv(B * E_max * X_max, tile), 1):
+                        l_kind, out_temp, (out_full, l_full) = kinds
+                        tile = _flat_tile(B * S_max)
+                        for first, size in grid_chunks(triton.cdiv(B * S_max, tile), 1):
                             _block_input_kernel[(s1 - s0, size)](
                                 element_mars, node_mars, temp, obs_class, prog.next_col, class_mars, prog.mass_row,
-                                trans, tt.pred_ptr, tt.pred_col, tt.pred_x, prog.width_t, part, B = B, n = n, W = W,
+                                trans, tt.pred_ptr, tt.pred_col, tt.pred_x, prog.width_t, ivs.of, ivs.info, ivs.table,
+                                part, B = B, n = n, W = W,
                                 C = C, input_start = prog.input_start, pid0 = first, L_KIND = l_kind,
-                                OUT_TEMP = out_temp, GROUPED = tt.grouped, TILE = tile, num_warps = 4, **common)
+                                OUT_TEMP = out_temp, GROUPED = tt.grouped, OUT_FULL = out_full, L_FULL = l_full,
+                                TILE = tile, num_warps = 4, **common)
             elif form == "block_block":
                 l_kind, r_kind, out_temp = kinds
                 steps, triples = steps
@@ -641,7 +692,8 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, class_mar
                 split = triton.cdiv(tiles, group)                         # no group past the widest step's tiles
                 for first, size in grid_chunks(S * B * split, 0):
                     _block_block_kernel[(size,)](
-                        element_mars, node_mars, temp, prog.width_t, steps, triples, skip.bits, B = B, n = n,
+                        element_mars, node_mars, temp, prog.width_t, ivs.of, ivs.info, ivs.table, steps, triples,
+                        skip.bits, B = B, n = n,
                         TILES_I = skip.tiles_i, TILES_J = skip.tiles_j, WORDS = skip.words, SPLIT = split,
                         GROUP = group, pid0 = first, L_KIND = l_kind, R_KIND = r_kind, OUT_TEMP = out_temp,
                         TM = cfg["TM"], TN = cfg["TN"], TK = cfg["TK"], SUB_I = cfg["TM"] // skip.tm,
@@ -649,8 +701,8 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, class_mar
                         num_warps = cfg["warps"], num_stages = 1, **common)
             else:                                                            # "copy"
                 l_kind, out_temp = kinds
-                tile = _tile(E_max * X_max * B)
-                for first, size in grid_chunks(triton.cdiv(E_max * X_max * B, tile), 1):
+                tile = _tile(S_max * B)
+                for first, size in grid_chunks(triton.cdiv(S_max * B, tile), 1):
                     _copy_kernel[(S, size)](
-                        element_mars, node_mars, temp, prog.width_t, steps, B = B, n = n, pid0 = first,
+                        element_mars, node_mars, temp, ivs.of, ivs.info, steps, B = B, n = n, pid0 = first,
                         L_KIND = l_kind, OUT_TEMP = out_temp, TILE = tile, num_warps = 4, **common)

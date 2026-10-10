@@ -25,7 +25,7 @@ from .kernels.prod import IDENTITY, SUM, TEMP, max_successors, skip_masks, trans
 from .kernels.prod import transition_tables
 from .kernels.prod import run_products as products
 from .kernels.sum import dense_groups, dense_sum, fused_sum
-from .plan import Reachability, _align
+from .plan import _align, interval_tables
 
 #: Matrix-product precision of the kernels: "fp32" (three TF32 products, fp32-level accuracy) or "tf32".
 PRECISIONS = {"fp32": "tf32x3", "tf32": "tf32"}
@@ -57,6 +57,7 @@ class Program:
         self.n = n
         self.width = [int(w) for w in layout.width.tolist()]
         self.width_t = layout.width.to(dev, torch.int32)
+        self.reach = layout.reachability                               # the slots of every interval's blocks
         self.next_col = layout.next_col.to(dev, torch.int32).contiguous()
         self.input_start, self.input_end = cc.input_range
         self.mass_row = cc._class_mass_rows()[2]                       # input node -> its row of the class masses
@@ -124,7 +125,7 @@ class Program:
             alias_reg = torch.zeros(end - first, dtype = torch.int32)
             for stages, _, _ in layers:
                 for launches in stages:
-                    for li, (form, kinds, steps, E, X) in enumerate(launches):
+                    for li, (form, kinds, steps, *sizes) in enumerate(launches):
                         if form != "copy" or kinds != (SUM, False):
                             continue
                         st = steps.cpu().long()
@@ -132,7 +133,7 @@ class Program:
                         regs = st[~keep, 2]
                         alias_row[st[~keep, 0] - first] = (st[~keep, 1] - torch.tensor(firsts)[regs]).to(torch.int32)
                         alias_reg[st[~keep, 0] - first] = regs.to(torch.int32)
-                        launches[li] = (form, kinds, st[keep].to(dev, torch.int32).contiguous(), E, X)
+                        launches[li] = (form, kinds, st[keep].to(dev, torch.int32).contiguous(), *sizes)
                     launches[:] = [l for l in launches if l[0] != "copy" or l[2].size(0) > 0]
             if (alias_row >= 0).any():
                 self.alias[prod_index] = (alias_row, alias_reg)
@@ -140,6 +141,9 @@ class Program:
                     for pi, (dense, E, fused) in enumerate(parts):
                         if fused is not None:
                             parts[pi] = (dense, E, _split_aliased(fused, alias_row, alias_reg, first, dev))
+
+        # where every interval a product reads or writes keeps its slots
+        self.intervals = interval_tables(self.reach, sorted(_intervals(self.steps)), dev)
 
         # which (output tile, shared chunk) pairs every block @ block step can skip: one mask per boundary triple,
         # each step's launch carrying its triple's index
@@ -150,11 +154,11 @@ class Program:
             for tri in launches[li][2][:, 5:8].tolist():
                 triples.setdefault(tuple(tri), len(triples))
         self.skip_triples = list(triples)
-        self.skip = skip_masks(Reachability(layout), self.skip_triples, device = dev)
+        self.skip = skip_masks(self.reach, self.skip_triples, device = dev)
         for launches, li in bb:
-            form, kinds, steps, E, X = launches[li]
+            form, kinds, steps, *sizes = launches[li]
             idx = torch.tensor([triples[tuple(t)] for t in steps[:, 5:8].tolist()], dtype = torch.int32, device = dev)
-            launches[li] = (form, kinds, (steps, idx), E, X)
+            launches[li] = (form, kinds, (steps, idx), *sizes)
 
         # grouped transitions: every input @ block / block @ input step's transition masses, a row of the boundary's
         # pairs at t_off. All kept at once when they fit TRANSITION_BUDGET; else each launch in chunks of steps that
@@ -171,7 +175,7 @@ class Program:
         self.trans_persistent = sum(int(z.sum()) for z in sizes) <= TRANSITION_BUDGET
         self.trans_size, rows = 0, []
         for st, z, (launches, li) in zip(tables, sizes, ins):
-            form, kinds, _, E, X = launches[li]
+            form, kinds, _, *sizes = launches[li]
             if not self.trans.grouped:
                 chunks = [(0, st.size(0), None)]
             elif self.trans_persistent:
@@ -190,7 +194,7 @@ class Program:
                     self.trans_size = max(self.trans_size, used)
                 bounds.append((start, st.size(0)))
                 chunks = [(s0, s1, transition_job(st[s0:s1][:, [*cols[form], 6]], dev)) for s0, s1 in bounds]
-            launches[li] = (form, kinds, (st.to(dev, torch.int32).contiguous(), chunks), E, X)
+            launches[li] = (form, kinds, (st.to(dev, torch.int32).contiguous(), chunks), *sizes)
         self.trans_job = transition_job(torch.cat(rows), dev) if self.trans.grouped and rows else None
         self._trans, self._trans_version = None, None
 
@@ -223,7 +227,8 @@ class Program:
         earlier stages, grouped into one launch per contraction and operand kinds.
 
         :returns: ``(stages, num_temps, max_temp_slots)``: per stage, ``(form, kinds, steps [S, F] int32, E_max,
-            X_max)`` launches; the scratch rows the layer needs and the most slots per sample any of them holds
+            X_max, S_max)`` launches (the most entry columns, exit columns and slots of their outputs); the scratch
+            rows the layer needs and the most slots per sample any of them holds
         """
         out_rows, child_rows, bounds = (t.cpu().long() for t in rows)
         firsts = torch.tensor(self.firsts, dtype = torch.long)
@@ -233,7 +238,7 @@ class Program:
             kids = child_rows[r, :k].tolist()
             groups.setdefault((tuple(c < self.input_end for c in kids), tuple(bounds[r, :k + 1].tolist())), []).append(r)
 
-        stages = defaultdict(lambda: defaultdict(list))              # stage -> (form, kinds) -> [(fields, E, X)]
+        stages = defaultdict(lambda: defaultdict(list))              # stage -> (form, kinds) -> [(fields, E, X, S)]
         temps = [0, 1]                                               # scratch rows so far, most slots per row
         zeros = None
 
@@ -244,11 +249,14 @@ class Program:
         def scratch(R, entry, exit):
             first = temps[0]
             temps[0] += R
-            temps[1] = max(temps[1], self._entry(entry) * self._exit(exit))
+            temps[1] = max(temps[1], self.reach.slots(entry, exit))
             return ("block", TEMP, torch.arange(first, first + R), torch.zeros(R, dtype = torch.long))
 
-        def emit(stage, form, kinds, fields, entry, exit):
-            stages[stage][(form, kinds)].append((torch.stack(fields, dim = 1), self._entry(entry), self._exit(exit)))
+        def emit(stage, form, kinds, fields, entry, exit, operands = ()):
+            if form in ("input_block", "block_input"):    # which of the output's and operand's intervals keep every
+                kinds += (tuple(self.reach.positions(a, b) is None for a, b in [(entry, exit), *operands]),)    # pair
+            stages[stage][(form, kinds)].append((torch.stack(fields, dim = 1), self._entry(entry), self._exit(exit),
+                                                 self.reach.slots(entry, exit)))
 
         for (is_input, bd), members in groups.items():
             idx = torch.tensor(members)
@@ -277,12 +285,14 @@ class Program:
                         stage += 1
                         acc = tmp
                     emit(stage, "input_block", (acc[1], out_temp), [dest[2], kids[:, m], full(bd[m]), acc[2], acc[3],
-                                                                    full(bd[k]), zeros], bd[m], bd[k])
+                                                                    full(bd[k]), zeros], bd[m], bd[k],
+                         [(bd[m] + 1, bd[k])])
                 else:
                     _, l_kind, l_rows, l_regs = block(kids[:, m])
                     if acc[0] == "input":
                         emit(stage, "block_input", (l_kind, out_temp), [dest[2], l_rows, l_regs, full(bd[m]), acc[1],
-                                                                        full(acc[2]), zeros], bd[m], bd[k])
+                                                                        full(acc[2]), zeros], bd[m], bd[k],
+                             [(bd[m], acc[2])])
                     else:
                         emit(stage, "block_block", (l_kind, acc[1], out_temp),
                              [dest[2], l_rows, l_regs, acc[2], acc[3], full(bd[m]), full(bd[m + 1]), full(bd[k])],
@@ -294,10 +304,36 @@ class Program:
         for stage in sorted(stages):
             launches = []
             for (form, kinds), parts in stages[stage].items():
-                steps = torch.cat([f for f, _, _ in parts]).to(dev, torch.int32).contiguous()
-                launches.append((form, kinds, steps, max(e for _, e, _ in parts), max(x for _, _, x in parts)))
+                steps = torch.cat([p[0] for p in parts]).to(dev, torch.int32).contiguous()
+                launches.append((form, kinds, steps, *(max(p[k] for p in parts) for k in (1, 2, 3))))
             out.append(launches)
         return out, temps[0], temps[1]
+
+
+def _intervals(steps) -> set:
+    """Every interval ``(a, b)`` whose blocks the product steps read or write."""
+    out = set()
+    for kind, _, layers in steps:
+        if kind != "prod":
+            continue
+        for stages, _, _ in layers:
+            for launches in stages:
+                for form, kinds, st, *_ in launches:
+                    st = st.cpu().long()
+                    if form == "input_block":                        # (input at t) @ [t + 1, t2) -> [t, t2)
+                        t, t2 = st[:, 2], st[:, 5]
+                        ivs = [(t, t2)] + ([(t + 1, t2)] if kinds[0] != IDENTITY else [])
+                    elif form == "block_input":                      # [t0, t) @ (input at t) -> [t0, t + 1)
+                        t0, t = st[:, 3], st[:, 5]
+                        ivs = [(t0, t + 1), (t0, t)]
+                    elif form == "block_block":                      # [t0, t1) @ [t1, t2) -> [t0, t2)
+                        t0, t1, t2 = st[:, 5], st[:, 6], st[:, 7]
+                        ivs = [(t0, t2), (t0, t1), (t1, t2)]
+                    else:                                            # a copy of [t0, t2)
+                        ivs = [(st[:, 3], st[:, 4])]
+                    for a, b in ivs:
+                        out.update(zip(a.tolist(), b.tolist()))
+    return out
 
 
 def _split_aliased(fused, alias_row, alias_reg, elem_first: int, dev):

@@ -1,8 +1,10 @@
 """
 The lifted buffers: regions follow the PC's layers, every sum node group keeps exactly its own block per
-sample, regions are aligned and disjoint, an input layer writes the input region exactly as it writes a
-TensorCircuit's node_mars, and the storage is reused across batch sizes.
+sample (the pairs of columns the automaton joins), regions are aligned and disjoint, an input layer writes the
+input region exactly as it writes a TensorCircuit's node_mars, and the storage is reused across batch sizes.
 """
+import random
+
 import pytest
 import torch
 
@@ -20,10 +22,26 @@ def compiled(build_pc, kind, constraint = None):
 
 
 def slots_of(cc, n, ns):
-    """Entry columns x exit columns of a node group's block, a sequence end counting as one."""
+    """The (entry column, exit column) pairs of a node group's block that the automaton joins, a sequence end
+    counting as one column, joined from every column that can still accept."""
+    (a, b), = cc.structure.node(ns).scope_runs
+    w, next_col = cc.width_per_boundary.tolist(), cc.layout.next_col
+    joined = torch.eye(w[a], dtype = torch.bool)
+    for t in range(a, b + 1):
+        step = torch.zeros(w[a], w[t + 1], dtype = torch.bool)
+        for q in range(w[t]):
+            for c in next_col[t, q].tolist():
+                if c >= 0:
+                    step[:, c] |= joined[:, q]
+        joined = step
+    return int(joined.any(dim = 1).sum()) if b == n - 1 else int(joined.sum())
+
+
+def dense_slots_of(cc, n, ns):
+    """Entry columns x exit columns of a node group's block."""
     (a, b), = cc.structure.node(ns).scope_runs
     w = cc.width_per_boundary.tolist()
-    return (1 if a == 0 else w[a]) * (1 if b == n - 1 else w[b + 1])
+    return w[a] * (1 if b == n - 1 else w[b + 1])
 
 
 @pytest.mark.parametrize("kind", list(KINDS))
@@ -61,6 +79,25 @@ def test_layout_is_aligned_disjoint_and_tight(kind, B, build_pc):
                                       zip(cc.element_regions, lay["element_widths"]))
     num_class_rows = sum(layer.params.numel() // V for layer in cc.pc.input_layer_group)
     assert cc.buffer_bytes(B) == 4 * (lay["node_size"] + lay["element_size"] + num_class_rows * cc.num_classes)
+
+
+def test_blocks_keep_only_the_joined_pairs(build_pc):
+    """A wide automaton on a PD: interval nodes keep a fraction of their entry x exit pairs, prefixes and suffixes
+    all of them."""
+    rng = random.Random(0)
+    K, n = 48, 8
+    dfa = jc.DFA.from_dense(V, [[rng.randrange(K) for _ in range(V)] for _ in range(K)], 0, rng.sample(range(K), 12))
+    cc = jc.compile(dfa, build_pc("pd", n, V))
+    kept = dense = 0
+    for info in cc.structure.nodes:
+        if info.kind == "sum":
+            (a, b), = info.scope_runs
+            slots, full = slots_of(cc, n, info.ns), dense_slots_of(cc, n, info.ns)
+            assert slots <= full and (slots == full or 0 < a <= b < n - 1)
+            kept += slots * info.ns.num_nodes
+            dense += full * info.ns.num_nodes
+    assert kept < 0.8 * dense
+    assert sum((end - first) * slots for first, end, slots in cc.sum_regions) == kept
 
 
 def test_class_masses_take_one_row_per_parameter_row(build_pc):

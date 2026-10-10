@@ -20,7 +20,8 @@ from __future__ import annotations
 import math
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Dict, Tuple
+from functools import cached_property
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 
@@ -57,6 +58,12 @@ class BoundaryLayout:
     @property
     def max_width(self) -> int:
         return self.state_id.size(1)
+
+    @cached_property
+    def reachability(self) -> "Reachability":
+        """The pairs of columns the automaton joins, per interval (:class:`Reachability`, built on first use and kept
+        with the layout)."""
+        return Reachability(self)
 
     @property
     def num_classes(self) -> int:
@@ -134,10 +141,16 @@ def _build(dfa: DFA, n: int) -> BoundaryLayout:
 class Reachability:
     """
     Which (column at boundary ``a``, column at boundary ``b``) pairs the automaton joins in exactly ``b - a``
-    tokens -- the entries of a block over ``[a, b)`` that are not structurally ``-inf``. A sequence end (``b ==
-    n``) is one column, joined from every column that can still accept. The pairs are kept per interval only as
-    TILE OCCUPANCY (does tile ``(I, J)`` of ``tile x tile`` columns hold a pair?), computed on demand, one forward
-    sweep per entry boundary, with the pair matrices dropped as the sweep moves on.
+    tokens -- the entries of a block over ``[a, b)`` that are not structurally ``-inf``, and the only ones a block
+    keeps: its SLOTS, the joined pairs in row-major order. A sequence end (``b == n``) is one column, joined from
+    every column that can still accept. Per interval, computed on demand by one forward sweep per entry boundary
+    (the pair matrices dropped as the sweep moves on):
+
+    * :meth:`slots`: how many pairs are joined. A prefix (``a == 0``) or a suffix (``b == n``) joins every pair --
+      every column is reachable from the initial state and can still accept -- so neither is swept;
+    * :meth:`positions`: every pair's slot, or None when every pair is joined (pair ``(i, j)`` in slot ``i * X +
+      j``, ``X`` the exit width);
+    * :meth:`occupancy`: which ``tile x tile`` tiles of columns hold a joined pair.
 
     :param layout: the constraint's layout
     :param tile: the side of an occupancy tile, in columns
@@ -149,9 +162,31 @@ class Reachability:
         self.tile = tile
         self._next_col = layout.next_col
         self._occupancy: Dict[Tuple[int, int], torch.Tensor] = {}
+        self._slots: Dict[Tuple[int, int], int] = {}
+        self._positions: Dict[Tuple[int, int], Optional[torch.Tensor]] = {}
 
     def exit_width(self, b: int) -> int:
         return 1 if b == self.n else self.width[b]
+
+    def _every_pair(self, a: int, b: int) -> bool:
+        return a == 0 or b == self.n
+
+    def slots(self, a: int, b: int) -> int:
+        """The joined pairs of the interval ``[a, b)``: the slots of its blocks."""
+        if self._every_pair(a, b):
+            return self.width[a] * self.exit_width(b)
+        if (a, b) not in self._slots:
+            self._sweep(a)
+        return self._slots[a, b]
+
+    def positions(self, a: int, b: int) -> Optional[torch.Tensor]:
+        """int32 [width[a], exit width at b]: the slot of every pair, -1 where not joined; None if every pair is
+        joined."""
+        if self._every_pair(a, b):
+            return None
+        if (a, b) not in self._positions:
+            self._sweep(a)
+        return self._positions[a, b]
 
     def _advance(self, cur: torch.Tensor, t: int) -> torch.Tensor:
         """[R, width[t]] 0/1 -> [R, width[t + 1]]: the columns one token on (a scatter through next_col)."""
@@ -161,20 +196,25 @@ class Reachability:
         return (nxt > 0).to(cur.dtype)
 
     def _sweep(self, a: int):
-        """Every interval starting at ``a``: pairs (a, b) for b = a, ..., n, kept as occupancy."""
+        """Every interval starting at ``a``: pairs (a, b) for b = a, ..., n, kept as occupancy, slots and
+        positions."""
         cur = torch.eye(self.width[a])
         for b in range(a, self.n + 1):
             if b > a:
                 cur = self._advance(cur, b - 1)
-            pairs = cur.amax(dim = 1, keepdim = True) if b == self.n else cur
-            self._occupancy[a, b] = _tile_any(pairs > 0, self.tile, self.tile)
+            pairs = (cur.sum(dim = 1, keepdim = True) if b == self.n else cur) > 0
+            self._occupancy[a, b] = _tile_any(pairs, self.tile, self.tile)
+            count = int(pairs.sum())
+            self._slots[a, b] = count
+            self._positions[a, b] = None if count == pairs.numel() else \
+                torch.where(pairs, torch.cumsum(pairs.flatten(), 0).view_as(pairs) - 1, -1).to(torch.int32)
 
     def pairs(self, a: int, b: int) -> torch.Tensor:
         """bool [width[a], exit width at b]: the joined pairs (computed afresh, not cached)."""
         cur = torch.eye(self.width[a])
         for t in range(a, b):
             cur = self._advance(cur, t)
-        return (cur.amax(dim = 1, keepdim = True) if b == self.n else cur) > 0
+        return (cur.sum(dim = 1, keepdim = True) if b == self.n else cur) > 0
 
     def occupancy(self, a: int, b: int) -> torch.Tensor:
         """bool [ceil(width[a] / tile), ceil(exit width at b / tile)]."""
@@ -192,6 +232,44 @@ def _tile_any(m: torch.Tensor, tr: int, tc: int) -> torch.Tensor:
     return p.view(I, tr, J, tc).any(dim = 3).any(dim = 1)
 
 
+@dataclass(frozen = True)
+class IntervalTables:
+    """
+    Where the product kernels find the slots of the blocks over every interval they read or write (see
+    :class:`Reachability`).
+
+    :ivar of: int32 [(n + 1) * (n + 1)], the number of interval ``[a, b)`` at ``a * (n + 1) + b`` (-1 if unused)
+    :ivar info: int64 [intervals, 3], per interval: its slots per sample, and where its positions and its pairs
+        start in ``table`` -- both -1 when every pair is joined (pair ``(i, j)`` is then in slot ``i * X + j``)
+    :ivar table: int32, the positions (``[entry columns, exit columns]``, every pair's slot or -1) and the pairs
+        (``[slots]``, ``i * X + j`` of every slot's pair) of the intervals where not every pair is joined
+    """
+
+    of: torch.Tensor
+    info: torch.Tensor
+    table: torch.Tensor
+
+
+def interval_tables(reach: Reachability, intervals, device) -> IntervalTables:
+    """The :class:`IntervalTables` of ``intervals`` (``(a, b)`` boundary pairs), on ``device``."""
+    n = reach.n
+    of = torch.full(((n + 1) * (n + 1),), -1, dtype = torch.int32)
+    info, parts, size = [], [], 0
+    for k, (a, b) in enumerate(intervals):
+        of[a * (n + 1) + b] = k
+        positions = reach.positions(a, b)
+        if positions is None:
+            info.append((reach.slots(a, b), -1, -1))
+        else:
+            pairs = torch.nonzero(positions.flatten() >= 0).flatten().to(torch.int32)
+            info.append((pairs.numel(), size, size + positions.numel()))
+            parts += [positions.flatten(), pairs]
+            size += positions.numel() + pairs.numel()
+    table = torch.cat(parts) if parts else torch.zeros(1, dtype = torch.int32)
+    return IntervalTables(of.to(device), torch.tensor(info, dtype = torch.int64).reshape(-1, 3).to(device),
+                          table.to(device))
+
+
 # -------------------------------------------------------------------------------------------------
 # The PC side
 # -------------------------------------------------------------------------------------------------
@@ -202,7 +280,8 @@ def build_pc_tables(structure, layout: BoundaryLayout, pc) -> Dict[str, Any]:
 
     A node over the scope ``[a, b]`` keeps, for every sample, a block of (columns at boundary ``a``) x
     (columns at boundary ``b + 1``) values, where a sequence end counts as one column: the entry of a
-    prefix is the initial state alone, and the exit of a suffix is summed over the accepting states.
+    prefix is the initial state alone, and the exit of a suffix is summed over the accepting states. Only
+    the pairs the automaton joins are stored -- the block's slots (:class:`Reachability`).
     Only sum and product nodes keep blocks in the PC's buffers: in pyjuice a sum's children are always
     products (`SumNodes` puts a one-child product above an input child), so input nodes are only ever
     read by products.
@@ -218,7 +297,7 @@ def build_pc_tables(structure, layout: BoundaryLayout, pc) -> Dict[str, Any]:
 
     :returns: a dict with
 
-        * ``columns_per_sample`` -- S, the most columns any node keeps per sample;
+        * ``columns_per_sample`` -- S, the most slots any node keeps per sample;
         * ``product_rows`` -- one ``(out_rows [R], child_rows [R, k], boundaries [R, k + 1])`` per product
           layer, in ``pc.inner_layer_groups`` order: every product node's element row, its children's node
           rows in scope order, and the boundaries before, between and after them (``-1`` padding for rows
@@ -235,11 +314,11 @@ def build_pc_tables(structure, layout: BoundaryLayout, pc) -> Dict[str, Any]:
         :func:`buffer_layout` turns the regions into offsets and widths for a batch size.
     """
     n = structure.num_vars
-    width = layout.width.tolist()
     info_of = {info.ns: info for info in structure.nodes}
+    reach = layout.reachability
 
     def block(a, b):
-        return (1 if a == 0 else width[a]) * (1 if b == n - 1 else width[b + 1])
+        return reach.slots(a, b + 1)
 
     # rows of every node group, from the layers (node_mars for inputs and sums, element_mars for products)
     first_row, stale = {}, []
