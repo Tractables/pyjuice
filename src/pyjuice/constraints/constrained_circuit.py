@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional
 
 import torch
 
+from .distributions import TokenClasses
 from .language.base import Constraint
 from .structure import SHAPES, PCStructure, analyze_structure
 from .backends.lifted.plan import BoundaryLayout, build_pc_tables, buffer_layout
@@ -40,6 +41,8 @@ class ConstrainedCircuit:
     :ivar automaton: the constraint's automaton
     :ivar layout: the :class:`~pyjuice.constraints.backends.lifted.plan.BoundaryLayout` of the automaton
         over the PC's variables
+    :ivar token_classes: the automaton's :class:`~pyjuice.constraints.distributions.TokenClasses`, on the PC's
+        device, as the input distributions read them
     :ivar columns_per_sample: the most slots any sum or product node's block takes per sample
         (see :func:`~pyjuice.constraints.backends.lifted.plan.build_pc_tables`)
     :ivar product_rows: per product layer, the rows and boundaries the lifted products read
@@ -56,7 +59,8 @@ class ConstrainedCircuit:
     exact = True
 
     def __init__(self, pc, constraint: Constraint, structure: PCStructure, automaton,
-                 layout: BoundaryLayout, tables: Dict[str, Any], compile_time_s: float):
+                 layout: BoundaryLayout, tables: Dict[str, Any], compile_time_s: float,
+                 token_classes: Optional[TokenClasses] = None):
         self._pc = pc
         self._device = pc.params.device             # where the tables live
         pc.free_activation_buffers()                # constrained queries use buffers of their own
@@ -64,6 +68,9 @@ class ConstrainedCircuit:
         self.structure = structure
         self.automaton = automaton
         self.layout = layout
+        if token_classes is None or token_classes.token_class.device != self._device:
+            token_classes = TokenClasses(layout.token_class.to(self._device), automaton.num_classes)
+        self.token_classes = token_classes
         self.columns_per_sample = tables["columns_per_sample"]
         self.product_rows = tables["product_rows"]
         self.input_range = tables["input_range"]
@@ -97,6 +104,7 @@ class ConstrainedCircuit:
         self._pc.to(device)
         device = self._pc.params.device
         self.product_rows = [tuple(t.to(device) for t in rows) for rows in self.product_rows]
+        self.token_classes = self.token_classes.to(device)
         self._storage, self._layouts = {}, {}       # the buffers are allocated again on the new device
         self._program = None                        # and the forward's tables built again there
         self._device = device
@@ -252,7 +260,7 @@ class ConstrainedCircuit:
                                          "instead.")
         tables = build_pc_tables(structure, self.layout, pc)
         return ConstrainedCircuit(pc, self.constraint, structure, self.automaton, self.layout, tables,
-                                  compile_time_s = time.perf_counter() - t0)
+                                  compile_time_s = time.perf_counter() - t0, token_classes = self.token_classes)
 
     # ---------------------------------------------------------------------------------------------
     # Queries

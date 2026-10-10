@@ -165,14 +165,14 @@ def test_skipping_empty_tiles_changes_nothing(build_pc, monkeypatch):
 
 
 def test_every_token_its_own_class(build_pc, reference):
-    """An automaton that sends every token of a 600-token vocabulary its own way: 600 token classes, more than
-    one class-mass product takes. The marginal still matches the reference."""
+    """An automaton that sends every token of a 600-token vocabulary its own way: 600 token classes, so the
+    class masses take the class-order pass. The marginal still matches the reference."""
     from pyjuice.constraints.distributions import categorical
     rng = random.Random(0)
     V2, K, n = 600, 6, 6
     dfa = jc.DFA.from_dense(V2, [[rng.randrange(K) for _ in range(V2)] for _ in range(K)], 0, rng.sample(range(K), 3))
     cc = jc.compile(dfa, build_pc("hmm", n, V2))
-    assert cc.num_classes > categorical.CLASS_CHUNK
+    assert cc.num_classes > categorical.NATURAL_ORDER_MAX_CLASSES             # the class-order pass
     g = torch.Generator().manual_seed(0)
     data = torch.randint(0, V2, (3, n), generator = g)
     missing = torch.rand(3, n, generator = g) < 0.5

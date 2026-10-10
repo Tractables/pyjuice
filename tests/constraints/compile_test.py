@@ -164,6 +164,7 @@ def test_with_pc_rebinds_to_the_same_structure_only():
     cb = cc.with_pc(pb)
     assert cb.pc is pb and cb.structure is analyze_structure(pb)
     assert cb.constraint is cc.constraint and cb.automaton is cc.automaton and cb.layout is cc.layout
+    assert cb.token_classes is cc.token_classes and cc.token_classes.num_classes == cc.num_classes
 
     with pytest.raises(jc.ConstraintCompileError, match = "structure differs"):
         cc.with_pc(hmm(7))
@@ -208,6 +209,7 @@ def test_to_moves_the_pc_and_the_tables_together():
         want = torch.device(device)
         assert cc.pc.params.device.type == want.type
         assert all(t.device == cc.pc.params.device for rows in cc.product_rows for t in rows)
+        assert cc.token_classes.token_class.device == cc.pc.params.device
         x = torch.randint(0, V, (3, 6))
         if want.type == "cuda":                                    # the guard passes: queries run
             assert torch.isfinite(cc.marginal(x, torch.ones(6, dtype = torch.bool))).all()
