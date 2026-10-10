@@ -21,7 +21,7 @@ from typing import Optional
 
 import torch
 
-from .kernels.inputs import class_masses, input_class_tables
+from .kernels.inputs import class_masses
 from .kernels.prod import IDENTITY, SUM, TEMP, predecessor_tables, skip_masks
 from .kernels.prod import run_products as products
 from .kernels.sum import dense_groups, dense_sum, fused_sum
@@ -47,7 +47,6 @@ class Program:
         self.next_col = layout.next_col.to(dev, torch.int32).contiguous()
         self.token_class = layout.token_class.to(dev, torch.long)
         self.input_start, self.input_end = cc.input_range
-        self.input_tables = input_class_tables(pc, int(layout.token_class.numel()))
         self.pred_ptr, self.pred_q, self.pred_c = predecessor_tables(self.next_col, self.width, n)
 
         firsts = [first for first, _, _ in cc.sum_regions]
@@ -308,7 +307,7 @@ def marginal(cc, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None
     with torch.no_grad():
         for layer in pc.input_layer_group:
             layer(x.permute(1, 0), input_mars, missing_mask = missing)
-        class_masses(prog.input_tables, prog.token_class, cc.num_classes, class_mars, prog.input_start)
+        class_masses(pc, prog.token_class, cc.num_classes, class_mars, prog.input_start)
         obs_class = torch.where(missing, -1, prog.token_class[x]).to(torch.int32).contiguous()
 
         for kind, prod_index, layers in prog.steps:

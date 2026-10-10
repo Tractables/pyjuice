@@ -24,8 +24,8 @@ from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
 from pyjuice.nodes import CircuitNodes
-from pyjuice.nodes.distributions import Categorical
 
+from . import distributions
 from .language.base import _hash_into
 
 
@@ -157,8 +157,9 @@ def _unsupported_reason(ns: CircuitNodes, kind: str) -> Optional[str]:
     if kind == "input":
         if len(ns.scope) > 1:
             return f"input nodes over {len(ns.scope)} variables (only single-variable input nodes are supported)"
-        if not isinstance(ns.dist, Categorical):
-            return f"input distribution {type(ns.dist).__name__} (only Categorical is supported)"
+        if distributions.lookup(ns.dist) is None:
+            supported = ", ".join(t.__name__ for t in distributions.SUPPORTED)
+            return f"input distribution {type(ns.dist).__name__} (supported: {supported})"
         return None
     if kind == "sum" and getattr(ns, "external_params", None) is not None:
         return "sum nodes with external parameters (gated layers are not supported yet)"

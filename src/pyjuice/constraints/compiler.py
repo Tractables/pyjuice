@@ -12,8 +12,8 @@ from collections import defaultdict
 from typing import List, Optional, Sequence, Tuple
 
 from pyjuice.model import TensorCircuit
-from pyjuice.nodes.distributions import Categorical
 
+from . import distributions
 from .language.base import Constraint
 from .structure import PCStructure, _runs, analyze_structure
 from .backends.lifted.plan import build_layout, build_pc_tables
@@ -91,15 +91,17 @@ def _lifted_refusals(constraint: Constraint, structure: PCStructure) -> List[str
         reasons.append(f"{_count(len(group), 'node group')} {'is' if len(group) == 1 else 'are'} not supported: "
                        f"{why}; e.g. over variables {_format_vars(group[0].scope.to_list())}")
 
-    vars_by_cats = defaultdict(list)
+    vars_by_values = defaultdict(list)                                  # (distribution, values) -> variables
     for info in structure.nodes:
-        if info.kind == "input" and isinstance(info.ns.dist, Categorical):
-            vars_by_cats[info.ns.dist.num_cats].extend(info.ns.scope.to_list())
-    for num_cats, vs in sorted(vars_by_cats.items()):
-        if num_cats != constraint.vocab_size:
+        module = distributions.lookup(info.ns.dist) if info.kind == "input" else None
+        if module is not None:
+            key = (type(info.ns.dist).__name__, module.num_values(info.ns.dist))
+            vars_by_values[key].extend(info.ns.scope.to_list())
+    for (name, num_values), vs in sorted(vars_by_values.items()):
+        if num_values != constraint.vocab_size:
             reasons.append(f"vocabulary mismatch: the constraint reads tokens 0..{constraint.vocab_size - 1} "
-                           f"(vocab_size {constraint.vocab_size}), but the Categorical input nodes over variables "
-                           f"{_format_vars(vs)} have num_cats {num_cats}")
+                           f"(vocab_size {constraint.vocab_size}), but the {name} input nodes over variables "
+                           f"{_format_vars(vs)} range over {num_values} values")
 
     fragmented = [info for info in structure.nodes if info.shape == "fragmented"]
     if fragmented:

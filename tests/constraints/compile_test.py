@@ -120,7 +120,8 @@ def test_unsupported_input_nodes_are_refused():
 
 def test_a_vocabulary_mismatch_is_refused():
     msg = refusal(jc.DFA.contains([[1, 2]], vocab_size = V + 2), hmm(6))
-    assert f"vocab_size {V + 2}" in msg and f"variables {{0..5}} have num_cats {V}" in msg
+    assert f"vocab_size {V + 2}" in msg
+    assert f"Categorical input nodes over variables {{0..5}} range over {V} values" in msg
 
 
 def test_a_constraint_without_an_automaton_is_refused():
