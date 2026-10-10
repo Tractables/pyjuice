@@ -327,8 +327,8 @@ def buffer_layout(input_range, sum_regions, element_regions, num_classes: int, b
       as it writes a :class:`TensorCircuit`'s ``node_mars``), ``batch_size`` columns, the log-probability of
       every observed token;
     * the class region: the input rows, ``num_classes`` columns, every class's log-mass for a missing token;
-    * one region per sum node group: its rows, ``align(batch_size * slots)`` columns, slot-major (slot ``s``
-      of sample ``b`` in column ``s * batch_size + b``).
+    * one region per sum node group: its rows, ``align(batch_size * slots)`` columns, sample-major (slot ``s``
+      of sample ``b`` in column ``b * slots + s``: every sample's block is contiguous).
 
     ``element_mars`` holds the products of one product layer group at a time, ``align(batch_size * slots)``
     columns per row; its size is that of the largest group.

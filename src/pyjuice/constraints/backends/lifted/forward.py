@@ -95,14 +95,14 @@ class Program:
         bb = [(launches, li) for kind, _, layers in self.steps if kind == "prod" for stages, _, _ in layers
               for launches in stages for li, launch in enumerate(launches) if launch[0] == "block_block"]
         for launches, li in bb:
-            for tri in launches[li][2][0][:, 5:8].tolist():
+            for tri in launches[li][2][:, 5:8].tolist():
                 triples.setdefault(tuple(tri), len(triples))
         self.skip_triples = list(triples)
         self.skip = skip_masks(Reachability(layout), self.skip_triples, device = dev)
         for launches, li in bb:
             form, kinds, steps, E, X = launches[li]
-            idx = torch.tensor([triples[tuple(t)] for t in steps[0][:, 5:8].tolist()], dtype = torch.int32, device = dev)
-            launches[li] = (form, kinds, steps + (idx,), E, X)
+            idx = torch.tensor([triples[tuple(t)] for t in steps[:, 5:8].tolist()], dtype = torch.int32, device = dev)
+            launches[li] = (form, kinds, (steps, idx), E, X)
 
     def _entry(self, t: int) -> int:
         return self.width[t]                                         # boundary 0: the initial state alone
@@ -190,16 +190,7 @@ class Program:
         for stage in sorted(stages):
             launches = []
             for (form, kinds), parts in stages[stage].items():
-                steps = torch.cat([f for f, _, _ in parts])
-                if form == "block_block":
-                    # every distinct operand once: its row (or column) maxima are computed once per launch
-                    left_ops, l_op = torch.unique(steps[:, [1, 2, 5, 6]], dim = 0, return_inverse = True)
-                    right_ops, r_op = torch.unique(steps[:, [3, 4, 6, 7]], dim = 0, return_inverse = True)
-                    steps = (torch.cat([steps, l_op[:, None], r_op[:, None]], dim = 1),
-                             left_ops, right_ops)
-                    steps = tuple(t.to(dev, torch.int32).contiguous() for t in steps)
-                else:
-                    steps = steps.to(dev, torch.int32).contiguous()
+                steps = torch.cat([f for f, _, _ in parts]).to(dev, torch.int32).contiguous()
                 launches.append((form, kinds, steps, max(e for _, e, _ in parts), max(x for _, _, x in parts)))
             out.append(launches)
         return out, temps[0], temps[1]

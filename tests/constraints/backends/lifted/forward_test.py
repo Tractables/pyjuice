@@ -6,6 +6,8 @@ node-level product edges, an edge block listed twice, block size 1). Also: the o
 pyjuice's own marginal, an unsatisfiable constraint or evidence that breaks the constraint gives -inf, and
 TF32 products stay close to the fp32 default.
 """
+import random
+
 import pytest
 import torch
 
@@ -107,3 +109,56 @@ def test_tf32_products_stay_close(kind, sum_path, build_pc):
     assert ((fp32 - tf32)[fin].abs() <= 1e-2).all()
     with pytest.raises(ValueError, match = "precision"):
         cc.marginal(data, missing, precision = "bf16")
+
+
+def sum_blocks(cc, B, data, missing):
+    """Run the marginal; every sum region's rows, B * slots columns (cloned: the buffers are reused)."""
+    cc.marginal(data, missing)
+    bufs = cc._buffers(B)
+    lay, nm = bufs["layout"], bufs["node_mars"]
+    out = []
+    for r, (first, end, slots) in enumerate(cc.sum_regions):
+        off, wid = lay["sum_offsets"][r], lay["sum_widths"][r]
+        out.append(nm[off:off + (end - first) * wid].view(end - first, wid)[:, :B * slots].clone())
+    return out
+
+
+@pytest.mark.parametrize("kind", ["hmm", "pd", "hand", "hand_left"])
+def test_every_sample_is_a_contiguous_block(kind, build_pc):
+    """Sample b's block of every sum node is columns [b * slots, (b + 1) * slots) of its row: what a batch of one
+    puts in columns [0, slots)."""
+    n = KINDS[kind]
+    cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
+    data, missing = evidence(n, 3)
+    batched = sum_blocks(cc, 3, data, missing)
+    for b in range(3):
+        single = sum_blocks(cc, 1, data[b:b + 1], missing[b:b + 1])
+        for (first, end, slots), rb, rs in zip(cc.sum_regions, batched, single):
+            got = rb[:, b * slots:(b + 1) * slots]
+            assert torch.equal(torch.isneginf(got), torch.isneginf(rs))
+            fin = torch.isfinite(rs)
+            assert torch.allclose(got[fin], rs[fin], rtol = 1e-6, atol = 1e-6), (kind, b, first)
+
+
+def test_skipping_empty_tiles_changes_nothing(build_pc, monkeypatch):
+    """A wide automaton, so that blocks span several tiles and some (output tile, shared chunk) pairs cannot be
+    joined: skipping them gives what computing them gives."""
+    from pyjuice.constraints.backends.lifted.kernels import prod
+    from pyjuice.constraints.backends.lifted.plan import Reachability
+    rng = random.Random(0)
+    K, n = 48, 8
+    dfa = jc.DFA.from_dense(V, [[rng.randrange(K) for _ in range(V)] for _ in range(K)], 0, rng.sample(range(K), 12))
+    cc = jc.compile(dfa, build_pc("pd", n, V))
+    prog = cc._lifted_program()
+    assert prog.skip.tiles_i > 1                                         # blocks wider than one tile
+    reach = Reachability(cc.layout)
+    kept = total = 0
+    for a, b, c in prog.skip_triples:
+        lt, rt = reach.occupancy(a, b).float(), reach.occupancy(b, c).float()
+        kept += float((lt @ rt).sum())
+        total += lt.size(0) * lt.size(1) * rt.size(1)
+    assert kept < total                                                  # something is skipped
+    data, missing = evidence(n, 4)
+    with_skip = cc.marginal(data, missing)
+    monkeypatch.setattr(prod, "SKIP_EMPTY_TILES", False)
+    assert_close(with_skip, cc.marginal(data, missing), n)

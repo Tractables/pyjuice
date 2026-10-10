@@ -337,8 +337,9 @@ def test_every_block_block_step_indexes_its_triple(kind, build_pc):
             for launches in stages:
                 for form, _, steps, _, _ in launches:
                     if form == "block_block":
-                        tri = [prog.skip_triples[i] for i in steps[3].tolist()]
-                        assert tri == [tuple(r) for r in steps[0][:, 5:8].tolist()]
+                        table, index = steps
+                        tri = [prog.skip_triples[i] for i in index.tolist()]
+                        assert tri == [tuple(r) for r in table[:, 5:8].tolist()]
                         seen += 1
     m = prog.skip
     assert m.bits.numel() == max(1, len(prog.skip_triples) * m.tiles_i * m.tiles_j * m.words)

@@ -12,12 +12,14 @@ circuit's shape:
 * ``block @ input`` (:func:`_block_input_kernel`): the mirror case, a gather over the predecessors of each
   column at ``t + 1`` (:func:`predecessor_tables`);
 * ``block @ block`` (:func:`_block_block_kernel`): a per-sample log-space matrix product over the shared
-  boundary, on tensor cores.
+  boundary, skipping the (output tile, shared chunk) pairs the automaton cannot join (:class:`SkipMasks`).
 
 Blocks are either sum nodes' rows in ``node_mars`` or intermediate results in a scratch buffer. Outputs go
-to the product layer's ``element_mars`` rows, or to scratch when another step reads them. An input child is
-read only as the log-probability of its observed token (pyjuice's own input layers wrote it) or as the
-log-mass of a token class when the token is missing (:mod:`.inputs`).
+to the product layer's ``element_mars`` rows, or to scratch when another step reads them. A row holds one
+block per sample, sample-major: sample ``b``'s block in columns ``[b * slots, (b + 1) * slots)``, slot ``i *
+X + j`` for entry column ``i`` and exit column ``j``. An input child is read only as the log-probability of
+its observed token (pyjuice's own input layers wrote it) or as the log-mass of a token class when the token
+is missing (:mod:`.inputs`).
 """
 
 import math
@@ -36,8 +38,7 @@ SUM, TEMP, IDENTITY = 0, 1, 2
 #: fields of a step, per contraction (int32 rows of the step tables the Program builds)
 INPUT_BLOCK_FIELDS = ("out", "u", "t", "r_row", "r_reg", "t2")             # input u at t, then block over [t+1, t2)
 BLOCK_INPUT_FIELDS = ("out", "l_row", "l_reg", "t0", "u", "t")             # block over [t0, t), then input u at t
-BLOCK_BLOCK_FIELDS = ("out", "l_row", "l_reg", "r_row", "r_reg", "t0", "t1", "t2", "l_op", "r_op")
-OPERAND_FIELDS = ("row", "reg", "t_first", "t_last")                      # a block over [t_first, t_last)
+BLOCK_BLOCK_FIELDS = ("out", "l_row", "l_reg", "r_row", "r_reg", "t0", "t1", "t2")
 COPY_FIELDS = ("out", "l_row", "l_reg", "t0", "t2")
 
 
@@ -84,26 +85,32 @@ def _input_block_kernel(element_mars, node_mars, temp, input_mars, class_mars, o
                         reg_offset, reg_width, reg_first, out_first, out_width, temp_width,
                         B, n, W, C, input_start,
                         R_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, TILE: tl.constexpr):
+    """One program per step and tile of its whole output, flattened (sample, entry column, exit column): with the
+    samples' blocks contiguous, a step's output is one run of columns, and the lanes stay full whatever the
+    widths."""
     s = tl.program_id(0)
-    j = tl.program_id(1)                                                     # exit column
-    pid = tl.program_id(2)                                                   # tile of (entry column, sample)
+    tile = tl.program_id(1)
     out_row = tl.load(steps + s * 6 + 0)
     u = tl.load(steps + s * 6 + 1).to(tl.int64)
     t = tl.load(steps + s * 6 + 2)
     t2 = tl.load(steps + s * 6 + 5)
     E = tl.load(width + t)
     X = _exit_width(width, t2, n)
-    if (j < X) & (pid * TILE < E * B):
-        idx = pid * TILE + tl.arange(0, TILE)
-        m = idx < E * B
-        i = idx // B
-        b = idx % B
-        oc = tl.load(obs_class + b * n + t, mask = m, other = -1)            # observed token's class, -1 if missing
+    EX = E * X
+    if tile * TILE < B * EX:
+        idx = tile * TILE + tl.arange(0, TILE)
+        m = idx < B * EX
+        b = (idx // EX).to(tl.int64)
+        pos = idx % EX
+        i = pos // X
+        j = pos % X
         nc = (t * W + i) * C
         end = t + 1 == n
         if R_KIND != 2:
+            M = tl.load(width + t + 1)                                       # the block's entry columns
             rp = _block_ptr(tl.load(steps + s * 6 + 3), tl.load(steps + s * 6 + 4), node_mars, temp, reg_offset,
-                            reg_width, reg_first, temp_width, R_KIND)
+                            reg_width, reg_first, temp_width, R_KIND) + b * M * X
+        oc = tl.load(obs_class + b * n + t, mask = m, other = -1)            # observed token's class, -1 if missing
 
         # an observed token: its own log-probability, then the block from the column its class leads to
         obs = m & (oc >= 0)
@@ -111,34 +118,39 @@ def _input_block_kernel(element_mars, node_mars, temp, input_mars, class_mars, o
         if R_KIND == 2:
             rv = tl.where((q == j) | (end & (q >= 0)), 0.0, float("-inf"))
         else:
-            rv = tl.load(rp + (q * X + j).to(tl.int64) * B + b, mask = obs & (q >= 0), other = float("-inf"))
-        v_obs = tl.load(input_mars + u * B + b, mask = obs, other = float("-inf")) + rv
+            rv = tl.load(rp + q * X + j, mask = obs & (q >= 0), other = float("-inf"))
+        val = tl.load(input_mars + u * B + b, mask = obs, other = float("-inf")) + rv
 
-        # a missing token: log-sum over the classes of class mass + block
+        # a missing token: log-sum over the classes of class mass + block (skipped when every lane is observed)
         miss = m & (oc < 0)
-        mx = tl.full([TILE], float("-inf"), dtype = tl.float32)
-        acc = tl.zeros([TILE], dtype = tl.float32)
-        for c in range(C):
-            q = tl.load(next_col + nc + c, mask = miss, other = -1)
-            if R_KIND == 2:
-                rv = tl.where((q == j) | (end & (q >= 0)), 0.0, float("-inf"))
-            else:
-                rv = tl.load(rp + (q * X + j).to(tl.int64) * B + b, mask = miss & (q >= 0), other = float("-inf"))
-            mx, acc = _lse_step(mx, acc, tl.load(class_mars + (u - input_start) * C + c) + rv)
-        v_miss = _lse_value(mx, acc)
-
+        if tl.max(tl.where(miss, 1, 0), axis = 0) > 0:
+            mx = tl.full([TILE], float("-inf"), dtype = tl.float32)
+            acc = tl.zeros([TILE], dtype = tl.float32)
+            for c in range(C):
+                q = tl.load(next_col + nc + c, mask = miss, other = -1)
+                if R_KIND == 2:
+                    rv = tl.where((q == j) | (end & (q >= 0)), 0.0, float("-inf"))
+                else:
+                    rv = tl.load(rp + q * X + j, mask = miss & (q >= 0), other = float("-inf"))
+                mx, acc = _lse_step(mx, acc, tl.load(class_mars + (u - input_start) * C + c) + rv)
+            val = tl.where(oc >= 0, val, _lse_value(mx, acc))
         op = _out_ptr(out_row, element_mars, temp, out_first, out_width, temp_width, OUT_TEMP)
-        tl.store(op + (i * X + j).to(tl.int64) * B + b, tl.where(oc >= 0, v_obs, v_miss), mask = m)
+        tl.store(op + idx, val, mask = m)
 
 
 @triton.jit
 def _block_input_kernel(element_mars, node_mars, temp, input_mars, class_mars, obs_class, width,
                         pred_ptr, pred_q, pred_c, steps, reg_offset, reg_width, reg_first, out_first, out_width,
-                        temp_width, B, n, W, C, input_start,
+                        temp_width, B, n, W, C, input_start, X_MAX,
                         L_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, TILE: tl.constexpr):
-    s = tl.program_id(0)
-    j = tl.program_id(1)                                                     # exit column (at boundary t + 1)
-    pid = tl.program_id(2)
+    """One program per (step, sample, exit column) and tile of entry columns: a log-sum over the exit column's
+    predecessors (the same list for every lane)."""
+    pid = tl.program_id(0)
+    s = pid // (B * X_MAX)
+    r = pid % (B * X_MAX)
+    b = (r // X_MAX).to(tl.int64)
+    j = r % X_MAX                                                            # exit column (at boundary t + 1)
+    tile = tl.program_id(1)
     out_row = tl.load(steps + s * 6 + 0)
     t0 = tl.load(steps + s * 6 + 3)
     u = tl.load(steps + s * 6 + 4).to(tl.int64)
@@ -146,15 +158,13 @@ def _block_input_kernel(element_mars, node_mars, temp, input_mars, class_mars, o
     E = tl.load(width + t0)
     M = tl.load(width + t)
     X = _exit_width(width, t + 1, n)
-    if (j < X) & (pid * TILE < E * B):
-        idx = pid * TILE + tl.arange(0, TILE)
-        m = idx < E * B
-        i = idx // B
-        b = idx % B
-        oc = tl.load(obs_class + b * n + t, mask = m, other = -1)
+    if (j < X) & (tile * TILE < E):
+        i = tile * TILE + tl.arange(0, TILE)
+        m = i < E
+        oc = tl.load(obs_class + b * n + t)
+        own = tl.load(input_mars + u * B + b)
         lp = _block_ptr(tl.load(steps + s * 6 + 1), tl.load(steps + s * 6 + 2), node_mars, temp, reg_offset,
-                        reg_width, reg_first, temp_width, L_KIND)
-        own = tl.load(input_mars + u * B + b, mask = m & (oc >= 0), other = float("-inf"))
+                        reg_width, reg_first, temp_width, L_KIND) + b * E * M
         p0 = tl.load(pred_ptr + t * (W + 1) + j)
         p1 = tl.load(pred_ptr + t * (W + 1) + j + 1)
         mx = tl.full([TILE], float("-inf"), dtype = tl.float32)
@@ -164,120 +174,99 @@ def _block_input_kernel(element_mars, node_mars, temp, input_mars, class_mars, o
             c = tl.load(pred_c + p)
             mass = tl.where(oc >= 0, tl.where(oc == c, own, float("-inf")),
                             tl.load(class_mars + (u - input_start) * C + c))
-            lv = tl.load(lp + (i * M + q).to(tl.int64) * B + b, mask = m, other = float("-inf"))
+            lv = tl.load(lp + i * M + q, mask = m, other = float("-inf"))
             mx, acc = _lse_step(mx, acc, lv + mass)
-        op = _out_ptr(out_row, element_mars, temp, out_first, out_width, temp_width, OUT_TEMP)
-        tl.store(op + (i * X + j).to(tl.int64) * B + b, _lse_value(mx, acc), mask = m)
+        op = _out_ptr(out_row, element_mars, temp, out_first, out_width, temp_width, OUT_TEMP) + b * E * X
+        tl.store(op + i * X + j, _lse_value(mx, acc), mask = m)
 
 
 @triton.jit
-def _row_max_kernel(node_mars, temp, ops, width, reg_offset, reg_width, reg_first, temp_width, mx, B, n, EMAX,
-                    KIND: tl.constexpr, TILE: tl.constexpr, TQ: tl.constexpr):
-    """``mx[o, i, b] = max_q block_o(i, q, b)``: every left operand's row maxima over the boundary it shares."""
-    o = tl.program_id(0)
-    pid = tl.program_id(1)
-    t0 = tl.load(ops + o * 4 + 2)
-    t1 = tl.load(ops + o * 4 + 3)
-    E = tl.load(width + t0)
-    M = tl.load(width + t1)
-    if pid * TILE < E * B:
-        idx = pid * TILE + tl.arange(0, TILE)
-        m = idx < E * B
-        i = idx // B
-        b = idx % B
-        bp = _block_ptr(tl.load(ops + o * 4), tl.load(ops + o * 4 + 1), node_mars, temp, reg_offset, reg_width,
-                        reg_first, temp_width, KIND)
-        # an elementwise running max over tiles of the shared boundary, reduced once after the loop (a reduction
-        # inside the loop crashes Triton 3.7's TritonGPUOptimizeThreadLocality pass)
-        run = tl.full([TILE, TQ], float("-inf"), dtype = tl.float32)
-        for q0 in range(0, M, TQ):
-            q = q0 + tl.arange(0, TQ)
-            run = tl.maximum(run, tl.load(bp + ((i[:, None] * M + q[None, :]).to(tl.int64) * B + b[:, None]),
-                                          mask = m[:, None] & (q < M)[None, :], other = float("-inf")))
-        acc = tl.max(run, axis = 1)
-        tl.store(mx + (o.to(tl.int64) * EMAX + i) * B + b, acc, mask = m)
+def _chunk_needed(mb, ti, tj, c, TILES_I, TILES_J, WORDS, SUB_I: tl.constexpr, SUB_J: tl.constexpr):
+    """Whether shared chunk ``c`` can contribute to output tile ``(ti, tj)``: the OR of its ``SUB_I x SUB_J``
+    mask tiles' bits (``mb``: the step's triple's masks)."""
+    need = 0
+    for si in tl.static_range(SUB_I):
+        for sj in tl.static_range(SUB_J):
+            bi = ti * SUB_I + si
+            bj = tj * SUB_J + sj
+            w = tl.load(mb + (bi * TILES_J + bj) * WORDS + c // 32, mask = (bi < TILES_I) & (bj < TILES_J), other = 0)
+            need = need | ((w >> (c % 32)) & 1)
+    return need != 0
 
 
 @triton.jit
-def _col_max_kernel(node_mars, temp, ops, width, reg_offset, reg_width, reg_first, temp_width, mx, B, n, XMAX,
-                    KIND: tl.constexpr, TILE: tl.constexpr, TQ: tl.constexpr):
-    """``mx[o, j, b] = max_q block_o(q, j, b)``: every right operand's column maxima over the boundary it shares."""
-    o = tl.program_id(0)
-    pid = tl.program_id(1)
-    t1 = tl.load(ops + o * 4 + 2)
-    t2 = tl.load(ops + o * 4 + 3)
-    M = tl.load(width + t1)
-    X = _exit_width(width, t2, n)
-    if pid * TILE < X * B:
-        idx = pid * TILE + tl.arange(0, TILE)
-        m = idx < X * B
-        j = idx // B
-        b = idx % B
-        bp = _block_ptr(tl.load(ops + o * 4), tl.load(ops + o * 4 + 1), node_mars, temp, reg_offset, reg_width,
-                        reg_first, temp_width, KIND)
-        # an elementwise running max over tiles of the shared boundary, reduced once after the loop (a reduction
-        # inside the loop crashes Triton 3.7's TritonGPUOptimizeThreadLocality pass)
-        run = tl.full([TILE, TQ], float("-inf"), dtype = tl.float32)
-        for q0 in range(0, M, TQ):
-            q = q0 + tl.arange(0, TQ)
-            run = tl.maximum(run, tl.load(bp + ((q[None, :] * X + j[:, None]).to(tl.int64) * B + b[:, None]),
-                                          mask = m[:, None] & (q < M)[None, :], other = float("-inf")))
-        acc = tl.max(run, axis = 1)
-        tl.store(mx + (o.to(tl.int64) * XMAX + j) * B + b, acc, mask = m)
+def _block_block_tile(lp, rp, mb, i, j, ti, tj, E, M, X, TILES_I, TILES_J, WORDS,
+                      TM: tl.constexpr, TN: tl.constexpr, TK: tl.constexpr, SUB_I: tl.constexpr, SUB_J: tl.constexpr,
+                      SKIP: tl.constexpr, PRECISION: tl.constexpr):
+    """``log(sum_q exp(L[i, q] + R[q, j]))`` for one output tile: every row's and column's maximum over the
+    shared chunks the tile needs, then the product of the shifted exponentials over those chunks."""
+    im, jm = i < E, j < X
+    runl = tl.full([TM, TK], float("-inf"), dtype = tl.float32)
+    runr = tl.full([TK, TN], float("-inf"), dtype = tl.float32)
+    for c in range(0, tl.cdiv(M, TK)):
+        need = True
+        if SKIP:
+            need = _chunk_needed(mb, ti, tj, c, TILES_I, TILES_J, WORDS, SUB_I, SUB_J)
+        if need:
+            q = c * TK + tl.arange(0, TK)
+            qm = q < M
+            # an elementwise running maximum, reduced once after the loop (a reduction inside the loop crashes
+            # Triton 3.7's TritonGPUOptimizeThreadLocality pass)
+            runl = tl.maximum(runl, tl.load(lp + (i[:, None] * M + q[None, :]), mask = im[:, None] & qm[None, :],
+                                            other = float("-inf")))
+            runr = tl.maximum(runr, tl.load(rp + (q[:, None] * X + j[None, :]), mask = qm[:, None] & jm[None, :],
+                                            other = float("-inf")))
+    sL = tl.max(runl, axis = 1)
+    sR = tl.max(runr, axis = 0)
+    sL = tl.where(sL == float("-inf"), 0.0, sL)
+    sR = tl.where(sR == float("-inf"), 0.0, sR)
+    acc = tl.zeros([TM, TN], dtype = tl.float32)
+    for c in range(0, tl.cdiv(M, TK)):
+        need = True
+        if SKIP:
+            need = _chunk_needed(mb, ti, tj, c, TILES_I, TILES_J, WORDS, SUB_I, SUB_J)
+        if need:
+            q = c * TK + tl.arange(0, TK)
+            qm = q < M
+            lt = tl.load(lp + (i[:, None] * M + q[None, :]), mask = im[:, None] & qm[None, :], other = float("-inf"))
+            rt = tl.load(rp + (q[:, None] * X + j[None, :]), mask = qm[:, None] & jm[None, :], other = float("-inf"))
+            acc += tl.dot(tl.exp(lt - sL[:, None]), tl.exp(rt - sR[None, :]), input_precision = PRECISION)
+    return tl.log(acc) + sL[:, None] + sR[None, :]
 
 
 @triton.jit
-def _block_block_kernel(element_mars, node_mars, temp, width, steps, reg_offset, reg_width, reg_first,
-                        out_first, out_width, temp_width, mL, mR, EMAX, XMAX, B, n, NB, NI, NJ,
+def _block_block_kernel(element_mars, node_mars, temp, width, steps, triples, skip_bits, reg_offset, reg_width,
+                        reg_first, out_first, out_width, temp_width, B, n, TILES_I, TILES_J, WORDS,
                         L_KIND: tl.constexpr, R_KIND: tl.constexpr, OUT_TEMP: tl.constexpr,
-                        TB: tl.constexpr, TM: tl.constexpr, TN: tl.constexpr, TK: tl.constexpr,
-                        PRECISION: tl.constexpr):
-    # one flat grid, a step's tiles consecutive (they read the same blocks, which then stay in L2)
+                        TM: tl.constexpr, TN: tl.constexpr, TK: tl.constexpr, SUB_I: tl.constexpr,
+                        SUB_J: tl.constexpr, SKIP: tl.constexpr, PRECISION: tl.constexpr):
+    """One program per (step, sample), every output tile in turn: the sample's two blocks are contiguous and stay
+    in L1 across the tiles."""
     pid = tl.program_id(0)
-    per_step = NB * NI * NJ
-    s = pid // per_step
-    r = pid % per_step
-    pid_b = r // (NI * NJ)
-    ti = (r // NJ) % NI
-    tj = r % NJ
-    out_row = tl.load(steps + s * 10 + 0)
-    t0 = tl.load(steps + s * 10 + 5)
-    t1 = tl.load(steps + s * 10 + 6)
-    t2 = tl.load(steps + s * 10 + 7)
+    s = pid // B
+    b = (pid % B).to(tl.int64)
+    out_row = tl.load(steps + s * 8 + 0)
+    t0 = tl.load(steps + s * 8 + 5)
+    t1 = tl.load(steps + s * 8 + 6)
+    t2 = tl.load(steps + s * 8 + 7)
     E = tl.load(width + t0)
     M = tl.load(width + t1)
     X = _exit_width(width, t2, n)
-    if (ti * TM < E) & (tj * TN < X):
-        lp = _block_ptr(tl.load(steps + s * 10 + 1), tl.load(steps + s * 10 + 2), node_mars, temp, reg_offset,
-                        reg_width, reg_first, temp_width, L_KIND)
-        rp = _block_ptr(tl.load(steps + s * 10 + 3), tl.load(steps + s * 10 + 4), node_mars, temp, reg_offset,
-                        reg_width, reg_first, temp_width, R_KIND)
-        l_op = tl.load(steps + s * 10 + 8).to(tl.int64)
-        r_op = tl.load(steps + s * 10 + 9).to(tl.int64)
-        b = pid_b * TB + tl.arange(0, TB)
+    lp = _block_ptr(tl.load(steps + s * 8 + 1), tl.load(steps + s * 8 + 2), node_mars, temp, reg_offset,
+                    reg_width, reg_first, temp_width, L_KIND) + b * E * M
+    rp = _block_ptr(tl.load(steps + s * 8 + 3), tl.load(steps + s * 8 + 4), node_mars, temp, reg_offset,
+                    reg_width, reg_first, temp_width, R_KIND) + b * M * X
+    op = _out_ptr(out_row, element_mars, temp, out_first, out_width, temp_width, OUT_TEMP) + b * E * X
+    mb = skip_bits + tl.load(triples + s).to(tl.int64) * TILES_I * TILES_J * WORDS
+    NJ = tl.cdiv(X, TN)
+    for t in range(0, tl.cdiv(E, TM) * NJ):
+        ti = t // NJ
+        tj = t % NJ
         i = ti * TM + tl.arange(0, TM)
         j = tj * TN + tl.arange(0, TN)
-        bm, im, jm = b < B, i < E, j < X
-        # each left row's and right column's maximum over the shared boundary, from the pre-pass
-        sL = tl.load(mL + (l_op * EMAX + i[None, :]) * B + b[:, None], mask = bm[:, None] & im[None, :],
-                     other = float("-inf"))
-        sR = tl.load(mR + (r_op * XMAX + j[None, :]) * B + b[:, None], mask = bm[:, None] & jm[None, :],
-                     other = float("-inf"))
-        sL = tl.where(sL == float("-inf"), 0.0, sL)
-        sR = tl.where(sR == float("-inf"), 0.0, sR)
-        acc = tl.zeros([TB, TM, TN], dtype = tl.float32)
-        for q0 in range(0, M, TK):
-            q = q0 + tl.arange(0, TK)
-            qm = q < M
-            lt = tl.load(lp + ((i[None, :, None] * M + q[None, None, :]).to(tl.int64) * B + b[:, None, None]),
-                         mask = bm[:, None, None] & im[None, :, None] & qm[None, None, :], other = float("-inf"))
-            rt = tl.load(rp + ((q[None, :, None] * X + j[None, None, :]).to(tl.int64) * B + b[:, None, None]),
-                         mask = bm[:, None, None] & qm[None, :, None] & jm[None, None, :], other = float("-inf"))
-            acc += tl.dot(tl.exp(lt - sL[:, :, None]), tl.exp(rt - sR[:, None, :]), input_precision = PRECISION)
-        out = tl.log(acc) + sL[:, :, None] + sR[:, None, :]
-        op = _out_ptr(out_row, element_mars, temp, out_first, out_width, temp_width, OUT_TEMP)
-        tl.store(op + ((i[None, :, None] * X + j[None, None, :]).to(tl.int64) * B + b[:, None, None]), out,
-                 mask = bm[:, None, None] & im[None, :, None] & jm[None, None, :])
+        out = _block_block_tile(lp, rp, mb, i, j, ti, tj, E, M, X, TILES_I, TILES_J, WORDS, TM, TN, TK, SUB_I,
+                                SUB_J, SKIP, PRECISION)
+        tl.store(op + (i[:, None] * X + j[None, :]), out, mask = (i < E)[:, None] & (j < X)[None, :])
 
 
 @triton.jit
@@ -388,20 +377,13 @@ def skip_masks(reach: Reachability, triples: Sequence[Tuple[int, int, int]], tm:
     return SkipMasks(torch.cat(parts).to(device), I, J, words, tm, tn, tk)
 
 
-#: tiles of :func:`_block_block_kernel`: samples, entry and exit columns, shared columns per step; launch knobs
-BLOCK_BLOCK_CONFIG = dict(TB = 4, TM = 32, TN = 32, TK = 16, warps = 4, stages = 2)
-
-
-def _fit(width: int, largest: int) -> int:
-    """A dot tile for ``width`` columns: the power of two in [16, largest] that pads them least."""
-    best = None
-    for t in (16, 32, 64, 128):
-        if t > largest:
-            break
-        pad = triton.cdiv(width, t) * t
-        if best is None or pad < best[0]:
-            best = (pad, t)
-    return best[1]
+#: :func:`_block_block_kernel`'s output tile (entry x exit columns), shared chunk and warps; the tile is a multiple
+#: of :class:`SkipMasks`'s, and the chunk equal to it
+BLOCK_BLOCK_TILES = dict(TM = 16, TN = 32, TK = 16, warps = 4)
+#: the products' dot precision: "ieee" (exact fp32, CUDA cores) or "tf32x3" (three TF32 tensor-core passes)
+PRODUCT_PRECISION = "ieee"
+#: skip the (output tile, shared chunk) pairs the automaton cannot join; False computes every pair
+SKIP_EMPTY_TILES = True
 
 
 def _tile(cols: int) -> int:
@@ -412,12 +394,12 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, input_mar
                  elem_first: int, elem_width: int, B: int):
     """
     Every step of one product layer, stage by stage (a stage reads only earlier stages' scratch rows). Products
-    are fp32-level whatever the query's precision, which applies to the sum layers: ``block @ block`` takes
-    three TF32 passes (``tf32x3``), and the other contractions are exact fp32 log-sum-exps.
+    are fp32-level whatever the query's precision, which applies to the sum layers: ``block @ block`` dots in
+    :data:`PRODUCT_PRECISION` (exact fp32 by default), the other contractions exact fp32 log-sum-exps.
 
     :param stages: the layer's stages from :class:`~pyjuice.constraints.backends.lifted.forward.Program`: lists
-        of ``(form, kinds, steps, E_max, X_max)`` launches (``block @ block`` steps: ``(steps, left operands, right
-        operands, triple index)``, the last indexing ``Program.skip``)
+        of ``(form, kinds, steps, E_max, X_max)`` launches (``block @ block`` steps: ``(steps, triple index)``,
+        the latter indexing ``Program.skip``)
     :param bufs: ``(temp, temp_width)``, the layer's scratch rows
     """
     temp, temp_width = bufs
@@ -429,41 +411,30 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, input_mar
             S = steps[0].size(0) if isinstance(steps, tuple) else steps.size(0)
             if form == "input_block":
                 r_kind, out_temp = kinds
-                tile = _tile(E_max * B)
-                _input_block_kernel[(S, X_max, triton.cdiv(E_max * B, tile))](
+                tile = min(512, max(128, triton.next_power_of_2(B * E_max * X_max) // 8))
+                _input_block_kernel[(S, triton.cdiv(B * E_max * X_max, tile))](
                     element_mars, node_mars, temp, input_mars, class_mars, obs_class, prog.next_col, prog.width_t,
                     steps, B = B, n = n, W = W, C = C, input_start = prog.input_start, R_KIND = r_kind,
                     OUT_TEMP = out_temp, TILE = tile, num_warps = 4, **common)
             elif form == "block_input":
                 l_kind, out_temp = kinds
-                tile = _tile(E_max * B)
-                _block_input_kernel[(S, X_max, triton.cdiv(E_max * B, tile))](
+                tile = _tile(E_max)
+                _block_input_kernel[(S * B * X_max, triton.cdiv(E_max, tile))](
                     element_mars, node_mars, temp, input_mars, class_mars, obs_class, prog.width_t,
                     prog.pred_ptr, prog.pred_q, prog.pred_c, steps, B = B, n = n, W = W, C = C,
-                    input_start = prog.input_start, L_KIND = l_kind, OUT_TEMP = out_temp, TILE = tile, num_warps = 4,
-                    **common)
+                    input_start = prog.input_start, X_MAX = X_max, L_KIND = l_kind, OUT_TEMP = out_temp, TILE = tile,
+                    num_warps = 4, **common)
             elif form == "block_block":
                 l_kind, r_kind, out_temp = kinds
-                steps, left_ops, right_ops = steps[:3]
-                S = steps.size(0)
-                maxima = []
-                for ops, kernel, kind, wmax in ((left_ops, _row_max_kernel, l_kind, E_max),
-                                                (right_ops, _col_max_kernel, r_kind, X_max)):
-                    mx = torch.empty(ops.size(0) * wmax * B, device = node_mars.device)
-                    tile = min(128, _tile(wmax * B))
-                    kernel[(ops.size(0), triton.cdiv(wmax * B, tile))](
-                        node_mars, temp, ops, prog.width_t, regions["offset"], regions["width"], regions["first"],
-                        temp_width, mx, B, n, wmax, KIND = kind, TILE = tile, TQ = 16, num_warps = 4)
-                    maxima.append(mx)
-                cfg = BLOCK_BLOCK_CONFIG
-                TB = min(cfg["TB"], triton.next_power_of_2(B))
-                TM, TN = _fit(E_max, cfg["TM"]), _fit(X_max, cfg["TN"])
-                NB, NI, NJ = triton.cdiv(B, TB), triton.cdiv(E_max, TM), triton.cdiv(X_max, TN)
-                _block_block_kernel[(S * NB * NI * NJ,)](
-                    element_mars, node_mars, temp, prog.width_t, steps, mL = maxima[0], mR = maxima[1], EMAX = E_max,
-                    XMAX = X_max, B = B, n = n, NB = NB, NI = NI, NJ = NJ, L_KIND = l_kind, R_KIND = r_kind,
-                    OUT_TEMP = out_temp, TB = TB, TM = TM, TN = TN, TK = cfg["TK"], PRECISION = "tf32x3",
-                    num_warps = cfg["warps"], num_stages = cfg["stages"], **common)
+                steps, triples = steps
+                cfg, skip = BLOCK_BLOCK_TILES, prog.skip
+                assert cfg["TK"] == skip.tk and cfg["TM"] % skip.tm == 0 and cfg["TN"] % skip.tn == 0
+                _block_block_kernel[(steps.size(0) * B,)](
+                    element_mars, node_mars, temp, prog.width_t, steps, triples, skip.bits, B = B, n = n,
+                    TILES_I = skip.tiles_i, TILES_J = skip.tiles_j, WORDS = skip.words, L_KIND = l_kind,
+                    R_KIND = r_kind, OUT_TEMP = out_temp, TM = cfg["TM"], TN = cfg["TN"], TK = cfg["TK"],
+                    SUB_I = cfg["TM"] // skip.tm, SUB_J = cfg["TN"] // skip.tn, SKIP = SKIP_EMPTY_TILES,
+                    PRECISION = PRODUCT_PRECISION, num_warps = cfg["warps"], num_stages = 1, **common)
             else:                                                            # "copy"
                 l_kind, out_temp = kinds
                 tile = _tile(E_max * X_max * B)
