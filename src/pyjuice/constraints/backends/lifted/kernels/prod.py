@@ -134,6 +134,18 @@ def _lse_step(m, acc, v):
 
 
 @triton.jit
+def _lse_step_one_exp(m, acc, v):
+    """:func:`_lse_step` with one exp, bit for bit: a new maximum rescales the sum by ``exp(m - v)`` and adds 1, any
+    other term adds ``exp(v - m)`` -- both ``exp(-|v - m|)``, the float the two-exp form computes for the term it does
+    not round to 1 (a ``-inf`` term adds nothing, and the first finite one makes the sum 1). Faster in
+    :func:`_block_input_kernel` (x1.10); in the ``input @ block`` kernels it won with most lanes live and lost under
+    evidence pruning, so they keep :func:`_lse_step`."""
+    e = tl.exp(-tl.abs(v - m))
+    acc = tl.where(v == float("-inf"), acc, tl.where(v > m, acc * e + 1.0, acc + e))
+    return tl.maximum(m, v), acc
+
+
+@triton.jit
 def _lse_value(m, acc):
     return tl.log(acc) + tl.where(m == float("-inf"), 0.0, m)
 
@@ -327,7 +339,7 @@ def _block_input_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
                             tl.load(masses + x, mask = em, other = float("-inf")))
             sl = _slot(iv_table, lpos, i, q, M, em, L_FULL)
             lv = tl.load(lp + sl, mask = em & (sl >= 0), other = float("-inf"))
-            mx, acc = _lse_step(mx, acc, lv + mass)
+            mx, acc = _lse_step_one_exp(mx, acc, lv + mass)
         op = _out_ptr(out_row, element_mars, temp, out_first, out_width, temp_width, OUT_TEMP)
         tl.store(op + idx, _lse_value(mx, acc), mask = m)
 

@@ -11,9 +11,12 @@ import random
 
 import pytest
 import torch
+import triton
+import triton.language as tl
 
 import pyjuice as juice
 import pyjuice.constraints as jc
+from pyjuice.constraints.backends.lifted.kernels.prod import _lse_step, _lse_step_one_exp
 
 V = 3
 KINDS = {"hmm": 6, "hmm_untied": 6, "hmm_block_sparse": 6, "left_linear": 6, "pd": 8, "pd_prod_dominated": 8, "pd_blockified": 8,
@@ -351,6 +354,50 @@ def test_the_stacked_weights_are_what_is_multiplied(dense_pruning, monkeypatch):
     monkeypatch.setattr(F, "stacked_weights", lambda *a: 2 * stacked_weights(*a))
     runs = sum(key is not None for key in stack_keys(cc))
     assert_close(cc.marginal(data, missing), want + runs * math.log(2), n)
+
+
+@triton.jit
+def _lse_steps_kernel(x, out_m, out_acc, steps, LANES: tl.constexpr, ONE_EXP: tl.constexpr):
+    """Every lane's online log-sum-exp over ``steps`` terms, by the one-exp step or the two-exp one."""
+    lanes = tl.arange(0, LANES)
+    m = tl.full([LANES], float("-inf"), dtype = tl.float32)
+    acc = tl.zeros([LANES], dtype = tl.float32)
+    for k in range(steps):
+        v = tl.load(x + k * LANES + lanes)
+        if ONE_EXP:
+            m, acc = _lse_step_one_exp(m, acc, v)
+        else:
+            m, acc = _lse_step(m, acc, v)
+    tl.store(out_m + lanes, m)
+    tl.store(out_acc + lanes, acc)
+
+
+def test_one_exp_lse_step_is_the_two_exp_one():
+    """The one-exp log-sum-exp step (block @ input's) computes, bit for bit, what the two-exp one computes: on random
+    terms, rising and falling ones, ties, and -inf (leading, trailing, scattered, every term)."""
+    g = torch.Generator().manual_seed(0)
+    steps, per = 24, 64
+    cols = [torch.randn(steps, generator = g) * 10 for _ in range(per)]                      # random
+    cols += [torch.sort(torch.randn(steps, generator = g) * 10).values for _ in range(per)]   # rising
+    cols += [torch.sort(torch.randn(steps, generator = g) * 10, descending = True).values for _ in range(per)]
+    cols += [torch.full((steps,), float(torch.randn(1, generator = g))) for _ in range(per)]   # ties
+    for c in cols[:3 * per]:
+        c[torch.randperm(steps, generator = g)[:6]] = float("-inf")                          # scattered -inf
+    for k, c in enumerate(cols[per:2 * per]):
+        c[:k % steps] = float("-inf")                                                         # leading
+        cols[2 * per + k][steps - k % steps:] = float("-inf")                                 # trailing
+    cols += [torch.full((steps,), float("-inf"))] * per                                      # every term
+    cols += [torch.randn(steps, generator = g) * 10 for _ in range(512 - len(cols))]          # lanes: a power of 2
+    x = torch.stack(cols, 1).contiguous().cuda()
+    lanes = x.size(1)
+    out = {}
+    for one_exp in (True, False):
+        m, acc = torch.empty(lanes, device = "cuda"), torch.empty(lanes, device = "cuda")
+        _lse_steps_kernel[(1,)](x, m, acc, steps, LANES = lanes, ONE_EXP = one_exp)
+        out[one_exp] = (m.cpu(), acc.cpu())
+    assert torch.equal(out[True][0], out[False][0])
+    assert torch.equal(out[True][1], out[False][1])
+    assert torch.isfinite(out[True][1]).all() and (out[True][1][4 * per:5 * per] == 0).all()
 
 
 def test_transition_masses_match_brute_force(build_pc, monkeypatch):
