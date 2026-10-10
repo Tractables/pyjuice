@@ -87,6 +87,7 @@ class ConstrainedCircuit:
         self._storage = {}                          # buffer name -> backing storage (see `_buffers`)
         self._layouts = {}                          # batch size -> `buffer_layout` and its device tensors
         self._program = None                        # the lifted forward's tables (see `_lifted_program`)
+        self._class_rows = None                     # where the input nodes' class masses are (see `_class_mass_rows`)
         self._class_mars = None                     # the input nodes' class masses (see `_class_masses`)
         self._class_mars_kept = False               # kept by a `pyjuice.fast_inference` scope
         self._class_mars_version = 0                # counts their computations (what is derived from them follows)
@@ -115,7 +116,7 @@ class ConstrainedCircuit:
         self.product_rows = [tuple(t.to(device) for t in rows) for rows in self.product_rows]
         self.token_classes = self.token_classes.to(device)
         self._storage, self._layouts = {}, {}       # the buffers are allocated again on the new device
-        self._class_mars, self._class_mars_kept = None, False
+        self._class_rows, self._class_mars, self._class_mars_kept = None, None, False
         self._program = None                        # and the forward's tables built again there
         self._device = device
         return self
@@ -151,21 +152,40 @@ class ConstrainedCircuit:
         return dict(node_mars = node_mars, element_mars = element_mars,
                     input_mars = node_mars[:self.input_range[1] * B].view(self.input_range[1], B), layout = layout)
 
+    def _class_mass_rows(self):
+        """
+        Where the class masses of every input node are: ``(firsts, num_rows, mass_row)``, every input layer's
+        class-mass table (see :mod:`pyjuice.constraints.distributions`) being rows ``firsts[k] ..`` of the
+        ``num_rows`` rows of :meth:`_class_masses`, and input node ``u`` reading row ``mass_row[u - input_start]``
+        (int32, on the device). Built on first use: it depends only on the PC's structure.
+        """
+        if self._class_rows is None:
+            input_start, input_end = self.input_range
+            mass_row = torch.zeros(input_end - input_start, dtype = torch.int32, device = self._device)
+            firsts, num_rows = [], 0
+            for layer in self._pc.input_layer_group:
+                rows = lookup(layer.dist).class_mass_rows(layer)
+                first, end = layer._output_ind_range
+                mass_row[first - input_start:end - input_start] = (num_rows + rows).to(torch.int32)
+                firsts.append(num_rows)
+                num_rows += int(rows.max()) + 1
+            self._class_rows = (firsts, num_rows, mass_row)
+        return self._class_rows
+
     def _class_masses(self) -> torch.Tensor:
         """
-        ``[num_input_rows, num_classes]``: the log-mass of every token class for every input node, by its
-        distribution's function in :mod:`pyjuice.constraints.distributions`. Computed on every query, except
-        inside :func:`pyjuice.fast_inference`: there by the first query, then kept until the scope exits.
+        ``[num_rows, num_classes]`` (see :meth:`_class_mass_rows`): the log-mass of every token class for every
+        input layer's class-mass row, by its distribution's functions in :mod:`pyjuice.constraints.distributions`.
+        Computed on every query, except inside :func:`pyjuice.fast_inference`: there by the first query, then kept
+        until the scope exits.
         """
         if self._class_mars_kept:
             return self._class_mars
-        input_start, input_end = self.input_range
+        firsts, num_rows, _ = self._class_mass_rows()
         if self._class_mars is None:
-            self._class_mars = torch.empty(input_end - input_start, self.num_classes, device = self._device)
-        for layer in self._pc.input_layer_group:
-            first, end = layer._output_ind_range
-            lookup(layer.dist).class_masses(layer, self.token_classes,
-                                            out = self._class_mars[first - input_start:end - input_start])
+            self._class_mars = torch.empty(num_rows, self.num_classes, device = self._device)
+        for layer, first, end in zip(self._pc.input_layer_group, firsts, firsts[1:] + [num_rows]):
+            lookup(layer.dist).class_masses(layer, self.token_classes, out = self._class_mars[first:end])
         self._class_mars_version += 1
         if is_active():
             self._class_mars_kept = True
@@ -198,8 +218,7 @@ class ConstrainedCircuit:
         """Bytes of the lifted buffers for a batch of ``batch_size`` and of the class masses (fp32, alignment
         included)."""
         layout = buffer_layout(self.input_range, self.sum_regions, self.element_regions, batch_size)
-        num_input_rows = self.input_range[1] - self.input_range[0]
-        return 4 * (layout["node_size"] + layout["element_size"] + num_input_rows * self.num_classes)
+        return 4 * (layout["node_size"] + layout["element_size"] + self._class_mass_rows()[1] * self.num_classes)
 
     # ---------------------------------------------------------------------------------------------
     # Report

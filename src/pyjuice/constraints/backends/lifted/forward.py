@@ -59,6 +59,7 @@ class Program:
         self.width_t = layout.width.to(dev, torch.int32)
         self.next_col = layout.next_col.to(dev, torch.int32).contiguous()
         self.input_start, self.input_end = cc.input_range
+        self.mass_row = cc._class_mass_rows()[2]                       # input node -> its row of the class masses
         grouped = cc.num_classes >= GROUP_MIN_RATIO * max_successors(self.next_col, self.width, n)
         self.trans = transition_tables(self.next_col, self.width, n, grouped = grouped)
         self.dev = dev

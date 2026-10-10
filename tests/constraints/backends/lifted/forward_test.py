@@ -258,6 +258,7 @@ def test_transition_masses_match_brute_force(build_pc, monkeypatch):
     assert tt.grouped and prog.trans_persistent and tt.max_pairs > 16    # several pair tiles at the narrowest
     assert nc.size(2) > prod.TRANSITION_TILES["TC"]
     T, cm = prog.transition_buffer().double().cpu(), cc._class_mars.double().cpu()
+    mass_row = prog.mass_row.long().cpu()
     assert (cm[torch.isfinite(cm)] < -87.4).any()                       # class masses below the normal range
     assert (cm.max(dim = 1).values < -87.4).any()                       # ... every class of a row
     for u, t, off in prog.trans_job[0].long().cpu().tolist():
@@ -265,7 +266,7 @@ def test_transition_masses_match_brute_force(build_pc, monkeypatch):
             to = nc[t, q].long()
             for g in range(int(ptr[t, q]), int(ptr[t, q + 1])):
                 classes = (to >= 0) if t + 1 == n else (to == succ[g])
-                want = torch.logsumexp(cm[u - prog.input_start, classes], dim = 0)
+                want = torch.logsumexp(cm[mass_row[u - prog.input_start], classes], dim = 0)
                 got = T[off + g - int(ptr[t, 0])]
                 assert abs(float(got - want)) < 1e-5, (u, t, q, g, float(got), float(want))
 

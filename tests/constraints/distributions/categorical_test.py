@@ -1,6 +1,7 @@
 """
 Categorical class masses (:mod:`pyjuice.constraints.distributions.categorical`) against a float64 brute force: per
-node, the log of the summed probabilities of each class's tokens. Both passes -- the natural token order (up to
+node, the log of the summed probabilities of each class's tokens, read through the node's row of the class-mass
+table (one row per parameter row, however many tied nodes share it). Both passes -- the natural token order (up to
 NATURAL_ORDER_MAX_CLASSES classes) and the class order (above) -- on tied (homogeneous HMM) and untied input layers
 (and one whose tied nodes come out of their rows' order), for one class, two, a skewed split, a class with no
 token, both sides of the boundary between the passes, and every token its own class; and on probabilities small
@@ -89,13 +90,17 @@ def test_class_masses_match_brute_force(kind, name):
             rows = layer.s_pids // V
             assert not torch.equal(rows, torch.arange(rows.numel(), device = DEV) % (rows.max() + 1))
         want = brute_force(layer, classes.token_class, C)
+        rows = categorical.class_mass_rows(layer)
+        num_rows = layer.params.numel() // V                              # one per parameter row
+        assert rows.shape == (layer.num_nodes,) and int(rows.max()) + 1 == num_rows
+        assert (num_rows < layer.num_nodes) == (kind != "untied")          # tied nodes share their row
         got = categorical.class_masses(layer, classes)
-        assert got.shape == (layer.num_nodes, C) and got.dtype == torch.float32
-        check(got, want)
+        assert got.shape == (num_rows, C) and got.dtype == torch.float32
+        check(got[rows], want)
         assert torch.isneginf(want).any() == (name in ("empty_class", "many"))
-        out = torch.full((layer.num_nodes, C), float("nan"), device = DEV)
+        out = torch.full((num_rows, C), float("nan"), device = DEV)
         assert categorical.class_masses(layer, classes, out = out) is out
-        check(out, want)
+        check(out[rows], want)
     # the class order is built only past the boundary, once
     assert bool(classes._by_class) == (C > categorical.NATURAL_ORDER_MAX_CLASSES)
 
@@ -115,7 +120,7 @@ def test_subnormal_probabilities_are_kept(name):
     classes = TokenClasses(token_class.to(DEV), C)
     want = brute_force(layer, classes.token_class, C)
     assert want[0, 1] < math.log(1.17e-38)                             # class 1 of node 0: a subnormal mass
-    check(categorical.class_masses(layer, classes), want)
+    check(categorical.class_masses(layer, classes)[categorical.class_mass_rows(layer)], want)
 
 
 def test_the_class_order_is_built_once():

@@ -94,8 +94,8 @@ def _lse_value(m, acc):
 
 
 @triton.jit
-def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, class_mars, trans, entry_ptr, entry_succ,
-                        entry_x, width, steps, reg_offset, reg_width, reg_first, out_first, out_width, temp_width,
+def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, class_mars, mass_row, trans, entry_ptr,
+                        entry_succ, entry_x, width, steps, reg_offset, reg_width, reg_first, out_first, out_width, temp_width,
                         B, n, W, C, input_start, pid0, R_KIND: tl.constexpr, OUT_TEMP: tl.constexpr,
                         GROUPED: tl.constexpr, TILE: tl.constexpr):
     """One program per step and tile of its whole output, flattened (sample, entry column, exit column): with the
@@ -155,21 +155,22 @@ def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
                                    other = float("-inf"))
                     mx, acc = _lse_step(mx, acc, mass + rv)
             else:                                                            # every class, in order: the same class
-                for c in range(C):                                           # (and mass) in every lane
+                masses = class_mars + tl.load(mass_row + (u - input_start)).to(tl.int64) * C    # (and mass) in
+                for c in range(C):                                           # every lane
                     q = tl.load(next_col + (t * W + i) * C + c, mask = miss, other = -1)
                     if R_KIND == 2:
                         rv = tl.where((q == j) | (end & (q >= 0)), 0.0, float("-inf"))
                     else:
                         rv = tl.load(rp + q * X + j, mask = miss & (q >= 0), other = float("-inf"))
-                    mx, acc = _lse_step(mx, acc, tl.load(class_mars + (u - input_start) * C + c) + rv)
+                    mx, acc = _lse_step(mx, acc, tl.load(masses + c) + rv)
             val = tl.where(oc >= 0, val, _lse_value(mx, acc))
         op = _out_ptr(out_row, element_mars, temp, out_first, out_width, temp_width, OUT_TEMP)
         tl.store(op + idx, val, mask = m)
 
 
 @triton.jit
-def _block_input_kernel(element_mars, node_mars, temp, obs_class, next_col, class_mars, trans, pred_ptr, pred_col,
-                        pred_x, width, steps, reg_offset, reg_width, reg_first, out_first, out_width, temp_width,
+def _block_input_kernel(element_mars, node_mars, temp, obs_class, next_col, class_mars, mass_row, trans, pred_ptr,
+                        pred_col, pred_x, width, steps, reg_offset, reg_width, reg_first, out_first, out_width, temp_width,
                         B, n, W, C, input_start, X_MAX, pid0, L_KIND: tl.constexpr, OUT_TEMP: tl.constexpr,
                         GROUPED: tl.constexpr, TILE: tl.constexpr):
     """One program per (step, sample, exit column) and tile of entry columns: a log-sum over the exit column's
@@ -197,8 +198,8 @@ def _block_input_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
                         reg_width, reg_first, temp_width, L_KIND) + b * E * M
         if GROUPED:
             masses = trans + tl.load(steps + s * 7 + 6).to(tl.int64)          # the step's transition masses
-        else:
-            masses = class_mars + (u - input_start) * C                      # the input's class masses
+        else:                                                                # the input's class masses
+            masses = class_mars + tl.load(mass_row + (u - input_start)).to(tl.int64) * C
         end = t + 1 == n
         e0 = tl.load(pred_ptr + t * (W + 1) + j)
         e1 = tl.load(pred_ptr + t * (W + 1) + j + 1)
@@ -436,8 +437,8 @@ def transition_job(rows: torch.Tensor, dev):
 
 
 @triton.jit
-def _transition_kernel(class_mars, trans, rows, tiles, pair_of, entry_ptr, width, W, C, input_start, num_qtiles,
-                       pid0, TS: tl.constexpr, QT: tl.constexpr, TP: tl.constexpr, TC: tl.constexpr):
+def _transition_kernel(class_mars, mass_row, trans, rows, tiles, pair_of, entry_ptr, width, W, C, input_start,
+                       num_qtiles, pid0, TS: tl.constexpr, QT: tl.constexpr, TP: tl.constexpr, TC: tl.constexpr):
     """
     One program per (tile of rows at one position, ``QT`` columns): per column, its pairs ``TP`` at a time, as the
     product of the rows' class masses -- linear, scaled by 2^64, in natural class order -- with the 0/1 table of
@@ -451,7 +452,7 @@ def _transition_kernel(class_mars, trans, rows, tiles, pair_of, entry_ptr, width
     rmask = r < count
     u = tl.load(rows + (start + r) * 3, mask = rmask, other = 0).to(tl.int64)
     off = tl.load(rows + (start + r) * 3 + 2, mask = rmask, other = 0).to(tl.int64)
-    masses = class_mars + (u - input_start) * C
+    masses = class_mars + tl.load(mass_row + (u - input_start), mask = rmask, other = 0).to(tl.int64) * C
     base = tl.load(entry_ptr + t * (W + 1))                                  # the boundary's first pair
     jj = tl.arange(0, TP)
     for qi in range(QT):
@@ -475,8 +476,9 @@ def _transition_kernel(class_mars, trans, rows, tiles, pair_of, entry_ptr, width
 def transition_masses(trans, job, class_mars, prog):
     """
     Write the transition masses of every step of ``job`` (from :func:`transition_job`): for each column ``q`` at the
-    input's position ``t`` and each successor ``s``, ``log sum_{c: next_col[t, q, c] = s} exp(class_mars[u, c])``,
-    at ``trans[offset + p]`` for the pair's number ``p`` within the boundary.
+    input's position ``t`` and each successor ``s``, ``log sum_{c: next_col[t, q, c] = s} exp(class_mars[r, c])``
+    (``r``: input ``u``'s row of the class masses), at ``trans[offset + p]`` for the pair's number ``p`` within the
+    boundary.
     """
     rows, tiles, TS = job
     tt, cfg = prog.trans, TRANSITION_TILES
@@ -487,7 +489,8 @@ def transition_masses(trans, job, class_mars, prog):
     num_qtiles = triton.cdiv(max(prog.width), QT)
     TP = min(64, max(16, triton.next_power_of_2(tt.max_pairs)))
     for first, size in grid_chunks(tiles.size(0) * num_qtiles, 0):
-        _transition_kernel[(size,)](class_mars, trans, rows, tiles, tt.pair_of, tt.entry_ptr, prog.width_t, W, C,
+        _transition_kernel[(size,)](class_mars, prog.mass_row, trans, rows, tiles, tt.pair_of, tt.entry_ptr,
+                                    prog.width_t, W, C,
                                     prog.input_start, num_qtiles, first, TS = TS, QT = QT, TP = TP, TC = cfg["TC"],
                                     num_warps = cfg["warps"])
 
@@ -605,8 +608,8 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, class_mar
                         tile = min(512, max(128, triton.next_power_of_2(B * E_max * X_max) // 8))
                         for first, size in grid_chunks(triton.cdiv(B * E_max * X_max, tile), 1):
                             _input_block_kernel[(s1 - s0, size)](
-                                element_mars, node_mars, temp, obs_class, prog.next_col, class_mars, trans,
-                                tt.entry_ptr, tt.entry_succ, tt.entry_x, prog.width_t, part, B = B, n = n, W = W,
+                                element_mars, node_mars, temp, obs_class, prog.next_col, class_mars, prog.mass_row,
+                                trans, tt.entry_ptr, tt.entry_succ, tt.entry_x, prog.width_t, part, B = B, n = n, W = W,
                                 C = C, input_start = prog.input_start, pid0 = first, R_KIND = r_kind,
                                 OUT_TEMP = out_temp, GROUPED = tt.grouped, TILE = tile, num_warps = 4, **common)
                     else:
@@ -614,8 +617,8 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, class_mar
                         tile = _tile(E_max)
                         for first, size in grid_chunks((s1 - s0) * B * X_max, 0):
                             _block_input_kernel[(size, triton.cdiv(E_max, tile))](
-                                element_mars, node_mars, temp, obs_class, prog.next_col, class_mars, trans,
-                                tt.pred_ptr, tt.pred_col, tt.pred_x, prog.width_t, part, B = B, n = n, W = W,
+                                element_mars, node_mars, temp, obs_class, prog.next_col, class_mars, prog.mass_row,
+                                trans, tt.pred_ptr, tt.pred_col, tt.pred_x, prog.width_t, part, B = B, n = n, W = W,
                                 C = C, input_start = prog.input_start, X_MAX = X_max, pid0 = first,
                                 L_KIND = l_kind, OUT_TEMP = out_temp, GROUPED = tt.grouped, TILE = tile,
                                 num_warps = 4, **common)

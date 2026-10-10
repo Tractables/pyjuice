@@ -59,7 +59,21 @@ def test_layout_is_aligned_disjoint_and_tight(kind, B, build_pc):
     assert lay["node_size"] == spans[-1][1]
     assert lay["element_size"] == max((end - first) * w for (first, end, _), w in
                                       zip(cc.element_regions, lay["element_widths"]))
-    assert cc.buffer_bytes(B) == 4 * (lay["node_size"] + lay["element_size"] + (input_end - input_start) * cc.num_classes)
+    num_class_rows = sum(layer.params.numel() // V for layer in cc.pc.input_layer_group)
+    assert cc.buffer_bytes(B) == 4 * (lay["node_size"] + lay["element_size"] + num_class_rows * cc.num_classes)
+
+
+def test_class_masses_take_one_row_per_parameter_row(build_pc):
+    """A tied HMM's input nodes (one group per position) share one set of emission parameters: the class masses keep
+    it once, n times fewer rows than input nodes, and every input node reads its own parameters' row."""
+    cc, n = compiled(build_pc, "hmm")
+    lo, hi = cc.input_range
+    firsts, num_rows, mass_row = cc._class_mass_rows()
+    assert num_rows * n == hi - lo
+    assert cc._class_masses().shape == (num_rows, cc.num_classes)
+    for layer, first in zip(cc.pc.input_layer_group, firsts):
+        a, b = layer._output_ind_range
+        assert torch.equal(mass_row[a - lo:b - lo].long(), first + layer.s_pids // V)
 
 
 @pytest.mark.parametrize("kind", ["hmm", "pd", "hand_unit"])

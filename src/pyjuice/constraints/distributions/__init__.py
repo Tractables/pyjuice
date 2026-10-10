@@ -6,13 +6,16 @@ node, besides what its input layer already computes (the log-probability of an o
 * for a token that is marginalized, the mass of every token class of the constraint's automaton:
   ``log sum_{v in c} p_n(v)``.
 
-Both are computed here, one module per distribution, named as in :mod:`pyjuice.nodes.distributions`. Each module
-provides
+Both are computed here, one module per distribution, named as in :mod:`pyjuice.nodes.distributions`. Class masses
+are kept once per set of parameters, however many tied nodes share it: the rows of a layer's class-mass table. Each
+module provides
 
 * ``num_values(dist) -> int``: the values (tokens) the distribution ranges over;
-* ``class_masses(layer, classes, out = None) -> torch.Tensor``: ``[number of nodes of layer, num_classes]``, the
-  log-mass of every class for every node of the input layer, the same for every sample (``classes``: the
-  constraint's :class:`TokenClasses`); written into ``out`` when given.
+* ``class_mass_rows(layer) -> torch.Tensor``: ``[number of nodes of layer]`` int64, the row of the layer's
+  class-mass table every node reads, numbered from 0 (the table has ``max + 1`` rows);
+* ``class_masses(layer, classes, out = None) -> torch.Tensor``: the table, ``[rows, num_classes]``, the log-mass of
+  every class for every row, the same for every sample (``classes``: the constraint's :class:`TokenClasses`);
+  written into ``out`` when given.
 
 Only the distributions in :data:`SUPPORTED` can be compiled under a constraint, matched by exact type: a subclass
 may compute different probabilities, so it is refused until it has its own module.

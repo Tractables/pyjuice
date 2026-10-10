@@ -1,7 +1,8 @@
 """
 Categorical input nodes: a class's mass is the sum of the probabilities of its tokens (pyjuice keeps Categorical
-parameters normalized, in probability space). Every row of the layer's ``[rows, num_cats]`` parameter table is
-summed once, however many tied nodes read it, then every node reads its row.
+parameters normalized, in probability space). The class-mass table has a row per row of the layer's ``[rows,
+num_cats]`` parameter table, summed once however many tied nodes read it: node ``i`` reads row ``s_pids[i] //
+num_cats``.
 
 Two passes over the table, chosen by the number of classes (a fixed rule, so results never depend on timing):
 
@@ -35,19 +36,25 @@ def num_values(dist) -> int:
     return dist.num_cats
 
 
+def class_mass_rows(layer) -> torch.Tensor:
+    """The row every node reads: every node of the layer ranges over the same ``num_cats`` values (the compiler
+    refuses any other vocabulary), so its parameters are one ``[rows, num_cats]`` table, node ``i``'s at row
+    ``s_pids[i] // num_cats``."""
+    return (layer.s_pids // layer.dist.num_cats).long()
+
+
 def class_masses(layer, classes, out = None) -> torch.Tensor:
-    """``[number of nodes of layer, num_classes]``: ``log sum_{v: token_class[v] == c} p_n(v)`` for every node,
-    into ``out`` when given (contiguous). Every node of the layer ranges over the same ``num_cats`` values (the
-    compiler refuses any other vocabulary), so its parameters are one ``[rows, num_cats]`` table and node ``i``
-    reads row ``s_pids[i] // num_cats``."""
+    """``[rows, num_classes]``: ``log sum_{v: token_class[v] == c} p(v)`` for every row of the parameter table,
+    into ``out`` when given (contiguous)."""
     num_cats, C = layer.dist.num_cats, classes.num_classes
     table = layer.params.view(-1, num_cats)
-    masses = torch.empty(table.size(0), C, dtype = torch.float32, device = table.device)
+    if out is None:
+        out = torch.empty(table.size(0), C, dtype = torch.float32, device = table.device)
     if C <= NATURAL_ORDER_MAX_CLASSES:
-        _natural_order(table, classes.token_class, C, masses)
+        _natural_order(table, classes.token_class, C, out)
     else:
-        _class_order(table, classes.by_class(CLASS_CHUNK), C, masses)
-    return torch.index_select(masses, 0, layer.s_pids // num_cats, out = out)
+        _class_order(table, classes.by_class(CLASS_CHUNK), C, out)
+    return out
 
 
 # -------------------------------------------------------------------------------------------------
