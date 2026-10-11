@@ -3,9 +3,11 @@ Evidence pruning (:mod:`pyjuice.constraints.backends.lifted.kernels.live`): ever
 brute force over strings, and the marginal against the reference under every pattern of evidence -- none, all, a
 prefix, a suffix, scattered, and a different one per sample -- on every kind of PC, with the buffers filled with NaN
 before each call (a dead slot must still be written, -inf). Also: pruning engages when tokens are observed, and
-does nothing when none is.
+does nothing when none is. And the marginal survives blocks of a wide dynamic range (see
+``test_marginals_survive_a_wide_dynamic_range``).
 """
 import itertools
+import math
 import random
 
 import pytest
@@ -208,3 +210,31 @@ def test_pruning_engages_only_under_evidence(build_pc, monkeypatch):
     live = pruning.live.cpu()
     for t in range(n // 2 + 1):                                  # through the observed prefix: one column each
         assert (live[:, t].sum(dim = 1) <= 1).all()
+
+
+@pytest.mark.parametrize("kind", ["pd", "pd_prod_dominated", "hand", "hmm"])
+def test_marginals_survive_a_wide_dynamic_range(kind, build_pc, reference, monkeypatch):
+    """A block's entries can span far more than fp32's exponent. Here tokens 1 and 2 have probability e^-50 at every
+    position under the constraint "contains 1 2": the satisfied state carries nearly all of a block's mass, a state
+    still owing the keyword e^-100 of it. A sample whose observed prefix leaves it in such a state at a block's boundary
+    needs exactly those small entries -- which block @ block's row and column shifts flush unless the tile is computed
+    again exactly. Against the reference in float64."""
+    n = KINDS[kind]
+    pc = build_pc(kind, n, V, perturbation = 2.0)
+    with torch.no_grad():
+        for layer in pc.input_layer_group:                                 # P(0) ~ 1, P(1) = P(2) = e^-50 everywhere
+            table = layer.params.view(-1, V)
+            table[:, 1:] = math.exp(-50.0)
+            table[:, 0] = 1.0 - 2 * math.exp(-50.0)
+    cc = jc.compile(jc.DFA.contains([[1, 2]], V), pc)
+    t = n // 2
+    data = torch.zeros(4, n, dtype = torch.long)
+    data[2, t - 1] = 1                                                      # ... owing "2": state 1
+    data[3, 0], data[3, 1] = 1, 2                                           # ... satisfied: state 2
+    missing = torch.arange(n)[None, :] >= torch.tensor([0, t, t, t])[:, None]   # sample 0: nothing observed
+    monkeypatch.setitem(reference.marginal.__globals__, "DTYPE", torch.float64)
+    want = reference.marginal(cc, data, missing).float()
+    assert torch.isfinite(want).all()                                        # every mass ~ e^-100, finite
+    got = cc.marginal(data, missing)
+    assert torch.isfinite(got).all(), got
+    assert ((got - want).abs() <= 1e-5 * want.abs() + 1e-4).all(), (got - want)

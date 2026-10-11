@@ -437,8 +437,9 @@ PC_KINDS = {
 }
 
 
-def build_pc(kind, n, V, seed = 0, device = torch.device("cuda:0"), **compile_kwargs):
-    """A compiled PC of one of the :data:`PC_KINDS` over ``n`` variables with ``V`` categories."""
+def build_pc(kind, n, V, seed = 0, device = torch.device("cuda:0"), perturbation = 2.0, **compile_kwargs):
+    """A compiled PC of one of the :data:`PC_KINDS` over ``n`` variables with ``V`` categories (``perturbation``: of
+    its parameters' initialization, see ``init_parameters``)."""
     assert PC_KINDS[kind] in (None, n), (kind, n)
     torch.manual_seed(seed); random.seed(seed)
     if kind == "hmm":
@@ -466,7 +467,7 @@ def build_pc(kind, n, V, seed = 0, device = torch.device("cuda:0"), **compile_kw
         ns = juice.blockify(base, sparsity_tolerance = 0.5, max_target_block_size = 4)
     else:
         ns = {"hand": hand_built, "hand_permuted": hand_permuted, "hand_unit": hand_unit, "hand_left": hand_left}[kind](V)
-    ns.init_parameters(perturbation = 2.0)
+    ns.init_parameters(perturbation = perturbation)
     return juice.compile(ns, verbose = False, **compile_kwargs).to(device)
 
 

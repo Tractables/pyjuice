@@ -379,7 +379,10 @@ def _block_block_tile(lp, rp, iv_table, lpos, rpos, mb, live_q, i, j, ti, tj, E,
     """``log(sum_q exp(L[i, q] + R[q, j]))`` for one output tile, in one pass over the shared chunks it needs: the
     product of the operands' exponentials, shifted by every row's and column's running maximum, the sum rescaled
     whenever a maximum grows (``lpos`` and ``rpos``: the operands' position tables; pruned, ``live_q``: the shared
-    boundary's liveness, a chunk without a live column skipped)."""
+    boundary's liveness, a chunk without a live column skipped). The shifts can lie farther above an entry's own terms
+    than fp32's exponent reaches -- blocks of a wide dynamic range, where a row's maximum comes from a column that
+    cannot reach the entry's own -- and the entry's terms then flush: the returned sums tell (see
+    :data:`EXACT_BELOW`). Below that, fp32 keeps its precision at any scale."""
     im, jm = i < E, j < X
     mL = tl.full([TM], float("-inf"), dtype = tl.float32)
     mR = tl.full([TN], float("-inf"), dtype = tl.float32)
@@ -407,20 +410,58 @@ def _block_block_tile(lp, rp, iv_table, lpos, rpos, mb, live_q, i, j, ti, tj, E,
             mL, mR = nL, nR
     sL = tl.where(mL == float("-inf"), 0.0, mL)
     sR = tl.where(mR == float("-inf"), 0.0, mR)
-    return tl.log(acc) + sL[:, None] + sR[None, :]
+    return tl.log(acc) + sL[:, None] + sR[None, :], acc
+
+
+#: An output entry of :func:`_block_block_tile` whose sum of shifted exponentials is below this is computed again by
+#: :func:`_block_block_tile_exact`. Every term the shifts flush out of fp32's range is below 2^-126 (so is a
+#: subnormal term's error), at most 2^-112 together over a 16k-column boundary: above 2^-90 they are at most 2^-22
+#: of the sum, fp32 rounding's order; below, they need not be.
+EXACT_BELOW = 2.0 ** -90
 
 
 @triton.jit
-def _block_block_kernel(element_mars, node_mars, temp, width, iv_of, iv_info, iv_table, live, steps, triples,
-                        skip_bits, reg_offset, reg_width, reg_first, out_first, out_width, temp_width, B, n, W, TILES_I,
-                        TILES_J, WORDS, SPLIT, GROUP,
-                        pid0, L_KIND: tl.constexpr, R_KIND: tl.constexpr, OUT_TEMP: tl.constexpr,
-                        TM: tl.constexpr, TN: tl.constexpr, TK: tl.constexpr, SUB_I: tl.constexpr,
-                        SUB_J: tl.constexpr, SKIP: tl.constexpr, PRUNE: tl.constexpr, PRECISION: tl.constexpr):
-    """One program per (step, sample, group of ``GROUP`` consecutive output tiles), its tiles in turn: the sample's
-    two blocks are contiguous and stay in L1 across them. A (step, sample) has ``SPLIT`` groups: 1 unless the
-    launch has too few (step, sample) pairs to fill the GPU."""
-    pid = pid0 + tl.program_id(0)
+def _block_block_tile_exact(lp, rp, iv_table, lpos, rpos, mb, live_q, i, j, ti, tj, E, M, X, TILES_I, TILES_J, WORDS,
+                            TM: tl.constexpr, TN: tl.constexpr, TK: tl.constexpr, SUB_I: tl.constexpr,
+                            SUB_J: tl.constexpr, SKIP: tl.constexpr, PRUNE: tl.constexpr):
+    """:func:`_block_block_tile`'s output by an online log-sum-exp per entry over the shared columns, one at a time:
+    exact whatever the blocks' dynamic range, at the cost of an exponential per (entry, column) instead of the
+    tensor-core product. For the tiles whose entries the shifts flush (see :data:`EXACT_BELOW`): the entries of a
+    block over a wide dynamic range that lie far below their row's and column's maxima -- those of a sample pinned by
+    its evidence to columns of little mass, in a block kept for every sample."""
+    im, jm = i < E, j < X
+    m = tl.full([TM, TN], float("-inf"), dtype = tl.float32)
+    acc = tl.zeros([TM, TN], dtype = tl.float32)
+    for c in range(0, tl.cdiv(M, TK)):
+        need = True
+        if SKIP:
+            need = _chunk_needed(mb, ti, tj, c, TILES_I, TILES_J, WORDS, SUB_I, SUB_J)
+        if PRUNE:
+            qs = c * TK + tl.arange(0, TK)
+            need = need & (tl.max(tl.load(live_q + qs, mask = qs < M, other = 0).to(tl.int32), axis = 0) > 0)
+        if need:
+            for k in range(0, TK):
+                q = c * TK + k
+                ok = q < M
+                if PRUNE:
+                    ok = ok & (tl.load(live_q + q, mask = q < M, other = 0) != 0)
+                if ok:
+                    sl = _slot(iv_table, lpos, i, q, M, im, False)
+                    lv = tl.load(lp + sl, mask = im & (sl >= 0), other = float("-inf"))
+                    sr = _slot(iv_table, rpos, q, j, X, jm, False)
+                    rv = tl.load(rp + sr, mask = jm & (sr >= 0), other = float("-inf"))
+                    m, acc = _lse_step(m, acc, lv[:, None] + rv[None, :])
+    return _lse_value(m, acc)
+
+
+@triton.jit
+def _block_block_program(element_mars, node_mars, temp, width, iv_of, iv_info, live, steps, triples, skip_bits,
+                         reg_offset, reg_width, reg_first, out_first, out_width, temp_width, B, n, W, TILES_I, TILES_J,
+                         WORDS, SPLIT, pid,
+                         L_KIND: tl.constexpr, R_KIND: tl.constexpr, OUT_TEMP: tl.constexpr):
+    """What program ``pid`` of a ``block @ block`` launch works on: its tile group ``g``, step and sample, the
+    boundaries, widths and position tables of its three intervals, its operands' and output's blocks, its step's skip
+    masks and its sample's liveness row."""
     g = pid % SPLIT
     s = pid // SPLIT // B
     b = (pid // SPLIT % B).to(tl.int64)
@@ -441,7 +482,32 @@ def _block_block_kernel(element_mars, node_mars, temp, width, iv_of, iv_info, iv
     op = _out_ptr(out_row, element_mars, temp, out_first, out_width, temp_width, OUT_TEMP) + b * OS
     mb = skip_bits + tl.load(triples + s).to(tl.int64) * TILES_I * TILES_J * WORDS
     lrow = live + b * (n + 1) * W                                            # the sample's liveness (if pruned)
+    return g, t0, t1, t2, E, M, X, lpos, rpos, opos, lp, rp, op, mb, lrow
+
+
+@triton.jit
+def _block_block_kernel(element_mars, node_mars, temp, width, iv_of, iv_info, iv_table, live, steps, triples,
+                        skip_bits, reg_offset, reg_width, reg_first, out_first, out_width, temp_width, B, n, W, TILES_I,
+                        TILES_J, WORDS, SPLIT, GROUP, exact_below,
+                        pid0, L_KIND: tl.constexpr, R_KIND: tl.constexpr, OUT_TEMP: tl.constexpr,
+                        TM: tl.constexpr, TN: tl.constexpr, TK: tl.constexpr, SUB_I: tl.constexpr,
+                        SUB_J: tl.constexpr, SKIP: tl.constexpr, PRUNE: tl.constexpr, EXACT: tl.constexpr,
+                        PRECISION: tl.constexpr):
+    """One program per (step, sample, group of ``GROUP`` consecutive output tiles), its tiles in turn: the sample's
+    two blocks are contiguous and stay in L1 across them. A (step, sample) has ``SPLIT`` groups: 1 unless the
+    launch has too few (step, sample) pairs to fill the GPU. ``EXACT``: the program records, entry by entry, whether
+    the shifts flushed any of its tiles' entries (see :data:`EXACT_BELOW`), and when they did -- rarely -- goes over
+    its tiles again to find those (the shifted sums again, a reduction per tile) and compute them exactly
+    (:func:`_block_block_tile_exact`). An elementwise record and one reduction per program in the common case: a
+    pruned tile does little work, and a reduction per tile cost a fifth of it; a second launch for the flagged
+    programs cost more still in launches."""
+    g, t0, t1, t2, E, M, X, lpos, rpos, opos, lp, rp, op, mb, lrow = _block_block_program(
+        element_mars, node_mars, temp, width, iv_of, iv_info, live, steps, triples, skip_bits, reg_offset, reg_width,
+        reg_first, out_first, out_width, temp_width, B, n, W, TILES_I, TILES_J, WORDS, SPLIT, pid0 + tl.program_id(0),
+        L_KIND, R_KIND, OUT_TEMP)
     NJ = tl.cdiv(X, TN)
+    if EXACT:
+        bad = tl.zeros([TM, TN], dtype = tl.int32)
     for t in range(g * GROUP, tl.minimum(g * GROUP + GROUP, tl.cdiv(E, TM) * NJ)):
         ti = t // NJ
         tj = t % NJ
@@ -451,16 +517,43 @@ def _block_block_kernel(element_mars, node_mars, temp, width, iv_of, iv_info, iv
             lr = tl.load(lrow + t0 * W + i, mask = i < E, other = 0) != 0
             lc = tl.load(lrow + t2 * W + j, mask = j < X, other = 0) != 0
             out = tl.full([TM, TN], float("-inf"), dtype = tl.float32)
+            if EXACT:
+                acc = tl.full([TM, TN], 1.0, dtype = tl.float32)
             if (tl.max(lr.to(tl.int32), axis = 0) > 0) & (tl.max(lc.to(tl.int32), axis = 0) > 0):
-                out = _block_block_tile(lp, rp, iv_table, lpos, rpos, mb, lrow + t1 * W, i, j, ti, tj, E, M, X,
-                                        TILES_I, TILES_J, WORDS, TM, TN, TK, SUB_I, SUB_J, SKIP, PRUNE, PRECISION)
+                out, acc = _block_block_tile(lp, rp, iv_table, lpos, rpos, mb, lrow + t1 * W, i, j, ti, tj, E, M, X,
+                                             TILES_I, TILES_J, WORDS, TM, TN, TK, SUB_I, SUB_J, SKIP, PRUNE, PRECISION)
             out = tl.where(lr[:, None] & lc[None, :], out, float("-inf"))
         else:
-            out = _block_block_tile(lp, rp, iv_table, lpos, rpos, mb, lrow, i, j, ti, tj, E, M, X, TILES_I, TILES_J,
-                                    WORDS, TM, TN, TK, SUB_I, SUB_J, SKIP, PRUNE, PRECISION)
+            out, acc = _block_block_tile(lp, rp, iv_table, lpos, rpos, mb, lrow, i, j, ti, tj, E, M, X, TILES_I,
+                                         TILES_J, WORDS, TM, TN, TK, SUB_I, SUB_J, SKIP, PRUNE, PRECISION)
         om = (i < E)[:, None] & (j < X)[None, :]
         sl = _slot(iv_table, opos, i[:, None], j[None, :], X, om, False)
+        if EXACT:
+            valid = om & (sl >= 0)
+            if PRUNE:
+                valid = valid & lr[:, None] & lc[None, :]
+            bad = bad | (acc < exact_below).to(tl.int32)
         tl.store(op + sl, out, mask = om & (sl >= 0))
+    if EXACT:
+        if tl.max(bad) > 0:
+            for t in range(g * GROUP, tl.minimum(g * GROUP + GROUP, tl.cdiv(E, TM) * NJ)):
+                ti = t // NJ
+                tj = t % NJ
+                i = ti * TM + tl.arange(0, TM)
+                j = tj * TN + tl.arange(0, TN)
+                om = (i < E)[:, None] & (j < X)[None, :]
+                sl = _slot(iv_table, opos, i[:, None], j[None, :], X, om, False)
+                valid = om & (sl >= 0)
+                if PRUNE:
+                    lr = tl.load(lrow + t0 * W + i, mask = i < E, other = 0) != 0
+                    lc = tl.load(lrow + t2 * W + j, mask = j < X, other = 0) != 0
+                    valid = valid & lr[:, None] & lc[None, :]
+                _, acc = _block_block_tile(lp, rp, iv_table, lpos, rpos, mb, lrow + t1 * W, i, j, ti, tj, E, M, X,
+                                           TILES_I, TILES_J, WORDS, TM, TN, TK, SUB_I, SUB_J, SKIP, PRUNE, PRECISION)
+                if tl.min(tl.where(valid, acc, 1.0)) < exact_below:
+                    out = _block_block_tile_exact(lp, rp, iv_table, lpos, rpos, mb, lrow + t1 * W, i, j, ti, tj, E, M,
+                                                  X, TILES_I, TILES_J, WORDS, TM, TN, TK, SUB_I, SUB_J, SKIP, PRUNE)
+                    tl.store(op + sl, tl.where(valid, out, float("-inf")), mask = om & (sl >= 0))
 
 
 @triton.jit
@@ -748,7 +841,7 @@ INPUT_BLOCK_ONE_EXP = (False, True)
 
 
 def run_products(stages, bufs, prog, regions, element_mars, node_mars, class_mars, obs_class, live,
-                 elem_first: int, elem_width: int, B: int):
+                 elem_first: int, elem_width: int, B: int, exact: bool):
     """
     Every step of one product layer, stage by stage (a stage reads only earlier stages' scratch rows). Products
     are fp32-level whatever the query's precision, which applies to the sum layers: ``block @ block`` dots in
@@ -763,6 +856,10 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, class_mar
         program), or ``{G: firsts}`` for :func:`_input_block_group_kernel`, used above :data:`GROUP_MIN_LANES`)
     :param bufs: ``(temp, temp_width)``, the layer's scratch rows
     :param live: None, or the query's liveness (:class:`~.live.Pruning`'s ``live``)
+    :param exact: whether ``block @ block`` tiles whose entries its shifts flush are computed again exactly (see
+        :data:`EXACT_BELOW`): under evidence pruning, where a sample's few live columns may carry very different
+        masses; a batch observing nothing reads its blocks' entries weighted by its own masses, which the shifts
+        respect (and pays nothing)
     """
     temp, temp_width = bufs
     common = dict(reg_offset = regions["offset"], reg_width = regions["width"], reg_first = regions["first"],
@@ -841,12 +938,13 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, class_mar
                             element_mars, node_mars, temp, prog.width_t, ivs.of, ivs.info, ivs.table, live, steps,
                             triples, skip.bits, B = B, n = n, W = W,
                             TILES_I = skip.tiles_i, TILES_J = skip.tiles_j, WORDS = skip.words, SPLIT = split,
-                            GROUP = group, pid0 = first, L_KIND = l_kind, R_KIND = r_kind, OUT_TEMP = out_temp,
-                            TM = TM, TN = TN, TK = TK, SUB_I = TM // skip.tm, SUB_J = TN // skip.tn,
-                            SKIP = SKIP_EMPTY_TILES, PRUNE = prune, PRECISION = PRODUCT_PRECISION,
+                            GROUP = group, exact_below = EXACT_BELOW, pid0 = first, L_KIND = l_kind, R_KIND = r_kind,
+                            OUT_TEMP = out_temp, TM = TM, TN = TN, TK = TK, SUB_I = TM // skip.tm, SUB_J = TN // skip.tn,
+                            SKIP = SKIP_EMPTY_TILES, PRUNE = prune, EXACT = exact, PRECISION = PRODUCT_PRECISION,
                             num_warps = warps, num_stages = 1, **common)
 
-                key = ("lifted_block_block", kinds, prune, SKIP_EMPTY_TILES, PRODUCT_PRECISION, B, S, E_max, X_max)
+                key = ("lifted_block_block", kinds, prune, exact, SKIP_EMPTY_TILES, PRODUCT_PRECISION, B, S, E_max,
+                       X_max)
                 block_block(autotune.pick(key, BLOCK_BLOCK_TILES, block_block))   # outputs overwritten: timed in place
             else:                                                            # "copy"
                 l_kind, out_temp = kinds

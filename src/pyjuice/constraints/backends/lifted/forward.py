@@ -503,7 +503,7 @@ def marginal(cc, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None
                         temp_width = _align(B * temp_slots)
                         temp = cc._storage_view("product_scratch", num_temps * temp_width)
                     products(stages, (temp, temp_width), prog, regions, element_mars, node_mars,
-                             class_mars, obs_class, live, elem_first, elem_width, B)
+                             class_mars, obs_class, live, elem_first, elem_width, B, exact = pruning is not None)
             else:
                 for block_size, parts in layers:
                     for dense, num_edges, fused in parts:
