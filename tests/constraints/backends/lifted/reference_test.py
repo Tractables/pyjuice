@@ -13,7 +13,11 @@ Categorical input nodes only, so every PC here has Categorical input nodes. Chec
   size 1;
 * under real constraints it equals brute force -- the PC's own probabilities of every string, summed
   over the accepted ones consistent with the evidence -- including after an in-place parameter update;
-* its log-space block operations stay exact far outside exp's range.
+* its log-space block operations stay exact far outside exp's range;
+* its conditionals of the target positions equal brute force (per token, normalized), rows in ``dense[targets]``
+  order;
+* its outside values satisfy the cut identity at every position: ``p(C, e)`` is the sum over the position's input
+  nodes of inside x outside, observed positions included, at sizes brute force cannot reach.
 """
 import itertools
 import random
@@ -126,8 +130,8 @@ def constraints(V, n):
     }
 
 
-def brute_force(pc, cc, data, missing, V):
-    """log sum over every accepted string consistent with the evidence of the PC's own p(x)."""
+def every_string(pc, cc, V):
+    """Every string of length n, the PC's own log p(x) of each (float64), and whether the automaton accepts it."""
     n = cc.n
     X = torch.tensor(list(itertools.product(range(V), repeat = n)), device = DEV)
     lls = pc(X)[:, 0].double()
@@ -136,7 +140,12 @@ def brute_force(pc, cc, data, missing, V):
     delta, cls = dfa.delta.to(DEV), dfa.token_class.to(DEV)
     for t in range(n):
         q = delta[q, cls[X[:, t]]]
-    accepted = dfa.accept.to(DEV)[q]
+    return X, lls, dfa.accept.to(DEV)[q]
+
+
+def brute_force(pc, cc, data, missing, V):
+    """log sum over every accepted string consistent with the evidence of the PC's own p(x)."""
+    X, lls, accepted = every_string(pc, cc, V)
     out = []
     for b in range(data.size(0)):
         ok = accepted & ((X == data[b].to(DEV)) | missing[b].to(DEV)).all(dim = 1)
@@ -158,6 +167,87 @@ def test_reference_equals_brute_force(kind, name, reference, build_pc):
     assert torch.equal(torch.isneginf(got), torch.isneginf(want)), (got, want)
     fin = torch.isfinite(want)
     assert (got[fin] - want[fin]).abs().max() < 1e-5 if fin.any() else name == "unsatisfiable"
+
+
+def brute_force_conditional(pc, cc, data, missing, targets, V):
+    """log p(x_t = v | e, C) for every target (b, t) in ``dense[targets]`` order: the PC's own p(x) of the accepted
+    strings consistent with sample b's evidence, summed per token at t and normalized (rows of -inf when there is
+    none)."""
+    X, lls, accepted = every_string(pc, cc, V)
+    rows = []
+    for b in range(data.size(0)):
+        ok = accepted & ((X == data[b].to(DEV)) | missing[b].to(DEV)).all(dim = 1)
+        for t in torch.nonzero(targets[b]).flatten().tolist():
+            row = torch.stack([torch.logsumexp(lls[ok & (X[:, t] == v)], dim = 0) for v in range(V)])
+            norm = torch.logsumexp(row, dim = 0)
+            rows.append(row - norm if torch.isfinite(norm) else row)
+    return torch.stack(rows)
+
+
+@pytest.mark.parametrize("name", list(constraints(3, 5)))
+@pytest.mark.parametrize("kind", list(TINY))
+def test_reference_conditional_equals_brute_force(kind, name, reference, build_pc):
+    n, V = TINY[kind], 3
+    pc = build_pc(kind, n, V)
+    cc = jc.compile(constraints(V, n)[name], pc)
+    data, missing = evidence(n, V)
+    got = reference.conditional(cc, data, missing)                     # every missing position is a target
+    want = brute_force_conditional(pc, cc, data, missing, missing, V)
+    assert got.shape == want.shape == (int(missing.sum()), V) and got.dtype == torch.float32
+    assert torch.equal(torch.isneginf(got), torch.isneginf(want)), (got, want)
+    fin = torch.isfinite(want)
+    assert (got[fin] - want[fin]).abs().max() < 1e-5 if fin.any() else name == "unsatisfiable"
+    live = fin.any(dim = 1)                                             # rows of samples the constraint allows
+    assert torch.allclose(got[live].exp().sum(dim = 1), torch.ones(int(live.sum()), device = DEV), atol = 1e-5)
+
+
+@pytest.mark.parametrize("name", ["keyword", "random"])
+@pytest.mark.parametrize("kind", list(KINDS))
+def test_outside_cut(kind, name, reference, build_pc):
+    """Every term of the lifted circuit's polynomial holds exactly one input entry per position (the circuit is
+    smooth and decomposable), so at every position t, p(C, e) = the sum over t's input nodes and their (i, j)
+    entries of inside x outside: every input node's outside value is checked, observed positions included."""
+    n, V = KINDS[kind], 5
+    pc = build_pc(kind, n, V)
+    cc = jc.compile(constraints(V, n)[name], pc)
+    data, missing = evidence(n, V)
+    inside = reference.inside(cc, data, missing)
+    outside = reference.outside(cc, data, missing, inside)
+    want = reference.marginal(cc, data, missing)[:, 0]
+    fin = torch.isfinite(want)
+    assert fin.any()
+    terms = [[] for _ in range(n)]                                      # per position: [B, entries] per input group
+    for ns, O in outside.items():
+        if ns.is_input():
+            terms[ns.scope.to_list()[0]].append((inside[ns] + O).transpose(0, 1).flatten(1))
+    for t in range(n):
+        got = torch.logsumexp(torch.cat(terms[t], dim = 1), dim = 1)
+        assert torch.equal(torch.isneginf(got), ~fin), t
+        assert ((got[fin] - want[fin]).abs() <= 1e-5 * want[fin].abs().clamp(min = 1)).all(), (t, got, want)
+
+
+def test_reference_conditional_targets(reference, build_pc):
+    """Rows come in ``dense[targets]`` order: the batch's rows are each sample's own rows, one sample after the other;
+    a [n] target mask equals its [B, n] expansion; the default targets are every missing position; a target must be
+    missing."""
+    n, V = 5, 3
+    pc = build_pc("hand", n, V)
+    cc = jc.compile(jc.DFA.contains([[1, 2]], V), pc)
+    data, missing = evidence(n, V)
+    rows = reference.conditional(cc, data, missing)
+    each = torch.cat([reference.conditional(cc, data[b:b + 1], missing[b:b + 1]) for b in range(data.size(0))])
+    assert rows.shape == each.shape and torch.equal(torch.isneginf(rows), torch.isneginf(each))
+    assert torch.allclose(rows[torch.isfinite(rows)], each[torch.isfinite(each)], rtol = 0, atol = 1e-6)
+
+    missing[:, 2] = True                                                # position 2 a target of every sample
+    one = torch.zeros(n, dtype = torch.bool)
+    one[2] = True
+    got = reference.conditional(cc, data, missing, one)
+    assert got.shape == (data.size(0), V)
+    assert torch.equal(got, reference.conditional(cc, data, missing, one.expand(data.size(0), n)))
+    assert torch.equal(reference.conditional(cc, data, missing), reference.conditional(cc, data, missing, missing))
+    with pytest.raises(ValueError, match = "missing"):
+        reference.conditional(cc, data, missing, ~missing)              # sample 1: every position observed
 
 
 def test_reference_follows_in_place_parameter_updates(reference, build_pc):

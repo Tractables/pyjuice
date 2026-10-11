@@ -32,6 +32,11 @@ kept: an accepted string of length ``n`` passes through active states only. Then
 * the root is ``log sum_j V[root, sample, 0, j]``: boundary 0 holds only the initial state, and every
   active state at boundary ``n`` is accepting.
 
+``reference_outside`` gives every node's OUTSIDE block, of the same shape, top-down from the root:
+``O[node, sample, i, j]`` is the log of everything ``p(C, e)`` multiplies the node's entry ``(i, j)`` by, over the
+positions outside its scope. ``reference_conditional`` reads the conditionals of target positions off the outside
+blocks of their input nodes.
+
 Parameters are read from the PC's live parameter tensors (never from the node objects, which are not
 kept in sync), so in-place parameter updates are seen by the next call.
 """
@@ -163,23 +168,20 @@ def input_block(cc, ns, data, missing):
     return torch.log(torch.einsum("nbc,icj->nbij", torch.exp(lmass - s), T)) + s[..., None]
 
 
-def reference_marginal(cc, data, missing_mask = None) -> torch.Tensor:
+def reference_inside(cc, data, missing_mask = None) -> dict:
     """
-    log p(C, e) for every sample, in float32. The PC's input nodes must be Categorical.
+    Every node group's block ``[num_nodes, B, W_a, W_{b+1}]`` of log inside values (see the module docstring), by
+    node group. The constraint must be satisfiable (every boundary is empty otherwise).
 
     :param cc: a constrained circuit
     :param data: [B, n] token ids (ignored where missing)
     :param missing_mask: None (everything observed), [n] or [B, n]; True = marginalized
-    :returns: [B, num_root_nodes]
     """
     pc, layout = cc.pc, cc.layout
-    n = cc.n
-    data, missing = _evidence(data, missing_mask, n)
+    assert layout.satisfiable
+    data, missing = _evidence(data, missing_mask, cc.n)
     B = data.size(0)
     dev = pc.params.device
-    if not layout.satisfiable:
-        return torch.full((B, pc.root_ns.num_nodes), -float("inf"), dtype = DTYPE, device = dev)
-
     vals = {}
     for ns in pc.root_ns:                                                       # children before parents
         info = cc.structure.node(ns)
@@ -197,16 +199,152 @@ def reference_marginal(cc, data, missing_mask = None) -> torch.Tensor:
             v = log_weighted_sum(sum_weights(pc, ns), X)
         assert v.shape == (ns.num_nodes, B, int(layout.width[a]), int(layout.width[b + 1])), (v.shape, a, b)
         vals[ns] = v
+    return vals
 
-    root = vals[pc.root_ns]                                                     # [N_root, B, 1, W_n]
+
+def reference_marginal(cc, data, missing_mask = None) -> torch.Tensor:
+    """
+    log p(C, e) for every sample, in float32. The PC's input nodes must be Categorical.
+
+    :param cc: a constrained circuit
+    :param data: [B, n] token ids (ignored where missing)
+    :param missing_mask: None (everything observed), [n] or [B, n]; True = marginalized
+    :returns: [B, num_root_nodes]
+    """
+    pc = cc.pc
+    if not cc.layout.satisfiable:
+        return torch.full((data.size(0), pc.root_ns.num_nodes), -float("inf"), dtype = DTYPE, device = pc.params.device)
+    root = reference_inside(cc, data, missing_mask)[pc.root_ns]                 # [N_root, B, 1, W_n]
     return torch.logsumexp(root[:, :, 0, :], dim = -1).t()
+
+
+def _log_index_add(dest, idx, src):
+    """``dest[idx[k]] = log(exp(dest[idx[k]]) + exp(src[k]))`` for every ``k``, repeated indices adding up."""
+    m = dest.scatter_reduce(0, idx.view(-1, *[1] * (src.dim() - 1)).expand_as(src), src, "amax")   # at least dest
+    m = torch.where(torch.isfinite(m), m, torch.zeros_like(m))
+    acc = torch.exp(dest - m).index_add_(0, idx, torch.exp(src - m[idx]))
+    return torch.log(acc) + m
+
+
+def reference_outside(cc, data, missing_mask = None, inside = None) -> dict:
+    """
+    Every node group's block of log OUTSIDE values, of the same shape as its inside block, by node group: ``O[node,
+    sample, i, j]`` is the log of the derivative of ``p(C, e)`` with respect to the node's (linear) inside value at
+    ``(i, j)``. Top-down from the root, 0 on every column (its value is summed over the accepting columns):
+
+    * a sum passes ``W^T`` times its outside to its children;
+    * a product passes child ``m`` the product ``L^T @ O @ R^T``, ``L`` and ``R`` the products of its children
+      before and after ``m`` in scope order;
+    * the contributions of every parent, and of every product node reading the same child node, add up.
+
+    Single-root PCs only (each root has its own outside values otherwise).
+
+    :param inside: :func:`reference_inside` of the same arguments, if already computed
+    """
+    pc = cc.pc
+    if pc.root_ns.num_nodes != 1:
+        raise NotImplementedError(f"The reference computes outside values of single-root PCs only, got "
+                                  f"{pc.root_ns.num_nodes} root nodes.")
+    if inside is None:
+        inside = reference_inside(cc, data, missing_mask)
+    dev = pc.params.device
+    outs = {ns: torch.full_like(v, -float("inf")) for ns, v in inside.items()}
+    outs[pc.root_ns] = torch.zeros_like(inside[pc.root_ns])
+    T = lambda x: x.transpose(-1, -2)
+    for ns in reversed(list(pc.root_ns)):                                       # parents before children
+        O = outs[ns]
+        if ns.is_sum():
+            O_ch = log_weighted_sum(sum_weights(pc, ns).t(), O)                 # children's nodes, concatenated
+            k = 0
+            for cs in ns.chs:
+                outs[cs] = torch.logaddexp(outs[cs], O_ch[k:k + cs.num_nodes])
+                k += cs.num_nodes
+        elif ns.is_prod():
+            order = sorted(range(len(ns.chs)), key = lambda k: cc.structure.node(ns.chs[k]).scope_runs[0][0])
+            idx = [product_child_index(ns, k).to(dev) for k in order]
+            blocks = [inside[ns.chs[k]][i] for k, i in zip(order, idx)]
+            left = [None]                                                       # left[m]: blocks[0] @ .. @ blocks[m-1]
+            for b in blocks[:-1]:
+                left.append(b if left[-1] is None else log_matmul(left[-1], b))
+            right = [None]                                                      # right[m]: blocks[m+1] @ .. (reversed)
+            for b in reversed(blocks[1:]):
+                right.append(b if right[-1] is None else log_matmul(b, right[-1]))
+            right.reverse()
+            for m, (k, i) in enumerate(zip(order, idx)):
+                o = O if left[m] is None else log_matmul(T(left[m]), O)
+                o = o if right[m] is None else log_matmul(o, T(right[m]))
+                outs[ns.chs[k]] = _log_index_add(outs[ns.chs[k]], i, o)
+    return outs
+
+
+def _targets(targets, missing):
+    """[B, n] bool: the target (sample, position) pairs, every missing one by default; each must be missing."""
+    if targets is None:
+        return missing.clone()
+    targets = targets.cpu().bool()
+    targets = targets.expand(missing.shape) if targets.dim() == 1 else targets
+    if (targets & ~missing).any():
+        raise ValueError("Every target must be a missing position.")
+    return targets
+
+
+def reference_conditional(cc, data, missing_mask = None, targets = None) -> torch.Tensor:
+    """
+    ``log p(x_t = v | e, C)`` for every target ``(b, t)`` and token ``v``, in float32: one row per target, in the
+    order ``dense[targets]`` lists them (sample by sample, positions in order). Rows are -inf where ``p(e, C) = 0``.
+    The PC's input nodes must be Categorical.
+
+    Token ``v`` at ``t`` moves column ``i`` to ``next_col[t, i, class(v)]`` with probability ``p_u(v)`` at every input
+    node ``u`` over ``t``, so ``p(x_t = v, e, C) = sum_u p_u(v) A_u[class(v)]``, with the class weights
+    ``A_u[c] = sum_i exp(O_u[i, next_col[t, i, c]])`` of the input node's outside block; normalized over ``v``.
+
+    :param cc: a constrained circuit
+    :param data: [B, n] token ids (ignored where missing)
+    :param missing_mask: None (everything observed), [n] or [B, n]; True = marginalized
+    :param targets: None (every missing position of every sample), or a bool mask [n] or [B, n] of missing positions
+    :returns: [number of targets, V]
+    """
+    pc, layout = cc.pc, cc.layout
+    n, dev = cc.n, pc.params.device
+    _, missing = _evidence(data, missing_mask, n)
+    targets = _targets(targets, missing)
+    V = layout.token_class.numel()
+    if not layout.satisfiable:
+        return torch.full((int(targets.sum()), V), -float("inf"), dtype = DTYPE, device = dev)
+    inside = reference_inside(cc, data, missing_mask)
+    outside = reference_outside(cc, data, missing_mask, inside)
+
+    token_class = layout.token_class.to(dev)
+    scores = torch.full((missing.size(0), n, V), -float("inf"), dtype = DTYPE, device = dev)   # log p(x_t = v, e, C)
+    wanted = targets.any(dim = 0)
+    for ns, O in outside.items():
+        if not ns.is_input():
+            continue
+        t = ns.scope.to_list()[0]
+        if not wanted[t]:
+            continue
+        if not isinstance(ns.dist, Categorical):
+            raise NotImplementedError(f"The reference supports Categorical input nodes only, got "
+                                      f"{type(ns.dist).__name__} over variable {t}.")
+        Wi = int(layout.width[t])
+        nc = layout.next_col[t, :Wi].to(dev)                                    # [Wi, C]
+        G = O[:, :, torch.arange(Wi, device = dev)[:, None], nc.clamp(min = 0)] # [N, B, Wi, C]
+        A = torch.logsumexp(G.masked_fill(nc < 0, -float("inf")), dim = 2)      # [N, B, C] log class weights
+        logp = torch.log(categorical_probs(pc, ns))                             # [N, V]
+        s = torch.logsumexp(A[:, :, token_class] + logp[:, None, :], dim = 0)  # [B, V]
+        scores[:, t] = torch.logaddexp(scores[:, t], s)
+
+    rows = scores[targets.to(dev)]
+    norm = torch.logsumexp(rows, dim = -1, keepdim = True)                      # log p(e, C)
+    return torch.where(torch.isfinite(norm), rows - norm, torch.full_like(rows, -float("inf")))
 
 
 @pytest.fixture
 def reference():
     """The reference implementation (this module's functions), for tests in this directory."""
     import types
-    return types.SimpleNamespace(marginal = reference_marginal, sum_weights = sum_weights,
+    return types.SimpleNamespace(marginal = reference_marginal, inside = reference_inside, outside = reference_outside,
+                                 conditional = reference_conditional, sum_weights = sum_weights,
                                  categorical_probs = categorical_probs, input_block = input_block,
                                  product_child_index = product_child_index,
                                  log_matmul = log_matmul, log_weighted_sum = log_weighted_sum)
