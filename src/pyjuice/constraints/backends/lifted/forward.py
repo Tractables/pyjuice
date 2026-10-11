@@ -7,7 +7,8 @@ every observed token, the class masses of missing ones are summed per token clas
 :meth:`ConstrainedCircuit._class_masses`), then every product layer group chains its children's blocks
 (:mod:`.kernels.prod`) and every sum layer group sums its children column by column (:mod:`.kernels.sum`).
 The root keeps a single value per sample. Like a :class:`TensorCircuit`, the pass is driven by tables: no
-kernel knows the circuit's shape.
+kernel knows the circuit's shape. A query runs the part of them its :mod:`.query_plan` says, and the values no
+sample's evidence reaches once for all of them.
 
 Everything the pass reads besides the buffers and the parameters is built once per constrained circuit
 (:class:`Program`), from the plan's tables and the PC's own layer metadata.
@@ -19,14 +20,16 @@ import bisect
 from collections import OrderedDict, defaultdict
 from typing import Optional
 
+import numpy as np
 import torch
 
-from .kernels.prod import IDENTITY, SUM, TEMP, max_successors, skip_masks, transition_job, transition_masses
+from .kernels.prod import IDENTITY, SUM, TEMP, Launch, max_successors, skip_masks, transition_job, transition_masses
 from .kernels.prod import transition_tables
 from .kernels.prod import run_products as products
 from .kernels.live import prune
 from .kernels.sum import dense_groups, dense_sum, fused_sum, stacked_weights
 from .plan import _align, interval_tables
+from .query_plan import prior_regions, query_plan
 
 #: Matrix-product precision of the kernels: "fp32" (three TF32 products, fp32-level accuracy) or "tf32".
 PRECISIONS = {"fp32": "tf32x3", "tf32": "tf32"}
@@ -71,6 +74,9 @@ INPUT_BLOCK_GROUP_ALTERNATIVES = (16, 4)
 #: of steps that fit, into one scratch
 TRANSITION_BUDGET = 1 << 26
 
+#: (input row, position) columns of the steps whose input's transitions they read
+TRANS_COLS = {"input_block": (1, 2), "block_input": (4, 5)}
+
 
 class Program:
     """Everything the lifted forward pass of one constrained circuit reads besides buffers and parameters."""
@@ -106,11 +112,20 @@ class Program:
         reg_ivs = [interval_of_row[first] for first in firsts]
         self.sum_ivs = sorted(set(reg_ivs))
         self.sum_iv_slots = [self.reach.slots(a, b) for a, b in self.sum_ivs]
-        number = {iv: k for k, iv in enumerate(self.sum_ivs)}
-        self.reg_iv_host = [number[iv] for iv in reg_ivs]
+        self.iv_number = {iv: k for k, iv in enumerate(self.sum_ivs)}
+        # for query plans (host, numpy): every sum interval's bounds and slots, and which intervals lie inside which
+        self.iv_bounds = np.array(self.sum_ivs, dtype = np.int64).reshape(-1, 2)
+        self.iv_slots = np.array(self.sum_iv_slots, dtype = np.int64)
+        a, b = self.iv_bounds[:, 0], self.iv_bounds[:, 1]
+        self.iv_inside = (a[None, :] >= a[:, None]) & (b[None, :] <= b[:, None])   # [k, m]: m inside k
+        self.reg_iv_host = [self.iv_number[iv] for iv in reg_ivs]
         self.reg_iv = torch.tensor(self.reg_iv_host, dtype = torch.long, device = dev)
         self.live_tables = {}                                          # batch size -> evidence pruning's lists
+        self.no_evidence = torch.full((1, n), -1, dtype = torch.int32, device = dev)   # a sample with nothing observed
+        self.plans = OrderedDict()                                     # query plans, see :mod:`.query_plan`
 
+        # every product layer's launches are first built on the host -- ``(form, kinds, rows, iv, sizes)``, see
+        # :class:`~.kernels.prod.Launch` -- and passed over below, then made into launches (:meth:`_launch`)
         self.steps = []
         self.stack_uses = {}                                           # stack key -> dense runs reading it per query
         prod_index = -1
@@ -118,7 +133,7 @@ class Program:
         for lg in pc.inner_layer_groups:
             if lg.is_prod():
                 prod_index += 1
-                layers = [self._product_stages(next(prod_layers), dev) for _ in lg.layers]
+                layers = [self._product_stages(next(prod_layers)) for _ in lg.layers]
                 self.steps.append(("prod", prod_index, layers))
             else:
                 elem_first = cc.element_regions[prod_index][0]
@@ -171,15 +186,14 @@ class Program:
             alias_reg = torch.zeros(end - first, dtype = torch.int32)
             for stages, _, _ in layers:
                 for launches in stages:
-                    for li, (form, kinds, steps, *sizes) in enumerate(launches):
+                    for li, (form, kinds, st, iv, sizes) in enumerate(launches):
                         if form != "copy" or kinds != (SUM, False):
                             continue
-                        st = steps.cpu().long()
                         keep = torch.tensor([int(o) in dense_rows for o in st[:, 0].tolist()], dtype = torch.bool)
                         regs = st[~keep, 2]
                         alias_row[st[~keep, 0] - first] = (st[~keep, 1] - torch.tensor(firsts)[regs]).to(torch.int32)
                         alias_reg[st[~keep, 0] - first] = regs.to(torch.int32)
-                        launches[li] = (form, kinds, st[keep].to(dev, torch.int32).contiguous(), *sizes)
+                        launches[li] = (form, kinds, st[keep], iv[keep], sizes[keep])
                     launches[:] = [l for l in launches if l[0] != "copy" or l[2].size(0) > 0]
             if (alias_row >= 0).any():
                 self.alias[prod_index] = (alias_row, alias_reg)
@@ -193,65 +207,82 @@ class Program:
 
         # which (output tile, shared chunk) pairs every block @ block step can skip: one mask per boundary triple,
         # each step's launch carrying its triple's index
+        launches_of = lambda forms: [(launches, li) for kind, _, layers in self.steps if kind == "prod"
+                                     for stages, _, _ in layers for launches in stages
+                                     for li, launch in enumerate(launches) if launch[0] in forms]
         triples = {}
-        bb = [(launches, li) for kind, _, layers in self.steps if kind == "prod" for stages, _, _ in layers
-              for launches in stages for li, launch in enumerate(launches) if launch[0] == "block_block"]
-        for launches, li in bb:
+        for launches, li in launches_of(("block_block",)):
             for tri in launches[li][2][:, 5:8].tolist():
                 triples.setdefault(tuple(tri), len(triples))
+        self.triple_of = triples
         self.skip_triples = list(triples)
         self.skip = skip_masks(self.reach, self.skip_triples, device = dev)
-        for launches, li in bb:
-            form, kinds, steps, *sizes = launches[li]
-            idx = torch.tensor([triples[tuple(t)] for t in steps[:, 5:8].tolist()], dtype = torch.int32, device = dev)
-            launches[li] = (form, kinds, (steps, idx), *sizes)
 
         # grouped transitions: every input @ block / block @ input step's transition masses, a row of the boundary's
-        # pairs at t_off. All kept at once when they fit TRANSITION_BUDGET; else each launch in chunks of steps that
-        # fit, sharing one scratch (a chunk's masses are built just before its steps run)
-        cols = {"input_block": (1, 2), "block_input": (4, 5)}               # (input row, position) columns
-        ins = [(launches, li) for kind, _, layers in self.steps if kind == "prod" for stages, _, _ in layers
-               for launches in stages for li, launch in enumerate(launches) if launch[0] in cols]
-        tables = [launches[li][2].cpu().long() for launches, li in ins]
-        if self.trans.grouped:
-            pairs = torch.tensor(self.trans.num_pairs, dtype = torch.long)
-            sizes = [pairs[st[:, cols[launches[li][0]][1]]] for st, (launches, li) in zip(tables, ins)]
-        else:
-            sizes = [torch.zeros(st.size(0), dtype = torch.long) for st in tables]
+        # pairs at t_off. All kept at once when they fit TRANSITION_BUDGET (offsets set here, once); else each launch
+        # in chunks of steps that fit, sharing one scratch (a chunk's masses are built just before its steps run)
+        ins = launches_of(tuple(TRANS_COLS))
+        self.trans_pairs = torch.tensor(self.trans.num_pairs, dtype = torch.long) if self.trans.grouped else None
+        sizes = [self.trans_pairs[launches[li][2][:, TRANS_COLS[launches[li][0]][1]]] if self.trans.grouped else
+                 torch.zeros(launches[li][2].size(0), dtype = torch.long) for launches, li in ins]
         self.trans_persistent = sum(int(z.sum()) for z in sizes) <= TRANSITION_BUDGET
         self.trans_size, rows = 0, []
-        for st, z, (launches, li) in zip(tables, sizes, ins):
-            form, kinds, _, *sizes = launches[li]
-            groups = None                                               # input @ block steps, several to a program
-            if not self.trans.grouped:
-                chunks = [(0, st.size(0), None)]
-                if form == "input_block" and kinds[0] != IDENTITY and INPUT_BLOCK_GROUP > 1:
-                    sizes_g = dict.fromkeys((INPUT_BLOCK_GROUP, *INPUT_BLOCK_GROUP_ALTERNATIVES))   # default first
-                    st, firsts = _step_groups(st, [G for G in sizes_g if G > 1])
-                    groups = {G: f.to(dev, torch.int32) for G, f in firsts.items()}
-            elif self.trans_persistent:
+        if self.trans.grouped and self.trans_persistent:
+            for z, (launches, li) in zip(sizes, ins):
+                form, kinds, st, iv, sz = launches[li]
+                st = st.clone()
                 st[:, 6] = self.trans_size + torch.cumsum(z, 0) - z
                 self.trans_size += int(z.sum())
-                chunks = [(0, st.size(0), None)]
-                rows.append(st[:, [*cols[form], 6]])
+                rows.append(st[:, [*TRANS_COLS[form], 6]])
+                launches[li] = (form, kinds, st, iv, sz)
+        self.trans_job = transition_job(torch.cat(rows), dev) if rows else None
+        self._trans, self._trans_version = None, None
+
+        for launches, li in launches_of(("input_block", "block_input", "block_block", "copy")):
+            launches[li] = self._launch(*launches[li])
+
+    def _launch(self, form: str, kinds: tuple, rows: torch.Tensor, iv: torch.Tensor, sizes: torch.Tensor) -> Launch:
+        """The :class:`~.kernels.prod.Launch` of steps built on the host (``rows`` [S, fields] int64, ``iv`` [S], ``sizes``
+        [S, 3], see there) -- of a whole stage when the Program is built, of a subset for a query plan."""
+        dev, S = self.dev, rows.size(0)
+        if form == "block_block":
+            idx = torch.tensor([self.triple_of[tuple(t)] for t in rows[:, 5:8].tolist()], dtype = torch.int32,
+                               device = dev)
+            steps = (rows.to(dev, torch.int32).contiguous(), idx)
+        elif form in TRANS_COLS:
+            groups = None                                               # input @ block steps, several to a program
+            if not self.trans.grouped:
+                chunks = [(0, S, None)]
+                if form == "input_block" and kinds[0] != IDENTITY and INPUT_BLOCK_GROUP > 1:
+                    sizes_g = dict.fromkeys((INPUT_BLOCK_GROUP, *INPUT_BLOCK_GROUP_ALTERNATIVES))   # default first
+                    order, firsts = _step_groups(rows, [G for G in sizes_g if G > 1])
+                    rows, iv, sizes = rows[order], iv[order], sizes[order]
+                    groups = {G: f.to(dev, torch.int32) for G, f in firsts.items()}
+            elif self.trans_persistent:
+                chunks = [(0, S, None)]                                 # offsets set once, see __init__
             else:
+                rows = rows.clone()
                 bounds, start, used = [], 0, 0
-                for k, size in enumerate(z.tolist()):
+                for k, size in enumerate(self.trans_pairs[rows[:, TRANS_COLS[form][1]]].tolist()):
                     if used + size > TRANSITION_BUDGET and k > start:
                         bounds.append((start, k))
                         start, used = k, 0
-                    st[k, 6] = used
+                    rows[k, 6] = used
                     used += size
                     self.trans_size = max(self.trans_size, used)
-                bounds.append((start, st.size(0)))
-                chunks = [(s0, s1, transition_job(st[s0:s1][:, [*cols[form], 6]], dev)) for s0, s1 in bounds]
-            launches[li] = (form, kinds, (st.to(dev, torch.int32).contiguous(), chunks, groups), *sizes)
-        self.trans_job = transition_job(torch.cat(rows), dev) if self.trans.grouped and rows else None
-        self._trans, self._trans_version = None, None
+                bounds.append((start, S))
+                chunks = [(s0, s1, transition_job(rows[s0:s1][:, [*TRANS_COLS[form], 6]], dev)) for s0, s1 in bounds]
+            steps = (rows.to(dev, torch.int32).contiguous(), chunks, groups)
+        else:
+            steps = rows.to(dev, torch.int32).contiguous()
+        E_max, X_max, S_max = (int(sizes[:, k].max()) for k in range(3))
+        return Launch(form, kinds, steps, E_max, X_max, S_max, rows, iv, sizes)
 
     def transition_buffer(self) -> torch.Tensor:
-        """Where the transition masses go (all of them, or one chunk's; allocated on first use)."""
-        if self._trans is None:
+        """Where the transition masses go (all of them, or one chunk's; allocated on first use, and again when a
+        query plan's chunks need more)."""
+        if self._trans is None or self._trans.numel() < self.trans_size:
+            self._trans = None
             self._trans = torch.empty(max(1, self.trans_size), dtype = torch.float32, device = self.dev)
         return self._trans
 
@@ -269,7 +300,7 @@ class Program:
     def _exit(self, t: int) -> int:
         return 1 if t == self.n else self.width[t]                   # a sequence end: one column
 
-    def _product_stages(self, rows, dev):
+    def _product_stages(self, rows):
         """
         One product layer's table, compiled into launches. Rows that share their children's kinds and
         boundaries fold the same way, right to left: ``c_0 @ (c_1 @ (... @ c_{k-1}))``, every intermediate
@@ -277,9 +308,9 @@ class Program:
         contraction of :mod:`.kernels.prod`, chosen by its operands; a stage holds the steps that read only
         earlier stages, grouped into one launch per contraction and operand kinds.
 
-        :returns: ``(stages, num_temps, max_temp_slots)``: per stage, ``(form, kinds, steps [S, F] int32, E_max,
-            X_max, S_max)`` launches (the most entry columns, exit columns and slots of their outputs); the scratch
-            rows the layer needs and the most slots per sample any of them holds
+        :returns: ``(stages, num_temps, max_temp_slots)``: per stage, ``(form, kinds, rows, iv, sizes)`` launches on
+            the host (see :class:`~.kernels.prod.Launch`); the scratch rows the layer needs and the most slots per
+            sample any of them holds
         """
         out_rows, child_rows, bounds = (t.cpu().long() for t in rows)
         firsts = torch.tensor(self.firsts, dtype = torch.long)
@@ -289,7 +320,7 @@ class Program:
             kids = child_rows[r, :k].tolist()
             groups.setdefault((tuple(c < self.input_end for c in kids), tuple(bounds[r, :k + 1].tolist())), []).append(r)
 
-        stages = defaultdict(lambda: defaultdict(list))              # stage -> (form, kinds) -> [(fields, E, X, S)]
+        stages = defaultdict(lambda: defaultdict(list))              # stage -> (form, kinds) -> [(rows, iv, sizes)]
         temps = [0, 1]                                               # scratch rows so far, most slots per row
         zeros = None
 
@@ -306,12 +337,14 @@ class Program:
         def emit(stage, form, kinds, fields, entry, exit, operands = ()):
             if form in ("input_block", "block_input"):    # which of the output's and operand's intervals keep every
                 kinds += (tuple(self.reach.positions(a, b) is None for a, b in [(entry, exit), *operands]),)    # pair
-            stages[stage][(form, kinds)].append((torch.stack(fields, dim = 1), self._entry(entry), self._exit(exit),
-                                                 self.reach.slots(entry, exit)))
+            R = fields[0].numel()
+            sizes = torch.tensor([[self._entry(entry), self._exit(exit), self.reach.slots(entry, exit)]]).expand(R, 3)
+            stages[stage][(form, kinds)].append((torch.stack(fields, dim = 1), torch.full((R,), product), sizes))
 
         for (is_input, bd), members in groups.items():
             idx = torch.tensor(members)
             R, k = idx.numel(), len(is_input)
+            product = self.iv_number[(bd[0], bd[k])]                 # the products' interval (their sums')
             kids, outs = child_rows[idx], out_rows[idx]
             zeros = torch.zeros(R, dtype = torch.long)
             full = lambda v: torch.full((R,), v, dtype = torch.long)
@@ -351,18 +384,13 @@ class Program:
                 stage += 1
                 acc = dest if m != 0 else acc
 
-        out = []
-        for stage in sorted(stages):
-            launches = []
-            for (form, kinds), parts in stages[stage].items():
-                steps = torch.cat([p[0] for p in parts]).to(dev, torch.int32).contiguous()
-                launches.append((form, kinds, steps, *(max(p[k] for p in parts) for k in (1, 2, 3))))
-            out.append(launches)
+        out = [[(form, kinds, *(torch.cat([p[k] for p in parts]) for k in range(3)))
+                for (form, kinds), parts in stages[stage].items()] for stage in sorted(stages)]
         return out, temps[0], temps[1]
 
 
 def _intervals(steps) -> set:
-    """Every interval ``(a, b)`` whose blocks the product steps read or write."""
+    """Every interval ``(a, b)`` whose blocks the product steps read or write (the Program's host launches)."""
     out = set()
     for kind, _, layers in steps:
         if kind != "prod":
@@ -370,7 +398,6 @@ def _intervals(steps) -> set:
         for stages, _, _ in layers:
             for launches in stages:
                 for form, kinds, st, *_ in launches:
-                    st = st.cpu().long()
                     if form == "input_block":                        # (input at t) @ [t + 1, t2) -> [t, t2)
                         t, t2 = st[:, 2], st[:, 5]
                         ivs = [(t, t2)] + ([(t + 1, t2)] if kinds[0] != IDENTITY else [])
@@ -388,18 +415,18 @@ def _intervals(steps) -> set:
 
 
 def _step_groups(st: torch.Tensor, sizes):
-    """An ``input @ block`` launch's steps (host rows, see :data:`~.kernels.prod.INPUT_BLOCK_FIELDS`) sorted by their
-    position and block end, and per group size ``G`` of ``sizes``, ``firsts`` [groups + 1]: the first step of every
-    group of at most ``G`` consecutive steps that share both, then the end."""
+    """An ``input @ block`` launch's steps (host rows, see :data:`~.kernels.prod.INPUT_BLOCK_FIELDS`): ``order``, which
+    sorts them by their position and block end, and per group size ``G`` of ``sizes``, ``firsts`` [groups + 1]: the
+    first (sorted) step of every group of at most ``G`` consecutive steps that share both, then the end."""
     key = st[:, 2] * (int(st[:, 5].max()) + 1) + st[:, 5]
     order = torch.sort(key, stable = True).indices
-    st, key = st[order], key[order]
+    key = key[order]
     k = torch.arange(st.size(0))
     change = torch.ones(st.size(0), dtype = torch.bool)
     change[1:] = key[1:] != key[:-1]
     run_first = torch.cummax(torch.where(change, k, 0), 0).values           # the first step of each step's run
     end = torch.tensor([st.size(0)])
-    return st, {G: torch.cat([torch.nonzero((k - run_first) % G == 0).flatten(), end]) for G in sizes}
+    return order, {G: torch.cat([torch.nonzero((k - run_first) % G == 0).flatten(), end]) for G in sizes}
 
 
 def _stack_key(blocks, E: int, block_size: int):
@@ -473,64 +500,118 @@ def marginal(cc, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None
 
     prog = cc._lifted_program()
     missing = _missing(missing_mask, B, n, dev)
+    observed = np.ones(n, dtype = bool) if missing_mask is None else \
+        (~missing).any(dim = 0).cpu().numpy()                           # the positions some sample observes
     x = torch.where(missing, 0, data.to(dev).long())                     # missing tokens: any valid id
     bufs = cc._buffers(B)
-    lay = bufs["layout"]
-    node_mars, element_mars = bufs["node_mars"], bufs["element_mars"]
-    input_mars = bufs["input_mars"]                                    # the input region: pyjuice's own layout
-    regions = dict(offset = lay["sum_offsets_t"], width = lay["sum_widths_t"], first = prog.reg_first,
-                   slots = prog.reg_slots)
-    dot = PRECISIONS[precision]
 
     with torch.no_grad():
         obs_class = torch.where(missing, -1, cc.token_classes.token_class[x]).contiguous()
-        observed = missing_mask is None or not bool(missing.all())
-        pruning = prune(prog, obs_class, B) if observed else None        # nothing observed: nothing to prune
-        live = pruning.live if pruning is not None else None
-        for layer in pc.input_layer_group:
-            layer(x.permute(1, 0), input_mars, missing_mask = missing)
-        class_mars = cc._class_masses()
-        prog.transitions(class_mars, cc._class_mars_version)
-        stacks, kept = cc._weight_stacks()
-
-        for kind, prod_index, layers in prog.steps:
-            elem_first = cc.element_regions[prod_index][0]
-            elem_width = lay["element_widths"][prod_index]
-            if kind == "prod":
-                for stages, num_temps, temp_slots in layers:
-                    temp, temp_width = node_mars, 0                  # no scratch rows: never read
-                    if num_temps > 0:
-                        temp_width = _align(B * temp_slots)
-                        temp = cc._storage_view("product_scratch", num_temps * temp_width)
-                    products(stages, (temp, temp_width), prog, regions, element_mars, node_mars,
-                             class_mars, obs_class, live, elem_first, elem_width, B, exact = pruning is not None)
-            else:
-                for block_size, parts in layers:
-                    for dense, num_edges, fused in parts:
-                        for (r, c0), (blocks, key) in dense.items():
-                            region = (lay["sum_offsets"][r], lay["sum_widths"][r], prog.firsts[r])
-                            ncols = B * prog.slots[r]
-                            cols = None                                  # every column live
-                            if pruning is not None and ncols >= DENSE_PRUNE_MIN_COLUMNS and \
-                                    pruning.num_live[prog.reg_iv_host[r]] < ncols:
-                                cols = pruning.segment(prog.reg_iv_host[r], ncols)
-                            stacked = None                  # stacked if narrow enough and the copy is kept or reused
-                            width = cols[2] if cols is not None else ncols                # the product's columns
-                            if key is not None and width <= STACK_MAX_COLUMNS[precision] and \
-                                    (kept or prog.stack_uses[key] > 1):
-                                if key not in stacks:
-                                    stacks[key] = stacked_weights(pc.params, key[2], num_edges, block_size)
-                                stacked = {c0: stacks[key]}
-                            dense_sum(node_mars, element_mars, pc.params, {c0: blocks}, num_edges, block_size, region,
-                                      elem_first, elem_width, ncols, dot, live = cols, stacked = stacked)
-                        if fused is not None:
-                            nids, cids, pids, nb_reg, max_slots, aliased = fused
-                            fused_sum(node_mars, element_mars, pc.params, nids, cids, pids, nb_reg, regions, elem_first,
-                                      elem_width, B, block_size, max_cols = B * max_slots, precision = dot,
-                                      aliased = aliased, pruning = pruning)
+        pruning = prune(prog, obs_class, B) if observed.any() else None     # nothing observed: nothing to prune
+        valid, kept = cc._prior_validity()
+        prior = prior_regions(prog, observed, B, kept, pruning)
+        plan = query_plan(prog, observed, None, valid.numpy(), prior)   # every inside value
+        run_forward(cc, bufs, plan, x, missing, obs_class, pruning, precision)
+        valid |= plan.todo
 
         r = prog.root_region
+        if plan.root_prior:                                             # nothing observed: every sample's value
+            prior = cc._prior_buffer()
+            base = prior["offset"][r] + (root_first - cc.sum_regions[r][0]) * prior["width"][r]
+            rows = base + torch.arange(root_end - root_first, device = dev) * prior["width"][r]
+            return prior["mars"][rows][None, :].expand(B, -1).contiguous()
+        lay = bufs["layout"]
         base = lay["sum_offsets"][r] + (root_first - cc.sum_regions[r][0]) * lay["sum_widths"][r]
         width = lay["sum_widths"][r]
         rows = base + torch.arange(root_end - root_first, device = dev)[:, None] * width
-        return node_mars[rows + torch.arange(B, device = dev)[None, :]].t().contiguous()
+        return bufs["node_mars"][rows + torch.arange(B, device = dev)[None, :]].t().contiguous()
+
+
+def run_forward(cc, bufs: dict, plan, x: torch.Tensor, missing: torch.Tensor, obs_class: torch.Tensor, pruning,
+                precision: str):
+    """
+    The inside values a query plan computes (see :mod:`.query_plan`): the per-sample ones into ``node_mars``, and
+    those kept once that ``prior_mars`` does not hold yet, for a batch of one, into ``prior_mars``. Layer by layer, as
+    :meth:`TensorCircuit.forward`: the PC's own input layers write the log-probability of every observed token, then
+    every product layer and every sum layer run their parts of the plan.
+
+    :param bufs: the batch's :meth:`~pyjuice.constraints.ConstrainedCircuit._buffers`
+    :param x: [B, n] token ids (any valid id where missing)
+    :param missing: [B, n] bool, True where a token is missing
+    :param obs_class: [B, n] int32, every observed token's class, -1 where missing
+    :param pruning: None, or the query's :class:`~.kernels.live.Pruning`
+    :param precision: "fp32" or "tf32" for the sum layers' matrix products
+    """
+    pc, prog = cc.pc, cc._lifted_program()
+    B = x.size(0)
+    lay = bufs["layout"]
+    node_mars, element_mars = bufs["node_mars"], bufs["element_mars"]
+    regions = dict(offset = lay["sum_offsets_t"], width = lay["sum_widths_t"], first = prog.reg_first,
+                   slots = prog.reg_slots)
+    prior = cc._prior_buffer() if plan.prior else None
+    if prior is not None:                                              # where the values kept once are
+        once = dict(offset = prior["offset_t"], width = prior["width_t"], first = prog.reg_first, slots = prog.reg_slots)
+        srcs = dict(mars = prior["mars"], offset = prior["offset_t"], width = prior["width_t"], reg_prior = plan.reg_prior)
+    else:                                                              # none: never read
+        srcs = dict(mars = node_mars, offset = regions["offset"], width = regions["width"], reg_prior = plan.reg_prior)
+    dot = PRECISIONS[precision]
+    live = pruning.live if pruning is not None else None
+
+    for layer in pc.input_layer_group:                                 # the input region: pyjuice's own layout
+        layer(x.permute(1, 0), bufs["input_mars"], missing_mask = missing)
+    class_mars = cc._class_masses()
+    prog.transitions(class_mars, cc._class_mars_version)
+    stacks, kept = cc._weight_stacks()
+
+    for kind, prod_index, layers in plan.steps:
+        elem_first = cc.element_regions[prod_index][0]
+        elem_width = lay["element_widths"][prod_index]
+        if kind == "prod":
+            for prior_stages, sample_stages, num_temps, temp_slots in layers:
+                temp, temp_width = node_mars, 0                      # no scratch rows: never read
+                if num_temps > 0:
+                    temp_width = _align(B * temp_slots)
+                    temp = cc._storage_view("product_scratch", num_temps * temp_width)
+                if prior_stages:                                     # nothing observed in their scopes
+                    products(prior_stages, (temp, temp_width), prog, regions, element_mars, node_mars, class_mars,
+                             prog.no_evidence, None, elem_first, elem_width, 1, srcs, exact = True)
+                if sample_stages:
+                    products(sample_stages, (temp, temp_width), prog, regions, element_mars, node_mars, class_mars,
+                             obs_class, live, elem_first, elem_width, B, srcs, exact = pruning is not None)
+        else:
+            for block_size, prior_parts, sample_parts in layers:
+                if prior_parts:
+                    _sums(cc, prior_parts, block_size, prior["mars"], element_mars, once, prior["offset"],
+                          prior["width"], elem_first, elem_width, 1, None, stacks, kept, precision)
+                if sample_parts:
+                    _sums(cc, sample_parts, block_size, node_mars, element_mars, regions, lay["sum_offsets"],
+                          lay["sum_widths"], elem_first, elem_width, B, pruning, stacks, kept, precision)
+
+
+def _sums(cc, parts, block_size: int, nodes: torch.Tensor, element_mars: torch.Tensor, regions: dict, offsets, widths,
+          elem_first: int, elem_width: int, B: int, pruning, stacks: dict, kept: bool, precision: str):
+    """A sum layer's ``parts`` (``(dense runs, num_edges, fused part)``) into ``nodes`` -- ``node_mars``, or
+    ``prior_mars`` with ``B`` 1 and no pruning -- whose sum regions ``regions`` (device tensors) and ``offsets`` /
+    ``widths`` (Python ints) describe."""
+    prog, pc = cc._lifted_program(), cc.pc
+    dot = PRECISIONS[precision]
+    for dense, num_edges, fused in parts:
+        for (r, c0), (blocks, key) in dense.items():
+            region = (offsets[r], widths[r], prog.firsts[r])
+            ncols = B * prog.slots[r]
+            cols = None                                                  # every column live
+            if pruning is not None and ncols >= DENSE_PRUNE_MIN_COLUMNS and \
+                    pruning.num_live[prog.reg_iv_host[r]] < ncols:
+                cols = pruning.segment(prog.reg_iv_host[r], ncols)
+            stacked = None                                  # stacked if narrow enough and the copy is kept or reused
+            width = cols[2] if cols is not None else ncols                                # the product's columns
+            if key is not None and width <= STACK_MAX_COLUMNS[precision] and (kept or prog.stack_uses[key] > 1):
+                if key not in stacks:
+                    stacks[key] = stacked_weights(pc.params, key[2], num_edges, block_size)
+                stacked = {c0: stacks[key]}
+            dense_sum(nodes, element_mars, pc.params, {c0: blocks}, num_edges, block_size, region, elem_first,
+                      elem_width, ncols, dot, live = cols, stacked = stacked)
+        if fused is not None:
+            nids, cids, pids, nb_reg, max_slots, aliased = fused
+            fused_sum(nodes, element_mars, pc.params, nids, cids, pids, nb_reg, regions, elem_first, elem_width, B,
+                      block_size, max_cols = B * max_slots, precision = dot, aliased = aliased, pruning = pruning)

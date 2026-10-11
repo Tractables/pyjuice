@@ -37,10 +37,13 @@ class ConstrainedCircuit:
 
     The input nodes' token-class masses depend only on the parameters, so inside :func:`pyjuice.fast_inference`
     (whose contract is that parameters do not change) they are computed by the first query and kept until the
-    scope exits; outside it, every query computes them. Likewise the stacked weights of dense sum node blocks
-    that read the same children (one matrix product instead of one per block, on products narrow enough for it to
-    pay): inside a scope that allows parameter copies, each is copied once and kept until the scope exits; outside
-    it, a query copies only the weights it reads more than once (tied ones) and drops them when it returns.
+    scope exits; outside it, every query computes them. So do the input-independent inside values -- those of the
+    nodes whose scope no sample of a query observes (see :mod:`~.backends.lifted.query_plan`), held once in
+    ``prior_mars`` and read by every sample -- each kept from the query that first computes it. Likewise the stacked
+    weights of dense sum node blocks that read the same children (one matrix product instead of one per block, on
+    products narrow enough for it to pay): inside a scope that allows parameter copies, each is copied once and kept
+    until the scope exits; outside it, a query copies only the weights it reads more than once (tied ones) and drops
+    them when it returns.
 
     Created by :func:`pyjuice.constraints.compile`; not meant to be constructed directly.
 
@@ -95,6 +98,8 @@ class ConstrainedCircuit:
         self._class_mars_kept = False               # kept by a `pyjuice.fast_inference` scope
         self._class_mars_version = 0                # counts their computations (what is derived from them follows)
         self._kept_stacks = None                    # stacked dense weights kept by a scope (see `_weight_stacks`)
+        self._prior_valid = None                    # which input-independent values prior_mars holds (`_prior_validity`)
+        self._prior_kept = False                    # kept by a `pyjuice.fast_inference` scope
 
     @property
     def pc(self):
@@ -122,6 +127,7 @@ class ConstrainedCircuit:
         self._storage, self._layouts = {}, {}       # the buffers are allocated again on the new device
         self._class_rows, self._class_mars, self._class_mars_kept = None, None, False
         self._kept_stacks = None
+        self._prior_valid, self._prior_kept = None, False
         self._program = None                        # and the forward's tables built again there
         self._device = device
         return self
@@ -146,16 +152,46 @@ class ConstrainedCircuit:
             ``sum_offsets`` / ``sum_widths`` as int64 tensors on the device for the kernels)
         """
         B = int(batch_size)
+        layout = self._layout(B)
+        node_mars = self._storage_view("node_mars", layout["node_size"])
+        element_mars = self._storage_view("element_mars", layout["element_size"])
+        return dict(node_mars = node_mars, element_mars = element_mars,
+                    input_mars = node_mars[:self.input_range[1] * B].view(self.input_range[1], B), layout = layout)
+
+    def _layout(self, B: int) -> Dict[str, Any]:
+        """The :func:`buffer_layout` of a batch of ``B``, with ``sum_offsets_t`` / ``sum_widths_t`` on the device."""
         layout = self._layouts.get(B)
         if layout is None:
             layout = buffer_layout(self.input_range, self.sum_regions, self.element_regions, B)
             layout["sum_offsets_t"] = torch.tensor(layout["sum_offsets"], dtype = torch.int64, device = self._device)
             layout["sum_widths_t"] = torch.tensor(layout["sum_widths"], dtype = torch.int64, device = self._device)
             self._layouts[B] = layout
-        node_mars = self._storage_view("node_mars", layout["node_size"])
-        element_mars = self._storage_view("element_mars", layout["element_size"])
-        return dict(node_mars = node_mars, element_mars = element_mars,
-                    input_mars = node_mars[:self.input_range[1] * B].view(self.input_range[1], B), layout = layout)
+        return layout
+
+    def _prior_buffer(self) -> Dict[str, Any]:
+        """
+        ``prior_mars``: the input-independent inside values (see :mod:`~.backends.lifted.query_plan`), laid out as
+        ``node_mars`` for a batch of one, in storage of its own (it outlives queries of any batch size), allocated
+        on first use. A dict with ``mars`` (flat), and every sum region's ``offset`` and ``width`` there (Python
+        ints) and ``offset_t`` / ``width_t`` (int64 on the device).
+        """
+        layout = self._layout(1)
+        return dict(mars = self._storage_view("prior_mars", layout["node_size"]), offset = layout["sum_offsets"],
+                    width = layout["sum_widths"], offset_t = layout["sum_offsets_t"], width_t = layout["sum_widths_t"])
+
+    def _prior_validity(self):
+        """
+        ``(valid, kept)`` for a query starting now: which inside values ``prior_mars`` holds (bool on the host, one
+        per sum interval of the lifted Program, ``Program.sum_ivs``, set by the queries that compute them), and
+        whether they outlive the query. They depend on the parameters only, so they are kept as the class masses are:
+        inside :func:`pyjuice.fast_inference` until the scope exits; outside it, every query starts with none.
+        """
+        if self._prior_valid is None or not self._prior_kept:
+            self._prior_valid = torch.zeros(len(self._lifted_program().sum_ivs), dtype = torch.bool)
+            if is_active():
+                self._prior_kept = True
+                register_layer(self)                                # its exit calls `_release_fast_inference_params`
+        return self._prior_valid, self._prior_kept
 
     def _class_mass_rows(self):
         """
@@ -215,13 +251,16 @@ class ConstrainedCircuit:
         return {}, False
 
     def _release_fast_inference_params(self, poison: bool = False):
-        """The :func:`pyjuice.fast_inference` scope that kept the class masses or the stacked weights exited:
-        parameters may change from now on (``poison``: fill the released masses with NaN, as the scope does for its
-        layers' copies; the stacked weights are dropped)."""
+        """The :func:`pyjuice.fast_inference` scope that kept the class masses, the input-independent values or the
+        stacked weights exited: parameters may change from now on (``poison``: fill the released masses and values
+        with NaN, as the scope does for its layers' copies; the stacked weights are dropped). Safe to call again."""
         self._class_mars_kept = False
         self._kept_stacks = None
+        self._prior_kept = False
         if poison and self._class_mars is not None:
             self._class_mars.fill_(float("nan"))
+        if poison and "prior_mars" in self._storage:
+            self._storage["prior_mars"].fill_(float("nan"))
 
     def _lifted_program(self):
         """The lifted forward's tables (:class:`~pyjuice.constraints.backends.lifted.forward.Program`), built on

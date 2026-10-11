@@ -15,6 +15,12 @@ anyway --
 
 So an observed prefix pins every block before it to one column per sample, and a sample whose evidence breaks the
 constraint keeps no live slot at all (its marginal is -inf).
+
+A block kept once for every sample (``prior_mars``, see :mod:`..query_plan`) is computed without pruning, so its dead
+slots hold finite values. The arguments above still make every such slot a term of a dead product -- it is only ever
+added to -inf -- so the values stay exact. They do enter the maxima ``block @ block`` shifts its exponentials by, which
+can flush a live entry's terms: the tiles where that happens are computed again exactly (see
+:func:`~.prod._block_block_tile`).
 """
 
 from dataclasses import dataclass

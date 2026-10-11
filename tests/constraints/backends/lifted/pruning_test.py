@@ -10,10 +10,13 @@ import itertools
 import math
 import random
 
+import numpy as np
 import pytest
 import torch
 
+import pyjuice as juice
 import pyjuice.constraints as jc
+import pyjuice.constraints.backends.lifted.forward as F
 from pyjuice.constraints.backends.lifted.kernels.live import prune
 
 V = 3
@@ -218,16 +221,17 @@ def test_marginals_survive_a_wide_dynamic_range(kind, build_pc, reference, monke
     position under the constraint "contains 1 2": the satisfied state carries nearly all of a block's mass, a state
     still owing the keyword e^-100 of it. A sample whose observed prefix leaves it in such a state at a block's boundary
     needs exactly those small entries -- which block @ block's row and column shifts flush unless the tile is computed
-    again exactly. Against the reference in float64."""
+    again exactly, and which the finite values of the sample's dead columns in a block kept once would flush as well,
+    were they not masked. Against the reference in float64, kept once (inside fast_inference) and per sample."""
     n = KINDS[kind]
-    pc = build_pc(kind, n, V, perturbation = 2.0)
+    pc = build_pc(kind, n, V)
     with torch.no_grad():
         for layer in pc.input_layer_group:                                 # P(0) ~ 1, P(1) = P(2) = e^-50 everywhere
             table = layer.params.view(-1, V)
             table[:, 1:] = math.exp(-50.0)
             table[:, 0] = 1.0 - 2 * math.exp(-50.0)
     cc = jc.compile(jc.DFA.contains([[1, 2]], V), pc)
-    t = n // 2
+    t = n // 2                                                              # prefixes end at a boundary of a kept block
     data = torch.zeros(4, n, dtype = torch.long)
     data[2, t - 1] = 1                                                      # ... owing "2": state 1
     data[3, 0], data[3, 1] = 1, 2                                           # ... satisfied: state 2
@@ -235,6 +239,14 @@ def test_marginals_survive_a_wide_dynamic_range(kind, build_pc, reference, monke
     monkeypatch.setitem(reference.marginal.__globals__, "DTYPE", torch.float64)
     want = reference.marginal(cc, data, missing).float()
     assert torch.isfinite(want).all()                                        # every mass ~ e^-100, finite
-    got = cc.marginal(data, missing)
-    assert torch.isfinite(got).all(), got
-    assert ((got - want).abs() <= 1e-5 * want.abs() + 1e-4).all(), (got - want)
+    with juice.fast_inference():
+        kept = cc.marginal(data, missing)
+    real = F.prior_regions
+    try:
+        F.prior_regions = lambda prog, observed, B, kept, pruning: np.zeros(len(prog.sum_ivs), dtype = bool)
+        per_sample = cc.marginal(data, missing)
+    finally:
+        F.prior_regions = real
+    for got in (kept, per_sample):
+        assert torch.isfinite(got).all(), got
+        assert ((got - want).abs() <= 1e-5 * want.abs() + 1e-4).all(), (got - want)

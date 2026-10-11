@@ -416,9 +416,9 @@ def test_every_block_block_step_indexes_its_triple(kind, build_pc):
             continue
         for stages, _, _ in layers:
             for launches in stages:
-                for form, _, steps, *_ in launches:
-                    if form == "block_block":
-                        table, index = steps
+                for launch in launches:
+                    if launch.form == "block_block":
+                        table, index = launch.steps
                         tri = [prog.skip_triples[i] for i in index.tolist()]
                         assert tri == [tuple(r) for r in table[:, 5:8].tolist()]
                         seen += 1

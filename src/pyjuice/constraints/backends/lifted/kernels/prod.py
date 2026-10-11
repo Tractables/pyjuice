@@ -16,7 +16,9 @@ circuit's shape:
 
 Blocks are either sum nodes' rows in ``node_mars`` or intermediate results in a scratch buffer. Outputs go
 to the product layer's ``element_mars`` rows, or to scratch when another step reads them. A row holds one
-block per sample, sample-major: sample ``b``'s block in columns ``[b * slots, (b + 1) * slots)``. A block keeps
+block per sample, sample-major: sample ``b``'s block in columns ``[b * slots, (b + 1) * slots)``. A sum node whose
+scope no sample observes may keep one block for every sample instead, in ``prior_mars`` (the query plan says which,
+see :mod:`..query_plan`). A block keeps
 only the (entry column ``i``, exit column ``j``) pairs the automaton joins, in row-major order: slot ``i * X +
 j`` when it joins them all, else through its interval's tables (:class:`~..plan.IntervalTables`). An input child
 is read only as the log-probability of its observed token (pyjuice's own input layers wrote it) or, when the
@@ -28,7 +30,7 @@ work.
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Sequence, Tuple
+from typing import Any, Optional, Sequence, Tuple
 
 import torch
 import triton
@@ -60,14 +62,49 @@ BLOCK_BLOCK_FIELDS = ("out", "l_row", "l_reg", "r_row", "r_reg", "t0", "t1", "t2
 COPY_FIELDS = ("out", "l_row", "l_reg", "t0", "t2")
 
 
+@dataclass
+class Launch:
+    """
+    One launch of a product layer's stage, as :func:`run_products` runs it, and what a query plan needs to run a
+    subset of its steps (:func:`~..query_plan.query_plan`).
+
+    :ivar form: the contraction: ``input_block``, ``block_input``, ``block_block`` or ``copy``
+    :ivar kinds: its operands' kinds (see :class:`~..forward.Program`)
+    :ivar steps: its device tables: ``input_block`` and ``block_input``, ``(steps, chunks, groups)``; ``block_block``,
+        ``(steps, triple index)``; ``copy``, ``steps`` (int32 rows, see the ``*_FIELDS`` above)
+    :ivar E_max, X_max, S_max: the most entry columns, exit columns and slots of its steps' outputs
+    :ivar rows: [S, fields] int64, its steps on the host, in the device tables' order
+    :ivar iv: [S] int64, the interval of every step's product, as its number in ``Program.sum_ivs`` (a scratch step
+        follows the product it is a fold of)
+    :ivar sizes: [S, 3] int64, every step's output's entry columns, exit columns and slots
+    """
+
+    form: str
+    kinds: tuple
+    steps: Any
+    E_max: int
+    X_max: int
+    S_max: int
+    rows: torch.Tensor
+    iv: torch.Tensor
+    sizes: torch.Tensor
+
+
 @triton.jit
-def _block_ptr(row, reg, node_mars, temp, reg_offset, reg_width, reg_first, temp_width, KIND: tl.constexpr):
-    """Start of a block operand: a sum node's row in its region of ``node_mars``, or a scratch row."""
+def _block_ptr(row, reg, node_mars, prior_mars, temp, reg_offset, reg_width, reg_first, prior_offset, prior_width,
+               reg_prior, temp_width, KIND: tl.constexpr):
+    """Start of a block operand, and whether every sample has a block of its own there (sample ``b``'s then ``b *
+    slots`` further): a sum node's row -- in its region of ``node_mars``, or of ``prior_mars`` when the query plan
+    keeps the region's values there (``reg_prior``, see :mod:`..query_plan`), its one block read by every sample -- or
+    a scratch row."""
     if KIND == 0:
-        base = tl.load(reg_offset + reg) + (row - tl.load(reg_first + reg)) * tl.load(reg_width + reg)
-        return node_mars + base
+        k = row - tl.load(reg_first + reg)
+        shared = tl.load(reg_prior + reg) != 0
+        own = node_mars + tl.load(reg_offset + reg) + k * tl.load(reg_width + reg)
+        prior = prior_mars + tl.load(prior_offset + reg) + k * tl.load(prior_width + reg)
+        return tl.where(shared, prior, own), ~shared
     else:
-        return temp + row.to(tl.int64) * temp_width
+        return temp + row.to(tl.int64) * temp_width, row >= 0
 
 
 @triton.jit
@@ -155,7 +192,8 @@ def _lse_value(m, acc):
 @triton.jit
 def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, class_mars, mass_row, trans, entry_ptr,
                         entry_succ, entry_x, width, iv_of, iv_info, iv_table, live, steps, reg_offset, reg_width,
-                        reg_first, out_first, out_width, temp_width, B, n, W, C, input_start, pid0,
+                        reg_first, prior_mars, prior_offset, prior_width, reg_prior, out_first, out_width, temp_width,
+                        B, n, W, C, input_start, pid0,
                         R_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, GROUPED: tl.constexpr, PRUNE: tl.constexpr,
                         OUT_FULL: tl.constexpr, R_FULL: tl.constexpr, TILE: tl.constexpr):
     """One program per step and tile of its whole output, flattened (sample, slot): with the samples' blocks
@@ -179,8 +217,10 @@ def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
         end = t + 1 == n
         if R_KIND != 2:
             RS, rpos, _ = _interval(iv_of, iv_info, t + 1, t2, n)            # the block's slots
-            rp = _block_ptr(tl.load(steps + s * 7 + 3), tl.load(steps + s * 7 + 4), node_mars, temp, reg_offset,
-                            reg_width, reg_first, temp_width, R_KIND) + b * RS
+            rp, r_own = _block_ptr(tl.load(steps + s * 7 + 3), tl.load(steps + s * 7 + 4), node_mars, prior_mars, temp,
+                                   reg_offset, reg_width, reg_first, prior_offset, prior_width, reg_prior, temp_width,
+                                   R_KIND)
+            rp = rp + tl.where(r_own, b * RS, 0)
         oc = tl.load(obs_class + b * n + t, mask = m, other = -1)            # observed token's class, -1 if missing
 
         # an observed token: its own log-probability (the input region of node_mars), then the block from the
@@ -232,8 +272,9 @@ def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
 
 @triton.jit
 def _input_block_group_kernel(element_mars, node_mars, temp, obs_class, next_col, class_mars, mass_row, width, iv_of,
-                              iv_info, iv_table, live, steps, groups, reg_offset, reg_width, reg_first, out_first,
-                              out_width, temp_width, B, n, W, C, input_start, pid0, R_KIND: tl.constexpr,
+                              iv_info, iv_table, live, steps, groups, reg_offset, reg_width, reg_first, prior_mars,
+                              prior_offset, prior_width, reg_prior, out_first, out_width, temp_width, B, n, W, C,
+                              input_start, pid0, R_KIND: tl.constexpr,
                               OUT_TEMP: tl.constexpr, PRUNE: tl.constexpr, OUT_FULL: tl.constexpr, R_FULL: tl.constexpr,
                               G: tl.constexpr, ONE_EXP: tl.constexpr, TILE: tl.constexpr):
     """:func:`_input_block_kernel` for a group of steps per program, class by class, the block a sum's or a scratch
@@ -259,9 +300,11 @@ def _input_block_group_kernel(element_mars, node_mars, temp, obs_class, next_col
         ml = _live_lanes(live, m, b, t, i, t2, j, n, W, PRUNE)
         RS, rpos, _ = _interval(iv_of, iv_info, t + 1, t2, n)                # the blocks' slots
         u = tl.load(steps + gs * 7 + 1, mask = gm, other = input_start).to(tl.int64)
-        rp = _block_ptr(tl.load(steps + gs * 7 + 3, mask = gm, other = 0), tl.load(steps + gs * 7 + 4, mask = gm, other = 0),
-                        node_mars, temp, reg_offset, reg_width, reg_first, temp_width, R_KIND)[:, None] + \
-            (b * RS)[None, :]                                                # [G, TILE]
+        rp, r_own = _block_ptr(tl.load(steps + gs * 7 + 3, mask = gm, other = 0),
+                               tl.load(steps + gs * 7 + 4, mask = gm, other = 0), node_mars, prior_mars, temp,
+                               reg_offset, reg_width, reg_first, prior_offset, prior_width, reg_prior, temp_width,
+                               R_KIND)
+        rp = rp[:, None] + tl.where(r_own[:, None], (b * RS)[None, :], 0)   # [G, TILE]
         oc = tl.load(obs_class + b * n + t, mask = m, other = -1)            # observed token's class, -1 if missing
 
         # an observed token, as in _input_block_kernel
@@ -294,7 +337,8 @@ def _input_block_group_kernel(element_mars, node_mars, temp, obs_class, next_col
 @triton.jit
 def _block_input_kernel(element_mars, node_mars, temp, obs_class, next_col, class_mars, mass_row, trans, pred_ptr,
                         pred_col, pred_x, width, iv_of, iv_info, iv_table, live, steps, reg_offset, reg_width,
-                        reg_first, out_first, out_width, temp_width, B, n, W, C, input_start, pid0,
+                        reg_first, prior_mars, prior_offset, prior_width, reg_prior, out_first, out_width, temp_width,
+                        B, n, W, C, input_start, pid0,
                         L_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, GROUPED: tl.constexpr, PRUNE: tl.constexpr,
                         OUT_FULL: tl.constexpr, L_FULL: tl.constexpr, TILE: tl.constexpr):
     """One program per step and tile of its whole output, flattened (sample, slot) as in
@@ -321,8 +365,9 @@ def _block_input_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
         ml = _live_lanes(live, m, b, t0, i, t + 1, j, n, W, PRUNE)
         oc = tl.load(obs_class + b * n + t, mask = m, other = -1)
         own = tl.load(node_mars + u * B + b, mask = m, other = float("-inf"))  # the input region of node_mars
-        lp = _block_ptr(tl.load(steps + s * 7 + 1), tl.load(steps + s * 7 + 2), node_mars, temp, reg_offset,
-                        reg_width, reg_first, temp_width, L_KIND) + b * LS
+        lp, l_own = _block_ptr(tl.load(steps + s * 7 + 1), tl.load(steps + s * 7 + 2), node_mars, prior_mars, temp,
+                               reg_offset, reg_width, reg_first, prior_offset, prior_width, reg_prior, temp_width, L_KIND)
+        lp = lp + tl.where(l_own, b * LS, 0)
         if GROUPED:
             masses = trans + tl.load(steps + s * 7 + 6).to(tl.int64)          # the step's transition masses
         else:                                                                # the input's class masses
@@ -380,9 +425,9 @@ def _block_block_tile(lp, rp, iv_table, lpos, rpos, mb, live_q, i, j, ti, tj, E,
     product of the operands' exponentials, shifted by every row's and column's running maximum, the sum rescaled
     whenever a maximum grows (``lpos`` and ``rpos``: the operands' position tables; pruned, ``live_q``: the shared
     boundary's liveness, a chunk without a live column skipped). The shifts can lie farther above an entry's own terms
-    than fp32's exponent reaches -- blocks of a wide dynamic range, where a row's maximum comes from a column that
-    cannot reach the entry's own -- and the entry's terms then flush: the returned sums tell (see
-    :data:`EXACT_BELOW`). Below that, fp32 keeps its precision at any scale."""
+    than fp32's exponent reaches -- blocks of a wide dynamic range, or an operand kept for every sample (``prior_mars``),
+    whose dead columns hold finite values the sample's evidence rules out -- and the entry's terms then flush: the
+    returned sums tell (see :data:`EXACT_BELOW`). Below that, fp32 keeps its precision at any scale."""
     im, jm = i < E, j < X
     mL = tl.full([TM], float("-inf"), dtype = tl.float32)
     mR = tl.full([TN], float("-inf"), dtype = tl.float32)
@@ -456,8 +501,8 @@ def _block_block_tile_exact(lp, rp, iv_table, lpos, rpos, mb, live_q, i, j, ti, 
 
 @triton.jit
 def _block_block_program(element_mars, node_mars, temp, width, iv_of, iv_info, live, steps, triples, skip_bits,
-                         reg_offset, reg_width, reg_first, out_first, out_width, temp_width, B, n, W, TILES_I, TILES_J,
-                         WORDS, SPLIT, pid,
+                         reg_offset, reg_width, reg_first, prior_mars, prior_offset, prior_width, reg_prior, out_first,
+                         out_width, temp_width, B, n, W, TILES_I, TILES_J, WORDS, SPLIT, pid,
                          L_KIND: tl.constexpr, R_KIND: tl.constexpr, OUT_TEMP: tl.constexpr):
     """What program ``pid`` of a ``block @ block`` launch works on: its tile group ``g``, step and sample, the
     boundaries, widths and position tables of its three intervals, its operands' and output's blocks, its step's skip
@@ -475,10 +520,12 @@ def _block_block_program(element_mars, node_mars, temp, width, iv_of, iv_info, l
     LS, lpos, _ = _interval(iv_of, iv_info, t0, t1, n)
     RS, rpos, _ = _interval(iv_of, iv_info, t1, t2, n)
     OS, opos, _ = _interval(iv_of, iv_info, t0, t2, n)
-    lp = _block_ptr(tl.load(steps + s * 8 + 1), tl.load(steps + s * 8 + 2), node_mars, temp, reg_offset,
-                    reg_width, reg_first, temp_width, L_KIND) + b * LS
-    rp = _block_ptr(tl.load(steps + s * 8 + 3), tl.load(steps + s * 8 + 4), node_mars, temp, reg_offset,
-                    reg_width, reg_first, temp_width, R_KIND) + b * RS
+    lp, l_own = _block_ptr(tl.load(steps + s * 8 + 1), tl.load(steps + s * 8 + 2), node_mars, prior_mars, temp,
+                           reg_offset, reg_width, reg_first, prior_offset, prior_width, reg_prior, temp_width, L_KIND)
+    rp, r_own = _block_ptr(tl.load(steps + s * 8 + 3), tl.load(steps + s * 8 + 4), node_mars, prior_mars, temp,
+                           reg_offset, reg_width, reg_first, prior_offset, prior_width, reg_prior, temp_width, R_KIND)
+    lp = lp + tl.where(l_own, b * LS, 0)
+    rp = rp + tl.where(r_own, b * RS, 0)
     op = _out_ptr(out_row, element_mars, temp, out_first, out_width, temp_width, OUT_TEMP) + b * OS
     mb = skip_bits + tl.load(triples + s).to(tl.int64) * TILES_I * TILES_J * WORDS
     lrow = live + b * (n + 1) * W                                            # the sample's liveness (if pruned)
@@ -487,8 +534,8 @@ def _block_block_program(element_mars, node_mars, temp, width, iv_of, iv_info, l
 
 @triton.jit
 def _block_block_kernel(element_mars, node_mars, temp, width, iv_of, iv_info, iv_table, live, steps, triples,
-                        skip_bits, reg_offset, reg_width, reg_first, out_first, out_width, temp_width, B, n, W, TILES_I,
-                        TILES_J, WORDS, SPLIT, GROUP, exact_below,
+                        skip_bits, reg_offset, reg_width, reg_first, prior_mars, prior_offset, prior_width, reg_prior,
+                        out_first, out_width, temp_width, B, n, W, TILES_I, TILES_J, WORDS, SPLIT, GROUP, exact_below,
                         pid0, L_KIND: tl.constexpr, R_KIND: tl.constexpr, OUT_TEMP: tl.constexpr,
                         TM: tl.constexpr, TN: tl.constexpr, TK: tl.constexpr, SUB_I: tl.constexpr,
                         SUB_J: tl.constexpr, SKIP: tl.constexpr, PRUNE: tl.constexpr, EXACT: tl.constexpr,
@@ -503,8 +550,8 @@ def _block_block_kernel(element_mars, node_mars, temp, width, iv_of, iv_info, iv
     programs cost more still in launches."""
     g, t0, t1, t2, E, M, X, lpos, rpos, opos, lp, rp, op, mb, lrow = _block_block_program(
         element_mars, node_mars, temp, width, iv_of, iv_info, live, steps, triples, skip_bits, reg_offset, reg_width,
-        reg_first, out_first, out_width, temp_width, B, n, W, TILES_I, TILES_J, WORDS, SPLIT, pid0 + tl.program_id(0),
-        L_KIND, R_KIND, OUT_TEMP)
+        reg_first, prior_mars, prior_offset, prior_width, reg_prior, out_first, out_width, temp_width, B, n, W,
+        TILES_I, TILES_J, WORDS, SPLIT, pid0 + tl.program_id(0), L_KIND, R_KIND, OUT_TEMP)
     NJ = tl.cdiv(X, TN)
     if EXACT:
         bad = tl.zeros([TM, TN], dtype = tl.int32)
@@ -532,7 +579,7 @@ def _block_block_kernel(element_mars, node_mars, temp, width, iv_of, iv_info, iv
             valid = om & (sl >= 0)
             if PRUNE:
                 valid = valid & lr[:, None] & lc[None, :]
-            bad = bad | (acc < exact_below).to(tl.int32)
+            bad = bad | (valid & (acc < exact_below)).to(tl.int32)
         tl.store(op + sl, out, mask = om & (sl >= 0))
     if EXACT:
         if tl.max(bad) > 0:
@@ -557,9 +604,9 @@ def _block_block_kernel(element_mars, node_mars, temp, width, iv_of, iv_info, iv
 
 
 @triton.jit
-def _copy_kernel(element_mars, node_mars, temp, iv_of, iv_info, steps, reg_offset, reg_width, reg_first, out_first,
-                 out_width, temp_width, B, n, pid0, L_KIND: tl.constexpr, OUT_TEMP: tl.constexpr,
-                 TILE: tl.constexpr):
+def _copy_kernel(element_mars, node_mars, temp, iv_of, iv_info, steps, reg_offset, reg_width, reg_first, prior_mars,
+                 prior_offset, prior_width, reg_prior, out_first, out_width, temp_width, B, n, pid0,
+                 L_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, TILE: tl.constexpr):
     s = tl.program_id(0)
     pid = pid0 + tl.program_id(1)
     out_row = tl.load(steps + s * 5 + 0)
@@ -570,8 +617,10 @@ def _copy_kernel(element_mars, node_mars, temp, iv_of, iv_info, steps, reg_offse
     if pid * TILE < ncols:
         cols = pid * TILE + tl.arange(0, TILE)
         m = cols < ncols
-        lp = _block_ptr(tl.load(steps + s * 5 + 1), tl.load(steps + s * 5 + 2), node_mars, temp, reg_offset,
-                        reg_width, reg_first, temp_width, L_KIND)
+        # the block's scope is the output's: in prior_mars only when this is a batch of one (sample stride moot)
+        lp, l_own = _block_ptr(tl.load(steps + s * 5 + 1), tl.load(steps + s * 5 + 2), node_mars, prior_mars, temp,
+                               reg_offset, reg_width, reg_first, prior_offset, prior_width, reg_prior, temp_width,
+                               L_KIND)
         op = _out_ptr(out_row, element_mars, temp, out_first, out_width, temp_width, OUT_TEMP)
         tl.store(op + cols, tl.load(lp + cols, mask = m), mask = m)
 
@@ -841,35 +890,39 @@ INPUT_BLOCK_ONE_EXP = (False, True)
 
 
 def run_products(stages, bufs, prog, regions, element_mars, node_mars, class_mars, obs_class, live,
-                 elem_first: int, elem_width: int, B: int, exact: bool):
+                 elem_first: int, elem_width: int, B: int, prior: dict, exact: bool):
     """
     Every step of one product layer, stage by stage (a stage reads only earlier stages' scratch rows). Products
     are fp32-level whatever the query's precision, which applies to the sum layers: ``block @ block`` dots in
     :data:`PRODUCT_PRECISION` (exact fp32 by default), the other contractions exact fp32 log-sum-exps.
 
-    :param stages: the layer's stages from :class:`~pyjuice.constraints.backends.lifted.forward.Program`: lists
-        of ``(form, kinds, steps, E_max, X_max, S_max)`` launches (the most entry columns, exit columns and slots of
-        their steps' outputs; ``block @ block`` steps: ``(steps, triple index)``,
+    :param stages: the layer's stages: lists of :class:`Launch` (``block @ block`` steps: ``(steps, triple index)``,
         the latter indexing ``Program.skip``; ``input @ block`` and ``block @ input`` steps: ``(steps, chunks,
         groups)``, chunks ``(first, end, job)`` step ranges, ``job`` the :func:`transition_job` that builds their
         transition masses just before them, or None when the Program keeps them all; ``groups`` None (one step per
         program), or ``{G: firsts}`` for :func:`_input_block_group_kernel`, used above :data:`GROUP_MIN_LANES`)
     :param bufs: ``(temp, temp_width)``, the layer's scratch rows
     :param live: None, or the query's liveness (:class:`~.live.Pruning`'s ``live``)
+    :param prior: where the sum operands the plan keeps once are (see :func:`_block_ptr`): ``mars``, the regions'
+        ``offset`` and ``width`` there, and ``reg_prior`` (device tensors)
     :param exact: whether ``block @ block`` tiles whose entries its shifts flush are computed again exactly (see
-        :data:`EXACT_BELOW`): under evidence pruning, where a sample's few live columns may carry very different
-        masses; a batch observing nothing reads its blocks' entries weighted by its own masses, which the shifts
-        respect (and pays nothing)
+        :data:`EXACT_BELOW`): for the blocks kept once, every entry of which some sample may need, and under evidence
+        pruning, where a sample's few live columns may carry very different masses; a batch observing nothing reads
+        its blocks' entries weighted by its own masses, which the shifts respect (and pays nothing)
     """
     temp, temp_width = bufs
     common = dict(reg_offset = regions["offset"], reg_width = regions["width"], reg_first = regions["first"],
-                  out_first = elem_first, out_width = elem_width, temp_width = temp_width)
+                  prior_mars = prior["mars"], prior_offset = prior["offset"], prior_width = prior["width"],
+                  reg_prior = prior["reg_prior"], out_first = elem_first, out_width = elem_width,
+                  temp_width = temp_width)
     n, W, C = prog.n, prog.next_col.size(1), prog.next_col.size(2)
     ivs = prog.intervals
     prune, live = live is not None, live if live is not None else obs_class
     for launches in stages:
-        for form, kinds, steps, E_max, X_max, S_max in launches:
-            S = steps[0].size(0) if isinstance(steps, tuple) else steps.size(0)
+        for launch in launches:
+            form, kinds, steps, E_max, X_max, S_max = (launch.form, launch.kinds, launch.steps, launch.E_max,
+                                                       launch.X_max, launch.S_max)
+            S = launch.rows.size(0)
             if form in ("input_block", "block_input"):
                 steps, chunks, groups = steps
                 trans, tt = prog.transition_buffer(), prog.trans
@@ -894,10 +947,11 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, class_mar
                                     OUT_TEMP = out_temp, PRUNE = prune, OUT_FULL = out_full, R_FULL = all(r_full),
                                     G = G, ONE_EXP = one_exp, TILE = tile, num_warps = 4, **common)
 
-                        # the group sizes the Program built (its default first), each step form: timed per shape
+                        # the group sizes the Program built (its default first), each step form: timed per shape (the
+                        # steps rounded up to a power of 2, so that queries running subsets of a launch share choices)
                         cands = [(G, one_exp) for one_exp in INPUT_BLOCK_ONE_EXP for G in groups]
-                        key = ("lifted_input_block_group", kinds, prune, C, S, triton.next_power_of_2(B * S_max),
-                               tuple(groups))
+                        key = ("lifted_input_block_group", kinds, prune, C, triton.next_power_of_2(S),
+                               triton.next_power_of_2(B * S_max), tuple(groups))
                         input_block_group(autotune.pick(key, cands, input_block_group))   # outputs overwritten
                     elif form == "input_block":
                         r_kind, out_temp, (out_full, *r_full) = kinds
@@ -943,8 +997,8 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, class_mar
                             SKIP = SKIP_EMPTY_TILES, PRUNE = prune, EXACT = exact, PRECISION = PRODUCT_PRECISION,
                             num_warps = warps, num_stages = 1, **common)
 
-                key = ("lifted_block_block", kinds, prune, exact, SKIP_EMPTY_TILES, PRODUCT_PRECISION, B, S, E_max,
-                       X_max)
+                key = ("lifted_block_block", kinds, prune, exact, SKIP_EMPTY_TILES, PRODUCT_PRECISION, B,
+                       triton.next_power_of_2(S), E_max, X_max)
                 block_block(autotune.pick(key, BLOCK_BLOCK_TILES, block_block))   # outputs overwritten: timed in place
             else:                                                            # "copy"
                 l_kind, out_temp = kinds

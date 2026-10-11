@@ -139,31 +139,45 @@ def test_tf32_products_stay_close(kind, sum_path, build_pc):
 
 
 def sum_blocks(cc, B, data, missing):
-    """Run the marginal; every sum region's rows, B * slots columns (cloned: the buffers are reused)."""
+    """Run the marginal; every sum region's rows, B * slots columns (cloned: the buffers are reused). A region the
+    marginal's plan keeps once is read in prior_mars, its one block every sample's."""
     cc.marginal(data, missing)
-    bufs = cc._buffers(B)
+    prog = cc._lifted_program()
+    plan = next(reversed(prog.plans.values()))                              # the marginal's plan (most recently used)
+    bufs, prior = cc._buffers(B), cc._prior_buffer()
     lay, nm = bufs["layout"], bufs["node_mars"]
     out = []
     for r, (first, end, slots) in enumerate(cc.sum_regions):
-        off, wid = lay["sum_offsets"][r], lay["sum_widths"][r]
-        out.append(nm[off:off + (end - first) * wid].view(end - first, wid)[:, :B * slots].clone())
+        if not plan.reg_prior[r]:
+            off, wid = lay["sum_offsets"][r], lay["sum_widths"][r]
+            out.append(nm[off:off + (end - first) * wid].view(end - first, wid)[:, :B * slots].clone())
+        else:
+            off, wid = prior["offset"][r], prior["width"][r]
+            out.append(prior["mars"][off:off + (end - first) * wid].view(end - first, wid)[:, :slots].repeat(1, B))
     return out
 
 
 @pytest.mark.parametrize("kind", ["hmm", "pd", "hand", "hand_left"])
 def test_every_sample_is_a_contiguous_block(kind, build_pc):
     """Sample b's block of every sum node is columns [b * slots, (b + 1) * slots) of its row: what a batch of one
-    puts in columns [0, slots)."""
+    puts in columns [0, slots). Where sample b observes nothing of the scope, the batch of one keeps the region's
+    input-independent block, unpruned: the batch's block then differs only by the slots evidence pruning drops."""
     n = KINDS[kind]
     cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
+    prog = cc._lifted_program()
     data, missing = evidence(n, 3)
     batched = sum_blocks(cc, 3, data, missing)
     for b in range(3):
         single = sum_blocks(cc, 1, data[b:b + 1], missing[b:b + 1])
-        for (first, end, slots), rb, rs in zip(cc.sum_regions, batched, single):
+        for r, ((first, end, slots), rb, rs) in enumerate(zip(cc.sum_regions, batched, single)):
             got = rb[:, b * slots:(b + 1) * slots]
-            assert torch.equal(torch.isneginf(got), torch.isneginf(rs))
-            fin = torch.isfinite(rs)
+            lo, hi = prog.sum_ivs[prog.reg_iv_host[r]]
+            if missing[b, lo:hi].all():                                 # the batch of one: unpruned
+                fin = torch.isfinite(got)
+                assert (torch.isfinite(rs) | ~fin).all()
+            else:
+                assert torch.equal(torch.isneginf(got), torch.isneginf(rs))
+                fin = torch.isfinite(rs)
             assert torch.allclose(got[fin], rs[fin], rtol = 1e-6, atol = 1e-6), (kind, b, first)
 
 
@@ -489,9 +503,8 @@ def test_splitting_block_block_tiles_changes_nothing(build_pc, monkeypatch):
 
 def input_block_launches(cc):
     """Every ``input @ block`` launch: ``(kinds, steps, groups)``."""
-    return [(kinds, steps, groups) for kind, _, layers in cc._lifted_program().steps if kind == "prod"
-            for stages, _, _ in layers for launches in stages
-            for _, kinds, (steps, _, groups), *_ in (l for l in launches if l[0] == "input_block")]
+    return [(l.kinds, l.steps[0], l.steps[2]) for kind, _, layers in cc._lifted_program().steps if kind == "prod"
+            for stages, _, _ in layers for launches in stages for l in launches if l.form == "input_block"]
 
 
 def input_block_groups(cc):
@@ -558,8 +571,8 @@ def test_narrow_launches_run_one_step_per_program(build_pc, reference, monkeypat
     cc = jc.compile(CONSTRAINTS["contains"](), build_pc("hmm", n, V))
     data, missing = evidence(n, 4)
     assert input_block_groups(cc)
-    lanes = max(4 * l[5] for kind, _, layers in cc._lifted_program().steps if kind == "prod" for stages, _, _ in layers
-                for launches in stages for l in launches if l[0] == "input_block" and l[2][2] is not None)
+    lanes = max(4 * l.S_max for kind, _, layers in cc._lifted_program().steps if kind == "prod" for stages, _, _ in layers
+                for launches in stages for l in launches if l.form == "input_block" and l.steps[2] is not None)
     want = reference.marginal(cc, data, missing)
     for limit, launched in ((lanes, False), (lanes - 1, True)):
         monkeypatch.setattr(prod, "GROUP_MIN_LANES", limit)
@@ -575,9 +588,9 @@ def tuned_sites(cc, B):
     for kind, _, layers in cc._lifted_program().steps:
         for stages, _, _ in (layers if kind == "prod" else []):
             for launch in (l for launches in stages for l in launches):
-                if launch[0] == "block_block":
+                if launch.form == "block_block":
                     sites.add("lifted_block_block")
-                elif launch[0] == "input_block" and launch[2][2] is not None:
+                elif launch.form == "input_block" and launch.steps[2] is not None:
                     sites.add("lifted_input_block_group")
     return sites
 
@@ -718,8 +731,8 @@ def marginal_with_aliasing(cc, on, data, missing, monkeypatch):
 
 
 def copy_launches(prog):
-    return [steps for k, _, layers in prog.steps if k == "prod" for stages, _, _ in layers
-            for launches in stages for form, _, steps, *_ in launches if form == "copy"]
+    return [l.steps for k, _, layers in prog.steps if k == "prod" for stages, _, _ in layers
+            for launches in stages for l in launches if l.form == "copy"]
 
 
 @pytest.mark.parametrize("kind", list(KINDS))
