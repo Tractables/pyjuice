@@ -361,6 +361,7 @@ def run_backward(cc, bufs: dict, flows: dict, plan, x: torch.Tensor, missing: to
         once = dict(offset = pf["offset_t"], width = pf["width_t"], first = prog.reg_first, slots = prog.reg_slots)
     dot = F.PRECISIONS[precision]
     live = pruning.live if pruning is not None else None
+    lanes = (pruning.perm, pruning.reg_first, pruning.reg_live) if pruning is not None else None
     exact = pruning is not None
     class_mars = cc._class_masses()
     prog.transitions(class_mars, cc._class_mars_version)
@@ -391,8 +392,8 @@ def run_backward(cc, bufs: dict, flows: dict, plan, x: torch.Tensor, missing: to
                     for r, c0, E, piece, blocks, key, add in dense_runs[part]:
                         ncols = nb * prog.slots[r]
                         cols = None
-                        if part == 1 and pruning is not None and ncols >= F.DENSE_PRUNE_MIN_COLUMNS and \
-                                pruning.num_live[prog.reg_iv_host[r]] < ncols:
+                        if part == 1 and pruning is not None and \
+                                F.prune_dense(ncols, pruning.num_live[prog.reg_iv_host[r]]):
                             cols = pruning.segment(prog.reg_iv_host[r], ncols)
                         stacked = None
                         width_ = cols[2] if cols is not None else ncols
@@ -431,6 +432,6 @@ def run_backward(cc, bufs: dict, flows: dict, plan, x: torch.Tensor, missing: to
                     if sample_launches:
                         run_top_down(sample_launches, (temp, temp_width), prog, regions, element_flows, temp_flows,
                                      node_flows, node_mars, class_mars, obs_class, live, elem_first, elem_width, B,
-                                     srcs, out.skip, exact, td.once_iv)
+                                     srcs, out.skip, exact, td.once_iv, lanes = lanes)
     if pf is not None:
         pf["valid"] |= td.todo

@@ -31,6 +31,8 @@ import triton
 import triton.language as tl
 
 from .prod import _exit_width, _interval, _pair, grid_chunks
+from pyjuice.utils.kernel_launcher import triton_jit
+from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
 
 @triton.jit
@@ -72,7 +74,7 @@ def _reach_back(live, back, base, q, qm, oc, next_col, succ_ptr, succ, t, n, W, 
     tl.store(live + base + t * W + q, ((fwd != 0) & (g != 0)).to(tl.int8), mask = qm)
 
 
-@triton.jit
+@triton_jit
 def _liveness_kernel(live, back, obs_class, next_col, succ_ptr, succ, width, n, W, C, TILE: tl.constexpr):
     """One program per sample: ``live[b, t, q]`` (int8 [B, n + 1, W]; boundary ``n`` is the sequence end, column 0),
     forward reachability by a sweep over boundaries -- every live column marks its successors -- then ANDed with
@@ -105,7 +107,7 @@ def _liveness_kernel(live, back, obs_class, next_col, succ_ptr, succ, width, n, 
             _reach_back(live, back, base, q, q < E, oc, next_col, succ_ptr, succ, t, n, W, C, TILE)
 
 
-@triton.jit
+@triton_jit
 def _live_forward_kernel(live, obs_class, next_col, succ_ptr, succ, width, t, n, W, C, TILE: tl.constexpr):
     """Boundary ``t`` -> ``t + 1`` of :func:`_liveness_kernel`'s forward sweep as one launch, programs over (sample,
     tile of the boundary's columns): ``live`` holds the boundaries up to ``t``, and zeros after (concurrent marks of a
@@ -118,7 +120,7 @@ def _live_forward_kernel(live, obs_class, next_col, succ_ptr, succ, width, t, n,
     _mark_successors(live, base, q, f, tl.load(obs_class + b * n + t), next_col, succ_ptr, succ, t, n, W, C, TILE)
 
 
-@triton.jit
+@triton_jit
 def _live_backward_kernel(live, back, obs_class, next_col, succ_ptr, succ, width, t, n, W, C, TILE: tl.constexpr):
     """Boundary ``t + 1`` -> ``t`` of :func:`_liveness_kernel`'s backward sweep as one launch, programs over (sample,
     tile of the boundary's columns): ``back`` holds the boundaries after ``t``."""
@@ -129,7 +131,7 @@ def _live_backward_kernel(live, back, obs_class, next_col, succ_ptr, succ, width
                 t, n, W, C, TILE)
 
 
-@triton.jit
+@triton_jit
 def _live_slot_kernel(flag, live, ivs, iv_of, iv_info, iv_table, width, B, n, W, pid0, TILE: tl.constexpr):
     """One program per (interval, tile of its ``B * slots`` columns): ``flag`` = 1 where the column's slot is live."""
     k = tl.program_id(0)
@@ -150,7 +152,7 @@ def _live_slot_kernel(flag, live, ivs, iv_of, iv_info, iv_table, width, B, n, W,
         tl.store(flag + first + col, alive.to(tl.int32), mask = m)
 
 
-@triton.jit
+@triton_jit
 def _live_order_kernel(flag, cum, perm, rank, ivs, iv_of, iv_info, B, n, pid0, TILE: tl.constexpr):
     """One program per (interval, tile of its columns): ``perm`` lists the interval's live columns in order, then its
     dead ones; ``rank`` holds every column's place among the live ones, -1 if dead (``cum``: inclusive prefix sums of
@@ -234,13 +236,13 @@ def prune(prog, obs_class: torch.Tensor, B: int) -> Pruning:
         live[:, 0, 0] = 1                                                   # the initial column
         back[:, n, 0] = 1                                                   # the sequence end
         for t in range(n):
-            _live_forward_kernel[(B, triton.cdiv(prog.width[t], LIVE_STEP_TILE))](
+            _live_forward_kernel[(B, host_cdiv(prog.width[t], LIVE_STEP_TILE))](
                 live, *tables, t, n, W, C, TILE = LIVE_STEP_TILE, num_warps = 4)
         for t in range(n - 1, -1, -1):
-            _live_backward_kernel[(B, triton.cdiv(prog.width[t], LIVE_STEP_TILE))](
+            _live_backward_kernel[(B, host_cdiv(prog.width[t], LIVE_STEP_TILE))](
                 live, back, *tables, t, n, W, C, TILE = LIVE_STEP_TILE, num_warps = 4)
     else:                                            # one program per sample, sweeping every boundary
-        TILE = min(1024, max(32, triton.next_power_of_2(W)))
+        TILE = min(1024, max(32, host_next_power_of_2(W)))
         _liveness_kernel[(B,)](live, back, *tables, n, W, C, TILE = TILE, num_warps = 4)
 
     if B not in prog.live_tables:                                           # where every sum interval's columns go
@@ -253,7 +255,7 @@ def prune(prog, obs_class: torch.Tensor, B: int) -> Pruning:
         prog.live_tables[B] = (sizes, first[:-1], first[-1], table, starts, starts + torch.tensor(sizes, device = dev))
     sizes, first, total, table, starts, ends = prog.live_tables[B]
     flag = torch.empty(total, dtype = torch.int32, device = dev)
-    tiles = triton.cdiv(max(sizes), LIST_TILE)
+    tiles = host_cdiv(max(sizes), LIST_TILE)
     for f0, size in grid_chunks(tiles, 1):
         _live_slot_kernel[(len(sizes), size)](flag, live, table, ivs.of, ivs.info, ivs.table, prog.width_t, B, n, W,
                                               f0, TILE = LIST_TILE)

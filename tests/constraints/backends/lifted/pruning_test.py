@@ -58,7 +58,8 @@ def sum_path(request, monkeypatch):
     import pyjuice.constraints.backends.lifted.forward as F
     from pyjuice.constraints.backends.lifted.kernels import sum as lifted_sum
     monkeypatch.setattr(lifted_sum, "DENSE_MIN_BLOCK", 1 << 30 if request.param == "fused" else 1)
-    monkeypatch.setattr(F, "DENSE_PRUNE_MIN_COLUMNS", 0 if request.param == "dense_pruned" else 1 << 30)
+    monkeypatch.setattr(F, "prune_dense", (lambda ncols, live: live < ncols) if request.param == "dense_pruned" else
+                        (lambda ncols, live: False))
     return request.param
 
 

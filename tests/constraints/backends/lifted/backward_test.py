@@ -52,11 +52,14 @@ def evidence(pattern, n, B = 6, seed = 0):
     return data, missing
 
 
-@pytest.fixture(params = ["fused", "dense"])
+@pytest.fixture(params = ["fused", "dense", "dense_unpruned"])
 def sum_path(request, monkeypatch):
+    """The fused sum kernels, or the dense path with its products on the live columns only or on every column (the
+    dead ones read too: they must hold -inf)."""
     from pyjuice.constraints.backends.lifted.kernels import sum as lifted_sum
     monkeypatch.setattr(lifted_sum, "DENSE_MIN_BLOCK", 1 << 30 if request.param == "fused" else 1)
-    monkeypatch.setattr(F, "DENSE_PRUNE_MIN_COLUMNS", 0)
+    monkeypatch.setattr(F, "prune_dense", (lambda ncols, live: False) if request.param == "dense_unpruned" else
+                        (lambda ncols, live: live < ncols))
     return request.param
 
 
@@ -184,6 +187,27 @@ def test_top_down_values_match_the_reference(kind, name, pattern, sum_path, buil
     data, missing = evidence(pattern, n)
     assert_top_down_close(cc, top_down_blocks(cc, data, missing)[0], reference.top_down(cc, data, missing), data,
                           missing)
+
+
+@pytest.mark.parametrize("kind", list(KINDS))
+def test_dead_slots_hold_neg_inf(kind, sum_path, build_pc, reference):
+    """A batch whose lanes (sample, slot) span several programs per node, under an observed prefix (one live column
+    per sample at the boundaries in it): a program of dead lanes only (a sum child's, in the pruning order) still
+    writes -inf over the NaN, as a dead slot's value is a term of live ones (the dense sum path on every column reads
+    it); the live slots match the reference."""
+    n = KINDS[kind]
+    cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
+    prog, dev = cc._lifted_program(), cc.pc.params.device
+    data, missing = evidence("prefix", n, B = 48)
+    B = data.size(0)
+    got, plan = top_down_blocks(cc, data, missing, policy = "sample")
+    x = torch.where(missing, 0, data).to(dev)
+    obs_class = torch.where(missing.to(dev), -1, cc.token_classes.token_class[x]).contiguous()
+    pruning = prune(prog, obs_class, B)
+    for r in range(len(cc.sum_regions)):
+        a, b = prog.sum_ivs[prog.reg_iv_host[r]]
+        assert torch.isneginf(got[r][:, ~live_slots(cc, pruning.live, a, b, B).to(dev)]).all(), r
+    assert_top_down_close(cc, got, reference.top_down(cc, data, missing), data, missing)
 
 
 @pytest.mark.parametrize("kind", ["pd", "pd_prod_dominated", "hand", "hmm"])

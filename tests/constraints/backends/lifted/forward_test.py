@@ -301,7 +301,7 @@ def test_stacked_dense_weights(tied, dense_pruning, reference, monkeypatch):
     and on the live ones only (evidence pruning)."""
     import pyjuice.constraints.backends.lifted.forward as F
     if dense_pruning:
-        monkeypatch.setattr(F, "DENSE_PRUNE_MIN_COLUMNS", 0)              # the live-column path at these sizes
+        monkeypatch.setattr(F, "prune_dense", lambda ncols, live: live < ncols)   # the live-column path, always
     n = 6
     pc, other = blocks_hmm(n, tied, seed = 0), blocks_hmm(n, tied, seed = 1)
     cc = jc.compile(CONSTRAINTS["contains"](), pc)
@@ -340,7 +340,7 @@ def test_wide_products_are_not_stacked(dense_pruning, reference, monkeypatch):
     pyjuice.fast_inference scope too, and copies no weights."""
     import pyjuice.constraints.backends.lifted.forward as F
     if dense_pruning:
-        monkeypatch.setattr(F, "DENSE_PRUNE_MIN_COLUMNS", 0)
+        monkeypatch.setattr(F, "prune_dense", lambda ncols, live: live < ncols)
     monkeypatch.setattr(F, "STACK_MAX_COLUMNS", {"fp32": -1, "tf32": -1})
     n = 6
     cc = jc.compile(CONSTRAINTS["contains"](), blocks_hmm(n, tied = True, seed = 0))
@@ -359,7 +359,7 @@ def test_the_stacked_weights_are_what_is_multiplied(dense_pruning, monkeypatch):
     crosses each transition once, so the marginal moves by log 2 per run -- the product reads the copy."""
     import pyjuice.constraints.backends.lifted.forward as F
     if dense_pruning:
-        monkeypatch.setattr(F, "DENSE_PRUNE_MIN_COLUMNS", 0)
+        monkeypatch.setattr(F, "prune_dense", lambda ncols, live: live < ncols)
     n = 6
     cc = jc.compile(CONSTRAINTS["contains"](), blocks_hmm(n, tied = True, seed = 0))
     data, missing = evidence(n, 4)
@@ -412,6 +412,25 @@ def test_one_exp_lse_step_is_the_two_exp_one():
     assert torch.equal(out[True][0], out[False][0])
     assert torch.equal(out[True][1], out[False][1])
     assert torch.isfinite(out[True][1]).all() and (out[True][1][4 * per:5 * per] == 0).all()
+
+
+def test_live_columns_are_shifted_and_exponentiated():
+    """The dense sum paths' pre-op (sum.py's ``_live_shifted_exp``): the first ``num_live`` columns of a pruning order,
+    gathered from a block taller than a program's row tile (and a row stride past its width), each shifted by its
+    maximum and exponentiated, transposed; a column of -inf gives zeros."""
+    from pyjuice.constraints.backends.lifted.kernels.sum import _live_shifted_exp
+    g = torch.Generator().manual_seed(0)
+    x = (torch.randn(2500, 48, generator = g) * 4).cuda()
+    x[:, 7] = float("-inf")
+    x[100:2400, 3] = float("-inf")
+    block = x[:, :40]
+    perm = torch.tensor([7, 3, 39, 0, 21, 5], dtype = torch.int32, device = "cuda")
+    ex_t, m = _live_shifted_exp(block, perm, 5)
+    cols = block[:, perm[:5].long()]
+    top = cols.amax(0)
+    assert torch.equal(m, top)
+    torch.testing.assert_close(ex_t, torch.exp(cols - torch.where(torch.isneginf(top), 0.0, top)).t(), rtol = 1e-5,
+                               atol = 0)
 
 
 def test_transition_masses_match_brute_force(build_pc, monkeypatch):

@@ -45,10 +45,9 @@ ALIAS_COPIES = True
 #: and below, nothing gained or losses (64 successors: 256 classes x0.71-0.73 / x1.24, 64 classes x0.81-0.87).
 GROUP_MIN_RATIO = 8
 
-#: Under evidence pruning, a dense sum region computes only its live columns when it has at least this many columns
-#: (batch x slots); below, its product reads the weights whatever the columns, and pruning gains nothing but costs
-#: the host the live columns' count (a synchronization). Either is exact.
-DENSE_PRUNE_MIN_COLUMNS = 256
+#: The fewest columns (batch x slots) a dense sum region needs before evidence pruning pays with more than one live
+#: column (see :func:`prune_dense`).
+DENSE_PRUNE_MIN_COLUMNS = 48
 
 #: Dense node blocks over the same children multiply their stacked weights in one product (see
 #: :func:`~.kernels.sum.stacked_weights`) only up to this many columns per precision (the live ones under evidence
@@ -464,6 +463,19 @@ def _split_aliased(fused, alias_row, alias_reg, elem_first: int, dev):
     return nids, ce, pe, nb_reg, max_slots, (ar, ag, ap)
 
 
+def prune_dense(ncols: int, num_live: int) -> bool:
+    """
+    Whether a dense sum region with ``ncols`` columns (batch x slots), ``num_live`` of them live under evidence
+    pruning, multiplies only its live ones -- exact either way. From the library's dense products at an HMM4096 size
+    (4096 x 4096 stacked weights, fp32 and tf32, 4 to 512 columns, forward and top-down): one live column (or none)
+    always pays -- a matrix-vector product, x1.07-6.2; otherwise pruning pays once the product has left the
+    weight-read floor (from ``DENSE_PRUNE_MIN_COLUMNS`` columns) and at least half the columns are dead (x1.2-2.4
+    with a quarter live), while below, the gather and scatter cost more than they save (x0.74-0.98). Reading
+    ``num_live`` is the query's one wait for the device (see :class:`~.kernels.live.Pruning`).
+    """
+    return num_live < ncols and (num_live <= 1 or (ncols >= DENSE_PRUNE_MIN_COLUMNS and 2 * num_live <= ncols))
+
+
 def _missing(missing_mask: Optional[torch.Tensor], B: int, n: int, dev) -> torch.Tensor:
     if missing_mask is None:
         return torch.zeros(B, n, dtype = torch.bool, device = dev)
@@ -600,8 +612,7 @@ def _sums(cc, parts, block_size: int, nodes: torch.Tensor, element_mars: torch.T
             region = (offsets[r], widths[r], prog.firsts[r])
             ncols = B * prog.slots[r]
             cols = None                                                  # every column live
-            if pruning is not None and ncols >= DENSE_PRUNE_MIN_COLUMNS and \
-                    pruning.num_live[prog.reg_iv_host[r]] < ncols:
+            if pruning is not None and prune_dense(ncols, pruning.num_live[prog.reg_iv_host[r]]):
                 cols = pruning.segment(prog.reg_iv_host[r], ncols)
             stacked = None                                  # stacked if narrow enough and the copy is kept or reused
             width = cols[2] if cols is not None else ncols                                # the product's columns

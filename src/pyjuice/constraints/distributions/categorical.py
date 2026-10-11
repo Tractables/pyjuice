@@ -23,6 +23,9 @@ import torch
 import triton
 import triton.language as tl
 
+from pyjuice.utils.kernel_launcher import triton_jit
+from pyjuice.utils.util import host_cdiv, host_next_power_of_2
+
 #: up to this many classes, the natural-order pass; above, the class-order pass
 NATURAL_ORDER_MAX_CLASSES = 64
 #: sorted positions per chunk of the class-order pass
@@ -69,7 +72,7 @@ def _exact_dot(p, onehot):
     return tl.dot(hi, onehot, input_precision = "tf32") + tl.dot(p - hi, onehot, input_precision = "tf32")
 
 
-@triton.jit
+@triton_jit
 def _natural_order_kernel(table, token_class, out, R, V, C, num_splits, split_len,
                           TU: tl.constexpr, TV: tl.constexpr, TC: tl.constexpr, PARTIAL: tl.constexpr):
     """One program per (tile of rows, split of the tokens): the rows' sums over every class (``PARTIAL``: the
@@ -96,7 +99,7 @@ def _natural_order_kernel(table, token_class, out, R, V, C, num_splits, split_le
                  mask = mask)
 
 
-@triton.jit
+@triton_jit
 def _natural_order_combine(part, out, R, C, num_splits, TU: tl.constexpr, TC: tl.constexpr):
     rows = tl.program_id(0) * TU + tl.arange(0, TU)
     cls = tl.arange(0, TC)
@@ -109,11 +112,11 @@ def _natural_order_combine(part, out, R, C, num_splits, TU: tl.constexpr, TC: tl
 
 def _natural_order(table, token_class, C, out, TU = 32, TV = 64):
     R, V = table.shape
-    TC = max(16, triton.next_power_of_2(C))
-    row_tiles = triton.cdiv(R, TU)
-    splits = max(1, min(triton.cdiv(NATURAL_ORDER_PROGRAMS, row_tiles), triton.cdiv(V, TV * 8)))
-    split_len = triton.cdiv(triton.cdiv(V, splits), TV) * TV
-    splits = triton.cdiv(V, split_len)
+    TC = max(16, host_next_power_of_2(C))
+    row_tiles = host_cdiv(R, TU)
+    splits = max(1, min(host_cdiv(NATURAL_ORDER_PROGRAMS, row_tiles), host_cdiv(V, TV * 8)))
+    split_len = host_cdiv(host_cdiv(V, splits), TV) * TV
+    splits = host_cdiv(V, split_len)
     if splits == 1:
         _natural_order_kernel[(row_tiles,)](table, token_class, out, R, V, C, 1, split_len, TU = TU, TV = TV, TC = TC,
                                             PARTIAL = False, num_warps = 4, num_stages = 2)
@@ -121,10 +124,10 @@ def _natural_order(table, token_class, C, out, TU = 32, TV = 64):
     part = torch.empty(splits, R, C, dtype = torch.float32, device = table.device)
     _natural_order_kernel[(row_tiles * splits,)](table, token_class, part, R, V, C, splits, split_len, TU = TU,
                                                  TV = TV, TC = TC, PARTIAL = True, num_warps = 4, num_stages = 2)
-    _natural_order_combine[(triton.cdiv(R, 16),)](part, out, R, C, splits, TU = 16, TC = TC)
+    _natural_order_combine[(host_cdiv(R, 16),)](part, out, R, C, splits, TU = 16, TC = TC)
 
 
-@triton.jit
+@triton_jit
 def _class_order_kernel(table, order, rank, part, R, V, num_chunks, num_segments, TU: tl.constexpr,
                         CHUNK: tl.constexpr):
     """One program per (tile of rows, chunk of sorted positions), chunks fastest so that a row tile stays in L2:
@@ -146,7 +149,7 @@ def _class_order_kernel(table, order, rank, part, R, V, num_chunks, num_segments
              mask = rmask[:, None] & (idx <= tl.max(local, axis = 0))[None, :])
 
 
-@triton.jit
+@triton_jit
 def _class_order_combine(part, class_rank, seg_lo, seg_hi, out, R, C, num_segments, TU: tl.constexpr,
                          TC: tl.constexpr):
     """One program per (tile of rows, tile of classes): each class's segments summed, then its log mass."""
@@ -170,9 +173,9 @@ def _class_order_combine(part, class_rank, seg_lo, seg_hi, out, R, C, num_segmen
 def _class_order(table, by_class, C, out, TU = 32):
     R, V = table.shape
     part = torch.empty(R, by_class.num_segments, dtype = torch.float32, device = table.device)
-    _class_order_kernel[(triton.cdiv(R, TU) * by_class.num_chunks,)](
+    _class_order_kernel[(host_cdiv(R, TU) * by_class.num_chunks,)](
         table, by_class.order, by_class.rank, part, R, V, by_class.num_chunks, by_class.num_segments, TU = TU,
         CHUNK = by_class.chunk, num_warps = 4)
-    _class_order_combine[(triton.cdiv(R, 16) * triton.cdiv(C, 64),)](
+    _class_order_combine[(host_cdiv(R, 16) * host_cdiv(C, 64),)](
         part, by_class.class_rank, by_class.seg_lo, by_class.seg_hi, out, R, C, by_class.num_segments, TU = 16,
         TC = 64)

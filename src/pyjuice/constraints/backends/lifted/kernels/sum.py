@@ -29,6 +29,9 @@ import torch
 import triton
 import triton.language as tl
 
+from pyjuice.utils.kernel_launcher import triton_jit
+from pyjuice.utils.util import host_cdiv, host_next_power_of_2
+
 from .prod import grid_chunks
 
 #: The fused kernel's tiles (TILE_M, TILE_E, TILE_B, num_warps, num_stages) per product precision, from a sweep on
@@ -50,7 +53,7 @@ def _lse_dot_step(m, acc, x, w, PRECISION: tl.constexpr):
     return m_new, acc * scale[None, :] + tl.dot(w, tl.exp(x - shift[None, :]), input_precision = PRECISION)
 
 
-@triton.jit
+@triton_jit
 def _lifted_sum_kernel(node_mars, element_mars, weights, nids, cids, pids, nb_reg,
                        reg_offset, reg_width, reg_first, reg_slots, a_rows, a_regs, a_pids, perm, reg_perm, reg_live,
                        elem_first, elem_width, B, num_edges, num_alias, num_mtiles, pid0,
@@ -137,16 +140,16 @@ def fused_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch
     """
     num_blocks, num_edges = cids.shape
     tm, te, tb, warps, stages = _TILES[precision]
-    TILE_M = min(tm, max(16, triton.next_power_of_2(block_size)))
-    TILE_E = min(te, max(16, triton.next_power_of_2(num_edges)))
-    TILE_B = min(tb, max(16, triton.next_power_of_2(max_cols)))
-    num_mtiles = triton.cdiv(block_size, TILE_M)
+    TILE_M = min(tm, max(16, host_next_power_of_2(block_size)))
+    TILE_E = min(te, max(16, host_next_power_of_2(num_edges)))
+    TILE_B = min(tb, max(16, host_next_power_of_2(max_cols)))
+    num_mtiles = host_cdiv(block_size, TILE_M)
     a_rows, a_regs, a_pids = aliased if aliased is not None else (cids, cids, cids)
     num_alias = a_rows.size(1) if aliased is not None else 0
-    TILE_A = min(te, max(16, triton.next_power_of_2(num_alias)))
+    TILE_A = min(te, max(16, host_next_power_of_2(num_alias)))
     perm, reg_perm, reg_live = (pruning.perm, pruning.reg_first, pruning.reg_live) if pruning is not None else \
         (cids, cids, cids)
-    for first, size in grid_chunks(triton.cdiv(max_cols, TILE_B), 1):
+    for first, size in grid_chunks(host_cdiv(max_cols, TILE_B), 1):
         _lifted_sum_kernel[(num_blocks * num_mtiles, size)](
             node_mars, element_mars, params, nids, cids, pids, nb_reg, regions["offset"], regions["width"],
             regions["first"], regions["slots"], a_rows, a_regs, a_pids, perm, reg_perm, reg_live, elem_first,
@@ -196,7 +199,7 @@ def _matmul_precision(precision: str):
 _EW_TILE = (32, 128)
 
 
-@triton.jit
+@triton_jit
 def _shifted_exp_kernel(x, ex, m, rows, ncols, x_ld, num_ctiles, TILE_R: tl.constexpr, TILE_C: tl.constexpr):
     """``ex = exp(x - m)`` (``ex`` contiguous [rows, ncols]), ``m`` the column maxima of ``x``; a column of -inf
     is shifted by 0 and stays all 0."""
@@ -211,7 +214,37 @@ def _shifted_exp_kernel(x, ex, m, rows, ncols, x_ld, num_ctiles, TILE_R: tl.cons
     tl.store(ex + r[:, None] * ncols + c[None, :], tl.exp(v - shift[None, :]), mask = mask)
 
 
-@triton.jit
+@triton_jit
+def _live_shifted_exp_kernel(x, perm, ex_t, m, rows, x_ld, TILE_R: tl.constexpr):
+    """One program per live column ``k`` (``perm[k]`` of ``x``, [rows, *] with row stride ``x_ld``): its maximum
+    ``m[k]`` and ``ex_t[k, :] = exp(x[:, perm[k]] - m[k])`` -- the live columns gathered, shifted and exponentiated in
+    one pass, stored transposed (contiguous per column) for the product to read as ``ex_t.t()``."""
+    k = tl.program_id(0)
+    col = tl.load(perm + k).to(tl.int64)
+    big = tl.full([TILE_R], float("-inf"), dtype = tl.float32)
+    for r0 in range(0, rows, TILE_R):
+        r = r0 + tl.arange(0, TILE_R)
+        big = tl.maximum(big, tl.load(x + r.to(tl.int64) * x_ld + col, mask = r < rows, other = float("-inf")))
+    top = tl.max(big, axis = 0)
+    tl.store(m + k, top)
+    shift = tl.where(top == float("-inf"), 0.0, top)
+    for r0 in range(0, rows, TILE_R):
+        r = r0 + tl.arange(0, TILE_R)
+        v = tl.load(x + r.to(tl.int64) * x_ld + col, mask = r < rows, other = float("-inf"))
+        tl.store(ex_t + k.to(tl.int64) * rows + r, tl.exp(v - shift), mask = r < rows)
+
+
+def _live_shifted_exp(x: torch.Tensor, perm: torch.Tensor, num_live: int):
+    """``(ex_t, m)`` of :func:`_live_shifted_exp_kernel`: [num_live, rows] and [num_live] for ``x`` [rows, *]."""
+    rows = x.size(0)
+    ex_t = torch.empty(num_live, rows, dtype = x.dtype, device = x.device)
+    m = torch.empty(num_live, dtype = x.dtype, device = x.device)
+    if num_live > 0:
+        _live_shifted_exp_kernel[(num_live,)](x, perm, ex_t, m, rows, x.stride(0), TILE_R = 1024, num_warps = 4)
+    return ex_t, m
+
+
+@triton_jit
 def _log_add_kernel(out, m, rows, ncols, ld, num_ctiles, TILE_R: tl.constexpr, TILE_C: tl.constexpr):
     """``out = log(out) + m`` in place, ``m`` the column maxima :func:`_shifted_exp_kernel` shifted by (a column of
     -inf has a product of 0, and log 0 - inf = -inf: no guard needed)."""
@@ -224,7 +257,7 @@ def _log_add_kernel(out, m, rows, ncols, ld, num_ctiles, TILE_R: tl.constexpr, T
     tl.store(ptr, tl.log(tl.load(ptr, mask = mask, other = 1.0)) + shift[None, :], mask = mask)
 
 
-@triton.jit
+@triton_jit
 def _log_scatter_kernel(out, prod, m, rank, rows, ncols, ld, num_live, num_ctiles, TILE_R: tl.constexpr,
                         TILE_C: tl.constexpr):
     """``out[:, c] = log(prod[:, rank[c]]) + m[rank[c]]`` for every live column ``c`` of ``out``, -inf for the others
@@ -276,7 +309,7 @@ def dense_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch
     elems = element_mars[:element_mars.numel() // elem_width * elem_width].view(-1, elem_width)
     nodes = node_mars[offset:offset + (node_mars.numel() - offset) // width * width].view(-1, width)
     TILE_R, TILE_C = _EW_TILE
-    num_ctiles = triton.cdiv(ncols, TILE_C)
+    num_ctiles = host_cdiv(ncols, TILE_C)
     if live is not None:
         _dense_sum_live(nodes, elems, params, groups, E, BS, first, elem_first, ncols, precision, live, stacked)
         return
@@ -285,14 +318,14 @@ def dense_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch
             x = elems[c0 - elem_first:c0 - elem_first + E, :ncols]
             m = x.amax(dim = 0)
             ex = torch.empty(E, ncols, dtype = x.dtype, device = x.device)
-            _shifted_exp_kernel[(triton.cdiv(E, TILE_R) * num_ctiles,)](x, ex, m, E, ncols, elem_width, num_ctiles,
-                                                                       TILE_R = TILE_R, TILE_C = TILE_C)
+            _shifted_exp_kernel[(host_cdiv(E, TILE_R) * num_ctiles,)](x, ex, m, E, ncols, elem_width, num_ctiles,
+                                                                     TILE_R = TILE_R, TILE_C = TILE_C)
             for w, nid in _products(blocks, params, E, BS, stacked.get(c0)):
                 rows = w.size(0)
                 out = nodes[nid - first:nid - first + rows, :ncols]
                 torch.mm(w, ex, out = out)
-                _log_add_kernel[(triton.cdiv(rows, TILE_R) * num_ctiles,)](out, m, rows, ncols, width, num_ctiles,
-                                                                          TILE_R = TILE_R, TILE_C = TILE_C)
+                _log_add_kernel[(host_cdiv(rows, TILE_R) * num_ctiles,)](out, m, rows, ncols, width, num_ctiles,
+                                                                        TILE_R = TILE_R, TILE_C = TILE_C)
 
 
 def _dense_sum_live(nodes, elems, params, groups, E, BS, first, elem_first, ncols, precision, live, stacked):
@@ -301,17 +334,12 @@ def _dense_sum_live(nodes, elems, params, groups, E, BS, first, elem_first, ncol
     TILE_R, TILE_C = _EW_TILE
     with _matmul_precision(precision):
         for c0, blocks in groups.items():
-            x = torch.index_select(elems[c0 - elem_first:c0 - elem_first + E, :ncols], 1, perm[:num_live])  # [E, live]
-            m = x.amax(dim = 0)
-            live_tiles = triton.cdiv(num_live, TILE_C)
-            if num_live > 0:
-                _shifted_exp_kernel[(triton.cdiv(E, TILE_R) * live_tiles,)](x, x, m, E, num_live, num_live, live_tiles,
-                                                                           TILE_R = TILE_R, TILE_C = TILE_C)
+            ex_t, m = _live_shifted_exp(elems[c0 - elem_first:c0 - elem_first + E], perm, num_live)    # [live, E]
             for w, nid in _products(blocks, params, E, BS, stacked.get(c0)):
                 rows = w.size(0)
-                prod = torch.mm(w, x)                                              # [rows, live]
-                num_ctiles = triton.cdiv(ncols, TILE_C)
-                _log_scatter_kernel[(triton.cdiv(rows, TILE_R) * num_ctiles,)](
+                prod = torch.mm(w, ex_t.t())                                       # [rows, live]
+                num_ctiles = host_cdiv(ncols, TILE_C)
+                _log_scatter_kernel[(host_cdiv(rows, TILE_R) * num_ctiles,)](
                     nodes[nid - first:nid - first + rows], prod, m, rank, rows, ncols, width, num_live, num_ctiles,
                     TILE_R = TILE_R, TILE_C = TILE_C)
 
@@ -327,7 +355,7 @@ def _logaddexp_tile(a, b):
     return tl.where(hi == float("-inf"), float("-inf"), tl.log(tl.exp(a - s) + tl.exp(b - s)) + s)
 
 
-@triton.jit
+@triton_jit
 def _lifted_sum_top_down_kernel(element_flows, node_flows, weights, cb_row, cb_reg, cb_add, cb_ivreg, cb_idx, par_ptr,
                                par_nid, par_reg, par_pid, reg_offset, reg_width, reg_first, reg_slots, perm, reg_perm,
                                reg_live, elem_first, elem_width, B, pid0, BS: tl.constexpr, CBS: tl.constexpr,
@@ -412,13 +440,13 @@ def fused_sum_top_down(element_flows: torch.Tensor, node_flows: torch.Tensor, pa
     """
     num_blocks = tables["cb_row"].numel() if idx is None else idx.numel()
     tm, te, tb, warps, stages = _TILES[precision]
-    TILE_C = min(tm, max(16, triton.next_power_of_2(cbs)))
-    TILE_I = min(te, max(16, triton.next_power_of_2(block_size)))
-    TILE_B = min(tb, max(16, triton.next_power_of_2(max_cols)))
-    num_ctiles = triton.cdiv(cbs, TILE_C)
+    TILE_C = min(tm, max(16, host_next_power_of_2(cbs)))
+    TILE_I = min(te, max(16, host_next_power_of_2(block_size)))
+    TILE_B = min(tb, max(16, host_next_power_of_2(max_cols)))
+    num_ctiles = host_cdiv(cbs, TILE_C)
     perm, reg_perm, reg_live = (pruning.perm, pruning.reg_first, pruning.reg_live) if pruning is not None else \
         (tables["cb_row"], tables["cb_row"], tables["cb_row"])
-    for first, size in grid_chunks(triton.cdiv(max_cols, TILE_B), 1):
+    for first, size in grid_chunks(host_cdiv(max_cols, TILE_B), 1):
         _lifted_sum_top_down_kernel[(num_blocks * num_ctiles, size)](
             element_flows, node_flows, params, tables["cb_row"], tables["cb_reg"], tables["cb_add"], tables["cb_ivreg"],
             tables["cb_row"] if idx is None else idx, tables["par_ptr"], tables["par_nid"], tables["par_reg"],
@@ -428,7 +456,7 @@ def fused_sum_top_down(element_flows: torch.Tensor, node_flows: torch.Tensor, pa
             INDEXED = idx is not None, num_warps = warps, num_stages = stages)
 
 
-@triton.jit
+@triton_jit
 def _log_accumulate_kernel(out, prod, m, rows, ncols, ld, num_ctiles, TILE_R: tl.constexpr, TILE_C: tl.constexpr):
     """``out = logaddexp(out, log(prod) + m)`` (``prod`` contiguous [rows, ncols])."""
     r = (tl.program_id(0) // num_ctiles) * TILE_R + tl.arange(0, TILE_R)
@@ -442,7 +470,7 @@ def _log_accumulate_kernel(out, prod, m, rows, ncols, ld, num_ctiles, TILE_R: tl
     tl.store(ptr, _logaddexp_tile(tl.load(ptr, mask = mask, other = float("-inf")), v), mask = mask)
 
 
-@triton.jit
+@triton_jit
 def _log_scatter_accumulate_kernel(out, prod, m, rank, rows, ncols, ld, num_live, num_ctiles, TILE_R: tl.constexpr,
                                    TILE_C: tl.constexpr):
     """``out[:, c] = logaddexp(out[:, c], log(prod[:, rank[c]]) + m[rank[c]])`` for every live column ``c``; dead
@@ -490,34 +518,29 @@ def dense_sum_top_down(element_flows: torch.Tensor, node_flows: torch.Tensor, pa
             if live is None:
                 m = x.amax(dim = 0)
                 ex = torch.empty(rows, ncols, dtype = x.dtype, device = x.device)
-                num_ctiles = triton.cdiv(ncols, TILE_C)
-                _shifted_exp_kernel[(triton.cdiv(rows, TILE_R) * num_ctiles,)](x, ex, m, rows, ncols, width, num_ctiles,
-                                                                              TILE_R = TILE_R, TILE_C = TILE_C)
+                num_ctiles = host_cdiv(ncols, TILE_C)
+                _shifted_exp_kernel[(host_cdiv(rows, TILE_R) * num_ctiles,)](x, ex, m, rows, ncols, width, num_ctiles,
+                                                                            TILE_R = TILE_R, TILE_C = TILE_C)
                 if add:
                     prod = torch.mm(wt, ex)
-                    _log_accumulate_kernel[(triton.cdiv(E, TILE_R) * num_ctiles,)](
+                    _log_accumulate_kernel[(host_cdiv(E, TILE_R) * num_ctiles,)](
                         out, prod, m, E, ncols, elem_width, num_ctiles, TILE_R = TILE_R, TILE_C = TILE_C)
                 else:
                     torch.mm(wt, ex, out = out[:, :ncols])
-                    _log_add_kernel[(triton.cdiv(E, TILE_R) * num_ctiles,)](out, m, E, ncols, elem_width, num_ctiles,
-                                                                           TILE_R = TILE_R, TILE_C = TILE_C)
+                    _log_add_kernel[(host_cdiv(E, TILE_R) * num_ctiles,)](out, m, E, ncols, elem_width, num_ctiles,
+                                                                         TILE_R = TILE_R, TILE_C = TILE_C)
             else:
                 perm, rank, num_live = live
-                xl = torch.index_select(x, 1, perm[:num_live])                                  # [rows, live]
-                m = xl.amax(dim = 0)
-                live_tiles = triton.cdiv(num_live, TILE_C)
-                if num_live > 0:
-                    _shifted_exp_kernel[(triton.cdiv(rows, TILE_R) * live_tiles,)](
-                        xl, xl, m, rows, num_live, num_live, live_tiles, TILE_R = TILE_R, TILE_C = TILE_C)
-                prod = torch.mm(wt, xl)                                                         # [E, live]
-                num_ctiles = triton.cdiv(ncols, TILE_C)
+                ex_t, m = _live_shifted_exp(x, perm, num_live)                                  # [live, rows]
+                prod = torch.mm(wt, ex_t.t())                                                   # [E, live]
+                num_ctiles = host_cdiv(ncols, TILE_C)
                 kernel = _log_scatter_accumulate_kernel if add else _log_scatter_kernel
-                kernel[(triton.cdiv(E, TILE_R) * num_ctiles,)](out, prod, m, rank, E, ncols, elem_width, num_live,
-                                                              num_ctiles, TILE_R = TILE_R, TILE_C = TILE_C)
+                kernel[(host_cdiv(E, TILE_R) * num_ctiles,)](out, prod, m, rank, E, ncols, elem_width, num_live,
+                                                            num_ctiles, TILE_R = TILE_R, TILE_C = TILE_C)
             add = True                                                        # the run's later blocks add to the first
 
 
-@triton.jit
+@triton_jit
 def _fill_dead_rows_kernel(node_flows, rows, reg_offset, reg_width, reg_first, num_tiles, TILE: tl.constexpr):
     """Sum rows of ``node_flows`` set to -inf over their whole width: one program per (``(row, region)`` of ``rows``,
     tile of ``TILE`` columns)."""
@@ -539,6 +562,6 @@ def fill_dead_rows(node_flows: torch.Tensor, rows: torch.Tensor, regions: dict, 
     :param max_width: the widest of their regions' rows
     """
     TILE = 1024
-    num_tiles = triton.cdiv(max_width, TILE)
+    num_tiles = host_cdiv(max_width, TILE)
     _fill_dead_rows_kernel[(rows.size(0) * num_tiles,)](node_flows, rows, regions["offset"], regions["width"],
                                                         regions["first"], num_tiles, TILE = TILE)

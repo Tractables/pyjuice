@@ -37,6 +37,8 @@ import triton
 import triton.language as tl
 
 from pyjuice.layer.kernels import autotune
+from pyjuice.utils.kernel_launcher import triton_jit
+from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
 from ....distributions.categorical import _exact_dot
 from ..plan import Reachability, _tile_any
@@ -189,7 +191,7 @@ def _lse_value(m, acc):
     return tl.log(acc) + tl.where(m == float("-inf"), 0.0, m)
 
 
-@triton.jit
+@triton_jit
 def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, class_mars, mass_row, trans, entry_ptr,
                         entry_succ, entry_x, width, iv_of, iv_info, iv_table, live, steps, reg_offset, reg_width,
                         reg_first, prior_mars, prior_offset, prior_width, reg_prior, out_first, out_width, temp_width,
@@ -270,7 +272,7 @@ def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
         tl.store(op + idx, val, mask = m)
 
 
-@triton.jit
+@triton_jit
 def _input_block_group_kernel(element_mars, node_mars, temp, obs_class, next_col, class_mars, mass_row, width, iv_of,
                               iv_info, iv_table, live, steps, groups, reg_offset, reg_width, reg_first, prior_mars,
                               prior_offset, prior_width, reg_prior, out_first, out_width, temp_width, B, n, W, C,
@@ -334,7 +336,7 @@ def _input_block_group_kernel(element_mars, node_mars, temp, obs_class, next_col
         tl.store(op[:, None] + idx[None, :], val, mask = gm[:, None] & m[None, :])
 
 
-@triton.jit
+@triton_jit
 def _block_input_kernel(element_mars, node_mars, temp, obs_class, next_col, class_mars, mass_row, trans, pred_ptr,
                         pred_col, pred_x, width, iv_of, iv_info, iv_table, live, steps, reg_offset, reg_width,
                         reg_first, prior_mars, prior_offset, prior_width, reg_prior, out_first, out_width, temp_width,
@@ -532,7 +534,7 @@ def _block_block_program(element_mars, node_mars, temp, width, iv_of, iv_info, l
     return g, t0, t1, t2, E, M, X, lpos, rpos, opos, lp, rp, op, mb, lrow
 
 
-@triton.jit
+@triton_jit
 def _block_block_kernel(element_mars, node_mars, temp, width, iv_of, iv_info, iv_table, live, steps, triples,
                         skip_bits, reg_offset, reg_width, reg_first, prior_mars, prior_offset, prior_width, reg_prior,
                         out_first, out_width, temp_width, B, n, W, TILES_I, TILES_J, WORDS, SPLIT, GROUP, exact_below,
@@ -603,7 +605,7 @@ def _block_block_kernel(element_mars, node_mars, temp, width, iv_of, iv_info, iv
                     tl.store(op + sl, tl.where(valid, out, float("-inf")), mask = om & (sl >= 0))
 
 
-@triton.jit
+@triton_jit
 def _copy_kernel(element_mars, node_mars, temp, iv_of, iv_info, steps, reg_offset, reg_width, reg_first, prior_mars,
                  prior_offset, prior_width, reg_prior, out_first, out_width, temp_width, B, n, pid0,
                  L_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, TILE: tl.constexpr):
@@ -720,7 +722,7 @@ def transition_job(rows: torch.Tensor, dev):
     [tiles, 3] (first row, number of rows, position) cutting them into tiles of at most ``TS`` rows at one position
     (fewer when there are few rows, so that there are enough programs).
     """
-    TS = min(TRANSITION_TILES["TS"], max(16, triton.next_power_of_2(rows.size(0)) // 32))
+    TS = min(TRANSITION_TILES["TS"], max(16, host_next_power_of_2(rows.size(0)) // 32))
     rows = rows[torch.argsort(rows[:, 1], stable = True)]
     pos, counts = torch.unique_consecutive(rows[:, 1], return_counts = True)
     tiles, start = [], 0
@@ -731,7 +733,7 @@ def transition_job(rows: torch.Tensor, dev):
     return i32(rows), i32(tiles), TS
 
 
-@triton.jit
+@triton_jit
 def _transition_kernel(class_mars, mass_row, trans, rows, tiles, pair_of, entry_ptr, width, W, C, input_start,
                        num_qtiles, pid0, TS: tl.constexpr, QT: tl.constexpr, TP: tl.constexpr, TC: tl.constexpr):
     """
@@ -779,10 +781,10 @@ def transition_masses(trans, job, class_mars, prog):
     tt, cfg = prog.trans, TRANSITION_TILES
     W, C = prog.next_col.size(1), prog.next_col.size(2)
     QT = cfg["QT"]
-    while QT > 1 and tiles.size(0) * triton.cdiv(max(prog.width), QT) < cfg["programs"]:
+    while QT > 1 and tiles.size(0) * host_cdiv(max(prog.width), QT) < cfg["programs"]:
         QT //= 2
-    num_qtiles = triton.cdiv(max(prog.width), QT)
-    TP = min(64, max(16, triton.next_power_of_2(tt.max_pairs)))
+    num_qtiles = host_cdiv(max(prog.width), QT)
+    TP = min(64, max(16, host_next_power_of_2(tt.max_pairs)))
     for first, size in grid_chunks(tiles.size(0) * num_qtiles, 0):
         _transition_kernel[(size,)](class_mars, prog.mass_row, trans, rows, tiles, tt.pair_of, tt.entry_ptr,
                                     prog.width_t, W, C,
@@ -886,12 +888,12 @@ BLOCK_BLOCK_PROGRAMS_PER_SM = 16
 
 
 def _tile(cols: int) -> int:
-    return min(256, max(16, triton.next_power_of_2(cols)))
+    return min(256, max(16, host_next_power_of_2(cols)))
 
 
 def _flat_tile(lanes: int) -> int:
     """Lanes per program of a step whose output is flattened (sample, entry column, exit column)."""
-    return min(512, max(128, triton.next_power_of_2(lanes) // 8))
+    return min(512, max(128, host_next_power_of_2(lanes) // 8))
 
 
 #: An ``input @ block`` launch runs its steps in groups (see :func:`_input_block_group_kernel`) only when a step's
@@ -953,9 +955,9 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, class_mar
                         def input_block_group(cfg):
                             G, one_exp = cfg
                             firsts = groups[G]
-                            G = triton.next_power_of_2(G)            # lanes per group (a group may be shorter)
+                            G = host_next_power_of_2(G)            # lanes per group (a group may be shorter)
                             tile = min(_flat_tile(B * S_max), 1024 // G)
-                            for first, size in grid_chunks(triton.cdiv(B * S_max, tile), 1):
+                            for first, size in grid_chunks(host_cdiv(B * S_max, tile), 1):
                                 _input_block_group_kernel[(firsts.numel() - 1, size)](
                                     element_mars, node_mars, temp, obs_class, prog.next_col, class_mars,
                                     prog.mass_row, prog.width_t, ivs.of, ivs.info, ivs.table, live, part, firsts, B = B,
@@ -966,13 +968,13 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, class_mar
                         # the group sizes the Program built (its default first), each step form: timed per shape (the
                         # steps rounded up to a power of 2, so that queries running subsets of a launch share choices)
                         cands = [(G, one_exp) for one_exp in INPUT_BLOCK_ONE_EXP for G in groups]
-                        key = ("lifted_input_block_group", kinds, prune, C, triton.next_power_of_2(S),
-                               triton.next_power_of_2(B * S_max), tuple(groups))
+                        key = ("lifted_input_block_group", kinds, prune, C, host_next_power_of_2(S),
+                               host_next_power_of_2(B * S_max), tuple(groups))
                         input_block_group(autotune.pick(key, cands, input_block_group))   # outputs overwritten
                     elif form == "input_block":
                         r_kind, out_temp, (out_full, *r_full) = kinds
                         tile = _flat_tile(B * S_max)
-                        for first, size in grid_chunks(triton.cdiv(B * S_max, tile), 1):
+                        for first, size in grid_chunks(host_cdiv(B * S_max, tile), 1):
                             _input_block_kernel[(s1 - s0, size)](
                                 element_mars, node_mars, temp, obs_class, prog.next_col, class_mars, prog.mass_row,
                                 trans, tt.entry_ptr, tt.entry_succ, tt.entry_x, prog.width_t, ivs.of, ivs.info,
@@ -983,7 +985,7 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, class_mar
                     else:
                         l_kind, out_temp, (out_full, l_full) = kinds
                         tile = _flat_tile(B * S_max)
-                        for first, size in grid_chunks(triton.cdiv(B * S_max, tile), 1):
+                        for first, size in grid_chunks(host_cdiv(B * S_max, tile), 1):
                             _block_input_kernel[(s1 - s0, size)](
                                 element_mars, node_mars, temp, obs_class, prog.next_col, class_mars, prog.mass_row,
                                 trans, tt.pred_ptr, tt.pred_col, tt.pred_x, prog.width_t, ivs.of, ivs.info, ivs.table,
@@ -999,10 +1001,10 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, class_mar
                 def block_block(cfg):
                     TM, TN, TK, warps = cfg
                     assert TK == skip.tk and TM % skip.tm == 0 and TN % skip.tn == 0
-                    tiles = triton.cdiv(E_max, TM) * triton.cdiv(X_max, TN)
-                    split = min(tiles, triton.cdiv(BLOCK_BLOCK_PROGRAMS_PER_SM * prog.num_sms, S * B))
-                    group = triton.cdiv(tiles, max(1, split))
-                    split = triton.cdiv(tiles, group)                     # no group past the widest step's tiles
+                    tiles = host_cdiv(E_max, TM) * host_cdiv(X_max, TN)
+                    split = min(tiles, host_cdiv(BLOCK_BLOCK_PROGRAMS_PER_SM * prog.num_sms, S * B))
+                    group = host_cdiv(tiles, max(1, split))
+                    split = host_cdiv(tiles, group)                     # no group past the widest step's tiles
                     for first, size in grid_chunks(S * B * split, 0):
                         _block_block_kernel[(size,)](
                             element_mars, node_mars, temp, prog.width_t, ivs.of, ivs.info, ivs.table, live, steps,
@@ -1014,12 +1016,12 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, class_mar
                             num_warps = warps, num_stages = 1, **common)
 
                 key = ("lifted_block_block", kinds, prune, exact, SKIP_EMPTY_TILES, PRODUCT_PRECISION, B,
-                       triton.next_power_of_2(S), E_max, X_max)
+                       host_next_power_of_2(S), E_max, X_max)
                 block_block(autotune.pick(key, BLOCK_BLOCK_TILES, block_block))   # outputs overwritten: timed in place
             else:                                                            # "copy"
                 l_kind, out_temp = kinds
                 tile = _tile(S_max * B)
-                for first, size in grid_chunks(triton.cdiv(S_max * B, tile), 1):
+                for first, size in grid_chunks(host_cdiv(S_max * B, tile), 1):
                     _copy_kernel[(S, size)](
                         element_mars, node_mars, temp, ivs.of, ivs.info, steps, B = B, n = n, pid0 = first,
                         L_KIND = l_kind, OUT_TEMP = out_temp, TILE = tile, num_warps = 4, **common)
