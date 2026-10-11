@@ -313,3 +313,226 @@ def _dense_sum_live(nodes, elems, params, groups, E, BS, first, elem_first, ncol
                 _log_scatter_kernel[(triton.cdiv(rows, TILE_R) * num_ctiles,)](
                     nodes[nid - first:nid - first + rows], prod, m, rank, rows, ncols, width, num_live, num_ctiles,
                     TILE_R = TILE_R, TILE_C = TILE_C)
+
+
+# -------------------------------------------------------------------------------------------------
+# The top-down pass: a sum's children from the sum
+# -------------------------------------------------------------------------------------------------
+
+@triton.jit
+def _logaddexp_tile(a, b):
+    hi = tl.maximum(a, b)
+    s = tl.where(hi == float("-inf"), 0.0, hi)
+    return tl.where(hi == float("-inf"), float("-inf"), tl.log(tl.exp(a - s) + tl.exp(b - s)) + s)
+
+
+@triton.jit
+def _lifted_sum_top_down_kernel(element_flows, node_flows, weights, cb_row, cb_reg, cb_add, cb_ivreg, par_ptr, par_nid,
+                               par_reg, par_pid, reg_offset, reg_width, reg_first, reg_slots, perm, reg_perm, reg_live,
+                               elem_first, elem_width, B, pid0, BS: tl.constexpr, CBS: tl.constexpr,
+                               TILE_C: tl.constexpr, TILE_I: tl.constexpr, TILE_B: tl.constexpr,
+                               PRECISION: tl.constexpr, PRUNE: tl.constexpr):
+    """One program per (child block, tile of its children, tile of columns): ``O_child[c, col] = log sum over the
+    block's parent node blocks and their nodes i of w[c, i] exp(O_node[i, col])``, an online log-sum-exp over tiles
+    of parent nodes with the products on tensor cores -- the forward's fused kernel with children and nodes
+    exchanged (``w[c, i] = weights[pid + c * BS + i]``). A child block is element rows (``cb_reg`` -1), written to
+    ``element_flows``, or a sum node block's rows (an aliased copy), written to ``node_flows``; written, or log-added
+    to what is there (``cb_add``). Pruned, the columns are the interval's live ones first, as in the forward."""
+    pid_cm = tl.program_id(0)
+    pid_c = pid0 + tl.program_id(1)
+    cb = pid_cm // ((CBS + TILE_C - 1) // TILE_C)
+    ct = pid_cm % ((CBS + TILE_C - 1) // TILE_C)
+    ivreg = tl.load(cb_ivreg + cb)
+    ncols = B * tl.load(reg_slots + ivreg)
+    col0 = pid_c * TILE_B
+    if col0 < ncols:
+        k = col0 + tl.arange(0, TILE_B)
+        kmask = k < ncols
+        if PRUNE:
+            num_live = tl.load(reg_live + ivreg)
+            cols = tl.load(perm + tl.load(reg_perm + ivreg) + k, mask = kmask, other = 0)
+            cmask = kmask & (k < num_live)
+            skip = col0 >= num_live                                           # a dead tile reads nothing
+        else:
+            cols = k
+            cmask = kmask
+            skip = False
+        offs_c = ct * TILE_C + tl.arange(0, TILE_C)
+        cm = offs_c < CBS
+        m = tl.full([TILE_B], float("-inf"), dtype = tl.float32)
+        acc = tl.zeros([TILE_C, TILE_B], dtype = tl.float32)
+        p0 = tl.load(par_ptr + cb)
+        p1 = tl.load(par_ptr + cb + 1)
+        if not skip:
+            for p in range(p0, p1):
+                nid = tl.load(par_nid + p).to(tl.int64)
+                reg = tl.load(par_reg + p)
+                pid = tl.load(par_pid + p).to(tl.int64)
+                base = tl.load(reg_offset + reg) + (nid - tl.load(reg_first + reg)) * tl.load(reg_width + reg)
+                width = tl.load(reg_width + reg)
+                for i0 in range(0, BS, TILE_I):
+                    offs_i = i0 + tl.arange(0, TILE_I)
+                    im = offs_i < BS
+                    w = tl.load(weights + pid + offs_c[:, None] * BS + offs_i[None, :],
+                                mask = cm[:, None] & im[None, :], other = 0.0)                # [TILE_C, TILE_I]
+                    x = tl.load(node_flows + base + offs_i.to(tl.int64)[:, None] * width + cols[None, :],
+                                mask = im[:, None] & cmask[None, :], other = float("-inf"))     # [TILE_I, TILE_B]
+                    m, acc = _lse_dot_step(m, acc, x, w, PRECISION)
+        out = tl.log(acc) + tl.where(m == float("-inf"), 0.0, m)[None, :]
+        row = tl.load(cb_row + cb).to(tl.int64)
+        creg = tl.load(cb_reg + cb)
+        add = tl.load(cb_add + cb)
+        if creg < 0:                                                          # element rows
+            ptr = element_flows + (row - elem_first + offs_c.to(tl.int64))[:, None] * elem_width + cols[None, :]
+        else:                                                                 # an aliased sum's rows
+            crow = row - tl.load(reg_first + creg) + offs_c.to(tl.int64)
+            ptr = node_flows + tl.load(reg_offset + creg) + crow[:, None] * tl.load(reg_width + creg) + cols[None, :]
+        mask = cm[:, None] & kmask[None, :]
+        if add:
+            out = _logaddexp_tile(tl.load(ptr, mask = mask, other = float("-inf")), out)
+        tl.store(ptr, out, mask = mask)
+
+
+def fused_sum_top_down(element_flows: torch.Tensor, node_flows: torch.Tensor, params: torch.Tensor, tables: dict,
+                      regions: dict, elem_first: int, elem_width: int, batch_size: int, block_size: int, cbs: int,
+                      max_cols: int, precision: str, pruning = None):
+    """
+    The top-down values of the children of a sum layer's fused node blocks (:func:`_lifted_sum_top_down_kernel`).
+
+    :param tables: child-block-major: ``cb_row``, ``cb_reg`` (-1 for element rows), ``cb_add``, ``cb_ivreg`` (a region
+        of the children's interval, for pruning), ``par_ptr``, ``par_nid``, ``par_reg``, ``par_pid`` (int32 / int64
+        device tensors, see :mod:`..backward`)
+    :param cbs: the child block size of these children
+    :param max_cols: the most columns any child block has (``batch_size`` x its slots)
+    """
+    num_blocks = tables["cb_row"].numel()
+    tm, te, tb, warps, stages = _TILES[precision]
+    TILE_C = min(tm, max(16, triton.next_power_of_2(cbs)))
+    TILE_I = min(te, max(16, triton.next_power_of_2(block_size)))
+    TILE_B = min(tb, max(16, triton.next_power_of_2(max_cols)))
+    num_ctiles = triton.cdiv(cbs, TILE_C)
+    perm, reg_perm, reg_live = (pruning.perm, pruning.reg_first, pruning.reg_live) if pruning is not None else \
+        (tables["cb_row"], tables["cb_row"], tables["cb_row"])
+    for first, size in grid_chunks(triton.cdiv(max_cols, TILE_B), 1):
+        _lifted_sum_top_down_kernel[(num_blocks * num_ctiles, size)](
+            element_flows, node_flows, params, tables["cb_row"], tables["cb_reg"], tables["cb_add"], tables["cb_ivreg"],
+            tables["par_ptr"], tables["par_nid"], tables["par_reg"], tables["par_pid"], regions["offset"],
+            regions["width"], regions["first"], regions["slots"], perm, reg_perm, reg_live, elem_first, elem_width,
+            batch_size, first, BS = block_size, CBS = cbs, TILE_C = TILE_C, TILE_I = TILE_I, TILE_B = TILE_B,
+            PRECISION = precision, PRUNE = pruning is not None, num_warps = warps, num_stages = stages)
+
+
+@triton.jit
+def _log_accumulate_kernel(out, prod, m, rows, ncols, ld, num_ctiles, TILE_R: tl.constexpr, TILE_C: tl.constexpr):
+    """``out = logaddexp(out, log(prod) + m)`` (``prod`` contiguous [rows, ncols])."""
+    r = (tl.program_id(0) // num_ctiles) * TILE_R + tl.arange(0, TILE_R)
+    c = (tl.program_id(0) % num_ctiles) * TILE_C + tl.arange(0, TILE_C)
+    cmask = c < ncols
+    mask = (r < rows)[:, None] & cmask[None, :]
+    shift = tl.load(m + c, mask = cmask, other = 0.0)
+    r = r.to(tl.int64)
+    v = tl.log(tl.load(prod + r[:, None] * ncols + c[None, :], mask = mask, other = 0.0)) + shift[None, :]
+    ptr = out + r[:, None] * ld + c[None, :]
+    tl.store(ptr, _logaddexp_tile(tl.load(ptr, mask = mask, other = float("-inf")), v), mask = mask)
+
+
+@triton.jit
+def _log_scatter_accumulate_kernel(out, prod, m, rank, rows, ncols, ld, num_live, num_ctiles, TILE_R: tl.constexpr,
+                                   TILE_C: tl.constexpr):
+    """``out[:, c] = logaddexp(out[:, c], log(prod[:, rank[c]]) + m[rank[c]])`` for every live column ``c``; dead
+    columns untouched (they hold -inf from the first writer)."""
+    r = (tl.program_id(0) // num_ctiles) * TILE_R + tl.arange(0, TILE_R)
+    c = (tl.program_id(0) % num_ctiles) * TILE_C + tl.arange(0, TILE_C)
+    cmask = c < ncols
+    k = tl.load(rank + c, mask = cmask, other = -1)
+    alive = k >= 0
+    mask = (r < rows)[:, None] & (cmask & alive)[None, :]
+    shift = tl.load(m + k, mask = cmask & alive, other = 0.0)
+    r = r.to(tl.int64)
+    v = tl.log(tl.load(prod + r[:, None] * num_live + k[None, :], mask = mask, other = 0.0)) + shift[None, :]
+    ptr = out + r[:, None] * ld + c[None, :]
+    tl.store(ptr, _logaddexp_tile(tl.load(ptr, mask = mask, other = float("-inf")), v), mask = mask)
+
+
+def dense_sum_top_down(element_flows: torch.Tensor, node_flows: torch.Tensor, params: torch.Tensor, blocks, E: int,
+                      block_size: int, region: tuple, c0: int, elem_first: int, elem_width: int, ncols: int,
+                      precision: str, add: bool, live = None, stacked = None, piece = None):
+    """
+    The top-down values of the ``E`` children ``c0 ..`` of a run of dense node blocks of one sum region:
+    ``O_elem = log(W^T @ exp(O_node - m)) + m`` with ``m`` the column maximum of the node blocks' top-down values,
+    written to ``element_flows``, or log-added to it (``add``); ``W^T`` is the parameter buffer's own ``[E, BS]``
+    view per block (``stacked``: the blocks' :func:`stacked_weights`, transposed for free).
+
+    :param blocks: ``[(k, nid, p0)]`` as in :func:`dense_sum`'s groups (consecutive rows when ``stacked``)
+    :param region: ``(offset, width, first)`` of the node blocks' sum region
+    :param live: None, or the interval's ``(perm, rank, num_live)`` (see :meth:`~.live.Pruning.segment`)
+    :param piece: None, or ``(lo, hi)``: only the children ``c0 + lo .. c0 + hi``
+    """
+    offset, width, first = region
+    BS = block_size
+    lo, hi = piece if piece is not None else (0, E)
+    elems = element_flows[:element_flows.numel() // elem_width * elem_width].view(-1, elem_width)
+    nodes = node_flows[offset:offset + (node_flows.numel() - offset) // width * width].view(-1, width)
+    out = elems[c0 + lo - elem_first:c0 + hi - elem_first]
+    E = hi - lo
+    TILE_R, TILE_C = _EW_TILE
+    products = [(stacked.t()[lo:hi], blocks[0][1], stacked.size(0))] if stacked is not None else \
+        [(params[p0 + lo * BS:p0 + hi * BS].view(E, BS), nid, BS) for _, nid, p0 in blocks]
+    with _matmul_precision(precision):
+        for wt, nid, rows in products:
+            x = nodes[nid - first:nid - first + rows, :ncols]
+            if live is None:
+                m = x.amax(dim = 0)
+                ex = torch.empty(rows, ncols, dtype = x.dtype, device = x.device)
+                num_ctiles = triton.cdiv(ncols, TILE_C)
+                _shifted_exp_kernel[(triton.cdiv(rows, TILE_R) * num_ctiles,)](x, ex, m, rows, ncols, width, num_ctiles,
+                                                                              TILE_R = TILE_R, TILE_C = TILE_C)
+                if add:
+                    prod = torch.mm(wt, ex)
+                    _log_accumulate_kernel[(triton.cdiv(E, TILE_R) * num_ctiles,)](
+                        out, prod, m, E, ncols, elem_width, num_ctiles, TILE_R = TILE_R, TILE_C = TILE_C)
+                else:
+                    torch.mm(wt, ex, out = out[:, :ncols])
+                    _log_add_kernel[(triton.cdiv(E, TILE_R) * num_ctiles,)](out, m, E, ncols, elem_width, num_ctiles,
+                                                                           TILE_R = TILE_R, TILE_C = TILE_C)
+            else:
+                perm, rank, num_live = live
+                xl = torch.index_select(x, 1, perm[:num_live])                                  # [rows, live]
+                m = xl.amax(dim = 0)
+                live_tiles = triton.cdiv(num_live, TILE_C)
+                if num_live > 0:
+                    _shifted_exp_kernel[(triton.cdiv(rows, TILE_R) * live_tiles,)](
+                        xl, xl, m, rows, num_live, num_live, live_tiles, TILE_R = TILE_R, TILE_C = TILE_C)
+                prod = torch.mm(wt, xl)                                                         # [E, live]
+                num_ctiles = triton.cdiv(ncols, TILE_C)
+                kernel = _log_scatter_accumulate_kernel if add else _log_scatter_kernel
+                kernel[(triton.cdiv(E, TILE_R) * num_ctiles,)](out, prod, m, rank, E, ncols, elem_width, num_live,
+                                                              num_ctiles, TILE_R = TILE_R, TILE_C = TILE_C)
+            add = True                                                        # the run's later blocks add to the first
+
+
+@triton.jit
+def _fill_dead_rows_kernel(node_flows, rows, reg_offset, reg_width, reg_first, num_tiles, TILE: tl.constexpr):
+    """Sum rows of ``node_flows`` set to -inf over their whole width: one program per (``(row, region)`` of ``rows``,
+    tile of ``TILE`` columns)."""
+    k = tl.program_id(0) // num_tiles
+    row = tl.load(rows + k * 2)
+    reg = tl.load(rows + k * 2 + 1)
+    width = tl.load(reg_width + reg)
+    base = node_flows + tl.load(reg_offset + reg) + (row - tl.load(reg_first + reg)).to(tl.int64) * width
+    c = (tl.program_id(0) % num_tiles) * TILE + tl.arange(0, TILE)
+    tl.store(base + c, tl.full([TILE], float("-inf"), dtype = tl.float32), mask = c < width)
+
+
+def fill_dead_rows(node_flows: torch.Tensor, rows: torch.Tensor, regions: dict, max_width: int):
+    """
+    The top-down value -inf on the sum rows no chain of edges from the root reaches (no launch writes them).
+
+    :param rows: int32 [D, 2], ``(row, region)`` per dead row
+    :param regions: ``offset``, ``width`` and ``first`` of every sum region (device tensors)
+    :param max_width: the widest of their regions' rows
+    """
+    TILE = 1024
+    num_tiles = triton.cdiv(max_width, TILE)
+    _fill_dead_rows_kernel[(rows.size(0) * num_tiles,)](node_flows, rows, regions["offset"], regions["width"],
+                                                        regions["first"], num_tiles, TILE = TILE)

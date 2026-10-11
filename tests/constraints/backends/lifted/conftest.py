@@ -32,10 +32,10 @@ kept: an accepted string of length ``n`` passes through active states only. Then
 * the root is ``log sum_j V[root, sample, 0, j]``: boundary 0 holds only the initial state, and every
   active state at boundary ``n`` is accepting.
 
-``reference_outside`` gives every node's OUTSIDE block, of the same shape, top-down from the root:
-``O[node, sample, i, j]`` is the log of everything ``p(C, e)`` multiplies the node's entry ``(i, j)`` by, over the
-positions outside its scope. ``reference_conditional`` reads the conditionals of target positions off the outside
-blocks of their input nodes.
+``reference_top_down`` gives every node's TOP-DOWN block, of the same shape, from the root: ``O[node, sample, i, j]``
+is the log of everything ``p(C, e)`` multiplies the node's entry ``(i, j)`` by, over the positions outside its scope
+(its log outside value; pyjuice's top-down probability, with the evidence and the automaton's columns).
+``reference_conditional`` reads the conditionals of target positions off the top-down blocks of their input nodes.
 
 Parameters are read from the PC's live parameter tensors (never from the node objects, which are not
 kept in sync), so in-place parameter updates are seen by the next call.
@@ -226,7 +226,7 @@ def _log_index_add(dest, idx, src):
     return torch.log(acc) + m
 
 
-def reference_outside(cc, data, missing_mask = None, inside = None) -> dict:
+def reference_top_down(cc, data, missing_mask = None, inside = None) -> dict:
     """
     Every node group's block of log OUTSIDE values, of the same shape as its inside block, by node group: ``O[node,
     sample, i, j]`` is the log of the derivative of ``p(C, e)`` with respect to the node's (linear) inside value at
@@ -312,12 +312,12 @@ def reference_conditional(cc, data, missing_mask = None, targets = None) -> torc
     if not layout.satisfiable:
         return torch.full((int(targets.sum()), V), -float("inf"), dtype = DTYPE, device = dev)
     inside = reference_inside(cc, data, missing_mask)
-    outside = reference_outside(cc, data, missing_mask, inside)
+    top_down = reference_top_down(cc, data, missing_mask, inside)
 
     token_class = layout.token_class.to(dev)
     scores = torch.full((missing.size(0), n, V), -float("inf"), dtype = DTYPE, device = dev)   # log p(x_t = v, e, C)
     wanted = targets.any(dim = 0)
-    for ns, O in outside.items():
+    for ns, O in top_down.items():
         if not ns.is_input():
             continue
         t = ns.scope.to_list()[0]
@@ -343,10 +343,10 @@ def reference_conditional(cc, data, missing_mask = None, targets = None) -> torc
 def reference():
     """The reference implementation (this module's functions), for tests in this directory."""
     import types
-    return types.SimpleNamespace(marginal = reference_marginal, inside = reference_inside, outside = reference_outside,
-                                 conditional = reference_conditional, sum_weights = sum_weights,
-                                 categorical_probs = categorical_probs, input_block = input_block,
-                                 product_child_index = product_child_index,
+    return types.SimpleNamespace(marginal = reference_marginal, inside = reference_inside,
+                                 top_down = reference_top_down, conditional = reference_conditional,
+                                 sum_weights = sum_weights, categorical_probs = categorical_probs,
+                                 input_block = input_block, product_child_index = product_child_index,
                                  log_matmul = log_matmul, log_weighted_sum = log_weighted_sum)
 
 
@@ -410,6 +410,25 @@ def hand_left(V):
     return summate(multiply(pre, x[4]), multiply(s03, x[4]), num_node_blocks = 1, block_size = 1)
 
 
+def hand_shared(V):
+    """Sums of one layer over overlapping sets of products of sums, over 4 variables: ``a01`` over ``p01``, ``c01``
+    over ``r01`` and ``b01`` over ``p01``, ``q01`` and ``r01``, whose children are two runs of rows (``r01``'s come
+    first, ``c01`` being first), the first starting in rows ``a01`` reads too. Where the dense path is taken, ``a01``
+    and ``c01`` are dense and ``b01`` is not."""
+    cat = lambda: dists.Categorical(num_cats = V)
+    x = [inputs(v, num_node_blocks = 2, block_size = 2, dist = cat()) for v in range(4)]
+    s0, s0b, s1 = (summate(x[v], num_node_blocks = 2, block_size = 2) for v in (0, 0, 1))
+    p01 = multiply(s0, s1)
+    q01 = multiply(s0b, s1)
+    r01 = multiply(s0, s1, edge_ids = torch.tensor([[1, 1], [0, 0]]))
+    c01 = summate(r01, num_node_blocks = 1, block_size = 2)
+    b01 = summate(p01, q01, r01, num_node_blocks = 1, block_size = 2)
+    a01 = summate(p01, num_node_blocks = 2, block_size = 2)
+    s23 = summate(multiply(x[2], x[3]), num_node_blocks = 2, block_size = 2)
+    one = lambda s: multiply(s, s23, edge_ids = torch.tensor([[0, 0], [0, 1]]))     # a one-block sum next to s23
+    return summate(one(c01), one(b01), multiply(a01, s23), num_node_blocks = 1, block_size = 1)
+
+
 def left_linear(n, V, num_latents = 8):
     """The mirror of an HMM: a sum over every prefix, each over the previous prefix times the next input (`block @
     input`, whose left blocks have the initial state as their only entry column), every input tied to the first."""
@@ -434,6 +453,7 @@ PC_KINDS = {
     "hand_permuted": 5,          # :func:`hand_permuted`
     "hand_unit": 4,              # :func:`hand_unit`
     "hand_left": 5,              # :func:`hand_left`
+    "hand_shared": 4,            # :func:`hand_shared`
 }
 
 
@@ -466,7 +486,8 @@ def build_pc(kind, n, V, seed = 0, device = torch.device("cuda:0"), perturbation
         base.init_parameters(perturbation = 2.0)
         ns = juice.blockify(base, sparsity_tolerance = 0.5, max_target_block_size = 4)
     else:
-        ns = {"hand": hand_built, "hand_permuted": hand_permuted, "hand_unit": hand_unit, "hand_left": hand_left}[kind](V)
+        ns = {"hand": hand_built, "hand_permuted": hand_permuted, "hand_unit": hand_unit, "hand_left": hand_left,
+              "hand_shared": hand_shared}[kind](V)
     ns.init_parameters(perturbation = perturbation)
     return juice.compile(ns, verbose = False, **compile_kwargs).to(device)
 

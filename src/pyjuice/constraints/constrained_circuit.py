@@ -168,6 +168,24 @@ class ConstrainedCircuit:
             self._layouts[B] = layout
         return layout
 
+    def _flows(self, batch_size: int, bufs: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        The top-down buffers of a batch (see :mod:`~.backends.lifted.backward`): ``node_flows`` (laid out as
+        ``node_mars``, storage of its own, allocated on first use) and ``element_flows``, which is ``element_mars``'s
+        storage -- the top-down pass never reads the product insides there.
+        """
+        return dict(node_flows = self._storage_view("node_flows", bufs["layout"]["node_size"]),
+                    element_flows = bufs["element_mars"])
+
+    def _top_down_program(self):
+        """The top-down pass's tables (:class:`~.backends.lifted.backward.TopDownProgram`), built on first use and
+        kept with the forward's."""
+        prog = self._lifted_program()
+        if getattr(prog, "top_down", None) is None:
+            from .backends.lifted.backward import top_down_program
+            prog.top_down = top_down_program(self)
+        return prog.top_down
+
     def _prior_buffer(self) -> Dict[str, Any]:
         """
         ``prior_mars``: the input-independent inside values (see :mod:`~.backends.lifted.query_plan`), laid out as

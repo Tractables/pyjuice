@@ -817,18 +817,34 @@ def skip_masks(reach: Reachability, triples: Sequence[Tuple[int, int, int]], tm:
     The :class:`SkipMasks` of ``triples`` (``(t0, t1, t2)`` boundaries, in the order their index refers to), from
     the occupancy ``reach`` keeps; ``tm``, ``tn`` and ``tk`` are multiples of its tile.
     """
+    return skip_masks_for(reach, [((a, b, False), (b, c, False)) for a, b, c in triples], tm, tn, tk, device)
+
+
+def skip_masks_for(reach: Reachability, specs, tm: int = 16, tn: int = 16, tk: int = 16, device = None) -> SkipMasks:
+    """
+    The :class:`SkipMasks` of log-space products ``A @ B`` whose operands are blocks or transposed blocks: spec ``k``
+    is ``((a, b, transposed), (c, d, transposed))``, ``A`` the block over ``[a, b)`` (rows: its entry columns, shared:
+    its exit columns; transposed, the other way round) and ``B`` the block over ``[c, d)`` (shared: entry, output
+    columns: exit; or the other way round). A forward step is ``((t0, t1, False), (t1, t2, False))``; the top-down
+    pass reads one operand transposed.
+    """
     T = reach.tile
     if tm % T or tn % T or tk % T:
         raise ValueError(f"Tiles ({tm}, {tn}, {tk}) must be multiples of the occupancy tile {T}.")
-    if len(triples) == 0:
+    if len(specs) == 0:
         return SkipMasks(torch.zeros(1, dtype = torch.int32, device = device), 0, 0, 1, tm, tn, tk)
-    lefts = sorted({(a, b) for a, b, _ in triples})
-    rights = sorted({(b, c) for _, b, c in triples})
-    L = [_tile_any(reach.occupancy(a, b), tm // T, tk // T) for a, b in lefts]     # [entry tiles, chunks]
-    R = [_tile_any(reach.occupancy(b, c), tk // T, tn // T) for b, c in rights]    # [chunks, exit tiles]
+
+    def occ(a, b, transposed):
+        m = reach.occupancy(a, b)
+        return m.t() if transposed else m
+
+    lefts = sorted({a for a, _ in specs})
+    rights = sorted({b for _, b in specs})
+    L = [_tile_any(occ(*a), tm // T, tk // T) for a in lefts]                   # [output row tiles, chunks]
+    R = [_tile_any(occ(*b), tk // T, tn // T) for b in rights]                  # [chunks, output column tiles]
     I = max(m.size(0) for m in L)
     J = max(m.size(1) for m in R)
-    words = max(1, math.ceil(max(m.size(1) for m in L) / 32))
+    words = max(1, math.ceil(max(max(m.size(1) for m in L), max(m.size(0) for m in R)) / 32))
     NC = 32 * words
 
     def stack(ms, shape):
@@ -838,14 +854,14 @@ def skip_masks(reach: Reachability, triples: Sequence[Tuple[int, int, int]], tm:
         return out
 
     Ls, Rs = stack(L, (I, NC)), stack(R, (NC, J))
-    lpos = {iv: k for k, iv in enumerate(lefts)}
-    rpos = {iv: k for k, iv in enumerate(rights)}
-    li = torch.tensor([lpos[a, b] for a, b, _ in triples], dtype = torch.long)
-    ri = torch.tensor([rpos[b, c] for _, b, c in triples], dtype = torch.long)
+    lpos = {a: k for k, a in enumerate(lefts)}
+    rpos = {b: k for k, b in enumerate(rights)}
+    li = torch.tensor([lpos[a] for a, _ in specs], dtype = torch.long)
+    ri = torch.tensor([rpos[b] for _, b in specs], dtype = torch.long)
     shifts = torch.arange(32, dtype = torch.int64)
     chunk = max(1, (1 << 26) // (I * J * NC))
     parts = []
-    for g0 in range(0, len(triples), chunk):
+    for g0 in range(0, len(specs), chunk):
         need = Ls[li[g0:g0 + chunk], :, None, :] & Rs[ri[g0:g0 + chunk]].transpose(1, 2)[:, None, :, :]
         w = (need.view(need.size(0), I, J, words, 32).to(torch.int64) << shifts).sum(dim = -1)
         parts.append(torch.where(w >= 2 ** 31, w - 2 ** 32, w).to(torch.int32).flatten())

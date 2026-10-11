@@ -33,7 +33,7 @@ DEV = torch.device("cuda:0")
 
 # kind (see `PC_KINDS` in conftest.py) -> n, for the identity tests and for brute force
 KINDS = {"hmm": 6, "hmm_untied": 6, "hmm_block_sparse": 6, "left_linear": 6, "pd": 8, "pd_prod_dominated": 8, "pd_blockified": 8,
-         "hand": 5, "hand_permuted": 5, "hand_unit": 4, "hand_left": 5}
+         "hand": 5, "hand_permuted": 5, "hand_unit": 4, "hand_left": 5, "hand_shared": 4}
 TINY = {"hmm": 5, "hmm_untied": 5, "hmm_block_sparse": 5, "left_linear": 5, "pd": 4, "pd_prod_dominated": 5, "pd_blockified": 5,
         "hand": 5, "hand_permuted": 5, "hand_unit": 4, "hand_left": 5}
 
@@ -203,7 +203,7 @@ def test_reference_conditional_equals_brute_force(kind, name, reference, build_p
 
 @pytest.mark.parametrize("name", ["keyword", "random"])
 @pytest.mark.parametrize("kind", list(KINDS))
-def test_outside_cut(kind, name, reference, build_pc):
+def test_top_down_cut(kind, name, reference, build_pc):
     """Every term of the lifted circuit's polynomial holds exactly one input entry per position (the circuit is
     smooth and decomposable), so at every position t, p(C, e) = the sum over t's input nodes and their (i, j)
     entries of inside x outside: every input node's outside value is checked, observed positions included."""
@@ -212,7 +212,7 @@ def test_outside_cut(kind, name, reference, build_pc):
     cc = jc.compile(constraints(V, n)[name], pc)
     data, missing = evidence(n, V)
     inside = reference.inside(cc, data, missing)
-    outside = reference.outside(cc, data, missing, inside)
+    outside = reference.top_down(cc, data, missing, inside)
     want = reference.marginal(cc, data, missing)[:, 0]
     fin = torch.isfinite(want)
     assert fin.any()
