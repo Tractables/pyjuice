@@ -7,6 +7,7 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, Optional
 
+import numpy as np
 import torch
 
 from pyjuice.utils.fast_inference import is_active, param_copies_allowed, register_layer
@@ -14,7 +15,7 @@ from pyjuice.utils.fast_inference import is_active, param_copies_allowed, regist
 from .distributions import TokenClasses, lookup
 from .language.base import Constraint
 from .structure import SHAPES, PCStructure, analyze_structure
-from .backends.lifted.plan import BoundaryLayout, build_pc_tables, buffer_layout
+from .backends.lifted.plan import BoundaryLayout, _align, build_pc_tables, buffer_layout
 
 
 class ConstrainedCircuit:
@@ -100,6 +101,7 @@ class ConstrainedCircuit:
         self._kept_stacks = None                    # stacked dense weights kept by a scope (see `_weight_stacks`)
         self._prior_valid = None                    # which input-independent values prior_mars holds (`_prior_validity`)
         self._prior_kept = False                    # kept by a `pyjuice.fast_inference` scope
+        self._prior_flows_state = None              # the input-independent top-down values (see `_prior_flows`)
 
     @property
     def pc(self):
@@ -128,6 +130,7 @@ class ConstrainedCircuit:
         self._class_rows, self._class_mars, self._class_mars_kept = None, None, False
         self._kept_stacks = None
         self._prior_valid, self._prior_kept = None, False
+        self._prior_flows_state = None
         self._program = None                        # and the forward's tables built again there
         self._device = device
         return self
@@ -197,6 +200,37 @@ class ConstrainedCircuit:
         return dict(mars = self._storage_view("prior_mars", layout["node_size"]), offset = layout["sum_offsets"],
                     width = layout["sum_widths"], offset_t = layout["sum_offsets_t"], width_t = layout["sum_widths_t"])
 
+    def _prior_flows(self, regions) -> Dict[str, Any]:
+        """
+        ``prior_flows``: the input-independent top-down values (see :mod:`~.backends.lifted.query_plan`), for a batch
+        of one, in storage of its own laid out APPEND-ONLY: a sum region (node) gets its rows, filled with -inf, the
+        first time a query keeps its values once (``regions``, bool per sum region), and keeps them, so the storage
+        holds only the regions ever kept once and never more than one sample's ``node_flows``. Its values are kept as
+        ``prior_mars``'s (see :meth:`_prior_validity`). A dict with ``flows`` (flat), every region's ``offset`` and
+        ``width`` (Python ints; offset -1 where it has no rows yet) and ``offset_t`` / ``width_t`` (int64 on the
+        device), and ``valid`` (bool per sum region on the host: the regions whose values it holds).
+        """
+        pf = self._prior_flows_state
+        if pf is None:
+            R = len(self.sum_regions)
+            pf = self._prior_flows_state = dict(flows = torch.empty(0, device = self._device), offset = [-1] * R,
+                                                width = [0] * R, size = 0, valid = np.zeros(R, dtype = bool))
+        new = [r for r in np.nonzero(regions)[0].tolist() if pf["offset"][r] < 0]
+        if new or "offset_t" not in pf:
+            start = pf["size"]
+            for r in new:
+                first, end, slots = self.sum_regions[r]
+                pf["offset"][r], pf["width"][r] = pf["size"], _align(slots)
+                pf["size"] += (end - first) * pf["width"][r]
+            if pf["size"] > pf["flows"].numel():         # grow by half again, keeping what is there
+                flows = torch.empty(max(pf["size"], pf["flows"].numel() * 3 // 2), device = self._device)
+                flows[:pf["flows"].numel()] = pf["flows"]
+                pf["flows"] = flows
+            pf["flows"][start:pf["size"]] = float("-inf")
+            pf["offset_t"] = torch.tensor([max(o, 0) for o in pf["offset"]], dtype = torch.int64, device = self._device)
+            pf["width_t"] = torch.tensor(pf["width"], dtype = torch.int64, device = self._device)
+        return pf
+
     def _prior_validity(self):
         """
         ``(valid, kept)`` for a query starting now: which inside values ``prior_mars`` holds (bool on the host, one
@@ -206,6 +240,8 @@ class ConstrainedCircuit:
         """
         if self._prior_valid is None or not self._prior_kept:
             self._prior_valid = torch.zeros(len(self._lifted_program().sum_ivs), dtype = torch.bool)
+            if self._prior_flows_state is not None:
+                self._prior_flows_state["valid"][:] = False
             if is_active():
                 self._prior_kept = True
                 register_layer(self)                                # its exit calls `_release_fast_inference_params`
@@ -279,6 +315,11 @@ class ConstrainedCircuit:
             self._class_mars.fill_(float("nan"))
         if poison and "prior_mars" in self._storage:
             self._storage["prior_mars"].fill_(float("nan"))
+        if poison and self._prior_flows_state is not None:      # rows given again (filled with -inf) on next use
+            self._prior_flows_state["flows"].fill_(float("nan"))
+            self._prior_flows_state = dict(self._prior_flows_state, offset = [-1] * len(self.sum_regions),
+                                           width = [0] * len(self.sum_regions), size = 0)
+            self._prior_flows_state.pop("offset_t")
 
     def _lifted_program(self):
         """The lifted forward's tables (:class:`~pyjuice.constraints.backends.lifted.forward.Program`), built on

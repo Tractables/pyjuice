@@ -429,6 +429,17 @@ def hand_shared(V):
     return summate(one(c01), one(b01), multiply(a01, s23), num_node_blocks = 1, block_size = 1)
 
 
+def hand_fold(V):
+    """A product of three sums, ``s01 @ (s2 @ s3)``, over 4 variables, and nothing else: no other sum covers the fold
+    of ``s2`` and ``s3``, which ``s01``'s top-down value reads -- computed for a batch of one when that value is
+    input-independent (nothing observed after position 1), reading ``s2`` and ``s3`` once."""
+    cat = lambda: dists.Categorical(num_cats = V)
+    x = [inputs(v, num_node_blocks = 2, block_size = 2, dist = cat()) for v in range(4)]
+    s01 = summate(multiply(x[0], x[1]), num_node_blocks = 2, block_size = 2)
+    s2, s3 = (summate(x[v], num_node_blocks = 2, block_size = 2) for v in (2, 3))
+    return summate(multiply(s01, s2, s3), num_node_blocks = 1, block_size = 1)
+
+
 def left_linear(n, V, num_latents = 8):
     """The mirror of an HMM: a sum over every prefix, each over the previous prefix times the next input (`block @
     input`, whose left blocks have the initial state as their only entry column), every input tied to the first."""
@@ -454,6 +465,7 @@ PC_KINDS = {
     "hand_unit": 4,              # :func:`hand_unit`
     "hand_left": 5,              # :func:`hand_left`
     "hand_shared": 4,            # :func:`hand_shared`
+    "hand_fold": 4,              # :func:`hand_fold`
 }
 
 
@@ -487,7 +499,7 @@ def build_pc(kind, n, V, seed = 0, device = torch.device("cuda:0"), perturbation
         ns = juice.blockify(base, sparsity_tolerance = 0.5, max_target_block_size = 4)
     else:
         ns = {"hand": hand_built, "hand_permuted": hand_permuted, "hand_unit": hand_unit, "hand_left": hand_left,
-              "hand_shared": hand_shared}[kind](V)
+              "hand_shared": hand_shared, "hand_fold": hand_fold}[kind](V)
     ns.init_parameters(perturbation = perturbation)
     return juice.compile(ns, verbose = False, **compile_kwargs).to(device)
 

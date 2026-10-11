@@ -2,24 +2,33 @@
 The lifted top-down pass (:mod:`pyjuice.constraints.backends.lifted.backward`): every sum node's top-down value (its
 log outside value) against the test reference's (``reference.top_down``), on every kind of PC in conftest.py's
 ``PC_KINDS``, under constraints and every pattern of evidence (pruned, and unpruned where nothing is observed), through
-both sum paths, and where block @ block's shifts flush entries; run twice, the values are identical.
+both sum paths, and where block @ block's shifts flush entries; run twice, the values are identical. Under query plans
+(:mod:`~pyjuice.constraints.backends.lifted.query_plan`): with every policy of keeping values once, a query computes
+exactly the values its targets need; values kept once accumulate across queries, append-only; held values are not
+computed again.
 """
+import contextlib
 import math
 
+import numpy as np
 import pytest
 import torch
 
+import pyjuice as juice
 import pyjuice.constraints as jc
 from pyjuice.constraints.backends.lifted import forward as F
 from pyjuice.constraints.backends.lifted.backward import run_backward
 from pyjuice.constraints.backends.lifted.kernels.live import prune
-from pyjuice.constraints.backends.lifted.query_plan import prior_regions, query_plan
+from pyjuice.constraints.backends.lifted.query_plan import prior_regions, query_plan, top_down_prior
 
 V = 3
 KINDS = {"hmm": 6, "hmm_untied": 6, "hmm_block_sparse": 6, "left_linear": 6, "pd": 8, "pd_prod_dominated": 8,
          "pd_blockified": 8, "hand": 5, "hand_permuted": 5, "hand_unit": 4, "hand_left": 5,
-         "hand_shared": 4}                                                                      # see conftest.py
+         "hand_shared": 4, "hand_fold": 4}                                                      # see conftest.py
 PATTERNS = ["none", "all", "prefix", "suffix", "scattered", "mixed"]
+# keep nothing once; as a query decides; every input-independent value (fast_inference); every input-independent
+# top-down value and no inside value (so the inside values its launches for a batch of one read must be kept once)
+POLICIES = ["sample", "default", "kept", "top_down"]
 CONSTRAINTS = {
     "contains": lambda: jc.DFA.contains([[1, 2]], V),
     "either": lambda: jc.DFA.contains([[2]], V) | jc.DFA.contains([[0, 0]], V),
@@ -51,30 +60,63 @@ def sum_path(request, monkeypatch):
     return request.param
 
 
-def top_down_blocks(cc, data, missing, precision = "fp32"):
-    """The forward then the full top-down pass; every sum region's rows of node_flows, [rows, B * slots] (cloned)."""
-    prog, dev = cc._lifted_program(), cc.pc.params.device
-    B, n = data.size(0), cc.n
-    missing = missing.to(dev)
-    observed = (~missing).any(dim = 0).cpu().numpy()
-    x = torch.where(missing, 0, data.to(dev).long())
-    obs_class = torch.where(missing, -1, cc.token_classes.token_class[x]).contiguous()
-    pruning = prune(prog, obs_class, B) if observed.any() else None
-    valid, kept = cc._prior_validity()
-    plan = query_plan(prog, observed, None, valid.numpy(), prior_regions(prog, observed, B, kept, pruning))
-    bufs = cc._buffers(B)
-    flows = cc._flows(B, bufs)
-    flows["node_flows"].fill_(float("nan"))                                 # every needed slot must be written
-    with torch.no_grad():
-        F.run_forward(cc, bufs, plan, x, missing, obs_class, pruning, precision)
-        valid |= plan.todo
-        run_backward(cc, bufs, flows, plan, x, missing, obs_class, pruning, precision)
-    lay, nf = bufs["layout"], flows["node_flows"]
+def top_down_blocks(cc, data, missing, targets = None, policy = "default", held = None, nan_fill = True,
+                    visit = None):
+    """
+    The forward then the top-down pass of a query under its plan (``policy``: see ``POLICIES``; "kept" runs inside
+    :func:`pyjuice.fast_inference`), node_flows filled with NaN first (``nan_fill``): ``(blocks, plan)``, ``blocks``
+    every sum region's rows of the buffer its values are in -- [rows, B * slots], those kept once repeated per sample
+    (cloned). ``visit(prod_index, bufs, flows, plan)``: see :func:`~pyjuice.constraints.backends.lifted.backward.
+    run_backward`.
+    """
+    with juice.fast_inference() if policy == "kept" else contextlib.nullcontext():
+        prog, td, dev = cc._lifted_program(), cc._top_down_program(), cc.pc.params.device
+        B = data.size(0)
+        missing = missing.to(dev)
+        observed = (~missing).any(dim = 0).cpu().numpy()
+        x = torch.where(missing, 0, data.to(dev).long())
+        obs_class = torch.where(missing, -1, cc.token_classes.token_class[x]).contiguous()
+        pruning = prune(prog, obs_class, B) if observed.any() else None
+        valid, kept = cc._prior_validity()
+        if policy in ("sample", "top_down"):
+            prior = np.zeros(prog.iv_bounds.shape[0], dtype = bool)
+            once = top_down_prior(prog, td, observed, B, True, pruning) if policy == "top_down" else \
+                np.zeros(td.iv_bounds.shape[0], dtype = bool)
+        else:
+            prior = prior_regions(prog, observed, B, kept, pruning)
+            once = top_down_prior(prog, td, observed, B, kept, pruning)
+        pf = cc._prior_flows(np.zeros(len(cc.sum_regions), dtype = bool))
+        plan = query_plan(prog, observed, None if targets is None else targets.cpu().numpy(), valid.numpy(), prior,
+                          top_down = dict(program = td, once = once, valid = pf["valid"].copy(), held = held))
+        bufs = cc._buffers(B)
+        flows = cc._flows(B, bufs)
+        if nan_fill:
+            flows["node_flows"].fill_(float("nan"))         # every needed slot must be written
+        with torch.no_grad():
+            F.run_forward(cc, bufs, plan, x, missing, obs_class, pruning, "fp32")
+            valid |= plan.todo
+            run_backward(cc, bufs, flows, plan, x, missing, obs_class, pruning, "fp32",
+                         visit = None if visit is None else lambda pi: visit(pi, bufs, flows, plan))
+        lay, nf, pf = bufs["layout"], flows["node_flows"], cc._prior_flows_state
+        out = []
+        for r, (first, end, slots) in enumerate(cc.sum_regions):
+            if plan.top_down.once[r]:
+                o, w = pf["offset"][r], pf["width"][r]
+                out.append(pf["flows"][o:o + (end - first) * w].view(end - first, w)[:, :slots].repeat(1, B).clone())
+            else:
+                off, wid = lay["sum_offsets"][r], lay["sum_widths"][r]
+                out.append(nf[off:off + (end - first) * wid].view(end - first, wid)[:, :B * slots].clone())
+        return out, plan
+
+
+def needed_regions(cc, targets):
+    """bool [sum regions]: those whose scope meets a target (all for None)."""
+    prog = cc._lifted_program()
     out = []
-    for r, (first, end, slots) in enumerate(cc.sum_regions):
-        off, wid = lay["sum_offsets"][r], lay["sum_widths"][r]
-        out.append(nf[off:off + (end - first) * wid].view(end - first, wid)[:, :B * slots].clone())
-    return out
+    for r in range(len(cc.sum_regions)):
+        a, b = prog.sum_ivs[prog.reg_iv_host[r]]
+        out.append(targets is None or bool(targets[a:b].any()))
+    return np.asarray(out)
 
 
 def compact(cc, block, a, b, B):
@@ -103,8 +145,9 @@ def live_slots(cc, pruning_live, a, b, B):
     return torch.cat(out)
 
 
-def assert_top_down_close(cc, got, want, data, missing):
-    """Every sum region's top-down values (:func:`top_down_blocks`) against the reference's, on the live slots."""
+def assert_top_down_close(cc, got, want, data, missing, regions = None):
+    """Every sum region's top-down values (:func:`top_down_blocks`) against the reference's, on the live slots (of the
+    ``regions`` marked, bool per sum region, if given)."""
     prog, n, B = cc._lifted_program(), cc.n, data.size(0)
     dev = cc.pc.params.device
     x = torch.where(missing, 0, data).to(dev)
@@ -115,6 +158,8 @@ def assert_top_down_close(cc, got, want, data, missing):
         if not ns.is_sum():
             continue
         r = firsts.index(ns._output_ind_range[0])
+        if regions is not None and not regions[r]:
+            continue
         a, b = prog.sum_ivs[prog.reg_iv_host[r]]
         w = compact(cc, block, a, b, B).float()
         g = got[r]
@@ -137,7 +182,7 @@ def test_top_down_values_match_the_reference(kind, name, pattern, sum_path, buil
     n = KINDS[kind]
     cc = jc.compile(CONSTRAINTS[name](), build_pc(kind, n, V))
     data, missing = evidence(pattern, n)
-    assert_top_down_close(cc, top_down_blocks(cc, data, missing), reference.top_down(cc, data, missing), data,
+    assert_top_down_close(cc, top_down_blocks(cc, data, missing)[0], reference.top_down(cc, data, missing), data,
                           missing)
 
 
@@ -161,7 +206,7 @@ def test_top_down_values_survive_a_wide_dynamic_range(kind, build_pc, reference,
     data[3, 0], data[3, 1] = 1, 2                                           # ... satisfied: state 2
     missing = torch.arange(n)[None, :] >= torch.tensor([0, t, t, t])[:, None]   # sample 0: nothing observed
     monkeypatch.setitem(reference.top_down.__globals__, "DTYPE", torch.float64)
-    assert_top_down_close(cc, top_down_blocks(cc, data, missing), reference.top_down(cc, data, missing), data,
+    assert_top_down_close(cc, top_down_blocks(cc, data, missing)[0], reference.top_down(cc, data, missing), data,
                           missing)
 
 
@@ -170,7 +215,151 @@ def test_top_down_values_are_deterministic(kind, build_pc):
     n = KINDS[kind]
     cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
     data, missing = evidence("mixed", n)
-    a = top_down_blocks(cc, data, missing)
-    b = top_down_blocks(cc, data, missing)
+    a = top_down_blocks(cc, data, missing)[0]
+    b = top_down_blocks(cc, data, missing)[0]
     for x, y in zip(a, b):
         assert torch.equal(x, y)
+
+
+@pytest.mark.parametrize("pattern", ["none", "prefix", "mixed"])
+@pytest.mark.parametrize("policy", POLICIES)
+@pytest.mark.parametrize("kind", list(KINDS))
+def test_top_down_values_under_every_policy(kind, policy, pattern, build_pc, reference):
+    """Values kept once (in prior_flows, read with sample stride 0) or per sample, as the policy decides: the same."""
+    n = KINDS[kind]
+    cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
+    data, missing = evidence(pattern, n)
+    got, plan = top_down_blocks(cc, data, missing, policy = policy)
+    if policy == "sample":
+        assert not plan.top_down.once.any()
+    elif policy == "kept" and pattern == "none":
+        assert plan.top_down.once.all()                 # nothing observed: every value is input-independent
+    assert_top_down_close(cc, got, reference.top_down(cc, data, missing), data, missing)
+
+
+@pytest.mark.parametrize("seed", [0, 1])
+@pytest.mark.parametrize("policy", POLICIES)
+@pytest.mark.parametrize("kind", list(KINDS))
+def test_targets_compute_what_they_need(kind, policy, seed, build_pc, reference):
+    """A query computes the top-down values of the nodes whose scope meets a target, and leaves every other one
+    alone: per-sample rows still NaN, nothing kept once."""
+    n = KINDS[kind]
+    cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
+    data, missing = evidence("mixed", n, seed = seed)
+    g = torch.Generator().manual_seed(seed)
+    targets = torch.zeros(n, dtype = torch.bool)
+    targets[torch.randperm(n, generator = g)[:1 + seed]] = True
+    got, plan = top_down_blocks(cc, data, missing, targets = targets, policy = policy)
+    need = needed_regions(cc, targets.numpy())
+    assert not (plan.top_down.once & ~need).any()
+    assert not (plan.top_down.sample & ~need).any()
+    for r in np.nonzero(~need)[0]:
+        assert torch.isnan(got[r]).all(), r                # untouched
+    assert_top_down_close(cc, got, reference.top_down(cc, data, missing), data, missing, regions = need)
+
+
+@pytest.mark.parametrize("kind", ["pd", "hmm", "left_linear", "hand_shared"])
+def test_values_kept_once_accumulate(kind, build_pc, reference):
+    """Inside one fast_inference scope, two queries observing different sides: the second keeps the first's values
+    once where they still apply (computing none of them again, leaving their rows where they are) and adds its own
+    after them; every value matches the reference."""
+    n = KINDS[kind]
+    cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
+    with juice.fast_inference():
+        data, first = evidence("prefix", n)
+        got, plan = top_down_blocks(cc, data, first)
+        assert_top_down_close(cc, got, reference.top_down(cc, data, first), data, first)
+        pf = cc._prior_flows_state
+        kept, offsets, size = pf["valid"].copy(), list(pf["offset"]), pf["size"]
+        assert kept.any()
+        data, second = evidence("suffix", n, seed = 1)
+        got, plan = top_down_blocks(cc, data, second)
+        assert_top_down_close(cc, got, reference.top_down(cc, data, second), data, second)
+        assert not (plan.top_down.todo & kept).any()     # held from the first query
+        for r in np.nonzero(kept)[0]:
+            assert pf["offset"][r] == offsets[r]         # append-only
+        new = plan.top_down.todo & ~kept
+        assert all(pf["offset"][r] >= size for r in np.nonzero(new)[0])
+
+
+@pytest.mark.parametrize("kind", ["pd", "hmm", "hand_shared"])
+def test_held_values_are_not_computed(kind, build_pc, reference):
+    """A query told the buffers hold some per-sample values (a caching engine's decision) computes none of them and
+    reads them where they are: after a first query of the same evidence, the second holds the nodes whose scope starts
+    at 0 (the root and its kin, parents of the others) and computes only the others, written over with NaN in between;
+    every value matches."""
+    n = KINDS[kind]
+    cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
+    prog = cc._lifted_program()
+    data, missing = evidence("mixed", n)
+    top_down_blocks(cc, data, missing, policy = "sample")
+    held = np.asarray([prog.sum_ivs[prog.reg_iv_host[r]][0] == 0 for r in range(len(cc.sum_regions))])
+    lay, nf = cc._layout(data.size(0)), cc._flows(data.size(0), cc._buffers(data.size(0)))["node_flows"]
+    for r, (first, end, _) in enumerate(cc.sum_regions):
+        if not held[r]:
+            nf[lay["sum_offsets"][r]:lay["sum_offsets"][r] + (end - first) * lay["sum_widths"][r]] = float("nan")
+    got, plan = top_down_blocks(cc, data, missing, policy = "sample", held = held, nan_fill = False)
+    assert not (plan.top_down.sample & held).any()
+    assert plan.top_down.sample[~held].any()
+    assert_top_down_close(cc, got, reference.top_down(cc, data, missing), data, missing)
+
+
+@pytest.mark.parametrize("policy", POLICIES)
+@pytest.mark.parametrize("kind", list(KINDS))
+def test_products_of_target_inputs_get_their_values(kind, policy, build_pc, reference):
+    """A target's scoring reads the top-down values of the products with an input at it: each is computed (where no
+    child needs it too) and in element_flows when its group is visited -- against the reference."""
+    n = KINDS[kind]
+    pc = build_pc(kind, n, V)
+    cc = jc.compile(CONSTRAINTS["contains"](), pc)
+    prog, dev = cc._lifted_program(), pc.params.device
+    data, missing = evidence("mixed", n)
+    B = data.size(0)
+    targets = torch.zeros(n, dtype = torch.bool)
+    targets[n // 2] = True
+    want = reference.top_down(cc, data, missing)
+    x = torch.where(missing, 0, data).to(dev)
+    obs_class = torch.where(missing.to(dev), -1, cc.token_classes.token_class[x]).contiguous()
+    pruning = prune(prog, obs_class, B) if (~missing).any() else None
+    groups = [lg for lg in pc.inner_layer_groups if lg.is_prod()]
+    of = prog.intervals.of.cpu().numpy()
+    checked = []
+
+    def visit(pi, bufs, flows, plan):
+        first, _, _ = cc.element_regions[pi]
+        width = bufs["layout"]["element_widths"][pi]
+        once = plan.top_down.once_iv.cpu().numpy()
+        for layer in groups[pi]:
+            for ns in layer.nodes:
+                if not any(c.is_input() and targets[c.scope.to_list()[0]] for c in ns.chs):
+                    continue
+                scope = sorted(ns.scope.to_list())
+                a, b = scope[0], scope[-1] + 1
+                S = cc.layout.reachability.slots(a, b)
+                lo, hi = ns._output_ind_range
+                rows = flows["element_flows"][(lo - first) * width:(hi - first) * width].view(hi - lo, width)
+                g = rows[:, :S].repeat(1, B) if once[of[a * (n + 1) + b]] else rows[:, :B * S]
+                w = compact(cc, want[ns], a, b, B).float()
+                if pruning is not None:
+                    ls = live_slots(cc, pruning.live, a, b, B).to(dev)
+                    g, w = g[:, ls], w[:, ls]
+                fin = torch.isfinite(w)
+                assert torch.equal(torch.isneginf(g), torch.isneginf(w)), (pi, lo)
+                assert ((g[fin] - w[fin]).abs() <= 1e-5 * w[fin].abs() + n * 1e-6).all(), (pi, lo)
+                checked.append(lo)
+
+    top_down_blocks(cc, data, missing, targets = targets, policy = policy, visit = visit)
+    assert checked
+
+
+@pytest.mark.parametrize("policy", ["default", "top_down", "kept"])
+def test_values_kept_once_read_their_inside_values_once(policy, build_pc, reference):
+    """A top-down value kept once reads inside values for a batch of one -- its siblings', and a fold's operands' --
+    which are kept once too, never read off one sample's pruned ones: hand_fold (whose s01 reads the fold of s2 and s3)
+    with prefixes leaving the automaton in each of its states at position 2, so the samples' live columns differ."""
+    cc = jc.compile(CONSTRAINTS["contains"](), build_pc("hand_fold", 4, V))
+    data = torch.tensor([[0, 0, 0, 0], [0, 1, 0, 0], [1, 2, 0, 0]])
+    missing = (torch.arange(4) >= 2)[None, :].expand(3, 4).contiguous()
+    got, plan = top_down_blocks(cc, data, missing, policy = policy)
+    assert plan.top_down.once.any()
+    assert_top_down_close(cc, got, reference.top_down(cc, data, missing), data, missing)

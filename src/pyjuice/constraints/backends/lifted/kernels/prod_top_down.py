@@ -56,7 +56,8 @@ class TopDownLaunch:
     :ivar parents: int32 [P, fields], the forward step rows, every child's contiguous; ``block_block`` rows carry the
         parent's triple index in a 9th field
     :ivar E_max, X_max, S_max: the most entry columns, exit columns and slots of the children's blocks
-    :ivar rows: host copies (int64) of ``children`` and ``parents`` and every parent's product interval, for plans
+    :ivar host: for query plans, numpy copies: ``children`` [C, 3] (row, region, add), ``ptr``, ``parents``, and every
+        child's (``child_iv``) and parent's (``parent_iv``) interval, by ``prog.intervals``' numbers
     """
 
     form: str
@@ -68,7 +69,7 @@ class TopDownLaunch:
     E_max: int
     X_max: int
     S_max: int
-    rows: Any
+    host: Any
 
 
 @triton.jit
@@ -91,6 +92,21 @@ def _out_flows_ptr(row, element_flows, temp_flows, out_first, out_width, temp_wi
 
 
 @triton.jit
+def _once(once_iv, iv_of, a, b, n):
+    """Whether this query keeps the top-down values of interval ``[a, b)`` once (a batch of one, sample stride 0)."""
+    return tl.load(once_iv + tl.load(iv_of + a * (n + 1) + b)) != 0
+
+
+@triton.jit
+def _child(children_idx, c, INDEXED: tl.constexpr):
+    """The launch's child that program ``c`` owns: the ``c``-th of the plan's index list, or ``c``."""
+    if INDEXED:
+        return tl.load(children_idx + c)
+    else:
+        return c
+
+
+@triton.jit
 def _store_flows(ptr, idx, val, m, add):
     """Write ``val`` at ``ptr + idx``, or log-add it to the value there (``add``)."""
     if add:
@@ -99,11 +115,11 @@ def _store_flows(ptr, idx, val, m, add):
 
 
 @triton.jit
-def _copy_top_down_kernel(element_flows, temp_flows, node_flows, iv_of, iv_info, children, ptr, parents, reg_offset,
-                         reg_width, reg_first, out_first, out_width, temp_width, B, n, pid0,
-                         C_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, TILE: tl.constexpr):
+def _copy_top_down_kernel(element_flows, temp_flows, node_flows, iv_of, iv_info, once_iv, children, children_idx, ptr,
+                         parents, reg_offset, reg_width, reg_first, out_first, out_width, temp_width, B, n, pid0,
+                         C_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, INDEXED: tl.constexpr, TILE: tl.constexpr):
     """One program per child and tile of its ``B * slots`` lanes: the log-sum over its parents' copies."""
-    c = tl.program_id(0)
+    c = _child(children_idx, tl.program_id(0), INDEXED)
     pid = pid0 + tl.program_id(1)
     row = tl.load(children + c * 4 + 0)
     reg = tl.load(children + c * 4 + 1)
@@ -117,27 +133,29 @@ def _copy_top_down_kernel(element_flows, temp_flows, node_flows, iv_of, iv_info,
     if pid * TILE < ncols:
         cols = pid * TILE + tl.arange(0, TILE)
         m = cols < ncols
+        ocols = tl.where(_once(once_iv, iv_of, t0, t2, n), cols % S, cols)  # the parents' values kept once?
         mx = tl.full([TILE], float("-inf"), dtype = tl.float32)
         acc = tl.zeros([TILE], dtype = tl.float32)
         for p in range(p0, p1):
             op = _out_flows_ptr(tl.load(parents + p * 5 + 0), element_flows, temp_flows, out_first, out_width,
                                 temp_width, OUT_TEMP)
-            mx, acc = _lse_step(mx, acc, tl.load(op + cols, mask = m, other = float("-inf")))
+            mx, acc = _lse_step(mx, acc, tl.load(op + ocols, mask = m, other = float("-inf")))
         cp = _flows_ptr(row, reg, node_flows, temp_flows, reg_offset, reg_width, reg_first, temp_width, C_KIND)
         _store_flows(cp, cols, _lse_value(mx, acc), m, add)
 
 
 @triton.jit
 def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mars, obs_class, next_col, class_mars,
-                                mass_row, trans, pred_ptr, pred_col, pred_x, width, iv_of, iv_info, iv_table, live,
-                                children, ptr, parents, reg_offset, reg_width, reg_first, out_first, out_width,
-                                temp_width, B, n, W, C, input_start, pid0, C_KIND: tl.constexpr, OUT_TEMP: tl.constexpr,
-                                GROUPED: tl.constexpr, PRUNE: tl.constexpr, C_FULL: tl.constexpr,
-                                OUT_FULL: tl.constexpr, TILE: tl.constexpr):
+                                mass_row, trans, pred_ptr, pred_col, pred_x, width, iv_of, iv_info, iv_table, once_iv,
+                                live, children, children_idx, ptr, parents, reg_offset, reg_width, reg_first, out_first,
+                                out_width, temp_width, B, n, W, C, input_start, pid0, C_KIND: tl.constexpr,
+                                OUT_TEMP: tl.constexpr, GROUPED: tl.constexpr, PRUNE: tl.constexpr,
+                                C_FULL: tl.constexpr, OUT_FULL: tl.constexpr, INDEXED: tl.constexpr,
+                                TILE: tl.constexpr):
     """The right operand ``R`` over ``[t + 1, t2)`` of ``input @ block`` steps: ``O_R[q, j] = log sum over the
     parents, and over the entries ``(i, class)`` leading to ``q`` at boundary ``t``, of mass + O_out[i, j]``. One
     program per child and tile of its lanes, flattened (sample, slot)."""
-    c = tl.program_id(0)
+    c = _child(children_idx, tl.program_id(0), INDEXED)
     tile = pid0 + tl.program_id(1)
     row = tl.load(children + c * 4 + 0)
     reg = tl.load(children + c * 4 + 1)
@@ -149,6 +167,7 @@ def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
     X = _exit_width(width, t2, n)
     S, _, pairs = _interval(iv_of, iv_info, t + 1, t2, n)                   # the child's slots
     OS, opos, _ = _interval(iv_of, iv_info, t, t2, n)                        # the parents' slots
+    ostride = tl.where(_once(once_iv, iv_of, t, t2, n), 0, OS)              # ... kept once?
     if tile * TILE < B * S:
         idx = tile * TILE + tl.arange(0, TILE)
         m = idx < B * S
@@ -166,7 +185,7 @@ def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
             u = tl.load(parents + p * 7 + 1).to(tl.int64)
             own = tl.load(node_mars + u * B + b, mask = m, other = float("-inf"))   # the observed token's log-prob
             op = _out_flows_ptr(tl.load(parents + p * 7 + 0), element_flows, temp_flows, out_first, out_width,
-                                temp_width, OUT_TEMP) + b * OS
+                                temp_width, OUT_TEMP) + b * ostride
             if GROUPED:
                 masses = trans + tl.load(parents + p * 7 + 6).to(tl.int64)
             else:
@@ -190,15 +209,16 @@ def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
 
 @triton.jit
 def _block_input_top_down_kernel(element_flows, temp_flows, node_flows, node_mars, obs_class, next_col, class_mars,
-                                mass_row, trans, entry_ptr, entry_succ, entry_x, width, iv_of, iv_info, iv_table, live,
-                                children, ptr, parents, reg_offset, reg_width, reg_first, out_first, out_width,
-                                temp_width, B, n, W, C, input_start, pid0, C_KIND: tl.constexpr, OUT_TEMP: tl.constexpr,
-                                GROUPED: tl.constexpr, PRUNE: tl.constexpr, C_FULL: tl.constexpr,
-                                OUT_FULL: tl.constexpr, TILE: tl.constexpr):
+                                mass_row, trans, entry_ptr, entry_succ, entry_x, width, iv_of, iv_info, iv_table,
+                                once_iv, live, children, children_idx, ptr, parents, reg_offset, reg_width, reg_first,
+                                out_first, out_width, temp_width, B, n, W, C, input_start, pid0, C_KIND: tl.constexpr,
+                                OUT_TEMP: tl.constexpr, GROUPED: tl.constexpr, PRUNE: tl.constexpr,
+                                C_FULL: tl.constexpr, OUT_FULL: tl.constexpr, INDEXED: tl.constexpr,
+                                TILE: tl.constexpr):
     """The left operand ``L`` over ``[t0, t)`` of ``block @ input`` steps (output over ``[t0, t + 1)``): ``O_L[i, q] =
     log sum over the parents and over the entries ``(successor, class)`` of ``q`` at boundary ``t`` of mass +
     O_out[i, successor]``."""
-    c = tl.program_id(0)
+    c = _child(children_idx, tl.program_id(0), INDEXED)
     tile = pid0 + tl.program_id(1)
     row = tl.load(children + c * 4 + 0)
     reg = tl.load(children + c * 4 + 1)
@@ -211,6 +231,7 @@ def _block_input_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
     X = _exit_width(width, t + 1, n)                                         # the parents' exit columns
     S, _, pairs = _interval(iv_of, iv_info, t0, t, n)
     OS, opos, _ = _interval(iv_of, iv_info, t0, t + 1, n)
+    ostride = tl.where(_once(once_iv, iv_of, t0, t + 1, n), 0, OS)           # the parents' values kept once?
     end = t + 1 == n
     if tile * TILE < B * S:
         idx = tile * TILE + tl.arange(0, TILE)
@@ -227,7 +248,7 @@ def _block_input_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
             u = tl.load(parents + p * 7 + 4).to(tl.int64)
             own = tl.load(node_mars + u * B + b, mask = m, other = float("-inf"))
             op = _out_flows_ptr(tl.load(parents + p * 7 + 0), element_flows, temp_flows, out_first, out_width,
-                                temp_width, OUT_TEMP) + b * OS
+                                temp_width, OUT_TEMP) + b * ostride
             # an observed token: its own log-probability, then the output at the column its class leads to
             obs = ml & (oc >= 0)
             s = tl.load(next_col + (t * W + q) * C + oc, mask = obs, other = -1)
@@ -349,8 +370,9 @@ def _top_down_tile_exact(ap, bp, iv_table, apos, bpos, mb, live_k, r, c, tr, tc,
 
 @triton.jit
 def _parent_tile(p, parents, element_flows, temp_flows, node_mars, prior_mars, temp, width, iv_of, iv_info, iv_table,
-                 lrow, skip_bits, reg_offset, reg_width, reg_first, prior_offset, prior_width, reg_prior, out_first,
-                 out_width, temp_width, b, n, W, r, cc, tr, tc, Rn, Cn, valid, exact_below, TILES_I, TILES_J, WORDS,
+                 once_iv, lrow, skip_bits, reg_offset, reg_width, reg_first, prior_offset, prior_width, reg_prior,
+                 out_first, out_width, temp_width, b, n, W, r, cc, tr, tc, Rn, Cn, valid, exact_below, TILES_I, TILES_J,
+                 WORDS,
                  O_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, SIDE_L: tl.constexpr, TM: tl.constexpr,
                  TN: tl.constexpr, TK: tl.constexpr, SUB_I: tl.constexpr, SUB_J: tl.constexpr, SKIP: tl.constexpr,
                  PRUNE: tl.constexpr, PRECISION: tl.constexpr, RECHECK: tl.constexpr):
@@ -363,7 +385,7 @@ def _parent_tile(p, parents, element_flows, temp_flows, node_mars, prior_mars, t
     t2 = tl.load(parents + p * 9 + 7)
     OS, opos, _ = _interval(iv_of, iv_info, t0, t2, n)
     op = _out_flows_ptr(tl.load(parents + p * 9 + 0), element_flows, temp_flows, out_first, out_width, temp_width,
-                        OUT_TEMP) + b * OS
+                        OUT_TEMP) + tl.where(_once(once_iv, iv_of, t0, t2, n), 0, b * OS)   # kept once: stride 0
     mb = skip_bits + tl.load(parents + p * 9 + 8).to(tl.int64) * TILES_I * TILES_J * WORDS
     if SIDE_L:                                                               # O_out @ R^T, shared: the exit columns
         K = _exit_width(width, t2, n)
@@ -398,12 +420,14 @@ def _parent_tile(p, parents, element_flows, temp_flows, node_mars, prior_mars, t
 
 @triton.jit
 def _block_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mars, prior_mars, temp, width, iv_of,
-                                iv_info, iv_table, live, children, ptr, parents, skip_bits, reg_offset, reg_width,
+                                iv_info, iv_table, once_iv, live, children, children_idx, ptr, parents, skip_bits,
+                                reg_offset, reg_width,
                                 reg_first, prior_offset, prior_width, reg_prior, out_first, out_width, temp_width, B, n,
                                 W, TILES_I, TILES_J, WORDS, SPLIT, GROUP, exact_below, pid0, C_KIND: tl.constexpr,
                                 O_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, SIDE_L: tl.constexpr, TM: tl.constexpr,
                                 TN: tl.constexpr, TK: tl.constexpr, SUB_I: tl.constexpr, SUB_J: tl.constexpr,
-                                SKIP: tl.constexpr, PRUNE: tl.constexpr, EXACT: tl.constexpr, PRECISION: tl.constexpr):
+                                SKIP: tl.constexpr, PRUNE: tl.constexpr, EXACT: tl.constexpr, PRECISION: tl.constexpr,
+                                INDEXED: tl.constexpr):
     """One program per (child, sample, group of ``GROUP`` output tiles): the child's top-down tile is the log-sum over
     its parents of ``O_out @ R^T`` (``SIDE_L``: the child is the left operand ``L`` over ``[t0, t1)``, the other
     operand ``R`` over ``[t1, t2)``, the shared columns the exit ``j``) or ``L^T @ O_out`` (the child is ``R`` over
@@ -412,7 +436,7 @@ def _block_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
     :func:`~.prod._block_block_kernel`, per (parent, tile)."""
     pid = pid0 + tl.program_id(0)
     g = pid % SPLIT
-    c = pid // SPLIT // B
+    c = _child(children_idx, pid // SPLIT // B, INDEXED)
     b = (pid // SPLIT % B).to(tl.int64)
     row = tl.load(children + c * 4 + 0)
     reg = tl.load(children + c * 4 + 1)
@@ -450,11 +474,11 @@ def _block_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
         tot = tl.full([TM, TN], float("-inf"), dtype = tl.float32)
         for p in range(p0, p1):
             out, acc, fast = _parent_tile(p, parents, element_flows, temp_flows, node_mars, prior_mars, temp, width,
-                                          iv_of, iv_info, iv_table, lrow, skip_bits, reg_offset, reg_width, reg_first,
-                                          prior_offset, prior_width, reg_prior, out_first, out_width, temp_width, b, n,
-                                          W, r, cc, tr, tc, Rn, Cn, valid, exact_below, TILES_I, TILES_J, WORDS,
-                                          O_KIND, OUT_TEMP, SIDE_L, TM, TN, TK, SUB_I, SUB_J, SKIP, PRUNE, PRECISION,
-                                          False)
+                                          iv_of, iv_info, iv_table, once_iv, lrow, skip_bits, reg_offset, reg_width,
+                                          reg_first, prior_offset, prior_width, reg_prior, out_first, out_width,
+                                          temp_width, b, n, W, r, cc, tr, tc, Rn, Cn, valid, exact_below, TILES_I,
+                                          TILES_J, WORDS, O_KIND, OUT_TEMP, SIDE_L, TM, TN, TK, SUB_I, SUB_J, SKIP,
+                                          PRUNE, PRECISION, False)
             if EXACT:
                 bad = bad | (valid & (acc < exact_below)).to(tl.int32)
             tot = _logaddexp_tile(tot, out)
@@ -480,9 +504,10 @@ def _block_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
                 tot_fast = tl.full([TM, TN], float("-inf"), dtype = tl.float32)
                 for p in range(p0, p1):
                     out, acc, fast = _parent_tile(p, parents, element_flows, temp_flows, node_mars, prior_mars, temp,
-                                                  width, iv_of, iv_info, iv_table, lrow, skip_bits, reg_offset,
-                                                  reg_width, reg_first, prior_offset, prior_width, reg_prior, out_first,
-                                                  out_width, temp_width, b, n, W, r, cc, tr, tc, Rn, Cn, valid,
+                                                  width, iv_of, iv_info, iv_table, once_iv, lrow, skip_bits,
+                                                  reg_offset, reg_width, reg_first, prior_offset, prior_width,
+                                                  reg_prior, out_first, out_width, temp_width, b, n, W, r, cc, tr, tc,
+                                                  Rn, Cn, valid,
                                                   exact_below, TILES_I, TILES_J, WORDS, O_KIND, OUT_TEMP, SIDE_L, TM,
                                                   TN, TK, SUB_I, SUB_J, SKIP, PRUNE, PRECISION, True)
                     tot = _logaddexp_tile(tot, out)
@@ -499,16 +524,20 @@ def _block_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
 
 
 def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_flows, node_mars, class_mars, obs_class,
-                live, elem_first: int, elem_width: int, B: int, prior: dict, skip, exact: bool):
+                live, elem_first: int, elem_width: int, B: int, prior: dict, skip, exact: bool, once_iv: torch.Tensor):
     """
-    The top-down pass of one product layer's stage: every :class:`TopDownLaunch` in ``launches``.
+    The top-down pass of one product layer's stage: every :class:`TopDownLaunch` in ``launches``, each with the plan's
+    index list of the children it computes (int32 on the device) or None for every one.
 
     :param bufs: ``(temp, temp_width)``, the layer's scratch rows, holding the folds' inside values (recomputed)
-    :param regions: ``offset``, ``width``, ``first`` and ``slots`` of every sum region (device tensors)
+    :param regions: ``offset``, ``width``, ``first`` and ``slots`` of every sum region (device tensors) of the buffer
+        the children are written to (``node_flows``, or ``prior_flows`` for a batch of one)
     :param element_flows, temp_flows, node_flows: the top-down buffers (``temp_flows`` as wide as ``temp``)
     :param prior: where the sum operands the plan keeps once are (see :func:`~.prod._block_ptr`)
     :param skip: the top-down pass's :class:`~.prod.SkipMasks` (its triples are the parents' ``(interval A, B)`` specs)
     :param exact: see :func:`~.prod.run_products`
+    :param once_iv: int32 [intervals] (device, by ``prog.intervals``' numbers): 1 where the query keeps an interval's
+        top-down values once, for a batch of one: a parent there is read with sample stride 0
     """
     temp, temp_width = bufs
     common = dict(reg_offset = regions["offset"], reg_width = regions["width"], reg_first = regions["first"],
@@ -518,15 +547,17 @@ def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_
     prune, live = live is not None, live if live is not None else obs_class
     tt, grouped = prog.trans_top_down, prog.trans_top_down.grouped
     trans = prog.transition_buffer()
-    for la in launches:
-        Cn = la.children.size(0)
+    for la, idx in launches:
+        Cn = la.children.size(0) if idx is None else idx.numel()
+        indexed = dict(children_idx = la.children if idx is None else idx, INDEXED = idx is not None)
         if la.form == "copy":
             c_kind, out_temp = la.kinds
             tile = _tile(la.S_max * B)
             for first, size in grid_chunks(triton.cdiv(la.S_max * B, tile), 1):
                 _copy_top_down_kernel[(Cn, size)](
-                    element_flows, temp_flows, node_flows, ivs.of, ivs.info, la.children, la.ptr, la.parents, B = B,
-                    n = n, pid0 = first, C_KIND = c_kind, OUT_TEMP = out_temp, TILE = tile, num_warps = 4, **common)
+                    element_flows, temp_flows, node_flows, ivs.of, ivs.info, once_iv, la.children, ptr = la.ptr,
+                    parents = la.parents, B = B, n = n, pid0 = first, C_KIND = c_kind, OUT_TEMP = out_temp,
+                    TILE = tile, num_warps = 4, **indexed, **common)
         elif la.form in ("input_block", "block_input"):
             c_kind, out_temp, (c_full, out_full) = la.kinds
             tile = _flat_tile(B * la.S_max)
@@ -536,33 +567,33 @@ def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_
             for first, size in grid_chunks(triton.cdiv(B * la.S_max, tile), 1):
                 kernel[(Cn, size)](
                     element_flows, temp_flows, node_flows, node_mars, obs_class, prog.next_col, class_mars,
-                    prog.mass_row, trans, *tables, prog.width_t, ivs.of, ivs.info, ivs.table, live, la.children,
-                    la.ptr, la.parents,
-                    B = B, n = n, W = W, C = C, input_start = prog.input_start, pid0 = first, C_KIND = c_kind,
-                    OUT_TEMP = out_temp, GROUPED = grouped, PRUNE = prune, C_FULL = c_full, OUT_FULL = out_full,
-                    TILE = tile, num_warps = 4, **common)
+                    prog.mass_row, trans, *tables, prog.width_t, ivs.of, ivs.info, ivs.table, once_iv, live,
+                    la.children, ptr = la.ptr, parents = la.parents, B = B, n = n, W = W, C = C,
+                    input_start = prog.input_start, pid0 = first, C_KIND = c_kind, OUT_TEMP = out_temp,
+                    GROUPED = grouped, PRUNE = prune, C_FULL = c_full, OUT_FULL = out_full, TILE = tile, num_warps = 4,
+                    **indexed, **common)
         else:
             c_kind, o_kind, out_temp = la.kinds
             side_l = la.side == "L"
 
-            def block_block(cfg, nf, tf, la = la, c_kind = c_kind, o_kind = o_kind, out_temp = out_temp,
-                            side_l = side_l):
+            def block_block(cfg, nf, tf, la = la, Cn = Cn, indexed = indexed, c_kind = c_kind, o_kind = o_kind,
+                            out_temp = out_temp, side_l = side_l):
                 TM, TN, TK, warps = cfg
                 tiles = triton.cdiv(la.E_max, TM) * triton.cdiv(la.X_max, TN)
-                split = min(tiles, triton.cdiv(BLOCK_BLOCK_PROGRAMS_PER_SM * prog.num_sms, la.children.size(0) * B))
+                split = min(tiles, triton.cdiv(BLOCK_BLOCK_PROGRAMS_PER_SM * prog.num_sms, Cn * B))
                 group = triton.cdiv(tiles, max(1, split))
                 split = triton.cdiv(tiles, group)
-                for first, size in grid_chunks(la.children.size(0) * B * split, 0):
+                for first, size in grid_chunks(Cn * B * split, 0):
                     _block_block_top_down_kernel[(size,)](
                         element_flows, tf, nf, node_mars, prior["mars"], temp, prog.width_t, ivs.of, ivs.info,
-                        ivs.table, live, la.children, la.ptr, la.parents, skip.bits, prior_offset = prior["offset"],
-                        prior_width = prior["width"], reg_prior = prior["reg_prior"], B = B, n = n, W = W,
-                        TILES_I = skip.tiles_i, TILES_J = skip.tiles_j, WORDS = skip.words, SPLIT = split,
-                        GROUP = group,
+                        ivs.table, once_iv, live, la.children, ptr = la.ptr, parents = la.parents,
+                        skip_bits = skip.bits, prior_offset = prior["offset"], prior_width = prior["width"],
+                        reg_prior = prior["reg_prior"], B = B, n = n, W = W, TILES_I = skip.tiles_i,
+                        TILES_J = skip.tiles_j, WORDS = skip.words, SPLIT = split, GROUP = group,
                         exact_below = EXACT_BELOW, pid0 = first, C_KIND = c_kind, O_KIND = o_kind, OUT_TEMP = out_temp,
                         SIDE_L = side_l, TM = TM, TN = TN, TK = TK, SUB_I = TM // skip.tm, SUB_J = TN // skip.tn,
                         SKIP = SKIP_EMPTY_TILES, PRUNE = prune, EXACT = exact, PRECISION = PRODUCT_PRECISION,
-                        num_warps = warps, num_stages = 1, **common)
+                        num_warps = warps, num_stages = 1, **indexed, **common)
 
             # a child reached before log-adds to its value, so the launch is not idempotent: the candidates are timed
             # into throwaway copies of the outputs (and not at all when those cannot be allocated)

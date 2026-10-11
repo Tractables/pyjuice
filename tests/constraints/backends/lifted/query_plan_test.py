@@ -9,7 +9,9 @@ Query plans (:mod:`pyjuice.constraints.backends.lifted.query_plan`) and the inpu
   missing), and a planned forward computes the needed input-dependent values as the full one does, leaving the
   others untouched;
 * they are kept inside :func:`pyjuice.fast_inference` (the second query computes none, and gets the same marginal)
-  and recomputed by every query outside it, following in-place parameter updates.
+  and recomputed by every query outside it, following in-place parameter updates;
+* the top-down values kept once are those with nothing observed outside their interval, by the same rule, closed
+  upward; a forward told the buffers hold some per-sample values computes none of them.
 
 Marginals under every pattern of evidence, which run on these plans, are tested in ``pruning_test.py``.
 """
@@ -24,7 +26,8 @@ import pyjuice.constraints as jc
 from pyjuice.constraints.backends.lifted import forward as F
 from pyjuice.constraints.backends.lifted.kernels.live import prune
 from pyjuice.constraints.backends.lifted.kernels.prod import TEMP
-from pyjuice.constraints.backends.lifted.query_plan import free_regions, prior_regions, query_plan
+from pyjuice.constraints.backends.lifted.query_plan import (free_regions, prior_regions, query_plan, top_down_free,
+                                                            top_down_prior)
 
 V = 3
 KINDS = {"hmm": 6, "hmm_untied": 6, "hmm_block_sparse": 6, "left_linear": 6, "pd": 8, "pd_prod_dominated": 8,
@@ -384,3 +387,82 @@ def test_kept_once_when_it_pays(build_pc):
     live[k] += 1
     assert np.array_equal(prior_regions(prog, nothing, 2, False, types.SimpleNamespace(num_live = live.tolist())), inside)
     assert not prior_regions(prog, nothing, 1, False, None).any()           # one sample: never, and no counts read
+
+
+@pytest.mark.parametrize("kind", ["pd", "hand", "hmm"])
+def test_top_down_kept_once_when_it_pays(kind, build_pc):
+    """The top-down values a query keeps once, over every interval the top-down pass writes (the folds' of a product of
+    several children included): those with nothing observed outside the interval, when kept across queries; else those
+    of the free sum intervals whose block costs less than the samples' live columns, and every interval HOLDING one of
+    them (a value kept once reads its parents' for a batch of one); one sample: none."""
+    cc, n = compiled(build_pc, kind)
+    prog, td = cc._lifted_program(), cc._top_down_program()
+    a, b = td.iv_bounds[:, 0], td.iv_bounds[:, 1]
+    first_region = {}
+    for r, k in enumerate(prog.reg_iv_host):
+        first_region.setdefault(k, r)
+    sums = np.array([td.reg_iv[first_region[k]] for k in range(len(prog.sum_ivs))])     # sum interval -> number
+    slots = prog.iv_slots
+    for lengths in ([0], [0, 0, 0], [n // 2, n // 2], [n // 2] + [0] * 7, [1, 2, 3]):
+        data, missing = prefixes(n, lengths)
+        observed = (~missing).any(dim = 0).numpy()
+        free = top_down_free(td, observed)
+        assert np.array_equal(free, np.array([not observed[:lo].any() and not observed[hi:].any() for lo, hi in
+                                              td.iv_bounds]))
+        dev = cc.pc.params.device
+        x = torch.where(missing, 0, data).to(dev)
+        obs_class = torch.where(missing.to(dev), -1, cc.token_classes.token_class[x]).contiguous()
+        pruning = prune(prog, obs_class, len(lengths)) if observed.any() else None
+        live = np.array(pruning.num_live) if pruning is not None else len(lengths) * slots
+        worth = np.zeros(len(a), dtype = bool)
+        worth[sums] = free[sums] & (live > slots)
+        closed = free & np.array([bool((worth & (a >= a[i]) & (b <= b[i])).any()) for i in range(len(a))])
+        assert np.array_equal(top_down_prior(prog, td, observed, len(lengths), False, pruning), closed)
+        assert np.array_equal(top_down_prior(prog, td, observed, len(lengths), True, pruning), free)
+        if lengths == [0, 0, 0]:                                             # nothing observed, 3 samples: every
+            assert closed[sums].all()                                       # sum interval once (a fold over inputs
+                                                                            # alone holds none)
+    # the rule on live counts set by hand: strict, and closed upward
+    nothing = np.zeros(n, dtype = bool)
+    k = min(range(len(slots)), key = lambda m: (prog.sum_ivs[m][1] - prog.sum_ivs[m][0], prog.sum_ivs[m][0]))
+    holding = (a <= a[sums[k]]) & (b >= b[sums[k]])
+    assert holding.sum() > 1
+    live = np.zeros(len(slots), dtype = np.int64)
+    live[k] = slots[k]
+    counts = lambda: types.SimpleNamespace(num_live = live.tolist())
+    assert not top_down_prior(prog, td, nothing, 2, False, counts()).any()
+    live[k] += 1
+    assert np.array_equal(top_down_prior(prog, td, nothing, 2, False, counts()), holding)
+    assert not top_down_prior(prog, td, nothing, 1, False, None).any()     # one sample: never, and no counts read
+
+
+@pytest.mark.parametrize("kind", ["pd", "hmm", "hand", "left_linear"])
+def test_held_inside_values_are_not_computed(kind, build_pc, reference):
+    """A forward told the buffers hold some per-sample inside values (a caching engine's decision) computes none of
+    them and reads them where they are: after a forward of the same evidence, the second holds the nodes whose scope
+    misses position 0 and computes the others (the root among them), written over with NaN in between."""
+    cc, n = compiled(build_pc, kind)
+    prog, dev = cc._lifted_program(), cc.pc.params.device
+    data, missing = prefixes(n, [n // 2, 1, 0])
+    B = data.size(0)
+    missing = missing.to(dev)
+    observed = (~missing).any(dim = 0).cpu().numpy()
+    x = torch.where(missing, 0, data.to(dev).long())
+    obs_class = torch.where(missing, -1, cc.token_classes.token_class[x]).contiguous()
+    pruning = prune(prog, obs_class, B)
+    nothing_once = np.zeros(len(prog.sum_ivs), dtype = bool)
+    bufs = cc._buffers(B)
+    valid = np.zeros(len(prog.sum_ivs), dtype = bool)
+    with torch.no_grad():
+        F.run_forward(cc, bufs, query_plan(prog, observed, None, valid, nothing_once), x, missing, obs_class, pruning,
+                      "fp32")
+    held = np.array([prog.sum_ivs[k][0] > 0 for k in prog.reg_iv_host])
+    for r in np.nonzero(~held)[0]:
+        sample_rows(cc, bufs, r, B).fill_(float("nan"))
+    plan = query_plan(prog, observed, None, valid, nothing_once, held = held)
+    assert not plan.sample[np.asarray(prog.reg_iv_host)[held]].any()
+    with torch.no_grad():
+        F.run_forward(cc, bufs, plan, x, missing, obs_class, pruning, "fp32")
+    r = prog.root_region
+    root = sample_rows(cc, bufs, r, B)[prog.root_rows[0] - cc.sum_regions[r][0]]
+    assert_close(root[None, :], reference.marginal(cc, data, missing.cpu())[:, 0][None, :].float().to(dev))

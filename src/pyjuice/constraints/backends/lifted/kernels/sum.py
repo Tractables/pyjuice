@@ -23,6 +23,7 @@ paths:
 """
 
 import contextlib
+from typing import Optional
 
 import torch
 import triton
@@ -327,21 +328,24 @@ def _logaddexp_tile(a, b):
 
 
 @triton.jit
-def _lifted_sum_top_down_kernel(element_flows, node_flows, weights, cb_row, cb_reg, cb_add, cb_ivreg, par_ptr, par_nid,
-                               par_reg, par_pid, reg_offset, reg_width, reg_first, reg_slots, perm, reg_perm, reg_live,
-                               elem_first, elem_width, B, pid0, BS: tl.constexpr, CBS: tl.constexpr,
+def _lifted_sum_top_down_kernel(element_flows, node_flows, weights, cb_row, cb_reg, cb_add, cb_ivreg, cb_idx, par_ptr,
+                               par_nid, par_reg, par_pid, reg_offset, reg_width, reg_first, reg_slots, perm, reg_perm,
+                               reg_live, elem_first, elem_width, B, pid0, BS: tl.constexpr, CBS: tl.constexpr,
                                TILE_C: tl.constexpr, TILE_I: tl.constexpr, TILE_B: tl.constexpr,
-                               PRECISION: tl.constexpr, PRUNE: tl.constexpr):
+                               PRECISION: tl.constexpr, PRUNE: tl.constexpr, INDEXED: tl.constexpr):
     """One program per (child block, tile of its children, tile of columns): ``O_child[c, col] = log sum over the
     block's parent node blocks and their nodes i of w[c, i] exp(O_node[i, col])``, an online log-sum-exp over tiles
     of parent nodes with the products on tensor cores -- the forward's fused kernel with children and nodes
     exchanged (``w[c, i] = weights[pid + c * BS + i]``). A child block is element rows (``cb_reg`` -1), written to
     ``element_flows``, or a sum node block's rows (an aliased copy), written to ``node_flows``; written, or log-added
-    to what is there (``cb_add``). Pruned, the columns are the interval's live ones first, as in the forward."""
+    to what is there (``cb_add``). Pruned, the columns are the interval's live ones first, as in the forward.
+    ``INDEXED``: the child blocks are those of the plan's index list ``cb_idx``."""
     pid_cm = tl.program_id(0)
     pid_c = pid0 + tl.program_id(1)
     cb = pid_cm // ((CBS + TILE_C - 1) // TILE_C)
     ct = pid_cm % ((CBS + TILE_C - 1) // TILE_C)
+    if INDEXED:
+        cb = tl.load(cb_idx + cb)
     ivreg = tl.load(cb_ivreg + cb)
     ncols = B * tl.load(reg_slots + ivreg)
     col0 = pid_c * TILE_B
@@ -395,7 +399,7 @@ def _lifted_sum_top_down_kernel(element_flows, node_flows, weights, cb_row, cb_r
 
 def fused_sum_top_down(element_flows: torch.Tensor, node_flows: torch.Tensor, params: torch.Tensor, tables: dict,
                       regions: dict, elem_first: int, elem_width: int, batch_size: int, block_size: int, cbs: int,
-                      max_cols: int, precision: str, pruning = None):
+                      max_cols: int, precision: str, pruning = None, idx: Optional[torch.Tensor] = None):
     """
     The top-down values of the children of a sum layer's fused node blocks (:func:`_lifted_sum_top_down_kernel`).
 
@@ -404,8 +408,9 @@ def fused_sum_top_down(element_flows: torch.Tensor, node_flows: torch.Tensor, pa
         device tensors, see :mod:`..backward`)
     :param cbs: the child block size of these children
     :param max_cols: the most columns any child block has (``batch_size`` x its slots)
+    :param idx: None (every child block), or int32 on the device: the plan's index list of the child blocks to compute
     """
-    num_blocks = tables["cb_row"].numel()
+    num_blocks = tables["cb_row"].numel() if idx is None else idx.numel()
     tm, te, tb, warps, stages = _TILES[precision]
     TILE_C = min(tm, max(16, triton.next_power_of_2(cbs)))
     TILE_I = min(te, max(16, triton.next_power_of_2(block_size)))
@@ -416,10 +421,11 @@ def fused_sum_top_down(element_flows: torch.Tensor, node_flows: torch.Tensor, pa
     for first, size in grid_chunks(triton.cdiv(max_cols, TILE_B), 1):
         _lifted_sum_top_down_kernel[(num_blocks * num_ctiles, size)](
             element_flows, node_flows, params, tables["cb_row"], tables["cb_reg"], tables["cb_add"], tables["cb_ivreg"],
-            tables["par_ptr"], tables["par_nid"], tables["par_reg"], tables["par_pid"], regions["offset"],
-            regions["width"], regions["first"], regions["slots"], perm, reg_perm, reg_live, elem_first, elem_width,
-            batch_size, first, BS = block_size, CBS = cbs, TILE_C = TILE_C, TILE_I = TILE_I, TILE_B = TILE_B,
-            PRECISION = precision, PRUNE = pruning is not None, num_warps = warps, num_stages = stages)
+            tables["cb_row"] if idx is None else idx, tables["par_ptr"], tables["par_nid"], tables["par_reg"],
+            tables["par_pid"], regions["offset"], regions["width"], regions["first"], regions["slots"], perm, reg_perm,
+            reg_live, elem_first, elem_width, batch_size, first, BS = block_size, CBS = cbs, TILE_C = TILE_C,
+            TILE_I = TILE_I, TILE_B = TILE_B, PRECISION = precision, PRUNE = pruning is not None,
+            INDEXED = idx is not None, num_warps = warps, num_stages = stages)
 
 
 @triton.jit
