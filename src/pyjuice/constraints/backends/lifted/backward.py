@@ -38,6 +38,7 @@ import torch
 from .kernels.prod import IDENTITY, SUM, TEMP, skip_masks_for, transition_tables
 from .kernels.prod import run_products as products
 from .kernels.prod_top_down import TopDownLaunch, run_top_down
+from .kernels.score import class_weight_launch, run_class_weights, score_tables
 from .kernels.sum import dense_sum_top_down, fill_dead_rows, fused_sum_top_down, stacked_weights
 from .plan import _align
 from . import forward as F
@@ -54,9 +55,10 @@ class TopDownProgram:
         dense run over ``E``), ``fused_groups`` ``{child block size: tables}``
         for :func:`~.kernels.sum.fused_sum_top_down` (with host copies under ``"host"``) -- and ``("prod", prod_index,
         [(fold_stages, stages, num_temps, temp_slots)])``: ``fold_stages`` the forward launches that write scratch rows,
-        ``stages`` per forward stage, in the forward's order, ``(launches, inputs, folds)`` -- the stage's
-        :class:`~.kernels.prod_top_down.TopDownLaunch` es, its products' input operands ``(out_temp, out rows,
-        positions)`` and, per fold launch, ``(out rows, scratch operand rows or None, [sum operands' regions])``
+        ``stages`` per forward stage, in the forward's order, ``(launches, inputs, folds, class_weights)`` -- the
+        stage's :class:`~.kernels.prod_top_down.TopDownLaunch` es, its products' input operands ``(out_temp, out rows,
+        positions)``, per fold launch, ``(out rows, scratch operand rows or None, [sum operands' regions])``, and the
+        :class:`~.kernels.score.ClassWeightLaunch` es of its input operands (a conditional's scoring reads them)
     :ivar skip: the skip masks of the ``block @ block`` top-down steps (their specs' index is the parents' 9th field)
     :ivar iv_bounds: int64 [intervals, 2] (host): ``prog.intervals``' intervals, by number
     :ivar reg_iv: int64 [sum regions] (host): every sum region's interval, by that number
@@ -82,6 +84,7 @@ def top_down_program(cc) -> TopDownProgram:
             transition_tables(prog.next_col, prog.width, n, grouped = False)
     reach = prog.reach
     firsts = prog.firsts
+    score = score_tables(prog)
     of = prog.intervals.of.cpu().numpy()
     iv_index = lambda a, b: of[np.asarray(a) * (n + 1) + np.asarray(b)].astype(np.int64)
     # what already has its top-down value: ("S", row, region) sum rows, ("E", group, row) element rows and ("T", layer,
@@ -200,13 +203,18 @@ def top_down_program(cc) -> TopDownProgram:
                 fold_stages = [s for s in fold_stages if s]
                 info = []
                 for launches in reversed(stages):            # in the order run_backward launches them
-                    out = []
+                    out, cws = [], []
                     for launch in launches:
                         for side in (("L", "R") if launch.form == "block_block" else ("L",)):
                             la = child_launch(launch, side, prod_index, (prod_index, li))
                             if la is not None:
                                 out.append(la)
-                    info.append((out, _inputs(launches), _folds([l for l in launches if out_temp_of(l)])))
+                        alive = np.asarray([(("T", (prod_index, li), r) if out_temp_of(launch) else
+                                             ("E", prod_index, r)) in written for r in launch.rows[:, 0].tolist()])
+                        cw = class_weight_launch(launch, alive, prog, score)
+                        if cw is not None:
+                            cws.append(cw)
+                    info.append((out, _inputs(launches), _folds([l for l in launches if out_temp_of(l)]), cws))
                 layers_out.append((fold_stages, info[::-1], num_temps, temp_slots))
             steps.append(("prod", prod_index, layers_out))
     dead = [(row, r) for r, (first, end, _) in enumerate(cc.sum_regions) for row in range(first, end)
@@ -332,7 +340,8 @@ def _segments(flags) -> list:
 
 
 def run_backward(cc, bufs: dict, flows: dict, plan, x: torch.Tensor, missing: torch.Tensor, obs_class: torch.Tensor,
-                 pruning, precision: str, visit: Optional[Callable[[int], None]] = None):
+                 pruning, precision: str, visit: Optional[Callable[[int], None]] = None,
+                 class_weights: Optional[dict] = None, class_mars: Optional[torch.Tensor] = None):
     """
     The top-down values a query plan computes (``plan.top_down``, see :mod:`.query_plan`), after
     :func:`~.forward.run_forward` filled the inside values of ``bufs`` under ``plan``: the per-sample ones into
@@ -343,6 +352,10 @@ def run_backward(cc, bufs: dict, flows: dict, plan, x: torch.Tensor, missing: to
     :param visit: None, or called with a product layer group's index once its products' top-down values are in
         ``element_flows`` (per sample, or for a batch of one where the plan keeps them once), before the next group's
         overwrite them: where the values of the products of the targets' inputs are read
+    :param class_weights: None, or where the class weights of the target positions' input nodes go, every sample's
+        (see :func:`~.kernels.score.run_class_weights`; the plan must be a scoring one, see :func:`~.query_plan.
+        top_down_plan`)
+    :param class_mars: the query's class masses if its forward has them (:func:`~.forward.run_forward`'s), else None
     """
     pc, prog, td = cc.pc, cc._lifted_program(), plan.top_down
     out = cc._top_down_program()
@@ -363,7 +376,8 @@ def run_backward(cc, bufs: dict, flows: dict, plan, x: torch.Tensor, missing: to
     live = pruning.live if pruning is not None else None
     lanes = (pruning.perm, pruning.reg_first, pruning.reg_live) if pruning is not None else None
     exact = pruning is not None
-    class_mars = cc._class_masses()
+    if class_mars is None:
+        class_mars = cc._class_masses()
     prog.transitions(class_mars, cc._class_mars_version)
     stacks, kept = cc._weight_stacks()
 
@@ -424,7 +438,7 @@ def run_backward(cc, bufs: dict, flows: dict, plan, x: torch.Tensor, missing: to
                 if folds[1]:                             # ... and per sample
                     products(folds[1], (temp, temp_width), prog, regions, element_mars, node_mars, class_mars,
                              obs_class, live, elem_first, elem_width, B, srcs, exact = exact)
-                for once_launches, sample_launches in stages:
+                for once_launches, sample_launches, cw_launches in stages:
                     if once_launches:
                         run_top_down(once_launches, (temp, temp_width), prog, once, element_flows, temp_flows,
                                      pf["flows"], node_mars, class_mars, prog.no_evidence, None, elem_first,
@@ -433,5 +447,9 @@ def run_backward(cc, bufs: dict, flows: dict, plan, x: torch.Tensor, missing: to
                         run_top_down(sample_launches, (temp, temp_width), prog, regions, element_flows, temp_flows,
                                      node_flows, node_mars, class_mars, obs_class, live, elem_first, elem_width, B,
                                      srcs, out.skip, exact, td.once_iv, lanes = lanes)
+                    if cw_launches and class_weights is not None:
+                        run_class_weights(cw_launches, class_weights, prog, (temp, temp_width), element_flows,
+                                          temp_flows, node_mars, live, elem_first, elem_width, B, srcs, td.once_iv,
+                                          regions)
     if pf is not None:
         pf["valid"] |= td.todo

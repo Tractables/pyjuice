@@ -19,6 +19,7 @@ halves) carry their full precision, and the probabilities are scaled by 2^64 fir
 subnormal inputs to zero (a class whose tokens are all subnormal would read -inf).
 """
 
+import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -44,6 +45,24 @@ def class_mass_rows(layer) -> torch.Tensor:
     refuses any other vocabulary), so its parameters are one ``[rows, num_cats]`` table, node ``i``'s at row
     ``s_pids[i] // num_cats``."""
     return (layer.s_pids // layer.dist.num_cats).long()
+
+
+#: rows of the parameter table :func:`token_probs` gathers at a time when they are not consecutive (bounds the copy)
+TOKEN_ROWS_PER_COPY = 256
+
+
+def token_probs(layer, rows: np.ndarray, out: torch.Tensor) -> torch.Tensor:
+    """``out[v, k] = p(v)`` of row ``rows[k]`` of the layer's parameter table (see :func:`class_mass_rows`; ``rows``
+    sorted, host int64): the rows transposed token-major, as the conditionals score them. ``out``: [num_cats,
+    len(rows)], fp32 or bf16, possibly the columns of a wider table."""
+    table = layer.params.view(-1, layer.dist.num_cats)
+    if len(rows) and rows[-1] - rows[0] + 1 == len(rows):                    # consecutive: no gather
+        out.copy_(table[int(rows[0]):int(rows[-1]) + 1].t())
+    else:
+        idx = torch.as_tensor(rows, dtype = torch.long, device = table.device)
+        for k0 in range(0, len(rows), TOKEN_ROWS_PER_COPY):
+            out[:, k0:k0 + TOKEN_ROWS_PER_COPY].copy_(table[idx[k0:k0 + TOKEN_ROWS_PER_COPY]].t())
+    return out
 
 
 def class_masses(layer, classes, out = None) -> torch.Tensor:

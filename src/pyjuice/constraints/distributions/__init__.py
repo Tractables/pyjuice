@@ -15,7 +15,10 @@ module provides
   class-mass table every node reads, numbered from 0 (the table has ``max + 1`` rows);
 * ``class_masses(layer, classes, out = None) -> torch.Tensor``: the table, ``[rows, num_classes]``, the log-mass of
   every class for every row, the same for every sample (``classes``: the constraint's :class:`TokenClasses`);
-  written into ``out`` when given.
+  written into ``out`` when given;
+* ``token_probs(layer, rows, out) -> torch.Tensor``: the probability of every value under the table's rows ``rows``
+  (sorted, host int64), token-major: ``out[v, k] = p(v)`` of row ``rows[k]``, ``out`` [values, len(rows)] in fp32 or
+  bf16 -- what the conditionals score (:mod:`~pyjuice.constraints.backends.lifted.conditional`).
 
 Only the distributions in :data:`SUPPORTED` can be compiled under a constraint, matched by exact type: a subclass
 may compute different probabilities, so it is refused until it has its own module.
@@ -42,6 +45,7 @@ class TokenClasses:
         self.token_class = token_class.to(torch.int32).contiguous()
         self.num_classes = int(num_classes)
         self._by_class = {}
+        self._class_tiles = {}
 
     def to(self, device) -> "TokenClasses":
         """The same classes on ``device`` (a new object: nothing derived is carried over)."""
@@ -52,6 +56,26 @@ class TokenClasses:
         found = self._by_class.get(chunk)
         if found is None:
             found = self._by_class[chunk] = ByClass.build(self.token_class, self.num_classes, chunk)
+        return found
+
+    def class_tiles(self, width: int):
+        """``(tokens, tile_class)``: the tokens in class order (by id within a class), every class's run padded with -1
+        to whole tiles of ``width`` (int32 [tiles * width]), and every tile's class (int32 [tiles]) -- one class per
+        tile, for a kernel that reads a class's weights once per tile (built on first use, then kept)."""
+        found = self._class_tiles.get(width)
+        if found is None:
+            tc = self.token_class.cpu().long()
+            order = torch.argsort(tc, stable = True)
+            counts = torch.bincount(tc, minlength = self.num_classes)
+            tiles = (counts + width - 1) // width                               # per class
+            first_tile = torch.cumsum(tiles, 0) - tiles
+            first_token = torch.cumsum(counts, 0) - counts
+            cls = tc[order]
+            tokens = torch.full((int(tiles.sum()) * width,), -1, dtype = torch.long)
+            tokens[first_tile[cls] * width + torch.arange(tc.numel()) - first_token[cls]] = order
+            tile_class = torch.repeat_interleave(torch.arange(self.num_classes), tiles)
+            dev = self.token_class.device
+            found = self._class_tiles[width] = (tokens.to(dev, torch.int32), tile_class.to(dev, torch.int32))
         return found
 
 

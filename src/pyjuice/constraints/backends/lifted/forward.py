@@ -553,6 +553,8 @@ def run_forward(cc, bufs: dict, plan, x: torch.Tensor, missing: torch.Tensor, ob
     :param obs_class: [B, n] int32, every observed token's class, -1 where missing
     :param pruning: None, or the query's :class:`~.kernels.live.Pruning`
     :param precision: "fp32" or "tf32" for the sum layers' matrix products
+    :returns: the class masses the pass read (:meth:`~pyjuice.constraints.ConstrainedCircuit._class_masses`; computed
+        for this query outside :func:`pyjuice.fast_inference`), for the query's later passes
     """
     pc, prog = cc.pc, cc._lifted_program()
     B = x.size(0)
@@ -598,6 +600,7 @@ def run_forward(cc, bufs: dict, plan, x: torch.Tensor, missing: torch.Tensor, ob
                 if sample_parts:
                     _sums(cc, sample_parts, block_size, node_mars, element_mars, regions, lay["sum_offsets"],
                           lay["sum_widths"], elem_first, elem_width, B, pruning, stacks, kept, precision)
+    return class_mars
 
 
 def _sums(cc, parts, block_size: int, nodes: torch.Tensor, element_mars: torch.Tensor, regions: dict, offsets, widths,

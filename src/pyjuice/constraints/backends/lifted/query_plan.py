@@ -85,7 +85,8 @@ class TopDownPlan:
 
     :ivar steps: from the top down, ``("sum", prod_index, [(block_size, (once, sample) dense runs, (once, sample)
         fused [(child block size, tables, index list)])])`` and ``("prod", prod_index, [((once, sample) fold stages,
-        stages [(once launches, sample launches)] in launch order, num_temps, temp_slots)])``
+        stages [(once launches, sample launches, class weight launches)] in launch order, num_temps, temp_slots)])``
+        (class weight launches: a scoring plan's, else none)
     :ivar root: ``(computed, once)`` of the root's value
     :ivar once: bool [sum regions] (host): those whose values the query keeps once (reads or writes in ``prior_flows``)
     :ivar todo: bool [sum regions] (host): those it writes in ``prior_flows``
@@ -156,7 +157,7 @@ def query_plan(prog, observed: np.ndarray, targets: Optional[np.ndarray], valid:
     :param prior: bool [sum intervals] (host): the intervals kept once (:func:`prior_regions`)
     :param held: None, or bool [sum regions] (host): the per-sample inside values ``node_mars`` holds for this query
     :param top_down: None (no top-down pass), or the arguments of :func:`top_down_plan` but ``prog`` and ``targets``,
-        as a dict: ``program``, ``once``, ``valid`` and ``held``
+        as a dict: ``program``, ``once``, ``valid``, ``held`` and optionally ``scoring``
     """
     a, b = prog.iv_bounds[:, 0], prog.iv_bounds[:, 1]
     if targets is None:
@@ -166,12 +167,12 @@ def query_plan(prog, observed: np.ndarray, targets: Optional[np.ndarray], valid:
         needed = (Q[a] > 0) | (Q[-1] > Q[b])                         # a target outside the scope
     td, td_key = None, None
     if top_down is not None:
-        h = top_down["held"]
+        h, scoring = top_down["held"], top_down.get("scoring", False)
         td_key = ("top_down", None if targets is None else targets.tobytes(), top_down["once"].tobytes(),
-                  top_down["valid"].tobytes(), None if h is None else h.tobytes())
+                  top_down["valid"].tobytes(), None if h is None else h.tobytes(), scoring)
         td = prog.plans.get(td_key)
         if td is None:
-            td = top_down_plan(prog, top_down["program"], targets, top_down["once"], top_down["valid"], h)
+            td = top_down_plan(prog, top_down["program"], targets, top_down["once"], top_down["valid"], h, scoring)
             _keep(prog, td_key, td)
         else:
             prog.plans.move_to_end(td_key)
@@ -302,18 +303,21 @@ def top_down_prior(prog, td, observed: np.ndarray, B: int, kept: bool, pruning) 
 
 
 def top_down_plan(prog, td, targets: Optional[np.ndarray], once: np.ndarray, valid: np.ndarray,
-                  held: Optional[np.ndarray]) -> TopDownPlan:
+                  held: Optional[np.ndarray], scoring: bool = False) -> TopDownPlan:
     """
     The top-down pass of a query (see the module docstring and :class:`TopDownPlan`). A sum node's value is computed
     when it is needed and the buffer of its kind (``prior_flows`` once, ``node_flows`` per sample) does not hold it; a
     product's (a fold's) when a child computed reads it, or a target position is one of its inputs. From the bottom
-    up, which values are computed; then the launches computing them, split by where they go.
+    up, which values are computed; then the launches computing them, split by where they go. A ``scoring`` plan also
+    runs the class weights of the target positions' input nodes (:mod:`~.kernels.score`), every sample's: their
+    products' values are computed (see above), and a fold they read as an operand is computed again per sample.
 
     :param td: the :class:`~.backward.TopDownProgram`
     :param targets: None (every value), or bool [n] (host): the positions some sample targets
     :param once: bool [intervals]: the values kept once (:func:`top_down_prior`)
     :param valid: bool [sum regions]: those ``prior_flows`` holds
     :param held: None, or bool [sum regions]: those ``node_flows`` holds for this query
+    :param scoring: whether the plan runs the class weights (``targets`` given)
     """
     n, dev = prog.n, prog.dev
     a, b = td.iv_bounds[:, 0], td.iv_bounds[:, 1]
@@ -346,7 +350,7 @@ def top_down_plan(prog, td, targets: Optional[np.ndarray], once: np.ndarray, val
                 treq = np.zeros(max(num_temps, 1), dtype = bool)
                 tin = np.full(max(num_temps, 1), -1)      # the folds' inside values: needed per sample (0) or once (1)
                 masks = []
-                for launches, inputs, _ in stages:        # the forward's order: a fold before the steps reading it
+                for launches, inputs, _, _ in stages:     # the forward's order: a fold before the steps reading it
                     ms = []
                     for la in launches:
                         h = la.host
@@ -359,8 +363,18 @@ def top_down_plan(prog, td, targets: Optional[np.ndarray], once: np.ndarray, val
                         mark(rows[positions[pos]], out_temp, first, treq, ereq)
                     masks.append(ms)
                 stages_out = []
-                for (launches, _, folds), ms in zip(stages[::-1], masks[::-1]):    # the order they run in
-                    once_l, sample_l = [], []
+                for (launches, _, folds, cws), ms in zip(stages[::-1], masks[::-1]):    # the order they run in
+                    once_l, sample_l, cw_l = [], [], []
+                    for cw in cws if scoring else ():     # the class weights at the target positions
+                        h = cw.host
+                        sel = positions[h["dests"][:, 0]]
+                        if not sel.any():
+                            continue
+                        cw_l.append((cw, idx(sel)))
+                        if cw.form == "input_block" and cw.kinds[0] == TEMP:    # a fold operand: per sample
+                            rows = h["parents"][np.repeat(sel, np.diff(h["ptr"])), 3]
+                            assert not (tin[rows] == 1).any(), "a fold's inside value read once and per sample"
+                            tin[rows] = 0
                     for la, rq in zip(launches, ms):
                         if not rq.any():
                             continue
@@ -384,7 +398,7 @@ def top_down_plan(prog, td, targets: Optional[np.ndarray], once: np.ndarray, val
                             tin[temp[mode >= 0]] = mode[mode >= 0]
                         for regs in sums:
                             prior[regs[mode == 1]] = True
-                    stages_out.append((once_l, sample_l))
+                    stages_out.append((once_l, sample_l, cw_l))
                 folds_out = ([], [])
                 for launches in fold_stages:
                     cut = ([], [])

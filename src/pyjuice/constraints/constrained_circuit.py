@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional
 import numpy as np
 import torch
 
-from pyjuice.utils.fast_inference import is_active, param_copies_allowed, register_layer
+from pyjuice.utils.fast_inference import bf16_params_allowed, is_active, param_copies_allowed, register_layer
 
 from .distributions import TokenClasses, lookup
 from .language.base import Constraint
@@ -44,7 +44,8 @@ class ConstrainedCircuit:
     weights of dense sum node blocks that read the same children (one matrix product instead of one per block, on
     products narrow enough for it to pay): inside a scope that allows parameter copies, each is copied once and kept
     until the scope exits; outside it, a query copies only the weights it reads more than once (tied ones) and drops
-    them when it returns.
+    them when it returns. So do the token-major copies of the input parameters that conditionals score against
+    (:meth:`_token_table`): kept by a scope that allows parameter copies, else built by every query.
 
     Created by :func:`pyjuice.constraints.compile`; not meant to be constructed directly.
 
@@ -102,6 +103,7 @@ class ConstrainedCircuit:
         self._prior_valid = None                    # which input-independent values prior_mars holds (`_prior_validity`)
         self._prior_kept = False                    # kept by a `pyjuice.fast_inference` scope
         self._prior_flows_state = None              # the input-independent top-down values (see `_prior_flows`)
+        self._token_tables = None                   # token-major input parameters kept by a scope (`_token_table`)
 
     @property
     def pc(self):
@@ -131,6 +133,7 @@ class ConstrainedCircuit:
         self._kept_stacks = None
         self._prior_valid, self._prior_kept = None, False
         self._prior_flows_state = None
+        self._token_tables = None
         self._program = None                        # and the forward's tables built again there
         self._device = device
         return self
@@ -304,12 +307,41 @@ class ConstrainedCircuit:
             return self._kept_stacks, True
         return {}, False
 
+    def _token_table(self, group: int, rows: np.ndarray) -> torch.Tensor:
+        """
+        ``[V, len(rows)]``: the probability of every token under the class-mass rows ``rows`` (sorted, see
+        :meth:`_class_mass_rows`), token-major -- the table row group ``group`` of the conditionals is scored against
+        (:mod:`~.backends.lifted.conditional`) -- from every input layer's distribution's ``token_probs``. Built by
+        every query, except inside a :func:`pyjuice.fast_inference` scope that allows parameter copies: there by the
+        first query, then kept until the scope exits; in bfloat16 when the scope allows bf16 parameter copies.
+        """
+        dtype = torch.bfloat16 if bf16_params_allowed() else torch.float32
+        key = (group, dtype)
+        if self._token_tables is not None and key in self._token_tables:
+            return self._token_tables[key]
+        firsts, num_rows, _ = self._class_mass_rows()
+        layers = list(self._pc.input_layer_group)
+        V = lookup(layers[0].dist).num_values(layers[0].dist)
+        table = torch.empty(V, len(rows), dtype = dtype, device = self._device)
+        for layer, first, end in zip(layers, firsts, firsts[1:] + [num_rows]):
+            k0, k1 = (int(k) for k in np.searchsorted(rows, [first, end]))
+            if k1 > k0:                                             # the layer's rows: consecutive columns
+                lookup(layer.dist).token_probs(layer, rows[k0:k1] - first, table[:, k0:k1])
+        if param_copies_allowed():
+            if self._token_tables is None:
+                self._token_tables = {}
+                register_layer(self)                                # its exit calls `_release_fast_inference_params`
+            self._token_tables[key] = table
+        return table
+
     def _release_fast_inference_params(self, poison: bool = False):
-        """The :func:`pyjuice.fast_inference` scope that kept the class masses, the input-independent values or the
-        stacked weights exited: parameters may change from now on (``poison``: fill the released masses and values
-        with NaN, as the scope does for its layers' copies; the stacked weights are dropped). Safe to call again."""
+        """The :func:`pyjuice.fast_inference` scope that kept the class masses, the input-independent values, the
+        stacked weights or the token tables exited: parameters may change from now on (``poison``: fill the released
+        masses and values with NaN, as the scope does for its layers' copies; the stacked weights and token tables are
+        dropped). Safe to call again."""
         self._class_mars_kept = False
         self._kept_stacks = None
+        self._token_tables = None
         self._prior_kept = False
         if poison and self._class_mars is not None:
             self._class_mars.fill_(float("nan"))
@@ -463,10 +495,38 @@ class ConstrainedCircuit:
         from .backends.lifted.forward import marginal
         return marginal(self, data, missing_mask, precision = precision)
 
-    def conditional(self, *args, **kwargs):
-        """Per-variable distributions given the constraint (and evidence). Not implemented yet."""
+    def conditional(self, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None,
+                    targets: Optional[torch.Tensor] = None, precision: str = "fp32",
+                    return_log_marginal: bool = False):
+        """
+        ``log p(x_t = v | e, C)``: the distribution of every target position's token given the observed tokens and the
+        constraint, for every target (sample, position).
+
+        :param data: [B, n] token ids (ignored where missing)
+        :type data: torch.Tensor
+
+        :param missing_mask: None (everything observed), [n] or [B, n]; True where a token is marginalized
+        :type missing_mask: Optional[torch.Tensor]
+
+        :param targets: None (every missing position of every sample), or a bool mask [n] or [B, n] of missing
+            positions
+        :type targets: Optional[torch.Tensor]
+
+        :param precision: "fp32" (the default; fp32-level accuracy) or "tf32" for the matrix products; inside
+            ``pyjuice.fast_inference(allow_bf16_params = True)`` the token probabilities are scored in bfloat16
+        :type precision: str
+
+        :param return_log_marginal: also return ``log p(C, e)`` of every row's sample
+        :type return_log_marginal: bool
+
+        :returns: [number of targets, V], one row per target in the order ``dense[targets]`` lists them (sample by
+            sample, positions in order), -inf rows where ``p(C, e) = 0``; with ``return_log_marginal``, also
+            [number of targets]
+        """
         self._check_pc_unchanged()
-        raise NotImplementedError("`conditional` under a constraint is not implemented yet.")
+        from .backends.lifted.conditional import conditional
+        return conditional(self, data, missing_mask, targets, precision = precision,
+                           return_log_marginal = return_log_marginal)
 
     def sample(self, *args, **kwargs):
         """Samples from the PC conditioned on the constraint (and evidence). Not implemented yet."""

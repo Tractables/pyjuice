@@ -196,7 +196,7 @@ def test_the_pc_is_fixed_once_compiled():
     with pytest.raises(NotImplementedError, match = "CUDA only"):
         cc.marginal(x)                                             # (the lifted backend needs a GPU)
     pc.to(torch.device("cuda:0"))                                  # the PC moved on its own
-    for query in (lambda: cc.marginal(x), cc.conditional, cc.sample, cc.decoder):
+    for query in (lambda: cc.marginal(x), lambda: cc.conditional(x), cc.sample, cc.decoder):
         with pytest.raises(RuntimeError, match = "moved from cpu to cuda:0 on its own.*cc.to"):
             query()
     assert cc.with_pc(pc).marginal(x).shape == (3, 1)              # recompiling (or with_pc) fixes it
