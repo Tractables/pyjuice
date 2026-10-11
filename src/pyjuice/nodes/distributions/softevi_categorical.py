@@ -3360,7 +3360,7 @@ class SoftEvidenceCategorical(Distribution):
 
             if keep_zero_params:
                 param = tl.load(params_ptr + s_pids[:,None] + cat_ids[None,:], mask = cat_mask, other = 0)
-                cum_flow += tl.sum(tl.where(param < 1e-12, 0.0, flow + numerate_pseudocount[:,None]))
+                cum_flow += tl.sum(tl.where(param < 1e-12, 0.0, flow + numerate_pseudocount[:,None]), axis = 1)
             else:
                 cum_flow += tl.sum(flow, axis = 1)
 
