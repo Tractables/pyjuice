@@ -949,7 +949,9 @@ def test_a_node_axis_gate_computes_the_right_flows(K, block_size, gate_bs, gate_
                      dist = dists.Categorical(num_cats = NUM_CATS)) for v in range(2)]
         ns = summate(multiply(*ni), num_node_blocks = K // block_size,
                      external_params = BlockScaleSumParams(block_size = gate_bs,
-                                                           ch_block_size = gate_cbs))
+                                                           ch_block_size = gate_cbs,
+                                                           # not served on a finer node-axis gate
+                                                           apply_z_correction = gate_bs == block_size))
         root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
     torch.manual_seed(0)
     root.init_parameters(perturbation = 2.0)
