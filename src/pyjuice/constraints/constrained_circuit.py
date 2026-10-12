@@ -197,8 +197,70 @@ class ConstrainedCircuit:
                 for t in range(n):
                     logp = decoder.conditional(data[:, :t], targets = [t])
 
+        Every call takes the whole evidence and computes its whole answer; the decoder compares the evidence with the
+        previous call's. A call reuses work when every row continues a row of the previous call: it observes all that
+        row observed, with the same tokens, and maybe more -- tokens appended, positions unmasked, beams reordered,
+        duplicated or dropped, the batch size changed. A new row (a new prompt) or a token observed and then missing
+        again makes the call compute everything, and so does another query on the circuit in between (allowed, inside
+        the session or not) or another ``precision``. Each call compares its rows with the previous call's on the host
+        (microseconds); when rows moved, it also copies the values it reuses to their rows' new places. The
+        ``dfa_exact`` backend reuses values; a backend that cannot computes every call afresh.
+
         The session is a :func:`pyjuice.fast_inference` scope: parameters must not change inside it. One decoder is
         open on a circuit at a time.
+
+        **Generation with a language model** (Hugging Face ``generate``), weighted as Ctrl-G does: the LM's
+        log-probabilities plus ``alpha * (log p(x_t = v | x_<t, C) - log p(x_t = v | x_<t))`` under the PC, the second
+        term from the same PC under a constraint every string satisfies. The PC's positions are the generated tokens;
+        ``generate`` hands the processor every row's tokens so far, beams already reordered, and the PC's vocabulary
+        is the start of the LM's::
+
+            from transformers import LogitsProcessor
+
+            class ConstrainedProcessor(LogitsProcessor):
+                def __init__(self, decoder, free, prompt_len, alpha = 1.0):
+                    self.decoder, self.free, self.prompt_len, self.alpha = decoder, free, prompt_len, alpha
+
+                def __call__(self, input_ids, scores):
+                    x = input_ids[:, self.prompt_len:]                      # generated so far: positions 0 .. t-1
+                    t = x.size(1)
+                    c = self.decoder.conditional(x, targets = [t])          # log p(x_t = v | x_<t, C): [B, V]
+                    u = self.free.conditional(x, targets = [t])             # log p(x_t = v | x_<t)
+                    w = torch.where(torch.isneginf(c), c, c - u)            # -inf: v makes C impossible
+                    w = torch.nn.functional.pad(w, (0, scores.size(1) - w.size(1)), value = -float("inf"))
+                    return scores.log_softmax(dim = 1) + self.alpha * w
+
+            free = jc.compile(jc.DFA.anything(V), pc)
+            with cc.decoder() as decoder, free.decoder() as free_decoder:
+                processor = ConstrainedProcessor(decoder, free_decoder, prompt.size(1))
+                out = model.generate(prompt, max_new_tokens = cc.n, num_beams = 4, logits_processor = [processor])
+
+        Dropping ``u`` (and ``free``) gives the plain product of the two models, at half the PC's cost. With
+        ``candidates``, a query scores only the given tokens -- e.g. the LM's 64 likeliest (an id outside the PC's
+        vocabulary gets -inf), in place of the four lines from ``c = ...``::
+
+                    top = scores.topk(64, dim = 1).indices
+                    c = self.decoder.conditional(x, targets = [t], candidates = top)        # [B, 64]
+                    u = self.free.conditional(x, targets = [t], candidates = top)
+                    w = torch.where(torch.isneginf(c), c, c - u)
+                    w = torch.full_like(scores, -float("inf")).scatter(1, top, w)
+
+        **Masked diffusion** (e.g. LLaDA): every step asks for every masked position at once; the rows come sample by
+        sample, positions in order -- the order ``x == MASK`` selects them in::
+
+            x = torch.full((B, cc.n), MASK, device = "cuda")
+            with cc.decoder(mask_id = MASK) as decoder:
+                for _ in range(cc.n):                                       # one position per step
+                    masked = x == MASK
+                    logp = torch.full((B, cc.n, V), -float("inf"), device = "cuda")
+                    logp[masked] = decoder.conditional(x)                   # log p(x_i = v | the unmasked, C)
+                    logp = logp + denoiser(x).log_softmax(dim = 2)
+                    best, token = logp.max(dim = 2)
+                    i = best.masked_fill(~masked, -float("inf")).argmax(dim = 1)   # the surest masked position
+                    x[torch.arange(B), i] = token[torch.arange(B), i]
+
+        Unmasking several positions in one step takes each from its own conditional, and together they may break the
+        constraint; one position at a time (the next query is cheap) keeps every sample in it.
 
         :param options: ``allow_param_copy``, ``allow_bf16_params`` and ``allow_cudagraph`` for the
             :func:`pyjuice.fast_inference` scope; any other keyword (e.g. ``mask_id``, ``precision``) is a default for
