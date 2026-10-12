@@ -9,7 +9,8 @@ newly observes a position of a region's scope, the region's inside values are th
 row. Where no row newly observes a position outside the scope, its top-down values are the previous call's too. The
 call holds the ones it needs (``held``, see :mod:`.plans`) and computes none of them. They stay in place when every row
 continues the row at its own index. Otherwise they are first moved into the call's rows
-(:func:`~..kernels.blocks.move_blocks`), and the others are given up.
+(:func:`~..kernels.blocks.move_blocks`: only the lanes live in the previous call are read), and the others are given
+up.
 
 They are exact under the call's evidence pruning (:mod:`..kernels.live`). Every slot holds its true value if live and
 at most its true value if dead. More evidence leaves fewer slots live, never more, so that stays true: a slot live
@@ -33,6 +34,7 @@ import torch
 from ....decoder import Decoder
 from ..kernels.blocks import move_blocks, move_table
 from ..kernels.common import pack_aligned
+from ..kernels.live import Pruning
 from .conditional import conditional
 from .marginal import marginal
 
@@ -47,13 +49,15 @@ class _Kept:
     """What the buffers hold after a decoder's call: per sum region, whether ``node_mars`` holds its per-sample inside
     values for the call's rows, and whether ``node_flows`` holds its top-down values. They are valid while the state
     is the same (a weak reference: a backend moved to another device frees its old state), its buffers were not used
-    since (``epoch``), and the next call has the same ``precision``."""
+    since (``epoch``), and the next call has the same ``precision``. ``pruning``: the call's liveness (None: every
+    lane), whose live lanes hold their true values in every region valid here."""
     state: weakref.ref
     epoch: int
     precision: str
     B: int
     inside: np.ndarray
     top_down: np.ndarray
+    pruning: Optional[Pruning]
 
 
 class DFAExactDecoder(Decoder):
@@ -128,13 +132,15 @@ class DFAExactDecoder(Decoder):
             held = (inside & ~on_asked.all(axis = 0), top_down & on_asked.any(axis = 0))
         if B == kept.B and (parents == np.arange(B)).all():
             return held, (inside, top_down)                             # in place: all of them stay
-        self._move(state, kept.B, B, parents, *held)
+        self._move(state, kept.B, B, parents, *held, kept.pruning)
         return held, held
 
-    def _move(self, state, B_old: int, B: int, parents: np.ndarray, inside: np.ndarray, top_down: np.ndarray):
+    def _move(self, state, B_old: int, B: int, parents: np.ndarray, inside: np.ndarray, top_down: np.ndarray,
+              pruning: Optional[Pruning]):
         """The ``inside`` and ``top_down`` values of the previous call's rows (``B_old`` of them) moved into this
         call's: row ``b`` gets row ``parents[b]``'s, in new storage laid out for a batch of ``B``, which replaces the
-        old (in one pass: the old and the new layout of a storage overlap)."""
+        old (in one pass: the old and the new layout of a storage overlap); only the lanes live under the previous
+        call's ``pruning``, -inf at the others."""
         regs = np.concatenate([np.nonzero(inside)[0], np.nonzero(top_down)[0]])
         if regs.size == 0:
             return
@@ -144,7 +150,10 @@ class DFAExactDecoder(Decoder):
         which = np.repeat(np.array([0, 1]), [int(inside.sum()), int(top_down.sum())])
         old_offset, old_width = self._layout(state, B_old)
         new_offset, new_width = self._layout(state, B)
-        table = move_table(old_offset[regs], old_width[regs], new_offset[regs], new_width[regs], slots, rows, which)
+        rank_first = None if pruning is None else \
+            np.asarray(pruning.first, dtype = np.int64)[be.program().reg_iv_np[regs]]
+        table = move_table(old_offset[regs], old_width[regs], new_offset[regs], new_width[regs], slots, rows, which,
+                           rank_first)
         tables, starts = pack_aligned([table.ravel(), parents], np.int64)
         tables = torch.from_numpy(tables).to(be.device)
         size = state.batch_layout(B)["node_size"]
@@ -154,7 +163,7 @@ class DFAExactDecoder(Decoder):
                 dsts.append(_empty(size, be.device))
                 srcs.append(state.replace_storage(name, dsts[-1]))
         move_blocks(srcs, dsts, tables[:starts[1]], B, int(rows.max()), int(slots.max()),
-                    parents = tables[starts[1]:starts[1] + B])
+                    parents = tables[starts[1]:starts[1] + B], rank = None if pruning is None else pruning.rank)
 
     def _after(self, B: int, precision: str, keep, report: dict):
         """What the buffers hold after a call: what it kept, and what it computed per sample."""
@@ -167,7 +176,8 @@ class DFAExactDecoder(Decoder):
             inside |= plan.sample[be.program().reg_iv_np]
             if plan.top_down is not None:
                 top_down |= plan.top_down.sample
-        self._kept = _Kept(weakref.ref(be.state), be.state.epoch, precision, B, inside, top_down)
+        self._kept = _Kept(weakref.ref(be.state), be.state.epoch, precision, B, inside, top_down,
+                           report.get("pruning"))
 
     def _region_tables(self, prog):
         """``(prog, cover, rows, slots)``: whether every sum region's scope holds every position (bool [n, R]), and

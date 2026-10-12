@@ -27,7 +27,8 @@ def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] =
     :param precision: "fp32" (default) or "tf32" for the sum layers' matrix products
     :param held: None, or bool [sum regions]: the per-sample inside values ``node_mars`` holds for this query, as a
         decoder decides (see :mod:`.plans`)
-    :param report: None, or a dict where the query leaves its :class:`~.plans.QueryPlan` (``"plan"``)
+    :param report: None, or a dict where the query leaves its :class:`~.plans.QueryPlan` (``"plan"``) and its
+        :class:`~..kernels.live.Pruning` (``"pruning"``; None when it observes nothing)
     :returns: [B, number of root nodes], as :func:`pyjuice.queries.marginal`
     """
     if precision not in PRECISIONS:
@@ -57,7 +58,7 @@ def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] =
         prior = prior_regions(prog, observed, B, kept, pruning)
         plan = query_plan(prog, observed, None, valid.numpy(), prior, held = held)   # every inside value
         if report is not None:
-            report["plan"] = plan
+            report.update(plan = plan, pruning = pruning)
         run_forward(backend, bufs, plan, x, missing, obs_class, pruning, precision)
         valid |= plan.todo
 

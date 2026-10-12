@@ -98,7 +98,8 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     :param missing: [B, n] bool on the device, True where a token is missing
     :param held: see :func:`conditional`
     :param observed: None, or bool [n] (host): the positions some sample observes (read off ``missing`` if None)
-    :param report: None, or a dict where the query leaves its :class:`~.plans.QueryPlan` (``"plan"``)
+    :param report: None, or a dict where the query leaves its :class:`~.plans.QueryPlan` (``"plan"``) and its
+        :class:`~..kernels.live.Pruning` (``"pruning"``; None when it observes nothing)
     :param layout: None, or ``(groups, size, (base, K))``: :func:`_layout`'s groups and size, and its ``base`` and
         ``K`` already on the device (int64 [n] each) -- copied before the query launches anything, as copies from the
         host wait for the stream
@@ -128,7 +129,7 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
                held = held.get("top_down"), scoring = True)
     plan = query_plan(prog, observed, positions, valid.numpy(), prior, held = held.get("inside"), top_down = top)
     if report is not None:
-        report["plan"] = plan
+        report.update(plan = plan, pruning = pruning)
     class_mars = F.run_forward(backend, bufs, plan, x, missing, obs_class, pruning, precision)
     valid |= plan.todo
 
@@ -161,8 +162,8 @@ def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor
     :param candidates: None (every token), or [B, n, k] token ids (see :mod:`pyjuice.constraints.evidence`): a target
         ``(b, t)``'s row scores ``candidates[b, t]`` only (:func:`~.score.score_group`); ids outside the vocabulary
         pad, and get -inf
-    :param report: None, or a dict where the query leaves its :class:`~.plans.QueryPlan` (``"plan"``; none when the
-        query computes nothing)
+    :param report: None, or a dict where the query leaves its :class:`~.plans.QueryPlan` and
+        :class:`~..kernels.live.Pruning` (see :func:`class_weights`; neither when it computes nothing)
     :returns: [rows, V], or [rows, k] with ``candidates``
     """
     _check(backend, data, precision)

@@ -38,10 +38,11 @@ def sum_path(request, monkeypatch):
 
 
 class Spy:
-    """Every call's held values (None, or ``(inside, top_down)``, bool per sum region) and the block moves."""
+    """Every call's held values (None, or ``(inside, top_down)``, bool per sum region), and the block moves and those
+    of live lanes only."""
 
     def __init__(self, monkeypatch):
-        self.held, self.moves = [], 0
+        self.held, self.moves, self.live_moves = [], 0, 0
         conditional, marginal, move_blocks = QD.conditional, QD.marginal, QD.move_blocks
 
         def spy_conditional(*args, held = None, **kwargs):
@@ -54,6 +55,7 @@ class Spy:
 
         def spy_move_blocks(*args, **kwargs):
             self.moves += 1
+            self.live_moves += kwargs.get("rank") is not None
             return move_blocks(*args, **kwargs)
 
         monkeypatch.setattr(QD, "conditional", spy_conditional)
@@ -188,8 +190,8 @@ def test_a_decoders_calls_are_the_circuits(kind, scenario, query, sum_path, buil
 def test_a_call_holds_what_the_evidence_left_unchanged(kind, build_pc, monkeypatch):
     """Left to right, a call newly observes the position before its target: it holds inside values only of scopes
     without it, top-down values only of scopes with it (none newly observed outside), and some of them; in place,
-    while reordered beams move theirs. The marginal holds inside values alone -- none on an HMM, whose per-sample
-    scopes are suffixes holding the new position."""
+    while reordered beams move theirs (the lanes live in the previous call). The marginal holds inside values alone
+    -- none on an HMM, whose per-sample scopes are suffixes holding the new position."""
     n = KINDS[kind]
     cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc(kind, n, V))
     a, b = scopes(cc).T
@@ -208,7 +210,7 @@ def test_a_call_holds_what_the_evidence_left_unchanged(kind, build_pc, monkeypat
     with cc.decoder() as decoder:
         for s in beams(n):
             decoder.conditional(**s)
-    assert spy.moves > 0
+    assert spy.live_moves > 0                                       # the previous call's live lanes only
     spy.held.clear()
     with cc.decoder() as decoder:
         for s in left_to_right(n):
@@ -278,6 +280,28 @@ def test_moving_blocks():
                 max(slots))
     for to, _, do, dw, k, r, which in place:
         assert torch.equal(dst[which][do:].view(r, dw)[:, :B * k], temp[to:to + r * B * k].view(r, B * k))
+
+
+def test_moving_live_lanes_only():
+    """Given the source samples' liveness (a pruning's ``rank``, each region's columns from a start of its own), a
+    destination lane gets its parent's value where the parent's column is live, and -inf where it is dead."""
+    g = torch.Generator().manual_seed(1)
+    B_old, B, slots, rows = 5, 170, (7, 3), (41, 18)
+    src = [torch.randn(3000, generator = g).cuda() for _ in range(2)]
+    parents = torch.randint(0, B_old, (B,), generator = g)
+    rank = torch.where(torch.rand(40 + B_old * sum(slots), generator = g) < 0.3, 0, -1).to(torch.int32)
+    starts = (40, 40 + B_old * slots[0])                            # past 40 columns of other intervals
+    moves = [(1000, B_old * slots[0] + 3, 0, B * slots[0], slots[0], rows[0], 0, starts[0]),
+             (1500, B_old * slots[1] + 3, rows[0] * B * slots[0], B * slots[1], slots[1], rows[1], 1, starts[1])]
+    dst = torch.full((sum(r * B * k for r, k in zip(rows, slots)),), float("nan"), device = "cuda")
+    move_blocks(src, (dst, dst), torch.tensor(move_table(*np.asarray(moves).T), device = "cuda"), B, max(rows),
+                max(slots), parents = parents.cuda(), rank = rank.cuda())
+    for so, sw, do, _, k, r, which, first in moves:
+        old = src[which][so:so + r * sw].view(r, sw)[:, :B_old * k].view(r, B_old, k).cpu()
+        live = (rank[first:first + B_old * k] >= 0).view(B_old, k)[parents]                  # [B, k]
+        want = torch.where(live, old[:, parents], float("-inf"))
+        assert torch.equal(dst[do:do + r * B * k].view(r, B, k).cpu(), want)
+        assert live.any() and not live.all()
 
 
 @pytest.mark.parametrize("kind", ["hmm", "hmm_untied", "hmm_block_sparse"])
