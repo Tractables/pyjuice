@@ -193,6 +193,36 @@ def test_per_boundary_liveness_equals_per_sample(kind, build_pc, monkeypatch):
         assert torch.equal(a.perm, b.perm) and torch.equal(a.rank, b.rank) and torch.equal(a.counts, b.counts)
 
 
+@pytest.mark.parametrize("kind", ["hmm", "pd", "hand_permuted", "left_linear"])
+def test_live_column_lists(kind, build_pc):
+    """Every sum interval's column lists against its live slots (both ends live, sample-major): ``perm`` the live
+    columns in order then the dead ones, ``rank`` their places among the live ones (-1 dead), the interval's and every
+    region's live count, every region's first column -- with a batch whose intervals span several list tiles."""
+    from pyjuice.constraints.backends.lifted.kernels import live as L
+    n = KINDS[kind]
+    cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc(kind, n, V))
+    prog = cc._lifted_program()
+    data, missing = evidence("mixed", n, B = 512)
+    B = data.size(0)
+    pruning = prune(prog, obs_classes(cc, data, missing), B)
+    live = pruning.live.cpu()
+    perm, rank, counts = pruning.perm.cpu(), pruning.rank.cpu(), pruning.counts.cpu()
+    assert max(B * s for s in prog.sum_iv_slots) > 2 * L.LIST_TILE
+    for k, (a, b) in enumerate(prog.sum_ivs):
+        pos = cc.layout.reachability.positions(a, b)
+        X = 1 if b == n else int(cc.layout.width[b])
+        pairs = torch.arange(int(cc.layout.width[a]) * X) if pos is None else torch.nonzero(pos.flatten() >= 0).flatten()
+        flag = ((live[:, a, pairs // X] != 0) & (live[:, b, pairs % X] != 0)).flatten()        # sample-major
+        f, size = pruning.first[k], flag.numel()
+        want = torch.cat([torch.nonzero(flag).flatten(), torch.nonzero(~flag).flatten()]).to(torch.int32)
+        assert torch.equal(perm[f:f + size], want), k
+        assert torch.equal(rank[f:f + size], torch.where(flag, torch.cumsum(flag, 0) - 1, -1).to(torch.int32)), k
+        assert int(counts[k]) == int(flag.sum()) == pruning.num_live[k]
+    reg_iv = np.asarray(prog.reg_iv_host)
+    assert torch.equal(pruning.reg_live.cpu(), counts[reg_iv])
+    assert pruning.reg_first.cpu().tolist() == [pruning.first[k] for k in reg_iv]
+
+
 def test_pruning_engages_only_under_evidence(build_pc, monkeypatch):
     """An observed prefix pins every sample to one column per boundary before it: the sums compute far fewer
     columns. With nothing observed, nothing is pruned (and nothing computed for it)."""

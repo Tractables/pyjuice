@@ -26,6 +26,7 @@ can flush a live entry's terms: the tiles where that happens are computed again 
 from dataclasses import dataclass
 from typing import List, Optional
 
+import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -131,47 +132,64 @@ def _live_backward_kernel(live, back, obs_class, next_col, succ_ptr, succ, width
                 t, n, W, C, TILE)
 
 
-@triton_jit
-def _live_slot_kernel(flag, live, ivs, iv_of, iv_info, iv_table, width, B, n, W, pid0, TILE: tl.constexpr):
-    """One program per (interval, tile of its ``B * slots`` columns): ``flag`` = 1 where the column's slot is live."""
-    k = tl.program_id(0)
-    tile = pid0 + tl.program_id(1)
-    a = tl.load(ivs + k * 3)
-    e = tl.load(ivs + k * 3 + 1)
-    first = tl.load(ivs + k * 3 + 2).to(tl.int64)
+@triton.jit
+def _live_columns(live, ivs, iv_of, iv_info, iv_table, width, k, tile, B, n, W, TILE: tl.constexpr):
+    """Tile ``tile`` of sum interval ``k``'s ``B * slots`` columns (sample-major): ``(columns, in range, live, first
+    column in the lists, slots)`` -- a column is live where its slot's two ends are live for its sample."""
+    a = tl.load(ivs + k * 4)
+    e = tl.load(ivs + k * 4 + 1)
+    first = tl.load(ivs + k * 4 + 2).to(tl.int64)
     S, _, pairs = _interval(iv_of, iv_info, a, e, n)
     X = _exit_width(width, e, n)
-    if tile * TILE < B * S:
-        col = tile * TILE + tl.arange(0, TILE)
-        m = col < B * S
-        b = (col // S).to(tl.int64)
-        v = _pair(iv_table, pairs, col % S, m, False)
-        row = live + b * (n + 1) * W
-        alive = (tl.load(row + a * W + v // X, mask = m, other = 0) != 0) & \
-            (tl.load(row + e * W + v % X, mask = m, other = 0) != 0)
-        tl.store(flag + first + col, alive.to(tl.int32), mask = m)
+    col = tile * TILE + tl.arange(0, TILE)
+    m = col < B * S
+    b = (col // S).to(tl.int64)
+    v = _pair(iv_table, pairs, col % S, m, False)
+    row = live + b * (n + 1) * W
+    alive = m & (tl.load(row + a * W + v // X, mask = m, other = 0) != 0) & \
+        (tl.load(row + e * W + v % X, mask = m, other = 0) != 0)
+    return col, m, alive, first, S
 
 
 @triton_jit
-def _live_order_kernel(flag, cum, perm, rank, ivs, iv_of, iv_info, B, n, pid0, TILE: tl.constexpr):
-    """One program per (interval, tile of its columns): ``perm`` lists the interval's live columns in order, then its
-    dead ones; ``rank`` holds every column's place among the live ones, -1 if dead (``cum``: inclusive prefix sums of
-    ``flag`` over all intervals)."""
+def _live_count_kernel(tile_live, live, ivs, iv_of, iv_info, iv_table, width, B, n, W, pid0, TILE: tl.constexpr):
+    """One program per (sum interval, tile of its columns): the tile's live columns, at ``tile_live[ivs[k, 3] +
+    tile]``."""
     k = tl.program_id(0)
     tile = pid0 + tl.program_id(1)
-    a = tl.load(ivs + k * 3)
-    e = tl.load(ivs + k * 3 + 1)
-    first = tl.load(ivs + k * 3 + 2).to(tl.int64)
-    S, _, _ = _interval(iv_of, iv_info, a, e, n)
+    col, m, alive, first, S = _live_columns(live, ivs, iv_of, iv_info, iv_table, width, k, tile, B, n, W, TILE)
     if tile * TILE < B * S:
-        col = tile * TILE + tl.arange(0, TILE)
-        m = col < B * S
-        before = tl.load(cum + first) - tl.load(flag + first)              # live columns of earlier intervals
-        num_live = tl.load(cum + first + B * S - 1) - before
-        f = tl.load(flag + first + col, mask = m, other = 0)
-        r = tl.load(cum + first + col, mask = m, other = 0) - f - before    # live columns before col
-        tl.store(perm + first + tl.where(f != 0, r, num_live + col - r), col.to(tl.int32), mask = m)
-        tl.store(rank + first + col, tl.where(f != 0, r, -1), mask = m)
+        tl.store(tile_live + tl.load(ivs + k * 4 + 3) + tile, tl.sum(alive.to(tl.int32), axis = 0))
+
+
+@triton_jit
+def _live_order_kernel(tile_live, counts, perm, rank, reg_live, iv_regs, iv_reg_ptr, live, ivs, iv_of, iv_info,
+                       iv_table, width, B, n, W, pid0, TILE: tl.constexpr):
+    """One program per (sum interval, tile of its columns): ``perm`` lists the interval's live columns in order, then
+    its dead ones, and ``rank`` holds every column's place among the live ones (-1 if dead), from the earlier tiles'
+    live counts (:func:`_live_count_kernel`) and the tile's own prefix sums; the first tile writes the interval's
+    count to ``counts`` and to its regions' ``reg_live``."""
+    k = tl.program_id(0)
+    tile = pid0 + tl.program_id(1)
+    col, m, alive, first, S = _live_columns(live, ivs, iv_of, iv_info, iv_table, width, k, tile, B, n, W, TILE)
+    t0 = tl.load(ivs + k * 4 + 3)
+    tiles = (B * S + TILE - 1) // TILE
+    before = tl.zeros([], dtype = tl.int32)
+    total = tl.zeros([], dtype = tl.int32)
+    for c0 in range(0, tiles, TILE):                                       # the interval's tiles' live counts
+        c = c0 + tl.arange(0, TILE)
+        cnt = tl.load(tile_live + t0 + c, mask = c < tiles, other = 0)
+        before += tl.sum(tl.where(c < tile, cnt, 0), axis = 0)
+        total += tl.sum(cnt, axis = 0)
+    if tile * TILE < B * S:
+        f = alive.to(tl.int32)
+        r = before + tl.cumsum(f, axis = 0) - f                            # live columns before each column
+        tl.store(perm + first + tl.where(alive, r, total + col - r), col.to(tl.int32), mask = m)
+        tl.store(rank + first + col, tl.where(alive, r, -1), mask = m)
+    if tile == 0:                                                          # (an interval without slots: 0)
+        tl.store(counts + k, total)
+        for j in range(tl.load(iv_reg_ptr + k), tl.load(iv_reg_ptr + k + 1)):
+            tl.store(reg_live + tl.load(iv_regs + j), total)
 
 
 @dataclass
@@ -245,27 +263,29 @@ def prune(prog, obs_class: torch.Tensor, B: int) -> Pruning:
         TILE = min(1024, max(32, host_next_power_of_2(W)))
         _liveness_kernel[(B,)](live, back, *tables, n, W, C, TILE = TILE, num_warps = 4)
 
-    if B not in prog.live_tables:                                           # where every sum interval's columns go
+    if B not in prog.live_tables:                    # where every sum interval's columns and their tiles' counts go
         sizes = [B * s for s in prog.sum_iv_slots]
-        first = [0]
-        for s in sizes:
-            first.append(first[-1] + s)
-        table = torch.tensor([(a, e, f) for (a, e), f in zip(prog.sum_ivs, first)], dtype = torch.int32).to(dev)
-        starts = torch.tensor(first[:-1], dtype = torch.long, device = dev)
-        prog.live_tables[B] = (sizes, first[:-1], first[-1], table, starts, starts + torch.tensor(sizes, device = dev))
-    sizes, first, total, table, starts, ends = prog.live_tables[B]
-    flag = torch.empty(total, dtype = torch.int32, device = dev)
-    tiles = host_cdiv(max(sizes), LIST_TILE)
-    for f0, size in grid_chunks(tiles, 1):
-        _live_slot_kernel[(len(sizes), size)](flag, live, table, ivs.of, ivs.info, ivs.table, prog.width_t, B, n, W,
-                                              f0, TILE = LIST_TILE)
-    cum = torch.cumsum(flag, 0, dtype = torch.int32)
-    counts = cum[ends - 1] - cum[starts] + flag[starts]
+        first, tiles = np.cumsum([0] + sizes), np.cumsum([0] + [host_cdiv(z, LIST_TILE) for z in sizes])
+        table = torch.tensor([(a, e, f, t) for (a, e), f, t in zip(prog.sum_ivs, first[:-1].tolist(), tiles[:-1].tolist())],
+                             dtype = torch.int32).to(dev)
+        regs = np.argsort(np.asarray(prog.reg_iv_host), kind = "stable")  # every interval's regions
+        reg_ptr = np.searchsorted(np.asarray(prog.reg_iv_host)[regs], np.arange(len(sizes) + 1))
+        reg_first = torch.from_numpy(first[:-1][np.asarray(prog.reg_iv_host)]).to(dev)
+        prog.live_tables[B] = (sizes, first[:-1].tolist(), int(first[-1]), int(tiles[-1]), table,
+                               torch.from_numpy(regs.astype(np.int32)).to(dev),
+                               torch.from_numpy(reg_ptr.astype(np.int32)).to(dev), reg_first)
+    sizes, first, total, num_tiles, table, iv_regs, iv_reg_ptr, reg_first = prog.live_tables[B]
+    K = len(sizes)
+    tile_live = torch.empty(num_tiles, dtype = torch.int32, device = dev)
+    counts = torch.empty(K, dtype = torch.int32, device = dev)
+    reg_live = torch.empty(len(prog.reg_iv_host), dtype = torch.int32, device = dev)
     perm = torch.empty(total, dtype = torch.int32, device = dev)
     rank = torch.empty(total, dtype = torch.int32, device = dev)
-    for f0, size in grid_chunks(tiles, 1):
-        _live_order_kernel[(len(sizes), size)](flag, cum, perm, rank, table, ivs.of, ivs.info, B, n, f0,
-                                               TILE = LIST_TILE)
-    reg_first = starts[prog.reg_iv]
+    lists = (live, table, ivs.of, ivs.info, ivs.table, prog.width_t)
+    for f0, size in grid_chunks(host_cdiv(max(sizes), LIST_TILE), 1):
+        _live_count_kernel[(K, size)](tile_live, *lists, B, n, W, f0, TILE = LIST_TILE)
+    for f0, size in grid_chunks(host_cdiv(max(sizes), LIST_TILE), 1):
+        _live_order_kernel[(K, size)](tile_live, counts, perm, rank, reg_live, iv_regs, iv_reg_ptr, *lists, B, n, W,
+                                      f0, TILE = LIST_TILE)
     return Pruning(live = live, perm = perm, rank = rank, first = first, counts = counts, reg_first = reg_first,
-                   reg_live = counts[prog.reg_iv].to(torch.int32))
+                   reg_live = reg_live)
