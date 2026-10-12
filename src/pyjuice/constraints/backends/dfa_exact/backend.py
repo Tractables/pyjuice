@@ -252,6 +252,12 @@ class DFAExactBackend(Backend):
         return conditional(self, data, missing_mask, targets, precision = precision,
                            return_log_marginal = return_log_marginal, candidates = candidates)
 
+    def decoder(self, cc, **options):
+        """A decoding session over ``cc`` whose queries reuse what the previous one computed where the evidence did
+        not change it (:class:`~.queries.decoder.DFAExactDecoder`)."""
+        from .queries.decoder import DFAExactDecoder
+        return DFAExactDecoder(cc, **{**self.decoder_defaults, **options})
+
 
 def _unsupported_reason(ns, kind: str) -> Optional[str]:
     """Why this backend cannot serve a node group (None if it can)."""

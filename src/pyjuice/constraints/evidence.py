@@ -12,6 +12,7 @@ A constrained query's inputs, from the forms users give them to the one form eve
 
 from typing import Optional
 
+import numpy as np
 import torch
 
 
@@ -50,21 +51,26 @@ def target_mask(targets, B: int, n: int) -> Optional[torch.Tensor]:
     """
     if targets is None:
         return None
-    t = torch.as_tensor(targets)
-    if t.dtype == torch.bool:
-        return t
-    if t.is_floating_point() or t.is_complex():
-        raise TypeError(f"`targets` must be a bool mask or integer positions, got {t.dtype}.")
-    pos = t.to("cpu", torch.long)
-    if pos.dim() == 1:
-        pos = pos[None, :].expand(B, -1)
-    if pos.dim() != 2 or pos.size(0) != B:
-        raise ValueError(f"`targets` given as positions must be [k] or [{B}, k], got {list(t.shape)}.")
-    if ((pos < -1) | (pos >= n)).any():
+    if isinstance(targets, torch.Tensor):
+        if targets.dtype == torch.bool:
+            return targets
+        pos = targets.cpu().numpy()
+    else:
+        pos = np.asarray(targets)                                              # numpy: a few us, not tens
+        if pos.dtype == bool:
+            return torch.from_numpy(pos)
+    if pos.dtype.kind not in "iu":
+        raise TypeError(f"`targets` must be a bool mask or integer positions, got {pos.dtype}.")
+    if pos.ndim not in (1, 2) or (pos.ndim == 2 and pos.shape[0] != B):
+        raise ValueError(f"`targets` given as positions must be [k] or [{B}, k], got {list(pos.shape)}.")
+    if pos.size and (pos.min() < -1 or pos.max() >= n):
         raise ValueError(f"`targets` given as positions must be in 0..{n - 1} (-1 pads).")
-    mask = torch.zeros(B, n + 1, dtype = torch.bool)
-    mask.scatter_(1, torch.where(pos < 0, n, pos), True)                       # -1 pads into the extra column
-    return mask[:, :n]
+    mask = np.zeros((B, n + 1), dtype = bool)                                  # -1 pads into the extra column
+    if pos.ndim == 1:
+        mask[:, pos] = True
+    else:
+        mask[np.arange(B)[:, None], pos] = True
+    return torch.from_numpy(np.ascontiguousarray(mask[:, :n]))
 
 
 def candidate_tensor(candidates, B: int, n: int) -> Optional[torch.Tensor]:

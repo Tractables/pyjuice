@@ -16,7 +16,8 @@ from .plans import prior_regions, query_plan
 
 
 
-def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None, precision: str = "fp32"):
+def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None, precision: str = "fp32",
+             held: Optional[np.ndarray] = None, report: Optional[dict] = None):
     """
     ``log p(C, e)`` for every sample: the probability that the PC generates a string that satisfies the
     constraint and agrees with the observed tokens.
@@ -24,6 +25,9 @@ def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] =
     :param data: [B, n] token ids (ignored where missing)
     :param missing_mask: None (everything observed), [n] or [B, n]; True where a token is marginalized
     :param precision: "fp32" (default) or "tf32" for the sum layers' matrix products
+    :param held: None, or bool [sum regions]: the per-sample inside values ``node_mars`` holds for this query, as a
+        decoder decides (see :mod:`.plans`)
+    :param report: None, or a dict where the query leaves its :class:`~.plans.QueryPlan` (``"plan"``)
     :returns: [B, number of root nodes], as :func:`pyjuice.queries.marginal`
     """
     if precision not in PRECISIONS:
@@ -51,7 +55,9 @@ def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] =
         pruning = prune(prog, obs_class, B) if observed.any() else None     # nothing observed: nothing to prune
         valid, kept = backend.state.prior_validity()
         prior = prior_regions(prog, observed, B, kept, pruning)
-        plan = query_plan(prog, observed, None, valid.numpy(), prior)   # every inside value
+        plan = query_plan(prog, observed, None, valid.numpy(), prior, held = held)   # every inside value
+        if report is not None:
+            report["plan"] = plan
         run_forward(backend, bufs, plan, x, missing, obs_class, pruning, precision)
         valid |= plan.todo
 

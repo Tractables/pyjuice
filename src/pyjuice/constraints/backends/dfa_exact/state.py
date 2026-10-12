@@ -19,7 +19,7 @@ else built by every query.
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
@@ -36,6 +36,8 @@ class State:
     lives on the backend's device; moving the backend starts a new one.
 
     :ivar class_mars_version: counts the computations of the class masses (what is derived from them follows)
+    :ivar epoch: counts the uses of the buffers (:meth:`buffers`): a decoder that keeps values in them between its
+        queries reuses them only if nothing else used the buffers in between
     """
 
     def __init__(self, backend):
@@ -52,6 +54,7 @@ class State:
         self._prior_kept = False                    # kept by a `pyjuice.fast_inference` scope
         self._prior_flows_state = None              # the input-independent top-down values (see `prior_flows`)
         self._token_tables = None                   # token-major input parameters kept by a scope (`token_table`)
+        self.epoch = 0
 
     # ---------------------------------------------------------------------------------------------
     # Buffers
@@ -72,6 +75,7 @@ class State:
             int64 tensors on the device for the kernels)
         """
         B = int(batch_size)
+        self.epoch += 1
         layout = self.batch_layout(B)
         node_mars = self.storage_view("node_mars", layout["node_size"])
         element_mars = self.storage_view("element_mars", layout["element_size"])
@@ -141,6 +145,17 @@ class State:
             pf["offset_t"] = torch.tensor([max(o, 0) for o in pf["offset"]], dtype = torch.int64, device = self._device)
             pf["width_t"] = torch.tensor(pf["width"], dtype = torch.int64, device = self._device)
         return pf
+
+    def storage(self, name: str) -> Optional[torch.Tensor]:
+        """The whole storage named ``name`` (see :meth:`storage_view`) as it is, or None if it was never allocated."""
+        return self._storage.get(name)
+
+    def replace_storage(self, name: str, storage: torch.Tensor) -> Optional[torch.Tensor]:
+        """Make ``storage`` (flat floats on the device) the storage named ``name`` (see :meth:`storage_view`); returns
+        the one it replaces (None if none). As every slot a query reads is written first, it need not be filled."""
+        old = self._storage.get(name)
+        self._storage[name] = storage
+        return old
 
     def storage_view(self, name: str, numel: int) -> torch.Tensor:
         """The first ``numel`` floats of the storage named ``name`` (see :meth:`buffers`)."""

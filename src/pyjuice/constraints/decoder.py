@@ -17,7 +17,9 @@ default, reuses nothing.
 from contextlib import ExitStack
 from typing import Optional
 
+import numpy as np
 import torch
+from numba import njit
 
 from pyjuice.utils.fast_inference import fast_inference
 
@@ -26,35 +28,48 @@ from .evidence import candidate_tensor, evidence, target_mask
 #: the options of the :func:`pyjuice.fast_inference` scope a decoder opens; every other option is a query default
 FAST_INFERENCE_OPTIONS = ("allow_param_copy", "allow_bf16_params", "allow_cudagraph")
 
-#: :func:`match_rows` compares at most this many (row, previous row, position) triples at a time
-MATCH_ELEMENTS = 1 << 24
-
-
-def match_rows(data: torch.Tensor, missing: torch.Tensor, previous_data: torch.Tensor,
-               previous_missing: torch.Tensor):
+def match_rows(data: np.ndarray, missing: np.ndarray, previous_data: np.ndarray, previous_missing: np.ndarray):
     """
-    For every row of a call's evidence (``data`` and ``missing``, [B, n]), the row of the previous call's evidence
-    ([B', n]) it continues -- one whose every observed position it still observes, with the same token -- and the
-    positions it newly observes.
+    For every row of a call's evidence (``data`` and ``missing``, [B, n], on the host), the row of the previous call's
+    evidence ([B', n]) it continues -- one whose every observed position it still observes, with the same token -- and
+    the positions it newly observes. A row continuing the previous row at its own index (left to right, any order, a
+    sample's draws) costs ``O(n)``; any other, up to ``O(B' n)``.
 
-    :returns: ``(parents, newly_observed)``: int64 [B], the first such previous row (-1: none -- a new row, or one
-        that no longer observes a position it did), and bool [B, n] (all False on a row without a parent), on
-        ``data``'s device
+    :returns: ``(parents, newly_observed)``: int64 [B], the previous row at the row's own index if it continues that
+        one, else the first such previous row (-1: none -- a new row, or one that no longer observes a position it
+        did), and bool [B, n] (all False on a row without a parent)
     """
-    dev = data.device
-    previous_data, previous_missing = previous_data.to(dev), previous_missing.to(dev)
+    return _match_rows(np.ascontiguousarray(data, dtype = np.int64), np.ascontiguousarray(missing, dtype = bool),
+                       np.ascontiguousarray(previous_data, dtype = np.int64),
+                       np.ascontiguousarray(previous_missing, dtype = bool))
+
+
+@njit(cache = True)
+def _continues(data, missing, previous_data, previous_missing, b, p):
+    for j in range(data.shape[1]):
+        if not previous_missing[p, j] and (missing[b, j] or data[b, j] != previous_data[p, j]):
+            return False
+    return True
+
+
+@njit(cache = True)
+def _match_rows(data, missing, previous_data, previous_missing):
     B, n = data.shape
-    Bp = previous_data.size(0)
-    parents = torch.full((B,), -1, dtype = torch.long, device = dev)
-    chunk = max(1, MATCH_ELEMENTS // max(1, Bp * n))
-    for b0 in range(0, B, chunk):
-        d, m = data[b0:b0 + chunk], missing[b0:b0 + chunk]
-        same = (d[:, None, :] == previous_data[None, :, :]) & ~m[:, None, :]          # observed, the same token
-        extends = (same | previous_missing[None, :, :]).all(dim = 2)                    # [rows, B']
-        first = extends.to(torch.int32).argmax(dim = 1)                                # the first, ties included
-        parents[b0:b0 + chunk] = torch.where(extends.any(dim = 1), first, -1)
-    has = parents >= 0
-    newly_observed = ~missing & previous_missing[parents.clamp(min = 0)] & has[:, None]
+    Bp = previous_data.shape[0]
+    parents = np.full(B, -1, dtype = np.int64)
+    newly_observed = np.zeros((B, n), dtype = np.bool_)
+    for b in range(B):
+        if b < Bp and _continues(data, missing, previous_data, previous_missing, b, b):
+            parents[b] = b
+        else:
+            for p in range(Bp):
+                if _continues(data, missing, previous_data, previous_missing, b, p):
+                    parents[b] = p
+                    break
+        p = parents[b]
+        if p >= 0:
+            for j in range(n):
+                newly_observed[b, j] = previous_missing[p, j] and not missing[b, j]
     return parents, newly_observed
 
 
@@ -69,7 +84,8 @@ class Decoder:
     :attr:`remembers`, to keep the last call's evidence for :meth:`_match_rows`); this one calls the backend's queries.
     """
 
-    #: whether the decoder keeps its own copy of the last call's evidence (for :meth:`_match_rows`)
+    #: whether the decoder keeps its own copy of the last call's evidence (for :meth:`_match_rows`); a call's
+    #: evidence then reaches its hooks on the host, where rows are matched, copied there once
     remembers = False
 
     def __init__(self, cc, **options):
@@ -109,7 +125,7 @@ class Decoder:
         """``log p(C, e)`` for every sample, as :meth:`ConstrainedCircuit.marginal` (``mask_id``: None for the
         decoder's default, -1 unless it was made with another)."""
         options = self._options(options)
-        data, missing = evidence(data, missing_mask, self._mask_id(mask_id), self.cc.n)
+        data, missing = self._evidence(data, missing_mask, mask_id)
         out = self._marginal(data, missing, **options)
         self._remember(data, missing)
         return out
@@ -120,7 +136,7 @@ class Decoder:
         """``log p(x_t = v | e, C)`` for every target, as :meth:`ConstrainedCircuit.conditional` (``mask_id``: None
         for the decoder's default, -1 unless it was made with another)."""
         options = self._options(options)
-        data, missing = evidence(data, missing_mask, self._mask_id(mask_id), self.cc.n)
+        data, missing = self._evidence(data, missing_mask, mask_id)
         B, n = data.size(0), self.cc.n
         out = self._conditional(data, missing, target_mask(targets, B, n), return_log_marginal,
                                 candidate_tensor(candidates, B, n), **options)
@@ -147,10 +163,11 @@ class Decoder:
                                            candidates = candidates, **options)
 
     def _match_rows(self, data: torch.Tensor, missing: torch.Tensor):
-        """:func:`match_rows` against the last call's evidence; None before the first call."""
+        """:func:`match_rows` of a call's evidence (on the host) against the last call's; None before the first
+        call."""
         if self._previous is None:
             return None
-        return match_rows(data, missing, *self._previous)
+        return match_rows(data.numpy(), missing.numpy(), *self._previous)
 
     # ---------------------------------------------------------------------------------------------
 
@@ -160,9 +177,15 @@ class Decoder:
         self.cc._check_pc_unchanged()
         return {**{k: v for k, v in self._defaults.items() if k != "mask_id"}, **options}
 
-    def _mask_id(self, mask_id: Optional[int]) -> int:
-        return self._defaults.get("mask_id", -1) if mask_id is None else mask_id
+    def _evidence(self, data, missing_mask, mask_id: Optional[int]):
+        """The canonical evidence (:func:`~pyjuice.constraints.evidence.evidence`); on the host if the decoder
+        remembers it (copied there as given)."""
+        mask_id = self._defaults.get("mask_id", -1) if mask_id is None else mask_id
+        if self.remembers:
+            data = torch.as_tensor(data).cpu()
+            missing_mask = None if missing_mask is None else torch.as_tensor(missing_mask).cpu()
+        return evidence(data, missing_mask, mask_id, self.cc.n)
 
     def _remember(self, data: torch.Tensor, missing: torch.Tensor):
         if self.remembers:
-            self._previous = (data.clone(), missing.clone())                # never the caller's tensors
+            self._previous = (data.numpy().copy(), missing.numpy().copy())  # never the caller's tensors

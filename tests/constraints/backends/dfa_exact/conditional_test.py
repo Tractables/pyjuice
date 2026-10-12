@@ -4,11 +4,8 @@ the test reference's (``reference.conditional``) on every kind of PC in conftest
 and every pattern of evidence, through every sum path; the class weights it scores (``dfa_class_flow``, which the
 normalized rows cannot check: a factor common to every class cancels) against the reference's input nodes' top-down
 blocks; ``log p(C, e)`` against the marginal; targets; evidence and constraints no string satisfies; the token tables'
-lifetime, in fp32 and bf16; tf32; and an HMM's decoding through a pseudo cache (:class:`HMMDecodeCache`) giving the
-rows a query computing everything gives, and (slow) its speed on an HMM4096.
+lifetime, in fp32 and bf16; tf32. Decoding with values reused between queries is in decoder_test.py.
 """
-import time
-
 import numpy as np
 import pytest
 import torch
@@ -16,7 +13,7 @@ import torch
 import pyjuice as juice
 import pyjuice.constraints as jc
 from pyjuice.constraints.backends.dfa_exact.queries import forward as F
-from pyjuice.constraints.backends.dfa_exact.queries.conditional import class_weights, conditional
+from pyjuice.constraints.backends.dfa_exact.queries.conditional import class_weights
 from pyjuice.constraints.backends.dfa_exact.kernels.score import score_tables
 from pyjuice.constraints.distributions import TokenClasses
 from pyjuice.constraints.evidence import candidate_tensor
@@ -340,95 +337,3 @@ def test_class_tiles():
             ids = tile[tile >= 0]
             assert ids.numel() and (token_class[ids] == c).all() and (ids.diff() > 0).all()
             assert (tile[ids.numel():] == -1).all()
-
-
-class HMMDecodeCache:
-    """
-    A pseudo caching engine, for tests only: the left-to-right decoding of an HMM-shaped circuit (sums over the
-    suffixes ``[t, n)``) under a constraint, step ``t`` observing the tokens before ``t`` and asking for ``t``. A sum
-    node's top-down value depends only on the evidence outside its scope, so observing ``x_{t-1}`` changes none of
-    those whose scope holds ``t - 1``, every one of which step ``t - 1`` needed: step ``t`` holds them (``held``, see
-    :mod:`pyjuice.constraints.backends.dfa_exact.query_plan`) and computes the one new layer. The buffers keep the
-    values only for the same batch size and with no other query in between.
-    """
-
-    def __init__(self, cc):
-        prog = cc.backend.program()
-        self.cc = cc
-        self.scope = np.asarray([prog.sum_ivs[prog.reg_iv_host[r]] for r in range(len(cc.backend.sum_regions))])
-        self.last = None
-
-    def step(self, data, t, precision = "fp32", cached = True):
-        B, n = data.shape
-        missing = torch.zeros(B, n, dtype = torch.bool)
-        missing[:, t:] = True
-        targets = torch.zeros(B, n, dtype = torch.bool)
-        targets[:, t] = True
-        held = None
-        if cached and self.last == (B, t - 1):
-            held = dict(top_down = (self.scope[:, 0] <= t - 1) & (t - 1 < self.scope[:, 1]))
-        self.last = (B, t)
-        return conditional(self.cc.backend, data, missing, targets, precision, held = held)
-
-
-@pytest.mark.parametrize("kind", ["hmm", "hmm_untied", "hmm_block_sparse"])
-def test_cached_decoding_gives_the_same_rows(kind, sum_path, build_pc, reference):
-    """Every step of an HMM's decoding through :class:`HMMDecodeCache`: the rows of a query computing every value, bit
-    for bit, and the reference's."""
-    n = 8
-    cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
-    data, _ = evidence("none", n, B = 4)
-    cache = HMMDecodeCache(cc)
-    with juice.fast_inference():
-        cached = [cache.step(data, t).clone() for t in range(n)]           # one decoding, then the other
-        fresh = [cache.step(data, t, cached = False).clone() for t in range(n)]
-    for t in range(n):
-        assert torch.equal(cached[t], fresh[t]), t
-        missing = torch.zeros_like(data, dtype = torch.bool)
-        missing[:, t:] = True
-        targets = torch.zeros_like(missing)
-        targets[:, t] = True
-        assert_rows_close(cached[t], reference.conditional(cc, data, missing, targets = targets), n)
-
-
-@pytest.mark.slow
-def test_cached_decoding_speed(capsys):
-    """An HMM4096 over 50257 tokens and 32 positions, under a 60-state, 10-class automaton (three keywords, all
-    required -- the size of Ctrl-G's first example's), decoded step by step at batch 1, 16 and 128 through
-    :class:`HMMDecodeCache`, inside fast_inference (fp32 and bf16 token tables) and without the cache: the cache's
-    rows are the others', and its steps are faster. Prints the milliseconds per step."""
-    n, Vb = 32, 50257
-    torch.manual_seed(0)
-    ns = juice.structures.HMM(seq_length = n, num_latents = 4096, num_emits = Vb)
-    ns.init_parameters(perturbation = 2.0)
-    pc = juice.compile(ns, verbose = False).to("cuda")
-    dfa = jc.DFA.contains([[11, 12, 13]], Vb) & jc.DFA.contains([[21, 22, 23, 24]], Vb) & jc.DFA.contains([[31, 32]], Vb)
-    cc = jc.compile(dfa, pc)
-    report = []
-    for B in (1, 16, 128):
-        g = torch.Generator().manual_seed(B)
-        data = torch.randint(0, Vb, (B, n), generator = g)
-        for bf16 in (False, True):
-            times = {}
-            for cached in (True, False):
-                cache = HMMDecodeCache(cc)
-                with juice.fast_inference(allow_bf16_params = bf16):
-                    for rep in range(2):                                        # the second pass: plans kept
-                        ts = []
-                        for t in range(n):
-                            torch.cuda.synchronize()
-                            t0 = time.perf_counter()
-                            rows = cache.step(data, t, cached = cached)
-                            torch.cuda.synchronize()
-                            ts.append(time.perf_counter() - t0)
-                            if rep == 1 and t in (8, 24):
-                                times.setdefault(("rows", t), []).append(rows)
-                times[cached] = 1e3 * float(np.median(ts[8:]))
-            for t in (8, 24):
-                a, b = times[("rows", t)]
-                assert_rows_close(a, b, n, tol = 1e-4)
-            assert times[True] < times[False]
-            report.append(f"B={B:4d} {'bf16' if bf16 else 'fp32'} table: cached {times[True]:.3f} ms/step, "
-                          f"uncached {times[False]:.3f} ms/step")
-    with capsys.disabled():
-        print("\n" + "\n".join(report))

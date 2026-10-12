@@ -60,8 +60,11 @@ def test_targets_as_positions_are_the_mask():
     assert torch.equal(target_mask([1, 3], 2, n), want)
     assert torch.equal(target_mask(torch.tensor([3, 1]), 2, n), want)
     want = torch.zeros(2, n, dtype = torch.bool)
-    want[0, 4] = want[1, 0] = want[1, 2] = True
-    assert torch.equal(target_mask(torch.tensor([[4, -1], [0, 2]]), 2, n), want)                 # -1 pads
+    want[0, 1] = want[1, 0] = want[1, 2] = True
+    assert torch.equal(target_mask(torch.tensor([[1, -1], [0, 2]]), 2, n), want)                 # -1 pads
+    want = torch.zeros(2, n, dtype = torch.bool)
+    want[:, 2] = True
+    assert torch.equal(target_mask([2, -1], 2, n), want)
     with pytest.raises(ValueError, match = "targets"):
         target_mask([n], 2, n)
     with pytest.raises(ValueError, match = "targets"):

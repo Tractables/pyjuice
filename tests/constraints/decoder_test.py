@@ -1,18 +1,18 @@
 """
 Row matching between a decoder's calls (:func:`pyjuice.constraints.decoder.match_rows`): which previous row every row
 continues -- appended tokens, reordered and duplicated beams, any-order unmasking -- and none for a new row or one that
-no longer observes a position it did; ties go to the first row; chunking changes nothing.
+no longer observes a position it did; ties go to the row at its own index, then the first; random rows as a
+brute force matches them.
 """
-import torch
+import numpy as np
 
-from pyjuice.constraints import decoder as D
 from pyjuice.constraints.decoder import match_rows
 
 
 def ev(rows):
     """``(data, missing)`` from rows of tokens, None where missing."""
-    data = torch.tensor([[0 if v is None else v for v in r] for r in rows])
-    missing = torch.tensor([[v is None for v in r] for r in rows])
+    data = np.array([[0 if v is None else v for v in r] for r in rows], dtype = np.int64)
+    missing = np.array([[v is None for v in r] for r in rows], dtype = bool)
     return data, missing
 
 
@@ -44,19 +44,26 @@ def test_any_order_unmasking():
     assert new.tolist() == [[True, False, False, False], [False, False, True, False]]
 
 
-def test_ties_go_to_the_first_row():
-    parents, _ = match_rows(*ev([[1, 2, 0]]), *ev([[None, None, None], [1, None, None], [1, None, None]]))
-    assert parents.tolist() == [0]
+def test_ties_go_to_the_row_at_its_own_index_then_the_first():
+    previous = ev([[None, None, None], [1, None, None], [1, None, None]])
+    parents, _ = match_rows(*ev([[1, 2, 0], [1, 0, 0], [1, 1, 1], [1, 2, 2]]), *previous)
+    assert parents.tolist() == [0, 1, 2, 0]                     # row 3 has no previous row at its index
+    parents, _ = match_rows(*ev([[2, 2, 0], [0, 0, 0]]), *previous)
+    assert parents.tolist() == [0, 0]                           # row 1 does not continue previous row 1
 
 
-def test_chunks_change_nothing(monkeypatch):
-    g = torch.Generator().manual_seed(0)
-    previous_data, previous_missing = torch.randint(0, 2, (9, 6), generator = g), torch.rand(9, 6, generator = g) < 0.3
-    data, missing = torch.randint(0, 2, (40, 6), generator = g), torch.rand(40, 6, generator = g) < 0.3
-    src = torch.randint(0, 9, (20,), generator = g)                           # half the rows continue a previous one
-    data[:20], missing[:20] = previous_data[src], previous_missing[src] & (torch.rand(20, 6, generator = g) < 0.5)
-    want = match_rows(data, missing, previous_data, previous_missing)
-    monkeypatch.setattr(D, "MATCH_ELEMENTS", 1)                               # one row at a time
-    got = match_rows(data, missing, previous_data, previous_missing)
-    assert torch.equal(got[0], want[0]) and torch.equal(got[1], want[1])
-    assert (want[0] >= 0).any() and (want[0] < 0).any()                       # both cases occur
+def test_random_rows_match_a_brute_force():
+    """Rows continuing random previous rows (own index or not), new rows, rows dropping an observed position."""
+    rng = np.random.default_rng(0)
+    previous_data, previous_missing = rng.integers(0, 2, (9, 6)), rng.random((9, 6)) < 0.3
+    data, missing = rng.integers(0, 2, (40, 6)), rng.random((40, 6)) < 0.3
+    src = rng.integers(0, 9, 20)                                              # half the rows continue a previous one
+    data[:20], missing[:20] = previous_data[src], previous_missing[src] & (rng.random((20, 6)) < 0.5)
+    parents, new = match_rows(data, missing, previous_data, previous_missing)
+    for b in range(40):
+        fits = [p for p in range(9) if all(previous_missing[p, j] or (not missing[b, j] and data[b, j] ==
+                                                                     previous_data[p, j]) for j in range(6))]
+        assert parents[b] == (b if b in fits else fits[0] if fits else -1), b
+        assert new[b].tolist() == ([bool(previous_missing[parents[b], j] and not missing[b, j]) for j in range(6)]
+                                   if fits else [False] * 6), b
+    assert (parents >= 0).any() and (parents < 0).any() and (parents[:9] == np.arange(9)).any()

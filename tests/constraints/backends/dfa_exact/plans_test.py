@@ -342,8 +342,8 @@ def count_once(monkeypatch):
     """Record, per marginal, whether its plan computes input-independent values."""
     seen = []
 
-    def spy(*args):
-        plan = query_plan(*args)
+    def spy(*args, **kwargs):
+        plan = query_plan(*args, **kwargs)
         seen.append(bool(plan.todo.any()))
         return plan
 

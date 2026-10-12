@@ -88,7 +88,8 @@ def _check(backend, data: torch.Tensor, precision: str):
 
 
 def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions: np.ndarray, precision: str = "fp32",
-                  held: Optional[dict] = None, observed: Optional[np.ndarray] = None, layout = None):
+                  held: Optional[dict] = None, observed: Optional[np.ndarray] = None, layout = None,
+                  report: Optional[dict] = None):
     """
     The forward and top-down passes of a conditional query: the log class weights of every input node over the
     target ``positions`` (bool [n], host), every sample's, summed per row of the class masses (see
@@ -97,6 +98,7 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     :param missing: [B, n] bool on the device, True where a token is missing
     :param held: see :func:`conditional`
     :param observed: None, or bool [n] (host): the positions some sample observes (read off ``missing`` if None)
+    :param report: None, or a dict where the query leaves its :class:`~.plans.QueryPlan` (``"plan"``)
     :param layout: None, or ``(groups, size, (base, K))``: :func:`_layout`'s groups and size, and its ``base`` and
         ``K`` already on the device (int64 [n] each) -- copied before the query launches anything, as copies from the
         host wait for the stream
@@ -125,6 +127,8 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     top = dict(program = td, once = top_down_prior(prog, td, observed, B, kept, pruning), valid = pf["valid"].copy(),
                held = held.get("top_down"), scoring = True)
     plan = query_plan(prog, observed, positions, valid.numpy(), prior, held = held.get("inside"), top_down = top)
+    if report is not None:
+        report["plan"] = plan
     class_mars = F.run_forward(backend, bufs, plan, x, missing, obs_class, pruning, precision)
     valid |= plan.todo
 
@@ -140,7 +144,7 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
 
 def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None,
                 targets: Optional[torch.Tensor] = None, precision: str = "fp32", return_log_marginal: bool = False,
-                held: Optional[dict] = None, candidates: Optional[torch.Tensor] = None):
+                held: Optional[dict] = None, candidates: Optional[torch.Tensor] = None, report: Optional[dict] = None):
     """
     ``log p(x_t = v | e, C)`` for every target ``(b, t)`` and token ``v`` (or candidate ``v``): one row per target, in
     the order ``dense[targets]`` lists them (sample by sample, positions in order); -inf rows where ``p(e, C) = 0``.
@@ -157,6 +161,8 @@ def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor
     :param candidates: None (every token), or [B, n, k] token ids (see :mod:`pyjuice.constraints.evidence`): a target
         ``(b, t)``'s row scores ``candidates[b, t]`` only (:func:`~.score.score_group`); ids outside the vocabulary
         pad, and get -inf
+    :param report: None, or a dict where the query leaves its :class:`~.plans.QueryPlan` (``"plan"``; none when the
+        query computes nothing)
     :returns: [rows, V], or [rows, k] with ``candidates``
     """
     _check(backend, data, precision)
@@ -189,7 +195,7 @@ def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor
     with torch.no_grad():
         layout = (groups, size, (tables[starts[0]:starts[0] + n], tables[starts[1]:starts[1] + n]))
         groups, class_mars = class_weights(backend, data, missing, positions, precision, held,
-                                           observed = (~miss).any(axis = 0), layout = layout)
+                                           observed = (~miss).any(axis = 0), layout = layout, report = report)
         out = torch.empty(M, width, device = dev)
         log_marginal = torch.empty(M + 1, device = dev) if return_log_marginal else None
         for (g, pos, w), start in zip(groups, starts[2:]):
