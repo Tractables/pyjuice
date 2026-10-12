@@ -24,7 +24,7 @@ mass_k(c)`` from the class masses (no second pass over the tokens).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -369,6 +369,49 @@ def _score_kernel(table, w, shift, logz, toks, tile_cls, out_row, out, N, K, V, 
     tl.store(out + r.to(tl.int64)[:, None] * V + tk[None, :], val, mask = (r >= 0)[:, None] & ok[None, :])
 
 
+@triton_jit
+def _score_candidates_kernel(table, w, shift, logz, token_class, cand, out_row, out, N, K, V, C, KC,
+                             BV: tl.constexpr, BH: tl.constexpr, EVEN_K: tl.constexpr):
+    """One program per (column ``n``, tile of ``BV`` of its row's candidates): ``log sum_k T[v, k] w[n, c(v), k] +
+    shift[n, c(v)] - logz[n]`` for every candidate ``v = cand[r, j]`` of row ``r = out_row[n]`` (-1: not requested),
+    into ``out[r, j]`` (``out`` [M, KC]); -inf where ``v`` is outside the vocabulary (padding) or ``p(e, C)`` is 0.
+    The weights as :func:`_score_kernel` reads them; the dot in fp32, over the candidates' rows of the table alone.
+    ``EVEN_K``: ``BH`` divides ``K``."""
+    n = tl.program_id(0).to(tl.int64)
+    js = tl.program_id(1) * BV + tl.arange(0, BV)
+    r = tl.load(out_row + n)
+    jm = (js < KC) & (r >= 0)
+    rr = tl.where(r >= 0, r, 0).to(tl.int64)
+    tk = tl.load(cand + rr * KC + js, mask = jm, other = -1)
+    ok = jm & (tk >= 0) & (tk < V)
+    tks = tl.where(ok, tk, 0).to(tl.int64)
+    c = tl.load(token_class + tks, mask = ok, other = 0).to(tl.int64)
+    trow = table + tks[:, None] * K                                           # [BV, 1]: every candidate's row
+    wrow = w + (n * C + c)[:, None] * K                                       # [BV, 1]: its class's weights
+    acc = tl.zeros([BV], dtype = tl.float32)
+    for k0 in range(0, K, BH):
+        ks = k0 + tl.arange(0, BH)
+        if EVEN_K:
+            m = ok[:, None]
+        else:
+            m = ok[:, None] & (ks < K)[None, :]
+        t = tl.load(trow + ks[None, :], mask = m, other = 0.0).to(tl.float32)                       # [BV, BH]
+        a = tl.load(wrow + ks[None, :], mask = m, other = 0.0)                                      # [BV, BH]
+        acc += tl.sum(t * a, axis = 1)
+    sc = tl.load(shift + n * C + c, mask = ok, other = float("-inf"))
+    lz = tl.load(logz + n)
+    val = tl.where(ok & (lz != float("-inf")), tl.log(acc) + sc - lz, float("-inf"))
+    tl.store(out + rr * KC + js, val, mask = jm)
+
+
+#: :func:`_score_candidates_kernel`'s ``(BV, BH, warps)`` -- candidates per program, the dot's chunk of rows -- for at
+#: most :data:`SCORE_CANDIDATE_PAIRS` (column, candidate) pairs, and for more: from a sweep of the cached decode step on
+#: Ctrl-G's HMM4096 (4096 rows) at 1/16/128 columns x 50/1024 candidates, the first within 2% of the best everywhere
+#: but 128 x 1024, where the second takes the step from 3.32 to 2.87 ms (scoring every token: 2.92)
+SCORE_CANDIDATE_TILES = ((16, 256, 4), (64, 64, 2))
+SCORE_CANDIDATE_PAIRS = 1 << 16
+
+
 #: :func:`_score_kernel`'s tiles ``(BB, BV, BH, warps, stages)`` by table dtype and dot precision, for at most 16, 64 and
 #: more columns: from a sweep of the kernel on Ctrl-G's HMM4096 (V = 50257, 4096 rows) and first example's 10 classes at
 #: 1/16, 64 and 128 columns, ``BH`` (the dots' reduction chunk) fixed per dtype. (16, 64, 32, 4, 2) -- the fastest
@@ -379,7 +422,8 @@ SCORE_TILES = {("fp32", "tf32x3"): ((16, 128, 32, 4, 2), (32, 64, 32, 8, 3), (32
 
 
 def score_group(out: torch.Tensor, table: torch.Tensor, w: torch.Tensor, rows: torch.Tensor, class_mars: torch.Tensor,
-                out_row: torch.Tensor, classes, precision: str) -> torch.Tensor:
+                out_row: torch.Tensor, classes, precision: str, candidates: Optional[torch.Tensor] = None
+                ) -> torch.Tensor:
     """
     Score one row group: ``out[out_row[n], v] = log p(x_t = v | e, C)`` for every column ``n`` (a target position's
     sample) that ``out_row`` asks for, from its log class weights ``w`` [N, C, K] (overwritten), the group's
@@ -387,6 +431,8 @@ def score_group(out: torch.Tensor, table: torch.Tensor, w: torch.Tensor, rows: t
 
     :param classes: the constraint's :class:`~pyjuice.constraints.distributions.TokenClasses`
     :param precision: the dot's: "tf32x3" (fp32-level) or "tf32"
+    :param candidates: None (every token), or int32 [M, k] on the device: row ``r`` scores ``candidates[r]`` alone,
+        into ``out[r]`` ([M, k]), by :func:`_score_candidates_kernel` (in fp32 whatever ``precision``)
     :returns: ``log p(e, C)`` of every column, [N]
     """
     N, C, K = w.shape
@@ -396,6 +442,13 @@ def score_group(out: torch.Tensor, table: torch.Tensor, w: torch.Tensor, rows: t
     _score_weights_kernel[(N * C,)](w, class_mars, rows, shift[0], shift[1], C, K,
                                     TK = min(1024, max(16, host_next_power_of_2(K))), num_warps = 4)
     _logz_kernel[(N,)](shift[1], logz, C, TC = min(1024, max(16, host_next_power_of_2(C))), num_warps = 1)
+    if candidates is not None:
+        KC = candidates.size(1)
+        BV, BH, warps = SCORE_CANDIDATE_TILES[N * KC > SCORE_CANDIDATE_PAIRS]
+        _score_candidates_kernel[(N, host_cdiv(KC, BV))](table, w, shift[0], logz, classes.token_class, candidates,
+                                                         out_row, out, N, K, V, C, KC, BV = BV, BH = BH,
+                                                         EVEN_K = K % BH == 0, num_warps = warps)
+        return logz
     dtype = "bf16" if table.dtype == torch.bfloat16 else "fp32"
     prec = "tf32" if dtype == "bf16" else precision
     BB, BV, BH, warps, stages = SCORE_TILES[(dtype, prec)][0 if N <= 16 else 1 if N <= 64 else 2]

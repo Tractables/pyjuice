@@ -140,10 +140,10 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
 
 def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None,
                 targets: Optional[torch.Tensor] = None, precision: str = "fp32", return_log_marginal: bool = False,
-                held: Optional[dict] = None):
+                held: Optional[dict] = None, candidates: Optional[torch.Tensor] = None):
     """
-    ``log p(x_t = v | e, C)`` for every target ``(b, t)`` and token ``v``: one row per target, in the order
-    ``dense[targets]`` lists them (sample by sample, positions in order); -inf rows where ``p(e, C) = 0``.
+    ``log p(x_t = v | e, C)`` for every target ``(b, t)`` and token ``v`` (or candidate ``v``): one row per target, in
+    the order ``dense[targets]`` lists them (sample by sample, positions in order); -inf rows where ``p(e, C) = 0``.
 
     :param data: [B, n] token ids (ignored where missing)
     :param missing_mask: None (everything observed), [n] or [B, n]; True where a token is marginalized
@@ -154,17 +154,21 @@ def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor
     :param return_log_marginal: also return ``log p(e, C)`` of every row's sample, [rows]
     :param held: None, or what the buffers hold for this query, as a caching engine decides (see :mod:`.plans`):
         a dict with ``inside`` and ``top_down``, each None or bool [sum regions]
-    :returns: [rows, V]
+    :param candidates: None (every token), or [B, n, k] token ids (see :mod:`pyjuice.constraints.evidence`): a target
+        ``(b, t)``'s row scores ``candidates[b, t]`` only (:func:`~.score.score_group`); ids outside the vocabulary
+        pad, and get -inf
+    :returns: [rows, V], or [rows, k] with ``candidates``
     """
     _check(backend, data, precision)
     n, dev = backend.n, backend.device
     B = data.size(0)
     miss, tgt = _masks(missing_mask, targets, B, n)                          # on the host: the query's one wait
     V = backend.token_classes.token_class.numel()
+    width = V if candidates is None else candidates.size(2)
     rank = np.cumsum(tgt.ravel()).reshape(B, n) - 1                          # a target's row
     M = int(tgt.sum())
     if M == 0 or not backend.satisfiable:
-        out = torch.full((M, V), -float("inf"), device = dev)
+        out = torch.full((M, width), -float("inf"), device = dev)
         return (out, torch.full((M,), -float("inf"), device = dev)) if return_log_marginal else out
 
     score = score_tables(backend.program())
@@ -172,22 +176,27 @@ def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor
     groups, base, K, size = _layout(backend, positions, B)
     # every row group's columns' rows (-1: a sample not targeting the position), with the layout, in one copy
     out_rows = [np.where(tgt[:, pos], rank[:, pos], -1).T.ravel() for _, pos, _ in groups]     # column p * B + b
-    tables, starts = pack_aligned([base, K, *out_rows], np.int64)
+    rows_bt = list(np.nonzero(tgt)) if candidates is not None else []          # every row's (sample, position)
+    tables, starts = pack_aligned([base, K, *out_rows, *rows_bt], np.int64)
     tables = torch.from_numpy(tables).to(dev)
     starts = starts.tolist()
+    cand = None
+    if candidates is not None:                                                # every row's candidates, [M, k]
+        sb, st = starts[-3], starts[-2]
+        cand = candidates.to(dev)[tables[sb:sb + M], tables[st:st + M]].to(torch.int32).contiguous()
     missing = F.missing_tensor(missing_mask, B, n, dev) if missing_mask is None or missing_mask.is_cuda else \
         torch.from_numpy(miss).to(dev)
     with torch.no_grad():
         layout = (groups, size, (tables[starts[0]:starts[0] + n], tables[starts[1]:starts[1] + n]))
         groups, class_mars = class_weights(backend, data, missing, positions, precision, held,
                                            observed = (~miss).any(axis = 0), layout = layout)
-        out = torch.empty(M, V, device = dev)
+        out = torch.empty(M, width, device = dev)
         log_marginal = torch.empty(M + 1, device = dev) if return_log_marginal else None
         for (g, pos, w), start in zip(groups, starts[2:]):
             out_row = tables[start:start + len(pos) * B]
             table = backend.state.token_table(g, score.rows[g])
             logz = score_group(out, table, w, score.rows_t[g], class_mars, out_row, backend.token_classes,
-                               F.PRECISIONS[precision])
+                               F.PRECISIONS[precision], candidates = cand)
             if log_marginal is not None:
                 log_marginal[torch.where(out_row >= 0, out_row, M)] = logz
     return (out, log_marginal[:M]) if return_log_marginal else out

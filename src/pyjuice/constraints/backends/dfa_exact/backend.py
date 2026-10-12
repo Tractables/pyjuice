@@ -240,16 +240,17 @@ class DFAExactBackend(Backend):
 
     def conditional(self, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None,
                     targets: Optional[torch.Tensor] = None, return_log_marginal: bool = False,
-                    precision: str = "fp32"):
+                    candidates: Optional[torch.Tensor] = None, precision: str = "fp32"):
         """
-        ``log p(x_t = v | e, C)`` for every target (see :meth:`~pyjuice.constraints.ConstrainedCircuit.conditional`).
+        ``log p(x_t = v | e, C)`` for every target, of every token or of the ``candidates`` (see
+        :meth:`~pyjuice.constraints.ConstrainedCircuit.conditional`).
 
         :param precision: "fp32" (the default; fp32-level accuracy) or "tf32" for the matrix products; inside
             ``pyjuice.fast_inference(allow_bf16_params = True)`` the token probabilities are scored in bfloat16
         """
         from .queries.conditional import conditional
         return conditional(self, data, missing_mask, targets, precision = precision,
-                           return_log_marginal = return_log_marginal)
+                           return_log_marginal = return_log_marginal, candidates = candidates)
 
 
 def _unsupported_reason(ns, kind: str) -> Optional[str]:

@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional
 import torch
 
 from .backends.base import Backend
+from .evidence import candidate_tensor, evidence, target_mask
 from .language.base import Constraint
 from .structure import PCStructure, analyze_structure
 
@@ -112,52 +113,73 @@ class ConstrainedCircuit:
     # Queries
     # ---------------------------------------------------------------------------------------------
 
-    def marginal(self, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None, **options) -> torch.Tensor:
+    def marginal(self, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None, *, mask_id: int = -1,
+                 **options) -> torch.Tensor:
         """
         ``log p(C, e)`` for every sample: the log-probability that the PC generates a string that satisfies the
         constraint and agrees with the observed tokens.
 
-        :param data: [B, n] token ids (ignored where missing)
+        :param data: [B, n] token ids, or a prefix [B, L] (``L <= n``) whose later positions are missing; a token equal
+            to ``mask_id`` is missing
         :type data: torch.Tensor
 
-        :param missing_mask: None (everything observed), [n] or [B, n]; True where a token is marginalized
+        :param missing_mask: None, [n] or [B, n]; True where a token is marginalized (as well as where ``data`` holds
+            ``mask_id``)
         :type missing_mask: Optional[torch.Tensor]
+
+        :param mask_id: the token id marking a missing position, never a real token (default -1)
+        :type mask_id: int
 
         :param options: the backend's options (e.g. ``precision`` for ``dfa_exact``, see its ``marginal``)
 
         :returns: [B, number of root nodes], as :func:`pyjuice.queries.marginal`
         """
         self._check_pc_unchanged()
-        return self.backend.marginal(data, missing_mask, **options)
+        data, missing = evidence(data, missing_mask, mask_id, self.n)
+        return self.backend.marginal(data, missing, **options)
 
     def conditional(self, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None,
-                    targets: Optional[torch.Tensor] = None, return_log_marginal: bool = False, **options):
+                    targets: Optional[torch.Tensor] = None, return_log_marginal: bool = False, *, mask_id: int = -1,
+                    candidates: Optional[torch.Tensor] = None, **options):
         """
         ``log p(x_t = v | e, C)``: the distribution of every target position's token given the observed tokens and the
         constraint, for every target (sample, position).
 
-        :param data: [B, n] token ids (ignored where missing)
+        :param data: [B, n] token ids, or a prefix [B, L] (``L <= n``) whose later positions are missing; a token equal
+            to ``mask_id`` is missing
         :type data: torch.Tensor
 
-        :param missing_mask: None (everything observed), [n] or [B, n]; True where a token is marginalized
+        :param missing_mask: None, [n] or [B, n]; True where a token is marginalized (as well as where ``data`` holds
+            ``mask_id``)
         :type missing_mask: Optional[torch.Tensor]
 
-        :param targets: None (every missing position of every sample), or a bool mask [n] or [B, n] of missing
-            positions
+        :param targets: None (every missing position of every sample); a bool mask [n] or [B, n] of missing
+            positions; or the positions themselves, [k] for every sample or [B, k] per sample (-1 pads)
         :type targets: Optional[torch.Tensor]
 
         :param return_log_marginal: also return ``log p(C, e)`` of every row's sample
         :type return_log_marginal: bool
 
+        :param mask_id: the token id marking a missing position, never a real token (default -1)
+        :type mask_id: int
+
+        :param candidates: None (every token), or the tokens whose log-probabilities to return: [k] for every
+            target, [B, k] for every target of sample ``b``, or [B, n, k] per sample and position; an id outside the
+            vocabulary (-1) pads, and gets -inf. Exact, and cheaper than every token when ``k`` is small
+        :type candidates: Optional[torch.Tensor]
+
         :param options: the backend's options (e.g. ``precision`` for ``dfa_exact``, see its ``conditional``)
 
-        :returns: [number of targets, V], one row per target in the order ``dense[targets]`` lists them (sample by
-            sample, positions in order), -inf rows where ``p(C, e) = 0``; with ``return_log_marginal``, also
-            [number of targets]
+        :returns: [number of targets, V] (or [number of targets, k] with ``candidates``), one row per target in the
+            order ``dense[targets]`` lists them (sample by sample, positions in order), -inf rows where ``p(C, e) =
+            0``; with ``return_log_marginal``, also [number of targets]
         """
         self._check_pc_unchanged()
-        return self.backend.conditional(data, missing_mask, targets, return_log_marginal = return_log_marginal,
-                                        **options)
+        data, missing = evidence(data, missing_mask, mask_id, self.n)
+        B = data.size(0)
+        return self.backend.conditional(data, missing, target_mask(targets, B, self.n),
+                                        return_log_marginal = return_log_marginal,
+                                        candidates = candidate_tensor(candidates, B, self.n), **options)
 
     def sample(self, *args, **kwargs):
         """Samples from the PC conditioned on the constraint (and evidence)."""

@@ -19,6 +19,7 @@ from pyjuice.constraints.backends.dfa_exact.queries import forward as F
 from pyjuice.constraints.backends.dfa_exact.queries.conditional import class_weights, conditional
 from pyjuice.constraints.backends.dfa_exact.kernels.score import score_tables
 from pyjuice.constraints.distributions import TokenClasses
+from pyjuice.constraints.evidence import candidate_tensor
 
 V = 3
 KINDS = {"hmm": 6, "hmm_untied": 6, "hmm_block_sparse": 6, "left_linear": 6, "pd": 8, "pd_prod_dominated": 8,
@@ -152,6 +153,88 @@ def test_targets(build_pc, reference):
                       reference.conditional(cc, data, missing, targets = some), n)
     with pytest.raises(ValueError):
         cc.conditional(data, missing, targets = ~missing)
+
+
+def test_evidence_and_targets_in_every_form(build_pc):
+    """``mask_id``, a prefix, and ``mask_id`` with ``missing_mask`` give what the explicit ``missing_mask`` gives,
+    conditionals and marginal alike; targets as positions ([k] or [B, k] with padding) what their mask gives."""
+    n = KINDS["hand_left"]
+    cc = jc.compile(CONSTRAINTS["contains"](), build_pc("hand_left", n, V))
+    data, missing = evidence("mixed", n)
+    B = data.size(0)
+    want = cc.conditional(data, missing)
+    assert torch.equal(cc.conditional(torch.where(missing, -1, data)), want)
+    assert torch.equal(cc.conditional(torch.where(missing, 7, data), mask_id = 7), want)
+    some = missing & (torch.arange(n) % 2 == 0)
+    assert torch.equal(cc.conditional(torch.where(some, -1, data), missing & ~some), want)
+    assert torch.equal(cc.marginal(torch.where(missing, -1, data)), cc.marginal(data, missing))
+    L = n // 2
+    after = torch.zeros(B, n, dtype = torch.bool)
+    after[:, L:] = True
+    assert torch.equal(cc.conditional(data[:, :L]), cc.conditional(data, after))
+    assert torch.equal(cc.marginal(data[:, :L]), cc.marginal(data, after))
+
+    missing[:, 2] = True
+    one = torch.zeros(n, dtype = torch.bool)
+    one[2] = True
+    assert torch.equal(cc.conditional(data, missing, targets = [2]), cc.conditional(data, missing, targets = one))
+    pos = torch.full((B, 2), -1, dtype = torch.long)
+    mask = torch.zeros(B, n, dtype = torch.bool)
+    for b in range(B):
+        idx = torch.nonzero(missing[b]).flatten()[:b % 3]                    # 0, 1 or 2 targets per sample
+        pos[b, :len(idx)] = idx.flip(0)                                       # in any order
+        mask[b, idx] = True
+    assert torch.equal(cc.conditional(data, missing, targets = pos), cc.conditional(data, missing, targets = mask))
+
+
+@pytest.mark.parametrize("name", ["contains", "avoids"])
+@pytest.mark.parametrize("kind", list(KINDS))
+def test_candidates_are_columns_of_the_full_rows(kind, name, build_pc):
+    """``candidates`` in every form -- shared, per sample, per sample and position, with repeats and padding (-1, and
+    ids past the vocabulary) -- give the full rows' columns at them, -inf at padding; ``log p(C, e)`` is unchanged."""
+    n = KINDS[kind]
+    cc = jc.compile(CONSTRAINTS[name](), build_pc(kind, n, V))
+    data, missing = evidence("mixed", n)
+    B = data.size(0)
+    full, log_marginal = cc.conditional(data, missing, return_log_marginal = True)
+    rows = torch.nonzero(missing)
+    g = torch.Generator().manual_seed(0)
+    forms = {"shared": torch.tensor([2, 0, -1, 1, V + 2, 2]),
+             "per sample": torch.randint(-1, V, (B, 5), generator = g),
+             "per position": torch.randint(-1, V + 1, (B, n, 40), generator = g)}            # several tiles
+    for form, cand in forms.items():
+        got, got_marginal = cc.conditional(data, missing, return_log_marginal = True, candidates = cand)
+        per_row = candidate_tensor(cand, B, n)[rows[:, 0], rows[:, 1]]
+        ok = (per_row >= 0) & (per_row < V)
+        want = torch.where(ok, full.cpu().gather(1, per_row.clamp(0, V - 1)), -float("inf"))
+        assert_rows_close(got.cpu(), want, n)
+        assert torch.equal(got_marginal, log_marginal), form
+
+
+@pytest.mark.parametrize("tiles", ["small", "large"])
+def test_candidates_over_many_rows_and_bf16_tables(tiles, build_pc, monkeypatch):
+    """An HMM whose input nodes read 256 rows (the kernel's whole chunks of rows), in fp32 and with a bf16 token table
+    inside fast_inference, with either of the kernel's tiles; and a constraint no string satisfies."""
+    from pyjuice.constraints.backends.dfa_exact.kernels import score
+    monkeypatch.setattr(score, "SCORE_CANDIDATE_PAIRS", 1 << 30 if tiles == "small" else 0)
+    torch.manual_seed(0)
+    n = 6
+    pc = juice.compile(juice.structures.HMM(seq_length = n, num_latents = 256, num_emits = V),
+                       verbose = False).to(torch.device("cuda:0"))
+    cc = jc.compile(CONSTRAINTS["either"](), pc)
+    data, missing = evidence("mixed", n)
+    cand = torch.randint(-1, V, (data.size(0), n, 7))
+    rows = torch.nonzero(missing)
+    per_row = candidate_tensor(cand, data.size(0), n)[rows[:, 0], rows[:, 1]]
+    ok = (per_row >= 0) & (per_row < V)
+    for scope, tol in ((juice.fast_inference(), None), (juice.fast_inference(allow_bf16_params = True), 1e-2)):
+        with scope:
+            full = cc.conditional(data, missing).cpu()
+            got = cc.conditional(data, missing, candidates = cand).cpu()
+        assert_rows_close(got, torch.where(ok, full.gather(1, per_row.clamp(0, V - 1)), -float("inf")), n, tol = tol)
+    never = jc.compile(jc.DFA.contains([[1, 2] * n], V), pc)
+    got = never.conditional(data, missing, candidates = cand)
+    assert got.shape == (int(missing.sum()), 7) and torch.isneginf(got).all()
 
 
 def test_evidence_breaking_the_constraint(build_pc, reference):

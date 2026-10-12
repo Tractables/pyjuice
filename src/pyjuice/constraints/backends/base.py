@@ -22,7 +22,10 @@ class Backend(ABC):
     An inference backend: what :func:`pyjuice.constraints.compile` built for one constraint and one PC.
 
     Options of a query that only some backends have (e.g. a numerical precision) are keyword arguments of its
-    query methods, passed through by the :class:`~pyjuice.constraints.ConstrainedCircuit`.
+    query methods, passed through by the :class:`~pyjuice.constraints.ConstrainedCircuit`. The circuit gives the
+    queries their inputs in one form (see :mod:`pyjuice.constraints.evidence`): ``data`` [B, n] token ids and
+    ``missing_mask`` [B, n] bool on ``data``'s device, ``targets`` None or a bool mask ([n] or [B, n]), and
+    ``candidates`` None or [B, n, k] token ids (a view where shared; an id outside the vocabulary pads).
     """
 
     #: the name ``pyjuice.constraints.compile(..., backend = name)`` selects it by
@@ -52,13 +55,13 @@ class Backend(ABC):
         """A summary of what the backend compiled (merged into :meth:`ConstrainedCircuit.info`)."""
         return {}
 
-    def marginal(self, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None, **options) -> torch.Tensor:
+    def marginal(self, data: torch.Tensor, missing_mask: torch.Tensor, **options) -> torch.Tensor:
         """``log p(C, e)`` for every sample (see :meth:`~pyjuice.constraints.ConstrainedCircuit.marginal`)."""
         raise NotImplementedError(f"The {self.name} backend does not serve `marginal`.")
 
-    def conditional(self, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None,
-                    targets: Optional[torch.Tensor] = None, return_log_marginal: bool = False, **options):
-        """``log p(x_t = v | e, C)`` for every target (see
+    def conditional(self, data: torch.Tensor, missing_mask: torch.Tensor, targets: Optional[torch.Tensor] = None,
+                    return_log_marginal: bool = False, candidates: Optional[torch.Tensor] = None, **options):
+        """``log p(x_t = v | e, C)`` for every target, of every token or of the ``candidates`` (see
         :meth:`~pyjuice.constraints.ConstrainedCircuit.conditional`)."""
         raise NotImplementedError(f"The {self.name} backend does not serve `conditional`.")
 
