@@ -16,7 +16,7 @@ import triton.language as tl
 
 import pyjuice as juice
 import pyjuice.constraints as jc
-from pyjuice.constraints.backends.lifted.kernels.prod import _lse_step, _lse_step_one_exp
+from pyjuice.constraints.backends.dfa_exact.kernels.prod import _lse_step, _lse_step_one_exp
 
 V = 3
 KINDS = {"hmm": 6, "hmm_untied": 6, "hmm_block_sparse": 6, "left_linear": 6, "pd": 8, "pd_prod_dominated": 8, "pd_blockified": 8,
@@ -52,7 +52,7 @@ def assert_close(got, want, n):
 def sum_path(request, monkeypatch):
     """Run the sum layers' node blocks through the fused kernel only, or through the dense (cuBLAS) path wherever
     they qualify -- the test circuits' blocks are far below the size the dense path is used from by default."""
-    from pyjuice.constraints.backends.lifted.kernels import sum as lifted_sum
+    from pyjuice.constraints.backends.dfa_exact.kernels import sum as lifted_sum
     monkeypatch.setattr(lifted_sum, "DENSE_MIN_BLOCK", 1 if request.param == "dense" else 1 << 30)
     return request.param
 
@@ -61,7 +61,7 @@ def sum_path(request, monkeypatch):
 def transitions(request, monkeypatch):
     """A missing token's transitions one class at a time, or grouped by successor through transition masses (the
     test automata have far fewer classes than grouping is used from by default)."""
-    import pyjuice.constraints.backends.lifted.forward as F
+    import pyjuice.constraints.backends.dfa_exact.forward as F
     monkeypatch.setattr(F, "GROUP_MIN_RATIO", 1 << 30 if request.param == "classes" else 0)
     return request.param
 
@@ -184,8 +184,8 @@ def test_every_sample_is_a_contiguous_block(kind, build_pc):
 def test_skipping_empty_tiles_changes_nothing(build_pc, monkeypatch):
     """A wide automaton, so that blocks span several tiles and some (output tile, shared chunk) pairs cannot be
     joined: skipping them gives what computing them gives."""
-    from pyjuice.constraints.backends.lifted.kernels import prod
-    from pyjuice.constraints.backends.lifted.plan import Reachability
+    from pyjuice.constraints.backends.dfa_exact.kernels import prod
+    from pyjuice.constraints.backends.dfa_exact.plan import Reachability
     rng = random.Random(0)
     K, n = 48, 8
     dfa = jc.DFA.from_dense(V, [[rng.randrange(K) for _ in range(V)] for _ in range(K)], 0, rng.sample(range(K), 12))
@@ -234,7 +234,7 @@ def test_fast_inference_keeps_the_class_masses(kind, build_pc, reference, monkey
     pc, other = build_pc(kind, n, V, seed = 0), build_pc(kind, n, V, seed = 1)
     cc = jc.compile(CONSTRAINTS["contains"](), pc)
     data, missing = evidence(n, 4)
-    import pyjuice.constraints.backends.lifted.forward as F
+    import pyjuice.constraints.backends.dfa_exact.forward as F
     monkeypatch.setattr(F, "GROUP_MIN_RATIO", 0)                       # transitions grouped
     calls, computed = [], categorical.class_masses
     monkeypatch.setattr(categorical, "class_masses", lambda *a, **k: calls.append(1) or computed(*a, **k))
@@ -282,7 +282,7 @@ def stack_keys(cc):
 def spy_dense_sums(monkeypatch):
     """Record, per dense_sum call of the forward, whether it got stacked weights and live columns; and count the
     stacked weights built."""
-    import pyjuice.constraints.backends.lifted.forward as F
+    import pyjuice.constraints.backends.dfa_exact.forward as F
     calls, builds = [], []
     dense_sum, stacked_weights = F.dense_sum, F.stacked_weights
     monkeypatch.setattr(F, "dense_sum", lambda *a, **k: calls.append((k["stacked"] is not None, k["live"] is not None))
@@ -299,7 +299,7 @@ def test_stacked_dense_weights(tied, dense_pruning, reference, monkeypatch):
     copying each once; inside a scope every run is stacked, by the first query, and kept until the scope exits --
     an in-place parameter update after it is read. The marginal matches the reference throughout, on all columns
     and on the live ones only (evidence pruning)."""
-    import pyjuice.constraints.backends.lifted.forward as F
+    import pyjuice.constraints.backends.dfa_exact.forward as F
     if dense_pruning:
         monkeypatch.setattr(F, "prune_dense", lambda ncols, live: live < ncols)   # the live-column path, always
     n = 6
@@ -338,7 +338,7 @@ def test_stacked_dense_weights(tied, dense_pruning, reference, monkeypatch):
 def test_wide_products_are_not_stacked(dense_pruning, reference, monkeypatch):
     """A product wider than STACK_MAX_COLUMNS (here every one) runs one product per block, inside a
     pyjuice.fast_inference scope too, and copies no weights."""
-    import pyjuice.constraints.backends.lifted.forward as F
+    import pyjuice.constraints.backends.dfa_exact.forward as F
     if dense_pruning:
         monkeypatch.setattr(F, "prune_dense", lambda ncols, live: live < ncols)
     monkeypatch.setattr(F, "STACK_MAX_COLUMNS", {"fp32": -1, "tf32": -1})
@@ -357,7 +357,7 @@ def test_wide_products_are_not_stacked(dense_pruning, reference, monkeypatch):
 def test_the_stacked_weights_are_what_is_multiplied(dense_pruning, monkeypatch):
     """Doubling every stacked copy (and nothing else) doubles the sums of every stacked run: every path of the HMM
     crosses each transition once, so the marginal moves by log 2 per run -- the product reads the copy."""
-    import pyjuice.constraints.backends.lifted.forward as F
+    import pyjuice.constraints.backends.dfa_exact.forward as F
     if dense_pruning:
         monkeypatch.setattr(F, "prune_dense", lambda ncols, live: live < ncols)
     n = 6
@@ -418,7 +418,7 @@ def test_live_columns_are_shifted_and_exponentiated():
     """The dense sum paths' pre-op (sum.py's ``_live_shifted_exp``): the first ``num_live`` columns of a pruning order,
     gathered from a block taller than a program's row tile (and a row stride past its width), each shifted by its
     maximum and exponentiated, transposed; a column of -inf gives zeros."""
-    from pyjuice.constraints.backends.lifted.kernels.sum import _live_shifted_exp
+    from pyjuice.constraints.backends.dfa_exact.kernels.sum import _live_shifted_exp
     g = torch.Generator().manual_seed(0)
     x = (torch.randn(2500, 48, generator = g) * 4).cuda()
     x[:, 7] = float("-inf")
@@ -438,8 +438,8 @@ def test_transition_masses_match_brute_force(build_pc, monkeypatch):
     float64, on an automaton whose columns have more successors than one pair tile takes and more classes than one
     chunk, with token probabilities down to e^-100 and one emission row below e^-90 altogether (pairs whose class
     masses are all below the fp32 normal range)."""
-    import pyjuice.constraints.backends.lifted.forward as F
-    from pyjuice.constraints.backends.lifted.kernels import prod
+    import pyjuice.constraints.backends.dfa_exact.forward as F
+    from pyjuice.constraints.backends.dfa_exact.kernels import prod
     monkeypatch.setattr(F, "GROUP_MIN_RATIO", 0)
     rng = random.Random(0)
     V2, K, n = 600, 48, 6
@@ -477,7 +477,7 @@ def test_chunked_transition_masses_change_nothing(kind, build_pc, monkeypatch):
     """Transitions grouped, with a budget of one float: every input step's transition masses are built on their own,
     just before the step, into one shared scratch -- the marginal of keeping them all, bit for bit (a wide
     automaton; the buffers filled with NaN before each call)."""
-    import pyjuice.constraints.backends.lifted.forward as F
+    import pyjuice.constraints.backends.dfa_exact.forward as F
     monkeypatch.setattr(F, "GROUP_MIN_RATIO", 0)
     rng = random.Random(0)
     K, n = 48, KINDS[kind]
@@ -502,7 +502,7 @@ def test_splitting_block_block_tiles_changes_nothing(build_pc, monkeypatch):
     """Spreading every (step, sample)'s output tiles over as many programs as it has tiles gives what one program
     per (step, sample) gives, bit for bit (a wide automaton: blocks of several tiles). The buffers are filled with
     NaN before each call, so a tile no program writes shows."""
-    from pyjuice.constraints.backends.lifted.kernels import prod
+    from pyjuice.constraints.backends.dfa_exact.kernels import prod
     rng = random.Random(0)
     K, n = 48, 8
     dfa = jc.DFA.from_dense(V, [[rng.randrange(K) for _ in range(V)] for _ in range(K)], 0, rng.sample(range(K), 12))
@@ -551,8 +551,8 @@ def test_grouped_input_steps_change_nothing(kind, B, G, build_pc, monkeypatch):
     bit for bit, with evidence (pruned) and without. Every launch whose block is not the identity runs in groups
     (the PDs and the left-linear chain have none), here at any width. The buffers are filled with NaN before each
     call, so an output no group writes shows."""
-    import pyjuice.constraints.backends.lifted.forward as F
-    from pyjuice.constraints.backends.lifted.kernels import prod
+    import pyjuice.constraints.backends.dfa_exact.forward as F
+    from pyjuice.constraints.backends.dfa_exact.kernels import prod
     monkeypatch.setattr(F, "GROUP_MIN_RATIO", 1 << 30)                       # transitions class by class
     monkeypatch.setattr(prod, "GROUP_MIN_LANES", 0)                          # groups however narrow the launch
     kernel = CountingKernel(prod._input_block_group_kernel)
@@ -581,8 +581,8 @@ def test_grouped_input_steps_change_nothing(kind, B, G, build_pc, monkeypatch):
 def test_narrow_launches_run_one_step_per_program(build_pc, reference, monkeypatch):
     """A launch whose steps' outputs have at most GROUP_MIN_LANES lanes runs one step per program even where the
     Program grouped its steps; one just above it runs the groups."""
-    import pyjuice.constraints.backends.lifted.forward as F
-    from pyjuice.constraints.backends.lifted.kernels import prod
+    import pyjuice.constraints.backends.dfa_exact.forward as F
+    from pyjuice.constraints.backends.dfa_exact.kernels import prod
     monkeypatch.setattr(F, "GROUP_MIN_RATIO", 1 << 30)
     kernel = CountingKernel(prod._input_block_group_kernel)
     monkeypatch.setattr(prod, "_input_block_group_kernel", kernel)
@@ -622,8 +622,8 @@ def test_every_tuned_candidate_gives_the_same_marginal(kind, build_pc, monkeypat
     Up to fp32 rounding: a block @ block tile sets its dots' accumulation order (on a 16-latent PD ~1e-7 relative);
     the group candidates are bit-identical (test_grouped_input_steps_change_nothing,
     test_one_exp_lse_step_is_the_two_exp_one)."""
-    import pyjuice.constraints.backends.lifted.forward as F
-    from pyjuice.constraints.backends.lifted.kernels import prod
+    import pyjuice.constraints.backends.dfa_exact.forward as F
+    from pyjuice.constraints.backends.dfa_exact.kernels import prod
     monkeypatch.setattr(F, "GROUP_MIN_RATIO", 1 << 30)                       # transitions class by class
     monkeypatch.setattr(prod, "GROUP_MIN_LANES", 0)                          # groups however narrow the launch
     n, B = KINDS[kind], 4
@@ -670,8 +670,8 @@ def test_every_tuned_candidate_gives_the_same_marginal(kind, build_pc, monkeypat
 def test_tuning_runs_once_per_launch_shape(kind, build_pc, monkeypatch):
     """The first query benchmarks each tuned launch shape once; later ones reuse the choice. With autotuning off,
     nothing is benchmarked."""
-    import pyjuice.constraints.backends.lifted.forward as F
-    from pyjuice.constraints.backends.lifted.kernels import prod
+    import pyjuice.constraints.backends.dfa_exact.forward as F
+    from pyjuice.constraints.backends.dfa_exact.kernels import prod
     from pyjuice.layer.kernels import autotune
     monkeypatch.setattr(prod, "GROUP_MIN_LANES", 0)
     monkeypatch.setattr(F, "GROUP_MIN_RATIO", 1 << 30)
@@ -697,7 +697,7 @@ def test_input_steps_group_by_position(kind, build_pc, monkeypatch):
     """Groups of ``input @ block`` steps never mix positions or block ends, hold at most their table's group size
     (INPUT_BLOCK_GROUP's, then every alternative's), and cover every step once -- also where one launch holds steps
     at several positions (one of "hand"'s)."""
-    import pyjuice.constraints.backends.lifted.forward as F
+    import pyjuice.constraints.backends.dfa_exact.forward as F
     monkeypatch.setattr(F, "GROUP_MIN_RATIO", 1 << 30)
     monkeypatch.setattr(F, "INPUT_BLOCK_GROUP", 3)
     n = KINDS[kind]
@@ -723,7 +723,7 @@ def test_kernels_launch_past_the_grid_limits(kind, sum_path, build_pc, monkeypat
     bit. A wide automaton gives each of them far more work than that (an HMM: input @ block; a PD: block
     @ block; left_linear and hand_left: block @ input; the dense path keeps copies). The buffers are filled with NaN before each
     call, so a slot left unwritten shows instead of keeping the previous call's value."""
-    from pyjuice.constraints.backends.lifted.kernels import prod
+    from pyjuice.constraints.backends.dfa_exact.kernels import prod
     rng = random.Random(0)
     K, n = 48, KINDS[kind]
     dfa = jc.DFA.from_dense(V, [[rng.randrange(K) for _ in range(V)] for _ in range(K)], 0, rng.sample(range(K), 12))
@@ -743,7 +743,7 @@ def test_kernels_launch_past_the_grid_limits(kind, sum_path, build_pc, monkeypat
 
 def marginal_with_aliasing(cc, on, data, missing, monkeypatch):
     """The marginal with copies of sums aliased or materialized (the Program is rebuilt either way)."""
-    import pyjuice.constraints.backends.lifted.forward as F
+    import pyjuice.constraints.backends.dfa_exact.forward as F
     monkeypatch.setattr(F, "ALIAS_COPIES", on)
     cc._program = None
     return cc.marginal(data, missing), cc._lifted_program()

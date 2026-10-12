@@ -1,5 +1,5 @@
 """
-Evidence pruning (:mod:`pyjuice.constraints.backends.lifted.kernels.live`): every sample's live columns against a
+Evidence pruning (:mod:`pyjuice.constraints.backends.dfa_exact.kernels.live`): every sample's live columns against a
 brute force over strings, and the marginal against the reference under every pattern of evidence -- none, all, a
 prefix, a suffix, scattered, and a different one per sample -- on every kind of PC, with the buffers filled with NaN
 before each call (a dead slot must still be written, -inf). Also: pruning engages when tokens are observed, and
@@ -16,8 +16,8 @@ import torch
 
 import pyjuice as juice
 import pyjuice.constraints as jc
-import pyjuice.constraints.backends.lifted.forward as F
-from pyjuice.constraints.backends.lifted.kernels.live import prune
+import pyjuice.constraints.backends.dfa_exact.forward as F
+from pyjuice.constraints.backends.dfa_exact.kernels.live import prune
 
 V = 3
 KINDS = {"hmm": 6, "hmm_untied": 6, "hmm_block_sparse": 6, "left_linear": 6, "pd": 8, "pd_prod_dominated": 8,
@@ -55,8 +55,8 @@ def assert_close(got, want, n):
 def sum_path(request, monkeypatch):
     """The sum layers through the fused kernel, or the dense path wherever blocks qualify, with its live columns
     only (``dense_pruned``) or all of them -- the test batches are below the size dense pruning starts from."""
-    import pyjuice.constraints.backends.lifted.forward as F
-    from pyjuice.constraints.backends.lifted.kernels import sum as lifted_sum
+    import pyjuice.constraints.backends.dfa_exact.forward as F
+    from pyjuice.constraints.backends.dfa_exact.kernels import sum as lifted_sum
     monkeypatch.setattr(lifted_sum, "DENSE_MIN_BLOCK", 1 << 30 if request.param == "fused" else 1)
     monkeypatch.setattr(F, "prune_dense", (lambda ncols, live: live < ncols) if request.param == "dense_pruned" else
                         (lambda ncols, live: False))
@@ -65,7 +65,7 @@ def sum_path(request, monkeypatch):
 
 @pytest.fixture(params = ["classes", "grouped"])
 def transitions(request, monkeypatch):
-    import pyjuice.constraints.backends.lifted.forward as F
+    import pyjuice.constraints.backends.dfa_exact.forward as F
     monkeypatch.setattr(F, "GROUP_MIN_RATIO", 1 << 30 if request.param == "classes" else 0)
     return request.param
 
@@ -74,7 +74,7 @@ def transitions(request, monkeypatch):
 def liveness(request, monkeypatch):
     """The liveness sweeps in one program per sample, or as a launch per boundary (used from far wider automata than
     the test ones by default)."""
-    from pyjuice.constraints.backends.lifted.kernels import live
+    from pyjuice.constraints.backends.dfa_exact.kernels import live
     monkeypatch.setattr(live, "LIVE_STEPS_MIN_WIDTH", 1 << 30 if request.param == "per_sample" else 0)
     return request.param
 
@@ -166,7 +166,7 @@ def test_a_wide_automaton_under_evidence_matches_the_reference(kind, pattern, su
 def test_per_boundary_liveness_equals_per_sample(kind, build_pc, monkeypatch):
     """The liveness sweeps as a launch per boundary give the one-program-per-sample sweeps' live columns, and so the
     same live slots, under every pattern of evidence (a 48-state automaton: boundaries of several tiles)."""
-    from pyjuice.constraints.backends.lifted.kernels import live
+    from pyjuice.constraints.backends.dfa_exact.kernels import live
     rng = random.Random(0)
     K, n = 48, KINDS[kind]
     dfa = jc.DFA.from_dense(V, [[rng.randrange(K) for _ in range(V)] for _ in range(K)], 0, rng.sample(range(K), 12))
@@ -198,7 +198,7 @@ def test_live_column_lists(kind, build_pc):
     """Every sum interval's column lists against its live slots (both ends live, sample-major): ``perm`` the live
     columns in order then the dead ones, ``rank`` their places among the live ones (-1 dead), the interval's and every
     region's live count, every region's first column -- with a batch whose intervals span several list tiles."""
-    from pyjuice.constraints.backends.lifted.kernels import live as L
+    from pyjuice.constraints.backends.dfa_exact.kernels import live as L
     n = KINDS[kind]
     cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc(kind, n, V))
     prog = cc._lifted_program()
@@ -226,7 +226,7 @@ def test_live_column_lists(kind, build_pc):
 def test_pruning_engages_only_under_evidence(build_pc, monkeypatch):
     """An observed prefix pins every sample to one column per boundary before it: the sums compute far fewer
     columns. With nothing observed, nothing is pruned (and nothing computed for it)."""
-    import pyjuice.constraints.backends.lifted.forward as F
+    import pyjuice.constraints.backends.dfa_exact.forward as F
     calls, pruned = [], F.prune
     monkeypatch.setattr(F, "prune", lambda *a: calls.append(1) or pruned(*a))
     n = 8

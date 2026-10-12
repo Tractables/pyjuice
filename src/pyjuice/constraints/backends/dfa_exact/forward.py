@@ -506,7 +506,7 @@ def marginal(cc, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None
         raise ValueError(f"`precision` must be one of {sorted(PRECISIONS)}, got {precision!r}.")
     pc, n, dev = cc.pc, cc.n, cc._device
     if dev.type != "cuda":
-        raise NotImplementedError(f"The lifted backend runs on CUDA only, but the constrained circuit is on {dev}. "
+        raise NotImplementedError(f"The dfa_exact backend runs on CUDA only, but the constrained circuit is on {dev}. "
                                   f"Move it with `cc.to('cuda')`.")
     if data.dim() != 2 or data.size(1) != n:
         raise ValueError(f"`data` must be [batch, {n}], got {list(data.shape)}.")

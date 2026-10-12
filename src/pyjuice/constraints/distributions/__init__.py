@@ -18,7 +18,7 @@ module provides
   written into ``out`` when given;
 * ``token_probs(layer, rows, out) -> torch.Tensor``: the probability of every value under the table's rows ``rows``
   (sorted, host int64), token-major: ``out[v, k] = p(v)`` of row ``rows[k]``, ``out`` [values, len(rows)] in fp32 or
-  bf16 -- what the conditionals score (:mod:`~pyjuice.constraints.backends.lifted.conditional`).
+  bf16 -- what the conditionals score (:mod:`~pyjuice.constraints.backends.dfa_exact.conditional`).
 
 Only the distributions in :data:`SUPPORTED` can be compiled under a constraint, matched by exact type: a subclass
 may compute different probabilities, so it is refused until it has its own module.

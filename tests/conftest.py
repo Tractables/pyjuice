@@ -28,11 +28,11 @@ def _pin_gpu():
 
     Runs when this conftest is IMPORTED, not in `pytest_configure`: pytest imports the conftests of the
     directories on its command line (and of their parents, this one first) before `pytest_configure`
-    runs, and a nested conftest that imports pyjuice (`tests/constraints/backends/lifted/conftest.py`)
+    runs, and a nested conftest that imports pyjuice (`tests/constraints/backends/dfa_exact/conftest.py`)
     initializes the CUDA driver through Triton as a side effect -- with whatever CUDA_VISIBLE_DEVICES the
     process inherited, which for a worker is the controller's single pinned GPU. The driver's device list
     is fixed for the process from then on, so pinning afterwards changed the environment variable but
-    not the device: `pytest -n 8 tests/constraints/backends/lifted` ran every worker on GPU 0, while
+    not the device: `pytest -n 8 tests/constraints/backends/dfa_exact` ran every worker on GPU 0, while
     `pytest -n 8 tests/constraints` (whose nested conftest is imported during collection, after
     `pytest_configure`) spread them. At import time nothing has touched CUDA yet.
     """

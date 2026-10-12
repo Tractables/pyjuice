@@ -1,9 +1,9 @@
 """
-The lifted top-down pass (:mod:`pyjuice.constraints.backends.lifted.backward`): every sum node's top-down value (its
+The lifted top-down pass (:mod:`pyjuice.constraints.backends.dfa_exact.backward`): every sum node's top-down value (its
 log outside value) against the test reference's (``reference.top_down``), on every kind of PC in conftest.py's
 ``PC_KINDS``, under constraints and every pattern of evidence (pruned, and unpruned where nothing is observed), through
 both sum paths, and where block @ block's shifts flush entries; run twice, the values are identical. Under query plans
-(:mod:`~pyjuice.constraints.backends.lifted.query_plan`): with every policy of keeping values once, a query computes
+(:mod:`~pyjuice.constraints.backends.dfa_exact.query_plan`): with every policy of keeping values once, a query computes
 exactly the values its targets need; values kept once accumulate across queries, append-only; held values are not
 computed again.
 """
@@ -16,10 +16,10 @@ import torch
 
 import pyjuice as juice
 import pyjuice.constraints as jc
-from pyjuice.constraints.backends.lifted import forward as F
-from pyjuice.constraints.backends.lifted.backward import run_backward
-from pyjuice.constraints.backends.lifted.kernels.live import prune
-from pyjuice.constraints.backends.lifted.query_plan import prior_regions, query_plan, top_down_prior
+from pyjuice.constraints.backends.dfa_exact import forward as F
+from pyjuice.constraints.backends.dfa_exact.backward import run_backward
+from pyjuice.constraints.backends.dfa_exact.kernels.live import prune
+from pyjuice.constraints.backends.dfa_exact.query_plan import prior_regions, query_plan, top_down_prior
 
 V = 3
 KINDS = {"hmm": 6, "hmm_untied": 6, "hmm_block_sparse": 6, "left_linear": 6, "pd": 8, "pd_prod_dominated": 8,
@@ -56,7 +56,7 @@ def evidence(pattern, n, B = 6, seed = 0):
 def sum_path(request, monkeypatch):
     """The fused sum kernels, or the dense path with its products on the live columns only or on every column (the
     dead ones read too: they must hold -inf)."""
-    from pyjuice.constraints.backends.lifted.kernels import sum as lifted_sum
+    from pyjuice.constraints.backends.dfa_exact.kernels import sum as lifted_sum
     monkeypatch.setattr(lifted_sum, "DENSE_MIN_BLOCK", 1 << 30 if request.param == "fused" else 1)
     monkeypatch.setattr(F, "prune_dense", (lambda ncols, live: False) if request.param == "dense_unpruned" else
                         (lambda ncols, live: live < ncols))
@@ -69,7 +69,7 @@ def top_down_blocks(cc, data, missing, targets = None, policy = "default", held 
     The forward then the top-down pass of a query under its plan (``policy``: see ``POLICIES``; "kept" runs inside
     :func:`pyjuice.fast_inference`), node_flows filled with NaN first (``nan_fill``): ``(blocks, plan)``, ``blocks``
     every sum region's rows of the buffer its values are in -- [rows, B * slots], those kept once repeated per sample
-    (cloned). ``visit(prod_index, bufs, flows, plan)``: see :func:`~pyjuice.constraints.backends.lifted.backward.
+    (cloned). ``visit(prod_index, bufs, flows, plan)``: see :func:`~pyjuice.constraints.backends.dfa_exact.backward.
     run_backward`.
     """
     with juice.fast_inference() if policy == "kept" else contextlib.nullcontext():

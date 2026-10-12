@@ -1,5 +1,5 @@
 """
-Conditionals under a constraint (:mod:`pyjuice.constraints.backends.lifted.conditional`): ``cc.conditional`` against
+Conditionals under a constraint (:mod:`pyjuice.constraints.backends.dfa_exact.conditional`): ``cc.conditional`` against
 the test reference's (``reference.conditional``) on every kind of PC in conftest.py's ``PC_KINDS``, under constraints
 and every pattern of evidence, through every sum path; the class weights it scores (``dfa_class_flow``, which the
 normalized rows cannot check: a factor common to every class cancels) against the reference's input nodes' top-down
@@ -15,9 +15,9 @@ import torch
 
 import pyjuice as juice
 import pyjuice.constraints as jc
-from pyjuice.constraints.backends.lifted import forward as F
-from pyjuice.constraints.backends.lifted.conditional import class_weights, conditional
-from pyjuice.constraints.backends.lifted.kernels.score import score_tables
+from pyjuice.constraints.backends.dfa_exact import forward as F
+from pyjuice.constraints.backends.dfa_exact.conditional import class_weights, conditional
+from pyjuice.constraints.backends.dfa_exact.kernels.score import score_tables
 from pyjuice.constraints.distributions import TokenClasses
 
 V = 3
@@ -54,7 +54,7 @@ def evidence(pattern, n, B = 6, seed = 0):
 @pytest.fixture(params = ["fused", "dense", "dense_unpruned"])
 def sum_path(request, monkeypatch):
     """The fused sum kernels, or the dense path with its products on the live columns only or on every column."""
-    from pyjuice.constraints.backends.lifted.kernels import sum as lifted_sum
+    from pyjuice.constraints.backends.dfa_exact.kernels import sum as lifted_sum
     monkeypatch.setattr(lifted_sum, "DENSE_MIN_BLOCK", 1 << 30 if request.param == "fused" else 1)
     monkeypatch.setattr(F, "prune_dense", (lambda ncols, live: False) if request.param == "dense_unpruned" else
                         (lambda ncols, live: live < ncols))
@@ -264,7 +264,7 @@ class HMMDecodeCache:
     suffixes ``[t, n)``) under a constraint, step ``t`` observing the tokens before ``t`` and asking for ``t``. A sum
     node's top-down value depends only on the evidence outside its scope, so observing ``x_{t-1}`` changes none of
     those whose scope holds ``t - 1``, every one of which step ``t - 1`` needed: step ``t`` holds them (``held``, see
-    :mod:`pyjuice.constraints.backends.lifted.query_plan`) and computes the one new layer. The buffers keep the
+    :mod:`pyjuice.constraints.backends.dfa_exact.query_plan`) and computes the one new layer. The buffers keep the
     values only for the same batch size and with no other query in between.
     """
 

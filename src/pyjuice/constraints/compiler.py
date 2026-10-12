@@ -16,12 +16,12 @@ from pyjuice.model import TensorCircuit
 from . import distributions
 from .language.base import Constraint
 from .structure import PCStructure, _runs, analyze_structure
-from .backends.lifted.plan import build_layout, build_pc_tables
+from .backends.dfa_exact.plan import build_layout, build_pc_tables
 from .constrained_circuit import ConstrainedCircuit
 
 
 #: Backends :func:`compile` knows.
-BACKENDS = ("lifted",)
+BACKENDS = ("dfa_exact",)
 
 
 class ConstraintCompileError(ValueError):
@@ -41,7 +41,7 @@ def compile(constraint: Constraint, pc: TensorCircuit, backend: Optional[str] = 
     :param pc: a compiled PC (from :func:`pyjuice.compile`)
     :type pc: TensorCircuit
 
-    :param backend: the backend to use; ``None`` picks one (today always ``"lifted"``: exact lifting of
+    :param backend: the backend to use; ``None`` picks one (today always ``"dfa_exact"``: exact lifting of
         the constraint's automaton, for PCs whose node scopes are contiguous in variable order)
     :type backend: Optional[str]
     """
@@ -56,7 +56,7 @@ def compile(constraint: Constraint, pc: TensorCircuit, backend: Optional[str] = 
     structure = analyze_structure(pc)
     reasons = _lifted_refusals(constraint, structure)
     if reasons:
-        raise ConstraintCompileError("Cannot compile the constraint against this PC (backend 'lifted'):\n"
+        raise ConstraintCompileError("Cannot compile the constraint against this PC (backend 'dfa_exact'):\n"
                                      + "\n".join(f"  - {r}" for r in reasons))
 
     automaton = constraint.automaton()
@@ -73,7 +73,7 @@ def _check_pc(pc):
 
 
 def _lifted_refusals(constraint: Constraint, structure: PCStructure) -> List[str]:
-    """Every reason the lifted backend cannot serve the pair (empty if it can)."""
+    """Every reason the dfa_exact backend cannot serve the pair (empty if it can)."""
     reasons = []
 
     caps = constraint.capabilities()

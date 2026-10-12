@@ -6,8 +6,8 @@ import pyjuice.nodes.distributions as dists
 from pyjuice.nodes import inputs, multiply, summate
 import pyjuice.constraints as jc
 from pyjuice.constraints.structure import analyze_structure
-from pyjuice.constraints.backends.lifted import plan
-from pyjuice.constraints.backends.lifted.plan import build_layout
+from pyjuice.constraints.backends.dfa_exact import plan
+from pyjuice.constraints.backends.dfa_exact.plan import build_layout
 
 
 V = 5
@@ -53,7 +53,7 @@ def test_hmm_compiles_with_the_lifted_backend():
 
     assert isinstance(cc, jc.ConstrainedCircuit)
     assert cc.pc is pc and cc.constraint is c and cc.structure is analyze_structure(pc)
-    assert cc.backend == "lifted" and cc.exact and cc.n == n and cc.satisfiable
+    assert cc.backend == "dfa_exact" and cc.exact and cc.n == n and cc.satisfiable
     assert cc.num_states == c.automaton().num_states and cc.num_classes == c.automaton().num_classes
     assert torch.equal(cc.width_per_boundary, build_layout(c.automaton(), n).width)
     assert cc.max_width == int(cc.width_per_boundary.max())
@@ -64,7 +64,7 @@ def test_hmm_compiles_with_the_lifted_backend():
     assert counts["whole"] >= 1 and counts["suffix"] > 0
     assert counts["prefix"] == counts["interval"] == counts["fragmented"] == 0
     assert cc.compile_time_s > 0
-    assert "lifted" in repr(cc) and cc.info()["width_per_boundary"] == cc.width_per_boundary.tolist()
+    assert "dfa_exact" in repr(cc) and cc.info()["width_per_boundary"] == cc.width_per_boundary.tolist()
 
 
 def test_1d_pd_compiles_with_interval_scopes():
@@ -140,7 +140,7 @@ def test_every_reason_is_reported_at_once():
 
 def test_an_unknown_backend_or_wrong_types_are_refused():
     pc = hmm(6)
-    with pytest.raises(jc.ConstraintCompileError, match = "known backends: 'lifted'"):
+    with pytest.raises(jc.ConstraintCompileError, match = "known backends: 'dfa_exact'"):
         jc.compile(jc.DFA.anything(V), pc, backend = "smc")
     with pytest.raises(TypeError, match = "Constraint"):
         jc.compile("abc", pc)
@@ -194,7 +194,7 @@ def test_the_pc_is_fixed_once_compiled():
     with pytest.raises(AttributeError):
         cc.pc = hmm(6)                                             # switching PCs goes through `with_pc`
     with pytest.raises(NotImplementedError, match = "CUDA only"):
-        cc.marginal(x)                                             # (the lifted backend needs a GPU)
+        cc.marginal(x)                                             # (the dfa_exact backend needs a GPU)
     pc.to(torch.device("cuda:0"))                                  # the PC moved on its own
     for query in (lambda: cc.marginal(x), lambda: cc.conditional(x), cc.sample, cc.decoder):
         with pytest.raises(RuntimeError, match = "moved from cpu to cuda:0 on its own.*cc.to"):

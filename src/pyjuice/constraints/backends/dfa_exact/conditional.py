@@ -80,7 +80,7 @@ def _check(cc, data: torch.Tensor, precision: str):
     if precision not in F.PRECISIONS:
         raise ValueError(f"`precision` must be one of {sorted(F.PRECISIONS)}, got {precision!r}.")
     if cc._device.type != "cuda":
-        raise NotImplementedError(f"The lifted backend runs on CUDA only, but the constrained circuit is on "
+        raise NotImplementedError(f"The dfa_exact backend runs on CUDA only, but the constrained circuit is on "
                                   f"{cc._device}. Move it with `cc.to('cuda')`.")
     if data.dim() != 2 or data.size(1) != cc.n:
         raise ValueError(f"`data` must be [batch, {cc.n}], got {list(data.shape)}.")

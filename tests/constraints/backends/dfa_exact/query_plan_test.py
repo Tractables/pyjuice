@@ -1,5 +1,5 @@
 """
-Query plans (:mod:`pyjuice.constraints.backends.lifted.query_plan`) and the input-independent values they keep in
+Query plans (:mod:`pyjuice.constraints.backends.dfa_exact.query_plan`) and the input-independent values they keep in
 ``prior_mars``:
 
 * a plan cuts every launch, dense run and fused part to exactly the values the query needs, input-dependent ones per
@@ -24,10 +24,10 @@ import torch
 
 import pyjuice as juice
 import pyjuice.constraints as jc
-from pyjuice.constraints.backends.lifted import forward as F
-from pyjuice.constraints.backends.lifted.kernels.live import prune
-from pyjuice.constraints.backends.lifted.kernels.prod import TEMP, IndexList, Launch, pack_aligned
-from pyjuice.constraints.backends.lifted.query_plan import (free_regions, prior_regions, query_plan, top_down_free,
+from pyjuice.constraints.backends.dfa_exact import forward as F
+from pyjuice.constraints.backends.dfa_exact.kernels.live import prune
+from pyjuice.constraints.backends.dfa_exact.kernels.prod import TEMP, IndexList, Launch, pack_aligned
+from pyjuice.constraints.backends.dfa_exact.query_plan import (free_regions, prior_regions, query_plan, top_down_free,
                                                             top_down_prior)
 
 V = 3
@@ -136,7 +136,7 @@ def cases(n, seed):
 
 
 def selected_steps(cut):
-    """The steps of a launch a :class:`~pyjuice.constraints.backends.lifted.kernels.prod.Cut` runs (host)."""
+    """The steps of a launch a :class:`~pyjuice.constraints.backends.dfa_exact.kernels.prod.Cut` runs (host)."""
     return np.concatenate([s0 + (np.arange(s1 - s0) if sel is None else sel.tensor.cpu().numpy())
                            for s0, s1, _, sel, _ in cut.chunks])
 

@@ -1,5 +1,5 @@
 """
-What a query computes, and where: the lifted backend's partial evaluation.
+What a query computes, and where: the dfa_exact backend's partial evaluation.
 
 Every sum region holds, per sample, the INSIDE values of its node group's scope: the log-probability of the evidence
 on the scope, for every pair of automaton columns at its ends. Two facts decide which of them a query computes:

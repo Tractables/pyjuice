@@ -15,7 +15,7 @@ from pyjuice.utils.fast_inference import bf16_params_allowed, is_active, param_c
 from .distributions import TokenClasses, lookup
 from .language.base import Constraint
 from .structure import SHAPES, PCStructure, analyze_structure
-from .backends.lifted.plan import BoundaryLayout, _align, build_pc_tables, buffer_layout
+from .backends.dfa_exact.plan import BoundaryLayout, _align, build_pc_tables, buffer_layout
 
 
 class ConstrainedCircuit:
@@ -31,7 +31,7 @@ class ConstrainedCircuit:
     own makes every query raise.
 
     Constrained queries run in buffers of their own, laid out for the lifted plan (see
-    :func:`~pyjuice.constraints.backends.lifted.plan.buffer_layout`) and allocated on the first query, so
+    :func:`~pyjuice.constraints.backends.dfa_exact.plan.buffer_layout`) and allocated on the first query, so
     creating a constrained circuit releases the PC's activation buffers
     (:meth:`TensorCircuit.free_activation_buffers`; its parameter flows are kept). The PC allocates them
     again on its next own pass.
@@ -39,7 +39,7 @@ class ConstrainedCircuit:
     The input nodes' token-class masses depend only on the parameters, so inside :func:`pyjuice.fast_inference`
     (whose contract is that parameters do not change) they are computed by the first query and kept until the
     scope exits; outside it, every query computes them. So do the input-independent inside values -- those of the
-    nodes whose scope no sample of a query observes (see :mod:`~.backends.lifted.query_plan`), held once in
+    nodes whose scope no sample of a query observes (see :mod:`~.backends.dfa_exact.query_plan`), held once in
     ``prior_mars`` and read by every sample -- each kept from the query that first computes it. Likewise the stacked
     weights of dense sum node blocks that read the same children (one matrix product instead of one per block, on
     products narrow enough for it to pay): inside a scope that allows parameter copies, each is copied once and kept
@@ -53,12 +53,12 @@ class ConstrainedCircuit:
     :ivar constraint: the constraint
     :ivar structure: the PC's :class:`~pyjuice.constraints.structure.PCStructure`
     :ivar automaton: the constraint's automaton
-    :ivar layout: the :class:`~pyjuice.constraints.backends.lifted.plan.BoundaryLayout` of the automaton
+    :ivar layout: the :class:`~pyjuice.constraints.backends.dfa_exact.plan.BoundaryLayout` of the automaton
         over the PC's variables
     :ivar token_classes: the automaton's :class:`~pyjuice.constraints.distributions.TokenClasses`, on the PC's
         device, as the input distributions read them
     :ivar columns_per_sample: the most slots any sum or product node's block takes per sample
-        (see :func:`~pyjuice.constraints.backends.lifted.plan.build_pc_tables`)
+        (see :func:`~pyjuice.constraints.backends.dfa_exact.plan.build_pc_tables`)
     :ivar product_rows: per product layer, the rows and boundaries the lifted products read
     :ivar input_range: the ``node_mars`` rows of all input nodes
     :ivar root_rows: the ``node_mars`` rows of the root nodes
@@ -68,7 +68,7 @@ class ConstrainedCircuit:
     """
 
     #: the backend queries run on
-    backend = "lifted"
+    backend = "dfa_exact"
     #: whether queries are exact (up to floating point)
     exact = True
 
@@ -145,7 +145,7 @@ class ConstrainedCircuit:
     def _buffers(self, batch_size: int) -> Dict[str, Any]:
         """
         The lifted buffers for a batch of ``batch_size``, cut from storage this constrained circuit owns
-        (:func:`~pyjuice.constraints.backends.lifted.plan.buffer_layout` says where every region sits).
+        (:func:`~pyjuice.constraints.backends.dfa_exact.plan.buffer_layout` says where every region sits).
 
         Each buffer has one backing storage, reused while it is large enough and at most 4 times larger
         than needed (so a loop whose batch size varies does not reallocate, and keeps its addresses), and
@@ -176,7 +176,7 @@ class ConstrainedCircuit:
 
     def _flows(self, batch_size: int, bufs: Dict[str, Any]) -> Dict[str, Any]:
         """
-        The top-down buffers of a batch (see :mod:`~.backends.lifted.backward`): ``node_flows`` (laid out as
+        The top-down buffers of a batch (see :mod:`~.backends.dfa_exact.backward`): ``node_flows`` (laid out as
         ``node_mars``, storage of its own, allocated on first use) and ``element_flows``, which is ``element_mars``'s
         storage -- the top-down pass never reads the product insides there.
         """
@@ -184,17 +184,17 @@ class ConstrainedCircuit:
                     element_flows = bufs["element_mars"])
 
     def _top_down_program(self):
-        """The top-down pass's tables (:class:`~.backends.lifted.backward.TopDownProgram`), built on first use and
+        """The top-down pass's tables (:class:`~.backends.dfa_exact.backward.TopDownProgram`), built on first use and
         kept with the forward's."""
         prog = self._lifted_program()
         if getattr(prog, "top_down", None) is None:
-            from .backends.lifted.backward import top_down_program
+            from .backends.dfa_exact.backward import top_down_program
             prog.top_down = top_down_program(self)
         return prog.top_down
 
     def _prior_buffer(self) -> Dict[str, Any]:
         """
-        ``prior_mars``: the input-independent inside values (see :mod:`~.backends.lifted.query_plan`), laid out as
+        ``prior_mars``: the input-independent inside values (see :mod:`~.backends.dfa_exact.query_plan`), laid out as
         ``node_mars`` for a batch of one, in storage of its own (it outlives queries of any batch size), allocated
         on first use. A dict with ``mars`` (flat), and every sum region's ``offset`` and ``width`` there (Python
         ints) and ``offset_t`` / ``width_t`` (int64 on the device).
@@ -205,7 +205,7 @@ class ConstrainedCircuit:
 
     def _prior_flows(self, regions) -> Dict[str, Any]:
         """
-        ``prior_flows``: the input-independent top-down values (see :mod:`~.backends.lifted.query_plan`), for a batch
+        ``prior_flows``: the input-independent top-down values (see :mod:`~.backends.dfa_exact.query_plan`), for a batch
         of one, in storage of its own laid out APPEND-ONLY: a sum region (node) gets its rows, filled with -inf, the
         first time a query keeps its values once (``regions``, bool per sum region), and keeps them, so the storage
         holds only the regions ever kept once and never more than one sample's ``node_flows``. Its values are kept as
@@ -293,8 +293,8 @@ class ConstrainedCircuit:
     def _weight_stacks(self):
         """
         ``(stacks, kept)``: where a query finds and leaves the stacked weights of its dense sum node blocks
-        (stack key -> :func:`~pyjuice.constraints.backends.lifted.kernels.sum.stacked_weights`, see
-        :meth:`~pyjuice.constraints.backends.lifted.forward.Program`), and whether they outlive the query. Inside a
+        (stack key -> :func:`~pyjuice.constraints.backends.dfa_exact.kernels.sum.stacked_weights`, see
+        :meth:`~pyjuice.constraints.backends.dfa_exact.forward.Program`), and whether they outlive the query. Inside a
         :func:`pyjuice.fast_inference` scope that allows parameter copies, the scope's: kept until it exits, so the
         query stacks every run it can (see ``STACK_MAX_COLUMNS`` there); else an empty dict of the query's own, which
         stacks only reused weights.
@@ -311,7 +311,7 @@ class ConstrainedCircuit:
         """
         ``[V, len(rows)]``: the probability of every token under the class-mass rows ``rows`` (sorted, see
         :meth:`_class_mass_rows`), token-major -- the table row group ``group`` of the conditionals is scored against
-        (:mod:`~.backends.lifted.conditional`) -- from every input layer's distribution's ``token_probs``. Built by
+        (:mod:`~.backends.dfa_exact.conditional`) -- from every input layer's distribution's ``token_probs``. Built by
         every query, except inside a :func:`pyjuice.fast_inference` scope that allows parameter copies: there by the
         first query, then kept until the scope exits; in bfloat16 when the scope allows bf16 parameter copies.
         """
@@ -354,10 +354,10 @@ class ConstrainedCircuit:
             self._prior_flows_state.pop("offset_t")
 
     def _lifted_program(self):
-        """The lifted forward's tables (:class:`~pyjuice.constraints.backends.lifted.forward.Program`), built on
+        """The lifted forward's tables (:class:`~pyjuice.constraints.backends.dfa_exact.forward.Program`), built on
         the first query and kept until the circuit moves."""
         if self._program is None:
-            from .backends.lifted.forward import Program
+            from .backends.dfa_exact.forward import Program
             self._program = Program(self)
         return self._program
 
@@ -492,7 +492,7 @@ class ConstrainedCircuit:
         :returns: [B, number of root nodes], as :func:`pyjuice.queries.marginal`
         """
         self._check_pc_unchanged()
-        from .backends.lifted.forward import marginal
+        from .backends.dfa_exact.forward import marginal
         return marginal(self, data, missing_mask, precision = precision)
 
     def conditional(self, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None,
@@ -524,7 +524,7 @@ class ConstrainedCircuit:
             [number of targets]
         """
         self._check_pc_unchanged()
-        from .backends.lifted.conditional import conditional
+        from .backends.dfa_exact.conditional import conditional
         return conditional(self, data, missing_mask, targets, precision = precision,
                            return_log_marginal = return_log_marginal)
 
