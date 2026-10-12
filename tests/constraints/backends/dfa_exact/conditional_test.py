@@ -133,6 +133,26 @@ def test_class_weights_match_the_reference(kind, name, pattern, sum_path, build_
     assert checked > 0
 
 
+@pytest.mark.parametrize("scan", [1, 16])
+@pytest.mark.parametrize("pattern", ["mixed", "scattered", "none"])
+@pytest.mark.parametrize("kind", ["hmm", "hand_left", "left_linear", "pd"])
+def test_class_weights_scan_the_live_columns_any_number_at_a_time(kind, pattern, scan, build_pc, monkeypatch):
+    """The class weights with the live columns found a column or two at a time (every scan of a boundary's columns
+    advancing past empty ones; the default finds them all at once on these automata): bit for bit the same."""
+    from pyjuice.constraints.backends.dfa_exact.kernels import score
+    n = KINDS[kind]
+    cc = jc.compile(CONSTRAINTS["either"](), build_pc(kind, n, V))
+    data, missing = evidence(pattern, n)
+    positions = missing.any(dim = 0).numpy()
+    dev = cc.pc.params.device
+    with torch.no_grad():
+        want = [w.clone() for _, _, w in class_weights(cc.backend, data, missing.to(dev), positions)[0]]
+        monkeypatch.setattr(score, "CLASS_WEIGHT_SCAN", scan)
+        got = [w.clone() for _, _, w in class_weights(cc.backend, data, missing.to(dev), positions)[0]]
+    assert len(got) == len(want) and all(torch.equal(a, b) for a, b in zip(got, want))
+    assert any(torch.isfinite(w).any() for w in want)
+
+
 def test_targets(build_pc, reference):
     """Targets as a [n] mask and a [B, n] subset of the missing positions: the reference's rows for them, in the
     order ``dense[targets]``; a target that is observed raises."""
