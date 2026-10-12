@@ -433,7 +433,8 @@ def test_a_node_axis_gate_is_captured():
     with juice.set_block_size(256):
         ni = [inputs(v, num_node_blocks = 1, dist = dists.Categorical(num_cats = 6)) for v in range(2)]
         ns = summate(multiply(*ni), num_node_blocks = 1,
-                     external_params = BlockScaleSumParams(block_size = 128, ch_block_size = 8))
+                     external_params = BlockScaleSumParams(block_size = 128, ch_block_size = 8,
+                                                           apply_z_correction = False))  # not served here
         root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
     root.init_parameters(perturbation = 2.0)
     pc = juice.compile(root, verbose = False).to(device)
