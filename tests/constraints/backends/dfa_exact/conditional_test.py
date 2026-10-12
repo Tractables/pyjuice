@@ -15,8 +15,8 @@ import torch
 
 import pyjuice as juice
 import pyjuice.constraints as jc
-from pyjuice.constraints.backends.dfa_exact import forward as F
-from pyjuice.constraints.backends.dfa_exact.conditional import class_weights, conditional
+from pyjuice.constraints.backends.dfa_exact.queries import forward as F
+from pyjuice.constraints.backends.dfa_exact.queries.conditional import class_weights, conditional
 from pyjuice.constraints.backends.dfa_exact.kernels.score import score_tables
 from pyjuice.constraints.distributions import TokenClasses
 

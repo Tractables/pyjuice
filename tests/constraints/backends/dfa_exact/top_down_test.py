@@ -16,10 +16,10 @@ import torch
 
 import pyjuice as juice
 import pyjuice.constraints as jc
-from pyjuice.constraints.backends.dfa_exact import forward as F
-from pyjuice.constraints.backends.dfa_exact.backward import run_backward
+from pyjuice.constraints.backends.dfa_exact.queries import forward as F
+from pyjuice.constraints.backends.dfa_exact.queries.top_down import run_backward
 from pyjuice.constraints.backends.dfa_exact.kernels.live import prune
-from pyjuice.constraints.backends.dfa_exact.query_plan import prior_regions, query_plan, top_down_prior
+from pyjuice.constraints.backends.dfa_exact.queries.plans import prior_regions, query_plan, top_down_prior
 
 V = 3
 KINDS = {"hmm": 6, "hmm_untied": 6, "hmm_block_sparse": 6, "left_linear": 6, "pd": 8, "pd_prod_dominated": 8,

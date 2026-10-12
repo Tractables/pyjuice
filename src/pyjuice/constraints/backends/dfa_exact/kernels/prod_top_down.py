@@ -1,7 +1,7 @@
 """
-The lifted product layer's top-down pass (see :mod:`..backward`): the top-down value of every child of every product,
-from the products' own (``element_flows``, or ``temp_flows`` for a fold's scratch row) and the other children's inside
-values. One kernel per contraction of :mod:`.prod`, each the transpose of its forward:
+The lifted product layer's top-down pass (see :mod:`.queries.top_down`): the top-down value of every child of every
+product, from the products' own (``element_flows``, or ``temp_flows`` for a fold's scratch row) and the other children's
+inside values. One kernel per contraction of :mod:`.prod`, each the transpose of its forward:
 
 * ``copy``: the child's top-down value is the copy's;
 * ``input @ block`` (``out[i, j] = sum_c mass(i, c) R[next(t, i, c), j]``): ``O_R[q, j] = sum_(i, c) -> q mass(i, c)
@@ -32,10 +32,11 @@ from pyjuice.layer.kernels import autotune
 from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
+from .common import (SUM, _block_ptr, _child, _exit_width, _interval, _logaddexp_tile, _lse_step, _pair, _slot,
+                     grid_chunks, tensor)
 from .prod import (BLOCK_BLOCK_PROGRAMS_PER_SM, BLOCK_BLOCK_TILES, EXACT_BELOW, PRODUCT_PRECISION, SKIP_EMPTY_TILES,
-                   SUM, _block_ptr, _child, tensor, _chunk_needed, _exit_width, _flat_tile, _interval, _live_lanes, _lse_step,
-                   _lse_step_one_exp, _lse_value, _pair, _slot, _tile, _tile_load, grid_chunks)
-from .sum import _logaddexp_tile
+                   _chunk_needed, _flat_tile, _live_lanes, _lse_step_one_exp, _lse_value, _tile, _tile_load)
+
 
 #: fields of a child-major table's parent rows, per contraction: the forward step's fields (see :mod:`.prod`), the
 #: child being the operand named by the side
@@ -550,7 +551,7 @@ def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_
     :param regions: ``offset``, ``width``, ``first`` and ``slots`` of every sum region (device tensors) of the buffer
         the children are written to (``node_flows``, or ``prior_flows`` for a batch of one)
     :param element_flows, temp_flows, node_flows: the top-down buffers (``temp_flows`` as wide as ``temp``)
-    :param prior: where the sum operands the plan keeps once are (see :func:`~.prod._block_ptr`)
+    :param prior: where the sum operands the plan keeps once are (see :func:`~.common._block_ptr`)
     :param skip: the top-down pass's :class:`~.prod.SkipMasks` (its triples are the parents' ``(interval A, B)`` specs)
     :param exact: see :func:`~.prod.run_products`
     :param once_iv: int32 [intervals] (device, by ``prog.intervals``' numbers): 1 where the query keeps an interval's

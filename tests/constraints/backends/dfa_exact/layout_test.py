@@ -6,8 +6,9 @@ import torch
 
 import pyjuice as juice
 import pyjuice.constraints as jc
-from pyjuice.constraints.backends.dfa_exact.kernels.prod import max_successors, skip_masks, transition_tables
-from pyjuice.constraints.backends.dfa_exact.plan import Reachability, _tile_any, build_layout, interval_tables
+from pyjuice.constraints.backends.dfa_exact.kernels.prod import skip_masks
+from pyjuice.constraints.backends.dfa_exact.kernels.transitions import max_successors, transition_tables
+from pyjuice.constraints.backends.dfa_exact.compiled.layout import Reachability, _tile_any, build_layout, interval_tables
 
 
 def random_dfa(K, V, seed):

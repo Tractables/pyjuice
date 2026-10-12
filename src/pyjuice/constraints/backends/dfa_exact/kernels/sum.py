@@ -16,7 +16,7 @@ paths:
   product (measured faster than pyjuice's own sum layer at every batch size on a 4096-state HMM, with ~100x
   smaller error). Node blocks that read the same children from consecutive rows can instead multiply their
   weights stacked into one ``[K * BS, E]`` matrix (:func:`stacked_weights`, a copy) in one product;
-  :mod:`..forward` decides when the copy pays for itself;
+  :mod:`.forward` decides when the copy pays for itself;
 * every other node block runs the fused Triton kernel: an online log-sum-exp over chunks of children, with
   the products on tensor cores. Padded edges point at pyjuice's dummy element rows, which lie below the
   product layer group's region, and are skipped.
@@ -32,7 +32,8 @@ import triton.language as tl
 from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
-from .prod import _child, grid_chunks
+from .common import _child, _logaddexp_tile, grid_chunks
+
 
 #: The fused kernel's tiles (TILE_M, TILE_E, TILE_B, num_warps, num_stages) per product precision, from a sweep on
 #: a 4096-state HMM layer (4 x 1024 nodes, 4096 children) at 69 to 8832 columns.
@@ -350,17 +351,6 @@ def _dense_sum_live(nodes, elems, params, groups, E, BS, first, elem_first, ncol
                     TILE_R = TILE_R, TILE_C = TILE_C)
 
 
-# -------------------------------------------------------------------------------------------------
-# The top-down pass: a sum's children from the sum
-# -------------------------------------------------------------------------------------------------
-
-@triton.jit
-def _logaddexp_tile(a, b):
-    hi = tl.maximum(a, b)
-    s = tl.where(hi == float("-inf"), 0.0, hi)
-    return tl.where(hi == float("-inf"), float("-inf"), tl.log(tl.exp(a - s) + tl.exp(b - s)) + s)
-
-
 @triton_jit
 def _lifted_sum_top_down_kernel(element_flows, node_flows, weights, cb_row, cb_reg, cb_add, cb_ivreg, cb_idx, par_ptr,
                                par_nid, par_reg, par_pid, reg_offset, reg_width, reg_first, reg_slots, perm, reg_perm,
@@ -439,7 +429,7 @@ def fused_sum_top_down(element_flows: torch.Tensor, node_flows: torch.Tensor, pa
 
     :param tables: child-block-major: ``cb_row``, ``cb_reg`` (-1 for element rows), ``cb_add``, ``cb_ivreg`` (a region
         of the children's interval, for pruning), ``par_ptr``, ``par_nid``, ``par_reg``, ``par_pid`` (int32 / int64
-        device tensors, see :mod:`..backward`)
+        device tensors, see :mod:`.queries.top_down`)
     :param cbs: the child block size of these children
     :param max_cols: the most columns any child block has (``batch_size`` x its slots)
     :param idx: None (every child block), or int32 on the device: the plan's index list of the child blocks to compute

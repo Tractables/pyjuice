@@ -1,43 +1,29 @@
 """
-The lifted forward pass: ``log p(C, e)`` for a batch of evidence, in the buffers of a
-:class:`~pyjuice.constraints.ConstrainedCircuit`.
-
-Layer by layer, as :meth:`TensorCircuit.forward`: the PC's own input layers write the log-probability of
-every observed token, the class masses of missing ones are summed per token class (by the backend's state, see
-:meth:`~.state.State.class_masses`), then every product layer group chains its children's blocks
-(:mod:`.kernels.prod`) and every sum layer group sums its children column by column (:mod:`.kernels.sum`).
-The root keeps a single value per sample. Like a :class:`TensorCircuit`, the pass is driven by tables: no
-kernel knows the circuit's shape. A query runs the part of them its :mod:`.query_plan` says, and the values no
-sample's evidence reaches once for all of them.
-
-Everything the pass reads besides the buffers and the parameters is built once per constrained circuit
-(:class:`Program`), from the plan's tables and the PC's own layer metadata.
+What the forward pass reads besides the buffers and the parameters, built once per backend (:class:`Program`): every
+product layer's launches -- each product folded into binary steps, the steps of one contraction launched together
+(:mod:`.prod`) -- and every sum layer's dense runs and fused parts (:mod:`.sum`), with the interval,
+transition and skip tables they read. A query runs the subsets of them its plan selects (:mod:`.plans`).
 """
 
 from __future__ import annotations
 
 import bisect
 from collections import OrderedDict, defaultdict
-from typing import Optional
 
 import numpy as np
 import torch
 
-from .kernels.prod import IDENTITY, SUM, TEMP, Launch, max_successors, skip_masks, transition_job, transition_masses
-from .kernels.prod import transition_tables
-from .kernels.prod import run_products as products
-from .kernels.live import prune
-from .kernels.sum import dense_groups, dense_sum, fused_sum, stacked_weights
-from .plan import _align, interval_tables
-from .query_plan import prior_regions, query_plan
+from ..kernels.common import IDENTITY, SUM, TEMP
+from ..kernels.prod import Launch, skip_masks
+from ..kernels.sum import dense_groups
+from ..kernels.transitions import max_successors, transition_job, transition_masses, transition_tables
+from .layout import interval_tables
 
-#: Matrix-product precision of the kernels: "fp32" (three TF32 products, fp32-level accuracy) or "tf32".
-PRECISIONS = {"fp32": "tf32x3", "tf32": "tf32"}
 
 #: Read a one-child product over a sum straight from the sum's row instead of copying its block (see Program)
 ALIAS_COPIES = True
 
-#: A missing token's transitions are grouped by successor (see :class:`~.kernels.prod.TransitionTables`) when the
+#: A missing token's transitions are grouped by successor (see :class:`~.transitions.TransitionTables`) when the
 #: automaton has at least this many token classes per successor of its most branching column: its products then
 #: loop over successors, not classes, through transition masses built per query. Below it, they loop over the
 #: classes, and nothing more is built. 8 from a sweep on HMMs (grouped against class by class, batch 1 / 16):
@@ -45,30 +31,18 @@ ALIAS_COPIES = True
 #: and below, nothing gained or losses (64 successors: 256 classes x0.71-0.73 / x1.24, 64 classes x0.81-0.87).
 GROUP_MIN_RATIO = 8
 
-#: The fewest columns (batch x slots) a dense sum region needs before evidence pruning pays with more than one live
-#: column (see :func:`prune_dense`).
-DENSE_PRUNE_MIN_COLUMNS = 48
-
-#: Dense node blocks over the same children multiply their stacked weights in one product (see
-#: :func:`~.kernels.sum.stacked_weights`) only up to this many columns per precision (the live ones under evidence
-#: pruning); wider, one product per block. From an HMM4096 sweep (4 x 1024 rows) and lifted marginals on ex1-ex4 and
-#: 13.8k- / 49k-state automata: stacked wins in TF32 at every width (x1.04-1.46) but loses 1% at 49k columns; in fp32
-#: it wins up to ~2k (x1.1-1.3) and loses 1-3% wider (cuBLAS's fp32 kernel for the 4096-row shape, and the log pass
-#: no longer finding a block's product in L2).
-STACK_MAX_COLUMNS = {"fp32": 2048, "tf32": 16384}
-
 #: ``input @ block`` steps at the same position and block interval run this many to a program on the class-by-class
-#: path, when the block is not the identity (see :func:`~.kernels.prod._input_block_group_kernel`; launches wider than
-#: :data:`~.kernels.prod.GROUP_MIN_LANES`): every class's successors and slots are read once for all of them, not once
+#: path, when the block is not the identity (see :func:`~.prod._input_block_group_kernel`; launches wider than
+#: :data:`~.prod.GROUP_MIN_LANES`): every class's successors and slots are read once for all of them, not once
 #: per step. HMM4096 sweep over 1, 2, 4, 8, 16: 8 best or within 5% of it on every workload; against one step per
 #: program, bit-identical: 13.8k- / 49k-state automata x1.09-1.15 with a prefix, x1.16-1.31 on the 49k one without;
 #: batch 16 x1.02-1.18. 1: one step per program.
 INPUT_BLOCK_GROUP = 8
 #: the other group sizes the Program builds tables for: the autotuner times every one per launch shape (see
-#: :func:`~.kernels.prod.run_products`); 16 measured best on a 168-state automaton at batch 16 (x1.05 over 8)
+#: :func:`~.prod.run_products`); 16 measured best on a 168-state automaton at batch 16 (x1.05 over 8)
 INPUT_BLOCK_GROUP_ALTERNATIVES = (16, 4)
 
-#: Floats of transition masses (see :func:`~.kernels.prod.transition_masses`) held at once: when every input step's
+#: Floats of transition masses (see :func:`~.transitions.transition_masses`) held at once: when every input step's
 #: fit, they are all kept, built once per computation of the class masses; else built launch by launch, in chunks
 #: of steps that fit, into one scratch
 TRANSITION_BUDGET = 1 << 26
@@ -78,7 +52,7 @@ TRANS_COLS = {"input_block": (1, 2), "block_input": (4, 5)}
 
 
 class Program:
-    """Everything the lifted forward pass of one constrained circuit reads besides buffers and parameters."""
+    """Everything the lifted forward pass of one backend reads besides buffers and parameters."""
 
     def __init__(self, backend):
         pc, layout = backend.pc, backend.layout
@@ -122,11 +96,11 @@ class Program:
         self.reg_iv = torch.tensor(self.reg_iv_host, dtype = torch.long, device = dev)
         self.live_tables = {}                                          # batch size -> evidence pruning's lists
         self.no_evidence = torch.full((1, n), -1, dtype = torch.int32, device = dev)   # a sample with nothing observed
-        self.plans = OrderedDict()                                     # query plans, see :mod:`.query_plan`
+        self.plans = OrderedDict()                                     # query plans, see :mod:`.plans`
         self.layouts = OrderedDict()                                   # conditionals' class weights, see .conditional
 
         # every product layer's launches are first built on the host -- ``(form, kinds, rows, iv, sizes)``, see
-        # :class:`~.kernels.prod.Launch` -- and passed over below, then made into launches (:meth:`_launch`)
+        # :class:`~.prod.Launch` -- and passed over below, then made into launches (:meth:`_launch`)
         self.steps = []
         self.stack_uses = {}                                           # stack key -> dense runs reading it per query
         prod_index = -1
@@ -243,9 +217,9 @@ class Program:
             launches[li] = self._launch(*launches[li])
 
     def _launch(self, form: str, kinds: tuple, rows: torch.Tensor, iv: torch.Tensor, sizes: torch.Tensor) -> Launch:
-        """The :class:`~.kernels.prod.Launch` of a stage's steps built on the host (``rows`` [S, fields] int64, ``iv``
+        """The :class:`~.prod.Launch` of a stage's steps built on the host (``rows`` [S, fields] int64, ``iv``
         [S], ``sizes`` [S, 3], see there); a query plan runs a subset of them through index lists
-        (:class:`~.kernels.prod.Cut`)."""
+        (:class:`~.prod.Cut`)."""
         dev, S = self.dev, rows.size(0)
         groups_host = None
         if form == "block_block":
@@ -309,11 +283,11 @@ class Program:
         One product layer's table, compiled into launches. Rows that share their children's kinds and
         boundaries fold the same way, right to left: ``c_0 @ (c_1 @ (... @ c_{k-1}))``, every intermediate
         block in a scratch row, the last step writing the layer's ``element_mars`` row. Each step is one
-        contraction of :mod:`.kernels.prod`, chosen by its operands; a stage holds the steps that read only
+        contraction of :mod:`.prod`, chosen by its operands; a stage holds the steps that read only
         earlier stages, grouped into one launch per contraction and operand kinds.
 
         :returns: ``(stages, num_temps, max_temp_slots)``: per stage, ``(form, kinds, rows, iv, sizes)`` launches on
-            the host (see :class:`~.kernels.prod.Launch`); the scratch rows the layer needs and the most slots per
+            the host (see :class:`~.prod.Launch`); the scratch rows the layer needs and the most slots per
             sample any of them holds
         """
         out_rows, child_rows, bounds = (t.cpu().long() for t in rows)
@@ -419,7 +393,7 @@ def _intervals(steps) -> set:
 
 
 def _step_groups(st: torch.Tensor, sizes):
-    """An ``input @ block`` launch's steps (host rows, see :data:`~.kernels.prod.INPUT_BLOCK_FIELDS`): ``order``, which
+    """An ``input @ block`` launch's steps (host rows, see :data:`~.prod.INPUT_BLOCK_FIELDS`): ``order``, which
     sorts them by their position and block end, and per group size ``G`` of ``sizes``, ``firsts`` [groups + 1]: the
     first (sorted) step of every group of at most ``G`` consecutive steps that share both, then the end."""
     key = st[:, 2] * (int(st[:, 5].max()) + 1) + st[:, 5]
@@ -434,7 +408,7 @@ def _step_groups(st: torch.Tensor, sizes):
 
 
 def _stack_key(blocks, E: int, block_size: int):
-    """The key of a dense run's :func:`~.kernels.sum.stacked_weights` -- ``(E, block size, first weights in row
+    """The key of a dense run's :func:`~.sum.stacked_weights` -- ``(E, block size, first weights in row
     order)`` -- when two or more node blocks occupy consecutive rows (one product can write them all), else None."""
     nids = [nid for _, nid, _ in blocks]
     if len(blocks) < 2 or any(b - a != block_size for a, b in zip(nids, nids[1:])):
@@ -466,173 +440,3 @@ def _split_aliased(fused, alias_row, alias_reg, elem_first: int, dev):
     ce, pe = pack(~is_alias, c, p, pad = (0, 0))
     ar, ag, ap = pack(is_alias, row, reg, p, pad = (-1, 0, 0))
     return nids, ce, pe, nb_reg, max_slots, (ar, ag, ap)
-
-
-def prune_dense(ncols: int, num_live: int) -> bool:
-    """
-    Whether a dense sum region with ``ncols`` columns (batch x slots), ``num_live`` of them live under evidence
-    pruning, multiplies only its live ones -- exact either way. From the library's dense products at an HMM4096 size
-    (4096 x 4096 stacked weights, fp32 and tf32, 4 to 512 columns, forward and top-down): one live column (or none)
-    always pays -- a matrix-vector product, x1.07-6.2; otherwise pruning pays once the product has left the
-    weight-read floor (from ``DENSE_PRUNE_MIN_COLUMNS`` columns) and at least half the columns are dead (x1.2-2.4
-    with a quarter live), while below, the gather and scatter cost more than they save (x0.74-0.98). Reading
-    ``num_live`` is the query's one wait for the device (see :class:`~.kernels.live.Pruning`).
-    """
-    return num_live < ncols and (num_live <= 1 or (ncols >= DENSE_PRUNE_MIN_COLUMNS and 2 * num_live <= ncols))
-
-
-def _missing(missing_mask: Optional[torch.Tensor], B: int, n: int, dev) -> torch.Tensor:
-    if missing_mask is None:
-        return torch.zeros(B, n, dtype = torch.bool, device = dev)
-    missing = missing_mask.to(dev).bool()
-    if missing.dim() == 1:
-        missing = missing[None, :].expand(B, n)
-    if missing.shape != (B, n):
-        raise ValueError(f"`missing_mask` must be [{n}] or [{B}, {n}], got {list(missing_mask.shape)}.")
-    return missing.contiguous()
-
-
-def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None, precision: str = "fp32"):
-    """
-    ``log p(C, e)`` for every sample: the probability that the PC generates a string that satisfies the
-    constraint and agrees with the observed tokens.
-
-    :param data: [B, n] token ids (ignored where missing)
-    :param missing_mask: None (everything observed), [n] or [B, n]; True where a token is marginalized
-    :param precision: "fp32" (default) or "tf32" for the sum layers' matrix products
-    :returns: [B, number of root nodes], as :func:`pyjuice.queries.marginal`
-    """
-    if precision not in PRECISIONS:
-        raise ValueError(f"`precision` must be one of {sorted(PRECISIONS)}, got {precision!r}.")
-    pc, n, dev = backend.pc, backend.n, backend.device
-    if dev.type != "cuda":
-        raise NotImplementedError(f"The dfa_exact backend runs on CUDA only, but the constrained circuit is on {dev}. "
-                                  f"Move it with `cc.to('cuda')`.")
-    if data.dim() != 2 or data.size(1) != n:
-        raise ValueError(f"`data` must be [batch, {n}], got {list(data.shape)}.")
-    B = data.size(0)
-    root_first, root_end = pc._root_node_range
-    if not backend.satisfiable:
-        return torch.full((B, root_end - root_first), -float("inf"), device = dev)
-
-    prog = backend.program()
-    missing = _missing(missing_mask, B, n, dev)
-    observed = np.ones(n, dtype = bool) if missing_mask is None else \
-        (~missing).any(dim = 0).cpu().numpy()                           # the positions some sample observes
-    x = torch.where(missing, 0, data.to(dev).long())                     # missing tokens: any valid id
-    bufs = backend.state.buffers(B)
-
-    with torch.no_grad():
-        obs_class = torch.where(missing, -1, backend.token_classes.token_class[x]).contiguous()
-        pruning = prune(prog, obs_class, B) if observed.any() else None     # nothing observed: nothing to prune
-        valid, kept = backend.state.prior_validity()
-        prior = prior_regions(prog, observed, B, kept, pruning)
-        plan = query_plan(prog, observed, None, valid.numpy(), prior)   # every inside value
-        run_forward(backend, bufs, plan, x, missing, obs_class, pruning, precision)
-        valid |= plan.todo
-
-        r = prog.root_region
-        if plan.root_prior:                                             # nothing observed: every sample's value
-            prior = backend.state.prior_buffer()
-            base = prior["offset"][r] + (root_first - backend.sum_regions[r][0]) * prior["width"][r]
-            rows = base + torch.arange(root_end - root_first, device = dev) * prior["width"][r]
-            return prior["mars"][rows][None, :].expand(B, -1).contiguous()
-        lay = bufs["layout"]
-        base = lay["sum_offsets"][r] + (root_first - backend.sum_regions[r][0]) * lay["sum_widths"][r]
-        width = lay["sum_widths"][r]
-        rows = base + torch.arange(root_end - root_first, device = dev)[:, None] * width
-        return bufs["node_mars"][rows + torch.arange(B, device = dev)[None, :]].t().contiguous()
-
-
-def run_forward(backend, bufs: dict, plan, x: torch.Tensor, missing: torch.Tensor, obs_class: torch.Tensor, pruning,
-                precision: str):
-    """
-    The inside values a query plan computes (see :mod:`.query_plan`): the per-sample ones into ``node_mars``, and
-    those kept once that ``prior_mars`` does not hold yet, for a batch of one, into ``prior_mars``. Layer by layer, as
-    :meth:`TensorCircuit.forward`: the PC's own input layers write the log-probability of every observed token, then
-    every product layer and every sum layer run their parts of the plan.
-
-    :param bufs: the batch's :meth:`~.state.State.buffers`
-    :param x: [B, n] token ids (any valid id where missing)
-    :param missing: [B, n] bool, True where a token is missing
-    :param obs_class: [B, n] int32, every observed token's class, -1 where missing
-    :param pruning: None, or the query's :class:`~.kernels.live.Pruning`
-    :param precision: "fp32" or "tf32" for the sum layers' matrix products
-    :returns: the class masses the pass read (:meth:`~.state.State.class_masses`; computed
-        for this query outside :func:`pyjuice.fast_inference`), for the query's later passes
-    """
-    pc, prog = backend.pc, backend.program()
-    B = x.size(0)
-    lay = bufs["layout"]
-    node_mars, element_mars = bufs["node_mars"], bufs["element_mars"]
-    regions = dict(offset = lay["sum_offsets_t"], width = lay["sum_widths_t"], first = prog.reg_first,
-                   slots = prog.reg_slots)
-    prior = backend.state.prior_buffer() if plan.prior else None
-    if prior is not None:                                              # where the values kept once are
-        once = dict(offset = prior["offset_t"], width = prior["width_t"], first = prog.reg_first, slots = prog.reg_slots)
-        srcs = dict(mars = prior["mars"], offset = prior["offset_t"], width = prior["width_t"], reg_prior = plan.reg_prior)
-    else:                                                              # none: never read
-        srcs = dict(mars = node_mars, offset = regions["offset"], width = regions["width"], reg_prior = plan.reg_prior)
-    dot = PRECISIONS[precision]
-    live = pruning.live if pruning is not None else None
-
-    for layer in pc.input_layer_group:                                 # the input region: pyjuice's own layout
-        layer(x.permute(1, 0), bufs["input_mars"], missing_mask = missing)
-    class_mars = backend.state.class_masses()
-    prog.transitions(class_mars, backend.state.class_mars_version)
-    stacks, kept = backend.state.weight_stacks()
-
-    for kind, prod_index, layers in plan.steps:
-        elem_first = backend.element_regions[prod_index][0]
-        elem_width = lay["element_widths"][prod_index]
-        if kind == "prod":
-            for prior_stages, sample_stages, num_temps, temp_slots in layers:
-                temp, temp_width = node_mars, 0                      # no scratch rows: never read
-                if num_temps > 0:
-                    temp_width = _align(B * temp_slots)
-                    temp = backend.state.storage_view("product_scratch", num_temps * temp_width)
-                if prior_stages:                                     # nothing observed in their scopes
-                    products(prior_stages, (temp, temp_width), prog, regions, element_mars, node_mars, class_mars,
-                             prog.no_evidence, None, elem_first, elem_width, 1, srcs, exact = True)
-                if sample_stages:
-                    products(sample_stages, (temp, temp_width), prog, regions, element_mars, node_mars, class_mars,
-                             obs_class, live, elem_first, elem_width, B, srcs, exact = pruning is not None)
-        else:
-            for block_size, prior_parts, sample_parts in layers:
-                if prior_parts:
-                    _sums(backend, prior_parts, block_size, prior["mars"], element_mars, once, prior["offset"],
-                          prior["width"], elem_first, elem_width, 1, None, stacks, kept, precision)
-                if sample_parts:
-                    _sums(backend, sample_parts, block_size, node_mars, element_mars, regions, lay["sum_offsets"],
-                          lay["sum_widths"], elem_first, elem_width, B, pruning, stacks, kept, precision)
-    return class_mars
-
-
-def _sums(backend, parts, block_size: int, nodes: torch.Tensor, element_mars: torch.Tensor, regions: dict, offsets,
-          widths, elem_first: int, elem_width: int, B: int, pruning, stacks: dict, kept: bool, precision: str):
-    """A sum layer's parts a query plan runs (``(dense runs, num_edges, fused)``: the runs ``(region, c0, blocks,
-    key)``, and None or ``(fused part, index list of its node blocks or None for all, count, most slots)``, see
-    :func:`~.query_plan.query_plan`) into ``nodes`` -- ``node_mars``, or ``prior_mars`` with ``B`` 1 and no pruning --
-    whose sum regions ``regions`` (device tensors) and ``offsets`` / ``widths`` (Python ints) describe."""
-    prog, pc = backend.program(), backend.pc
-    dot = PRECISIONS[precision]
-    for runs, num_edges, fused in parts:
-        for r, c0, blocks, key in runs:
-            region = (offsets[r], widths[r], prog.firsts[r])
-            ncols = B * prog.slots[r]
-            cols = None                                                  # every column live
-            if pruning is not None and prune_dense(ncols, pruning.num_live[prog.reg_iv_host[r]]):
-                cols = pruning.segment(prog.reg_iv_host[r], ncols)
-            stacked = None                                  # stacked if narrow enough and the copy is kept or reused
-            width = cols[2] if cols is not None else ncols                                # the product's columns
-            if key is not None and width <= STACK_MAX_COLUMNS[precision] and (kept or prog.stack_uses[key] > 1):
-                if key not in stacks:
-                    stacks[key] = stacked_weights(pc.params, key[2], num_edges, block_size)
-                stacked = {c0: stacks[key]}
-            dense_sum(nodes, element_mars, pc.params, {c0: blocks}, num_edges, block_size, region, elem_first,
-                      elem_width, ncols, dot, live = cols, stacked = stacked)
-        if fused is not None:
-            (nids, cids, pids, nb_reg, _, aliased), sel, count, max_slots = fused
-            fused_sum(nodes, element_mars, pc.params, nids, cids, pids, nb_reg, regions, elem_first, elem_width, B,
-                      block_size, max_cols = B * max_slots, precision = dot, aliased = aliased, pruning = pruning,
-                      sel = None if sel is None else sel.tensor, count = count)

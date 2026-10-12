@@ -1,6 +1,6 @@
 """
-The conditionals' kernels (see :mod:`..conditional`): the class weights of the target positions' input nodes, read off
-the top-down pass, and the scoring of every token from them.
+The conditionals' kernels (see :mod:`.queries.conditional`): the class weights of the target positions' input nodes,
+read off the top-down pass, and the scoring of every token from them.
 
 Token ``v`` of class ``c`` at position ``t`` moves column ``i`` to ``next_col[t, i, c]`` with probability ``p_u(v)`` at
 input node ``u``, so ``p(x_t = v, e, C) = sum_u p_u(v) A_u[c]``, with ``A_u[c] = sum_i exp(O_u[i, next_col[t, i, c]])``
@@ -33,9 +33,10 @@ import triton.language as tl
 from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
-from .prod import IDENTITY, _block_ptr, _child, _exit_width, _interval, _lse_step, _slot, grid_chunks, tensor
+from .common import (IDENTITY, _block_ptr, _child, _exit_width, _interval, _logaddexp_tile, _lse_step, _slot,
+                     grid_chunks, tensor)
 from .prod_top_down import _once, _out_flows_ptr
-from .sum import _logaddexp_tile
+
 
 
 @dataclass
@@ -60,7 +61,7 @@ class ScoreTables:
 
 
 def score_tables(prog) -> ScoreTables:
-    """The :class:`ScoreTables` of a lifted :class:`~..forward.Program` (built on first use, kept on it): the input
+    """The :class:`ScoreTables` of a lifted :class:`~.program.Program` (built on first use, kept on it): the input
     operands of its product steps, by position."""
     if getattr(prog, "score", None) is not None:
         return prog.score
@@ -257,7 +258,7 @@ def run_class_weights(launches, cw: dict, prog, bufs, element_flows, temp_flows,
         (``base``, int64 [n], -1 for a position no sample targets) and its row group's rows (``K``, int64 [n])
     :param bufs: ``(temp, temp_width)``, the layer's scratch rows (the folds' inside values)
     :param live: None, or the query's liveness (:class:`~.live.Pruning`'s ``live``)
-    :param prior: where the sum operands kept once are (see :func:`~.prod._block_ptr`)
+    :param prior: where the sum operands kept once are (see :func:`~.common._block_ptr`)
     :param once_iv: the plan's per-interval flag of top-down values kept once (read with sample stride 0)
     """
     temp, temp_width = bufs

@@ -6,8 +6,8 @@ import pyjuice.nodes.distributions as dists
 from pyjuice.nodes import inputs, multiply, summate
 import pyjuice.constraints as jc
 from pyjuice.constraints.structure import analyze_structure
-from pyjuice.constraints.backends.dfa_exact import plan
-from pyjuice.constraints.backends.dfa_exact.plan import build_layout
+from pyjuice.constraints.backends.dfa_exact.compiled import layout
+from pyjuice.constraints.backends.dfa_exact.compiled.layout import build_layout
 
 
 V = 5
@@ -222,20 +222,20 @@ def test_to_moves_the_pc_and_the_tables_together():
 def test_the_plan_does_not_depend_on_parameters():
     c = jc.DFA.contains([[1, 2]], vocab_size = V)
     pa, pb = hmm(6, seed = 0), hmm(6, seed = 1)
-    plan._CACHE.clear()
+    layout._CACHE.clear()
     ca = jc.compile(c, pa)
     tables = {k: v.clone() for k, v in vars(ca.backend.layout).items() if isinstance(v, torch.Tensor)}
     info = {k: v for k, v in ca.info().items() if k != "compile_time_s"}
 
     with torch.no_grad():
         pa.params.uniform_(0.1, 1.0)                    # change the parameters in place
-    plan._CACHE.clear()                                 # build the layout again, from scratch
+    layout._CACHE.clear()                                 # build the layout again, from scratch
     for cc in (jc.compile(c, pa), jc.compile(c, pb)):
         assert cc.backend.layout is not ca.backend.layout
         for k, v in tables.items():
             assert torch.equal(getattr(cc.backend.layout, k), v), k
         assert {k: v for k, v in cc.info().items() if k != "compile_time_s"} == info
-        plan._CACHE.clear()
+        layout._CACHE.clear()
     # ... and the first compiled object is untouched
     for k, v in tables.items():
         assert torch.equal(getattr(ca.backend.layout, k), v), k

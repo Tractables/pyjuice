@@ -22,7 +22,7 @@ Every node over the contiguous scope ``[a, b]`` gets a block of log-values
                             p_node(x_a..x_b) * 1[the automaton goes from column i to column j reading them]
 
 where ``i`` is a column at boundary ``a`` and ``j`` a column at boundary ``b + 1`` (columns are the
-active automaton states, see :mod:`pyjuice.constraints.backends.dfa_exact.plan`). Only active columns are
+active automaton states, see :mod:`pyjuice.constraints.backends.dfa_exact.compiled.layout`). Only active columns are
 kept: an accepted string of length ``n`` passes through active states only. Then
 
 * an input node at variable ``t`` sums its token probabilities per token class, and class ``c`` moves column

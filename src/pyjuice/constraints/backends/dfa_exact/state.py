@@ -3,12 +3,12 @@ The runtime state of a :class:`~.backend.DFAExactBackend`: the buffers its queri
 the PC's parameters and keeps across queries.
 
 Constrained queries run in buffers of their own, laid out for the lifted values (see
-:func:`~.plan.buffer_layout`) and allocated on the first query.
+:func:`~.tables.buffer_layout`) and allocated on the first query.
 
 The input nodes' token-class masses depend only on the parameters, so inside :func:`pyjuice.fast_inference` (whose
 contract is that parameters do not change) they are computed by the first query and kept until the scope exits;
 outside it, every query computes them. So do the input-independent inside values -- those of the nodes whose scope no
-sample of a query observes (see :mod:`~.query_plan`), held once in ``prior_mars`` and read by every sample -- each
+sample of a query observes (see :mod:`~.plans`), held once in ``prior_mars`` and read by every sample -- each
 kept from the query that first computes it. Likewise the stacked weights of dense sum node blocks that read the same
 children (one matrix product instead of one per block, on products narrow enough for it to pay): inside a scope that
 allows parameter copies, each is copied once and kept until the scope exits; outside it, a query copies only the
@@ -27,7 +27,7 @@ import torch
 from pyjuice.utils.fast_inference import bf16_params_allowed, is_active, param_copies_allowed, register_layer
 
 from ...distributions import lookup
-from .plan import _align, buffer_layout
+from .compiled.tables import _align, buffer_layout
 
 
 class State:
@@ -59,8 +59,8 @@ class State:
 
     def buffers(self, batch_size: int) -> Dict[str, Any]:
         """
-        The lifted buffers for a batch of ``batch_size``, cut from storage this state owns (:func:`~.plan.buffer_layout`
-        says where every region sits).
+        The lifted buffers for a batch of ``batch_size``, cut from storage this state owns
+        (:func:`~.tables.buffer_layout` says where every region sits).
 
         Each buffer has one backing storage, reused while it is large enough and at most 4 times larger than needed
         (so a loop whose batch size varies does not reallocate, and keeps its addresses), and filled with -inf only
@@ -92,16 +92,16 @@ class State:
 
     def flows(self, batch_size: int, bufs: Dict[str, Any]) -> Dict[str, Any]:
         """
-        The top-down buffers of a batch (see :mod:`~.backward`): ``node_flows`` (laid out as ``node_mars``, storage of
-        its own, allocated on first use) and ``element_flows``, which is ``element_mars``'s storage -- the top-down
-        pass never reads the product insides there.
+        The top-down buffers of a batch (see :mod:`~.queries.top_down`): ``node_flows`` (laid out as ``node_mars``,
+        storage of its own, allocated on first use) and ``element_flows``, which is ``element_mars``'s storage -- the
+        top-down pass never reads the product insides there.
         """
         return dict(node_flows = self.storage_view("node_flows", bufs["layout"]["node_size"]),
                     element_flows = bufs["element_mars"])
 
     def prior_buffer(self) -> Dict[str, Any]:
         """
-        ``prior_mars``: the input-independent inside values (see :mod:`~.query_plan`), laid out as ``node_mars`` for a
+        ``prior_mars``: the input-independent inside values (see :mod:`~.plans`), laid out as ``node_mars`` for a
         batch of one, in storage of its own (it outlives queries of any batch size), allocated on first use. A dict
         with ``mars`` (flat), and every sum region's ``offset`` and ``width`` there (Python ints) and ``offset_t`` /
         ``width_t`` (int64 on the device).
@@ -112,7 +112,7 @@ class State:
 
     def prior_flows(self, regions) -> Dict[str, Any]:
         """
-        ``prior_flows``: the input-independent top-down values (see :mod:`~.query_plan`), for a batch of one, in
+        ``prior_flows``: the input-independent top-down values (see :mod:`~.plans`), for a batch of one, in
         storage of its own laid out APPEND-ONLY: a sum region (node) gets its rows, filled with -inf, the first time a
         query keeps its values once (``regions``, bool per sum region), and keeps them, so the storage holds only the
         regions ever kept once and never more than one sample's ``node_flows``. Its values are kept as
@@ -214,7 +214,7 @@ class State:
     def weight_stacks(self):
         """
         ``(stacks, kept)``: where a query finds and leaves the stacked weights of its dense sum node blocks (stack
-        key -> :func:`~.kernels.sum.stacked_weights`, see :class:`~.forward.Program`), and whether they outlive the
+        key -> :func:`~.sum.stacked_weights`, see :class:`~.program.Program`), and whether they outlive the
         query. Inside a :func:`pyjuice.fast_inference` scope that allows parameter copies, the scope's: kept until it
         exits, so the query stacks every run it can (see ``STACK_MAX_COLUMNS`` there); else an empty dict of the
         query's own, which stacks only reused weights.
@@ -231,7 +231,7 @@ class State:
         """
         ``[V, len(rows)]``: the probability of every token under the class-mass rows ``rows`` (sorted, see
         :meth:`class_mass_rows`), token-major -- the table row group ``group`` of the conditionals is scored against
-        (:mod:`~.conditional`) -- from every input layer's distribution's ``token_probs``. Built by every query,
+        (:mod:`~.queries.conditional`) -- from every input layer's distribution's ``token_probs``. Built by every query,
         except inside a :func:`pyjuice.fast_inference` scope that allows parameter copies: there by the first query,
         then kept until the scope exits; in bfloat16 when the scope allows bf16 parameter copies.
         """

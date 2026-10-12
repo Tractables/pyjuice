@@ -16,7 +16,8 @@ import torch
 
 import pyjuice as juice
 import pyjuice.constraints as jc
-import pyjuice.constraints.backends.dfa_exact.forward as F
+import pyjuice.constraints.backends.dfa_exact.queries.marginal as M
+import pyjuice.constraints.backends.dfa_exact.compiled.program as P
 from pyjuice.constraints.backends.dfa_exact.kernels.live import prune
 
 V = 3
@@ -55,7 +56,7 @@ def assert_close(got, want, n):
 def sum_path(request, monkeypatch):
     """The sum layers through the fused kernel, or the dense path wherever blocks qualify, with its live columns
     only (``dense_pruned``) or all of them -- the test batches are below the size dense pruning starts from."""
-    import pyjuice.constraints.backends.dfa_exact.forward as F
+    import pyjuice.constraints.backends.dfa_exact.queries.forward as F
     from pyjuice.constraints.backends.dfa_exact.kernels import sum as lifted_sum
     monkeypatch.setattr(lifted_sum, "DENSE_MIN_BLOCK", 1 << 30 if request.param == "fused" else 1)
     monkeypatch.setattr(F, "prune_dense", (lambda ncols, live: live < ncols) if request.param == "dense_pruned" else
@@ -65,8 +66,7 @@ def sum_path(request, monkeypatch):
 
 @pytest.fixture(params = ["classes", "grouped"])
 def transitions(request, monkeypatch):
-    import pyjuice.constraints.backends.dfa_exact.forward as F
-    monkeypatch.setattr(F, "GROUP_MIN_RATIO", 1 << 30 if request.param == "classes" else 0)
+    monkeypatch.setattr(P, "GROUP_MIN_RATIO", 1 << 30 if request.param == "classes" else 0)
     return request.param
 
 
@@ -227,9 +227,9 @@ def test_live_column_lists(kind, build_pc):
 def test_pruning_engages_only_under_evidence(build_pc, monkeypatch):
     """An observed prefix pins every sample to one column per boundary before it: the sums compute far fewer
     columns. With nothing observed, nothing is pruned (and nothing computed for it)."""
-    import pyjuice.constraints.backends.dfa_exact.forward as F
-    calls, pruned = [], F.prune
-    monkeypatch.setattr(F, "prune", lambda *a: calls.append(1) or pruned(*a))
+    import pyjuice.constraints.backends.dfa_exact.queries.marginal as M
+    calls, pruned = [], M.prune
+    monkeypatch.setattr(M, "prune", lambda *a: calls.append(1) or pruned(*a))
     n = 8
     cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc("pd", n, V))
     prog = cc.backend.program()
@@ -273,12 +273,12 @@ def test_marginals_survive_a_wide_dynamic_range(kind, build_pc, reference, monke
     assert torch.isfinite(want).all()                                        # every mass ~ e^-100, finite
     with juice.fast_inference():
         kept = cc.marginal(data, missing)
-    real = F.prior_regions
+    real = M.prior_regions
     try:
-        F.prior_regions = lambda prog, observed, B, kept, pruning: np.zeros(len(prog.sum_ivs), dtype = bool)
+        M.prior_regions = lambda prog, observed, B, kept, pruning: np.zeros(len(prog.sum_ivs), dtype = bool)
         per_sample = cc.marginal(data, missing)
     finally:
-        F.prior_regions = real
+        M.prior_regions = real
     for got in (kept, per_sample):
         assert torch.isfinite(got).all(), got
         assert ((got - want).abs() <= 1e-5 * want.abs() + 1e-4).all(), (got - want)

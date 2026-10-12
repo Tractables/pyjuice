@@ -3,13 +3,13 @@ Conditionals under a constraint on the lifted plan: ``log p(x_t = v | e, C)`` fo
 every token ``v``.
 
 A query runs the forward pass (:mod:`.forward`) over the inside values its targets need -- those of the nodes whose
-scope misses a target -- and the top-down pass (:mod:`.backward`) over the top-down values they need -- those of the
-nodes whose scope meets one -- which leaves the CLASS WEIGHTS of the target positions' input nodes, every sample's, in
-``dfa_class_flow`` (see :mod:`.kernels.score`). Then every ROW GROUP (the positions whose input nodes read the same rows
-of their parameter tables, :class:`~.kernels.score.ScoreTables`) is scored in one pass, all its targets at once, against
-a token-major copy of those rows that the backend's state keeps inside :func:`pyjuice.fast_inference`
-(:meth:`~.state.State.token_table`). The normalizer ``p(e, C)`` comes from the class weights
-and the class masses: the root's inside value is never needed.
+scope misses a target -- and the top-down pass (:mod:`.queries.top_down`) over the top-down values they need -- those of
+the nodes whose scope meets one -- which leaves the CLASS WEIGHTS of the target positions' input nodes, every sample's,
+in ``dfa_class_flow`` (see :mod:`.score`). Then every ROW GROUP (the positions whose input nodes read the same rows of
+their parameter tables, :class:`~.score.ScoreTables`) is scored in one pass, all its targets at once, against a
+token-major copy of those rows that the backend's state keeps inside :func:`pyjuice.fast_inference`
+(:meth:`~.state.State.token_table`). The normalizer ``p(e, C)`` comes from the class weights and the class masses: the
+root's inside value is never needed.
 """
 
 from __future__ import annotations
@@ -20,11 +20,12 @@ import numpy as np
 import torch
 
 from . import forward as F
-from .backward import run_backward
-from .kernels.live import prune
-from .kernels.prod import pack_aligned
-from .kernels.score import score_group, score_tables
-from .query_plan import PLAN_CACHE_SIZE, PLANS_PER_POSITION, prior_regions, query_plan, top_down_prior
+from ..kernels.common import pack_aligned
+from ..kernels.live import prune
+from ..kernels.score import score_group, score_tables
+from .plans import PLANS_PER_POSITION, PLAN_CACHE_SIZE, prior_regions, query_plan, top_down_prior
+from .top_down import run_backward
+
 
 
 def _host_mask(mask: torch.Tensor, B: int, n: int, name: str) -> np.ndarray:
@@ -91,7 +92,7 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     """
     The forward and top-down passes of a conditional query: the log class weights of every input node over the
     target ``positions`` (bool [n], host), every sample's, summed per row of the class masses (see
-    :mod:`.kernels.score`), in ``dfa_class_flow``.
+    :mod:`.score`), in ``dfa_class_flow``.
 
     :param missing: [B, n] bool on the device, True where a token is missing
     :param held: see :func:`conditional`
@@ -151,7 +152,7 @@ def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor
         products; a token table in bf16 (inside a ``pyjuice.fast_inference`` scope allowing bf16 parameter copies) is
         read in tf32
     :param return_log_marginal: also return ``log p(e, C)`` of every row's sample, [rows]
-    :param held: None, or what the buffers hold for this query, as a caching engine decides (see :mod:`.query_plan`):
+    :param held: None, or what the buffers hold for this query, as a caching engine decides (see :mod:`.plans`):
         a dict with ``inside`` and ``top_down``, each None or bool [sum regions]
     :returns: [rows, V]
     """
@@ -174,7 +175,7 @@ def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor
     tables, starts = pack_aligned([base, K, *out_rows], np.int64)
     tables = torch.from_numpy(tables).to(dev)
     starts = starts.tolist()
-    missing = F._missing(missing_mask, B, n, dev) if missing_mask is None or missing_mask.is_cuda else \
+    missing = F.missing_tensor(missing_mask, B, n, dev) if missing_mask is None or missing_mask.is_cuda else \
         torch.from_numpy(miss).to(dev)
     with torch.no_grad():
         layout = (groups, size, (tables[starts[0]:starts[0] + n], tables[starts[1]:starts[1] + n]))

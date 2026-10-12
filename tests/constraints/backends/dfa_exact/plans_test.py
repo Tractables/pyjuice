@@ -24,10 +24,12 @@ import torch
 
 import pyjuice as juice
 import pyjuice.constraints as jc
-from pyjuice.constraints.backends.dfa_exact import forward as F
+from pyjuice.constraints.backends.dfa_exact.queries import forward as F
+from pyjuice.constraints.backends.dfa_exact.queries import marginal as M
 from pyjuice.constraints.backends.dfa_exact.kernels.live import prune
-from pyjuice.constraints.backends.dfa_exact.kernels.prod import TEMP, IndexList, Launch, pack_aligned
-from pyjuice.constraints.backends.dfa_exact.query_plan import (free_regions, prior_regions, query_plan, top_down_free,
+from pyjuice.constraints.backends.dfa_exact.kernels.common import TEMP, IndexList, pack_aligned
+from pyjuice.constraints.backends.dfa_exact.kernels.prod import Launch
+from pyjuice.constraints.backends.dfa_exact.queries.plans import (free_regions, prior_regions, query_plan, top_down_free,
                                                             top_down_prior)
 
 V = 3
@@ -345,7 +347,7 @@ def count_once(monkeypatch):
         seen.append(bool(plan.todo.any()))
         return plan
 
-    monkeypatch.setattr(F, "query_plan", spy)
+    monkeypatch.setattr(M, "query_plan", spy)
     return seen
 
 

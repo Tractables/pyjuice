@@ -14,7 +14,8 @@ from ... import distributions
 from ...language.base import Constraint
 from ...structure import PCStructure, _runs
 from ..base import Backend
-from .plan import BoundaryLayout, build_layout, build_pc_tables, buffer_layout
+from .compiled.layout import BoundaryLayout, build_layout
+from .compiled.tables import build_pc_tables, buffer_layout
 from .state import State
 
 
@@ -33,11 +34,11 @@ class DFAExactBackend(Backend):
     :ivar constraint: the constraint
     :ivar structure: the PC's :class:`~pyjuice.constraints.structure.PCStructure`
     :ivar automaton: the constraint's automaton
-    :ivar layout: the :class:`~.plan.BoundaryLayout` of the automaton over the PC's variables
+    :ivar layout: the :class:`~.layout.BoundaryLayout` of the automaton over the PC's variables
     :ivar token_classes: the automaton's :class:`~pyjuice.constraints.distributions.TokenClasses`, on the PC's
         device, as the input distributions read them
     :ivar columns_per_sample: the most slots any sum or product node's block takes per sample
-        (see :func:`~.plan.build_pc_tables`)
+        (see :func:`~.tables.build_pc_tables`)
     :ivar product_rows: per product layer, the rows and boundaries the lifted products read
     :ivar input_range: the ``node_mars`` rows of all input nodes
     :ivar root_rows: the ``node_mars`` rows of the root nodes
@@ -148,19 +149,19 @@ class DFAExactBackend(Backend):
         self.state = State(self)                    # and the buffers allocated again
 
     def program(self):
-        """The lifted forward's tables (:class:`~.forward.Program`), built on the first query and kept until the
+        """The lifted forward's tables (:class:`~.program.Program`), built on the first query and kept until the
         backend moves."""
         if self._program is None:
-            from .forward import Program
+            from .compiled.program import Program
             self._program = Program(self)
         return self._program
 
     def top_down_program(self):
-        """The top-down pass's tables (:class:`~.backward.TopDownProgram`), built on first use and kept with the
+        """The top-down pass's tables (:class:`~.top_down_program.TopDownProgram`), built on first use and kept with the
         forward's."""
         prog = self.program()
         if getattr(prog, "top_down", None) is None:
-            from .backward import top_down_program
+            from .compiled.top_down_program import top_down_program
             prog.top_down = top_down_program(self)
         return prog.top_down
 
@@ -234,7 +235,7 @@ class DFAExactBackend(Backend):
 
         :param precision: "fp32" (the default; fp32-level accuracy) or "tf32" for the sum layers' matrix products
         """
-        from .forward import marginal
+        from .queries.marginal import marginal
         return marginal(self, data, missing_mask, precision = precision)
 
     def conditional(self, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None,
@@ -246,7 +247,7 @@ class DFAExactBackend(Backend):
         :param precision: "fp32" (the default; fp32-level accuracy) or "tf32" for the matrix products; inside
             ``pyjuice.fast_inference(allow_bf16_params = True)`` the token probabilities are scored in bfloat16
         """
-        from .conditional import conditional
+        from .queries.conditional import conditional
         return conditional(self, data, missing_mask, targets, precision = precision,
                            return_log_marginal = return_log_marginal)
 

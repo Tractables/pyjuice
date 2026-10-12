@@ -16,7 +16,7 @@ anyway --
 So an observed prefix pins every block before it to one column per sample, and a sample whose evidence breaks the
 constraint keeps no live slot at all (its marginal is -inf).
 
-A block kept once for every sample (``prior_mars``, see :mod:`..query_plan`) is computed without pruning, so its dead
+A block kept once for every sample (``prior_mars``, see :mod:`.plans`) is computed without pruning, so its dead
 slots hold finite values. The arguments above still make every such slot a term of a dead product -- it is only ever
 added to -inf -- so the values stay exact. They do enter the maxima ``block @ block`` shifts its exponentials by, which
 can flush a live entry's terms: the tiles where that happens are computed again exactly (see
@@ -31,9 +31,11 @@ import torch
 import triton
 import triton.language as tl
 
-from .prod import _exit_width, _interval, _pair, grid_chunks
 from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
+
+from .common import _exit_width, _interval, _pair, grid_chunks
+
 
 
 @triton.jit
@@ -81,7 +83,8 @@ def _liveness_kernel(live, back, obs_class, next_col, succ_ptr, succ, width, n, 
     forward reachability by a sweep over boundaries -- every live column marks its successors -- then ANDed with
     ``back`` (the same shape, scratch), whether acceptance can be reached, by a sweep the other way -- every column
     reads its successors. ``succ_ptr`` / ``succ``: every column's distinct successors (a CSR as
-    :class:`~.prod.TransitionTables` grouped). A barrier makes each boundary visible to every lane before the next."""
+    :class:`~.transitions.TransitionTables` grouped). A barrier makes each boundary visible to every lane before the
+    next."""
     b = tl.program_id(0).to(tl.int64)
     base = b * (n + 1) * W
     lanes = tl.arange(0, TILE)

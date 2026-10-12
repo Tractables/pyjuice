@@ -9,7 +9,7 @@ import pytest
 import torch
 
 import pyjuice.constraints as jc
-from pyjuice.constraints.backends.dfa_exact.plan import ALIGN, buffer_layout
+from pyjuice.constraints.backends.dfa_exact.compiled.tables import ALIGN, buffer_layout
 
 V = 3
 KINDS = {"hmm": 6, "hmm_untied": 6, "hmm_block_sparse": 6, "pd": 8, "pd_prod_dominated": 8, "pd_blockified": 8,

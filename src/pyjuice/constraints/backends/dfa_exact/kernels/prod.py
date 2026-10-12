@@ -18,9 +18,9 @@ Blocks are either sum nodes' rows in ``node_mars`` or intermediate results in a 
 to the product layer's ``element_mars`` rows, or to scratch when another step reads them. A row holds one
 block per sample, sample-major: sample ``b``'s block in columns ``[b * slots, (b + 1) * slots)``. A sum node whose
 scope no sample observes may keep one block for every sample instead, in ``prior_mars`` (the query plan says which,
-see :mod:`..query_plan`). A block keeps
+see :mod:`.plans`). A block keeps
 only the (entry column ``i``, exit column ``j``) pairs the automaton joins, in row-major order: slot ``i * X +
-j`` when it joins them all, else through its interval's tables (:class:`~..plan.IntervalTables`). An input child
+j`` when it joins them all, else through its interval's tables (:class:`~.layout.IntervalTables`). An input child
 is read only as the log-probability of its observed token (pyjuice's own input layers wrote it) or, when the
 token is missing, through its transition masses (:func:`transition_masses`): for a column and one of its
 successors, the log-mass of the token classes that lead there -- so a missing token costs a gather per
@@ -32,7 +32,6 @@ import math
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence, Tuple
 
-import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -41,21 +40,10 @@ from pyjuice.layer.kernels import autotune
 from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
-from ....distributions.categorical import _exact_dot
-from ..plan import Reachability, _tile_any
+from ..compiled.layout import Reachability, _tile_any
+from .common import _block_ptr, _child, _exit_width, _interval, _lse_step, _pair, _slot, grid_chunks
+from .transitions import transition_masses
 
-#: operand kinds: a sum node's block in ``node_mars``, an intermediate block in scratch, the identity
-SUM, TEMP, IDENTITY = 0, 1, 2
-
-#: CUDA's limit on the programs along a grid's first axis, and along each of the others
-MAX_GRID = (2 ** 31 - 1, 65535)
-
-
-def grid_chunks(count: int, axis: int):
-    """``(first, size)`` of every launch that ``count`` programs along grid ``axis`` take: one launch, unless the
-    count passes CUDA's limit there (each kernel adds ``first`` to its program id on that axis)."""
-    limit = MAX_GRID[axis]
-    return [(first, min(limit, count - first)) for first in range(0, count, limit)]
 
 #: fields of a step, per contraction (int32 rows of the step tables the Program builds)
 INPUT_BLOCK_FIELDS = ("out", "u", "t", "r_row", "r_reg", "t2", "t_off")    # input u at t, then block over [t+1, t2)
@@ -69,10 +57,10 @@ COPY_FIELDS = ("out", "l_row", "l_reg", "t0", "t2")
 class Launch:
     """
     One launch of a product layer's stage, as :func:`run_products` runs it, and what a query plan needs to run a
-    subset of its steps (:func:`~..query_plan.query_plan`).
+    subset of its steps (:func:`~.plans.query_plan`).
 
     :ivar form: the contraction: ``input_block``, ``block_input``, ``block_block`` or ``copy``
-    :ivar kinds: its operands' kinds (see :class:`~..forward.Program`)
+    :ivar kinds: its operands' kinds (see :class:`~.program.Program`)
     :ivar steps: its device tables: ``input_block`` and ``block_input``, ``(steps, chunks, groups)``; ``block_block``,
         ``(steps, triple index)``; ``copy``, ``steps`` (int32 rows, see the ``*_FIELDS`` above)
     :ivar E_max, X_max, S_max: the most entry columns, exit columns and slots of its steps' outputs
@@ -94,56 +82,6 @@ class Launch:
     groups_host: Optional[dict] = None
 
 
-def pack_aligned(arrays: Sequence[np.ndarray], dtype) -> Tuple[np.ndarray, np.ndarray]:
-    """``(buffer, starts)``: ``arrays`` concatenated as ``dtype``, each starting 16 bytes into the buffer: Triton
-    specializes a pointer argument on that alignment, so a view at another offset would compile and run a slower
-    variant of its kernel."""
-    step = 16 // np.dtype(dtype).itemsize
-    sizes = np.fromiter((len(a) for a in arrays), dtype = np.int64, count = len(arrays))
-    starts = np.zeros(len(arrays) + 1, dtype = np.int64)
-    np.cumsum(-(-sizes // step) * step, out = starts[1:])
-    buf = np.zeros(int(starts[-1]), dtype = dtype)
-    for a, s, k in zip(arrays, starts.tolist(), sizes.tolist()):
-        buf[s:s + k] = a
-    return buf, starts
-
-
-class IndexList:
-    """An int32 index list of a query plan: ``host`` (numpy) until :meth:`IndexLists.upload` copies it to the device
-    (``tensor``) and drops it -- a cached plan holds the device copy alone (the host one may view a planner's whole
-    output)."""
-
-    __slots__ = ("host", "tensor")
-
-    def __init__(self, host):
-        self.host, self.tensor = host, None
-
-
-class IndexLists:
-    """The index lists of one query plan, copied to the device together (a copy from the host waits for the stream:
-    one per plan)."""
-
-    def __init__(self):
-        self.items = []
-
-    def add(self, idx) -> IndexList:
-        item = IndexList(idx)
-        self.items.append(item)
-        return item
-
-    def upload(self, dev):
-        if self.items:
-            buf, starts = pack_aligned([i.host for i in self.items], np.int32)
-            buf = torch.from_numpy(buf).to(dev)
-            for i, s in zip(self.items, starts.tolist()):
-                i.tensor, i.host = buf[s:s + len(i.host)], None
-
-
-def tensor(item: Optional[IndexList]):
-    """An index list's device tensor, or None (every row)."""
-    return None if item is None else item.tensor
-
-
 @dataclass
 class Cut:
     """
@@ -161,105 +99,12 @@ class Cut:
     count: int
 
 
-def cut_launch(launch: Launch, sel: np.ndarray, lists: IndexLists) -> Optional[Cut]:
-    """The :class:`Cut` of ``launch`` running the steps ``sel`` marks (bool [S], host), None if none; its index lists
-    go into ``lists``."""
-    count = int(sel.sum())
-    if count == 0:
-        return None
-    every = count == sel.size
-    if every:
-        E_max, X_max, S_max = launch.E_max, launch.X_max, launch.S_max
-    else:
-        sizes = launch.sizes.numpy()[sel]
-        E_max, X_max, S_max = (int(sizes[:, k].max()) for k in range(3))
-    chunks, groups = [(0, sel.size, None)], None
-    if launch.form in ("input_block", "block_input"):
-        _, chunks, groups = launch.steps
-    cuts = []
-    for s0, s1, job in chunks:
-        part = sel[s0:s1]
-        c = int(part.sum())
-        if c:
-            cuts.append((s0, s1, job, None if c == s1 - s0 else lists.add(np.nonzero(part)[0]), c))
-    gcuts = None
-    if groups is not None:
-        gcuts = {}
-        for G, firsts in launch.groups_host.items():
-            gsel = sel[firsts[:-1]]
-            c = int(gsel.sum())
-            gcuts[G] = (None if c == gsel.size else lists.add(np.nonzero(gsel)[0]), c)
-    return Cut(cuts, gcuts, E_max, X_max, S_max, count)
-
-
-@triton.jit
-def _child(idx, c, INDEXED: tl.constexpr):
-    """The row of a table that program ``c`` owns: the ``c``-th of a query plan's index list, or ``c``."""
-    if INDEXED:
-        return tl.load(idx + c)
-    else:
-        return c
-
-
-@triton.jit
-def _block_ptr(row, reg, node_mars, prior_mars, temp, reg_offset, reg_width, reg_first, prior_offset, prior_width,
-               reg_prior, temp_width, KIND: tl.constexpr):
-    """Start of a block operand, and whether every sample has a block of its own there (sample ``b``'s then ``b *
-    slots`` further): a sum node's row -- in its region of ``node_mars``, or of ``prior_mars`` when the query plan
-    keeps the region's values there (``reg_prior``, see :mod:`..query_plan`), its one block read by every sample -- or
-    a scratch row."""
-    if KIND == 0:
-        k = row - tl.load(reg_first + reg)
-        shared = tl.load(reg_prior + reg) != 0
-        own = node_mars + tl.load(reg_offset + reg) + k * tl.load(reg_width + reg)
-        prior = prior_mars + tl.load(prior_offset + reg) + k * tl.load(prior_width + reg)
-        return tl.where(shared, prior, own), ~shared
-    else:
-        return temp + row.to(tl.int64) * temp_width, row >= 0
-
-
 @triton.jit
 def _out_ptr(row, element_mars, temp, out_first, out_width, temp_width, OUT_TEMP: tl.constexpr):
     if OUT_TEMP:
         return temp + row.to(tl.int64) * temp_width
     else:
         return element_mars + (row - out_first).to(tl.int64) * out_width
-
-
-@triton.jit
-def _exit_width(width, t2, n):
-    """Columns at the exit boundary ``t2``: a sequence end is one column (summed over the accepting states)."""
-    return tl.where(t2 == n, 1, tl.load(width + tl.minimum(t2, n)))
-
-
-@triton.jit
-def _interval(iv_of, iv_info, a, b, n):
-    """``(slots, positions, pairs)`` of the interval ``[a, b)``: its blocks' slots per sample, and where its
-    position and pair tables start (-1 when it keeps every pair; see :class:`~..plan.IntervalTables`)."""
-    k = tl.load(iv_of + a * (n + 1) + b).to(tl.int64) * 3
-    return tl.load(iv_info + k).to(tl.int32), tl.load(iv_info + k + 1), tl.load(iv_info + k + 2)  # 32-bit index math
-
-
-@triton.jit
-def _slot(iv_table, positions, r, c, ncols, mask, FULL: tl.constexpr):
-    """The slot of pair ``(r, c)`` in a block with ``ncols`` exit columns: negative where the automaton does not join
-    them, or ``r`` is negative. ``FULL``: the block's interval keeps every pair (known when the kernel is compiled);
-    else the interval's tables say (``positions`` -1: it keeps every pair)."""
-    if FULL:
-        return r * ncols + c
-    else:
-        return tl.where(positions < 0, r * ncols + c,
-                        tl.load(iv_table + positions + r * ncols + c, mask = mask & (r >= 0) & (positions >= 0),
-                                other = -1))
-
-
-@triton.jit
-def _pair(iv_table, pairs, p, mask, FULL: tl.constexpr):
-    """``i * X + j`` of the pair ``(i, j)`` in slot ``p`` (``FULL`` as for :func:`_slot`)."""
-    if FULL:
-        return p
-    else:
-        return tl.where(pairs < 0, p, tl.load(iv_table + pairs + p, mask = mask & (pairs >= 0), other = 0))
 
 
 @triton.jit
@@ -272,15 +117,6 @@ def _live_lanes(live, m, b, a, i, e, j, n, W, PRUNE: tl.constexpr):
             (tl.load(row + e * W + j, mask = m, other = 0) != 0)
     else:
         return m
-
-
-@triton.jit
-def _lse_step(m, acc, v):
-    """One step of an online log-sum-exp (``m``: running max, ``acc``: running sum scaled by ``exp(-m)``)."""
-    m_new = tl.maximum(m, v)
-    scale = tl.where(m_new == float("-inf"), 1.0, tl.exp(m - m_new))
-    shift = tl.where(m_new == float("-inf"), 0.0, m_new)
-    return m_new, acc * scale + tl.exp(v - shift)
 
 
 @triton.jit
@@ -736,171 +572,6 @@ def _copy_kernel(element_mars, node_mars, temp, iv_of, iv_info, steps, sel, reg_
                                L_KIND)
         op = _out_ptr(out_row, element_mars, temp, out_first, out_width, temp_width, OUT_TEMP)
         tl.store(op + cols, tl.load(lp + cols, mask = m), mask = m)
-
-
-@dataclass(frozen = True)
-class TransitionTables:
-    """
-    Every boundary's transitions as entries (column, successor, mass), the successor of a sequence end being its one
-    column. Ungrouped, one entry per (column, class) that leads somewhere, its mass the class's mass. Grouped, one
-    per (column, successor) pair, its mass the pair's transition mass: the mass of every class that leads there
-    (:func:`transition_masses`) -- a missing token then costs a gather per successor, not per class.
-
-    :ivar grouped: which of the two
-    :ivar entry_ptr: [n, W + 1] int32, the entries of column ``q`` at ``t``: ``entry_ptr[t, q] .. entry_ptr[t, q + 1]``
-        (global numbers; ``entry_ptr[t, 0]``: the boundary's first)
-    :ivar entry_succ, entry_x: [entries] int32, every entry's successor column and where its mass is: its class,
-        or its pair's number within the boundary
-    :ivar pred_ptr, pred_col, pred_x: the entries leading to column ``j`` at ``t + 1``, as a CSR (``pred_ptr``
-        [n, W + 1]) into their columns and their mass indices
-    :ivar pair_of: grouped only, [n, W, C] int32: the pair (within the boundary) every class of every column leads
-        to, -1 where it leads nowhere
-    :ivar num_pairs: grouped only, pairs per boundary (Python ints)
-    :ivar max_pairs: grouped only, the most pairs of any column
-    """
-
-    grouped: bool
-    entry_ptr: torch.Tensor
-    entry_succ: torch.Tensor
-    entry_x: torch.Tensor
-    pred_ptr: torch.Tensor
-    pred_col: torch.Tensor
-    pred_x: torch.Tensor
-    pair_of: Optional[torch.Tensor]
-    num_pairs: list
-    max_pairs: int
-
-
-def max_successors(next_col: torch.Tensor, width, n: int) -> int:
-    """The most distinct columns one column reaches in one token, at any boundary (a sequence end being one)."""
-    W = next_col.size(1)
-    nc, most = next_col.cpu().long(), 0
-    for t in range(n - 1):                                                  # the last boundary: one column
-        succ = nc[t, :int(width[t])]
-        q, c = torch.nonzero(succ >= 0, as_tuple = True)
-        if q.numel():
-            pairs = torch.unique(q * (W + 1) + succ[q, c])
-            most = max(most, int(torch.bincount(pairs // (W + 1)).max()))
-    return max(1, most)
-
-
-def transition_tables(next_col: torch.Tensor, width, n: int, grouped: bool) -> TransitionTables:
-    """The :class:`TransitionTables` of a layout's ``next_col`` [n, W, C] and boundary widths."""
-    W, C = next_col.size(1), next_col.size(2)
-    nc = next_col.cpu().long()
-    entry_ptr = torch.zeros(n, W + 1, dtype = torch.int64)
-    pred_ptr = torch.zeros(n, W + 1, dtype = torch.int64)
-    pair_of = torch.full((n, W, C), -1, dtype = torch.int64) if grouped else None
-    succs, xs, cols, pxs, num_pairs = [], [], [], [], []
-    base = max_pairs = 0
-    for t in range(n):
-        wt = int(width[t])
-        succ = nc[t, :wt]                                                    # [wt, C]
-        if t + 1 == n:
-            succ = torch.where(succ >= 0, 0, -1)                             # a sequence end: one column
-        q, c = torch.nonzero(succ >= 0, as_tuple = True)                     # by column, then class
-        if grouped:
-            key, inverse = torch.unique(q * (W + 1) + succ[q, c], return_inverse = True)    # by column, successor
-            eq, es, ex = key // (W + 1), key % (W + 1), torch.arange(key.numel())
-            pair_of[t, q, c] = inverse
-            num_pairs.append(key.numel())
-            max_pairs = max(max_pairs, int(torch.bincount(eq, minlength = 1).max()) if key.numel() else 0)
-        else:
-            eq, es, ex = q, succ[q, c], c
-        entry_ptr[t] = base + torch.searchsorted(eq, torch.arange(W + 1))
-        by_succ = torch.argsort(es * (W + 1) + eq, stable = True)
-        pred_ptr[t] = base + torch.searchsorted(es[by_succ], torch.arange(W + 1))
-        succs.append(es); xs.append(ex); cols.append(eq[by_succ]); pxs.append(ex[by_succ])
-        base += eq.numel()
-    dev = next_col.device
-    i32 = lambda x: x.to(dev, torch.int32).contiguous()
-    cat = lambda xs: i32(torch.cat(xs)) if base > 0 else torch.zeros(1, dtype = torch.int32, device = dev)
-    return TransitionTables(grouped = grouped, entry_ptr = i32(entry_ptr), entry_succ = cat(succs), entry_x = cat(xs),
-                            pred_ptr = i32(pred_ptr), pred_col = cat(cols), pred_x = cat(pxs),
-                            pair_of = i32(pair_of) if grouped else None, num_pairs = num_pairs, max_pairs = max_pairs)
-
-
-#: :func:`transition_masses`' tiles: the most rows (input steps at one position) and columns per program, classes per
-#: product, warps. Rows and columns shrink until there are enough programs (they never change a result); the pairs
-#: per product follow the widest column, up to 64.
-TRANSITION_TILES = dict(TS = 64, QT = 4, TC = 16, warps = 4, programs = 1024)
-
-
-def transition_job(rows: torch.Tensor, dev):
-    """
-    The steps whose transition masses one :func:`transition_masses` call builds: ``rows`` [N, 3] (input row,
-    position, offset of its masses), as ``(rows, tiles, TS)`` on ``dev``, the rows ordered by position and ``tiles``
-    [tiles, 3] (first row, number of rows, position) cutting them into tiles of at most ``TS`` rows at one position
-    (fewer when there are few rows, so that there are enough programs).
-    """
-    TS = min(TRANSITION_TILES["TS"], max(16, host_next_power_of_2(rows.size(0)) // 32))
-    rows = rows[torch.argsort(rows[:, 1], stable = True)]
-    pos, counts = torch.unique_consecutive(rows[:, 1], return_counts = True)
-    tiles, start = [], 0
-    for t, k in zip(pos.tolist(), counts.tolist()):
-        tiles += [(start + i, min(TS, k - i), t) for i in range(0, k, TS)]
-        start += k
-    i32 = lambda x: torch.as_tensor(x, dtype = torch.int32).reshape(-1, 3).to(dev).contiguous()
-    return i32(rows), i32(tiles), TS
-
-
-@triton_jit
-def _transition_kernel(class_mars, mass_row, trans, rows, tiles, pair_of, entry_ptr, width, W, C, input_start,
-                       num_qtiles, pid0, TS: tl.constexpr, QT: tl.constexpr, TP: tl.constexpr, TC: tl.constexpr):
-    """
-    One program per (tile of rows at one position, ``QT`` columns): per column, its pairs ``TP`` at a time, as the
-    product of the rows' class masses -- linear, scaled by 2^64, in natural class order -- with the 0/1 table of
-    which of the pairs every class leads to. A class mass is a sum of fp32 probabilities, so 0 or at least 2^-149:
-    scaled, a normal float, which tensor cores do not flush. Its log is the transition mass.
-    """
-    pid = pid0 + tl.program_id(0)
-    tile = pid // num_qtiles
-    start, count, t = tl.load(tiles + tile * 3), tl.load(tiles + tile * 3 + 1), tl.load(tiles + tile * 3 + 2)
-    r = tl.arange(0, TS)
-    rmask = r < count
-    u = tl.load(rows + (start + r) * 3, mask = rmask, other = 0).to(tl.int64)
-    off = tl.load(rows + (start + r) * 3 + 2, mask = rmask, other = 0).to(tl.int64)
-    masses = class_mars + tl.load(mass_row + (u - input_start), mask = rmask, other = 0).to(tl.int64) * C
-    base = tl.load(entry_ptr + t * (W + 1))                                  # the boundary's first pair
-    jj = tl.arange(0, TP)
-    for qi in range(QT):
-        q = (pid % num_qtiles) * QT + qi
-        if q < tl.load(width + t):
-            g_end = tl.load(entry_ptr + t * (W + 1) + q + 1) - base
-            col = pair_of + (t * W + q).to(tl.int64) * C
-            for g0 in range(tl.load(entry_ptr + t * (W + 1) + q) - base, g_end, TP):
-                acc = tl.zeros([TS, TP], dtype = tl.float32)
-                for c0 in range(0, C, TC):
-                    c = c0 + tl.arange(0, TC)
-                    cmask = c < C
-                    x = tl.exp(tl.load(masses[:, None] + c[None, :], mask = rmask[:, None] & cmask[None, :],
-                                       other = float("-inf")) + 44.3614195558365)                # x 2^64
-                    g = tl.load(col + c, mask = cmask, other = -1) - g0                          # pair in the tile
-                    acc += _exact_dot(x, tl.where(g[:, None] == jj[None, :], 1.0, 0.0))
-                tl.store(trans + off[:, None] + (g0 + jj)[None, :], tl.log(acc) - 44.3614195558365,
-                         mask = rmask[:, None] & (g0 + jj < g_end)[None, :])
-
-
-def transition_masses(trans, job, class_mars, prog):
-    """
-    Write the transition masses of every step of ``job`` (from :func:`transition_job`): for each column ``q`` at the
-    input's position ``t`` and each successor ``s``, ``log sum_{c: next_col[t, q, c] = s} exp(class_mars[r, c])``
-    (``r``: input ``u``'s row of the class masses), at ``trans[offset + p]`` for the pair's number ``p`` within the
-    boundary.
-    """
-    rows, tiles, TS = job
-    tt, cfg = prog.trans, TRANSITION_TILES
-    W, C = prog.next_col.size(1), prog.next_col.size(2)
-    QT = cfg["QT"]
-    while QT > 1 and tiles.size(0) * host_cdiv(max(prog.width), QT) < cfg["programs"]:
-        QT //= 2
-    num_qtiles = host_cdiv(max(prog.width), QT)
-    TP = min(64, max(16, host_next_power_of_2(tt.max_pairs)))
-    for first, size in grid_chunks(tiles.size(0) * num_qtiles, 0):
-        _transition_kernel[(size,)](class_mars, prog.mass_row, trans, rows, tiles, tt.pair_of, tt.entry_ptr,
-                                    prog.width_t, W, C,
-                                    prog.input_start, num_qtiles, first, TS = TS, QT = QT, TP = TP, TC = cfg["TC"],
-                                    num_warps = cfg["warps"])
 
 
 @dataclass(frozen = True)
