@@ -101,7 +101,7 @@ def _fminus(pc, ns):
 def test_request_signal_defaults_false_on_descriptors():
     assert ExternalSumParams.requests_denom_param_flows is False
     assert LowRankSumParams(rank = 4).requests_denom_param_flows is False
-    assert BlockScaleSumParams().requests_denom_param_flows is False          # correction off by default
+    assert BlockScaleSumParams().requests_denom_param_flows is True           # correction on by default
 
 
 def test_blockscale_requests_denom_iff_correction():
@@ -311,7 +311,7 @@ def test_mixed_gated_and_plain_sum_layers_in_one_group():
     pc(x, sum_external_params = {ns_gated: phi})
     # the plain SumLayer in the group also receives `denom_param_flows` (via **kwargs) -- must not choke
     pc.backward(x, sum_external_params = {ns_gated: phi}, logspace_flows = True, flows_memory = 1.0)
-    assert pc.denom_param_flows is None                # correction off -> not requested
+    assert pc.denom_param_flows is not None            # correction on by default -> requested
 
 
 # ------------------------------------------------------ step 5: the F- accumulation (apply_z_correction)

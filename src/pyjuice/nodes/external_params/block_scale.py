@@ -162,10 +162,12 @@ class BlockScaleSumParams(ExternalSumParams):
                                the conditional `theta <- normalize(theta * F+ / F-)`, whose fixed point
                                is the true one (and whose `F+ - F-` is `d LL / d log theta`). Costs a
                                second flow accumulator -- kept in gate space, `ch_block_size` times
-                               smaller than `param_flows` -- and ~1% of an EM step. Off by default, so
-                               an ordinary gated model allocates nothing and behaves exactly as before.
-                               Supported by `FullBatchEM` / `MiniBatchEM` / `Anemone`; the gradient
-                               optimizers warn, since their descent direction is uncorrected.
+                               smaller than `param_flows` -- and ~1% of an EM step. On by default; with
+                               `False` the layer allocates nothing and takes the plain M-step. Not
+                               implemented for a gate finer than `ns.block_size` along the node axis (the
+                               backward raises): pass `False` there. Supported by `FullBatchEM` /
+                               `MiniBatchEM` / `Anemone`; the gradient optimizers warn, since their
+                               descent direction is uncorrected.
     :type apply_z_correction: bool
 
     :param tie_external: share one gate tensor across every copy of a tied node, instead of one per copy.
@@ -191,7 +193,7 @@ class BlockScaleSumParams(ExternalSumParams):
     computes_external_grads = True
 
     def __init__(self, block_size: Optional[int] = None, ch_block_size: Optional[int] = None,
-                 apply_z_correction: bool = False, tie_external: bool = False):
+                 apply_z_correction: bool = True, tie_external: bool = False):
         super(BlockScaleSumParams, self).__init__()
 
         for name, value in (("block_size", block_size), ("ch_block_size", ch_block_size)):
@@ -1104,9 +1106,10 @@ class BlockScaleSumParams(ExternalSumParams):
         # only at one node gate per block. Refused here, before `node_mars` is perturbed.
         if self.apply_z_correction and n_ngates_ > 1:
             raise NotImplementedError(
-                f"`apply_z_correction = True` is not implemented for a gate finer than `ns.block_size` "
-                f"along the NODE axis ({n_ngates_} node gates per block). Build the node at the gate's "
-                f"block size for a served equivalent -- the gate tensor has the same shape."
+                f"`apply_z_correction = True` (the default) is not implemented for a gate finer than "
+                f"`ns.block_size` along the NODE axis ({n_ngates_} node gates per block). Build the node at "
+                f"the gate's block size for a served equivalent -- the gate tensor has the same shape -- or "
+                f"pass `apply_z_correction = False` for the plain M-step."
             )
 
         external_params = kwargs.get(_buffer_kwarg(), None)
@@ -1592,9 +1595,9 @@ class BlockScaleSumParams(ExternalSumParams):
             layer._bs_grad_ext = None
 
         # The denominator flow `F-` for `apply_z_correction`. Present exactly when the PC allocated
-        # `denom_param_flows` (i.e. a layer requested it), so an ordinary gated model does nothing here.
-        # Uses the forward's cached `log Z`, so it is independent of the `node_mars` shift about to be
-        # undone below.
+        # `denom_param_flows` (i.e. a layer requested it): a model built with `apply_z_correction = False`
+        # does nothing here. Uses the forward's cached `log Z`, so it is independent of the `node_mars`
+        # shift about to be undone below.
         if denom_param_flows is not None:
             external_params = kwargs.get(_buffer_kwarg(), None)
             if external_params is None:
@@ -1905,7 +1908,7 @@ class BlockScaleSumParams(ExternalSumParams):
     def requests_denom_param_flows(self) -> bool:
         # The gate makes `Z = sum_c phi * theta` depend on `theta`, so `normalize(F+)` is not exact EM
         # under a live gate (see `__init__`). The exact M-step needs the denominator flow `F-`; request
-        # it only when `apply_z_correction` is on, so an ordinary gated model still pays nothing.
+        # it only when `apply_z_correction` is on (the default), so a model built without it pays nothing.
         return self.apply_z_correction
 
     def denom_gate_geometry(self, layer):
