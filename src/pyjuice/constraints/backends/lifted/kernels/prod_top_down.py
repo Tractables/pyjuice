@@ -33,7 +33,7 @@ from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
 from .prod import (BLOCK_BLOCK_PROGRAMS_PER_SM, BLOCK_BLOCK_TILES, EXACT_BELOW, PRODUCT_PRECISION, SKIP_EMPTY_TILES,
-                   SUM, _block_ptr, _chunk_needed, _exit_width, _flat_tile, _interval, _live_lanes, _lse_step,
+                   SUM, _block_ptr, _child, tensor, _chunk_needed, _exit_width, _flat_tile, _interval, _live_lanes, _lse_step,
                    _lse_step_one_exp, _lse_value, _pair, _slot, _tile, _tile_load, grid_chunks)
 from .sum import _logaddexp_tile
 
@@ -97,15 +97,6 @@ def _out_flows_ptr(row, element_flows, temp_flows, out_first, out_width, temp_wi
 def _once(once_iv, iv_of, a, b, n):
     """Whether this query keeps the top-down values of interval ``[a, b)`` once (a batch of one, sample stride 0)."""
     return tl.load(once_iv + tl.load(iv_of + a * (n + 1) + b)) != 0
-
-
-@triton.jit
-def _child(children_idx, c, INDEXED: tl.constexpr):
-    """The launch's child that program ``c`` owns: the ``c``-th of the plan's index list, or ``c``."""
-    if INDEXED:
-        return tl.load(children_idx + c)
-    else:
-        return c
 
 
 @triton.jit
@@ -576,6 +567,7 @@ def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_
     tt, grouped = prog.trans_top_down, prog.trans_top_down.grouped
     trans = prog.transition_buffer()
     for la, idx in launches:
+        idx = tensor(idx)
         Cn = la.children.size(0) if idx is None else idx.numel()
         indexed = dict(children_idx = la.children if idx is None else idx, INDEXED = idx is not None)
         if la.form == "copy":

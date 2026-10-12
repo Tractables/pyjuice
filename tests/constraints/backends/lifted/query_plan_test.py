@@ -15,6 +15,7 @@ Query plans (:mod:`pyjuice.constraints.backends.lifted.query_plan`) and the inpu
 
 Marginals under every pattern of evidence, which run on these plans, are tested in ``pruning_test.py``.
 """
+import dataclasses
 import types
 
 import numpy as np
@@ -25,7 +26,7 @@ import pyjuice as juice
 import pyjuice.constraints as jc
 from pyjuice.constraints.backends.lifted import forward as F
 from pyjuice.constraints.backends.lifted.kernels.live import prune
-from pyjuice.constraints.backends.lifted.kernels.prod import TEMP
+from pyjuice.constraints.backends.lifted.kernels.prod import TEMP, IndexList, Launch, pack_aligned
 from pyjuice.constraints.backends.lifted.query_plan import (free_regions, prior_regions, query_plan, top_down_free,
                                                             top_down_prior)
 
@@ -134,6 +135,12 @@ def cases(n, seed):
         yield observed, targets, valid, g
 
 
+def selected_steps(cut):
+    """The steps of a launch a :class:`~pyjuice.constraints.backends.lifted.kernels.prod.Cut` runs (host)."""
+    return np.concatenate([s0 + (np.arange(s1 - s0) if sel is None else sel.tensor.cpu().numpy())
+                           for s0, s1, _, sel, _ in cut.chunks])
+
+
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_plans_cut_exactly_the_needed_steps(kind, build_pc):
     """Every launch, dense run and fused part of a plan holds exactly the steps and node blocks whose product's (or
@@ -154,18 +161,20 @@ def test_plans_cut_exactly_the_needed_steps(kind, build_pc):
             if kind_ == "prod":
                 for (stages, _, _), (once, sample, _, _) in zip(layers, cut):
                     for variant, side in ((sample, 0), (once, 1)):
-                        got = sorted(tuple(r) for launches in variant for l in launches for r in l.rows.tolist())
+                        got = sorted(tuple(r) for launches in variant for l, c in launches
+                                     for r in l.rows[selected_steps(c)].tolist())
                         exp = sorted(tuple(r) for launches in stages for l in launches
                                      for r, i in zip(l.rows.tolist(), l.iv.tolist()) if want[i][side])
                         assert got == exp
             else:
                 for (_, parts), (_, once, sample) in zip(layers, cut):
                     for variant, side in ((sample, 0), (once, 1)):
-                        got = sorted((r, c0) for dense, _, _ in variant for (r, c0) in dense)
+                        got = sorted((r, c0) for dense, _, _ in variant for r, c0, _, _ in dense)
                         exp = sorted((r, c0) for dense, _, _ in parts for (r, c0) in dense
                                      if want[prog.reg_iv_host[r]][side])
                         assert got == exp
-                        got = sorted(int(x) for _, _, fused in variant if fused is not None for x in fused[0].tolist())
+                        got = sorted(int(x) for _, _, f in variant if f is not None
+                                     for x in (f[0][0] if f[1] is None else f[0][0][f[1].tensor.long()]).tolist())
                         exp = sorted(int(x) for _, _, fused in parts if fused is not None
                                      for x, r in zip(fused[0].tolist(), fused[3].tolist())
                                      if want[prog.reg_iv_host[r]][side])
@@ -182,6 +191,42 @@ def test_plans_are_cached(build_pc):
     assert query_plan(prog, observed.copy(), None, valid.copy(), prior.copy()) is plan
     valid[:] = True
     assert query_plan(prog, observed, None, valid, prior) is not plan        # nothing left to compute once
+
+
+def device_tensors(obj):
+    """Every device tensor a query plan holds (its index lists' included), the Program's launches aside."""
+    if isinstance(obj, torch.Tensor):
+        if obj.is_cuda:
+            yield obj
+    elif isinstance(obj, IndexList):
+        yield from device_tensors(obj.tensor)
+    elif isinstance(obj, (list, tuple)):
+        for x in obj:
+            yield from device_tensors(x)
+    elif isinstance(obj, dict):
+        for x in obj.values():
+            yield from device_tensors(x)
+    elif dataclasses.is_dataclass(obj) and not isinstance(obj, Launch):
+        for f in dataclasses.fields(obj):
+            yield from device_tensors(getattr(obj, f.name))
+
+
+@pytest.mark.parametrize("kind", list(KINDS))
+def test_plan_tensors_are_aligned(kind, build_pc):
+    """Every device tensor of a plan (forward and top-down, index lists of partly run launches included) starts 16
+    bytes into its buffer: Triton specializes pointer arguments on it, so a list at another offset would compile and
+    run a slower variant of its kernel."""
+    buf, starts = pack_aligned([np.arange(k) + 1 for k in (3, 0, 5, 1)], np.int64)
+    assert (starts % 2 == 0).all() and all(np.array_equal(buf[s:s + k], np.arange(k) + 1)
+                                           for s, k in zip(starts.tolist(), (3, 0, 5, 1)))
+    cc, n = compiled(build_pc, kind)
+    prog = cc._lifted_program()
+    data, missing = prefixes(n, [n // 2, 1, 0])
+    g = torch.Generator().manual_seed(0)
+    for _ in range(4):
+        cc.conditional(data, missing, missing & (torch.rand(missing.shape, generator = g) < 0.5))
+    tensors = [t for plan in prog.plans.values() for t in device_tensors(plan)]
+    assert len(tensors) > 0 and all(t.data_ptr() % 16 == 0 for t in tensors)
 
 
 def compact(cc, block, a, b):

@@ -33,8 +33,8 @@ import triton.language as tl
 from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
-from .prod import IDENTITY, _block_ptr, _exit_width, _interval, _lse_step, _slot, grid_chunks
-from .prod_top_down import _child, _once, _out_flows_ptr
+from .prod import IDENTITY, _block_ptr, _child, _exit_width, _interval, _lse_step, _slot, grid_chunks, tensor
+from .prod_top_down import _once, _out_flows_ptr
 from .sum import _logaddexp_tile
 
 
@@ -266,6 +266,7 @@ def run_class_weights(launches, cw: dict, prog, bufs, element_flows, temp_flows,
     prune = live is not None
     TC = min(64, host_next_power_of_2(C))
     for la, idx in launches:
+        idx = tensor(idx)
         D = la.dests.size(0) if idx is None else idx.numel()
         s_kind, out_temp, (out_full, *s_full) = la.kinds
         identity = la.form == "input_block" and s_kind == IDENTITY

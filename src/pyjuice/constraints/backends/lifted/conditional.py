@@ -22,8 +22,9 @@ import torch
 from . import forward as F
 from .backward import run_backward
 from .kernels.live import prune
+from .kernels.prod import pack_aligned
 from .kernels.score import score_group, score_tables
-from .query_plan import prior_regions, query_plan, top_down_prior
+from .query_plan import PLAN_CACHE_SIZE, PLANS_PER_POSITION, prior_regions, query_plan, top_down_prior
 
 
 def _host_mask(mask: torch.Tensor, B: int, n: int, name: str) -> np.ndarray:
@@ -51,8 +52,13 @@ def _layout(cc, positions: np.ndarray, B: int):
     """Where the class weights of a query with the target ``positions`` go in ``dfa_class_flow``: every position's
     block ``[B, classes, rows of its row group]``, a row group's consecutive: ``(groups, base, K, size)`` -- per row group
     with a target position ``(group, its target positions, start)``, and per position its block's start (-1: no
-    target) and its row group's rows (int64 [n], host)."""
-    score, n, C = score_tables(cc._lifted_program()), cc.n, cc.num_classes
+    target) and its row group's rows (int64 [n], host). Kept on the Program, by its arguments."""
+    prog = cc._lifted_program()
+    key = (positions.tobytes(), B)
+    if key in prog.layouts:
+        prog.layouts.move_to_end(key)
+        return prog.layouts[key]
+    score, n, C = score_tables(prog), cc.n, cc.num_classes
     union = np.nonzero(positions)[0]
     assert (score.group_of[union] >= 0).all(), "a target position without an input node in any product"
     base, K = np.full(n, -1, dtype = np.int64), np.zeros(n, dtype = np.int64)
@@ -64,6 +70,9 @@ def _layout(cc, positions: np.ndarray, B: int):
         base[pos] = size + np.arange(len(pos)) * B * C * k
         groups.append((g, pos, size))
         size += len(pos) * B * C * k
+    prog.layouts[key] = (groups, base, K, size)
+    if len(prog.layouts) > max(PLAN_CACHE_SIZE, PLANS_PER_POSITION * n):   # bounded as the plans are
+        prog.layouts.popitem(last = False)
     return groups, base, K, size
 
 
@@ -87,20 +96,20 @@ def class_weights(cc, data: torch.Tensor, missing: torch.Tensor, positions: np.n
     :param missing: [B, n] bool on the device, True where a token is missing
     :param held: see :func:`conditional`
     :param observed: None, or bool [n] (host): the positions some sample observes (read off ``missing`` if None)
-    :param layout: None, or ``(groups, size, tables)``: :func:`_layout`'s groups and size, and its ``base`` and ``K``
-        already on the device, concatenated (int64 [2n]) -- copied before the query launches anything, as copies from
-        the host wait for the stream
+    :param layout: None, or ``(groups, size, (base, K))``: :func:`_layout`'s groups and size, and its ``base`` and
+        ``K`` already on the device (int64 [n] each) -- copied before the query launches anything, as copies from the
+        host wait for the stream
     :returns: ``(groups, class_mars)``: per row group with a target position, ``(group, its target positions (host),
         weights [positions x B, classes, rows of the group])`` (sample ``b`` of the ``p``-th position: column ``p * B +
         b``), and the class masses the query read
     """
-    prog, td, n, dev = cc._lifted_program(), cc._top_down_program(), cc.n, cc._device
+    prog, td, dev = cc._lifted_program(), cc._top_down_program(), cc._device
     score = score_tables(prog)
     B = data.size(0)
     if layout is None:
         groups, base, K, size = _layout(cc, positions, B)
-        layout = (groups, size, torch.from_numpy(np.concatenate([base, K])).to(dev))
-    groups, size, tables = layout
+        layout = (groups, size, (torch.from_numpy(base).to(dev), torch.from_numpy(K).to(dev)))
+    groups, size, (base, K) = layout
     if observed is None:
         observed = (~missing).any(dim = 0).cpu().numpy()
     x = torch.where(missing, 0, data.to(dev).long())                          # missing tokens: any valid id
@@ -121,7 +130,7 @@ def class_weights(cc, data: torch.Tensor, missing: torch.Tensor, positions: np.n
     C = cc.num_classes
     buf = cc._storage_view("dfa_class_flow", size)
     buf.fill_(-float("inf"))
-    cw = dict(buf = buf, base = tables[:n], K = tables[n:2 * n])
+    cw = dict(buf = buf, base = base, K = K)
     run_backward(cc, bufs, flows, plan, x, missing, obs_class, pruning, precision, class_weights = cw,
                  class_mars = class_mars)
     return [(g, pos, buf[s:s + len(pos) * B * C * len(score.rows[g])].view(len(pos) * B, C, len(score.rows[g])))
@@ -162,18 +171,19 @@ def conditional(cc, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = N
     groups, base, K, size = _layout(cc, positions, B)
     # every row group's columns' rows (-1: a sample not targeting the position), with the layout, in one copy
     out_rows = [np.where(tgt[:, pos], rank[:, pos], -1).T.ravel() for _, pos, _ in groups]     # column p * B + b
-    tables = torch.from_numpy(np.concatenate([base, K, *out_rows])).to(dev)
+    tables, starts = pack_aligned([base, K, *out_rows], np.int64)
+    tables = torch.from_numpy(tables).to(dev)
+    starts = starts.tolist()
     missing = F._missing(missing_mask, B, n, dev) if missing_mask is None or missing_mask.is_cuda else \
         torch.from_numpy(miss).to(dev)
     with torch.no_grad():
+        layout = (groups, size, (tables[starts[0]:starts[0] + n], tables[starts[1]:starts[1] + n]))
         groups, class_mars = class_weights(cc, data, missing, positions, precision, held,
-                                           observed = (~miss).any(axis = 0), layout = (groups, size, tables))
+                                           observed = (~miss).any(axis = 0), layout = layout)
         out = torch.empty(M, V, device = dev)
         log_marginal = torch.empty(M + 1, device = dev) if return_log_marginal else None
-        start = 2 * n
-        for g, pos, w in groups:
+        for (g, pos, w), start in zip(groups, starts[2:]):
             out_row = tables[start:start + len(pos) * B]
-            start += len(pos) * B
             logz = score_group(out, cc._token_table(g, score.rows[g]), w, score.rows_t[g], class_mars, out_row,
                                cc.token_classes, F.PRECISIONS[precision])
             if log_marginal is not None:

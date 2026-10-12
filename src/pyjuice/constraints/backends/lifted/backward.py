@@ -35,7 +35,7 @@ from typing import Any, Callable, Optional
 import numpy as np
 import torch
 
-from .kernels.prod import IDENTITY, SUM, TEMP, skip_masks_for, transition_tables
+from .kernels.prod import IDENTITY, SUM, TEMP, skip_masks_for, tensor, transition_tables
 from .kernels.prod import run_products as products
 from .kernels.prod_top_down import TopDownLaunch, run_top_down
 from .kernels.score import class_weight_launch, run_class_weights, score_tables
@@ -66,11 +66,13 @@ class TopDownProgram:
     :ivar dead: int64 [D, 2] (host): the ``(row, region)`` of every sum node no chain of edges from the root reaches
         (pyjuice's PD has such nodes); no launch writes them: :func:`run_backward` fills those of the regions it
         computes with -inf (``prior_flows`` is -inf where never written)
+    :ivar dead_region: bool [sum regions] (host): those with a dead row
     """
 
     steps: list
     skip: Any
     dead: np.ndarray
+    dead_region: np.ndarray
     iv_bounds: np.ndarray
     reg_iv: np.ndarray
     elem_regions: list
@@ -222,8 +224,11 @@ def top_down_program(cc) -> TopDownProgram:
     iv_bounds = np.zeros((int(of.max()) + 1, 2), dtype = np.int64)
     for k in np.nonzero(of >= 0)[0]:
         iv_bounds[of[k]] = (k // (n + 1), k % (n + 1))
+    dead = np.asarray(dead, dtype = np.int64).reshape(-1, 2)
+    dead_region = np.zeros(len(cc.sum_regions), dtype = bool)
+    dead_region[dead[:, 1]] = True
     return TopDownProgram(steps = steps, skip = skip_masks_for(reach, specs, device = dev),
-                          dead = np.asarray(dead, dtype = np.int64).reshape(-1, 2), iv_bounds = iv_bounds,
+                          dead = dead, dead_region = dead_region, iv_bounds = iv_bounds,
                           reg_iv = iv_index(*np.asarray([prog.sum_ivs[k] for k in prog.reg_iv_host]).T),
                           elem_regions = [(first, end) for first, end, _ in cc.element_regions])
 
@@ -422,7 +427,7 @@ def run_backward(cc, bufs: dict, flows: dict, plan, x: torch.Tensor, missing: to
                     for cbs, tables, idx in fused_groups[part]:
                         fused_sum_top_down(element_flows, nf, pc.params, tables, regs, elem_first, elem_width, nb,
                                           block_size, cbs, max_cols = nb * tables["max_slots"], precision = dot,
-                                          pruning = pruning if part == 1 else None, idx = idx)
+                                          pruning = pruning if part == 1 else None, idx = tensor(idx))
             if visit is not None:
                 visit(prod_index)
         else:

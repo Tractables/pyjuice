@@ -118,10 +118,12 @@ class Program:
         a, b = self.iv_bounds[:, 0], self.iv_bounds[:, 1]
         self.iv_inside = (a[None, :] >= a[:, None]) & (b[None, :] <= b[:, None])   # [k, m]: m inside k
         self.reg_iv_host = [self.iv_number[iv] for iv in reg_ivs]
+        self.reg_iv_np = np.asarray(self.reg_iv_host, dtype = np.int64)
         self.reg_iv = torch.tensor(self.reg_iv_host, dtype = torch.long, device = dev)
         self.live_tables = {}                                          # batch size -> evidence pruning's lists
         self.no_evidence = torch.full((1, n), -1, dtype = torch.int32, device = dev)   # a sample with nothing observed
         self.plans = OrderedDict()                                     # query plans, see :mod:`.query_plan`
+        self.layouts = OrderedDict()                                   # conditionals' class weights, see .conditional
 
         # every product layer's launches are first built on the host -- ``(form, kinds, rows, iv, sizes)``, see
         # :class:`~.kernels.prod.Launch` -- and passed over below, then made into launches (:meth:`_launch`)
@@ -241,9 +243,11 @@ class Program:
             launches[li] = self._launch(*launches[li])
 
     def _launch(self, form: str, kinds: tuple, rows: torch.Tensor, iv: torch.Tensor, sizes: torch.Tensor) -> Launch:
-        """The :class:`~.kernels.prod.Launch` of steps built on the host (``rows`` [S, fields] int64, ``iv`` [S], ``sizes``
-        [S, 3], see there) -- of a whole stage when the Program is built, of a subset for a query plan."""
+        """The :class:`~.kernels.prod.Launch` of a stage's steps built on the host (``rows`` [S, fields] int64, ``iv``
+        [S], ``sizes`` [S, 3], see there); a query plan runs a subset of them through index lists
+        (:class:`~.kernels.prod.Cut`)."""
         dev, S = self.dev, rows.size(0)
+        groups_host = None
         if form == "block_block":
             idx = torch.tensor([self.triple_of[tuple(t)] for t in rows[:, 5:8].tolist()], dtype = torch.int32,
                                device = dev)
@@ -257,6 +261,7 @@ class Program:
                     order, firsts = _step_groups(rows, [G for G in sizes_g if G > 1])
                     rows, iv, sizes = rows[order], iv[order], sizes[order]
                     groups = {G: f.to(dev, torch.int32) for G, f in firsts.items()}
+                    groups_host = {G: f.numpy() for G, f in firsts.items()}
             elif self.trans_persistent:
                 chunks = [(0, S, None)]                                 # offsets set once, see __init__
             else:
@@ -275,7 +280,7 @@ class Program:
         else:
             steps = rows.to(dev, torch.int32).contiguous()
         E_max, X_max, S_max = (int(sizes[:, k].max()) for k in range(3))
-        return Launch(form, kinds, steps, E_max, X_max, S_max, rows, iv, sizes)
+        return Launch(form, kinds, steps, E_max, X_max, S_max, rows, iv, sizes, groups_host)
 
     def transition_buffer(self) -> torch.Tensor:
         """Where the transition masses go (all of them, or one chunk's; allocated on first use, and again when a
@@ -605,13 +610,14 @@ def run_forward(cc, bufs: dict, plan, x: torch.Tensor, missing: torch.Tensor, ob
 
 def _sums(cc, parts, block_size: int, nodes: torch.Tensor, element_mars: torch.Tensor, regions: dict, offsets, widths,
           elem_first: int, elem_width: int, B: int, pruning, stacks: dict, kept: bool, precision: str):
-    """A sum layer's ``parts`` (``(dense runs, num_edges, fused part)``) into ``nodes`` -- ``node_mars``, or
-    ``prior_mars`` with ``B`` 1 and no pruning -- whose sum regions ``regions`` (device tensors) and ``offsets`` /
-    ``widths`` (Python ints) describe."""
+    """A sum layer's parts a query plan runs (``(dense runs, num_edges, fused)``: the runs ``(region, c0, blocks,
+    key)``, and None or ``(fused part, index list of its node blocks or None for all, count, most slots)``, see
+    :func:`~.query_plan.query_plan`) into ``nodes`` -- ``node_mars``, or ``prior_mars`` with ``B`` 1 and no pruning --
+    whose sum regions ``regions`` (device tensors) and ``offsets`` / ``widths`` (Python ints) describe."""
     prog, pc = cc._lifted_program(), cc.pc
     dot = PRECISIONS[precision]
-    for dense, num_edges, fused in parts:
-        for (r, c0), (blocks, key) in dense.items():
+    for runs, num_edges, fused in parts:
+        for r, c0, blocks, key in runs:
             region = (offsets[r], widths[r], prog.firsts[r])
             ncols = B * prog.slots[r]
             cols = None                                                  # every column live
@@ -626,6 +632,7 @@ def _sums(cc, parts, block_size: int, nodes: torch.Tensor, element_mars: torch.T
             dense_sum(nodes, element_mars, pc.params, {c0: blocks}, num_edges, block_size, region, elem_first,
                       elem_width, ncols, dot, live = cols, stacked = stacked)
         if fused is not None:
-            nids, cids, pids, nb_reg, max_slots, aliased = fused
+            (nids, cids, pids, nb_reg, _, aliased), sel, count, max_slots = fused
             fused_sum(nodes, element_mars, pc.params, nids, cids, pids, nb_reg, regions, elem_first, elem_width, B,
-                      block_size, max_cols = B * max_slots, precision = dot, aliased = aliased, pruning = pruning)
+                      block_size, max_cols = B * max_slots, precision = dot, aliased = aliased, pruning = pruning,
+                      sel = None if sel is None else sel.tensor, count = count)

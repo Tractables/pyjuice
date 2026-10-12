@@ -32,6 +32,7 @@ import math
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -90,6 +91,114 @@ class Launch:
     rows: torch.Tensor
     iv: torch.Tensor
     sizes: torch.Tensor
+    groups_host: Optional[dict] = None
+
+
+def pack_aligned(arrays: Sequence[np.ndarray], dtype) -> Tuple[np.ndarray, np.ndarray]:
+    """``(buffer, starts)``: ``arrays`` concatenated as ``dtype``, each starting 16 bytes into the buffer: Triton
+    specializes a pointer argument on that alignment, so a view at another offset would compile and run a slower
+    variant of its kernel."""
+    step = 16 // np.dtype(dtype).itemsize
+    sizes = np.fromiter((len(a) for a in arrays), dtype = np.int64, count = len(arrays))
+    starts = np.zeros(len(arrays) + 1, dtype = np.int64)
+    np.cumsum(-(-sizes // step) * step, out = starts[1:])
+    buf = np.zeros(int(starts[-1]), dtype = dtype)
+    for a, s, k in zip(arrays, starts.tolist(), sizes.tolist()):
+        buf[s:s + k] = a
+    return buf, starts
+
+
+class IndexList:
+    """An int32 index list of a query plan: ``host`` (numpy) until :meth:`IndexLists.upload` copies it to the device
+    (``tensor``) and drops it -- a cached plan holds the device copy alone (the host one may view a planner's whole
+    output)."""
+
+    __slots__ = ("host", "tensor")
+
+    def __init__(self, host):
+        self.host, self.tensor = host, None
+
+
+class IndexLists:
+    """The index lists of one query plan, copied to the device together (a copy from the host waits for the stream:
+    one per plan)."""
+
+    def __init__(self):
+        self.items = []
+
+    def add(self, idx) -> IndexList:
+        item = IndexList(idx)
+        self.items.append(item)
+        return item
+
+    def upload(self, dev):
+        if self.items:
+            buf, starts = pack_aligned([i.host for i in self.items], np.int32)
+            buf = torch.from_numpy(buf).to(dev)
+            for i, s in zip(self.items, starts.tolist()):
+                i.tensor, i.host = buf[s:s + len(i.host)], None
+
+
+def tensor(item: Optional[IndexList]):
+    """An index list's device tensor, or None (every row)."""
+    return None if item is None else item.tensor
+
+
+@dataclass
+class Cut:
+    """
+    The steps of a :class:`Launch` a query plan runs: per chunk of the launch (``chunks``: ``(first, end, job, index
+    list or None for every step, count)``, see :func:`run_products`; the index list relative to the chunk's first); for
+    ``input_block`` steps run in groups, per group size ``(index list or None, count)`` of its groups (a group's steps
+    share their interval); the selected steps' most entry columns, exit columns and slots, and how many there are.
+    """
+
+    chunks: list
+    groups: Optional[dict]
+    E_max: int
+    X_max: int
+    S_max: int
+    count: int
+
+
+def cut_launch(launch: Launch, sel: np.ndarray, lists: IndexLists) -> Optional[Cut]:
+    """The :class:`Cut` of ``launch`` running the steps ``sel`` marks (bool [S], host), None if none; its index lists
+    go into ``lists``."""
+    count = int(sel.sum())
+    if count == 0:
+        return None
+    every = count == sel.size
+    if every:
+        E_max, X_max, S_max = launch.E_max, launch.X_max, launch.S_max
+    else:
+        sizes = launch.sizes.numpy()[sel]
+        E_max, X_max, S_max = (int(sizes[:, k].max()) for k in range(3))
+    chunks, groups = [(0, sel.size, None)], None
+    if launch.form in ("input_block", "block_input"):
+        _, chunks, groups = launch.steps
+    cuts = []
+    for s0, s1, job in chunks:
+        part = sel[s0:s1]
+        c = int(part.sum())
+        if c:
+            cuts.append((s0, s1, job, None if c == s1 - s0 else lists.add(np.nonzero(part)[0]), c))
+    gcuts = None
+    if groups is not None:
+        gcuts = {}
+        for G, firsts in launch.groups_host.items():
+            gsel = sel[firsts[:-1]]
+            c = int(gsel.sum())
+            gcuts[G] = (None if c == gsel.size else lists.add(np.nonzero(gsel)[0]), c)
+    return Cut(cuts, gcuts, E_max, X_max, S_max, count)
+
+
+@triton.jit
+def _child(idx, c, INDEXED: tl.constexpr):
+    """The row of a table that program ``c`` owns: the ``c``-th of a query plan's index list, or ``c``."""
+    if INDEXED:
+        return tl.load(idx + c)
+    else:
+        return c
 
 
 @triton.jit
@@ -193,14 +302,15 @@ def _lse_value(m, acc):
 
 @triton_jit
 def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, class_mars, mass_row, trans, entry_ptr,
-                        entry_succ, entry_x, width, iv_of, iv_info, iv_table, live, steps, reg_offset, reg_width,
+                        entry_succ, entry_x, width, iv_of, iv_info, iv_table, live, steps, sel, reg_offset, reg_width,
                         reg_first, prior_mars, prior_offset, prior_width, reg_prior, out_first, out_width, temp_width,
                         B, n, W, C, input_start, pid0,
                         R_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, GROUPED: tl.constexpr, PRUNE: tl.constexpr,
-                        OUT_FULL: tl.constexpr, R_FULL: tl.constexpr, TILE: tl.constexpr):
-    """One program per step and tile of its whole output, flattened (sample, slot): with the samples' blocks
-    contiguous, a step's output is one run of columns, and the lanes stay full whatever the widths."""
-    s = tl.program_id(0)
+                        OUT_FULL: tl.constexpr, R_FULL: tl.constexpr, INDEXED: tl.constexpr, TILE: tl.constexpr):
+    """One program per step (of the plan's index list ``sel`` if ``INDEXED``) and tile of its whole output, flattened
+    (sample, slot): with the samples' blocks contiguous, a step's output is one run of columns, and the lanes stay
+    full whatever the widths."""
+    s = _child(sel, tl.program_id(0), INDEXED)
     tile = pid0 + tl.program_id(1)
     out_row = tl.load(steps + s * 7 + 0)
     u = tl.load(steps + s * 7 + 1).to(tl.int64)
@@ -274,19 +384,20 @@ def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
 
 @triton_jit
 def _input_block_group_kernel(element_mars, node_mars, temp, obs_class, next_col, class_mars, mass_row, width, iv_of,
-                              iv_info, iv_table, live, steps, groups, reg_offset, reg_width, reg_first, prior_mars,
+                              iv_info, iv_table, live, steps, groups, sel, reg_offset, reg_width, reg_first, prior_mars,
                               prior_offset, prior_width, reg_prior, out_first, out_width, temp_width, B, n, W, C,
                               input_start, pid0, R_KIND: tl.constexpr,
                               OUT_TEMP: tl.constexpr, PRUNE: tl.constexpr, OUT_FULL: tl.constexpr, R_FULL: tl.constexpr,
-                              G: tl.constexpr, ONE_EXP: tl.constexpr, TILE: tl.constexpr):
+                              G: tl.constexpr, ONE_EXP: tl.constexpr, INDEXED: tl.constexpr, TILE: tl.constexpr):
     """:func:`_input_block_kernel` for a group of steps per program, class by class, the block a sum's or a scratch
     row: group ``g`` is steps ``groups[g] .. groups[g + 1]`` (at most ``G``, a power of 2), which share their position
     and block interval, so they share their lanes' columns, successors and slots. Those are read once for the
     ``[G, TILE]`` lanes; only the input's masses and the block's values are read per step. ``ONE_EXP``: the
-    log-sum-exp by :func:`_lse_step_one_exp` (bit-identical)."""
-    first = tl.load(groups + tl.program_id(0))
+    log-sum-exp by :func:`_lse_step_one_exp` (bit-identical). ``INDEXED``: the groups of the plan's index list ``sel``."""
+    g = _child(sel, tl.program_id(0), INDEXED)
+    first = tl.load(groups + g)
     gs = first + tl.arange(0, G)
-    gm = tl.arange(0, G) < tl.load(groups + tl.program_id(0) + 1) - first          # the group's steps
+    gm = tl.arange(0, G) < tl.load(groups + g + 1) - first                         # the group's steps
     tile = pid0 + tl.program_id(1)
     t = tl.load(steps + first * 7 + 2)
     t2 = tl.load(steps + first * 7 + 5)
@@ -338,16 +449,16 @@ def _input_block_group_kernel(element_mars, node_mars, temp, obs_class, next_col
 
 @triton_jit
 def _block_input_kernel(element_mars, node_mars, temp, obs_class, next_col, class_mars, mass_row, trans, pred_ptr,
-                        pred_col, pred_x, width, iv_of, iv_info, iv_table, live, steps, reg_offset, reg_width,
+                        pred_col, pred_x, width, iv_of, iv_info, iv_table, live, steps, sel, reg_offset, reg_width,
                         reg_first, prior_mars, prior_offset, prior_width, reg_prior, out_first, out_width, temp_width,
                         B, n, W, C, input_start, pid0,
                         L_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, GROUPED: tl.constexpr, PRUNE: tl.constexpr,
-                        OUT_FULL: tl.constexpr, L_FULL: tl.constexpr, TILE: tl.constexpr):
+                        OUT_FULL: tl.constexpr, L_FULL: tl.constexpr, INDEXED: tl.constexpr, TILE: tl.constexpr):
     """One program per step and tile of its whole output, flattened (sample, slot) as in
     :func:`_input_block_kernel`: every lane takes a log-sum over its exit column's predecessor entries (the
     program loops to the longest list among its lanes), each through its mass for a missing token, or the
-    observed token's own log-probability when the entry holds its class."""
-    s = tl.program_id(0)
+    observed token's own log-probability when the entry holds its class. ``INDEXED``: as :func:`_input_block_kernel`."""
+    s = _child(sel, tl.program_id(0), INDEXED)
     tile = pid0 + tl.program_id(1)
     out_row = tl.load(steps + s * 7 + 0)
     t0 = tl.load(steps + s * 7 + 3)
@@ -502,15 +613,15 @@ def _block_block_tile_exact(lp, rp, iv_table, lpos, rpos, mb, live_q, i, j, ti, 
 
 
 @triton.jit
-def _block_block_program(element_mars, node_mars, temp, width, iv_of, iv_info, live, steps, triples, skip_bits,
+def _block_block_program(element_mars, node_mars, temp, width, iv_of, iv_info, live, steps, sel, triples, skip_bits,
                          reg_offset, reg_width, reg_first, prior_mars, prior_offset, prior_width, reg_prior, out_first,
                          out_width, temp_width, B, n, W, TILES_I, TILES_J, WORDS, SPLIT, pid,
-                         L_KIND: tl.constexpr, R_KIND: tl.constexpr, OUT_TEMP: tl.constexpr):
+                         L_KIND: tl.constexpr, R_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, INDEXED: tl.constexpr):
     """What program ``pid`` of a ``block @ block`` launch works on: its tile group ``g``, step and sample, the
     boundaries, widths and position tables of its three intervals, its operands' and output's blocks, its step's skip
     masks and its sample's liveness row."""
     g = pid % SPLIT
-    s = pid // SPLIT // B
+    s = _child(sel, pid // SPLIT // B, INDEXED)
     b = (pid // SPLIT % B).to(tl.int64)
     out_row = tl.load(steps + s * 8 + 0)
     t0 = tl.load(steps + s * 8 + 5)
@@ -535,13 +646,13 @@ def _block_block_program(element_mars, node_mars, temp, width, iv_of, iv_info, l
 
 
 @triton_jit
-def _block_block_kernel(element_mars, node_mars, temp, width, iv_of, iv_info, iv_table, live, steps, triples,
+def _block_block_kernel(element_mars, node_mars, temp, width, iv_of, iv_info, iv_table, live, steps, sel, triples,
                         skip_bits, reg_offset, reg_width, reg_first, prior_mars, prior_offset, prior_width, reg_prior,
                         out_first, out_width, temp_width, B, n, W, TILES_I, TILES_J, WORDS, SPLIT, GROUP, exact_below,
                         pid0, L_KIND: tl.constexpr, R_KIND: tl.constexpr, OUT_TEMP: tl.constexpr,
                         TM: tl.constexpr, TN: tl.constexpr, TK: tl.constexpr, SUB_I: tl.constexpr,
                         SUB_J: tl.constexpr, SKIP: tl.constexpr, PRUNE: tl.constexpr, EXACT: tl.constexpr,
-                        PRECISION: tl.constexpr):
+                        PRECISION: tl.constexpr, INDEXED: tl.constexpr):
     """One program per (step, sample, group of ``GROUP`` consecutive output tiles), its tiles in turn: the sample's
     two blocks are contiguous and stay in L1 across them. A (step, sample) has ``SPLIT`` groups: 1 unless the
     launch has too few (step, sample) pairs to fill the GPU. ``EXACT``: the program records, entry by entry, whether
@@ -551,9 +662,9 @@ def _block_block_kernel(element_mars, node_mars, temp, width, iv_of, iv_info, iv
     pruned tile does little work, and a reduction per tile cost a fifth of it; a second launch for the flagged
     programs cost more still in launches."""
     g, t0, t1, t2, E, M, X, lpos, rpos, opos, lp, rp, op, mb, lrow = _block_block_program(
-        element_mars, node_mars, temp, width, iv_of, iv_info, live, steps, triples, skip_bits, reg_offset, reg_width,
-        reg_first, prior_mars, prior_offset, prior_width, reg_prior, out_first, out_width, temp_width, B, n, W,
-        TILES_I, TILES_J, WORDS, SPLIT, pid0 + tl.program_id(0), L_KIND, R_KIND, OUT_TEMP)
+        element_mars, node_mars, temp, width, iv_of, iv_info, live, steps, sel, triples, skip_bits, reg_offset,
+        reg_width, reg_first, prior_mars, prior_offset, prior_width, reg_prior, out_first, out_width, temp_width, B, n,
+        W, TILES_I, TILES_J, WORDS, SPLIT, pid0 + tl.program_id(0), L_KIND, R_KIND, OUT_TEMP, INDEXED)
     NJ = tl.cdiv(X, TN)
     if EXACT:
         bad = tl.zeros([TM, TN], dtype = tl.int32)
@@ -606,10 +717,10 @@ def _block_block_kernel(element_mars, node_mars, temp, width, iv_of, iv_info, iv
 
 
 @triton_jit
-def _copy_kernel(element_mars, node_mars, temp, iv_of, iv_info, steps, reg_offset, reg_width, reg_first, prior_mars,
-                 prior_offset, prior_width, reg_prior, out_first, out_width, temp_width, B, n, pid0,
-                 L_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, TILE: tl.constexpr):
-    s = tl.program_id(0)
+def _copy_kernel(element_mars, node_mars, temp, iv_of, iv_info, steps, sel, reg_offset, reg_width, reg_first,
+                 prior_mars, prior_offset, prior_width, reg_prior, out_first, out_width, temp_width, B, n, pid0,
+                 L_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, INDEXED: tl.constexpr, TILE: tl.constexpr):
+    s = _child(sel, tl.program_id(0), INDEXED)
     pid = pid0 + tl.program_id(1)
     out_row = tl.load(steps + s * 5 + 0)
     t0 = tl.load(steps + s * 5 + 3)
@@ -910,15 +1021,16 @@ INPUT_BLOCK_ONE_EXP = (False, True)
 def run_products(stages, bufs, prog, regions, element_mars, node_mars, class_mars, obs_class, live,
                  elem_first: int, elem_width: int, B: int, prior: dict, exact: bool):
     """
-    Every step of one product layer, stage by stage (a stage reads only earlier stages' scratch rows). Products
-    are fp32-level whatever the query's precision, which applies to the sum layers: ``block @ block`` dots in
-    :data:`PRODUCT_PRECISION` (exact fp32 by default), the other contractions exact fp32 log-sum-exps.
+    The steps a query plan runs of one product layer, stage by stage (a stage reads only earlier stages' scratch
+    rows). Products are fp32-level whatever the query's precision, which applies to the sum layers: ``block @ block``
+    dots in :data:`PRODUCT_PRECISION` (exact fp32 by default), the other contractions exact fp32 log-sum-exps.
 
-    :param stages: the layer's stages: lists of :class:`Launch` (``block @ block`` steps: ``(steps, triple index)``,
-        the latter indexing ``Program.skip``; ``input @ block`` and ``block @ input`` steps: ``(steps, chunks,
-        groups)``, chunks ``(first, end, job)`` step ranges, ``job`` the :func:`transition_job` that builds their
-        transition masses just before them, or None when the Program keeps them all; ``groups`` None (one step per
-        program), or ``{G: firsts}`` for :func:`_input_block_group_kernel`, used above :data:`GROUP_MIN_LANES`)
+    :param stages: the layer's stages: lists of ``(launch, cut)`` -- a :class:`Launch` and the :class:`Cut` of its
+        steps the plan runs. ``block @ block`` steps: ``(steps, triple index)``, the latter indexing ``Program.skip``;
+        ``input @ block`` and ``block @ input`` steps: ``(steps, chunks, groups)``, chunks ``(first, end, job)`` step
+        ranges, ``job`` the :func:`transition_job` that builds their transition masses just before them, or None when
+        the Program keeps them all; ``groups`` None (one step per program), or ``{G: firsts}`` for
+        :func:`_input_block_group_kernel`, used above :data:`GROUP_MIN_LANES`
     :param bufs: ``(temp, temp_width)``, the layer's scratch rows
     :param live: None, or the query's liveness (:class:`~.live.Pruning`'s ``live``)
     :param prior: where the sum operands the plan keeps once are (see :func:`_block_ptr`): ``mars``, the regions'
@@ -937,33 +1049,36 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, class_mar
     ivs = prog.intervals
     prune, live = live is not None, live if live is not None else obs_class
     for launches in stages:
-        for launch in launches:
-            form, kinds, steps, E_max, X_max, S_max = (launch.form, launch.kinds, launch.steps, launch.E_max,
-                                                       launch.X_max, launch.S_max)
-            S = launch.rows.size(0)
+        for launch, cut in launches:
+            form, kinds = launch.form, launch.kinds
+            E_max, X_max, S_max, S = cut.E_max, cut.X_max, cut.S_max, cut.count
             if form in ("input_block", "block_input"):
-                steps, chunks, groups = steps
+                steps, _, groups = launch.steps
                 trans, tt = prog.transition_buffer(), prog.trans
-                for s0, s1, job in chunks:
+                for s0, s1, job, sel, cnt in cut.chunks:
                     part = steps[s0:s1]
+                    idx = dict(sel = part if sel is None else sel.tensor, INDEXED = sel is not None)
                     if job is not None:                              # this chunk's transition masses, in scratch
                         transition_masses(trans, job, class_mars, prog)
                     if form == "input_block" and groups is not None and B * S_max > GROUP_MIN_LANES:
                         r_kind, out_temp, (out_full, *r_full) = kinds
-                        assert (s0, s1) == (0, S)                    # groups index the launch's one chunk
+                        assert (s0, s1) == (0, launch.rows.size(0))   # groups index the launch's one chunk
 
                         def input_block_group(cfg):
                             G, one_exp = cfg
                             firsts = groups[G]
+                            gsel, gcnt = cut.groups[G]
                             G = host_next_power_of_2(G)            # lanes per group (a group may be shorter)
                             tile = min(_flat_tile(B * S_max), 1024 // G)
                             for first, size in grid_chunks(host_cdiv(B * S_max, tile), 1):
-                                _input_block_group_kernel[(firsts.numel() - 1, size)](
+                                _input_block_group_kernel[(gcnt, size)](
                                     element_mars, node_mars, temp, obs_class, prog.next_col, class_mars,
-                                    prog.mass_row, prog.width_t, ivs.of, ivs.info, ivs.table, live, part, firsts, B = B,
-                                    n = n, W = W, C = C, input_start = prog.input_start, pid0 = first, R_KIND = r_kind,
+                                    prog.mass_row, prog.width_t, ivs.of, ivs.info, ivs.table, live, part, firsts,
+                                    firsts if gsel is None else gsel.tensor, B = B, n = n, W = W, C = C,
+                                    input_start = prog.input_start, pid0 = first, R_KIND = r_kind,
                                     OUT_TEMP = out_temp, PRUNE = prune, OUT_FULL = out_full, R_FULL = all(r_full),
-                                    G = G, ONE_EXP = one_exp, TILE = tile, num_warps = 4, **common)
+                                    G = G, ONE_EXP = one_exp, INDEXED = gsel is not None, TILE = tile, num_warps = 4,
+                                    **common)
 
                         # the group sizes the Program built (its default first), each step form: timed per shape (the
                         # steps rounded up to a power of 2, so that queries running subsets of a launch share choices)
@@ -975,27 +1090,28 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, class_mar
                         r_kind, out_temp, (out_full, *r_full) = kinds
                         tile = _flat_tile(B * S_max)
                         for first, size in grid_chunks(host_cdiv(B * S_max, tile), 1):
-                            _input_block_kernel[(s1 - s0, size)](
+                            _input_block_kernel[(cnt, size)](
                                 element_mars, node_mars, temp, obs_class, prog.next_col, class_mars, prog.mass_row,
                                 trans, tt.entry_ptr, tt.entry_succ, tt.entry_x, prog.width_t, ivs.of, ivs.info,
                                 ivs.table, live, part, B = B, n = n, W = W,
                                 C = C, input_start = prog.input_start, pid0 = first, R_KIND = r_kind,
                                 OUT_TEMP = out_temp, GROUPED = tt.grouped, PRUNE = prune, OUT_FULL = out_full,
-                                R_FULL = all(r_full), TILE = tile, num_warps = 4, **common)
+                                R_FULL = all(r_full), TILE = tile, num_warps = 4, **idx, **common)
                     else:
                         l_kind, out_temp, (out_full, l_full) = kinds
                         tile = _flat_tile(B * S_max)
                         for first, size in grid_chunks(host_cdiv(B * S_max, tile), 1):
-                            _block_input_kernel[(s1 - s0, size)](
+                            _block_input_kernel[(cnt, size)](
                                 element_mars, node_mars, temp, obs_class, prog.next_col, class_mars, prog.mass_row,
                                 trans, tt.pred_ptr, tt.pred_col, tt.pred_x, prog.width_t, ivs.of, ivs.info, ivs.table,
                                 live, part, B = B, n = n, W = W,
                                 C = C, input_start = prog.input_start, pid0 = first, L_KIND = l_kind,
                                 OUT_TEMP = out_temp, GROUPED = tt.grouped, PRUNE = prune, OUT_FULL = out_full,
-                                L_FULL = l_full, TILE = tile, num_warps = 4, **common)
+                                L_FULL = l_full, TILE = tile, num_warps = 4, **idx, **common)
             elif form == "block_block":
                 l_kind, r_kind, out_temp = kinds
-                steps, triples = steps
+                steps, triples = launch.steps
+                sel = cut.chunks[0][3]
                 skip = prog.skip
 
                 def block_block(cfg):
@@ -1008,20 +1124,22 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, class_mar
                     for first, size in grid_chunks(S * B * split, 0):
                         _block_block_kernel[(size,)](
                             element_mars, node_mars, temp, prog.width_t, ivs.of, ivs.info, ivs.table, live, steps,
-                            triples, skip.bits, B = B, n = n, W = W,
+                            steps if sel is None else sel.tensor, triples, skip.bits, B = B, n = n, W = W,
                             TILES_I = skip.tiles_i, TILES_J = skip.tiles_j, WORDS = skip.words, SPLIT = split,
                             GROUP = group, exact_below = EXACT_BELOW, pid0 = first, L_KIND = l_kind, R_KIND = r_kind,
                             OUT_TEMP = out_temp, TM = TM, TN = TN, TK = TK, SUB_I = TM // skip.tm, SUB_J = TN // skip.tn,
                             SKIP = SKIP_EMPTY_TILES, PRUNE = prune, EXACT = exact, PRECISION = PRODUCT_PRECISION,
-                            num_warps = warps, num_stages = 1, **common)
+                            INDEXED = sel is not None, num_warps = warps, num_stages = 1, **common)
 
                 key = ("lifted_block_block", kinds, prune, exact, SKIP_EMPTY_TILES, PRODUCT_PRECISION, B,
                        host_next_power_of_2(S), E_max, X_max)
                 block_block(autotune.pick(key, BLOCK_BLOCK_TILES, block_block))   # outputs overwritten: timed in place
             else:                                                            # "copy"
                 l_kind, out_temp = kinds
+                sel = cut.chunks[0][3]
                 tile = _tile(S_max * B)
                 for first, size in grid_chunks(host_cdiv(S_max * B, tile), 1):
                     _copy_kernel[(S, size)](
-                        element_mars, node_mars, temp, ivs.of, ivs.info, steps, B = B, n = n, pid0 = first,
-                        L_KIND = l_kind, OUT_TEMP = out_temp, TILE = tile, num_warps = 4, **common)
+                        element_mars, node_mars, temp, ivs.of, ivs.info, launch.steps,
+                        launch.steps if sel is None else sel.tensor, B = B, n = n, pid0 = first, L_KIND = l_kind,
+                        OUT_TEMP = out_temp, INDEXED = sel is not None, TILE = tile, num_warps = 4, **common)
