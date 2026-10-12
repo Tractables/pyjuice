@@ -32,6 +32,8 @@ class Backend(ABC):
     name: ClassVar[str]
     #: whether its queries are exact (up to floating point)
     exact: ClassVar[bool]
+    #: the options its decoders start from (:meth:`decoder`), under the caller's
+    decoder_defaults: ClassVar[Dict[str, Any]] = {}
 
     @classmethod
     @abstractmethod
@@ -69,6 +71,9 @@ class Backend(ABC):
         """Samples from the PC conditioned on the constraint (and evidence)."""
         raise NotImplementedError(f"The {self.name} backend does not serve `sample`.")
 
-    def decoder(self, *args, **kwargs):
-        """Incremental (token-by-token) constrained decoding."""
-        raise NotImplementedError(f"The {self.name} backend does not serve `decoder`.")
+    def decoder(self, cc, **options):
+        """A decoding session over ``cc`` (see :meth:`~pyjuice.constraints.ConstrainedCircuit.decoder`): this one
+        reuses nothing between queries; a backend that can returns its own
+        :class:`~pyjuice.constraints.decoder.Decoder`."""
+        from ..decoder import Decoder
+        return Decoder(cc, **{**self.decoder_defaults, **options})

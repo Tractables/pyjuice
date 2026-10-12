@@ -43,6 +43,7 @@ class ConstrainedCircuit:
         self.structure = structure
         self.backend = backend
         self.compile_time_s = compile_time_s
+        self._decoder = None                        # the open decoder (see `decoder`)
 
     @property
     def pc(self):
@@ -186,7 +187,22 @@ class ConstrainedCircuit:
         self._check_pc_unchanged()
         return self.backend.sample(*args, **kwargs)
 
-    def decoder(self, *args, **kwargs):
-        """Incremental (token-by-token) constrained decoding."""
+    def decoder(self, **options):
+        """
+        A decoding session (:class:`~pyjuice.constraints.decoder.Decoder`), used as a context manager: inside it,
+        ``decoder.marginal`` / ``decoder.conditional`` / ``decoder.sample`` answer as this circuit's queries do --
+        same arguments, same results -- and a backend that can reuses between them what the evidence left unchanged::
+
+            with cc.decoder() as decoder:
+                for t in range(n):
+                    logp = decoder.conditional(data[:, :t], targets = [t])
+
+        The session is a :func:`pyjuice.fast_inference` scope: parameters must not change inside it. One decoder is
+        open on a circuit at a time.
+
+        :param options: ``allow_param_copy``, ``allow_bf16_params`` and ``allow_cudagraph`` for the
+            :func:`pyjuice.fast_inference` scope; any other keyword (e.g. ``mask_id``, ``precision``) is a default for
+            every query, which a query's own keyword overrides. Each backend sets its own defaults.
+        """
         self._check_pc_unchanged()
-        return self.backend.decoder(*args, **kwargs)
+        return self.backend.decoder(self, **options)
