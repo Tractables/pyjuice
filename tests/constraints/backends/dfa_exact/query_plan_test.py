@@ -86,7 +86,7 @@ def test_every_step_carries_its_products_interval(kind, build_pc):
     """A step writing the layer's element row is its product: its interval is its output's. A step writing scratch
     is a fold of the product whose later step reads that row: both carry the same interval."""
     cc, _ = compiled(build_pc, kind)
-    prog = cc._lifted_program()
+    prog = cc.backend.program()
     for k, _, layers in prog.steps:
         if k != "prod":
             continue
@@ -111,7 +111,7 @@ def test_every_step_carries_its_products_interval(kind, build_pc):
 def flags(cc, observed, targets, valid, prior):
     """Per sum interval, from the definitions: (computed per sample, computed once) -- needed and not kept once;
     needed, kept once and not yet held."""
-    prog = cc._lifted_program()
+    prog = cc.backend.program()
     out = []
     for k, (a, b) in enumerate(prog.sum_ivs):
         needed = targets is None or bool(targets[:a].any() or targets[b:].any())
@@ -147,7 +147,7 @@ def test_plans_cut_exactly_the_needed_steps(kind, build_pc):
     region's) values the query computes: the input-dependent needed ones per sample, the input-independent needed
     ones not yet kept once."""
     cc, n = compiled(build_pc, kind)
-    prog = cc._lifted_program()
+    prog = cc.backend.program()
     for observed, targets, valid, g in rng_cases(n, seed = 1):
         valid = valid[:len(prog.sum_ivs)]
         free = free_regions(prog, observed)
@@ -183,7 +183,7 @@ def test_plans_cut_exactly_the_needed_steps(kind, build_pc):
 
 def test_plans_are_cached(build_pc):
     cc, n = compiled(build_pc, "pd")
-    prog = cc._lifted_program()
+    prog = cc.backend.program()
     observed, valid = np.zeros(n, dtype = bool), np.zeros(len(prog.sum_ivs), dtype = bool)
     observed[:2] = True
     prior = free_regions(prog, observed)
@@ -220,7 +220,7 @@ def test_plan_tensors_are_aligned(kind, build_pc):
     assert (starts % 2 == 0).all() and all(np.array_equal(buf[s:s + k], np.arange(k) + 1)
                                            for s, k in zip(starts.tolist(), (3, 0, 5, 1)))
     cc, n = compiled(build_pc, kind)
-    prog = cc._lifted_program()
+    prog = cc.backend.program()
     data, missing = prefixes(n, [n // 2, 1, 0])
     g = torch.Generator().manual_seed(0)
     for _ in range(4):
@@ -234,15 +234,15 @@ def compact(cc, block, a, b):
     a sequence end's columns summed."""
     if b == cc.n:
         block = torch.logsumexp(block, dim = -1, keepdim = True)
-    pos = cc.layout.reachability.positions(a, b)
+    pos = cc.backend.layout.reachability.positions(a, b)
     flat = block.flatten(2)
     return flat if pos is None else flat[:, :, torch.nonzero(pos.flatten() >= 0).flatten().to(flat.device)]
 
 
 def prior_rows(cc, r):
     """Sum region r's rows in prior_mars, its slots."""
-    first, end, slots = cc.sum_regions[r]
-    buf = cc._prior_buffer()
+    first, end, slots = cc.backend.sum_regions[r]
+    buf = cc.backend.state.prior_buffer()
     off, wid = buf["offset"][r], buf["width"][r]
     return buf["mars"][off:off + (end - first) * wid].view(end - first, wid)[:, :slots]
 
@@ -259,7 +259,7 @@ def test_input_independent_values_are_those_with_nothing_observed(kind, build_pc
     inside values with every token missing. Two batches: one decoding in lockstep (the regions after the longest
     prefix), one observing suffixes (the regions before them: a left-linear chain's are all prefixes)."""
     cc, n = compiled(build_pc, kind)
-    prog = cc._lifted_program()
+    prog = cc.backend.program()
     want = reference.inside(cc, torch.zeros(1, n, dtype = torch.long), torch.ones(1, n, dtype = torch.bool))
     decoding = prefixes(n, [n // 3, n // 2, n // 2])
     data, missing = prefixes(n, [n // 2, n // 3])
@@ -271,7 +271,7 @@ def test_input_independent_values_are_those_with_nothing_observed(kind, build_pc
         for ns, block in want.items():
             if not ns.is_sum():
                 continue
-            r = [first for first, _, _ in cc.sum_regions].index(ns._output_ind_range[0])
+            r = [first for first, _, _ in cc.backend.sum_regions].index(ns._output_ind_range[0])
             a, b = prog.sum_ivs[prog.reg_iv_host[r]]
             if not observed[a:b].any():
                 assert_close(prior_rows(cc, r), compact(cc, block, a, b)[:, 0])
@@ -281,24 +281,24 @@ def test_input_independent_values_are_those_with_nothing_observed(kind, build_pc
 
 def planned_forward(cc, data, missing, targets):
     """The forward of a conditional's plan (its values only, nothing read off): returns the plan and buffers."""
-    prog, dev = cc._lifted_program(), cc.pc.params.device
+    prog, dev = cc.backend.program(), cc.pc.params.device
     missing = missing.to(dev)
     observed = (~missing).any(dim = 0).cpu().numpy()
-    valid, _ = cc._prior_validity()
+    valid, _ = cc.backend.state.prior_validity()
     plan = query_plan(prog, observed, None if targets is None else targets.numpy(), valid.numpy(),
                       free_regions(prog, observed))                         # every free region once
     x = torch.where(missing, 0, data.to(dev).long())
-    obs_class = torch.where(missing, -1, cc.token_classes.token_class[x]).contiguous()
+    obs_class = torch.where(missing, -1, cc.backend.token_classes.token_class[x]).contiguous()
     pruning = prune(prog, obs_class, data.size(0)) if observed.any() else None
-    bufs = cc._buffers(data.size(0))
+    bufs = cc.backend.state.buffers(data.size(0))
     with torch.no_grad():
-        F.run_forward(cc, bufs, plan, x, missing, obs_class, pruning, "fp32")
+        F.run_forward(cc.backend, bufs, plan, x, missing, obs_class, pruning, "fp32")
     valid |= plan.todo
     return plan, bufs
 
 
 def sample_rows(cc, bufs, r, B):
-    first, end, slots = cc.sum_regions[r]
+    first, end, slots = cc.backend.sum_regions[r]
     lay = bufs["layout"]
     off, wid = lay["sum_offsets"][r], lay["sum_widths"][r]
     return bufs["node_mars"][off:off + (end - first) * wid].view(end - first, wid)[:, :B * slots]
@@ -310,7 +310,7 @@ def test_a_planned_forward_computes_exactly_the_needed_values(kind, build_pc):
     full forward of the same evidence computes; the others are not computed (their rows keep the NaN they were filled
     with)."""
     cc, n = compiled(build_pc, kind)
-    prog = cc._lifted_program()
+    prog = cc.backend.program()
     g = torch.Generator().manual_seed(2)
     B = 3
     data = torch.randint(0, V, (B, n), generator = g)
@@ -320,12 +320,12 @@ def test_a_planned_forward_computes_exactly_the_needed_values(kind, build_pc):
         targets[t] = True
         missing_t = missing | targets[None, :]                              # a target is missing
         planned_forward(cc, data, missing_t, None)                          # every value, as a marginal
-        full = [sample_rows(cc, cc._buffers(B), r, B).clone() for r in range(len(cc.sum_regions))]
-        bufs = cc._buffers(B)
+        full = [sample_rows(cc, cc.backend.state.buffers(B), r, B).clone() for r in range(len(cc.backend.sum_regions))]
+        bufs = cc.backend.state.buffers(B)
         bufs["node_mars"].fill_(float("nan"))
         planned_forward(cc, data, missing_t, targets)
         obs_t = (~missing_t).any(dim = 0)
-        for r in range(len(cc.sum_regions)):
+        for r in range(len(cc.backend.sum_regions)):
             a, b = prog.sum_ivs[prog.reg_iv_host[r]]
             if not obs_t[a:b].any():                                        # input-independent: prior_mars
                 continue
@@ -384,7 +384,7 @@ def test_nothing_observed_reads_the_root_once(build_pc, reference):
     written, and every sample reads the same root."""
     cc, n = compiled(build_pc, "pd")
     data, missing = prefixes(n, [0, 0, 0])
-    bufs = cc._buffers(3)
+    bufs = cc.backend.state.buffers(3)
     bufs["node_mars"].fill_(float("nan"))
     got = cc.marginal(data, missing)
     assert_close(got, reference.marginal(cc, data, missing))
@@ -396,7 +396,7 @@ def test_kept_once_when_it_pays(build_pc):
     """Outside fast_inference, a free interval is kept once when its block costs less than the samples' live columns
     (and so is every interval inside one of those); inside, every free interval is."""
     cc, n = compiled(build_pc, "pd")
-    prog = cc._lifted_program()
+    prog = cc.backend.program()
     slots = prog.iv_slots
     a, b = prog.iv_bounds[:, 0], prog.iv_bounds[:, 1]
     for lengths in ([0], [0, 0, 0], [n // 2, n // 2], [n // 2] + [0] * 7, [1, 2, 3]):
@@ -406,7 +406,7 @@ def test_kept_once_when_it_pays(build_pc):
         assert np.array_equal(free, np.array([not observed[lo:hi].any() for lo, hi in prog.sum_ivs]))
         dev = cc.pc.params.device
         x = torch.where(missing, 0, data).to(dev)
-        obs_class = torch.where(missing.to(dev), -1, cc.token_classes.token_class[x]).contiguous()
+        obs_class = torch.where(missing.to(dev), -1, cc.backend.token_classes.token_class[x]).contiguous()
         pruning = prune(prog, obs_class, len(lengths)) if observed.any() else None
         live = np.array(pruning.num_live) if pruning is not None else len(lengths) * slots
         worth = free & (live > slots)
@@ -441,7 +441,7 @@ def test_top_down_kept_once_when_it_pays(kind, build_pc):
     of the free sum intervals whose block costs less than the samples' live columns, and every interval HOLDING one of
     them (a value kept once reads its parents' for a batch of one); one sample: none."""
     cc, n = compiled(build_pc, kind)
-    prog, td = cc._lifted_program(), cc._top_down_program()
+    prog, td = cc.backend.program(), cc.backend.top_down_program()
     a, b = td.iv_bounds[:, 0], td.iv_bounds[:, 1]
     first_region = {}
     for r, k in enumerate(prog.reg_iv_host):
@@ -456,7 +456,7 @@ def test_top_down_kept_once_when_it_pays(kind, build_pc):
                                               td.iv_bounds]))
         dev = cc.pc.params.device
         x = torch.where(missing, 0, data).to(dev)
-        obs_class = torch.where(missing.to(dev), -1, cc.token_classes.token_class[x]).contiguous()
+        obs_class = torch.where(missing.to(dev), -1, cc.backend.token_classes.token_class[x]).contiguous()
         pruning = prune(prog, obs_class, len(lengths)) if observed.any() else None
         live = np.array(pruning.num_live) if pruning is not None else len(lengths) * slots
         worth = np.zeros(len(a), dtype = bool)
@@ -487,27 +487,27 @@ def test_held_inside_values_are_not_computed(kind, build_pc, reference):
     them and reads them where they are: after a forward of the same evidence, the second holds the nodes whose scope
     misses position 0 and computes the others (the root among them), written over with NaN in between."""
     cc, n = compiled(build_pc, kind)
-    prog, dev = cc._lifted_program(), cc.pc.params.device
+    prog, dev = cc.backend.program(), cc.pc.params.device
     data, missing = prefixes(n, [n // 2, 1, 0])
     B = data.size(0)
     missing = missing.to(dev)
     observed = (~missing).any(dim = 0).cpu().numpy()
     x = torch.where(missing, 0, data.to(dev).long())
-    obs_class = torch.where(missing, -1, cc.token_classes.token_class[x]).contiguous()
+    obs_class = torch.where(missing, -1, cc.backend.token_classes.token_class[x]).contiguous()
     pruning = prune(prog, obs_class, B)
     nothing_once = np.zeros(len(prog.sum_ivs), dtype = bool)
-    bufs = cc._buffers(B)
+    bufs = cc.backend.state.buffers(B)
     valid = np.zeros(len(prog.sum_ivs), dtype = bool)
     with torch.no_grad():
-        F.run_forward(cc, bufs, query_plan(prog, observed, None, valid, nothing_once), x, missing, obs_class, pruning,
-                      "fp32")
+        F.run_forward(cc.backend, bufs, query_plan(prog, observed, None, valid, nothing_once), x, missing, obs_class,
+                      pruning, "fp32")
     held = np.array([prog.sum_ivs[k][0] > 0 for k in prog.reg_iv_host])
     for r in np.nonzero(~held)[0]:
         sample_rows(cc, bufs, r, B).fill_(float("nan"))
     plan = query_plan(prog, observed, None, valid, nothing_once, held = held)
     assert not plan.sample[np.asarray(prog.reg_iv_host)[held]].any()
     with torch.no_grad():
-        F.run_forward(cc, bufs, plan, x, missing, obs_class, pruning, "fp32")
+        F.run_forward(cc.backend, bufs, plan, x, missing, obs_class, pruning, "fp32")
     r = prog.root_region
-    root = sample_rows(cc, bufs, r, B)[prog.root_rows[0] - cc.sum_regions[r][0]]
+    root = sample_rows(cc, bufs, r, B)[prog.root_rows[0] - cc.backend.sum_regions[r][0]]
     assert_close(root[None, :], reference.marginal(cc, data, missing.cpu())[:, 0][None, :].float().to(dev))

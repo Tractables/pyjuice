@@ -34,8 +34,8 @@ from pyjuice.nodes.distributions import Categorical
 
 class TokenClasses:
     """
-    The token classes of a constraint's automaton, as the input distributions read them. A
-    :class:`~pyjuice.constraints.ConstrainedCircuit` owns one (``cc.token_classes``), built with it.
+    The token classes of a constraint's automaton, as the input distributions read them. The ``dfa_exact`` backend
+    owns one (``cc.backend.token_classes``), built with it.
 
     :ivar token_class: [V] int32, the class of every token, on the circuit's device
     :ivar num_classes: the number of classes

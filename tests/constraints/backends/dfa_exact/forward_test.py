@@ -86,7 +86,7 @@ def test_a_wide_automaton_matches_the_reference(kind, sum_path, build_pc, refere
     cc = jc.compile(dfa, build_pc(kind, n, V))
     data, missing = evidence(n, 4)
     got = cc.marginal(data, missing)
-    assert (cc._lifted_program().intervals.info[:, 1] >= 0).any()           # some interval keeps a fraction
+    assert (cc.backend.program().intervals.info[:, 1] >= 0).any()           # some interval keeps a fraction
     assert_close(got, reference.marginal(cc, data, missing), n)
 
 
@@ -142,12 +142,12 @@ def sum_blocks(cc, B, data, missing):
     """Run the marginal; every sum region's rows, B * slots columns (cloned: the buffers are reused). A region the
     marginal's plan keeps once is read in prior_mars, its one block every sample's."""
     cc.marginal(data, missing)
-    prog = cc._lifted_program()
+    prog = cc.backend.program()
     plan = next(reversed(prog.plans.values()))                              # the marginal's plan (most recently used)
-    bufs, prior = cc._buffers(B), cc._prior_buffer()
+    bufs, prior = cc.backend.state.buffers(B), cc.backend.state.prior_buffer()
     lay, nm = bufs["layout"], bufs["node_mars"]
     out = []
-    for r, (first, end, slots) in enumerate(cc.sum_regions):
+    for r, (first, end, slots) in enumerate(cc.backend.sum_regions):
         if not plan.reg_prior[r]:
             off, wid = lay["sum_offsets"][r], lay["sum_widths"][r]
             out.append(nm[off:off + (end - first) * wid].view(end - first, wid)[:, :B * slots].clone())
@@ -164,12 +164,12 @@ def test_every_sample_is_a_contiguous_block(kind, build_pc):
     input-independent block, unpruned: the batch's block then differs only by the slots evidence pruning drops."""
     n = KINDS[kind]
     cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
-    prog = cc._lifted_program()
+    prog = cc.backend.program()
     data, missing = evidence(n, 3)
     batched = sum_blocks(cc, 3, data, missing)
     for b in range(3):
         single = sum_blocks(cc, 1, data[b:b + 1], missing[b:b + 1])
-        for r, ((first, end, slots), rb, rs) in enumerate(zip(cc.sum_regions, batched, single)):
+        for r, ((first, end, slots), rb, rs) in enumerate(zip(cc.backend.sum_regions, batched, single)):
             got = rb[:, b * slots:(b + 1) * slots]
             lo, hi = prog.sum_ivs[prog.reg_iv_host[r]]
             if missing[b, lo:hi].all():                                 # the batch of one: unpruned
@@ -190,9 +190,9 @@ def test_skipping_empty_tiles_changes_nothing(build_pc, monkeypatch):
     K, n = 48, 8
     dfa = jc.DFA.from_dense(V, [[rng.randrange(K) for _ in range(V)] for _ in range(K)], 0, rng.sample(range(K), 12))
     cc = jc.compile(dfa, build_pc("pd", n, V))
-    prog = cc._lifted_program()
+    prog = cc.backend.program()
     assert prog.skip.tiles_i > 1                                         # blocks wider than one tile
-    reach = Reachability(cc.layout)
+    reach = Reachability(cc.backend.layout)
     kept = total = 0
     for a, b, c in prog.skip_triples:
         lt, rt = reach.occupancy(a, b).float(), reach.occupancy(b, c).float()
@@ -216,7 +216,7 @@ def test_every_token_its_own_class(kind, transitions, build_pc, reference):
     V2, K, n = 600, 6, KINDS[kind]
     dfa = jc.DFA.from_dense(V2, [[rng.randrange(K) for _ in range(V2)] for _ in range(K)], 0, rng.sample(range(K), 3))
     cc = jc.compile(dfa, build_pc(kind, n, V2))
-    assert cc.num_classes > categorical.NATURAL_ORDER_MAX_CLASSES             # the class-order pass
+    assert cc.backend.num_classes > categorical.NATURAL_ORDER_MAX_CLASSES             # the class-order pass
     g = torch.Generator().manual_seed(0)
     data = torch.randint(0, V2, (3, n), generator = g)
     missing = torch.rand(3, n, generator = g) < 0.5
@@ -275,7 +275,7 @@ def blocks_hmm(n, tied, seed):
 
 def stack_keys(cc):
     """The stack key of every dense run the forward multiplies (None where its node blocks cannot be stacked)."""
-    return [key for kind, _, layers in cc._lifted_program().steps if kind == "sum" for _, parts in layers
+    return [key for kind, _, layers in cc.backend.program().steps if kind == "sum" for _, parts in layers
             for dense, _, _ in parts for _, key in dense.values()]
 
 
@@ -321,7 +321,7 @@ def test_stacked_dense_weights(tied, dense_pruning, reference, monkeypatch):
         for _ in range(2):
             assert_close(cc.marginal(data, missing), want, n)
     assert stacked() == 2 * len(keys) and len(builds) == len(set(keys))      # built by the first query only
-    assert cc._kept_stacks is None                                            # and dropped when the scope exits
+    assert cc.backend.state._kept_stacks is None                              # and dropped when the scope exits
 
     calls.clear(), builds.clear()
     with torch.no_grad():                                                     # an in-place update after the scope
@@ -453,12 +453,12 @@ def test_transition_masses_match_brute_force(build_pc, monkeypatch):
             layer.params[row:row + V2] = torch.exp(-90 - torch.rand(V2, device = pc.params.device, generator = g))
     cc = jc.compile(dfa, pc)
     cc.marginal(torch.zeros(1, n, dtype = torch.long), torch.ones(1, n, dtype = torch.bool))
-    prog = cc._lifted_program()
-    tt, width, nc = prog.trans, prog.width, cc.layout.next_col
+    prog = cc.backend.program()
+    tt, width, nc = prog.trans, prog.width, cc.backend.layout.next_col
     ptr, succ = tt.entry_ptr.long().cpu(), tt.entry_succ.long().cpu()
     assert tt.grouped and prog.trans_persistent and tt.max_pairs > 16    # several pair tiles at the narrowest
     assert nc.size(2) > prod.TRANSITION_TILES["TC"]
-    T, cm = prog.transition_buffer().double().cpu(), cc._class_mars.double().cpu()
+    T, cm = prog.transition_buffer().double().cpu(), cc.backend.state._class_mars.double().cpu()
     mass_row = prog.mass_row.long().cpu()
     assert (cm[torch.isfinite(cm)] < -87.4).any()                       # class masses below the normal range
     assert (cm.max(dim = 1).values < -87.4).any()                       # ... every class of a row
@@ -487,12 +487,12 @@ def test_chunked_transition_masses_change_nothing(kind, build_pc, monkeypatch):
 
     def marginal(budget):
         monkeypatch.setattr(F, "TRANSITION_BUDGET", budget)
-        cc._program = None
-        bufs = cc._buffers(data.size(0))
+        cc.backend._program = None
+        bufs = cc.backend.state.buffers(data.size(0))
         bufs["node_mars"].fill_(float("nan"))
         bufs["element_mars"].fill_(float("nan"))
         out = cc.marginal(data, missing)
-        assert cc._lifted_program().trans_persistent == (budget > 1)
+        assert cc.backend.program().trans_persistent == (budget > 1)
         return out
 
     assert torch.equal(marginal(1), marginal(1 << 26))
@@ -507,12 +507,12 @@ def test_splitting_block_block_tiles_changes_nothing(build_pc, monkeypatch):
     K, n = 48, 8
     dfa = jc.DFA.from_dense(V, [[rng.randrange(K) for _ in range(V)] for _ in range(K)], 0, rng.sample(range(K), 12))
     cc = jc.compile(dfa, build_pc("pd", n, V))
-    assert cc._lifted_program().skip.tiles_i > 1                          # blocks wider than one tile
+    assert cc.backend.program().skip.tiles_i > 1                          # blocks wider than one tile
     data, missing = evidence(n, 4)
 
     def marginal(per_sm):
         monkeypatch.setattr(prod, "BLOCK_BLOCK_PROGRAMS_PER_SM", per_sm)
-        bufs = cc._buffers(data.size(0))
+        bufs = cc.backend.state.buffers(data.size(0))
         bufs["node_mars"].fill_(float("nan"))
         bufs["element_mars"].fill_(float("nan"))
         return cc.marginal(data, missing)
@@ -522,7 +522,7 @@ def test_splitting_block_block_tiles_changes_nothing(build_pc, monkeypatch):
 
 def input_block_launches(cc):
     """Every ``input @ block`` launch: ``(kinds, steps, groups)``."""
-    return [(l.kinds, l.steps[0], l.steps[2]) for kind, _, layers in cc._lifted_program().steps if kind == "prod"
+    return [(l.kinds, l.steps[0], l.steps[2]) for kind, _, layers in cc.backend.program().steps if kind == "prod"
             for stages, _, _ in layers for launches in stages for l in launches if l.form == "input_block"]
 
 
@@ -563,8 +563,8 @@ def test_grouped_input_steps_change_nothing(kind, B, G, build_pc, monkeypatch):
 
     def marginal(group, missing):
         monkeypatch.setattr(F, "INPUT_BLOCK_GROUP", group)
-        cc._program = None                                                    # built again with this grouping
-        bufs = cc._buffers(B)
+        cc.backend._program = None                                                    # built again with this grouping
+        bufs = cc.backend.state.buffers(B)
         bufs["node_mars"].fill_(float("nan"))
         bufs["element_mars"].fill_(float("nan"))
         kernel.launches = 0
@@ -590,8 +590,8 @@ def test_narrow_launches_run_one_step_per_program(build_pc, reference, monkeypat
     cc = jc.compile(CONSTRAINTS["contains"](), build_pc("hmm", n, V))
     data, missing = evidence(n, 4)
     assert input_block_groups(cc)
-    lanes = max(4 * l.S_max for kind, _, layers in cc._lifted_program().steps if kind == "prod" for stages, _, _ in layers
-                for launches in stages for l in launches if l.form == "input_block" and l.steps[2] is not None)
+    lanes = max(4 * l.S_max for kind, _, layers in cc.backend.program().steps if kind == "prod"
+                for stages, _, _ in layers for launches in stages for l in launches if l.form == "input_block" and l.steps[2] is not None)
     want = reference.marginal(cc, data, missing)
     for limit, launched in ((lanes, False), (lanes - 1, True)):
         monkeypatch.setattr(prod, "GROUP_MIN_LANES", limit)
@@ -604,7 +604,7 @@ def tuned_sites(cc, B):
     """The autotuned launch sites a query of ``B`` samples reaches (``GROUP_MIN_LANES`` 0): block @ block, and the
     grouped input @ block steps."""
     sites = set()
-    for kind, _, layers in cc._lifted_program().steps:
+    for kind, _, layers in cc.backend.program().steps:
         for stages, _, _ in (layers if kind == "prod" else []):
             for launch in (l for launches in stages for l in launches):
                 if launch.form == "block_block":
@@ -643,7 +643,7 @@ def test_every_tuned_candidate_gives_the_same_marginal(kind, build_pc, monkeypat
             return candidates[min(k, len(candidates) - 1)]
         monkeypatch.setattr(prod.autotune, "pick", pick)
         chosen.clear(), launched.clear()
-        bufs = cc._buffers(B)
+        bufs = cc.backend.state.buffers(B)
         bufs["node_mars"].fill_(float("nan"))
         bufs["element_mars"].fill_(float("nan"))
         out = cc.marginal(data, missing)
@@ -731,7 +731,7 @@ def test_kernels_launch_past_the_grid_limits(kind, sum_path, build_pc, monkeypat
     data, missing = evidence(n, 4)
 
     def marginal():
-        bufs = cc._buffers(data.size(0))
+        bufs = cc.backend.state.buffers(data.size(0))
         bufs["node_mars"].fill_(float("nan"))
         bufs["element_mars"].fill_(float("nan"))
         return cc.marginal(data, missing)
@@ -745,8 +745,8 @@ def marginal_with_aliasing(cc, on, data, missing, monkeypatch):
     """The marginal with copies of sums aliased or materialized (the Program is rebuilt either way)."""
     import pyjuice.constraints.backends.dfa_exact.forward as F
     monkeypatch.setattr(F, "ALIAS_COPIES", on)
-    cc._program = None
-    return cc.marginal(data, missing), cc._lifted_program()
+    cc.backend._program = None
+    return cc.marginal(data, missing), cc.backend.program()
 
 
 def copy_launches(prog):
@@ -768,7 +768,7 @@ def test_aliased_copies_give_the_materialized_marginal(kind, sum_path, build_pc,
     for k, (kind_, prod_index, layers) in enumerate(prog.steps[:-1]):
         if kind_ == "prod" and prod_index in prog.alias:
             alias_row = prog.alias[prod_index][0].cpu()
-            first = cc.element_regions[prod_index][0]
+            first = cc.backend.element_regions[prod_index][0]
             for _, parts in prog.steps[k + 1][2]:
                 for dense, E, _ in parts:
                     for (_, c0) in dense:

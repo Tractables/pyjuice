@@ -78,8 +78,8 @@ class TopDownProgram:
     elem_regions: list
 
 
-def top_down_program(cc) -> TopDownProgram:
-    prog = cc._lifted_program()
+def top_down_program(backend) -> TopDownProgram:
+    prog = backend.program()
     dev, n = prog.dev, prog.n
     if not hasattr(prog, "trans_top_down"):                   # the transitions as the top-down kernels read them
         prog.trans_top_down = prog.trans if (not prog.trans.grouped or prog.trans_persistent) else \
@@ -195,7 +195,7 @@ def top_down_program(cc) -> TopDownProgram:
                         for lo, hi, add in _segments(hit):       # written by an earlier launch: log-added to
                             dense_runs.append((r, c0, E, (lo, hi), blocks, key, add))
                 fused_groups = _fused_tables(prog, [fused for _, _, fused in parts if fused is not None], block_size,
-                                             prod_index, cc.element_regions[prod_index][0], firsts, written, dev)
+                                             prod_index, backend.element_regions[prod_index][0], firsts, written, dev)
                 layers_out.append((block_size, dense_runs, fused_groups))
             steps.append(("sum", prod_index, layers_out))
         else:
@@ -219,18 +219,18 @@ def top_down_program(cc) -> TopDownProgram:
                     info.append((out, _inputs(launches), _folds([l for l in launches if out_temp_of(l)]), cws))
                 layers_out.append((fold_stages, info[::-1], num_temps, temp_slots))
             steps.append(("prod", prod_index, layers_out))
-    dead = [(row, r) for r, (first, end, _) in enumerate(cc.sum_regions) for row in range(first, end)
+    dead = [(row, r) for r, (first, end, _) in enumerate(backend.sum_regions) for row in range(first, end)
             if ("S", row, r) not in written]
     iv_bounds = np.zeros((int(of.max()) + 1, 2), dtype = np.int64)
     for k in np.nonzero(of >= 0)[0]:
         iv_bounds[of[k]] = (k // (n + 1), k % (n + 1))
     dead = np.asarray(dead, dtype = np.int64).reshape(-1, 2)
-    dead_region = np.zeros(len(cc.sum_regions), dtype = bool)
+    dead_region = np.zeros(len(backend.sum_regions), dtype = bool)
     dead_region[dead[:, 1]] = True
     return TopDownProgram(steps = steps, skip = skip_masks_for(reach, specs, device = dev),
                           dead = dead, dead_region = dead_region, iv_bounds = iv_bounds,
                           reg_iv = iv_index(*np.asarray([prog.sum_ivs[k] for k in prog.reg_iv_host]).T),
-                          elem_regions = [(first, end) for first, end, _ in cc.element_regions])
+                          elem_regions = [(first, end) for first, end, _ in backend.element_regions])
 
 
 def _inputs(launches) -> list:
@@ -344,14 +344,14 @@ def _segments(flags) -> list:
     return out
 
 
-def run_backward(cc, bufs: dict, flows: dict, plan, x: torch.Tensor, missing: torch.Tensor, obs_class: torch.Tensor,
-                 pruning, precision: str, visit: Optional[Callable[[int], None]] = None,
+def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missing: torch.Tensor,
+                 obs_class: torch.Tensor, pruning, precision: str, visit: Optional[Callable[[int], None]] = None,
                  class_weights: Optional[dict] = None, class_mars: Optional[torch.Tensor] = None):
     """
     The top-down values a query plan computes (``plan.top_down``, see :mod:`.query_plan`), after
     :func:`~.forward.run_forward` filled the inside values of ``bufs`` under ``plan``: the per-sample ones into
-    ``flows["node_flows"]``, those kept once into ``prior_flows`` (:meth:`~pyjuice.constraints.ConstrainedCircuit.
-    _prior_flows`), for a batch of one. Products' values pass through ``flows["element_flows"]`` and the folds' through
+    ``flows["node_flows"]``, those kept once into ``prior_flows`` (:meth:`~.state.State.prior_flows`), for a batch
+    of one. Products' values pass through ``flows["element_flows"]`` and the folds' through
     the layer's scratch rows (per sample, or a batch of one in the same rows).
 
     :param visit: None, or called with a product layer group's index once its products' top-down values are in
@@ -362,19 +362,19 @@ def run_backward(cc, bufs: dict, flows: dict, plan, x: torch.Tensor, missing: to
         top_down_plan`)
     :param class_mars: the query's class masses if its forward has them (:func:`~.forward.run_forward`'s), else None
     """
-    pc, prog, td = cc.pc, cc._lifted_program(), plan.top_down
-    out = cc._top_down_program()
+    pc, prog, td = backend.pc, backend.program(), plan.top_down
+    out = backend.top_down_program()
     B = x.size(0)
     lay = bufs["layout"]
     node_mars, element_mars = bufs["node_mars"], bufs["element_mars"]
     node_flows, element_flows = flows["node_flows"], flows["element_flows"]
     regions = dict(offset = lay["sum_offsets_t"], width = lay["sum_widths_t"], first = prog.reg_first,
                    slots = prog.reg_slots)
-    prior = cc._prior_buffer() if plan.prior else None
+    prior = backend.state.prior_buffer() if plan.prior else None
     srcs = dict(mars = node_mars, offset = regions["offset"], width = regions["width"], reg_prior = plan.reg_prior)
     if prior is not None:
         srcs.update(mars = prior["mars"], offset = prior["offset_t"], width = prior["width_t"])
-    pf = cc._prior_flows(td.once) if td.once.any() else None
+    pf = backend.state.prior_flows(td.once) if td.once.any() else None
     if pf is not None:                                   # where the values kept once go
         once = dict(offset = pf["offset_t"], width = pf["width_t"], first = prog.reg_first, slots = prog.reg_slots)
     dot = F.PRECISIONS[precision]
@@ -382,9 +382,9 @@ def run_backward(cc, bufs: dict, flows: dict, plan, x: torch.Tensor, missing: to
     lanes = (pruning.perm, pruning.reg_first, pruning.reg_live) if pruning is not None else None
     exact = pruning is not None
     if class_mars is None:
-        class_mars = cc._class_masses()
-    prog.transitions(class_mars, cc._class_mars_version)
-    stacks, kept = cc._weight_stacks()
+        class_mars = backend.state.class_masses()
+    prog.transitions(class_mars, backend.state.class_mars_version)
+    stacks, kept = backend.state.weight_stacks()
 
     r = prog.root_region                                 # the root: top-down value 0 (log 1) on its slot
     computed, root_once = td.root
@@ -398,7 +398,7 @@ def run_backward(cc, bufs: dict, flows: dict, plan, x: torch.Tensor, missing: to
         fill_dead_rows(node_flows, td.dead, regions, max(lay["sum_widths"][r] for r in td.dead_regions))
 
     for kind, prod_index, layers in td.steps:
-        elem_first = cc.element_regions[prod_index][0]
+        elem_first = backend.element_regions[prod_index][0]
         elem_width = lay["element_widths"][prod_index]
         if kind == "sum":
             for block_size, dense_runs, fused_groups in layers:
@@ -435,8 +435,8 @@ def run_backward(cc, bufs: dict, flows: dict, plan, x: torch.Tensor, missing: to
                 temp, temp_flows, temp_width = node_mars, node_mars, 0
                 if num_temps > 0:
                     temp_width = _align(B * temp_slots)
-                    temp = cc._storage_view("product_scratch", num_temps * temp_width)
-                    temp_flows = cc._storage_view("product_scratch_flows", num_temps * temp_width)
+                    temp = backend.state.storage_view("product_scratch", num_temps * temp_width)
+                    temp_flows = backend.state.storage_view("product_scratch_flows", num_temps * temp_width)
                 if folds[0]:                             # the folds' inside values, for a batch of one ...
                     products(folds[0], (temp, temp_width), prog, regions, element_mars, node_mars, class_mars,
                              prog.no_evidence, None, elem_first, elem_width, 1, srcs, exact = True)

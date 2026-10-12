@@ -26,7 +26,6 @@ def test_hmm_is_right_linear():
     n = 6
     st = analyze_structure(hmm(n))
     assert st.num_vars == n and st.right_linear and st.contiguous and st.max_runs == 1
-    assert st.unsupported == ()
     for info in st.nodes:
         (a, b), = info.scope_runs
         if info.kind == "input":
@@ -79,9 +78,3 @@ def test_signature_ignores_parameters_but_not_structure():
     # cached per compiled PC
     assert analyze_structure(pa) is analyze_structure(pa)
 
-
-def test_unsupported_features_are_reported():
-    st = analyze_structure(fragmented_circuit(input_dist = dists.Gaussian(mu = 0.0, sigma = 1.0)))
-    assert len(st.unsupported) == 1
-    ns, reason = st.unsupported[0]
-    assert ns.is_input() and "Gaussian" in reason

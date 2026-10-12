@@ -106,17 +106,17 @@ def test_class_weights_match_the_reference(kind, name, pattern, sum_path, build_
     B, dev = data.size(0), cc.pc.params.device
     positions = missing.any(dim = 0).numpy()
     with torch.no_grad():
-        groups, _ = class_weights(cc, data, missing.to(dev), positions)
-    prog = cc._lifted_program()
+        groups, _ = class_weights(cc.backend, data, missing.to(dev), positions)
+    prog = cc.backend.program()
     score = score_tables(prog)
-    C = cc.num_classes
+    C = cc.backend.num_classes
     want = {}                                                                   # (t, column) -> [B, C]
     for ns, O in reference.top_down(cc, data, missing).items():
         t = ns.scope.to_list()[0] if ns.is_input() else None
         if t is None or not positions[t]:
             continue
-        Wi = int(cc.layout.width[t])
-        nc = cc.layout.next_col[t, :Wi].to(dev)                                 # [Wi, C]
+        Wi = int(cc.backend.layout.width[t])
+        nc = cc.backend.layout.next_col[t, :Wi].to(dev)                                 # [Wi, C]
         G = O[:, :, torch.arange(Wi, device = dev)[:, None], nc.clamp(min = 0)]
         A = torch.logsumexp(G.masked_fill(nc < 0, -float("inf")), dim = 2)      # [N, B, C]
         first = ns._output_ind_range[0]
@@ -167,7 +167,7 @@ def test_evidence_breaking_the_constraint(build_pc, reference):
     assert torch.isneginf(got[0]).all() and torch.isneginf(log_marginal[0])
     assert_rows_close(got, reference.conditional(cc, data, missing), n)
     never = jc.compile(jc.DFA.contains([[1, 2] * n], V), build_pc("hmm", n, V))
-    assert not never.satisfiable
+    assert not never.backend.satisfiable
     assert torch.isneginf(never.conditional(data, missing)).all()
 
 
@@ -180,19 +180,19 @@ def test_token_tables_live_as_long_as_the_scope(build_pc, reference):
     data, missing = evidence("mixed", n)
     with juice.fast_inference():
         a = cc.conditional(data, missing)
-        kept = dict(cc._token_tables)
+        kept = dict(cc.backend.state._token_tables)
         assert kept and all(t.dtype == torch.float32 for t in kept.values())
         b = cc.conditional(data, missing)
-        assert all(cc._token_tables[k] is t for k, t in kept.items())
+        assert all(cc.backend.state._token_tables[k] is t for k, t in kept.items())
         assert torch.equal(a, b)
-    assert cc._token_tables is None
+    assert cc.backend.state._token_tables is None
     with torch.no_grad():
         layer = pc.input_layer_group[0]
         table = layer.params.view(-1, V)
         table[:] = torch.rand_like(table) + 0.1
         table /= table.sum(dim = 1, keepdim = True)
     assert_rows_close(cc.conditional(data, missing), reference.conditional(cc, data, missing), n)
-    assert cc._token_tables is None
+    assert cc.backend.state._token_tables is None
 
 
 def test_bf16_token_tables(build_pc, reference):
@@ -203,7 +203,7 @@ def test_bf16_token_tables(build_pc, reference):
     data, missing = evidence("mixed", n)
     with juice.fast_inference(allow_bf16_params = True):
         got = cc.conditional(data, missing)
-        assert all(t.dtype == torch.bfloat16 for t in cc._token_tables.values())
+        assert all(t.dtype == torch.bfloat16 for t in cc.backend.state._token_tables.values())
     assert_rows_close(got, reference.conditional(cc, data, missing), n, tol = 1e-2)
 
 
@@ -234,10 +234,11 @@ def test_token_tables_are_the_parameters_transposed(build_pc):
         out = torch.empty(V, len(rows) + 2, device = table.device)
         categorical.token_probs(layer, rows, out[:, 1:-1])
         assert torch.equal(out[:, 1:-1], table[torch.from_numpy(rows).to(table.device)].t())
-    score = score_tables(cc._lifted_program())
-    firsts, _, _ = cc._class_mass_rows()
+    score = score_tables(cc.backend.program())
+    firsts, _, _ = cc.backend.state.class_mass_rows()
     for g, rows in enumerate(score.rows):
-        assert torch.equal(cc._token_table(g, rows), table[torch.from_numpy(rows - firsts[0]).to(table.device)].t())
+        want = table[torch.from_numpy(rows - firsts[0]).to(table.device)].t()
+        assert torch.equal(cc.backend.state.token_table(g, rows), want)
 
 
 def test_class_tiles():
@@ -269,9 +270,9 @@ class HMMDecodeCache:
     """
 
     def __init__(self, cc):
-        prog = cc._lifted_program()
+        prog = cc.backend.program()
         self.cc = cc
-        self.scope = np.asarray([prog.sum_ivs[prog.reg_iv_host[r]] for r in range(len(cc.sum_regions))])
+        self.scope = np.asarray([prog.sum_ivs[prog.reg_iv_host[r]] for r in range(len(cc.backend.sum_regions))])
         self.last = None
 
     def step(self, data, t, precision = "fp32", cached = True):
@@ -284,7 +285,7 @@ class HMMDecodeCache:
         if cached and self.last == (B, t - 1):
             held = dict(top_down = (self.scope[:, 0] <= t - 1) & (t - 1 < self.scope[:, 1]))
         self.last = (B, t)
-        return conditional(self.cc, data, missing, targets, precision, held = held)
+        return conditional(self.cc.backend, data, missing, targets, precision, held = held)
 
 
 @pytest.mark.parametrize("kind", ["hmm", "hmm_untied", "hmm_block_sparse"])

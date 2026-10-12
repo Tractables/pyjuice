@@ -140,7 +140,7 @@ def input_block(cc, ns, data, missing):
     if not isinstance(ns.dist, Categorical):
         raise NotImplementedError(f"The reference supports Categorical input nodes only, got {type(ns.dist).__name__} "
                                   f"over variable {ns.scope.to_list()}.")
-    layout, dev = cc.layout, cc.pc.params.device
+    layout, dev = cc.backend.layout, cc.pc.params.device
     t = ns.scope.to_list()[0]
     probs = categorical_probs(cc.pc, ns)                                        # [N, V]
     token_class = layout.token_class.to(dev)
@@ -177,7 +177,7 @@ def reference_inside(cc, data, missing_mask = None) -> dict:
     :param data: [B, n] token ids (ignored where missing)
     :param missing_mask: None (everything observed), [n] or [B, n]; True = marginalized
     """
-    pc, layout = cc.pc, cc.layout
+    pc, layout = cc.pc, cc.backend.layout
     assert layout.satisfiable
     data, missing = _evidence(data, missing_mask, cc.n)
     B = data.size(0)
@@ -212,7 +212,7 @@ def reference_marginal(cc, data, missing_mask = None) -> torch.Tensor:
     :returns: [B, num_root_nodes]
     """
     pc = cc.pc
-    if not cc.layout.satisfiable:
+    if not cc.backend.layout.satisfiable:
         return torch.full((data.size(0), pc.root_ns.num_nodes), -float("inf"), dtype = DTYPE, device = pc.params.device)
     root = reference_inside(cc, data, missing_mask)[pc.root_ns]                 # [N_root, B, 1, W_n]
     return torch.logsumexp(root[:, :, 0, :], dim = -1).t()
@@ -304,7 +304,7 @@ def reference_conditional(cc, data, missing_mask = None, targets = None) -> torc
     :param targets: None (every missing position of every sample), or a bool mask [n] or [B, n] of missing positions
     :returns: [number of targets, V]
     """
-    pc, layout = cc.pc, cc.layout
+    pc, layout = cc.pc, cc.backend.layout
     n, dev = cc.n, pc.params.device
     _, missing = _evidence(data, missing_mask, n)
     targets = _targets(targets, missing)

@@ -336,7 +336,7 @@ def build_pc_tables(structure, layout: BoundaryLayout, pc) -> Dict[str, Any]:
         for layer in lg.layers:
             number(layer, layer._layer_nid_range[0])
     if stale:
-        from ...compiler import ConstraintCompileError
+        from ...errors import ConstraintCompileError
         raise ConstraintCompileError(
             f"The PC's node groups no longer describe this circuit: {len(stale)} of them record other rows than "
             f"the circuit's layers. This happens when the same node graph has been compiled again into "

@@ -146,12 +146,12 @@ def test_compile_a_ctrlg_case(case, setting):
 
     # compile binds the PC's structure and the automaton; an HMM is right-linear
     cc = jc.compile(c, hmm(n))
-    assert cc.n == n and cc.automaton is dfa and cc.satisfiable == bool(want.any())
-    assert cc.structure.right_linear and cc.structure.unsupported == ()
-    assert {k for k, v in cc.shape_counts.items() if v > 0} == {"suffix", "whole"}
+    assert cc.n == n and cc.backend.automaton is dfa and cc.backend.satisfiable == bool(want.any())
+    assert cc.structure.right_linear
+    assert {k for k, v in cc.structure.shape_counts.items() if v > 0} == {"suffix", "whole"}
 
     # the layout: active columns are exactly the states admissible strings pass through
-    lay = cc.layout
+    lay = cc.backend.layout
     for t in range(n + 1):
         w = int(lay.width[t])
         active = lay.state_id[t, :w]
@@ -160,7 +160,7 @@ def test_compile_a_ctrlg_case(case, setting):
 
     # walking next_col: alive exactly while the prefix can still be completed, on the automaton's state
     prefix_code = lambda Y, t: (Y[:, :t] * V ** torch.arange(t)).sum(dim = 1)   # injective on length-t prefixes
-    col = torch.full((X.size(0),), 0 if cc.satisfiable else -1, dtype = torch.long)
+    col = torch.full((X.size(0),), 0 if cc.backend.satisfiable else -1, dtype = torch.long)
     for t in range(n + 1):
         alive = col >= 0
         completable = torch.isin(prefix_code(X, t), prefix_code(X[want], t))
@@ -196,5 +196,5 @@ def test_a_ctrlg_case_rebinds_to_an_hmm_with_other_parameters():
     assert not torch.equal(pa.params, pb.params)
     ca = jc.compile(c, pa)
     cb = ca.with_pc(pb)
-    assert cb.pc is pb and cb.layout is ca.layout and cb.automaton is ca.automaton
-    assert jc.compile(c, pb).layout is ca.layout                  # recompiling hits the layout cache
+    assert cb.pc is pb and cb.backend.layout is ca.backend.layout and cb.backend.automaton is ca.backend.automaton
+    assert jc.compile(c, pb).backend.layout is ca.backend.layout                  # recompiling hits the layout cache

@@ -324,7 +324,7 @@ def rows_by_element(cc):
     """(product layer index, element row) -> (child rows, boundaries), padding removed. Element rows are only
     unique within a layer: every product layer reuses element_mars from its start."""
     out = {}
-    for li, (rows, child, bounds) in enumerate(cc.product_rows):
+    for li, (rows, child, bounds) in enumerate(cc.backend.product_rows):
         for r, ch, bd in zip(rows.tolist(), child.tolist(), bounds.tolist()):
             assert (li, r) not in out                                      # every product node once
             k = sum(c >= 0 for c in ch)
@@ -363,7 +363,7 @@ def test_hmm_products_are_an_input_then_a_suffix(build_pc):
     n = 6
     cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc("hmm", n, V))
     got = rows_by_element(cc)
-    lo, hi = cc.input_range
+    lo, hi = cc.backend.input_range
     for ch, bd in got.values():
         if bd == [n - 1, n]:                       # pyjuice's one-child product over the last input node
             assert len(ch) == 1 and lo <= ch[0] < hi
@@ -377,14 +377,14 @@ def test_columns_per_sample(build_pc):
     # an HMM keeps one vector over the entry columns per node: S = the widest boundary after the first
     n = 6
     cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc("hmm", n, V))
-    assert cc.columns_per_sample == max(cc.width_per_boundary[1:n].tolist())
+    assert cc.backend.columns_per_sample == max(cc.backend.width_per_boundary[1:n].tolist())
     # the hand-built circuit under "contains 1 1": widths 1, 2, 3, 3, 2, 1, and its interval nodes over
     # [1, 2] (2 x 3 columns) and the one-child product over x3 (3 x 2) are the largest blocks
     cc = jc.compile(jc.DFA.contains([[1, 1]], V), build_pc("hand", 5, V))
-    assert cc.width_per_boundary.tolist() == [1, 2, 3, 3, 2, 1] and cc.columns_per_sample == 6
+    assert cc.backend.width_per_boundary.tolist() == [1, 2, 3, 3, 2, 1] and cc.backend.columns_per_sample == 6
     # a one-state constraint keeps one column per sample everywhere
     for kind, n in PC_KINDS.items():
-        assert jc.compile(jc.DFA.anything(V), build_pc(kind, n, V)).columns_per_sample == 1
+        assert jc.compile(jc.DFA.anything(V), build_pc(kind, n, V)).backend.columns_per_sample == 1
 
 
 def test_tables_live_on_the_pcs_device_and_with_pc_reads_the_new_pc(build_pc):
@@ -395,10 +395,11 @@ def test_tables_live_on_the_pcs_device_and_with_pc_reads_the_new_pc(build_pc):
     pb = build_pc("pd", 8, V, seed = 0, device = torch.device("cpu"), layer_sparsity_tol = 0.05)
     ca = jc.compile(c, pa)
     cb = ca.with_pc(pb)
-    assert cb.layout is ca.layout and cb.automaton is ca.automaton
-    assert cb.columns_per_sample == ca.columns_per_sample
-    assert len(cb.product_rows) == len(ca.product_rows)
-    for la, lb in zip(ca.product_rows, cb.product_rows):
+    a, b = ca.backend, cb.backend
+    assert b.layout is a.layout and b.automaton is a.automaton
+    assert b.columns_per_sample == a.columns_per_sample
+    assert len(b.product_rows) == len(a.product_rows)
+    for la, lb in zip(a.product_rows, b.product_rows):
         for ta, tb in zip(la, lb):
             assert ta.dtype == tb.dtype == torch.int32
             assert ta.device == pa.device and tb.device.type == "cpu"         # each PC's own tables
@@ -409,7 +410,7 @@ def test_tables_live_on_the_pcs_device_and_with_pc_reads_the_new_pc(build_pc):
 def test_every_block_block_step_indexes_its_triple(kind, build_pc):
     n = PC_KINDS[kind]
     cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc(kind, n, V))
-    prog = cc._lifted_program()
+    prog = cc.backend.program()
     seen = 0
     for k, _, layers in prog.steps:
         if k != "prod":

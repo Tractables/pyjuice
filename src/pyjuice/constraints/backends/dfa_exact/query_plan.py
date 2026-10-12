@@ -12,7 +12,7 @@ on the scope, for every pair of automaton columns at its ends. Two facts decide 
   ``prior_mars`` (a batch of one, laid out as ``node_mars``), which every sample reads (see
   :func:`~.kernels.prod._block_ptr`), and computed only when ``prior_mars`` does not hold it yet -- inside
   :func:`pyjuice.fast_inference` it keeps them across queries, as the class masses, else every query starts afresh
-  (see :meth:`~pyjuice.constraints.ConstrainedCircuit._prior_validity`).
+  (see :meth:`~.state.State.prior_validity`).
 
 Keeping a region once computes it without evidence pruning -- every column, where the samples' evidence may leave
 very few live: :func:`prior_regions` keeps a region once when that is kept across queries, or costs no more than the

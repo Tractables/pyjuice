@@ -53,25 +53,25 @@ def test_hmm_compiles_with_the_lifted_backend():
 
     assert isinstance(cc, jc.ConstrainedCircuit)
     assert cc.pc is pc and cc.constraint is c and cc.structure is analyze_structure(pc)
-    assert cc.backend == "dfa_exact" and cc.exact and cc.n == n and cc.satisfiable
-    assert cc.num_states == c.automaton().num_states and cc.num_classes == c.automaton().num_classes
-    assert torch.equal(cc.width_per_boundary, build_layout(c.automaton(), n).width)
-    assert cc.max_width == int(cc.width_per_boundary.max())
+    assert cc.backend.name == "dfa_exact" and cc.backend.exact and cc.n == n and cc.backend.satisfiable
+    assert cc.backend.num_states == c.automaton().num_states and cc.backend.num_classes == c.automaton().num_classes
+    assert torch.equal(cc.backend.width_per_boundary, build_layout(c.automaton(), n).width)
+    assert cc.backend.max_width == int(cc.backend.width_per_boundary.max())
 
-    counts = cc.shape_counts
+    counts = cc.structure.shape_counts
     num_inner = sum(info.kind != "input" for info in cc.structure.nodes)
     assert sum(counts.values()) == num_inner
     assert counts["whole"] >= 1 and counts["suffix"] > 0
     assert counts["prefix"] == counts["interval"] == counts["fragmented"] == 0
     assert cc.compile_time_s > 0
-    assert "dfa_exact" in repr(cc) and cc.info()["width_per_boundary"] == cc.width_per_boundary.tolist()
+    assert "dfa_exact" in repr(cc) and cc.info()["width_per_boundary"] == cc.backend.width_per_boundary.tolist()
 
 
 def test_1d_pd_compiles_with_interval_scopes():
     pc = juice.compile(juice.structures.PD(data_shape = (8,), num_latents = 4, split_intervals = 1,
                                            input_node_params = {"num_cats": V}), verbose = False)
     cc = jc.compile(jc.DFA.contains([[1, 2]], vocab_size = V), pc)
-    assert cc.shape_counts["interval"] > 0 and cc.shape_counts["fragmented"] == 0
+    assert cc.structure.shape_counts["interval"] > 0 and cc.structure.shape_counts["fragmented"] == 0
 
 
 def test_columns_and_memory_on_a_hand_counted_circuit():
@@ -86,13 +86,13 @@ def test_columns_and_memory_on_a_hand_counted_circuit():
     s02 = mk(x[0], mk(x[1], x[2]))
     pc = juice.compile(summate(multiply(s02, mk(x[3], x[4])), num_node_blocks = 1, block_size = 1), verbose = False)
     cc = jc.compile(jc.DFA.contains([[1, 1]], vocab_size = 3), pc)
-    assert cc.shape_counts == dict(whole = 2, suffix = 2, prefix = 2, interval = 2, fragmented = 0)
-    assert cc.width_per_boundary.tolist() == [1, 2, 3, 3, 2, 1] and cc.num_classes == 2
-    assert cc.columns_per_sample == 6
+    assert cc.structure.shape_counts == dict(whole = 2, suffix = 2, prefix = 2, interval = 2, fragmented = 0)
+    assert cc.backend.width_per_boundary.tolist() == [1, 2, 3, 3, 2, 1] and cc.backend.num_classes == 2
+    assert cc.backend.columns_per_sample == 6
     # per sample: the sum node groups' blocks (2 x 6 + 2 x 3 + 2 x 3 + 1 x 1 = 25), the largest product layer
     # (x1 * x2 and x3 * x4: 4 nodes x 6 = 24) and the input rows (2 dummy rows, then the 10 input nodes)
-    assert cc.input_range == (2, 12)
-    assert cc.bytes_per_sample == 4 * (25 + 24 + 12)
+    assert cc.backend.input_range == (2, 12)
+    assert cc.backend.bytes_per_sample == 4 * (25 + 24 + 12)
 
 
 def test_fragmented_scopes_are_refused_with_a_clear_message():
@@ -152,8 +152,8 @@ def test_an_unsatisfiable_constraint_compiles():
     n = 4
     for c in (jc.DFA.nothing(V), jc.DFA.contains([[1, 2, 3, 4, 1]], vocab_size = V)):    # pattern longer than n
         cc = jc.compile(c, hmm(n))
-        assert not cc.satisfiable
-        assert cc.max_width == 0 and cc.width_per_boundary.tolist() == [0] * (n + 1)
+        assert not cc.backend.satisfiable
+        assert cc.backend.max_width == 0 and cc.backend.width_per_boundary.tolist() == [0] * (n + 1)
 
 
 def test_with_pc_rebinds_to_the_same_structure_only():
@@ -163,8 +163,9 @@ def test_with_pc_rebinds_to_the_same_structure_only():
 
     cb = cc.with_pc(pb)
     assert cb.pc is pb and cb.structure is analyze_structure(pb)
-    assert cb.constraint is cc.constraint and cb.automaton is cc.automaton and cb.layout is cc.layout
-    assert cb.token_classes is cc.token_classes and cc.token_classes.num_classes == cc.num_classes
+    a, b = cc.backend, cb.backend
+    assert cb.constraint is cc.constraint and b.automaton is a.automaton and b.layout is a.layout
+    assert b.token_classes is a.token_classes and a.token_classes.num_classes == a.num_classes
 
     with pytest.raises(jc.ConstraintCompileError, match = "structure differs"):
         cc.with_pc(hmm(7))
@@ -208,8 +209,8 @@ def test_to_moves_the_pc_and_the_tables_together():
         assert cc.to(device) is cc
         want = torch.device(device)
         assert cc.pc.params.device.type == want.type
-        assert all(t.device == cc.pc.params.device for rows in cc.product_rows for t in rows)
-        assert cc.token_classes.token_class.device == cc.pc.params.device
+        assert all(t.device == cc.pc.params.device for rows in cc.backend.product_rows for t in rows)
+        assert cc.backend.token_classes.token_class.device == cc.pc.params.device
         x = torch.randint(0, V, (3, 6))
         if want.type == "cuda":                                    # the guard passes: queries run
             assert torch.isfinite(cc.marginal(x, torch.ones(6, dtype = torch.bool))).all()
@@ -223,21 +224,21 @@ def test_the_plan_does_not_depend_on_parameters():
     pa, pb = hmm(6, seed = 0), hmm(6, seed = 1)
     plan._CACHE.clear()
     ca = jc.compile(c, pa)
-    tables = {k: v.clone() for k, v in vars(ca.layout).items() if isinstance(v, torch.Tensor)}
+    tables = {k: v.clone() for k, v in vars(ca.backend.layout).items() if isinstance(v, torch.Tensor)}
     info = {k: v for k, v in ca.info().items() if k != "compile_time_s"}
 
     with torch.no_grad():
         pa.params.uniform_(0.1, 1.0)                    # change the parameters in place
     plan._CACHE.clear()                                 # build the layout again, from scratch
     for cc in (jc.compile(c, pa), jc.compile(c, pb)):
-        assert cc.layout is not ca.layout
+        assert cc.backend.layout is not ca.backend.layout
         for k, v in tables.items():
-            assert torch.equal(getattr(cc.layout, k), v), k
+            assert torch.equal(getattr(cc.backend.layout, k), v), k
         assert {k: v for k, v in cc.info().items() if k != "compile_time_s"} == info
         plan._CACHE.clear()
     # ... and the first compiled object is untouched
     for k, v in tables.items():
-        assert torch.equal(getattr(ca.layout, k), v), k
+        assert torch.equal(getattr(ca.backend.layout, k), v), k
 
 
 def test_compile_is_exported_without_shadowing_a_module():

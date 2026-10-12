@@ -1,5 +1,5 @@
 """
-Compiling a constraint against a PC: check that a backend can serve the pair, and build its plan.
+Compiling a constraint against a PC: find a backend that can serve the pair, and build it.
 
 Compilation depends only on the constraint and the PC's STRUCTURE, never on parameter values or
 evidence, so a PC whose parameters change every step is compiled once.
@@ -8,32 +8,23 @@ evidence, so a PC whose parameters change every step is compiled once.
 from __future__ import annotations
 
 import time
-from collections import defaultdict
-from typing import List, Optional, Sequence, Tuple
+from typing import Optional
 
 from pyjuice.model import TensorCircuit
 
-from . import distributions
-from .language.base import Constraint
-from .structure import PCStructure, _runs, analyze_structure
-from .backends.dfa_exact.plan import build_layout, build_pc_tables
+from .backends import BACKENDS
 from .constrained_circuit import ConstrainedCircuit
-
-
-#: Backends :func:`compile` knows.
-BACKENDS = ("dfa_exact",)
-
-
-class ConstraintCompileError(ValueError):
-    """Raised when a constraint cannot be compiled against a PC. The message lists every reason."""
+from .errors import ConstraintCompileError
+from .language.base import Constraint
+from .structure import analyze_structure
 
 
 def compile(constraint: Constraint, pc: TensorCircuit, backend: Optional[str] = None) -> ConstrainedCircuit:
     """
     Compile ``constraint`` against ``pc`` for constrained queries.
 
-    The constraint reads the PC's variables ``0, ..., n-1`` in index order. If the pair cannot be
-    served, a :class:`ConstraintCompileError` lists every reason at once.
+    The constraint reads the PC's variables ``0, ..., n-1`` in index order. If no backend can serve the
+    pair, a :class:`ConstraintCompileError` lists every reason of every backend tried, at once.
 
     :param constraint: the constraint
     :type constraint: Constraint
@@ -41,8 +32,9 @@ def compile(constraint: Constraint, pc: TensorCircuit, backend: Optional[str] = 
     :param pc: a compiled PC (from :func:`pyjuice.compile`)
     :type pc: TensorCircuit
 
-    :param backend: the backend to use; ``None`` picks one (today always ``"dfa_exact"``: exact lifting of
-        the constraint's automaton, for PCs whose node scopes are contiguous in variable order)
+    :param backend: the backend to use, by name (see :data:`~pyjuice.constraints.backends.BACKENDS`); ``None``
+        picks the first that can serve the pair (today there is one, ``"dfa_exact"``: exact lifting of the
+        constraint's automaton, for PCs whose node scopes are contiguous in variable order)
     :type backend: Optional[str]
     """
     t0 = time.perf_counter()
@@ -54,87 +46,19 @@ def compile(constraint: Constraint, pc: TensorCircuit, backend: Optional[str] = 
                                      f"{', '.join(repr(b) for b in BACKENDS)}.")
 
     structure = analyze_structure(pc)
-    reasons = _lifted_refusals(constraint, structure)
-    if reasons:
-        raise ConstraintCompileError("Cannot compile the constraint against this PC (backend 'dfa_exact'):\n"
-                                     + "\n".join(f"  - {r}" for r in reasons))
-
-    automaton = constraint.automaton()
-    layout = build_layout(automaton, structure.num_vars)
-    tables = build_pc_tables(structure, layout, pc)
-    return ConstrainedCircuit(pc, constraint, structure, automaton, layout, tables,
-                              compile_time_s = time.perf_counter() - t0)
+    refused = {}
+    for cls in ([BACKENDS[backend]] if backend is not None else BACKENDS.values()):
+        reasons = cls.refusals(constraint, structure)
+        if not reasons:
+            return ConstrainedCircuit(pc, constraint, structure, cls.build(constraint, pc, structure),
+                                      compile_time_s = time.perf_counter() - t0)
+        refused[cls.name] = reasons
+    raise ConstraintCompileError("\n".join(f"Cannot compile the constraint against this PC (backend {name!r}):\n"
+                                           + "\n".join(f"  - {r}" for r in reasons)
+                                           for name, reasons in refused.items()))
 
 
 def _check_pc(pc):
     if not isinstance(pc, TensorCircuit):
         raise TypeError(f"Expected a compiled PC (TensorCircuit), got {type(pc).__name__}. "
                         f"Compile the circuit with `pyjuice.compile` first.")
-
-
-def _lifted_refusals(constraint: Constraint, structure: PCStructure) -> List[str]:
-    """Every reason the dfa_exact backend cannot serve the pair (empty if it can)."""
-    reasons = []
-
-    caps = constraint.capabilities()
-    automaton = None
-    if "automaton" in caps:
-        automaton = constraint.automaton()
-    else:
-        reasons.append(f"the constraint ({type(constraint).__name__}) has no `automaton` capability, which "
-                       f"exact lifting needs; it supports: {', '.join(sorted(caps))}")
-
-    by_reason = defaultdict(list)
-    for ns, why in structure.unsupported:
-        by_reason[why].append(ns)
-    for why, group in by_reason.items():
-        reasons.append(f"{_count(len(group), 'node group')} {'is' if len(group) == 1 else 'are'} not supported: "
-                       f"{why}; e.g. over variables {_format_vars(group[0].scope.to_list())}")
-
-    vars_by_values = defaultdict(list)                                  # (distribution, values) -> variables
-    for info in structure.nodes:
-        module = distributions.lookup(info.ns.dist) if info.kind == "input" else None
-        if module is not None:
-            key = (type(info.ns.dist).__name__, module.num_values(info.ns.dist))
-            vars_by_values[key].extend(info.ns.scope.to_list())
-    for (name, num_values), vs in sorted(vars_by_values.items()):
-        if num_values != constraint.vocab_size:
-            reasons.append(f"vocabulary mismatch: the constraint reads tokens 0..{constraint.vocab_size - 1} "
-                           f"(vocab_size {constraint.vocab_size}), but the {name} input nodes over variables "
-                           f"{_format_vars(vs)} range over {num_values} values")
-
-    fragmented = [info for info in structure.nodes if info.shape == "fragmented"]
-    if fragmented:
-        worst = max(fragmented, key = lambda info: info.num_runs)       # the first one with the most runs
-        r = worst.num_runs
-        msg = (f"the node group over variables {_format_runs(worst.scope_runs)} has {r} separate runs in "
-               f"variable order ({_count(len(fragmented), 'node group')} {'is' if len(fragmented) == 1 else 'are'} "
-               f"fragmented, with up to {r} runs). A constraint reads the PC's variables in index order "
-               f"0..{structure.num_vars - 1}, and this version only supports PCs whose node scopes are "
-               f"contiguous in that order (e.g. HMMs, 1-D PD over a sequence). A node with r runs would need "
-               f"a state of size up to K^(2r)")
-        if automaton is not None:
-            K = automaton.num_states
-            msg += f"; with this constraint's K = {K} states and r = {r} that is {_format_big(K ** (2 * r))} per node"
-        reasons.append(msg)
-
-    return reasons
-
-
-def _count(k: int, noun: str) -> str:
-    return f"{k} {noun}{'' if k == 1 else 's'}"
-
-
-def _format_runs(runs: Sequence[Tuple[int, int]], max_runs: int = 8) -> str:
-    parts = [str(a) if a == b else f"{a}..{b}" for a, b in runs[:max_runs]]
-    if len(runs) > max_runs:
-        parts.append("...")
-    return "{" + ", ".join(parts) + "}"
-
-
-def _format_vars(vs: Sequence[int]) -> str:
-    return _format_runs(_runs(set(vs)))
-
-
-def _format_big(x: int) -> str:
-    return f"{x:,}" if x < 10 ** 9 else f"{float(x):.1e}"

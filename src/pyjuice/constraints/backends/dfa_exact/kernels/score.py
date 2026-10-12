@@ -42,7 +42,7 @@ from .sum import _logaddexp_tile
 class ScoreTables:
     """
     Where every position's conditionals are scored. The input nodes over a position read rows of the class masses
-    (:meth:`~pyjuice.constraints.ConstrainedCircuit._class_mass_rows`; tied nodes one row), the rows of their
+    (:meth:`~..state.State.class_mass_rows`; tied nodes one row), the rows of their
     parameter tables: positions whose input nodes read the same rows form a ROW GROUP, scored together against one
     token-major table of those rows (an HMM with tied emissions: one group).
 

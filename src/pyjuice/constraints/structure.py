@@ -12,8 +12,8 @@ constraint with a PC exactly depends on how each node's scope sits in that order
 * a scope with several runs (FRAGMENTED) needs an entry and exit state for every run.
 
 :func:`analyze_structure` computes this for every node group of a PC, together with a structural
-signature (a hash of the node graph that ignores parameter values) and the features the first version of
-the constrained backends does not support. It only reports; refusing is the compiler's job.
+signature (a hash of the node graph that ignores parameter values). It only reports facts about the PC; which
+of them a backend cannot serve is the backend's to say (see :meth:`~.backends.base.Backend.refusals`).
 """
 
 from __future__ import annotations
@@ -21,11 +21,10 @@ from __future__ import annotations
 import hashlib
 import weakref
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import Dict, Tuple, Union
 
 from pyjuice.nodes import CircuitNodes
 
-from . import distributions
 from .language.base import _hash_into
 
 
@@ -60,8 +59,6 @@ class PCStructure:
         HMM built position by position
     :ivar contiguous: every node's scope is a single contiguous run
     :ivar max_runs: the largest number of runs of any scope
-    :ivar unsupported: ``(node group, reason)`` for everything the first version of the constrained
-        backends does not handle
     """
 
     num_vars: int
@@ -70,7 +67,15 @@ class PCStructure:
     right_linear: bool
     contiguous: bool
     max_runs: int
-    unsupported: Tuple[Tuple[CircuitNodes, str], ...]
+
+    @property
+    def shape_counts(self) -> Dict[str, int]:
+        """Number of sum and product node groups per scope shape (see :data:`SHAPES`)."""
+        counts = {shape: 0 for shape in SHAPES}
+        for info in self.nodes:
+            if info.kind != "input":
+                counts[info.shape] += 1
+        return counts
 
     def node(self, ns: CircuitNodes) -> NodeInfo:
         """The :class:`NodeInfo` of a node group."""
@@ -106,14 +111,11 @@ def _analyze(root_ns: CircuitNodes) -> PCStructure:
     order = list(root_ns)                                       # children before parents
     num_vars = max(max(ns.scope.to_list()) for ns in order) + 1 if order else 0
 
-    nodes, unsupported = [], []
+    nodes = []
     for ns in order:
         kind = "input" if ns.is_input() else ("sum" if ns.is_sum() else "prod")
         runs = _runs(ns.scope.to_list())
         nodes.append(NodeInfo(ns = ns, kind = kind, scope_runs = runs, shape = _shape(runs, num_vars)))
-        reason = _unsupported_reason(ns, kind)
-        if reason is not None:
-            unsupported.append((ns, reason))
 
     inner = [info for info in nodes if info.kind != "input"]
     return PCStructure(
@@ -123,7 +125,6 @@ def _analyze(root_ns: CircuitNodes) -> PCStructure:
         right_linear = all(info.shape in ("suffix", "whole") for info in inner),
         contiguous = all(info.num_runs == 1 for info in nodes),
         max_runs = max((info.num_runs for info in nodes), default = 0),
-        unsupported = tuple(unsupported),
     )
 
 
@@ -151,19 +152,6 @@ def _shape(runs, num_vars) -> str:
     if a == 0:
         return "prefix"
     return "interval"
-
-
-def _unsupported_reason(ns: CircuitNodes, kind: str) -> Optional[str]:
-    if kind == "input":
-        if len(ns.scope) > 1:
-            return f"input nodes over {len(ns.scope)} variables (only single-variable input nodes are supported)"
-        if distributions.lookup(ns.dist) is None:
-            supported = ", ".join(t.__name__ for t in distributions.SUPPORTED)
-            return f"input distribution {type(ns.dist).__name__} (supported: {supported})"
-        return None
-    if kind == "sum" and getattr(ns, "external_params", None) is not None:
-        return "sum nodes with external parameters (gated layers are not supported yet)"
-    return None
 
 
 def _signature(order) -> str:

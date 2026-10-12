@@ -81,7 +81,7 @@ def liveness(request, monkeypatch):
 
 def marginal(cc, data, missing):
     """The marginal with the buffers filled with NaN first."""
-    bufs = cc._buffers(data.size(0))
+    bufs = cc.backend.state.buffers(data.size(0))
     bufs["node_mars"].fill_(float("nan"))
     bufs["element_mars"].fill_(float("nan"))
     return cc.marginal(data, missing)
@@ -90,7 +90,7 @@ def marginal(cc, data, missing):
 def obs_classes(cc, data, missing):
     dev = cc.pc.device
     x = torch.where(missing, 0, data).to(dev)
-    return torch.where(missing.to(dev), -1, cc.token_classes.token_class[x]).contiguous()
+    return torch.where(missing.to(dev), -1, cc.backend.token_classes.token_class[x]).contiguous()
 
 
 def brute_live(dfa, L, data, missing):
@@ -123,17 +123,17 @@ def test_liveness_matches_brute_force(build_pc, liveness):
         dfa = jc.DFA.from_dense(V, [[rng.randrange(K) for _ in range(V)] for _ in range(K)], 0,
                                 rng.sample(range(K), rng.randint(1, 3)))
         cc = jc.compile(dfa, build_pc("hmm", n, V))
-        if not cc.satisfiable:
+        if not cc.backend.satisfiable:
             continue
-        prog = cc._lifted_program()
+        prog = cc.backend.program()
         for pattern in ("prefix", "suffix", "scattered", "mixed"):
             data, missing = evidence(pattern, n, B = 8, seed = seed)
             pruning = prune(prog, obs_classes(cc, data, missing), data.size(0))
-            want = brute_live(dfa, cc.layout, data, missing)
+            want = brute_live(dfa, cc.backend.layout, data, missing)
             got = pruning.live.cpu() != 0
             for t in range(n):
-                assert torch.equal(got[:, t, :int(cc.layout.width[t])], want[:, t, :int(cc.layout.width[t])]), \
-                    (seed, pattern, t)
+                w = int(cc.backend.layout.width[t])
+                assert torch.equal(got[:, t, :w], want[:, t, :w]), (seed, pattern, t)
             assert torch.equal(got[:, n, 0], want[:, n, 0]), (seed, pattern)
             compared += 1
     assert compared > 10
@@ -171,8 +171,8 @@ def test_per_boundary_liveness_equals_per_sample(kind, build_pc, monkeypatch):
     K, n = 48, KINDS[kind]
     dfa = jc.DFA.from_dense(V, [[rng.randrange(K) for _ in range(V)] for _ in range(K)], 0, rng.sample(range(K), 12))
     cc = jc.compile(dfa, build_pc(kind, n, V))
-    prog = cc._lifted_program()
-    widths = [int(w) for w in cc.layout.width.tolist()[:n]] + [1]
+    prog = cc.backend.program()
+    widths = [int(w) for w in cc.backend.layout.width.tolist()[:n]] + [1]
     monkeypatch.setattr(live, "LIVE_STEP_TILE", 8)                          # several tiles per boundary
     assert max(widths) > 8
     launches, forward = [], live._live_forward_kernel
@@ -201,7 +201,7 @@ def test_live_column_lists(kind, build_pc):
     from pyjuice.constraints.backends.dfa_exact.kernels import live as L
     n = KINDS[kind]
     cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc(kind, n, V))
-    prog = cc._lifted_program()
+    prog = cc.backend.program()
     data, missing = evidence("mixed", n, B = 512)
     B = data.size(0)
     pruning = prune(prog, obs_classes(cc, data, missing), B)
@@ -209,9 +209,10 @@ def test_live_column_lists(kind, build_pc):
     perm, rank, counts = pruning.perm.cpu(), pruning.rank.cpu(), pruning.counts.cpu()
     assert max(B * s for s in prog.sum_iv_slots) > 2 * L.LIST_TILE
     for k, (a, b) in enumerate(prog.sum_ivs):
-        pos = cc.layout.reachability.positions(a, b)
-        X = 1 if b == n else int(cc.layout.width[b])
-        pairs = torch.arange(int(cc.layout.width[a]) * X) if pos is None else torch.nonzero(pos.flatten() >= 0).flatten()
+        layout = cc.backend.layout
+        pos = layout.reachability.positions(a, b)
+        X = 1 if b == n else int(layout.width[b])
+        pairs = torch.arange(int(layout.width[a]) * X) if pos is None else torch.nonzero(pos.flatten() >= 0).flatten()
         flag = ((live[:, a, pairs // X] != 0) & (live[:, b, pairs % X] != 0)).flatten()        # sample-major
         f, size = pruning.first[k], flag.numel()
         want = torch.cat([torch.nonzero(flag).flatten(), torch.nonzero(~flag).flatten()]).to(torch.int32)
@@ -231,7 +232,7 @@ def test_pruning_engages_only_under_evidence(build_pc, monkeypatch):
     monkeypatch.setattr(F, "prune", lambda *a: calls.append(1) or pruned(*a))
     n = 8
     cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc("pd", n, V))
-    prog = cc._lifted_program()
+    prog = cc.backend.program()
     data, missing = evidence("none", n)
     cc.marginal(data, missing)
     assert calls == []

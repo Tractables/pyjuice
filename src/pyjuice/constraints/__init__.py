@@ -15,5 +15,6 @@ The package is conventionally imported as ``jc``::
 """
 
 from .language import Constraint, Matcher, And, Or, Not, Concat, OPTIONAL_CAPABILITIES, DFA, DFAMatcher
-from .compiler import compile, ConstraintCompileError
+from .compiler import compile
+from .errors import ConstraintCompileError
 from .constrained_circuit import ConstrainedCircuit

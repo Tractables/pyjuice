@@ -73,14 +73,14 @@ def top_down_blocks(cc, data, missing, targets = None, policy = "default", held 
     run_backward`.
     """
     with juice.fast_inference() if policy == "kept" else contextlib.nullcontext():
-        prog, td, dev = cc._lifted_program(), cc._top_down_program(), cc.pc.params.device
+        prog, td, dev = cc.backend.program(), cc.backend.top_down_program(), cc.pc.params.device
         B = data.size(0)
         missing = missing.to(dev)
         observed = (~missing).any(dim = 0).cpu().numpy()
         x = torch.where(missing, 0, data.to(dev).long())
-        obs_class = torch.where(missing, -1, cc.token_classes.token_class[x]).contiguous()
+        obs_class = torch.where(missing, -1, cc.backend.token_classes.token_class[x]).contiguous()
         pruning = prune(prog, obs_class, B) if observed.any() else None
-        valid, kept = cc._prior_validity()
+        valid, kept = cc.backend.state.prior_validity()
         if policy in ("sample", "top_down"):
             prior = np.zeros(prog.iv_bounds.shape[0], dtype = bool)
             once = top_down_prior(prog, td, observed, B, True, pruning) if policy == "top_down" else \
@@ -88,21 +88,21 @@ def top_down_blocks(cc, data, missing, targets = None, policy = "default", held 
         else:
             prior = prior_regions(prog, observed, B, kept, pruning)
             once = top_down_prior(prog, td, observed, B, kept, pruning)
-        pf = cc._prior_flows(np.zeros(len(cc.sum_regions), dtype = bool))
+        pf = cc.backend.state.prior_flows(np.zeros(len(cc.backend.sum_regions), dtype = bool))
         plan = query_plan(prog, observed, None if targets is None else targets.cpu().numpy(), valid.numpy(), prior,
                           top_down = dict(program = td, once = once, valid = pf["valid"].copy(), held = held))
-        bufs = cc._buffers(B)
-        flows = cc._flows(B, bufs)
+        bufs = cc.backend.state.buffers(B)
+        flows = cc.backend.state.flows(B, bufs)
         if nan_fill:
             flows["node_flows"].fill_(float("nan"))         # every needed slot must be written
         with torch.no_grad():
-            F.run_forward(cc, bufs, plan, x, missing, obs_class, pruning, "fp32")
+            F.run_forward(cc.backend, bufs, plan, x, missing, obs_class, pruning, "fp32")
             valid |= plan.todo
-            run_backward(cc, bufs, flows, plan, x, missing, obs_class, pruning, "fp32",
+            run_backward(cc.backend, bufs, flows, plan, x, missing, obs_class, pruning, "fp32",
                          visit = None if visit is None else lambda pi: visit(pi, bufs, flows, plan))
-        lay, nf, pf = bufs["layout"], flows["node_flows"], cc._prior_flows_state
+        lay, nf, pf = bufs["layout"], flows["node_flows"], cc.backend.state._prior_flows_state
         out = []
-        for r, (first, end, slots) in enumerate(cc.sum_regions):
+        for r, (first, end, slots) in enumerate(cc.backend.sum_regions):
             if plan.top_down.once[r]:
                 o, w = pf["offset"][r], pf["width"][r]
                 out.append(pf["flows"][o:o + (end - first) * w].view(end - first, w)[:, :slots].repeat(1, B).clone())
@@ -114,9 +114,9 @@ def top_down_blocks(cc, data, missing, targets = None, policy = "default", held 
 
 def needed_regions(cc, targets):
     """bool [sum regions]: those whose scope meets a target (all for None)."""
-    prog = cc._lifted_program()
+    prog = cc.backend.program()
     out = []
-    for r in range(len(cc.sum_regions)):
+    for r in range(len(cc.backend.sum_regions)):
         a, b = prog.sum_ivs[prog.reg_iv_host[r]]
         out.append(targets is None or bool(targets[a:b].any()))
     return np.asarray(out)
@@ -127,7 +127,7 @@ def compact(cc, block, a, b, B):
     a sequence end's columns summed."""
     if b == cc.n:
         block = torch.logsumexp(block, dim = -1, keepdim = True)
-    pos = cc.layout.reachability.positions(a, b)
+    pos = cc.backend.layout.reachability.positions(a, b)
     flat = block.flatten(2)
     if pos is not None:
         flat = flat[:, :, torch.nonzero(pos.flatten() >= 0).flatten().to(flat.device)]
@@ -137,9 +137,10 @@ def compact(cc, block, a, b, B):
 def live_slots(cc, pruning_live, a, b, B):
     """bool [B * slots]: the live slots of the interval [a, b) per sample (all when not pruned)."""
     n, W = cc.n, pruning_live.size(2)
-    pos = cc.layout.reachability.positions(a, b)
-    X = 1 if b == n else int(cc.layout.width[b])
-    pairs = torch.arange(int(cc.layout.width[a]) * X) if pos is None else torch.nonzero(pos.flatten() >= 0).flatten()
+    layout = cc.backend.layout
+    pos = layout.reachability.positions(a, b)
+    X = 1 if b == n else int(layout.width[b])
+    pairs = torch.arange(int(layout.width[a]) * X) if pos is None else torch.nonzero(pos.flatten() >= 0).flatten()
     i, j = pairs // X, pairs % X
     live = pruning_live.cpu()
     out = []
@@ -151,12 +152,12 @@ def live_slots(cc, pruning_live, a, b, B):
 def assert_top_down_close(cc, got, want, data, missing, regions = None):
     """Every sum region's top-down values (:func:`top_down_blocks`) against the reference's, on the live slots (of the
     ``regions`` marked, bool per sum region, if given)."""
-    prog, n, B = cc._lifted_program(), cc.n, data.size(0)
+    prog, n, B = cc.backend.program(), cc.n, data.size(0)
     dev = cc.pc.params.device
     x = torch.where(missing, 0, data).to(dev)
-    obs_class = torch.where(missing.to(dev), -1, cc.token_classes.token_class[x]).contiguous()
+    obs_class = torch.where(missing.to(dev), -1, cc.backend.token_classes.token_class[x]).contiguous()
     pruning = prune(prog, obs_class, B) if (~missing).any() else None
-    firsts = [first for first, _, _ in cc.sum_regions]
+    firsts = [first for first, _, _ in cc.backend.sum_regions]
     for ns, block in want.items():
         if not ns.is_sum():
             continue
@@ -197,14 +198,14 @@ def test_dead_slots_hold_neg_inf(kind, sum_path, build_pc, reference):
     it); the live slots match the reference."""
     n = KINDS[kind]
     cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
-    prog, dev = cc._lifted_program(), cc.pc.params.device
+    prog, dev = cc.backend.program(), cc.pc.params.device
     data, missing = evidence("prefix", n, B = 48)
     B = data.size(0)
     got, plan = top_down_blocks(cc, data, missing, policy = "sample")
     x = torch.where(missing, 0, data).to(dev)
-    obs_class = torch.where(missing.to(dev), -1, cc.token_classes.token_class[x]).contiguous()
+    obs_class = torch.where(missing.to(dev), -1, cc.backend.token_classes.token_class[x]).contiguous()
     pruning = prune(prog, obs_class, B)
-    for r in range(len(cc.sum_regions)):
+    for r in range(len(cc.backend.sum_regions)):
         a, b = prog.sum_ivs[prog.reg_iv_host[r]]
         assert torch.isneginf(got[r][:, ~live_slots(cc, pruning.live, a, b, B).to(dev)]).all(), r
     assert_top_down_close(cc, got, reference.top_down(cc, data, missing), data, missing)
@@ -293,7 +294,7 @@ def test_values_kept_once_accumulate(kind, build_pc, reference):
         data, first = evidence("prefix", n)
         got, plan = top_down_blocks(cc, data, first)
         assert_top_down_close(cc, got, reference.top_down(cc, data, first), data, first)
-        pf = cc._prior_flows_state
+        pf = cc.backend.state._prior_flows_state
         kept, offsets, size = pf["valid"].copy(), list(pf["offset"]), pf["size"]
         assert kept.any()
         data, second = evidence("suffix", n, seed = 1)
@@ -314,12 +315,13 @@ def test_held_values_are_not_computed(kind, build_pc, reference):
     every value matches."""
     n = KINDS[kind]
     cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
-    prog = cc._lifted_program()
+    prog = cc.backend.program()
     data, missing = evidence("mixed", n)
     top_down_blocks(cc, data, missing, policy = "sample")
-    held = np.asarray([prog.sum_ivs[prog.reg_iv_host[r]][0] == 0 for r in range(len(cc.sum_regions))])
-    lay, nf = cc._layout(data.size(0)), cc._flows(data.size(0), cc._buffers(data.size(0)))["node_flows"]
-    for r, (first, end, _) in enumerate(cc.sum_regions):
+    held = np.asarray([prog.sum_ivs[prog.reg_iv_host[r]][0] == 0 for r in range(len(cc.backend.sum_regions))])
+    state, B = cc.backend.state, data.size(0)
+    lay, nf = state.batch_layout(B), state.flows(B, state.buffers(B))["node_flows"]
+    for r, (first, end, _) in enumerate(cc.backend.sum_regions):
         if not held[r]:
             nf[lay["sum_offsets"][r]:lay["sum_offsets"][r] + (end - first) * lay["sum_widths"][r]] = float("nan")
     got, plan = top_down_blocks(cc, data, missing, policy = "sample", held = held, nan_fill = False)
@@ -336,21 +338,21 @@ def test_products_of_target_inputs_get_their_values(kind, policy, build_pc, refe
     n = KINDS[kind]
     pc = build_pc(kind, n, V)
     cc = jc.compile(CONSTRAINTS["contains"](), pc)
-    prog, dev = cc._lifted_program(), pc.params.device
+    prog, dev = cc.backend.program(), pc.params.device
     data, missing = evidence("mixed", n)
     B = data.size(0)
     targets = torch.zeros(n, dtype = torch.bool)
     targets[n // 2] = True
     want = reference.top_down(cc, data, missing)
     x = torch.where(missing, 0, data).to(dev)
-    obs_class = torch.where(missing.to(dev), -1, cc.token_classes.token_class[x]).contiguous()
+    obs_class = torch.where(missing.to(dev), -1, cc.backend.token_classes.token_class[x]).contiguous()
     pruning = prune(prog, obs_class, B) if (~missing).any() else None
     groups = [lg for lg in pc.inner_layer_groups if lg.is_prod()]
     of = prog.intervals.of.cpu().numpy()
     checked = []
 
     def visit(pi, bufs, flows, plan):
-        first, _, _ = cc.element_regions[pi]
+        first, _, _ = cc.backend.element_regions[pi]
         width = bufs["layout"]["element_widths"][pi]
         once = plan.top_down.once_iv.cpu().numpy()
         for layer in groups[pi]:
@@ -359,7 +361,7 @@ def test_products_of_target_inputs_get_their_values(kind, policy, build_pc, refe
                     continue
                 scope = sorted(ns.scope.to_list())
                 a, b = scope[0], scope[-1] + 1
-                S = cc.layout.reachability.slots(a, b)
+                S = cc.backend.layout.reachability.slots(a, b)
                 lo, hi = ns._output_ind_range
                 rows = flows["element_flows"][(lo - first) * width:(hi - first) * width].view(hi - lo, width)
                 g = rows[:, :S].repeat(1, B) if once[of[a * (n + 1) + b]] else rows[:, :B * S]

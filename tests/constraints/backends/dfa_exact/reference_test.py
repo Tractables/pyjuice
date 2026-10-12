@@ -136,7 +136,7 @@ def every_string(pc, cc, V):
     n = cc.n
     X = torch.tensor(list(itertools.product(range(V), repeat = n)), device = DEV)
     lls = pc(X)[:, 0].double()
-    dfa = cc.automaton
+    dfa = cc.backend.automaton
     q = torch.full((X.size(0),), dfa.initial, device = DEV)
     delta, cls = dfa.delta.to(DEV), dfa.token_class.to(DEV)
     for t in range(n):

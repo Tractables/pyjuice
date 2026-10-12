@@ -3,8 +3,8 @@ The lifted forward pass: ``log p(C, e)`` for a batch of evidence, in the buffers
 :class:`~pyjuice.constraints.ConstrainedCircuit`.
 
 Layer by layer, as :meth:`TensorCircuit.forward`: the PC's own input layers write the log-probability of
-every observed token, the class masses of missing ones are summed per token class (by the circuit, see
-:meth:`ConstrainedCircuit._class_masses`), then every product layer group chains its children's blocks
+every observed token, the class masses of missing ones are summed per token class (by the backend's state, see
+:meth:`~.state.State.class_masses`), then every product layer group chains its children's blocks
 (:mod:`.kernels.prod`) and every sum layer group sums its children column by column (:mod:`.kernels.sum`).
 The root keeps a single value per sample. Like a :class:`TensorCircuit`, the pass is driven by tables: no
 kernel knows the circuit's shape. A query runs the part of them its :mod:`.query_plan` says, and the values no
@@ -80,34 +80,34 @@ TRANS_COLS = {"input_block": (1, 2), "block_input": (4, 5)}
 class Program:
     """Everything the lifted forward pass of one constrained circuit reads besides buffers and parameters."""
 
-    def __init__(self, cc):
-        pc, layout = cc.pc, cc.layout
-        dev = cc._device
-        n = cc.n
+    def __init__(self, backend):
+        pc, layout = backend.pc, backend.layout
+        dev = backend.device
+        n = backend.n
         self.n = n
         self.width = [int(w) for w in layout.width.tolist()]
         self.width_t = layout.width.to(dev, torch.int32)
         self.reach = layout.reachability                               # the slots of every interval's blocks
         self.next_col = layout.next_col.to(dev, torch.int32).contiguous()
-        self.input_start, self.input_end = cc.input_range
-        self.mass_row = cc._class_mass_rows()[2]                       # input node -> its row of the class masses
-        grouped = cc.num_classes >= GROUP_MIN_RATIO * max_successors(self.next_col, self.width, n)
+        self.input_start, self.input_end = backend.input_range
+        self.mass_row = backend.state.class_mass_rows()[2]               # input node -> its row of the class masses
+        grouped = backend.num_classes >= GROUP_MIN_RATIO * max_successors(self.next_col, self.width, n)
         self.trans = transition_tables(self.next_col, self.width, n, grouped = grouped)
         # every column's distinct successors (evidence pruning's liveness sweeps)
         self.succ = self.trans if grouped else transition_tables(self.next_col, self.width, n, grouped = True)
         self.dev = dev
 
-        firsts = [first for first, _, _ in cc.sum_regions]
+        firsts = [first for first, _, _ in backend.sum_regions]
         self.firsts = firsts
-        self.slots = [slots for _, _, slots in cc.sum_regions]
+        self.slots = [slots for _, _, slots in backend.sum_regions]
         self.reg_first = torch.tensor(firsts, dtype = torch.long, device = dev)
-        self.reg_slots = torch.tensor([slots for _, _, slots in cc.sum_regions], dtype = torch.long, device = dev)
-        slots_of_reg = [slots for _, _, slots in cc.sum_regions]
+        self.reg_slots = torch.tensor([slots for _, _, slots in backend.sum_regions], dtype = torch.long, device = dev)
+        slots_of_reg = [slots for _, _, slots in backend.sum_regions]
         region_of = lambda row: bisect.bisect_right(firsts, row) - 1
 
         # every sum region's interval (its node group's scope, as boundaries), for evidence pruning
         interval_of_row = {info.ns._output_ind_range[0]: (info.scope_runs[0][0], info.scope_runs[0][1] + 1)
-                           for info in cc.structure.nodes if info.kind == "sum"}
+                           for info in backend.structure.nodes if info.kind == "sum"}
         reg_ivs = [interval_of_row[first] for first in firsts]
         self.sum_ivs = sorted(set(reg_ivs))
         self.sum_iv_slots = [self.reach.slots(a, b) for a, b in self.sum_ivs]
@@ -130,14 +130,14 @@ class Program:
         self.steps = []
         self.stack_uses = {}                                           # stack key -> dense runs reading it per query
         prod_index = -1
-        prod_layers = iter(cc.product_rows)
+        prod_layers = iter(backend.product_rows)
         for lg in pc.inner_layer_groups:
             if lg.is_prod():
                 prod_index += 1
                 layers = [self._product_stages(next(prod_layers)) for _ in lg.layers]
                 self.steps.append(("prod", prod_index, layers))
             else:
-                elem_first = cc.element_regions[prod_index][0]
+                elem_first = backend.element_regions[prod_index][0]
                 layers = []
                 for layer in lg.layers:
                     parts = []
@@ -180,7 +180,7 @@ class Program:
             kind, prod_index, layers = self.steps[k]
             if kind != "prod" or self.steps[k + 1][:2] != ("sum", prod_index):
                 continue
-            first, end, _ = cc.element_regions[prod_index]
+            first, end, _ = backend.element_regions[prod_index]
             dense_rows = {c0 + e for _, parts in self.steps[k + 1][2] for dense, E, _ in parts
                           for (_, c0) in dense for e in range(E)}
             alias_row = torch.full((end - first,), -1, dtype = torch.int32)
@@ -492,7 +492,7 @@ def _missing(missing_mask: Optional[torch.Tensor], B: int, n: int, dev) -> torch
     return missing.contiguous()
 
 
-def marginal(cc, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None, precision: str = "fp32"):
+def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None, precision: str = "fp32"):
     """
     ``log p(C, e)`` for every sample: the probability that the PC generates a string that satisfies the
     constraint and agrees with the observed tokens.
@@ -504,7 +504,7 @@ def marginal(cc, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None
     """
     if precision not in PRECISIONS:
         raise ValueError(f"`precision` must be one of {sorted(PRECISIONS)}, got {precision!r}.")
-    pc, n, dev = cc.pc, cc.n, cc._device
+    pc, n, dev = backend.pc, backend.n, backend.device
     if dev.type != "cuda":
         raise NotImplementedError(f"The dfa_exact backend runs on CUDA only, but the constrained circuit is on {dev}. "
                                   f"Move it with `cc.to('cuda')`.")
@@ -512,39 +512,39 @@ def marginal(cc, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None
         raise ValueError(f"`data` must be [batch, {n}], got {list(data.shape)}.")
     B = data.size(0)
     root_first, root_end = pc._root_node_range
-    if not cc.satisfiable:
+    if not backend.satisfiable:
         return torch.full((B, root_end - root_first), -float("inf"), device = dev)
 
-    prog = cc._lifted_program()
+    prog = backend.program()
     missing = _missing(missing_mask, B, n, dev)
     observed = np.ones(n, dtype = bool) if missing_mask is None else \
         (~missing).any(dim = 0).cpu().numpy()                           # the positions some sample observes
     x = torch.where(missing, 0, data.to(dev).long())                     # missing tokens: any valid id
-    bufs = cc._buffers(B)
+    bufs = backend.state.buffers(B)
 
     with torch.no_grad():
-        obs_class = torch.where(missing, -1, cc.token_classes.token_class[x]).contiguous()
+        obs_class = torch.where(missing, -1, backend.token_classes.token_class[x]).contiguous()
         pruning = prune(prog, obs_class, B) if observed.any() else None     # nothing observed: nothing to prune
-        valid, kept = cc._prior_validity()
+        valid, kept = backend.state.prior_validity()
         prior = prior_regions(prog, observed, B, kept, pruning)
         plan = query_plan(prog, observed, None, valid.numpy(), prior)   # every inside value
-        run_forward(cc, bufs, plan, x, missing, obs_class, pruning, precision)
+        run_forward(backend, bufs, plan, x, missing, obs_class, pruning, precision)
         valid |= plan.todo
 
         r = prog.root_region
         if plan.root_prior:                                             # nothing observed: every sample's value
-            prior = cc._prior_buffer()
-            base = prior["offset"][r] + (root_first - cc.sum_regions[r][0]) * prior["width"][r]
+            prior = backend.state.prior_buffer()
+            base = prior["offset"][r] + (root_first - backend.sum_regions[r][0]) * prior["width"][r]
             rows = base + torch.arange(root_end - root_first, device = dev) * prior["width"][r]
             return prior["mars"][rows][None, :].expand(B, -1).contiguous()
         lay = bufs["layout"]
-        base = lay["sum_offsets"][r] + (root_first - cc.sum_regions[r][0]) * lay["sum_widths"][r]
+        base = lay["sum_offsets"][r] + (root_first - backend.sum_regions[r][0]) * lay["sum_widths"][r]
         width = lay["sum_widths"][r]
         rows = base + torch.arange(root_end - root_first, device = dev)[:, None] * width
         return bufs["node_mars"][rows + torch.arange(B, device = dev)[None, :]].t().contiguous()
 
 
-def run_forward(cc, bufs: dict, plan, x: torch.Tensor, missing: torch.Tensor, obs_class: torch.Tensor, pruning,
+def run_forward(backend, bufs: dict, plan, x: torch.Tensor, missing: torch.Tensor, obs_class: torch.Tensor, pruning,
                 precision: str):
     """
     The inside values a query plan computes (see :mod:`.query_plan`): the per-sample ones into ``node_mars``, and
@@ -552,22 +552,22 @@ def run_forward(cc, bufs: dict, plan, x: torch.Tensor, missing: torch.Tensor, ob
     :meth:`TensorCircuit.forward`: the PC's own input layers write the log-probability of every observed token, then
     every product layer and every sum layer run their parts of the plan.
 
-    :param bufs: the batch's :meth:`~pyjuice.constraints.ConstrainedCircuit._buffers`
+    :param bufs: the batch's :meth:`~.state.State.buffers`
     :param x: [B, n] token ids (any valid id where missing)
     :param missing: [B, n] bool, True where a token is missing
     :param obs_class: [B, n] int32, every observed token's class, -1 where missing
     :param pruning: None, or the query's :class:`~.kernels.live.Pruning`
     :param precision: "fp32" or "tf32" for the sum layers' matrix products
-    :returns: the class masses the pass read (:meth:`~pyjuice.constraints.ConstrainedCircuit._class_masses`; computed
+    :returns: the class masses the pass read (:meth:`~.state.State.class_masses`; computed
         for this query outside :func:`pyjuice.fast_inference`), for the query's later passes
     """
-    pc, prog = cc.pc, cc._lifted_program()
+    pc, prog = backend.pc, backend.program()
     B = x.size(0)
     lay = bufs["layout"]
     node_mars, element_mars = bufs["node_mars"], bufs["element_mars"]
     regions = dict(offset = lay["sum_offsets_t"], width = lay["sum_widths_t"], first = prog.reg_first,
                    slots = prog.reg_slots)
-    prior = cc._prior_buffer() if plan.prior else None
+    prior = backend.state.prior_buffer() if plan.prior else None
     if prior is not None:                                              # where the values kept once are
         once = dict(offset = prior["offset_t"], width = prior["width_t"], first = prog.reg_first, slots = prog.reg_slots)
         srcs = dict(mars = prior["mars"], offset = prior["offset_t"], width = prior["width_t"], reg_prior = plan.reg_prior)
@@ -578,19 +578,19 @@ def run_forward(cc, bufs: dict, plan, x: torch.Tensor, missing: torch.Tensor, ob
 
     for layer in pc.input_layer_group:                                 # the input region: pyjuice's own layout
         layer(x.permute(1, 0), bufs["input_mars"], missing_mask = missing)
-    class_mars = cc._class_masses()
-    prog.transitions(class_mars, cc._class_mars_version)
-    stacks, kept = cc._weight_stacks()
+    class_mars = backend.state.class_masses()
+    prog.transitions(class_mars, backend.state.class_mars_version)
+    stacks, kept = backend.state.weight_stacks()
 
     for kind, prod_index, layers in plan.steps:
-        elem_first = cc.element_regions[prod_index][0]
+        elem_first = backend.element_regions[prod_index][0]
         elem_width = lay["element_widths"][prod_index]
         if kind == "prod":
             for prior_stages, sample_stages, num_temps, temp_slots in layers:
                 temp, temp_width = node_mars, 0                      # no scratch rows: never read
                 if num_temps > 0:
                     temp_width = _align(B * temp_slots)
-                    temp = cc._storage_view("product_scratch", num_temps * temp_width)
+                    temp = backend.state.storage_view("product_scratch", num_temps * temp_width)
                 if prior_stages:                                     # nothing observed in their scopes
                     products(prior_stages, (temp, temp_width), prog, regions, element_mars, node_mars, class_mars,
                              prog.no_evidence, None, elem_first, elem_width, 1, srcs, exact = True)
@@ -600,21 +600,21 @@ def run_forward(cc, bufs: dict, plan, x: torch.Tensor, missing: torch.Tensor, ob
         else:
             for block_size, prior_parts, sample_parts in layers:
                 if prior_parts:
-                    _sums(cc, prior_parts, block_size, prior["mars"], element_mars, once, prior["offset"],
+                    _sums(backend, prior_parts, block_size, prior["mars"], element_mars, once, prior["offset"],
                           prior["width"], elem_first, elem_width, 1, None, stacks, kept, precision)
                 if sample_parts:
-                    _sums(cc, sample_parts, block_size, node_mars, element_mars, regions, lay["sum_offsets"],
+                    _sums(backend, sample_parts, block_size, node_mars, element_mars, regions, lay["sum_offsets"],
                           lay["sum_widths"], elem_first, elem_width, B, pruning, stacks, kept, precision)
     return class_mars
 
 
-def _sums(cc, parts, block_size: int, nodes: torch.Tensor, element_mars: torch.Tensor, regions: dict, offsets, widths,
-          elem_first: int, elem_width: int, B: int, pruning, stacks: dict, kept: bool, precision: str):
+def _sums(backend, parts, block_size: int, nodes: torch.Tensor, element_mars: torch.Tensor, regions: dict, offsets,
+          widths, elem_first: int, elem_width: int, B: int, pruning, stacks: dict, kept: bool, precision: str):
     """A sum layer's parts a query plan runs (``(dense runs, num_edges, fused)``: the runs ``(region, c0, blocks,
     key)``, and None or ``(fused part, index list of its node blocks or None for all, count, most slots)``, see
     :func:`~.query_plan.query_plan`) into ``nodes`` -- ``node_mars``, or ``prior_mars`` with ``B`` 1 and no pruning --
     whose sum regions ``regions`` (device tensors) and ``offsets`` / ``widths`` (Python ints) describe."""
-    prog, pc = cc._lifted_program(), cc.pc
+    prog, pc = backend.program(), backend.pc
     dot = PRECISIONS[precision]
     for runs, num_edges, fused in parts:
         for r, c0, blocks, key in runs:
