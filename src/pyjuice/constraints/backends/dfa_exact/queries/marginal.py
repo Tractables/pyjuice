@@ -30,8 +30,9 @@ def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] =
         decoder decides (see :mod:`.plans`)
     :param report: None, or a dict where the query leaves its :class:`~.plans.QueryPlan` (``"plan"``) and its
         :class:`~..kernels.live.Liveness` (``"liveness"``; None when it observes nothing)
-    :param storage: "dense" or "compact": how a query keeps its per-sample top-down values (see
-        :func:`~.conditional.conditional`); a marginal has none, and keeps its inside values dense either way
+    :param storage: "dense" or "compact": how a query keeps its per-sample values (see
+        :func:`~.conditional.conditional`); a marginal has no top-down value, and compact only keeps no inside value
+        per sample where it computes and holds none
     :returns: [B, number of root nodes], as :func:`pyjuice.queries.marginal`
     """
     if precision not in PRECISIONS:
@@ -54,7 +55,6 @@ def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] =
     observed = np.ones(n, dtype = bool) if missing_mask is None else \
         (~missing).any(dim = 0).cpu().numpy()                           # the positions some sample observes
     x = torch.where(missing, 0, data.to(dev).long())                     # missing tokens: any valid id
-    bufs = backend.state.buffers(B)
 
     with torch.no_grad():
         obs_class = torch.where(missing, -1, backend.token_classes.token_class[x]).contiguous()
@@ -64,8 +64,10 @@ def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] =
         plan = query_plan(prog, observed, None, valid.numpy(), prior, held = held)   # every inside value
         if lv is not None:
             lv.order(per_sample_intervals(prog, plan))
+        inputs_only = storage == "compact" and not plan.sample.any() and (held is None or not held.any())
+        bufs = backend.state.buffers(B, inputs_only)                    # compact: no rows for no per-sample value
         if report is not None:
-            report.update(plan = plan, liveness = lv)
+            report.update(plan = plan, liveness = lv, inputs_only = inputs_only)
         run_forward(backend, bufs, plan, x, missing, obs_class, lv, precision)
         valid |= plan.todo
 

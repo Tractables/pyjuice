@@ -122,7 +122,6 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     if observed is None:
         observed = (~missing).any(dim = 0).cpu().numpy()
     x = torch.where(missing, 0, data.to(dev).long())                          # missing tokens: any valid id
-    bufs = backend.state.buffers(B)
     held = held or {}
     obs_class = torch.where(missing, -1, backend.token_classes.token_class[x]).contiguous()
     # compact, a query needs its liveness even with nothing observed: every column is live, but only the regions it
@@ -135,6 +134,9 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
                held = held.get("top_down"), scoring = True)
     plan = query_plan(prog, observed, positions, valid.numpy(), prior, held = held.get("inside"), top_down = top)
     compact = storage == "compact"
+    held_inside = held.get("inside")
+    inputs_only = compact and not plan.sample.any() and (held_inside is None or not held_inside.any())
+    bufs = backend.state.buffers(B, inputs_only)                        # compact: no rows for no per-sample value
     if lv is not None:
         lv.order(per_sample_intervals(prog, plan, top_down = not compact))
     compact = compact_layout(backend, lv, plan.top_down.per_sample) if compact else None
@@ -144,7 +146,7 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     else:
         flows = backend.state.flows(B, bufs, compact)
     if report is not None:
-        report.update(plan = plan, liveness = lv, compact = compact)
+        report.update(plan = plan, liveness = lv, compact = compact, inputs_only = inputs_only)
     class_mars = F.run_forward(backend, bufs, plan, x, missing, obs_class, lv, precision)
     valid |= plan.todo
 
@@ -183,8 +185,9 @@ def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor
         none when it computes nothing)
     :param storage: "dense" (the default) or "compact": how the query keeps its per-sample top-down values -- every
         lane of every block, or only the pairs of each sample's live columns, and only of the regions the query needs
-        per sample (see :mod:`~..kernels.compact`). Compact takes far less memory when the evidence leaves few live
-        columns, and skips the dead lanes' writes
+        per sample (see :mod:`~..kernels.compact`) -- and, compact, no per-sample inside value at all where it computes
+        and holds none (a prefix's next token on an HMM: every per-sample scope holds the prefix's last position).
+        Compact takes far less memory when the evidence leaves few live columns, and skips the dead lanes' writes
     :param carry: compact, the top-down values ``held["top_down"]`` marks are in ``node_flows`` as a previous query
         laid them out, not yet as this one does: a dict with that query's ``layout`` (its
         :class:`~..kernels.compact.CompactLayout`), the ``regions`` it holds (bool [sum regions]) and every row's

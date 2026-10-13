@@ -188,6 +188,20 @@ def test_a_decoders_calls_are_the_circuits(kind, scenario, query, storage, sum_p
         assert_close(a, b, n, where = f"step {i}")
 
 
+def test_a_call_with_no_inside_rows_keeps_no_inside_value(build_pc):
+    """A call whose node_mars holds the input rows alone (compact, no per-sample inside value computed or held) leaves
+    no inside value kept, whatever the buffers held before it: their storage was given up."""
+    n = KINDS["hmm"]
+    cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc("hmm", n, V))
+    R = len(cc.backend.sum_regions)
+    with cc.decoder(storage = "compact") as decoder:
+        decoder._after(4, "fp32", "compact", (np.ones(R, dtype = bool), np.zeros(R, dtype = bool)),
+                       {"inputs_only": True}, None)
+        assert not decoder._kept.inside.any()
+        decoder._after(4, "fp32", "compact", (np.ones(R, dtype = bool), np.zeros(R, dtype = bool)), {}, None)
+        assert decoder._kept.inside.all()
+
+
 @pytest.mark.parametrize("kind", ["hmm", "pd"])
 def test_a_compact_decoder_over_a_wide_batch(kind, build_pc, monkeypatch):
     """24 rows left to right, then beams: compact, the held values' blocks span many tiles of the copies that carry

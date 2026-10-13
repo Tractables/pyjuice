@@ -204,6 +204,8 @@ class DFAExactDecoder(Decoder):
             inside |= plan.sample[be.program().reg_iv_np]
             if plan.top_down is not None:
                 top_down |= plan.top_down.sample
+        if report.get("inputs_only"):                                   # node_mars's storage given up: none kept
+            inside[:] = False
         if report.get("compact") is not None:                           # the call laid out its top-down values
             compact = report["compact"]
             top_down &= plan.top_down.per_sample                        # (those with rows there)

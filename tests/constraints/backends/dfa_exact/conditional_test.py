@@ -111,6 +111,25 @@ def test_compact_storage_gives_the_same_rows(kind, name, pattern, sum_path, buil
         assert_rows_close(got, dense, n)
 
 
+@pytest.mark.parametrize("kind", ["hmm", "pd"])
+def test_compact_keeps_no_inside_values_where_it_needs_none(kind, build_pc):
+    """Inside fast_inference, every missing position of a prefix asked: on an HMM no per-sample inside value is needed
+    (every per-sample scope holds a target; the others are kept once), and compact, node_mars holds the input rows
+    alone; on a PD some are, and it holds every region's. The rows are dense's either way."""
+    n = KINDS[kind]
+    cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
+    data, missing = evidence("prefix", n)
+    B = data.size(0)
+    with juice.fast_inference():
+        dense = cc.conditional(data, missing)
+        full = cc.backend.state.storage("node_mars").numel()
+        got = cc.conditional(data, missing, storage = "compact")
+        held = cc.backend.state.storage("node_mars").numel()
+    assert_rows_close(got, dense, n)
+    inputs = cc.backend.input_range[1] * B
+    assert held == (inputs if kind == "hmm" else full) and full > inputs
+
+
 def test_storage_option(build_pc):
     """``storage`` is "dense" or "compact" (anything else raises); a marginal keeps no top-down value, so it is the
     same either way."""
