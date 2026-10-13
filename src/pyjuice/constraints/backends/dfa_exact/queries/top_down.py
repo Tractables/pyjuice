@@ -148,12 +148,10 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
         else:
             for folds, stages, num_temps, temp_slots in layers:
                 temp, temp_flows, temp_width, tw = node_mars, node_mars, 0, 0
-                if compact is not None and any(la.form == "block_block" for st in stages for la, _ in st[0] + st[1]):
-                    raise NotImplementedError("Compact storage of the top-down values is not supported by block @ "
-                                              "block products yet: use storage = \"dense\".")
                 if num_temps > 0:
                     temp_width = _align(B * temp_slots)                    # the folds' inside values'
-                    tw = temp_width if compact is None else compact.row_width(_temp_intervals(stages), temp_slots)
+                    tw = temp_width if compact is None else \
+                        compact.row_width(_sample_temp_intervals(stages), temp_slots)
                     temp = backend.state.storage_view("product_scratch", num_temps * temp_width)
                     temp_flows = backend.state.storage_view("product_scratch_flows", num_temps * tw)
                 if folds[0]:                             # the folds' inside values, for a batch of one ...
@@ -164,13 +162,14 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
                              obs_class, live, elem_first, elem_width, B, srcs, exact = exact)
                 for once_launches, sample_launches, cw_launches in stages:
                     if once_launches:
-                        run_top_down(once_launches, (temp, tw), prog, once, element_flows, temp_flows, pf["flows"],
-                                     node_mars, class_mars, prog.no_evidence, None, elem_first, ew, 1, srcs, out.skip,
-                                     True, td.once_iv)
+                        run_top_down(once_launches, (temp, temp_width), prog, once, element_flows, temp_flows,
+                                     pf["flows"], node_mars, class_mars, prog.no_evidence, None, elem_first, ew, 1,
+                                     srcs, out.skip, True, td.once_iv, tflow_width = tw)
                     if sample_launches:
-                        run_top_down(sample_launches, (temp, tw), prog, fregions, element_flows, temp_flows,
+                        run_top_down(sample_launches, (temp, temp_width), prog, fregions, element_flows, temp_flows,
                                      node_flows, node_mars, class_mars, obs_class, live, elem_first, ew, B, srcs,
-                                     out.skip, exact, td.once_iv, lanes = lanes, compact = compact)
+                                     out.skip, exact, td.once_iv, lanes = lanes, compact = compact, tflow_width = tw,
+                                     inside_regions = regions)
                     if cw_launches and class_weights is not None:
                         run_class_weights(cw_launches, class_weights, prog, (temp, temp_width), element_flows,
                                           temp_flows, node_mars, liveness, elem_first, ew, B, srcs, td.once_iv,
@@ -179,12 +178,13 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
         pf["valid"] |= td.todo
 
 
-def _temp_intervals(stages) -> np.ndarray:
-    """The intervals (``prog.intervals``' numbers) of the scratch rows a product layer's top-down launches write or
-    read: their children's where those are scratch rows, their parents' where those are."""
+def _sample_temp_intervals(stages) -> np.ndarray:
+    """The intervals (``prog.intervals``' numbers) of the scratch rows a product layer's per-sample top-down launches
+    write or read: their children's where those are scratch rows, their parents' where those are (a launch for a batch
+    of one writes and reads one sample's block)."""
     ivs = [np.zeros(0, dtype = np.int64)]
-    for once_launches, sample_launches, _ in stages:
-        for la, _ in once_launches + sample_launches:
+    for _, sample_launches, _ in stages:
+        for la, _ in sample_launches:
             if la.kinds[0] != SUM:
                 ivs.append(la.host["child_iv"])
             if la.kinds[2 if la.form == "block_block" else 1]:

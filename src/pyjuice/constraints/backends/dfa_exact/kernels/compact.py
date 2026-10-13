@@ -115,8 +115,11 @@ class CompactLayout:
         without per-sample values), and ``offset_t``, ``width_t``, ``lanes_t`` (int64 on the device; ``lanes_t``: its
         rows' lanes) and ``size``, the floats of ``node_flows``
     :ivar sum_lanes: the most lanes of a row of a region with per-sample values
-    :ivar elem_width: per product layer group, the width of its rows in ``element_flows`` (as wide as its products'
-        compact values, or one sample's block kept once), and ``element_size``, the floats ``element_flows`` needs
+    :ivar max_count: int64 [n + 1] (host): every boundary's most live columns of a sample
+    :ivar elem_width: per product layer group, the width of its rows in ``element_flows`` (as wide as the compact values
+        of its products under a sum with per-sample values -- a product's interval is its sum's --, or one sample's
+        block kept once), and ``element_size``, the floats ``element_flows`` needs
+    :ivar sample_ivs: bool [intervals] (host): those of the sum regions with per-sample values
     """
 
     B: int
@@ -134,6 +137,8 @@ class CompactLayout:
     lanes_t: torch.Tensor
     size: int
     sum_lanes: int
+    max_count: np.ndarray
+    sample_ivs: np.ndarray
     elem_width: list
     element_size: int
     prog: Any
@@ -142,6 +147,11 @@ class CompactLayout:
         """The most lanes per row of the intervals ``ivs`` (``prog.intervals``' numbers; 0 for none)."""
         ivs = np.asarray(ivs, dtype = np.int64)
         return int(self.total[ivs].max()) if ivs.size else 0
+
+    def per_sample(self, ivs) -> np.ndarray:
+        """The intervals of ``ivs`` (``prog.intervals``' numbers) of sum regions with per-sample values."""
+        ivs = np.asarray(ivs, dtype = np.int64)
+        return ivs[self.sample_ivs[ivs]]
 
     def row_width(self, ivs, slots: int) -> int:
         """The width of rows that hold the compact values of the intervals ``ivs``, or a batch of one's ``slots``."""
@@ -160,7 +170,8 @@ def compact_layout(backend, liveness, regions: np.ndarray) -> CompactLayout:
     """
     The :class:`CompactLayout` of a query: every interval's rectangles from its liveness (one launch, and the lists
     with their ranks), and the rows in ``node_flows`` of the sum ``regions`` (bool [sum regions], host) whose top-down
-    values it keeps per sample. The one wait: the rows' lanes, for their widths.
+    values it keeps per sample. The one wait: the rows' lanes, for their widths, and every boundary's most live
+    columns, for the grids.
     """
     prog = backend.program()
     B, n = liveness.B, prog.n
@@ -169,7 +180,8 @@ def compact_layout(backend, liveness, regions: np.ndarray) -> CompactLayout:
     off = torch.empty(K, B + 1, dtype = torch.int64, device = prog.dev)
     _rectangles_kernel[(K,)](off, count, prog.iv_ends, B, n, TILE = min(1024, max(32, host_next_power_of_2(B))),
                              num_warps = 4)
-    total = off[:, B].cpu().numpy()
+    host = torch.cat([off[:, B], count.view(B, n + 1).amax(dim = 0).long()]).cpu().numpy()
+    total, max_count = host[:K], host[K:]
     lanes = total[prog.reg_iv_all]
     width = np.where(regions, _aligned(lanes), 0)
     offset = np.zeros(len(width), dtype = np.int64)
@@ -180,8 +192,10 @@ def compact_layout(backend, liveness, regions: np.ndarray) -> CompactLayout:
                         start = start, columns = columns, rank = liveness.rank, offset = offset.tolist(),
                         width = width.tolist(), offset_t = i64(offset), width_t = i64(width), lanes_t = i64(lanes),
                         size = int((rows * width).sum()), sum_lanes = int(lanes[regions].max(initial = 0)),
-                        elem_width = [], element_size = 0, prog = prog)
-    out.elem_width = [out.row_width(prog.elem_ivs.get(pi, ()), slots)
+                        max_count = max_count, sample_ivs = np.zeros(K, dtype = bool), elem_width = [],
+                        element_size = 0, prog = prog)
+    out.sample_ivs[prog.reg_iv_all[regions]] = True
+    out.elem_width = [out.row_width(out.per_sample(prog.elem_ivs.get(pi, ())), slots)
                       for pi, (_, _, slots) in enumerate(backend.element_regions)]
     out.element_size = max(((end - first) * w for (first, end, _), w in zip(backend.element_regions, out.elem_width)),
                            default = 0)

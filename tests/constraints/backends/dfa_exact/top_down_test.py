@@ -9,6 +9,7 @@ computed again.
 """
 import contextlib
 import math
+import random
 
 import numpy as np
 import pytest
@@ -27,11 +28,13 @@ V = 3
 KINDS = {"hmm": 6, "hmm_untied": 6, "hmm_block_sparse": 6, "left_linear": 6, "pd": 8, "pd_prod_dominated": 8,
          "pd_blockified": 8, "hand": 5, "hand_permuted": 5, "hand_unit": 4, "hand_left": 5,
          "hand_shared": 4, "hand_fold": 4}                                                      # see conftest.py
-COMPACT_KINDS = ["hmm", "hmm_untied", "hmm_block_sparse", "left_linear", "hand_left"]   # no block @ block product
 PATTERNS = ["none", "all", "prefix", "suffix", "scattered", "mixed"]
 # keep nothing once; as a query decides; every input-independent value (fast_inference); every input-independent
 # top-down value and no inside value (so the inside values its launches for a batch of one read must be kept once)
 POLICIES = ["sample", "default", "kept", "top_down"]
+# no block @ block product: compact top-down values are dense's bit for bit through the fused sums (a block @ block one
+# sums the live shared columns only, in other groups)
+BIT_EXACT_KINDS = ["hmm", "hmm_untied", "hmm_block_sparse", "left_linear", "hand_left"]
 CONSTRAINTS = {
     "contains": lambda: jc.DFA.contains([[1, 2]], V),
     "either": lambda: jc.DFA.contains([[2]], V) | jc.DFA.contains([[0, 0]], V),
@@ -255,12 +258,13 @@ def test_dead_slots_hold_neg_inf(kind, sum_path, build_pc, reference):
     assert_top_down_close(cc, got, reference.top_down(cc, data, missing), data, missing)
 
 
+@pytest.mark.parametrize("storage", ["dense", "compact"])
 @pytest.mark.parametrize("kind", ["pd", "pd_prod_dominated", "hand", "hmm"])
-def test_top_down_values_survive_a_wide_dynamic_range(kind, build_pc, reference, monkeypatch):
+def test_top_down_values_survive_a_wide_dynamic_range(kind, storage, build_pc, reference, monkeypatch):
     """The construction of liveness_test.py's ``test_marginals_survive_a_wide_dynamic_range`` (tokens 1 and 2 have
     probability e^-50 under "contains 1 2", so a block's entries span far more than fp32's exponent): the top-down
     pass's transposed block @ block contractions flush the small entries as the forward's do unless the tile is
-    computed again exactly. Against the reference in float64."""
+    computed again exactly -- dense, or compact (one shared column at a time). Against the reference in float64."""
     n = KINDS[kind]
     pc = build_pc(kind, n, V)
     with torch.no_grad():
@@ -275,8 +279,8 @@ def test_top_down_values_survive_a_wide_dynamic_range(kind, build_pc, reference,
     data[3, 0], data[3, 1] = 1, 2                                           # ... satisfied: state 2
     missing = torch.arange(n)[None, :] >= torch.tensor([0, t, t, t])[:, None]   # sample 0: nothing observed
     monkeypatch.setitem(reference.top_down.__globals__, "DTYPE", torch.float64)
-    assert_top_down_close(cc, top_down_blocks(cc, data, missing)[0], reference.top_down(cc, data, missing), data,
-                          missing)
+    assert_top_down_close(cc, top_down_blocks(cc, data, missing, storage = storage)[0],
+                          reference.top_down(cc, data, missing), data, missing)
 
 
 @pytest.mark.parametrize("kind", ["pd_prod_dominated", "hand_permuted", "hmm"])
@@ -422,15 +426,17 @@ def test_products_of_target_inputs_get_their_values(kind, policy, build_pc, refe
     assert checked
 
 
+@pytest.mark.parametrize("storage", ["dense", "compact"])
 @pytest.mark.parametrize("policy", ["default", "top_down", "kept"])
-def test_values_kept_once_read_their_inside_values_once(policy, build_pc, reference):
+def test_values_kept_once_read_their_inside_values_once(policy, storage, build_pc, reference):
     """A top-down value kept once reads inside values for a batch of one -- its siblings', and a fold's operands' --
     which are kept once too, never read off one sample's pruned ones: hand_fold (whose s01 reads the fold of s2 and s3)
-    with prefixes leaving the automaton in each of its states at position 2, so the samples' live columns differ."""
+    with prefixes leaving the automaton in each of its states at position 2, so the samples' live columns differ.
+    Compact, the folds' scratch rows hold both a batch of one's values and the samples' compact ones."""
     cc = jc.compile(CONSTRAINTS["contains"](), build_pc("hand_fold", 4, V))
-    data = torch.tensor([[0, 0, 0, 0], [0, 1, 0, 0], [1, 2, 0, 0]])
-    missing = (torch.arange(4) >= 2)[None, :].expand(3, 4).contiguous()
-    got, plan = top_down_blocks(cc, data, missing, policy = policy)
+    data = torch.tensor([[0, 0, 0, 0], [0, 1, 0, 0], [1, 2, 0, 0]]).repeat(16, 1)   # 48 samples: rows wider than
+    missing = (torch.arange(4) >= 2)[None, :].expand(48, 4).contiguous()            # padding, either way
+    got, plan = top_down_blocks(cc, data, missing, policy = policy, storage = storage)
     assert plan.top_down.once.any()
     assert_top_down_close(cc, got, reference.top_down(cc, data, missing), data, missing)
 
@@ -446,10 +452,11 @@ def live_columns_of(cc, got, data, missing):
 
 @pytest.mark.parametrize("pattern", ["none", "prefix", "suffix", "scattered", "mixed"])
 @pytest.mark.parametrize("name", list(CONSTRAINTS))
-@pytest.mark.parametrize("kind", COMPACT_KINDS)
+@pytest.mark.parametrize("kind", list(KINDS))
 def test_compact_top_down_values_match_the_reference(kind, name, pattern, sum_path, build_pc, reference):
     """Kept compact (``storage = "compact"``, see kernels/compact.py): every lane written, the reference's values on
-    the live slots, and the dense storage's -- bit for bit through the fused sums, which compute each lane alone."""
+    the live slots, and the dense storage's -- bit for bit through the fused sums, which compute each lane alone, but
+    for block @ block products (``BIT_EXACT_KINDS``)."""
     n = KINDS[kind]
     cc = jc.compile(CONSTRAINTS[name](), build_pc(kind, n, V))
     data, missing = evidence(pattern, n)
@@ -457,15 +464,14 @@ def test_compact_top_down_values_match_the_reference(kind, name, pattern, sum_pa
     assert_top_down_close(cc, got, reference.top_down(cc, data, missing), data, missing)
     dense = top_down_blocks(cc, data, missing)[0]
     for r, (g, d) in enumerate(zip(live_columns_of(cc, got, data, missing), live_columns_of(cc, dense, data, missing))):
-        if sum_path == "fused":
+        assert torch.equal(torch.isneginf(g), torch.isneginf(d)), r
+        if sum_path == "fused" and kind in BIT_EXACT_KINDS:
             assert torch.equal(g, d), r
-        else:
-            assert torch.equal(torch.isneginf(g), torch.isneginf(d)), r
 
 
 @pytest.mark.parametrize("pattern", ["none", "prefix", "mixed"])
 @pytest.mark.parametrize("policy", POLICIES)
-@pytest.mark.parametrize("kind", COMPACT_KINDS)
+@pytest.mark.parametrize("kind", list(KINDS))
 def test_compact_values_under_every_policy(kind, policy, pattern, build_pc, reference):
     """Compact per-sample values next to values kept once (read from and written to a batch of one's blocks, in rows
     as wide as both need): the reference's. Nothing observed, every value input-independent: inside fast_inference
@@ -479,7 +485,7 @@ def test_compact_values_under_every_policy(kind, policy, pattern, build_pc, refe
         assert not plan.top_down.per_sample.any()
 
 
-@pytest.mark.parametrize("kind", COMPACT_KINDS)
+@pytest.mark.parametrize("kind", list(KINDS))
 def test_compact_values_of_targets_only(kind, build_pc, reference):
     """Compact, a query computes the values its targets need and leaves the others alone (no rows at all)."""
     n = KINDS[kind]
@@ -493,11 +499,21 @@ def test_compact_values_of_targets_only(kind, build_pc, reference):
     assert_top_down_close(cc, got, reference.top_down(cc, data, missing), data, missing, regions = need)
 
 
-@pytest.mark.parametrize("kind", ["pd", "hand"])
-def test_compact_storage_refuses_block_block_products(kind, build_pc):
-    """Block @ block products do not keep compact values yet: a clear error, not wrong values."""
-    n = KINDS[kind]
-    cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
-    data, missing = evidence("prefix", n)
-    with pytest.raises(NotImplementedError, match = "block @ block"):
-        top_down_blocks(cc, data, missing, storage = "compact")
+@pytest.mark.parametrize("storage", ["dense", "compact"])
+@pytest.mark.parametrize("kind", ["pd", "pd_prod_dominated"])
+def test_wide_automata(kind, storage, build_pc, reference):
+    """A 48-state automaton with 10 accepting columns at the sequence end, samples observing nothing among others: a
+    sample's rectangle of live columns spans several tiles of a compact block @ block product each way (more than 32
+    live columns at a boundary); the values against the reference."""
+    rng = random.Random(0)
+    K, n = 48, KINDS[kind]
+    dfa = jc.DFA.from_dense(V, [[rng.randrange(K) for _ in range(V)] for _ in range(K)], 0, rng.sample(range(K), 12))
+    cc = jc.compile(dfa, build_pc(kind, n, V))
+    data, missing = evidence("mixed", n)
+    dev = cc.pc.params.device
+    x = torch.where(missing, 0, data).to(dev)
+    lv = liveness(cc.backend.program(), torch.where(missing.to(dev), -1, cc.backend.token_classes.token_class[x]).int(),
+                  data.size(0))
+    assert int(lv.lists()[0].max()) > 32
+    got = top_down_blocks(cc, data, missing, storage = storage)[0]
+    assert_top_down_close(cc, got, reference.top_down(cc, data, missing), data, missing)

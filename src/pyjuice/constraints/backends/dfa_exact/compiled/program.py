@@ -184,7 +184,8 @@ class Program:
         self.all_ivs = sorted(_intervals(self.steps) | set(self.sum_ivs))
         self.intervals = interval_tables(self.reach, self.all_ivs, dev)
         self.iv_index = {iv: k for k, iv in enumerate(self.all_ivs)}
-        self.iv_ends = torch.tensor(self.all_ivs, dtype = torch.int32).reshape(-1, 2).to(dev)
+        self.iv_ends_np = np.asarray(self.all_ivs, dtype = np.int64).reshape(-1, 2)
+        self.iv_ends = torch.from_numpy(self.iv_ends_np).to(dev, torch.int32)
         self.reg_iv_all = np.asarray([self.iv_index[self.sum_ivs[k]] for k in self.reg_iv_host], dtype = np.int64)
         self.elem_ivs = {}
         for kind, prod_index, layers in self.steps:

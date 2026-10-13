@@ -24,7 +24,6 @@ KINDS = {"hmm": 6, "hmm_untied": 6, "hmm_block_sparse": 6, "left_linear": 6, "pd
          "pd_blockified": 8, "hand": 5, "hand_permuted": 5, "hand_unit": 4, "hand_left": 5,
          "hand_shared": 4, "hand_fold": 4}                                                      # see conftest.py
 PATTERNS = ["none", "prefix", "suffix", "scattered", "mixed"]      # "all" observes everything: no target
-COMPACT_KINDS = ["hmm", "hmm_untied", "hmm_block_sparse", "left_linear", "hand_left"]   # no block @ block product
 CONSTRAINTS = {
     "contains": lambda: jc.DFA.contains([[1, 2]], V),
     "either": lambda: jc.DFA.contains([[2]], V) | jc.DFA.contains([[0, 0]], V),
@@ -95,17 +94,18 @@ def test_conditionals_match_the_reference(kind, name, pattern, sum_path, build_p
 
 @pytest.mark.parametrize("pattern", PATTERNS)
 @pytest.mark.parametrize("name", list(CONSTRAINTS))
-@pytest.mark.parametrize("kind", COMPACT_KINDS)
+@pytest.mark.parametrize("kind", list(KINDS))
 def test_compact_storage_gives_the_same_rows(kind, name, pattern, sum_path, build_pc, reference):
     """``storage = "compact"`` (every sample's top-down values over the pairs of its live columns only): the
-    reference's rows, and the dense storage's -- bit for bit through the fused sums."""
+    reference's rows, and the dense storage's -- bit for bit through the fused sums, but for block @ block products
+    (whose compact products sum the live shared columns only, in other groups)."""
     n = KINDS[kind]
     cc = jc.compile(CONSTRAINTS[name](), build_pc(kind, n, V))
     data, missing = evidence(pattern, n)
     got, log_marginal = cc.conditional(data, missing, return_log_marginal = True, storage = "compact")
     assert_rows_close(got, reference.conditional(cc, data, missing), n)
     dense, dense_marginal = cc.conditional(data, missing, return_log_marginal = True)
-    if sum_path == "fused":
+    if sum_path == "fused" and kind in ["hmm", "hmm_untied", "hmm_block_sparse", "left_linear", "hand_left"]:
         assert torch.equal(got, dense) and torch.equal(log_marginal, dense_marginal)
     else:
         assert_rows_close(got, dense, n)
@@ -172,7 +172,7 @@ def test_class_weights_match_the_reference(kind, name, pattern, sum_path, build_
 @pytest.mark.parametrize("one_sample", [False, True])
 @pytest.mark.parametrize("kind, storage", [("hmm", "dense"), ("hand_left", "dense"), ("left_linear", "dense"),
                                            ("pd", "dense"), ("hmm", "compact"), ("hand_left", "compact"),
-                                           ("left_linear", "compact")])
+                                           ("left_linear", "compact"), ("pd", "compact")])
 def test_class_weights_walk_every_samples_own_live_columns(kind, storage, one_sample, build_pc, monkeypatch):
     """Samples sharing a class-weight program whose live lists at the target boundary differ in length -- every column
     (nothing observed), one (a prefix), none (evidence the constraint rules out) --: every sample's class weights are
