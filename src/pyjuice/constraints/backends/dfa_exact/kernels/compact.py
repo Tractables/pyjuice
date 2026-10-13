@@ -1,0 +1,188 @@
+"""
+Compact storage of the per-sample top-down values (a conditional's ``storage = "compact"``, see
+:mod:`..queries.conditional`).
+
+Dense, a block over the interval ``[a, e)`` keeps ``slots`` lanes per sample -- every pair the automaton joins --, most
+of them dead under evidence (:mod:`.live`). Compact, a row of an interval ``k`` keeps per sample ``b`` the RECTANGLE of
+its live columns, ``count(b, a) x count(b, e)`` lanes, the samples one after the other: the pair ``(i, j)`` of sample
+``b`` at ``off[k, b] + rank(b, a, i) * count(b, e) + rank(b, e, j)`` (``count``, ``rank``: the sample's live columns at
+a boundary, and a column's place among them, see :meth:`~.live.Liveness.lists`). A pair the automaton does not join --
+a HOLE, both ends live but no path between them inside the interval -- holds -inf. A row of interval ``k`` has
+``T_k = off[k, B]`` lanes (padded), and a lane finds its sample by a binary search in ``off[k]``.
+
+Only the per-sample top-down values are compact: ``node_flows``, the products' in ``element_flows`` and the folds' in
+the scratch rows. The inside values a top-down kernel reads stay dense, as do the values kept once (a batch of one, in
+``prior_flows``); a row that may hold either (a product's, a fold's) is as wide as both need.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+import numpy as np
+import torch
+import triton
+import triton.language as tl
+
+from pyjuice.utils.kernel_launcher import triton_jit
+from pyjuice.utils.util import host_next_power_of_2
+
+from ..compiled.tables import ALIGN
+
+#: the storages a conditional can keep its per-sample top-down values in
+STORAGES = ("dense", "compact")
+
+
+@triton_jit
+def _rectangles_kernel(off, count, ends, B, n, TILE: tl.constexpr):
+    """One program per interval ``k`` (``ends``: int32 [intervals, 2]): ``off[k, b]``, the lanes of the samples before
+    ``b`` in a row of ``k`` -- every sample's live columns at the entry times those at the exit --, and ``off[k, B]``
+    the row's."""
+    k = tl.program_id(0)
+    a = tl.load(ends + k * 2)
+    e = tl.load(ends + k * 2 + 1)
+    base = off + k.to(tl.int64) * (B + 1)
+    tl.store(base, tl.zeros([], dtype = tl.int64))
+    total = tl.zeros([], dtype = tl.int64)
+    for b0 in range(0, B, TILE):
+        b = b0 + tl.arange(0, TILE)
+        m = b < B
+        rect = tl.load(count + b * (n + 1) + a, mask = m, other = 0).to(tl.int64) * \
+            tl.load(count + b * (n + 1) + e, mask = m, other = 0).to(tl.int64)
+        tl.store(base + 1 + b, total + tl.cumsum(rect, axis = 0), mask = m)
+        total += tl.sum(rect, axis = 0)
+
+
+@triton.jit
+def _lane_sample(off, k, idx, B, steps):
+    """The samples of the lanes ``idx`` of a row of interval ``k``: the last ``b`` with ``off[k, b] <= idx`` (a binary
+    search of ``steps`` steps over the ``B + 1`` offsets; a sample without lanes is never the last)."""
+    base = off + k.to(tl.int64) * (B + 1)
+    lo = tl.zeros_like(idx)
+    hi = lo + B
+    for _ in range(steps):
+        mid = (lo + hi + 1) // 2
+        go = tl.load(base + mid) <= idx
+        lo = tl.where(go, mid, lo)
+        hi = tl.where(go, hi, mid - 1)
+    return lo
+
+
+@triton.jit
+def _lane_ends(off, count, start, columns, k, a, e, idx, m, B, n, steps):
+    """``(b, i, j)`` of the lanes ``idx`` (``m``: the real ones) of a row of interval ``k`` = ``[a, e)``: their sample,
+    and their pair's columns at the entry and the exit."""
+    b = _lane_sample(off, k, idx, B, steps)
+    local = (idx - tl.load(off + k.to(tl.int64) * (B + 1) + b, mask = m, other = 0)).to(tl.int32)
+    ra = b.to(tl.int64) * (n + 1) + a
+    re = b.to(tl.int64) * (n + 1) + e
+    ce = tl.maximum(tl.load(count + re, mask = m, other = 1), 1)
+    pa = local // ce
+    i = tl.load(columns + tl.load(start + ra, mask = m, other = 0) + pa, mask = m, other = 0)
+    j = tl.load(columns + tl.load(start + re, mask = m, other = 0) + (local - pa * ce), mask = m, other = 0)
+    return b, i, j
+
+
+@triton.jit
+def _lane(off, count, rank, k, b, a, i, e, j, m, B, n, W):
+    """The lane of the pair ``(i at a, j at e)`` of samples ``b`` in a row of interval ``k`` = ``[a, e)``, -1 where
+    either column is dead for its sample (``m``: the real ones; shapes broadcast)."""
+    row = rank + b.to(tl.int64) * (n + 1) * W
+    ri = tl.load(row + a * W + i, mask = m, other = -1)
+    rj = tl.load(row + e * W + j, mask = m, other = -1)
+    ce = tl.load(count + b.to(tl.int64) * (n + 1) + e, mask = m, other = 0)
+    lane = tl.load(off + k.to(tl.int64) * (B + 1) + b, mask = m, other = 0) + ri * ce + rj
+    return tl.where((ri >= 0) & (rj >= 0), lane, -1)
+
+
+def _aligned(x):
+    return (np.asarray(x, dtype = np.int64) + ALIGN - 1) // ALIGN * ALIGN
+
+
+@dataclass
+class CompactLayout:
+    """
+    Where a query keeps its per-sample top-down values compact (see the module docstring); :func:`compact_layout`.
+
+    :ivar B: the batch size
+    :ivar off: int64 [intervals, B + 1] on the device, by ``prog.intervals``' numbers: every sample's first lane in a
+        row of the interval, then the row's lanes
+    :ivar total: int64 [intervals] (host): every interval's lanes per row
+    :ivar steps: the steps of a binary search over ``B + 1`` offsets
+    :ivar count, start, columns, rank: the query's live lists and ranks (:meth:`~.live.Liveness.lists`)
+    :ivar offset, width: per sum region, its rows' place and width in ``node_flows`` (host lists; width 0 for a region
+        without per-sample values), and ``offset_t``, ``width_t``, ``lanes_t`` (int64 on the device; ``lanes_t``: its
+        rows' lanes) and ``size``, the floats of ``node_flows``
+    :ivar sum_lanes: the most lanes of a row of a region with per-sample values
+    :ivar elem_width: per product layer group, the width of its rows in ``element_flows`` (as wide as its products'
+        compact values, or one sample's block kept once), and ``element_size``, the floats ``element_flows`` needs
+    """
+
+    B: int
+    off: torch.Tensor
+    total: np.ndarray
+    steps: int
+    count: torch.Tensor
+    start: torch.Tensor
+    columns: torch.Tensor
+    rank: torch.Tensor
+    offset: list
+    width: list
+    offset_t: torch.Tensor
+    width_t: torch.Tensor
+    lanes_t: torch.Tensor
+    size: int
+    sum_lanes: int
+    elem_width: list
+    element_size: int
+    prog: Any
+
+    def lanes(self, ivs) -> int:
+        """The most lanes per row of the intervals ``ivs`` (``prog.intervals``' numbers; 0 for none)."""
+        ivs = np.asarray(ivs, dtype = np.int64)
+        return int(self.total[ivs].max()) if ivs.size else 0
+
+    def row_width(self, ivs, slots: int) -> int:
+        """The width of rows that hold the compact values of the intervals ``ivs``, or a batch of one's ``slots``."""
+        return int(_aligned(max(self.lanes(ivs), slots)))
+
+    def identity(self, size: int) -> torch.Tensor:
+        """int32 ``0 .. size - 1`` on the device (the dense sum path's columns: a compact row's lanes in order)."""
+        prog = self.prog
+        ident = getattr(prog, "compact_identity", None)
+        if ident is None or ident.numel() < size:
+            ident = prog.compact_identity = torch.arange(max(size, 1024), dtype = torch.int32, device = prog.dev)
+        return ident[:size]
+
+
+def compact_layout(backend, liveness, regions: np.ndarray) -> CompactLayout:
+    """
+    The :class:`CompactLayout` of a query: every interval's rectangles from its liveness (one launch, and the lists
+    with their ranks), and the rows in ``node_flows`` of the sum ``regions`` (bool [sum regions], host) whose top-down
+    values it keeps per sample. The one wait: the rows' lanes, for their widths.
+    """
+    prog = backend.program()
+    B, n = liveness.B, prog.n
+    count, start, columns = liveness.lists(rank = True)
+    K = prog.iv_ends.size(0)
+    off = torch.empty(K, B + 1, dtype = torch.int64, device = prog.dev)
+    _rectangles_kernel[(K,)](off, count, prog.iv_ends, B, n, TILE = min(1024, max(32, host_next_power_of_2(B))),
+                             num_warps = 4)
+    total = off[:, B].cpu().numpy()
+    lanes = total[prog.reg_iv_all]
+    width = np.where(regions, _aligned(lanes), 0)
+    offset = np.zeros(len(width), dtype = np.int64)
+    rows = prog.reg_rows
+    np.cumsum((rows * width)[:-1], out = offset[1:])
+    i64 = lambda x: torch.from_numpy(np.ascontiguousarray(x, dtype = np.int64)).to(prog.dev)
+    out = CompactLayout(B = B, off = off, total = total, steps = max(1, int(np.ceil(np.log2(B + 1)))), count = count,
+                        start = start, columns = columns, rank = liveness.rank, offset = offset.tolist(),
+                        width = width.tolist(), offset_t = i64(offset), width_t = i64(width), lanes_t = i64(lanes),
+                        size = int((rows * width).sum()), sum_lanes = int(lanes[regions].max(initial = 0)),
+                        elem_width = [], element_size = 0, prog = prog)
+    out.elem_width = [out.row_width(prog.elem_ivs.get(pi, ()), slots)
+                      for pi, (_, _, slots) in enumerate(backend.element_regions)]
+    out.element_size = max(((end - first) * w for (first, end, _), w in zip(backend.element_regions, out.elem_width)),
+                           default = 0)
+    return out

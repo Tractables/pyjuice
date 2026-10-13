@@ -24,11 +24,12 @@ from __future__ import annotations
 
 from typing import Callable, Optional
 
+import numpy as np
 import torch
 
 from . import forward as F
 from ..compiled.tables import _align
-from ..kernels.common import tensor
+from ..kernels.common import SUM, tensor
 from ..kernels.prod import run_products as products
 from ..kernels.prod_top_down import run_top_down
 from ..kernels.score import run_class_weights
@@ -38,7 +39,7 @@ from ..kernels.sum import dense_sum_top_down, fill_dead_rows, fused_sum_top_down
 
 def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missing: torch.Tensor,
                  obs_class: torch.Tensor, liveness, precision: str, visit: Optional[Callable[[int], None]] = None,
-                 class_weights: Optional[dict] = None, class_mars: Optional[torch.Tensor] = None):
+                 class_weights: Optional[dict] = None, class_mars: Optional[torch.Tensor] = None, compact = None):
     """
     The top-down values a query plan computes (``plan.top_down``, see :mod:`.plans`), after
     :func:`~.forward.run_forward` filled the inside values of ``bufs`` under ``plan``: the per-sample ones into
@@ -53,6 +54,8 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
         (see :func:`~.score.run_class_weights`; the plan must be a scoring one, see :func:`~.query_plan.
         top_down_plan`)
     :param class_mars: the query's class masses if its forward has them (:func:`~.forward.run_forward`'s), else None
+    :param compact: None, or the query's :class:`~..kernels.compact.CompactLayout`: the per-sample values are compact
+        (``flows`` laid out by it, see :meth:`~.state.State.flows`); the inside values stay dense
     """
     pc, prog, td = backend.pc, backend.program(), plan.top_down
     out = backend.top_down_program()
@@ -61,7 +64,13 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
     node_mars, element_mars = bufs["node_mars"], bufs["element_mars"]
     node_flows, element_flows = flows["node_flows"], flows["element_flows"]
     regions = dict(offset = lay["sum_offsets_t"], width = lay["sum_widths_t"], first = prog.reg_first,
-                   slots = prog.reg_slots)
+                   slots = prog.reg_slots)                                     # the inside values'
+    if compact is None:                                  # the per-sample top-down values', as wide as the inside ones
+        fregions, f_offsets, f_widths, nbatch = regions, lay["sum_offsets"], lay["sum_widths"], B
+    else:                                                # ... or compact: a batch of one whose "slots" are the lanes
+        fregions = dict(offset = compact.offset_t, width = compact.width_t, first = prog.reg_first,
+                        slots = compact.lanes_t)
+        f_offsets, f_widths, nbatch = compact.offset, compact.width, 1
     prior = backend.state.prior_buffer() if plan.prior else None
     srcs = dict(mars = node_mars, offset = regions["offset"], width = regions["width"], reg_prior = plan.reg_prior)
     if prior is not None:
@@ -71,7 +80,8 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
         once = dict(offset = pf["offset_t"], width = pf["width_t"], first = prog.reg_first, slots = prog.reg_slots)
     dot = F.PRECISIONS[precision]
     live = liveness.live if liveness is not None else None
-    lanes = (liveness.lanes.perm, liveness.lanes.reg_first, liveness.lanes.reg_live) if liveness is not None else None
+    lanes = (liveness.lanes.perm, liveness.lanes.reg_first, liveness.lanes.reg_live) \
+        if liveness is not None and compact is None else None
     exact = liveness is not None
     if class_mars is None:
         class_mars = backend.state.class_masses()
@@ -81,29 +91,38 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
     r = prog.root_region                                 # the root: top-down value 0 (log 1) on its slot
     computed, root_once = td.root
     if computed:
+        cols = B * prog.slots[r] if compact is None else int(compact.total[prog.reg_iv_all[r]])
         dest, offset, width, cols = (pf["flows"], pf["offset"][r], pf["width"][r], prog.slots[r]) if root_once else \
-            (node_flows, lay["sum_offsets"][r], lay["sum_widths"][r], B * prog.slots[r])
+            (node_flows, f_offsets[r], f_widths[r], cols)
         base = offset + (prog.root_rows[0] - prog.firsts[r]) * width
         for row in range(prog.root_rows[1] - prog.root_rows[0]):
             dest[base + row * width:base + row * width + cols] = 0.0
     if td.dead is not None:                              # rows no launch writes, of the regions computed per sample
-        fill_dead_rows(node_flows, td.dead, regions, max(lay["sum_widths"][r] for r in td.dead_regions))
+        dead_width = max(f_widths[r] for r in td.dead_regions)
+        if dead_width > 0:
+            fill_dead_rows(node_flows, td.dead, fregions, dead_width)
 
     for kind, prod_index, layers in td.steps:
         elem_first = backend.element_regions[prod_index][0]
-        elem_width = lay["element_widths"][prod_index]
+        elem_width = lay["element_widths"][prod_index]                         # the products' inside values'
+        ew = elem_width if compact is None else compact.elem_width[prod_index]   # ... and top-down values'
         if kind == "sum":
             for block_size, dense_runs, fused_groups in layers:
                 for part in (0, 1):                      # once, then per sample
                     if part == 0 and not (dense_runs[0] or fused_groups[0]):
                         continue
-                    nf, regs, nb = (pf["flows"], once, 1) if part == 0 else (node_flows, regions, B)
-                    offsets, widths = (pf["offset"], pf["width"]) if part == 0 else \
-                        (lay["sum_offsets"], lay["sum_widths"])
+                    nf, regs, nb = (pf["flows"], once, 1) if part == 0 else (node_flows, fregions, nbatch)
+                    offsets, widths = (pf["offset"], pf["width"]) if part == 0 else (f_offsets, f_widths)
                     for r, c0, E, piece, blocks, key, add in dense_runs[part]:
                         ncols = nb * prog.slots[r]
                         cols = None
-                        if part == 1 and liveness is not None and \
+                        if part == 1 and compact is not None:    # a compact row's lanes, in order
+                            ncols = int(compact.total[prog.reg_iv_all[r]])
+                            if ncols == 0:
+                                continue
+                            ident = compact.identity(ncols)
+                            cols = (ident, ident, ncols)
+                        elif part == 1 and liveness is not None and \
                                 F.prune_dense(ncols, liveness.lanes.num_live(prog.reg_iv_host[r])):
                             cols = liveness.lanes.segment(prog.reg_iv_host[r], ncols)
                         stacked = None
@@ -114,21 +133,29 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
                                 stacks[key] = stacked_weights(pc.params, key[2], key[0], block_size)
                             stacked = stacks[key]
                         dense_sum_top_down(element_flows, nf, pc.params, blocks, E, block_size,
-                                          (offsets[r], widths[r], prog.firsts[r]), c0, elem_first, elem_width, ncols,
-                                          dot, add, live = cols, stacked = stacked, piece = piece)
+                                          (offsets[r], widths[r], prog.firsts[r]), c0, elem_first, ew, ncols, dot,
+                                          add, live = cols, stacked = stacked, piece = piece)
                     for cbs, tables, idx in fused_groups[part]:
-                        fused_sum_top_down(element_flows, nf, pc.params, tables, regs, elem_first, elem_width, nb,
-                                          block_size, cbs, max_cols = nb * tables["max_slots"], precision = dot,
-                                          liveness = liveness if part == 1 else None, idx = tensor(idx))
+                        max_cols = compact.sum_lanes if part == 1 and compact is not None else nb * tables["max_slots"]
+                        if max_cols == 0:
+                            continue
+                        fused_sum_top_down(element_flows, nf, pc.params, tables, regs, elem_first, ew, nb,
+                                          block_size, cbs, max_cols = max_cols, precision = dot,
+                                          liveness = liveness if part == 1 and compact is None else None,
+                                          idx = tensor(idx))
             if visit is not None:
                 visit(prod_index)
         else:
             for folds, stages, num_temps, temp_slots in layers:
-                temp, temp_flows, temp_width = node_mars, node_mars, 0
+                temp, temp_flows, temp_width, tw = node_mars, node_mars, 0, 0
+                if compact is not None and any(la.form == "block_block" for st in stages for la, _ in st[0] + st[1]):
+                    raise NotImplementedError("Compact storage of the top-down values is not supported by block @ "
+                                              "block products yet: use storage = \"dense\".")
                 if num_temps > 0:
-                    temp_width = _align(B * temp_slots)
+                    temp_width = _align(B * temp_slots)                    # the folds' inside values'
+                    tw = temp_width if compact is None else compact.row_width(_temp_intervals(stages), temp_slots)
                     temp = backend.state.storage_view("product_scratch", num_temps * temp_width)
-                    temp_flows = backend.state.storage_view("product_scratch_flows", num_temps * temp_width)
+                    temp_flows = backend.state.storage_view("product_scratch_flows", num_temps * tw)
                 if folds[0]:                             # the folds' inside values, for a batch of one ...
                     products(folds[0], (temp, temp_width), prog, regions, element_mars, node_mars, class_mars,
                              prog.no_evidence, None, elem_first, elem_width, 1, srcs, exact = True)
@@ -137,16 +164,29 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
                              obs_class, live, elem_first, elem_width, B, srcs, exact = exact)
                 for once_launches, sample_launches, cw_launches in stages:
                     if once_launches:
-                        run_top_down(once_launches, (temp, temp_width), prog, once, element_flows, temp_flows,
-                                     pf["flows"], node_mars, class_mars, prog.no_evidence, None, elem_first,
-                                     elem_width, 1, srcs, out.skip, True, td.once_iv)
+                        run_top_down(once_launches, (temp, tw), prog, once, element_flows, temp_flows, pf["flows"],
+                                     node_mars, class_mars, prog.no_evidence, None, elem_first, ew, 1, srcs, out.skip,
+                                     True, td.once_iv)
                     if sample_launches:
-                        run_top_down(sample_launches, (temp, temp_width), prog, regions, element_flows, temp_flows,
-                                     node_flows, node_mars, class_mars, obs_class, live, elem_first, elem_width, B,
-                                     srcs, out.skip, exact, td.once_iv, lanes = lanes)
+                        run_top_down(sample_launches, (temp, tw), prog, fregions, element_flows, temp_flows,
+                                     node_flows, node_mars, class_mars, obs_class, live, elem_first, ew, B, srcs,
+                                     out.skip, exact, td.once_iv, lanes = lanes, compact = compact)
                     if cw_launches and class_weights is not None:
                         run_class_weights(cw_launches, class_weights, prog, (temp, temp_width), element_flows,
-                                          temp_flows, node_mars, liveness, elem_first, elem_width, B, srcs, td.once_iv,
-                                          regions)
+                                          temp_flows, node_mars, liveness, elem_first, ew, B, srcs, td.once_iv,
+                                          regions, compact = compact, tflow_width = tw)
     if pf is not None:
         pf["valid"] |= td.todo
+
+
+def _temp_intervals(stages) -> np.ndarray:
+    """The intervals (``prog.intervals``' numbers) of the scratch rows a product layer's top-down launches write or
+    read: their children's where those are scratch rows, their parents' where those are."""
+    ivs = [np.zeros(0, dtype = np.int64)]
+    for once_launches, sample_launches, _ in stages:
+        for la, _ in once_launches + sample_launches:
+            if la.kinds[0] != SUM:
+                ivs.append(la.host["child_iv"])
+            if la.kinds[2 if la.form == "block_block" else 1]:
+                ivs.append(la.host["parent_iv"])
+    return np.concatenate(ivs)

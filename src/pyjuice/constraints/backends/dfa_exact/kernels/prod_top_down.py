@@ -34,6 +34,7 @@ from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
 from .common import (SUM, _block_ptr, _child, _exit_width, _interval, _logaddexp_tile, _lse_step, _pair, _slot,
                      grid_chunks, tensor)
+from .compact import _lane, _lane_ends
 from .prod import (BLOCK_BLOCK_PROGRAMS_PER_SM, BLOCK_BLOCK_TILES, EXACT_BELOW, PRODUCT_PRECISION, SKIP_EMPTY_TILES,
                    _chunk_needed, _flat_tile, _live_lanes, _lse_step_one_exp, _lse_value, _tile, _tile_load)
 
@@ -101,13 +102,13 @@ def _once(once_iv, iv_of, a, b, n):
 
 
 @triton.jit
-def _child_lanes(tile, B, S, reg, lanes, lane_first, lane_live, TILE: tl.constexpr, COMPACT: tl.constexpr):
-    """A tile of a child's lanes, flattened (sample, slot): ``(lane, in range, live, all dead)``. ``COMPACT``: through
-    the query's pruning permutation of the child's interval (its live lanes first), the first ``lane_live`` live --
-    every tile past them dead; else in order, liveness left to the caller."""
+def _child_lanes(tile, B, S, reg, lanes, lane_first, lane_live, TILE: tl.constexpr, ORDERED: tl.constexpr):
+    """A tile of a child's lanes, flattened (sample, slot): ``(lane, in range, live, all dead)``. ``ORDERED``: through
+    the query's lane order of the child's interval (its live lanes first, :class:`~.live.LaneOrder`), the first
+    ``lane_live`` live -- every tile past them dead; else in order, liveness left to the caller."""
     k = tile * TILE + tl.arange(0, TILE)
     m = k < B * S
-    if COMPACT:
+    if ORDERED:
         nl = tl.load(lane_live + reg)
         return tl.load(lanes + tl.load(lane_first + reg) + k, mask = m, other = 0), m, m & (k < nl), tile * TILE >= nl
     else:
@@ -122,11 +123,38 @@ def _store_flows(ptr, idx, val, m, add):
     tl.store(ptr + idx, val, mask = m)
 
 
+@triton.jit
+def _parent_base(b, ostride, COMPACT: tl.constexpr):
+    """Where samples ``b``'s values start in a parent's row: their block (``ostride`` floats each, 0 for values kept
+    once) when dense; the row's start when ``COMPACT`` (a lane says where, :func:`_parent_lane`)."""
+    if COMPACT:
+        return b * 0
+    else:
+        return b * ostride
+
+
+@triton.jit
+def _parent_lane(sl, b, once, coff, ccount, crank, kp, a, i, e, j, m, B, n, W, COMPACT: tl.constexpr):
+    """Where a parent's value of the pair ``(i at a, j at e)`` of samples ``b`` is from :func:`_parent_base` (its slot
+    ``sl`` in the sample's block; negative: the automaton does not join them): dense, slot ``sl``; ``COMPACT`` (see
+    :mod:`.compact`), the pair's lane in the row of the parent's interval ``kp``, or slot ``sl`` of the one block kept
+    once (``once``), -1 if nowhere."""
+    if COMPACT:
+        ok = (sl >= 0) & (i >= 0) & (j >= 0)
+        lane = _lane(coff, ccount, crank, kp, b, a, i, e, j, m & ok, B, n, W)
+        return tl.where(ok, tl.where(once, sl, lane), -1)
+    else:
+        return sl
+
+
 @triton_jit
-def _copy_top_down_kernel(element_flows, temp_flows, node_flows, iv_of, iv_info, once_iv, children, children_idx, ptr,
-                         parents, reg_offset, reg_width, reg_first, out_first, out_width, temp_width, B, n, pid0,
-                         C_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, INDEXED: tl.constexpr, TILE: tl.constexpr):
-    """One program per child and tile of its ``B * slots`` lanes: the log-sum over its parents' copies."""
+def _copy_top_down_kernel(element_flows, temp_flows, node_flows, iv_of, iv_info, once_iv, coff, children,
+                         children_idx, ptr, parents, reg_offset, reg_width, reg_first, out_first, out_width, temp_width,
+                         B, n, pid0, C_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, COMPACT: tl.constexpr,
+                         INDEXED: tl.constexpr, TILE: tl.constexpr):
+    """One program per child and tile of its lanes (``B * slots``, or ``COMPACT`` its interval's, see
+    :mod:`.compact`): the log-sum over its parents' copies. A copy's child and parents share their interval, so they
+    are kept once together: a per-sample child's parents are per sample, a compact one's lanes theirs."""
     c = _child(children_idx, tl.program_id(0), INDEXED)
     pid = pid0 + tl.program_id(1)
     row = tl.load(children + c * 4 + 0)
@@ -137,11 +165,18 @@ def _copy_top_down_kernel(element_flows, temp_flows, node_flows, iv_of, iv_info,
     t0 = tl.load(parents + p0 * 5 + 3)
     t2 = tl.load(parents + p0 * 5 + 4)
     S, _, _ = _interval(iv_of, iv_info, t0, t2, n)
-    ncols = S * B
+    if COMPACT:
+        k = tl.load(iv_of + t0 * (n + 1) + t2)
+        ncols = tl.load(coff + k.to(tl.int64) * (B + 1) + B).to(tl.int32)
+    else:
+        ncols = S * B
     if pid * TILE < ncols:
         cols = pid * TILE + tl.arange(0, TILE)
         m = cols < ncols
-        ocols = tl.where(_once(once_iv, iv_of, t0, t2, n), cols % S, cols)  # the parents' values kept once?
+        if COMPACT:
+            ocols = cols
+        else:
+            ocols = tl.where(_once(once_iv, iv_of, t0, t2, n), cols % S, cols)  # the parents' values kept once?
         mx = tl.full([TILE], float("-inf"), dtype = tl.float32)
         acc = tl.zeros([TILE], dtype = tl.float32)
         for p in range(p0, p1):
@@ -155,16 +190,19 @@ def _copy_top_down_kernel(element_flows, temp_flows, node_flows, iv_of, iv_info,
 @triton_jit
 def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mars, obs_class, next_col, class_mars,
                                 mass_row, trans, pred_ptr, pred_col, pred_x, width, iv_of, iv_info, iv_table, once_iv,
-                                live, lanes, lane_first, lane_live, children, children_idx, ptr, parents, reg_offset,
-                                reg_width, reg_first, out_first, out_width, temp_width, B, n, W, C, input_start, pid0,
-                                C_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, GROUPED: tl.constexpr,
-                                PRUNE: tl.constexpr, COMPACT: tl.constexpr, C_FULL: tl.constexpr,
+                                live, lanes, lane_first, lane_live, coff, ccount, cstart, ccolumns, crank, children,
+                                children_idx, ptr, parents, reg_offset, reg_width, reg_first, out_first, out_width,
+                                temp_width, B, n, W, C, input_start, csteps, pid0, C_KIND: tl.constexpr,
+                                OUT_TEMP: tl.constexpr, GROUPED: tl.constexpr, PRUNE: tl.constexpr,
+                                ORDERED: tl.constexpr, COMPACT: tl.constexpr, C_FULL: tl.constexpr,
                                 OUT_FULL: tl.constexpr, INDEXED: tl.constexpr, TILE: tl.constexpr):
     """The right operand ``R`` over ``[t + 1, t2)`` of ``input @ block`` steps: ``O_R[q, j] = log sum over the
     parents, and over the entries ``(i, class)`` leading to ``q`` at boundary ``t``, of mass + O_out[i, j]``. One
-    program per child and tile of its lanes, flattened (sample, slot). ``COMPACT`` (a sum child under evidence pruning):
-    the lanes in the query's pruning order, live ones first -- a tile of dead lanes only stores -inf (a first writer)
-    or nothing (a later one), since evidence usually leaves a few live (one per sample through an observed prefix)."""
+    program per child and tile of its lanes, flattened (sample, slot). ``ORDERED`` (a sum child under evidence pruning):
+    the lanes in the query's lane order, live ones first -- a tile of dead lanes only stores -inf (a first writer)
+    or nothing (a later one), since evidence usually leaves a few live (one per sample through an observed prefix).
+    ``COMPACT``: the child's and the parents' values compact (:mod:`.compact`), a lane per pair of live columns, -inf
+    at a pair the automaton does not join."""
     c = _child(children_idx, tl.program_id(0), INDEXED)
     tile = pid0 + tl.program_id(1)
     row = tl.load(children + c * 4 + 0)
@@ -175,21 +213,36 @@ def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
     t = tl.load(parents + p0 * 7 + 2)
     t2 = tl.load(parents + p0 * 7 + 5)
     X = _exit_width(width, t2, n)
-    S, _, pairs = _interval(iv_of, iv_info, t + 1, t2, n)                   # the child's slots
+    S, cpos, pairs = _interval(iv_of, iv_info, t + 1, t2, n)               # the child's slots
     OS, opos, _ = _interval(iv_of, iv_info, t, t2, n)                        # the parents' slots
-    ostride = tl.where(_once(once_iv, iv_of, t, t2, n), 0, OS)              # ... kept once?
+    once = _once(once_iv, iv_of, t, t2, n)                                   # ... kept once?
+    ostride = tl.where(once, 0, OS)
+    kp = tl.load(iv_of + t * (n + 1) + t2)
     cp = _flows_ptr(row, reg, node_flows, temp_flows, reg_offset, reg_width, reg_first, temp_width, C_KIND)
-    idx, m, ml, dead = _child_lanes(tile, B, S, reg, lanes, lane_first, lane_live, TILE, COMPACT)
-    if dead:                                                                 # COMPACT: no live lane in the tile
+    if COMPACT:
+        kc = tl.load(iv_of + (t + 1) * (n + 1) + t2)
+        ncols = tl.load(coff + kc.to(tl.int64) * (B + 1) + B).to(tl.int32)
+        idx = tile * TILE + tl.arange(0, TILE)
+        m = idx < ncols
+        dead = False
+    else:
+        ncols = B * S
+        idx, m, ml, dead = _child_lanes(tile, B, S, reg, lanes, lane_first, lane_live, TILE, ORDERED)
+    if dead:                                                                 # ORDERED: no live lane in the tile
         if add == 0:
             tl.store(cp + idx, tl.full([TILE], float("-inf"), dtype = tl.float32), mask = m)
-    elif tile * TILE < B * S:
-        b = (idx // S).to(tl.int64)
-        v = _pair(iv_table, pairs, idx % S, m, C_FULL)
-        q = v // X
-        j = v % X
-        if not COMPACT:
-            ml = _live_lanes(live, m, b, t + 1, q, t2, j, n, W, PRUNE)
+    elif tile * TILE < ncols:
+        if COMPACT:
+            b, q, j = _lane_ends(coff, ccount, cstart, ccolumns, kc, t + 1, t2, idx, m, B, n, csteps)
+            b = b.to(tl.int64)
+            ml = m & (_slot(iv_table, cpos, q, j, X, m, C_FULL) >= 0)        # a hole: -inf
+        else:
+            b = (idx // S).to(tl.int64)
+            v = _pair(iv_table, pairs, idx % S, m, C_FULL)
+            q = v // X
+            j = v % X
+            if not ORDERED:
+                ml = _live_lanes(live, m, b, t + 1, q, t2, j, n, W, PRUNE)
         oc = tl.load(obs_class + b * n + t, mask = m, other = -1)
         e0 = tl.load(pred_ptr + t * (W + 1) + q, mask = ml, other = 0)
         e1 = tl.load(pred_ptr + t * (W + 1) + q + 1, mask = ml, other = 0)
@@ -199,7 +252,7 @@ def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
             u = tl.load(parents + p * 7 + 1).to(tl.int64)
             own = tl.load(node_mars + u * B + b, mask = m, other = float("-inf"))   # the observed token's log-prob
             op = _out_flows_ptr(tl.load(parents + p * 7 + 0), element_flows, temp_flows, out_first, out_width,
-                                temp_width, OUT_TEMP) + b * ostride
+                                temp_width, OUT_TEMP) + _parent_base(b, ostride, COMPACT)
             if GROUPED:
                 masses = trans + tl.load(parents + p * 7 + 6).to(tl.int64)
             else:
@@ -214,24 +267,28 @@ def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
                     holds = x == oc
                 mass = tl.where(oc >= 0, tl.where(holds, own, float("-inf")),
                                 tl.load(masses + x, mask = em, other = float("-inf")))
-                sl = _slot(iv_table, opos, i, j, X, em, OUT_FULL)
+                sl = _parent_lane(_slot(iv_table, opos, i, j, X, em, OUT_FULL), b, once, coff, ccount, crank, kp, t,
+                                  i, t2, j, em, B, n, W, COMPACT)
                 ov = tl.load(op + sl, mask = em & (sl >= 0), other = float("-inf"))
                 mx, acc = _lse_step_one_exp(mx, acc, mass + ov)
-        _store_flows(cp, idx, _lse_value(mx, acc), m, add)
+        val = _lse_value(mx, acc)
+        if COMPACT:
+            val = tl.where(ml, val, float("-inf"))
+        _store_flows(cp, idx, val, m, add)
 
 
 @triton_jit
 def _block_input_top_down_kernel(element_flows, temp_flows, node_flows, node_mars, obs_class, next_col, class_mars,
                                 mass_row, trans, entry_ptr, entry_succ, entry_x, width, iv_of, iv_info, iv_table,
-                                once_iv, live, lanes, lane_first, lane_live, children, children_idx, ptr, parents,
-                                reg_offset, reg_width, reg_first, out_first, out_width, temp_width, B, n, W, C,
-                                input_start, pid0, C_KIND: tl.constexpr, OUT_TEMP: tl.constexpr,
-                                GROUPED: tl.constexpr, PRUNE: tl.constexpr, COMPACT: tl.constexpr,
-                                C_FULL: tl.constexpr, OUT_FULL: tl.constexpr, INDEXED: tl.constexpr,
-                                TILE: tl.constexpr):
+                                once_iv, live, lanes, lane_first, lane_live, coff, ccount, cstart, ccolumns, crank,
+                                children, children_idx, ptr, parents, reg_offset, reg_width, reg_first, out_first,
+                                out_width, temp_width, B, n, W, C, input_start, csteps, pid0, C_KIND: tl.constexpr,
+                                OUT_TEMP: tl.constexpr, GROUPED: tl.constexpr, PRUNE: tl.constexpr,
+                                ORDERED: tl.constexpr, COMPACT: tl.constexpr, C_FULL: tl.constexpr,
+                                OUT_FULL: tl.constexpr, INDEXED: tl.constexpr, TILE: tl.constexpr):
     """The left operand ``L`` over ``[t0, t)`` of ``block @ input`` steps (output over ``[t0, t + 1)``): ``O_L[i, q] =
     log sum over the parents and over the entries ``(successor, class)`` of ``q`` at boundary ``t`` of mass +
-    O_out[i, successor]``. ``COMPACT``: as :func:`_input_block_top_down_kernel`."""
+    O_out[i, successor]``. ``ORDERED``, ``COMPACT``: as :func:`_input_block_top_down_kernel`."""
     c = _child(children_idx, tl.program_id(0), INDEXED)
     tile = pid0 + tl.program_id(1)
     row = tl.load(children + c * 4 + 0)
@@ -243,22 +300,37 @@ def _block_input_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
     t = tl.load(parents + p0 * 7 + 5)
     M = tl.load(width + t)                                                   # the child's exit columns
     X = _exit_width(width, t + 1, n)                                         # the parents' exit columns
-    S, _, pairs = _interval(iv_of, iv_info, t0, t, n)
+    S, cpos, pairs = _interval(iv_of, iv_info, t0, t, n)
     OS, opos, _ = _interval(iv_of, iv_info, t0, t + 1, n)
-    ostride = tl.where(_once(once_iv, iv_of, t0, t + 1, n), 0, OS)           # the parents' values kept once?
+    once = _once(once_iv, iv_of, t0, t + 1, n)                               # the parents' values kept once?
+    ostride = tl.where(once, 0, OS)
+    kp = tl.load(iv_of + t0 * (n + 1) + t + 1)
     end = t + 1 == n
     cp = _flows_ptr(row, reg, node_flows, temp_flows, reg_offset, reg_width, reg_first, temp_width, C_KIND)
-    idx, m, ml, dead = _child_lanes(tile, B, S, reg, lanes, lane_first, lane_live, TILE, COMPACT)
-    if dead:                                                                 # COMPACT: no live lane in the tile
+    if COMPACT:
+        kc = tl.load(iv_of + t0 * (n + 1) + t)
+        ncols = tl.load(coff + kc.to(tl.int64) * (B + 1) + B).to(tl.int32)
+        idx = tile * TILE + tl.arange(0, TILE)
+        m = idx < ncols
+        dead = False
+    else:
+        ncols = B * S
+        idx, m, ml, dead = _child_lanes(tile, B, S, reg, lanes, lane_first, lane_live, TILE, ORDERED)
+    if dead:                                                                 # ORDERED: no live lane in the tile
         if add == 0:
             tl.store(cp + idx, tl.full([TILE], float("-inf"), dtype = tl.float32), mask = m)
-    elif tile * TILE < B * S:
-        b = (idx // S).to(tl.int64)
-        v = _pair(iv_table, pairs, idx % S, m, C_FULL)
-        i = v // M
-        q = v % M
-        if not COMPACT:
-            ml = _live_lanes(live, m, b, t0, i, t, q, n, W, PRUNE)
+    elif tile * TILE < ncols:
+        if COMPACT:
+            b, i, q = _lane_ends(coff, ccount, cstart, ccolumns, kc, t0, t, idx, m, B, n, csteps)
+            b = b.to(tl.int64)
+            ml = m & (_slot(iv_table, cpos, i, q, M, m, C_FULL) >= 0)        # a hole: -inf
+        else:
+            b = (idx // S).to(tl.int64)
+            v = _pair(iv_table, pairs, idx % S, m, C_FULL)
+            i = v // M
+            q = v % M
+            if not ORDERED:
+                ml = _live_lanes(live, m, b, t0, i, t, q, n, W, PRUNE)
         oc = tl.load(obs_class + b * n + t, mask = m, other = -1)
         mx = tl.full([TILE], float("-inf"), dtype = tl.float32)
         acc = tl.zeros([TILE], dtype = tl.float32)
@@ -266,12 +338,13 @@ def _block_input_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
             u = tl.load(parents + p * 7 + 4).to(tl.int64)
             own = tl.load(node_mars + u * B + b, mask = m, other = float("-inf"))
             op = _out_flows_ptr(tl.load(parents + p * 7 + 0), element_flows, temp_flows, out_first, out_width,
-                                temp_width, OUT_TEMP) + b * ostride
+                                temp_width, OUT_TEMP) + _parent_base(b, ostride, COMPACT)
             # an observed token: its own log-probability, then the output at the column its class leads to
             obs = ml & (oc >= 0)
             s = tl.load(next_col + (t * W + q) * C + oc, mask = obs, other = -1)
             s = tl.where(end & (s >= 0), 0, s)
-            sl = _slot(iv_table, opos, i, s, X, obs, OUT_FULL)
+            sl = _parent_lane(_slot(iv_table, opos, i, s, X, obs, OUT_FULL), b, once, coff, ccount, crank, kp, t0,
+                              i, t + 1, s, obs, B, n, W, COMPACT)
             ov = tl.load(op + sl, mask = obs & (sl >= 0), other = float("-inf"))
             mx, acc = _lse_step_one_exp(mx, acc, tl.where(obs, own + ov, float("-inf")))
             # a missing token: every entry (successor, mass) of q
@@ -287,12 +360,16 @@ def _block_input_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
                     em = miss & (e0 + k < e1)
                     s = tl.load(entry_succ + e0 + k, mask = em, other = -1)
                     s = tl.where(end & (s >= 0), 0, s)
-                    sl = _slot(iv_table, opos, i, s, X, em, OUT_FULL)
+                    sl = _parent_lane(_slot(iv_table, opos, i, s, X, em, OUT_FULL), b, once, coff, ccount, crank,
+                                      kp, t0, i, t + 1, s, em, B, n, W, COMPACT)
                     ov = tl.load(op + sl, mask = em & (sl >= 0), other = float("-inf"))
                     mass = tl.load(masses + tl.load(entry_x + e0 + k, mask = em, other = 0), mask = em,
                                    other = float("-inf"))
                     mx, acc = _lse_step_one_exp(mx, acc, mass + ov)
-        _store_flows(cp, idx, _lse_value(mx, acc), m, add)
+        val = _lse_value(mx, acc)
+        if COMPACT:
+            val = tl.where(ml, val, float("-inf"))
+        _store_flows(cp, idx, val, m, add)
 
 
 @triton.jit
@@ -542,7 +619,7 @@ def _block_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
 
 def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_flows, node_mars, class_mars, obs_class,
                 live, elem_first: int, elem_width: int, B: int, prior: dict, skip, exact: bool, once_iv: torch.Tensor,
-                lanes = None):
+                lanes = None, compact = None):
     """
     The top-down pass of one product layer's stage: every :class:`TopDownLaunch` in ``launches``, each with the plan's
     index list of the children it computes (int32 on the device) or None for every one.
@@ -558,6 +635,9 @@ def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_
         top-down values once, for a batch of one: a parent there is read with sample stride 0
     :param lanes: None, or under evidence pruning the query's :class:`~.live.LaneOrder` ``(perm, reg_first,
         reg_live)``: a sum child's lanes run in that order, its dead ones only set to -inf
+    :param compact: None, or the query's :class:`~.compact.CompactLayout`: the per-sample values (children and
+        parents) are compact -- ``regions``, ``elem_width`` and ``bufs``' width are their rows'; the children are
+        written, and the parents read, a lane per pair of live columns
     """
     temp, temp_width = bufs
     common = dict(reg_offset = regions["offset"], reg_width = regions["width"], reg_first = regions["first"],
@@ -567,33 +647,44 @@ def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_
     prune, live = live is not None, live if live is not None else obs_class
     tt, grouped = prog.trans_top_down, prog.trans_top_down.grouped
     trans = prog.transition_buffer()
+    if compact is not None:
+        cl = compact
+        lists = dict(coff = cl.off, ccount = cl.count, cstart = cl.start, ccolumns = cl.columns, csteps = cl.steps)
+    else:
+        lists = dict(coff = live, ccount = live, cstart = live, ccolumns = live, csteps = 0)
     for la, idx in launches:
         idx = tensor(idx)
         Cn = la.children.size(0) if idx is None else idx.numel()
         indexed = dict(children_idx = la.children if idx is None else idx, INDEXED = idx is not None)
+        lanes_max = compact.lanes(la.host["child_iv"]) if compact is not None else B * la.S_max   # a child's most
         if la.form == "copy":
             c_kind, out_temp = la.kinds
-            tile = _tile(la.S_max * B)
-            for first, size in grid_chunks(host_cdiv(la.S_max * B, tile), 1):
+            tile = _tile(max(lanes_max, 1))
+            for first, size in grid_chunks(host_cdiv(lanes_max, tile), 1):
                 _copy_top_down_kernel[(Cn, size)](
-                    element_flows, temp_flows, node_flows, ivs.of, ivs.info, once_iv, la.children, ptr = la.ptr,
-                    parents = la.parents, B = B, n = n, pid0 = first, C_KIND = c_kind, OUT_TEMP = out_temp,
-                    TILE = tile, num_warps = 4, **indexed, **common)
+                    element_flows, temp_flows, node_flows, ivs.of, ivs.info, once_iv, lists["coff"],
+                    children = la.children, ptr = la.ptr, parents = la.parents, B = B, n = n, pid0 = first,
+                    C_KIND = c_kind, OUT_TEMP = out_temp, COMPACT = compact is not None, TILE = tile, num_warps = 4,
+                    **indexed, **common)
         elif la.form in ("input_block", "block_input"):
             c_kind, out_temp, (c_full, out_full) = la.kinds
-            compact = prune and lanes is not None and c_kind == SUM
-            tile = _flat_tile(B * la.S_max)
+            ordered = prune and lanes is not None and c_kind == SUM and compact is None
+            tile = _flat_tile(max(lanes_max, 1))
             kernel = _input_block_top_down_kernel if la.form == "input_block" else _block_input_top_down_kernel
             tables = (tt.pred_ptr, tt.pred_col, tt.pred_x) if la.form == "input_block" else \
                 (tt.entry_ptr, tt.entry_succ, tt.entry_x)
-            for first, size in grid_chunks(host_cdiv(B * la.S_max, tile), 1):
+            for first, size in grid_chunks(host_cdiv(lanes_max, tile), 1):
                 kernel[(Cn, size)](
                     element_flows, temp_flows, node_flows, node_mars, obs_class, prog.next_col, class_mars,
                     prog.mass_row, trans, *tables, prog.width_t, ivs.of, ivs.info, ivs.table, once_iv, live,
-                    *(lanes if compact else (live, live, live)), la.children, ptr = la.ptr, parents = la.parents,
-                    B = B, n = n, W = W, C = C, input_start = prog.input_start, pid0 = first, C_KIND = c_kind,
-                    OUT_TEMP = out_temp, GROUPED = grouped, PRUNE = prune, COMPACT = compact, C_FULL = c_full,
-                    OUT_FULL = out_full, TILE = tile, num_warps = 4, **indexed, **common)
+                    *(lanes if ordered else (live, live, live)), crank = compact.rank if compact is not None else live,
+                    children = la.children, ptr = la.ptr, parents = la.parents, B = B, n = n, W = W, C = C,
+                    input_start = prog.input_start, pid0 = first, C_KIND = c_kind, OUT_TEMP = out_temp,
+                    GROUPED = grouped, PRUNE = prune, ORDERED = ordered, COMPACT = compact is not None,
+                    C_FULL = c_full, OUT_FULL = out_full, TILE = tile, num_warps = 4, **indexed, **common, **lists)
+        elif compact is not None:
+            raise NotImplementedError("Compact storage of the top-down values is not supported by block @ block "
+                                      "products yet: use storage = \"dense\".")
         else:
             c_kind, o_kind, out_temp = la.kinds
             side_l = la.side == "L"

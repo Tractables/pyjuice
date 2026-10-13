@@ -21,6 +21,7 @@ import torch
 
 from . import forward as F
 from ..kernels.common import pack_aligned
+from ..kernels.compact import STORAGES, compact_layout
 from ..kernels.live import liveness
 from ..kernels.score import score_group, score_tables
 from .plans import PLANS_PER_POSITION, PLAN_CACHE_SIZE, per_sample_intervals, prior_regions, query_plan, top_down_prior
@@ -77,9 +78,11 @@ def _layout(backend, positions: np.ndarray, B: int):
     return groups, base, K, size
 
 
-def _check(backend, data: torch.Tensor, precision: str):
+def _check(backend, data: torch.Tensor, precision: str, storage: str = "dense"):
     if precision not in F.PRECISIONS:
         raise ValueError(f"`precision` must be one of {sorted(F.PRECISIONS)}, got {precision!r}.")
+    if storage not in STORAGES:
+        raise ValueError(f"`storage` must be one of {list(STORAGES)}, got {storage!r}.")
     if backend.device.type != "cuda":
         raise NotImplementedError(f"The dfa_exact backend runs on CUDA only, but the constrained circuit is on "
                                   f"{backend.device}. Move it with `cc.to('cuda')`.")
@@ -89,7 +92,7 @@ def _check(backend, data: torch.Tensor, precision: str):
 
 def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions: np.ndarray, precision: str = "fp32",
                   held: Optional[dict] = None, observed: Optional[np.ndarray] = None, layout = None,
-                  report: Optional[dict] = None):
+                  report: Optional[dict] = None, storage: str = "dense"):
     """
     The forward and top-down passes of a conditional query: the log class weights of every input node over the
     target ``positions`` (bool [n], host), every sample's, summed per row of the class masses (see
@@ -103,6 +106,7 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     :param layout: None, or ``(groups, size, (base, K))``: :func:`_layout`'s groups and size, and its ``base`` and
         ``K`` already on the device (int64 [n] each) -- copied before the query launches anything, as copies from the
         host wait for the stream
+    :param storage: see :func:`conditional`
     :returns: ``(groups, class_mars)``: per row group with a target position, ``(group, its target positions (host),
         weights [positions x B, classes, rows of the group])`` (sample ``b`` of the ``p``-th position: column ``p * B +
         b``), and the class masses the query read
@@ -118,18 +122,22 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
         observed = (~missing).any(dim = 0).cpu().numpy()
     x = torch.where(missing, 0, data.to(dev).long())                          # missing tokens: any valid id
     bufs = backend.state.buffers(B)
-    flows = backend.state.flows(B, bufs)
     held = held or {}
     obs_class = torch.where(missing, -1, backend.token_classes.token_class[x]).contiguous()
-    lv = liveness(prog, obs_class, B) if observed.any() else None
+    # compact, a query needs its liveness even with nothing observed: every column is live, but only the regions it
+    # computes per sample get rows (none, every value input-independent, inside fast_inference)
+    lv = liveness(prog, obs_class, B) if observed.any() or storage == "compact" else None
     valid, kept = backend.state.prior_validity()
     prior = prior_regions(prog, observed, B, kept, lv)
     pf = backend.state.prior_flows(np.zeros(len(backend.sum_regions), dtype = bool))
     top = dict(program = td, once = top_down_prior(prog, td, observed, B, kept, lv), valid = pf["valid"].copy(),
                held = held.get("top_down"), scoring = True)
     plan = query_plan(prog, observed, positions, valid.numpy(), prior, held = held.get("inside"), top_down = top)
+    compact = storage == "compact"
     if lv is not None:
-        lv.order(per_sample_intervals(prog, plan))
+        lv.order(per_sample_intervals(prog, plan, top_down = not compact))
+    compact = compact_layout(backend, lv, plan.top_down.per_sample) if compact else None
+    flows = backend.state.flows(B, bufs, compact)
     if report is not None:
         report.update(plan = plan, liveness = lv)
     class_mars = F.run_forward(backend, bufs, plan, x, missing, obs_class, lv, precision)
@@ -140,14 +148,15 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     buf.fill_(-float("inf"))
     cw = dict(buf = buf, base = base, K = K)
     run_backward(backend, bufs, flows, plan, x, missing, obs_class, lv, precision, class_weights = cw,
-                 class_mars = class_mars)
+                 class_mars = class_mars, compact = compact)
     return [(g, pos, buf[s:s + len(pos) * B * C * len(score.rows[g])].view(len(pos) * B, C, len(score.rows[g])))
             for g, pos, s in groups], class_mars
 
 
 def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None,
                 targets: Optional[torch.Tensor] = None, precision: str = "fp32", return_log_marginal: bool = False,
-                held: Optional[dict] = None, candidates: Optional[torch.Tensor] = None, report: Optional[dict] = None):
+                held: Optional[dict] = None, candidates: Optional[torch.Tensor] = None, report: Optional[dict] = None,
+                storage: str = "dense"):
     """
     ``log p(x_t = v | e, C)`` for every target ``(b, t)`` and token ``v`` (or candidate ``v``): one row per target, in
     the order ``dense[targets]`` lists them (sample by sample, positions in order); -inf rows where ``p(e, C) = 0``.
@@ -166,9 +175,13 @@ def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor
         pad, and get -inf
     :param report: None, or a dict where the query leaves its :class:`~.plans.QueryPlan` and
         :class:`~..kernels.live.Liveness` (see :func:`class_weights`; neither when it computes nothing)
+    :param storage: "dense" (the default) or "compact": how the query keeps its per-sample top-down values -- every
+        lane of every block, or only the pairs of each sample's live columns, and only of the regions the query needs
+        per sample (see :mod:`~..kernels.compact`). Compact takes far less memory when the evidence leaves few live
+        columns, and skips the dead lanes' writes
     :returns: [rows, V], or [rows, k] with ``candidates``
     """
-    _check(backend, data, precision)
+    _check(backend, data, precision, storage)
     n, dev = backend.n, backend.device
     B = data.size(0)
     miss, tgt = _masks(missing_mask, targets, B, n)                          # on the host: the query's one wait
@@ -198,7 +211,8 @@ def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor
     with torch.no_grad():
         layout = (groups, size, (tables[starts[0]:starts[0] + n], tables[starts[1]:starts[1] + n]))
         groups, class_mars = class_weights(backend, data, missing, positions, precision, held,
-                                           observed = (~miss).any(axis = 0), layout = layout, report = report)
+                                           observed = (~miss).any(axis = 0), layout = layout, report = report,
+                                           storage = storage)
         out = torch.empty(M, width, device = dev)
         log_marginal = torch.empty(M + 1, device = dev) if return_log_marginal else None
         for (g, pos, w), start in zip(groups, starts[2:]):

@@ -200,10 +200,12 @@ def _live_order_kernel(tile_live, counts, perm, rank, reg_live, iv_regs, iv_reg_
 
 
 @triton_jit
-def _row_lists_kernel(live, count, start, columns, width, S, n, W, NP: tl.constexpr, TILE: tl.constexpr):
+def _row_lists_kernel(live, count, start, columns, rank, width, S, n, W, NP: tl.constexpr, RANK: tl.constexpr,
+                      TILE: tl.constexpr):
     """One program per (sample, boundary) row of ``live``: its live columns (below the boundary's width, the columns
     past it being unwritten), ascending, at ``columns[start[row]]`` on -- where the row's columns would be were every
-    one live (``S``: a sample's columns over all boundaries) --, and how many."""
+    one live (``S``: a sample's columns over all boundaries) --, and how many; ``RANK``: every column's place among
+    them in ``rank`` (laid out as ``live``), -1 if dead."""
     row = tl.program_id(0).to(tl.int64)
     t = row % (n + 1)
     tt = tl.arange(0, NP)
@@ -214,7 +216,10 @@ def _row_lists_kernel(live, count, start, columns, width, S, n, W, NP: tl.conste
     for c0 in range(0, w, TILE):
         c = c0 + tl.arange(0, TILE)
         v = (tl.load(live + row * W + c, mask = c < w, other = 0) != 0).to(tl.int32)
-        tl.store(columns + base + total + tl.cumsum(v, axis = 0) - v, c, mask = v != 0)
+        r = total + tl.cumsum(v, axis = 0) - v
+        tl.store(columns + base + r, c, mask = v != 0)
+        if RANK:
+            tl.store(rank + row * W + c, tl.where(v != 0, r, -1), mask = c < w)
         total += tl.sum(v, axis = 0)
     tl.store(count + row, total)
     tl.store(start + row, base)
@@ -288,23 +293,36 @@ class Liveness:
     live: torch.Tensor
     lanes: Optional[LaneOrder] = None
     _lists: Optional[tuple] = None
+    _rank: Optional[torch.Tensor] = None
     _all: Optional[LaneOrder] = None                # every interval's order, when the live counts were asked for
 
-    def lists(self):
+    def lists(self, rank: bool = False):
         """``(count, start, columns)``: every (sample, boundary) row's live columns, ascending -- ``count[row]`` (int32
         [B * (n + 1)]) of them from ``columns[start[row]]`` (int64 start, int32 columns) on, ``row`` being
         ``b * (n + 1) + t`` --, built on first use, one launch. ``columns`` has room for every column live (4 bytes per
-        sample and column: at most 4x ``live``), so no row waits for another's count."""
-        if self._lists is None:
+        sample and column: at most 4x ``live``), so no row waits for another's count. ``rank``: also :attr:`rank`, in
+        the same launch (or one more, when the lists were built without it)."""
+        if self._lists is None or (rank and self._rank is None):
             prog, B, n = self.prog, self.B, self.prog.n
             rows, S = B * (n + 1), sum(prog.width[:n]) + 1
             count = torch.empty(rows, dtype = torch.int32, device = prog.dev)
             start = torch.empty(rows, dtype = torch.int64, device = prog.dev)
             columns = torch.empty(B * S, dtype = torch.int32, device = prog.dev)
-            _row_lists_kernel[(rows,)](self.live, count, start, columns, prog.width_t, S, n, prog.next_col.size(1),
-                                       NP = host_next_power_of_2(n + 1), TILE = ROW_TILE, num_warps = 4)
+            ranks = torch.empty(self.live.shape, dtype = torch.int32, device = prog.dev) if rank else count
+            _row_lists_kernel[(rows,)](self.live, count, start, columns, ranks, prog.width_t, S, n,
+                                       prog.next_col.size(1), NP = host_next_power_of_2(n + 1), RANK = rank,
+                                       TILE = ROW_TILE, num_warps = 4)
             self._lists = (count, start, columns)
+            if rank:
+                self._rank = ranks
         return self._lists
+
+    @property
+    def rank(self) -> torch.Tensor:
+        """int32 [B, n + 1, W], laid out as :attr:`live`: every column's place among its row's live columns
+        (:meth:`lists`), -1 if dead (columns past a boundary's width unwritten), built with the lists on first use."""
+        self.lists(rank = True)
+        return self._rank
 
     @property
     def num_live(self) -> List[int]:

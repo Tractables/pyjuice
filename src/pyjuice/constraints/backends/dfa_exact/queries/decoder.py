@@ -60,6 +60,12 @@ class _Kept:
     liveness: Optional[Liveness]
 
 
+def _dense_only(storage: str):
+    if storage != "dense":
+        raise NotImplementedError(f"A decoder keeps its values dense: `storage` {storage!r} is not supported by "
+                                  f"decoders yet.")
+
+
 class DFAExactDecoder(Decoder):
     """
     A :class:`~pyjuice.constraints.decoder.Decoder` over a constrained circuit with the dfa_exact backend
@@ -79,7 +85,9 @@ class DFAExactDecoder(Decoder):
         self._kept, self._layouts = None, {}
         return super().__exit__(*exc)
 
-    def _marginal(self, data: torch.Tensor, missing: torch.Tensor, precision: str = "fp32") -> torch.Tensor:
+    def _marginal(self, data: torch.Tensor, missing: torch.Tensor, precision: str = "fp32",
+                  storage: str = "dense") -> torch.Tensor:
+        _dense_only(storage)
         be = self.cc.backend
         held, keep = self._reuse(data, missing, None, precision, marginal = True)
         report = {}
@@ -88,7 +96,9 @@ class DFAExactDecoder(Decoder):
         return out
 
     def _conditional(self, data: torch.Tensor, missing: torch.Tensor, targets: Optional[torch.Tensor],
-                     return_log_marginal: bool, candidates: Optional[torch.Tensor], precision: str = "fp32"):
+                     return_log_marginal: bool, candidates: Optional[torch.Tensor], precision: str = "fp32",
+                     storage: str = "dense"):
+        _dense_only(storage)
         be = self.cc.backend
         held, keep = self._reuse(data, missing, targets, precision, marginal = False)
         report = {}

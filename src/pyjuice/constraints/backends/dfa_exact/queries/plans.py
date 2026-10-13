@@ -212,13 +212,14 @@ def query_plan(prog, observed: np.ndarray, targets: Optional[np.ndarray], valid:
     return plan
 
 
-def per_sample_intervals(prog, plan: QueryPlan) -> np.ndarray:
+def per_sample_intervals(prog, plan: QueryPlan, top_down: bool = True) -> np.ndarray:
     """bool [sum intervals]: those whose columns the query's kernels walk in lane order
     (:meth:`~..kernels.live.Liveness.order`): the inside values ``plan`` computes per sample
     (:attr:`QueryPlan.sample`), and the top-down values it needs per sample (:attr:`TopDownPlan.per_sample` -- held ones
-    included: a sum launch gives its products their values from them)."""
+    included: a sum launch gives its products their values from them), unless ``top_down`` is False (they are compact,
+    see :mod:`..kernels.compact`, and walked in their own order)."""
     out = plan.sample.copy()
-    if plan.top_down is not None:
+    if plan.top_down is not None and top_down:
         out[prog.reg_iv_np[plan.top_down.per_sample]] = True
     return out
 

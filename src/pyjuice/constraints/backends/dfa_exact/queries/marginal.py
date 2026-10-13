@@ -10,6 +10,7 @@ from typing import Optional
 import numpy as np
 import torch
 
+from ..kernels.compact import STORAGES
 from ..kernels.live import liveness
 from .forward import PRECISIONS, missing_tensor, run_forward
 from .plans import per_sample_intervals, prior_regions, query_plan
@@ -17,7 +18,7 @@ from .plans import per_sample_intervals, prior_regions, query_plan
 
 
 def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None, precision: str = "fp32",
-             held: Optional[np.ndarray] = None, report: Optional[dict] = None):
+             held: Optional[np.ndarray] = None, report: Optional[dict] = None, storage: str = "dense"):
     """
     ``log p(C, e)`` for every sample: the probability that the PC generates a string that satisfies the
     constraint and agrees with the observed tokens.
@@ -29,10 +30,14 @@ def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] =
         decoder decides (see :mod:`.plans`)
     :param report: None, or a dict where the query leaves its :class:`~.plans.QueryPlan` (``"plan"``) and its
         :class:`~..kernels.live.Liveness` (``"liveness"``; None when it observes nothing)
+    :param storage: "dense" or "compact": how a query keeps its per-sample top-down values (see
+        :func:`~.conditional.conditional`); a marginal has none, and keeps its inside values dense either way
     :returns: [B, number of root nodes], as :func:`pyjuice.queries.marginal`
     """
     if precision not in PRECISIONS:
         raise ValueError(f"`precision` must be one of {sorted(PRECISIONS)}, got {precision!r}.")
+    if storage not in STORAGES:
+        raise ValueError(f"`storage` must be one of {list(STORAGES)}, got {storage!r}.")
     pc, n, dev = backend.pc, backend.n, backend.device
     if dev.type != "cuda":
         raise NotImplementedError(f"The dfa_exact backend runs on CUDA only, but the constrained circuit is on {dev}. "

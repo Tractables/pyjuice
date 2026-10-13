@@ -18,6 +18,7 @@ import pyjuice as juice
 import pyjuice.constraints as jc
 from pyjuice.constraints.backends.dfa_exact.queries import forward as F
 from pyjuice.constraints.backends.dfa_exact.queries.top_down import run_backward
+from pyjuice.constraints.backends.dfa_exact.kernels.compact import compact_layout
 from pyjuice.constraints.backends.dfa_exact.kernels.live import liveness
 from pyjuice.constraints.backends.dfa_exact.queries.plans import (per_sample_intervals, prior_regions, query_plan,
                                                                   top_down_prior)
@@ -26,6 +27,7 @@ V = 3
 KINDS = {"hmm": 6, "hmm_untied": 6, "hmm_block_sparse": 6, "left_linear": 6, "pd": 8, "pd_prod_dominated": 8,
          "pd_blockified": 8, "hand": 5, "hand_permuted": 5, "hand_unit": 4, "hand_left": 5,
          "hand_shared": 4, "hand_fold": 4}                                                      # see conftest.py
+COMPACT_KINDS = ["hmm", "hmm_untied", "hmm_block_sparse", "left_linear", "hand_left"]   # no block @ block product
 PATTERNS = ["none", "all", "prefix", "suffix", "scattered", "mixed"]
 # keep nothing once; as a query decides; every input-independent value (fast_inference); every input-independent
 # top-down value and no inside value (so the inside values its launches for a batch of one read must be kept once)
@@ -65,13 +67,14 @@ def sum_path(request, monkeypatch):
 
 
 def top_down_blocks(cc, data, missing, targets = None, policy = "default", held = None, nan_fill = True,
-                    visit = None):
+                    visit = None, storage = "dense"):
     """
     The forward then the top-down pass of a query under its plan (``policy``: see ``POLICIES``; "kept" runs inside
     :func:`pyjuice.fast_inference`), node_flows filled with NaN first (``nan_fill``): ``(blocks, plan)``, ``blocks``
     every sum region's rows of the buffer its values are in -- [rows, B * slots], those kept once repeated per sample
     (cloned). ``visit(prod_index, bufs, flows, plan)``: see :func:`~pyjuice.constraints.backends.dfa_exact.backward.
-    run_backward`.
+    run_backward`. ``storage = "compact"``: the per-sample values compact, expanded to [rows, B * slots] (-inf off the
+    lanes; every lane written, -inf at a pair the automaton does not join).
     """
     with juice.fast_inference() if policy == "kept" else contextlib.nullcontext():
         prog, td, dev = cc.backend.program(), cc.backend.top_down_program(), cc.pc.params.device
@@ -80,7 +83,7 @@ def top_down_blocks(cc, data, missing, targets = None, policy = "default", held 
         observed = (~missing).any(dim = 0).cpu().numpy()
         x = torch.where(missing, 0, data.to(dev).long())
         obs_class = torch.where(missing, -1, cc.backend.token_classes.token_class[x]).contiguous()
-        lv = liveness(prog, obs_class, B) if observed.any() else None
+        lv = liveness(prog, obs_class, B) if observed.any() or storage == "compact" else None
         valid, kept = cc.backend.state.prior_validity()
         if policy in ("sample", "top_down"):
             prior = np.zeros(prog.iv_bounds.shape[0], dtype = bool)
@@ -92,27 +95,61 @@ def top_down_blocks(cc, data, missing, targets = None, policy = "default", held 
         pf = cc.backend.state.prior_flows(np.zeros(len(cc.backend.sum_regions), dtype = bool))
         plan = query_plan(prog, observed, None if targets is None else targets.cpu().numpy(), valid.numpy(), prior,
                           top_down = dict(program = td, once = once, valid = pf["valid"].copy(), held = held))
+        compact = storage == "compact"
         if lv is not None:
-            lv.order(per_sample_intervals(prog, plan))
+            lv.order(per_sample_intervals(prog, plan, top_down = not compact))
         bufs = cc.backend.state.buffers(B)
-        flows = cc.backend.state.flows(B, bufs)
+        cl = compact_layout(cc.backend, lv, plan.top_down.per_sample) if compact else None
+        flows = cc.backend.state.flows(B, bufs, cl)
         if nan_fill:
             flows["node_flows"].fill_(float("nan"))         # every needed slot must be written
         with torch.no_grad():
             F.run_forward(cc.backend, bufs, plan, x, missing, obs_class, lv, "fp32")
             valid |= plan.todo
             run_backward(cc.backend, bufs, flows, plan, x, missing, obs_class, lv, "fp32",
-                         visit = None if visit is None else lambda pi: visit(pi, bufs, flows, plan))
+                         visit = None if visit is None else lambda pi: visit(pi, bufs, flows, plan), compact = cl)
         lay, nf, pf = bufs["layout"], flows["node_flows"], cc.backend.state._prior_flows_state
         out = []
         for r, (first, end, slots) in enumerate(cc.backend.sum_regions):
             if plan.top_down.once[r]:
                 o, w = pf["offset"][r], pf["width"][r]
                 out.append(pf["flows"][o:o + (end - first) * w].view(end - first, w)[:, :slots].repeat(1, B).clone())
+            elif cl is not None:
+                out.append(expand(cc, cl, nf, r) if plan.top_down.per_sample[r] else
+                           torch.full((end - first, B * slots), float("nan"), device = dev))
             else:
                 off, wid = lay["sum_offsets"][r], lay["sum_widths"][r]
                 out.append(nf[off:off + (end - first) * wid].view(end - first, wid)[:, :B * slots].clone())
         return out, plan
+
+
+def expand(cc, cl, nf, r):
+    """Sum region ``r``'s compact rows in ``nf`` (``cl``: the query's CompactLayout) as [rows, B * slots]: every
+    sample's lanes at their pairs' slots, -inf at the slots without a lane; every lane written, -inf where its pair is
+    not joined."""
+    prog, n, B = cc.backend.program(), cc.n, cl.B
+    first, end, slots = cc.backend.sum_regions[r]
+    a, e = prog.sum_ivs[prog.reg_iv_host[r]]
+    k, rows, width = int(prog.reg_iv_all[r]), end - first, cl.width[r]
+    block = nf[cl.offset[r]:cl.offset[r] + rows * width].view(rows, width)
+    lanes = int(cl.total[k])
+    assert not torch.isnan(block[:, :lanes]).any(), r
+    pos = cc.backend.layout.reachability.positions(a, e)
+    X = 1 if e == n else int(cc.backend.layout.width[e])
+    count, start, columns = cl.count.cpu().view(B, n + 1), cl.start.cpu().view(B, n + 1), cl.columns.cpu()
+    off = cl.off[k].cpu()
+    out = torch.full((rows, B * slots), -float("inf"), device = block.device)
+    for b in range(B):
+        ca, ce = int(count[b, a]), int(count[b, e])
+        ia = columns[int(start[b, a]):int(start[b, a]) + ca].long()
+        je = columns[int(start[b, e]):int(start[b, e]) + ce].long()
+        i, j = ia[:, None].expand(ca, ce).flatten(), je[None, :].expand(ca, ce).flatten()
+        slot = i * X + j if pos is None else pos.cpu()[i, j].long()
+        lane = int(off[b]) + torch.arange(ca * ce)
+        joined = slot >= 0
+        assert torch.isneginf(block[:, lane[~joined].to(block.device)]).all(), (r, b)
+        out[:, (b * slots + slot[joined]).to(block.device)] = block[:, lane[joined].to(block.device)]
+    return out
 
 
 def needed_regions(cc, targets):
@@ -392,3 +429,71 @@ def test_values_kept_once_read_their_inside_values_once(policy, build_pc, refere
     got, plan = top_down_blocks(cc, data, missing, policy = policy)
     assert plan.top_down.once.any()
     assert_top_down_close(cc, got, reference.top_down(cc, data, missing), data, missing)
+
+
+def live_columns_of(cc, got, data, missing):
+    """Every sum region's blocks (:func:`top_down_blocks`) on their live slots only."""
+    prog, B, dev = cc.backend.program(), data.size(0), cc.pc.params.device
+    x = torch.where(missing, 0, data).to(dev)
+    obs_class = torch.where(missing.to(dev), -1, cc.backend.token_classes.token_class[x]).contiguous()
+    lv = liveness(prog, obs_class, B)
+    return [g[:, live_slots(cc, lv.live, *prog.sum_ivs[prog.reg_iv_host[r]], B).to(dev)] for r, g in enumerate(got)]
+
+
+@pytest.mark.parametrize("pattern", ["none", "prefix", "suffix", "scattered", "mixed"])
+@pytest.mark.parametrize("name", list(CONSTRAINTS))
+@pytest.mark.parametrize("kind", COMPACT_KINDS)
+def test_compact_top_down_values_match_the_reference(kind, name, pattern, sum_path, build_pc, reference):
+    """Kept compact (``storage = "compact"``, see kernels/compact.py): every lane written, the reference's values on
+    the live slots, and the dense storage's -- bit for bit through the fused sums, which compute each lane alone."""
+    n = KINDS[kind]
+    cc = jc.compile(CONSTRAINTS[name](), build_pc(kind, n, V))
+    data, missing = evidence(pattern, n)
+    got = top_down_blocks(cc, data, missing, storage = "compact")[0]
+    assert_top_down_close(cc, got, reference.top_down(cc, data, missing), data, missing)
+    dense = top_down_blocks(cc, data, missing)[0]
+    for r, (g, d) in enumerate(zip(live_columns_of(cc, got, data, missing), live_columns_of(cc, dense, data, missing))):
+        if sum_path == "fused":
+            assert torch.equal(g, d), r
+        else:
+            assert torch.equal(torch.isneginf(g), torch.isneginf(d)), r
+
+
+@pytest.mark.parametrize("pattern", ["none", "prefix", "mixed"])
+@pytest.mark.parametrize("policy", POLICIES)
+@pytest.mark.parametrize("kind", COMPACT_KINDS)
+def test_compact_values_under_every_policy(kind, policy, pattern, build_pc, reference):
+    """Compact per-sample values next to values kept once (read from and written to a batch of one's blocks, in rows
+    as wide as both need): the reference's. Nothing observed, every value input-independent: inside fast_inference
+    ("kept") no region has per-sample values, and node_flows no row."""
+    n = KINDS[kind]
+    cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
+    data, missing = evidence(pattern, n)
+    got, plan = top_down_blocks(cc, data, missing, policy = policy, storage = "compact")
+    assert_top_down_close(cc, got, reference.top_down(cc, data, missing), data, missing)
+    if policy == "kept" and pattern == "none":
+        assert not plan.top_down.per_sample.any()
+
+
+@pytest.mark.parametrize("kind", COMPACT_KINDS)
+def test_compact_values_of_targets_only(kind, build_pc, reference):
+    """Compact, a query computes the values its targets need and leaves the others alone (no rows at all)."""
+    n = KINDS[kind]
+    cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
+    data, missing = evidence("mixed", n)
+    targets = torch.zeros(n, dtype = torch.bool)
+    targets[n // 2] = True
+    got, plan = top_down_blocks(cc, data, missing, targets = targets, policy = "sample", storage = "compact")
+    need = needed_regions(cc, targets.numpy())
+    assert not (plan.top_down.sample & ~need).any()
+    assert_top_down_close(cc, got, reference.top_down(cc, data, missing), data, missing, regions = need)
+
+
+@pytest.mark.parametrize("kind", ["pd", "hand"])
+def test_compact_storage_refuses_block_block_products(kind, build_pc):
+    """Block @ block products do not keep compact values yet: a clear error, not wrong values."""
+    n = KINDS[kind]
+    cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
+    data, missing = evidence("prefix", n)
+    with pytest.raises(NotImplementedError, match = "block @ block"):
+        top_down_blocks(cc, data, missing, storage = "compact")

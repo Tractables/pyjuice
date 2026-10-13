@@ -74,6 +74,7 @@ class Program:
         firsts = [first for first, _, _ in backend.sum_regions]
         self.firsts = firsts
         self.slots = [slots for _, _, slots in backend.sum_regions]
+        self.reg_rows = np.asarray([end - first for first, end, _ in backend.sum_regions], dtype = np.int64)
         self.reg_first = torch.tensor(firsts, dtype = torch.long, device = dev)
         self.reg_slots = torch.tensor([slots for _, _, slots in backend.sum_regions], dtype = torch.long, device = dev)
         slots_of_reg = [slots for _, _, slots in backend.sum_regions]
@@ -177,8 +178,21 @@ class Program:
                         if fused is not None:
                             parts[pi] = (dense, E, _split_aliased(fused, alias_row, alias_reg, first, dev))
 
-        # where every interval a product reads or writes keeps its slots
-        self.intervals = interval_tables(self.reach, sorted(_intervals(self.steps) | set(self.sum_ivs)), dev)
+        # where every interval a product reads or writes keeps its slots; the intervals themselves (host, and their
+        # ends on the device), and per product layer group the intervals of its products, for compact storage (see
+        # :mod:`..kernels.compact`)
+        self.all_ivs = sorted(_intervals(self.steps) | set(self.sum_ivs))
+        self.intervals = interval_tables(self.reach, self.all_ivs, dev)
+        self.iv_index = {iv: k for k, iv in enumerate(self.all_ivs)}
+        self.iv_ends = torch.tensor(self.all_ivs, dtype = torch.int32).reshape(-1, 2).to(dev)
+        self.reg_iv_all = np.asarray([self.iv_index[self.sum_ivs[k]] for k in self.reg_iv_host], dtype = np.int64)
+        self.elem_ivs = {}
+        for kind, prod_index, layers in self.steps:
+            if kind == "prod":
+                ivs = {int(k) for stages, _, _ in layers for launches in stages for *_, iv, _ in launches
+                       for k in iv.unique().tolist()}
+                self.elem_ivs[prod_index] = np.asarray(sorted(self.iv_index[self.sum_ivs[k]] for k in ivs),
+                                                       dtype = np.int64)
 
         # which (output tile, shared chunk) pairs every block @ block step can skip: one mask per boundary triple,
         # each step's launch carrying its triple's index

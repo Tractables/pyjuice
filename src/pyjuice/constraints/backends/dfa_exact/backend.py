@@ -229,28 +229,33 @@ class DFAExactBackend(Backend):
     # ---------------------------------------------------------------------------------------------
 
     def marginal(self, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None,
-                 precision: str = "fp32") -> torch.Tensor:
+                 precision: str = "fp32", storage: str = "dense") -> torch.Tensor:
         """
         ``log p(C, e)`` for every sample (see :meth:`~pyjuice.constraints.ConstrainedCircuit.marginal`).
 
         :param precision: "fp32" (the default; fp32-level accuracy) or "tf32" for the sum layers' matrix products
+        :param storage: "dense" (the default) or "compact" (see :meth:`conditional`; a marginal keeps no top-down
+            value, so it is the same either way)
         """
         from .queries.marginal import marginal
-        return marginal(self, data, missing_mask, precision = precision)
+        return marginal(self, data, missing_mask, precision = precision, storage = storage)
 
     def conditional(self, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None,
                     targets: Optional[torch.Tensor] = None, return_log_marginal: bool = False,
-                    candidates: Optional[torch.Tensor] = None, precision: str = "fp32"):
+                    candidates: Optional[torch.Tensor] = None, precision: str = "fp32", storage: str = "dense"):
         """
         ``log p(x_t = v | e, C)`` for every target, of every token or of the ``candidates`` (see
         :meth:`~pyjuice.constraints.ConstrainedCircuit.conditional`).
 
         :param precision: "fp32" (the default; fp32-level accuracy) or "tf32" for the matrix products; inside
             ``pyjuice.fast_inference(allow_bf16_params = True)`` the token probabilities are scored in bfloat16
+        :param storage: "dense" (the default) or "compact": keep the per-sample top-down values of every pair of
+            automaton states, or under evidence only of each sample's live ones (far less memory when the evidence
+            pins the automaton down, as a decoded prefix does; not yet with block @ block products, as in PD circuits)
         """
         from .queries.conditional import conditional
         return conditional(self, data, missing_mask, targets, precision = precision,
-                           return_log_marginal = return_log_marginal, candidates = candidates)
+                           return_log_marginal = return_log_marginal, candidates = candidates, storage = storage)
 
     def decoder(self, cc, **options):
         """A decoding session over ``cc`` whose queries reuse what the previous one computed where the evidence did
