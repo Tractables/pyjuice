@@ -251,8 +251,7 @@ class DFAExactBackend(Backend):
             ``pyjuice.fast_inference(allow_bf16_params = True)`` the token probabilities are scored in bfloat16
         :param storage: "dense" (the default) or "compact": keep the per-sample values of every pair of automaton
             states, or under evidence only of each sample's live ones (far less memory when the evidence pins the
-            automaton down, as a decoded prefix does; the inside values not yet with block @ block products, as in PD
-            circuits)
+            automaton down, as a decoded prefix does)
         """
         from .queries.conditional import conditional
         return conditional(self, data, missing_mask, targets, precision = precision,

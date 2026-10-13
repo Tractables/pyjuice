@@ -192,8 +192,7 @@ def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor
         none when it computes nothing)
     :param storage: "dense" (the default) or "compact": how the query keeps its per-sample values -- every lane of
         every block, or only the pairs of each sample's live columns, and only of the regions the query needs per
-        sample (see :mod:`~..kernels.compact`; its inside values not yet with ``block @ block`` products, see
-        :func:`~..kernels.compact.inside_compact`) -- and, compact, no per-sample inside value at all where it computes
+        sample (see :mod:`~..kernels.compact`) -- and, compact, no per-sample inside value at all where it computes
         and holds none (a prefix's next token on an HMM: every per-sample scope holds the prefix's last position).
         Compact takes far less memory when the evidence leaves few live columns, and skips the dead lanes' work
     :param carry: compact, the top-down values ``held["top_down"]`` marks are in ``node_flows`` as a previous query

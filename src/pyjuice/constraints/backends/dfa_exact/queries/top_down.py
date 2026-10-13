@@ -171,7 +171,7 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
                         run_top_down(sample_launches, (temp, temp_width), prog, fregions, element_flows, temp_flows,
                                      node_flows, node_mars, class_mars, obs_class, live, elem_first, ew, B, srcs,
                                      out.skip, exact, td.once_iv, lanes = lanes, compact = compact, tflow_width = tw,
-                                     inside_regions = regions)
+                                     inside_regions = regions, inside = mars is not None)
                     if cw_launches and class_weights is not None:
                         run_class_weights(cw_launches, class_weights, prog, (temp, temp_width), element_flows,
                                           temp_flows, node_mars, liveness, elem_first, ew, B, srcs, td.once_iv,

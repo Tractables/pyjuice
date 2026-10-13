@@ -12,9 +12,8 @@ a HOLE, both ends live but no path between them inside the interval -- holds -in
 The per-sample top-down values are compact: ``node_flows``, the products' in ``element_flows`` and the folds' in the
 scratch rows. So are the per-sample inside values (:attr:`CompactLayout.mars`): the sums' in ``node_mars`` (whose
 input rows stay as they are, a value per sample), the products' in ``element_mars`` and the folds' in the scratch rows
--- but not yet where a ``block @ block`` product reads them (:func:`inside_compact`). The values kept once stay dense
-(a batch of one, in ``prior_mars`` and ``prior_flows``); a row that may hold either (a product's, a fold's) is as wide
-as both need.
+(but a decoder's, see :func:`inside_compact`). The values kept once stay dense (a batch of one, in ``prior_mars`` and
+``prior_flows``); a row that may hold either (a product's, a fold's) is as wide as both need.
 """
 
 from __future__ import annotations
@@ -38,10 +37,9 @@ STORAGES = ("dense", "compact")
 
 
 def inside_compact(prog, storage: str, held: Optional[np.ndarray]) -> bool:
-    """Whether a query of ``storage`` keeps its per-sample inside values compact: compact storage, unless the
-    Program has ``block @ block`` products (not yet) or the query holds some (bool [sum regions], a decoder's: kept
-    dense)."""
-    return storage == "compact" and not prog.triple_of and (held is None or not held.any())
+    """Whether a query of ``storage`` keeps its per-sample inside values compact: compact storage, unless the query
+    holds some (bool [sum regions], a decoder's: kept dense)."""
+    return storage == "compact" and (held is None or not held.any())
 
 
 @triton_jit

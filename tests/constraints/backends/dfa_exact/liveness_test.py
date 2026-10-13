@@ -306,14 +306,16 @@ def test_pruning_engages_only_under_evidence(build_pc, monkeypatch):
         assert (live[:, t].sum(dim = 1) <= 1).all()
 
 
+@pytest.mark.parametrize("storage", ["dense", "compact"])
 @pytest.mark.parametrize("kind", ["pd", "pd_prod_dominated", "hand", "hmm"])
-def test_marginals_survive_a_wide_dynamic_range(kind, build_pc, reference, monkeypatch):
+def test_marginals_survive_a_wide_dynamic_range(kind, storage, build_pc, reference, monkeypatch):
     """A block's entries can span far more than fp32's exponent. Here tokens 1 and 2 have probability e^-50 at every
     position under the constraint "contains 1 2": the satisfied state carries nearly all of a block's mass, a state
     still owing the keyword e^-100 of it. A sample whose observed prefix leaves it in such a state at a block's boundary
     needs exactly those small entries -- which block @ block's row and column shifts flush unless the tile is computed
     again exactly, and which the finite values of the sample's dead columns in a block kept once would flush as well,
-    were they not masked. Against the reference in float64, kept once (inside fast_inference) and per sample."""
+    were they not masked. Against the reference in float64, kept once (inside fast_inference) and per sample, dense or
+    compact (whose block @ block products compute again exactly one shared column at a time)."""
     n = KINDS[kind]
     pc = build_pc(kind, n, V)
     with torch.no_grad():
@@ -331,11 +333,11 @@ def test_marginals_survive_a_wide_dynamic_range(kind, build_pc, reference, monke
     want = reference.marginal(cc, data, missing).float()
     assert torch.isfinite(want).all()                                        # every mass ~ e^-100, finite
     with juice.fast_inference():
-        kept = cc.marginal(data, missing)
+        kept = cc.marginal(data, missing, storage = storage)
     real = M.prior_regions
     try:
         M.prior_regions = lambda prog, observed, B, kept, liveness: np.zeros(len(prog.sum_ivs), dtype = bool)
-        per_sample = cc.marginal(data, missing)
+        per_sample = cc.marginal(data, missing, storage = storage)
     finally:
         M.prior_regions = real
     for got in (kept, per_sample):

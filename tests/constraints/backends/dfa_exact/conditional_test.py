@@ -96,10 +96,9 @@ def test_conditionals_match_the_reference(kind, name, pattern, sum_path, build_p
 @pytest.mark.parametrize("name", list(CONSTRAINTS))
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_compact_storage_gives_the_same_rows(kind, name, pattern, sum_path, build_pc, reference):
-    """``storage = "compact"`` (every sample's values over the pairs of its live columns only, its inside values too
-    but with block @ block products): the reference's rows, and the dense storage's -- bit for bit through the fused
-    sums, but for block @ block products (whose compact products sum the live shared columns only, in other
-    groups)."""
+    """``storage = "compact"`` (every sample's values, inside and top-down, over the pairs of its live columns only):
+    the reference's rows, and the dense storage's -- bit for bit through the fused sums, but for block @ block products
+    (whose compact products sum the live shared columns only, in other groups)."""
     n = KINDS[kind]
     cc = jc.compile(CONSTRAINTS[name](), build_pc(kind, n, V))
     data, missing = evidence(pattern, n)

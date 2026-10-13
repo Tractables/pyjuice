@@ -12,7 +12,8 @@ circuit's shape:
 * ``block @ input`` (:func:`_block_input_kernel`): the mirror case, a gather over the predecessors of each
   column at ``t + 1``;
 * ``block @ block`` (:func:`_block_block_kernel`): a per-sample log-space matrix product over the shared
-  boundary, skipping the (output tile, shared chunk) pairs the automaton cannot join (:class:`SkipMasks`).
+  boundary, skipping the (output tile, shared chunk) pairs the automaton cannot join (:class:`SkipMasks`) -- or, the
+  values compact (:mod:`.compact`), over the sample's live columns alone (:func:`_block_block_compact_kernel`).
 
 Blocks are either sum nodes' rows in ``node_mars`` or intermediate results in a scratch buffer. Outputs go
 to the product layer's ``element_mars`` rows, or to scratch when another step reads them. A row holds one
@@ -617,6 +618,151 @@ def _block_block_kernel(element_mars, node_mars, temp, width, iv_of, iv_info, iv
                     tl.store(op + sl, tl.where(valid, out, float("-inf")), mask = om & (sl >= 0))
 
 
+@triton.jit
+def _rect_tile(p, base, stride, by_slot, positions, ncols, iv_table, x, y, xp, yp, xm, ym, T: tl.constexpr):
+    """The ``[len(x), len(y)]`` tile of a block operand ``S``'s values ``S[x, y]`` (``T``: ``S[y, x]``, the operand
+    read transposed), ``x`` and ``y`` columns of the automaton and ``xp`` and ``yp`` their places among the sample's
+    live ones (``xm``, ``ym``: the real ones): compact (:mod:`.compact`), at ``p + base + (row's place) * stride +
+    (column's place)`` -- ``base`` the sample's first lane in the row, ``stride`` its live columns at the block's
+    exit --; ``by_slot``, at the pair's slot from ``p`` (a block kept once, or a sample's dense one), -inf where the
+    automaton does not join them."""
+    m = xm[:, None] & ym[None, :]
+    if T:
+        ri, ci, pr, pc = y[None, :], x[:, None], yp[None, :], xp[:, None]
+    else:
+        ri, ci, pr, pc = x[:, None], y[None, :], xp[:, None], yp[None, :]
+    if by_slot:
+        sl = _slot(iv_table, positions, ri, ci, ncols, m, False).to(tl.int64)
+    else:
+        sl = base + pr.to(tl.int64) * stride + pc
+    return tl.load(p + sl, mask = m & (sl >= 0), other = float("-inf"))
+
+
+@triton.jit
+def _rect_product(ap, a0, a_stride, a_slot, a_pos, a_ncols, bp, b0, b_stride, b_slot, b_pos, b_ncols, iv_table, rid,
+                  pr, rm, cid, pc, cm, columns, kstart, ck, A_T: tl.constexpr, B_T: tl.constexpr, TM: tl.constexpr,
+                  TN: tl.constexpr, TK: tl.constexpr, PRECISION: tl.constexpr):
+    """``log(sum_k exp(A[r, k] + B[k, c]))`` for one output tile -- rows ``rid`` (places ``pr``), columns ``cid``
+    (places ``pc``) -- over the sample's ``ck`` live columns at the shared boundary (``columns[kstart]`` on), ``A``
+    and ``B`` read by :func:`_rect_tile` (``A_T``, ``B_T``: stored transposed), shifted by every row's and column's
+    running maximum as :func:`_block_block_tile` does. Returns the tile and its shifted sums (see :data:`EXACT_BELOW`)."""
+    mA = tl.full([TM], float("-inf"), dtype = tl.float32)
+    mB = tl.full([TN], float("-inf"), dtype = tl.float32)
+    acc = tl.zeros([TM, TN], dtype = tl.float32)
+    for k0 in range(0, ck, TK):
+        pk = k0 + tl.arange(0, TK)
+        km = pk < ck
+        kid = tl.load(columns + kstart + pk, mask = km, other = 0)
+        at = _rect_tile(ap, a0, a_stride, a_slot, a_pos, a_ncols, iv_table, rid, kid, pr, pk, rm, km, A_T)
+        bt = _rect_tile(bp, b0, b_stride, b_slot, b_pos, b_ncols, iv_table, kid, cid, pk, pc, km, cm, B_T)
+        nA = tl.maximum(mA, tl.max(at, axis = 1))
+        nB = tl.maximum(mB, tl.max(bt, axis = 0))
+        sA = tl.where(nA == float("-inf"), 0.0, nA)
+        sB = tl.where(nB == float("-inf"), 0.0, nB)
+        fA = tl.where(nA == float("-inf"), 1.0, tl.exp(mA - sA))
+        fB = tl.where(nB == float("-inf"), 1.0, tl.exp(mB - sB))
+        acc = acc * fA[:, None] * fB[None, :] + tl.dot(tl.exp(at - sA[:, None]), tl.exp(bt - sB[None, :]),
+                                                        input_precision = PRECISION)
+        mA, mB = nA, nB
+    sA = tl.where(mA == float("-inf"), 0.0, mA)
+    sB = tl.where(mB == float("-inf"), 0.0, mB)
+    return tl.log(acc) + sA[:, None] + sB[None, :], acc
+
+
+@triton.jit
+def _rect_product_exact(ap, a0, a_stride, a_slot, a_pos, a_ncols, bp, b0, b_stride, b_slot, b_pos, b_ncols, iv_table,
+                        rid, pr, rm, cid, pc, cm, columns, kstart, ck, A_T: tl.constexpr, B_T: tl.constexpr,
+                        TM: tl.constexpr, TN: tl.constexpr):
+    """:func:`_rect_product` by an online log-sum-exp per entry, one shared column at a time: exact whatever the
+    operands' dynamic range."""
+    m = tl.full([TM, TN], float("-inf"), dtype = tl.float32)
+    acc = tl.zeros([TM, TN], dtype = tl.float32)
+    one = tl.zeros([1], dtype = tl.int32)
+    for k in range(0, ck):
+        kid = one + tl.load(columns + kstart + k)
+        at = _rect_tile(ap, a0, a_stride, a_slot, a_pos, a_ncols, iv_table, rid, kid, pr, one + k, rm, one == 0, A_T)
+        bt = _rect_tile(bp, b0, b_stride, b_slot, b_pos, b_ncols, iv_table, kid, cid, one + k, pc, one == 0, cm, B_T)
+        m, acc = _lse_step(m, acc, at + bt)                                  # [TM, 1] + [1, TN]
+    return _lse_value(m, acc)
+
+
+def compact_tiles(rows: int, cols: int):
+    """``(TM, TN, TK, warps)`` of a compact ``block @ block`` launch whose samples have at most ``rows`` and ``cols``
+    live columns at its outputs' ends (see :func:`_block_block_compact_kernel`)."""
+    return (32, 32, 16, 4) if max(rows, cols) >= 32 else (16, 16, 16, 2)
+
+
+@triton_jit
+def _block_block_compact_kernel(element_mars, node_mars, temp, width, iv_of, iv_info, iv_table, coff, ccount, cstart,
+                                ccolumns, steps, sel, reg_offset, reg_width, reg_first, prior_mars, prior_offset,
+                                prior_width, reg_prior, out_first, out_width, temp_width, B, n, SPLIT, GROUP,
+                                exact_below, pid0, L_KIND: tl.constexpr, R_KIND: tl.constexpr,
+                                OUT_TEMP: tl.constexpr, TM: tl.constexpr, TN: tl.constexpr, TK: tl.constexpr,
+                                PRECISION: tl.constexpr, INDEXED: tl.constexpr):
+    """:func:`_block_block_kernel` on compact values (:mod:`.compact`): one program per (step, sample, group of
+    ``GROUP`` tiles of the sample's rectangle of live columns at the output's ends), each tile a log-space matrix
+    product over the sample's live columns at the shared boundary (:func:`_rect_product`), the operands' values by
+    their places -- by slot, kept once --, -inf at the pairs the automaton does not join. The entries the shifts flush
+    are recorded entry by entry and their tiles computed again exactly, as there."""
+    pid = pid0 + tl.program_id(0)
+    g = pid % SPLIT
+    s = _child(sel, pid // SPLIT // B, INDEXED)
+    b = (pid // SPLIT % B).to(tl.int64)
+    t0 = tl.load(steps + s * 8 + 5)
+    t1 = tl.load(steps + s * 8 + 6)
+    t2 = tl.load(steps + s * 8 + 7)
+    M = tl.load(width + t1)
+    X = _exit_width(width, t2, n)
+    _, lpos, _ = _interval(iv_of, iv_info, t0, t1, n)
+    _, rpos, _ = _interval(iv_of, iv_info, t1, t2, n)
+    _, opos, _ = _interval(iv_of, iv_info, t0, t2, n)
+    lp, l_own = _block_ptr(tl.load(steps + s * 8 + 1), tl.load(steps + s * 8 + 2), node_mars, prior_mars, temp,
+                           reg_offset, reg_width, reg_first, prior_offset, prior_width, reg_prior, temp_width, L_KIND)
+    rp, r_own = _block_ptr(tl.load(steps + s * 8 + 3), tl.load(steps + s * 8 + 4), node_mars, prior_mars, temp,
+                           reg_offset, reg_width, reg_first, prior_offset, prior_width, reg_prior, temp_width, R_KIND)
+    row = b * (n + 1)
+    c0 = tl.load(ccount + row + t0)                                          # the sample's live columns at t0, t1, t2
+    c1 = tl.load(ccount + row + t1)
+    c2 = tl.load(ccount + row + t2)
+    s0 = tl.load(cstart + row + t0)
+    s1 = tl.load(cstart + row + t1)
+    s2 = tl.load(cstart + row + t2)
+    l0 = tl.load(coff + tl.load(iv_of + t0 * (n + 1) + t1).to(tl.int64) * (B + 1) + b)
+    r0 = tl.load(coff + tl.load(iv_of + t1 * (n + 1) + t2).to(tl.int64) * (B + 1) + b)
+    op = _out_ptr(tl.load(steps + s * 8 + 0), element_mars, temp, out_first, out_width, temp_width, OUT_TEMP) + \
+        tl.load(coff + tl.load(iv_of + t0 * (n + 1) + t2).to(tl.int64) * (B + 1) + b)
+    NJ = tl.cdiv(c2, TN)
+    bad = tl.zeros([TM, TN], dtype = tl.int32)
+    for t in range(g * GROUP, tl.minimum(g * GROUP + GROUP, tl.cdiv(c0, TM) * NJ)):
+        pr = (t // NJ) * TM + tl.arange(0, TM)
+        pc = (t % NJ) * TN + tl.arange(0, TN)
+        rm, cm = pr < c0, pc < c2
+        rid = tl.load(ccolumns + s0 + pr, mask = rm, other = 0)
+        cid = tl.load(ccolumns + s2 + pc, mask = cm, other = 0)
+        om = rm[:, None] & cm[None, :]
+        valid = om & (_slot(iv_table, opos, rid[:, None], cid[None, :], X, om, False) >= 0)
+        out, acc = _rect_product(lp, l0, c1, ~l_own, lpos, M, rp, r0, c2, ~r_own, rpos, X, iv_table, rid, pr, rm, cid,
+                                 pc, cm, ccolumns, s1, c1, False, False, TM, TN, TK, PRECISION)
+        bad = bad | (valid & (acc < exact_below)).to(tl.int32)
+        tl.store(op + pr[:, None].to(tl.int64) * c2 + pc[None, :], tl.where(valid, out, float("-inf")), mask = om)
+    if tl.max(bad) > 0:                                                      # an entry flushed (rare): its tiles
+        for t in range(g * GROUP, tl.minimum(g * GROUP + GROUP, tl.cdiv(c0, TM) * NJ)):   # again, exactly where so
+            pr = (t // NJ) * TM + tl.arange(0, TM)
+            pc = (t % NJ) * TN + tl.arange(0, TN)
+            rm, cm = pr < c0, pc < c2
+            rid = tl.load(ccolumns + s0 + pr, mask = rm, other = 0)
+            cid = tl.load(ccolumns + s2 + pc, mask = cm, other = 0)
+            om = rm[:, None] & cm[None, :]
+            valid = om & (_slot(iv_table, opos, rid[:, None], cid[None, :], X, om, False) >= 0)
+            fast, acc = _rect_product(lp, l0, c1, ~l_own, lpos, M, rp, r0, c2, ~r_own, rpos, X, iv_table, rid, pr, rm,
+                                      cid, pc, cm, ccolumns, s1, c1, False, False, TM, TN, TK, PRECISION)
+            if tl.min(tl.where(valid, acc, 1.0)) < exact_below:
+                out = _rect_product_exact(lp, l0, c1, ~l_own, lpos, M, rp, r0, c2, ~r_own, rpos, X, iv_table, rid, pr,
+                                          rm, cid, pc, cm, ccolumns, s1, c1, False, False, TM, TN)
+                tl.store(op + pr[:, None].to(tl.int64) * c2 + pc[None, :], tl.where(valid, out, float("-inf")),
+                         mask = om)
+
+
 @triton_jit
 def _copy_kernel(element_mars, node_mars, temp, iv_of, iv_info, coff, steps, sel, reg_offset, reg_width, reg_first,
                  prior_mars, prior_offset, prior_width, reg_prior, out_first, out_width, temp_width, B, n, pid0,
@@ -780,7 +926,7 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, class_mar
         its blocks' entries weighted by its own masses, which the shifts respect (and pays nothing)
     :param compact: None, or the query's :class:`~.compact.CompactLayout`, by which the per-sample inside values are
         compact (``regions``, ``elem_width`` and the scratch rows' width are their rows'): a lane per pair of live
-        columns; not yet with ``block @ block`` steps
+        columns (``block @ block`` steps: :func:`_block_block_compact_kernel`, ``exact`` always)
     """
     temp, temp_width = bufs
     common = dict(reg_offset = regions["offset"], reg_width = regions["width"], reg_first = regions["first"],
@@ -860,9 +1006,25 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, class_mar
                                 OUT_TEMP = out_temp, GROUPED = tt.grouped, PRUNE = prune, OUT_FULL = out_full,
                                 L_FULL = l_full, COMPACT = compact is not None, TILE = tile, num_warps = 4, **idx,
                                 **lists, **common)
+            elif form == "block_block" and compact is not None:     # a sample's rectangle at a time
+                l_kind, r_kind, out_temp = kinds
+                steps, sel = launch.steps[0], cut.chunks[0][3]
+                ends = prog.iv_ends_np[launch.out_ivs]
+                rmax, cmax = int(compact.max_count[ends[:, 0]].max()), int(compact.max_count[ends[:, 1]].max())
+                TM, TN, TK, warps = compact_tiles(rmax, cmax)
+                tiles = host_cdiv(rmax, TM) * host_cdiv(cmax, TN)
+                split = min(tiles, host_cdiv(BLOCK_BLOCK_PROGRAMS_PER_SM * prog.num_sms, S * B))
+                group = host_cdiv(tiles, max(1, split))
+                split = host_cdiv(tiles, group)
+                for first, size in grid_chunks(S * B * split, 0):
+                    _block_block_compact_kernel[(size,)](
+                        element_mars, node_mars, temp, prog.width_t, ivs.of, ivs.info, ivs.table, compact.off,
+                        compact.count, compact.start, compact.columns, steps, steps if sel is None else sel.tensor,
+                        B = B, n = n, SPLIT = split, GROUP = group, exact_below = EXACT_BELOW, pid0 = first,
+                        L_KIND = l_kind, R_KIND = r_kind, OUT_TEMP = out_temp, TM = TM, TN = TN, TK = TK,
+                        PRECISION = PRODUCT_PRECISION, INDEXED = sel is not None, num_warps = warps, num_stages = 1,
+                        **common)
             elif form == "block_block":
-                if compact is not None:
-                    raise NotImplementedError("compact inside values of block @ block products (not yet)")
                 l_kind, r_kind, out_temp = kinds
                 steps, triples = launch.steps
                 sel = cut.chunks[0][3]

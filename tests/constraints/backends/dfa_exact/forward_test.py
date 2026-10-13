@@ -79,8 +79,8 @@ def test_marginal_matches_the_reference(kind, B, constraint, sum_path, transitio
     assert_close(cc.marginal(data, missing), reference.marginal(cc, data, missing), n)
 
 
-#: no block @ block product: compact inside values are dense's bit for bit through the fused sums (with one, a query
-#: keeps them dense: not yet compact)
+#: no block @ block product: compact inside values are dense's bit for bit through the fused sums (a compact block @
+#: block product sums the live shared columns only, in other groups)
 BIT_EXACT_KINDS = ["hmm", "hmm_untied", "hmm_block_sparse", "left_linear", "hand_left"]
 
 
@@ -100,8 +100,7 @@ def test_compact_marginal_is_the_dense_one(kind, B, kept, sum_path, transitions,
     kernels/compact.py), every lane written (the storage filled with NaN between two runs) -- the reference's
     marginal, and the dense storage's, bit for bit through the fused sums, which compute each lane alone. ``kept``:
     inside fast_inference, every sample observing positions 1 .. n / 2, the values of scopes before or after them
-    kept once, which the compact products read by slot. Not yet with block @ block products: their inside values stay
-    dense."""
+    kept once, which the compact products read by slot. With block @ block products, up to fp32 rounding."""
     n = KINDS[kind]
     cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
     data, missing = evidence(n, B)
@@ -113,7 +112,7 @@ def test_compact_marginal_is_the_dense_one(kind, B, kept, sum_path, transitions,
         marginal(cc.backend, data, missing, report = report, storage = "compact")
         nan_storages(cc)
         got = marginal(cc.backend, data, missing, report = report, storage = "compact")
-    assert (report["compact"] is not None) == (kind in BIT_EXACT_KINDS)
+    assert report["compact"] is not None and report["compact"].mars is not None
     assert not kept or report["plan"].prior
     assert_close(got, reference.marginal(cc, data, missing), n)
     if sum_path == "fused" and kind in BIT_EXACT_KINDS:
@@ -139,16 +138,19 @@ def test_compact_inside_values_take_their_live_pairs_only(kind, build_pc):
     assert cc.backend.state.storage("element_mars").numel() == mars["element_size"] < dense["element_size"]
 
 
+@pytest.mark.parametrize("storage", ["dense", "compact"])
 @pytest.mark.parametrize("kind", ["pd", "pd_prod_dominated", "pd_blockified", "hand"])
-def test_a_wide_automaton_matches_the_reference(kind, sum_path, build_pc, reference):
+def test_a_wide_automaton_matches_the_reference(kind, storage, sum_path, build_pc, reference):
     """A 48-state random automaton: interval nodes keep only the pairs of columns it joins -- a fraction of them on
-    some intervals -- and the marginal matches the reference, which keeps every pair."""
+    some intervals -- and the marginal matches the reference, which keeps every pair. Compact, a sample observing
+    nothing has more than 32 live columns at a boundary: its rectangles span several tiles of a block @ block product
+    each way."""
     rng = random.Random(0)
     K, n = 48, KINDS[kind]
     dfa = jc.DFA.from_dense(V, [[rng.randrange(K) for _ in range(V)] for _ in range(K)], 0, rng.sample(range(K), 12))
     cc = jc.compile(dfa, build_pc(kind, n, V))
     data, missing = evidence(n, 4)
-    got = cc.marginal(data, missing)
+    got = cc.marginal(data, missing, storage = storage)
     assert (cc.backend.program().intervals.info[:, 1] >= 0).any()           # some interval keeps a fraction
     assert_close(got, reference.marginal(cc, data, missing), n)
 

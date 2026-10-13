@@ -36,7 +36,8 @@ from .common import (SUM, _block_ptr, _child, _exit_width, _interval, _logaddexp
                      grid_chunks, tensor)
 from .compact import _lane, _lane_ends
 from .prod import (BLOCK_BLOCK_PROGRAMS_PER_SM, BLOCK_BLOCK_TILES, EXACT_BELOW, PRODUCT_PRECISION, SKIP_EMPTY_TILES,
-                   _chunk_needed, _flat_tile, _live_lanes, _lse_step_one_exp, _lse_value, _tile, _tile_load)
+                   _chunk_needed, _flat_tile, _live_lanes, _lse_step_one_exp, _lse_value, _rect_product,
+                   _rect_product_exact, _tile, _tile_load, compact_tiles)
 
 
 #: fields of a child-major table's parent rows, per contraction: the forward step's fields (see :mod:`.prod`), the
@@ -619,106 +620,68 @@ def _block_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
 
 
 @triton.jit
-def _bb_compact_chunk(op, o0, ostride, once, opos, X_o, xp, xpos, X_x, iv_table, rid, cid, kid, pr, pc, pk, rm, cm,
-                      km, SIDE_L: tl.constexpr):
-    """``(A, B)`` of one chunk of shared columns of :func:`_block_block_top_down_compact_kernel`'s product, for the
-    output rows ``rid`` and columns ``cid`` and the shared columns ``kid`` (``pr``, ``pc``, ``pk``: their places among
-    the sample's live ones). ``SIDE_L``: ``A[r, k] = O_out[r, k]`` (compact from ``o0``, ``ostride`` lanes per entry
-    place, or kept once and read by slot), ``B[k, c] = R[c, k]``; else ``A[r, k] = L[k, r]``, ``B[k, c] =
-    O_out[k, c]``. The inside operand is dense, read by slot."""
-    if SIDE_L:
-        ma = rm[:, None] & km[None, :]
-        if once:
-            la = _slot(iv_table, opos, rid[:, None], kid[None, :], X_o, ma, False).to(tl.int64)
-        else:
-            la = o0 + pr[:, None].to(tl.int64) * ostride + pk[None, :]
-        at = tl.load(op + la, mask = ma & (la >= 0), other = float("-inf"))
-        mb = km[:, None] & cm[None, :]
-        sb = _slot(iv_table, xpos, cid[None, :], kid[:, None], X_x, mb, False)
-        bt = tl.load(xp + sb, mask = mb & (sb >= 0), other = float("-inf"))
-    else:
-        ma = rm[:, None] & km[None, :]
-        sa = _slot(iv_table, xpos, kid[None, :], rid[:, None], X_x, ma, False)
-        at = tl.load(xp + sa, mask = ma & (sa >= 0), other = float("-inf"))
-        mb = km[:, None] & cm[None, :]
-        if once:
-            lb = _slot(iv_table, opos, kid[:, None], cid[None, :], X_o, mb, False).to(tl.int64)
-        else:
-            lb = o0 + pk[:, None].to(tl.int64) * ostride + pc[None, :]
-        bt = tl.load(op + lb, mask = mb & (lb >= 0), other = float("-inf"))
-    return at, bt
-
-
-@triton.jit
 def _bb_compact_parent(p, parents, element_flows, temp_flows, node_mars, prior_mars, temp, width, iv_of, iv_info,
                        iv_table, once_iv, coff, ccount, cstart, ccolumns, mars_offset, mars_width, reg_first,
                        prior_offset, prior_width, reg_prior, out_first, out_width, temp_width, tflow_width, b, B, n,
                        rid, cid, pr, pc, rm, cm, valid, exact_below, O_KIND: tl.constexpr, OUT_TEMP: tl.constexpr,
-                       SIDE_L: tl.constexpr, TM: tl.constexpr, TN: tl.constexpr, TK: tl.constexpr,
-                       PRECISION: tl.constexpr):
-    """Parent ``p``'s contribution to a compact child's output tile (rows ``rid``, columns ``cid``), a log-space matrix
-    product over the sample's live columns at the shared boundary -- the exit ``t2`` (``SIDE_L``) or the entry ``t0``
-    --, computed again exactly (one shared column at a time) where its shifts flush a ``valid`` entry."""
+                       SIDE_L: tl.constexpr, MARS: tl.constexpr, TM: tl.constexpr, TN: tl.constexpr,
+                       TK: tl.constexpr, PRECISION: tl.constexpr):
+    """Parent ``p``'s contribution to a compact child's output tile (rows ``rid``, columns ``cid``; ``pr``, ``pc``:
+    their places among the sample's live columns), a log-space matrix product over the sample's live columns at the
+    shared boundary -- the exit ``t2`` (``SIDE_L``: ``O_out @ R^T``) or the entry ``t0`` (``L^T @ O_out``) -- of
+    :func:`~.prod._rect_product`, computed again exactly (one shared column at a time) where its shifts flush a
+    ``valid`` entry. The parent's values are compact, or kept once (by slot); the other operand's inside values
+    compact too (``MARS``), or the sample's dense block, or kept once (by slot)."""
     t0 = tl.load(parents + p * 9 + 5)
     t1 = tl.load(parents + p * 9 + 6)
     t2 = tl.load(parents + p * 9 + 7)
-    OS, opos, _ = _interval(iv_of, iv_info, t0, t2, n)
+    _, opos, _ = _interval(iv_of, iv_info, t0, t2, n)
     once = _once(once_iv, iv_of, t0, t2, n)
-    kp = tl.load(iv_of + t0 * (n + 1) + t2)
     op = _out_flows_ptr(tl.load(parents + p * 9 + 0), element_flows, temp_flows, out_first, out_width, tflow_width,
                         OUT_TEMP)
-    o0 = tl.load(coff + kp.to(tl.int64) * (B + 1) + b)
-    ostride = tl.load(ccount + b * (n + 1) + t2).to(tl.int64)                # the parent's exit columns live
+    o0 = tl.load(coff + tl.load(iv_of + t0 * (n + 1) + t2).to(tl.int64) * (B + 1) + b)
+    ostride = tl.load(ccount + b * (n + 1) + t2)                             # the parent's exit columns live
     X_o = _exit_width(width, t2, n)
-    if SIDE_L:                                                               # O_out @ R^T, shared: the exit columns
+    if SIDE_L:                                                               # the other operand R over [t1, t2)
         ks = t2
         X_x = X_o
         XS, xpos, _ = _interval(iv_of, iv_info, t1, t2, n)
         xp, x_own = _block_ptr(tl.load(parents + p * 9 + 3), tl.load(parents + p * 9 + 4), node_mars, prior_mars, temp,
                                mars_offset, mars_width, reg_first, prior_offset, prior_width, reg_prior, temp_width,
                                O_KIND)
-    else:                                                                    # L^T @ O_out, shared: the entry columns
+        kx = tl.load(iv_of + t1 * (n + 1) + t2)
+        xstride = ostride                                                    # its exit columns live
+    else:                                                                    # ... or L over [t0, t1)
         ks = t0
         X_x = tl.load(width + t1)
         XS, xpos, _ = _interval(iv_of, iv_info, t0, t1, n)
         xp, x_own = _block_ptr(tl.load(parents + p * 9 + 1), tl.load(parents + p * 9 + 2), node_mars, prior_mars, temp,
                                mars_offset, mars_width, reg_first, prior_offset, prior_width, reg_prior, temp_width,
                                O_KIND)
-    xp = xp + tl.where(x_own, b * XS, 0)
+        kx = tl.load(iv_of + t0 * (n + 1) + t1)
+        xstride = tl.load(ccount + b * (n + 1) + t1)
+    if MARS:
+        x0 = tl.load(coff + kx.to(tl.int64) * (B + 1) + b)
+        x_slot = ~x_own
+    else:
+        xp = xp + tl.where(x_own, b * XS, 0)
+        x0 = 0
+        x_slot = True
     krow = b * (n + 1) + ks
     ck = tl.load(ccount + krow)
     k0p = tl.load(cstart + krow)
-    mA = tl.full([TM], float("-inf"), dtype = tl.float32)
-    mB = tl.full([TN], float("-inf"), dtype = tl.float32)
-    acc = tl.zeros([TM, TN], dtype = tl.float32)
-    for k0 in range(0, ck, TK):
-        pk = k0 + tl.arange(0, TK)
-        km = pk < ck
-        kid = tl.load(ccolumns + k0p + pk, mask = km, other = 0)
-        at, bt = _bb_compact_chunk(op, o0, ostride, once, opos, X_o, xp, xpos, X_x, iv_table, rid, cid, kid, pr, pc,
-                                   pk, rm, cm, km, SIDE_L)
-        nA = tl.maximum(mA, tl.max(at, axis = 1))
-        nB = tl.maximum(mB, tl.max(bt, axis = 0))
-        sA = tl.where(nA == float("-inf"), 0.0, nA)
-        sB = tl.where(nB == float("-inf"), 0.0, nB)
-        fA = tl.where(nA == float("-inf"), 1.0, tl.exp(mA - sA))
-        fB = tl.where(nB == float("-inf"), 1.0, tl.exp(mB - sB))
-        acc = acc * fA[:, None] * fB[None, :] + tl.dot(tl.exp(at - sA[:, None]), tl.exp(bt - sB[None, :]),
-                                                        input_precision = PRECISION)
-        mA, mB = nA, nB
-    sA = tl.where(mA == float("-inf"), 0.0, mA)
-    sB = tl.where(mB == float("-inf"), 0.0, mB)
-    out = tl.log(acc) + sA[:, None] + sB[None, :]
-    if tl.min(tl.where(valid, acc, 1.0)) < exact_below:                      # flushed: one shared column at a time
-        m = tl.full([TM, TN], float("-inf"), dtype = tl.float32)
-        acc = tl.zeros([TM, TN], dtype = tl.float32)
-        for k in range(0, ck):
-            kid = tl.load(ccolumns + k0p + k)
-            one = tl.zeros([1], dtype = tl.int32)
-            at, bt = _bb_compact_chunk(op, o0, ostride, once, opos, X_o, xp, xpos, X_x, iv_table, rid, cid, one + kid,
-                                       pr, pc, one + k, rm, cm, one == 0, SIDE_L)
-            m, acc = _lse_step(m, acc, at + bt)                              # [TM, 1] + [1, TN]
-        out = _lse_value(m, acc)
+    if SIDE_L:                                       # A[r, k] = O_out[r, k], B[k, c] = R[c, k]
+        out, acc = _rect_product(op, o0, ostride, once, opos, X_o, xp, x0, xstride, x_slot, xpos, X_x, iv_table, rid,
+                                 pr, rm, cid, pc, cm, ccolumns, k0p, ck, False, True, TM, TN, TK, PRECISION)
+        if tl.min(tl.where(valid, acc, 1.0)) < exact_below:                  # flushed: one shared column at a time
+            out = _rect_product_exact(op, o0, ostride, once, opos, X_o, xp, x0, xstride, x_slot, xpos, X_x, iv_table,
+                                      rid, pr, rm, cid, pc, cm, ccolumns, k0p, ck, False, True, TM, TN)
+    else:                                            # A[r, k] = L[k, r], B[k, c] = O_out[k, c]
+        out, acc = _rect_product(xp, x0, xstride, x_slot, xpos, X_x, op, o0, ostride, once, opos, X_o, iv_table, rid,
+                                 pr, rm, cid, pc, cm, ccolumns, k0p, ck, True, False, TM, TN, TK, PRECISION)
+        if tl.min(tl.where(valid, acc, 1.0)) < exact_below:
+            out = _rect_product_exact(xp, x0, xstride, x_slot, xpos, X_x, op, o0, ostride, once, opos, X_o, iv_table,
+                                      rid, pr, rm, cid, pc, cm, ccolumns, k0p, ck, True, False, TM, TN)
     return out
 
 
@@ -729,12 +692,14 @@ def _block_block_top_down_compact_kernel(element_flows, temp_flows, node_flows, 
                                         mars_width, prior_offset, prior_width, reg_prior, out_first, out_width,
                                         temp_width, tflow_width, B, n, SPLIT, GROUP, exact_below, pid0,
                                         C_KIND: tl.constexpr, O_KIND: tl.constexpr, OUT_TEMP: tl.constexpr,
-                                        SIDE_L: tl.constexpr, TM: tl.constexpr, TN: tl.constexpr, TK: tl.constexpr,
-                                        PRECISION: tl.constexpr, INDEXED: tl.constexpr):
+                                        SIDE_L: tl.constexpr, MARS: tl.constexpr, TM: tl.constexpr,
+                                        TN: tl.constexpr, TK: tl.constexpr, PRECISION: tl.constexpr,
+                                        INDEXED: tl.constexpr):
     """:func:`_block_block_top_down_kernel` on compact values (:mod:`.compact`): one program per (child, sample, group
     of ``GROUP`` tiles of the sample's rectangle), each tile the log-sum over the child's parents of a log-space matrix
     product over the sample's live columns at the shared boundary (:func:`_bb_compact_parent`), -inf at the pairs the
-    automaton does not join; the inside operands (``mars_offset``, ``mars_width``; ``temp_width``) stay dense."""
+    automaton does not join; the inside operands (``mars_offset``, ``mars_width``; ``temp_width``) compact too
+    (``MARS``) or dense."""
     pid = pid0 + tl.program_id(0)
     g = pid % SPLIT
     c = _child(children_idx, pid // SPLIT // B, INDEXED)
@@ -774,14 +739,14 @@ def _block_block_top_down_compact_kernel(element_flows, temp_flows, node_flows, 
                                      iv_info, iv_table, once_iv, coff, ccount, cstart, ccolumns, mars_offset,
                                      mars_width, reg_first, prior_offset, prior_width, reg_prior, out_first, out_width,
                                      temp_width, tflow_width, b, B, n, rid, cid, pr, pc, rm, cm, valid, exact_below,
-                                     O_KIND, OUT_TEMP, SIDE_L, TM, TN, TK, PRECISION)
+                                     O_KIND, OUT_TEMP, SIDE_L, MARS, TM, TN, TK, PRECISION)
             tot = _logaddexp_tile(tot, out)
         _store_flows(cp, pr[:, None].to(tl.int64) * cc_ + pc[None, :], tl.where(valid, tot, float("-inf")), om, add)
 
 
 def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_flows, node_mars, class_mars, obs_class,
                 live, elem_first: int, elem_width: int, B: int, prior: dict, skip, exact: bool, once_iv: torch.Tensor,
-                lanes = None, compact = None, tflow_width = None, inside_regions = None):
+                lanes = None, compact = None, tflow_width = None, inside_regions = None, inside: bool = False):
     """
     The top-down pass of one product layer's stage: every :class:`TopDownLaunch` in ``launches``, each with the plan's
     index list of the children it computes (int32 on the device) or None for every one.
@@ -803,6 +768,8 @@ def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_
     :param tflow_width: the scratch rows' width in ``temp_flows`` (None: ``bufs``')
     :param inside_regions: the sum regions' tables in ``node_mars`` (None: ``regions``), for the inside values a
         ``block @ block`` launch reads
+    :param inside: whether those inside values are compact too (by ``compact``'s layout; ``inside_regions`` and
+        ``bufs`` are their rows')
     """
     temp, temp_width = bufs
     tflow_width = temp_width if tflow_width is None else tflow_width
@@ -853,7 +820,7 @@ def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_
             c_kind, o_kind, out_temp = la.kinds
             ends = prog.iv_ends_np[la.host["child_iv"]]
             rmax, cmax = int(compact.max_count[ends[:, 0]].max()), int(compact.max_count[ends[:, 1]].max())
-            TM, TN, TK, warps = (32, 32, 16, 4) if max(rmax, cmax) >= 32 else (16, 16, 16, 2)
+            TM, TN, TK, warps = compact_tiles(rmax, cmax)
             tiles = host_cdiv(rmax, TM) * host_cdiv(cmax, TN)
             if tiles == 0:
                 continue
@@ -868,7 +835,7 @@ def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_
                     mars_width = inside_regions["width"], prior_offset = prior["offset"], prior_width = prior["width"],
                     reg_prior = prior["reg_prior"], tflow_width = tflow_width, B = B, n = n, SPLIT = split,
                     GROUP = group, exact_below = EXACT_BELOW, pid0 = first, C_KIND = c_kind, O_KIND = o_kind,
-                    OUT_TEMP = out_temp, SIDE_L = la.side == "L", TM = TM, TN = TN, TK = TK,
+                    OUT_TEMP = out_temp, SIDE_L = la.side == "L", MARS = inside, TM = TM, TN = TN, TK = TK,
                     PRECISION = PRODUCT_PRECISION, num_warps = warps, num_stages = 1, **indexed,
                     **dict(common, temp_width = temp_width))
         else:
