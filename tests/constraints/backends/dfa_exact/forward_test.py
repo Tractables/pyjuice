@@ -76,7 +76,7 @@ def test_marginal_matches_the_reference(kind, B, constraint, sum_path, transitio
     n = KINDS[kind]
     cc = jc.compile(CONSTRAINTS[constraint](), build_pc(kind, n, V))
     data, missing = evidence(n, B)
-    assert_close(cc.marginal(data, missing), reference.marginal(cc, data, missing), n)
+    assert_close(cc.marginal(data, missing, storage = "dense"), reference.marginal(cc, data, missing), n)
 
 
 #: no block @ block product: compact inside values are dense's bit for bit through the fused sums (a compact block @
@@ -212,7 +212,7 @@ def test_tf32_products_stay_close(kind, sum_path, build_pc):
 def sum_blocks(cc, B, data, missing):
     """Run the marginal; every sum region's rows, B * slots columns (cloned: the buffers are reused). A region the
     marginal's plan keeps once is read in prior_mars, its one block every sample's."""
-    cc.marginal(data, missing)
+    cc.marginal(data, missing, storage = "dense")
     prog = cc.backend.program()
     plan = next(reversed(prog.plans.values()))                              # the marginal's plan (most recently used)
     bufs, prior = cc.backend.state.buffers(B), cc.backend.state.prior_buffer()
@@ -271,9 +271,9 @@ def test_skipping_empty_tiles_changes_nothing(build_pc, monkeypatch):
         total += lt.size(0) * lt.size(1) * rt.size(1)
     assert kept < total                                                  # something is skipped
     data, missing = evidence(n, 4)
-    with_skip = cc.marginal(data, missing)
+    with_skip = cc.marginal(data, missing, storage = "dense")
     monkeypatch.setattr(prod, "SKIP_EMPTY_TILES", False)
-    assert_close(with_skip, cc.marginal(data, missing), n)
+    assert_close(with_skip, cc.marginal(data, missing, storage = "dense"), n)
 
 
 @pytest.mark.parametrize("kind", ["hmm", "left_linear", "hand_left"])
@@ -384,13 +384,13 @@ def test_stacked_dense_weights(tied, dense_pruning, reference, monkeypatch):
 
     want = reference.marginal(cc, data, missing)
     for _ in range(2):
-        assert_close(cc.marginal(data, missing), want, n)
+        assert_close(cc.marginal(data, missing, storage = "dense"), want, n)
     assert any(p for _, p in calls) == dense_pruning
     assert stacked() == (2 * len(keys) if tied else 0) and len(builds) == (2 if tied else 0)
     calls.clear(), builds.clear()
     with juice.fast_inference():
         for _ in range(2):
-            assert_close(cc.marginal(data, missing), want, n)
+            assert_close(cc.marginal(data, missing, storage = "dense"), want, n)
     assert stacked() == 2 * len(keys) and len(builds) == len(set(keys))      # built by the first query only
     assert cc.backend.state._kept_stacks is None                              # and dropped when the scope exits
 
@@ -401,7 +401,7 @@ def test_stacked_dense_weights(tied, dense_pruning, reference, monkeypatch):
             layer.params.copy_(src.params)
     updated = reference.marginal(cc, data, missing)
     assert (updated - want)[torch.isfinite(want)].abs().max() > 1e-2
-    assert_close(cc.marginal(data, missing), updated, n)
+    assert_close(cc.marginal(data, missing, storage = "dense"), updated, n)
     assert len(builds) == (1 if tied else 0)
 
 
@@ -418,9 +418,9 @@ def test_wide_products_are_not_stacked(dense_pruning, reference, monkeypatch):
     data, missing = evidence(n, 4)
     calls, builds = spy_dense_sums(monkeypatch)
     want = reference.marginal(cc, data, missing)
-    assert_close(cc.marginal(data, missing), want, n)
+    assert_close(cc.marginal(data, missing, storage = "dense"), want, n)
     with juice.fast_inference():
-        assert_close(cc.marginal(data, missing), want, n)
+        assert_close(cc.marginal(data, missing, storage = "dense"), want, n)
     assert calls and not any(s for s, _ in calls) and not builds
 
 
@@ -434,11 +434,11 @@ def test_the_stacked_weights_are_what_is_multiplied(dense_pruning, monkeypatch):
     n = 6
     cc = jc.compile(CONSTRAINTS["contains"](), blocks_hmm(n, tied = True, seed = 0))
     data, missing = evidence(n, 4)
-    want = cc.marginal(data, missing)
+    want = cc.marginal(data, missing, storage = "dense")
     stacked_weights = F.stacked_weights
     monkeypatch.setattr(F, "stacked_weights", lambda *a: 2 * stacked_weights(*a))
     runs = sum(key is not None for key in stack_keys(cc))
-    assert_close(cc.marginal(data, missing), want + runs * math.log(2), n)
+    assert_close(cc.marginal(data, missing, storage = "dense"), want + runs * math.log(2), n)
 
 
 @triton.jit
@@ -586,7 +586,7 @@ def test_splitting_block_block_tiles_changes_nothing(build_pc, monkeypatch):
         bufs = cc.backend.state.buffers(data.size(0))
         bufs["node_mars"].fill_(float("nan"))
         bufs["element_mars"].fill_(float("nan"))
-        return cc.marginal(data, missing)
+        return cc.marginal(data, missing, storage = "dense")
 
     assert torch.equal(marginal(1 << 20), marginal(0))
 
@@ -692,7 +692,7 @@ def test_narrow_launches_run_one_step_per_program(build_pc, reference, monkeypat
     for limit, launched in ((lanes, False), (lanes - 1, True)):
         monkeypatch.setattr(prod, "GROUP_MIN_LANES", limit)
         kernel.launches = 0
-        assert_close(cc.marginal(data, missing), want, n)
+        assert_close(cc.marginal(data, missing, storage = "dense"), want, n)
         assert (kernel.launches > 0) == launched
 
 
@@ -742,7 +742,7 @@ def test_every_tuned_candidate_gives_the_same_marginal(kind, build_pc, monkeypat
         bufs = cc.backend.state.buffers(B)
         bufs["node_mars"].fill_(float("nan"))
         bufs["element_mars"].fill_(float("nan"))
-        out = cc.marginal(data, missing)
+        out = cc.marginal(data, missing, storage = "dense")
         expected = set()                                              # what was chosen reached the kernels:
         for c in chosen:
             if len(c) == 2:                                           # (group size: launched as a power of 2,
@@ -778,13 +778,13 @@ def test_tuning_runs_once_per_launch_shape(kind, build_pc, monkeypatch):
     cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
     data, missing = evidence(n, 4)
     monkeypatch.setattr(autotune, "ENABLED", False)
-    cc.marginal(data, missing)
+    cc.marginal(data, missing, storage = "dense")
     assert timed == []
     monkeypatch.setattr(autotune, "ENABLED", True)
-    cc.marginal(data, missing)
+    cc.marginal(data, missing, storage = "dense")
     first = len(timed)
     assert first > 0 and first == sum(1 for k in autotune._CACHE if k[1][0].startswith("lifted_"))
-    cc.marginal(data, missing)
+    cc.marginal(data, missing, storage = "dense")
     assert len(timed) == first
 
 

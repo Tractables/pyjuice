@@ -32,8 +32,38 @@ from pyjuice.utils.util import host_next_power_of_2
 from ..compiled.tables import ALIGN
 from .common import _slot, pack_aligned
 
-#: the storages a query can keep its per-sample values in
-STORAGES = ("dense", "compact")
+#: the storages a query can keep its per-sample values in: "auto" picks one of the other two per query
+#: (:func:`resolve_storage`)
+STORAGES = ("auto", "dense", "compact")
+
+
+def dense_floats(backend, B: int, top_down: bool) -> int:
+    """The floats a dense query of ``B`` samples keeps per sample: ``node_mars`` and ``element_mars``, and with
+    ``top_down`` ``node_flows`` (``element_flows`` is ``element_mars``'s storage)."""
+    lay = backend.state.batch_layout(B)
+    return lay["node_size"] * (2 if top_down else 1) + lay["element_size"]
+
+
+def resolve_storage(backend, storage: str, B: int, top_down: bool, liveness, plan, regions: np.ndarray,
+                    held: Optional[np.ndarray]):
+    """
+    ``(storage, layout)`` of a query under its ``plan``: "dense" with no layout, or "compact" with its
+    :class:`CompactLayout` (:func:`query_layout`; ``regions``, ``held`` as there) -- "auto" the one whose per-sample
+    buffers take fewer floats (:meth:`CompactLayout.floats`, :func:`dense_floats`), compact when they tie.
+    """
+    if storage == "dense":
+        return "dense", None
+    layout = query_layout(backend, liveness, plan, regions, held)
+    if storage == "auto" and layout.floats(top_down) > dense_floats(backend, B, top_down):
+        return "dense", None
+    return "compact", layout
+
+
+def held_elsewhere(storage: str, held, carry: Optional[dict]) -> bool:
+    """Whether the values a query holds (``held``: bool [sum regions] arrays, None for none) are in the other storage
+    than ``storage``: compact ones come with their ``carry`` (see :func:`compact_buffers`), dense ones without."""
+    holds = any(h is not None and h.any() for h in held)
+    return holds and (carry is None) == (storage == "compact")
 
 
 @triton_jit
@@ -189,6 +219,15 @@ class CompactLayout:
         """``(offset, width)``: every sum region's rows' place and width (host lists), in ``node_flows`` (``kind``
         "flows") or ``node_mars`` ("mars")."""
         return (self.mars["sum_offsets"], self.mars["sum_widths"]) if kind == "mars" else (self.offset, self.width)
+
+    def floats(self, top_down: bool) -> int:
+        """The floats the query's per-sample buffers take: ``node_mars`` and ``element_mars``, and with ``top_down``
+        ``node_flows`` and ``element_flows`` (in ``element_mars``'s storage when that is large enough, see
+        :meth:`~..state.State.flows`)."""
+        out = self.mars["node_size"] + self.mars["element_size"]
+        if top_down:
+            out += self.size + (self.element_size if self.element_size > self.mars["element_size"] else 0)
+        return out
 
     def identity(self, size: int) -> torch.Tensor:
         """int32 ``0 .. size - 1`` on the device (the dense sum path's columns: a compact row's lanes in order)."""
@@ -380,23 +419,22 @@ def regather_into(state, prog, old: "CompactLayout", new: "CompactLayout", regio
     return out
 
 
-def compact_buffers(backend, liveness, plan, B: int, inputs_only: bool, regions: np.ndarray, held: Optional[np.ndarray],
-                    carry: Optional[dict]):
-    """
-    ``(layout, bufs)`` of a compact query: its :class:`CompactLayout` -- its top-down values those of the sum
+def query_layout(backend, liveness, plan, regions: np.ndarray, held: Optional[np.ndarray]) -> CompactLayout:
+    """The :class:`CompactLayout` of a compact query under its ``plan``: its top-down values those of the sum
     ``regions`` (bool), its inside values those it computes per sample and those it holds (``held``: None or bool [sum
-    regions]) -- and its buffers (:meth:`~..state.State.buffers`, ``inputs_only`` as there), the inside values it holds
-    re-gathered into them (:func:`regather_into`) from the layout of the query that left them, ``carry`` (see
-    :func:`~..queries.conditional.conditional`; required when the query holds some).
+    regions])."""
+    inside = plan.sample[backend.program().reg_iv_np]
+    return compact_layout(backend, liveness, regions, inside = inside if held is None else inside | held)
+
+
+def compact_buffers(backend, layout: CompactLayout, B: int, inputs_only: bool, carry: Optional[dict]):
     """
-    prog = backend.program()
-    inside = plan.sample[prog.reg_iv_np]
-    if held is not None:
-        assert not held.any() or carry is not None, "compact values held without the layout they are in"
-        inside = inside | held
-    layout = compact_layout(backend, liveness, regions, inside = inside)
+    The buffers of a compact query laid out by ``layout`` (:meth:`~..state.State.buffers`, ``inputs_only`` as there),
+    the inside values it holds re-gathered into them (:func:`regather_into`) from the layout of the query that left
+    them, ``carry`` (see :func:`~..queries.conditional.conditional`).
+    """
     allocate = lambda: backend.state.buffers(B, inputs_only, layout.mars)
     if carry is not None and carry["inside"].any():
-        return layout, regather_into(backend.state, prog, carry["layout"], layout, carry["inside"], carry["parents"],
-                                     allocate, "node_mars", "mars")
-    return layout, allocate()
+        return regather_into(backend.state, backend.program(), carry["layout"], layout, carry["inside"],
+                             carry["parents"], allocate, "node_mars", "mars")
+    return allocate()

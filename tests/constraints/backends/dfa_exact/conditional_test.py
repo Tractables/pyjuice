@@ -6,13 +6,18 @@ normalized rows cannot check: a factor common to every class cancels) against th
 blocks; ``log p(C, e)`` against the marginal; targets; evidence and constraints no string satisfies; the token tables'
 lifetime, in fp32 and bf16; tf32. Decoding with values reused between queries is in decoder_test.py.
 """
+import random
+
 import numpy as np
 import pytest
 import torch
 
 import pyjuice as juice
 import pyjuice.constraints as jc
+from pyjuice.constraints.backends.dfa_exact.kernels import compact as CP
+from pyjuice.constraints.backends.dfa_exact.queries import conditional as QC
 from pyjuice.constraints.backends.dfa_exact.queries import forward as F
+from pyjuice.constraints.backends.dfa_exact.queries import marginal as QM
 from pyjuice.constraints.backends.dfa_exact.queries.conditional import class_weights
 from pyjuice.constraints.backends.dfa_exact.kernels import score as S
 from pyjuice.constraints.backends.dfa_exact.kernels.score import score_tables
@@ -84,7 +89,7 @@ def test_conditionals_match_the_reference(kind, name, pattern, sum_path, build_p
     n = KINDS[kind]
     cc = jc.compile(CONSTRAINTS[name](), build_pc(kind, n, V))
     data, missing = evidence(pattern, n)
-    got, log_marginal = cc.conditional(data, missing, return_log_marginal = True)
+    got, log_marginal = cc.conditional(data, missing, return_log_marginal = True, storage = "dense")
     assert_rows_close(got, reference.conditional(cc, data, missing), n)
     fin = torch.isfinite(got).any(dim = 1)
     assert (torch.logsumexp(got[fin], dim = 1).abs() <= 1e-5).all()
@@ -104,7 +109,7 @@ def test_compact_storage_gives_the_same_rows(kind, name, pattern, sum_path, buil
     data, missing = evidence(pattern, n)
     got, log_marginal = cc.conditional(data, missing, return_log_marginal = True, storage = "compact")
     assert_rows_close(got, reference.conditional(cc, data, missing), n)
-    dense, dense_marginal = cc.conditional(data, missing, return_log_marginal = True)
+    dense, dense_marginal = cc.conditional(data, missing, return_log_marginal = True, storage = "dense")
     if sum_path == "fused" and kind in ["hmm", "hmm_untied", "hmm_block_sparse", "left_linear", "hand_left"]:
         assert torch.equal(got, dense) and torch.equal(log_marginal, dense_marginal)
     else:
@@ -121,7 +126,7 @@ def test_compact_keeps_no_inside_values_where_it_needs_none(kind, build_pc):
     data, missing = evidence("prefix", n)
     B = data.size(0)
     with juice.fast_inference():
-        dense = cc.conditional(data, missing)
+        dense = cc.conditional(data, missing, storage = "dense")
         full = cc.backend.state.storage("node_mars").numel()
         got = cc.conditional(data, missing, storage = "compact")
         held = cc.backend.state.storage("node_mars").numel()
@@ -131,8 +136,8 @@ def test_compact_keeps_no_inside_values_where_it_needs_none(kind, build_pc):
 
 
 def test_storage_option(build_pc):
-    """``storage`` is "dense" or "compact" (anything else raises); a marginal keeps no top-down value, and its compact
-    inside values give dense's bit for bit (an HMM's fused sums compute each lane alone)."""
+    """``storage`` is "auto", "dense" or "compact" (anything else raises); a marginal keeps no top-down value, and its
+    compact inside values give dense's bit for bit (an HMM's fused sums compute each lane alone)."""
     n = KINDS["hmm"]
     cc = jc.compile(CONSTRAINTS["contains"](), build_pc("hmm", n, V))
     data, missing = evidence("prefix", n)
@@ -140,7 +145,81 @@ def test_storage_option(build_pc):
         cc.conditional(data, missing, storage = "sparse")
     with pytest.raises(ValueError, match = "storage"):
         cc.marginal(data, missing, storage = "sparse")
-    assert torch.equal(cc.marginal(data, missing, storage = "compact"), cc.marginal(data, missing))
+    assert torch.equal(cc.marginal(data, missing, storage = "compact"), cc.marginal(data, missing, storage = "dense"))
+
+
+def wide_automaton(K = 48, accepting = 12, seed = 0):
+    rng = random.Random(seed)
+    return jc.DFA.from_dense(V, [[rng.randrange(K) for _ in range(V)] for _ in range(K)], 0,
+                             rng.sample(range(K), accepting))
+
+
+@pytest.mark.parametrize("query", ["conditional", "marginal"])
+@pytest.mark.parametrize("kind", ["pd", "hand_left"])
+def test_values_held_in_the_other_storage_are_computed_again(kind, query, build_pc):
+    """A query holding values left in the other storage (a decoder's, under "auto") computes them again: compact,
+    held values without the ``carry`` that compact ones come with; dense, a carry. Its rows are those of a query holding
+    nothing, and the report says so."""
+    n = KINDS[kind]
+    cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
+    data, missing = evidence("prefix", n)
+    reg_iv = cc.backend.program().reg_iv_np
+    run = (lambda **kw: QC.conditional(cc.backend, data, missing, **kw)) if query == "conditional" else \
+        (lambda **kw: QM.marginal(cc.backend, data, missing, **kw))
+    for storage in ("compact", "dense"):
+        fresh = {}
+        want = run(storage = storage, report = fresh)
+        plan = fresh["plan"]                              # hold every value the query computes per sample
+        if query == "conditional":
+            held = dict(inside = plan.sample[reg_iv], top_down = plan.top_down.sample)
+            assert held["inside"].any() or held["top_down"].any()
+        else:
+            held = plan.sample[reg_iv]
+            assert held.any()
+        carry = None
+        if storage == "dense":                            # a compact query's layout: the values said to be compact
+            other = {}
+            run(storage = "compact", report = other)
+            inside = held["inside"] if query == "conditional" else held
+            carry = dict(layout = other["compact"], inside = inside, regions = held["top_down"] if
+                         query == "conditional" else np.zeros_like(inside), parents = torch.arange(data.size(0)).cuda())
+        report = {}
+        got = run(storage = storage, held = held, carry = carry, report = report)
+        assert report["dropped"] and report["storage"] == storage
+        assert torch.equal(got, want), storage
+
+
+@pytest.mark.parametrize("query", ["conditional", "marginal"])
+@pytest.mark.parametrize("kind", ["pd", "pd_prod_dominated", "hand", "hmm"])
+def test_auto_storage_keeps_the_smaller_buffers(kind, query, build_pc):
+    """``storage = "auto"`` (the default): a query keeps its values dense where its compact buffers would take more
+    floats -- a 48-state automaton under any-order evidence observing one position per sample, whose live columns it
+    joins in few pairs (not an HMM's) -- else compact; its rows those of the storage it picks, bit for bit, and the
+    report says which."""
+    n = KINDS[kind]
+    cc = jc.compile(wide_automaton(), build_pc(kind, n, V))
+    B = 6
+    g = torch.Generator().manual_seed(0)
+    data = torch.randint(0, V, (B, n), generator = g)
+    order = torch.stack([torch.randperm(n, generator = g) for _ in range(B)])
+    run = (lambda **kw: QC.conditional(cc.backend, data, missing, **kw)) if query == "conditional" else \
+        (lambda **kw: QM.marginal(cc.backend, data, missing, **kw))
+    picked = set()
+    for s in range(n):
+        missing = torch.ones(B, n, dtype = torch.bool)
+        missing.scatter_(1, order[:, :s], False)
+        rows, reports = {}, {}
+        for storage in ("dense", "compact"):
+            reports[storage] = {}
+            rows[storage] = run(report = reports[storage], storage = storage)
+        floats = reports["compact"]["compact"].floats(query == "conditional")
+        want = "compact" if floats <= CP.dense_floats(cc.backend, B, query == "conditional") else "dense"
+        report = {}
+        got = run(report = report)
+        assert report["storage"] == want and (report["compact"] is None) == (want == "dense"), s
+        assert torch.equal(got, rows[want]), s
+        picked.add(want)
+    assert picked == ({"compact"} if kind == "hmm" else {"dense", "compact"})
 
 
 @pytest.mark.parametrize("pattern", ["none", "prefix", "mixed"])
@@ -156,7 +235,7 @@ def test_class_weights_match_the_reference(kind, name, pattern, sum_path, build_
     B, dev = data.size(0), cc.pc.params.device
     positions = missing.any(dim = 0).numpy()
     with torch.no_grad():
-        groups, _ = class_weights(cc.backend, data, missing.to(dev), positions)
+        groups, _ = class_weights(cc.backend, data, missing.to(dev), positions, storage = "dense")
     prog = cc.backend.program()
     score = score_tables(prog)
     C = cc.backend.num_classes

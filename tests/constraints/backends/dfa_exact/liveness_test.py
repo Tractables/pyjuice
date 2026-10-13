@@ -85,7 +85,7 @@ def marginal(cc, data, missing):
     bufs = cc.backend.state.buffers(data.size(0))
     bufs["node_mars"].fill_(float("nan"))
     bufs["element_mars"].fill_(float("nan"))
-    return cc.marginal(data, missing)
+    return cc.marginal(data, missing, storage = "dense")
 
 
 def obs_classes(cc, data, missing):
@@ -293,9 +293,9 @@ def test_pruning_engages_only_under_evidence(build_pc, monkeypatch):
     cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc("pd", n, V))
     prog = cc.backend.program()
     data, missing = evidence("none", n)
-    cc.marginal(data, missing)
+    cc.marginal(data, missing, storage = "dense")
     assert calls == []
-    cc.marginal(data)                                            # everything observed
+    cc.marginal(data, storage = "dense")                                            # everything observed
     assert calls == [1]
     data, missing = evidence("prefix", n)
     lv = liveness(prog, obs_classes(cc, data, missing), data.size(0))

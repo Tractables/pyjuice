@@ -9,6 +9,7 @@ for bit, and the reference's; (slow) it is faster than the circuit's own calls o
 fast_inference scope (its options reach it, it nests), one per circuit at a time, usable only inside its ``with``,
 with query defaults a call overrides.
 """
+import random
 import time
 
 import numpy as np
@@ -41,20 +42,32 @@ def sum_path(request, monkeypatch):
 
 
 class Spy:
-    """Every call's held values (None, or ``(inside, top_down)``, bool per sum region), the block moves and those of
-    live lanes only, and the compact re-gathers of inside (``"mars"``) and top-down (``"flows"``) values."""
+    """Every call's held values (None, or ``(inside, top_down)``, bool per sum region; None too when the call computed
+    them again, held in the other storage than the one it picked), the block moves and those of live lanes only, the
+    compact re-gathers of inside (``"mars"``) and top-down (``"flows"``) values, and the storage each call used."""
 
     def __init__(self, monkeypatch):
-        self.held, self.moves, self.live_moves, self.regathers = [], 0, 0, {"mars": 0, "flows": 0}
+        self.held, self.moves, self.live_moves, self.regathers, self.storage = [], 0, 0, {"mars": 0, "flows": 0}, []
+        self.plans, self.dropped = [], []
         conditional, marginal, move_blocks, regather = QD.conditional, QD.marginal, QD.move_blocks, CP.regather
 
-        def spy_conditional(*args, held = None, **kwargs):
-            self.held.append(None if held is None else (held["inside"].copy(), held["top_down"].copy()))
-            return conditional(*args, held = held, **kwargs)
+        def record(held, report):
+            self.held.append(None if held is None or report.get("dropped") else held)
+            self.storage.append(report.get("storage"))
+            self.plans.append(report.get("plan"))
+            self.dropped.append(bool(report.get("dropped")))
 
-        def spy_marginal(*args, held = None, **kwargs):
-            self.held.append(None if held is None else (held.copy(), np.zeros_like(held)))
-            return marginal(*args, held = held, **kwargs)
+        def spy_conditional(*args, held = None, report = None, **kwargs):
+            report = {} if report is None else report
+            out = conditional(*args, held = held, report = report, **kwargs)
+            record(None if held is None else (held["inside"].copy(), held["top_down"].copy()), report)
+            return out
+
+        def spy_marginal(*args, held = None, report = None, **kwargs):
+            report = {} if report is None else report
+            out = marginal(*args, held = held, report = report, **kwargs)
+            record(None if held is None else (held.copy(), np.zeros_like(held)), report)
+            return out
 
         def spy_move_blocks(*args, **kwargs):
             self.moves += 1
@@ -183,8 +196,8 @@ SCENARIOS = {"left to right": left_to_right, "any order": any_order, "beams": be
 
 def ask(target, query, step):
     if query == "marginal":
-        return target.marginal(step["data"], step.get("missing_mask"), **({"mask_id": step["mask_id"]}
-                                                                          if "mask_id" in step else {}))
+        return target.marginal(step["data"], step.get("missing_mask"), **{k: step[k] for k in ("mask_id", "storage")
+                                                                          if k in step})
     return target.conditional(**step)
 
 
@@ -287,6 +300,53 @@ def test_a_call_holds_what_the_evidence_left_unchanged(kind, storage, build_pc, 
     assert any(spy.anything(c) for c in range(1, n)) == (kind == "pd")   # an HMM's scopes are suffixes
 
 
+@pytest.mark.parametrize("kind, query", [("pd", "conditional"), ("pd_prod_dominated", "conditional"),
+                                         ("hand", "conditional"), ("hand", "marginal")])   # (a PD's marginals: compact)
+def test_an_auto_decoder_switching_storage_computes_its_values_again(kind, query, build_pc, monkeypatch):
+    """``storage = "auto"`` (the default), any-order decoding with a 48-state automaton: compact, then dense once every
+    sample observes one position (its live columns joined in few pairs), then compact again -- a call that picks the
+    other storage than the previous one computes the values held in that one again (into storage filled with NaN), and
+    keeps no other value than those it computed. The rows are the circuit's own."""
+    nan_new_storage(monkeypatch)
+    rng = random.Random(0)
+    K, n = 48, {"pd": 8, "pd_prod_dominated": 8, "hand": 5}[kind]
+    dfa = jc.DFA.from_dense(V, [[rng.randrange(K) for _ in range(V)] for _ in range(K)], 0, rng.sample(range(K), 12))
+    cc = jc.compile(dfa, build_pc(kind, n, V))
+    steps = any_order(n)
+    with juice.fast_inference():
+        want = [ask(cc, query, dict(s, storage = "dense")) for s in steps]
+    spy = Spy(monkeypatch)
+    reg_iv = cc.backend.program().reg_iv_np
+    got = []
+    with cc.decoder() as decoder:
+        for s in steps:
+            got.append(ask(decoder, query, s))
+            if spy.dropped[-1]:                                         # only what the call computed is kept
+                plan = spy.plans[-1]
+                assert not (decoder._kept.inside & ~plan.sample[reg_iv]).any()
+                assert plan.top_down is None or not (decoder._kept.top_down & ~plan.top_down.sample).any()
+    for i, (a, b) in enumerate(zip(got, want)):
+        assert_close(a, b, n, where = f"step {i}")
+    used = spy.storage
+    assert used[0] == "compact" and "dense" in used and used[-1] == "compact"
+    switches = [c for c in range(1, n) if used[c] != used[c - 1]]
+    assert all(not spy.anything(c) for c in switches)                  # each switch: nothing held
+    assert any(spy.anything(c) for c in range(1, n) if c not in switches)   # ... else held
+
+
+def test_a_call_that_computed_its_held_values_again_keeps_only_what_it_computed(build_pc):
+    """A call that computed again the values held in the other storage than the one it picked (``report["dropped"]``)
+    keeps none of them, only what it computed (here nothing); one that did not keeps them."""
+    n = KINDS["pd"]
+    cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc("pd", n, V))
+    ones = np.ones(len(cc.backend.sum_regions), dtype = bool)
+    with cc.decoder() as decoder:
+        decoder._after(4, "fp32", "auto", (ones, ones), {"storage": "dense", "dropped": True}, None)
+        assert not decoder._kept.inside.any() and not decoder._kept.top_down.any()
+        decoder._after(4, "fp32", "auto", (ones, ones), {"storage": "dense"}, None)
+        assert decoder._kept.inside.all() and decoder._kept.top_down.all() and decoder._kept.storage == "dense"
+
+
 def test_anything_else_using_the_buffers_or_another_precision_starts_afresh(build_pc, monkeypatch):
     """A circuit's own query between two calls, inside the session or not, overwrites the values the decoder would
     hold, and a call in another precision or storage computes them otherwise: the next call holds nothing, and is
@@ -298,7 +358,7 @@ def test_anything_else_using_the_buffers_or_another_precision_starts_afresh(buil
     with juice.fast_inference():
         want = [cc.conditional(**s) for s in steps]
     spy = Spy(monkeypatch)
-    with cc.decoder() as decoder:
+    with cc.decoder(storage = "dense") as decoder:
         for t in range(4):
             decoder.conditional(**steps[t])
         assert spy.anything(3)
@@ -311,7 +371,7 @@ def test_anything_else_using_the_buffers_or_another_precision_starts_afresh(buil
         decoder.conditional(**steps[6], precision = "tf32")
         assert_close(decoder.conditional(**steps[7]), want[7], n)
         assert spy.held[-1] is None
-    with cc.decoder() as decoder:
+    with cc.decoder(storage = "dense") as decoder:
         for t in range(4):
             decoder.conditional(**steps[t])
         decoder.conditional(**steps[4], storage = "compact")

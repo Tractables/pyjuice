@@ -229,29 +229,30 @@ class DFAExactBackend(Backend):
     # ---------------------------------------------------------------------------------------------
 
     def marginal(self, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None,
-                 precision: str = "fp32", storage: str = "dense") -> torch.Tensor:
+                 precision: str = "fp32", storage: str = "auto") -> torch.Tensor:
         """
         ``log p(C, e)`` for every sample (see :meth:`~pyjuice.constraints.ConstrainedCircuit.marginal`).
 
         :param precision: "fp32" (the default; fp32-level accuracy) or "tf32" for the sum layers' matrix products
-        :param storage: "dense" (the default) or "compact" (see :meth:`conditional`; a marginal keeps inside values
-            only)
+        :param storage: "auto" (the default), "dense" or "compact" (see :meth:`conditional`; a marginal keeps inside
+            values only)
         """
         from .queries.marginal import marginal
         return marginal(self, data, missing_mask, precision = precision, storage = storage)
 
     def conditional(self, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None,
                     targets: Optional[torch.Tensor] = None, return_log_marginal: bool = False,
-                    candidates: Optional[torch.Tensor] = None, precision: str = "fp32", storage: str = "dense"):
+                    candidates: Optional[torch.Tensor] = None, precision: str = "fp32", storage: str = "auto"):
         """
         ``log p(x_t = v | e, C)`` for every target, of every token or of the ``candidates`` (see
         :meth:`~pyjuice.constraints.ConstrainedCircuit.conditional`).
 
         :param precision: "fp32" (the default; fp32-level accuracy) or "tf32" for the matrix products; inside
             ``pyjuice.fast_inference(allow_bf16_params = True)`` the token probabilities are scored in bfloat16
-        :param storage: "dense" (the default) or "compact": keep the per-sample values of every pair of automaton
-            states, or under evidence only of each sample's live ones (far less memory when the evidence pins the
-            automaton down, as a decoded prefix does)
+        :param storage: "auto" (the default), "dense" or "compact": keep the per-sample values of every pair of
+            automaton states, or under evidence only of each sample's live ones (far less memory when the evidence pins
+            the automaton down, as a decoded prefix does; more where it joins few of them); "auto" picks the one whose
+            buffers are smaller, per query
         """
         from .queries.conditional import conditional
         return conditional(self, data, missing_mask, targets, precision = precision,

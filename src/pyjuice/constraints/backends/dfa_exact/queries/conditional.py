@@ -21,7 +21,8 @@ import torch
 
 from . import forward as F
 from ..kernels.common import pack_aligned
-from ..kernels.compact import STORAGES, compact_buffers, regather_into
+from ..kernels.compact import (STORAGES, compact_buffers, held_elsewhere, query_layout, regather_into,
+                               resolve_storage)
 from ..kernels.live import liveness
 from ..kernels.score import score_group, score_tables
 from .plans import PLANS_PER_POSITION, PLAN_CACHE_SIZE, per_sample_intervals, prior_regions, query_plan, top_down_prior
@@ -92,7 +93,7 @@ def _check(backend, data: torch.Tensor, precision: str, storage: str = "dense"):
 
 def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions: np.ndarray, precision: str = "fp32",
                   held: Optional[dict] = None, observed: Optional[np.ndarray] = None, layout = None,
-                  report: Optional[dict] = None, storage: str = "dense", carry: Optional[dict] = None):
+                  report: Optional[dict] = None, storage: str = "auto", carry: Optional[dict] = None):
     """
     The forward and top-down passes of a conditional query: the log class weights of every input node over the
     target ``positions`` (bool [n], host), every sample's, summed per row of the class masses (see
@@ -101,8 +102,10 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     :param missing: [B, n] bool on the device, True where a token is missing
     :param held: see :func:`conditional`
     :param observed: None, or bool [n] (host): the positions some sample observes (read off ``missing`` if None)
-    :param report: None, or a dict where the query leaves its :class:`~.plans.QueryPlan` (``"plan"``) and its
-        :class:`~..kernels.live.Liveness` (``"liveness"``; None when it observes nothing)
+    :param report: None, or a dict where the query leaves its :class:`~.plans.QueryPlan` (``"plan"``), its
+        :class:`~..kernels.live.Liveness` (``"liveness"``; None when it observes nothing, dense), its
+        :class:`~..kernels.compact.CompactLayout` (``"compact"``; None when dense), the storage it used (``"storage"``,
+        "dense" or "compact") and whether it computed again the values held in the other one (``"dropped"``)
     :param layout: None, or ``(groups, size, (base, K))``: :func:`_layout`'s groups and size, and its ``base`` and
         ``K`` already on the device (int64 [n] each) -- copied before the query launches anything, as copies from the
         host wait for the stream
@@ -126,30 +129,43 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     obs_class = torch.where(missing, -1, backend.token_classes.token_class[x]).contiguous()
     # compact, a query needs its liveness even with nothing observed: every column is live, but only the regions it
     # computes per sample get rows (none, every value input-independent, inside fast_inference)
-    lv = liveness(prog, obs_class, B) if observed.any() or storage == "compact" else None
+    lv = liveness(prog, obs_class, B) if observed.any() or storage != "dense" else None
     valid, kept = backend.state.prior_validity()
     prior = prior_regions(prog, observed, B, kept, lv)
     pf = backend.state.prior_flows(np.zeros(len(backend.sum_regions), dtype = bool))
-    top = dict(program = td, once = top_down_prior(prog, td, observed, B, kept, lv), valid = pf["valid"].copy(),
-               held = held.get("top_down"), scoring = True)
-    plan = query_plan(prog, observed, positions, valid.numpy(), prior, held = held.get("inside"), top_down = top)
-    compact = storage == "compact"
+    once, pf_valid = top_down_prior(prog, td, observed, B, kept, lv), pf["valid"].copy()
+
+    def plan_for(held):
+        top = dict(program = td, once = once, valid = pf_valid, held = held.get("top_down"), scoring = True)
+        return query_plan(prog, observed, positions, valid.numpy(), prior, held = held.get("inside"), top_down = top)
+
+    plan = plan_for(held)
+    storage, compact = resolve_storage(backend, storage, B, True, lv, plan, plan.top_down.per_sample,
+                                       held.get("inside"))
+    dropped = held_elsewhere(storage, held.values(), carry)
+    if dropped:                                         # held in the other storage: computed again
+        held, carry = {}, None
+        plan = plan_for(held)
+        if compact is not None:
+            compact = query_layout(backend, lv, plan, plan.top_down.per_sample, None)
     held_inside = held.get("inside")
-    inputs_only = compact and not plan.sample.any() and (held_inside is None or not held_inside.any())
-    if compact:                                         # rows for the per-sample values only, walked in their own
-        compact, bufs = compact_buffers(backend, lv, plan, B, inputs_only, plan.top_down.per_sample, held_inside,
-                                        carry)          # order, the held ones re-gathered into this query's layout
+    inputs_only = compact is not None and not plan.sample.any() and (held_inside is None or not held_inside.any())
+    if compact is not None:                             # rows for the per-sample values only, walked in their own
+        bufs = compact_buffers(backend, compact, B, inputs_only, carry)   # order, the held ones re-gathered into them
     else:
+        if lv is not None and not observed.any():        # (laid out for "auto", but dense: nothing to prune)
+            lv = None
         if lv is not None:
             lv.order(per_sample_intervals(prog, plan))
-        compact, bufs = None, backend.state.buffers(B)
+        bufs = backend.state.buffers(B)
     if compact is not None and carry is not None and carry["regions"].any():
         flows = regather_into(backend.state, prog, carry["layout"], compact, carry["regions"], carry["parents"],
                               lambda: backend.state.flows(B, bufs, compact))
     else:
         flows = backend.state.flows(B, bufs, compact)
     if report is not None:
-        report.update(plan = plan, liveness = lv, compact = compact, inputs_only = inputs_only)
+        report.update(plan = plan, liveness = lv, compact = compact, inputs_only = inputs_only, storage = storage,
+                      dropped = dropped)
     class_mars = F.run_forward(backend, bufs, plan, x, missing, obs_class, lv, precision, compact)
     valid |= plan.todo
 
@@ -166,7 +182,7 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
 def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None,
                 targets: Optional[torch.Tensor] = None, precision: str = "fp32", return_log_marginal: bool = False,
                 held: Optional[dict] = None, candidates: Optional[torch.Tensor] = None, report: Optional[dict] = None,
-                storage: str = "dense", carry: Optional[dict] = None):
+                storage: str = "auto", carry: Optional[dict] = None):
     """
     ``log p(x_t = v | e, C)`` for every target ``(b, t)`` and token ``v`` (or candidate ``v``): one row per target, in
     the order ``dense[targets]`` lists them (sample by sample, positions in order); -inf rows where ``p(e, C) = 0``.
@@ -186,11 +202,14 @@ def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor
     :param report: None, or a dict where the query leaves its :class:`~.plans.QueryPlan`,
         :class:`~..kernels.live.Liveness` and :class:`~..kernels.compact.CompactLayout` (see :func:`class_weights`;
         none when it computes nothing)
-    :param storage: "dense" (the default) or "compact": how the query keeps its per-sample values -- every lane of
-        every block, or only the pairs of each sample's live columns, and only of the regions the query needs per
-        sample (see :mod:`~..kernels.compact`) -- and, compact, no per-sample inside value at all where it computes
+    :param storage: "auto" (the default), "dense" or "compact": how the query keeps its per-sample values -- every
+        lane of every block, or only the pairs of each sample's live columns, and only of the regions the query needs
+        per sample (see :mod:`~..kernels.compact`) -- and, compact, no per-sample inside value at all where it computes
         and holds none (a prefix's next token on an HMM: every per-sample scope holds the prefix's last position).
-        Compact takes far less memory when the evidence leaves few live columns, and skips the dead lanes' work
+        Compact takes far less memory when the evidence leaves few live columns, and skips the dead lanes' work; but
+        every pair of a sample's live columns has a lane, joined or not, so it takes more where the automaton joins
+        few of them (sparse evidence on a wide automaton). "auto" picks the one whose buffers are smaller
+        (:func:`~..kernels.compact.resolve_storage`); values held in the other storage are computed again
     :param carry: compact, the values ``held`` marks are in ``node_mars`` and ``node_flows`` as a previous query laid
         them out, not yet as this one does: a dict with that query's ``layout`` (its
         :class:`~..kernels.compact.CompactLayout`), the regions whose inside (``inside``) and top-down (``regions``)

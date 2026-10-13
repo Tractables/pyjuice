@@ -19,7 +19,9 @@ a term of a product that is -inf anyway.
 
 Nothing is reused after a call where a row continues no row of the previous one (a new prompt, a position observed and
 then missing again). Nothing is reused when anything else used the buffers in between (:attr:`~..state.State.epoch`:
-another query, inside the session or not), or when the precision or the storage changed.
+another query, inside the session or not), or when the precision or the storage changed -- also under ``storage =
+"auto"`` (the default), where every call picks the storage of its own values (see :func:`~.conditional.conditional`):
+one that picks the other storage than the previous call's computes the values again.
 
 Compact (``storage = "compact"``, :mod:`..kernels.compact`), a call's values are laid out by its own liveness, which
 only the call knows: the values held, inside and top-down, are re-gathered into its rows by the call itself
@@ -55,7 +57,8 @@ class _Kept:
     """What the buffers hold after a decoder's call: per sum region, whether ``node_mars`` holds its per-sample inside
     values for the call's rows, and whether ``node_flows`` holds its top-down values. They are valid while the state
     is the same (a weak reference: a backend moved to another device frees its old state), its buffers were not used
-    since (``epoch``), and the next call has the same ``precision`` and ``storage``. ``liveness``: the call's liveness
+    since (``epoch``), and the next call has the same ``precision`` and ``storage`` (the one the call used: "dense"
+    or "compact"; a call asking "auto" uses them if it picks it too). ``liveness``: the call's liveness
     (None: every lane), whose live lanes hold their true values in every region valid here; ``compact``: the layout of
     the values when compact (None: dense)."""
     state: weakref.ref
@@ -89,7 +92,7 @@ class DFAExactDecoder(Decoder):
         return super().__exit__(*exc)
 
     def _marginal(self, data: torch.Tensor, missing: torch.Tensor, precision: str = "fp32",
-                  storage: str = "dense") -> torch.Tensor:
+                  storage: str = "auto") -> torch.Tensor:
         be = self.cc.backend
         held, keep, compact, carry = self._reuse(data, missing, None, precision, storage, marginal = True)
         report = {}
@@ -100,7 +103,7 @@ class DFAExactDecoder(Decoder):
 
     def _conditional(self, data: torch.Tensor, missing: torch.Tensor, targets: Optional[torch.Tensor],
                      return_log_marginal: bool, candidates: Optional[torch.Tensor], precision: str = "fp32",
-                     storage: str = "dense"):
+                     storage: str = "auto"):
         be = self.cc.backend
         held, keep, compact, carry = self._reuse(data, missing, targets, precision, storage, marginal = False)
         report = {}
@@ -125,7 +128,7 @@ class DFAExactDecoder(Decoder):
         be = self.cc.backend
         state, B = be.state, data.size(0)
         if kept is None or kept.state() is not state or kept.epoch != state.epoch or kept.precision != precision or \
-                kept.storage != storage:
+                storage not in ("auto", kept.storage):                  # (auto: the call says if it uses them)
             return None, None, None, None
         if not marginal:
             asked = (missing if targets is None else targets).cpu().numpy()  # every missing position by default
@@ -191,11 +194,21 @@ class DFAExactDecoder(Decoder):
                     prog = prog)
 
     def _after(self, B: int, precision: str, storage: str, keep, report: dict, compact: Optional[CompactLayout]):
-        """What the buffers hold after a call: what it kept, and what it computed per sample. Compact, the values are
-        laid out by the call's own layout if it made one (only those it has rows for, held or computed; a marginal's
-        has none for top-down values), else by ``compact``, the one they were in before it (None: given up)."""
+        """What the buffers hold after a call: what it kept, and what it computed per sample, in the storage it used
+        (``storage`` "auto": the one the call reports, or for a call that returned early the one its held values are
+        in, compact if ``compact``). Compact, the values are laid out by the call's own layout if it made one (only
+        those it has rows for, held or computed; a marginal's has none for top-down values), else by ``compact``, the
+        one they were in before it (None: given up). A call that computed again the values held in the other storage
+        keeps none of them."""
         be = self.cc.backend
         R = len(be.sum_regions)
+        storage = report.get("storage", storage)
+        if storage == "auto":
+            storage = "compact" if compact is not None else "dense"
+        if storage == "dense":                                          # (the values held before were compact)
+            compact = None
+        if report.get("dropped"):
+            keep = None
         inside, top_down = (np.zeros(R, dtype = bool),) * 2 if keep is None else keep
         inside, top_down = inside.copy(), top_down.copy()
         plan = report.get("plan")
