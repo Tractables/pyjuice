@@ -152,9 +152,10 @@ def top_down_program(backend) -> TopDownProgram:
         else:
             okinds = (c_kind, r_kind if side == "L" else l_kind, out_temp)
         ch = torch.tensor([[r, g, ad, 0] for (r, g), ad in zip(children, add)], dtype = torch.int32, device = dev)
+        child_iv, parent_iv = iv_index(a.numpy()[ptr_np[:-1]], b.numpy()[ptr_np[:-1]]), iv_index(pa, pb)
         host = dict(children = np.asarray([[r, g, ad] for (r, g), ad in zip(children, add)], dtype = np.int64),
-                    ptr = ptr_np, parents = par.numpy(), parent_iv = iv_index(pa, pb),
-                    child_iv = iv_index(a.numpy()[ptr_np[:-1]], b.numpy()[ptr_np[:-1]]))
+                    ptr = ptr_np, parents = par.numpy(), parent_iv = parent_iv, child_iv = child_iv,
+                    parent_ivs = np.unique(parent_iv), child_ivs = np.unique(child_iv))
         return TopDownLaunch(form, side, okinds, ch, torch.tensor(ptr, dtype = torch.int32, device = dev),
                              par.to(dev, torch.int32).contiguous(), int(entry.max()), int(exit_.max()),
                              int(slots.max()), host)

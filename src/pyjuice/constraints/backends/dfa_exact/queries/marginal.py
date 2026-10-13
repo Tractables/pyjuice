@@ -93,8 +93,8 @@ def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] =
             rows = base + torch.arange(root_end - root_first, device = dev) * prior["width"][r]
             return prior["mars"][rows][None, :].expand(B, -1).contiguous()
         lay = bufs["layout"]
-        base = lay["sum_offsets"][r] + (root_first - backend.sum_regions[r][0]) * lay["sum_widths"][r]
-        width = lay["sum_widths"][r]
+        width = int(lay["sum_widths"][r])
+        base = int(lay["sum_offsets"][r]) + (root_first - backend.sum_regions[r][0]) * width
         rows = base + torch.arange(root_end - root_first, device = dev)[:, None] * width
         if compact is None:
             return bufs["node_mars"][rows + torch.arange(B, device = dev)[None, :]].t().contiguous()

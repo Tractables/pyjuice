@@ -62,7 +62,8 @@ class TopDownLaunch:
         parent's triple index in a 9th field
     :ivar E_max, X_max, S_max: the most entry columns, exit columns and slots of the children's blocks
     :ivar host: for query plans, numpy copies: ``children`` [C, 3] (row, region, add), ``ptr``, ``parents``, and every
-        child's (``child_iv``) and parent's (``parent_iv``) interval, by ``prog.intervals``' numbers
+        child's (``child_iv``) and parent's (``parent_iv``) interval, by ``prog.intervals``' numbers -- and those
+        intervals each once (``child_ivs``, ``parent_ivs``; for compact storage, see :mod:`.compact`)
     """
 
     form: str
@@ -790,7 +791,7 @@ def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_
         idx = tensor(idx)
         Cn = la.children.size(0) if idx is None else idx.numel()
         indexed = dict(children_idx = la.children if idx is None else idx, INDEXED = idx is not None)
-        lanes_max = compact.lanes(la.host["child_iv"]) if compact is not None else B * la.S_max   # a child's most
+        lanes_max = compact.lanes(la.host["child_ivs"]) if compact is not None else B * la.S_max   # a child's most
         if la.form == "copy":
             c_kind, out_temp = la.kinds
             tile = _tile(max(lanes_max, 1))
@@ -818,7 +819,7 @@ def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_
                     C_FULL = c_full, OUT_FULL = out_full, TILE = tile, num_warps = 4, **indexed, **common, **lists)
         elif compact is not None:                    # block @ block on compact values, a sample's rectangle at a time
             c_kind, o_kind, out_temp = la.kinds
-            ends = prog.iv_ends_np[la.host["child_iv"]]
+            ends = prog.iv_ends_np[la.host["child_ivs"]]
             rmax, cmax = int(compact.max_count[ends[:, 0]].max()), int(compact.max_count[ends[:, 1]].max())
             TM, TN, TK, warps = compact_tiles(rmax, cmax)
             tiles = host_cdiv(rmax, TM) * host_cdiv(cmax, TN)

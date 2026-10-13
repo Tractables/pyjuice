@@ -55,9 +55,9 @@ def test_rectangles_ranks_and_rows(kind, build_pc):
         assert cl.total[k] == want[-1]
     lanes = cl.total[prog.reg_iv_all]
     want_width = np.where(regions, (lanes + 15) // 16 * 16, 0)
-    assert cl.width == want_width.tolist()
+    assert cl.width.tolist() == want_width.tolist()
     rows = prog.reg_rows
-    assert cl.offset == np.concatenate([[0], np.cumsum(rows * want_width)[:-1]]).tolist()
+    assert cl.offset.tolist() == np.concatenate([[0], np.cumsum(rows * want_width)[:-1]]).tolist()
     assert cl.size == int((rows * want_width).sum())
     assert torch.equal(cl.lanes_t.cpu(), torch.from_numpy(lanes))
     assert torch.equal(cl.offset_t.cpu(), torch.tensor(cl.offset)) and torch.equal(cl.width_t.cpu(),
@@ -66,8 +66,8 @@ def test_rectangles_ranks_and_rows(kind, build_pc):
     # the inside values: the input rows first (a value per sample), then the regions given, as the top-down values'
     mars, inputs = cl.mars, (cc.backend.input_range[1] * B + 15) // 16 * 16
     want_width = np.where(inside, (lanes + 15) // 16 * 16, 0)
-    assert mars["sum_widths"] == want_width.tolist()
-    assert mars["sum_offsets"] == (inputs + np.concatenate([[0], np.cumsum(rows * want_width)[:-1]])).tolist()
+    assert mars["sum_widths"].tolist() == want_width.tolist()
+    assert mars["sum_offsets"].tolist() == (inputs + np.concatenate([[0], np.cumsum(rows * want_width)[:-1]])).tolist()
     assert mars["node_size"] == inputs + int((rows * want_width).sum())
     assert torch.equal(mars["sum_offsets_t"].cpu(), torch.tensor(mars["sum_offsets"]))
     assert torch.equal(mars["sum_widths_t"].cpu(), torch.tensor(mars["sum_widths"]))

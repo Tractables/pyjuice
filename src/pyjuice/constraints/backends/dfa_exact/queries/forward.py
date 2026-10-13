@@ -152,14 +152,14 @@ def _sums(backend, parts, block_size: int, nodes: torch.Tensor, element_mars: to
     """A sum layer's parts a query plan runs (``(dense runs, num_edges, fused)``: the runs ``(region, c0, blocks,
     key)``, and None or ``(fused part, index list of its node blocks or None for all, count, most slots)``, see
     :func:`~.plans.query_plan`) into ``nodes`` -- ``node_mars``, or ``prior_mars`` with ``B`` 1 and no pruning --
-    whose sum regions ``regions`` (device tensors) and ``offsets`` / ``widths`` (Python ints) describe. ``compact``:
-    the query's :class:`~..kernels.compact.CompactLayout`, by which the rows are compact -- a batch of one whose slots
-    are the lanes (``regions``' ``slots``), every lane computed."""
+    whose sum regions ``regions`` (device tensors) and ``offsets`` / ``widths`` (host, a value per region) describe.
+    ``compact``: the query's :class:`~..kernels.compact.CompactLayout`, by which the rows are compact -- a batch of one
+    whose slots are the lanes (``regions``' ``slots``), every lane computed."""
     prog, pc = backend.program(), backend.pc
     dot = PRECISIONS[precision]
     for runs, num_edges, fused in parts:
         for r, c0, blocks, key in runs:
-            region = (offsets[r], widths[r], prog.firsts[r])
+            region = (int(offsets[r]), int(widths[r]), prog.firsts[r])
             ncols = B * prog.slots[r]
             cols = None                                                  # every column live
             if compact is not None:                                      # a compact row's lanes, in order

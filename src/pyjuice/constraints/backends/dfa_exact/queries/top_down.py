@@ -95,12 +95,12 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
     if computed:
         cols = B * prog.slots[r] if compact is None else int(compact.total[prog.reg_iv_all[r]])
         dest, offset, width, cols = (pf["flows"], pf["offset"][r], pf["width"][r], prog.slots[r]) if root_once else \
-            (node_flows, f_offsets[r], f_widths[r], cols)
+            (node_flows, int(f_offsets[r]), int(f_widths[r]), cols)
         base = offset + (prog.root_rows[0] - prog.firsts[r]) * width
         for row in range(prog.root_rows[1] - prog.root_rows[0]):
             dest[base + row * width:base + row * width + cols] = 0.0
     if td.dead is not None:                              # rows no launch writes, of the regions computed per sample
-        dead_width = max(f_widths[r] for r in td.dead_regions)
+        dead_width = max(int(f_widths[r]) for r in td.dead_regions)
         if dead_width > 0:
             fill_dead_rows(node_flows, td.dead, fregions, dead_width)
 
@@ -135,8 +135,8 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
                                 stacks[key] = stacked_weights(pc.params, key[2], key[0], block_size)
                             stacked = stacks[key]
                         dense_sum_top_down(element_flows, nf, pc.params, blocks, E, block_size,
-                                          (offsets[r], widths[r], prog.firsts[r]), c0, elem_first, ew, ncols, dot,
-                                          add, live = cols, stacked = stacked, piece = piece)
+                                          (int(offsets[r]), int(widths[r]), prog.firsts[r]), c0, elem_first, ew,
+                                          ncols, dot, add, live = cols, stacked = stacked, piece = piece)
                     for cbs, tables, idx in fused_groups[part]:
                         max_cols = compact.sum_lanes if part == 1 and compact is not None else nb * tables["max_slots"]
                         if max_cols == 0:
@@ -188,7 +188,7 @@ def _sample_temp_intervals(stages) -> np.ndarray:
     for _, sample_launches, _ in stages:
         for la, _ in sample_launches:
             if la.kinds[0] != SUM:
-                ivs.append(la.host["child_iv"])
+                ivs.append(la.host["child_ivs"])
             if la.kinds[2 if la.form == "block_block" else 1]:
-                ivs.append(la.host["parent_iv"])
+                ivs.append(la.host["parent_ivs"])
     return np.concatenate(ivs)

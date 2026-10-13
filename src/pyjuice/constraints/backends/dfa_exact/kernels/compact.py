@@ -169,11 +169,9 @@ class CompactLayout:
     :ivar total: int64 [intervals] (host): every interval's lanes per row
     :ivar steps: the steps of a binary search over ``B + 1`` offsets
     :ivar count, start, columns, rank: the query's live lists and ranks (:meth:`~.live.Liveness.lists`)
-    :ivar offset, width: per sum region, its rows' place and width in ``node_flows`` (host lists; width 0 for a region
-        without per-sample values), and ``offset_t``, ``width_t``, ``lanes_t`` (int64 on the device; ``lanes_t``: its
-        rows' lanes) and ``size``, the floats of ``node_flows``
-    :ivar host_rows: :meth:`rows`' tables, by kind: the regions' rows' places and widths as int64 arrays (host), for
-        the tables a re-gather builds over many regions at once (the lists serve one region at a time)
+    :ivar offset, width: per sum region, its rows' place and width in ``node_flows`` (int64 arrays, host; width 0 for a
+        region without per-sample values), and ``offset_t``, ``width_t``, ``lanes_t`` (int64 on the device;
+        ``lanes_t``: its rows' lanes) and ``size``, the floats of ``node_flows``
     :ivar sum_lanes: the most lanes of a row of a region with per-sample values
     :ivar max_count: int64 [n + 1] (host): every boundary's most live columns of a sample
     :ivar elem_width: per product layer group, the width of its rows in ``element_flows`` (as wide as the compact values
@@ -181,9 +179,10 @@ class CompactLayout:
         block kept once), and ``element_size``, the floats ``element_flows`` needs
     :ivar sample_ivs: bool [intervals] (host): those of the sum regions with per-sample values
     :ivar mars: None (the inside values dense), or where the query keeps its per-sample inside values compact, as
-        :func:`~..compiled.tables.buffer_layout` says it for dense ones (:func:`compact_layout`), with ``sum_offsets_t``
-        / ``sum_widths_t`` on the device, ``lanes`` (the most lanes of a row of a region with per-sample inside values),
-        ``regions`` (bool [sum regions], host: those with rows) and ``ivs`` (bool [intervals], host: their intervals)
+        :func:`~..compiled.tables.buffer_layout` says it for dense ones (:func:`compact_layout`) -- but ``sum_offsets``
+        / ``sum_widths`` int64 arrays (host), and ``sum_offsets_t`` / ``sum_widths_t`` on the device --, with ``lanes``
+        (the most lanes of a row of a region with per-sample inside values), ``regions`` (bool [sum regions], host:
+        those with rows) and ``ivs`` (bool [intervals], host: their intervals)
     """
 
     B: int
@@ -194,9 +193,8 @@ class CompactLayout:
     start: torch.Tensor
     columns: torch.Tensor
     rank: torch.Tensor
-    offset: list
-    width: list
-    host_rows: dict
+    offset: np.ndarray
+    width: np.ndarray
     offset_t: torch.Tensor
     width_t: torch.Tensor
     lanes_t: torch.Tensor
@@ -221,7 +219,7 @@ class CompactLayout:
     def rows(self, kind: str):
         """``(offset, width)``: every sum region's rows' place and width (int64 arrays, host), in ``node_flows``
         (``kind`` "flows") or ``node_mars`` ("mars")."""
-        return self.host_rows[kind]
+        return (self.mars["sum_offsets"], self.mars["sum_widths"]) if kind == "mars" else (self.offset, self.width)
 
     def floats(self, top_down: bool) -> int:
         """The floats the query's per-sample buffers take: ``node_mars`` and ``element_mars``, and with ``top_down``
@@ -264,19 +262,16 @@ def compact_layout(backend, liveness, regions: np.ndarray, inside: Optional[np.n
     sample_ivs = _region_ivs(prog, regions, K)
     elem_width, element_size = _group_widths(prog, total, sample_ivs)
     arrays = [offset, width, lanes]
-    host_rows = dict(flows = (offset, width))
     mars = None
     if inside is not None:
         mars = _mars_layout(backend, prog, total, lanes, inside, B)
         arrays += [mars["sum_offsets"], mars["sum_widths"]]
-        host_rows["mars"] = (mars["sum_offsets"], mars["sum_widths"])
     tables = _upload(prog, arrays)
     if mars is not None:
-        mars.update(sum_offsets = mars["sum_offsets"].tolist(), sum_widths = mars["sum_widths"].tolist(),
-                    sum_offsets_t = tables[3], sum_widths_t = tables[4])
+        mars.update(sum_offsets_t = tables[3], sum_widths_t = tables[4])
     return CompactLayout(B = B, off = off, total = total, steps = max(1, int(np.ceil(np.log2(B + 1)))), count = count,
-                         start = start, columns = columns, rank = liveness.rank, offset = offset.tolist(),
-                         width = width.tolist(), host_rows = host_rows, offset_t = tables[0], width_t = tables[1], lanes_t = tables[2],
+                         start = start, columns = columns, rank = liveness.rank, offset = offset, width = width,
+                         offset_t = tables[0], width_t = tables[1], lanes_t = tables[2],
                          size = int((prog.reg_rows * width).sum()), sum_lanes = int(lanes[regions].max(initial = 0)),
                          max_count = max_count, sample_ivs = sample_ivs, elem_width = elem_width,
                          element_size = element_size, prog = prog, mars = mars)
@@ -316,7 +311,7 @@ def _upload(prog, arrays) -> list:
 
 
 def _mars_layout(backend, prog, total: np.ndarray, lanes: np.ndarray, inside: np.ndarray, B: int) -> dict:
-    """:attr:`CompactLayout.mars`, but its rows' offsets and widths as arrays and not on the device: ``node_mars``'s
+    """:attr:`CompactLayout.mars`, but its rows' offsets and widths not on the device: ``node_mars``'s
     input rows as dense ones (a value per sample, where pyjuice's input layers write them), then the compact rows of
     the sum regions ``inside`` (bool), none for the others; per product layer group, ``element_mars``'s rows as wide
     as the compact values of its products under those regions, or one sample's block kept once."""
