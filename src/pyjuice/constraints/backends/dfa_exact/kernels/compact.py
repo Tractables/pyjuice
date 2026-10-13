@@ -12,7 +12,7 @@ a HOLE, both ends live but no path between them inside the interval -- holds -in
 The per-sample top-down values are compact: ``node_flows``, the products' in ``element_flows`` and the folds' in the
 scratch rows. So are the per-sample inside values (:attr:`CompactLayout.mars`): the sums' in ``node_mars`` (whose
 input rows stay as they are, a value per sample), the products' in ``element_mars`` and the folds' in the scratch rows
-(but a decoder's, see :func:`inside_compact`). The values kept once stay dense (a batch of one, in ``prior_mars`` and
+(:func:`compact_buffers`). The values kept once stay dense (a batch of one, in ``prior_mars`` and
 ``prior_flows``); a row that may hold either (a product's, a fold's) is as wide as both need.
 """
 
@@ -34,12 +34,6 @@ from .common import _slot, pack_aligned
 
 #: the storages a query can keep its per-sample values in
 STORAGES = ("dense", "compact")
-
-
-def inside_compact(prog, storage: str, held: Optional[np.ndarray]) -> bool:
-    """Whether a query of ``storage`` keeps its per-sample inside values compact: compact storage, unless the query
-    holds some (bool [sum regions], a decoder's: kept dense)."""
-    return storage == "compact" and (held is None or not held.any())
 
 
 @triton_jit
@@ -156,8 +150,8 @@ class CompactLayout:
     :ivar sample_ivs: bool [intervals] (host): those of the sum regions with per-sample values
     :ivar mars: None (the inside values dense), or where the query keeps its per-sample inside values compact, as
         :func:`~..compiled.tables.buffer_layout` says it for dense ones (:func:`compact_layout`), with ``sum_offsets_t``
-        / ``sum_widths_t`` on the device, ``lanes`` (the most lanes of a row of a region with per-sample inside values)
-        and ``ivs`` (bool [intervals], host: those of the regions with per-sample inside values)
+        / ``sum_widths_t`` on the device, ``lanes`` (the most lanes of a row of a region with per-sample inside values),
+        ``regions`` (bool [sum regions], host: those with rows) and ``ivs`` (bool [intervals], host: their intervals)
     """
 
     B: int
@@ -190,6 +184,11 @@ class CompactLayout:
     def row_width(self, ivs, slots: int) -> int:
         """The width of rows that hold the compact values of the intervals ``ivs``, or a batch of one's ``slots``."""
         return int(_aligned(max(self.lanes(ivs), slots)))
+
+    def rows(self, kind: str):
+        """``(offset, width)``: every sum region's rows' place and width (host lists), in ``node_flows`` (``kind``
+        "flows") or ``node_mars`` ("mars")."""
+        return (self.mars["sum_offsets"], self.mars["sum_widths"]) if kind == "mars" else (self.offset, self.width)
 
     def identity(self, size: int) -> torch.Tensor:
         """int32 ``0 .. size - 1`` on the device (the dense sum path's columns: a compact row's lanes in order)."""
@@ -283,7 +282,7 @@ def _mars_layout(backend, prog, total: np.ndarray, lanes: np.ndarray, inside: np
     elem, size = _group_widths(prog, total, ivs)
     return dict(input_offset = 0, sum_offsets = base + _row_offsets(prog.reg_rows, width), sum_widths = width,
                 node_size = base + int((prog.reg_rows * width).sum()), element_widths = elem, element_size = size,
-                lanes = int(lanes[inside].max(initial = 0)), ivs = ivs)
+                lanes = int(lanes[inside].max(initial = 0)), ivs = ivs, regions = inside)
 
 
 #: rows of a region one re-gather program copies, and its lanes; floats a segment copy's program copies
@@ -317,23 +316,25 @@ def _regather_kernel(src, dst, table, parents, old_off, old_count, old_rank, off
 
 
 def regather(prog, old: "CompactLayout", src: torch.Tensor, new: "CompactLayout", dst: torch.Tensor,
-             regions: np.ndarray, parents: torch.Tensor, dst_offset: Optional[np.ndarray] = None):
+             regions: np.ndarray, parents: torch.Tensor, dst_offset: Optional[np.ndarray] = None, rows: str = "flows"):
     """
-    The compact top-down values of the sum ``regions`` (bool [sum regions]) from ``src``, laid out by ``old`` (a
-    previous query's layout), into ``dst``, laid out by ``new`` (rows starting at ``dst_offset`` instead, int64 [sum
-    regions], if given): every row of the new batch gets its ``parents`` row's values (int64 [B] on the device) at the
-    same pairs of live columns -- one launch. A query of more evidence than its parent rows' has fewer live columns, so
-    every new lane has an old one; a region's values must hold under the new evidence (none newly observed outside its
-    scope, see :mod:`..queries.decoder`).
+    The compact values of the sum ``regions`` (bool [sum regions]) from ``src``, laid out by ``old`` (a previous
+    query's layout), into ``dst``, laid out by ``new`` (rows starting at ``dst_offset`` instead, int64 [sum regions], if
+    given) -- top-down values, or inside values (``rows``, see :meth:`CompactLayout.rows`): every row of the new batch
+    gets its ``parents`` row's values (int64 [B] on the device) at the same pairs of live columns -- one launch. A query
+    of more evidence than its parent rows' has fewer live columns, so every new lane has an old one; a region's values
+    must hold under the new evidence (none newly observed outside its scope -- top-down values -- or inside it, see
+    :mod:`..queries.decoder`).
     """
     regs = np.nonzero(regions)[0]
     if regs.size == 0:
         return
     k = prog.reg_iv_all[regs]
     ends = prog.iv_ends_np[k]
-    dst_offset = np.asarray(new.offset if dst_offset is None else dst_offset)[regs]
-    table = np.stack([np.asarray(old.offset)[regs], np.asarray(old.width)[regs], dst_offset,
-                      np.asarray(new.width)[regs], prog.reg_rows[regs], k, ends[:, 0], ends[:, 1]], axis = 1)
+    (old_offset, old_width), (new_offset, new_width) = old.rows(rows), new.rows(rows)
+    dst_offset = np.asarray(new_offset if dst_offset is None else dst_offset)[regs]
+    table = np.stack([np.asarray(old_offset)[regs], np.asarray(old_width)[regs], dst_offset,
+                      np.asarray(new_width)[regs], prog.reg_rows[regs], k, ends[:, 0], ends[:, 1]], axis = 1)
     table = torch.from_numpy(np.ascontiguousarray(table, dtype = np.int64)).to(prog.dev)
     grid = (-(-max(new.lanes(k), 1) // REGATHER_TILE), regs.size, -(-int(prog.reg_rows[regs].max()) // REGATHER_ROWS))
     _regather_kernel[grid](src, dst, table, parents, old.off, old.count, old.rank, new.off, new.count, new.start,
@@ -354,24 +355,48 @@ def _copy_segments_kernel(src, dst, table, TILE: tl.constexpr):
 
 
 def regather_into(state, prog, old: "CompactLayout", new: "CompactLayout", regions: np.ndarray,
-                  parents: torch.Tensor, allocate):
+                  parents: torch.Tensor, allocate, name: str = "node_flows", rows: str = "flows"):
     """
-    :func:`regather` from the storage ``state`` holds as ``node_flows`` (laid out by ``old``) into the one
-    ``allocate()`` returns (laid out by ``new``), never holding both: the ``regions``' values are gathered into a
-    scratch first, the old storage given up, and the scratch copied into the new one -- so a query whose rows hold
-    little more than they did does not need its top-down values' memory twice. Returns ``allocate()``'s result.
+    :func:`regather` from the storage ``state`` holds as ``name`` (``node_flows`` or ``node_mars``, its ``rows`` laid
+    out by ``old``) into the one ``allocate()`` returns (a dict holding it as ``name``, laid out by ``new``), never
+    holding both: the ``regions``' values (some) are gathered into a scratch first, the old storage given up, and the
+    scratch copied into the new one -- so a query whose rows hold little more than they did does not need their
+    memory twice. Returns ``allocate()``'s result.
     """
     regs = np.nonzero(regions)[0]
-    sizes = prog.reg_rows[regs] * np.asarray(new.width, dtype = np.int64)[regs]
-    starts = np.zeros(len(new.width), dtype = np.int64)
+    new_offset, new_width = new.rows(rows)
+    sizes = prog.reg_rows[regs] * np.asarray(new_width, dtype = np.int64)[regs]
+    starts = np.zeros(len(new_width), dtype = np.int64)
     starts[regs] = np.concatenate([[0], np.cumsum(sizes)[:-1]])
     scratch = torch.empty(max(int(sizes.sum()), 1), device = prog.dev)
-    src = state.replace_storage("node_flows", None)
-    regather(prog, old, src, new, scratch, regions, parents, dst_offset = starts)
+    src = state.replace_storage(name, None)
+    regather(prog, old, src, new, scratch, regions, parents, dst_offset = starts, rows = rows)
     del src
     out = allocate()
-    table = np.stack([starts[regs], np.asarray(new.offset, dtype = np.int64)[regs], sizes], axis = 1)
+    table = np.stack([starts[regs], np.asarray(new_offset, dtype = np.int64)[regs], sizes], axis = 1)
     table = torch.from_numpy(np.ascontiguousarray(table, dtype = np.int64)).to(prog.dev)
-    _copy_segments_kernel[(-(-max(int(sizes.max()), 1) // COPY_TILE), regs.size)](scratch, out["node_flows"], table,
+    _copy_segments_kernel[(-(-max(int(sizes.max()), 1) // COPY_TILE), regs.size)](scratch, out[name], table,
                                                                                 TILE = COPY_TILE, num_warps = 4)
     return out
+
+
+def compact_buffers(backend, liveness, plan, B: int, inputs_only: bool, regions: np.ndarray, held: Optional[np.ndarray],
+                    carry: Optional[dict]):
+    """
+    ``(layout, bufs)`` of a compact query: its :class:`CompactLayout` -- its top-down values those of the sum
+    ``regions`` (bool), its inside values those it computes per sample and those it holds (``held``: None or bool [sum
+    regions]) -- and its buffers (:meth:`~..state.State.buffers`, ``inputs_only`` as there), the inside values it holds
+    re-gathered into them (:func:`regather_into`) from the layout of the query that left them, ``carry`` (see
+    :func:`~..queries.conditional.conditional`; required when the query holds some).
+    """
+    prog = backend.program()
+    inside = plan.sample[prog.reg_iv_np]
+    if held is not None:
+        assert not held.any() or carry is not None, "compact values held without the layout they are in"
+        inside = inside | held
+    layout = compact_layout(backend, liveness, regions, inside = inside)
+    allocate = lambda: backend.state.buffers(B, inputs_only, layout.mars)
+    if carry is not None and carry["inside"].any():
+        return layout, regather_into(backend.state, prog, carry["layout"], layout, carry["inside"], carry["parents"],
+                                     allocate, "node_mars", "mars")
+    return layout, allocate()

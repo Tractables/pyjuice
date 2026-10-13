@@ -17,6 +17,8 @@ import torch
 
 import pyjuice as juice
 import pyjuice.constraints as jc
+from pyjuice.constraints.backends.dfa_exact import state as S
+from pyjuice.constraints.backends.dfa_exact.kernels import compact as CP
 from pyjuice.constraints.backends.dfa_exact.kernels.blocks import move_blocks, move_table
 from pyjuice.constraints.backends.dfa_exact.kernels.live import liveness
 from pyjuice.constraints.backends.dfa_exact.queries import decoder as QD
@@ -39,12 +41,12 @@ def sum_path(request, monkeypatch):
 
 
 class Spy:
-    """Every call's held values (None, or ``(inside, top_down)``, bool per sum region), and the block moves and those
-    of live lanes only."""
+    """Every call's held values (None, or ``(inside, top_down)``, bool per sum region), the block moves and those of
+    live lanes only, and the compact re-gathers of inside (``"mars"``) and top-down (``"flows"``) values."""
 
     def __init__(self, monkeypatch):
-        self.held, self.moves, self.live_moves = [], 0, 0
-        conditional, marginal, move_blocks = QD.conditional, QD.marginal, QD.move_blocks
+        self.held, self.moves, self.live_moves, self.regathers = [], 0, 0, {"mars": 0, "flows": 0}
+        conditional, marginal, move_blocks, regather = QD.conditional, QD.marginal, QD.move_blocks, CP.regather
 
         def spy_conditional(*args, held = None, **kwargs):
             self.held.append(None if held is None else (held["inside"].copy(), held["top_down"].copy()))
@@ -59,12 +61,32 @@ class Spy:
             self.live_moves += kwargs.get("live") is not None
             return move_blocks(*args, **kwargs)
 
+        def spy_regather(*args, rows = "flows", **kwargs):
+            self.regathers[rows] += 1
+            return regather(*args, rows = rows, **kwargs)
+
         monkeypatch.setattr(QD, "conditional", spy_conditional)
         monkeypatch.setattr(QD, "marginal", spy_marginal)
         monkeypatch.setattr(QD, "move_blocks", spy_move_blocks)
+        monkeypatch.setattr(CP, "regather", spy_regather)
 
     def anything(self, call):
         return self.held[call] is not None and (self.held[call][0].any() or self.held[call][1].any())
+
+
+def nan_new_storage(monkeypatch):
+    """Every storage the backends' states allocate from now on is filled with NaN (see State.storage_view): a slot read
+    before it is written -- computed, moved or re-gathered -- shows."""
+    real = S.State.storage_view
+
+    def storage_view(self, name, numel):
+        old = self._storage.get(name)
+        out = real(self, name, numel)
+        if self._storage[name] is not old:
+            self._storage[name].fill_(float("nan"))
+        return out
+
+    monkeypatch.setattr(S.State, "storage_view", storage_view)
 
 
 def scopes(cc):
@@ -173,8 +195,11 @@ def ask(target, query, step):
 def test_a_decoders_calls_are_the_circuits(kind, scenario, query, storage, sum_path, build_pc, monkeypatch):
     """A scenario's calls through a decoder give the circuit's own calls' results (in a fast_inference scope of
     their own, dense). The storage values move into is filled with NaN: a query reading a slot before writing it would
-    show. Compact (``storage``), the top-down values held are re-gathered by the call."""
+    show. Compact (``storage``), the values held, inside and top-down, are re-gathered by the call into storage filled
+    with NaN as well."""
     monkeypatch.setattr(QD, "_empty", lambda numel, device: torch.full((numel,), float("nan"), device = device))
+    if storage == "compact":
+        nan_new_storage(monkeypatch)
     n = KINDS[kind]
     cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc(kind, n, V))
     steps = SCENARIOS[scenario](n)
@@ -188,18 +213,21 @@ def test_a_decoders_calls_are_the_circuits(kind, scenario, query, storage, sum_p
         assert_close(a, b, n, where = f"step {i}")
 
 
-def test_a_call_with_no_inside_rows_keeps_no_inside_value(build_pc):
-    """A call whose node_mars holds the input rows alone (compact, no per-sample inside value computed or held) leaves
-    no inside value kept, whatever the buffers held before it: their storage was given up."""
-    n = KINDS["hmm"]
-    cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc("hmm", n, V))
-    R = len(cc.backend.sum_regions)
+@pytest.mark.parametrize("kind", ["hmm", "pd"])
+def test_a_compact_call_keeps_the_inside_values_it_has_rows_for(kind, build_pc):
+    """Compact, a call keeps the inside values it has rows for, held or computed, and no other: none in an HMM's
+    prefix decoding (every per-sample scope holds the prefix's last position, the others are kept once: node_mars
+    holds the input rows alone), some in a PD's."""
+    n = KINDS[kind]
+    cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc(kind, n, V))
+    kept_any = False
     with cc.decoder(storage = "compact") as decoder:
-        decoder._after(4, "fp32", "compact", (np.ones(R, dtype = bool), np.zeros(R, dtype = bool)),
-                       {"inputs_only": True}, None)
-        assert not decoder._kept.inside.any()
-        decoder._after(4, "fp32", "compact", (np.ones(R, dtype = bool), np.zeros(R, dtype = bool)), {}, None)
-        assert decoder._kept.inside.all()
+        for s in left_to_right(n)[1:]:
+            decoder.conditional(**s)
+            kept = decoder._kept
+            assert not (kept.inside & ~kept.compact.mars["regions"]).any()
+            kept_any |= bool(kept.inside.any())
+        assert kept_any == (kind == "pd")
 
 
 @pytest.mark.parametrize("kind", ["hmm", "pd"])
@@ -225,8 +253,8 @@ def test_a_call_holds_what_the_evidence_left_unchanged(kind, storage, build_pc, 
     """Left to right, a call newly observes the position before its target: it holds inside values only of scopes
     without it, top-down values only of scopes with it (none newly observed outside), and some of them; in place,
     while reordered beams move theirs (the lanes live in the previous call). The marginal holds inside values alone
-    -- none on an HMM, whose per-sample scopes are suffixes holding the new position. Compact, the same: the top-down
-    values held are re-gathered into the call's layout, the inside values move."""
+    -- none on an HMM, whose per-sample scopes are suffixes holding the new position. Compact, the same, but nothing
+    moves: the values held, inside (a PD's) and top-down, are re-gathered into the call's layout."""
     n = KINDS[kind]
     cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc(kind, n, V))
     a, b = scopes(cc).T
@@ -247,7 +275,9 @@ def test_a_call_holds_what_the_evidence_left_unchanged(kind, storage, build_pc, 
         for s in beams(n):
             decoder.conditional(**s)
     assert any(held is not None and held[1].any() for held in spy.held[1:])   # top-down values held across moves
-    if kind == "pd":
+    if storage == "compact":
+        assert spy.moves == 0 and spy.regathers["flows"] > 0 and (spy.regathers["mars"] > 0) == (kind == "pd")
+    elif kind == "pd":
         assert spy.live_moves > 0                                   # the previous call's live lanes only
     spy.held.clear()
     with cc.decoder(storage = storage) as decoder:

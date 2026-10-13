@@ -21,7 +21,7 @@ import torch
 
 from . import forward as F
 from ..kernels.common import pack_aligned
-from ..kernels.compact import STORAGES, compact_layout, inside_compact, regather_into
+from ..kernels.compact import STORAGES, compact_buffers, regather_into
 from ..kernels.live import liveness
 from ..kernels.score import score_group, score_tables
 from .plans import PLANS_PER_POSITION, PLAN_CACHE_SIZE, per_sample_intervals, prior_regions, query_plan, top_down_prior
@@ -92,8 +92,7 @@ def _check(backend, data: torch.Tensor, precision: str, storage: str = "dense"):
 
 def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions: np.ndarray, precision: str = "fp32",
                   held: Optional[dict] = None, observed: Optional[np.ndarray] = None, layout = None,
-                  report: Optional[dict] = None, storage: str = "dense", carry: Optional[dict] = None,
-                  inside_storage: Optional[str] = None):
+                  report: Optional[dict] = None, storage: str = "dense", carry: Optional[dict] = None):
     """
     The forward and top-down passes of a conditional query: the log class weights of every input node over the
     target ``positions`` (bool [n], host), every sample's, summed per row of the class masses (see
@@ -109,7 +108,6 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
         host wait for the stream
     :param storage: see :func:`conditional`
     :param carry: see :func:`conditional`
-    :param inside_storage: see :func:`conditional`
     :returns: ``(groups, class_mars)``: per row group with a target position, ``(group, its target positions (host),
         weights [positions x B, classes, rows of the group])`` (sample ``b`` of the ``p``-th position: column ``p * B +
         b``), and the class masses the query read
@@ -138,19 +136,17 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     compact = storage == "compact"
     held_inside = held.get("inside")
     inputs_only = compact and not plan.sample.any() and (held_inside is None or not held_inside.any())
-    inside = inside_compact(prog, storage if inside_storage is None else inside_storage, held_inside)
-    if lv is not None and not inside:                                   # (compact values: walked in their own order)
-        lv.order(per_sample_intervals(prog, plan, top_down = not compact))
-    if compact:
-        compact = compact_layout(backend, lv, plan.top_down.per_sample,
-                                 inside = plan.sample[prog.reg_iv_np] if inside else None)
+    if compact:                                         # rows for the per-sample values only, walked in their own
+        compact, bufs = compact_buffers(backend, lv, plan, B, inputs_only, plan.top_down.per_sample, held_inside,
+                                        carry)          # order, the held ones re-gathered into this query's layout
     else:
-        compact = None
-    bufs = backend.state.buffers(B, inputs_only, compact.mars if inside else None)   # compact: no rows for no
-    if compact is not None and carry is not None and carry["regions"].any():         # per-sample value
+        if lv is not None:
+            lv.order(per_sample_intervals(prog, plan))
+        compact, bufs = None, backend.state.buffers(B)
+    if compact is not None and carry is not None and carry["regions"].any():
         flows = regather_into(backend.state, prog, carry["layout"], compact, carry["regions"], carry["parents"],
-                              lambda: backend.state.flows(B, bufs, compact))   # the held values, into rows of this
-    else:                                                                      # query's layout
+                              lambda: backend.state.flows(B, bufs, compact))
+    else:
         flows = backend.state.flows(B, bufs, compact)
     if report is not None:
         report.update(plan = plan, liveness = lv, compact = compact, inputs_only = inputs_only)
@@ -170,7 +166,7 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
 def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None,
                 targets: Optional[torch.Tensor] = None, precision: str = "fp32", return_log_marginal: bool = False,
                 held: Optional[dict] = None, candidates: Optional[torch.Tensor] = None, report: Optional[dict] = None,
-                storage: str = "dense", carry: Optional[dict] = None, inside_storage: Optional[str] = None):
+                storage: str = "dense", carry: Optional[dict] = None):
     """
     ``log p(x_t = v | e, C)`` for every target ``(b, t)`` and token ``v`` (or candidate ``v``): one row per target, in
     the order ``dense[targets]`` lists them (sample by sample, positions in order); -inf rows where ``p(e, C) = 0``.
@@ -195,12 +191,11 @@ def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor
         sample (see :mod:`~..kernels.compact`) -- and, compact, no per-sample inside value at all where it computes
         and holds none (a prefix's next token on an HMM: every per-sample scope holds the prefix's last position).
         Compact takes far less memory when the evidence leaves few live columns, and skips the dead lanes' work
-    :param carry: compact, the top-down values ``held["top_down"]`` marks are in ``node_flows`` as a previous query
-        laid them out, not yet as this one does: a dict with that query's ``layout`` (its
-        :class:`~..kernels.compact.CompactLayout`), the ``regions`` it holds (bool [sum regions]) and every row's
-        ``parents`` there (int64 [B] on the device); they are re-gathered (:func:`~..kernels.compact.regather`)
-    :param inside_storage: None (as ``storage``), or "dense": the per-sample inside values dense whatever
-        ``storage`` (a decoder's, which holds them across its calls as dense blocks)
+    :param carry: compact, the values ``held`` marks are in ``node_mars`` and ``node_flows`` as a previous query laid
+        them out, not yet as this one does: a dict with that query's ``layout`` (its
+        :class:`~..kernels.compact.CompactLayout`), the regions whose inside (``inside``) and top-down (``regions``)
+        values it holds (bool [sum regions] each) and every row's ``parents`` there (int64 [B] on the device); they are
+        re-gathered (:func:`~..kernels.compact.regather`)
     :returns: [rows, V], or [rows, k] with ``candidates``
     """
     _check(backend, data, precision, storage)
@@ -234,7 +229,7 @@ def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor
         layout = (groups, size, (tables[starts[0]:starts[0] + n], tables[starts[1]:starts[1] + n]))
         groups, class_mars = class_weights(backend, data, missing, positions, precision, held,
                                            observed = (~miss).any(axis = 0), layout = layout, report = report,
-                                           storage = storage, carry = carry, inside_storage = inside_storage)
+                                           storage = storage, carry = carry)
         out = torch.empty(M, width, device = dev)
         log_marginal = torch.empty(M + 1, device = dev) if return_log_marginal else None
         for (g, pos, w), start in zip(groups, starts[2:]):

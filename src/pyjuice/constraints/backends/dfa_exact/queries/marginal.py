@@ -10,7 +10,7 @@ from typing import Optional
 import numpy as np
 import torch
 
-from ..kernels.compact import STORAGES, compact_layout, inside_compact
+from ..kernels.compact import STORAGES, compact_buffers
 from ..kernels.live import liveness
 from .forward import PRECISIONS, missing_tensor, run_forward
 from .plans import per_sample_intervals, prior_regions, query_plan
@@ -19,7 +19,7 @@ from .plans import per_sample_intervals, prior_regions, query_plan
 
 def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None, precision: str = "fp32",
              held: Optional[np.ndarray] = None, report: Optional[dict] = None, storage: str = "dense",
-             inside_storage: Optional[str] = None):
+             carry: Optional[dict] = None):
     """
     ``log p(C, e)`` for every sample: the probability that the PC generates a string that satisfies the
     constraint and agrees with the observed tokens.
@@ -34,7 +34,7 @@ def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] =
         :class:`~..kernels.compact.CompactLayout` (``"compact"``; None when dense)
     :param storage: "dense" or "compact": how a query keeps its per-sample values (see
         :func:`~.conditional.conditional`); a marginal has no top-down value
-    :param inside_storage: see :func:`~.conditional.conditional`
+    :param carry: compact, where the inside values ``held`` marks are (see :func:`~.conditional.conditional`)
     :returns: [B, number of root nodes], as :func:`pyjuice.queries.marginal`
     """
     if precision not in PRECISIONS:
@@ -60,19 +60,20 @@ def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] =
 
     with torch.no_grad():
         obs_class = torch.where(missing, -1, backend.token_classes.token_class[x]).contiguous()
-        inside = inside_compact(prog, storage if inside_storage is None else inside_storage, held)
+        compact = storage == "compact"
         # nothing observed: nothing to prune, but compact values are laid out by the live columns (every one)
-        lv = liveness(prog, obs_class, B) if observed.any() or inside else None
+        lv = liveness(prog, obs_class, B) if observed.any() or compact else None
         valid, kept = backend.state.prior_validity()
         prior = prior_regions(prog, observed, B, kept, lv)
         plan = query_plan(prog, observed, None, valid.numpy(), prior, held = held)   # every inside value
-        if lv is not None and not inside:
-            lv.order(per_sample_intervals(prog, plan))
-        inputs_only = storage == "compact" and not plan.sample.any() and (held is None or not held.any())
-        compact = compact_layout(backend, lv, np.zeros(len(backend.sum_regions), dtype = bool),
-                                 inside = plan.sample[prog.reg_iv_np]) if inside else None
-        # compact: no rows for no per-sample value
-        bufs = backend.state.buffers(B, inputs_only, None if compact is None else compact.mars)
+        inputs_only = compact and not plan.sample.any() and (held is None or not held.any())
+        if compact:                                     # rows for the per-sample values only, the held ones
+            compact, bufs = compact_buffers(backend, lv, plan, B, inputs_only,   # re-gathered into them
+                                            np.zeros(len(backend.sum_regions), dtype = bool), held, carry)
+        else:
+            if lv is not None:
+                lv.order(per_sample_intervals(prog, plan))
+            compact, bufs = None, backend.state.buffers(B)
         if report is not None:
             report.update(plan = plan, liveness = lv, inputs_only = inputs_only, compact = compact)
         run_forward(backend, bufs, plan, x, missing, obs_class, lv, precision, compact)

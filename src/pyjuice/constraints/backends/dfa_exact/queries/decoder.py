@@ -21,10 +21,10 @@ Nothing is reused after a call where a row continues no row of the previous one 
 then missing again). Nothing is reused when anything else used the buffers in between (:attr:`~..state.State.epoch`:
 another query, inside the session or not), or when the precision or the storage changed.
 
-Compact (``storage = "compact"``, :mod:`..kernels.compact`), a call's top-down values are laid out by its own
-liveness, which only the call knows: the values held are re-gathered into its rows by the call itself
+Compact (``storage = "compact"``, :mod:`..kernels.compact`), a call's values are laid out by its own liveness, which
+only the call knows: the values held, inside and top-down, are re-gathered into its rows by the call itself
 (:func:`~..kernels.compact.regather`, ``carry``), in place or not -- every row's values at the pairs of columns still
-live, which are among the previous ones. The inside values stay dense, moved as above.
+live, which are among the previous ones. A call keeps rows for the values it needs only, so the others are given up.
 """
 
 from __future__ import annotations
@@ -57,7 +57,7 @@ class _Kept:
     is the same (a weak reference: a backend moved to another device frees its old state), its buffers were not used
     since (``epoch``), and the next call has the same ``precision`` and ``storage``. ``liveness``: the call's liveness
     (None: every lane), whose live lanes hold their true values in every region valid here; ``compact``: the layout of
-    the top-down values when compact (None: dense)."""
+    the values when compact (None: dense)."""
     state: weakref.ref
     epoch: int
     precision: str
@@ -91,10 +91,10 @@ class DFAExactDecoder(Decoder):
     def _marginal(self, data: torch.Tensor, missing: torch.Tensor, precision: str = "fp32",
                   storage: str = "dense") -> torch.Tensor:
         be = self.cc.backend
-        held, keep, compact, _ = self._reuse(data, missing, None, precision, storage, marginal = True)
+        held, keep, compact, carry = self._reuse(data, missing, None, precision, storage, marginal = True)
         report = {}
         out = marginal(be, data, missing, precision, held = None if held is None else held[0], report = report,
-                       storage = storage, inside_storage = "dense")
+                       storage = storage, carry = carry)
         self._after(data.size(0), precision, storage, keep, report, compact)
         return out
 
@@ -106,8 +106,7 @@ class DFAExactDecoder(Decoder):
         report = {}
         out = conditional(be, data, missing, targets, precision, return_log_marginal = return_log_marginal,
                           held = None if held is None else dict(inside = held[0], top_down = held[1]),
-                          candidates = candidates, report = report, storage = storage, carry = carry,
-                          inside_storage = "dense")
+                          candidates = candidates, report = report, storage = storage, carry = carry)
         self._after(data.size(0), precision, storage, keep, report, compact)
         return out
 
@@ -119,8 +118,8 @@ class DFAExactDecoder(Decoder):
         ``(held, keep, compact, carry)`` for a call: ``held`` None (nothing reused) or ``(inside, top_down)``, the
         values the call holds (bool per sum region, see :mod:`.plans`), in place or moved there; ``keep`` None or
         ``(inside, top_down)``, those the buffers still hold for the call's rows besides what it computes; compact, the
-        layout of the top-down values the buffers hold as they are (``compact``: None once moved) and what the call
-        needs to re-gather those it holds into its own (``carry``, see :func:`~.conditional.conditional`).
+        layout of the values the buffers hold, while it is the call's rows' (``compact``: None if not), and what the
+        call needs to re-gather those it holds into its own (``carry``, see :func:`~.conditional.conditional`).
         """
         kept, self._kept = self._kept, None         # given up until the call returns (if it raises: for good)
         be = self.cc.backend
@@ -147,14 +146,13 @@ class DFAExactDecoder(Decoder):
             on_asked = cover[asked]
             held = (inside & ~on_asked.all(axis = 0), top_down & on_asked.any(axis = 0))
         identity = B == kept.B and (parents == np.arange(B)).all()
-        if kept.compact is not None:                                    # top-down values compact: the call re-gathers
+        if kept.compact is not None:                                    # compact: the call re-gathers what it holds
             carry = None
-            if held[1].any():
-                carry = dict(layout = kept.compact, regions = held[1],
+            if held[0].any() or held[1].any():
+                carry = dict(layout = kept.compact, inside = held[0], regions = held[1],
                              parents = torch.from_numpy(parents.astype(np.int64)).to(be.device))
             if identity:
                 return held, (inside, top_down), kept.compact, carry
-            self._move(state, kept.B, B, parents, held[0], np.zeros_like(held[1]), kept.liveness)
             return held, held, None, carry
         if identity:
             return held, (inside, top_down), None, None                 # in place: all of them stay
@@ -193,9 +191,9 @@ class DFAExactDecoder(Decoder):
                     prog = prog)
 
     def _after(self, B: int, precision: str, storage: str, keep, report: dict, compact: Optional[CompactLayout]):
-        """What the buffers hold after a call: what it kept, and what it computed per sample. Compact, the top-down
-        values are laid out by the call's own layout if it made one (only those it has rows for, held or computed),
-        else by ``compact``, the one they were in before it (None: given up)."""
+        """What the buffers hold after a call: what it kept, and what it computed per sample. Compact, the values are
+        laid out by the call's own layout if it made one (only those it has rows for, held or computed; a marginal's
+        has none for top-down values), else by ``compact``, the one they were in before it (None: given up)."""
         be = self.cc.backend
         R = len(be.sum_regions)
         inside, top_down = (np.zeros(R, dtype = bool),) * 2 if keep is None else keep
@@ -207,10 +205,12 @@ class DFAExactDecoder(Decoder):
                 top_down |= plan.top_down.sample
         if report.get("inputs_only"):                                   # node_mars's storage given up: none kept
             inside[:] = False
-        if report.get("compact") is not None:                           # the call laid out its top-down values
+        if report.get("compact") is not None:                           # the call laid out its values
             compact = report["compact"]
-            top_down &= plan.top_down.per_sample                        # (those with rows there)
+            inside &= compact.mars["regions"]                           # (those with rows there)
+            top_down &= plan.top_down.per_sample if plan.top_down is not None else False
         elif storage == "compact" and compact is None:
+            inside[:] = False
             top_down[:] = False
         self._kept = _Kept(weakref.ref(be.state), be.state.epoch, precision, storage, B, inside, top_down,
                            report.get("liveness"), compact)
