@@ -198,6 +198,16 @@ class Program:
                        for k in iv.unique().tolist()}
                 self.elem_ivs[prod_index] = np.asarray(sorted(self.iv_index[self.sum_ivs[k]] for k in ivs),
                                                        dtype = np.int64)
+        # ... as one table, a row per group padded with one past the last interval (one without lanes, see
+        # :func:`~..kernels.compact._group_widths`), and every group's rows and slots: a query's widths of every
+        # group's rows in a few array operations
+        groups = backend.element_regions
+        self.elem_iv_pad = np.full((len(groups), max([1, *map(len, self.elem_ivs.values())])), len(self.all_ivs),
+                                   dtype = np.int64)
+        for pi, ivs in self.elem_ivs.items():
+            self.elem_iv_pad[pi, :len(ivs)] = ivs
+        self.elem_rows = np.asarray([end - first for first, end, _ in groups], dtype = np.int64)
+        self.elem_slots = np.asarray([slots for _, _, slots in groups], dtype = np.int64)
 
         # which (output tile, shared chunk) pairs every block @ block step can skip: one mask per boundary triple,
         # each step's launch carrying its triple's index
