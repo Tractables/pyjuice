@@ -13,7 +13,7 @@ Query plans (:mod:`pyjuice.constraints.backends.dfa_exact.query_plan`) and the i
 * the top-down values kept once are those with nothing observed outside their interval, by the same rule, closed
   upward; a forward told the buffers hold some per-sample values computes none of them.
 
-Marginals under every pattern of evidence, which run on these plans, are tested in ``pruning_test.py``.
+Marginals under every pattern of evidence, which run on these plans, are tested in ``liveness_test.py``.
 """
 import dataclasses
 import types
@@ -26,11 +26,11 @@ import pyjuice as juice
 import pyjuice.constraints as jc
 from pyjuice.constraints.backends.dfa_exact.queries import forward as F
 from pyjuice.constraints.backends.dfa_exact.queries import marginal as M
-from pyjuice.constraints.backends.dfa_exact.kernels.live import prune
+from pyjuice.constraints.backends.dfa_exact.kernels.live import liveness
 from pyjuice.constraints.backends.dfa_exact.kernels.common import TEMP, IndexList, pack_aligned
 from pyjuice.constraints.backends.dfa_exact.kernels.prod import Launch
-from pyjuice.constraints.backends.dfa_exact.queries.plans import (free_regions, prior_regions, query_plan, top_down_free,
-                                                            top_down_prior)
+from pyjuice.constraints.backends.dfa_exact.queries.plans import (free_regions, per_sample_intervals, prior_regions,
+                                                            query_plan, top_down_free, top_down_prior)
 
 V = 3
 KINDS = {"hmm": 6, "hmm_untied": 6, "hmm_block_sparse": 6, "left_linear": 6, "pd": 8, "pd_prod_dominated": 8,
@@ -291,10 +291,12 @@ def planned_forward(cc, data, missing, targets):
                       free_regions(prog, observed))                         # every free region once
     x = torch.where(missing, 0, data.to(dev).long())
     obs_class = torch.where(missing, -1, cc.backend.token_classes.token_class[x]).contiguous()
-    pruning = prune(prog, obs_class, data.size(0)) if observed.any() else None
+    lv = liveness(prog, obs_class, data.size(0)) if observed.any() else None
+    if lv is not None:
+        lv.order(per_sample_intervals(prog, plan))
     bufs = cc.backend.state.buffers(data.size(0))
     with torch.no_grad():
-        F.run_forward(cc.backend, bufs, plan, x, missing, obs_class, pruning, "fp32")
+        F.run_forward(cc.backend, bufs, plan, x, missing, obs_class, lv, "fp32")
     valid |= plan.todo
     return plan, bufs
 
@@ -409,12 +411,12 @@ def test_kept_once_when_it_pays(build_pc):
         dev = cc.pc.params.device
         x = torch.where(missing, 0, data).to(dev)
         obs_class = torch.where(missing.to(dev), -1, cc.backend.token_classes.token_class[x]).contiguous()
-        pruning = prune(prog, obs_class, len(lengths)) if observed.any() else None
-        live = np.array(pruning.num_live) if pruning is not None else len(lengths) * slots
+        lv = liveness(prog, obs_class, len(lengths)) if observed.any() else None
+        live = np.array(lv.num_live) if lv is not None else len(lengths) * slots
         worth = free & (live > slots)
         closed = free & np.array([bool((worth & (a <= a[k]) & (b >= b[k])).any()) for k in range(len(slots))])
-        assert np.array_equal(prior_regions(prog, observed, len(lengths), False, pruning), closed)
-        assert np.array_equal(prior_regions(prog, observed, len(lengths), True, pruning), free)
+        assert np.array_equal(prior_regions(prog, observed, len(lengths), False, lv), closed)
+        assert np.array_equal(prior_regions(prog, observed, len(lengths), True, lv), free)
         if lengths == [0]:
             assert not closed.any()                                         # one sample, nothing observed: as before
         if lengths == [0, 0, 0]:
@@ -459,13 +461,13 @@ def test_top_down_kept_once_when_it_pays(kind, build_pc):
         dev = cc.pc.params.device
         x = torch.where(missing, 0, data).to(dev)
         obs_class = torch.where(missing.to(dev), -1, cc.backend.token_classes.token_class[x]).contiguous()
-        pruning = prune(prog, obs_class, len(lengths)) if observed.any() else None
-        live = np.array(pruning.num_live) if pruning is not None else len(lengths) * slots
+        lv = liveness(prog, obs_class, len(lengths)) if observed.any() else None
+        live = np.array(lv.num_live) if lv is not None else len(lengths) * slots
         worth = np.zeros(len(a), dtype = bool)
         worth[sums] = free[sums] & (live > slots)
         closed = free & np.array([bool((worth & (a >= a[i]) & (b <= b[i])).any()) for i in range(len(a))])
-        assert np.array_equal(top_down_prior(prog, td, observed, len(lengths), False, pruning), closed)
-        assert np.array_equal(top_down_prior(prog, td, observed, len(lengths), True, pruning), free)
+        assert np.array_equal(top_down_prior(prog, td, observed, len(lengths), False, lv), closed)
+        assert np.array_equal(top_down_prior(prog, td, observed, len(lengths), True, lv), free)
         if lengths == [0, 0, 0]:                                             # nothing observed, 3 samples: every
             assert closed[sums].all()                                       # sum interval once (a fold over inputs
                                                                             # alone holds none)
@@ -496,20 +498,22 @@ def test_held_inside_values_are_not_computed(kind, build_pc, reference):
     observed = (~missing).any(dim = 0).cpu().numpy()
     x = torch.where(missing, 0, data.to(dev).long())
     obs_class = torch.where(missing, -1, cc.backend.token_classes.token_class[x]).contiguous()
-    pruning = prune(prog, obs_class, B)
+    lv = liveness(prog, obs_class, B)
     nothing_once = np.zeros(len(prog.sum_ivs), dtype = bool)
     bufs = cc.backend.state.buffers(B)
     valid = np.zeros(len(prog.sum_ivs), dtype = bool)
+    first = query_plan(prog, observed, None, valid, nothing_once)
+    lv.order(per_sample_intervals(prog, first))
     with torch.no_grad():
-        F.run_forward(cc.backend, bufs, query_plan(prog, observed, None, valid, nothing_once), x, missing, obs_class,
-                      pruning, "fp32")
+        F.run_forward(cc.backend, bufs, first, x, missing, obs_class, lv, "fp32")
     held = np.array([prog.sum_ivs[k][0] > 0 for k in prog.reg_iv_host])
     for r in np.nonzero(~held)[0]:
         sample_rows(cc, bufs, r, B).fill_(float("nan"))
     plan = query_plan(prog, observed, None, valid, nothing_once, held = held)
     assert not plan.sample[np.asarray(prog.reg_iv_host)[held]].any()
+    lv.order(per_sample_intervals(prog, plan))
     with torch.no_grad():
-        F.run_forward(cc.backend, bufs, plan, x, missing, obs_class, pruning, "fp32")
+        F.run_forward(cc.backend, bufs, plan, x, missing, obs_class, lv, "fp32")
     r = prog.root_region
     root = sample_rows(cc, bufs, r, B)[prog.root_rows[0] - cc.backend.sum_regions[r][0]]
     assert_close(root[None, :], reference.marginal(cc, data, missing.cpu())[:, 0][None, :].float().to(dev))

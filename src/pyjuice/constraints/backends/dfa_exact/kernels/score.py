@@ -149,45 +149,63 @@ def class_weight_launch(launch, alive: np.ndarray, prog, score: ScoreTables) -> 
 
 
 @triton.jit
-def _scan_live(srow, sm, cols, M, PRUNE: tl.constexpr):
-    """Which of the columns ``cols`` (< ``M``) are live for some of a program's samples (liveness rows ``srow``,
-    ``sm`` the real samples); every column below ``M`` without ``PRUNE``."""
-    out = cols < M
+def _walk_column(columns, cstart, ccount, cm, ii, PRUNE: tl.constexpr, UNIFORM: tl.constexpr):
+    """Step ``ii`` of every lane's walk over its sample's columns at the input's boundary: ``(column, active)`` -- under
+    evidence pruning the ``ii``-th of its sample's live columns (ascending, see :meth:`~.live.Liveness.lists`), else
+    column ``ii``. ``UNIFORM`` (always without pruning, or one sample per program): every lane walks the same columns,
+    and the column is a scalar."""
     if PRUNE:
-        lv = tl.load(srow[:, None] + cols[None, :], mask = sm[:, None] & out[None, :], other = 0)
-        out = out & (tl.max(lv, axis = 0) != 0)
-    return out
+        if UNIFORM:
+            ok = cm
+            i = tl.load(columns + cstart + ii)
+        else:
+            ok = cm & (ii < ccount)
+            i = tl.load(columns + cstart + ii, mask = ok, other = 0)
+    else:
+        ok = cm
+        i = ii
+    return i, ok
 
 
 @triton.jit
-def _next_live(srow, sm, i, c0, rem, M, PRUNE: tl.constexpr, TL: tl.constexpr):
-    """``(i, c0, rem)``: the first column after ``i`` live for some of a program's samples (``M`` if none), scanning
-    ``TL`` columns at a time -- ``c0`` the scan's first column, ``rem`` its live columns not visited yet -- so a
-    boundary's columns cost a vector load per ``TL``, and its live columns one step each, in order."""
-    cols = c0 + tl.arange(0, TL)
-    rem = rem & (cols > i)
-    while (tl.max(rem.to(tl.int32), axis = 0) == 0) & (c0 + TL < M):
-        c0 += TL
-        cols = c0 + tl.arange(0, TL)
-        rem = _scan_live(srow, sm, cols, M, PRUNE)
-    return tl.min(tl.where(rem, cols, M), axis = 0), c0, rem
+def _walk_slots(iv_table, positions, i, other, ncols, ok, om, I_FIRST: tl.constexpr, FULL: tl.constexpr,
+                UNIFORM: tl.constexpr):
+    """The slots of the pairs ``(i, other)`` (``I_FIRST``) or ``(other, i)``, ``i`` the walk's column
+    (:func:`_walk_column`, ``ok`` its lanes), ``other`` a vector of columns (``om`` the real ones): a [lanes,
+    len(other)] tile -- one row for every lane when the column is ``UNIFORM`` (one lookup per column, not per lane),
+    else a row per lane."""
+    if UNIFORM:
+        r = i
+        c = other
+        m = om
+    else:
+        r = i[:, None]
+        c = other[None, :]
+        m = ok[:, None] & om[None, :]
+    if I_FIRST:
+        s = _slot(iv_table, positions, r, c, ncols, m, FULL)
+    else:
+        s = _slot(iv_table, positions, c, r, ncols, m, FULL)
+    if UNIFORM:
+        s = s[None, :]
+    return s
 
 
 @triton_jit
 def _class_weight_kernel(dfa_class_flow, cw_base, cw_K, element_flows, temp_flows, node_mars, prior_mars, temp,
-                         next_col, width, iv_of, iv_info, iv_table, once_iv, live, dests, dests_idx, ptr, parents,
-                         reg_offset, reg_width, reg_first, prior_offset, prior_width, reg_prior, out_first, out_width,
-                         temp_width, B, n, W, C, pid0, BLOCK_INPUT: tl.constexpr, S_KIND: tl.constexpr,
-                         OUT_TEMP: tl.constexpr, PRUNE: tl.constexpr, OUT_FULL: tl.constexpr, S_FULL: tl.constexpr,
-                         INDEXED: tl.constexpr, TB: tl.constexpr, TC: tl.constexpr, TJ: tl.constexpr,
-                         TL: tl.constexpr):
+                         next_col, width, iv_of, iv_info, iv_table, once_iv, count, start, columns, dests, dests_idx,
+                         ptr, parents, reg_offset, reg_width, reg_first, prior_offset, prior_width, reg_prior,
+                         out_first, out_width, temp_width, B, n, W, C, pid0, BLOCK_INPUT: tl.constexpr,
+                         S_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, PRUNE: tl.constexpr, OUT_FULL: tl.constexpr,
+                         S_FULL: tl.constexpr, INDEXED: tl.constexpr, UNIFORM: tl.constexpr, TB: tl.constexpr,
+                         TC: tl.constexpr, TJ: tl.constexpr):
     """One program per (destination, ``TB`` samples, ``TC`` classes), a lane per (sample, class): the log class
-    weights of its steps' inputs (see the module docstring) -- a loop over the columns ``i`` of the input's boundary,
+    weights of its steps' inputs (see the module docstring) -- a walk over the columns ``i`` of the input's boundary,
     then over the other boundary's columns ``TJ`` at a time -- log-added to ``dfa_class_flow`` at the destination's
-    position block (``cw_base``, ``cw_K`` per position). Under evidence pruning, the loop visits only the columns ``i``
-    live for some of the program's samples (every term through another is -inf), found ``TL`` at a time
-    (:func:`_next_live`): a wide automaton pinned by its evidence to a few columns costs a few steps, not one per
-    column."""
+    position block (``cw_base``, ``cw_K`` per position). Under evidence pruning every lane walks only its sample's live
+    columns (``count`` / ``start`` / ``columns``, see :meth:`~.live.Liveness.lists`; every term through another is
+    -inf): a wide automaton pinned by its evidence to a few columns costs a few steps, not one per column. ``UNIFORM``
+    (see :func:`_walk_column`; ``TB`` 1 under pruning): the program's lanes walk the same columns."""
     d = _child(dests_idx, tl.program_id(0), INDEXED)
     lane = tl.arange(0, TB * TC)
     b = ((pid0 + tl.program_id(1)) * TB + lane // TC).to(tl.int64)
@@ -196,11 +214,21 @@ def _class_weight_kernel(dfa_class_flow, cw_base, cw_K, element_flows, temp_flow
     t = tl.load(dests + d * 2)
     k = tl.load(dests + d * 2 + 1)
     end = t + 1 == n
-    lrow = live + (b * (n + 1) + t) * W                                         # the lanes' liveness at t (pruned)
-    bs = ((pid0 + tl.program_id(1)) * TB + tl.arange(0, TB)).to(tl.int64)
-    sm = bs < B
-    srow = live + (bs * (n + 1) + t) * W                                        # the program's samples' liveness at t
     M = tl.load(width + t).to(tl.int32)
+    if PRUNE:                                                                  # the lanes' samples' live columns at t
+        if UNIFORM:                                                            # (the program's one sample)
+            row = (pid0 + tl.program_id(1)).to(tl.int64) * (n + 1) + t
+            ccount = tl.load(count + row)
+            cstart = tl.load(start + row)
+            steps = ccount
+        else:
+            ccount = tl.load(count + b * (n + 1) + t, mask = cm, other = 0)
+            cstart = tl.load(start + b * (n + 1) + t, mask = cm, other = 0)
+            steps = tl.max(ccount, axis = 0)
+    else:
+        ccount = 0
+        cstart = 0
+        steps = M
     mx = tl.full([TB * TC, TJ], float("-inf"), dtype = tl.float32)
     acc = tl.zeros([TB * TC, TJ], dtype = tl.float32)
     for p in range(tl.load(ptr + d), tl.load(ptr + d + 1)):
@@ -217,25 +245,19 @@ def _class_weight_kernel(dfa_class_flow, cw_base, cw_K, element_flows, temp_flow
                                    temp, reg_offset, reg_width, reg_first, prior_offset, prior_width, reg_prior,
                                    temp_width, S_KIND)
             lp = lp + tl.where(l_own, b * LS, 0)
-            c0 = tl.zeros([], dtype = tl.int32)
-            i, c0, rem = _next_live(srow, sm, -1, c0, _scan_live(srow, sm, tl.arange(0, TL), M, PRUNE), M, PRUNE, TL)
-            while i < M:
-                ok = cm
-                if PRUNE:
-                    ok = ok & (tl.load(lrow + i, mask = cm, other = 0) != 0)
+            for ii in range(0, steps):
+                i, ok = _walk_column(columns, cstart, ccount, cm, ii, PRUNE, UNIFORM)
                 q = tl.load(next_col + (t * W + i) * C + cls, mask = ok, other = -1)
                 q = tl.where(end & (q >= 0), 0, q)                             # a sequence end: its one column
                 for e0 in range(0, E, TJ):
                     i0 = e0 + tl.arange(0, TJ)
-                    im = i0 < E
-                    sl = _slot(iv_table, lpos, i0, i, M, im, S_FULL)
-                    lv = tl.load(lp[:, None] + sl[None, :], mask = ok[:, None] & (im & (sl >= 0))[None, :],
-                                 other = float("-inf"))                        # L[i0, i]
-                    m2 = (ok & (q >= 0))[:, None] & im[None, :]
+                    m1 = ok[:, None] & (i0 < E)[None, :]
+                    sl = _walk_slots(iv_table, lpos, i, i0, M, ok, i0 < E, False, S_FULL, UNIFORM)
+                    lv = tl.load(lp[:, None] + sl, mask = m1 & (sl >= 0), other = float("-inf"))   # L[i0, i]
+                    m2 = (ok & (q >= 0))[:, None] & (i0 < E)[None, :]
                     so = _slot(iv_table, opos, i0[None, :], q[:, None], X, m2, OUT_FULL)
                     ov = tl.load(op[:, None] + so, mask = m2 & (so >= 0), other = float("-inf"))   # O_out[i0, next]
                     mx, acc = _lse_step(mx, acc, lv + ov)
-                i, c0, rem = _next_live(srow, sm, i, c0, rem, M, PRUNE, TL)
         else:                                                                  # the input, then a block over [t+1, t2)
             t2 = tl.load(parents + p * 7 + 5)
             X = _exit_width(width, t2, n)
@@ -248,12 +270,8 @@ def _class_weight_kernel(dfa_class_flow, cw_base, cw_K, element_flows, temp_flow
                                        prior_mars, temp, reg_offset, reg_width, reg_first, prior_offset, prior_width,
                                        reg_prior, temp_width, S_KIND)
                 rp = rp + tl.where(r_own, b * RS, 0)
-            c0 = tl.zeros([], dtype = tl.int32)
-            i, c0, rem = _next_live(srow, sm, -1, c0, _scan_live(srow, sm, tl.arange(0, TL), M, PRUNE), M, PRUNE, TL)
-            while i < M:
-                ok = cm
-                if PRUNE:
-                    ok = ok & (tl.load(lrow + i, mask = cm, other = 0) != 0)
+            for ii in range(0, steps):
+                i, ok = _walk_column(columns, cstart, ccount, cm, ii, PRUNE, UNIFORM)
                 q = tl.load(next_col + (t * W + i) * C + cls, mask = ok, other = -1)
                 if S_KIND == 2:                                                # the identity: the exit column is q
                     jq = tl.where(end & (q >= 0), 0, q)
@@ -264,15 +282,13 @@ def _class_weight_kernel(dfa_class_flow, cw_base, cw_K, element_flows, temp_flow
                 else:
                     for j0 in range(0, X, TJ):
                         j = j0 + tl.arange(0, TJ)
-                        jm = j < X
-                        so = _slot(iv_table, opos, i, j, X, jm, OUT_FULL)
-                        ov = tl.load(op[:, None] + so[None, :], mask = ok[:, None] & (jm & (so >= 0))[None, :],
-                                     other = float("-inf"))                   # O_out[i, j]
-                        m2 = (ok & (q >= 0))[:, None] & jm[None, :]
+                        mo = ok[:, None] & (j < X)[None, :]
+                        so = _walk_slots(iv_table, opos, i, j, X, ok, j < X, True, OUT_FULL, UNIFORM)
+                        ov = tl.load(op[:, None] + so, mask = mo & (so >= 0), other = float("-inf"))   # O_out[i, j]
+                        m2 = (ok & (q >= 0))[:, None] & (j < X)[None, :]
                         sr = _slot(iv_table, rpos, q[:, None], j[None, :], X, m2, S_FULL)
                         rv = tl.load(rp[:, None] + sr, mask = m2 & (sr >= 0), other = float("-inf"))   # R[next, j]
                         mx, acc = _lse_step(mx, acc, ov + rv)
-                i, c0, rem = _next_live(srow, sm, i, c0, rem, M, PRUNE, TL)
     top = tl.max(mx, axis = 1)
     shift = tl.where(top == float("-inf"), 0.0, top)
     val = tl.log(tl.sum(acc * tl.exp(mx - shift[:, None]), axis = 1)) + shift
@@ -283,12 +299,8 @@ def _class_weight_kernel(dfa_class_flow, cw_base, cw_K, element_flows, temp_flow
 #: lanes (sample, class) x other-boundary columns per :func:`_class_weight_kernel` program, at most
 CLASS_WEIGHT_LANES = 2048
 
-#: (sample, column) liveness flags a :func:`_class_weight_kernel` program scans at a time, at most (at most 1024
-#: columns, at least one per sample)
-CLASS_WEIGHT_SCAN = 4096
 
-
-def run_class_weights(launches, cw: dict, prog, bufs, element_flows, temp_flows, node_mars, live, elem_first: int,
+def run_class_weights(launches, cw: dict, prog, bufs, element_flows, temp_flows, node_mars, liveness, elem_first: int,
                       elem_width: int, B: int, prior: dict, once_iv: torch.Tensor, regions: dict):
     """
     The class weights of one product layer stage's input operands at the query's target positions: every
@@ -297,14 +309,15 @@ def run_class_weights(launches, cw: dict, prog, bufs, element_flows, temp_flows,
     :param cw: ``buf`` (``dfa_class_flow``, -inf where nothing was added yet), and per position the start of its block
         (``base``, int64 [n], -1 for a position no sample targets) and its row group's rows (``K``, int64 [n])
     :param bufs: ``(temp, temp_width)``, the layer's scratch rows (the folds' inside values)
-    :param live: None, or the query's liveness (:class:`~.live.Pruning`'s ``live``)
+    :param liveness: None, or the query's :class:`~.live.Liveness` (its live columns' lists are built on first use)
     :param prior: where the sum operands kept once are (see :func:`~.common._block_ptr`)
     :param once_iv: the plan's per-interval flag of top-down values kept once (read with sample stride 0)
     """
     temp, temp_width = bufs
     n, W, C = prog.n, prog.next_col.size(1), prog.next_col.size(2)
     ivs = prog.intervals
-    prune = live is not None
+    prune = liveness is not None
+    lists = liveness.lists() if prune else (cw["K"],) * 3
     TC = min(64, host_next_power_of_2(C))
     for la, idx in launches:
         idx = tensor(idx)
@@ -313,18 +326,18 @@ def run_class_weights(launches, cw: dict, prog, bufs, element_flows, temp_flows,
         identity = la.form == "input_block" and s_kind == IDENTITY
         TJ = 1 if identity else min(64, host_next_power_of_2(la.J_max))
         TB = max(1, min(host_next_power_of_2(B), 128 // TC, CLASS_WEIGHT_LANES // (TC * TJ)))
-        TL = max(1, min(1024, CLASS_WEIGHT_SCAN // TB))
         lanes = TB * TC * TJ
         warps = 1 if lanes <= 128 else 2 if lanes <= 512 else 4
         for first, size in grid_chunks(host_cdiv(B, TB), 1):
             _class_weight_kernel[(D, size, host_cdiv(C, TC))](
                 cw["buf"], cw["base"], cw["K"], element_flows, temp_flows, node_mars, prior["mars"], temp,
-                prog.next_col, prog.width_t, ivs.of, ivs.info, ivs.table, once_iv, live if prune else cw["K"],
+                prog.next_col, prog.width_t, ivs.of, ivs.info, ivs.table, once_iv, *lists,
                 la.dests, la.dests if idx is None else idx, la.ptr, la.parents, regions["offset"], regions["width"],
                 regions["first"], prior["offset"], prior["width"], prior["reg_prior"], elem_first, elem_width,
                 temp_width, B, n, W, C, first, BLOCK_INPUT = la.form == "block_input", S_KIND = s_kind,
                 OUT_TEMP = out_temp, PRUNE = prune, OUT_FULL = out_full, S_FULL = all(s_full),
-                INDEXED = idx is not None, TB = TB, TC = TC, TJ = TJ, TL = TL, num_warps = warps)
+                INDEXED = idx is not None, UNIFORM = not prune or TB == 1, TB = TB, TC = TC, TJ = TJ,
+                num_warps = warps)
 
 
 # -------------------------------------------------------------------------------------------------

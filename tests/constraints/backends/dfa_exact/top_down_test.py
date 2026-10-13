@@ -18,8 +18,9 @@ import pyjuice as juice
 import pyjuice.constraints as jc
 from pyjuice.constraints.backends.dfa_exact.queries import forward as F
 from pyjuice.constraints.backends.dfa_exact.queries.top_down import run_backward
-from pyjuice.constraints.backends.dfa_exact.kernels.live import prune
-from pyjuice.constraints.backends.dfa_exact.queries.plans import prior_regions, query_plan, top_down_prior
+from pyjuice.constraints.backends.dfa_exact.kernels.live import liveness
+from pyjuice.constraints.backends.dfa_exact.queries.plans import (per_sample_intervals, prior_regions, query_plan,
+                                                                  top_down_prior)
 
 V = 3
 KINDS = {"hmm": 6, "hmm_untied": 6, "hmm_block_sparse": 6, "left_linear": 6, "pd": 8, "pd_prod_dominated": 8,
@@ -79,26 +80,28 @@ def top_down_blocks(cc, data, missing, targets = None, policy = "default", held 
         observed = (~missing).any(dim = 0).cpu().numpy()
         x = torch.where(missing, 0, data.to(dev).long())
         obs_class = torch.where(missing, -1, cc.backend.token_classes.token_class[x]).contiguous()
-        pruning = prune(prog, obs_class, B) if observed.any() else None
+        lv = liveness(prog, obs_class, B) if observed.any() else None
         valid, kept = cc.backend.state.prior_validity()
         if policy in ("sample", "top_down"):
             prior = np.zeros(prog.iv_bounds.shape[0], dtype = bool)
-            once = top_down_prior(prog, td, observed, B, True, pruning) if policy == "top_down" else \
+            once = top_down_prior(prog, td, observed, B, True, lv) if policy == "top_down" else \
                 np.zeros(td.iv_bounds.shape[0], dtype = bool)
         else:
-            prior = prior_regions(prog, observed, B, kept, pruning)
-            once = top_down_prior(prog, td, observed, B, kept, pruning)
+            prior = prior_regions(prog, observed, B, kept, lv)
+            once = top_down_prior(prog, td, observed, B, kept, lv)
         pf = cc.backend.state.prior_flows(np.zeros(len(cc.backend.sum_regions), dtype = bool))
         plan = query_plan(prog, observed, None if targets is None else targets.cpu().numpy(), valid.numpy(), prior,
                           top_down = dict(program = td, once = once, valid = pf["valid"].copy(), held = held))
+        if lv is not None:
+            lv.order(per_sample_intervals(prog, plan))
         bufs = cc.backend.state.buffers(B)
         flows = cc.backend.state.flows(B, bufs)
         if nan_fill:
             flows["node_flows"].fill_(float("nan"))         # every needed slot must be written
         with torch.no_grad():
-            F.run_forward(cc.backend, bufs, plan, x, missing, obs_class, pruning, "fp32")
+            F.run_forward(cc.backend, bufs, plan, x, missing, obs_class, lv, "fp32")
             valid |= plan.todo
-            run_backward(cc.backend, bufs, flows, plan, x, missing, obs_class, pruning, "fp32",
+            run_backward(cc.backend, bufs, flows, plan, x, missing, obs_class, lv, "fp32",
                          visit = None if visit is None else lambda pi: visit(pi, bufs, flows, plan))
         lay, nf, pf = bufs["layout"], flows["node_flows"], cc.backend.state._prior_flows_state
         out = []
@@ -156,7 +159,7 @@ def assert_top_down_close(cc, got, want, data, missing, regions = None):
     dev = cc.pc.params.device
     x = torch.where(missing, 0, data).to(dev)
     obs_class = torch.where(missing.to(dev), -1, cc.backend.token_classes.token_class[x]).contiguous()
-    pruning = prune(prog, obs_class, B) if (~missing).any() else None
+    pruning = liveness(prog, obs_class, B) if (~missing).any() else None
     firsts = [first for first, _, _ in cc.backend.sum_regions]
     for ns, block in want.items():
         if not ns.is_sum():
@@ -204,7 +207,7 @@ def test_dead_slots_hold_neg_inf(kind, sum_path, build_pc, reference):
     got, plan = top_down_blocks(cc, data, missing, policy = "sample")
     x = torch.where(missing, 0, data).to(dev)
     obs_class = torch.where(missing.to(dev), -1, cc.backend.token_classes.token_class[x]).contiguous()
-    pruning = prune(prog, obs_class, B)
+    pruning = liveness(prog, obs_class, B)
     for r in range(len(cc.backend.sum_regions)):
         a, b = prog.sum_ivs[prog.reg_iv_host[r]]
         assert torch.isneginf(got[r][:, ~live_slots(cc, pruning.live, a, b, B).to(dev)]).all(), r
@@ -213,7 +216,7 @@ def test_dead_slots_hold_neg_inf(kind, sum_path, build_pc, reference):
 
 @pytest.mark.parametrize("kind", ["pd", "pd_prod_dominated", "hand", "hmm"])
 def test_top_down_values_survive_a_wide_dynamic_range(kind, build_pc, reference, monkeypatch):
-    """The construction of pruning_test.py's ``test_marginals_survive_a_wide_dynamic_range`` (tokens 1 and 2 have
+    """The construction of liveness_test.py's ``test_marginals_survive_a_wide_dynamic_range`` (tokens 1 and 2 have
     probability e^-50 under "contains 1 2", so a block's entries span far more than fp32's exponent): the top-down
     pass's transposed block @ block contractions flush the small entries as the forward's do unless the tile is
     computed again exactly. Against the reference in float64."""
@@ -346,7 +349,7 @@ def test_products_of_target_inputs_get_their_values(kind, policy, build_pc, refe
     want = reference.top_down(cc, data, missing)
     x = torch.where(missing, 0, data).to(dev)
     obs_class = torch.where(missing.to(dev), -1, cc.backend.token_classes.token_class[x]).contiguous()
-    pruning = prune(prog, obs_class, B) if (~missing).any() else None
+    pruning = liveness(prog, obs_class, B) if (~missing).any() else None
     groups = [lg for lg in pc.inner_layer_groups if lg.is_prod()]
     of = prog.intervals.of.cpu().numpy()
     checked = []

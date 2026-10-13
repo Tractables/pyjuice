@@ -556,7 +556,7 @@ def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_
     :param exact: see :func:`~.prod.run_products`
     :param once_iv: int32 [intervals] (device, by ``prog.intervals``' numbers): 1 where the query keeps an interval's
         top-down values once, for a batch of one: a parent there is read with sample stride 0
-    :param lanes: None, or under evidence pruning the query's :class:`~.live.Pruning` ``(perm, reg_first,
+    :param lanes: None, or under evidence pruning the query's :class:`~.live.LaneOrder` ``(perm, reg_first,
         reg_live)``: a sum child's lanes run in that order, its dead ones only set to -inf
     """
     temp, temp_width = bufs

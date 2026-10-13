@@ -18,6 +18,7 @@ import torch
 import pyjuice as juice
 import pyjuice.constraints as jc
 from pyjuice.constraints.backends.dfa_exact.kernels.blocks import move_blocks, move_table
+from pyjuice.constraints.backends.dfa_exact.kernels.live import liveness
 from pyjuice.constraints.backends.dfa_exact.queries import decoder as QD
 from pyjuice.utils.fast_inference import is_active
 
@@ -55,7 +56,7 @@ class Spy:
 
         def spy_move_blocks(*args, **kwargs):
             self.moves += 1
-            self.live_moves += kwargs.get("rank") is not None
+            self.live_moves += kwargs.get("live") is not None
             return move_blocks(*args, **kwargs)
 
         monkeypatch.setattr(QD, "conditional", spy_conditional)
@@ -282,26 +283,41 @@ def test_moving_blocks():
         assert torch.equal(dst[which][do:].view(r, dw)[:, :B * k], temp[to:to + r * B * k].view(r, B * k))
 
 
-def test_moving_live_lanes_only():
-    """Given the source samples' liveness (a pruning's ``rank``, each region's columns from a start of its own), a
-    destination lane gets its parent's value where the parent's column is live, and -inf where it is dead."""
+def test_moving_live_lanes_only(build_pc):
+    """Given the source call's liveness (its flags: a lane is live where both ends of its slot's pair are), a
+    destination lane gets its parent's value where that lane is live, and -inf where it is dead -- over an interval
+    that keeps every pair and one that does not, against the liveness's own lane order."""
+    n = KINDS["pd"]
+    cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc("pd", n, V))
+    prog, layout = cc.backend.program(), cc.backend.layout
     g = torch.Generator().manual_seed(1)
-    B_old, B, slots, rows = 5, 170, (7, 3), (41, 18)
-    src = [torch.randn(3000, generator = g).cuda() for _ in range(2)]
+    B_old, B = 5, 170
+    data = torch.randint(0, V, (B_old, n), generator = g)
+    missing = torch.rand(B_old, n, generator = g) < 0.5
+    x = torch.where(missing, 0, data).cuda()
+    oc = torch.where(missing.cuda(), -1, cc.backend.token_classes.token_class[x]).contiguous()
+    lv = liveness(prog, oc, B_old)
+    order = lv.order(np.ones(len(prog.sum_ivs), dtype = bool))
+    slots = np.asarray(prog.sum_iv_slots)
+    pick = lambda full: max((k for k, (a, b) in enumerate(prog.sum_ivs)
+                             if (layout.reachability.positions(a, b) is None) == full), key = lambda k: slots[k])
+    ks, rows = (pick(True), pick(False)), (41, 18)
+    S = [int(slots[k]) for k in ks]
+    src = [torch.randn(1000 + r * (B_old * s + 3), generator = g).cuda() for r, s in zip(rows, S)]
     parents = torch.randint(0, B_old, (B,), generator = g)
-    rank = torch.where(torch.rand(40 + B_old * sum(slots), generator = g) < 0.3, 0, -1).to(torch.int32)
-    starts = (40, 40 + B_old * slots[0])                            # past 40 columns of other intervals
-    moves = [(1000, B_old * slots[0] + 3, 0, B * slots[0], slots[0], rows[0], 0, starts[0]),
-             (1500, B_old * slots[1] + 3, rows[0] * B * slots[0], B * slots[1], slots[1], rows[1], 1, starts[1])]
-    dst = torch.full((sum(r * B * k for r, k in zip(rows, slots)),), float("nan"), device = "cuda")
-    move_blocks(src, (dst, dst), torch.tensor(move_table(*np.asarray(moves).T), device = "cuda"), B, max(rows),
-                max(slots), parents = parents.cuda(), rank = rank.cuda())
-    for so, sw, do, _, k, r, which, first in moves:
-        old = src[which][so:so + r * sw].view(r, sw)[:, :B_old * k].view(r, B_old, k).cpu()
-        live = (rank[first:first + B_old * k] >= 0).view(B_old, k)[parents]                  # [B, k]
-        want = torch.where(live, old[:, parents], float("-inf"))
-        assert torch.equal(dst[do:do + r * B * k].view(r, B, k).cpu(), want)
-        assert live.any() and not live.all()
+    moves = [(1000, B_old * S[0] + 3, 0, B * S[0], S[0], rows[0], 0, *prog.sum_ivs[ks[0]]),
+             (1000, B_old * S[1] + 3, rows[0] * B * S[0], B * S[1], S[1], rows[1], 1, *prog.sum_ivs[ks[1]])]
+    dst = torch.full((sum(r * B * s for r, s in zip(rows, S)),), float("nan"), device = "cuda")
+    move_blocks(src, (dst, dst), torch.tensor(move_table(*np.asarray(moves).T[:7], np.asarray(moves)[:, 7:]),
+                                              device = "cuda"),
+                B, max(rows), max(S), parents = parents.cuda(), live = lv.live, prog = prog)
+    rank = order.rank.cpu()
+    for (so, sw, do, _, s, r, which, _, _), k in zip(moves, ks):
+        old = src[which][so:so + r * sw].view(r, sw)[:, :B_old * s].view(r, B_old, s).cpu()
+        alive = (rank[order.first[k]:order.first[k] + B_old * s] >= 0).view(B_old, s)[parents]          # [B, s]
+        want = torch.where(alive, old[:, parents], float("-inf"))
+        assert torch.equal(dst[do:do + r * B * s].view(r, B, s).cpu(), want), k
+        assert alive.any() and not alive.all()
 
 
 @pytest.mark.parametrize("kind", ["hmm", "hmm_untied", "hmm_block_sparse"])

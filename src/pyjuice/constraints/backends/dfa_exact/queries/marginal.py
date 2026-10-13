@@ -10,9 +10,9 @@ from typing import Optional
 import numpy as np
 import torch
 
-from ..kernels.live import prune
+from ..kernels.live import liveness
 from .forward import PRECISIONS, missing_tensor, run_forward
-from .plans import prior_regions, query_plan
+from .plans import per_sample_intervals, prior_regions, query_plan
 
 
 
@@ -28,7 +28,7 @@ def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] =
     :param held: None, or bool [sum regions]: the per-sample inside values ``node_mars`` holds for this query, as a
         decoder decides (see :mod:`.plans`)
     :param report: None, or a dict where the query leaves its :class:`~.plans.QueryPlan` (``"plan"``) and its
-        :class:`~..kernels.live.Pruning` (``"pruning"``; None when it observes nothing)
+        :class:`~..kernels.live.Liveness` (``"liveness"``; None when it observes nothing)
     :returns: [B, number of root nodes], as :func:`pyjuice.queries.marginal`
     """
     if precision not in PRECISIONS:
@@ -53,13 +53,15 @@ def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] =
 
     with torch.no_grad():
         obs_class = torch.where(missing, -1, backend.token_classes.token_class[x]).contiguous()
-        pruning = prune(prog, obs_class, B) if observed.any() else None     # nothing observed: nothing to prune
+        lv = liveness(prog, obs_class, B) if observed.any() else None       # nothing observed: nothing to prune
         valid, kept = backend.state.prior_validity()
-        prior = prior_regions(prog, observed, B, kept, pruning)
+        prior = prior_regions(prog, observed, B, kept, lv)
         plan = query_plan(prog, observed, None, valid.numpy(), prior, held = held)   # every inside value
+        if lv is not None:
+            lv.order(per_sample_intervals(prog, plan))
         if report is not None:
-            report.update(plan = plan, pruning = pruning)
-        run_forward(backend, bufs, plan, x, missing, obs_class, pruning, precision)
+            report.update(plan = plan, liveness = lv)
+        run_forward(backend, bufs, plan, x, missing, obs_class, lv, precision)
         valid |= plan.todo
 
         r = prog.root_region

@@ -48,7 +48,7 @@ def prune_dense(ncols: int, num_live: int) -> bool:
     always pays -- a matrix-vector product, x1.07-6.2; otherwise pruning pays once the product has left the
     weight-read floor (from ``DENSE_PRUNE_MIN_COLUMNS`` columns) and at least half the columns are dead (x1.2-2.4
     with a quarter live), while below, the gather and scatter cost more than they save (x0.74-0.98). Reading
-    ``num_live`` is the query's one wait for the device (see :class:`~.live.Pruning`).
+    ``num_live`` waits for the device (see :meth:`~.live.LaneOrder.num_live`).
     """
     return num_live < ncols and (num_live <= 1 or (ncols >= DENSE_PRUNE_MIN_COLUMNS and 2 * num_live <= ncols))
 
@@ -66,7 +66,7 @@ def missing_tensor(missing_mask: Optional[torch.Tensor], B: int, n: int, dev) ->
     return missing.contiguous()
 
 
-def run_forward(backend, bufs: dict, plan, x: torch.Tensor, missing: torch.Tensor, obs_class: torch.Tensor, pruning,
+def run_forward(backend, bufs: dict, plan, x: torch.Tensor, missing: torch.Tensor, obs_class: torch.Tensor, liveness,
                 precision: str):
     """
     The inside values a query plan computes (see :mod:`.plans`): the per-sample ones into ``node_mars``, and
@@ -78,7 +78,7 @@ def run_forward(backend, bufs: dict, plan, x: torch.Tensor, missing: torch.Tenso
     :param x: [B, n] token ids (any valid id where missing)
     :param missing: [B, n] bool, True where a token is missing
     :param obs_class: [B, n] int32, every observed token's class, -1 where missing
-    :param pruning: None, or the query's :class:`~.live.Pruning`
+    :param liveness: None, or the query's :class:`~.live.Liveness`, the intervals it computes per sample ordered
     :param precision: "fp32" or "tf32" for the sum layers' matrix products
     :returns: the class masses the pass read (:meth:`~.state.State.class_masses`; computed
         for this query outside :func:`pyjuice.fast_inference`), for the query's later passes
@@ -96,7 +96,7 @@ def run_forward(backend, bufs: dict, plan, x: torch.Tensor, missing: torch.Tenso
     else:                                                              # none: never read
         srcs = dict(mars = node_mars, offset = regions["offset"], width = regions["width"], reg_prior = plan.reg_prior)
     dot = PRECISIONS[precision]
-    live = pruning.live if pruning is not None else None
+    live = liveness.live if liveness is not None else None
 
     for layer in pc.input_layer_group:                                 # the input region: pyjuice's own layout
         layer(x.permute(1, 0), bufs["input_mars"], missing_mask = missing)
@@ -118,7 +118,7 @@ def run_forward(backend, bufs: dict, plan, x: torch.Tensor, missing: torch.Tenso
                              prog.no_evidence, None, elem_first, elem_width, 1, srcs, exact = True)
                 if sample_stages:
                     products(sample_stages, (temp, temp_width), prog, regions, element_mars, node_mars, class_mars,
-                             obs_class, live, elem_first, elem_width, B, srcs, exact = pruning is not None)
+                             obs_class, live, elem_first, elem_width, B, srcs, exact = liveness is not None)
         else:
             for block_size, prior_parts, sample_parts in layers:
                 if prior_parts:
@@ -126,12 +126,12 @@ def run_forward(backend, bufs: dict, plan, x: torch.Tensor, missing: torch.Tenso
                           prior["width"], elem_first, elem_width, 1, None, stacks, kept, precision)
                 if sample_parts:
                     _sums(backend, sample_parts, block_size, node_mars, element_mars, regions, lay["sum_offsets"],
-                          lay["sum_widths"], elem_first, elem_width, B, pruning, stacks, kept, precision)
+                          lay["sum_widths"], elem_first, elem_width, B, liveness, stacks, kept, precision)
     return class_mars
 
 
 def _sums(backend, parts, block_size: int, nodes: torch.Tensor, element_mars: torch.Tensor, regions: dict, offsets,
-          widths, elem_first: int, elem_width: int, B: int, pruning, stacks: dict, kept: bool, precision: str):
+          widths, elem_first: int, elem_width: int, B: int, liveness, stacks: dict, kept: bool, precision: str):
     """A sum layer's parts a query plan runs (``(dense runs, num_edges, fused)``: the runs ``(region, c0, blocks,
     key)``, and None or ``(fused part, index list of its node blocks or None for all, count, most slots)``, see
     :func:`~.plans.query_plan`) into ``nodes`` -- ``node_mars``, or ``prior_mars`` with ``B`` 1 and no pruning --
@@ -143,8 +143,8 @@ def _sums(backend, parts, block_size: int, nodes: torch.Tensor, element_mars: to
             region = (offsets[r], widths[r], prog.firsts[r])
             ncols = B * prog.slots[r]
             cols = None                                                  # every column live
-            if pruning is not None and prune_dense(ncols, pruning.num_live[prog.reg_iv_host[r]]):
-                cols = pruning.segment(prog.reg_iv_host[r], ncols)
+            if liveness is not None and prune_dense(ncols, liveness.lanes.num_live(prog.reg_iv_host[r])):
+                cols = liveness.lanes.segment(prog.reg_iv_host[r], ncols)
             stacked = None                                  # stacked if narrow enough and the copy is kept or reused
             width = cols[2] if cols is not None else ncols                                # the product's columns
             if key is not None and width <= STACK_MAX_COLUMNS[precision] and (kept or prog.stack_uses[key] > 1):
@@ -156,5 +156,5 @@ def _sums(backend, parts, block_size: int, nodes: torch.Tensor, element_mars: to
         if fused is not None:
             (nids, cids, pids, nb_reg, _, aliased), sel, count, max_slots = fused
             fused_sum(nodes, element_mars, pc.params, nids, cids, pids, nb_reg, regions, elem_first, elem_width, B,
-                      block_size, max_cols = B * max_slots, precision = dot, aliased = aliased, pruning = pruning,
+                      block_size, max_cols = B * max_slots, precision = dot, aliased = aliased, liveness = liveness,
                       sel = None if sel is None else sel.tensor, count = count)

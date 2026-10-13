@@ -37,7 +37,7 @@ from ..kernels.sum import dense_sum_top_down, fill_dead_rows, fused_sum_top_down
 
 
 def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missing: torch.Tensor,
-                 obs_class: torch.Tensor, pruning, precision: str, visit: Optional[Callable[[int], None]] = None,
+                 obs_class: torch.Tensor, liveness, precision: str, visit: Optional[Callable[[int], None]] = None,
                  class_weights: Optional[dict] = None, class_mars: Optional[torch.Tensor] = None):
     """
     The top-down values a query plan computes (``plan.top_down``, see :mod:`.plans`), after
@@ -70,9 +70,9 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
     if pf is not None:                                   # where the values kept once go
         once = dict(offset = pf["offset_t"], width = pf["width_t"], first = prog.reg_first, slots = prog.reg_slots)
     dot = F.PRECISIONS[precision]
-    live = pruning.live if pruning is not None else None
-    lanes = (pruning.perm, pruning.reg_first, pruning.reg_live) if pruning is not None else None
-    exact = pruning is not None
+    live = liveness.live if liveness is not None else None
+    lanes = (liveness.lanes.perm, liveness.lanes.reg_first, liveness.lanes.reg_live) if liveness is not None else None
+    exact = liveness is not None
     if class_mars is None:
         class_mars = backend.state.class_masses()
     prog.transitions(class_mars, backend.state.class_mars_version)
@@ -103,9 +103,9 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
                     for r, c0, E, piece, blocks, key, add in dense_runs[part]:
                         ncols = nb * prog.slots[r]
                         cols = None
-                        if part == 1 and pruning is not None and \
-                                F.prune_dense(ncols, pruning.num_live[prog.reg_iv_host[r]]):
-                            cols = pruning.segment(prog.reg_iv_host[r], ncols)
+                        if part == 1 and liveness is not None and \
+                                F.prune_dense(ncols, liveness.lanes.num_live(prog.reg_iv_host[r])):
+                            cols = liveness.lanes.segment(prog.reg_iv_host[r], ncols)
                         stacked = None
                         width_ = cols[2] if cols is not None else ncols
                         if key is not None and width_ <= F.STACK_MAX_COLUMNS[precision] and \
@@ -119,7 +119,7 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
                     for cbs, tables, idx in fused_groups[part]:
                         fused_sum_top_down(element_flows, nf, pc.params, tables, regs, elem_first, elem_width, nb,
                                           block_size, cbs, max_cols = nb * tables["max_slots"], precision = dot,
-                                          pruning = pruning if part == 1 else None, idx = tensor(idx))
+                                          liveness = liveness if part == 1 else None, idx = tensor(idx))
             if visit is not None:
                 visit(prod_index)
         else:
@@ -146,7 +146,7 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
                                      srcs, out.skip, exact, td.once_iv, lanes = lanes)
                     if cw_launches and class_weights is not None:
                         run_class_weights(cw_launches, class_weights, prog, (temp, temp_width), element_flows,
-                                          temp_flows, node_mars, live, elem_first, elem_width, B, srcs, td.once_iv,
+                                          temp_flows, node_mars, liveness, elem_first, elem_width, B, srcs, td.once_iv,
                                           regions)
     if pf is not None:
         pf["valid"] |= td.todo

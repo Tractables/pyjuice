@@ -94,7 +94,7 @@ class Program:
         self.reg_iv_host = [self.iv_number[iv] for iv in reg_ivs]
         self.reg_iv_np = np.asarray(self.reg_iv_host, dtype = np.int64)
         self.reg_iv = torch.tensor(self.reg_iv_host, dtype = torch.long, device = dev)
-        self.live_tables = {}                                          # batch size -> evidence pruning's lists
+        self.live_tables = OrderedDict()                               # (batch size, intervals) -> lane order tables
         self.no_evidence = torch.full((1, n), -1, dtype = torch.int32, device = dev)   # a sample with nothing observed
         self.plans = OrderedDict()                                     # query plans, see :mod:`.plans`
         self.layouts = OrderedDict()                                   # conditionals' class weights, see .conditional

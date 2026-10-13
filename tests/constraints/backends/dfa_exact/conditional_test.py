@@ -14,6 +14,7 @@ import pyjuice as juice
 import pyjuice.constraints as jc
 from pyjuice.constraints.backends.dfa_exact.queries import forward as F
 from pyjuice.constraints.backends.dfa_exact.queries.conditional import class_weights
+from pyjuice.constraints.backends.dfa_exact.kernels import score as S
 from pyjuice.constraints.backends.dfa_exact.kernels.score import score_tables
 from pyjuice.constraints.distributions import TokenClasses
 from pyjuice.constraints.evidence import candidate_tensor
@@ -133,24 +134,35 @@ def test_class_weights_match_the_reference(kind, name, pattern, sum_path, build_
     assert checked > 0
 
 
-@pytest.mark.parametrize("scan", [1, 16])
-@pytest.mark.parametrize("pattern", ["mixed", "scattered", "none"])
+@pytest.mark.parametrize("one_sample", [False, True])
 @pytest.mark.parametrize("kind", ["hmm", "hand_left", "left_linear", "pd"])
-def test_class_weights_scan_the_live_columns_any_number_at_a_time(kind, pattern, scan, build_pc, monkeypatch):
-    """The class weights with the live columns found a column or two at a time (every scan of a boundary's columns
-    advancing past empty ones; the default finds them all at once on these automata): bit for bit the same."""
-    from pyjuice.constraints.backends.dfa_exact.kernels import score
+def test_class_weights_walk_every_samples_own_live_columns(kind, one_sample, build_pc, monkeypatch):
+    """Samples sharing a class-weight program whose live lists at the target boundary differ in length -- every column
+    (nothing observed), one (a prefix), none (evidence the constraint rules out) --: every sample's class weights are
+    those it gets alone. Also with one sample per program (``one_sample``: every lane walks the same columns)."""
+    if one_sample:
+        monkeypatch.setattr(S, "CLASS_WEIGHT_LANES", 1)
     n = KINDS[kind]
     cc = jc.compile(CONSTRAINTS["either"](), build_pc(kind, n, V))
-    data, missing = evidence(pattern, n)
+    data, missing = evidence("mixed", n, B = 12)
+    data[3], missing[3] = 1, False                                      # "1 1 ..." contains neither "2" nor "0 0"
+    missing[3, n // 2] = True
     positions = missing.any(dim = 0).numpy()
     dev = cc.pc.params.device
     with torch.no_grad():
-        want = [w.clone() for _, _, w in class_weights(cc.backend, data, missing.to(dev), positions)[0]]
-        monkeypatch.setattr(score, "CLASS_WEIGHT_SCAN", scan)
-        got = [w.clone() for _, _, w in class_weights(cc.backend, data, missing.to(dev), positions)[0]]
-    assert len(got) == len(want) and all(torch.equal(a, b) for a, b in zip(got, want))
-    assert any(torch.isfinite(w).any() for w in want)
+        together = [w.clone() for _, _, w in class_weights(cc.backend, data, missing.to(dev), positions)[0]]
+        alone = [[w.clone() for _, _, w in class_weights(cc.backend, data[b:b + 1], missing[b:b + 1].to(dev),
+                                                          positions)[0]] for b in range(data.size(0))]
+    B = data.size(0)
+    for g, w in enumerate(together):
+        P = w.size(0) // B
+        for b in range(B):
+            got = w.view(P, B, *w.shape[1:])[:, b]
+            want = alone[b][g]
+            assert torch.equal(torch.isneginf(got), torch.isneginf(want)), (g, b)
+            fin = torch.isfinite(want)
+            assert ((got[fin] - want[fin]).abs() <= 1e-5 * want[fin].abs() + n * 1e-6).all(), (g, b)
+    assert any(torch.isfinite(w).any() for w in together)
 
 
 def test_targets(build_pc, reference):

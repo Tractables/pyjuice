@@ -127,7 +127,7 @@ def _lifted_sum_kernel(node_mars, element_mars, weights, nids, cids, pids, nb_re
 def fused_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor, nids: torch.Tensor,
               cids: torch.Tensor, pids: torch.Tensor, nb_reg: torch.Tensor, regions: dict, elem_first: int,
               elem_width: int, batch_size: int, block_size: int, max_cols: int, precision: str, aliased = None,
-              pruning = None, sel = None, count: Optional[int] = None):
+              liveness = None, sel = None, count: Optional[int] = None):
     """
     Node blocks of a sum layer partition with the fused Triton kernel, into ``node_mars``.
 
@@ -139,7 +139,7 @@ def fused_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch
     :param aliased: None, or the node blocks' children that copy a sum and are read in the sum's own row:
         ``(rows, regions, pids)``, each [num node blocks, num aliased] int32 (``rows`` within the region, ``-1`` for
         padding; ``pids`` as for ``cids``)
-    :param pruning: None, or the query's :class:`~.live.Pruning`
+    :param liveness: None, or the query's :class:`~.live.Liveness` (its lane order covers the regions computed)
     :param sel, count: None for every node block, or a query plan's int32 index list of them and its length
     """
     num_blocks, num_edges = cids.shape
@@ -153,7 +153,8 @@ def fused_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch
     a_rows, a_regs, a_pids = aliased if aliased is not None else (cids, cids, cids)
     num_alias = a_rows.size(1) if aliased is not None else 0
     TILE_A = min(te, max(16, host_next_power_of_2(num_alias)))
-    perm, reg_perm, reg_live = (pruning.perm, pruning.reg_first, pruning.reg_live) if pruning is not None else \
+    lanes = liveness.lanes if liveness is not None else None
+    perm, reg_perm, reg_live = (lanes.perm, lanes.reg_first, lanes.reg_live) if lanes is not None else \
         (cids, cids, cids)
     for first, size in grid_chunks(host_cdiv(max_cols, TILE_B), 1):
         _lifted_sum_kernel[(num_blocks * num_mtiles, size)](
@@ -162,7 +163,7 @@ def fused_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch
             regions["first"], regions["slots"], a_rows, a_regs, a_pids, perm, reg_perm, reg_live, elem_first,
             elem_width, batch_size, num_edges, num_alias, num_mtiles, first, BS = block_size, TILE_M = TILE_M,
             TILE_E = TILE_E, TILE_A = TILE_A, TILE_B = TILE_B, PRECISION = precision, ALIAS = aliased is not None,
-            PRUNE = pruning is not None, INDEXED = sel is not None, num_warps = warps, num_stages = stages)
+            PRUNE = liveness is not None, INDEXED = sel is not None, num_warps = warps, num_stages = stages)
 
 
 # -------------------------------------------------------------------------------------------------
@@ -306,7 +307,7 @@ def dense_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch
 
     :param region: ``(offset, width, first)`` of the node blocks' sum region (Python ints)
     :param live: None (every column), or the region's interval's ``(perm, rank, num_live)`` (see
-        :meth:`~.live.Pruning.segment`): the live columns are gathered and multiplied, the others set to -inf
+        :meth:`~.live.LaneOrder.segment`): the live columns are gathered and multiplied, the others set to -inf
     :param stacked: first child row -> the :func:`stacked_weights` of that run's node blocks, which occupy
         consecutive rows in the order listed: one product for the run instead of one per block
     """
@@ -423,7 +424,7 @@ def _lifted_sum_top_down_kernel(element_flows, node_flows, weights, cb_row, cb_r
 
 def fused_sum_top_down(element_flows: torch.Tensor, node_flows: torch.Tensor, params: torch.Tensor, tables: dict,
                       regions: dict, elem_first: int, elem_width: int, batch_size: int, block_size: int, cbs: int,
-                      max_cols: int, precision: str, pruning = None, idx: Optional[torch.Tensor] = None):
+                      max_cols: int, precision: str, liveness = None, idx: Optional[torch.Tensor] = None):
     """
     The top-down values of the children of a sum layer's fused node blocks (:func:`_lifted_sum_top_down_kernel`).
 
@@ -440,7 +441,8 @@ def fused_sum_top_down(element_flows: torch.Tensor, node_flows: torch.Tensor, pa
     TILE_I = min(te, max(16, host_next_power_of_2(block_size)))
     TILE_B = min(tb, max(16, host_next_power_of_2(max_cols)))
     num_ctiles = host_cdiv(cbs, TILE_C)
-    perm, reg_perm, reg_live = (pruning.perm, pruning.reg_first, pruning.reg_live) if pruning is not None else \
+    lanes = liveness.lanes if liveness is not None else None
+    perm, reg_perm, reg_live = (lanes.perm, lanes.reg_first, lanes.reg_live) if lanes is not None else \
         (tables["cb_row"], tables["cb_row"], tables["cb_row"])
     for first, size in grid_chunks(host_cdiv(max_cols, TILE_B), 1):
         _lifted_sum_top_down_kernel[(num_blocks * num_ctiles, size)](
@@ -448,7 +450,7 @@ def fused_sum_top_down(element_flows: torch.Tensor, node_flows: torch.Tensor, pa
             tables["cb_row"] if idx is None else idx, tables["par_ptr"], tables["par_nid"], tables["par_reg"],
             tables["par_pid"], regions["offset"], regions["width"], regions["first"], regions["slots"], perm, reg_perm,
             reg_live, elem_first, elem_width, batch_size, first, BS = block_size, CBS = cbs, TILE_C = TILE_C,
-            TILE_I = TILE_I, TILE_B = TILE_B, PRECISION = precision, PRUNE = pruning is not None,
+            TILE_I = TILE_I, TILE_B = TILE_B, PRECISION = precision, PRUNE = liveness is not None,
             INDEXED = idx is not None, num_warps = warps, num_stages = stages)
 
 
@@ -495,7 +497,7 @@ def dense_sum_top_down(element_flows: torch.Tensor, node_flows: torch.Tensor, pa
 
     :param blocks: ``[(k, nid, p0)]`` as in :func:`dense_sum`'s groups (consecutive rows when ``stacked``)
     :param region: ``(offset, width, first)`` of the node blocks' sum region
-    :param live: None, or the interval's ``(perm, rank, num_live)`` (see :meth:`~.live.Pruning.segment`)
+    :param live: None, or the interval's ``(perm, rank, num_live)`` (see :meth:`~.live.LaneOrder.segment`)
     :param piece: None, or ``(lo, hi)``: only the children ``c0 + lo .. c0 + hi``
     """
     offset, width, first = region

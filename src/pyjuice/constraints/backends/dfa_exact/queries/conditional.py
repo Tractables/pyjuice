@@ -21,9 +21,9 @@ import torch
 
 from . import forward as F
 from ..kernels.common import pack_aligned
-from ..kernels.live import prune
+from ..kernels.live import liveness
 from ..kernels.score import score_group, score_tables
-from .plans import PLANS_PER_POSITION, PLAN_CACHE_SIZE, prior_regions, query_plan, top_down_prior
+from .plans import PLANS_PER_POSITION, PLAN_CACHE_SIZE, per_sample_intervals, prior_regions, query_plan, top_down_prior
 from .top_down import run_backward
 
 
@@ -99,7 +99,7 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     :param held: see :func:`conditional`
     :param observed: None, or bool [n] (host): the positions some sample observes (read off ``missing`` if None)
     :param report: None, or a dict where the query leaves its :class:`~.plans.QueryPlan` (``"plan"``) and its
-        :class:`~..kernels.live.Pruning` (``"pruning"``; None when it observes nothing)
+        :class:`~..kernels.live.Liveness` (``"liveness"``; None when it observes nothing)
     :param layout: None, or ``(groups, size, (base, K))``: :func:`_layout`'s groups and size, and its ``base`` and
         ``K`` already on the device (int64 [n] each) -- copied before the query launches anything, as copies from the
         host wait for the stream
@@ -121,23 +121,25 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     flows = backend.state.flows(B, bufs)
     held = held or {}
     obs_class = torch.where(missing, -1, backend.token_classes.token_class[x]).contiguous()
-    pruning = prune(prog, obs_class, B) if observed.any() else None
+    lv = liveness(prog, obs_class, B) if observed.any() else None
     valid, kept = backend.state.prior_validity()
-    prior = prior_regions(prog, observed, B, kept, pruning)
+    prior = prior_regions(prog, observed, B, kept, lv)
     pf = backend.state.prior_flows(np.zeros(len(backend.sum_regions), dtype = bool))
-    top = dict(program = td, once = top_down_prior(prog, td, observed, B, kept, pruning), valid = pf["valid"].copy(),
+    top = dict(program = td, once = top_down_prior(prog, td, observed, B, kept, lv), valid = pf["valid"].copy(),
                held = held.get("top_down"), scoring = True)
     plan = query_plan(prog, observed, positions, valid.numpy(), prior, held = held.get("inside"), top_down = top)
+    if lv is not None:
+        lv.order(per_sample_intervals(prog, plan))
     if report is not None:
-        report.update(plan = plan, pruning = pruning)
-    class_mars = F.run_forward(backend, bufs, plan, x, missing, obs_class, pruning, precision)
+        report.update(plan = plan, liveness = lv)
+    class_mars = F.run_forward(backend, bufs, plan, x, missing, obs_class, lv, precision)
     valid |= plan.todo
 
     C = backend.num_classes
     buf = backend.state.storage_view("dfa_class_flow", size)
     buf.fill_(-float("inf"))
     cw = dict(buf = buf, base = base, K = K)
-    run_backward(backend, bufs, flows, plan, x, missing, obs_class, pruning, precision, class_weights = cw,
+    run_backward(backend, bufs, flows, plan, x, missing, obs_class, lv, precision, class_weights = cw,
                  class_mars = class_mars)
     return [(g, pos, buf[s:s + len(pos) * B * C * len(score.rows[g])].view(len(pos) * B, C, len(score.rows[g])))
             for g, pos, s in groups], class_mars
@@ -163,7 +165,7 @@ def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor
         ``(b, t)``'s row scores ``candidates[b, t]`` only (:func:`~.score.score_group`); ids outside the vocabulary
         pad, and get -inf
     :param report: None, or a dict where the query leaves its :class:`~.plans.QueryPlan` and
-        :class:`~..kernels.live.Pruning` (see :func:`class_weights`; neither when it computes nothing)
+        :class:`~..kernels.live.Liveness` (see :func:`class_weights`; neither when it computes nothing)
     :returns: [rows, V], or [rows, k] with ``candidates``
     """
     _check(backend, data, precision)

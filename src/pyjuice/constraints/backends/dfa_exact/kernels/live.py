@@ -24,7 +24,7 @@ can flush a live entry's terms: the tiles where that happens are computed again 
 """
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import numpy as np
 import torch
@@ -193,47 +193,76 @@ def _live_order_kernel(tile_live, counts, perm, rank, reg_live, iv_regs, iv_reg_
         tl.store(counts + k, total)
         for j in range(tl.load(iv_reg_ptr + k), tl.load(iv_reg_ptr + k + 1)):
             tl.store(reg_live + tl.load(iv_regs + j), total)
+        if k == 0:                                                         # the regions of no ordered interval: 0
+            K = tl.num_programs(0)
+            for j in range(tl.load(iv_reg_ptr + K), tl.load(iv_reg_ptr + K + 1)):
+                tl.store(reg_live + tl.load(iv_regs + j), 0)
+
+
+@triton_jit
+def _row_lists_kernel(live, count, start, columns, width, S, n, W, NP: tl.constexpr, TILE: tl.constexpr):
+    """One program per (sample, boundary) row of ``live``: its live columns (below the boundary's width, the columns
+    past it being unwritten), ascending, at ``columns[start[row]]`` on -- where the row's columns would be were every
+    one live (``S``: a sample's columns over all boundaries) --, and how many."""
+    row = tl.program_id(0).to(tl.int64)
+    t = row % (n + 1)
+    tt = tl.arange(0, NP)
+    before = tl.sum(tl.where(tt < t, _exit_width(width, tt, n), 0), axis = 0)   # the sample's columns before t
+    base = (row // (n + 1)) * S + before.to(tl.int64)
+    w = _exit_width(width, t, n)
+    total = tl.zeros([], dtype = tl.int32)
+    for c0 in range(0, w, TILE):
+        c = c0 + tl.arange(0, TILE)
+        v = (tl.load(live + row * W + c, mask = c < w, other = 0) != 0).to(tl.int32)
+        tl.store(columns + base + total + tl.cumsum(v, axis = 0) - v, c, mask = v != 0)
+        total += tl.sum(v, axis = 0)
+    tl.store(count + row, total)
+    tl.store(start + row, base)
 
 
 @dataclass
-class Pruning:
+class LaneOrder:
     """
-    The live slots of one query (see the module docstring).
+    The columns of some sum intervals in their LANE ORDER (:meth:`Liveness.order`): an interval's ``B * slots``
+    columns (sample-major) with the live ones first, in order, then the dead ones -- the order the kernels that compute
+    a region's live columns only walk it in (a tile past the live ones writes -inf and reads nothing).
 
-    :ivar live: int8 [B, n + 1, W], every column's liveness per sample and boundary
-    :ivar perm: int32, per sum interval (``first[k]`` on), its ``B * slots`` columns: the live ones in order, then the
-        dead ones
+    :ivar perm: int32, per interval (``first[k]`` on), its columns in lane order
     :ivar rank: int32, the same columns' places among the live ones, -1 if dead
-    :ivar first: per sum interval, where its columns start in ``perm`` and ``rank``
-    :ivar counts: per sum interval, its live columns (a device tensor; :attr:`num_live` copies them to the host)
-    :ivar reg_first, reg_live: per sum region, ``first`` and the live columns of its interval (device tensors)
+    :ivar first: per sum interval, where its columns start in ``perm`` and ``rank``; -1 for one not ordered
+    :ivar counts: per ordered interval (in interval order), its live columns (a device tensor)
+    :ivar index: per sum interval, its place among the ordered ones (-1 if not ordered)
+    :ivar reg_first, reg_live: per sum region, ``first`` and the live columns of its interval (device tensors; 0 for a
+        region whose interval is not ordered)
     """
 
-    live: torch.Tensor
     perm: torch.Tensor
     rank: torch.Tensor
     first: List[int]
     counts: torch.Tensor
+    index: List[int]
     reg_first: torch.Tensor
     reg_live: torch.Tensor
     _num_live: Optional[List[int]] = None
 
-    @property
-    def num_live(self) -> List[int]:
-        """Per sum interval, its live columns, on the host: copied on first use, the query's one synchronization
-        (only a dense sum, whose product's size the host sets, needs them)."""
+    def num_live(self, k: int) -> int:
+        """Sum interval ``k``'s live columns, on the host: all ordered intervals' copied on first use, a wait for the
+        device (only a dense sum, whose product's size the host sets, needs them)."""
+        assert self.index[k] >= 0, "an interval whose lanes the query walks, but not ordered"
         if self._num_live is None:
             self._num_live = self.counts.tolist()
-        return self._num_live
+        return self._num_live[self.index[k]]
 
     def segment(self, k: int, ncols: int):
         """``(perm, rank, num_live)`` of sum interval ``k`` (``ncols``: its ``B * slots``)."""
         f = self.first[k]
-        return self.perm[f:f + ncols], self.rank[f:f + ncols], self.num_live[k]
+        assert f >= 0, "an interval the query computes per sample, but not ordered"
+        return self.perm[f:f + ncols], self.rank[f:f + ncols], self.num_live(k)
 
 
-#: lanes of the list kernels
+#: lanes of the lane order's kernels, and of the live lists'
 LIST_TILE = 512
+ROW_TILE = 1024
 
 #: The liveness sweeps run as a launch per boundary (:func:`_live_forward_kernel`, :func:`_live_backward_kernel`, on
 #: samples x tiles of LIVE_STEP_TILE columns) when the widest boundary has at least this many columns; below, one
@@ -244,11 +273,105 @@ LIVE_STEPS_MIN_WIDTH = 4096
 LIVE_STEP_TILE = 256
 
 
-def prune(prog, obs_class: torch.Tensor, B: int) -> Pruning:
-    """The :class:`Pruning` of a query whose observed token classes are ``obs_class`` ([B, n] int32, -1 where
-    missing). Nothing waits for the device."""
+@dataclass
+class Liveness:
+    """
+    The live columns of one query of ``B`` samples (see the module docstring), and what is derived from them on demand.
+
+    :ivar live: int8 [B, n + 1, W], every column's liveness per sample and boundary
+    :ivar lanes: the :class:`LaneOrder` of the sum intervals the query computes per sample (:meth:`order`), or None
+        before it orders them
+    """
+
+    prog: Any
+    B: int
+    live: torch.Tensor
+    lanes: Optional[LaneOrder] = None
+    _lists: Optional[tuple] = None
+    _all: Optional[LaneOrder] = None                # every interval's order, when the live counts were asked for
+
+    def lists(self):
+        """``(count, start, columns)``: every (sample, boundary) row's live columns, ascending -- ``count[row]`` (int32
+        [B * (n + 1)]) of them from ``columns[start[row]]`` (int64 start, int32 columns) on, ``row`` being
+        ``b * (n + 1) + t`` --, built on first use, one launch. ``columns`` has room for every column live (4 bytes per
+        sample and column: at most 4x ``live``), so no row waits for another's count."""
+        if self._lists is None:
+            prog, B, n = self.prog, self.B, self.prog.n
+            rows, S = B * (n + 1), sum(prog.width[:n]) + 1
+            count = torch.empty(rows, dtype = torch.int32, device = prog.dev)
+            start = torch.empty(rows, dtype = torch.int64, device = prog.dev)
+            columns = torch.empty(B * S, dtype = torch.int32, device = prog.dev)
+            _row_lists_kernel[(rows,)](self.live, count, start, columns, prog.width_t, S, n, prog.next_col.size(1),
+                                       NP = host_next_power_of_2(n + 1), TILE = ROW_TILE, num_warps = 4)
+            self._lists = (count, start, columns)
+        return self._lists
+
+    @property
+    def num_live(self) -> List[int]:
+        """Per sum interval, its live columns (every interval's), on the host: counted on first use, a wait for the
+        device. Only a query that may keep values once without :func:`pyjuice.fast_inference` asks (see
+        :func:`~..queries.plans.prior_regions`)."""
+        if self._all is None:
+            self._all = self._order(np.ones(len(self.prog.sum_ivs), dtype = bool))
+        return [self._all.num_live(k) for k in range(len(self.prog.sum_ivs))]
+
+    def order(self, intervals: np.ndarray) -> LaneOrder:
+        """The :class:`LaneOrder` of the sum intervals ``intervals`` (bool [sum intervals], host) -- those the query
+        computes per sample --, kept as :attr:`lanes`: every interval's when :attr:`num_live` already ordered them."""
+        self.lanes = self._all if self._all is not None else self._order(intervals)
+        return self.lanes
+
+    def _order(self, intervals: np.ndarray) -> LaneOrder:
+        prog, B = self.prog, self.B
+        n, W, dev, ivs = prog.n, prog.next_col.size(1), prog.dev, prog.intervals
+        key = (B, intervals.tobytes())
+        tables = prog.live_tables.get(key)
+        if tables is None:                           # where the intervals' columns and their tiles' counts go
+            sel = np.nonzero(intervals)[0]
+            sizes = [B * prog.sum_iv_slots[k] for k in sel]
+            starts = np.cumsum([0] + sizes)
+            tiles = np.cumsum([0] + [host_cdiv(z, LIST_TILE) for z in sizes])
+            K = len(prog.sum_ivs)
+            first, index = np.full(K, -1, dtype = np.int64), np.full(K, -1, dtype = np.int64)
+            first[sel], index[sel] = starts[:-1], np.arange(len(sel))
+            reg_iv = np.asarray(prog.reg_iv_host)
+            group = np.where(index[reg_iv] >= 0, index[reg_iv], len(sel))  # an ordered interval's place, or past them
+            regs = np.argsort(group, kind = "stable")                      # every ordered interval's regions, then
+            reg_ptr = np.searchsorted(group[regs], np.arange(len(sel) + 2))  # the others'
+            table = torch.tensor([(*prog.sum_ivs[k], f, t) for k, f, t in zip(sel, starts[:-1], tiles[:-1])],
+                                 dtype = torch.int32).reshape(-1, 4).to(dev)
+            to_dev = lambda x: torch.from_numpy(np.ascontiguousarray(x)).to(dev)
+            tables = (sizes, first.tolist(), index.tolist(), int(starts[-1]), int(tiles[-1]), table,
+                      to_dev(regs.astype(np.int32)), to_dev(reg_ptr.astype(np.int32)),
+                      to_dev(np.where(first[reg_iv] >= 0, first[reg_iv], 0)))
+            prog.live_tables[key] = tables
+            if len(prog.live_tables) > max(64, 4 * n):
+                prog.live_tables.popitem(last = False)
+        else:
+            prog.live_tables.move_to_end(key)
+        sizes, first, index, total, num_tiles, table, iv_regs, iv_reg_ptr, reg_first = tables
+        K = len(sizes)
+        tile_live = torch.empty(max(num_tiles, 1), dtype = torch.int32, device = dev)
+        counts = torch.empty(max(K, 1), dtype = torch.int32, device = dev)          # the order kernel writes these
+        reg_live = (torch.empty if K > 0 else torch.zeros)(len(prog.reg_iv_host), dtype = torch.int32, device = dev)
+        perm = torch.empty(max(total, 1), dtype = torch.int32, device = dev)
+        rank = torch.empty(max(total, 1), dtype = torch.int32, device = dev)
+        if K > 0:
+            lists = (self.live, table, ivs.of, ivs.info, ivs.table, prog.width_t)
+            for f0, size in grid_chunks(host_cdiv(max(sizes), LIST_TILE), 1):
+                _live_count_kernel[(K, size)](tile_live, *lists, B, n, W, f0, TILE = LIST_TILE)
+            for f0, size in grid_chunks(host_cdiv(max(sizes), LIST_TILE), 1):
+                _live_order_kernel[(K, size)](tile_live, counts, perm, rank, reg_live, iv_regs, iv_reg_ptr, *lists, B,
+                                              n, W, f0, TILE = LIST_TILE)
+        return LaneOrder(perm = perm, rank = rank, first = first, counts = counts, index = index,
+                         reg_first = reg_first, reg_live = reg_live)
+
+
+def liveness(prog, obs_class: torch.Tensor, B: int) -> Liveness:
+    """The :class:`Liveness` of a query whose observed token classes are ``obs_class`` ([B, n] int32, -1 where
+    missing): the sweeps. Nothing waits for the device."""
     n, W, C = prog.n, prog.next_col.size(1), prog.next_col.size(2)
-    dev, ivs = prog.dev, prog.intervals
+    dev = prog.dev
     live = torch.empty(B, n + 1, W, dtype = torch.int8, device = dev)
     back = torch.empty_like(live)
     tables = (obs_class, prog.next_col, prog.succ.entry_ptr, prog.succ.entry_succ, prog.width_t)
@@ -265,30 +388,4 @@ def prune(prog, obs_class: torch.Tensor, B: int) -> Pruning:
     else:                                            # one program per sample, sweeping every boundary
         TILE = min(1024, max(32, host_next_power_of_2(W)))
         _liveness_kernel[(B,)](live, back, *tables, n, W, C, TILE = TILE, num_warps = 4)
-
-    if B not in prog.live_tables:                    # where every sum interval's columns and their tiles' counts go
-        sizes = [B * s for s in prog.sum_iv_slots]
-        first, tiles = np.cumsum([0] + sizes), np.cumsum([0] + [host_cdiv(z, LIST_TILE) for z in sizes])
-        table = torch.tensor([(a, e, f, t) for (a, e), f, t in zip(prog.sum_ivs, first[:-1].tolist(), tiles[:-1].tolist())],
-                             dtype = torch.int32).to(dev)
-        regs = np.argsort(np.asarray(prog.reg_iv_host), kind = "stable")  # every interval's regions
-        reg_ptr = np.searchsorted(np.asarray(prog.reg_iv_host)[regs], np.arange(len(sizes) + 1))
-        reg_first = torch.from_numpy(first[:-1][np.asarray(prog.reg_iv_host)]).to(dev)
-        prog.live_tables[B] = (sizes, first[:-1].tolist(), int(first[-1]), int(tiles[-1]), table,
-                               torch.from_numpy(regs.astype(np.int32)).to(dev),
-                               torch.from_numpy(reg_ptr.astype(np.int32)).to(dev), reg_first)
-    sizes, first, total, num_tiles, table, iv_regs, iv_reg_ptr, reg_first = prog.live_tables[B]
-    K = len(sizes)
-    tile_live = torch.empty(num_tiles, dtype = torch.int32, device = dev)
-    counts = torch.empty(K, dtype = torch.int32, device = dev)
-    reg_live = torch.empty(len(prog.reg_iv_host), dtype = torch.int32, device = dev)
-    perm = torch.empty(total, dtype = torch.int32, device = dev)
-    rank = torch.empty(total, dtype = torch.int32, device = dev)
-    lists = (live, table, ivs.of, ivs.info, ivs.table, prog.width_t)
-    for f0, size in grid_chunks(host_cdiv(max(sizes), LIST_TILE), 1):
-        _live_count_kernel[(K, size)](tile_live, *lists, B, n, W, f0, TILE = LIST_TILE)
-    for f0, size in grid_chunks(host_cdiv(max(sizes), LIST_TILE), 1):
-        _live_order_kernel[(K, size)](tile_live, counts, perm, rank, reg_live, iv_regs, iv_reg_ptr, *lists, B, n, W,
-                                      f0, TILE = LIST_TILE)
-    return Pruning(live = live, perm = perm, rank = rank, first = first, counts = counts, reg_first = reg_first,
-                   reg_live = reg_live)
+    return Liveness(prog = prog, B = B, live = live)

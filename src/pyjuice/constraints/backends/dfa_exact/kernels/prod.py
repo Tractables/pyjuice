@@ -703,7 +703,7 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, class_mar
         the Program keeps them all; ``groups`` None (one step per program), or ``{G: firsts}`` for
         :func:`_input_block_group_kernel`, used above :data:`GROUP_MIN_LANES`
     :param bufs: ``(temp, temp_width)``, the layer's scratch rows
-    :param live: None, or the query's liveness (:class:`~.live.Pruning`'s ``live``)
+    :param live: None, or the query's liveness (:class:`~.live.Liveness`'s ``live``)
     :param prior: where the sum operands the plan keeps once are (see :func:`_block_ptr`): ``mars``, the regions'
         ``offset`` and ``width`` there, and ``reg_prior`` (device tensors)
     :param exact: whether ``block @ block`` tiles whose entries its shifts flush are computed again exactly (see

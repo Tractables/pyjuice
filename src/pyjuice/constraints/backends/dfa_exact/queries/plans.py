@@ -96,6 +96,8 @@ class TopDownPlan:
     :ivar once: bool [sum regions] (host): those whose values the query keeps once (reads or writes in ``prior_flows``)
     :ivar todo: bool [sum regions] (host): those it writes in ``prior_flows``
     :ivar sample: bool [sum regions] (host): those it writes in ``node_flows``
+    :ivar per_sample: bool [sum regions] (host): those whose values it needs per sample, written or held in
+        ``node_flows`` -- the regions whose lanes its sum launches walk
     :ivar once_iv: int32 [intervals] (device, by ``prog.intervals``' numbers): 1 where the values are kept once
     :ivar prior: bool [sum intervals] (host): the inside values its launches for a batch of one read
     :ivar dead: None, or int32 [D, 2] (device): the rows of the regions it computes per sample that no launch writes
@@ -107,6 +109,7 @@ class TopDownPlan:
     once: np.ndarray
     todo: np.ndarray
     sample: np.ndarray
+    per_sample: np.ndarray
     once_iv: torch.Tensor
     prior: np.ndarray
     dead: Optional[torch.Tensor]
@@ -125,13 +128,13 @@ def free_regions(prog, observed: np.ndarray) -> np.ndarray:
     return P[prog.iv_bounds[:, 1]] == P[prog.iv_bounds[:, 0]]
 
 
-def prior_regions(prog, observed: np.ndarray, B: int, kept: bool, pruning) -> np.ndarray:
+def prior_regions(prog, observed: np.ndarray, B: int, kept: bool, liveness) -> np.ndarray:
     """
     bool [sum intervals]: the intervals a query of ``B`` samples keeps once (see the module docstring): every
     input-independent one (:func:`free_regions`) when ``kept`` (``prior_mars`` outlives the query: inside
     :func:`pyjuice.fast_inference`); else those whose block computed once is cheaper than the samples' live slots
-    (``pruning``, the query's :class:`~.live.Pruning`, whose counts this reads -- the query's one wait for the
-    device; None: every slot live), and every interval inside one of those. One sample's live slots never exceed a
+    (``liveness``, the query's :class:`~..kernels.live.Liveness`, whose counts this reads -- a wait for the device;
+    None: every slot live), and every interval inside one of those. One sample's live slots never exceed a
     block's, so a query of one sample keeps nothing once (and reads no counts).
 
     :param observed: bool [n] (host): the positions some sample observes
@@ -143,7 +146,7 @@ def prior_regions(prog, observed: np.ndarray, B: int, kept: bool, pruning) -> np
     if kept:
         return free
     slots = prog.iv_slots
-    live = np.asarray(pruning.num_live, dtype = np.int64) if pruning is not None else B * slots
+    live = np.asarray(liveness.num_live, dtype = np.int64) if liveness is not None else B * slots
     worth = free & (live > slots)
     if not worth.any():
         return worth
@@ -209,6 +212,17 @@ def query_plan(prog, observed: np.ndarray, targets: Optional[np.ndarray], valid:
     return plan
 
 
+def per_sample_intervals(prog, plan: QueryPlan) -> np.ndarray:
+    """bool [sum intervals]: those whose columns the query's kernels walk in lane order
+    (:meth:`~..kernels.live.Liveness.order`): the inside values ``plan`` computes per sample
+    (:attr:`QueryPlan.sample`), and the top-down values it needs per sample (:attr:`TopDownPlan.per_sample` -- held ones
+    included: a sum launch gives its products their values from them)."""
+    out = plan.sample.copy()
+    if plan.top_down is not None:
+        out[prog.reg_iv_np[plan.top_down.per_sample]] = True
+    return out
+
+
 def _keep(prog, key, plan):
     prog.plans[key] = plan
     if len(prog.plans) > max(PLAN_CACHE_SIZE, PLANS_PER_POSITION * prog.n):
@@ -229,7 +243,7 @@ def top_down_free(td, observed: np.ndarray) -> np.ndarray:
     return (P[td.iv_bounds[:, 0]] == 0) & (P[-1] == P[td.iv_bounds[:, 1]])
 
 
-def top_down_prior(prog, td, observed: np.ndarray, B: int, kept: bool, pruning) -> np.ndarray:
+def top_down_prior(prog, td, observed: np.ndarray, B: int, kept: bool, liveness) -> np.ndarray:
     """
     bool [intervals] (by ``prog.intervals``' numbers): the top-down values a query of ``B`` samples keeps once, as
     :func:`prior_regions` decides for inside values -- every input-independent one (:func:`top_down_free`) when
@@ -246,7 +260,7 @@ def top_down_prior(prog, td, observed: np.ndarray, B: int, kept: bool, pruning) 
     if kept:
         return free
     slots = prog.iv_slots
-    live = np.asarray(pruning.num_live, dtype = np.int64) if pruning is not None else B * slots
+    live = np.asarray(liveness.num_live, dtype = np.int64) if liveness is not None else B * slots
     sums = td.reg_iv[np.unique(np.asarray(prog.reg_iv_host), return_index = True)[1]]    # sum interval -> number
     worth = sums[free[sums] & (live > slots)]
     if worth.size == 0:
@@ -303,6 +317,7 @@ def top_down_plan(prog, td, targets: Optional[np.ndarray], once: np.ndarray, val
     lists.upload(dev)
     return TopDownPlan(steps = out, root = (bool(req[root]), bool(r_once[root])),
                        once = r_once & needed[td.reg_iv], todo = req & r_once, sample = sample,
+                       per_sample = needed[td.reg_iv] & ~r_once,
                        once_iv = once_iv.tensor, prior = reads,
                        dead = None if dead_rows is None else dead_rows.tensor.view(-1, 2),
                        dead_regions = np.nonzero(sample & td.dead_region)[0].tolist())
