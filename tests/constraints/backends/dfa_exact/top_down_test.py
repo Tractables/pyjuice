@@ -163,10 +163,14 @@ def needed_regions(cc, targets):
 
 
 def compact(cc, block, a, b, B):
-    """A reference block [N, B, W_a, W_b] as the library keeps it: [N, B * slots], joined pairs row-major per sample,
-    a sequence end's columns summed."""
+    """A reference top-down block [N, B, W_a, W_b] as the library keeps it: [N, B * slots], joined pairs row-major per
+    sample, a sequence end's columns as one -- a top-down value is the same at every accepting column (the root adds
+    them up), so it is any of them, not their sum (which an inside value is)."""
     if b == cc.n:
-        block = torch.logsumexp(block, dim = -1, keepdim = True)
+        assert torch.equal(torch.isneginf(block), torch.isneginf(block[..., :1]).expand_as(block))
+        fin = torch.isfinite(block)
+        assert ((block - block[..., :1])[fin].abs() <= 1e-4 * block[fin].abs() + 1e-4).all()
+        block = block[..., :1]
     pos = cc.backend.layout.reachability.positions(a, b)
     flat = block.flatten(2)
     if pos is not None:
