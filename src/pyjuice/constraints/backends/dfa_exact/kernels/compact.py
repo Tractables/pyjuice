@@ -18,7 +18,7 @@ the scratch rows. The inside values a top-down kernel reads stay dense, as do th
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -199,4 +199,95 @@ def compact_layout(backend, liveness, regions: np.ndarray) -> CompactLayout:
                       for pi, (_, _, slots) in enumerate(backend.element_regions)]
     out.element_size = max(((end - first) * w for (first, end, _), w in zip(backend.element_regions, out.elem_width)),
                            default = 0)
+    return out
+
+
+#: rows of a region one re-gather program copies, and its lanes; floats a segment copy's program copies
+REGATHER_ROWS, REGATHER_TILE = 16, 512
+COPY_TILE = 1024
+
+
+@triton_jit
+def _regather_kernel(src, dst, table, parents, old_off, old_count, old_rank, off, count, start, columns, B_old, B, n,
+                     W, steps, ROWS: tl.constexpr, TILE: tl.constexpr):
+    """One program per (``TILE`` of a region's lanes, region, ``ROWS`` of its rows; ``table`` as :func:`regather`'s --
+    the lanes first, the grid's only axis long enough for every lane of a wide batch): every lane of the new layout
+    -- sample ``b``, pair ``(i, j)`` -- gets the old one of sample ``parents[b]`` at the same pair (-inf where the old
+    layout has none)."""
+    t = tl.program_id(1).to(tl.int64) * 8
+    r0 = tl.program_id(2).to(tl.int64) * ROWS
+    rows, k = tl.load(table + t + 4), tl.load(table + t + 5)
+    idx = tl.program_id(0) * TILE + tl.arange(0, TILE)
+    lanes = tl.load(off + k * (B + 1) + B).to(tl.int32)
+    if (r0 < rows) & (tl.program_id(0) * TILE < lanes):
+        a, e = tl.load(table + t + 6), tl.load(table + t + 7)
+        m = idx < lanes
+        b, i, j = _lane_ends(off, count, start, columns, k, a, e, idx, m, B, n, steps)
+        p = tl.load(parents + b, mask = m, other = 0)
+        old = _lane(old_off, old_count, old_rank, k, p, a, i, e, j, m, B_old, n, W)
+        sw, dw = tl.load(table + t + 1), tl.load(table + t + 3)
+        so, do = tl.load(table + t) + r0 * sw, tl.load(table + t + 2) + r0 * dw
+        for r in range(tl.minimum(ROWS, rows - r0)):
+            tl.store(dst + do + r * dw + idx, tl.load(src + so + r * sw + old, mask = m & (old >= 0),
+                                                      other = float("-inf")), mask = m)
+
+
+def regather(prog, old: "CompactLayout", src: torch.Tensor, new: "CompactLayout", dst: torch.Tensor,
+             regions: np.ndarray, parents: torch.Tensor, dst_offset: Optional[np.ndarray] = None):
+    """
+    The compact top-down values of the sum ``regions`` (bool [sum regions]) from ``src``, laid out by ``old`` (a
+    previous query's layout), into ``dst``, laid out by ``new`` (rows starting at ``dst_offset`` instead, int64 [sum
+    regions], if given): every row of the new batch gets its ``parents`` row's values (int64 [B] on the device) at the
+    same pairs of live columns -- one launch. A query of more evidence than its parent rows' has fewer live columns, so
+    every new lane has an old one; a region's values must hold under the new evidence (none newly observed outside its
+    scope, see :mod:`..queries.decoder`).
+    """
+    regs = np.nonzero(regions)[0]
+    if regs.size == 0:
+        return
+    k = prog.reg_iv_all[regs]
+    ends = prog.iv_ends_np[k]
+    dst_offset = np.asarray(new.offset if dst_offset is None else dst_offset)[regs]
+    table = np.stack([np.asarray(old.offset)[regs], np.asarray(old.width)[regs], dst_offset,
+                      np.asarray(new.width)[regs], prog.reg_rows[regs], k, ends[:, 0], ends[:, 1]], axis = 1)
+    table = torch.from_numpy(np.ascontiguousarray(table, dtype = np.int64)).to(prog.dev)
+    grid = (-(-max(new.lanes(k), 1) // REGATHER_TILE), regs.size, -(-int(prog.reg_rows[regs].max()) // REGATHER_ROWS))
+    _regather_kernel[grid](src, dst, table, parents, old.off, old.count, old.rank, new.off, new.count, new.start,
+                           new.columns, old.B, new.B, prog.n, prog.next_col.size(1), new.steps, ROWS = REGATHER_ROWS,
+                           TILE = REGATHER_TILE, num_warps = 4)
+
+
+@triton_jit
+def _copy_segments_kernel(src, dst, table, TILE: tl.constexpr):
+    """One program per (``TILE`` of a segment's floats, segment): ``table`` int64 [segments, 3], (source start,
+    destination start, length)."""
+    t = tl.program_id(1).to(tl.int64) * 3
+    c = tl.program_id(0).to(tl.int64) * TILE + tl.arange(0, TILE)
+    size = tl.load(table + t + 2)
+    if tl.program_id(0).to(tl.int64) * TILE < size:
+        m = c < size
+        tl.store(dst + tl.load(table + t + 1) + c, tl.load(src + tl.load(table + t) + c, mask = m), mask = m)
+
+
+def regather_into(state, prog, old: "CompactLayout", new: "CompactLayout", regions: np.ndarray,
+                  parents: torch.Tensor, allocate):
+    """
+    :func:`regather` from the storage ``state`` holds as ``node_flows`` (laid out by ``old``) into the one
+    ``allocate()`` returns (laid out by ``new``), never holding both: the ``regions``' values are gathered into a
+    scratch first, the old storage given up, and the scratch copied into the new one -- so a query whose rows hold
+    little more than they did does not need its top-down values' memory twice. Returns ``allocate()``'s result.
+    """
+    regs = np.nonzero(regions)[0]
+    sizes = prog.reg_rows[regs] * np.asarray(new.width, dtype = np.int64)[regs]
+    starts = np.zeros(len(new.width), dtype = np.int64)
+    starts[regs] = np.concatenate([[0], np.cumsum(sizes)[:-1]])
+    scratch = torch.empty(max(int(sizes.sum()), 1), device = prog.dev)
+    src = state.replace_storage("node_flows", None)
+    regather(prog, old, src, new, scratch, regions, parents, dst_offset = starts)
+    del src
+    out = allocate()
+    table = np.stack([starts[regs], np.asarray(new.offset, dtype = np.int64)[regs], sizes], axis = 1)
+    table = torch.from_numpy(np.ascontiguousarray(table, dtype = np.int64)).to(prog.dev)
+    _copy_segments_kernel[(-(-max(int(sizes.max()), 1) // COPY_TILE), regs.size)](scratch, out["node_flows"], table,
+                                                                                TILE = COPY_TILE, num_warps = 4)
     return out

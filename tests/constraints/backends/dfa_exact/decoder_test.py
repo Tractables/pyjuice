@@ -166,13 +166,14 @@ def ask(target, query, step):
     return target.conditional(**step)
 
 
+@pytest.mark.parametrize("storage", ["dense", "compact"])
 @pytest.mark.parametrize("query", ["conditional", "marginal"])
 @pytest.mark.parametrize("scenario", list(SCENARIOS))
 @pytest.mark.parametrize("kind", list(KINDS))
-def test_a_decoders_calls_are_the_circuits(kind, scenario, query, sum_path, build_pc, monkeypatch):
+def test_a_decoders_calls_are_the_circuits(kind, scenario, query, storage, sum_path, build_pc, monkeypatch):
     """A scenario's calls through a decoder give the circuit's own calls' results (in a fast_inference scope of
-    their own). The storage values move into is filled with NaN: a query reading a slot before writing it would
-    show."""
+    their own, dense). The storage values move into is filled with NaN: a query reading a slot before writing it would
+    show. Compact (``storage``), the top-down values held are re-gathered by the call."""
     monkeypatch.setattr(QD, "_empty", lambda numel, device: torch.full((numel,), float("nan"), device = device))
     n = KINDS[kind]
     cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc(kind, n, V))
@@ -181,23 +182,42 @@ def test_a_decoders_calls_are_the_circuits(kind, scenario, query, sum_path, buil
         steps = [{k: v for k, v in s.items() if k in ("data", "missing_mask", "mask_id")} for s in steps]
     with juice.fast_inference():
         want = [ask(cc, query, s) for s in steps]
-    with cc.decoder() as decoder:
+    with cc.decoder(storage = storage) as decoder:
         got = [ask(decoder, query, s) for s in steps]
     for i, (a, b) in enumerate(zip(got, want)):
         assert_close(a, b, n, where = f"step {i}")
 
 
 @pytest.mark.parametrize("kind", ["hmm", "pd"])
-def test_a_call_holds_what_the_evidence_left_unchanged(kind, build_pc, monkeypatch):
+def test_a_compact_decoder_over_a_wide_batch(kind, build_pc, monkeypatch):
+    """24 rows left to right, then beams: compact, the held values' blocks span many tiles of the copies that carry
+    them over into a call's layout (a tile of 16 floats here); the rows are the circuit's own."""
+    from pyjuice.constraints.backends.dfa_exact.kernels import compact as CP
+    monkeypatch.setattr(CP, "COPY_TILE", 16)
+    n = KINDS[kind]
+    cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc(kind, n, V))
+    for steps in (left_to_right(n, B = 24), beams(n)):
+        with juice.fast_inference():
+            want = [cc.conditional(**s) for s in steps]
+        with cc.decoder(storage = "compact") as decoder:
+            got = [decoder.conditional(**s) for s in steps]
+        for i, (a, b) in enumerate(zip(got, want)):
+            assert_close(a, b, n, where = f"step {i}")
+
+
+@pytest.mark.parametrize("storage", ["dense", "compact"])
+@pytest.mark.parametrize("kind", ["hmm", "pd"])
+def test_a_call_holds_what_the_evidence_left_unchanged(kind, storage, build_pc, monkeypatch):
     """Left to right, a call newly observes the position before its target: it holds inside values only of scopes
     without it, top-down values only of scopes with it (none newly observed outside), and some of them; in place,
     while reordered beams move theirs (the lanes live in the previous call). The marginal holds inside values alone
-    -- none on an HMM, whose per-sample scopes are suffixes holding the new position."""
+    -- none on an HMM, whose per-sample scopes are suffixes holding the new position. Compact, the same: the top-down
+    values held are re-gathered into the call's layout, the inside values move."""
     n = KINDS[kind]
     cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc(kind, n, V))
     a, b = scopes(cc).T
     spy = Spy(monkeypatch)
-    with cc.decoder() as decoder:
+    with cc.decoder(storage = storage) as decoder:
         for s in left_to_right(n):
             decoder.conditional(**s)
     assert spy.held[0] is None and spy.moves == 0                  # left to right: every row stays put
@@ -208,12 +228,15 @@ def test_a_call_holds_what_the_evidence_left_unchanged(kind, build_pc, monkeypat
     assert any(held[1].any() for held in spy.held[1:])
     if kind == "pd":                                                # an HMM's inside values are kept once
         assert any(held[0].any() for held in spy.held[1:])
-    with cc.decoder() as decoder:
+    spy.held.clear()
+    with cc.decoder(storage = storage) as decoder:
         for s in beams(n):
             decoder.conditional(**s)
-    assert spy.live_moves > 0                                       # the previous call's live lanes only
+    assert any(held is not None and held[1].any() for held in spy.held[1:])   # top-down values held across moves
+    if kind == "pd":
+        assert spy.live_moves > 0                                   # the previous call's live lanes only
     spy.held.clear()
-    with cc.decoder() as decoder:
+    with cc.decoder(storage = storage) as decoder:
         for s in left_to_right(n):
             decoder.marginal(s["data"])
     assert all(not held[1].any() for held in spy.held[1:])
@@ -222,7 +245,8 @@ def test_a_call_holds_what_the_evidence_left_unchanged(kind, build_pc, monkeypat
 
 def test_anything_else_using_the_buffers_or_another_precision_starts_afresh(build_pc, monkeypatch):
     """A circuit's own query between two calls, inside the session or not, overwrites the values the decoder would
-    hold, and a call in another precision computes them otherwise: the next call holds nothing, and is right."""
+    hold, and a call in another precision or storage computes them otherwise: the next call holds nothing, and is
+    right."""
     n = KINDS["pd"]
     cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc("pd", n, V))
     steps = left_to_right(n)
@@ -242,6 +266,13 @@ def test_anything_else_using_the_buffers_or_another_precision_starts_afresh(buil
         assert spy.held[-1] is None
         decoder.conditional(**steps[6], precision = "tf32")
         assert_close(decoder.conditional(**steps[7]), want[7], n)
+        assert spy.held[-1] is None
+    with cc.decoder() as decoder:
+        for t in range(4):
+            decoder.conditional(**steps[t])
+        decoder.conditional(**steps[4], storage = "compact")
+        assert spy.held[-1] is None
+        assert_close(decoder.conditional(**steps[5]), want[5], n)
         assert spy.held[-1] is None
 
 

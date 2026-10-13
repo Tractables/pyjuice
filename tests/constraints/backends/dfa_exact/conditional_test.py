@@ -113,7 +113,7 @@ def test_compact_storage_gives_the_same_rows(kind, name, pattern, sum_path, buil
 
 def test_storage_option(build_pc):
     """``storage`` is "dense" or "compact" (anything else raises); a marginal keeps no top-down value, so it is the
-    same either way; a decoder keeps its values dense (compact raises, for now)."""
+    same either way."""
     n = KINDS["hmm"]
     cc = jc.compile(CONSTRAINTS["contains"](), build_pc("hmm", n, V))
     data, missing = evidence("prefix", n)
@@ -122,9 +122,6 @@ def test_storage_option(build_pc):
     with pytest.raises(ValueError, match = "storage"):
         cc.marginal(data, missing, storage = "sparse")
     assert torch.equal(cc.marginal(data, missing, storage = "compact"), cc.marginal(data, missing))
-    with cc.decoder(storage = "compact") as decoder:
-        with pytest.raises(NotImplementedError, match = "decoders"):
-            decoder.conditional(data, missing)
 
 
 @pytest.mark.parametrize("pattern", ["none", "prefix", "mixed"])
