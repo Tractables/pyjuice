@@ -172,6 +172,8 @@ class CompactLayout:
     :ivar offset, width: per sum region, its rows' place and width in ``node_flows`` (host lists; width 0 for a region
         without per-sample values), and ``offset_t``, ``width_t``, ``lanes_t`` (int64 on the device; ``lanes_t``: its
         rows' lanes) and ``size``, the floats of ``node_flows``
+    :ivar host_rows: :meth:`rows`' tables, by kind: the regions' rows' places and widths as int64 arrays (host), for
+        the tables a re-gather builds over many regions at once (the lists serve one region at a time)
     :ivar sum_lanes: the most lanes of a row of a region with per-sample values
     :ivar max_count: int64 [n + 1] (host): every boundary's most live columns of a sample
     :ivar elem_width: per product layer group, the width of its rows in ``element_flows`` (as wide as the compact values
@@ -194,6 +196,7 @@ class CompactLayout:
     rank: torch.Tensor
     offset: list
     width: list
+    host_rows: dict
     offset_t: torch.Tensor
     width_t: torch.Tensor
     lanes_t: torch.Tensor
@@ -216,9 +219,9 @@ class CompactLayout:
         return int(_aligned(max(self.lanes(ivs), slots)))
 
     def rows(self, kind: str):
-        """``(offset, width)``: every sum region's rows' place and width (host lists), in ``node_flows`` (``kind``
-        "flows") or ``node_mars`` ("mars")."""
-        return (self.mars["sum_offsets"], self.mars["sum_widths"]) if kind == "mars" else (self.offset, self.width)
+        """``(offset, width)``: every sum region's rows' place and width (int64 arrays, host), in ``node_flows``
+        (``kind`` "flows") or ``node_mars`` ("mars")."""
+        return self.host_rows[kind]
 
     def floats(self, top_down: bool) -> int:
         """The floats the query's per-sample buffers take: ``node_mars`` and ``element_mars``, and with ``top_down``
@@ -261,17 +264,19 @@ def compact_layout(backend, liveness, regions: np.ndarray, inside: Optional[np.n
     sample_ivs = _region_ivs(prog, regions, K)
     elem_width, element_size = _group_widths(prog, total, sample_ivs)
     arrays = [offset, width, lanes]
+    host_rows = dict(flows = (offset, width))
     mars = None
     if inside is not None:
         mars = _mars_layout(backend, prog, total, lanes, inside, B)
         arrays += [mars["sum_offsets"], mars["sum_widths"]]
+        host_rows["mars"] = (mars["sum_offsets"], mars["sum_widths"])
     tables = _upload(prog, arrays)
     if mars is not None:
         mars.update(sum_offsets = mars["sum_offsets"].tolist(), sum_widths = mars["sum_widths"].tolist(),
                     sum_offsets_t = tables[3], sum_widths_t = tables[4])
     return CompactLayout(B = B, off = off, total = total, steps = max(1, int(np.ceil(np.log2(B + 1)))), count = count,
                          start = start, columns = columns, rank = liveness.rank, offset = offset.tolist(),
-                         width = width.tolist(), offset_t = tables[0], width_t = tables[1], lanes_t = tables[2],
+                         width = width.tolist(), host_rows = host_rows, offset_t = tables[0], width_t = tables[1], lanes_t = tables[2],
                          size = int((prog.reg_rows * width).sum()), sum_lanes = int(lanes[regions].max(initial = 0)),
                          max_count = max_count, sample_ivs = sample_ivs, elem_width = elem_width,
                          element_size = element_size, prog = prog, mars = mars)
@@ -371,9 +376,9 @@ def regather(prog, old: "CompactLayout", src: torch.Tensor, new: "CompactLayout"
     k = prog.reg_iv_all[regs]
     ends = prog.iv_ends_np[k]
     (old_offset, old_width), (new_offset, new_width) = old.rows(rows), new.rows(rows)
-    dst_offset = np.asarray(new_offset if dst_offset is None else dst_offset)[regs]
-    table = np.stack([np.asarray(old_offset)[regs], np.asarray(old_width)[regs], dst_offset,
-                      np.asarray(new_width)[regs], prog.reg_rows[regs], k, ends[:, 0], ends[:, 1]], axis = 1)
+    dst_offset = (new_offset if dst_offset is None else dst_offset)[regs]
+    table = np.stack([old_offset[regs], old_width[regs], dst_offset, new_width[regs], prog.reg_rows[regs], k,
+                      ends[:, 0], ends[:, 1]], axis = 1)
     table = torch.from_numpy(np.ascontiguousarray(table, dtype = np.int64)).to(prog.dev)
     grid = (-(-max(new.lanes(k), 1) // REGATHER_TILE), regs.size, -(-int(prog.reg_rows[regs].max()) // REGATHER_ROWS))
     _regather_kernel[grid](src, dst, table, parents, old.off, old.count, old.rank, new.off, new.count, new.start,
@@ -404,7 +409,7 @@ def regather_into(state, prog, old: "CompactLayout", new: "CompactLayout", regio
     """
     regs = np.nonzero(regions)[0]
     new_offset, new_width = new.rows(rows)
-    sizes = prog.reg_rows[regs] * np.asarray(new_width, dtype = np.int64)[regs]
+    sizes = prog.reg_rows[regs] * new_width[regs]
     starts = np.zeros(len(new_width), dtype = np.int64)
     starts[regs] = np.concatenate([[0], np.cumsum(sizes)[:-1]])
     scratch = torch.empty(max(int(sizes.sum()), 1), device = prog.dev)
@@ -412,7 +417,7 @@ def regather_into(state, prog, old: "CompactLayout", new: "CompactLayout", regio
     regather(prog, old, src, new, scratch, regions, parents, dst_offset = starts, rows = rows)
     del src
     out = allocate()
-    table = np.stack([starts[regs], np.asarray(new_offset, dtype = np.int64)[regs], sizes], axis = 1)
+    table = np.stack([starts[regs], new_offset[regs], sizes], axis = 1)
     table = torch.from_numpy(np.ascontiguousarray(table, dtype = np.int64)).to(prog.dev)
     _copy_segments_kernel[(-(-max(int(sizes.max()), 1) // COPY_TILE), regs.size)](scratch, out[name], table,
                                                                                 TILE = COPY_TILE, num_warps = 4)
