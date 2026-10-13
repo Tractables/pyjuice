@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+import numpy as np
 import torch
 
 from ..compiled.tables import _align
@@ -67,7 +68,7 @@ def missing_tensor(missing_mask: Optional[torch.Tensor], B: int, n: int, dev) ->
 
 
 def run_forward(backend, bufs: dict, plan, x: torch.Tensor, missing: torch.Tensor, obs_class: torch.Tensor, liveness,
-                precision: str):
+                precision: str, compact = None):
     """
     The inside values a query plan computes (see :mod:`.plans`): the per-sample ones into ``node_mars``, and
     those kept once that ``prior_mars`` does not hold yet, for a batch of one, into ``prior_mars``. Layer by layer, as
@@ -78,8 +79,11 @@ def run_forward(backend, bufs: dict, plan, x: torch.Tensor, missing: torch.Tenso
     :param x: [B, n] token ids (any valid id where missing)
     :param missing: [B, n] bool, True where a token is missing
     :param obs_class: [B, n] int32, every observed token's class, -1 where missing
-    :param liveness: None, or the query's :class:`~.live.Liveness`, the intervals it computes per sample ordered
+    :param liveness: None, or the query's :class:`~.live.Liveness`, the intervals it computes per sample ordered (unless
+        they are compact)
     :param precision: "fp32" or "tf32" for the sum layers' matrix products
+    :param compact: None, or the query's :class:`~..kernels.compact.CompactLayout`: the per-sample inside values are
+        compact where it lays them out (``mars``; ``bufs`` are laid out by it, see :meth:`~.state.State.buffers`)
     :returns: the class masses the pass read (:meth:`~.state.State.class_masses`; computed
         for this query outside :func:`pyjuice.fast_inference`), for the query's later passes
     """
@@ -87,8 +91,9 @@ def run_forward(backend, bufs: dict, plan, x: torch.Tensor, missing: torch.Tenso
     B = x.size(0)
     lay = bufs["layout"]
     node_mars, element_mars = bufs["node_mars"], bufs["element_mars"]
+    compact = compact if compact is not None and compact.mars is not None else None
     regions = dict(offset = lay["sum_offsets_t"], width = lay["sum_widths_t"], first = prog.reg_first,
-                   slots = prog.reg_slots)
+                   slots = prog.reg_slots if compact is None else compact.lanes_t)   # compact: B = 1, slots = lanes
     prior = backend.state.prior_buffer() if plan.prior else None
     if prior is not None:                                              # where the values kept once are
         once = dict(offset = prior["offset_t"], width = prior["width_t"], first = prog.reg_first, slots = prog.reg_slots)
@@ -111,14 +116,15 @@ def run_forward(backend, bufs: dict, plan, x: torch.Tensor, missing: torch.Tenso
             for prior_stages, sample_stages, num_temps, temp_slots in layers:
                 temp, temp_width = node_mars, 0                      # no scratch rows: never read
                 if num_temps > 0:
-                    temp_width = _align(B * temp_slots)
+                    temp_width = scratch_width(B, temp_slots, sample_stages, compact)
                     temp = backend.state.storage_view("product_scratch", num_temps * temp_width)
                 if prior_stages:                                     # nothing observed in their scopes
                     products(prior_stages, (temp, temp_width), prog, regions, element_mars, node_mars, class_mars,
                              prog.no_evidence, None, elem_first, elem_width, 1, srcs, exact = True)
                 if sample_stages:
                     products(sample_stages, (temp, temp_width), prog, regions, element_mars, node_mars, class_mars,
-                             obs_class, live, elem_first, elem_width, B, srcs, exact = liveness is not None)
+                             obs_class, live, elem_first, elem_width, B, srcs, exact = liveness is not None,
+                             compact = compact)
         else:
             for block_size, prior_parts, sample_parts in layers:
                 if prior_parts:
@@ -126,16 +132,29 @@ def run_forward(backend, bufs: dict, plan, x: torch.Tensor, missing: torch.Tenso
                           prior["width"], elem_first, elem_width, 1, None, stacks, kept, precision)
                 if sample_parts:
                     _sums(backend, sample_parts, block_size, node_mars, element_mars, regions, lay["sum_offsets"],
-                          lay["sum_widths"], elem_first, elem_width, B, liveness, stacks, kept, precision)
+                          lay["sum_widths"], elem_first, elem_width, B, liveness, stacks, kept, precision, compact)
     return class_mars
 
 
+def scratch_width(B: int, temp_slots: int, sample_stages, compact) -> int:
+    """The width of a product layer's scratch rows (floats): a batch's blocks of ``temp_slots`` -- or ``compact`` (a
+    :class:`~..kernels.compact.CompactLayout`), the compact values of the folds ``sample_stages`` (lists of ``(launch,
+    cut)``, see :mod:`..kernels.prod`) compute per sample, or one sample's block kept once."""
+    if compact is None:
+        return _align(B * temp_slots)
+    ivs = [launch.out_ivs for launches in sample_stages for launch, _ in launches if launch.out_temp]
+    return compact.row_width(np.concatenate(ivs) if ivs else np.zeros(0, dtype = np.int64), temp_slots)
+
+
 def _sums(backend, parts, block_size: int, nodes: torch.Tensor, element_mars: torch.Tensor, regions: dict, offsets,
-          widths, elem_first: int, elem_width: int, B: int, liveness, stacks: dict, kept: bool, precision: str):
+          widths, elem_first: int, elem_width: int, B: int, liveness, stacks: dict, kept: bool, precision: str,
+          compact = None):
     """A sum layer's parts a query plan runs (``(dense runs, num_edges, fused)``: the runs ``(region, c0, blocks,
     key)``, and None or ``(fused part, index list of its node blocks or None for all, count, most slots)``, see
     :func:`~.plans.query_plan`) into ``nodes`` -- ``node_mars``, or ``prior_mars`` with ``B`` 1 and no pruning --
-    whose sum regions ``regions`` (device tensors) and ``offsets`` / ``widths`` (Python ints) describe."""
+    whose sum regions ``regions`` (device tensors) and ``offsets`` / ``widths`` (Python ints) describe. ``compact``:
+    the query's :class:`~..kernels.compact.CompactLayout`, by which the rows are compact -- a batch of one whose slots
+    are the lanes (``regions``' ``slots``), every lane computed."""
     prog, pc = backend.program(), backend.pc
     dot = PRECISIONS[precision]
     for runs, num_edges, fused in parts:
@@ -143,7 +162,13 @@ def _sums(backend, parts, block_size: int, nodes: torch.Tensor, element_mars: to
             region = (offsets[r], widths[r], prog.firsts[r])
             ncols = B * prog.slots[r]
             cols = None                                                  # every column live
-            if liveness is not None and prune_dense(ncols, liveness.lanes.num_live(prog.reg_iv_host[r])):
+            if compact is not None:                                      # a compact row's lanes, in order
+                ncols = int(compact.total[prog.reg_iv_all[r]])
+                if ncols == 0:
+                    continue
+                ident = compact.identity(ncols)
+                cols = (ident, ident, ncols)
+            elif liveness is not None and prune_dense(ncols, liveness.lanes.num_live(prog.reg_iv_host[r])):
                 cols = liveness.lanes.segment(prog.reg_iv_host[r], ncols)
             stacked = None                                  # stacked if narrow enough and the copy is kept or reused
             width = cols[2] if cols is not None else ncols                                # the product's columns
@@ -155,6 +180,10 @@ def _sums(backend, parts, block_size: int, nodes: torch.Tensor, element_mars: to
                       elem_width, ncols, dot, live = cols, stacked = stacked)
         if fused is not None:
             (nids, cids, pids, nb_reg, _, aliased), sel, count, max_slots = fused
-            fused_sum(nodes, element_mars, pc.params, nids, cids, pids, nb_reg, regions, elem_first, elem_width, B,
-                      block_size, max_cols = B * max_slots, precision = dot, aliased = aliased, liveness = liveness,
-                      sel = None if sel is None else sel.tensor, count = count)
+            max_cols = B * max_slots if compact is None else compact.mars["lanes"]
+            if max_cols == 0:
+                continue
+            fused_sum(nodes, element_mars, pc.params, nids, cids, pids, nb_reg, regions, elem_first, elem_width,
+                      B if compact is None else 1, block_size, max_cols = max_cols, precision = dot, aliased = aliased,
+                      liveness = liveness if compact is None else None, sel = None if sel is None else sel.tensor,
+                      count = count)

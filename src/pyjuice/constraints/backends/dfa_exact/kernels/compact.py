@@ -1,6 +1,5 @@
 """
-Compact storage of the per-sample top-down values (a conditional's ``storage = "compact"``, see
-:mod:`..queries.conditional`).
+Compact storage of the per-sample values (a query's ``storage = "compact"``, see :mod:`..queries.conditional`).
 
 Dense, a block over the interval ``[a, e)`` keeps ``slots`` lanes per sample -- every pair the automaton joins --, most
 of them dead under evidence (:mod:`.live`). Compact, a row of an interval ``k`` keeps per sample ``b`` the RECTANGLE of
@@ -10,9 +9,12 @@ a boundary, and a column's place among them, see :meth:`~.live.Liveness.lists`).
 a HOLE, both ends live but no path between them inside the interval -- holds -inf. A row of interval ``k`` has
 ``T_k = off[k, B]`` lanes (padded), and a lane finds its sample by a binary search in ``off[k]``.
 
-Only the per-sample top-down values are compact: ``node_flows``, the products' in ``element_flows`` and the folds' in
-the scratch rows. The inside values a top-down kernel reads stay dense, as do the values kept once (a batch of one, in
-``prior_flows``); a row that may hold either (a product's, a fold's) is as wide as both need.
+The per-sample top-down values are compact: ``node_flows``, the products' in ``element_flows`` and the folds' in the
+scratch rows. So are the per-sample inside values (:attr:`CompactLayout.mars`): the sums' in ``node_mars`` (whose
+input rows stay as they are, a value per sample), the products' in ``element_mars`` and the folds' in the scratch rows
+-- but not yet where a ``block @ block`` product reads them (:func:`inside_compact`). The values kept once stay dense
+(a batch of one, in ``prior_mars`` and ``prior_flows``); a row that may hold either (a product's, a fold's) is as wide
+as both need.
 """
 
 from __future__ import annotations
@@ -29,9 +31,17 @@ from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_next_power_of_2
 
 from ..compiled.tables import ALIGN
+from .common import _slot
 
-#: the storages a conditional can keep its per-sample top-down values in
+#: the storages a query can keep its per-sample values in
 STORAGES = ("dense", "compact")
+
+
+def inside_compact(prog, storage: str, held: Optional[np.ndarray]) -> bool:
+    """Whether a query of ``storage`` keeps its per-sample inside values compact: compact storage, unless the
+    Program has ``block @ block`` products (not yet) or the query holds some (bool [sum regions], a decoder's: kept
+    dense)."""
+    return storage == "compact" and not prog.triple_of and (held is None or not held.any())
 
 
 @triton_jit
@@ -70,17 +80,27 @@ def _lane_sample(off, k, idx, B, steps):
 
 
 @triton.jit
-def _lane_ends(off, count, start, columns, k, a, e, idx, m, B, n, steps):
-    """``(b, i, j)`` of the lanes ``idx`` (``m``: the real ones) of a row of interval ``k`` = ``[a, e)``: their sample,
-    and their pair's columns at the entry and the exit."""
+def _lane_pairs(off, count, start, columns, k, a, e, idx, m, B, n, steps):
+    """``(b, i, j, pa, pe, ce)`` of the lanes ``idx`` (``m``: the real ones) of a row of interval ``k`` = ``[a, e)``:
+    their sample, their pair's columns at the entry and the exit, and those columns' places among the sample's live
+    ones there (``ce``: the sample's live columns at the exit)."""
     b = _lane_sample(off, k, idx, B, steps)
     local = (idx - tl.load(off + k.to(tl.int64) * (B + 1) + b, mask = m, other = 0)).to(tl.int32)
     ra = b.to(tl.int64) * (n + 1) + a
     re = b.to(tl.int64) * (n + 1) + e
     ce = tl.maximum(tl.load(count + re, mask = m, other = 1), 1)
     pa = local // ce
+    pe = local - pa * ce
     i = tl.load(columns + tl.load(start + ra, mask = m, other = 0) + pa, mask = m, other = 0)
-    j = tl.load(columns + tl.load(start + re, mask = m, other = 0) + (local - pa * ce), mask = m, other = 0)
+    j = tl.load(columns + tl.load(start + re, mask = m, other = 0) + pe, mask = m, other = 0)
+    return b, i, j, pa, pe, ce
+
+
+@triton.jit
+def _lane_ends(off, count, start, columns, k, a, e, idx, m, B, n, steps):
+    """``(b, i, j)`` of the lanes ``idx`` (``m``: the real ones) of a row of interval ``k`` = ``[a, e)``: their sample,
+    and their pair's columns at the entry and the exit."""
+    b, i, j, _, _, _ = _lane_pairs(off, count, start, columns, k, a, e, idx, m, B, n, steps)
     return b, i, j
 
 
@@ -94,6 +114,22 @@ def _lane(off, count, rank, k, b, a, i, e, j, m, B, n, W):
     ce = tl.load(count + b.to(tl.int64) * (n + 1) + e, mask = m, other = 0)
     lane = tl.load(off + k.to(tl.int64) * (B + 1) + b, mask = m, other = 0) + ri * ce + rj
     return tl.where((ri >= 0) & (rj >= 0), lane, -1)
+
+
+@triton.jit
+def _operand_slot(iv_table, positions, r, c, ncols, m, own, rank, b, t, q, base, mult, n, W, FULL: tl.constexpr,
+                  COMPACT: tl.constexpr):
+    """Where a product step's block operand holds its value of the pair ``(r, c)`` -- ``q`` its column at boundary
+    ``t``, the other one the output's --, from where samples ``b``'s values start in its row: dense, the pair's slot
+    in the sample's block (negative where the automaton does not join them, see :func:`~.common._slot`); ``COMPACT``,
+    the pair's lane ``base + (q's place among the sample's live columns at t) x mult`` (-1 if ``q`` is dead) when the
+    sample has values of its own there (``own``), else the pair's slot in the one block kept once."""
+    if COMPACT:
+        sl = _slot(iv_table, positions, r, c, ncols, m & ~own, FULL)
+        rq = tl.load(rank + b * (n + 1) * W + t * W + q, mask = m & own & (q >= 0), other = -1)
+        return tl.where(own, tl.where(rq >= 0, base + rq * mult, -1), sl)
+    else:
+        return _slot(iv_table, positions, r, c, ncols, m, FULL)
 
 
 def _aligned(x):
@@ -120,6 +156,10 @@ class CompactLayout:
         of its products under a sum with per-sample values -- a product's interval is its sum's --, or one sample's
         block kept once), and ``element_size``, the floats ``element_flows`` needs
     :ivar sample_ivs: bool [intervals] (host): those of the sum regions with per-sample values
+    :ivar mars: None (the inside values dense), or where the query keeps its per-sample inside values compact, as
+        :func:`~..compiled.tables.buffer_layout` says it for dense ones (:func:`compact_layout`), with ``sum_offsets_t``
+        / ``sum_widths_t`` on the device, ``lanes`` (the most lanes of a row of a region with per-sample inside values)
+        and ``ivs`` (bool [intervals], host: those of the regions with per-sample inside values)
     """
 
     B: int
@@ -142,6 +182,7 @@ class CompactLayout:
     elem_width: list
     element_size: int
     prog: Any
+    mars: Optional[dict] = None
 
     def lanes(self, ivs) -> int:
         """The most lanes per row of the intervals ``ivs`` (``prog.intervals``' numbers; 0 for none)."""
@@ -166,12 +207,13 @@ class CompactLayout:
         return ident[:size]
 
 
-def compact_layout(backend, liveness, regions: np.ndarray) -> CompactLayout:
+def compact_layout(backend, liveness, regions: np.ndarray, inside: Optional[np.ndarray] = None) -> CompactLayout:
     """
     The :class:`CompactLayout` of a query: every interval's rectangles from its liveness (one launch, and the lists
     with their ranks), and the rows in ``node_flows`` of the sum ``regions`` (bool [sum regions], host) whose top-down
-    values it keeps per sample. The one wait: the rows' lanes, for their widths, and every boundary's most live
-    columns, for the grids.
+    values it keeps per sample; ``inside``: None, or the sum regions (bool) whose inside values it keeps per sample,
+    compact (:attr:`CompactLayout.mars`). The one wait: the rows' lanes, for their widths, and every boundary's most
+    live columns, for the grids.
     """
     prog = backend.program()
     B, n = liveness.B, prog.n
@@ -199,7 +241,35 @@ def compact_layout(backend, liveness, regions: np.ndarray) -> CompactLayout:
                       for pi, (_, _, slots) in enumerate(backend.element_regions)]
     out.element_size = max(((end - first) * w for (first, end, _), w in zip(backend.element_regions, out.elem_width)),
                            default = 0)
+    if inside is not None:
+        out.mars = _mars_layout(backend, out, lanes, inside, i64)
     return out
+
+
+def _mars_layout(backend, cl: CompactLayout, lanes: np.ndarray, inside: np.ndarray, i64) -> dict:
+    """:attr:`CompactLayout.mars`: ``node_mars``'s input rows as dense ones (a value per sample, where pyjuice's input
+    layers write them), then the compact rows of the sum regions ``inside`` (bool), none for the others; per product
+    layer group, ``element_mars``'s rows as wide as the compact values of its products under those regions, or one
+    sample's block kept once."""
+    prog = cl.prog
+    width = np.where(inside, _aligned(lanes), 0)
+    rows = prog.reg_rows
+    base = int(_aligned(backend.input_range[1] * cl.B))
+    offset = np.zeros(len(width), dtype = np.int64)
+    np.cumsum((rows * width)[:-1], out = offset[1:])
+    offset += base
+    ivs = np.zeros(len(cl.total), dtype = bool)
+    ivs[prog.reg_iv_all[inside]] = True
+    elem = []
+    for pi, (_, _, slots) in enumerate(backend.element_regions):
+        k = np.asarray(prog.elem_ivs.get(pi, ()), dtype = np.int64)
+        elem.append(cl.row_width(k[ivs[k]], slots))
+    return dict(input_offset = 0, sum_offsets = offset.tolist(), sum_widths = width.tolist(),
+                node_size = base + int((rows * width).sum()), element_widths = elem,
+                element_size = max(((end - first) * w for (first, end, _), w in zip(backend.element_regions, elem)),
+                                   default = 0),
+                sum_offsets_t = i64(offset), sum_widths_t = i64(width), lanes = int(lanes[inside].max(initial = 0)),
+                ivs = ivs)
 
 
 #: rows of a region one re-gather program copies, and its lanes; floats a segment copy's program copies

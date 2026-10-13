@@ -96,9 +96,10 @@ def test_conditionals_match_the_reference(kind, name, pattern, sum_path, build_p
 @pytest.mark.parametrize("name", list(CONSTRAINTS))
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_compact_storage_gives_the_same_rows(kind, name, pattern, sum_path, build_pc, reference):
-    """``storage = "compact"`` (every sample's top-down values over the pairs of its live columns only): the
-    reference's rows, and the dense storage's -- bit for bit through the fused sums, but for block @ block products
-    (whose compact products sum the live shared columns only, in other groups)."""
+    """``storage = "compact"`` (every sample's values over the pairs of its live columns only, its inside values too
+    but with block @ block products): the reference's rows, and the dense storage's -- bit for bit through the fused
+    sums, but for block @ block products (whose compact products sum the live shared columns only, in other
+    groups)."""
     n = KINDS[kind]
     cc = jc.compile(CONSTRAINTS[name](), build_pc(kind, n, V))
     data, missing = evidence(pattern, n)
@@ -131,8 +132,8 @@ def test_compact_keeps_no_inside_values_where_it_needs_none(kind, build_pc):
 
 
 def test_storage_option(build_pc):
-    """``storage`` is "dense" or "compact" (anything else raises); a marginal keeps no top-down value, so it is the
-    same either way."""
+    """``storage`` is "dense" or "compact" (anything else raises); a marginal keeps no top-down value, and its compact
+    inside values give dense's bit for bit (an HMM's fused sums compute each lane alone)."""
     n = KINDS["hmm"]
     cc = jc.compile(CONSTRAINTS["contains"](), build_pc("hmm", n, V))
     data, missing = evidence("prefix", n)

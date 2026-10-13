@@ -55,7 +55,8 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
         top_down_plan`)
     :param class_mars: the query's class masses if its forward has them (:func:`~.forward.run_forward`'s), else None
     :param compact: None, or the query's :class:`~..kernels.compact.CompactLayout`: the per-sample values are compact
-        (``flows`` laid out by it, see :meth:`~.state.State.flows`); the inside values stay dense
+        (``flows`` laid out by it, see :meth:`~.state.State.flows`), the inside values too where it lays them out
+        (``mars``, as ``bufs``)
     """
     pc, prog, td = backend.pc, backend.program(), plan.top_down
     out = backend.top_down_program()
@@ -63,8 +64,9 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
     lay = bufs["layout"]
     node_mars, element_mars = bufs["node_mars"], bufs["element_mars"]
     node_flows, element_flows = flows["node_flows"], flows["element_flows"]
+    mars = compact if compact is not None and compact.mars is not None else None   # the inside values compact
     regions = dict(offset = lay["sum_offsets_t"], width = lay["sum_widths_t"], first = prog.reg_first,
-                   slots = prog.reg_slots)                                     # the inside values'
+                   slots = prog.reg_slots if mars is None else mars.lanes_t)   # the inside values'
     if compact is None:                                  # the per-sample top-down values', as wide as the inside ones
         fregions, f_offsets, f_widths, nbatch = regions, lay["sum_offsets"], lay["sum_widths"], B
     else:                                                # ... or compact: a batch of one whose "slots" are the lanes
@@ -149,8 +151,8 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
             for folds, stages, num_temps, temp_slots in layers:
                 temp, temp_flows, temp_width, tw = node_mars, node_mars, 0, 0
                 if num_temps > 0:
-                    temp_width = _align(B * temp_slots)                    # the folds' inside values'
-                    tw = temp_width if compact is None else \
+                    temp_width = F.scratch_width(B, temp_slots, folds[1], mars)   # the folds' inside values'
+                    tw = _align(B * temp_slots) if compact is None else \
                         compact.row_width(_sample_temp_intervals(stages), temp_slots)
                     temp = backend.state.storage_view("product_scratch", num_temps * temp_width)
                     temp_flows = backend.state.storage_view("product_scratch_flows", num_temps * tw)
@@ -159,7 +161,7 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
                              prog.no_evidence, None, elem_first, elem_width, 1, srcs, exact = True)
                 if folds[1]:                             # ... and per sample
                     products(folds[1], (temp, temp_width), prog, regions, element_mars, node_mars, class_mars,
-                             obs_class, live, elem_first, elem_width, B, srcs, exact = exact)
+                             obs_class, live, elem_first, elem_width, B, srcs, exact = exact, compact = mars)
                 for once_launches, sample_launches, cw_launches in stages:
                     if once_launches:
                         run_top_down(once_launches, (temp, temp_width), prog, once, element_flows, temp_flows,
@@ -173,7 +175,7 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
                     if cw_launches and class_weights is not None:
                         run_class_weights(cw_launches, class_weights, prog, (temp, temp_width), element_flows,
                                           temp_flows, node_mars, liveness, elem_first, ew, B, srcs, td.once_iv,
-                                          regions, compact = compact, tflow_width = tw)
+                                          regions, compact = compact, tflow_width = tw, inside = mars is not None)
     if pf is not None:
         pf["valid"] |= td.todo
 

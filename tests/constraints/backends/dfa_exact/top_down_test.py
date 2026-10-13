@@ -19,7 +19,7 @@ import pyjuice as juice
 import pyjuice.constraints as jc
 from pyjuice.constraints.backends.dfa_exact.queries import forward as F
 from pyjuice.constraints.backends.dfa_exact.queries.top_down import run_backward
-from pyjuice.constraints.backends.dfa_exact.kernels.compact import compact_layout
+from pyjuice.constraints.backends.dfa_exact.kernels.compact import compact_layout, inside_compact
 from pyjuice.constraints.backends.dfa_exact.kernels.live import liveness
 from pyjuice.constraints.backends.dfa_exact.queries.plans import (per_sample_intervals, prior_regions, query_plan,
                                                                   top_down_prior)
@@ -77,7 +77,8 @@ def top_down_blocks(cc, data, missing, targets = None, policy = "default", held 
     every sum region's rows of the buffer its values are in -- [rows, B * slots], those kept once repeated per sample
     (cloned). ``visit(prod_index, bufs, flows, plan)``: see :func:`~pyjuice.constraints.backends.dfa_exact.backward.
     run_backward`. ``storage = "compact"``: the per-sample values compact, expanded to [rows, B * slots] (-inf off the
-    lanes; every lane written, -inf at a pair the automaton does not join).
+    lanes; every lane written, -inf at a pair the automaton does not join), the inside values too where a query keeps
+    them so (:func:`~pyjuice.constraints.backends.dfa_exact.kernels.compact.inside_compact`).
     """
     with juice.fast_inference() if policy == "kept" else contextlib.nullcontext():
         prog, td, dev = cc.backend.program(), cc.backend.top_down_program(), cc.pc.params.device
@@ -98,16 +99,17 @@ def top_down_blocks(cc, data, missing, targets = None, policy = "default", held 
         pf = cc.backend.state.prior_flows(np.zeros(len(cc.backend.sum_regions), dtype = bool))
         plan = query_plan(prog, observed, None if targets is None else targets.cpu().numpy(), valid.numpy(), prior,
                           top_down = dict(program = td, once = once, valid = pf["valid"].copy(), held = held))
-        compact = storage == "compact"
-        if lv is not None:
+        compact, inside = storage == "compact", inside_compact(prog, storage, None)
+        if lv is not None and not inside:
             lv.order(per_sample_intervals(prog, plan, top_down = not compact))
-        bufs = cc.backend.state.buffers(B)
-        cl = compact_layout(cc.backend, lv, plan.top_down.per_sample) if compact else None
+        cl = compact_layout(cc.backend, lv, plan.top_down.per_sample,
+                            inside = plan.sample[prog.reg_iv_np] if inside else None) if compact else None
+        bufs = cc.backend.state.buffers(B, layout = cl.mars if inside else None)
         flows = cc.backend.state.flows(B, bufs, cl)
         if nan_fill:
             flows["node_flows"].fill_(float("nan"))         # every needed slot must be written
         with torch.no_grad():
-            F.run_forward(cc.backend, bufs, plan, x, missing, obs_class, lv, "fp32")
+            F.run_forward(cc.backend, bufs, plan, x, missing, obs_class, lv, "fp32", cl)
             valid |= plan.todo
             run_backward(cc.backend, bufs, flows, plan, x, missing, obs_class, lv, "fp32",
                          visit = None if visit is None else lambda pi: visit(pi, bufs, flows, plan), compact = cl)

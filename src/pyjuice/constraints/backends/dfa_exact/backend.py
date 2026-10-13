@@ -234,8 +234,8 @@ class DFAExactBackend(Backend):
         ``log p(C, e)`` for every sample (see :meth:`~pyjuice.constraints.ConstrainedCircuit.marginal`).
 
         :param precision: "fp32" (the default; fp32-level accuracy) or "tf32" for the sum layers' matrix products
-        :param storage: "dense" (the default) or "compact" (see :meth:`conditional`; a marginal keeps no top-down
-            value, so it is the same either way)
+        :param storage: "dense" (the default) or "compact" (see :meth:`conditional`; a marginal keeps inside values
+            only)
         """
         from .queries.marginal import marginal
         return marginal(self, data, missing_mask, precision = precision, storage = storage)
@@ -249,9 +249,10 @@ class DFAExactBackend(Backend):
 
         :param precision: "fp32" (the default; fp32-level accuracy) or "tf32" for the matrix products; inside
             ``pyjuice.fast_inference(allow_bf16_params = True)`` the token probabilities are scored in bfloat16
-        :param storage: "dense" (the default) or "compact": keep the per-sample top-down values of every pair of
-            automaton states, or under evidence only of each sample's live ones (far less memory when the evidence
-            pins the automaton down, as a decoded prefix does; not yet with block @ block products, as in PD circuits)
+        :param storage: "dense" (the default) or "compact": keep the per-sample values of every pair of automaton
+            states, or under evidence only of each sample's live ones (far less memory when the evidence pins the
+            automaton down, as a decoded prefix does; the inside values not yet with block @ block products, as in PD
+            circuits)
         """
         from .queries.conditional import conditional
         return conditional(self, data, missing_mask, targets, precision = precision,

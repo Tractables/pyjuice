@@ -42,6 +42,7 @@ from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
 from ..compiled.layout import Reachability, _tile_any
 from .common import _block_ptr, _child, _exit_width, _interval, _lse_step, _pair, _slot, grid_chunks
+from .compact import _lane_pairs, _operand_slot
 from .transitions import transition_masses
 
 
@@ -68,6 +69,8 @@ class Launch:
     :ivar iv: [S] int64, the interval of every step's product, as its number in ``Program.sum_ivs`` (a scratch step
         follows the product it is a fold of)
     :ivar sizes: [S, 3] int64, every step's output's entry columns, exit columns and slots
+    :ivar out_ivs: int64 (host): the intervals of its steps' outputs, each once, by ``prog.intervals``' numbers (for
+        compact storage, see :mod:`.compact`)
     """
 
     form: str
@@ -80,6 +83,12 @@ class Launch:
     iv: torch.Tensor
     sizes: torch.Tensor
     groups_host: Optional[dict] = None
+    out_ivs: Any = None
+
+    @property
+    def out_temp(self) -> bool:
+        """Whether its steps' outputs are scratch rows (a fold's), not the layer's ``element_mars`` rows."""
+        return self.kinds[2 if self.form == "block_block" else 1]
 
 
 @dataclass
@@ -120,6 +129,36 @@ def _live_lanes(live, m, b, a, i, e, j, n, W, PRUNE: tl.constexpr):
 
 
 @triton.jit
+def _out_count(iv_of, coff, a, e, B, S, n, COMPACT: tl.constexpr):
+    """``(k, lanes)`` of a step's output over ``[a, e)``: its interval's number and its row's lanes -- ``B * S``, or
+    ``COMPACT`` the interval's (see :mod:`.compact`)."""
+    k = tl.load(iv_of + a * (n + 1) + e)
+    if COMPACT:
+        return k, tl.load(coff + k.to(tl.int64) * (B + 1) + B).to(tl.int32)
+    else:
+        return k, B * S
+
+
+@triton.jit
+def _out_lanes(idx, m, iv_table, opos, pairs, live, coff, ccount, cstart, ccolumns, k, a, e, S, X, B, n, W, csteps,
+               PRUNE: tl.constexpr, OUT_FULL: tl.constexpr, COMPACT: tl.constexpr):
+    """``(b, i, j, live, pa, pe, ce)`` of the lanes ``idx`` (``m``: the real ones) of a step's output over ``[a, e)``:
+    their sample and pair, which are live (the others -inf), and -- ``COMPACT`` -- the pair's places among the
+    sample's live columns at the entry and the exit (``ce``: those at the exit). Dense, the samples' blocks of ``S``
+    slots one after the other, live where both columns are (``PRUNE``); ``COMPACT``, the lanes of a row of the
+    output's interval ``k`` (:mod:`.compact`), every one live but at a pair the automaton does not join."""
+    if COMPACT:
+        b, i, j, pa, pe, ce = _lane_pairs(coff, ccount, cstart, ccolumns, k, a, e, idx, m, B, n, csteps)
+        return b.to(tl.int64), i, j, m & (_slot(iv_table, opos, i, j, X, m, OUT_FULL) >= 0), pa, pe, ce
+    else:
+        b = (idx // S).to(tl.int64)
+        v = _pair(iv_table, pairs, idx % S, m, OUT_FULL)
+        i = v // X
+        j = v % X
+        return b, i, j, _live_lanes(live, m, b, a, i, e, j, n, W, PRUNE), i, j, X
+
+
+@triton.jit
 def _lse_step_one_exp(m, acc, v):
     """:func:`_lse_step` with one exp, bit for bit: a new maximum rescales the sum by ``exp(m - v)`` and adds 1, any
     other term adds ``exp(v - m)`` -- both ``exp(-|v - m|)``, the float the two-exp form computes for the term it does
@@ -138,14 +177,16 @@ def _lse_value(m, acc):
 
 @triton_jit
 def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, class_mars, mass_row, trans, entry_ptr,
-                        entry_succ, entry_x, width, iv_of, iv_info, iv_table, live, steps, sel, reg_offset, reg_width,
-                        reg_first, prior_mars, prior_offset, prior_width, reg_prior, out_first, out_width, temp_width,
-                        B, n, W, C, input_start, pid0,
+                        entry_succ, entry_x, width, iv_of, iv_info, iv_table, live, coff, ccount, cstart, ccolumns,
+                        crank, steps, sel, reg_offset, reg_width, reg_first, prior_mars, prior_offset, prior_width,
+                        reg_prior, out_first, out_width, temp_width, B, n, W, C, input_start, csteps, pid0,
                         R_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, GROUPED: tl.constexpr, PRUNE: tl.constexpr,
-                        OUT_FULL: tl.constexpr, R_FULL: tl.constexpr, INDEXED: tl.constexpr, TILE: tl.constexpr):
+                        OUT_FULL: tl.constexpr, R_FULL: tl.constexpr, COMPACT: tl.constexpr, INDEXED: tl.constexpr,
+                        TILE: tl.constexpr):
     """One program per step (of the plan's index list ``sel`` if ``INDEXED``) and tile of its whole output, flattened
     (sample, slot): with the samples' blocks contiguous, a step's output is one run of columns, and the lanes stay
-    full whatever the widths."""
+    full whatever the widths. ``COMPACT``: the per-sample values compact (:mod:`.compact`), a lane per pair of the
+    sample's live columns; the block's, kept once, by slot."""
     s = _child(sel, tl.program_id(0), INDEXED)
     tile = pid0 + tl.program_id(1)
     out_row = tl.load(steps + s * 7 + 0)
@@ -153,22 +194,25 @@ def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
     t = tl.load(steps + s * 7 + 2)
     t2 = tl.load(steps + s * 7 + 5)
     X = _exit_width(width, t2, n)
-    S, _, pairs = _interval(iv_of, iv_info, t, t2, n)
-    if tile * TILE < B * S:
+    S, opos, pairs = _interval(iv_of, iv_info, t, t2, n)
+    ko, ncols = _out_count(iv_of, coff, t, t2, B, S, n, COMPACT)
+    if tile * TILE < ncols:
         idx = tile * TILE + tl.arange(0, TILE)
-        m = idx < B * S
-        b = (idx // S).to(tl.int64)
-        v = _pair(iv_table, pairs, idx % S, m, OUT_FULL)
-        i = v // X
-        j = v % X
-        ml = _live_lanes(live, m, b, t, i, t2, j, n, W, PRUNE)
+        m = idx < ncols
+        b, i, j, ml, pa, pe, ce = _out_lanes(idx, m, iv_table, opos, pairs, live, coff, ccount, cstart, ccolumns, ko,
+                                            t, t2, S, X, B, n, W, csteps, PRUNE, OUT_FULL, COMPACT)
         end = t + 1 == n
         if R_KIND != 2:
             RS, rpos, _ = _interval(iv_of, iv_info, t + 1, t2, n)            # the block's slots
             rp, r_own = _block_ptr(tl.load(steps + s * 7 + 3), tl.load(steps + s * 7 + 4), node_mars, prior_mars, temp,
                                    reg_offset, reg_width, reg_first, prior_offset, prior_width, reg_prior, temp_width,
                                    R_KIND)
-            rp = rp + tl.where(r_own, b * RS, 0)
+            if COMPACT:                                                      # pair (q, j): the lane rbase + q's place
+                kr = tl.load(iv_of + (t + 1) * (n + 1) + t2).to(tl.int64)    # x ce (the exit is the output's)
+                rbase = tl.load(coff + kr * (B + 1) + b, mask = m, other = 0) + pe
+            else:
+                rp = rp + tl.where(r_own, b * RS, 0)
+                rbase = 0
         oc = tl.load(obs_class + b * n + t, mask = m, other = -1)            # observed token's class, -1 if missing
 
         # an observed token: its own log-probability (the input region of node_mars), then the block from the
@@ -178,7 +222,8 @@ def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
         if R_KIND == 2:
             rv = tl.where((q == j) | (end & (q >= 0)), 0.0, float("-inf"))
         else:
-            sl = _slot(iv_table, rpos, q, j, X, obs, R_FULL)
+            sl = _operand_slot(iv_table, rpos, q, j, X, obs, r_own, crank, b, t + 1, q, rbase, ce, n, W, R_FULL,
+                               COMPACT)
             rv = tl.load(rp + sl, mask = obs & (sl >= 0), other = float("-inf"))
         val = tl.load(node_mars + u * B + b, mask = obs, other = float("-inf")) + rv
 
@@ -198,7 +243,8 @@ def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
                     if R_KIND == 2:
                         rv = tl.where(pm & (q == j), 0.0, float("-inf"))
                     else:
-                        sl = _slot(iv_table, rpos, q, j, X, pm, R_FULL)
+                        sl = _operand_slot(iv_table, rpos, q, j, X, pm, r_own, crank, b, t + 1, q, rbase, ce, n, W,
+                                           R_FULL, COMPACT)
                         rv = tl.load(rp + sl, mask = pm & (sl >= 0), other = float("-inf"))
                     mass = tl.load(masses + tl.load(entry_x + p0 + k, mask = pm, other = 0), mask = pm,
                                    other = float("-inf"))
@@ -210,7 +256,8 @@ def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
                     if R_KIND == 2:
                         rv = tl.where((q == j) | (end & (q >= 0)), 0.0, float("-inf"))
                     else:
-                        sl = _slot(iv_table, rpos, q, j, X, miss, R_FULL)
+                        sl = _operand_slot(iv_table, rpos, q, j, X, miss, r_own, crank, b, t + 1, q, rbase, ce, n, W,
+                                           R_FULL, COMPACT)
                         rv = tl.load(rp + sl, mask = miss & (sl >= 0), other = float("-inf"))
                     mx, acc = _lse_step(mx, acc, tl.load(masses + c) + rv)
             val = tl.where(oc >= 0, val, _lse_value(mx, acc))
@@ -220,16 +267,19 @@ def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
 
 @triton_jit
 def _input_block_group_kernel(element_mars, node_mars, temp, obs_class, next_col, class_mars, mass_row, width, iv_of,
-                              iv_info, iv_table, live, steps, groups, sel, reg_offset, reg_width, reg_first, prior_mars,
-                              prior_offset, prior_width, reg_prior, out_first, out_width, temp_width, B, n, W, C,
-                              input_start, pid0, R_KIND: tl.constexpr,
-                              OUT_TEMP: tl.constexpr, PRUNE: tl.constexpr, OUT_FULL: tl.constexpr, R_FULL: tl.constexpr,
-                              G: tl.constexpr, ONE_EXP: tl.constexpr, INDEXED: tl.constexpr, TILE: tl.constexpr):
+                              iv_info, iv_table, live, coff, ccount, cstart, ccolumns, crank, steps, groups, sel,
+                              reg_offset, reg_width, reg_first, prior_mars, prior_offset, prior_width, reg_prior,
+                              out_first, out_width, temp_width, B, n, W, C, input_start, csteps, pid0,
+                              R_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, PRUNE: tl.constexpr,
+                              OUT_FULL: tl.constexpr, R_FULL: tl.constexpr, G: tl.constexpr, ONE_EXP: tl.constexpr,
+                              COMPACT: tl.constexpr, INDEXED: tl.constexpr, TILE: tl.constexpr):
     """:func:`_input_block_kernel` for a group of steps per program, class by class, the block a sum's or a scratch
     row: group ``g`` is steps ``groups[g] .. groups[g + 1]`` (at most ``G``, a power of 2), which share their position
     and block interval, so they share their lanes' columns, successors and slots. Those are read once for the
     ``[G, TILE]`` lanes; only the input's masses and the block's values are read per step. ``ONE_EXP``: the
-    log-sum-exp by :func:`_lse_step_one_exp` (bit-identical). ``INDEXED``: the groups of the plan's index list ``sel``."""
+    log-sum-exp by :func:`_lse_step_one_exp` (bit-identical). ``COMPACT``: as :func:`_input_block_kernel`, the group's
+    blocks all kept once or none (their interval is shared). ``INDEXED``: the groups of the plan's index list
+    ``sel``."""
     g = _child(sel, tl.program_id(0), INDEXED)
     first = tl.load(groups + g)
     gs = first + tl.arange(0, G)
@@ -238,28 +288,36 @@ def _input_block_group_kernel(element_mars, node_mars, temp, obs_class, next_col
     t = tl.load(steps + first * 7 + 2)
     t2 = tl.load(steps + first * 7 + 5)
     X = _exit_width(width, t2, n)
-    S, _, pairs = _interval(iv_of, iv_info, t, t2, n)
-    if tile * TILE < B * S:
+    S, opos, pairs = _interval(iv_of, iv_info, t, t2, n)
+    ko, ncols = _out_count(iv_of, coff, t, t2, B, S, n, COMPACT)
+    if tile * TILE < ncols:
         idx = tile * TILE + tl.arange(0, TILE)
-        m = idx < B * S
-        b = (idx // S).to(tl.int64)
-        v = _pair(iv_table, pairs, idx % S, m, OUT_FULL)
-        i = v // X
-        j = v % X
-        ml = _live_lanes(live, m, b, t, i, t2, j, n, W, PRUNE)
+        m = idx < ncols
+        b, i, j, ml, pa, pe, ce = _out_lanes(idx, m, iv_table, opos, pairs, live, coff, ccount, cstart, ccolumns, ko,
+                                            t, t2, S, X, B, n, W, csteps, PRUNE, OUT_FULL, COMPACT)
         RS, rpos, _ = _interval(iv_of, iv_info, t + 1, t2, n)                # the blocks' slots
         u = tl.load(steps + gs * 7 + 1, mask = gm, other = input_start).to(tl.int64)
         rp, r_own = _block_ptr(tl.load(steps + gs * 7 + 3, mask = gm, other = 0),
                                tl.load(steps + gs * 7 + 4, mask = gm, other = 0), node_mars, prior_mars, temp,
                                reg_offset, reg_width, reg_first, prior_offset, prior_width, reg_prior, temp_width,
                                R_KIND)
-        rp = rp[:, None] + tl.where(r_own[:, None], (b * RS)[None, :], 0)   # [G, TILE]
+        if COMPACT:                                          # as in _input_block_kernel, the first step's for the group
+            _rp, own = _block_ptr(tl.load(steps + first * 7 + 3), tl.load(steps + first * 7 + 4), node_mars, prior_mars,
+                                temp, reg_offset, reg_width, reg_first, prior_offset, prior_width, reg_prior,
+                                temp_width, R_KIND)
+            kr = tl.load(iv_of + (t + 1) * (n + 1) + t2).to(tl.int64)
+            rbase = tl.load(coff + kr * (B + 1) + b, mask = m, other = 0) + pe
+            rp = rp[:, None]
+        else:
+            own = True
+            rbase = 0
+            rp = rp[:, None] + tl.where(r_own[:, None], (b * RS)[None, :], 0)   # [G, TILE]
         oc = tl.load(obs_class + b * n + t, mask = m, other = -1)            # observed token's class, -1 if missing
 
         # an observed token, as in _input_block_kernel
         obs = ml & (oc >= 0)
         q = tl.load(next_col + (t * W + i) * C + oc, mask = obs, other = -1)
-        sl = _slot(iv_table, rpos, q, j, X, obs, R_FULL)
+        sl = _operand_slot(iv_table, rpos, q, j, X, obs, own, crank, b, t + 1, q, rbase, ce, n, W, R_FULL, COMPACT)
         val = tl.load(node_mars + u[:, None] * B + b[None, :], mask = gm[:, None] & obs[None, :], other = float("-inf")) + \
             tl.load(rp + sl[None, :], mask = gm[:, None] & (obs & (sl >= 0))[None, :], other = float("-inf"))
 
@@ -271,7 +329,8 @@ def _input_block_group_kernel(element_mars, node_mars, temp, obs_class, next_col
             masses = class_mars + tl.load(mass_row + (u - input_start)).to(tl.int64) * C
             for c in range(C):
                 q = tl.load(next_col + (t * W + i) * C + c, mask = miss, other = -1)
-                sl = _slot(iv_table, rpos, q, j, X, miss, R_FULL)
+                sl = _operand_slot(iv_table, rpos, q, j, X, miss, own, crank, b, t + 1, q, rbase, ce, n, W, R_FULL,
+                                   COMPACT)
                 rv = tl.load(rp + sl[None, :], mask = gm[:, None] & (miss & (sl >= 0))[None, :], other = float("-inf"))
                 if ONE_EXP:
                     mx, acc = _lse_step_one_exp(mx, acc, tl.load(masses + c)[:, None] + rv)
@@ -285,15 +344,17 @@ def _input_block_group_kernel(element_mars, node_mars, temp, obs_class, next_col
 
 @triton_jit
 def _block_input_kernel(element_mars, node_mars, temp, obs_class, next_col, class_mars, mass_row, trans, pred_ptr,
-                        pred_col, pred_x, width, iv_of, iv_info, iv_table, live, steps, sel, reg_offset, reg_width,
-                        reg_first, prior_mars, prior_offset, prior_width, reg_prior, out_first, out_width, temp_width,
-                        B, n, W, C, input_start, pid0,
+                        pred_col, pred_x, width, iv_of, iv_info, iv_table, live, coff, ccount, cstart, ccolumns,
+                        crank, steps, sel, reg_offset, reg_width, reg_first, prior_mars, prior_offset, prior_width,
+                        reg_prior, out_first, out_width, temp_width, B, n, W, C, input_start, csteps, pid0,
                         L_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, GROUPED: tl.constexpr, PRUNE: tl.constexpr,
-                        OUT_FULL: tl.constexpr, L_FULL: tl.constexpr, INDEXED: tl.constexpr, TILE: tl.constexpr):
+                        OUT_FULL: tl.constexpr, L_FULL: tl.constexpr, COMPACT: tl.constexpr, INDEXED: tl.constexpr,
+                        TILE: tl.constexpr):
     """One program per step and tile of its whole output, flattened (sample, slot) as in
     :func:`_input_block_kernel`: every lane takes a log-sum over its exit column's predecessor entries (the
     program loops to the longest list among its lanes), each through its mass for a missing token, or the
-    observed token's own log-probability when the entry holds its class. ``INDEXED``: as :func:`_input_block_kernel`."""
+    observed token's own log-probability when the entry holds its class. ``COMPACT``, ``INDEXED``: as
+    :func:`_input_block_kernel`."""
     s = _child(sel, tl.program_id(0), INDEXED)
     tile = pid0 + tl.program_id(1)
     out_row = tl.load(steps + s * 7 + 0)
@@ -302,21 +363,25 @@ def _block_input_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
     t = tl.load(steps + s * 7 + 5)
     M = tl.load(width + t)
     X = _exit_width(width, t + 1, n)
-    S, _, pairs = _interval(iv_of, iv_info, t0, t + 1, n)
+    S, opos, pairs = _interval(iv_of, iv_info, t0, t + 1, n)
     LS, lpos, _ = _interval(iv_of, iv_info, t0, t, n)                       # the block's slots
-    if tile * TILE < B * S:
+    ko, ncols = _out_count(iv_of, coff, t0, t + 1, B, S, n, COMPACT)
+    if tile * TILE < ncols:
         idx = tile * TILE + tl.arange(0, TILE)
-        m = idx < B * S
-        b = (idx // S).to(tl.int64)
-        v = _pair(iv_table, pairs, idx % S, m, OUT_FULL)
-        i = v // X
-        j = v % X                                                            # exit column (at boundary t + 1)
-        ml = _live_lanes(live, m, b, t0, i, t + 1, j, n, W, PRUNE)
+        m = idx < ncols
+        b, i, j, ml, pa, pe, ce = _out_lanes(idx, m, iv_table, opos, pairs, live, coff, ccount, cstart, ccolumns, ko,
+                                           t0, t + 1, S, X, B, n, W, csteps, PRUNE, OUT_FULL, COMPACT)   # j: at t + 1
         oc = tl.load(obs_class + b * n + t, mask = m, other = -1)
         own = tl.load(node_mars + u * B + b, mask = m, other = float("-inf"))  # the input region of node_mars
         lp, l_own = _block_ptr(tl.load(steps + s * 7 + 1), tl.load(steps + s * 7 + 2), node_mars, prior_mars, temp,
                                reg_offset, reg_width, reg_first, prior_offset, prior_width, reg_prior, temp_width, L_KIND)
-        lp = lp + tl.where(l_own, b * LS, 0)
+        if COMPACT:                                                          # pair (i, q): the lane lbase + q's place
+            kl = tl.load(iv_of + t0 * (n + 1) + t).to(tl.int64)              # (the entry is the output's)
+            lbase = tl.load(coff + kl * (B + 1) + b, mask = m, other = 0) + \
+                pa * tl.load(ccount + b * (n + 1) + t, mask = m, other = 0)
+        else:
+            lp = lp + tl.where(l_own, b * LS, 0)
+            lbase = 0
         if GROUPED:
             masses = trans + tl.load(steps + s * 7 + 6).to(tl.int64)          # the step's transition masses
         else:                                                                # the input's class masses
@@ -337,7 +402,7 @@ def _block_input_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
                 holds = x == oc
             mass = tl.where(oc >= 0, tl.where(holds, own, float("-inf")),
                             tl.load(masses + x, mask = em, other = float("-inf")))
-            sl = _slot(iv_table, lpos, i, q, M, em, L_FULL)
+            sl = _operand_slot(iv_table, lpos, i, q, M, em, l_own, crank, b, t, q, lbase, 1, n, W, L_FULL, COMPACT)
             lv = tl.load(lp + sl, mask = em & (sl >= 0), other = float("-inf"))
             mx, acc = _lse_step_one_exp(mx, acc, lv + mass)
         op = _out_ptr(out_row, element_mars, temp, out_first, out_width, temp_width, OUT_TEMP)
@@ -553,16 +618,19 @@ def _block_block_kernel(element_mars, node_mars, temp, width, iv_of, iv_info, iv
 
 
 @triton_jit
-def _copy_kernel(element_mars, node_mars, temp, iv_of, iv_info, steps, sel, reg_offset, reg_width, reg_first,
+def _copy_kernel(element_mars, node_mars, temp, iv_of, iv_info, coff, steps, sel, reg_offset, reg_width, reg_first,
                  prior_mars, prior_offset, prior_width, reg_prior, out_first, out_width, temp_width, B, n, pid0,
-                 L_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, INDEXED: tl.constexpr, TILE: tl.constexpr):
+                 L_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, COMPACT: tl.constexpr, INDEXED: tl.constexpr,
+                 TILE: tl.constexpr):
+    """One program per step and tile of its output's lanes (``COMPACT``: its interval's, see :mod:`.compact`; the
+    block's are the same)."""
     s = _child(sel, tl.program_id(0), INDEXED)
     pid = pid0 + tl.program_id(1)
     out_row = tl.load(steps + s * 5 + 0)
     t0 = tl.load(steps + s * 5 + 3)
     t2 = tl.load(steps + s * 5 + 4)
     S, _, _ = _interval(iv_of, iv_info, t0, t2, n)
-    ncols = S * B
+    _, ncols = _out_count(iv_of, coff, t0, t2, B, S, n, COMPACT)
     if pid * TILE < ncols:
         cols = pid * TILE + tl.arange(0, TILE)
         m = cols < ncols
@@ -690,7 +758,7 @@ INPUT_BLOCK_ONE_EXP = (False, True)
 
 
 def run_products(stages, bufs, prog, regions, element_mars, node_mars, class_mars, obs_class, live,
-                 elem_first: int, elem_width: int, B: int, prior: dict, exact: bool):
+                 elem_first: int, elem_width: int, B: int, prior: dict, exact: bool, compact = None):
     """
     The steps a query plan runs of one product layer, stage by stage (a stage reads only earlier stages' scratch
     rows). Products are fp32-level whatever the query's precision, which applies to the sum layers: ``block @ block``
@@ -710,6 +778,9 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, class_mar
         :data:`EXACT_BELOW`): for the blocks kept once, every entry of which some sample may need, and under evidence
         pruning, where a sample's few live columns may carry very different masses; a batch observing nothing reads
         its blocks' entries weighted by its own masses, which the shifts respect (and pays nothing)
+    :param compact: None, or the query's :class:`~.compact.CompactLayout`, by which the per-sample inside values are
+        compact (``regions``, ``elem_width`` and the scratch rows' width are their rows'): a lane per pair of live
+        columns; not yet with ``block @ block`` steps
     """
     temp, temp_width = bufs
     common = dict(reg_offset = regions["offset"], reg_width = regions["width"], reg_first = regions["first"],
@@ -719,10 +790,18 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, class_mar
     n, W, C = prog.n, prog.next_col.size(1), prog.next_col.size(2)
     ivs = prog.intervals
     prune, live = live is not None, live if live is not None else obs_class
+    if compact is not None:
+        lists = dict(coff = compact.off, ccount = compact.count, cstart = compact.start, ccolumns = compact.columns,
+                     crank = compact.rank, csteps = compact.steps)
+    else:
+        lists = dict(coff = live, ccount = live, cstart = live, ccolumns = live, crank = live, csteps = 0)
     for launches in stages:
         for launch, cut in launches:
             form, kinds = launch.form, launch.kinds
             E_max, X_max, S_max, S = cut.E_max, cut.X_max, cut.S_max, cut.count
+            lanes = B * S_max if compact is None else compact.lanes(launch.out_ivs)   # an output's most
+            if compact is not None and lanes == 0:                           # no sample has a live pair there
+                continue
             if form in ("input_block", "block_input"):
                 steps, _, groups = launch.steps
                 trans, tt = prog.transition_buffer(), prog.trans
@@ -731,7 +810,7 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, class_mar
                     idx = dict(sel = part if sel is None else sel.tensor, INDEXED = sel is not None)
                     if job is not None:                              # this chunk's transition masses, in scratch
                         transition_masses(trans, job, class_mars, prog)
-                    if form == "input_block" and groups is not None and B * S_max > GROUP_MIN_LANES:
+                    if form == "input_block" and groups is not None and lanes > GROUP_MIN_LANES:
                         r_kind, out_temp, (out_full, *r_full) = kinds
                         assert (s0, s1) == (0, launch.rows.size(0))   # groups index the launch's one chunk
 
@@ -740,46 +819,50 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, class_mar
                             firsts = groups[G]
                             gsel, gcnt = cut.groups[G]
                             G = host_next_power_of_2(G)            # lanes per group (a group may be shorter)
-                            tile = min(_flat_tile(B * S_max), 1024 // G)
-                            for first, size in grid_chunks(host_cdiv(B * S_max, tile), 1):
+                            tile = min(_flat_tile(lanes), 1024 // G)
+                            for first, size in grid_chunks(host_cdiv(lanes, tile), 1):
                                 _input_block_group_kernel[(gcnt, size)](
                                     element_mars, node_mars, temp, obs_class, prog.next_col, class_mars,
-                                    prog.mass_row, prog.width_t, ivs.of, ivs.info, ivs.table, live, part, firsts,
-                                    firsts if gsel is None else gsel.tensor, B = B, n = n, W = W, C = C,
-                                    input_start = prog.input_start, pid0 = first, R_KIND = r_kind,
+                                    prog.mass_row, prog.width_t, ivs.of, ivs.info, ivs.table, live, steps = part,
+                                    groups = firsts, sel = firsts if gsel is None else gsel.tensor, B = B, n = n,
+                                    W = W, C = C, input_start = prog.input_start, pid0 = first, R_KIND = r_kind,
                                     OUT_TEMP = out_temp, PRUNE = prune, OUT_FULL = out_full, R_FULL = all(r_full),
-                                    G = G, ONE_EXP = one_exp, INDEXED = gsel is not None, TILE = tile, num_warps = 4,
-                                    **common)
+                                    G = G, ONE_EXP = one_exp, COMPACT = compact is not None,
+                                    INDEXED = gsel is not None, TILE = tile, num_warps = 4, **lists, **common)
 
                         # the group sizes the Program built (its default first), each step form: timed per shape (the
                         # steps rounded up to a power of 2, so that queries running subsets of a launch share choices)
                         cands = [(G, one_exp) for one_exp in INPUT_BLOCK_ONE_EXP for G in groups]
-                        key = ("lifted_input_block_group", kinds, prune, C, host_next_power_of_2(S),
-                               host_next_power_of_2(B * S_max), tuple(groups))
+                        key = ("lifted_input_block_group", kinds, prune, compact is not None, C,
+                               host_next_power_of_2(S), host_next_power_of_2(lanes), tuple(groups))
                         input_block_group(autotune.pick(key, cands, input_block_group))   # outputs overwritten
                     elif form == "input_block":
                         r_kind, out_temp, (out_full, *r_full) = kinds
-                        tile = _flat_tile(B * S_max)
-                        for first, size in grid_chunks(host_cdiv(B * S_max, tile), 1):
+                        tile = _flat_tile(lanes)
+                        for first, size in grid_chunks(host_cdiv(lanes, tile), 1):
                             _input_block_kernel[(cnt, size)](
                                 element_mars, node_mars, temp, obs_class, prog.next_col, class_mars, prog.mass_row,
                                 trans, tt.entry_ptr, tt.entry_succ, tt.entry_x, prog.width_t, ivs.of, ivs.info,
-                                ivs.table, live, part, B = B, n = n, W = W,
+                                ivs.table, live, steps = part, B = B, n = n, W = W,
                                 C = C, input_start = prog.input_start, pid0 = first, R_KIND = r_kind,
                                 OUT_TEMP = out_temp, GROUPED = tt.grouped, PRUNE = prune, OUT_FULL = out_full,
-                                R_FULL = all(r_full), TILE = tile, num_warps = 4, **idx, **common)
+                                R_FULL = all(r_full), COMPACT = compact is not None, TILE = tile, num_warps = 4,
+                                **idx, **lists, **common)
                     else:
                         l_kind, out_temp, (out_full, l_full) = kinds
-                        tile = _flat_tile(B * S_max)
-                        for first, size in grid_chunks(host_cdiv(B * S_max, tile), 1):
+                        tile = _flat_tile(lanes)
+                        for first, size in grid_chunks(host_cdiv(lanes, tile), 1):
                             _block_input_kernel[(cnt, size)](
                                 element_mars, node_mars, temp, obs_class, prog.next_col, class_mars, prog.mass_row,
                                 trans, tt.pred_ptr, tt.pred_col, tt.pred_x, prog.width_t, ivs.of, ivs.info, ivs.table,
-                                live, part, B = B, n = n, W = W,
+                                live, steps = part, B = B, n = n, W = W,
                                 C = C, input_start = prog.input_start, pid0 = first, L_KIND = l_kind,
                                 OUT_TEMP = out_temp, GROUPED = tt.grouped, PRUNE = prune, OUT_FULL = out_full,
-                                L_FULL = l_full, TILE = tile, num_warps = 4, **idx, **common)
+                                L_FULL = l_full, COMPACT = compact is not None, TILE = tile, num_warps = 4, **idx,
+                                **lists, **common)
             elif form == "block_block":
+                if compact is not None:
+                    raise NotImplementedError("compact inside values of block @ block products (not yet)")
                 l_kind, r_kind, out_temp = kinds
                 steps, triples = launch.steps
                 sel = cut.chunks[0][3]
@@ -808,9 +891,10 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, class_mar
             else:                                                            # "copy"
                 l_kind, out_temp = kinds
                 sel = cut.chunks[0][3]
-                tile = _tile(S_max * B)
-                for first, size in grid_chunks(host_cdiv(S_max * B, tile), 1):
+                tile = _tile(lanes)
+                for first, size in grid_chunks(host_cdiv(lanes, tile), 1):
                     _copy_kernel[(S, size)](
-                        element_mars, node_mars, temp, ivs.of, ivs.info, launch.steps,
+                        element_mars, node_mars, temp, ivs.of, ivs.info, lists["coff"], launch.steps,
                         launch.steps if sel is None else sel.tensor, B = B, n = n, pid0 = first, L_KIND = l_kind,
-                        OUT_TEMP = out_temp, INDEXED = sel is not None, TILE = tile, num_warps = 4, **common)
+                        OUT_TEMP = out_temp, COMPACT = compact is not None, INDEXED = sel is not None, TILE = tile,
+                        num_warps = 4, **common)

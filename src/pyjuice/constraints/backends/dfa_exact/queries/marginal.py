@@ -10,7 +10,7 @@ from typing import Optional
 import numpy as np
 import torch
 
-from ..kernels.compact import STORAGES
+from ..kernels.compact import STORAGES, compact_layout, inside_compact
 from ..kernels.live import liveness
 from .forward import PRECISIONS, missing_tensor, run_forward
 from .plans import per_sample_intervals, prior_regions, query_plan
@@ -18,7 +18,8 @@ from .plans import per_sample_intervals, prior_regions, query_plan
 
 
 def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None, precision: str = "fp32",
-             held: Optional[np.ndarray] = None, report: Optional[dict] = None, storage: str = "dense"):
+             held: Optional[np.ndarray] = None, report: Optional[dict] = None, storage: str = "dense",
+             inside_storage: Optional[str] = None):
     """
     ``log p(C, e)`` for every sample: the probability that the PC generates a string that satisfies the
     constraint and agrees with the observed tokens.
@@ -28,11 +29,12 @@ def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] =
     :param precision: "fp32" (default) or "tf32" for the sum layers' matrix products
     :param held: None, or bool [sum regions]: the per-sample inside values ``node_mars`` holds for this query, as a
         decoder decides (see :mod:`.plans`)
-    :param report: None, or a dict where the query leaves its :class:`~.plans.QueryPlan` (``"plan"``) and its
-        :class:`~..kernels.live.Liveness` (``"liveness"``; None when it observes nothing)
+    :param report: None, or a dict where the query leaves its :class:`~.plans.QueryPlan` (``"plan"``), its
+        :class:`~..kernels.live.Liveness` (``"liveness"``; None when it observes nothing, dense) and its
+        :class:`~..kernels.compact.CompactLayout` (``"compact"``; None when dense)
     :param storage: "dense" or "compact": how a query keeps its per-sample values (see
-        :func:`~.conditional.conditional`); a marginal has no top-down value, and compact only keeps no inside value
-        per sample where it computes and holds none
+        :func:`~.conditional.conditional`); a marginal has no top-down value
+    :param inside_storage: see :func:`~.conditional.conditional`
     :returns: [B, number of root nodes], as :func:`pyjuice.queries.marginal`
     """
     if precision not in PRECISIONS:
@@ -58,17 +60,22 @@ def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] =
 
     with torch.no_grad():
         obs_class = torch.where(missing, -1, backend.token_classes.token_class[x]).contiguous()
-        lv = liveness(prog, obs_class, B) if observed.any() else None       # nothing observed: nothing to prune
+        inside = inside_compact(prog, storage if inside_storage is None else inside_storage, held)
+        # nothing observed: nothing to prune, but compact values are laid out by the live columns (every one)
+        lv = liveness(prog, obs_class, B) if observed.any() or inside else None
         valid, kept = backend.state.prior_validity()
         prior = prior_regions(prog, observed, B, kept, lv)
         plan = query_plan(prog, observed, None, valid.numpy(), prior, held = held)   # every inside value
-        if lv is not None:
+        if lv is not None and not inside:
             lv.order(per_sample_intervals(prog, plan))
         inputs_only = storage == "compact" and not plan.sample.any() and (held is None or not held.any())
-        bufs = backend.state.buffers(B, inputs_only)                    # compact: no rows for no per-sample value
+        compact = compact_layout(backend, lv, np.zeros(len(backend.sum_regions), dtype = bool),
+                                 inside = plan.sample[prog.reg_iv_np]) if inside else None
+        # compact: no rows for no per-sample value
+        bufs = backend.state.buffers(B, inputs_only, None if compact is None else compact.mars)
         if report is not None:
-            report.update(plan = plan, liveness = lv, inputs_only = inputs_only)
-        run_forward(backend, bufs, plan, x, missing, obs_class, lv, precision)
+            report.update(plan = plan, liveness = lv, inputs_only = inputs_only, compact = compact)
+        run_forward(backend, bufs, plan, x, missing, obs_class, lv, precision, compact)
         valid |= plan.todo
 
         r = prog.root_region
@@ -81,4 +88,12 @@ def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] =
         base = lay["sum_offsets"][r] + (root_first - backend.sum_regions[r][0]) * lay["sum_widths"][r]
         width = lay["sum_widths"][r]
         rows = base + torch.arange(root_end - root_first, device = dev)[:, None] * width
-        return bufs["node_mars"][rows + torch.arange(B, device = dev)[None, :]].t().contiguous()
+        if compact is None:
+            return bufs["node_mars"][rows + torch.arange(B, device = dev)[None, :]].t().contiguous()
+        k = prog.reg_iv_all[r]                         # compact: a sample's one lane if both its ends are live, else
+        if compact.total[k] == 0:                      # its evidence breaks the constraint
+            return torch.full((B, root_end - root_first), -float("inf"), device = dev)
+        off = compact.off[k]
+        lane = off[:B] < off[1:]
+        out = bufs["node_mars"][rows + torch.where(lane, off[:B], 0)[None, :]]
+        return torch.where(lane[None, :], out, -float("inf")).t().contiguous()

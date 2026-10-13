@@ -94,7 +94,7 @@ class DFAExactDecoder(Decoder):
         held, keep, compact, _ = self._reuse(data, missing, None, precision, storage, marginal = True)
         report = {}
         out = marginal(be, data, missing, precision, held = None if held is None else held[0], report = report,
-                       storage = storage)
+                       storage = storage, inside_storage = "dense")
         self._after(data.size(0), precision, storage, keep, report, compact)
         return out
 
@@ -106,7 +106,8 @@ class DFAExactDecoder(Decoder):
         report = {}
         out = conditional(be, data, missing, targets, precision, return_log_marginal = return_log_marginal,
                           held = None if held is None else dict(inside = held[0], top_down = held[1]),
-                          candidates = candidates, report = report, storage = storage, carry = carry)
+                          candidates = candidates, report = report, storage = storage, carry = carry,
+                          inside_storage = "dense")
         self._after(data.size(0), precision, storage, keep, report, compact)
         return out
 

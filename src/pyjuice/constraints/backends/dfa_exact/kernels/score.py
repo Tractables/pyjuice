@@ -198,7 +198,8 @@ def _class_weight_kernel(dfa_class_flow, cw_base, cw_K, element_flows, temp_flow
                          reg_prior, out_first, out_width, temp_width, tflow_width, B, n, W, C, pid0,
                          BLOCK_INPUT: tl.constexpr, S_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, PRUNE: tl.constexpr,
                          OUT_FULL: tl.constexpr, S_FULL: tl.constexpr, INDEXED: tl.constexpr, UNIFORM: tl.constexpr,
-                         COMPACT: tl.constexpr, TB: tl.constexpr, TC: tl.constexpr, TJ: tl.constexpr):
+                         COMPACT: tl.constexpr, MARS: tl.constexpr, TB: tl.constexpr, TC: tl.constexpr,
+                         TJ: tl.constexpr):
     """One program per (destination, ``TB`` samples, ``TC`` classes), a lane per (sample, class): the log class
     weights of its steps' inputs (see the module docstring) -- a walk over the columns ``i`` of the input's boundary,
     then over the other boundary's columns ``TJ`` at a time -- log-added to ``dfa_class_flow`` at the destination's
@@ -207,7 +208,7 @@ def _class_weight_kernel(dfa_class_flow, cw_base, cw_K, element_flows, temp_flow
     -inf): a wide automaton pinned by its evidence to a few columns costs a few steps, not one per column. ``UNIFORM``
     (see :func:`_walk_column`; ``TB`` 1 under pruning): the program's lanes walk the same columns. ``COMPACT``: the
     outputs' top-down values compact (:mod:`.compact`; ``tflow_width`` the scratch rows' width there, ``temp_width``
-    their inside values')."""
+    their inside values'); ``MARS``: the other operands' inside values too (by the same layout)."""
     d = _child(dests_idx, tl.program_id(0), INDEXED)
     lane = tl.arange(0, TB * TC)
     b = ((pid0 + tl.program_id(1)) * TB + lane // TC).to(tl.int64)
@@ -249,7 +250,8 @@ def _class_weight_kernel(dfa_class_flow, cw_base, cw_K, element_flows, temp_flow
             lp, l_own = _block_ptr(tl.load(parents + p * 7 + 1), tl.load(parents + p * 7 + 2), node_mars, prior_mars,
                                    temp, reg_offset, reg_width, reg_first, prior_offset, prior_width, reg_prior,
                                    temp_width, S_KIND)
-            lp = lp + tl.where(l_own, b * LS, 0)
+            lp = lp + _parent_base(b, tl.where(l_own, LS, 0), MARS)
+            kl = tl.load(iv_of + t0 * (n + 1) + t)
             for ii in range(0, steps):
                 i, ok = _walk_column(columns, cstart, ccount, cm, ii, PRUNE, UNIFORM)
                 q = tl.load(next_col + (t * W + i) * C + cls, mask = ok, other = -1)
@@ -257,7 +259,13 @@ def _class_weight_kernel(dfa_class_flow, cw_base, cw_K, element_flows, temp_flow
                 for e0 in range(0, E, TJ):
                     i0 = e0 + tl.arange(0, TJ)
                     m1 = ok[:, None] & (i0 < E)[None, :]
-                    sl = _walk_slots(iv_table, lpos, i, i0, M, ok, i0 < E, False, S_FULL, UNIFORM)
+                    if UNIFORM:
+                        ir = i
+                    else:
+                        ir = i[:, None]
+                    sl = _parent_lane(_walk_slots(iv_table, lpos, i, i0, M, ok, i0 < E, False, S_FULL, UNIFORM),
+                                      b[:, None], ~l_own, coff, count, crank, kl, t0, i0[None, :], t, ir, m1, B, n, W,
+                                      MARS)
                     lv = tl.load(lp[:, None] + sl, mask = m1 & (sl >= 0), other = float("-inf"))   # L[i0, i]
                     m2 = (ok & (q >= 0))[:, None] & (i0 < E)[None, :]
                     so = _parent_lane(_slot(iv_table, opos, i0[None, :], q[:, None], X, m2, OUT_FULL), b[:, None],
@@ -279,7 +287,8 @@ def _class_weight_kernel(dfa_class_flow, cw_base, cw_K, element_flows, temp_flow
                 rp, r_own = _block_ptr(tl.load(parents + p * 7 + 3), tl.load(parents + p * 7 + 4), node_mars,
                                        prior_mars, temp, reg_offset, reg_width, reg_first, prior_offset, prior_width,
                                        reg_prior, temp_width, S_KIND)
-                rp = rp + tl.where(r_own, b * RS, 0)
+                rp = rp + _parent_base(b, tl.where(r_own, RS, 0), MARS)
+                kr = tl.load(iv_of + (t + 1) * (n + 1) + t2)
             for ii in range(0, steps):
                 i, ok = _walk_column(columns, cstart, ccount, cm, ii, PRUNE, UNIFORM)
                 q = tl.load(next_col + (t * W + i) * C + cls, mask = ok, other = -1)
@@ -303,7 +312,9 @@ def _class_weight_kernel(dfa_class_flow, cw_base, cw_K, element_flows, temp_flow
                                           COMPACT)
                         ov = tl.load(op[:, None] + so, mask = mo & (so >= 0), other = float("-inf"))   # O_out[i, j]
                         m2 = (ok & (q >= 0))[:, None] & (j < X)[None, :]
-                        sr = _slot(iv_table, rpos, q[:, None], j[None, :], X, m2, S_FULL)
+                        sr = _parent_lane(_slot(iv_table, rpos, q[:, None], j[None, :], X, m2, S_FULL), b[:, None],
+                                          ~r_own, coff, count, crank, kr, t + 1, q[:, None], t2, j[None, :], m2, B, n,
+                                          W, MARS)
                         rv = tl.load(rp[:, None] + sr, mask = m2 & (sr >= 0), other = float("-inf"))   # R[next, j]
                         mx, acc = _lse_step(mx, acc, ov + rv)
     top = tl.max(mx, axis = 1)
@@ -319,7 +330,7 @@ CLASS_WEIGHT_LANES = 2048
 
 def run_class_weights(launches, cw: dict, prog, bufs, element_flows, temp_flows, node_mars, liveness, elem_first: int,
                       elem_width: int, B: int, prior: dict, once_iv: torch.Tensor, regions: dict, compact = None,
-                      tflow_width: Optional[int] = None):
+                      tflow_width: Optional[int] = None, inside: bool = False):
     """
     The class weights of one product layer stage's input operands at the query's target positions: every
     :class:`ClassWeightLaunch` in ``launches``, each with its plan's index list of destinations (None: all).
@@ -333,6 +344,8 @@ def run_class_weights(launches, cw: dict, prog, bufs, element_flows, temp_flows,
     :param compact: None, or the query's :class:`~.compact.CompactLayout`: the outputs' top-down values are compact,
         ``elem_width`` and ``tflow_width`` the widths of their rows (``regions``: the sum operands' inside values')
     :param tflow_width: the scratch rows' width in ``temp_flows`` (None: ``bufs``')
+    :param inside: whether the other operands' per-sample inside values are compact too (by ``compact``'s layout;
+        ``regions`` and ``bufs`` are their rows')
     """
     temp, temp_width = bufs
     tflow_width = temp_width if tflow_width is None else tflow_width
@@ -359,8 +372,8 @@ def run_class_weights(launches, cw: dict, prog, bufs, element_flows, temp_flows,
                 regions["first"], prior["offset"], prior["width"], prior["reg_prior"], elem_first, elem_width,
                 temp_width, tflow_width, B, n, W, C, first, BLOCK_INPUT = la.form == "block_input", S_KIND = s_kind,
                 OUT_TEMP = out_temp, PRUNE = prune, OUT_FULL = out_full, S_FULL = all(s_full),
-                INDEXED = idx is not None, UNIFORM = not prune or TB == 1, COMPACT = compact is not None, TB = TB,
-                TC = TC, TJ = TJ, num_warps = warps)
+                INDEXED = idx is not None, UNIFORM = not prune or TB == 1, COMPACT = compact is not None,
+                MARS = inside, TB = TB, TC = TC, TJ = TJ, num_warps = warps)
 
 
 # -------------------------------------------------------------------------------------------------

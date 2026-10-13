@@ -50,6 +50,10 @@ TRANSITION_BUDGET = 1 << 26
 #: (input row, position) columns of the steps whose input's transitions they read
 TRANS_COLS = {"input_block": (1, 2), "block_input": (4, 5)}
 
+#: the step fields of their outputs' entry and exit boundaries, and how far past that exit field the output ends (a
+#: ``block @ input`` step's ends after its input; see :mod:`~..kernels.prod`)
+OUT_ENDS = {"input_block": (2, 5, 0), "block_input": (3, 5, 1), "block_block": (5, 7, 0), "copy": (3, 4, 0)}
+
 
 class Program:
     """Everything the lifted forward pass of one backend reads besides buffers and parameters."""
@@ -269,7 +273,10 @@ class Program:
         else:
             steps = rows.to(dev, torch.int32).contiguous()
         E_max, X_max, S_max = (int(sizes[:, k].max()) for k in range(3))
-        return Launch(form, kinds, steps, E_max, X_max, S_max, rows, iv, sizes, groups_host)
+        a, e, past = OUT_ENDS[form]                                     # the outputs' intervals [a, e + past)
+        ends = set(zip(rows[:, a].tolist(), (rows[:, e] + past).tolist()))
+        out_ivs = np.unique(np.asarray([self.iv_index[iv] for iv in ends], dtype = np.int64))
+        return Launch(form, kinds, steps, E_max, X_max, S_max, rows, iv, sizes, groups_host, out_ivs)
 
     def transition_buffer(self) -> torch.Tensor:
         """Where the transition masses go (all of them, or one chunk's; allocated on first use, and again when a

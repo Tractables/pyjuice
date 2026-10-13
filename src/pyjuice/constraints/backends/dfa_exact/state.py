@@ -60,11 +60,12 @@ class State:
     # Buffers
     # ---------------------------------------------------------------------------------------------
 
-    def buffers(self, batch_size: int, inputs_only: bool = False) -> Dict[str, Any]:
+    def buffers(self, batch_size: int, inputs_only: bool = False, layout: Optional[dict] = None) -> Dict[str, Any]:
         """
         The lifted buffers for a batch of ``batch_size``, cut from storage this state owns
-        (:func:`~.tables.buffer_layout` says where every region sits); ``inputs_only``: ``node_mars`` holds the input
-        rows alone, for a query with no per-sample inside value of a sum region (its storage given up if larger).
+        (:func:`~.tables.buffer_layout` says where every region sits, or ``layout``: a query's compact one, see
+        :attr:`~.kernels.compact.CompactLayout.mars`); ``inputs_only``: ``node_mars`` holds the input rows alone, for
+        a query with no per-sample inside value of a sum region (its storage given up if larger).
 
         Each buffer has one backing storage, reused while it is large enough and at most 4 times larger than needed
         (so a loop whose batch size varies does not reallocate, and keeps its addresses), and filled with -inf only
@@ -77,7 +78,7 @@ class State:
         """
         B = int(batch_size)
         self.epoch += 1
-        layout = self.batch_layout(B)
+        layout = self.batch_layout(B) if layout is None else layout
         input_end = self._backend.input_range[1]
         node_mars = self.storage_view("node_mars", input_end * B if inputs_only else layout["node_size"])
         element_mars = self.storage_view("element_mars", layout["element_size"])
