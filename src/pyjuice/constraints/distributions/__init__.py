@@ -27,6 +27,8 @@ provides besides
 * ``KEYWORDS``: the keywords it reads;
 * ``check_inputs(layer, inputs) -> Optional[int]``: checks the layer's inputs (``inputs``: keyword -> value, those of
   ``KEYWORDS`` given) and returns their batch size, or None if the layer reads none of them;
+* optionally ``free_positions(layer, inputs, n) -> Optional[torch.Tensor]``: bool [batch, n], the PC's positions the
+  inputs leave free -- marginalized under them whatever a query's data holds there (None: none);
 * ``sample_rows(layer, inputs) -> int`` and ``sample_inputs(layer, classes, inputs, out) -> SampleInputs``: the class
   masses the inputs give its nodes, per sample, in ``sample_rows`` rows per sample written into ``out`` ([batch,
   rows, num_classes]);
@@ -43,6 +45,8 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
+import triton
+import triton.language as tl
 
 from pyjuice.nodes.distributions import Categorical, SoftEvidenceCategorical
 
@@ -50,23 +54,55 @@ from pyjuice.nodes.distributions import Categorical, SoftEvidenceCategorical
 @dataclass
 class SampleInputs:
     """
-    The class masses an input layer's nodes take from a query's per-sample inputs (see the module docstring), in a
-    table of their own per sample: node ``i`` of the layer reads row ``rows[i]`` of sample ``b``'s (sample 0's for
-    every sample when ``batch`` is 1), a token class's mass at every row -- where the layer's other values (an observed
-    token's log-probability, :func:`input_values`) need more of what the inputs give, ``data``.
+    What an input layer's nodes take from a query's per-sample inputs (see the module docstring). The inputs reweight
+    every token: at node ``i`` of sample ``b`` the token distribution is ``q(v) = p_i(v) w(v) / Z``, ``w`` the inputs'
+    weights there. Its class masses are in a table of their own per sample: node ``i`` reads row ``rows[i]`` of sample
+    ``b``'s (sample 0's for every sample when ``batch`` is 1), a token class's mass ``log sum_{v in c} q(v)`` at every
+    row, and ``log Z`` per row besides; the weights ``log w`` are in ``token_logw``, node ``i`` at row
+    ``token_rows[i]`` -- of the first ``K`` tokens, or of the tokens ``token_ids`` lists (:func:`find_token` finds
+    one). Where the layer's other values (an observed token's log-probability, ``input_values``) need more, ``data``.
 
     :ivar masses: [batch, rows, num_classes] fp32, log
     :ivar rows: int64 [nodes of the layer], every node's row
+    :ivar logz: [batch, rows] fp32, every row's ``log Z``: its masses are ``log sum_{v in c} p(v) w(v) - log Z`` (0
+        where nothing weighs, the masses -inf -- or where they are unnormalized: a token there weighs ``p(v) w(v)``)
+    :ivar token_logw: [batch, weight rows, K] fp32, ``log w`` of the first ``K`` tokens, or of ``token_ids``' (the
+        others weigh nothing)
+    :ivar token_rows: int64 [nodes of the layer], every node's row of ``token_logw``
     :ivar batch: the inputs' batch size
     :ivar variables: int64, the PC's variables whose input nodes read them
+    :ivar token_ids: None, or int32 [batch, weight rows, K], ascending in every row (distinct): the tokens
+        ``token_logw`` weighs
     :ivar data: what the distribution's module keeps besides (its own)
     """
 
     masses: torch.Tensor
     rows: torch.Tensor
+    logz: torch.Tensor
+    token_logw: torch.Tensor
+    token_rows: torch.Tensor
     batch: int
     variables: torch.Tensor
+    token_ids: Optional[torch.Tensor] = None
     data: Any = None
+
+
+@triton.jit
+def find_token(ids, base, K, v, mask, STEPS: tl.constexpr):
+    """Lane-wise, where token ``v`` is in the ascending run ``ids[base : base + K]`` (``SampleInputs.token_ids``' rows):
+    its index in the run, or -1 if it is not there (or the lane is masked). A binary search, ``STEPS`` (at least ``K``'s
+    bit length) halvings."""
+    lo = tl.zeros_like(base)
+    left = tl.zeros_like(base) + K                                          # candidates left from lo on
+    for _ in tl.static_range(STEPS):
+        half = left // 2
+        live = left > 0
+        right = live & (tl.load(ids + base + lo + half, mask = mask & live, other = 0) < v)
+        lo = tl.where(right, lo + half + 1, lo)
+        left = tl.where(right, left - half - 1, half)
+    hit = mask & (lo < K)
+    found = tl.load(ids + base + lo, mask = hit, other = -1) == v
+    return tl.where(hit & found, lo, -1)
 
 
 class TokenClasses:

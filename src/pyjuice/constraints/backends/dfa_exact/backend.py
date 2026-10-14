@@ -234,7 +234,7 @@ class DFAExactBackend(Backend):
         checked against the PC by the input distributions that read them (their modules' ``check_inputs``)."""
         if inputs.get("sum_external_params") is not None:
             raise NotImplementedError("`sum_external_params` is not supported under a constraint yet.")
-        batches, layers, read = set(), [], set()
+        batches, layers, read, frees = set(), [], set(), []
         variables = np.zeros(self.n, dtype = bool)
         for k, layer in enumerate(self.pc.input_layer_group):
             module = distributions.lookup(layer.dist)
@@ -245,12 +245,17 @@ class DFAExactBackend(Backend):
                 layers.append(k)
                 read |= set(given)
                 variables[layer.vids.view(-1).cpu().numpy()] = True
+                if hasattr(module, "free_positions"):
+                    frees.append(module.free_positions(layer, given, self.n))
         unread = [key for key in inputs if key not in read]
         if unread:
             raise ValueError(f"No input layer of the PC reads {', '.join(f'`{key}`' for key in unread)}.")
         if len(batches) > 1:
             raise ValueError(f"The per-sample inputs have different batch sizes: {sorted(batches)}.")
-        return ExternalInputs(dict(inputs), batches.pop(), tuple(layers), variables)
+        frees = [f for f in frees if f is not None]
+        free = None if not frees else torch.stack(torch.broadcast_tensors(*frees)).any(dim = 0)
+        return ExternalInputs(dict(inputs), batches.pop(), tuple(layers), variables, free = free,
+                              free_host = None if free is None else free.cpu().numpy())
 
     def marginal(self, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None,
                  precision: str = "fp32", storage: str = "auto",
@@ -280,12 +285,12 @@ class DFAExactBackend(Backend):
             automaton states, or under evidence only of each sample's live ones (far less memory when the evidence pins
             the automaton down, as a decoded prefix does; more where it joins few of them); "auto" picks the one whose
             buffers are smaller, per query
+        :param external: a decoder session's per-sample inputs (:meth:`external_inputs`)
         """
-        if external is not None:
-            raise NotImplementedError("Conditionals under per-sample inputs are not supported yet (marginals are).")
         from .queries.conditional import conditional
         return conditional(self, data, missing_mask, targets, precision = precision,
-                           return_log_marginal = return_log_marginal, candidates = candidates, storage = storage)
+                           return_log_marginal = return_log_marginal, candidates = candidates, storage = storage,
+                           external = external)
 
     def decoder(self, cc, **options):
         """A decoding session over ``cc`` whose queries reuse what the previous one computed where the evidence did

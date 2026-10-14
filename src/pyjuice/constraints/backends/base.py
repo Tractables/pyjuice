@@ -74,7 +74,9 @@ class Backend(ABC):
     def external_inputs(self, inputs: Dict[str, Any]):
         """The per-sample inputs of a decoder's session (``inputs``: keyword -> value, as ``pc(x, ...)`` takes them,
         see :meth:`~pyjuice.constraints.ConstrainedCircuit.decoder`), checked against the PC: what the backend's
-        queries take as ``external``."""
+        queries take as ``external``. Where the inputs leave positions free (marginalized under their weights whatever
+        a query's data holds there, as a soft evidence's value mask does), it has ``free``: bool [batch or 1, n], which
+        the decoder adds to every query's missing positions."""
         raise NotImplementedError(f"The {self.name} backend does not take per-sample inputs ({', '.join(inputs)}).")
 
     def decoder(self, cc, **options):

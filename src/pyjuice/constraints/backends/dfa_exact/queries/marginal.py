@@ -35,7 +35,7 @@ def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] =
     :param carry: compact, where the inside values ``held`` marks are (see :func:`~.conditional.conditional`)
     :param external: None, or a decoder session's per-sample inputs (:class:`~..state.ExternalInputs`): their
         variables count as observed when they differ per row (a batch of 1: the values over them are every sample's,
-        kept once for the session as the class masses that give them)
+        kept once for the session as the class masses that give them); the positions they leave free are missing
     :returns: [B, number of root nodes], as :func:`pyjuice.queries.marginal`
     """
     if precision not in PRECISIONS:
@@ -58,6 +58,8 @@ def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] =
 
     prog = backend.program()
     missing = missing_tensor(missing_mask, B, n, dev)
+    if external is not None and external.free is not None:             # (a decoder's queries have them already)
+        missing, missing_mask = missing | external.free, True
     observed = np.ones(n, dtype = bool) if missing_mask is None else \
         (~missing).any(dim = 0).cpu().numpy()                           # the positions some sample observes
     if external is not None and external.batch > 1:

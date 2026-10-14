@@ -195,12 +195,24 @@ class Decoder:
 
     def _evidence(self, data, missing_mask, mask_id: Optional[int]):
         """The canonical evidence (:func:`~pyjuice.constraints.evidence.evidence`); on the host if the decoder
-        remembers it (copied there as given)."""
+        remembers it (copied there as given). The positions the session's per-sample inputs leave free (``free``, see
+        :meth:`~.backends.base.Backend.external_inputs`) are missing too: marginalized, whatever ``data`` holds."""
         mask_id = self._defaults.get("mask_id", -1) if mask_id is None else mask_id
         if self.remembers:
             data = torch.as_tensor(data).cpu()
             missing_mask = None if missing_mask is None else torch.as_tensor(missing_mask).cpu()
-        return evidence(data, missing_mask, mask_id, self.cc.n)
+        data, missing = evidence(data, missing_mask, mask_id, self.cc.n)
+        free = getattr(self._external, "free", None)
+        if free is None or free.size(0) not in (1, missing.size(0)):         # (a wrong batch: the query says so)
+            return data, missing
+        host = getattr(self._external, "free_host", None)
+        free = torch.from_numpy(host) if host is not None and missing.device.type == "cpu" else free.to(missing.device)
+        if (missing & free).any():
+            raise ValueError("Positions marked missing are left free by the decoder's per-sample inputs too (a soft "
+                             "evidence's `soft_evidence_value_mask` False there): a missing token contributes 1 "
+                             "whatever its weights, as in `pc(x, missing_mask = ...)`, a free one the sum of its "
+                             "weights -- mark each position one way.")
+        return data, missing | free
 
     def _remember(self, data: torch.Tensor, missing: torch.Tensor):
         if self.remembers:

@@ -79,6 +79,36 @@ def _layout(backend, positions: np.ndarray, B: int):
     return groups, base, K, size
 
 
+def _sample_columns(masses, nodes: np.ndarray, B: int, dev) -> Optional[dict]:
+    """:func:`~..kernels.score.score_group`'s ``sample`` for a row group's target positions, whose input nodes are
+    ``nodes`` (int64 [positions, rows of the group], host; -1 for none): None unless per-sample inputs reweight them.
+    Every node over a position reweighted by the same weights (or none of them reweighted), the column of sample ``b``
+    of the ``p``-th position reads its rows and weights."""
+    if masses.lognorm is None:
+        return None
+    at = np.where(nodes >= 0, nodes, 0)
+    tr = np.where(nodes >= 0, masses.token_row_host[at], -2)               # -2: no node
+    real = tr != -2
+    first = np.where(real.any(axis = 1), tr[np.arange(len(tr)), real.argmax(axis = 1)], -1)
+    if not (np.where(real, tr, first[:, None]) == first[:, None]).all() or \
+            (masses.token_ids is not None and (first < 0).any() and (first >= 0).any()):
+        raise NotImplementedError("Conditionals at a position whose input nodes are reweighted by different per-sample "
+                                  "inputs (or some only) are not supported.")
+    if (first < 0).all():
+        return None
+    P, K = nodes.shape
+    nd = torch.from_numpy(at).to(dev)
+    b = torch.arange(B, device = dev)
+    rows = masses.row[nd].long()[:, None, :]                                 # [P, 1, K]
+    if masses.stride is not None:
+        rows = rows + b[None, :, None] * masses.stride[nd].long()[:, None, :]
+    off = torch.from_numpy(first).to(dev)[:, None]
+    offset = torch.where(off >= 0, (off + b[None, :] * masses.token_stride) * masses.token_width, -1)
+    return dict(rows = rows.expand(P, B, K).reshape(P * B, K).contiguous(), lognorm = masses.lognorm,
+                logw = masses.token_logw, offset = offset.reshape(P * B).contiguous(), width = masses.token_width,
+                ids = masses.token_ids)
+
+
 def _check(backend, data: torch.Tensor, precision: str, storage: str = "dense"):
     if precision not in F.PRECISIONS:
         raise ValueError(f"`precision` must be one of {sorted(F.PRECISIONS)}, got {precision!r}.")
@@ -93,7 +123,8 @@ def _check(backend, data: torch.Tensor, precision: str, storage: str = "dense"):
 
 def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions: np.ndarray, precision: str = "fp32",
                   held: Optional[dict] = None, observed: Optional[np.ndarray] = None, layout = None,
-                  report: Optional[dict] = None, storage: str = "auto", carry: Optional[dict] = None):
+                  report: Optional[dict] = None, storage: str = "auto", carry: Optional[dict] = None,
+                  external = None):
     """
     The forward and top-down passes of a conditional query: the log class weights of every input node over the
     target ``positions`` (bool [n], host), every sample's, summed per row of the class masses (see
@@ -111,6 +142,7 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
         host wait for the stream
     :param storage: see :func:`conditional`
     :param carry: see :func:`conditional`
+    :param external: see :func:`conditional`
     :returns: ``(groups, masses)``: per row group with a target position, ``(group, its target positions (host),
         weights [positions x B, classes, rows of the group])`` (sample ``b`` of the ``p``-th position: column ``p * B +
         b``), and the class masses the query read (:class:`~..state.ClassMasses`)
@@ -124,13 +156,15 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     groups, size, (base, K) = layout
     if observed is None:
         observed = (~missing).any(dim = 0).cpu().numpy()
+    if external is not None and external.batch > 1:                         # values over them differ per sample
+        observed = observed | external.variables
     x = torch.where(missing, 0, data.to(dev).long())                          # missing tokens: any valid id
     held = held or {}
     obs_class = torch.where(missing, -1, backend.token_classes.token_class[x]).contiguous()
     # compact, a query needs its liveness even with nothing observed: every column is live, but only the regions it
     # computes per sample get rows (none, every value input-independent, inside fast_inference)
     lv = liveness(prog, obs_class, B) if observed.any() or storage != "dense" else None
-    masses = backend.state.masses()
+    masses = backend.state.masses(external)
     valid, kept = backend.state.prior_validity(masses.version)
     prior = prior_regions(prog, observed, B, kept, lv)
     pf = backend.state.prior_flows(np.zeros(len(backend.sum_regions), dtype = bool))
@@ -183,7 +217,7 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
 def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None,
                 targets: Optional[torch.Tensor] = None, precision: str = "fp32", return_log_marginal: bool = False,
                 held: Optional[dict] = None, candidates: Optional[torch.Tensor] = None, report: Optional[dict] = None,
-                storage: str = "auto", carry: Optional[dict] = None):
+                storage: str = "auto", carry: Optional[dict] = None, external = None):
     """
     ``log p(x_t = v | e, C)`` for every target ``(b, t)`` and token ``v`` (or candidate ``v``): one row per target, in
     the order ``dense[targets]`` lists them (sample by sample, positions in order); -inf rows where ``p(e, C) = 0``.
@@ -216,11 +250,20 @@ def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor
         :class:`~..kernels.compact.CompactLayout`), the regions whose inside (``inside``) and top-down (``regions``)
         values it holds (bool [sum regions] each) and every row's ``parents`` there (int64 [B] on the device); they are
         re-gathered (:func:`~..kernels.compact.regather`)
+    :param external: None, or a decoder session's per-sample inputs (:class:`~..state.ExternalInputs`), e.g. soft
+        evidence: every input node's tokens then weigh ``q(v) = p(v) w(v) / Z`` -- a target's too (or ``p(v) w(v)`` at
+        a position its value mask leaves free: missing too, so a target may be there)
     :returns: [rows, V], or [rows, k] with ``candidates``
     """
     _check(backend, data, precision, storage)
     n, dev = backend.n, backend.device
     B = data.size(0)
+    if external is not None and external.batch not in (1, B):
+        raise ValueError(f"The decoder's per-sample inputs have a batch of {external.batch}: a query's must be the "
+                         f"same (or theirs 1), got {B}.")
+    if external is not None and external.free is not None:                 # (a decoder's queries have them already)
+        miss = np.zeros((B, n), dtype = bool) if missing_mask is None else _host_mask(missing_mask, B, n, "missing_mask")
+        missing_mask = torch.from_numpy(miss | external.free_host)
     miss, tgt = _masks(missing_mask, targets, B, n)                          # on the host: the query's one wait
     V = backend.token_classes.token_class.numel()
     width = V if candidates is None else candidates.size(2)
@@ -249,14 +292,18 @@ def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor
         layout = (groups, size, (tables[starts[0]:starts[0] + n], tables[starts[1]:starts[1] + n]))
         groups, masses = class_weights(backend, data, missing, positions, precision, held,
                                        observed = (~miss).any(axis = 0), layout = layout, report = report,
-                                       storage = storage, carry = carry)
-        out = torch.empty(M, width, device = dev)
+                                       storage = storage, carry = carry, external = external)
+        if masses.token_ids is not None and cand is None:                   # top-k weights: only theirs are written
+            out = torch.full((M, width), -float("inf"), device = dev)
+        else:
+            out = torch.empty(M, width, device = dev)
         log_marginal = torch.empty(M + 1, device = dev) if return_log_marginal else None
         for (g, pos, w), start in zip(groups, starts[2:]):
             out_row = tables[start:start + len(pos) * B]
             table = backend.state.token_table(g, score.rows[g])
             logz = score_group(out, table, w, score.rows_t[g], masses.table, out_row, backend.token_classes,
-                               F.PRECISIONS[precision], candidates = cand)
+                               F.PRECISIONS[precision], candidates = cand,
+                               sample = _sample_columns(masses, score.nodes[g][pos], B, dev))
             if log_marginal is not None:
                 log_marginal[torch.where(out_row >= 0, out_row, M)] = logz
     return (out, log_marginal[:M]) if return_log_marginal else out

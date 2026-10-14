@@ -45,12 +45,17 @@ class ExternalInputs:
     :ivar batch: their batch size: every query's, or 1 (every row reads the same)
     :ivar layers: the input layers that read them (indices into the PC's input layer group)
     :ivar variables: bool [n] (host): the variables whose input nodes read them
+    :ivar free: None, or bool [batch or 1, n] on the device: the positions they leave free -- marginalized under the
+        inputs' weights whatever ``data`` holds there (a soft evidence's value mask False), which a query must not
+        mark missing besides; ``free_host`` the same on the host
     """
 
     inputs: Dict[str, Any]
     batch: int
     layers: tuple
     variables: np.ndarray
+    free: Optional[torch.Tensor] = None
+    free_host: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -66,6 +71,15 @@ class ClassMasses:
         follows it)
     :ivar sample: per input layer (index in the PC's input layer group) that reads per-sample inputs, its
         :class:`~pyjuice.constraints.distributions.SampleInputs`
+    :ivar lognorm: None, or under per-sample inputs fp32 [rows of ``table``]: every row's ``log Z`` (0 for rows of no
+        input's): the rows are the class masses of a token distribution ``q = p w / Z``
+    :ivar token_logw, token_row, token_stride, token_width: under per-sample inputs, the tokens' weights ``log w``:
+        node ``u`` of sample ``b`` weighs token ``v < token_width`` ``token_logw[(token_row[u - input_start] + b *
+        token_stride) * token_width + v]`` (fp32, flat), the others nothing; ``token_row`` int64 on the device (-1: a
+        node no input reweights), and on the host as ``token_row_host``
+    :ivar token_ids: None, or (top-k) int32, flat as ``token_logw``: the tokens the weights are of, ascending in every
+        row of ``token_width`` (see :func:`~pyjuice.constraints.distributions.find_token`) -- token ``token_ids[i]``
+        weighs ``token_logw[i]``, the others nothing
     """
 
     table: torch.Tensor
@@ -74,6 +88,13 @@ class ClassMasses:
     batch: int
     version: int
     sample: Dict[int, Any]
+    lognorm: Optional[torch.Tensor] = None
+    token_logw: Optional[torch.Tensor] = None
+    token_row: Optional[torch.Tensor] = None
+    token_row_host: Optional[np.ndarray] = None
+    token_stride: int = 0
+    token_width: int = 0
+    token_ids: Optional[torch.Tensor] = None
 
 
 class State:
@@ -308,7 +329,9 @@ class State:
         full = torch.empty(table.size(0) + Be * sum(sizes), C, dtype = table.dtype, device = self._device)
         full[:table.size(0)] = table                                    # the other nodes' rows first
         row, stride = mass_row.clone(), torch.zeros_like(mass_row)
-        num_rows, sample = table.size(0), {}
+        lognorm = torch.zeros(full.size(0), dtype = torch.float32, device = self._device)
+        token_row = torch.full(mass_row.shape, -1, dtype = torch.int64, device = self._device)
+        num_rows, sample, logw, ids, num_wrows = table.size(0), {}, [], [], 0
         for k, layer, rows_s in zip(external.layers, layers, sizes):
             out = full[num_rows:num_rows + Be * rows_s].view(Be, rows_s, C)
             si = lookup(layer.dist).sample_inputs(layer, be.token_classes, external.inputs, out)
@@ -316,10 +339,21 @@ class State:
             row[first - input_start:end - input_start] = (num_rows + si.rows).to(torch.int32)
             if Be > 1:
                 stride[first - input_start:end - input_start] = rows_s
-            num_rows += Be * rows_s
+            lognorm[num_rows:num_rows + Be * rows_s] = si.logz.reshape(-1)
+            token_row[first - input_start:end - input_start] = num_wrows + si.token_rows
+            logw.append(si.token_logw)
+            ids.append(si.token_ids)
+            num_rows, num_wrows = num_rows + Be * rows_s, num_wrows + si.token_logw.size(1)
             sample[k] = si
+        if len({w.size(2) for w in logw}) > 1 or len({i is None for i in ids}) > 1:
+            raise NotImplementedError("Per-sample inputs weighing different numbers of tokens in different input "
+                                      "layers (or listing the tokens in some only) are not supported.")
+        cat = lambda ts: (ts[0] if len(ts) == 1 else torch.cat(ts, dim = 1)).contiguous().view(-1)
         self.class_mars_version += 1
-        masses = ClassMasses(full, row, stride if Be > 1 else None, Be, self.class_mars_version, sample)
+        masses = ClassMasses(full, row, stride if Be > 1 else None, Be, self.class_mars_version, sample,
+                             lognorm = lognorm, token_logw = cat(logw), token_row = token_row,
+                             token_row_host = token_row.cpu().numpy(), token_stride = num_wrows if Be > 1 else 0,
+                             token_width = logw[0].size(2), token_ids = None if ids[0] is None else cat(ids))
         self._session = (external, self._class_mars_at, masses)
         if is_active():
             register_layer(self)                                # its exit calls `_release_fast_inference_params`

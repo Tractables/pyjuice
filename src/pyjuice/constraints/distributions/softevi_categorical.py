@@ -10,6 +10,18 @@ p(v) w(v)``: an observed token's value is ``log q(d)`` (the library's forward), 
 are ``log sum_{v in c} q(v)`` -- they sum to 1 over the classes, as the library's 0 for a missing token. They depend on
 the sample, the variable and the node's row: :func:`sample_inputs` computes them once for a decoder's session, a row
 per (variable, row) pair some node reads, in one pass over the parameter table.
+
+Top-k soft evidence, ``soft_evidence_cat_ids`` besides (int [batch, the layer's variables, K], distinct per row): token
+``ids[b, i, k]`` weighs ``exp(E[b, i, k])``, the others nothing -- an observed token that is not a candidate is
+impossible (-inf), as in the library. The pass then reads only the candidates' probabilities, from the library's
+transposed table where a :func:`pyjuice.fast_inference` scope keeps one (as the library's top-k forward does).
+
+A value mask, ``soft_evidence_value_mask`` (bool [batch, the layer's variables]), makes the library's unnormalized
+model: where True, an observed token's value is ``log p(d) w(d)`` (no ``Z``); where False, the token is ignored and the
+value is ``log Z`` -- the sum over every token of ``p(v) w(v)``, so under a constraint the position is free
+(:func:`free_positions`: marginalized, its tokens weighed by ``p w``), with class masses ``log sum_{v in c} p(v) w(v)``.
+A missing token's masses stay ``q``'s, wherever the mask is True (a position cannot be missing and False: the library's
+missing token contributes 1 whatever the mask, a False one ``Z``).
 """
 
 import weakref
@@ -22,11 +34,11 @@ import triton.language as tl
 from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
-from . import SampleInputs
+from . import SampleInputs, find_token
 from .categorical import class_mass_rows, class_masses, num_values, token_probs
 
 __all__ = ["KEYWORDS", "num_values", "class_mass_rows", "class_masses", "token_probs", "check_inputs",
-           "sample_rows", "sample_inputs", "input_values"]
+           "free_positions", "sample_rows", "sample_inputs", "input_values"]
 
 #: the keywords of ``pc(x, ...)`` the distribution reads
 KEYWORDS = ("categorical_evidence_logp", "soft_evidence_cat_ids", "soft_evidence_value_mask")
@@ -39,18 +51,21 @@ MASS_TILES = dict(TU = 32, TN = 32, TV = 64)
 MASS_PROGRAMS = 1024
 #: ... and keeps every split's partial sums only while they take at most this many floats (beyond, fewer splits)
 MASS_PARTIAL_BUDGET = 1 << 26
+#: the top-k pass's tiles (:func:`_topk_kernel`): rows of the parameter table and candidates per product, and the most
+#: classes per program (more: the candidates sorted by tile of classes, a tile at a time)
+TOPK_TILES = dict(TU = 32, TK = 64, TC = 64)
 
 
 def check_inputs(layer, inputs: dict):
     """The batch size of the layer's soft evidence in ``inputs`` (see :data:`KEYWORDS`), or None if it has none."""
-    for key in ("soft_evidence_cat_ids", "soft_evidence_value_mask"):
-        if inputs.get(key) is not None:
-            raise NotImplementedError(f"`{key}` is not supported under a constraint yet: only dense soft evidence "
-                                      f"(`categorical_evidence_logp` alone) is.")
-    ev = inputs.get("categorical_evidence_logp")
+    ev, ids = inputs.get("categorical_evidence_logp"), inputs.get("soft_evidence_cat_ids")
+    vm = inputs.get("soft_evidence_value_mask")
     if ev is None:
+        for key, value in (("soft_evidence_cat_ids", ids), ("soft_evidence_value_mask", vm)):
+            if value is not None:
+                raise ValueError(f"`{key}` needs `categorical_evidence_logp`: the tokens' log-weights.")
         return None
-    num_vars = int(torch.unique(layer.vids.view(-1)).numel())
+    num_vars = _num_vars(layer)
     if not torch.is_tensor(ev) or ev.dim() != 3 or not ev.is_floating_point():
         raise ValueError(f"`categorical_evidence_logp` must be a float tensor [batch, {num_vars}, K], got "
                          f"{type(ev).__name__ if not torch.is_tensor(ev) else list(ev.shape)}.")
@@ -60,32 +75,93 @@ def check_inputs(layer, inputs: dict):
         raise ValueError(f"`categorical_evidence_logp` must be [batch, {num_vars}, K] with K <= "
                          f"{layer.dist.num_cats} (the SoftEvidenceCategorical layer's variables and values), got "
                          f"{list(ev.shape)}.")
-    return int(ev.size(0))
+    if ids is not None:
+        if not torch.is_tensor(ids) or ids.shape != ev.shape or ids.is_floating_point() or ids.dtype == torch.bool:
+            raise ValueError(f"`soft_evidence_cat_ids` must be an integer tensor of `categorical_evidence_logp`'s shape "
+                             f"{list(ev.shape)}, got {type(ids).__name__ if not torch.is_tensor(ids) else ids.dtype} "
+                             f"{list(ids.shape) if torch.is_tensor(ids) else ''}.")
+        if ids.device != ev.device:
+            raise ValueError(f"`soft_evidence_cat_ids` is on {ids.device}, `categorical_evidence_logp` on {ev.device}.")
+        s = torch.sort(ids[:, :num_vars], dim = 2).values                  # the rows the layer reads
+        if bool(((s[..., 1:] == s[..., :-1]).any(dim = 2) | (s[..., 0] < 0) |
+                 (s[..., -1] >= layer.dist.num_cats)).any()):
+            raise ValueError(f"`soft_evidence_cat_ids` must list distinct tokens in [0, {layer.dist.num_cats}) for every "
+                             f"sample and variable (as `torch.topk` gives them).")
+    if vm is None:
+        return int(ev.size(0))
+    if not torch.is_tensor(vm) or vm.dtype != torch.bool or vm.dim() != 2 or vm.size(1) < num_vars or \
+            vm.size(0) not in (1, ev.size(0)) and ev.size(0) != 1:
+        raise ValueError(f"`soft_evidence_value_mask` must be a bool tensor [batch, {num_vars}], its batch the "
+                         f"evidence's ({ev.size(0)}) or either's 1, got "
+                         f"{type(vm).__name__ if not torch.is_tensor(vm) else f'{vm.dtype} {list(vm.shape)}'}.")
+    if vm.device != ev.device:
+        raise ValueError(f"`soft_evidence_value_mask` is on {vm.device}, `categorical_evidence_logp` on {ev.device}.")
+    return max(int(ev.size(0)), int(vm.size(0)))
+
+
+def free_positions(layer, inputs: dict, n: int):
+    """bool [batch, n]: the PC's positions the layer's value mask leaves free (False there: the token is ignored and
+    marginalized under the evidence's weights, see the module docstring); None without a value mask."""
+    vm = inputs.get("soft_evidence_value_mask")
+    if vm is None:
+        return None
+    vids = torch.unique(layer.vids.view(-1)).to(vm.device)
+    free = torch.zeros(vm.size(0), n, dtype = torch.bool, device = vm.device)
+    free[:, vids] = ~vm[:, layer.var_idmapping.to(vm.device)[vids]]
+    return free
 
 
 def sample_rows(layer, inputs: dict) -> int:
     """The rows per sample of :func:`sample_inputs`' masses: the (variable, parameter row) pairs the nodes read."""
-    return _structure(layer, inputs["categorical_evidence_logp"].size(1))["num_pairs"]
+    return _structure(layer, _num_vars(layer))["num_pairs"]
 
 
 def sample_inputs(layer, classes, inputs: dict, out: torch.Tensor) -> SampleInputs:
     """
     The class masses the layer's soft evidence gives its nodes (see the module docstring), into ``out`` [batch,
     :func:`sample_rows`, num_classes]: a row per (variable, parameter row) pair some node reads, per sample, ``log
-    sum_{v in c} p(v) w(v) - log Z``, with ``log Z`` per row and sample in ``data`` (what an observed token's value
-    subtracts, :func:`input_values`). One pass over the parameter table: every row is read once for all the variables
-    it serves (tied rows: every variable), every token class's tokens against the evidence of those variables, fp32
-    -- split over the tokens for enough programs, each split's sums kept apart while they fit
-    :data:`MASS_PARTIAL_BUDGET`, else in one split, written straight.
+    sum_{v in c} p(v) w(v) - log Z``, with ``log Z`` per row and sample (what an observed token's value subtracts,
+    :func:`input_values`) and the evidence as the tokens' weights (a node's variable its row; top-k: the candidates
+    sorted, see :class:`~pyjuice.constraints.distributions.SampleInputs`). One pass, fp32: every row of the parameter
+    table read once for all the variables it serves (tied rows: every variable) -- dense evidence: every token
+    class's tokens against the evidence of those variables (:func:`_dense_masses`); top-k: every variable's
+    candidates alone (:func:`_topk_masses`). Under a value mask, rows of a sample and variable it marks False keep
+    the masses unnormalized (``log Z`` 0: a free position's tokens weigh ``p w``).
     """
-    ev = inputs["categorical_evidence_logp"].float().contiguous()
-    Be, Vl, K = ev.shape
+    Vl = _num_vars(layer)                                                   # the rows of the evidence the layer reads
+    ids, vm = inputs.get("soft_evidence_cat_ids"), inputs.get("soft_evidence_value_mask")
+    Be = max(inputs["categorical_evidence_logp"].size(0), 1 if vm is None else vm.size(0))   # (a mask per sample
+    ev = inputs["categorical_evidence_logp"][:, :Vl].float().expand(Be, -1, -1).contiguous()  # over shared evidence)
+    ids = None if ids is None else ids[:, :Vl].expand(Be, -1, -1)
     st = _structure(layer, Vl)
-    C = classes.num_classes
-    dev = ev.device
     # the evidence's shift per (sample, variable): the max weight scales to 1 (a row of -inf weighs nothing anyway)
     shift = ev.amax(dim = 2)
     shift = torch.where(torch.isfinite(shift), shift, 0.0).contiguous()
+    if ids is None:
+        _dense_masses(layer, classes, ev, shift, st, out)
+    else:                                                                   # ascending: what the lookups search
+        ids, order = torch.sort(ids.to(torch.int32), dim = 2)
+        ev = torch.gather(ev, 2, order)
+        _topk_masses(layer, classes, inputs, ev, ids, shift, st, out)
+    logz = torch.logsumexp(out, dim = 2)
+    logz = torch.where(torch.isfinite(logz), logz, 0.0)
+    if vm is not None:                                                      # False: unnormalized (a free position)
+        logz = torch.where(vm[:, :Vl].expand(Be, -1)[:, st["pair_lv"].long()], logz, 0.0)
+    logz = logz.contiguous()
+    out -= logz[:, :, None]                                                 # q's classes: they sum to one
+    return SampleInputs(masses = out, rows = st["node_rows"], logz = logz, token_logw = ev,
+                        token_rows = _lvid32(layer).long(), batch = Be, variables = st["variables"],
+                        token_ids = None if ids is None else ids.contiguous(),
+                        data = None if vm is None else dict(value_mask = True))
+
+
+def _dense_masses(layer, classes, ev, shift, st, out):
+    """:func:`sample_inputs`' masses under dense evidence, before ``log Z``: every row's tokens in class order against
+    every variable's evidence -- split over the tokens for enough programs, each split's sums kept apart while they
+    fit :data:`MASS_PARTIAL_BUDGET`, else in one split, written straight."""
+    Be, Vl, K = ev.shape
+    C = classes.num_classes
+    dev = ev.device
     cols, tiles = _columns(st, Be, dev)
     tc, TV = MASS_TILES, MASS_TILES["TV"]
     tokens, tile_rank, class_rank, rank_class = _class_runs(classes, TV)
@@ -111,17 +187,51 @@ def sample_inputs(layer, classes, inputs: dict, out: torch.Tensor) -> SampleInpu
         TS, TC = 32, max(16, min(64, host_next_power_of_2(C)))
         _combine_kernel[(host_cdiv(R_s, TS) * host_cdiv(C, TC), Be)](
             part, out, shift, st["pair_lv"], class_rank, seg_lo, seg_hi, Vl, Be, R_s, C, TS = TS, TC = TC)
-        del part
-    logz = torch.logsumexp(out, dim = 2)
-    out -= torch.where(torch.isfinite(logz), logz, 0.0)[:, :, None]         # q's classes: they sum to one
-    return SampleInputs(masses = out, rows = st["node_rows"], batch = Be, variables = st["variables"],
-                        data = dict(ev = ev, logz = logz.contiguous()))
+
+
+def _topk_masses(layer, classes, inputs, ev, ids, shift, st, out):
+    """:func:`sample_inputs`' masses under top-k evidence (``ids`` the candidates, ``ev`` their log-weights), before
+    ``log Z``: every row's probabilities of every variable's candidates, a program per (tile of rows, variable and
+    sample) -- the classes ``TC`` at a time, the candidates sorted by tile of classes where there are more."""
+    Be, Vl, K = ev.shape
+    C, num_cats = classes.num_classes, layer.dist.num_cats
+    dev = ev.device
+    cols, tiles = _columns(st, Be, dev)
+    TU, TK = TOPK_TILES["TU"], TOPK_TILES["TK"]
+    TC = max(16, min(TOPK_TILES["TC"], host_next_power_of_2(C)))
+    NCT = host_cdiv(C, TC)
+    bounds = shift                                                          # (unread with one tile of classes)
+    if NCT > 1:
+        ctile = (classes.token_class[ids.long()] // TC).long()
+        order = torch.argsort(ctile * num_cats + ids, dim = 2)
+        ids, ev, ctile = (torch.gather(a, 2, order).contiguous() for a in (ids, ev, ctile))
+        at = torch.arange(NCT + 1, device = dev).expand(Be * Vl, NCT + 1).contiguous()
+        bounds = torch.searchsorted(ctile.view(Be * Vl, K), at).to(torch.int32).contiguous()
+    table = layer.params.view(-1, num_cats)
+    table_t = _transposed_table(layer, inputs)
+    _topk_kernel[(tiles.size(0), MASS_TILES["TN"])](
+        table, table if table_t is None else table_t, table.size(0), ev, ids, shift, classes.token_class, bounds,
+        st["rows"], cols, tiles, st["pair_index"], out, num_cats, K, Vl, st["num_pairs"], C, NCT,
+        TRANSPOSED = table_t is not None, BY_TILE = NCT > 1, TU = TU, TK = TK, TC = TC, num_warps = 4)
+
+
+def _transposed_table(layer, inputs):
+    """The layer's parameter table transposed ([num_cats, rows]), where the library keeps one for its top-k forward:
+    inside a :func:`pyjuice.fast_inference` scope that allows parameter copies (built on first use there); else
+    None."""
+    ensure = getattr(layer, "_ensure_fast_inference_params", None)
+    table = ensure(inputs) if ensure is not None else None
+    if table is None or table.dim() != 2 or table.size(0) != layer.dist.num_cats or \
+            table.numel() != layer.params.numel():
+        return None
+    return table
 
 
 def input_values(layer, x: torch.Tensor, missing: torch.Tensor, out: torch.Tensor, sample = None):
     """``log q(d)`` of every observed token ``d`` at every node of the layer, into its rows of ``out`` (0 where the
     token is missing): ``log p(d)``, and under soft evidence (``sample``, :func:`sample_inputs`') ``+ log w(d) - log
-    Z``."""
+    Z`` (top-k: -inf for a token that is not a candidate; under a value mask, True wherever a token is observed, no
+    ``Z``)."""
     B, n = x.shape
     first, end = layer._output_ind_range
     nodes = end - first
@@ -129,8 +239,10 @@ def input_values(layer, x: torch.Tensor, missing: torch.Tensor, out: torch.Tenso
     table = layer.params.view(-1, num_cats)
     prow = _rows32(layer)
     has_ev = sample is not None
+    topk = has_ev and sample.token_ids is not None
+    normalize = has_ev and not (sample.data or {}).get("value_mask", False)
     if has_ev:
-        ev, logz = sample.data["ev"], sample.data["logz"]
+        ev, logz = sample.token_logw, sample.logz
         lvid, srow, Be, Vl, K, R_s = _lvid32(layer), sample.rows.to(torch.int32), sample.batch, ev.size(1), \
             ev.size(2), sample.masses.size(1)
     else:
@@ -138,9 +250,10 @@ def input_values(layer, x: torch.Tensor, missing: torch.Tensor, out: torch.Tenso
         Be = Vl = K = R_s = 1
     TN, TB = 32, max(16, min(64, host_next_power_of_2(B)))
     _input_values_kernel[(host_cdiv(nodes, TN), host_cdiv(B, TB))](
-        out, table, x, missing.view(torch.uint8), layer.vids, prow, lvid, srow, ev, logz, first, nodes, B, n,
-        num_cats, Vl, K, R_s,
-        HAS_EV = has_ev, PER_SAMPLE = Be > 1, TN = TN, TB = TB)
+        out, table, x, missing.view(torch.uint8), layer.vids, prow, lvid, srow, ev,
+        sample.token_ids if topk else ev, logz, first, nodes, B, n, num_cats, Vl, K, R_s,
+        HAS_EV = has_ev, PER_SAMPLE = Be > 1, TOPK = topk, NORMALIZE = normalize, STEPS = max(1, K.bit_length()),
+        TN = TN, TB = TB)
 
 
 # -------------------------------------------------------------------------------------------------
@@ -156,6 +269,11 @@ def _rows32(layer) -> torch.Tensor:
 
 def _lvid32(layer) -> torch.Tensor:
     return _cached(layer, "lvid", lambda: layer.var_idmapping[layer.vids.view(-1).long()].to(torch.int32).contiguous())
+
+
+def _num_vars(layer) -> int:
+    """The layer's variables (its nodes' variable ids map to ``0 ..`` that, the rows of the evidence it reads)."""
+    return _cached(layer, "num_vars", lambda: int(torch.unique(layer.vids.view(-1)).numel()))
 
 
 def _cached(layer, key, build):
@@ -328,10 +446,66 @@ def _combine_kernel(part, masses, shift, pair_lv, class_rank, seg_lo, seg_hi, Vl
 
 
 @triton_jit
-def _input_values_kernel(out, table, x, missing, vids, prow, lvid, srow, ev, logz, first, nodes, B, n, num_cats, Vl,
-                         K, R_s, HAS_EV: tl.constexpr, PER_SAMPLE: tl.constexpr, TN: tl.constexpr, TB: tl.constexpr):
+def _topk_kernel(table, table_t, num_rows, ev, ids, shift, token_class, bounds, rows, cols, tiles, pair_index, out,
+                 num_cats, K, Vl, R_s, C, NCT, TRANSPOSED: tl.constexpr, BY_TILE: tl.constexpr, TU: tl.constexpr,
+                 TK: tl.constexpr, TC: tl.constexpr):
+    """One program per (tile, column of the tile: a variable and sample): per class, the sums ``sum_k p(v_k) w_k`` of
+    the tile's rows over the column's candidates ``v_k`` of the class -- the probabilities read at the candidates
+    alone (``TRANSPOSED``: from the token-major table ``table_t``, a candidate's rows contiguous), scaled by 2^64 so
+    that tiny products do not flush, dotted with the weights spread over ``TC`` classes -- and their logs (the
+    evidence's shift added back; -inf for a class without a candidate), into ``out`` [Be, R_s, C] at the pairs the
+    nodes read. ``BY_TILE``: ``NCT`` tiles of classes, the candidates sorted by tile (``bounds``: where every tile
+    starts, per column), else one."""
+    tile = tl.program_id(0)
+    j = tl.program_id(1)
+    r0, nr = tl.load(tiles + tile * 4), tl.load(tiles + tile * 4 + 1)
+    c0, nc = tl.load(tiles + tile * 4 + 2), tl.load(tiles + tile * 4 + 3)
+    on = j < nc
+    jc = tl.minimum(j, nc - 1)
+    lv = tl.load(cols + (c0 + jc) * 2).to(tl.int64)
+    b = tl.load(cols + (c0 + jc) * 2 + 1).to(tl.int64)
+    col = b * Vl + lv
+    m = tl.load(shift + col)
+    ru = tl.arange(0, TU)
+    rm = ru < nr
+    r = tl.load(rows + r0 + ru, mask = rm, other = 0).to(tl.int64)
+    s = tl.load(pair_index + r * Vl + lv, mask = rm, other = -1)
+    keep = rm & (s >= 0) & on
+    dst = out + (b * R_s + s) * C
+    cls = tl.arange(0, TC)
+    for t in range(0, NCT):
+        if BY_TILE:
+            k0 = tl.load(bounds + col * (NCT + 1) + t)
+            k1 = tl.load(bounds + col * (NCT + 1) + t + 1)
+        else:
+            k0 = 0
+            k1 = K
+        k1 = tl.where(on, k1, k0)
+        acc = tl.zeros([TC, TU], dtype = tl.float32)
+        for k in range(k0, k1, TK):
+            kk = k + tl.arange(0, TK)
+            km = kk < k1
+            v = tl.load(ids + col * K + kk, mask = km, other = 0).to(tl.int64)
+            w = tl.exp(tl.load(ev + col * K + kk, mask = km, other = float("-inf")) - m)
+            c = tl.load(token_class + v, mask = km, other = -1) - t * TC
+            if TRANSPOSED:
+                p = tl.load(table_t + v[:, None] * num_rows + r[None, :], mask = km[:, None] & rm[None, :], other = 0.0)
+            else:
+                p = tl.load(table + r[None, :] * num_cats + v[:, None], mask = km[:, None] & rm[None, :], other = 0.0)
+            wc = tl.where(cls[:, None] == c[None, :], w[None, :], 0.0)                            # [TC, TK]
+            acc += tl.dot(wc, p * 18446744073709551616.0, input_precision = "ieee")               # x 2^64
+        cc = t * TC + cls
+        tl.store(dst[None, :] + cc[:, None], tl.log(acc) - 44.3614195558365 + m,
+                 mask = keep[None, :] & (cc < C)[:, None])
+
+
+@triton_jit
+def _input_values_kernel(out, table, x, missing, vids, prow, lvid, srow, ev, ids, logz, first, nodes, B, n, num_cats,
+                         Vl, K, R_s, HAS_EV: tl.constexpr, PER_SAMPLE: tl.constexpr, TOPK: tl.constexpr,
+                         NORMALIZE: tl.constexpr, STEPS: tl.constexpr, TN: tl.constexpr, TB: tl.constexpr):
     """One program per (tile of the layer's nodes, tile of samples): every observed token's ``log p(d)`` (``HAS_EV``:
-    ``+ log w(d) - log Z``), 0 where it is missing."""
+    ``+ log w(d)``, ``- log Z`` if ``NORMALIZE``; ``TOPK``: ``w(d)`` the candidate's, found among ``ids``' sorted ones,
+    else 0), 0 where it is missing."""
     i = tl.program_id(0) * TN + tl.arange(0, TN)
     b = tl.program_id(1) * TB + tl.arange(0, TB)
     im, bm = i < nodes, b < B
@@ -345,9 +519,16 @@ def _input_values_kernel(out, table, x, missing, vids, prow, lvid, srow, ev, log
     if HAS_EV:
         be = b.to(tl.int64) if PER_SAMPLE else tl.zeros_like(b).to(tl.int64)
         lv = tl.load(lvid + i, mask = im, other = 0).to(tl.int64)
-        w = tl.load(ev + (be[None, :] * Vl + lv[:, None]) * K + d, mask = mask & ~miss & (d < K),
-                    other = float("-inf"))
-        z = tl.load(logz + be[None, :] * R_s + tl.load(srow + i, mask = im, other = 0)[:, None], mask = mask,
-                    other = 0.0)
-        val = tl.where(z == float("-inf"), float("-inf"), val + w - z)     # no token weighs: an impossible sample
+        row = (be[None, :] * Vl + lv[:, None]) * K
+        if TOPK:
+            k = find_token(ids, row, K, d, mask & ~miss, STEPS)
+            w = tl.load(ev + row + k, mask = k >= 0, other = float("-inf"))
+        else:
+            w = tl.load(ev + row + d, mask = mask & ~miss & (d < K), other = float("-inf"))
+        if NORMALIZE:
+            z = tl.load(logz + be[None, :] * R_s + tl.load(srow + i, mask = im, other = 0)[:, None], mask = mask,
+                        other = 0.0)
+            val = tl.where(z == float("-inf"), float("-inf"), val + w - z)  # no token weighs: an impossible sample
+        else:
+            val = val + w
     tl.store(out + (first + i[:, None]).to(tl.int64) * B + b[None, :], tl.where(miss, 0.0, val), mask = mask)

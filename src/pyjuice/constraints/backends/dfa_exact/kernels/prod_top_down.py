@@ -191,20 +191,22 @@ def _copy_top_down_kernel(element_flows, temp_flows, node_flows, iv_of, iv_info,
 
 @triton_jit
 def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mars, obs_class, next_col, class_mars,
-                                mass_row, trans, pred_ptr, pred_col, pred_x, width, iv_of, iv_info, iv_table, once_iv,
-                                live, lanes, lane_first, lane_live, coff, ccount, cstart, ccolumns, crank, children,
-                                children_idx, ptr, parents, reg_offset, reg_width, reg_first, out_first, out_width,
-                                temp_width, B, n, W, C, input_start, csteps, pid0, C_KIND: tl.constexpr,
-                                OUT_TEMP: tl.constexpr, GROUPED: tl.constexpr, PRUNE: tl.constexpr,
-                                ORDERED: tl.constexpr, COMPACT: tl.constexpr, C_FULL: tl.constexpr,
-                                OUT_FULL: tl.constexpr, INDEXED: tl.constexpr, TILE: tl.constexpr):
+                                mass_row, mass_stride, trans, trans_stride, pred_ptr, pred_col, pred_x, width, iv_of,
+                                iv_info, iv_table, once_iv, live, lanes, lane_first, lane_live, coff, ccount, cstart,
+                                ccolumns, crank, children, children_idx, ptr, parents, reg_offset, reg_width,
+                                reg_first, out_first, out_width, temp_width, B, n, W, C, input_start, csteps, pid0,
+                                C_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, GROUPED: tl.constexpr,
+                                PRUNE: tl.constexpr, ORDERED: tl.constexpr, COMPACT: tl.constexpr,
+                                C_FULL: tl.constexpr, OUT_FULL: tl.constexpr, INDEXED: tl.constexpr,
+                                SAMPLE: tl.constexpr, TILE: tl.constexpr):
     """The right operand ``R`` over ``[t + 1, t2)`` of ``input @ block`` steps: ``O_R[q, j] = log sum over the
     parents, and over the entries ``(i, class)`` leading to ``q`` at boundary ``t``, of mass + O_out[i, j]``. One
     program per child and tile of its lanes, flattened (sample, slot). ``ORDERED`` (a sum child under evidence pruning):
     the lanes in the query's lane order, live ones first -- a tile of dead lanes only stores -inf (a first writer)
     or nothing (a later one), since evidence usually leaves a few live (one per sample through an observed prefix).
     ``COMPACT``: the child's and the parents' values compact (:mod:`.compact`), a lane per pair of live columns, -inf
-    at a pair the automaton does not join."""
+    at a pair the automaton does not join. ``SAMPLE``: class masses of each sample's own (see
+    :class:`~..state.ClassMasses`; transition masses ``trans_stride`` floats apart)."""
     c = _child(children_idx, tl.program_id(0), INDEXED)
     tile = pid0 + tl.program_id(1)
     row = tl.load(children + c * 4 + 0)
@@ -257,8 +259,12 @@ def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
                                 temp_width, OUT_TEMP) + _parent_base(b, ostride, COMPACT)
             if GROUPED:
                 masses = trans + tl.load(parents + p * 7 + 6).to(tl.int64)
+                if SAMPLE:                                                   # (the lane's sample's)
+                    masses = masses + tl.where(tl.load(mass_stride + (u - input_start)) > 0, b * trans_stride, 0)
             else:
                 masses = class_mars + tl.load(mass_row + (u - input_start)).to(tl.int64) * C
+                if SAMPLE:
+                    masses = masses + b * tl.load(mass_stride + (u - input_start)).to(tl.int64) * C
             for k in range(0, tl.max(e1 - e0, axis = 0)):                    # entry (i, x) -> q
                 em = ml & (e0 + k < e1)
                 i = tl.load(pred_col + e0 + k, mask = em, other = 0)
@@ -281,16 +287,17 @@ def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
 
 @triton_jit
 def _block_input_top_down_kernel(element_flows, temp_flows, node_flows, node_mars, obs_class, next_col, class_mars,
-                                mass_row, trans, entry_ptr, entry_succ, entry_x, width, iv_of, iv_info, iv_table,
-                                once_iv, live, lanes, lane_first, lane_live, coff, ccount, cstart, ccolumns, crank,
-                                children, children_idx, ptr, parents, reg_offset, reg_width, reg_first, out_first,
-                                out_width, temp_width, B, n, W, C, input_start, csteps, pid0, C_KIND: tl.constexpr,
-                                OUT_TEMP: tl.constexpr, GROUPED: tl.constexpr, PRUNE: tl.constexpr,
-                                ORDERED: tl.constexpr, COMPACT: tl.constexpr, C_FULL: tl.constexpr,
-                                OUT_FULL: tl.constexpr, INDEXED: tl.constexpr, TILE: tl.constexpr):
+                                mass_row, mass_stride, trans, trans_stride, entry_ptr, entry_succ, entry_x, width,
+                                iv_of, iv_info, iv_table, once_iv, live, lanes, lane_first, lane_live, coff, ccount,
+                                cstart, ccolumns, crank, children, children_idx, ptr, parents, reg_offset, reg_width,
+                                reg_first, out_first, out_width, temp_width, B, n, W, C, input_start, csteps, pid0,
+                                C_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, GROUPED: tl.constexpr,
+                                PRUNE: tl.constexpr, ORDERED: tl.constexpr, COMPACT: tl.constexpr,
+                                C_FULL: tl.constexpr, OUT_FULL: tl.constexpr, INDEXED: tl.constexpr,
+                                SAMPLE: tl.constexpr, TILE: tl.constexpr):
     """The left operand ``L`` over ``[t0, t)`` of ``block @ input`` steps (output over ``[t0, t + 1)``): ``O_L[i, q] =
     log sum over the parents and over the entries ``(successor, class)`` of ``q`` at boundary ``t`` of mass +
-    O_out[i, successor]``. ``ORDERED``, ``COMPACT``: as :func:`_input_block_top_down_kernel`."""
+    O_out[i, successor]``. ``ORDERED``, ``COMPACT``, ``SAMPLE``: as :func:`_input_block_top_down_kernel`."""
     c = _child(children_idx, tl.program_id(0), INDEXED)
     tile = pid0 + tl.program_id(1)
     row = tl.load(children + c * 4 + 0)
@@ -354,8 +361,12 @@ def _block_input_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
             if tl.max(tl.where(miss, 1, 0), axis = 0) > 0:
                 if GROUPED:
                     masses = trans + tl.load(parents + p * 7 + 6).to(tl.int64)
+                    if SAMPLE:                                               # (the lane's sample's)
+                        masses = masses + tl.where(tl.load(mass_stride + (u - input_start)) > 0, b * trans_stride, 0)
                 else:
                     masses = class_mars + tl.load(mass_row + (u - input_start)).to(tl.int64) * C
+                    if SAMPLE:
+                        masses = masses + b * tl.load(mass_stride + (u - input_start)).to(tl.int64) * C
                 e0 = tl.load(entry_ptr + t * (W + 1) + q, mask = miss, other = 0)
                 e1 = tl.load(entry_ptr + t * (W + 1) + q + 1, mask = miss, other = 0)
                 for k in range(0, tl.max(e1 - e0, axis = 0)):
@@ -745,7 +756,7 @@ def _block_block_top_down_compact_kernel(element_flows, temp_flows, node_flows, 
         _store_flows(cp, pr[:, None].to(tl.int64) * cc_ + pc[None, :], tl.where(valid, tot, float("-inf")), om, add)
 
 
-def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_flows, node_mars, class_mars, obs_class,
+def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_flows, node_mars, masses, obs_class,
                 live, elem_first: int, elem_width: int, B: int, prior: dict, skip, exact: bool, once_iv: torch.Tensor,
                 lanes = None, compact = None, tflow_width = None, inside_regions = None, inside: bool = False):
     """
@@ -756,6 +767,7 @@ def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_
     :param regions: ``offset``, ``width``, ``first`` and ``slots`` of every sum region (device tensors) of the buffer
         the children are written to (``node_flows``, or ``prior_flows`` for a batch of one)
     :param element_flows, temp_flows, node_flows: the top-down buffers (``temp_flows`` as wide as ``temp``)
+    :param masses: the query's :class:`~..state.ClassMasses` (per sample, the ``SAMPLE`` kernels)
     :param prior: where the sum operands the plan keeps once are (see :func:`~.common._block_ptr`)
     :param skip: the top-down pass's :class:`~.prod.SkipMasks` (its triples are the parents' ``(interval A, B)`` specs)
     :param exact: see :func:`~.prod.run_products`
@@ -781,7 +793,8 @@ def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_
     ivs = prog.intervals
     prune, live = live is not None, live if live is not None else obs_class
     tt, grouped = prog.trans_top_down, prog.trans_top_down.grouped
-    trans = prog.transition_buffer()
+    trans = prog.transition_buffer(masses.batch)
+    sample = masses.batch > 1
     if compact is not None:
         cl = compact
         lists = dict(coff = cl.off, ccount = cl.count, cstart = cl.start, ccolumns = cl.columns, csteps = cl.steps)
@@ -810,13 +823,15 @@ def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_
                 (tt.entry_ptr, tt.entry_succ, tt.entry_x)
             for first, size in grid_chunks(host_cdiv(lanes_max, tile), 1):
                 kernel[(Cn, size)](
-                    element_flows, temp_flows, node_flows, node_mars, obs_class, prog.next_col, class_mars,
-                    prog.mass_row, trans, *tables, prog.width_t, ivs.of, ivs.info, ivs.table, once_iv, live,
+                    element_flows, temp_flows, node_flows, node_mars, obs_class, prog.next_col, masses.table,
+                    masses.row, masses.stride if sample else masses.row, trans, prog.trans_size, *tables, prog.width_t,
+                    ivs.of, ivs.info, ivs.table, once_iv, live,
                     *(lanes if ordered else (live, live, live)), crank = compact.rank if compact is not None else live,
                     children = la.children, ptr = la.ptr, parents = la.parents, B = B, n = n, W = W, C = C,
                     input_start = prog.input_start, pid0 = first, C_KIND = c_kind, OUT_TEMP = out_temp,
                     GROUPED = grouped, PRUNE = prune, ORDERED = ordered, COMPACT = compact is not None,
-                    C_FULL = c_full, OUT_FULL = out_full, TILE = tile, num_warps = 4, **indexed, **common, **lists)
+                    C_FULL = c_full, OUT_FULL = out_full, SAMPLE = sample, TILE = tile, num_warps = 4, **indexed,
+                    **common, **lists)
         elif compact is not None:                    # block @ block on compact values, a sample's rectangle at a time
             c_kind, o_kind, out_temp = la.kinds
             ends = prog.iv_ends_np[la.host["child_ivs"]]

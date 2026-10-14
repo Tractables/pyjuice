@@ -10,8 +10,9 @@ share come from the ``build_pc`` fixture.
 
 INPUT NODES: CATEGORICAL, AND SOFTEVIDENCECATEGORICAL. The reference turns a node's token probabilities into
 per-token-class masses: a Categorical's own, or under soft evidence (``inputs``, as ``pc(x, ...)`` takes them) every
-sample's product of experts ``q(v) = p(v) w(v) / Z``; any other input node raises ``NotImplementedError``. Other
-distributions need their own class-mass rule here.
+sample's product of experts ``q(v) = p(v) w(v) / Z`` -- under a value mask the library's unnormalized ``p(v) w(v)``
+at an observed token and where the mask is False, a free position (marginalized whatever the data holds); any other
+input node raises ``NotImplementedError``. Other distributions need their own class-mass rule here.
 
 PRECISION: float32, the precision the library runs at. Every log-space step is max-shifted, so the
 reference's own rounding stays around 1e-7 relative -- far below the tolerances it is compared at.
@@ -124,14 +125,33 @@ def log_weighted_sum(Wt, X):
 # The reference
 # -------------------------------------------------------------------------------------------------
 
-def _evidence(data, missing_mask, n):
+def _evidence(data, missing_mask, n, cc = None, inputs = None):
+    """``(data, missing)`` on the host; with soft evidence's value mask (``inputs``), the positions it marks False
+    missing too -- free: marginalized under the evidence's weights, whatever ``data`` holds there."""
     B = data.size(0)
     if missing_mask is None:
         missing = torch.zeros(B, n, dtype = torch.bool)
     else:
         missing = missing_mask.cpu().bool()
         missing = missing.expand(B, n) if missing.dim() == 1 else missing
+    if cc is not None:
+        for ns in cc.pc.root_ns:
+            vm = value_mask(cc, ns, inputs, B) if ns.is_input() else None
+            if vm is not None:
+                missing = missing.clone()
+                missing[:, ns.scope.to_list()[0]] |= ~vm.cpu()
     return data.cpu().long(), missing
+
+
+def value_mask(cc, ns, inputs, B):
+    """[B] bool: soft evidence's value mask at the variable of ``ns`` (a SoftEvidenceCategorical node group) for every
+    sample, from ``inputs``; None without one."""
+    vm = None if inputs is None else inputs.get("soft_evidence_value_mask")
+    if vm is None or not isinstance(ns.dist, SoftEvidenceCategorical):
+        return None
+    src = ns.get_source_ns()
+    layer = next(layer for layer in cc.pc.input_layer_group if src in layer.nodes)
+    return vm[:, int(layer.var_idmapping[ns.scope.to_list()[0]])].to(cc.pc.params.device).expand(B)
 
 
 def soft_weights(cc, ns, inputs, B):
@@ -155,6 +175,24 @@ def soft_weights(cc, ns, inputs, B):
     return w
 
 
+def emission(cc, ns, inputs, B, observed = False):
+    """[num_nodes, B, V]: every sample's token probabilities at the input nodes ``ns`` -- a Categorical's, or under
+    soft evidence (``inputs``) the product of experts ``q(v) = p(v) w(v) / Z``, in float64 (products of tiny weights are
+    subnormal in float32, with too few digits: a class of one unlikely token off by nats at a 126k vocabulary). Under
+    a value mask, the library's unnormalized ``p(v) w(v)`` for an ``observed`` token (the mask True there) and where
+    the mask is False (a free position)."""
+    probs = categorical_probs(cc.pc, ns)                                        # [N, V]
+    w = soft_weights(cc, ns, inputs, B) if isinstance(ns.dist, SoftEvidenceCategorical) else None
+    if w is None:
+        return probs[:, None, :].expand(-1, B, -1)
+    pw = probs[:, None, :].double() * w[None, :, :]
+    q = pw / pw.sum(dim = 2, keepdim = True)
+    vm = value_mask(cc, ns, inputs, B)
+    if vm is None:
+        return q
+    return torch.where((torch.ones_like(vm) if observed else ~vm)[None, :, None], pw, q)
+
+
 def input_block(cc, ns, data, missing, inputs = None):
     """[num_nodes, B, W_t, W_{t+1}] block of an input node at variable t: Categorical, or SoftEvidenceCategorical whose
     every sample's emission is the product of experts ``q(v) = p(v) w(v) / Z`` under the evidence in ``inputs`` (as
@@ -164,16 +202,10 @@ def input_block(cc, ns, data, missing, inputs = None):
                                   f"over variable {ns.scope.to_list()}.")
     layout, dev = cc.backend.layout, cc.pc.params.device
     t = ns.scope.to_list()[0]
-    probs = categorical_probs(cc.pc, ns)                                        # [N, V]
     token_class = layout.token_class.to(dev)
     C = layout.num_classes
     N, B = ns.num_nodes, data.size(0)
-    w = soft_weights(cc, ns, inputs, B) if isinstance(ns.dist, SoftEvidenceCategorical) else None
-    if w is None:
-        q = probs[:, None, :].expand(N, B, -1)                                  # [N, B, V]
-    else:                                                   # in float64: products of tiny weights are subnormal
-        q = probs[:, None, :].double() * w[None, :, :]       # in float32, with too few digits (a class of one
-        q = q / q.sum(dim = 2, keepdim = True)               # unlikely token off by nats at a 126k vocabulary)
+    q = emission(cc, ns, inputs, B)                                             # [N, B, V]
 
     # log mass per token class: sum over the tokens of the class, or only the observed token
     mass = torch.zeros(N, B, C, dtype = q.dtype, device = dev).index_add_(2, token_class, q)
@@ -181,9 +213,10 @@ def input_block(cc, ns, data, missing, inputs = None):
     if obs.any():
         x = data[obs, t].to(dev)
         o = obs.to(dev)
+        qo = emission(cc, ns, inputs, B, observed = True)
         m_obs = torch.zeros(N, int(obs.sum()), C, dtype = q.dtype, device = dev)
         m_obs.scatter_(2, token_class[x][None, :, None].expand(N, -1, 1),
-                       q[:, o].gather(2, x[None, :, None].expand(N, -1, 1)))
+                       qo[:, o].gather(2, x[None, :, None].expand(N, -1, 1)))
         mass[:, o] = m_obs
     lmass = torch.log(mass).to(DTYPE)                                           # [N, B, C]
 
@@ -209,7 +242,7 @@ def reference_inside(cc, data, missing_mask = None, inputs = None) -> dict:
     """
     pc, layout = cc.pc, cc.backend.layout
     assert layout.satisfiable
-    data, missing = _evidence(data, missing_mask, cc.n)
+    data, missing = _evidence(data, missing_mask, cc.n, cc, inputs)
     B = data.size(0)
     dev = pc.params.device
     vals = {}
@@ -256,7 +289,7 @@ def _log_index_add(dest, idx, src):
     return torch.log(acc) + m
 
 
-def reference_top_down(cc, data, missing_mask = None, inside = None) -> dict:
+def reference_top_down(cc, data, missing_mask = None, inside = None, inputs = None) -> dict:
     """
     Every node group's block of log OUTSIDE values, of the same shape as its inside block, by node group: ``O[node,
     sample, i, j]`` is the log of the derivative of ``p(C, e)`` with respect to the node's (linear) inside value at
@@ -270,13 +303,14 @@ def reference_top_down(cc, data, missing_mask = None, inside = None) -> dict:
     Single-root PCs only (each root has its own outside values otherwise).
 
     :param inside: :func:`reference_inside` of the same arguments, if already computed
+    :param inputs: per-sample inputs, as :func:`reference_inside` takes them
     """
     pc = cc.pc
     if pc.root_ns.num_nodes != 1:
         raise NotImplementedError(f"The reference computes outside values of single-root PCs only, got "
                                   f"{pc.root_ns.num_nodes} root nodes.")
     if inside is None:
-        inside = reference_inside(cc, data, missing_mask)
+        inside = reference_inside(cc, data, missing_mask, inputs)
     dev = pc.params.device
     outs = {ns: torch.full_like(v, -float("inf")) for ns, v in inside.items()}
     outs[pc.root_ns] = torch.zeros_like(inside[pc.root_ns])
@@ -318,11 +352,12 @@ def _targets(targets, missing):
     return targets
 
 
-def reference_conditional(cc, data, missing_mask = None, targets = None) -> torch.Tensor:
+def reference_conditional(cc, data, missing_mask = None, targets = None, inputs = None) -> torch.Tensor:
     """
     ``log p(x_t = v | e, C)`` for every target ``(b, t)`` and token ``v``, in float32: one row per target, in the
     order ``dense[targets]`` lists them (sample by sample, positions in order). Rows are -inf where ``p(e, C) = 0``.
-    The PC's input nodes must be Categorical.
+    The PC's input nodes must be Categorical or SoftEvidenceCategorical (``inputs``: its soft evidence, see
+    :func:`input_block`; ``p_u`` below is then every sample's ``q``).
 
     Token ``v`` at ``t`` moves column ``i`` to ``next_col[t, i, class(v)]`` with probability ``p_u(v)`` at every input
     node ``u`` over ``t``, so ``p(x_t = v, e, C) = sum_u p_u(v) A_u[class(v)]``, with the class weights
@@ -336,12 +371,12 @@ def reference_conditional(cc, data, missing_mask = None, targets = None) -> torc
     """
     pc, layout = cc.pc, cc.backend.layout
     n, dev = cc.n, pc.params.device
-    _, missing = _evidence(data, missing_mask, n)
+    _, missing = _evidence(data, missing_mask, n, cc, inputs)
     targets = _targets(targets, missing)
     V = layout.token_class.numel()
     if not layout.satisfiable:
         return torch.full((int(targets.sum()), V), -float("inf"), dtype = DTYPE, device = dev)
-    inside = reference_inside(cc, data, missing_mask)
+    inside = reference_inside(cc, data, missing_mask, inputs)
     top_down = reference_top_down(cc, data, missing_mask, inside)
 
     token_class = layout.token_class.to(dev)
@@ -353,15 +388,15 @@ def reference_conditional(cc, data, missing_mask = None, targets = None) -> torc
         t = ns.scope.to_list()[0]
         if not wanted[t]:
             continue
-        if not isinstance(ns.dist, Categorical):
+        if not isinstance(ns.dist, (Categorical, SoftEvidenceCategorical)):
             raise NotImplementedError(f"The reference supports Categorical input nodes only, got "
                                       f"{type(ns.dist).__name__} over variable {t}.")
         Wi = int(layout.width[t])
         nc = layout.next_col[t, :Wi].to(dev)                                    # [Wi, C]
         G = O[:, :, torch.arange(Wi, device = dev)[:, None], nc.clamp(min = 0)] # [N, B, Wi, C]
         A = torch.logsumexp(G.masked_fill(nc < 0, -float("inf")), dim = 2)      # [N, B, C] log class weights
-        logp = torch.log(categorical_probs(pc, ns))                             # [N, V]
-        s = torch.logsumexp(A[:, :, token_class] + logp[:, None, :], dim = 0)  # [B, V]
+        logp = torch.log(emission(cc, ns, inputs, missing.size(0))).to(DTYPE)  # [N, B, V]
+        s = torch.logsumexp(A[:, :, token_class] + logp, dim = 0)               # [B, V]
         scores[:, t] = torch.logaddexp(scores[:, t], s)
 
     rows = scores[targets.to(dev)]

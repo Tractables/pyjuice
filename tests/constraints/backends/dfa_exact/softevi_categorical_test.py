@@ -8,6 +8,11 @@ sum and transition paths, compact storage, evidence per row or shared, and the c
 float64 brute force (many classes, an empty one, few tokens of evidence). Evidence shaped like a language model's
 (peaked, tokens drawn from it) against the reference's q, also at Codpula's 126464 tokens -- where uniform evidence is
 the Categorical PC itself and one-hot evidence the constraint's verdict on its string -- and at Codpula's shape (slow).
+Top-k evidence (``soft_evidence_cat_ids``) likewise: the library's forward, brute force (observed tokens that are not
+candidates: impossible), the reference's conditionals, and at Codpula's vocabulary its top 1024 -- the dense evidence
+that weighs every other token nothing, from the library's transposed table (a decoder's scope keeps one) or not. A
+value mask (``soft_evidence_value_mask``): the library's unnormalized forward, brute force over the free positions,
+the reference's conditionals at free and missing targets, Codpula's vocabulary, sessions.
 """
 import itertools
 
@@ -48,9 +53,27 @@ def evidence(n, B, Be = None, K = V, seed = 0):
     return data.to(DEV), missing.to(DEV), E.to(DEV)
 
 
+def topk_evidence(n, B, Be = None, K = 2, seed = 0):
+    """``(data, missing, inputs)``: as :func:`evidence`, the evidence top-k -- ``K`` distinct candidates per sample and
+    position (``soft_evidence_cat_ids``, in no order); fewer than all tokens: sample 1 observes a token that is not a
+    candidate at position 0."""
+    g = torch.Generator().manual_seed(seed)
+    data, missing, _ = evidence(n, B, seed = seed)
+    rows = B if Be is None else Be
+    ids = torch.argsort(torch.rand(rows, n, V, generator = g), dim = 2)
+    if K < V:
+        missing[1, 0] = False
+        data[1, 0] = int(ids[min(1, rows - 1), 0, K])
+    ids = ids[..., :K]
+    E = torch.randn(rows, n, K, generator = g) * 2
+    return data, missing, dict(categorical_evidence_logp = E.to(DEV), soft_evidence_cat_ids = ids.to(DEV))
+
+
 def brute_force(pc, constraint, data, missing, E):
     """log sum over the completions the constraint accepts of log q(x), from pyjuice's own forward (every token
-    observed) under the evidence row of each sample."""
+    observed) under the evidence row of each sample (``E``: dense log-weights, or the inputs, as ``pc(x, ...)`` takes
+    them)."""
+    inputs = E if isinstance(E, dict) else dict(categorical_evidence_logp = E)
     out = []
     for b in range(data.size(0)):
         miss = missing[b].nonzero().view(-1).tolist()
@@ -62,8 +85,9 @@ def brute_force(pc, constraint, data, missing, E):
         if xs.size(0) == 0:
             out.append(torch.tensor(-float("inf"), device = DEV))
             continue
-        Eb = E[b if E.size(0) > 1 else 0][None].expand(xs.size(0), -1, -1).contiguous()
-        out.append(torch.logsumexp(pc(xs, categorical_evidence_logp = Eb).view(-1).double(), 0).float())
+        kw = {key: t[b if t.size(0) > 1 else 0][None].expand(xs.size(0), *t.shape[1:]).contiguous()
+              for key, t in inputs.items()}
+        out.append(torch.logsumexp(pc(xs, **kw).view(-1).double(), 0).float())
     return torch.stack(out)
 
 
@@ -151,23 +175,25 @@ def test_compact_storage_and_shared_evidence(kind, build_pc):
     assert_close(got["dense", "shared"], brute_force(pc, CONSTRAINTS["contains"](), data, missing, E), n)
 
 
+@pytest.mark.parametrize("topk", [False, True])
 @pytest.mark.parametrize("storage", ["dense", "compact"])
-def test_a_session_reuses_only_what_its_rows_inputs_allow(storage, build_pc):
+def test_a_session_reuses_only_what_its_rows_inputs_allow(storage, topk, build_pc):
     """Left to right in one session (values reused where the evidence did not change), then the rows reordered as
     beams are (each continuing another row): every call is what a fresh session gives -- with evidence per row too,
-    where a row taking another row's values would read that row's evidence."""
+    where a row taking another row's values would read that row's evidence; dense or top-k."""
     pc = soft_pc(build_pc, "hmm")
     n = KINDS["hmm"]
-    data, _, E = evidence(n, 4)
+    data, _, inputs = topk_evidence(n, 4, K = V) if topk else evidence(n, 4)    # (every token a candidate: finite)
+    inputs = inputs if topk else dict(categorical_evidence_logp = inputs)
     cc = jc.compile(CONSTRAINTS["contains"](), pc)
     prefix = lambda t: (torch.arange(n, device = DEV)[None, :] >= t).expand(4, n)
     order = torch.tensor([2, 0, 1, 3], device = DEV)
     calls = [(data, prefix(t)) for t in range(n)] + [(data[order], prefix(n - 1))]
-    for ev in (E, E[:1]):
-        with cc.decoder(categorical_evidence_logp = ev, storage = storage) as decoder:
+    for kw in (inputs, {key: t[:1] for key, t in inputs.items()}):
+        with cc.decoder(storage = storage, **kw) as decoder:
             session = [decoder.marginal(x, m) for x, m in calls]
         for (x, m), got in zip(calls, session):
-            with cc.decoder(categorical_evidence_logp = ev, storage = storage) as decoder:
+            with cc.decoder(storage = storage, **kw) as decoder:
                 assert_close(got, decoder.marginal(x, m), n)
 
 
@@ -322,6 +348,358 @@ def test_codpula_vocabulary(kind, build_pc, reference):
     assert got[0].abs() < 1e-5 and torch.isneginf(got[1:]).all(), got
 
 
+def assert_rows_close(got, want, n):
+    """Conditionals' rows (log-probabilities over the tokens): -inf where the reference's are, else close."""
+    assert got.shape == want.shape
+    assert torch.equal(torch.isneginf(got), torch.isneginf(want))
+    fin = torch.isfinite(want)
+    assert ((got[fin] - want[fin]).abs() <= 1e-4 + n * 2e-6 + 1e-5 * want[fin].abs()).all(), \
+        (got[fin] - want[fin]).abs().max()
+
+
+@pytest.mark.parametrize("shared", [False, True])
+@pytest.mark.parametrize("kind", list(KINDS))
+def test_conditional_matches_the_reference(kind, shared, sum_path, transitions, build_pc, reference):
+    """``log p(x_t = v | e, C)`` under language-model evidence, every token of every missing position: the reference's
+    (the target's own emission q = p w / Z), every path; the log marginal it returns is the marginal's; and the
+    scores of candidates alone are the full rows' (a candidate past the vocabulary -inf)."""
+    n = KINDS[kind]
+    Vm = 50
+    pc = build_pc(kind, n, Vm, input_dist = dists.SoftEvidenceCategorical)
+    c = jc.DFA.contains([[7, 31]], Vm) & jc.Not(jc.DFA.contains([[44]], Vm))
+    E = lm_evidence(1 if shared else 3, n, Vm, hot = [(1, 7), (2, 31), (n - 1, 44)])
+    inputs = dict(categorical_evidence_logp = E)
+    cc = jc.compile(c, pc)
+    data = draw(E.expand(3, -1, -1).contiguous())
+    m = masks(n, 3)[3]
+    m[0] = True
+    with cc.decoder(categorical_evidence_logp = E, storage = "dense") as decoder:
+        got, lm = decoder.conditional(data, m, return_log_marginal = True)
+        marg = decoder.marginal(data, m)
+        cand = torch.randint(0, Vm + 3, (3, n, 6), device = DEV)
+        got_c = decoder.conditional(data, m, candidates = cand)
+    assert_rows_close(got, reference.conditional(cc, data, m, inputs = inputs), n)
+    rows = torch.nonzero(m)
+    assert_close(lm, marg.view(-1)[rows[:, 0]], n)
+    want_c = torch.where(cand[rows[:, 0], rows[:, 1]] < Vm,
+                         got.gather(1, cand[rows[:, 0], rows[:, 1]].clamp(max = Vm - 1)), -float("inf"))
+    assert_rows_close(got_c, want_c, n)
+
+
+@pytest.mark.parametrize("kind", ["hmm", "pd", "hand_left"])
+def test_codpula_vocabulary_conditionals(kind, build_pc, reference):
+    """Conditionals at Codpula's 126464 tokens: language-model evidence against the reference (any order and prefix
+    decoding in one session, compact storage); uniform evidence gives the Categorical PC's; one-hot evidence gives
+    the point mass at its token where the constraint allows it."""
+    n = KINDS[kind]
+    pc = build_pc(kind, n, CODD_V, input_dist = dists.SoftEvidenceCategorical)
+    c = CODD_CONSTRAINT()
+    cc = jc.compile(c, pc)
+    E = lm_evidence(2, n, CODD_V, hot = [(1, 50000), (2, 100000), (n - 2, 126000)])
+    inputs = dict(categorical_evidence_logp = E)
+    data = draw(E)
+    with cc.decoder(categorical_evidence_logp = E) as decoder:
+        for m in masks(n, 2)[:3] + [masks(n, 2)[3] | (torch.arange(n, device = DEV) == 1)]:
+            if m.any():
+                assert_rows_close(decoder.conditional(data, m), reference.conditional(cc, data, m, inputs = inputs), n)
+
+    plain = build_pc(kind, n, CODD_V)
+    for a, b in zip(plain.input_layer_group, pc.input_layer_group):
+        a.params.data.copy_(b.params.data)
+    plain.params.data.copy_(pc.params.data)
+    m = masks(n, 2)[3] | (torch.arange(n, device = DEV) == 0)
+    with cc.decoder(categorical_evidence_logp = torch.zeros(1, n, CODD_V, device = DEV)) as decoder:
+        assert_rows_close(decoder.conditional(data, m), jc.compile(c, plain).conditional(data, m), n)
+
+    strings = torch.full((1, n), 7, device = DEV)
+    strings[0, 1], strings[0, 2] = 50000, 100000
+    one_hot = torch.full((1, n, CODD_V), -float("inf"), device = DEV).scatter_(2, strings[:, :, None], 0.0)
+    with cc.decoder(categorical_evidence_logp = one_hot) as decoder:
+        got = decoder.conditional(strings, torch.ones(1, n, dtype = torch.bool, device = DEV))
+    assert torch.equal(got.argmax(dim = 1), strings[0]) and (got.max(dim = 1).values.abs() < 1e-5).all()
+
+
+def test_a_session_of_conditionals(build_pc):
+    """Prefix decoding with conditionals in one session (values reused), evidence per row or shared, then rows moved:
+    every call is a fresh session's."""
+    pc = soft_pc(build_pc, "hmm")
+    n = KINDS["hmm"]
+    data, _, E = evidence(n, 4)
+    cc = jc.compile(CONSTRAINTS["contains"](), pc)
+    prefix = lambda t: (torch.arange(n, device = DEV)[None, :] >= t).expand(4, n)
+    order = torch.tensor([2, 0, 1, 3], device = DEV)
+    calls = [(data, prefix(t)) for t in range(n)] + [(data[order], prefix(n - 1))]
+    for ev in (E, E[:1]):
+        with cc.decoder(categorical_evidence_logp = ev) as decoder:
+            session = [decoder.conditional(x, m, targets = [min(n - 1, int(m[0].int().argmax()))]) for x, m in calls]
+        for (x, m), got in zip(calls, session):
+            with cc.decoder(categorical_evidence_logp = ev) as decoder:
+                fresh = decoder.conditional(x, m, targets = [min(n - 1, int(m[0].int().argmax()))])
+            assert_rows_close(got, fresh, n)
+
+
+# -------------------------------------------------------------------------------------------------
+# Top-k evidence (soft_evidence_cat_ids)
+# -------------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("shared", [False, True])
+@pytest.mark.parametrize("kind", list(KINDS))
+def test_topk_the_one_state_constraint_is_the_pcs_own_marginal(kind, shared, build_pc):
+    """Top-k evidence, two of the three tokens candidates: under ``DFA.anything`` the session's marginal is
+    ``pc(x, missing_mask, categorical_evidence_logp, soft_evidence_cat_ids)`` -- -inf where an observed token is not
+    a candidate."""
+    pc = soft_pc(build_pc, kind)
+    n = KINDS[kind]
+    data, missing, inputs = topk_evidence(n, 4, Be = 1 if shared else None)
+    cc = jc.compile(jc.DFA.anything(V), pc)
+    with cc.decoder(**inputs) as decoder:
+        got = decoder.marginal(data, missing)
+    want = pc(data, missing_mask = missing, **{key: t.expand(4, -1, -1).contiguous() for key, t in inputs.items()})
+    assert torch.isneginf(want).any() and torch.isfinite(want).any()
+    assert_close(got, want, n)
+
+
+@pytest.mark.parametrize("constraint", ["contains", "contains_either_and_not"])
+@pytest.mark.parametrize("kind", list(KINDS))
+def test_topk_marginal_matches_a_brute_force(kind, constraint, build_pc):
+    """``log p(C, x_observed)`` under top-k evidence (every token a candidate, or two of three): pyjuice's own ``log
+    q(x)`` summed over the completions the constraint accepts, dense and compact storage, the candidates'
+    probabilities from the library's transposed table (the decoder's scope keeps one) or the table itself."""
+    pc = soft_pc(build_pc, kind)
+    n = KINDS[kind]
+    c = CONSTRAINTS[constraint]()
+    cc = jc.compile(c, pc)
+    for K in (V, 2):
+        data, missing, inputs = topk_evidence(n, 3, K = K, seed = K)
+        want = brute_force(pc, c, data, missing, inputs)
+        for storage, copies in itertools.product(("dense", "compact"), (True, False)):
+            with cc.decoder(storage = storage, allow_param_copy = copies, **inputs) as decoder:
+                assert_close(decoder.marginal(data, missing), want, n)
+
+
+@pytest.mark.parametrize("shared", [False, True])
+@pytest.mark.parametrize("kind", list(KINDS))
+def test_topk_conditional_matches_the_reference(kind, shared, build_pc, reference):
+    """Conditionals under top-k language-model evidence (the 12 likeliest of 50 tokens), tokens drawn from it: the
+    reference's, -inf at every token that is not a candidate; candidates alone score as the full rows (one past the
+    vocabulary -inf); the log marginal returned is the marginal's."""
+    n = KINDS[kind]
+    Vm = 50
+    pc = build_pc(kind, n, Vm, input_dist = dists.SoftEvidenceCategorical)
+    c = jc.DFA.contains([[7, 31]], Vm) & jc.Not(jc.DFA.contains([[44]], Vm))
+    E, ids = torch.topk(lm_evidence(1 if shared else 3, n, Vm, hot = [(1, 7), (2, 31), (n - 1, 44)]), 12, dim = 2)
+    inputs = dict(categorical_evidence_logp = E, soft_evidence_cat_ids = ids)
+    dense = torch.full((E.size(0), n, Vm), -float("inf"), device = DEV).scatter_(2, ids, E)
+    cc = jc.compile(c, pc)
+    data = draw(dense.expand(3, -1, -1).contiguous())
+    m = masks(n, 3)[3]
+    m[0] = True
+    with cc.decoder(**inputs) as decoder:
+        got, lm = decoder.conditional(data, m, return_log_marginal = True)
+        marg = decoder.marginal(data, m)
+        cand = torch.randint(0, Vm + 3, (3, n, 9), device = DEV)
+        cand[..., :4] = ids[..., :4]                                        # some of the candidates
+        got_c = decoder.conditional(data, m, candidates = cand)
+    want = reference.conditional(cc, data, m, inputs = inputs)
+    assert_rows_close(got, want, n)
+    rows = torch.nonzero(m)
+    assert (torch.isfinite(want).sum(dim = 1) <= 12).all() and torch.isfinite(marg).any()
+    assert_close(lm, marg.view(-1)[rows[:, 0]], n)
+    want_c = torch.where(cand[rows[:, 0], rows[:, 1]] < Vm,
+                         got.gather(1, cand[rows[:, 0], rows[:, 1]].clamp(max = Vm - 1)), -float("inf"))
+    assert_rows_close(got_c, want_c, n)
+
+
+@pytest.mark.parametrize("kind", ["hmm", "pd", "hand_left"])
+def test_codpula_vocabulary_topk(kind, build_pc, reference):
+    """Codpula's 126464 tokens and its top-k, the 1024 likeliest of a language model's: the reference's marginals and
+    conditionals, which are the dense evidence's that weighs every other token nothing -- the candidates' probabilities
+    read from the library's transposed table (the decoder's scope keeps one) or, without parameter copies, from the
+    table itself; and a single candidate per position is the constraint's verdict on their string."""
+    n = KINDS[kind]
+    pc = build_pc(kind, n, CODD_V, input_dist = dists.SoftEvidenceCategorical)
+    cc = jc.compile(CODD_CONSTRAINT(), pc)
+    E, ids = torch.topk(lm_evidence(2, n, CODD_V, hot = [(1, 50000), (2, 100000), (n - 2, 126000)]), 1024, dim = 2)
+    inputs = dict(categorical_evidence_logp = E, soft_evidence_cat_ids = ids)
+    dense = torch.full((2, n, CODD_V), -float("inf"), device = DEV).scatter_(2, ids, E)
+    data = draw(dense)
+    ms = [m for m in masks(n, 2)[:3] + [masks(n, 2)[3] | (torch.arange(n, device = DEV) == 1)] if m.any()]
+    got = {}
+    for copies in (True, False):
+        for name, kw in (("topk", inputs), ("dense", dict(categorical_evidence_logp = dense))):
+            with cc.decoder(allow_param_copy = copies, **kw) as decoder:
+                got[copies, name] = [(decoder.marginal(data, m), decoder.conditional(data, m)) for m in ms]
+                if name == "topk":
+                    assert (pc.input_layer_group[0]._fast_inference_params is not None) == copies
+    for k, m in enumerate(ms):
+        want = (reference.marginal(cc, data, m, inputs), reference.conditional(cc, data, m, inputs = inputs))
+        for (marg, cond) in (got[key][k] for key in got):
+            assert_close(marg, want[0], n)
+            assert_rows_close(cond, want[1], n)
+
+    strings = torch.full((3, n, 1), 7, device = DEV)                         # accepted, rejected twice
+    strings[:, 1], strings[:, 2] = 50000, 100000
+    strings[1, 2] = 99999
+    strings[2, n - 1] = 126000
+    with cc.decoder(categorical_evidence_logp = torch.zeros(3, n, 1, device = DEV), soft_evidence_cat_ids = strings) \
+            as decoder:
+        got = decoder.marginal(strings[..., 0], torch.ones(3, n, dtype = torch.bool, device = DEV)).view(-1)
+    assert got[0].abs() < 1e-5 and torch.isneginf(got[1:]).all(), got
+
+
+# -------------------------------------------------------------------------------------------------
+# A value mask (soft_evidence_value_mask)
+# -------------------------------------------------------------------------------------------------
+
+def masked_evidence(n, B, Be = None, topk = False, seed = 0):
+    """``(data, missing, inputs)``: :func:`evidence` (or :func:`topk_evidence`, every token a candidate), with a value
+    mask per sample, False at about a third of the positions -- free: marginalized under the weights -- and missing
+    only where it is True; row 0 has free and missing positions both."""
+    g = torch.Generator().manual_seed(seed + 100)
+    data, missing, inputs = topk_evidence(n, B, Be, K = V, seed = seed) if topk else evidence(n, B, Be, seed = seed)
+    inputs = inputs if topk else dict(categorical_evidence_logp = inputs)
+    vm = torch.rand(B, n, generator = g) >= 0.35
+    vm[0, 0], vm[0, 1] = False, True
+    missing = missing & vm.to(DEV)
+    missing[0, 1] = True
+    return data, missing, dict(inputs, soft_evidence_value_mask = vm.to(DEV))
+
+
+@pytest.mark.parametrize("topk", [False, True])
+@pytest.mark.parametrize("shared", [False, True])
+@pytest.mark.parametrize("kind", list(KINDS))
+def test_value_mask_the_one_state_constraint_is_the_pcs_own_marginal(kind, shared, topk, build_pc):
+    """Under ``DFA.anything``, the session's marginal is ``pc(x, missing_mask, ..., soft_evidence_value_mask)``: True,
+    an observed token's ``log p(d) w(d)``; False, ``log Z``; missing, 0 -- evidence per row or one row for all (the
+    mask per row: every row its own masses); the backend's own query, given the inputs, alike."""
+    pc = soft_pc(build_pc, kind)
+    n = KINDS[kind]
+    data, missing, inputs = masked_evidence(n, 4, Be = 1 if shared else None, topk = topk)
+    cc = jc.compile(jc.DFA.anything(V), pc)
+    with cc.decoder(**inputs) as decoder:
+        got = decoder.marginal(data, missing)
+    want = pc(data, missing_mask = missing, **{key: t.expand(4, *t.shape[1:]).contiguous() for key, t in inputs.items()})
+    assert_close(got, want, n)
+    assert_close(cc.backend.marginal(data, missing, external = cc.backend.external_inputs(inputs)), want, n)
+
+
+@pytest.mark.parametrize("constraint", ["contains", "contains_either_and_not"])
+@pytest.mark.parametrize("kind", list(KINDS))
+def test_value_mask_matches_a_brute_force(kind, constraint, build_pc):
+    """``log`` of the sum over the completions of the free positions the constraint accepts of the library's
+    unnormalized ``p(x) w(x)`` (its forward with the mask True everywhere), dense and top-k evidence, dense and compact
+    storage."""
+    pc = soft_pc(build_pc, kind)
+    n = KINDS[kind]
+    c = CONSTRAINTS[constraint]()
+    cc = jc.compile(c, pc)
+    for topk in (False, True):
+        data, _, inputs = masked_evidence(n, 3, topk = topk, seed = 3)
+        free = ~inputs["soft_evidence_value_mask"]
+        want = brute_force(pc, c, data, free, dict(inputs, soft_evidence_value_mask = ~free | True))
+        for storage in ("dense", "compact"):
+            with cc.decoder(storage = storage, **inputs) as decoder:
+                assert_close(decoder.marginal(data), want, n)
+
+
+@pytest.mark.parametrize("shared", [False, True])
+@pytest.mark.parametrize("kind", list(KINDS))
+def test_value_mask_conditional_matches_the_reference(kind, shared, build_pc, reference):
+    """Marginals and conditionals under a value mask and language-model evidence (dense, and its top 12): the
+    reference's, every target -- a free position's (its tokens weighing ``p w``) and a missing one's (``q``)."""
+    n = KINDS[kind]
+    Vm = 50
+    pc = build_pc(kind, n, Vm, input_dist = dists.SoftEvidenceCategorical)
+    c = jc.DFA.contains([[7, 31]], Vm) & jc.Not(jc.DFA.contains([[44]], Vm))
+    lm = lm_evidence(1 if shared else 3, n, Vm, hot = [(1, 7), (2, 31), (n - 1, 44)])
+    E, ids = torch.topk(lm, 12, dim = 2)
+    dense = torch.full_like(lm, -float("inf")).scatter_(2, ids, E)
+    cc = jc.compile(c, pc)
+    data = draw(dense.expand(3, -1, -1).contiguous())
+    vm = torch.ones(3, n, dtype = torch.bool, device = DEV)
+    vm[:, 1], vm[1, n - 1], vm[2, 0] = False, False, False
+    m = torch.zeros(3, n, dtype = torch.bool, device = DEV)
+    m[:, 2], m[0, n - 1] = True, True
+    for inputs in (dict(categorical_evidence_logp = lm), dict(categorical_evidence_logp = E, soft_evidence_cat_ids = ids)):
+        inputs = dict(inputs, soft_evidence_value_mask = vm)
+        with cc.decoder(**inputs) as decoder:
+            marg = decoder.marginal(data, m)
+            got = decoder.conditional(data, m)
+            got_t = decoder.conditional(data, targets = ~vm)                 # the free positions alone
+        assert_close(marg, reference.marginal(cc, data, m, inputs), n)
+        want = reference.conditional(cc, data, m, inputs = inputs)
+        assert_rows_close(got, want, n)
+        assert_rows_close(got_t, reference.conditional(cc, data, None, ~vm, inputs = inputs), n)
+        external = cc.backend.external_inputs(inputs)                       # the backend's own query alike
+        assert_rows_close(cc.backend.conditional(data, m, external = external), want, n)
+
+
+@pytest.mark.parametrize("kind", ["hmm", "pd", "hand_left"])
+def test_codpula_vocabulary_value_mask(kind, build_pc, reference):
+    """A value mask at Codpula's 126464 tokens, dense evidence and its top 1024: the reference's marginal and
+    conditionals at the free positions."""
+    n = KINDS[kind]
+    pc = build_pc(kind, n, CODD_V, input_dist = dists.SoftEvidenceCategorical)
+    cc = jc.compile(CODD_CONSTRAINT(), pc)
+    lm = lm_evidence(2, n, CODD_V, hot = [(1, 50000), (2, 100000), (n - 2, 126000)])
+    E, ids = torch.topk(lm, 1024, dim = 2)
+    data = draw(torch.full_like(lm, -float("inf")).scatter_(2, ids, E))
+    vm = torch.ones(2, n, dtype = torch.bool, device = DEV)
+    vm[:, 1], vm[1, n - 2] = False, False
+    for inputs in (dict(categorical_evidence_logp = lm), dict(categorical_evidence_logp = E, soft_evidence_cat_ids = ids)):
+        inputs = dict(inputs, soft_evidence_value_mask = vm)
+        with cc.decoder(**inputs) as decoder:
+            assert_close(decoder.marginal(data), reference.marginal(cc, data, None, inputs), n)
+            got = decoder.conditional(data, targets = ~vm)
+        assert_rows_close(got, reference.conditional(cc, data, None, ~vm, inputs = inputs), n)
+
+
+def test_a_session_under_a_value_mask(build_pc):
+    """Prefix decoding of the positions the value mask keeps (the free ones marginalized throughout), marginals and
+    conditionals (every missing position: the free ones too), then the rows moved: every call is what a fresh session
+    gives."""
+    pc = soft_pc(build_pc, "hmm")
+    n = KINDS["hmm"]
+    data, _, inputs = masked_evidence(n, 4)
+    vm = inputs["soft_evidence_value_mask"]
+    cc = jc.compile(CONSTRAINTS["contains"](), pc)
+    prefix = lambda t: (torch.arange(n, device = DEV)[None, :] >= t) & vm
+    order = torch.tensor([2, 0, 1, 3], device = DEV)
+    calls = [(data, prefix(t)) for t in range(n)] + [(data[order], prefix(n - 1))]
+    query = lambda decoder, x, m: (decoder.marginal(x, m), decoder.conditional(x, m))
+    for kw in (inputs, dict(inputs, categorical_evidence_logp = inputs["categorical_evidence_logp"][:1])):
+        with cc.decoder(**kw) as decoder:
+            session = [query(decoder, x, m) for x, m in calls]
+        for (x, m), (marg, cond) in zip(calls, session):
+            with cc.decoder(**kw) as decoder:
+                fresh = query(decoder, x, m)
+            assert_close(marg, fresh[0], n)
+            assert_rows_close(cond, fresh[1], n)
+
+
+def test_a_session_ignores_the_data_at_free_positions(build_pc, monkeypatch):
+    """Whatever the data holds at the positions the value mask frees: calls that differ only there (and in a newly
+    observed position) continue each other -- values are reused, and every call is a fresh session's."""
+    import pyjuice.constraints.backends.dfa_exact.queries.decoder as session_queries
+    held, real = [], session_queries.marginal
+    monkeypatch.setattr(session_queries, "marginal", lambda *a, **kw: (held.append(kw["held"]), real(*a, **kw))[1])
+    pc = soft_pc(build_pc, "hmm")
+    n = KINDS["hmm"]
+    data, _, inputs = masked_evidence(n, 4)
+    vm = inputs["soft_evidence_value_mask"]
+    cc = jc.compile(CONSTRAINTS["contains"](), pc)
+    calls = []
+    for t in range(n):
+        x = torch.where(vm, data, t % V)                                    # another token at every free position
+        calls.append((x, (torch.arange(n, device = DEV)[None, :] >= t) & vm))
+    with cc.decoder(**inputs) as decoder:
+        session = [decoder.marginal(x, m) for x, m in calls]
+    assert any(h is not None and h.any() for h in held[1:n])
+    for (x, m), got in zip(calls, session):
+        with cc.decoder(**inputs) as decoder:
+            assert_close(got, decoder.marginal(x, m), n)
+
+
 @pytest.mark.slow
 def test_codpula_shape(reference):
     """Codpula's PC: an HMM of 1024 latents over 32 positions and 126464 tokens; prefix decoding in a session under
@@ -347,14 +725,16 @@ def test_codpula_shape(reference):
 # The class masses on their own
 # -------------------------------------------------------------------------------------------------
 
+@pytest.mark.parametrize("evidence_kind", ["dense", "topk", "topk_transposed"])
 @pytest.mark.parametrize("classes", ["one", "three_and_empty", "each_token"])
 @pytest.mark.parametrize("Be", [1, 3])
 @pytest.mark.parametrize("kind", ["hmm", "hmm_untied", "hand_permuted"])
-def test_class_masses_match_a_float64_brute_force(kind, Be, classes, build_pc, monkeypatch):
-    """Every node's row, per sample: ``log sum_{v in c} p(v) w(v) - log Z`` against float64, over 40 tokens with
-    evidence on the first 30 (the others weigh nothing); the tokens in many splits, or in one (no partial budget),
-    written straight."""
-    Vb = 40
+def test_class_masses_match_a_float64_brute_force(kind, Be, classes, evidence_kind, build_pc, monkeypatch):
+    """Every node's row, per sample: ``log sum_{v in c} p(v) w(v) - log Z`` against float64, over 150 tokens with
+    evidence on 30 (the others weigh nothing): dense on the first 30, the tokens in many splits or in one (no partial
+    budget, written straight); or top-k on 30 others, the candidates' probabilities from the parameter table or (in
+    fast_inference) the library's transposed one, the classes 64 at a time (each token its own: three tiles)."""
+    Vb = 150
     pc = build_pc(kind, 5 if kind != "hmm_untied" else 4, Vb, input_dist = dists.SoftEvidenceCategorical)
     layer = next(iter(pc.input_layer_group))
     g = torch.Generator().manual_seed(1)
@@ -362,15 +742,23 @@ def test_class_masses_match_a_float64_brute_force(kind, Be, classes, build_pc, m
     E = (torch.randn(Be, nv, 30, generator = g) * 3).to(DEV)
     C = {"one": 1, "three_and_empty": 4, "each_token": Vb}[classes]
     tc = torch.tensor([0, 2, 3])[torch.randint(0, 3, (Vb,), generator = g)] if classes == "three_and_empty" else \
-        (torch.zeros(Vb, dtype = torch.long) if classes == "one" else torch.arange(Vb))   # (class 1 empty)
-    tokens = TokenClasses(tc.to(DEV), C)
+        (torch.zeros(Vb, dtype = torch.long) if classes == "one" else torch.randperm(Vb, generator = g))
+    tokens = TokenClasses(tc.to(DEV), C)                                    # (class 1 empty; each token: not in order)
     p = layer.params.view(-1, Vb).double()
-    w = torch.cat([E.double().exp(), torch.zeros(Be, nv, Vb - 30, device = DEV, dtype = torch.float64)], dim = 2)
-    for budget in (1 << 26, 1):
-        monkeypatch.setattr(softevi_categorical, "MASS_PARTIAL_BUDGET", budget)
+    if evidence_kind == "dense":
         inputs = dict(categorical_evidence_logp = E)
+        w = torch.cat([E.double().exp(), torch.zeros(Be, nv, Vb - 30, device = DEV, dtype = torch.float64)], dim = 2)
+    else:
+        ids = torch.argsort(torch.rand(Be, nv, Vb, generator = g), dim = 2)[..., :30].to(DEV)
+        inputs = dict(categorical_evidence_logp = E, soft_evidence_cat_ids = ids)
+        w = torch.zeros(Be, nv, Vb, device = DEV, dtype = torch.float64).scatter_(2, ids, E.double().exp())
+    for budget in ((1 << 26, 1) if evidence_kind == "dense" else (1 << 26,)):
+        monkeypatch.setattr(softevi_categorical, "MASS_PARTIAL_BUDGET", budget)
         out = torch.full((Be, softevi_categorical.sample_rows(layer, inputs), C), float("nan"), device = DEV)
-        si = softevi_categorical.sample_inputs(layer, tokens, inputs, out)
+        with juice.fast_inference() if evidence_kind == "topk_transposed" else torch.no_grad():
+            si = softevi_categorical.sample_inputs(layer, tokens, inputs, out)
+            assert (softevi_categorical._transposed_table(layer, inputs) is not None) == \
+                (evidence_kind == "topk_transposed")
         rows = softevi_categorical.class_mass_rows(layer)
         lvid = layer.var_idmapping[layer.vids.view(-1).long()]
         for b in range(Be):
@@ -392,11 +780,26 @@ def test_inputs_checked_and_refused(build_pc):
     n = KINDS["hmm"]
     data, missing, E = evidence(n, 2)
     cc = jc.compile(CONSTRAINTS["contains"](), pc)
-    ids = torch.zeros(2, n, V, dtype = torch.long, device = DEV)
-    with pytest.raises(NotImplementedError, match = "soft_evidence_cat_ids"):
-        cc.decoder(categorical_evidence_logp = E, soft_evidence_cat_ids = ids)
-    with pytest.raises(NotImplementedError, match = "soft_evidence_value_mask"):
-        cc.decoder(categorical_evidence_logp = E, soft_evidence_value_mask = missing)
+    ids = torch.arange(V, device = DEV).expand(2, n, V).contiguous()
+    with pytest.raises(ValueError, match = "needs `categorical_evidence_logp`"):
+        cc.decoder(soft_evidence_cat_ids = ids)
+    for bad in (ids[..., :2], ids.float(), ids.cpu()):
+        with pytest.raises(ValueError, match = "soft_evidence_cat_ids"):
+            cc.decoder(categorical_evidence_logp = E, soft_evidence_cat_ids = bad)
+    for value in (0, -1, V):                                               # a duplicate, out of range twice
+        bad = ids.clone()
+        bad[1, n - 1, 1] = value
+        with pytest.raises(ValueError, match = "distinct tokens"):
+            cc.decoder(categorical_evidence_logp = E, soft_evidence_cat_ids = bad)
+    with pytest.raises(ValueError, match = "needs `categorical_evidence_logp`"):
+        cc.decoder(soft_evidence_value_mask = missing)
+    for bad in (missing.float(), missing[:, :1], missing.expand(3, 2, n)):
+        with pytest.raises(ValueError, match = "soft_evidence_value_mask"):
+            cc.decoder(categorical_evidence_logp = E, soft_evidence_value_mask = bad)
+    with cc.decoder(categorical_evidence_logp = E, soft_evidence_value_mask = ~missing) as decoder:
+        with pytest.raises(ValueError, match = "one way"):                  # missing where the mask frees it
+            decoder.marginal(data, missing)
+        decoder.marginal(data, missing & ~missing)
     with pytest.raises(NotImplementedError, match = "sum_external_params"):
         cc.decoder(sum_external_params = {})
     with pytest.raises(ValueError, match = "K <="):
@@ -408,8 +811,6 @@ def test_inputs_checked_and_refused(build_pc):
             decoder.marginal(data[:1], missing[:1])
         with pytest.raises(TypeError, match = "whole session"):
             decoder.marginal(data, missing, categorical_evidence_logp = E)
-        with pytest.raises(NotImplementedError, match = "Conditionals"):
-            decoder.conditional(data, missing)
     plain = jc.compile(CONSTRAINTS["contains"](), build_pc("hmm", n, V))
     with pytest.raises(ValueError, match = "No input layer"):
         plain.decoder(categorical_evidence_logp = E)

@@ -89,7 +89,6 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
     if masses is None:
         masses = backend.state.masses()
     prog.transitions(masses)
-    class_mars = masses.table
     stacks, kept = backend.state.weight_stacks()
 
     r = prog.root_region                                 # the root: top-down value 0 (log 1) on its slot
@@ -167,11 +166,11 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
                 for once_launches, sample_launches, cw_launches in stages:
                     if once_launches:
                         run_top_down(once_launches, (temp, temp_width), prog, once, element_flows, temp_flows,
-                                     pf["flows"], node_mars, class_mars, prog.no_evidence, None, elem_first, ew, 1,
+                                     pf["flows"], node_mars, masses, prog.no_evidence, None, elem_first, ew, 1,
                                      srcs, out.skip, True, td.once_iv, tflow_width = tw)
                     if sample_launches:
                         run_top_down(sample_launches, (temp, temp_width), prog, fregions, element_flows, temp_flows,
-                                     node_flows, node_mars, class_mars, obs_class, live, elem_first, ew, B, srcs,
+                                     node_flows, node_mars, masses, obs_class, live, elem_first, ew, B, srcs,
                                      out.skip, exact, td.once_iv, lanes = lanes, compact = compact, tflow_width = tw,
                                      inside_regions = regions, inside = mars is not None)
                     if cw_launches and class_weights is not None:

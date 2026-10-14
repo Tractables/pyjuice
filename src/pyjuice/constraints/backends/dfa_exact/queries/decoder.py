@@ -105,14 +105,14 @@ class DFAExactDecoder(Decoder):
     def _conditional(self, data: torch.Tensor, missing: torch.Tensor, targets: Optional[torch.Tensor],
                      return_log_marginal: bool, candidates: Optional[torch.Tensor], precision: str = "fp32",
                      storage: str = "auto", external = None):
-        if external is not None:
-            raise NotImplementedError("Conditionals under per-sample inputs are not supported yet (marginals are).")
         be = self.cc.backend
-        held, keep, compact, carry = self._reuse(data, missing, targets, precision, storage, marginal = False)
+        held, keep, compact, carry = self._reuse(data, missing, targets, precision, storage, marginal = False,
+                                                 external = external)
         report = {}
         out = conditional(be, data, missing, targets, precision, return_log_marginal = return_log_marginal,
                           held = None if held is None else dict(inside = held[0], top_down = held[1]),
-                          candidates = candidates, report = report, storage = storage, carry = carry)
+                          candidates = candidates, report = report, storage = storage, carry = carry,
+                          external = external)
         self._after(data.size(0), precision, storage, keep, report, compact)
         return out
 
