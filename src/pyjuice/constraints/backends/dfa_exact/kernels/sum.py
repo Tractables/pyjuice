@@ -34,7 +34,8 @@ import triton.language as tl
 from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
-from ..external_params.block_scale import _add_gated_parent, _chunk_gates, _edge_gates, _node_log_z, _tile_gates
+from ..external_params.block_scale import (_add_gated_parent, _chunk_gates, _edge_gates, _node_log_z, _row_gates,
+                                           _segment_cell, _tile_gates)
 from .common import _child, _logaddexp_tile, grid_chunks
 from .compact import _lane_sample
 
@@ -70,6 +71,43 @@ def _lse_dot_step_biased(m, acc, x, w, bias, PRECISION: tl.constexpr):
 
 
 @triton.jit
+def _lse_dot_step_rows(m, acc, x, w, gates, gidx, offs, emask, samp, gstride, goff, mmask, cmask,
+                       PRECISION: tl.constexpr, TILE_E: tl.constexpr, SEG: tl.constexpr, SHARED: tl.constexpr):
+    """One chunk of edges of the online log-sum-exp when the tile's rows read several node gates (node gates finer than
+    the tile, see :mod:`..external_params.block_scale`; row ``r``'s cells are ``goff[r]`` from the block's first
+    row's): the running maximum ``m`` per row and column, from -FLT_MAX (nothing: no rescale, no NaN). Every segment of
+    ``SEG`` edges (one gate cell; the whole chunk when it reads one) is shifted by its own maximum per column -- an
+    entry is lost only far below one of the same gate, as in :func:`_lse_dot_step` -- and is a product of its own,
+    scaled per row and column by its gate: of the running sum's and the segment's factors one is 1, the other
+    ``exp(-|t - m|)`` (one exp per row and column)."""
+    NSEG: tl.constexpr = TILE_E // SEG
+    TILE_B: tl.constexpr = x.shape[1]
+    if NSEG == 1:
+        xm = tl.max(x, axis = 0)                                                     # -inf: nothing
+        e = tl.exp(x - tl.where(xm == float("-inf"), 0.0, xm)[None, :])
+    else:
+        xm3 = tl.max(tl.reshape(x, [NSEG, SEG, TILE_B]), axis = 1)                     # [NSEG, TILE_B]
+        sh3 = tl.where(xm3 == float("-inf"), 0.0, xm3)
+        e = tl.exp(x - tl.reshape(tl.broadcast_to(sh3[:, None, :], [NSEG, SEG, TILE_B]), [TILE_E, TILE_B]))
+    for s in tl.static_range(NSEG):
+        if NSEG == 1:
+            seg = emask
+            ws = w
+        else:
+            seg = emask & (tl.arange(0, TILE_E) // SEG == s)
+            ws = tl.where(seg[None, :], w, 0.0)
+            xm = tl.max(tl.where((tl.arange(0, NSEG) == s)[:, None], xm3, float("-inf")), axis = 0)  # segment s's
+        g = _row_gates(gates, _segment_cell(gidx, offs, seg), goff, samp, gstride, mmask, cmask, SHARED)
+        part = tl.dot(ws, e, input_precision = PRECISION)
+        t = xm[None, :] + g                                                          # the segment's log-bound
+        up = t > m
+        r = tl.exp(tl.where(up, m - t, t - m))                                       # -inf - finite: 0
+        acc = acc * tl.where(up, r, 1.0) + part * tl.where(up, 1.0, r)
+        m = tl.maximum(m, t)
+    return m, acc
+
+
+@triton.jit
 def _column_sample(cols, reg, reg_slots, coff, reg_ivk, Bq, steps, LANES: tl.constexpr):
     """The sample of every column ``cols`` of a row of sum region ``reg`` (a gated layer's): its block of the region's
     slots, or ``LANES`` (compact rows, see :mod:`.compact`), the sample whose lanes hold it."""
@@ -88,25 +126,48 @@ def _gate_tile(tile: int, uniform: dict) -> int:
     return tile
 
 
-def gate_launch(gated: Optional[dict], dummy: torch.Tensor, idx = None, a_idx = None) -> tuple:
-    """The sum kernels' gate arguments, ``(idx, a_idx, gates, gstride, lz, lzstride, coff, reg_ivk, Bq, steps)``, from
-    a part's gates (see :func:`~..queries.forward.part_gates`; ``dummy`` where nothing is read)."""
+def _gate_segment(tile: int, uniform: dict) -> int:
+    """The segments of a chunk of ``tile`` edges that read one gate cell each: the widest aligned run of edges, a power
+    of two, whose every one does (``uniform``, see ``block_scale.uniform_chunks``)."""
+    t = tile
+    while t > 1 and not uniform.get(t, False):
+        t //= 2
+    return t
+
+
+def _node_gates_per_tile(block_size: int, node_gate: int, tile: int) -> int:
+    """The node gates a tile of ``tile`` rows of a node block spans at most (1: every tile lies in one)."""
+    if node_gate >= block_size:
+        return 1
+    return max((min(block_size, t + tile) - 1) // node_gate - t // node_gate + 1 for t in range(0, block_size, tile))
+
+
+def _row_tile(tile: int, block_size: int, node_gate: int) -> int:
+    """A gated launch's tile of node rows when node gates are finer than the block: within one node gate where the
+    products can be (16 rows or more) -- a tile of several reads a gate per row and keeps a maximum per row."""
+    return min(tile, max(16, host_next_power_of_2(node_gate)))
+
+
+def gate_launch(gated: Optional[dict], dummy: torch.Tensor, idx = None, a_idx = None, ck = None) -> tuple:
+    """The sum kernels' gate arguments, ``(idx, a_idx, ck, gates, gstride, lz, lzstride, coff, reg_ivk, Bq, steps)``,
+    from a part's gates (see :func:`~..queries.forward.part_gates`; ``dummy`` where nothing is read)."""
     if gated is None:
-        return (dummy,) * 2 + (dummy, 0, dummy, 0, dummy, dummy, 1, 1)
+        return (dummy,) * 3 + (dummy, 0, dummy, 0, dummy, dummy, 1, 1)
     off, reg_ivk, Bq, steps = gated["lanes"] if gated["lanes"] is not None else (dummy, dummy, 1, 1)
-    return (idx if idx is not None else dummy, a_idx if a_idx is not None else dummy, gated["values"],
-            gated["gstride"], gated["lz"], gated["lzstride"], off, reg_ivk, Bq, steps)
+    return (idx if idx is not None else dummy, a_idx if a_idx is not None else dummy, ck if ck is not None else dummy,
+            gated["values"], gated["gstride"], gated["lz"], gated["lzstride"], off, reg_ivk, Bq, steps)
 
 
 @triton_jit
 def _lifted_sum_kernel(node_mars, element_mars, weights, nids, cids, pids, nb_reg, sel,
                        reg_offset, reg_width, reg_first, reg_slots, a_rows, a_regs, a_pids, perm, reg_perm, reg_live,
-                       gidx, a_gidx, gates, gstride, lz, lzstride, coff, reg_ivk, Bq, steps,
+                       gidx, a_gidx, gck, gates, gstride, lz, lzstride, coff, reg_ivk, Bq, steps,
                        elem_first, elem_width, B, num_edges, num_alias, num_mtiles, pid0,
                        BS: tl.constexpr, TILE_M: tl.constexpr, TILE_E: tl.constexpr, TILE_A: tl.constexpr,
                        TILE_B: tl.constexpr, PRECISION: tl.constexpr, ALIAS: tl.constexpr, PRUNE: tl.constexpr,
                        INDEXED: tl.constexpr, GATED: tl.constexpr, LANES: tl.constexpr, CHUNK_GATE: tl.constexpr,
-                       A_CHUNK_GATE: tl.constexpr, SHARED_GATES: tl.constexpr):
+                       A_CHUNK_GATE: tl.constexpr, SHARED_GATES: tl.constexpr, NG: tl.constexpr, NGT: tl.constexpr,
+                       SEG: tl.constexpr, A_SEG: tl.constexpr):
     """One program per (node block -- of the plan's index list ``sel`` if ``INDEXED`` --, tile of its nodes, tile of
     columns). Pruned (``PRUNE``), the program's columns are positions in the region's interval's order of columns
     (live ones first, see :mod:`.live`): a tile past the live ones is all -inf, without reading anything. ``GATED``
@@ -114,7 +175,10 @@ def _lifted_sum_kernel(node_mars, element_mars, weights, nids, cids, pids, nb_re
     column's sample (``gidx`` / ``a_gidx`` the edges' cells in ``gates``, ``gstride`` floats per sample, 0 for every
     sample's), and every node's ``log Z`` of the sample (``lz``, by node row, ``lzstride`` per sample) taken off;
     ``CHUNK_GATE`` / ``A_CHUNK_GATE``: every chunk of edges (aliased children) reads one cell; ``SHARED_GATES``: the
-    gates are every sample's."""
+    gates are every sample's; ``NG``: the node gate size, below ``BS`` a node block's rows read several -- node gate
+    ``m // NG`` of row ``m`` is ``gck`` (its node group's grid row length) cells per gate from the first row's: a tile
+    of rows within one (``NGT`` 1) reads its cells, else its rows read their own, every chunk in segments of ``SEG``
+    (``A_SEG``) edges of one cell each (:func:`_lse_dot_step_rows`)."""
     pid_nm = tl.program_id(0)                                     # (node block, tile of its nodes)
     pid_c = pid0 + tl.program_id(1)                               # tile of columns
     pid_n = _child(sel, pid_nm // num_mtiles, INDEXED)
@@ -142,6 +206,12 @@ def _lifted_sum_kernel(node_mars, element_mars, weights, nids, cids, pids, nb_re
         mmask = offs_m < BS
         m = tl.full([TILE_B], float("-inf"), dtype = tl.float32)
         acc = tl.zeros([TILE_M, TILE_B], dtype = tl.float32)
+        if GATED and NG < BS:                                              # node gates finer than the block
+            if NGT == 1:                                                   # the tile's one: its cells
+                gates += (mt * TILE_M) // NG * tl.load(gck + pid_n)
+            else:                                                          # several: per row
+                m2 = tl.full([TILE_M, TILE_B], -3.4028234663852886e38, dtype = tl.float32)
+                goff = (offs_m // NG) * tl.load(gck + pid_n)
         for e0 in range(0, n_edges, TILE_E):
             offs_e = e0 + tl.arange(0, TILE_E)
             emask = offs_e < num_edges
@@ -150,11 +220,14 @@ def _lifted_sum_kernel(node_mars, element_mars, weights, nids, cids, pids, nb_re
             valid = emask & (cid >= elem_first)
             x = tl.load(element_mars + (cid - elem_first)[:, None] * elem_width + cols[None, :],
                         mask = valid[:, None] & cmask[None, :], other = float("-inf"))           # [TILE_E, TILE_B]
-            if GATED and not CHUNK_GATE:
+            if GATED and not CHUNK_GATE and NGT == 1:
                 x += _edge_gates(gates, gidx + pid_n * num_edges, offs_e, emask, samp, gstride, cmask, SHARED_GATES)
             w = tl.load(weights + pid[None, :] + offs_m[:, None],
                         mask = mmask[:, None] & valid[None, :], other = 0.0)                    # [TILE_M, TILE_E]
-            if GATED and CHUNK_GATE:                                       # one gate per column
+            if GATED and NGT > 1:                                          # gates per row and column
+                m2, acc = _lse_dot_step_rows(m2, acc, x, w, gates, gidx + pid_n * num_edges, offs_e, emask, samp,
+                                             gstride, goff, mmask, cmask, PRECISION, TILE_E, SEG, SHARED_GATES)
+            elif GATED and CHUNK_GATE:                                     # one gate per column
                 m, acc = _lse_dot_step_biased(m, acc, x, w, _chunk_gates(gates, gidx + pid_n * num_edges, offs_e, emask,
                                                                          samp, gstride, cmask, SHARED_GATES), PRECISION)
             else:
@@ -173,18 +246,24 @@ def _lifted_sum_kernel(node_mars, element_mars, weights, nids, cids, pids, nb_re
                 base = tl.multiple_of(base, 16)                       # regions start and rows are padded to 16 floats
                 x = tl.load(node_mars + base[:, None] + cols[None, :], mask = valid[:, None] & cmask[None, :],
                             other = float("-inf"))                                             # [TILE_A, TILE_B]
-                if GATED and not A_CHUNK_GATE:
+                if GATED and not A_CHUNK_GATE and NGT == 1:
                     x += _edge_gates(gates, a_gidx + pid_n * num_alias, offs_a, amask, samp, gstride, cmask,
                                      SHARED_GATES)
                 w = tl.load(weights + pid[None, :] + offs_m[:, None],
                             mask = mmask[:, None] & valid[None, :], other = 0.0)                # [TILE_M, TILE_A]
-                if GATED and A_CHUNK_GATE:
+                if GATED and NGT > 1:
+                    m2, acc = _lse_dot_step_rows(m2, acc, x, w, gates, a_gidx + pid_n * num_alias, offs_a, amask, samp,
+                                                 gstride, goff, mmask, cmask, PRECISION, TILE_A, A_SEG, SHARED_GATES)
+                elif GATED and A_CHUNK_GATE:
                     m, acc = _lse_dot_step_biased(m, acc, x, w, _chunk_gates(gates, a_gidx + pid_n * num_alias, offs_a,
                                                                              amask, samp, gstride, cmask, SHARED_GATES),
                                                   PRECISION)
                 else:
                     m, acc = _lse_dot_step(m, acc, x, w, PRECISION)
-        out = tl.log(acc) + tl.where(m == float("-inf"), 0.0, m)[None, :]
+        if GATED and NGT > 1:
+            out = tl.log(acc) + m2                                         # nothing: log 0 = -inf
+        else:
+            out = tl.log(acc) + tl.where(m == float("-inf"), 0.0, m)[None, :]
         nid = tl.load(nids + pid_n).to(tl.int64)
         if GATED:
             out -= _node_log_z(lz, samp, lzstride, nid + offs_m, mmask, kmask, SHARED_GATES)
@@ -221,17 +300,28 @@ def fused_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch
     TILE_M = min(tm, max(16, host_next_power_of_2(block_size)))
     TILE_E = min(te, max(16, host_next_power_of_2(num_edges)))
     TILE_B = min(tb, max(16, host_next_power_of_2(max_cols)))
+    NG = gated["node_gate"] if gated is not None else block_size
+    if NG < block_size:
+        TILE_M = _row_tile(TILE_M, block_size, NG)
+    NGT = _node_gates_per_tile(block_size, NG, TILE_M)
+    rows = NGT > 1                                       # a tile's rows read several node gates
     if gated is not None:                                # a chunk of edges within one gate, if one fits
         TILE_E = _gate_tile(TILE_E, gated["uniform"])
+        if rows and not gated["uniform"].get(TILE_E, False):            # else a product per segment of one gate:
+            TILE_E = 16                                                 # chunks of the fewest
     num_mtiles = host_cdiv(block_size, TILE_M)
     a_rows, a_regs, a_pids = aliased if aliased is not None else (cids, cids, cids)
     num_alias = a_rows.size(1) if aliased is not None else 0
     TILE_A = min(te, max(16, host_next_power_of_2(num_alias)))
+    if rows and aliased is not None:
+        TILE_A = _gate_tile(TILE_A, gated["a_uniform"])
+        if not gated["a_uniform"].get(TILE_A, False):
+            TILE_A = 16
     lanes = liveness.lanes if liveness is not None else None
     perm, reg_perm, reg_live = (lanes.perm, lanes.reg_first, lanes.reg_live) if lanes is not None else \
         (cids, cids, cids)
     g = gate_launch(gated, cids, gated.get("idx") if gated else None,
-                    gated.get("a_idx") if gated and aliased is not None else None)
+                    gated.get("a_idx") if gated and aliased is not None else None, gated.get("ck") if gated else None)
     for first, size in grid_chunks(host_cdiv(max_cols, TILE_B), 1):
         _lifted_sum_kernel[(num_blocks * num_mtiles, size)](
             node_mars, element_mars, params, nids, cids, pids, nb_reg, nids if sel is None else sel, regions["offset"],
@@ -243,7 +333,10 @@ def fused_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch
             LANES = gated is not None and gated["lanes"] is not None,
             CHUNK_GATE = gated is not None and gated["uniform"].get(TILE_E, False),
             A_CHUNK_GATE = gated is not None and aliased is not None and gated["a_uniform"].get(TILE_A, False),
-            SHARED_GATES = gated is not None and gated["gstride"] == 0, num_warps = warps, num_stages = stages)
+            SHARED_GATES = gated is not None and gated["gstride"] == 0, NG = NG, NGT = NGT,
+            SEG = _gate_segment(TILE_E, gated["uniform"]) if gated is not None else 1,
+            A_SEG = _gate_segment(TILE_A, gated["a_uniform"]) if gated is not None and aliased is not None else 1,
+            num_warps = warps, num_stages = stages)
 
 
 # -------------------------------------------------------------------------------------------------
@@ -435,12 +528,12 @@ def _dense_sum_live(nodes, elems, params, groups, E, BS, first, elem_first, ncol
 @triton_jit
 def _lifted_sum_top_down_kernel(element_flows, node_flows, weights, cb_row, cb_reg, cb_add, cb_ivreg, cb_idx, par_ptr,
                                par_nid, par_reg, par_pid, reg_offset, reg_width, reg_first, reg_slots, perm, reg_perm,
-                               reg_live, par_lc, par_grow, par_gcbs, gates, gstride, lz, lzstride, coff, reg_ivk, Bq,
-                               steps, elem_first, elem_width, B, pid0, BS: tl.constexpr, CBS: tl.constexpr,
-                               TILE_C: tl.constexpr, TILE_I: tl.constexpr, TILE_B: tl.constexpr,
+                               reg_live, par_lc, par_grow, par_gcbs, par_gck, gates, gstride, lz, lzstride, coff,
+                               reg_ivk, Bq, steps, elem_first, elem_width, B, pid0, BS: tl.constexpr,
+                               CBS: tl.constexpr, TILE_C: tl.constexpr, TILE_I: tl.constexpr, TILE_B: tl.constexpr,
                                PRECISION: tl.constexpr, PRUNE: tl.constexpr, INDEXED: tl.constexpr,
                                GATED: tl.constexpr, LANES: tl.constexpr, GATE_TILE: tl.constexpr,
-                               SHARED_GATES: tl.constexpr):
+                               SHARED_GATES: tl.constexpr, NG: tl.constexpr):
     """One program per (child block, tile of its children, tile of columns): ``O_child[c, col] = log sum over the
     block's parent node blocks and their nodes i of w[c, i] exp(O_node[i, col])``, an online log-sum-exp over tiles
     of parent nodes with the products on tensor cores -- the forward's fused kernel with children and nodes
@@ -453,7 +546,9 @@ def _lifted_sum_top_down_kernel(element_flows, node_flows, weights, cb_row, cb_r
     every child and sample -- its grid row ``par_grow``, the child gate of the block's first child's place ``par_lc``
     over ``par_gcbs`` --, log-added per child and column (the gates vary with both); ``GATE_TILE``: every tile of
     children lies in one child gate, whose gate the parent's values take as they come (one per column);
-    ``SHARED_GATES``: the gates are every sample's."""
+    ``SHARED_GATES``: the gates are every sample's; ``NG``: the node gate size -- below ``BS`` a parent block's rows
+    read several (node gate ``i // NG`` of row ``i``, ``par_gck`` cells per gate from the first row's): taken by the
+    parent values per row with ``GATE_TILE``, else a sum of its own per node gate."""
     pid_cm = tl.program_id(0)
     pid_c = pid0 + tl.program_id(1)
     cb = pid_cm // ((CBS + TILE_C - 1) // TILE_C)
@@ -495,31 +590,48 @@ def _lifted_sum_top_down_kernel(element_flows, node_flows, weights, cb_row, cb_r
                 pid = tl.load(par_pid + p).to(tl.int64)
                 base = tl.load(reg_offset + reg) + (nid - tl.load(reg_first + reg)) * tl.load(reg_width + reg)
                 width = tl.load(reg_width + reg)
-                if GATED:
-                    if GATE_TILE:                                             # the tile's one gate per column
-                        gb = _tile_gates(gates, samp, gstride, tl.load(par_grow + p),
-                                         tl.load(par_lc + p) + ct * TILE_C, tl.load(par_gcbs + p), cmask, SHARED_GATES)
-                    else:                                                     # the parent block's own sum
+                if GATED and not GATE_TILE:                                   # per node gate: its own sum, times
+                    grow = tl.load(par_grow + p)                              # its gates, log-added
+                    for g0 in range(0, BS, NG):
                         m = tl.full([TILE_B], float("-inf"), dtype = tl.float32)
                         acc = tl.zeros([TILE_C, TILE_B], dtype = tl.float32)
-                for i0 in range(0, BS, TILE_I):
-                    offs_i = i0 + tl.arange(0, TILE_I)
-                    im = offs_i < BS
-                    w = tl.load(weights + pid + offs_c[:, None] * BS + offs_i[None, :],
-                                mask = cm[:, None] & im[None, :], other = 0.0)                # [TILE_C, TILE_I]
-                    x = tl.load(node_flows + base + offs_i.to(tl.int64)[:, None] * width + cols[None, :],
-                                mask = im[:, None] & cmask[None, :], other = float("-inf"))     # [TILE_I, TILE_B]
-                    if GATED:
-                        x -= _node_log_z(lz, samp, lzstride, nid + offs_i, im, cmask, SHARED_GATES)
-                    if GATED and GATE_TILE:
-                        m, acc = _lse_dot_step_biased(m, acc, x, w, gb, PRECISION)
-                    else:
-                        m, acc = _lse_dot_step(m, acc, x, w, PRECISION)
-                if GATED:
-                    if not GATE_TILE:                                         # times its gates, log-added
-                        m2, acc2 = _add_gated_parent(m2, acc2, m, acc, gates, samp, gstride, tl.load(par_grow + p),
-                                                     tl.load(par_lc + p), tl.load(par_gcbs + p), offs_c, cm, cmask,
-                                                     SHARED_GATES)
+                        for i0 in range(g0, g0 + NG, TILE_I):
+                            offs_i = i0 + tl.arange(0, TILE_I)
+                            im = (offs_i < g0 + NG) & (offs_i < BS)
+                            w = tl.load(weights + pid + offs_c[:, None] * BS + offs_i[None, :],
+                                        mask = cm[:, None] & im[None, :], other = 0.0)        # [TILE_C, TILE_I]
+                            x = tl.load(node_flows + base + offs_i.to(tl.int64)[:, None] * width + cols[None, :],
+                                        mask = im[:, None] & cmask[None, :], other = float("-inf"))
+                            x -= _node_log_z(lz, samp, lzstride, nid + offs_i, im, cmask, SHARED_GATES)
+                            m, acc = _lse_dot_step(m, acc, x, w, PRECISION)
+                        m2, acc2 = _add_gated_parent(m2, acc2, m, acc, gates, samp, gstride,
+                                                     grow + (g0 // NG) * tl.load(par_gck + p), tl.load(par_lc + p),
+                                                     tl.load(par_gcbs + p), offs_c, cm, cmask, SHARED_GATES)
+                else:
+                    if GATED:                                                 # the tile's one child gate
+                        gcell = tl.load(par_grow + p) + (tl.load(par_lc + p) + ct * TILE_C) // tl.load(par_gcbs + p)
+                        if NG == BS:                                          # ... and node gate: per column
+                            gb = _tile_gates(gates, samp, gstride, tl.load(par_grow + p),
+                                             tl.load(par_lc + p) + ct * TILE_C, tl.load(par_gcbs + p), cmask,
+                                             SHARED_GATES)
+                        else:                                                 # ... per row and column
+                            gck = tl.load(par_gck + p)
+                    for i0 in range(0, BS, TILE_I):
+                        offs_i = i0 + tl.arange(0, TILE_I)
+                        im = offs_i < BS
+                        w = tl.load(weights + pid + offs_c[:, None] * BS + offs_i[None, :],
+                                    mask = cm[:, None] & im[None, :], other = 0.0)            # [TILE_C, TILE_I]
+                        x = tl.load(node_flows + base + offs_i.to(tl.int64)[:, None] * width + cols[None, :],
+                                    mask = im[:, None] & cmask[None, :], other = float("-inf"))   # [TILE_I, TILE_B]
+                        if GATED:
+                            x -= _node_log_z(lz, samp, lzstride, nid + offs_i, im, cmask, SHARED_GATES)
+                            if NG < BS:
+                                x += _row_gates(gates, gcell, (offs_i // NG) * gck, samp, gstride, im, cmask,
+                                                SHARED_GATES)
+                        if GATED and NG == BS:
+                            m, acc = _lse_dot_step_biased(m, acc, x, w, gb, PRECISION)
+                        else:
+                            m, acc = _lse_dot_step(m, acc, x, w, PRECISION)
         if GATED and not GATE_TILE:
             out = tl.log(acc2) + tl.where(m2 == float("-inf"), 0.0, m2)
         else:
@@ -562,22 +674,25 @@ def fused_sum_top_down(element_flows: torch.Tensor, node_flows: torch.Tensor, pa
     gt = tables["gate"] if gated is not None else None
     if gt is not None:                                   # a tile of children within one gate, if one fits
         TILE_C = _gate_tile(TILE_C, gt["uniform"])
+        if gt["node_gate"] < block_size and not gt["uniform"].get(TILE_C, False):   # a sum per node gate: its rows
+            TILE_I = min(TILE_I, max(16, gt["node_gate"]))                         # at once, when 16 or more
     num_ctiles = host_cdiv(cbs, TILE_C)
     lanes = liveness.lanes if liveness is not None else None
     perm, reg_perm, reg_live = (lanes.perm, lanes.reg_first, lanes.reg_live) if lanes is not None else \
         (tables["cb_row"], tables["cb_row"], tables["cb_row"])
-    g = (gt["lc"], gt["row"], gt["cbs"]) if gt is not None else (tables["cb_row"],) * 3
+    g = (gt["lc"], gt["row"], gt["cbs"], gt["ck"]) if gt is not None else (tables["cb_row"],) * 4
     for first, size in grid_chunks(host_cdiv(max_cols, TILE_B), 1):
         _lifted_sum_top_down_kernel[(num_blocks * num_ctiles, size)](
             element_flows, node_flows, params, tables["cb_row"], tables["cb_reg"], tables["cb_add"], tables["cb_ivreg"],
             tables["cb_row"] if idx is None else idx, tables["par_ptr"], tables["par_nid"], tables["par_reg"],
             tables["par_pid"], regions["offset"], regions["width"], regions["first"], regions["slots"], perm, reg_perm,
-            reg_live, *g, *gate_launch(gated, tables["cb_row"])[2:], elem_first, elem_width, batch_size,
+            reg_live, *g, *gate_launch(gated, tables["cb_row"])[3:], elem_first, elem_width, batch_size,
             first, BS = block_size, CBS = cbs, TILE_C = TILE_C, TILE_I = TILE_I, TILE_B = TILE_B,
             PRECISION = precision, PRUNE = liveness is not None, INDEXED = idx is not None, GATED = gated is not None,
             LANES = gated is not None and gated["lanes"] is not None,
             GATE_TILE = gt is not None and gt["uniform"].get(TILE_C, False),
-            SHARED_GATES = gated is not None and gated["gstride"] == 0, num_warps = warps, num_stages = stages)
+            SHARED_GATES = gated is not None and gated["gstride"] == 0,
+            NG = gt["node_gate"] if gt is not None else block_size, num_warps = warps, num_stages = stages)
 
 
 @triton_jit

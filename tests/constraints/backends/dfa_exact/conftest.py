@@ -563,15 +563,19 @@ PC_KINDS = {
 }
 
 
-def gate_sums(root, child_gate = lambda ns: ns.ch_block_size, tie_external = False, which = lambda ns: True):
+def gate_sums(root, child_gate = lambda ns: ns.ch_block_size, tie_external = False, which = lambda ns: True,
+              node_gate = lambda ns: ns.block_size):
     """Every sum node group of the circuit under ``root`` that ``which`` picks made gated, before it is compiled: a
-    :class:`BlockScaleSumParams` with one gate per node block and ``child_gate(ns)`` children per child gate."""
+    :class:`BlockScaleSumParams` with ``node_gate(ns)`` nodes per node gate (default: one per node block) and
+    ``child_gate(ns)`` children per child gate."""
     from pyjuice.nodes import BlockScaleSumParams
     from pyjuice.nodes.external_sum_nodes import ExternalParamsSumNodes
     for ns in root:
         if ns.is_sum() and which(ns):
             ns.__class__ = ExternalParamsSumNodes
-            ns.external_params = BlockScaleSumParams(ch_block_size = child_gate(ns), tie_external = tie_external)
+            node = node_gate(ns)
+            ns.external_params = BlockScaleSumParams(block_size = None if node == ns.block_size else node,
+                                                     ch_block_size = child_gate(ns), tie_external = tie_external)
             ns.external_params.validate_ns(ns)
     return root
 

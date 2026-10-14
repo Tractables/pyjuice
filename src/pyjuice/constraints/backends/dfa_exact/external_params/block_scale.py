@@ -7,8 +7,8 @@ forward under ``pc(x, sum_external_params = ...)``. The gates are constant over 
 sum adds ``log phi_b[g(n, c)]`` to child ``c``'s values and takes ``log Z_b[n]`` off node ``n``'s, column by column;
 the top-down pass takes ``log Z`` off a parent's values and multiplies a parent block's sum by its gates (the kernel
 helpers below). The normalizers depend on the sample and the parameters only: computed once per session
-(:func:`log_normalizers`). One gate per node block (the parameterization's default); a child gate of a child block or
-finer.
+(:func:`log_normalizers`). Node gates of a node block or finer (then a node block's rows read several: the sum kernels
+scale their products per node row, see :mod:`..kernels.sum`); child gates of a child block or finer.
 
 A session's gates (:func:`session_inputs`) follow the library's rules: one tensor ``[batch, node gates, child gates]``
 of log gates per node group, the copies of a tied node reading their own unless the gates are tied (``tie_external``:
@@ -28,11 +28,7 @@ import triton.language as tl
 
 
 def refusal(ns) -> Optional[str]:
-    """Why a gated node group cannot be served under a constraint, or None."""
-    gate_bs = ns.external_params.gate_sizes(ns)[0]
-    if gate_bs != ns.block_size:
-        return f"BlockScaleSumParams with node gates of {gate_bs} nodes, finer than the node blocks " \
-               f"({ns.block_size}): only one gate per node block is supported"
+    """Why a gated node group cannot be served under a constraint, or None (every one can)."""
     return None
 
 
@@ -73,22 +69,28 @@ def cells(pc) -> Cells:
 def edge_tables(layout: Cells, layer, nids: torch.Tensor, cids: torch.Tensor, elem_first: int, dev) -> dict:
     """
     The gate of every edge of a gated sum layer's node blocks (``nids`` [K], ``cids`` [K, E]: their first node rows and
-    children): ``idx`` int32 [K, E] on the device, its cell; and, for the top-down tables, every node block's grid row
-    ``row`` (the cell of its node gate and child gate 0, int64 [K]), its node group's child gate size ``cbs`` (int64
-    [K]) and every edge's child's place among the node group's children ``lc`` (int64 [K, E]; the children concatenated
-    in ``ns.chs`` order), on the host; ``layer``: the layer's index among the gated ones. Padding edges (children below
-    ``elem_first``) read cell 0.
+    children): ``idx`` int32 [K, E] on the device, its cell (its node block's first row's); ``ck`` int32 [K] on the
+    device, the grid's row length of every node block's node group -- the cells one node gate apart -- and ``node_gate``
+    the layer's node gate size; for the top-down tables, every node block's grid row ``row`` (the cell of its first
+    row's node gate and child gate 0, int64 [K]), its node group's child gate size ``cbs`` (int64 [K]) and every edge's
+    child's place among the node group's children ``lc`` (int64 [K, E]; the children concatenated in ``ns.chs`` order),
+    on the host; ``layer``: the layer's index among the gated ones. Padding edges (children below ``elem_first``) read
+    cell 0.
     """
     nodes = sorted(layer.nodes, key = lambda ns: ns._output_ind_range[0])
     starts = np.asarray([ns._output_ind_range[0] for ns in nodes], dtype = np.int64)
     nid_h, cid_h = nids.cpu().long().numpy(), cids.cpu().long().numpy()
     K, E = cid_h.shape
     row, cbs, lc = np.zeros(K, dtype = np.int64), np.ones(K, dtype = np.int64), np.zeros((K, E), dtype = np.int64)
+    ck = np.zeros(K, dtype = np.int64)
+    node_gates = {ns.external_params.gate_sizes(ns)[0] for ns in nodes}
+    assert len(node_gates) == 1, node_gates          # a layer's nodes share their block size and gate signature
     for k, at in enumerate(np.searchsorted(starts, nid_h, side = "right") - 1):
         ns = nodes[at]
         owner = ns.external_params.storage_owner(ns)
         gate_bs, gate_cbs = ns.external_params.gate_sizes(ns)
-        row[k] = layout.base[owner] + (nid_h[k] - starts[at]) // gate_bs * layout.shape[owner][1]
+        ck[k] = layout.shape[owner][1]
+        row[k] = layout.base[owner] + (nid_h[k] - starts[at]) // gate_bs * ck[k]
         cbs[k] = gate_cbs
         first = np.asarray([cs._output_ind_range[0] for cs in ns.chs], dtype = np.int64)
         if np.unique(first).size != first.size:
@@ -100,14 +102,15 @@ def edge_tables(layout: Cells, layer, nids: torch.Tensor, cids: torch.Tensor, el
         j = order[np.clip(np.searchsorted(first[order], c, side = "right") - 1, 0, None)]
         lc[k] = np.where(c >= elem_first, cum[j] + c - first[j], 0)
     idx = np.where(cid_h >= elem_first, row[:, None] + lc // cbs[:, None], 0)
-    return dict(idx = torch.from_numpy(np.ascontiguousarray(idx)).to(dev, torch.int32), row = row, cbs = cbs, lc = lc,
+    i32 = lambda a: torch.from_numpy(np.ascontiguousarray(a)).to(dev, torch.int32)
+    return dict(idx = i32(idx), ck = i32(ck), ck_host = ck, node_gate = node_gates.pop(), row = row, cbs = cbs, lc = lc,
                 layer = next(k for k, gl in enumerate(layout.layers) if gl is layer),
                 uniform = uniform_chunks(idx, cid_h >= elem_first))
 
 
-#: the chunk sizes the sum kernels may take, for which :func:`uniform_chunks` / :func:`uniform_tiles` say whether a
-#: chunk's (a tile's) gate is one
-GATE_CHUNKS = (16, 32, 64, 128)
+#: the chunk sizes the sum kernels may take, or split a chunk into, for which :func:`uniform_chunks` /
+#: :func:`uniform_tiles` say whether a chunk's (a tile's) gate is one
+GATE_CHUNKS = (1, 2, 4, 8, 16, 32, 64, 128)
 
 
 def uniform_chunks(idx: np.ndarray, valid: np.ndarray) -> dict:
@@ -277,6 +280,25 @@ def _chunk_gates(gates, gidx, offs, emask, samp, gstride, cmask, SHARED: tl.cons
         return tl.load(gates + g)
     else:
         return tl.load(gates + samp * gstride + g, mask = cmask, other = 0.0)
+
+
+@triton.jit
+def _segment_cell(gidx, offs, seg):
+    """The cell a segment of a chunk of edges reads (its edges' cells at ``gidx + offs``, ``seg`` the segment's real
+    ones: they are one, the largest taken; 0 for none) -- of its node block's first row."""
+    return tl.max(tl.load(gidx + offs, mask = seg, other = 0), axis = 0)
+
+
+@triton.jit
+def _row_gates(gates, cell, roff, samp, gstride, rmask, cmask, SHARED: tl.constexpr):
+    """[rows, columns] (``SHARED``: [rows, 1]): the log gates of a tile of node rows whose node gates differ -- row
+    ``r`` reads cell ``cell + roff[r]`` (``roff``: its node gate's offset in the grid from the block's first row's) --
+    of every column's sample; 0 where masked."""
+    if SHARED:
+        return tl.load(gates + cell + roff, mask = rmask, other = 0.0)[:, None]
+    else:
+        return tl.load(gates + samp[None, :] * gstride + cell + roff[:, None], mask = rmask[:, None] & cmask[None, :],
+                       other = 0.0)
 
 
 @triton.jit

@@ -1,12 +1,13 @@
 """
 Gated sum nodes (:class:`~pyjuice.nodes.external_params.BlockScaleSumParams`) under a constraint, their gates
-(``sum_external_params``) bound to a decoder session (:mod:`pyjuice.constraints.backends.dfa_exact.gates`). Sample
-``b``'s sum node ``n`` weighs child ``c`` by ``theta[n, c] phi_b[g(n, c)] / Z_b[n]``, so the truth is pyjuice's own
-gated forward: under the one-state constraint ``pc(x, missing_mask, sum_external_params)`` itself, under any other the
-log-sum of it over the completions the constraint accepts, and for conditionals the float64 reference with every
-sample's weights. Every kind of PC of conftest.py with its sums gated -- a gate per node block, child gates of a child
-block or finer --, gates per row or one row for all, dense and compact storage, together with soft evidence, sessions,
-some layers gated or given gates only, registered groups and tied gates; and what a session refuses.
+(``sum_external_params``) bound to a decoder session
+(:mod:`pyjuice.constraints.backends.dfa_exact.external_params`). Sample ``b``'s sum node ``n`` weighs child ``c`` by
+``theta[n, c] phi_b[g(n, c)] / Z_b[n]``, so the truth is pyjuice's own gated forward: under the one-state constraint
+``pc(x, missing_mask, sum_external_params)`` itself, under any other the log-sum of it over the completions the
+constraint accepts, and for conditionals the float64 reference with every sample's weights. Every kind of PC of
+conftest.py with its sums gated -- node gates of a node block or half one, child gates of a child block or finer --,
+gates per row or one row for all, dense and compact storage, together with soft evidence, sessions, some layers gated
+or given gates only, registered groups and tied gates; and what a session refuses.
 """
 import itertools
 
@@ -31,11 +32,13 @@ DEV = torch.device("cuda:0")
 #: the gates' child block sizes: the child blocks', or the finest that divides them (one child per gate at most two)
 CHILD_GATES = {"block": lambda ns: ns.ch_block_size,
                "fine": lambda ns: next(d for d in (2, 1) if ns.ch_block_size % d == 0)}
+#: the gates' node block sizes: the node blocks', or half of them (a node block's rows read two node gates)
+NODE_GATES = {"block": lambda ns: ns.block_size, "half": lambda ns: max(1, ns.block_size // 2)}
 
 
-def gated_pc(build_pc, kind, child_gate = "fine", n = None, **gates):
+def gated_pc(build_pc, kind, child_gate = "fine", n = None, node_gate = "block", **gates):
     return build_pc(kind, KINDS[kind] if n is None else n, V, perturbation = 4.0,
-                    gates = dict(child_gate = CHILD_GATES[child_gate], **gates))
+                    gates = dict(child_gate = CHILD_GATES[child_gate], node_gate = NODE_GATES[node_gate], **gates))
 
 
 def make_gates(pc, B, seed = 0, scale = 2.0, nodes = None):
@@ -115,13 +118,14 @@ def brute_force(pc, constraint, data, missing, gates, other = None):
 # Marginals
 # -------------------------------------------------------------------------------------------------
 
+@pytest.mark.parametrize("node_gate", list(NODE_GATES))
 @pytest.mark.parametrize("child_gate", list(CHILD_GATES))
 @pytest.mark.parametrize("shared", [False, True])
 @pytest.mark.parametrize("kind", list(KINDS))
-def test_the_one_state_constraint_is_the_pcs_own_marginal(kind, shared, child_gate, build_pc):
+def test_the_one_state_constraint_is_the_pcs_own_marginal(kind, shared, child_gate, node_gate, build_pc):
     """Under ``DFA.anything`` the session's marginal is ``pc(x, missing_mask, sum_external_params)``: gates per row,
     or one row for all."""
-    pc = gated_pc(build_pc, kind, child_gate)
+    pc = gated_pc(build_pc, kind, child_gate, node_gate = node_gate)
     n = KINDS[kind]
     data, missing = evidence(n, 4)
     gates = make_gates(pc, 1 if shared else 4)
@@ -224,12 +228,13 @@ def test_gates_and_soft_evidence(build_pc, reference):
 # Conditionals
 # -------------------------------------------------------------------------------------------------
 
+@pytest.mark.parametrize("node_gate", list(NODE_GATES))
 @pytest.mark.parametrize("shared", [False, True])
 @pytest.mark.parametrize("kind", list(KINDS))
-def test_conditional_matches_the_reference(kind, shared, build_pc, reference):
+def test_conditional_matches_the_reference(kind, shared, node_gate, build_pc, reference):
     """``log p(x_t = v | e, C)`` under gates, every missing position: the reference's (every sample's weights), dense
     and compact storage; the log marginal it returns is the marginal's; candidates alone score as the full rows."""
-    pc = gated_pc(build_pc, kind)
+    pc = gated_pc(build_pc, kind, node_gate = node_gate)
     n = KINDS[kind]
     data, m = evidence(n, 3, seed = 3)
     gates = make_gates(pc, 1 if shared else 3, seed = 3)
@@ -250,14 +255,18 @@ def test_conditional_matches_the_reference(kind, shared, build_pc, reference):
         assert_rows_close(got_c, torch.where(cr < V, got.gather(1, cr.clamp(max = V - 1)), -float("inf")), n)
 
 
-@pytest.mark.parametrize("latents, block, gate", [(64, 32, 8), (64, 32, 32), (128, 64, 64)])
-def test_wide_gates(latents, block, gate, gate_sums, reference):
+@pytest.mark.parametrize("latents, block, gate, node_gate", [(64, 32, 8, 32), (64, 32, 32, 32), (128, 64, 64, 64),
+                                                             (64, 32, 32, 16), (64, 32, 8, 8), (128, 64, 64, 16),
+                                                             (128, 64, 16, 8)])
+def test_wide_gates(latents, block, gate, node_gate, gate_sums, reference):
     """HMMs of wider blocks, gates of 8 children (an edge chunk and a tile of children read several), 32 (a chunk
-    reads one) and 64 (a tile too): the reference's marginals and conditionals, per-row and shared gates."""
+    reads one) and 64 (a tile too), of a node block or of 16 or 8 of its nodes (its rows read several): the
+    reference's marginals and conditionals, per-row and shared gates."""
     torch.manual_seed(0)
     n = 5
     ns = juice.structures.HMM(seq_length = n, num_latents = latents, num_emits = V, block_size = block)
-    gate_sums(ns, child_gate = lambda s: min(gate, s.ch_block_size), which = lambda s: s.num_nodes == latents)
+    gate_sums(ns, child_gate = lambda s: min(gate, s.ch_block_size), node_gate = lambda s: min(node_gate, s.block_size),
+              which = lambda s: s.num_nodes == latents)
     ns.init_parameters(perturbation = 4.0)
     pc = juice.compile(ns, verbose = False).to(DEV)
     cc = jc.compile(CONSTRAINTS["contains_either_and_not"](), pc)
@@ -268,6 +277,44 @@ def test_wide_gates(latents, block, gate, gate_sums, reference):
             with cc.decoder(storage = storage, **inputs_) as decoder:
                 assert_close(decoder.marginal(data, m), reference.marginal(cc, data, m, inputs_), n)
                 assert_rows_close(decoder.conditional(data, m), reference.conditional(cc, data, m, inputs = inputs_), n)
+
+
+@pytest.mark.parametrize("child_gate", [1, 4])
+@pytest.mark.parametrize("node_gate", [32, 16, 8])
+def test_gates_far_from_the_values(node_gate, child_gate):
+    """One gated block of 32 nodes over 32 children ``x0[c] x1[c]``, every other child gate's children ~85 nats less
+    likely per input and gated 200 nats above the others: those far children are the nodes' values, so a sum that
+    shifts its children before their gates scale them loses them. pyjuice's gated forward is the truth: the marginals,
+    and the conditionals as its log-softmax over the completions."""
+    x = [inputs(v, num_node_blocks = 1, block_size = 32, dist = dists.Categorical(num_cats = V)) for v in range(2)]
+    gate = BlockScaleSumParams(block_size = None if node_gate == 32 else node_gate, ch_block_size = child_gate)
+    s = summate(multiply(x[0], x[1]), num_node_blocks = 1, block_size = 32, external_params = gate)
+    root = summate(multiply(s), num_node_blocks = 1, block_size = 1)
+    torch.manual_seed(0)
+    root.init_parameters(perturbation = 2.0)
+    far = (torch.arange(32) // child_gate) % 2 == 1
+    for xi in x:
+        p = torch.full((32, V), 0.5)
+        p[far, 0], p[~far, 0], p[~far, 1:] = 1e-37, 1.0 - 2e-7, 1e-7
+        xi._params = (p / p.sum(1, keepdim = True)).reshape(-1)
+    pc = juice.compile(root, verbose = False).to(DEV)
+    (ns,) = pc.external_params_nodes
+    lphi = torch.zeros(ns.external_params.tensor_shapes(ns, 2)[0])
+    lphi[..., 1::2] = 200.0
+    lphi[1] += torch.randn(lphi.shape[1:], generator = torch.Generator().manual_seed(0)) * 5
+    gates = {ns: lphi.to(DEV)}
+    data = torch.zeros(2, 2, dtype = torch.long, device = DEV)
+    m = torch.tensor([[False, False], [False, True]], device = DEV)
+    cc = jc.compile(jc.DFA.anything(V), pc)
+    with cc.decoder(sum_external_params = gates) as decoder:
+        marg = decoder.marginal(data, m)
+        cond = decoder.conditional(data, m)
+    want = pc(data, missing_mask = m, sum_external_params = gates)
+    assert want.max() < -80                                                  # the far children's values
+    assert_close(marg, want, 2)
+    xs = torch.tensor([[0, v] for v in range(V)], device = DEV)
+    lls = pc(xs, sum_external_params = {ns: lphi[1:].expand(V, -1, -1).to(DEV)}).view(1, V)
+    assert_rows_close(cond, torch.log_softmax(lls, dim = 1), 2)
 
 
 def test_children_in_another_order(reference):
@@ -448,12 +495,12 @@ def test_gates_checked_and_refused(build_pc):
 
 
 def test_unsupported_gates_refused_at_compile():
-    """LowRank sums, and gates finer than a node block, cannot be compiled under a constraint."""
+    """LowRank sums cannot be compiled under a constraint."""
     x = [inputs(v, num_node_blocks = 2, block_size = 4, dist = dists.Categorical(num_cats = V)) for v in range(2)]
-    for ext in (LowRankSumParams(rank = 2), BlockScaleSumParams(block_size = 2)):
-        root = summate(multiply(x[0], x[1]), num_node_blocks = 2, block_size = 4, external_params = ext)
-        root = summate(multiply(root), num_node_blocks = 1, block_size = 1)
-        root.init_parameters()
-        pc = juice.compile(root, verbose = False).to(DEV)
-        with pytest.raises(Exception, match = "LowRank|finer"):
-            jc.compile(jc.DFA.anything(V), pc)
+    root = summate(multiply(x[0], x[1]), num_node_blocks = 2, block_size = 4,
+                   external_params = LowRankSumParams(rank = 2))
+    root = summate(multiply(root), num_node_blocks = 1, block_size = 1)
+    root.init_parameters()
+    pc = juice.compile(root, verbose = False).to(DEV)
+    with pytest.raises(Exception, match = "LowRank"):
+        jc.compile(jc.DFA.anything(V), pc)

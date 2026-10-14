@@ -101,7 +101,8 @@ def part_gates(gates: Optional[dict], gate: Optional[dict], compact, prog, once:
         lanes = (compact.off, prog.reg_iv_all_t, compact.B, compact.steps)
     return dict(values = gates["values"], gstride = 0 if shared else gates["values"].size(1), lz = gates["lz"],
                 lzstride = 0 if shared else gates["lz"].size(1), lanes = lanes, idx = gate.get("idx"),
-                a_idx = gate.get("a_idx"), uniform = gate["uniform"], a_uniform = gate.get("a_uniform", {}))
+                a_idx = gate.get("a_idx"), uniform = gate["uniform"], a_uniform = gate.get("a_uniform", {}),
+                ck = gate.get("ck"), node_gate = gate["node_gate"])
 
 
 def run_forward(backend, bufs: dict, plan, x: torch.Tensor, missing: torch.Tensor, obs_class: torch.Tensor, liveness,
