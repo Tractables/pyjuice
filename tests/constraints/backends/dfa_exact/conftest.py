@@ -50,6 +50,7 @@ import torch
 
 import pyjuice as juice
 import pyjuice.nodes.distributions as dists
+from pyjuice.constraints.backends.dfa_exact.kernels import sum as _lifted_sum
 from pyjuice.nodes import inputs, multiply, summate
 from pyjuice.nodes.distributions import Categorical, SoftEvidenceCategorical
 from pyjuice.nodes.methods.edge_constructors import block_sparse_rnd_blk_edge_constructor
@@ -634,3 +635,29 @@ def build_pc_fixture():
 def gate_sums_fixture():
     """:func:`gate_sums`, for tests in this directory."""
     return gate_sums
+
+
+_SPLIT_DEFAULTS = (_lifted_sum.SPLIT_PROGRAMS_PER_SM, _lifted_sum.SPLIT_MIN_SHARE, _lifted_sum.SPLIT_MAX)
+
+
+def set_split(monkeypatch, mode: str):
+    """The fused sum kernels' split reductions (``kernels/sum.py``): ``"default"`` the library's rule, ``"max"``
+    every launch split as far as its reductions allow (shares of one chunk, whatever the launch's size), ``"off"``
+    none; any mode after any other."""
+    per_sm, min_share, most = _SPLIT_DEFAULTS
+    values = {"default": (per_sm, min_share, most), "max": (1 << 20, 1, most), "off": (per_sm, min_share, 1)}[mode]
+    for name, value in zip(("SPLIT_PROGRAMS_PER_SM", "SPLIT_MIN_SHARE", "SPLIT_MAX"), values):
+        monkeypatch.setattr(_lifted_sum, name, value)
+
+
+@pytest.fixture(params = ["default", "max"])
+def split(request, monkeypatch):
+    """:func:`set_split`: the library's rule, or every launch split as far as its reductions allow."""
+    set_split(monkeypatch, request.param)
+    return request.param
+
+
+@pytest.fixture(name = "set_split")
+def set_split_fixture(monkeypatch):
+    """:func:`set_split` for a test that switches modes."""
+    return lambda mode: set_split(monkeypatch, mode)

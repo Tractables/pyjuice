@@ -12,7 +12,8 @@ alike; under a value mask an observed token weighs ``p_n(v) w_i(v)`` if True, a 
 with ``p_n(v) w_i(v)``, a missing one with ``p_n(v) w_i(v) / Z_ni`` (the library's forward, softevi_categorical.py).
 Every test checks the hand polynomial against the library's own forward first -- the unconstrained marginals, and
 without a value mask every full assignment -- then the decoder's marginals and conditionals under two constraints,
-dense and compact storage, and a prefix-decoding session call by call.
+dense and compact storage, and a prefix-decoding session call by call; the fused sum kernels' reductions split by
+the library's rule, or as far as they go.
 """
 import itertools
 
@@ -154,7 +155,7 @@ def assert_close(got, want, tol = 2e-5):
 @pytest.mark.parametrize("evidence", ["none", "dense", "topk", "value_mask"])
 @pytest.mark.parametrize("shape", list(SHAPES))
 @pytest.mark.parametrize("circuit", ["hmm", "tree"])
-def test_the_hand_computation(circuit, shape, evidence, rows):
+def test_the_hand_computation(circuit, shape, evidence, rows, split):
     H, bs, gate = SHAPES[shape]
     if gate is None and evidence == "none":
         pytest.skip("nothing per sample")

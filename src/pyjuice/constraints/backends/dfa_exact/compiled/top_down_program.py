@@ -327,7 +327,7 @@ def _fused_tables(prog, parts, block_size, prod_index, elem_first, firsts, writt
         t = lambda xs, dt = torch.int32: torch.tensor(xs, dtype = dt, device = dev)
         groups[length] = dict(cb_row = t(cb_row), cb_reg = t(cb_reg), cb_add = t(cb_add), cb_ivreg = t(cb_ivreg),
                               par_ptr = t(ptr), par_nid = t(p_nid), par_reg = t(p_reg), par_pid = t(p_pid, torch.int64),
-                              max_slots = max(prog.slots[r] for r in cb_ivreg),
+                              max_slots = max(prog.slots[r] for r in cb_ivreg), max_parents = int(np.diff(ptr).max()),
                               gate = None if not gated else dict(
                                   layer = parts[0][6]["layer"], lc = t(p_lc), row = t(p_grow), cbs = t(p_gcbs),
                                   ck = t(p_gck), node_gate = parts[0][6]["node_gate"],
