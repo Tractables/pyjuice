@@ -3,8 +3,9 @@ The lifted forward pass: ``log p(C, e)`` for a batch of evidence, in the backend
 
 Layer by layer, as :meth:`TensorCircuit.forward`: the PC's own input layers write the log-probability of
 every observed token, the class masses of missing ones are summed per token class (by the backend's state, see
-:meth:`~.state.State.class_masses`), then every product layer group chains its children's blocks
-(:mod:`.prod`) and every sum layer group sums its children column by column (:mod:`.sum`).
+:meth:`~.state.State.masses`; per sample under a decoder session's soft evidence), then every product layer group
+chains its children's blocks (:mod:`.prod`) and every sum layer group sums its children column by column
+(:mod:`.sum`).
 The root keeps a single value per sample. Like a :class:`TensorCircuit`, the pass is driven by tables: no
 kernel knows the circuit's shape. A query runs the part of them its plan (:mod:`.plans`) says, and the values
 no sample's evidence reaches once for all of them.
@@ -20,6 +21,7 @@ from typing import Optional
 import numpy as np
 import torch
 
+from ....distributions import lookup
 from ..compiled.tables import _align
 from ..kernels.prod import run_products as products
 from ..kernels.sum import dense_sum, fused_sum, stacked_weights
@@ -68,12 +70,13 @@ def missing_tensor(missing_mask: Optional[torch.Tensor], B: int, n: int, dev) ->
 
 
 def run_forward(backend, bufs: dict, plan, x: torch.Tensor, missing: torch.Tensor, obs_class: torch.Tensor, liveness,
-                precision: str, compact = None):
+                precision: str, compact = None, masses = None):
     """
     The inside values a query plan computes (see :mod:`.plans`): the per-sample ones into ``node_mars``, and
     those kept once that ``prior_mars`` does not hold yet, for a batch of one, into ``prior_mars``. Layer by layer, as
-    :meth:`TensorCircuit.forward`: the PC's own input layers write the log-probability of every observed token, then
-    every product layer and every sum layer run their parts of the plan.
+    :meth:`TensorCircuit.forward`: the PC's own input layers write the log-probability of every observed token (or
+    their distributions' modules, ``input_values``, see :mod:`pyjuice.constraints.distributions`), then every product
+    layer and every sum layer run their parts of the plan.
 
     :param bufs: the batch's :meth:`~.state.State.buffers`
     :param x: [B, n] token ids (any valid id where missing)
@@ -84,8 +87,10 @@ def run_forward(backend, bufs: dict, plan, x: torch.Tensor, missing: torch.Tenso
     :param precision: "fp32" or "tf32" for the sum layers' matrix products
     :param compact: None, or the query's :class:`~..kernels.compact.CompactLayout`: the per-sample inside values are
         compact where it lays them out (``mars``; ``bufs`` are laid out by it, see :meth:`~.state.State.buffers`)
-    :returns: the class masses the pass read (:meth:`~.state.State.class_masses`; computed
-        for this query outside :func:`pyjuice.fast_inference`), for the query's later passes
+    :param masses: the query's class masses (:meth:`~.state.State.masses`; None: the state's, under no per-sample
+        inputs)
+    :returns: the class masses the pass read (computed for this query outside :func:`pyjuice.fast_inference`), for the
+        query's later passes
     """
     pc, prog = backend.pc, backend.program()
     B = x.size(0)
@@ -103,10 +108,14 @@ def run_forward(backend, bufs: dict, plan, x: torch.Tensor, missing: torch.Tenso
     dot = PRECISIONS[precision]
     live = liveness.live if liveness is not None else None
 
-    for layer in pc.input_layer_group:                                 # the input region: pyjuice's own layout
-        layer(x.permute(1, 0), bufs["input_mars"], missing_mask = missing)
-    class_mars = backend.state.class_masses()
-    prog.transitions(class_mars, backend.state.class_mars_version)
+    masses = backend.state.masses() if masses is None else masses
+    for k, layer in enumerate(pc.input_layer_group):                   # the input region: pyjuice's own layout
+        values = getattr(lookup(layer.dist), "input_values", None)
+        if values is not None:
+            values(layer, x, missing, bufs["input_mars"], masses.sample.get(k))
+        else:
+            layer(x.permute(1, 0), bufs["input_mars"], missing_mask = missing)
+    prog.transitions(masses)
     stacks, kept = backend.state.weight_stacks()
 
     for kind, prod_index, layers in plan.steps:
@@ -119,10 +128,10 @@ def run_forward(backend, bufs: dict, plan, x: torch.Tensor, missing: torch.Tenso
                     temp_width = scratch_width(B, temp_slots, sample_stages, compact)
                     temp = backend.state.storage_view("product_scratch", num_temps * temp_width)
                 if prior_stages:                                     # nothing observed in their scopes
-                    products(prior_stages, (temp, temp_width), prog, regions, element_mars, node_mars, class_mars,
+                    products(prior_stages, (temp, temp_width), prog, regions, element_mars, node_mars, masses,
                              prog.no_evidence, None, elem_first, elem_width, 1, srcs, exact = True)
                 if sample_stages:
-                    products(sample_stages, (temp, temp_width), prog, regions, element_mars, node_mars, class_mars,
+                    products(sample_stages, (temp, temp_width), prog, regions, element_mars, node_mars, masses,
                              obs_class, live, elem_first, elem_width, B, srcs, exact = liveness is not None,
                              compact = compact)
         else:
@@ -133,7 +142,7 @@ def run_forward(backend, bufs: dict, plan, x: torch.Tensor, missing: torch.Tenso
                 if sample_parts:
                     _sums(backend, sample_parts, block_size, node_mars, element_mars, regions, lay["sum_offsets"],
                           lay["sum_widths"], elem_first, elem_width, B, liveness, stacks, kept, precision, compact)
-    return class_mars
+    return masses
 
 
 def scratch_width(B: int, temp_slots: int, sample_stages, compact) -> int:

@@ -8,6 +8,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 
 from ... import distributions
@@ -16,7 +17,7 @@ from ...structure import PCStructure, _runs
 from ..base import Backend
 from .compiled.layout import BoundaryLayout, build_layout
 from .compiled.tables import build_pc_tables, buffer_layout
-from .state import State
+from .state import ExternalInputs, State
 
 
 class DFAExactBackend(Backend):
@@ -228,21 +229,47 @@ class DFAExactBackend(Backend):
     # Queries
     # ---------------------------------------------------------------------------------------------
 
+    def external_inputs(self, inputs: Dict[str, Any]) -> ExternalInputs:
+        """A decoder session's per-sample inputs (see :meth:`~pyjuice.constraints.ConstrainedCircuit.decoder`),
+        checked against the PC by the input distributions that read them (their modules' ``check_inputs``)."""
+        if inputs.get("sum_external_params") is not None:
+            raise NotImplementedError("`sum_external_params` is not supported under a constraint yet.")
+        batches, layers, read = set(), [], set()
+        variables = np.zeros(self.n, dtype = bool)
+        for k, layer in enumerate(self.pc.input_layer_group):
+            module = distributions.lookup(layer.dist)
+            given = {key: inputs[key] for key in getattr(module, "KEYWORDS", ()) if key in inputs}
+            batch = module.check_inputs(layer, given) if given else None
+            if batch is not None:
+                batches.add(batch)
+                layers.append(k)
+                read |= set(given)
+                variables[layer.vids.view(-1).cpu().numpy()] = True
+        unread = [key for key in inputs if key not in read]
+        if unread:
+            raise ValueError(f"No input layer of the PC reads {', '.join(f'`{key}`' for key in unread)}.")
+        if len(batches) > 1:
+            raise ValueError(f"The per-sample inputs have different batch sizes: {sorted(batches)}.")
+        return ExternalInputs(dict(inputs), batches.pop(), tuple(layers), variables)
+
     def marginal(self, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None,
-                 precision: str = "fp32", storage: str = "auto") -> torch.Tensor:
+                 precision: str = "fp32", storage: str = "auto",
+                 external: Optional[ExternalInputs] = None) -> torch.Tensor:
         """
         ``log p(C, e)`` for every sample (see :meth:`~pyjuice.constraints.ConstrainedCircuit.marginal`).
 
         :param precision: "fp32" (the default; fp32-level accuracy) or "tf32" for the sum layers' matrix products
         :param storage: "auto" (the default), "dense" or "compact" (see :meth:`conditional`; a marginal keeps inside
             values only)
+        :param external: a decoder session's per-sample inputs (:meth:`external_inputs`)
         """
         from .queries.marginal import marginal
-        return marginal(self, data, missing_mask, precision = precision, storage = storage)
+        return marginal(self, data, missing_mask, precision = precision, storage = storage, external = external)
 
     def conditional(self, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None,
                     targets: Optional[torch.Tensor] = None, return_log_marginal: bool = False,
-                    candidates: Optional[torch.Tensor] = None, precision: str = "fp32", storage: str = "auto"):
+                    candidates: Optional[torch.Tensor] = None, precision: str = "fp32", storage: str = "auto",
+                    external: Optional[ExternalInputs] = None):
         """
         ``log p(x_t = v | e, C)`` for every target, of every token or of the ``candidates`` (see
         :meth:`~pyjuice.constraints.ConstrainedCircuit.conditional`).
@@ -254,6 +281,8 @@ class DFAExactBackend(Backend):
             the automaton down, as a decoded prefix does; more where it joins few of them); "auto" picks the one whose
             buffers are smaller, per query
         """
+        if external is not None:
+            raise NotImplementedError("Conditionals under per-sample inputs are not supported yet (marginals are).")
         from .queries.conditional import conditional
         return conditional(self, data, missing_mask, targets, precision = precision,
                            return_log_marginal = return_log_marginal, candidates = candidates, storage = storage)

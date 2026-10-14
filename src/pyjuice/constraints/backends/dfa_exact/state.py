@@ -15,10 +15,16 @@ allows parameter copies, each is copied once and kept until the scope exits; out
 weights it reads more than once (tied ones) and drops them when it returns. So do the token-major copies of the input
 parameters that conditionals score against (:meth:`State.token_table`): kept by a scope that allows parameter copies,
 else built by every query.
+
+A decoder's per-sample inputs (e.g. soft evidence, see :meth:`~pyjuice.constraints.ConstrainedCircuit.decoder`) give
+the input nodes that read them class masses of their own per sample: built by the session's first query, from the
+inputs' distributions' functions (:mod:`pyjuice.constraints.distributions`), and kept with the others until the
+session's scope exits (:meth:`State.masses`).
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 import numpy as np
@@ -28,6 +34,46 @@ from pyjuice.utils.fast_inference import bf16_params_allowed, is_active, param_c
 
 from ...distributions import lookup
 from .compiled.tables import _align, buffer_layout
+
+
+@dataclass(eq = False)
+class ExternalInputs:
+    """
+    A decoder session's per-sample inputs, checked against the PC (:meth:`~.backend.DFAExactBackend.external_inputs`).
+
+    :ivar inputs: keyword -> value, as ``pc(x, ...)`` takes them
+    :ivar batch: their batch size: every query's, or 1 (every row reads the same)
+    :ivar layers: the input layers that read them (indices into the PC's input layer group)
+    :ivar variables: bool [n] (host): the variables whose input nodes read them
+    """
+
+    inputs: Dict[str, Any]
+    batch: int
+    layers: tuple
+    variables: np.ndarray
+
+
+@dataclass
+class ClassMasses:
+    """
+    The class masses a query's input nodes read (:meth:`State.masses`): input node ``u`` of sample ``b`` reads row
+    ``row[u - input_start] + b * stride[u - input_start]`` of ``table`` ([rows, num_classes], log).
+
+    :ivar table, row, stride: ``row``, ``stride`` int32 on the device; ``stride`` None for the same rows for every
+        sample
+    :ivar batch: 1, or the samples that have rows of their own (``stride``)
+    :ivar version: which computation of class masses ``table`` is (what is derived from them, e.g. transition masses,
+        follows it)
+    :ivar sample: per input layer (index in the PC's input layer group) that reads per-sample inputs, its
+        :class:`~pyjuice.constraints.distributions.SampleInputs`
+    """
+
+    table: torch.Tensor
+    row: torch.Tensor
+    stride: Optional[torch.Tensor]
+    batch: int
+    version: int
+    sample: Dict[int, Any]
 
 
 class State:
@@ -49,8 +95,11 @@ class State:
         self._class_mars = None                     # the input nodes' class masses (see `class_masses`)
         self._class_mars_kept = False               # kept by a `pyjuice.fast_inference` scope
         self.class_mars_version = 0
+        self._class_mars_at = 0                     # the version `_class_mars` is
+        self._session = None                        # (inputs, their class masses) of a decoder session (`masses`)
         self._kept_stacks = None                    # stacked dense weights kept by a scope (see `weight_stacks`)
         self._prior_valid = None                    # which input-independent values prior_mars holds (`prior_validity`)
+        self._prior_version = None                  # the class masses they were computed with
         self._prior_kept = False                    # kept by a `pyjuice.fast_inference` scope
         self._prior_flows_state = None              # the input-independent top-down values (see `prior_flows`)
         self._token_tables = None                   # token-major input parameters kept by a scope (`token_table`)
@@ -178,15 +227,18 @@ class State:
     # Derived from the parameters
     # ---------------------------------------------------------------------------------------------
 
-    def prior_validity(self):
+    def prior_validity(self, version: Optional[int] = None):
         """
-        ``(valid, kept)`` for a query starting now: which inside values ``prior_mars`` holds (bool on the host, one
-        per sum interval of the lifted Program, ``Program.sum_ivs``, set by the queries that compute them), and
-        whether they outlive the query. They depend on the parameters only, so they are kept as the class masses are:
-        inside :func:`pyjuice.fast_inference` until the scope exits; outside it, every query starts with none.
+        ``(valid, kept)`` for a query starting now, reading the class masses of computation ``version``
+        (:attr:`ClassMasses.version`): which inside values ``prior_mars`` holds (bool on the host, one per sum interval
+        of the lifted Program, ``Program.sum_ivs``, set by the queries that compute them), and whether they outlive the
+        query. They depend on the parameters and the class masses only, so they are kept as the class masses are:
+        inside :func:`pyjuice.fast_inference` until the scope exits, while queries read the same masses (a decoder
+        session's per-sample inputs give masses of their own); outside it, every query starts with none.
         """
-        if self._prior_valid is None or not self._prior_kept:
+        if self._prior_valid is None or not self._prior_kept or self._prior_version != version:
             self._prior_valid = torch.zeros(len(self._backend.program().sum_ivs), dtype = torch.bool)
+            self._prior_version = version
             if self._prior_flows_state is not None:
                 self._prior_flows_state["valid"][:] = False
             if is_active():
@@ -230,10 +282,48 @@ class State:
         for layer, first, end in zip(be.pc.input_layer_group, firsts, firsts[1:] + [num_rows]):
             lookup(layer.dist).class_masses(layer, be.token_classes, out = self._class_mars[first:end])
         self.class_mars_version += 1
+        self._class_mars_at = self.class_mars_version
         if is_active():
             self._class_mars_kept = True
             register_layer(self)                                # its exit calls `_release_fast_inference_params`
         return self._class_mars
+
+    def masses(self, external: Optional[ExternalInputs] = None) -> ClassMasses:
+        """
+        The class masses of a query's input nodes (:class:`ClassMasses`): :meth:`class_masses`, the same for every
+        sample -- and under a decoder session's per-sample ``external`` inputs, those the inputs give the nodes that
+        read them, per sample (their distributions' ``sample_inputs``), in a table of the session's: built by its
+        first query (the other nodes' rows copied in), kept until its scope exits.
+        """
+        table = self.class_masses()
+        _, _, mass_row = self.class_mass_rows()
+        if external is None:
+            return ClassMasses(table, mass_row, None, 1, self._class_mars_at, {})
+        if self._session is not None and self._session[0] is external and self._session[1] == self._class_mars_at:
+            return self._session[2]
+        be, Be, C = self._backend, external.batch, self._backend.num_classes
+        input_start = be.input_range[0]
+        layers = [be.pc.input_layer_group[k] for k in external.layers]
+        sizes = [lookup(layer.dist).sample_rows(layer, external.inputs) for layer in layers]
+        full = torch.empty(table.size(0) + Be * sum(sizes), C, dtype = table.dtype, device = self._device)
+        full[:table.size(0)] = table                                    # the other nodes' rows first
+        row, stride = mass_row.clone(), torch.zeros_like(mass_row)
+        num_rows, sample = table.size(0), {}
+        for k, layer, rows_s in zip(external.layers, layers, sizes):
+            out = full[num_rows:num_rows + Be * rows_s].view(Be, rows_s, C)
+            si = lookup(layer.dist).sample_inputs(layer, be.token_classes, external.inputs, out)
+            first, end = layer._output_ind_range
+            row[first - input_start:end - input_start] = (num_rows + si.rows).to(torch.int32)
+            if Be > 1:
+                stride[first - input_start:end - input_start] = rows_s
+            num_rows += Be * rows_s
+            sample[k] = si
+        self.class_mars_version += 1
+        masses = ClassMasses(full, row, stride if Be > 1 else None, Be, self.class_mars_version, sample)
+        self._session = (external, self._class_mars_at, masses)
+        if is_active():
+            register_layer(self)                                # its exit calls `_release_fast_inference_params`
+        return masses
 
     def weight_stacks(self):
         """
@@ -287,6 +377,7 @@ class State:
         self._kept_stacks = None
         self._token_tables = None
         self._prior_kept = False
+        self._session = None
         if poison and self._class_mars is not None:
             self._class_mars.fill_(float("nan"))
         if poison and "prior_mars" in self._storage:

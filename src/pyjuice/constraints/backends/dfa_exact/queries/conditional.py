@@ -111,9 +111,9 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
         host wait for the stream
     :param storage: see :func:`conditional`
     :param carry: see :func:`conditional`
-    :returns: ``(groups, class_mars)``: per row group with a target position, ``(group, its target positions (host),
+    :returns: ``(groups, masses)``: per row group with a target position, ``(group, its target positions (host),
         weights [positions x B, classes, rows of the group])`` (sample ``b`` of the ``p``-th position: column ``p * B +
-        b``), and the class masses the query read
+        b``), and the class masses the query read (:class:`~..state.ClassMasses`)
     """
     prog, td, dev = backend.program(), backend.top_down_program(), backend.device
     score = score_tables(prog)
@@ -130,7 +130,8 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     # compact, a query needs its liveness even with nothing observed: every column is live, but only the regions it
     # computes per sample get rows (none, every value input-independent, inside fast_inference)
     lv = liveness(prog, obs_class, B) if observed.any() or storage != "dense" else None
-    valid, kept = backend.state.prior_validity()
+    masses = backend.state.masses()
+    valid, kept = backend.state.prior_validity(masses.version)
     prior = prior_regions(prog, observed, B, kept, lv)
     pf = backend.state.prior_flows(np.zeros(len(backend.sum_regions), dtype = bool))
     once, pf_valid = top_down_prior(prog, td, observed, B, kept, lv), pf["valid"].copy()
@@ -166,7 +167,7 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     if report is not None:
         report.update(plan = plan, liveness = lv, compact = compact, inputs_only = inputs_only, storage = storage,
                       dropped = dropped)
-    class_mars = F.run_forward(backend, bufs, plan, x, missing, obs_class, lv, precision, compact)
+    F.run_forward(backend, bufs, plan, x, missing, obs_class, lv, precision, compact, masses)
     valid |= plan.todo
 
     C = backend.num_classes
@@ -174,9 +175,9 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     buf.fill_(-float("inf"))
     cw = dict(buf = buf, base = base, K = K)
     run_backward(backend, bufs, flows, plan, x, missing, obs_class, lv, precision, class_weights = cw,
-                 class_mars = class_mars, compact = compact)
+                 masses = masses, compact = compact)
     return [(g, pos, buf[s:s + len(pos) * B * C * len(score.rows[g])].view(len(pos) * B, C, len(score.rows[g])))
-            for g, pos, s in groups], class_mars
+            for g, pos, s in groups], masses
 
 
 def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None,
@@ -246,15 +247,15 @@ def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor
         torch.from_numpy(miss).to(dev)
     with torch.no_grad():
         layout = (groups, size, (tables[starts[0]:starts[0] + n], tables[starts[1]:starts[1] + n]))
-        groups, class_mars = class_weights(backend, data, missing, positions, precision, held,
-                                           observed = (~miss).any(axis = 0), layout = layout, report = report,
-                                           storage = storage, carry = carry)
+        groups, masses = class_weights(backend, data, missing, positions, precision, held,
+                                       observed = (~miss).any(axis = 0), layout = layout, report = report,
+                                       storage = storage, carry = carry)
         out = torch.empty(M, width, device = dev)
         log_marginal = torch.empty(M + 1, device = dev) if return_log_marginal else None
         for (g, pos, w), start in zip(groups, starts[2:]):
             out_row = tables[start:start + len(pos) * B]
             table = backend.state.token_table(g, score.rows[g])
-            logz = score_group(out, table, w, score.rows_t[g], class_mars, out_row, backend.token_classes,
+            logz = score_group(out, table, w, score.rows_t[g], masses.table, out_row, backend.token_classes,
                                F.PRECISIONS[precision], candidates = cand)
             if log_marginal is not None:
                 log_marginal[torch.where(out_row >= 0, out_row, M)] = logz

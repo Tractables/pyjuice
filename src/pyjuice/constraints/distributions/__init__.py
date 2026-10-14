@@ -20,16 +20,53 @@ module provides
   (sorted, host int64), token-major: ``out[v, k] = p(v)`` of row ``rows[k]``, ``out`` [values, len(rows)] in fp32 or
   bf16 -- what the conditionals score (:mod:`~pyjuice.constraints.backends.dfa_exact.conditional`).
 
+A distribution that also reads per-sample inputs at query time -- keyword arguments of ``pc(x, ...)``, such as soft
+evidence; a decoder takes them for its whole session (see :meth:`~pyjuice.constraints.ConstrainedCircuit.decoder`) --
+provides besides
+
+* ``KEYWORDS``: the keywords it reads;
+* ``check_inputs(layer, inputs) -> Optional[int]``: checks the layer's inputs (``inputs``: keyword -> value, those of
+  ``KEYWORDS`` given) and returns their batch size, or None if the layer reads none of them;
+* ``sample_rows(layer, inputs) -> int`` and ``sample_inputs(layer, classes, inputs, out) -> SampleInputs``: the class
+  masses the inputs give its nodes, per sample, in ``sample_rows`` rows per sample written into ``out`` ([batch,
+  rows, num_classes]);
+* ``input_values(layer, x, missing, out, sample = None)``: the log-probability of every observed token, into the
+  layer's rows of ``out`` (``[input nodes, B]``, as a :class:`TensorCircuit`'s ``node_mars``; ``x`` [B, n] token ids,
+  ``missing`` [B, n] bool), under the inputs (``sample``, :func:`sample_inputs`') or none -- written by the backend
+  instead of the layer's own forward, which would need the inputs every query.
+
 Only the distributions in :data:`SUPPORTED` can be compiled under a constraint, matched by exact type: a subclass
 may compute different probabilities, so it is refused until it has its own module.
 """
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 
-from pyjuice.nodes.distributions import Categorical
+from pyjuice.nodes.distributions import Categorical, SoftEvidenceCategorical
+
+
+@dataclass
+class SampleInputs:
+    """
+    The class masses an input layer's nodes take from a query's per-sample inputs (see the module docstring), in a
+    table of their own per sample: node ``i`` of the layer reads row ``rows[i]`` of sample ``b``'s (sample 0's for
+    every sample when ``batch`` is 1), a token class's mass at every row -- where the layer's other values (an observed
+    token's log-probability, :func:`input_values`) need more of what the inputs give, ``data``.
+
+    :ivar masses: [batch, rows, num_classes] fp32, log
+    :ivar rows: int64 [nodes of the layer], every node's row
+    :ivar batch: the inputs' batch size
+    :ivar variables: int64, the PC's variables whose input nodes read them
+    :ivar data: what the distribution's module keeps besides (its own)
+    """
+
+    masses: torch.Tensor
+    rows: torch.Tensor
+    batch: int
+    variables: torch.Tensor
+    data: Any = None
 
 
 class TokenClasses:
@@ -122,10 +159,10 @@ class ByClass:
                        num_chunks = num_chunks, num_segments = ends.numel() + num_chunks)
 
 
-from . import categorical                                                      # noqa: E402 (uses TokenClasses)
+from . import categorical, softevi_categorical                                 # noqa: E402 (uses TokenClasses)
 
 #: the module of every supported input distribution, by exact type
-SUPPORTED = {Categorical: categorical}
+SUPPORTED = {Categorical: categorical, SoftEvidenceCategorical: softevi_categorical}
 
 
 def lookup(dist) -> Optional[object]:

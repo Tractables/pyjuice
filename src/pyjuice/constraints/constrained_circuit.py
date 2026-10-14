@@ -21,7 +21,8 @@ class ConstrainedCircuit:
     compiled from the pair, which answers the queries -- its methods.
 
     Everything the backend compiled depends only on the constraint and the PC's STRUCTURE, never on parameter values
-    or evidence, so it stays valid while the PC's parameters change (e.g. CoDD's external parameters at every step).
+    or evidence, so it stays valid while the PC's parameters change (e.g. between training steps), and whatever
+    per-sample inputs its decoders take (e.g. CoDD's soft evidence at every step, see :meth:`decoder`).
     The PC itself is fixed: :attr:`pc` cannot be reassigned (:meth:`with_pc` puts the same constraint on another PC
     with the same structure), and it moves to another device together with the backend, through :meth:`to`. A PC
     moved on its own makes every query raise.
@@ -262,9 +263,21 @@ class ConstrainedCircuit:
         Unmasking several positions in one step takes each from its own conditional, and together they may break the
         constraint; one position at a time (the next query is cheap) keeps every sample in it.
 
+        **Per-sample inputs** -- the keyword arguments ``pc(x, ...)`` takes for the PC's layers, e.g.
+        ``categorical_evidence_logp`` (the soft evidence of ``SoftEvidenceCategorical`` input nodes) -- hold for the
+        whole session: the decoder takes them, and every query in it runs under them, as ``pc(x, ...)`` would::
+
+            with cc.decoder(categorical_evidence_logp = E) as decoder:     # E: [B or 1, n, V] log-weights
+                logp = decoder.marginal(x, missing)                        # log p(C, x_observed) under E
+
+        Their batch is every query's (row ``b`` reads row ``b``) or 1 (every row reads the same). A token missing at a
+        position with soft evidence takes the evidence's weights too: the constraint sees the same per-position
+        distribution ``q(v) = p(v) w(v) / Z`` an observed token's value comes from.
+
         :param options: ``allow_param_copy``, ``allow_bf16_params`` and ``allow_cudagraph`` for the
-            :func:`pyjuice.fast_inference` scope; any other keyword (e.g. ``mask_id``, ``precision``) is a default for
-            every query, which a query's own keyword overrides. Each backend sets its own defaults.
+            :func:`pyjuice.fast_inference` scope; the per-sample inputs above; any other keyword (e.g. ``mask_id``,
+            ``precision``) is a default for every query, which a query's own keyword overrides. Each backend sets its
+            own defaults.
         """
         self._check_pc_unchanged()
         return self.backend.decoder(self, **options)

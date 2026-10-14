@@ -19,7 +19,7 @@ from .plans import per_sample_intervals, prior_regions, query_plan
 
 def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None, precision: str = "fp32",
              held: Optional[np.ndarray] = None, report: Optional[dict] = None, storage: str = "auto",
-             carry: Optional[dict] = None):
+             carry: Optional[dict] = None, external = None):
     """
     ``log p(C, e)`` for every sample: the probability that the PC generates a string that satisfies the
     constraint and agrees with the observed tokens.
@@ -33,6 +33,9 @@ def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] =
     :param storage: "auto" (the default), "dense" or "compact": how a query keeps its per-sample values (see
         :func:`~.conditional.conditional`); a marginal has no top-down value
     :param carry: compact, where the inside values ``held`` marks are (see :func:`~.conditional.conditional`)
+    :param external: None, or a decoder session's per-sample inputs (:class:`~..state.ExternalInputs`): their
+        variables count as observed when they differ per row (a batch of 1: the values over them are every sample's,
+        kept once for the session as the class masses that give them)
     :returns: [B, number of root nodes], as :func:`pyjuice.queries.marginal`
     """
     if precision not in PRECISIONS:
@@ -46,6 +49,9 @@ def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] =
     if data.dim() != 2 or data.size(1) != n:
         raise ValueError(f"`data` must be [batch, {n}], got {list(data.shape)}.")
     B = data.size(0)
+    if external is not None and external.batch not in (1, B):
+        raise ValueError(f"The decoder's per-sample inputs have a batch of {external.batch}: a query's must be the "
+                         f"same (or theirs 1), got {B}.")
     root_first, root_end = pc._root_node_range
     if not backend.satisfiable:
         return torch.full((B, root_end - root_first), -float("inf"), device = dev)
@@ -54,13 +60,16 @@ def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] =
     missing = missing_tensor(missing_mask, B, n, dev)
     observed = np.ones(n, dtype = bool) if missing_mask is None else \
         (~missing).any(dim = 0).cpu().numpy()                           # the positions some sample observes
+    if external is not None and external.batch > 1:
+        observed |= external.variables
     x = torch.where(missing, 0, data.to(dev).long())                     # missing tokens: any valid id
 
     with torch.no_grad():
         obs_class = torch.where(missing, -1, backend.token_classes.token_class[x]).contiguous()
         # nothing observed: nothing to prune, but compact values are laid out by the live columns (every one)
         lv = liveness(prog, obs_class, B) if observed.any() or storage != "dense" else None
-        valid, kept = backend.state.prior_validity()
+        masses = backend.state.masses(external)
+        valid, kept = backend.state.prior_validity(masses.version)
         prior = prior_regions(prog, observed, B, kept, lv)
         no_top_down = np.zeros(len(backend.sum_regions), dtype = bool)
         plan = query_plan(prog, observed, None, valid.numpy(), prior, held = held)   # every inside value
@@ -83,7 +92,7 @@ def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] =
         if report is not None:
             report.update(plan = plan, liveness = lv, inputs_only = inputs_only, compact = compact, storage = storage,
                           dropped = dropped)
-        run_forward(backend, bufs, plan, x, missing, obs_class, lv, precision, compact)
+        run_forward(backend, bufs, plan, x, missing, obs_class, lv, precision, compact, masses)
         valid |= plan.todo
 
         r = prog.root_region

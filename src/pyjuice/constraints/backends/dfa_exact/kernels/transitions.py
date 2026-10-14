@@ -126,13 +126,16 @@ def transition_job(rows: torch.Tensor, dev):
 
 
 @triton_jit
-def _transition_kernel(class_mars, mass_row, trans, rows, tiles, pair_of, entry_ptr, width, W, C, input_start,
-                       num_qtiles, pid0, TS: tl.constexpr, QT: tl.constexpr, TP: tl.constexpr, TC: tl.constexpr):
+def _transition_kernel(class_mars, mass_row, mass_stride, trans, rows, tiles, pair_of, entry_ptr, width, W, C,
+                       input_start, num_qtiles, trans_stride, pid0, TS: tl.constexpr, QT: tl.constexpr,
+                       TP: tl.constexpr, TC: tl.constexpr, SAMPLE: tl.constexpr):
     """
-    One program per (tile of rows at one position, ``QT`` columns): per column, its pairs ``TP`` at a time, as the
-    product of the rows' class masses -- linear, scaled by 2^64, in natural class order -- with the 0/1 table of
-    which of the pairs every class leads to. A class mass is a sum of fp32 probabilities, so 0 or at least 2^-149:
-    scaled, a normal float, which tensor cores do not flush. Its log is the transition mass.
+    One program per (tile of rows at one position, ``QT`` columns) -- ``SAMPLE``: and sample, for class masses of each
+    sample's own (rows ``mass_row + b * mass_stride``, transition masses ``trans_stride`` floats apart; a row the same
+    for every sample, stride 0, is built for sample 0 alone): per column, its pairs ``TP`` at a time, as the product
+    of the rows' class masses -- linear, scaled by 2^64, in natural class order -- with the 0/1 table of which of the
+    pairs every class leads to. A class mass is a sum of fp32 probabilities, so 0 or at least 2^-149: scaled, a normal
+    float, which tensor cores do not flush. Its log is the transition mass.
     """
     pid = pid0 + tl.program_id(0)
     tile = pid // num_qtiles
@@ -141,7 +144,14 @@ def _transition_kernel(class_mars, mass_row, trans, rows, tiles, pair_of, entry_
     rmask = r < count
     u = tl.load(rows + (start + r) * 3, mask = rmask, other = 0).to(tl.int64)
     off = tl.load(rows + (start + r) * 3 + 2, mask = rmask, other = 0).to(tl.int64)
-    masses = class_mars + tl.load(mass_row + (u - input_start), mask = rmask, other = 0).to(tl.int64) * C
+    row = tl.load(mass_row + (u - input_start), mask = rmask, other = 0).to(tl.int64)
+    if SAMPLE:
+        b = tl.program_id(1).to(tl.int64)
+        st = tl.load(mass_stride + (u - input_start), mask = rmask, other = 0).to(tl.int64)
+        rmask = rmask & ((b == 0) | (st > 0))
+        row = row + b * st
+        off = off + tl.where(st > 0, b * trans_stride, 0)
+    masses = class_mars + row * C
     base = tl.load(entry_ptr + t * (W + 1))                                  # the boundary's first pair
     jj = tl.arange(0, TP)
     for qi in range(QT):
@@ -162,11 +172,12 @@ def _transition_kernel(class_mars, mass_row, trans, rows, tiles, pair_of, entry_
                          mask = rmask[:, None] & (g0 + jj < g_end)[None, :])
 
 
-def transition_masses(trans, job, class_mars, prog):
+def transition_masses(trans, job, masses, prog):
     """
     Write the transition masses of every step of ``job`` (from :func:`transition_job`): for each column ``q`` at the
     input's position ``t`` and each successor ``s``, ``log sum_{c: next_col[t, q, c] = s} exp(class_mars[r, c])``
-    (``r``: input ``u``'s row of the class masses), at ``trans[offset + p]`` for the pair's number ``p`` within the
+    (``r``: input ``u``'s row of the class masses ``masses``, a :class:`~..state.ClassMasses`; per sample when they
+    are, ``prog.trans_size`` floats apart), at ``trans[offset + p]`` for the pair's number ``p`` within the
     boundary.
     """
     rows, tiles, TS = job
@@ -177,8 +188,10 @@ def transition_masses(trans, job, class_mars, prog):
         QT //= 2
     num_qtiles = host_cdiv(max(prog.width), QT)
     TP = min(64, max(16, host_next_power_of_2(tt.max_pairs)))
+    sample = masses.batch > 1
+    stride = masses.stride if sample else masses.row
     for first, size in grid_chunks(tiles.size(0) * num_qtiles, 0):
-        _transition_kernel[(size,)](class_mars, prog.mass_row, trans, rows, tiles, tt.pair_of, tt.entry_ptr,
-                                    prog.width_t, W, C,
-                                    prog.input_start, num_qtiles, first, TS = TS, QT = QT, TP = TP, TC = cfg["TC"],
-                                    num_warps = cfg["warps"])
+        _transition_kernel[(size, masses.batch)](masses.table, masses.row, stride, trans, rows, tiles, tt.pair_of,
+                                                 tt.entry_ptr, prog.width_t, W, C, prog.input_start, num_qtiles,
+                                                 prog.trans_size, first, TS = TS, QT = QT, TP = TP, TC = cfg["TC"],
+                                                 SAMPLE = sample, num_warps = cfg["warps"])

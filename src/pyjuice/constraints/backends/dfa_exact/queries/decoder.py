@@ -92,18 +92,21 @@ class DFAExactDecoder(Decoder):
         return super().__exit__(*exc)
 
     def _marginal(self, data: torch.Tensor, missing: torch.Tensor, precision: str = "fp32",
-                  storage: str = "auto") -> torch.Tensor:
+                  storage: str = "auto", external = None) -> torch.Tensor:
         be = self.cc.backend
-        held, keep, compact, carry = self._reuse(data, missing, None, precision, storage, marginal = True)
+        held, keep, compact, carry = self._reuse(data, missing, None, precision, storage, marginal = True,
+                                                 external = external)
         report = {}
         out = marginal(be, data, missing, precision, held = None if held is None else held[0], report = report,
-                       storage = storage, carry = carry)
+                       storage = storage, carry = carry, external = external)
         self._after(data.size(0), precision, storage, keep, report, compact)
         return out
 
     def _conditional(self, data: torch.Tensor, missing: torch.Tensor, targets: Optional[torch.Tensor],
                      return_log_marginal: bool, candidates: Optional[torch.Tensor], precision: str = "fp32",
-                     storage: str = "auto"):
+                     storage: str = "auto", external = None):
+        if external is not None:
+            raise NotImplementedError("Conditionals under per-sample inputs are not supported yet (marginals are).")
         be = self.cc.backend
         held, keep, compact, carry = self._reuse(data, missing, targets, precision, storage, marginal = False)
         report = {}
@@ -116,13 +119,15 @@ class DFAExactDecoder(Decoder):
     # ---------------------------------------------------------------------------------------------
 
     def _reuse(self, data: torch.Tensor, missing: torch.Tensor, targets: Optional[torch.Tensor], precision: str,
-               storage: str, marginal: bool):
+               storage: str, marginal: bool, external = None):
         """
         ``(held, keep, compact, carry)`` for a call: ``held`` None (nothing reused) or ``(inside, top_down)``, the
         values the call holds (bool per sum region, see :mod:`.plans`), in place or moved there; ``keep`` None or
         ``(inside, top_down)``, those the buffers still hold for the call's rows besides what it computes; compact, the
         layout of the values the buffers hold, while it is the call's rows' (``compact``: None if not), and what the
-        call needs to re-gather those it holds into its own (``carry``, see :func:`~.conditional.conditional`).
+        call needs to re-gather those it holds into its own (``carry``, see :func:`~.conditional.conditional`). Under
+        the session's per-sample ``external`` inputs, a row's values hold for its own inputs: none is reused once rows
+        moved, unless every row reads the same (a batch of 1).
         """
         kept, self._kept = self._kept, None         # given up until the call returns (if it raises: for good)
         be = self.cc.backend
@@ -149,6 +154,8 @@ class DFAExactDecoder(Decoder):
             on_asked = cover[asked]
             held = (inside & ~on_asked.all(axis = 0), top_down & on_asked.any(axis = 0))
         identity = B == kept.B and (parents == np.arange(B)).all()
+        if not identity and external is not None and external.batch > 1:   # another row's inputs
+            return None, None, None, None
         if kept.compact is not None:                                    # compact: the call re-gathers what it holds
             carry = None
             if held[0].any() or held[1].any():

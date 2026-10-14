@@ -288,21 +288,22 @@ class Program:
         out_ivs = np.unique(np.asarray([self.iv_index[iv] for iv in ends], dtype = np.int64))
         return Launch(form, kinds, steps, E_max, X_max, S_max, rows, iv, sizes, groups_host, out_ivs)
 
-    def transition_buffer(self) -> torch.Tensor:
-        """Where the transition masses go (all of them, or one chunk's; allocated on first use, and again when a
-        query plan's chunks need more)."""
-        if self._trans is None or self._trans.numel() < self.trans_size:
+    def transition_buffer(self, samples: int = 1) -> torch.Tensor:
+        """Where the transition masses go (all of them, or one chunk's; ``samples`` blocks of ``trans_size``, for
+        class masses of each sample's own; allocated on first use, and again when a query plan's chunks need more)."""
+        size = self.trans_size * samples
+        if self._trans is None or self._trans.numel() < size:
             self._trans = None
-            self._trans = torch.empty(max(1, self.trans_size), dtype = torch.float32, device = self.dev)
+            self._trans = torch.empty(max(1, size), dtype = torch.float32, device = self.dev)
         return self._trans
 
-    def transitions(self, class_mars: torch.Tensor, version: int):
-        """When transitions are grouped and all their masses kept: build them from the class masses of computation
-        ``version``, unless they already are."""
+    def transitions(self, masses):
+        """When transitions are grouped and all their masses kept: build them from the query's class masses
+        (:class:`~..state.ClassMasses`), unless they already are."""
         if self.trans.grouped and self.trans_persistent and self.trans_job is not None and \
-                self._trans_version != version:
-            transition_masses(self.transition_buffer(), self.trans_job, class_mars, self)
-            self._trans_version = version
+                self._trans_version != masses.version:
+            transition_masses(self.transition_buffer(masses.batch), self.trans_job, masses, self)
+            self._trans_version = masses.version
 
     def _entry(self, t: int) -> int:
         return self.width[t]                                         # boundary 0: the initial state alone

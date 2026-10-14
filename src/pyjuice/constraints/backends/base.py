@@ -71,6 +71,12 @@ class Backend(ABC):
         """Samples from the PC conditioned on the constraint (and evidence)."""
         raise NotImplementedError(f"The {self.name} backend does not serve `sample`.")
 
+    def external_inputs(self, inputs: Dict[str, Any]):
+        """The per-sample inputs of a decoder's session (``inputs``: keyword -> value, as ``pc(x, ...)`` takes them,
+        see :meth:`~pyjuice.constraints.ConstrainedCircuit.decoder`), checked against the PC: what the backend's
+        queries take as ``external``."""
+        raise NotImplementedError(f"The {self.name} backend does not take per-sample inputs ({', '.join(inputs)}).")
+
     def decoder(self, cc, **options):
         """A decoding session over ``cc`` (see :meth:`~pyjuice.constraints.ConstrainedCircuit.decoder`): this one
         reuses nothing between queries; a backend that can returns its own

@@ -39,7 +39,7 @@ from ..kernels.sum import dense_sum_top_down, fill_dead_rows, fused_sum_top_down
 
 def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missing: torch.Tensor,
                  obs_class: torch.Tensor, liveness, precision: str, visit: Optional[Callable[[int], None]] = None,
-                 class_weights: Optional[dict] = None, class_mars: Optional[torch.Tensor] = None, compact = None):
+                 class_weights: Optional[dict] = None, masses = None, compact = None):
     """
     The top-down values a query plan computes (``plan.top_down``, see :mod:`.plans`), after
     :func:`~.forward.run_forward` filled the inside values of ``bufs`` under ``plan``: the per-sample ones into
@@ -53,7 +53,8 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
     :param class_weights: None, or where the class weights of the target positions' input nodes go, every sample's
         (see :func:`~.score.run_class_weights`; the plan must be a scoring one, see :func:`~.query_plan.
         top_down_plan`)
-    :param class_mars: the query's class masses if its forward has them (:func:`~.forward.run_forward`'s), else None
+    :param masses: the query's class masses (:class:`~..state.ClassMasses`) if its forward has them
+        (:func:`~.forward.run_forward`'s), else None
     :param compact: None, or the query's :class:`~..kernels.compact.CompactLayout`: the per-sample values are compact
         (``flows`` laid out by it, see :meth:`~.state.State.flows`), the inside values too where it lays them out
         (``mars``, as ``bufs``)
@@ -85,9 +86,10 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
     lanes = (liveness.lanes.perm, liveness.lanes.reg_first, liveness.lanes.reg_live) \
         if liveness is not None and compact is None else None
     exact = liveness is not None
-    if class_mars is None:
-        class_mars = backend.state.class_masses()
-    prog.transitions(class_mars, backend.state.class_mars_version)
+    if masses is None:
+        masses = backend.state.masses()
+    prog.transitions(masses)
+    class_mars = masses.table
     stacks, kept = backend.state.weight_stacks()
 
     r = prog.root_region                                 # the root: top-down value 0 (log 1) on its slot
@@ -157,10 +159,10 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
                     temp = backend.state.storage_view("product_scratch", num_temps * temp_width)
                     temp_flows = backend.state.storage_view("product_scratch_flows", num_temps * tw)
                 if folds[0]:                             # the folds' inside values, for a batch of one ...
-                    products(folds[0], (temp, temp_width), prog, regions, element_mars, node_mars, class_mars,
+                    products(folds[0], (temp, temp_width), prog, regions, element_mars, node_mars, masses,
                              prog.no_evidence, None, elem_first, elem_width, 1, srcs, exact = True)
                 if folds[1]:                             # ... and per sample
-                    products(folds[1], (temp, temp_width), prog, regions, element_mars, node_mars, class_mars,
+                    products(folds[1], (temp, temp_width), prog, regions, element_mars, node_mars, masses,
                              obs_class, live, elem_first, elem_width, B, srcs, exact = exact, compact = mars)
                 for once_launches, sample_launches, cw_launches in stages:
                     if once_launches:

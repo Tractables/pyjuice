@@ -2,7 +2,8 @@
 The examples in :meth:`ConstrainedCircuit.decoder`'s docstring, run as written: Hugging Face ``generate`` (a tiny random
 GPT-2; beam search reorders the rows) with the Ctrl-G weighting, with and without candidates, and a masked-diffusion
 loop (a random denoiser). Every sequence they produce satisfies the constraint, and is the one the same code produces
-with the circuit's own queries in place of the decoders'.
+with the circuit's own queries in place of the decoders'. The per-sample inputs' example gives the PC's own marginal
+under the one-state constraint.
 """
 import contextlib
 import inspect
@@ -35,7 +36,7 @@ def examples():
             k += 1
         blocks.append(textwrap.dedent("\n".join(lines[j:k])).strip("\n"))
         i = k
-    assert len(blocks) == 4, "the loop, the processor, its candidates, masked diffusion"
+    assert len(blocks) == 5, "the loop, the processor, its candidates, masked diffusion, per-sample inputs"
     return blocks
 
 
@@ -55,7 +56,7 @@ def test_the_loop(cc):
 @pytest.mark.parametrize("candidates", [False, True])
 def test_generation_with_a_language_model(cc, candidates):
     transformers = pytest.importorskip("transformers")
-    _, processor, top, _ = examples()
+    _, processor, top, _, _ = examples()
     if candidates:                                                  # the four lines from `c = ...` replaced
         body = textwrap.indent(top, " " * 8)
         start = processor.index("        c = self.decoder")
@@ -90,7 +91,7 @@ class Plain:
 
 
 def test_masked_diffusion(cc):
-    *_, diffusion = examples()
+    diffusion = examples()[3]
     B, MASK = 8, 7
 
     def run(circuit):
@@ -103,3 +104,15 @@ def test_masked_diffusion(cc):
     x = run(cc)
     assert torch.equal(x, run(Plain(cc)))
     assert not (x == MASK).any() and all(cc.constraint.accepts(row) for row in x.tolist())
+
+
+def test_per_sample_inputs(build_pc):
+    pc = build_pc("hmm", N, V, input_dist = juice.nodes.distributions.SoftEvidenceCategorical)
+    g = torch.Generator().manual_seed(0)
+    x = torch.randint(0, V, (4, N), generator = g).cuda()
+    missing = (torch.rand(4, N, generator = g) < 0.5).cuda()
+    E = torch.randn(4, N, V, generator = g).cuda()
+    scope = dict(cc = jc.compile(jc.DFA.anything(V), pc), E = E, x = x, missing = missing)
+    exec(examples()[4], scope)
+    want = pc(x, missing_mask = missing, categorical_evidence_logp = E)
+    assert (scope["logp"] - want).abs().max() < 1e-5

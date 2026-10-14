@@ -27,6 +27,10 @@ from .evidence import candidate_tensor, evidence, target_mask
 
 #: the options of the :func:`pyjuice.fast_inference` scope a decoder opens; every other option is a query default
 FAST_INFERENCE_OPTIONS = ("allow_param_copy", "allow_bf16_params", "allow_cudagraph")
+#: the per-sample inputs a decoder takes for its whole session, as ``pc(x, ...)`` takes them (keyword arguments of
+#: the PC's layers: sum layers' external parameters, input layers' soft evidence)
+EXTERNAL_INPUTS = ("sum_external_params", "categorical_evidence_logp", "soft_evidence_cat_ids",
+                   "soft_evidence_value_mask")
 
 def match_rows(data: np.ndarray, missing: np.ndarray, previous_data: np.ndarray, previous_missing: np.ndarray):
     """
@@ -78,7 +82,10 @@ class Decoder:
     A decoding session over a :class:`~pyjuice.constraints.ConstrainedCircuit`, made by
     :meth:`ConstrainedCircuit.decoder` and used as a context manager: its queries are the circuit's (same arguments,
     same results), inside the :func:`pyjuice.fast_inference` scope it opens. Options given when it is made are
-    defaults for every call, which a call's own keyword overrides. One decoder is open on a circuit at a time.
+    defaults for every call, which a call's own keyword overrides -- but the per-sample inputs
+    (:data:`EXTERNAL_INPUTS`), which hold for the whole session: checked against the PC when the decoder is made, and
+    given to every call as ``external`` (the backend's :meth:`~.backends.base.Backend.external_inputs`). One decoder is
+    open on a circuit at a time.
 
     A backend's decoder reuses work between calls by overriding :meth:`_marginal` and :meth:`_conditional` (and setting
     :attr:`remembers`, to keep the last call's evidence for :meth:`_match_rows`); this one calls the backend's queries.
@@ -91,6 +98,8 @@ class Decoder:
     def __init__(self, cc, **options):
         self.cc = cc
         self._fast_inference = {k: options.pop(k) for k in FAST_INFERENCE_OPTIONS if k in options}
+        inputs = {k: options.pop(k) for k in EXTERNAL_INPUTS if options.get(k) is not None}
+        self._external = cc.backend.external_inputs(inputs) if inputs else None
         self._defaults = options
         self._scope = None                          # the open fast_inference scope
         self._used = False                          # a decoder is opened once
@@ -175,7 +184,14 @@ class Decoder:
         if self._scope is None:
             raise RuntimeError("Use the decoder inside its `with` block: `with cc.decoder() as decoder: ...`.")
         self.cc._check_pc_unchanged()
-        return {**{k: v for k, v in self._defaults.items() if k != "mask_id"}, **options}
+        bound = [k for k in options if k in EXTERNAL_INPUTS]
+        if bound:
+            raise TypeError(f"{', '.join(f'`{k}`' for k in bound)}: per-sample inputs hold for a decoder's whole "
+                            f"session; give them to `cc.decoder(...)`.")
+        options = {**{k: v for k, v in self._defaults.items() if k != "mask_id"}, **options}
+        if self._external is not None:
+            options["external"] = self._external
+        return options
 
     def _evidence(self, data, missing_mask, mask_id: Optional[int]):
         """The canonical evidence (:func:`~pyjuice.constraints.evidence.evidence`); on the host if the decoder
