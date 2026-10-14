@@ -25,7 +25,8 @@ from ..kernels.compact import (STORAGES, compact_buffers, held_elsewhere, query_
                                resolve_storage)
 from ..kernels.live import liveness
 from ..kernels.score import score_group, score_tables
-from .plans import PLANS_PER_POSITION, PLAN_CACHE_SIZE, per_sample_intervals, prior_regions, query_plan, top_down_prior
+from .plans import (PLANS_PER_POSITION, PLAN_CACHE_SIZE, per_sample_intervals, prior_regions, query_plan,
+                    scope_intervals, top_down_prior)
 from .top_down import run_backward
 
 
@@ -156,8 +157,8 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     groups, size, (base, K) = layout
     if observed is None:
         observed = (~missing).any(dim = 0).cpu().numpy()
-    if external is not None and external.batch > 1:                         # values over them differ per sample
-        observed = observed | external.variables
+    if external is not None:                                                # values that differ per sample
+        observed = observed | external.observed
     x = torch.where(missing, 0, data.to(dev).long())                          # missing tokens: any valid id
     held = held or {}
     obs_class = torch.where(missing, -1, backend.token_classes.token_class[x]).contiguous()
@@ -169,6 +170,8 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     prior = prior_regions(prog, observed, B, kept, lv)
     pf = backend.state.prior_flows(np.zeros(len(backend.sum_regions), dtype = bool))
     once, pf_valid = top_down_prior(prog, td, observed, B, kept, lv), pf["valid"].copy()
+    if external is not None and external.scopes:                            # under gates of a batch: their nodes'
+        once = once & ~scope_intervals(td, external.scopes)                 # children's values are every sample's own
 
     def plan_for(held):
         top = dict(program = td, once = once, valid = pf_valid, held = held.get("top_down"), scoring = True)
@@ -201,7 +204,8 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     if report is not None:
         report.update(plan = plan, liveness = lv, compact = compact, inputs_only = inputs_only, storage = storage,
                       dropped = dropped)
-    F.run_forward(backend, bufs, plan, x, missing, obs_class, lv, precision, compact, masses)
+    gates = F.gate_context(backend, external)
+    F.run_forward(backend, bufs, plan, x, missing, obs_class, lv, precision, compact, masses, gates = gates)
     valid |= plan.todo
 
     C = backend.num_classes
@@ -209,7 +213,7 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     buf.fill_(-float("inf"))
     cw = dict(buf = buf, base = base, K = K)
     run_backward(backend, bufs, flows, plan, x, missing, obs_class, lv, precision, class_weights = cw,
-                 masses = masses, compact = compact)
+                 masses = masses, compact = compact, gates = gates)
     return [(g, pos, buf[s:s + len(pos) * B * C * len(score.rows[g])].view(len(pos) * B, C, len(score.rows[g])))
             for g, pos, s in groups], masses
 

@@ -12,7 +12,7 @@ import torch
 
 from ..kernels.compact import STORAGES, compact_buffers, held_elsewhere, query_layout, resolve_storage
 from ..kernels.live import liveness
-from .forward import PRECISIONS, missing_tensor, run_forward
+from .forward import PRECISIONS, gate_context, missing_tensor, run_forward
 from .plans import per_sample_intervals, prior_regions, query_plan
 
 
@@ -34,8 +34,8 @@ def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] =
         :func:`~.conditional.conditional`); a marginal has no top-down value
     :param carry: compact, where the inside values ``held`` marks are (see :func:`~.conditional.conditional`)
     :param external: None, or a decoder session's per-sample inputs (:class:`~..state.ExternalInputs`): their
-        variables count as observed when they differ per row (a batch of 1: the values over them are every sample's,
-        kept once for the session as the class masses that give them); the positions they leave free are missing
+        variables (soft evidence) and scopes (gates) count as observed when they differ per row (a batch of 1: the
+        values over them are every sample's, kept once for the session); the positions they leave free are missing
     :returns: [B, number of root nodes], as :func:`pyjuice.queries.marginal`
     """
     if precision not in PRECISIONS:
@@ -62,8 +62,8 @@ def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] =
         missing, missing_mask = missing | external.free, True
     observed = np.ones(n, dtype = bool) if missing_mask is None else \
         (~missing).any(dim = 0).cpu().numpy()                           # the positions some sample observes
-    if external is not None and external.batch > 1:
-        observed |= external.variables
+    if external is not None:                                            # values that differ per sample
+        observed |= external.observed
     x = torch.where(missing, 0, data.to(dev).long())                     # missing tokens: any valid id
 
     with torch.no_grad():
@@ -94,7 +94,8 @@ def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] =
         if report is not None:
             report.update(plan = plan, liveness = lv, inputs_only = inputs_only, compact = compact, storage = storage,
                           dropped = dropped)
-        run_forward(backend, bufs, plan, x, missing, obs_class, lv, precision, compact, masses)
+        run_forward(backend, bufs, plan, x, missing, obs_class, lv, precision, compact, masses,
+                    gates = gate_context(backend, external))
         valid |= plan.todo
 
         r = prog.root_region

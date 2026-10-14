@@ -17,6 +17,7 @@ from ..kernels.common import IDENTITY, SUM, TEMP
 from ..kernels.prod import Launch, skip_masks
 from ..kernels.sum import dense_groups
 from ..kernels.transitions import max_successors, transition_job, transition_masses, transition_tables
+from ..external_params import block_scale
 from .layout import interval_tables
 
 
@@ -105,9 +106,11 @@ class Program:
         self.layouts = OrderedDict()                                   # conditionals' class weights, see .conditional
 
         # every product layer's launches are first built on the host -- ``(form, kinds, rows, iv, sizes)``, see
-        # :class:`~.prod.Launch` -- and passed over below, then made into launches (:meth:`_launch`)
+        # :class:`~.prod.Launch` -- and passed over below, then made into launches (:meth:`_launch`). Gated sum layers
+        # (:mod:`..external_params.block_scale`) run every node block fused, each edge with its gate.
         self.steps = []
         self.stack_uses = {}                                           # stack key -> dense runs reading it per query
+        self.gate_cells = block_scale.cells(pc)
         prod_index = -1
         prod_layers = iter(backend.product_rows)
         for lg in pc.inner_layer_groups:
@@ -120,9 +123,13 @@ class Program:
                 layers = []
                 for layer in lg.layers:
                     parts = []
+                    gated = any(gl is layer for gl in self.gate_cells.layers)
                     for nids, cids, pids in zip(layer.partitioned_nids, layer.partitioned_cids, layer.partitioned_pids):
                         regs = [region_of(int(r)) for r in nids.tolist()]
-                        groups, rest = dense_groups(nids, cids, pids, layer.block_size, elem_first)
+                        if not gated:
+                            groups, rest = dense_groups(nids, cids, pids, layer.block_size, elem_first)
+                        else:
+                            groups, rest = {}, torch.arange(nids.numel(), device = nids.device)
                         dense = {}                                      # (region, first child row) -> node blocks
                         for c0, blocks in groups.items():
                             for k, nid, p0 in blocks:
@@ -137,9 +144,13 @@ class Program:
                         fused = None
                         if rest.numel() > 0:
                             rest_regs = [regs[k] for k in rest.tolist()]
+                            gate = None
+                            if gated:
+                                gate = block_scale.edge_tables(self.gate_cells, layer, nids[rest], cids[rest],
+                                                               elem_first, dev)
                             fused = (nids[rest].contiguous(), cids[rest].contiguous(), pids[rest].contiguous(),
                                      torch.tensor(rest_regs, dtype = torch.long, device = dev),
-                                     max(slots_of_reg[r] for r in rest_regs), None)
+                                     max(slots_of_reg[r] for r in rest_regs), None, gate)
                         parts.append((dense, cids.size(1), fused))
                     layers.append((layer.block_size, parts))
                 self.steps.append(("sum", prod_index, layers))
@@ -451,8 +462,9 @@ def _stack_key(blocks, E: int, block_size: int):
 
 def _split_aliased(fused, alias_row, alias_reg, elem_first: int, dev):
     """A fused sum part's edges split in two: the children read in element_mars (left-packed, padded with element
-    row 0, below every region) and the children that copy a sum, read in the sum's own row."""
-    nids, cids, pids, nb_reg, max_slots, _ = fused
+    row 0, below every region) and the children that copy a sum, read in the sum's own row -- under a gate, each with
+    its gate cell (``idx``, ``a_idx``) and child place (``lc``, ``a_lc``)."""
+    nids, cids, pids, nb_reg, max_slots, _, gate = fused
     c, p = cids.cpu().long(), pids.cpu().long()
     inside = c >= elem_first
     row = torch.where(inside, alias_row[(c - elem_first).clamp(min = 0, max = alias_row.numel() - 1)].long(), -1)
@@ -470,6 +482,15 @@ def _split_aliased(fused, alias_row, alias_reg, elem_first: int, dev):
         return [t.to(dev, torch.int32).contiguous() for t in out]
 
     reg = torch.where(is_alias, alias_reg[(c - elem_first).clamp(min = 0, max = alias_row.numel() - 1)].long(), 0)
-    ce, pe = pack(~is_alias, c, p, pad = (0, 0))
-    ar, ag, ap = pack(is_alias, row, reg, p, pad = (-1, 0, 0))
-    return nids, ce, pe, nb_reg, max_slots, (ar, ag, ap)
+    if gate is None:
+        ce, pe = pack(~is_alias, c, p, pad = (0, 0))
+        ar, ag, ap = pack(is_alias, row, reg, p, pad = (-1, 0, 0))
+        return nids, ce, pe, nb_reg, max_slots, (ar, ag, ap), None
+    g, lc = gate["idx"].cpu().long(), torch.from_numpy(gate["lc"])
+    ce, pe, ge, le = pack(~is_alias, c, p, g, lc, pad = (0, 0, 0, 0))
+    ar, ag, ap, ga, la = pack(is_alias, row, reg, p, g, lc, pad = (-1, 0, 0, 0, 0))
+    host = lambda t: t.cpu().long().numpy()
+    gate = dict(gate, idx = ge, lc = host(le), a_idx = ga, a_lc = host(la),
+                uniform = block_scale.uniform_chunks(host(ge), host(ce) >= elem_first),
+                a_uniform = block_scale.uniform_chunks(host(ga), host(ar) >= 0))
+    return nids, ce, pe, nb_reg, max_slots, (ar, ag, ap), gate

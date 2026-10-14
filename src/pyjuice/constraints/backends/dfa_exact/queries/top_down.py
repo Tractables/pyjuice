@@ -39,7 +39,7 @@ from ..kernels.sum import dense_sum_top_down, fill_dead_rows, fused_sum_top_down
 
 def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missing: torch.Tensor,
                  obs_class: torch.Tensor, liveness, precision: str, visit: Optional[Callable[[int], None]] = None,
-                 class_weights: Optional[dict] = None, masses = None, compact = None):
+                 class_weights: Optional[dict] = None, masses = None, compact = None, gates: Optional[dict] = None):
     """
     The top-down values a query plan computes (``plan.top_down``, see :mod:`.plans`), after
     :func:`~.forward.run_forward` filled the inside values of ``bufs`` under ``plan``: the per-sample ones into
@@ -58,6 +58,7 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
     :param compact: None, or the query's :class:`~..kernels.compact.CompactLayout`: the per-sample values are compact
         (``flows`` laid out by it, see :meth:`~.state.State.flows`), the inside values too where it lays them out
         (``mars``, as ``bufs``)
+    :param gates: None, or the gates of the query's gated sum layers (:func:`~.forward.gate_context`)
     """
     pc, prog, td = backend.pc, backend.program(), plan.top_down
     out = backend.top_down_program()
@@ -145,7 +146,9 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
                         fused_sum_top_down(element_flows, nf, pc.params, tables, regs, elem_first, ew, nb,
                                           block_size, cbs, max_cols = max_cols, precision = dot,
                                           liveness = liveness if part == 1 and compact is None else None,
-                                          idx = tensor(idx))
+                                          idx = tensor(idx), gated = F.part_gates(gates, tables["gate"],
+                                                                                  compact if part == 1 else None, prog,
+                                                                                  part == 0))
             if visit is not None:
                 visit(prod_index)
         else:

@@ -41,13 +41,20 @@ class ExternalInputs:
     """
     A decoder session's per-sample inputs, checked against the PC (:meth:`~.backend.DFAExactBackend.external_inputs`).
 
-    :ivar inputs: keyword -> value, as ``pc(x, ...)`` takes them
-    :ivar batch: their batch size: every query's, or 1 (every row reads the same)
+    :ivar inputs: keyword -> value, as ``pc(x, ...)`` takes them (the input layers' alone)
+    :ivar batch: their batch size: every query's, or 1 (every row reads the same); ``evidence_batch`` the input
+        layers' inputs'
     :ivar layers: the input layers that read them (indices into the PC's input layer group)
     :ivar variables: bool [n] (host): the variables whose input nodes read them
     :ivar free: None, or bool [batch or 1, n] on the device: the positions they leave free -- marginalized under the
         inputs' weights whatever ``data`` holds there (a soft evidence's value mask False), which a query must not
         mark missing besides; ``free_host`` the same on the host
+    :ivar gates: None, or the gates of the PC's gated sum nodes (``sum_external_params``, a
+        :class:`.external_params.block_scale.SessionGates`)
+    :ivar observed: bool [n] (host): the positions whose values differ per sample whatever is observed -- the variables
+        of evidence of a batch, the scopes of gates of a batch -- which a query plans as observed
+    :ivar scopes: the intervals ``(a, b)`` of the gated nodes' scopes when their gates differ per sample: the top-down
+        values of a node of such a scope read them (its parents' are gated), so a query computes them per sample
     """
 
     inputs: Dict[str, Any]
@@ -56,6 +63,10 @@ class ExternalInputs:
     variables: np.ndarray
     free: Optional[torch.Tensor] = None
     free_host: Optional[np.ndarray] = None
+    gates: Any = None
+    observed: Optional[np.ndarray] = None
+    scopes: tuple = ()
+    evidence_batch: int = 1
 
 
 @dataclass
@@ -322,7 +333,14 @@ class State:
             return ClassMasses(table, mass_row, None, 1, self._class_mars_at, {})
         if self._session is not None and self._session[0] is external and self._session[1] == self._class_mars_at:
             return self._session[2]
-        be, Be, C = self._backend, external.batch, self._backend.num_classes
+        if not external.layers:                     # gates alone: the class masses, as a computation of the session's
+            self.class_mars_version += 1            # own (what is kept once under its gates is its own)
+            masses = ClassMasses(table, mass_row, None, 1, self.class_mars_version, {})
+            self._session = (external, self._class_mars_at, masses)
+            if is_active():
+                register_layer(self)                                # its exit calls `_release_fast_inference_params`
+            return masses
+        be, Be, C = self._backend, external.evidence_batch, self._backend.num_classes
         input_start = be.input_range[0]
         layers = [be.pc.input_layer_group[k] for k in external.layers]
         sizes = [lookup(layer.dist).sample_rows(layer, external.inputs) for layer in layers]

@@ -12,6 +12,7 @@ import numpy as np
 import torch
 
 from ... import distributions
+from . import external_params
 from ...language.base import Constraint
 from ...structure import PCStructure, _runs
 from ..base import Backend
@@ -231,9 +232,13 @@ class DFAExactBackend(Backend):
 
     def external_inputs(self, inputs: Dict[str, Any]) -> ExternalInputs:
         """A decoder session's per-sample inputs (see :meth:`~pyjuice.constraints.ConstrainedCircuit.decoder`),
-        checked against the PC by the input distributions that read them (their modules' ``check_inputs``)."""
+        checked against the PC by the input distributions that read them (their modules' ``check_inputs``), and the
+        gates of its gated sum nodes (``sum_external_params``, see :mod:`.external_params`)."""
+        inputs = dict(inputs)
+        gates = None
         if inputs.get("sum_external_params") is not None:
-            raise NotImplementedError("`sum_external_params` is not supported under a constraint yet.")
+            gates = external_params.block_scale.session_inputs(self.pc, self.program().gate_cells,
+                                                               inputs.pop("sum_external_params"))
         batches, layers, read, frees = set(), [], set(), []
         variables = np.zeros(self.n, dtype = bool)
         for k, layer in enumerate(self.pc.input_layer_group):
@@ -252,10 +257,20 @@ class DFAExactBackend(Backend):
             raise ValueError(f"No input layer of the PC reads {', '.join(f'`{key}`' for key in unread)}.")
         if len(batches) > 1:
             raise ValueError(f"The per-sample inputs have different batch sizes: {sorted(batches)}.")
+        evidence_batch = batches.pop() if batches else 1
+        gate_batch = gates.batch if gates is not None else 1
+        if evidence_batch > 1 and gate_batch > 1 and evidence_batch != gate_batch:
+            raise ValueError(f"The soft evidence has a batch of {evidence_batch}, the gates of {gate_batch}: one of "
+                             f"them must be 1 or both the same.")
         frees = [f for f in frees if f is not None]
         free = None if not frees else torch.stack(torch.broadcast_tensors(*frees)).any(dim = 0)
-        return ExternalInputs(dict(inputs), batches.pop(), tuple(layers), variables, free = free,
-                              free_host = None if free is None else free.cpu().numpy())
+        observed = variables & (evidence_batch > 1)
+        scopes = tuple(gates.scopes) if gate_batch > 1 else ()
+        for a, b in scopes:
+            observed[a:b] = True
+        return ExternalInputs(inputs, max(evidence_batch, gate_batch), tuple(layers), variables, free = free,
+                              free_host = None if free is None else free.cpu().numpy(), gates = gates,
+                              observed = observed, scopes = scopes, evidence_batch = evidence_batch)
 
     def marginal(self, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None,
                  precision: str = "fp32", storage: str = "auto",
@@ -308,8 +323,13 @@ def _unsupported_reason(ns, kind: str) -> Optional[str]:
             supported = ", ".join(t.__name__ for t in distributions.SUPPORTED)
             return f"input distribution {type(ns.dist).__name__} (supported: {supported})"
         return None
-    if kind == "sum" and getattr(ns, "external_params", None) is not None:
-        return "sum nodes with external parameters (gated layers are not supported yet)"
+    ext = getattr(ns, "external_params", None) if kind == "sum" else None
+    if ext is not None:
+        module = external_params.lookup(ext)
+        if module is None:
+            supported = ", ".join(t.__name__ for t in external_params.SUPPORTED)
+            return f"sum nodes with {type(ext).__name__} external parameters (supported: {supported})"
+        return module.refusal(ns)
     return None
 
 

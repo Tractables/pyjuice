@@ -263,16 +263,19 @@ class ConstrainedCircuit:
         Unmasking several positions in one step takes each from its own conditional, and together they may break the
         constraint; one position at a time (the next query is cheap) keeps every sample in it.
 
-        **Per-sample inputs** -- the keyword arguments ``pc(x, ...)`` takes for the PC's layers, e.g.
-        ``categorical_evidence_logp`` (the soft evidence of ``SoftEvidenceCategorical`` input nodes) -- hold for the
-        whole session: the decoder takes them, and every query in it runs under them, as ``pc(x, ...)`` would::
+        **Per-sample inputs** -- the keyword arguments ``pc(x, ...)`` takes for the PC's layers: the soft evidence of
+        ``SoftEvidenceCategorical`` input nodes (``categorical_evidence_logp``, with ``soft_evidence_cat_ids`` and
+        ``soft_evidence_value_mask``) and the gates of ``BlockScaleSumParams`` sum nodes (``sum_external_params``) --
+        hold for the whole session: the decoder takes them, and every query in it runs under them, as ``pc(x, ...)``
+        would::
 
             with cc.decoder(categorical_evidence_logp = E) as decoder:     # E: [B or 1, n, V] log-weights
                 logp = decoder.marginal(x, missing)                        # log p(C, x_observed) under E
 
         Their batch is every query's (row ``b`` reads row ``b``) or 1 (every row reads the same). A token missing at a
         position with soft evidence takes the evidence's weights too: the constraint sees the same per-position
-        distribution ``q(v) = p(v) w(v) / Z`` an observed token's value comes from.
+        distribution ``q(v) = p(v) w(v) / Z`` an observed token's value comes from; where a value mask is False, the
+        position is marginalized under ``p(v) w(v)`` whatever ``x`` holds there (the library's ``log Z``).
 
         :param options: ``allow_param_copy``, ``allow_bf16_params`` and ``allow_cudagraph`` for the
             :func:`pyjuice.fast_inference` scope; the per-sample inputs above; any other keyword (e.g. ``mask_id``,

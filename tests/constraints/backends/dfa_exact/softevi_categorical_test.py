@@ -800,7 +800,7 @@ def test_inputs_checked_and_refused(build_pc):
         with pytest.raises(ValueError, match = "one way"):                  # missing where the mask frees it
             decoder.marginal(data, missing)
         decoder.marginal(data, missing & ~missing)
-    with pytest.raises(NotImplementedError, match = "sum_external_params"):
+    with pytest.raises(ValueError, match = "sum_external_params"):
         cc.decoder(sum_external_params = {})
     with pytest.raises(ValueError, match = "K <="):
         cc.decoder(categorical_evidence_logp = torch.zeros(2, n, V + 1, device = DEV))

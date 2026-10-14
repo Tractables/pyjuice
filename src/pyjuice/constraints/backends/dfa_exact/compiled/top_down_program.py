@@ -19,6 +19,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from ..external_params import block_scale
 from ..kernels.common import IDENTITY, SUM, TEMP
 from ..kernels.prod import skip_masks_for
 from ..kernels.prod_top_down import TopDownLaunch
@@ -256,63 +257,80 @@ def _fused_tables(prog, parts, block_size, prod_index, elem_first, firsts, writt
     block size. A node block reads runs of consecutive children whose weights are ``BS`` apart; the runs of every node
     block of the layer are cut where any of them starts or ends, so two child blocks are equal or disjoint (one
     launch's programs never write the same row), and where an earlier launch's children end, so a child block is
-    written or log-added to as a whole. Node blocks with no top-down value (no row written) add nothing: left out."""
+    written or log-added to as a whole. Node blocks with no top-down value (no row written) add nothing: left out.
+    A gated layer's runs are also cut where their children's places among their node group's children stop being
+    consecutive: every parent of a child block has its gate row, child gate size and its first child's place (``gate``,
+    see ``block_scale.edge_tables`` in :mod:`..external_params`)."""
     BS = block_size
 
-    def runs(cols, pid_row, valid, group = None):
+    def runs(cols, pid_row, valid, group = None, lc = None):
         """Maximal runs of valid consecutive children with weights ``BS`` apart (and, given ``group``, in one group:
-        the sum region of aliased children): [(first, length, pid base, group)]."""
+        the sum region of aliased children; given ``lc``, consecutive places): [(first, length, pid base, group, first
+        place)]."""
         cont = valid[1:] & valid[:-1] & (cols[1:] == cols[:-1] + 1) & (pid_row[1:] == pid_row[:-1] + BS)
         if group is not None:
             cont &= group[1:] == group[:-1]
+        if lc is not None:
+            cont &= lc[1:] == lc[:-1] + 1
         starts = np.nonzero(valid & ~np.concatenate([[False], cont]))[0]
         ends = np.nonzero(valid & ~np.concatenate([cont, [False]]))[0]
-        return [(int(cols[a]), int(b - a + 1), int(pid_row[a]), -1 if group is None else int(group[a]))
-                for a, b in zip(starts, ends)]
+        return [(int(cols[a]), int(b - a + 1), int(pid_row[a]), -1 if group is None else int(group[a]),
+                 0 if lc is None else int(lc[a])) for a, b in zip(starts, ends)]
 
-    found = {"E": [], "S": []}                           # kind -> [(first row, length, pid base, region, nid, reg)]
+    found = {"E": [], "S": []}           # kind -> [(first row, length, pid base, region, nid, reg, place, row, cbs)]
     firsts_np = np.asarray(firsts)
-    for nids, cids, pids, nb_reg, _, aliased in parts:
+    gated = False
+    for nids, cids, pids, nb_reg, _, aliased, gate in parts:
         nids_h, regs_h = nids.cpu().long().tolist(), nb_reg.cpu().long().tolist()
         cids_h, pids_h = cids.cpu().long().numpy(), pids.cpu().long().numpy()
         if aliased is not None:
             a_rows, a_regs, a_pids = (t.cpu().long().numpy() for t in aliased)
+        gated = gate is not None
         for k, (nid, reg) in enumerate(zip(nids_h, regs_h)):
             if not any(("S", nid + i, reg) in written for i in range(BS)):
                 continue
-            for c0, length, p0, _ in runs(cids_h[k], pids_h[k], cids_h[k] >= elem_first):   # padding: below the region
-                found["E"].append((c0, length, p0, -1, nid, reg))
+            g = (int(gate["row"][k]), int(gate["cbs"][k])) if gated else (0, 1)
+            for c0, length, p0, _, lc0 in runs(cids_h[k], pids_h[k], cids_h[k] >= elem_first,   # padding: below
+                                               lc = gate["lc"][k] if gated else None):        # the region
+                found["E"].append((c0, length, p0, -1, nid, reg, lc0, *g))
             if aliased is not None:
                 valid = a_rows[k] >= 0
                 rows = np.where(valid, a_rows[k] + firsts_np[a_regs[k]], -1)
-                for r0, length, p0, creg in runs(rows, a_pids[k], valid, a_regs[k]):
-                    found["S"].append((r0, length, p0, creg, nid, reg))
-    blocks = defaultdict(list)                           # (kind, first row, region, size) -> [(nid, reg, pid base)]
+                for r0, length, p0, creg, lc0 in runs(rows, a_pids[k], valid, a_regs[k],
+                                                      lc = gate["a_lc"][k] if gated else None):
+                    found["S"].append((r0, length, p0, creg, nid, reg, lc0, *g))
+    blocks = defaultdict(list)           # (kind, first row, region, size) -> [(nid, reg, pid base, place, row, cbs)]
     for kind, rs in found.items():
         cuts = sorted({x for c0, length, *_ in rs for x in (c0, c0 + length)})
-        for c0, length, p0, creg, nid, reg in rs:
+        for c0, length, p0, creg, nid, reg, lc0, grow, gcbs in rs:
             lo, hi = bisect_left(cuts, c0), bisect_left(cuts, c0 + length)
             for a, b in zip(cuts[lo:hi], cuts[lo + 1:hi + 1]):
-                blocks[(kind, a, creg, b - a)].append((nid, reg, p0 + (a - c0) * BS))
+                blocks[(kind, a, creg, b - a)].append((nid, reg, p0 + (a - c0) * BS, lc0 + a - c0, grow, gcbs))
     by_size = defaultdict(list)                          # child block size -> [(kind, first row, region, add, parents)]
     for (kind, row, creg, length), parents in blocks.items():
         keys = [(("E", prod_index, row + c) if kind == "E" else ("S", row + c, creg)) for c in range(length)]
         hit = [k in written for k in keys]
         written.update(keys)
         for lo, hi, add in _segments(hit):               # written by an earlier launch: log-added to
-            by_size[hi - lo].append((kind, row + lo, creg, add, [(nid, reg, p0 + lo * BS) for nid, reg, p0 in parents]))
+            by_size[hi - lo].append((kind, row + lo, creg, add, [(nid, reg, p0 + lo * BS, lc0 + lo, grow, gcbs)
+                                                                  for nid, reg, p0, lc0, grow, gcbs in parents]))
     groups = {}
     for length, items in by_size.items():
-        cb_row, cb_reg, cb_add, cb_ivreg, ptr, p_nid, p_reg, p_pid = [], [], [], [], [0], [], [], []
+        cb_row, cb_reg, cb_add, cb_ivreg, ptr = [], [], [], [], [0]
+        p_nid, p_reg, p_pid, p_lc, p_grow, p_gcbs = [], [], [], [], [], []
         for kind, row, creg, add, parents in items:
             cb_row.append(row); cb_reg.append(creg); cb_add.append(add); cb_ivreg.append(parents[0][1])
-            for nid, reg, p0 in parents:
+            for nid, reg, p0, lc0, grow, gcbs in parents:
                 p_nid.append(nid); p_reg.append(reg); p_pid.append(p0)
+                p_lc.append(lc0); p_grow.append(grow); p_gcbs.append(gcbs)
             ptr.append(len(p_nid))
         t = lambda xs, dt = torch.int32: torch.tensor(xs, dtype = dt, device = dev)
         groups[length] = dict(cb_row = t(cb_row), cb_reg = t(cb_reg), cb_add = t(cb_add), cb_ivreg = t(cb_ivreg),
                               par_ptr = t(ptr), par_nid = t(p_nid), par_reg = t(p_reg), par_pid = t(p_pid, torch.int64),
                               max_slots = max(prog.slots[r] for r in cb_ivreg),
+                              gate = None if not gated else dict(
+                                  layer = parts[0][6]["layer"], lc = t(p_lc), row = t(p_grow), cbs = t(p_gcbs),
+                                  uniform = block_scale.uniform_tiles(np.asarray(p_lc), np.asarray(p_gcbs), length)),
                               host = dict(cb_row = np.asarray(cb_row), cb_reg = np.asarray(cb_reg),
                                           cb_ivreg = np.asarray(cb_ivreg)))
     return groups

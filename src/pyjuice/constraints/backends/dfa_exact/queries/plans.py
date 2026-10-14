@@ -244,6 +244,18 @@ def top_down_free(td, observed: np.ndarray) -> np.ndarray:
     return (P[td.iv_bounds[:, 0]] == 0) & (P[-1] == P[td.iv_bounds[:, 1]])
 
 
+def scope_intervals(td, scopes) -> np.ndarray:
+    """bool [intervals] (by ``prog.intervals``' numbers, ``td`` the :class:`~.top_down_program.TopDownProgram`): those
+    equal to one of ``scopes`` (``(a, b)`` pairs) -- under per-sample inputs of a sum node group (gates, see
+    :mod:`..external_params`), its scope: the top-down values there (its children's) read them, so
+    they are input-dependent whatever is observed."""
+    a, b = td.iv_bounds[:, 0], td.iv_bounds[:, 1]
+    out = np.zeros(a.size, dtype = bool)
+    for s, e in scopes:
+        out |= (a == s) & (b == e)
+    return out
+
+
 def top_down_prior(prog, td, observed: np.ndarray, B: int, kept: bool, liveness) -> np.ndarray:
     """
     bool [intervals] (by ``prog.intervals``' numbers): the top-down values a query of ``B`` samples keeps once, as

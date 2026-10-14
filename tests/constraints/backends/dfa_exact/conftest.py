@@ -115,10 +115,38 @@ def log_matmul(A, B):
 
 
 def log_weighted_sum(Wt, X):
-    """log(Wt @ exp(X)) over the first dim of X: Wt [N, K], X [K, ...] -> [N, ...]."""
+    """log(Wt @ exp(X)) over the first dim of X: Wt [N, K], X [K, ...] -> [N, ...]; or every sample's own weights,
+    Wt [B, N, K] and X [K, B, ...]."""
     s = _shift(X, 0)
+    if Wt.dim() == 3:
+        out = torch.einsum("bnk,kbr->nbr", Wt, torch.exp(X - s).reshape(X.size(0), X.size(1), -1))
+        return torch.log(out).reshape(Wt.size(1), *X.shape[1:]) + s
     out = Wt @ torch.exp(X - s).reshape(X.size(0), -1)
     return torch.log(out).reshape(Wt.size(0), *X.shape[1:]) + s
+
+
+def node_weights(cc, ns, inputs, B):
+    """A sum node group's weights [num_nodes, num_ch_nodes] -- or, a gated one under ``sum_external_params``
+    (``inputs``, as ``pc(x, ...)`` takes them), every sample's [B, num_nodes, num_ch_nodes]: ``theta[n, c] phi_b[n //
+    node gate size, c // child gate size] / Z_b[n]``, from the gate tensor of the node group (or of its storage owner,
+    under tied gates)."""
+    W = sum_weights(cc.pc, ns)
+    gates = None if inputs is None else inputs.get("sum_external_params")
+    ext = getattr(ns, "external_params", None)
+    if gates is None or ext is None:
+        return W
+    if any(isinstance(k, str) for k in gates):
+        first = next(iter(gates.values()))
+        gates = cc.pc._expand_external_params_groups(gates, (first[0] if isinstance(first, tuple) else first).size(0))
+    lphi = gates.get(ns, gates.get(ext.storage_owner(ns)))
+    if lphi is None:
+        return W
+    lphi = (lphi[0] if isinstance(lphi, (tuple, list)) else lphi).double()
+    gbs, gcbs = ext.gate_sizes(ns)
+    rows = torch.arange(ns.num_nodes, device = W.device) // gbs
+    cols = torch.arange(ns.num_ch_nodes, device = W.device) // gcbs
+    Wb = W.double()[None] * lphi.exp()[:, rows][:, :, cols].expand(B, -1, -1)
+    return (Wb / Wb.sum(dim = 2, keepdim = True)).to(DTYPE)
 
 
 # -------------------------------------------------------------------------------------------------
@@ -259,7 +287,7 @@ def reference_inside(cc, data, missing_mask = None, inputs = None) -> dict:
                 v = child if v is None else log_matmul(v, child)
         else:
             X = torch.cat([vals[cs] for cs in ns.chs], dim = 0)
-            v = log_weighted_sum(sum_weights(pc, ns), X)
+            v = log_weighted_sum(node_weights(cc, ns, inputs, B), X)
         assert v.shape == (ns.num_nodes, B, int(layout.width[a]), int(layout.width[b + 1])), (v.shape, a, b)
         vals[ns] = v
     return vals
@@ -318,7 +346,8 @@ def reference_top_down(cc, data, missing_mask = None, inside = None, inputs = No
     for ns in reversed(list(pc.root_ns)):                                       # parents before children
         O = outs[ns]
         if ns.is_sum():
-            O_ch = log_weighted_sum(sum_weights(pc, ns).t(), O)                 # children's nodes, concatenated
+            W = node_weights(cc, ns, inputs, O.size(1))
+            O_ch = log_weighted_sum(W.transpose(-1, -2), O)                     # children's nodes, concatenated
             k = 0
             for cs in ns.chs:
                 outs[cs] = torch.logaddexp(outs[cs], O_ch[k:k + cs.num_nodes])
@@ -377,7 +406,7 @@ def reference_conditional(cc, data, missing_mask = None, targets = None, inputs 
     if not layout.satisfiable:
         return torch.full((int(targets.sum()), V), -float("inf"), dtype = DTYPE, device = dev)
     inside = reference_inside(cc, data, missing_mask, inputs)
-    top_down = reference_top_down(cc, data, missing_mask, inside)
+    top_down = reference_top_down(cc, data, missing_mask, inside, inputs)
 
     token_class = layout.token_class.to(dev)
     scores = torch.full((missing.size(0), n, V), -float("inf"), dtype = DTYPE, device = dev)   # log p(x_t = v, e, C)
@@ -534,11 +563,25 @@ PC_KINDS = {
 }
 
 
+def gate_sums(root, child_gate = lambda ns: ns.ch_block_size, tie_external = False, which = lambda ns: True):
+    """Every sum node group of the circuit under ``root`` that ``which`` picks made gated, before it is compiled: a
+    :class:`BlockScaleSumParams` with one gate per node block and ``child_gate(ns)`` children per child gate."""
+    from pyjuice.nodes import BlockScaleSumParams
+    from pyjuice.nodes.external_sum_nodes import ExternalParamsSumNodes
+    for ns in root:
+        if ns.is_sum() and which(ns):
+            ns.__class__ = ExternalParamsSumNodes
+            ns.external_params = BlockScaleSumParams(ch_block_size = child_gate(ns), tie_external = tie_external)
+            ns.external_params.validate_ns(ns)
+    return root
+
+
 def build_pc(kind, n, V, seed = 0, device = torch.device("cuda:0"), perturbation = 2.0, input_dist = None,
-             **compile_kwargs):
+             gates = None, **compile_kwargs):
     """A compiled PC of one of the :data:`PC_KINDS` over ``n`` variables with ``V`` categories (``perturbation``: of
     its parameters' initialization, see ``init_parameters``; ``input_dist``: None, or another distribution class of
-    ``V`` categories every input node takes, e.g. ``SoftEvidenceCategorical``)."""
+    ``V`` categories every input node takes, e.g. ``SoftEvidenceCategorical``; ``gates``: None, or keywords of
+    :func:`gate_sums` -- its sums gated)."""
     assert PC_KINDS[kind] in (None, n), (kind, n)
     torch.manual_seed(seed); random.seed(seed)
     if kind == "hmm":
@@ -571,6 +614,8 @@ def build_pc(kind, n, V, seed = 0, device = torch.device("cuda:0"), perturbation
         for node in ns:
             if node.is_input():
                 node.dist = input_dist(num_cats = V)
+    if gates is not None:
+        gate_sums(ns, **gates)
     ns.init_parameters(perturbation = perturbation)
     return juice.compile(ns, verbose = False, **compile_kwargs).to(device)
 
@@ -579,3 +624,9 @@ def build_pc(kind, n, V, seed = 0, device = torch.device("cuda:0"), perturbation
 def build_pc_fixture():
     """:func:`build_pc`, for tests in this directory."""
     return build_pc
+
+
+@pytest.fixture(name = "gate_sums")
+def gate_sums_fixture():
+    """:func:`gate_sums`, for tests in this directory."""
+    return gate_sums
