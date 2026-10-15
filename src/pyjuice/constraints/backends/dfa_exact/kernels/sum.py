@@ -50,13 +50,21 @@ _TILES = {"tf32": (128, 32, 128, 8, 3), "tf32x3": (64, 32, 64, 4, 3), "bf16x3": 
 DENSE_MIN_BLOCK = 64
 
 
+def _tile_warps(warps: int, rows: int) -> int:
+    """A fused launch's warps for output tiles of ``rows`` rows: the table's (:data:`_TILES`, tuned on tiles of 128
+    rows), at most 4 for tiles of 32 rows or fewer (node blocks of 32: at 8 warps a launch took up to 2.4x as long as
+    at 4, with the same results; tiles of 128 rows and few columns lost 7% at 4)."""
+    return warps if rows > 32 else min(warps, 4)
+
+
 #: A fused launch of fewer programs than this many per SM splits every program's reduction (over its parents or
 #: children) in shares, each a program of its own (:func:`_split_merge`), as long as a share keeps
 #: ``SPLIT_MIN_SHARE`` chunks of it (dots); a power of two, at most ``SPLIT_MAX``. A launch of few, long programs (an
 #: HMM's layer of 1024 nodes in blocks of 32 at small batch: one program per tile of 32 nodes, 32 chunks of children
-#: each) leaves most of the GPU idle.
-SPLIT_PROGRAMS_PER_SM = 2
-SPLIT_MIN_SHARE = 2
+#: each) leaves most of the GPU idle. (2 and 2 before: shares of 2 chunks merged at a cost above their gain -- an LL1024
+#: top-down launch took 3.6x as long; 4 and 8 ran HMM, PD and Codpula-shaped queries as fast or faster.)
+SPLIT_PROGRAMS_PER_SM = 4
+SPLIT_MIN_SHARE = 8
 SPLIT_MAX = 16
 
 
@@ -541,6 +549,7 @@ def fused_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch
     if NG < block_size:
         TILE_M = _row_tile(TILE_M, block_size, NG)
     NGT = _node_gates_per_tile(block_size, NG, TILE_M)
+    warps = _tile_warps(warps, TILE_M)
     rows = NGT > 1                                       # a tile's rows read several node gates
     if gated is not None:                                # a chunk of edges within one gate, if one fits
         TILE_E = _gate_tile(TILE_E, gated["uniform"])
@@ -1080,6 +1089,7 @@ def fused_sum_top_down(element_flows: torch.Tensor, node_flows: torch.Tensor, pa
             TILE_I = min(TILE_I, max(16, gt["node_gate"]))                         # at once, when 16 or more
     num_ctiles = host_cdiv(cbs, TILE_C)
     num_col_tiles = host_cdiv(max_cols, TILE_B)
+    warps = _tile_warps(warps, TILE_C)
     tiles = num_blocks * num_ctiles * num_col_tiles
     split, buf, split_kw = 1, (), _NO_SPLIT                 # unsplit: the kernel without the split's arguments
     chunks = tables["max_parents"] * host_cdiv(block_size, TILE_I)
