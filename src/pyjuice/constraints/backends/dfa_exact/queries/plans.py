@@ -267,11 +267,11 @@ def scope_intervals(td, scopes) -> np.ndarray:
     equal to one of ``scopes`` (``(a, b)`` pairs) -- under per-sample inputs of a sum node group (gates, see
     :mod:`..external_params`), its scope: the top-down values there (its children's) read them, so
     they are input-dependent whatever is observed."""
-    a, b = td.iv_bounds[:, 0], td.iv_bounds[:, 1]
-    out = np.zeros(a.size, dtype = bool)
-    for s, e in scopes:
-        out |= (a == s) & (b == e)
-    return out
+    if not scopes:
+        return np.zeros(td.iv_bounds.shape[0], dtype = bool)
+    se = np.asarray(scopes, dtype = np.int64).reshape(-1, 2)
+    big = int(max(td.iv_bounds.max(), se.max())) + 1
+    return np.isin(td.iv_bounds[:, 0] * big + td.iv_bounds[:, 1], se[:, 0] * big + se[:, 1])
 
 
 def top_down_prior(prog, td, observed: np.ndarray, B: int, kept: bool, liveness) -> np.ndarray:

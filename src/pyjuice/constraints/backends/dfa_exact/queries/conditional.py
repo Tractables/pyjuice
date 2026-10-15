@@ -115,6 +115,14 @@ def _sample_columns(masses, score, g: int, pos: np.ndarray, B: int, prog) -> Opt
     return nodes[g], np.asarray(pos, dtype = np.int64), offset.reshape(-1)
 
 
+def _scope_ivs(td, external) -> np.ndarray:
+    """:func:`~.plans.scope_intervals` of a session's gated scopes, kept on its inputs (for the program ``td``)."""
+    kept = getattr(external, "_scope_ivs", None)
+    if kept is None or kept[0] is not td:
+        kept = external._scope_ivs = (td, scope_intervals(td, external.scopes))
+    return kept[1]
+
+
 def _check(backend, data: torch.Tensor, precision: str, storage: str = "dense"):
     if precision not in F.PRECISIONS:
         raise ValueError(f"`precision` must be one of {sorted(F.PRECISIONS)}, got {precision!r}.")
@@ -179,7 +187,7 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     pf = backend.state.prior_flows(np.zeros(len(backend.sum_regions), dtype = bool))
     once, pf_valid = top_down_prior(prog, td, observed, B, kept, lv), pf["valid"].copy()
     if external is not None and external.scopes:                            # under gates of a batch: their nodes'
-        once = once & ~scope_intervals(td, external.scopes)                 # children's values are every sample's own
+        once = once & ~_scope_ivs(td, external)                             # children's values are every sample's own
 
     def plan_for(held):
         top = dict(program = td, once = once, valid = pf_valid, held = held.get("top_down"), scoring = True)

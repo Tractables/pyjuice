@@ -620,7 +620,12 @@ def _cuda_shares(mod, dev, td: bool, ext: bool, precision: str, tn: int, tiles: 
     chunks."""
     cap = min(256 if ext else nch, nch if affine else 128)
     ctas = _ctas_per_sm(mod, dev, td, ext, precision == "tf32x3", tn, affine) * _num_sms(dev)
-    return _cuda_split(tiles, nch, ctas, tn, cap)
+    key = (tiles, nch, ctas, tn, cap, SPLIT_MAX, SPLIT_MIN_SHARE, _CUDA_SPLIT_BYTES, _CUDA_MERGE_BYTES)
+    if key not in _CUDA_SPLITS:                         # (by the launch's shape: a few per program)
+        if len(_CUDA_SPLITS) >= 4096:
+            _CUDA_SPLITS.clear()
+        _CUDA_SPLITS[key] = _cuda_split(tiles, nch, ctas, tn, cap)
+    return _CUDA_SPLITS[key]
 
 
 def _cuda_plan(params, pids, num_blocks, gated, g, num_edges, max_cols, block_size, TILE_E, precision, aliased,
@@ -673,6 +678,7 @@ def _cuda_forward(plan, node_mars, params, nids, nb_reg, sel, num_blocks, region
 
 
 _CUDA_TD_TABLES = {}
+_CUDA_SPLITS = {}
 
 
 def _cuda_td_tables(tables: dict, gt: Optional[dict], cbs: int):

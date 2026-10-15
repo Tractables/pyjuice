@@ -18,10 +18,11 @@ before and dead now holds its true value, as the slots of a block kept once do. 
 a term of a product that is -inf anyway.
 
 Nothing is reused after a call where a row continues no row of the previous one (a new prompt, a position observed and
-then missing again), or after :meth:`~pyjuice.constraints.decoder.Decoder.reset`. Nothing is reused when anything else used the buffers in between (:attr:`~..state.State.epoch`:
-another query, inside the session or not), or when the precision or the storage changed -- also under ``storage =
-"auto"`` (the default), where every call picks the storage of its own values (see :func:`~.conditional.conditional`):
-one that picks the other storage than the previous call's computes the values again.
+then missing again), or after :meth:`~pyjuice.constraints.decoder.Decoder.reset`. Nothing is reused when anything else
+used the buffers in between (:attr:`~..state.State.epoch`: another query, inside the session or not), or when the
+precision or the storage changed -- also under ``storage = "auto"`` (the default), where every call picks the storage
+of its own values (see :func:`~.conditional.conditional`): one that picks the other storage than the previous call's
+computes the values again.
 
 Compact (``storage = "compact"``, :mod:`..kernels.compact`), a call's values are laid out by its own liveness, which
 only the call knows: the values it holds and reads -- every top-down one, the inside ones its launches read
@@ -100,6 +101,7 @@ class DFAExactDecoder(Decoder):
         self._kept = None                           # what the buffers hold for the next call (`_Kept`)
         self._regions = None                        # see `_region_tables`
         self._layouts = {}                          # batch size -> (sum offsets, sum widths) as int64 arrays
+        self._aranges = {}                          # batch size -> its rows' identity parents (see `_identity`)
 
     def __enter__(self) -> "DFAExactDecoder":
         super().__enter__()
@@ -167,11 +169,15 @@ class DFAExactDecoder(Decoder):
         if (parents < 0).any():
             return None, None, None, None
 
-        _, cover, _, _ = self._region_tables(be.program())
-        on_new = cover[new.any(axis = 0)]                               # [newly observed positions, regions]
-        inside = kept.inside & ~on_new.any(axis = 0)                    # nothing new on the scope
-        top_down = kept.top_down & on_new.all(axis = 0)                 # nothing new outside it
-        parked = [dict(p, inside = p["inside"] & ~on_new.any(axis = 0)) for p in kept.parked]
+        _, bounds, _, _ = self._region_tables(be.program())
+        a, b = bounds[:, 0], bounds[:, 1]
+        cum = np.zeros(be.n + 1, dtype = np.int64)                      # positions newly observed, then targeted,
+        np.cumsum(new.any(axis = 0), out = cum[1:])                     # before every boundary
+        on_new = cum[b] - cum[a]                                        # (in every region's scope)
+        unseen = on_new == 0
+        inside = kept.inside & unseen                                   # nothing new on the scope
+        top_down = kept.top_down & (on_new == cum[-1])                  # nothing new outside it
+        parked = [dict(p, inside = p["inside"] & unseen) for p in kept.parked]
         parked = [p for p in parked if p["inside"].any()]
         every = inside.copy()                                           # in the buffers, or parked
         for p in parked:
@@ -179,16 +185,21 @@ class DFAExactDecoder(Decoder):
         if marginal:                                                    # every inside value; no top-down one
             held = (every, np.zeros_like(top_down))
         else:                                                           # those of a scope missing a target; meeting one
-            on_asked = cover[asked]
-            held = (every & ~on_asked.all(axis = 0), top_down & on_asked.any(axis = 0))
+            np.cumsum(asked, out = cum[1:])
+            on_asked = cum[b] - cum[a]
+            held = (every & (on_asked < cum[-1]), top_down & (on_asked > 0))
         identity = B == kept.B and (parents == np.arange(B)).all()
         if not identity and external is not None and external.batch > 1:   # another row's inputs
             return None, None, None, None
         if kept.compact is not None:                                    # compact: the call re-gathers what it reads
             carry = None                                                # (and keeps the rest of what it holds)
             if held[0].any() or held[1].any():
-                rows = torch.from_numpy(parents.astype(np.int64)).to(be.device)
-                parked = [dict(p, inside = p["inside"] & held[0], parents = p["parents"][rows]) for p in parked]
+                if identity:                                            # every row its own: the same parents
+                    rows = self._identity(B, be.device)
+                    parked = [dict(p, inside = p["inside"] & held[0]) for p in parked]
+                else:
+                    rows = torch.from_numpy(parents.astype(np.int64)).to(be.device)
+                    parked = [dict(p, inside = p["inside"] & held[0], parents = p["parents"][rows]) for p in parked]
                 carry = dict(layout = kept.compact, inside = inside & held[0], regions = held[1], parents = rows,
                              parked = [p for p in parked if p["inside"].any()])
             if identity:                                                # (kept: those it has rows for, parked or not)
@@ -267,15 +278,21 @@ class DFAExactDecoder(Decoder):
                            report.get("liveness"), compact, parked)
 
     def _region_tables(self, prog):
-        """``(prog, cover, rows, slots)``: whether every sum region's scope holds every position (bool [n, R]), and
-        every region's rows and slots per sample (int64 [R]); read once per Program."""
+        """``(prog, bounds, rows, slots)``: every sum region's scope ``[a, b)`` (int64 [R, 2]), rows and slots per
+        sample (int64 [R]); read once per Program."""
         if self._regions is None or self._regions[0] is not prog:
             regions = np.asarray(self.cc.backend.sum_regions, dtype = np.int64).reshape(-1, 3)
             bounds = np.asarray([prog.sum_ivs[k] for k in prog.reg_iv_host], dtype = np.int64).reshape(-1, 2)
-            at = np.arange(self.cc.backend.n)[:, None]
-            cover = (bounds[None, :, 0] <= at) & (at < bounds[None, :, 1])
-            self._regions = (prog, cover, regions[:, 1] - regions[:, 0], regions[:, 2])
+            self._regions = (prog, bounds, regions[:, 1] - regions[:, 0], regions[:, 2])
         return self._regions
+
+    def _identity(self, B: int, dev) -> torch.Tensor:
+        """int64 ``0 .. B - 1`` on ``dev``: every row's parent when each continues its own (kept per batch size; read
+        only)."""
+        out = self._aranges.get(B)
+        if out is None or out.device != dev:
+            out = self._aranges[B] = torch.arange(B, dtype = torch.int64, device = dev)
+        return out
 
     def _layout(self, state, B: int):
         """Every sum region's offset and row width (floats) in the buffers of a batch of ``B`` (int64 arrays)."""
