@@ -476,6 +476,32 @@ def test_a_session_of_conditionals(build_pc):
             assert_rows_close(got, fresh, n)
 
 
+def test_scoring_columns_follow_the_session(build_pc, reference):
+    """The scoring's per-sample columns (their nodes and offsets, kept on the program): sessions of other inputs and
+    batch sizes over the same circuit and targets each score against their own inputs (the reference's), and a
+    session's later calls take its kept offsets (no upload from the host, which would wait for the device)."""
+    n, Vm = KINDS["hmm"], 50
+    pc = build_pc("hmm", n, Vm, input_dist = dists.SoftEvidenceCategorical)
+    cc = jc.compile(jc.DFA.contains([[7, 31]], Vm), pc)
+    prog = cc.backend.program()
+    for B, rows, seed in ((3, 3, 0), (3, 3, 1), (2, 1, 2), (4, 4, 3)):
+        E = lm_evidence(rows, n, Vm, hot = [(1, 7), (2, 31)], seed = seed)
+        data = draw(E.expand(B, -1, -1).contiguous(), seed = seed)
+        m = torch.zeros(B, n, dtype = torch.bool, device = DEV)
+        m[:, 2:] = True
+        inputs = dict(categorical_evidence_logp = E)
+        with cc.decoder(**inputs) as decoder:
+            got = decoder.conditional(data, m, targets = [2])
+            kept = {k: v["offset"] for k, v in prog.sample_nodes.items()}
+            again = decoder.conditional(data, m, targets = [2])
+            assert kept and all(prog.sample_nodes[k]["offset"] is v for k, v in kept.items())
+        tg = torch.zeros_like(m)
+        tg[:, 2] = True
+        want = reference.conditional(cc, data, m, targets = tg, inputs = inputs)
+        assert_rows_close(got, want, n)
+        assert_rows_close(again, want, n)
+
+
 # -------------------------------------------------------------------------------------------------
 # Top-k evidence (soft_evidence_cat_ids)
 # -------------------------------------------------------------------------------------------------

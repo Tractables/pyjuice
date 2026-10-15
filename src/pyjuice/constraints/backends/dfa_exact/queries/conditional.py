@@ -14,6 +14,7 @@ root's inside value is never needed.
 
 from __future__ import annotations
 
+import weakref
 from collections import OrderedDict
 from typing import Optional
 
@@ -85,33 +86,39 @@ def _sample_columns(masses, nodes: np.ndarray, B: int, dev, prog = None, key = N
     """:func:`~..kernels.score.score_group`'s ``sample`` for a row group's target positions, whose input nodes are
     ``nodes`` (int64 [positions, rows of the group], host; -1 for none): None unless per-sample inputs reweight them.
     Every node over a position reweighted by the same weights (or none of them reweighted), the column of sample ``b``
-    of the ``p``-th position reads its nodes' rows and weights. The nodes on the device are kept on ``prog`` by
-    ``key`` (the group and positions), bounded as the plans are."""
+    of the ``p``-th position reads its nodes' rows and weights. The nodes on the device, and the columns' offsets
+    under these class masses (a decoder session's, by weak reference) and ``B``, are kept on ``prog`` by ``key`` (the
+    group and positions), bounded as the plans are: an upload from the host waits for the device, so a session makes
+    it once, not every call."""
     if masses.lognorm is None:
         return None
-    at = np.where(nodes >= 0, nodes, 0)
-    tr = np.where(nodes >= 0, masses.token_row_host[at], -2)               # -2: no node
-    real = tr != -2
-    first = np.where(real.any(axis = 1), tr[np.arange(len(tr)), real.argmax(axis = 1)], -1)
-    if not (np.where(real, tr, first[:, None]) == first[:, None]).all() or \
-            (masses.token_ids is not None and (first < 0).any() and (first >= 0).any()):
-        raise NotImplementedError("Conditionals at a position whose input nodes are reweighted by different per-sample "
-                                  "inputs (or some only) are not supported.")
-    if (first < 0).all():
-        return None
     cache = None if prog is None else prog.__dict__.setdefault("sample_nodes", OrderedDict())
-    nd = None if cache is None else cache.get(key)
-    if nd is None:
-        nd = torch.from_numpy(at).to(dev)
+    kept = None if cache is None else cache.get(key)
+    if kept is None or kept["masses"]() is not masses or kept["B"] != B:
+        at = np.where(nodes >= 0, nodes, 0)
+        tr = np.where(nodes >= 0, masses.token_row_host[at], -2)           # -2: no node
+        real = tr != -2
+        first = np.where(real.any(axis = 1), tr[np.arange(len(tr)), real.argmax(axis = 1)], -1)
+        if not (np.where(real, tr, first[:, None]) == first[:, None]).all() or \
+                (masses.token_ids is not None and (first < 0).any() and (first >= 0).any()):
+            raise NotImplementedError("Conditionals at a position whose input nodes are reweighted by different "
+                                      "per-sample inputs (or some only) are not supported.")
+        nd, offset = None if kept is None else kept["nodes"], None
+        if not (first < 0).all():
+            if nd is None:
+                nd = torch.from_numpy(at).to(dev)
+            off = first[:, None]
+            offset = np.where(off >= 0, (off + np.arange(B)[None, :] * masses.token_stride) * masses.token_width, -1)
+            offset = torch.from_numpy(offset.reshape(-1)).to(dev)
+        kept = dict(nodes = nd, masses = weakref.ref(masses), B = B, offset = offset)
         if cache is not None:
-            cache[key] = nd
+            cache[key] = kept
             if len(cache) > max(PLAN_CACHE_SIZE, PLANS_PER_POSITION * prog.n):
                 cache.popitem(last = False)
-    off = first[:, None]
-    offset = np.where(off >= 0, (off + np.arange(B)[None, :] * masses.token_stride) * masses.token_width, -1)
-    return dict(nodes = nd, row = masses.row, stride = masses.stride, columns = B, lognorm = masses.lognorm,
-                logw = masses.token_logw, offset = torch.from_numpy(offset.reshape(-1)).to(dev),
-                width = masses.token_width, ids = masses.token_ids)
+    if kept["offset"] is None:
+        return None
+    return dict(nodes = kept["nodes"], row = masses.row, stride = masses.stride, columns = B, lognorm = masses.lognorm,
+                logw = masses.token_logw, offset = kept["offset"], width = masses.token_width, ids = masses.token_ids)
 
 
 def _check(backend, data: torch.Tensor, precision: str, storage: str = "dense"):
