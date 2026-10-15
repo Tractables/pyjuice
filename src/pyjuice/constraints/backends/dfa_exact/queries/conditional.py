@@ -115,6 +115,13 @@ def _sample_columns(masses, score, g: int, pos: np.ndarray, B: int, prog) -> Opt
     return nodes[g], np.asarray(pos, dtype = np.int64), offset.reshape(-1)
 
 
+def _as_int64(a: np.ndarray) -> np.ndarray:
+    """``a``'s bytes as int64 (zero-padded to whole ones): packed with int64 tables, viewed back as ``a``'s dtype on the
+    device."""
+    b = np.ascontiguousarray(a).view(np.uint8).ravel()
+    return np.concatenate([b, np.zeros((-b.size) % 8, dtype = np.uint8)]).view(np.int64)
+
+
 def _scope_ivs(td, external) -> np.ndarray:
     """:func:`~.plans.scope_intervals` of a session's gated scopes, kept on its inputs (for the program ``td``)."""
     kept = getattr(external, "_scope_ivs", None)
@@ -138,7 +145,7 @@ def _check(backend, data: torch.Tensor, precision: str, storage: str = "dense"):
 def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions: np.ndarray, precision: str = "fp32",
                   held: Optional[dict] = None, observed: Optional[np.ndarray] = None, layout = None,
                   report: Optional[dict] = None, storage: str = "auto", carry: Optional[dict] = None,
-                  external = None, masses = None):
+                  external = None, masses = None, evidence: Optional[tuple] = None):
     """
     The forward and top-down passes of a conditional query: the log class weights of every input node over the
     target ``positions`` (bool [n], host), every sample's, summed per row of the class masses (see
@@ -160,6 +167,8 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     :param external: see :func:`conditional`
     :param masses: None, or the query's class masses (:meth:`~..state.State.masses` of ``external``) if already
         taken
+    :param evidence: None, or ``(x, obs_class)`` on the device if already built: the tokens (int64 [B, n], 0 where
+        missing) and their classes (int32 [B, n], -1 where missing)
     :returns: ``(groups, masses)``: per row group with a target position, ``(group, its target positions (host),
         weights [positions x B, classes, rows of the group])`` (sample ``b`` of the ``p``-th position: column ``p * B +
         b``), and the class masses the query read (:class:`~..state.ClassMasses`)
@@ -175,9 +184,12 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
         observed = (~missing).any(dim = 0).cpu().numpy()
     if external is not None:                                                # values that differ per sample
         observed = observed | external.observed
-    x = torch.where(missing, 0, data.to(dev).long())                          # missing tokens: any valid id
+    if evidence is None:
+        x = torch.where(missing, 0, data.to(dev).long())                      # missing tokens: any valid id
+        obs_class = torch.where(missing, -1, backend.token_classes.token_class[x]).contiguous()
+    else:
+        x, obs_class = evidence
     held = held or {}
-    obs_class = torch.where(missing, -1, backend.token_classes.token_class[x]).contiguous()
     # compact, a query needs its liveness even with nothing observed: every column is live, but only the regions it
     # computes per sample get rows (none, every value input-independent, inside fast_inference)
     lv = liveness(prog, obs_class, B) if observed.any() or storage != "dense" else None
@@ -308,8 +320,13 @@ def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor
     out_rows = [np.where(tgt[:, pos], rank[:, pos], -1).T.ravel() for _, pos, _ in groups]     # column p * B + b
     rows_bt = list(np.nonzero(tgt)) if candidates is not None else []          # every row's (sample, position)
     G = len(groups)
-    tables, starts = pack_aligned([base, K, *out_rows, *rows_bt, *(a for c in cols if c is not None for a in c[1:])],
-                                  np.int64)
+    ev = []
+    if data.device.type == "cpu":                       # (a decoder's evidence, kept on the host): every token, and
+        x_h = np.where(miss, 0, data.numpy()).astype(np.int64)                 # its class, built here, in the copy
+        ev = [x_h.ravel(), _as_int64(np.where(miss, -1, backend.token_classes.host()[x_h]).astype(np.int32)),
+              _as_int64(miss)]
+    tables, starts = pack_aligned([base, K, *out_rows, *rows_bt, *(a for c in cols if c is not None for a in c[1:]),
+                                   *ev], np.int64)
     tables = torch.from_numpy(tables).to(dev)
     starts = starts.tolist()
     view = lambda i: tables[starts[i]:starts[i + 1]]
@@ -324,13 +341,20 @@ def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor
                             columns = B, lognorm = masses.lognorm, logw = masses.token_logw,
                             offset = view(i + 1)[:len(c[2])], width = masses.token_width, ids = masses.token_ids))
         i += 0 if c is None else 2
-    missing = F.missing_tensor(missing_mask, B, n, dev) if missing_mask is None or missing_mask.is_cuda else \
-        torch.from_numpy(miss).to(dev)
+    evidence = None
+    if ev:                                              # (the last three arrays)
+        j = len(starts) - 4
+        x, missing = view(j)[:B * n].view(B, n), view(j + 2).view(torch.bool)[:B * n].view(B, n)
+        evidence = (x, view(j + 1).view(torch.int32)[:B * n].view(B, n))
+    else:
+        missing = F.missing_tensor(missing_mask, B, n, dev) if missing_mask is None or missing_mask.is_cuda else \
+            torch.from_numpy(miss).to(dev)
     with torch.no_grad():
         layout = (groups, size, (tables[starts[0]:starts[0] + n], tables[starts[1]:starts[1] + n]))
         groups, _ = class_weights(backend, data, missing, positions, precision, held,
                                   observed = (~miss).any(axis = 0), layout = layout, report = report,
-                                  storage = storage, carry = carry, external = external, masses = masses)
+                                  storage = storage, carry = carry, external = external, masses = masses,
+                                  evidence = evidence)
         if masses.token_ids is not None and cand is None:                   # top-k weights: only theirs are written
             out = torch.full((M, width), -float("inf"), device = dev)
         else:

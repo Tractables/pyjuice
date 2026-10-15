@@ -67,23 +67,33 @@ def held_elsewhere(storage: str, held, carry: Optional[dict]) -> bool:
 
 
 @triton_jit
-def _rectangles_kernel(off, count, ends, B, n, TILE: tl.constexpr):
-    """One program per interval ``k`` (``ends``: int32 [intervals, 2]): ``off[k, b]``, the lanes of the samples before
-    ``b`` in a row of ``k`` -- every sample's live columns at the entry times those at the exit --, and ``off[k, B]``
-    the row's."""
+def _rectangles_kernel(off, count, ends, summary, K, B, n, TILE: tl.constexpr):
+    """One program per interval ``k`` < ``K`` (``ends``: int32 [intervals, 2]): ``off[k, b]``, the lanes of the samples
+    before ``b`` in a row of ``k`` -- every sample's live columns at the entry times those at the exit --, and
+    ``off[k, B]`` the row's, also ``summary[k]``; and per boundary ``t`` <= ``n`` (the programs from 0 on),
+    ``summary[K + t]``, a sample's most live columns there -- what the host reads, in one copy."""
     k = tl.program_id(0)
-    a = tl.load(ends + k * 2)
-    e = tl.load(ends + k * 2 + 1)
-    base = off + k.to(tl.int64) * (B + 1)
-    tl.store(base, tl.zeros([], dtype = tl.int64))
-    total = tl.zeros([], dtype = tl.int64)
-    for b0 in range(0, B, TILE):
-        b = b0 + tl.arange(0, TILE)
-        m = b < B
-        rect = tl.load(count + b * (n + 1) + a, mask = m, other = 0).to(tl.int64) * \
-            tl.load(count + b * (n + 1) + e, mask = m, other = 0).to(tl.int64)
-        tl.store(base + 1 + b, total + tl.cumsum(rect, axis = 0), mask = m)
-        total += tl.sum(rect, axis = 0)
+    if k < K:
+        a = tl.load(ends + k * 2)
+        e = tl.load(ends + k * 2 + 1)
+        base = off + k.to(tl.int64) * (B + 1)
+        tl.store(base, tl.zeros([], dtype = tl.int64))
+        total = tl.zeros([], dtype = tl.int64)
+        for b0 in range(0, B, TILE):
+            b = b0 + tl.arange(0, TILE)
+            m = b < B
+            rect = tl.load(count + b * (n + 1) + a, mask = m, other = 0).to(tl.int64) * \
+                tl.load(count + b * (n + 1) + e, mask = m, other = 0).to(tl.int64)
+            tl.store(base + 1 + b, total + tl.cumsum(rect, axis = 0), mask = m)
+            total += tl.sum(rect, axis = 0)
+        tl.store(summary + k, total)
+    if k <= n:
+        most = tl.zeros([], dtype = tl.int64)
+        for b0 in range(0, B, TILE):
+            b = b0 + tl.arange(0, TILE)
+            most = tl.maximum(most, tl.max(tl.load(count + b * (n + 1) + k, mask = b < B, other = 0).to(tl.int64),
+                                           axis = 0))
+        tl.store(summary + K + k, most)
 
 
 @triton.jit
@@ -252,9 +262,10 @@ def compact_layout(backend, liveness, regions: np.ndarray, inside: Optional[np.n
     count, start, columns = liveness.lists(rank = True)
     K = prog.iv_ends.size(0)
     off = torch.empty(K, B + 1, dtype = torch.int64, device = prog.dev)
-    _rectangles_kernel[(K,)](off, count, prog.iv_ends, B, n, TILE = min(1024, max(32, host_next_power_of_2(B))),
-                             num_warps = 4)
-    host = torch.cat([off[:, B], count.view(B, n + 1).amax(dim = 0).long()]).cpu().numpy()
+    summary = torch.empty(K + n + 1, dtype = torch.int64, device = prog.dev)
+    _rectangles_kernel[(max(K, n + 1),)](off, count, prog.iv_ends, summary, K, B, n,
+                                         TILE = min(1024, max(32, host_next_power_of_2(B))), num_warps = 4)
+    host = summary.cpu().numpy()
     total, max_count = host[:K], host[K:]
     lanes = total[prog.reg_iv_all]
     width = np.where(regions, _aligned(lanes), 0)

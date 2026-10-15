@@ -351,6 +351,23 @@ def test_evidence_and_targets_in_every_form(build_pc):
     assert torch.equal(cc.conditional(data, missing, targets = pos), cc.conditional(data, missing, targets = mask))
 
 
+@pytest.mark.parametrize("kind", ["hmm", "pd", "hand_left"])
+def test_evidence_on_the_host_or_the_device(kind, build_pc):
+    """The tokens and their classes built on the host (evidence there: packed in the query's one copy) or on the
+    device (evidence there) give the same rows, bit for bit, under every pattern of evidence, and with candidates."""
+    n = KINDS[kind]
+    cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
+    dev = cc.pc.params.device
+    for pattern in PATTERNS:
+        data, missing = evidence(pattern, n)
+        if not missing.any():
+            continue
+        assert torch.equal(cc.conditional(data, missing), cc.conditional(data.to(dev), missing.to(dev))), pattern
+        cand = torch.randint(-1, V + 2, (data.size(0), n, 2), generator = torch.Generator().manual_seed(0))
+        assert torch.equal(cc.conditional(data, missing, candidates = cand),
+                           cc.conditional(data.to(dev), missing.to(dev), candidates = cand.to(dev))), pattern
+
+
 @pytest.mark.parametrize("name", ["contains", "avoids"])
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_candidates_are_columns_of_the_full_rows(kind, name, build_pc):

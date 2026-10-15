@@ -250,7 +250,7 @@ def input_values(layer, x: torch.Tensor, missing: torch.Tensor, out: torch.Tenso
         _token_weights_kernel[(host_cdiv(B, 16), host_cdiv(Vl, 32))](
             w, x, miss, sample.variables, ev, sample.token_ids if topk else ev, B, n, Vl, K, PER_SAMPLE = Be > 1,
             TOPK = topk, STEPS = max(1, K.bit_length()), TB = 16, TV = 32)
-        logz, lvid, srow, R_s = sample.logz, _lvid32(layer), sample.rows.to(torch.int32), sample.masses.size(1)
+        logz, lvid, srow, R_s = sample.logz, _lvid32(layer), _rows_of(sample), sample.masses.size(1)
     else:
         w = logz = lvid = srow = prow
         Be = Vl = R_s = 1
@@ -265,6 +265,14 @@ def input_values(layer, x: torch.Tensor, missing: torch.Tensor, out: torch.Tenso
 # -------------------------------------------------------------------------------------------------
 
 _STRUCTURES = weakref.WeakKeyDictionary()                  # layer -> {Vl: structure}
+
+
+def _rows_of(sample) -> torch.Tensor:
+    """``sample.rows`` as int32 (converted once per session's inputs)."""
+    rows = sample.__dict__.get("_rows32")
+    if rows is None:
+        rows = sample.__dict__["_rows32"] = sample.rows.to(torch.int32).contiguous()
+    return rows
 
 
 def _rows32(layer) -> torch.Tensor:

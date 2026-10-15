@@ -44,6 +44,7 @@ may compute different probabilities, so it is refused until it has its own modul
 from dataclasses import dataclass
 from typing import Any, Optional
 
+import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -118,11 +119,18 @@ class TokenClasses:
         self.token_class = token_class.to(torch.int32).contiguous()
         self.num_classes = int(num_classes)
         self._by_class = {}
+        self._host = None
         self._class_tiles = {}
 
     def to(self, device) -> "TokenClasses":
         """The same classes on ``device`` (a new object: nothing derived is carried over)."""
         return TokenClasses(self.token_class.to(device), self.num_classes)
+
+    def host(self) -> np.ndarray:
+        """``token_class`` on the host (int32), copied on first use."""
+        if self._host is None:
+            self._host = self.token_class.cpu().numpy()
+        return self._host
 
     def by_class(self, chunk: int) -> "ByClass":
         """The tokens in class order, cut into chunks of ``chunk`` positions (built on first use, then kept)."""
