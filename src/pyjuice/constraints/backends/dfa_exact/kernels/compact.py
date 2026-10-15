@@ -433,14 +433,66 @@ def query_layout(backend, liveness, plan, regions: np.ndarray, held: Optional[np
     return compact_layout(backend, liveness, regions, inside = inside if held is None else inside | held)
 
 
-def compact_buffers(backend, layout: CompactLayout, B: int, inputs_only: bool, carry: Optional[dict]):
+def compact_buffers(backend, layout: CompactLayout, B: int, inputs_only: bool, carry: Optional[dict],
+                    move: Optional[np.ndarray] = None):
     """
-    The buffers of a compact query laid out by ``layout`` (:meth:`~..state.State.buffers`, ``inputs_only`` as there),
-    the inside values it holds re-gathered into them (:func:`regather_into`) from the layout of the query that left
-    them, ``carry`` (see :func:`~..queries.conditional.conditional`).
+    ``(bufs, parked)``: the buffers of a compact query laid out by ``layout`` (:meth:`~..state.State.buffers`,
+    ``inputs_only`` as there), and where the inside values held for it are. ``carry`` (see
+    :func:`~..queries.conditional.conditional`) says where they were: the previous query's storage (its ``layout``,
+    ``inside`` the regions it holds) and the storage of an earlier one (``parked``: at most one dict with ``layout``,
+    ``storage``, ``inside`` and ``parents``, the rows of the query's samples there). Those of ``move`` (bool [sum
+    regions]; None: all of them; :func:`held_moves`) are re-gathered into the new buffers (:func:`regather`), the
+    others stay where they are: ``parked`` lists the storage still holding some, as ``carry`` does.
     """
-    allocate = lambda: backend.state.buffers(B, inputs_only, layout.mars)
-    if carry is not None and carry["inside"].any():
-        return regather_into(backend.state, backend.program(), carry["layout"], layout, carry["inside"],
-                             carry["parents"], allocate, "node_mars", "mars")
-    return allocate()
+    state, prog = backend.state, backend.program()
+    allocate = lambda: state.buffers(B, inputs_only, layout.mars)
+    if carry is None:
+        return allocate(), []
+    sources = [dict(layout = carry["layout"], storage = None, inside = carry["inside"], parents = carry["parents"])]
+    sources += carry.get("parked", ())
+    moved = [s["inside"] if move is None else s["inside"] & move for s in sources]
+    if len(sources) == 1 and not (sources[0]["inside"] & ~moved[0]).any():   # the previous storage, given up
+        bufs = allocate() if not moved[0].any() else regather_into(state, prog, sources[0]["layout"], layout,
+                                                                   moved[0], sources[0]["parents"], allocate,
+                                                                   "node_mars", "mars")
+        return bufs, []
+    if sources[0]["inside"].any():                                         # kept apart from the new buffers
+        sources[0]["storage"] = state.replace_storage("node_mars", None)
+    bufs = allocate()
+    for s, regions in zip(sources, moved):
+        if regions.any():
+            regather(prog, s["layout"], s["storage"], layout, bufs["node_mars"], regions, s["parents"], rows = "mars")
+    left = [dict(s, inside = s["inside"] & ~regions) for s, regions in zip(sources, moved)]
+    return bufs, [s for s in left if s["inside"].any()]
+
+
+#: a compact query leaves the held inside values it does not read where they are (:func:`held_moves`) only when the
+#: values held take at least this many floats: below, moving them all costs less than keeping track of another storage
+#: (and of which values its launches read)
+PARK_MIN_FLOATS = 1 << 24
+
+
+def worth_parking(prog, carry: dict) -> bool:
+    """Whether the inside values held for a compact query (``carry``, see :func:`compact_buffers`) take at least
+    :data:`PARK_MIN_FLOATS`: if not, it re-gathers them all into its rows."""
+    return sum(int((prog.reg_rows * s["layout"].rows("mars")[1])[s["inside"]].sum())
+               for s in [carry] + list(carry.get("parked", ()))) >= PARK_MIN_FLOATS
+
+
+def held_moves(prog, carry: dict, read: np.ndarray) -> np.ndarray:
+    """
+    bool [sum regions]: the held inside values a compact query re-gathers into its rows (:func:`compact_buffers`,
+    ``carry`` as there): those it reads (``read``, see :func:`~..queries.plans.read_regions`), and of the others all
+    but those of the storage holding the most of them, which stay there -- one storage at most is kept besides the
+    buffers. A query that reads few of many held values (decoding left to right: the block after the target) thus
+    moves those alone, each once; values it holds but never reads again (a left-to-right prefix's) do not pile up in
+    storages of their own.
+    """
+    sources = [carry] + list(carry.get("parked", ()))
+    unread = [int((prog.reg_rows * s["layout"].rows("mars")[1])[s["inside"] & ~read].sum()) for s in sources]
+    keep = int(np.argmax(unread)) if max(unread) > 0 else -1                # the storage holding the most unread
+    out = read.copy()
+    for i, s in enumerate(sources):
+        if i != keep:
+            out |= s["inside"]
+    return out

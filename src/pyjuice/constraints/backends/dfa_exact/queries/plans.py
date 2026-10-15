@@ -212,6 +212,22 @@ def query_plan(prog, observed: np.ndarray, targets: Optional[np.ndarray], valid:
     return plan
 
 
+def read_regions(prog, plan: QueryPlan, root: bool = False) -> np.ndarray:
+    """bool [sum regions]: those whose per-sample inside values the query's launches may read -- the children of the
+    products of the intervals it computes per sample (:attr:`QueryPlan.sample`), and of those whose top-down values it
+    needs, per sample or kept once (:attr:`TopDownPlan.per_sample`, ``once``: a product's top-down step reads its other
+    children's inside values, and so do the class weights of its input at a target, per sample even under a value
+    kept once) -- and the ``root``'s if asked. Held values of other regions may stay where they are (see
+    :mod:`..kernels.compact`)."""
+    ivs = plan.sample.copy()
+    if plan.top_down is not None:
+        ivs[prog.reg_iv_np[plan.top_down.per_sample | plan.top_down.once]] = True
+    out = prog.operands[ivs].any(axis = 0)
+    if root:
+        out[prog.root_region] = True
+    return out
+
+
 def per_sample_intervals(prog, plan: QueryPlan, top_down: bool = True) -> np.ndarray:
     """bool [sum intervals]: those whose columns the query's kernels walk in lane order
     (:meth:`~..kernels.live.Liveness.order`): the inside values ``plan`` computes per sample

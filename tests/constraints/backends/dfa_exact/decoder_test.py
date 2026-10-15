@@ -3,7 +3,8 @@ Decoding sessions (:meth:`ConstrainedCircuit.decoder`) on the dfa_exact backend
 (:class:`~pyjuice.constraints.backends.dfa_exact.queries.decoder.DFAExactDecoder`): a scenario's decoder calls give
 what the circuit's own calls give -- left to right, any order, beams reordered and expanded, a new row, a position
 observed then missing again, other targets after rows moved; candidates, targets as positions, a mask id, the marginal
--- through every sum path; they hold what the evidence left unchanged, and only that, moving it when rows move;
+-- through every sum path; they hold what the evidence left unchanged, and only that, moving it when rows move
+(compact, only the inside values a call reads: the others stay parked);
 anything else using the buffers, or another precision, starts afresh; an HMM's decoding gives the circuit's rows bit
 for bit, and the reference's; (slow) it is faster than the circuit's own calls on an HMM4096. The session is a
 fast_inference scope (its options reach it, it nests), one per circuit at a time, usable only inside its ``with``,
@@ -201,18 +202,21 @@ def ask(target, query, step):
     return target.conditional(**step)
 
 
-@pytest.mark.parametrize("storage", ["dense", "compact"])
+@pytest.mark.parametrize("storage, park", [("dense", "default"), ("compact", "default"), ("compact", "always")])
 @pytest.mark.parametrize("query", ["conditional", "marginal"])
 @pytest.mark.parametrize("scenario", list(SCENARIOS))
 @pytest.mark.parametrize("kind", list(KINDS))
-def test_a_decoders_calls_are_the_circuits(kind, scenario, query, storage, sum_path, build_pc, monkeypatch):
+def test_a_decoders_calls_are_the_circuits(kind, scenario, query, storage, park, sum_path, build_pc, monkeypatch):
     """A scenario's calls through a decoder give the circuit's own calls' results (in a fast_inference scope of
     their own, dense). The storage values move into is filled with NaN: a query reading a slot before writing it would
     show. Compact (``storage``), the values held, inside and top-down, are re-gathered by the call into storage filled
-    with NaN as well."""
+    with NaN as well -- every one, or (``park`` "always", whatever their size) those it reads alone, the others
+    left where they are (``compact_buffers``)."""
     monkeypatch.setattr(QD, "_empty", lambda numel, device: torch.full((numel,), float("nan"), device = device))
     if storage == "compact":
         nan_new_storage(monkeypatch)
+    if park == "always":
+        monkeypatch.setattr(CP, "PARK_MIN_FLOATS", 0)
     n = KINDS[kind]
     cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc(kind, n, V))
     steps = SCENARIOS[scenario](n)
@@ -241,6 +245,54 @@ def test_a_compact_call_keeps_the_inside_values_it_has_rows_for(kind, build_pc):
             assert not (kept.inside & ~kept.compact.mars["regions"]).any()
             kept_any |= bool(kept.inside.any())
         assert kept_any == (kind == "pd")
+
+
+@pytest.mark.parametrize("scenario", ["left to right", "any order", "beams"])
+def test_a_compact_call_moves_the_held_values_it_reads(scenario, build_pc, monkeypatch):
+    """Compact, a call holding enough (here: any amount) re-gathers into its rows the held inside values its launches
+    read (``read_regions``), and of the others those of every storage but one: the one holding the most stays
+    (``parked``) until a call reads them -- a PD's do when every row extends its prefix (left to right, beams). A value
+    is in one place only, and one moved is kept (not computed again); the calls give the circuit's results, the storage
+    values move into filled with NaN."""
+    from pyjuice.constraints.backends.dfa_exact.queries.plans import read_regions
+    nan_new_storage(monkeypatch)
+    monkeypatch.setattr(CP, "PARK_MIN_FLOATS", 0)                       # (values of every size)
+    n = KINDS["pd"]
+    cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc("pd", n, V))
+    steps = SCENARIOS[scenario](n)
+    calls, regather, conditional = [], CP.regather, QD.conditional
+
+    def spy_regather(prog, old, src, new, dst, regions, parents, dst_offset = None, rows = "flows"):
+        if rows == "mars":
+            calls[-1]["moved"] |= regions
+        return regather(prog, old, src, new, dst, regions, parents, dst_offset = dst_offset, rows = rows)
+
+    def spy_conditional(*args, held = None, report = None, **kwargs):
+        report = {} if report is None else report
+        calls.append(dict(moved = np.zeros(len(cc.backend.sum_regions), dtype = bool)))
+        out = conditional(*args, held = held, report = report, **kwargs)
+        calls[-1].update(held = None if held is None else held["inside"].copy(), plan = report.get("plan"))
+        return out
+
+    monkeypatch.setattr(CP, "regather", spy_regather)
+    monkeypatch.setattr(QD, "conditional", spy_conditional)
+    with juice.fast_inference():
+        want = [cc.conditional(**s) for s in steps]
+    parked = []
+    with cc.decoder(storage = "compact") as decoder:
+        for i, s in enumerate(steps):
+            assert_close(decoder.conditional(**s), want[i], n, where = f"step {i}")
+            parked.append(np.any([p["inside"] for p in decoder._kept.parked], axis = 0) if decoder._kept.parked
+                          else np.zeros(len(cc.backend.sum_regions), dtype = bool))
+            assert len(decoder._kept.parked) <= 1 and not (parked[-1] & decoder._kept.inside).any()
+            assert not (calls[-1]["moved"] & ~decoder._kept.inside).any()      # what it moved, kept: never recomputed
+    prog = cc.backend.program()
+    for call in calls:
+        if call["held"] is not None:                                     # what it reads, of what it holds
+            read = call["held"] & read_regions(prog, call["plan"])
+            assert not (call["moved"] & ~call["held"]).any() and not (read & ~call["moved"]).any()
+    if scenario != "any order":
+        assert any(p.any() for p in parked)
 
 
 @pytest.mark.parametrize("kind", ["hmm", "pd"])

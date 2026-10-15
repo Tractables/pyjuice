@@ -100,6 +100,7 @@ class Program:
         self.reg_iv_host = [self.iv_number[iv] for iv in reg_ivs]
         self.reg_iv_np = np.asarray(self.reg_iv_host, dtype = np.int64)
         self.reg_iv = torch.tensor(self.reg_iv_host, dtype = torch.long, device = dev)
+        self.operands = self._operand_table(backend.product_rows)
         self.live_tables = OrderedDict()                               # (batch size, intervals) -> lane order tables
         self.no_evidence = torch.full((1, n), -1, dtype = torch.int32, device = dev)   # a sample with nothing observed
         self.plans = OrderedDict()                                     # query plans, see :mod:`.plans`
@@ -321,6 +322,22 @@ class Program:
 
     def _exit(self, t: int) -> int:
         return 1 if t == self.n else self.width[t]                   # a sequence end: one column
+
+    def _operand_table(self, product_rows) -> np.ndarray:
+        """bool [sum intervals, sum regions]: whether a product over the interval (``sum_ivs``' numbers: a product's
+        scope is its parent sum's) has a child in the region -- whose per-sample inside values computing the product, or
+        its children's top-down values, reads (see :func:`~..queries.plans.read_regions`)."""
+        out = np.zeros((len(self.sum_ivs), len(self.firsts)), dtype = bool)
+        firsts = np.asarray(self.firsts, dtype = np.int64)
+        for _, child_rows, bounds in product_rows:
+            child, bnd = child_rows.cpu().numpy(), bounds.cpu().numpy()
+            k = (child >= 0).sum(axis = 1)
+            ends, inverse = np.unique(bnd[:, 0] * (self.n + 1) + bnd[np.arange(k.size), k], return_inverse = True)
+            iv = np.array([self.iv_number.get((int(e) // (self.n + 1), int(e) % (self.n + 1)), -1) for e in ends],
+                          dtype = np.int64)[inverse.reshape(-1)]
+            r, c = np.nonzero((child >= self.input_end) & (iv >= 0)[:, None])        # every sum child of a product
+            out[iv[r], np.searchsorted(firsts, child[r, c], side = "right") - 1] = True
+        return out
 
     def _product_stages(self, rows):
         """

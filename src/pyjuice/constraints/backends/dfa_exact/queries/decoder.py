@@ -24,15 +24,19 @@ another query, inside the session or not), or when the precision or the storage 
 one that picks the other storage than the previous call's computes the values again.
 
 Compact (``storage = "compact"``, :mod:`..kernels.compact`), a call's values are laid out by its own liveness, which
-only the call knows: the values held, inside and top-down, are re-gathered into its rows by the call itself
-(:func:`~..kernels.compact.regather`, ``carry``), in place or not -- every row's values at the pairs of columns still
-live, which are among the previous ones. A call keeps rows for the values it needs only, so the others are given up.
+only the call knows: the values it holds and reads -- every top-down one, the inside ones its launches read
+(:func:`~.plans.read_regions`) -- are re-gathered into its rows by the call itself (:func:`~..kernels.compact.regather`,
+``carry``), in place or not: every row's values at the pairs of columns still live, which are among the previous ones.
+The other inside values stay where the calls that left them laid them out (``parked``, see
+:func:`~..kernels.compact.compact_buffers`) until a call reads them, or new evidence on their scope gives them up --
+decoding left to right, the call at ``t`` reads the block after ``t`` alone of the suffixes' blocks it holds, so each
+is moved once instead of by every call.
 """
 
 from __future__ import annotations
 
 import weakref
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
@@ -60,7 +64,8 @@ class _Kept:
     since (``epoch``), and the next call has the same ``precision`` and ``storage`` (the one the call used: "dense"
     or "compact"; a call asking "auto" uses them if it picks it too). ``liveness``: the call's liveness
     (None: every lane), whose live lanes hold their true values in every region valid here; ``compact``: the layout of
-    the values when compact (None: dense)."""
+    the values when compact (None: dense); ``parked``: compact, the storages of earlier calls still holding inside
+    values of the call's rows that it did not read (see :func:`~..kernels.compact.compact_buffers`)."""
     state: weakref.ref
     epoch: int
     precision: str
@@ -70,6 +75,7 @@ class _Kept:
     top_down: np.ndarray
     liveness: Optional[Liveness]
     compact: Optional[CompactLayout]
+    parked: list = field(default_factory = list)
 
 
 class DFAExactDecoder(Decoder):
@@ -148,21 +154,28 @@ class DFAExactDecoder(Decoder):
         on_new = cover[new.any(axis = 0)]                               # [newly observed positions, regions]
         inside = kept.inside & ~on_new.any(axis = 0)                    # nothing new on the scope
         top_down = kept.top_down & on_new.all(axis = 0)                 # nothing new outside it
+        parked = [dict(p, inside = p["inside"] & ~on_new.any(axis = 0)) for p in kept.parked]
+        parked = [p for p in parked if p["inside"].any()]
+        every = inside.copy()                                           # in the buffers, or parked
+        for p in parked:
+            every |= p["inside"]
         if marginal:                                                    # every inside value; no top-down one
-            held = (inside, np.zeros_like(top_down))
+            held = (every, np.zeros_like(top_down))
         else:                                                           # those of a scope missing a target; meeting one
             on_asked = cover[asked]
-            held = (inside & ~on_asked.all(axis = 0), top_down & on_asked.any(axis = 0))
+            held = (every & ~on_asked.all(axis = 0), top_down & on_asked.any(axis = 0))
         identity = B == kept.B and (parents == np.arange(B)).all()
         if not identity and external is not None and external.batch > 1:   # another row's inputs
             return None, None, None, None
-        if kept.compact is not None:                                    # compact: the call re-gathers what it holds
-            carry = None
+        if kept.compact is not None:                                    # compact: the call re-gathers what it reads
+            carry = None                                                # (and keeps the rest of what it holds)
             if held[0].any() or held[1].any():
-                carry = dict(layout = kept.compact, inside = held[0], regions = held[1],
-                             parents = torch.from_numpy(parents.astype(np.int64)).to(be.device))
-            if identity:
-                return held, (inside, top_down), kept.compact, carry
+                rows = torch.from_numpy(parents.astype(np.int64)).to(be.device)
+                parked = [dict(p, inside = p["inside"] & held[0], parents = p["parents"][rows]) for p in parked]
+                carry = dict(layout = kept.compact, inside = inside & held[0], regions = held[1], parents = rows,
+                             parked = [p for p in parked if p["inside"].any()])
+            if identity:                                                # (kept: those it has rows for, parked or not)
+                return held, (every, top_down), kept.compact, carry
             return held, held, None, carry
         if identity:
             return held, (inside, top_down), None, None                 # in place: all of them stay
@@ -232,8 +245,9 @@ class DFAExactDecoder(Decoder):
         elif storage == "compact" and compact is None:
             inside[:] = False
             top_down[:] = False
+        parked = report.get("parked", []) if storage == "compact" and compact is not None else []
         self._kept = _Kept(weakref.ref(be.state), be.state.epoch, precision, storage, B, inside, top_down,
-                           report.get("liveness"), compact)
+                           report.get("liveness"), compact, parked)
 
     def _region_tables(self, prog):
         """``(prog, cover, rows, slots)``: whether every sum region's scope holds every position (bool [n, R]), and

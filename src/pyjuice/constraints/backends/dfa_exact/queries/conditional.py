@@ -21,12 +21,12 @@ import torch
 
 from . import forward as F
 from ..kernels.common import pack_aligned
-from ..kernels.compact import (STORAGES, compact_buffers, held_elsewhere, query_layout, regather_into,
-                               resolve_storage)
+from ..kernels.compact import (STORAGES, compact_buffers, held_elsewhere, held_moves, query_layout, regather_into,
+                               resolve_storage, worth_parking)
 from ..kernels.live import liveness
 from ..kernels.score import score_group, score_tables
 from .plans import (PLANS_PER_POSITION, PLAN_CACHE_SIZE, per_sample_intervals, prior_regions, query_plan,
-                    scope_intervals, top_down_prior)
+                    read_regions, scope_intervals, top_down_prior)
 from .top_down import run_backward
 
 
@@ -137,7 +137,8 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     :param report: None, or a dict where the query leaves its :class:`~.plans.QueryPlan` (``"plan"``), its
         :class:`~..kernels.live.Liveness` (``"liveness"``; None when it observes nothing, dense), its
         :class:`~..kernels.compact.CompactLayout` (``"compact"``; None when dense), the storage it used (``"storage"``,
-        "dense" or "compact") and whether it computed again the values held in the other one (``"dropped"``)
+        "dense" or "compact"), whether it computed again the values held in the other one (``"dropped"``) and the
+        storages holding the held values it did not read (``"parked"``, see :func:`~..kernels.compact.compact_buffers`)
     :param layout: None, or ``(groups, size, (base, K))``: :func:`_layout`'s groups and size, and its ``base`` and
         ``K`` already on the device (int64 [n] each) -- copied before the query launches anything, as copies from the
         host wait for the stream
@@ -178,19 +179,21 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
         return query_plan(prog, observed, positions, valid.numpy(), prior, held = held.get("inside"), top_down = top)
 
     plan = plan_for(held)
-    storage, compact = resolve_storage(backend, storage, B, True, lv, plan, plan.top_down.per_sample,
-                                       held.get("inside"))
+    move = held.get("inside")                           # compact: the held inside values it reads get its rows
+    if move is not None and carry is not None and worth_parking(prog, carry):
+        move = held_moves(prog, carry, move & read_regions(prog, plan))
+    storage, compact = resolve_storage(backend, storage, B, True, lv, plan, plan.top_down.per_sample, move)
     dropped = held_elsewhere(storage, held.values(), carry)
     if dropped:                                         # held in the other storage: computed again
-        held, carry = {}, None
+        held, carry, move = {}, None, None
         plan = plan_for(held)
         if compact is not None:
             compact = query_layout(backend, lv, plan, plan.top_down.per_sample, None)
-    held_inside = held.get("inside")
-    inputs_only = compact is not None and not plan.sample.any() and (held_inside is None or not held_inside.any())
+    inputs_only = compact is not None and not plan.sample.any() and (move is None or not move.any())
+    parked = []
     if compact is not None:                             # rows for the per-sample values only, walked in their own
-        bufs = compact_buffers(backend, compact, B, inputs_only, carry)   # order, the held ones re-gathered into them
-    else:
+        bufs, parked = compact_buffers(backend, compact, B, inputs_only, carry, move)   # order, the held ones it
+    else:                                                                              # reads re-gathered into them
         if lv is not None and not observed.any():        # (laid out for "auto", but dense: nothing to prune)
             lv = None
         if lv is not None:
@@ -203,7 +206,7 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
         flows = backend.state.flows(B, bufs, compact)
     if report is not None:
         report.update(plan = plan, liveness = lv, compact = compact, inputs_only = inputs_only, storage = storage,
-                      dropped = dropped)
+                      dropped = dropped, parked = parked)
     gates = F.gate_context(backend, external)
     F.run_forward(backend, bufs, plan, x, missing, obs_class, lv, precision, compact, masses, gates = gates)
     valid |= plan.todo
@@ -252,8 +255,10 @@ def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor
     :param carry: compact, the values ``held`` marks are in ``node_mars`` and ``node_flows`` as a previous query laid
         them out, not yet as this one does: a dict with that query's ``layout`` (its
         :class:`~..kernels.compact.CompactLayout`), the regions whose inside (``inside``) and top-down (``regions``)
-        values it holds (bool [sum regions] each) and every row's ``parents`` there (int64 [B] on the device); they are
-        re-gathered (:func:`~..kernels.compact.regather`)
+        values it holds (bool [sum regions] each) and every row's ``parents`` there (int64 [B] on the device), and the
+        inside values earlier queries left in storages of their own (``parked``, see
+        :func:`~..kernels.compact.compact_buffers`); those the query reads are re-gathered
+        (:func:`~..kernels.compact.regather`), the other inside values stay where they are
     :param external: None, or a decoder session's per-sample inputs (:class:`~..state.ExternalInputs`), e.g. soft
         evidence: every input node's tokens then weigh ``q(v) = p(v) w(v) / Z`` -- a target's too (or ``p(v) w(v)`` at
         a position its value mask leaves free: missing too, so a target may be there)

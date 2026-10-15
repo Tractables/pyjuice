@@ -10,10 +10,11 @@ from typing import Optional
 import numpy as np
 import torch
 
-from ..kernels.compact import STORAGES, compact_buffers, held_elsewhere, query_layout, resolve_storage
+from ..kernels.compact import (STORAGES, compact_buffers, held_elsewhere, held_moves, query_layout,
+                              resolve_storage, worth_parking)
 from ..kernels.live import liveness
 from .forward import PRECISIONS, gate_context, missing_tensor, run_forward
-from .plans import per_sample_intervals, prior_regions, query_plan
+from .plans import per_sample_intervals, prior_regions, query_plan, read_regions
 
 
 
@@ -75,16 +76,20 @@ def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] =
         prior = prior_regions(prog, observed, B, kept, lv)
         no_top_down = np.zeros(len(backend.sum_regions), dtype = bool)
         plan = query_plan(prog, observed, None, valid.numpy(), prior, held = held)   # every inside value
-        storage, compact = resolve_storage(backend, storage, B, False, lv, plan, no_top_down, held)
+        move = held                                     # compact: the held values it reads (the root's too) get rows
+        if move is not None and carry is not None and worth_parking(prog, carry):
+            move = held_moves(prog, carry, move & read_regions(prog, plan, root = True))
+        storage, compact = resolve_storage(backend, storage, B, False, lv, plan, no_top_down, move)
         dropped = held_elsewhere(storage, [held], carry)
         if dropped:                                     # held in the other storage: computed again
-            held, carry = None, None
+            held, carry, move = None, None, None
             plan = query_plan(prog, observed, None, valid.numpy(), prior)
             if compact is not None:
                 compact = query_layout(backend, lv, plan, no_top_down, None)
-        inputs_only = compact is not None and not plan.sample.any() and (held is None or not held.any())
-        if compact is not None:                         # rows for the per-sample values only, the held ones
-            bufs = compact_buffers(backend, compact, B, inputs_only, carry)   # re-gathered into them
+        inputs_only = compact is not None and not plan.sample.any() and (move is None or not move.any())
+        parked = []
+        if compact is not None:                         # rows for the per-sample values only, the held ones it
+            bufs, parked = compact_buffers(backend, compact, B, inputs_only, carry, move)   # reads re-gathered there
         else:
             if lv is not None and not observed.any():    # (laid out for "auto", but dense: nothing to prune)
                 lv = None
@@ -93,7 +98,7 @@ def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] =
             bufs = backend.state.buffers(B)
         if report is not None:
             report.update(plan = plan, liveness = lv, inputs_only = inputs_only, compact = compact, storage = storage,
-                          dropped = dropped)
+                          dropped = dropped, parked = parked)
         run_forward(backend, bufs, plan, x, missing, obs_class, lv, precision, compact, masses,
                     gates = gate_context(backend, external))
         valid |= plan.todo
