@@ -269,15 +269,16 @@ def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
                 em = ml & (e0 + k < e1)
                 i = tl.load(pred_col + e0 + k, mask = em, other = 0)
                 x = tl.load(pred_x + e0 + k, mask = em, other = 0)
+                sl = _parent_lane(_slot(iv_table, opos, i, j, X, em, OUT_FULL), b, once, coff, ccount, crank, kp, t,
+                                  i, t2, j, em, B, n, W, COMPACT)
+                ev = em & (sl >= 0)                                          # a dead parent lane: no term, nothing read
                 if GROUPED:                                                  # the observed class leads to q?
-                    holds = tl.load(next_col + (t * W + i) * C + tl.maximum(oc, 0), mask = em, other = -1) == q
+                    holds = tl.load(next_col + (t * W + i) * C + tl.maximum(oc, 0), mask = ev, other = -1) == q
                 else:                                                        # is it this entry's class?
                     holds = x == oc
                 mass = tl.where(oc >= 0, tl.where(holds, own, float("-inf")),
-                                tl.load(masses + x, mask = em, other = float("-inf")))
-                sl = _parent_lane(_slot(iv_table, opos, i, j, X, em, OUT_FULL), b, once, coff, ccount, crank, kp, t,
-                                  i, t2, j, em, B, n, W, COMPACT)
-                ov = tl.load(op + sl, mask = em & (sl >= 0), other = float("-inf"))
+                                tl.load(masses + x, mask = ev, other = float("-inf")))
+                ov = tl.load(op + sl, mask = ev, other = float("-inf"))
                 mx, acc = _lse_step_one_exp(mx, acc, mass + ov)
         val = _lse_value(mx, acc)
         if COMPACT:
@@ -375,8 +376,9 @@ def _block_input_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
                     s = tl.where(end & (s >= 0), 0, s)
                     sl = _parent_lane(_slot(iv_table, opos, i, s, X, em, OUT_FULL), b, once, coff, ccount, crank,
                                       kp, t0, i, t + 1, s, em, B, n, W, COMPACT)
-                    ov = tl.load(op + sl, mask = em & (sl >= 0), other = float("-inf"))
-                    mass = tl.load(masses + tl.load(entry_x + e0 + k, mask = em, other = 0), mask = em,
+                    ev = em & (sl >= 0)                                      # a live parent lane: else nothing read
+                    ov = tl.load(op + sl, mask = ev, other = float("-inf"))
+                    mass = tl.load(masses + tl.load(entry_x + e0 + k, mask = ev, other = 0), mask = ev,
                                    other = float("-inf"))
                     mx, acc = _lse_step_one_exp(mx, acc, mass + ov)
         val = _lse_value(mx, acc)
