@@ -18,7 +18,7 @@ before and dead now holds its true value, as the slots of a block kept once do. 
 a term of a product that is -inf anyway.
 
 Nothing is reused after a call where a row continues no row of the previous one (a new prompt, a position observed and
-then missing again). Nothing is reused when anything else used the buffers in between (:attr:`~..state.State.epoch`:
+then missing again), or after :meth:`~pyjuice.constraints.decoder.Decoder.reset`. Nothing is reused when anything else used the buffers in between (:attr:`~..state.State.epoch`:
 another query, inside the session or not), or when the precision or the storage changed -- also under ``storage =
 "auto"`` (the default), where every call picks the storage of its own values (see :func:`~.conditional.conditional`):
 one that picks the other storage than the previous call's computes the values again.
@@ -110,6 +110,9 @@ class DFAExactDecoder(Decoder):
         self._kept, self._layouts = None, {}
         self.cc.backend.state.bf16_tokens = False
         return super().__exit__(*exc)
+
+    def _forget(self):
+        self._kept, self._layouts = None, {}
 
     def _marginal(self, data: torch.Tensor, missing: torch.Tensor, precision: str = "fp32",
                   storage: str = "auto", external = None) -> torch.Tensor:

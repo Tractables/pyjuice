@@ -207,8 +207,10 @@ class ConstrainedCircuit:
         (microseconds); when rows moved, it also copies the values it reuses to their rows' new places. The
         ``dfa_exact`` backend reuses values; a backend that cannot computes every call afresh.
 
-        The session is a :func:`pyjuice.fast_inference` scope: parameters must not change inside it. One decoder is
-        open on a circuit at a time.
+        The session is a :func:`pyjuice.fast_inference` scope: parameters must not change inside it, unless
+        ``decoder.reset()`` follows (and no outer ``fast_inference`` scope is open) -- it forgets everything the
+        session kept (reused values, the last call's evidence, what the scope kept), so the next call starts afresh.
+        One decoder is open on a circuit at a time.
 
         **Generation with a language model** (Hugging Face ``generate``), weighted as Ctrl-G does: the LM's
         log-probabilities plus ``alpha * (log p(x_t = v | x_<t, C) - log p(x_t = v | x_<t))`` under the PC, the second

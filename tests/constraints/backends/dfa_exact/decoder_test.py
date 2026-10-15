@@ -5,8 +5,8 @@ what the circuit's own calls give -- left to right, any order, beams reordered a
 observed then missing again, other targets after rows moved; candidates, targets as positions, a mask id, the marginal
 -- through every sum path; they hold what the evidence left unchanged, and only that, moving it when rows move
 (compact, only the inside values a call reads: the others stay parked);
-anything else using the buffers, or another precision, starts afresh; an HMM's decoding gives the circuit's rows bit
-for bit, and the reference's; (slow) it is faster than the circuit's own calls on an HMM4096. The session is a
+anything else using the buffers, or another precision, starts afresh, and so does a reset (parameter updates seen); an
+HMM's decoding gives the circuit's rows bit for bit, and the reference's; (slow) it is faster than the circuit's own calls on an HMM4096. The session is a
 fast_inference scope (its options reach it, it nests), one per circuit at a time, usable only inside its ``with``,
 with query defaults a call overrides.
 """
@@ -430,6 +430,43 @@ def test_anything_else_using_the_buffers_or_another_precision_starts_afresh(buil
         assert spy.held[-1] is None
         assert_close(decoder.conditional(**steps[5]), want[5], n)
         assert spy.held[-1] is None
+
+
+@pytest.mark.parametrize("storage", ["dense", "compact"])
+def test_reset_starts_afresh(storage, build_pc, monkeypatch):
+    """``decoder.reset()``: the next call holds nothing and is right, the one after holds again; parameters updated in
+    place and then a reset: the next call answers under the new ones, where without the reset it would not; outside
+    the ``with``, a reset is refused."""
+    n = KINDS["pd"]
+    pc, other = build_pc("pd", n, V, seed = 0), build_pc("pd", n, V, seed = 1)
+    cc = jc.compile(jc.DFA.contains([[1, 2]], V), pc)
+    steps = left_to_right(n)
+    with juice.fast_inference():
+        want = [cc.conditional(**s) for s in steps]
+    spy = Spy(monkeypatch)
+    with cc.decoder(storage = storage) as decoder:
+        for t in range(4):
+            decoder.conditional(**steps[t])
+        assert spy.anything(3)
+        decoder.reset()
+        assert is_active()                                          # (still the session's scope)
+        assert_close(decoder.conditional(**steps[4]), want[4], n)
+        assert spy.held[-1] is None
+        assert_close(decoder.conditional(**steps[5]), want[5], n)
+        assert spy.anything(-1)
+        with torch.no_grad():                                       # parameters updated in place
+            pc.params.copy_(other.params)
+            for layer, src in zip(pc.input_layer_group, other.input_layer_group):
+                layer.params.copy_(src.params)
+        stale = decoder.conditional(**steps[6])
+        decoder.reset()
+        fresh = decoder.conditional(**steps[6])
+    new = cc.conditional(**steps[6])
+    assert_close(fresh, new, n)
+    fin = torch.isfinite(new)
+    assert (stale[fin] - new[fin]).abs().max() > 1e-2                # (the session kept the old parameters' values)
+    with pytest.raises(RuntimeError, match = "inside its `with` block"):
+        decoder.reset()
 
 
 def test_evidence_on_the_device(build_pc):

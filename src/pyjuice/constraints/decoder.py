@@ -11,7 +11,7 @@ and the same results -- inside a :func:`pyjuice.fast_inference` scope it opens a
 Every call computes its whole answer; nothing happens between calls. A backend's decoder may make a call cheaper by
 reusing what its previous call computed where the evidence did not change -- :func:`match_rows` says, for every row
 of a call, which row of the previous call it continues and what it newly observes. This class, every backend's by
-default, reuses nothing.
+default, reuses nothing. :meth:`Decoder.reset` forgets what a session kept: the next call starts afresh.
 """
 
 from contextlib import ExitStack
@@ -111,9 +111,7 @@ class Decoder:
         if self.cc._decoder is not None:
             raise RuntimeError("This constrained circuit already has an open decoder; close it first.")
         self._used = True
-        scope = ExitStack()
-        scope.enter_context(fast_inference(**self._fast_inference))
-        self._scope = scope
+        self._scope = self._open_scope()
         self.cc._decoder = self
         return self
 
@@ -124,6 +122,29 @@ class Decoder:
             self._scope, self._previous = None, None
             self.cc._decoder = None
         return False
+
+    def reset(self) -> None:
+        """
+        Forget what the session kept between calls: the next call computes its whole answer, as the first call of a
+        new decoder with the same options and per-sample inputs would. The values a backend's decoder reuses and the
+        last call's evidence are dropped, and the session's :func:`pyjuice.fast_inference` scope is closed and opened
+        again: what it kept -- parameter copies, input-independent values, token tables -- is computed again, from
+        the parameters as they are now (a session inside another ``fast_inference`` scope: that scope keeps them
+        until it exits). The decoder stays open.
+        """
+        if self._scope is None:
+            raise RuntimeError("Use the decoder inside its `with` block: `with cc.decoder() as decoder: ...`.")
+        self._forget()
+        self._previous = None
+        try:
+            self._scope.close()
+        finally:
+            self._scope = self._open_scope()
+
+    def _open_scope(self) -> ExitStack:
+        scope = ExitStack()
+        scope.enter_context(fast_inference(**self._fast_inference))
+        return scope
 
     # ---------------------------------------------------------------------------------------------
     # Queries
@@ -170,6 +191,9 @@ class Decoder:
         :mod:`pyjuice.constraints.evidence`)."""
         return self.cc.backend.conditional(data, missing, targets, return_log_marginal = return_log_marginal,
                                            candidates = candidates, **options)
+
+    def _forget(self):
+        """Drop what the decoder kept for its next call (:meth:`reset`): this one keeps nothing."""
 
     def _match_rows(self, data: torch.Tensor, missing: torch.Tensor):
         """:func:`match_rows` of a call's evidence (on the host) against the last call's; None before the first
