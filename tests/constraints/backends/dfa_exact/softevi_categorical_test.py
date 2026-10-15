@@ -477,29 +477,34 @@ def test_a_session_of_conditionals(build_pc):
 
 
 def test_scoring_columns_follow_the_session(build_pc, reference):
-    """The scoring's per-sample columns (their nodes and offsets, kept on the program): sessions of other inputs and
-    batch sizes over the same circuit and targets each score against their own inputs (the reference's), and a
-    session's later calls take its kept offsets (no upload from the host, which would wait for the device)."""
+    """The scoring's per-sample columns: sessions of other inputs and batch sizes over the same circuit, each target
+    position's conditionals against its own inputs (the reference's) -- the input nodes on the device kept on the
+    program for every session, every position's weights' row kept per session (not taken again by its later calls)."""
     n, Vm = KINDS["hmm"], 50
     pc = build_pc("hmm", n, Vm, input_dist = dists.SoftEvidenceCategorical)
     cc = jc.compile(jc.DFA.contains([[7, 31]], Vm), pc)
     prog = cc.backend.program()
+    nodes = None
     for B, rows, seed in ((3, 3, 0), (3, 3, 1), (2, 1, 2), (4, 4, 3)):
         E = lm_evidence(rows, n, Vm, hot = [(1, 7), (2, 31)], seed = seed)
         data = draw(E.expand(B, -1, -1).contiguous(), seed = seed)
         m = torch.zeros(B, n, dtype = torch.bool, device = DEV)
-        m[:, 2:] = True
+        m[:, 1:] = True
         inputs = dict(categorical_evidence_logp = E)
+        got = []
         with cc.decoder(**inputs) as decoder:
-            got = decoder.conditional(data, m, targets = [2])
-            kept = {k: v["offset"] for k, v in prog.sample_nodes.items()}
-            again = decoder.conditional(data, m, targets = [2])
-            assert kept and all(prog.sample_nodes[k]["offset"] is v for k, v in kept.items())
-        tg = torch.zeros_like(m)
-        tg[:, 2] = True
-        want = reference.conditional(cc, data, m, targets = tg, inputs = inputs)
-        assert_rows_close(got, want, n)
-        assert_rows_close(again, want, n)
+            for t in (1, 2, 3):
+                got.append(decoder.conditional(data, m, targets = [t]))
+                if t == 1:
+                    kept = dict(prog.sample_rows)
+                    assert kept and (nodes is None or all(prog.sample_nodes[g] is v for g, v in nodes.items()))
+                    nodes = dict(prog.sample_nodes)
+            assert all(prog.sample_rows[g] is v for g, v in kept.items())          # (the session's)
+            assert all(prog.sample_nodes[g] is v for g, v in nodes.items())        # (the program's)
+        for t, row in zip((1, 2, 3), got):
+            tg = torch.zeros_like(m)
+            tg[:, t] = True
+            assert_rows_close(row, reference.conditional(cc, data, m, targets = tg, inputs = inputs), n)
 
 
 # -------------------------------------------------------------------------------------------------

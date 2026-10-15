@@ -15,7 +15,6 @@ root's inside value is never needed.
 from __future__ import annotations
 
 import weakref
-from collections import OrderedDict
 from typing import Optional
 
 import numpy as np
@@ -82,43 +81,38 @@ def _layout(backend, positions: np.ndarray, B: int):
     return groups, base, K, size
 
 
-def _sample_columns(masses, nodes: np.ndarray, B: int, dev, prog = None, key = None) -> Optional[dict]:
-    """:func:`~..kernels.score.score_group`'s ``sample`` for a row group's target positions, whose input nodes are
-    ``nodes`` (int64 [positions, rows of the group], host; -1 for none): None unless per-sample inputs reweight them.
-    Every node over a position reweighted by the same weights (or none of them reweighted), the column of sample ``b``
-    of the ``p``-th position reads its nodes' rows and weights. The nodes on the device, and the columns' offsets
-    under these class masses (a decoder session's, by weak reference) and ``B``, are kept on ``prog`` by ``key`` (the
-    group and positions), bounded as the plans are: an upload from the host waits for the device, so a session makes
-    it once, not every call."""
+def _sample_columns(masses, score, g: int, pos: np.ndarray, B: int, prog) -> Optional[tuple]:
+    """What :func:`~..kernels.score.score_group`'s ``sample`` needs for row group ``g``'s target positions ``pos``
+    (int64, host), besides the class masses: None unless per-sample inputs reweight their input nodes. Every node over
+    a position reweighted by the same weights (or none of them reweighted), the column of sample ``b`` of the ``p``-th
+    position reads its nodes' rows and weights: ``(nodes, positions, offsets)`` -- every position's input nodes on the
+    device (int64 [n, rows of the group], kept on the program), and the positions and every column's first weight
+    (int64, host: the query uploads them with its other tables, as a copy from the host waits for the device). Every
+    position's weights' row is kept per session (its class masses, by weak reference)."""
     if masses.lognorm is None:
         return None
-    cache = None if prog is None else prog.__dict__.setdefault("sample_nodes", OrderedDict())
-    kept = None if cache is None else cache.get(key)
-    if kept is None or kept["masses"]() is not masses or kept["B"] != B:
+    rows = prog.__dict__.setdefault("sample_rows", {})
+    kept = rows.get(g)
+    if kept is None or kept[0]() is not masses:
+        nodes = score.nodes[g]
         at = np.where(nodes >= 0, nodes, 0)
         tr = np.where(nodes >= 0, masses.token_row_host[at], -2)           # -2: no node
         real = tr != -2
         first = np.where(real.any(axis = 1), tr[np.arange(len(tr)), real.argmax(axis = 1)], -1)
-        if not (np.where(real, tr, first[:, None]) == first[:, None]).all() or \
-                (masses.token_ids is not None and (first < 0).any() and (first >= 0).any()):
-            raise NotImplementedError("Conditionals at a position whose input nodes are reweighted by different "
-                                      "per-sample inputs (or some only) are not supported.")
-        nd, offset = None if kept is None else kept["nodes"], None
-        if not (first < 0).all():
-            if nd is None:
-                nd = torch.from_numpy(at).to(dev)
-            off = first[:, None]
-            offset = np.where(off >= 0, (off + np.arange(B)[None, :] * masses.token_stride) * masses.token_width, -1)
-            offset = torch.from_numpy(offset.reshape(-1)).to(dev)
-        kept = dict(nodes = nd, masses = weakref.ref(masses), B = B, offset = offset)
-        if cache is not None:
-            cache[key] = kept
-            if len(cache) > max(PLAN_CACHE_SIZE, PLANS_PER_POSITION * prog.n):
-                cache.popitem(last = False)
-    if kept["offset"] is None:
+        mixed = ~(np.where(real, tr, first[:, None]) == first[:, None]).all(axis = 1)
+        kept = rows[g] = (weakref.ref(masses), first, mixed)
+    first, mixed = kept[1][pos], kept[2][pos]
+    if mixed.any() or (masses.token_ids is not None and (first < 0).any() and (first >= 0).any()):
+        raise NotImplementedError("Conditionals at a position whose input nodes are reweighted by different per-sample "
+                                  "inputs (or some only) are not supported.")
+    if (first < 0).all():
         return None
-    return dict(nodes = kept["nodes"], row = masses.row, stride = masses.stride, columns = B, lognorm = masses.lognorm,
-                logw = masses.token_logw, offset = kept["offset"], width = masses.token_width, ids = masses.token_ids)
+    nodes = prog.__dict__.setdefault("sample_nodes", {})
+    if g not in nodes:
+        nodes[g] = torch.from_numpy(np.maximum(score.nodes[g], 0)).to(prog.dev)
+    off = first[:, None]
+    offset = np.where(off >= 0, (off + np.arange(B)[None, :] * masses.token_stride) * masses.token_width, -1)
+    return nodes[g], np.asarray(pos, dtype = np.int64), offset.reshape(-1)
 
 
 def _check(backend, data: torch.Tensor, precision: str, storage: str = "dense"):
@@ -136,7 +130,7 @@ def _check(backend, data: torch.Tensor, precision: str, storage: str = "dense"):
 def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions: np.ndarray, precision: str = "fp32",
                   held: Optional[dict] = None, observed: Optional[np.ndarray] = None, layout = None,
                   report: Optional[dict] = None, storage: str = "auto", carry: Optional[dict] = None,
-                  external = None):
+                  external = None, masses = None):
     """
     The forward and top-down passes of a conditional query: the log class weights of every input node over the
     target ``positions`` (bool [n], host), every sample's, summed per row of the class masses (see
@@ -156,6 +150,8 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     :param storage: see :func:`conditional`
     :param carry: see :func:`conditional`
     :param external: see :func:`conditional`
+    :param masses: None, or the query's class masses (:meth:`~..state.State.masses` of ``external``) if already
+        taken
     :returns: ``(groups, masses)``: per row group with a target position, ``(group, its target positions (host),
         weights [positions x B, classes, rows of the group])`` (sample ``b`` of the ``p``-th position: column ``p * B +
         b``), and the class masses the query read (:class:`~..state.ClassMasses`)
@@ -177,7 +173,7 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     # compact, a query needs its liveness even with nothing observed: every column is live, but only the regions it
     # computes per sample get rows (none, every value input-independent, inside fast_inference)
     lv = liveness(prog, obs_class, B) if observed.any() or storage != "dense" else None
-    masses = backend.state.masses(external)
+    masses = backend.state.masses(external) if masses is None else masses
     valid, kept = backend.state.prior_validity(masses.version)
     prior = prior_regions(prog, observed, B, kept, lv)
     pf = backend.state.prior_flows(np.zeros(len(backend.sum_regions), dtype = bool))
@@ -293,38 +289,50 @@ def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor
         out = torch.full((M, width), -float("inf"), device = dev)
         return (out, torch.full((M,), -float("inf"), device = dev)) if return_log_marginal else out
 
-    score = score_tables(backend.program())
+    prog = backend.program()
+    score = score_tables(prog)
     positions = tgt.any(axis = 0)
     groups, base, K, size = _layout(backend, positions, B)
-    # every row group's columns' rows (-1: a sample not targeting the position), with the layout, in one copy
+    masses = backend.state.masses(external)                                  # (the query's, read twice)
+    cols = [_sample_columns(masses, score, g, pos, B, prog) for g, pos, _ in groups]
+    # every row group's columns' rows (-1: a sample not targeting the position), with the layout, every row's (sample,
+    # position) under candidates, and the per-sample columns' positions and weights' offsets: in one copy
     out_rows = [np.where(tgt[:, pos], rank[:, pos], -1).T.ravel() for _, pos, _ in groups]     # column p * B + b
     rows_bt = list(np.nonzero(tgt)) if candidates is not None else []          # every row's (sample, position)
-    tables, starts = pack_aligned([base, K, *out_rows, *rows_bt], np.int64)
+    G = len(groups)
+    tables, starts = pack_aligned([base, K, *out_rows, *rows_bt, *(a for c in cols if c is not None for a in c[1:])],
+                                  np.int64)
     tables = torch.from_numpy(tables).to(dev)
     starts = starts.tolist()
+    view = lambda i: tables[starts[i]:starts[i + 1]]
     cand = None
     if candidates is not None:                                                # every row's candidates, [M, k]
-        sb, st = starts[-3], starts[-2]
+        sb, st = starts[2 + G], starts[3 + G]
         cand = candidates.to(dev)[tables[sb:sb + M], tables[st:st + M]].to(torch.int32).contiguous()
+    samples, i = [], 2 + G + len(rows_bt)
+    for c in cols:
+        samples.append(None if c is None else
+                       dict(nodes = c[0], positions = view(i)[:len(c[1])], row = masses.row, stride = masses.stride,
+                            columns = B, lognorm = masses.lognorm, logw = masses.token_logw,
+                            offset = view(i + 1)[:len(c[2])], width = masses.token_width, ids = masses.token_ids))
+        i += 0 if c is None else 2
     missing = F.missing_tensor(missing_mask, B, n, dev) if missing_mask is None or missing_mask.is_cuda else \
         torch.from_numpy(miss).to(dev)
     with torch.no_grad():
         layout = (groups, size, (tables[starts[0]:starts[0] + n], tables[starts[1]:starts[1] + n]))
-        groups, masses = class_weights(backend, data, missing, positions, precision, held,
-                                       observed = (~miss).any(axis = 0), layout = layout, report = report,
-                                       storage = storage, carry = carry, external = external)
+        groups, _ = class_weights(backend, data, missing, positions, precision, held,
+                                  observed = (~miss).any(axis = 0), layout = layout, report = report,
+                                  storage = storage, carry = carry, external = external, masses = masses)
         if masses.token_ids is not None and cand is None:                   # top-k weights: only theirs are written
             out = torch.full((M, width), -float("inf"), device = dev)
         else:
             out = torch.empty(M, width, device = dev)
         log_marginal = torch.empty(M + 1, device = dev) if return_log_marginal else None
-        for (g, pos, w), start in zip(groups, starts[2:]):
+        for (g, pos, w), start, sample in zip(groups, starts[2:], samples):
             out_row = tables[start:start + len(pos) * B]
             table = backend.state.token_table(g, score.rows[g], precision)
             logz = score_group(out, table, w, score.rows_t[g], masses.table, out_row, backend.token_classes,
-                               F.PRECISIONS[precision], candidates = cand,
-                               sample = _sample_columns(masses, score.nodes[g][pos], B, dev, backend.program(),
-                                                        (g, pos.tobytes())))
+                               F.PRECISIONS[precision], candidates = cand, sample = sample)
             if log_marginal is not None:
                 log_marginal[torch.where(out_row >= 0, out_row, M)] = logz
     return (out, log_marginal[:M]) if return_log_marginal else out
