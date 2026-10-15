@@ -14,6 +14,7 @@ root's inside value is never needed.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from typing import Optional
 
 import numpy as np
@@ -80,11 +81,12 @@ def _layout(backend, positions: np.ndarray, B: int):
     return groups, base, K, size
 
 
-def _sample_columns(masses, nodes: np.ndarray, B: int, dev) -> Optional[dict]:
+def _sample_columns(masses, nodes: np.ndarray, B: int, dev, prog = None, key = None) -> Optional[dict]:
     """:func:`~..kernels.score.score_group`'s ``sample`` for a row group's target positions, whose input nodes are
     ``nodes`` (int64 [positions, rows of the group], host; -1 for none): None unless per-sample inputs reweight them.
     Every node over a position reweighted by the same weights (or none of them reweighted), the column of sample ``b``
-    of the ``p``-th position reads its rows and weights."""
+    of the ``p``-th position reads its nodes' rows and weights. The nodes on the device are kept on ``prog`` by
+    ``key`` (the group and positions), bounded as the plans are."""
     if masses.lognorm is None:
         return None
     at = np.where(nodes >= 0, nodes, 0)
@@ -97,17 +99,19 @@ def _sample_columns(masses, nodes: np.ndarray, B: int, dev) -> Optional[dict]:
                                   "inputs (or some only) are not supported.")
     if (first < 0).all():
         return None
-    P, K = nodes.shape
-    nd = torch.from_numpy(at).to(dev)
-    b = torch.arange(B, device = dev)
-    rows = masses.row[nd].long()[:, None, :]                                 # [P, 1, K]
-    if masses.stride is not None:
-        rows = rows + b[None, :, None] * masses.stride[nd].long()[:, None, :]
-    off = torch.from_numpy(first).to(dev)[:, None]
-    offset = torch.where(off >= 0, (off + b[None, :] * masses.token_stride) * masses.token_width, -1)
-    return dict(rows = rows.expand(P, B, K).reshape(P * B, K).contiguous(), lognorm = masses.lognorm,
-                logw = masses.token_logw, offset = offset.reshape(P * B).contiguous(), width = masses.token_width,
-                ids = masses.token_ids)
+    cache = None if prog is None else prog.__dict__.setdefault("sample_nodes", OrderedDict())
+    nd = None if cache is None else cache.get(key)
+    if nd is None:
+        nd = torch.from_numpy(at).to(dev)
+        if cache is not None:
+            cache[key] = nd
+            if len(cache) > max(PLAN_CACHE_SIZE, PLANS_PER_POSITION * prog.n):
+                cache.popitem(last = False)
+    off = first[:, None]
+    offset = np.where(off >= 0, (off + np.arange(B)[None, :] * masses.token_stride) * masses.token_width, -1)
+    return dict(nodes = nd, row = masses.row, stride = masses.stride, columns = B, lognorm = masses.lognorm,
+                logw = masses.token_logw, offset = torch.from_numpy(offset.reshape(-1)).to(dev),
+                width = masses.token_width, ids = masses.token_ids)
 
 
 def _check(backend, data: torch.Tensor, precision: str, storage: str = "dense"):
@@ -312,7 +316,8 @@ def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor
             table = backend.state.token_table(g, score.rows[g])
             logz = score_group(out, table, w, score.rows_t[g], masses.table, out_row, backend.token_classes,
                                F.PRECISIONS[precision], candidates = cand,
-                               sample = _sample_columns(masses, score.nodes[g][pos], B, dev))
+                               sample = _sample_columns(masses, score.nodes[g][pos], B, dev, backend.program(),
+                                                        (g, pos.tobytes())))
             if log_marginal is not None:
                 log_marginal[torch.where(out_row >= 0, out_row, M)] = logz
     return (out, log_marginal[:M]) if return_log_marginal else out

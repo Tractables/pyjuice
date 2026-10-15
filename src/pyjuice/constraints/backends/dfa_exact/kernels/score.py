@@ -387,13 +387,15 @@ def run_class_weights(launches, cw: dict, prog, bufs, element_flows, temp_flows,
 # -------------------------------------------------------------------------------------------------
 
 @triton_jit
-def _score_weights_kernel(w, class_mars, rows, nrows, lognorm, shift, zc, C, K, TK: tl.constexpr,
-                          PER_COLUMN: tl.constexpr):
+def _score_weights_kernel(w, class_mars, rows, nodes, mrow, mstride, lognorm, shift, zc, C, K, B, TK: tl.constexpr,
+                          PER_COLUMN: tl.constexpr, STRIDE: tl.constexpr):
     """One program per (column ``n``, class ``c``) of a row group's log class weights ``w`` [N, C, K]: their maximum
     over the rows (``shift[n, c]``), the weights shifted by it and exponentiated in place, and ``zc[n, c] = log sum_k
     exp(w[n, c, k] + class_mars[rows[k], c])``, the class's part of ``p(e, C)``. ``PER_COLUMN`` (the class masses of
-    each column's own, per-sample inputs: :class:`~..state.ClassMasses`): row ``nrows[n, k]`` of them, and the weights
-    less the row's ``lognorm`` -- a token's own weight ``q(v) = p(v) w(v) / Z`` is ``p(v)``'s times ``w(v) / Z``."""
+    each column's own, per-sample inputs: :class:`~..state.ClassMasses`): column ``n`` is sample ``n % B`` of the
+    ``n // B``-th position, whose input nodes are ``nodes`` ([positions, K]): node ``u`` reads row ``mrow[u] + b
+    mstride[u]`` (``STRIDE``; else ``mrow[u]``) of them, and the weights less the row's ``lognorm`` -- a token's own
+    weight ``q(v) = p(v) w(v) / Z`` is ``p(v)``'s times ``w(v) / Z``."""
     nc = tl.program_id(0).to(tl.int64)
     c = nc % C
     base = w + nc * K
@@ -405,7 +407,11 @@ def _score_weights_kernel(w, class_mars, rows, nrows, lognorm, shift, zc, C, K, 
         km = ks < K
         v = tl.load(base + ks, mask = km, other = float("-inf"))
         if PER_COLUMN:
-            r = tl.load(nrows + (nc // C) * K + ks, mask = km, other = 0)
+            col = nc // C
+            u = tl.load(nodes + (col // B) * K + ks, mask = km, other = 0)
+            r = tl.load(mrow + u, mask = km, other = 0).to(tl.int64)
+            if STRIDE:
+                r += (col % B) * tl.load(mstride + u, mask = km, other = 0).to(tl.int64)
         else:
             r = tl.load(rows + ks, mask = km, other = 0).to(tl.int64)
         mass = tl.load(class_mars + r * C + c, mask = km, other = float("-inf"))
@@ -569,7 +575,9 @@ def score_group(out: torch.Tensor, table: torch.Tensor, w: torch.Tensor, rows: t
     :param candidates: None (every token), or int32 [M, k] on the device: row ``r`` scores ``candidates[r]`` alone,
         into ``out[r]`` ([M, k]), by :func:`_score_candidates_kernel` (in fp32 whatever ``precision``)
     :param sample: None, or the columns' own class masses under per-sample inputs (see
-        :class:`~..state.ClassMasses`): a dict with ``rows`` (int64 [N, K] on the device, every column's rows of
+        :class:`~..state.ClassMasses`): a dict with ``nodes`` (int64 [N / columns, K] on the device: the input nodes of
+        every ``columns`` columns, the samples of a position), ``row`` and ``stride`` (int32 per node; ``stride`` None
+        for the same rows for every sample: node ``u`` of sample ``b`` reads row ``row[u] + b stride[u]`` of
         ``class_mars``), ``lognorm`` (every row's ``log Z``) and the tokens' weights, ``logw`` (flat), ``offset`` (int64
         [N], every column's, -1 for none), ``width`` (the tokens with a weight) and ``ids`` (None: the first ``width``
         tokens; else int32, flat as ``logw``, the tokens of its ascending runs -- every column then has an offset, and
@@ -584,10 +592,13 @@ def score_group(out: torch.Tensor, table: torch.Tensor, w: torch.Tensor, rows: t
     ids = sample["ids"] if per_column else None
     weights = dict(logw = sample["logw"] if per_column else w, logw_off = sample["offset"] if per_column else rows,
                    KW = sample["width"] if per_column else 0)
-    _score_weights_kernel[(N * C,)](w, class_mars, rows, sample["rows"] if per_column else rows,
+    stride = per_column and sample["stride"] is not None
+    _score_weights_kernel[(N * C,)](w, class_mars, rows, sample["nodes"] if per_column else rows,
+                                    sample["row"] if per_column else rows, sample["stride"] if stride else rows,
                                     sample["lognorm"] if per_column else w, shift[0], shift[1], C, K,
+                                    sample["columns"] if per_column else 1,
                                     TK = min(1024, max(16, host_next_power_of_2(K))), PER_COLUMN = per_column,
-                                    num_warps = 4)
+                                    STRIDE = stride, num_warps = 4)
     _logz_kernel[(N,)](shift[1], logz, C, TC = min(1024, max(16, host_next_power_of_2(C))), num_warps = 1)
     if candidates is not None or ids is not None:                           # top-k weights: their tokens alone
         KC = candidates.size(1) if candidates is not None else weights["KW"]
