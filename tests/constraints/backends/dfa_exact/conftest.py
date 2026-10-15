@@ -661,3 +661,12 @@ def split(request, monkeypatch):
 def set_split_fixture(monkeypatch):
     """:func:`set_split` for a test that switches modes."""
     return lambda mode: set_split(monkeypatch, mode)
+
+
+@pytest.fixture(params = ["default", "always"])
+def pre(request, monkeypatch):
+    """The fused top-down kernel's pre-pass (``kernels/sum.py``): the library's rule, or every launch that may take
+    it (any number of tiles of children)."""
+    if request.param == "always":
+        monkeypatch.setattr(_lifted_sum, "PRE_MIN_TILES", 1)
+    return request.param

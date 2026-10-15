@@ -397,14 +397,20 @@ def regather_into(state, prog, old: "CompactLayout", new: "CompactLayout", regio
                   parents: torch.Tensor, allocate, name: str = "node_flows", rows: str = "flows"):
     """
     :func:`regather` from the storage ``state`` holds as ``name`` (``node_flows`` or ``node_mars``, its ``rows`` laid
-    out by ``old``) into the one ``allocate()`` returns (a dict holding it as ``name``, laid out by ``new``), never
-    holding both: the ``regions``' values (some) are gathered into a scratch first, the old storage given up, and the
-    scratch copied into the new one -- so a query whose rows hold little more than they did does not need their
-    memory twice. Returns ``allocate()``'s result.
+    out by ``old``) into the one ``allocate()`` returns (a dict holding it as ``name``, laid out by ``new``). Where the
+    ``regions`` make most of the new storage, straight into it, the old one held meanwhile; else never holding both:
+    the ``regions``' values are gathered into a scratch first, the old storage given up, and the scratch copied into
+    the new one -- so a query whose rows hold little of it does not need their memory twice. Returns ``allocate()``'s
+    result.
     """
     regs = np.nonzero(regions)[0]
     new_offset, new_width = new.rows(rows)
     sizes = prog.reg_rows[regs] * new_width[regs]
+    if 2 * int(sizes.sum()) >= int((prog.reg_rows * new_width).sum()):      # most of the new storage: in one pass,
+        src = state.replace_storage(name, None)                            # the old held while the new is made
+        out = allocate()
+        regather(prog, old, src, new, out[name], regions, parents, rows = rows)
+        return out
     starts = np.zeros(len(new_width), dtype = np.int64)
     starts[regs] = np.concatenate([[0], np.cumsum(sizes)[:-1]])
     scratch = torch.empty(max(int(sizes.sum()), 1), device = prog.dev)

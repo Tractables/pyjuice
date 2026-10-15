@@ -108,6 +108,20 @@ class ClassMasses:
     token_ids: Optional[torch.Tensor] = None
 
 
+#: What a storage holds when it is allocated (:meth:`State.storage_view`): None, nothing in particular -- every slot a
+#: query reads is written first --, or a value it is filled with (the tests fill NaN, so that a read of a slot nothing
+#: wrote shows).
+FRESH_FILL: Optional[float] = None
+
+
+def fresh_storage(numel: int, device) -> torch.Tensor:
+    """``numel`` floats of new storage on ``device``, as :data:`FRESH_FILL` says."""
+    out = torch.empty(max(int(numel), 1), device = device)
+    if FRESH_FILL is not None:
+        out.fill_(FRESH_FILL)
+    return out
+
+
 class State:
     """
     The buffers and the parameter-derived values of one :class:`~.backend.DFAExactBackend` (``backend.state``). It
@@ -149,8 +163,8 @@ class State:
         a query with no per-sample inside value of a sum region (its storage given up if larger).
 
         Each buffer has one backing storage, reused while it is large enough and at most 4 times larger than needed
-        (so a loop whose batch size varies does not reallocate, and keeps its addresses), and filled with -inf only
-        when allocated: every slot a kernel reads is written first, and padding is never read.
+        (so a loop whose batch size varies does not reallocate, and keeps its addresses), not filled when allocated
+        (:func:`fresh_storage`): every slot a kernel reads is written first, and padding is never read.
 
         :returns: a dict with ``node_mars`` and ``element_mars`` (flat), ``input_mars`` (a contiguous
             ``[input_end, batch_size]`` view, which an input layer writes as it writes a :class:`TensorCircuit`'s
@@ -252,7 +266,7 @@ class State:
         storage = self._storage.get(name)
         if storage is None or storage.numel() < numel or storage.numel() > 4 * max(numel, 1):
             storage = self._storage[name] = None                                    # free the old one first
-            storage = self._storage[name] = torch.full((max(numel, 1),), -float("inf"), device = self._device)
+            storage = self._storage[name] = fresh_storage(numel, self._device)
         return storage[:numel]
 
     # ---------------------------------------------------------------------------------------------

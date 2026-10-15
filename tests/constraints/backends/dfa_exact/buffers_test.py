@@ -153,8 +153,8 @@ def test_buffers_are_reused_across_batch_sizes(build_pc):
     assert ptr(128) != p64                                                 # too small: grown
     p128 = ptr(128)
     assert ptr(8) != p128                                                  # more than 4x too large: shrunk
-    fresh = cc.backend.state.buffers(256)["node_mars"]                          # a new allocation starts at -inf
-    assert torch.isneginf(fresh).all()
+    fresh = cc.backend.state.buffers(256)["node_mars"]               # a new allocation: as FRESH_FILL says (the
+    assert torch.isnan(fresh).all()                                  # tests' NaN; unfilled in use)
 
 
 def test_per_group_widths_are_smaller_than_per_layer_widths(build_pc):

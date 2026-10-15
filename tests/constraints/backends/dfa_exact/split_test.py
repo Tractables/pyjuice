@@ -78,9 +78,9 @@ class Splits:
 
     def __init__(self, monkeypatch):
         self.seen = {"forward": [], "top_down": []}
-        for name, kind in (("_lifted_sum_kernel", "forward"), ("_lifted_sum_split_kernel", "forward"),
+        for name, kind in (("_lifted_sum_kernel", "forward"), ("_lifted_sum_aux_kernel", "forward"),
                            ("_lifted_sum_top_down_kernel", "top_down"),
-                           ("_lifted_sum_top_down_split_kernel", "top_down")):
+                           ("_lifted_sum_top_down_aux_kernel", "top_down")):
             monkeypatch.setattr(lifted_sum, name, self._spy(getattr(lifted_sum, name), kind))
 
     def _spy(self, kernel, kind):
@@ -91,7 +91,7 @@ class Splits:
                 launch = kernel[grid]
 
                 def run(*args, **kwargs):
-                    seen.append((kwargs.get("SPLIT", 1), tuple(grid)))
+                    seen.append((kwargs.get("SPLIT", 1), tuple(grid), kwargs.get("PRE", False)))
                     return launch(*args, **kwargs)
                 return run
         return Spy()
@@ -123,11 +123,11 @@ def compare(kind, gated, B, build_pc, gate_sums, set_split, monkeypatch) -> dict
     splits = Splits(monkeypatch)
     set_split("max")
     split = queries(cc, data, missing, kw)
-    split_launches = {k: [(s, g) for s, g in v if s > 1] for k, v in splits.seen.items()}
+    split_launches = {k: [(s, g) for s, g, _ in v if s > 1] for k, v in splits.seen.items()}
     set_split("off")
     count = {k: len(v) for k, v in splits.seen.items()}
     whole = queries(cc, data, missing, kw)
-    assert all(s == 1 for k, v in splits.seen.items() for s, _ in v[count[k]:])
+    assert all(s == 1 for k, v in splits.seen.items() for s, _, _ in v[count[k]:])
     for got, want in zip(split, whole):
         assert_close(got, want)
     return split_launches
@@ -183,3 +183,29 @@ def test_split_count():
             assert s & (s - 1) == 0 and s <= lifted_sum.SPLIT_MAX
             assert s == 1 or chunks // s >= lifted_sum.SPLIT_MIN_SHARE
             assert s == 1 or programs * s // 2 < need
+
+
+@pytest.mark.parametrize("gated", [False, True])
+@pytest.mark.parametrize("kind", list(KINDS))
+def test_pre_passes_are_the_plain_loops(kind, gated, build_pc, gate_sums, monkeypatch):
+    """The fused kernels' pre-passes (every parent chunk's -- children chunk's -- shifted exponentials computed once)
+    taken by every launch that may take them, then by none: the same marginals and conditionals; the wider circuits
+    take them in the top-down, and those with node blocks over the same children (an HMM layer) in the forward."""
+    pc = circuit(kind, gated, build_pc, gate_sums)
+    data, missing = evidence(KINDS[kind], 3)
+    kw = dict(sum_external_params = gates_of(pc, 3)) if gated else {}
+    cc = jc.compile(jc.DFA.contains([[0, 1, 1], [2, 0]], V) & jc.Not(jc.DFA.contains([[2, 2]], V)), pc)
+    splits = Splits(monkeypatch)
+    monkeypatch.setattr(lifted_sum, "PRE_MIN_TILES", 1)
+    pre = queries(cc, data, missing, kw)
+    took = {k: any(p for _, _, p in v) for k, v in splits.seen.items()}
+    if kind in WIDE:
+        assert took["top_down"], splits.seen["top_down"]
+    if kind == "hmm48" or (kind == "wide_hmm" and not gated):   # gates of 8 children are per edge: no forward pre
+        assert took["forward"], splits.seen["forward"]
+    monkeypatch.setattr(lifted_sum, "PRE_MIN_TILES", 1 << 30)
+    count = {k: len(v) for k, v in splits.seen.items()}
+    plain = queries(cc, data, missing, kw)
+    assert not any(p for k, v in splits.seen.items() for _, _, p in v[count[k]:])
+    for got, want in zip(pre, plain):
+        assert_close(got, want)
