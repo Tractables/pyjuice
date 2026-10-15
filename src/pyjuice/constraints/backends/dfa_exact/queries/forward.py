@@ -228,8 +228,8 @@ def _sums(backend, parts, block_size: int, nodes: torch.Tensor, element_mars: to
             dense_sum(nodes, element_mars, pc.params, {c0: blocks}, num_edges, block_size, region, elem_first,
                       elem_width, ncols, dot, live = cols, stacked = stacked)
         if fused is not None:
-            (nids, cids, pids, nb_reg, _, aliased, gate), sel, count, max_slots = fused
-            max_cols = B * max_slots if compact is None else compact.mars["lanes"]
+            (nids, cids, pids, nb_reg, _, aliased, gate), sel, count, max_slots, ivs = fused
+            max_cols = B * max_slots if compact is None else compact.lanes(ivs)          # (its regions' most)
             if max_cols == 0:
                 continue
             fused_sum(nodes, element_mars, pc.params, nids, cids, pids, nb_reg, regions, elem_first, elem_width,

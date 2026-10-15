@@ -100,14 +100,16 @@ def _runs(keys: np.ndarray):
 
 
 def _forward_tables(prog):
-    """``(tables, launches, full cuts, parts)``: what :func:`_forward_modes` reads (:data:`_FW_FIELDS`), every product
-    launch in the Program's order with the :class:`~.prod.Cut` running all of its steps, and every sum layer
-    part's dense runs (built on first use, kept on the Program)."""
+    """``(tables, launches, full cuts, parts, part intervals)``: what :func:`_forward_modes` reads
+    (:data:`_FW_FIELDS`), every product launch in the Program's order with the :class:`~.prod.Cut` running all of its
+    steps, every sum layer part's dense runs, and the intervals of its fused node blocks' regions (``prog.intervals``'
+    numbers, as a :class:`~..kernels.compact.CompactLayout` counts their lanes; None for none) -- built on first use,
+    kept on the Program."""
     if getattr(prog, "fw_flat", None) is not None:
         return prog.fw_flat
     F = _Flat(*_FW_FIELDS)
     reg_iv, slots = np.asarray(prog.reg_iv_host), np.asarray(prog.slots)
-    launches, full, runs_of = [], [], []
+    launches, full, runs_of, ivs_of = [], [], [], []
     nc = nr = ng = ngr = nd = nbr = 0
     for kind, _, layers in prog.steps:
         if kind == "prod":
@@ -148,6 +150,7 @@ def _forward_tables(prog):
                     F.add("dense_iv", [reg_iv[r] for (r, _), _ in runs])
                     nd += len(runs)
                     F.add("part_brun_ptr", nbr)
+                    ivs_of.append(None if fused is None else np.unique(prog.reg_iv_all[fused[3].cpu().numpy()]))
                     if fused is not None:
                         biv = reg_iv[fused[3].cpu().numpy()]
                         bsl = slots[fused[3].cpu().numpy()]
@@ -161,7 +164,7 @@ def _forward_tables(prog):
     for name, value in (("launch_chunk_ptr", nc), ("chunk_run_ptr", nr), ("launch_gsize_ptr", ng),
                         ("gsize_run_ptr", ngr), ("part_dense_ptr", nd), ("part_brun_ptr", nbr)):
         F.add(name, value)
-    prog.fw_flat = (_Packed(_FW_FIELDS, F.done()), launches, full, runs_of)
+    prog.fw_flat = (_Packed(_FW_FIELDS, F.done()), launches, full, runs_of, ivs_of)
     return prog.fw_flat
 
 
@@ -273,7 +276,7 @@ def _forward_modes(todo, sample, data, offsets):
 def _forward_steps(prog, todo: np.ndarray, sample: np.ndarray, lists: IndexLists) -> list:
     """The steps of a :class:`QueryPlan` (``todo`` / ``sample``: the intervals whose values it computes once / per
     sample), from :func:`_forward_modes`; their index lists go into ``lists``."""
-    t, launches, full, runs_of = _forward_tables(prog)
+    t, launches, full, runs_of, ivs_of = _forward_tables(prog)
     lc, lmax, cc, cs, gc, gs, run_sel, pc, pslots, ps, buf = _forward_modes(todo, sample, t.data, t.offsets)
     counts, part_counts, run_sel, run_ptr = lc.tolist(), pc.tolist(), run_sel.tolist(), t.part_dense_ptr.tolist()
 
@@ -325,7 +328,7 @@ def _forward_steps(prog, todo: np.ndarray, sample: np.ndarray, lists: IndexLists
                         if n:
                             every = n == len(fused[3])
                             f = (fused, None if every else lists.add(buf[ps[P, m]:ps[P, m] + n]), int(n),
-                                 int(pslots[P, m]))
+                                 int(pslots[P, m]), ivs_of[P])
                         if dense or f is not None:
                             out[m].append((dense, num_edges, f))
                     P += 1

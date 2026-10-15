@@ -62,7 +62,8 @@ class QueryPlan:
         for a batch of one into ``prior_mars``, and its per-sample ones -- a product layer ``(once stages, sample
         stages, num_temps, max_temp_slots)``, its stages lists of ``(launch, cut)`` (:class:`~.prod.Cut`), a
         sum layer ``(block_size, once parts, sample parts)``, each part ``(dense runs [(region, c0, blocks, key)],
-        num_edges, None or (fused part, index list of its node blocks or None for all, count, most slots))``
+        num_edges, None or (fused part, index list of its node blocks or None for all, count, most slots, its
+        regions' intervals))``
     :ivar todo: bool [sum intervals] (host tensor): the values kept once the query computes
     :ivar prior: whether the query reads or writes ``prior_mars`` at all
     :ivar root_prior: whether the root's value is kept once

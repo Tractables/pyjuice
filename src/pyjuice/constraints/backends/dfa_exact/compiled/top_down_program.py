@@ -333,7 +333,8 @@ def _fused_tables(prog, parts, block_size, prod_index, elem_first, firsts, writt
                                   ck = t(p_gck), node_gate = parts[0][6]["node_gate"],
                                   uniform = block_scale.uniform_tiles(np.asarray(p_lc), np.asarray(p_gcbs), length)),
                               host = dict(cb_row = np.asarray(cb_row), cb_reg = np.asarray(cb_reg),
-                                          cb_ivreg = np.asarray(cb_ivreg)))
+                                          cb_ivreg = np.asarray(cb_ivreg),
+                                          ivs = np.unique(prog.reg_iv_all[np.asarray(cb_ivreg)])))
     return groups
 
 
