@@ -386,6 +386,44 @@ def test_conditional_matches_the_reference(kind, shared, sum_path, transitions, 
     assert_rows_close(got_c, want_c, n)
 
 
+@pytest.mark.parametrize("shared", [False, True])
+@pytest.mark.parametrize("columns", ["per class", "in shares"])
+def test_score_weights_paths(shared, columns, reference, monkeypatch):
+    """The scoring's class weights under per-sample inputs (an HMM of 160 input nodes per position): one program per
+    (column, class), or per column in shares of 64 rows -- the shares' partials, then their combination, the last
+    share short -- the reference's conditionals either way."""
+    from pyjuice.constraints.backends.dfa_exact.kernels import score
+    if columns == "per class":
+        monkeypatch.setattr(score, "SCORE_COLUMNS_MAX_CLASSES", 0)
+    else:
+        monkeypatch.setattr(score, "SCORE_COLUMNS_SHARE_ROWS", 1)
+    shares, real = [], score._score_weights_columns_kernel
+
+    class Recorded:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                shares.append(kwargs["SHARES"])
+                return real[grid](*args, **kwargs)
+            return launch
+
+    monkeypatch.setattr(score, "_score_weights_columns_kernel", Recorded())
+    n, Vm = 4, 50
+    torch.manual_seed(0)
+    ns = juice.structures.GeneralizedHMM(seq_length = n, num_latents = 160, block_size = 32,
+                                         input_dist = dists.SoftEvidenceCategorical(num_cats = Vm))
+    ns.init_parameters(perturbation = 2.0)
+    pc = juice.compile(ns, verbose = False).to(DEV)
+    cc = jc.compile(jc.DFA.contains([[7, 31]], Vm) & jc.Not(jc.DFA.contains([[44]], Vm)), pc)
+    E = lm_evidence(1 if shared else 3, n, Vm, hot = [(1, 7), (2, 31), (n - 1, 44)])
+    data = draw(E.expand(3, -1, -1).contiguous())
+    m = masks(n, 3)[3]
+    m[0] = True
+    with cc.decoder(categorical_evidence_logp = E) as decoder:
+        got = decoder.conditional(data, m)
+    assert_rows_close(got, reference.conditional(cc, data, m, inputs = dict(categorical_evidence_logp = E)), n)
+    assert (max(shares) > 1) if columns == "in shares" else not shares, shares
+
+
 @pytest.mark.parametrize("kind", ["hmm", "pd", "hand_left"])
 def test_codpula_vocabulary_conditionals(kind, build_pc, reference):
     """Conditionals at Codpula's 126464 tokens: language-model evidence against the reference (any order and prefix

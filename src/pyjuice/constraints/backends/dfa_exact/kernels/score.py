@@ -38,6 +38,7 @@ from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 from .common import (IDENTITY, _block_ptr, _child, _exit_width, _interval, _logaddexp_tile, _lse_step, _slot,
                      grid_chunks, tensor)
 from .prod_top_down import _once, _out_flows_ptr, _parent_base, _parent_lane
+from .sum import _num_sms
 
 
 
@@ -432,6 +433,92 @@ def _score_weights_kernel(w, class_mars, rows, nodes, mrow, mstride, lognorm, sh
         tl.store(base + ks, tl.exp(tl.load(base + ks, mask = km, other = float("-inf")) - s), mask = km)
 
 
+@triton.jit
+def _column_rows(nodes, mrow, mstride, b, ks, km, STRIDE: tl.constexpr):
+    """The class mass rows of a column's input nodes ``ks`` (its position's ``nodes``, its sample ``b``)."""
+    u = tl.load(nodes + ks, mask = km, other = 0)
+    r = tl.load(mrow + u, mask = km, other = 0).to(tl.int64)
+    if STRIDE:
+        r += b * tl.load(mstride + u, mask = km, other = 0).to(tl.int64)
+    return r
+
+
+@triton_jit
+def _score_weights_columns_kernel(w, class_mars, nodes, mrow, mstride, lognorm, shift, zc, part, C, K, B, KS,
+                                  TC: tl.constexpr, TK: tl.constexpr, STRIDE: tl.constexpr, SHARES: tl.constexpr,
+                                  FINISH: tl.constexpr):
+    """:func:`_score_weights_kernel` under per-sample inputs (``PER_COLUMN``), a program per column ``n`` -- and
+    share ``s`` of its rows ``[s KS, (s + 1) KS)`` (grid axis 1) -- for all its classes: a row of the class masses
+    (``C`` floats) read whole (a program per (column, class) reads every row a float at a time), and the weights read
+    twice and written once. One share (``SHARES`` 1): the shifts and the classes' parts, then ``exp(w - lognorm -
+    shift)``. Several: the shares' maxima, running maxima and sums into ``part`` ([N, SHARES, 3, TC]), then
+    (``FINISH``, a second launch) every share combines them in order and writes its rows."""
+    n = tl.program_id(0).to(tl.int64)
+    sh_ = tl.program_id(1)
+    cs = tl.arange(0, TC)
+    cm = cs < C
+    base = w + n * C * K
+    node0 = nodes + (n // B) * K
+    b = n % B
+    k_lo = sh_ * KS
+    k_hi = tl.minimum(K, k_lo + KS)
+    if not FINISH:
+        big = tl.full([TC], float("-inf"), dtype = tl.float32)
+        mz = tl.full([TC], float("-inf"), dtype = tl.float32)
+        az = tl.zeros([TC], dtype = tl.float32)
+        for k0 in range(k_lo, k_hi, TK):
+            ks = k0 + tl.arange(0, TK)
+            km = ks < k_hi
+            r = _column_rows(node0, mrow, mstride, b, ks, km, STRIDE)
+            mk = cm[:, None] & km[None, :]
+            v = tl.load(base + cs[:, None] * K + ks[None, :], mask = mk, other = float("-inf"))          # [TC, TK]
+            x = v + tl.load(class_mars + r[None, :] * C + cs[:, None], mask = mk, other = float("-inf"))
+            m_new = tl.maximum(mz, tl.max(x, axis = 1))
+            sh = tl.where(m_new == float("-inf"), 0.0, m_new)
+            az = az * tl.exp(mz - sh) + tl.sum(tl.exp(x - sh[:, None]), axis = 1)
+            mz = m_new
+            big = tl.maximum(big, tl.max(v - tl.load(lognorm + r, mask = km, other = 0.0)[None, :], axis = 1))
+        if SHARES > 1:
+            out = part + ((n * SHARES + sh_) * 3) * TC + cs
+            tl.store(out, big)
+            tl.store(out + TC, mz)
+            tl.store(out + 2 * TC, az)
+            return
+    else:
+        big = tl.full([TC], float("-inf"), dtype = tl.float32)
+        mz = tl.full([TC], float("-inf"), dtype = tl.float32)
+        for j in range(SHARES):                                             # (in order: the same in every share)
+            src = part + ((n * SHARES + j) * 3) * TC + cs
+            big = tl.maximum(big, tl.load(src))
+            mz = tl.maximum(mz, tl.load(src + TC))
+        zs0 = tl.where(mz == float("-inf"), 0.0, mz)
+        az = tl.zeros([TC], dtype = tl.float32)
+        for j in range(SHARES):
+            src = part + ((n * SHARES + j) * 3) * TC + cs
+            az += tl.load(src + 2 * TC) * tl.exp(tl.load(src + TC) - zs0)
+    if sh_ == 0:
+        tl.store(shift + n * C + cs, big, mask = cm)
+        tl.store(zc + n * C + cs, tl.log(az) + tl.where(mz == float("-inf"), 0.0, mz), mask = cm)
+    s = tl.where(big == float("-inf"), 0.0, big)
+    for k0 in range(k_lo, k_hi, TK):
+        ks = k0 + tl.arange(0, TK)
+        km = ks < k_hi
+        r = _column_rows(node0, mrow, mstride, b, ks, km, STRIDE)
+        mk = cm[:, None] & km[None, :]
+        ptr = base + cs[:, None] * K + ks[None, :]
+        v = tl.load(ptr, mask = mk, other = float("-inf")) - tl.load(lognorm + r, mask = km, other = 0.0)[None, :]
+        tl.store(ptr, tl.exp(v - s[:, None]), mask = mk)
+
+
+#: Under per-sample inputs a row group of at most this many classes has its weights scored a column (all its classes)
+#: per program, or a share of its rows when the columns are fewer than twice the SMs
+#: (:func:`_score_weights_columns_kernel`).
+SCORE_COLUMNS_MAX_CLASSES = 64
+
+#: ... the fewest rows of a share.
+SCORE_COLUMNS_SHARE_ROWS = 256
+
+
 @triton_jit
 def _logz_kernel(zc, logz, C, TC: tl.constexpr):
     """One program per column ``n``: ``logz[n] = log sum_c exp(zc[n, c])``, ``log p(e, C)``."""
@@ -593,12 +680,26 @@ def score_group(out: torch.Tensor, table: torch.Tensor, w: torch.Tensor, rows: t
     weights = dict(logw = sample["logw"] if per_column else w, logw_off = sample["offset"] if per_column else rows,
                    KW = sample["width"] if per_column else 0)
     stride = per_column and sample["stride"] is not None
-    _score_weights_kernel[(N * C,)](w, class_mars, rows, sample["nodes"] if per_column else rows,
-                                    sample["row"] if per_column else rows, sample["stride"] if stride else rows,
-                                    sample["lognorm"] if per_column else w, shift[0], shift[1], C, K,
-                                    sample["columns"] if per_column else 1,
-                                    TK = min(1024, max(16, host_next_power_of_2(K))), PER_COLUMN = per_column,
-                                    STRIDE = stride, num_warps = 4)
+    if per_column and C <= SCORE_COLUMNS_MAX_CLASSES:              # a column a program, its rows in shares if few
+        TC, TK = max(16, host_next_power_of_2(C)), 64
+        shares = max(1, min(host_cdiv(2 * _num_sms(w.device), N), host_cdiv(K, SCORE_COLUMNS_SHARE_ROWS)))
+        KS = host_cdiv(host_cdiv(K, shares), TK) * TK
+        shares = host_cdiv(K, KS)
+        part = torch.empty(N * shares * 3 * TC if shares > 1 else 1, dtype = torch.float32, device = w.device)
+        args = (w, class_mars, sample["nodes"], sample["row"], sample["stride"] if stride else rows, sample["lognorm"],
+                shift[0], shift[1], part, C, K, sample["columns"], KS)
+        _score_weights_columns_kernel[(N, shares)](*args, TC = TC, TK = TK, STRIDE = stride, SHARES = shares,
+                                                   FINISH = False, num_warps = 4)
+        if shares > 1:
+            _score_weights_columns_kernel[(N, shares)](*args, TC = TC, TK = TK, STRIDE = stride, SHARES = shares,
+                                                       FINISH = True, num_warps = 4)
+    else:
+        _score_weights_kernel[(N * C,)](w, class_mars, rows, sample["nodes"] if per_column else rows,
+                                        sample["row"] if per_column else rows, sample["stride"] if stride else rows,
+                                        sample["lognorm"] if per_column else w, shift[0], shift[1], C, K,
+                                        sample["columns"] if per_column else 1,
+                                        TK = min(1024, max(16, host_next_power_of_2(K))), PER_COLUMN = per_column,
+                                        STRIDE = stride, num_warps = 4)
     _logz_kernel[(N,)](shift[1], logz, C, TC = min(1024, max(16, host_next_power_of_2(C))), num_warps = 1)
     if candidates is not None or ids is not None:                           # top-k weights: their tokens alone
         KC = candidates.size(1) if candidates is not None else weights["KW"]
