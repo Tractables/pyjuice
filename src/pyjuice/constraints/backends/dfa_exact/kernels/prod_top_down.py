@@ -22,7 +22,7 @@ buffers are never filled beforehand.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
 import torch
 import triton
@@ -32,8 +32,8 @@ from pyjuice.layer.kernels import autotune
 from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
-from .common import (SUM, _block_ptr, _child, _exit_width, _interval, _logaddexp_tile, _lse_step, _pair, _slot,
-                     grid_chunks, tensor)
+from .common import (NODE_TILE, SUM, _block_ptr, _child, _exit_width, _interval, _logaddexp_tile, _lse_step, _pair,
+                     _slot, _tile_rows, grid_chunks, tensor)
 from .compact import _lane, _lane_ends
 from .prod import (BLOCK_BLOCK_PROGRAMS_PER_SM, BLOCK_BLOCK_TILES, EXACT_BELOW, PRODUCT_PRECISION, SKIP_EMPTY_TILES,
                    _chunk_needed, _flat_tile, _live_lanes, _lse_step_one_exp, _lse_value, _rect_product,
@@ -63,7 +63,11 @@ class TopDownLaunch:
     :ivar E_max, X_max, S_max: the most entry columns, exit columns and slots of the children's blocks
     :ivar host: for query plans, numpy copies: ``children`` [C, 3] (row, region, add), ``ptr``, ``parents``, and every
         child's (``child_iv``) and parent's (``parent_iv``) interval, by ``prog.intervals``' numbers -- and those
-        intervals each once (``child_ivs``, ``parent_ivs``; for compact storage, see :mod:`.compact`)
+        intervals each once (``child_ivs``, ``parent_ivs``; for compact storage, see :mod:`.compact`); for
+        ``input_block`` / ``block_input``, every child's node tile ``group`` (:func:`~.common.node_groups`: its
+        interval, number of parents and ``add``)
+    :ivar tiles, tile_height: for ``input_block`` / ``block_input``, every child in node tiles (int32 on the device)
+        and their height (:func:`~.common.node_tiles`) -- a query plan's lists of these launches are tiles too
     """
 
     form: str
@@ -76,6 +80,8 @@ class TopDownLaunch:
     X_max: int
     S_max: int
     host: Any
+    tiles: Optional[torch.Tensor] = None
+    tile_height: int = 1
 
 
 @triton.jit
@@ -193,31 +199,33 @@ def _copy_top_down_kernel(element_flows, temp_flows, node_flows, iv_of, iv_info,
 def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mars, obs_class, next_col, class_mars,
                                 mass_row, mass_stride, trans, trans_stride, pred_ptr, pred_col, pred_x, width, iv_of,
                                 iv_info, iv_table, once_iv, live, lanes, lane_first, lane_live, coff, ccount, cstart,
-                                ccolumns, crank, children, children_idx, ptr, parents, reg_offset, reg_width,
-                                reg_first, out_first, out_width, temp_width, B, n, W, C, input_start, csteps, pid0,
+                                ccolumns, crank, children, tiles, ptr, parents, reg_offset, reg_width, reg_first,
+                                out_first, out_width, temp_width, B, n, W, C, input_start, csteps, pid0,
                                 C_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, GROUPED: tl.constexpr,
                                 PRUNE: tl.constexpr, ORDERED: tl.constexpr, COMPACT: tl.constexpr,
-                                C_FULL: tl.constexpr, OUT_FULL: tl.constexpr, INDEXED: tl.constexpr,
-                                SAMPLE: tl.constexpr, TILE: tl.constexpr):
+                                C_FULL: tl.constexpr, OUT_FULL: tl.constexpr, SAMPLE: tl.constexpr, TN: tl.constexpr,
+                                SUBS: tl.constexpr, TILE: tl.constexpr):
     """The right operand ``R`` over ``[t + 1, t2)`` of ``input @ block`` steps: ``O_R[q, j] = log sum over the
     parents, and over the entries ``(i, class)`` leading to ``q`` at boundary ``t``, of mass + O_out[i, j]``. One
-    program per child and tile of its lanes, flattened (sample, slot). ``ORDERED`` (a sum child under evidence pruning):
-    the lanes in the query's lane order, live ones first -- a tile of dead lanes only stores -inf (a first writer)
-    or nothing (a later one), since evidence usually leaves a few live (one per sample through an observed prefix).
-    ``COMPACT``: the child's and the parents' values compact (:mod:`.compact`), a lane per pair of live columns, -inf
-    at a pair the automaton does not join. ``SAMPLE``: class masses of each sample's own (see
-    :class:`~..state.ClassMasses`; transition masses ``trans_stride`` floats apart)."""
-    c = _child(children_idx, tl.program_id(0), INDEXED)
+    program per ``TN`` children of a node tile (:func:`~.common.node_tiles`: children of one interval with as many
+    parents and one ``add``, whose lanes walk the same entries -- walked once for all of them) and tile of their
+    lanes, flattened (sample, slot). ``ORDERED`` (a sum child under evidence pruning): the lanes in the query's lane
+    order, live ones first -- a tile of dead lanes only stores -inf (a first writer) or nothing (a later one), since
+    evidence usually leaves a few live (one per sample through an observed prefix). ``COMPACT``: the child's and the
+    parents' values compact (:mod:`.compact`), a lane per pair of live columns, -inf at a pair the automaton does not
+    join. ``SAMPLE``: class masses of each sample's own (see :class:`~..state.ClassMasses`; transition masses
+    ``trans_stride`` floats apart)."""
+    c, real, c0 = _tile_rows(tiles, tl.program_id(0), TN, SUBS)
     tile = pid0 + tl.program_id(1)
     row = tl.load(children + c * 4 + 0)
     reg = tl.load(children + c * 4 + 1)
-    add = tl.load(children + c * 4 + 2)
+    add = tl.load(children + c0 * 4 + 2)                                     # (the tile's: one for all)
     p0 = tl.load(ptr + c)
-    p1 = tl.load(ptr + c + 1)
-    t = tl.load(parents + p0 * 7 + 2)
-    t2 = tl.load(parents + p0 * 7 + 5)
+    f0 = tl.load(ptr + c0)                                                   # the tile's first child's parents:
+    t = tl.load(parents + f0 * 7 + 2)                                        # every child's have its interval
+    t2 = tl.load(parents + f0 * 7 + 5)
     X = _exit_width(width, t2, n)
-    S, cpos, pairs = _interval(iv_of, iv_info, t + 1, t2, n)               # the child's slots
+    S, cpos, pairs = _interval(iv_of, iv_info, t + 1, t2, n)               # the children's slots
     OS, opos, _ = _interval(iv_of, iv_info, t, t2, n)                        # the parents' slots
     once = _once(once_iv, iv_of, t, t2, n)                                   # ... kept once?
     ostride = tl.where(once, 0, OS)
@@ -231,10 +239,13 @@ def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
         dead = False
     else:
         ncols = B * S
-        idx, m, ml, dead = _child_lanes(tile, B, S, reg, lanes, lane_first, lane_live, TILE, ORDERED)
+        idx, m, ml, dead = _child_lanes(tile, B, S, tl.load(children + c0 * 4 + 1), lanes, lane_first, lane_live,
+                                        TILE, ORDERED)                     # (an interval's lane order)
+    out = cp[:, None] + idx[None, :]
+    om = real[:, None] & m[None, :]
     if dead:                                                                 # ORDERED: no live lane in the tile
         if add == 0:
-            tl.store(cp + idx, tl.full([TILE], float("-inf"), dtype = tl.float32), mask = m)
+            tl.store(out, tl.full([TN, TILE], float("-inf"), dtype = tl.float32), mask = om)
     elif tile * TILE < ncols:
         if COMPACT:
             b, q, j = _lane_ends(coff, ccount, cstart, ccolumns, kc, t + 1, t2, idx, m, B, n, csteps)
@@ -250,21 +261,24 @@ def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
         oc = tl.load(obs_class + b * n + t, mask = m, other = -1)
         e0 = tl.load(pred_ptr + t * (W + 1) + q, mask = ml, other = 0)
         e1 = tl.load(pred_ptr + t * (W + 1) + q + 1, mask = ml, other = 0)
-        mx = tl.full([TILE], float("-inf"), dtype = tl.float32)
-        acc = tl.zeros([TILE], dtype = tl.float32)
-        for p in range(p0, p1):
+        mx = tl.full([TN, TILE], float("-inf"), dtype = tl.float32)
+        acc = tl.zeros([TN, TILE], dtype = tl.float32)
+        for r in range(0, tl.load(ptr + c0 + 1) - f0):
+            p = p0 + r
             u = tl.load(parents + p * 7 + 1).to(tl.int64)
-            own = tl.load(node_mars + u * B + b, mask = m, other = float("-inf"))   # the observed token's log-prob
+            own = tl.load(node_mars + u[:, None] * B + b[None, :], mask = om & (oc >= 0)[None, :],
+                          other = float("-inf"))                             # the observed token's log-prob
             op = _out_flows_ptr(tl.load(parents + p * 7 + 0), element_flows, temp_flows, out_first, out_width,
-                                temp_width, OUT_TEMP) + _parent_base(b, ostride, COMPACT)
+                                temp_width, OUT_TEMP)[:, None] + _parent_base(b, ostride, COMPACT)[None, :]
             if GROUPED:
-                masses = trans + tl.load(parents + p * 7 + 6).to(tl.int64)
+                masses = (trans + tl.load(parents + p * 7 + 6).to(tl.int64))[:, None]
                 if SAMPLE:                                                   # (the lane's sample's)
-                    masses = masses + tl.where(tl.load(mass_stride + (u - input_start)) > 0, b * trans_stride, 0)
+                    masses = masses + tl.where((tl.load(mass_stride + (u - input_start)) > 0)[:, None],
+                                               b[None, :] * trans_stride, 0)
             else:
-                masses = class_mars + tl.load(mass_row + (u - input_start)).to(tl.int64) * C
+                masses = (class_mars + tl.load(mass_row + (u - input_start)).to(tl.int64) * C)[:, None]
                 if SAMPLE:
-                    masses = masses + b * tl.load(mass_stride + (u - input_start)).to(tl.int64) * C
+                    masses = masses + b[None, :] * (tl.load(mass_stride + (u - input_start)).to(tl.int64) * C)[:, None]
             for k in range(0, tl.max(e1 - e0, axis = 0)):                    # entry (i, x) -> q
                 em = ml & (e0 + k < e1)
                 i = tl.load(pred_col + e0 + k, mask = em, other = 0)
@@ -276,39 +290,40 @@ def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
                     holds = tl.load(next_col + (t * W + i) * C + tl.maximum(oc, 0), mask = ev, other = -1) == q
                 else:                                                        # is it this entry's class?
                     holds = x == oc
-                mass = tl.where(oc >= 0, tl.where(holds, own, float("-inf")),
-                                tl.load(masses + x, mask = ev, other = float("-inf")))
-                ov = tl.load(op + sl, mask = ev, other = float("-inf"))
+                vm = real[:, None] & ev[None, :]
+                mass = tl.where((oc >= 0)[None, :], tl.where(holds[None, :], own, float("-inf")),
+                                tl.load(masses + x[None, :], mask = vm & (oc < 0)[None, :], other = float("-inf")))
+                ov = tl.load(op + sl[None, :], mask = vm, other = float("-inf"))
                 mx, acc = _lse_step_one_exp(mx, acc, mass + ov)
         val = _lse_value(mx, acc)
         if COMPACT:
-            val = tl.where(ml, val, float("-inf"))
-        _store_flows(cp, idx, val, m, add)
+            val = tl.where(ml[None, :], val, float("-inf"))
+        _store_flows(out, 0, val, om, add)
 
 
 @triton_jit
 def _block_input_top_down_kernel(element_flows, temp_flows, node_flows, node_mars, obs_class, next_col, class_mars,
                                 mass_row, mass_stride, trans, trans_stride, entry_ptr, entry_succ, entry_x, width,
                                 iv_of, iv_info, iv_table, once_iv, live, lanes, lane_first, lane_live, coff, ccount,
-                                cstart, ccolumns, crank, children, children_idx, ptr, parents, reg_offset, reg_width,
+                                cstart, ccolumns, crank, children, tiles, ptr, parents, reg_offset, reg_width,
                                 reg_first, out_first, out_width, temp_width, B, n, W, C, input_start, csteps, pid0,
                                 C_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, GROUPED: tl.constexpr,
                                 PRUNE: tl.constexpr, ORDERED: tl.constexpr, COMPACT: tl.constexpr,
-                                C_FULL: tl.constexpr, OUT_FULL: tl.constexpr, INDEXED: tl.constexpr,
-                                SAMPLE: tl.constexpr, TILE: tl.constexpr):
+                                C_FULL: tl.constexpr, OUT_FULL: tl.constexpr, SAMPLE: tl.constexpr, TN: tl.constexpr,
+                                SUBS: tl.constexpr, TILE: tl.constexpr):
     """The left operand ``L`` over ``[t0, t)`` of ``block @ input`` steps (output over ``[t0, t + 1)``): ``O_L[i, q] =
     log sum over the parents and over the entries ``(successor, class)`` of ``q`` at boundary ``t`` of mass +
-    O_out[i, successor]``. ``ORDERED``, ``COMPACT``, ``SAMPLE``: as :func:`_input_block_top_down_kernel`."""
-    c = _child(children_idx, tl.program_id(0), INDEXED)
+    O_out[i, successor]``. Node tiles, ``ORDERED``, ``COMPACT``, ``SAMPLE``: as :func:`_input_block_top_down_kernel`."""
+    c, real, c0 = _tile_rows(tiles, tl.program_id(0), TN, SUBS)
     tile = pid0 + tl.program_id(1)
     row = tl.load(children + c * 4 + 0)
     reg = tl.load(children + c * 4 + 1)
-    add = tl.load(children + c * 4 + 2)
+    add = tl.load(children + c0 * 4 + 2)                                     # (the tile's: one for all)
     p0 = tl.load(ptr + c)
-    p1 = tl.load(ptr + c + 1)
-    t0 = tl.load(parents + p0 * 7 + 3)
-    t = tl.load(parents + p0 * 7 + 5)
-    M = tl.load(width + t)                                                   # the child's exit columns
+    f0 = tl.load(ptr + c0)
+    t0 = tl.load(parents + f0 * 7 + 3)
+    t = tl.load(parents + f0 * 7 + 5)
+    M = tl.load(width + t)                                                   # the children's exit columns
     X = _exit_width(width, t + 1, n)                                         # the parents' exit columns
     S, cpos, pairs = _interval(iv_of, iv_info, t0, t, n)
     OS, opos, _ = _interval(iv_of, iv_info, t0, t + 1, n)
@@ -325,10 +340,13 @@ def _block_input_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
         dead = False
     else:
         ncols = B * S
-        idx, m, ml, dead = _child_lanes(tile, B, S, reg, lanes, lane_first, lane_live, TILE, ORDERED)
+        idx, m, ml, dead = _child_lanes(tile, B, S, tl.load(children + c0 * 4 + 1), lanes, lane_first, lane_live,
+                                        TILE, ORDERED)
+    out = cp[:, None] + idx[None, :]
+    om = real[:, None] & m[None, :]
     if dead:                                                                 # ORDERED: no live lane in the tile
         if add == 0:
-            tl.store(cp + idx, tl.full([TILE], float("-inf"), dtype = tl.float32), mask = m)
+            tl.store(out, tl.full([TN, TILE], float("-inf"), dtype = tl.float32), mask = om)
     elif tile * TILE < ncols:
         if COMPACT:
             b, i, q = _lane_ends(coff, ccount, cstart, ccolumns, kc, t0, t, idx, m, B, n, csteps)
@@ -342,49 +360,52 @@ def _block_input_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
             if not ORDERED:
                 ml = _live_lanes(live, m, b, t0, i, t, q, n, W, PRUNE)
         oc = tl.load(obs_class + b * n + t, mask = m, other = -1)
-        mx = tl.full([TILE], float("-inf"), dtype = tl.float32)
-        acc = tl.zeros([TILE], dtype = tl.float32)
-        for p in range(p0, p1):
+        # an observed token: its own log-probability, then the output at the column its class leads to
+        obs = ml & (oc >= 0)
+        s = tl.load(next_col + (t * W + q) * C + oc, mask = obs, other = -1)
+        s = tl.where(end & (s >= 0), 0, s)
+        so = _parent_lane(_slot(iv_table, opos, i, s, X, obs, OUT_FULL), b, once, coff, ccount, crank, kp, t0, i, t + 1,
+                          s, obs, B, n, W, COMPACT)
+        miss = ml & (oc < 0)                                                 # a missing token: every entry (successor,
+        any_miss = tl.max(tl.where(miss, 1, 0), axis = 0) > 0                # mass) of q
+        e0 = tl.load(entry_ptr + t * (W + 1) + q, mask = miss, other = 0)
+        e1 = tl.load(entry_ptr + t * (W + 1) + q + 1, mask = miss, other = 0)
+        mx = tl.full([TN, TILE], float("-inf"), dtype = tl.float32)
+        acc = tl.zeros([TN, TILE], dtype = tl.float32)
+        for r in range(0, tl.load(ptr + c0 + 1) - f0):
+            p = p0 + r
             u = tl.load(parents + p * 7 + 4).to(tl.int64)
-            own = tl.load(node_mars + u * B + b, mask = m, other = float("-inf"))
+            own = tl.load(node_mars + u[:, None] * B + b[None, :], mask = om & obs[None, :], other = float("-inf"))
             op = _out_flows_ptr(tl.load(parents + p * 7 + 0), element_flows, temp_flows, out_first, out_width,
-                                temp_width, OUT_TEMP) + _parent_base(b, ostride, COMPACT)
-            # an observed token: its own log-probability, then the output at the column its class leads to
-            obs = ml & (oc >= 0)
-            s = tl.load(next_col + (t * W + q) * C + oc, mask = obs, other = -1)
-            s = tl.where(end & (s >= 0), 0, s)
-            sl = _parent_lane(_slot(iv_table, opos, i, s, X, obs, OUT_FULL), b, once, coff, ccount, crank, kp, t0,
-                              i, t + 1, s, obs, B, n, W, COMPACT)
-            ov = tl.load(op + sl, mask = obs & (sl >= 0), other = float("-inf"))
-            mx, acc = _lse_step_one_exp(mx, acc, tl.where(obs, own + ov, float("-inf")))
-            # a missing token: every entry (successor, mass) of q
-            miss = ml & (oc < 0)
-            if tl.max(tl.where(miss, 1, 0), axis = 0) > 0:
+                                temp_width, OUT_TEMP)[:, None] + _parent_base(b, ostride, COMPACT)[None, :]
+            ov = tl.load(op + so[None, :], mask = real[:, None] & (obs & (so >= 0))[None, :], other = float("-inf"))
+            mx, acc = _lse_step_one_exp(mx, acc, tl.where(obs[None, :], own + ov, float("-inf")))
+            if any_miss:
                 if GROUPED:
-                    masses = trans + tl.load(parents + p * 7 + 6).to(tl.int64)
+                    masses = (trans + tl.load(parents + p * 7 + 6).to(tl.int64))[:, None]
                     if SAMPLE:                                               # (the lane's sample's)
-                        masses = masses + tl.where(tl.load(mass_stride + (u - input_start)) > 0, b * trans_stride, 0)
+                        masses = masses + tl.where((tl.load(mass_stride + (u - input_start)) > 0)[:, None],
+                                                   b[None, :] * trans_stride, 0)
                 else:
-                    masses = class_mars + tl.load(mass_row + (u - input_start)).to(tl.int64) * C
+                    masses = (class_mars + tl.load(mass_row + (u - input_start)).to(tl.int64) * C)[:, None]
                     if SAMPLE:
-                        masses = masses + b * tl.load(mass_stride + (u - input_start)).to(tl.int64) * C
-                e0 = tl.load(entry_ptr + t * (W + 1) + q, mask = miss, other = 0)
-                e1 = tl.load(entry_ptr + t * (W + 1) + q + 1, mask = miss, other = 0)
+                        masses = masses + b[None, :] * \
+                            (tl.load(mass_stride + (u - input_start)).to(tl.int64) * C)[:, None]
                 for k in range(0, tl.max(e1 - e0, axis = 0)):
                     em = miss & (e0 + k < e1)
                     s = tl.load(entry_succ + e0 + k, mask = em, other = -1)
                     s = tl.where(end & (s >= 0), 0, s)
                     sl = _parent_lane(_slot(iv_table, opos, i, s, X, em, OUT_FULL), b, once, coff, ccount, crank,
                                       kp, t0, i, t + 1, s, em, B, n, W, COMPACT)
-                    ev = em & (sl >= 0)                                      # a live parent lane: else nothing read
-                    ov = tl.load(op + sl, mask = ev, other = float("-inf"))
-                    mass = tl.load(masses + tl.load(entry_x + e0 + k, mask = ev, other = 0), mask = ev,
-                                   other = float("-inf"))
+                    vm = real[:, None] & (em & (sl >= 0))[None, :]           # a live parent lane: else nothing read
+                    ov = tl.load(op + sl[None, :], mask = vm, other = float("-inf"))
+                    mass = tl.load(masses + tl.load(entry_x + e0 + k, mask = em & (sl >= 0), other = 0)[None, :],
+                                   mask = vm, other = float("-inf"))
                     mx, acc = _lse_step_one_exp(mx, acc, mass + ov)
         val = _lse_value(mx, acc)
         if COMPACT:
-            val = tl.where(ml, val, float("-inf"))
-        _store_flows(cp, idx, val, m, add)
+            val = tl.where(ml[None, :], val, float("-inf"))
+        _store_flows(out, 0, val, om, add)
 
 
 @triton.jit
@@ -758,6 +779,14 @@ def _block_block_top_down_compact_kernel(element_flows, temp_flows, node_flows, 
         _store_flows(cp, pr[:, None].to(tl.int64) * cc_ + pc[None, :], tl.where(valid, tot, float("-inf")), om, add)
 
 
+#: children (of a node tile) and (children x lanes) per program of the ``input @ block`` and ``block @ input``
+#: top-down kernels, at most, and its warps: many small programs (Codpula diffusion, 4096 latents: 8 x 16 lanes 0.92
+#: ms per call, 16 x 16 1.09, 16 x 64 1.89; 1 x 128, every child its own walk, 2.46)
+TOP_DOWN_NODES = 8
+TOP_DOWN_TILE_LANES = 128
+TOP_DOWN_WARPS = 4
+
+
 def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_flows, node_mars, masses, obs_class,
                 live, elem_first: int, elem_width: int, B: int, prior: dict, skip, exact: bool, once_iv: torch.Tensor,
                 lanes = None, compact = None, tflow_width = None, inside_regions = None, inside: bool = False):
@@ -802,8 +831,8 @@ def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_
         lists = dict(coff = cl.off, ccount = cl.count, cstart = cl.start, ccolumns = cl.columns, csteps = cl.steps)
     else:
         lists = dict(coff = live, ccount = live, cstart = live, ccolumns = live, csteps = 0)
-    for la, idx in launches:
-        idx = tensor(idx)
+    for la, item in launches:
+        idx = tensor(item)
         Cn = la.children.size(0) if idx is None else idx.numel()
         indexed = dict(children_idx = la.children if idx is None else idx, INDEXED = idx is not None)
         lanes_max = compact.lanes(la.host["child_ivs"]) if compact is not None else B * la.S_max   # a child's most
@@ -819,21 +848,23 @@ def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_
         elif la.form in ("input_block", "block_input"):
             c_kind, out_temp, (c_full, out_full) = la.kinds
             ordered = prune and lanes is not None and c_kind == SUM and compact is None
-            tile = _flat_tile(max(lanes_max, 1))
+            tiles, height = (la.tiles, la.tile_height) if idx is None else (idx, item.height)
+            tn = min(height, TOP_DOWN_NODES)
+            tile = max(16, min(_flat_tile(max(lanes_max, 1)), TOP_DOWN_TILE_LANES // tn))
             kernel = _input_block_top_down_kernel if la.form == "input_block" else _block_input_top_down_kernel
             tables = (tt.pred_ptr, tt.pred_col, tt.pred_x) if la.form == "input_block" else \
                 (tt.entry_ptr, tt.entry_succ, tt.entry_x)
             for first, size in grid_chunks(host_cdiv(lanes_max, tile), 1):
-                kernel[(Cn, size)](
+                kernel[(tiles.numel() // NODE_TILE * (height // tn), size)](
                     element_flows, temp_flows, node_flows, node_mars, obs_class, prog.next_col, masses.table,
                     masses.row, masses.stride if sample else masses.row, trans, prog.trans_size, *tables, prog.width_t,
                     ivs.of, ivs.info, ivs.table, once_iv, live,
                     *(lanes if ordered else (live, live, live)), crank = compact.rank if compact is not None else live,
-                    children = la.children, ptr = la.ptr, parents = la.parents, B = B, n = n, W = W, C = C,
-                    input_start = prog.input_start, pid0 = first, C_KIND = c_kind, OUT_TEMP = out_temp,
+                    children = la.children, tiles = tiles, ptr = la.ptr, parents = la.parents, B = B, n = n, W = W,
+                    C = C, input_start = prog.input_start, pid0 = first, C_KIND = c_kind, OUT_TEMP = out_temp,
                     GROUPED = grouped, PRUNE = prune, ORDERED = ordered, COMPACT = compact is not None,
-                    C_FULL = c_full, OUT_FULL = out_full, SAMPLE = sample, TILE = tile, num_warps = 4, **indexed,
-                    **common, **lists)
+                    C_FULL = c_full, OUT_FULL = out_full, SAMPLE = sample, TN = tn, SUBS = height // tn, TILE = tile,
+                    num_warps = TOP_DOWN_WARPS, **common, **lists)
         elif compact is not None:                    # block @ block on compact values, a sample's rectangle at a time
             c_kind, o_kind, out_temp = la.kinds
             ends = prog.iv_ends_np[la.host["child_ivs"]]

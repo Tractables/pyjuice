@@ -15,7 +15,7 @@ import numpy as np
 import torch
 from numba import njit
 
-from ..kernels.common import IndexList, SUM, TEMP, pack_aligned
+from ..kernels.common import IndexList, SUM, TEMP, node_tiles, pack_aligned
 from ..kernels.prod import Cut, Launch
 
 
@@ -27,8 +27,8 @@ class IndexLists:
     def __init__(self):
         self.items = []
 
-    def add(self, idx) -> IndexList:
-        item = IndexList(idx)
+    def add(self, idx, height: Optional[int] = None) -> IndexList:
+        item = IndexList(idx, height)
         self.items.append(item)
         return item
 
@@ -691,6 +691,11 @@ def _top_down_steps(td, t, index, m, scoring: bool, lists: IndexLists) -> list:
     def selection(modes, mode, count):
         return None if count == modes.size else lists.add(np.nonzero(modes == mode)[0])
 
+    def tiled(la, modes, mode, count):                 # (a walk kernel's: in node tiles)
+        if la.form not in ("input_block", "block_input"):
+            return selection(modes, mode, count)
+        return None if count == modes.size else lists.add(*node_tiles(la.host["group"], np.nonzero(modes == mode)[0]))
+
     out = [None] * len(td.steps)
     for si, (kind, pi, layers) in enumerate(td.steps):
         layers_out = []
@@ -704,12 +709,12 @@ def _top_down_steps(td, t, index, m, scoring: bool, lists: IndexLists) -> list:
                         for mode, lst in ((1, once_l), (0, sample_l)):
                             if unit_count[u][mode]:
                                 modes = child_mode[child_ptr[u]:child_ptr[u + 1]]
-                                lst.append((la, selection(modes, mode, unit_count[u][mode])))
+                                lst.append((la, tiled(la, modes, mode, unit_count[u][mode])))
                     for k, cw in enumerate(cws if scoring else ()):
                         w = w0 + k
                         if cw_count[w]:
                             sel = dest_sel[dest_ptr[w]:dest_ptr[w + 1]]
-                            cw_l.append((cw, selection(sel, 1, cw_count[w])))
+                            cw_l.append((cw, tiled(cw, sel, 1, cw_count[w])))
                     stages_out.append((once_l, sample_l, cw_l))
                 folds_out = ([], [])
                 for launches, ids in zip(fold_stages, fold_ids):

@@ -86,8 +86,9 @@ class TopDownPlan:
     """
     The top-down pass of a query (:func:`top_down_plan`), from the :class:`~.top_down_program.TopDownProgram`'s tables:
     every launch the query runs, as ``(launch or tables, index list)`` -- the int32 device list of the children (child
-    blocks) it computes, or None for all -- split in two, ``(once, sample)``: the values kept once, for a batch of one
-    in ``prior_flows``, and the per-sample ones.
+    blocks) it computes, or None for all; for the walk kernels' launches (``input_block`` / ``block_input`` and class
+    weights) the children (destinations) in node tiles (:func:`~.common.node_tiles`) -- split in two, ``(once,
+    sample)``: the values kept once, for a batch of one in ``prior_flows``, and the per-sample ones.
 
     :ivar steps: from the top down, ``("sum", prod_index, [(block_size, (once, sample) dense runs, (once, sample)
         fused [(child block size, tables, index list)])])`` and ``("prod", prod_index, [((once, sample) fold stages,

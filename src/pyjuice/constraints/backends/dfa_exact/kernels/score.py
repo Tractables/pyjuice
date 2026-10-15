@@ -35,8 +35,8 @@ from pyjuice.constraints.distributions import find_token
 from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
-from .common import (IDENTITY, _block_ptr, _child, _exit_width, _interval, _logaddexp_tile, _lse_step, _slot,
-                     grid_chunks, tensor)
+from .common import (IDENTITY, NODE_TILE, _block_ptr, _exit_width, _interval, _logaddexp_tile, _lse_step, _slot,
+                     _tile_rows, grid_chunks, node_groups, node_tiles, tensor)
 from .prod_top_down import _once, _out_flows_ptr, _parent_base, _parent_lane
 from .sum import _num_sms
 
@@ -119,7 +119,10 @@ class ClassWeightLaunch:
     :ivar ptr: int32 [D + 1], every destination's steps in ``parents``
     :ivar parents: int32 [P, 7], the forward step rows (see :mod:`.prod`), every destination's contiguous
     :ivar J_max: the most exit columns (``input_block``) or entry columns (``block_input``) of the outputs
-    :ivar host: for query plans, numpy copies of ``dests``, ``ptr`` and ``parents``
+    :ivar host: for query plans, numpy copies of ``dests``, ``ptr`` and ``parents``, and every destination's node tile
+        ``group`` (:func:`~.common.node_groups`: its position, and its steps' other boundaries in order)
+    :ivar tiles, tile_height: every destination in node tiles (int32 on the device) and their height
+        (:func:`~.common.node_tiles`) -- a query plan's lists of destinations are tiles too
     """
 
     form: str
@@ -129,6 +132,8 @@ class ClassWeightLaunch:
     parents: torch.Tensor
     J_max: int
     host: Any
+    tiles: torch.Tensor
+    tile_height: int
 
 
 def class_weight_launch(launch, alive: np.ndarray, prog, score: ScoreTables) -> "ClassWeightLaunch | None":
@@ -150,9 +155,15 @@ def class_weight_launch(launch, alive: np.ndarray, prog, score: ScoreTables) -> 
         J = np.where(rows[:, 5] == prog.n, 1, np.asarray(prog.width)[rows[:, 5]])
     else:                                                                      # entry columns at t0
         J = np.asarray(prog.width)[rows[:, 3]]
+    count = np.diff(ptr)                                    # destinations walking the same columns, together: at
+    other = np.full((len(starts), int(count.max())), -1, dtype = np.int64)   # one position, steps to the same ends
+    other[np.repeat(np.arange(len(starts)), count), np.arange(len(t)) - np.repeat(starts, count)] = \
+        rows[:, 5 if launch.form == "input_block" else 3]
+    group = node_groups(dests[:, 0], other)
+    tiles, height = node_tiles(group)
     i32 = lambda x: torch.from_numpy(np.ascontiguousarray(x)).to(prog.dev, torch.int32)
     return ClassWeightLaunch(launch.form, launch.kinds, i32(dests), i32(ptr), i32(rows), int(J.max()),
-                             dict(dests = dests, ptr = ptr, parents = rows))
+                             dict(dests = dests, ptr = ptr, parents = rows, group = group), i32(tiles), height)
 
 
 @triton.jit
@@ -201,27 +212,29 @@ def _walk_slots(iv_table, positions, i, other, ncols, ok, om, I_FIRST: tl.conste
 @triton_jit
 def _class_weight_kernel(dfa_class_flow, cw_base, cw_K, element_flows, temp_flows, node_mars, prior_mars, temp,
                          next_col, width, iv_of, iv_info, iv_table, once_iv, count, start, columns, coff, crank, dests,
-                         dests_idx, ptr, parents, reg_offset, reg_width, reg_first, prior_offset, prior_width,
-                         reg_prior, out_first, out_width, temp_width, tflow_width, B, n, W, C, pid0,
-                         BLOCK_INPUT: tl.constexpr, S_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, PRUNE: tl.constexpr,
-                         OUT_FULL: tl.constexpr, S_FULL: tl.constexpr, INDEXED: tl.constexpr, UNIFORM: tl.constexpr,
-                         COMPACT: tl.constexpr, MARS: tl.constexpr, TB: tl.constexpr, TC: tl.constexpr,
-                         TJ: tl.constexpr):
-    """One program per (destination, ``TB`` samples, ``TC`` classes), a lane per (sample, class): the log class
-    weights of its steps' inputs (see the module docstring) -- a walk over the columns ``i`` of the input's boundary,
-    then over the other boundary's columns ``TJ`` at a time -- log-added to ``dfa_class_flow`` at the destination's
-    position block (``cw_base``, ``cw_K`` per position). Under evidence pruning every lane walks only its sample's live
-    columns (``count`` / ``start`` / ``columns``, see :meth:`~.live.Liveness.lists`; every term through another is
-    -inf): a wide automaton pinned by its evidence to a few columns costs a few steps, not one per column. ``UNIFORM``
-    (see :func:`_walk_column`; ``TB`` 1 under pruning): the program's lanes walk the same columns. ``COMPACT``: the
+                         tiles, ptr, parents, reg_offset, reg_width, reg_first, prior_offset, prior_width, reg_prior,
+                         out_first, out_width, temp_width, tflow_width, B, n, W, C, pid0, BLOCK_INPUT: tl.constexpr,
+                         S_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, PRUNE: tl.constexpr, OUT_FULL: tl.constexpr,
+                         S_FULL: tl.constexpr, UNIFORM: tl.constexpr, COMPACT: tl.constexpr, MARS: tl.constexpr,
+                         TN: tl.constexpr, SUBS: tl.constexpr, TB: tl.constexpr, TC: tl.constexpr, TJ: tl.constexpr):
+    """One program per (``TN`` destinations of a node tile, ``TB`` samples, ``TC`` classes), a lane per (sample,
+    class): the log class weights of its steps' inputs (see the module docstring) -- a walk over the columns ``i`` of
+    the input's boundary, then over the other boundary's columns ``TJ`` at a time -- log-added to ``dfa_class_flow``
+    at the destination's position block (``cw_base``, ``cw_K`` per position). A node tile's destinations (see
+    :func:`~.common.node_tiles`) are at one position, with steps to the same other boundaries: they walk the same
+    columns, once for all of them. Under evidence pruning every lane walks only its sample's live columns (``count``
+    / ``start`` / ``columns``, see :meth:`~.live.Liveness.lists`; every term through another is -inf): a wide
+    automaton pinned by its evidence to a few columns costs a few steps, not one per column. ``UNIFORM`` (see
+    :func:`_walk_column`; ``TB`` 1 under pruning): the program's lanes walk the same columns. ``COMPACT``: the
     outputs' top-down values compact (:mod:`.compact`; ``tflow_width`` the scratch rows' width there, ``temp_width``
     their inside values'); ``MARS``: the other operands' inside values too (by the same layout)."""
-    d = _child(dests_idx, tl.program_id(0), INDEXED)
+    d, real, d0 = _tile_rows(tiles, tl.program_id(0), TN, SUBS)
     lane = tl.arange(0, TB * TC)
     b = ((pid0 + tl.program_id(1)) * TB + lane // TC).to(tl.int64)
     cls = tl.program_id(2) * TC + lane % TC
     cm = (b < B) & (cls < C)
-    t = tl.load(dests + d * 2)
+    vm = real[:, None, None] & cm[None, :, None]                               # (destination, lane, column)
+    t = tl.load(dests + d0 * 2)
     k = tl.load(dests + d * 2 + 1)
     end = t + 1 == n
     M = tl.load(width + t).to(tl.int32)
@@ -239,12 +252,17 @@ def _class_weight_kernel(dfa_class_flow, cw_base, cw_K, element_flows, temp_flow
         ccount = 0
         cstart = 0
         steps = M
-    mx = tl.full([TB * TC, TJ], float("-inf"), dtype = tl.float32)
-    acc = tl.zeros([TB * TC, TJ], dtype = tl.float32)
-    for p in range(tl.load(ptr + d), tl.load(ptr + d + 1)):
-        out_row = tl.load(parents + p * 7 + 0)
+    mx = tl.full([TN, TB * TC, TJ], float("-inf"), dtype = tl.float32)
+    acc = tl.zeros([TN, TB * TC, TJ], dtype = tl.float32)
+    p0 = tl.load(ptr + d)
+    f0 = tl.load(ptr + d0)
+    for r in range(0, tl.load(ptr + d0 + 1) - f0):
+        p = p0 + r
+        f = f0 + r                                                             # (the tile's first destination's step)
+        op = _out_flows_ptr(tl.load(parents + p * 7 + 0), element_flows, temp_flows, out_first, out_width,
+                            tflow_width, OUT_TEMP)[:, None, None]
         if BLOCK_INPUT:                                                        # a block over [t0, t), then the input
-            t0 = tl.load(parents + p * 7 + 3)
+            t0 = tl.load(parents + f * 7 + 3)
             E = tl.load(width + t0)
             X = _exit_width(width, t + 1, n)
             OS, opos, _ = _interval(iv_of, iv_info, t0, t + 1, n)
@@ -252,12 +270,11 @@ def _class_weight_kernel(dfa_class_flow, cw_base, cw_K, element_flows, temp_flow
             once = _once(once_iv, iv_of, t0, t + 1, n)
             ostride = tl.where(once, 0, OS)
             kp = tl.load(iv_of + t0 * (n + 1) + t + 1)
-            op = _out_flows_ptr(out_row, element_flows, temp_flows, out_first, out_width, tflow_width, OUT_TEMP) + \
-                _parent_base(b, ostride, COMPACT)
+            op = op + _parent_base(b, ostride, COMPACT)[None, :, None]
             lp, l_own = _block_ptr(tl.load(parents + p * 7 + 1), tl.load(parents + p * 7 + 2), node_mars, prior_mars,
                                    temp, reg_offset, reg_width, reg_first, prior_offset, prior_width, reg_prior,
                                    temp_width, S_KIND)
-            lp = lp + _parent_base(b, tl.where(l_own, LS, 0), MARS)
+            lp = lp[:, None, None] + _parent_base(b[None, :], tl.where(l_own, LS, 0)[:, None], MARS)[:, :, None]
             kl = tl.load(iv_of + t0 * (n + 1) + t)
             for ii in range(0, steps):
                 i, ok = _walk_column(columns, cstart, ccount, cm, ii, PRUNE, UNIFORM)
@@ -271,30 +288,30 @@ def _class_weight_kernel(dfa_class_flow, cw_base, cw_K, element_flows, temp_flow
                     else:
                         ir = i[:, None]
                     sl = _parent_lane(_walk_slots(iv_table, lpos, i, i0, M, ok, i0 < E, False, S_FULL, UNIFORM),
-                                      b[:, None], ~l_own, coff, count, crank, kl, t0, i0[None, :], t, ir, m1, B, n, W,
-                                      MARS)
-                    lv = tl.load(lp[:, None] + sl, mask = m1 & (sl >= 0), other = float("-inf"))   # L[i0, i]
+                                      b[:, None], (~l_own)[:, None, None], coff, count, crank, kl, t0, i0[None, :], t,
+                                      ir, m1, B, n, W, MARS)                   # (a block kept once: its slot)
+                    lv = tl.load(lp + sl, mask = vm & m1[None, :, :] & (sl >= 0), other = float("-inf"))   # L[i0, i]
                     m2 = (ok & (q >= 0))[:, None] & (i0 < E)[None, :]
                     so = _parent_lane(_slot(iv_table, opos, i0[None, :], q[:, None], X, m2, OUT_FULL), b[:, None],
                                       once, coff, count, crank, kp, t0, i0[None, :], t + 1, q[:, None], m2, B, n, W,
                                       COMPACT)
-                    ov = tl.load(op[:, None] + so, mask = m2 & (so >= 0), other = float("-inf"))   # O_out[i0, next]
+                    ov = tl.load(op + so[None, :, :], mask = vm & (m2 & (so >= 0))[None, :, :],
+                                 other = float("-inf"))                        # O_out[i0, next]
                     mx, acc = _lse_step(mx, acc, lv + ov)
         else:                                                                  # the input, then a block over [t+1, t2)
-            t2 = tl.load(parents + p * 7 + 5)
+            t2 = tl.load(parents + f * 7 + 5)
             X = _exit_width(width, t2, n)
             OS, opos, _ = _interval(iv_of, iv_info, t, t2, n)
             once = _once(once_iv, iv_of, t, t2, n)
             ostride = tl.where(once, 0, OS)
             kp = tl.load(iv_of + t * (n + 1) + t2)
-            op = _out_flows_ptr(out_row, element_flows, temp_flows, out_first, out_width, tflow_width, OUT_TEMP) + \
-                _parent_base(b, ostride, COMPACT)
+            op = op + _parent_base(b, ostride, COMPACT)[None, :, None]
             if S_KIND != 2:
                 RS, rpos, _ = _interval(iv_of, iv_info, t + 1, t2, n)
                 rp, r_own = _block_ptr(tl.load(parents + p * 7 + 3), tl.load(parents + p * 7 + 4), node_mars,
                                        prior_mars, temp, reg_offset, reg_width, reg_first, prior_offset, prior_width,
                                        reg_prior, temp_width, S_KIND)
-                rp = rp + _parent_base(b, tl.where(r_own, RS, 0), MARS)
+                rp = rp[:, None, None] + _parent_base(b[None, :], tl.where(r_own, RS, 0)[:, None], MARS)[:, :, None]
                 kr = tl.load(iv_of + (t + 1) * (n + 1) + t2)
             for ii in range(0, steps):
                 i, ok = _walk_column(columns, cstart, ccount, cm, ii, PRUNE, UNIFORM)
@@ -304,8 +321,9 @@ def _class_weight_kernel(dfa_class_flow, cw_base, cw_K, element_flows, temp_flow
                     qm = ok & (q >= 0)
                     so = _parent_lane(_slot(iv_table, opos, i, jq, X, qm, OUT_FULL), b, once, coff, count, crank, kp,
                                       t, i, t2, jq, qm, B, n, W, COMPACT)
-                    ov = tl.load(op + so, mask = qm & (so >= 0), other = float("-inf"))
-                    mx, acc = _lse_step(mx, acc, ov[:, None] + tl.zeros([TB * TC, TJ], dtype = tl.float32))
+                    ov = tl.load(op + so[None, :, None], mask = vm & (qm & (so >= 0))[None, :, None],
+                                 other = float("-inf"))
+                    mx, acc = _lse_step(mx, acc, ov + tl.zeros([TN, TB * TC, TJ], dtype = tl.float32))
                 else:
                     for j0 in range(0, X, TJ):
                         j = j0 + tl.arange(0, TJ)
@@ -317,22 +335,28 @@ def _class_weight_kernel(dfa_class_flow, cw_base, cw_K, element_flows, temp_flow
                         so = _parent_lane(_walk_slots(iv_table, opos, i, j, X, ok, j < X, True, OUT_FULL, UNIFORM),
                                           b[:, None], once, coff, count, crank, kp, t, ir, t2, j[None, :], mo, B, n, W,
                                           COMPACT)
-                        ov = tl.load(op[:, None] + so, mask = mo & (so >= 0), other = float("-inf"))   # O_out[i, j]
+                        ov = tl.load(op + so[None, :, :], mask = vm & (mo & (so >= 0))[None, :, :],
+                                     other = float("-inf"))                    # O_out[i, j]
                         m2 = (ok & (q >= 0))[:, None] & (j < X)[None, :]
                         sr = _parent_lane(_slot(iv_table, rpos, q[:, None], j[None, :], X, m2, S_FULL), b[:, None],
-                                          ~r_own, coff, count, crank, kr, t + 1, q[:, None], t2, j[None, :], m2, B, n,
-                                          W, MARS)
-                        rv = tl.load(rp[:, None] + sr, mask = m2 & (sr >= 0), other = float("-inf"))   # R[next, j]
+                                          (~r_own)[:, None, None], coff, count, crank, kr, t + 1, q[:, None], t2,
+                                          j[None, :], m2, B, n, W, MARS)       # (a block kept once: its slot)
+                        rv = tl.load(rp + sr, mask = vm & m2[None, :, :] & (sr >= 0),
+                                     other = float("-inf"))                    # R[next, j]
                         mx, acc = _lse_step(mx, acc, ov + rv)
-    top = tl.max(mx, axis = 1)
+    top = tl.max(mx, axis = 2)
     shift = tl.where(top == float("-inf"), 0.0, top)
-    val = tl.log(tl.sum(acc * tl.exp(mx - shift[:, None]), axis = 1)) + shift
-    dest = dfa_class_flow + tl.load(cw_base + t) + (b * C + cls) * tl.load(cw_K + t) + k
-    tl.store(dest, _logaddexp_tile(tl.load(dest, mask = cm, other = float("-inf")), val), mask = cm)
+    val = tl.log(tl.sum(acc * tl.exp(mx - shift[:, :, None]), axis = 2)) + shift
+    dest = dfa_class_flow + tl.load(cw_base + t) + ((b * C + cls) * tl.load(cw_K + t))[None, :] + k[:, None]
+    dm = real[:, None] & cm[None, :]
+    tl.store(dest, _logaddexp_tile(tl.load(dest, mask = dm, other = float("-inf")), val), mask = dm)
 
 
-#: lanes (sample, class) x other-boundary columns per :func:`_class_weight_kernel` program, at most
-CLASS_WEIGHT_LANES = 2048
+#: destinations (of a node tile), and destinations x lanes (sample, class) x other-boundary columns, per
+#: :func:`_class_weight_kernel` program, at most (Codpula diffusion, 4096 latents: 16 x 32 lanes 1.09 ms per call,
+#: 8 x 32 1.16, 8 x 128 1.34, 16 x 128 1.65; 1 x 128, every destination its own walk, 2.29)
+CLASS_WEIGHT_NODES = 16
+CLASS_WEIGHT_LANES = 512
 
 
 def run_class_weights(launches, cw: dict, prog, bufs, element_flows, temp_flows, node_mars, liveness, elem_first: int,
@@ -362,25 +386,26 @@ def run_class_weights(launches, cw: dict, prog, bufs, element_flows, temp_flows,
     lists = liveness.lists() if prune else (cw["K"],) * 3
     ctables = (compact.off, compact.rank) if compact is not None else (cw["K"],) * 2
     TC = min(64, host_next_power_of_2(C))
-    for la, idx in launches:
-        idx = tensor(idx)
-        D = la.dests.size(0) if idx is None else idx.numel()
+    for la, item in launches:
+        idx = tensor(item)
+        tiles, height = (la.tiles, la.tile_height) if idx is None else (idx, item.height)
         s_kind, out_temp, (out_full, *s_full) = la.kinds
         identity = la.form == "input_block" and s_kind == IDENTITY
         TJ = 1 if identity else min(64, host_next_power_of_2(la.J_max))
-        TB = max(1, min(host_next_power_of_2(B), 128 // TC, CLASS_WEIGHT_LANES // (TC * TJ)))
-        lanes = TB * TC * TJ
+        TN = min(height, CLASS_WEIGHT_NODES, max(1, CLASS_WEIGHT_LANES // (TC * TJ)))   # (powers of 2)
+        TB = max(1, min(host_next_power_of_2(B), 128 // TC, CLASS_WEIGHT_LANES // (TC * TJ * TN)))
+        lanes = TN * TB * TC * TJ
         warps = 1 if lanes <= 128 else 2 if lanes <= 512 else 4
         for first, size in grid_chunks(host_cdiv(B, TB), 1):
-            _class_weight_kernel[(D, size, host_cdiv(C, TC))](
+            _class_weight_kernel[(tiles.numel() // NODE_TILE * (height // TN), size, host_cdiv(C, TC))](
                 cw["buf"], cw["base"], cw["K"], element_flows, temp_flows, node_mars, prior["mars"], temp,
                 prog.next_col, prog.width_t, ivs.of, ivs.info, ivs.table, once_iv, *lists, *ctables,
-                la.dests, la.dests if idx is None else idx, la.ptr, la.parents, regions["offset"], regions["width"],
-                regions["first"], prior["offset"], prior["width"], prior["reg_prior"], elem_first, elem_width,
-                temp_width, tflow_width, B, n, W, C, first, BLOCK_INPUT = la.form == "block_input", S_KIND = s_kind,
-                OUT_TEMP = out_temp, PRUNE = prune, OUT_FULL = out_full, S_FULL = all(s_full),
-                INDEXED = idx is not None, UNIFORM = not prune or TB == 1, COMPACT = compact is not None,
-                MARS = inside, TB = TB, TC = TC, TJ = TJ, num_warps = warps)
+                la.dests, tiles, la.ptr, la.parents, regions["offset"], regions["width"], regions["first"],
+                prior["offset"], prior["width"], prior["reg_prior"], elem_first, elem_width, temp_width, tflow_width,
+                B, n, W, C, first, BLOCK_INPUT = la.form == "block_input", S_KIND = s_kind, OUT_TEMP = out_temp,
+                PRUNE = prune, OUT_FULL = out_full, S_FULL = all(s_full), UNIFORM = not prune or TB == 1,
+                COMPACT = compact is not None, MARS = inside, TN = TN, SUBS = height // TN, TB = TB, TC = TC, TJ = TJ,
+                num_warps = warps)
 
 
 # -------------------------------------------------------------------------------------------------

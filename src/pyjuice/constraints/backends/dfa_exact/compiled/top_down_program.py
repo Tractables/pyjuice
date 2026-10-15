@@ -20,7 +20,7 @@ import numpy as np
 import torch
 
 from ..external_params import block_scale
-from ..kernels.common import IDENTITY, SUM, TEMP
+from ..kernels.common import IDENTITY, SUM, TEMP, node_groups, node_tiles
 from ..kernels.prod import skip_masks_for
 from ..kernels.prod_top_down import TopDownLaunch
 from ..kernels.score import class_weight_launch, score_tables
@@ -157,9 +157,14 @@ def top_down_program(backend) -> TopDownProgram:
         host = dict(children = np.asarray([[r, g, ad] for (r, g), ad in zip(children, add)], dtype = np.int64),
                     ptr = ptr_np, parents = par.numpy(), parent_iv = parent_iv, child_iv = child_iv,
                     parent_ivs = np.unique(parent_iv), child_ivs = np.unique(child_iv))
+        tiles, height = None, 1
+        if form in ("input_block", "block_input"):                # children walking the same entries, together
+            host["group"] = node_groups(a.numpy()[ptr_np[:-1]], b.numpy()[ptr_np[:-1]], np.diff(ptr_np), add)
+            tiles, height = node_tiles(host["group"])
+            tiles = torch.from_numpy(tiles).to(dev)
         return TopDownLaunch(form, side, okinds, ch, torch.tensor(ptr, dtype = torch.int32, device = dev),
                              par.to(dev, torch.int32).contiguous(), int(entry.max()), int(exit_.max()),
-                             int(slots.max()), host)
+                             int(slots.max()), host, tiles, height)
 
     def out_temp_of(launch):
         return launch.kinds[2] if launch.form == "block_block" else launch.kinds[1]

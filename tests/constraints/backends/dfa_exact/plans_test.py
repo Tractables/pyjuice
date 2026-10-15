@@ -27,10 +27,10 @@ import pyjuice.constraints as jc
 from pyjuice.constraints.backends.dfa_exact.queries import forward as F
 from pyjuice.constraints.backends.dfa_exact.queries import marginal as M
 from pyjuice.constraints.backends.dfa_exact.kernels.live import liveness
-from pyjuice.constraints.backends.dfa_exact.kernels.common import TEMP, IndexList, pack_aligned
+from pyjuice.constraints.backends.dfa_exact.kernels.common import NODE_TILE, TEMP, IndexList, node_tiles, pack_aligned
 from pyjuice.constraints.backends.dfa_exact.kernels.prod import Launch
-from pyjuice.constraints.backends.dfa_exact.queries.plans import (free_regions, per_sample_intervals, prior_regions,
-                                                            query_plan, top_down_free, top_down_prior)
+from pyjuice.constraints.backends.dfa_exact.queries.plans import (TopDownPlan, free_regions, per_sample_intervals,
+                                                            prior_regions, query_plan, top_down_free, top_down_prior)
 
 V = 3
 KINDS = {"hmm": 6, "hmm_untied": 6, "hmm_block_sparse": 6, "left_linear": 6, "pd": 8, "pd_prod_dominated": 8,
@@ -229,6 +229,89 @@ def test_plan_tensors_are_aligned(kind, build_pc):
         cc.conditional(data, missing, missing & (torch.rand(missing.shape, generator = g) < 0.5))
     tensors = [t for plan in prog.plans.values() for t in device_tensors(plan)]
     assert len(tensors) > 0 and all(t.data_ptr() % 16 == 0 for t in tensors)
+
+
+def test_node_tiles():
+    """A walk kernel's rows in node tiles: every selected row once, a tile's rows of one group, first, in order, at
+    most NODE_TILE of them (a longer group goes on in the next tile); the height the most rows of a tile, as 1, 4 or
+    NODE_TILE."""
+    group = np.array([2, 0, 2, 1, 2, 0] + [3] * (NODE_TILE + 1))
+    for sel, height, count in ((None, NODE_TILE, 5), (np.array([5, 0, 2, 3]), 4, 3), (np.array([4]), 1, 1)):
+        tiles, h = node_tiles(group, sel)
+        t = tiles.reshape(-1, NODE_TILE)
+        assert h == height and len(t) == count
+        assert sorted(t[t >= 0].tolist()) == (list(range(group.size)) if sel is None else sorted(sel.tolist()))
+        for row in t:
+            k = int((row >= 0).sum())
+            assert 0 < k <= h and (row[k:] < 0).all() and len(set(group[row[:k]].tolist())) == 1
+            assert (np.diff(row[:k]) > 0).all()
+
+
+def walk_groups(la, rows):
+    """What the rows of a walk kernel's node tile share: a top-down launch's children their interval (as their first
+    parent's ends), number of parents and ``add``; a class weight launch's destinations their position and their
+    steps' other boundaries, in order."""
+    h = la.host
+    ptr, par = h["ptr"], h["parents"]
+    if hasattr(la, "children"):
+        ends = (2, 5) if la.form == "input_block" else (3, 5)
+        return [(tuple(par[ptr[c], list(ends)].tolist()), int(ptr[c + 1] - ptr[c]), int(h["children"][c, 2]))
+                for c in rows]
+    other = 5 if la.form == "input_block" else 3
+    return [(int(h["dests"][d, 0]), tuple(par[ptr[d]:ptr[d + 1], other].tolist())) for d in rows]
+
+
+def check_tiles(la, tiles, height):
+    """The rows of node tiles (int32, as a launch or plan holds them), each tile's sharing :func:`walk_groups`."""
+    t = tiles.reshape(-1, NODE_TILE)
+    assert (t[:, height:] < 0).all() and (t[:, 0] >= 0).all()
+    rows = []
+    for row in t:
+        row = row[row >= 0].tolist()
+        assert len(set(walk_groups(la, row))) == 1
+        rows += row
+    assert len(rows) == len(set(rows))
+    return set(rows)
+
+
+@pytest.mark.parametrize("kind", list(KINDS))
+def test_walk_launches_run_node_tiles(kind, build_pc):
+    """The walk kernels' launches (``input @ block`` / ``block @ input`` top-down, class weights) hold every child
+    (destination) once in node tiles of children walking the same entries; a scoring plan's lists of them are node
+    tiles too, a child (destination) in at most one of a launch's (computed once or per sample)."""
+    cc, n = compiled(build_pc, kind)
+    prog, td = cc.backend.program(), cc.backend.top_down_program()
+    walks = [la for kind_, _, layers in td.steps if kind_ == "prod" for _, stages, _, _ in layers
+             for launches, _, _, cws in stages for la in list(launches) + list(cws)
+             if la.form in ("input_block", "block_input")]
+    assert walks
+    for la in walks:
+        rows = len(la.host["children"] if hasattr(la, "children") else la.host["dests"])
+        assert check_tiles(la, la.tiles.cpu().numpy(), la.tile_height) == set(range(rows))
+    data, missing = prefixes(n, [n // 2, 1, 0])
+    g = torch.Generator().manual_seed(0)
+    lists = 0
+    for _ in range(4):
+        cc.conditional(data, missing, missing & (torch.rand(missing.shape, generator = g) < 0.5))
+    for plan in prog.plans.values():
+        plan = getattr(plan, "top_down", plan)
+        if not isinstance(plan, TopDownPlan):
+            continue
+        for kind_, _, layers in plan.steps:
+            if kind_ != "prod":
+                continue
+            for _, stages, _, _ in layers:
+                for once, sample, cws in stages:
+                    seen = {}
+                    for la, item in list(once) + list(sample) + list(cws):
+                        if la.form not in ("input_block", "block_input") or item is None:
+                            continue
+                        rows = check_tiles(la, item.tensor.cpu().numpy(), item.height)
+                        assert not rows & seen.get(id(la), set())
+                        seen[id(la)] = seen.get(id(la), set()) | rows
+                        lists += 1
+    if kind in ("pd", "hand"):
+        assert lists > 0
 
 
 def compact(cc, block, a, b):
