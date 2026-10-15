@@ -83,18 +83,32 @@ class DFAExactDecoder(Decoder):
     A :class:`~pyjuice.constraints.decoder.Decoder` over a constrained circuit with the dfa_exact backend
     (:meth:`~..backend.DFAExactBackend.decoder`): a query reuses what the previous one computed where the evidence did
     not change it (see the module docstring). It keeps its own copy of the last call's evidence.
+
+    ``bf16_token_table``: whether the conditionals score the tokens against a bfloat16 copy of the token table
+    (:meth:`~..state.State.token_table`) -- half the bytes their scoring reads, at the scores' cost: ~2e-4 nats on
+    Codpula's and Ctrl-G's circuits (no best token changed), up to ~3e-3 on small ones. "auto" (the default): under
+    ``precision = "tf32"`` (approximate products anyway), not under "fp32"; True / False: always / never.
     """
 
     remembers = True
 
-    def __init__(self, cc, **options):
+    def __init__(self, cc, bf16_token_table = "auto", **options):
+        if bf16_token_table not in ("auto", True, False):
+            raise ValueError(f"`bf16_token_table` must be 'auto', True or False, got {bf16_token_table!r}.")
         super().__init__(cc, **options)
+        self._bf16_tokens = bf16_token_table
         self._kept = None                           # what the buffers hold for the next call (`_Kept`)
         self._regions = None                        # see `_region_tables`
         self._layouts = {}                          # batch size -> (sum offsets, sum widths) as int64 arrays
 
+    def __enter__(self) -> "DFAExactDecoder":
+        super().__enter__()
+        self.cc.backend.state.bf16_tokens = self._bf16_tokens
+        return self
+
     def __exit__(self, *exc) -> bool:
         self._kept, self._layouts = None, {}
+        self.cc.backend.state.bf16_tokens = False
         return super().__exit__(*exc)
 
     def _marginal(self, data: torch.Tensor, missing: torch.Tensor, precision: str = "fp32",

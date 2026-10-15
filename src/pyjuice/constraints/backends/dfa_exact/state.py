@@ -149,6 +149,7 @@ class State:
         self._prior_kept = False                    # kept by a `pyjuice.fast_inference` scope
         self._prior_flows_state = None              # the input-independent top-down values (see `prior_flows`)
         self._token_tables = None                   # token-major input parameters kept by a scope (`token_table`)
+        self.bf16_tokens = False                    # a decoder session's: token tables in bfloat16 ("auto": at tf32)
         self.epoch = 0
 
     # ---------------------------------------------------------------------------------------------
@@ -407,15 +408,18 @@ class State:
             return self._kept_stacks, True
         return {}, False
 
-    def token_table(self, group: int, rows: np.ndarray) -> torch.Tensor:
+    def token_table(self, group: int, rows: np.ndarray, precision: str = "fp32") -> torch.Tensor:
         """
         ``[V, len(rows)]``: the probability of every token under the class-mass rows ``rows`` (sorted, see
         :meth:`class_mass_rows`), token-major -- the table row group ``group`` of the conditionals is scored against
         (:mod:`~.queries.conditional`) -- from every input layer's distribution's ``token_probs``. Built by every query,
         except inside a :func:`pyjuice.fast_inference` scope that allows parameter copies: there by the first query,
-        then kept until the scope exits; in bfloat16 when the scope allows bf16 parameter copies.
+        then kept until the scope exits; in bfloat16 when the scope allows bf16 parameter copies, or in a decoder
+        session that asks for it (``bf16_tokens``, see :class:`~.queries.decoder.DFAExactDecoder`; "auto": for a
+        query whose ``precision`` is "tf32").
         """
-        dtype = torch.bfloat16 if bf16_params_allowed() else torch.float32
+        bf16 = bf16_params_allowed() or self.bf16_tokens is True or (self.bf16_tokens == "auto" and precision == "tf32")
+        dtype = torch.bfloat16 if bf16 else torch.float32
         key = (group, dtype)
         if self._token_tables is not None and key in self._token_tables:
             return self._token_tables[key]

@@ -544,6 +544,26 @@ def test_the_session_is_a_fast_inference_scope(build_pc):
         assert is_active()
 
 
+@pytest.mark.parametrize("option", ["auto", True, False])
+def test_the_bf16_token_table_option(option, build_pc):
+    """``bf16_token_table``: the conditionals' token tables in bfloat16 -- "auto" (the default) at tf32 only -- the
+    scores within ~1e-2 of the fp32 table's; never outside the session."""
+    n = KINDS["hmm"]
+    cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc("hmm", n, V))
+    data = torch.randint(0, V, (2, n), generator = torch.Generator().manual_seed(0))
+    for precision in ("fp32", "tf32"):
+        want = cc.conditional(data[:, :2], precision = precision)
+        kw = {} if option == "auto" else dict(bf16_token_table = option)
+        with cc.decoder(**kw) as decoder:
+            got = decoder.conditional(data[:, :2], precision = precision)
+            dtypes = {t.dtype for t in cc.backend.state._token_tables.values()}
+        bf16 = option is True or (option == "auto" and precision == "tf32")
+        assert dtypes == {torch.bfloat16 if bf16 else torch.float32}, (precision, dtypes)
+        fin = torch.isfinite(want)
+        assert torch.equal(fin, torch.isfinite(got)) and ((got - want)[fin].abs() < (1e-2 if bf16 else 1e-5)).all()
+        assert cc.backend.state.bf16_tokens is False
+
+
 def test_one_session_at_a_time_inside_its_with(build_pc):
     n = KINDS["hmm"]
     cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc("hmm", n, V))
@@ -565,7 +585,8 @@ def test_one_session_at_a_time_inside_its_with(build_pc):
 
 
 def test_query_defaults_and_a_calls_own_options(build_pc):
-    """Options other than fast_inference's are defaults for every call (precision, mask_id); a call's own wins."""
+    """Options other than fast_inference's are defaults for every call (precision, mask_id); a call's own wins (the
+    token table fp32 as the circuit's own queries score it: not the decoder's default at tf32)."""
     n = KINDS["pd"]
     cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc("pd", n, V))
     g = torch.Generator().manual_seed(0)
@@ -574,7 +595,7 @@ def test_query_defaults_and_a_calls_own_options(build_pc):
     with juice.fast_inference():
         tf32 = cc.conditional(data, mask_id = 7, precision = "tf32")
         fp32 = cc.conditional(data, mask_id = 7)
-    with cc.decoder(precision = "tf32", mask_id = 7) as decoder:
+    with cc.decoder(precision = "tf32", mask_id = 7, bf16_token_table = False) as decoder:
         assert torch.equal(decoder.conditional(data), tf32)
         assert torch.equal(decoder.conditional(data, precision = "fp32"), fp32)
         assert torch.equal(decoder.conditional(torch.where(data == 7, -1, data), mask_id = -1), tf32)

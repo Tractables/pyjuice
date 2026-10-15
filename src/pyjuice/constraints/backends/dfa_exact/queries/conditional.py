@@ -313,7 +313,7 @@ def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor
         log_marginal = torch.empty(M + 1, device = dev) if return_log_marginal else None
         for (g, pos, w), start in zip(groups, starts[2:]):
             out_row = tables[start:start + len(pos) * B]
-            table = backend.state.token_table(g, score.rows[g])
+            table = backend.state.token_table(g, score.rows[g], precision)
             logz = score_group(out, table, w, score.rows_t[g], masses.table, out_row, backend.token_classes,
                                F.PRECISIONS[precision], candidates = cand,
                                sample = _sample_columns(masses, score.nodes[g][pos], B, dev, backend.program(),
