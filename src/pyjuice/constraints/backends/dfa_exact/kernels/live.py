@@ -277,6 +277,34 @@ ROW_TILE = 1024
 LIVE_STEPS_MIN_WIDTH = 4096
 LIVE_STEP_TILE = 256
 
+#: below that width, the CUDA sweep (``kernels/c/liveness.cu``: a CTA per sample, rows and tables in shared memory,
+#: every boundary's tables read during the step before) where the extension builds and the automaton fits; Codpula's
+#: 1694-column keyword automaton, batch 16: 214 us (Triton, 4 warps) / 106 us (32 warps) per sweep
+LIVE_CUDA = True
+
+
+def _cuda_sweep(prog):
+    """The extension if the CUDA sweep takes ``prog``'s automaton (its most successor entries a boundary kept as
+    ``prog.live_smax``), else None."""
+    if not LIVE_CUDA:
+        return None
+    ok = getattr(prog, "live_cuda", None)
+    if ok is None:
+        from .c import get_module
+        mod = get_module()
+        ok = False
+        if mod is not None:
+            n, W = prog.n, prog.next_col.size(1)
+            ptr = prog.succ.entry_ptr.view(n, W + 1).cpu().numpy()
+            width = np.asarray(prog.width[:n], dtype = np.int64)
+            prog.live_smax = int((ptr[np.arange(n), width] - ptr[:, 0]).max(initial = 0))
+            ok = bool(mod.liveness_fits(n, W, prog.live_smax))
+        prog.live_cuda = ok
+    if not ok:
+        return None
+    from .c import get_module
+    return get_module()
+
 
 @dataclass
 class Liveness:
@@ -403,7 +431,10 @@ def liveness(prog, obs_class: torch.Tensor, B: int) -> Liveness:
         for t in range(n - 1, -1, -1):
             _live_backward_kernel[(B, host_cdiv(prog.width[t], LIVE_STEP_TILE))](
                 live, back, *tables, t, n, W, C, TILE = LIVE_STEP_TILE, num_warps = 4)
-    else:                                            # one program per sample, sweeping every boundary
-        TILE = min(1024, max(32, host_next_power_of_2(W)))
-        _liveness_kernel[(B,)](live, back, *tables, n, W, C, TILE = TILE, num_warps = 4)
+    elif _cuda_sweep(prog) is not None and obs_class.dtype == torch.int32 and obs_class.is_contiguous():
+        _cuda_sweep(prog).liveness_cuda(live, back, obs_class, prog.next_col, prog.succ.entry_ptr,
+                                        prog.succ.entry_succ, prog.width_t, n, W, C, prog.live_smax)
+    else:                                            # one program per sample, sweeping every boundary: a lane
+        TILE = min(1024, max(32, host_next_power_of_2(W)))       # per column, a step's latency is the sweep's cost
+        _liveness_kernel[(B,)](live, back, *tables, n, W, C, TILE = TILE, num_warps = max(4, TILE // 32))
     return Liveness(prog = prog, B = B, live = live)

@@ -561,8 +561,16 @@ int64_t ctas_per_sm(bool td, bool ext, bool x3, int64_t tn, int64_t share, bool 
 }
 
 
+// liveness.cu
+bool liveness_fits(int64_t n, int64_t W, int64_t smax);
+void liveness_cuda(torch::Tensor live, torch::Tensor back, torch::Tensor obs_class, torch::Tensor next_col,
+                   torch::Tensor entry_ptr, torch::Tensor entry_succ, torch::Tensor width, int64_t n, int64_t W,
+                   int64_t C, int64_t smax);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fused_sum_cuda", &fused_sum_cuda,
           "a fused sum launch (forward, or top-down) of blocks of 32 over the same chunks, from the pre-pass's");
     m.def("ctas_per_sm", &ctas_per_sm, "how many CTAs of a direction's kernel an SM holds at once");
+    m.def("liveness_fits", &liveness_fits, "whether the shared-memory liveness sweep takes an automaton");
+    m.def("liveness_cuda", &liveness_cuda, "the liveness sweep, one CTA per sample in shared memory");
 }

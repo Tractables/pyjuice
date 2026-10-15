@@ -71,12 +71,17 @@ def transitions(request, monkeypatch):
     return request.param
 
 
-@pytest.fixture(params = ["per_sample", "per_boundary"])
+@pytest.fixture(params = ["cuda", "per_sample", "per_boundary"])
 def sweeps(request, monkeypatch):
-    """The liveness sweeps in one program per sample, or as a launch per boundary (used from far wider automata than
-    the test ones by default)."""
+    """The liveness sweeps: the CUDA kernel's (a CTA per sample and sweep, the default where the extension builds), one
+    Triton program per sample, or a launch per boundary (used from far wider automata than the test ones by
+    default)."""
     from pyjuice.constraints.backends.dfa_exact.kernels import live
-    monkeypatch.setattr(live, "LIVE_STEPS_MIN_WIDTH", 1 << 30 if request.param == "per_sample" else 0)
+    from pyjuice.constraints.backends.dfa_exact.kernels.c import get_module
+    if request.param == "cuda" and get_module() is None:
+        pytest.skip("the dfa_exact CUDA extension is unavailable")
+    monkeypatch.setattr(live, "LIVE_CUDA", request.param == "cuda")
+    monkeypatch.setattr(live, "LIVE_STEPS_MIN_WIDTH", 0 if request.param == "per_boundary" else 1 << 30)
     return request.param
 
 
@@ -165,10 +170,11 @@ def test_a_wide_automaton_under_evidence_matches_the_reference(kind, pattern, su
 
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_per_boundary_liveness_equals_per_sample(kind, build_pc, monkeypatch):
-    """The liveness sweeps as a launch per boundary give the one-program-per-sample sweeps' live columns, and so the
-    same live slots, lists and lane order, under every pattern of evidence (a 48-state automaton: boundaries of
-    several tiles)."""
+    """The liveness sweeps as a launch per boundary, and the CUDA kernel's (where the extension builds), give the
+    one-program-per-sample sweeps' live columns, and so the same live slots, lists and lane order, under every pattern
+    of evidence (a 48-state automaton: boundaries of several tiles)."""
     from pyjuice.constraints.backends.dfa_exact.kernels import live
+    from pyjuice.constraints.backends.dfa_exact.kernels.c import get_module
     rng = random.Random(0)
     K, n = 48, KINDS[kind]
     dfa = jc.DFA.from_dense(V, [[rng.randrange(K) for _ in range(V)] for _ in range(K)], 0, rng.sample(range(K), 12))
@@ -184,18 +190,27 @@ def test_per_boundary_liveness_equals_per_sample(kind, build_pc, monkeypatch):
         data, missing = evidence(pattern, n)
         oc = obs_classes(cc, data, missing)
         got = {}
-        for name, min_width in (("per_sample", 1 << 30), ("per_boundary", 0)):
+        arms = [("per_sample", 1 << 30, False), ("per_boundary", 0, False)]
+        if get_module() is not None:
+            arms.append(("cuda", 1 << 30, True))
+        for name, min_width, cuda in arms:
             monkeypatch.setattr(live, "LIVE_STEPS_MIN_WIDTH", min_width)
+            monkeypatch.setattr(live, "LIVE_CUDA", cuda)
+            assert (live._cuda_sweep(prog) is not None) == cuda                # (the arm's path taken)
             launches.clear()
             got[name] = liveness(prog, oc, data.size(0))
             assert len(launches) == (n if name == "per_boundary" else 0)
-        a, b = got["per_sample"], got["per_boundary"]
-        for t, w in enumerate(widths):
-            assert torch.equal(a.live[:, t, :w], b.live[:, t, :w]), (pattern, t)
-        assert all(torch.equal(x, y) for x, y in zip(listed(a), listed(b))), pattern
-        every = np.ones(len(prog.sum_ivs), dtype = bool)
-        oa, ob = a.order(every), b.order(every)
-        assert torch.equal(oa.perm, ob.perm) and torch.equal(oa.rank, ob.rank) and torch.equal(oa.counts, ob.counts)
+        a = got["per_sample"]
+        for name in got:
+            if name == "per_sample":
+                continue
+            b = got[name]
+            for t, w in enumerate(widths):
+                assert torch.equal(a.live[:, t, :w], b.live[:, t, :w]), (name, pattern, t)
+            assert all(torch.equal(x, y) for x, y in zip(listed(a), listed(b))), (name, pattern)
+            every = np.ones(len(prog.sum_ivs), dtype = bool)
+            oa, ob = a.order(every), b.order(every)
+            assert torch.equal(oa.perm, ob.perm) and torch.equal(oa.rank, ob.rank) and torch.equal(oa.counts, ob.counts)
 
 
 def listed(lv):
