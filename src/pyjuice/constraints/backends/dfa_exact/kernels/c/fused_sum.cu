@@ -567,10 +567,26 @@ void liveness_cuda(torch::Tensor live, torch::Tensor back, torch::Tensor obs_cla
                    torch::Tensor entry_ptr, torch::Tensor entry_succ, torch::Tensor width, int64_t n, int64_t W,
                    int64_t C, int64_t smax);
 
+// walk.cu
+void ibtd_cuda(torch::Tensor element_flows, torch::Tensor temp_flows, torch::Tensor node_flows,
+               torch::Tensor node_mars, torch::Tensor obs_class, torch::Tensor class_mars, torch::Tensor mass_row,
+               torch::Tensor mass_stride, torch::Tensor pred_ptr, torch::Tensor pred_col, torch::Tensor pred_x,
+               torch::Tensor width, torch::Tensor iv_of, torch::Tensor iv_info, torch::Tensor iv_table,
+               torch::Tensor once_iv, torch::Tensor coff, torch::Tensor ccount, torch::Tensor cstart,
+               torch::Tensor ccolumns, torch::Tensor crank, torch::Tensor children, torch::Tensor tiles,
+               torch::Tensor ptr, torch::Tensor parents, torch::Tensor reg_offset, torch::Tensor reg_width,
+               torch::Tensor reg_first, torch::Tensor tlist, torch::Tensor t2i, torch::Tensor ecum,
+               torch::Tensor terms, torch::Tensor cnt, torch::Tensor perm, torch::Tensor done, int64_t out_first,
+               int64_t out_width, int64_t temp_width, int64_t B, int64_t n, int64_t W, int64_t C,
+               int64_t input_start, int64_t subs, int64_t tn, int64_t threads, bool warps, bool sort,
+               int64_t lp_ld, int64_t cq_max, bool sample, int64_t c_kind, bool out_temp, bool c_full,
+               bool out_full);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fused_sum_cuda", &fused_sum_cuda,
           "a fused sum launch (forward, or top-down) of blocks of 32 over the same chunks, from the pre-pass's");
     m.def("ctas_per_sm", &ctas_per_sm, "how many CTAs of a direction's kernel an SM holds at once");
     m.def("liveness_fits", &liveness_fits, "whether the shared-memory liveness sweep takes an automaton");
     m.def("liveness_cuda", &liveness_cuda, "the liveness sweep, one CTA per sample in shared memory");
+    m.def("ibtd_cuda", &ibtd_cuda, "an input @ block top-down launch on compact values, a sample's live terms");
 }

@@ -5,7 +5,8 @@ log outside value) against the test reference's (``reference.top_down``), on eve
 both sum paths, and where block @ block's shifts flush entries; run twice, the values are identical. Under query plans
 (:mod:`~pyjuice.constraints.backends.dfa_exact.query_plan`): with every policy of keeping values once, a query computes
 exactly the values its targets need; values kept once accumulate across queries, append-only; held values are not
-computed again.
+computed again. Compact, the ``input @ block`` steps' CUDA walk (``kernels/c/walk.cu``) gives the Triton kernel's values
+bit for bit, in every case it has.
 """
 import contextlib
 import math
@@ -17,6 +18,10 @@ import torch
 
 import pyjuice as juice
 import pyjuice.constraints as jc
+import pyjuice.nodes.distributions as dists
+from pyjuice.nodes import inputs, multiply, summate
+from pyjuice.constraints.backends.dfa_exact.kernels import prod_top_down
+from pyjuice.constraints.backends.dfa_exact.kernels.c import get_module
 from pyjuice.constraints.backends.dfa_exact.queries import forward as F
 from pyjuice.constraints.backends.dfa_exact.queries.top_down import run_backward
 from pyjuice.constraints.backends.dfa_exact.kernels.compact import compact_layout
@@ -518,3 +523,165 @@ def test_wide_automata(kind, storage, build_pc, reference):
     assert int(lv.lists()[0].max()) > 32
     got = top_down_blocks(cc, data, missing, storage = storage)[0]
     assert_top_down_close(cc, got, reference.top_down(cc, data, missing), data, missing)
+
+
+def walks_circuit(V, unit = False, input_dist = dists.Categorical):
+    """``input @ block`` steps over 6 variables that reach the CUDA top-down walk (kernels/c/walk.cu) from every side:
+    ``s3`` under two products of different inputs at position 2 (two parents per child), over intervals ending before
+    the sequence ([3, 4) and [2, 4): pairs the automaton does not join), in a three-child product (folds); ``unit``:
+    blocks of one node, every node tile one row."""
+    nb, bs = (1, 1) if unit else (2, 2)
+    x = [inputs(v, num_node_blocks = nb, block_size = bs, dist = input_dist(num_cats = V)) for v in range(6)]
+    x2 = inputs(2, num_node_blocks = nb, block_size = bs, dist = input_dist(num_cats = V))
+    s3 = summate(x[3], num_node_blocks = nb, block_size = bs)
+    s24 = summate(multiply(x[2], s3), multiply(x2, s3), num_node_blocks = nb, block_size = bs)
+    s01 = summate(multiply(x[0], x[1]), num_node_blocks = nb, block_size = bs)
+    s45 = summate(multiply(x[4], x[5]), num_node_blocks = nb, block_size = bs)
+    root = summate(multiply(s01, s24, s45), num_node_blocks = 1, block_size = 1)
+    torch.manual_seed(0)
+    root.init_parameters(perturbation = 2.0)
+    return juice.compile(root, verbose = False).to(torch.device("cuda:0"))
+
+
+#: the circuits of the walk's tests: conftest.py's kinds with ``input @ block`` steps, and :func:`walks_circuit`'s
+WALK_KINDS = {"hmm": 6, "hmm_block_sparse": 6, "hand": 5, "hand_left": 5, "hand_fold": 4, "walks": 6, "walks_unit": 6}
+
+
+def walk_pc(kind, build_pc, input_dist = dists.Categorical):
+    if kind.startswith("walks"):
+        return walks_circuit(V, unit = kind == "walks_unit", input_dist = input_dist)
+    return build_pc(kind, WALK_KINDS[kind], V, input_dist = None if input_dist is dists.Categorical else input_dist)
+
+
+@pytest.fixture
+def walk_launches(monkeypatch):
+    """Every ``input @ block`` launch offered to the CUDA kernels (switched on): whether they took it, and what it is
+    made of."""
+    seen = []
+    real = prod_top_down._input_block_cuda
+
+    def record(la, tiles, height, prog, compact, *args):
+        taken = real(la, tiles, height, prog, compact, *args)
+        if not prod_top_down.INPUT_BLOCK_CUDA:                           # (the Triton kernel's run)
+            return taken
+        masses, obs_class, once_iv = args[4], args[5], args[6]
+        c_kind, out_temp, (c_full, out_full) = la.kinds
+        seen.append(dict(taken = taken is not None, c_kind = c_kind, out_temp = out_temp, c_full = c_full,
+                         out_full = out_full, parents = int(np.diff(la.host["ptr"]).max()), height = height,
+                         once = bool(once_iv.cpu().numpy()[np.asarray(la.host["parent_ivs"])].any()),
+                         add = bool(la.host["children"][:, 2].any()), sample = masses.batch > 1,
+                         observed = bool((obs_class >= 0).any()), missing = bool((obs_class < 0).any()),
+                         **(taken or {})))
+        return taken
+
+    monkeypatch.setattr(prod_top_down, "_input_block_cuda", record)
+    return seen
+
+
+def both_walks(monkeypatch, run):
+    """``run()`` on the Triton kernel, then on the CUDA kernels."""
+    monkeypatch.setattr(prod_top_down, "INPUT_BLOCK_CUDA", False)
+    want = run()
+    monkeypatch.setattr(prod_top_down, "INPUT_BLOCK_CUDA", True)
+    return want, run()
+
+
+def assert_same_bits(got, want):
+    for r, (g, w) in enumerate(zip(got, want)):
+        assert g.shape == w.shape and torch.equal(g.view(torch.int32), w.view(torch.int32)), r
+
+
+#: CTAs of the CUDA walk: a node tile's children (at most 16) or fewer, a sample's (128 threads or 256) or 8 samples'
+#: (a warp each) -- ``INPUT_BLOCK_CUDA_NODES``, ``_WIDE``, ``_WARP_ITEMS``
+WALK_CTAS = {"default": (16, 512, 64), "8_wide": (8, 0, 0), "2": (2, 512, 0), "1_warps": (1, 512, 1 << 20),
+             "16_warps": (16, 512, 1 << 20)}
+
+
+def set_walk_ctas(monkeypatch, cta):
+    for name, value in zip(("NODES", "WIDE", "WARP_ITEMS"), WALK_CTAS[cta]):
+        monkeypatch.setattr(prod_top_down, "INPUT_BLOCK_CUDA_" + name, value)
+
+
+@pytest.mark.skipif(get_module() is None, reason = "the CUDA kernels are unavailable")
+@pytest.mark.parametrize("cta", list(WALK_CTAS))
+@pytest.mark.parametrize("policy", ["default", "top_down"])
+@pytest.mark.parametrize("pattern", ["none", "prefix", "mixed"])
+@pytest.mark.parametrize("name", list(CONSTRAINTS))
+@pytest.mark.parametrize("kind", list(WALK_KINDS))
+def test_cuda_walk_gives_the_triton_values(kind, name, pattern, policy, cta, build_pc, walk_launches, monkeypatch):
+    """Compact, the ``input @ block`` launches run on the CUDA kernels (every one, CTAs of every size) and give the
+    Triton kernel's top-down values bit for bit: the same terms in the same order, the same arithmetic."""
+    set_walk_ctas(monkeypatch, cta)
+    n = WALK_KINDS[kind]
+    cc = jc.compile(CONSTRAINTS[name](), walk_pc(kind, build_pc))
+    data, missing = evidence(pattern, n)
+    want, got = both_walks(monkeypatch, lambda: top_down_blocks(cc, data, missing, policy = policy,
+                                                                storage = "compact")[0])
+    assert_same_bits(got, want)
+    assert all(la["taken"] for la in walk_launches)
+
+
+@pytest.mark.skipif(get_module() is None, reason = "the CUDA kernels are unavailable")
+@pytest.mark.parametrize("kind", ["hmm", "walks"])
+def test_cuda_walk_on_per_sample_class_masses(kind, build_pc, walk_launches, monkeypatch):
+    """Soft evidence inputs (class masses of each sample's own) in a decoder session, left to right: the conditionals
+    of the Triton kernel's bit for bit."""
+    n = WALK_KINDS[kind]
+    cc = jc.compile(CONSTRAINTS["contains"](), walk_pc(kind, build_pc, input_dist = dists.SoftEvidenceCategorical))
+    g = torch.Generator().manual_seed(0)
+    B = 5
+    data = torch.randint(0, V, (B, n), generator = g).cuda()
+    E = (torch.randn(B, n, V, generator = g) * 2).cuda()
+
+    def session():
+        with cc.decoder(categorical_evidence_logp = E, storage = "compact") as decoder:
+            return [decoder.conditional(data, (torch.arange(n, device = data.device) >= t)[None, :].expand(B, n))
+                    for t in range(n)]
+
+    want, got = both_walks(monkeypatch, session)
+    assert_same_bits(got, want)
+    assert any(la["taken"] and la["sample"] for la in walk_launches)
+
+
+@pytest.mark.skipif(get_module() is None, reason = "the CUDA kernels are unavailable")
+def test_cuda_walk_on_wide_automata(build_pc, walk_launches, monkeypatch):
+    """A 48-state automaton, samples observing nothing among others: tens of live columns a sample (their terms
+    ordered, most first), 256 threads a CTA; the Triton kernel's values bit for bit."""
+    rng = random.Random(0)
+    K, n = 48, 6
+    dfa = jc.DFA.from_dense(V, [[rng.randrange(K) for _ in range(V)] for _ in range(K)], 0, rng.sample(range(K), 12))
+    cc = jc.compile(dfa, build_pc("hmm_block_sparse", n, V))
+    data, missing = evidence("mixed", n)
+    want, got = both_walks(monkeypatch, lambda: top_down_blocks(cc, data, missing, storage = "compact")[0])
+    assert_same_bits(got, want)
+    assert all(la["taken"] for la in walk_launches)
+
+
+@pytest.mark.skipif(get_module() is None, reason = "the CUDA kernels are unavailable")
+def test_cuda_walk_reaches_every_case(build_pc, walk_launches, monkeypatch):
+    """The walk tests' circuits and queries reach every case of the CUDA kernels: children in sum rows and in fold
+    rows, parents in element rows and fold rows, intervals joining every pair or not (child's and parent's), several
+    parents a child, parents kept once, children log-added to, observed and missing classes, node tiles of 1, 4 and 16
+    rows, CTAs of every number of children, of 128 and 256 threads, of a sample or a warp per sample."""
+    for kind in WALK_KINDS:
+        n = WALK_KINDS[kind]
+        for name in CONSTRAINTS:
+            cc = jc.compile(CONSTRAINTS[name](), walk_pc(kind, build_pc))
+            for pattern, policy in (("mixed", "default"), ("prefix", "top_down")):
+                data, missing = evidence(pattern, n)
+                top_down_blocks(cc, data, missing, policy = policy, storage = "compact")
+    for cta in WALK_CTAS:
+        set_walk_ctas(monkeypatch, cta)
+        for kind in ("walks", "hmm"):                                     # node tiles of 4 rows and of 16
+            cc = jc.compile(CONSTRAINTS["contains"](), walk_pc(kind, build_pc))
+            data, missing = evidence("mixed", 6)
+            top_down_blocks(cc, data, missing, storage = "compact")
+    taken = [la for la in walk_launches if la["taken"]]
+    cases = {key: {la[key] for la in taken} for key in taken[0]}
+    for key, want in dict(c_kind = {0, 1}, out_temp = {False, True}, c_full = {False, True},
+                          out_full = {False, True}, once = {False, True}, add = {False, True}, observed = {True},
+                          missing = {True}, height = {1, 4, 16}, tn = {16, 8, 4, 2, 1}, threads = {128, 256},
+                          warps = {False, True}).items():
+        assert want <= cases[key], (key, cases[key])
+    assert max(cases["parents"]) > 1
+

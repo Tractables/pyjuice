@@ -24,6 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Optional
 
+import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -786,6 +787,107 @@ TOP_DOWN_NODES = 8
 TOP_DOWN_TILE_LANES = 128
 TOP_DOWN_WARPS = 4
 
+#: ``input @ block`` launches on compact values run the CUDA kernels (``c/walk.cu``) when those take them
+#: (:func:`_input_block_cuda`); False: the Triton kernel always
+INPUT_BLOCK_CUDA = True
+#: the most children of a node tile a CTA of the CUDA kernel takes (a node tile's at most), and the most dynamic
+#: shared memory (a sample's lanes of its children's parents, their class masses; 48 KB less the kernel's own): past
+#: it, CTAs of fewer
+INPUT_BLOCK_CUDA_NODES = NODE_TILE
+INPUT_BLOCK_CUDA_SMEM = 45 * 1024
+#: (lane, 4 children) items of a sample from which its CTA has 256 threads, not 128; up to which a CTA takes 8 samples
+#: instead, a warp each, their columns not ordered by their terms (most of a CTA's threads would idle: left to right,
+#: B 64, 61 -> 32 us a call)
+INPUT_BLOCK_CUDA_WIDE = 512
+INPUT_BLOCK_CUDA_WARP_ITEMS = 64
+#: the most int32 of work space a launch takes (every sample's copy of its boundaries' predecessor lists): past it, the
+#: Triton kernel
+INPUT_BLOCK_CUDA_SPACE = 1 << 26
+
+
+def _input_block_boundaries(la: TopDownLaunch, prog) -> dict:
+    """An ``input @ block`` launch's boundaries for the CUDA kernels, built on first use: ``ts`` (its parents' ``t``,
+    ascending; ``tlist`` int32 on the device), ``t2i`` (int32 [n] on the device: every one's place among them),
+    ``ecum`` (int64 [T + 1], host and ``ecum_t`` device: the predecessor entries at the boundaries before), and every
+    child's interval as ``(t, t2)`` (``ta``, ``te``)."""
+    st = la.host.get("cuda")
+    if st is None:
+        n, W = prog.n, prog.next_col.size(1)
+        counts = getattr(prog, "pred_counts", None)
+        if counts is None:                                                   # every boundary's predecessor entries
+            pp = prog.trans_top_down.pred_ptr.view(n, W + 1).cpu().numpy().astype(np.int64)
+            counts = prog.pred_counts = pp[:, W] - pp[:, 0]
+        ts = np.unique(la.host["parents"][:, 2]).astype(np.int64)
+        ecum = np.zeros(ts.size + 1, dtype = np.int64)
+        np.cumsum(counts[ts], out = ecum[1:])
+        t2i = np.full(n, -1, dtype = np.int32)
+        t2i[ts] = np.arange(ts.size, dtype = np.int32)
+        ends = prog.iv_ends_np[np.asarray(la.host["child_ivs"], dtype = np.int64)]
+        dev = prog.dev
+        st = la.host["cuda"] = dict(ts = ts, tlist = torch.from_numpy(ts.astype(np.int32)).to(dev),
+                                    t2i = torch.from_numpy(t2i).to(dev), ecum = ecum,
+                                    ecum_t = torch.from_numpy(ecum).to(dev), ta = ends[:, 0] - 1, te = ends[:, 1])
+    return st
+
+
+def _work_space(prog, size: int, counters: int):
+    """``(scratch, counters)``: int32 scratch of at least ``size`` on ``prog``'s device, and ``counters`` int32 zeros
+    (each launch leaves them zero), both kept for the next launch (launches on one stream use them one after the
+    other)."""
+    ws, done = getattr(prog, "walk_space", None), getattr(prog, "walk_done", None)
+    if ws is None or ws.numel() < size:
+        ws = prog.walk_space = torch.empty(max(size, 1 << 16), dtype = torch.int32, device = prog.dev)
+    if done is None or done.numel() < counters:
+        done = prog.walk_done = torch.zeros(max(counters, 1 << 10), dtype = torch.int32, device = prog.dev)
+    return ws, done
+
+
+def _input_block_cuda(la: TopDownLaunch, tiles: torch.Tensor, height: int, prog, compact, element_flows, temp_flows,
+                      node_flows, node_mars, masses, obs_class, once_iv, common: dict, B: int) -> Optional[dict]:
+    """
+    Run an ``input @ block`` launch on compact values with the CUDA kernels (``c/walk.cu``: every sample's live terms
+    per column, its columns by their terms, then a CTA per (node tile's children, sample) summing them from shared
+    memory), if they take it -- ungrouped transitions, its CTAs' shared memory within :data:`INPUT_BLOCK_CUDA_SMEM`,
+    its work space within :data:`INPUT_BLOCK_CUDA_SPACE` --, and return the CTAs' shape (``tn`` children, ``threads``, ``warps``: a warp per sample), else None. The values
+    are the Triton kernel's, bit for bit.
+    """
+    if not INPUT_BLOCK_CUDA or prog.trans_top_down.grouped or not obs_class.is_contiguous():
+        return None
+    from .c import get_module
+    mod = get_module()
+    n, W, C = prog.n, prog.next_col.size(1), prog.next_col.size(2)
+    if mod is None or C > 65536 or W > 32767 or B > 65535:
+        return None
+    st = _input_block_boundaries(la, prog)
+    mc = compact.max_count
+    cq = int(mc[st["ts"] + 1].max())                                         # a sample's most live columns at t + 1
+    lp = max(int((mc[st["ta"]] * mc[st["te"]]).max()), 1)                   # ... lanes of a parent's row
+    team = lambda tn: (4 * tn * (lp + C + 1) + 15) // 16 * 16                # a sample's shared memory (bytes)
+    tn = min(height, INPUT_BLOCK_CUDA_NODES)
+    while tn > 1 and team(tn) > INPUT_BLOCK_CUDA_SMEM:
+        tn //= 2
+    if team(tn) > INPUT_BLOCK_CUDA_SMEM:
+        return None
+    items = cq * int(mc[st["te"]].max()) * max(tn // 4, 1)                  # a sample's most (lane, 4 children)
+    warps = items <= INPUT_BLOCK_CUDA_WARP_ITEMS and 8 * team(tn) <= INPUT_BLOCK_CUDA_SMEM
+    threads = 256 if warps or items >= INPUT_BLOCK_CUDA_WIDE else 128
+    T, nterms = st["ts"].size, B * int(st["ecum"][-1])
+    if nterms + 2 * T * B * W > INPUT_BLOCK_CUDA_SPACE:
+        return None
+    ws, done = _work_space(prog, nterms + 2 * T * B * W, T * B)
+    tt, ivs = prog.trans_top_down, prog.intervals
+    c_kind, out_temp, (c_full, out_full) = la.kinds
+    sample = masses.batch > 1
+    mod.ibtd_cuda(element_flows, temp_flows, node_flows, node_mars, obs_class, masses.table, masses.row,
+                  masses.stride if sample else masses.row, tt.pred_ptr, tt.pred_col, tt.pred_x, prog.width_t, ivs.of,
+                  ivs.info, ivs.table, once_iv, compact.off, compact.count, compact.start, compact.columns,
+                  compact.rank, la.children, tiles, la.ptr, la.parents, common["reg_offset"], common["reg_width"],
+                  common["reg_first"], st["tlist"], st["t2i"], st["ecum_t"], ws[:nterms],
+                  ws[nterms:nterms + T * B * W], ws[nterms + T * B * W:nterms + 2 * T * B * W], done,
+                  common["out_first"], common["out_width"], common["temp_width"], B, n, W, C, prog.input_start,
+                  height // tn, tn, threads, warps, not warps, lp, cq, sample, c_kind, out_temp, c_full, out_full)
+    return dict(tn = tn, threads = threads, warps = warps)
+
 
 def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_flows, node_mars, masses, obs_class,
                 live, elem_first: int, elem_width: int, B: int, prior: dict, skip, exact: bool, once_iv: torch.Tensor,
@@ -849,6 +951,10 @@ def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_
             c_kind, out_temp, (c_full, out_full) = la.kinds
             ordered = prune and lanes is not None and c_kind == SUM and compact is None
             tiles, height = (la.tiles, la.tile_height) if idx is None else (idx, item.height)
+            if la.form == "input_block" and compact is not None and lanes_max > 0 and \
+                    _input_block_cuda(la, tiles, height, prog, compact, element_flows, temp_flows, node_flows,
+                                      node_mars, masses, obs_class, once_iv, common, B):
+                continue
             tn = min(height, TOP_DOWN_NODES)
             tile = max(16, min(_flat_tile(max(lanes_max, 1)), TOP_DOWN_TILE_LANES // tn))
             kernel = _input_block_top_down_kernel if la.form == "input_block" else _block_input_top_down_kernel

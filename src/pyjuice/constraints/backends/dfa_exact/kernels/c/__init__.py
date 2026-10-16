@@ -1,5 +1,5 @@
 """
-The dfa_exact backend's CUDA kernels (``fused_sum.cu``, ``liveness.cu``), JIT-compiled on first use like pyjuice's other extensions
+The dfa_exact backend's CUDA kernels (``fused_sum.cu``, ``liveness.cu``, ``walk.cu``), JIT-compiled on first use like pyjuice's other extensions
 (:mod:`pyjuice.nodes.external_params.kernels.c`): if anything about the toolchain is missing -- no ``nvcc``, a GPU
 without TF32 tensor cores, a compile error -- the loader disables itself (warning once) and the callers run their
 Triton kernels. ``PYJUICE_DISABLE_CUDA_KERNELS=1`` turns it off with the others. Nothing here runs at import time.
@@ -19,8 +19,8 @@ _attempted = False
 
 
 def get_module():
-    """The extension (``fused_sum_cuda``, ``ctas_per_sm``, ``liveness_fits``, ``liveness_cuda``), or None if it is
-    unavailable."""
+    """The extension (``fused_sum_cuda``, ``ctas_per_sm``, ``liveness_fits``, ``liveness_cuda``,
+    ``ibtd_cuda``), or None if it is unavailable."""
     global _module, _attempted
     if _attempted:
         return _module
@@ -34,7 +34,8 @@ def get_module():
     from pyjuice.utils.cuda_ext import jit_load
     try:
         _module = jit_load("pyjuice_dfa_exact_cuda", sources = [os.path.join(_THIS_DIR, "fused_sum.cu"),
-                                                                os.path.join(_THIS_DIR, "liveness.cu")],
+                                                                os.path.join(_THIS_DIR, "liveness.cu"),
+                                                                os.path.join(_THIS_DIR, "walk.cu")],
                            extra_cuda_cflags = ["-O3", f"-arch=sm_{cc[0]}{cc[1]}", "--use_fast_math", "-DNDEBUG"],
                            verbose = False)
     except Exception as e:
