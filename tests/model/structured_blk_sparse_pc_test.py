@@ -119,7 +119,8 @@ def test_structured_blk_sparse_pc():
     data = torch.randint(0, 256, (512, 3)).to(device)
     data_cpu = data.cpu()
 
-    lls = pc(data, force_use_fp32 = True)
+    pc.precision = "tf32"                       # no bf16 products: a tight comparison
+    lls = pc(data)
 
     node_mars = pc.node_mars.clone().cpu()
 

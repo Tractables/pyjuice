@@ -451,7 +451,8 @@ def test_simple_structure_block16():
 
     data = torch.randint(0, 5, [16, 4]).to(device)
 
-    lls = pc(data, force_use_fp32 = True)
+    pc.precision = "tf32"                       # no bf16 products: a tight comparison
+    lls = pc(data)
 
     node_mars = pc.node_mars.detach().cpu()
     params = pc.params.detach().cpu()
