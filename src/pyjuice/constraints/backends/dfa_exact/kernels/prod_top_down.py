@@ -34,7 +34,7 @@ from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
 from .common import (NODE_TILE, SUM, _block_ptr, _child, _exit_width, _interval, _logaddexp_tile, _lse_step, _pair,
-                     _slot, _tile_rows, grid_chunks, tensor)
+                     _slot, _tf32_operand, _tile_rows, grid_chunks, tensor)
 from .compact import _lane, _lane_ends
 from .prod import (BLOCK_BLOCK_PROGRAMS_PER_SM, BLOCK_BLOCK_TILES, EXACT_BELOW, PRODUCT_PRECISION, SKIP_EMPTY_TILES,
                    _chunk_needed, _flat_tile, _live_lanes, _lse_step_one_exp, _lse_value, _rect_product,
@@ -454,7 +454,8 @@ def _top_down_tile(ap, bp, iv_table, apos, bpos, mb, live_k, r, c, tr, tc, Rn, K
             sB = tl.where(nB == float("-inf"), 0.0, nB)
             fA = tl.where(nA == float("-inf"), 1.0, tl.exp(mA - sA))
             fB = tl.where(nB == float("-inf"), 1.0, tl.exp(mB - sB))
-            acc = acc * fA[:, None] * fB[None, :] + tl.dot(tl.exp(at - sA[:, None]), tl.exp(bt - sB[None, :]),
+            acc = acc * fA[:, None] * fB[None, :] + tl.dot(_tf32_operand(tl.exp(at - sA[:, None]), PRECISION),
+                                                            _tf32_operand(tl.exp(bt - sB[None, :]), PRECISION),
                                                             input_precision = PRECISION)
             mA, mB = nA, nB
     sA = tl.where(mA == float("-inf"), 0.0, mA)

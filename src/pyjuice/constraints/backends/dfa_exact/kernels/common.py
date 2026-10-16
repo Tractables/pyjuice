@@ -2,7 +2,7 @@
 What the kernels share: the operand kinds of a step, CUDA's grid limits, the int32 index lists through which a launch
 runs a subset of its steps (16-byte aligned, :func:`pack_aligned`), the node tiles of the walk kernels
 (:func:`node_tiles`), and the Triton device functions several kernels use -- a block's address, an interval's tables,
-slots and column pairs, log-space accumulation.
+slots and column pairs, log-space accumulation, a TF32 dot's operands.
 """
 
 from typing import Optional, Sequence, Tuple
@@ -184,6 +184,19 @@ def _lse_step(m, acc, v):
     scale = tl.where(m_new == float("-inf"), 1.0, tl.exp(m - m_new))
     shift = tl.where(m_new == float("-inf"), 0.0, m_new)
     return m_new, acc * scale + tl.exp(v - shift)
+
+
+@triton.jit
+def _tf32_operand(x, PRECISION: tl.constexpr):
+    """A dot's operand ``x`` as a dot of ``PRECISION`` should read it: under "tf32" an fp32 ``x`` rounded to the
+    nearest TF32 value (ties away from zero, as ``cvt.rna.tf32.f32``; finite ``x``). A Triton TF32 dot hands the
+    tensor cores the fp32 bits, of which they drop the low 13 -- every operand truncated, every product biased low
+    (by 6.5e-4 relative on uniform operands), a bias that compounds through a circuit's layers. Otherwise ``x``
+    unchanged (other precisions; narrower types are exact in TF32)."""
+    if PRECISION == "tf32":
+        if x.dtype == tl.float32:
+            x = ((x.to(tl.int32, bitcast = True) + 0x1000) & -8192).to(tl.float32, bitcast = True)
+    return x
 
 
 # -------------------------------------------------------------------------------------------------

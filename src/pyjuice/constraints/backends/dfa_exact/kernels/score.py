@@ -36,7 +36,7 @@ from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
 from .common import (IDENTITY, NODE_TILE, _block_ptr, _exit_width, _interval, _logaddexp_tile, _lse_step, _slot,
-                     _tile_rows, grid_chunks, node_groups, node_tiles, tensor)
+                     _tf32_operand, _tile_rows, grid_chunks, node_groups, node_tiles, tensor)
 from .prod import _lse_step_one_exp
 from .prod_top_down import _once, _out_flows_ptr, _parent_base, _parent_lane
 from .sum import _num_sms
@@ -589,13 +589,14 @@ def _score_kernel(table, w, shift, logz, toks, tile_cls, out_row, out, logw, log
     for k0 in range(0, K, BH):
         ks = k0 + tl.arange(0, BH)
         if EVEN_K:
-            bt = tl.load(trow + ks[:, None], mask = ok[None, :], other = 0.0).to(tl.float32)            # [BH, BV]
+            bt = tl.load(trow + ks[:, None], mask = ok[None, :], other = 0.0)                           # [BH, BV]
             a = tl.load(wrow + ks[None, :], mask = nm[:, None], other = 0.0)                           # [BB, BH]
         else:
             km = ks < K
-            bt = tl.load(trow + ks[:, None], mask = km[:, None] & ok[None, :], other = 0.0).to(tl.float32)
+            bt = tl.load(trow + ks[:, None], mask = km[:, None] & ok[None, :], other = 0.0)
             a = tl.load(wrow + ks[None, :], mask = nm[:, None] & km[None, :], other = 0.0)
-        acc += tl.dot(a, bt, input_precision = PRECISION)
+        acc += tl.dot(_tf32_operand(a, PRECISION), _tf32_operand(bt, PRECISION).to(tl.float32),   # (bf16: exact)
+                      input_precision = PRECISION)
     sc = tl.load(shift + ns.to(tl.int64) * C + c, mask = nm, other = float("-inf"))
     lz = tl.load(logz + ns, mask = nm, other = float("-inf"))
     val = tl.where((lz == float("-inf"))[:, None], float("-inf"), tl.log(acc) + (sc - lz)[:, None])

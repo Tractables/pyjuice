@@ -37,7 +37,7 @@ from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
 from ..external_params.block_scale import (_add_gated_parent, _chunk_gates, _edge_gates, _node_log_z, _row_gates,
                                            _segment_cell, _tile_gates)
-from .common import _child, _logaddexp_tile, grid_chunks
+from .common import _child, _logaddexp_tile, _tf32_operand, grid_chunks
 from .compact import _lane_sample
 
 
@@ -127,11 +127,13 @@ def _num_sms(dev) -> int:
 @triton.jit
 def _lse_dot_step(m, acc, x, w, PRECISION: tl.constexpr):
     """One chunk of children of the online log-sum-exp: ``x`` [children, columns] in log space, ``w`` [nodes,
-    children] the weights."""
+    children] the weights (the dot's operands rounded for ``PRECISION``, :func:`~.common._tf32_operand`)."""
     m_new = tl.maximum(m, tl.max(x, axis = 0))
     scale = tl.where(m_new == float("-inf"), 1.0, tl.exp(m - m_new))
     shift = tl.where(m_new == float("-inf"), 0.0, m_new)
-    return m_new, acc * scale[None, :] + tl.dot(w, tl.exp(x - shift[None, :]), input_precision = PRECISION)
+    return m_new, acc * scale[None, :] + tl.dot(_tf32_operand(w, PRECISION),
+                                                 _tf32_operand(tl.exp(x - shift[None, :]), PRECISION),
+                                                 input_precision = PRECISION)
 
 
 @triton.jit
@@ -142,7 +144,9 @@ def _lse_dot_step_biased(m, acc, x, w, bias, PRECISION: tl.constexpr):
     m_new = tl.maximum(m, tl.max(x, axis = 0) + bias)
     scale = tl.where(m_new == float("-inf"), 1.0, tl.exp(m - m_new))
     shift = tl.where(m_new == float("-inf"), 0.0, m_new - bias)
-    return m_new, acc * scale[None, :] + tl.dot(w, tl.exp(x - shift[None, :]), input_precision = PRECISION)
+    return m_new, acc * scale[None, :] + tl.dot(_tf32_operand(w, PRECISION),
+                                                 _tf32_operand(tl.exp(x - shift[None, :]), PRECISION),
+                                                 input_precision = PRECISION)
 
 
 @triton.jit
@@ -164,6 +168,8 @@ def _lse_dot_step_rows(m, acc, x, w, gates, gidx, offs, emask, samp, gstride, go
         xm3 = tl.max(tl.reshape(x, [NSEG, SEG, TILE_B]), axis = 1)                     # [NSEG, TILE_B]
         sh3 = tl.where(xm3 == float("-inf"), 0.0, xm3)
         e = tl.exp(x - tl.reshape(tl.broadcast_to(sh3[:, None, :], [NSEG, SEG, TILE_B]), [TILE_E, TILE_B]))
+    e = _tf32_operand(e, PRECISION)                                                  # (once for every segment)
+    w = _tf32_operand(w, PRECISION)
     for s in tl.static_range(NSEG):
         if NSEG == 1:
             seg = emask
@@ -185,13 +191,15 @@ def _lse_dot_step_rows(m, acc, x, w, gates, gidx, offs, emask, samp, gstride, go
 @triton.jit
 def _lse_dot_step_pre(m, acc, e, t, w, PRECISION: tl.constexpr):
     """:func:`_lse_dot_step` of a chunk whose shifted exponentials ``e`` [children, columns] and log-bound ``t``
-    [columns] (the chunk's maximum per column, plus a gate) were computed beforehand
-    (:func:`_top_down_prepass_kernel`): the running maximum and the rescale on columns only, then one dot."""
+    [columns] (the chunk's maximum per column, plus a gate) were computed beforehand, ``e`` rounded for ``PRECISION``
+    (:func:`_forward_prepass_kernel`, :func:`_top_down_prepass_kernel`): the running maximum and the rescale on
+    columns only, then one dot."""
     m_new = tl.maximum(m, t)
     live = m_new != float("-inf")
     scale = tl.where(live, tl.exp(m - m_new), 1.0)
     f = tl.where(live, tl.exp(t - m_new), 0.0)
-    return m_new, acc * scale[None, :] + tl.dot(w, e, input_precision = PRECISION) * f[None, :]
+    part = tl.dot(_tf32_operand(w, PRECISION), e, input_precision = PRECISION)
+    return m_new, acc * scale[None, :] + part * f[None, :]
 
 
 @triton.jit
@@ -473,12 +481,12 @@ def _lifted_sum_aux_kernel(node_mars, element_mars, weights, nids, cids, pids, n
 @triton_jit
 def _forward_prepass_kernel(element_mars, pre_buf, pre_cm, pre_ld, cids, nb_reg, reg_slots, perm, reg_perm, reg_live,
                             elem_first, elem_width, B, num_edges, pid0, TILE_E: tl.constexpr, TILE_B: tl.constexpr,
-                            PRUNE: tl.constexpr, ROUND: tl.constexpr):
+                            PRUNE: tl.constexpr, PRECISION: tl.constexpr):
     """One program per (chunk of ``TILE_E`` edges, tile of columns) of a fused forward launch whose node blocks share
     their children (``cids`` row 0, region ``nb_reg[0]``): the children's values, their maximum per column ``t`` and the
     shifted exponentials ``e = exp(x - t)``, stored at ``pre_buf[edge * pre_ld + k]`` and
-    ``pre_buf[pre_cm + chunk * pre_ld + k]`` by column position ``k``, as the forward kernel reads them; ``ROUND``: e
-    rounded to the nearest TF32 value (the CUDA kernel's TF32 products read it as it is)."""
+    ``pre_buf[pre_cm + chunk * pre_ld + k]`` by column position ``k``, as the forward kernel reads them; e rounded for
+    the products' ``PRECISION`` (:func:`~.common._tf32_operand`), which read it as it is."""
     chunk = tl.program_id(0)
     reg = tl.load(nb_reg)
     ncols = B * tl.load(reg_slots + reg)
@@ -500,9 +508,7 @@ def _forward_prepass_kernel(element_mars, pre_buf, pre_cm, pre_ld, cids, nb_reg,
         x = tl.load(element_mars + (cid - elem_first)[:, None] * elem_width + cols[None, :],
                     mask = valid[:, None] & cmask[None, :], other = float("-inf"))
         t = tl.max(x, axis = 0)
-        e = tl.exp(x - tl.where(t == float("-inf"), 0.0, t)[None, :])
-        if ROUND:                                        # (0 <= e <= 1: ties away from zero, as cvt.rna)
-            e = ((e.to(tl.int32, bitcast = True) + 0x1000) & -8192).to(tl.float32, bitcast = True)
+        e = _tf32_operand(tl.exp(x - tl.where(t == float("-inf"), 0.0, t)[None, :]), PRECISION)
         tl.store(pre_buf + offs_e.to(tl.int64)[:, None] * pre_ld + k[None, :], e,
                  mask = emask[:, None] & kmask[None, :])
         tl.store(pre_buf + pre_cm + chunk * pre_ld + k, t, mask = kmask)
@@ -766,7 +772,7 @@ def _cuda_top_down(plan, element_flows, node_flows, params, tables, regions, ele
             batch_size, npar, first, BS = 32, NGC = 32, TILE_I = 32, TILE_B = TILE_B, PRUNE = liveness is not None,
             INDEXED = idx is not None, GATED = gated is not None,
             LANES = gated is not None and gated["lanes"] is not None,
-            SHARED_GATES = gated is not None and gated["gstride"] == 0, REL = True, ROUND = precision == "tf32",
+            SHARED_GATES = gated is not None and gated["gstride"] == 0, REL = True, PRECISION = precision,
             num_warps = 4)
     ext = gated is not None
     sbuf = _cuda_split_buffer(dev, num_blocks, max_cols, tn, npar, split, element_flows)
@@ -851,7 +857,7 @@ def fused_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch
             _forward_prepass_kernel[(nch, size)](
                 element_mars, pre, nch * TILE_E * pre_ld, pre_ld, cids, nb_reg, regions["slots"], perm, reg_perm,
                 reg_live, elem_first, elem_width, batch_size, num_edges, first, TILE_E = TILE_E, TILE_B = TILE_B,
-                PRUNE = liveness is not None, ROUND = plan is not None and precision == "tf32", num_warps = 4)
+                PRUNE = liveness is not None, PRECISION = precision, num_warps = 4)
         pre_kw = dict(pre_args = (pre, nch * TILE_E * pre_ld, pre_ld))
         if plan is not None:
             _cuda_forward(plan, node_mars, params, nids, nb_reg, sel, num_blocks, regions, lanes, gated, g,
@@ -1279,7 +1285,7 @@ def _top_down_prepass_kernel(node_flows, pre_buf, pre_cm, pre_ld, cb_ivreg, cb_i
                              reg_ivk, Bq, steps, B, max_par, pid0, BS: tl.constexpr, NGC: tl.constexpr,
                              TILE_I: tl.constexpr, TILE_B: tl.constexpr, PRUNE: tl.constexpr, INDEXED: tl.constexpr,
                              GATED: tl.constexpr, LANES: tl.constexpr, SHARED_GATES: tl.constexpr,
-                             REL: tl.constexpr = False, ROUND: tl.constexpr = False):
+                             PRECISION: tl.constexpr, REL: tl.constexpr = False):
     """One program per (child block -- of the index list ``cb_idx`` if ``INDEXED`` --, its ``j``-th parent entry
     ``p``, chunk ``c`` of the parent's rows, tile of columns): the chunk's values -- less their log Z of the column's
     sample when ``GATED`` --, their maximum per column ``t`` and the shifted exponentials ``e = exp(x - t)``, stored at
@@ -1287,8 +1293,8 @@ def _top_down_prepass_kernel(node_flows, pre_buf, pre_cm, pre_ld, cb_ivreg, cb_i
     ``k`` (pruned: the interval's live columns first, as the top-down kernel reads them). The chunks are the top-down
     kernel's: ``TILE_I`` rows within every group of ``NGC`` (its node gate, or the block). ``REL``: stored by the
     entry's place ``j`` among the child block's (every child block's parents the same: the CUDA kernel's, one child
-    block's programs); ``ROUND``: e rounded to the nearest TF32 value (the CUDA kernel's TF32 products read it as it
-    is)."""
+    block's programs); e rounded for the products' ``PRECISION`` (:func:`~.common._tf32_operand`), which read it as
+    it is."""
     NCPG: tl.constexpr = (NGC + TILE_I - 1) // TILE_I
     NCH: tl.constexpr = (BS // NGC) * NCPG
     pid = tl.program_id(0)
@@ -1328,9 +1334,7 @@ def _top_down_prepass_kernel(node_flows, pre_buf, pre_cm, pre_ld, cb_ivreg, cb_i
         if GATED:
             x -= _node_log_z(lz, samp, lzstride, nid + offs_i, im, cmask, SHARED_GATES)
         t = tl.max(x, axis = 0)
-        e = tl.exp(x - tl.where(t == float("-inf"), 0.0, t)[None, :])
-        if ROUND:                                        # (0 <= e <= 1: ties away from zero, as cvt.rna)
-            e = ((e.to(tl.int32, bitcast = True) + 0x1000) & -8192).to(tl.float32, bitcast = True)
+        e = _tf32_operand(tl.exp(x - tl.where(t == float("-inf"), 0.0, t)[None, :]), PRECISION)
         p64 = (j if REL else p).to(tl.int64)
         tl.store(pre_buf + (p64 * BS + offs_i)[:, None] * pre_ld + k[None, :], e, mask = im[:, None] & kmask[None, :])
         tl.store(pre_buf + pre_cm + (p64 * NCH + c) * pre_ld + k, t, mask = kmask)
@@ -1402,7 +1406,7 @@ def fused_sum_top_down(element_flows: torch.Tensor, node_flows: torch.Tensor, pa
                 gl[2], gl[3], gl[4], gl[5], gl[6], gl[7], batch_size, tables["max_parents"], first, BS = block_size,
                 NGC = NGC, TILE_I = TILE_I, TILE_B = TILE_B, PRUNE = liveness is not None, INDEXED = idx is not None,
                 GATED = gated is not None, LANES = gated is not None and gated["lanes"] is not None,
-                SHARED_GATES = gated is not None and gated["gstride"] == 0, num_warps = 4)
+                SHARED_GATES = gated is not None and gated["gstride"] == 0, PRECISION = precision, num_warps = 4)
         aux, aux_kw = (pre, entries * block_size * pre_ld, pre_ld), dict(PRE = True)
     if split > 1 or aux:
         aux = (buf[0] if buf else element_flows,) + (aux or (element_flows, 0, 0))

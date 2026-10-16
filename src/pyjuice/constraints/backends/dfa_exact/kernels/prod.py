@@ -42,7 +42,7 @@ from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
 from ..compiled.layout import Reachability, _tile_any
-from .common import _block_ptr, _child, _exit_width, _interval, _lse_step, _pair, _slot, grid_chunks
+from .common import _block_ptr, _child, _exit_width, _interval, _lse_step, _pair, _slot, _tf32_operand, grid_chunks
 from .compact import _lane_pairs, _operand_slot
 from .transitions import transition_masses
 
@@ -487,7 +487,8 @@ def _block_block_tile(lp, rp, iv_table, lpos, rpos, mb, live_q, i, j, ti, tj, E,
             sR = tl.where(nR == float("-inf"), 0.0, nR)
             fL = tl.where(nL == float("-inf"), 1.0, tl.exp(mL - sL))
             fR = tl.where(nR == float("-inf"), 1.0, tl.exp(mR - sR))
-            acc = acc * fL[:, None] * fR[None, :] + tl.dot(tl.exp(lt - sL[:, None]), tl.exp(rt - sR[None, :]),
+            acc = acc * fL[:, None] * fR[None, :] + tl.dot(_tf32_operand(tl.exp(lt - sL[:, None]), PRECISION),
+                                                            _tf32_operand(tl.exp(rt - sR[None, :]), PRECISION),
                                                             input_precision = PRECISION)
             mL, mR = nL, nR
     sL = tl.where(mL == float("-inf"), 0.0, mL)
@@ -683,7 +684,8 @@ def _rect_product(ap, a0, a_stride, a_slot, a_pos, a_ncols, bp, b0, b_stride, b_
         sB = tl.where(nB == float("-inf"), 0.0, nB)
         fA = tl.where(nA == float("-inf"), 1.0, tl.exp(mA - sA))
         fB = tl.where(nB == float("-inf"), 1.0, tl.exp(mB - sB))
-        acc = acc * fA[:, None] * fB[None, :] + tl.dot(tl.exp(at - sA[:, None]), tl.exp(bt - sB[None, :]),
+        acc = acc * fA[:, None] * fB[None, :] + tl.dot(_tf32_operand(tl.exp(at - sA[:, None]), PRECISION),
+                                                        _tf32_operand(tl.exp(bt - sB[None, :]), PRECISION),
                                                         input_precision = PRECISION)
         mA, mB = nA, nB
     sA = tl.where(mA == float("-inf"), 0.0, mA)
