@@ -1,7 +1,7 @@
 """Optional plain-CUDA fast-path kernels for input distributions.
 
 One source file per distribution, named after its Python module (e.g. `softevi_categorical.cu` holds
-every CUDA kernel for `SoftEvidenceCategorical` in `softevi_categorical.py`).
+every CUDA kernel for `SoftEvidenceCategorical` in `softevi_categorical.py`, launched from `softevi/`).
 
 Mirrors ``pyjuice.layer.kernels.c.input_layers``: each kernel JIT-compiles on first use and disables
 itself -- falling back to the Triton implementation -- if anything required is missing (no CUDA, no

@@ -5,7 +5,7 @@ import torch
 
 import pyjuice as juice
 import pyjuice.nodes.distributions as dists
-from pyjuice.nodes.distributions import softevi_categorical as _softevi
+from pyjuice.nodes.distributions.softevi import backward as _sbw, dense_index as _dense, forward as _sfw
 
 
 # A `SoftEvidenceCategorical` leaf whose variable is MARGINALIZED carries no soft evidence: the forward
@@ -175,11 +175,11 @@ def _dense_setup(monkeypatch, use_dense, dual_flow = True, with_grad = False, fo
     device = torch.device("cuda:0")
     S, L, C, B, K = 4, 8, 64, batch_size, 32
 
-    monkeypatch.setattr(_softevi._l2_bytes, "_cached", 512, raising = False)
+    monkeypatch.setattr(_dense._l2_bytes, "_cached", 512, raising = False)
     if not use_dense:
-        monkeypatch.setattr(_softevi, "_DENSE_TOPK_BACKWARD", False)
+        monkeypatch.setattr(_dense, "_DENSE_TOPK_BACKWARD", False)
     elif force:
-        monkeypatch.setattr(_softevi, "_dense_worth_it", lambda layer, kwargs: True)
+        monkeypatch.setattr(_dense, "_dense_worth_it", lambda layer, kwargs: True)
 
     pc = _build(S, L, C, dual_flow = dual_flow, homogeneous = homogeneous)
     layer = pc.input_layer_group[0]
@@ -193,7 +193,7 @@ def _dense_setup(monkeypatch, use_dense, dual_flow = True, with_grad = False, fo
     if with_grad:
         probe["categorical_evidence_logp_grad"] = torch.zeros_like(kw["categorical_evidence_logp"])
     if force or not use_dense:
-        assert _softevi._dense_topk_applicable(layer, probe) == use_dense, \
+        assert _dense._dense_topk_applicable(layer, probe) == use_dense, \
             f"expected dense={use_dense}, got the other path"
 
     return pc, layer, data, kw, (S, L, C, B)
@@ -289,7 +289,7 @@ def _record_dense_timings(mp):
     from pyjuice.layer.kernels import autotune
 
     times, depth, active = [], [0], [False]
-    real_time, real_tune = autotune._median_time, _softevi._tune_dense_choice
+    real_time, real_tune = autotune._median_time, _dense._tune_dense_choice
 
     def timed(run, warmup, reps):
         depth[0] += 1
@@ -309,7 +309,7 @@ def _record_dense_timings(mp):
             active[0] = False
 
     mp.setattr(autotune, "_median_time", timed)
-    mp.setattr(_softevi, "_tune_dense_choice", tune)
+    mp.setattr(_dense, "_tune_dense_choice", tune)
     return times
 
 
@@ -354,7 +354,7 @@ def test_dense_choice_times_every_candidate_as_the_step_runs_it(cuda, mode):
                     # As without a toolchain: the probe says no, and every entry point would fail to build
                     # -- so a tuner that called one directly, rather than going through the gates, raises.
                     mp.setattr(c_kernels, "dense_expected_flow_available", lambda: False)
-                    mp.setattr(_softevi._DenseDenomDispatch, "_cuda_ok", lambda self: False)
+                    mp.setattr(_sbw._DenseDenomDispatch, "_cuda_ok", lambda self: False)
                     for entry in ("dense_expected_flow", "softevi_forward", "softevi_forward_dense"):
                         mp.setattr(c_kernels, entry, _no_toolchain)
                 times = _record_dense_timings(mp)
@@ -444,12 +444,12 @@ def test_dense_forward_shared_memory_limit(fits):
     for choice in ("scattered", "single"):
         with pytest.MonkeyPatch.context() as mp:
             if not fits:
-                mp.setattr(_softevi._fw_smem_cap, "_cached", 1024, raising = False)
+                mp.setattr(_dense._fw_smem_cap, "_cached", 1024, raising = False)
             pc, layer, data, kw, (S, L, C, B) = _dense_setup(mp, True, with_grad = True, force = False, batch_size = 800)
             layer._dense_choice_override = choice
             dense_fw = []
-            real_launch = _softevi._fw_launch_dense
-            mp.setattr(_softevi, "_fw_launch_dense", lambda *a: dense_fw.append(1) or real_launch(*a))
+            real_launch = _sfw._fw_launch_dense
+            mp.setattr(_sfw, "_fw_launch_dense", lambda *a: dense_fw.append(1) or real_launch(*a))
             pc.init_param_flows(flows_memory = 0.0)
             lls = pc(data, **kw).clone()
             grad = torch.zeros_like(kw["categorical_evidence_logp"])
@@ -457,7 +457,7 @@ def test_dense_forward_shared_memory_limit(fits):
             out[choice] = (lls, layer.param_flows.clone(), grad)
             if choice == "single":
                 assert bool(dense_fw) == fits, f"dense forward ran: {bool(dense_fw)}"
-                assert _softevi._dense_topk_applicable(layer, dict(kw, dual_flow_backward = True,
+                assert _dense._dense_topk_applicable(layer, dict(kw, dual_flow_backward = True,
                                                                    categorical_evidence_logp_grad = grad))
 
     for name, a, b in zip(("LL", "param flows", "evidence gradient"), out["single"], out["scattered"]):
@@ -472,7 +472,7 @@ def test_dense_path_on_other_structures(structure, monkeypatch):
     (both layouts) and compare a whole step with the scattered path."""
     device = torch.device("cuda:0")
     C, K, B, L = 64, 16, 6, 16
-    monkeypatch.setattr(_softevi._l2_bytes, "_cached", 512, raising = False)
+    monkeypatch.setattr(_dense._l2_bytes, "_cached", 512, raising = False)
     torch.manual_seed(5)
     leaf = lambda: dists.SoftEvidenceCategorical(num_cats = C, _dual_flow_backward = True)
     if structure == "hclt":
@@ -485,7 +485,7 @@ def test_dense_path_on_other_structures(structure, monkeypatch):
     pc = juice.compile(ns, verbose = False).to(device)
     layer = pc.input_layer_group[0]
     V = pc.num_vars
-    assert _softevi._dense_layer_layout(layer, V) is not None, "the dense layout does not cover this structure"
+    assert _dense._dense_layer_layout(layer, V) is not None, "the dense layout does not cover this structure"
 
     data = torch.randint(0, C, (B, V), device = device)
     kw = dict(categorical_evidence_logp = _evidence(B, V, K, device), soft_evidence_cat_ids = _topk_ids(B, V, K, C, data, device))
@@ -519,7 +519,7 @@ def test_dense_layouts_agree_with_scattered(homogeneous, split):
     for choice in ("scattered", "single", "ladder"):
         with pytest.MonkeyPatch.context() as mp:
             if split is not None:
-                mp.setattr(_softevi, "_DENSE_LIST_SPLIT", split)
+                mp.setattr(_dense, "_DENSE_LIST_SPLIT", split)
             pc, layer, data, kw, (S, L, C, B) = _dense_setup(mp, True, with_grad = True, force = False,
                                                              homogeneous = homogeneous)
             layer._dense_choice_override = choice
@@ -555,10 +555,10 @@ def test_forward_and_backward_share_one_dense_index():
             pc, layer, data, kw, (S, L, C, B) = _dense_setup(mp, True, with_grad = True, force = False)
             # As if tuned to the dense ladder -- through the choice CACHE, under the step's own key, which is
             # the path whose key once changed mid-forward (a forced override would bypass it).
-            key = _softevi._dense_choice_key(layer, dict(kw, dual_flow_backward = True))
+            key = _dense._dense_choice_key(layer, dict(kw, dual_flow_backward = True))
             autotune._CACHE[autotune._full_key(key)] = "ladder"
             builds = []
-            real = _softevi._build_dense_index
+            real = _dense._build_dense_index
 
             def counting(layer_, kwargs, ladder = None):
                 cached = getattr(layer_, "_dense_index_cache", None)
@@ -569,7 +569,8 @@ def test_forward_and_backward_share_one_dense_index():
                     builds.append(ladder)
                 return index
 
-            mp.setattr(_softevi, "_build_dense_index", counting)
+            for mod in (_dense, _sfw, _sbw):                     # every module that calls it
+                mp.setattr(mod, "_build_dense_index", counting)
             for _ in range(3):                                   # the first steps may tune; then steady state
                 _grad_step(pc, data, None, **{k: v.clone() for k, v in kw.items()})
             builds.clear()
@@ -604,10 +605,10 @@ def test_dense_triton_fallback_reads_only_valid_references(dual_flow, split, mon
     for use_dense in (True, False):
         with pytest.MonkeyPatch.context() as mp:
             if split is not None:
-                mp.setattr(_softevi, "_DENSE_LIST_SPLIT", split)
+                mp.setattr(_dense, "_DENSE_LIST_SPLIT", split)
             pc, layer, data, kw, (S, L, C, B) = _dense_setup(mp, use_dense, dual_flow = dual_flow, with_grad = True)
             if use_dense:
-                mp.setattr(_softevi._DenseDenomDispatch, "_cuda_ok", lambda self: False)
+                mp.setattr(_sbw._DenseDenomDispatch, "_cuda_ok", lambda self: False)
                 mp.setattr(torch, "empty", poisoned_empty)
             flows[use_dense] = _grad_step(pc, data, None, **kw)
             if use_dense:

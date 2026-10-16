@@ -353,7 +353,7 @@ def _bf16_circuit(dev, num_cats = None):
     # threshold was raised from 4096 to 32768 this helper's hardcoded 4096 fell below it, which made
     # one test fail loudly and -- worse -- made `test_bf16_params_changes_the_answer_only_slightly`
     # pass VACUOUSLY, since fp32 and bf16 are trivially equal when neither takes the GEMM.
-    from pyjuice.nodes.distributions.softevi_categorical import _GEMM_MIN_CATS
+    from pyjuice.nodes.distributions.softevi.forward import _GEMM_MIN_CATS
     if num_cats is None:
         num_cats = _GEMM_MIN_CATS
     torch.manual_seed(0)
