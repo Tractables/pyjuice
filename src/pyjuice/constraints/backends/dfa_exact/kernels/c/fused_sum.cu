@@ -6,8 +6,10 @@
 // Every chunk's shifted exponentials `e = exp(x - t)` and its maximum per column `t` are computed beforehand
 // (`_forward_prepass_kernel` / `_top_down_prepass_kernel`, in `pre_buf`, the parents' less their log Z; at TF32, e on
 // the TF32 grid already). With external parameters (BlockScale, see `..external_params.block_scale`) every (row block,
-// chunk) reads one log-scale cell s of the column's sample -- staged per (block, sample) where the tile's columns are of
-// few samples (TILE_SAMPLES), else per column; forward, every node's log Z of the sample is taken off.
+// chunk) reads one log-scale cell s of the column's sample, from the session's scales stored sample-minor (a cell's
+// samples side by side): a chunk stages every block's scales of the tile's samples -- a range, its columns being in
+// sample order -- 16 bytes at a time, or, a range wider than the tile (samples without a column between), a scale per
+// column; forward, every node's log Z of the sample is taken off.
 //
 // Per output tile -- 4 row blocks (128 rows) x TN columns (64 to 128, the launch's), a CTA of 8 warps, a warp one
 // block's 32 rows x TN / 2 columns -- and share of the chunks (grid z): a first pass gives every (row block, column)
@@ -40,8 +42,8 @@
 #define SPLIT_TILES 4096   // the split buffer's counters (`kernels/sum.py`, SPLIT_TILES): not used here
 #define MAX_SHARE_CELLS 256    // external parameters: the most chunks a share (their cells in shared memory)
 #define MAX_SHARE_TABLE 128    // weights not in one run per block: the most chunks a share (their firsts too)
-#define TILE_SAMPLES 8         // external parameters: a tile's columns of at most this many samples (a range: lanes
-                               // are in sample order) stage their scales per (block, sample), not per column
+#define OFF_SAMPLES 255        // external parameters, lanes: up to this many samples, the column's interval's lane
+                               // offsets are read once into shared memory and its columns' samples found there
 
 
 // An index table of either width (the backend's tables are int32 or int64)
@@ -91,8 +93,9 @@ struct Tile {
     static constexpr int A_LD = TD ? 36 : 40;
     static constexpr int B_LD = TN + 8;                // a row of a B tile (one reduction row's columns), padded
     static constexpr int J = TN / 16;                  // a warp's tiles of 8 columns
+    static constexpr int SL = TN + 4;                  // a block's scales: its samples from a multiple of 4, or columns
     static constexpr int A_ST = NBT * BS * A_LD, B_ST = BS * B_LD;
-    static constexpr int ST = A_ST + B_ST + TN + NBT * TN;
+    static constexpr int ST = A_ST + B_ST + TN + NBT * SL;
     static constexpr int SHARE = NBT * BS * TN + NBT * TN;          // a share's sums and shifts in the split buffer
     static constexpr int HEAD = 4 * TN;                             // a tile's columns (int64) and samples first
 };
@@ -110,9 +113,9 @@ struct Args {
     Idx reg_offset, reg_width, reg_first, reg_slots;
     Idx perm, reg_perm, reg_live;     // prune: the lane order
     long long elem_first, elem_width; // TD: the element rows
-    const float* scales;              // EXT: the external parameters' log-scales
-    const int* cells;                 // [blocks, chunks]: every chunk's cell
-    long long sstride;                // floats per sample (0: every sample's)
+    const float* scales;              // EXT: the external parameters' log-scales, sample-minor: cell k of sample s at
+    const int* cells;                 // k sstride + s (sstride 0: every sample's, cell k at k); [blocks, chunks]: every
+    long long sstride;                // chunk's cell
     const float* lz;                  // EXT forward: log Z by node row, lzstride per sample
     long long lzstride;
     Idx coff, reg_ivk;                // lanes: compact rows, every lane's sample by a binary search
@@ -172,7 +175,8 @@ __global__ void __launch_bounds__(THREADS) fused_sum_kernel(Args a) {
     long long* Cs = reinterpret_cast<long long*>(Ts + NBT * TN);   // [TN] the columns
     int* Ss = reinterpret_cast<int*>(Cs + TN);                      // [TN] their samples
     int* Cl = Ss + TN;                                              // EXT: [NBT][share] the chunks' cells
-    long long* Wb = reinterpret_cast<long long*>(Cl + (EXT ? NBT * a.share : 0));   // !affine: [NBT][share]
+    long long* Off = reinterpret_cast<long long*>(Cl + (EXT ? NBT * a.share : 0));  // EXT: lanes' offsets
+    long long* Wb = Off + (EXT ? OFF_SAMPLES + 1 : 0);              // !affine: [NBT][share]
     __shared__ Where w;
     __shared__ int s_lo, s_hi;                                      // EXT: the tile's columns' samples, a range
 
@@ -197,17 +201,31 @@ __global__ void __launch_bounds__(THREADS) fused_sum_kernel(Args a) {
         }
         return;
     }
+    // lanes: a column's sample is the last whose lanes start at or before it (the interval's offsets, Bq + 1 of them)
+    const bool search = EXT && a.sstride != 0 && a.lanes, near = search && a.Bq <= OFF_SAMPLES;
+    const long long obase = search ? a.reg_ivk[w.reg] * (a.Bq + 1) : 0;
+    if (near)                                           // (read once)
+        for (int i = tid; i <= a.Bq; i += THREADS) Off[i] = a.coff[obase + i];
+    for (int i = tid; i < NBT * a.share; i += THREADS) {  // the share's cells and (not one run) first weights
+        const int b = i / a.share, ch = ch0 + i % a.share;
+        const bool v = w.nbs[b] >= 0 && ch < ch1;
+        if (EXT) Cl[i] = v ? a.cells[w.nbs[b] * a.nch + ch] : 0;
+        if (!a.affine) Wb[i] = v ? a.wbase[w.nbs[b] * a.nch + ch] : 0;
+    }
+    long long w0[NBT];                                  // affine: every block's first weight
+    #pragma unroll
+    for (int b = 0; b < NBT; ++b) w0[b] = a.affine && w.nbs[b] >= 0 ? a.wbase[w.nbs[b] * a.nch] : 0;
+    if (near) __syncthreads();                          // (the offsets in)
     for (int c = tid; c < TN; c += THREADS) {           // every column and its sample
         long long k = col0 + c;
         long long col = k < w.ncols ? (a.prune ? a.perm[a.reg_perm[w.reg] + k] : k) : 0;
         int s = 0;
         if (EXT && a.sstride != 0) {
-            if (a.lanes) {                              // the last sample whose lanes start at or before it
-                long long base = a.reg_ivk[w.reg] * (a.Bq + 1);
+            if (search) {
                 int lo = 0, hi = a.Bq;
                 for (int st = 0; st < a.steps; ++st) {
                     int mid = (lo + hi + 1) / 2;
-                    bool go = a.coff[base + mid] <= col;
+                    bool go = (near ? Off[mid] : a.coff[obase + mid]) <= col;
                     lo = go ? mid : lo;
                     hi = go ? hi : mid - 1;
                 }
@@ -223,18 +241,10 @@ __global__ void __launch_bounds__(THREADS) fused_sum_kernel(Args a) {
             atomicMax(&s_hi, s);
         }
     }
-    for (int i = tid; i < NBT * a.share; i += THREADS) {  // the share's cells and (not one run) first weights
-        const int b = i / a.share, ch = ch0 + i % a.share;
-        const bool v = w.nbs[b] >= 0 && ch < ch1;
-        if (EXT) Cl[i] = v ? a.cells[w.nbs[b] * a.nch + ch] : 0;
-        if (!a.affine) Wb[i] = v ? a.wbase[w.nbs[b] * a.nch + ch] : 0;
-    }
-    long long w0[NBT];                                  // affine: every block's first weight
-    #pragma unroll
-    for (int b = 0; b < NBT; ++b) w0[b] = a.affine && w.nbs[b] >= 0 ? a.wbase[w.nbs[b] * a.nch] : 0;
     __syncthreads();
-    const int lo = s_lo, ns = s_hi - s_lo + 1;          // EXT: the scales per (block, sample), when few samples
-    const bool few = EXT && ns <= TILE_SAMPLES;
+    const int lo4 = s_lo & ~3, span = s_hi - lo4 + 1;   // EXT: the tile's samples, from a multiple of 4
+    const bool ranged = EXT && a.sstride != 0 && span <= TT::SL;    // (else a scale per column)
+    const int q4 = (span + 3) / 4;                      // ranged: a block's copies of 16 bytes
 
     auto load = [&](int ch, int st) {                   // chunk ch into stage st
         float* As = smem + st * TT::ST;
@@ -259,24 +269,31 @@ __global__ void __launch_bounds__(THREADS) fused_sum_kernel(Args a) {
             const int bytes = (int)max(0LL, min(16LL, 4 * (w.ncols - pos)));
             cp_async16(tS + 4 * i, a.pre + a.pre_cm + (long long)ch * a.pre_ld + (bytes ? pos : 0), bytes);
         }
-        if (EXT && few)                                                 // s per (block, sample)
-            for (int i = tid; i < NBT * TILE_SAMPLES; i += THREADS) {
-                const int b = i / TILE_SAMPLES, r = i % TILE_SAMPLES;
-                const bool v = w.nbs[b] >= 0 && r < ns;
-                cp_async4(sS + i, a.scales + (v ? (long long)(lo + r) * a.sstride + Cl[b * a.share + ch - ch0] : 0), v);
+        if (EXT && a.sstride == 0)                                      // every sample's: s per block
+            for (int b = tid; b < NBT; b += THREADS) {
+                const bool v = w.nbs[b] >= 0;
+                cp_async4(sS + b * TT::SL, a.scales + (v ? Cl[b * a.share + ch - ch0] : 0), v);
+            }
+        else if (ranged)                                                // s per (block, sample), 4 samples a copy
+            for (int i = tid; i < NBT * q4; i += THREADS) {
+                const int b = i / q4, k = 4 * (i % q4);
+                const bool v = w.nbs[b] >= 0;
+                const long long at = v ? (long long)Cl[b * a.share + ch - ch0] * a.sstride + lo4 + k : 0;
+                cp_async16(sS + b * TT::SL + k, a.scales + at, v ? 16 : 0);
             }
         else if (EXT)                                                   // s per (block, column)
             for (int i = tid; i < NBT * TN; i += THREADS) {
                 const int b = i / TN, c = i % TN;
                 const bool v = w.nbs[b] >= 0 && col0 + c < w.ncols;
-                cp_async4(sS + i, a.scales + (v ? (long long)Ss[c] * a.sstride + Cl[b * a.share + ch - ch0] : 0), v);
+                const long long at = v ? (long long)Cl[b * a.share + ch - ch0] * a.sstride + Ss[c] : 0;
+                cp_async4(sS + b * TT::SL + c, a.scales + at, v);
             }
     };
     load(ch0, 0);                                       // (under pass 1)
     cp_commit();
 
-    {   // pass 1: T = max over the share's chunks of t + s -- a thread's one or two (block, column)s together (their
-        // loads in flight)
+    {   // pass 1: T = max over the share's chunks of t + s -- a thread's one or two (block, column)s together, which of
+        // them are live tested once, outside the loops (a loop without a test: its loads in flight together)
         static_assert(NBT * TN >= THREADS && NBT * TN <= 2 * THREADS, "a thread's one or two (block, column)s");
         const int i1 = tid + THREADS;
         const int b0 = tid / TN, c0 = tid % TN, b1 = i1 / TN, c1 = i1 % TN;
@@ -284,20 +301,36 @@ __global__ void __launch_bounds__(THREADS) fused_sum_kernel(Args a) {
         const bool v1 = i1 < NBT * TN && w.nbs[min(b1, NBT - 1)] >= 0 && col0 + c1 < w.num_live;
         const float* tp0 = a.pre + a.pre_cm + col0 + c0;
         const float* tp1 = a.pre + a.pre_cm + col0 + c1;
-        const float* sp0 = a.scales + (long long)Ss[c0] * a.sstride;
-        const float* sp1 = a.scales + (long long)Ss[c1] * a.sstride;
+        const long long cm = a.sstride != 0 ? a.sstride : 1;          // (sample-minor: a warp's columns side by side)
+        const float* sp0 = a.scales + (a.sstride != 0 ? Ss[c0] : 0);
+        const float* sp1 = a.scales + (a.sstride != 0 ? Ss[c1] : 0);
         float T0 = -CUDART_INF_F, T1 = -CUDART_INF_F;
-        #pragma unroll 8
-        for (int ch = ch0; ch < ch1; ++ch) {
-            if (v0) {
-                float t = tp0[(long long)ch * a.pre_ld];
-                if (EXT) t += sp0[Cl[b0 * a.share + ch - ch0]];
-                T0 = fmaxf(T0, t);
+        const int* cl0 = Cl + b0 * a.share - ch0;
+        const int* cl1 = Cl + min(b1, NBT - 1) * a.share - ch0;
+        if (v0 && v1) {
+            #pragma unroll 16
+            for (int ch = ch0; ch < ch1; ++ch) {
+                float t0 = tp0[(long long)ch * a.pre_ld], t1 = tp1[(long long)ch * a.pre_ld];
+                if (EXT) {
+                    t0 += sp0[cl0[ch] * cm];
+                    t1 += sp1[cl1[ch] * cm];
+                }
+                T0 = fmaxf(T0, t0);
+                T1 = fmaxf(T1, t1);
             }
-            if (v1) {
-                float t = tp1[(long long)ch * a.pre_ld];
-                if (EXT) t += sp1[Cl[b1 * a.share + ch - ch0]];
-                T1 = fmaxf(T1, t);
+        } else if (v0) {
+            #pragma unroll 16
+            for (int ch = ch0; ch < ch1; ++ch) {
+                float t0 = tp0[(long long)ch * a.pre_ld];
+                if (EXT) t0 += sp0[cl0[ch] * cm];
+                T0 = fmaxf(T0, t0);
+            }
+        } else if (v1) {
+            #pragma unroll 16
+            for (int ch = ch0; ch < ch1; ++ch) {
+                float t1 = tp1[(long long)ch * a.pre_ld];
+                if (EXT) t1 += sp1[cl1[ch] * cm];
+                T1 = fmaxf(T1, t1);
             }
         }
         Ts[tid] = T0;
@@ -313,9 +346,12 @@ __global__ void __launch_bounds__(THREADS) fused_sum_kernel(Args a) {
             for (int q = 0; q < 4; ++q) acc[i][j][q] = 0.f;
     const int wb = warp >> 1, wc = (warp & 1) * (TN / 2);   // the warp's block and first column
     const bool fl = lane < TN / 4;                      // lane l: the factors of the warp's columns wc + 2 l, + 1
-    int slot[2];                                        // EXT, few samples: their samples
+    int slot[2];                                        // EXT: the lane's two columns' scales in a block's
     #pragma unroll
-    for (int h = 0; h < 2; ++h) slot[h] = few && fl ? max(Ss[wc + 2 * lane + h] - lo, 0) : 0;
+    for (int h = 0; h < 2; ++h) {
+        const int c = wc + 2 * lane + h;
+        slot[h] = !EXT || !fl || a.sstride == 0 ? 0 : ranged ? min(max(Ss[c] - lo4, 0), TT::SL - 1) : c;
+    }
 
     // A chunk: its copies waited for, the next chunk's issued under its products, its sums into P and the lane's two
     // factors into G (shuffled to the fold)
@@ -328,15 +364,14 @@ __global__ void __launch_bounds__(THREADS) fused_sum_kernel(Args a) {
         const float* A = smem + st * TT::ST + wb * BS * TT::A_LD;
         const float* Bt = smem + st * TT::ST + TT::A_ST;
         const float* tS = Bt + TT::B_ST;
-        const float* sS = tS + TN + wb * (few ? TILE_SAMPLES : TN);
-        const float s1 = EXT && ns == 1 ? sS[0] : 0.f;   // (one sample: one scale for every column)
+        const float* sS = tS + TN + wb * TT::SL;
         #pragma unroll
         for (int h = 0; h < 2; ++h) {
             const int c = wc + 2 * lane + h;
             G[h] = 0.f;
             if (fl) {
                 const float T = Ts[wb * TN + c];
-                const float t = !EXT ? tS[c] : tS[c] + (ns == 1 ? s1 : few ? sS[slot[h]] : sS[c]);
+                const float t = !EXT ? tS[c] : tS[c] + sS[slot[h]];
                 G[h] = T != -CUDART_INF_F && t != -CUDART_INF_F ? __expf(t - T) : 0.f;
             }
         }
@@ -495,9 +530,10 @@ __global__ void __launch_bounds__(THREADS) fused_sum_merge_kernel(Args a) {
 
 
 static size_t smem_bytes(int tn, bool td, bool ext, int share, bool affine) {
-    const int st = NBT * BS * (td ? 36 : 40) + BS * (tn + 8) + tn + NBT * tn;
+    const int st = NBT * BS * (td ? 36 : 40) + BS * (tn + 8) + tn + NBT * (tn + 4);
     return (2 * st + NBT * tn) * sizeof(float) + tn * (sizeof(long long) + sizeof(int)) +
-           (ext ? NBT * share * sizeof(int) : 0) + (affine ? 0 : NBT * share * sizeof(long long));
+           (ext ? NBT * share * sizeof(int) + (OFF_SAMPLES + 1) * sizeof(long long) : 0) +
+           (affine ? 0 : NBT * share * sizeof(long long));
 }
 
 // A kernel may take as much shared memory as a block may have (set once)

@@ -665,13 +665,13 @@ def _cuda_forward(plan, node_mars, params, nids, nb_reg, sel, num_blocks, region
     mod, (wbase, cells, nch, affine), tn, split = plan
     sbuf = _cuda_split_buffer(node_mars.device, num_blocks, max_cols, tn, nch, split, node_mars)
     pre, pre_cm, pre_ld = pre_args
-    _, _, _, scales, sstride, lz, lzstride, coff, reg_ivk, Bq, steps = g
+    _, _, _, _, sstride, lz, lzstride, coff, reg_ivk, Bq, steps = g
     ext = gated is not None
     perm, reg_perm, reg_live = (lanes.perm, lanes.reg_first, lanes.reg_live) if lanes is not None else (nids,) * 3
     mod.fused_sum_cuda(False, node_mars, node_mars, params, wbase, 1024, pre, pre_ld, pre_cm, nids, nb_reg, nb_reg,
                        nids if sel is None else sel, regions["offset"], regions["width"], regions["first"],
-                       regions["slots"], perm, reg_perm, reg_live, 0, 0, scales if ext else node_mars,
-                       cells if ext else _int32_dummy(node_mars.device), sstride if ext else 0,
+                       regions["slots"], perm, reg_perm, reg_live, 0, 0, gated["minor"] if ext else node_mars,
+                       cells if ext else _int32_dummy(node_mars.device), gated["mstride"] if ext else 0,
                        lz if ext else node_mars, lzstride if ext else 0, coff, reg_ivk, Bq, steps, batch_size,
                        num_blocks, nch, max_cols, ext, ext and sstride == 0, ext and gated["lanes"] is not None,
                        lanes is not None, sel is not None, precision == "tf32x3", affine, tn, sbuf, split)
@@ -773,7 +773,8 @@ def _cuda_top_down(plan, element_flows, node_flows, params, tables, regions, ele
     mod.fused_sum_cuda(True, element_flows, node_flows, params, wbase, wstride, pre, pre_ld, npar * 32 * pre_ld, rows,
                        rreg, colreg, rows if sel is None else sel, regions["offset"], regions["width"],
                        regions["first"], regions["slots"], perm, reg_perm, reg_live, elem_first, elem_width,
-                       gl[0] if ext else element_flows, cells if ext else _int32_dummy(dev), gl[1] if ext else 0,
+                       gated["minor"] if ext else element_flows, cells if ext else _int32_dummy(dev),
+                       gated["mstride"] if ext else 0,
                        element_flows, 0, gl[4], gl[5], gl[6], gl[7], batch_size, num_blocks, npar, max_cols, ext,
                        ext and gl[1] == 0, ext and gated["lanes"] is not None, liveness is not None, sel is not None,
                        precision == "tf32x3", affine, tn, sbuf, split)

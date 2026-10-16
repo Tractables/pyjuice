@@ -157,6 +157,24 @@ class SessionGates:
     scopes: list
     nodes: list = field(default_factory = list)
     _logz: Optional[torch.Tensor] = None
+    _minor: Optional[torch.Tensor] = None
+
+
+def sample_minor(gates: SessionGates) -> torch.Tensor:
+    """
+    The gates' log-scales sample-minor: fp32 [cells, batch rounded up to 4] on the device, cell ``k`` of sample ``b``
+    at ``[k, b]`` (0 past the batch) -- a cell's samples side by side, as the CUDA fused sums read a tile's range of
+    them, 16 bytes at a time. Built on first use, then kept with the gates (a batch of one: ``values`` itself).
+    """
+    if gates._minor is None:
+        if gates.batch == 1:
+            gates._minor = gates.values.view(-1, 1)
+        else:
+            minor = torch.zeros(gates.values.size(1), -(-gates.batch // 4) * 4, dtype = torch.float32,
+                                device = gates.values.device)
+            minor[:, :gates.batch] = gates.values.t()
+            gates._minor = minor
+    return gates._minor
 
 
 def session_inputs(pc, layout: Cells, value) -> SessionGates:

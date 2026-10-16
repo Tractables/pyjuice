@@ -72,13 +72,14 @@ def missing_tensor(missing_mask: Optional[torch.Tensor], B: int, n: int, dev) ->
 
 def gate_context(backend, external) -> Optional[dict]:
     """The gates a query's gated sum layers read (:mod:`..external_params.block_scale`): None
-    without, else ``values`` and ``lz`` (the session's log gates and log normalizers) and ``layers`` (bool per gated
+    without, else ``values`` and ``lz`` (the session's log gates and log normalizers), ``minor`` (the log gates
+    sample-minor, :func:`~..external_params.block_scale.sample_minor`, for the CUDA sums) and ``layers`` (bool per gated
     layer: those given gates)."""
     gates = None if external is None else external.gates
     if gates is None:
         return None
     lz = block_scale.log_normalizers(backend.pc, backend.program().gate_cells, gates)
-    return dict(values = gates.values, lz = lz, layers = gates.layers)
+    return dict(values = gates.values, lz = lz, minor = block_scale.sample_minor(gates), layers = gates.layers)
 
 
 def part_gates(gates: Optional[dict], gate: Optional[dict], compact, prog, once: bool) -> Optional[dict]:
@@ -100,7 +101,8 @@ def part_gates(gates: Optional[dict], gate: Optional[dict], compact, prog, once:
             prog.reg_iv_all_t = torch.from_numpy(prog.reg_iv_all).to(prog.dev)
         lanes = (compact.off, prog.reg_iv_all_t, compact.B, compact.steps)
     return dict(values = gates["values"], gstride = 0 if shared else gates["values"].size(1), lz = gates["lz"],
-                lzstride = 0 if shared else gates["lz"].size(1), lanes = lanes, idx = gate.get("idx"),
+                lzstride = 0 if shared else gates["lz"].size(1), minor = gates["minor"],
+                mstride = 0 if shared else gates["minor"].size(1), lanes = lanes, idx = gate.get("idx"),
                 a_idx = gate.get("a_idx"), uniform = gate["uniform"], a_uniform = gate.get("a_uniform", {}),
                 ck = gate.get("ck"), node_gate = gate["node_gate"])
 
