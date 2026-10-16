@@ -19,7 +19,6 @@ import torch
 import pyjuice as juice
 import pyjuice.constraints as jc
 import pyjuice.nodes.distributions as dists
-from pyjuice.nodes import inputs, multiply, summate
 from pyjuice.constraints.backends.dfa_exact.kernels import prod_top_down
 from pyjuice.constraints.backends.dfa_exact.kernels.c import get_module
 from pyjuice.constraints.backends.dfa_exact.queries import forward as F
@@ -525,32 +524,12 @@ def test_wide_automata(kind, storage, build_pc, reference):
     assert_top_down_close(cc, got, reference.top_down(cc, data, missing), data, missing)
 
 
-def walks_circuit(V, unit = False, input_dist = dists.Categorical):
-    """``input @ block`` steps over 6 variables that reach the CUDA top-down walk (kernels/c/walk.cu) from every side:
-    ``s3`` under two products of different inputs at position 2 (two parents per child), over intervals ending before
-    the sequence ([3, 4) and [2, 4): pairs the automaton does not join), in a three-child product (folds); ``unit``:
-    blocks of one node, every node tile one row."""
-    nb, bs = (1, 1) if unit else (2, 2)
-    x = [inputs(v, num_node_blocks = nb, block_size = bs, dist = input_dist(num_cats = V)) for v in range(6)]
-    x2 = inputs(2, num_node_blocks = nb, block_size = bs, dist = input_dist(num_cats = V))
-    s3 = summate(x[3], num_node_blocks = nb, block_size = bs)
-    s24 = summate(multiply(x[2], s3), multiply(x2, s3), num_node_blocks = nb, block_size = bs)
-    s01 = summate(multiply(x[0], x[1]), num_node_blocks = nb, block_size = bs)
-    s45 = summate(multiply(x[4], x[5]), num_node_blocks = nb, block_size = bs)
-    root = summate(multiply(s01, s24, s45), num_node_blocks = 1, block_size = 1)
-    torch.manual_seed(0)
-    root.init_parameters(perturbation = 2.0)
-    return juice.compile(root, verbose = False).to(torch.device("cuda:0"))
-
-
-#: the circuits of the walk's tests: conftest.py's kinds with ``input @ block`` steps, and :func:`walks_circuit`'s
+#: the circuits of the walk's tests: conftest.py's kinds with ``input @ block`` steps
 WALK_KINDS = {"hmm": 6, "hmm_block_sparse": 6, "hand": 5, "hand_left": 5, "hand_fold": 4, "walks": 6, "walks_unit": 6}
 
 
-def walk_pc(kind, build_pc, input_dist = dists.Categorical):
-    if kind.startswith("walks"):
-        return walks_circuit(V, unit = kind == "walks_unit", input_dist = input_dist)
-    return build_pc(kind, WALK_KINDS[kind], V, input_dist = None if input_dist is dists.Categorical else input_dist)
+def walk_pc(kind, build_pc, input_dist = None):
+    return build_pc(kind, WALK_KINDS[kind], V, input_dist = input_dist)
 
 
 @pytest.fixture

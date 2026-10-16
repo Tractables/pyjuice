@@ -240,7 +240,8 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
 
     C = backend.num_classes
     buf = backend.state.storage_view("dfa_class_flow", size)
-    buf.fill_(-float("inf"))
+    if plan.top_down.cw_fill:                           # (every weight stored by the launch writing it first: no fill)
+        buf.fill_(-float("inf"))
     cw = dict(buf = buf, base = base, K = K)
     run_backward(backend, bufs, flows, plan, x, missing, obs_class, lv, precision, class_weights = cw,
                  masses = masses, compact = compact, gates = gates)

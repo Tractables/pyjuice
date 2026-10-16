@@ -4,7 +4,8 @@ the test reference's (``reference.conditional``) on every kind of PC in conftest
 and every pattern of evidence, through every sum path; the class weights it scores (``dfa_class_flow``, which the
 normalized rows cannot check: a factor common to every class cancels) against the reference's input nodes' top-down
 blocks; ``log p(C, e)`` against the marginal; targets; evidence and constraints no string satisfies; the token tables'
-lifetime, in fp32 and bf16; tf32. Decoding with values reused between queries is in decoder_test.py.
+lifetime, in fp32 and bf16; tf32. The class weights stored by the launch writing them first, the others log-added to a
+fill only where needed. Decoding with values reused between queries is in decoder_test.py.
 """
 import random
 
@@ -21,6 +22,7 @@ from pyjuice.constraints.backends.dfa_exact.queries import marginal as QM
 from pyjuice.constraints.backends.dfa_exact.queries.conditional import class_weights
 from pyjuice.constraints.backends.dfa_exact.kernels import score as S
 from pyjuice.constraints.backends.dfa_exact.kernels.score import score_tables
+from pyjuice.constraints.backends.dfa_exact.queries import plans as QP
 from pyjuice.constraints.distributions import TokenClasses
 from pyjuice.constraints.evidence import candidate_tensor
 
@@ -521,3 +523,79 @@ def test_class_tiles():
             ids = tile[tile >= 0]
             assert ids.numel() and (token_class[ids] == c).all() and (ids.diff() > 0).all()
             assert (tile[ids.numel():] == -1).all()
+
+
+def cw_weights(cc, data, missing, storage = "compact"):
+    """The class weights of a query whose targets are its missing positions (cloned)."""
+    positions = missing.any(dim = 0).numpy()
+    with torch.no_grad():
+        groups, _ = class_weights(cc.backend, data, missing.to(cc.pc.params.device), positions, storage = storage)
+    return [w.clone() for _, _, w in groups]
+
+
+def forced_fill(real):
+    """:func:`~...queries.planners.class_weight_writes` as if every launch log-added to a fill."""
+    def writes(prog, steps, positions):
+        real(prog, steps, positions)
+        for step in steps:
+            if step is None or step[0] != "prod":
+                continue
+            for _, stages, _, _ in step[2]:
+                for _, _, cws in stages:
+                    cws[:] = [(la, item, False) for la, item, _ in cws]
+        return True
+    return writes
+
+
+@pytest.mark.parametrize("storage", ["dense", "compact"])
+@pytest.mark.parametrize("pattern", ["none", "prefix", "mixed", "ruled_out"])
+@pytest.mark.parametrize("kind", list(KINDS) + ["walks", "hand_dead"])
+def test_class_weights_are_stored_once_or_added_to_a_fill(kind, pattern, storage, build_pc, monkeypatch):
+    """A plan's class weight launches store the weights where they write each destination first and log-add them
+    elsewhere, ``dfa_class_flow`` filled with -inf only where a launch adds to nothing yet or a weight is written by
+    none (``cw_fill``, :func:`~...queries.planners.class_weight_writes`; ``hand_dead``: steps without a top-down value):
+    with the buffer poisoned (NaN) before every query, the weights are what log-adding every launch's to a fill gives,
+    bit for bit -- also where the evidence leaves no sample a live column (``ruled_out``: every launch still writes)."""
+    n = {"walks": 6, "hand_dead": 3}.get(kind, KINDS.get(kind))
+    if pattern == "ruled_out":                                   # 0s around one missing token: never "1 2"
+        data, missing = torch.zeros(4, n, dtype = torch.long), torch.zeros(4, n, dtype = torch.bool)
+        missing[:, n // 2] = True
+    else:
+        data, missing = evidence(pattern, n)
+    out = {}
+    for force in (False, True):
+        with monkeypatch.context() as m:
+            if force:
+                m.setattr(QP, "class_weight_writes", forced_fill(QP.class_weight_writes))
+            cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
+            view = cc.backend.state.storage_view
+
+            def poisoned(name, numel):
+                v = view(name, numel)
+                if name == "dfa_class_flow":
+                    v.fill_(float("nan"))
+                return v
+
+            m.setattr(cc.backend.state, "storage_view", poisoned)
+            out[force] = cw_weights(cc, data, missing, storage = storage)
+    for g, (got, want) in enumerate(zip(out[False], out[True])):
+        assert not torch.isnan(want).any() and torch.equal(got.view(torch.int32), want.view(torch.int32)), g
+
+
+@pytest.mark.parametrize("kind, fill, store", [("hmm", False, True), ("hmm_block_sparse", False, True),
+                                               ("pd", False, True), ("hand", True, False), ("hand_dead", True, True)])
+def test_class_weight_fill_where_needed(kind, fill, store, build_pc):
+    """Where every input node is an operand of one product (an HMM, a PD), the class weight launches each write their
+    destinations first and between them every one: they store, no fill; where some are operands of several
+    (``hand``), the later launches log-add: the buffer filled; where some are operands of steps without a top-down
+    value only (``hand_dead``), every launch stores but their weights are written by none: the buffer filled."""
+    n = {"hand_dead": 3}.get(kind, KINDS.get(kind))
+    cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
+    data, missing = evidence("mixed", n)
+    cw_weights(cc, data, missing)
+    plans = [p.top_down for p in cc.backend.program().plans.values() if getattr(p, "top_down", None) is not None]
+    stores = [s for p in plans for step, _, layers in p.steps if step == "prod" for _, stages, _, _ in layers
+              for _, _, cws in stages for _, _, s in cws]
+    assert plans and stores and all(p.cw_fill == fill for p in plans)
+    assert all(stores) == store
+

@@ -216,11 +216,13 @@ def _class_weight_kernel(dfa_class_flow, cw_base, cw_K, element_flows, temp_flow
                          out_first, out_width, temp_width, tflow_width, B, n, W, C, pid0, BLOCK_INPUT: tl.constexpr,
                          S_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, PRUNE: tl.constexpr, OUT_FULL: tl.constexpr,
                          S_FULL: tl.constexpr, UNIFORM: tl.constexpr, COMPACT: tl.constexpr, MARS: tl.constexpr,
-                         TN: tl.constexpr, SUBS: tl.constexpr, TB: tl.constexpr, TC: tl.constexpr, TJ: tl.constexpr):
+                         STORE: tl.constexpr, TN: tl.constexpr, SUBS: tl.constexpr, TB: tl.constexpr,
+                         TC: tl.constexpr, TJ: tl.constexpr):
     """One program per (``TN`` destinations of a node tile, ``TB`` samples, ``TC`` classes), a lane per (sample,
     class): the log class weights of its steps' inputs (see the module docstring) -- a walk over the columns ``i`` of
     the input's boundary, then over the other boundary's columns ``TJ`` at a time -- log-added to ``dfa_class_flow``
-    at the destination's position block (``cw_base``, ``cw_K`` per position). A node tile's destinations (see
+    at the destination's position block (``cw_base``, ``cw_K`` per position) -- or stored there (``STORE``: the launch
+    writes each of its destinations first in its query, see :mod:`..queries.plans`). A node tile's destinations (see
     :func:`~.common.node_tiles`) are at one position, with steps to the same other boundaries: they walk the same
     columns, once for all of them. Under evidence pruning every lane walks only its sample's live columns (``count``
     / ``start`` / ``columns``, see :meth:`~.live.Liveness.lists`; every term through another is -inf): a wide
@@ -349,7 +351,10 @@ def _class_weight_kernel(dfa_class_flow, cw_base, cw_K, element_flows, temp_flow
     val = tl.log(tl.sum(acc * tl.exp(mx - shift[:, :, None]), axis = 2)) + shift
     dest = dfa_class_flow + tl.load(cw_base + t) + ((b * C + cls) * tl.load(cw_K + t))[None, :] + k[:, None]
     dm = real[:, None] & cm[None, :]
-    tl.store(dest, _logaddexp_tile(tl.load(dest, mask = dm, other = float("-inf")), val), mask = dm)
+    if STORE:
+        tl.store(dest, val, mask = dm)
+    else:
+        tl.store(dest, _logaddexp_tile(tl.load(dest, mask = dm, other = float("-inf")), val), mask = dm)
 
 
 #: destinations (of a node tile), and destinations x lanes (sample, class) x other-boundary columns, per
@@ -358,16 +363,18 @@ def _class_weight_kernel(dfa_class_flow, cw_base, cw_K, element_flows, temp_flow
 CLASS_WEIGHT_NODES = 16
 CLASS_WEIGHT_LANES = 512
 
-
 def run_class_weights(launches, cw: dict, prog, bufs, element_flows, temp_flows, node_mars, liveness, elem_first: int,
                       elem_width: int, B: int, prior: dict, once_iv: torch.Tensor, regions: dict, compact = None,
                       tflow_width: Optional[int] = None, inside: bool = False):
     """
     The class weights of one product layer stage's input operands at the query's target positions: every
-    :class:`ClassWeightLaunch` in ``launches``, each with its plan's index list of destinations (None: all).
+    :class:`ClassWeightLaunch` in ``launches`` as ``(launch, index list of destinations (None: all), store)`` --
+    ``store``: the launch writes each of its destinations first in the query, and stores the weights there; the others
+    log-add them.
 
-    :param cw: ``buf`` (``dfa_class_flow``, -inf where nothing was added yet), and per position the start of its block
-        (``base``, int64 [n], -1 for a position no sample targets) and its row group's rows (``K``, int64 [n])
+    :param cw: ``buf`` (``dfa_class_flow``: -inf where a launch log-adds and nothing was written yet), and per position
+        the start of its block (``base``, int64 [n], -1 for a position no sample targets) and its row group's rows
+        (``K``, int64 [n])
     :param bufs: ``(temp, temp_width)``, the layer's scratch rows (the folds' inside values)
     :param liveness: None, or the query's :class:`~.live.Liveness` (its live columns' lists are built on first use)
     :param prior: where the sum operands kept once are (see :func:`~.common._block_ptr`)
@@ -386,7 +393,7 @@ def run_class_weights(launches, cw: dict, prog, bufs, element_flows, temp_flows,
     lists = liveness.lists() if prune else (cw["K"],) * 3
     ctables = (compact.off, compact.rank) if compact is not None else (cw["K"],) * 2
     TC = min(64, host_next_power_of_2(C))
-    for la, item in launches:
+    for la, item, store in launches:
         idx = tensor(item)
         tiles, height = (la.tiles, la.tile_height) if idx is None else (idx, item.height)
         s_kind, out_temp, (out_full, *s_full) = la.kinds
@@ -404,8 +411,8 @@ def run_class_weights(launches, cw: dict, prog, bufs, element_flows, temp_flows,
                 prior["offset"], prior["width"], prior["reg_prior"], elem_first, elem_width, temp_width, tflow_width,
                 B, n, W, C, first, BLOCK_INPUT = la.form == "block_input", S_KIND = s_kind, OUT_TEMP = out_temp,
                 PRUNE = prune, OUT_FULL = out_full, S_FULL = all(s_full), UNIFORM = not prune or TB == 1,
-                COMPACT = compact is not None, MARS = inside, TN = TN, SUBS = height // TN, TB = TB, TC = TC, TJ = TJ,
-                num_warps = warps)
+                COMPACT = compact is not None, MARS = inside, STORE = store, TN = TN, SUBS = height // TN, TB = TB,
+                TC = TC, TJ = TJ, num_warps = warps)
 
 
 # -------------------------------------------------------------------------------------------------

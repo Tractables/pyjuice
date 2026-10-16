@@ -744,6 +744,38 @@ def _top_down_steps(td, t, index, m, scoring: bool, lists: IndexLists) -> list:
     return out
 
 
+def class_weight_writes(prog, steps: list, positions: np.ndarray) -> bool:
+    """
+    The class weight launches of a scoring plan's top-down ``steps`` (:func:`_top_down_steps`' output, its index lists
+    not uploaded yet) as ``(launch, index list, store)``, in place: ``store`` where the launch is the first in the
+    order they run to write every destination it writes -- it stores the weights, the later ones log-add to them.
+    Returns whether ``dfa_class_flow`` must be filled with -inf first: some launch log-adds to a destination nothing
+    wrote before, or some (target position, row) of the buffer (``positions``: bool [n]) is never written.
+    """
+    from ..kernels.score import score_tables
+    score = score_tables(prog)
+    K = np.array([len(score.rows[g]) if g >= 0 else 0 for g in score.group_of], dtype = np.int64)
+    seen = np.zeros((prog.n, max(int(K.max(initial = 0)), 1)), dtype = bool)
+    fill = False
+    for step in steps:
+        if step is None or step[0] != "prod":
+            continue
+        for _, stages, _, _ in step[2]:
+            for _, _, cw_l in stages:
+                for i, (la, item) in enumerate(cw_l):
+                    d = la.host["dests"]
+                    if item is not None:
+                        rows = np.asarray(item.host).ravel()
+                        d = d[rows[rows >= 0]]
+                    first = ~seen[d[:, 0], d[:, 1]]
+                    store = bool(first.all())
+                    fill |= not store and bool(first.any())
+                    seen[d[:, 0], d[:, 1]] = True
+                    cw_l[i] = (la, item, store)
+    covered = (np.arange(seen.shape[1])[None, :] < K[:, None]) <= seen
+    return fill or not covered[np.asarray(positions, dtype = bool)].all()
+
+
 def _out_temp(la) -> bool:
     """Whether a :class:`~.prod_top_down.TopDownLaunch`'s parents are scratch rows."""
     return bool(la.kinds[2] if la.form == "block_block" else la.kinds[1])

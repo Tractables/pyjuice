@@ -535,6 +535,33 @@ def hand_fold(V):
     return summate(multiply(s01, s2, s3), num_node_blocks = 1, block_size = 1)
 
 
+def hand_dead(V):
+    """``x0`` times a sum over [1, 3), over 3 variables, under a root whose block-sparse edges read the products' first
+    block only: the second block's steps have no top-down value, so the class weights of ``x0``'s second block are
+    written by no launch (their rows of ``dfa_class_flow`` must hold -inf)."""
+    cat = lambda: dists.Categorical(num_cats = V)
+    x = [inputs(v, num_node_blocks = 2, block_size = 2, dist = cat()) for v in range(3)]
+    s12 = summate(multiply(x[1], x[2]), num_node_blocks = 2, block_size = 2)
+    return summate(multiply(x[0], s12), num_node_blocks = 1, block_size = 1, edge_ids = torch.tensor([[0], [0]]))
+
+
+def walks(V, unit = False):
+    """``input @ block`` steps over 6 variables that reach the CUDA walk kernels (``kernels/c/walk.cu``) from every
+    side: ``s3`` under two products of different inputs at position 2 (two parents per child), ``x2`` under two
+    products of different sums over [3, 4) (two steps per class weight destination), over intervals ending before the
+    sequence ([3, 4) and [2, 4): pairs the automaton does not join), in a three-child product (folds); ``unit``: blocks
+    of one node, every node tile one row."""
+    nb, bs = (1, 1) if unit else (2, 2)
+    cat = lambda: dists.Categorical(num_cats = V)
+    x = [inputs(v, num_node_blocks = nb, block_size = bs, dist = cat()) for v in range(6)]
+    x2 = inputs(2, num_node_blocks = nb, block_size = bs, dist = cat())
+    s3, s3b = (summate(x[3], num_node_blocks = nb, block_size = bs) for _ in range(2))
+    s24 = summate(multiply(x[2], s3), multiply(x2, s3), multiply(x2, s3b), num_node_blocks = nb, block_size = bs)
+    s01 = summate(multiply(x[0], x[1]), num_node_blocks = nb, block_size = bs)
+    s45 = summate(multiply(x[4], x[5]), num_node_blocks = nb, block_size = bs)
+    return summate(multiply(s01, s24, s45), num_node_blocks = 1, block_size = 1)
+
+
 def left_linear(n, V, num_latents = 8):
     """The mirror of an HMM: a sum over every prefix, each over the previous prefix times the next input (`block @
     input`, whose left blocks have the initial state as their only entry column), every input tied to the first."""
@@ -561,6 +588,9 @@ PC_KINDS = {
     "hand_left": 5,              # :func:`hand_left`
     "hand_shared": 4,            # :func:`hand_shared`
     "hand_fold": 4,              # :func:`hand_fold`
+    "hand_dead": 3,              # :func:`hand_dead`
+    "walks": 6,                  # :func:`walks`
+    "walks_unit": 6,             # :func:`walks`, blocks of one node
 }
 
 
@@ -614,7 +644,8 @@ def build_pc(kind, n, V, seed = 0, device = torch.device("cuda:0"), perturbation
         ns = juice.blockify(base, sparsity_tolerance = 0.5, max_target_block_size = 4)
     else:
         ns = {"hand": hand_built, "hand_permuted": hand_permuted, "hand_unit": hand_unit, "hand_left": hand_left,
-              "hand_shared": hand_shared, "hand_fold": hand_fold}[kind](V)
+              "hand_shared": hand_shared, "hand_fold": hand_fold, "hand_dead": hand_dead, "walks": walks,
+              "walks_unit": lambda V: walks(V, unit = True)}[kind](V)
     if input_dist is not None:                          # the same circuit over another input distribution
         for node in ns:
             if node.is_input():

@@ -303,7 +303,7 @@ def test_walk_launches_run_node_tiles(kind, build_pc):
             for _, stages, _, _ in layers:
                 for once, sample, cws in stages:
                     seen = {}
-                    for la, item in list(once) + list(sample) + list(cws):
+                    for la, item in list(once) + list(sample) + [(la, item) for la, item, _ in cws]:
                         if la.form not in ("input_block", "block_input") or item is None:
                             continue
                         rows = check_tiles(la, item.tensor.cpu().numpy(), item.height)

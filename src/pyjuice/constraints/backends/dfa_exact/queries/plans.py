@@ -45,7 +45,8 @@ from typing import Optional
 import numpy as np
 import torch
 
-from .planners import IndexLists, _forward_steps, _top_down_modes, _top_down_steps, _top_down_tables
+from .planners import IndexLists, _forward_steps, _top_down_modes, _top_down_steps, _top_down_tables, \
+    class_weight_writes
 
 
 #: query plans a Program keeps (the most recently used): at least this many, and at least ``PLANS_PER_POSITION`` per
@@ -93,7 +94,7 @@ class TopDownPlan:
     :ivar steps: from the top down, ``("sum", prod_index, [(block_size, (once, sample) dense runs, (once, sample)
         fused [(child block size, tables, index list)])])`` and ``("prod", prod_index, [((once, sample) fold stages,
         stages [(once launches, sample launches, class weight launches)] in launch order, num_temps, temp_slots)])``
-        (class weight launches: a scoring plan's, else none)
+        (class weight launches: a scoring plan's, ``(launch, index list, store)``, see ``cw_fill``; else none)
     :ivar root: ``(computed, once)`` of the root's value
     :ivar once: bool [sum regions] (host): those whose values the query keeps once (reads or writes in ``prior_flows``)
     :ivar todo: bool [sum regions] (host): those it writes in ``prior_flows``
@@ -104,6 +105,8 @@ class TopDownPlan:
     :ivar prior: bool [sum intervals] (host): the inside values its launches for a batch of one read
     :ivar dead: None, or int32 [D, 2] (device): the rows of the regions it computes per sample that no launch writes
         (see :class:`~.top_down_program.TopDownProgram`), and ``dead_regions``, their regions
+    :ivar cw_fill: a scoring plan's: whether ``dfa_class_flow`` must hold -inf before its class weight launches run
+        (:func:`~.planners.class_weight_writes`; their entries ``(launch, index list, store)``)
     """
 
     steps: list
@@ -116,6 +119,7 @@ class TopDownPlan:
     prior: np.ndarray
     dead: Optional[torch.Tensor]
     dead_regions: list
+    cw_fill: bool = True
 
 
 def _prefix(mask: np.ndarray) -> np.ndarray:
@@ -338,6 +342,7 @@ def top_down_plan(prog, td, targets: Optional[np.ndarray], once: np.ndarray, val
     m = _top_down_modes(req, positions, once, scoring, t.data, t.offsets)
     lists = IndexLists()                                 # every index list, copied to the device together
     out = _top_down_steps(td, t, index, m, scoring, lists)
+    cw_fill = class_weight_writes(prog, out, positions) if scoring else True
     prior = m[-1]
     root = prog.root_region
     sample = req & ~r_once
@@ -351,4 +356,4 @@ def top_down_plan(prog, td, targets: Optional[np.ndarray], once: np.ndarray, val
                        per_sample = needed[td.reg_iv] & ~r_once,
                        once_iv = once_iv.tensor, prior = reads,
                        dead = None if dead_rows is None else dead_rows.tensor.view(-1, 2),
-                       dead_regions = np.nonzero(sample & td.dead_region)[0].tolist())
+                       dead_regions = np.nonzero(sample & td.dead_region)[0].tolist(), cw_fill = cw_fill)
