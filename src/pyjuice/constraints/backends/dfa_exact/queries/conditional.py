@@ -24,7 +24,7 @@ from . import forward as F
 from ..kernels.common import pack_aligned
 from ..kernels.compact import (STORAGES, compact_buffers, held_elsewhere, held_moves, query_layout, regather_into,
                                resolve_storage, worth_parking)
-from ..kernels.live import liveness
+from ..kernels.live import live_successors, liveness
 from ..kernels.score import score_group, score_tables
 from .plans import (PLANS_PER_POSITION, PLAN_CACHE_SIZE, per_sample_intervals, prior_regions, query_plan,
                     read_regions, scope_intervals, top_down_prior)
@@ -190,10 +190,11 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     else:
         x, obs_class = evidence
     held = held or {}
+    masses = backend.state.masses(external) if masses is None else masses
+    succ = live_successors(prog, masses)                # (per-sample inputs that rule classes out: theirs)
     # compact, a query needs its liveness even with nothing observed: every column is live, but only the regions it
     # computes per sample get rows (none, every value input-independent, inside fast_inference)
-    lv = liveness(prog, obs_class, B) if observed.any() or storage != "dense" else None
-    masses = backend.state.masses(external) if masses is None else masses
+    lv = liveness(prog, obs_class, B, succ) if observed.any() or storage != "dense" or succ is not None else None
     valid, kept = backend.state.prior_validity(masses.version)
     prior = prior_regions(prog, observed, B, kept, lv)
     pf = backend.state.prior_flows(np.zeros(len(backend.sum_regions), dtype = bool))
@@ -221,8 +222,8 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     if compact is not None:                             # rows for the per-sample values only, walked in their own
         bufs, parked = compact_buffers(backend, compact, B, inputs_only, carry, move)   # order, the held ones it
     else:                                                                              # reads re-gathered into them
-        if lv is not None and not observed.any():        # (laid out for "auto", but dense: nothing to prune)
-            lv = None
+        if lv is not None and not observed.any() and succ is None:   # (laid out for "auto", but dense: nothing to
+            lv = None                                                 # prune)
         if lv is not None:
             lv.order(per_sample_intervals(prog, plan))
         bufs = backend.state.buffers(B)

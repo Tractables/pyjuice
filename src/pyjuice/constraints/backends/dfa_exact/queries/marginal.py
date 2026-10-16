@@ -12,7 +12,7 @@ import torch
 
 from ..kernels.compact import (STORAGES, compact_buffers, held_elsewhere, held_moves, query_layout,
                               resolve_storage, worth_parking)
-from ..kernels.live import liveness
+from ..kernels.live import live_successors, liveness
 from .forward import PRECISIONS, gate_context, missing_tensor, run_forward
 from .plans import per_sample_intervals, prior_regions, query_plan, read_regions
 
@@ -69,9 +69,10 @@ def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] =
 
     with torch.no_grad():
         obs_class = torch.where(missing, -1, backend.token_classes.token_class[x]).contiguous()
-        # nothing observed: nothing to prune, but compact values are laid out by the live columns (every one)
-        lv = liveness(prog, obs_class, B) if observed.any() or storage != "dense" else None
         masses = backend.state.masses(external)
+        succ = live_successors(prog, masses)            # (per-sample inputs that rule classes out: theirs)
+        # nothing observed: nothing to prune, but compact values are laid out by the live columns (every one)
+        lv = liveness(prog, obs_class, B, succ) if observed.any() or storage != "dense" or succ is not None else None
         valid, kept = backend.state.prior_validity(masses.version)
         prior = prior_regions(prog, observed, B, kept, lv)
         no_top_down = np.zeros(len(backend.sum_regions), dtype = bool)
@@ -91,8 +92,8 @@ def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] =
         if compact is not None:                         # rows for the per-sample values only, the held ones it
             bufs, parked = compact_buffers(backend, compact, B, inputs_only, carry, move)   # reads re-gathered there
         else:
-            if lv is not None and not observed.any():    # (laid out for "auto", but dense: nothing to prune)
-                lv = None
+            if lv is not None and not observed.any() and succ is None:   # (laid out for "auto", but dense:
+                lv = None                                                 # nothing to prune)
             if lv is not None:
                 lv.order(per_sample_intervals(prog, plan))
             bufs = backend.state.buffers(B)

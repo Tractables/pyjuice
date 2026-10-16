@@ -1,7 +1,8 @@
 // The evidence pruning's liveness sweep (`kernels/live.py`, `_liveness_kernel`) in shared memory: `live[b, t, q]`
 // (int8 [B, n + 1, W]) the forward reachability of column q at boundary t through the sample's observed classes
-// (every class where a token is missing), ANDed with whether acceptance can be reached from it -- a CTA per sample for
-// each of the two sweeps, at once (they do not depend on each other), into `live` and `back`, then their AND.
+// (where a token is missing, the successor lists' classes: every class, or a sample's own lists of the classes its
+// inputs leave possible, `ps` / `ss` apart), ANDed with whether acceptance can be reached from it -- a CTA per sample
+// for each of the two sweeps, at once (they do not depend on each other), into `live` and `back`, then their AND.
 //
 // A boundary's step is latency-bound: a column's successors are two dependent reads (`entry_ptr`, then `entry_succ`, or
 // `next_col` for an observed token) after the live row. Here the rows live in shared memory, and every step's tables --
@@ -22,10 +23,11 @@ struct LiveArgs {
     signed char* live;
     const int* obs;        // [B, n]
     const int* next_col;   // [n, W, C]
-    const int* ptr;        // [n, W + 1]
-    const int* succ;
+    const int* ptr;        // [n, W + 1] per sample, ps apart (0: every sample's)
+    const int* succ;       // ss apart
     const int* width;      // [n + 1]
     int n, W, C, smax;
+    long long ps, ss;
 };
 
 // The tables of boundary t a step reads, into registers: an observed token's successor of every owned column, or the
@@ -36,8 +38,8 @@ struct Stage {
     int sc[LS];
 };
 
-__device__ __forceinline__ void stage_load(const LiveArgs& a, int t, int w, int oc, int base, int count, int tid,
-                                           Stage& s) {
+__device__ __forceinline__ void stage_load(const LiveArgs& a, const int* ptr, const int* succ, int t, int w, int oc,
+                                           int base, int count, int tid, Stage& s) {
     if (oc >= 0) {
 #pragma unroll
         for (int k = 0; k < LQ; ++k) {
@@ -48,12 +50,12 @@ __device__ __forceinline__ void stage_load(const LiveArgs& a, int t, int w, int 
 #pragma unroll
         for (int k = 0; k <= LQ; ++k) {
             int q = tid + k * LT;
-            s.pq[k] = q <= w ? a.ptr[(long long)t * (a.W + 1) + q] : 0;
+            s.pq[k] = q <= w ? ptr[(long long)t * (a.W + 1) + q] : 0;
         }
 #pragma unroll
         for (int j = 0; j < LS; ++j) {
             int i = tid + j * LT;
-            s.sc[j] = i < count ? a.succ[base + i] : 0;
+            s.sc[j] = i < count ? succ[base + i] : 0;
         }
     }
 }
@@ -95,21 +97,23 @@ __global__ void __launch_bounds__(LT) liveness_kernel(LiveArgs a, signed char* b
     unsigned char* rowa = reinterpret_cast<unsigned char*>(wd + n + 1);         // [W]
     unsigned char* rowb = rowa + W;                                              // [W]
     const long long b = blockIdx.x;
+    const int* ptr = a.ptr + b * a.ps;                    // the sample's successor lists
+    const int* succ = a.succ + b * a.ss;
     for (int t = tid; t <= n; t += LT) {
         int w = a.width[t];
         wd[t] = w;
         if (t == n) continue;
         oc[t] = a.obs[b * n + t];
-        int s0 = a.ptr[(long long)t * (W + 1)];
+        int s0 = ptr[(long long)t * (W + 1)];
         sbase[t] = s0;
-        scount[t] = a.ptr[(long long)t * (W + 1) + w] - s0;
+        scount[t] = ptr[(long long)t * (W + 1) + w] - s0;
     }
     __syncthreads();
     Stage st;
 
     if (blockIdx.y == 0) {                               // forward: rowa boundary t, rowb boundary t + 1
         signed char* live = a.live + b * (long long)(n + 1) * W;
-        stage_load(a, 0, wd[0], oc[0], sbase[0], scount[0], tid, st);
+        stage_load(a, ptr, succ, 0, wd[0], oc[0], sbase[0], scount[0], tid, st);
         stage_store(wd[0], oc[0], scount[0], tid, st, nc, pq, sc);
         for (int q = tid; q < wd[0]; q += LT) {
             rowa[q] = q == 0;
@@ -119,7 +123,7 @@ __global__ void __launch_bounds__(LT) liveness_kernel(LiveArgs a, signed char* b
         for (int t = 0; t < n; ++t) {
             const int w = wd[t], ot = oc[t];
             const int nxt = t + 1 == n ? 1 : wd[t + 1];
-            if (t + 1 < n) stage_load(a, t + 1, wd[t + 1], oc[t + 1], sbase[t + 1], scount[t + 1], tid, st);
+            if (t + 1 < n) stage_load(a, ptr, succ, t + 1, wd[t + 1], oc[t + 1], sbase[t + 1], scount[t + 1], tid, st);
             for (int q = tid; q < nxt; q += LT) rowb[q] = 0;
             __syncthreads();
             for (int q = tid; q < w; q += LT) {
@@ -146,12 +150,12 @@ __global__ void __launch_bounds__(LT) liveness_kernel(LiveArgs a, signed char* b
     // backward: rowa acceptance from boundary t + 1, rowb from t, into `back`
     signed char* back = back_all + b * (long long)(n + 1) * W;
     if (tid == 0) rowa[0] = 1;                                                  // the sequence end
-    stage_load(a, n - 1, wd[n - 1], oc[n - 1], sbase[n - 1], scount[n - 1], tid, st);
+    stage_load(a, ptr, succ, n - 1, wd[n - 1], oc[n - 1], sbase[n - 1], scount[n - 1], tid, st);
     stage_store(wd[n - 1], oc[n - 1], scount[n - 1], tid, st, nc, pq, sc);
     __syncthreads();
     for (int t = n - 1; t >= 0; --t) {
         const int w = wd[t], ot = oc[t];
-        if (t > 0) stage_load(a, t - 1, wd[t - 1], oc[t - 1], sbase[t - 1], scount[t - 1], tid, st);
+        if (t > 0) stage_load(a, ptr, succ, t - 1, wd[t - 1], oc[t - 1], sbase[t - 1], scount[t - 1], tid, st);
         signed char* out = back + (long long)t * W;
         for (int q = tid; q < w; q += LT) {
             bool g = false;
@@ -185,8 +189,8 @@ static size_t liveness_smem(int n, int W, int smax) {
     return sizeof(int) * ((size_t)W + W + 1 + smax + 4 * (size_t)n + 1) + 2 * (size_t)W;
 }
 
-// Whether the shared-memory sweep takes an automaton of W columns, at most smax successor entries a boundary, over
-// n positions on this device.
+// Whether the shared-memory sweep takes an automaton of W columns, at most smax successor entries a boundary (a
+// sample's lists of fewer classes have no more), over n positions on this device.
 bool liveness_fits(int64_t n, int64_t W, int64_t smax) {
     if (W > (int64_t)LQ * LT || smax > (int64_t)LS * LT) return false;
     int dev, optin;
@@ -197,7 +201,7 @@ bool liveness_fits(int64_t n, int64_t W, int64_t smax) {
 
 void liveness_cuda(torch::Tensor live, torch::Tensor back, torch::Tensor obs_class, torch::Tensor next_col,
                    torch::Tensor entry_ptr, torch::Tensor entry_succ, torch::Tensor width, int64_t n, int64_t W,
-                   int64_t C, int64_t smax) {
+                   int64_t C, int64_t smax, int64_t ps, int64_t ss) {
     TORCH_CHECK(live.scalar_type() == torch::kInt8 && back.scalar_type() == torch::kInt8 && back.is_contiguous() &&
                 back.numel() == live.numel() && obs_class.scalar_type() == torch::kInt32 &&
                 next_col.scalar_type() == torch::kInt32 && entry_ptr.scalar_type() == torch::kInt32 &&
@@ -209,9 +213,10 @@ void liveness_cuda(torch::Tensor live, torch::Tensor back, torch::Tensor obs_cla
     TORCH_CHECK(W <= (int64_t)LQ * LT && smax <= (int64_t)LS * LT, "liveness_cuda: automaton too wide");
     const int B = (int)live.size(0);
     if (B == 0) return;
+    TORCH_CHECK(ps == 0 || entry_ptr.numel() >= (int64_t)B * ps, "liveness_cuda: a successor list per sample");
     LiveArgs a{live.data_ptr<signed char>(), obs_class.data_ptr<int>(), next_col.data_ptr<int>(),
                entry_ptr.data_ptr<int>(), entry_succ.data_ptr<int>(), width.data_ptr<int>(), (int)n, (int)W, (int)C,
-               (int)smax};
+               (int)smax, (long long)ps, (long long)ss};
     size_t smem = liveness_smem((int)n, (int)W, (int)smax);
     static size_t allowed[64] = {0};                    // per device, the largest dynamic shared memory set
     int dev;

@@ -5,7 +5,10 @@ prefix, a suffix, scattered, and a different one per sample -- on every kind of 
 before each call (a dead slot must still be written, -inf). A query's :class:`Liveness`: every (sample, boundary)'s
 live columns listed, every interval's live count, and the lane order of every interval or of some only. Also: pruning
 engages when tokens are observed, and does nothing when none is. And the marginal survives blocks of a wide dynamic
-range (see ``test_marginals_survive_a_wide_dynamic_range``).
+range (see ``test_marginals_survive_a_wide_dynamic_range``). Where per-sample inputs rule classes out (top-k soft
+evidence: a class without a candidate), the sweeps follow only the classes left: their live columns against the brute
+force through those classes' tokens, every sample's successor lists against the automaton, and a session's queries
+against the same ones through every class.
 """
 import itertools
 import math
@@ -19,7 +22,7 @@ import pyjuice as juice
 import pyjuice.constraints as jc
 import pyjuice.constraints.backends.dfa_exact.queries.marginal as M
 import pyjuice.constraints.backends.dfa_exact.compiled.program as P
-from pyjuice.constraints.backends.dfa_exact.kernels.live import liveness
+from pyjuice.constraints.backends.dfa_exact.kernels.live import liveness, sample_successors
 
 V = 3
 KINDS = {"hmm": 6, "hmm_untied": 6, "hmm_block_sparse": 6, "left_linear": 6, "pd": 8, "pd_prod_dominated": 8,
@@ -99,15 +102,17 @@ def obs_classes(cc, data, missing):
     return torch.where(missing.to(dev), -1, cc.backend.token_classes.token_class[x]).contiguous()
 
 
-def brute_live(dfa, L, data, missing):
+def brute_live(dfa, L, data, missing, classes = None, token_class = None):
     """[B, n + 1, W] bool: column i at boundary t is reachable through the sample's evidence on [0, t) and can reach
-    acceptance through its evidence on [t, n) (boundary n: the sequence end, column 0)."""
+    acceptance through its evidence on [t, n) (boundary n: the sequence end, column 0) -- a missing token any, or
+    (``classes`` [B, n, C] bool) one of a class the sample allows there (``token_class``: every token's)."""
     B, n = data.shape
     K = dfa.num_states
     step = lambda q, v: dfa.run([v], state = q)
     out = torch.zeros(B, n + 1, L.max_width, dtype = torch.bool)
     for b in range(B):
-        allowed = [range(V) if missing[b, t] else [int(data[b, t])] for t in range(n)]
+        allowed = [([v for v in range(V) if classes is None or classes[b, t, token_class[v]]] if missing[b, t] else
+                    [int(data[b, t])]) for t in range(n)]
         fwd = [{dfa.initial}]
         for t in range(n):
             fwd.append({step(q, v) for q in fwd[-1] for v in allowed[t]})
@@ -143,6 +148,118 @@ def test_liveness_matches_brute_force(build_pc, sweeps):
             assert torch.equal(got[:, n, 0], want[:, n, 0]), (seed, pattern)
             compared += 1
     assert compared > 10
+
+
+def random_dfas(count, tokens = V):
+    """``count`` random 7-state automata over ``tokens`` tokens (one to three accepting states)."""
+    for seed in range(count):
+        rng = random.Random(seed)
+        K = 7
+        yield seed, jc.DFA.from_dense(tokens, [[rng.randrange(K) for _ in range(tokens)] for _ in range(K)], 0,
+                                      rng.sample(range(K), rng.randint(1, 3)))
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_liveness_through_sample_classes_matches_brute_force(build_pc, sweeps, shared):
+    """Where a token is missing, only the classes a sample's inputs leave possible (:func:`sample_successors`, every
+    sample's own lists or one set for all): the live columns against the brute force through those classes' tokens."""
+    compared, n, B = 0, 6, 8
+    for seed, dfa in random_dfas(6):
+        cc = jc.compile(dfa, build_pc("hmm", n, V))
+        if not cc.backend.satisfiable:
+            continue
+        prog = cc.backend.program()
+        C = prog.next_col.size(2)
+        token_class = cc.backend.token_classes.token_class.tolist()
+        g = torch.Generator().manual_seed(seed)
+        for pattern in ("none", "prefix", "scattered", "mixed"):
+            data, missing = evidence(pattern, n, B = B, seed = seed)
+            classes = torch.rand(1 if shared else B, n, C, generator = g) < 0.6
+            lv = liveness(prog, obs_classes(cc, data, missing), B, sample_successors(prog, classes.to(prog.dev)))
+            want = brute_live(dfa, cc.backend.layout, data, missing, classes.expand(B, n, C), token_class)
+            got = lv.live.cpu() != 0
+            for t in range(n):
+                w = int(cc.backend.layout.width[t])
+                assert torch.equal(got[:, t, :w], want[:, t, :w]), (seed, pattern, t)
+            assert torch.equal(got[:, n, 0], want[:, n, 0]), (seed, pattern)
+            compared += 1
+    assert compared > 10
+
+
+@pytest.mark.parametrize("tokens", [V, 70])
+def test_sample_successors_are_the_allowed_classes_successors(tokens, build_pc):
+    """A sample's successor lists: at every boundary and column, the distinct successors the classes allowed there
+    lead to (at the last boundary the sequence end's one column), ascending -- with every class allowed, the program's
+    own lists. Over 70 tokens, more classes than one word of class bits holds."""
+    n, B = 6, 5
+    for seed, dfa in random_dfas(4, tokens):
+        cc = jc.compile(dfa, build_pc("hmm", n, tokens))
+        if not cc.backend.satisfiable:
+            continue
+        prog = cc.backend.program()
+        nc, width = prog.next_col.cpu(), prog.width
+        W, C = nc.shape[1:]
+        allowed = torch.rand(B, n, C, generator = torch.Generator().manual_seed(seed)) < 0.5
+        lists = sample_successors(prog, allowed.to(prog.dev))
+        assert lists.strides() == (n * (W + 1), lists.succ.size(1))
+        ptr, succ = lists.ptr.cpu(), lists.succ.cpu()
+        for b in range(B):
+            assert ptr[b, 0, 0] == 0
+            for t in range(n):
+                assert t == 0 or ptr[b, t, 0] == ptr[b, t - 1, W]
+                for q in range(W):
+                    want = sorted({0 if t == n - 1 else int(nc[t, q, c]) for c in range(C)
+                                   if allowed[b, t, c] and nc[t, q, c] >= 0}) if q < width[t] else []
+                    assert succ[b, ptr[b, t, q]:ptr[b, t, q + 1]].tolist() == want, (seed, b, t, q)
+        assert tokens == V or C > 62
+        every = sample_successors(prog, torch.ones(1, n, C, dtype = torch.bool, device = prog.dev))
+        E = prog.succ.entry_succ.numel()
+        assert every.strides() == (0, 0)
+        assert torch.equal(every.ptr[0], prog.succ.entry_ptr.view(n, W + 1))
+        assert torch.equal(every.succ[0, :E], prog.succ.entry_succ)
+
+
+@pytest.mark.parametrize("shared", [False, True])
+@pytest.mark.parametrize("storage", ["dense", "compact"])
+def test_a_sessions_candidates_prune_its_queries(storage, shared, build_pc, monkeypatch):
+    """Top-k soft evidence of 2 of the 3 tokens a position leaves classes without a candidate: a decoder session's
+    sweeps follow only the classes left -- its candidates' (``class_support``), fewer live slots than through
+    every class (``LIVE_SUPPORT`` off) -- and its marginals and conditionals are those through every class, -inf where
+    theirs are."""
+    import pyjuice.nodes.distributions as dists
+    import pyjuice.constraints.backends.dfa_exact.queries.conditional as Q
+    from pyjuice.constraints.backends.dfa_exact.kernels import live
+    n, B = 6, 6
+    pc = build_pc("hmm", n, V, input_dist = dists.SoftEvidenceCategorical)
+    cc = jc.compile(jc.DFA.contains([[0, 1, 1], [2, 0]], V) & jc.Not(jc.DFA.contains([[2, 2]], V)), pc)
+    dev = cc.pc.device
+    g = torch.Generator().manual_seed(0)
+    rows = 1 if shared else B
+    inputs = dict(categorical_evidence_logp = (torch.randn(rows, n, 2, generator = g) * 2).to(dev),
+                  soft_evidence_cat_ids = torch.argsort(torch.rand(rows, n, V, generator = g), dim = 2)[..., :2].to(dev))
+    data, missing = evidence("mixed", n, B = B)
+    data, missing = data.to(dev), missing.to(dev)
+    live_counts, supports = [], []
+    real_support = live.class_support
+    monkeypatch.setattr(live, "class_support", lambda *a: (lambda c: supports.append(c) or c)(real_support(*a)))
+    for module in (M, Q):                               # every query's live slots
+        real = module.liveness
+        monkeypatch.setattr(module, "liveness", lambda *a, real = real: (
+            lambda lv: live_counts.append(sum(lv.num_live)) or lv)(real(*a)))
+    out = {}
+    for on in (True, False):
+        monkeypatch.setattr(live, "LIVE_SUPPORT", on)
+        live_counts.clear()
+        with cc.decoder(storage = storage, **inputs) as decoder:
+            out[on] = (decoder.marginal(data, missing), decoder.conditional(data, missing), sum(live_counts))
+    assert_close(out[True][0], out[False][0], n)
+    assert_close(out[True][1], out[False][1], n)
+    assert torch.isfinite(out[True][0]).any()
+    assert out[True][2] < out[False][2]
+    token_class = cc.backend.token_classes.token_class
+    want = torch.zeros(rows, n, cc.backend.num_classes, dtype = torch.bool, device = dev)
+    want.scatter_(2, token_class[inputs["soft_evidence_cat_ids"]].long(), True)
+    assert len(supports) == 1 and torch.equal(supports[0], want)           # (once a session)
 
 
 @pytest.mark.parametrize("pattern", PATTERNS)

@@ -91,6 +91,8 @@ class ClassMasses:
     :ivar token_ids: None, or (top-k) int32, flat as ``token_logw``: the tokens the weights are of, ascending in every
         row of ``token_width`` (see :func:`~pyjuice.constraints.distributions.find_token`) -- token ``token_ids[i]``
         weighs ``token_logw[i]``, the others nothing
+    :ivar successors: None until a query asks, then ``(lists,)``: the successor lists its liveness sweeps follow where
+        a token is missing (:func:`~.kernels.live.live_successors`; ``lists`` None for every class's)
     """
 
     table: torch.Tensor
@@ -106,6 +108,7 @@ class ClassMasses:
     token_stride: int = 0
     token_width: int = 0
     token_ids: Optional[torch.Tensor] = None
+    successors: Optional[tuple] = None
 
 
 #: What a storage holds when it is allocated (:meth:`State.storage_view`): None, nothing in particular -- every slot a
