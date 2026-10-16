@@ -37,6 +37,7 @@ from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
 from .common import (IDENTITY, NODE_TILE, _block_ptr, _exit_width, _interval, _logaddexp_tile, _lse_step, _slot,
                      _tile_rows, grid_chunks, node_groups, node_tiles, tensor)
+from .prod import _lse_step_one_exp
 from .prod_top_down import _once, _out_flows_ptr, _parent_base, _parent_lane
 from .sum import _num_sms
 
@@ -224,12 +225,13 @@ def _class_weight_kernel(dfa_class_flow, cw_base, cw_K, element_flows, temp_flow
     at the destination's position block (``cw_base``, ``cw_K`` per position) -- or stored there (``STORE``: the launch
     writes each of its destinations first in its query, see :mod:`..queries.plans`). A node tile's destinations (see
     :func:`~.common.node_tiles`) are at one position, with steps to the same other boundaries: they walk the same
-    columns, once for all of them. Under evidence pruning every lane walks only its sample's live columns (``count``
-    / ``start`` / ``columns``, see :meth:`~.live.Liveness.lists`; every term through another is -inf): a wide
-    automaton pinned by its evidence to a few columns costs a few steps, not one per column. ``UNIFORM`` (see
-    :func:`_walk_column`; ``TB`` 1 under pruning): the program's lanes walk the same columns. ``COMPACT``: the
-    outputs' top-down values compact (:mod:`.compact`; ``tflow_width`` the scratch rows' width there, ``temp_width``
-    their inside values'); ``MARS``: the other operands' inside values too (by the same layout)."""
+    columns, once for all of them; one exp a term (:func:`~.prod._lse_step_one_exp`). Under evidence pruning every
+    lane walks only its sample's live columns (``count`` / ``start`` / ``columns``, see :meth:`~.live.Liveness.lists`;
+    every term through another is -inf): a wide automaton pinned by its evidence to a few columns costs a few steps,
+    not one per column. ``UNIFORM`` (see :func:`_walk_column`; ``TB`` 1 under pruning): the program's lanes walk the
+    same columns. ``COMPACT``: the outputs' top-down values compact (:mod:`.compact`; ``tflow_width`` the scratch rows'
+    width there, ``temp_width`` their inside values'); ``MARS``: the other operands' inside values too (by the same
+    layout)."""
     d, real, d0 = _tile_rows(tiles, tl.program_id(0), TN, SUBS)
     lane = tl.arange(0, TB * TC)
     b = ((pid0 + tl.program_id(1)) * TB + lane // TC).to(tl.int64)
@@ -299,7 +301,7 @@ def _class_weight_kernel(dfa_class_flow, cw_base, cw_K, element_flows, temp_flow
                                       COMPACT)
                     ov = tl.load(op + so[None, :, :], mask = vm & (m2 & (so >= 0))[None, :, :],
                                  other = float("-inf"))                        # O_out[i0, next]
-                    mx, acc = _lse_step(mx, acc, lv + ov)
+                    mx, acc = _lse_step_one_exp(mx, acc, lv + ov)
         else:                                                                  # the input, then a block over [t+1, t2)
             t2 = tl.load(parents + f * 7 + 5)
             X = _exit_width(width, t2, n)
@@ -325,7 +327,7 @@ def _class_weight_kernel(dfa_class_flow, cw_base, cw_K, element_flows, temp_flow
                                       t, i, t2, jq, qm, B, n, W, COMPACT)
                     ov = tl.load(op + so[None, :, None], mask = vm & (qm & (so >= 0))[None, :, None],
                                  other = float("-inf"))
-                    mx, acc = _lse_step(mx, acc, ov + tl.zeros([TN, TB * TC, TJ], dtype = tl.float32))
+                    mx, acc = _lse_step_one_exp(mx, acc, ov + tl.zeros([TN, TB * TC, TJ], dtype = tl.float32))
                 else:
                     for j0 in range(0, X, TJ):
                         j = j0 + tl.arange(0, TJ)
@@ -345,7 +347,7 @@ def _class_weight_kernel(dfa_class_flow, cw_base, cw_K, element_flows, temp_flow
                                           j[None, :], m2, B, n, W, MARS)       # (a block kept once: its slot)
                         rv = tl.load(rp + sr, mask = vm & m2[None, :, :] & (sr >= 0),
                                      other = float("-inf"))                    # R[next, j]
-                        mx, acc = _lse_step(mx, acc, ov + rv)
+                        mx, acc = _lse_step_one_exp(mx, acc, ov + rv)
     top = tl.max(mx, axis = 2)
     shift = tl.where(top == float("-inf"), 0.0, top)
     val = tl.log(tl.sum(acc * tl.exp(mx - shift[:, :, None]), axis = 2)) + shift

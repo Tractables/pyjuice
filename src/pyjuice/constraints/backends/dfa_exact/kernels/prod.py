@@ -164,8 +164,9 @@ def _lse_step_one_exp(m, acc, v):
     """:func:`_lse_step` with one exp, bit for bit: a new maximum rescales the sum by ``exp(m - v)`` and adds 1, any
     other term adds ``exp(v - m)`` -- both ``exp(-|v - m|)``, the float the two-exp form computes for the term it does
     not round to 1 (a ``-inf`` term adds nothing, and the first finite one makes the sum 1). Faster in
-    :func:`_block_input_kernel` (x1.10); in the ``input @ block`` kernels it won with most lanes live and lost under
-    evidence pruning, so they keep :func:`_lse_step`."""
+    :func:`_block_input_kernel` (x1.10) and in the class weights (:func:`~.score._class_weight_kernel`, 5-9% on every
+    call of a diffusion decode); in the ``input @ block`` kernels it won with most lanes live and lost under evidence
+    pruning, so they keep :func:`_lse_step`."""
     e = tl.exp(-tl.abs(v - m))
     acc = tl.where(v == float("-inf"), acc, tl.where(v > m, acc * e + 1.0, acc + e))
     return tl.maximum(m, v), acc
