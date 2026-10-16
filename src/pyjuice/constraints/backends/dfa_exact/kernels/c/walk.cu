@@ -7,8 +7,9 @@
 // Two kernels per launch:
 //   `ibtd_terms_kernel`, a warp per (boundary t of the launch, sample, live column q at t + 1), 32 entries at a time:
 //   the entries of q's predecessor list that the sample sums -- i live at t, and the observed class if the sample
-//   observes t --, in the list's order, as (i's place among the sample's live columns, class) at q's own place in a
-//   copy of the list per sample (`terms`), and their number (`cnt`); every program of the main kernel would otherwise
+//   observes t --, in the list's order, as (i's place among the sample's live columns, class) packed in 32 bits (the
+//   class in the low `xb`, as few as the classes need) at q's own place in a copy of the list per sample (`terms`), and
+//   their number (`cnt`); every program of the main kernel would otherwise
 //   walk the whole list, mostly dead entries under evidence. The last CTA of a (boundary, sample) then orders its live
 //   columns by their terms, most first (`perm`): a warp's lanes sum about as many (a column of many predecessors next
 //   to columns of few kept 3 of 4 threads waiting, without evidence) -- unless the sample's lanes are few;
@@ -124,7 +125,7 @@ struct TermArgs {
     int* cnt;              // [T, B, W]: by live column's place
     int* perm;             // [T, B, W]: the live columns' places, most terms first (none: not ordered)
     int* done;             // [T, B]: CTAs done (0 between launches)
-    int B, n, W;
+    int B, n, W, xb;       // xb: a term's class bits
 };
 
 __global__ void __launch_bounds__(TW) ibtd_terms_kernel(TermArgs a) {
@@ -154,7 +155,7 @@ __global__ void __launch_bounds__(TW) ibtd_terms_kernel(TermArgs a) {
                 if (oc < 0 || x == oc) {
                     const int ri = rank[a.pred_col[e]];
                     ok = ri >= 0;
-                    pk = (ri << 16) | x;
+                    pk = (int)(((unsigned)ri << a.xb) | (unsigned)x);
                 }
             }
             const unsigned m = __ballot_sync(0xffffffffu, ok);
@@ -230,7 +231,7 @@ struct IbArgs {
     const int* perm;
     long long out_first, out_width, temp_width;
     long long team_floats;   // a team's shared memory (floats, a multiple of 4)
-    int B, n, W, C, input_start, subs, tn, lp_ld;
+    int B, n, W, C, input_start, subs, tn, lp_ld, xb;
     int sample, c_kind, out_temp, c_full, out_full;
 };
 
@@ -359,8 +360,9 @@ __global__ void __launch_bounds__(256) ibtd_kernel(IbArgs a) {
             const float* ob = O + (long long)rj * TN + k0;
             const int* ent = terms + pp[q];
             const int m = cnt[rq];
+            const int xmask = (1 << a.xb) - 1;
             for (int s = 0; s < m; ++s) {
-                const int pk = ent[s], ri = pk >> 16, x = pk & 0xffff;
+                const int pk = ent[s], ri = (int)((unsigned)pk >> a.xb), x = pk & xmask;
                 if (opos >= 0 && a.iv_table[opos + (long long)a.ccolumns[st_t + ri] * X + j] < 0) continue;
                 load_g<G>(ob + (long long)ri * ce * TN, ov);
                 if (oc < 0) load_g<G>(M + x * TN + k0, mv);
@@ -438,6 +440,30 @@ static int64_t ibtd_smem(int64_t tn, int64_t lp_ld, int64_t C) {
     return (4 * tn * (lp_ld + C + 1) + 15) / 16 * 16;
 }
 
+// The most dynamic shared memory a CTA of `ibtd_kernel<G, WARPS>` may take (the device's opt-in less the kernel's
+// static), the attribute set once
+template <int G, bool WARPS>
+static int64_t ibtd_allowed() {
+    static const int64_t most = [] {
+        const void* f = (const void*)ibtd_kernel<G, WARPS>;
+        int dev = 0, optin = 0;
+        cudaFuncAttributes fa;
+        C10_CUDA_CHECK(cudaGetDevice(&dev));
+        C10_CUDA_CHECK(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
+        C10_CUDA_CHECK(cudaFuncGetAttributes(&fa, f));
+        const int dyn = optin - (int)fa.sharedSizeBytes;
+        C10_CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, dyn));
+        return (int64_t)dyn;
+    }();
+    return most;
+}
+
+// The most dynamic shared memory of a CTA of one child (a sample's CTA, not warp teams): `_input_block_cuda`'s limit
+// for the CTAs of parent rows too wide for 45 KB
+int64_t ibtd_smem_max() {
+    return ibtd_allowed<1, false>();
+}
+
 // One launch: `tiles` (int32, 16 per node tile) with `subs` CTAs of `tn` children per tile (`threads` each), every
 // sample (`warps`: 8 a CTA, a warp each); `tlist` / `t2i` / `ecum` the launch's boundaries (see TermArgs), `terms` /
 // `cnt` / `perm` / `done` the work space (B x ecum[T], T x B x W, T x B x W, T x B int32; `done` zero), `sort`: the
@@ -463,7 +489,9 @@ void ibtd_cuda(torch::Tensor element_flows, torch::Tensor temp_flows, torch::Ten
                 "ibtd_cuda: 1, 2 or a multiple of 4 children a CTA, at most 16 a tile");
     TORCH_CHECK(threads == 128 || threads == 256, "ibtd_cuda: 128 or 256 threads");
     TORCH_CHECK(!warps || threads / 32 <= WTEAMS, "ibtd_cuda: at most 8 warp teams");
-    TORCH_CHECK(C <= 65536 && W <= 32767, "ibtd_cuda: a term packs (place < 2^15, class < 2^16)");
+    int xb = 1;                                                           // a term's class bits, its place the rest
+    while ((1LL << xb) < C) ++xb;
+    TORCH_CHECK(xb < 32 && W < (1LL << (32 - xb)), "ibtd_cuda: a term packs (place, class) in 32 bits");
     const int64_t ntiles = tiles.numel() / WTILE;
     const int T = (int)tlist.numel();
     if (ntiles == 0 || B == 0 || T == 0 || cq_max == 0) return;
@@ -471,7 +499,7 @@ void ibtd_cuda(torch::Tensor element_flows, torch::Tensor temp_flows, torch::Ten
     TermArgs ta{i32(tlist, "tlist"), widx(ecum), i32(pred_ptr, "pred_ptr"), i32(pred_col, "pred_col"),
                 i32(pred_x, "pred_x"), widx(obs_class), i32(ccount, "ccount"), widx(cstart), i32(ccolumns, "ccolumns"),
                 i32(crank, "crank"), terms.data_ptr<int>(), cnt.data_ptr<int>(),
-                sort ? perm.data_ptr<int>() : nullptr, done.data_ptr<int>(), (int)B, (int)n, (int)W};
+                sort ? perm.data_ptr<int>() : nullptr, done.data_ptr<int>(), (int)B, (int)n, (int)W, xb};
     ibtd_terms_kernel<<<dim3((unsigned)((cq_max + TW / 32 - 1) / (TW / 32)), (unsigned)B, (unsigned)T), TW, 0,
                         stream>>>(ta);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -519,6 +547,7 @@ void ibtd_cuda(torch::Tensor element_flows, torch::Tensor temp_flows, torch::Ten
     a.subs = (int)subs;
     a.tn = (int)tn;
     a.lp_ld = (int)lp_ld;
+    a.xb = xb;
     a.sample = sample;
     a.c_kind = (int)c_kind;
     a.out_temp = out_temp;
@@ -526,9 +555,13 @@ void ibtd_cuda(torch::Tensor element_flows, torch::Tensor temp_flows, torch::Ten
     a.out_full = out_full;
     a.team_floats = ibtd_smem(tn, lp_ld, C) / 4;
     const int64_t smem = 4 * a.team_floats * (warps ? threads / 32 : 1);
-    TORCH_CHECK(smem <= 45 * 1024, "ibtd_cuda: at most 45 KB of dynamic shared memory (48 KB with the kernel's)");
     const dim3 grid((unsigned)(ntiles * subs), (unsigned)(warps ? (B + threads / 32 - 1) / (threads / 32) : B));
-#define IBTD_LAUNCH(GG, WW) ibtd_kernel<GG, WW><<<grid, (unsigned)threads, (size_t)smem, stream>>>(a)
+#define IBTD_LAUNCH(GG, WW) \
+    do { \
+        TORCH_CHECK(smem <= 45 * 1024 || smem <= (ibtd_allowed<GG, WW>()), "ibtd_cuda: ", smem, \
+                    " bytes of dynamic shared memory, more than the device takes"); \
+        ibtd_kernel<GG, WW><<<grid, (unsigned)threads, (size_t)smem, stream>>>(a); \
+    } while (0)
     if (warps) {
         if (tn % 4 == 0) IBTD_LAUNCH(4, true);
         else if (tn == 2) IBTD_LAUNCH(2, true);

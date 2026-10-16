@@ -792,7 +792,7 @@ TOP_DOWN_WARPS = 4
 INPUT_BLOCK_CUDA = True
 #: the most children of a node tile a CTA of the CUDA kernel takes (a node tile's at most), and the most dynamic
 #: shared memory (a sample's lanes of its children's parents, their class masses; 48 KB less the kernel's own): past
-#: it, CTAs of fewer
+#: it, CTAs of fewer -- and past it for one child, CTAs of one child with as much as the device takes
 INPUT_BLOCK_CUDA_NODES = NODE_TILE
 INPUT_BLOCK_CUDA_SMEM = 45 * 1024
 #: (lane, 4 children) items of a sample from which its CTA has 256 threads, not 128; up to which a CTA takes 8 samples
@@ -842,21 +842,36 @@ def _work_space(prog, size: int, counters: int):
     return ws, done
 
 
+def _ibtd_smem_max(mod) -> int:
+    """The most dynamic shared memory of a CTA of the CUDA kernel of one child on the current device (kept per
+    device)."""
+    dev = torch.cuda.current_device()
+    kept = _IBTD_SMEM_MAX.get(dev)
+    if kept is None:
+        kept = _IBTD_SMEM_MAX[dev] = int(mod.ibtd_smem_max())
+    return kept
+
+
+_IBTD_SMEM_MAX = {}
+
+
 def _input_block_cuda(la: TopDownLaunch, tiles: torch.Tensor, height: int, prog, compact, element_flows, temp_flows,
                       node_flows, node_mars, masses, obs_class, once_iv, common: dict, B: int) -> Optional[dict]:
     """
     Run an ``input @ block`` launch on compact values with the CUDA kernels (``c/walk.cu``: every sample's live terms
     per column, its columns by their terms, then a CTA per (node tile's children, sample) summing them from shared
-    memory), if they take it -- ungrouped transitions, its CTAs' shared memory within :data:`INPUT_BLOCK_CUDA_SMEM`,
-    its work space within :data:`INPUT_BLOCK_CUDA_SPACE` --, and return the CTAs' shape (``tn`` children, ``threads``, ``warps``: a warp per sample), else None. The values
-    are the Triton kernel's, bit for bit.
+    memory), if they take it -- ungrouped transitions, a term's place and class in 32 bits, its CTAs' shared memory
+    within :data:`INPUT_BLOCK_CUDA_SMEM` (or a CTA of one child within the device's), its work space within
+    :data:`INPUT_BLOCK_CUDA_SPACE` --, and return the CTAs' shape (``tn`` children, ``threads``, ``warps``: a warp per
+    sample, ``smem``: bytes), else None. The values are the Triton kernel's, bit for bit.
     """
     if not INPUT_BLOCK_CUDA or prog.trans_top_down.grouped or not obs_class.is_contiguous():
         return None
     from .c import get_module
     mod = get_module()
     n, W, C = prog.n, prog.next_col.size(1), prog.next_col.size(2)
-    if mod is None or C > 65536 or W > 32767 or B > 65535:
+    xb = max(1, (C - 1).bit_length())                                        # a term's class bits, its place the rest
+    if mod is None or xb >= 32 or W >= 1 << (32 - xb) or B > 65535:
         return None
     st = _input_block_boundaries(la, prog)
     mc = compact.max_count
@@ -866,7 +881,7 @@ def _input_block_cuda(la: TopDownLaunch, tiles: torch.Tensor, height: int, prog,
     tn = min(height, INPUT_BLOCK_CUDA_NODES)
     while tn > 1 and team(tn) > INPUT_BLOCK_CUDA_SMEM:
         tn //= 2
-    if team(tn) > INPUT_BLOCK_CUDA_SMEM:
+    if team(tn) > INPUT_BLOCK_CUDA_SMEM and team(tn) > _ibtd_smem_max(mod):  # (one child: the device's most)
         return None
     items = cq * int(mc[st["te"]].max()) * max(tn // 4, 1)                  # a sample's most (lane, 4 children)
     warps = items <= INPUT_BLOCK_CUDA_WARP_ITEMS and 8 * team(tn) <= INPUT_BLOCK_CUDA_SMEM
@@ -886,7 +901,7 @@ def _input_block_cuda(la: TopDownLaunch, tiles: torch.Tensor, height: int, prog,
                   ws[nterms:nterms + T * B * W], ws[nterms + T * B * W:nterms + 2 * T * B * W], done,
                   common["out_first"], common["out_width"], common["temp_width"], B, n, W, C, prog.input_start,
                   height // tn, tn, threads, warps, not warps, lp, cq, sample, c_kind, out_temp, c_full, out_full)
-    return dict(tn = tn, threads = threads, warps = warps)
+    return dict(tn = tn, threads = threads, warps = warps, smem = team(tn) * (8 if warps else 1))
 
 
 def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_flows, node_mars, masses, obs_class,

@@ -650,6 +650,7 @@ void ibtd_cuda(torch::Tensor element_flows, torch::Tensor temp_flows, torch::Ten
                int64_t input_start, int64_t subs, int64_t tn, int64_t threads, bool warps, bool sort,
                int64_t lp_ld, int64_t cq_max, bool sample, int64_t c_kind, bool out_temp, bool c_full,
                bool out_full);
+int64_t ibtd_smem_max();
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fused_sum_cuda", &fused_sum_cuda,
@@ -658,4 +659,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("liveness_fits", &liveness_fits, "whether the shared-memory liveness sweep takes an automaton");
     m.def("liveness_cuda", &liveness_cuda, "the liveness sweep, one CTA per sample in shared memory");
     m.def("ibtd_cuda", &ibtd_cuda, "an input @ block top-down launch on compact values, a sample's live terms");
+    m.def("ibtd_smem_max", &ibtd_smem_max, "the most dynamic shared memory of an input @ block top-down CTA of one child");
 }

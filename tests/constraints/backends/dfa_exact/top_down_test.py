@@ -637,6 +637,24 @@ def test_cuda_walk_on_wide_automata(build_pc, walk_launches, monkeypatch):
 
 
 @pytest.mark.skipif(get_module() is None, reason = "the CUDA kernels are unavailable")
+def test_cuda_walk_past_45k_of_shared_memory(build_pc, walk_launches, monkeypatch):
+    """A random 16000-state automaton over 32 tokens: a sample observing nothing keeps most states live within three
+    tokens, its parents' rows too wide for 45 KB of shared memory -- CTAs of one child with the device's more; the
+    Triton kernel's values bit for bit."""
+    g = torch.Generator().manual_seed(0)
+    K, Vw, n = 16000, 32, 5
+    dfa = jc.DFA.from_dense(Vw, torch.randint(0, K, (K, Vw), generator = g), 0,
+                            torch.randperm(K, generator = g)[:K // 2].tolist())
+    cc = jc.compile(dfa, build_pc("hmm_block_sparse", n, Vw))
+    data = torch.randint(0, Vw, (2, n), generator = g)
+    missing = torch.tensor([[True] * n, [True, False, True, True, False]])
+    want, got = both_walks(monkeypatch, lambda: top_down_blocks(cc, data, missing, storage = "compact")[0])
+    assert_same_bits(got, want)
+    assert all(la["taken"] for la in walk_launches)
+    assert max(la["smem"] for la in walk_launches) > 45 * 1024
+
+
+@pytest.mark.skipif(get_module() is None, reason = "the CUDA kernels are unavailable")
 def test_cuda_walk_reaches_every_case(build_pc, walk_launches, monkeypatch):
     """The walk tests' circuits and queries reach every case of the CUDA kernels: children in sum rows and in fold
     rows, parents in element rows and fold rows, intervals joining every pair or not (child's and parent's), several
