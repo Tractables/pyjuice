@@ -317,6 +317,50 @@ def test_gates_far_from_the_values(node_gate, child_gate):
     assert_rows_close(cond, torch.log_softmax(lls, dim = 1), 2)
 
 
+@pytest.mark.parametrize("child_gate, node_gate", [("fine", "block"), ("block", "half")])
+@pytest.mark.parametrize("kind", ["hmm", "hmm_block_sparse", "pd"])
+def test_log_normalizers_against_float64(kind, child_gate, node_gate, build_pc, reference):
+    """Every gated node's log Z of every sample (``block_scale.log_normalizers``) against ``log sum_c w[n, c]
+    phi_b[gate(n, c)]`` in float64, straight from the weights: gates N(0, 2^2), every other child gate 200 nats up,
+    and -- where a gate row has a gate its nodes have no edge in (block-sparse sums) -- that gate 1000 nats above the
+    row's others, so the nodes' Z is 1000 nats below the row's largest gate: a sum that underflows even in float64,
+    computed exactly."""
+    from pyjuice.constraints.backends.dfa_exact.external_params import block_scale
+    pc = gated_pc(build_pc, kind, child_gate = child_gate, node_gate = node_gate)
+    layout = jc.compile(jc.DFA.anything(V), pc).backend.program().gate_cells
+    B, deep = 3, 0
+    for case in ("normal", "far", "deep"):
+        gates = make_gates(pc, B, seed = 1)
+        for ns in pc.external_params_nodes:
+            owner = ns.external_params.storage_owner(ns)
+            if case == "far":
+                gates[owner][:, :, 1::2] += 200.0
+            elif case == "deep":                    # a gate its row's nodes have no edge in: 1000 nats up
+                ng, cg = ns.external_params.gate_sizes(ns)
+                W = reference.sum_weights(pc, ns)
+                empty = (W.view(W.size(0), -1, cg) == 0).all(dim = 2)                   # [nodes, child gates]
+                for r in range(gates[owner].size(1)):
+                    rows = empty[r * ng:(r + 1) * ng]
+                    hit = rows.all(dim = 0).nonzero().view(-1) if (~rows).any() else rows.new_zeros(0)
+                    if hit.numel():
+                        gates[owner][:, r, hit[0]] += 1000.0
+                        deep += 1
+        session = block_scale.session_inputs(pc, layout, gates)
+        got = block_scale.log_normalizers(pc, layout, session)
+        for ns in session.nodes:
+            ng, cg = ns.external_params.gate_sizes(ns)
+            W = reference.sum_weights(pc, ns).double()
+            lphi = gates[ns.external_params.storage_owner(ns)].double()
+            g = lphi[:, torch.arange(W.size(0), device = DEV) // ng][:, :, torch.arange(W.size(1), device = DEV) // cg]
+            want = torch.logsumexp(torch.log(W)[None] + g, dim = 2)                        # [B, nodes]
+            first = ns._output_ind_range[0]
+            have = got[:, first:first + ns.num_nodes].double()
+            assert torch.equal(torch.isneginf(have), torch.isneginf(want)), (kind, case)
+            fin = torch.isfinite(want)
+            assert ((have[fin] - want[fin]).abs() <= 1e-6 * (1 + want[fin].abs())).all(), (kind, case)
+    assert kind != "hmm_block_sparse" or deep > 0
+
+
 def test_children_in_another_order(reference):
     """Two gated sums over the same two products in opposite orders, a gate per child: the second's children are
     rows in the first's order, so its edges' places among its own children are not their rows' order -- the reference's

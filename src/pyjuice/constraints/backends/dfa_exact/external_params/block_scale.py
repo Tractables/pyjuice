@@ -232,23 +232,39 @@ def log_normalizers(pc, layout: Cells, gates: SessionGates) -> torch.Tensor:
     for ns in gates.nodes:
         groups.setdefault((ns.get_source_ns(), ns.external_params.gate_sizes(ns)), []).append(ns)
     for (_, (gate_bs, gate_cbs)), members in groups.items():
-        lsig = _log_gate_sums(pc, members[0], gate_cbs).float()                 # [nodes, Ck]
+        lsig = _log_gate_sums(pc, members[0], gate_cbs)                         # [nodes, Ck] float64
         Nk, Ck = layout.shape[members[0].external_params.storage_owner(members[0])]
-        node = torch.arange(members[0].num_nodes, device = dev)
-        step = max(1, LOGZ_CHUNK // (gates.batch * node.numel() * Ck))
+        N = members[0].num_nodes
+        node = torch.arange(N, device = dev)
+        # Z = sum_g phi[g] sigma[n, g], each node's sigma and each gate row's phi shifted by its maximum: a product of
+        # [samples, Ck] by [Ck, nodes] per gate row, in float64
+        top = lsig.max(dim = 1).values
+        top = torch.where(torch.isfinite(top), top, 0.0)                         # (a node of no edge: Z 0)
+        sig = torch.zeros(Nk * gate_bs, Ck, dtype = torch.float64, device = dev)
+        sig[:N] = torch.exp(lsig - top[:, None])
+        sig = sig.view(Nk, gate_bs, Ck).transpose(1, 2)                          # [Nk, Ck, gate_bs]
+        step = max(1, LOGZ_CHUNK // (gates.batch * Nk * Ck))
         for k in range(0, len(members), step):
             chunk = members[k:k + step]
             cells = torch.tensor([layout.base[ns.external_params.storage_owner(ns)] for ns in chunk], device = dev)
-            lphi = gates.values[:, cells[:, None] + torch.arange(Nk * Ck, device = dev)[None, :]]
-            lphi = lphi.view(gates.batch, len(chunk), Nk, Ck)[:, :, node // gate_bs, :]
-            lz = torch.logsumexp(lphi + lsig[None, None], dim = 3)                                 # [B, chunk, N]
+            lphi = gates.values[:, cells[:, None] + torch.arange(Nk * Ck, device = dev)[None, :]].double()
+            lphi = lphi.view(gates.batch * len(chunk), Nk, Ck)                    # (sample, member) major
+            m = lphi.max(dim = 2, keepdim = True).values
+            m = torch.where(torch.isfinite(m), m, 0.0)                           # (a row of no gate: Z 0)
+            tot = torch.bmm(torch.exp(lphi - m).transpose(0, 1), sig)            # [Nk, samples x members, gate_bs]
+            tot = tot.transpose(0, 1).reshape(lphi.size(0), Nk * gate_bs)[:, :N]
+            lz = torch.log(tot) + m[:, node // gate_bs, 0] + top[None]
+            low = tot == 0                                                       # underflowed (or no mass): exactly
+            if bool(low.any()):
+                at, n = low.nonzero(as_tuple = True)
+                lz[at, n] = torch.logsumexp(lphi[at, n // gate_bs] + lsig[n], dim = 1)
             rows = torch.tensor([ns._output_ind_range[0] for ns in chunk], device = dev)[:, None] + node[None, :]
-            out[:, rows.reshape(-1)] = lz.reshape(gates.batch, -1)
+            out[:, rows.reshape(-1)] = lz.view(gates.batch, -1).float()
     gates._logz = out
     return out
 
 
-#: floats :func:`log_normalizers` works on at once (a chunk of node groups' gates per node)
+#: gates :func:`log_normalizers` works on at once (a chunk of node groups' every sample's)
 LOGZ_CHUNK = 1 << 24
 
 
