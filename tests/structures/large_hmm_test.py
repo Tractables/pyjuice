@@ -33,7 +33,8 @@ def test_large_hmm():
     pc.backward(data, flows_memory = 1.0, allow_modify_flows = False,
                 propagation_alg = "LL", logspace_flows = True)
 
-    import pdb; pdb.set_trace()
+    assert torch.isfinite(lls).all()
+    assert torch.isfinite(pc.param_flows.sum()), "the backward left a non-finite parameter flow"
 
 
 if __name__ == "__main__":
