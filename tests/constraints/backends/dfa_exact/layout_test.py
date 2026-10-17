@@ -301,12 +301,12 @@ def test_layouts_are_cached_by_fingerprint():
     assert build_layout(jc.DFA.contains([[1, 2]], 6), 5) is not a
 
 
-def test_pruning_on_a_word_count_constraint():
+def test_pruning_on_a_word_count_constraint(word_count):
     """Report how much pruning narrows the columns for a Ctrl-G-style constraint (keyword AND exactly 8
     words) over a small vocabulary; the active width must stay below the automaton's state count."""
     V = 6
     kinds = torch.tensor([0, 3, 3, 3, 1, 2])          # 0 special, 1-3 words, 4 glued, 5 separator
-    c = (jc.DFA.contains([[1, 2]], V) & jc.DFA.word_count(8, 8, kinds)).automaton()
+    c = (jc.DFA.contains([[1, 2]], V) & word_count(8, 8, kinds)).automaton()
     L = build_layout(c, 12)
     print(f"{c.num_states} states; active width per boundary {L.width.tolist()}")
     assert L.satisfiable and int(L.width.max()) < c.num_states

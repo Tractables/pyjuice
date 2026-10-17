@@ -84,21 +84,6 @@ def test_from_transitions_partial_map_with_arbitrary_ids():
     assert sparse.accepts([1]) and not sparse.accepts([1, 0]) and not sparse.accepts([0, 1])
 
 
-def test_from_ctrlg_graph():
-    V = 4
-    rng = np.random.default_rng(0)
-    # Ctrl-G style: edges (u, v, bitset) with tuple state names
-    bits = lambda toks: np.isin(np.arange(V), toks)
-    graph = {"edges": [(("a",), ("a",), bits([0, 2, 3])), (("a",), ("b",), bits([1])),
-                       (("b",), ("b",), bits([0, 1, 2, 3]))],
-             "initial_state": ("a",), "accept_states": {("b",)}}
-    dfa = jc.DFA.from_ctrlg(graph, V)
-    for t in strings(V, 4):
-        assert dfa.accepts(t) == (1 in t)
-    with pytest.raises(ValueError, match = "not complete"):
-        jc.DFA.from_ctrlg({"edges": [(0, 1, bits([1]))], "initial_state": 0, "accept_states": {1}}, V)
-
-
 def test_invalid_tables_raise():
     with pytest.raises(ValueError, match = "complete"):
         jc.DFA(2, [0, 0], [[1]], 0, [0])

@@ -1,6 +1,7 @@
 """
 The two constraints of Ctrl-G's tutorial, built with pyjuice.constraints over a small synthetic
-vocabulary (no tokenizer download):
+vocabulary (no tokenizer download), the word counts by Ctrl-G's definition (``word_count`` in
+tests/constraints/conftest.py):
 
   1. one of {" riding a bike", " ride bikes", " rides a bike", " biking", " bikes"} appears, AND one of
      {" park", " beach"} appears, AND the text has exactly 10 words;
@@ -17,7 +18,6 @@ import pytest
 import torch
 
 import pyjuice.constraints as jc
-from pyjuice.constraints.language.text import DEFAULT_SEPARATORS, word_token_kinds_from_strings
 
 VOCAB = ["<|endoftext|>", " a", " boy", " girl", " girls", " boys", " children", " is", " are", " riding",
          " ride", " rides", " bike", " bikes", " biking", " in", " the", " park", " beach", " dog", " dogs",
@@ -26,27 +26,23 @@ VOCAB = ["<|endoftext|>", " a", " boy", " girl", " girls", " boys", " children",
 TOK = {s: i for i, s in enumerate(VOCAB)}
 V = len(VOCAB)
 EOS = TOK["<|endoftext|>"]
+SEPARATORS = (" ", "\n", ",", ".", ":", ";", "\"", "/")             # Ctrl-G's word separators
 
 
 def enc(text_tokens):
     return [TOK[t] for t in text_tokens]
 
 
-def kinds():
-    return word_token_kinds_from_strings(VOCAB, special_ids = [EOS])
-
-
-def example1():
+@pytest.fixture(name = "examples")
+def examples_fixture(word_count, word_kinds):
+    """The two constraints, by number."""
+    kinds = word_kinds(VOCAB, SEPARATORS, special_ids = [EOS])
     bike = jc.DFA.contains([enc([" riding", " a", " bike"]), enc([" ride", " bikes"]),
                          enc([" rides", " a", " bike"]), enc([" biking"]), enc([" bikes"])], V)
     place = jc.DFA.contains([enc([" park"]), enc([" beach"])], V)
-    return bike & place & jc.DFA.word_count(10, 10, kinds())
-
-
-def example2():
     who = jc.DFA.contains([enc([w]) for w in [" girl", " boy", " girls", " boys", " children"]], V)
     pet = jc.DFA.contains([enc([w]) for w in [" dogs", " cats", " dog", " cat"]], V)
-    return who.concat(pet) & jc.DFA.word_count(7, 12, kinds())
+    return {1: bike & place & word_count(10, 10, kinds), 2: who.concat(pet) & word_count(7, 12, kinds)}
 
 
 # Independent references, written from the definitions (not from the automata).
@@ -71,7 +67,7 @@ def word_count_ref(tokens):
         if t == EOS or text == "":
             continue
         word_char = any(ch.isalnum() for ch in text)
-        starts_sep = text[0] in DEFAULT_SEPARATORS
+        starts_sep = text[0] in SEPARATORS
         if word_char:
             count += starts_sep or after_sep
             after_sep = False
@@ -128,8 +124,8 @@ SENTENCES = {
 }
 
 
-def test_hand_written_sentences():
-    c1, c2 = example1(), example2()
+def test_hand_written_sentences(examples):
+    c1, c2 = examples[1], examples[2]
     for name, (words, want1, want2) in SENTENCES.items():
         t = enc(words)
         assert ref1(t) == want1 and ref2(t) == want2, f"reference disagrees with the label: {name}"
@@ -138,8 +134,8 @@ def test_hand_written_sentences():
 
 
 @pytest.mark.parametrize("which", [1, 2])
-def test_constraint_and_its_automaton_match_the_definition(which):
-    c, ref = (example1(), ref1) if which == 1 else (example2(), ref2)
+def test_constraint_and_its_automaton_match_the_definition(which, examples):
+    c, ref = examples[which], ref1 if which == 1 else ref2
     assert isinstance(c, jc.And) and (which == 1 or isinstance(c.children[0], jc.Concat) or
                                    any(isinstance(ch, jc.Concat) for ch in c.children))
     dfa = c.automaton()
@@ -152,20 +148,20 @@ def test_constraint_and_its_automaton_match_the_definition(which):
     assert pos > 0                              # the random strings do reach acceptance
 
 
-def test_automaton_sizes():
+def test_automaton_sizes(examples):
     # Ctrl-G's minimised DFAs have 100 and 66 states over the GPT-2 vocabulary; with this smaller
     # vocabulary the keyword parts are the same, so the canonical minimal automata are comparable.
-    d1, d2 = example1().automaton(), example2().automaton()
+    d1, d2 = examples[1].automaton(), examples[2].automaton()
     assert d1.minimize() == d1 and d2.minimize() == d2
     print(f"example 1: {d1.num_states} states, {d1.num_classes} classes; "
           f"example 2: {d2.num_states} states, {d2.num_classes} classes")
 
 
 @pytest.mark.parametrize("which", [1, 2])
-def test_wmc_and_sample_through_the_composite(which):
+def test_wmc_and_sample_through_the_composite(which, examples):
     """wmc / sample of the composite under factorised weights vs brute force, on a sub-vocabulary small
     enough to enumerate (all other tokens get weight 0)."""
-    c, ref_fn = (example1(), ref1) if which == 1 else (example2(), ref2)
+    c, ref_fn = examples[which], ref1 if which == 1 else ref2
     # example 1 needs >= 10 tokens; "s" at the very start counts as a word, elsewhere it does not
     words, n = ([" bikes", " park", "s"], 11) if which == 1 else ([" girl", " dog", " the", "s", "."], 7)
     sub = enc(words)
@@ -184,8 +180,8 @@ def test_wmc_and_sample_through_the_composite(which):
             assert set(x) <= set(sub) and ref_fn(x)
 
 
-def test_matcher_through_the_composite():
-    c = example2()
+def test_matcher_through_the_composite(examples):
+    c = examples[2]
     m = c.matcher()
     for w in [" a", " girl", " walking", " with", " her"]:
         assert m.advance(TOK[w])
