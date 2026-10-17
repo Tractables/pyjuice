@@ -196,10 +196,11 @@ SCENARIOS = {"left to right": left_to_right, "any order": any_order, "beams": be
 
 
 def ask(target, query, step):
+    """A step's query at fp32 (where a decoder's calls are the circuit's own to the bit)."""
     if query == "marginal":
-        return target.marginal(step["data"], step.get("missing_mask"), **{k: step[k] for k in ("mask_id", "storage")
-                                                                          if k in step})
-    return target.conditional(**step)
+        return target.marginal(step["data"], step.get("missing_mask"), precision = "fp32",
+                               **{k: step[k] for k in ("mask_id", "storage") if k in step})
+    return target.conditional(**{"precision": "fp32", **step})
 
 
 @pytest.mark.parametrize("storage, park", [("dense", "default"), ("compact", "default"), ("compact", "always")])
@@ -224,7 +225,7 @@ def test_a_decoders_calls_are_the_circuits(kind, scenario, query, storage, park,
         steps = [{k: v for k, v in s.items() if k in ("data", "missing_mask", "mask_id")} for s in steps]
     with juice.fast_inference():
         want = [ask(cc, query, s) for s in steps]
-    with cc.decoder(storage = storage) as decoder:
+    with cc.decoder(storage = storage, precision = "fp32") as decoder:
         got = [ask(decoder, query, s) for s in steps]
     for i, (a, b) in enumerate(zip(got, want)):
         assert_close(a, b, n, where = f"step {i}")
@@ -277,9 +278,9 @@ def test_a_compact_call_moves_the_held_values_it_reads(scenario, build_pc, monke
     monkeypatch.setattr(CP, "regather", spy_regather)
     monkeypatch.setattr(QD, "conditional", spy_conditional)
     with juice.fast_inference():
-        want = [cc.conditional(**s) for s in steps]
+        want = [cc.conditional(precision = "fp32", **s) for s in steps]
     parked = []
-    with cc.decoder(storage = "compact") as decoder:
+    with cc.decoder(storage = "compact", precision = "fp32") as decoder:
         for i, s in enumerate(steps):
             assert_close(decoder.conditional(**s), want[i], n, where = f"step {i}")
             parked.append(np.any([p["inside"] for p in decoder._kept.parked], axis = 0) if decoder._kept.parked
@@ -305,8 +306,8 @@ def test_a_compact_decoder_over_a_wide_batch(kind, build_pc, monkeypatch):
     cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc(kind, n, V))
     for steps in (left_to_right(n, B = 24), beams(n)):
         with juice.fast_inference():
-            want = [cc.conditional(**s) for s in steps]
-        with cc.decoder(storage = "compact") as decoder:
+            want = [cc.conditional(precision = "fp32", **s) for s in steps]
+        with cc.decoder(storage = "compact", precision = "fp32") as decoder:
             got = [decoder.conditional(**s) for s in steps]
         for i, (a, b) in enumerate(zip(got, want)):
             assert_close(a, b, n, where = f"step {i}")
@@ -370,7 +371,7 @@ def test_an_auto_decoder_switching_storage_computes_its_values_again(kind, query
     spy = Spy(monkeypatch)
     reg_iv = cc.backend.program().reg_iv_np
     got = []
-    with cc.decoder() as decoder:
+    with cc.decoder(precision = "fp32") as decoder:
         for s in steps:
             got.append(ask(decoder, query, s))
             if spy.dropped[-1]:                                         # only what the call computed is kept
@@ -408,13 +409,13 @@ def test_anything_else_using_the_buffers_or_another_precision_starts_afresh(buil
     steps = left_to_right(n)
     other = left_to_right(n, seed = 9)
     with juice.fast_inference():
-        want = [cc.conditional(**s) for s in steps]
+        want = [cc.conditional(precision = "fp32", **s) for s in steps]
     spy = Spy(monkeypatch)
-    with cc.decoder(storage = "dense") as decoder:
+    with cc.decoder(storage = "dense", precision = "fp32") as decoder:
         for t in range(4):
             decoder.conditional(**steps[t])
         assert spy.anything(3)
-        cc.conditional(**other[4])                                  # the same regions, other values
+        cc.conditional(precision = "fp32", **other[4])                                  # the same regions, other values
         assert_close(decoder.conditional(**steps[4]), want[4], n)
         assert spy.held[-1] is None
         cc.marginal(other[5]["data"])
@@ -423,7 +424,7 @@ def test_anything_else_using_the_buffers_or_another_precision_starts_afresh(buil
         decoder.conditional(**steps[6], precision = "tf32")
         assert_close(decoder.conditional(**steps[7]), want[7], n)
         assert spy.held[-1] is None
-    with cc.decoder(storage = "dense") as decoder:
+    with cc.decoder(storage = "dense", precision = "fp32") as decoder:
         for t in range(4):
             decoder.conditional(**steps[t])
         decoder.conditional(**steps[4], storage = "compact")
@@ -442,9 +443,9 @@ def test_reset_starts_afresh(storage, build_pc, monkeypatch):
     cc = jc.compile(jc.DFA.contains([[1, 2]], V), pc)
     steps = left_to_right(n)
     with juice.fast_inference():
-        want = [cc.conditional(**s) for s in steps]
+        want = [cc.conditional(precision = "fp32", **s) for s in steps]
     spy = Spy(monkeypatch)
-    with cc.decoder(storage = storage) as decoder:
+    with cc.decoder(storage = storage, precision = "fp32") as decoder:
         for t in range(4):
             decoder.conditional(**steps[t])
         assert spy.anything(3)
@@ -461,7 +462,7 @@ def test_reset_starts_afresh(storage, build_pc, monkeypatch):
         stale = decoder.conditional(**steps[6])
         decoder.reset()
         fresh = decoder.conditional(**steps[6])
-    new = cc.conditional(**steps[6])
+    new = cc.conditional(precision = "fp32", **steps[6])
     assert_close(fresh, new, n)
     fin = torch.isfinite(new)
     assert (stale[fin] - new[fin]).abs().max() > 1e-2                # (the session kept the old parameters' values)
@@ -552,8 +553,8 @@ def test_hmm_decoding_gives_the_circuits_rows(kind, sum_path, build_pc, referenc
     cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc(kind, n, V))
     data = torch.randint(0, V, (4, n), generator = torch.Generator().manual_seed(0))
     with juice.fast_inference():
-        want = [cc.conditional(data[:, :t], targets = [t]) for t in range(n)]
-    with cc.decoder() as decoder:
+        want = [cc.conditional(data[:, :t], targets = [t], precision = "fp32") for t in range(n)]
+    with cc.decoder(precision = "fp32") as decoder:
         got = [decoder.conditional(data[:, :t], targets = [t]) for t in range(n)]
     for t in range(n):
         assert torch.equal(got[t], want[t]), t
@@ -631,11 +632,33 @@ def test_query_defaults_and_a_calls_own_options(build_pc):
     data[:, n // 2:] = 7
     with juice.fast_inference():
         tf32 = cc.conditional(data, mask_id = 7, precision = "tf32")
-        fp32 = cc.conditional(data, mask_id = 7)
+        fp32 = cc.conditional(data, mask_id = 7, precision = "fp32")
     with cc.decoder(precision = "tf32", mask_id = 7, bf16_token_table = False) as decoder:
         assert torch.equal(decoder.conditional(data), tf32)
         assert torch.equal(decoder.conditional(data, precision = "fp32"), fp32)
         assert torch.equal(decoder.conditional(torch.where(data == 7, -1, data), mask_id = -1), tf32)
+
+
+def test_conditionals_default_to_bf16_and_marginals_to_fp32(build_pc, monkeypatch):
+    """A conditional's precision defaults to "bf16" and a marginal's to "fp32", the circuit's queries and a decoder's
+    alike: a session mixing them computes again at each switch (its values are the other precision's), and reuses
+    across them under a precision of its own."""
+    n = KINDS["pd"]
+    cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc("pd", n, V))
+    steps = left_to_right(n)
+    with juice.fast_inference():
+        assert torch.equal(cc.conditional(**steps[3]), cc.conditional(**steps[3], precision = "bf16"))
+        assert torch.equal(cc.marginal(steps[3]["data"]), cc.marginal(steps[3]["data"], precision = "fp32"))
+    spy = Spy(monkeypatch)
+    for options in ({}, dict(precision = "fp32")):
+        spy.held.clear()
+        with cc.decoder(storage = "dense", **options) as decoder:
+            for t in range(4):
+                decoder.conditional(**steps[t])
+            decoder.marginal(steps[4]["data"])
+            decoder.conditional(**steps[5])
+        assert spy.anything(3)                                          # conditionals after conditionals
+        assert spy.anything(4) == spy.anything(5) == bool(options)      # the switches: a precision of its own
 
 
 @pytest.mark.slow
@@ -671,7 +694,7 @@ def test_decoding_speed(capsys):
                         for t in range(n):
                             torch.cuda.synchronize()
                             t0 = time.perf_counter()
-                            out = query.conditional(data[order[t]][:, :t], targets = [t])
+                            out = query.conditional(data[order[t]][:, :t], targets = [t], precision = "fp32")
                             torch.cuda.synchronize()
                             if rep == 1:
                                 ts.append(time.perf_counter() - t0)

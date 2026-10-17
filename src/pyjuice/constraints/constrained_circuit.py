@@ -192,7 +192,10 @@ class ConstrainedCircuit:
         """
         A decoding session (:class:`~pyjuice.constraints.decoder.Decoder`), used as a context manager: inside it,
         ``decoder.marginal`` / ``decoder.conditional`` / ``decoder.sample`` answer as this circuit's queries do --
-        same arguments, same results -- and a backend that can reuses between them what the evidence left unchanged::
+        same arguments, same results (to the bit at fp32-level precision; at an approximate one -- the ``dfa_exact``
+        backend's "tf32" and "bf16", its conditionals' default -- within its error, the values a call reuses being
+        rounded as the launches that computed them round) -- and a backend that can reuses between them what the
+        evidence left unchanged::
 
             with cc.decoder() as decoder:
                 for t in range(n):
@@ -203,9 +206,11 @@ class ConstrainedCircuit:
         row observed, with the same tokens, and maybe more -- tokens appended, positions unmasked, beams reordered,
         duplicated or dropped, the batch size changed. A new row (a new prompt) or a token observed and then missing
         again makes the call compute everything, and so does another query on the circuit in between (allowed, inside
-        the session or not) or another ``precision``. Each call compares its rows with the previous call's on the host
-        (microseconds); when rows moved, it also copies the values it reuses to their rows' new places. The
-        ``dfa_exact`` backend reuses values; a backend that cannot computes every call afresh.
+        the session or not) or another ``precision`` (the ``dfa_exact`` backend's marginals and conditionals default to
+        different ones: a session mixing them reuses across them given a ``precision`` of its own). Each call compares
+        its rows with the previous call's on the host (microseconds); when rows moved, it also copies the values it
+        reuses to their rows' new places. The ``dfa_exact`` backend reuses values; a backend that cannot computes every
+        call afresh.
 
         The session is a :func:`pyjuice.fast_inference` scope: parameters must not change inside it, unless
         ``decoder.reset()`` follows (and no outer ``fast_inference`` scope is open) -- it forgets everything the

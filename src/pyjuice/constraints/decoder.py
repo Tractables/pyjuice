@@ -2,7 +2,8 @@
 Decoding sessions over a constrained circuit (:meth:`~pyjuice.constraints.ConstrainedCircuit.decoder`).
 
 A :class:`Decoder` answers the circuit's queries -- ``marginal``, ``conditional``, ``sample``, with the same arguments
-and the same results -- inside a :func:`pyjuice.fast_inference` scope it opens and closes::
+and the same results (at an approximate precision, within its error) -- inside a :func:`pyjuice.fast_inference` scope
+it opens and closes::
 
     with cc.decoder() as decoder:
         for t in range(n):
@@ -81,11 +82,11 @@ class Decoder:
     """
     A decoding session over a :class:`~pyjuice.constraints.ConstrainedCircuit`, made by
     :meth:`ConstrainedCircuit.decoder` and used as a context manager: its queries are the circuit's (same arguments,
-    same results), inside the :func:`pyjuice.fast_inference` scope it opens. Options given when it is made are
-    defaults for every call, which a call's own keyword overrides -- but the per-sample inputs
-    (:data:`EXTERNAL_INPUTS`), which hold for the whole session: checked against the PC when the decoder is made, and
-    given to every call as ``external`` (the backend's :meth:`~.backends.base.Backend.external_inputs`). One decoder is
-    open on a circuit at a time.
+    same results -- at an approximate precision, within its error), inside the :func:`pyjuice.fast_inference` scope it
+    opens. Options given when it is made are defaults for every call, which a call's own keyword overrides -- but the
+    per-sample inputs (:data:`EXTERNAL_INPUTS`), which hold for the whole session: checked against the PC when the
+    decoder is made, and given to every call as ``external`` (the backend's
+    :meth:`~.backends.base.Backend.external_inputs`). One decoder is open on a circuit at a time.
 
     A backend's decoder reuses work between calls by overriding :meth:`_marginal` and :meth:`_conditional` (and setting
     :attr:`remembers`, to keep the last call's evidence for :meth:`_match_rows`); this one calls the backend's queries.

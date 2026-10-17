@@ -91,7 +91,7 @@ def test_conditionals_match_the_reference(kind, name, pattern, sum_path, build_p
     n = KINDS[kind]
     cc = jc.compile(CONSTRAINTS[name](), build_pc(kind, n, V))
     data, missing = evidence(pattern, n)
-    got, log_marginal = cc.conditional(data, missing, return_log_marginal = True, storage = "dense")
+    got, log_marginal = cc.conditional(data, missing, return_log_marginal = True, storage = "dense", precision = "fp32")
     assert_rows_close(got, reference.conditional(cc, data, missing), n)
     fin = torch.isfinite(got).any(dim = 1)
     assert (torch.logsumexp(got[fin], dim = 1).abs() <= 1e-5).all()
@@ -109,9 +109,9 @@ def test_compact_storage_gives_the_same_rows(kind, name, pattern, sum_path, buil
     n = KINDS[kind]
     cc = jc.compile(CONSTRAINTS[name](), build_pc(kind, n, V))
     data, missing = evidence(pattern, n)
-    got, log_marginal = cc.conditional(data, missing, return_log_marginal = True, storage = "compact")
+    got, log_marginal = cc.conditional(data, missing, return_log_marginal = True, storage = "compact", precision = "fp32")
     assert_rows_close(got, reference.conditional(cc, data, missing), n)
-    dense, dense_marginal = cc.conditional(data, missing, return_log_marginal = True, storage = "dense")
+    dense, dense_marginal = cc.conditional(data, missing, return_log_marginal = True, storage = "dense", precision = "fp32")
     if sum_path == "fused" and kind in ["hmm", "hmm_untied", "hmm_block_sparse", "left_linear", "hand_left"]:
         assert torch.equal(got, dense) and torch.equal(log_marginal, dense_marginal)
     else:
@@ -311,14 +311,14 @@ def test_targets(build_pc, reference):
     missing[:, 2] = True
     one = torch.zeros(n, dtype = torch.bool)
     one[2] = True
-    assert_rows_close(cc.conditional(data, missing, targets = one),
+    assert_rows_close(cc.conditional(data, missing, targets = one, precision = "fp32"),
                       reference.conditional(cc, data, missing, targets = one), n)
     g = torch.Generator().manual_seed(1)
     some = missing & (torch.rand(missing.shape, generator = g) < 0.5)
-    assert_rows_close(cc.conditional(data, missing, targets = some),
+    assert_rows_close(cc.conditional(data, missing, targets = some, precision = "fp32"),
                       reference.conditional(cc, data, missing, targets = some), n)
     with pytest.raises(ValueError):
-        cc.conditional(data, missing, targets = ~missing)
+        cc.conditional(data, missing, targets = ~missing, precision = "fp32")
 
 
 def test_evidence_and_targets_in_every_form(build_pc):
@@ -379,14 +379,14 @@ def test_candidates_are_columns_of_the_full_rows(kind, name, build_pc):
     cc = jc.compile(CONSTRAINTS[name](), build_pc(kind, n, V))
     data, missing = evidence("mixed", n)
     B = data.size(0)
-    full, log_marginal = cc.conditional(data, missing, return_log_marginal = True)
+    full, log_marginal = cc.conditional(data, missing, return_log_marginal = True, precision = "fp32")
     rows = torch.nonzero(missing)
     g = torch.Generator().manual_seed(0)
     forms = {"shared": torch.tensor([2, 0, -1, 1, V + 2, 2]),
              "per sample": torch.randint(-1, V, (B, 5), generator = g),
              "per position": torch.randint(-1, V + 1, (B, n, 40), generator = g)}            # several tiles
     for form, cand in forms.items():
-        got, got_marginal = cc.conditional(data, missing, return_log_marginal = True, candidates = cand)
+        got, got_marginal = cc.conditional(data, missing, return_log_marginal = True, candidates = cand, precision = "fp32")
         per_row = candidate_tensor(cand, B, n)[rows[:, 0], rows[:, 1]]
         ok = (per_row >= 0) & (per_row < V)
         want = torch.where(ok, full.cpu().gather(1, per_row.clamp(0, V - 1)), -float("inf"))
@@ -412,11 +412,11 @@ def test_candidates_over_many_rows_and_bf16_tables(tiles, build_pc, monkeypatch)
     ok = (per_row >= 0) & (per_row < V)
     for scope, tol in ((juice.fast_inference(), None), (juice.fast_inference(allow_bf16_params = True), 1e-2)):
         with scope:
-            full = cc.conditional(data, missing).cpu()
-            got = cc.conditional(data, missing, candidates = cand).cpu()
+            full = cc.conditional(data, missing, precision = "fp32").cpu()
+            got = cc.conditional(data, missing, candidates = cand, precision = "fp32").cpu()
         assert_rows_close(got, torch.where(ok, full.gather(1, per_row.clamp(0, V - 1)), -float("inf")), n, tol = tol)
     never = jc.compile(jc.DFA.contains([[1, 2] * n], V), pc)
-    got = never.conditional(data, missing, candidates = cand)
+    got = never.conditional(data, missing, candidates = cand, precision = "fp32")
     assert got.shape == (int(missing.sum()), 7) and torch.isneginf(got).all()
 
 
@@ -429,12 +429,12 @@ def test_evidence_breaking_the_constraint(build_pc, reference):
     missing = torch.zeros(2, n, dtype = torch.bool)
     missing[0, 2] = True                                                        # "1 2" impossible: one free token
     missing[1, 2:] = True
-    got, log_marginal = cc.conditional(data, missing, return_log_marginal = True)
+    got, log_marginal = cc.conditional(data, missing, return_log_marginal = True, precision = "fp32")
     assert torch.isneginf(got[0]).all() and torch.isneginf(log_marginal[0])
     assert_rows_close(got, reference.conditional(cc, data, missing), n)
     never = jc.compile(jc.DFA.contains([[1, 2] * n], V), build_pc("hmm", n, V))
     assert not never.backend.satisfiable
-    assert torch.isneginf(never.conditional(data, missing)).all()
+    assert torch.isneginf(never.conditional(data, missing, precision = "fp32")).all()
 
 
 def test_token_tables_live_as_long_as_the_scope(build_pc, reference):
@@ -445,10 +445,10 @@ def test_token_tables_live_as_long_as_the_scope(build_pc, reference):
     cc = jc.compile(CONSTRAINTS["contains"](), pc)
     data, missing = evidence("mixed", n)
     with juice.fast_inference():
-        a = cc.conditional(data, missing)
+        a = cc.conditional(data, missing, precision = "fp32")
         kept = dict(cc.backend.state._token_tables)
         assert kept and all(t.dtype == torch.float32 for t in kept.values())
-        b = cc.conditional(data, missing)
+        b = cc.conditional(data, missing, precision = "fp32")
         assert all(cc.backend.state._token_tables[k] is t for k, t in kept.items())
         assert torch.equal(a, b)
     assert cc.backend.state._token_tables is None
@@ -457,7 +457,7 @@ def test_token_tables_live_as_long_as_the_scope(build_pc, reference):
         table = layer.params.view(-1, V)
         table[:] = torch.rand_like(table) + 0.1
         table /= table.sum(dim = 1, keepdim = True)
-    assert_rows_close(cc.conditional(data, missing), reference.conditional(cc, data, missing), n)
+    assert_rows_close(cc.conditional(data, missing, precision = "fp32"), reference.conditional(cc, data, missing), n)
     assert cc.backend.state._token_tables is None
 
 

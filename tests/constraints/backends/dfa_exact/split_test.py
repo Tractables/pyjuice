@@ -106,9 +106,10 @@ def assert_close(got, want):
 
 
 def queries(cc, data, missing, kw):
+    """A session's marginals and conditionals, dense and compact, at fp32 (where two kernels' sums agree to 1e-5)."""
     out = []
     for storage in ("dense", "compact"):
-        with cc.decoder(storage = storage, **kw) as decoder:
+        with cc.decoder(storage = storage, precision = "fp32", **kw) as decoder:
             out += [decoder.marginal(data, missing), decoder.conditional(data, missing)]
     return out
 

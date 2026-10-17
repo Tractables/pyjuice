@@ -217,7 +217,7 @@ def test_gates_and_soft_evidence(build_pc, reference):
             ev = dict(zip(("categorical_evidence_logp", "soft_evidence_cat_ids"), torch.topk(E, Vm - 2, dim = 2)))
         gates = make_gates(pc, Bg, seed = Be + Bg)
         inputs = dict(ev, sum_external_params = gates)
-        with cc.decoder(**inputs) as decoder:
+        with cc.decoder(precision = "fp32", **inputs) as decoder:
             marg = decoder.marginal(data, m)
             cond = decoder.conditional(data, m)
         assert_close(marg, reference.marginal(cc, data, m, inputs), n)
@@ -243,7 +243,7 @@ def test_conditional_matches_the_reference(kind, shared, node_gate, build_pc, re
     inputs = dict(sum_external_params = gates)
     want = reference.conditional(cc, data, m, inputs = inputs)
     for storage in ("dense", "compact"):
-        with cc.decoder(storage = storage, **inputs) as decoder:
+        with cc.decoder(storage = storage, precision = "fp32", **inputs) as decoder:
             got, lm = decoder.conditional(data, m, return_log_marginal = True)
             marg = decoder.marginal(data, m)
             cand = torch.randint(0, V + 2, (3, n, 4), device = DEV)
@@ -274,7 +274,7 @@ def test_wide_gates(latents, block, gate, node_gate, gate_sums, reference):
     for Bg in (3, 1):
         inputs_ = dict(sum_external_params = make_gates(pc, Bg, seed = Bg))
         for storage in ("dense", "compact"):
-            with cc.decoder(storage = storage, **inputs_) as decoder:
+            with cc.decoder(storage = storage, precision = "fp32", **inputs_) as decoder:
                 assert_close(decoder.marginal(data, m), reference.marginal(cc, data, m, inputs_), n)
                 assert_rows_close(decoder.conditional(data, m), reference.conditional(cc, data, m, inputs = inputs_), n)
 
@@ -380,7 +380,7 @@ def test_children_in_another_order(reference):
     data, m = evidence(3, 3)
     gates = make_gates(pc, 3, scale = 3.0)
     inputs_ = dict(sum_external_params = gates)
-    with cc.decoder(**inputs_) as decoder:
+    with cc.decoder(precision = "fp32", **inputs_) as decoder:
         assert_close(decoder.marginal(data, m), reference.marginal(cc, data, m, inputs_), 3)
         assert_rows_close(decoder.conditional(data, m), reference.conditional(cc, data, m, inputs = inputs_), 3)
 
@@ -444,7 +444,7 @@ def test_some_layers_gated(build_pc, reference):
     cc = jc.compile(CONSTRAINTS["contains"](), pc)
     for gates in (some, None):
         kw = {} if gates is None else dict(sum_external_params = gates)
-        with cc.decoder(**kw) as decoder:
+        with cc.decoder(precision = "fp32", **kw) as decoder:
             marg = decoder.marginal(data, m)
             cond = decoder.conditional(data, m)
         assert_close(marg, brute_force(pc, CONSTRAINTS["contains"](), data, m, gates or {}), n)

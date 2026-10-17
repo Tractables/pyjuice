@@ -40,6 +40,20 @@ def examples():
     return blocks
 
 
+class AtFp32:
+    """The circuit with its decoders at ``precision = "fp32"`` (a conditional's default is "bf16"): a decoder's results
+    are then the circuit's own fp32 ones to the bit."""
+
+    def __init__(self, cc):
+        self.cc = cc
+
+    def __getattr__(self, name):
+        return getattr(self.cc, name)
+
+    def decoder(self, **options):
+        return self.cc.decoder(**{"precision": "fp32", **options})
+
+
 @pytest.fixture(name = "cc")
 def cc_fixture(build_pc):
     return jc.compile(jc.DFA.contains([[1, 2]], V), build_pc("hmm", N, V))
@@ -47,10 +61,10 @@ def cc_fixture(build_pc):
 
 def test_the_loop(cc):
     data = torch.randint(0, V, (4, N), generator = torch.Generator().manual_seed(0))
-    scope = dict(cc = cc, data = data, n = N)
+    scope = dict(cc = AtFp32(cc), data = data, n = N)
     exec(examples()[0], scope)
     with juice.fast_inference():
-        assert torch.equal(scope["logp"], cc.conditional(data[:, :N - 1], targets = [N - 1]))
+        assert torch.equal(scope["logp"], cc.conditional(data[:, :N - 1], targets = [N - 1], precision = "fp32"))
 
 
 @pytest.mark.parametrize("candidates", [False, True])

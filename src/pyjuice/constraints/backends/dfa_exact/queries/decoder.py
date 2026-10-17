@@ -20,9 +20,10 @@ a term of a product that is -inf anyway.
 Nothing is reused after a call where a row continues no row of the previous one (a new prompt, a position observed and
 then missing again), or after :meth:`~pyjuice.constraints.decoder.Decoder.reset`. Nothing is reused when anything else
 used the buffers in between (:attr:`~..state.State.epoch`: another query, inside the session or not), or when the
-precision or the storage changed -- also under ``storage = "auto"`` (the default), where every call picks the storage
-of its own values (see :func:`~.conditional.conditional`): one that picks the other storage than the previous call's
-computes the values again.
+precision or the storage changed -- a marginal and a conditional by default (fp32 and bf16: a session mixing them reuses
+across them under a ``precision`` of its own) -- also under ``storage = "auto"`` (the default), where every call picks
+the storage of its own values (see :func:`~.conditional.conditional`): one that picks the other storage than the
+previous call's computes the values again.
 
 Compact (``storage = "compact"``, :mod:`..kernels.compact`), a call's values are laid out by its own liveness, which
 only the call knows: the values it holds and reads -- every top-down one, the inside ones its launches read
@@ -128,7 +129,7 @@ class DFAExactDecoder(Decoder):
         return out
 
     def _conditional(self, data: torch.Tensor, missing: torch.Tensor, targets: Optional[torch.Tensor],
-                     return_log_marginal: bool, candidates: Optional[torch.Tensor], precision: str = "fp32",
+                     return_log_marginal: bool, candidates: Optional[torch.Tensor], precision: str = "bf16",
                      storage: str = "auto", external = None):
         be = self.cc.backend
         held, keep, compact, carry = self._reuse(data, missing, targets, precision, storage, marginal = False,

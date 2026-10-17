@@ -289,15 +289,17 @@ class DFAExactBackend(Backend):
 
     def conditional(self, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None,
                     targets: Optional[torch.Tensor] = None, return_log_marginal: bool = False,
-                    candidates: Optional[torch.Tensor] = None, precision: str = "fp32", storage: str = "auto",
+                    candidates: Optional[torch.Tensor] = None, precision: str = "bf16", storage: str = "auto",
                     external: Optional[ExternalInputs] = None):
         """
         ``log p(x_t = v | e, C)`` for every target, of every token or of the ``candidates`` (see
         :meth:`~pyjuice.constraints.ConstrainedCircuit.conditional`).
 
-        :param precision: "fp32" (the default; fp32-level accuracy), "tf32", or "bf16" (see :meth:`marginal`) for
-            the matrix products; inside ``pyjuice.fast_inference(allow_bf16_params = True)`` the token probabilities
-            are scored in bfloat16
+        :param precision: "bf16" (the default, unlike :meth:`marginal`'s: the conditionals as accurate as at "tf32",
+            the bf16 error cancelling in their normalization), "fp32" (fp32-level accuracy) or "tf32" (see
+            :meth:`marginal`) for the matrix products; the log marginals ``return_log_marginal`` gives are the
+            query's own, at its precision (at bf16 up to ~1e-2 off: :meth:`marginal` for fp32-level ones); inside
+            ``pyjuice.fast_inference(allow_bf16_params = True)`` the token probabilities are scored in bfloat16
         :param storage: "auto" (the default), "dense" or "compact": keep the per-sample values of every pair of
             automaton states, or under evidence only of each sample's live ones (far less memory when the evidence pins
             the automaton down, as a decoded prefix does; more where it joins few of them); "auto" picks the one whose

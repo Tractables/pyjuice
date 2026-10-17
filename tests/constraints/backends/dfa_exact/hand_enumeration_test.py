@@ -210,13 +210,13 @@ def test_the_hand_computation(circuit, shape, evidence, rows, split, pre):
         cc = jc.compile(constraint, pc)
         truth = enumerate_truth(evaluate, P, data, missing, vmask, ev, lphi, constraint)
         for storage in ("dense", "compact"):
-            with cc.decoder(storage = storage, **kw) as decoder:
+            with cc.decoder(storage = storage, precision = "fp32", **kw) as decoder:
                 marg = decoder.marginal(x, m)
                 cond, lm = decoder.conditional(x, m, return_log_marginal = True)
             assert_close(marg, [t[0] for t in truth])
             assert_close(cond, np.concatenate([np.stack(t[2]) for t in truth if len(t[2])]))
             assert_close(lm, [truth[b][0] for b in np.nonzero(free)[0]])
-        with cc.decoder(**kw) as decoder:                      # prefix decoding, positions t.. missing
+        with cc.decoder(precision = "fp32", **kw) as decoder:                      # prefix decoding, positions t.. missing
             for t in range(N_VARS):
                 pm = np.broadcast_to(np.arange(N_VARS)[None, :] >= t, (B, N_VARS)).copy()
                 if vmask is not None:

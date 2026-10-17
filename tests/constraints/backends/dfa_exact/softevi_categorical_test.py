@@ -373,7 +373,7 @@ def test_conditional_matches_the_reference(kind, shared, sum_path, transitions, 
     data = draw(E.expand(3, -1, -1).contiguous())
     m = masks(n, 3)[3]
     m[0] = True
-    with cc.decoder(categorical_evidence_logp = E, storage = "dense") as decoder:
+    with cc.decoder(categorical_evidence_logp = E, storage = "dense", precision = "fp32") as decoder:
         got, lm = decoder.conditional(data, m, return_log_marginal = True)
         marg = decoder.marginal(data, m)
         cand = torch.randint(0, Vm + 3, (3, n, 6), device = DEV)
@@ -418,7 +418,7 @@ def test_score_weights_paths(shared, columns, reference, monkeypatch):
     data = draw(E.expand(3, -1, -1).contiguous())
     m = masks(n, 3)[3]
     m[0] = True
-    with cc.decoder(categorical_evidence_logp = E) as decoder:
+    with cc.decoder(categorical_evidence_logp = E, precision = "fp32") as decoder:
         got = decoder.conditional(data, m)
     assert_rows_close(got, reference.conditional(cc, data, m, inputs = dict(categorical_evidence_logp = E)), n)
     assert (max(shares) > 1) if columns == "in shares" else not shares, shares
@@ -436,7 +436,7 @@ def test_codpula_vocabulary_conditionals(kind, build_pc, reference):
     E = lm_evidence(2, n, CODD_V, hot = [(1, 50000), (2, 100000), (n - 2, 126000)])
     inputs = dict(categorical_evidence_logp = E)
     data = draw(E)
-    with cc.decoder(categorical_evidence_logp = E) as decoder:
+    with cc.decoder(categorical_evidence_logp = E, precision = "fp32") as decoder:
         for m in masks(n, 2)[:3] + [masks(n, 2)[3] | (torch.arange(n, device = DEV) == 1)]:
             if m.any():
                 assert_rows_close(decoder.conditional(data, m), reference.conditional(cc, data, m, inputs = inputs), n)
@@ -446,13 +446,13 @@ def test_codpula_vocabulary_conditionals(kind, build_pc, reference):
         a.params.data.copy_(b.params.data)
     plain.params.data.copy_(pc.params.data)
     m = masks(n, 2)[3] | (torch.arange(n, device = DEV) == 0)
-    with cc.decoder(categorical_evidence_logp = torch.zeros(1, n, CODD_V, device = DEV)) as decoder:
-        assert_rows_close(decoder.conditional(data, m), jc.compile(c, plain).conditional(data, m), n)
+    with cc.decoder(categorical_evidence_logp = torch.zeros(1, n, CODD_V, device = DEV), precision = "fp32") as decoder:
+        assert_rows_close(decoder.conditional(data, m), jc.compile(c, plain).conditional(data, m, precision = "fp32"), n)
 
     strings = torch.full((1, n), 7, device = DEV)
     strings[0, 1], strings[0, 2] = 50000, 100000
     one_hot = torch.full((1, n, CODD_V), -float("inf"), device = DEV).scatter_(2, strings[:, :, None], 0.0)
-    with cc.decoder(categorical_evidence_logp = one_hot) as decoder:
+    with cc.decoder(categorical_evidence_logp = one_hot, precision = "fp32") as decoder:
         got = decoder.conditional(strings, torch.ones(1, n, dtype = torch.bool, device = DEV))
     assert torch.equal(got.argmax(dim = 1), strings[0]) and (got.max(dim = 1).values.abs() < 1e-5).all()
 
@@ -492,7 +492,7 @@ def test_scoring_columns_follow_the_session(build_pc, reference):
         m[:, 1:] = True
         inputs = dict(categorical_evidence_logp = E)
         got = []
-        with cc.decoder(**inputs) as decoder:
+        with cc.decoder(precision = "fp32", **inputs) as decoder:
             for t in (1, 2, 3):
                 got.append(decoder.conditional(data, m, targets = [t]))
                 if t == 1:
@@ -563,7 +563,7 @@ def test_topk_conditional_matches_the_reference(kind, shared, build_pc, referenc
     data = draw(dense.expand(3, -1, -1).contiguous())
     m = masks(n, 3)[3]
     m[0] = True
-    with cc.decoder(**inputs) as decoder:
+    with cc.decoder(precision = "fp32", **inputs) as decoder:
         got, lm = decoder.conditional(data, m, return_log_marginal = True)
         marg = decoder.marginal(data, m)
         cand = torch.randint(0, Vm + 3, (3, n, 9), device = DEV)
@@ -596,7 +596,7 @@ def test_codpula_vocabulary_topk(kind, build_pc, reference):
     got = {}
     for copies in (True, False):
         for name, kw in (("topk", inputs), ("dense", dict(categorical_evidence_logp = dense))):
-            with cc.decoder(allow_param_copy = copies, **kw) as decoder:
+            with cc.decoder(allow_param_copy = copies, precision = "fp32", **kw) as decoder:
                 got[copies, name] = [(decoder.marginal(data, m), decoder.conditional(data, m)) for m in ms]
                 if name == "topk":
                     assert (pc.input_layer_group[0]._fast_inference_params is not None) == copies
@@ -610,7 +610,7 @@ def test_codpula_vocabulary_topk(kind, build_pc, reference):
     strings[:, 1], strings[:, 2] = 50000, 100000
     strings[1, 2] = 99999
     strings[2, n - 1] = 126000
-    with cc.decoder(categorical_evidence_logp = torch.zeros(3, n, 1, device = DEV), soft_evidence_cat_ids = strings) \
+    with cc.decoder(categorical_evidence_logp = torch.zeros(3, n, 1, device = DEV), soft_evidence_cat_ids = strings, precision = "fp32") \
             as decoder:
         got = decoder.marginal(strings[..., 0], torch.ones(3, n, dtype = torch.bool, device = DEV)).view(-1)
     assert got[0].abs() < 1e-5 and torch.isneginf(got[1:]).all(), got
@@ -691,7 +691,7 @@ def test_value_mask_conditional_matches_the_reference(kind, shared, build_pc, re
     m[:, 2], m[0, n - 1] = True, True
     for inputs in (dict(categorical_evidence_logp = lm), dict(categorical_evidence_logp = E, soft_evidence_cat_ids = ids)):
         inputs = dict(inputs, soft_evidence_value_mask = vm)
-        with cc.decoder(**inputs) as decoder:
+        with cc.decoder(precision = "fp32", **inputs) as decoder:
             marg = decoder.marginal(data, m)
             got = decoder.conditional(data, m)
             got_t = decoder.conditional(data, targets = ~vm)                 # the free positions alone
@@ -700,7 +700,7 @@ def test_value_mask_conditional_matches_the_reference(kind, shared, build_pc, re
         assert_rows_close(got, want, n)
         assert_rows_close(got_t, reference.conditional(cc, data, None, ~vm, inputs = inputs), n)
         external = cc.backend.external_inputs(inputs)                       # the backend's own query alike
-        assert_rows_close(cc.backend.conditional(data, m, external = external), want, n)
+        assert_rows_close(cc.backend.conditional(data, m, external = external, precision = "fp32"), want, n)
 
 
 @pytest.mark.parametrize("kind", ["hmm", "pd", "hand_left"])
