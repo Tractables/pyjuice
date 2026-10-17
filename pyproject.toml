@@ -29,9 +29,10 @@ authors = [
 cuda = [
     "nvidia-cutlass>=3.5",
 ]
-# Text-level constraints (pyjuice.constraints.Regex): `pip install pyjuice[constraints]`.
+# Text-level constraints (pyjuice.constraints.Regex, JSONSchema): `pip install pyjuice[constraints]`.
 constraints = [
     "interegular>=0.3.3",
+    "outlines-core>=0.2.14,<0.3",
 ]
 dev = [
     "pytest",
@@ -39,7 +40,8 @@ dev = [
     "pytest-skip-slow",
     "torchvision",
     "datasets",
-    "matplotlib"
+    "matplotlib",
+    "jsonschema"
 ]
 
 [options.packages.find]

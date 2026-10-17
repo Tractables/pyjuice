@@ -112,6 +112,21 @@ def _unsupported(pattern: str) -> Optional[str]:
     return None
 
 
+def _char_automaton(parsed):
+    """interegular's automaton over characters of a parsed pattern, reduced, and every symbol's characters as code
+    point ranges (its "anything else" symbol: every character no other symbol names)."""
+    from interegular.fsm import anything_else
+    fsm = parsed.to_fsm().reduce()
+    groups = fsm.alphabet.by_transition                             # symbol -> its characters (or "anything else")
+    rest = complement_ranges(code_point_ranges(ch for chars in groups.values() for ch in chars
+                                               if ch is not anything_else))
+    ranges = {}
+    for symbol, chars in groups.items():
+        own = code_point_ranges(ch for ch in chars if ch is not anything_else)
+        ranges[symbol] = sorted(own + rest) if any(ch is anything_else for ch in chars) else own
+    return fsm, ranges
+
+
 def _refused(pattern: str, err) -> ValueError:
     return ValueError(f"Unsupported regular expression {pattern!r}: {err}. Regex matches the whole text, so anchors "
                       f"(^ $ \\A \\Z) are never needed; \\b, lookarounds, backreferences, possessive repetition, atomic "
@@ -202,18 +217,10 @@ class Regex(Constraint):
 
     def _byte_automaton(self) -> ByteAutomaton:
         _, errors = _interegular()
-        from interegular.fsm import anything_else
         try:
-            fsm = self._parsed.to_fsm().reduce()
+            fsm, ranges = _char_automaton(self._parsed)
         except errors as e:                     # (nothing the checks let through should get here)
             raise _refused(self._pattern, e) from None
-        groups = fsm.alphabet.by_transition                         # symbol -> its characters (or "anything else")
-        rest = complement_ranges(code_point_ranges(ch for chars in groups.values() for ch in chars
-                                                   if ch is not anything_else))
-        ranges = {}
-        for symbol, chars in groups.items():
-            own = code_point_ranges(ch for ch in chars if ch is not anything_else)
-            ranges[symbol] = sorted(own + rest) if any(ch is anything_else for ch in chars) else own
         return ByteAutomaton.from_char_automaton(fsm.states, fsm.initial, fsm.finals, fsm.map, ranges)
 
     def matcher(self) -> Matcher:
@@ -227,9 +234,9 @@ class Regex(Constraint):
         return self.automaton().sample(log_weights, num_samples, generator = generator)
 
     def _widened(self, vocab_size: int) -> "Regex":
-        out = Regex.__new__(Regex)
+        out = type(self).__new__(type(self))                # (a subclass's own fields come along)
+        out.__dict__.update(self.__dict__)
         Constraint.__init__(out, vocab_size)
-        out._pattern, out._parsed, out._re, out._eos_padding = self._pattern, self._parsed, self._re, self._eos_padding
         out._vocabulary = self._vocabulary.with_size(vocab_size)
         out._automaton = None if self._automaton is None else widened(self._automaton, vocab_size)
         return out

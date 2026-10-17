@@ -6,3 +6,4 @@ from .base import Constraint, Matcher, And, Or, Not, Concat, OPTIONAL_CAPABILITI
 from .dfa import DFA, DFAMatcher
 from .vocabulary import Vocabulary
 from .regex import Regex
+from .json_schema import JSONSchema

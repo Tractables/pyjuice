@@ -22,7 +22,8 @@ The package is conventionally imported as ``jc``::
             logp = decoder.conditional(x[:, :t], targets = [t])    # log p(x_t = v | x_<t, C), [batch, V]
 """
 
-from .language import Constraint, Matcher, And, Or, Not, Concat, OPTIONAL_CAPABILITIES, DFA, DFAMatcher, Vocabulary, Regex
+from .language import (Constraint, Matcher, And, Or, Not, Concat, OPTIONAL_CAPABILITIES, DFA, DFAMatcher, Vocabulary,
+                       Regex, JSONSchema)
 from .compiler import compile
 from .errors import ConstraintCompileError
 from .constrained_circuit import ConstrainedCircuit
