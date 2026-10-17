@@ -27,7 +27,8 @@ def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] =
 
     :param data: [B, n] token ids (ignored where missing)
     :param missing_mask: None (everything observed), [n] or [B, n]; True where a token is marginalized
-    :param precision: "fp32" (default) or "tf32" for the sum layers' matrix products
+    :param precision: "fp32" (default), "tf32" or "bf16" for the sum layers' matrix products (see
+        :data:`~.forward.PRECISIONS`)
     :param held: None, or bool [sum regions]: the per-sample inside values ``node_mars`` holds for this query, as a
         decoder decides (see :mod:`.plans`)
     :param report: None, or a dict where the query leaves what :func:`~.conditional.class_weights` says

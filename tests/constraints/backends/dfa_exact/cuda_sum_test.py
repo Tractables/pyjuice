@@ -10,6 +10,8 @@ chunk (the merge kernel) or not; the weights' first entries read from a table (a
 run) or not; every launch's blocks given as an index list, last first, or not; copies of sums (the top-down's aliased
 rows). At TF32 its products round to nearest: marginals stay near the float64 reference over 16 layers; inside a scope
 that allows parameter copies they read the weights from copies in the kernel's fragment order, with the same results.
+At bf16 (``precision = "bf16"``) the products are bf16 m16n8k16 ones, from a bf16 copy of the weights -- the scope's, or
+a query's own -- and bf16 e.
 """
 import inspect
 
@@ -124,8 +126,13 @@ def listed(monkeypatch):
                         with_list(lifted_sum.fused_sum_top_down, "idx", False, lambda a: a["tables"]["cb_row"].numel()))
 
 
+def operands(plan):
+    """A CUDA plan's operands besides e (``_cuda_operands``): None, "tf32" or "bf16"."""
+    return None if plan[4] is None else "bf16" if plan[4].dtype == torch.bfloat16 else "tf32"
+
+
 def assert_same(got, want, precision):
-    tol = 1e-5 if precision == "fp32" else 5e-3
+    tol = 1e-5 if precision == "fp32" else 5e-3            # (bf16: against the Triton kernels' TF32, within ~1e-3)
     for i, (a, b) in enumerate(zip(got, want)):
         assert torch.equal(torch.isneginf(a), torch.isneginf(b)) and not torch.isnan(a).any(), i
         fin = torch.isfinite(b)
@@ -134,7 +141,7 @@ def assert_same(got, want, precision):
 
 @pytest.mark.parametrize("split, table, lists", [(False, False, False), (True, False, False), (False, True, False),
                                                  (True, True, False), (False, False, True), (True, False, True)])
-@pytest.mark.parametrize("precision", ["fp32", "tf32"])
+@pytest.mark.parametrize("precision", ["fp32", "tf32", "bf16"])
 @pytest.mark.parametrize("storage", ["dense", "compact"])
 @pytest.mark.parametrize("external", ["none", "per_sample", "shared"])
 @pytest.mark.parametrize("latents, B", [(128, 3), (160, 37), (128, 70)])
@@ -160,14 +167,15 @@ def test_the_cuda_sums_are_the_triton_kernels(latents, B, external, storage, pre
     got = calls(cc, B, kw, precision, storage)
     for ps in (plans, td_plans):                                        # (shares)
         assert ps and (any(p[3] > 1 for p in ps) if split else all(p[3] == 1 for p in ps)), [p[2:4] for p in ps]
-    assert all((p[4] is not None) == (precision == "tf32") for p in plans + td_plans)   # (fragment-ordered weights)
+    want_ops = {"fp32": None, "tf32": "tf32", "bf16": "bf16"}[precision]  # (fragment-ordered weights: a decoder's)
+    assert all(operands(p) == want_ops for p in plans + td_plans)
     monkeypatch.setattr(lifted_sum, "SPLIT_MIN_SHARE", 8)
     monkeypatch.setattr(lifted_sum, "CUDA_MIN_TILES", 1 << 40)          # none
     want = calls(cc, B, kw, precision, storage)
     assert_same(got, want, precision)
 
 
-@pytest.mark.parametrize("precision", ["fp32", "tf32"])
+@pytest.mark.parametrize("precision", ["fp32", "tf32", "bf16"])
 @pytest.mark.parametrize("storage", ["dense", "compact"])
 @pytest.mark.parametrize("external", ["none", "per_sample"])
 @pytest.mark.parametrize("split, lists", [(False, False), (True, False), (False, True)])
@@ -196,14 +204,16 @@ def test_the_cuda_top_down_writes_aliased_rows(external, storage, precision, spl
     assert_same(got, want, precision)
 
 
+@pytest.mark.parametrize("precision", ["tf32", "bf16"])
 @pytest.mark.parametrize("external", ["none", "per_sample"])
-def test_the_weights_in_fragment_order(external, gate_sums, set_split, monkeypatch):
-    """At TF32, in a decoder session that allows parameter copies (the default), the CUDA kernel reads the weights in
-    its fragment order from copies (``_cuda_fragments``, one per direction): built by the session's first launch of
-    every part, dropped when the session ends -- an in-place parameter update after it is read -- and the only weights
-    the launches read (a copy of zeros: forward, every marginal -inf; top-down, the marginals as they were and other
-    conditionals). Its products are those of the same TF32 operands in the same order: every result bit-identical to
-    the kernel reading the weights themselves (no copies)."""
+def test_the_weights_in_fragment_order(external, precision, gate_sums, set_split, monkeypatch):
+    """The CUDA kernel reads the weights in its fragment order from copies (``_cuda_fragments``, one per direction):
+    at TF32 in a decoder session that allows parameter copies (the default), at bf16 always -- outside such a session
+    a query's own. A copy is built by the first launch that reads a part's tiles (parts reading the same tiles share
+    it), dropped when the session (query) ends -- an in-place parameter update after it is read -- and the only
+    weights the launches read (a copy of zeros: forward, every marginal -inf; top-down, the marginals as they were and
+    other conditionals). Every result is bit-identical with and without a session's copies: at TF32 the products are
+    those of the same operands in the same order as the kernel reading the weights themselves."""
     mod = get_module()
     if mod is None:
         pytest.skip("the CUDA extension is unavailable")
@@ -216,20 +226,23 @@ def test_the_weights_in_fragment_order(external, gate_sums, set_split, monkeypat
     plans, td_plans = recorded_plans(monkeypatch)
     builds = []
     fragment_weights = mod.fragment_weights
-    monkeypatch.setattr(mod, "fragment_weights", lambda *a: builds.append((id(a[2]), a[3])) or fragment_weights(*a))
+    monkeypatch.setattr(mod, "fragment_weights",
+                        lambda *a: builds.append((lifted_sum._tiles_key(a[2]), a[3])) or fragment_weights(*a))
     same = lambda a, b: all(torch.equal(x, y) for x, y in zip(a, b)) and len(a) == len(b)
 
-    want = calls(cc, B, kw, "tf32", "dense", allow_param_copy = False)
-    assert plans and td_plans and all(p[4] is None for p in plans + td_plans) and not builds
+    want = calls(cc, B, kw, precision, "dense", allow_param_copy = False)
+    no_copies = None if precision == "tf32" else "bf16"                 # (bf16: a query's own)
+    assert plans and td_plans and all(operands(p) == no_copies for p in plans + td_plans)
+    assert bool(builds) == (precision == "bf16")
     plans.clear(), td_plans.clear()
-    assert same(calls(cc, B, kw, "tf32", "dense"), want)
-    assert all(p[4] is not None for p in plans + td_plans) and cc.backend.state._kept_stacks is None
+    assert same(calls(cc, B, kw, precision, "dense"), want)
+    assert all(operands(p) == precision for p in plans + td_plans) and cc.backend.state._kept_stacks is None
 
     g = torch.Generator().manual_seed(2)
     data = torch.randint(0, V, (B, N), generator = g).to(DEV)
     missing = [torch.rand(B, N, generator = g).to(DEV) < 0.5 for _ in range(2)]
     builds.clear()
-    with cc.decoder(precision = "tf32", **kw) as decoder:               # copied once a session
+    with cc.decoder(precision = precision, **kw) as decoder:           # copied once a session, a tile set once
         decoder.conditional(data, missing[0])
         first = list(builds)
         decoder.conditional(data, missing[1])                           # (other evidence: every launch again)
@@ -237,22 +250,22 @@ def test_the_weights_in_fragment_order(external, gate_sums, set_split, monkeypat
 
     with torch.no_grad():                                               # an in-place update between sessions
         pc.params.copy_(circuit(128, external != "none", gate_sums, seed = 1).params)
-    updated = calls(cc, B, kw, "tf32", "dense", allow_param_copy = False)
+    updated = calls(cc, B, kw, precision, "dense", allow_param_copy = False)
     assert not same(updated, want)
-    assert same(calls(cc, B, kw, "tf32", "dense"), updated)
+    assert same(calls(cc, B, kw, precision, "dense"), updated)
 
     def queries():
-        with cc.decoder(precision = "tf32", **kw) as decoder:
+        with cc.decoder(precision = precision, **kw) as decoder:
             marginal = decoder.marginal(data, missing[0])
-        with cc.decoder(precision = "tf32", **kw) as decoder:
+        with cc.decoder(precision = precision, **kw) as decoder:
             return marginal, decoder.conditional(data, missing[0])
 
     marginal, conditional = queries()
     assert torch.isfinite(marginal).any()
     real = lifted_sum._cuda_fragments
     for zeroed in (False, True):                                        # forward, top-down
-        monkeypatch.setattr(lifted_sum, "_cuda_fragments", lambda mod, frags, params, wbase, td:
-                            real(mod, frags, params, wbase, td) * (0.0 if td == zeroed else 1.0))
+        monkeypatch.setattr(lifted_sum, "_cuda_fragments", lambda mod, frags, params, wbase, td, bf16 = False:
+                            real(mod, frags, params, wbase, td, bf16) * (0.0 if td == zeroed else 1.0))
         m, c = queries()
         assert torch.isneginf(m).all() if not zeroed else torch.equal(m, marginal)
         assert not torch.equal(c, conditional)

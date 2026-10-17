@@ -261,9 +261,9 @@ def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor
     :param data: [B, n] token ids (ignored where missing)
     :param missing_mask: None (everything observed), [n] or [B, n]; True where a token is marginalized
     :param targets: None (every missing position of every sample), or a bool mask [n] or [B, n] of missing positions
-    :param precision: "fp32" (fp32-level, the default) or "tf32", for the sum layers' and the scoring's matrix
-        products; a token table in bf16 (inside a ``pyjuice.fast_inference`` scope allowing bf16 parameter copies) is
-        read in tf32
+    :param precision: "fp32" (fp32-level, the default), "tf32" or "bf16" (see :data:`~.forward.PRECISIONS`), for the
+        sum layers' and the scoring's matrix products; a token table in bf16 (inside a ``pyjuice.fast_inference``
+        scope allowing bf16 parameter copies) is read in tf32
     :param return_log_marginal: also return ``log p(e, C)`` of every row's sample, [rows]
     :param held: None, or what the buffers hold for this query, as a caching engine decides (see :mod:`.plans`):
         a dict with ``inside`` and ``top_down``, each None or bool [sum regions]

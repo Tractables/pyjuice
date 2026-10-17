@@ -198,15 +198,18 @@ def test_impossible_is_minus_inf(kind, storage, build_pc):
 
 @pytest.mark.parametrize("kind", ["hmm_block_sparse", "pd_prod_dominated", "hand_permuted"])
 def test_tf32_products_stay_close(kind, sum_path, build_pc):
+    """The tf32 and bf16 marginals within 1e-2 of fp32's, -inf where they are; an unknown precision is refused."""
     n = KINDS[kind]
     cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
     data, missing = evidence(n, 16)
-    fp32, tf32 = cc.marginal(data, missing), cc.marginal(data, missing, precision = "tf32")
+    fp32 = cc.marginal(data, missing)
     fin = torch.isfinite(fp32)
-    assert torch.equal(fin, torch.isfinite(tf32))
-    assert ((fp32 - tf32)[fin].abs() <= 1e-2).all()
+    for precision in ("tf32", "bf16"):
+        got = cc.marginal(data, missing, precision = precision)
+        assert torch.equal(fin, torch.isfinite(got)), precision
+        assert ((fp32 - got)[fin].abs() <= 1e-2).all(), precision
     with pytest.raises(ValueError, match = "precision"):
-        cc.marginal(data, missing, precision = "bf16")
+        cc.marginal(data, missing, precision = "fp16")
 
 
 def sum_blocks(cc, B, data, missing):

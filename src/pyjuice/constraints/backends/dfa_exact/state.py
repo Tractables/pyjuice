@@ -402,7 +402,7 @@ class State:
         query. Inside a :func:`pyjuice.fast_inference` scope that allows parameter copies, the scope's: kept until it
         exits, so the query stacks every run it can (see ``STACK_MAX_COLUMNS`` there) -- and the CUDA fused sums keep
         their weights in fragment order there too (:func:`~.kernels.sum._cuda_fragments`); else an empty dict of the
-        query's own, which stacks only reused weights.
+        query's own, which stacks only reused weights (and, a ``precision = "bf16"`` query, holds its bf16 weights).
         """
         if self._kept_stacks is not None:
             return self._kept_stacks, True
@@ -420,9 +420,10 @@ class State:
         except inside a :func:`pyjuice.fast_inference` scope that allows parameter copies: there by the first query,
         then kept until the scope exits; in bfloat16 when the scope allows bf16 parameter copies, or in a decoder
         session that asks for it (``bf16_tokens``, see :class:`~.queries.decoder.DFAExactDecoder`; "auto": for a
-        query whose ``precision`` is "tf32").
+        query whose ``precision`` is "tf32" or "bf16").
         """
-        bf16 = bf16_params_allowed() or self.bf16_tokens is True or (self.bf16_tokens == "auto" and precision == "tf32")
+        bf16 = bf16_params_allowed() or self.bf16_tokens is True or \
+            (self.bf16_tokens == "auto" and precision in ("tf32", "bf16"))
         dtype = torch.bfloat16 if bf16 else torch.float32
         key = (group, dtype)
         if self._token_tables is not None and key in self._token_tables:

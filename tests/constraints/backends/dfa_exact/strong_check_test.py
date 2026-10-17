@@ -26,7 +26,7 @@ longer. (The CUDA and Triton sums against each other: ``cuda_sum_test.py``.)
 TIERS: the default tests (seconds) on small circuits; ``@pytest.mark.slow`` at Codpula's shapes and PD16's; ``python
 strong_check_test.py --help`` for the full shapes (4096 latents).
 TOLERANCES (log space, :data:`TOLERANCE`): fp32 ``1e-4``; TF32 ``2.5e-3`` for the marginals and ``5e-3`` for the
-conditionals; -inf exactly where the reference has it.
+conditionals; bf16 ``1.5e-2`` and ``5e-3``; -inf exactly where the reference has it.
 """
 import argparse
 import itertools
@@ -47,8 +47,11 @@ from pyjuice.nodes.distributions import Categorical, SoftEvidenceCategorical
 #: log marginals) and of the conditionals. TF32 rounds both operands of every product to the nearest TF32 value (2^-11
 #: relative at most): the marginals err upward where a sum's children are nearly equal -- a chunk's maximum is 1, the
 #: terms just below it round up to it -- by up to ~1.5e-3 over Codpula's and PD16's depth; the conditionals, normalized,
-#: by unbiased noise, up to 3.5e-3 on a small PD (sums of few children: little to average over)
-TOLERANCE = {"fp32": dict(marginal = 1e-4, conditional = 1e-4), "tf32": dict(marginal = 2.5e-3, conditional = 5e-3)}
+#: by unbiased noise, up to 3.5e-3 on a small PD (sums of few children: little to average over). bf16 rounds the CUDA
+#: fused sums' operands to 2^-9: the marginals err up to ~1e-2 at Codpula's shapes (the same upward rounding near a
+#: chunk's maximum), the conditionals as at TF32 -- the error cancels in their normalization
+TOLERANCE = {"fp32": dict(marginal = 1e-4, conditional = 1e-4), "tf32": dict(marginal = 2.5e-3, conditional = 5e-3),
+             "bf16": dict(marginal = 1.5e-2, conditional = 5e-3)}
 DEV = torch.device("cuda:0")
 F64 = torch.float64
 NEG = -float("inf")
@@ -785,7 +788,7 @@ def small_case(kind, seed = 0):
     return pc, dfa, data, inputs
 
 
-@pytest.mark.parametrize("precision", ["fp32", "tf32"])
+@pytest.mark.parametrize("precision", ["fp32", "tf32", "bf16"])
 @pytest.mark.parametrize("storage", ["dense", "compact"])
 @pytest.mark.parametrize("mode", ["diffusion", "l2r"])
 @pytest.mark.parametrize("kind", ["codpula", "pd"])
@@ -836,7 +839,7 @@ def shape_case(kind, latents = 1024, B = 2, keys = 8, seed = 0):
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("precision", ["tf32", "fp32"])
+@pytest.mark.parametrize("precision", ["tf32", "fp32", "bf16"])
 @pytest.mark.parametrize("kind", ["codpula", "pd"])
 def test_the_shapes_against_float64(kind, precision):
     """Codpula (1024 latents, 126464 tokens, top-1024, gates, 8 keyword phrases) and PD16 (50257 tokens): diffusion
@@ -868,7 +871,7 @@ def main(argv = None):
     ap.add_argument("--batch", type = int, default = 2)
     ap.add_argument("--mode", choices = ["diffusion", "l2r"], default = "diffusion")
     ap.add_argument("--calls", default = "0,1,4,10,20,30")
-    ap.add_argument("--precision", choices = ["fp32", "tf32"], default = "tf32")
+    ap.add_argument("--precision", choices = ["fp32", "tf32", "bf16"], default = "tf32")
     ap.add_argument("--storage", choices = ["auto", "dense", "compact"], default = "auto")
     ap.add_argument("--invariants", action = "store_true", help = "also the invariants")
     args = ap.parse_args(argv)

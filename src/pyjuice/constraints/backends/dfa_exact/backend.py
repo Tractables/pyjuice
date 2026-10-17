@@ -278,7 +278,8 @@ class DFAExactBackend(Backend):
         """
         ``log p(C, e)`` for every sample (see :meth:`~pyjuice.constraints.ConstrainedCircuit.marginal`).
 
-        :param precision: "fp32" (the default; fp32-level accuracy) or "tf32" for the sum layers' matrix products
+        :param precision: "fp32" (the default; fp32-level accuracy), "tf32", or "bf16" -- the CUDA fused sums'
+            products on bfloat16 operands, every other product as at "tf32" -- for the sum layers' matrix products
         :param storage: "auto" (the default), "dense" or "compact" (see :meth:`conditional`; a marginal keeps inside
             values only)
         :param external: a decoder session's per-sample inputs (:meth:`external_inputs`)
@@ -294,8 +295,9 @@ class DFAExactBackend(Backend):
         ``log p(x_t = v | e, C)`` for every target, of every token or of the ``candidates`` (see
         :meth:`~pyjuice.constraints.ConstrainedCircuit.conditional`).
 
-        :param precision: "fp32" (the default; fp32-level accuracy) or "tf32" for the matrix products; inside
-            ``pyjuice.fast_inference(allow_bf16_params = True)`` the token probabilities are scored in bfloat16
+        :param precision: "fp32" (the default; fp32-level accuracy), "tf32", or "bf16" (see :meth:`marginal`) for
+            the matrix products; inside ``pyjuice.fast_inference(allow_bf16_params = True)`` the token probabilities
+            are scored in bfloat16
         :param storage: "auto" (the default), "dense" or "compact": keep the per-sample values of every pair of
             automaton states, or under evidence only of each sample's live ones (far less memory when the evidence pins
             the automaton down, as a decoded prefix does; more where it joins few of them); "auto" picks the one whose

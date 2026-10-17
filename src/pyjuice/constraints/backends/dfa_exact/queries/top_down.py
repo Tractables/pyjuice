@@ -150,7 +150,8 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
                                           idx = tensor(idx), gated = F.part_gates(gates, tables["gate"],
                                                                                   compact if part == 1 else None, prog,
                                                                                   part == 0),
-                                          frags = stacks if kept else None)
+                                          frags = stacks if kept or precision == "bf16" else None,
+                                          bf16 = precision == "bf16")
             if visit is not None:
                 visit(prod_index)
         else:

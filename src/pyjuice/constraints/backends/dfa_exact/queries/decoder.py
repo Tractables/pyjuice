@@ -88,7 +88,7 @@ class DFAExactDecoder(Decoder):
     ``bf16_token_table``: whether the conditionals score the tokens against a bfloat16 copy of the token table
     (:meth:`~..state.State.token_table`) -- half the bytes their scoring reads, at the scores' cost: ~2e-4 nats on
     Codpula's and Ctrl-G's circuits (no best token changed), up to ~3e-3 on small ones. "auto" (the default): under
-    ``precision = "tf32"`` (approximate products anyway), not under "fp32"; True / False: always / never.
+    ``precision = "tf32"`` or "bf16" (approximate products anyway), not under "fp32"; True / False: always / never.
     """
 
     remembers = True

@@ -28,8 +28,10 @@ from ..external_params import block_scale
 from ..kernels.sum import dense_sum, fused_sum, stacked_weights
 
 
-#: Matrix-product precision of the kernels: "fp32" (three TF32 products, fp32-level accuracy) or "tf32".
-PRECISIONS = {"fp32": "tf32x3", "tf32": "tf32"}
+#: Matrix-product precision of the kernels per query precision: "fp32" (three TF32 products, fp32-level accuracy),
+#: "tf32", or "bf16" -- the CUDA fused sums' products on bf16 operands (:func:`~..kernels.sum.fused_sum`), every other
+#: kernel's as at "tf32".
+PRECISIONS = {"fp32": "tf32x3", "tf32": "tf32", "bf16": "tf32"}
 
 #: The fewest columns (batch x slots) a dense sum region needs before evidence pruning pays with more than one live
 #: column (see :func:`prune_dense`).
@@ -41,7 +43,7 @@ DENSE_PRUNE_MIN_COLUMNS = 48
 #: 13.8k- / 49k-state automata: stacked wins in TF32 at every width (x1.04-1.46) but loses 1% at 49k columns; in fp32
 #: it wins up to ~2k (x1.1-1.3) and loses 1-3% wider (cuBLAS's fp32 kernel for the 4096-row shape, and the log pass
 #: no longer finding a block's product in L2).
-STACK_MAX_COLUMNS = {"fp32": 2048, "tf32": 16384}
+STACK_MAX_COLUMNS = {"fp32": 2048, "tf32": 16384, "bf16": 16384}
 
 
 def prune_dense(ncols: int, num_live: int) -> bool:
@@ -122,7 +124,7 @@ def run_forward(backend, bufs: dict, plan, x: torch.Tensor, missing: torch.Tenso
     :param obs_class: [B, n] int32, every observed token's class, -1 where missing
     :param liveness: None, or the query's :class:`~.live.Liveness`, the intervals it computes per sample ordered (unless
         they are compact)
-    :param precision: "fp32" or "tf32" for the sum layers' matrix products
+    :param precision: "fp32", "tf32" or "bf16" for the sum layers' matrix products (see :data:`PRECISIONS`)
     :param compact: None, or the query's :class:`~..kernels.compact.CompactLayout`: the per-sample inside values are
         compact where it lays them out (``mars``; ``bufs`` are laid out by it, see :meth:`~.state.State.buffers`)
     :param masses: the query's class masses (:meth:`~.state.State.masses`; None: the state's, under no per-sample
@@ -238,4 +240,4 @@ def _sums(backend, parts, block_size: int, nodes: torch.Tensor, element_mars: to
                       B if compact is None else 1, block_size, max_cols = max_cols, precision = dot, aliased = aliased,
                       liveness = liveness if compact is None else None, sel = None if sel is None else sel.tensor,
                       count = count, gated = part_gates(gates, gate, compact, prog, once),
-                      frags = stacks if kept else None)
+                      frags = stacks if kept or precision == "bf16" else None, bf16 = precision == "bf16")
