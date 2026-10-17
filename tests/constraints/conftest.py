@@ -59,6 +59,75 @@ def word_count(lo: int, hi: int, token_kind):
     return DFA(token_kind.numel(), token_kind, delta, 1, accept).minimize()
 
 
+#: what :func:`byte_level_tokenizer` is trained on: several scripts, emoji, whitespace
+TOKENIZER_CORPUS = ["the quick brown fox", " leading space", "naïve café — “quotes” …", "日本語のテキスト",
+                    "emoji 🎉🚀 done", "tabs\tand\nnewlines", '{"k": [1, 2.5, null]}'] * 10 + \
+                   ["the lazy dog jumps over the fox"] * 10
+
+
+def byte_level_tokenizer(tk):
+    """A ``tokenizers.Tokenizer`` in GPT-2's layout (``tk``: the ``tokenizers`` module): byte-level BPE over all 256
+    bytes, an end-of-text special token (id 0)."""
+    tok = tk.Tokenizer(tk.models.BPE())
+    tok.pre_tokenizer = tk.pre_tokenizers.ByteLevel(add_prefix_space = False)
+    tok.decoder = tk.decoders.ByteLevel()
+    trainer = tk.trainers.BpeTrainer(vocab_size = 400, special_tokens = ["<|endoftext|>"], show_progress = False,
+                                     initial_alphabet = tk.pre_tokenizers.ByteLevel.alphabet())
+    tok.train_from_iterator(TOKENIZER_CORPUS, trainer)
+    return tok
+
+
+def sentencepiece_tokenizer(tk):
+    """Llama 2's layout: <unk> <s> </s>, the 256 byte tokens (byte fallback), then pieces; a space marker prepended to
+    the text."""
+    vocab = {"<unk>": 0, "<s>": 1, "</s>": 2, **{f"<0x{b:02X}>": 3 + b for b in range(256)}}
+    for p in ["▁", "t", "h", "e", "▁t", "he", "▁the", "f", "o", "x", "▁f", "ox", "▁fox"]:
+        vocab.setdefault(p, len(vocab))
+    merges = [("▁", "t"), ("h", "e"), ("▁t", "he"), ("▁", "f"), ("o", "x"), ("▁f", "ox")]
+    tok = tk.Tokenizer(tk.models.BPE(vocab = vocab, merges = merges, unk_token = "<unk>", byte_fallback = True,
+                                     fuse_unk = True))
+    tok.normalizer = tk.normalizers.Sequence([tk.normalizers.Prepend("▁"), tk.normalizers.Replace(" ", "▁")])
+    tok.decoder = tk.decoders.Sequence([tk.decoders.Replace("▁", " "), tk.decoders.ByteFallback(),
+                                        tk.decoders.Fuse(), tk.decoders.Strip(" ", 1, 0)])
+    tok.add_special_tokens(["<unk>", "<s>", "</s>"])
+    return tok
+
+
+def unigram_tokenizer(tk):
+    """T5's layout: a SentencePiece unigram without byte fallback (<unk> 0, </s> 1)."""
+    pieces = [("<unk>", 0.0), ("</s>", 0.0), ("▁", -2.0), ("▁the", -1.0), ("▁fox", -1.0)] + \
+             [(c, -3.0) for c in "abcdefghijklmnopqrstuvwxyz"]
+    tok = tk.Tokenizer(tk.models.Unigram(pieces, unk_id = 0))
+    tok.pre_tokenizer = tk.pre_tokenizers.Metaspace()
+    tok.decoder = tk.decoders.Metaspace()
+    tok.add_special_tokens(["<unk>", "</s>"])
+    return tok
+
+
+@pytest.fixture(name = "tk")
+def tk_fixture():
+    """The ``tokenizers`` module (the test is skipped without it)."""
+    return pytest.importorskip("tokenizers")
+
+
+@pytest.fixture(name = "byte_level")
+def byte_level_fixture(tk):
+    """A builder of fresh :func:`byte_level_tokenizer` s."""
+    return lambda: byte_level_tokenizer(tk)
+
+
+@pytest.fixture(name = "sentencepiece")
+def sentencepiece_fixture(tk):
+    """A builder of fresh :func:`sentencepiece_tokenizer` s."""
+    return lambda: sentencepiece_tokenizer(tk)
+
+
+@pytest.fixture(name = "unigram")
+def unigram_fixture(tk):
+    """A builder of fresh :func:`unigram_tokenizer` s."""
+    return lambda: unigram_tokenizer(tk)
+
+
 @pytest.fixture(name = "word_kinds")
 def word_kinds_fixture():
     """:func:`word_kinds`, for tests."""

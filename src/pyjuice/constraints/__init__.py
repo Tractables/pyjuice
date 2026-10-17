@@ -11,6 +11,8 @@ The package is conventionally imported as ``jc``::
 
     # the tokens 3, 7 appear in a row, and token 5 never appears
     c = jc.DFA.contains([[3, 7]], vocab_size = V) & ~jc.DFA.contains([[5]], vocab_size = V)
+    # or on the text the tokens spell, read from a tokenizer: the text is a date (`pip install pyjuice[constraints]`)
+    #   c = jc.Regex(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", tokenizer)
     cc = jc.compile(c, pc)      # a ConstrainedCircuit: pc under c, valid across parameter updates
 
     # decoding x ([batch, 12] token ids): the circuit's queries in a session that reuses work between them (with a
@@ -20,7 +22,7 @@ The package is conventionally imported as ``jc``::
             logp = decoder.conditional(x[:, :t], targets = [t])    # log p(x_t = v | x_<t, C), [batch, V]
 """
 
-from .language import Constraint, Matcher, And, Or, Not, Concat, OPTIONAL_CAPABILITIES, DFA, DFAMatcher, Vocabulary
+from .language import Constraint, Matcher, And, Or, Not, Concat, OPTIONAL_CAPABILITIES, DFA, DFAMatcher, Vocabulary, Regex
 from .compiler import compile
 from .errors import ConstraintCompileError
 from .constrained_circuit import ConstrainedCircuit

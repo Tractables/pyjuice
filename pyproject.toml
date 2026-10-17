@@ -29,6 +29,10 @@ authors = [
 cuda = [
     "nvidia-cutlass>=3.5",
 ]
+# Text-level constraints (pyjuice.constraints.Regex): `pip install pyjuice[constraints]`.
+constraints = [
+    "interegular>=0.3.3",
+]
 dev = [
     "pytest",
     "pytest-xdist",

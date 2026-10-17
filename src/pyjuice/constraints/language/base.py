@@ -229,6 +229,16 @@ class Constraint(ABC):
             return self
         raise NotImplementedError(f"{type(self).__name__} does not support `relax`.")
 
+    def _widened(self, vocab_size: int) -> Optional["Constraint"]:
+        """
+        The same constraint over the larger vocabulary ``{0, ..., vocab_size - 1}``, or None if it cannot widen (the
+        default: a :class:`~pyjuice.constraints.DFA` cannot). A text-level leaf widens with the new ids as ids
+        without text, which never occur in what it accepts; a composite widens when all its children do (a complement
+        then contains the new ids). :func:`~pyjuice.constraints.compile` widens a constraint to the vocabulary of the
+        PC it compiles against.
+        """
+        return None
+
     # ---------------------------------------------------------------------------------------------
     # Lazy composition
     # ---------------------------------------------------------------------------------------------
@@ -383,6 +393,10 @@ class _Composite(_ViaAutomaton, Constraint):
         fps = [c.fingerprint() for c in self._children]
         return tuple(sorted(fps)) if self._commutative else tuple(fps)
 
+    def _widened(self, vocab_size: int) -> Optional[Constraint]:
+        children = [c._widened(vocab_size) for c in self._children]
+        return None if any(c is None for c in children) else type(self)(*children)
+
     def info(self):
         info = super().info()
         info["children"] = [c.info()["kind"] for c in self._children]
@@ -467,6 +481,10 @@ class Not(_ViaAutomaton, Constraint):
 
     def _fingerprint_payload(self):
         return (self._child,)
+
+    def _widened(self, vocab_size: int) -> Optional[Constraint]:
+        child = self._child._widened(vocab_size)
+        return None if child is None else Not(child)
 
     def __invert__(self) -> Constraint:
         return self._child

@@ -124,6 +124,25 @@ def test_a_vocabulary_mismatch_is_refused():
     assert f"Categorical input nodes over variables {{0..5}} range over {V} values" in msg
 
 
+def test_text_constraints_widen_to_the_pcs_vocabulary():
+    """A Regex over fewer ids than the PC's inputs range over (a model's embedding rows beyond its tokenizer's)
+    compiles over the PC's vocabulary, the extra ids without text: the constraint over the larger vocabulary, the
+    same marginals as compiling that one, probability 0 for the extra id; composites widen too; a DFA does not."""
+    pytest.importorskip("interegular")
+    vocab = jc.Vocabulary([b"a", b"b", b"ab", None], eos = [3])           # 4 ids; the PC's inputs range over V = 5
+    pc = hmm(4).to("cuda")
+    regex = jc.Regex("a+b?", vocab)
+    cc = jc.compile(regex, pc)
+    wide = jc.Regex("a+b?", vocab.with_size(V))
+    assert cc.constraint.vocab_size == V and cc.constraint == wide
+    x = torch.zeros(2, 4, dtype = torch.long, device = "cuda")
+    missing = torch.ones(2, 4, dtype = torch.bool, device = "cuda")
+    assert torch.equal(cc.marginal(x, missing), jc.compile(wide, pc).marginal(x, missing))
+    assert torch.isneginf(cc.conditional(x, missing)[:, V - 1]).all()   # every position a target
+    assert jc.compile(regex & ~jc.Regex("ab", vocab), pc).constraint.vocab_size == V
+    assert f"vocab_size {V - 1}" in refusal(jc.DFA.contains([[1, 2]], vocab_size = V - 1), pc)
+
+
 def test_a_constraint_without_an_automaton_is_refused():
     msg = refusal(OnlyAccepts(V), hmm(6))
     assert "no `automaton` capability" in msg and "it supports: accepts" in msg

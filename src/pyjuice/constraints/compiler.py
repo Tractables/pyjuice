@@ -14,6 +14,7 @@ from pyjuice.model import TensorCircuit
 
 from .backends import BACKENDS
 from .constrained_circuit import ConstrainedCircuit
+from .distributions import lookup
 from .errors import ConstraintCompileError
 from .language.base import Constraint
 from .structure import analyze_structure
@@ -23,8 +24,11 @@ def compile(constraint: Constraint, pc: TensorCircuit, backend: Optional[str] = 
     """
     Compile ``constraint`` against ``pc`` for constrained queries.
 
-    The constraint reads the PC's variables ``0, ..., n-1`` in index order. If no backend can serve the
-    pair, a :class:`ConstraintCompileError` lists every reason of every backend tried, at once.
+    The constraint reads the PC's variables ``0, ..., n-1`` in index order. When the PC's inputs range over more
+    values than the constraint's vocabulary has ids -- a model's embedding rows beyond its tokenizer's -- a
+    constraint that can widen is compiled over the PC's vocabulary (a text-level constraint's new ids have no text;
+    see ``Constraint._widened``), and is the circuit's ``constraint``. If no backend can serve the pair, a
+    :class:`ConstraintCompileError` lists every reason of every backend tried, at once.
 
     :param constraint: the constraint
     :type constraint: Constraint
@@ -46,6 +50,7 @@ def compile(constraint: Constraint, pc: TensorCircuit, backend: Optional[str] = 
                                      f"{', '.join(repr(b) for b in BACKENDS)}.")
 
     structure = analyze_structure(pc)
+    constraint = _widened_to_pc(constraint, structure)
     refused = {}
     for cls in ([BACKENDS[backend]] if backend is not None else BACKENDS.values()):
         reasons = cls.refusals(constraint, structure)
@@ -56,6 +61,24 @@ def compile(constraint: Constraint, pc: TensorCircuit, backend: Optional[str] = 
     raise ConstraintCompileError("\n".join(f"Cannot compile the constraint against this PC (backend {name!r}):\n"
                                            + "\n".join(f"  - {r}" for r in reasons)
                                            for name, reasons in refused.items()))
+
+
+def _widened_to_pc(constraint: Constraint, structure) -> Constraint:
+    """``constraint`` over the PC's vocabulary when every input the backends read ranges over the same number of
+    values, more than the constraint's vocabulary, and the constraint widens; else ``constraint`` itself (a mismatch
+    left is the backends' to report)."""
+    values = set()
+    for info in structure.nodes:
+        module = lookup(info.ns.dist) if info.kind == "input" else None
+        if module is not None:
+            values.add(module.num_values(info.ns.dist))
+    if len(values) == 1:
+        (num_values,) = values
+        if num_values > constraint.vocab_size:
+            wide = constraint._widened(num_values)
+            if wide is not None:
+                return wide
+    return constraint
 
 
 def _check_pc(pc):

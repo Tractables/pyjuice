@@ -90,6 +90,23 @@ class Vocabulary:
         self._offsets = offsets
         self._buffer = b"".join(parts)
         self._fingerprint = None
+        self._byte_trie = None                  # the tokens' byte trie, built by text-level constraints on first use
+
+    def with_size(self, size: int) -> "Vocabulary":
+        """The same vocabulary over ``size`` ids, at least :attr:`size`: the new ones have no text (a model's embedding
+        rows beyond its tokenizer's)."""
+        size = int(size)
+        if size < self._size:
+            raise ValueError(f"`size` ({size}) is smaller than the vocabulary's ({self._size}).")
+        if size == self._size:
+            return self
+        out = Vocabulary.__new__(Vocabulary)
+        extra = size - self._size
+        out._size, out._eos, out._buffer, out._fingerprint = size, self._eos, self._buffer, None
+        out._has_text = np.concatenate([self._has_text, np.zeros(extra, dtype = bool)])
+        out._offsets = np.concatenate([self._offsets, np.full(extra, self._offsets[-1], dtype = np.int64)])
+        out._byte_trie = self._byte_trie        # the same texts, the same trie
+        return out
 
     # ---------------------------------------------------------------------------------------------
     # Reading tokenizers
