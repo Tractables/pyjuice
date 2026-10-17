@@ -26,8 +26,8 @@ import numpy as np
 import torch
 from numba import njit
 
-from .dfa import DFA
-from .vocabulary import Vocabulary
+from ..dfa import DFA
+from ..vocabulary import Vocabulary
 
 MAX_CODE_POINT = 0x10FFFF
 

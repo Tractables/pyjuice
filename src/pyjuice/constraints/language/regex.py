@@ -13,8 +13,8 @@ a matching text is in the language, tokens that split a character included.
 
 The PC's n positions hold the text followed by end-of-sequence ids (``eos_padding``, the default: a text may end before
 the last position, and then only end-of-sequence ids follow), or the text alone. The automaton -- interegular's
-automaton over characters, its UTF-8 byte automaton, then the token automaton (:mod:`.byte_level`) -- is built on first
-use. Needs the ``interegular`` package (``pip install pyjuice[constraints]``).
+automaton over characters, its UTF-8 byte automaton, then the token automaton (:mod:`.backend.byte_level`) -- is built
+on first use. Needs the ``interegular`` package (``pip install pyjuice[constraints]``).
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from typing import Optional
 import torch
 
 from .base import Constraint, Matcher, Tokens
-from .byte_level import ByteAutomaton, code_point_ranges, complement_ranges, to_tokens, widened
+from .backend.byte_level import ByteAutomaton, code_point_ranges, complement_ranges, to_tokens, widened
 from .dfa import DFA
 from .vocabulary import Vocabulary
 

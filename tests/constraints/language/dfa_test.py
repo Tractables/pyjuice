@@ -132,6 +132,125 @@ def test_inequivalent_dfas_are_told_apart():
 
 
 # -------------------------------------------------------------------------------------------------
+# The numba kernels (language/backend/dfa.py) against the Python implementations they replaced
+# -------------------------------------------------------------------------------------------------
+
+def reference_order(delta, initial):
+    """States reachable from `initial` in BFS order (classes in increasing order), in Python."""
+    from collections import deque
+    order, seen, queue = [], {initial}, deque([initial])
+    rows = delta.tolist()
+    while queue:
+        q = queue.popleft()
+        order.append(q)
+        for nxt in rows[q]:
+            if nxt not in seen:
+                seen.add(nxt)
+                queue.append(nxt)
+    return order
+
+
+def reference_minimize(dfa):
+    """Moore partition refinement in torch, then the canonical numbering -- the implementation before the kernels."""
+    reach = reference_order(dfa.delta, dfa.initial)
+    idx = torch.as_tensor(reach, dtype = torch.long)
+    remap = torch.full((dfa.num_states,), -1, dtype = torch.long)
+    remap[idx] = torch.arange(len(reach))
+    d = remap[dfa.delta[idx]]
+    acc = dfa.accept[idx]
+    part = acc.long()
+    while True:
+        sig = torch.cat([part[:, None], part[d]], dim = 1)
+        _, new = torch.unique(sig, dim = 0, return_inverse = True)
+        pairs = torch.unique(torch.stack([new, part], dim = 1), dim = 0)
+        if pairs.size(0) == int(new.max()) + 1 == int(part.max()) + 1:
+            break
+        part = new
+    rep = torch.full((int(part.max()) + 1,), -1, dtype = torch.long)
+    for s in range(len(reach) - 1, -1, -1):
+        rep[part[s]] = s
+    merged = jc.DFA(dfa.vocab_size, dfa.token_class, part[d[rep]], int(part[0]), acc[rep])
+    order = reference_order(merged.delta, merged.initial)
+    remap = torch.full((merged.num_states,), -1, dtype = torch.long)
+    remap[torch.as_tensor(order)] = torch.arange(len(order))
+    idx = torch.as_tensor(order)
+    return jc.DFA(dfa.vocab_size, merged.token_class, remap[merged.delta[idx]], 0, merged.accept[idx])
+
+
+def reference_product(dfas, mode):
+    """The Python breadth-first product over reachable tuples, then the reference minimisation."""
+    from collections import deque
+    from pyjuice.constraints.language.dfa import _joint_classes
+    token_class, child_class = _joint_classes(dfas)
+    deltas, accepts, cc = [d.delta.tolist() for d in dfas], [d.accept.tolist() for d in dfas], child_class.tolist()
+    start = tuple(d.initial for d in dfas)
+    ids, order, queue, rows = {start: 0}, [start], deque([start]), []
+    while queue:
+        s = queue.popleft()
+        row = []
+        for joint in cc:
+            nxt = tuple(deltas[i][s[i]][joint[i]] for i in range(len(dfas)))
+            if nxt not in ids:
+                ids[nxt] = len(order)
+                order.append(nxt)
+                queue.append(nxt)
+            row.append(ids[nxt])
+        rows.append(row)
+    combine = all if mode == "and" else any
+    accept = [i for i, s in enumerate(order) if combine(accepts[k][s[k]] for k in range(len(dfas)))]
+    return reference_minimize(jc.DFA(dfas[0].vocab_size, token_class, rows, 0, accept))
+
+
+def random_table_dfa(rng, V, K, C):
+    """A random complete DFA of K states over C classes of V tokens (unreachable states and missing dead states
+    included as they come)."""
+    token_class = torch.tensor([rng.randrange(C) for _ in range(V)])
+    delta = [[rng.randrange(K) for _ in range(C)] for _ in range(K)]
+    accept = [q for q in range(K) if rng.random() < rng.choice([0.0, 0.3, 0.7, 1.0])]
+    return jc.DFA(V, token_class, delta, rng.randrange(K), accept)
+
+
+def test_minimize_kernels_give_the_tables_of_moore_refinement():
+    """Hopcroft and the BFS orders in numba: the very tables the torch implementation gave, on random DFAs of 1 to 300
+    states (unreachable states, everything or nothing accepting, a single class among them)."""
+    rng = random.Random(0)
+    for trial in range(300):
+        K = rng.choice([1, 2, 3, 5, 8, 20, 60, 300])
+        dfa = random_table_dfa(rng, rng.choice([1, 2, 5, 12]), K, rng.choice([1, 2, 3, 6]))
+        got, want = dfa.minimize(), reference_minimize(dfa)
+        assert got == want, (trial, K)
+        for name in ("token_class", "delta", "accept"):
+            assert torch.equal(getattr(got, name), getattr(want, name)), (trial, name)
+
+
+def test_product_kernel_grows_past_its_first_capacity():
+    """Counters of tokens 0..3 up to 4, 6, 10 and 12: 5005 reachable tuples (more than the kernel's first 1024 rows),
+    all of them distinct in the minimal product."""
+    from pyjuice.constraints.language import dfa as dfa_module
+    counters = [jc.DFA(4, [int(t == i) for t in range(4)], [[q, min(q + 1, p - 1)] for q in range(p)], 0, [p - 1])
+                for i, p in enumerate((5, 7, 11, 13))]
+    got = dfa_module.product(counters, "and")
+    assert got.num_states == 5005 and got == reference_product(counters, "and")
+
+
+@pytest.mark.parametrize("fold", [False, True])
+def test_product_kernel_gives_the_python_product(fold, monkeypatch):
+    """The numba BFS over mixed-radix tuple keys -- or, when the keys of 3 or more DFAs would not fit (forced here),
+    the DFAs combined two at a time -- gives the very automaton the Python BFS gave, for 2 to 5 components, `and` and
+    `or`."""
+    from pyjuice.constraints.language import dfa as dfa_module
+    if fold:
+        monkeypatch.setattr(dfa_module, "PRODUCT_KEY_BITS", 1)
+    rng = random.Random(1)
+    for trial in range(80):
+        V = rng.choice([2, 4, 9])
+        dfas = [random_table_dfa(rng, V, rng.choice([1, 2, 4, 7]), rng.choice([1, 2, 3]))
+                for _ in range(rng.randint(2, 5))]
+        mode = rng.choice(["and", "or"])
+        assert dfa_module.product(dfas, mode) == reference_product(dfas, mode), (trial, mode)
+
+
+# -------------------------------------------------------------------------------------------------
 # Matcher
 # -------------------------------------------------------------------------------------------------
 

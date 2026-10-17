@@ -29,6 +29,7 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence
 import numpy as np
 import torch
 
+from .backend.dfa import bfs_order, hopcroft, product_bfs
 from .base import Constraint, Matcher, Tokens
 
 
@@ -244,56 +245,32 @@ class DFA(Constraint):
 
     def minimize(self) -> "DFA":
         """The minimal equivalent DFA, in canonical form: unreachable states removed, equivalent states
-        merged (Moore partition refinement), states numbered in BFS order from the initial state over
+        merged (Hopcroft's algorithm), states numbered in BFS order from the initial state over
         classes, and classes numbered by their smallest token. Two DFAs accept the same language iff
         their minimized forms are ``==``."""
-        reach = self._reachable_order()
-        delta = self._delta
-        # Moore refinement over the reachable states
-        idx = torch.as_tensor(reach, dtype = torch.long)
-        remap = torch.full((self.num_states,), -1, dtype = torch.long)
-        remap[idx] = torch.arange(len(reach))
-        d = remap[delta[idx]]                                   # [R, C], all reachable by construction
-        acc = self._accept[idx]
-        part = acc.long()
-        while True:
-            sig = torch.cat([part[:, None], part[d]], dim = 1)
-            _, new = torch.unique(sig, dim = 0, return_inverse = True)
-            if int(new.max()) == int(part.max()) and _same_partition(new, part):
-                break
-            part = new
-        num_blocks = int(part.max()) + 1
-        rep = torch.full((num_blocks,), -1, dtype = torch.long)
-        for s in range(len(reach) - 1, -1, -1):                 # any member represents its block
-            rep[part[s]] = s
-        block_delta = part[d[rep]]                              # [num_blocks, C]
-        block_accept = acc[rep]
-        merged = DFA(self.vocab_size, self._token_class, block_delta, int(part[0]), block_accept)
+        delta = self._delta.numpy()
+        reach = bfs_order(delta, self._initial)
+        remap = np.full(self.num_states, -1, dtype = np.int64)
+        remap[reach] = np.arange(reach.size)
+        d = remap[delta[reach]]                                 # [R, C], all reachable by construction
+        acc = self._accept.numpy()[reach]
+        block, num_blocks = hopcroft(d, acc)
+        rep = np.empty(num_blocks, dtype = np.int64)
+        rep[block] = np.arange(reach.size)                      # any member represents its block
+        merged = DFA(self.vocab_size, self._token_class, torch.from_numpy(block[d[rep]]), int(block[0]),
+                     torch.from_numpy(acc[rep]))
         return merged._renumbered()
 
     def equivalent(self, other: "DFA") -> bool:
         """Whether two DFAs accept the same language."""
         return self.minimize() == other.minimize()
 
-    def _reachable_order(self) -> List[int]:
-        order, seen, queue = [], {self._initial}, deque([self._initial])
-        delta = self._delta.tolist()
-        while queue:
-            q = queue.popleft()
-            order.append(q)
-            for nxt in delta[q]:
-                if nxt not in seen:
-                    seen.add(nxt)
-                    queue.append(nxt)
-        return order
-
     def _renumbered(self) -> "DFA":
         """Canonical numbering: states in BFS order (classes visited in increasing order)."""
-        order = self._reachable_order()
+        order = torch.from_numpy(bfs_order(self._delta.numpy(), self._initial))
         remap = torch.full((self.num_states,), -1, dtype = torch.long)
-        remap[torch.as_tensor(order, dtype = torch.long)] = torch.arange(len(order))
-        idx = torch.as_tensor(order, dtype = torch.long)
-        return DFA(self.vocab_size, self._token_class, remap[self._delta[idx]], 0, self._accept[idx])
+        remap[order] = torch.arange(order.numel())
+        return DFA(self.vocab_size, self._token_class, remap[self._delta[order]], 0, self._accept[order])
 
     # ---------------------------------------------------------------------------------------------
     # Builders
@@ -486,33 +463,41 @@ def _joint_classes(dfas: Sequence[DFA]):
     return token_class, child_class
 
 
+#: a product's state tuples are numbers in mixed radix while the product of the state counts stays below 2 ** this
+PRODUCT_KEY_BITS = 62
+
+
 def product(dfas: Sequence[DFA], mode: str) -> DFA:
     """
     The product automaton of ``dfas`` over their joint token classes, built over reachable state
     tuples only, then minimised. ``mode`` is ``"and"`` (intersection: every DFA accepts) or ``"or"``
-    (union: at least one accepts).
+    (union: at least one accepts). Tuples too many for one int64 key: the DFAs are combined two at a time, each
+    product minimised (the same minimal automaton).
     """
     if mode not in ("and", "or"):
         raise ValueError(f"`mode` must be 'and' or 'or', got {mode!r}.")
+    Ks = np.array([d.num_states for d in dfas], dtype = np.int64)
+    tuples = float(np.prod(Ks, dtype = np.float64))
+    if len(dfas) > 2 and tuples >= 2.0 ** PRODUCT_KEY_BITS:
+        out = dfas[0]
+        for d in dfas[1:]:
+            out = product([out, d], mode)
+        return out
+    if tuples >= 2.0 ** 63:
+        raise ValueError(f"A product of DFAs of {Ks.tolist()} states is too large.")
     token_class, child_class = _joint_classes(dfas)
-    deltas = [d._delta.tolist() for d in dfas]
-    accepts = [d._accept.tolist() for d in dfas]
-    cc = child_class.tolist()                                               # [C_joint][k]
-    start = tuple(d.initial for d in dfas)
-    ids, order, queue = {start: 0}, [start], deque([start])
-    rows = []
-    while queue:
-        s = queue.popleft()
-        row = []
-        for joint in cc:
-            nxt = tuple(deltas[i][s[i]][joint[i]] for i in range(len(dfas)))
-            if nxt not in ids:
-                ids[nxt] = len(order); order.append(nxt); queue.append(nxt)
-            row.append(ids[nxt])
-        rows.append(row)
-    combine = all if mode == "and" else any
-    accept = [i for i, s in enumerate(order) if combine(accepts[k][s[k]] for k in range(len(dfas)))]
-    return DFA(dfas[0].vocab_size, token_class, rows, 0, accept).minimize()
+    flat = [d._delta.numpy().reshape(-1) for d in dfas]
+    offsets = np.zeros(len(dfas) + 1, dtype = np.int64)
+    offsets[1:] = np.cumsum([f.size for f in flat])
+    rows, keys = product_bfs(np.concatenate(flat), offsets, Ks, child_class.numpy().astype(np.int64),
+                             np.array([d.initial for d in dfas], dtype = np.int64))
+    accept = np.full(keys.size, mode == "and")
+    rest = keys.copy()
+    for i in range(len(dfas) - 1, -1, -1):                                  # every component's state, from the key
+        a = dfas[i]._accept.numpy()[rest % Ks[i]]
+        accept = accept & a if mode == "and" else accept | a
+        rest //= Ks[i]
+    return DFA(dfas[0].vocab_size, token_class, torch.from_numpy(rows), 0, torch.from_numpy(accept)).minimize()
 
 
 def complement(dfa: DFA) -> DFA:
@@ -578,9 +563,3 @@ def _compress_classes(token_class: torch.Tensor, delta: torch.Tensor):
     rank = torch.empty_like(order)
     rank[order] = torch.arange(C)
     return rank[tc].contiguous(), cols[:, order].contiguous()
-
-
-def _same_partition(a: torch.Tensor, b: torch.Tensor) -> bool:
-    """Whether two labelings induce the same partition (equal number of blocks and a consistent map)."""
-    pairs = torch.unique(torch.stack([a, b], dim = 1), dim = 0)
-    return pairs.size(0) == int(a.max()) + 1 == int(b.max()) + 1
