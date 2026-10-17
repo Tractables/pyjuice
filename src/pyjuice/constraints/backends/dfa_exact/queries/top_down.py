@@ -149,7 +149,8 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
                                           liveness = liveness if part == 1 and compact is None else None,
                                           idx = tensor(idx), gated = F.part_gates(gates, tables["gate"],
                                                                                   compact if part == 1 else None, prog,
-                                                                                  part == 0))
+                                                                                  part == 0),
+                                          frags = stacks if kept else None)
             if visit is not None:
                 visit(prod_index)
         else:

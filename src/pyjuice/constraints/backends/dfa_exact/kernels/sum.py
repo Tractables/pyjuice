@@ -478,15 +478,25 @@ def _lifted_sum_aux_kernel(node_mars, element_mars, weights, nids, cids, pids, n
                      A_SEG = A_SEG, SPLIT = SPLIT, PRE = PRE)
 
 
+@triton.jit
+def _frag_offsets(i, k):
+    """Where a chunk's e of reduction rows ``i`` (32) and column positions ``k`` lie from the chunk's first (``32
+    pre_ld``, ``pre_ld`` a multiple of 8) for the CUDA kernel (``c/fused_sum.cu``): a group of 8 columns' 32 rows at a
+    time, every tensor-core B fragment's two values side by side -- of lane ``(k % 8) 4 + i % 4``, its k8 step ``i //
+    8`` of the group, rows ``i % 8 < 4`` and ``+ 4``."""
+    return ((k // 8) * 256 + (k % 8) * 8)[None, :] + ((i // 8) * 64 + (i % 4) * 2 + (i % 8) // 4)[:, None]
+
+
 @triton_jit
 def _forward_prepass_kernel(element_mars, pre_buf, pre_cm, pre_ld, cids, nb_reg, reg_slots, perm, reg_perm, reg_live,
                             elem_first, elem_width, B, num_edges, pid0, TILE_E: tl.constexpr, TILE_B: tl.constexpr,
-                            PRUNE: tl.constexpr, PRECISION: tl.constexpr):
+                            PRUNE: tl.constexpr, PRECISION: tl.constexpr, FRAG: tl.constexpr = False):
     """One program per (chunk of ``TILE_E`` edges, tile of columns) of a fused forward launch whose node blocks share
     their children (``cids`` row 0, region ``nb_reg[0]``): the children's values, their maximum per column ``t`` and the
     shifted exponentials ``e = exp(x - t)``, stored at ``pre_buf[edge * pre_ld + k]`` and
-    ``pre_buf[pre_cm + chunk * pre_ld + k]`` by column position ``k``, as the forward kernel reads them; e rounded for
-    the products' ``PRECISION`` (:func:`~.common._tf32_operand`), which read it as it is."""
+    ``pre_buf[pre_cm + chunk * pre_ld + k]`` by column position ``k``, as the forward kernel reads them -- e, for the
+    CUDA kernel (``FRAG``, chunks of 32), in its order (:func:`_frag_offsets`); e rounded for the products'
+    ``PRECISION`` (:func:`~.common._tf32_operand`), which read it as it is."""
     chunk = tl.program_id(0)
     reg = tl.load(nb_reg)
     ncols = B * tl.load(reg_slots + reg)
@@ -509,8 +519,11 @@ def _forward_prepass_kernel(element_mars, pre_buf, pre_cm, pre_ld, cids, nb_reg,
                     mask = valid[:, None] & cmask[None, :], other = float("-inf"))
         t = tl.max(x, axis = 0)
         e = _tf32_operand(tl.exp(x - tl.where(t == float("-inf"), 0.0, t)[None, :]), PRECISION)
-        tl.store(pre_buf + offs_e.to(tl.int64)[:, None] * pre_ld + k[None, :], e,
-                 mask = emask[:, None] & kmask[None, :])
+        if FRAG:
+            at = chunk.to(tl.int64) * TILE_E * pre_ld + _frag_offsets(tl.arange(0, TILE_E), k)
+        else:
+            at = offs_e.to(tl.int64)[:, None] * pre_ld + k[None, :]
+        tl.store(pre_buf + at, e, mask = emask[:, None] & kmask[None, :])
         tl.store(pre_buf + pre_cm + chunk * pre_ld + k, t, mask = kmask)
 
 
@@ -579,12 +592,18 @@ def _int32_dummy(dev) -> torch.Tensor:
     return _INT32_DUMMIES[key]
 
 
-def _ctas_per_sm(mod, dev, td: bool, ext: bool, x3: bool, tn: int, affine: bool) -> int:
-    """How many CTAs of the CUDA kernel (``td``: top-down) an SM of ``dev`` holds at once (at a share's most chunks)."""
-    key = (dev.index if dev.index is not None else torch.cuda.current_device(), td, ext, x3, tn, affine)
+def _no_fragments(params: torch.Tensor) -> torch.Tensor:
+    """An empty tensor: no fragment-ordered weights (the CUDA kernel reads ``params`` as they are)."""
+    return params[:0]
+
+
+def _ctas_per_sm(mod, dev, td: bool, ext: bool, x3: bool, fa: bool, tn: int, affine: bool) -> int:
+    """How many CTAs of the CUDA kernel (``td``: top-down; ``fa``: fragment-ordered weights) an SM of ``dev`` holds
+    at once (at a share's most chunks)."""
+    key = (dev.index if dev.index is not None else torch.cuda.current_device(), td, ext, x3, fa, tn, affine)
     if key not in _CTAS_PER_SM:
         with torch.cuda.device(key[0]):
-            _CTAS_PER_SM[key] = max(1, int(mod.ctas_per_sm(td, ext, x3, tn, 256 if ext else 128, affine)))
+            _CTAS_PER_SM[key] = max(1, int(mod.ctas_per_sm(td, ext, x3, fa, tn, 256 if ext else 128, affine)))
     return _CTAS_PER_SM[key]
 
 
@@ -620,12 +639,12 @@ def _cuda_shape(num_blocks: int, max_cols: int) -> Optional[tuple]:
     return None if tiles < CUDA_MIN_TILES or col_tiles > 65535 else (tn, tiles)
 
 
-def _cuda_shares(mod, dev, td: bool, ext: bool, precision: str, tn: int, tiles: int, nch: int,
+def _cuda_shares(mod, dev, td: bool, ext: bool, precision: str, fa: bool, tn: int, tiles: int, nch: int,
                  affine: bool) -> Optional[int]:
-    """:func:`_cuda_split` of a CUDA launch (``td``: top-down) of ``tiles`` tiles of ``tn`` columns over ``nch``
-    chunks."""
+    """:func:`_cuda_split` of a CUDA launch (``td``: top-down; ``fa``: fragment-ordered weights) of ``tiles`` tiles
+    of ``tn`` columns over ``nch`` chunks."""
     cap = min(256 if ext else nch, nch if affine else 128)
-    ctas = _ctas_per_sm(mod, dev, td, ext, precision == "tf32x3", tn, affine) * _num_sms(dev)
+    ctas = _ctas_per_sm(mod, dev, td, ext, precision == "tf32x3", fa, tn, affine) * _num_sms(dev)
     key = (tiles, nch, ctas, tn, cap, SPLIT_MAX, SPLIT_MIN_SHARE, _CUDA_SPLIT_BYTES, _CUDA_MERGE_BYTES)
     if key not in _CUDA_SPLITS:                         # (by the launch's shape: a few per program)
         if len(_CUDA_SPLITS) >= 4096:
@@ -635,9 +654,10 @@ def _cuda_shares(mod, dev, td: bool, ext: bool, precision: str, tn: int, tiles: 
 
 
 def _cuda_plan(params, pids, num_blocks, gated, g, num_edges, max_cols, block_size, TILE_E, precision, aliased,
-               dev) -> Optional[tuple]:
-    """``(module, tables, tn, split)`` if a fused forward launch the pre-pass serves is the CUDA kernel's (see
-    :data:`CUDA_MIN_TILES`), else None. ``g``: the launch's :func:`gate_launch` arguments."""
+               dev, frags: Optional[dict] = None) -> Optional[tuple]:
+    """``(module, tables, tn, split, wfrag)`` if a fused forward launch the pre-pass serves is the CUDA kernel's (see
+    :data:`CUDA_MIN_TILES`), else None. ``g``: the launch's :func:`gate_launch` arguments; ``wfrag``: the weights in
+    the kernel's fragment order, from ``frags`` (:func:`_cuda_fragments`), or None."""
     if block_size != 32 or TILE_E != 32 or num_edges % 32 or aliased is not None or \
             precision not in ("tf32", "tf32x3") or \
             (gated is not None and (gated["node_gate"] < block_size or not gated["uniform"].get(32, False))):
@@ -651,8 +671,27 @@ def _cuda_plan(params, pids, num_blocks, gated, g, num_edges, max_cols, block_si
     tables = _cuda_tables(pids, g[0] if gated is not None else None) if mod is not None else None
     if tables is None:
         return None
-    split = _cuda_shares(mod, dev, False, gated is not None, precision, tn, tiles, tables[2], tables[3])
-    return None if split is None else (mod, tables, tn, split)
+    fa = frags is not None and precision == "tf32"
+    split = _cuda_shares(mod, dev, False, gated is not None, precision, fa, tn, tiles, tables[2], tables[3])
+    if split is None:
+        return None
+    return mod, tables, tn, split, _cuda_fragments(mod, frags, params, tables[0], False) if fa else None
+
+
+def _cuda_fragments(mod, frags: dict, params: torch.Tensor, wbase: torch.Tensor, td: bool) -> torch.Tensor:
+    """The weights of a CUDA launch (its every 32 x 32 tile's first ``wbase``) in the kernel's A-fragment order at
+    TF32 (``c/fused_sum.cu``, ``fragment_weights``), a copy of ``params`` -- per direction (``td``), every tile in its
+    own place -- kept in ``frags``, the stacked weights of a :func:`pyjuice.fast_inference` scope that allows
+    parameter copies (:meth:`~..state.State.weight_stacks`): a part's tiles copied by its first launch in the scope,
+    the parameters not changing inside it. The fragments are the products' own, so the sums do not change."""
+    key = ("cuda_fragments", td)
+    if key not in frags:
+        frags[key] = (torch.empty_like(params), {})
+    frag, done = frags[key]
+    if id(wbase) not in done:                           # (the part's tables live as long as the program)
+        mod.fragment_weights(params, frag, wbase, td)
+        done[id(wbase)] = wbase
+    return frag
 
 
 def _cuda_split_buffer(dev, num_blocks: int, max_cols: int, tn: int, nch: int, split: int, fallback: torch.Tensor):
@@ -668,15 +707,16 @@ def _cuda_forward(plan, node_mars, params, nids, nb_reg, sel, num_blocks, region
                   batch_size, max_cols, precision):
     """The fused forward launch ``plan`` (:func:`_cuda_plan`) on the CUDA kernel, from the pre-pass's chunks
     (``pre_args``: its buffer, ``pre_cm``, ``pre_ld``)."""
-    mod, (wbase, cells, nch, affine), tn, split = plan
+    mod, (wbase, cells, nch, affine), tn, split, wfrag = plan
     sbuf = _cuda_split_buffer(node_mars.device, num_blocks, max_cols, tn, nch, split, node_mars)
     pre, pre_cm, pre_ld = pre_args
     _, _, _, _, sstride, lz, lzstride, coff, reg_ivk, Bq, steps = g
     ext = gated is not None
     perm, reg_perm, reg_live = (lanes.perm, lanes.reg_first, lanes.reg_live) if lanes is not None else (nids,) * 3
-    mod.fused_sum_cuda(False, node_mars, node_mars, params, wbase, 1024, pre, pre_ld, pre_cm, nids, nb_reg, nb_reg,
-                       nids if sel is None else sel, regions["offset"], regions["width"], regions["first"],
-                       regions["slots"], perm, reg_perm, reg_live, 0, 0, gated["minor"] if ext else node_mars,
+    mod.fused_sum_cuda(False, node_mars, node_mars, params, _no_fragments(params) if wfrag is None else wfrag, wbase,
+                       1024, pre, pre_ld, pre_cm, nids, nb_reg, nb_reg, nids if sel is None else sel, regions["offset"],
+                       regions["width"], regions["first"], regions["slots"], perm, reg_perm, reg_live, 0, 0,
+                       gated["minor"] if ext else node_mars,
                        cells if ext else _int32_dummy(node_mars.device), gated["mstride"] if ext else 0,
                        lz if ext else node_mars, lzstride if ext else 0, coff, reg_ivk, Bq, steps, batch_size,
                        num_blocks, nch, max_cols, ext, ext and sstride == 0, ext and gated["lanes"] is not None,
@@ -728,11 +768,13 @@ def _cuda_td_tables(tables: dict, gt: Optional[dict], cbs: int):
     return hit[2]
 
 
-def _cuda_td_plan(tables, gt, idx, block_size, cbs, max_cols, TILE_I, precision, dev) -> Optional[tuple]:
-    """``(module, tables, tn, split)`` if a fused top-down launch is the CUDA kernel's: child blocks of 32 children or
-    a multiple (read in slices of 32, :func:`_cuda_td_tables`) under the same parent node blocks of 32, none log-added
-    (with external parameters, every slice in one child gate and a parent block in one node gate), see
-    :data:`CUDA_MIN_TILES` -- else None."""
+def _cuda_td_plan(tables, gt, idx, block_size, cbs, max_cols, TILE_I, precision, dev, params,
+                  frags: Optional[dict] = None) -> Optional[tuple]:
+    """``(module, tables, tn, split, wfrag)`` if a fused top-down launch is the CUDA kernel's: child blocks of 32
+    children or a multiple (read in slices of 32, :func:`_cuda_td_tables`) under the same parent node blocks of 32,
+    none log-added (with external parameters, every slice in one child gate and a parent block in one node gate), see
+    :data:`CUDA_MIN_TILES` -- else None. ``wfrag``: the weights ``params`` in the kernel's fragment order, from
+    ``frags`` (:func:`_cuda_fragments`), or None."""
     if block_size != 32 or cbs % 32 or TILE_I != 32 or precision not in ("tf32", "tf32x3") or \
             (gt is not None and (gt["node_gate"] < block_size or not gt["uniform"].get(32, False))):
         return None
@@ -745,15 +787,18 @@ def _cuda_td_plan(tables, gt, idx, block_size, cbs, max_cols, TILE_I, precision,
     td = _cuda_td_tables(tables, gt, cbs) if mod is not None else None
     if td is None:
         return None
-    split = _cuda_shares(mod, dev, True, gt is not None, precision, tn, tiles, td[5], td[6])
-    return None if split is None else (mod, td, tn, split)
+    fa = frags is not None and precision == "tf32"
+    split = _cuda_shares(mod, dev, True, gt is not None, precision, fa, tn, tiles, td[5], td[6])
+    if split is None:
+        return None
+    return mod, td, tn, split, _cuda_fragments(mod, frags, params, td[3], True) if fa else None
 
 
 def _cuda_top_down(plan, element_flows, node_flows, params, tables, regions, elem_first, elem_width, batch_size,
                    max_cols, precision, liveness, idx, gated, gl):
     """The fused top-down launch ``plan`` (:func:`_cuda_td_plan`) on the CUDA kernel: the parents' chunks once, by the
     pre-pass, then the products. ``gl``: the launch's :func:`gate_launch` arguments past the edges'."""
-    mod, (rows, rreg, colreg, wbase, cells, npar, affine, wstride, sl), tn, split = plan
+    mod, (rows, rreg, colreg, wbase, cells, npar, affine, wstride, sl), tn, split, wfrag = plan
     dev = element_flows.device
     sel = None
     if idx is not None:                                  # (the index list's child blocks' slices)
@@ -762,7 +807,7 @@ def _cuda_top_down(plan, element_flows, node_flows, params, tables, regions, ele
     lanes = liveness.lanes if liveness is not None else None
     perm, reg_perm, reg_live = (lanes.perm, lanes.reg_first, lanes.reg_live) if lanes is not None else (rows,) * 3
     TILE_B = min(_TILES[precision][2], max(16, host_next_power_of_2(max_cols)))
-    pre_ld = host_cdiv(max_cols, 4) * 4
+    pre_ld = host_cdiv(max_cols, 8) * 8                                 # (groups of 8 columns, :func:`_frag_offsets`)
     pre = pre_buffer(dev, npar * (32 + 1) * pre_ld)
     for first, size in grid_chunks(host_cdiv(max_cols, TILE_B), 1):      # (one child block's parents: every one's)
         _top_down_prepass_kernel[(npar, size)](
@@ -773,12 +818,13 @@ def _cuda_top_down(plan, element_flows, node_flows, params, tables, regions, ele
             INDEXED = idx is not None, GATED = gated is not None,
             LANES = gated is not None and gated["lanes"] is not None,
             SHARED_GATES = gated is not None and gated["gstride"] == 0, REL = True, PRECISION = precision,
-            num_warps = 4)
+            FRAG = True, num_warps = 4)
     ext = gated is not None
     sbuf = _cuda_split_buffer(dev, num_blocks, max_cols, tn, npar, split, element_flows)
-    mod.fused_sum_cuda(True, element_flows, node_flows, params, wbase, wstride, pre, pre_ld, npar * 32 * pre_ld, rows,
-                       rreg, colreg, rows if sel is None else sel, regions["offset"], regions["width"],
-                       regions["first"], regions["slots"], perm, reg_perm, reg_live, elem_first, elem_width,
+    mod.fused_sum_cuda(True, element_flows, node_flows, params, _no_fragments(params) if wfrag is None else wfrag,
+                       wbase, wstride, pre, pre_ld, npar * 32 * pre_ld, rows, rreg, colreg,
+                       rows if sel is None else sel, regions["offset"], regions["width"], regions["first"],
+                       regions["slots"], perm, reg_perm, reg_live, elem_first, elem_width,
                        gated["minor"] if ext else element_flows, cells if ext else _int32_dummy(dev),
                        gated["mstride"] if ext else 0,
                        element_flows, 0, gl[4], gl[5], gl[6], gl[7], batch_size, num_blocks, npar, max_cols, ext,
@@ -789,7 +835,8 @@ def _cuda_top_down(plan, element_flows, node_flows, params, tables, regions, ele
 def fused_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor, nids: torch.Tensor,
               cids: torch.Tensor, pids: torch.Tensor, nb_reg: torch.Tensor, regions: dict, elem_first: int,
               elem_width: int, batch_size: int, block_size: int, max_cols: int, precision: str, aliased = None,
-              liveness = None, sel = None, count: Optional[int] = None, gated: Optional[dict] = None):
+              liveness = None, sel = None, count: Optional[int] = None, gated: Optional[dict] = None,
+              frags: Optional[dict] = None):
     """
     Node blocks of a sum layer partition with the fused Triton kernel, into ``node_mars`` -- or, a launch of node
     blocks of 32 the pre-pass serves, the CUDA kernel (:func:`_cuda_plan`).
@@ -806,6 +853,7 @@ def fused_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch
     :param sel, count: None for every node block, or a query plan's int32 index list of them and its length
     :param gated: None, or the gates of a gated layer's node blocks (:func:`~..queries.forward.part_gates`): ``idx``
         / ``a_idx`` (the edges' cells, as ``cids`` / the aliased children), the session's gates and normalizers
+    :param frags: None, or where the CUDA kernel's fragment-ordered weights are kept (:func:`_cuda_fragments`)
     """
     num_blocks, num_edges = cids.shape
     if sel is not None:
@@ -849,15 +897,16 @@ def fused_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch
     if not rows and (gated is None or gated["uniform"].get(TILE_E, False)) and \
             num_blocks * num_mtiles >= PRE_MIN_TILES and shared_children(cids, nb_reg):   # the children's chunks once
         nch = host_cdiv(num_edges, TILE_E)
-        pre_ld = host_cdiv(max_cols, 4) * 4
-        pre = pre_buffer(node_mars.device, (nch * TILE_E + nch) * pre_ld)
         plan = _cuda_plan(params, pids, num_blocks, gated, g, num_edges, max_cols, block_size, TILE_E, precision,
-                          aliased, node_mars.device)
+                          aliased, node_mars.device, frags)
+        al = 4 if plan is None else 8                   # (the CUDA kernel's groups of 8 columns, :func:`_frag_offsets`)
+        pre_ld = host_cdiv(max_cols, al) * al
+        pre = pre_buffer(node_mars.device, (nch * TILE_E + nch) * pre_ld)
         for first, size in grid_chunks(num_col_tiles, 1):
             _forward_prepass_kernel[(nch, size)](
                 element_mars, pre, nch * TILE_E * pre_ld, pre_ld, cids, nb_reg, regions["slots"], perm, reg_perm,
                 reg_live, elem_first, elem_width, batch_size, num_edges, first, TILE_E = TILE_E, TILE_B = TILE_B,
-                PRUNE = liveness is not None, PRECISION = precision, num_warps = 4)
+                PRUNE = liveness is not None, PRECISION = precision, FRAG = plan is not None, num_warps = 4)
         pre_kw = dict(pre_args = (pre, nch * TILE_E * pre_ld, pre_ld))
         if plan is not None:
             _cuda_forward(plan, node_mars, params, nids, nb_reg, sel, num_blocks, regions, lanes, gated, g,
@@ -1285,7 +1334,7 @@ def _top_down_prepass_kernel(node_flows, pre_buf, pre_cm, pre_ld, cb_ivreg, cb_i
                              reg_ivk, Bq, steps, B, max_par, pid0, BS: tl.constexpr, NGC: tl.constexpr,
                              TILE_I: tl.constexpr, TILE_B: tl.constexpr, PRUNE: tl.constexpr, INDEXED: tl.constexpr,
                              GATED: tl.constexpr, LANES: tl.constexpr, SHARED_GATES: tl.constexpr,
-                             PRECISION: tl.constexpr, REL: tl.constexpr = False):
+                             PRECISION: tl.constexpr, REL: tl.constexpr = False, FRAG: tl.constexpr = False):
     """One program per (child block -- of the index list ``cb_idx`` if ``INDEXED`` --, its ``j``-th parent entry
     ``p``, chunk ``c`` of the parent's rows, tile of columns): the chunk's values -- less their log Z of the column's
     sample when ``GATED`` --, their maximum per column ``t`` and the shifted exponentials ``e = exp(x - t)``, stored at
@@ -1293,8 +1342,8 @@ def _top_down_prepass_kernel(node_flows, pre_buf, pre_cm, pre_ld, cb_ivreg, cb_i
     ``k`` (pruned: the interval's live columns first, as the top-down kernel reads them). The chunks are the top-down
     kernel's: ``TILE_I`` rows within every group of ``NGC`` (its node gate, or the block). ``REL``: stored by the
     entry's place ``j`` among the child block's (every child block's parents the same: the CUDA kernel's, one child
-    block's programs); e rounded for the products' ``PRECISION`` (:func:`~.common._tf32_operand`), which read it as
-    it is."""
+    block's programs) -- e, for the CUDA kernel (``FRAG``, chunks of 32 rows), in its order (:func:`_frag_offsets`); e
+    rounded for the products' ``PRECISION`` (:func:`~.common._tf32_operand`), which read it as it is."""
     NCPG: tl.constexpr = (NGC + TILE_I - 1) // TILE_I
     NCH: tl.constexpr = (BS // NGC) * NCPG
     pid = tl.program_id(0)
@@ -1336,14 +1385,18 @@ def _top_down_prepass_kernel(node_flows, pre_buf, pre_cm, pre_ld, cb_ivreg, cb_i
         t = tl.max(x, axis = 0)
         e = _tf32_operand(tl.exp(x - tl.where(t == float("-inf"), 0.0, t)[None, :]), PRECISION)
         p64 = (j if REL else p).to(tl.int64)
-        tl.store(pre_buf + (p64 * BS + offs_i)[:, None] * pre_ld + k[None, :], e, mask = im[:, None] & kmask[None, :])
+        if FRAG:
+            at = p64 * BS * pre_ld + _frag_offsets(offs_i, k)
+        else:
+            at = (p64 * BS + offs_i)[:, None] * pre_ld + k[None, :]
+        tl.store(pre_buf + at, e, mask = im[:, None] & kmask[None, :])
         tl.store(pre_buf + pre_cm + (p64 * NCH + c) * pre_ld + k, t, mask = kmask)
 
 
 def fused_sum_top_down(element_flows: torch.Tensor, node_flows: torch.Tensor, params: torch.Tensor, tables: dict,
                       regions: dict, elem_first: int, elem_width: int, batch_size: int, block_size: int, cbs: int,
                       max_cols: int, precision: str, liveness = None, idx: Optional[torch.Tensor] = None,
-                      gated: Optional[dict] = None):
+                      gated: Optional[dict] = None, frags: Optional[dict] = None):
     """
     The top-down values of the children of a sum layer's fused node blocks (:func:`_lifted_sum_top_down_kernel`) --
     or, child blocks of 32 children or a multiple under the same parent node blocks of 32, the CUDA kernel
@@ -1357,6 +1410,7 @@ def fused_sum_top_down(element_flows: torch.Tensor, node_flows: torch.Tensor, pa
     :param max_cols: the most columns any child block has (``batch_size`` x its slots)
     :param idx: None (every child block), or int32 on the device: the plan's index list of the child blocks to compute
     :param gated: None, or the session's gates (:func:`~..queries.forward.part_gates`): the layer's gates applied
+    :param frags: None, or where the CUDA kernel's fragment-ordered weights are kept (:func:`_cuda_fragments`)
     """
     num_blocks = tables["cb_row"].numel() if idx is None else idx.numel()
     tm, te, tb, warps, stages = _TILES[precision]
@@ -1370,7 +1424,8 @@ def fused_sum_top_down(element_flows: torch.Tensor, node_flows: torch.Tensor, pa
             TILE_I = min(TILE_I, max(16, gt["node_gate"]))                         # at once, when 16 or more
     num_ctiles = host_cdiv(cbs, TILE_C)
     num_col_tiles = host_cdiv(max_cols, TILE_B)
-    plan = _cuda_td_plan(tables, gt, idx, block_size, cbs, max_cols, TILE_I, precision, element_flows.device)
+    plan = _cuda_td_plan(tables, gt, idx, block_size, cbs, max_cols, TILE_I, precision, element_flows.device, params,
+                         frags)
     if plan is not None:
         _cuda_top_down(plan, element_flows, node_flows, params, tables, regions, elem_first, elem_width, batch_size,
                        max_cols, precision, liveness, idx, gated, gate_launch(gated, tables["cb_row"])[3:])

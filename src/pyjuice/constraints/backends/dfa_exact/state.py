@@ -400,7 +400,8 @@ class State:
         ``(stacks, kept)``: where a query finds and leaves the stacked weights of its dense sum node blocks (stack
         key -> :func:`~.sum.stacked_weights`, see :class:`~.program.Program`), and whether they outlive the
         query. Inside a :func:`pyjuice.fast_inference` scope that allows parameter copies, the scope's: kept until it
-        exits, so the query stacks every run it can (see ``STACK_MAX_COLUMNS`` there); else an empty dict of the
+        exits, so the query stacks every run it can (see ``STACK_MAX_COLUMNS`` there) -- and the CUDA fused sums keep
+        their weights in fragment order there too (:func:`~.kernels.sum._cuda_fragments`); else an empty dict of the
         query's own, which stacks only reused weights.
         """
         if self._kept_stacks is not None:

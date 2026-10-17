@@ -237,4 +237,5 @@ def _sums(backend, parts, block_size: int, nodes: torch.Tensor, element_mars: to
             fused_sum(nodes, element_mars, pc.params, nids, cids, pids, nb_reg, regions, elem_first, elem_width,
                       B if compact is None else 1, block_size, max_cols = max_cols, precision = dot, aliased = aliased,
                       liveness = liveness if compact is None else None, sel = None if sel is None else sel.tensor,
-                      count = count, gated = part_gates(gates, gate, compact, prog, once))
+                      count = count, gated = part_gates(gates, gate, compact, prog, once),
+                      frags = stacks if kept else None)

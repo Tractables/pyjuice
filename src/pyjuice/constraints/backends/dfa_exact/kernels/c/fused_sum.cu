@@ -5,11 +5,15 @@
 //   block, 32 x 32, read node-major).
 // Every chunk's shifted exponentials `e = exp(x - t)` and its maximum per column `t` are computed beforehand
 // (`_forward_prepass_kernel` / `_top_down_prepass_kernel`, in `pre_buf`, the parents' less their log Z; at TF32, e on
-// the TF32 grid already). With external parameters (BlockScale, see `..external_params.block_scale`) every (row block,
-// chunk) reads one log-scale cell s of the column's sample, from the session's scales stored sample-minor (a cell's
-// samples side by side): a chunk stages every block's scales of the tile's samples -- a range, its columns being in
-// sample order -- 16 bytes at a time, or, a range wider than the tile (samples without a column between), a scale per
-// column; forward, every node's log Z of the sample is taken off.
+// the TF32 grid already), e in the order the tensor cores read it: a chunk's 32 rows x 8 columns at a time, every
+// lane's two values of a k8 step side by side (`_frag_offsets` there), so a B fragment is one 8-byte read. At TF32
+// the weights may come the same way (FA): a copy of every 32 x 32 tile in A-fragment order, on the TF32 grid
+// (`fragment_weights`), a fragment one 16-byte read and no conversion. With external parameters (BlockScale, see
+// `..external_params.block_scale`) every (row block, chunk) reads one log-scale cell s of the column's sample, from
+// the session's scales stored sample-minor (a cell's samples side by side): a chunk stages every block's scales of
+// the tile's samples -- a range, its columns being in sample order -- 16 bytes at a time, or, a range wider than the
+// tile (samples without a column between), a scale per column; forward, every node's log Z of the sample is taken
+// off.
 //
 // Per output tile -- 4 row blocks (128 rows) x TN columns (64 to 128, the launch's), a CTA of 8 warps, a warp one
 // block's 32 rows x TN / 2 columns -- and share of the chunks (grid z): a first pass gives every (row block, column)
@@ -87,14 +91,14 @@ __device__ __forceinline__ void mma_tf32(float* c, const unsigned* a, unsigned b
 
 // A tile of TN columns: a stage of shared memory holds a chunk's weights, e, t and (external parameters) s. The
 // weights' rows are their memory's (32 floats: forward one child's nodes, top-down one child's parent nodes), padded:
-// A_LD 40 (forward: the products read a column of them), 36 (top-down: a row).
+// A_LD 40 (forward: the products read a column of them), 36 (top-down: a row) -- or (FA) a block's 1024 in fragment
+// order. e: the tile's TN / 8 groups of 8 columns, 256 floats each, in fragment order.
 template <int TN, bool TD>
 struct Tile {
     static constexpr int A_LD = TD ? 36 : 40;
-    static constexpr int B_LD = TN + 8;                // a row of a B tile (one reduction row's columns), padded
     static constexpr int J = TN / 16;                  // a warp's tiles of 8 columns
     static constexpr int SL = TN + 4;                  // a block's scales: its samples from a multiple of 4, or columns
-    static constexpr int A_ST = NBT * BS * A_LD, B_ST = BS * B_LD;
+    static constexpr int A_ST = NBT * BS * A_LD, B_ST = BS * TN;
     static constexpr int ST = A_ST + B_ST + TN + NBT * SL;
     static constexpr int SHARE = NBT * BS * TN + NBT * TN;          // a share's sums and shifts in the split buffer
     static constexpr int HEAD = 4 * TN;                             // a tile's columns (int64) and samples first
@@ -105,9 +109,11 @@ struct Args {
     float* out0;                      // forward: node_mars; TD: element_flows
     float* out1;                      // TD: node_flows (aliased sums' rows)
     const float* weights;
+    const float* wfrag;               // FA: the weights' copy in fragment order (`fragment_weights`), same offsets
     const long long* wbase;           // [blocks, chunks]: a chunk's 32 x 32 weights' first
     long long wstride;                // affine: chunk ch's at the block's first + wstride ch
-    const float* pre;                 // e[chunk row, k] at (chunk 32 + row) * pre_ld + k; the chunks' t from pre_cm on
+    const float* pre;                 // a chunk's e from chunk 32 pre_ld on, in fragment order; the chunks' t from
+                                      // pre_cm on, chunk ch's column k at ch pre_ld + k
     long long pre_ld, pre_cm;
     Idx rows, rreg, colreg, sel;      // forward: nids, nb_reg, nb_reg; TD: cb_row, cb_reg, cb_ivreg
     Idx reg_offset, reg_width, reg_first, reg_slots;
@@ -167,7 +173,7 @@ __device__ __forceinline__ void put(const Where& w, int b, long long r, long lon
 }
 
 
-template <bool EXT, bool X3, int TN, bool TD>
+template <bool EXT, bool X3, bool FA, int TN, bool TD>
 __global__ void __launch_bounds__(THREADS) fused_sum_kernel(Args a) {
     using TT = Tile<TN, TD>;
     extern __shared__ float smem[];
@@ -256,13 +262,15 @@ __global__ void __launch_bounds__(THREADS) fused_sum_kernel(Args a) {
             const int r = tid / (BS / 4), q4 = (tid % (BS / 4)) * 4;
             const bool v = w.nbs[b] >= 0;
             const long long first = !v ? 0 : a.affine ? w0[b] + (long long)ch * a.wstride : Wb[b * a.share + ch - ch0];
-            cp_async16(As + (b * BS + r) * TT::A_LD + q4, a.weights + first + r * BS + q4, v ? 16 : 0);
+            if (FA)                                     // (the copy: the tile's 1024 floats in a row)
+                cp_async16(As + b * BS * TT::A_LD + 4 * tid, a.wfrag + first + 4 * tid, v ? 16 : 0);
+            else
+                cp_async16(As + (b * BS + r) * TT::A_LD + q4, a.weights + first + r * BS + q4, v ? 16 : 0);
         }
-        for (int i = tid; i < BS * TN / 4; i += THREADS) {              // e: past the columns, zeros
-            const int k = i / (TN / 4), c4 = (i % (TN / 4)) * 4;
-            const long long pos = col0 + c4;
-            const int bytes = (int)max(0LL, min(16LL, 4 * (w.ncols - pos)));
-            cp_async16(Bs + k * TT::B_LD + c4, a.pre + ((long long)ch * BS + k) * a.pre_ld + (bytes ? pos : 0), bytes);
+        const float* ech = a.pre + (long long)ch * BS * a.pre_ld + col0 * BS;   // e: the tile's groups in a row; a
+        for (int i = tid; i < BS * TN / 4; i += THREADS) {              // copy holds one column's, zeros past them
+            const long long col = col0 + 8 * (i / 64) + (i % 16) / 2;
+            cp_async16(Bs + 4 * i, col < w.ncols ? ech + 4 * i : a.pre, col < w.ncols ? 16 : 0);
         }
         for (int i = tid; i < TN / 4; i += THREADS) {                   // t
             const long long pos = col0 + 4 * i;
@@ -384,6 +392,16 @@ __global__ void __launch_bounds__(THREADS) fused_sum_kernel(Args a) {
         #pragma unroll
         for (int k8 = 0; k8 < BS / 8; ++k8) {
             unsigned ah[2][4], al[2][4];
+            if (FA) {                                   // A in fragment order, on the TF32 grid: one 16-byte read
+                #pragma unroll
+                for (int i = 0; i < 2; ++i) {
+                    const float4 v = reinterpret_cast<const float4*>(A)[(k8 * 2 + i) * 32 + lane];
+                    ah[i][0] = __float_as_uint(v.x);
+                    ah[i][1] = __float_as_uint(v.y);
+                    ah[i][2] = __float_as_uint(v.z);
+                    ah[i][3] = __float_as_uint(v.w);
+                }
+            } else
             #pragma unroll
             for (int i = 0; i < 2; ++i) {               // A (rows r, r + 8; reduction rows kk, kk + 4)
                 const int r = i * 16 + (lane >> 2), kk = k8 * 8 + (lane & 3);
@@ -397,9 +415,9 @@ __global__ void __launch_bounds__(THREADS) fused_sum_kernel(Args a) {
                 }
             }
             #pragma unroll
-            for (int j = 0; j < TT::J; ++j) {
-                const int c = wc + j * 8 + (lane >> 2), kk = k8 * 8 + (lane & 3);
-                const float y0 = Bt[kk * TT::B_LD + c], y1 = Bt[(kk + 4) * TT::B_LD + c];
+            for (int j = 0; j < TT::J; ++j) {           // B (column wc + 8 j + lane / 4; rows kk, kk + 4): 8 bytes
+                const float2 y = reinterpret_cast<const float2*>(Bt + (wc / 8 + j) * 256 + k8 * 64)[lane];
+                const float y0 = y.x, y1 = y.y;
                 if (X3) {                               // (from zero every 8: the small terms first)
                     const unsigned bh0 = to_tf32(y0), bh1 = to_tf32(y1);
                     const unsigned bl0 = to_tf32(y0 - __uint_as_float(bh0)), bl1 = to_tf32(y1 - __uint_as_float(bh1));
@@ -530,17 +548,17 @@ __global__ void __launch_bounds__(THREADS) fused_sum_merge_kernel(Args a) {
 
 
 static size_t smem_bytes(int tn, bool td, bool ext, int share, bool affine) {
-    const int st = NBT * BS * (td ? 36 : 40) + BS * (tn + 8) + tn + NBT * (tn + 4);
+    const int st = NBT * BS * (td ? 36 : 40) + BS * tn + tn + NBT * (tn + 4);
     return (2 * st + NBT * tn) * sizeof(float) + tn * (sizeof(long long) + sizeof(int)) +
            (ext ? NBT * share * sizeof(int) + (OFF_SAMPLES + 1) * sizeof(long long) : 0) +
            (affine ? 0 : NBT * share * sizeof(long long));
 }
 
 // A kernel may take as much shared memory as a block may have (set once)
-template <bool EXT, bool X3, int TN, bool TD>
+template <bool EXT, bool X3, bool FA, int TN, bool TD>
 static const void* allowed() {
     static const void* k = [] {
-        const void* f = (const void*)fused_sum_kernel<EXT, X3, TN, TD>;
+        const void* f = (const void*)fused_sum_kernel<EXT, X3, FA, TN, TD>;
         int dev = 0, most = 0;
         cudaFuncAttributes fa;
         C10_CUDA_CHECK(cudaGetDevice(&dev));
@@ -553,11 +571,11 @@ static const void* allowed() {
     return k;
 }
 
-template <bool EXT, bool X3, int TN, bool TD>
+template <bool EXT, bool X3, bool FA, int TN, bool TD>
 static void launch(const Args& a, dim3 grid, cudaStream_t stream) {
-    allowed<EXT, X3, TN, TD>();
+    allowed<EXT, X3, FA, TN, TD>();
     const size_t bytes = smem_bytes(TN, TD, EXT, a.share, a.affine);
-    fused_sum_kernel<EXT, X3, TN, TD><<<grid, THREADS, bytes, stream>>>(a);
+    fused_sum_kernel<EXT, X3, FA, TN, TD><<<grid, THREADS, bytes, stream>>>(a);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     if (a.split > 1) {
         dim3 mgrid(grid.x, grid.y, (NBT * BS * TN + THREADS - 1) / THREADS);
@@ -566,23 +584,23 @@ static void launch(const Args& a, dim3 grid, cudaStream_t stream) {
     }
 }
 
-template <bool EXT, bool X3, bool TD>
+template <bool EXT, bool X3, bool FA, bool TD>
 static void launch_tn(const Args& a, int tn, dim3 grid, cudaStream_t stream) {
     switch (tn) {
-        case 64: return launch<EXT, X3, 64, TD>(a, grid, stream);
-        case 80: return launch<EXT, X3, 80, TD>(a, grid, stream);
-        case 96: return launch<EXT, X3, 96, TD>(a, grid, stream);
-        case 112: return launch<EXT, X3, 112, TD>(a, grid, stream);
-        case 128: return launch<EXT, X3, 128, TD>(a, grid, stream);
+        case 64: return launch<EXT, X3, FA, 64, TD>(a, grid, stream);
+        case 80: return launch<EXT, X3, FA, 80, TD>(a, grid, stream);
+        case 96: return launch<EXT, X3, FA, 96, TD>(a, grid, stream);
+        case 112: return launch<EXT, X3, FA, 112, TD>(a, grid, stream);
+        case 128: return launch<EXT, X3, FA, 128, TD>(a, grid, stream);
     }
     TORCH_CHECK(false, "tiles of 64, 80, 96, 112 or 128 columns");
 }
 
 
 // One launch of either direction: the tables as `kernels/sum.py` passes them (`_cuda_forward`, `_cuda_top_down`)
-void fused_sum_cuda(bool td, torch::Tensor out0, torch::Tensor out1, torch::Tensor weights, torch::Tensor wbase,
-                    int64_t wstride, torch::Tensor pre, int64_t pre_ld, int64_t pre_cm, torch::Tensor rows,
-                    torch::Tensor rreg, torch::Tensor colreg, torch::Tensor sel,
+void fused_sum_cuda(bool td, torch::Tensor out0, torch::Tensor out1, torch::Tensor weights, torch::Tensor wfrag,
+                    torch::Tensor wbase, int64_t wstride, torch::Tensor pre, int64_t pre_ld, int64_t pre_cm,
+                    torch::Tensor rows, torch::Tensor rreg, torch::Tensor colreg, torch::Tensor sel,
                     torch::Tensor reg_offset, torch::Tensor reg_width, torch::Tensor reg_first, torch::Tensor reg_slots,
                     torch::Tensor perm, torch::Tensor reg_perm, torch::Tensor reg_live, int64_t elem_first,
                     int64_t elem_width, torch::Tensor scales, torch::Tensor cells, int64_t sstride, torch::Tensor lz,
@@ -593,10 +611,14 @@ void fused_sum_cuda(bool td, torch::Tensor out0, torch::Tensor out1, torch::Tens
                 "outputs: fp32 on the device");
     TORCH_CHECK(wbase.scalar_type() == torch::kInt64 && cells.scalar_type() == torch::kInt32,
                 "wbase int64, cells int32");
+    const bool fa = wfrag.numel() > 0;              // (empty: the weights as they are)
+    TORCH_CHECK(!fa || (!x3 && wfrag.numel() == weights.numel()),
+                "fragment-ordered weights: TF32, as many as the weights");
     Args a;
     a.out0 = out0.data_ptr<float>();
     a.out1 = out1.data_ptr<float>();
     a.weights = weights.data_ptr<float>();
+    a.wfrag = fa ? wfrag.data_ptr<float>() : nullptr;
     a.wbase = reinterpret_cast<const long long*>(wbase.data_ptr<int64_t>());
     a.wstride = wstride;
     a.pre = pre.data_ptr<float>();
@@ -645,21 +667,62 @@ void fused_sum_cuda(bool td, torch::Tensor out0, torch::Tensor out1, torch::Tens
                 "the split buffer is too small");
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
     const int t = (int)tn;
-#define DISPATCH(E, X) \
-    if (ext == E && x3 == X) return td ? launch_tn<E, X, true>(a, t, grid, stream) : launch_tn<E, X, false>(a, t, grid, stream);
-    DISPATCH(false, false) DISPATCH(false, true) DISPATCH(true, false) DISPATCH(true, true)
+#define DISPATCH(E, X, F) if (ext == E && x3 == X && fa == F) \
+        return td ? launch_tn<E, X, F, true>(a, t, grid, stream) : launch_tn<E, X, F, false>(a, t, grid, stream);
+    DISPATCH(false, false, false) DISPATCH(false, true, false) DISPATCH(true, false, false) DISPATCH(true, true, false)
+    DISPATCH(false, false, true) DISPATCH(true, false, true)
+}
+
+
+// The TF32 weights in the order the fused sums' A fragments read them (FA): every 32 x 32 tile `wbase` names (a CTA
+// one), rounded to TF32 as the products round them (`cvt.rna`) and stored at the tile's own place in `frag`, a
+// fragment's four values side by side -- fragment (k8, i) of lane l at (2 k8 + i) 128 + 4 l: rows i 16 + l / 4 (+ 8),
+// reduction rows k8 8 + l % 4 (+ 4); a row is a node (forward, the tile's column) or a child (TD, its row)
+template <bool TD>
+__global__ void __launch_bounds__(THREADS) fragment_weights_kernel(const float* w, float* frag,
+                                                                   const long long* wbase) {
+    const long long first = wbase[blockIdx.x];
+    const int f = 4 * threadIdx.x, lane = (f >> 2) & 31, i = (f >> 7) & 1, k8 = f >> 8;
+    const int m = i * 16 + (lane >> 2), kk = k8 * 8 + (lane & 3);
+    const float* t = w + first;
+    float4 v;                                           // (q 0: m, kk; 1: m + 8, kk; 2: m, kk + 4; 3: m + 8, kk + 4)
+    v.x = __uint_as_float(to_tf32(TD ? t[m * BS + kk] : t[kk * BS + m]));
+    v.y = __uint_as_float(to_tf32(TD ? t[(m + 8) * BS + kk] : t[kk * BS + m + 8]));
+    v.z = __uint_as_float(to_tf32(TD ? t[m * BS + kk + 4] : t[(kk + 4) * BS + m]));
+    v.w = __uint_as_float(to_tf32(TD ? t[(m + 8) * BS + kk + 4] : t[(kk + 4) * BS + m + 8]));
+    reinterpret_cast<float4*>(frag + first)[threadIdx.x] = v;
+}
+
+void fragment_weights(torch::Tensor weights, torch::Tensor frag, torch::Tensor wbase, bool td) {
+    TORCH_CHECK(weights.scalar_type() == torch::kFloat32 && frag.scalar_type() == torch::kFloat32 &&
+                frag.numel() == weights.numel() && wbase.scalar_type() == torch::kInt64 && wbase.is_contiguous(),
+                "fp32 weights and their copy, int64 firsts");
+    const long long n = wbase.numel();
+    TORCH_CHECK(n < (1LL << 31), "at most 2^31 - 1 tiles");
+    if (n == 0) return;
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    const long long* wb = reinterpret_cast<const long long*>(wbase.data_ptr<int64_t>());
+    const float* w = weights.data_ptr<float>();
+    float* f = frag.data_ptr<float>();
+    if (td)
+        fragment_weights_kernel<true><<<(unsigned)n, THREADS, 0, stream>>>(w, f, wb);
+    else
+        fragment_weights_kernel<false><<<(unsigned)n, THREADS, 0, stream>>>(w, f, wb);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 
 // How many CTAs of a direction's kernel an SM holds at once (for the split's waves)
-int64_t ctas_per_sm(bool td, bool ext, bool x3, int64_t tn, int64_t share, bool affine) {
+int64_t ctas_per_sm(bool td, bool ext, bool x3, bool fa, int64_t tn, int64_t share, bool affine) {
     const size_t bytes = smem_bytes((int)tn, td, ext, (int)share, affine);
     const void* k = nullptr;
-#define K_OF(T, E, X, N) if (td == T && ext == E && x3 == X && tn == N) k = allowed<E, X, N, T>();
-#define K_TN(T, E, X) K_OF(T, E, X, 64) K_OF(T, E, X, 80) K_OF(T, E, X, 96) K_OF(T, E, X, 112) K_OF(T, E, X, 128)
-    K_TN(false, false, false) K_TN(false, false, true) K_TN(false, true, false) K_TN(false, true, true)
-    K_TN(true, false, false) K_TN(true, false, true) K_TN(true, true, false) K_TN(true, true, true)
-    TORCH_CHECK(k != nullptr, "tiles of 64, 80, 96, 112 or 128 columns");
+#define K_OF(T, E, X, F, N) if (td == T && ext == E && x3 == X && fa == F && tn == N) k = allowed<E, X, F, N, T>();
+#define K_TN(T, E, X, F) \
+    K_OF(T, E, X, F, 64) K_OF(T, E, X, F, 80) K_OF(T, E, X, F, 96) K_OF(T, E, X, F, 112) K_OF(T, E, X, F, 128)
+#define K_TD(T) K_TN(T, false, false, false) K_TN(T, false, true, false) K_TN(T, true, false, false) \
+    K_TN(T, true, true, false) K_TN(T, false, false, true) K_TN(T, true, false, true)
+    K_TD(false) K_TD(true)
+    TORCH_CHECK(k != nullptr, "tiles of 64, 80, 96, 112 or 128 columns (fragment-ordered weights: TF32)");
     int n = 0;
     C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, k, THREADS, bytes));
     return n;
@@ -692,6 +755,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fused_sum_cuda", &fused_sum_cuda,
           "a fused sum launch (forward, or top-down) of blocks of 32 over the same chunks, from the pre-pass's");
     m.def("ctas_per_sm", &ctas_per_sm, "how many CTAs of a direction's kernel an SM holds at once");
+    m.def("fragment_weights", &fragment_weights, "the weights' tiles a launch reads, in its A-fragment order at TF32");
     m.def("liveness_fits", &liveness_fits, "whether the shared-memory liveness sweep takes an automaton");
     m.def("liveness_cuda", &liveness_cuda, "the liveness sweep, one CTA per sample in shared memory");
     m.def("ibtd_cuda", &ibtd_cuda, "an input @ block top-down launch on compact values, a sample's live terms");

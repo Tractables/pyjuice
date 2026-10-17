@@ -8,7 +8,8 @@ inputs; dense storage (pruned columns) and compact (lanes); fp32 and TF32 produc
 the circuit's own; batches whose columns fill no tile, tiles of 64 to 128 columns; launches split in shares of one
 chunk (the merge kernel) or not; the weights' first entries read from a table (as when a block's weights are not one
 run) or not; every launch's blocks given as an index list, last first, or not; copies of sums (the top-down's aliased
-rows). At TF32 its products round to nearest: marginals stay near the float64 reference over 16 layers.
+rows). At TF32 its products round to nearest: marginals stay near the float64 reference over 16 layers; inside a scope
+that allows parameter copies they read the weights from copies in the kernel's fragment order, with the same results.
 """
 import inspect
 
@@ -29,8 +30,8 @@ N = 5
 DEV = torch.device("cuda:0")
 
 
-def circuit(latents: int, external: bool, gate_sums):
-    torch.manual_seed(0)
+def circuit(latents: int, external: bool, gate_sums, seed = 0):
+    torch.manual_seed(seed)
     ns = juice.structures.GeneralizedHMM(seq_length = N, num_latents = latents, block_size = 32,
                                          input_dist = dists.SoftEvidenceCategorical(num_cats = V))
     if external:
@@ -69,19 +70,20 @@ def inputs(pc, B: int, external: str, seed = 0, n = N):
     return kw
 
 
-def calls(cc, B, kw, precision, storage, n = N):
-    """A decoder's marginals and conditionals left to right, then a fresh decoder's of other evidence."""
+def calls(cc, B, kw, precision, storage, n = N, **options):
+    """A decoder's marginals and conditionals left to right, then a fresh decoder's of other evidence (``options``:
+    the decoders' others)."""
     g = torch.Generator().manual_seed(1)
     data = torch.randint(0, V, (B, n), generator = g).to(DEV)
     out = []
-    with cc.decoder(precision = precision, storage = storage, **kw) as decoder:
+    with cc.decoder(precision = precision, storage = storage, **kw, **options) as decoder:
         for t in range(n):
             missing = torch.arange(n, device = DEV)[None, :].expand(B, n) >= t
             out.append(decoder.marginal(data, missing))
             out.append(decoder.conditional(data, missing, targets = [t]))
     missing = torch.rand(B, n, generator = g).to(DEV) < 0.5
     for query in ("marginal", "conditional"):                           # (a session's first call holds nothing)
-        with cc.decoder(precision = precision, storage = storage, **kw) as decoder:
+        with cc.decoder(precision = precision, storage = storage, **kw, **options) as decoder:
             out.append(getattr(decoder, query)(data, missing))
     return out
 
@@ -157,7 +159,8 @@ def test_the_cuda_sums_are_the_triton_kernels(latents, B, external, storage, pre
         monkeypatch.setattr(lifted_sum, "SPLIT_MIN_SHARE", 1)           # shares of a chunk
     got = calls(cc, B, kw, precision, storage)
     for ps in (plans, td_plans):                                        # (shares)
-        assert ps and (any(p[3] > 1 for p in ps) if split else all(p[3] == 1 for p in ps)), [p[2:] for p in ps]
+        assert ps and (any(p[3] > 1 for p in ps) if split else all(p[3] == 1 for p in ps)), [p[2:4] for p in ps]
+    assert all((p[4] is not None) == (precision == "tf32") for p in plans + td_plans)   # (fragment-ordered weights)
     monkeypatch.setattr(lifted_sum, "SPLIT_MIN_SHARE", 8)
     monkeypatch.setattr(lifted_sum, "CUDA_MIN_TILES", 1 << 40)          # none
     want = calls(cc, B, kw, precision, storage)
@@ -191,6 +194,68 @@ def test_the_cuda_top_down_writes_aliased_rows(external, storage, precision, spl
     monkeypatch.setattr(lifted_sum, "CUDA_MIN_TILES", 1 << 40)
     want = calls(cc, B, kw, precision, storage, n = n)
     assert_same(got, want, precision)
+
+
+@pytest.mark.parametrize("external", ["none", "per_sample"])
+def test_the_weights_in_fragment_order(external, gate_sums, set_split, monkeypatch):
+    """At TF32, in a decoder session that allows parameter copies (the default), the CUDA kernel reads the weights in
+    its fragment order from copies (``_cuda_fragments``, one per direction): built by the session's first launch of
+    every part, dropped when the session ends -- an in-place parameter update after it is read -- and the only weights
+    the launches read (a copy of zeros: forward, every marginal -inf; top-down, the marginals as they were and other
+    conditionals). Its products are those of the same TF32 operands in the same order: every result bit-identical to
+    the kernel reading the weights themselves (no copies)."""
+    mod = get_module()
+    if mod is None:
+        pytest.skip("the CUDA extension is unavailable")
+    B = 5
+    pc = circuit(128, external != "none", gate_sums)
+    cc = jc.compile(jc.DFA.contains([[1, 2]], V) & jc.Not(jc.DFA.contains([[2, 2]], V)), pc)
+    kw = inputs(pc, B, external)
+    monkeypatch.setattr(lifted_sum, "CUDA_MIN_TILES", 0)
+    set_split("off")                                    # (a split follows the kernels' occupancy, which may differ)
+    plans, td_plans = recorded_plans(monkeypatch)
+    builds = []
+    fragment_weights = mod.fragment_weights
+    monkeypatch.setattr(mod, "fragment_weights", lambda *a: builds.append((id(a[2]), a[3])) or fragment_weights(*a))
+    same = lambda a, b: all(torch.equal(x, y) for x, y in zip(a, b)) and len(a) == len(b)
+
+    want = calls(cc, B, kw, "tf32", "dense", allow_param_copy = False)
+    assert plans and td_plans and all(p[4] is None for p in plans + td_plans) and not builds
+    plans.clear(), td_plans.clear()
+    assert same(calls(cc, B, kw, "tf32", "dense"), want)
+    assert all(p[4] is not None for p in plans + td_plans) and cc.backend.state._kept_stacks is None
+
+    g = torch.Generator().manual_seed(2)
+    data = torch.randint(0, V, (B, N), generator = g).to(DEV)
+    missing = [torch.rand(B, N, generator = g).to(DEV) < 0.5 for _ in range(2)]
+    builds.clear()
+    with cc.decoder(precision = "tf32", **kw) as decoder:               # copied once a session
+        decoder.conditional(data, missing[0])
+        first = list(builds)
+        decoder.conditional(data, missing[1])                           # (other evidence: every launch again)
+    assert {td for _, td in first} == {False, True} and len(set(first)) == len(first) and builds == first
+
+    with torch.no_grad():                                               # an in-place update between sessions
+        pc.params.copy_(circuit(128, external != "none", gate_sums, seed = 1).params)
+    updated = calls(cc, B, kw, "tf32", "dense", allow_param_copy = False)
+    assert not same(updated, want)
+    assert same(calls(cc, B, kw, "tf32", "dense"), updated)
+
+    def queries():
+        with cc.decoder(precision = "tf32", **kw) as decoder:
+            marginal = decoder.marginal(data, missing[0])
+        with cc.decoder(precision = "tf32", **kw) as decoder:
+            return marginal, decoder.conditional(data, missing[0])
+
+    marginal, conditional = queries()
+    assert torch.isfinite(marginal).any()
+    real = lifted_sum._cuda_fragments
+    for zeroed in (False, True):                                        # forward, top-down
+        monkeypatch.setattr(lifted_sum, "_cuda_fragments", lambda mod, frags, params, wbase, td:
+                            real(mod, frags, params, wbase, td) * (0.0 if td == zeroed else 1.0))
+        m, c = queries()
+        assert torch.isneginf(m).all() if not zeroed else torch.equal(m, marginal)
+        assert not torch.equal(c, conditional)
 
 
 def test_tf32_products_round_to_nearest(reference, monkeypatch):
