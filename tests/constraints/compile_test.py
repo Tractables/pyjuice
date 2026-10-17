@@ -143,6 +143,19 @@ def test_text_constraints_widen_to_the_pcs_vocabulary():
     assert f"vocab_size {V - 1}" in refusal(jc.DFA.contains([[1, 2]], vocab_size = V - 1), pc)
 
 
+def test_an_ltlf_widens_to_the_pcs_vocabulary():
+    """An LTLf over fewer ids than the PC's inputs range over compiles over the PC's vocabulary, the extra id in no
+    atom: the same constraint as the LTLf over all ids, the same marginals."""
+    pc = hmm(4).to("cuda")
+    formula = "G(a -> X[!] !a) & F b"
+    cc = jc.compile(jc.LTLf(formula, {"a": [0], "b": [1, 2]}, V - 1), pc)
+    wide = jc.LTLf(formula, {"a": [0], "b": [1, 2]}, V)
+    assert cc.constraint.vocab_size == V and cc.constraint == wide
+    x = torch.zeros(2, 4, dtype = torch.long, device = "cuda")
+    missing = torch.ones(2, 4, dtype = torch.bool, device = "cuda")
+    assert torch.equal(cc.marginal(x, missing), jc.compile(wide, pc).marginal(x, missing))
+
+
 def test_a_constraint_without_an_automaton_is_refused():
     msg = refusal(OnlyAccepts(V), hmm(6))
     assert "no `automaton` capability" in msg and "it supports: accepts" in msg

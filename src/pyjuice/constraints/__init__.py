@@ -13,6 +13,8 @@ The package is conventionally imported as ``jc``::
     c = jc.DFA.contains([[3, 7]], vocab_size = V) & ~jc.DFA.contains([[5]], vocab_size = V)
     # or on the text the tokens spell, read from a tokenizer: the text is a date (`pip install pyjuice[constraints]`)
     #   c = jc.Regex(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", tokenizer)
+    # or in temporal logic over sets of token ids: never `good` right after `neg`, and `end` eventually
+    #   c = jc.LTLf("G(neg -> X !good) & F end", {"neg": [...], "good": [...], "end": [...]}, vocab_size = V)
     cc = jc.compile(c, pc)      # a ConstrainedCircuit: pc under c, valid across parameter updates
 
     # decoding x ([batch, 12] token ids): the circuit's queries in a session that reuses work between them (with a
@@ -23,7 +25,7 @@ The package is conventionally imported as ``jc``::
 """
 
 from .language import (Constraint, Matcher, And, Or, Not, Concat, OPTIONAL_CAPABILITIES, DFA, DFAMatcher, Vocabulary,
-                       Regex, JSONSchema)
+                       Regex, JSONSchema, LTLf)
 from .compiler import compile
 from .errors import ConstraintCompileError
 from .constrained_circuit import ConstrainedCircuit
