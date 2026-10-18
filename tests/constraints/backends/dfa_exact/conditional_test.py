@@ -302,6 +302,30 @@ def test_class_weights_walk_every_samples_own_live_columns(kind, storage, one_sa
     assert any(torch.isfinite(w).any() for w in together)
 
 
+@pytest.mark.parametrize("storage", ["dense", "compact"])
+@pytest.mark.parametrize("pattern", ["none", "prefix", "mixed"])
+@pytest.mark.parametrize("name", ["contains", "either", "avoids"])
+@pytest.mark.parametrize("kind", ["hmm", "hmm_block_sparse", "hand_left", "left_linear", "pd"])
+def test_the_two_class_weight_walks_give_the_same_bits(kind, name, pattern, storage, build_pc, monkeypatch):
+    """The class weights walked over every class's own columns, and over the sample's columns (every one, or its live
+    ones under evidence pruning): the same terms in the same order -- bit for bit; and the kernel's own choice is one
+    of the two."""
+    n = KINDS[kind]
+    cc = jc.compile(CONSTRAINTS[name](), build_pc(kind, n, V))
+    data, missing = evidence(pattern, n)
+    positions = missing.any(dim = 0).numpy()
+    dev = cc.pc.params.device
+    out = {}
+    for walk in (1, 2, 0):
+        monkeypatch.setattr(S, "CLASS_WEIGHT_WALK", walk)
+        with torch.no_grad():
+            out[walk] = [w.clone() for _, _, w in class_weights(cc.backend, data, missing.to(dev), positions,
+                                                                 storage = storage)[0]]
+    assert any(torch.isfinite(w).any() for w in out[1])
+    for a, b, c in zip(out[1], out[2], out[0]):
+        assert torch.equal(a, b) and torch.equal(a, c)
+
+
 def test_targets(build_pc, reference):
     """Targets as a [n] mask and a [B, n] subset of the missing positions: the reference's rows for them, in the
     order ``dense[targets]``; a target that is observed raises."""
