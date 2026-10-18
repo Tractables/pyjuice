@@ -802,6 +802,55 @@ def test_a_session_against_float64(kind, mode, storage, precision):
     check_against_reference(cc, ref, data, masks, inputs, storage, precision)
 
 
+def enumerating_case(kind, seed = 0):
+    """:func:`small_case`'s circuit under an automaton most of whose classes are one token each -- ``1 2`` or ``3 4``
+    appears, ``0 0`` never --, which the backend enumerates: no column in the class-mass tables, their masses read
+    from their tokens' probabilities (see :class:`~pyjuice.constraints.distributions.TokenClasses`)."""
+    cfg = SMALL[kind]
+    pc, _, data, _ = small_case(kind, seed)
+    V = cfg["V"]
+    dfa = (jc.DFA.contains([[1, 2], [3, 4]], V) & ~jc.DFA.contains([[0, 0]], V)).automaton()
+    data[:, 2:4] = torch.tensor([1, 2])
+    inputs = soft_inputs(pc, data.size(0), data.size(1), V, K = cfg["K"], seed = seed, data = data) \
+        if kind == "codpula" else None
+    return pc, dfa, data, inputs
+
+
+@pytest.mark.parametrize("storage", ["dense", "compact"])
+@pytest.mark.parametrize("mode", ["diffusion", "l2r"])
+@pytest.mark.parametrize("kind", ["codpula", "pd"])
+def test_a_session_with_enumerated_classes_against_float64(kind, mode, storage):
+    """:func:`test_a_session_against_float64` (fp32) where the backend enumerates the automaton's one-token
+    classes."""
+    pc, dfa, data, inputs = enumerating_case(kind)
+    cc = jc.compile(dfa, pc)
+    assert cc.backend.token_classes.num_enumerated > 0
+    ref = Float64Reference(pc, dfa, data.size(1))
+    check_against_reference(cc, ref, data, schedule(mode, data.size(0), data.size(1)), inputs, storage, "fp32")
+
+
+@pytest.mark.parametrize("mode", ["diffusion", "l2r"])
+def test_enumerated_scores_under_class_weights_beyond_fp32_exp(mode):
+    """:func:`enumerating_case`'s PD (its 4 rows not a multiple of the scoring's row tile) with the data's filler
+    tokens (4, 5) improbable under every input node, ``e^-40`` or so: the target positions' class weights fall far
+    below -88 nats once a few are observed, where an exponential shifted by them overflows fp32 -- the scores and log
+    marginals against the float64 reference, finite where it is."""
+    pc, dfa, data, _ = enumerating_case("pd")
+    g = torch.Generator().manual_seed(3)
+    with torch.no_grad():
+        for layer in pc.input_layer_group:
+            table = layer.params.view(-1, SMALL["pd"]["V"])
+            logits = torch.randn(table.shape, generator = g) * 2
+            logits[:, 4:] -= 40
+            table.copy_(torch.softmax(logits, dim = 1).to(table.device))
+    cc = jc.compile(dfa, pc)
+    ref = Float64Reference(pc, dfa, data.size(1))
+    masks = schedule(mode, data.size(0), data.size(1))
+    lm, _ = ref.conditionals(data, masks[-1][1], None)
+    assert float(lm.max()) < -88                                            # (the regime it is about)
+    check_against_reference(cc, ref, data, masks, None, "dense", "fp32")
+
+
 @pytest.mark.parametrize("kind", ["codpula", "pd"])
 def test_the_invariants(kind):
     """The invariants of the module docstring on a diffusion session's calls 0, 1 and 3."""

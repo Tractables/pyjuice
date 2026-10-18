@@ -658,7 +658,8 @@ def _log_dot(trow, wrow, nodes_t, mrow, mstride, lognorm, b, ok, enum, K, BH: tl
                     e = tl.exp(a - lz[None, :] - s[:, None])
                 else:
                     e = tl.exp(a - s[:, None])
-                acc += tl.sum(tv * tl.where(enum[:, None], e, a), axis = 1)
+                acc += tl.sum(tv * tl.where(enum[:, None] & mk, e, a), axis = 1)   # (a row past K adds its 0:
+                                                       # exp(0 - s) is inf for a lane's shift below -88, 0 x inf NaN)
         else:
             acc = _plain_dot(trow, wrow, ok, K, BH, EVEN_K)
     else:
