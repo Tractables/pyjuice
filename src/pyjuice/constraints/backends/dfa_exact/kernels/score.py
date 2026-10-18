@@ -433,36 +433,30 @@ def _column_rows(nodes, mrow, mstride, b, ks, km, STRIDE: tl.constexpr):
 
 
 @triton_jit
-def _score_weights_kernel(w, class_mars, rows, nodes, positions, mrow, mstride, lognorm, shift, zc, part, code, C, K, B,
-                          KS, Cs, TC: tl.constexpr, TK: tl.constexpr, PER_COLUMN: tl.constexpr, STRIDE: tl.constexpr,
-                          SHARES: tl.constexpr, FINISH: tl.constexpr, ENUM: tl.constexpr):
-    """One program per (column ``n``, tile of ``TC`` classes, share ``s`` of the rows ``[s KS, (s + 1) KS)``) of a row
-    group's log class weights ``w`` [N, C, K]: ``shift[n, c]``, the maximum over the rows of the class's weights
-    (``PER_COLUMN``, the class masses of each column's own, see :class:`~..state.ClassMasses`: less the row's
-    ``lognorm`` -- a token's own weight ``q(v) = p(v) w(v) / Z`` is ``p(v)``'s times ``w(v) / Z``), the weights
-    shifted by it and exponentiated in place, and ``zc[n, c] = log sum_k exp(w[n, c, k] + mass_k(c))``, the class's
-    part of ``p(e, C)``, for the STORED classes -- their mass at row ``k`` from the table, by the class's code at the
-    column's position (``code[t, c]``, ``ENUM``; else the class itself); -inf for an enumerated class, whose part is
-    its token's score (see :func:`_score_tokens_kernel`, :func:`_logz_kernel`). Column ``n`` is sample ``n % B`` of
-    position ``positions[n // B]``, whose input nodes are that row of ``nodes`` ([positions of the PC, K]): node ``u``
-    reads row ``mrow[u] + b mstride[u]`` (``STRIDE``; else ``mrow[u]``) of the masses; without per-column masses every
-    column reads ``rows``. One share (``SHARES`` 1): all of it. Several: the shares' maxima, running maxima and sums into
-    ``part`` ([N, class tiles, SHARES, 3, TC]), then (``FINISH``, a second launch) every share combines them in order
-    and writes its rows."""
+def _score_weights_kernel(w, class_mars, rows, nodes, positions, mrow, mstride, lognorm, shift, zc, part, class_of_stored,
+                          C, K, B, KS, Cs, TC: tl.constexpr, TK: tl.constexpr, PER_COLUMN: tl.constexpr,
+                          STRIDE: tl.constexpr, SHARES: tl.constexpr, FINISH: tl.constexpr):
+    """One program per (column ``n``, tile of ``TC`` STORED classes, share ``s`` of the rows ``[s KS, (s + 1) KS)``) of a
+    row group's log class weights ``w`` [N, C, K] -- an enumerated class's weights are left as they are: its token's
+    dot takes them in log (:func:`_log_dot`). For stored column ``x`` (class ``class_of_stored[x]``): ``shift[n, c]``,
+    the maximum over the rows of the class's weights (``PER_COLUMN``, the class masses of each column's own, see
+    :class:`~..state.ClassMasses`: less the row's ``lognorm`` -- a token's own weight ``q(v) = p(v) w(v) / Z`` is
+    ``p(v)``'s times ``w(v) / Z``), the weights shifted by it and exponentiated in place, and ``zc[n, x] = log sum_k
+    exp(w[n, c, k] + mass_k(c))``, the class's part of ``p(e, C)``, from the mass table. Column ``n`` is sample ``n %
+    B`` of position ``positions[n // B]``, whose input nodes are that row of ``nodes`` ([positions of the PC, K]):
+    node ``u`` reads row ``mrow[u] + b mstride[u]`` (``STRIDE``; else ``mrow[u]``) of the masses; without per-column
+    masses every column reads ``rows``. One share (``SHARES`` 1): all of it. Several: the shares' maxima, running
+    maxima and sums into ``part`` ([N, class tiles, SHARES, 3, TC]), then (``FINISH``, a second launch) every share
+    combines them in order and writes its rows."""
     n = tl.program_id(0).to(tl.int64)
     ct = tl.program_id(1)
     sh_ = tl.program_id(2)
-    cs = ct * TC + tl.arange(0, TC)
-    cm = cs < C
+    xs = ct * TC + tl.arange(0, TC)
+    cm = xs < Cs
+    cs = tl.load(class_of_stored + xs, mask = cm, other = 0).to(tl.int64)
     base = w + n * C * K
     t = tl.load(positions + n // B)
     b = n % B
-    if ENUM:
-        xs = tl.load(code + t * C + cs, mask = cm, other = -1)
-    else:
-        xs = tl.where(cm, cs, -1)
-    stored = cm & (xs >= 0)
-    xs = tl.maximum(xs, 0)
     k_lo = sh_ * KS
     k_hi = tl.minimum(K, k_lo + KS)
     if not FINISH:
@@ -480,8 +474,7 @@ def _score_weights_kernel(w, class_mars, rows, nodes, positions, mrow, mstride, 
                 lz = tl.zeros([TK], dtype = tl.float32)
             mk = cm[:, None] & km[None, :]
             v = tl.load(base + cs[:, None] * K + ks[None, :], mask = mk, other = float("-inf"))          # [TC, TK]
-            x = v + tl.load(class_mars + r[None, :] * Cs + xs[:, None], mask = km[None, :] & stored[:, None],
-                            other = float("-inf"))
+            x = v + tl.load(class_mars + r[None, :] * Cs + xs[:, None], mask = mk, other = float("-inf"))
             mr = tl.max(x, axis = 1)                     # (selects, not maxima: Triton's thread-locality pass asserts
             m_new = tl.where(mr > mz, mr, mz)            # on a reduction accumulated by max whose result has several
             sh = tl.where(m_new == float("-inf"), 0.0, m_new)                             # uses after the loop)
@@ -490,7 +483,7 @@ def _score_weights_kernel(w, class_mars, rows, nodes, positions, mrow, mstride, 
             br = tl.max(v - lz[None, :], axis = 1)
             big = tl.where(br > big, br, big)
         if SHARES > 1:
-            out = part + (((n * tl.num_programs(1) + ct) * SHARES + sh_) * 3) * TC + cs
+            out = part + (((n * tl.num_programs(1) + ct) * SHARES + sh_) * 3) * TC + tl.arange(0, TC)
             tl.store(out, big)
             tl.store(out + TC, mz)
             tl.store(out + 2 * TC, az)
@@ -499,18 +492,17 @@ def _score_weights_kernel(w, class_mars, rows, nodes, positions, mrow, mstride, 
         big = tl.full([TC], float("-inf"), dtype = tl.float32)
         mz = tl.full([TC], float("-inf"), dtype = tl.float32)
         for j in range(SHARES):                                             # (in order: the same in every share)
-            src = part + (((n * tl.num_programs(1) + ct) * SHARES + j) * 3) * TC + cs
+            src = part + (((n * tl.num_programs(1) + ct) * SHARES + j) * 3) * TC + tl.arange(0, TC)
             big = tl.maximum(big, tl.load(src))
             mz = tl.maximum(mz, tl.load(src + TC))
         zs0 = tl.where(mz == float("-inf"), 0.0, mz)
         az = tl.zeros([TC], dtype = tl.float32)
         for j in range(SHARES):
-            src = part + (((n * tl.num_programs(1) + ct) * SHARES + j) * 3) * TC + cs
+            src = part + (((n * tl.num_programs(1) + ct) * SHARES + j) * 3) * TC + tl.arange(0, TC)
             az += tl.load(src + 2 * TC) * tl.exp(tl.load(src + TC) - zs0)
     if sh_ == 0:
         tl.store(shift + n * C + cs, big, mask = cm)
-        tl.store(zc + n * C + cs, tl.log(az) + tl.where(mz == float("-inf"), 0.0, mz), mask = cm)   # (enumerated:
-                                                                                                    # log 0 = -inf)
+        tl.store(zc + n * Cs + xs, tl.log(az) + tl.where(mz == float("-inf"), 0.0, mz), mask = cm)
     s = tl.where(big == float("-inf"), 0.0, big)
     for k0 in range(k_lo, k_hi, TK):
         ks = k0 + tl.arange(0, TK)
@@ -531,18 +523,81 @@ def _score_weights_kernel(w, class_mars, rows, nodes, positions, mrow, mstride, 
 SCORE_SHARE_ROWS = 256
 
 
+@triton.jit
+def _plain_dot(trow, wrow, ok, K, BH: tl.constexpr, EVEN_K: tl.constexpr):
+    """``sum_k T[v, k] a[k]`` of ``BV`` lanes, over the lanes' rows of the table (``trow`` [BV, 1] pointers) and
+    their exponentiated weights (``wrow``), in fp32; ``ok`` the lanes on; ``EVEN_K``: ``BH`` divides ``K``."""
+    acc = tl.zeros([trow.shape[0]], dtype = tl.float32)
+    for k0 in range(0, K, BH):
+        ks = k0 + tl.arange(0, BH)
+        if EVEN_K:
+            mk = ok[:, None]
+        else:
+            mk = ok[:, None] & (ks < K)[None, :]
+        tv = tl.load(trow + ks[None, :], mask = mk, other = 0.0).to(tl.float32)                     # [BV, BH]
+        a = tl.load(wrow + ks[None, :], mask = mk, other = 0.0)                                     # [BV, BH]
+        acc += tl.sum(tv * a, axis = 1)
+    return acc
+
+
+@triton.jit
+def _log_dot(trow, wrow, nodes_t, mrow, mstride, lognorm, b, ok, enum, K, BH: tl.constexpr, EVEN_K: tl.constexpr,
+             ENUM: tl.constexpr, PER_COLUMN: tl.constexpr, STRIDE: tl.constexpr):
+    """``(dot, shift)`` of ``BV`` lanes: ``sum_k T[v, k] a[k]`` over the lanes' rows of the table (``trow`` [BV, 1]
+    pointers) and weights (``wrow``) -- the weights as :func:`_score_weights_kernel` left them, exponentiated, for a
+    stored class's lane (:func:`_plain_dot`); ``enum`` (``ENUM``: some class is enumerated), an enumerated class's:
+    in log, so the lane first takes their maximum (less the rows' ``lognorm`` under per-column masses,
+    ``PER_COLUMN``; the rows of the column's position's input nodes ``nodes_t``, see :func:`_column_rows`) as its
+    shift, then exponentiates them under it as the dot goes -- a program without such a lane takes the plain dot.
+    The dot in fp32; ``ok`` the lanes on; ``EVEN_K``: ``BH`` divides ``K``."""
+    m = tl.full([trow.shape[0]], float("-inf"), dtype = tl.float32)
+    if ENUM:
+        if tl.max(tl.where(enum, 1, 0), axis = 0) > 0:
+            for k0 in range(0, K, BH):
+                ks = k0 + tl.arange(0, BH)
+                km = ks < K
+                a = tl.load(wrow + ks[None, :], mask = enum[:, None] & km[None, :], other = float("-inf"))
+                if PER_COLUMN:
+                    a = a - tl.load(lognorm + _column_rows(nodes_t, mrow, mstride, b, ks, km, STRIDE), mask = km,
+                                    other = 0.0)[None, :]
+                mr = tl.max(a, axis = 1)
+                m = tl.where(mr > m, mr, m)                      # (a select: see _score_weights_kernel)
+            s = tl.where(m == float("-inf"), 0.0, m)
+            acc = tl.zeros([trow.shape[0]], dtype = tl.float32)
+            for k0 in range(0, K, BH):
+                ks = k0 + tl.arange(0, BH)
+                if EVEN_K:
+                    mk = ok[:, None]
+                else:
+                    mk = ok[:, None] & (ks < K)[None, :]
+                tv = tl.load(trow + ks[None, :], mask = mk, other = 0.0).to(tl.float32)             # [BV, BH]
+                a = tl.load(wrow + ks[None, :], mask = mk, other = 0.0)                             # [BV, BH]
+                if PER_COLUMN:
+                    lz = tl.load(lognorm + _column_rows(nodes_t, mrow, mstride, b, ks, ks < K, STRIDE),
+                                 mask = ks < K, other = 0.0)
+                    e = tl.exp(a - lz[None, :] - s[:, None])
+                else:
+                    e = tl.exp(a - s[:, None])
+                acc += tl.sum(tv * tl.where(enum[:, None], e, a), axis = 1)
+        else:
+            acc = _plain_dot(trow, wrow, ok, K, BH, EVEN_K)
+    else:
+        acc = _plain_dot(trow, wrow, ok, K, BH, EVEN_K)
+    return acc, m
+
+
 @triton_jit
-def _score_tokens_kernel(table, w, shift, enum_tokens, token_class, code, tok_ptr, enum_logw, positions, out_row, out,
-                         uz, N, K, V, C, B, E, logw_stride, BV: tl.constexpr, BH: tl.constexpr, EVEN_K: tl.constexpr,
-                         LOGW: tl.constexpr, WRITE: tl.constexpr):
+def _score_tokens_kernel(table, w, enum_tokens, token_class, code, tok_ptr, enum_logw, positions, nodes, mrow, mstride,
+                         lognorm, out_row, out, uz, N, K, V, C, B, E, logw_stride, BV: tl.constexpr, BH: tl.constexpr,
+                         EVEN_K: tl.constexpr, LOGW: tl.constexpr, WRITE: tl.constexpr, PER_COLUMN: tl.constexpr,
+                         STRIDE: tl.constexpr):
     """One program per (column ``n``, tile of ``BV`` of the ``E`` enumerated classes' tokens): ``u_v = log sum_k T[v, k]
-    w[n, c(v), k] + shift[n, c(v)]`` -- ``LOGW``: plus the token's log-weight for the column's sample, ``enum_logw[b,
-    tok_ptr[t] + e]``, ``e`` its number among the live enumerated tokens of the column's position ``t`` (from its
-    class's code); a token weighing nothing, or of a class dead at ``t``, -inf, its dot skipped -- the token's
-    UNNORMALIZED log score, into ``out[out_row[n], v]`` (``WRITE``; ``out`` [M, V]), and ``uz[n, tile] = log sum_v
-    exp(u_v)`` over the tile: the tokens' part of ``p(e, C)`` (see :func:`_logz_kernel`). The weights as
-    :func:`_score_weights_kernel` leaves them, the dot in fp32. Columns of no row (``out_row[n]`` -1): -inf, nothing
-    written."""
+    exp(w[n, c(v), k])`` (:func:`_log_dot`) -- ``LOGW``: plus the token's log-weight for the column's sample,
+    ``enum_logw[b, tok_ptr[t] + e]``, ``e`` its number among the live enumerated tokens of the column's position ``t``
+    (from its class's code); a token weighing nothing, or of a class dead at ``t``, -inf, its dot skipped -- the
+    token's UNNORMALIZED log score, into ``out[out_row[n], v]`` (``WRITE``; ``out`` [M, V]), and ``uz[n, tile] = log
+    sum_v exp(u_v)`` over the tile: the tokens' part of ``p(e, C)`` (see :func:`_logz_kernel`). Columns of no row
+    (``out_row[n]`` -1): -inf, nothing written."""
     n = tl.program_id(0).to(tl.int64)
     tile = tl.program_id(1)
     es = tile * BV + tl.arange(0, BV)
@@ -561,20 +616,9 @@ def _score_tokens_kernel(table, w, shift, enum_tokens, token_class, code, tok_pt
     else:
         lw = tl.where(live, 0.0, float("-inf"))
     ok = lw > float("-inf")
-    trow = table + tk[:, None] * K                                            # [BV, 1]: every token's row
-    wrow = w + (n * C + c)[:, None] * K                                       # [BV, 1]: its class's weights
-    acc = tl.zeros([BV], dtype = tl.float32)
-    for k0 in range(0, K, BH):
-        ks = k0 + tl.arange(0, BH)
-        if EVEN_K:
-            m = ok[:, None]
-        else:
-            m = ok[:, None] & (ks < K)[None, :]
-        tv = tl.load(trow + ks[None, :], mask = m, other = 0.0).to(tl.float32)                      # [BV, BH]
-        a = tl.load(wrow + ks[None, :], mask = m, other = 0.0)                                      # [BV, BH]
-        acc += tl.sum(tv * a, axis = 1)
-    sc = tl.load(shift + n * C + c, mask = ok, other = 0.0)
-    u = tl.where(ok, tl.log(acc) + sc + lw, float("-inf"))
+    acc, m = _log_dot(table + tk[:, None] * K, w + (n * C + c)[:, None] * K, nodes + t * K, mrow, mstride, lognorm, b,
+                      ok, ok, K, BH, EVEN_K, True, PER_COLUMN, STRIDE)
+    u = tl.where(ok, tl.log(acc) + m + lw, float("-inf"))
     top = tl.max(u, axis = 0)
     s = tl.where(top == float("-inf"), 0.0, top)
     tl.store(uz + n * tl.num_programs(1) + tile, tl.log(tl.sum(tl.exp(u - s), axis = 0)) + s)
@@ -583,15 +627,15 @@ def _score_tokens_kernel(table, w, shift, enum_tokens, token_class, code, tok_pt
 
 
 @triton_jit
-def _logz_kernel(zc, uz, logz, C, UT, TC: tl.constexpr):
-    """One program per column ``n``: ``logz[n] = log (sum_c exp(zc[n, c]) + sum_j exp(uz[n, j]))``, ``log p(e, C)`` --
-    the stored classes' parts and the enumerated tokens' (``UT`` tiles of them, see :func:`_score_tokens_kernel`)."""
+def _logz_kernel(zc, uz, logz, Cs, UT, TC: tl.constexpr):
+    """One program per column ``n``: ``logz[n] = log (sum_x exp(zc[n, x]) + sum_j exp(uz[n, j]))``, ``log p(e, C)`` --
+    the ``Cs`` stored classes' parts and the enumerated tokens' (``UT`` tiles of them, see :func:`_score_tokens_kernel`)."""
     n = tl.program_id(0).to(tl.int64)
     m = tl.full([TC], float("-inf"), dtype = tl.float32)
     acc = tl.zeros([TC], dtype = tl.float32)
-    for c0 in range(0, C, TC):
+    for c0 in range(0, Cs, TC):
         cs = c0 + tl.arange(0, TC)
-        m, acc = _lse_step(m, acc, tl.load(zc + n * C + cs, mask = cs < C, other = float("-inf")))
+        m, acc = _lse_step(m, acc, tl.load(zc + n * Cs + cs, mask = cs < Cs, other = float("-inf")))
     for j0 in range(0, UT, TC):
         js = j0 + tl.arange(0, TC)
         m, acc = _lse_step(m, acc, tl.load(uz + n * UT + js, mask = js < UT, other = float("-inf")))
@@ -667,24 +711,28 @@ def _score_kernel(table, w, shift, logz, toks, tile_cls, out_row, out, logw, log
 
 
 @triton_jit
-def _score_candidates_kernel(table, w, shift, token_class, code, positions, cand, out_row, out, uz, logw, logw_off, ids,
-                             N, K, V, C, B, KC, KW, BV: tl.constexpr, BH: tl.constexpr, EVEN_K: tl.constexpr,
-                             WEIGHTS: tl.constexpr, STEPS: tl.constexpr, UZ: tl.constexpr):
-    """One program per (column ``n``, tile of ``BV`` of its row's candidates): ``log sum_k T[v, k] w[n, c(v), k] +
-    shift[n, c(v)]``, the UNNORMALIZED log score (less ``logz`` afterwards, :func:`_normalize_kernel`), for every
-    candidate ``v = cand[r, j]`` of row ``r = out_row[n]`` (-1: not requested), into ``out[r, j]`` (``out`` [M, KC]);
-    -inf where ``v`` is outside the vocabulary (padding). The weights as :func:`_score_weights_kernel` leaves them; the
-    dot in fp32, over the candidates' rows of the table alone. ``EVEN_K``: ``BH`` divides ``K``. ``WEIGHTS``: plus the
-    column's tokens' log-weights (none for a column whose offset ``logw_off[n]`` is -1) -- 1: as :func:`_score_kernel`;
-    2: of the tokens its ascending run of ``KW`` in ``ids`` lists, ``logw`` aligned with it (found in ``STEPS``
-    halvings; the others -inf); 3: the candidates are that run's tokens themselves, each scored into ``out[r, v]``
-    (``out`` [M, V]; the rest of the row is not written). ``UZ``: ``uz[n, tile] = log sum exp`` of the scores of the
-    tile's candidates of ENUMERATED classes (by their codes at the column's position, ``code[t, c]`` < 0): the tokens'
-    part of ``p(e, C)`` (see :func:`_logz_kernel`) -- when the candidates are every token with a weight (3)."""
+def _score_candidates_kernel(table, w, shift, token_class, code, positions, nodes, mrow, mstride, lognorm, cand,
+                             out_row, out, uz, logw, logw_off, ids, N, K, V, C, B, KC, KW, BV: tl.constexpr,
+                             BH: tl.constexpr, EVEN_K: tl.constexpr, WEIGHTS: tl.constexpr, STEPS: tl.constexpr,
+                             UZ: tl.constexpr, ENUM: tl.constexpr, PER_COLUMN: tl.constexpr, STRIDE: tl.constexpr):
+    """One program per (column ``n``, tile of ``BV`` of its row's candidates): ``log sum_k T[v, k] exp(w[n, c(v),
+    k])``, the UNNORMALIZED log score (less ``logz`` afterwards, :func:`_normalize_kernel`), for every candidate ``v =
+    cand[r, j]`` of row ``r = out_row[n]`` (-1: not requested), into ``out[r, j]`` (``out`` [M, KC]); -inf where ``v``
+    is outside the vocabulary (padding). The weights as :func:`_score_weights_kernel` left them -- ``ENUM``: an
+    enumerated class's (by its code at the column's position, ``code[t, c]`` < 0) in log, see :func:`_log_dot` --,
+    the dot in fp32 over the candidates' rows of the table alone. ``EVEN_K``: ``BH`` divides ``K``. ``WEIGHTS``:
+    plus the column's tokens' log-weights (none for a column whose offset ``logw_off[n]`` is -1) -- 1: as
+    :func:`_score_kernel`; 2: of the tokens its ascending run of ``KW`` in ``ids`` lists, ``logw`` aligned with it
+    (found in ``STEPS`` halvings; the others -inf); 3: the candidates are that run's tokens themselves, each scored
+    into ``out[r, v]`` (``out`` [M, V]; the rest of the row is not written). ``UZ``: ``uz[n, tile] = log sum exp`` of
+    the tile's enumerated candidates' scores: the tokens' part of ``p(e, C)`` (see :func:`_logz_kernel`) -- when the
+    candidates are every token with a weight (3)."""
     n = tl.program_id(0).to(tl.int64)
     js = tl.program_id(1) * BV + tl.arange(0, BV)
     r = tl.load(out_row + n)
     rr = tl.where(r >= 0, r, 0).to(tl.int64)
+    t = tl.load(positions + n // B)
+    b = n % B
     if WEIGHTS != 0:
         wo = tl.load(logw_off + n)
         wb = tl.maximum(wo, 0)
@@ -697,19 +745,13 @@ def _score_candidates_kernel(table, w, shift, token_class, code, positions, cand
     ok = jm & (tk >= 0) & (tk < V)
     tks = tl.where(ok, tk, 0).to(tl.int64)
     c = tl.load(token_class + tks, mask = ok, other = 0).to(tl.int64)
-    trow = table + tks[:, None] * K                                           # [BV, 1]: every candidate's row
-    wrow = w + (n * C + c)[:, None] * K                                       # [BV, 1]: its class's weights
-    acc = tl.zeros([BV], dtype = tl.float32)
-    for k0 in range(0, K, BH):
-        ks = k0 + tl.arange(0, BH)
-        if EVEN_K:
-            m = ok[:, None]
-        else:
-            m = ok[:, None] & (ks < K)[None, :]
-        t = tl.load(trow + ks[None, :], mask = m, other = 0.0).to(tl.float32)                       # [BV, BH]
-        a = tl.load(wrow + ks[None, :], mask = m, other = 0.0)                                      # [BV, BH]
-        acc += tl.sum(t * a, axis = 1)
-    sc = tl.load(shift + n * C + c, mask = ok, other = float("-inf"))
+    if ENUM:
+        enum = ok & (tl.load(code + t * C + c, mask = ok, other = 0) < 0)
+    else:
+        enum = ok & (c < 0)
+    acc, m = _log_dot(table + tks[:, None] * K, w + (n * C + c)[:, None] * K, nodes + t * K, mrow, mstride, lognorm, b,
+                      ok, enum, K, BH, EVEN_K, ENUM, PER_COLUMN, STRIDE)
+    sc = tl.where(enum, m, tl.load(shift + n * C + c, mask = ok & ~enum, other = float("-inf")))
     val = tl.where(ok, tl.log(acc) + sc, float("-inf"))
     if WEIGHTS == 1:
         lw = tl.load(logw + wb + tks, mask = ok & (wo >= 0) & (tks < KW), other = float("-inf"))
@@ -721,8 +763,6 @@ def _score_candidates_kernel(table, w, shift, token_class, code, positions, cand
     elif WEIGHTS == 3:
         val = val + tl.load(logw + wb + js, mask = ok, other = float("-inf"))
     if UZ:
-        t_ = tl.load(positions + n // B)
-        enum = ok & (tl.load(code + t_ * C + c, mask = ok, other = 0) < 0)
         u = tl.where(enum, val, float("-inf"))
         top = tl.max(u, axis = 0)
         s = tl.where(top == float("-inf"), 0.0, top)
@@ -756,13 +796,15 @@ def score_group(out: torch.Tensor, table: torch.Tensor, w: torch.Tensor, rows: t
                 candidates: Optional[torch.Tensor] = None, sample: Optional[dict] = None) -> torch.Tensor:
     """
     Score one row group: ``out[out_row[n], v] = log p(x_t = v | e, C)`` for every column ``n`` (a target position's
-    sample) that ``out_row`` asks for, from its log class weights ``w`` [N, C, K] (overwritten), the group's
-    token-major table [V, K] and its rows of the class masses (``rows``, int64 [K] on the device).
+    sample) that ``out_row`` asks for, from its log class weights ``w`` [N, C, K] (the stored classes' overwritten),
+    the group's token-major table [V, K] and its rows of the class masses (``rows``, int64 [K] on the device).
 
     ``p(e, C) = sum_c sum_k A[k, c] mass_k(c)``: the stored classes' parts from the class masses
     (:func:`_score_weights_kernel`), an enumerated class's from its token's unnormalized score -- the dot the scoring
     computes anyway (:func:`_score_tokens_kernel`; under top-k weights, of the tokens with a weight alone, scored by
     :func:`_score_candidates_kernel`) -- so no second pass over the tokens, and no mass per (row, enumerated class).
+    An enumerated class's weights are read once, by its token's dot, in log (:func:`_log_dot`): the shift-and-exp
+    pass is over the stored classes alone.
 
     :param classes: the constraint's :class:`~pyjuice.constraints.distributions.TokenClasses`
     :param precision: the dot's: "tf32x3" (fp32-level) or "tf32"
@@ -785,30 +827,33 @@ def score_group(out: torch.Tensor, table: torch.Tensor, w: torch.Tensor, rows: t
     V = table.size(0)
     B = N // positions.numel()
     dev = w.device
-    shift = torch.empty(2, N, C, dtype = torch.float32, device = dev)      # the shifts, then the classes' parts
+    Cs, E = classes.num_stored, classes.num_enumerated                        # (one token each)
+    shift = torch.empty(N, C, dtype = torch.float32, device = dev)
+    zc = torch.empty(N, max(Cs, 1), dtype = torch.float32, device = dev)      # the stored classes' parts of p(e, C)
     logz = torch.empty(N, dtype = torch.float32, device = dev)
     per_column = sample is not None
     ids = sample["ids"] if per_column else None
     weights = dict(logw = sample["logw"] if per_column else w, logw_off = sample["offset"] if per_column else rows,
                    KW = sample["width"] if per_column else 0)
     stride = per_column and sample["stride"] is not None
-    E = classes.num_enumerated                                              # (one token each)
+    columns = dict(nodes = sample["nodes"] if per_column else rows, mrow = sample["row"] if per_column else rows,
+                   mstride = sample["stride"] if stride else rows, lognorm = sample["lognorm"] if per_column else w)
+    modes = dict(PER_COLUMN = per_column, STRIDE = stride)
 
-    # the shifts, the weights exponentiated, the stored classes' parts of p(e, C)
-    TC, TK = min(64, max(16, host_next_power_of_2(C))), 64
-    ctiles = host_cdiv(C, TC)
-    shares = max(1, min(host_cdiv(2 * _num_sms(dev), N * ctiles), host_cdiv(K, SCORE_SHARE_ROWS)))
-    KS = host_cdiv(host_cdiv(K, shares), TK) * TK
-    shares = host_cdiv(K, KS)
-    part = torch.empty(N * ctiles * shares * 3 * TC if shares > 1 else 1, dtype = torch.float32, device = dev)
-    args = (w, class_mars, rows, sample["nodes"] if per_column else rows, positions, sample["row"] if per_column else rows,
-            sample["stride"] if stride else rows, sample["lognorm"] if per_column else w, shift[0], shift[1], part,
-            enum["code"], C, K, B, KS, enum["Cs"])
-    consts = dict(TC = TC, TK = TK, PER_COLUMN = per_column, STRIDE = stride, SHARES = shares, ENUM = enum["ENUM"],
-                  num_warps = 4)
-    _score_weights_kernel[(N, ctiles, shares)](*args, FINISH = False, **consts)
-    if shares > 1:
-        _score_weights_kernel[(N, ctiles, shares)](*args, FINISH = True, **consts)
+    # the stored classes: the shifts, the weights exponentiated, their parts of p(e, C)
+    if Cs > 0:
+        TC, TK = min(64, max(16, host_next_power_of_2(Cs))), 64
+        ctiles = host_cdiv(Cs, TC)
+        shares = max(1, min(host_cdiv(2 * _num_sms(dev), N * ctiles), host_cdiv(K, SCORE_SHARE_ROWS)))
+        KS = host_cdiv(host_cdiv(K, shares), TK) * TK
+        shares = host_cdiv(K, KS)
+        part = torch.empty(N * ctiles * shares * 3 * TC if shares > 1 else 1, dtype = torch.float32, device = dev)
+        args = (w, class_mars, rows, columns["nodes"], positions, columns["mrow"], columns["mstride"],
+                columns["lognorm"], shift, zc, part, classes.class_of_stored32, C, K, B, KS, Cs)
+        consts = dict(TC = TC, TK = TK, SHARES = shares, num_warps = 4, **modes)
+        _score_weights_kernel[(N, ctiles, shares)](*args, FINISH = False, **consts)
+        if shares > 1:
+            _score_weights_kernel[(N, ctiles, shares)](*args, FINISH = True, **consts)
 
     # the scores: the candidates', or the enumerated tokens' (unnormalized), with the enumerated tokens' parts of p(e, C)
     run = ids is not None and candidates is None                           # the weights' run of tokens, every one
@@ -823,18 +868,21 @@ def score_group(out: torch.Tensor, table: torch.Tensor, w: torch.Tensor, rows: t
         mode = (2 if ids is not None else int(per_column)) if candidates is not None else 3
         BV, BH, warps = cand_tile
         _score_candidates_kernel[(N, host_cdiv(KC, BV))](
-            table, w, shift[0], classes.token_class, enum["code"], positions,
-            candidates if candidates is not None else rows, out_row, out, uz, ids = ids if ids is not None else rows,
-            N = N, K = K, V = V, C = C, B = B, KC = KC, BV = BV, BH = BH, EVEN_K = K % BH == 0, WEIGHTS = mode,
-            STEPS = max(1, int(weights["KW"]).bit_length()), UZ = run and E > 0, num_warps = warps, **weights)
+            table, w, shift, classes.token_class, enum["code"], positions, columns["nodes"], columns["mrow"],
+            columns["mstride"], columns["lognorm"], candidates if candidates is not None else rows, out_row, out, uz,
+            ids = ids if ids is not None else rows, N = N, K = K, V = V, C = C, B = B, KC = KC, BV = BV, BH = BH,
+            EVEN_K = K % BH == 0, WEIGHTS = mode, STEPS = max(1, int(weights["KW"]).bit_length()),
+            UZ = run and E > 0, ENUM = E > 0, num_warps = warps, **weights, **modes)
     if by_tokens:
         BV, BH, warps = tokens_tile
-        _score_tokens_kernel[(N, UT)](table, w, shift[0], classes.enumerated_tokens, classes.token_class, enum["code"],
-                                      enum["tok_ptr"], enum["enum_logw"], positions, out_row, out, uz, N = N, K = K,
-                                      V = V, C = C, B = B, E = E, logw_stride = enum["logw_stride"], BV = BV, BH = BH,
+        _score_tokens_kernel[(N, UT)](table, w, classes.enumerated_tokens, classes.token_class, enum["code"],
+                                      enum["tok_ptr"], enum["enum_logw"], positions, columns["nodes"], columns["mrow"],
+                                      columns["mstride"], columns["lognorm"], out_row, out, uz, N = N, K = K, V = V,
+                                      C = C, B = B, E = E, logw_stride = enum["logw_stride"], BV = BV, BH = BH,
                                       EVEN_K = K % BH == 0, LOGW = enum["LOGW"] and per_column,
-                                      WRITE = candidates is None and ids is None, num_warps = warps)
-    _logz_kernel[(N,)](shift[1], uz, logz, C, UT, TC = min(1024, max(16, host_next_power_of_2(C))), num_warps = 1)
+                                      WRITE = candidates is None and ids is None, num_warps = warps, **modes)
+    _logz_kernel[(N,)](zc, uz, logz, Cs, UT, TC = min(1024, max(16, host_next_power_of_2(max(Cs, UT, 1)))),
+                       num_warps = 1)
     if candidates is not None or ids is not None:
         BV = cand_tile[0]
         _normalize_kernel[(N, host_cdiv(KC, BV))](out, out_row, logz, ids if run else rows, weights["logw_off"], KC,
@@ -844,14 +892,13 @@ def score_group(out: torch.Tensor, table: torch.Tensor, w: torch.Tensor, rows: t
         BV = tokens_tile[0]
         _normalize_kernel[(N, UT)](out, out_row, logz, classes.enumerated_tokens, rows, E, V, V, BV = BV, MODE = 2,
                                    num_warps = 1)
-    dtype = "bf16" if table.dtype == torch.bfloat16 else "fp32"
-    prec = "tf32" if dtype == "bf16" else precision
-    BB, BV, BH, warps, stages = SCORE_TILES[(dtype, prec)][0 if N <= 16 else 1 if N <= 64 else 2]
-    Cs = classes.num_stored
     if Cs > 0:                                                              # the stored classes' tokens, in tiles
+        dtype = "bf16" if table.dtype == torch.bfloat16 else "fp32"
+        prec = "tf32" if dtype == "bf16" else precision
+        BB, BV, BH, warps, stages = SCORE_TILES[(dtype, prec)][0 if N <= 16 else 1 if N <= 64 else 2]
         BV = min(BV, max(16, host_next_power_of_2(-(-V // Cs))))            # many small classes: narrower tiles
         toks, tile_cls = classes.class_tiles(BV, stored = True)
-        _score_kernel[(host_cdiv(N, BB), tile_cls.numel())](table, w, shift[0], logz, toks, tile_cls, out_row, out,
+        _score_kernel[(host_cdiv(N, BB), tile_cls.numel())](table, w, shift, logz, toks, tile_cls, out_row, out,
                                                             N = N, K = K, V = V, C = C, BB = BB, BV = BV, BH = BH,
                                                             EVEN_K = K % BH == 0, PRECISION = prec,
                                                             WEIGHTS = per_column, num_warps = warps,
