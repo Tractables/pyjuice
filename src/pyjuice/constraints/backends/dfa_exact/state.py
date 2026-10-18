@@ -93,6 +93,15 @@ class ClassMasses:
         weighs ``token_logw[i]``, the others nothing
     :ivar successors: None until a query asks, then ``(lists,)``: the successor lists its liveness sweeps follow where
         a token is missing (:func:`~.kernels.live.live_successors`; ``lists`` None for every class's)
+    :ivar prow: int32 [rows of ``table``]: every row's row of the backend's token-major table
+        (:meth:`State.token_major`; the parameter row it is of: itself for the shared rows, the pair's for a
+        per-sample row)
+    :ivar tokmaj: the token-major table, fp32 [V, parameter rows], when the automaton has enumerated classes (see
+        :class:`~pyjuice.constraints.distributions.TokenClasses`): an enumerated class's mass at a row is its token's
+        probability there, under per-sample inputs times ``exp(enum_logw - lognorm)``; else None
+    :ivar enum_logw: under per-sample inputs with enumerated classes, fp32 [batch, enumerated tokens live at any
+        boundary] (:class:`~.kernels.transitions.EnumeratedTokens`): ``log w`` of every such token per sample at its
+        boundary (0 at a position no input reweights, -inf for a token the inputs rule out); else None
     """
 
     table: torch.Tensor
@@ -109,6 +118,9 @@ class ClassMasses:
     token_width: int = 0
     token_ids: Optional[torch.Tensor] = None
     successors: Optional[tuple] = None
+    prow: Optional[torch.Tensor] = None
+    tokmaj: Optional[torch.Tensor] = None
+    enum_logw: Optional[torch.Tensor] = None
 
 
 #: What a storage holds when it is allocated (:meth:`State.storage_view`): None, nothing in particular -- every slot a
@@ -152,6 +164,8 @@ class State:
         self._prior_kept = False                    # kept by a `pyjuice.fast_inference` scope
         self._prior_flows_state = None              # the input-independent top-down values (see `prior_flows`)
         self._token_tables = None                   # token-major input parameters kept by a scope (`token_table`)
+        self._token_major = None                    # ... of every class-mass row, fp32, kept by a scope (`token_major`)
+        self._prow = None                           # every shared class-mass row's own number (see `masses`)
         self.bf16_tokens = False                    # a decoder session's: token tables in bfloat16 ("auto": at tf32)
         self.epoch = 0
 
@@ -328,7 +342,7 @@ class State:
         be = self._backend
         firsts, num_rows, _ = self.class_mass_rows()
         if self._class_mars is None:
-            self._class_mars = torch.empty(num_rows, be.num_classes, device = self._device)
+            self._class_mars = torch.empty(num_rows, be.token_classes.num_stored, device = self._device)
         for layer, first, end in zip(be.pc.input_layer_group, firsts, firsts[1:] + [num_rows]):
             lookup(layer.dist).class_masses(layer, be.token_classes, out = self._class_mars[first:end])
         self.class_mars_version += 1
@@ -338,35 +352,71 @@ class State:
             register_layer(self)                                # its exit calls `_release_fast_inference_params`
         return self._class_mars
 
+    def token_major(self) -> torch.Tensor:
+        """
+        ``[V, num_rows]`` fp32 (see :meth:`class_mass_rows`): the probability of every token under every class-mass
+        row, token-major, from every input layer's distribution's ``token_probs`` -- what an enumerated class's mass
+        is read from (see :class:`~pyjuice.constraints.distributions.TokenClasses`; the kernels of
+        :mod:`~.kernels.transitions`). Built by every query, except inside a :func:`pyjuice.fast_inference` scope
+        that allows parameter copies: there by the first query, then kept until the scope exits.
+        """
+        if self._token_major is not None:
+            return self._token_major
+        firsts, num_rows, _ = self.class_mass_rows()
+        layers = list(self._backend.pc.input_layer_group)
+        V = lookup(layers[0].dist).num_values(layers[0].dist)
+        table = torch.empty(V, num_rows, dtype = torch.float32, device = self._device)
+        for layer, first, end in zip(layers, firsts, firsts[1:] + [num_rows]):
+            lookup(layer.dist).token_probs(layer, np.arange(end - first), table[:, first:end])
+        if param_copies_allowed():
+            self._token_major = table
+            register_layer(self)                                    # its exit calls `_release_fast_inference_params`
+        return table
+
+    def _shared_rows(self) -> torch.Tensor:
+        """int32 [num_rows]: every shared class-mass row's own number (its row of :meth:`token_major`)."""
+        if self._prow is None:
+            self._prow = torch.arange(self.class_mass_rows()[1], dtype = torch.int32, device = self._device)
+        return self._prow
+
     def masses(self, external: Optional[ExternalInputs] = None) -> ClassMasses:
         """
         The class masses of a query's input nodes (:class:`ClassMasses`): :meth:`class_masses`, the same for every
         sample -- and under a decoder session's per-sample ``external`` inputs, those the inputs give the nodes that
         read them, per sample (their distributions' ``sample_inputs``), in a table of the session's: built by its
-        first query (the other nodes' rows copied in), kept until its scope exits.
+        first query (the other nodes' rows copied in), kept until its scope exits. With enumerated classes, the
+        token-major table (:meth:`token_major`) and the enumerated tokens' per-sample weights besides.
         """
         table = self.class_masses()
         _, _, mass_row = self.class_mass_rows()
+        enum = self._backend.token_classes.num_enumerated > 0
+        tokmaj = self.token_major() if enum else None
         if external is None:
-            return ClassMasses(table, mass_row, None, 1, self._class_mars_at, {})
+            return ClassMasses(table, mass_row, None, 1, self._class_mars_at, {}, prow = self._shared_rows(),
+                               tokmaj = tokmaj)
         if self._session is not None and self._session[0] is external and self._session[1] == self._class_mars_at:
             return self._session[2]
         if not external.layers:                     # gates alone: the class masses, as a computation of the session's
             self.class_mars_version += 1            # own (what is kept once under its gates is its own)
-            masses = ClassMasses(table, mass_row, None, 1, self.class_mars_version, {})
+            masses = ClassMasses(table, mass_row, None, 1, self.class_mars_version, {}, prow = self._shared_rows(),
+                                 tokmaj = tokmaj)
             self._session = (external, self._class_mars_at, masses)
             if is_active():
                 register_layer(self)                                # its exit calls `_release_fast_inference_params`
             return masses
-        be, Be, C = self._backend, external.evidence_batch, self._backend.num_classes
+        be, Be, C = self._backend, external.evidence_batch, self._backend.token_classes.num_stored
         input_start = be.input_range[0]
+        firsts = self.class_mass_rows()[0]
         layers = [be.pc.input_layer_group[k] for k in external.layers]
         sizes = [lookup(layer.dist).sample_rows(layer, external.inputs) for layer in layers]
         full = torch.empty(table.size(0) + Be * sum(sizes), C, dtype = table.dtype, device = self._device)
         full[:table.size(0)] = table                                    # the other nodes' rows first
         row, stride = mass_row.clone(), torch.zeros_like(mass_row)
         lognorm = torch.zeros(full.size(0), dtype = torch.float32, device = self._device)
+        prow = torch.empty(full.size(0), dtype = torch.int32, device = self._device)
+        prow[:table.size(0)] = self._shared_rows()
         token_row = torch.full(mass_row.shape, -1, dtype = torch.int64, device = self._device)
+        enum_logw = self._enumerated_weights(Be) if enum else None
         num_rows, sample, logw, ids, num_wrows = table.size(0), {}, [], [], 0
         for k, layer, rows_s in zip(external.layers, layers, sizes):
             out = full[num_rows:num_rows + Be * rows_s].view(Be, rows_s, C)
@@ -376,9 +426,12 @@ class State:
             if Be > 1:
                 stride[first - input_start:end - input_start] = rows_s
             lognorm[num_rows:num_rows + Be * rows_s] = si.logz.reshape(-1)
+            prow[num_rows:num_rows + Be * rows_s] = (firsts[k] + si.pair_rows).to(torch.int32).repeat(Be)
             token_row[first - input_start:end - input_start] = num_wrows + si.token_rows
             logw.append(si.token_logw)
             ids.append(si.token_ids)
+            if enum:
+                self._enumerated_weights_of(layer, si, enum_logw)
             num_rows, num_wrows = num_rows + Be * rows_s, num_wrows + si.token_logw.size(1)
             sample[k] = si
         if len({w.size(2) for w in logw}) > 1 or len({i is None for i in ids}) > 1:
@@ -389,11 +442,52 @@ class State:
         masses = ClassMasses(full, row, stride if Be > 1 else None, Be, self.class_mars_version, sample,
                              lognorm = lognorm, token_logw = cat(logw), token_row = token_row,
                              token_row_host = token_row.cpu().numpy(), token_stride = num_wrows if Be > 1 else 0,
-                             token_width = logw[0].size(2), token_ids = None if ids[0] is None else cat(ids))
+                             token_width = logw[0].size(2), token_ids = None if ids[0] is None else cat(ids),
+                             prow = prow, tokmaj = tokmaj, enum_logw = enum_logw)
         self._session = (external, self._class_mars_at, masses)
         if is_active():
             register_layer(self)                                # its exit calls `_release_fast_inference_params`
         return masses
+
+    def _enumerated_weights(self, Be: int) -> torch.Tensor:
+        """fp32 [Be, enumerated tokens live at any boundary + 1], 0 (``log 1``): what :meth:`_enumerated_weights_of`
+        fills for the positions an input layer's per-sample inputs reweight (the last column padding, as
+        :class:`~.kernels.transitions.EnumeratedTokens`' tokens are)."""
+        return torch.zeros(Be, self._backend.program().enum.num + 1, dtype = torch.float32, device = self._device)
+
+    def _enumerated_weights_of(self, layer, si, enum_logw: torch.Tensor):
+        """Into ``enum_logw`` (:meth:`_enumerated_weights`), at the boundaries of the layer's variables: every
+        enumerated token's ``log w`` per sample from the layer's
+        :class:`~pyjuice.constraints.distributions.SampleInputs` -- its weight among the first ``K`` tokens' (dense
+        inputs), or its candidate's (top-k; -inf for none)."""
+        en = self._backend.program().enum
+        if en.num == 0:
+            return
+        ptr = en.ptr_host
+        vids = si.variables.cpu().numpy().astype(np.int64)
+        counts = ptr[vids + 1] - ptr[vids]
+        if counts.sum() == 0:
+            return
+        dev = self._device
+        pos = torch.from_numpy(np.repeat(vids, counts)).to(dev)                 # every token's boundary
+        at = torch.cat([torch.arange(int(ptr[v]), int(ptr[v + 1])) for v in vids]).to(dev)   # ... and its number
+        lv = layer.var_idmapping.to(dev)[pos].long()                             # the evidence's row of the boundary
+        tok = en.tok[at].long()
+        Be, Vl, K = si.token_logw.shape
+        bs = torch.arange(Be, device = dev)[:, None]
+        if si.token_ids is None:
+            w = torch.where((tok < K)[None, :], si.token_logw[bs, lv[None, :], tok.clamp(max = K - 1)[None, :]],
+                            float("-inf"))
+        else:                                       # every boundary's tokens as a padded row of queries: one search
+            most = int(counts.max())                # per (sample, evidence row), no gather of the candidates per token
+            place = torch.from_numpy(np.concatenate([np.arange(c) for c in counts])).to(dev)
+            queries = torch.full((Vl, most), K, dtype = torch.long, device = dev)   # (K: past every candidate)
+            queries[lv, place] = tok
+            ids = si.token_ids.long()                                            # [Be, Vl, K], ascending rows
+            k = torch.searchsorted(ids, queries[None].expand(Be, -1, -1)).clamp(max = K - 1)    # [Be, Vl, most]
+            hit = ids.gather(2, k) == queries[None]
+            w = torch.where(hit, si.token_logw.gather(2, k), float("-inf"))[:, lv, place]      # [Be, tokens]
+        enum_logw[:, at] = w.expand(enum_logw.size(0), -1)
 
     def weight_stacks(self):
         """
@@ -451,6 +545,7 @@ class State:
         self._class_mars_kept = False
         self._kept_stacks = None
         self._token_tables = None
+        self._token_major = None
         self._prior_kept = False
         self._session = None
         if poison and self._class_mars is not None:

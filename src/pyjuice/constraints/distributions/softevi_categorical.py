@@ -137,13 +137,13 @@ def sample_inputs(layer, classes, inputs: dict, out: torch.Tensor) -> SampleInpu
     # the evidence's shift per (sample, variable): the max weight scales to 1 (a row of -inf weighs nothing anyway)
     shift = ev.amax(dim = 2)
     shift = torch.where(torch.isfinite(shift), shift, 0.0).contiguous()
-    if ids is None:
-        _dense_masses(layer, classes, ev, shift, st, out)
+    logz = torch.empty(Be, st["num_pairs"], dtype = torch.float32, device = ev.device)   # log Z of every row: over
+    if ids is None:                                                         # every token, the enumerated classes' too
+        _dense_masses(layer, classes, ev, shift, st, out, logz)
     else:                                                                   # ascending: what the lookups search
         ids, order = torch.sort(ids.to(torch.int32), dim = 2)
         ev = torch.gather(ev, 2, order)
-        _topk_masses(layer, classes, inputs, ev, ids, shift, st, out)
-    logz = torch.logsumexp(out, dim = 2)
+        _topk_masses(layer, classes, inputs, ev, ids, shift, st, out, logz)
     logz = torch.where(torch.isfinite(logz), logz, 0.0)
     if vm is not None:                                                      # False: unnormalized (a free position)
         logz = torch.where(vm[:, :Vl].expand(Be, -1)[:, st["pair_lv"].long()], logz, 0.0)
@@ -151,20 +151,21 @@ def sample_inputs(layer, classes, inputs: dict, out: torch.Tensor) -> SampleInpu
     out -= logz[:, :, None]                                                 # q's classes: they sum to one
     return SampleInputs(masses = out, rows = st["node_rows"], logz = logz, token_logw = ev,
                         token_rows = _lvid32(layer).long(), batch = Be, variables = st["variables"],
-                        token_ids = None if ids is None else ids.contiguous(),
+                        token_ids = None if ids is None else ids.contiguous(), pair_rows = st["pair_rows"],
                         data = None if vm is None else dict(value_mask = True))
 
 
-def _dense_masses(layer, classes, ev, shift, st, out):
+def _dense_masses(layer, classes, ev, shift, st, out, logz):
     """:func:`sample_inputs`' masses under dense evidence, before ``log Z``: every row's tokens in class order against
     every variable's evidence -- split over the tokens for enough programs, each split's sums kept apart while they
-    fit :data:`MASS_PARTIAL_BUDGET`, else in one split, written straight."""
+    fit :data:`MASS_PARTIAL_BUDGET`, else in one split, written straight. The stored classes' masses into ``out``, and
+    every row's ``log Z`` (over every token, the enumerated classes' too) into ``logz`` [Be, R_s]."""
     Be, Vl, K = ev.shape
-    C = classes.num_classes
+    C = classes.num_stored
     dev = ev.device
     cols, tiles = _columns(st, Be, dev)
     tc, TV = MASS_TILES, MASS_TILES["TV"]
-    tokens, tile_rank, class_rank, rank_class = _class_runs(classes, TV)
+    tokens, tile_rank, class_rank, rank_stored, stored_rank = _class_runs(classes, TV)
     T = tile_rank.numel()
     R_s = st["num_pairs"]
     present = int(class_rank.max()) + 1
@@ -176,33 +177,39 @@ def _dense_masses(layer, classes, ev, shift, st, out):
     if direct:                                                          # every class's sum in one piece: its log
         out.fill_(-float("inf"))                                        # (a class without a token: -inf)
         part = out
-    else:
-        part = torch.empty(present + splits, Be, R_s, dtype = torch.float32, device = dev)
+    else:                                                               # (zeros: the segments between two classes'
+        part = torch.zeros(present + splits, Be, R_s, dtype = torch.float32, device = dev)   # pieces are never written)
     _partial_kernel[(tiles.size(0) * splits,)](
-        table, ev, shift, tokens, tile_rank, rank_class, st["rows"], cols, tiles, st["pair_index"], part,
+        table, ev, shift, tokens, tile_rank, rank_stored, st["rows"], cols, tiles, st["pair_index"], part, logz,
         layer.dist.num_cats, K, Vl, Be, R_s, C, splits, split_len, T, DIRECT = direct, TU = tc["TU"], TN = tc["TN"],
         TV = TV, num_warps = 4)
     if not direct:
         seg_lo, seg_hi = _segments(tile_rank, class_rank, split_len, dev)
-        TS, TC = 32, max(16, min(64, host_next_power_of_2(C)))
-        _combine_kernel[(host_cdiv(R_s, TS) * host_cdiv(C, TC), Be)](
-            part, out, shift, st["pair_lv"], class_rank, seg_lo, seg_hi, Vl, Be, R_s, C, TS = TS, TC = TC)
+        TS, TC = 32, max(16, min(64, host_next_power_of_2(max(C, 1))))
+        if C > 0:
+            _combine_kernel[(host_cdiv(R_s, TS) * host_cdiv(C, TC), Be)](
+                part, out, shift, st["pair_lv"], stored_rank, seg_lo, seg_hi, Vl, Be, R_s, C, TS = TS, TC = TC)
+        m = shift.view(Be, Vl)[:, st["pair_lv"].long()]                 # log Z: every segment's sum, unscaled
+        logz.copy_(torch.log(part.sum(dim = 0)) - 44.3614195558365 + m)
 
 
-def _topk_masses(layer, classes, inputs, ev, ids, shift, st, out):
+def _topk_masses(layer, classes, inputs, ev, ids, shift, st, out, logz):
     """:func:`sample_inputs`' masses under top-k evidence (``ids`` the candidates, ``ev`` their log-weights), before
     ``log Z``: every row's probabilities of every variable's candidates, a program per (tile of rows, variable and
-    sample) -- the classes ``TC`` at a time, the candidates sorted by tile of classes where there are more."""
+    sample) -- the classes ``TC`` at a time, the candidates sorted by tile of classes where there are more (those of
+    enumerated classes first: they count in ``log Z`` alone). The stored classes' masses into ``out``, every row's
+    ``log Z`` into ``logz`` [Be, R_s]."""
     Be, Vl, K = ev.shape
-    C, num_cats = classes.num_classes, layer.dist.num_cats
+    C, num_cats = classes.num_stored, layer.dist.num_cats
     dev = ev.device
     cols, tiles = _columns(st, Be, dev)
     TU, TK = TOPK_TILES["TU"], TOPK_TILES["TK"]
-    TC = max(16, min(TOPK_TILES["TC"], host_next_power_of_2(C)))
+    TC = max(16, min(TOPK_TILES["TC"], host_next_power_of_2(max(C, 1))))
     NCT = host_cdiv(C, TC)
     bounds = shift                                                          # (unread with one tile of classes)
     if NCT > 1:
-        ctile = (classes.token_class[ids.long()] // TC).long()
+        sc = classes.stored_class[ids.long()].long()
+        ctile = torch.where(sc >= 0, sc // TC, -1)
         order = torch.argsort(ctile * num_cats + ids, dim = 2)
         ids, ev, ctile = (torch.gather(a, 2, order).contiguous() for a in (ids, ev, ctile))
         at = torch.arange(NCT + 1, device = dev).expand(Be * Vl, NCT + 1).contiguous()
@@ -210,8 +217,8 @@ def _topk_masses(layer, classes, inputs, ev, ids, shift, st, out):
     table = layer.params.view(-1, num_cats)
     table_t = _transposed_table(layer, inputs)
     _topk_kernel[(tiles.size(0), MASS_TILES["TN"])](
-        table, table if table_t is None else table_t, table.size(0), ev, ids, shift, classes.token_class, bounds,
-        st["rows"], cols, tiles, st["pair_index"], out, num_cats, K, Vl, st["num_pairs"], C, NCT,
+        table, table if table_t is None else table_t, table.size(0), ev, ids, shift, classes.stored_class, bounds,
+        st["rows"], cols, tiles, st["pair_index"], out, logz, num_cats, K, Vl, st["num_pairs"], C, max(NCT, 1),
         TRANSPOSED = table_t is not None, BY_TILE = NCT > 1, TU = TU, TK = TK, TC = TC, num_warps = 4)
 
 
@@ -317,7 +324,7 @@ def _structure(layer, Vl: int) -> dict:
             groups.setdefault(lvs[s:e].tobytes(), (lvs[s:e], []))[1].append(rows[s])
         groups = [(np.asarray(r, dtype = np.int64), v) for v, r in groups.values()]
         return dict(num_pairs = int(uniq.numel()), node_rows = inverse, pair_index = pair_index,
-                    pair_lv = (uniq % Vl).to(torch.int32).contiguous(), groups = groups,
+                    pair_lv = (uniq % Vl).to(torch.int32).contiguous(), pair_rows = uniq // Vl, groups = groups,
                     rows = torch.as_tensor(np.concatenate([g for g, _ in groups]), dtype = torch.int32,
                                            device = pr.device),
                     variables = torch.unique(layer.vids.view(-1).long()))
@@ -340,9 +347,10 @@ def _columns(st: dict, Be: int, dev):
 
 
 def _class_runs(classes, TV: int):
-    """The tokens in class order, every class's run padded to whole tiles of ``TV`` (:meth:`TokenClasses.class_tiles`),
-    every tile's class's rank among the classes with a token, every class's rank (-1 for none) and every rank's class;
-    kept with the classes."""
+    """The tokens in class order (every class's, the enumerated ones' too: ``log Z`` sums them all), every class's
+    run padded to whole tiles of ``TV`` (:meth:`TokenClasses.class_tiles`), every tile's class's rank among the
+    classes with a token, every class's rank (-1 for none), every rank's stored column (-1: an enumerated class) and
+    every stored column's rank (-1: a stored class without a token); kept with the classes."""
     key = ("softevi_runs", TV)
     found = classes._class_tiles.get(key)
     if found is None:
@@ -352,8 +360,11 @@ def _class_runs(classes, TV: int):
         present[tc] = True
         rank = torch.cumsum(present.long(), 0) - 1
         class_rank = torch.where(present, rank, -1).to(torch.int32).contiguous()
-        rank_class = torch.nonzero(present).view(-1).to(torch.int32).contiguous()
-        found = classes._class_tiles[key] = (tokens, rank[tc].to(torch.int32).contiguous(), class_rank, rank_class)
+        rank_class = torch.nonzero(present).view(-1)
+        i32 = lambda t: t.to(torch.int32).contiguous()
+        found = classes._class_tiles[key] = (tokens, i32(rank[tc]), class_rank,
+                                             i32(classes.stored_of_class[rank_class]),
+                                             i32(class_rank[classes.class_of_stored]))
     return found
 
 
@@ -375,13 +386,14 @@ def _segments(tile_rank: torch.Tensor, class_rank: torch.Tensor, split_len: int,
 # -------------------------------------------------------------------------------------------------
 
 @triton_jit
-def _partial_kernel(table, ev, shift, tokens, tile_rank, rank_class, rows, cols, tiles, pair_index, part, num_cats, K,
-                    Vl, Be, R_s, C, num_splits, split_len, T, DIRECT: tl.constexpr, TU: tl.constexpr, TN: tl.constexpr,
-                    TV: tl.constexpr):
+def _partial_kernel(table, ev, shift, tokens, tile_rank, rank_stored, rows, cols, tiles, pair_index, part, logz,
+                    num_cats, K, Vl, Be, R_s, C, num_splits, split_len, T, DIRECT: tl.constexpr, TU: tl.constexpr,
+                    TN: tl.constexpr, TV: tl.constexpr):
     """One program per (tile, split of the token tiles), splits fastest so that a tile's rows stay in L2: per class,
     the sums ``sum_v p(v) w(v)`` of the tile's rows against its columns' evidence over the split's tokens of the class
     -- linear, the probabilities scaled by 2^64 so that tiny products do not flush --, into ``part`` [segments, Be,
-    R_s] at the pairs the nodes read; ``DIRECT`` (one split): each class's log mass, into ``part`` [Be, R_s, C]."""
+    R_s] at the pairs the nodes read; ``DIRECT`` (one split): each stored class's log mass, into ``part`` [Be, R_s, C]
+    (an enumerated class's sum counts in ``log Z`` alone), and every row's ``log Z`` into ``logz`` [Be, R_s]."""
     pid = tl.program_id(0)
     sp = pid % num_splits
     tile = pid // num_splits
@@ -406,11 +418,13 @@ def _partial_kernel(table, ev, shift, tokens, tile_rank, rank_class, rows, cols,
     k1 = tl.minimum(k0 + split_len, T)
     cur = tl.load(tile_rank + k0)
     acc = tl.zeros([TU, TN], dtype = tl.float32)
+    total = tl.zeros([TU, TN], dtype = tl.float32)
     v_off = tl.arange(0, TV)
     for k in range(k0, k1):
         rk = tl.load(tile_rank + k)
         if rk != cur:                                                       # a class's piece done
-            _flush(dst, acc, cur, sp, Be * R_s, m, keep, rank_class, DIRECT)
+            _flush(dst, acc, cur, sp, Be * R_s, m, keep, rank_stored, DIRECT)
+            total += acc
             acc = tl.zeros([TU, TN], dtype = tl.float32)
             cur = rk
         v = tl.load(tokens + k * TV + v_off)
@@ -419,32 +433,36 @@ def _partial_kernel(table, ev, shift, tokens, tile_rank, rank_class, rows, cols,
         w = tl.exp(tl.load(evp[None, :] + v[:, None], mask = vm[:, None] & cm[None, :], other = float("-inf")) -
                    m[None, :])
         acc += tl.dot(p * 18446744073709551616.0, w, input_precision = "ieee")       # x 2^64
-    _flush(dst, acc, cur, sp, Be * R_s, m, keep, rank_class, DIRECT)
+    _flush(dst, acc, cur, sp, Be * R_s, m, keep, rank_stored, DIRECT)
+    if DIRECT:                                                              # (one split: every token summed here)
+        total += acc
+        tl.store(logz + b[None, :] * R_s + s, tl.log(total) - 44.3614195558365 + m[None, :], mask = keep)
 
 
 @triton.jit
-def _flush(dst, acc, cur, sp, seg_stride, m, keep, rank_class, DIRECT: tl.constexpr):
+def _flush(dst, acc, cur, sp, seg_stride, m, keep, rank_stored, DIRECT: tl.constexpr):
     """A class's piece of :func:`_partial_kernel` (``cur``: the class's rank among those with a token, see
     :func:`_class_runs`): its sums, at segment ``sp + cur`` -- or ``DIRECT``, its log mass (unscaled, the evidence's
-    shift ``m`` added back) at the class itself."""
+    shift ``m`` added back) at the class's stored column (none for an enumerated class: nothing stored)."""
     if DIRECT:
-        tl.store(dst + tl.load(rank_class + cur), tl.log(acc) - 44.3614195558365 + m[None, :], mask = keep)
+        col = tl.load(rank_stored + cur)
+        tl.store(dst + col, tl.log(acc) - 44.3614195558365 + m[None, :], mask = keep & (col >= 0))
     else:
         tl.store(dst + (sp + cur) * seg_stride, acc, mask = keep)
 
 
 @triton_jit
-def _combine_kernel(part, masses, shift, pair_lv, class_rank, seg_lo, seg_hi, Vl, Be, R_s, C, TS: tl.constexpr,
+def _combine_kernel(part, masses, shift, pair_lv, stored_rank, seg_lo, seg_hi, Vl, Be, R_s, C, TS: tl.constexpr,
                     TC: tl.constexpr):
-    """One program per (tile of pairs, tile of classes) and sample: every class's pieces summed, then its log mass
-    (unscaled, the evidence's shift added back; -inf for a class without a token)."""
+    """One program per (tile of pairs, tile of stored columns) and sample: every stored class's pieces summed, then
+    its log mass (unscaled, the evidence's shift added back; -inf for a class without a token)."""
     pid = tl.program_id(0)
     b = tl.program_id(1).to(tl.int64)
     num_ctiles = tl.cdiv(C, TC)
     s = (pid // num_ctiles) * TS + tl.arange(0, TS)
     c = (pid % num_ctiles) * TC + tl.arange(0, TC)
     sm, cm = s < R_s, c < C
-    rk = tl.load(class_rank + c, mask = cm, other = -1)
+    rk = tl.load(stored_rank + c, mask = cm, other = -1)
     has = cm & (rk >= 0)
     lo = tl.load(seg_lo + rk, mask = has, other = 0)
     hi = tl.load(seg_hi + rk, mask = has, other = -1)
@@ -458,16 +476,17 @@ def _combine_kernel(part, masses, shift, pair_lv, class_rank, seg_lo, seg_hi, Vl
 
 
 @triton_jit
-def _topk_kernel(table, table_t, num_rows, ev, ids, shift, token_class, bounds, rows, cols, tiles, pair_index, out,
-                 num_cats, K, Vl, R_s, C, NCT, TRANSPOSED: tl.constexpr, BY_TILE: tl.constexpr, TU: tl.constexpr,
-                 TK: tl.constexpr, TC: tl.constexpr):
-    """One program per (tile, column of the tile: a variable and sample): per class, the sums ``sum_k p(v_k) w_k`` of
-    the tile's rows over the column's candidates ``v_k`` of the class -- the probabilities read at the candidates
-    alone (``TRANSPOSED``: from the token-major table ``table_t``, a candidate's rows contiguous), scaled by 2^64 so
-    that tiny products do not flush, dotted with the weights spread over ``TC`` classes -- and their logs (the
-    evidence's shift added back; -inf for a class without a candidate), into ``out`` [Be, R_s, C] at the pairs the
-    nodes read. ``BY_TILE``: ``NCT`` tiles of classes, the candidates sorted by tile (``bounds``: where every tile
-    starts, per column), else one."""
+def _topk_kernel(table, table_t, num_rows, ev, ids, shift, stored_class, bounds, rows, cols, tiles, pair_index, out,
+                 logz, num_cats, K, Vl, R_s, C, NCT, TRANSPOSED: tl.constexpr, BY_TILE: tl.constexpr,
+                 TU: tl.constexpr, TK: tl.constexpr, TC: tl.constexpr):
+    """One program per (tile, column of the tile: a variable and sample): per stored class, the sums ``sum_k p(v_k)
+    w_k`` of the tile's rows over the column's candidates ``v_k`` of the class -- the probabilities read at the
+    candidates alone (``TRANSPOSED``: from the token-major table ``table_t``, a candidate's rows contiguous), scaled
+    by 2^64 so that tiny products do not flush, dotted with the weights spread over ``TC`` classes -- and their logs
+    (the evidence's shift added back; -inf for a class without a candidate), into ``out`` [Be, R_s, C] at the pairs
+    the nodes read; and every row's ``log Z``, the sum over every candidate (those of enumerated classes, column -1,
+    count there alone), into ``logz`` [Be, R_s]. ``BY_TILE``: ``NCT`` tiles of classes, the candidates sorted by tile
+    (``bounds``: where every tile starts, per column; the enumerated classes' candidates before the first), else one."""
     tile = tl.program_id(0)
     j = tl.program_id(1)
     r0, nr = tl.load(tiles + tile * 4), tl.load(tiles + tile * 4 + 1)
@@ -485,6 +504,19 @@ def _topk_kernel(table, table_t, num_rows, ev, ids, shift, token_class, bounds, 
     keep = rm & (s >= 0) & on
     dst = out + (b * R_s + s) * C
     cls = tl.arange(0, TC)
+    total = tl.zeros([TU], dtype = tl.float32)
+    if BY_TILE:                                                             # the enumerated classes' candidates
+        k1 = tl.where(on, tl.load(bounds + col * (NCT + 1)), 0)
+        for k in range(0, k1, TK):
+            kk = k + tl.arange(0, TK)
+            km = kk < k1
+            v = tl.load(ids + col * K + kk, mask = km, other = 0).to(tl.int64)
+            w = tl.exp(tl.load(ev + col * K + kk, mask = km, other = float("-inf")) - m)
+            if TRANSPOSED:
+                p = tl.load(table_t + v[:, None] * num_rows + r[None, :], mask = km[:, None] & rm[None, :], other = 0.0)
+            else:
+                p = tl.load(table + r[None, :] * num_cats + v[:, None], mask = km[:, None] & rm[None, :], other = 0.0)
+            total += tl.sum(w[:, None] * (p * 18446744073709551616.0), axis = 0)
     for t in range(0, NCT):
         if BY_TILE:
             k0 = tl.load(bounds + col * (NCT + 1) + t)
@@ -499,16 +531,19 @@ def _topk_kernel(table, table_t, num_rows, ev, ids, shift, token_class, bounds, 
             km = kk < k1
             v = tl.load(ids + col * K + kk, mask = km, other = 0).to(tl.int64)
             w = tl.exp(tl.load(ev + col * K + kk, mask = km, other = float("-inf")) - m)
-            c = tl.load(token_class + v, mask = km, other = -1) - t * TC
+            c = tl.load(stored_class + v, mask = km, other = -1) - t * TC
             if TRANSPOSED:
                 p = tl.load(table_t + v[:, None] * num_rows + r[None, :], mask = km[:, None] & rm[None, :], other = 0.0)
             else:
                 p = tl.load(table + r[None, :] * num_cats + v[:, None], mask = km[:, None] & rm[None, :], other = 0.0)
+            ps = p * 18446744073709551616.0                                                       # x 2^64
             wc = tl.where(cls[:, None] == c[None, :], w[None, :], 0.0)                            # [TC, TK]
-            acc += tl.dot(wc, p * 18446744073709551616.0, input_precision = "ieee")               # x 2^64
+            acc += tl.dot(wc, ps, input_precision = "ieee")
+            total += tl.sum(w[:, None] * ps, axis = 0)
         cc = t * TC + cls
         tl.store(dst[None, :] + cc[:, None], tl.log(acc) - 44.3614195558365 + m,
                  mask = keep[None, :] & (cc < C)[:, None])
+    tl.store(logz + b * R_s + s, tl.log(total) - 44.3614195558365 + m, mask = keep)
 
 
 @triton_jit

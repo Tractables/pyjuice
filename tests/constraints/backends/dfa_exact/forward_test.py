@@ -60,12 +60,14 @@ def sum_path(request, monkeypatch):
     return request.param
 
 
-@pytest.fixture(params = ["classes", "grouped"])
+@pytest.fixture(params = ["classes", "entries", "grouped"])
 def transitions(request, monkeypatch):
-    """A missing token's transitions one class at a time, or grouped by successor through transition masses (the
-    test automata have far fewer classes than grouping is used from by default)."""
+    """A missing token's transitions one class at a time (every class of the automaton, or a column's live entries),
+    or grouped by successor through transition masses (the test automata have far fewer classes than grouping is
+    used from by default, and most of their (column, class) pairs are live)."""
     import pyjuice.constraints.backends.dfa_exact.compiled.program as P
-    monkeypatch.setattr(P, "GROUP_MIN_RATIO", 1 << 30 if request.param == "classes" else 0)
+    monkeypatch.setattr(P, "GROUP_MIN_RATIO", 0 if request.param == "grouped" else 1 << 30)
+    monkeypatch.setattr(P, "ENTRY_LOOP_MAX_LIVE", 2 if request.param == "entries" else 0)
     return request.param
 
 
@@ -304,12 +306,12 @@ def test_fast_inference_keeps_the_class_masses(kind, build_pc, reference, monkey
     and kept, through a nested scope, until the outer scope exits. Outside one every query computes them, so an
     in-place parameter update -- here after the scope -- is read."""
     from pyjuice.constraints.distributions import categorical
+    import pyjuice.constraints.backends.dfa_exact.compiled.program as P
+    monkeypatch.setattr(P, "GROUP_MIN_RATIO", 0)                       # transitions grouped (decided when compiling)
     n = KINDS[kind]
     pc, other = build_pc(kind, n, V, seed = 0), build_pc(kind, n, V, seed = 1)
     cc = jc.compile(CONSTRAINTS["contains"](), pc)
     data, missing = evidence(n, 4)
-    import pyjuice.constraints.backends.dfa_exact.compiled.program as P
-    monkeypatch.setattr(P, "GROUP_MIN_RATIO", 0)                       # transitions grouped
     calls, computed = [], categorical.class_masses
     monkeypatch.setattr(categorical, "class_masses", lambda *a, **k: calls.append(1) or computed(*a, **k))
     builds, built = [], P.transition_masses                              # the transition masses follow them
@@ -532,7 +534,12 @@ def test_transition_masses_match_brute_force(build_pc, monkeypatch):
     ptr, succ = tt.entry_ptr.long().cpu(), tt.entry_succ.long().cpu()
     assert tt.grouped and prog.trans_persistent and tt.max_pairs > 16    # several pair tiles at the narrowest
     assert nc.size(2) > transitions.TRANSITION_TILES["TC"]
-    T, cm = prog.transition_buffer().double().cpu(), cc.backend.state._class_mars.double().cpu()
+    assert cc.backend.token_classes.num_enumerated > 0                   # (most classes one token: enumerated)
+    T = prog.transition_buffer().double().cpu()
+    layer = next(iter(pc.input_layer_group))                             # the class masses, in float64 from the
+    tc = cc.backend.token_classes.token_class.long()                     # parameters (the table holds the stored
+    cm = torch.zeros(layer.params.numel() // V2, nc.size(2), dtype = torch.float64, device = tc.device)   # ones)
+    cm = cm.index_add_(1, tc, layer.params.double().view(-1, V2)).log().cpu()
     mass_row = prog.mass_row.long().cpu()
     assert (cm[torch.isfinite(cm)] < -87.4).any()                       # class masses below the normal range
     assert (cm.max(dim = 1).values < -87.4).any()                       # ... every class of a row
@@ -546,11 +553,11 @@ def test_transition_masses_match_brute_force(build_pc, monkeypatch):
                 assert abs(float(got - want)) < 1e-5, (u, t, q, g, float(got), float(want))
 
 
-@pytest.mark.parametrize("kind", ["hmm", "left_linear", "pd", "hand_left"])
-def test_chunked_transition_masses_change_nothing(kind, build_pc, monkeypatch):
-    """Transitions grouped, with a budget of one float: every input step's transition masses are built on their own,
-    just before the step, into one shared scratch -- the marginal of keeping them all, bit for bit (a wide
-    automaton; the buffers filled with NaN before each call)."""
+@pytest.mark.parametrize("kind", ["hmm", "pd"])
+def test_transitions_over_the_budget_are_not_grouped(kind, build_pc, monkeypatch):
+    """Transitions grouped by the ratio, with a budget of one float: the program reads the classes' masses instead
+    (ungrouped tables), and gives the marginal of grouping them -- a wide automaton; the buffers filled with NaN
+    before each call, so a slot no program writes shows."""
     import pyjuice.constraints.backends.dfa_exact.compiled.program as P
     monkeypatch.setattr(P, "GROUP_MIN_RATIO", 0)
     rng = random.Random(0)
@@ -566,10 +573,10 @@ def test_chunked_transition_masses_change_nothing(kind, build_pc, monkeypatch):
         bufs["node_mars"].fill_(float("nan"))
         bufs["element_mars"].fill_(float("nan"))
         out = cc.marginal(data, missing)
-        assert cc.backend.program().trans_persistent == (budget > 1)
+        assert cc.backend.grouped == (budget > 1)
         return out
 
-    assert torch.equal(marginal(1), marginal(1 << 26))
+    assert torch.allclose(marginal(1), marginal(1 << 26), atol = 1e-5, rtol = 1e-5)
 
 
 def test_splitting_block_block_tiles_changes_nothing(build_pc, monkeypatch):

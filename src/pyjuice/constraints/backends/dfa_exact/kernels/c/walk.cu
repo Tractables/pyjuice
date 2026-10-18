@@ -110,12 +110,21 @@ __device__ __forceinline__ float log_add(float a, float b) {
     return hi == -CUDART_INF_F ? -CUDART_INF_F : tri_log(tri_exp(a - s) + tri_exp(b - s)) + s;
 }
 
+// A class's CODE at a boundary (`kernels/transitions.py`, EnumeratedTokens): a stored class's column of the class-mass
+// table, or -1 - e for the e-th enumerated token live at the boundary (its mass its token's own probability). The
+// staged masses of a child run over the Cs stored columns, then the boundary's enumerated tokens: code x sits at
+// `x >= 0 ? x : Cs + (-1 - x)`, which is what a packed term carries.
+__device__ __forceinline__ int code_index(int x, int Cs) {
+    return x >= 0 ? x : Cs + (-1 - x);
+}
+
 struct TermArgs {
     const int* tlist;      // [T]: the launch's boundaries t
     WIdx ecum;             // [T + 1]: the entries of the boundaries before, of one sample's copy
     const int* pred_ptr;   // [n, W + 1]
     const int* pred_col;
-    const int* pred_x;
+    const int* pred_x;     // every entry's class code
+    const int* code;       // [n, C]: every class's code at every boundary
     WIdx obs;              // [B, n]: observed classes, -1 where missing
     const int* ccount;     // [B * (n + 1)]
     WIdx cstart;
@@ -125,7 +134,7 @@ struct TermArgs {
     int* cnt;              // [T, B, W]: by live column's place
     int* perm;             // [T, B, W]: the live columns' places, most terms first (none: not ordered)
     int* done;             // [T, B]: CTAs done (0 between launches)
-    int B, n, W, xb;       // xb: a term's class bits
+    int B, n, W, C, Cs, xb;   // xb: a term's mass-index bits
 };
 
 __global__ void __launch_bounds__(TW) ibtd_terms_kernel(TermArgs a) {
@@ -144,6 +153,7 @@ __global__ void __launch_bounds__(TW) ibtd_terms_kernel(TermArgs a) {
         const long long E = a.ecum[ti + 1] - a.ecum[ti];
         int* out = a.terms + a.ecum[ti] * a.B + (long long)b * E + (e0 - pp[0]);
         const int oc = (int)a.obs[(long long)b * n + t];
+        const int code_oc = oc >= 0 ? a.code[(long long)t * a.C + oc] : -1;   // the observed class's code
         const int* rank = a.crank + ((long long)b * (n + 1) + t) * W;
         int kept = 0;
         for (int base = e0; base < e1; base += 32) {
@@ -152,10 +162,10 @@ __global__ void __launch_bounds__(TW) ibtd_terms_kernel(TermArgs a) {
             int pk = 0;
             if (e < e1) {
                 const int x = a.pred_x[e];
-                if (oc < 0 || x == oc) {
+                if (oc < 0 || x == code_oc) {
                     const int ri = rank[a.pred_col[e]];
                     ok = ri >= 0;
-                    pk = (int)(((unsigned)ri << a.xb) | (unsigned)x);
+                    pk = (int)(((unsigned)ri << a.xb) | (unsigned)code_index(x, a.Cs));
                 }
             }
             const unsigned m = __ballot_sync(0xffffffffu, ok);
@@ -209,7 +219,14 @@ struct IbArgs {
     const int* mass_stride;
     const int* pred_ptr;
     const int* pred_col;
-    const int* pred_x;
+    const int* pred_x;     // every entry's class code
+    const int* code;       // [n, C]: every class's code at every boundary
+    const int* tok_ptr;    // [n + 1]: the enumerated tokens live at boundary t are tok[tok_ptr[t] .. tok_ptr[t + 1]]
+    const int* tok;
+    const float* tokmaj;   // [V, num_rows]: every token's probability under every parameter row
+    const int* prow;       // [rows of class_mars]: every row's parameter row
+    const float* lognorm;  // [rows of class_mars]: every row's log Z (per-sample masses)
+    const float* enum_logw;   // [B or 1, enumerated tokens + 1]: every enumerated token's log weight per sample
     const int* width;
     const int* iv_of;
     WIdx iv_info;
@@ -231,8 +248,8 @@ struct IbArgs {
     const int* perm;
     long long out_first, out_width, temp_width;
     long long team_floats;   // a team's shared memory (floats, a multiple of 4)
-    int B, n, W, C, input_start, subs, tn, lp_ld, xb;
-    int sample, c_kind, out_temp, c_full, out_full;
+    int B, n, W, C, Cs, mw, num_rows, logw_stride, input_start, subs, tn, lp_ld, xb;   // mw: staged masses a child
+    int sample, logw, c_kind, out_temp, c_full, out_full;
 };
 
 template <int G>
@@ -257,7 +274,7 @@ __global__ void __launch_bounds__(256) ibtd_kernel(IbArgs a) {
     __shared__ long long s_dst[WTILE];         // where a child's row starts (`node_flows` / `temp_flows`)
     __shared__ long long s_op[WARPS ? WTEAMS : 1][WTILE];     // where its parent's row starts (a team's parent r)
     __shared__ long long s_mrow[WARPS ? WTEAMS : 1][WTILE];   // its parent's class masses (the team's sample's)
-    const int n = a.n, B = a.B, W = a.W, C = a.C, TN = a.tn;
+    const int n = a.n, B = a.B, W = a.W, Cs = a.Cs, MW = a.mw, TN = a.tn;
     const int team = WARPS ? threadIdx.x >> 5 : 0;                        // a team sums one sample
     const int tid = WARPS ? threadIdx.x & 31 : threadIdx.x, nt = WARPS ? 32 : blockDim.x;
     const int tile = blockIdx.x / a.subs, sub = blockIdx.x - tile * a.subs;
@@ -299,10 +316,12 @@ __global__ void __launch_bounds__(256) ibtd_kernel(IbArgs a) {
     const int* perm = a.perm != nullptr ? a.perm + sb * W : nullptr;
     const float* src = a.out_temp ? a.temp_flows : a.element_flows;
     float* O = sm + (long long)team * a.team_floats;                     // [lp_ld][TN]: the parents' lanes
-    float* M = O + (long long)a.lp_ld * TN;                               // [C][TN]: their class masses
-    float* own = M + (long long)C * TN;                                   // [TN]: an observed token's log-prob
+    float* M = O + (long long)a.lp_ld * TN;                               // [MW][TN]: their masses, by code index
+    float* own = M + (long long)MW * TN;                                  // [TN]: an observed token's log-prob
     long long* op_ = s_op[team];
     long long* mrow = s_mrow[team];
+    const int tk = a.tok_ptr[t], ecount = a.tok_ptr[t + 1] - tk;          // the boundary's enumerated tokens
+    const int code_oc = oc >= 0 ? a.code[(long long)t * a.C + oc] : -1;
     auto sync = [&]() {
         if constexpr (WARPS) __syncwarp();
         else __syncthreads();
@@ -318,7 +337,7 @@ __global__ void __launch_bounds__(256) ibtd_kernel(IbArgs a) {
                 const long long row = a.parents[p * 7], u = a.parents[p * 7 + 1];
                 op_[tid] = a.out_temp ? row * a.temp_width : (row - a.out_first) * a.out_width;
                 const long long k = u - a.input_start;
-                mrow[tid] = ((long long)a.mass_row[k] + (a.sample ? (long long)b * a.mass_stride[k] : 0)) * C;
+                mrow[tid] = (long long)a.mass_row[k] + (a.sample ? (long long)b * a.mass_stride[k] : 0);
                 if (oc >= 0) own[tid] = a.node_mars[u * B + b];
             }
         }
@@ -329,9 +348,19 @@ __global__ void __launch_bounds__(256) ibtd_kernel(IbArgs a) {
                 O[(long long)l * TN + k] = s_c[k] >= 0 ? src[op_[k] + base_p + l] : -CUDART_INF_F;
             }
         if (oc < 0)
-            for (int e = tid; e < TN * C; e += nt) {
-                const int k = e / C, x = e - k * C;
-                M[x * TN + k] = s_c[k] >= 0 ? a.class_mars[mrow[k] + x] : -CUDART_INF_F;
+            for (int e = tid; e < TN * MW; e += nt) {                    // stored columns, then enumerated tokens
+                const int k = e / MW, x = e - k * MW;
+                float v = -CUDART_INF_F;
+                if (s_c[k] >= 0) {
+                    if (x < Cs) {
+                        v = a.class_mars[mrow[k] * Cs + x];
+                    } else if (x - Cs < ecount) {                        // (`_entry_mass`'s arithmetic, in its order)
+                        const int ei = x - Cs;
+                        v = tri_log(a.tokmaj[(long long)a.tok[tk + ei] * a.num_rows + a.prow[mrow[k]]]);
+                        if (a.logw) v = v + a.enum_logw[(long long)b * a.logw_stride + tk + ei] - a.lognorm[mrow[k]];
+                    }
+                }
+                M[x * TN + k] = v;
             }
         sync();
     };
@@ -372,11 +401,11 @@ __global__ void __launch_bounds__(256) ibtd_kernel(IbArgs a) {
         } else {                                                          // the one block kept once, by slot
             for (int s = pp[q]; s < pp[q + 1]; ++s) {
                 const int i = a.pred_col[s], x = a.pred_x[s];
-                if (oc >= 0 && x != oc) continue;
+                if (oc >= 0 && x != code_oc) continue;
                 long long sl = (long long)i * X + j;
                 if (opos >= 0) sl = a.iv_table[opos + sl];
                 if (sl < 0) continue;
-                if (oc < 0) load_g<G>(M + x * TN + k0, mv);
+                if (oc < 0) load_g<G>(M + code_index(x, Cs) * TN + k0, mv);
 #pragma unroll
                 for (int c = 0; c < G; ++c)
                     if (s_c[k0 + c] >= 0) lse_one_exp(mx[c], acc[c], mv[c] + src[op_[k0 + c] + sl]);
@@ -434,10 +463,11 @@ __global__ void __launch_bounds__(256) ibtd_kernel(IbArgs a) {
 
 }  // namespace
 
-// Shared memory of a CTA of `tn` children: their parents' lanes (`lp_ld` each), class masses, observed
-// log-probabilities (`prod_top_down._input_block_cuda` sizes the CTAs by the same rule)
-static int64_t ibtd_smem(int64_t tn, int64_t lp_ld, int64_t C) {
-    return (4 * tn * (lp_ld + C + 1) + 15) / 16 * 16;
+// Shared memory of a CTA of `tn` children: their parents' lanes (`lp_ld` each), masses (`mw`: the stored columns and a
+// boundary's most enumerated tokens), observed log-probabilities (`prod_top_down._input_block_cuda` sizes the CTAs by
+// the same rule)
+static int64_t ibtd_smem(int64_t tn, int64_t lp_ld, int64_t mw) {
+    return (4 * tn * (lp_ld + mw + 1) + 15) / 16 * 16;
 }
 
 // The most dynamic shared memory a CTA of `ibtd_kernel<G, WARPS>` may take (the device's opt-in less the kernel's
@@ -481,25 +511,31 @@ void ibtd_cuda(torch::Tensor element_flows, torch::Tensor temp_flows, torch::Ten
                int64_t out_width, int64_t temp_width, int64_t B, int64_t n, int64_t W, int64_t C,
                int64_t input_start, int64_t subs, int64_t tn, int64_t threads, bool warps, bool sort,
                int64_t lp_ld, int64_t cq_max, bool sample, int64_t c_kind, bool out_temp, bool c_full,
-               bool out_full) {
+               bool out_full, torch::Tensor code, torch::Tensor tok_ptr, torch::Tensor tok, torch::Tensor tokmaj,
+               torch::Tensor prow, torch::Tensor lognorm, torch::Tensor enum_logw, int64_t Cs, int64_t mw,
+               int64_t num_rows, int64_t logw_stride, bool logw) {
     TORCH_CHECK(node_flows.scalar_type() == torch::kFloat32 && element_flows.scalar_type() == torch::kFloat32 &&
                 temp_flows.scalar_type() == torch::kFloat32 && node_mars.scalar_type() == torch::kFloat32 &&
-                class_mars.scalar_type() == torch::kFloat32, "ibtd_cuda: fp32 values");
+                class_mars.scalar_type() == torch::kFloat32 && tokmaj.scalar_type() == torch::kFloat32 &&
+                lognorm.scalar_type() == torch::kFloat32 && enum_logw.scalar_type() == torch::kFloat32,
+                "ibtd_cuda: fp32 values");
     TORCH_CHECK(tn >= 1 && tn <= WTILE && subs * tn <= WTILE && (tn < 4 || tn % 4 == 0),
                 "ibtd_cuda: 1, 2 or a multiple of 4 children a CTA, at most 16 a tile");
     TORCH_CHECK(threads == 128 || threads == 256, "ibtd_cuda: 128 or 256 threads");
     TORCH_CHECK(!warps || threads / 32 <= WTEAMS, "ibtd_cuda: at most 8 warp teams");
-    int xb = 1;                                                           // a term's class bits, its place the rest
-    while ((1LL << xb) < C) ++xb;
-    TORCH_CHECK(xb < 32 && W < (1LL << (32 - xb)), "ibtd_cuda: a term packs (place, class) in 32 bits");
+    TORCH_CHECK(mw >= Cs && mw >= 1, "ibtd_cuda: the staged masses hold every stored column");
+    int xb = 1;                                                     // a term's mass-index bits, its place the rest
+    while ((1LL << xb) < mw) ++xb;
+    TORCH_CHECK(xb < 32 && W < (1LL << (32 - xb)), "ibtd_cuda: a term packs (place, mass index) in 32 bits");
     const int64_t ntiles = tiles.numel() / WTILE;
     const int T = (int)tlist.numel();
     if (ntiles == 0 || B == 0 || T == 0 || cq_max == 0) return;
     auto stream = at::cuda::getCurrentCUDAStream();
     TermArgs ta{i32(tlist, "tlist"), widx(ecum), i32(pred_ptr, "pred_ptr"), i32(pred_col, "pred_col"),
-                i32(pred_x, "pred_x"), widx(obs_class), i32(ccount, "ccount"), widx(cstart), i32(ccolumns, "ccolumns"),
-                i32(crank, "crank"), terms.data_ptr<int>(), cnt.data_ptr<int>(),
-                sort ? perm.data_ptr<int>() : nullptr, done.data_ptr<int>(), (int)B, (int)n, (int)W, xb};
+                i32(pred_x, "pred_x"), i32(code, "code"), widx(obs_class), i32(ccount, "ccount"), widx(cstart),
+                i32(ccolumns, "ccolumns"), i32(crank, "crank"), terms.data_ptr<int>(), cnt.data_ptr<int>(),
+                sort ? perm.data_ptr<int>() : nullptr, done.data_ptr<int>(), (int)B, (int)n, (int)W, (int)C, (int)Cs,
+                xb};
     ibtd_terms_kernel<<<dim3((unsigned)((cq_max + TW / 32 - 1) / (TW / 32)), (unsigned)B, (unsigned)T), TW, 0,
                         stream>>>(ta);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -515,6 +551,13 @@ void ibtd_cuda(torch::Tensor element_flows, torch::Tensor temp_flows, torch::Ten
     a.pred_ptr = i32(pred_ptr, "pred_ptr");
     a.pred_col = i32(pred_col, "pred_col");
     a.pred_x = i32(pred_x, "pred_x");
+    a.code = i32(code, "code");
+    a.tok_ptr = i32(tok_ptr, "tok_ptr");
+    a.tok = i32(tok, "tok");
+    a.tokmaj = tokmaj.data_ptr<float>();
+    a.prow = i32(prow, "prow");
+    a.lognorm = lognorm.data_ptr<float>();
+    a.enum_logw = enum_logw.data_ptr<float>();
     a.width = i32(width, "width");
     a.iv_of = i32(iv_of, "iv_of");
     a.iv_info = widx(iv_info);
@@ -543,17 +586,22 @@ void ibtd_cuda(torch::Tensor element_flows, torch::Tensor temp_flows, torch::Ten
     a.n = (int)n;
     a.W = (int)W;
     a.C = (int)C;
+    a.Cs = (int)Cs;
+    a.mw = (int)mw;
+    a.num_rows = (int)num_rows;
+    a.logw_stride = (int)logw_stride;
     a.input_start = (int)input_start;
     a.subs = (int)subs;
     a.tn = (int)tn;
     a.lp_ld = (int)lp_ld;
     a.xb = xb;
     a.sample = sample;
+    a.logw = logw;
     a.c_kind = (int)c_kind;
     a.out_temp = out_temp;
     a.c_full = c_full;
     a.out_full = out_full;
-    a.team_floats = ibtd_smem(tn, lp_ld, C) / 4;
+    a.team_floats = ibtd_smem(tn, lp_ld, mw) / 4;
     const int64_t smem = 4 * a.team_floats * (warps ? threads / 32 : 1);
     const dim3 grid((unsigned)(ntiles * subs), (unsigned)(warps ? (B + threads / 32 - 1) / (threads / 32) : B));
 #define IBTD_LAUNCH(GG, WW) \

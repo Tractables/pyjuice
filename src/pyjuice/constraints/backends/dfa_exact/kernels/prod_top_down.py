@@ -36,6 +36,7 @@ from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 from .common import (NODE_TILE, SUM, _block_ptr, _child, _exit_width, _interval, _logaddexp_tile, _lse_step, _pair,
                      _slot, _tf32_operand, _tile_rows, grid_chunks, tensor)
 from .compact import _lane, _lane_ends
+from .transitions import enumerated_args
 from .prod import (BLOCK_BLOCK_PROGRAMS_PER_SM, BLOCK_BLOCK_TILES, EXACT_BELOW, PRODUCT_PRECISION, SKIP_EMPTY_TILES,
                    _chunk_needed, _flat_tile, _live_lanes, _lse_step_one_exp, _lse_value, _rect_product,
                    _rect_product_exact, _tile, _tile_load, compact_tiles)
@@ -196,16 +197,46 @@ def _copy_top_down_kernel(element_flows, temp_flows, node_flows, iv_of, iv_info,
         _store_flows(cp, cols, _lse_value(mx, acc), m, add)
 
 
+@triton.jit
+def _entry_mass(masses, x, code_oc, tokmaj, pr, lz, lw0, tok0, num_rows, oc, own, vm, ENUM: tl.constexpr,
+                LOGW: tl.constexpr, OBSERVED: tl.constexpr):
+    """The mass of an entry of class code ``x`` ([lanes]) at the parents' rows (``masses`` [TN, lanes] the rows'
+    stored masses; ``ENUM``: ``tokmaj`` + ``pr`` [TN, lanes] the rows' token-major columns, ``tok0`` the boundary's
+    enumerated tokens, ``LOGW``: ``lw0`` their weights for the lane's sample and ``lz`` [TN, lanes] the rows' ``log
+    Z``) -- ``OBSERVED``: or, where the lane observes a token (``oc`` >= 0), the token's own log-probability ``own`` if
+    the entry's class is the observed one (``code_oc`` its code), else -inf."""
+    if OBSERVED:
+        miss = vm & (oc < 0)[None, :]
+    else:
+        miss = vm
+    if ENUM:
+        enum = (x < 0)[None, :]
+        stored = tl.load(masses + tl.maximum(x, 0)[None, :], mask = miss & ~enum, other = float("-inf"))
+        e = tl.maximum(-1 - x, 0).to(tl.int64)             # the e-th enumerated token (a stored entry: the boundary's
+        v = tl.load(tok0 + e).to(tl.int64)                 # first, or the padding past the last; unread)
+        val = tl.log(tl.load(tokmaj + v[None, :] * num_rows + pr, mask = miss & enum, other = 0.0))
+        if LOGW:
+            val = val + tl.load(lw0 + e)[None, :] - lz
+        mass = tl.where(enum, val, stored)
+    else:
+        mass = tl.load(masses + x[None, :], mask = miss, other = float("-inf"))
+    if OBSERVED:
+        holds = x == code_oc
+        return tl.where((oc >= 0)[None, :], tl.where(holds[None, :], own, float("-inf")), mass)
+    return mass
+
+
 @triton_jit
 def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mars, obs_class, next_col, class_mars,
                                 mass_row, mass_stride, trans, trans_stride, pred_ptr, pred_col, pred_x, width, iv_of,
                                 iv_info, iv_table, once_iv, live, lanes, lane_first, lane_live, coff, ccount, cstart,
                                 ccolumns, crank, children, tiles, ptr, parents, reg_offset, reg_width, reg_first,
+                                code, tok_ptr, tok, tokmaj, prow, lognorm, enum_logw, Cs, num_rows, logw_stride,
                                 out_first, out_width, temp_width, B, n, W, C, input_start, csteps, pid0,
                                 C_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, GROUPED: tl.constexpr,
                                 PRUNE: tl.constexpr, ORDERED: tl.constexpr, COMPACT: tl.constexpr,
-                                C_FULL: tl.constexpr, OUT_FULL: tl.constexpr, SAMPLE: tl.constexpr, TN: tl.constexpr,
-                                SUBS: tl.constexpr, TILE: tl.constexpr):
+                                C_FULL: tl.constexpr, OUT_FULL: tl.constexpr, SAMPLE: tl.constexpr, ENUM: tl.constexpr,
+                                LOGW: tl.constexpr, TN: tl.constexpr, SUBS: tl.constexpr, TILE: tl.constexpr):
     """The right operand ``R`` over ``[t + 1, t2)`` of ``input @ block`` steps: ``O_R[q, j] = log sum over the
     parents, and over the entries ``(i, class)`` leading to ``q`` at boundary ``t``, of mass + O_out[i, j]``. One
     program per ``TN`` children of a node tile (:func:`~.common.node_tiles`: children of one interval with as many
@@ -215,7 +246,8 @@ def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
     evidence usually leaves a few live (one per sample through an observed prefix). ``COMPACT``: the child's and the
     parents' values compact (:mod:`.compact`), a lane per pair of live columns, -inf at a pair the automaton does not
     join. ``SAMPLE``: class masses of each sample's own (see :class:`~..state.ClassMasses`; transition masses
-    ``trans_stride`` floats apart)."""
+    ``trans_stride`` floats apart). Ungrouped, an entry's mass is read by its class's code (``ENUM``: an enumerated
+    class's from its token, see :func:`_entry_mass`; ``Cs`` the stored classes, the table's width)."""
     c, real, c0 = _tile_rows(tiles, tl.program_id(0), TN, SUBS)
     tile = pid0 + tl.program_id(1)
     row = tl.load(children + c * 4 + 0)
@@ -277,9 +309,19 @@ def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
                     masses = masses + tl.where((tl.load(mass_stride + (u - input_start)) > 0)[:, None],
                                                b[None, :] * trans_stride, 0)
             else:
-                masses = (class_mars + tl.load(mass_row + (u - input_start)).to(tl.int64) * C)[:, None]
+                mrow = tl.load(mass_row + (u - input_start)).to(tl.int64)[:, None]
                 if SAMPLE:
-                    masses = masses + b[None, :] * (tl.load(mass_stride + (u - input_start)).to(tl.int64) * C)[:, None]
+                    mrow = mrow + b[None, :] * tl.load(mass_stride + (u - input_start)).to(tl.int64)[:, None]
+                else:
+                    mrow = mrow + (b * 0)[None, :]
+                masses = class_mars + mrow * Cs
+                if ENUM:                                                     # the rows' token-major columns, log Z
+                    pr = tl.load(prow + mrow, mask = om, other = 0).to(tl.int64)
+                    if LOGW:
+                        lz = tl.load(lognorm + mrow, mask = om, other = 0.0)
+                    else:
+                        lz = pr
+                    code_oc = tl.load(code + t * C + tl.maximum(oc, 0), mask = m, other = -1)
             for k in range(0, tl.max(e1 - e0, axis = 0)):                    # entry (i, x) -> q
                 em = ml & (e0 + k < e1)
                 i = tl.load(pred_col + e0 + k, mask = em, other = 0)
@@ -287,13 +329,18 @@ def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
                 sl = _parent_lane(_slot(iv_table, opos, i, j, X, em, OUT_FULL), b, once, coff, ccount, crank, kp, t,
                                   i, t2, j, em, B, n, W, COMPACT)
                 ev = em & (sl >= 0)                                          # a dead parent lane: no term, nothing read
+                vm = real[:, None] & ev[None, :]
                 if GROUPED:                                                  # the observed class leads to q?
                     holds = tl.load(next_col + (t * W + i) * C + tl.maximum(oc, 0), mask = ev, other = -1) == q
-                else:                                                        # is it this entry's class?
-                    holds = x == oc
-                vm = real[:, None] & ev[None, :]
-                mass = tl.where((oc >= 0)[None, :], tl.where(holds[None, :], own, float("-inf")),
-                                tl.load(masses + x[None, :], mask = vm & (oc < 0)[None, :], other = float("-inf")))
+                    mass = tl.where((oc >= 0)[None, :], tl.where(holds[None, :], own, float("-inf")),
+                                    tl.load(masses + x[None, :], mask = vm & (oc < 0)[None, :], other = float("-inf")))
+                elif ENUM:                                                   # is it this entry's class?
+                    tk = tl.load(tok_ptr + t)
+                    mass = _entry_mass(masses, x, code_oc, tokmaj, pr, lz, enum_logw + b * logw_stride + tk, tok + tk,
+                                       num_rows, oc, own, vm, ENUM, LOGW, True)
+                else:
+                    mass = _entry_mass(masses, x, oc, tokmaj, masses, masses, enum_logw, tok, num_rows, oc, own, vm,
+                                       ENUM, LOGW, True)
                 ov = tl.load(op + sl[None, :], mask = vm, other = float("-inf"))
                 mx, acc = _lse_step_one_exp(mx, acc, mass + ov)
         val = _lse_value(mx, acc)
@@ -307,14 +354,16 @@ def _block_input_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
                                 mass_row, mass_stride, trans, trans_stride, entry_ptr, entry_succ, entry_x, width,
                                 iv_of, iv_info, iv_table, once_iv, live, lanes, lane_first, lane_live, coff, ccount,
                                 cstart, ccolumns, crank, children, tiles, ptr, parents, reg_offset, reg_width,
-                                reg_first, out_first, out_width, temp_width, B, n, W, C, input_start, csteps, pid0,
+                                reg_first, code, tok_ptr, tok, tokmaj, prow, lognorm, enum_logw, Cs, num_rows,
+                                logw_stride, out_first, out_width, temp_width, B, n, W, C, input_start, csteps, pid0,
                                 C_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, GROUPED: tl.constexpr,
                                 PRUNE: tl.constexpr, ORDERED: tl.constexpr, COMPACT: tl.constexpr,
-                                C_FULL: tl.constexpr, OUT_FULL: tl.constexpr, SAMPLE: tl.constexpr, TN: tl.constexpr,
-                                SUBS: tl.constexpr, TILE: tl.constexpr):
+                                C_FULL: tl.constexpr, OUT_FULL: tl.constexpr, SAMPLE: tl.constexpr, ENUM: tl.constexpr,
+                                LOGW: tl.constexpr, TN: tl.constexpr, SUBS: tl.constexpr, TILE: tl.constexpr):
     """The left operand ``L`` over ``[t0, t)`` of ``block @ input`` steps (output over ``[t0, t + 1)``): ``O_L[i, q] =
     log sum over the parents and over the entries ``(successor, class)`` of ``q`` at boundary ``t`` of mass +
-    O_out[i, successor]``. Node tiles, ``ORDERED``, ``COMPACT``, ``SAMPLE``: as :func:`_input_block_top_down_kernel`."""
+    O_out[i, successor]``. Node tiles, ``ORDERED``, ``COMPACT``, ``SAMPLE``, codes (``ENUM``): as
+    :func:`_input_block_top_down_kernel`."""
     c, real, c0 = _tile_rows(tiles, tl.program_id(0), TN, SUBS)
     tile = pid0 + tl.program_id(1)
     row = tl.load(children + c * 4 + 0)
@@ -388,10 +437,18 @@ def _block_input_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
                         masses = masses + tl.where((tl.load(mass_stride + (u - input_start)) > 0)[:, None],
                                                    b[None, :] * trans_stride, 0)
                 else:
-                    masses = (class_mars + tl.load(mass_row + (u - input_start)).to(tl.int64) * C)[:, None]
+                    mrow = tl.load(mass_row + (u - input_start)).to(tl.int64)[:, None]
                     if SAMPLE:
-                        masses = masses + b[None, :] * \
-                            (tl.load(mass_stride + (u - input_start)).to(tl.int64) * C)[:, None]
+                        mrow = mrow + b[None, :] * tl.load(mass_stride + (u - input_start)).to(tl.int64)[:, None]
+                    else:
+                        mrow = mrow + (b * 0)[None, :]
+                    masses = class_mars + mrow * Cs
+                    if ENUM:
+                        pr = tl.load(prow + mrow, mask = om, other = 0).to(tl.int64)
+                        if LOGW:
+                            lz = tl.load(lognorm + mrow, mask = om, other = 0.0)
+                        else:
+                            lz = pr
                 for k in range(0, tl.max(e1 - e0, axis = 0)):
                     em = miss & (e0 + k < e1)
                     s = tl.load(entry_succ + e0 + k, mask = em, other = -1)
@@ -400,8 +457,15 @@ def _block_input_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
                                       kp, t0, i, t + 1, s, em, B, n, W, COMPACT)
                     vm = real[:, None] & (em & (sl >= 0))[None, :]           # a live parent lane: else nothing read
                     ov = tl.load(op + sl[None, :], mask = vm, other = float("-inf"))
-                    mass = tl.load(masses + tl.load(entry_x + e0 + k, mask = em & (sl >= 0), other = 0)[None, :],
-                                   mask = vm, other = float("-inf"))
+                    x = tl.load(entry_x + e0 + k, mask = em & (sl >= 0), other = 0)
+                    if GROUPED:
+                        mass = tl.load(masses + x[None, :], mask = vm, other = float("-inf"))
+                    elif ENUM:                                               # (no lane here observes a token)
+                        tk = tl.load(tok_ptr + t)                            # (`t0`: the block's start)
+                        mass = _entry_mass(masses, x, x, tokmaj, pr, lz, enum_logw + b * logw_stride + tk, tok + tk,
+                                           num_rows, x, ov, vm, ENUM, LOGW, False)
+                    else:
+                        mass = tl.load(masses + x[None, :], mask = vm, other = float("-inf"))
                     mx, acc = _lse_step_one_exp(mx, acc, mass + ov)
         val = _lse_value(mx, acc)
         if COMPACT:
@@ -871,14 +935,17 @@ def _input_block_cuda(la: TopDownLaunch, tiles: torch.Tensor, height: int, prog,
     from .c import get_module
     mod = get_module()
     n, W, C = prog.n, prog.next_col.size(1), prog.next_col.size(2)
-    xb = max(1, (C - 1).bit_length())                                        # a term's class bits, its place the rest
+    ea = enumerated_args(prog, masses)
+    ptr = prog.enum.ptr_host
+    mw = int(ea["Cs"]) + (int((ptr[1:] - ptr[:-1]).max()) if prog.enum.num > 0 else 0)   # a child's staged masses:
+    xb = max(1, (mw - 1).bit_length())                      # the stored columns, a boundary's most enumerated tokens
     if mod is None or xb >= 32 or W >= 1 << (32 - xb) or B > 65535:
         return None
     st = _input_block_boundaries(la, prog)
     mc = compact.max_count
     cq = int(mc[st["ts"] + 1].max())                                         # a sample's most live columns at t + 1
     lp = max(int((mc[st["ta"]] * mc[st["te"]]).max()), 1)                   # ... lanes of a parent's row
-    team = lambda tn: (4 * tn * (lp + C + 1) + 15) // 16 * 16                # a sample's shared memory (bytes)
+    team = lambda tn: (4 * tn * (lp + mw + 1) + 15) // 16 * 16               # a sample's shared memory (bytes)
     tn = min(height, INPUT_BLOCK_CUDA_NODES)
     while tn > 1 and team(tn) > INPUT_BLOCK_CUDA_SMEM:
         tn //= 2
@@ -901,7 +968,9 @@ def _input_block_cuda(la: TopDownLaunch, tiles: torch.Tensor, height: int, prog,
                   common["reg_first"], st["tlist"], st["t2i"], st["ecum_t"], ws[:nterms],
                   ws[nterms:nterms + T * B * W], ws[nterms + T * B * W:nterms + 2 * T * B * W], done,
                   common["out_first"], common["out_width"], common["temp_width"], B, n, W, C, prog.input_start,
-                  height // tn, tn, threads, warps, not warps, lp, cq, sample, c_kind, out_temp, c_full, out_full)
+                  height // tn, tn, threads, warps, not warps, lp, cq, sample, c_kind, out_temp, c_full, out_full,
+                  ea["code"], ea["tok_ptr"], ea["tok"], ea["tokmaj"], ea["prow"], ea["lognorm"], ea["enum_logw"],
+                  ea["Cs"], mw, ea["num_rows"], ea["logw_stride"], ea["LOGW"])
     return dict(tn = tn, threads = threads, warps = warps, smem = team(tn) * (8 if warps else 1))
 
 
@@ -986,7 +1055,7 @@ def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_
                     C = C, input_start = prog.input_start, pid0 = first, C_KIND = c_kind, OUT_TEMP = out_temp,
                     GROUPED = grouped, PRUNE = prune, ORDERED = ordered, COMPACT = compact is not None,
                     C_FULL = c_full, OUT_FULL = out_full, SAMPLE = sample, TN = tn, SUBS = height // tn, TILE = tile,
-                    num_warps = TOP_DOWN_WARPS, **common, **lists)
+                    num_warps = TOP_DOWN_WARPS, **common, **lists, **enumerated_args(prog, masses))
         elif compact is not None:                    # block @ block on compact values, a sample's rectangle at a time
             c_kind, o_kind, out_temp = la.kinds
             ends = prog.iv_ends_np[la.host["child_ivs"]]

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import bisect
 from collections import OrderedDict, defaultdict
+from typing import Tuple
 
 import numpy as np
 import torch
@@ -16,7 +17,8 @@ import torch
 from ..kernels.common import IDENTITY, SUM, TEMP
 from ..kernels.prod import Launch, skip_masks
 from ..kernels.sum import dense_groups
-from ..kernels.transitions import max_successors, transition_job, transition_masses, transition_tables
+from ..kernels.transitions import (enumerated_tokens, max_successors, transition_job, transition_masses,
+                                   transition_tables)
 from ..external_params import block_scale
 from .layout import interval_tables
 
@@ -24,12 +26,14 @@ from .layout import interval_tables
 #: Read a one-child product over a sum straight from the sum's row instead of copying its block (see Program)
 ALIAS_COPIES = True
 
-#: A missing token's transitions are grouped by successor (see :class:`~.transitions.TransitionTables`) when the
-#: automaton has at least this many token classes per successor of its most branching column: its products then
-#: loop over successors, not classes, through transition masses built per query. Below it, they loop over the
-#: classes, and nothing more is built. 8 from a sweep on HMMs (grouped against class by class, batch 1 / 16):
-#: 512 classes, 16 successors x1.6-1.8 / x2.7-3.4; 128 and 16 x1.0-1.2 / x1.4-1.5; at 4 classes per successor
-#: and below, nothing gained or losses (64 successors: 256 classes x0.71-0.73 / x1.24, 64 classes x0.81-0.87).
+#: A missing token's transitions are grouped by successor (see :class:`~.transitions.TransitionTables`) when a
+#: column has at least this many live token classes, on average over every boundary's columns, per successor of the
+#: most branching column (and their masses fit :data:`TRANSITION_BUDGET`; see :func:`grouped_transitions`): its
+#: products then loop over successors, not classes, through transition masses built per query. Below it, they loop
+#: over the live classes, and nothing more is built. 8 from a sweep on HMMs (grouped against class by class, batch
+#: 1 / 16; every class live in every column): 512 classes, 16 successors x1.6-1.8 / x2.7-3.4; 128 and 16 x1.0-1.2 /
+#: x1.4-1.5; at 4 classes per successor and below, nothing gained or losses (64 successors: 256 classes
+#: x0.71-0.73 / x1.24, 64 classes x0.81-0.87).
 GROUP_MIN_RATIO = 8
 
 #: ``input @ block`` steps at the same position and block interval run this many to a program on the class-by-class
@@ -43,10 +47,48 @@ INPUT_BLOCK_GROUP = 8
 #: :func:`~.prod.run_products`); 16 measured best on a 168-state automaton at batch 16 (x1.05 over 8)
 INPUT_BLOCK_GROUP_ALTERNATIVES = (16, 4)
 
-#: Floats of transition masses (see :func:`~.transitions.transition_masses`) held at once: when every input step's
-#: fit, they are all kept, built once per computation of the class masses; else built launch by launch, in chunks
-#: of steps that fit, into one scratch
+#: Floats of transition masses (see :func:`~.transitions.transition_masses`) a program keeps at most: every input
+#: step's, built once per computation of the class masses. Transitions whose masses would not fit are not grouped
+#: (rebuilding them query by query would read every class's mass anyway, and write besides; the forward reads the
+#: classes' masses directly instead)
 TRANSITION_BUDGET = 1 << 26
+
+
+#: Ungrouped transitions: the forward kernels loop over a column's live entries (its live classes' successors and
+#: codes, see :class:`~..kernels.transitions.TransitionTables`) when at most this fraction of the automaton's
+#: (column, class) pairs is live, else over every class in class order (the dead ones -inf). An entry's two loads
+#: ahead of its mass load cost about 1.7 of a class's: with 90% of the pairs live (Ctrl-G ex108 / ex110, Codpula
+#: 4096, batch 16) ``_input_block_group_kernel`` over entries against classes 6.6 against 4.2 ms a decode (ex108
+#: l2r), 8.3 against 4.7 (ex110 l2r), 29.9 against 21.5 (ex108 diffusion); with few live (JSON hard_1, 617 classes,
+#: 36 successors at most) ``_input_block_kernel`` 103 against 129 ms. The crossover is estimated from these two ends,
+#: not swept.
+ENTRY_LOOP_MAX_LIVE = 0.5
+
+
+def live_pairs(next_col: torch.Tensor, width, n: int) -> Tuple[int, int]:
+    """How many (column, class) pairs of the ``n`` boundaries lead somewhere (``next_col`` [n, W, C] host, ``width``
+    the boundaries' columns), and how many columns there are."""
+    live = sum(int((next_col[t, :int(width[t])] >= 0).sum()) for t in range(n))
+    return live, sum(int(width[t]) for t in range(n))
+
+
+def grouped_transitions(next_col: torch.Tensor, width, n: int, pair_masses: int) -> bool:
+    """Whether a missing token's transitions are grouped by successor: when the input steps' ``pair_masses`` (floats
+    of transition masses) fit :data:`TRANSITION_BUDGET`, and a column's live classes, on average over every
+    boundary's columns, are :data:`GROUP_MIN_RATIO` times the most successors of any column or more -- the ungrouped
+    kernels' loop over a column's live classes against the grouped kernels' loop over its successors."""
+    if pair_masses > TRANSITION_BUDGET:
+        return False
+    live, columns = live_pairs(next_col, width, n)
+    return live >= GROUP_MIN_RATIO * max_successors(next_col, width, n) * max(columns, 1)
+
+
+def entry_loop(next_col: torch.Tensor, width, n: int) -> bool:
+    """Whether the ungrouped forward kernels loop over a column's live entries rather than every class: at most
+    :data:`ENTRY_LOOP_MAX_LIVE` of the (column, class) pairs live."""
+    live, columns = live_pairs(next_col, width, n)
+    return live < ENTRY_LOOP_MAX_LIVE * columns * next_col.size(2)
+
 
 #: (input row, position) columns of the steps whose input's transitions they read
 TRANS_COLS = {"input_block": (1, 2), "block_input": (4, 5)}
@@ -70,10 +112,11 @@ class Program:
         self.next_col = layout.next_col.to(dev, torch.int32).contiguous()
         self.input_start, self.input_end = backend.input_range
         self.mass_row = backend.state.class_mass_rows()[2]               # input node -> its row of the class masses
-        grouped = backend.num_classes >= GROUP_MIN_RATIO * max_successors(self.next_col, self.width, n)
-        self.trans = transition_tables(self.next_col, self.width, n, grouped = grouped)
-        # every column's distinct successors (evidence pruning's liveness sweeps)
-        self.succ = self.trans if grouped else transition_tables(self.next_col, self.width, n, grouped = True)
+        self.token_classes = backend.token_classes
+        self.enum = enumerated_tokens(self.next_col, self.width, n, backend.token_classes)   # the enumerated classes'
+        # every column's distinct successors (evidence pruning's liveness sweeps; the forward's tables when its
+        # transitions are grouped: decided below, once the steps are known)
+        self.succ = transition_tables(self.next_col, self.width, n, grouped = True, enum = self.enum)
         self.dev = dev
 
         firsts = [first for first, _, _ in backend.sum_regions]
@@ -234,16 +277,22 @@ class Program:
         self.skip_triples = list(triples)
         self.skip = skip_masks(self.reach, self.skip_triples, device = dev)
 
-        # grouped transitions: every input @ block / block @ input step's transition masses, a row of the boundary's
-        # pairs at t_off. All kept at once when they fit TRANSITION_BUDGET (offsets set here, once); else each launch
-        # in chunks of steps that fit, sharing one scratch (a chunk's masses are built just before its steps run)
+        # a missing token's transitions: GROUPED by successor -- every input @ block / block @ input step's transition
+        # masses, a row of the boundary's pairs at t_off, all kept (offsets set here, once) and built once per
+        # computation of the class masses -- when they fit TRANSITION_BUDGET and a column's live classes are
+        # GROUP_MIN_RATIO times its successors or more (see :func:`grouped_transitions`); else one entry per live
+        # class, its mass read by the class's code (:class:`~..kernels.transitions.EnumeratedTokens`)
         ins = launches_of(tuple(TRANS_COLS))
-        self.trans_pairs = torch.tensor(self.trans.num_pairs, dtype = torch.long) if self.trans.grouped else None
-        sizes = [self.trans_pairs[launches[li][2][:, TRANS_COLS[launches[li][0]][1]]] if self.trans.grouped else
-                 torch.zeros(launches[li][2].size(0), dtype = torch.long) for launches, li in ins]
-        self.trans_persistent = sum(int(z.sum()) for z in sizes) <= TRANSITION_BUDGET
+        pairs = torch.tensor(self.succ.num_pairs, dtype = torch.long)
+        sizes = [pairs[launches[li][2][:, TRANS_COLS[launches[li][0]][1]]] for launches, li in ins]
+        grouped = grouped_transitions(layout.next_col, self.width, n, sum(int(z.sum()) for z in sizes))
+        self.trans = self.succ if grouped else transition_tables(self.next_col, self.width, n, grouped = False,
+                                                                 enum = self.enum)
+        self.entry_loop = entry_loop(layout.next_col, self.width, n)   # ungrouped kernels: entries, or every class
+        self.trans_persistent = grouped                             # (grouped transitions are always kept whole)
+        self.trans_pairs = pairs if grouped else None
         self.trans_size, rows = 0, []
-        if self.trans.grouped and self.trans_persistent:
+        if grouped:
             for z, (launches, li) in zip(sizes, ins):
                 form, kinds, st, iv, sz = launches[li]
                 st = st.clone()
@@ -269,28 +318,13 @@ class Program:
             steps = (rows.to(dev, torch.int32).contiguous(), idx)
         elif form in TRANS_COLS:
             groups = None                                               # input @ block steps, several to a program
-            if not self.trans.grouped:
-                chunks = [(0, S, None)]
-                if form == "input_block" and kinds[0] != IDENTITY and INPUT_BLOCK_GROUP > 1:
-                    sizes_g = dict.fromkeys((INPUT_BLOCK_GROUP, *INPUT_BLOCK_GROUP_ALTERNATIVES))   # default first
-                    order, firsts = _step_groups(rows, [G for G in sizes_g if G > 1])
-                    rows, iv, sizes = rows[order], iv[order], sizes[order]
-                    groups = {G: f.to(dev, torch.int32) for G, f in firsts.items()}
-                    groups_host = {G: f.numpy() for G, f in firsts.items()}
-            elif self.trans_persistent:
-                chunks = [(0, S, None)]                                 # offsets set once, see __init__
-            else:
-                rows = rows.clone()
-                bounds, start, used = [], 0, 0
-                for k, size in enumerate(self.trans_pairs[rows[:, TRANS_COLS[form][1]]].tolist()):
-                    if used + size > TRANSITION_BUDGET and k > start:
-                        bounds.append((start, k))
-                        start, used = k, 0
-                    rows[k, 6] = used
-                    used += size
-                    self.trans_size = max(self.trans_size, used)
-                bounds.append((start, S))
-                chunks = [(s0, s1, transition_job(rows[s0:s1][:, [*TRANS_COLS[form], 6]], dev)) for s0, s1 in bounds]
+            chunks = [(0, S, None)]                                     # (every step's masses at hand: one chunk)
+            if not self.trans.grouped and form == "input_block" and kinds[0] != IDENTITY and INPUT_BLOCK_GROUP > 1:
+                sizes_g = dict.fromkeys((INPUT_BLOCK_GROUP, *INPUT_BLOCK_GROUP_ALTERNATIVES))   # default first
+                order, firsts = _step_groups(rows, [G for G in sizes_g if G > 1])
+                rows, iv, sizes = rows[order], iv[order], sizes[order]
+                groups = {G: f.to(dev, torch.int32) for G, f in firsts.items()}
+                groups_host = {G: f.numpy() for G, f in firsts.items()}
             steps = (rows.to(dev, torch.int32).contiguous(), chunks, groups)
         else:
             steps = rows.to(dev, torch.int32).contiguous()
@@ -301,8 +335,8 @@ class Program:
         return Launch(form, kinds, steps, E_max, X_max, S_max, rows, iv, sizes, groups_host, out_ivs)
 
     def transition_buffer(self, samples: int = 1) -> torch.Tensor:
-        """Where the transition masses go (all of them, or one chunk's; ``samples`` blocks of ``trans_size``, for
-        class masses of each sample's own; allocated on first use, and again when a query plan's chunks need more)."""
+        """Where the transition masses go (``samples`` blocks of ``trans_size``, for class masses of each sample's
+        own; allocated on first use, and again for more samples)."""
         size = self.trans_size * samples
         if self._trans is None or self._trans.numel() < size:
             self._trans = None
@@ -310,10 +344,9 @@ class Program:
         return self._trans
 
     def transitions(self, masses):
-        """When transitions are grouped and all their masses kept: build them from the query's class masses
+        """When transitions are grouped: build their masses from the query's class masses
         (:class:`~..state.ClassMasses`), unless they already are."""
-        if self.trans.grouped and self.trans_persistent and self.trans_job is not None and \
-                self._trans_version != masses.version:
+        if self.trans.grouped and self.trans_job is not None and self._trans_version != masses.version:
             transition_masses(self.transition_buffer(masses.batch), self.trans_job, masses, self)
             self._trans_version = masses.version
 

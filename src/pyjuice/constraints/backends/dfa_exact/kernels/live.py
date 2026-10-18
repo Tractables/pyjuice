@@ -471,14 +471,28 @@ def class_support(prog, masses) -> Optional[torch.Tensor]:
     u = nodes.clamp(min = 0)
     row = masses.row[u].long()
     stride = masses.stride[u].long() if masses.stride is not None else torch.zeros_like(row)
-    finite = masses.table > -float("inf")                                    # [rows, C]
-    (n, K), Be, C = nodes.shape, masses.batch, finite.size(1)
-    allowed = torch.empty(Be, n, C, dtype = torch.bool, device = prog.dev)
+    finite = masses.table > -float("inf")                                    # [rows, stored classes]
+    (n, K), Be, Cs, C = nodes.shape, masses.batch, finite.size(1), prog.next_col.size(2)
+    classes = prog.token_classes
+    allowed = torch.zeros(Be, n, C, dtype = torch.bool, device = prog.dev)
     samples = torch.arange(Be, device = prog.dev)
-    step = max(1, SUPPORT_CHUNK // (n * K * C))
-    for b0 in range(0, Be, step):
+    step = max(1, SUPPORT_CHUNK // (n * K * max(Cs, 1)))
+    for b0 in range(0, Be, step):                                           # the stored classes: a finite mass
         at = row[None] + samples[b0:b0 + step, None, None] * stride[None]   # [samples, n, K]
-        allowed[b0:b0 + step] = (finite[at] & real[None, :, :, None]).any(dim = 2)
+        allowed[b0:b0 + step, :, classes.class_of_stored] = (finite[at] & real[None, :, :, None]).any(dim = 2)
+    en = prog.enum
+    if en.num > 0:                                                          # the enumerated classes: a token some
+        counts = en.ptr_host[1:] - en.ptr_host[:-1]                         # node gives probability, with a weight
+        pos = torch.from_numpy(np.repeat(np.arange(n), counts)).to(prog.dev)
+        tok = en.tok[:en.num].long()
+        cls = classes.token_class[tok].long()
+        has_p = torch.empty(en.num, dtype = torch.bool, device = prog.dev)
+        step = max(1, SUPPORT_CHUNK // (8 * K))                             # (tokens at a time: [tokens, K] gathers)
+        for e0 in range(0, en.num, step):
+            pr = masses.prow[row[pos[e0:e0 + step]]].long()                 # [tokens, K] (a node's parameter row:
+            has_p[e0:e0 + step] = ((masses.tokmaj[tok[e0:e0 + step, None], pr] > 0) & real[pos[e0:e0 + step]]).any(1)
+        w = masses.enum_logw if masses.enum_logw is not None else torch.zeros(1, en.num, device = prog.dev)   # every
+        allowed[:, pos, cls] = (w[:, :en.num] > -float("inf")) & has_p[None, :]                             # sample's)
     allowed[:, ~real.any(dim = 1)] = True                                   # (a position no product step reads)
     return None if bool(allowed.all()) else allowed
 

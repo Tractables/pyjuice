@@ -26,6 +26,7 @@ from ..kernels.compact import (STORAGES, compact_buffers, held_elsewhere, held_m
                                resolve_storage, worth_parking)
 from ..kernels.live import live_successors, liveness
 from ..kernels.score import score_group, score_tables
+from ..kernels.transitions import enumerated_args
 from .plans import (PLANS_PER_POSITION, PLAN_CACHE_SIZE, per_sample_intervals, prior_regions, query_plan,
                     read_regions, scope_intervals, top_down_prior)
 from .top_down import run_backward
@@ -328,21 +329,21 @@ def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor
         x_h = np.where(miss, 0, data.numpy()).astype(np.int64)                 # its class, built here, in the copy
         ev = [x_h.ravel(), _as_int64(np.where(miss, -1, backend.token_classes.host()[x_h]).astype(np.int32)),
               _as_int64(miss)]
-    tables, starts = pack_aligned([base, K, *out_rows, *rows_bt, *(a for c in cols if c is not None for a in c[1:]),
-                                   *ev], np.int64)
+    tables, starts = pack_aligned([base, K, *out_rows, *(np.asarray(pos, dtype = np.int64) for _, pos, _ in groups),
+                                   *rows_bt, *(a for c in cols if c is not None for a in c[1:]), *ev], np.int64)
     tables = torch.from_numpy(tables).to(dev)
     starts = starts.tolist()
     view = lambda i: tables[starts[i]:starts[i + 1]]
     cand = None
     if candidates is not None:                                                # every row's candidates, [M, k]
-        sb, st = starts[2 + G], starts[3 + G]
+        sb, st = starts[2 + 2 * G], starts[3 + 2 * G]
         cand = candidates.to(dev)[tables[sb:sb + M], tables[st:st + M]].to(torch.int32).contiguous()
-    samples, i = [], 2 + G + len(rows_bt)
+    samples, i = [], 2 + 2 * G + len(rows_bt)
     for c in cols:
         samples.append(None if c is None else
-                       dict(nodes = c[0], positions = view(i)[:len(c[1])], row = masses.row, stride = masses.stride,
-                            columns = B, lognorm = masses.lognorm, logw = masses.token_logw,
-                            offset = view(i + 1)[:len(c[2])], width = masses.token_width, ids = masses.token_ids))
+                       dict(nodes = c[0], row = masses.row, stride = masses.stride, lognorm = masses.lognorm,
+                            logw = masses.token_logw, offset = view(i + 1)[:len(c[2])], width = masses.token_width,
+                            ids = masses.token_ids))
         i += 0 if c is None else 2
     evidence = None
     if ev:                                              # (the last three arrays)
@@ -363,11 +364,13 @@ def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor
         else:
             out = torch.empty(M, width, device = dev)
         log_marginal = torch.empty(M + 1, device = dev) if return_log_marginal else None
-        for (g, pos, w), start, sample in zip(groups, starts[2:], samples):
-            out_row = tables[start:start + len(pos) * B]
+        enum = enumerated_args(prog, masses)
+        for gi, ((g, pos, w), sample) in enumerate(zip(groups, samples)):
+            out_row = view(2 + gi)[:len(pos) * B]
             table = backend.state.token_table(g, score.rows[g], precision)
             logz = score_group(out, table, w, score.rows_t[g], masses.table, out_row, backend.token_classes,
-                               F.PRECISIONS[precision], candidates = cand, sample = sample)
+                               F.PRECISIONS[precision], view(2 + G + gi)[:len(pos)], enum, candidates = cand,
+                               sample = sample)
             if log_marginal is not None:
                 log_marginal[torch.where(out_row >= 0, out_row, M)] = logz
     return (out, log_marginal[:M]) if return_log_marginal else out

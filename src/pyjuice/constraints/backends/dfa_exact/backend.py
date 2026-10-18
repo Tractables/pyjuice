@@ -21,6 +21,15 @@ from .compiled.tables import build_pc_tables, buffer_layout
 from .state import ExternalInputs, State
 
 
+#: Token classes of up to this many tokens are ENUMERATED (:class:`~pyjuice.constraints.distributions.TokenClasses`):
+#: no column in the class-mass tables, their token looked up instead wherever the class's mass is read -- when at
+#: least :data:`ENUMERATE_MIN_FRACTION` of the automaton's classes qualify. In JSON / regex automata 90-95% of the
+#: classes hold one token (a key, a literal) and the tables shrink by that much; keyword automata have a few, not
+#: worth a token table.
+ENUMERATE_MAX_TOKENS = 1
+ENUMERATE_MIN_FRACTION = 0.5
+
+
 class DFAExactBackend(Backend):
     """
     Exact queries under a constraint with a finite-state form (the ``automaton`` capability), on a PC whose node
@@ -38,7 +47,10 @@ class DFAExactBackend(Backend):
     :ivar automaton: the constraint's automaton
     :ivar layout: the :class:`~.layout.BoundaryLayout` of the automaton over the PC's variables
     :ivar token_classes: the automaton's :class:`~pyjuice.constraints.distributions.TokenClasses`, on the PC's
-        device, as the input distributions read them
+        device, as the input distributions read them (its one-token classes enumerated when :data:`ENUMERATE_MAX_TOKENS`
+        and :data:`ENUMERATE_MIN_FRACTION` say so)
+    :ivar grouped: whether a missing token's transitions are grouped by successor (see
+        :class:`~.kernels.transitions.TransitionTables`; decided by the :class:`~.compiled.program.Program`)
     :ivar columns_per_sample: the most slots any sum or product node's block takes per sample
         (see :func:`~.tables.build_pc_tables`)
     :ivar product_rows: per product layer, the rows and boundaries the lifted products read
@@ -63,7 +75,11 @@ class DFAExactBackend(Backend):
         self.automaton = automaton
         self.layout = layout
         if token_classes is None or token_classes.token_class.device != self.device:
-            token_classes = distributions.TokenClasses(layout.token_class.to(self.device), automaton.num_classes)
+            sizes = torch.bincount(layout.token_class, minlength = automaton.num_classes)
+            small = int(((sizes > 0) & (sizes <= ENUMERATE_MAX_TOKENS)).sum())
+            enumerate_max = ENUMERATE_MAX_TOKENS if small >= ENUMERATE_MIN_FRACTION * automaton.num_classes else 0
+            token_classes = distributions.TokenClasses(layout.token_class.to(self.device), automaton.num_classes,
+                                                       enumerate_max)
         self.token_classes = token_classes
         self.columns_per_sample = tables["columns_per_sample"]
         self.product_rows = tables["product_rows"]
@@ -201,6 +217,10 @@ class DFAExactBackend(Backend):
         return self.automaton.num_classes
 
     @property
+    def grouped(self) -> bool:
+        return self.program().trans.grouped
+
+    @property
     def bytes_per_sample(self) -> int:
         """
         Memory the lifted buffers need per sample, in fp32: every sum node group's block, the largest product layer
@@ -215,10 +235,12 @@ class DFAExactBackend(Backend):
         """Bytes of the lifted buffers for a batch of ``batch_size`` and of the class masses (fp32, alignment
         included)."""
         layout = buffer_layout(self.input_range, self.sum_regions, self.element_regions, batch_size)
-        return 4 * (layout["node_size"] + layout["element_size"] + self.state.class_mass_rows()[1] * self.num_classes)
+        return 4 * (layout["node_size"] + layout["element_size"]
+                    + self.state.class_mass_rows()[1] * self.token_classes.num_stored)
 
     def info(self) -> Dict[str, Any]:
         return dict(satisfiable = self.satisfiable, num_states = self.num_states, num_classes = self.num_classes,
+                    num_enumerated_classes = self.token_classes.num_enumerated,
                     max_width = self.max_width, width_per_boundary = self.width_per_boundary.tolist(),
                     columns_per_sample = self.columns_per_sample, bytes_per_sample = self.bytes_per_sample)
 

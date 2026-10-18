@@ -24,7 +24,6 @@ from ..kernels.common import IDENTITY, SUM, TEMP, node_groups, node_tiles
 from ..kernels.prod import skip_masks_for
 from ..kernels.prod_top_down import TopDownLaunch
 from ..kernels.score import class_weight_launch, score_tables
-from ..kernels.transitions import transition_tables
 
 
 
@@ -65,9 +64,8 @@ class TopDownProgram:
 def top_down_program(backend) -> TopDownProgram:
     prog = backend.program()
     dev, n = prog.dev, prog.n
-    if not hasattr(prog, "trans_top_down"):                   # the transitions as the top-down kernels read them
-        prog.trans_top_down = prog.trans if (not prog.trans.grouped or prog.trans_persistent) else \
-            transition_tables(prog.next_col, prog.width, n, grouped = False)
+    if not hasattr(prog, "trans_top_down"):                   # the transitions as the top-down kernels read them:
+        prog.trans_top_down = prog.trans                       # the forward's (grouped ones are kept whole)
     reach = prog.reach
     firsts = prog.firsts
     score = score_tables(prog)

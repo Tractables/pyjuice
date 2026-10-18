@@ -66,14 +66,15 @@ def token_probs(layer, rows: np.ndarray, out: torch.Tensor) -> torch.Tensor:
 
 
 def class_masses(layer, classes, out = None) -> torch.Tensor:
-    """``[rows, num_classes]``: ``log sum_{v: token_class[v] == c} p(v)`` for every row of the parameter table,
-    into ``out`` when given (contiguous)."""
-    num_cats, C = layer.dist.num_cats, classes.num_classes
+    """``[rows, num_stored]``: ``log sum_{v: token_class[v] == c} p(v)`` of every stored class ``c`` (column
+    ``stored_of_class[c]``, see :class:`TokenClasses`) for every row of the parameter table, into ``out`` when given
+    (contiguous)."""
+    num_cats, C = layer.dist.num_cats, classes.num_stored
     table = layer.params.view(-1, num_cats)
     if out is None:
         out = torch.empty(table.size(0), C, dtype = torch.float32, device = table.device)
     if C <= NATURAL_ORDER_MAX_CLASSES:
-        _natural_order(table, classes.token_class, C, out)
+        _natural_order(table, classes.stored_class, C, out)
     else:
         _class_order(table, classes.by_class(CLASS_CHUNK), C, out)
     return out
@@ -147,16 +148,16 @@ def _natural_order(table, token_class, C, out, TU = 32, TV = 64):
 
 
 @triton_jit
-def _class_order_kernel(table, order, rank, part, R, V, num_chunks, num_segments, TU: tl.constexpr,
+def _class_order_kernel(table, order, rank, part, R, V, S, num_chunks, num_segments, TU: tl.constexpr,
                         CHUNK: tl.constexpr):
-    """One program per (tile of rows, chunk of sorted positions), chunks fastest so that a row tile stays in L2:
-    the rows' sums over each class's piece of the chunk, scaled by 2^64, into ``part`` [R, num_segments]."""
+    """One program per (tile of rows, chunk of the ``S`` sorted positions), chunks fastest so that a row tile stays
+    in L2: the rows' sums over each class's piece of the chunk, scaled by 2^64, into ``part`` [R, num_segments]."""
     pid = tl.program_id(0)
     j = pid % num_chunks
     rows = (pid // num_chunks) * TU + tl.arange(0, TU)
     rmask = rows < R
     k = j * CHUNK + tl.arange(0, CHUNK)
-    kmask = k < V
+    kmask = k < S
     tok = tl.load(order + k, mask = kmask, other = 0)
     r0 = tl.load(rank + j * CHUNK)
     local = tl.where(kmask, tl.load(rank + k, mask = kmask, other = 0) - r0, -1)      # class within the chunk
@@ -193,8 +194,8 @@ def _class_order(table, by_class, C, out, TU = 32):
     R, V = table.shape
     part = torch.empty(R, by_class.num_segments, dtype = torch.float32, device = table.device)
     _class_order_kernel[(host_cdiv(R, TU) * by_class.num_chunks,)](
-        table, by_class.order, by_class.rank, part, R, V, by_class.num_chunks, by_class.num_segments, TU = TU,
-        CHUNK = by_class.chunk, num_warps = 4)
+        table, by_class.order, by_class.rank, part, R, V, by_class.num_sorted, by_class.num_chunks,
+        by_class.num_segments, TU = TU, CHUNK = by_class.chunk, num_warps = 4)
     _class_order_combine[(host_cdiv(R, 16) * host_cdiv(C, 64),)](
         part, by_class.class_rank, by_class.seg_lo, by_class.seg_hi, out, R, C, by_class.num_segments, TU = 16,
         TC = 64)

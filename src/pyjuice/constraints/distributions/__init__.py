@@ -74,6 +74,7 @@ class SampleInputs:
     :ivar variables: int64, the PC's variables whose input nodes read them
     :ivar token_ids: None, or int32 [batch, weight rows, K], ascending in every row (distinct): the tokens
         ``token_logw`` weighs
+    :ivar pair_rows: int64 [rows], the row of the layer's parameter table every row of ``masses`` is of
     :ivar data: what the distribution's module keeps besides (its own)
     """
 
@@ -85,6 +86,7 @@ class SampleInputs:
     batch: int
     variables: torch.Tensor
     token_ids: Optional[torch.Tensor] = None
+    pair_rows: Optional[torch.Tensor] = None
     data: Any = None
 
 
@@ -111,20 +113,47 @@ class TokenClasses:
     The token classes of a constraint's automaton, as the input distributions read them. The ``dfa_exact`` backend
     owns one (``cc.backend.token_classes``), built with it.
 
+    Classes of at most ``enumerate_max`` tokens are ENUMERATED: they have no column in any class-mass table -- wherever
+    the mass of such a class is needed, its token's own probability is looked up instead (the backend's kernels read
+    ``stored_class`` and write ``num_stored`` columns). The other classes, a class without a token among them, are
+    STORED, numbered by ``stored_of_class`` in class order. ``enumerate_max`` 0: every class stored, as plain tables.
+
     :ivar token_class: [V] int32, the class of every token, on the circuit's device
     :ivar num_classes: the number of classes
+    :ivar enumerate_max: classes of up to this many tokens are enumerated (0: none; 1 is the most supported)
+    :ivar stored_of_class: [num_classes] int32, the column of every class in the class-mass tables, -1 if enumerated
+    :ivar num_stored: the stored classes (the tables' columns)
+    :ivar class_of_stored: [num_stored] int64, the class of every column (``class_of_stored32``: the same, int32)
+    :ivar stored_class: [V] int32, ``stored_of_class`` of every token's class (-1: the token's class is enumerated)
+    :ivar enumerated_token: [num_classes] int32, the token of every enumerated class, -1 for a stored one
+    :ivar num_enumerated: the enumerated classes
     """
 
-    def __init__(self, token_class: torch.Tensor, num_classes: int):
+    def __init__(self, token_class: torch.Tensor, num_classes: int, enumerate_max: int = 0):
         self.token_class = token_class.to(torch.int32).contiguous()
         self.num_classes = int(num_classes)
+        self.enumerate_max = int(enumerate_max)
+        if self.enumerate_max > 1:
+            raise NotImplementedError("Only classes of one token can be enumerated (`enumerate_max` is 0 or 1).")
+        dev = self.token_class.device
+        sizes = torch.bincount(self.token_class.long(), minlength = self.num_classes)
+        enumerated = (sizes > 0) & (sizes <= self.enumerate_max)
+        self.stored_of_class = torch.where(enumerated, -1, torch.cumsum((~enumerated).long(), 0) - 1).to(torch.int32)
+        self.num_stored = int((~enumerated).sum())
+        self.num_enumerated = self.num_classes - self.num_stored
+        self.class_of_stored = torch.nonzero(~enumerated).view(-1)
+        self.class_of_stored32 = self.class_of_stored.to(torch.int32).contiguous()   # (for the kernels)
+        self.stored_class = self.stored_of_class[self.token_class.long()].contiguous()
+        self.enumerated_token = torch.full((self.num_classes,), -1, dtype = torch.int32, device = dev)
+        single = torch.nonzero(self.stored_class < 0).view(-1)                 # (one token per enumerated class)
+        self.enumerated_token[self.token_class[single].long()] = single.to(torch.int32)
         self._by_class = {}
         self._host = None
         self._class_tiles = {}
 
     def to(self, device) -> "TokenClasses":
         """The same classes on ``device`` (a new object: nothing derived is carried over)."""
-        return TokenClasses(self.token_class.to(device), self.num_classes)
+        return TokenClasses(self.token_class.to(device), self.num_classes, self.enumerate_max)
 
     def host(self) -> np.ndarray:
         """``token_class`` on the host (int32), copied on first use."""
@@ -133,10 +162,11 @@ class TokenClasses:
         return self._host
 
     def by_class(self, chunk: int) -> "ByClass":
-        """The tokens in class order, cut into chunks of ``chunk`` positions (built on first use, then kept)."""
+        """The tokens of the stored classes in class order, cut into chunks of ``chunk`` positions (built on first
+        use, then kept)."""
         found = self._by_class.get(chunk)
         if found is None:
-            found = self._by_class[chunk] = ByClass.build(self.token_class, self.num_classes, chunk)
+            found = self._by_class[chunk] = ByClass.build(self.stored_class, self.num_stored, chunk)
         return found
 
     def class_tiles(self, width: int):
@@ -167,10 +197,10 @@ class ByClass:
     chunks of ``chunk`` sorted positions. Classes are numbered by ``rank`` among the classes that have a token. A
     chunk's piece of a class is a segment; the segment of rank ``r`` in chunk ``j`` has index ``r + j`` (distinct,
     since classes do not interleave), so a class's segments are the contiguous indices
-    ``seg_lo[r]..seg_hi[r]``.
+    ``seg_lo[r]..seg_hi[r]``. Tokens whose class is -1 (an enumerated class's) are left out.
 
-    :ivar order: [V] int32, the token at every sorted position
-    :ivar rank: [V] int32, the rank of the class at every sorted position
+    :ivar order: [sorted positions] int32, the token at every sorted position
+    :ivar rank: [sorted positions] int32, the rank of the class at every sorted position
     :ivar class_rank: [num_classes] int32, the rank of every class (-1 for a class without a token)
     :ivar seg_lo, seg_hi: [classes with a token] int32, a class's first and last segment index
     :ivar num_chunks: chunks of sorted positions
@@ -186,17 +216,22 @@ class ByClass:
     num_chunks: int
     num_segments: int
 
+    @property
+    def num_sorted(self) -> int:
+        return self.order.numel()
+
     @staticmethod
     def build(token_class: torch.Tensor, num_classes: int, chunk: int) -> "ByClass":
         tc = token_class.long()
         order = torch.argsort(tc, stable = True)
-        counts = torch.bincount(tc, minlength = num_classes)
+        order = order[tc[order] >= 0]                               # (the tokens of enumerated classes left out)
+        counts = torch.bincount(tc[order], minlength = num_classes)
         present = counts > 0
         rank_of = torch.cumsum(present.long(), 0) - 1
         ends = torch.cumsum(counts[present], 0)                     # end of every class's run, in rank order
         starts = ends - counts[present]
         ranks = torch.arange(ends.numel(), device = tc.device)
-        num_chunks = -(-tc.numel() // chunk)
+        num_chunks = max(1, -(-order.numel() // chunk))
         i32 = lambda t: t.to(torch.int32).contiguous()
         return ByClass(order = i32(order), rank = i32(rank_of[tc[order]]), class_rank = i32(torch.where(present, rank_of, -1)),
                        seg_lo = i32(ranks + starts // chunk), seg_hi = i32(ranks + (ends - 1) // chunk), chunk = chunk,

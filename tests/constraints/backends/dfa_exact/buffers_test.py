@@ -78,8 +78,8 @@ def test_layout_is_aligned_disjoint_and_tight(kind, B, build_pc):
     assert lay["element_size"] == max((end - first) * w for (first, end, _), w in
                                       zip(cc.backend.element_regions, lay["element_widths"]))
     num_class_rows = sum(layer.params.numel() // V for layer in cc.pc.input_layer_group)
-    want = 4 * (lay["node_size"] + lay["element_size"] + num_class_rows * cc.backend.num_classes)
-    assert cc.backend.buffer_bytes(B) == want
+    want = 4 * (lay["node_size"] + lay["element_size"] + num_class_rows * cc.backend.token_classes.num_stored)
+    assert cc.backend.buffer_bytes(B) == want                                 # (the enumerated classes: no column)
 
 
 def test_blocks_keep_only_the_joined_pairs(build_pc):
@@ -108,7 +108,7 @@ def test_class_masses_take_one_row_per_parameter_row(build_pc):
     lo, hi = cc.backend.input_range
     firsts, num_rows, mass_row = cc.backend.state.class_mass_rows()
     assert num_rows * n == hi - lo
-    assert cc.backend.state.class_masses().shape == (num_rows, cc.backend.num_classes)
+    assert cc.backend.state.class_masses().shape == (num_rows, cc.backend.token_classes.num_stored)
     for layer, first in zip(cc.pc.input_layer_group, firsts):
         a, b = layer._output_ind_range
         assert torch.equal(mass_row[a - lo:b - lo].long(), first + layer.s_pids // V)
