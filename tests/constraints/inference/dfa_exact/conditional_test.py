@@ -1,5 +1,5 @@
 """
-Conditionals under a constraint (:mod:`pyjuice.constraints.backends.dfa_exact.conditional`): ``cc.conditional`` against
+Conditionals under a constraint (:mod:`pyjuice.constraints.inference.dfa_exact.conditional`): ``cc.conditional`` against
 the test reference's (``reference.conditional``) on every kind of PC in conftest.py's ``PC_KINDS``, under constraints
 and every pattern of evidence, through every sum path; the class weights it scores (``dfa_class_flow``, which the
 normalized rows cannot check: a factor common to every class cancels) against the reference's input nodes' top-down
@@ -15,14 +15,14 @@ import torch
 
 import pyjuice as juice
 import pyjuice.constraints as jc
-from pyjuice.constraints.backends.dfa_exact.kernels import compact as CP
-from pyjuice.constraints.backends.dfa_exact.queries import conditional as QC
-from pyjuice.constraints.backends.dfa_exact.queries.backend import forward as F
-from pyjuice.constraints.backends.dfa_exact.queries import marginal as QM
-from pyjuice.constraints.backends.dfa_exact.queries.conditional import class_weights
-from pyjuice.constraints.backends.dfa_exact.kernels import score as S
-from pyjuice.constraints.backends.dfa_exact.kernels.score import score_tables
-from pyjuice.constraints.backends.dfa_exact.queries.backend import plans as QP
+from pyjuice.constraints.inference.dfa_exact.kernels import compact as CP
+from pyjuice.constraints.inference.dfa_exact.queries import conditional as QC
+from pyjuice.constraints.inference.dfa_exact.queries.backend import forward as F
+from pyjuice.constraints.inference.dfa_exact.queries import marginal as QM
+from pyjuice.constraints.inference.dfa_exact.queries.conditional import class_weights
+from pyjuice.constraints.inference.dfa_exact.kernels import score as S
+from pyjuice.constraints.inference.dfa_exact.kernels.score import score_tables
+from pyjuice.constraints.inference.dfa_exact.queries.backend import plans as QP
 from pyjuice.constraints.distributions import TokenClasses
 from pyjuice.constraints.evidence import candidate_tensor
 
@@ -60,7 +60,7 @@ def evidence(pattern, n, B = 6, seed = 0):
 @pytest.fixture(params = ["fused", "dense", "dense_unpruned"])
 def sum_path(request, monkeypatch):
     """The fused sum kernels, or the dense path with its products on the live columns only or on every column."""
-    from pyjuice.constraints.backends.dfa_exact.kernels import sum as lifted_sum
+    from pyjuice.constraints.inference.dfa_exact.kernels import sum as lifted_sum
     monkeypatch.setattr(lifted_sum, "DENSE_MIN_BLOCK", 1 << 30 if request.param == "fused" else 1)
     monkeypatch.setattr(F, "prune_dense", (lambda ncols, live: False) if request.param == "dense_unpruned" else
                         (lambda ncols, live: live < ncols))
@@ -422,7 +422,7 @@ def test_candidates_are_columns_of_the_full_rows(kind, name, build_pc):
 def test_candidates_over_many_rows_and_bf16_tables(tiles, build_pc, monkeypatch):
     """An HMM whose input nodes read 256 rows (the kernel's whole chunks of rows), in fp32 and with a bf16 token table
     inside fast_inference, with either of the kernel's tiles; and a constraint no string satisfies."""
-    from pyjuice.constraints.backends.dfa_exact.kernels import score
+    from pyjuice.constraints.inference.dfa_exact.kernels import score
     monkeypatch.setattr(score, "SCORE_CANDIDATE_PAIRS", 1 << 30 if tiles == "small" else 0)
     torch.manual_seed(0)
     n = 6

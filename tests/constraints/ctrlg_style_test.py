@@ -27,7 +27,7 @@ import torch
 
 import pyjuice as juice
 import pyjuice.constraints as jc
-from pyjuice.constraints.backends.dfa_exact.compiled.layout import build_layout
+from pyjuice.constraints.inference.dfa_exact.compiled.layout import build_layout
 
 V = 4
 

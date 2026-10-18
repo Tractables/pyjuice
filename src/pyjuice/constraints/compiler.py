@@ -12,7 +12,7 @@ from typing import Optional
 
 from pyjuice.model import TensorCircuit
 
-from .backends import BACKENDS
+from .inference import BACKENDS
 from .constrained_circuit import ConstrainedCircuit
 from .distributions import lookup
 from .errors import ConstraintCompileError
@@ -36,7 +36,7 @@ def compile(constraint: Constraint, pc: TensorCircuit, backend: Optional[str] = 
     :param pc: a compiled PC (from :func:`pyjuice.compile`)
     :type pc: TensorCircuit
 
-    :param backend: the backend to use, by name (see :data:`~pyjuice.constraints.backends.BACKENDS`); ``None``
+    :param backend: the backend to use, by name (see :data:`~pyjuice.constraints.inference.BACKENDS`); ``None``
         picks the first that can serve the pair (today there is one, ``"dfa_exact"``: exact lifting of the
         constraint's automaton, for PCs whose node scopes are contiguous in variable order)
     :type backend: Optional[str]

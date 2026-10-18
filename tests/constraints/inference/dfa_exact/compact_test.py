@@ -1,5 +1,5 @@
 """
-Compact storage of the per-sample values (:mod:`pyjuice.constraints.backends.dfa_exact.kernels.compact`): the
+Compact storage of the per-sample values (:mod:`pyjuice.constraints.inference.dfa_exact.kernels.compact`): the
 layout's rectangles, ranks and rows against the liveness flags. The values themselves: forward_test.py's,
 top_down_test.py's and conditional_test.py's compact tests.
 """
@@ -8,8 +8,8 @@ import pytest
 import torch
 
 import pyjuice.constraints as jc
-from pyjuice.constraints.backends.dfa_exact.kernels.compact import compact_layout
-from pyjuice.constraints.backends.dfa_exact.kernels.live import liveness
+from pyjuice.constraints.inference.dfa_exact.kernels.compact import compact_layout
+from pyjuice.constraints.inference.dfa_exact.kernels.live import liveness
 
 V = 3
 KINDS = {"hmm": 6, "pd": 8, "hand_permuted": 5, "left_linear": 6}                     # see conftest.py

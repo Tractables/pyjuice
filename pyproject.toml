@@ -54,7 +54,7 @@ readme = {file = "README.md"}
 # present in installed trees / wheels (it is compiled at runtime via torch.utils.cpp_extension).
 [tool.setuptools.package-data]
 "pyjuice.layer.kernels.c" = ["*.cu", "*.cuh", "*.h"]
-"pyjuice.constraints.backends.dfa_exact.kernels.c" = ["*.cu"]
+"pyjuice.constraints.inference.dfa_exact.kernels.c" = ["*.cu"]
 
 [tool.pytest.ini_options]
 addopts = [

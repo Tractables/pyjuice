@@ -1,5 +1,5 @@
 """
-The fused sum kernels' split reductions (:mod:`pyjuice.constraints.backends.dfa_exact.kernels.sum`): a launch of few,
+The fused sum kernels' split reductions (:mod:`pyjuice.constraints.inference.dfa_exact.kernels.sum`): a launch of few,
 long programs splits every program's reduction -- over a child block's parents (top-down), a node block's children
 (forward) -- in shares, each a program of its own, which the last share in merges. Every kind of PC of conftest.py,
 plain and gated, and wider circuits whose forward reductions split too (node and child gates finer than the blocks,
@@ -14,7 +14,7 @@ import torch
 import pyjuice as juice
 import pyjuice.constraints as jc
 import pyjuice.nodes.distributions as dists
-from pyjuice.constraints.backends.dfa_exact.kernels import sum as lifted_sum
+from pyjuice.constraints.inference.dfa_exact.kernels import sum as lifted_sum
 from pyjuice.nodes import inputs, multiply, summate
 
 V = 3

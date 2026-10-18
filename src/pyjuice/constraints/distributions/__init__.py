@@ -18,7 +18,7 @@ module provides
   written into ``out`` when given;
 * ``token_probs(layer, rows, out) -> torch.Tensor``: the probability of every value under the table's rows ``rows``
   (sorted, host int64), token-major: ``out[v, k] = p(v)`` of row ``rows[k]``, ``out`` [values, len(rows)] in fp32 or
-  bf16 -- what the conditionals score (:mod:`~pyjuice.constraints.backends.dfa_exact.conditional`).
+  bf16 -- what the conditionals score (:mod:`~pyjuice.constraints.inference.dfa_exact.conditional`).
 
 A distribution that also reads per-sample inputs at query time -- keyword arguments of ``pc(x, ...)``, such as soft
 evidence; a decoder takes them for its whole session (see :meth:`~pyjuice.constraints.ConstrainedCircuit.decoder`) --

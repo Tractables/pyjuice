@@ -1,6 +1,6 @@
 """
 Decoding sessions (:meth:`ConstrainedCircuit.decoder`) on the dfa_exact backend
-(:class:`~pyjuice.constraints.backends.dfa_exact.queries.decoder.DFAExactDecoder`): a scenario's decoder calls give
+(:class:`~pyjuice.constraints.inference.dfa_exact.queries.decoder.DFAExactDecoder`): a scenario's decoder calls give
 what the circuit's own calls give -- left to right, any order, beams reordered and expanded, a new row, a position
 observed then missing again, other targets after rows moved; candidates, targets as positions, a mask id, the marginal
 -- through every sum path; they hold what the evidence left unchanged, and only that, moving it when rows move
@@ -19,11 +19,11 @@ import torch
 
 import pyjuice as juice
 import pyjuice.constraints as jc
-from pyjuice.constraints.backends.dfa_exact import state as S
-from pyjuice.constraints.backends.dfa_exact.kernels import compact as CP
-from pyjuice.constraints.backends.dfa_exact.kernels.blocks import move_blocks, move_table
-from pyjuice.constraints.backends.dfa_exact.kernels.live import liveness
-from pyjuice.constraints.backends.dfa_exact.queries import decoder as QD
+from pyjuice.constraints.inference.dfa_exact import state as S
+from pyjuice.constraints.inference.dfa_exact.kernels import compact as CP
+from pyjuice.constraints.inference.dfa_exact.kernels.blocks import move_blocks, move_table
+from pyjuice.constraints.inference.dfa_exact.kernels.live import liveness
+from pyjuice.constraints.inference.dfa_exact.queries import decoder as QD
 from pyjuice.utils.fast_inference import is_active
 
 V = 3
@@ -34,8 +34,8 @@ KINDS = {"hmm": 6, "pd": 8, "hand_left": 5, "left_linear": 6}                  #
 def sum_path(request, monkeypatch):
     """As conditional_test.py's: the fused sum kernels, or the dense path with its products on the live columns only or
     on every column -- which reads the slots a held block computed under less evidence left finite."""
-    from pyjuice.constraints.backends.dfa_exact.kernels import sum as lifted_sum
-    from pyjuice.constraints.backends.dfa_exact.queries.backend import forward as F
+    from pyjuice.constraints.inference.dfa_exact.kernels import sum as lifted_sum
+    from pyjuice.constraints.inference.dfa_exact.queries.backend import forward as F
     monkeypatch.setattr(lifted_sum, "DENSE_MIN_BLOCK", 1 << 30 if request.param == "fused" else 1)
     monkeypatch.setattr(F, "prune_dense", (lambda ncols, live: False) if request.param == "dense_unpruned" else
                         (lambda ncols, live: live < ncols))
@@ -255,7 +255,7 @@ def test_a_compact_call_moves_the_held_values_it_reads(scenario, build_pc, monke
     (``parked``) until a call reads them -- a PD's do when every row extends its prefix (left to right, beams). A value
     is in one place only, and one moved is kept (not computed again); the calls give the circuit's results, the storage
     values move into filled with NaN."""
-    from pyjuice.constraints.backends.dfa_exact.queries.backend.plans import read_regions
+    from pyjuice.constraints.inference.dfa_exact.queries.backend.plans import read_regions
     nan_new_storage(monkeypatch)
     monkeypatch.setattr(CP, "PARK_MIN_FLOATS", 0)                       # (values of every size)
     n = KINDS["pd"]
@@ -300,7 +300,7 @@ def test_a_compact_call_moves_the_held_values_it_reads(scenario, build_pc, monke
 def test_a_compact_decoder_over_a_wide_batch(kind, build_pc, monkeypatch):
     """24 rows left to right, then beams: compact, the held values' blocks span many tiles of the copies that carry
     them over into a call's layout (a tile of 16 floats here); the rows are the circuit's own."""
-    from pyjuice.constraints.backends.dfa_exact.kernels import compact as CP
+    from pyjuice.constraints.inference.dfa_exact.kernels import compact as CP
     monkeypatch.setattr(CP, "COPY_TILE", 16)
     n = KINDS[kind]
     cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc(kind, n, V))
@@ -438,7 +438,7 @@ def test_reset_starts_afresh(storage, build_pc, monkeypatch):
     """``decoder.reset()``: the next call holds nothing and is right, the one after holds again; parameters updated in
     place and then a reset: the next call answers under the new ones, where without the reset it would not; outside
     the ``with``, a reset is refused."""
-    import pyjuice.constraints.backends.dfa_exact.backend as BE
+    import pyjuice.constraints.inference.dfa_exact.backend as BE
     monkeypatch.setattr(BE, "ENUMERATE_MAX_TOKENS", 0)   # every class stored: the kept class masses carry the old
     n = KINDS["pd"]                                       # parameters (an enumerated class's kept value is the token
     pc, other = build_pc("pd", n, V, seed = 0), build_pc("pd", n, V, seed = 1)   # table, which these rows barely

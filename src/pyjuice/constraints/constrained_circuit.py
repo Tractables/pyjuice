@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional
 
 import torch
 
-from .backends.base import Backend
+from .inference.base import Backend
 from .evidence import candidate_tensor, evidence, target_mask
 from .language.base import Constraint
 from .structure import PCStructure, analyze_structure
@@ -17,7 +17,7 @@ from .structure import PCStructure, analyze_structure
 
 class ConstrainedCircuit:
     """
-    A PC under a constraint: the PC, the constraint, the PC's structure, and the :class:`~.backends.base.Backend`
+    A PC under a constraint: the PC, the constraint, the PC's structure, and the :class:`~.inference.base.Backend`
     compiled from the pair, which answers the queries -- its methods.
 
     Everything the backend compiled depends only on the constraint and the PC's STRUCTURE, never on parameter values
@@ -32,7 +32,7 @@ class ConstrainedCircuit:
     :ivar pc: the PC queries run on
     :ivar constraint: the constraint
     :ivar structure: the PC's :class:`~pyjuice.constraints.structure.PCStructure`
-    :ivar backend: the :class:`~.backends.base.Backend` that answers the queries (what it compiled, and its reports,
+    :ivar backend: the :class:`~.inference.base.Backend` that answers the queries (what it compiled, and its reports,
         are its own: e.g. ``cc.backend.num_states`` for the ``dfa_exact`` backend)
     :ivar compile_time_s: wall-clock seconds :func:`~pyjuice.constraints.compile` (or :meth:`with_pc`) took
     """
@@ -79,7 +79,7 @@ class ConstrainedCircuit:
         """
         The same constraint on another PC with the same structure (e.g. a drafter and a verifier, or a
         copy of the PC on another device). The structure analysis is checked by signature and reused, and the
-        backend rebinds what it compiled from the constraint (see :meth:`~.backends.base.Backend.rebind`).
+        backend rebinds what it compiled from the constraint (see :meth:`~.inference.base.Backend.rebind`).
 
         :param pc: a compiled PC whose structure equals this one's (parameters may differ)
         :type pc: TensorCircuit

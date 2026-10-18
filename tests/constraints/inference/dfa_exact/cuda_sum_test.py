@@ -1,5 +1,5 @@
 """
-The fused sums' CUDA kernel (:mod:`pyjuice.constraints.backends.dfa_exact.kernels.c`, ``fused_sum.cu``): the forward
+The fused sums' CUDA kernel (:mod:`pyjuice.constraints.inference.dfa_exact.kernels.c`, ``fused_sum.cu``): the forward
 launches of node blocks of 32 over shared children that the pre-pass serves, and the top-down launches of child blocks
 of 32 children or a multiple under shared parents, run on it (taken for every such launch here, whatever its size) and
 give the Triton kernels' marginals and conditionals -- HMMs of 4 and 5 node blocks (the latter's edge tables padded to
@@ -21,10 +21,10 @@ import torch
 import pyjuice as juice
 import pyjuice.constraints as jc
 import pyjuice.nodes.distributions as dists
-from pyjuice.constraints.backends.dfa_exact.kernels import sum as lifted_sum
-from pyjuice.constraints.backends.dfa_exact.kernels.c import get_module
-from pyjuice.constraints.backends.dfa_exact.queries.backend import forward as forward_queries
-from pyjuice.constraints.backends.dfa_exact.queries.backend import top_down as top_down_queries
+from pyjuice.constraints.inference.dfa_exact.kernels import sum as lifted_sum
+from pyjuice.constraints.inference.dfa_exact.kernels.c import get_module
+from pyjuice.constraints.inference.dfa_exact.queries.backend import forward as forward_queries
+from pyjuice.constraints.inference.dfa_exact.queries.backend import top_down as top_down_queries
 from pyjuice.nodes import inputs as input_nodes, multiply, summate
 
 V = 3

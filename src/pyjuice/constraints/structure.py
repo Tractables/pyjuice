@@ -13,7 +13,7 @@ constraint with a PC exactly depends on how each node's scope sits in that order
 
 :func:`analyze_structure` computes this for every node group of a PC, together with a structural
 signature (a hash of the node graph that ignores parameter values). It only reports facts about the PC; which
-of them a backend cannot serve is the backend's to say (see :meth:`~.backends.base.Backend.refusals`).
+of them a backend cannot serve is the backend's to say (see :meth:`~.inference.base.Backend.refusals`).
 """
 
 from __future__ import annotations

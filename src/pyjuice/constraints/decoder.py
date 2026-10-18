@@ -86,7 +86,7 @@ class Decoder:
     opens. Options given when it is made are defaults for every call, which a call's own keyword overrides -- but the
     per-sample inputs (:data:`EXTERNAL_INPUTS`), which hold for the whole session: checked against the PC when the
     decoder is made, and given to every call as ``external`` (the backend's
-    :meth:`~.backends.base.Backend.external_inputs`). One decoder is open on a circuit at a time.
+    :meth:`~.inference.base.Backend.external_inputs`). One decoder is open on a circuit at a time.
 
     A backend's decoder reuses work between calls by overriding :meth:`_marginal` and :meth:`_conditional` (and setting
     :attr:`remembers`, to keep the last call's evidence for :meth:`_match_rows`); this one calls the backend's queries.
@@ -221,7 +221,7 @@ class Decoder:
     def _evidence(self, data, missing_mask, mask_id: Optional[int]):
         """The canonical evidence (:func:`~pyjuice.constraints.evidence.evidence`); on the host if the decoder
         remembers it (copied there as given). The positions the session's per-sample inputs leave free (``free``, see
-        :meth:`~.backends.base.Backend.external_inputs`) are missing too: marginalized, whatever ``data`` holds."""
+        :meth:`~.inference.base.Backend.external_inputs`) are missing too: marginalized, whatever ``data`` holds."""
         mask_id = self._defaults.get("mask_id", -1) if mask_id is None else mask_id
         if self.remembers:
             data = torch.as_tensor(data).cpu()

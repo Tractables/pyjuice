@@ -103,7 +103,7 @@ def assert_close(got, want, n):
 @pytest.fixture(params = ["fused", "dense"])
 def sum_path(request, monkeypatch):
     """The sum layers through the fused kernel only, or the dense (cuBLAS) path wherever they qualify."""
-    from pyjuice.constraints.backends.dfa_exact.kernels import sum as lifted_sum
+    from pyjuice.constraints.inference.dfa_exact.kernels import sum as lifted_sum
     monkeypatch.setattr(lifted_sum, "DENSE_MIN_BLOCK", 1 if request.param == "dense" else 1 << 30)
     return request.param
 
@@ -113,8 +113,8 @@ def transitions(request, monkeypatch):
     """A missing token's transitions one class at a time (one step per program, or ``input_groups``: several input
     steps per program, however narrow the launch), or grouped by successor through transition masses -- per sample,
     built for the session."""
-    import pyjuice.constraints.backends.dfa_exact.compiled.program as P
-    import pyjuice.constraints.backends.dfa_exact.kernels.prod as prod
+    import pyjuice.constraints.inference.dfa_exact.compiled.program as P
+    import pyjuice.constraints.inference.dfa_exact.kernels.prod as prod
     monkeypatch.setattr(P, "GROUP_MIN_RATIO", 0 if request.param == "grouped" else 1 << 30)
     if request.param == "input_groups":
         monkeypatch.setattr(prod, "GROUP_MIN_LANES", 0)
@@ -201,7 +201,7 @@ def test_a_session_reuses_only_what_its_rows_inputs_allow(storage, topk, build_p
 def test_evidence_every_row_reads_is_kept_once(kind, build_pc):
     """Evidence of one row for all: the values over positions no row observes are every sample's, kept once for the
     session (the brute force's value); evidence per row: they are each sample's own, none kept once over them."""
-    from pyjuice.constraints.backends.dfa_exact.queries.marginal import marginal
+    from pyjuice.constraints.inference.dfa_exact.queries.marginal import marginal
     pc = soft_pc(build_pc, kind)
     n = KINDS[kind]
     data, missing, E = evidence(n, 3)
@@ -392,7 +392,7 @@ def test_score_weights_paths(shared, columns, reference, monkeypatch):
     """The scoring's class weights under per-sample inputs (an HMM of 160 input nodes per position): a program per
     (column, class tile) over every row, or over shares of 64 rows -- the shares' partials, then their combination,
     the last share short -- the reference's conditionals either way."""
-    from pyjuice.constraints.backends.dfa_exact.kernels import score
+    from pyjuice.constraints.inference.dfa_exact.kernels import score
     if columns == "in shares":
         monkeypatch.setattr(score, "SCORE_SHARE_ROWS", 1)
     shares, real = [], score._score_weights_kernel
@@ -750,7 +750,7 @@ def test_a_session_under_a_value_mask(build_pc):
 def test_a_session_ignores_the_data_at_free_positions(build_pc, monkeypatch):
     """Whatever the data holds at the positions the value mask frees: calls that differ only there (and in a newly
     observed position) continue each other -- values are reused, and every call is a fresh session's."""
-    import pyjuice.constraints.backends.dfa_exact.queries.decoder as session_queries
+    import pyjuice.constraints.inference.dfa_exact.queries.decoder as session_queries
     held, real = [], session_queries.marginal
     monkeypatch.setattr(session_queries, "marginal", lambda *a, **kw: (held.append(kw["held"]), real(*a, **kw))[1])
     pc = soft_pc(build_pc, "hmm")

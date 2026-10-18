@@ -1,5 +1,5 @@
 """
-Query plans (:mod:`pyjuice.constraints.backends.dfa_exact.query_plan`) and the input-independent values they keep in
+Query plans (:mod:`pyjuice.constraints.inference.dfa_exact.query_plan`) and the input-independent values they keep in
 ``prior_mars``:
 
 * a plan cuts every launch, dense run and fused part to exactly the values the query needs, input-dependent ones per
@@ -24,12 +24,12 @@ import torch
 
 import pyjuice as juice
 import pyjuice.constraints as jc
-from pyjuice.constraints.backends.dfa_exact.queries.backend import forward as F
-from pyjuice.constraints.backends.dfa_exact.queries import marginal as M
-from pyjuice.constraints.backends.dfa_exact.kernels.live import liveness
-from pyjuice.constraints.backends.dfa_exact.kernels.common import NODE_TILE, TEMP, IndexList, node_tiles, pack_aligned
-from pyjuice.constraints.backends.dfa_exact.kernels.prod import Launch
-from pyjuice.constraints.backends.dfa_exact.queries.backend.plans import (TopDownPlan, free_regions,
+from pyjuice.constraints.inference.dfa_exact.queries.backend import forward as F
+from pyjuice.constraints.inference.dfa_exact.queries import marginal as M
+from pyjuice.constraints.inference.dfa_exact.kernels.live import liveness
+from pyjuice.constraints.inference.dfa_exact.kernels.common import NODE_TILE, TEMP, IndexList, node_tiles, pack_aligned
+from pyjuice.constraints.inference.dfa_exact.kernels.prod import Launch
+from pyjuice.constraints.inference.dfa_exact.queries.backend.plans import (TopDownPlan, free_regions,
                                                                          per_sample_intervals, prior_regions,
                                                                          query_plan, top_down_free, top_down_prior)
 
@@ -139,7 +139,7 @@ def cases(n, seed):
 
 
 def selected_steps(cut):
-    """The steps of a launch a :class:`~pyjuice.constraints.backends.dfa_exact.kernels.prod.Cut` runs (host)."""
+    """The steps of a launch a :class:`~pyjuice.constraints.inference.dfa_exact.kernels.prod.Cut` runs (host)."""
     return np.concatenate([s0 + (np.arange(s1 - s0) if sel is None else sel.tensor.cpu().numpy())
                            for s0, s1, _, sel, _ in cut.chunks])
 

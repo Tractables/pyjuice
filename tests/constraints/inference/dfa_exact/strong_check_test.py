@@ -619,7 +619,7 @@ def check_against_reference(cc, ref, data, masks, inputs, storage, precision):
 def check_invariants(cc, data, masks, inputs, precision = "fp32"):
     """The invariants of the module docstring on one session (the marginals to the marginals' tolerance, the
     conditionals and the identities on them to the conditionals'); returns the worst difference."""
-    from pyjuice.constraints.backends.dfa_exact.kernels import live
+    from pyjuice.constraints.inference.dfa_exact.kernels import live
     tm, tc = TOLERANCE[precision]["marginal"], TOLERANCE[precision]["conditional"]
     outputs = (("marginal", tm), ("log marginal", tm), ("conditionals", tc))
     worst = 0.0

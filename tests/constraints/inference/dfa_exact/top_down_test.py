@@ -1,9 +1,9 @@
 """
-The lifted top-down pass (:mod:`pyjuice.constraints.backends.dfa_exact.backward`): every sum node's top-down value (its
+The lifted top-down pass (:mod:`pyjuice.constraints.inference.dfa_exact.backward`): every sum node's top-down value (its
 log outside value) against the test reference's (``reference.top_down``), on every kind of PC in conftest.py's
 ``PC_KINDS``, under constraints and every pattern of evidence (pruned, and unpruned where nothing is observed), through
 both sum paths, and where block @ block's shifts flush entries; run twice, the values are identical. Under query plans
-(:mod:`~pyjuice.constraints.backends.dfa_exact.query_plan`): with every policy of keeping values once, a query computes
+(:mod:`~pyjuice.constraints.inference.dfa_exact.query_plan`): with every policy of keeping values once, a query computes
 exactly the values its targets need; values kept once accumulate across queries, append-only; held values are not
 computed again. Compact, the ``input @ block`` steps' CUDA walk (``kernels/c/walk.cu``) gives the Triton kernel's values
 bit for bit, in every case it has.
@@ -19,13 +19,13 @@ import torch
 import pyjuice as juice
 import pyjuice.constraints as jc
 import pyjuice.nodes.distributions as dists
-from pyjuice.constraints.backends.dfa_exact.kernels import prod_top_down
-from pyjuice.constraints.backends.dfa_exact.kernels.c import get_module
-from pyjuice.constraints.backends.dfa_exact.queries.backend import forward as F
-from pyjuice.constraints.backends.dfa_exact.queries.backend.top_down import run_backward
-from pyjuice.constraints.backends.dfa_exact.kernels.compact import compact_layout
-from pyjuice.constraints.backends.dfa_exact.kernels.live import liveness
-from pyjuice.constraints.backends.dfa_exact.queries.backend.plans import (per_sample_intervals, prior_regions,
+from pyjuice.constraints.inference.dfa_exact.kernels import prod_top_down
+from pyjuice.constraints.inference.dfa_exact.kernels.c import get_module
+from pyjuice.constraints.inference.dfa_exact.queries.backend import forward as F
+from pyjuice.constraints.inference.dfa_exact.queries.backend.top_down import run_backward
+from pyjuice.constraints.inference.dfa_exact.kernels.compact import compact_layout
+from pyjuice.constraints.inference.dfa_exact.kernels.live import liveness
+from pyjuice.constraints.inference.dfa_exact.queries.backend.plans import (per_sample_intervals, prior_regions,
                                                                          query_plan, top_down_prior)
 
 V = 3
@@ -66,7 +66,7 @@ def evidence(pattern, n, B = 6, seed = 0):
 def sum_path(request, monkeypatch):
     """The fused sum kernels, or the dense path with its products on the live columns only or on every column (the
     dead ones read too: they must hold -inf)."""
-    from pyjuice.constraints.backends.dfa_exact.kernels import sum as lifted_sum
+    from pyjuice.constraints.inference.dfa_exact.kernels import sum as lifted_sum
     monkeypatch.setattr(lifted_sum, "DENSE_MIN_BLOCK", 1 << 30 if request.param == "fused" else 1)
     monkeypatch.setattr(F, "prune_dense", (lambda ncols, live: False) if request.param == "dense_unpruned" else
                         (lambda ncols, live: live < ncols))
@@ -79,7 +79,7 @@ def top_down_blocks(cc, data, missing, targets = None, policy = "default", held 
     The forward then the top-down pass of a query under its plan (``policy``: see ``POLICIES``; "kept" runs inside
     :func:`pyjuice.fast_inference`), node_flows filled with NaN first (``nan_fill``): ``(blocks, plan)``, ``blocks``
     every sum region's rows of the buffer its values are in -- [rows, B * slots], those kept once repeated per sample
-    (cloned). ``visit(prod_index, bufs, flows, plan)``: see :func:`~pyjuice.constraints.backends.dfa_exact.backward.
+    (cloned). ``visit(prod_index, bufs, flows, plan)``: see :func:`~pyjuice.constraints.inference.dfa_exact.backward.
     run_backward`. ``storage = "compact"``: the per-sample values compact, expanded to [rows, B * slots] (-inf off the
     lanes; every lane written, -inf at a pair the automaton does not join), the inside values too.
     """

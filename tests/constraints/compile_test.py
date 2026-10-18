@@ -6,8 +6,8 @@ import pyjuice.nodes.distributions as dists
 from pyjuice.nodes import inputs, multiply, summate
 import pyjuice.constraints as jc
 from pyjuice.constraints.structure import analyze_structure
-from pyjuice.constraints.backends.dfa_exact.compiled import layout
-from pyjuice.constraints.backends.dfa_exact.compiled.layout import build_layout
+from pyjuice.constraints.inference.dfa_exact.compiled import layout
+from pyjuice.constraints.inference.dfa_exact.compiled.layout import build_layout
 
 
 V = 5

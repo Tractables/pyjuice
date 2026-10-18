@@ -21,11 +21,11 @@ import torch
 import pyjuice as juice
 import pyjuice.constraints as jc
 import pyjuice.nodes.distributions as dists
-import pyjuice.constraints.backends.dfa_exact.backend as BE
-import pyjuice.constraints.backends.dfa_exact.compiled.program as P
+import pyjuice.constraints.inference.dfa_exact.backend as BE
+import pyjuice.constraints.inference.dfa_exact.compiled.program as P
 from pyjuice.constraints.distributions import TokenClasses, categorical, softevi_categorical
-from pyjuice.constraints.backends.dfa_exact.kernels import live, prod_top_down
-from pyjuice.constraints.backends.dfa_exact.kernels.c import get_module
+from pyjuice.constraints.inference.dfa_exact.kernels import live, prod_top_down
+from pyjuice.constraints.inference.dfa_exact.kernels.c import get_module
 
 V = 12
 KINDS = {"hmm": 6, "hmm_untied": 6, "left_linear": 6, "pd": 6, "hand_left": 5, "hand_permuted": 5}

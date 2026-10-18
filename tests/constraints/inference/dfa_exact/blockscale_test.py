@@ -1,7 +1,7 @@
 """
 Gated sum nodes (:class:`~pyjuice.nodes.external_params.BlockScaleSumParams`) under a constraint, their gates
 (``sum_external_params``) bound to a decoder session
-(:mod:`pyjuice.constraints.backends.dfa_exact.external_params`). Sample ``b``'s sum node ``n`` weighs child ``c`` by
+(:mod:`pyjuice.constraints.inference.dfa_exact.external_params`). Sample ``b``'s sum node ``n`` weighs child ``c`` by
 ``theta[n, c] phi_b[g(n, c)] / Z_b[n]``, so the truth is pyjuice's own gated forward: under the one-state constraint
 ``pc(x, missing_mask, sum_external_params)`` itself, under any other the log-sum of it over the completions the
 constraint accepts, and for conditionals the float64 reference with every sample's weights. Every kind of PC of
@@ -88,7 +88,7 @@ def assert_rows_close(got, want, n):
 def sum_path(request, monkeypatch):
     """The sum layers through the fused kernel only, or the dense (cuBLAS) path wherever they qualify -- gated layers
     never do: their weights differ per sample."""
-    from pyjuice.constraints.backends.dfa_exact.kernels import sum as lifted_sum
+    from pyjuice.constraints.inference.dfa_exact.kernels import sum as lifted_sum
     monkeypatch.setattr(lifted_sum, "DENSE_MIN_BLOCK", 1 if request.param == "dense" else 1 << 30)
     return request.param
 
@@ -179,7 +179,7 @@ def test_storage_and_shared_gates(kind, build_pc):
 def test_shared_gates_are_kept_once(kind, build_pc):
     """Gates of one row for all: the values over positions no row observes are every sample's, kept once for the
     session (the brute force's value); gates per row: none kept once over them."""
-    from pyjuice.constraints.backends.dfa_exact.queries.marginal import marginal
+    from pyjuice.constraints.inference.dfa_exact.queries.marginal import marginal
     pc = gated_pc(build_pc, kind)
     n = KINDS[kind]
     data, missing = evidence(n, 3)
@@ -325,7 +325,7 @@ def test_log_normalizers_against_float64(kind, child_gate, node_gate, build_pc, 
     and -- where a gate row has a gate its nodes have no edge in (block-sparse sums) -- that gate 1000 nats above the
     row's others, so the nodes' Z is 1000 nats below the row's largest gate: a sum that underflows even in float64,
     computed exactly."""
-    from pyjuice.constraints.backends.dfa_exact.external_params import block_scale
+    from pyjuice.constraints.inference.dfa_exact.external_params import block_scale
     pc = gated_pc(build_pc, kind, child_gate = child_gate, node_gate = node_gate)
     layout = jc.compile(jc.DFA.anything(V), pc).backend.program().gate_cells
     B, deep = 3, 0
