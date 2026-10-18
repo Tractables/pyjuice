@@ -1,11 +1,11 @@
 """
-Conditionals under a constraint (:mod:`pyjuice.constraints.inference.dfa_exact.conditional`): ``cc.conditional`` against
-the test reference's (``reference.conditional``) on every kind of PC in conftest.py's ``PC_KINDS``, under constraints
-and every pattern of evidence, through every sum path; the class weights it scores (``dfa_class_flow``, which the
-normalized rows cannot check: a factor common to every class cancels) against the reference's input nodes' top-down
-blocks; ``log p(C, e)`` against the marginal; targets; evidence and constraints no string satisfies; the token tables'
-lifetime, in fp32 and bf16; tf32. The class weights stored by the launch writing them first, the others log-added to a
-fill only where needed. Decoding with values reused between queries is in decoder_test.py.
+Conditionals under a constraint (:mod:`pyjuice.constraints.inference.dfa_exact.queries.conditional`): ``cc.conditional``
+against the test reference's (``reference.conditional``) on every kind of PC in conftest.py's ``PC_KINDS``, under
+constraints and every pattern of evidence, through every sum path; the class weights it scores (``dfa_class_flow``,
+which the normalized rows cannot check: a factor common to every class cancels) against the reference's input nodes'
+top-down blocks; ``log p(C, e)`` against the marginal; targets; evidence and constraints no string satisfies; the token
+tables' lifetime, in fp32 and bf16; tf32. The class weights stored by the launch writing them first, the others
+log-added to a fill only where needed. Decoding with values reused between queries is in decoder_test.py.
 """
 import random
 

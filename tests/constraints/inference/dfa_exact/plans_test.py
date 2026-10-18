@@ -1,6 +1,6 @@
 """
-Query plans (:mod:`pyjuice.constraints.inference.dfa_exact.query_plan`) and the input-independent values they keep in
-``prior_mars``:
+Query plans (:mod:`pyjuice.constraints.inference.dfa_exact.queries.backend.plans`) and the input-independent values they
+keep in ``prior_mars``:
 
 * a plan cuts every launch, dense run and fused part to exactly the values the query needs, input-dependent ones per
   sample and input-independent ones not yet kept once -- against the definitions, from the scopes, on every kind of

@@ -1,12 +1,12 @@
 """
-The lifted top-down pass (:mod:`pyjuice.constraints.inference.dfa_exact.backward`): every sum node's top-down value (its
-log outside value) against the test reference's (``reference.top_down``), on every kind of PC in conftest.py's
-``PC_KINDS``, under constraints and every pattern of evidence (pruned, and unpruned where nothing is observed), through
-both sum paths, and where block @ block's shifts flush entries; run twice, the values are identical. Under query plans
-(:mod:`~pyjuice.constraints.inference.dfa_exact.query_plan`): with every policy of keeping values once, a query computes
-exactly the values its targets need; values kept once accumulate across queries, append-only; held values are not
-computed again. Compact, the ``input @ block`` steps' CUDA walk (``kernels/c/walk.cu``) gives the Triton kernel's values
-bit for bit, in every case it has.
+The lifted top-down pass (:mod:`pyjuice.constraints.inference.dfa_exact.queries.backend.top_down`): every sum node's
+top-down value (its log outside value) against the test reference's (``reference.top_down``), on every kind of PC in
+conftest.py's ``PC_KINDS``, under constraints and every pattern of evidence (pruned, and unpruned where nothing is
+observed), through both sum paths, and where block @ block's shifts flush entries; run twice, the values are identical.
+Under query plans (:mod:`~pyjuice.constraints.inference.dfa_exact.queries.backend.plans`): with every policy of keeping
+values once, a query computes exactly the values its targets need; values kept once accumulate across queries,
+append-only; held values are not computed again. Compact, the ``input @ block`` steps' CUDA walk (``kernels/c/walk.cu``)
+gives the Triton kernel's values bit for bit, in every case it has.
 """
 import contextlib
 import math
@@ -79,9 +79,10 @@ def top_down_blocks(cc, data, missing, targets = None, policy = "default", held 
     The forward then the top-down pass of a query under its plan (``policy``: see ``POLICIES``; "kept" runs inside
     :func:`pyjuice.fast_inference`), node_flows filled with NaN first (``nan_fill``): ``(blocks, plan)``, ``blocks``
     every sum region's rows of the buffer its values are in -- [rows, B * slots], those kept once repeated per sample
-    (cloned). ``visit(prod_index, bufs, flows, plan)``: see :func:`~pyjuice.constraints.inference.dfa_exact.backward.
-    run_backward`. ``storage = "compact"``: the per-sample values compact, expanded to [rows, B * slots] (-inf off the
-    lanes; every lane written, -inf at a pair the automaton does not join), the inside values too.
+    (cloned). ``visit(prod_index, bufs, flows, plan)``: see
+    :func:`~pyjuice.constraints.inference.dfa_exact.queries.backend.top_down.run_backward`. ``storage = "compact"``: the
+    per-sample values compact, expanded to [rows, B * slots] (-inf off the lanes; every lane written, -inf at a pair the
+    automaton does not join), the inside values too.
     """
     with juice.fast_inference() if policy == "kept" else contextlib.nullcontext():
         prog, td, dev = cc.backend.program(), cc.backend.top_down_program(), cc.pc.params.device

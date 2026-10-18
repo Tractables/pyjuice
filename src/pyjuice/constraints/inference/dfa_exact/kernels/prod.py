@@ -1,7 +1,7 @@
 """
 The lifted product layer. A product chains its children's blocks in scope order: a log-space product over the
 boundary columns that adjacent children share. There is one table-driven implementation for every circuit
-shape. :class:`~pyjuice.constraints.inference.dfa_exact.forward.Program` folds each product into binary steps,
+shape. :class:`~pyjuice.constraints.inference.dfa_exact.compiled.program.Program` folds each product into binary steps,
 right to left. Each step is one of three contractions, chosen by what its two operands are, never by the
 circuit's shape:
 
