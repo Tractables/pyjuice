@@ -387,26 +387,24 @@ def test_conditional_matches_the_reference(kind, shared, sum_path, transitions, 
 
 
 @pytest.mark.parametrize("shared", [False, True])
-@pytest.mark.parametrize("columns", ["per class", "in shares"])
+@pytest.mark.parametrize("columns", ["whole", "in shares"])
 def test_score_weights_paths(shared, columns, reference, monkeypatch):
-    """The scoring's class weights under per-sample inputs (an HMM of 160 input nodes per position): one program per
-    (column, class), or per column in shares of 64 rows -- the shares' partials, then their combination, the last
-    share short -- the reference's conditionals either way."""
+    """The scoring's class weights under per-sample inputs (an HMM of 160 input nodes per position): a program per
+    (column, class tile) over every row, or over shares of 64 rows -- the shares' partials, then their combination,
+    the last share short -- the reference's conditionals either way."""
     from pyjuice.constraints.backends.dfa_exact.kernels import score
-    if columns == "per class":
-        monkeypatch.setattr(score, "SCORE_COLUMNS_MAX_CLASSES", 0)
-    else:
-        monkeypatch.setattr(score, "SCORE_COLUMNS_SHARE_ROWS", 1)
-    shares, real = [], score._score_weights_columns_kernel
+    if columns == "in shares":
+        monkeypatch.setattr(score, "SCORE_SHARE_ROWS", 1)
+    shares, real = [], score._score_weights_kernel
 
     class Recorded:
         def __getitem__(self, grid):
             def launch(*args, **kwargs):
-                shares.append(kwargs["SHARES"])
+                shares.append((kwargs["SHARES"], kwargs["FINISH"]))
                 return real[grid](*args, **kwargs)
             return launch
 
-    monkeypatch.setattr(score, "_score_weights_columns_kernel", Recorded())
+    monkeypatch.setattr(score, "_score_weights_kernel", Recorded())
     n, Vm = 4, 50
     torch.manual_seed(0)
     ns = juice.structures.GeneralizedHMM(seq_length = n, num_latents = 160, block_size = 32,
@@ -421,7 +419,10 @@ def test_score_weights_paths(shared, columns, reference, monkeypatch):
     with cc.decoder(categorical_evidence_logp = E, precision = "fp32") as decoder:
         got = decoder.conditional(data, m)
     assert_rows_close(got, reference.conditional(cc, data, m, inputs = dict(categorical_evidence_logp = E)), n)
-    assert (max(shares) > 1) if columns == "in shares" else not shares, shares
+    if columns == "in shares":                                # several shares, each launched twice (then combined)
+        assert shares and all(s > 1 for s, _ in shares) and {f for _, f in shares} == {False, True}, shares
+    else:
+        assert shares and all(s == 1 and not f for s, f in shares), shares
 
 
 @pytest.mark.parametrize("kind", ["hmm", "pd", "hand_left"])

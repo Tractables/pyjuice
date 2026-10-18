@@ -104,8 +104,15 @@ def test_the_split():
     assert classes.class_of_stored.tolist() == [0, 5]
     assert classes.stored_class.tolist() == [-1, 0, -1, 0, -1, 0, -1, 0]
     assert classes.enumerated_token.tolist() == [-1, 2, 4, 0, 6, -1]
+    assert classes.enumerated_tokens.tolist() == [2, 4, 0, 6]                # (in class order)
     by = classes.by_class(4)                                                 # the stored classes' tokens alone
     assert by.order.tolist() == [1, 3, 5, 7] and by.class_rank.tolist() == [0, -1]
+    toks, tile_class = classes.class_tiles(4, stored = True)                 # the stored classes' tokens, in tiles
+    assert toks.tolist() == [1, 3, 5, 7] and tile_class.tolist() == [0]
+    for cl in (classes, TokenClasses(tc, 6)):                                # every class's (the soft-evidence masses)
+        toks, tile_class = cl.class_tiles(4)
+        assert toks.tolist() == [1, 3, 5, 7, 2, -1, -1, -1, 4, -1, -1, -1, 0, -1, -1, -1, 6, -1, -1, -1]
+        assert tile_class.tolist() == [0, 1, 2, 3, 4]
     plain = TokenClasses(tc, 6)
     assert plain.num_stored == 6 and plain.num_enumerated == 0 and torch.equal(plain.stored_class, plain.token_class)
     assert torch.equal(plain.stored_of_class, torch.arange(6, dtype = torch.int32))
@@ -429,6 +436,37 @@ def test_every_class_enumerated(transitions, storage, evidence_kind, build_pc, m
     assert torch.isfinite(out[1][0]).any()
     for got, want in zip(out[1], out[0]):
         assert_close(got, want, n)
+
+
+@pytest.mark.parametrize("evidence_kind", ["none", "dense", "topk"])
+@pytest.mark.parametrize("enumerate_max", [0, 1])
+def test_candidates_of_enumerated_classes_are_columns_of_the_full_rows(enumerate_max, evidence_kind, build_pc,
+                                                                      monkeypatch):
+    """Candidates mixing enumerated and stored classes' tokens (some outside a top-k run, some repeated, some padding):
+    every row's candidate scores are the columns of its full row -- the normalizer over every token with a weight,
+    whichever tokens are asked for."""
+    monkeypatch.setattr(BE, "ENUMERATE_MAX_TOKENS", enumerate_max)
+    n, B = 6, 4
+    pc = build_pc("hmm", n, V, input_dist = dists.SoftEvidenceCategorical if evidence_kind != "none" else None)
+    data, missing, inputs = evidence(n, B, evidence_kind)
+    cc = jc.compile(singleton_automaton(), pc)
+    assert cc.backend.token_classes.num_enumerated == (7 if enumerate_max else 0)
+    g = torch.Generator().manual_seed(1)
+    candidates = torch.randint(0, V, (B, n, 5), generator = g)
+    candidates[:, :, 0] = 1                                                  # an enumerated class's token everywhere
+    candidates[:, :, 1] = 11                                                 # a stored class's
+    candidates[0, :, 2] = V                                                  # padding
+    with cc.decoder(storage = "dense", precision = "fp32", **inputs) as decoder:
+        full, logm = decoder.conditional(data, missing, return_log_marginal = True)
+        got, logm_c = decoder.conditional(data, missing, candidates = candidates, return_log_marginal = True)
+    assert torch.isfinite(full).any() and torch.equal(logm, logm_c)
+    rows = torch.nonzero(missing.to(DEV))
+    want = torch.full_like(got, -float("inf"))
+    for r, (b, t) in enumerate(rows.tolist()):
+        for j, v in enumerate(candidates[b, t].tolist()):
+            if v < V:
+                want[r, j] = full[r, v]
+    assert_close(got, want, n)
 
 
 @pytest.mark.parametrize("evidence_kind", ["none", "topk"])

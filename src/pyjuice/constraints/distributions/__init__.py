@@ -126,6 +126,7 @@ class TokenClasses:
     :ivar class_of_stored: [num_stored] int64, the class of every column (``class_of_stored32``: the same, int32)
     :ivar stored_class: [V] int32, ``stored_of_class`` of every token's class (-1: the token's class is enumerated)
     :ivar enumerated_token: [num_classes] int32, the token of every enumerated class, -1 for a stored one
+    :ivar enumerated_tokens: [num_enumerated] int32, the enumerated classes' tokens in class order
     :ivar num_enumerated: the enumerated classes
     """
 
@@ -147,6 +148,7 @@ class TokenClasses:
         self.enumerated_token = torch.full((self.num_classes,), -1, dtype = torch.int32, device = dev)
         single = torch.nonzero(self.stored_class < 0).view(-1)                 # (one token per enumerated class)
         self.enumerated_token[self.token_class[single].long()] = single.to(torch.int32)
+        self.enumerated_tokens = self.enumerated_token[self.enumerated_token >= 0].contiguous()   # in class order
         self._by_class = {}
         self._host = None
         self._class_tiles = {}
@@ -169,24 +171,27 @@ class TokenClasses:
             found = self._by_class[chunk] = ByClass.build(self.stored_class, self.num_stored, chunk)
         return found
 
-    def class_tiles(self, width: int):
+    def class_tiles(self, width: int, stored: bool = False):
         """``(tokens, tile_class)``: the tokens in class order (by id within a class), every class's run padded with -1
         to whole tiles of ``width`` (int32 [tiles * width]), and every tile's class (int32 [tiles]) -- one class per
-        tile, for a kernel that reads a class's weights once per tile (built on first use, then kept)."""
-        found = self._class_tiles.get(width)
+        tile, for a kernel that reads a class's weights once per tile (built on first use, then kept). ``stored``: the
+        stored classes' tokens alone (scoring: an enumerated class's token is scored on its own, no tile of one)."""
+        found = self._class_tiles.get((width, stored))
         if found is None:
             tc = self.token_class.cpu().long()
             order = torch.argsort(tc, stable = True)
-            counts = torch.bincount(tc, minlength = self.num_classes)
+            if stored:
+                order = order[self.stored_class.cpu()[order] >= 0]
+            counts = torch.bincount(tc[order], minlength = self.num_classes)
             tiles = (counts + width - 1) // width                               # per class
             first_tile = torch.cumsum(tiles, 0) - tiles
             first_token = torch.cumsum(counts, 0) - counts
             cls = tc[order]
             tokens = torch.full((int(tiles.sum()) * width,), -1, dtype = torch.long)
-            tokens[first_tile[cls] * width + torch.arange(tc.numel()) - first_token[cls]] = order
+            tokens[first_tile[cls] * width + torch.arange(order.numel()) - first_token[cls]] = order
             tile_class = torch.repeat_interleave(torch.arange(self.num_classes), tiles)
             dev = self.token_class.device
-            found = self._class_tiles[width] = (tokens.to(dev, torch.int32), tile_class.to(dev, torch.int32))
+            found = self._class_tiles[(width, stored)] = (tokens.to(dev, torch.int32), tile_class.to(dev, torch.int32))
         return found
 
 

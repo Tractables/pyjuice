@@ -438,9 +438,11 @@ def test_reset_starts_afresh(storage, build_pc, monkeypatch):
     """``decoder.reset()``: the next call holds nothing and is right, the one after holds again; parameters updated in
     place and then a reset: the next call answers under the new ones, where without the reset it would not; outside
     the ``with``, a reset is refused."""
-    n = KINDS["pd"]
-    pc, other = build_pc("pd", n, V, seed = 0), build_pc("pd", n, V, seed = 1)
-    cc = jc.compile(jc.DFA.contains([[1, 2]], V), pc)
+    import pyjuice.constraints.backends.dfa_exact.backend as BE
+    monkeypatch.setattr(BE, "ENUMERATE_MAX_TOKENS", 0)   # every class stored: the kept class masses carry the old
+    n = KINDS["pd"]                                       # parameters (an enumerated class's kept value is the token
+    pc, other = build_pc("pd", n, V, seed = 0), build_pc("pd", n, V, seed = 1)   # table, which these rows barely
+    cc = jc.compile(jc.DFA.contains([[1, 2]], V), pc)                           # depend on)
     steps = left_to_right(n)
     with juice.fast_inference():
         want = [cc.conditional(precision = "fp32", **s) for s in steps]
