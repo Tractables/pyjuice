@@ -178,23 +178,41 @@ def _lse_value(m, acc):
 
 
 @triton.jit
-def _lane_mass(masses, mrow, x, pm, tokmaj, prow, lognorm, enum_logw, tok_ptr, tok, t, b, num_rows, logw_stride,
-               ENUM: tl.constexpr, LOGW: tl.constexpr):
+def _lane_rows(tok_ptr, prow, lognorm, t, mrow, lm, ENUM: tl.constexpr, LOGW: tl.constexpr):
+    """What :func:`_lane_mass` reads the same for every term of a lane, loaded once ahead of a loop over its terms:
+    ``(tk, pr, lz)`` -- the first enumerated token of boundary ``t`` (``tok_ptr[t]``), and the lanes' parameter rows
+    ``prow[mrow]`` and (``LOGW``) log Z ``lognorm[mrow]``, where ``lm`` (a mask every term's mask lies within);
+    placeholders, nothing read, without ``ENUM`` (and ``lz`` without ``LOGW``)."""
+    if ENUM:
+        tk = tl.load(tok_ptr + t)
+        pr = tl.load(prow + mrow, mask = lm, other = 0).to(tl.int64)
+        if LOGW:
+            lz = tl.load(lognorm + mrow, mask = lm, other = 0.0)
+        else:
+            lz = (mrow * 0).to(tl.float32)
+    else:
+        tk = t * 0
+        pr = mrow
+        lz = (mrow * 0).to(tl.float32)
+    return tk, pr, lz
+
+
+@triton.jit
+def _lane_mass(masses, x, pm, tokmaj, tk, pr, lz, enum_logw, tok, b, num_rows, logw_stride, ENUM: tl.constexpr,
+               LOGW: tl.constexpr):
     """The mass of class code ``x`` ([lanes]) at the lanes' rows of the class masses: ``masses`` the rows' pointers
-    (``class_mars + mrow * Cs``, ``mrow`` int64 [lanes]), a stored class's column read there, an enumerated class's
-    (``ENUM``, code ``-1 - e``: the e-th enumerated token of boundary ``t``) its token's probability ``tokmaj[token,
-    prow[row]]``, ``LOGW``: times its weight for the lane's sample ``b`` over the row's ``Z``; -inf where ``pm`` is
-    off."""
+    (``class_mars + mrow * Cs``), a stored class's column read there, an enumerated class's (``ENUM``, code ``-1 -
+    e``: the e-th enumerated token of the boundary, from ``tk``) its token's probability ``tokmaj[token, pr]``,
+    ``LOGW``: times its weight for the lane's sample ``b`` over the row's ``Z`` (``lz`` its log) -- ``tk``, ``pr`` and
+    ``lz`` from :func:`_lane_rows`; -inf where ``pm`` is off."""
     if ENUM:
         enum = x < 0
         stored = tl.load(masses + tl.maximum(x, 0), mask = pm & ~enum, other = float("-inf"))
-        tk = tl.load(tok_ptr + t)
         e = tl.maximum(-1 - x, 0).to(tl.int64)                                  # (a stored entry: token 0, unread)
         v = tl.load(tok + tk + e).to(tl.int64)
-        pr = tl.load(prow + mrow, mask = pm, other = 0).to(tl.int64)
         val = tl.log(tl.load(tokmaj + v * num_rows + pr, mask = pm & enum, other = 0.0))
         if LOGW:
-            val = val + tl.load(enum_logw + b * logw_stride + tk + e) - tl.load(lognorm + mrow, mask = pm, other = 0.0)
+            val = val + tl.load(enum_logw + b * logw_stride + tk + e) - lz
         return tl.where(enum, val, stored)
     return tl.load(masses + x, mask = pm, other = float("-inf"))
 
@@ -299,6 +317,7 @@ def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
                 if SAMPLE:
                     mrow = mrow + b * tl.load(mass_stride + (u - input_start)).to(tl.int64)
                 masses = class_mars + mrow * Cs
+                tk, pr, lz = _lane_rows(tok_ptr, prow, lognorm, t, mrow, miss, ENUM, LOGW)   # (once, not per term)
             if GROUPED or ENTRIES:                                           # i's entries: a successor, and a
                 p0 = tl.load(entry_ptr + t * (W + 1) + i, mask = miss, other = 0)   # transition mass or a class code
                 p1 = tl.load(entry_ptr + t * (W + 1) + i + 1, mask = miss, other = 0)
@@ -314,8 +333,8 @@ def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
                     if GROUPED:
                         mass = tl.load(masses + x, mask = pm, other = float("-inf"))
                     else:
-                        mass = _lane_mass(masses, mrow, x, pm, tokmaj, prow, lognorm, enum_logw, tok_ptr, tok, t, b,
-                                          num_rows, logw_stride, ENUM, LOGW)
+                        mass = _lane_mass(masses, x, pm, tokmaj, tk, pr, lz, enum_logw, tok, b, num_rows, logw_stride,
+                                          ENUM, LOGW)
                     mx, acc = _lse_step(mx, acc, mass + rv)
             else:                                                            # every class in class order, the dead
                 for c in range(C):                                           # ones -inf (no entry tables read)
@@ -331,8 +350,8 @@ def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
                         x = tl.load(code + t * C + c + i * 0)                # the class's code at the boundary
                     else:
                         x = c + i * 0
-                    mass = _lane_mass(masses, mrow, x, pm, tokmaj, prow, lognorm, enum_logw, tok_ptr, tok, t, b,
-                                      num_rows, logw_stride, ENUM, LOGW)
+                    mass = _lane_mass(masses, x, pm, tokmaj, tk, pr, lz, enum_logw, tok, b, num_rows, logw_stride, ENUM,
+                                      LOGW)
                     mx, acc = _lse_step(mx, acc, mass + rv)
             val = tl.where(oc >= 0, val, _lse_value(mx, acc))
         op = _out_ptr(out_row, element_mars, temp, out_first, out_width, temp_width, OUT_TEMP)
@@ -513,6 +532,7 @@ def _block_input_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
             if SAMPLE:
                 mrow = mrow + b * tl.load(mass_stride + (u - input_start)).to(tl.int64)
             masses = class_mars + mrow * Cs
+            tk, pr, lz = _lane_rows(tok_ptr, prow, lognorm, t, mrow, ml & (oc < 0), ENUM, LOGW)   # (once a lane)
             if ENUM:                                                         # the observed class's code
                 code_oc = tl.load(code + t * C + tl.maximum(oc, 0), mask = m, other = -1)
             else:
@@ -532,8 +552,8 @@ def _block_input_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
                 mass = tl.load(masses + x, mask = em & (oc < 0), other = float("-inf"))
             else:                                                            # is it this entry's class?
                 holds = x == code_oc
-                mass = _lane_mass(masses, mrow, x, em & (oc < 0), tokmaj, prow, lognorm, enum_logw, tok_ptr, tok, t,
-                                  b, num_rows, logw_stride, ENUM, LOGW)
+                mass = _lane_mass(masses, x, em & (oc < 0), tokmaj, tk, pr, lz, enum_logw, tok, b, num_rows,
+                                  logw_stride, ENUM, LOGW)
             mass = tl.where(oc >= 0, tl.where(holds, own, float("-inf")), mass)
             sl = _operand_slot(iv_table, lpos, i, q, M, em, l_own, crank, b, t, q, lbase, 1, n, W, L_FULL, COMPACT)
             lv = tl.load(lp + sl, mask = em & (sl >= 0), other = float("-inf"))
