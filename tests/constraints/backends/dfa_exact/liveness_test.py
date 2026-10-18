@@ -60,7 +60,7 @@ def assert_close(got, want, n):
 def sum_path(request, monkeypatch):
     """The sum layers through the fused kernel, or the dense path wherever blocks qualify, with its live columns
     only (``dense_pruned``) or all of them -- the test batches are below the size dense pruning starts from."""
-    import pyjuice.constraints.backends.dfa_exact.queries.forward as F
+    import pyjuice.constraints.backends.dfa_exact.queries.backend.forward as F
     from pyjuice.constraints.backends.dfa_exact.kernels import sum as lifted_sum
     monkeypatch.setattr(lifted_sum, "DENSE_MIN_BLOCK", 1 << 30 if request.param == "fused" else 1)
     monkeypatch.setattr(F, "prune_dense", (lambda ncols, live: live < ncols) if request.param == "dense_pruned" else
@@ -553,7 +553,7 @@ def test_successor_lists_change_nothing(kind, form, storage, evidence_kind, buil
     follows their candidate classes)."""
     import pyjuice.nodes.distributions as dists
     from pyjuice.constraints.backends.dfa_exact.kernels import live as L, prod as K
-    from pyjuice.constraints.backends.dfa_exact.queries import forward as F
+    from pyjuice.constraints.backends.dfa_exact.queries.backend import forward as F
     entry_form(form, monkeypatch)
     n = KINDS[kind]
     topk = evidence_kind == "topk"

@@ -493,8 +493,8 @@ def worth_parking(prog, carry: dict) -> bool:
 def held_moves(prog, carry: dict, read: np.ndarray) -> np.ndarray:
     """
     bool [sum regions]: the held inside values a compact query re-gathers into its rows (:func:`compact_buffers`,
-    ``carry`` as there): those it reads (``read``, see :func:`~..queries.plans.read_regions`), and of the others all
-    but those of the storage holding the most of them, which stay there -- one storage at most is kept besides the
+    ``carry`` as there): those it reads (``read``, see :func:`~..queries.backend.plans.read_regions`), and of the others
+    all but those of the storage holding the most of them, which stay there -- one storage at most is kept besides the
     buffers. A query that reads few of many held values (decoding left to right: the block after the target) thus
     moves those alone, each once; values it holds but never reads again (a left-to-right prefix's) do not pile up in
     storages of their own.

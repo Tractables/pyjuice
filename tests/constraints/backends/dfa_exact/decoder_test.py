@@ -35,7 +35,7 @@ def sum_path(request, monkeypatch):
     """As conditional_test.py's: the fused sum kernels, or the dense path with its products on the live columns only or
     on every column -- which reads the slots a held block computed under less evidence left finite."""
     from pyjuice.constraints.backends.dfa_exact.kernels import sum as lifted_sum
-    from pyjuice.constraints.backends.dfa_exact.queries import forward as F
+    from pyjuice.constraints.backends.dfa_exact.queries.backend import forward as F
     monkeypatch.setattr(lifted_sum, "DENSE_MIN_BLOCK", 1 << 30 if request.param == "fused" else 1)
     monkeypatch.setattr(F, "prune_dense", (lambda ncols, live: False) if request.param == "dense_unpruned" else
                         (lambda ncols, live: live < ncols))
@@ -255,7 +255,7 @@ def test_a_compact_call_moves_the_held_values_it_reads(scenario, build_pc, monke
     (``parked``) until a call reads them -- a PD's do when every row extends its prefix (left to right, beams). A value
     is in one place only, and one moved is kept (not computed again); the calls give the circuit's results, the storage
     values move into filled with NaN."""
-    from pyjuice.constraints.backends.dfa_exact.queries.plans import read_regions
+    from pyjuice.constraints.backends.dfa_exact.queries.backend.plans import read_regions
     nan_new_storage(monkeypatch)
     monkeypatch.setattr(CP, "PARK_MIN_FLOATS", 0)                       # (values of every size)
     n = KINDS["pd"]

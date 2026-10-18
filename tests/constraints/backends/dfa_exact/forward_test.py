@@ -358,7 +358,7 @@ def stack_keys(cc):
 def spy_dense_sums(monkeypatch):
     """Record, per dense_sum call of the forward, whether it got stacked weights and live columns; and count the
     stacked weights built."""
-    import pyjuice.constraints.backends.dfa_exact.queries.forward as F
+    import pyjuice.constraints.backends.dfa_exact.queries.backend.forward as F
     calls, builds = [], []
     dense_sum, stacked_weights = F.dense_sum, F.stacked_weights
     monkeypatch.setattr(F, "dense_sum", lambda *a, **k: calls.append((k["stacked"] is not None, k["live"] is not None))
@@ -375,7 +375,7 @@ def test_stacked_dense_weights(tied, dense_pruning, reference, monkeypatch):
     copying each once; inside a scope every run is stacked, by the first query, and kept until the scope exits --
     an in-place parameter update after it is read. The marginal matches the reference throughout, on all columns
     and on the live ones only (evidence pruning)."""
-    import pyjuice.constraints.backends.dfa_exact.queries.forward as F
+    import pyjuice.constraints.backends.dfa_exact.queries.backend.forward as F
     if dense_pruning:
         monkeypatch.setattr(F, "prune_dense", lambda ncols, live: live < ncols)   # the live-column path, always
     n = 6
@@ -414,7 +414,7 @@ def test_stacked_dense_weights(tied, dense_pruning, reference, monkeypatch):
 def test_wide_products_are_not_stacked(dense_pruning, reference, monkeypatch):
     """A product wider than STACK_MAX_COLUMNS (here every one) runs one product per block, inside a
     pyjuice.fast_inference scope too, and copies no weights."""
-    import pyjuice.constraints.backends.dfa_exact.queries.forward as F
+    import pyjuice.constraints.backends.dfa_exact.queries.backend.forward as F
     if dense_pruning:
         monkeypatch.setattr(F, "prune_dense", lambda ncols, live: live < ncols)
     monkeypatch.setattr(F, "STACK_MAX_COLUMNS", {"fp32": -1, "tf32": -1})
@@ -433,7 +433,7 @@ def test_wide_products_are_not_stacked(dense_pruning, reference, monkeypatch):
 def test_the_stacked_weights_are_what_is_multiplied(dense_pruning, monkeypatch):
     """Doubling every stacked copy (and nothing else) doubles the sums of every stacked run: every path of the HMM
     crosses each transition once, so the marginal moves by log 2 per run -- the product reads the copy."""
-    import pyjuice.constraints.backends.dfa_exact.queries.forward as F
+    import pyjuice.constraints.backends.dfa_exact.queries.backend.forward as F
     if dense_pruning:
         monkeypatch.setattr(F, "prune_dense", lambda ncols, live: live < ncols)
     n = 6

@@ -24,13 +24,14 @@ import torch
 
 import pyjuice as juice
 import pyjuice.constraints as jc
-from pyjuice.constraints.backends.dfa_exact.queries import forward as F
+from pyjuice.constraints.backends.dfa_exact.queries.backend import forward as F
 from pyjuice.constraints.backends.dfa_exact.queries import marginal as M
 from pyjuice.constraints.backends.dfa_exact.kernels.live import liveness
 from pyjuice.constraints.backends.dfa_exact.kernels.common import NODE_TILE, TEMP, IndexList, node_tiles, pack_aligned
 from pyjuice.constraints.backends.dfa_exact.kernels.prod import Launch
-from pyjuice.constraints.backends.dfa_exact.queries.plans import (TopDownPlan, free_regions, per_sample_intervals,
-                                                            prior_regions, query_plan, top_down_free, top_down_prior)
+from pyjuice.constraints.backends.dfa_exact.queries.backend.plans import (TopDownPlan, free_regions,
+                                                                         per_sample_intervals, prior_regions,
+                                                                         query_plan, top_down_free, top_down_prior)
 
 V = 3
 KINDS = {"hmm": 6, "hmm_untied": 6, "hmm_block_sparse": 6, "left_linear": 6, "pd": 8, "pd_prod_dominated": 8,

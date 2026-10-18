@@ -25,7 +25,7 @@ follows its sum regions (they share their scope), and a product's intermediate f
 :class:`QueryPlan` is the subsets of the Program's launches, dense runs and fused parts that do so, cached on the
 Program by what they depend on.
 
-A query with a top-down pass (:mod:`.queries.top_down`) plans it the same way, mirrored: a node's top-down value is
+A query with a top-down pass (:mod:`.top_down`) plans it the same way, mirrored: a node's top-down value is
 NEEDED when its scope meets a target (the scoring reads the top-down values of the target positions' products, each from
 its parents'), and INPUT-INDEPENDENT when no sample observes a position OUTSIDE its scope -- kept once then, in
 ``prior_flows``, when that is kept across queries or costs less than the samples' live columns, and with it every
@@ -139,7 +139,7 @@ def prior_regions(prog, observed: np.ndarray, B: int, kept: bool, liveness) -> n
     bool [sum intervals]: the intervals a query of ``B`` samples keeps once (see the module docstring): every
     input-independent one (:func:`free_regions`) when ``kept`` (``prior_mars`` outlives the query: inside
     :func:`pyjuice.fast_inference`); else those whose block computed once is cheaper than the samples' live slots
-    (``liveness``, the query's :class:`~..kernels.live.Liveness`, whose counts this reads -- a wait for the device;
+    (``liveness``, the query's :class:`~...kernels.live.Liveness`, whose counts this reads -- a wait for the device;
     None: every slot live), and every interval inside one of those. One sample's live slots never exceed a
     block's, so a query of one sample keeps nothing once (and reads no counts).
 
@@ -224,7 +224,7 @@ def read_regions(prog, plan: QueryPlan, root: bool = False) -> np.ndarray:
     needs, per sample or kept once (:attr:`TopDownPlan.per_sample`, ``once``: a product's top-down step reads its other
     children's inside values, and so do the class weights of its input at a target, per sample even under a value
     kept once) -- and the ``root``'s if asked. Held values of other regions may stay where they are (see
-    :mod:`..kernels.compact`)."""
+    :mod:`...kernels.compact`)."""
     ivs = plan.sample.copy()
     if plan.top_down is not None:
         ivs[prog.reg_iv_np[plan.top_down.per_sample | plan.top_down.once]] = True
@@ -236,10 +236,10 @@ def read_regions(prog, plan: QueryPlan, root: bool = False) -> np.ndarray:
 
 def per_sample_intervals(prog, plan: QueryPlan, top_down: bool = True) -> np.ndarray:
     """bool [sum intervals]: those whose columns the query's kernels walk in lane order
-    (:meth:`~..kernels.live.Liveness.order`): the inside values ``plan`` computes per sample
+    (:meth:`~...kernels.live.Liveness.order`): the inside values ``plan`` computes per sample
     (:attr:`QueryPlan.sample`), and the top-down values it needs per sample (:attr:`TopDownPlan.per_sample` -- held ones
     included: a sum launch gives its products their values from them), unless ``top_down`` is False (they are compact,
-    see :mod:`..kernels.compact`, and walked in their own order)."""
+    see :mod:`...kernels.compact`, and walked in their own order)."""
     out = plan.sample.copy()
     if plan.top_down is not None and top_down:
         out[prog.reg_iv_np[plan.top_down.per_sample]] = True
@@ -269,7 +269,7 @@ def top_down_free(td, observed: np.ndarray) -> np.ndarray:
 def scope_intervals(td, scopes) -> np.ndarray:
     """bool [intervals] (by ``prog.intervals``' numbers, ``td`` the :class:`~.top_down_program.TopDownProgram`): those
     equal to one of ``scopes`` (``(a, b)`` pairs) -- under per-sample inputs of a sum node group (gates, see
-    :mod:`..external_params`), its scope: the top-down values there (its children's) read them, so
+    :mod:`...external_params`), its scope: the top-down values there (its children's) read them, so
     they are input-dependent whatever is observed."""
     if not scopes:
         return np.zeros(td.iv_bounds.shape[0], dtype = bool)

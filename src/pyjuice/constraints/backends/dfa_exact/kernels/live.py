@@ -459,7 +459,7 @@ class Liveness:
     def num_live(self) -> List[int]:
         """Per sum interval, its live columns (every interval's), on the host: counted on first use, a wait for the
         device. Only a query that may keep values once without :func:`pyjuice.fast_inference` asks (see
-        :func:`~..queries.plans.prior_regions`)."""
+        :func:`~..queries.backend.plans.prior_regions`)."""
         if self._all is None:
             self._all = self._order(np.ones(len(self.prog.sum_ivs), dtype = bool))
         return [self._all.num_live(k) for k in range(len(self.prog.sum_ivs))]

@@ -21,12 +21,12 @@ import pyjuice.constraints as jc
 import pyjuice.nodes.distributions as dists
 from pyjuice.constraints.backends.dfa_exact.kernels import prod_top_down
 from pyjuice.constraints.backends.dfa_exact.kernels.c import get_module
-from pyjuice.constraints.backends.dfa_exact.queries import forward as F
-from pyjuice.constraints.backends.dfa_exact.queries.top_down import run_backward
+from pyjuice.constraints.backends.dfa_exact.queries.backend import forward as F
+from pyjuice.constraints.backends.dfa_exact.queries.backend.top_down import run_backward
 from pyjuice.constraints.backends.dfa_exact.kernels.compact import compact_layout
 from pyjuice.constraints.backends.dfa_exact.kernels.live import liveness
-from pyjuice.constraints.backends.dfa_exact.queries.plans import (per_sample_intervals, prior_regions, query_plan,
-                                                                  top_down_prior)
+from pyjuice.constraints.backends.dfa_exact.queries.backend.plans import (per_sample_intervals, prior_regions,
+                                                                         query_plan, top_down_prior)
 
 V = 3
 KINDS = {"hmm": 6, "hmm_untied": 6, "hmm_block_sparse": 6, "left_linear": 6, "pd": 8, "pd_prod_dominated": 8,

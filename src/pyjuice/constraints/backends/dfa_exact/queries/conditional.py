@@ -3,7 +3,7 @@ Conditionals under a constraint on the lifted plan: ``log p(x_t = v | e, C)`` fo
 every token ``v``.
 
 A query runs the forward pass (:mod:`.forward`) over the inside values its targets need -- those of the nodes whose
-scope misses a target -- and the top-down pass (:mod:`.queries.top_down`) over the top-down values they need -- those of
+scope misses a target -- and the top-down pass (:mod:`.backend.top_down`) over the top-down values they need -- those of
 the nodes whose scope meets one -- which leaves the CLASS WEIGHTS of the target positions' input nodes, every sample's,
 in ``dfa_class_flow`` (see :mod:`.score`). Then every ROW GROUP (the positions whose input nodes read the same rows of
 their parameter tables, :class:`~.score.ScoreTables`) is scored in one pass, all its targets at once, against a
@@ -20,16 +20,16 @@ from typing import Optional
 import numpy as np
 import torch
 
-from . import forward as F
+from .backend import forward as F
 from ..kernels.common import pack_aligned
 from ..kernels.compact import (STORAGES, compact_buffers, held_elsewhere, held_moves, query_layout, regather_into,
                                resolve_storage, worth_parking)
 from ..kernels.live import live_successors, liveness
 from ..kernels.score import score_group, score_tables
 from ..kernels.transitions import enumerated_args
-from .plans import (PLANS_PER_POSITION, PLAN_CACHE_SIZE, per_sample_intervals, prior_regions, query_plan,
+from .backend.plans import (PLANS_PER_POSITION, PLAN_CACHE_SIZE, per_sample_intervals, prior_regions, query_plan,
                     read_regions, scope_intervals, top_down_prior)
-from .top_down import run_backward
+from .backend.top_down import run_backward
 
 
 

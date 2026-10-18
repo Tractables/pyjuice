@@ -359,7 +359,7 @@ class Program:
     def _operand_table(self, product_rows) -> np.ndarray:
         """bool [sum intervals, sum regions]: whether a product over the interval (``sum_ivs``' numbers: a product's
         scope is its parent sum's) has a child in the region -- whose per-sample inside values computing the product, or
-        its children's top-down values, reads (see :func:`~..queries.plans.read_regions`)."""
+        its children's top-down values, reads (see :func:`~..queries.backend.plans.read_regions`)."""
         out = np.zeros((len(self.sum_ivs), len(self.firsts)), dtype = bool)
         firsts = np.asarray(self.firsts, dtype = np.int64)
         for _, child_rows, bounds in product_rows:

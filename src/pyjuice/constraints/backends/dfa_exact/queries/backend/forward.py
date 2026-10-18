@@ -21,15 +21,15 @@ from typing import Optional
 import numpy as np
 import torch
 
-from ....distributions import lookup
-from ..compiled.tables import _align
-from ..kernels.prod import run_products as products
-from ..external_params import block_scale
-from ..kernels.sum import dense_sum, fused_sum, stacked_weights
+from .....distributions import lookup
+from ...compiled.tables import _align
+from ...kernels.prod import run_products as products
+from ...external_params import block_scale
+from ...kernels.sum import dense_sum, fused_sum, stacked_weights
 
 
 #: Matrix-product precision of the kernels per query precision: "fp32" (three TF32 products, fp32-level accuracy),
-#: "tf32", or "bf16" -- the CUDA fused sums' products on bf16 operands (:func:`~..kernels.sum.fused_sum`), every other
+#: "tf32", or "bf16" -- the CUDA fused sums' products on bf16 operands (:func:`~...kernels.sum.fused_sum`), every other
 #: kernel's as at "tf32".
 PRECISIONS = {"fp32": "tf32x3", "tf32": "tf32", "bf16": "tf32"}
 
@@ -73,10 +73,10 @@ def missing_tensor(missing_mask: Optional[torch.Tensor], B: int, n: int, dev) ->
 
 
 def gate_context(backend, external) -> Optional[dict]:
-    """The gates a query's gated sum layers read (:mod:`..external_params.block_scale`): None
+    """The gates a query's gated sum layers read (:mod:`...external_params.block_scale`): None
     without, else ``values`` and ``lz`` (the session's log gates and log normalizers), ``minor`` (the log gates
-    sample-minor, :func:`~..external_params.block_scale.sample_minor`, for the CUDA sums) and ``layers`` (bool per gated
-    layer: those given gates)."""
+    sample-minor, :func:`~...external_params.block_scale.sample_minor`, for the CUDA sums) and ``layers`` (bool per
+    gated layer: those given gates)."""
     gates = None if external is None else external.gates
     if gates is None:
         return None
@@ -85,9 +85,9 @@ def gate_context(backend, external) -> Optional[dict]:
 
 
 def part_gates(gates: Optional[dict], gate: Optional[dict], compact, prog, once: bool) -> Optional[dict]:
-    """A fused sum part's gates for :func:`~..kernels.sum.fused_sum` / :func:`~..kernels.sum.fused_sum_top_down` under a
-    query's ``gates`` (:func:`gate_context`), or None when its layer is not gated: ``gate`` the part's tables
-    (``block_scale.edge_tables``); ``compact`` the query's :class:`~..kernels.compact.CompactLayout` if the part's rows
+    """A fused sum part's gates for :func:`~...kernels.sum.fused_sum` / :func:`~...kernels.sum.fused_sum_top_down` under
+    a query's ``gates`` (:func:`gate_context`), or None when its layer is not gated: ``gate`` the part's tables
+    (``block_scale.edge_tables``); ``compact`` the query's :class:`~...kernels.compact.CompactLayout` if the part's rows
     are compact (a lane's sample found in its offsets); ``once``: the part computes values kept once, for a batch of
     one -- so the gates are every sample's."""
     if gates is None or gate is None or not gates["layers"][gate["layer"]]:
@@ -125,7 +125,7 @@ def run_forward(backend, bufs: dict, plan, x: torch.Tensor, missing: torch.Tenso
     :param liveness: None, or the query's :class:`~.live.Liveness`, the intervals it computes per sample ordered (unless
         they are compact)
     :param precision: "fp32", "tf32" or "bf16" for the sum layers' matrix products (see :data:`PRECISIONS`)
-    :param compact: None, or the query's :class:`~..kernels.compact.CompactLayout`: the per-sample inside values are
+    :param compact: None, or the query's :class:`~...kernels.compact.CompactLayout`: the per-sample inside values are
         compact where it lays them out (``mars``; ``bufs`` are laid out by it, see :meth:`~.state.State.buffers`)
     :param masses: the query's class masses (:meth:`~.state.State.masses`; None: the state's, under no per-sample
         inputs)
@@ -193,8 +193,8 @@ def run_forward(backend, bufs: dict, plan, x: torch.Tensor, missing: torch.Tenso
 
 def scratch_width(B: int, temp_slots: int, sample_stages, compact) -> int:
     """The width of a product layer's scratch rows (floats): a batch's blocks of ``temp_slots`` -- or ``compact`` (a
-    :class:`~..kernels.compact.CompactLayout`), the compact values of the folds ``sample_stages`` (lists of ``(launch,
-    cut)``, see :mod:`..kernels.prod`) compute per sample, or one sample's block kept once."""
+    :class:`~...kernels.compact.CompactLayout`), the compact values of the folds ``sample_stages`` (lists of ``(launch,
+    cut)``, see :mod:`...kernels.prod`) compute per sample, or one sample's block kept once."""
     if compact is None:
         return _align(B * temp_slots)
     ivs = [launch.out_ivs for launches in sample_stages for launch, _ in launches if launch.out_temp]
@@ -208,7 +208,7 @@ def _sums(backend, parts, block_size: int, nodes: torch.Tensor, element_mars: to
     key)``, and None or ``(fused part, index list of its node blocks or None for all, count, most slots)``, see
     :func:`~.plans.query_plan`) into ``nodes`` -- ``node_mars``, or ``prior_mars`` with ``B`` 1 and no pruning
     (``once``) -- whose sum regions ``regions`` (device tensors) and ``offsets`` / ``widths`` (host, a value per
-    region) describe. ``compact``: the query's :class:`~..kernels.compact.CompactLayout`, by which the rows are
+    region) describe. ``compact``: the query's :class:`~...kernels.compact.CompactLayout`, by which the rows are
     compact -- a batch of one whose slots are the lanes (``regions``' ``slots``), every lane computed. ``gates``: see
     :func:`run_forward`."""
     prog, pc = backend.program(), backend.pc

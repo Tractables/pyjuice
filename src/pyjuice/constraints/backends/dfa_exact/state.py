@@ -211,9 +211,9 @@ class State:
 
     def flows(self, batch_size: int, bufs: Dict[str, Any], compact = None) -> Dict[str, Any]:
         """
-        The top-down buffers of a batch (see :mod:`~.queries.top_down`): ``node_flows`` (laid out as ``node_mars``,
-        storage of its own, allocated on first use) and ``element_flows``, which is ``element_mars``'s storage -- the
-        top-down pass never reads the product insides there. ``compact``: the query's
+        The top-down buffers of a batch (see :mod:`~.queries.backend.top_down`): ``node_flows`` (laid out as
+        ``node_mars``, storage of its own, allocated on first use) and ``element_flows``, which is ``element_mars``'s
+        storage -- the top-down pass never reads the product insides there. ``compact``: the query's
         :class:`~.kernels.compact.CompactLayout`, which lays both out (``element_flows`` in storage of its own where
         ``element_mars``'s is too small: a compact row holds every pair of live columns, joined or not).
         """

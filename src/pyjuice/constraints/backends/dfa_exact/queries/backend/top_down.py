@@ -28,12 +28,12 @@ import numpy as np
 import torch
 
 from . import forward as F
-from ..compiled.tables import _align
-from ..kernels.common import SUM, tensor
-from ..kernels.prod import run_products as products
-from ..kernels.prod_top_down import run_top_down
-from ..kernels.score import run_class_weights
-from ..kernels.sum import dense_sum_top_down, fill_dead_rows, fused_sum_top_down, stacked_weights
+from ...compiled.tables import _align
+from ...kernels.common import SUM, tensor
+from ...kernels.prod import run_products as products
+from ...kernels.prod_top_down import run_top_down
+from ...kernels.score import run_class_weights
+from ...kernels.sum import dense_sum_top_down, fill_dead_rows, fused_sum_top_down, stacked_weights
 
 
 
@@ -53,9 +53,9 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
     :param class_weights: None, or where the class weights of the target positions' input nodes go, every sample's
         (see :func:`~.score.run_class_weights`; the plan must be a scoring one, see :func:`~.query_plan.
         top_down_plan`)
-    :param masses: the query's class masses (:class:`~..state.ClassMasses`) if its forward has them
+    :param masses: the query's class masses (:class:`~...state.ClassMasses`) if its forward has them
         (:func:`~.forward.run_forward`'s), else None
-    :param compact: None, or the query's :class:`~..kernels.compact.CompactLayout`: the per-sample values are compact
+    :param compact: None, or the query's :class:`~...kernels.compact.CompactLayout`: the per-sample values are compact
         (``flows`` laid out by it, see :meth:`~.state.State.flows`), the inside values too where it lays them out
         (``mars``, as ``bufs``)
     :param gates: None, or the gates of the query's gated sum layers (:func:`~.forward.gate_context`)

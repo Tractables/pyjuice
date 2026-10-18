@@ -280,7 +280,7 @@ def _row_tile(tile: int, block_size: int, node_gate: int) -> int:
 
 def gate_launch(gated: Optional[dict], dummy: torch.Tensor, idx = None, a_idx = None, ck = None) -> tuple:
     """The sum kernels' gate arguments, ``(idx, a_idx, ck, gates, gstride, lz, lzstride, coff, reg_ivk, Bq, steps)``,
-    from a part's gates (see :func:`~..queries.forward.part_gates`; ``dummy`` where nothing is read)."""
+    from a part's gates (see :func:`~..queries.backend.forward.part_gates`; ``dummy`` where nothing is read)."""
     if gated is None:
         return (dummy,) * 3 + (dummy, 0, dummy, 0, dummy, dummy, 1, 1)
     off, reg_ivk, Bq, steps = gated["lanes"] if gated["lanes"] is not None else (dummy, dummy, 1, 1)
@@ -897,8 +897,8 @@ def fused_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch
         padding; ``pids`` as for ``cids``)
     :param liveness: None, or the query's :class:`~.live.Liveness` (its lane order covers the regions computed)
     :param sel, count: None for every node block, or a query plan's int32 index list of them and its length
-    :param gated: None, or the gates of a gated layer's node blocks (:func:`~..queries.forward.part_gates`): ``idx``
-        / ``a_idx`` (the edges' cells, as ``cids`` / the aliased children), the session's gates and normalizers
+    :param gated: None, or the gates of a gated layer's node blocks (:func:`~..queries.backend.forward.part_gates`):
+        ``idx`` / ``a_idx`` (the edges' cells, as ``cids`` / the aliased children), the session's gates and normalizers
     :param frags: None, or where the CUDA kernel's fragment-ordered weights are kept (:func:`_cuda_fragments`)
     :param bf16: a CUDA launch's products on bf16 operands (a ``precision = "bf16"`` query's: ``precision`` "tf32",
         ``frags`` given)
@@ -1459,12 +1459,13 @@ def fused_sum_top_down(element_flows: torch.Tensor, node_flows: torch.Tensor, pa
 
     :param tables: child-block-major: ``cb_row``, ``cb_reg`` (-1 for element rows), ``cb_add``, ``cb_ivreg`` (a region
         of the children's interval, for pruning), ``par_ptr``, ``par_nid``, ``par_reg``, ``par_pid`` (int32 / int64
-        device tensors, see :mod:`.queries.top_down`), and a gated layer's ``gate``: its parents' ``lc``, ``row`` and
-        ``cbs`` (see :mod:`..compiled.top_down_program`)
+        device tensors, see :mod:`.queries.backend.top_down`), and a gated layer's ``gate``: its parents' ``lc``,
+        ``row`` and ``cbs`` (see :mod:`..compiled.top_down_program`)
     :param cbs: the child block size of these children
     :param max_cols: the most columns any child block has (``batch_size`` x its slots)
     :param idx: None (every child block), or int32 on the device: the plan's index list of the child blocks to compute
-    :param gated: None, or the session's gates (:func:`~..queries.forward.part_gates`): the layer's gates applied
+    :param gated: None, or the session's gates (:func:`~..queries.backend.forward.part_gates`):
+        the layer's gates applied
     :param frags: None, or where the CUDA kernel's fragment-ordered weights are kept (:func:`_cuda_fragments`)
     :param bf16: a CUDA launch's products on bf16 operands (see :func:`fused_sum`)
     """

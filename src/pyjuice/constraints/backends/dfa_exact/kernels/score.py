@@ -287,8 +287,8 @@ def _class_weight_kernel(dfa_class_flow, cw_base, cw_K, element_flows, temp_flow
     the input's boundary where the lane's class leads somewhere, then over the other boundary's columns ``TJ`` at a
     time -- log-added to ``dfa_class_flow`` at the destination's position block (``cw_base``, ``cw_K`` per position)
     -- or stored there (``STORE``: the launch writes each of its destinations first in its query, see
-    :mod:`..queries.plans`). A node tile's destinations (see :func:`~.common.node_tiles`) are at one position, with
-    steps to the same other boundaries: they walk the same columns, once for all of them; one exp a term
+    :mod:`..queries.backend.plans`). A node tile's destinations (see :func:`~.common.node_tiles`) are at one position,
+    with steps to the same other boundaries: they walk the same columns, once for all of them; one exp a term
     (:func:`~.prod._lse_step_one_exp`).
 
     Two walks, the program choosing per its lanes (``WALK`` 0; 1 and 2 force one): over the CLASS's columns -- those

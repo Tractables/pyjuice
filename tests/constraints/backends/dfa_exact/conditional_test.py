@@ -17,12 +17,12 @@ import pyjuice as juice
 import pyjuice.constraints as jc
 from pyjuice.constraints.backends.dfa_exact.kernels import compact as CP
 from pyjuice.constraints.backends.dfa_exact.queries import conditional as QC
-from pyjuice.constraints.backends.dfa_exact.queries import forward as F
+from pyjuice.constraints.backends.dfa_exact.queries.backend import forward as F
 from pyjuice.constraints.backends.dfa_exact.queries import marginal as QM
 from pyjuice.constraints.backends.dfa_exact.queries.conditional import class_weights
 from pyjuice.constraints.backends.dfa_exact.kernels import score as S
 from pyjuice.constraints.backends.dfa_exact.kernels.score import score_tables
-from pyjuice.constraints.backends.dfa_exact.queries import plans as QP
+from pyjuice.constraints.backends.dfa_exact.queries.backend import plans as QP
 from pyjuice.constraints.distributions import TokenClasses
 from pyjuice.constraints.evidence import candidate_tensor
 
@@ -558,7 +558,7 @@ def cw_weights(cc, data, missing, storage = "compact"):
 
 
 def forced_fill(real):
-    """:func:`~...queries.planners.class_weight_writes` as if every launch log-added to a fill."""
+    """:func:`~...queries.backend.planners.class_weight_writes` as if every launch log-added to a fill."""
     def writes(prog, steps, positions):
         real(prog, steps, positions)
         for step in steps:
@@ -577,9 +577,10 @@ def forced_fill(real):
 def test_class_weights_are_stored_once_or_added_to_a_fill(kind, pattern, storage, build_pc, monkeypatch):
     """A plan's class weight launches store the weights where they write each destination first and log-add them
     elsewhere, ``dfa_class_flow`` filled with -inf only where a launch adds to nothing yet or a weight is written by
-    none (``cw_fill``, :func:`~...queries.planners.class_weight_writes`; ``hand_dead``: steps without a top-down value):
-    with the buffer poisoned (NaN) before every query, the weights are what log-adding every launch's to a fill gives,
-    bit for bit -- also where the evidence leaves no sample a live column (``ruled_out``: every launch still writes)."""
+    none (``cw_fill``, :func:`~...queries.backend.planners.class_weight_writes`; ``hand_dead``: steps without a top-down
+    value): with the buffer poisoned (NaN) before every query, the weights are what log-adding every launch's to a fill
+    gives, bit for bit -- also where the evidence leaves no sample a live column (``ruled_out``: every launch still
+    writes)."""
     n = {"walks": 6, "hand_dead": 3}.get(kind, KINDS.get(kind))
     if pattern == "ruled_out":                                   # 0s around one missing token: never "1 2"
         data, missing = torch.zeros(4, n, dtype = torch.long), torch.zeros(4, n, dtype = torch.bool)

@@ -13,8 +13,8 @@ import torch
 from ..kernels.compact import (STORAGES, compact_buffers, held_elsewhere, held_moves, query_layout,
                               resolve_storage, worth_parking)
 from ..kernels.live import live_successors, liveness
-from .forward import PRECISIONS, gate_context, missing_tensor, run_forward
-from .plans import per_sample_intervals, prior_regions, query_plan, read_regions
+from .backend.forward import PRECISIONS, gate_context, missing_tensor, run_forward
+from .backend.plans import per_sample_intervals, prior_regions, query_plan, read_regions
 
 
 

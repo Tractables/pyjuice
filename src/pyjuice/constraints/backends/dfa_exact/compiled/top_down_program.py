@@ -1,6 +1,6 @@
 """
-What the top-down pass (:mod:`.queries.top_down`) reads besides the buffers and the parameters, built once per backend
-from the forward's :class:`~.program.Program` (:class:`TopDownProgram`).
+What the top-down pass (:mod:`.queries.backend.top_down`) reads besides the buffers and the parameters, built once per
+backend from the forward's :class:`~.program.Program` (:class:`TopDownProgram`).
 
 Every table is CHILD-MAJOR: a program owns a child and sums over its parents, so nothing is accumulated with atomics
 or scratch; a child reached by several launches (a sum shared by products in several layers) is written by the

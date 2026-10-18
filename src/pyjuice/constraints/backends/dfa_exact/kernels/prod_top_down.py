@@ -1,7 +1,7 @@
 """
-The lifted product layer's top-down pass (see :mod:`.queries.top_down`): the top-down value of every child of every
-product, from the products' own (``element_flows``, or ``temp_flows`` for a fold's scratch row) and the other children's
-inside values. One kernel per contraction of :mod:`.prod`, each the transpose of its forward:
+The lifted product layer's top-down pass (see :mod:`.queries.backend.top_down`): the top-down value of every child of
+every product, from the products' own (``element_flows``, or ``temp_flows`` for a fold's scratch row) and the other
+children's inside values. One kernel per contraction of :mod:`.prod`, each the transpose of its forward:
 
 * ``copy``: the child's top-down value is the copy's;
 * ``input @ block`` (``out[i, j] = sum_c mass(i, c) R[next(t, i, c), j]``): ``O_R[q, j] = sum_(i, c) -> q mass(i, c)

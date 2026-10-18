@@ -23,8 +23,8 @@ import pyjuice.constraints as jc
 import pyjuice.nodes.distributions as dists
 from pyjuice.constraints.backends.dfa_exact.kernels import sum as lifted_sum
 from pyjuice.constraints.backends.dfa_exact.kernels.c import get_module
-from pyjuice.constraints.backends.dfa_exact.queries import forward as forward_queries
-from pyjuice.constraints.backends.dfa_exact.queries import top_down as top_down_queries
+from pyjuice.constraints.backends.dfa_exact.queries.backend import forward as forward_queries
+from pyjuice.constraints.backends.dfa_exact.queries.backend import top_down as top_down_queries
 from pyjuice.nodes import inputs as input_nodes, multiply, summate
 
 V = 3

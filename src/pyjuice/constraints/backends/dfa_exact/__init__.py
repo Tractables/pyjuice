@@ -28,7 +28,7 @@ WHAT MAKES IT FAST
 * Query plans: a query computes only the values its targets need; those no sample's evidence reaches are computed
   once for the batch, and inside :func:`pyjuice.fast_inference` once across queries; values a caching engine says the
   buffers hold (``held``) are not computed. A plan is index lists into the passes' fixed launch tables, built by numba
-  planners and cached by the query's inputs (:mod:`.queries.plans`, :mod:`.queries.planners`).
+  planners and cached by the query's inputs (:mod:`.queries.backend.plans`, :mod:`.queries.backend.planners`).
 * Kept across queries inside :func:`pyjuice.fast_inference`: the class masses, the values no evidence reaches, the
   stacked weights of dense sums and the token tables the conditionals score against, in bf16 if allowed
   (:mod:`.state`).
@@ -40,9 +40,10 @@ MODULES, by when they take effect
 * ``compiled/`` -- built once per (constraint, PC): :mod:`.compiled.layout` (the automaton over the positions),
   :mod:`.compiled.tables` (the PC's rows, the buffers' layout), :mod:`.compiled.program` and
   :mod:`.compiled.top_down_program` (the launch tables of the forward and top-down passes).
-* ``queries/`` -- run by every query: :mod:`.queries.marginal` and :mod:`.queries.conditional`; what a query computes,
-  :mod:`.queries.plans` (built by :mod:`.queries.planners`); the passes, :mod:`.queries.forward` and
-  :mod:`.queries.top_down`.
+* ``queries/`` -- run by every query: :mod:`.queries.marginal`, :mod:`.queries.conditional` and a decoder's session
+  (:mod:`.queries.decoder`); what they share, in ``queries/backend/``: what a query computes,
+  :mod:`.queries.backend.plans` (built by :mod:`.queries.backend.planners`), and the passes,
+  :mod:`.queries.backend.forward` and :mod:`.queries.backend.top_down`.
 * ``kernels/`` -- the Triton kernels with their launchers: products (:mod:`.kernels.prod`, :mod:`.kernels.transitions`)
   and their top-down pass (:mod:`.kernels.prod_top_down`), sums both ways (:mod:`.kernels.sum`), evidence pruning
   (:mod:`.kernels.live`), the conditionals' class weights and scoring (:mod:`.kernels.score`), shared helpers

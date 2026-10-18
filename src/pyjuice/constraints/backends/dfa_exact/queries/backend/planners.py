@@ -15,8 +15,8 @@ import numpy as np
 import torch
 from numba import njit
 
-from ..kernels.common import IndexList, SUM, TEMP, node_tiles, pack_aligned
-from ..kernels.prod import Cut, Launch
+from ...kernels.common import IndexList, SUM, TEMP, node_tiles, pack_aligned
+from ...kernels.prod import Cut, Launch
 
 
 
@@ -103,7 +103,7 @@ def _forward_tables(prog):
     """``(tables, launches, full cuts, parts, part intervals)``: what :func:`_forward_modes` reads
     (:data:`_FW_FIELDS`), every product launch in the Program's order with the :class:`~.prod.Cut` running all of its
     steps, every sum layer part's dense runs, and the intervals of its fused node blocks' regions (``prog.intervals``'
-    numbers, as a :class:`~..kernels.compact.CompactLayout` counts their lanes; None for none) -- built on first use,
+    numbers, as a :class:`~...kernels.compact.CompactLayout` counts their lanes; None for none) -- built on first use,
     kept on the Program."""
     if getattr(prog, "fw_flat", None) is not None:
         return prog.fw_flat
@@ -752,7 +752,7 @@ def class_weight_writes(prog, steps: list, positions: np.ndarray) -> bool:
     Returns whether ``dfa_class_flow`` must be filled with -inf first: some launch log-adds to a destination nothing
     wrote before, or some (target position, row) of the buffer (``positions``: bool [n]) is never written.
     """
-    from ..kernels.score import score_tables
+    from ...kernels.score import score_tables
     score = score_tables(prog)
     K = np.array([len(score.rows[g]) if g >= 0 else 0 for g in score.group_of], dtype = np.int64)
     seen = np.zeros((prog.n, max(int(K.max(initial = 0)), 1)), dtype = bool)
