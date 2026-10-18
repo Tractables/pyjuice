@@ -475,3 +475,146 @@ def test_marginals_survive_a_wide_dynamic_range(kind, storage, build_pc, referen
     for got in (kept, per_sample):
         assert torch.isfinite(got).all(), got
         assert ((got - want).abs() <= 1e-5 * want.abs() + 1e-4).all(), (got - want)
+
+
+# -------------------------------------------------------------------------------------------------
+# Successor lists: a column's entries whose successor is live (the forward's input @ block entry loops)
+# -------------------------------------------------------------------------------------------------
+
+VW = 8                                                                  # tokens of the successor lists' automata
+
+
+def wide_dfa(K = 24, seed = 0):
+    """A random ``K``-state automaton over :data:`VW` tokens: columns of several entries, most leading to columns the
+    evidence kills."""
+    rng = random.Random(seed)
+    return jc.DFA.from_dense(VW, [[rng.randrange(K) for _ in range(VW)] for _ in range(K)], 0, rng.sample(range(K), 6))
+
+
+def entry_form(form, monkeypatch):
+    """A missing token's transitions grouped by successor, or a column's live entries (the test automata are dense:
+    the entry loop forced)."""
+    monkeypatch.setattr(P, "GROUP_MIN_RATIO", 0 if form == "grouped" else 1 << 30)
+    monkeypatch.setattr(P, "ENTRY_LOOP_MAX_LIVE", 2)
+
+
+@pytest.mark.parametrize("form", ["grouped", "entries"])
+@pytest.mark.parametrize("kind", ["hmm", "pd", "hand_left"])
+def test_successor_lists_match_a_brute_force(kind, form, build_pc, monkeypatch):
+    """Every (sample, boundary, live column)'s successor list -- the column's entries of the Program's transition
+    tables whose successor is live at the next boundary, ascending -- and every boundary's choice to take them (over
+    the samples), against the liveness flags: an odd batch, a sample whose evidence breaks the constraint (nothing
+    live)."""
+    from pyjuice.constraints.backends.dfa_exact.kernels import live as L
+    entry_form(form, monkeypatch)
+    n = KINDS[kind]
+    cc = jc.compile(wide_dfa(), build_pc(kind, n, VW))
+    prog = cc.backend.program()
+    g = torch.Generator().manual_seed(1)
+    B = 7
+    data = torch.randint(0, VW, (B, n), generator = g)
+    missing = torch.rand(B, n, generator = g) < 0.6
+    missing[0] = True
+    lv = liveness(prog, obs_classes(cc, data, missing), B)
+    live = lv.live.cpu() != 0
+    ep = prog.trans.entry_ptr.cpu().long().view(n, -1)
+    succ = prog.trans.entry_succ.cpu().long()
+    lists, kept, total = {}, [0] * n, [0] * n
+    for b in range(B):
+        for t in range(n):
+            for i in torch.nonzero(live[b, t, :int(prog.width[t])]).flatten().tolist():
+                es = torch.arange(int(ep[t, i]), int(ep[t, i + 1]))
+                lists[b, t, i] = want = es[live[b, t + 1, succ[es]]]
+                kept[t], total[t] = kept[t] + want.numel(), total[t] + es.numel()
+    ratios = sorted({kept[t] / total[t] for t in range(n) if total[t] > 0})
+    assert lists and len(ratios) > 1
+    monkeypatch.setattr(L, "SUCCESSOR_LIST_MAX_LIVE", (ratios[0] + ratios[1]) / 2)   # some take them, some do not
+    sl = lv.successor_lists(cc.backend.state)
+    assert lv.successor_lists(cc.backend.state) is sl                       # built once
+    start, count, entries, use = (x.cpu().long() for x in (sl.start, sl.count, sl.entries, sl.use))
+    E = sl.num_entries
+    assert E == succ.numel() and entries.numel() == B * E
+    for (b, t, i), want in lists.items():
+        s0 = b * E + int(ep[t, 0]) + int(start[b, t, i])
+        assert torch.equal(entries[s0:s0 + int(count[b, t, i])], want), (b, t, i)
+    assert use.tolist() == [int(kept[t] <= L.SUCCESSOR_LIST_MAX_LIVE * total[t]) for t in range(n)]  # over samples
+    assert 0 < int(use.sum()) < n
+    assert sl.boundaries.tolist() == (use != 0).tolist()                     # (read back: launches compile by them)
+
+
+@pytest.mark.parametrize("evidence_kind", ["none", "topk"])
+@pytest.mark.parametrize("storage", ["dense", "compact"])
+@pytest.mark.parametrize("form", ["grouped", "entries"])
+@pytest.mark.parametrize("kind", ["hmm", "hmm_untied", "pd", "hand", "hand_left", "left_linear"])
+def test_successor_lists_change_nothing(kind, form, storage, evidence_kind, build_pc, monkeypatch):
+    """Marginals, conditionals and log marginals with the successor lists taken at every boundary (the kernels with
+    the lists alone), at every other boundary (the kernels choosing per step), at none, and not built at all: the
+    same bits -- the lists drop only terms through a dead successor, -inf (top-k per-sample inputs: the liveness also
+    follows their candidate classes)."""
+    import pyjuice.nodes.distributions as dists
+    from pyjuice.constraints.backends.dfa_exact.kernels import live as L, prod as K
+    from pyjuice.constraints.backends.dfa_exact.queries import forward as F
+    entry_form(form, monkeypatch)
+    n = KINDS[kind]
+    topk = evidence_kind == "topk"
+    pc = build_pc(kind, n, VW, input_dist = dists.SoftEvidenceCategorical if topk else None)
+    cc = jc.compile(wide_dfa(), pc)
+    g = torch.Generator().manual_seed(2)
+    B, dev = 5, cc.pc.device
+    data = torch.randint(0, VW, (B, n), generator = g)
+    missing = torch.ones(B, n, dtype = torch.bool)
+    missing[1, :n // 2] = False                                             # a prefix, a suffix, scattered
+    missing[2, n // 2:] = False
+    missing[3] = torch.rand(n, generator = g) < 0.5
+    missing[4, 1::2] = False
+    inputs = {}
+    if topk:
+        ids = torch.argsort(torch.rand(B, n, VW, generator = g), dim = 2)[..., :3]
+        data = torch.where(missing, data, ids[..., 0])
+        inputs = dict(categorical_evidence_logp = (torch.randn(B, n, 3, generator = g) * 2).to(dev),
+                      soft_evidence_cat_ids = ids.to(dev))
+    data, missing = data.to(dev), missing.to(dev)
+    real = L.Liveness.successor_lists
+
+    def alternate(self, state):                                             # every other boundary takes them
+        sl = real(self, state)
+        sl.use.copy_((torch.arange(sl.use.numel(), device = sl.use.device) % 2 == 0).to(torch.int32))
+        sl.boundaries = sl.use.cpu().numpy() != 0
+        return sl
+
+    class Spy:                                                              # the modes the entry loops compile
+        def __init__(self, kernel):
+            self.kernel = kernel
+
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                modes.add(kwargs["SUCC_LISTS"])
+                return self.kernel[grid](*args, **kwargs)
+            return launch
+
+    for name in ("_input_block_kernel", "_input_block_group_kernel"):
+        monkeypatch.setattr(K, name, Spy(getattr(K, name)))
+    spans, products = K.Launch.input_boundaries, F.products
+    out, seen = {}, {}
+    for arm in ("always", "alternate", "never", "unbuilt"):
+        modes = set()
+        monkeypatch.setattr(K.Launch, "input_boundaries", spans)
+        monkeypatch.setattr(F, "products", products)
+        if arm == "unbuilt":
+            monkeypatch.setattr(F, "products", lambda *args, succ_lists = None, **kwargs: products(*args, **kwargs))
+        elif arm == "alternate":                                            # (every launch as if over every boundary:
+            monkeypatch.setattr(L.Liveness, "successor_lists", alternate)   # the steps choose, the launches cannot)
+            monkeypatch.setattr(K.Launch, "input_boundaries", property(lambda self: np.arange(n)))
+            monkeypatch.setattr(L, "SUCCESSOR_LIST_MAX_LIVE", 2.0)
+        else:
+            monkeypatch.setattr(L.Liveness, "successor_lists", real)
+            monkeypatch.setattr(L, "SUCCESSOR_LIST_MAX_LIVE", 2.0 if arm == "always" else -1.0)
+        with cc.decoder(storage = storage, precision = "fp32", **inputs) as d:
+            marg = d.marginal(data, missing)
+            cond, logm = d.conditional(data, missing, return_log_marginal = True)
+        out[arm], seen[arm] = (marg, cond, logm), modes
+    assert torch.isfinite(out["always"][1]).any()
+    assert 2 in seen["always"] and 1 in seen["alternate"] and seen["never"] == seen["unbuilt"] == {0}, seen
+    for arm in ("alternate", "never", "unbuilt"):
+        for got, want in zip(out["always"], out[arm]):
+            assert torch.equal(got, want), arm

@@ -276,6 +276,75 @@ class LaneOrder:
 LIST_TILE = 512
 ROW_TILE = 1024
 
+#: A boundary takes its SUCCESSOR LISTS (:meth:`Liveness.successor_lists`) -- the forward's ``input @ block`` kernels
+#: then loop over a column's entries whose successor is live alone, for every sample -- when, over the query's
+#: samples, at most this fraction of its live columns' entries have a live successor; above, the entry tables (a list
+#: costs a load a term). Replayed launches, Codpula 4096, batch 16: regex 400words (1.6% live) 0.52-0.60 -> 0.05-0.09
+#: ms; JSON hard_1 (55-95% live) 0 to 5% slower; the crossover between them not swept.
+SUCCESSOR_LIST_MAX_LIVE = 0.5
+SUCCESSOR_LIST_TILE = 128
+
+
+@dataclass
+class SuccessorLists:
+    """
+    For every sample ``b``, boundary ``t`` and live column ``i`` of a query, the column's entries (of the Program's
+    transition tables, ``Program.trans``) whose successor is live at ``t + 1``, ascending: ``entries[b E + e_t +
+    start[b, t, i] + k]`` for ``k < count[b, t, i]``, ``E`` the tables' entries and ``e_t`` boundary ``t``'s first --
+    each (sample, boundary) list within its boundary's entry range, so none waits for another's count. A dead column's
+    ``start`` and ``count`` are unwritten (never read).
+
+    :ivar start, count: int32 [B, n, W]
+    :ivar entries: int32 [B E], entry numbers
+    :ivar use: int32 [n], whether the boundary takes its lists, every sample's (:data:`SUCCESSOR_LIST_MAX_LIVE`)
+    :ivar num_entries: ``E``
+    :ivar boundaries: ``use`` on the host -- a launch compiles with the lists alone where every boundary of its steps
+        takes them, without them where none does, and chooses per step otherwise (see :func:`~.prod.run_products`)
+    """
+
+    start: torch.Tensor
+    count: torch.Tensor
+    entries: torch.Tensor
+    use: torch.Tensor
+    num_entries: int
+    boundaries: np.ndarray
+
+
+@triton_jit
+def _successor_lists_kernel(live, entry_ptr, entry_succ, count, start, columns, lstart, lcount, entries, sizes, n, W, E,
+                            TILE: tl.constexpr):
+    """One program per (sample, boundary ``t < n``): over the sample's live columns at ``t`` (``count`` / ``start`` /
+    ``columns``, :meth:`Liveness.lists`), ascending, their entries whose successor is live at ``t + 1``, into the
+    (sample, boundary)'s :class:`SuccessorLists`; ``sizes`` [B, n, 2]: the entries kept, and those columns' entries."""
+    pid = tl.program_id(0)
+    b = (pid // n).to(tl.int64)
+    t = pid % n
+    row = b * (n + 1) + t                                                   # (the live lists' row)
+    nc = tl.load(count + row)
+    cs = tl.load(start + row)
+    nxt = live + (row + 1) * W                                              # the successors' boundary
+    region = entries + b * E + tl.load(entry_ptr + t * (W + 1))
+    out = (b * n + t) * W
+    kept = tl.zeros([], dtype = tl.int32)
+    total = tl.zeros([], dtype = tl.int32)
+    for ci in range(0, nc):
+        i = tl.load(columns + cs + ci)
+        e0 = tl.load(entry_ptr + t * (W + 1) + i)
+        e1 = tl.load(entry_ptr + t * (W + 1) + i + 1)
+        first = kept
+        for c0 in range(e0, e1, TILE):
+            e = c0 + tl.arange(0, TILE)
+            em = e < e1
+            q = tl.load(entry_succ + e, mask = em, other = 0)
+            v = (em & (tl.load(nxt + q, mask = em, other = 0) != 0)).to(tl.int32)
+            tl.store(region + kept + tl.cumsum(v, axis = 0) - v, e, mask = v != 0)
+            kept += tl.sum(v, axis = 0)
+        total += e1 - e0
+        tl.store(lstart + out + i, first)
+        tl.store(lcount + out + i, kept - first)
+    tl.store(sizes + (b * n + t) * 2, kept)
+    tl.store(sizes + (b * n + t) * 2 + 1, total)
+
 #: The liveness sweeps run as a launch per boundary (:func:`_live_forward_kernel`, :func:`_live_backward_kernel`, on
 #: samples x tiles of LIVE_STEP_TILE columns) when the widest boundary has at least this many columns; below, one
 #: program per sample sweeps them all (:func:`_liveness_kernel`). HMM4096, batch 1: the sweep of a 47k-column
@@ -330,6 +399,33 @@ class Liveness:
     _lists: Optional[tuple] = None
     _rank: Optional[torch.Tensor] = None
     _all: Optional[LaneOrder] = None                # every interval's order, when the live counts were asked for
+    _succ: Optional[SuccessorLists] = None
+
+    def successor_lists(self, state) -> SuccessorLists:
+        """The query's :class:`SuccessorLists` of the Program's transition tables, in ``state``'s storage
+        ``"successor_lists"`` (:meth:`~..state.State.storage_view`): built on first use, one launch (and the live
+        lists', :meth:`lists`), then the boundaries taking them read back -- the one wait for the device."""
+        if self._succ is None:
+            prog, B, n = self.prog, self.B, self.prog.n
+            W = prog.next_col.size(1)
+            tt = prog.trans
+            E = int(tt.entry_succ.numel())
+            parts = [B * E, B * n * W, B * n * W, B * n * 2]
+            offs = np.cumsum([0] + [-(-z // 4) * 4 for z in parts])          # (16-byte aligned pieces)
+            store = state.storage_view("successor_lists", int(offs[-1])).view(torch.int32)
+            entries, lstart, lcount, sizes = (store[offs[k]:offs[k] + parts[k]] for k in range(4))
+            count, start, columns = self.lists()
+            if n > 0 and B > 0:
+                _successor_lists_kernel[(B * n,)](self.live, tt.entry_ptr, tt.entry_succ, count, start, columns, lstart,
+                                                  lcount, entries, sizes, n, W, E, TILE = SUCCESSOR_LIST_TILE,
+                                                  num_warps = 4)
+                kept, total = sizes.view(B, n, 2).sum(dim = 0, dtype = torch.float64).unbind(1)   # (exact counts)
+                use = (kept <= SUCCESSOR_LIST_MAX_LIVE * total).to(torch.int32)
+            else:
+                use = torch.zeros(n, dtype = torch.int32, device = prog.dev)
+            self._succ = SuccessorLists(start = lstart.view(B, n, W), count = lcount.view(B, n, W), entries = entries,
+                                        use = use, num_entries = E, boundaries = use.cpu().numpy() != 0)
+        return self._succ
 
     def lists(self, rank: bool = False):
         """``(count, start, columns)``: every (sample, boundary) row's live columns, ascending -- ``count[row]`` (int32

@@ -148,6 +148,9 @@ def run_forward(backend, bufs: dict, plan, x: torch.Tensor, missing: torch.Tenso
         srcs = dict(mars = node_mars, offset = regions["offset"], width = regions["width"], reg_prior = plan.reg_prior)
     dot = PRECISIONS[precision]
     live = liveness.live if liveness is not None else None
+    succ_lists = None                                                  # entry loops under pruning: a column's entries
+    if liveness is not None and (prog.trans.grouped or prog.entry_loop):         # whose successor is live, where few are
+        succ_lists = lambda: liveness.successor_lists(backend.state)   # (built by the first launch that can take them)
 
     masses = backend.state.masses() if masses is None else masses
     for k, layer in enumerate(pc.input_layer_group):                   # the input region: pyjuice's own layout
@@ -174,7 +177,7 @@ def run_forward(backend, bufs: dict, plan, x: torch.Tensor, missing: torch.Tenso
                 if sample_stages:
                     products(sample_stages, (temp, temp_width), prog, regions, element_mars, node_mars, masses,
                              obs_class, live, elem_first, elem_width, B, srcs, exact = liveness is not None,
-                             compact = compact)
+                             compact = compact, succ_lists = succ_lists)
         else:
             for block_size, prior_parts, sample_parts in layers:
                 if prior_parts:

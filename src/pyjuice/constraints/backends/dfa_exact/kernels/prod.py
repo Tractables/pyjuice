@@ -33,6 +33,7 @@ import math
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -85,11 +86,19 @@ class Launch:
     sizes: torch.Tensor
     groups_host: Optional[dict] = None
     out_ivs: Any = None
+    _input_boundaries: Any = None
 
     @property
     def out_temp(self) -> bool:
         """Whether its steps' outputs are scratch rows (a fold's), not the layer's ``element_mars`` rows."""
         return self.kinds[2 if self.form == "block_block" else 1]
+
+    @property
+    def input_boundaries(self) -> np.ndarray:
+        """``input_block`` steps: the boundaries of their inputs, each once (int64, host; computed on first use)."""
+        if self._input_boundaries is None:
+            self._input_boundaries = np.unique(self.rows[:, 2].numpy())
+        return self._input_boundaries
 
 
 @dataclass
@@ -198,6 +207,52 @@ def _lane_rows(tok_ptr, prow, lognorm, t, mrow, lm, ENUM: tl.constexpr, LOGW: tl
 
 
 @triton.jit
+def _list_range(entry_ptr, succ_start, succ_count, b, t, i, miss, n, W, E):
+    """``(l0, l1)``, int64: lanes' column ``i`` at boundary ``t`` (samples ``b``, ``miss`` the lanes on) -- its
+    successor list's range in the :class:`~.live.SuccessorLists`' entries (those whose successor is live)."""
+    bt = b.to(tl.int64) * n + t
+    l0 = b.to(tl.int64) * E + tl.load(entry_ptr + t * (W + 1)) + tl.load(succ_start + bt * W + i, mask = miss, other = 0)
+    return l0, l0 + tl.load(succ_count + bt * W + i, mask = miss, other = 0)
+
+
+@triton.jit
+def _ib_term(mx, acc, ee, pm, entry_succ, entry_x, rp, iv_table, rpos, j, X, r_own, crank, b, t, rbase, ce, n, W,
+             masses, tokmaj, tk, pr, lz, enum_logw, tok, num_rows, logw_stride, R_KIND: tl.constexpr,
+             R_FULL: tl.constexpr, COMPACT: tl.constexpr, GROUPED: tl.constexpr, ENUM: tl.constexpr,
+             LOGW: tl.constexpr):
+    """:func:`_input_block_kernel`'s term of entry ``ee`` (lanes ``pm``): its successor's block value plus its mass
+    (a transition mass, ``GROUPED``; else the class's, :func:`_lane_mass`), log-summed into ``(mx, acc)``."""
+    q = tl.load(entry_succ + ee, mask = pm, other = -1)
+    if R_KIND == 2:
+        rv = tl.where(pm & (q == j), 0.0, float("-inf"))
+    else:
+        rv = _block_value(rp, iv_table, rpos, q, j, X, pm, r_own, crank, b, t, rbase, ce, n, W, R_FULL, COMPACT)
+    x = tl.load(entry_x + ee, mask = pm, other = 0)
+    if GROUPED:
+        mass = tl.load(masses + x, mask = pm, other = float("-inf"))
+    else:
+        mass = _lane_mass(masses, x, pm, tokmaj, tk, pr, lz, enum_logw, tok, b, num_rows, logw_stride, ENUM, LOGW)
+    return _lse_step(mx, acc, mass + rv)
+
+
+@triton.jit
+def _ibg_term(mx, acc, ee, pm, gm, entry_succ, entry_x, rp, iv_table, rpos, j, X, own, crank, b, t, rbase, ce, n, W,
+              masses, tokmaj, tk, pr, lz, enum_logw, tok, num_rows, logw_stride, R_FULL: tl.constexpr,
+              COMPACT: tl.constexpr, ENUM: tl.constexpr, LOGW: tl.constexpr, ONE_EXP: tl.constexpr):
+    """:func:`_input_block_group_kernel`'s term of entry ``ee`` (lanes ``pm``) for the ``[G, TILE]`` lanes (``gm`` the
+    group's steps): the successor's slot once, the steps' block values and masses (:func:`_group_mass`)."""
+    q = tl.load(entry_succ + ee, mask = pm, other = -1)
+    x = tl.load(entry_x + ee, mask = pm, other = 0)
+    sl = _operand_slot(iv_table, rpos, q, j, X, pm, own, crank, b, t + 1, q, rbase, ce, n, W, R_FULL, COMPACT)
+    rv = tl.load(rp + sl[None, :], mask = gm[:, None] & (pm & (sl >= 0))[None, :], other = float("-inf"))
+    mass = _group_mass(masses, x, gm[:, None] & pm[None, :], tk, pr, lz, tok, tokmaj, enum_logw, b, logw_stride,
+                       num_rows, ENUM, LOGW)
+    if ONE_EXP:
+        return _lse_step_one_exp(mx, acc, mass + rv)
+    return _lse_step(mx, acc, mass + rv)
+
+
+@triton.jit
 def _lane_mass(masses, x, pm, tokmaj, tk, pr, lz, enum_logw, tok, b, num_rows, logw_stride, ENUM: tl.constexpr,
                LOGW: tl.constexpr):
     """The mass of class code ``x`` ([lanes]) at the lanes' rows of the class masses: ``masses`` the rows' pointers
@@ -250,9 +305,10 @@ def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
                         ccount, cstart, ccolumns, crank, steps, sel, reg_offset, reg_width, reg_first, prior_mars,
                         prior_offset, prior_width, reg_prior, code, tok_ptr, tok, tokmaj, prow, lognorm, enum_logw, Cs,
                         num_rows, logw_stride, out_first, out_width, temp_width, B, n, W, C, input_start, csteps, pid0,
-                        R_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, GROUPED: tl.constexpr, PRUNE: tl.constexpr,
-                        OUT_FULL: tl.constexpr, R_FULL: tl.constexpr, COMPACT: tl.constexpr, INDEXED: tl.constexpr,
-                        SAMPLE: tl.constexpr, ENUM: tl.constexpr, LOGW: tl.constexpr, ENTRIES: tl.constexpr,
+                        succ_start, succ_count, succ_use, succ_entries, E, R_KIND: tl.constexpr,
+                        OUT_TEMP: tl.constexpr, GROUPED: tl.constexpr, PRUNE: tl.constexpr, OUT_FULL: tl.constexpr,
+                        R_FULL: tl.constexpr, COMPACT: tl.constexpr, INDEXED: tl.constexpr, SAMPLE: tl.constexpr,
+                        ENUM: tl.constexpr, LOGW: tl.constexpr, ENTRIES: tl.constexpr, SUCC_LISTS: tl.constexpr,
                         TILE: tl.constexpr):
     """One program per step (of the plan's index list ``sel`` if ``INDEXED``) and tile of its whole output, flattened
     (sample, slot): with the samples' blocks contiguous, a step's output is one run of columns, and the lanes stay
@@ -261,7 +317,10 @@ def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
     :class:`~..state.ClassMasses`; transition masses ``trans_stride`` floats apart). A missing token's terms are the
     column's entries (:class:`~.transitions.TransitionTables`): grouped, a transition mass per successor; else a mass
     per live class, in class order, read by the class's code (:func:`_lane_mass`; ``ENUM``: enumerated classes from
-    their tokens; ``Cs`` the stored classes, the table's width)."""
+    their tokens; ``Cs`` the stored classes, the table's width). ``SUCC_LISTS`` (2: every step, 1: a step whose
+    boundary takes them, ``succ_use``): the lanes walk their column's entries whose successor is live alone
+    (:class:`~.live.SuccessorLists`, ``E`` the tables' entries; a term through a dead successor is -inf, a no-op: the
+    same bits)."""
     s = _child(sel, tl.program_id(0), INDEXED)
     tile = pid0 + tl.program_id(1)
     out_row = tl.load(steps + s * 7 + 0)
@@ -288,6 +347,8 @@ def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
             else:
                 rp = rp + tl.where(r_own, b * RS, 0)
                 rbase = 0
+        else:                                                                # (the identity: no block, never read)
+            rp, r_own, rpos, rbase = node_mars, m, opos, 0
         oc = tl.load(obs_class + b * n + t, mask = m, other = -1)            # observed token's class, -1 if missing
 
         # an observed token: its own log-probability (the input region of node_mars), then the block from the
@@ -312,6 +373,7 @@ def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
                 masses = trans + tl.load(steps + s * 7 + 6).to(tl.int64)      # the step's transition masses
                 if SAMPLE:                                                   # (the lane's sample's)
                     masses = masses + tl.where(tl.load(mass_stride + (u - input_start)) > 0, b * trans_stride, 0)
+                tk, pr, lz = 0, 0, 0.0                                       # (no class masses read)
             else:                                                            # the input's row of the class masses
                 mrow = tl.load(mass_row + (u - input_start)).to(tl.int64) + b * 0     # (the lane's sample's)
                 if SAMPLE:
@@ -319,23 +381,28 @@ def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
                 masses = class_mars + mrow * Cs
                 tk, pr, lz = _lane_rows(tok_ptr, prow, lognorm, t, mrow, miss, ENUM, LOGW)   # (once, not per term)
             if GROUPED or ENTRIES:                                           # i's entries: a successor, and a
-                p0 = tl.load(entry_ptr + t * (W + 1) + i, mask = miss, other = 0)   # transition mass or a class code
-                p1 = tl.load(entry_ptr + t * (W + 1) + i + 1, mask = miss, other = 0)
-                for k in range(0, tl.max(p1 - p0, axis = 0)):
-                    pm = miss & (p0 + k < p1)
-                    q = tl.load(entry_succ + p0 + k, mask = pm, other = -1)
-                    if R_KIND == 2:
-                        rv = tl.where(pm & (q == j), 0.0, float("-inf"))
-                    else:
-                        rv = _block_value(rp, iv_table, rpos, q, j, X, pm, r_own, crank, b, t, rbase, ce, n, W,
-                                          R_FULL, COMPACT)
-                    x = tl.load(entry_x + p0 + k, mask = pm, other = 0)
-                    if GROUPED:
-                        mass = tl.load(masses + x, mask = pm, other = float("-inf"))
-                    else:
-                        mass = _lane_mass(masses, x, pm, tokmaj, tk, pr, lz, enum_logw, tok, b, num_rows, logw_stride,
-                                          ENUM, LOGW)
-                    mx, acc = _lse_step(mx, acc, mass + rv)
+                if SUCC_LISTS == 2:                                          # (the boundary's successor lists)
+                    listed = True
+                elif SUCC_LISTS == 1:
+                    listed = tl.load(succ_use + t) != 0
+                else:
+                    listed = False
+                if listed:
+                    l0, l1 = _list_range(entry_ptr, succ_start, succ_count, b, t, i, miss, n, W, E)
+                    for kk in range(0, tl.max(l1 - l0, axis = 0)):                  # (kk: not the int32 k below)
+                        pm = miss & (l0 + kk < l1)
+                        ee = tl.load(succ_entries + l0 + kk, mask = pm, other = 0)
+                        mx, acc = _ib_term(mx, acc, ee, pm, entry_succ, entry_x, rp, iv_table, rpos, j, X, r_own,
+                                           crank, b, t, rbase, ce, n, W, masses, tokmaj, tk, pr, lz, enum_logw, tok,
+                                           num_rows, logw_stride, R_KIND, R_FULL, COMPACT, GROUPED, ENUM, LOGW)
+                else:                                                        # (or the entry tables)
+                    p0 = tl.load(entry_ptr + t * (W + 1) + i, mask = miss, other = 0)   # transition mass or a class
+                    p1 = tl.load(entry_ptr + t * (W + 1) + i + 1, mask = miss, other = 0)   # code
+                    for k in range(0, tl.max(p1 - p0, axis = 0)):
+                        pm = miss & (p0 + k < p1)
+                        mx, acc = _ib_term(mx, acc, p0 + k, pm, entry_succ, entry_x, rp, iv_table, rpos, j, X, r_own,
+                                           crank, b, t, rbase, ce, n, W, masses, tokmaj, tk, pr, lz, enum_logw, tok,
+                                           num_rows, logw_stride, R_KIND, R_FULL, COMPACT, GROUPED, ENUM, LOGW)
             else:                                                            # every class in class order, the dead
                 for c in range(C):                                           # ones -inf (no entry tables read)
                     q = tl.load(next_col + (t * W + i) * C + c, mask = miss, other = -1)
@@ -364,16 +431,18 @@ def _input_block_group_kernel(element_mars, node_mars, temp, obs_class, next_col
                               cstart, ccolumns, crank, steps, groups, sel, reg_offset, reg_width, reg_first,
                               prior_mars, prior_offset, prior_width, reg_prior, code, tok_ptr, tok, tokmaj, prow,
                               lognorm, enum_logw, Cs, num_rows, logw_stride, out_first, out_width, temp_width, B, n, W,
-                              C, input_start, csteps, pid0, R_KIND: tl.constexpr, OUT_TEMP: tl.constexpr,
-                              PRUNE: tl.constexpr, OUT_FULL: tl.constexpr, R_FULL: tl.constexpr, G: tl.constexpr,
-                              ONE_EXP: tl.constexpr, COMPACT: tl.constexpr, INDEXED: tl.constexpr,
-                              SAMPLE: tl.constexpr, ENUM: tl.constexpr, LOGW: tl.constexpr, ENTRIES: tl.constexpr,
+                              C, input_start, csteps, pid0, succ_start, succ_count, succ_use, succ_entries, E,
+                              R_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, PRUNE: tl.constexpr,
+                              OUT_FULL: tl.constexpr, R_FULL: tl.constexpr, G: tl.constexpr, ONE_EXP: tl.constexpr,
+                              COMPACT: tl.constexpr, INDEXED: tl.constexpr, SAMPLE: tl.constexpr, ENUM: tl.constexpr,
+                              LOGW: tl.constexpr, ENTRIES: tl.constexpr, SUCC_LISTS: tl.constexpr,
                               TILE: tl.constexpr):
     """:func:`_input_block_kernel` for a group of steps per program, ungrouped transitions (a column's live entries,
     ``ENTRIES``, or every class, in class order), the block a sum's or a scratch row: group ``g`` is steps ``groups[g] .. groups[g +
     1]`` (at most ``G``, a power of 2), which share their position and block interval, so they share their lanes'
     columns, successors and slots. Those are read once for the ``[G, TILE]`` lanes; only the input's masses (by the
     class's code, ``ENUM``: an enumerated class's from its token) and the block's values are read per step.
+    ``SUCC_LISTS`` (``ENTRIES``): as :func:`_input_block_kernel`'s.
     ``ONE_EXP``: the log-sum-exp by :func:`_lse_step_one_exp` (bit-identical). ``COMPACT``: as
     :func:`_input_block_kernel`, the group's blocks all kept once or none (their interval is shared). ``INDEXED``: the
     groups of the plan's index list ``sel``. ``SAMPLE``: as :func:`_input_block_kernel`."""
@@ -441,22 +510,28 @@ def _input_block_group_kernel(element_mars, node_mars, temp, obs_class, next_col
                 pr = mrow
                 lz = mrow
             if ENTRIES:                                                      # i's live entries, in class order
-                p0 = tl.load(entry_ptr + t * (W + 1) + i, mask = miss, other = 0)
-                p1 = tl.load(entry_ptr + t * (W + 1) + i + 1, mask = miss, other = 0)
-                for k in range(0, tl.max(p1 - p0, axis = 0)):
-                    pm = miss & (p0 + k < p1)
-                    q = tl.load(entry_succ + p0 + k, mask = pm, other = -1)
-                    x = tl.load(entry_x + p0 + k, mask = pm, other = 0)
-                    sl = _operand_slot(iv_table, rpos, q, j, X, pm, own, crank, b, t + 1, q, rbase, ce, n, W, R_FULL,
-                                       COMPACT)
-                    rv = tl.load(rp + sl[None, :], mask = gm[:, None] & (pm & (sl >= 0))[None, :],
-                                 other = float("-inf"))
-                    mass = _group_mass(masses, x, gm[:, None] & pm[None, :], tk, pr, lz, tok, tokmaj, enum_logw, b,
-                                       logw_stride, num_rows, ENUM, LOGW)
-                    if ONE_EXP:
-                        mx, acc = _lse_step_one_exp(mx, acc, mass + rv)
-                    else:
-                        mx, acc = _lse_step(mx, acc, mass + rv)
+                if SUCC_LISTS == 2:                                          # (or those whose successor is live)
+                    listed = True
+                elif SUCC_LISTS == 1:
+                    listed = tl.load(succ_use + t) != 0
+                else:
+                    listed = False
+                if listed:
+                    l0, l1 = _list_range(entry_ptr, succ_start, succ_count, b, t, i, miss, n, W, E)
+                    for kk in range(0, tl.max(l1 - l0, axis = 0)):                  # (kk: not the int32 k below)
+                        pm = miss & (l0 + kk < l1)
+                        ee = tl.load(succ_entries + l0 + kk, mask = pm, other = 0)
+                        mx, acc = _ibg_term(mx, acc, ee, pm, gm, entry_succ, entry_x, rp, iv_table, rpos, j, X, own,
+                                            crank, b, t, rbase, ce, n, W, masses, tokmaj, tk, pr, lz, enum_logw, tok,
+                                            num_rows, logw_stride, R_FULL, COMPACT, ENUM, LOGW, ONE_EXP)
+                else:
+                    p0 = tl.load(entry_ptr + t * (W + 1) + i, mask = miss, other = 0)
+                    p1 = tl.load(entry_ptr + t * (W + 1) + i + 1, mask = miss, other = 0)
+                    for k in range(0, tl.max(p1 - p0, axis = 0)):
+                        pm = miss & (p0 + k < p1)
+                        mx, acc = _ibg_term(mx, acc, p0 + k, pm, gm, entry_succ, entry_x, rp, iv_table, rpos, j, X, own,
+                                            crank, b, t, rbase, ce, n, W, masses, tokmaj, tk, pr, lz, enum_logw, tok,
+                                            num_rows, logw_stride, R_FULL, COMPACT, ENUM, LOGW, ONE_EXP)
             else:                                                            # every class in class order, the dead
                 for c in range(C):                                           # ones -inf (no entry tables read)
                     q = tl.load(next_col + (t * W + i) * C + c, mask = miss, other = -1)
@@ -1058,7 +1133,8 @@ INPUT_BLOCK_ONE_EXP = (False, True)
 
 
 def run_products(stages, bufs, prog, regions, element_mars, node_mars, masses, obs_class, live,
-                 elem_first: int, elem_width: int, B: int, prior: dict, exact: bool, compact = None):
+                 elem_first: int, elem_width: int, B: int, prior: dict, exact: bool, compact = None,
+                 succ_lists = None):
     """
     The steps a query plan runs of one product layer, stage by stage (a stage reads only earlier stages' scratch
     rows). Products are fp32-level whatever the query's precision, which applies to the sum layers: ``block @ block``
@@ -1083,6 +1159,9 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, masses, o
     :param compact: None, or the query's :class:`~.compact.CompactLayout`, by which the per-sample inside values are
         compact (``regions``, ``elem_width`` and the scratch rows' width are their rows'): a lane per pair of live
         columns (``block @ block`` steps: :func:`_block_block_compact_kernel`, ``exact`` always)
+    :param succ_lists: None, or a function giving the query's :class:`~.live.SuccessorLists` (of ``Program.trans``,
+        under evidence pruning), called by the first ``input @ block`` launch (a query running none builds none):
+        their entry loops take them at the boundaries that do
     """
     temp, temp_width = bufs
     common = dict(reg_offset = regions["offset"], reg_width = regions["width"], reg_first = regions["first"],
@@ -1101,6 +1180,20 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, masses, o
                      crank = compact.rank, csteps = compact.steps)
     else:
         lists = dict(coff = live, ccount = live, cstart = live, ccolumns = live, crank = live, csteps = 0)
+    no_lists = dict(succ_start = live, succ_count = live, succ_use = live, succ_entries = live, E = 0, SUCC_LISTS = 0)
+
+    def succ_of(launch):
+        """The input @ block entry loops' successor lists: 2 every step's boundary takes them, 1 some (chosen per
+        program), 0 none -- compiled in only where taken: a list loop next to the entry tables' slows that loop 10-20%
+        even where no step takes it."""
+        if succ_lists is None:
+            return no_lists
+        sl = succ_lists()
+        taken = sl.boundaries[launch.input_boundaries]
+        if not taken.any():
+            return no_lists
+        return dict(succ_start = sl.start, succ_count = sl.count, succ_use = sl.use, succ_entries = sl.entries,
+                    E = sl.num_entries, SUCC_LISTS = 2 if taken.all() else 1)
     for launches in stages:
         for launch, cut in launches:
             form, kinds = launch.form, launch.kinds
@@ -1111,6 +1204,7 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, masses, o
             if form in ("input_block", "block_input"):
                 steps, _, groups = launch.steps
                 trans, tt = prog.transition_buffer(masses.batch), prog.trans
+                succ = succ_of(launch) if form == "input_block" else no_lists
                 for s0, s1, _, sel, cnt in cut.chunks:
                     part = steps[s0:s1]
                     idx = dict(sel = part if sel is None else sel.tensor, INDEXED = sel is not None)
@@ -1135,13 +1229,14 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, masses, o
                                     OUT_TEMP = out_temp, PRUNE = prune, OUT_FULL = out_full, R_FULL = all(r_full),
                                     G = G, ONE_EXP = one_exp, COMPACT = compact is not None,
                                     INDEXED = gsel is not None, ENTRIES = prog.entry_loop, TILE = tile,
-                                    num_warps = 4, **inputs, **lists, **common)
+                                    num_warps = 4, **inputs, **lists, **common, **succ)
 
                         # the group sizes the Program built (its default first), each step form: timed per shape (the
                         # steps rounded up to a power of 2, so that queries running subsets of a launch share choices)
                         cands = [(G, one_exp) for one_exp in INPUT_BLOCK_ONE_EXP for G in groups]
                         key = ("lifted_input_block_group", kinds, prune, compact is not None, sample, C,
-                               host_next_power_of_2(S), host_next_power_of_2(lanes), tuple(groups))
+                               host_next_power_of_2(S), host_next_power_of_2(lanes), tuple(groups),
+                               succ["SUCC_LISTS"])
                         input_block_group(autotune.pick(key, cands, input_block_group))   # outputs overwritten
                     elif form == "input_block":
                         r_kind, out_temp, (out_full, *r_full) = kinds
@@ -1155,7 +1250,7 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, masses, o
                                 C = C, input_start = prog.input_start, pid0 = first, R_KIND = r_kind,
                                 OUT_TEMP = out_temp, GROUPED = tt.grouped, PRUNE = prune, OUT_FULL = out_full,
                                 R_FULL = all(r_full), COMPACT = compact is not None, ENTRIES = prog.entry_loop,
-                                TILE = tile, num_warps = 4, **idx, **inputs, **lists, **common)
+                                TILE = tile, num_warps = 4, **idx, **inputs, **lists, **common, **succ)
                     else:
                         l_kind, out_temp, (out_full, l_full) = kinds
                         tile = _flat_tile(lanes)
