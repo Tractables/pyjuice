@@ -198,18 +198,19 @@ def _copy_top_down_kernel(element_flows, temp_flows, node_flows, iv_of, iv_info,
 
 
 @triton.jit
-def _entry_mass(masses, x, code_oc, eprobs, pr, lz, lw0, eidx0, num_enum, oc, own, vm, ENUM: tl.constexpr,
+def _entry_mass(masses, x, code_oc, eprobs, pr, lz, lw0, eidx0, num_enum, oc, own, vm, lane, ENUM: tl.constexpr,
                 LOGW: tl.constexpr, OBSERVED: tl.constexpr):
     """The mass of an entry of class code ``x`` ([lanes]) at the parents' rows (``masses`` [TN, lanes] the rows'
     stored masses; ``ENUM``: ``eprobs`` + ``pr`` [TN, lanes] the rows' parameter rows of the enumerated tokens'
     probabilities, ``eidx0`` the columns there of the boundary's enumerated tokens, ``LOGW``: ``lw0`` their weights for
     the lane's sample and ``lz`` [TN, lanes] the rows' ``log Z``) -- ``OBSERVED``: or, where the lane observes a token
     (``oc`` >= 0), the token's own log-probability ``own`` if the entry's class is the observed one (``code_oc`` its
-    code), else -inf."""
+    code), else -inf. ``vm`` [TN, lanes] the parents and lanes on, ``lane`` [lanes] the lanes: the weights are read
+    where a lane is on alone (a lane off the walk may have a sample past the last)."""
     if OBSERVED:
-        miss = vm & (oc < 0)[None, :]
+        miss, lmiss = vm & (oc < 0)[None, :], lane & (oc < 0)
     else:
-        miss = vm
+        miss, lmiss = vm, lane
     if ENUM:
         enum = (x < 0)[None, :]
         stored = tl.load(masses + tl.maximum(x, 0)[None, :], mask = miss & ~enum, other = float("-inf"))
@@ -217,7 +218,7 @@ def _entry_mass(masses, x, code_oc, eprobs, pr, lz, lw0, eidx0, num_enum, oc, ow
         g = tl.load(eidx0 + e).to(tl.int64)                # first, or the padding past the last; unread)
         val = tl.log(tl.load(eprobs + pr * num_enum + g[None, :], mask = miss & enum, other = 0.0))
         if LOGW:
-            val = val + tl.load(lw0 + e)[None, :] - lz
+            val = val + tl.load(lw0 + e, mask = lmiss & (x < 0), other = 0.0)[None, :] - lz
         mass = tl.where(enum, val, stored)
     else:
         mass = tl.load(masses + x[None, :], mask = miss, other = float("-inf"))
@@ -338,10 +339,10 @@ def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
                 elif ENUM:                                                   # is it this entry's class?
                     tk = tl.load(tok_ptr + t)
                     mass = _entry_mass(masses, x, code_oc, eprobs, pr, lz, enum_logw + b * logw_stride + tk, eidx + tk,
-                                       num_enum, oc, own, vm, ENUM, LOGW, True)
+                                       num_enum, oc, own, vm, ev, ENUM, LOGW, True)
                 else:
                     mass = _entry_mass(masses, x, oc, eprobs, masses, masses, enum_logw, eidx, num_enum, oc, own, vm,
-                                       ENUM, LOGW, True)
+                                       ev, ENUM, LOGW, True)
                 ov = tl.load(op + sl[None, :], mask = vm, other = float("-inf"))
                 mx, acc = _lse_step_one_exp(mx, acc, mass + ov)
         val = _lse_value(mx, acc)
@@ -464,7 +465,7 @@ def _block_input_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
                     elif ENUM:                                               # (no lane here observes a token)
                         tk = tl.load(tok_ptr + t)                            # (`t0`: the block's start)
                         mass = _entry_mass(masses, x, x, eprobs, pr, lz, enum_logw + b * logw_stride + tk, eidx + tk,
-                                           num_enum, x, ov, vm, ENUM, LOGW, False)
+                                           num_enum, x, ov, vm, em & (sl >= 0), ENUM, LOGW, False)
                     else:
                         mass = tl.load(masses + x[None, :], mask = vm, other = float("-inf"))
                     mx, acc = _lse_step_one_exp(mx, acc, mass + ov)

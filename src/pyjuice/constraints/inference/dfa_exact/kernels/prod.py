@@ -245,7 +245,7 @@ def _ibg_term(mx, acc, ee, pm, gm, entry_succ, entry_x, rp, iv_table, rpos, j, X
     x = tl.load(entry_x + ee, mask = pm, other = 0)
     sl = _operand_slot(iv_table, rpos, q, j, X, pm, own, crank, b, t + 1, q, rbase, ce, n, W, R_FULL, COMPACT)
     rv = tl.load(rp + sl[None, :], mask = gm[:, None] & (pm & (sl >= 0))[None, :], other = float("-inf"))
-    mass = _group_mass(masses, x, gm[:, None] & pm[None, :], tk, pr, lz, eidx, eprobs, enum_logw, b, logw_stride,
+    mass = _group_mass(masses, x, gm, pm, tk, pr, lz, eidx, eprobs, enum_logw, b, logw_stride,
                        num_enum, ENUM, LOGW)
     if ONE_EXP:
         return _lse_step_one_exp(mx, acc, mass + rv)
@@ -259,7 +259,8 @@ def _lane_mass(masses, x, pm, eprobs, tk, pr, lz, enum_logw, eidx, b, num_enum, 
     (``class_mars + mrow * Cs``), a stored class's column read there, an enumerated class's (``ENUM``, code ``-1 -
     e``: the e-th enumerated token of the boundary, from ``tk``) its token's probability ``eprobs[pr, eidx[tk + e]]``,
     ``LOGW``: times its weight for the lane's sample ``b`` over the row's ``Z`` (``lz`` its log) -- ``tk``, ``pr`` and
-    ``lz`` from :func:`_lane_rows`; -inf where ``pm`` is off."""
+    ``lz`` from :func:`_lane_rows`; -inf where ``pm`` is off. The weights are read where a lane is on alone: a lane off
+    the step's output has a sample past the last, a dead class the count past the boundary's tokens."""
     if ENUM:
         enum = x < 0
         stored = tl.load(masses + tl.maximum(x, 0), mask = pm & ~enum, other = float("-inf"))
@@ -267,17 +268,18 @@ def _lane_mass(masses, x, pm, eprobs, tk, pr, lz, enum_logw, eidx, b, num_enum, 
         g = tl.load(eidx + tk + e).to(tl.int64)                              # (its column of the table)
         val = tl.log(tl.load(eprobs + pr * num_enum + g, mask = pm & enum, other = 0.0))
         if LOGW:
-            val = val + tl.load(enum_logw + b * logw_stride + tk + e) - lz
+            val = val + tl.load(enum_logw + b * logw_stride + tk + e, mask = pm & enum, other = 0.0) - lz
         return tl.where(enum, val, stored)
     return tl.load(masses + x, mask = pm, other = float("-inf"))
 
 
 @triton.jit
-def _group_mass(masses, x, lm, tk, pr, lz, eidx, eprobs, enum_logw, b, logw_stride, num_enum, ENUM: tl.constexpr,
+def _group_mass(masses, x, gm, pm, tk, pr, lz, eidx, eprobs, enum_logw, b, logw_stride, num_enum, ENUM: tl.constexpr,
                 LOGW: tl.constexpr):
     """:func:`_lane_mass` for a group of steps: [G, TILE], the mass of class code ``x`` ([TILE]) at the lanes' rows
-    (``masses`` [G, TILE] pointers), ``lm`` [G, TILE] the lanes on; ``ENUM``: ``tk`` the boundary's first enumerated
-    token, ``pr`` the rows' parameter rows, ``lz`` (``LOGW``) their log Z."""
+    (``masses`` [G, TILE] pointers), the lanes on ``gm`` [G] (the group's steps) x ``pm`` [TILE]; ``ENUM``: ``tk`` the
+    boundary's first enumerated token, ``pr`` the rows' parameter rows, ``lz`` (``LOGW``) their log Z."""
+    lm = gm[:, None] & pm[None, :]
     if ENUM:
         enum = (x < 0)[None, :]
         stored = tl.load(masses + tl.maximum(x, 0)[None, :], mask = lm & ~enum, other = float("-inf"))
@@ -285,7 +287,7 @@ def _group_mass(masses, x, lm, tk, pr, lz, eidx, eprobs, enum_logw, b, logw_stri
         g = tl.load(eidx + tk + e).to(tl.int64)
         ev = tl.log(tl.load(eprobs + pr * num_enum + g[None, :], mask = lm & enum, other = 0.0))
         if LOGW:
-            ev = ev + tl.load(enum_logw + b * logw_stride + tk + e)[None, :] - lz
+            ev = ev + tl.load(enum_logw + b * logw_stride + tk + e, mask = pm & (x < 0), other = 0.0)[None, :] - lz
         return tl.where(enum, ev, stored)
     return tl.load(masses + x[None, :], mask = lm, other = float("-inf"))
 
@@ -545,7 +547,7 @@ def _input_block_group_kernel(element_mars, node_mars, temp, obs_class, next_col
                                        COMPACT)
                     rv = tl.load(rp + sl[None, :], mask = gm[:, None] & (pm & (sl >= 0))[None, :],
                                  other = float("-inf"))
-                    mass = _group_mass(masses, x, gm[:, None] & pm[None, :], tk, pr, lz, eidx, eprobs, enum_logw, b,
+                    mass = _group_mass(masses, x, gm, pm, tk, pr, lz, eidx, eprobs, enum_logw, b,
                                        logw_stride, num_enum, ENUM, LOGW)
                     if ONE_EXP:
                         mx, acc = _lse_step_one_exp(mx, acc, mass + rv)
