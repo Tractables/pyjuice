@@ -21,6 +21,7 @@ from pyjuice.constraints.inference.dfa_exact.queries.backend import forward as F
 from pyjuice.constraints.inference.dfa_exact.queries import marginal as QM
 from pyjuice.constraints.inference.dfa_exact.queries.conditional import class_weights
 from pyjuice.constraints.inference.dfa_exact.kernels import score as S
+from pyjuice.constraints.inference.dfa_exact.kernels.live import sample_successors
 from pyjuice.constraints.inference.dfa_exact.kernels.score import score_tables
 from pyjuice.constraints.inference.dfa_exact.queries.backend import plans as QP
 from pyjuice.constraints.distributions import TokenClasses
@@ -278,22 +279,29 @@ def test_class_weights_match_the_reference(kind, name, pattern, sum_path, build_
     assert checked > 0
 
 
+@pytest.mark.parametrize("classes", ["every", "sample"])
 @pytest.mark.parametrize("one_pair", [False, True])
 @pytest.mark.parametrize("pattern", ["none", "prefix", "mixed"])
 @pytest.mark.parametrize("storage", ["dense", "compact"])
 @pytest.mark.parametrize("kind", ["hmm", "pd", "hand_left", "left_linear", "walks"])
-def test_live_class_rows_match_a_brute_force(kind, storage, pattern, one_pair, build_pc, monkeypatch):
+def test_live_class_rows_match_a_brute_force(kind, storage, pattern, one_pair, classes, build_pc, monkeypatch):
     """A query keeps its class weights in their live rows alone: a target column's (position ``t``, sample ``b``)
     class ``c`` has a row exactly when a column live at ``t`` for the sample leads by ``c`` to one live at ``t + 1``
     (``next_col``; at the last position the sequence end's one column) -- every column live where the query prunes
     nothing --; a column's live classes on consecutive rows in the boundary's class order, a row group's columns in
-    order. Also reading a class's pairs one at a time (``one_pair``: every list walked over several tiles)."""
+    order. Also reading a class's pairs one at a time (``one_pair``: every list walked over several tiles), and under a
+    session's per-sample classes (``classes``, stood in for the session's): a class the sample rules out has none."""
     if one_pair:
         monkeypatch.setattr(S, "LIVE_CLASS_LANES", 1)
     n = {"walks": 6}.get(kind, KINDS.get(kind))
     cc = jc.compile(CONSTRAINTS["either"](), build_pc(kind, n, V))
     data, missing = evidence(pattern, n)
     B, dev = data.size(0), cc.pc.params.device
+    allowed = None
+    if classes == "sample":
+        C = cc.backend.program().next_col.size(2)
+        allowed = torch.rand(B, n, C, generator = torch.Generator().manual_seed(3)) < 0.6
+        monkeypatch.setattr(QC, "live_successors", lambda prog, masses: sample_successors(prog, allowed.to(prog.dev)))
     positions = missing.any(dim = 0).numpy()
     report = {}
     with torch.no_grad():
@@ -311,7 +319,8 @@ def test_live_class_rows_match_a_brute_force(kind, storage, pattern, one_pair, b
                 for c in order[t].tolist():
                     succ = [(i, 0 if t + 1 == n else int(nc[t, i, c])) for i in range(int(width[t]))
                             if nc[t, i, c] >= 0]
-                    if any(live is None or (live[b, t, i] and live[b, t + 1, q]) for i, q in succ):
+                    if (allowed is None or allowed[b, t, c]) and \
+                            any(live is None or (live[b, t, i] and live[b, t + 1, q]) for i, q in succ):
                         want.append(c)
                 m = p * B + b
                 assert [c for c in order[t].tolist() if row[m, c] >= 0] == want, (g, t, b)

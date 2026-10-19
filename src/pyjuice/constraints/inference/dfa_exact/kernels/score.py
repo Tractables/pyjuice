@@ -461,8 +461,10 @@ class ClassWeightRows:
     Where a conditional query keeps its class weights in ``dfa_class_flow`` (:func:`class_weight_rows`): the LIVE
     rows alone. A target column's (position ``t``, sample ``b``) class ``c`` is live when one of the (column,
     successor) pairs of ``c``'s list at ``t`` (``Program.trans``' by-class lists) is live at both ends for the sample;
-    only then can its weights be finite. Every column's live classes, in the boundary's class order (``cls_order``),
-    are consecutive rows of ``K`` floats (its row group's rows).
+    only then can its weights be finite -- and, under a session's per-sample inputs, when the sample allows ``c`` there
+    (:attr:`~.live.Liveness.allowed`): a class they rule out has no token of mass, so its tokens score -inf whatever
+    its weights. Every column's live classes, in the boundary's class order (``cls_order``), are consecutive rows of
+    ``K`` floats (its row group's rows).
 
     :ivar count: int32 [N], every column's live classes
     :ivar cls: int32 [N, C], every column's live classes: ``cls[m, :count[m]]``
@@ -498,18 +500,21 @@ class ClassWeightRows:
 
 
 @triton_jit
-def _live_classes_kernel(live, cls_ptr, cls_col, cls_succ, col_pos, col_K, row, floats, n, W, C, B,
-                         TC: tl.constexpr, TP: tl.constexpr, PRUNE: tl.constexpr):
+def _live_classes_kernel(live, cls_ptr, cls_col, cls_succ, col_pos, col_K, row, floats, n, W, C, B, allowed, a_stride,
+                         TC: tl.constexpr, TP: tl.constexpr, PRUNE: tl.constexpr, ALLOWED: tl.constexpr):
     """One program per target column ``m`` (sample ``m % B`` of position ``col_pos[m // B]``) and tile of ``TC``
     classes: which of them are live -- a class whose list (``cls_ptr`` / ``cls_col`` / ``cls_succ``) has a pair live
     at both ends for the sample (``live`` int8 [B, n + 1, W]; without ``PRUNE``, every class with a pair), its pairs
-    ``TP`` at a time -- into ``row[m, c]`` (0 live, -1 dead), and their rows' floats (``col_K[m]`` a row) added to
-    ``floats[m]``."""
+    ``TP`` at a time, and -- ``ALLOWED`` -- that the sample allows there (``allowed`` int8 [Be, n, C], ``a_stride`` a
+    sample's flags apart; a class it rules out is not walked) -- into ``row[m, c]`` (0 live, -1 dead), and their
+    rows' floats (``col_K[m]`` a row) added to ``floats[m]``."""
     m = tl.program_id(0).to(tl.int64)
     t = tl.load(col_pos + m // B)
     b = m % B
     c = tl.program_id(1) * TC + tl.arange(0, TC)
     cm = c < C
+    if ALLOWED:
+        cm = cm & (tl.load(allowed + b * a_stride + t * C + c, mask = cm, other = 0) != 0)
     p0 = tl.load(cls_ptr + t * (C + 1) + c, mask = cm, other = 0)
     p1 = tl.load(cls_ptr + t * (C + 1) + c + 1, mask = cm, other = 0)
     if PRUNE:
@@ -525,7 +530,7 @@ def _live_classes_kernel(live, cls_ptr, cls_col, cls_succ, col_pos, col_K, row, 
         on = cm & (hit != 0)
     else:
         on = cm & (p1 > p0)
-    tl.store(row + m * C + c, tl.where(on, 0, -1), mask = cm)
+    tl.store(row + m * C + c, tl.where(on, 0, -1), mask = c < C)
     tl.atomic_add(floats + m, tl.sum(on.to(tl.int64), axis = 0) * tl.load(col_K + m))
 
 
@@ -581,13 +586,16 @@ def class_weight_rows(prog, liveness, col_pos: torch.Tensor, col_K: torch.Tensor
     cls, row, count = e.as_strided((M, C), (C, 1)), e.as_strided((M, C), (C, 1), NC), e.as_strided((M,), (1,), 2 * NC)
     if N > 0:
         prune = liveness is not None
+        classes = prune and liveness.allowed is not None                    # (a session's per-sample classes)
+        a_stride = n * C if classes and liveness.allowed.size(0) > 1 else 0  # (one set: every sample's)
         TC = min(LIVE_CLASS_TILE, host_next_power_of_2(C))
         while prune and TC > 1 and N * host_cdiv(C, TC) < 4 * _num_sms(dev):   # (programs filling the device)
             TC //= 2
         _live_classes_kernel[(N, host_cdiv(C, TC))](liveness.live if prune else row, tt.cls_ptr, tt.cls_col,
-                                                     tt.cls_succ, col_pos, col_K, row, floats, n, W, C, B, TC = TC,
+                                                     tt.cls_succ, col_pos, col_K, row, floats, n, W, C, B,
+                                                     liveness.allowed if classes else row, a_stride, TC = TC,
                                                      TP = max(1, LIVE_CLASS_LANES // TC), PRUNE = prune,
-                                                     num_warps = 4)
+                                                     ALLOWED = classes, num_warps = 4)
         torch.cumsum(floats, dim = 0, out = off[1:])
     TC = min(LIVE_CLASS_TILE, host_next_power_of_2(C))
     _class_rows_kernel[(max(N, G + 1),)](off, tt.cls_order, col_pos, col_K, col_first, group_first, row, count, cls,
