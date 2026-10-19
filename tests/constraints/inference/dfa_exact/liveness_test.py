@@ -190,7 +190,7 @@ def test_liveness_through_sample_classes_matches_brute_force(build_pc, sweeps, s
 def test_sample_successors_are_the_allowed_classes_successors(tokens, build_pc):
     """A sample's successor lists: at every boundary and column, the distinct successors the classes allowed there
     lead to (at the last boundary the sequence end's one column), ascending -- with every class allowed, the program's
-    own lists. Over 70 tokens, more classes than one word of class bits holds."""
+    own lists. Over 70 tokens, many classes (more than 62)."""
     n, B = 6, 5
     for seed, dfa in random_dfas(4, tokens):
         cc = jc.compile(dfa, build_pc("hmm", n, tokens))

@@ -390,6 +390,46 @@ def test_the_support_rules_out_a_token_no_node_gives_probability(build_pc, monke
     assert not supports[0][:, :, c3].any() and supports[0][:, :, c4].any()
 
 
+@pytest.mark.parametrize("kind", ["hmm_untied", "hand_permuted"])
+def test_the_support_reads_every_positions_own_nodes(kind, build_pc, monkeypatch):
+    """Token 3 given probability by the input nodes of position 0 alone (an untied HMM's positions their own rows; a
+    circuit whose positions have different numbers of nodes, the slots past a position's padding): a session's
+    liveness support allows its class at a position exactly where the position's own nodes give it some -- against
+    the circuit's parameters, node group by node group."""
+    monkeypatch.setattr(P, "GROUP_MIN_RATIO", 0)
+    n, B = KINDS[kind], 2
+    pc = build_pc(kind, n, V, input_dist = dists.SoftEvidenceCategorical)
+    given = torch.zeros(n, dtype = torch.bool)
+    with torch.no_grad():
+        for layer in pc.input_layer_group:
+            for ns in layer.nodes:
+                ps, pe = ns.get_source_ns()._param_range
+                table = layer.params[ps:pe].view(-1, V)
+                if ns.scope.to_list()[0] != 0:
+                    table[:, 3] = 0.0
+                    table /= table.sum(dim = 1, keepdim = True)
+        for layer in pc.input_layer_group:                                   # (after: a table nodes share)
+            for ns in layer.nodes:
+                ps, pe = ns.get_source_ns()._param_range
+                t = ns.scope.to_list()[0]
+                given[t] |= bool((layer.params[ps:pe].view(-1, V)[:, 3] > 0).any())
+    assert given[0] and not given[1:].any()
+    cc = jc.compile(singleton_automaton(), pc)
+    c3 = int(cc.backend.token_classes.token_class[3])
+    data, missing, _ = evidence(n, B, "none")
+    supports = []
+    real = live.class_support
+    monkeypatch.setattr(live, "class_support", lambda *a: (lambda c: supports.append(c) or c)(real(*a)))
+    with cc.decoder(categorical_evidence_logp = torch.randn(B, n, V, device = DEV)) as decoder:
+        decoder.marginal(data, missing)
+    en = cc.backend.program().enum
+    ptr, tok = en.ptr_host, en.tok.cpu().tolist()
+    live_at = torch.tensor([3 in tok[ptr[t]:ptr[t + 1]] for t in range(n)])   # (token 3's class live there)
+    assert live_at[1:].any()
+    assert len(supports) == 1 and supports[0] is not None
+    assert torch.equal(supports[0][:, :, c3].cpu(), (given & live_at)[None].expand(B, -1)), supports[0][:, :, c3]
+
+
 # -------------------------------------------------------------------------------------------------
 # Enumeration changes nothing
 # -------------------------------------------------------------------------------------------------

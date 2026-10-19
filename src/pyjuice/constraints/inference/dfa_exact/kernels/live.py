@@ -582,60 +582,60 @@ def class_support(prog, masses) -> Optional[torch.Tensor]:
         pos = torch.from_numpy(np.repeat(np.arange(n), counts)).to(prog.dev)
         tok = en.tok[:en.num].long()
         cls = classes.token_class[tok].long()
-        col = en.index[:en.num].long()                                      # (the tokens' columns of enum_probs, of
-        by_token = masses.enum_probs.t().contiguous()                       # which a token-major copy: a token's
-        has_p = torch.empty(en.num, dtype = torch.bool, device = prog.dev)  # rows read along it)
-        step = max(1, SUPPORT_CHUNK // (8 * K))                             # (tokens at a time: [tokens, K] gathers)
-        for e0 in range(0, en.num, step):
-            pr = masses.prow[row[pos[e0:e0 + step]]].long()                 # [tokens, K]: the nodes' parameter rows
-            has_p[e0:e0 + step] = ((by_token[col[e0:e0 + step, None], pr] > 0) & real[pos[e0:e0 + step]]).any(1)
+        col = en.index[:en.num].long()                                      # (the tokens' columns of enum_probs)
+        pr = masses.prow[row].long()                                        # [n, K]: the nodes' parameter rows
+        NE = masses.enum_probs.size(1)
+        given = torch.empty(n, NE, dtype = torch.bool, device = prog.dev)    # every position's tokens some row of
+        step = max(1, SUPPORT_CHUNK // (K * NE))                            # its gives probability (whole rows of
+        for t0 in range(0, n, step):                                        # the table read)
+            p = masses.enum_probs[pr[t0:t0 + step]] > 0
+            given[t0:t0 + step] = (p & real[t0:t0 + step, :, None]).any(dim = 1)
+        has_p = given[pos, col]
         w = masses.enum_logw if masses.enum_logw is not None else torch.zeros(1, en.num, device = prog.dev)   # (every
         allowed[:, pos, cls] = (w[:, :en.num] > -float("inf")) & has_p[None, :]                             # sample's)
     allowed[:, ~real.any(dim = 1)] = True                                   # (a position no product step reads)
     return None if bool(allowed.all()) else allowed
 
 
-#: the classes one word of :func:`entry_classes` holds
-CLASS_BITS = 62
-
-
 def entry_classes(prog):
-    """``(bits, boundary)``: every entry of the program's grouped successor lists, the classes leading along it -- int64
-    [E, words], class ``c`` bit ``c % CLASS_BITS`` of word ``c // CLASS_BITS`` -- and its boundary (int64 [E]); built
-    once per program."""
-    kept = getattr(prog, "entry_class_bits", None)
+    """``(key, first)``: every (entry, class) pair of the program's grouped successor lists -- an entry (column,
+    successor) and a class leading along it --, by entry: the pair's place in a sample's classes [n, C], ``t * C +
+    c`` (int64 [P]), and every entry's first pair (int64 [E + 1]); built once per program."""
+    kept = getattr(prog, "entry_class_pairs", None)
     if kept is None:
         tt, (n, W, C) = prog.succ, prog.next_col.shape
-        E, words = tt.entry_succ.numel(), -(-C // CLASS_BITS)
+        E = tt.entry_succ.numel()
         t, q, c = torch.nonzero(tt.pair_of >= 0, as_tuple = True)
         e = tt.entry_ptr[t, 0].long() + tt.pair_of[t, q, c].long()
-        bits = torch.zeros(E * words, dtype = torch.int64, device = prog.dev)  # (a pair's classes: distinct bits)
-        bits.scatter_add_(0, e * words + c // CLASS_BITS, torch.ones_like(c) << (c % CLASS_BITS))
-        first = tt.entry_ptr[:, 0].contiguous()
-        boundary = torch.bucketize(torch.arange(E, dtype = first.dtype, device = prog.dev), first, right = True) - 1
-        kept = prog.entry_class_bits = (bits.view(E, words), boundary)
+        order = torch.argsort(e, stable = True)
+        first = torch.zeros(E + 1, dtype = torch.int64, device = prog.dev)
+        first[1:] = torch.cumsum(torch.bincount(e, minlength = E), dim = 0)
+        kept = prog.entry_class_pairs = ((t * C + c)[order].contiguous(), first)
     return kept
 
 
 def sample_successors(prog, allowed: torch.Tensor) -> SampleSuccessors:
     """The :class:`SampleSuccessors` of the classes ``allowed`` (bool [Be, n, C] on the device): an entry (column,
-    successor) of the grouped lists stays for sample ``b`` when some class allowed at its boundary leads along it
-    (:func:`entry_classes`). Nothing waits for the device."""
+    successor) of the grouped lists stays for sample ``b`` when some class allowed at its boundary leads along it --
+    one of its (entry, class) pairs (:func:`entry_classes`). Nothing waits for the device."""
     tt, (n, W, C) = prog.succ, prog.next_col.shape
     Be, E, dev = allowed.size(0), tt.entry_succ.numel(), prog.dev
-    bits, boundary = entry_classes(prog)
-    words = bits.size(1)
-    c = torch.arange(C, device = dev)
+    key, first = entry_classes(prog)
     ptr = torch.empty(Be, n, W + 1, dtype = torch.int32, device = dev)
     succ = torch.empty(Be, E + 1, dtype = torch.int32, device = dev)
-    step = max(1, SUPPORT_CHUNK // (E * words))
-    for b0 in range(0, Be, step):
-        bs = min(step, Be - b0)
-        sample_bits = torch.zeros(bs, n, words, dtype = torch.int64, device = dev).scatter_add_(
-            2, (c // CLASS_BITS).expand(bs, n, C), allowed[b0:b0 + bs].long() << (c % CLASS_BITS))
-        kept = ((bits[None] & sample_bits[:, boundary]) != 0).any(dim = 2)     # [bs, E]
-        count = torch.zeros(bs, E + 1, dtype = torch.int32, device = dev)
-        count[:, 1:] = torch.cumsum(kept, dim = 1, dtype = torch.int32)     # count[:, e]: the kept entries before e
+    P = key.numel()
+    step = max(1, SUPPORT_CHUNK // max(P, E, 1))
+    for b0 in range(0, Be, step):                                           # (the scans over the chunk's samples
+        bs = min(step, Be - b0)                                             # flattened, every row a view of it: a
+        hits = torch.zeros(bs * P + 1, dtype = torch.int32, device = dev)   # scan along rows runs a row a block)
+        pair = allowed[b0:b0 + bs].reshape(bs, n * C)[:, key]                # [bs, P]: a pair's class allowed
+        hits[1:] = torch.cumsum(pair.reshape(-1), dim = 0, dtype = torch.int32)
+        hits = hits.as_strided((bs, P + 1), (P, 1))                         # the allowed pairs before each
+        kept = hits[:, first[1:]] > hits[:, first[:-1]]                     # [bs, E]: an allowed pair of the entry's
+        count = torch.zeros(bs * E + 1, dtype = torch.int32, device = dev)
+        count[1:] = torch.cumsum(kept.reshape(-1), dim = 0, dtype = torch.int32)
+        count = count.as_strided((bs, E + 1), (E, 1))
+        count = count - count[:, :1]                                        # count[:, e]: the kept entries before e
         ptr[b0:b0 + bs] = count[:, tt.entry_ptr.long().view(-1)].view(bs, n, W + 1)
         succ[b0:b0 + bs].scatter_(1, torch.where(kept, count[:, :E].long(), E), tt.entry_succ[None].expand(bs, -1))
     return SampleSuccessors(ptr = ptr, succ = succ)
