@@ -170,8 +170,8 @@ def _dual_em_update_kernel(mparams, param_flows, denom, cum, out, cids, pids, pf
     new = theta * (one_m_s + step_size * ratio) / c[:,None]
     new = tl.maximum(new, tiny_par)                            # momentum-underflow guard
     if KEEP_ZERO:
-        zero_thr = tl.load(consts + 5)                         # 1e-12, the `keep_zero_params` threshold
-        new = tl.where(theta < zero_thr, tl.load(consts + 6), new)
+        zero = tl.load(consts + 5)                             # freeze exactly zero parameters
+        new = tl.where(theta == zero, zero, new)
 
     if OUT_BY_PAR:
         off = par[None,:] + offs_node[:,None] - out_base
