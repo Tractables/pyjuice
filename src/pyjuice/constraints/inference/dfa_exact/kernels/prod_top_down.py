@@ -923,14 +923,17 @@ _IBTD_SMEM_MAX = {}
 
 
 def _input_block_cuda(la: TopDownLaunch, tiles: torch.Tensor, height: int, prog, compact, element_flows, temp_flows,
-                      node_flows, node_mars, masses, obs_class, once_iv, common: dict, B: int) -> Optional[dict]:
+                      node_flows, node_mars, masses, obs_class, once_iv, common: dict, B: int,
+                      allowed: Optional[torch.Tensor] = None) -> Optional[dict]:
     """
     Run an ``input @ block`` launch on compact values with the CUDA kernels (``c/walk.cu``: every sample's live terms
     per column, its columns by their terms, then a CTA per (node tile's children, sample) summing them from shared
     memory), if they take it -- ungrouped transitions, a term's place and class in 32 bits, its CTAs' shared memory
     within :data:`INPUT_BLOCK_CUDA_SMEM` (or a CTA of one child within the device's), its work space within
     :data:`INPUT_BLOCK_CUDA_SPACE` --, and return the CTAs' shape (``tn`` children, ``threads``, ``warps``: a warp per
-    sample, ``smem``: bytes), else None. The values are the Triton kernel's, bit for bit.
+    sample, ``smem``: bytes), else None. The values are the Triton kernel's, bit for bit. ``allowed``: None, or the
+    classes a session's per-sample inputs leave each sample (:attr:`~.live.Liveness.allowed`): where a token is missing,
+    the terms of a class ruled out (-inf, nothing to add) are not summed.
     """
     if not INPUT_BLOCK_CUDA or prog.trans_top_down.grouped or not obs_class.is_contiguous():
         return None
@@ -963,6 +966,8 @@ def _input_block_cuda(la: TopDownLaunch, tiles: torch.Tensor, height: int, prog,
     tt, ivs = prog.trans_top_down, prog.intervals
     c_kind, out_temp, (c_full, out_full) = la.kinds
     sample = masses.batch > 1
+    classes = allowed is not None and tt.pred_class is not None
+    a_stride = n * C if classes and allowed.size(0) > 1 else 0               # (one set: every sample's)
     mod.ibtd_cuda(element_flows, temp_flows, node_flows, node_mars, obs_class, masses.table, masses.row,
                   masses.stride if sample else masses.row, tt.pred_ptr, tt.pred_col, tt.pred_x, prog.width_t, ivs.of,
                   ivs.info, ivs.table, once_iv, compact.off, compact.count, compact.start, compact.columns,
@@ -972,13 +977,15 @@ def _input_block_cuda(la: TopDownLaunch, tiles: torch.Tensor, height: int, prog,
                   common["out_first"], common["out_width"], common["temp_width"], B, n, W, C, prog.input_start,
                   height // tn, tn, threads, warps, not warps, lp, cq, sample, c_kind, out_temp, c_full, out_full,
                   ea["code"], ea["tok_ptr"], ea["eidx"], ea["eprobs"], ea["prow"], ea["lognorm"], ea["enum_logw"],
-                  ea["Cs"], mw, ea["num_enum"], ea["logw_stride"], ea["LOGW"])
+                  ea["Cs"], mw, ea["num_enum"], ea["logw_stride"], ea["LOGW"],
+                  tt.pred_class if classes else tt.pred_x, allowed if classes else obs_class, a_stride, classes)
     return dict(tn = tn, threads = threads, warps = warps, smem = team(tn) * (8 if warps else 1))
 
 
 def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_flows, node_mars, masses, obs_class,
                 live, elem_first: int, elem_width: int, B: int, prior: dict, skip, exact: bool, once_iv: torch.Tensor,
-                lanes = None, compact = None, tflow_width = None, inside_regions = None, inside: bool = False):
+                lanes = None, compact = None, tflow_width = None, inside_regions = None, inside: bool = False,
+                allowed: Optional[torch.Tensor] = None):
     """
     The top-down pass of one product layer's stage: every :class:`TopDownLaunch` in ``launches``, each with the plan's
     index list of the children it computes (int32 on the device) or None for every one.
@@ -1003,6 +1010,9 @@ def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_
         ``block @ block`` launch reads
     :param inside: whether those inside values are compact too (by ``compact``'s layout; ``inside_regions`` and
         ``bufs`` are their rows')
+    :param allowed: None, or the classes a session's per-sample inputs leave each sample
+        (:attr:`~.live.Liveness.allowed`), by which the CUDA ``input @ block`` walk drops terms
+        (:func:`_input_block_cuda`)
     """
     temp, temp_width = bufs
     tflow_width = temp_width if tflow_width is None else tflow_width
@@ -1040,7 +1050,7 @@ def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_
             tiles, height = (la.tiles, la.tile_height) if idx is None else (idx, item.height)
             if la.form == "input_block" and compact is not None and lanes_max > 0 and \
                     _input_block_cuda(la, tiles, height, prog, compact, element_flows, temp_flows, node_flows,
-                                      node_mars, masses, obs_class, once_iv, common, B):
+                                      node_mars, masses, obs_class, once_iv, common, B, allowed):
                 continue
             tn = min(height, TOP_DOWN_NODES)
             tile = max(16, min(_flat_tile(max(lanes_max, 1)), TOP_DOWN_TILE_LANES // tn))

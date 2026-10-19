@@ -7,8 +7,10 @@
 // Two kernels per launch:
 //   `ibtd_terms_kernel`, a warp per (boundary t of the launch, sample, live column q at t + 1), 32 entries at a time:
 //   the entries of q's predecessor list that the sample sums -- i live at t, and the observed class if the sample
-//   observes t --, in the list's order, as (i's place among the sample's live columns, class) packed in 32 bits (the
-//   class in the low `xb`, as few as the classes need) at q's own place in a copy of the list per sample (`terms`), and
+//   observes t, else (under a session's per-sample inputs, `classes`) a class the sample allows there: a ruled-out
+//   class's mass is -inf, its term adds nothing --, in the list's order, as (i's place among the sample's live
+//   columns, class) packed in 32 bits (the class in the low `xb`, as few as the classes need) at q's own place in a
+//   copy of the list per sample (`terms`), and
 //   their number (`cnt`); every program of the main kernel would otherwise
 //   walk the whole list, mostly dead entries under evidence. The last CTA of a (boundary, sample) then orders its live
 //   columns by their terms, most first (`perm`): a warp's lanes sum about as many (a column of many predecessors next
@@ -135,6 +137,10 @@ struct TermArgs {
     int* perm;             // [T, B, W]: the live columns' places, most terms first (none: not ordered)
     int* done;             // [T, B]: CTAs done (0 between launches)
     int B, n, W, C, Cs, xb;   // xb: a term's mass-index bits
+    const int* pred_class;     // every entry's class (`classes`)
+    const signed char* allowed;   // [Be, n, C]: the classes a sample allows where its token is missing (`classes`)
+    long long a_stride;        // a sample's flags apart (0: one set for every sample)
+    int classes;
 };
 
 __global__ void __launch_bounds__(TW) ibtd_terms_kernel(TermArgs a) {
@@ -164,7 +170,8 @@ __global__ void __launch_bounds__(TW) ibtd_terms_kernel(TermArgs a) {
                 const int x = a.pred_x[e];
                 if (oc < 0 || x == code_oc) {
                     const int ri = rank[a.pred_col[e]];
-                    ok = ri >= 0;
+                    ok = ri >= 0 && (oc >= 0 || !a.classes ||
+                                     a.allowed[(long long)b * a.a_stride + (long long)t * a.C + a.pred_class[e]] != 0);
                     pk = (int)(((unsigned)ri << a.xb) | (unsigned)code_index(x, a.Cs));
                 }
             }
@@ -513,7 +520,8 @@ void ibtd_cuda(torch::Tensor element_flows, torch::Tensor temp_flows, torch::Ten
                int64_t lp_ld, int64_t cq_max, bool sample, int64_t c_kind, bool out_temp, bool c_full,
                bool out_full, torch::Tensor code, torch::Tensor tok_ptr, torch::Tensor eidx, torch::Tensor eprobs,
                torch::Tensor prow, torch::Tensor lognorm, torch::Tensor enum_logw, int64_t Cs, int64_t mw,
-               int64_t num_enum, int64_t logw_stride, bool logw) {
+               int64_t num_enum, int64_t logw_stride, bool logw, torch::Tensor pred_class, torch::Tensor allowed,
+               int64_t a_stride, bool classes) {
     TORCH_CHECK(node_flows.scalar_type() == torch::kFloat32 && element_flows.scalar_type() == torch::kFloat32 &&
                 temp_flows.scalar_type() == torch::kFloat32 && node_mars.scalar_type() == torch::kFloat32 &&
                 class_mars.scalar_type() == torch::kFloat32 && eprobs.scalar_type() == torch::kFloat32 &&
@@ -524,6 +532,7 @@ void ibtd_cuda(torch::Tensor element_flows, torch::Tensor temp_flows, torch::Ten
     TORCH_CHECK(threads == 128 || threads == 256, "ibtd_cuda: 128 or 256 threads");
     TORCH_CHECK(!warps || threads / 32 <= WTEAMS, "ibtd_cuda: at most 8 warp teams");
     TORCH_CHECK(mw >= Cs && mw >= 1, "ibtd_cuda: the staged masses hold every stored column");
+    TORCH_CHECK(!classes || allowed.scalar_type() == torch::kInt8, "ibtd_cuda: int8 class flags");
     int xb = 1;                                                     // a term's mass-index bits, its place the rest
     while ((1LL << xb) < mw) ++xb;
     TORCH_CHECK(xb < 32 && W < (1LL << (32 - xb)), "ibtd_cuda: a term packs (place, mass index) in 32 bits");
@@ -535,7 +544,9 @@ void ibtd_cuda(torch::Tensor element_flows, torch::Tensor temp_flows, torch::Ten
                 i32(pred_x, "pred_x"), i32(code, "code"), widx(obs_class), i32(ccount, "ccount"), widx(cstart),
                 i32(ccolumns, "ccolumns"), i32(crank, "crank"), terms.data_ptr<int>(), cnt.data_ptr<int>(),
                 sort ? perm.data_ptr<int>() : nullptr, done.data_ptr<int>(), (int)B, (int)n, (int)W, (int)C, (int)Cs,
-                xb};
+                xb, classes ? i32(pred_class, "pred_class") : nullptr,
+                classes ? (const signed char*)allowed.data_ptr<int8_t>() : nullptr, (long long)a_stride,
+                classes ? 1 : 0};
     ibtd_terms_kernel<<<dim3((unsigned)((cq_max + TW / 32 - 1) / (TW / 32)), (unsigned)B, (unsigned)T), TW, 0,
                         stream>>>(ta);
     C10_CUDA_KERNEL_LAUNCH_CHECK();

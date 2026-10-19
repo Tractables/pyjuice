@@ -110,8 +110,9 @@ class TransitionTables:
         class's columns (:func:`~.score._class_weight_kernel`); ``max_cls`` the most of any (boundary, class);
         ``cls_order`` [n, C] int32, every boundary's classes by their columns, most first (the walk's lanes take
         classes in this order, so that a program's classes have lists of a length)
-    :ivar entry_class: ungrouped only, [entries] int32: every entry's class -- by which a session's per-sample inputs
-        rule entries out (the ``input @ block`` entry loops' :class:`~.live.SuccessorLists`)
+    :ivar entry_class, pred_class: ungrouped only, [entries] int32: every entry's class, in the entry and the
+        predecessor order -- by which a session's per-sample inputs rule entries out (the ``input @ block`` entry loops'
+        :class:`~.live.SuccessorLists`, the CUDA top-down walk's terms)
     """
 
     grouped: bool
@@ -134,6 +135,7 @@ class TransitionTables:
     max_cls: int = 0
     cls_order: Optional[torch.Tensor] = None
     entry_class: Optional[torch.Tensor] = None
+    pred_class: Optional[torch.Tensor] = None
 
 
 def max_successors(next_col: torch.Tensor, width, n: int) -> int:
@@ -162,7 +164,8 @@ def transition_tables(next_col: torch.Tensor, width, n: int, grouped: bool,
     pair_of = torch.full((n, W, C), -1, dtype = torch.int64) if grouped else None
     cls_ptr = torch.zeros(n, C + 1, dtype = torch.int64)
     cls_order = torch.arange(C, dtype = torch.int64).repeat(n, 1)
-    succs, xs, cols, pxs, num_pairs, ees, epairs, ccols, csuccs, clss = [], [], [], [], [], [], [], [], [], []
+    succs, xs, cols, pxs, num_pairs, ees, epairs, ccols, csuccs = [], [], [], [], [], [], [], [], []
+    clss, pclss = [], []                                                    # (ungrouped: the entries' classes)
     base = max_pairs = ebase = max_enum = cbase = max_cls = 0
     for t in range(n):
         wt = int(width[t])
@@ -196,6 +199,8 @@ def transition_tables(next_col: torch.Tensor, width, n: int, grouped: bool,
         by_succ = torch.argsort(es * (W + 1) + eq, stable = True)
         pred_ptr[t] = base + torch.searchsorted(es[by_succ], torch.arange(W + 1))
         succs.append(es); xs.append(ex); cols.append(eq[by_succ]); pxs.append(ex[by_succ])
+        if not grouped:
+            pclss.append(c[by_succ])
         base += eq.numel()
     dev = next_col.device
     i32 = lambda x: x.to(dev, torch.int32).contiguous()
@@ -209,7 +214,8 @@ def transition_tables(next_col: torch.Tensor, width, n: int, grouped: bool,
                             enum_pair = cat(epairs, ebase) if grouped else None, max_enum = max_enum,
                             cls_ptr = i32(cls_ptr), cls_col = cat(ccols, cbase), cls_succ = cat(csuccs, cbase),
                             max_cls = max_cls, cls_order = i32(cls_order),
-                            entry_class = None if grouped else cat(clss, base))
+                            entry_class = None if grouped else cat(clss, base),
+                            pred_class = None if grouped else cat(pclss, base))
 
 
 #: :func:`transition_masses`' tiles: the most rows (input steps at one position) and columns per program, classes per
