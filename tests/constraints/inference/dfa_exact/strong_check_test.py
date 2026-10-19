@@ -1,7 +1,8 @@
 """
 Strong correctness checks of the dfa_exact backend on Codpula circuits (a GeneralizedHMM with SoftEvidenceCategorical
-inputs under top-k or dense soft evidence, and BlockScale external parameters) and PD circuits: every output of a
-decoder session against an independent float64 reference, and invariants that need no reference.
+inputs under top-k or dense soft evidence, and BlockScale external parameters), PD circuits and HMMs (dense blocks:
+the backend's dense matrix products): every output of a decoder session against an independent float64 reference,
+and invariants that need no reference.
 
 THE REFERENCE (:class:`Float64Reference`) computes ``log p(C, e)`` and the conditionals of every missing token from the
 definitions alone -- the automaton's own ``token_class``, ``delta``, ``initial`` and ``accept``, the PC's structure and
@@ -490,6 +491,19 @@ def codpula_pc(n, latents, V, gated = True, seed = 0, block = 32):
     return juice.compile(ns, verbose = False).to(DEV)
 
 
+def hmm_pc(n, latents, V, seed = 0, block = None):
+    """A homogeneous HMM of ``latents`` states over ``V`` tokens (Categorical inputs): its transition sums are dense
+    blocks of ``block`` (default ``latents``) nodes, which take the backend's dense matrix products from
+    ``DENSE_MIN_BLOCK``."""
+    from pyjuice.constraints.inference.dfa_exact.kernels.sum import DENSE_MIN_BLOCK
+    assert (block or latents) >= DENSE_MIN_BLOCK
+    torch.manual_seed(seed)
+    ns = juice.structures.HMM(seq_length = n, num_latents = latents, num_emits = V, homogeneous = True,
+                              block_size = block)
+    ns.init_parameters(perturbation = 2.0)
+    return juice.compile(ns, verbose = False).to(DEV)
+
+
 def pd_pc(n, latents, V, seed = 0):
     """A PD circuit over ``n`` variables of ``V`` categories, ``latents`` nodes a region."""
     torch.manual_seed(seed)
@@ -765,18 +779,19 @@ def test_the_reference_matches_a_brute_force(kind):
     compare(cond, want_cond, 1e-5, "conditionals")
 
 
-SMALL = {"codpula": dict(n = 8, latents = 64, V = 40, K = 6, B = 5), "pd": dict(n = 8, latents = 4, V = 6, B = 5)}
+SMALL = {"codpula": dict(n = 8, latents = 64, V = 40, K = 6, B = 5), "pd": dict(n = 8, latents = 4, V = 6, B = 5),
+         "hmm": dict(n = 8, latents = 64, V = 40, B = 5)}
 
 
 def small_case(kind, seed = 0):
-    """A small circuit (Codpula: blocks of 32 under gates, top-k evidence; PD: Categorical inputs), an automaton,
-    data whose observed tokens keep the constraint possible, and the inputs."""
+    """A small circuit (Codpula: blocks of 32 under gates, top-k evidence; PD: Categorical inputs; HMM: dense blocks,
+    Categorical inputs), an automaton, data whose observed tokens keep the constraint possible, and the inputs."""
     cfg = SMALL[kind]
     n, V, B = cfg["n"], cfg["V"], cfg["B"]
     g = torch.Generator().manual_seed(seed)
     data = torch.randint(4, V, (B, n), generator = g)
-    if kind == "codpula":
-        pc = codpula_pc(n, cfg["latents"], V, seed = seed)
+    if kind in ("codpula", "hmm"):
+        pc = codpula_pc(n, cfg["latents"], V, seed = seed) if kind == "codpula" else hmm_pc(n, cfg["latents"], V, seed)
         phrases = [[1, 2], [3]]
         dfa = keyword_dfa(V, phrases, forbidden = 0)
     else:
@@ -791,7 +806,7 @@ def small_case(kind, seed = 0):
 @pytest.mark.parametrize("precision", ["fp32", "tf32", "bf16"])
 @pytest.mark.parametrize("storage", ["dense", "compact"])
 @pytest.mark.parametrize("mode", ["diffusion", "l2r"])
-@pytest.mark.parametrize("kind", ["codpula", "pd"])
+@pytest.mark.parametrize("kind", ["codpula", "pd", "hmm"])
 def test_a_session_against_float64(kind, mode, storage, precision):
     """Every call of a decoder session -- marginals, log marginals, every missing token's conditional -- against the
     float64 reference (to :data:`TOLERANCE`; -inf exactly where it has it)."""
@@ -800,6 +815,22 @@ def test_a_session_against_float64(kind, mode, storage, precision):
     ref = Float64Reference(pc, dfa, data.size(1))
     masks = schedule(mode, data.size(0), data.size(1))
     check_against_reference(cc, ref, data, masks, inputs, storage, precision)
+
+
+@pytest.mark.parametrize("precision", ["fp32", "tf32", "bf16"])
+@pytest.mark.parametrize("storage", ["dense", "compact"])
+@pytest.mark.parametrize("mode", ["diffusion", "l2r"])
+def test_unstacked_dense_products_against_float64(mode, storage, precision, monkeypatch):
+    """:func:`test_a_session_against_float64` on an HMM of two 64-node blocks a transition whose products run block by
+    block (no stacked weights, as for a product wider than ``STACK_MAX_COLUMNS``): a run's later blocks log-add their
+    children's top-down values to the first's."""
+    import pyjuice.constraints.inference.dfa_exact.queries.backend.forward as F
+    monkeypatch.setattr(F, "STACK_MAX_COLUMNS", {p: -1 for p in F.STACK_MAX_COLUMNS})
+    _, dfa, data, _ = small_case("hmm")
+    pc = hmm_pc(data.size(1), 128, SMALL["hmm"]["V"], block = 64)
+    cc = jc.compile(dfa, pc)
+    ref = Float64Reference(pc, dfa, data.size(1))
+    check_against_reference(cc, ref, data, schedule(mode, data.size(0), data.size(1)), None, storage, precision)
 
 
 def enumerating_case(kind, seed = 0):

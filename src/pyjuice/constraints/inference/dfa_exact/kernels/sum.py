@@ -1125,9 +1125,9 @@ def _log_add_kernel(out, m, rows, ncols, ld, num_ctiles, TILE_R: tl.constexpr, T
 
 @triton_jit
 def _log_scatter_kernel(out, prod, m, rank, rows, ncols, ld, num_live, num_ctiles, TILE_R: tl.constexpr,
-                        TILE_C: tl.constexpr):
+                        TILE_C: tl.constexpr, TRANS: tl.constexpr = False):
     """``out[:, c] = log(prod[:, rank[c]]) + m[rank[c]]`` for every live column ``c`` of ``out``, -inf for the others
-    (``prod`` [rows, num_live], the products of the live columns)."""
+    (``prod`` [rows, num_live], the products of the live columns; ``TRANS``: [num_live, rows], read transposed)."""
     r = (tl.program_id(0) // num_ctiles) * TILE_R + tl.arange(0, TILE_R)
     c = (tl.program_id(0) % num_ctiles) * TILE_C + tl.arange(0, TILE_C)
     cmask = c < ncols
@@ -1136,7 +1136,11 @@ def _log_scatter_kernel(out, prod, m, rank, rows, ncols, ld, num_live, num_ctile
     alive = k >= 0
     shift = tl.load(m + k, mask = cmask & alive, other = 0.0)
     r = r.to(tl.int64)
-    v = tl.load(prod + r[:, None] * num_live + k[None, :], mask = mask & alive[None, :], other = 1.0)
+    if TRANS:
+        at = k.to(tl.int64)[None, :] * rows + r[:, None]
+    else:
+        at = r[:, None] * num_live + k[None, :]
+    v = tl.load(prod + at, mask = mask & alive[None, :], other = 1.0)
     tl.store(out + r[:, None] * ld + c[None, :], tl.where(alive[None, :], tl.log(v) + shift[None, :], float("-inf")),
              mask = mask)
 
@@ -1194,20 +1198,28 @@ def dense_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch
                                                                         TILE_R = TILE_R, TILE_C = TILE_C)
 
 
+#: The precisions whose dense live-column products come out transposed, ``[live, rows] = ex_t @ W^T``: those on tensor
+#: cores, where cuBLAS picks faster kernels for that than for ``W @ ex_t^T`` [rows, live]. Over every product of an HMM
+#: ex108 B8 diffusion session (M = K = 4096, 1 to 83k live columns; toast): TF32 1806 -> 1469 ms, faster at every width,
+#: the weights stacked or not; fp32 (SIMT kernels) 4423 -> 4480 ms, so its products stay [rows, live].
+_TRANSPOSED_PRODUCTS = ("tf32",)
+
+
 def _dense_sum_live(nodes, elems, params, groups, E, BS, first, elem_first, ncols, precision, live, stacked):
     perm, rank, num_live = live
     width = nodes.size(1)
     TILE_R, TILE_C = _EW_TILE
+    trans = precision in _TRANSPOSED_PRODUCTS
     with _matmul_precision(precision):
         for c0, blocks in groups.items():
             ex_t, m = _live_shifted_exp(elems[c0 - elem_first:c0 - elem_first + E], perm, num_live)    # [live, E]
             for w, nid in _products(blocks, params, E, BS, stacked.get(c0)):
                 rows = w.size(0)
-                prod = torch.mm(w, ex_t.t())                                       # [rows, live]
+                prod = torch.mm(ex_t, w.t()) if trans else torch.mm(w, ex_t.t())  # [live, rows] / [rows, live]
                 num_ctiles = host_cdiv(ncols, TILE_C)
                 _log_scatter_kernel[(host_cdiv(rows, TILE_R) * num_ctiles,)](
                     nodes[nid - first:nid - first + rows], prod, m, rank, rows, ncols, width, num_live, num_ctiles,
-                    TILE_R = TILE_R, TILE_C = TILE_C)
+                    TILE_R = TILE_R, TILE_C = TILE_C, TRANS = trans)
 
 
 @triton.jit
@@ -1594,9 +1606,9 @@ def _log_accumulate_kernel(out, prod, m, rows, ncols, ld, num_ctiles, TILE_R: tl
 
 @triton_jit
 def _log_scatter_accumulate_kernel(out, prod, m, rank, rows, ncols, ld, num_live, num_ctiles, TILE_R: tl.constexpr,
-                                   TILE_C: tl.constexpr):
+                                   TILE_C: tl.constexpr, TRANS: tl.constexpr = False):
     """``out[:, c] = logaddexp(out[:, c], log(prod[:, rank[c]]) + m[rank[c]])`` for every live column ``c``; dead
-    columns untouched (they hold -inf from the first writer)."""
+    columns untouched (they hold -inf from the first writer). ``TRANS``: ``prod`` [num_live, rows], read transposed."""
     r = (tl.program_id(0) // num_ctiles) * TILE_R + tl.arange(0, TILE_R)
     c = (tl.program_id(0) % num_ctiles) * TILE_C + tl.arange(0, TILE_C)
     cmask = c < ncols
@@ -1605,7 +1617,11 @@ def _log_scatter_accumulate_kernel(out, prod, m, rank, rows, ncols, ld, num_live
     mask = (r < rows)[:, None] & (cmask & alive)[None, :]
     shift = tl.load(m + k, mask = cmask & alive, other = 0.0)
     r = r.to(tl.int64)
-    v = tl.log(tl.load(prod + r[:, None] * num_live + k[None, :], mask = mask, other = 0.0)) + shift[None, :]
+    if TRANS:
+        at = k.to(tl.int64)[None, :] * rows + r[:, None]
+    else:
+        at = r[:, None] * num_live + k[None, :]
+    v = tl.log(tl.load(prod + at, mask = mask, other = 0.0)) + shift[None, :]
     ptr = out + r[:, None] * ld + c[None, :]
     tl.store(ptr, _logaddexp_tile(tl.load(ptr, mask = mask, other = float("-inf")), v), mask = mask)
 
@@ -1653,12 +1669,13 @@ def dense_sum_top_down(element_flows: torch.Tensor, node_flows: torch.Tensor, pa
                                                                          TILE_R = TILE_R, TILE_C = TILE_C)
             else:
                 perm, rank, num_live = live
+                trans = precision in _TRANSPOSED_PRODUCTS
                 ex_t, m = _live_shifted_exp(x, perm, num_live)                                  # [live, rows]
-                prod = torch.mm(wt, ex_t.t())                                                   # [E, live]
+                prod = torch.mm(ex_t, wt.t()) if trans else torch.mm(wt, ex_t.t())             # [live, E] / [E, live]
                 num_ctiles = host_cdiv(ncols, TILE_C)
                 kernel = _log_scatter_accumulate_kernel if add else _log_scatter_kernel
                 kernel[(host_cdiv(E, TILE_R) * num_ctiles,)](out, prod, m, rank, E, ncols, elem_width, num_live,
-                                                            num_ctiles, TILE_R = TILE_R, TILE_C = TILE_C)
+                                                            num_ctiles, TILE_R = TILE_R, TILE_C = TILE_C, TRANS = trans)
             add = True                                                        # the run's later blocks add to the first
 
 
