@@ -146,13 +146,23 @@ def test_views_sit_in_their_regions(kind, build_pc):
 
 
 def test_buffers_are_reused_across_batch_sizes(build_pc):
+    """A buffer's storage is re-cut while large enough and at most 4x too large, else replaced (larger, or smaller).
+    Every buffer is held: the storage it replaces stays allocated, so a replacement cannot land at its address (freed
+    first, the allocator may reuse it -- the address test failed in full runs, by what earlier tests left)."""
     cc, _ = compiled(build_pc, "pd")
-    ptr = lambda B: cc.backend.state.buffers(B)["node_mars"].data_ptr()
-    p64 = ptr(64)
-    assert ptr(32) == p64 and ptr(64) == p64                               # within 4x: re-cut, same addresses
-    assert ptr(128) != p64                                                 # too small: grown
-    p128 = ptr(128)
-    assert ptr(8) != p128                                                  # more than 4x too large: shrunk
+    held = []
+
+    def buf(B):
+        held.append(cc.backend.state.buffers(B)["node_mars"])
+        return held[-1]
+
+    size = lambda t: t.untyped_storage().nbytes()
+    b64 = buf(64)
+    assert buf(32).data_ptr() == b64.data_ptr() == buf(64).data_ptr()     # within 4x: the same storage, re-cut
+    b128 = buf(128)
+    assert b128.data_ptr() != b64.data_ptr() and size(b128) > size(b64)    # too small: grown
+    b8 = buf(8)
+    assert b8.data_ptr() != b128.data_ptr() and size(b8) < size(b128)     # more than 4x too large: shrunk
     fresh = cc.backend.state.buffers(256)["node_mars"]               # a new allocation: as FRESH_FILL says (the
     assert torch.isnan(fresh).all()                                  # tests' NaN; unfilled in use)
 
