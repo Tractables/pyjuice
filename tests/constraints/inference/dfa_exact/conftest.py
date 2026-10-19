@@ -42,7 +42,14 @@ Parameters are read from the PC's live parameter tensors (never from the node ob
 kept in sync), so in-place parameter updates are seen by the next call.
 """
 
+import collections
+import copy
+import functools
+import hashlib
+import inspect
 import random
+import sys
+import types
 from functools import partial
 
 import pytest
@@ -434,6 +441,94 @@ def reference_conditional(cc, data, missing_mask = None, targets = None, inputs 
     return torch.where(torch.isfinite(norm), rows - norm, torch.full_like(rows, -float("inf")))
 
 
+#: the reference's results by the content of everything they read (:func:`_reference_key`), at most this many: the
+#: tests of one circuit, constraint and evidence along other paths (``sum_path``, the storages) compute them once
+_REFERENCE = collections.OrderedDict()
+_REFERENCE_SIZE = 256
+
+
+def _digest(h, x, order):
+    """Into the hash ``h``: ``x`` -- tensors and arrays by dtype, shape and bytes, dicts and lists by their items (a
+    node group as its place in ``order``), None, numbers and strings by value; TypeError for anything else."""
+    if x is None or isinstance(x, (bool, int, float, str)):
+        h.update(repr(x).encode())
+    elif isinstance(x, torch.Tensor):
+        t = x.detach().cpu().contiguous()
+        h.update(f"T{t.dtype}{tuple(t.shape)}".encode())
+        h.update(t.reshape(-1).view(torch.uint8).numpy().tobytes())
+    elif hasattr(x, "tobytes") and hasattr(x, "dtype"):                     # (numpy)
+        h.update(f"A{x.dtype}{x.shape}".encode())
+        h.update(x.tobytes())
+    elif isinstance(x, dict):
+        h.update(b"{")
+        for k, v in x.items():
+            _digest(h, k if isinstance(k, str) else order[k], order)        # (KeyError: not the circuit's)
+            _digest(h, v, order)
+        h.update(b"}")
+    elif isinstance(x, (list, tuple)):
+        h.update(b"[")
+        for v in x:
+            _digest(h, v, order)
+        h.update(b"]")
+    else:
+        raise TypeError(type(x).__name__)
+
+
+def _reference_key(fn, cc, arguments: dict, order: dict):
+    """What a result of the reference function ``fn`` keys on: the circuit's build (:func:`build_pc`'s arguments) and
+    device, and the content of its parameters, of the constraint's layout and of the call's ``arguments`` -- None for
+    a circuit :func:`build_pc` did not build, or arguments the key cannot hold."""
+    pc = cc.pc
+    built = getattr(pc, "_built_as", None)
+    if built is None:
+        return None
+    lay = cc.backend.layout
+    h = hashlib.blake2b(digest_size = 16)
+    try:
+        _digest(h, [pc.params] + [layer.params for layer in pc.input_layer_group], order)
+        _digest(h, [lay.next_col, lay.width, lay.token_class, lay.num_classes, lay.satisfiable, cc.n], order)
+        _digest(h, arguments, order)
+    except (TypeError, KeyError):
+        return None
+    return (fn.__name__, built, str(pc.params.device), h.hexdigest())
+
+
+def _remembered(fn, ignore = ()):
+    """``fn`` (a reference function of a constrained circuit) with its results kept in :data:`_REFERENCE`, every call
+    given its own copy: a tensor, or a dict by node group (kept by their places in the circuit's ``root_ns``, read back
+    as the caller's circuit's). ``ignore``: arguments that are functions of the others (``inside``)."""
+    sig = inspect.signature(fn)
+
+    @functools.wraps(fn)
+    def run(cc, *args, **kwargs):
+        bound = sig.bind(cc, *args, **kwargs)
+        bound.apply_defaults()
+        nodes = list(cc.pc.root_ns)
+        order = {ns: i for i, ns in enumerate(nodes)}
+        key = _reference_key(fn, cc, {k: v for k, v in bound.arguments.items() if k != "cc" and k not in ignore}, order)
+        if key is None:
+            return fn(cc, *args, **kwargs)
+        kept = _REFERENCE.get(key)
+        if kept is None:
+            out = fn(cc, *args, **kwargs)
+            kept = tuple((order[ns], v) for ns, v in out.items()) if isinstance(out, dict) else out
+            _REFERENCE[key] = kept
+            if len(_REFERENCE) > _REFERENCE_SIZE:
+                _REFERENCE.popitem(last = False)
+        else:
+            _REFERENCE.move_to_end(key)
+        if isinstance(kept, tuple):
+            return {nodes[i]: v.clone() for i, v in kept}
+        return kept.clone()
+    return run
+
+
+reference_inside = _remembered(reference_inside)
+reference_marginal = _remembered(reference_marginal)
+reference_top_down = _remembered(reference_top_down, ignore = ("inside",))
+reference_conditional = _remembered(reference_conditional)
+
+
 @pytest.fixture
 def reference():
     """The reference implementation (this module's functions), for tests in this directory."""
@@ -611,12 +706,95 @@ def gate_sums(root, child_gate = lambda ns: ns.ch_block_size, tie_external = Fal
     return root
 
 
+#: :func:`build_pc`'s circuits, built once a process: by its arguments, the compiled PC (never handed out, never run),
+#: the kernels its copies share, and the random generators' states its build left (None: a circuit that cannot be
+#: copied, built every time)
+_BUILT = {}
+
+
+def _kernels(root) -> list:
+    """The kernels ``root`` reaches through attributes, dicts, lists and tuples (Triton's, and the launchers wrapping
+    them): code, which a copy of a circuit shares; everything else it reaches is copied."""
+    from triton.runtime.jit import KernelInterface
+    kernel = lambda x: isinstance(x, KernelInterface) or isinstance(getattr(x, "jit_fn", None), KernelInterface)
+    out, seen, todo = [], set(), [root]
+    while todo:
+        x = todo.pop()
+        atom = isinstance(x, (torch.Tensor, str, bytes, int, float, bool, type, type(None), types.ModuleType))
+        if id(x) in seen or atom:
+            continue
+        seen.add(id(x))
+        if kernel(x):
+            out.append(x)
+        elif isinstance(x, dict):
+            todo.extend(x.values())
+        elif isinstance(x, (list, tuple, set, frozenset)):
+            todo.extend(x)
+        elif hasattr(x, "__dict__"):
+            todo.extend(vars(x).values())
+    return out
+
+
+def _frozen(x):
+    """``x`` as a hashable key: dicts and lists by their items (TypeError where something is not hashable)."""
+    if isinstance(x, dict):
+        return tuple(sorted(((k, _frozen(v)) for k, v in x.items()), key = lambda kv: kv[0]))
+    if isinstance(x, (list, tuple)):
+        return tuple(_frozen(v) for v in x)
+    hash(x)
+    return x
+
+
 def build_pc(kind, n, V, seed = 0, device = torch.device("cuda:0"), perturbation = 2.0, input_dist = None,
              gates = None, **compile_kwargs):
     """A compiled PC of one of the :data:`PC_KINDS` over ``n`` variables with ``V`` categories (``perturbation``: of
     its parameters' initialization, see ``init_parameters``; ``input_dist``: None, or another distribution class of
     ``V`` categories every input node takes, e.g. ``SoftEvidenceCategorical``; ``gates``: None, or keywords of
-    :func:`gate_sums` -- its sums gated)."""
+    :func:`gate_sums` -- its sums gated). Built once a process for the same arguments: every call gets a copy of its
+    own (``copy.deepcopy``, nothing shared), and the random generators as the build left them."""
+    device = torch.device(device)
+    try:
+        key = (kind, n, V, seed, device, perturbation, input_dist, _frozen(gates), _frozen(compile_kwargs))
+    except TypeError:                                   # (arguments that cannot key a cache: built every time)
+        return _build_pc(kind, n, V, seed, device, perturbation, input_dist, gates, **compile_kwargs)
+    built = _BUILT.get(key, False)
+    cuda = device.type == "cuda"
+    if built is None:
+        return _build_pc(kind, n, V, seed, device, perturbation, input_dist, gates, **compile_kwargs)
+    if built is False:
+        pc = _build_pc(kind, n, V, seed, device, perturbation, input_dist, gates, **compile_kwargs)
+        states = (torch.get_rng_state(), torch.cuda.get_rng_state(device) if cuda else None, random.getstate())
+        pc._built_as = key                              # (its copies' too: what the reference's results key on)
+        kernels = _kernels(pc)
+        try:
+            first = _copy(pc, kernels)
+        except (TypeError, RecursionError):             # (something in it no copy can hold)
+            _BUILT[key] = None
+            del pc._built_as
+            return pc
+        _BUILT[key] = (pc, kernels, *states)
+        return first
+    torch.manual_seed(seed)                             # (every device's generator, as the build seeds them)
+    torch.set_rng_state(built[2])
+    if cuda:
+        torch.cuda.set_rng_state(built[3], device)
+    random.setstate(built[4])
+    return _copy(built[0], built[1])
+
+
+def _copy(pc, kernels):
+    """A copy of ``pc`` sharing its ``kernels`` alone (a deep circuit's node graph recursing deeper than the default
+    limit allows under pytest's frames)."""
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(max(limit, 10000))
+    try:
+        return copy.deepcopy(pc, {id(k): k for k in kernels})
+    finally:
+        sys.setrecursionlimit(limit)
+
+
+def _build_pc(kind, n, V, seed, device, perturbation, input_dist, gates, **compile_kwargs):
+    """:func:`build_pc`'s circuit, built."""
     assert PC_KINDS[kind] in (None, n), (kind, n)
     torch.manual_seed(seed); random.seed(seed)
     if kind == "hmm":
