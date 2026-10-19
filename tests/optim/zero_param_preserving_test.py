@@ -169,6 +169,7 @@ def test_zero_param_preserving_input_normalized(num_emits):
     """
 
     device = torch.device("cuda:0")
+    torch.manual_seed(7)
 
     num_latents = 32
 
@@ -183,10 +184,8 @@ def test_zero_param_preserving_input_normalized(num_emits):
     # Zero out 10% of the emission matrix, keeping every row non-empty.
     emit_ns = root_ns.chs[0].chs[0].get_source_ns()
     beta = emit_ns._params.clone().reshape(num_latents, num_emits)
-    while True:
-        mask = torch.rand(num_latents, num_emits) < 0.1
-        if torch.all((~mask).long().sum(dim = 1) > 0):
-            break
+    mask = torch.rand(num_latents, num_emits) < 0.1
+    mask[:,0] = False
     beta[mask] = 0.0
     beta /= beta.sum(dim = 1, keepdim = True)
     emit_ns.set_params(beta.reshape(-1))
@@ -205,7 +204,7 @@ def test_zero_param_preserving_input_normalized(num_emits):
 
     beta_new = emit_ns._params.clone().reshape(num_latents, num_emits)
 
-    assert torch.all((beta > 1e-12) | (beta_new < 1e-12))
+    assert torch.equal(beta_new[mask], torch.zeros_like(beta_new[mask]))
     assert torch.allclose(beta_new.sum(dim = 1), torch.ones(num_latents), atol = 1e-4)
 
 
