@@ -950,7 +950,8 @@ def _input_block_cuda(la: TopDownLaunch, tiles: torch.Tensor, height: int, prog,
     mc = compact.max_count
     cq = int(mc[st["ts"] + 1].max())                                         # a sample's most live columns at t + 1
     lp = max(int((mc[st["ta"]] * mc[st["te"]]).max()), 1)                   # ... lanes of a parent's row
-    team = lambda tn: (4 * tn * (lp + mw + 1) + 15) // 16 * 16               # a sample's shared memory (bytes)
+    team = lambda tn: (4 * tn * (lp + mw + 1) + 4 * ((mw + 31) // 32) + 15) // 16 * 16   # a sample's shared memory
+                                                                             # (bytes: c/walk.cu's `ibtd_smem`)
     tn = min(height, INPUT_BLOCK_CUDA_NODES)
     while tn > 1 and team(tn) > INPUT_BLOCK_CUDA_SMEM:
         tn //= 2

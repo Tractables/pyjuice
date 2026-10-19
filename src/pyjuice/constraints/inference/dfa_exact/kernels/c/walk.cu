@@ -17,7 +17,9 @@
 //   to columns of few kept 3 of 4 threads waiting, without evidence) -- unless the sample's lanes are few;
 //   `ibtd_kernel`, a CTA per (node tile's children, sample) -- or per 8 samples, a warp each, when a sample's lanes are
 //   few --: stages the children's parents' lanes of the sample and the parents' class masses (or an observed token's
-//   log-probability) in shared memory, children minor, then a thread per (lane, G children) sums the lane's terms for
+//   log-probability) in shared memory, children minor -- where a missing token's terms are fewer than the codes,
+//   the masses of the codes they read alone (`used`, marked from the terms first; the others are never read) --,
+//   then a thread per (lane, G children) sums the lane's terms for
 //   each of them -- in the Triton kernel's order and with its arithmetic (`tri_exp`, `tri_log`), so the values are the
 //   same bit for bit whichever thread sums them -- and writes it, or log-adds it to the value there (`add`). Parents
 //   whose values the query keeps once are read by slot, every entry of the list (`once`), as the Triton kernel does.
@@ -281,6 +283,7 @@ __global__ void __launch_bounds__(256) ibtd_kernel(IbArgs a) {
     __shared__ long long s_dst[WTILE];         // where a child's row starts (`node_flows` / `temp_flows`)
     __shared__ long long s_op[WARPS ? WTEAMS : 1][WTILE];     // where its parent's row starts (a team's parent r)
     __shared__ long long s_mrow[WARPS ? WTEAMS : 1][WTILE];   // its parent's class masses (the team's sample's)
+    __shared__ int s_terms[WARPS ? WTEAMS : 1];                // the team's terms (whether to mark the codes read)
     const int n = a.n, B = a.B, W = a.W, Cs = a.Cs, MW = a.mw, TN = a.tn;
     const int team = WARPS ? threadIdx.x >> 5 : 0;                        // a team sums one sample
     const int tid = WARPS ? threadIdx.x & 31 : threadIdx.x, nt = WARPS ? 32 : blockDim.x;
@@ -325,6 +328,7 @@ __global__ void __launch_bounds__(256) ibtd_kernel(IbArgs a) {
     float* O = sm + (long long)team * a.team_floats;                     // [lp_ld][TN]: the parents' lanes
     float* M = O + (long long)a.lp_ld * TN;                               // [MW][TN]: their masses, by code index
     float* own = M + (long long)MW * TN;                                  // [TN]: an observed token's log-prob
+    unsigned* used = reinterpret_cast<unsigned*>(own + TN);               // [(MW + 31) / 32]: the codes the terms read
     long long* op_ = s_op[team];
     long long* mrow = s_mrow[team];
     const int tk = a.tok_ptr[t], ecount = a.tok_ptr[t + 1] - tk;          // the boundary's enumerated tokens
@@ -333,6 +337,33 @@ __global__ void __launch_bounds__(256) ibtd_kernel(IbArgs a) {
         if constexpr (WARPS) __syncwarp();
         else __syncthreads();
     };
+
+    // the codes the sample's terms read, where they are fewer than the codes (a missing token, its terms summed: the
+    // blocks kept once read every entry): `stage` computes those masses alone -- the same masses, the same bits
+    bool sparse = false;
+    if (oc < 0 && !once) {
+        const int cqs = (int)(lc / ce);                                   // the sample's live columns at t + 1
+        int mine = 0;
+        for (int rq = tid; rq < cqs; rq += nt) mine += cnt[rq];
+        if (tid == 0) s_terms[team] = 0;
+        sync();
+        atomicAdd(s_terms + team, mine);
+        sync();
+        const int total = s_terms[team];
+        sparse = total < MW;
+        if (sparse) {
+            for (int w = tid; w < (MW + 31) / 32; w += nt) used[w] = 0u;
+            sync();
+            const int xmask = (1 << a.xb) - 1;
+            for (int e = tid; e < total; e += nt) {                        // (live column, term), flattened
+                int rq = 0, s = e;
+                while (s >= cnt[rq]) s -= cnt[rq++];
+                const int x = terms[pp[a.ccolumns[st_q + rq]] + s] & xmask;
+                atomicOr(used + (x >> 5), 1u << (x & 31));
+            }
+            sync();
+        }
+    }
 
     // the children's parents r: their rows, masses and lanes of the sample in shared memory (-inf for no child)
     auto stage = [&](int r) {
@@ -357,6 +388,7 @@ __global__ void __launch_bounds__(256) ibtd_kernel(IbArgs a) {
         if (oc < 0)
             for (int e = tid; e < TN * MW; e += nt) {                    // stored columns, then enumerated tokens
                 const int k = e / MW, x = e - k * MW;
+                if (sparse && !((used[x >> 5] >> (x & 31)) & 1u)) continue;   // (no term reads it)
                 float v = -CUDART_INF_F;
                 if (s_c[k] >= 0) {
                     if (x < Cs) {
@@ -471,10 +503,10 @@ __global__ void __launch_bounds__(256) ibtd_kernel(IbArgs a) {
 }  // namespace
 
 // Shared memory of a CTA of `tn` children: their parents' lanes (`lp_ld` each), masses (`mw`: the stored columns and a
-// boundary's most enumerated tokens), observed log-probabilities (`prod_top_down._input_block_cuda` sizes the CTAs by
-// the same rule)
+// boundary's most enumerated tokens), observed log-probabilities, a bit per code read
+// (`prod_top_down._input_block_cuda` sizes the CTAs by the same rule)
 static int64_t ibtd_smem(int64_t tn, int64_t lp_ld, int64_t mw) {
-    return (4 * tn * (lp_ld + mw + 1) + 15) / 16 * 16;
+    return (4 * tn * (lp_ld + mw + 1) + 4 * ((mw + 31) / 32) + 15) / 16 * 16;
 }
 
 // The most dynamic shared memory a CTA of `ibtd_kernel<G, WARPS>` may take (the device's opt-in less the kernel's
