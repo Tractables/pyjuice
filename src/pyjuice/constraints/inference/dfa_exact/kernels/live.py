@@ -582,12 +582,14 @@ def class_support(prog, masses) -> Optional[torch.Tensor]:
         pos = torch.from_numpy(np.repeat(np.arange(n), counts)).to(prog.dev)
         tok = en.tok[:en.num].long()
         cls = classes.token_class[tok].long()
-        has_p = torch.empty(en.num, dtype = torch.bool, device = prog.dev)
+        col = en.index[:en.num].long()                                      # (the tokens' columns of enum_probs, of
+        by_token = masses.enum_probs.t().contiguous()                       # which a token-major copy: a token's
+        has_p = torch.empty(en.num, dtype = torch.bool, device = prog.dev)  # rows read along it)
         step = max(1, SUPPORT_CHUNK // (8 * K))                             # (tokens at a time: [tokens, K] gathers)
         for e0 in range(0, en.num, step):
-            pr = masses.prow[row[pos[e0:e0 + step]]].long()                 # [tokens, K] (a node's parameter row:
-            has_p[e0:e0 + step] = ((masses.tokmaj[tok[e0:e0 + step, None], pr] > 0) & real[pos[e0:e0 + step]]).any(1)
-        w = masses.enum_logw if masses.enum_logw is not None else torch.zeros(1, en.num, device = prog.dev)   # every
+            pr = masses.prow[row[pos[e0:e0 + step]]].long()                 # [tokens, K]: the nodes' parameter rows
+            has_p[e0:e0 + step] = ((by_token[col[e0:e0 + step, None], pr] > 0) & real[pos[e0:e0 + step]]).any(1)
+        w = masses.enum_logw if masses.enum_logw is not None else torch.zeros(1, en.num, device = prog.dev)   # (every
         allowed[:, pos, cls] = (w[:, :en.num] > -float("inf")) & has_p[None, :]                             # sample's)
     allowed[:, ~real.any(dim = 1)] = True                                   # (a position no product step reads)
     return None if bool(allowed.all()) else allowed

@@ -7,8 +7,9 @@ classes that lead there, from the class masses (:func:`transition_masses`). The 
 ENUMERATED CLASSES (see :class:`~pyjuice.constraints.distributions.TokenClasses`) have no class mass: where a kernel
 read the mass of class ``c`` at row ``r`` it reads a CODE instead (:class:`EnumeratedTokens`): the class's stored
 column, or ``-1 - e`` for the ``e``-th enumerated token live at the boundary, whose mass is its token's own
-probability (``tokmaj[token, prow[r]]``, the backend's token-major table) times its per-sample weight
-(``enum_logw``, see :class:`~..state.ClassMasses`) over the row's ``Z``.
+probability under the row's parameter row (``eprobs[prow[r], index]``, the enumerated tokens' probabilities, by
+parameter row: a step's lanes read along one row, see :meth:`~..state.State.enumerated_probs`) times its per-sample
+weight (``enum_logw``, see :class:`~..state.ClassMasses`) over the row's ``Z``.
 """
 
 from dataclasses import dataclass
@@ -36,12 +37,16 @@ class EnumeratedTokens:
     :ivar ptr: [n + 1] int32, the boundary's tokens are ``tok[ptr[t] .. ptr[t + 1]]``; ``ptr_host`` the same on the host
     :ivar tok: [num + 1] int32, the tokens, then a 0 (kernels read a boundary's first token unmasked for a stored
         entry: past the last boundary's, this one)
+    :ivar index: [num + 1] int32, every token's place among the automaton's enumerated tokens
+        (``TokenClasses.enumerated_tokens``, in class order) -- its column of the enumerated tokens' probabilities
+        (:meth:`~..state.State.enumerated_probs`) --, then a 0
     :ivar code: [n, C] int32
     :ivar num: the tokens over all boundaries (0: nothing enumerated; every code a stored column, the class itself)
     """
 
     ptr: torch.Tensor
     tok: torch.Tensor
+    index: torch.Tensor
     code: torch.Tensor
     num: int
     ptr_host: np.ndarray
@@ -57,7 +62,8 @@ def enumerated_tokens(next_col: torch.Tensor, width, n: int, classes) -> Enumera
     etok = classes.enumerated_token.cpu().long()
     code = stored.expand(n, C).clone() if n > 0 else torch.zeros(0, C, dtype = torch.long)
     ptr = torch.zeros(n + 1, dtype = torch.long)
-    toks = []
+    place = torch.cumsum(etok >= 0, dim = 0) - 1                             # an enumerated class's among them
+    toks, places = [], []
     if classes.num_enumerated > 0:
         for t in range(n):
             live = (nc[t, :int(width[t])] >= 0).any(dim = 0) & (etok >= 0)   # enumerated classes live at t
@@ -67,9 +73,11 @@ def enumerated_tokens(next_col: torch.Tensor, width, n: int, classes) -> Enumera
             code[t] = torch.where(etok >= 0, -1 - e, stored)
             ptr[t + 1] = ptr[t] + ids.numel()
             toks.append(etok[ids])
+            places.append(place[ids])
     tok = torch.cat(toks + [torch.zeros(1, dtype = torch.long)])
+    index = torch.cat(places + [torch.zeros(1, dtype = torch.long)])
     i32 = lambda x: x.to(dev, torch.int32).contiguous()
-    return EnumeratedTokens(ptr = i32(ptr), tok = i32(tok), code = i32(code), num = int(ptr[-1]),
+    return EnumeratedTokens(ptr = i32(ptr), tok = i32(tok), index = i32(index), code = i32(code), num = int(ptr[-1]),
                             ptr_host = ptr.numpy())
 
 
@@ -225,8 +233,8 @@ def transition_job(rows: torch.Tensor, dev):
 
 @triton_jit
 def _transition_kernel(class_mars, mass_row, mass_stride, trans, rows, tiles, pair_of, entry_ptr, class_of_stored,
-                       enum_ptr, enum_e, enum_pair, tok_ptr, tok, tokmaj, prow, lognorm, enum_logw, width, W, C, Cs,
-                       num_rows, logw_stride, input_start, num_qtiles, trans_stride, pid0, TS: tl.constexpr,
+                       enum_ptr, enum_e, enum_pair, tok_ptr, eidx, eprobs, prow, lognorm, enum_logw, width, W, C, Cs,
+                       num_enum, logw_stride, input_start, num_qtiles, trans_stride, pid0, TS: tl.constexpr,
                        QT: tl.constexpr, TP: tl.constexpr, TC: tl.constexpr, TE: tl.constexpr, SAMPLE: tl.constexpr,
                        ENUM: tl.constexpr, LOGW: tl.constexpr):
     """
@@ -238,7 +246,7 @@ def _transition_kernel(class_mars, mass_row, mass_stride, trans, rows, tiles, pa
     every class leads to. A class mass is a sum of fp32 probabilities, so 0 or at least 2^-149: scaled, a normal
     float, which tensor cores do not flush. ``ENUM``: then the column's enumerated entries (``enum_ptr`` / ``enum_e``
     / ``enum_pair``, see :class:`TransitionTables`), ``TE`` at a time, each the mass of its token: its probability
-    under the row's parameter row (``tokmaj[token, prow[row]]``, ``num_rows`` the table's row stride) times --
+    under the row's parameter row (``eprobs[prow[row], eidx[e]]``, ``num_enum`` the table's row stride) times --
     ``LOGW`` -- its weight ``exp(enum_logw[b, e] - lognorm[row])`` (``logw_stride`` floats per sample). The log of the
     sum is the transition mass.
     """
@@ -262,7 +270,7 @@ def _transition_kernel(class_mars, mass_row, mass_stride, trans, rows, tiles, pa
         if LOGW:
             lz = tl.load(lognorm + row, mask = rmask, other = 0.0)
             lw0 = enum_logw + b * logw_stride + tl.load(tok_ptr + t)
-        tk0 = tok + tl.load(tok_ptr + t)
+        tk0 = eidx + tl.load(tok_ptr + t)
     base = tl.load(entry_ptr + t * (W + 1))                                  # the boundary's first pair
     jj = tl.arange(0, TP)
     ee = tl.arange(0, TE)
@@ -286,8 +294,8 @@ def _transition_kernel(class_mars, mass_row, mass_stride, trans, rows, tiles, pa
                     for e0 in range(tl.load(enum_ptr + t * (W + 1) + q), e_end, TE):
                         em = e0 + ee < e_end
                         e = tl.load(enum_e + e0 + ee, mask = em, other = 0).to(tl.int64)
-                        v = tl.load(tk0 + e, mask = em, other = 0).to(tl.int64)
-                        x = tl.load(tokmaj + v[None, :] * num_rows + pr[:, None], mask = rmask[:, None] & em[None, :],
+                        g = tl.load(tk0 + e, mask = em, other = 0).to(tl.int64)
+                        x = tl.load(eprobs + pr[:, None] * num_enum + g[None, :], mask = rmask[:, None] & em[None, :],
                                     other = 0.0) * 18446744073709551616.0                        # x 2^64
                         if LOGW:
                             x = x * tl.exp(tl.load(lw0 + e, mask = em, other = float("-inf"))[None, :] - lz[:, None])
@@ -299,17 +307,18 @@ def _transition_kernel(class_mars, mass_row, mass_stride, trans, rows, tiles, pa
 
 def enumerated_args(prog, masses) -> dict:
     """The keyword arguments a kernel reading class masses by code takes (see :class:`EnumeratedTokens` and
-    :class:`~..state.ClassMasses`): ``code, tok_ptr, tok, tokmaj, prow, lognorm, enum_logw, Cs, num_rows,
-    logw_stride, ENUM, LOGW`` -- unread placeholders where nothing is enumerated (``ENUM`` False) or the masses are no
-    sample's own (``LOGW`` False)."""
+    :class:`~..state.ClassMasses`): ``code, tok_ptr, eidx, eprobs, prow, lognorm, enum_logw, Cs, num_enum,
+    logw_stride, ENUM, LOGW`` -- ``eidx`` the boundaries' tokens' columns of ``eprobs``, the enumerated tokens'
+    probabilities by parameter row (``num_enum`` columns); unread placeholders where nothing is enumerated (``ENUM``
+    False) or the masses are no sample's own (``LOGW`` False)."""
     en = prog.enum
     enum = en.num > 0
     logw = enum and masses.enum_logw is not None
-    tokmaj = masses.tokmaj if enum else masses.table
-    return dict(code = en.code, tok_ptr = en.ptr, tok = en.tok, tokmaj = tokmaj, prow = masses.prow,
+    eprobs = masses.enum_probs if enum else masses.table
+    return dict(code = en.code, tok_ptr = en.ptr, eidx = en.index, eprobs = eprobs, prow = masses.prow,
                 lognorm = masses.lognorm if logw else masses.table,
                 enum_logw = masses.enum_logw if logw else masses.table, Cs = masses.table.size(1),
-                num_rows = tokmaj.size(1), logw_stride = enum_logw_stride(masses), ENUM = enum, LOGW = logw)
+                num_enum = eprobs.size(1), logw_stride = enum_logw_stride(masses), ENUM = enum, LOGW = logw)
 
 
 def enum_logw_stride(masses) -> int:
@@ -338,15 +347,15 @@ def transition_masses(trans, job, masses, prog):
     stride = masses.stride if sample else masses.row
     enum = en.num > 0
     logw = enum and masses.enum_logw is not None
-    tokmaj = masses.tokmaj if enum else masses.table
+    eprobs = masses.enum_probs if enum else masses.table
     for first, size in grid_chunks(tiles.size(0) * num_qtiles, 0):
         _transition_kernel[(size, masses.batch)](
             masses.table, masses.row, stride, trans, rows, tiles, tt.pair_of, tt.entry_ptr,
             prog.token_classes.class_of_stored32, tt.enum_ptr if enum else tt.entry_ptr,
             tt.enum_e if enum else tt.entry_ptr,
-            tt.enum_pair if enum else tt.entry_ptr, en.ptr, en.tok, tokmaj, masses.prow,
+            tt.enum_pair if enum else tt.entry_ptr, en.ptr, en.index, eprobs, masses.prow,
             masses.lognorm if logw else masses.table, masses.enum_logw if logw else masses.table, prog.width_t, W, C,
-            masses.table.size(1), tokmaj.size(1), enum_logw_stride(masses), prog.input_start, num_qtiles,
+            masses.table.size(1), eprobs.size(1), enum_logw_stride(masses), prog.input_start, num_qtiles,
             prog.trans_size, first,
             TS = TS, QT = QT, TP = TP, TC = cfg["TC"], TE = min(64, max(16, host_next_power_of_2(max(tt.max_enum, 1)))),
             SAMPLE = sample, ENUM = enum, LOGW = logw, num_warps = cfg["warps"])

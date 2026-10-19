@@ -831,9 +831,9 @@ void ibtd_cuda(torch::Tensor element_flows, torch::Tensor temp_flows, torch::Ten
                int64_t out_width, int64_t temp_width, int64_t B, int64_t n, int64_t W, int64_t C,
                int64_t input_start, int64_t subs, int64_t tn, int64_t threads, bool warps, bool sort,
                int64_t lp_ld, int64_t cq_max, bool sample, int64_t c_kind, bool out_temp, bool c_full,
-               bool out_full, torch::Tensor code, torch::Tensor tok_ptr, torch::Tensor tok, torch::Tensor tokmaj,
+               bool out_full, torch::Tensor code, torch::Tensor tok_ptr, torch::Tensor eidx, torch::Tensor eprobs,
                torch::Tensor prow, torch::Tensor lognorm, torch::Tensor enum_logw, int64_t Cs, int64_t mw,
-               int64_t num_rows, int64_t logw_stride, bool logw);
+               int64_t num_enum, int64_t logw_stride, bool logw);
 int64_t ibtd_smem_max();
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

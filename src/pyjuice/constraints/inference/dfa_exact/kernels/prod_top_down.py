@@ -198,13 +198,14 @@ def _copy_top_down_kernel(element_flows, temp_flows, node_flows, iv_of, iv_info,
 
 
 @triton.jit
-def _entry_mass(masses, x, code_oc, tokmaj, pr, lz, lw0, tok0, num_rows, oc, own, vm, ENUM: tl.constexpr,
+def _entry_mass(masses, x, code_oc, eprobs, pr, lz, lw0, eidx0, num_enum, oc, own, vm, ENUM: tl.constexpr,
                 LOGW: tl.constexpr, OBSERVED: tl.constexpr):
     """The mass of an entry of class code ``x`` ([lanes]) at the parents' rows (``masses`` [TN, lanes] the rows'
-    stored masses; ``ENUM``: ``tokmaj`` + ``pr`` [TN, lanes] the rows' token-major columns, ``tok0`` the boundary's
-    enumerated tokens, ``LOGW``: ``lw0`` their weights for the lane's sample and ``lz`` [TN, lanes] the rows' ``log
-    Z``) -- ``OBSERVED``: or, where the lane observes a token (``oc`` >= 0), the token's own log-probability ``own`` if
-    the entry's class is the observed one (``code_oc`` its code), else -inf."""
+    stored masses; ``ENUM``: ``eprobs`` + ``pr`` [TN, lanes] the rows' parameter rows of the enumerated tokens'
+    probabilities, ``eidx0`` the columns there of the boundary's enumerated tokens, ``LOGW``: ``lw0`` their weights for
+    the lane's sample and ``lz`` [TN, lanes] the rows' ``log Z``) -- ``OBSERVED``: or, where the lane observes a token
+    (``oc`` >= 0), the token's own log-probability ``own`` if the entry's class is the observed one (``code_oc`` its
+    code), else -inf."""
     if OBSERVED:
         miss = vm & (oc < 0)[None, :]
     else:
@@ -213,8 +214,8 @@ def _entry_mass(masses, x, code_oc, tokmaj, pr, lz, lw0, tok0, num_rows, oc, own
         enum = (x < 0)[None, :]
         stored = tl.load(masses + tl.maximum(x, 0)[None, :], mask = miss & ~enum, other = float("-inf"))
         e = tl.maximum(-1 - x, 0).to(tl.int64)             # the e-th enumerated token (a stored entry: the boundary's
-        v = tl.load(tok0 + e).to(tl.int64)                 # first, or the padding past the last; unread)
-        val = tl.log(tl.load(tokmaj + v[None, :] * num_rows + pr, mask = miss & enum, other = 0.0))
+        g = tl.load(eidx0 + e).to(tl.int64)                # first, or the padding past the last; unread)
+        val = tl.log(tl.load(eprobs + pr * num_enum + g[None, :], mask = miss & enum, other = 0.0))
         if LOGW:
             val = val + tl.load(lw0 + e)[None, :] - lz
         mass = tl.where(enum, val, stored)
@@ -231,7 +232,7 @@ def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
                                 mass_row, mass_stride, trans, trans_stride, pred_ptr, pred_col, pred_x, width, iv_of,
                                 iv_info, iv_table, once_iv, live, lanes, lane_first, lane_live, coff, ccount, cstart,
                                 ccolumns, crank, children, tiles, ptr, parents, reg_offset, reg_width, reg_first,
-                                code, tok_ptr, tok, tokmaj, prow, lognorm, enum_logw, Cs, num_rows, logw_stride,
+                                code, tok_ptr, eidx, eprobs, prow, lognorm, enum_logw, Cs, num_enum, logw_stride,
                                 out_first, out_width, temp_width, B, n, W, C, input_start, csteps, pid0,
                                 C_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, GROUPED: tl.constexpr,
                                 PRUNE: tl.constexpr, ORDERED: tl.constexpr, COMPACT: tl.constexpr,
@@ -315,7 +316,7 @@ def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
                 else:
                     mrow = mrow + (b * 0)[None, :]
                 masses = class_mars + mrow * Cs
-                if ENUM:                                                     # the rows' token-major columns, log Z
+                if ENUM:                                                     # the rows' parameter rows, log Z
                     pr = tl.load(prow + mrow, mask = om, other = 0).to(tl.int64)
                     if LOGW:
                         lz = tl.load(lognorm + mrow, mask = om, other = 0.0)
@@ -336,10 +337,10 @@ def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
                                     tl.load(masses + x[None, :], mask = vm & (oc < 0)[None, :], other = float("-inf")))
                 elif ENUM:                                                   # is it this entry's class?
                     tk = tl.load(tok_ptr + t)
-                    mass = _entry_mass(masses, x, code_oc, tokmaj, pr, lz, enum_logw + b * logw_stride + tk, tok + tk,
-                                       num_rows, oc, own, vm, ENUM, LOGW, True)
+                    mass = _entry_mass(masses, x, code_oc, eprobs, pr, lz, enum_logw + b * logw_stride + tk, eidx + tk,
+                                       num_enum, oc, own, vm, ENUM, LOGW, True)
                 else:
-                    mass = _entry_mass(masses, x, oc, tokmaj, masses, masses, enum_logw, tok, num_rows, oc, own, vm,
+                    mass = _entry_mass(masses, x, oc, eprobs, masses, masses, enum_logw, eidx, num_enum, oc, own, vm,
                                        ENUM, LOGW, True)
                 ov = tl.load(op + sl[None, :], mask = vm, other = float("-inf"))
                 mx, acc = _lse_step_one_exp(mx, acc, mass + ov)
@@ -354,7 +355,7 @@ def _block_input_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
                                 mass_row, mass_stride, trans, trans_stride, entry_ptr, entry_succ, entry_x, width,
                                 iv_of, iv_info, iv_table, once_iv, live, lanes, lane_first, lane_live, coff, ccount,
                                 cstart, ccolumns, crank, children, tiles, ptr, parents, reg_offset, reg_width,
-                                reg_first, code, tok_ptr, tok, tokmaj, prow, lognorm, enum_logw, Cs, num_rows,
+                                reg_first, code, tok_ptr, eidx, eprobs, prow, lognorm, enum_logw, Cs, num_enum,
                                 logw_stride, out_first, out_width, temp_width, B, n, W, C, input_start, csteps, pid0,
                                 C_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, GROUPED: tl.constexpr,
                                 PRUNE: tl.constexpr, ORDERED: tl.constexpr, COMPACT: tl.constexpr,
@@ -462,8 +463,8 @@ def _block_input_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
                         mass = tl.load(masses + x[None, :], mask = vm, other = float("-inf"))
                     elif ENUM:                                               # (no lane here observes a token)
                         tk = tl.load(tok_ptr + t)                            # (`t0`: the block's start)
-                        mass = _entry_mass(masses, x, x, tokmaj, pr, lz, enum_logw + b * logw_stride + tk, tok + tk,
-                                           num_rows, x, ov, vm, ENUM, LOGW, False)
+                        mass = _entry_mass(masses, x, x, eprobs, pr, lz, enum_logw + b * logw_stride + tk, eidx + tk,
+                                           num_enum, x, ov, vm, ENUM, LOGW, False)
                     else:
                         mass = tl.load(masses + x[None, :], mask = vm, other = float("-inf"))
                     mx, acc = _lse_step_one_exp(mx, acc, mass + ov)
@@ -969,8 +970,8 @@ def _input_block_cuda(la: TopDownLaunch, tiles: torch.Tensor, height: int, prog,
                   ws[nterms:nterms + T * B * W], ws[nterms + T * B * W:nterms + 2 * T * B * W], done,
                   common["out_first"], common["out_width"], common["temp_width"], B, n, W, C, prog.input_start,
                   height // tn, tn, threads, warps, not warps, lp, cq, sample, c_kind, out_temp, c_full, out_full,
-                  ea["code"], ea["tok_ptr"], ea["tok"], ea["tokmaj"], ea["prow"], ea["lognorm"], ea["enum_logw"],
-                  ea["Cs"], mw, ea["num_rows"], ea["logw_stride"], ea["LOGW"])
+                  ea["code"], ea["tok_ptr"], ea["eidx"], ea["eprobs"], ea["prow"], ea["lognorm"], ea["enum_logw"],
+                  ea["Cs"], mw, ea["num_enum"], ea["logw_stride"], ea["LOGW"])
     return dict(tn = tn, threads = threads, warps = warps, smem = team(tn) * (8 if warps else 1))
 
 

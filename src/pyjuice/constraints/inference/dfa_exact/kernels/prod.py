@@ -217,7 +217,7 @@ def _list_range(entry_ptr, succ_start, succ_count, b, t, i, miss, n, W, E):
 
 @triton.jit
 def _ib_term(mx, acc, ee, pm, entry_succ, entry_x, rp, iv_table, rpos, j, X, r_own, crank, b, t, rbase, ce, n, W,
-             masses, tokmaj, tk, pr, lz, enum_logw, tok, num_rows, logw_stride, R_KIND: tl.constexpr,
+             masses, eprobs, tk, pr, lz, enum_logw, eidx, num_enum, logw_stride, R_KIND: tl.constexpr,
              R_FULL: tl.constexpr, COMPACT: tl.constexpr, GROUPED: tl.constexpr, ENUM: tl.constexpr,
              LOGW: tl.constexpr):
     """:func:`_input_block_kernel`'s term of entry ``ee`` (lanes ``pm``): its successor's block value plus its mass
@@ -231,13 +231,13 @@ def _ib_term(mx, acc, ee, pm, entry_succ, entry_x, rp, iv_table, rpos, j, X, r_o
     if GROUPED:
         mass = tl.load(masses + x, mask = pm, other = float("-inf"))
     else:
-        mass = _lane_mass(masses, x, pm, tokmaj, tk, pr, lz, enum_logw, tok, b, num_rows, logw_stride, ENUM, LOGW)
+        mass = _lane_mass(masses, x, pm, eprobs, tk, pr, lz, enum_logw, eidx, b, num_enum, logw_stride, ENUM, LOGW)
     return _lse_step(mx, acc, mass + rv)
 
 
 @triton.jit
 def _ibg_term(mx, acc, ee, pm, gm, entry_succ, entry_x, rp, iv_table, rpos, j, X, own, crank, b, t, rbase, ce, n, W,
-              masses, tokmaj, tk, pr, lz, enum_logw, tok, num_rows, logw_stride, R_FULL: tl.constexpr,
+              masses, eprobs, tk, pr, lz, enum_logw, eidx, num_enum, logw_stride, R_FULL: tl.constexpr,
               COMPACT: tl.constexpr, ENUM: tl.constexpr, LOGW: tl.constexpr, ONE_EXP: tl.constexpr):
     """:func:`_input_block_group_kernel`'s term of entry ``ee`` (lanes ``pm``) for the ``[G, TILE]`` lanes (``gm`` the
     group's steps): the successor's slot once, the steps' block values and masses (:func:`_group_mass`)."""
@@ -245,27 +245,27 @@ def _ibg_term(mx, acc, ee, pm, gm, entry_succ, entry_x, rp, iv_table, rpos, j, X
     x = tl.load(entry_x + ee, mask = pm, other = 0)
     sl = _operand_slot(iv_table, rpos, q, j, X, pm, own, crank, b, t + 1, q, rbase, ce, n, W, R_FULL, COMPACT)
     rv = tl.load(rp + sl[None, :], mask = gm[:, None] & (pm & (sl >= 0))[None, :], other = float("-inf"))
-    mass = _group_mass(masses, x, gm[:, None] & pm[None, :], tk, pr, lz, tok, tokmaj, enum_logw, b, logw_stride,
-                       num_rows, ENUM, LOGW)
+    mass = _group_mass(masses, x, gm[:, None] & pm[None, :], tk, pr, lz, eidx, eprobs, enum_logw, b, logw_stride,
+                       num_enum, ENUM, LOGW)
     if ONE_EXP:
         return _lse_step_one_exp(mx, acc, mass + rv)
     return _lse_step(mx, acc, mass + rv)
 
 
 @triton.jit
-def _lane_mass(masses, x, pm, tokmaj, tk, pr, lz, enum_logw, tok, b, num_rows, logw_stride, ENUM: tl.constexpr,
+def _lane_mass(masses, x, pm, eprobs, tk, pr, lz, enum_logw, eidx, b, num_enum, logw_stride, ENUM: tl.constexpr,
                LOGW: tl.constexpr):
     """The mass of class code ``x`` ([lanes]) at the lanes' rows of the class masses: ``masses`` the rows' pointers
     (``class_mars + mrow * Cs``), a stored class's column read there, an enumerated class's (``ENUM``, code ``-1 -
-    e``: the e-th enumerated token of the boundary, from ``tk``) its token's probability ``tokmaj[token, pr]``,
+    e``: the e-th enumerated token of the boundary, from ``tk``) its token's probability ``eprobs[pr, eidx[tk + e]]``,
     ``LOGW``: times its weight for the lane's sample ``b`` over the row's ``Z`` (``lz`` its log) -- ``tk``, ``pr`` and
     ``lz`` from :func:`_lane_rows`; -inf where ``pm`` is off."""
     if ENUM:
         enum = x < 0
         stored = tl.load(masses + tl.maximum(x, 0), mask = pm & ~enum, other = float("-inf"))
         e = tl.maximum(-1 - x, 0).to(tl.int64)                                  # (a stored entry: token 0, unread)
-        v = tl.load(tok + tk + e).to(tl.int64)
-        val = tl.log(tl.load(tokmaj + v * num_rows + pr, mask = pm & enum, other = 0.0))
+        g = tl.load(eidx + tk + e).to(tl.int64)                              # (its column of the table)
+        val = tl.log(tl.load(eprobs + pr * num_enum + g, mask = pm & enum, other = 0.0))
         if LOGW:
             val = val + tl.load(enum_logw + b * logw_stride + tk + e) - lz
         return tl.where(enum, val, stored)
@@ -273,7 +273,7 @@ def _lane_mass(masses, x, pm, tokmaj, tk, pr, lz, enum_logw, tok, b, num_rows, l
 
 
 @triton.jit
-def _group_mass(masses, x, lm, tk, pr, lz, tok, tokmaj, enum_logw, b, logw_stride, num_rows, ENUM: tl.constexpr,
+def _group_mass(masses, x, lm, tk, pr, lz, eidx, eprobs, enum_logw, b, logw_stride, num_enum, ENUM: tl.constexpr,
                 LOGW: tl.constexpr):
     """:func:`_lane_mass` for a group of steps: [G, TILE], the mass of class code ``x`` ([TILE]) at the lanes' rows
     (``masses`` [G, TILE] pointers), ``lm`` [G, TILE] the lanes on; ``ENUM``: ``tk`` the boundary's first enumerated
@@ -282,8 +282,8 @@ def _group_mass(masses, x, lm, tk, pr, lz, tok, tokmaj, enum_logw, b, logw_strid
         enum = (x < 0)[None, :]
         stored = tl.load(masses + tl.maximum(x, 0)[None, :], mask = lm & ~enum, other = float("-inf"))
         e = tl.maximum(-1 - x, 0).to(tl.int64)
-        v = tl.load(tok + tk + e).to(tl.int64)
-        ev = tl.log(tl.load(tokmaj + v[None, :] * num_rows + pr, mask = lm & enum, other = 0.0))
+        g = tl.load(eidx + tk + e).to(tl.int64)
+        ev = tl.log(tl.load(eprobs + pr * num_enum + g[None, :], mask = lm & enum, other = 0.0))
         if LOGW:
             ev = ev + tl.load(enum_logw + b * logw_stride + tk + e)[None, :] - lz
         return tl.where(enum, ev, stored)
@@ -303,8 +303,8 @@ def _block_value(rp, iv_table, rpos, q, j, X, pm, r_own, crank, b, t, rbase, ce,
 def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, class_mars, mass_row, mass_stride, trans,
                         trans_stride, entry_ptr, entry_succ, entry_x, width, iv_of, iv_info, iv_table, live, coff,
                         ccount, cstart, ccolumns, crank, steps, sel, reg_offset, reg_width, reg_first, prior_mars,
-                        prior_offset, prior_width, reg_prior, code, tok_ptr, tok, tokmaj, prow, lognorm, enum_logw, Cs,
-                        num_rows, logw_stride, out_first, out_width, temp_width, B, n, W, C, input_start, csteps, pid0,
+                        prior_offset, prior_width, reg_prior, code, tok_ptr, eidx, eprobs, prow, lognorm, enum_logw, Cs,
+                        num_enum, logw_stride, out_first, out_width, temp_width, B, n, W, C, input_start, csteps, pid0,
                         succ_start, succ_count, succ_use, succ_entries, E, R_KIND: tl.constexpr,
                         OUT_TEMP: tl.constexpr, GROUPED: tl.constexpr, PRUNE: tl.constexpr, OUT_FULL: tl.constexpr,
                         R_FULL: tl.constexpr, COMPACT: tl.constexpr, INDEXED: tl.constexpr, SAMPLE: tl.constexpr,
@@ -393,16 +393,16 @@ def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
                         pm = miss & (l0 + kk < l1)
                         ee = tl.load(succ_entries + l0 + kk, mask = pm, other = 0)
                         mx, acc = _ib_term(mx, acc, ee, pm, entry_succ, entry_x, rp, iv_table, rpos, j, X, r_own,
-                                           crank, b, t, rbase, ce, n, W, masses, tokmaj, tk, pr, lz, enum_logw, tok,
-                                           num_rows, logw_stride, R_KIND, R_FULL, COMPACT, GROUPED, ENUM, LOGW)
+                                           crank, b, t, rbase, ce, n, W, masses, eprobs, tk, pr, lz, enum_logw, eidx,
+                                           num_enum, logw_stride, R_KIND, R_FULL, COMPACT, GROUPED, ENUM, LOGW)
                 else:                                                        # (or the entry tables)
                     p0 = tl.load(entry_ptr + t * (W + 1) + i, mask = miss, other = 0)   # transition mass or a class
                     p1 = tl.load(entry_ptr + t * (W + 1) + i + 1, mask = miss, other = 0)   # code
                     for k in range(0, tl.max(p1 - p0, axis = 0)):
                         pm = miss & (p0 + k < p1)
                         mx, acc = _ib_term(mx, acc, p0 + k, pm, entry_succ, entry_x, rp, iv_table, rpos, j, X, r_own,
-                                           crank, b, t, rbase, ce, n, W, masses, tokmaj, tk, pr, lz, enum_logw, tok,
-                                           num_rows, logw_stride, R_KIND, R_FULL, COMPACT, GROUPED, ENUM, LOGW)
+                                           crank, b, t, rbase, ce, n, W, masses, eprobs, tk, pr, lz, enum_logw, eidx,
+                                           num_enum, logw_stride, R_KIND, R_FULL, COMPACT, GROUPED, ENUM, LOGW)
             else:                                                            # every class in class order, the dead
                 for c in range(C):                                           # ones -inf (no entry tables read)
                     q = tl.load(next_col + (t * W + i) * C + c, mask = miss, other = -1)
@@ -417,8 +417,8 @@ def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
                         x = tl.load(code + t * C + c + i * 0)                # the class's code at the boundary
                     else:
                         x = c + i * 0
-                    mass = _lane_mass(masses, x, pm, tokmaj, tk, pr, lz, enum_logw, tok, b, num_rows, logw_stride, ENUM,
-                                      LOGW)
+                    mass = _lane_mass(masses, x, pm, eprobs, tk, pr, lz, enum_logw, eidx, b, num_enum, logw_stride,
+                                      ENUM, LOGW)
                     mx, acc = _lse_step(mx, acc, mass + rv)
             val = tl.where(oc >= 0, val, _lse_value(mx, acc))
         op = _out_ptr(out_row, element_mars, temp, out_first, out_width, temp_width, OUT_TEMP)
@@ -429,8 +429,8 @@ def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
 def _input_block_group_kernel(element_mars, node_mars, temp, obs_class, next_col, class_mars, mass_row, mass_stride,
                               entry_ptr, entry_succ, entry_x, width, iv_of, iv_info, iv_table, live, coff, ccount,
                               cstart, ccolumns, crank, steps, groups, sel, reg_offset, reg_width, reg_first,
-                              prior_mars, prior_offset, prior_width, reg_prior, code, tok_ptr, tok, tokmaj, prow,
-                              lognorm, enum_logw, Cs, num_rows, logw_stride, out_first, out_width, temp_width, B, n, W,
+                              prior_mars, prior_offset, prior_width, reg_prior, code, tok_ptr, eidx, eprobs, prow,
+                              lognorm, enum_logw, Cs, num_enum, logw_stride, out_first, out_width, temp_width, B, n, W,
                               C, input_start, csteps, pid0, succ_start, succ_count, succ_use, succ_entries, E,
                               R_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, PRUNE: tl.constexpr,
                               OUT_FULL: tl.constexpr, R_FULL: tl.constexpr, G: tl.constexpr, ONE_EXP: tl.constexpr,
@@ -522,16 +522,16 @@ def _input_block_group_kernel(element_mars, node_mars, temp, obs_class, next_col
                         pm = miss & (l0 + kk < l1)
                         ee = tl.load(succ_entries + l0 + kk, mask = pm, other = 0)
                         mx, acc = _ibg_term(mx, acc, ee, pm, gm, entry_succ, entry_x, rp, iv_table, rpos, j, X, own,
-                                            crank, b, t, rbase, ce, n, W, masses, tokmaj, tk, pr, lz, enum_logw, tok,
-                                            num_rows, logw_stride, R_FULL, COMPACT, ENUM, LOGW, ONE_EXP)
+                                            crank, b, t, rbase, ce, n, W, masses, eprobs, tk, pr, lz, enum_logw, eidx,
+                                            num_enum, logw_stride, R_FULL, COMPACT, ENUM, LOGW, ONE_EXP)
                 else:
                     p0 = tl.load(entry_ptr + t * (W + 1) + i, mask = miss, other = 0)
                     p1 = tl.load(entry_ptr + t * (W + 1) + i + 1, mask = miss, other = 0)
                     for k in range(0, tl.max(p1 - p0, axis = 0)):
                         pm = miss & (p0 + k < p1)
                         mx, acc = _ibg_term(mx, acc, p0 + k, pm, gm, entry_succ, entry_x, rp, iv_table, rpos, j, X, own,
-                                            crank, b, t, rbase, ce, n, W, masses, tokmaj, tk, pr, lz, enum_logw, tok,
-                                            num_rows, logw_stride, R_FULL, COMPACT, ENUM, LOGW, ONE_EXP)
+                                            crank, b, t, rbase, ce, n, W, masses, eprobs, tk, pr, lz, enum_logw, eidx,
+                                            num_enum, logw_stride, R_FULL, COMPACT, ENUM, LOGW, ONE_EXP)
             else:                                                            # every class in class order, the dead
                 for c in range(C):                                           # ones -inf (no entry tables read)
                     q = tl.load(next_col + (t * W + i) * C + c, mask = miss, other = -1)
@@ -545,8 +545,8 @@ def _input_block_group_kernel(element_mars, node_mars, temp, obs_class, next_col
                                        COMPACT)
                     rv = tl.load(rp + sl[None, :], mask = gm[:, None] & (pm & (sl >= 0))[None, :],
                                  other = float("-inf"))
-                    mass = _group_mass(masses, x, gm[:, None] & pm[None, :], tk, pr, lz, tok, tokmaj, enum_logw, b,
-                                       logw_stride, num_rows, ENUM, LOGW)
+                    mass = _group_mass(masses, x, gm[:, None] & pm[None, :], tk, pr, lz, eidx, eprobs, enum_logw, b,
+                                       logw_stride, num_enum, ENUM, LOGW)
                     if ONE_EXP:
                         mx, acc = _lse_step_one_exp(mx, acc, mass + rv)
                     else:
@@ -561,8 +561,8 @@ def _input_block_group_kernel(element_mars, node_mars, temp, obs_class, next_col
 def _block_input_kernel(element_mars, node_mars, temp, obs_class, next_col, class_mars, mass_row, mass_stride, trans,
                         trans_stride, pred_ptr, pred_col, pred_x, width, iv_of, iv_info, iv_table, live, coff, ccount,
                         cstart, ccolumns, crank, steps, sel, reg_offset, reg_width, reg_first, prior_mars,
-                        prior_offset, prior_width, reg_prior, code, tok_ptr, tok, tokmaj, prow, lognorm, enum_logw, Cs,
-                        num_rows, logw_stride, out_first, out_width, temp_width, B, n, W, C, input_start, csteps, pid0,
+                        prior_offset, prior_width, reg_prior, code, tok_ptr, eidx, eprobs, prow, lognorm, enum_logw, Cs,
+                        num_enum, logw_stride, out_first, out_width, temp_width, B, n, W, C, input_start, csteps, pid0,
                         L_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, GROUPED: tl.constexpr, PRUNE: tl.constexpr,
                         OUT_FULL: tl.constexpr, L_FULL: tl.constexpr, COMPACT: tl.constexpr, INDEXED: tl.constexpr,
                         SAMPLE: tl.constexpr, ENUM: tl.constexpr, LOGW: tl.constexpr, TILE: tl.constexpr):
@@ -627,7 +627,7 @@ def _block_input_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
                 mass = tl.load(masses + x, mask = em & (oc < 0), other = float("-inf"))
             else:                                                            # is it this entry's class?
                 holds = x == code_oc
-                mass = _lane_mass(masses, x, em & (oc < 0), tokmaj, tk, pr, lz, enum_logw, tok, b, num_rows,
+                mass = _lane_mass(masses, x, em & (oc < 0), eprobs, tk, pr, lz, enum_logw, eidx, b, num_enum,
                                   logw_stride, ENUM, LOGW)
             mass = tl.where(oc >= 0, tl.where(holds, own, float("-inf")), mass)
             sl = _operand_slot(iv_table, lpos, i, q, M, em, l_own, crank, b, t, q, lbase, 1, n, W, L_FULL, COMPACT)

@@ -221,9 +221,9 @@ struct IbArgs {
     const int* pred_col;
     const int* pred_x;     // every entry's class code
     const int* code;       // [n, C]: every class's code at every boundary
-    const int* tok_ptr;    // [n + 1]: the enumerated tokens live at boundary t are tok[tok_ptr[t] .. tok_ptr[t + 1]]
-    const int* tok;
-    const float* tokmaj;   // [V, num_rows]: every token's probability under every parameter row
+    const int* tok_ptr;    // [n + 1]: the enumerated tokens live at boundary t are tok_ptr[t] .. tok_ptr[t + 1]
+    const int* eidx;       // ... their columns of eprobs
+    const float* eprobs;   // [parameter rows, num_enum]: every enumerated token's probability under every row
     const int* prow;       // [rows of class_mars]: every row's parameter row
     const float* lognorm;  // [rows of class_mars]: every row's log Z (per-sample masses)
     const float* enum_logw;   // [B or 1, enumerated tokens + 1]: every enumerated token's log weight per sample
@@ -248,7 +248,7 @@ struct IbArgs {
     const int* perm;
     long long out_first, out_width, temp_width;
     long long team_floats;   // a team's shared memory (floats, a multiple of 4)
-    int B, n, W, C, Cs, mw, num_rows, logw_stride, input_start, subs, tn, lp_ld, xb;   // mw: staged masses a child
+    int B, n, W, C, Cs, mw, num_enum, logw_stride, input_start, subs, tn, lp_ld, xb;   // mw: staged masses a child
     int sample, logw, c_kind, out_temp, c_full, out_full;
 };
 
@@ -356,7 +356,7 @@ __global__ void __launch_bounds__(256) ibtd_kernel(IbArgs a) {
                         v = a.class_mars[mrow[k] * Cs + x];
                     } else if (x - Cs < ecount) {                        // (`_entry_mass`'s arithmetic, in its order)
                         const int ei = x - Cs;
-                        v = tri_log(a.tokmaj[(long long)a.tok[tk + ei] * a.num_rows + a.prow[mrow[k]]]);
+                        v = tri_log(a.eprobs[(long long)a.prow[mrow[k]] * a.num_enum + a.eidx[tk + ei]]);
                         if (a.logw) v = v + a.enum_logw[(long long)b * a.logw_stride + tk + ei] - a.lognorm[mrow[k]];
                     }
                 }
@@ -511,12 +511,12 @@ void ibtd_cuda(torch::Tensor element_flows, torch::Tensor temp_flows, torch::Ten
                int64_t out_width, int64_t temp_width, int64_t B, int64_t n, int64_t W, int64_t C,
                int64_t input_start, int64_t subs, int64_t tn, int64_t threads, bool warps, bool sort,
                int64_t lp_ld, int64_t cq_max, bool sample, int64_t c_kind, bool out_temp, bool c_full,
-               bool out_full, torch::Tensor code, torch::Tensor tok_ptr, torch::Tensor tok, torch::Tensor tokmaj,
+               bool out_full, torch::Tensor code, torch::Tensor tok_ptr, torch::Tensor eidx, torch::Tensor eprobs,
                torch::Tensor prow, torch::Tensor lognorm, torch::Tensor enum_logw, int64_t Cs, int64_t mw,
-               int64_t num_rows, int64_t logw_stride, bool logw) {
+               int64_t num_enum, int64_t logw_stride, bool logw) {
     TORCH_CHECK(node_flows.scalar_type() == torch::kFloat32 && element_flows.scalar_type() == torch::kFloat32 &&
                 temp_flows.scalar_type() == torch::kFloat32 && node_mars.scalar_type() == torch::kFloat32 &&
-                class_mars.scalar_type() == torch::kFloat32 && tokmaj.scalar_type() == torch::kFloat32 &&
+                class_mars.scalar_type() == torch::kFloat32 && eprobs.scalar_type() == torch::kFloat32 &&
                 lognorm.scalar_type() == torch::kFloat32 && enum_logw.scalar_type() == torch::kFloat32,
                 "ibtd_cuda: fp32 values");
     TORCH_CHECK(tn >= 1 && tn <= WTILE && subs * tn <= WTILE && (tn < 4 || tn % 4 == 0),
@@ -553,8 +553,8 @@ void ibtd_cuda(torch::Tensor element_flows, torch::Tensor temp_flows, torch::Ten
     a.pred_x = i32(pred_x, "pred_x");
     a.code = i32(code, "code");
     a.tok_ptr = i32(tok_ptr, "tok_ptr");
-    a.tok = i32(tok, "tok");
-    a.tokmaj = tokmaj.data_ptr<float>();
+    a.eidx = i32(eidx, "eidx");
+    a.eprobs = eprobs.data_ptr<float>();
     a.prow = i32(prow, "prow");
     a.lognorm = lognorm.data_ptr<float>();
     a.enum_logw = enum_logw.data_ptr<float>();
@@ -588,7 +588,7 @@ void ibtd_cuda(torch::Tensor element_flows, torch::Tensor temp_flows, torch::Ten
     a.C = (int)C;
     a.Cs = (int)Cs;
     a.mw = (int)mw;
-    a.num_rows = (int)num_rows;
+    a.num_enum = (int)num_enum;
     a.logw_stride = (int)logw_stride;
     a.input_start = (int)input_start;
     a.subs = (int)subs;

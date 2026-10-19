@@ -152,6 +152,9 @@ def test_the_codes_of_every_class_at_every_boundary(build_pc, monkeypatch):
     en, nc, W = prog.enum, cc.backend.layout.next_col, cc.backend.layout.width.tolist()
     ptr, tok, code = en.ptr_host, en.tok.cpu().tolist(), en.code.cpu()
     assert en.num == ptr[-1] and len(tok) == en.num + 1 and tok[-1] == 0
+    index = en.index.cpu().tolist()                                          # every token's column of enum_probs
+    assert len(index) == en.num + 1 and index[-1] == 0
+    assert [int(classes.enumerated_tokens[g]) for g in index[:-1]] == tok[:-1]
     dead = int(classes.token_class[0])
     assert classes.enumerated_token[dead] == 0
     for t in range(n):
@@ -173,6 +176,34 @@ def test_the_codes_of_every_class_at_every_boundary(build_pc, monkeypatch):
         count = ptr[t + 1] - ptr[t]
         codes = ex[int(eptr[t, 0]):int(eptr[t, W[t]])]
         assert ((codes >= 0) & (codes < classes.num_stored) | (codes < 0) & (codes >= -count)).all(), t
+
+
+def test_the_enumerated_probs_and_their_lifetime(build_pc):
+    """The enumerated tokens' probabilities by parameter row are the token-major table's columns of the enumerated
+    tokens, bit for bit, contiguous; inside fast_inference built by the first query and kept (the token-major table
+    itself not), dropped when the scope exits; outside, nothing kept and a change of the parameters read."""
+    n = KINDS["hmm_untied"]
+    pc = build_pc("hmm_untied", n, V)
+    cc = jc.compile(singleton_automaton(), pc)
+    state, classes = cc.backend.state, cc.backend.token_classes
+    assert classes.num_enumerated > 0
+    want = state.token_major()[classes.enumerated_tokens.long()].t()
+    data, missing, _ = evidence(n, 2, "none")
+    with juice.fast_inference():
+        a = cc.conditional(data, missing, precision = "fp32")
+        kept = state._enum_probs
+        assert kept is not None and kept.is_contiguous() and torch.equal(kept, want)
+        assert kept.shape == (state.class_mass_rows()[1], classes.num_enumerated)
+        b = cc.conditional(data, missing, precision = "fp32")
+        assert state._enum_probs is kept and torch.equal(a, b)
+    assert state._enum_probs is None
+    with torch.no_grad():
+        layer = pc.input_layer_group[0]
+        table = layer.params.view(-1, V)
+        table[:] = torch.rand_like(table) + 0.1
+        table /= table.sum(dim = 1, keepdim = True)
+    assert torch.equal(state.enumerated_probs(), state.token_major()[classes.enumerated_tokens.long()].t())
+    assert state._enum_probs is None and not torch.equal(state.enumerated_probs(), want)
 
 
 # -------------------------------------------------------------------------------------------------
@@ -328,6 +359,35 @@ def test_a_sessions_support_follows_its_candidates(build_pc, monkeypatch):
     want = torch.zeros(B, n, C + 1, dtype = torch.bool, device = DEV)     # (an unweighed candidate: a spare column)
     want.scatter_(2, torch.where(weighed, cls, C), True)
     assert len(supports) == 1 and torch.equal(supports[0], want[:, :, :C])
+
+
+def test_the_support_rules_out_a_token_no_node_gives_probability(build_pc, monkeypatch):
+    """Dense evidence weighing every token: a session's liveness support rules an enumerated class out at every
+    position when no input node gives its token any probability -- read at the token's own column of the enumerated
+    tokens' probabilities -- and keeps the others."""
+    monkeypatch.setattr(P, "GROUP_MIN_RATIO", 0)
+    n, B = 6, 3
+    pc = build_pc("hmm", n, V, input_dist = dists.SoftEvidenceCategorical)
+    with torch.no_grad():
+        for layer in pc.input_layer_group:
+            table = layer.params.view(-1, V)
+            table[:, 3] = 0.0
+            table /= table.sum(dim = 1, keepdim = True)
+    cc = jc.compile(singleton_automaton(), pc)
+    classes = cc.backend.token_classes
+    c3, c4 = int(classes.token_class[3]), int(classes.token_class[4])
+    assert int(classes.enumerated_token[c3]) == 3 and int(classes.enumerated_token[c4]) == 4
+    data, missing, _ = evidence(n, B, "none")
+    inputs = dict(categorical_evidence_logp = torch.randn(B, n, V, device = DEV))
+    supports = []
+    real = live.class_support
+    monkeypatch.setattr(live, "class_support", lambda *a: (lambda c: supports.append(c) or c)(real(*a)))
+    with cc.decoder(**inputs) as decoder:
+        decoder.marginal(data, missing)
+    en = cc.backend.program().enum
+    assert 3 in en.tok.tolist() and 4 in en.tok.tolist()                   # (both live at some boundary)
+    assert len(supports) == 1 and supports[0] is not None
+    assert not supports[0][:, :, c3].any() and supports[0][:, :, c4].any()
 
 
 # -------------------------------------------------------------------------------------------------
