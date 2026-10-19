@@ -328,7 +328,9 @@ __global__ void __launch_bounds__(256) ibtd_kernel(IbArgs a) {
     float* O = sm + (long long)team * a.team_floats;                     // [lp_ld][TN]: the parents' lanes
     float* M = O + (long long)a.lp_ld * TN;                               // [MW][TN]: their masses, by code index
     float* own = M + (long long)MW * TN;                                  // [TN]: an observed token's log-prob
-    unsigned* used = reinterpret_cast<unsigned*>(own + TN);               // [(MW + 31) / 32]: the codes the terms read
+    const int NW = (MW + 31) / 32;
+    unsigned* used = reinterpret_cast<unsigned*>(own + TN);               // [NW]: the codes the terms read
+    int* wpre = reinterpret_cast<int*>(used + NW);                        // [NW + 1]: the marked codes before a word
     long long* op_ = s_op[team];
     long long* mrow = s_mrow[team];
     const int tk = a.tok_ptr[t], ecount = a.tok_ptr[t + 1] - tk;          // the boundary's enumerated tokens
@@ -352,7 +354,7 @@ __global__ void __launch_bounds__(256) ibtd_kernel(IbArgs a) {
         const int total = s_terms[team];
         sparse = total < MW;
         if (sparse) {
-            for (int w = tid; w < (MW + 31) / 32; w += nt) used[w] = 0u;
+            for (int w = tid; w < NW; w += nt) used[w] = 0u;
             sync();
             const int xmask = (1 << a.xb) - 1;
             for (int e = tid; e < total; e += nt) {                        // (live column, term), flattened
@@ -362,8 +364,39 @@ __global__ void __launch_bounds__(256) ibtd_kernel(IbArgs a) {
                 atomicOr(used + (x >> 5), 1u << (x & 31));
             }
             sync();
+            if (tid < 32) {                                               // the words' prefix of marked codes (a warp)
+                int run = 0;
+                for (int w0 = 0; w0 < NW; w0 += 32) {
+                    const int w = w0 + tid, c = w < NW ? __popc(used[w]) : 0;
+                    int incl = c;
+#pragma unroll
+                    for (int off = 1; off < 32; off <<= 1) {
+                        const int y = __shfl_up_sync(0xffffffffu, incl, off);
+                        if (tid >= off) incl += y;
+                    }
+                    if (w < NW) wpre[w] = run + incl - c;
+                    run += __shfl_sync(0xffffffffu, incl, 31);
+                }
+                if (tid == 0) wpre[NW] = run;
+            }
+            sync();
         }
     }
+
+    // code x's mass for child k at the staged parent (`_entry_mass`'s arithmetic, in its order)
+    auto mass_of = [&](int k, int x) -> float {
+        float v = -CUDART_INF_F;
+        if (s_c[k] >= 0) {
+            if (x < Cs) {
+                v = a.class_mars[mrow[k] * Cs + x];
+            } else if (x - Cs < ecount) {
+                const int ei = x - Cs;
+                v = tri_log(a.eprobs[(long long)a.prow[mrow[k]] * a.num_enum + a.eidx[tk + ei]]);
+                if (a.logw) v = v + a.enum_logw[(long long)b * a.logw_stride + tk + ei] - a.lognorm[mrow[k]];
+            }
+        }
+        return v;
+    };
 
     // the children's parents r: their rows, masses and lanes of the sample in shared memory (-inf for no child)
     auto stage = [&](int r) {
@@ -385,21 +418,24 @@ __global__ void __launch_bounds__(256) ibtd_kernel(IbArgs a) {
                 const int k = e / lp, l = e - k * lp;
                 O[(long long)l * TN + k] = s_c[k] >= 0 ? src[op_[k] + base_p + l] : -CUDART_INF_F;
             }
-        if (oc < 0)
+        if (oc < 0 && sparse) {                                          // the marked codes alone, the i-th of
+            const int nu = wpre[NW];                                      // them by its word's prefix and its bit
+            for (int e = tid; e < TN * nu; e += nt) {
+                const int k = e / nu, i = e - k * nu;
+                int lo = 0, hi = NW;                                      // wpre[lo] <= i < wpre[hi]
+                while (hi - lo > 1) {
+                    const int mid = (lo + hi) >> 1;
+                    if (wpre[mid] <= i) lo = mid; else hi = mid;
+                }
+                unsigned m = used[lo];
+                for (int c = i - wpre[lo]; c > 0; --c) m &= m - 1u;
+                const int x = lo * 32 + __ffs(m) - 1;
+                M[x * TN + k] = mass_of(k, x);
+            }
+        } else if (oc < 0)
             for (int e = tid; e < TN * MW; e += nt) {                    // stored columns, then enumerated tokens
                 const int k = e / MW, x = e - k * MW;
-                if (sparse && !((used[x >> 5] >> (x & 31)) & 1u)) continue;   // (no term reads it)
-                float v = -CUDART_INF_F;
-                if (s_c[k] >= 0) {
-                    if (x < Cs) {
-                        v = a.class_mars[mrow[k] * Cs + x];
-                    } else if (x - Cs < ecount) {                        // (`_entry_mass`'s arithmetic, in its order)
-                        const int ei = x - Cs;
-                        v = tri_log(a.eprobs[(long long)a.prow[mrow[k]] * a.num_enum + a.eidx[tk + ei]]);
-                        if (a.logw) v = v + a.enum_logw[(long long)b * a.logw_stride + tk + ei] - a.lognorm[mrow[k]];
-                    }
-                }
-                M[x * TN + k] = v;
+                M[x * TN + k] = mass_of(k, x);
             }
         sync();
     };
@@ -503,10 +539,10 @@ __global__ void __launch_bounds__(256) ibtd_kernel(IbArgs a) {
 }  // namespace
 
 // Shared memory of a CTA of `tn` children: their parents' lanes (`lp_ld` each), masses (`mw`: the stored columns and a
-// boundary's most enumerated tokens), observed log-probabilities, a bit per code read
+// boundary's most enumerated tokens), observed log-probabilities, a bit per code read and the words' prefix of them
 // (`prod_top_down._input_block_cuda` sizes the CTAs by the same rule)
 static int64_t ibtd_smem(int64_t tn, int64_t lp_ld, int64_t mw) {
-    return (4 * tn * (lp_ld + mw + 1) + 4 * ((mw + 31) / 32) + 15) / 16 * 16;
+    return (4 * tn * (lp_ld + mw + 1) + 4 * (2 * ((mw + 31) / 32) + 1) + 15) / 16 * 16;
 }
 
 // The most dynamic shared memory a CTA of `ibtd_kernel<G, WARPS>` may take (the device's opt-in less the kernel's
