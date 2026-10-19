@@ -25,7 +25,7 @@ from ..kernels.common import pack_aligned
 from ..kernels.compact import (STORAGES, compact_buffers, held_elsewhere, held_moves, query_layout, regather_into,
                                resolve_storage, worth_parking)
 from ..kernels.live import live_successors, liveness
-from ..kernels.score import score_group, score_tables
+from ..kernels.score import class_weight_rows, score_group, score_tables
 from ..kernels.transitions import enumerated_args
 from .backend.plans import (PLANS_PER_POSITION, PLAN_CACHE_SIZE, per_sample_intervals, prior_regions, query_plan,
                     read_regions, scope_intervals, top_down_prior)
@@ -55,31 +55,36 @@ def _masks(missing_mask: Optional[torch.Tensor], targets: Optional[torch.Tensor]
 
 
 def _layout(backend, positions: np.ndarray, B: int):
-    """Where the class weights of a query with the target ``positions`` go in ``dfa_class_flow``: every position's
-    block ``[B, classes, rows of its row group]``, a row group's consecutive: ``(groups, base, K, size)`` -- per row group
-    with a target position ``(group, its target positions, start)``, and per position its block's start (-1: no
-    target) and its row group's rows (int64 [n], host). Kept on the Program, by its arguments."""
+    """The target columns of a query with the target ``positions``, whose class weights it keeps (their live rows, see
+    :class:`~..kernels.score.ClassWeightRows`): every target position's ``B`` samples, a row group's positions
+    consecutive -- ``(groups, col, K, blocks)``: per row group with a target position ``(group, its target positions,
+    its first column)``; per position its first column (-1: no target) and its row group's rows (int64 [n] each); and
+    ``blocks``, ``(col_pos, col_K, col_first, group_first)``: every block of ``B`` columns' position, every column's
+    row group's rows and first column, and every row group's first column, then the columns' count (int64). On the
+    host; kept on the Program, by its arguments."""
     prog = backend.program()
     key = (positions.tobytes(), B)
     if key in prog.layouts:
         prog.layouts.move_to_end(key)
         return prog.layouts[key]
-    score, n, C = score_tables(prog), backend.n, backend.num_classes
+    score, n = score_tables(prog), backend.n
     union = np.nonzero(positions)[0]
     assert (score.group_of[union] >= 0).all(), "a target position without an input node in any product"
-    base, K = np.full(n, -1, dtype = np.int64), np.zeros(n, dtype = np.int64)
-    groups, size = [], 0
+    col, K = np.full(n, -1, dtype = np.int64), np.zeros(n, dtype = np.int64)
+    groups, first = [], 0
     for g in np.unique(score.group_of[union]).tolist():
         pos = union[score.group_of[union] == g]
-        k = len(score.rows[g])
-        K[pos] = k
-        base[pos] = size + np.arange(len(pos)) * B * C * k
-        groups.append((g, pos, size))
-        size += len(pos) * B * C * k
-    prog.layouts[key] = (groups, base, K, size)
+        K[pos] = len(score.rows[g])
+        col[pos] = first + np.arange(len(pos)) * B
+        groups.append((g, pos, first))
+        first += len(pos) * B
+    col_pos = np.concatenate([pos for _, pos, _ in groups]).astype(np.int64)
+    group_first = np.array([f for _, _, f in groups] + [first], dtype = np.int64)
+    col_first = np.repeat(group_first[:-1], [len(pos) * B for _, pos, _ in groups])
+    prog.layouts[key] = layout = (groups, col, K, (col_pos, np.repeat(K[col_pos], B), col_first, group_first))
     if len(prog.layouts) > max(PLAN_CACHE_SIZE, PLANS_PER_POSITION * n):   # bounded as the plans are
         prog.layouts.popitem(last = False)
-    return groups, base, K, size
+    return layout
 
 
 def _sample_columns(masses, score, g: int, pos: np.ndarray, B: int, prog) -> Optional[tuple]:
@@ -150,7 +155,7 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     """
     The forward and top-down passes of a conditional query: the log class weights of every input node over the
     target ``positions`` (bool [n], host), every sample's, summed per row of the class masses (see
-    :mod:`.score`), in ``dfa_class_flow``.
+    :mod:`.score`), in ``dfa_class_flow``: the live rows alone (:class:`~..kernels.score.ClassWeightRows`).
 
     :param missing: [B, n] bool on the device, True where a token is missing
     :param held: see :func:`conditional`
@@ -160,9 +165,9 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
         :class:`~..kernels.compact.CompactLayout` (``"compact"``; None when dense), the storage it used (``"storage"``,
         "dense" or "compact"), whether it computed again the values held in the other one (``"dropped"``) and the
         storages holding the held values it did not read (``"parked"``, see :func:`~..kernels.compact.compact_buffers`)
-    :param layout: None, or ``(groups, size, (base, K))``: :func:`_layout`'s groups and size, and its ``base`` and
-        ``K`` already on the device (int64 [n] each) -- copied before the query launches anything, as copies from the
-        host wait for the stream
+    :param layout: None, or ``(groups, (col, K, col_pos, col_K, col_first, group_first))``: :func:`_layout`'s groups,
+        and its arrays already on the device -- copied before the query launches anything, as copies from the host
+        wait for the stream
     :param storage: see :func:`conditional`
     :param carry: see :func:`conditional`
     :param external: see :func:`conditional`
@@ -171,16 +176,17 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     :param evidence: None, or ``(x, obs_class)`` on the device if already built: the tokens (int64 [B, n], 0 where
         missing) and their classes (int32 [B, n], -1 where missing)
     :returns: ``(groups, masses)``: per row group with a target position, ``(group, its target positions (host),
-        weights [positions x B, classes, rows of the group])`` (sample ``b`` of the ``p``-th position: column ``p * B +
-        b``), and the class masses the query read (:class:`~..state.ClassMasses`)
+        weights [live rows, rows of the group], row [positions x B, classes])``: column ``p * B + b`` (sample ``b`` of
+        the ``p``-th position) class ``c``'s weights at row ``row[p * B + b, c]`` (int32; -1: dead, -inf) -- and the
+        class masses the query read (:class:`~..state.ClassMasses`)
     """
     prog, td, dev = backend.program(), backend.top_down_program(), backend.device
     score = score_tables(prog)
     B = data.size(0)
     if layout is None:
-        groups, base, K, size = _layout(backend, positions, B)
-        layout = (groups, size, (torch.from_numpy(base).to(dev), torch.from_numpy(K).to(dev)))
-    groups, size, (base, K) = layout
+        groups, col, K, blocks = _layout(backend, positions, B)
+        layout = (groups, tuple(torch.from_numpy(a).to(dev) for a in (col, K, *blocks)))
+    groups, (col, K, col_pos, col_K, col_first, group_first) = layout
     if observed is None:
         observed = (~missing).any(dim = 0).cpu().numpy()
     if external is not None:                                                # values that differ per sample
@@ -236,19 +242,19 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     if report is not None:
         report.update(plan = plan, liveness = lv, compact = compact, inputs_only = inputs_only, storage = storage,
                       dropped = dropped, parked = parked)
-    gates = F.gate_context(backend, external)
+    rows = class_weight_rows(prog, lv, col_pos, col_K, col_first, group_first, B)   # (their sizes copied behind
+    gates = F.gate_context(backend, external)                                         # the forward pass's launches)
     F.run_forward(backend, bufs, plan, x, missing, obs_class, lv, precision, compact, masses, gates = gates)
     valid |= plan.todo
 
-    C = backend.num_classes
-    buf = backend.state.storage_view("dfa_class_flow", size)
+    buf = backend.state.storage_view("dfa_class_flow", rows.starts[-1])
     if plan.top_down.cw_fill:                           # (every weight stored by the launch writing it first: no fill)
         buf.fill_(-float("inf"))
-    cw = dict(buf = buf, base = base, K = K)
+    cw = dict(buf = buf, col = col, K = K, rows = rows)
     run_backward(backend, bufs, flows, plan, x, missing, obs_class, lv, precision, class_weights = cw,
                  masses = masses, compact = compact, gates = gates)
-    return [(g, pos, buf[s:s + len(pos) * B * C * len(score.rows[g])].view(len(pos) * B, C, len(score.rows[g])))
-            for g, pos, s in groups], masses
+    return [(g, pos, buf[rows.starts[i]:rows.starts[i + 1]].view(-1, len(score.rows[g])), rows.row[f:f + len(pos) * B])
+            for i, (g, pos, f) in enumerate(groups)], masses
 
 
 def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None,
@@ -316,7 +322,7 @@ def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor
     prog = backend.program()
     score = score_tables(prog)
     positions = tgt.any(axis = 0)
-    groups, base, K, size = _layout(backend, positions, B)
+    groups, col, K, blocks = _layout(backend, positions, B)
     masses = backend.state.masses(external)                                  # (the query's, read twice)
     cols = [_sample_columns(masses, score, g, pos, B, prog) for g, pos, _ in groups]
     # every row group's columns' rows (-1: a sample not targeting the position), with the layout, every row's (sample,
@@ -329,8 +335,10 @@ def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor
         x_h = np.where(miss, 0, data.numpy()).astype(np.int64)                 # its class, built here, in the copy
         ev = [x_h.ravel(), _as_int64(np.where(miss, -1, backend.token_classes.host()[x_h]).astype(np.int32)),
               _as_int64(miss)]
-    tables, starts = pack_aligned([base, K, *out_rows, *(np.asarray(pos, dtype = np.int64) for _, pos, _ in groups),
-                                   *rows_bt, *(a for c in cols if c is not None for a in c[1:]), *ev], np.int64)
+    arrays = [col, K, *out_rows, *(np.asarray(pos, dtype = np.int64) for _, pos, _ in groups), *rows_bt,
+              *(a for c in cols if c is not None for a in c[1:])]
+    lb = len(arrays)                                    # (the layout's blocks, then the evidence: the last three)
+    tables, starts = pack_aligned(arrays + list(blocks) + ev, np.int64)
     tables = torch.from_numpy(tables).to(dev)
     starts = starts.tolist()
     view = lambda i: tables[starts[i]:starts[i + 1]]
@@ -354,7 +362,8 @@ def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor
         missing = F.missing_tensor(missing_mask, B, n, dev) if missing_mask is None or missing_mask.is_cuda else \
             torch.from_numpy(miss).to(dev)
     with torch.no_grad():
-        layout = (groups, size, (tables[starts[0]:starts[0] + n], tables[starts[1]:starts[1] + n]))
+        piece = lambda i, size: tables[starts[i]:starts[i] + size]           # (pieces padded: their own lengths)
+        layout = (groups, (piece(0, n), piece(1, n), *(piece(lb + i, len(a)) for i, a in enumerate(blocks))))
         groups, _ = class_weights(backend, data, missing, positions, precision, held,
                                   observed = (~miss).any(axis = 0), layout = layout, report = report,
                                   storage = storage, carry = carry, external = external, masses = masses,
@@ -365,10 +374,10 @@ def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor
             out = torch.empty(M, width, device = dev)
         log_marginal = torch.empty(M + 1, device = dev) if return_log_marginal else None
         enum = enumerated_args(prog, masses)
-        for gi, ((g, pos, w), sample) in enumerate(zip(groups, samples)):
+        for gi, ((g, pos, w, row), sample) in enumerate(zip(groups, samples)):
             out_row = view(2 + gi)[:len(pos) * B]
             table = backend.state.token_table(g, score.rows[g], precision)
-            logz = score_group(out, table, w, score.rows_t[g], masses.table, out_row, backend.token_classes,
+            logz = score_group(out, table, w, row, score.rows_t[g], masses.table, out_row, backend.token_classes,
                                F.PRECISIONS[precision], view(2 + G + gi)[:len(pos)], enum, candidates = cand,
                                sample = sample)
             if log_marginal is not None:

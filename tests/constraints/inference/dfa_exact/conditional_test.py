@@ -224,6 +224,18 @@ def test_auto_storage_keeps_the_smaller_buffers(kind, query, build_pc):
     assert picked == ({"compact"} if kind == "hmm" else {"dense", "compact"})
 
 
+def dense_weights(groups):
+    """Every row group's class weights from :func:`class_weights` (its live rows, ``(group, positions, weights,
+    row)``) as ``(group, positions, [positions x B, classes, rows])``: -inf at a dead (column, class)."""
+    out = []
+    for g, pos, w, row in groups:
+        full = torch.full((*row.shape, w.size(1)), -float("inf"), device = w.device)
+        live = row >= 0
+        full[live] = w[row[live].long()]
+        out.append((g, pos, full))
+    return out
+
+
 @pytest.mark.parametrize("pattern", ["none", "prefix", "mixed"])
 @pytest.mark.parametrize("name", ["contains", "avoids"])
 @pytest.mark.parametrize("kind", list(KINDS))
@@ -237,7 +249,7 @@ def test_class_weights_match_the_reference(kind, name, pattern, sum_path, build_
     B, dev = data.size(0), cc.pc.params.device
     positions = missing.any(dim = 0).numpy()
     with torch.no_grad():
-        groups, _ = class_weights(cc.backend, data, missing.to(dev), positions, storage = "dense")
+        groups = dense_weights(class_weights(cc.backend, data, missing.to(dev), positions, storage = "dense")[0])
     prog = cc.backend.program()
     score = score_tables(prog)
     C = cc.backend.num_classes
@@ -266,6 +278,49 @@ def test_class_weights_match_the_reference(kind, name, pattern, sum_path, build_
     assert checked > 0
 
 
+@pytest.mark.parametrize("one_pair", [False, True])
+@pytest.mark.parametrize("pattern", ["none", "prefix", "mixed"])
+@pytest.mark.parametrize("storage", ["dense", "compact"])
+@pytest.mark.parametrize("kind", ["hmm", "pd", "hand_left", "left_linear", "walks"])
+def test_live_class_rows_match_a_brute_force(kind, storage, pattern, one_pair, build_pc, monkeypatch):
+    """A query keeps its class weights in their live rows alone: a target column's (position ``t``, sample ``b``)
+    class ``c`` has a row exactly when a column live at ``t`` for the sample leads by ``c`` to one live at ``t + 1``
+    (``next_col``; at the last position the sequence end's one column) -- every column live where the query prunes
+    nothing --; a column's live classes on consecutive rows in the boundary's class order, a row group's columns in
+    order. Also reading a class's pairs one at a time (``one_pair``: every list walked over several tiles)."""
+    if one_pair:
+        monkeypatch.setattr(S, "LIVE_CLASS_LANES", 1)
+    n = {"walks": 6}.get(kind, KINDS.get(kind))
+    cc = jc.compile(CONSTRAINTS["either"](), build_pc(kind, n, V))
+    data, missing = evidence(pattern, n)
+    B, dev = data.size(0), cc.pc.params.device
+    positions = missing.any(dim = 0).numpy()
+    report = {}
+    with torch.no_grad():
+        groups, _ = class_weights(cc.backend, data, missing.to(dev), positions, storage = storage, report = report)
+    prog = cc.backend.program()
+    lv = report["liveness"]
+    live = None if lv is None else lv.live.cpu() != 0
+    nc, width, order = prog.next_col.cpu(), prog.width, prog.trans.cls_order.cpu()
+    checked = 0
+    for g, pos, w, row in groups:
+        row, rows = row.cpu(), 0
+        for p, t in enumerate(pos.tolist()):
+            for b in range(B):
+                want = []
+                for c in order[t].tolist():
+                    succ = [(i, 0 if t + 1 == n else int(nc[t, i, c])) for i in range(int(width[t]))
+                            if nc[t, i, c] >= 0]
+                    if any(live is None or (live[b, t, i] and live[b, t + 1, q]) for i, q in succ):
+                        want.append(c)
+                m = p * B + b
+                assert [c for c in order[t].tolist() if row[m, c] >= 0] == want, (g, t, b)
+                assert [int(row[m, c]) for c in want] == list(range(rows, rows + len(want))), (g, t, b)
+                rows, checked = rows + len(want), checked + 1
+        assert w.size(0) == rows
+    assert checked > 0 and (lv is not None or pattern == "none")
+
+
 @pytest.mark.parametrize("one_sample", [False, True])
 @pytest.mark.parametrize("kind, storage", [("hmm", "dense"), ("hand_left", "dense"), ("left_linear", "dense"),
                                            ("pd", "dense"), ("hmm", "compact"), ("hand_left", "compact"),
@@ -285,10 +340,10 @@ def test_class_weights_walk_every_samples_own_live_columns(kind, storage, one_sa
     positions = missing.any(dim = 0).numpy()
     dev = cc.pc.params.device
     with torch.no_grad():
-        together = [w.clone() for _, _, w in class_weights(cc.backend, data, missing.to(dev), positions,
-                                                            storage = storage)[0]]
-        alone = [[w.clone() for _, _, w in class_weights(cc.backend, data[b:b + 1], missing[b:b + 1].to(dev),
-                                                          positions, storage = storage)[0]]
+        together = [w for _, _, w in dense_weights(class_weights(cc.backend, data, missing.to(dev), positions,
+                                                                 storage = storage)[0])]
+        alone = [[w for _, _, w in dense_weights(class_weights(cc.backend, data[b:b + 1], missing[b:b + 1].to(dev),
+                                                               positions, storage = storage)[0])]
                  for b in range(data.size(0))]
     B = data.size(0)
     for g, w in enumerate(together):
@@ -319,8 +374,8 @@ def test_the_two_class_weight_walks_give_the_same_bits(kind, name, pattern, stor
     for walk in (1, 2, 0):
         monkeypatch.setattr(S, "CLASS_WEIGHT_WALK", walk)
         with torch.no_grad():
-            out[walk] = [w.clone() for _, _, w in class_weights(cc.backend, data, missing.to(dev), positions,
-                                                                 storage = storage)[0]]
+            out[walk] = [w for _, _, w in dense_weights(class_weights(cc.backend, data, missing.to(dev), positions,
+                                                                      storage = storage)[0])]
     assert any(torch.isfinite(w).any() for w in out[1])
     for a, b, c in zip(out[1], out[2], out[0]):
         assert torch.equal(a, b) and torch.equal(a, c)
@@ -554,7 +609,7 @@ def cw_weights(cc, data, missing, storage = "compact"):
     positions = missing.any(dim = 0).numpy()
     with torch.no_grad():
         groups, _ = class_weights(cc.backend, data, missing.to(cc.pc.params.device), positions, storage = storage)
-    return [w.clone() for _, _, w in groups]
+    return [w for _, _, w in dense_weights(groups)]
 
 
 def forced_fill(real):
