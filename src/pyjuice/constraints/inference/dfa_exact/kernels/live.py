@@ -289,7 +289,9 @@ SUCCESSOR_LIST_TILE = 128
 class SuccessorLists:
     """
     For every sample ``b``, boundary ``t`` and live column ``i`` of a query, the column's entries (of the Program's
-    transition tables, ``Program.trans``) whose successor is live at ``t + 1``, ascending: ``entries[b E + e_t +
+    transition tables, ``Program.trans``) whose successor is live at ``t + 1`` -- and, under a session's per-sample
+    inputs, whose class the sample allows there (:attr:`Liveness.allowed`; a ruled-out class's mass is -inf: its term
+    adds nothing) --, ascending: ``entries[b E + e_t +
     start[b, t, i] + k]`` for ``k < count[b, t, i]``, ``E`` the tables' entries and ``e_t`` boundary ``t``'s first --
     each (sample, boundary) list within its boundary's entry range, so none waits for another's count. A dead column's
     ``start`` and ``count`` are unwritten (never read).
@@ -312,10 +314,12 @@ class SuccessorLists:
 
 @triton_jit
 def _successor_lists_kernel(live, entry_ptr, entry_succ, count, start, columns, lstart, lcount, entries, sizes, n, W, E,
-                            TILE: tl.constexpr):
+                            allowed, entry_class, a_stride, C, TILE: tl.constexpr, ALLOWED: tl.constexpr):
     """One program per (sample, boundary ``t < n``): over the sample's live columns at ``t`` (``count`` / ``start`` /
-    ``columns``, :meth:`Liveness.lists`), ascending, their entries whose successor is live at ``t + 1``, into the
-    (sample, boundary)'s :class:`SuccessorLists`; ``sizes`` [B, n, 2]: the entries kept, and those columns' entries."""
+    ``columns``, :meth:`Liveness.lists`), ascending, their entries whose successor is live at ``t + 1`` -- ``ALLOWED``:
+    and whose class (``entry_class``) the sample allows there (``allowed`` int8 [Be, n, C], ``a_stride`` a sample's
+    flags apart) --, into the (sample, boundary)'s :class:`SuccessorLists`; ``sizes`` [B, n, 2]: the entries kept, and
+    those columns' entries."""
     pid = tl.program_id(0)
     b = (pid // n).to(tl.int64)
     t = pid % n
@@ -336,7 +340,11 @@ def _successor_lists_kernel(live, entry_ptr, entry_succ, count, start, columns, 
             e = c0 + tl.arange(0, TILE)
             em = e < e1
             q = tl.load(entry_succ + e, mask = em, other = 0)
-            v = (em & (tl.load(nxt + q, mask = em, other = 0) != 0)).to(tl.int32)
+            on = em & (tl.load(nxt + q, mask = em, other = 0) != 0)
+            if ALLOWED:
+                c = tl.load(entry_class + e, mask = on, other = 0)
+                on = on & (tl.load(allowed + b * a_stride + t * C + c, mask = on, other = 0) != 0)
+            v = on.to(tl.int32)
             tl.store(region + kept + tl.cumsum(v, axis = 0) - v, e, mask = v != 0)
             kept += tl.sum(v, axis = 0)
         total += e1 - e0
@@ -390,12 +398,15 @@ class Liveness:
     :ivar live: int8 [B, n + 1, W], every column's liveness per sample and boundary
     :ivar lanes: the :class:`LaneOrder` of the sum intervals the query computes per sample (:meth:`order`), or None
         before it orders them
+    :ivar allowed: None, or int8 [Be, n, C] (``Be`` 1 or ``B``): the classes a missing token can have per sample under
+        a session's per-sample inputs (:class:`SampleSuccessors`), by which :meth:`successor_lists` keep entries
     """
 
     prog: Any
     B: int
     live: torch.Tensor
     lanes: Optional[LaneOrder] = None
+    allowed: Optional[torch.Tensor] = None
     _lists: Optional[tuple] = None
     _rank: Optional[torch.Tensor] = None
     _all: Optional[LaneOrder] = None                # every interval's order, when the live counts were asked for
@@ -415,10 +426,15 @@ class Liveness:
             store = state.storage_view("successor_lists", int(offs[-1])).view(torch.int32)
             entries, lstart, lcount, sizes = (store[offs[k]:offs[k] + parts[k]] for k in range(4))
             count, start, columns = self.lists()
+            classes = self.allowed is not None and tt.entry_class is not None   # (ungrouped tables: an entry a class)
+            C = prog.next_col.size(2)
+            a_stride = n * C if classes and self.allowed.size(0) > 1 else 0          # (one set: every sample's)
             if n > 0 and B > 0:
                 _successor_lists_kernel[(B * n,)](self.live, tt.entry_ptr, tt.entry_succ, count, start, columns, lstart,
-                                                  lcount, entries, sizes, n, W, E, TILE = SUCCESSOR_LIST_TILE,
-                                                  num_warps = 4)
+                                                  lcount, entries, sizes, n, W, E,
+                                                  self.allowed if classes else self.live,
+                                                  tt.entry_class if classes else tt.entry_succ, a_stride, C,
+                                                  TILE = SUCCESSOR_LIST_TILE, ALLOWED = classes, num_warps = 4)
                 kept, total = sizes.view(B, n, 2).sum(dim = 0, dtype = torch.float64).unbind(1)   # (exact counts)
                 use = (kept <= SUCCESSOR_LIST_MAX_LIVE * total).to(torch.int32)
             else:
@@ -531,11 +547,13 @@ class SampleSuccessors:
     (:func:`sample_successors`): the program's grouped ``succ`` lists (every column's distinct successors, a sequence
     end's being its one column) less the successors only classes ruled out lead to -- a CSR per sample, ``ptr`` int32
     [Be, n, W + 1] (numbers within the sample's entries, ``ptr[b, t, 0]`` the boundary's first), ``succ`` int32 [Be,
-    E]; ``Be`` 1 for one set of lists for every sample.
+    E]; ``Be`` 1 for one set of lists for every sample. ``allowed``: int8 [Be, n, C], the classes allowed (what the
+    lists were built from), by which a query's :class:`SuccessorLists` keep entries too.
     """
 
     ptr: torch.Tensor
     succ: torch.Tensor
+    allowed: Optional[torch.Tensor] = None
 
     def strides(self):
         """``(ps, ss)``: a sample's lists apart in ``ptr`` and ``succ`` (0 for one set for every sample)."""
@@ -638,7 +656,7 @@ def sample_successors(prog, allowed: torch.Tensor) -> SampleSuccessors:
         count = count - count[:, :1]                                        # count[:, e]: the kept entries before e
         ptr[b0:b0 + bs] = count[:, tt.entry_ptr.long().view(-1)].view(bs, n, W + 1)
         succ[b0:b0 + bs].scatter_(1, torch.where(kept, count[:, :E].long(), E), tt.entry_succ[None].expand(bs, -1))
-    return SampleSuccessors(ptr = ptr, succ = succ)
+    return SampleSuccessors(ptr = ptr, succ = succ, allowed = allowed.to(torch.int8))
 
 
 def live_successors(prog, masses) -> Optional[SampleSuccessors]:
@@ -683,4 +701,4 @@ def liveness(prog, obs_class: torch.Tensor, B: int, succ: Optional[SampleSuccess
     else:                                            # one program per sample, sweeping every boundary: a lane
         TILE = min(1024, max(32, host_next_power_of_2(W)))       # per column, a step's latency is the sweep's cost
         _liveness_kernel[(B,)](live, back, *tables, n, W, C, TILE = TILE, num_warps = max(4, TILE // 32))
-    return Liveness(prog = prog, B = B, live = live)
+    return Liveness(prog = prog, B = B, live = live, allowed = None if succ is None else succ.allowed)

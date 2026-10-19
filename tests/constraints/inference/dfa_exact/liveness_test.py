@@ -498,13 +498,16 @@ def entry_form(form, monkeypatch):
     monkeypatch.setattr(P, "ENTRY_LOOP_MAX_LIVE", 2)
 
 
+@pytest.mark.parametrize("classes", ["every", "sample", "shared"])
 @pytest.mark.parametrize("form", ["grouped", "entries"])
 @pytest.mark.parametrize("kind", ["hmm", "pd", "hand_left"])
-def test_successor_lists_match_a_brute_force(kind, form, build_pc, monkeypatch):
+def test_successor_lists_match_a_brute_force(kind, form, classes, build_pc, monkeypatch):
     """Every (sample, boundary, live column)'s successor list -- the column's entries of the Program's transition
     tables whose successor is live at the next boundary, ascending -- and every boundary's choice to take them (over
     the samples), against the liveness flags: an odd batch, a sample whose evidence breaks the constraint (nothing
-    live)."""
+    live). Under a session's per-sample classes (``classes``: every sample's own, or one set for all), an entry of the
+    entry tables also needs its class allowed for the sample there -- a column's entries being its classes that lead
+    somewhere, ascending; a grouped entry (a successor) keeps every class."""
     from pyjuice.constraints.inference.dfa_exact.kernels import live as L
     entry_form(form, monkeypatch)
     n = KINDS[kind]
@@ -515,7 +518,12 @@ def test_successor_lists_match_a_brute_force(kind, form, build_pc, monkeypatch):
     data = torch.randint(0, VW, (B, n), generator = g)
     missing = torch.rand(B, n, generator = g) < 0.6
     missing[0] = True
-    lv = liveness(prog, obs_classes(cc, data, missing), B)
+    nc = prog.next_col.cpu()
+    allowed = None
+    if classes != "every":
+        allowed = torch.rand(1 if classes == "shared" else B, n, nc.size(2), generator = g) < 0.6
+    lv = liveness(prog, obs_classes(cc, data, missing), B,
+                  None if allowed is None else sample_successors(prog, allowed.to(prog.dev)))
     live = lv.live.cpu() != 0
     ep = prog.trans.entry_ptr.cpu().long().view(n, -1)
     succ = prog.trans.entry_succ.cpu().long()
@@ -524,7 +532,12 @@ def test_successor_lists_match_a_brute_force(kind, form, build_pc, monkeypatch):
         for t in range(n):
             for i in torch.nonzero(live[b, t, :int(prog.width[t])]).flatten().tolist():
                 es = torch.arange(int(ep[t, i]), int(ep[t, i + 1]))
-                lists[b, t, i] = want = es[live[b, t + 1, succ[es]]]
+                keep = live[b, t + 1, succ[es]]
+                if allowed is not None and form == "entries":
+                    cls = torch.nonzero(nc[t, i] >= 0).flatten()                # (the column's entries: its classes)
+                    assert cls.numel() == es.numel()
+                    keep = keep & allowed[0 if classes == "shared" else b, t, cls]
+                lists[b, t, i] = want = es[keep]
                 kept[t], total[t] = kept[t] + want.numel(), total[t] + es.numel()
     ratios = sorted({kept[t] / total[t] for t in range(n) if total[t] > 0})
     assert lists and len(ratios) > 1
