@@ -1059,12 +1059,53 @@ def _live_shifted_exp_kernel(x, perm, ex_t, m, rows, x_ld, TILE_R: tl.constexpr)
         tl.store(ex_t + k.to(tl.int64) * rows + r, tl.exp(v - shift), mask = r < rows)
 
 
+@triton_jit
+def _live_shifted_exp_tiles_kernel(x, perm, ex_t, m, rows, x_ld, num_live, TILE_R: tl.constexpr,
+                                   TILE_C: tl.constexpr):
+    """:func:`_live_shifted_exp_kernel` for ``TILE_C`` live columns a program, ``TILE_R`` rows of them read at a time
+    -- along the rows, where a program per column reads one float per memory sector at the row stride. The same
+    values to the bit: a maximum is exact in any order, and every exponential is the same."""
+    k = tl.program_id(0) * TILE_C + tl.arange(0, TILE_C)
+    km = k < num_live
+    col = tl.load(perm + k, mask = km, other = 0).to(tl.int64)
+    big = tl.full([TILE_R, TILE_C], float("-inf"), dtype = tl.float32)
+    for r0 in range(0, rows, TILE_R):
+        r = r0 + tl.arange(0, TILE_R)
+        mask = (r < rows)[:, None] & km[None, :]
+        big = tl.maximum(big, tl.load(x + r.to(tl.int64)[:, None] * x_ld + col[None, :], mask = mask,
+                                      other = float("-inf")))
+    top = tl.max(big, axis = 0)
+    tl.store(m + k, top, mask = km)
+    shift = tl.where(top == float("-inf"), 0.0, top)
+    for r0 in range(0, rows, TILE_R):
+        r = r0 + tl.arange(0, TILE_R)
+        mask = (r < rows)[:, None] & km[None, :]
+        v = tl.load(x + r.to(tl.int64)[:, None] * x_ld + col[None, :], mask = mask, other = float("-inf"))
+        tl.store(ex_t + k.to(tl.int64)[None, :] * rows + r[:, None], tl.exp(v - shift[None, :]), mask = mask)
+
+
+#: The live exp pass's column tiles (:func:`_live_shifted_exp_tiles_kernel`): ``(fewest live columns, TILE_R,
+#: TILE_C)``, the last entry a pass reaches; a narrower pass takes a program per column, whose many programs win there.
+#: Measured over every pass of an HMM ex108 B8 diffusion session (4096 rows, 1 to 83k live columns; toast): below 256
+#: columns 4.5 ms a session per column, 7.4 in tiles of 8; 256 to 4096 columns 46 -> 11 ms; above, 740 -> 248 ms.
+_LIVE_EXP_TILES = ((256, 512, 16), (4096, 512, 32))
+
+
 def _live_shifted_exp(x: torch.Tensor, perm: torch.Tensor, num_live: int):
-    """``(ex_t, m)`` of :func:`_live_shifted_exp_kernel`: [num_live, rows] and [num_live] for ``x`` [rows, *]."""
+    """``(ex_t, m)`` of :func:`_live_shifted_exp_kernel` (or :func:`_live_shifted_exp_tiles_kernel`, the same bits):
+    [num_live, rows] and [num_live] for ``x`` [rows, *]."""
     rows = x.size(0)
     ex_t = torch.empty(num_live, rows, dtype = x.dtype, device = x.device)
     m = torch.empty(num_live, dtype = x.dtype, device = x.device)
-    if num_live > 0:
+    tile = None
+    for least, TILE_R, TILE_C in _LIVE_EXP_TILES:
+        if num_live >= least:
+            tile = (TILE_R, TILE_C)
+    if tile is not None:
+        _live_shifted_exp_tiles_kernel[(host_cdiv(num_live, tile[1]),)](x, perm, ex_t, m, rows, x.stride(0), num_live,
+                                                                       TILE_R = tile[0], TILE_C = tile[1],
+                                                                       num_warps = 4)
+    elif num_live > 0:
         _live_shifted_exp_kernel[(num_live,)](x, perm, ex_t, m, rows, x.stride(0), TILE_R = 1024, num_warps = 4)
     return ex_t, m
 

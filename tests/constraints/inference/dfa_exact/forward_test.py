@@ -490,23 +490,31 @@ def test_one_exp_lse_step_is_the_two_exp_one():
     assert torch.isfinite(out[True][1]).all() and (out[True][1][4 * per:5 * per] == 0).all()
 
 
-def test_live_columns_are_shifted_and_exponentiated():
+@pytest.mark.parametrize("rows, width, num_live", [(2500, 40, 5), (700, 400, 300), (130, 4200, 4100)])
+def test_live_columns_are_shifted_and_exponentiated(rows, width, num_live):
     """The dense sum paths' pre-op (sum.py's ``_live_shifted_exp``): the first ``num_live`` columns of a pruning order,
-    gathered from a block taller than a program's row tile (and a row stride past its width), each shifted by its
-    maximum and exponentiated, transposed; a column of -inf gives zeros."""
-    from pyjuice.constraints.inference.dfa_exact.kernels.sum import _live_shifted_exp
+    gathered from a block with a row stride past its width, each shifted by its maximum and exponentiated, transposed;
+    a column of -inf gives zeros. A narrow pass (a program per column, the block taller than its row tile) and passes
+    wide enough for column tiles (``_LIVE_EXP_TILES``: rows past a row tile, or within one; the last tile partly past
+    the live columns), whose bits must be a program per column's."""
+    from pyjuice.constraints.inference.dfa_exact.kernels.sum import _live_shifted_exp, _live_shifted_exp_kernel
     g = torch.Generator().manual_seed(0)
-    x = (torch.randn(2500, 48, generator = g) * 4).cuda()
+    x = (torch.randn(rows, width + 8, generator = g) * 4).cuda()
     x[:, 7] = float("-inf")
-    x[100:2400, 3] = float("-inf")
-    block = x[:, :40]
-    perm = torch.tensor([7, 3, 39, 0, 21, 5], dtype = torch.int32, device = "cuda")
-    ex_t, m = _live_shifted_exp(block, perm, 5)
-    cols = block[:, perm[:5].long()]
+    x[100:rows - 20, 3] = float("-inf")
+    block = x[:, :width]
+    rest = torch.randperm(width, generator = g)
+    rest = rest[(rest != 7) & (rest != 3)]
+    perm = torch.cat([torch.tensor([7, 3]), rest])[:num_live + 1].to(torch.int32).cuda()     # one past the live
+    ex_t, m = _live_shifted_exp(block, perm, num_live)
+    cols = block[:, perm[:num_live].long()]
     top = cols.amax(0)
     assert torch.equal(m, top)
     torch.testing.assert_close(ex_t, torch.exp(cols - torch.where(torch.isneginf(top), 0.0, top)).t(), rtol = 1e-5,
                                atol = 0)
+    one_t, one_m = torch.empty_like(ex_t), torch.empty_like(m)
+    _live_shifted_exp_kernel[(num_live,)](block, perm, one_t, one_m, rows, block.stride(0), TILE_R = 1024)
+    assert torch.equal(ex_t.view(torch.int32), one_t.view(torch.int32)) and torch.equal(m, one_m)
 
 
 def test_transition_masses_match_brute_force(build_pc, monkeypatch):
