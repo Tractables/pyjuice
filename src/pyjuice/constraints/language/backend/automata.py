@@ -7,9 +7,10 @@ Every operation returns the MINIMAL automaton of its result in canonical form (:
 in breadth-first order from the initial state, every state's successors visited by increasing byte, then the one dead
 state. Two automata accept the same texts iff their canonical forms are equal (:func:`equivalent`).
 
-Concatenation, union and repetition put their operands' tables side by side as one automaton with empty moves (each
-operand's states keep their byte transitions: a state has at most one successor per byte; the empty moves join them)
-and determinize it once (:func:`_subsets`, the subset construction); intersection and difference walk the operands'
+Concatenation, union and repetition are carried out lazily (:class:`Expr`): an expression of them is evaluated on
+first use, all at once -- its automata side by side as one automaton with empty moves (each keeps its byte
+transitions: a state has at most one successor per byte; the empty moves join them), determinized once
+(:func:`_subsets`, the subset construction) and minimized once. Intersection and difference walk their operands'
 reachable state tuples (:func:`~.dfa.product_bfs`). Both work over the bytes no operand tells apart (byte classes).
 """
 
@@ -68,8 +69,16 @@ def _from_classes(table: np.ndarray, initial: int, accept: np.ndarray, byte_clas
                          byte_class = column_class[byte_class], minimal = True)
 
 
-def minimize(a: ByteAutomaton) -> ByteAutomaton:
+def force(a) -> ByteAutomaton:
+    """The automaton of ``a``: itself, or an expression's (evaluated once, see :class:`Expr`)."""
+    return a.force() if isinstance(a, Expr) else a
+
+
+def minimize(a) -> ByteAutomaton:
     """The minimal automaton accepting ``a``'s texts, in canonical form (see the module docstring)."""
+    a = force(a)
+    if a.minimal:                                               # (made by this module: canonical already)
+        return a
     return _from_classes(a.table.astype(np.int64), a.initial, a.accept, a.byte_class)
 
 
@@ -80,9 +89,9 @@ def equivalent(a: ByteAutomaton, b: ByteAutomaton) -> bool:
         np.array_equal(a.byte_class, b.byte_class)
 
 
-def is_empty(a: ByteAutomaton) -> bool:
+def is_empty(a) -> bool:
     """Whether ``a`` accepts no text."""
-    return not bool(a.accept.any())
+    return not bool(minimize(a).accept.any())
 
 
 # -------------------------------------------------------------------------------------------------
@@ -275,6 +284,44 @@ class _Joined:
         self.extra += 1
         return -self.extra
 
+    def wire(self, x) -> Tuple[int, List[int]]:
+        """``x`` -- an automaton, or an expression not evaluated yet, its parts wired in turn -- added: ``(entry,
+        accepting states)``. A repeated part is evaluated first (its copies then the minimal automaton's)."""
+        if isinstance(x, Expr) and x._forced is not None:
+            x = x._forced
+        if not isinstance(x, Expr):
+            off = self.add(x)
+            return off + x.initial, [off + int(q) for q in np.nonzero(x.accept)[0]]
+        if x.kind == "seq":
+            entry, prev = self.wire(x.parts[0])
+            for part in x.parts[1:]:                            # every accepting state enters the next part
+                e, acc = self.wire(part)
+                self.eps += [(q, e) for q in prev]
+                prev = acc
+            return entry, prev
+        start = self.fresh()
+        if x.kind == "alt":
+            accepting = []
+            for part in x.parts:
+                e, acc = self.wire(part)
+                self.eps.append((start, e))
+                accepting += acc
+            return start, accepting
+        lo, hi = x.lo, x.hi                                     # "rep"
+        copies = max(lo, 1) if hi is None else hi
+        part = force(x.parts[0]) if copies > 1 or hi is None else x.parts[0]
+        accepting = [start] if lo == 0 else []
+        prev = [start]                                          # the states a next copy is entered from
+        for i in range(copies):
+            e, acc = self.wire(part)
+            self.eps += [(p, e) for p in prev]
+            prev = acc
+            if i + 1 >= lo:
+                accepting += acc
+            if hi is None and i == copies - 1:                  # the last copy loops
+                self.eps += [(p, e) for p in acc]
+        return start, accepting
+
     def build(self, start: int) -> ByteAutomaton:
         total = self.size + self.extra
         num = lambda q: q if q >= 0 else self.size - 1 - q    # placeholders after the parts
@@ -298,63 +345,62 @@ class _Joined:
         return _from_classes(table, 1, acc, byte_class)
 
 
-def concat(*parts: ByteAutomaton) -> ByteAutomaton:
+class Expr:
+    """
+    A concatenation (``kind`` "seq"), union ("alt") or repetition ("rep", ``lo`` to ``hi`` times; ``hi`` None: no
+    bound) of automata or other expressions, not carried out yet: evaluated on first use -- read as an automaton (its
+    attributes are its automaton's) or forced (:func:`force`) -- all at once, the whole expression one automaton with
+    empty moves, determinized and minimized once. What is reused is best forced once, else every use wires it again.
+    """
+
+    __slots__ = ("kind", "parts", "lo", "hi", "_forced")
+
+    def __init__(self, kind: str, parts, lo: int = 0, hi: Optional[int] = None):
+        self.kind, self.parts, self.lo, self.hi = kind, tuple(parts), lo, hi
+        self._forced: Optional[ByteAutomaton] = None
+
+    def force(self) -> ByteAutomaton:
+        if self._forced is None:
+            j = _Joined()
+            entry, j.accepting = j.wire(self)
+            self._forced = j.build(entry)
+        return self._forced
+
+    def __getattr__(self, name):
+        return getattr(self.force(), name)
+
+
+def concat(*parts):
     """The texts ``u_1 + ... + u_k``, ``u_i`` accepted by ``parts[i]`` (none: the empty text alone)."""
     if not parts:
         return epsilon()
-    j = _Joined()
-    firsts = [j.add(a) for a in parts]
-    for i in range(len(parts) - 1):                             # every accepting state enters the next part
-        a, off, nxt = parts[i], firsts[i], firsts[i + 1] + parts[i + 1].initial
-        j.eps += [(off + int(q), nxt) for q in np.nonzero(a.accept)[0]]
-    j.accepting = [firsts[-1] + int(q) for q in np.nonzero(parts[-1].accept)[0]]
-    return j.build(firsts[0] + parts[0].initial)
+    return parts[0] if len(parts) == 1 else Expr("seq", parts)
 
 
-def union(*parts: ByteAutomaton) -> ByteAutomaton:
+def union(*parts):
     """The texts some of ``parts`` accepts (none: no text)."""
     if not parts:
         return nothing()
-    j = _Joined()
-    start = j.fresh()
-    for a in parts:
-        off = j.add(a)
-        j.eps.append((start, off + a.initial))
-        j.accepting += [off + int(q) for q in np.nonzero(a.accept)[0]]
-    return j.build(start)
+    return parts[0] if len(parts) == 1 else Expr("alt", parts)
 
 
-def optional(a: ByteAutomaton) -> ByteAutomaton:
+def optional(a):
     """``a``'s texts and the empty text."""
     return union(a, epsilon())
 
 
-def star(a: ByteAutomaton) -> ByteAutomaton:
+def star(a):
     """Concatenations of any number of ``a``'s texts (the empty text among them)."""
     return repeat(a, 0, None)
 
 
-def repeat(a: ByteAutomaton, lo: int, hi: Optional[int]) -> ByteAutomaton:
+def repeat(a, lo: int, hi: Optional[int]):
     """Concatenations of ``lo`` to ``hi`` of ``a``'s texts (``hi`` None: no bound)."""
     if lo < 0 or (hi is not None and hi < lo):
         raise ValueError(f"repeat: bounds {lo}..{hi} are not 0 <= lo <= hi.")
     if hi == 0:
         return epsilon()
-    j = _Joined()
-    start = j.fresh()
-    if lo == 0:
-        j.accepting.append(start)
-    copies = max(lo, 1) if hi is None else hi
-    prev = [start]                                              # the states a next copy is entered from
-    for i in range(copies):
-        off = j.add(a)
-        j.eps += [(p, off + a.initial) for p in prev]
-        prev = [off + int(q) for q in np.nonzero(a.accept)[0]]
-        if i + 1 >= lo:
-            j.accepting += prev
-        if hi is None and i == copies - 1:                      # the last copy loops
-            j.eps += [(p, off + a.initial) for p in prev]
-    return j.build(start)
+    return Expr("rep", [a], lo, hi)
 
 
 # -------------------------------------------------------------------------------------------------
@@ -379,7 +425,7 @@ def _product(parts: Sequence[ByteAutomaton], mode: str) -> ByteAutomaton:
     return _from_classes(rows, 0, accept, byte_class)
 
 
-def intersect(*parts: ByteAutomaton) -> ByteAutomaton:
+def intersect(*parts) -> ByteAutomaton:
     """The texts every one of ``parts`` accepts (two at a time, each product minimal)."""
     if not parts:
         raise ValueError("intersect: no automaton (every text is no regular set of texts here).")
@@ -389,6 +435,6 @@ def intersect(*parts: ByteAutomaton) -> ByteAutomaton:
     return out
 
 
-def difference(a: ByteAutomaton, b: ByteAutomaton) -> ByteAutomaton:
+def difference(a, b) -> ByteAutomaton:
     """The texts ``a`` accepts and ``b`` does not."""
     return _product([minimize(a), minimize(b)], "difference")

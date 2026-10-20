@@ -32,8 +32,6 @@ import math
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
-
 from . import automata as A
 from .automata import _Joined
 from .byte_level import ByteAutomaton
@@ -257,10 +255,10 @@ class _Compiler:
         return self._free
 
     def _free_values(self, values, items, key):
-        v, i = values, items                                    # an object's and an array's, at depth 0
+        v, i = A.force(values), A.force(items)                  # an object's and an array's, at depth 0
         for _ in range(FREE_DEPTH):                             # containers of the level below, then theirs
-            obj, arr = self.object_of(v, False, key), self.array_of(i, 0, None)
-            v, i = A.union(values, obj, arr), A.union(items, obj, arr)
+            obj, arr = A.force(self.object_of(v, False, key)), A.force(self.array_of(i, 0, None))
+            v, i = A.force(A.union(values, obj, arr)), A.force(A.union(items, obj, arr))
         return v, i
 
     def free_canon(self, canon: _Canon):
@@ -284,7 +282,7 @@ class _Compiler:
             for _ in range(self.depth(canon.root)):
                 entry = A.concat(A.optional(A.concat(self.any_string, self.sep(":", ws))), v)
                 inner = A.optional(A.concat(entry, A.star(A.concat(self.sep(",", ws), entry))))
-                v = A.union(scalars, A.concat(opening, ws, inner, ws, closing))
+                v = A.force(A.union(scalars, A.concat(opening, ws, inner, ws, closing)))
             canon.any_b = v
         return canon.any_b
 
@@ -327,8 +325,8 @@ class _Compiler:
             return self.any_value(canon)
         if canon.any is None:
             v, i = self.free_canon(canon)
-            canon.any = A.union(self.canon_string, self.canon_number, self.boolean, self.null,
-                                self.object_of(v, False, canon.other(self, "A")), self.array_of(i, 0, None))
+            canon.any = A.force(A.union(self.canon_string, self.canon_number, self.boolean, self.null,
+                                        self.object_of(v, False, canon.other(self, "A")), self.array_of(i, 0, None)))
         return canon.any
 
     def literal_value(self, v: Any) -> ByteAutomaton:
@@ -388,9 +386,9 @@ class _Compiler:
             if canon is None and self._subtracts(s):                # a subtracting combinator: its own form
                 hit = self.value(s, "A", self.keep(_Canon(self, s)))
             elif canon is None:
-                hit = self._parity(s)
+                hit = A.force(self._parity(s))
             else:
-                hit = self._value(s, mode, canon)
+                hit = A.force(self._value(s, mode, canon))
             self.memo[key] = hit
         return hit
 
@@ -469,29 +467,25 @@ class _Compiler:
         j = _Joined()
         k = len(items)
         none, some = [j.fresh() for _ in range(k + 1)], [j.fresh() for _ in range(k + 1)]
-        accepting = lambda a, off: [off + int(q) for q in np.nonzero(a.accept)[0]]
 
-        def enter(a: ByteAutomaton, sources, targets):
-            off = j.add(a)
-            j.eps.extend((u, off + a.initial) for u in sources)
-            j.eps.extend((q, t) for q in accepting(a, off) for t in targets)
-            return off
+        def enter(x, sources, targets):
+            entry, accepting = j.wire(x)
+            j.eps.extend((u, entry) for u in sources)
+            j.eps.extend((q, t) for q in accepting for t in targets)
+            return entry, accepting
 
-        opening = self.lit("{")
-        start = enter(opening, [], [none[0]]) + opening.initial
+        start, _ = enter(self.lit("{"), [], [none[0]])
         for i, (name, value, required) in enumerate(items):
             first = A.concat(self.ws, self.lit(json.dumps(name, ensure_ascii = False)), self.sep(":"))
             later = A.concat(self.ws, self.lit(","), first)
-            v = j.add(value)
-            enter(first, [none[i]], [v + value.initial])
-            enter(later, [some[i]], [v + value.initial])
-            j.eps.extend((q, some[i + 1]) for q in accepting(value, v))
+            v, done = j.wire(value)
+            enter(first, [none[i]], [v])
+            enter(later, [some[i]], [v])
+            j.eps.extend((q, some[i + 1]) for q in done)
             if not required:
                 j.eps += [(none[i], none[i + 1]), (some[i], some[i + 1])]
-        closing = A.concat(self.ws, self.lit("}"))
         empty = not nonempty and not any(r for _, _, r in items)
-        c = enter(closing, [some[k]] + ([none[k]] if empty else []), [])
-        j.accepting = accepting(closing, c)
+        _, j.accepting = enter(A.concat(self.ws, self.lit("}")), [some[k]] + ([none[k]] if empty else []), [])
         return j.build(start)
 
     # ---------------------------------------------------------------------------------------------
@@ -578,33 +572,29 @@ class _Compiler:
         j = _Joined()
         n = len(entries)
         none, some, tail = [j.fresh() for _ in range(n + 1)], [j.fresh() for _ in range(n + 1)], j.fresh()
-        accepting = lambda a, off: [off + int(q) for q in np.nonzero(a.accept)[0]]
 
-        def enter(a: ByteAutomaton, sources, targets):
-            off = j.add(a)
-            j.eps.extend((u, off + a.initial) for u in sources)
-            j.eps.extend((q, t) for q in accepting(a, off) for t in targets)
-            return off
+        def enter(x, sources, targets):
+            entry, accepting = j.wire(x)
+            j.eps.extend((u, entry) for u in sources)
+            j.eps.extend((q, t) for q in accepting for t in targets)
+            return entry, accepting
 
-        opening = self.lit("{")
-        start = enter(opening, [], [none[0]]) + opening.initial
+        start, _ = enter(self.lit("{"), [], [none[0]])
         for i, (name, value) in enumerate(entries):
             first = A.concat(ws, self.lit(json.dumps(name, ensure_ascii = False)), self.sep(":", ws))
             later = A.concat(ws, self.lit(","), first)
-            v = j.add(value)
-            enter(first, [none[i]], [v + value.initial])
-            enter(later, [some[i]], [v + value.initial])
-            j.eps.extend((q, some[i + 1]) for q in accepting(value, v))
+            v, done = j.wire(value)
+            enter(first, [none[i]], [v])
+            enter(later, [some[i]], [v])
+            j.eps.extend((q, some[i + 1]) for q in done)
             if name not in required:
                 j.eps += [(none[i], none[i + 1]), (some[i], some[i + 1])]
         if extra is not None:                                   # members of the other names, after them
-            member = A.concat(canon.other(self, "B"), self.sep(":", ws), extra)
+            member = A.force(A.concat(canon.other(self, "B"), self.sep(":", ws), extra))
             enter(A.concat(ws, member), [none[n]], [tail])
             enter(A.concat(self.sep(",", ws), member), [some[n], tail], [tail])
-        closing = A.concat(ws, self.lit("}"))
         empty = not (min1 or required)
-        c = enter(closing, [some[n], tail] + ([none[n]] if empty else []), [])
-        j.accepting = accepting(closing, c)
+        _, j.accepting = enter(A.concat(ws, self.lit("}")), [some[n], tail] + ([none[n]] if empty else []), [])
         return j.build(start)
 
     def _others(self, kind: str, canon: _Canon) -> ByteAutomaton:
@@ -615,7 +605,7 @@ class _Compiler:
             pieces = [self.any_string, self.canon_number, self.boolean, self.null]
             pieces.append(self._array_b(self.any_value(canon), 0, None) if kind == "object" else
                           self._object_b({}, set(), None, False, False, canon))
-            self.combos[key] = A.union(*pieces)
+            self.combos[key] = A.force(A.union(*pieces))
         return self.combos[key]
 
     def _array_b(self, item: ByteAutomaton, lo: int, hi: Optional[int]) -> ByteAutomaton:
@@ -661,7 +651,7 @@ class _Compiler:
         key = (tuple(id(p) for p in flat), mode, None if canon is None else id(canon))
         hit = self.combos.get(key)
         if hit is None:
-            hit = self.combos[key] = self._all_flat(flat, mode, canon)
+            hit = self.combos[key] = A.force(self._all_flat(flat, mode, canon))
         return hit
 
     def _all_flat(self, parts, mode: str, canon: Optional[_Canon]) -> ByteAutomaton:

@@ -170,6 +170,55 @@ def test_literals_bytes_and_edge_cases():
         A.regex("^a")
 
 
+def random_tree(rng, depth = 3):
+    """A random expression: ("pat", pattern) or (kind, children...) -- concatenation, union, repetition."""
+    if depth == 0 or rng.random() < 0.25:
+        return ("pat", rng.choice(PATTERNS))
+    kind = rng.choice(["cat", "alt", "rep", "opt", "star"])
+    if kind in ("cat", "alt"):
+        return (kind,) + tuple(random_tree(rng, depth - 1) for _ in range(rng.randint(2, 3)))
+    if kind == "rep":
+        lo = rng.randint(0, 2)
+        return ("rep", random_tree(rng, depth - 1), lo, rng.choice([lo, lo + 1, lo + 2, None]))
+    return (kind, random_tree(rng, depth - 1))
+
+
+def evaluate(tree, eager, shared):
+    """The tree through the algebra: every operation forced at once (``eager``), or left to one evaluation; the
+    first subtree of each node reused (``shared``) where the tree repeats it."""
+    kind = tree[0]
+    if kind == "pat":
+        return A.regex(tree[1])
+    done = (lambda x: A.force(x)) if eager else (lambda x: x)
+    kids = [evaluate(t, eager, shared) for t in tree[1:] if isinstance(t, tuple)]
+    if kind == "cat":
+        out = A.concat(*kids, kids[0]) if shared else A.concat(*kids)
+    elif kind == "alt":
+        out = A.union(*kids, kids[0]) if shared else A.union(*kids)
+    elif kind == "rep":
+        out = A.repeat(kids[0], tree[2], tree[3])
+    elif kind == "opt":
+        out = A.optional(kids[0])
+    else:
+        out = A.star(kids[0])
+    return done(out)
+
+
+def test_an_expression_is_its_operations_carried_out_in_turn():
+    """Concatenations, unions and repetitions nested, one expression evaluated at once: the same canonical automaton as
+    every operation evaluated in turn -- subexpressions used in several places among them."""
+    rng = random.Random(6)
+    for _ in range(60):
+        tree = random_tree(rng)
+        for shared in (False, True):
+            lazy, eager = A.force(evaluate(tree, False, shared)), evaluate(tree, True, shared)
+            assert np.array_equal(lazy.table, eager.table) and np.array_equal(lazy.byte_class, eager.byte_class) \
+                and lazy.initial == eager.initial and np.array_equal(lazy.accept, eager.accept), tree
+    e = A.union(A.literal(b"a"), A.regex("b+"))
+    composed = A.concat(e, A.literal(b"-"), A.star(e), A.repeat(e, 1, 2))
+    assert (language(composed) == reference(r"(?:a|b+)-(?:a|b+)*(?:a|b+){1,2}")).all()
+
+
 def test_a_long_chain_stays_linear():
     """Thousands of parts in one concatenation (an object's members): one state per byte, then the dead state."""
     parts = [A.literal(f'"k{i}":'.encode()) for i in range(3000)]
