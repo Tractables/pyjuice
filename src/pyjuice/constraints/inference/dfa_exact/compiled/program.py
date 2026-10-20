@@ -189,11 +189,13 @@ class Program:
                         if rest.numel() > 0:
                             rest_regs = [regs[k] for k in rest.tolist()]
                             gate = None
+                            nb_reg = torch.tensor(rest_regs, dtype = torch.long, device = dev)
                             if gated:
                                 gate = block_scale.edge_tables(self.gate_cells, layer, nids[rest], cids[rest],
                                                                elem_first, dev)
-                            fused = (nids[rest].contiguous(), cids[rest].contiguous(), pids[rest].contiguous(),
-                                     torch.tensor(rest_regs, dtype = torch.long, device = dev),
+                                gate["dense_run"] = block_scale.dense_run(nids[rest], cids[rest], nb_reg,
+                                                                          layer.block_size, elem_first)
+                            fused = (nids[rest].contiguous(), cids[rest].contiguous(), pids[rest].contiguous(), nb_reg,
                                      max(slots_of_reg[r] for r in rest_regs), None, gate)
                         parts.append((dense, cids.size(1), fused))
                     layers.append((layer.block_size, parts))
@@ -540,7 +542,7 @@ def _split_aliased(fused, alias_row, alias_reg, elem_first: int, dev):
     ce, pe, ge, le = pack(~is_alias, c, p, g, lc, pad = (0, 0, 0, 0))
     ar, ag, ap, ga, la = pack(is_alias, row, reg, p, g, lc, pad = (-1, 0, 0, 0, 0))
     host = lambda t: t.cpu().long().numpy()
-    gate = dict(gate, idx = ge, lc = host(le), a_idx = ga, a_lc = host(la),
+    gate = dict(gate, idx = ge, lc = host(le), a_idx = ga, a_lc = host(la), dense_run = None,
                 uniform = block_scale.uniform_chunks(host(ge), host(ce) >= elem_first),
                 a_uniform = block_scale.uniform_chunks(host(ga), host(ar) >= 0))
     return nids, ce, pe, nb_reg, max_slots, (ar, ag, ap), gate

@@ -33,7 +33,8 @@ from ...kernels.common import SUM, tensor
 from ...kernels.prod import run_products as products
 from ...kernels.prod_top_down import run_top_down
 from ...kernels.score import run_class_weights
-from ...kernels.sum import dense_sum_top_down, fill_dead_rows, fused_sum_top_down, stacked_weights
+from ...kernels.sum import (dense_sum_top_down, fill_dead_rows, fused_sum_top_down, per_sample_dense_sum_top_down,
+                            sample_spans, stacked_weights)
 
 
 
@@ -145,12 +146,24 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
                             nb * tables["max_slots"]                     # (its regions' most)
                         if max_cols == 0:
                             continue
+                        gated = F.part_gates(gates, tables["gate"], compact if part == 1 else None, prog, part == 0)
+                        dense = tables.get("dense")
+                        if dense is not None and gated is not None and part == 1 and compact is not None and \
+                                idx is None and dot == "tf32":           # one dense run: by sample?
+                            r = dense["run"]["reg"]
+                            iv = int(prog.reg_iv_all[r])
+                            ncols = int(compact.total[iv])
+                            spans = sample_spans(compact, iv, ncols, gated["gstride"] == 0)
+                            if spans is not None:
+                                per_sample_dense_sum_top_down(element_flows, nf, pc.params, dense,
+                                                              (int(offsets[r]), int(widths[r]), prog.firsts[r]),
+                                                              elem_first, ew, ncols, dot, gated, spans,
+                                                              compact.identity(ncols), bf16 = precision == "bf16")
+                                continue
                         fused_sum_top_down(element_flows, nf, pc.params, tables, regs, elem_first, ew, nb,
                                           block_size, cbs, max_cols = max_cols, precision = dot,
                                           liveness = liveness if part == 1 and compact is None else None,
-                                          idx = tensor(idx), gated = F.part_gates(gates, tables["gate"],
-                                                                                  compact if part == 1 else None, prog,
-                                                                                  part == 0),
+                                          idx = tensor(idx), gated = gated,
                                           frags = stacks if kept or precision == "bf16" else None,
                                           bf16 = precision == "bf16")
             if visit is not None:

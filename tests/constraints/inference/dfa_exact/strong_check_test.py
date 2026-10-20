@@ -475,9 +475,10 @@ class Float64Reference:
 # Circuits, evidence, sessions
 # -------------------------------------------------------------------------------------------------
 
-def codpula_pc(n, latents, V, gated = True, seed = 0, block = 32):
+def codpula_pc(n, latents, V, gated = True, seed = 0, block = 32, gate = None):
     """A Codpula circuit: a GeneralizedHMM of ``latents`` in blocks of ``block`` over ``V`` tokens, its inputs
-    SoftEvidenceCategorical, its transition sums under BlockScale external parameters (one gate per pair of blocks)."""
+    SoftEvidenceCategorical, its transition sums under BlockScale external parameters (one gate per pair of blocks, or
+    ``gate``: its node and child gate sizes)."""
     from pyjuice.nodes.external_sum_nodes import ExternalParamsSumNodes
     torch.manual_seed(seed)
     ns = juice.structures.GeneralizedHMM(seq_length = n, num_latents = latents, block_size = block,
@@ -486,7 +487,8 @@ def codpula_pc(n, latents, V, gated = True, seed = 0, block = 32):
         for s in ns:
             if s.is_sum() and s.num_nodes == latents:
                 s.__class__ = ExternalParamsSumNodes
-                s.external_params = BlockScaleSumParams(ch_block_size = block)
+                s.external_params = BlockScaleSumParams(ch_block_size = block) if gate is None else \
+                    BlockScaleSumParams(block_size = gate[0], ch_block_size = gate[1])
     ns.init_parameters(perturbation = 2.0)
     return juice.compile(ns, verbose = False).to(DEV)
 
@@ -831,6 +833,34 @@ def test_unstacked_dense_products_against_float64(mode, storage, precision, monk
     cc = jc.compile(dfa, pc)
     ref = Float64Reference(pc, dfa, data.size(1))
     check_against_reference(cc, ref, data, schedule(mode, data.size(0), data.size(1)), None, storage, precision)
+
+
+@pytest.mark.parametrize("precision", ["tf32", "bf16"])
+@pytest.mark.parametrize("mode", ["diffusion", "l2r"])
+@pytest.mark.parametrize("gates", ["blocks", "finer", "shared"])
+def test_sums_by_sample_against_float64(gates, mode, precision, monkeypatch):
+    """:func:`test_a_session_against_float64` on Codpula (compact rows) with every transition's top-down pass multiplied
+    sample by sample, its weights with the sample's gates in them (``PER_SAMPLE_MIN_LANES`` 0: however narrow) -- the
+    forward fused --: a gate per pair of blocks, node and child gates finer than a block, or every sample's gates the
+    same."""
+    import pyjuice.constraints.inference.dfa_exact.kernels.sum as lifted_sum
+    import pyjuice.constraints.inference.dfa_exact.queries.backend.forward as F
+    import pyjuice.constraints.inference.dfa_exact.queries.backend.top_down as TD
+    monkeypatch.setattr(lifted_sum, "PER_SAMPLE_MIN_LANES", 0)
+    calls = []
+    for mod, name in ((F, "fused_sum"), (TD, "per_sample_dense_sum_top_down")):
+        monkeypatch.setattr(mod, name, lambda *a, real = getattr(mod, name), name = name, **k:
+                            calls.append(name) or real(*a, **k))
+    cfg = SMALL["codpula"]
+    _, dfa, data, _ = small_case("codpula")
+    pc = codpula_pc(cfg["n"], cfg["latents"], cfg["V"], gate = (16, 16) if gates == "finer" else None)
+    inputs = soft_inputs(pc, data.size(0), cfg["n"], cfg["V"], K = cfg["K"], data = data)
+    if gates == "shared":
+        inputs["sum_external_params"] = {s: t[:1] for s, t in inputs["sum_external_params"].items()}
+    cc = jc.compile(dfa, pc)
+    ref = Float64Reference(pc, dfa, data.size(1))
+    check_against_reference(cc, ref, data, schedule(mode, data.size(0), data.size(1)), inputs, "compact", precision)
+    assert set(calls) == {"fused_sum", "per_sample_dense_sum_top_down"}
 
 
 def enumerating_case(kind, seed = 0):

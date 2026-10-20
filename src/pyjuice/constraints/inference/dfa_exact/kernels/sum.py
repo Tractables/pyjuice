@@ -37,7 +37,7 @@ from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
 from ..external_params.block_scale import (_add_gated_parent, _chunk_gates, _edge_gates, _node_log_z, _row_gates,
-                                           _segment_cell, _tile_gates)
+                                           _segment_cell, _tile_gates, sample_weights)
 from .common import _child, _logaddexp_tile, _tf32_operand, grid_chunks
 from .compact import _lane_sample
 
@@ -1271,6 +1271,66 @@ def _dense_sum_live(nodes, elems, params, groups, E, BS, first, elem_first, ncol
                 _log_scatter_kernel[(host_cdiv(rows, TILE_R) * num_ctiles,)](
                     nodes[nid - first:nid - first + rows], prod, m, rank, rows, ncols, width, num_live, num_ctiles,
                     TILE_R = TILE_R, TILE_C = TILE_C, TRANS = trans)
+
+
+#: The top-down pass of a sum part under external parameters that is one dense run (``block_scale.dense_run``)
+#: multiplies its compact rows sample by sample (:func:`per_sample_dense_sum_top_down`) from this many lanes a row per
+#: sample (every sample's gates the same: lanes), on tensor cores ("tf32": tf32 and bf16 queries); else fused. Replayed
+#: over every fused launch of a Codpula ex108 B8 diffusion session (4096 nodes in blocks of 32, a gate per pair of
+#: blocks; toast): narrower than 128 lanes a sample the fused kernel won every launch, from 256 the products by sample
+#: won 99% (Codpula ex108 unpruned B8 diffusion decode 7160 -> 6551 ms). The forward stays fused: by sample, its bf16
+#: products left the conditionals of that session's improbable tokens 10x the fused kernels' error (1.6e-2 vs 1.6e-3
+#: against fp32; the top-down pass's, 1.6e-3).
+PER_SAMPLE_MIN_LANES = 256
+
+
+def sample_spans(compact, iv: int, ncols: int, shared: bool) -> Optional[list]:
+    """The ``(sample, first lane, lanes)`` by which a compact row of interval ``iv`` (``ncols`` lanes) multiplies
+    sample by sample -- one span of sample 0 over every lane when the gates are every sample's (``shared``) --, or None
+    when its rows are too narrow for it (:data:`PER_SAMPLE_MIN_LANES`)."""
+    if ncols < PER_SAMPLE_MIN_LANES * (1 if shared else compact.B):
+        return None
+    if shared:
+        return [(0, 0, ncols)]
+    off = compact.sample_offsets(iv)
+    return [(b, int(off[b]), int(off[b + 1] - off[b])) for b in range(compact.B) if off[b + 1] > off[b]]
+
+
+def per_sample_dense_sum_top_down(element_flows: torch.Tensor, node_flows: torch.Tensor, params: torch.Tensor,
+                                  dense: dict, region: tuple, elem_first: int, elem_width: int, ncols: int,
+                                  precision: str, gated: dict, spans: list, ident: torch.Tensor, bf16: bool = False):
+    """
+    The top-down values of a sum part under external parameters that is one dense run (``dense``: a fused group's, see
+    :func:`~..compiled.top_down_program._fused_tables`) into its children's rows of ``element_flows`` (no earlier launch
+    wrote them), on compact rows (``ncols`` lanes; ``ident`` their identity order): ``O_elem = log(W_b^T @ exp(O_node -
+    m)) + m`` on every sample's lanes (``spans``: :func:`sample_spans`), ``W_b`` the sample's weights with its gates and
+    ``1 / Z_b`` in them (:func:`~..external_params.block_scale.sample_weights`, one matrix at a time) -- the dense
+    path's live-column products (transposed; bf16 operands at a bf16 query where ``torch.mm`` can, see
+    :func:`dense_sum_top_down`) by sample, which the fused kernels compute with every parent block's gate instead.
+
+    :param region: ``(offset, width, first)`` of the run's sum region in ``node_flows``
+    :param gated: the part's gates (:func:`~..queries.backend.forward.part_gates`)
+    """
+    run, (nids, _, pids, _, _, _, gate) = dense["run"], dense["part"]
+    c0, E, nid0, R = run["c0"], run["E"], run["nid0"], run["rows"]
+    offset, width, first = region
+    elems = element_flows[:element_flows.numel() // elem_width * elem_width].view(-1, elem_width)
+    nodes = node_flows[offset:offset + (node_flows.numel() - offset) // width * width].view(-1, width)
+    bf = bf16 and _bf16_products(nodes.device)
+    ex_t, m = _live_shifted_exp(nodes[nid0 - first:nid0 - first + R], ident, ncols,                 # [lanes, rows]
+                                torch.bfloat16 if bf else None)
+    prod = torch.empty(ncols, E, dtype = torch.float32, device = nodes.device)                      # [lanes, E]
+    w = torch.empty(R, E, dtype = torch.bfloat16 if bf else torch.float32, device = nodes.device)
+    kw = dict(out_dtype = torch.float32) if bf else {}
+    with _matmul_precision(precision):
+        for b, o, n in spans:
+            sample_weights(w, params, pids, nids, gate, gated, b, R // nids.numel())
+            torch.mm(ex_t[o:o + n], w, out = prod[o:o + n], **kw)
+    TILE_R, TILE_C = _EW_TILE
+    num_ctiles = host_cdiv(ncols, TILE_C)
+    _log_scatter_kernel[(host_cdiv(E, TILE_R) * num_ctiles,)](elems[c0 - elem_first:c0 - elem_first + E], prod, m,
+                                                              ident, E, ncols, elem_width, ncols, num_ctiles,
+                                                              TILE_R = TILE_R, TILE_C = TILE_C, TRANS = True)
 
 
 @triton.jit

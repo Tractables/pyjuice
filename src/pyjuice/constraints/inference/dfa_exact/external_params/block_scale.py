@@ -108,6 +108,65 @@ def edge_tables(layout: Cells, layer, nids: torch.Tensor, cids: torch.Tensor, el
                 uniform = uniform_chunks(idx, cid_h >= elem_first))
 
 
+def dense_run(nids: torch.Tensor, cids: torch.Tensor, nb_reg: torch.Tensor, block_size: int,
+              elem_first: int) -> Optional[dict]:
+    """
+    Whether a sum part under external parameters is one dense run -- every node block over the same ``E`` contiguous
+    children (no padding edge), the blocks consecutive rows of one sum region -- so that a sample's weights
+    (:func:`sample_weights`) make one matrix, and its sums one matrix product: ``dict(c0, E, nid0, rows, reg)`` (host
+    ints; ``rows`` the run's node rows from ``nid0``), else None.
+    """
+    nid_h, cid_h, reg_h = nids.cpu().long().numpy(), cids.cpu().long().numpy(), nb_reg.cpu().long().numpy()
+    K, E = cid_h.shape
+    c0, nid0 = int(cid_h[0, 0]), int(nid_h[0])
+    if c0 < elem_first or not (cid_h == c0 + np.arange(E)[None, :]).all() or (reg_h != reg_h[0]).any() or \
+            not (nid_h == nid0 + block_size * np.arange(K)).all():
+        return None
+    return dict(c0 = c0, E = E, nid0 = nid0, rows = K * block_size, reg = int(reg_h[0]))
+
+
+@triton.jit
+def _sample_weights_kernel(out, weights, pids, nids, idx, ck, values, gstride, lz, lzstride, b, E, num_rtiles,
+                           BS: tl.constexpr, NG: tl.constexpr, TILE_R: tl.constexpr, TILE_E: tl.constexpr):
+    """One program per (node block, tile of its rows, tile of its edges): ``out[k * BS + i, e] = theta * exp(log
+    gate - log Z)`` of node block ``k``'s row ``i`` and edge ``e`` for sample ``b`` -- its weight ``weights[pids[k, e] +
+    i]``, its cell ``idx[k, e]`` (plus ``i // NG`` node gates of ``ck[k]`` cells each, node gates finer than the block),
+    its row's ``log Z`` (a row of no mass: 0, its weights are 0) -- stored as ``out``'s dtype (bf16: to nearest)."""
+    k = tl.program_id(0) // num_rtiles
+    i = (tl.program_id(0) % num_rtiles) * TILE_R + tl.arange(0, TILE_R)
+    e = tl.program_id(1) * TILE_E + tl.arange(0, TILE_E)
+    im, em = i < BS, e < E
+    mask = im[:, None] & em[None, :]
+    at = k.to(tl.int64) * E + e
+    pid = tl.load(pids + at, mask = em, other = 0).to(tl.int64)
+    w = tl.load(weights + pid[None, :] + i[:, None], mask = mask, other = 0.0)
+    cell = tl.load(idx + at, mask = em, other = 0)[None, :] + tl.zeros([TILE_R, 1], dtype = tl.int32)
+    if NG < BS:
+        cell += (i // NG)[:, None] * tl.load(ck + k)
+    g = tl.load(values + b * gstride + cell, mask = mask, other = 0.0)
+    z = tl.load(lz + b * lzstride + tl.load(nids + k).to(tl.int64) + i, mask = im, other = 0.0)
+    z = tl.where(z == float("-inf"), 0.0, z)
+    tl.store(out + (k * BS + i).to(tl.int64)[:, None] * E + e[None, :], w * tl.exp(g - z[:, None]), mask = mask)
+
+
+def sample_weights(out: torch.Tensor, params: torch.Tensor, pids: torch.Tensor, nids: torch.Tensor, gate: dict,
+                   gated: dict, b: int, block_size: int):
+    """
+    Sample ``b``'s weights of a dense run under external parameters (:func:`dense_run`) into ``out`` [K * block_size,
+    E] (fp32, or bf16 rounded to nearest): ``theta[n, c] phi_b[g(n, c)] / Z_b[n]``, normalized per node as the sums
+    take them (see the module docstring) -- from the part's weights ``pids`` [K, E] and node blocks ``nids`` [K], its
+    edges' cells (``gate``: :func:`edge_tables`) and the session's gates and log normalizers (``gated``:
+    :func:`~..queries.backend.forward.part_gates`; ``b`` 0 when they are every sample's).
+    """
+    K, E = pids.shape
+    TILE_R, TILE_E = min(64, triton.next_power_of_2(block_size)), 64
+    num_rtiles = triton.cdiv(block_size, TILE_R)
+    _sample_weights_kernel[(K * num_rtiles, triton.cdiv(E, TILE_E))](
+        out, params, pids, nids, gate["idx"], gate["ck"], gated["values"], gated["gstride"], gated["lz"],
+        gated["lzstride"], b, E, num_rtiles, BS = block_size, NG = gate["node_gate"], TILE_R = TILE_R, TILE_E = TILE_E,
+        num_warps = 4)
+
+
 #: the chunk sizes the sum kernels may take, or split a chunk into, for which :func:`uniform_chunks` /
 #: :func:`uniform_tiles` say whether a chunk's (a tile's) gate is one
 GATE_CHUNKS = (1, 2, 4, 8, 16, 32, 64, 128)

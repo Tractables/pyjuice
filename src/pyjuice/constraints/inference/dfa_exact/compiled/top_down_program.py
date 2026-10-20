@@ -263,7 +263,10 @@ def _fused_tables(prog, parts, block_size, prod_index, elem_first, firsts, writt
     written or log-added to as a whole. Node blocks with no top-down value (no row written) add nothing: left out.
     A gated layer's runs are also cut where their children's places among their node group's children stop being
     consecutive: every parent of a child block has its gate row, child gate size, grid row length and its first child's
-    place (``gate``, see ``block_scale.edge_tables`` in :mod:`..external_params`), and the layer its node gate size."""
+    place (``gate``, see ``block_scale.edge_tables`` in :mod:`..external_params`), and the layer its node gate size.
+    A layer under external parameters that is one dense run (``block_scale.dense_run``) whose child blocks tile its
+    children, none of them written by an earlier launch, has in its one group's ``dense`` the run and its forward
+    part -- what its products by sample need (see :func:`~..kernels.sum.per_sample_dense_sum_top_down`); else None."""
     BS = block_size
 
     def runs(cols, pid_row, valid, group = None, lc = None):
@@ -328,9 +331,15 @@ def _fused_tables(prog, parts, block_size, prod_index, elem_first, firsts, writt
             ptr.append(len(p_nid))
         p_grow, p_gcbs, p_gck = (list(col) for col in zip(*p_g))
         t = lambda xs, dt = torch.int32: torch.tensor(xs, dtype = dt, device = dev)
+        dense = None              # one dense run under external parameters: its children these child blocks, unwritten
+        run = parts[0][6].get("dense_run") if gated and len(parts) == 1 and len(by_size) == 1 else None
+        if run is not None and run["E"] % length == 0 and not any(cb_add) and (np.asarray(cb_reg) < 0).all() and \
+                np.array_equal(np.sort(cb_row), run["c0"] + length * np.arange(run["E"] // length)):
+            dense = dict(run = run, part = parts[0])
         groups[length] = dict(cb_row = t(cb_row), cb_reg = t(cb_reg), cb_add = t(cb_add), cb_ivreg = t(cb_ivreg),
                               par_ptr = t(ptr), par_nid = t(p_nid), par_reg = t(p_reg), par_pid = t(p_pid, torch.int64),
                               max_slots = max(prog.slots[r] for r in cb_ivreg), max_parents = int(np.diff(ptr).max()),
+                              dense = dense,
                               gate = None if not gated else dict(
                                   layer = parts[0][6]["layer"], lc = t(p_lc), row = t(p_grow), cbs = t(p_gcbs),
                                   ck = t(p_gck), node_gate = parts[0][6]["node_gate"],

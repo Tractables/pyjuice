@@ -240,6 +240,14 @@ class CompactLayout:
             out += self.size + (self.element_size if self.element_size > self.mars["element_size"] else 0)
         return out
 
+    def sample_offsets(self, iv: int) -> np.ndarray:
+        """``off[iv]`` on the host (int64 [B + 1]: every sample's first lane in a row of interval ``iv``, then the row's
+        lanes), from the query's one host copy of ``off``, made on first use (it waits for the device)."""
+        host = getattr(self, "_off_host", None)
+        if host is None:
+            host = self._off_host = self.off.cpu().numpy()
+        return host[iv]
+
     def identity(self, size: int) -> torch.Tensor:
         """int32 ``0 .. size - 1`` on the device (the dense sum path's columns: a compact row's lanes in order)."""
         prog = self.prog
