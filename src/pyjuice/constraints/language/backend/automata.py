@@ -20,7 +20,7 @@ from typing import List, Optional, Sequence, Tuple
 import numpy as np
 from numba import njit
 
-from .byte_level import ByteAutomaton, _trimmed
+from .byte_level import ByteAutomaton, _coreachable
 from .dfa import bfs_order, hopcroft, product_bfs
 
 
@@ -28,14 +28,46 @@ from .dfa import bfs_order, hopcroft, product_bfs
 # Canonical minimal form
 # -------------------------------------------------------------------------------------------------
 
+@njit(cache = True)
+def _column_classes(stacked):
+    """The columns of ``stacked`` ([rows, 256]) grouped by equal content: ``(byte_class, first)`` as
+    :func:`_byte_classes`. One pass hashing every column (rows in order), then each byte's column compared with the
+    first column of its hash's classes."""
+    R = stacked.shape[0]
+    h = np.full(256, np.uint64(1469598103934665603))
+    prime = np.uint64(1099511628211)
+    for r in range(R):
+        for b in range(256):
+            h[b] = (h[b] ^ np.uint64(stacked[r, b] + 1)) * prime
+    byte_class = np.empty(256, dtype = np.int64)
+    first = np.empty(256, dtype = np.int64)
+    num = 0
+    for b in range(256):
+        found = -1
+        for c in range(num):
+            rep = first[c]
+            if h[rep] == h[b]:
+                same = True
+                for r in range(R):
+                    if stacked[r, rep] != stacked[r, b]:
+                        same = False
+                        break
+                if same:
+                    found = c
+                    break
+        if found < 0:
+            first[num] = b
+            found = num
+            num += 1
+        byte_class[b] = found
+    return byte_class, first[:num].copy()
+
+
 def _byte_classes(tables: Sequence[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
     """``(byte_class, first)``: the bytes no table's columns tell apart, as int64 [256] classes numbered by their
     smallest byte, and every class's smallest byte (int64 [classes], ascending)."""
-    stacked = np.concatenate([t.reshape(t.shape[0], 256) for t in tables], axis = 0)
-    _, first, inverse = np.unique(stacked.T, axis = 0, return_index = True, return_inverse = True)
-    rank = np.empty(first.size, dtype = np.int64)
-    rank[np.argsort(first)] = np.arange(first.size)
-    return rank[inverse.reshape(-1)], np.sort(first).astype(np.int64)
+    stacked = tables[0] if len(tables) == 1 else np.concatenate([t.reshape(t.shape[0], 256) for t in tables])
+    return _column_classes(np.ascontiguousarray(stacked))
 
 
 def _from_classes(table: np.ndarray, initial: int, accept: np.ndarray, byte_class: np.ndarray) -> ByteAutomaton:
@@ -54,7 +86,16 @@ def _from_classes(table: np.ndarray, initial: int, accept: np.ndarray, byte_clas
     remap = np.empty(num_blocks, dtype = np.int64)
     remap[order] = np.arange(num_blocks)
     d, acc = remap[d[order]], acc[order]
-    return _trimmed(d[:, byte_class].astype(np.int32), 0, acc)
+    live = _coreachable(d, np.ascontiguousarray(acc))           # (on the classes; the one dead state last)
+    keep = np.nonzero(live)[0]
+    dead = keep.size
+    remap = np.full(num_blocks, dead, dtype = np.int64)
+    remap[keep] = np.arange(keep.size)
+    table = np.full((keep.size + 1, d.shape[1]), dead, dtype = np.int64)
+    table[:keep.size] = remap[d[keep]]
+    accepting = np.zeros(keep.size + 1, dtype = bool)
+    accepting[:keep.size] = acc[keep]
+    return ByteAutomaton(np.ascontiguousarray(table[:, byte_class], dtype = np.int32), int(remap[0]), accepting, dead)
 
 
 def minimize(a: ByteAutomaton) -> ByteAutomaton:
@@ -266,12 +307,15 @@ class _Joined:
     def build(self, start: int) -> ByteAutomaton:
         total = self.size + self.extra
         num = lambda q: q if q >= 0 else self.size - 1 - q    # placeholders after the parts
-        byte_class, first = _byte_classes([a.delta for a in self.parts])
+        stacked = np.ascontiguousarray(np.concatenate([a.delta for a in self.parts]))
+        byte_class, first = _column_classes(stacked)
+        sizes = np.array([a.num_states for a in self.parts], dtype = np.int64)
+        offs = np.repeat(np.array(self.offsets, dtype = np.int64), sizes)[:, None]
+        deads = np.repeat(np.array([a.dead for a in self.parts], dtype = np.int64), sizes)[:, None]
         rows = np.full((total, first.size), -1, dtype = np.int64)
+        d = stacked[:, first].astype(np.int64)
+        rows[:self.size] = np.where(d == deads, -1, d + offs)       # (a part's dead state: no transition)
         accept = np.zeros(total, dtype = bool)
-        for a, off in zip(self.parts, self.offsets):
-            d = a.delta[:, first].astype(np.int64)
-            rows[off:off + a.num_states] = np.where(d == a.dead, -1, d + off)
         for q in self.accepting:
             accept[num(q)] = True
         src = np.array([num(u) for u, _ in self.eps], dtype = np.int64)
