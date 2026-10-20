@@ -36,7 +36,7 @@ from pyjuice.constraints.distributions import find_token
 from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
-from .common import (IDENTITY, NODE_TILE, _block_ptr, _exit_width, _interval, _logaddexp_tile, _lse_step, _slot,
+from .common import (IDENTITY, NODE_TILE, _block_ptr, _exit_width, _interval, _next_col, _logaddexp_tile, _lse_step, _slot,
                      _tf32_operand, _tile_rows, grid_chunks, node_groups, node_tiles, tensor)
 from .prod import _lse_step_one_exp
 from .prod_top_down import _once, _out_flows_ptr, _parent_base, _parent_lane
@@ -274,11 +274,12 @@ def _cw_input_block_term(mx, acc, i, ok, q, op, rp, iv_table, opos, rpos, coff, 
 
 @triton_jit
 def _class_weight_kernel(dfa_class_flow, cw_col, cw_K, cw_count, cw_cls, cw_off, element_flows, temp_flows, node_mars,
-                         prior_mars, temp, next_col, cls_ptr, cls_col, cls_succ, live, width, iv_of, iv_info, iv_table,
+                         prior_mars, temp, next_col, delta, state_id, col_of_state, cls_ptr, cls_col, cls_succ, live, width, iv_of,
+                         iv_info, iv_table,
                          once_iv, count,
                          start, columns, coff, crank, dests, tiles, ptr, parents, reg_offset, reg_width, reg_first,
                          prior_offset, prior_width, reg_prior, out_first, out_width, temp_width, tflow_width, B, n, W,
-                         C, pid0, BLOCK_INPUT: tl.constexpr, S_KIND: tl.constexpr, OUT_TEMP: tl.constexpr,
+                         C, K, pid0, HOMOGENEOUS: tl.constexpr, BLOCK_INPUT: tl.constexpr, S_KIND: tl.constexpr, OUT_TEMP: tl.constexpr,
                          PRUNE: tl.constexpr, OUT_FULL: tl.constexpr, S_FULL: tl.constexpr, UNIFORM: tl.constexpr,
                          COMPACT: tl.constexpr, MARS: tl.constexpr, STORE: tl.constexpr, WALK: tl.constexpr,
                          TN: tl.constexpr, SUBS: tl.constexpr, TB: tl.constexpr, TC: tl.constexpr, TJ: tl.constexpr):
@@ -296,7 +297,8 @@ def _class_weight_kernel(dfa_class_flow, cw_col, cw_K, cw_count, cw_cls, cw_off,
     where it leads somewhere, ``cls_ptr`` / ``cls_col`` / ``cls_succ`` (:class:`~.transitions.TransitionTables`),
     under evidence pruning those live for the lane's sample (``live`` [B, n + 1, W]) --, or over the SAMPLE's columns,
     every one of the boundary (``width``) or, under pruning, its live ones (``count`` / ``start`` / ``columns``, see
-    :meth:`~.live.Liveness.lists`), the class's successor from ``next_col``. The first costs the longest class list
+    :meth:`~.live.Liveness.lists`), the class's successor through the automaton's transitions (``delta``,
+    ``state_id``, ``col_of_state``, see :func:`~.common._next_col`). The first costs the longest class list
     among the lanes, the second the columns walked: a sparse automaton with every column live (nothing observed) takes
     the first, a few live columns the second -- the sample walk's lanes sharing the column (``UNIFORM``: a scalar, see
     :func:`_walk_column`; ``TB`` 1 under pruning) look slots up once per column, so the class walk must be
@@ -381,7 +383,7 @@ def _class_weight_kernel(dfa_class_flow, cw_col, cw_K, cw_count, cw_cls, cw_off,
             else:
                 for ii in range(0, steps):
                     i, ok = _walk_column(columns, cstart, ccount, cm, ii, PRUNE, UNIFORM)
-                    q = tl.load(next_col + (t * W + i).to(tl.int64) * C + cls, mask = ok, other = -1)
+                    q = _next_col(next_col, delta, state_id, col_of_state, t, i, cls, ok, K, W, C, HOMOGENEOUS)
                     mx, acc = _cw_block_input_term(mx, acc, i, ok, q, op, lp, iv_table, lpos, opos, coff, count, crank,
                                                    kl, kp, b, vm, once, l_own, M, E, X, t0, t, end, B, n, W, TJ,
                                                    S_FULL, OUT_FULL, COMPACT, MARS, UNIFORM)
@@ -418,7 +420,7 @@ def _class_weight_kernel(dfa_class_flow, cw_col, cw_K, cw_count, cw_cls, cw_off,
             else:
                 for ii in range(0, steps):
                     i, ok = _walk_column(columns, cstart, ccount, cm, ii, PRUNE, UNIFORM)
-                    q = tl.load(next_col + (t * W + i).to(tl.int64) * C + cls, mask = ok, other = -1)
+                    q = _next_col(next_col, delta, state_id, col_of_state, t, i, cls, ok, K, W, C, HOMOGENEOUS)
                     mx, acc = _cw_input_block_term(mx, acc, i, ok, q, op, rp, iv_table, opos, rpos, coff, count, crank,
                                                    kp, kr, b, vm, once, r_own, X, t, t2, end, B, n, W, TJ, S_KIND,
                                                    S_FULL, OUT_FULL, COMPACT, MARS, UNIFORM)
@@ -576,7 +578,7 @@ def class_weight_rows(prog, liveness, col_pos: torch.Tensor, col_K: torch.Tensor
     :param col_K, col_first: int64 [N] on the device, every column's row group's rows and first column
     :param group_first: int64 [row groups + 1] on the device, every row group's first column, then ``N``
     """
-    tt, n, W, C = prog.trans, prog.n, prog.next_col.size(1), prog.next_col.size(2)
+    tt, n, W, C = prog.trans, prog.n, prog.W, prog.C
     N, G, dev = col_K.numel(), group_first.numel() - 1, prog.dev
     M, a, b = max(N, 1), N + 1 + (N + 1) % 2, G + 2 + G % 2                 # (pieces 16 B aligned)
     z = torch.zeros(a + b + M, dtype = torch.int64, device = dev)
@@ -632,7 +634,7 @@ def run_class_weights(launches, cw: dict, prog, bufs, element_flows, temp_flows,
     """
     temp, temp_width = bufs
     tflow_width = temp_width if tflow_width is None else tflow_width
-    n, W, C = prog.n, prog.next_col.size(1), prog.next_col.size(2)
+    n, W, C = prog.n, prog.W, prog.C
     ivs, tt = prog.intervals, prog.trans
     prune = liveness is not None
     lists = liveness.lists() if prune else (cw["K"],) * 3
@@ -652,14 +654,17 @@ def run_class_weights(launches, cw: dict, prog, bufs, element_flows, temp_flows,
         for first, size in grid_chunks(host_cdiv(B, TB), 1):
             _class_weight_kernel[(tiles.numel() // NODE_TILE * (height // TN), size, host_cdiv(max(rows.most, 1), TC))](
                 cw["buf"], cw["col"], cw["K"], rows.count, rows.cls, rows.off, element_flows, temp_flows, node_mars,
-                prior["mars"], temp, prog.next_col, tt.cls_ptr, tt.cls_col, tt.cls_succ,
+                prior["mars"], temp, prog.next_col_arg, prog.delta, prog.state_id, prog.col_of_state, tt.cls_ptr,
+                tt.cls_col, tt.cls_succ,
                 liveness.live if prune else cw["K"], prog.width_t,
                 ivs.of, ivs.info, ivs.table, once_iv, *lists, *ctables,
                 la.dests, tiles, la.ptr, la.parents, regions["offset"], regions["width"], regions["first"],
                 prior["offset"], prior["width"], prior["reg_prior"], elem_first, elem_width, temp_width, tflow_width,
-                B, n, W, C, first, BLOCK_INPUT = la.form == "block_input", S_KIND = s_kind, OUT_TEMP = out_temp,
+                B, n, W, C, prog.K, first, BLOCK_INPUT = la.form == "block_input", S_KIND = s_kind,
+                OUT_TEMP = out_temp,
                 PRUNE = prune, OUT_FULL = out_full, S_FULL = all(s_full), UNIFORM = not prune or TB == 1,
                 COMPACT = compact is not None, MARS = inside, STORE = store, WALK = CLASS_WEIGHT_WALK, TN = TN,
+                HOMOGENEOUS = prog.homogeneous,
                 SUBS = height // TN, TB = TB, TC = TC, TJ = TJ, num_warps = warps)
 
 

@@ -7,7 +7,7 @@ import torch
 import pyjuice as juice
 import pyjuice.constraints as jc
 from pyjuice.constraints.inference.dfa_exact.kernels.prod import skip_masks
-from pyjuice.constraints.inference.dfa_exact.kernels.transitions import max_successors, transition_tables
+from pyjuice.constraints.inference.dfa_exact.kernels.transitions import transition_stats, transition_tables
 from pyjuice.constraints.inference.dfa_exact.compiled.layout import (Reachability, _tile_any, build_layout,
                                                                     interval_tables)
 
@@ -42,7 +42,7 @@ def test_running_example():
     # boundary 2 holds states {0, 1, 2} in order; boundary 3 holds {1, 2}
     assert L.state_id[2].tolist() == [0, 1, 2] and L.state_id[3, :2].tolist() == [1, 2]
     c0, c1, c2 = (int(dfa.token_class[v]) for v in (0, 1, 2))       # other, token 1, token 2
-    nxt = lambda k, c: int(L.next_col[2, k, c])
+    nxt = lambda k, c: int(L.next_col_at(2)[k, c])
     col3 = lambda s: int(L.col_of_state[3, s])
     # state 0 with two tokens left must read "1" now; state 1 continues with 1 or finishes with 2
     assert (nxt(0, c0), nxt(0, c1), nxt(0, c2)) == (-1, col3(1), -1)
@@ -76,15 +76,16 @@ def test_successors_are_consistent():
             continue
         delta = dfa.delta
         for t in range(n):
+            table = L.next_col_at(t)
+            assert table.shape == (int(L.width[t]), dfa.num_classes)   # a row per column, none for padding
             for k in range(int(L.width[t])):
                 s = int(L.state_id[t, k])
-                cols = L.next_col[t, k]
+                cols = table[k]
                 assert (cols >= 0).any(), "an active state must have an active successor"
                 for c in range(dfa.num_classes):
                     succ = int(delta[s, c])
                     expect = int(L.col_of_state[t + 1, succ])
                     assert int(cols[c]) == expect                    # -1 exactly when inactive at t + 1
-            assert (L.next_col[t, int(L.width[t]):] == -1).all()     # padding columns lead nowhere
 
 
 def to_accept(dfa, n):
@@ -253,30 +254,30 @@ def test_skip_masks_span_several_words():
 @pytest.mark.parametrize("grouped", [False, True])
 @pytest.mark.parametrize("seed", range(4))
 def test_transition_tables_against_next_col(seed, grouped):
-    """Against next_col directly. Ungrouped: every column's entries are its classes that lead somewhere (class
-    order), with their successors. Grouped: its distinct successors (one column at a sequence end), each entry's
-    mass index its pair's number within the boundary, and pair_of sends every class to its pair. Either way, every
-    exit column's predecessor entries are the entries that lead there, in column order."""
+    """Against the boundaries' transition tables directly. Ungrouped: every column's entries are its classes that
+    lead somewhere (class order), with their successors. Grouped: its distinct successors (one column at a sequence
+    end), each entry's mass index its pair's number within the boundary. Either way, every exit column's predecessor
+    entries are the entries that lead there, in column order; the transition statistics are the tables'."""
     dfa = random_dfa(6, 7, seed)
     n = 5
     L = build_layout(dfa, n)
     width = L.width.tolist()
-    tt = transition_tables(L.next_col, width, n, grouped)
+    tr = L.transitions(torch.device("cpu"))
+    tt = transition_tables(tr, grouped)
     ptr, succ, xs = tt.entry_ptr.long(), tt.entry_succ.long(), tt.entry_x.long()
     pred_ptr, pred_col, pred_x = tt.pred_ptr.long(), tt.pred_col.long(), tt.pred_x.long()
     for t in range(n):
         lead = []                                                         # (column, successor, class), in order
+        table = L.next_col_at(t)
         for q in range(width[t]):
-            for c in range(L.next_col.size(2)):
-                s = int(L.next_col[t, q, c])
+            for c in range(L.num_classes):
+                s = int(table[q, c])
                 if s >= 0:
                     lead.append((q, 0 if t + 1 == n else s, c))
         if grouped:
             want = sorted({(q, s) for q, s, _ in lead})                   # by column, then successor
             want = [(q, s, k) for k, (q, s) in enumerate(want)]
             assert tt.num_pairs[t] == len(want)
-            for q, s, c in lead:
-                assert (q, s) == want[int(tt.pair_of[t, q, c])][:2]
         else:
             want = lead
         got = [(q, int(succ[e]), int(xs[e])) for q in range(width[t]) for e in range(int(ptr[t, q]), int(ptr[t, q + 1]))]
@@ -286,13 +287,14 @@ def test_transition_tables_against_next_col(seed, grouped):
             assert preds == [(q, x) for q, s, x in want if s == j]
     if grouped:
         assert tt.max_pairs == max(int(ptr[t, q + 1] - ptr[t, q]) for t in range(n) for q in range(width[t]))
-        assert max_successors(L.next_col, width, n) == max(1, max(int(ptr[t, q + 1] - ptr[t, q])
-                                                                  for t in range(n - 1) for q in range(width[t])))
+        live, columns, most = transition_stats(tr)
+        assert most == max(1, max(int(ptr[t, q + 1] - ptr[t, q]) for t in range(n - 1) for q in range(width[t])))
+        assert columns == sum(width[:n]) and live == sum(int((L.next_col_at(t) >= 0).sum()) for t in range(n))
 
 
 def test_unsatisfiable_constraint_has_empty_boundaries():
     L = build_layout(jc.DFA.contains([[1, 2, 1]], 4), 2)
-    assert not L.satisfiable and (L.width == 0).all() and (L.next_col == -1).all()
+    assert not L.satisfiable and (L.width == 0).all() and all(L.next_col_at(t).numel() == 0 for t in range(2))
 
 
 def test_layouts_are_cached_by_fingerprint():

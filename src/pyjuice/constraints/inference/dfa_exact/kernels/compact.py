@@ -397,7 +397,7 @@ def regather(prog, old: "CompactLayout", src: torch.Tensor, new: "CompactLayout"
     table = torch.from_numpy(np.ascontiguousarray(table, dtype = np.int64)).to(prog.dev)
     grid = (-(-max(new.lanes(k), 1) // REGATHER_TILE), regs.size, -(-int(prog.reg_rows[regs].max()) // REGATHER_ROWS))
     _regather_kernel[grid](src, dst, table, parents, old.off, old.count, old.rank, new.off, new.count, new.start,
-                           new.columns, old.B, new.B, prog.n, prog.next_col.size(1), new.steps, ROWS = REGATHER_ROWS,
+                           new.columns, old.B, new.B, prog.n, prog.W, new.steps, ROWS = REGATHER_ROWS,
                            TILE = REGATHER_TILE, num_warps = 4)
 
 

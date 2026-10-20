@@ -13,7 +13,7 @@ weight (``enum_logw``, see :class:`~..state.ClassMasses`) over the row's ``Z``.
 """
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -23,7 +23,7 @@ from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
 from ....distributions.categorical import _exact_dot
-from .common import grid_chunks
+from .common import _next_col_of, grid_chunks
 
 
 
@@ -52,30 +52,29 @@ class EnumeratedTokens:
     ptr_host: np.ndarray
 
 
-def enumerated_tokens(next_col: torch.Tensor, width, n: int, classes) -> EnumeratedTokens:
-    """The :class:`EnumeratedTokens` of a layout's ``next_col`` [n, W, C] under ``classes`` (a
-    :class:`~pyjuice.constraints.distributions.TokenClasses`)."""
-    C = next_col.size(2)
-    dev = next_col.device
-    nc = next_col.cpu()
-    stored = classes.stored_of_class.cpu().long()
-    etok = classes.enumerated_token.cpu().long()
-    code = stored.expand(n, C).clone() if n > 0 else torch.zeros(0, C, dtype = torch.long)
+def enumerated_tokens(tr, classes) -> EnumeratedTokens:
+    """The :class:`EnumeratedTokens` of a layout's transitions ``tr`` (a :class:`~..compiled.layout.Transitions`, on
+    the device) under ``classes`` (a :class:`~pyjuice.constraints.distributions.TokenClasses`)."""
+    n, C, dev = tr.n, tr.C, tr.device
+    stored = classes.stored_of_class.to(dev).long()
+    etok = classes.enumerated_token.to(dev).long()
+    code = stored.expand(n, C).clone() if n > 0 else torch.zeros(0, C, dtype = torch.long, device = dev)
     ptr = torch.zeros(n + 1, dtype = torch.long)
     place = torch.cumsum(etok >= 0, dim = 0) - 1                             # an enumerated class's among them
     toks, places = [], []
     if classes.num_enumerated > 0:
         for t in range(n):
-            live = (nc[t, :int(width[t])] >= 0).any(dim = 0) & (etok >= 0)   # enumerated classes live at t
+            live = (tr.at(t) >= 0).any(dim = 0) & (etok >= 0)                # enumerated classes live at t
             ids = torch.nonzero(live).view(-1)
-            e = torch.full((C,), ids.numel(), dtype = torch.long)              # (dead: the count, past the last)
-            e[ids] = torch.arange(ids.numel())
+            e = torch.full((C,), ids.numel(), dtype = torch.long, device = dev)   # (dead: the count, past the last)
+            e[ids] = torch.arange(ids.numel(), device = dev)
             code[t] = torch.where(etok >= 0, -1 - e, stored)
             ptr[t + 1] = ptr[t] + ids.numel()
             toks.append(etok[ids])
             places.append(place[ids])
-    tok = torch.cat(toks + [torch.zeros(1, dtype = torch.long)])
-    index = torch.cat(places + [torch.zeros(1, dtype = torch.long)])
+    zero = torch.zeros(1, dtype = torch.long, device = dev)
+    tok = torch.cat(toks + [zero])
+    index = torch.cat(places + [zero])
     i32 = lambda x: x.to(dev, torch.int32).contiguous()
     return EnumeratedTokens(ptr = i32(ptr), tok = i32(tok), index = i32(index), code = i32(code), num = int(ptr[-1]),
                             ptr_host = ptr.numpy())
@@ -97,8 +96,6 @@ class TransitionTables:
         code, or its pair's number within the boundary
     :ivar pred_ptr, pred_col, pred_x: the entries leading to column ``j`` at ``t + 1``, as a CSR (``pred_ptr``
         [n, W + 1]) into their columns and their mass indices
-    :ivar pair_of: grouped only, [n, W, C] int32: the pair (within the boundary) every class of every column leads
-        to, -1 where it leads nowhere
     :ivar num_pairs: grouped only, pairs per boundary (Python ints)
     :ivar max_pairs: grouped only, the most pairs of any column
     :ivar enum_ptr, enum_e, enum_pair: grouped only, the enumerated classes' live entries of every column, as a CSR
@@ -122,7 +119,6 @@ class TransitionTables:
     pred_ptr: torch.Tensor
     pred_col: torch.Tensor
     pred_x: torch.Tensor
-    pair_of: Optional[torch.Tensor]
     num_pairs: list
     max_pairs: int
     enum_ptr: Optional[torch.Tensor] = None
@@ -138,43 +134,48 @@ class TransitionTables:
     pred_class: Optional[torch.Tensor] = None
 
 
-def max_successors(next_col: torch.Tensor, width, n: int) -> int:
-    """The most distinct columns one column reaches in one token, at any boundary (a sequence end being one)."""
-    W = next_col.size(1)
-    nc, most = next_col.cpu().long(), 0
-    for t in range(n - 1):                                                  # the last boundary: one column
-        succ = nc[t, :int(width[t])]
-        q, c = torch.nonzero(succ >= 0, as_tuple = True)
-        if q.numel():
-            pairs = torch.unique(q * (W + 1) + succ[q, c])
-            most = max(most, int(torch.bincount(pairs // (W + 1)).max()))
-    return max(1, most)
+def transition_stats(tr) -> Tuple[int, int, int]:
+    """``(live, columns, most)`` of a layout's transitions ``tr`` (a :class:`~..compiled.layout.Transitions`): how many
+    (column, class) pairs of the boundaries lead somewhere, how many columns the boundaries have, and the most distinct
+    columns one column reaches in one token at any boundary but the last (a sequence end being one column; at least
+    1) -- one pass over the boundaries' tables."""
+    n, W = tr.n, tr.W
+    live = columns = 0
+    most = 1
+    for t in range(n):
+        nc = tr.at(t)
+        alive = nc >= 0
+        live += int(alive.sum())
+        columns += nc.size(0)
+        if t + 1 < n and nc.numel():
+            q, c = torch.nonzero(alive, as_tuple = True)
+            if q.numel():
+                pairs = torch.unique(q * (W + 1) + nc[q, c])
+                most = max(most, int(torch.bincount(pairs // (W + 1)).max()))
+    return live, columns, most
 
 
-def transition_tables(next_col: torch.Tensor, width, n: int, grouped: bool,
-                      enum: Optional[EnumeratedTokens] = None) -> TransitionTables:
-    """The :class:`TransitionTables` of a layout's ``next_col`` [n, W, C] and boundary widths; ``enum`` the
-    :class:`EnumeratedTokens` (None: nothing enumerated, every class's code the class itself)."""
-    W, C = next_col.size(1), next_col.size(2)
-    nc = next_col.cpu().long()
-    code = enum.code.cpu().long() if enum is not None and enum.num > 0 else None
-    entry_ptr = torch.zeros(n, W + 1, dtype = torch.int64)
-    pred_ptr = torch.zeros(n, W + 1, dtype = torch.int64)
-    enum_ptr = torch.zeros(n, W + 1, dtype = torch.int64)
-    pair_of = torch.full((n, W, C), -1, dtype = torch.int64) if grouped else None
-    cls_ptr = torch.zeros(n, C + 1, dtype = torch.int64)
-    cls_order = torch.arange(C, dtype = torch.int64).repeat(n, 1)
+def transition_tables(tr, grouped: bool, enum: Optional[EnumeratedTokens] = None) -> TransitionTables:
+    """The :class:`TransitionTables` of a layout's transitions ``tr`` (a :class:`~..compiled.layout.Transitions`, on
+    the device; built there a boundary at a time); ``enum`` the :class:`EnumeratedTokens` (None: nothing enumerated,
+    every class's code the class itself)."""
+    n, W, C, dev = tr.n, tr.W, tr.C, tr.device
+    code = enum.code.long() if enum is not None and enum.num > 0 else None
+    zeros = lambda *shape: torch.zeros(*shape, dtype = torch.int64, device = dev)
+    arange = lambda k: torch.arange(k, dtype = torch.int64, device = dev)
+    entry_ptr, pred_ptr, enum_ptr = zeros(n, W + 1), zeros(n, W + 1), zeros(n, W + 1)
+    cls_ptr = zeros(n, C + 1)
+    cls_order = arange(C).repeat(n, 1)
     succs, xs, cols, pxs, num_pairs, ees, epairs, ccols, csuccs = [], [], [], [], [], [], [], [], []
     clss, pclss = [], []                                                    # (ungrouped: the entries' classes)
     base = max_pairs = ebase = max_enum = cbase = max_cls = 0
     for t in range(n):
-        wt = int(width[t])
-        succ = nc[t, :wt]                                                    # [wt, C]
+        succ = tr.at(t)                                                      # [wt, C]
         if t + 1 == n:
             succ = torch.where(succ >= 0, 0, -1)                             # a sequence end: one column
         q, c = torch.nonzero(succ >= 0, as_tuple = True)                     # by column, then class
         by_cls = torch.argsort(c * (W + 1) + q, stable = True)               # by class, then column
-        cls_ptr[t] = cbase + torch.searchsorted(c[by_cls], torch.arange(C + 1))
+        cls_ptr[t] = cbase + torch.searchsorted(c[by_cls], arange(C + 1))
         ccols.append(q[by_cls]); csuccs.append(succ[q, c][by_cls])
         cbase += q.numel()
         lengths = torch.bincount(c, minlength = C)
@@ -182,33 +183,30 @@ def transition_tables(next_col: torch.Tensor, width, n: int, grouped: bool,
         max_cls = max(max_cls, int(lengths.max()) if q.numel() else 0)
         if grouped:
             key, inverse = torch.unique(q * (W + 1) + succ[q, c], return_inverse = True)    # by column, successor
-            eq, es, ex = key // (W + 1), key % (W + 1), torch.arange(key.numel())
-            pair_of[t, q, c] = inverse
+            eq, es, ex = key // (W + 1), key % (W + 1), arange(key.numel())
             num_pairs.append(key.numel())
             max_pairs = max(max_pairs, int(torch.bincount(eq, minlength = 1).max()) if key.numel() else 0)
             if code is not None:                                             # the enumerated classes' live entries
                 en = code[t, c] < 0
-                enum_ptr[t] = ebase + torch.searchsorted(q[en], torch.arange(W + 1))
+                enum_ptr[t] = ebase + torch.searchsorted(q[en], arange(W + 1))
                 ees.append(-1 - code[t, c[en]]); epairs.append(inverse[en])
                 ebase += int(en.sum())
                 max_enum = max(max_enum, int(torch.bincount(q[en], minlength = 1).max()) if en.any() else 0)
         else:
             eq, es, ex = q, succ[q, c], (c if code is None else code[t, c])
             clss.append(c)
-        entry_ptr[t] = base + torch.searchsorted(eq, torch.arange(W + 1))
+        entry_ptr[t] = base + torch.searchsorted(eq, arange(W + 1))
         by_succ = torch.argsort(es * (W + 1) + eq, stable = True)
-        pred_ptr[t] = base + torch.searchsorted(es[by_succ], torch.arange(W + 1))
+        pred_ptr[t] = base + torch.searchsorted(es[by_succ], arange(W + 1))
         succs.append(es); xs.append(ex); cols.append(eq[by_succ]); pxs.append(ex[by_succ])
         if not grouped:
             pclss.append(c[by_succ])
         base += eq.numel()
-    dev = next_col.device
     i32 = lambda x: x.to(dev, torch.int32).contiguous()
     cat = lambda xs, total: i32(torch.cat(xs)) if total > 0 else torch.zeros(1, dtype = torch.int32, device = dev)
     return TransitionTables(grouped = grouped, entry_ptr = i32(entry_ptr), entry_succ = cat(succs, base),
                             entry_x = cat(xs, base), pred_ptr = i32(pred_ptr), pred_col = cat(cols, base),
-                            pred_x = cat(pxs, base), pair_of = i32(pair_of) if grouped else None,
-                            num_pairs = num_pairs, max_pairs = max_pairs,
+                            pred_x = cat(pxs, base), num_pairs = num_pairs, max_pairs = max_pairs,
                             enum_ptr = i32(enum_ptr) if grouped else None,
                             enum_e = cat(ees, ebase) if grouped else None,
                             enum_pair = cat(epairs, ebase) if grouped else None, max_enum = max_enum,
@@ -243,9 +241,10 @@ def transition_job(rows: torch.Tensor, dev):
 
 
 @triton_jit
-def _transition_kernel(class_mars, mass_row, mass_stride, trans, rows, tiles, pair_of, entry_ptr, class_of_stored,
-                       enum_ptr, enum_e, enum_pair, tok_ptr, eidx, eprobs, prow, lognorm, enum_logw, width, W, C, Cs,
-                       num_enum, logw_stride, input_start, num_qtiles, trans_stride, pid0, TS: tl.constexpr,
+def _transition_kernel(class_mars, mass_row, mass_stride, trans, rows, tiles, delta, state_id, col_of_state,
+                       entry_succ, entry_ptr, class_of_stored, enum_ptr, enum_e, enum_pair, tok_ptr, eidx, eprobs,
+                       prow, lognorm, enum_logw, width, W, C, K, n, Cs, num_enum, logw_stride, input_start,
+                       num_qtiles, trans_stride, pid0, TS: tl.constexpr,
                        QT: tl.constexpr, TP: tl.constexpr, TC: tl.constexpr, TE: tl.constexpr, SAMPLE: tl.constexpr,
                        ENUM: tl.constexpr, LOGW: tl.constexpr):
     """
@@ -253,8 +252,10 @@ def _transition_kernel(class_mars, mass_row, mass_stride, trans, rows, tiles, pa
     sample's own (rows ``mass_row + b * mass_stride``, transition masses ``trans_stride`` floats apart; a row the same
     for every sample, stride 0, is built for sample 0 alone): per column, its pairs ``TP`` at a time, as the product
     of the rows' class masses -- linear, scaled by 2^64, in column order over the ``Cs`` stored classes
-    (``class_of_stored``: every column's class, where ``pair_of`` reads) -- with the 0/1 table of which of the pairs
-    every class leads to. A class mass is a sum of fp32 probabilities, so 0 or at least 2^-149: scaled, a normal
+    (``class_of_stored``: every column's class) -- with the 0/1 table of which of the pairs every class leads to: the
+    class's successor column (the automaton's transitions ``delta`` through the boundaries' column maps ``state_id``
+    and ``col_of_state``, a sequence end's being 0) against the pairs' (``entry_succ``, the boundary's entries being
+    its pairs by column and successor). A class mass is a sum of fp32 probabilities, so 0 or at least 2^-149: scaled, a normal
     float, which tensor cores do not flush. ``ENUM``: then the column's enumerated entries (``enum_ptr`` / ``enum_e``
     / ``enum_pair``, see :class:`TransitionTables`), ``TE`` at a time, each the mass of its token: its probability
     under the row's parameter row (``eprobs[prow[row], eidx[e]]``, ``num_enum`` the table's row stride) times --
@@ -289,17 +290,19 @@ def _transition_kernel(class_mars, mass_row, mass_stride, trans, rows, tiles, pa
         q = (pid % num_qtiles) * QT + qi
         if q < tl.load(width + t):
             g_end = tl.load(entry_ptr + t * (W + 1) + q + 1) - base
-            col = pair_of + (t * W + q).to(tl.int64) * C
+            sq = tl.load(state_id + t * W + q)                                                   # the column's state
             for g0 in range(tl.load(entry_ptr + t * (W + 1) + q) - base, g_end, TP):
                 acc = tl.zeros([TS, TP], dtype = tl.float32)
+                sg = tl.load(entry_succ + base + g0 + jj, mask = g0 + jj < g_end, other = -2)   # the pairs' successors
                 for c0 in range(0, Cs, TC):
                     c = c0 + tl.arange(0, TC)
                     cmask = c < Cs
                     x = tl.exp(tl.load(masses[:, None] + c[None, :], mask = rmask[:, None] & cmask[None, :],
                                        other = float("-inf")) + 44.3614195558365)                # x 2^64
                     cls = tl.load(class_of_stored + c, mask = cmask, other = 0)
-                    g = tl.load(col + cls, mask = cmask, other = -1) - g0                        # pair in the tile
-                    acc += _exact_dot(x, tl.where(g[:, None] == jj[None, :], 1.0, 0.0))
+                    sc = _next_col_of(delta, col_of_state, sq, cls, cmask, t, K, C)             # the classes' successors
+                    sc = tl.where((t + 1 == n) & (sc >= 0), 0, sc)
+                    acc += _exact_dot(x, tl.where(sc[:, None] == sg[None, :], 1.0, 0.0))
                 if ENUM:                                                     # the column's enumerated entries
                     e_end = tl.load(enum_ptr + t * (W + 1) + q + 1)
                     for e0 in range(tl.load(enum_ptr + t * (W + 1) + q), e_end, TE):
@@ -348,7 +351,7 @@ def transition_masses(trans, job, masses, prog):
     """
     rows, tiles, TS = job
     tt, cfg, en = prog.trans, TRANSITION_TILES, prog.enum
-    W, C = prog.next_col.size(1), prog.next_col.size(2)
+    W, C = prog.W, prog.C
     QT = cfg["QT"]
     while QT > 1 and tiles.size(0) * host_cdiv(max(prog.width), QT) < cfg["programs"]:
         QT //= 2
@@ -361,12 +364,12 @@ def transition_masses(trans, job, masses, prog):
     eprobs = masses.enum_probs if enum else masses.table
     for first, size in grid_chunks(tiles.size(0) * num_qtiles, 0):
         _transition_kernel[(size, masses.batch)](
-            masses.table, masses.row, stride, trans, rows, tiles, tt.pair_of, tt.entry_ptr,
-            prog.token_classes.class_of_stored32, tt.enum_ptr if enum else tt.entry_ptr,
+            masses.table, masses.row, stride, trans, rows, tiles, prog.delta, prog.state_id, prog.col_of_state,
+            tt.entry_succ, tt.entry_ptr, prog.token_classes.class_of_stored32, tt.enum_ptr if enum else tt.entry_ptr,
             tt.enum_e if enum else tt.entry_ptr,
             tt.enum_pair if enum else tt.entry_ptr, en.ptr, en.index, eprobs, masses.prow,
             masses.lognorm if logw else masses.table, masses.enum_logw if logw else masses.table, prog.width_t, W, C,
-            masses.table.size(1), eprobs.size(1), enum_logw_stride(masses), prog.input_start, num_qtiles,
+            prog.K, prog.n, masses.table.size(1), eprobs.size(1), enum_logw_stride(masses), prog.input_start, num_qtiles,
             prog.trans_size, first,
             TS = TS, QT = QT, TP = TP, TC = cfg["TC"], TE = min(64, max(16, host_next_power_of_2(max(tt.max_enum, 1)))),
             SAMPLE = sample, ENUM = enum, LOGW = logw, num_warps = cfg["warps"])

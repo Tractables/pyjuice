@@ -43,7 +43,7 @@ from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
 from ..compiled.layout import Reachability, _tile_any
-from .common import _block_ptr, _child, _exit_width, _interval, _lse_step, _pair, _slot, _tf32_operand, grid_chunks
+from .common import _block_ptr, _child, _exit_width, _interval, _lse_step, _next_col, _pair, _slot, _tf32_operand, grid_chunks
 from .compact import _lane_pairs, _lane_sample, _operand_slot
 from .transitions import enumerated_args
 
@@ -317,11 +317,11 @@ def _block_value(rp, iv_table, rpos, q, j, X, pm, r_own, crank, b, t, rbase, ce,
 
 
 @triton_jit
-def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, class_mars, mass_row, mass_stride, trans,
+def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, delta, state_id, col_of_state, class_mars, mass_row, mass_stride, trans,
                         trans_stride, entry_ptr, entry_succ, entry_x, width, iv_of, iv_info, iv_table, live, coff,
                         ccount, cstart, ccolumns, crank, steps, sel, reg_offset, reg_width, reg_first, prior_mars,
                         prior_offset, prior_width, reg_prior, code, tok_ptr, eidx, eprobs, prow, lognorm, enum_logw, Cs,
-                        num_enum, logw_stride, out_first, out_width, temp_width, B, n, W, C, input_start, csteps, pid0,
+                        num_enum, logw_stride, out_first, out_width, temp_width, B, n, W, C, K, HOMOGENEOUS: tl.constexpr, input_start, csteps, pid0,
                         succ_start, succ_count, succ_use, succ_entries, E, R_KIND: tl.constexpr,
                         OUT_TEMP: tl.constexpr, GROUPED: tl.constexpr, PRUNE: tl.constexpr, OUT_FULL: tl.constexpr,
                         R_FULL: tl.constexpr, COMPACT: tl.constexpr, INDEXED: tl.constexpr, SAMPLE: tl.constexpr,
@@ -371,7 +371,7 @@ def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
         # an observed token: its own log-probability (the input region of node_mars), then the block from the
         # column its class leads to
         obs = ml & (oc >= 0)
-        q = tl.load(next_col + (t * W + i).to(tl.int64) * C + oc, mask = obs, other = -1)
+        q = _next_col(next_col, delta, state_id, col_of_state, t, i, oc, obs, K, W, C, HOMOGENEOUS)
         if R_KIND == 2:
             rv = tl.where((q == j) | (end & (q >= 0)), 0.0, float("-inf"))
         else:
@@ -422,7 +422,7 @@ def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
                                            num_enum, logw_stride, R_KIND, R_FULL, COMPACT, GROUPED, ENUM, LOGW)
             else:                                                            # every class in class order, the dead
                 for c in range(C):                                           # ones -inf (no entry tables read)
-                    q = tl.load(next_col + (t * W + i).to(tl.int64) * C + c, mask = miss, other = -1)
+                    q = _next_col(next_col, delta, state_id, col_of_state, t, i, c, miss, K, W, C, HOMOGENEOUS)
                     q = tl.where(end & (q >= 0), 0, q)                       # (a sequence end: one column, as the
                     pm = miss & (q >= 0)                                     # entry tables have it)
                     if R_KIND == 2:
@@ -443,12 +443,12 @@ def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
 
 
 @triton_jit
-def _input_block_group_kernel(element_mars, node_mars, temp, obs_class, next_col, class_mars, mass_row, mass_stride,
+def _input_block_group_kernel(element_mars, node_mars, temp, obs_class, next_col, delta, state_id, col_of_state, class_mars, mass_row, mass_stride,
                               entry_ptr, entry_succ, entry_x, width, iv_of, iv_info, iv_table, live, coff, ccount,
                               cstart, ccolumns, crank, steps, groups, sel, reg_offset, reg_width, reg_first,
                               prior_mars, prior_offset, prior_width, reg_prior, code, tok_ptr, eidx, eprobs, prow,
                               lognorm, enum_logw, Cs, num_enum, logw_stride, out_first, out_width, temp_width, B, n, W,
-                              C, input_start, csteps, pid0, succ_start, succ_count, succ_use, succ_entries, E,
+                              C, K, HOMOGENEOUS: tl.constexpr, input_start, csteps, pid0, succ_start, succ_count, succ_use, succ_entries, E,
                               R_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, PRUNE: tl.constexpr,
                               OUT_FULL: tl.constexpr, R_FULL: tl.constexpr, G: tl.constexpr, ONE_EXP: tl.constexpr,
                               COMPACT: tl.constexpr, INDEXED: tl.constexpr, SAMPLE: tl.constexpr, ENUM: tl.constexpr,
@@ -499,7 +499,7 @@ def _input_block_group_kernel(element_mars, node_mars, temp, obs_class, next_col
 
         # an observed token, as in _input_block_kernel
         obs = ml & (oc >= 0)
-        q = tl.load(next_col + (t * W + i).to(tl.int64) * C + oc, mask = obs, other = -1)
+        q = _next_col(next_col, delta, state_id, col_of_state, t, i, oc, obs, K, W, C, HOMOGENEOUS)
         sl = _operand_slot(iv_table, rpos, q, j, X, obs, own, crank, b, t + 1, q, rbase, ce, n, W, R_FULL, COMPACT)
         val = tl.load(node_mars + u[:, None] * B + b[None, :], mask = gm[:, None] & obs[None, :], other = float("-inf")) + \
             tl.load(rp + sl[None, :], mask = gm[:, None] & (obs & (sl >= 0))[None, :], other = float("-inf"))
@@ -551,7 +551,7 @@ def _input_block_group_kernel(element_mars, node_mars, temp, obs_class, next_col
                                             num_enum, logw_stride, R_FULL, COMPACT, ENUM, LOGW, ONE_EXP)
             else:                                                            # every class in class order, the dead
                 for c in range(C):                                           # ones -inf (no entry tables read)
-                    q = tl.load(next_col + (t * W + i).to(tl.int64) * C + c, mask = miss, other = -1)
+                    q = _next_col(next_col, delta, state_id, col_of_state, t, i, c, miss, K, W, C, HOMOGENEOUS)
                     q = tl.where((t + 1 == n) & (q >= 0), 0, q)              # (a sequence end: one column, as the
                     pm = miss & (q >= 0)                                     # entry tables have it)
                     if ENUM:
@@ -575,11 +575,11 @@ def _input_block_group_kernel(element_mars, node_mars, temp, obs_class, next_col
 
 
 @triton_jit
-def _block_input_kernel(element_mars, node_mars, temp, obs_class, next_col, class_mars, mass_row, mass_stride, trans,
+def _block_input_kernel(element_mars, node_mars, temp, obs_class, next_col, delta, state_id, col_of_state, class_mars, mass_row, mass_stride, trans,
                         trans_stride, pred_ptr, pred_col, pred_x, width, iv_of, iv_info, iv_table, live, coff, ccount,
                         cstart, ccolumns, crank, steps, sel, reg_offset, reg_width, reg_first, prior_mars,
                         prior_offset, prior_width, reg_prior, code, tok_ptr, eidx, eprobs, prow, lognorm, enum_logw, Cs,
-                        num_enum, logw_stride, out_first, out_width, temp_width, B, n, W, C, input_start, csteps, pid0,
+                        num_enum, logw_stride, out_first, out_width, temp_width, B, n, W, C, K, HOMOGENEOUS: tl.constexpr, input_start, csteps, pid0,
                         L_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, GROUPED: tl.constexpr, PRUNE: tl.constexpr,
                         OUT_FULL: tl.constexpr, L_FULL: tl.constexpr, COMPACT: tl.constexpr, INDEXED: tl.constexpr,
                         SAMPLE: tl.constexpr, ENUM: tl.constexpr, LOGW: tl.constexpr, TILE: tl.constexpr,
@@ -640,7 +640,8 @@ def _block_input_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
             q = tl.load(pred_col + e0 + k, mask = em, other = 0)
             x = tl.load(pred_x + e0 + k, mask = em, other = 0)
             if GROUPED:                                                      # does the observed class lead to j?
-                nq = tl.load(next_col + (t * W + q).to(tl.int64) * C + tl.maximum(oc, 0), mask = em, other = -1)
+                nq = _next_col(next_col, delta, state_id, col_of_state, t, q, tl.maximum(oc, 0), em, K, W, C,
+                               HOMOGENEOUS)
                 holds = (nq == j) | (end & (nq >= 0))
                 mass = tl.load(masses + x, mask = em & (oc < 0), other = float("-inf"))
             else:                                                            # is it this entry's class?
@@ -1189,7 +1190,7 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, masses, o
                   prior_mars = prior["mars"], prior_offset = prior["offset"], prior_width = prior["width"],
                   reg_prior = prior["reg_prior"], out_first = elem_first, out_width = elem_width,
                   temp_width = temp_width)
-    n, W, C = prog.n, prog.next_col.size(1), prog.next_col.size(2)
+    n, W, C = prog.n, prog.W, prog.C
     ivs = prog.intervals
     prune, live = live is not None, live if live is not None else obs_class
     sample = masses.batch > 1
@@ -1248,12 +1249,13 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, masses, o
                             tile = min(_flat_tile(lanes), 1024 // G)
                             for first, size in grid_chunks(host_cdiv(lanes, tile), 1):
                                 _input_block_group_kernel[(gcnt, size)](
-                                    element_mars, node_mars, temp, obs_class, prog.next_col, entry_ptr = tt.entry_ptr,
+                                    element_mars, node_mars, temp, obs_class, prog.next_col_arg, prog.delta, prog.state_id,
+                                    prog.col_of_state, entry_ptr = tt.entry_ptr,
                                     entry_succ = tt.entry_succ, entry_x = tt.entry_x,
                                     width = prog.width_t, iv_of = ivs.of, iv_info = ivs.info, iv_table = ivs.table,
                                     live = live, steps = part, groups = firsts,
                                     sel = firsts if gsel is None else gsel.tensor, B = B, n = n, W = W, C = C,
-                                    input_start = prog.input_start, pid0 = first, R_KIND = r_kind,
+                                    K = prog.K, input_start = prog.input_start, pid0 = first, HOMOGENEOUS = prog.homogeneous, R_KIND = r_kind,
                                     OUT_TEMP = out_temp, PRUNE = prune, OUT_FULL = out_full, R_FULL = all(r_full),
                                     G = G, ONE_EXP = one_exp, COMPACT = compact is not None,
                                     INDEXED = gsel is not None, ENTRIES = prog.entry_loop, TILE = tile,
@@ -1262,7 +1264,7 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, masses, o
                         # the group sizes the Program built (its default first), each step form: timed per shape (the
                         # steps rounded up to a power of 2, so that queries running subsets of a launch share choices)
                         cands = [(G, one_exp) for one_exp in INPUT_BLOCK_ONE_EXP for G in groups]
-                        key = ("lifted_input_block_group", kinds, prune, compact is not None, sample, C,
+                        key = ("lifted_input_block_group", kinds, prune, compact is not None, sample, C, prog.homogeneous,
                                host_next_power_of_2(S), host_next_power_of_2(lanes), tuple(groups),
                                succ["SUCC_LISTS"], bool(held(out_temp)))
                         input_block_group(autotune.pick(key, cands, input_block_group))   # outputs overwritten
@@ -1271,11 +1273,12 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, masses, o
                         tile = _flat_tile(lanes)
                         for first, size in grid_chunks(host_cdiv(lanes, tile), 1):
                             _input_block_kernel[(cnt, size)](
-                                element_mars, node_mars, temp, obs_class, prog.next_col, trans = trans,
+                                element_mars, node_mars, temp, obs_class, prog.next_col_arg, prog.delta, prog.state_id,
+                                    prog.col_of_state, trans = trans,
                                 trans_stride = prog.trans_size, entry_ptr = tt.entry_ptr, entry_succ = tt.entry_succ,
                                 entry_x = tt.entry_x, width = prog.width_t, iv_of = ivs.of, iv_info = ivs.info,
                                 iv_table = ivs.table, live = live, steps = part, B = B, n = n, W = W,
-                                C = C, input_start = prog.input_start, pid0 = first, R_KIND = r_kind,
+                                C = C, K = prog.K, input_start = prog.input_start, pid0 = first, HOMOGENEOUS = prog.homogeneous, R_KIND = r_kind,
                                 OUT_TEMP = out_temp, GROUPED = tt.grouped, PRUNE = prune, OUT_FULL = out_full,
                                 R_FULL = all(r_full), COMPACT = compact is not None, ENTRIES = prog.entry_loop,
                                 TILE = tile, num_warps = 4, **idx, **inputs, **lists, **common, **succ,
@@ -1285,11 +1288,12 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, masses, o
                         tile = _flat_tile(lanes)
                         for first, size in grid_chunks(host_cdiv(lanes, tile), 1):
                             _block_input_kernel[(cnt, size)](
-                                element_mars, node_mars, temp, obs_class, prog.next_col, trans = trans,
+                                element_mars, node_mars, temp, obs_class, prog.next_col_arg, prog.delta, prog.state_id,
+                                    prog.col_of_state, trans = trans,
                                 trans_stride = prog.trans_size, pred_ptr = tt.pred_ptr, pred_col = tt.pred_col,
                                 pred_x = tt.pred_x, width = prog.width_t, iv_of = ivs.of, iv_info = ivs.info,
                                 iv_table = ivs.table, live = live, steps = part, B = B, n = n, W = W,
-                                C = C, input_start = prog.input_start, pid0 = first, L_KIND = l_kind,
+                                C = C, K = prog.K, input_start = prog.input_start, pid0 = first, HOMOGENEOUS = prog.homogeneous, L_KIND = l_kind,
                                 OUT_TEMP = out_temp, GROUPED = tt.grouped, PRUNE = prune, OUT_FULL = out_full,
                                 L_FULL = l_full, COMPACT = compact is not None, TILE = tile, num_warps = 4, **idx,
                                 **inputs, **lists, **common, **held(out_temp))

@@ -149,7 +149,7 @@ def test_the_codes_of_every_class_at_every_boundary(build_pc, monkeypatch):
     data, missing, inputs = evidence(n, 2, "none")
     cc.conditional(data, missing)
     prog = cc.backend.program()
-    en, nc, W = prog.enum, cc.backend.layout.next_col, cc.backend.layout.width.tolist()
+    en, nc, W = prog.enum, cc.backend.layout.next_col_table(), cc.backend.layout.width.tolist()
     ptr, tok, code = en.ptr_host, en.tok.cpu().tolist(), en.code.cpu()
     assert en.num == ptr[-1] and len(tok) == en.num + 1 and tok[-1] == 0
     index = en.index.cpu().tolist()                                          # every token's column of enum_probs
@@ -308,7 +308,7 @@ def test_transition_masses_with_enumerated_classes_match_a_float64_brute_force(b
             masses = cc.backend.state._session[2] if ev == "dense" else cc.backend.state.masses()
             T = prog.transition_buffer(masses.batch).double().cpu()
         assert prog.trans.grouped and prog.trans_persistent
-        tt, width, nc = prog.trans, prog.width, cc.backend.layout.next_col
+        tt, width, nc = prog.trans, prog.width, cc.backend.layout.next_col_table()
         ptr, succ = tt.entry_ptr.long().cpu(), tt.entry_succ.long().cpu()
         layer = next(iter(pc.input_layer_group))
         p = layer.params.double().view(-1, V).cpu()

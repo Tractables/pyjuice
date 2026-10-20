@@ -169,7 +169,7 @@ def test_liveness_through_sample_classes_matches_brute_force(build_pc, sweeps, s
         if not cc.backend.satisfiable:
             continue
         prog = cc.backend.program()
-        C = prog.next_col.size(2)
+        C = prog.C
         token_class = cc.backend.token_classes.token_class.tolist()
         g = torch.Generator().manual_seed(seed)
         for pattern in ("none", "prefix", "scattered", "mixed"):
@@ -197,7 +197,7 @@ def test_sample_successors_are_the_allowed_classes_successors(tokens, build_pc):
         if not cc.backend.satisfiable:
             continue
         prog = cc.backend.program()
-        nc, width = prog.next_col.cpu(), prog.width
+        nc, width = prog.layout.next_col_table(), prog.width
         W, C = nc.shape[1:]
         allowed = torch.rand(B, n, C, generator = torch.Generator().manual_seed(seed)) < 0.5
         lists = sample_successors(prog, allowed.to(prog.dev))
@@ -518,7 +518,7 @@ def test_successor_lists_match_a_brute_force(kind, form, classes, build_pc, monk
     data = torch.randint(0, VW, (B, n), generator = g)
     missing = torch.rand(B, n, generator = g) < 0.6
     missing[0] = True
-    nc = prog.next_col.cpu()
+    nc = prog.layout.next_col_table()
     allowed = None
     if classes != "every":
         allowed = torch.rand(1 if classes == "shared" else B, n, nc.size(2), generator = g) < 0.6

@@ -37,17 +37,18 @@ import triton.language as tl
 from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
-from .common import _exit_width, _interval, _pair, grid_chunks
+from .common import _exit_width, _interval, _next_col, _pair, grid_chunks
 
 
 
 @triton.jit
-def _mark_successors(live, base, q, f, oc, next_col, succ_ptr, succ, t, n, W, C, TILE: tl.constexpr):
+def _mark_successors(live, base, q, f, oc, next_col, delta, state_id, col_of_state, succ_ptr, succ, t, n, W, C, K,
+                     TILE: tl.constexpr, HOMOGENEOUS: tl.constexpr):
     """Forward sweep, boundary ``t`` -> ``t + 1``: the live columns ``q`` (``f``) mark their successors live at
     ``t + 1``, through the observed class ``oc`` only, or every successor when the token is missing (``oc`` -1)."""
     ones = tl.full([TILE], 1, dtype = tl.int8)
     if oc >= 0:                                                             # through the observed class only
-        s = tl.load(next_col + (t * W + q).to(tl.int64) * C + oc, mask = f, other = -1)
+        s = _next_col(next_col, delta, state_id, col_of_state, t, q, oc, f, K, W, C, HOMOGENEOUS)
         s = tl.where((t + 1 == n) & (s >= 0), 0, s)
         tl.store(live + base + (t + 1) * W + s, ones, mask = f & (s >= 0))
     else:                                                                   # to every successor
@@ -59,12 +60,13 @@ def _mark_successors(live, base, q, f, oc, next_col, succ_ptr, succ, t, n, W, C,
 
 
 @triton.jit
-def _reach_back(live, back, base, q, qm, oc, next_col, succ_ptr, succ, t, n, W, C, TILE: tl.constexpr):
+def _reach_back(live, back, base, q, qm, oc, next_col, delta, state_id, col_of_state, succ_ptr, succ, t, n, W, C, K,
+                TILE: tl.constexpr, HOMOGENEOUS: tl.constexpr):
     """Backward sweep, boundary ``t + 1`` -> ``t``: the columns ``q`` (``qm``) can reach acceptance if a successor
     can (``back``, through the observed class ``oc`` or any class); stored in ``back`` and ANDed into ``live``."""
     g = tl.zeros([TILE], dtype = tl.int32)
     if oc >= 0:                                                             # the observed class's successor
-        s = tl.load(next_col + (t * W + q).to(tl.int64) * C + oc, mask = qm, other = -1)
+        s = _next_col(next_col, delta, state_id, col_of_state, t, q, oc, qm, K, W, C, HOMOGENEOUS)
         s = tl.where((t + 1 == n) & (s >= 0), 0, s)
         g = (qm & (s >= 0) & (tl.load(back + base + (t + 1) * W + s, mask = qm & (s >= 0), other = 0) != 0)
              ).to(tl.int32)
@@ -81,7 +83,8 @@ def _reach_back(live, back, base, q, qm, oc, next_col, succ_ptr, succ, t, n, W, 
 
 
 @triton_jit
-def _liveness_kernel(live, back, obs_class, next_col, succ_ptr, succ, width, ps, ss, n, W, C, TILE: tl.constexpr):
+def _liveness_kernel(live, back, obs_class, next_col, delta, state_id, col_of_state, succ_ptr, succ, width, ps, ss, n,
+                     W, C, K, TILE: tl.constexpr, HOMOGENEOUS: tl.constexpr):
     """One program per sample: ``live[b, t, q]`` (int8 [B, n + 1, W]; boundary ``n`` is the sequence end, column 0),
     forward reachability by a sweep over boundaries -- every live column marks its successors -- then ANDed with
     ``back`` (the same shape, scratch), whether acceptance can be reached, by a sweep the other way -- every column
@@ -103,7 +106,8 @@ def _liveness_kernel(live, back, obs_class, next_col, succ_ptr, succ, width, ps,
         for q0 in range(0, tl.load(width + t), TILE):
             q = q0 + lanes
             f = (q < tl.load(width + t)) & (tl.load(live + base + t * W + q, mask = q < W, other = 0) != 0)
-            _mark_successors(live, base, q, f, oc, next_col, succ_ptr, succ, t, n, W, C, TILE)
+            _mark_successors(live, base, q, f, oc, next_col, delta, state_id, col_of_state, succ_ptr, succ, t, n, W, C,
+                             K, TILE, HOMOGENEOUS)
         tl.debug_barrier()
     tl.store(back + base + n * W, tl.full([], 1, dtype = tl.int8))
     for tt in range(0, n):
@@ -113,11 +117,13 @@ def _liveness_kernel(live, back, obs_class, next_col, succ_ptr, succ, width, ps,
         E = tl.load(width + t)
         for q0 in range(0, E, TILE):
             q = q0 + lanes
-            _reach_back(live, back, base, q, q < E, oc, next_col, succ_ptr, succ, t, n, W, C, TILE)
+            _reach_back(live, back, base, q, q < E, oc, next_col, delta, state_id, col_of_state, succ_ptr, succ, t, n,
+                        W, C, K, TILE, HOMOGENEOUS)
 
 
 @triton_jit
-def _live_forward_kernel(live, obs_class, next_col, succ_ptr, succ, width, ps, ss, t, n, W, C, TILE: tl.constexpr):
+def _live_forward_kernel(live, obs_class, next_col, delta, state_id, col_of_state, succ_ptr, succ, width, ps, ss, t, n,
+                         W, C, K, TILE: tl.constexpr, HOMOGENEOUS: tl.constexpr):
     """Boundary ``t`` -> ``t + 1`` of :func:`_liveness_kernel`'s forward sweep as one launch, programs over (sample,
     tile of the boundary's columns): ``live`` holds the boundaries up to ``t``, and zeros after (concurrent marks of a
     column all write 1)."""
@@ -126,20 +132,22 @@ def _live_forward_kernel(live, obs_class, next_col, succ_ptr, succ, width, ps, s
     base = b * (n + 1) * W
     qm = q < tl.load(width + t)
     f = qm & (tl.load(live + base + t * W + q, mask = qm, other = 0) != 0)
-    _mark_successors(live, base, q, f, tl.load(obs_class + b * n + t), next_col, succ_ptr + b * ps, succ + b * ss, t,
-                     n, W, C, TILE)
+    _mark_successors(live, base, q, f, tl.load(obs_class + b * n + t), next_col, delta, state_id, col_of_state,
+                     succ_ptr + b * ps, succ + b * ss, t, n, W, C, K, TILE, HOMOGENEOUS)
 
 
 @triton_jit
-def _live_backward_kernel(live, back, obs_class, next_col, succ_ptr, succ, width, ps, ss, t, n, W, C,
-                          TILE: tl.constexpr):
+def _live_backward_kernel(live, back, obs_class, next_col, delta, state_id, col_of_state, succ_ptr, succ, width, ps, ss,
+                          t, n, W, C, K,
+                          TILE: tl.constexpr, HOMOGENEOUS: tl.constexpr):
     """Boundary ``t + 1`` -> ``t`` of :func:`_liveness_kernel`'s backward sweep as one launch, programs over (sample,
     tile of the boundary's columns): ``back`` holds the boundaries after ``t``."""
     b = tl.program_id(0).to(tl.int64)
     q = tl.program_id(1) * TILE + tl.arange(0, TILE)
     base = b * (n + 1) * W
-    _reach_back(live, back, base, q, q < tl.load(width + t), tl.load(obs_class + b * n + t), next_col,
-                succ_ptr + b * ps, succ + b * ss, t, n, W, C, TILE)
+    _reach_back(live, back, base, q, q < tl.load(width + t), tl.load(obs_class + b * n + t), next_col, delta,
+                state_id, col_of_state,
+                succ_ptr + b * ps, succ + b * ss, t, n, W, C, K, TILE, HOMOGENEOUS)
 
 
 @triton.jit
@@ -378,7 +386,7 @@ def _cuda_sweep(prog):
         mod = get_module()
         ok = False
         if mod is not None:
-            n, W = prog.n, prog.next_col.size(1)
+            n, W = prog.n, prog.W
             ptr = prog.succ.entry_ptr.view(n, W + 1).cpu().numpy()
             width = np.asarray(prog.width[:n], dtype = np.int64)
             prog.live_smax = int((ptr[np.arange(n), width] - ptr[:, 0]).max(initial = 0))
@@ -418,7 +426,7 @@ class Liveness:
         lists', :meth:`lists`), then the boundaries taking them read back -- the one wait for the device."""
         if self._succ is None:
             prog, B, n = self.prog, self.B, self.prog.n
-            W = prog.next_col.size(1)
+            W = prog.W
             tt = prog.trans
             E = int(tt.entry_succ.numel())
             parts = [B * E, B * n * W, B * n * W, B * n * 2]
@@ -427,7 +435,7 @@ class Liveness:
             entries, lstart, lcount, sizes = (store[offs[k]:offs[k] + parts[k]] for k in range(4))
             count, start, columns = self.lists()
             classes = self.allowed is not None and tt.entry_class is not None   # (ungrouped tables: an entry a class)
-            C = prog.next_col.size(2)
+            C = prog.C
             a_stride = n * C if classes and self.allowed.size(0) > 1 else 0          # (one set: every sample's)
             if n > 0 and B > 0:
                 _successor_lists_kernel[(B * n,)](self.live, tt.entry_ptr, tt.entry_succ, count, start, columns, lstart,
@@ -457,7 +465,7 @@ class Liveness:
             columns = torch.empty(B * S, dtype = torch.int32, device = prog.dev)
             ranks = torch.empty(self.live.shape, dtype = torch.int32, device = prog.dev) if rank else count
             _row_lists_kernel[(rows,)](self.live, count, start, columns, ranks, prog.width_t, S, n,
-                                       prog.next_col.size(1), NP = host_next_power_of_2(n + 1), RANK = rank,
+                                       prog.W, NP = host_next_power_of_2(n + 1), RANK = rank,
                                        TILE = ROW_TILE, num_warps = 4)
             self._lists = (count, start, columns)
             if rank:
@@ -488,7 +496,7 @@ class Liveness:
 
     def _order(self, intervals: np.ndarray) -> LaneOrder:
         prog, B = self.prog, self.B
-        n, W, dev, ivs = prog.n, prog.next_col.size(1), prog.dev, prog.intervals
+        n, W, dev, ivs = prog.n, prog.W, prog.dev, prog.intervals
         key = (B, intervals.tobytes())
         tables = prog.live_tables.get(key)
         if tables is None:                           # where the intervals' columns and their tiles' counts go
@@ -586,7 +594,7 @@ def class_support(prog, masses) -> Optional[torch.Tensor]:
     row = masses.row[u].long()
     stride = masses.stride[u].long() if masses.stride is not None else torch.zeros_like(row)
     finite = masses.table > -float("inf")                                    # [rows, stored classes]
-    (n, K), Be, Cs, C = nodes.shape, masses.batch, finite.size(1), prog.next_col.size(2)
+    (n, K), Be, Cs, C = nodes.shape, masses.batch, finite.size(1), prog.C
     classes = prog.token_classes
     allowed = torch.zeros(Be, n, C, dtype = torch.bool, device = prog.dev)
     samples = torch.arange(Be, device = prog.dev)
@@ -621,14 +629,27 @@ def entry_classes(prog):
     c`` (int64 [P]), and every entry's first pair (int64 [E + 1]); built once per program."""
     kept = getattr(prog, "entry_class_pairs", None)
     if kept is None:
-        tt, (n, W, C) = prog.succ, prog.next_col.shape
+        tt, n, W, C, dev = prog.succ, prog.n, prog.W, prog.C, prog.dev
+        tr = prog.layout.transitions(dev)
         E = tt.entry_succ.numel()
-        t, q, c = torch.nonzero(tt.pair_of >= 0, as_tuple = True)
-        e = tt.entry_ptr[t, 0].long() + tt.pair_of[t, q, c].long()
+        ptr, ptr_h, esucc = tt.entry_ptr.long().view(n, W + 1), tt.entry_ptr.view(n, W + 1).cpu().numpy(), \
+            tt.entry_succ.long()
+        keys, es = [], []
+        for t in range(n):                       # a boundary's entries: its (column, successor) pairs, in that order
+            nc = tr.at(t)
+            q, c = torch.nonzero(nc >= 0, as_tuple = True)
+            s = nc[q, c] if t + 1 < n else torch.zeros_like(q)
+            first, last = int(ptr_h[t, 0]), int(ptr_h[t, W])
+            qe = torch.repeat_interleave(torch.arange(W, device = dev), ptr[t, 1:] - ptr[t, :W])
+            e = first + torch.searchsorted(qe * (W + 1) + esucc[first:last], q * (W + 1) + s)
+            keys.append(t * C + c)
+            es.append(e)
+        e = torch.cat(es) if es else torch.zeros(0, dtype = torch.int64, device = dev)
+        key = torch.cat(keys) if keys else e
         order = torch.argsort(e, stable = True)
-        first = torch.zeros(E + 1, dtype = torch.int64, device = prog.dev)
+        first = torch.zeros(E + 1, dtype = torch.int64, device = dev)
         first[1:] = torch.cumsum(torch.bincount(e, minlength = E), dim = 0)
-        kept = prog.entry_class_pairs = ((t * C + c)[order].contiguous(), first)
+        kept = prog.entry_class_pairs = (key[order].contiguous(), first)
     return kept
 
 
@@ -636,7 +657,7 @@ def sample_successors(prog, allowed: torch.Tensor) -> SampleSuccessors:
     """The :class:`SampleSuccessors` of the classes ``allowed`` (bool [Be, n, C] on the device): an entry (column,
     successor) of the grouped lists stays for sample ``b`` when some class allowed at its boundary leads along it --
     one of its (entry, class) pairs (:func:`entry_classes`). Nothing waits for the device."""
-    tt, (n, W, C) = prog.succ, prog.next_col.shape
+    tt, (n, W, C) = prog.succ, (prog.n, prog.W, prog.C)
     Be, E, dev = allowed.size(0), tt.entry_succ.numel(), prog.dev
     key, first = entry_classes(prog)
     ptr = torch.empty(Be, n, W + 1, dtype = torch.int32, device = dev)
@@ -676,7 +697,7 @@ def liveness(prog, obs_class: torch.Tensor, B: int, succ: Optional[SampleSuccess
     """The :class:`Liveness` of a query whose observed token classes are ``obs_class`` ([B, n] int32, -1 where
     missing): the sweeps -- where a token is missing, through every class, or the classes of ``succ``
     (:func:`live_successors`). Nothing waits for the device."""
-    n, W, C = prog.n, prog.next_col.size(1), prog.next_col.size(2)
+    n, W, C, K = prog.n, prog.W, prog.C, prog.K
     dev = prog.dev
     live = torch.empty(B, n + 1, W, dtype = torch.int8, device = dev)
     back = torch.empty_like(live)
@@ -684,21 +705,24 @@ def liveness(prog, obs_class: torch.Tensor, B: int, succ: Optional[SampleSuccess
         raise ValueError(f"Successor lists of {succ.ptr.size(0)} samples for a query of {B}.")
     ptr, ent = (prog.succ.entry_ptr, prog.succ.entry_succ) if succ is None else (succ.ptr, succ.succ)
     ps, ss = (0, 0) if succ is None else succ.strides()
-    tables = (obs_class, prog.next_col, ptr, ent, prog.width_t, ps, ss)
+    tables = (obs_class, prog.next_col_arg, prog.delta, prog.state_id, prog.col_of_state, ptr, ent, prog.width_t, ps, ss)
+    homogeneous = prog.homogeneous
     if W >= LIVE_STEPS_MIN_WIDTH:                    # a launch per boundary, programs over samples and columns
         live.zero_()
         live[:, 0, 0] = 1                                                   # the initial column
         back[:, n, 0] = 1                                                   # the sequence end
         for t in range(n):
             _live_forward_kernel[(B, host_cdiv(prog.width[t], LIVE_STEP_TILE))](
-                live, *tables, t, n, W, C, TILE = LIVE_STEP_TILE, num_warps = 4)
+                live, *tables, t, n, W, C, K, TILE = LIVE_STEP_TILE, HOMOGENEOUS = homogeneous, num_warps = 4)
         for t in range(n - 1, -1, -1):
             _live_backward_kernel[(B, host_cdiv(prog.width[t], LIVE_STEP_TILE))](
-                live, back, *tables, t, n, W, C, TILE = LIVE_STEP_TILE, num_warps = 4)
+                live, back, *tables, t, n, W, C, K, TILE = LIVE_STEP_TILE, HOMOGENEOUS = homogeneous, num_warps = 4)
     elif _cuda_sweep(prog) is not None and obs_class.dtype == torch.int32 and obs_class.is_contiguous():
-        _cuda_sweep(prog).liveness_cuda(live, back, obs_class, prog.next_col, ptr, ent, prog.width_t, n, W, C,
-                                        prog.live_smax, ps, ss)
+        _cuda_sweep(prog).liveness_cuda(live, back, obs_class, prog.next_col_arg, prog.delta, prog.state_id,
+                                        prog.col_of_state, ptr, ent, prog.width_t, n, W, C, K, prog.live_smax, ps, ss,
+                                        homogeneous)
     else:                                            # one program per sample, sweeping every boundary: a lane
         TILE = min(1024, max(32, host_next_power_of_2(W)))       # per column, a step's latency is the sweep's cost
-        _liveness_kernel[(B,)](live, back, *tables, n, W, C, TILE = TILE, num_warps = max(4, TILE // 32))
+        _liveness_kernel[(B,)](live, back, *tables, n, W, C, K, TILE = TILE, HOMOGENEOUS = homogeneous,
+                               num_warps = max(4, TILE // 32))
     return Liveness(prog = prog, B = B, live = live, allowed = None if succ is None else succ.allowed)

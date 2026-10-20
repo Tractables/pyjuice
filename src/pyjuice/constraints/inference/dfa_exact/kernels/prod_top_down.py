@@ -33,7 +33,7 @@ from pyjuice.layer.kernels import autotune
 from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
-from .common import (NODE_TILE, SUM, _block_ptr, _child, _exit_width, _interval, _logaddexp_tile, _lse_step, _pair,
+from .common import (NODE_TILE, SUM, _block_ptr, _child, _exit_width, _next_col, _interval, _logaddexp_tile, _lse_step, _pair,
                      _slot, _tf32_operand, _tile_rows, grid_chunks, tensor)
 from .compact import _lane, _lane_ends
 from .transitions import enumerated_args
@@ -229,12 +229,12 @@ def _entry_mass(masses, x, code_oc, eprobs, pr, lz, lw0, eidx0, num_enum, oc, ow
 
 
 @triton_jit
-def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mars, obs_class, next_col, class_mars,
+def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mars, obs_class, next_col, delta, state_id, col_of_state, class_mars,
                                 mass_row, mass_stride, trans, trans_stride, pred_ptr, pred_col, pred_x, width, iv_of,
                                 iv_info, iv_table, once_iv, live, lanes, lane_first, lane_live, coff, ccount, cstart,
                                 ccolumns, crank, children, tiles, ptr, parents, reg_offset, reg_width, reg_first,
                                 code, tok_ptr, eidx, eprobs, prow, lognorm, enum_logw, Cs, num_enum, logw_stride,
-                                out_first, out_width, temp_width, B, n, W, C, input_start, csteps, pid0,
+                                out_first, out_width, temp_width, B, n, W, C, K, HOMOGENEOUS: tl.constexpr, input_start, csteps, pid0,
                                 C_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, GROUPED: tl.constexpr,
                                 PRUNE: tl.constexpr, ORDERED: tl.constexpr, COMPACT: tl.constexpr,
                                 C_FULL: tl.constexpr, OUT_FULL: tl.constexpr, SAMPLE: tl.constexpr, ENUM: tl.constexpr,
@@ -333,7 +333,8 @@ def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
                 ev = em & (sl >= 0)                                          # a dead parent lane: no term, nothing read
                 vm = real[:, None] & ev[None, :]
                 if GROUPED:                                                  # the observed class leads to q?
-                    holds = tl.load(next_col + (t * W + i).to(tl.int64) * C + tl.maximum(oc, 0), mask = ev, other = -1) == q
+                    holds = _next_col(next_col, delta, state_id, col_of_state, t, i, tl.maximum(oc, 0), ev, K, W, C,
+                                      HOMOGENEOUS) == q
                     mass = tl.where((oc >= 0)[None, :], tl.where(holds[None, :], own, float("-inf")),
                                     tl.load(masses + x[None, :], mask = vm & (oc < 0)[None, :], other = float("-inf")))
                 elif ENUM:                                                   # is it this entry's class?
@@ -352,12 +353,12 @@ def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
 
 
 @triton_jit
-def _block_input_top_down_kernel(element_flows, temp_flows, node_flows, node_mars, obs_class, next_col, class_mars,
+def _block_input_top_down_kernel(element_flows, temp_flows, node_flows, node_mars, obs_class, next_col, delta, state_id, col_of_state, class_mars,
                                 mass_row, mass_stride, trans, trans_stride, entry_ptr, entry_succ, entry_x, width,
                                 iv_of, iv_info, iv_table, once_iv, live, lanes, lane_first, lane_live, coff, ccount,
                                 cstart, ccolumns, crank, children, tiles, ptr, parents, reg_offset, reg_width,
                                 reg_first, code, tok_ptr, eidx, eprobs, prow, lognorm, enum_logw, Cs, num_enum,
-                                logw_stride, out_first, out_width, temp_width, B, n, W, C, input_start, csteps, pid0,
+                                logw_stride, out_first, out_width, temp_width, B, n, W, C, K, HOMOGENEOUS: tl.constexpr, input_start, csteps, pid0,
                                 C_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, GROUPED: tl.constexpr,
                                 PRUNE: tl.constexpr, ORDERED: tl.constexpr, COMPACT: tl.constexpr,
                                 C_FULL: tl.constexpr, OUT_FULL: tl.constexpr, SAMPLE: tl.constexpr, ENUM: tl.constexpr,
@@ -414,7 +415,7 @@ def _block_input_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
         oc = tl.load(obs_class + b * n + t, mask = m, other = -1)
         # an observed token: its own log-probability, then the output at the column its class leads to
         obs = ml & (oc >= 0)
-        s = tl.load(next_col + (t * W + q).to(tl.int64) * C + oc, mask = obs, other = -1)
+        s = _next_col(next_col, delta, state_id, col_of_state, t, q, oc, obs, K, W, C, HOMOGENEOUS)
         s = tl.where(end & (s >= 0), 0, s)
         so = _parent_lane(_slot(iv_table, opos, i, s, X, obs, OUT_FULL), b, once, coff, ccount, crank, kp, t0, i, t + 1,
                           s, obs, B, n, W, COMPACT)
@@ -879,7 +880,7 @@ def _input_block_boundaries(la: TopDownLaunch, prog) -> dict:
     child's interval as ``(t, t2)`` (``ta``, ``te``)."""
     st = la.host.get("cuda")
     if st is None:
-        n, W = prog.n, prog.next_col.size(1)
+        n, W = prog.n, prog.W
         counts = getattr(prog, "pred_counts", None)
         if counts is None:                                                   # every boundary's predecessor entries
             pp = prog.trans_top_down.pred_ptr.view(n, W + 1).cpu().numpy().astype(np.int64)
@@ -939,7 +940,7 @@ def _input_block_cuda(la: TopDownLaunch, tiles: torch.Tensor, height: int, prog,
         return None
     from .c import get_module
     mod = get_module()
-    n, W, C = prog.n, prog.next_col.size(1), prog.next_col.size(2)
+    n, W, C = prog.n, prog.W, prog.C
     ea = enumerated_args(prog, masses)
     ptr = prog.enum.ptr_host
     mw = int(ea["Cs"]) + (int((ptr[1:] - ptr[:-1]).max()) if prog.enum.num > 0 else 0)   # a child's staged masses:
@@ -1020,7 +1021,7 @@ def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_
     inside_regions = regions if inside_regions is None else inside_regions
     common = dict(reg_offset = regions["offset"], reg_width = regions["width"], reg_first = regions["first"],
                   out_first = elem_first, out_width = elem_width, temp_width = tflow_width)
-    n, W, C = prog.n, prog.next_col.size(1), prog.next_col.size(2)
+    n, W, C = prog.n, prog.W, prog.C
     ivs = prog.intervals
     prune, live = live is not None, live if live is not None else obs_class
     tt, grouped = prog.trans_top_down, prog.trans_top_down.grouped
@@ -1060,12 +1061,14 @@ def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_
                 (tt.entry_ptr, tt.entry_succ, tt.entry_x)
             for first, size in grid_chunks(host_cdiv(lanes_max, tile), 1):
                 kernel[(tiles.numel() // NODE_TILE * (height // tn), size)](
-                    element_flows, temp_flows, node_flows, node_mars, obs_class, prog.next_col, masses.table,
+                    element_flows, temp_flows, node_flows, node_mars, obs_class, prog.next_col_arg, prog.delta,
+                    prog.state_id, prog.col_of_state, masses.table,
                     masses.row, masses.stride if sample else masses.row, trans, prog.trans_size, *tables, prog.width_t,
                     ivs.of, ivs.info, ivs.table, once_iv, live,
                     *(lanes if ordered else (live, live, live)), crank = compact.rank if compact is not None else live,
                     children = la.children, tiles = tiles, ptr = la.ptr, parents = la.parents, B = B, n = n, W = W,
-                    C = C, input_start = prog.input_start, pid0 = first, C_KIND = c_kind, OUT_TEMP = out_temp,
+                    C = C, K = prog.K, input_start = prog.input_start, pid0 = first, C_KIND = c_kind,
+                    OUT_TEMP = out_temp, HOMOGENEOUS = prog.homogeneous,
                     GROUPED = grouped, PRUNE = prune, ORDERED = ordered, COMPACT = compact is not None,
                     C_FULL = c_full, OUT_FULL = out_full, SAMPLE = sample, TN = tn, SUBS = height // tn, TILE = tile,
                     num_warps = TOP_DOWN_WARPS, **common, **lists, **enumerated_args(prog, masses))

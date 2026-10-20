@@ -261,7 +261,7 @@ def test_class_weights_match_the_reference(kind, name, pattern, sum_path, build_
         if t is None or not positions[t]:
             continue
         Wi = int(cc.backend.layout.width[t])
-        nc = cc.backend.layout.next_col[t, :Wi].to(dev)                                 # [Wi, C]
+        nc = cc.backend.layout.next_col_at(t).to(dev)                                   # [Wi, C]
         G = O[:, :, torch.arange(Wi, device = dev)[:, None], nc.clamp(min = 0)]
         A = torch.logsumexp(G.masked_fill(nc < 0, -float("inf")), dim = 2)      # [N, B, C]
         first = ns._output_ind_range[0]
@@ -300,7 +300,7 @@ def test_live_class_rows_match_a_brute_force(kind, storage, pattern, one_pair, c
     B, dev = data.size(0), cc.pc.params.device
     allowed = None
     if classes == "sample":
-        C = cc.backend.program().next_col.size(2)
+        C = cc.backend.program().C
         allowed = torch.rand(B, n, C, generator = torch.Generator().manual_seed(3)) < 0.6
         monkeypatch.setattr(QC, "live_successors", lambda prog, masses: sample_successors(prog, allowed.to(prog.dev)))
     positions = missing.any(dim = 0).numpy()
@@ -310,7 +310,7 @@ def test_live_class_rows_match_a_brute_force(kind, storage, pattern, one_pair, c
     prog = cc.backend.program()
     lv = report["liveness"]
     live = None if lv is None else lv.live.cpu() != 0
-    nc, width, order = prog.next_col.cpu(), prog.width, prog.trans.cls_order.cpu()
+    nc, width, order = prog.layout.next_col_table(), prog.width, prog.trans.cls_order.cpu()
     checked = 0
     for g, pos, w, row in groups:
         row, rows = row.cpu(), 0
@@ -726,3 +726,50 @@ def test_transition_tables_past_two_billion_entries(reference):
     # fp32 ulp is 4.9e-4: up to 3 of them off the reference, at positions whose offsets overflow as at the others
     assert_rows_close(got, reference.conditional(cc, data, missing), n, tol = 4e-3)
     assert (torch.logsumexp(got, dim = 1).abs() <= 1e-4).all()
+
+
+@pytest.mark.parametrize("sweep", ["cuda", "per_boundary", "per_sample"])
+def test_transitions_through_the_automaton_give_the_tables_rows(sweep, build_pc, monkeypatch):
+    """The kernels read a transition from the table over every boundary (``next_col``) or, past
+    ``TRANSITION_TABLE_MAX_ENTRIES``, through the automaton's transitions and the boundaries' column maps: the same
+    columns, so the same rows bit for bit -- conditionals and marginals, dense and compact storage, every sweep of
+    the liveness, and a decoder session whose soft evidence prunes classes (its successor lists from the maps)."""
+    import pyjuice.nodes.distributions as dists
+    from pyjuice.constraints.inference.dfa_exact.compiled import program as P
+    from pyjuice.constraints.inference.dfa_exact.kernels import live
+    monkeypatch.setattr(live, "LIVE_CUDA", sweep == "cuda")
+    monkeypatch.setattr(live, "LIVE_STEPS_MIN_WIDTH", 0 if sweep == "per_boundary" else 1 << 30)
+    cases = [(kind, name, pattern) for kind in ("hmm", "pd") for name in ("contains", "either") for pattern in ("mixed",)]
+    cases += [("hand_fold", "avoids", "scattered"), ("hmm", "contains", "none")]
+    compiled = 0
+    for kind, name, pattern in cases:
+        n = KINDS[kind]
+        pcs = [build_pc(kind, n, V) for _ in range(2)]
+        data, missing = evidence(pattern, n)
+        rows = []
+        for pc, entries in zip(pcs, (P.TRANSITION_TABLE_MAX_ENTRIES, 0)):      # the table, then the maps
+            monkeypatch.setattr(P, "TRANSITION_TABLE_MAX_ENTRIES", entries)
+            cc = jc.compile(CONSTRAINTS[name](), pc)
+            assert cc.backend.program().homogeneous == (entries == 0)
+            rows.append([cc.conditional(data, missing, storage = s, precision = "fp32") for s in ("dense", "compact")]
+                        + [cc.marginal(data, missing)])
+            compiled += 1
+        for a, b in zip(*rows):
+            assert torch.equal(a, b), (kind, name, pattern)
+    # a session's inputs: top-k soft evidence of 2 of the 3 tokens, the sweeps through the classes left
+    n, B = KINDS["hmm"], 6
+    outs = []
+    for entries in (P.TRANSITION_TABLE_MAX_ENTRIES, 0):
+        monkeypatch.setattr(P, "TRANSITION_TABLE_MAX_ENTRIES", entries)
+        pc = build_pc("hmm", n, V, input_dist = dists.SoftEvidenceCategorical)
+        cc = jc.compile(jc.DFA.contains([[0, 1, 1], [2, 0]], V) & jc.Not(jc.DFA.contains([[2, 2]], V)), pc)
+        dev = cc.pc.device
+        gi = torch.Generator().manual_seed(1)
+        inputs = dict(categorical_evidence_logp = (torch.randn(B, n, 2, generator = gi) * 2).to(dev),
+                      soft_evidence_cat_ids = torch.argsort(torch.rand(B, n, V, generator = gi), dim = 2)[..., :2].to(dev))
+        data, missing = evidence("mixed", n, B = B)
+        with cc.decoder(**inputs) as decoder:
+            outs.append([decoder.conditional(data, missing), decoder.marginal(data, missing)])
+    for a, b in zip(*outs):
+        assert torch.equal(a, b)
+    assert compiled == 2 * len(cases)

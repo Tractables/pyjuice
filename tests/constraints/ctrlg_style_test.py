@@ -168,7 +168,7 @@ def test_compile_a_ctrlg_case(case, setting):
         assert torch.equal(lay.state_id[t, col[alive]], states[alive, t]), t
         if t < n:
             nxt = torch.full_like(col, -1)
-            nxt[alive] = lay.next_col[t, col[alive], dfa.token_class[X[alive, t]]]
+            nxt[alive] = lay.next_col_at(t)[col[alive], dfa.token_class[X[alive, t]]]
             col = nxt
     assert torch.equal(col >= 0, want)
 

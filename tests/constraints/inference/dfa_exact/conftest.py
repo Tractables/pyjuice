@@ -259,7 +259,7 @@ def input_block(cc, ns, data, missing, inputs = None):
     # class c moves column i (boundary t) to column next_col[t, i, c] (boundary t + 1)
     Wi, Wj = int(layout.width[t]), int(layout.width[t + 1])
     T = torch.zeros(Wi, C, Wj, dtype = DTYPE, device = dev)
-    nc = layout.next_col[t, :Wi].to(dev)                                        # [Wi, C]
+    nc = layout.next_col_at(t).to(dev)                                          # [Wi, C]
     ii, cc_ = torch.nonzero(nc >= 0, as_tuple = True)
     T[ii, cc_, nc[ii, cc_]] = 1.0
     s = _shift(lmass, -1)
@@ -429,7 +429,7 @@ def reference_conditional(cc, data, missing_mask = None, targets = None, inputs 
             raise NotImplementedError(f"The reference supports Categorical input nodes only, got "
                                       f"{type(ns.dist).__name__} over variable {t}.")
         Wi = int(layout.width[t])
-        nc = layout.next_col[t, :Wi].to(dev)                                    # [Wi, C]
+        nc = layout.next_col_at(t).to(dev)                                      # [Wi, C]
         G = O[:, :, torch.arange(Wi, device = dev)[:, None], nc.clamp(min = 0)] # [N, B, Wi, C]
         A = torch.logsumexp(G.masked_fill(nc < 0, -float("inf")), dim = 2)      # [N, B, C] log class weights
         logp = torch.log(emission(cc, ns, inputs, missing.size(0))).to(DTYPE)  # [N, B, V]
@@ -486,7 +486,8 @@ def _reference_key(fn, cc, arguments: dict, order: dict):
     h = hashlib.blake2b(digest_size = 16)
     try:
         _digest(h, [pc.params] + [layer.params for layer in pc.input_layer_group], order)
-        _digest(h, [lay.next_col, lay.width, lay.token_class, lay.num_classes, lay.satisfiable, cc.n], order)
+        _digest(h, [lay.delta, lay.state_id, lay.col_of_state, lay.width, lay.token_class, lay.satisfiable, cc.n],
+                order)
         _digest(h, arguments, order)
     except (TypeError, KeyError):
         return None

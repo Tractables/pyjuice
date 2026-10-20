@@ -4,8 +4,8 @@
 // inputs leave possible, `ps` / `ss` apart), ANDed with whether acceptance can be reached from it -- a CTA per sample
 // for each of the two sweeps, at once (they do not depend on each other), into `live` and `back`, then their AND.
 //
-// A boundary's step is latency-bound: a column's successors are two dependent reads (`entry_ptr`, then `entry_succ`, or
-// `next_col` for an observed token) after the live row. Here the rows live in shared memory, and every step's tables --
+// A boundary's step is latency-bound: a column's successors are dependent reads (`entry_ptr`, then `entry_succ`, or,
+// for an observed token, the column's state, its successor in `delta`, that one's column) after the live row. Here the rows live in shared memory, and every step's tables --
 // the next boundary's successor lists (or observed successors) and, going back, its forward row -- are read into
 // registers during the step before and stored to shared memory after it, so a step waits for no global read.
 // Columns past a boundary's width are never written, as by the Triton kernel.
@@ -22,11 +22,14 @@
 struct LiveArgs {
     signed char* live;
     const int* obs;        // [B, n]
-    const int* next_col;   // [n, W, C]
+    const int* next_col;   // [n, W, C] every boundary's transitions, or nullptr: through the three tables below
+    const int* delta;      // [K, C] the automaton's transitions
+    const int* state_id;   // [n + 1, W] every column's state
+    const int* col_of_state;   // [n + 1, K] every state's column, -1 if inactive
     const int* ptr;        // [n, W + 1] per sample, ps apart (0: every sample's)
     const int* succ;       // ss apart
     const int* width;      // [n + 1]
-    int n, W, C, smax;
+    int n, W, C, K, smax;
     long long ps, ss;
 };
 
@@ -44,7 +47,12 @@ __device__ __forceinline__ void stage_load(const LiveArgs& a, const int* ptr, co
 #pragma unroll
         for (int k = 0; k < LQ; ++k) {
             int q = tid + k * LT;
-            s.nc[k] = q < w ? a.next_col[((long long)t * a.W + q) * a.C + oc] : -1;
+            if (a.next_col != nullptr) {
+                s.nc[k] = q < w ? a.next_col[((long long)t * a.W + q) * a.C + oc] : -1;
+            } else {                                        // the column's state, its successor, that one's column
+                int st = q < w ? a.state_id[(long long)t * a.W + q] : -1;
+                s.nc[k] = st >= 0 ? a.col_of_state[(long long)(t + 1) * a.K + a.delta[(long long)st * a.C + oc]] : -1;
+            }
         }
     } else {
 #pragma unroll
@@ -200,23 +208,28 @@ bool liveness_fits(int64_t n, int64_t W, int64_t smax) {
 }
 
 void liveness_cuda(torch::Tensor live, torch::Tensor back, torch::Tensor obs_class, torch::Tensor next_col,
-                   torch::Tensor entry_ptr, torch::Tensor entry_succ, torch::Tensor width, int64_t n, int64_t W,
-                   int64_t C, int64_t smax, int64_t ps, int64_t ss) {
+                   torch::Tensor delta, torch::Tensor state_id, torch::Tensor col_of_state, torch::Tensor entry_ptr,
+                   torch::Tensor entry_succ, torch::Tensor width, int64_t n, int64_t W, int64_t C, int64_t K,
+                   int64_t smax, int64_t ps, int64_t ss, bool homogeneous) {
     TORCH_CHECK(live.scalar_type() == torch::kInt8 && back.scalar_type() == torch::kInt8 && back.is_contiguous() &&
                 back.numel() == live.numel() && obs_class.scalar_type() == torch::kInt32 &&
-                next_col.scalar_type() == torch::kInt32 && entry_ptr.scalar_type() == torch::kInt32 &&
+                next_col.scalar_type() == torch::kInt32 && delta.scalar_type() == torch::kInt32 &&
+                state_id.scalar_type() == torch::kInt32 &&
+                col_of_state.scalar_type() == torch::kInt32 && entry_ptr.scalar_type() == torch::kInt32 &&
                 entry_succ.scalar_type() == torch::kInt32 && width.scalar_type() == torch::kInt32,
                 "liveness_cuda: int8 live, int32 tables");
-    TORCH_CHECK(live.is_contiguous() && obs_class.is_contiguous() && next_col.is_contiguous() &&
-                entry_ptr.is_contiguous() && entry_succ.is_contiguous() && width.is_contiguous(),
-                "liveness_cuda: contiguous tensors");
+    TORCH_CHECK(live.is_contiguous() && obs_class.is_contiguous() && next_col.is_contiguous() && delta.is_contiguous() &&
+                state_id.is_contiguous() && col_of_state.is_contiguous() && entry_ptr.is_contiguous() &&
+                entry_succ.is_contiguous() && width.is_contiguous(), "liveness_cuda: contiguous tensors");
     TORCH_CHECK(W <= (int64_t)LQ * LT && smax <= (int64_t)LS * LT, "liveness_cuda: automaton too wide");
     const int B = (int)live.size(0);
     if (B == 0) return;
     TORCH_CHECK(ps == 0 || entry_ptr.numel() >= (int64_t)B * ps, "liveness_cuda: a successor list per sample");
-    LiveArgs a{live.data_ptr<signed char>(), obs_class.data_ptr<int>(), next_col.data_ptr<int>(),
-               entry_ptr.data_ptr<int>(), entry_succ.data_ptr<int>(), width.data_ptr<int>(), (int)n, (int)W, (int)C,
-               (int)smax, (long long)ps, (long long)ss};
+    LiveArgs a{live.data_ptr<signed char>(), obs_class.data_ptr<int>(),
+               homogeneous ? nullptr : next_col.data_ptr<int>(), delta.data_ptr<int>(),
+               state_id.data_ptr<int>(), col_of_state.data_ptr<int>(), entry_ptr.data_ptr<int>(),
+               entry_succ.data_ptr<int>(), width.data_ptr<int>(), (int)n, (int)W, (int)C, (int)K, (int)smax,
+               (long long)ps, (long long)ss};
     size_t smem = liveness_smem((int)n, (int)W, (int)smax);
     static size_t allowed[64] = {0};                    // per device, the largest dynamic shared memory set
     int dev;

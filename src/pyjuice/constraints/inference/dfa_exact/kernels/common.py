@@ -142,6 +142,38 @@ def _block_ptr(row, reg, node_mars, prior_mars, temp, reg_offset, reg_width, reg
 
 
 @triton.jit
+def _state_at(state_id, t, i, mask, W):
+    """The automaton state of column ``i`` at boundary ``t`` (-1 for a padding column, or off ``mask``) -- over
+    ``mask``'s lanes (``i`` may be one column for all of them; ``t`` a tensor or a Python int)."""
+    idx = tl.zeros_like(mask).to(tl.int64) + (t * W + i)
+    return tl.load(state_id + idx, mask = mask, other = -1)
+
+
+@triton.jit
+def _next_col_of(delta, col_of_state, s, c, mask, t, K, C):
+    """The column at boundary ``t + 1`` that class ``c`` leads state ``s`` to: ``col_of_state[t + 1, delta[s, c]]``,
+    -1 where that state is inactive there (pruned or dead), ``s`` is -1, or off ``mask`` -- 64-bit offsets
+    (``delta`` [K, C], ``col_of_state`` [n + 1, K]; ``t`` a tensor or a Python int)."""
+    ok = mask & (s >= 0)
+    succ = tl.load(delta + (s.to(tl.int64) * C + c), mask = ok, other = 0)
+    return tl.load(col_of_state + (succ.to(tl.int64) + (t + 1) * K), mask = ok, other = -1)
+
+
+@triton.jit
+def _next_col(next_col, delta, state_id, col_of_state, t, i, c, mask, K, W, C, HOMOGENEOUS: tl.constexpr):
+    """``next_col[t, i, c]`` (see :class:`~..compiled.layout.BoundaryLayout`): the column at boundary ``t + 1`` that
+    class ``c`` leads column ``i`` at ``t`` to, -1 where none -- from the table ``next_col`` [n, W, C], or
+    (``HOMOGENEOUS``: the table too large to keep, see :data:`~..compiled.program.TRANSITION_TABLE_MAX_ENTRIES`) from
+    the automaton's transitions ``delta`` through the boundaries' column maps (:func:`_state_at`,
+    :func:`_next_col_of`). 64-bit offsets; ``i`` may be one column for every lane of ``mask``."""
+    if HOMOGENEOUS:
+        return _next_col_of(delta, col_of_state, _state_at(state_id, t, i, mask, W), c, mask, t, K, C)
+    else:
+        idx = tl.zeros_like(mask).to(tl.int64) + (t * W + i)
+        return tl.load(next_col + (idx * C + c), mask = mask, other = -1)
+
+
+@triton.jit
 def _exit_width(width, t2, n):
     """Columns at the exit boundary ``t2``: a sequence end is one column (summed over the accepting states)."""
     return tl.where(t2 == n, 1, tl.load(width + tl.minimum(t2, n)))

@@ -17,7 +17,7 @@ import torch
 from ..kernels.common import IDENTITY, SUM, TEMP
 from ..kernels.prod import Launch, skip_masks
 from ..kernels.sum import dense_groups
-from ..kernels.transitions import (enumerated_tokens, max_successors, transition_job, transition_masses,
+from ..kernels.transitions import (enumerated_tokens, transition_job, transition_masses, transition_stats,
                                    transition_tables)
 from ..external_params import block_scale
 from .layout import interval_tables
@@ -48,6 +48,19 @@ INPUT_BLOCK_GROUP = 8
 INPUT_BLOCK_GROUP_ALTERNATIVES = (16, 4)
 
 #: Floats of transition masses (see :func:`~.transitions.transition_masses`) a program keeps at most: every input
+#: The transition table over every boundary, ``next_col`` [n, W, C] int32 (the column every class leads every column to,
+#: see :class:`~.layout.BoundaryLayout`), is kept on the device while it has at most this many entries (4 GiB) and read
+#: directly; past that the kernels read a transition through the automaton's ``delta`` [K, C] and the boundaries'
+#: column maps (:func:`~..kernels.common._next_col`), two dependent gathers instead of one load. The maps cost the walks
+#: that loop over every class of a column and read the table per lane -- those of automata of FEW classes (Ctrl-G
+#: ex108, 14 classes, B8 diffusion on croissant: the class weights' sample walk +11%, the input @ block group walk +17%,
+#: decode 4479 -> 4721 ms), whose tables are small: 4 GiB admits 49152 columns of 16 classes over 1024 positions
+#: (ex110). Automata of many classes walk the entry lists instead, and their tables are what grows past the bound
+#: (JSON hard_0 at n = 1024: 3.1e9 entries): through the maps they lose nothing -- hard_0 left to right at n = 1024
+#: 10.1 -> 9.5 ms a call (the maps stay in L2, the 12 GB table streamed from memory), hard_1 B8 diffusion the same --
+#: and compile in 35 s on 4.7 GB instead of 59 s on 29.6 GB; the 10x schema's 61 GB of tables go.
+TRANSITION_TABLE_MAX_ENTRIES = 1 << 30
+
 #: step's, built once per computation of the class masses. Transitions whose masses would not fit are not grouped
 #: (rebuilding them query by query would read every class's mass anyway, and write besides; the forward reads the
 #: classes' masses directly instead)
@@ -65,29 +78,23 @@ TRANSITION_BUDGET = 1 << 26
 ENTRY_LOOP_MAX_LIVE = 0.5
 
 
-def live_pairs(next_col: torch.Tensor, width, n: int) -> Tuple[int, int]:
-    """How many (column, class) pairs of the ``n`` boundaries lead somewhere (``next_col`` [n, W, C] host, ``width``
-    the boundaries' columns), and how many columns there are."""
-    live = sum(int((next_col[t, :int(width[t])] >= 0).sum()) for t in range(n))
-    return live, sum(int(width[t]) for t in range(n))
-
-
-def grouped_transitions(next_col: torch.Tensor, width, n: int, pair_masses: int) -> bool:
+def grouped_transitions(stats: Tuple[int, int, int], pair_masses: int) -> bool:
     """Whether a missing token's transitions are grouped by successor: when the input steps' ``pair_masses`` (floats
     of transition masses) fit :data:`TRANSITION_BUDGET`, and a column's live classes, on average over every
     boundary's columns, are :data:`GROUP_MIN_RATIO` times the most successors of any column or more -- the ungrouped
-    kernels' loop over a column's live classes against the grouped kernels' loop over its successors."""
+    kernels' loop over a column's live classes against the grouped kernels' loop over its successors (``stats``: the
+    layout's :func:`~..kernels.transitions.transition_stats`)."""
     if pair_masses > TRANSITION_BUDGET:
         return False
-    live, columns = live_pairs(next_col, width, n)
-    return live >= GROUP_MIN_RATIO * max_successors(next_col, width, n) * max(columns, 1)
+    live, columns, most = stats
+    return live >= GROUP_MIN_RATIO * most * max(columns, 1)
 
 
-def entry_loop(next_col: torch.Tensor, width, n: int) -> bool:
+def entry_loop(stats: Tuple[int, int, int], C: int) -> bool:
     """Whether the ungrouped forward kernels loop over a column's live entries rather than every class: at most
-    :data:`ENTRY_LOOP_MAX_LIVE` of the (column, class) pairs live."""
-    live, columns = live_pairs(next_col, width, n)
-    return live < ENTRY_LOOP_MAX_LIVE * columns * next_col.size(2)
+    :data:`ENTRY_LOOP_MAX_LIVE` of the (column, class) pairs live (``stats`` as :func:`grouped_transitions`)."""
+    live, columns, _ = stats
+    return live < ENTRY_LOOP_MAX_LIVE * columns * C
 
 
 #: (input row, position) columns of the steps whose input's transitions they read
@@ -109,15 +116,29 @@ class Program:
         self.width = [int(w) for w in layout.width.tolist()]
         self.width_t = layout.width.to(dev, torch.int32)
         self.reach = layout.reachability                               # the slots of every interval's blocks
-        self.next_col = layout.next_col.to(dev, torch.int32).contiguous()
+        self.dev = dev
+        self.layout = layout
+        # the automaton's transitions and the boundaries' column maps (int32: what the kernels read a boundary's
+        # transitions through, see Transitions; the tables below are built from them, a boundary at a time)
+        tr = layout.transitions(dev)
+        self.delta, self.state_id, self.col_of_state = (x.to(torch.int32).contiguous()
+                                                        for x in (tr.delta, tr.state_id, tr.col_of_state))
+        self.K, self.W, self.C = tr.K, tr.W, tr.C
+        self.next_col = None                                             # the table over every boundary, if kept
+        if n * self.W * self.C <= TRANSITION_TABLE_MAX_ENTRIES:          # (built on the device, a boundary at a time)
+            self.next_col = torch.full((n, self.W, self.C), -1, dtype = torch.int32, device = dev)
+            for t in range(n):
+                self.next_col[t, :self.width[t]] = tr.at(t)
+        self.homogeneous = self.next_col is None
+        self.next_col_arg = self.delta if self.homogeneous else self.next_col    # (a pointer the kernels never read)
         self.input_start, self.input_end = backend.input_range
         self.mass_row = backend.state.class_mass_rows()[2]               # input node -> its row of the class masses
         self.token_classes = backend.token_classes
-        self.enum = enumerated_tokens(self.next_col, self.width, n, backend.token_classes)   # the enumerated classes'
+        self.enum = enumerated_tokens(tr, backend.token_classes)         # the enumerated classes' codes and tokens
         # every column's distinct successors (evidence pruning's liveness sweeps; the forward's tables when its
         # transitions are grouped: decided below, once the steps are known)
-        self.succ = transition_tables(self.next_col, self.width, n, grouped = True, enum = self.enum)
-        self.dev = dev
+        self.succ = transition_tables(tr, grouped = True, enum = self.enum)
+        self.transition_stats = transition_stats(tr)
 
         firsts = [first for first, _, _ in backend.sum_regions]
         self.firsts = firsts
@@ -287,10 +308,10 @@ class Program:
         ins = launches_of(tuple(TRANS_COLS))
         pairs = torch.tensor(self.succ.num_pairs, dtype = torch.long)
         sizes = [pairs[launches[li][2][:, TRANS_COLS[launches[li][0]][1]]] for launches, li in ins]
-        grouped = grouped_transitions(layout.next_col, self.width, n, sum(int(z.sum()) for z in sizes))
-        self.trans = self.succ if grouped else transition_tables(self.next_col, self.width, n, grouped = False,
+        grouped = grouped_transitions(self.transition_stats, sum(int(z.sum()) for z in sizes))
+        self.trans = self.succ if grouped else transition_tables(tr, grouped = False,
                                                                  enum = self.enum)
-        self.entry_loop = entry_loop(layout.next_col, self.width, n)   # ungrouped kernels: entries, or every class
+        self.entry_loop = entry_loop(self.transition_stats, self.C)    # ungrouped kernels: entries, or every class
         self.trans_persistent = grouped                             # (grouped transitions are always kept whole)
         self.trans_pairs = pairs if grouped else None
         self.trans_size, rows = 0, []

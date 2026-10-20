@@ -40,12 +40,14 @@ class BoundaryLayout:
     :ivar state_id: [n+1, W] automaton state of every column, ``-1`` for padding (``W`` = max width); a
         boundary's columns run from the state farthest from acceptance to the nearest, ties by state id
     :ivar col_of_state: [n+1, K] column of every automaton state, ``-1`` if inactive
-    :ivar next_col: [n, W, C] column at boundary ``t+1`` reached from column ``k`` at ``t`` by a token of
-        class ``c``; ``-1`` if that successor is inactive (pruned or dead) or ``k`` is padding
+    :ivar delta: [K, C] the automaton's transitions: the successor state of every (state, class)
     :ivar satisfiable: whether any string of length ``n`` is accepted. If not, every boundary is empty.
 
     Boundary 0 holds only the initial state (column 0), and every active state at boundary ``n`` is
-    accepting, so neither needs a separate table.
+    accepting, so neither needs a separate table. The column-to-column transitions between boundaries are the
+    automaton's through the two boundaries' column maps -- :meth:`next_col_at` gives one boundary's table; the table
+    over every boundary, ``[n, W, C]``, is never kept (2.4e9 entries for a JSON schema's automaton over 1024
+    positions).
     """
 
     n: int
@@ -53,7 +55,7 @@ class BoundaryLayout:
     width: torch.Tensor
     state_id: torch.Tensor
     col_of_state: torch.Tensor
-    next_col: torch.Tensor
+    delta: torch.Tensor
     satisfiable: bool
 
     @property
@@ -68,7 +70,88 @@ class BoundaryLayout:
 
     @property
     def num_classes(self) -> int:
-        return self.next_col.size(2)
+        return self.delta.size(1)
+
+    @property
+    def num_states(self) -> int:
+        return self.delta.size(0)
+
+    def next_col_at(self, t: int) -> torch.Tensor:
+        """[width[t], C]: the column at boundary ``t + 1`` reached from every column at ``t`` by a token of each class,
+        ``-1`` if that successor is inactive (pruned or dead) -- :func:`next_columns` of this layout's tables."""
+        return next_columns(self.delta, self.state_id, self.col_of_state, t, int(self.width[t]))
+
+    def next_col_table(self) -> torch.Tensor:
+        """[n, W, C]: every boundary's :meth:`next_col_at`, ``-1`` past its columns -- for inspection of small
+        automata (the backend never builds it)."""
+        out = torch.full((self.n, self.max_width, self.num_classes), -1, dtype = torch.long)
+        for t in range(self.n):
+            out[t, :int(self.width[t])] = self.next_col_at(t)
+        return out
+
+    def transitions(self, device) -> "Transitions":
+        """The layout's transitions on ``device`` (:class:`Transitions`)."""
+        return Transitions(self.delta.to(device), self.state_id.to(device), self.col_of_state.to(device),
+                           [int(w) for w in self.width.tolist()])
+
+    @cached_property
+    def successors(self):
+        """``(ptr, states)``: every automaton state's distinct successor states, as a CSR (int64, host): those of
+        state ``s`` are ``states[ptr[s] .. ptr[s + 1]]``, ascending."""
+        K = self.delta.size(0)
+        keys = torch.unique(torch.arange(K)[:, None] * K + self.delta)             # (state, successor), ascending
+        ptr = torch.zeros(K + 1, dtype = torch.long)
+        ptr[1:] = torch.cumsum(torch.bincount(keys // K, minlength = K), dim = 0)
+        return ptr, keys % K
+
+
+def next_columns(delta: torch.Tensor, state_id: torch.Tensor, col_of_state: torch.Tensor, t: int,
+                 w: int) -> torch.Tensor:
+    """[w, C]: the column at boundary ``t + 1`` reached from each of the ``w`` columns at ``t`` by a token of each
+    class -- ``col_of_state[t + 1][delta[state_id[t, k], c]]`` --, ``-1`` where that successor is inactive there
+    (pruned or dead). The tables on one device, of one integer type."""
+    return col_of_state[t + 1][delta[state_id[t, :w]]]
+
+
+@dataclass(frozen = True)
+class Transitions:
+    """
+    A layout's transitions on one device (:meth:`BoundaryLayout.transitions`): :meth:`at` is a boundary's table
+    (:meth:`BoundaryLayout.next_col_at`) -- what the program's transition tables are built from, one boundary at a
+    time.
+
+    :ivar delta, state_id, col_of_state: the layout's, on the device
+    :ivar width: the boundaries' columns (Python ints)
+    """
+
+    delta: torch.Tensor
+    state_id: torch.Tensor
+    col_of_state: torch.Tensor
+    width: list
+
+    @property
+    def n(self) -> int:
+        return len(self.width) - 1
+
+    @property
+    def K(self) -> int:
+        return self.delta.size(0)
+
+    @property
+    def C(self) -> int:
+        return self.delta.size(1)
+
+    @property
+    def W(self) -> int:
+        return self.state_id.size(1)
+
+    @property
+    def device(self):
+        return self.delta.device
+
+    def at(self, t: int) -> torch.Tensor:
+        """[width[t], C]: boundary ``t``'s table (see :func:`next_columns`)."""
+        return next_columns(self.delta, self.state_id, self.col_of_state, t, self.width[t])
 
 
 _CACHE: "OrderedDict[tuple, BoundaryLayout]" = OrderedDict()
@@ -126,16 +209,8 @@ def _build(dfa: DFA, n: int) -> BoundaryLayout:
         state_id[t, :ids.numel()] = ids
         col_of_state[t, ids] = torch.arange(ids.numel())
 
-    if n > 0:
-        src = state_id[:n]                                                  # [n, W]
-        succ = delta[src.clamp(min = 0)]                                    # [n, W, C] successor states
-        next_col = torch.gather(col_of_state[1:], 1, succ.reshape(n, W * C)).reshape(n, W, C)
-        next_col[src < 0] = -1
-    else:
-        next_col = torch.full((0, W, C), -1, dtype = torch.long)
-
     return BoundaryLayout(n = n, token_class = dfa.token_class, width = width, state_id = state_id,
-                          col_of_state = col_of_state, next_col = next_col,
+                          col_of_state = col_of_state, delta = delta.to(torch.long).contiguous(),
                           satisfiable = bool(width[0] > 0))
 
 
@@ -161,7 +236,7 @@ class Reachability:
         self.n = layout.n
         self.width = [int(w) for w in layout.width.tolist()]
         self.tile = tile
-        self._next_col = layout.next_col
+        self._layout = layout
         self._occupancy: Dict[Tuple[int, int], torch.Tensor] = {}
         self._slots: Dict[Tuple[int, int], int] = {}
         self._positions: Dict[Tuple[int, int], Optional[torch.Tensor]] = {}
@@ -190,10 +265,18 @@ class Reachability:
         return self._positions[a, b]
 
     def _advance(self, cur: torch.Tensor, t: int) -> torch.Tensor:
-        """[R, width[t]] 0/1 -> [R, width[t + 1]]: the columns one token on (a scatter through next_col)."""
-        k, c = torch.nonzero(self._next_col[t, :self.width[t]] >= 0, as_tuple = True)
+        """[R, width[t]] 0/1 -> [R, width[t + 1]]: the columns one token on (a scatter through every column's state's
+        distinct successors, :attr:`BoundaryLayout.successors`, those active at ``t + 1``)."""
+        layout = self._layout
+        ids = layout.state_id[t, :self.width[t]]
+        ptr, states = layout.successors
+        counts = ptr[ids + 1] - ptr[ids]
+        k = torch.repeat_interleave(torch.arange(ids.numel()), counts)
+        at = ptr[ids][k] + torch.arange(k.numel()) - (torch.cumsum(counts, 0) - counts)[k]
+        cols = layout.col_of_state[t + 1][states[at]]
+        keep = cols >= 0
         nxt = torch.zeros(cur.size(0), self.width[t + 1])
-        nxt.index_add_(1, self._next_col[t, k, c], cur[:, k])
+        nxt.index_add_(1, cols[keep], cur[:, k[keep]])
         return (nxt > 0).to(cur.dtype)
 
     def _sweep(self, a: int):

@@ -815,8 +815,9 @@ int64_t ctas_per_sm(bool td, bool ext, bool x3, bool fa, bool bf, int64_t tn, in
 // liveness.cu
 bool liveness_fits(int64_t n, int64_t W, int64_t smax);
 void liveness_cuda(torch::Tensor live, torch::Tensor back, torch::Tensor obs_class, torch::Tensor next_col,
-                   torch::Tensor entry_ptr, torch::Tensor entry_succ, torch::Tensor width, int64_t n, int64_t W,
-                   int64_t C, int64_t smax, int64_t ps, int64_t ss);
+                   torch::Tensor delta, torch::Tensor state_id, torch::Tensor col_of_state, torch::Tensor entry_ptr,
+                   torch::Tensor entry_succ, torch::Tensor width, int64_t n, int64_t W, int64_t C, int64_t K,
+                   int64_t smax, int64_t ps, int64_t ss, bool homogeneous);
 
 // walk.cu
 void ibtd_cuda(torch::Tensor element_flows, torch::Tensor temp_flows, torch::Tensor node_flows,

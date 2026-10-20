@@ -581,7 +581,7 @@ def test_transition_masses_match_brute_force(build_pc, monkeypatch):
     cc = jc.compile(dfa, pc)
     cc.marginal(torch.zeros(1, n, dtype = torch.long), torch.ones(1, n, dtype = torch.bool))
     prog = cc.backend.program()
-    tt, width, nc = prog.trans, prog.width, cc.backend.layout.next_col
+    tt, width, nc = prog.trans, prog.width, cc.backend.layout.next_col_table()
     ptr, succ = tt.entry_ptr.long().cpu(), tt.entry_succ.long().cpu()
     assert tt.grouped and prog.trans_persistent and tt.max_pairs > 16    # several pair tiles at the narrowest
     assert nc.size(2) > transitions.TRANSITION_TILES["TC"]

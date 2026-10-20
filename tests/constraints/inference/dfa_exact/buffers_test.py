@@ -25,7 +25,7 @@ def slots_of(cc, n, ns):
     """The (entry column, exit column) pairs of a node group's block that the automaton joins, a sequence end
     counting as one column, joined from every column that can still accept."""
     (a, b), = cc.structure.node(ns).scope_runs
-    w, next_col = cc.backend.width_per_boundary.tolist(), cc.backend.layout.next_col
+    w, next_col = cc.backend.width_per_boundary.tolist(), cc.backend.layout.next_col_table()
     joined = torch.eye(w[a], dtype = torch.bool)
     for t in range(a, b + 1):
         step = torch.zeros(w[a], w[t + 1], dtype = torch.bool)
