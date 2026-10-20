@@ -165,6 +165,14 @@ class Program:
         self.reg_iv_np = np.asarray(self.reg_iv_host, dtype = np.int64)
         self.reg_iv = torch.tensor(self.reg_iv_host, dtype = torch.long, device = dev)
         self.operands = self._operand_table(backend.product_rows)
+        # every sum interval's child intervals (its products' sum children's), and its depth: the longest chain of
+        # product steps down to the inputs (0 for an interval of input children only) -- what the values kept once
+        # are evicted and checkpointed by (:class:`~..state.PriorPool`)
+        self.iv_children = [np.unique(self.reg_iv_np[self.operands[k]]) for k in range(len(self.sum_ivs))]
+        self.iv_depth = np.zeros(len(self.sum_ivs), dtype = np.int64)
+        for k in np.argsort(self.iv_bounds[:, 1] - self.iv_bounds[:, 0], kind = "stable"):     # children first
+            if self.iv_children[k].size:
+                self.iv_depth[k] = 1 + int(self.iv_depth[self.iv_children[k]].max())
         self.live_tables = OrderedDict()                               # (batch size, intervals) -> lane order tables
         self.no_evidence = torch.full((1, n), -1, dtype = torch.int32, device = dev)   # a sample with nothing observed
         self.plans = OrderedDict()                                     # query plans, see :mod:`.plans`

@@ -242,14 +242,16 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
                               lambda: backend.state.flows(B, bufs, compact))
     else:
         flows = backend.state.flows(B, bufs, compact)
-    if report is not None:
-        report.update(plan = plan, liveness = lv, compact = compact, inputs_only = inputs_only, storage = storage,
-                      dropped = dropped, parked = parked, partial = partial if compact is not None else None)
     rows = class_weight_rows(prog, lv, col_pos, col_K, col_first, group_first, B)   # (their sizes copied behind
     gates = F.gate_context(backend, external)                                         # the forward pass's launches)
     hold = None if partial is None or compact is None else dict(regions = partial, fresh = carry["fresh"])
-    F.run_forward(backend, bufs, plan, x, missing, obs_class, lv, precision, compact, masses, gates = gates,
-                  hold = hold)
+    forward = lambda p, **kw: F.run_forward(backend, bufs, p, x, missing, obs_class, lv, precision, compact, masses,
+                                            gates = gates, **kw)
+    plan = F.kept_values(backend, plan, lambda: plan_for(held), forward, valid)   # (in pieces first when its values
+    if report is not None:                                                        # kept once do not fit)
+        report.update(plan = plan, liveness = lv, compact = compact, inputs_only = inputs_only, storage = storage,
+                      dropped = dropped, parked = parked, partial = partial if compact is not None else None)
+    forward(plan, hold = hold)
     valid |= plan.todo
 
     buf = backend.state.storage_view("dfa_class_flow", rows.starts[-1])

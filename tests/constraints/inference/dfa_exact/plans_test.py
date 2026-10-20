@@ -113,13 +113,21 @@ def test_every_step_carries_its_products_interval(kind, build_pc):
 
 def flags(cc, observed, targets, valid, prior):
     """Per sum interval, from the definitions: (computed per sample, computed once) -- needed and not kept once;
-    needed, kept once and not yet held."""
+    kept once, not yet held, and read: a child of a product computed per sample (the root for a marginal), or a
+    child of one computed once that is not held either (so that it can be)."""
     prog = cc.backend.program()
-    out = []
-    for k, (a, b) in enumerate(prog.sum_ivs):
-        needed = targets is None or bool(targets[:a].any() or targets[b:].any())
-        out.append((needed and not bool(prior[k]), needed and bool(prior[k]) and not bool(valid[k])))
-    return out
+    K = len(prog.sum_ivs)
+    sample = [(targets is None or bool(targets[:a].any() or targets[b:].any())) and not bool(prior[k])
+              for k, (a, b) in enumerate(prog.sum_ivs)]
+    children = [set(prog.reg_iv_host[r] for r in np.nonzero(prog.operands[k])[0]) for k in range(K)]
+    read = set().union(*(children[k] for k in range(K) if sample[k]))
+    if targets is None:
+        read.add(prog.reg_iv_host[prog.root_region])
+    once, frontier = set(), {k for k in read if prior[k] and not valid[k]}
+    while frontier:
+        once |= frontier
+        frontier = {c for k in frontier for c in children[k] if prior[c] and not valid[c]} - once
+    return [(sample[k], k in once) for k in range(K)]
 
 
 def rng_cases(n, seed):

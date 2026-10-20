@@ -19,11 +19,16 @@ very few live: :func:`prior_regions` keeps a region once when that is kept acros
 samples' live columns would; the other input-independent regions are computed per sample, pruned, like the rest
 (a region kept once needs its descendants kept once too: its launch reads them for a batch of one).
 
-A query computes its needed values that are input-dependent per sample, into ``node_mars``, those kept once that
-``prior_mars`` does not hold yet, once, and the input-independent ones not kept once per sample as well. A product
-follows its sum regions (they share their scope), and a product's intermediate folds follow the product. The
-:class:`QueryPlan` is the subsets of the Program's launches, dense runs and fused parts that do so, cached on the
-Program by what they depend on.
+A query computes its needed values that are input-dependent per sample, into ``node_mars``, and the
+input-independent ones not kept once per sample as well. Of the values kept once it computes those its launches READ
+-- the children of the products it computes per sample, of the top-down values it computes, the root's for a
+marginal -- that ``prior_mars`` does not hold, and, so that each can be computed, their children kept once that it
+does not hold either, down to the ones it holds or the inputs (:attr:`QueryPlan.prior_read`: the values read, held
+or computed, which the storage keeps while the query runs, see :class:`~...state.PriorPool`; when they do not all fit
+it, the lower ones are computed first, by plans of their own, :func:`kept_plan`). A product follows its
+sum regions (they share their scope), and a product's intermediate folds follow the product. The :class:`QueryPlan`
+is the subsets of the Program's launches, dense runs and fused parts that do so, cached on the Program by what they
+depend on.
 
 A query with a top-down pass (:mod:`.top_down`) plans it the same way, mirrored: a node's top-down value is
 NEEDED when its scope meets a target (the scoring reads the top-down values of the target positions' products, each from
@@ -66,6 +71,7 @@ class QueryPlan:
         num_edges, None or (fused part, index list of its node blocks or None for all, count, most slots, its
         regions' intervals))``
     :ivar todo: bool [sum intervals] (host tensor): the values kept once the query computes
+    :ivar prior_read: bool [sum intervals] (host): the values kept once the query reads (``todo`` among them)
     :ivar prior: whether the query reads or writes ``prior_mars`` at all
     :ivar root_prior: whether the root's value is kept once
     :ivar reg_prior: int32 [sum regions] (device): 1 where a region's values are in ``prior_mars`` for this query
@@ -75,6 +81,7 @@ class QueryPlan:
 
     steps: list
     todo: torch.Tensor
+    prior_read: np.ndarray
     prior: bool
     root_prior: bool
     reg_prior: torch.Tensor
@@ -202,20 +209,60 @@ def query_plan(prog, observed: np.ndarray, targets: Optional[np.ndarray], valid:
         free = free_regions(prog, observed)
         assert not (td.prior & ~free).any(), "a value kept once reads an input-dependent inside value"
         prior = prior | (free & prog.iv_inside[td.prior].any(axis = 0))
-    todo = needed & prior & ~valid
     sample = needed & ~prior
     if held is not None:
         sample &= ~held_intervals(prog, held)
+    # the values kept once the launches read: the children of what is computed per sample or top down, the root's
+    # for a marginal -- and, to compute the ones not held, their children not held, down to held ones
+    read_ivs = sample.copy()
+    if td is not None:
+        read_ivs[prog.reg_iv_np[td.per_sample | td.once]] = True
+    wanted = np.zeros_like(prior)
+    wanted[prog.reg_iv_np[prog.operands[read_ivs].any(axis = 0)]] = True
+    if td is not None:
+        wanted |= td.prior
+    if targets is None:
+        wanted[prog.reg_iv_host[prog.root_region]] = True
+    wanted &= prior
+    todo, frontier, read = np.zeros_like(prior), wanted & ~valid, wanted.copy()
+    while frontier.any():
+        todo |= frontier
+        below = np.zeros_like(prior)
+        for k in np.nonzero(frontier)[0]:
+            below[prog.iv_children[k]] = True
+        read |= below & prior                            # (their children kept once: held, or computed too)
+        frontier = below & prior & ~valid & ~todo
+    prior_read = read | todo
 
     lists = IndexLists()                                 # every index list, copied to the device together
     steps = _forward_steps(prog, todo, sample, lists)
     reg_prior = lists.add(prior[prog.reg_iv_np].astype(np.int32))
     lists.upload(prog.dev)
-    plan = QueryPlan(steps = steps, todo = torch.from_numpy(todo), prior = bool((needed & prior).any()),
-                     root_prior = bool(prior[prog.reg_iv_host[prog.root_region]]), reg_prior = reg_prior.tensor,
-                     sample = sample, top_down = td)
+    plan = QueryPlan(steps = steps, todo = torch.from_numpy(todo), prior_read = prior_read,
+                     prior = bool(prior_read.any()), root_prior = bool(prior[prog.reg_iv_host[prog.root_region]]),
+                     reg_prior = reg_prior.tensor, sample = sample, top_down = td)
     _keep(prog, key, plan)
     return plan
+
+
+def kept_plan(prog, todo: np.ndarray, prior: np.ndarray, keep: np.ndarray) -> QueryPlan:
+    """
+    A plan computing the values kept once of the intervals ``todo`` (bool [sum intervals], host) and nothing per
+    sample: a piece of a query's values kept once, computed before the query when they do not all fit their pool
+    (:func:`~.forward.kept_values`). It reads them and their children kept once (``prior``, bool [sum intervals]: the
+    intervals kept once), which must be held or among ``todo``; its ``prior_read`` has ``keep`` too (bool [sum
+    intervals]: the held values the query reads, kept through its pieces).
+    """
+    lists = IndexLists()
+    sample = np.zeros_like(todo)
+    steps = _forward_steps(prog, todo, sample, lists)
+    reg_prior = lists.add(prior[prog.reg_iv_np].astype(np.int32))
+    lists.upload(prog.dev)
+    read = todo.copy()
+    for k in np.nonzero(todo)[0]:
+        read[prog.iv_children[k]] = True
+    return QueryPlan(steps = steps, todo = torch.from_numpy(todo), prior_read = (read & prior) | keep, prior = True,
+                     root_prior = False, reg_prior = reg_prior.tensor, sample = sample)
 
 
 def read_regions(prog, plan: QueryPlan, root: bool = False) -> np.ndarray:

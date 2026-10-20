@@ -90,15 +90,27 @@ class DFAExactDecoder(Decoder):
     (:meth:`~..state.State.token_table`) -- half the bytes their scoring reads, at the scores' cost: ~2e-4 nats on
     Codpula's and Ctrl-G's circuits (no best token changed), up to ~3e-3 on small ones. "auto" (the default): under
     ``precision = "tf32"`` or "bf16" (approximate products anyway), not under "fp32"; True / False: always / never.
+
+    ``memory_budget``: the bytes the inside values the session keeps once -- those of scopes no sample observes,
+    computed once and read by every call: decoding left to right, the suffixes after the prefix -- may take
+    (:class:`~pyjuice.constraints.inference.dfa_exact.state.PriorPool`). None: all of them when their total fits the
+    free device memory, else :data:`~pyjuice.constraints.inference.dfa_exact.state.PRIOR_MEMORY_SHARE` of that
+    memory. Below their total, the values a call reads are kept and the others evicted and
+    computed again when read: left to right, every segment of the suffixes is computed once as decoding enters it
+    (about one forward pass more a session) -- the answers the same, bit for bit.
     """
 
     remembers = True
 
-    def __init__(self, cc, bf16_token_table = "auto", **options):
+    def __init__(self, cc, bf16_token_table = "auto", memory_budget: Optional[int] = None, **options):
         if bf16_token_table not in ("auto", True, False):
             raise ValueError(f"`bf16_token_table` must be 'auto', True or False, got {bf16_token_table!r}.")
+        if memory_budget is not None and (isinstance(memory_budget, bool) or not isinstance(memory_budget, int) or
+                                          memory_budget <= 0):
+            raise ValueError(f"`memory_budget` must be a positive number of bytes, got {memory_budget!r}.")
         super().__init__(cc, **options)
         self._bf16_tokens = bf16_token_table
+        self._memory_budget = memory_budget
         self._kept = None                           # what the buffers hold for the next call (`_Kept`)
         self._regions = None                        # see `_region_tables`
         self._layouts = {}                          # batch size -> (sum offsets, sum widths) as int64 arrays
@@ -107,11 +119,13 @@ class DFAExactDecoder(Decoder):
     def __enter__(self) -> "DFAExactDecoder":
         super().__enter__()
         self.cc.backend.state.bf16_tokens = self._bf16_tokens
+        self.cc.backend.state.set_prior_budget(self._memory_budget)
         return self
 
     def __exit__(self, *exc) -> bool:
         self._kept, self._layouts = None, {}
         self.cc.backend.state.bf16_tokens = False
+        self.cc.backend.state.set_prior_budget(None)
         return super().__exit__(*exc)
 
     def _forget(self):

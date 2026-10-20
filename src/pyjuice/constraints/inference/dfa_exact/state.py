@@ -138,6 +138,269 @@ def fresh_storage(numel: int, device) -> torch.Tensor:
     return out
 
 
+#: Of the device's free memory when the values kept once are first stored, the share they may take when the layout
+#: of every region kept once does not fit that memory (then :class:`PriorPool` segments them; when it fits, they take
+#: it all, as they did without a pool); a decoder session's ``memory_budget`` sets the bytes instead.
+PRIOR_MEMORY_SHARE = 0.6
+
+
+def _bytes(n: int) -> str:
+    """``n`` bytes, in the unit that reads best."""
+    for unit, size in (("GB", 1e9), ("MB", 1e6), ("kB", 1e3)):
+        if n >= size:
+            return f"{n / size:.1f} {unit}"
+    return f"{n} bytes"
+
+
+class PriorPool:
+    """
+    The storage of the inside values kept once (``prior_mars``, see :mod:`~.queries.backend.plans`), under a memory
+    budget. Every sum region kept once has an EXTENT of the pool while its values are held: a query gets extents for
+    the values it computes (:meth:`allocate`), and when the pool is full, the values of an interval no query needs
+    now are EVICTED -- their validity withdrawn (:meth:`State.prior_validity`), so that a later query reading them
+    computes them again from the values still held below them. Which interval: the one read longest ago, among those
+    that are no CHECKPOINT first -- the intervals whose depth (the longest chain of product steps to the inputs,
+    ``Program.iv_depth``) is a multiple of the ``stride``, the smallest for which the checkpoints and a segment (the
+    values of ``stride`` consecutive depths) fit the pool together: no value is then recomputed from more than
+    ``stride`` steps below (left to right, a segment is computed once more as decoding enters it: about one forward
+    pass more a session). Holes are merged as extents are freed, and the live extents moved to the front when none
+    fits.
+
+    A query whose values do not fit beside the checkpoints computes them in PIECES (:func:`~.queries.backend.forward.
+    kept_values`), the lowest depths first (:meth:`piece`). Decoding that reads every value at every call (every
+    position a target) would evict and recompute endlessly under a smaller pool: the pool refuses a query whose
+    values do not fit it at all.
+
+    The budget is the full layout when that fits the device's free memory (else :data:`PRIOR_MEMORY_SHARE` of it):
+    then every region kept once has its extent, nothing is ever evicted, and the values are as without a pool.
+
+    :param state: the :class:`State`
+    :param budget: bytes, or None: by :data:`PRIOR_MEMORY_SHARE`
+    """
+
+    def __init__(self, state: "State", budget: Optional[int] = None):
+        self.state = state
+        self.budget = budget
+        self.buffer: Optional[torch.Tensor] = None
+        self.extents: Dict[int, tuple] = {}           # region -> (offset, floats)
+        self.free: list = []                          # (offset, floats) of the holes, by offset
+        self.stamp: Dict[int, int] = {}               # interval -> the query that last read or wrote its values
+        self.queries = 0
+        self.stride = 1
+        self.evictions = 0
+        self.reg_floats = None                        # a region's extent (floats, aligned)
+        self.iv_floats = None                         # an interval's regions' extents together
+        self.iv_regions = None                        # an interval's regions
+        self._version = 0                             # counts changes of the extents
+        self._table = None                            # (version, offsets host, offsets device)
+
+    def reset(self):
+        """Every value dropped (their validity withdrawn by the caller); the buffer kept."""
+        self.extents, self.stamp = {}, {}
+        self.free = [(0, self.buffer.numel())] if self.buffer is not None else []
+        self._version += 1
+
+    # ---------------------------------------------------------------------------------------------
+
+    def _open(self):
+        """The buffer, allocated on first use within the budget, and the checkpoint stride."""
+        if self.buffer is not None:
+            return
+        prog, layout = self.state._backend.program(), self.state.batch_layout(1)
+        full = layout["node_size"]
+        self.reg_floats = np.asarray([int(_align(r)) for r in prog.reg_rows * np.asarray(layout["sum_widths"],
+                                                                                        dtype = np.int64)])
+        K = len(prog.sum_ivs)
+        self.iv_floats = np.zeros(K, dtype = np.int64)
+        np.add.at(self.iv_floats, prog.reg_iv_np, self.reg_floats)
+        self.iv_regions = [np.nonzero(prog.reg_iv_np == k)[0] for k in range(K)]
+        dev = self.state._device
+        if self.budget is not None:
+            budget = self.budget
+        else:                                          # the memory this process can take: the device's free memory
+            if dev.type == "cuda":                     # and the blocks its caching allocator holds unused
+                free = torch.cuda.mem_get_info(dev)[0] + torch.cuda.memory_reserved(dev) - torch.cuda.memory_allocated(dev)
+            else:
+                free = full * 4
+            budget = full * 4 if full * 4 <= free else int(PRIOR_MEMORY_SHARE * free)
+        floats = min(int(_align(max(budget // 4, 1))), int(_align(full)))
+        self.buffer = fresh_storage(floats, dev)
+        self.state._storage["prior_mars"] = self.buffer
+        self.free = [(0, floats)]
+        self.stride = 1
+        if floats < full:                              # segmented: the stride by what the pool holds
+            self.stride = self._stride(prog.iv_depth, floats)
+        self._version += 1
+
+    def _stride(self, depth: np.ndarray, floats: int) -> int:
+        """
+        The smallest stride whose checkpoints, a segment (any ``stride`` consecutive depths) and two more values fit
+        ``floats`` together: a session walking the chain recomputes every value once at most. When none does (fewer
+        than about 2 sqrt(D) values fit), the stride of the least estimated recomputation: every segment entered
+        costs its values, and a segment the room beside the checkpoints does not hold costs about (S - room)^2 / 2
+        room more as the walk steps through it -- against no checkpoints at all, D^2 / 2 P (the walk recomputes a
+        pool's worth of the chain every P steps); D + 1 then (the leaves the checkpoints).
+        """
+        D = int(depth.max(initial = 0))
+        level = np.zeros(D + 1, dtype = np.int64)       # the values' floats per depth
+        np.add.at(level, depth, self.iv_floats)
+        value = max(1, int(self.iv_floats.max()))
+        best, best_cost = D + 1, D * D / (2 * max(1, floats / value))
+        for S in range(1, D + 1):
+            padded = np.concatenate([[0], np.cumsum(np.concatenate([level, np.zeros(S, dtype = np.int64)]))])
+            segment = int((padded[S:] - padded[:-S]).max())
+            room = floats - int(level[::S].sum()) - 2 * value
+            if room >= segment:
+                return S
+            if room > 0:
+                r = room / value
+                cost = (D / S) * (S + max(0.0, S - r) ** 2 / (2 * r))
+                if cost < best_cost:
+                    best, best_cost = S, cost
+        return best
+
+    def _fit(self, floats: int) -> Optional[int]:
+        """The offset of the first hole of ``floats`` or more, taken (first fit), or None."""
+        for k, (off, size) in enumerate(self.free):
+            if size >= floats:
+                if size == floats:
+                    del self.free[k]
+                else:
+                    self.free[k] = (off + floats, size - floats)
+                return off
+        return None
+
+    def _release(self, off: int, floats: int):
+        """A hole, merged with its neighbours."""
+        self.free.append((off, floats))
+        self.free.sort()
+        merged = []
+        for o, s in self.free:
+            if merged and merged[-1][0] + merged[-1][1] == o:
+                merged[-1] = (merged[-1][0], merged[-1][1] + s)
+            else:
+                merged.append((o, s))
+        self.free = merged
+
+    def _compact(self):
+        """The live extents moved to the front, in order, one hole after them."""
+        at = 0
+        for r, (off, size) in sorted(self.extents.items(), key = lambda kv: kv[1][0]):
+            if off != at:
+                self.buffer[at:at + size] = self.buffer[off:off + size].clone()
+                self.extents[r] = (at, size)
+            at += size
+        self.free = [(at, self.buffer.numel() - at)] if at < self.buffer.numel() else []
+        self._version += 1
+
+    def _take(self, floats: int) -> Optional[int]:
+        """An extent of ``floats``: a hole, or the live extents compacted first when the holes hold it together."""
+        off = self._fit(floats)
+        if off is None and sum(size for _, size in self.free) >= floats:
+            self._compact()
+            off = self._fit(floats)
+        return off
+
+    def _evict(self, iv: int):
+        """Interval ``iv``'s values dropped: its regions' extents freed, its validity withdrawn."""
+        for r in self.iv_regions[iv]:
+            if int(r) in self.extents:
+                self._release(*self.extents.pop(int(r)))
+        self.state._prior_valid[iv] = False
+        self.stamp.pop(iv, None)
+        self.evictions += 1
+        self._version += 1
+
+    def _held(self) -> np.ndarray:
+        """bool [sum intervals]: those with extents."""
+        out = np.zeros(len(self.iv_floats), dtype = bool)
+        if self.extents:
+            out[self.state._backend.program().reg_iv_np[list(self.extents)]] = True
+        return out
+
+    def _checkpoints(self) -> np.ndarray:
+        return self.state._backend.program().iv_depth % self.stride == 0
+
+    def _too_small(self, floats: int) -> RuntimeError:
+        return RuntimeError(f"The values kept once that this query reads take {_bytes(floats * 4)}, more than the "
+                            f"{_bytes(self.buffer.numel() * 4)} kept for them (the decoder's `memory_budget`, or "
+                            f"{PRIOR_MEMORY_SHARE:.0%} of the free device memory when they were first stored, their "
+                            f"total not fitting it). A query that reads them all (every position a target) needs them "
+                            f"all held.")
+
+    # ---------------------------------------------------------------------------------------------
+
+    def holds(self, ivs: np.ndarray, checkpoints: bool = True) -> bool:
+        """Whether the values of the intervals ``ivs`` (bool [sum intervals]) fit the pool -- beside the checkpoints
+        it holds, unless ``checkpoints`` is False (then they may be evicted)."""
+        self._open()
+        keep = ivs | (self._held() & self._checkpoints()) if checkpoints else ivs
+        return int(self.iv_floats[keep].sum()) <= self.buffer.numel()
+
+    def piece(self, plan) -> Optional[np.ndarray]:
+        """bool [sum intervals]: of the values ``plan`` computes, the ones to compute first when they do not all fit
+        beside the ones it reads: the intervals of the lowest depths such that they, the held values they read, the
+        held values the plan reads (kept through every piece: computed again otherwise) and the checkpoints fit the
+        pool together -- without the checkpoints when nothing fits beside them; None when nothing fits at all."""
+        self._open()
+        prog, valid = self.state._backend.program(), self.state._prior_valid.numpy()
+        todo = plan.todo.numpy() & ~valid
+        keep, depth = plan.prior_read & valid, prog.iv_depth
+        for checkpoints in (True, False):
+            best = None
+            for d in np.unique(depth[todo]):
+                piece = todo & (depth <= d)
+                below = np.zeros_like(piece)
+                for k in np.nonzero(piece)[0]:
+                    below[prog.iv_children[k]] = True
+                if not self.holds(piece | (below & valid) | keep, checkpoints):
+                    break
+                best = piece
+            if best is not None:
+                return best
+        return None
+
+    def allocate(self, plan) -> Dict[str, Any]:
+        """Extents for the values ``plan`` computes (:attr:`~.queries.backend.plans.QueryPlan.todo`), the ones it
+        reads (``prior_read``) kept meanwhile and the others evicted as needed; then :meth:`table`."""
+        self._open()
+        prog, valid = self.state._backend.program(), self.state._prior_valid
+        self.queries += 1
+        pinned = plan.prior_read
+        for iv in np.nonzero(pinned)[0]:
+            self.stamp[int(iv)] = self.queries
+        todo = plan.todo.numpy()
+        checkpoint = self._checkpoints()
+        for r in np.nonzero(todo[prog.reg_iv_np])[0]:
+            r = int(r)
+            if r in self.extents:
+                continue
+            floats = int(self.reg_floats[r])
+            off = self._take(floats)
+            while off is None:
+                held = [iv for iv in np.nonzero(self._held() & ~pinned)[0]]
+                if not held:
+                    raise self._too_small(int(self.iv_floats[pinned].sum()))
+                held.sort(key = lambda iv: (bool(checkpoint[iv]), self.stamp.get(int(iv), -1)))
+                self._evict(int(held[0]))
+                off = self._take(floats)
+            self.extents[r] = (off, floats)
+            self._version += 1
+        return self.table()
+
+    def table(self) -> Dict[str, Any]:
+        """Where the values kept once are: ``mars`` (the pool), every sum region's ``offset`` there (-1 for one
+        without an extent) and ``width`` (Python ints), ``offset_t`` / ``width_t`` on the device."""
+        self._open()
+        layout = self.state.batch_layout(1)
+        if self._table is None or self._table[0] != self._version:
+            R = len(layout["sum_widths"])
+            offsets = [self.extents[r][0] if r in self.extents else -1 for r in range(R)]
+            self._table = (self._version, offsets, torch.tensor(offsets, dtype = torch.int64, device = self.state._device))
+        return dict(mars = self.buffer, offset = self._table[1], width = layout["sum_widths"], offset_t = self._table[2],
+                    width_t = layout["sum_widths_t"])
+
+
 class State:
     """
     The buffers and the parameter-derived values of one :class:`~.backend.DFAExactBackend` (``backend.state``). It
@@ -164,6 +427,8 @@ class State:
         self._prior_version = None                  # the class masses they were computed with
         self._prior_kept = False                    # kept by a `pyjuice.fast_inference` scope
         self._prior_flows_state = None              # the input-independent top-down values (see `prior_flows`)
+        self._prior_pool = None                     # where they are kept, under a budget (see `prior_buffer`)
+        self._prior_budget = None                   # bytes, a decoder session's (None: PRIOR_MEMORY_SHARE)
         self._token_tables = None                   # token-major input parameters kept by a scope (`token_table`)
         self._enum_probs = None                     # the enumerated tokens', fp32, kept by a scope (`enumerated_probs`)
         self._prow = None                           # every shared class-mass row's own number (see `masses`)
@@ -226,16 +491,35 @@ class State:
             elements = self.storage_view("element_flows", compact.element_size)
         return dict(node_flows = self.storage_view("node_flows", compact.size), element_flows = elements)
 
-    def prior_buffer(self) -> Dict[str, Any]:
+    def prior_buffer(self, plan = None) -> Dict[str, Any]:
         """
-        ``prior_mars``: the input-independent inside values (see :mod:`~.plans`), laid out as ``node_mars`` for a
-        batch of one, in storage of its own (it outlives queries of any batch size), allocated on first use. A dict
-        with ``mars`` (flat), and every sum region's ``offset`` and ``width`` there (Python ints) and ``offset_t`` /
-        ``width_t`` (int64 on the device).
+        ``prior_mars``: the input-independent inside values (see :mod:`~.plans`), a block per sum region kept once
+        (as ``node_mars`` lays a batch of one out) in the :class:`PriorPool`'s storage, which outlives queries of any
+        batch size. With a ``plan`` (a :class:`~.queries.backend.plans.QueryPlan`), first the pool's extents for the
+        values it computes. A dict with ``mars`` (flat), and every sum region's ``offset`` (-1 for one not held)
+        and ``width`` there (Python ints) and ``offset_t`` / ``width_t`` (int64 on the device).
         """
-        layout = self.batch_layout(1)
-        return dict(mars = self.storage_view("prior_mars", layout["node_size"]), offset = layout["sum_offsets"],
-                    width = layout["sum_widths"], offset_t = layout["sum_offsets_t"], width_t = layout["sum_widths_t"])
+        pool = self.prior_pool()
+        return pool.allocate(plan) if plan is not None else pool.table()
+
+    def prior_pool(self) -> PriorPool:
+        """The :class:`PriorPool` holding the values kept once, under the session's budget."""
+        if self._prior_pool is None:
+            self._prior_pool = PriorPool(self, self._prior_budget)
+        return self._prior_pool
+
+    def set_prior_budget(self, budget: Optional[int]):
+        """The bytes the values kept once may take (None: all of them when they fit the free device memory when they
+        are first stored, else :data:`PRIOR_MEMORY_SHARE` of it): a decoder session's ``memory_budget``. Another
+        budget drops the values held."""
+        if budget is not None and (not isinstance(budget, int) or budget <= 0):
+            raise ValueError(f"`memory_budget` must be a positive number of bytes, got {budget!r}.")
+        if budget != self._prior_budget:
+            self._prior_budget = budget
+            self._prior_pool = None
+            self._storage["prior_mars"] = None
+            if self._prior_valid is not None:
+                self._prior_valid[:] = False
 
     def prior_flows(self, regions) -> Dict[str, Any]:
         """
@@ -304,6 +588,8 @@ class State:
         if self._prior_valid is None or not self._prior_kept or self._prior_version != version:
             self._prior_valid = torch.zeros(len(self._backend.program().sum_ivs), dtype = torch.bool)
             self._prior_version = version
+            if self._prior_pool is not None:
+                self._prior_pool.reset()
             if self._prior_flows_state is not None:
                 self._prior_flows_state["valid"][:] = False
             if is_active():
@@ -564,7 +850,7 @@ class State:
         self._session = None
         if poison and self._class_mars is not None:
             self._class_mars.fill_(float("nan"))
-        if poison and "prior_mars" in self._storage:
+        if poison and self._storage.get("prior_mars") is not None:
             self._storage["prior_mars"].fill_(float("nan"))
         if poison and self._prior_flows_state is not None:      # rows given again (filled with -inf) on next use
             R = len(self._backend.sum_regions)

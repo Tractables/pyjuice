@@ -27,6 +27,7 @@ from ...kernels.prod import run_products as products
 from ...external_params import block_scale
 from ...kernels.compact import fresh_counts, fresh_order
 from ...kernels.sum import dense_sum, fused_sum, stacked_weights
+from .plans import kept_plan
 
 
 #: Matrix-product precision of the kernels per query precision: "fp32" (three TF32 products, fp32-level accuracy),
@@ -147,7 +148,7 @@ def run_forward(backend, bufs: dict, plan, x: torch.Tensor, missing: torch.Tenso
     compact = compact if compact is not None and compact.mars is not None else None
     regions = dict(offset = lay["sum_offsets_t"], width = lay["sum_widths_t"], first = prog.reg_first,
                    slots = prog.reg_slots if compact is None else compact.lanes_t)   # compact: B = 1, slots = lanes
-    prior = backend.state.prior_buffer() if plan.prior else None
+    prior = backend.state.prior_buffer(plan) if plan.prior else None     # (extents for the values it computes)
     if prior is not None:                                              # where the values kept once are
         once = dict(offset = prior["offset_t"], width = prior["width_t"], first = prog.reg_first, slots = prog.reg_slots)
         srcs = dict(mars = prior["mars"], offset = prior["offset_t"], width = prior["width_t"], reg_prior = plan.reg_prior)
@@ -213,6 +214,37 @@ def run_forward(backend, bufs: dict, plan, x: torch.Tensor, missing: torch.Tenso
                           lay["sum_widths"], elem_first, elem_width, B, liveness, stacks, kept, precision, compact,
                           gates = gates, hold = hold if compact is not None else None)
     return masses
+
+
+def kept_values(backend, plan, replan, forward, valid: torch.Tensor):
+    """
+    The values kept once a query reads (:attr:`~.plans.QueryPlan.prior_read`) must be held together while it runs.
+    When they do not fit their pool (:class:`~...state.PriorPool`) beside its checkpoints, the ones it computes are
+    computed first in pieces, the lowest depths first (:meth:`~...state.PriorPool.piece`), each by a plan of its own
+    (:func:`~.plans.kept_plan`) that ``forward(plan)`` runs (:func:`run_forward` with the query's arguments), the pool
+    evicting between them all but the values the query reads -- ``valid`` (the state's, see
+    :meth:`~...state.State.prior_validity`) marked as they are computed; the query's plan is then made again
+    (``replan()``) over the values held, and so on while its values do not fit: every piece leaves fewer to compute
+    (the pieces keep what the query's closure reads). When even the lowest depth does not fit, and the query's values
+    do not fit without the checkpoints either, the pool refuses the query.
+
+    :returns: the query's plan, ``plan`` itself when its values fit
+    """
+    if not plan.prior:
+        return plan
+    pool, prog = backend.state.prior_pool(), backend.program()
+    prior = plan.prior_read | plan.todo.numpy()                     # (kept once: what it reads and computes)
+    while not pool.holds(plan.prior_read):
+        piece = pool.piece(plan)
+        if piece is None:
+            if pool.holds(plan.prior_read, checkpoints = False):     # the checkpoints go
+                break
+            raise pool._too_small(int(pool.iv_floats[plan.prior_read].sum()))
+        sub = kept_plan(prog, piece, prior | valid.numpy(), plan.prior_read & valid.numpy())
+        forward(sub)
+        valid |= sub.todo
+        plan = replan()
+    return plan
 
 
 def scratch_width(B: int, temp_slots: int, sample_stages, compact) -> int:

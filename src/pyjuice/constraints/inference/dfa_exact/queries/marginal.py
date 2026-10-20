@@ -13,7 +13,7 @@ import torch
 from ..kernels.compact import (STORAGES, compact_buffers, held_elsewhere, held_moves, query_layout,
                               resolve_storage, worth_parking)
 from ..kernels.live import live_successors, liveness
-from .backend.forward import PRECISIONS, gate_context, missing_tensor, run_forward
+from .backend.forward import PRECISIONS, gate_context, kept_values, missing_tensor, run_forward
 from .backend.plans import per_sample_intervals, prior_regions, query_plan, read_regions
 
 
@@ -98,11 +98,15 @@ def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] =
             if lv is not None:
                 lv.order(per_sample_intervals(prog, plan))
             bufs = backend.state.buffers(B)
+        gates = gate_context(backend, external)
+        forward = lambda p: run_forward(backend, bufs, p, x, missing, obs_class, lv, precision, compact, masses,
+                                        gates = gates)
+        plan = kept_values(backend, plan, lambda: query_plan(prog, observed, None, valid.numpy(), prior, held = held),
+                           forward, valid)             # (in pieces first when its values kept once do not fit)
         if report is not None:
             report.update(plan = plan, liveness = lv, inputs_only = inputs_only, compact = compact, storage = storage,
                           dropped = dropped, parked = parked)
-        run_forward(backend, bufs, plan, x, missing, obs_class, lv, precision, compact, masses,
-                    gates = gate_context(backend, external))
+        forward(plan)
         valid |= plan.todo
 
         r = prog.root_region
