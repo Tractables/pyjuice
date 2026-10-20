@@ -77,7 +77,9 @@ def test_actual_factory_launch_matches_stock_triton(dtype, offset):
         actual = launcher.triton_jit(_scale_kernel)
     reference = launcher.triton.jit(_scale_kernel)
     for n, block in ((17, 128), (1024, 256), (17, 128)):
-        x = torch.arange(n + offset, dtype=dtype, device="cuda:0")[offset:] * .125
+        base = torch.arange(n + offset, dtype=dtype, device="cuda:0") * .125
+        x = base[offset:]
+        assert x.data_ptr() % 16 == (offset * x.element_size()) % 16
         result, expected = torch.empty_like(x), torch.empty_like(x)
         grid = ((n + block - 1) // block,)
         actual[grid](x, result, n, 2., BLOCK=block)
