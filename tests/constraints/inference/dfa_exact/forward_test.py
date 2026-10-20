@@ -446,6 +446,49 @@ def test_the_stacked_weights_are_what_is_multiplied(dense_pruning, monkeypatch):
     assert_close(cc.marginal(data, missing, storage = "dense"), want + runs * math.log(2), n)
 
 
+@pytest.mark.parametrize("stacked", [True, False])
+@pytest.mark.parametrize("tied", [True, False])
+def test_bf16_dense_products_multiply_bf16_weight_copies(tied, stacked, reference, monkeypatch):
+    """A ``precision = "bf16"`` query's dense products on the live columns multiply bf16 copies of the weights --
+    stacked, or block by block (a product wider than STACK_MAX_COLUMNS) --, one per distinct weights (an HMM's tied
+    transitions share theirs), kept in its weight stacks: inside a pyjuice.fast_inference scope, built by the first
+    query only. Every token observed (every run computed per sample, on the live columns): the marginal is within
+    bf16's error of the reference, and doubling every copy (nothing else) moves it by log 2 per run."""
+    import pyjuice.constraints.inference.dfa_exact.kernels.sum as lifted_sum
+    import pyjuice.constraints.inference.dfa_exact.queries.backend.forward as F
+    able = "out_dtype" in (torch.mm.__doc__ or "") and torch.cuda.is_bf16_supported()
+    assert lifted_sum._bf16_products(torch.device("cuda:0")) == able
+    if not able:
+        pytest.skip("torch.mm multiplies no bf16 matrices into fp32 ones here: bf16 queries' dense products run TF32")
+    if not stacked:
+        monkeypatch.setattr(F, "STACK_MAX_COLUMNS", {p: -1 for p in F.STACK_MAX_COLUMNS})
+    n = 6
+    cc = jc.compile(CONSTRAINTS["contains"](), blocks_hmm(n, tied = tied, seed = 0))
+    data, missing = evidence(n, 4)
+    data[:, 2:4] = torch.tensor([1, 2])
+    missing[:] = False
+    want = reference.marginal(cc, data, missing)
+    built, copy = [], lifted_sum._bf16_copy
+    monkeypatch.setattr(lifted_sum, "_bf16_copy", lambda copies, key, make: copy(copies, key,
+                                                                                lambda: built.append(key) or make()))
+    with juice.fast_inference():
+        got = cc.marginal(data, missing, storage = "compact", precision = "bf16")
+        first = len(built)
+        assert_close(cc.marginal(data, missing, storage = "compact", precision = "bf16"), got, n)
+        kept = [t for t in cc.backend.state._kept_stacks.values() if t.dtype == torch.bfloat16]
+    runs = 1 if tied else len(stack_keys(cc))
+    assert first == runs * (1 if stacked else 2) == len(built) == len(kept)   # a stack, or a run's two blocks
+    assert torch.equal(torch.isneginf(got), torch.isneginf(want)) and torch.isfinite(want).any()
+    fin = torch.isfinite(want)
+    assert (got[fin] - want[fin]).abs().max() < 1.5e-2
+    base = cc.marginal(data, missing, storage = "compact", precision = "bf16")
+    monkeypatch.setattr(lifted_sum, "_bf16_copy", lambda copies, key, make: 2 * copy(copies, key, make))
+    doubled = cc.marginal(data, missing, storage = "compact", precision = "bf16")
+    # not exactly: a layer's log 2 higher outputs give its children's exponentials other last bits, some rounding to
+    # another bf16 value (~1e-4 here) -- a run reading anything but the copies would be off by log 2
+    assert ((doubled - base - len(stack_keys(cc)) * math.log(2))[fin].abs() < 1e-3).all()
+
+
 @triton.jit
 def _lse_steps_kernel(x, out_m, out_acc, steps, LANES: tl.constexpr, ONE_EXP: tl.constexpr):
     """Every lane's online log-sum-exp over ``steps`` terms, by the one-exp step or the two-exp one."""

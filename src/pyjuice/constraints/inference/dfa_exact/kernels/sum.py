@@ -1091,11 +1091,12 @@ def _live_shifted_exp_tiles_kernel(x, perm, ex_t, m, rows, x_ld, num_live, TILE_
 _LIVE_EXP_TILES = ((256, 512, 16), (4096, 512, 32))
 
 
-def _live_shifted_exp(x: torch.Tensor, perm: torch.Tensor, num_live: int):
+def _live_shifted_exp(x: torch.Tensor, perm: torch.Tensor, num_live: int, dtype: Optional[torch.dtype] = None):
     """``(ex_t, m)`` of :func:`_live_shifted_exp_kernel` (or :func:`_live_shifted_exp_tiles_kernel`, the same bits):
-    [num_live, rows] and [num_live] for ``x`` [rows, *]."""
+    [num_live, rows] (``dtype``, default ``x``'s: bf16 rounds the exponentials to nearest) and [num_live] for ``x``
+    [rows, *]."""
     rows = x.size(0)
-    ex_t = torch.empty(num_live, rows, dtype = x.dtype, device = x.device)
+    ex_t = torch.empty(num_live, rows, dtype = dtype or x.dtype, device = x.device)
     m = torch.empty(num_live, dtype = x.dtype, device = x.device)
     tile = None
     for least, TILE_R, TILE_C in _LIVE_EXP_TILES:
@@ -1160,9 +1161,45 @@ def _products(blocks, params, E, BS, stacked):
     return [(params[p0:p0 + E * BS].view(E, BS).t(), nid) for _, nid, p0 in blocks]
 
 
+_BF16_PRODUCTS = {}
+
+
+def _bf16_products(dev: torch.device) -> bool:
+    """Whether ``torch.mm`` multiplies bf16 matrices into fp32 ones on ``dev`` (its ``out_dtype``: recent PyTorch, a
+    GPU with bf16 tensor cores) -- else a bf16 query's dense products run as at "tf32"."""
+    key = (dev.type, dev.index)
+    hit = _BF16_PRODUCTS.get(key)
+    if hit is None:
+        a = torch.ones(16, 16, dtype = torch.bfloat16, device = dev)
+        try:
+            hit = torch.mm(a, a, out_dtype = torch.float32).dtype == torch.float32
+        except (TypeError, RuntimeError):
+            hit = False
+        _BF16_PRODUCTS[key] = hit
+    return hit
+
+
+def _bf16_copy(copies: dict, key, make) -> torch.Tensor:
+    """``copies[key]``, made from ``make()`` rounded to bf16 (to nearest) on first use."""
+    hit = copies.get(key)
+    if hit is None:
+        hit = copies[key] = make().to(torch.bfloat16)
+    return hit
+
+
+def _bf16_weights(copies: dict, blocks, params, E, BS, stacked):
+    """:func:`_products` of a run from bf16 copies of its weights kept in ``copies``: of the ``stacked`` weights, or of
+    every block's ``[E, BS]`` matrix (transposed for free)."""
+    if stacked is not None:
+        key = ("bf16 stacked", E, BS) + tuple(p0 for _, _, p0 in blocks)
+        return [(_bf16_copy(copies, key, lambda: stacked), blocks[0][1])]
+    return [(_bf16_copy(copies, ("bf16", p0, E, BS), lambda p0 = p0: params[p0:p0 + E * BS].view(E, BS)).t(), nid)
+            for _, nid, p0 in blocks]
+
+
 def dense_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor, groups: dict, E: int,
               block_size: int, region: tuple, elem_first: int, elem_width: int, ncols: int, precision: str,
-              live = None, stacked: dict = None):
+              live = None, stacked: dict = None, bf16: bool = False, copies: Optional[dict] = None):
     """
     Dense node blocks of one sum region (see :func:`dense_groups`), into ``node_mars``: per run of children,
     ``log(W_k @ exp(X - m)) + m`` with ``m`` the column maximum of the children ``X``.
@@ -1172,6 +1209,10 @@ def dense_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch
         :meth:`~.live.LaneOrder.segment`): the live columns are gathered and multiplied, the others set to -inf
     :param stacked: first child row -> the :func:`stacked_weights` of that run's node blocks, which occupy
         consecutive rows in the order listed: one product for the run instead of one per block
+    :param bf16: the live columns' products on bf16 operands, summed and returned in fp32 (a ``precision = "bf16"``
+        query's, ``precision`` then "tf32"): the exponentials, and the weights' copies kept in ``copies`` (the
+        query's :meth:`~..state.State.weight_stacks`), rounded to bf16 -- as at ``precision`` where ``torch.mm``
+        cannot (:func:`_bf16_products`), and for every column (no ``live``)
     """
     offset, width, first = region
     BS = block_size
@@ -1181,7 +1222,8 @@ def dense_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch
     TILE_R, TILE_C = _EW_TILE
     num_ctiles = host_cdiv(ncols, TILE_C)
     if live is not None:
-        _dense_sum_live(nodes, elems, params, groups, E, BS, first, elem_first, ncols, precision, live, stacked)
+        _dense_sum_live(nodes, elems, params, groups, E, BS, first, elem_first, ncols, precision, live, stacked,
+                        copies if bf16 and _bf16_products(nodes.device) else None)
         return
     with _matmul_precision(precision):
         for c0, blocks in groups.items():
@@ -1205,17 +1247,26 @@ def dense_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch
 _TRANSPOSED_PRODUCTS = ("tf32",)
 
 
-def _dense_sum_live(nodes, elems, params, groups, E, BS, first, elem_first, ncols, precision, live, stacked):
+def _dense_sum_live(nodes, elems, params, groups, E, BS, first, elem_first, ncols, precision, live, stacked,
+                    copies = None):
+    """:func:`dense_sum` on the live columns (``copies``: the bf16 weights' dict, products on bf16 operands)."""
     perm, rank, num_live = live
     width = nodes.size(1)
     TILE_R, TILE_C = _EW_TILE
-    trans = precision in _TRANSPOSED_PRODUCTS
+    bf16 = copies is not None
+    trans = bf16 or precision in _TRANSPOSED_PRODUCTS
     with _matmul_precision(precision):
         for c0, blocks in groups.items():
-            ex_t, m = _live_shifted_exp(elems[c0 - elem_first:c0 - elem_first + E], perm, num_live)    # [live, E]
-            for w, nid in _products(blocks, params, E, BS, stacked.get(c0)):
+            ex_t, m = _live_shifted_exp(elems[c0 - elem_first:c0 - elem_first + E], perm, num_live,     # [live, E]
+                                        torch.bfloat16 if bf16 else None)
+            products = _bf16_weights(copies, blocks, params, E, BS, stacked.get(c0)) if bf16 else \
+                _products(blocks, params, E, BS, stacked.get(c0))
+            for w, nid in products:
                 rows = w.size(0)
-                prod = torch.mm(ex_t, w.t()) if trans else torch.mm(w, ex_t.t())  # [live, rows] / [rows, live]
+                if bf16:
+                    prod = torch.mm(ex_t, w.t(), out_dtype = torch.float32)                      # [live, rows]
+                else:
+                    prod = torch.mm(ex_t, w.t()) if trans else torch.mm(w, ex_t.t())  # [live, rows] / [rows, live]
                 num_ctiles = host_cdiv(ncols, TILE_C)
                 _log_scatter_kernel[(host_cdiv(rows, TILE_R) * num_ctiles,)](
                     nodes[nid - first:nid - first + rows], prod, m, rank, rows, ncols, width, num_live, num_ctiles,
@@ -1628,7 +1679,8 @@ def _log_scatter_accumulate_kernel(out, prod, m, rank, rows, ncols, ld, num_live
 
 def dense_sum_top_down(element_flows: torch.Tensor, node_flows: torch.Tensor, params: torch.Tensor, blocks, E: int,
                       block_size: int, region: tuple, c0: int, elem_first: int, elem_width: int, ncols: int,
-                      precision: str, add: bool, live = None, stacked = None, piece = None):
+                      precision: str, add: bool, live = None, stacked = None, piece = None, bf16: bool = False,
+                      copies: Optional[dict] = None):
     """
     The top-down values of the ``E`` children ``c0 ..`` of a run of dense node blocks of one sum region:
     ``O_elem = log(W^T @ exp(O_node - m)) + m`` with ``m`` the column maximum of the node blocks' top-down values,
@@ -1639,17 +1691,22 @@ def dense_sum_top_down(element_flows: torch.Tensor, node_flows: torch.Tensor, pa
     :param region: ``(offset, width, first)`` of the node blocks' sum region
     :param live: None, or the interval's ``(perm, rank, num_live)`` (see :meth:`~.live.LaneOrder.segment`)
     :param piece: None, or ``(lo, hi)``: only the children ``c0 + lo .. c0 + hi``
+    :param bf16, copies: the live columns' products on bf16 operands, as in :func:`dense_sum`
     """
     offset, width, first = region
     BS = block_size
     lo, hi = piece if piece is not None else (0, E)
+    bf16 = bf16 and live is not None and _bf16_products(node_flows.device)
     elems = element_flows[:element_flows.numel() // elem_width * elem_width].view(-1, elem_width)
     nodes = node_flows[offset:offset + (node_flows.numel() - offset) // width * width].view(-1, width)
     out = elems[c0 + lo - elem_first:c0 + hi - elem_first]
+    if bf16:                                                     # (the bf16 copies of the whole run's weights)
+        products = [(w.t()[lo:hi], nid, w.size(0)) for w, nid in _bf16_weights(copies, blocks, params, E, BS, stacked)]
     E = hi - lo
     TILE_R, TILE_C = _EW_TILE
-    products = [(stacked.t()[lo:hi], blocks[0][1], stacked.size(0))] if stacked is not None else \
-        [(params[p0 + lo * BS:p0 + hi * BS].view(E, BS), nid, BS) for _, nid, p0 in blocks]
+    if not bf16:
+        products = [(stacked.t()[lo:hi], blocks[0][1], stacked.size(0))] if stacked is not None else \
+            [(params[p0 + lo * BS:p0 + hi * BS].view(E, BS), nid, BS) for _, nid, p0 in blocks]
     with _matmul_precision(precision):
         for wt, nid, rows in products:
             x = nodes[nid - first:nid - first + rows, :ncols]
@@ -1669,9 +1726,12 @@ def dense_sum_top_down(element_flows: torch.Tensor, node_flows: torch.Tensor, pa
                                                                          TILE_R = TILE_R, TILE_C = TILE_C)
             else:
                 perm, rank, num_live = live
-                trans = precision in _TRANSPOSED_PRODUCTS
-                ex_t, m = _live_shifted_exp(x, perm, num_live)                                  # [live, rows]
-                prod = torch.mm(ex_t, wt.t()) if trans else torch.mm(wt, ex_t.t())             # [live, E] / [E, live]
+                trans = bf16 or precision in _TRANSPOSED_PRODUCTS
+                ex_t, m = _live_shifted_exp(x, perm, num_live, torch.bfloat16 if bf16 else None)  # [live, rows]
+                if bf16:
+                    prod = torch.mm(ex_t, wt.t(), out_dtype = torch.float32)                      # [live, E]
+                else:
+                    prod = torch.mm(ex_t, wt.t()) if trans else torch.mm(wt, ex_t.t())         # [live, E] / [E, live]
                 num_ctiles = host_cdiv(ncols, TILE_C)
                 kernel = _log_scatter_accumulate_kernel if add else _log_scatter_kernel
                 kernel[(host_cdiv(E, TILE_R) * num_ctiles,)](out, prod, m, rank, E, ncols, elem_width, num_live,

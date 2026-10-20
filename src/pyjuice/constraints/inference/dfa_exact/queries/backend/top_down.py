@@ -138,7 +138,8 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
                             stacked = stacks[key]
                         dense_sum_top_down(element_flows, nf, pc.params, blocks, E, block_size,
                                           (int(offsets[r]), int(widths[r]), prog.firsts[r]), c0, elem_first, ew,
-                                          ncols, dot, add, live = cols, stacked = stacked, piece = piece)
+                                          ncols, dot, add, live = cols, stacked = stacked, piece = piece,
+                                          bf16 = precision == "bf16", copies = stacks)
                     for cbs, tables, idx in fused_groups[part]:
                         max_cols = compact.lanes(tables["host"]["ivs"]) if part == 1 and compact is not None else \
                             nb * tables["max_slots"]                     # (its regions' most)

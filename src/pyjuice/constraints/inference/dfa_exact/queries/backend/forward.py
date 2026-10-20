@@ -29,8 +29,8 @@ from ...kernels.sum import dense_sum, fused_sum, stacked_weights
 
 
 #: Matrix-product precision of the kernels per query precision: "fp32" (three TF32 products, fp32-level accuracy),
-#: "tf32", or "bf16" -- the CUDA fused sums' products on bf16 operands (:func:`~...kernels.sum.fused_sum`), every other
-#: kernel's as at "tf32".
+#: "tf32", or "bf16" -- the CUDA fused sums' and the dense sums' live-column products on bf16 operands
+#: (:func:`~...kernels.sum.fused_sum`, :func:`~...kernels.sum.dense_sum`), every other kernel's as at "tf32".
 PRECISIONS = {"fp32": "tf32x3", "tf32": "tf32", "bf16": "tf32"}
 
 #: The fewest columns (batch x slots) a dense sum region needs before evidence pruning pays with more than one live
@@ -233,7 +233,8 @@ def _sums(backend, parts, block_size: int, nodes: torch.Tensor, element_mars: to
                     stacks[key] = stacked_weights(pc.params, key[2], num_edges, block_size)
                 stacked = {c0: stacks[key]}
             dense_sum(nodes, element_mars, pc.params, {c0: blocks}, num_edges, block_size, region, elem_first,
-                      elem_width, ncols, dot, live = cols, stacked = stacked)
+                      elem_width, ncols, dot, live = cols, stacked = stacked, bf16 = precision == "bf16",
+                      copies = stacks)
         if fused is not None:
             (nids, cids, pids, nb_reg, _, aliased, gate), sel, count, max_slots, ivs = fused
             max_cols = B * max_slots if compact is None else compact.lanes(ivs)          # (its regions' most)

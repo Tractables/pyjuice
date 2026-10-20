@@ -300,8 +300,9 @@ class DFAExactBackend(Backend):
         """
         ``log p(C, e)`` for every sample (see :meth:`~pyjuice.constraints.ConstrainedCircuit.marginal`).
 
-        :param precision: "fp32" (the default; fp32-level accuracy), "tf32", or "bf16" -- the CUDA fused sums'
-            products on bfloat16 operands, every other product as at "tf32" -- for the sum layers' matrix products
+        :param precision: "fp32" (the default; fp32-level accuracy), "tf32", or "bf16" -- the CUDA fused sums' and
+            the dense sums' live-column products on bfloat16 operands, every other product as at "tf32" -- for the sum
+            layers' matrix products
         :param storage: "auto" (the default), "dense" or "compact" (see :meth:`conditional`; a marginal keeps inside
             values only)
         :param external: a decoder session's per-sample inputs (:meth:`external_inputs`)
