@@ -1,29 +1,42 @@
 """
 JSON Schema over a token sequence's text.
 
-:class:`JSONSchema` is the :class:`~pyjuice.constraints.Regex` of a schema's instances written as JSON, by the regular
-expression outlines-core's converter makes of the schema: the texts in its canonical form -- properties in the
-schema's order and no others, ``whitespace`` around separators, strings without ``\\u`` escapes or characters
-U+007F-U+009F, numbers with a signed exponent, free-form values (``{}``, objects and arrays whose members have no
-schema) nested at most two levels deep, a ``pattern`` matching a string's whole content. Every such text is valid
-under the schema, formats taken as annotations (JSON Schema's default); not every valid instance has one.
+:class:`JSONSchema` is the set of token sequences whose text is an instance of a schema written as JSON in a CANONICAL
+form -- outlines-core's (``build_regex_from_schema``): properties in the schema's order and no others, ``whitespace``
+around separators, strings without ``\\u`` escapes or characters U+007F-U+009F, numbers with a signed exponent,
+free-form values (``{}``, objects and arrays whose members have no schema) nested at most two levels deep, a
+``pattern`` matching a string's whole content. Every such text is valid under the schema, formats taken as annotations
+(JSON Schema's default); not every valid instance has one. The automaton is compiled from the schema directly, through
+an algebra of byte automata (:mod:`.backend.json_schema`, :mod:`.backend.automata`), each schema object once.
 
-The converter reads one form per schema object -- the first of ``properties``, ``allOf``, ``anyOf``, ``oneOf``,
-``prefixItems``, ``enum``, ``const``, ``$ref``, ``type`` -- and drops the other keywords, and reads some forms wrongly.
-So every schema object of a schema (those its references reach included) is checked first. It may hold one form and
-annotations (any keyword without a meaning in JSON Schema validation: titles, descriptions, unknown keywords); refused,
-with where and why, are a validation keyword its form drops (numeric bounds, ``multipleOf``, ``uniqueItems``,
-``contains``, ``patternProperties``, ``minProperties`` beside ``properties``, ``not``, ``if``/``then``/``else``, ...),
-``allOf`` of several schemas (concatenated), ``oneOf`` (read as ``anyOf``), a recursive or external ``$ref`` (past its
-depth the converter drops a property, required or not), ``required`` names outside ``properties``, bounds on the
-number of an object's members other than "not empty" and "empty", a string's length together with its ``pattern`` or
-``format``, a format other than ``date-time``, ``date`` and ``uuid`` (the converter's
-``uri``, ``email`` and ``time`` admit invalid JSON), and a ``pattern`` that can match a quote, a backslash or a control
-character (the converter puts it into the JSON text as it is). A pattern's anchors are stripped and it is put in a
-group (an alternative would otherwise reach past the string's quotes), and a schema of annotations only (``{}``
-among them) is given as an ``anyOf`` of every type (the converter's own regex for ``{}`` is ungrouped).
+A schema object holds one form -- ``properties``, ``allOf``, ``anyOf``, ``oneOf``, ``not``, ``if``/``then``/``else``,
+``prefixItems``, ``enum``, ``const``, ``$ref`` or ``type`` -- with the keywords that form reads, and annotations (any
+keyword without a meaning in JSON Schema validation: titles, descriptions, unknown keywords). So every schema object
+of a schema (those its references reach included) is checked first; refused, with where and why, are a validation
+keyword its form does not read (numeric bounds, ``multipleOf``, ``uniqueItems``, ``contains``, ``patternProperties``,
+``minProperties`` beside ``properties``, a combinator beside another keyword, ...), a recursive or external ``$ref``,
+``required`` names outside ``properties``, bounds on the number of an object's members other than "not empty" and
+"empty", a string's length together with its ``pattern`` or ``format``, a format other than ``date-time``, ``date``
+and ``uuid``, and a ``pattern`` that can match a quote, a backslash or a control character (it would be read against
+the JSON text of the string, escapes and all). A pattern's anchors are stripped and it is put in a group, a schema of
+annotations only (``{}`` among them) is any value, and ``then``/``else`` without an ``if`` constrain nothing.
+References are followed to any depth (outlines-core drops a property, required or not, past its third).
 
-Needs ``outlines-core`` and ``interegular`` (``pip install pyjuice[constraints]``).
+The combinators are read exactly, up to the canonical form: ``allOf`` intersects its schemas (objects merged member by
+member, a name one closes left out), ``oneOf`` admits the values exactly one of its schemas admits, ``not`` those its
+schema does not, ``if``/``then``/``else`` those ``then`` admits among those ``if`` does and those ``else`` admits among
+the others. What a combinator subtracts holds EVERY text of the other schema's instances that it could write, so it
+writes instances only: below one, ``properties`` without ``"type": "object"`` is met by every value not an object (and
+``prefixItems`` without ``"type": "array"`` by every value not an array), an object closed by ``additionalProperties:
+false`` admits no other name and an open one any. Below a combinator that subtracts (``oneOf``, ``not``, ``if``, and an
+``allOf`` holding one), texts are written in one canonical form of their own: property names in the order they first
+appear there, numbers without exponent or trailing zero (``0`` for zero), strings without ``\\/``, free-form objects
+only with names no schema there declares. Numbers are exact decimals, as JSON Schema reads them: a non-integer of many
+digits that a binary floating-point reading would round to an integer is still no integer.
+
+Two constraints are equal when their languages are: the same canonical texts over the same vocabulary and padding.
+
+Needs ``interegular`` (``pip install pyjuice[constraints]``): patterns and the ``whitespace`` pattern.
 """
 
 from __future__ import annotations
@@ -33,7 +46,7 @@ import json
 from typing import Any, Dict, Optional, Union
 
 from .base import Constraint
-from .regex import Regex, _char_automaton, _interegular, _unsupported
+from .regex import _Text, _char_automaton, _checked, _interegular, _unsupported
 
 #: the keywords with a meaning in JSON Schema validation (every draft); any other keyword is an annotation
 VALIDATION = frozenset({
@@ -43,25 +56,15 @@ VALIDATION = frozenset({
     "properties", "patternProperties", "additionalProperties", "dependentRequired", "dependentSchemas",
     "dependencies", "propertyNames", "unevaluatedProperties", "allOf", "anyOf", "oneOf", "not", "if", "then", "else",
     "$ref", "$dynamicRef", "$recursiveRef"})
-#: any value: what the converter makes of ``{}``, but grouped -- its own regex for ``{}`` is an alternative of the
-#: types without a group, which inside a property, a map's value or a tuple's item reaches past them
+#: any value (what a schema of annotations only is read as)
 ANY_VALUE = {"anyOf": [{"type": t} for t in ("boolean", "null", "number", "integer", "string", "array", "object")]}
-#: the formats whose regexes are read (others are refused: the converter's uri, email and time admit invalid JSON)
+#: the formats read (:data:`.backend.json_schema.FORMATS`); others are refused
 FORMATS = frozenset({"date-time", "date", "uuid"})
 #: the keywords a ``type`` form reads, by type (a format beside another type than string: an annotation it ignores)
 TYPE_KEYWORDS = {"string": {"minLength", "maxLength", "pattern", "format"}, "number": {"format"},
                  "integer": {"format"}, "boolean": {"format"}, "null": {"format"},
                  "array": {"items", "minItems", "maxItems", "format"},
                  "object": {"additionalProperties", "minProperties", "maxProperties", "format"}}
-
-
-def _outlines_core():
-    try:
-        import outlines_core
-    except ImportError as e:
-        raise ImportError("`jc.JSONSchema` needs the `outlines-core` package: pip install pyjuice[constraints] "
-                          "(or pip install outlines-core).") from e
-    return outlines_core
 
 
 class _Refused(Exception):
@@ -167,17 +170,31 @@ def _prepare(schema: Dict[str, Any]) -> Dict[str, Any]:
             for k, sub in s["properties"].items():
                 walk(sub, f"{where}/properties/{k}", active)
             return
-        for form in ("allOf", "anyOf"):
+        for form in ("allOf", "anyOf", "oneOf"):
             if form in keys:
                 if keys != {form}:
                     raise _Refused(f"{where}: {sorted(keys - {form})} beside {form}")
-                if form == "allOf" and len(s[form]) != 1:
-                    raise _Refused(f"{where}: allOf of {len(s[form])} schemas")
+                if not isinstance(s[form], list) or not s[form]:
+                    raise _Refused(f"{where}: {form} of no schema")
                 for i, sub in enumerate(s[form]):
                     walk(sub, f"{where}/{form}/{i}", active)
                 return
-        if "oneOf" in keys:
-            raise _Refused(f"{where}: oneOf")
+        if "not" in keys:
+            if keys != {"not"}:
+                raise _Refused(f"{where}: {sorted(keys - {'not'})} beside not")
+            walk(s["not"], f"{where}/not", active)
+            return
+        if keys & {"if", "then", "else"}:
+            if not keys <= {"if", "then", "else"}:
+                raise _Refused(f"{where}: {sorted(keys - {'if', 'then', 'else'})} beside if/then/else")
+            if "if" not in keys:                # (then and else without if: no constraint)
+                s.clear()
+                s.update(copy.deepcopy(ANY_VALUE))
+                return
+            for k in ("if", "then", "else"):
+                if k in s:
+                    walk(s[k], f"{where}/{k}", active)
+            return
         if "prefixItems" in keys:
             extra = keys - {"prefixItems", "type", "items"}
             if extra:
@@ -241,9 +258,9 @@ def _prepare(schema: Dict[str, Any]) -> Dict[str, Any]:
     return root
 
 
-class JSONSchema(Regex):
+class JSONSchema(_Text):
     """
-    Token sequences whose text is a JSON instance of ``schema`` in the converter's canonical form (see the module
+    Token sequences whose text is an instance of ``schema`` written as JSON in the canonical form (see the module
     docstring).
 
     :param schema: the schema, a dict or JSON text
@@ -251,7 +268,7 @@ class JSONSchema(Regex):
 
     :param vocabulary: the token texts: a :class:`~pyjuice.constraints.Vocabulary`, or a tokenizer
 
-    :param whitespace: the regular expression of what may stand around ``{ } [ ] , :`` (the converter's)
+    :param whitespace: the regular expression of what may stand around ``{ } [ ] , :``
     :type whitespace: str
 
     :param eos_padding: the text may end early, then only end-of-sequence ids follow (default); False: every token
@@ -265,15 +282,12 @@ class JSONSchema(Regex):
             schema = json.loads(schema)
         if not isinstance(schema, dict):
             raise TypeError(f"`schema` must be a dict or JSON text of an object, got {type(schema).__name__}.")
-        prepared = _prepare(schema)
-        oc = _outlines_core()
-        try:
-            regex = oc.json_schema.build_regex_from_schema(json.dumps(prepared), whitespace)
-        except Exception as e:
-            raise ValueError(f"Unsupported JSON Schema: the converter refuses it ({e}).") from None
-        super().__init__(regex, vocabulary, eos_padding = eos_padding)
+        super().__init__(vocabulary, eos_padding)
+        self._prepared = _prepare(schema)
+        _checked(whitespace)
         self._schema = copy.deepcopy(schema)
         self._whitespace = whitespace
+        self._bytes = None
 
     @property
     def schema(self) -> Dict[str, Any]:
@@ -283,7 +297,22 @@ class JSONSchema(Regex):
     def whitespace(self) -> str:
         return self._whitespace
 
+    def _byte_automaton(self):
+        """The canonical texts' minimal byte automaton, compiled on first use."""
+        if self._bytes is None:
+            from .backend.json_schema import compile_schema
+            self._bytes = compile_schema(self._prepared, self._whitespace)
+        return self._bytes
+
+    def _text_matches(self, text: str) -> bool:
+        return self._byte_automaton().accepts(text.encode("utf-8"))
+
+    def _fingerprint_payload(self):
+        a = self._byte_automaton()
+        return (a.initial, a.accept.tobytes(), a.delta.tobytes(), self._vocabulary.fingerprint(), self._eos_padding)
+
     def info(self):
         info = Constraint.info(self)
-        info.update(regex_length = len(self.pattern), whitespace = self._whitespace, eos_padding = self.eos_padding)
+        info.update(byte_states = self._byte_automaton().num_states, whitespace = self._whitespace,
+                    eos_padding = self.eos_padding)
         return info

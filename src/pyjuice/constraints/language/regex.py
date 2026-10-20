@@ -133,9 +133,111 @@ def _refused(pattern: str, err) -> ValueError:
                       f"groups, (?m), (?x) and (?i) with characters outside ASCII are not supported.")
 
 
+def _checked(pattern: str):
+    """``(compiled, parsed)``: ``pattern`` compiled by Python's ``re`` and parsed by interegular, or the
+    :class:`ValueError` saying why it is refused (see the module docstring)."""
+    if not isinstance(pattern, str):
+        raise TypeError(f"`pattern` must be a str, got {type(pattern).__name__}.")
+    interegular, _ = _interegular()
+    try:
+        compiled = re.compile(pattern, re.ASCII)
+    except re.error as e:
+        raise _refused(pattern, e) from None
+    why = _unsupported(pattern)
+    if why is not None:
+        raise _refused(pattern, why)
+    try:
+        parsed = interegular.parse_pattern(pattern)
+    except Exception as e:                      # interegular's own refusals, and its failures on what it cannot read
+        raise _refused(pattern, f"{type(e).__name__}: {e}") from None
+    return compiled, parsed
 
 
-class Regex(Constraint):
+def _pattern_bytes(pattern: str, parsed) -> ByteAutomaton:
+    """The byte automaton of the texts matching a pattern (``parsed`` by :func:`_checked`)."""
+    _, errors = _interegular()
+    try:
+        fsm, ranges = _char_automaton(parsed)
+    except errors as e:                         # (nothing the checks let through should get here)
+        raise _refused(pattern, e) from None
+    return ByteAutomaton.from_char_automaton(fsm.states, fsm.initial, fsm.finals, fsm.map, ranges)
+
+class _Text(Constraint):
+    """
+    Token sequences whose TEXT -- the tokens' bytes concatenated, valid UTF-8 -- is in a set of texts, under the
+    end-of-sequence padding convention (see the module docstring): what :class:`Regex` and
+    :class:`~pyjuice.constraints.JSONSchema` share. A subclass gives the texts as a byte automaton
+    (:meth:`_byte_automaton`) and its membership test on a decoded text (:meth:`_text_matches`).
+    """
+
+    def __init__(self, vocabulary, eos_padding: bool):
+        if not isinstance(vocabulary, Vocabulary):
+            vocabulary = Vocabulary.from_tokenizer(vocabulary)
+        if eos_padding and not vocabulary.eos:
+            raise ValueError("The vocabulary has no end-of-sequence ids, which `eos_padding` needs: give them to the "
+                             "Vocabulary (`eos = ...`), or pass `eos_padding = False`.")
+        super().__init__(vocabulary.size)
+        self._vocabulary = vocabulary
+        self._eos_padding = bool(eos_padding)
+        self._automaton: Optional[DFA] = None
+
+    @property
+    def vocabulary(self) -> Vocabulary:
+        return self._vocabulary
+
+    @property
+    def eos_padding(self) -> bool:
+        return self._eos_padding
+
+    def _byte_automaton(self) -> ByteAutomaton:
+        raise NotImplementedError
+
+    def _text_matches(self, text: str) -> bool:
+        raise NotImplementedError
+
+    def accepts(self, tokens: Tokens) -> bool:
+        toks = self._check_tokens(tokens)
+        if self._eos_padding:
+            eos = set(self._vocabulary.eos)
+            end = next((i for i, t in enumerate(toks) if t in eos), len(toks))
+            if any(t not in eos for t in toks[end:]):
+                return False
+            toks = toks[:end]
+        try:
+            text = self._vocabulary.decode(toks).decode("utf-8")
+        except ValueError:                      # an id with no text, or bytes that are not UTF-8
+            return False
+        return self._text_matches(text)
+
+    # ---------------------------------------------------------------------------------------------
+    # Capabilities, from the automaton
+    # ---------------------------------------------------------------------------------------------
+
+    def automaton(self) -> DFA:
+        if self._automaton is None:
+            self._automaton = to_tokens(self._byte_automaton(), self._vocabulary, self._eos_padding)
+        return self._automaton
+
+    def matcher(self) -> Matcher:
+        return self.automaton().matcher()
+
+    def wmc(self, log_weights: torch.Tensor) -> torch.Tensor:
+        return self.automaton().wmc(log_weights)
+
+    def sample(self, log_weights: torch.Tensor, num_samples: int,
+               generator: Optional[torch.Generator] = None) -> torch.Tensor:
+        return self.automaton().sample(log_weights, num_samples, generator = generator)
+
+    def _widened(self, vocab_size: int) -> "_Text":
+        out = type(self).__new__(type(self))                # (a subclass's own fields come along)
+        out.__dict__.update(self.__dict__)
+        Constraint.__init__(out, vocab_size)
+        out._vocabulary = self._vocabulary.with_size(vocab_size)
+        out._automaton = None if self._automaton is None else widened(self._automaton, vocab_size)
+        return out
+
+
+class Regex(_Text):
     """
     Token sequences whose text matches ``pattern`` in full (see the module docstring).
 
@@ -153,93 +255,20 @@ class Regex(Constraint):
     def __init__(self, pattern: str, vocabulary, eos_padding: bool = True):
         if not isinstance(pattern, str):
             raise TypeError(f"`pattern` must be a str, got {type(pattern).__name__}.")
-        if not isinstance(vocabulary, Vocabulary):
-            vocabulary = Vocabulary.from_tokenizer(vocabulary)
-        if eos_padding and not vocabulary.eos:
-            raise ValueError("The vocabulary has no end-of-sequence ids, which `eos_padding` needs: give them to the "
-                             "Vocabulary (`eos = ...`), or pass `eos_padding = False`.")
-        super().__init__(vocabulary.size)
-        interegular, _ = _interegular()
-        try:
-            compiled = re.compile(pattern, re.ASCII)
-        except re.error as e:
-            raise _refused(pattern, e) from None
-        why = _unsupported(pattern)
-        if why is not None:
-            raise _refused(pattern, why)
-        try:
-            parsed = interegular.parse_pattern(pattern)
-        except Exception as e:                  # interegular's own refusals, and its failures on what it cannot read
-            raise _refused(pattern, f"{type(e).__name__}: {e}") from None
+        super().__init__(vocabulary, eos_padding)
+        compiled, parsed = _checked(pattern)
         self._pattern, self._parsed, self._re = pattern, parsed, compiled
-        self._vocabulary = vocabulary
-        self._eos_padding = bool(eos_padding)
-        self._automaton: Optional[DFA] = None
 
     @property
     def pattern(self) -> str:
         return self._pattern
 
-    @property
-    def vocabulary(self) -> Vocabulary:
-        return self._vocabulary
-
-    @property
-    def eos_padding(self) -> bool:
-        return self._eos_padding
-
-    # ---------------------------------------------------------------------------------------------
-    # Membership: Python's `re` on the decoded text, independent of the automaton
-    # ---------------------------------------------------------------------------------------------
-
-    def accepts(self, tokens: Tokens) -> bool:
-        toks = self._check_tokens(tokens)
-        if self._eos_padding:
-            eos = set(self._vocabulary.eos)
-            end = next((i for i, t in enumerate(toks) if t in eos), len(toks))
-            if any(t not in eos for t in toks[end:]):
-                return False
-            toks = toks[:end]
-        try:
-            text = self._vocabulary.decode(toks).decode("utf-8")
-        except ValueError:                      # an id with no text, or bytes that are not UTF-8
-            return False
+    def _text_matches(self, text: str) -> bool:
+        """Python's `re` on the decoded text, independent of the automaton."""
         return self._re.fullmatch(text) is not None
 
-    # ---------------------------------------------------------------------------------------------
-    # Capabilities, from the automaton
-    # ---------------------------------------------------------------------------------------------
-
-    def automaton(self) -> DFA:
-        if self._automaton is None:
-            self._automaton = to_tokens(self._byte_automaton(), self._vocabulary, self._eos_padding)
-        return self._automaton
-
     def _byte_automaton(self) -> ByteAutomaton:
-        _, errors = _interegular()
-        try:
-            fsm, ranges = _char_automaton(self._parsed)
-        except errors as e:                     # (nothing the checks let through should get here)
-            raise _refused(self._pattern, e) from None
-        return ByteAutomaton.from_char_automaton(fsm.states, fsm.initial, fsm.finals, fsm.map, ranges)
-
-    def matcher(self) -> Matcher:
-        return self.automaton().matcher()
-
-    def wmc(self, log_weights: torch.Tensor) -> torch.Tensor:
-        return self.automaton().wmc(log_weights)
-
-    def sample(self, log_weights: torch.Tensor, num_samples: int,
-               generator: Optional[torch.Generator] = None) -> torch.Tensor:
-        return self.automaton().sample(log_weights, num_samples, generator = generator)
-
-    def _widened(self, vocab_size: int) -> "Regex":
-        out = type(self).__new__(type(self))                # (a subclass's own fields come along)
-        out.__dict__.update(self.__dict__)
-        Constraint.__init__(out, vocab_size)
-        out._vocabulary = self._vocabulary.with_size(vocab_size)
-        out._automaton = None if self._automaton is None else widened(self._automaton, vocab_size)
-        return out
+        return _pattern_bytes(self._pattern, self._parsed)
 
     # ---------------------------------------------------------------------------------------------
     # Identity

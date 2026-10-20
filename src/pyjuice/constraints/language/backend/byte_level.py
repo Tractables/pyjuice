@@ -130,14 +130,46 @@ class ByteAutomaton:
         return _trimmed(delta, 0, accept)
 
 
+@njit(cache = True)
+def _coreachable(delta, accept):
+    """bool [K]: the states some accepting state is reachable from (a breadth-first search over reversed edges)."""
+    K, C = delta.shape
+    ptr = np.zeros(K + 1, dtype = np.int64)
+    for q in range(K):
+        for c in range(C):
+            ptr[delta[q, c] + 1] += 1
+    for i in range(K):
+        ptr[i + 1] += ptr[i]
+    src = np.empty(K * C, dtype = np.int64)
+    fill = ptr[:-1].copy()
+    for q in range(K):
+        for c in range(C):
+            t = delta[q, c]
+            src[fill[t]] = q
+            fill[t] += 1
+    live = accept.copy()
+    queue = np.empty(K, dtype = np.int64)
+    num = 0
+    for q in range(K):
+        if live[q]:
+            queue[num] = q
+            num += 1
+    head = 0
+    while head < num:
+        t = queue[head]
+        head += 1
+        for k in range(ptr[t], ptr[t + 1]):
+            q = src[k]
+            if not live[q]:
+                live[q] = True
+                queue[num] = q
+                num += 1
+    return live
+
+
 def _trimmed(delta: np.ndarray, initial: int, accept: np.ndarray) -> ByteAutomaton:
     """Every state that cannot reach acceptance merged into one dead state (the last)."""
-    live = accept.copy()
-    while True:
-        nxt = live | live[delta].any(axis = 1)
-        if (nxt == live).all():
-            break
-        live = nxt
+    live = _coreachable(np.ascontiguousarray(delta), np.ascontiguousarray(accept, dtype = np.bool_))
     keep = np.nonzero(live)[0]
     dead = keep.size
     remap = np.full(delta.shape[0], dead, dtype = np.int32)
