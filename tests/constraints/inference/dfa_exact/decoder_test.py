@@ -272,7 +272,8 @@ def test_a_compact_call_moves_the_held_values_it_reads(scenario, build_pc, monke
         report = {} if report is None else report
         calls.append(dict(moved = np.zeros(len(cc.backend.sum_regions), dtype = bool)))
         out = conditional(*args, held = held, report = report, **kwargs)
-        calls[-1].update(held = None if held is None else held["inside"].copy(), plan = report.get("plan"))
+        calls[-1].update(held = None if held is None else held["inside"].copy(), plan = report.get("plan"),
+                         partial = report.get("partial"))
         return out
 
     monkeypatch.setattr(CP, "regather", spy_regather)
@@ -289,11 +290,98 @@ def test_a_compact_call_moves_the_held_values_it_reads(scenario, build_pc, monke
             assert not (calls[-1]["moved"] & ~decoder._kept.inside).any()      # what it moved, kept: never recomputed
     prog = cc.backend.program()
     for call in calls:
-        if call["held"] is not None:                                     # what it reads, of what it holds
-            read = call["held"] & read_regions(prog, call["plan"])
-            assert not (call["moved"] & ~call["held"]).any() and not (read & ~call["moved"]).any()
+        if call["held"] is not None:                                     # what it reads, of what it holds (and the
+            read = call["held"] & read_regions(prog, call["plan"])       # regions some of its rows hold)
+            moved = call["moved"] if call["partial"] is None else call["moved"] & ~call["partial"]
+            assert not (moved & ~call["held"]).any() and not (read & ~call["moved"]).any()
     if scenario != "any order":
         assert any(p.any() for p in parked)
+
+
+@pytest.mark.parametrize("kind", ["hmm", "pd", "hand_left"])
+def test_the_rows_that_hold_a_regions_values_get_them_back(kind, sum_path, build_pc, monkeypatch):
+    """Compact, every row unmasking a position of its own per call: a region some rows newly observe a position of is
+    computed again, and the values the previous call left are re-gathered into its rows first -- those of the rows
+    observing nothing new on its scope are what its launches compute for them (the others' are computed over; here
+    every row's, ``hold`` withheld from the forward pass)."""
+    from pyjuice.constraints.inference.dfa_exact.queries import conditional as QC
+    from pyjuice.constraints.inference.dfa_exact.queries.backend import forward as F
+    n = KINDS[kind]
+    cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc(kind, n, V))
+    prog = cc.backend.program()
+    seen, checked = {}, []
+    partial_carry, run_forward = QC.partial_carry, F.run_forward
+
+    def spy_partial_carry(prog, plan, carry):
+        out = partial_carry(prog, plan, carry)
+        seen.update(partial = out[1], fresh = None if carry is None else carry.get("fresh"))
+        return out
+
+    def spy_run_forward(backend, bufs, plan, x, missing, obs_class, lv, precision, compact = None, masses = None,
+                        gates = None, hold = None):
+        before = bufs["node_mars"].clone() if compact is not None and seen.get("partial") is not None else None
+        out = run_forward(backend, bufs, plan, x, missing, obs_class, lv, precision, compact, masses, gates = gates)
+        if before is not None:
+            offset, width = compact.rows("mars")
+            for r in np.nonzero(seen["partial"])[0]:
+                off = compact.off[prog.reg_iv_all[r]].cpu().numpy()
+                for b in np.nonzero(~seen["fresh"][r])[0]:
+                    lanes = np.arange(off[b], off[b + 1])
+                    at = offset[r] + np.arange(prog.reg_rows[r])[:, None] * width[r] + lanes[None, :]
+                    at = torch.from_numpy(at.ravel()).to(before.device)
+                    assert_close(before[at], bufs["node_mars"][at], n, where = f"region {r}, row {b}")
+                    checked.append(lanes.size)
+        return out
+
+    monkeypatch.setattr(QC, "partial_carry", spy_partial_carry)
+    monkeypatch.setattr(F, "run_forward", spy_run_forward)
+    with cc.decoder(storage = "compact", precision = "fp32") as decoder:
+        for s in any_order(n):
+            seen.clear()
+            decoder.conditional(**s)
+    assert sum(checked) > 0                                              # (some rows held some region's values)
+
+
+@pytest.mark.parametrize("path", ["dense", "fused"])
+@pytest.mark.parametrize("kind", ["hmm", "pd", "hand_left"])
+def test_sums_compute_the_lanes_of_the_rows_computing_theirs(kind, path, build_pc, monkeypatch):
+    """Compact, every row unmasking a position of its own per call: the sums of a region some rows hold the inside
+    values of compute the other rows' lanes alone, the held ones re-gathered and left as they are -- a dense run
+    multiplies those columns, a fused part takes them as its columns (``fresh_order``) -- and the calls give the
+    circuit's results, the storage values are re-gathered into filled with NaN."""
+    from pyjuice.constraints.inference.dfa_exact.kernels import sum as lifted_sum
+    from pyjuice.constraints.inference.dfa_exact.queries.backend import forward as F
+    monkeypatch.setattr(lifted_sum, "DENSE_MIN_BLOCK", 1 if path == "dense" else 1 << 30)
+    nan_new_storage(monkeypatch)
+    n = KINDS[kind]
+    cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc(kind, n, V))
+    runs, orders, dense_sum, fused_sum, fresh_order = [], [], F.dense_sum, F.fused_sum, F.fresh_order
+
+    def spy_dense_sum(*args, live = None, keep = False, **kwargs):
+        if keep:
+            runs.append(live[2] < args[9])                              # (its lanes multiplied, of its row's)
+        return dense_sum(*args, live = live, keep = keep, **kwargs)
+
+    def spy_fresh_order(layout, regions, fresh):
+        out = fresh_order(layout, regions, fresh)
+        orders.append(out)                                               # (some region's lanes, fewer than its row's)
+        runs.append(bool((out.slots.cpu().numpy() < layout.total[layout.prog.reg_iv_all]).any()))
+        return out
+
+    def spy_fused_sum(*args, liveness = None, **kwargs):
+        assert liveness is None or liveness is orders[-1]               # (compact: no lane order but that one)
+        return fused_sum(*args, liveness = liveness, **kwargs)
+
+    monkeypatch.setattr(F, "dense_sum", spy_dense_sum)
+    monkeypatch.setattr(F, "fused_sum", spy_fused_sum)
+    monkeypatch.setattr(F, "fresh_order", spy_fresh_order)
+    steps = any_order(n)
+    with juice.fast_inference():
+        want = [cc.conditional(precision = "fp32", **s) for s in steps]
+    with cc.decoder(storage = "compact", precision = "fp32") as decoder:
+        for i, s in enumerate(steps):
+            assert_close(decoder.conditional(**s), want[i], n, where = f"step {i}")
+    assert runs and any(runs)
 
 
 @pytest.mark.parametrize("kind", ["hmm", "pd"])

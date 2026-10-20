@@ -44,7 +44,7 @@ from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
 from ..compiled.layout import Reachability, _tile_any
 from .common import _block_ptr, _child, _exit_width, _interval, _lse_step, _pair, _slot, _tf32_operand, grid_chunks
-from .compact import _lane_pairs, _operand_slot
+from .compact import _lane_pairs, _lane_sample, _operand_slot
 from .transitions import enumerated_args
 
 
@@ -147,6 +147,21 @@ def _out_count(iv_of, coff, a, e, B, S, n, COMPACT: tl.constexpr):
         return k, tl.load(coff + k.to(tl.int64) * (B + 1) + B).to(tl.int32)
     else:
         return k, B * S
+
+
+@triton.jit
+def _fresh_tile(hold_cum, coff, k, tile, TILE: tl.constexpr, ncols, B, steps, HOLD: tl.constexpr):
+    """Whether a tile of a compact row's lanes (of interval ``k``, ``ncols`` of them) has one of a sample computing its
+    values: ``HOLD``, by the samples of its first and last lanes (a sample's lanes are consecutive) and the interval's
+    prefix counts of those computing theirs (``hold_cum`` [intervals, B + 1], :func:`~.compact.fresh_counts`); else
+    every tile does."""
+    if HOLD:
+        ends = tile * TILE + tl.where(tl.arange(0, 2) == 0, 0, tl.minimum(TILE, ncols - tile * TILE) - 1)
+        bs = _lane_sample(coff, k, ends, B, steps)
+        base = hold_cum + k.to(tl.int64) * (B + 1)
+        return tl.load(base + tl.max(bs, axis = 0) + 1) - tl.load(base + tl.min(bs, axis = 0)) > 0
+    else:
+        return tile >= 0
 
 
 @triton.jit
@@ -311,7 +326,7 @@ def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
                         OUT_TEMP: tl.constexpr, GROUPED: tl.constexpr, PRUNE: tl.constexpr, OUT_FULL: tl.constexpr,
                         R_FULL: tl.constexpr, COMPACT: tl.constexpr, INDEXED: tl.constexpr, SAMPLE: tl.constexpr,
                         ENUM: tl.constexpr, LOGW: tl.constexpr, ENTRIES: tl.constexpr, SUCC_LISTS: tl.constexpr,
-                        TILE: tl.constexpr):
+                        TILE: tl.constexpr, hold_cum = None, HOLD: tl.constexpr = False):
     """One program per step (of the plan's index list ``sel`` if ``INDEXED``) and tile of its whole output, flattened
     (sample, slot): with the samples' blocks contiguous, a step's output is one run of columns, and the lanes stay
     full whatever the widths. ``COMPACT``: the per-sample values compact (:mod:`.compact`), a lane per pair of the
@@ -332,7 +347,7 @@ def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
     X = _exit_width(width, t2, n)
     S, opos, pairs = _interval(iv_of, iv_info, t, t2, n)
     ko, ncols = _out_count(iv_of, coff, t, t2, B, S, n, COMPACT)
-    if tile * TILE < ncols:
+    if (tile * TILE < ncols) & _fresh_tile(hold_cum, coff, ko, tile, TILE, ncols, B, csteps, HOLD):
         idx = tile * TILE + tl.arange(0, TILE)
         m = idx < ncols
         b, i, j, ml, pa, pe, ce = _out_lanes(idx, m, iv_table, opos, pairs, live, coff, ccount, cstart, ccolumns, ko,
@@ -438,7 +453,7 @@ def _input_block_group_kernel(element_mars, node_mars, temp, obs_class, next_col
                               OUT_FULL: tl.constexpr, R_FULL: tl.constexpr, G: tl.constexpr, ONE_EXP: tl.constexpr,
                               COMPACT: tl.constexpr, INDEXED: tl.constexpr, SAMPLE: tl.constexpr, ENUM: tl.constexpr,
                               LOGW: tl.constexpr, ENTRIES: tl.constexpr, SUCC_LISTS: tl.constexpr,
-                              TILE: tl.constexpr):
+                              TILE: tl.constexpr, hold_cum = None, HOLD: tl.constexpr = False):
     """:func:`_input_block_kernel` for a group of steps per program, ungrouped transitions (a column's live entries,
     ``ENTRIES``, or every class, in class order), the block a sum's or a scratch row: group ``g`` is steps ``groups[g] .. groups[g +
     1]`` (at most ``G``, a power of 2), which share their position and block interval, so they share their lanes'
@@ -458,7 +473,7 @@ def _input_block_group_kernel(element_mars, node_mars, temp, obs_class, next_col
     X = _exit_width(width, t2, n)
     S, opos, pairs = _interval(iv_of, iv_info, t, t2, n)
     ko, ncols = _out_count(iv_of, coff, t, t2, B, S, n, COMPACT)
-    if tile * TILE < ncols:
+    if (tile * TILE < ncols) & _fresh_tile(hold_cum, coff, ko, tile, TILE, ncols, B, csteps, HOLD):
         idx = tile * TILE + tl.arange(0, TILE)
         m = idx < ncols
         b, i, j, ml, pa, pe, ce = _out_lanes(idx, m, iv_table, opos, pairs, live, coff, ccount, cstart, ccolumns, ko,
@@ -567,7 +582,8 @@ def _block_input_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
                         num_enum, logw_stride, out_first, out_width, temp_width, B, n, W, C, input_start, csteps, pid0,
                         L_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, GROUPED: tl.constexpr, PRUNE: tl.constexpr,
                         OUT_FULL: tl.constexpr, L_FULL: tl.constexpr, COMPACT: tl.constexpr, INDEXED: tl.constexpr,
-                        SAMPLE: tl.constexpr, ENUM: tl.constexpr, LOGW: tl.constexpr, TILE: tl.constexpr):
+                        SAMPLE: tl.constexpr, ENUM: tl.constexpr, LOGW: tl.constexpr, TILE: tl.constexpr,
+                        hold_cum = None, HOLD: tl.constexpr = False):
     """One program per step and tile of its whole output, flattened (sample, slot) as in
     :func:`_input_block_kernel`: every lane takes a log-sum over its exit column's predecessor entries (the
     program loops to the longest list among its lanes), each through its mass for a missing token (ungrouped: by
@@ -584,7 +600,7 @@ def _block_input_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
     S, opos, pairs = _interval(iv_of, iv_info, t0, t + 1, n)
     LS, lpos, _ = _interval(iv_of, iv_info, t0, t, n)                       # the block's slots
     ko, ncols = _out_count(iv_of, coff, t0, t + 1, B, S, n, COMPACT)
-    if tile * TILE < ncols:
+    if (tile * TILE < ncols) & _fresh_tile(hold_cum, coff, ko, tile, TILE, ncols, B, csteps, HOLD):
         idx = tile * TILE + tl.arange(0, TILE)
         m = idx < ncols
         b, i, j, ml, pa, pe, ce = _out_lanes(idx, m, iv_table, opos, pairs, live, coff, ccount, cstart, ccolumns, ko,
@@ -1136,7 +1152,7 @@ INPUT_BLOCK_ONE_EXP = (False, True)
 
 def run_products(stages, bufs, prog, regions, element_mars, node_mars, masses, obs_class, live,
                  elem_first: int, elem_width: int, B: int, prior: dict, exact: bool, compact = None,
-                 succ_lists = None):
+                 succ_lists = None, hold = None):
     """
     The steps a query plan runs of one product layer, stage by stage (a stage reads only earlier stages' scratch
     rows). Products are fp32-level whatever the query's precision, which applies to the sum layers: ``block @ block``
@@ -1164,6 +1180,9 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, masses, o
     :param succ_lists: None, or a function giving the query's :class:`~.live.SuccessorLists` (of ``Program.trans``,
         under evidence pruning), called by the first ``input @ block`` launch (a query running none builds none):
         their entry loops take them at the boundaries that do
+    :param hold: None, or (compact) a function giving the query's :func:`~.compact.fresh_counts`: the ``input @ block``
+        and ``block @ input`` steps writing a product's values skip the tiles of lanes of samples whose sums keep the
+        values they hold (a fold's scratch rows: every lane)
     """
     temp, temp_width = bufs
     common = dict(reg_offset = regions["offset"], reg_width = regions["width"], reg_first = regions["first"],
@@ -1183,6 +1202,13 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, masses, o
     else:
         lists = dict(coff = live, ccount = live, cstart = live, ccolumns = live, crank = live, csteps = 0)
     no_lists = dict(succ_start = live, succ_count = live, succ_use = live, succ_entries = live, E = 0, SUCC_LISTS = 0)
+
+    def held(out_temp):
+        """The steps' tile check (:func:`_fresh_tile`): those writing a product's values (not a fold's) under
+        ``hold``."""
+        if hold is None or compact is None or out_temp:
+            return {}
+        return dict(hold_cum = hold(), HOLD = True)
 
     def succ_of(launch):
         """The input @ block entry loops' successor lists: 2 every step's boundary takes them, 1 some (chosen per
@@ -1231,14 +1257,14 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, masses, o
                                     OUT_TEMP = out_temp, PRUNE = prune, OUT_FULL = out_full, R_FULL = all(r_full),
                                     G = G, ONE_EXP = one_exp, COMPACT = compact is not None,
                                     INDEXED = gsel is not None, ENTRIES = prog.entry_loop, TILE = tile,
-                                    num_warps = 4, **inputs, **lists, **common, **succ)
+                                    num_warps = 4, **inputs, **lists, **common, **succ, **held(out_temp))
 
                         # the group sizes the Program built (its default first), each step form: timed per shape (the
                         # steps rounded up to a power of 2, so that queries running subsets of a launch share choices)
                         cands = [(G, one_exp) for one_exp in INPUT_BLOCK_ONE_EXP for G in groups]
                         key = ("lifted_input_block_group", kinds, prune, compact is not None, sample, C,
                                host_next_power_of_2(S), host_next_power_of_2(lanes), tuple(groups),
-                               succ["SUCC_LISTS"])
+                               succ["SUCC_LISTS"], bool(held(out_temp)))
                         input_block_group(autotune.pick(key, cands, input_block_group))   # outputs overwritten
                     elif form == "input_block":
                         r_kind, out_temp, (out_full, *r_full) = kinds
@@ -1252,7 +1278,8 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, masses, o
                                 C = C, input_start = prog.input_start, pid0 = first, R_KIND = r_kind,
                                 OUT_TEMP = out_temp, GROUPED = tt.grouped, PRUNE = prune, OUT_FULL = out_full,
                                 R_FULL = all(r_full), COMPACT = compact is not None, ENTRIES = prog.entry_loop,
-                                TILE = tile, num_warps = 4, **idx, **inputs, **lists, **common, **succ)
+                                TILE = tile, num_warps = 4, **idx, **inputs, **lists, **common, **succ,
+                                **held(out_temp))
                     else:
                         l_kind, out_temp, (out_full, l_full) = kinds
                         tile = _flat_tile(lanes)
@@ -1265,7 +1292,7 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, masses, o
                                 C = C, input_start = prog.input_start, pid0 = first, L_KIND = l_kind,
                                 OUT_TEMP = out_temp, GROUPED = tt.grouped, PRUNE = prune, OUT_FULL = out_full,
                                 L_FULL = l_full, COMPACT = compact is not None, TILE = tile, num_warps = 4, **idx,
-                                **inputs, **lists, **common)
+                                **inputs, **lists, **common, **held(out_temp))
             elif form == "block_block" and compact is not None:     # a sample's rectangle at a time
                 l_kind, r_kind, out_temp = kinds
                 steps, sel = launch.steps[0], cut.chunks[0][3]

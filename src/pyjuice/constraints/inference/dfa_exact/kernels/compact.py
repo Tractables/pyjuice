@@ -193,6 +193,7 @@ class CompactLayout:
         / ``sum_widths`` int64 arrays (host), and ``sum_offsets_t`` / ``sum_widths_t`` on the device --, with ``lanes``
         (the most lanes of a row of a region with per-sample inside values), ``regions`` (bool [sum regions], host:
         those with rows) and ``ivs`` (bool [intervals], host: their intervals)
+    :ivar off_host: ``off`` on the host
     """
 
     B: int
@@ -216,6 +217,7 @@ class CompactLayout:
     element_size: int
     prog: Any
     mars: Optional[dict] = None
+    off_host: Optional[np.ndarray] = None
 
     def lanes(self, ivs) -> int:
         """The most lanes per row of the intervals ``ivs`` (``prog.intervals``' numbers; 0 for none)."""
@@ -242,11 +244,8 @@ class CompactLayout:
 
     def sample_offsets(self, iv: int) -> np.ndarray:
         """``off[iv]`` on the host (int64 [B + 1]: every sample's first lane in a row of interval ``iv``, then the row's
-        lanes), from the query's one host copy of ``off``, made on first use (it waits for the device)."""
-        host = getattr(self, "_off_host", None)
-        if host is None:
-            host = self._off_host = self.off.cpu().numpy()
-        return host[iv]
+        lanes)."""
+        return self.off_host[iv]
 
     def identity(self, size: int) -> torch.Tensor:
         """int32 ``0 .. size - 1`` on the device (the dense sum path's columns: a compact row's lanes in order)."""
@@ -263,18 +262,19 @@ def compact_layout(backend, liveness, regions: np.ndarray, inside: Optional[np.n
     with their ranks), and the rows in ``node_flows`` of the sum ``regions`` (bool [sum regions], host) whose top-down
     values it keeps per sample; ``inside``: None, or the sum regions (bool) whose inside values it keeps per sample,
     compact (:attr:`CompactLayout.mars`). The one wait: the rows' lanes, for their widths, and every boundary's most
-    live columns, for the grids.
+    live columns, for the grids -- with every sample's first lanes (:meth:`CompactLayout.sample_offsets`).
     """
     prog = backend.program()
     B, n = liveness.B, prog.n
     count, start, columns = liveness.lists(rank = True)
     K = prog.iv_ends.size(0)
-    off = torch.empty(K, B + 1, dtype = torch.int64, device = prog.dev)
-    summary = torch.empty(K + n + 1, dtype = torch.int64, device = prog.dev)
+    at = -(-K * (B + 1) // 2) * 2                       # (the summary 16 bytes into the buffer, see pack_aligned)
+    both = torch.empty(at + K + n + 1, dtype = torch.int64, device = prog.dev)
+    off, summary = both[:K * (B + 1)].view(K, B + 1), both[at:]
     _rectangles_kernel[(max(K, n + 1),)](off, count, prog.iv_ends, summary, K, B, n,
                                          TILE = min(1024, max(32, host_next_power_of_2(B))), num_warps = 4)
-    host = summary.cpu().numpy()
-    total, max_count = host[:K], host[K:]
+    host = both.cpu().numpy()
+    total, max_count = host[at:at + K], host[at + K:]
     lanes = total[prog.reg_iv_all]
     width = np.where(regions, _aligned(lanes), 0)
     offset = _row_offsets(prog.reg_rows, width)
@@ -293,7 +293,8 @@ def compact_layout(backend, liveness, regions: np.ndarray, inside: Optional[np.n
                          offset_t = tables[0], width_t = tables[1], lanes_t = tables[2],
                          size = int((prog.reg_rows * width).sum()), sum_lanes = int(lanes[regions].max(initial = 0)),
                          max_count = max_count, sample_ivs = sample_ivs, elem_width = elem_width,
-                         element_size = element_size, prog = prog, mars = mars)
+                         element_size = element_size, prog = prog, mars = mars,
+                         off_host = host[:K * (B + 1)].reshape(K, B + 1))
 
 
 def _row_offsets(rows: np.ndarray, width: np.ndarray) -> np.ndarray:
@@ -413,26 +414,30 @@ def _copy_segments_kernel(src, dst, table, TILE: tl.constexpr):
 
 
 def regather_into(state, prog, old: "CompactLayout", new: "CompactLayout", regions: np.ndarray,
-                  parents: torch.Tensor, allocate, name: str = "node_flows", rows: str = "flows"):
+                  parents: torch.Tensor, allocate, name: str = "node_flows", rows: str = "flows",
+                  spare: Optional[torch.Tensor] = None):
     """
     :func:`regather` from the storage ``state`` holds as ``name`` (``node_flows`` or ``node_mars``, its ``rows`` laid
     out by ``old``) into the one ``allocate()`` returns (a dict holding it as ``name``, laid out by ``new``). Where the
     ``regions`` make most of the new storage, straight into it, the old one held meanwhile; else never holding both:
     the ``regions``' values are gathered into a scratch first, the old storage given up, and the scratch copied into
-    the new one -- so a query whose rows hold little of it does not need their memory twice. Returns ``allocate()``'s
-    result.
+    the new one -- so a query whose rows hold little of it does not need their memory twice. ``spare``: None, or a
+    storage whose values the query neither reads nor keeps; where it holds the ``regions``' values, the scratch is
+    there, whatever their share. Returns ``allocate()``'s result.
     """
     regs = np.nonzero(regions)[0]
     new_offset, new_width = new.rows(rows)
     sizes = prog.reg_rows[regs] * new_width[regs]
-    if 2 * int(sizes.sum()) >= int((prog.reg_rows * new_width).sum()):      # most of the new storage: in one pass,
-        src = state.replace_storage(name, None)                            # the old held while the new is made
+    numel = max(int(sizes.sum()), 1)
+    spare = spare if spare is not None and spare.numel() >= numel else None
+    if spare is None and 2 * int(sizes.sum()) >= int((prog.reg_rows * new_width).sum()):   # most of the new storage:
+        src = state.replace_storage(name, None)                      # in one pass, the old held while the new is made
         out = allocate()
         regather(prog, old, src, new, out[name], regions, parents, rows = rows)
         return out
     starts = np.zeros(len(new_width), dtype = np.int64)
     starts[regs] = np.concatenate([[0], np.cumsum(sizes)[:-1]])
-    scratch = torch.empty(max(int(sizes.sum()), 1), device = prog.dev)
+    scratch = torch.empty(numel, device = prog.dev) if spare is None else spare[:numel]
     src = state.replace_storage(name, None)
     regather(prog, old, src, new, scratch, regions, parents, dst_offset = starts, rows = rows)
     del src
@@ -473,7 +478,7 @@ def compact_buffers(backend, layout: CompactLayout, B: int, inputs_only: bool, c
     if len(sources) == 1 and not (sources[0]["inside"] & ~moved[0]).any():   # the previous storage, given up
         bufs = allocate() if not moved[0].any() else regather_into(state, prog, sources[0]["layout"], layout,
                                                                    moved[0], sources[0]["parents"], allocate,
-                                                                   "node_mars", "mars")
+                                                                   "node_mars", "mars", _spare(state, prog, carry))
         return bufs, []
     if sources[0]["inside"].any():                                         # kept apart from the new buffers
         sources[0]["storage"] = state.replace_storage("node_mars", None)
@@ -483,6 +488,24 @@ def compact_buffers(backend, layout: CompactLayout, B: int, inputs_only: bool, c
             regather(prog, s["layout"], s["storage"], layout, bufs["node_mars"], regions, s["parents"], rows = "mars")
     left = [dict(s, inside = s["inside"] & ~regions) for s, regions in zip(sources, moved)]
     return bufs, [s for s in left if s["inside"].any()]
+
+
+def _spare(state, prog, carry: dict) -> Optional[torch.Tensor]:
+    """The longest stretch of the previous query's top-down storage (``node_flows``, laid out by ``carry["layout"]``)
+    holding none of the values a compact query keeps (``carry["regions"]``, see :func:`compact_buffers`): the others
+    are dead, so it is a scratch to move inside values through (:func:`regather_into`). None without that storage."""
+    storage = state.storage("node_flows")
+    if storage is None or carry.get("regions") is None:
+        return None
+    offset, width = carry["layout"].rows("flows")
+    regs = np.nonzero(carry["regions"])[0]
+    lo = offset[regs]
+    order = np.argsort(lo)
+    lo, hi = lo[order], (lo + prog.reg_rows[regs] * width[regs])[order]
+    starts = -(-np.concatenate([[0], hi]) // 4) * 4                  # (16 bytes into the storage)
+    ends = np.concatenate([lo, [storage.numel()]])
+    k = int(np.argmax(ends - starts))
+    return storage[int(starts[k]):int(ends[k])] if ends[k] > starts[k] else None
 
 
 #: a compact query leaves the held inside values it does not read where they are (:func:`held_moves`) only when the
@@ -496,6 +519,134 @@ def worth_parking(prog, carry: dict) -> bool:
     :data:`PARK_MIN_FLOATS`: if not, it re-gathers them all into its rows."""
     return sum(int((prog.reg_rows * s["layout"].rows("mars")[1])[s["inside"]].sum())
                for s in [carry] + list(carry.get("parked", ()))) >= PARK_MIN_FLOATS
+
+
+def partial_carry(prog, plan, carry: Optional[dict]):
+    """
+    ``(carry, partial)``: ``carry`` (see :func:`compact_buffers`) with, among the inside values it re-gathers, those of
+    the regions its query computes per sample (:attr:`~..queries.backend.plans.QueryPlan.sample`) that some of its rows
+    hold (``carry["partial"]``, see :mod:`..queries.decoder`) -- those rows keep their values, the others' are
+    computed over them -- and those regions (bool [sum regions]; None for none).
+    """
+    if carry is None or carry.get("partial") is None:
+        return carry, None
+    partial = carry["partial"] & plan.sample[prog.reg_iv_np]
+    if not partial.any():
+        return carry, None
+    return dict(carry, inside = carry["inside"] | partial), partial
+
+
+@triton_jit
+def _fresh_lanes_kernel(off, table, base, perm, rank, B, steps, TILE: tl.constexpr):
+    """One program per (``TILE`` lanes, interval ``e`` of :func:`fresh_order`'s): ``table[e]`` = (the interval, its
+    rows' lanes, its list's first slot in ``perm``, in ``rank``), ``base[e, b]`` = where the lanes of sample ``b`` start
+    in that list less its first lane (negative for a row holding its values). Every lane's place in the list (``rank``,
+    -1 for a held one), and the lane in every place (``perm``)."""
+    e = tl.program_id(1)
+    t = table + e * 4
+    lane = tl.program_id(0) * TILE + tl.arange(0, TILE)
+    m = lane < tl.load(t + 1)
+    b = _lane_sample(off, tl.load(t), lane, B, steps)
+    at = tl.load(base + e * B + b, mask = m, other = -1) + lane
+    fresh = m & (at >= 0)
+    tl.store(rank + tl.load(t + 3) + lane, tl.where(fresh, at, -1).to(tl.int32), mask = m)
+    tl.store(perm + tl.load(t + 2) + at, lane.to(tl.int32), mask = fresh)
+
+
+#: the lanes of a program of :func:`_fresh_lanes_kernel`
+FRESH_TILE = 1024
+
+
+@dataclass
+class FreshOrder:
+    """
+    The columns the sums of a compact query compute when some of its rows hold inside values (:func:`partial_carry`):
+    of a sum region some rows hold, the lanes of the others, in order. As the fused sums read a query's lane order
+    (:class:`~.live.LaneOrder`): per sum region (``reg_first``, ``reg_live``) those lanes in ``perm`` -- every lane in
+    order for the other regions --, and as many columns (``slots``, its rows' lanes otherwise: the row's
+    ``regions["slots"]`` for the fused sums, which then leave the other lanes as they are). For the dense sum path,
+    :meth:`dense`. ``ivs``: the intervals of the regions some rows hold.
+    """
+
+    perm: torch.Tensor
+    rank: torch.Tensor
+    reg_first: torch.Tensor
+    reg_live: torch.Tensor
+    slots: torch.Tensor
+    ivs: np.ndarray
+    lists: dict
+
+    @property
+    def lanes(self) -> "FreshOrder":
+        """The lane order (itself), as the fused sums read a query's liveness."""
+        return self
+
+    def dense(self, iv: int, ncols: int):
+        """``(perm, rank, count)`` (as :meth:`~.live.LaneOrder.segment`'s) of a row of interval ``iv`` (of ``self.ivs``;
+        ``ncols`` lanes): the lanes of the rows computing theirs, which the dense sum path multiplies alone, leaving
+        the others as they are -- None when that is every lane (the rows holding theirs have none)."""
+        p0, r0, count = self.lists[iv]
+        if count == ncols:
+            return None
+        return self.perm[p0:p0 + count], self.rank[r0:r0 + ncols], count
+
+
+def fresh_order(layout: "CompactLayout", regions: np.ndarray, fresh: np.ndarray) -> FreshOrder:
+    """:class:`FreshOrder` of a compact query whose rows hold the inside values of the sum ``regions`` (bool [sum
+    regions]) but those ``fresh`` (bool [sum regions, B]; a region's rows are its interval's) of their rows: every
+    other region's lanes in order. One launch makes the lists from the host's lane offsets
+    (:meth:`CompactLayout.sample_offsets`)."""
+    prog, B = layout.prog, layout.B
+    lanes = layout.total[prog.reg_iv_all].astype(np.int64)
+    first, live = np.zeros_like(lanes), lanes.copy()
+    up = lambda x: -(-x // 4) * 4                                   # (each list 16 bytes into the buffers)
+    top = up(int(lanes.max(initial = 0)))
+    regs = np.nonzero(regions)[0]
+    ivs, at = np.unique(prog.reg_iv_all[regs], return_index = True)
+    off, f = layout.off_host[ivs], fresh[regs[at]]                  # per interval: [B + 1] offsets, [B] fresh rows
+    sizes = np.diff(off, axis = 1) * f
+    base = np.where(f, np.cumsum(sizes, axis = 1) - sizes - off[:, :B], -1 - off[:, B:])
+    count, ncols = sizes.sum(axis = 1), layout.total[ivs].astype(np.int64)
+    p0, r0 = top + np.cumsum(up(count)) - up(count), np.cumsum(up(ncols)) - up(ncols)
+    table = np.stack([ivs, ncols, p0, r0], axis = 1).astype(np.int64)
+    e_of = np.searchsorted(ivs, prog.reg_iv_all[regs])
+    first[regs], live[regs] = p0[e_of], count[e_of]
+    lists = dict(zip(ivs.tolist(), zip(p0.tolist(), r0.tolist(), count.tolist())))
+    p0, r0 = top + int(up(count).sum()), int(up(ncols).sum())
+    small, s_at = pack_aligned([first, live], np.int32)
+    wide, w_at = pack_aligned([table.ravel(), base.ravel(), live], np.int64)
+    small, wide = torch.from_numpy(small).to(prog.dev), torch.from_numpy(wide).to(prog.dev)
+    perm = torch.empty(max(p0, 1), dtype = torch.int32, device = prog.dev)
+    rank = torch.empty(max(r0, 1), dtype = torch.int32, device = prog.dev)
+    perm[:top] = layout.identity(top)
+    if ivs.size:
+        grid = (-(-max(int(table[:, 1].max()), 1) // FRESH_TILE), ivs.size)
+        _fresh_lanes_kernel[grid](layout.off, wide[w_at[0]:], wide[w_at[1]:], perm, rank, B, layout.steps,
+                                  TILE = FRESH_TILE, num_warps = 4)
+    view = lambda t, at, i, size: t[at[i]:at[i] + size]
+    return FreshOrder(perm = perm, rank = rank, reg_first = view(small, s_at, 0, lanes.size),
+                      reg_live = view(small, s_at, 1, lanes.size), slots = view(wide, w_at, 2, lanes.size), ivs = ivs,
+                      lists = lists)
+
+
+def fresh_counts(layout: "CompactLayout", regions: np.ndarray, fresh: np.ndarray) -> torch.Tensor:
+    """
+    int32 [intervals, B + 1] on the device: per interval (``prog.intervals``' numbers), the prefix counts over its
+    samples of those whose products a compact query computes -- every one, but in the interval of sum ``regions``
+    (bool [sum regions]: those some rows hold the inside values of, see :func:`partial_carry`) that are all its
+    regions, those ``fresh`` (bool [sum regions, B]): its products' values are read by those sums alone, which compute
+    the other rows' lanes only (:func:`fresh_order`). See :func:`~.prod._fresh_tile`.
+    """
+    prog = layout.prog
+    out = np.ones((len(prog.all_ivs), layout.B), dtype = np.int32)
+    s_of = prog.reg_iv_np
+    for s in np.unique(s_of[regions]):
+        regs = np.nonzero(s_of == s)[0]
+        if regions[regs].all():
+            out[prog.reg_iv_all[regs[0]]] = fresh[regs[0]]
+    cum = np.zeros((out.shape[0], out.shape[1] + 1), dtype = np.int32)
+    np.cumsum(out, axis = 1, out = cum[:, 1:])
+    return torch.from_numpy(cum).to(prog.dev)
 
 
 def held_moves(prog, carry: dict, read: np.ndarray) -> np.ndarray:

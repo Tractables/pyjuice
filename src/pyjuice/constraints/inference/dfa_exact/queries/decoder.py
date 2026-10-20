@@ -194,7 +194,9 @@ class DFAExactDecoder(Decoder):
             return None, None, None, None
         if kept.compact is not None:                                    # compact: the call re-gathers what it reads
             carry = None                                                # (and keeps the rest of what it holds)
-            if held[0].any() or held[1].any():
+            fresh = self._fresh_samples(new, a, b)                      # per region: the rows it must compute again
+            partial = kept.inside & ~unseen & ~fresh.all(axis = 1)      # (some rows' inside values hold)
+            if held[0].any() or held[1].any() or partial.any():
                 if identity:                                            # every row its own: the same parents
                     rows = self._identity(B, be.device)
                     parked = [dict(p, inside = p["inside"] & held[0]) for p in parked]
@@ -202,7 +204,7 @@ class DFAExactDecoder(Decoder):
                     rows = torch.from_numpy(parents.astype(np.int64)).to(be.device)
                     parked = [dict(p, inside = p["inside"] & held[0], parents = p["parents"][rows]) for p in parked]
                 carry = dict(layout = kept.compact, inside = inside & held[0], regions = held[1], parents = rows,
-                             parked = [p for p in parked if p["inside"].any()])
+                             parked = [p for p in parked if p["inside"].any()], partial = partial, fresh = fresh)
             if identity:                                                # (kept: those it has rows for, parked or not)
                 return held, (every, top_down), kept.compact, carry
             return held, held, None, carry
@@ -277,6 +279,14 @@ class DFAExactDecoder(Decoder):
         parked = report.get("parked", []) if storage == "compact" and compact is not None else []
         self._kept = _Kept(weakref.ref(be.state), be.state.epoch, precision, storage, B, inside, top_down,
                            report.get("liveness"), compact, parked)
+
+    @staticmethod
+    def _fresh_samples(new: np.ndarray, a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        """bool [sum regions, B]: per region (scope ``[a, b)``), the rows newly observing a position of its scope --
+        whose inside values change; the others' hold (``new``: bool [B, n], the rows' newly observed positions)."""
+        cum = np.zeros((new.shape[0], new.shape[1] + 1), dtype = np.int64)
+        np.cumsum(new, axis = 1, out = cum[:, 1:])
+        return (cum[:, b] - cum[:, a] > 0).T
 
     def _region_tables(self, prog):
         """``(prog, bounds, rows, slots)``: every sum region's scope ``[a, b)`` (int64 [R, 2]), rows and slots per

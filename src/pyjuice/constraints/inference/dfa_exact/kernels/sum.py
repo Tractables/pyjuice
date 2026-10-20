@@ -1126,9 +1126,10 @@ def _log_add_kernel(out, m, rows, ncols, ld, num_ctiles, TILE_R: tl.constexpr, T
 
 @triton_jit
 def _log_scatter_kernel(out, prod, m, rank, rows, ncols, ld, num_live, num_ctiles, TILE_R: tl.constexpr,
-                        TILE_C: tl.constexpr, TRANS: tl.constexpr = False):
+                        TILE_C: tl.constexpr, TRANS: tl.constexpr = False, KEEP: tl.constexpr = False):
     """``out[:, c] = log(prod[:, rank[c]]) + m[rank[c]]`` for every live column ``c`` of ``out``, -inf for the others
-    (``prod`` [rows, num_live], the products of the live columns; ``TRANS``: [num_live, rows], read transposed)."""
+    (``prod`` [rows, num_live], the products of the live columns; ``TRANS``: [num_live, rows], read transposed) --
+    ``KEEP``: the others left as they are."""
     r = (tl.program_id(0) // num_ctiles) * TILE_R + tl.arange(0, TILE_R)
     c = (tl.program_id(0) % num_ctiles) * TILE_C + tl.arange(0, TILE_C)
     cmask = c < ncols
@@ -1142,6 +1143,8 @@ def _log_scatter_kernel(out, prod, m, rank, rows, ncols, ld, num_live, num_ctile
     else:
         at = r[:, None] * num_live + k[None, :]
     v = tl.load(prod + at, mask = mask & alive[None, :], other = 1.0)
+    if KEEP:
+        mask = mask & alive[None, :]
     tl.store(out + r[:, None] * ld + c[None, :], tl.where(alive[None, :], tl.log(v) + shift[None, :], float("-inf")),
              mask = mask)
 
@@ -1199,7 +1202,8 @@ def _bf16_weights(copies: dict, blocks, params, E, BS, stacked):
 
 def dense_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor, groups: dict, E: int,
               block_size: int, region: tuple, elem_first: int, elem_width: int, ncols: int, precision: str,
-              live = None, stacked: dict = None, bf16: bool = False, copies: Optional[dict] = None):
+              live = None, stacked: dict = None, bf16: bool = False, copies: Optional[dict] = None,
+              keep: bool = False):
     """
     Dense node blocks of one sum region (see :func:`dense_groups`), into ``node_mars``: per run of children,
     ``log(W_k @ exp(X - m)) + m`` with ``m`` the column maximum of the children ``X``.
@@ -1213,6 +1217,7 @@ def dense_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch
         query's, ``precision`` then "tf32"): the exponentials, and the weights' copies kept in ``copies`` (the
         query's :meth:`~..state.State.weight_stacks`), rounded to bf16 -- as at ``precision`` where ``torch.mm``
         cannot (:func:`_bf16_products`), and for every column (no ``live``)
+    :param keep: with ``live``, the columns not live left as they are (their values held), not set to -inf
     """
     offset, width, first = region
     BS = block_size
@@ -1223,7 +1228,7 @@ def dense_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch
     num_ctiles = host_cdiv(ncols, TILE_C)
     if live is not None:
         _dense_sum_live(nodes, elems, params, groups, E, BS, first, elem_first, ncols, precision, live, stacked,
-                        copies if bf16 and _bf16_products(nodes.device) else None)
+                        copies if bf16 and _bf16_products(nodes.device) else None, keep)
         return
     with _matmul_precision(precision):
         for c0, blocks in groups.items():
@@ -1248,8 +1253,9 @@ _TRANSPOSED_PRODUCTS = ("tf32",)
 
 
 def _dense_sum_live(nodes, elems, params, groups, E, BS, first, elem_first, ncols, precision, live, stacked,
-                    copies = None):
-    """:func:`dense_sum` on the live columns (``copies``: the bf16 weights' dict, products on bf16 operands)."""
+                    copies = None, keep = False):
+    """:func:`dense_sum` on the live columns (``copies``: the bf16 weights' dict, products on bf16 operands; ``keep``:
+    the others left as they are)."""
     perm, rank, num_live = live
     width = nodes.size(1)
     TILE_R, TILE_C = _EW_TILE
@@ -1270,7 +1276,7 @@ def _dense_sum_live(nodes, elems, params, groups, E, BS, first, elem_first, ncol
                 num_ctiles = host_cdiv(ncols, TILE_C)
                 _log_scatter_kernel[(host_cdiv(rows, TILE_R) * num_ctiles,)](
                     nodes[nid - first:nid - first + rows], prod, m, rank, rows, ncols, width, num_live, num_ctiles,
-                    TILE_R = TILE_R, TILE_C = TILE_C, TRANS = trans)
+                    TILE_R = TILE_R, TILE_C = TILE_C, TRANS = trans, KEEP = keep)
 
 
 #: The top-down pass of a sum part under external parameters that is one dense run (``block_scale.dense_run``)

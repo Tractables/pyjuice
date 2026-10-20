@@ -22,8 +22,8 @@ import torch
 
 from .backend import forward as F
 from ..kernels.common import pack_aligned
-from ..kernels.compact import (STORAGES, compact_buffers, held_elsewhere, held_moves, query_layout, regather_into,
-                               resolve_storage, worth_parking)
+from ..kernels.compact import (STORAGES, compact_buffers, held_elsewhere, held_moves, partial_carry, query_layout,
+                               regather_into, resolve_storage, worth_parking)
 from ..kernels.live import live_successors, liveness
 from ..kernels.score import class_weight_rows, score_group, score_tables
 from ..kernels.transitions import enumerated_args
@@ -215,12 +215,15 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
 
     plan = plan_for(held)
     move = held.get("inside")                           # compact: the held inside values it reads get its rows
+    carry, partial = partial_carry(prog, plan, carry)
     if move is not None and carry is not None and worth_parking(prog, carry):
         move = held_moves(prog, carry, move & read_regions(prog, plan))
+    if partial is not None:
+        move = partial if move is None else move | partial
     storage, compact = resolve_storage(backend, storage, B, True, lv, plan, plan.top_down.per_sample, move)
     dropped = held_elsewhere(storage, held.values(), carry)
     if dropped:                                         # held in the other storage: computed again
-        held, carry, move = {}, None, None
+        held, carry, move, partial = {}, None, None, None
         plan = plan_for(held)
         if compact is not None:
             compact = query_layout(backend, lv, plan, plan.top_down.per_sample, None)
@@ -241,10 +244,12 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
         flows = backend.state.flows(B, bufs, compact)
     if report is not None:
         report.update(plan = plan, liveness = lv, compact = compact, inputs_only = inputs_only, storage = storage,
-                      dropped = dropped, parked = parked)
+                      dropped = dropped, parked = parked, partial = partial if compact is not None else None)
     rows = class_weight_rows(prog, lv, col_pos, col_K, col_first, group_first, B)   # (their sizes copied behind
     gates = F.gate_context(backend, external)                                         # the forward pass's launches)
-    F.run_forward(backend, bufs, plan, x, missing, obs_class, lv, precision, compact, masses, gates = gates)
+    hold = None if partial is None or compact is None else dict(regions = partial, fresh = carry["fresh"])
+    F.run_forward(backend, bufs, plan, x, missing, obs_class, lv, precision, compact, masses, gates = gates,
+                  hold = hold)
     valid |= plan.todo
 
     buf = backend.state.storage_view("dfa_class_flow", rows.starts[-1])
