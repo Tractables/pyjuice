@@ -176,6 +176,56 @@ def _weighted_partition_nodes_dp_simple(node_n_edges: np.ndarray, counts: np.nda
     return np.unique(node_n_edges[partitions]), overhead
 
 
+def _partition_compact_integer_histogram(values, counts, max_num_partitions, target_overhead):
+    """Run the existing coalesced recurrence on a bounded positive integer histogram."""
+    tolerance = (int(values[-1]) - int(values[0])) // 1000
+    if tolerance:
+        kept, grouped_counts, begin = [], [], 0
+        while begin < len(values):
+            end = int(np.searchsorted(values, int(values[begin]) + tolerance, side="right"))
+            kept.append(end - 1)
+            grouped_counts.append(int(counts[begin:end].sum()))
+            begin = end
+        values, counts = values[kept], np.asarray(grouped_counts, dtype=np.int64)
+
+    if len(values) == 1:
+        return values.copy()
+    if len(values) == 2:
+        return _weighted_partition_nodes_dp_simple(values, counts, max_num_partitions, target_overhead)[0]
+
+    cumulative = np.cumsum(counts)
+    dp = np.zeros((len(values), max_num_partitions + 1), dtype=np.int64)
+    backtrace = np.zeros_like(dp)
+    dp[:, 1] = values * cumulative
+    target = 0 if target_overhead is None else target_overhead
+    target_partition = max_num_partitions
+    if dp[-1, 1] <= target:
+        target_partition = 1
+    else:
+        # The caller bounds every valid candidate below the original int32
+        # sentinel. Integer arithmetic and first-min ties match the scalar DP.
+        increments = values[:, None] * (cumulative[:, None] - cumulative[None, :])
+        valid = np.arange(len(values))[None, :] < np.arange(len(values))[:, None]
+        rows = np.arange(1, len(values))
+        for partition in range(2, max_num_partitions + 1):
+            costs = np.where(valid, dp[None, :, partition - 1] + increments, 2 ** 31 - 1)
+            best = costs.argmin(axis=1)
+            dp[1:, partition] = costs[rows, best[1:]]
+            backtrace[1:, partition] = best[1:]
+            dp[0, partition] = values[0] * cumulative[0]
+            if dp[-1, partition] <= target:
+                target_partition = partition
+                break
+
+    positions, index = np.empty(target_partition, dtype=np.int64), len(values) - 1
+    for partition in range(target_partition, 0, -1):
+        positions[partition - 1] = index
+        # Preserve the legacy fixed-column backtrace, including its quirk at
+        # three or more partitions; changing partition selection is separate.
+        index = backtrace[index, target_partition]
+    return np.unique(values[positions])
+
+
 def partition_nodes_by_n_edges(node_n_edges: Union[np.ndarray, torch.Tensor], 
                                max_num_partitions: Optional[int] = None, 
                                sparsity_tolerance: Optional[float] = None,
@@ -187,8 +237,25 @@ def partition_nodes_by_n_edges(node_n_edges: Union[np.ndarray, torch.Tensor],
 
     if sparsity_tolerance is not None:
         assert sparsity_tolerance > 1e-6 and sparsity_tolerance <= 1.0
+
+    histogram = None
+    if (algorithm == "dp_with_coalesce" and isinstance(node_n_edges, torch.Tensor)
+            and node_n_edges.device.type == "cpu" and node_n_edges.ndim == 1
+            and node_n_edges.dtype in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64)
+            and node_n_edges.numel() > 0
+            and (sparsity_tolerance is not None or max_num_partitions not in (None, 1))):
+        degrees = node_n_edges.detach().numpy()
+        lower, upper = int(degrees.min()), int(degrees.max())
+        if 0 < lower <= upper <= 4096 and upper * len(degrees) < 2 ** 31 - 1:
+            counts = np.bincount(degrees.astype(np.int64, copy=False))
+            occupied = np.flatnonzero(counts)
+            if len(occupied) <= 64:
+                histogram = occupied.astype(degrees.dtype), counts[occupied]
+
+    if sparsity_tolerance is not None:
         if max_num_partitions is None:
-            max_num_partitions = max(min(torch.unique(node_n_edges).shape[0], 16), 1)
+            num_unique = len(histogram[0]) if histogram is not None else torch.unique(node_n_edges).shape[0]
+            max_num_partitions = max(min(num_unique, 16), 1)
     elif max_num_partitions is None:
         max_num_partitions = 1
     else:
@@ -203,6 +270,11 @@ def partition_nodes_by_n_edges(node_n_edges: Union[np.ndarray, torch.Tensor],
         partitions = np.zeros([1], dtype = np.int64)
         partitions[0] = np.max(node_n_edges)
         return torch.from_numpy(partitions)
+
+    if (histogram is not None and isinstance(max_num_partitions, (int, np.integer))
+            and 2 <= max_num_partitions <= 16):
+        return torch.from_numpy(_partition_compact_integer_histogram(
+            *histogram, max_num_partitions, target_overhead))
 
     # Sort in non-descending order
     node_n_edges = np.sort(node_n_edges)
