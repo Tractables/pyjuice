@@ -20,8 +20,8 @@ from typing import List, Optional, Sequence, Tuple
 import numpy as np
 from numba import njit
 
-from .byte_level import ByteAutomaton, _column_classes, _coreachable
-from .dfa import bfs_order, hopcroft, product_bfs
+from .byte_level import ByteAutomaton, _coreachable
+from .dfa import _column_classes, bfs_order, hopcroft, product_bfs
 
 
 # -------------------------------------------------------------------------------------------------
@@ -65,7 +65,7 @@ def _from_classes(table: np.ndarray, initial: int, accept: np.ndarray, byte_clas
     accepting[:keep.size] = acc[keep]
     column_class, first = _column_classes(out)                  # (the classes the minimal automaton tells apart)
     return ByteAutomaton(None, int(remap[0]), accepting, dead, table = out[:, first],
-                         byte_class = column_class[byte_class])
+                         byte_class = column_class[byte_class], minimal = True)
 
 
 def minimize(a: ByteAutomaton) -> ByteAutomaton:
@@ -92,7 +92,7 @@ def is_empty(a: ByteAutomaton) -> bool:
 def nothing() -> ByteAutomaton:
     """No text."""
     return ByteAutomaton(None, 0, np.zeros(1, dtype = bool), 0, table = np.zeros((1, 1), dtype = np.int32),
-                         byte_class = np.zeros(256, dtype = np.int64))
+                         byte_class = np.zeros(256, dtype = np.int64), minimal = True)
 
 
 def epsilon() -> ByteAutomaton:

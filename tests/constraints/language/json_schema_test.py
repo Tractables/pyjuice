@@ -206,6 +206,32 @@ def test_combinators_draws_are_valid(case):
         assert validator.is_valid(instance), (schema, text)
 
 
+def test_the_token_lift_of_a_minimal_automaton_over_every_byte_is_minimal(monkeypatch):
+    """Every byte a token and the byte automaton minimal: the lift walks its states apart and needs no minimization
+    -- the same DFA as the walk from the initial state minimized, with the padding (merged into the state accepting
+    the empty text alone, where there is one) and without."""
+    from pyjuice.constraints.language.backend import automata as A, byte_level
+    from pyjuice.constraints.language.backend.json_schema import compile_schema
+    from pyjuice.constraints.language.json_schema import _prepare
+    automata = [compile_schema(_prepare(s), r"[ ]?") for s in (PERSON, POINTS, KIND, {"type": "string"})]
+    automata += [A.regex(p) for p in ("a*", "(ab|é)+c?", "")] + [A.nothing()]
+    numba = pytest.importorskip("numba")
+    threads = numba.get_num_threads()
+    for a in automata:
+        assert a.minimal
+        for eos in (True, False):
+            with monkeypatch.context() as m:
+                m.setattr(byte_level, "_byte_complete", lambda trie: False)
+                slow = byte_level.to_tokens(a, VOCAB, eos)
+            for n in sorted({1, 2, 3, threads}):                # (walkers fewer than states: each takes several)
+                numba.set_num_threads(min(n, threads))
+                try:
+                    fast = byte_level.to_tokens(a, VOCAB, eos)
+                finally:
+                    numba.set_num_threads(threads)
+                assert fast == slow and fast.num_states == slow.num_states, (a.num_states, eos, n)
+
+
 def test_numbers_below_a_combinator_are_written_one_way():
     from pyjuice.constraints.language.backend.json_schema import canonical_number
     for x, text in [(1, "1"), (1.0, "1"), (-0.0, "0"), (0, "0"), (1.5, "1.5"), (1e-7, "0.0000001"),

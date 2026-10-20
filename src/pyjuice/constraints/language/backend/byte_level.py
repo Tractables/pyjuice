@@ -24,10 +24,11 @@ from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
 
 import numpy as np
 import torch
-from numba import njit
+from numba import get_num_threads, njit, prange
 
 from ..dfa import DFA
 from ..vocabulary import Vocabulary
+from .dfa import _column_classes, bfs_order
 
 MAX_CODE_POINT = 0x10FFFF
 
@@ -35,42 +36,6 @@ MAX_CODE_POINT = 0x10FFFF
 # -------------------------------------------------------------------------------------------------
 # Byte automata
 # -------------------------------------------------------------------------------------------------
-
-@njit(cache = True)
-def _column_classes(stacked):
-    """The columns of ``stacked`` ([rows, columns]) grouped by equal content: ``(column_class, first)`` -- int64
-    [columns] every column's group, the groups numbered by their first column, and every group's first column
-    (ascending). One pass hashing every column (rows in order), then each column compared with the first column of
-    each group of its hash."""
-    R, W = stacked.shape
-    h = np.full(W, np.uint64(1469598103934665603))
-    prime = np.uint64(1099511628211)
-    for r in range(R):
-        for b in range(W):
-            h[b] = (h[b] ^ np.uint64(stacked[r, b] + 1)) * prime
-    column_class = np.empty(W, dtype = np.int64)
-    first = np.empty(W, dtype = np.int64)
-    num = 0
-    for b in range(W):
-        found = -1
-        for c in range(num):
-            rep = first[c]
-            if h[rep] == h[b]:
-                same = True
-                for r in range(R):
-                    if stacked[r, rep] != stacked[r, b]:
-                        same = False
-                        break
-                if same:
-                    found = c
-                    break
-        if found < 0:
-            first[num] = b
-            found = num
-            num += 1
-        column_class[b] = found
-    return column_class, first[:num].copy()
-
 
 class ByteAutomaton:
     """
@@ -82,12 +47,14 @@ class ByteAutomaton:
     :ivar initial: the initial state
     :ivar accept: bool [num_states]
     :ivar dead: the one state no accepting state is reachable from (it loops on every byte)
+    :ivar minimal: whether it is minimal (made so by :func:`~.automata.minimize` and the algebra's operations)
 
     Made from ``delta`` (the first argument), or from ``table`` and ``byte_class`` (keywords; ``delta`` None); the
     other form is made on first use.
     """
 
-    def __init__(self, delta, initial: int, accept, dead: int, *, table = None, byte_class = None):
+    def __init__(self, delta, initial: int, accept, dead: int, *, table = None, byte_class = None,
+                 minimal: bool = False):
         if (delta is None) == (table is None):
             raise ValueError("A ByteAutomaton takes delta, or table and byte_class.")
         self._delta = None if delta is None else np.ascontiguousarray(delta, dtype = np.int32)
@@ -95,6 +62,7 @@ class ByteAutomaton:
         self._byte_class = None if byte_class is None else np.ascontiguousarray(byte_class, dtype = np.int64)
         self.initial, self.dead = int(initial), int(dead)
         self.accept = np.asarray(accept, dtype = bool)
+        self.minimal = bool(minimal)
 
     @property
     def delta(self) -> np.ndarray:
@@ -408,6 +376,60 @@ def _walk(table, dead, initial, child_ptr, child_class, child_node, end_ptr, end
     return h1, h2, order[:num]
 
 
+@njit(parallel = True, cache = True)
+def _walk_from(table, dead, states, child_ptr, child_class, child_node, end_ptr, end_ids, V, r1, r2, r3, r4, P):
+    """:func:`_walk`'s hashes from the given ``states`` (every state reached at a token boundary), in parallel: ``P``
+    walkers take every ``P``-th state, each summing into its own hashes, then summed."""
+    S = states.shape[0]
+    N = child_ptr.shape[0] - 1
+    h1 = np.zeros((P, V), dtype = np.uint64)
+    h2 = np.zeros((P, V), dtype = np.uint64)
+    for c in prange(P):
+        stack_node = np.empty(N + 1, dtype = np.int64)
+        stack_q = np.empty(N + 1, dtype = np.int64)
+        for i in range(c, S, P):
+            s = states[i]
+            a1, b1, a2, b2 = r1[s], r2[s], r3[s], r4[s]
+            stack_node[0] = 0
+            stack_q[0] = s
+            top = 1
+            while top > 0:
+                top -= 1
+                u = stack_node[top]
+                q = stack_q[top]
+                for e in range(child_ptr[u], child_ptr[u + 1]):
+                    q2 = table[q, child_class[e]]
+                    if q2 == dead:
+                        continue
+                    w = child_node[e]
+                    if end_ptr[w] < end_ptr[w + 1]:
+                        x = np.uint64(q2 + 1)
+                        for k in range(end_ptr[w], end_ptr[w + 1]):
+                            t = end_ids[k]
+                            h1[c, t] += a1 * x + b1
+                            h2[c, t] += a2 * x + b2
+                    stack_node[top] = w
+                    stack_q[top] = q2
+                    top += 1
+    o1 = np.zeros(V, dtype = np.uint64)
+    o2 = np.zeros(V, dtype = np.uint64)
+    for t in prange(V):
+        for c in range(P):
+            o1[t] += h1[c, t]
+            o2[t] += h2[c, t]
+    return o1, o2
+
+
+def _byte_complete(trie: "_Trie") -> bool:
+    """Whether every byte is a token's whole text: then every state a byte text reaches is reached at a token
+    boundary, and states a byte text tells apart are told apart by tokens."""
+    first, last = trie.child_ptr[0], trie.child_ptr[1]
+    if last - first != 256:
+        return False
+    nodes = trie.child_node[first:last]
+    return bool((trie.end_ptr[nodes + 1] > trie.end_ptr[nodes]).all())
+
+
 @njit(cache = True)
 def _columns(table, dead, states, reps, kinds, offsets, data):
     """[len(states), len(reps)]: the successor of every state on every representative token -- kind 0 its bytes
@@ -442,8 +464,16 @@ def to_tokens(automaton: ByteAutomaton, vocabulary: Vocabulary, eos_padding: boo
     r[0] |= np.uint64(1)
     r[2] |= np.uint64(1)
     table, byte_class = automaton.table.astype(np.int64), automaton.byte_class
-    h1, h2, states = _walk(table, automaton.dead, automaton.initial, trie.child_ptr, byte_class[trie.child_byte],
-                           trie.child_node, trie.end_ptr, trie.end_ids, V, r[0], r[1], r[2], r[3])
+    complete = automaton.minimal and automaton.initial != automaton.dead and _byte_complete(trie)
+    if complete:                    # the states reached at token boundaries: every one a byte text reaches; walked apart
+        states = bfs_order(table, automaton.initial)
+        states = states[states != automaton.dead]
+        h1, h2 = _walk_from(table, automaton.dead, states, trie.child_ptr, byte_class[trie.child_byte],
+                            trie.child_node, trie.end_ptr, trie.end_ids, V, r[0], r[1], r[2], r[3],
+                            max(1, min(get_num_threads(), states.size)))
+    else:
+        h1, h2, states = _walk(table, automaton.dead, automaton.initial, trie.child_ptr, byte_class[trie.child_byte],
+                               trie.child_node, trie.end_ptr, trie.end_ids, V, r[0], r[1], r[2], r[3])
     offsets, has_text = vocabulary._offsets, vocabulary._has_text
     empty = np.nonzero(has_text & (offsets[1:] == offsets[:-1]))[0]
     if empty.size:                                                      # empty text: every state to itself
@@ -470,11 +500,16 @@ def to_tokens(automaton: ByteAutomaton, vocabulary: Vocabulary, eos_padding: boo
     if eos_padding and eos.size:
         ce = int(token_class[eos[0]])
         table[:, ce] = dead
+        if complete:                # a state accepting the empty text alone is the padding's (else it is a new one)
+            others = np.arange(table.shape[1]) != ce
+            alone = np.nonzero(accept[:K] & (table[:K][:, others] == dead).all(axis = 1))[0]
+            pad = int(alone[0]) if alone.size else pad
         table[np.nonzero(accept)[0], ce] = pad
         table[pad, ce] = pad
         accept[pad] = True
-    return DFA(V, torch.from_numpy(token_class.astype(np.int64)), torch.from_numpy(table), 0,
-               torch.from_numpy(accept)).minimize()
+    dfa = DFA(V, torch.from_numpy(token_class.astype(np.int64)), torch.from_numpy(table), 0, torch.from_numpy(accept))
+    # minimal byte automaton, every byte a token: the states are told apart by tokens as by bytes -- minimal already
+    return dfa._renumbered() if complete else dfa.minimize()
 
 
 def widened(dfa: DFA, vocab_size: int) -> DFA:

@@ -29,7 +29,7 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence
 import numpy as np
 import torch
 
-from .backend.dfa import bfs_order, hopcroft, product_bfs
+from .backend.dfa import _column_classes, bfs_order, hopcroft, product_bfs
 from .base import Constraint, Matcher, Tokens
 
 
@@ -551,7 +551,9 @@ def _compress_classes(token_class: torch.Tensor, delta: torch.Tensor):
     """Merge classes with identical successor columns, drop classes no token belongs to, and number
     the remaining classes by their smallest token (a canonical form for a given transition table)."""
     used = torch.nonzero(torch.bincount(token_class, minlength = delta.size(1))).flatten()   # O(V), no sort
-    cols, inv = torch.unique(delta[:, used], dim = 1, return_inverse = True)   # merge identical columns
+    sub = np.ascontiguousarray(delta[:, used].numpy())
+    group, first_col = _column_classes(sub)                                  # merge identical columns (one pass)
+    cols, inv = torch.from_numpy(np.ascontiguousarray(sub[:, first_col])), torch.from_numpy(group)
     old_to_new = torch.full((delta.size(1),), -1, dtype = torch.long)
     old_to_new[used] = inv
     tc = old_to_new[token_class]

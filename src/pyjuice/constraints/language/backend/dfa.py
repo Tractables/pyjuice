@@ -1,7 +1,8 @@
 """
 Numba kernels of the DFA algorithms in :mod:`pyjuice.constraints.language.dfa`: the breadth-first order of the
-reachable states (:func:`bfs_order`), Hopcroft's minimization (:func:`hopcroft`), and the breadth-first product of
-several DFAs over their joint classes (:func:`product_bfs`). Tables are int64 ``[states, classes]``, complete.
+reachable states (:func:`bfs_order`), Hopcroft's minimization (:func:`hopcroft`), the breadth-first product of
+several DFAs over their joint classes (:func:`product_bfs`), and the columns of a table grouped by equal content
+(:func:`_column_classes`). Tables are int64 ``[states, classes]``, complete.
 """
 
 import numpy as np
@@ -186,3 +187,39 @@ def product_bfs(deltas, offsets, num_states, child_class, initial):
             rows[head, c] = j
         head += 1
     return rows[:num], keys[:num]
+
+
+@njit(cache = True)
+def _column_classes(stacked):
+    """The columns of ``stacked`` ([rows, columns]) grouped by equal content: ``(column_class, first)`` -- int64
+    [columns] every column's group, the groups numbered by their first column, and every group's first column
+    (ascending). One pass hashing every column (rows in order), then each column compared with the first column of
+    each group of its hash."""
+    R, W = stacked.shape
+    h = np.full(W, np.uint64(1469598103934665603))
+    prime = np.uint64(1099511628211)
+    for r in range(R):
+        for b in range(W):
+            h[b] = (h[b] ^ np.uint64(stacked[r, b] + 1)) * prime
+    column_class = np.empty(W, dtype = np.int64)
+    first = np.empty(W, dtype = np.int64)
+    num = 0
+    for b in range(W):
+        found = -1
+        for c in range(num):
+            rep = first[c]
+            if h[rep] == h[b]:
+                same = True
+                for r in range(R):
+                    if stacked[r, rep] != stacked[r, b]:
+                        same = False
+                        break
+                if same:
+                    found = c
+                    break
+        if found < 0:
+            first[num] = b
+            found = num
+            num += 1
+        column_class[b] = found
+    return column_class, first[:num].copy()
