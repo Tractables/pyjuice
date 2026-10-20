@@ -309,7 +309,8 @@ class JSONSchema(_Text):
 
     def _fingerprint_payload(self):
         a = self._byte_automaton()
-        return (a.initial, a.accept.tobytes(), a.delta.tobytes(), self._vocabulary.fingerprint(), self._eos_padding)
+        return (a.initial, a.accept.tobytes(), a.table.tobytes(), a.byte_class.tobytes(), self._vocabulary.fingerprint(),
+                self._eos_padding)
 
     def info(self):
         info = Constraint.info(self)

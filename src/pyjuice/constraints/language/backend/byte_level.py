@@ -3,7 +3,8 @@ Byte-level automata, and the token automata they induce through a vocabulary: th
 (:class:`~pyjuice.constraints.Regex`, ...) compile through.
 
 A :class:`ByteAutomaton` is a complete DFA over the 256 byte values whose language is a set of texts, byte for byte
-(valid UTF-8 when it comes from a character automaton), with one dead state.
+(valid UTF-8 when it comes from a character automaton), with one dead state, kept per byte class (the bytes no state
+tells apart).
 :meth:`ByteAutomaton.from_char_automaton` builds one from an automaton over characters, every character set as code
 point ranges and every range as sequences of UTF-8 byte ranges (RE2's split), then subset construction.
 
@@ -19,7 +20,6 @@ of every token's successors, summed during the walks, then one representative to
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
 
 import numpy as np
@@ -36,30 +36,96 @@ MAX_CODE_POINT = 0x10FFFF
 # Byte automata
 # -------------------------------------------------------------------------------------------------
 
-@dataclass(frozen = True)
+@njit(cache = True)
+def _column_classes(stacked):
+    """The columns of ``stacked`` ([rows, columns]) grouped by equal content: ``(column_class, first)`` -- int64
+    [columns] every column's group, the groups numbered by their first column, and every group's first column
+    (ascending). One pass hashing every column (rows in order), then each column compared with the first column of
+    each group of its hash."""
+    R, W = stacked.shape
+    h = np.full(W, np.uint64(1469598103934665603))
+    prime = np.uint64(1099511628211)
+    for r in range(R):
+        for b in range(W):
+            h[b] = (h[b] ^ np.uint64(stacked[r, b] + 1)) * prime
+    column_class = np.empty(W, dtype = np.int64)
+    first = np.empty(W, dtype = np.int64)
+    num = 0
+    for b in range(W):
+        found = -1
+        for c in range(num):
+            rep = first[c]
+            if h[rep] == h[b]:
+                same = True
+                for r in range(R):
+                    if stacked[r, rep] != stacked[r, b]:
+                        same = False
+                        break
+                if same:
+                    found = c
+                    break
+        if found < 0:
+            first[num] = b
+            found = num
+            num += 1
+        column_class[b] = found
+    return column_class, first[:num].copy()
+
+
 class ByteAutomaton:
     """
-    A complete DFA over bytes.
+    A complete DFA over bytes, kept per BYTE CLASS: the bytes no state tells apart share a column.
 
-    :ivar delta: int32 [num_states, 256], the successor of every (state, byte)
+    :ivar table: int32 [num_states, num_classes], the successor of every (state, class)
+    :ivar byte_class: int64 [256], every byte's class (classes numbered by their smallest byte)
+    :ivar delta: int32 [num_states, 256], the successor of every (state, byte) -- made on first use
     :ivar initial: the initial state
     :ivar accept: bool [num_states]
     :ivar dead: the one state no accepting state is reachable from (it loops on every byte)
+
+    Made from ``delta`` (the first argument), or from ``table`` and ``byte_class`` (keywords; ``delta`` None); the
+    other form is made on first use.
     """
 
-    delta: np.ndarray
-    initial: int
-    accept: np.ndarray
-    dead: int
+    def __init__(self, delta, initial: int, accept, dead: int, *, table = None, byte_class = None):
+        if (delta is None) == (table is None):
+            raise ValueError("A ByteAutomaton takes delta, or table and byte_class.")
+        self._delta = None if delta is None else np.ascontiguousarray(delta, dtype = np.int32)
+        self._table = None if table is None else np.ascontiguousarray(table, dtype = np.int32)
+        self._byte_class = None if byte_class is None else np.ascontiguousarray(byte_class, dtype = np.int64)
+        self.initial, self.dead = int(initial), int(dead)
+        self.accept = np.asarray(accept, dtype = bool)
+
+    @property
+    def delta(self) -> np.ndarray:
+        if self._delta is None:
+            self._delta = np.ascontiguousarray(self._table[:, self._byte_class])
+        return self._delta
+
+    def _classes(self):
+        if self._table is None:
+            self._byte_class, first = _column_classes(self._delta)
+            self._table = np.ascontiguousarray(self._delta[:, first])
+
+    @property
+    def table(self) -> np.ndarray:
+        self._classes()
+        return self._table
+
+    @property
+    def byte_class(self) -> np.ndarray:
+        self._classes()
+        return self._byte_class
 
     @property
     def num_states(self) -> int:
-        return self.delta.shape[0]
+        return (self._table if self._table is not None else self._delta).shape[0]
 
     def accepts(self, data: bytes) -> bool:
+        table, byte_class = self.table, self.byte_class
         q = self.initial
         for b in data:
-            q = int(self.delta[q, b])
+            q = int(table[q, byte_class[b]])
         return bool(self.accept[q])
 
     @classmethod
@@ -295,10 +361,11 @@ def _trie(vocabulary: Vocabulary) -> _Trie:
 
 
 @njit(cache = True)
-def _walk(delta, dead, initial, child_ptr, child_byte, child_node, end_ptr, end_ids, V, r1, r2, r3, r4):
+def _walk(table, dead, initial, child_ptr, child_class, child_node, end_ptr, end_ids, V, r1, r2, r3, r4):
     """The states reached at token boundaries (breadth-first from ``initial``) and, per token, two hashes of its
-    successors from them: from every reached state a depth-first walk of the trie through live states."""
-    S = delta.shape[0]
+    successors from them: from every reached state a depth-first walk of the trie through live states (``table`` per
+    byte class, ``child_class`` every trie edge's byte's)."""
+    S = table.shape[0]
     h1 = np.zeros(V, dtype = np.uint64)
     h2 = np.zeros(V, dtype = np.uint64)
     order = np.empty(S, dtype = np.int64)
@@ -321,7 +388,7 @@ def _walk(delta, dead, initial, child_ptr, child_byte, child_node, end_ptr, end_
             u = stack_node[top]
             q = stack_q[top]
             for e in range(child_ptr[u], child_ptr[u + 1]):
-                q2 = delta[q, child_byte[e]]
+                q2 = table[q, child_class[e]]
                 if q2 == dead:
                     continue
                 w = child_node[e]
@@ -342,9 +409,9 @@ def _walk(delta, dead, initial, child_ptr, child_byte, child_node, end_ptr, end_
 
 
 @njit(cache = True)
-def _columns(delta, dead, states, reps, kinds, offsets, data):
-    """[len(states), len(reps)]: the successor of every state on every representative token -- kind 0 its bytes,
-    1 empty text (the state itself), 2 no text (the dead state)."""
+def _columns(table, dead, states, reps, kinds, offsets, data):
+    """[len(states), len(reps)]: the successor of every state on every representative token -- kind 0 its bytes
+    (``data``: their classes), 1 empty text (the state itself), 2 no text (the dead state)."""
     R, C = states.shape[0], reps.shape[0]
     out = np.empty((R, C), dtype = np.int64)
     for c in range(C):
@@ -355,7 +422,7 @@ def _columns(delta, dead, states, reps, kinds, offsets, data):
                 q = dead
             elif kind == 0:
                 for k in range(offsets[t], offsets[t + 1]):
-                    q = delta[q, data[k]]
+                    q = table[q, data[k]]
                     if q == dead:
                         break
             out[i, c] = q
@@ -374,8 +441,8 @@ def to_tokens(automaton: ByteAutomaton, vocabulary: Vocabulary, eos_padding: boo
     r = [rng.integers(1, 2 ** 63, size = S, dtype = np.uint64) for _ in range(4)]
     r[0] |= np.uint64(1)
     r[2] |= np.uint64(1)
-    delta = automaton.delta.astype(np.int64)
-    h1, h2, states = _walk(delta, automaton.dead, automaton.initial, trie.child_ptr, trie.child_byte,
+    table, byte_class = automaton.table.astype(np.int64), automaton.byte_class
+    h1, h2, states = _walk(table, automaton.dead, automaton.initial, trie.child_ptr, byte_class[trie.child_byte],
                            trie.child_node, trie.end_ptr, trie.end_ids, V, r[0], r[1], r[2], r[3])
     offsets, has_text = vocabulary._offsets, vocabulary._has_text
     empty = np.nonzero(has_text & (offsets[1:] == offsets[:-1]))[0]
@@ -391,7 +458,7 @@ def to_tokens(automaton: ByteAutomaton, vocabulary: Vocabulary, eos_padding: boo
     _, reps, token_class = np.unique(key, axis = 0, return_index = True, return_inverse = True)
     token_class = token_class.reshape(-1)
     kinds = np.where(~has_text[reps], 2, np.where(offsets[reps + 1] == offsets[reps], 1, 0)).astype(np.int64)
-    rows = _columns(delta, automaton.dead, states, reps.astype(np.int64), kinds, offsets, trie.data)
+    rows = _columns(table, automaton.dead, states, reps.astype(np.int64), kinds, offsets, byte_class[trie.data])
     K = states.size
     remap = np.full(S, K, dtype = np.int64)                             # unreached (the byte dead state among them)
     remap[states] = np.arange(K)
