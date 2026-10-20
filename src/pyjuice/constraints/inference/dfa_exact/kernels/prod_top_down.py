@@ -333,7 +333,7 @@ def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
                 ev = em & (sl >= 0)                                          # a dead parent lane: no term, nothing read
                 vm = real[:, None] & ev[None, :]
                 if GROUPED:                                                  # the observed class leads to q?
-                    holds = tl.load(next_col + (t * W + i) * C + tl.maximum(oc, 0), mask = ev, other = -1) == q
+                    holds = tl.load(next_col + (t * W + i).to(tl.int64) * C + tl.maximum(oc, 0), mask = ev, other = -1) == q
                     mass = tl.where((oc >= 0)[None, :], tl.where(holds[None, :], own, float("-inf")),
                                     tl.load(masses + x[None, :], mask = vm & (oc < 0)[None, :], other = float("-inf")))
                 elif ENUM:                                                   # is it this entry's class?
@@ -414,7 +414,7 @@ def _block_input_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
         oc = tl.load(obs_class + b * n + t, mask = m, other = -1)
         # an observed token: its own log-probability, then the output at the column its class leads to
         obs = ml & (oc >= 0)
-        s = tl.load(next_col + (t * W + q) * C + oc, mask = obs, other = -1)
+        s = tl.load(next_col + (t * W + q).to(tl.int64) * C + oc, mask = obs, other = -1)
         s = tl.where(end & (s >= 0), 0, s)
         so = _parent_lane(_slot(iv_table, opos, i, s, X, obs, OUT_FULL), b, once, coff, ccount, crank, kp, t0, i, t + 1,
                           s, obs, B, n, W, COMPACT)

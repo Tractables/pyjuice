@@ -47,7 +47,7 @@ def _mark_successors(live, base, q, f, oc, next_col, succ_ptr, succ, t, n, W, C,
     ``t + 1``, through the observed class ``oc`` only, or every successor when the token is missing (``oc`` -1)."""
     ones = tl.full([TILE], 1, dtype = tl.int8)
     if oc >= 0:                                                             # through the observed class only
-        s = tl.load(next_col + (t * W + q) * C + oc, mask = f, other = -1)
+        s = tl.load(next_col + (t * W + q).to(tl.int64) * C + oc, mask = f, other = -1)
         s = tl.where((t + 1 == n) & (s >= 0), 0, s)
         tl.store(live + base + (t + 1) * W + s, ones, mask = f & (s >= 0))
     else:                                                                   # to every successor
@@ -64,7 +64,7 @@ def _reach_back(live, back, base, q, qm, oc, next_col, succ_ptr, succ, t, n, W, 
     can (``back``, through the observed class ``oc`` or any class); stored in ``back`` and ANDed into ``live``."""
     g = tl.zeros([TILE], dtype = tl.int32)
     if oc >= 0:                                                             # the observed class's successor
-        s = tl.load(next_col + (t * W + q) * C + oc, mask = qm, other = -1)
+        s = tl.load(next_col + (t * W + q).to(tl.int64) * C + oc, mask = qm, other = -1)
         s = tl.where((t + 1 == n) & (s >= 0), 0, s)
         g = (qm & (s >= 0) & (tl.load(back + base + (t + 1) * W + s, mask = qm & (s >= 0), other = 0) != 0)
              ).to(tl.int32)

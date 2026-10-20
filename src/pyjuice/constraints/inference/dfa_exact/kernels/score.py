@@ -381,7 +381,7 @@ def _class_weight_kernel(dfa_class_flow, cw_col, cw_K, cw_count, cw_cls, cw_off,
             else:
                 for ii in range(0, steps):
                     i, ok = _walk_column(columns, cstart, ccount, cm, ii, PRUNE, UNIFORM)
-                    q = tl.load(next_col + (t * W + i) * C + cls, mask = ok, other = -1)
+                    q = tl.load(next_col + (t * W + i).to(tl.int64) * C + cls, mask = ok, other = -1)
                     mx, acc = _cw_block_input_term(mx, acc, i, ok, q, op, lp, iv_table, lpos, opos, coff, count, crank,
                                                    kl, kp, b, vm, once, l_own, M, E, X, t0, t, end, B, n, W, TJ,
                                                    S_FULL, OUT_FULL, COMPACT, MARS, UNIFORM)
@@ -418,7 +418,7 @@ def _class_weight_kernel(dfa_class_flow, cw_col, cw_K, cw_count, cw_cls, cw_off,
             else:
                 for ii in range(0, steps):
                     i, ok = _walk_column(columns, cstart, ccount, cm, ii, PRUNE, UNIFORM)
-                    q = tl.load(next_col + (t * W + i) * C + cls, mask = ok, other = -1)
+                    q = tl.load(next_col + (t * W + i).to(tl.int64) * C + cls, mask = ok, other = -1)
                     mx, acc = _cw_input_block_term(mx, acc, i, ok, q, op, rp, iv_table, opos, rpos, coff, count, crank,
                                                    kp, kr, b, vm, once, r_own, X, t, t2, end, B, n, W, TJ, S_KIND,
                                                    S_FULL, OUT_FULL, COMPACT, MARS, UNIFORM)

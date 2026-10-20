@@ -371,7 +371,7 @@ def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
         # an observed token: its own log-probability (the input region of node_mars), then the block from the
         # column its class leads to
         obs = ml & (oc >= 0)
-        q = tl.load(next_col + (t * W + i) * C + oc, mask = obs, other = -1)
+        q = tl.load(next_col + (t * W + i).to(tl.int64) * C + oc, mask = obs, other = -1)
         if R_KIND == 2:
             rv = tl.where((q == j) | (end & (q >= 0)), 0.0, float("-inf"))
         else:
@@ -422,7 +422,7 @@ def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
                                            num_enum, logw_stride, R_KIND, R_FULL, COMPACT, GROUPED, ENUM, LOGW)
             else:                                                            # every class in class order, the dead
                 for c in range(C):                                           # ones -inf (no entry tables read)
-                    q = tl.load(next_col + (t * W + i) * C + c, mask = miss, other = -1)
+                    q = tl.load(next_col + (t * W + i).to(tl.int64) * C + c, mask = miss, other = -1)
                     q = tl.where(end & (q >= 0), 0, q)                       # (a sequence end: one column, as the
                     pm = miss & (q >= 0)                                     # entry tables have it)
                     if R_KIND == 2:
@@ -499,7 +499,7 @@ def _input_block_group_kernel(element_mars, node_mars, temp, obs_class, next_col
 
         # an observed token, as in _input_block_kernel
         obs = ml & (oc >= 0)
-        q = tl.load(next_col + (t * W + i) * C + oc, mask = obs, other = -1)
+        q = tl.load(next_col + (t * W + i).to(tl.int64) * C + oc, mask = obs, other = -1)
         sl = _operand_slot(iv_table, rpos, q, j, X, obs, own, crank, b, t + 1, q, rbase, ce, n, W, R_FULL, COMPACT)
         val = tl.load(node_mars + u[:, None] * B + b[None, :], mask = gm[:, None] & obs[None, :], other = float("-inf")) + \
             tl.load(rp + sl[None, :], mask = gm[:, None] & (obs & (sl >= 0))[None, :], other = float("-inf"))
@@ -551,7 +551,7 @@ def _input_block_group_kernel(element_mars, node_mars, temp, obs_class, next_col
                                             num_enum, logw_stride, R_FULL, COMPACT, ENUM, LOGW, ONE_EXP)
             else:                                                            # every class in class order, the dead
                 for c in range(C):                                           # ones -inf (no entry tables read)
-                    q = tl.load(next_col + (t * W + i) * C + c, mask = miss, other = -1)
+                    q = tl.load(next_col + (t * W + i).to(tl.int64) * C + c, mask = miss, other = -1)
                     q = tl.where((t + 1 == n) & (q >= 0), 0, q)              # (a sequence end: one column, as the
                     pm = miss & (q >= 0)                                     # entry tables have it)
                     if ENUM:
@@ -640,7 +640,7 @@ def _block_input_kernel(element_mars, node_mars, temp, obs_class, next_col, clas
             q = tl.load(pred_col + e0 + k, mask = em, other = 0)
             x = tl.load(pred_x + e0 + k, mask = em, other = 0)
             if GROUPED:                                                      # does the observed class lead to j?
-                nq = tl.load(next_col + (t * W + q) * C + tl.maximum(oc, 0), mask = em, other = -1)
+                nq = tl.load(next_col + (t * W + q).to(tl.int64) * C + tl.maximum(oc, 0), mask = em, other = -1)
                 holds = (nq == j) | (end & (nq >= 0))
                 mass = tl.load(masses + x, mask = em & (oc < 0), other = float("-inf"))
             else:                                                            # is it this entry's class?

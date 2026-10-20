@@ -8,6 +8,7 @@ tables' lifetime, in fp32 and bf16; tf32. The class weights stored by the launch
 log-added to a fill only where needed. Decoding with values reused between queries is in decoder_test.py.
 """
 import random
+import sys
 
 import numpy as np
 import pytest
@@ -688,3 +689,40 @@ def test_class_weight_fill_where_needed(kind, fill, store, build_pc):
     assert plans and stores and all(p.cw_fill == fill for p in plans)
     assert all(stores) == store
 
+
+
+@pytest.mark.slow
+def test_transition_tables_past_two_billion_entries(reference):
+    """An automaton of 128 live states and 46715 classes over 400 positions: ``next_col`` [n, W, C] holds 2.4e9
+    entries, past what a 32-bit index reaches, so the kernels' offsets into it ``(t * W + i) * C`` must be 64-bit
+    (they were not: an illegal memory access on JSON hard_0 from n = 768 on, in the class weights' sample walk; the
+    forward walks' and the sweeps' offsets were the same). A two-latent HMM, the last 41 positions asked -- the ones
+    whose offsets overflow -- with the prefix observed: the rows are the reference's (its indexing PyTorch's). Takes
+    about 20 GB of GPU memory and 40 GB of host memory (the tables in int64 while they are built)."""
+    V, S, n = 50257, 128, 400
+    dev = torch.device("cuda")
+    c = torch.arange(V)
+    delta = torch.full((S + 1, V), S, dtype = torch.long)                   # S: the dead state
+    for q in (c % S, (c // S) % S, (c // (S * S)) % S):                     # three states a class lives at,
+        delta[q, c] = (q + 1 + c % 7) % S                                   # leading one of seven states on
+    accept = torch.cat([torch.ones(S, dtype = torch.bool), torch.zeros(1, dtype = torch.bool)])
+    dfa = jc.DFA(V, c, delta, 0, accept)
+    assert dfa.num_classes > 40000 and n * S * dfa.num_classes > 2 ** 31
+    torch.manual_seed(0)
+    ns = juice.structures.HMM(seq_length = n, num_latents = 2, num_emits = V)
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(max(limit, 10 * n))       # (pyjuice initializes and compiles a structure recursively)
+    try:
+        ns.init_parameters(perturbation = 2.0)
+        cc = jc.compile(dfa, juice.compile(ns, verbose = False).to(dev))
+    finally:
+        sys.setrecursionlimit(limit)
+    assert int(cc.backend.layout.width.max()) == S
+    g = torch.Generator(device = dev).manual_seed(1)
+    data = dfa.sample(torch.zeros(1, n, V, device = dev), 1, generator = g)[0]
+    missing = torch.arange(n, device = dev) >= n - 41
+    got = cc.conditional(data, missing, precision = "fp32")
+    # the rows are differences of log values near -4000 (400 positions of a 2-latent HMM over 50257 tokens), whose
+    # fp32 ulp is 4.9e-4: up to 3 of them off the reference, at positions whose offsets overflow as at the others
+    assert_rows_close(got, reference.conditional(cc, data, missing), n, tol = 4e-3)
+    assert (torch.logsumexp(got, dim = 1).abs() <= 1e-4).all()
