@@ -17,6 +17,7 @@ the reference's conditionals at free and missing targets, Codpula's vocabulary, 
 import itertools
 
 import pytest
+import numpy as np
 import torch
 
 import pyjuice as juice
@@ -199,23 +200,59 @@ def test_a_session_reuses_only_what_its_rows_inputs_allow(storage, topk, build_p
 
 @pytest.mark.parametrize("kind", ["hmm", "pd", "hand_left"])
 def test_evidence_every_row_reads_is_kept_once(kind, build_pc):
-    """Evidence of one row for all: the values over positions no row observes are every sample's, kept once for the
-    session (the brute force's value); evidence per row: they are each sample's own, none kept once over them."""
+    """Evidence of one row for all that rules no class out: the values over positions no row observes are every
+    sample's, kept once for the session (the brute force's value). Evidence per row: they are each sample's own, none
+    kept once over them. Evidence of one row that rules classes out: its positions are planned as observed, their
+    values per sample, pruned (cheaper than a block kept once over every column) -- the same values."""
     from pyjuice.constraints.inference.dfa_exact.queries.marginal import marginal
     pc = soft_pc(build_pc, kind)
     n = KINDS[kind]
     data, missing, E = evidence(n, 3)
     free = torch.arange(n, device = DEV) >= n // 2                          # a suffix no row observes (left-linear:
     missing[:] = ~free if kind == "hand_left" else free                     # a prefix)
+    finite = torch.where(torch.isinf(E[:1]), torch.full_like(E[:1], -20.0), E[:1])   # (every token weighs something)
     c = CONSTRAINTS["contains"]()
     cc = jc.compile(c, pc)
-    for ev in (E[:1], E):
+    prog = cc.backend.program()
+    for ev, mode in ((finite, "once"), (E, "per row"), (E[:1], "pruned")):
         external = cc.backend.external_inputs(dict(categorical_evidence_logp = ev))
         with juice.fast_inference():
             report = {}
             got = marginal(cc.backend, data, missing, report = report, external = external)
-        assert bool(report["plan"].prior) == (ev.size(0) == 1)
+            observed = external.observed_under(prog, cc.backend.state.masses(external))
+        plan = report["plan"]
+        if mode == "once":
+            assert not observed.any() and plan.prior
+        elif mode == "per row":
+            assert observed.all() and not plan.prior
+        else:                                           # kept once only over positions where nothing is ruled out
+            assert observed.any() and plan.sample.any()
+            for k in np.nonzero(plan.prior_read)[0]:
+                a, b = prog.sum_ivs[k]
+                assert not observed[a:b].any(), (a, b)
         assert_close(got, brute_force(pc, c, data, missing, ev), n)
+
+
+@pytest.mark.parametrize("kind", ["hmm", "pd"])
+def test_a_session_of_one_row_whose_evidence_prunes(kind, build_pc):
+    """A session of one row with top-k evidence (a token per position ruled out): left to right, every call is the
+    brute force's value, and the session computes its values per sample -- none kept once -- and reuses them."""
+    pc = soft_pc(build_pc, kind)
+    n = KINDS[kind]
+    data, _, inputs = topk_evidence(n, 2, K = V - 1)                        # (row 0 of two)
+    data, inputs = data[:1], {key: t[:1] for key, t in inputs.items()}
+    c = CONSTRAINTS["contains"]()
+    cc = jc.compile(c, pc)
+    prefix = lambda t: (torch.arange(n, device = DEV)[None, :] >= t)
+    with cc.decoder(storage = "compact", **inputs) as decoder:
+        for t in range(n):
+            got = decoder.marginal(data, prefix(t))
+            assert_close(got, brute_force(pc, c, data, prefix(t), inputs), n)
+            if t > 0:
+                assert decoder._kept is not None and decoder._kept.inside.any()   # (per-sample values held)
+        external = decoder._external                    # (its evidence rules a class out everywhere)
+        assert external.observed_under(cc.backend.program(), cc.backend.state.masses(external)).all()
+        assert cc.backend.state._prior_pool is None or not cc.backend.state._prior_valid.any()
 
 
 def test_a_plain_query_inside_a_session(build_pc):

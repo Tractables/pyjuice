@@ -189,8 +189,6 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     groups, (col, K, col_pos, col_K, col_first, group_first) = layout
     if observed is None:
         observed = (~missing).any(dim = 0).cpu().numpy()
-    if external is not None:                                                # values that differ per sample
-        observed = observed | external.observed
     if evidence is None:
         x = torch.where(missing, 0, data.to(dev).long())                      # missing tokens: any valid id
         obs_class = torch.where(missing, -1, backend.token_classes.token_class[x]).contiguous()
@@ -199,6 +197,8 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     held = held or {}
     masses = backend.state.masses(external) if masses is None else masses
     succ = live_successors(prog, masses)                # (per-sample inputs that rule classes out: theirs)
+    if external is not None:                            # values that differ per sample, or cheaper per sample
+        observed = observed | external.observed_under(prog, masses)
     # compact, a query needs its liveness even with nothing observed: every column is live, but only the regions it
     # computes per sample get rows (none, every value input-independent, inside fast_inference)
     lv = liveness(prog, obs_class, B, succ) if observed.any() or storage != "dense" or succ is not None else None

@@ -52,7 +52,8 @@ class ExternalInputs:
     :ivar gates: None, or the gates of the PC's gated sum nodes (``sum_external_params``, a
         :class:`.external_params.block_scale.SessionGates`)
     :ivar observed: bool [n] (host): the positions whose values differ per sample whatever is observed -- the variables
-        of evidence of a batch, the scopes of gates of a batch -- which a query plans as observed
+        of evidence of a batch, the scopes of gates of a batch -- which a query plans as observed, with those
+        :meth:`observed_under` adds
     :ivar scopes: the intervals ``(a, b)`` of the gated nodes' scopes when their gates differ per sample: the top-down
         values of a node of such a scope read them (its parents' are gated), so a query computes them per sample
     """
@@ -67,6 +68,26 @@ class ExternalInputs:
     observed: Optional[np.ndarray] = None
     scopes: tuple = ()
     evidence_batch: int = 1
+    _observed_under: Optional[tuple] = None
+
+    def observed_under(self, prog, masses: "ClassMasses") -> np.ndarray:
+        """
+        bool [n] (host): the positions a query under ``masses`` (the session's :class:`ClassMasses`) plans as
+        observed: :attr:`observed`, and under evidence of one row for all, the variables where it rules classes out
+        (:func:`~.kernels.live.class_support`, computed once per masses for the queries' pruning): their values pruned
+        per sample cost less than kept once over every column (a block kept once is computed without pruning, see
+        :mod:`.queries.backend.plans`) -- on a JSON Schema automaton of 24k states, a thousandth.
+        """
+        if self.evidence_batch != 1 or not self.layers:
+            return self.observed
+        if self._observed_under is None or self._observed_under[0] != masses.version:
+            from .kernels.live import live_successors
+            live_successors(prog, masses)                                   # (the support, once per masses)
+            out = self.observed
+            if masses.support is not None:
+                out = out | ((~masses.support.all(dim = 2)).any(dim = 0).cpu().numpy() & self.variables)
+            self._observed_under = (masses.version, out)
+        return self._observed_under[1]
 
 
 @dataclass
@@ -92,7 +113,9 @@ class ClassMasses:
         row of ``token_width`` (see :func:`~pyjuice.constraints.distributions.find_token`) -- token ``token_ids[i]``
         weighs ``token_logw[i]``, the others nothing
     :ivar successors: None until a query asks, then ``(lists,)``: the successor lists its liveness sweeps follow where
-        a token is missing (:func:`~.kernels.live.live_successors`; ``lists`` None for every class's)
+        a token is missing (:func:`~.kernels.live.live_successors`; ``lists`` None for every class's); ``support``
+        then the classes the inputs allow per sample and position (:func:`~.kernels.live.class_support`, None when
+        they rule none out)
     :ivar prow: int32 [rows of ``table``]: every row's parameter row (a row of :meth:`State.enumerated_probs`):
         itself for the shared rows, the pair's for a per-sample row
     :ivar enum_probs: when the automaton has enumerated classes (see
@@ -119,6 +142,7 @@ class ClassMasses:
     token_width: int = 0
     token_ids: Optional[torch.Tensor] = None
     successors: Optional[tuple] = None
+    support: Optional[torch.Tensor] = None
     prow: Optional[torch.Tensor] = None
     enum_probs: Optional[torch.Tensor] = None
     enum_logw: Optional[torch.Tensor] = None

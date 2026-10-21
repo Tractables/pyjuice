@@ -688,7 +688,7 @@ def live_successors(prog, masses) -> Optional[SampleSuccessors]:
         return None
     kept = masses.successors
     if kept is None:
-        allowed = class_support(prog, masses)
+        allowed = masses.support = class_support(prog, masses)
         kept = masses.successors = (None if allowed is None else sample_successors(prog, allowed),)
     return kept[0]
 

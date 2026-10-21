@@ -64,14 +64,14 @@ def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] =
         missing, missing_mask = missing | external.free, True
     observed = np.ones(n, dtype = bool) if missing_mask is None else \
         (~missing).any(dim = 0).cpu().numpy()                           # the positions some sample observes
-    if external is not None:                                            # values that differ per sample
-        observed |= external.observed
     x = torch.where(missing, 0, data.to(dev).long())                     # missing tokens: any valid id
 
     with torch.no_grad():
         obs_class = torch.where(missing, -1, backend.token_classes.token_class[x]).contiguous()
         masses = backend.state.masses(external)
         succ = live_successors(prog, masses)            # (per-sample inputs that rule classes out: theirs)
+        if external is not None:                        # values that differ per sample, or cheaper per sample
+            observed = observed | external.observed_under(prog, masses)
         # nothing observed: nothing to prune, but compact values are laid out by the live columns (every one)
         lv = liveness(prog, obs_class, B, succ) if observed.any() or storage != "dense" or succ is not None else None
         valid, kept = backend.state.prior_validity(masses.version)
